@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- pkd rejects unsandboxed app extensions ("plug-ins must be sandboxed"). The backing
+         directory is reached through the security-scoped path URL fskitd hands us. -->
+    <key>com.apple.security.app-sandbox</key> <true/>
+</dict>
+</plist>

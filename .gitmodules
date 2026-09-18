@@ -1,0 +1,12 @@
+[submodule "third_party/fmt"]
+	path = third_party/fmt
+	url = https://github.com/fmtlib/fmt.git
+[submodule "third_party/Arena"]
+	path = third_party/Arena
+	url = https://github.com/clapdb/Arena.git
+[submodule "third_party/Containa"]
+	path = third_party/Containa
+	url = https://github.com/clapdb/Containa.git
+[submodule "third_party/smallstring"]
+	path = third_party/smallstring
+	url = https://github.com/clapdb/smallstring.git
