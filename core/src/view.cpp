@@ -145,20 +145,40 @@ namespace {
 struct ReaddirCtx {
     wfs_view *v;
     wfs_ino dir;
+    wfs_ino parent;      // logical parent of `dir`; root is its own parent
     String dir_path;
     int want_attr;
+    bool emit_dots;      // wfs::fs_readdir_emits_dots(want_attr), sampled once per enumeration
     wfs_readdir_cb cb;
     void *ctx;
 };
 
 int readdir_trampoline(void *cp, const char *name, size_t len, uint64_t ino, wfs_type type, uint64_t index) {
     ReaddirCtx *c = (ReaddirCtx *)cp;
-    // The kernel (FSKit/VFS) synthesizes "." and ".." for every directory it enumerates, so packing
-    // the ones the backing opendir returns makes `ls -fa` show each of them twice. Skip them here and
-    // keep the backing readdir index as the cookie: cookies stay monotonic and a continuation that
-    // resumes at a cookie lands on the same backing entry it would have without the skip.
-    if (len == 1 && name[0] == '.') return 0;
-    if (len == 2 && name[0] == '.' && name[1] == '.') return 0;
+    // "." and ".." come out of the backing opendir stream at their natural index. Whether we hand
+    // them on is the host's business, not ours -- Darwin <= 26 synthesized both entries itself, and
+    // on Darwin >= 27 only the attribute-less enumeration wants them; see
+    // wfs::fs_readdir_emits_dots() in platform_posix.cpp. Either way the backing readdir index
+    // stays the cookie, so cookies are monotonic and a continuation that resumes at a cookie lands
+    // on the same backing entry regardless of the choice.
+    const bool is_dot = len == 1 && name[0] == '.';
+    const bool is_dotdot = len == 2 && name[0] == '.' && name[1] == '.';
+    if (is_dot || is_dotdot) {
+        if (!c->emit_dots) return 0;
+        wfs_dirent e;
+        memset(&e, 0, sizeof e);
+        e.name = name;
+        e.name_len = len;
+        e.type = WFS_T_DIR;
+        e.next_cookie = index + 1;
+        // The backing d_ino is the backing file system's; the caller needs the logical one, which
+        // for the view root is WFS_INO_ROOT rather than whatever the base directory's ino is.
+        e.ino = is_dot ? c->dir : c->parent;
+        wfs_attr a;
+        // Never intern a dot entry: its inode already has a record under its own name.
+        if (c->want_attr && wfs_getattr(c->v, e.ino, &a) == 0) e.attr = &a;
+        return c->cb(c->ctx, &e);
+    }
     wfs_dirent e;
     memset(&e, 0, sizeof e);
     e.name = name;
@@ -184,10 +204,12 @@ int readdir_trampoline(void *cp, const char *name, size_t len, uint64_t ino, wfs
 
 extern "C" int wfs_readdir(wfs_view *v, wfs_ino dir, uint64_t cookie, int want_attr, wfs_readdir_cb cb, void *ctx) {
     if (!v || !cb) return -EINVAL;
-    ReaddirCtx c{v, dir, String(), want_attr, cb, ctx};
+    ReaddirCtx c{v, dir, WFS_INO_ROOT, String(), want_attr, wfs::fs_readdir_emits_dots(want_attr != 0), cb, ctx};
     {
         Guard g(v->mu);
         if (int rc = path_locked(v, dir, c.dir_path)) return rc;
+        auto it = v->nodes.find(dir);
+        if (it != v->nodes.end()) c.parent = it->second.parent;   // root keeps WFS_INO_ROOT
     }
     return wfs::fs_readdir(c.dir_path.c_str(), cookie, readdir_trampoline, &c);
 }

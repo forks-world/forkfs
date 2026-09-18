@@ -14,12 +14,45 @@
 static void write_file(const char *p, const char *s) { FILE *f = fopen(p, "w"); CHECK(f); fputs(s, f); fclose(f); }
 static void join(char *out, size_t cap, const char *a, const char *b) { snprintf(out, cap, "%s%s", a, b); }
 
-struct Ent { char name[256]; wfs_ino ino; wfs_type type; uint64_t next_cookie; };
+struct Ent { char name[256]; wfs_ino ino; wfs_type type; uint64_t next_cookie; int has_attr; wfs_attr attr; };
 struct Ents { Ent e[64]; size_t n; };
 static int collect(void *ctx, const wfs_dirent *d) {
     Ents *es = (Ents *)ctx;
-    if (es->n < 64) { Ent &e = es->e[es->n++]; snprintf(e.name, sizeof e.name, "%.*s", (int)d->name_len, d->name); e.ino = d->ino; e.type = d->type; e.next_cookie = d->next_cookie; }
+    if (es->n < 64) {
+        Ent &e = es->e[es->n++];
+        snprintf(e.name, sizeof e.name, "%.*s", (int)d->name_len, d->name);
+        e.ino = d->ino; e.type = d->type; e.next_cookie = d->next_cookie;
+        e.has_attr = d->attr != NULL;
+        if (d->attr) e.attr = *d->attr;
+    }
     return 0;
+}
+
+// The same runtime decision readdir makes (core/src/platform_posix.cpp). Declared rather than
+// included so this file stays libc-only.
+namespace wfs { bool fs_readdir_emits_dots(bool with_attrs); }
+
+// Checks the dot entries of one enumeration of `dir`, whose logical parent is `parent`.
+// Returns the number of dot entries that should be there for this host and enumeration kind.
+static size_t check_dots(const Ents &es, wfs_ino dir, wfs_ino parent, int want_attr) {
+    const bool emit = wfs::fs_readdir_emits_dots(want_attr != 0);
+    size_t dots = 0, dotdots = 0;
+    for (size_t i = 0; i < es.n; ++i) {
+        const Ent &e = es.e[i];
+        bool is_dot = !strcmp(e.name, "."), is_dotdot = !strcmp(e.name, "..");
+        if (!is_dot && !is_dotdot) continue;
+        CHECK(emit);                                   // must not appear when the kernel synthesizes
+        CHECK(e.type == WFS_T_DIR);
+        CHECK(e.ino == (is_dot ? dir : parent));       // logical inode, not the backing st_ino
+        if (want_attr) {
+            CHECK(e.has_attr);
+            CHECK(e.attr.type == WFS_T_DIR);
+            CHECK(e.attr.ino == (is_dot ? dir : parent));
+        }
+        (is_dot ? dots : dotdots)++;
+    }
+    CHECK(dots == (emit ? 1u : 0u) && dotdots == (emit ? 1u : 0u));
+    return dots + dotdots;
 }
 
 int main() {
@@ -73,21 +106,32 @@ int main() {
     char pb[4096];
     CHECK_OK(wfs_backing_path(v, ac, 0, pb, sizeof pb));
     join(q, sizeof q, bd, "/src/a.c"); CHECK(strcmp(pb, q) == 0);
-    Ents ents = {}; 
-    CHECK_OK(wfs_readdir(v, WFS_INO_ROOT, 0, 1, collect, &ents));
-    // "." and ".." are synthesized by the kernel; readdir must not emit them itself.
+    // Root, attribute-less enumeration: "." is the root itself and ".." is the root too (the mount
+    // has no parent to expose). Whether the dot entries appear at all is the host's call.
+    Ents ents = {};
+    CHECK_OK(wfs_readdir(v, WFS_INO_ROOT, 0, 0, collect, &ents));
+    size_t ndots = check_dots(ents, WFS_INO_ROOT, WFS_INO_ROOT, 0);
     bool saw_src = false;
-    for (size_t i = 0; i < ents.n; ++i) {
-        CHECK(strcmp(ents.e[i].name, ".") != 0 && strcmp(ents.e[i].name, "..") != 0);
+    for (size_t i = 0; i < ents.n; ++i)
         if (!strcmp(ents.e[i].name, "src")) { saw_src = true; CHECK(ents.e[i].ino == src); }
-    }
-    CHECK(saw_src && ents.n >= 2);
-    // cookies stay monotonic and resumable across the skipped dot entries
+    CHECK(saw_src && ents.n == ndots + 2);   // hello.txt + src
+    // cookies stay monotonic and resumable whichever way the dot entries go
     for (size_t i = 1; i < ents.n; ++i) CHECK(ents.e[i].next_cookie > ents.e[i - 1].next_cookie);
     Ents rest = {};
     CHECK_OK(wfs_readdir(v, WFS_INO_ROOT, ents.e[0].next_cookie, 0, collect, &rest));
     CHECK(rest.n == ents.n - 1);
     for (size_t i = 0; i < rest.n; ++i) CHECK(!strcmp(rest.e[i].name, ents.e[i + 1].name));
+    // The attribute-bearing enumeration is the other branch of the same decision, and carries the
+    // same non-dot entries either way.
+    Ents wa = {};
+    CHECK_OK(wfs_readdir(v, WFS_INO_ROOT, 0, 1, collect, &wa));
+    size_t ndots_attr = check_dots(wa, WFS_INO_ROOT, WFS_INO_ROOT, 1);
+    CHECK(wa.n == ndots_attr + 2);
+    // A subdirectory: ".." must carry the parent's logical ino, not the subdirectory's own.
+    Ents sub = {};
+    CHECK_OK(wfs_readdir(v, src, 0, 0, collect, &sub));
+    CHECK(check_dots(sub, src, WFS_INO_ROOT, 0) == ndots);
+    CHECK(sub.n == ndots + 1);   // a.c
 
     // mutations land in the base dir; rename keeps children resolvable
     CHECK_OK(wfs_create(v, src, "b.c", 3, WFS_T_FILE, 0644, &a));

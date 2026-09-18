@@ -211,3 +211,110 @@ S1/S4 的抖动来自 mds 索引新生成的文件。)
 
 升级后的验收门槛(决定 A 是否值得重投):create+unlink 往返 ≤ 6 次且单次往返 ≤ 40µs(→ 元数据写约 40–60%);
 若两者都不满足,M1 维持 C(clonefile World)主线。
+
+### macOS 27.0 实测(2026-09-19,build 26A428,同一份二进制/同一套 deprecated Operations API)
+
+完整原始数据见 [`docs/MACOS27_MEASUREMENTS.md`](MACOS27_MEASUREMENTS.md)。27 SDK(Handler API)未安装,
+所以这是"同一份代码换个系统"的复测,不是"用新 API 重写"的结果。
+
+**门槛判定(两条都不满足,且都比 26.6.2 更差):**
+
+| 门槛 | 阈值 | 26.6.2 | **27.0** | 判定 |
+|---|---|---|---|---|
+| create+unlink 往返次数 | ≤ 6 | 16.06 | **16.025** | **FAIL**(超 2.7×,零改善) |
+| 单次往返(lookup-miss) | ≤ 40µs | 68.1µs | **73.6µs** | **FAIL**(超 1.8×,退步 8%) |
+
+- 往返构成逐项不变:`getattr` 7.025、`lookup` 3.00、`getxattr`(全是 `com.apple.provenance`)2.00、
+  `create`/`remove`/`reclaim`/`sync` 各 1.00。**mutation 后的 getattr 刷新和 provenance 探测都还在。**
+- RT 涨价不是我们的问题:Apple 自带 msdos 模块的同一探针也从 72.6µs 涨到 78.0µs(+7%),我们仍比它快 6%。
+- `-o` 挂载选项**仍然到不了扩展**(`FSTaskOptions.taskOptions` 恒为空数组),26.6.2 的这个 bug 原样存在。
+- 单 mount 仍然串行:8 客户端时 99.5% 的样本在一条 `com.apple.NSXPCConnection...(serial)` 队列上,
+  扩展 88.2% CPU、`fskitd` 107.9%。8 mount × 8 进程:lookup 46.5k ops/s、create+unlink 3.5k ops/s
+  (26.6.2 是 51.7k / 3.8k),瓶颈仍是全机一份的 `fskitd`。
+- 内核的否定名字缓存与属性缓存**依旧有效且与 native 持平**(同名 miss 0.78µs、已存在文件 lstat 0.91µs);
+  `vfs.generic.lifs` 12 个键的值与 26.6.2 逐字相同,两个 meta cache 计数器是活的。
+- 读/编译路径与 26.6.2 持平或更好:`cmake build -j8` 92%(26.6.2 90%)、open+close 106%、pread 104%、
+  S12 exec-artifacts 112%、S8 watch 99%。agentstress 十个场景 correctness 全 ok。
+
+**27 新出现的三个问题:**
+
+1. **`readdir(3)` / `getattrlistbulk` 不再返回 `.` 和 `..`**:27 的内核不再合成 dot 项,
+   而 26.6.2 的修复让 core 跳过了它们(Apple 的 msdos 模块是自己 pack 的)。
+   `ls -fa` 仍正确(BSD ls 自己合成),find/git/tar/rm -rf 实测不受影响,但这是 POSIX 语义缺口,
+   **需要在 `core` 的 `readdir_trampoline` 里把 dot/dotdot 重新 pack 回去。**
+2. **FSKit 的 `-[FSModuleVolume(Project) getItemForFH:]` 会退化成线性扫描**:
+   `sample` 显示 95% CPU 花在一个以 `FSFileHandle` 为 key 的 `NSMutableDictionary` 查找上,
+   沿哈希桶链逐个 `isEqual:`。表现是**同一挂载点上按目录呈稳定双峰**(75µs vs 270–560µs),
+   写路径(每次 create/remove 造新 handle)最坏被拖慢 3–12×:
+   create+unlink 1046µs(新挂载)→ 3781–4577µs(老挂载),8 进程聚合从 1249 掉到 402 ops/s。
+   劣化可逆(churn+reclaim 后自愈)。这是 FSKit 自己的代码。
+   实测后果:agentstress 第一轮 S4 82.8s / S5 134.8s,第二轮恢复到 8.7s / 24.3s;
+   `realwork` 的 "touch 头文件 + 增量编译" 从 66% native 稳定掉到 **24%**(两轮复现)。
+3. **每轮 mutation 会打一条 error 级日志** `getStandardItemAttributesForItem ... error:70`(ESTALE),
+   45 分钟测试产生 15 万条以上,落盘噪声。
+
+**27 SDK 的新 API 确实存在于运行时**(`FSVolumeHandler`、`FSLookupItemResult(initWithFoundItem:itemName:itemAttributes:)`、
+`FSCreateItemResult(... newItemAttributes:directoryAttributes:freeSpace:)`、`FSContext`、`FSVolumeDataCacheHandler` 全部 present;
+旧的 `FSVolumeOperations` 在 27 的 FSKit 里已改名为 `FSVolumeCommonOperations`,我们的 appex 因为自带协议对象仍能工作)。
+按 trace 估算,即使用它消掉全部 7 次 `getattr`,16.03 也只降到 ~9 次,**仍然过不了 ≤6 的门槛**,
+而且 3 次 lookup 和 2 次 provenance getxattr 不在这套 API 的射程内;单次往返更是反向走了 8%。
+
+**结论:T0.5 的 Go/No-Go 不因 macOS 27 改变。M1 维持 C(native-root clonefile World)主线;
+27 SDK Handler API 的改造降级为"装好 Xcode 27 之后的可选实验",不作为路线依据。**
+另外补三个 M0 收尾项(2026-09-19 已全部做完,见下节)。
+
+### M0 收尾 — 2026-09-19(macOS 27.0 实测暴露的三个问题)
+
+- [x] **T0.6 `readdir` 的 `.` / `..`**(`core/src/view.cpp` + `core/src/platform_posix.cpp`)
+  内核版本不同,要求正好相反:Darwin ≤ 26 的 VFS 自己合成 dot 项(模块再 pack 就会重复),
+  Darwin 27 不再合成(模块不 pack 就一个都没有)。没有能力位、`-o` 选项到不了扩展、C ABI 又不能改,
+  所以判定放在 `wfs::fs_readdir_emits_dots(bool with_attrs)` 里,从 `sysctl kern.osrelease` 读一次主版本号并缓存
+  (`static int cached = -1`,常量初始化,符合 §39 的"禁止静态对象动态初始化")。
+  **第二个维度是枚举种类**:27 上模块 pack 的东西会原样流进两个目录系统调用,而它们的语义不一样——
+  native APFS 的 `getdirentries(2)` 带 dot 项、`getattrlistbulk(2)` **从不**带(BSD `ls`/fts 正是因此自己合成 dot 行)。
+  内核替我们把两者分开了:实测 `readdir(3)` 到达扩展时 `attrs=0`,`getattrlistbulk` / `ls` / `find` 是 `attrs=1`。
+  因此只在"不带属性"的那次枚举里 pack dot 项,两个系统调用同时与 native 对齐。
+  `.` 带目录自己的**逻辑** ino(挂载根是 `WFS_INO_ROOT`,不是 backing 的 st_ino),`..` 带父目录的逻辑 ino(根的父是根本身);
+  want_attr 时 dot 项的属性走 `wfs_getattr(逻辑 ino)`,且**绝不 intern**(dot 名字不属于任何 inode)。
+  cookie 仍然是 backing readdir 的下标,所以续传语义与改动前完全一致。
+  实测(mnt4 vs native APFS):50 项目录 raw `getdirentries` **52 : 52**,100 / 1000 / 5000 项同样是 n+2 : n+2
+  (跨多个缓冲区也只有一个 `.` 一个 `..`);`getattrlistbulk` 两侧都是 n 项 0 个 dot;`ls -fa` 恰好一个 `.` 一个 `..`;
+  `os.scandir` / `os.listdir` 无 dot(libc 过滤);`.`/`..` 的 `d_ino` 与 `lstat` 一致,`d_type` 都是 `DT_DIR`;
+  readdir 完整性 100 / 1000 / 5000 四路比对全 `identical=YES`。
+  `core_test` 的期望值调用同一个 `wfs::fs_readdir_emits_dots(with_attrs)`,两个分支(带属性/不带属性)都覆盖。
+- [x] **ESTALE 日志噪声**(`macos/fskit/WorldVolume.mm` + `WorldItem.h/.mm`)
+  trace 确认序列是 `lookup → getattr(X) → remove(X) → **getattr(X)** → getattr(dir) → sync → reclaim(X)`,
+  每轮 create+unlink 恰好一条 `getStandardItemAttributesForItem ... error:70`。
+  两个方案都测了:**(b) 改回 ENOENT 没用**——op 数不变(16.30/轮),错误行数不变(20/20 轮),
+  只是把 `error:70` 换成 `error:2`;**(a) 在 `WorldItem` 里存最后一次 getattr 的 `wfs_attr`、
+  core 报 ESTALE 时拿它作答**——op 数同样不变(16.30/轮),错误行 **20 → 0**。选 (a)。
+  这不是编造属性:那份快照就是同一轮里 remove 前几微秒的那次 getattr 的结果;
+  缓存只到属性为止,**没有恢复 per-item fd 缓存**。
+- [x] **`scripts/smoke.sh` 不能在同一个活挂载上连跑两次**
+  收尾的清理从 backing 侧删文件(`rm -f "$B/smoke.txt" "$B/w.txt"`),view 的 ino→path 表看不见,
+  留下悬空节点,下一轮 `echo > "$M/w.txt"` 解析到旧 inode 拿 ENOENT。改成一律经挂载点删除,
+  并在脚本里写下复跑检查。实测同一个挂载点上**连跑三次全 ALL OK**。
+
+**验收(mnt4,2026-09-19):** `smoke.sh` ×3 全 ALL OK;`ctest` 1/1 通过;
+`check-deps.sh build/Release` 三个产物全是系统库;`agentstress.sh` scale=1 十个场景
+correctness 全 `native:ok worldfs:ok`(S1 15% / S2 15% / S3 11% / S4 10% / S5 15% / S6 17% /
+S7 59% / S8 108% / S9 69% / S12 134%,与 §6 的 mount 存活时间劣化同一量级的抖动)。
+整个 agentstress 窗口内 `getStandardItemAttributesForItem` 的 error 行只剩 9 条,而且是 `error:22`(EINVAL,
+FSKit 传进来的不是 `WorldItem`),与本次改动无关;`error:70` 一条都没有。
+
+### FSKit 前端冻结(2026-09-19)
+
+`macos/fskit/` 到此**冻结为实验性回退路径**,不再继续投入:
+
+- 冻结的理由是 T0.5 / macOS 27 复测的结论——元数据写 6.5–8% native、单次 XPC 往返 73.6µs、
+  create+unlink 16 次往返,而且 27 的 `getItemForFH:` 退化还会再乘 3–12×。M1 主线是 C(native-root clonefile World)。
+- **保留它的理由**:有两类场景 clonefile World 不覆盖,只有一个真正的挂载点能做到——
+  (1) **超大仓库**,`clonefile()` 也要复制一整棵目录树的元数据,当 World 数量或树的规模大到
+  连 COW 克隆都嫌贵时,挂载点的"零拷贝视图"仍然是唯一解;
+  (2) **跨卷 / 跨文件系统**,`clonefile()` 只在同一个 APFS 卷内有效,backing 与工作区不同卷时用不了。
+  这两种情况下 FSKit passthrough 虽然慢,但语义正确、已验证(agentstress 十个场景 correctness 全过)。
+- **不做的事**:不迁移到 macOS 27 的 Handler API(`FSVolume.Handler` / `FSLookupItemResult` /
+  `FSCreateItemResult` …)。按 §3.1 的 trace 估算,即使消掉全部 7 次 `getattr`,16.03 也只降到 ~9 次,
+  仍然过不了 ≤6 的门槛,而单次往返在 27 上反而涨了 8%。等 Xcode 27 SDK 装好之后可以作为可选实验复核,
+  但不作为路线依据。
+- 冻结不等于不维护:上面三个收尾项就是把它修到"正确且安静"的状态,以后只做正确性修复,不做性能改造。

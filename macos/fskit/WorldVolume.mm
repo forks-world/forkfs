@@ -161,6 +161,15 @@ static inline WorldItem *W(FSItem *i) { return [i isKindOfClass:[WorldItem class
     reply(nil);
 }
 
+// The kernel asks for an item's attributes once more immediately after removing it, before it
+// reclaims the item (measured on 27.0: lookup, getattr, remove, *getattr*, getattr(dir), sync,
+// reclaim -- exactly one such getattr per create+unlink cycle). By then the core has dropped the
+// node record, path_of() has no chain to walk and answers -ESTALE, and FSKit logs that at error
+// level: `-[FSVolumeConnector getStandardItemAttributesForItem:...]...error:70`, 150k+ lines in a
+// 45-minute run. Replying ENOENT instead only changes the number in the same error line (measured),
+// so serve the last attributes the core reported for this inode -- captured microseconds earlier by
+// the pre-remove getattr in the very same cycle, so it is a stale snapshot, not an invented one.
+// Nothing is cached beyond that snapshot: no per-item fd, no path.
 - (void)getAttributes:(FSItemGetAttributesRequest *)desired ofItem:(FSItem *)item
          replyHandler:(void (^)(FSItemAttributes *_Nullable, NSError *_Nullable))reply {
     WFS_TRACE("getattr ino=%llu", W(item).ino);
@@ -168,6 +177,8 @@ static inline WorldItem *W(FSItem *i) { return [i isKindOfClass:[WorldItem class
     if (!it) { reply(nil, perr(EINVAL)); return; }
     wfs_attr a;
     int rc = wfs_getattr(_view, it.ino, &a);
+    if (rc == -ESTALE && it.hasLastAttrs) { a = it.lastAttrs; rc = 0; }
+    else if (rc == 0) [it rememberAttrs:&a];
     if (rc) { reply(nil, perr(rc)); return; }
     reply(wfs_attributes(&a), nil);
 }
@@ -190,6 +201,7 @@ static inline WorldItem *W(FSItem *i) { return [i isKindOfClass:[WorldItem class
     wfs_attr a;
     int rc = wfs_setattr(_view, it.ino, &s, &a);
     if (rc) { reply(nil, perr(rc)); return; }
+    [it rememberAttrs:&a];
     req.consumedAttributes = consumed;
     reply(wfs_attributes(&a), nil);
 }

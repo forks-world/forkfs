@@ -65,6 +65,11 @@ int fs_statfs(const char *path, wfs_statfs_info &out);
 bool fs_xattr_is_own_quarantine(const char *path, const char *name, size_t name_len);
 int fs_realpath(const char *path, String &out);
 int fs_mkdir_p(const char *path);
+// True when this host expects the file system itself to pack "." and ".." into an enumeration that
+// does (`with_attrs`) or does not carry attributes. macOS 26.x's VFS synthesized them for FSKit
+// volumes; Darwin 27 stopped, and its two directory syscalls disagree about wanting them. Decided
+// once from kern.osrelease and cached; the full reasoning is in platform_posix.cpp.
+bool fs_readdir_emits_dots(bool with_attrs);
 // Enumerate a directory in stable order, skipping the first `skip` entries. cb returns non-zero to stop.
 int fs_readdir(const char *path, uint64_t skip,
                int (*cb)(void *ctx, const char *name, size_t len, uint64_t ino, wfs_type type, uint64_t index),

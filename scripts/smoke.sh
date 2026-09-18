@@ -55,5 +55,11 @@ ok mmap
 # fsync
 python3 -c "import os,sys; fd=os.open(sys.argv[1],os.O_RDWR); os.write(fd,b'x'); os.fsync(fd); os.close(fd)" "$M/smoke.txt" || fail "fsync"
 ok fsync
-rm -f "$B/smoke.txt" "$B/w.txt"
+# Clean up through the mount, never through the backing dir. A backing-side unlink is invisible to
+# the view's ino -> path table, so the record survives as a dangling node: the next `echo > $M/w.txt`
+# resolves the old inode and fails with ENOENT while `ls -l` still shows its stale attributes. That
+# is what stopped this script from running twice against one live mount.
+# Re-run check: `scripts/smoke.sh <backing> <mnt>` twice in a row on the same mount must print
+# ALL OK both times.
+rm -f "$M/smoke.txt" "$M/w.txt"
 echo "ALL OK"

@@ -7,6 +7,7 @@
     return self;
 }
 - (void)dealloc { if (_fd >= 0) close(_fd); }
+- (void)rememberAttrs:(const wfs_attr *)a { _lastAttrs = *a; _hasLastAttrs = YES; }
 @end
 
 FSItemAttributes *wfs_attributes(const wfs_attr *a) {

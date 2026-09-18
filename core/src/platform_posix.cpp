@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/sysctl.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
@@ -222,6 +223,47 @@ int fs_mkdir_p(const char *path) {
         }
     }
     return 0;
+}
+
+// Who packs "." and ".."?
+//
+// Until Darwin 26.x the VFS layer synthesized both entries for every FSKit directory it enumerated,
+// so a module that packed the ones its backing readdir(3) returned made `ls -fa` show each of them
+// twice. Darwin 27 dropped that synthesis (Apple's own msdos module has always packed its own) and
+// now hands whatever the module packs straight through, so a module that keeps skipping them
+// returns a directory with zero dot entries: a 50-file directory enumerates 50 where native APFS
+// returns 52.
+//
+// Straight through means to both directory syscalls, and they do not agree. Native APFS yields the
+// dot entries from getdirentries(2) and never from getattrlistbulk(2) -- BSD `ls`/fts depends on
+// that, it synthesizes its own dot lines precisely because the bulk call never gives it any. The
+// kernel tells the two apart for us: only the getattrlistbulk path asks the module for attributes
+// (measured on 27.0 -- readdir(3) arrives as attrs=0, getattrlistbulk / ls / find as attrs=1). So
+// pack the dot entries on the attribute-less enumeration only, and native parity holds for both.
+//
+// There is no capability bit for any of this, no mount option reaches the extension (FSTaskOptions
+// is empty on 26.6.2 and 27.0 alike) and the C ABI is frozen, so the kernel half of the decision is
+// read from kern.osrelease and cached. Non-Darwin (FUSE) hosts always expect dot entries from the
+// file system, with or without attributes.
+// `cached` is constant-initialized (arch.md §39 forbids dynamic initialization of statics) and the
+// race between two first callers is benign: they compute the same value.
+bool fs_readdir_emits_dots(bool with_attrs) {
+#ifdef __APPLE__
+    static int cached = -1;   // -1 unknown, 0 kernel synthesizes, 1 the module packs
+    int v = cached;
+    if (v < 0) {
+        char rel[64] = {0};
+        size_t n = sizeof rel - 1;
+        long major = 27;      // unreadable sysctl: assume current behaviour rather than lose entries
+        if (::sysctlbyname("kern.osrelease", rel, &n, nullptr, 0) == 0) major = ::strtol(rel, nullptr, 10);
+        v = major >= 27 ? 1 : 0;
+        cached = v;
+    }
+    return v != 0 && !with_attrs;
+#else
+    (void)with_attrs;
+    return true;
+#endif
 }
 
 int fs_readdir(const char *path, uint64_t skip,
