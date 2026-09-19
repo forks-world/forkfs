@@ -1435,7 +1435,25 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
     if (rc) {
         // Only ever our own clone. A name we drew but never created (EEXIST, or a gate that
         // would not open) belongs to whoever else is holding it.
-        if (tmp_is_ours) wfs::fs_remove_tree(tmp.c_str());
+        if (tmp_is_ours) {
+            wfs::fs_remove_tree(tmp.c_str());
+            // PR #1 review (20th round, P2): and a tree that could not be removed is not a tree
+            // that was removed -- the same rule as the 5th, 7th, 8th, 12th, 16th and 18th
+            // rounds, in the one place that still threw the result away. This tmp tree lives in
+            // the user's own target directory under a name drawn from 64 random bits, and the
+            // CREATING row is the ONLY record of that name anywhere: gc deliberately never
+            // sweeps a user directory by suffix (rm_tmp_in_store_dir). Deleting the row behind
+            // a failed removal stranded the whole clone for good, invisible to gc --status, to
+            // `gc` and to `adopt`. So the row stays CREATING with its tmp_path -- which is
+            // exactly the row a fork killed before its publish leaves, the shape
+            // gc_tmp_is_removable() accepts (marker names this world, row still CREATING and
+            // still naming this tree) and gc --status counts in creating_stranded -- and the
+            // caller gets the error that started all this.
+            if (!proven_gone(tmp.c_str())) {
+                if (rc == -EXDEV || rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
+                return rc;
+            }
+        }
         Guard g(s->mu);
         Txn t(s->db);
         Stmt del(s->db, "DELETE FROM worlds WHERE id=?");

@@ -16,6 +16,12 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+// PR #1 review (20th round, P2): a tree the remover genuinely cannot remove. Mode bits are no
+// use -- rm_rec() chmods its way in and fs_unprotect_tree() clears chflags, because it is
+// deleting the thing -- so this is the ACL scripts/tests/safety.sh uses for the same purpose,
+// applied through the API instead of through chmod(1).
+#include <membership.h>
+#include <sys/acl.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
 #define CHECK_OK(x) do { int _rc = (x); if (_rc != 0) { fprintf(stderr, "%s:%d: %s -> %d (%s)\n", __FILE__, __LINE__, #x, _rc, wfs_strerror(_rc)); exit(1); } } while (0)
@@ -418,6 +424,56 @@ static int crash_before_publish(void *ctx, wfs_id world, const char *tmp_path) {
     c->world = world;
     snprintf(c->tmp, sizeof c->tmp, "%s", tmp_path);
     return -EINTR;
+}
+
+// PR #1 review (20th round, P2): an owner-deny ACL on a directory -- delete and delete_child --
+// which survives every chmod and chflags the remover does on its way in. Undone by dropping the
+// extended ACL again.
+static void deny_delete(const char *path) {
+    acl_t acl = acl_init(1);
+    CHECK(acl != NULL);
+    acl_entry_t e;
+    CHECK(acl_create_entry(&acl, &e) == 0);
+    CHECK(acl_set_tag_type(e, ACL_EXTENDED_DENY) == 0);
+    acl_permset_t ps;
+    CHECK(acl_get_permset(e, &ps) == 0);
+    CHECK(acl_add_perm(ps, ACL_DELETE) == 0);
+    CHECK(acl_add_perm(ps, ACL_DELETE_CHILD) == 0);
+    CHECK(acl_set_permset(e, ps) == 0);
+    uuid_t uu;
+    CHECK(mbr_uid_to_uuid(getuid(), uu) == 0);
+    CHECK(acl_set_qualifier(e, uu) == 0);
+    CHECK(acl_set_link_np(path, ACL_TYPE_EXTENDED, acl) == 0);
+    acl_free(acl);
+}
+static void allow_delete(const char *path) {
+    acl_t empty = acl_init(0);   // an ACL with no entries removes the extended ACL
+    CHECK(empty != NULL);
+    CHECK(acl_set_link_np(path, ACL_TYPE_EXTENDED, empty) == 0);
+    acl_free(empty);
+}
+
+// ... and the fork failure that runs the ORDINARY path's unwind with the temp tree on disk. The
+// seam fires with the clone made, recorded and marked, so this locks a directory inside the
+// clone (the unwind's removal will fail on it) and then makes the publish rename fail the way
+// P7 says it must: a directory that appeared at --to since check_path looked. Returning 0 --
+// unlike crash_before_publish above, which is a `kill -9` and unwinds nothing.
+static char u20_target[4096];
+static char u20_tmp[4096];
+static char u20_locked[4096];
+static wfs_id u20_world;
+static int fork_fail_at_publish(void *ctx, wfs_id world, const char *tmp_path) {
+    (void)ctx;
+    u20_world = world;
+    snprintf(u20_tmp, sizeof u20_tmp, "%s", tmp_path);
+    snprintf(u20_locked, sizeof u20_locked, "%s/keep", tmp_path);
+    CHECK(mkdir(u20_locked, 0755) == 0);
+    char f[4096];
+    snprintf(f, sizeof f, "%s/f.txt", u20_locked);
+    write_file(f, "half a clone\n");
+    deny_delete(u20_locked);
+    CHECK(mkdir(u20_target, 0755) == 0);
+    return 0;
 }
 
 // PR #1 review (16th round, P2): the two halves of "a pool-backed fork that fails after the
@@ -1259,6 +1315,62 @@ int main() {
     CHECK(!exists(crash_seen.tmp));            // and the next wake finishes it
     CHECK_OK(wfs_world_info(s, crash_seen.world, &wr));
     CHECK(wr.state == WFS_ST_DEAD);
+
+    // ---- PR #1 review (20th round, P2): a fork unwind that could not remove its tmp tree -----
+    //
+    // A fork that fails after its clone exists removes the tree and then deletes the CREATING
+    // row. The removal's result was thrown away, and the row is the ONLY record of that tree's
+    // name anywhere: it lives in the user's own target directory under a name drawn from 64
+    // random bits, and gc deliberately never sweeps a user directory by suffix (that is what
+    // the wtmp case above pins down). So one EPERM left the whole half-built clone on disk with
+    // nothing in the store naming it -- not counted by `gc --status`, never retried, and not
+    // adoptable either. Same rule as the 5th, 7th, 8th, 12th, 16th and 18th rounds: a tree that
+    // could not be removed is not a tree that was removed, so the row stays CREATING with its
+    // tmp_path and the caller gets the error that started it.
+    {
+        char u20tgt[4096];
+        join(u20tgt, sizeof u20tgt, worlds, "w20unwind");
+        snprintf(u20_target, sizeof u20_target, "%s", u20tgt);
+        u20_tmp[0] = 0;
+        u20_locked[0] = 0;
+        u20_world = 0;
+        wfs_test_before_fork_publish = fork_fail_at_publish;
+        wfs_test_before_fork_publish_ctx = NULL;
+        wfs_test_fork_owner_pid = 2147480000;    // the producer is gone once the call returns
+        memset(&opts, 0, sizeof opts);
+        opts.name = "w20unwind";
+        wfs_id w20 = 0;
+        CHECK_RC(wfs_world_create(s, from, u20tgt, &opts, &w20), -EEXIST);
+        wfs_test_before_fork_publish = NULL;
+        wfs_test_before_fork_publish_ctx = &crash_seen;
+        wfs_test_fork_owner_pid = 0;
+        CHECK(u20_world != 0 && u20_tmp[0]);
+        CHECK(exists(u20_tmp));                        // the clone could not be removed ...
+        CHECK_OK(wfs_world_info(s, u20_world, &wr));   // ... so the row that names it is kept
+        CHECK(wr.state == WFS_ST_CREATING);
+        // And it is counted: `gc --status` is where an operator finds out that the space is
+        // still out there, which needs the row to exist (the count comes off the CREATING rows).
+        setenv("WORLD_GC_CREATING_MIN_AGE", "0", 1);
+        wfs_trash_stat u20st;
+        CHECK_OK(wfs_gc_status(s, 0, &u20st));
+        CHECK(u20st.creating_stranded >= 1);
+        // gc cannot remove it either while the ACL is on, and answers the same way: row kept,
+        // tree counted, retried under the failure cap.
+        memset(&gc, 0, sizeof gc);
+        CHECK_OK(wfs_gc(s, 0, &gc));
+        CHECK(exists(u20_tmp) && gc.tmp_failed >= 1);
+        CHECK_OK(wfs_world_info(s, u20_world, &wr));
+        CHECK(wr.state == WFS_ST_CREATING);
+        // Take the ACL away and the next wake finishes it: tree gone, row buried.
+        allow_delete(u20_locked);
+        memset(&gc, 0, sizeof gc);
+        CHECK_OK(wfs_gc(s, 0, &gc));
+        CHECK(!exists(u20_tmp));
+        CHECK_OK(wfs_world_info(s, u20_world, &wr));
+        CHECK(wr.state == WFS_ST_DEAD);
+        CHECK(exists(u20tgt));                         // the directory that was in the way, intact
+        CHECK(rmdir(u20tgt) == 0);
+    }
 
     // ---- PR #1 review (3rd round): "is there work for a collector?" must ask what the ---------
     // collector asks. A discard killed between the rename into <store>/trash and the commit of
