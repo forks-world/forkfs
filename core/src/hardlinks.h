@@ -79,9 +79,19 @@ struct HardlinkRestore {
 // that the caller is going to take back out of the clone -- for wfs_snapshot_create, the source
 // world's `.world` marker, which a checkpoint unlinks because the world's identity is not the
 // snapshot's. It is skipped by the grouping and by the `hardlinks` count, so a marker somebody
-// had hardlinked cannot put a name into a group that the published tree does not contain; its
-// twin is then an inode with a name outside the snapshot, which the external counters already
-// describe. nullptr (or "") excludes nothing.
+// had hardlinked cannot put a name into a group that the published tree does not contain.
+// nullptr (or "") excludes nothing.
+//
+// PR #1 review (22nd round, P2): and the excluded name is subtracted from ITS INODE'S nlink
+// everywhere that nlink is used, because the names that stay behind still count it. An inode
+// carrying `.world`, `m1` and `m2` has nlink 3 and two names inside the published tree, and
+// "fewer names than nlink" used to call that a group reaching outside -- so nothing was written,
+// the clone's broken links stayed broken, and the snapshot published `m1` and `m2` as two
+// independent files where the world has one inode under two names. With the subtraction, the
+// three cases are the three truths about the published tree: two or more names left is a real
+// group (its `nlink` is that count, which is what the tree will have); exactly one name left is
+// a plain file -- no group, nothing external, and not counted in `hardlinks` either; and a name
+// really outside the tree is external, exactly as before.
 int hardlinks_scan(const char *root, const char *exclude_rel, TreeStats *stats, HardlinkSet &out);
 
 // Appends the set to an open manifest, as

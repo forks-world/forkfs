@@ -118,11 +118,22 @@ int str_cmp(const void *a, const void *b) {
     return ::strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
+// PR #1 review (22nd round, P2): the inode behind the excluded name, and how many of that
+// inode's links wear a name this tree is not publishing. `n` is 1 in every run that has one at
+// all -- `exclude` is a single name, matched whole -- but the subtraction below is written as a
+// count so that it stays the subtraction it means.
+struct ExclIno {
+    uint64_t dev;
+    uint64_t ino;
+    uint64_t n;
+};
+
 struct ScanCtx {
     TreeStats *stats;
     const char *exclude;   // the one tree-relative name that is not a file of this tree
     Vec<Rec> recs;
     Vec<String> names;
+    Vec<ExclIno> excl;     // (dev, ino) of the excluded name, when it has links to spare
     Mutex mu;
 };
 
@@ -149,14 +160,35 @@ int scan_entry(void *ctx, const char *, const char *rel, const struct stat &st, 
         else {
             bump(c->stats->files);
             // Nor is it one of the tree's hardlinked files, however many links its inode has.
-            // What stays behind is its twin, and that twin's inode now carries a name the
-            // snapshot does not have -- which is what the external counters have always been
-            // for, and the grouping below reaches that verdict by itself: fewer names found
-            // inside the tree than the inode's nlink.
+            // What stays behind is its twin -- or its twins: whether that inode is still
+            // hardlinked at all, once this name is gone, is a question about the whole inode and
+            // is settled in the grouping pass below (22nd round), which also takes this bump
+            // back for the twin that turns out to be alone.
             if (st.st_nlink > 1 && !excluded) bump(c->stats->hardlinks);
         }
     }
-    if (excluded) return 0;
+    if (excluded) {
+        // PR #1 review (22nd round, P2): and its inode is remembered, because the names that
+        // stay behind still count it in their own st_nlink. See the grouping pass.
+        if (!is_dir && S_ISREG(st.st_mode) && st.st_nlink > 1) {
+            Guard g(c->mu);
+            bool found = false;
+            for (size_t i = 0; i < c->excl.size(); ++i)
+                if (c->excl[i].dev == (uint64_t)st.st_dev && c->excl[i].ino == (uint64_t)st.st_ino) {
+                    c->excl[i].n++;
+                    found = true;
+                    break;
+                }
+            if (!found) {
+                ExclIno e;
+                e.dev = (uint64_t)st.st_dev;
+                e.ino = (uint64_t)st.st_ino;
+                e.n = 1;
+                c->excl.emplace_back(e);
+            }
+        }
+        return 0;
+    }
     // Directories carry nlink > 1 by construction (one link per subdirectory) and cannot be
     // hardlinked; symlinks are lstat'ed here, and link(2) on one is not what any of this means.
     if (is_dir || !S_ISREG(st.st_mode) || st.st_nlink <= 1) return 0;
@@ -191,9 +223,36 @@ int hardlinks_scan(const char *root, const char *exclude_rel, TreeStats *stats,
         size_t j = i + 1;
         while (j < c.recs.size() && c.recs[j].dev == c.recs[i].dev && c.recs[j].ino == c.recs[i].ino) ++j;
         size_t k = j - i;
+        // PR #1 review (22nd round, P2): the inode's links, MINUS the ones the caller is taking
+        // back out of the tree. The 14th round dropped the excluded name's own record and
+        // nothing else, so the names that stayed behind kept an st_nlink that still counts it:
+        // `.world` hardlinked with `m1` and `m2` is one inode with nlink 3, of which the scan
+        // finds 2, and the test below -- k != nlink -- called that a group reaching outside the
+        // tree. It does not reach outside. The third name is ours and it is about to be
+        // unlinked, so the truth about the published tree is that `m1` and `m2` are one inode
+        // under two names -- and writing nothing meant the clone's broken links stayed broken
+        // and the snapshot went out with two independent files. Only a name that is really
+        // outside this tree may make a group external.
+        uint64_t nl = c.recs[i].nlink;
+        for (size_t e = 0; e < c.excl.size(); ++e)
+            if (c.excl[e].dev == c.recs[i].dev && c.excl[e].ino == c.recs[i].ino) {
+                nl = c.excl[e].n < nl ? nl - c.excl[e].n : 0;
+                break;
+            }
+        // One name left after the exclusion, and no link of that inode anywhere else: not a
+        // group (a group is two names or it is nothing) and not external either. It is a plain
+        // file in the published tree, so it is also not one of the tree's hardlinked files --
+        // the `hardlinks` bump the walk made for it above is taken back here, where the whole
+        // inode is finally in view. (`nl` is the source's count minus OUR names: k == nl == 1
+        // is only reachable through an exclusion, because a record exists only for nlink > 1.)
+        if (k == 1 && nl == 1) {
+            if (stats && stats->hardlinks) stats->hardlinks--;
+            i = j;
+            continue;
+        }
         // Fewer names here than the inode has links: the rest are outside this tree, and a
         // clone cannot be given links to files it does not contain. Count and move on.
-        if (k != (size_t)c.recs[i].nlink || k < 2) {
+        if (k != (size_t)nl || k < 2) {
             out.external_groups++;
             out.external_names += (uint64_t)k;
             i = j;
@@ -203,7 +262,11 @@ int hardlinks_scan(const char *root, const char *exclude_rel, TreeStats *stats,
         for (size_t t = i; t < j; ++t) ptr.emplace_back(c.names[c.recs[t].idx].c_str());
         if (ptr.size() > 1) ::qsort(ptr.data(), ptr.size(), sizeof(const char *), str_cmp);
         HardlinkGroup g;
-        g.nlink = c.recs[i].nlink;
+        // The nlink the PUBLISHED tree will have, which is the number of names in the group --
+        // the same value as before for every group with nothing excluded from it, and the only
+        // correct one for a group the marker was on: hardlinks_verify_groups and the manifest
+        // reader both hold a group to `nlink == paths.size()` against the tree that is there.
+        g.nlink = (uint64_t)k;
         for (size_t t = 0; t < ptr.size(); ++t) g.paths.emplace_back(ptr[t]);
         out.names += (uint64_t)g.paths.size();
         out.groups.emplace_back(std::move(g));

@@ -4768,9 +4768,9 @@ int main() {
     // never damaged.
     //
     // Both halves are fixed. The scan is told the one name the caller takes back out, so the
-    // marker never enters a group at all (its twin's inode then has a name outside the
-    // snapshot, which is what the external counters have always been for), and a member that is
-    // missing from the clone at replay time marks the group broken, so it is dropped from the
+    // marker never enters a group at all (its twin is then a file with one name, and the 22nd
+    // round below is what makes the scan say so rather than call it external), and a member that
+    // is missing from the clone at replay time marks the group broken, so it is dropped from the
     // manifest and from hl_groups -- the round-5 rule: a snapshot describes the tree it has.
     {
         char kstore[4096], ksrc[4096], kw[4096], kcw[4096], q2[4096];
@@ -4813,8 +4813,13 @@ int main() {
         CHECK_OK(wfs_snapshot_create(ks, kw, &sopts, &kc));
         CHECK_OK(wfs_snapshot_info(ks, kc, &sr));
         CHECK(sr.hl_groups == 1);     // the control pair, and no group holding the marker
-        CHECK(sr.hl_external == 1);   // `m`'s inode has a name this snapshot does not have
-        CHECK(sr.hardlinks == 3);     // c1, c2, m -- the marker is not a file of this tree
+        // PR #1 review (22nd round, P2): and `m` is not external either. The marker was this
+        // tree's own name, so with it gone `m`'s inode has ONE name and every one of them is
+        // inside the snapshot -- a plain file, which is neither a group nor a link reaching out
+        // of the tree, and not one of the tree's hardlinked files. (Both numbers changed in that
+        // round: hl_external was 1 and hardlinks was 3.)
+        CHECK(sr.hl_external == 0);
+        CHECK(sr.hardlinks == 2);     // c1, c2 -- `m` has one link once the marker is gone
         wfs_verify_report kvr;
         CHECK_OK(wfs_snapshot_verify(ks, kc, &kvr));
         CHECK(kvr.missing == 0 && kvr.modified == 0 && kvr.extra == 0 && kvr.unprotected == 0);
@@ -4870,6 +4875,104 @@ int main() {
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", kstore, (unsigned long long)k1);
         chmod(p, 0700);
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", kstore, (unsigned long long)kc);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
+    // ---- PR #1 review (22nd round, P2): the marker's twins are still each other's ------------
+    //
+    // The 14th round keeps the `.world` marker out of the scan's groups, because a checkpoint
+    // unlinks it out of the clone it is about to publish. That is right, and it left one thing
+    // half done: the marker's record is the only one dropped, while every OTHER name on that
+    // inode keeps an st_nlink that still counts the marker. With two such names -- `.world`,
+    // `m1`, `m2` on one inode, nlink 3 -- the grouping pass found 2 names for an inode that says
+    // 3, called the group external, and wrote nothing. The clone had already broken the link and
+    // the marker was gone, so `m1` and `m2` were published as two independent files where the
+    // world has one inode under two names: exactly the damage P9 exists to prevent, silently,
+    // and inherited by every fork of that snapshot.
+    //
+    // A name the caller takes out of the tree is not a link of that tree. So the scan remembers
+    // the excluded name's inode and subtracts it from that inode's nlink: 3 - 1 == 2 == the two
+    // names found, so (m1, m2) is a whole in-tree group and is written as one. The 14th round's
+    // own shape -- marker plus ONE other name -- becomes a single surviving name, which is a
+    // plain file: no group, and not external either, because nothing of that inode is outside
+    // the tree. Both are what the published snapshot really contains.
+    {
+        char zstore[4096], zsrc[4096], zw[4096], zcw[4096], zm2[4096], q2[4096];
+        join(zstore, sizeof zstore, root, "hlmark2-store");
+        join(zsrc, sizeof zsrc, root, "hlmark2-src");
+        CHECK(mkdir(zsrc, 0755) == 0);
+        join(p, sizeof p, zsrc, "c1");
+        write_file(p, "pair\n");
+        join(q2, sizeof q2, zsrc, "c2");
+        CHECK(link(p, q2) == 0);
+
+        wfs_store *zs = NULL;
+        CHECK_OK(wfs_store_open(zstore, &zs));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "hlmark2";
+        wfs_id z1 = 0;
+        CHECK_OK(wfs_snapshot_create(zs, zsrc, &sopts, &z1));
+        wfs_ref zf = {WFS_K_SNAPSHOT, z1};
+        memset(&opts, 0, sizeof opts);
+        opts.no_pool = 1;
+        join(zw, sizeof zw, worlds, "hlmark2-w");
+        wfs_id zw1 = 0;
+        CHECK_OK(wfs_world_create(zs, zf, zw, &opts, &zw1));
+
+        // Two ordinary names on the marker's inode: nlink 3, and exactly one of the three is
+        // not a file of the tree the checkpoint publishes.
+        join(p, sizeof p, zw, ".world");
+        join(q2, sizeof q2, zw, "m1");
+        CHECK(link(p, q2) == 0);
+        join(zm2, sizeof zm2, zw, "m2");
+        CHECK(link(p, zm2) == 0);
+        CHECK(nlink_of(p) == 3 && ino_of(p) == ino_of(q2) && ino_of(p) == ino_of(zm2));
+        wfs_identity zid;
+        CHECK_OK(wfs_world_verify_identity(zs, zw, &zid));   // still this world, in this store
+        CHECK(zid.world_id == zw1);
+
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "hlmark2-cp";
+        wfs_id zc = 0;
+        CHECK_OK(wfs_snapshot_create(zs, zw, &sopts, &zc));
+        CHECK_OK(wfs_snapshot_info(zs, zc, &sr));
+        CHECK(sr.hl_groups == 2);     // the control pair AND (m1, m2)
+        CHECK(sr.hl_external == 0);   // nothing of that inode is outside: the third name was ours
+        CHECK(sr.hardlinks == 4);     // c1, c2, m1, m2 -- the marker is not a file of this tree
+        wfs_verify_report zvr;
+        CHECK_OK(wfs_snapshot_verify(zs, zc, &zvr));
+        CHECK(zvr.missing == 0 && zvr.modified == 0 && zvr.extra == 0 && zvr.unprotected == 0);
+        // The snapshot tree itself: no marker, and the pair on one inode with nlink 2.
+        CHECK(chmod(sr.path, 0700) == 0);
+        join(p, sizeof p, sr.path, ".world");
+        CHECK(!exists(p));
+        join(p, sizeof p, sr.path, "m1");
+        join(q2, sizeof q2, sr.path, "m2");
+        CHECK(ino_of(p) == ino_of(q2) && nlink_of(p) == 2);
+        join(p, sizeof p, sr.path, "c1");
+        join(q2, sizeof q2, sr.path, "c2");
+        CHECK(ino_of(p) == ino_of(q2) && nlink_of(p) == 2);
+        CHECK(chmod(sr.path, 0000) == 0);
+
+        // And a fork of it rebuilds the pair, with the fork's own marker beside it.
+        wfs_ref zcf = {WFS_K_SNAPSHOT, zc};
+        memset(&opts, 0, sizeof opts);
+        opts.no_pool = 1;
+        join(zcw, sizeof zcw, worlds, "hlmark2-cw");
+        wfs_id zcw1 = 0;
+        CHECK_OK(wfs_world_create(zs, zcf, zcw, &opts, &zcw1));
+        join(p, sizeof p, zcw, "m1");
+        join(q2, sizeof q2, zcw, "m2");
+        CHECK(ino_of(p) == ino_of(q2) && nlink_of(p) == 2);
+        join(q2, sizeof q2, zcw, ".world");
+        CHECK(nlink_of(q2) == 1 && ino_of(p) != ino_of(q2));
+
+        CHECK_OK(wfs_world_discard(zs, zcw1, 1, 0));
+        CHECK_OK(wfs_world_discard(zs, zw1, 1, 0));
+        wfs_store_close(zs);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", zstore, (unsigned long long)z1);
+        chmod(p, 0700);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", zstore, (unsigned long long)zc);
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 
