@@ -423,6 +423,27 @@ static void discard_before_orphans(void *ctx) {
     g_orph_rc = wfs_world_discard(g_orph_store, g_orph_world, 0, 0);
 }
 
+// PR #1 review (10th round, P1): the snapshot tmp sweep's window. The seam runs inside
+// wfs_snapshot_create(), with <store>/snapshots/S<n>.wfs-tmp already on disk, the row CREATING
+// with this very process as its producer, and the clone not started yet; what it does in there
+// is a whole `gc` on a second handle, retention 0 and no deadline -- the suffix sweep at its
+// most eager. It must take nothing: that tree is a create that is still running.
+static wfs_store *g_sweep_store = NULL;
+static int g_sweep_ran;
+static int g_sweep_rc = -1;
+static wfs_gc_report g_sweep_rep;
+static void gc_before_snapshot_clone(void *ctx, const char *src_dir) {
+    (void)ctx;
+    (void)src_dir;
+    if (g_sweep_ran) return;
+    g_sweep_ran++;
+    wfs_gc_opts go;
+    memset(&go, 0, sizeof go);
+    go.retention_secs = 0;
+    memset(&g_sweep_rep, 0, sizeof g_sweep_rep);
+    g_sweep_rc = wfs_gc_ex(g_sweep_store, &go, &g_sweep_rep);
+}
+
 // A copy in the sense of `cp -R`: same bytes, same marker, different inode (P2).
 static void copy_dir(const char *src, const char *dst) {
     CHECK(mkdir(dst, 0755) == 0);
@@ -2828,6 +2849,103 @@ int main() {
         CHECK_OK(wfs_pool_fill(gs, g1, 1, &gmade));
         CHECK(gmade == 1);
         wfs_store_close(gs);
+    }
+
+    // ---- PR #1 review (10th round, P1): the tmp sweep never takes a live snapshot's clone ----
+    //
+    // gc's CREATING pass is careful with half-built snapshots: it skips any row whose producer
+    // is still alive, because `S<n>.wfs-tmp` is then a clone in progress. The suffix sweep that
+    // runs straight after it asked nothing at all -- every `*.wfs-tmp` under <store>/snapshots
+    // went on sight -- so it deleted the very tree that pass had just spared, and the
+    // `wfs_snapshot_create()` on the other side of it failed mid-clone. The sweep's verdict is
+    // "nothing names this tree", which is a verdict about live rows, so it is now asked of the
+    // live rows under the store mutex: the `S<n>` is parsed back into a row id and any row in
+    // any state but DEAD keeps its tree (docs/M1_DESIGN.md P18).
+    {
+        char tstore[4096], tsrc[4096], tsnaps[4096], tjunk[4096], tw[4096];
+        join(tstore, sizeof tstore, root, "sweeprace-store");
+        join(tsrc, sizeof tsrc, root, "sweeprace-src");
+        CHECK(mkdir(tsrc, 0755) == 0);
+        join(p, sizeof p, tsrc, "a.txt");
+        write_file(p, "one\n");
+        join(q, sizeof q, tsrc, "sub");
+        CHECK(mkdir(q, 0755) == 0);
+        join(p, sizeof p, q, "b.txt");
+        write_file(p, "two\n");
+        wfs_store *ta = NULL;
+        CHECK_OK(wfs_store_open(tstore, &ta));
+        // The collector runs on a handle of its own, the way another process would.
+        wfs_store *tb = NULL;
+        CHECK_OK(wfs_store_open(tstore, &tb));
+        g_sweep_store = tb;
+        g_sweep_ran = 0;
+        g_sweep_rc = -1;
+        wfs_test_before_snapshot_clone = gc_before_snapshot_clone;
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "sweeprace";
+        wfs_id t1 = 0;
+        CHECK_OK(wfs_snapshot_create(ta, tsrc, &sopts, &t1));   // used to fail here, mid-clone
+        wfs_test_before_snapshot_clone = NULL;
+        CHECK(g_sweep_ran == 1);
+        CHECK_OK(g_sweep_rc);
+        // Nothing removed, nothing counted as stuck, and no row buried: the tree under the
+        // sweep's hand was not the collector's to touch.
+        CHECK(g_sweep_rep.tmp_removed == 0 && g_sweep_rep.tmp_failed == 0);
+        CHECK(g_sweep_rep.snapshots_deleted == 0);
+        // And the snapshot is whole, by its own manifest and by what a fork from it gets.
+        wfs_snapshot_rec tr;
+        CHECK_OK(wfs_snapshot_info(ta, t1, &tr));
+        CHECK(tr.state == WFS_ST_ACTIVE);
+        wfs_verify_report tvr;
+        CHECK_OK(wfs_snapshot_verify(ta, t1, &tvr));
+        CHECK(tvr.missing == 0 && tvr.modified == 0 && tvr.extra == 0 && tvr.unprotected == 0);
+        CHECK_OK(wfs_snapshot_info(tb, t1, &tr));               // the collector's handle agrees
+        CHECK(tr.state == WFS_ST_ACTIVE);
+        wfs_ref tf = {WFS_K_SNAPSHOT, t1};
+        memset(&opts, 0, sizeof opts);
+        opts.no_pool = 1;
+        join(tw, sizeof tw, worlds, "sweeprace-w");
+        wfs_id tw1 = 0;
+        CHECK_OK(wfs_world_create(ta, tf, tw, &opts, &tw1));
+        join(p, sizeof p, tw, "a.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "one\n"));
+        join(p, sizeof p, tw, "sub/b.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "two\n"));
+
+        wfs_gc_report trep;
+        snprintf(tsnaps, sizeof tsnaps, "%s/snapshots", tstore);
+        // The controls, because this is a refinement of the sweep and not a retreat from it.
+        // (a) an `S<n>.wfs-tmp` whose id no row has at all still goes immediately.
+        snprintf(tjunk, sizeof tjunk, "%s/S999999%s", tsnaps, WFS_TMP_SUFFIX);
+        CHECK(mkdir(tjunk, 0755) == 0);
+        join(p, sizeof p, tjunk, "junk.txt");
+        write_file(p, "junk\n");
+        memset(&trep, 0, sizeof trep);
+        CHECK_OK(wfs_gc(tb, 0, &trep));
+        CHECK(trep.tmp_removed == 1 && !exists(tjunk));
+        // (b) so does a `*.wfs-tmp` that is not an `S<n>` name at all. Nothing writes one, and
+        // an unparseable name is exactly the case no row can speak for.
+        snprintf(tjunk, sizeof tjunk, "%s/stray%s", tsnaps, WFS_TMP_SUFFIX);
+        CHECK(mkdir(tjunk, 0755) == 0);
+        memset(&trep, 0, sizeof trep);
+        CHECK_OK(wfs_gc(tb, 0, &trep));
+        CHECK(trep.tmp_removed == 1 && !exists(tjunk));
+        // (c) and the `.wfs-tmp` of an id a live ACTIVE row holds is left alone: `S<n>` beside
+        // it is a real snapshot, so the name is not one nothing claims.
+        snprintf(tjunk, sizeof tjunk, "%s/S%llu%s", tsnaps, (unsigned long long)t1,
+                 WFS_TMP_SUFFIX);
+        CHECK(mkdir(tjunk, 0755) == 0);
+        memset(&trep, 0, sizeof trep);
+        CHECK_OK(wfs_gc(tb, 0, &trep));
+        CHECK(trep.tmp_removed == 0 && exists(tjunk));
+        CHECK(rmdir(tjunk) == 0);
+        CHECK_OK(wfs_snapshot_verify(ta, t1, &tvr));            // and the snapshot is still fine
+        wfs_store_close(tb);
+        wfs_store_close(ta);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", tstore, (unsigned long long)t1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 
     wfs_store_close(s);

@@ -2394,9 +2394,56 @@ const uint64_t kDefaultGcThreads = 4;
 // that removes a whole tree. What this sweeps are half-built snapshots -- clones of a source
 // tree, not a handful of files -- and it used to run flat out right after the CREATING loop,
 // which made that loop's own deadline pointless for exactly the trees it had just stopped on.
+//
+// PR #1 review (10th round), P18: "nothing names this tree" is a verdict, and a verdict about
+// live rows is re-asked of the live rows under the store mutex immediately before the deletion
+// (docs/M1_DESIGN.md §3). The sweep asked nothing at all: it removed every `S<n>.wfs-tmp` on
+// sight, including the one `wfs_snapshot_create()` had just made and was cloning into. The
+// CREATING pass above is careful about exactly that -- it skips a row whose producer is alive --
+// and the sweep then deleted the very tree that pass had spared, so the create failed with the
+// clone half gone. So each entry's `S<n>` is parsed back into a row id and asked of the
+// snapshots table: see snap_tmp_named_by_row().
+//
+// PR #1 review (10th round): and only over <store>/snapshots. The claim rule below IS the
+// snapshots table, so a second call site sweeping some other store directory by suffix would
+// inherit a rule that does not describe it; it has to bring its own (as pool.cpp's sweep does).
+bool snap_tmp_named_by_row(wfs_store *s, const char *leaf, size_t sl) {
+    // `S<digits>.wfs-tmp` and nothing else. Anything that does not parse is not a name this
+    // store ever wrote under <store>/snapshots, so it keeps the old behaviour and goes.
+    size_t n = ::strlen(leaf);
+    if (leaf[0] != 'S' || n <= sl + 1) return false;
+    uint64_t id = 0;
+    for (size_t i = 1; i + sl < n; ++i) {
+        if (leaf[i] < '0' || leaf[i] > '9') return false;
+        if (id > (UINT64_MAX - (uint64_t)(leaf[i] - '0')) / 10) return false;   // not a row id
+        id = id * 10 + (uint64_t)(leaf[i] - '0');
+    }
+    if (!id) return false;
+    Guard g(s->mu);
+    // Any state but DEAD counts as naming it, and deliberately more than just CREATING:
+    //   * CREATING with a live producer is a snapshot being built right now -- the tree under
+    //     the sweep's hand is its clone;
+    //   * CREATING with a dead producer is the CREATING pass's job, not the sweep's. That pass
+    //     removes both trees and only then deletes the row; when it cannot (EPERM, a deadline),
+    //     it keeps the row on purpose so the next wake retries under the failure cap. The sweep
+    //     racing it would remove the tree without ever clearing the row.
+    //   * ACTIVE/TRASHING/TRASHED means `S<n>` itself is a real snapshot. A `.wfs-tmp` beside it
+    //     should not exist at all, and if one ever does, leaving a stray directory in the store
+    //     is the cheap mistake -- wfs_snapshot_create() clears it before reusing that id, and
+    //     `gc --status` counts nothing it names.
+    // A row that cannot be read at all is likewise "do not delete": the sweep is the last and
+    // least informed of gc's passes, and its guess is never allowed to beat a row.
+    Stmt q(s->db, "SELECT 1 FROM snapshots WHERE id=? AND state<>?");
+    if (!q.ok()) return true;
+    q.i64(1, (int64_t)id);
+    q.i64(2, (int64_t)WFS_ST_DEAD);
+    return q.row();
+}
+
 int rm_tmp_in_store_dir(wfs_store *s, const char *dir, uint64_t *removed, int64_t deadline_us,
                         int *work_remains) {
     if (!under_dir(dir, s->dir.c_str())) return -EINVAL;   // not ours to sweep
+    if (::strcmp(dir, joinp(s->dir.c_str(), "snapshots").c_str()) != 0) return -EINVAL;
     DIR *d = ::opendir(dir);
     if (!d) return 0;
     size_t sl = ::strlen(WFS_TMP_SUFFIX);
@@ -2404,6 +2451,7 @@ int rm_tmp_in_store_dir(wfs_store *s, const char *dir, uint64_t *removed, int64_
         size_t n = ::strlen(e->d_name);
         if (n <= sl || ::strcmp(e->d_name + n - sl, WFS_TMP_SUFFIX) != 0) continue;
         if (deadline_us && now_us() >= deadline_us) { if (work_remains) *work_remains = 1; break; }
+        if (snap_tmp_named_by_row(s, e->d_name, sl)) continue;
         String p = joinp(dir, e->d_name);
         int partial = 0;
         int rc = wfs::fs_remove_tree(p.c_str(), deadline_us, &partial);
