@@ -3715,6 +3715,125 @@ int main() {
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 
+    // ---- PR #1 review (14th round, P2): the marker is not one of the snapshot's files -------
+    //
+    // A checkpoint clones the world and then unlinks the `.world` marker out of the clone: the
+    // source world's identity is not the snapshot's. But the scan that collects the hardlink
+    // groups ran over the world, marker and all -- so a marker that somebody's tool had
+    // hardlinked (a backup copy, a content-addressed store, a `cp -al` of the tree next door;
+    // ordinary in a workspace, and nothing in the world's identity minds it) went into a group
+    // with its twin. The replay then found the marker gone from the clone, counted it
+    // `missing` -- and left `whole` true, so the group stayed in the manifest and in hl_groups.
+    // The snapshot published, and from that moment every verify and every fork lstat'ed a
+    // member the tree does not have: WFS_E_SNAPSHOT_DIRTY, for ever, on a snapshot that was
+    // never damaged.
+    //
+    // Both halves are fixed. The scan is told the one name the caller takes back out, so the
+    // marker never enters a group at all (its twin's inode then has a name outside the
+    // snapshot, which is what the external counters have always been for), and a member that is
+    // missing from the clone at replay time marks the group broken, so it is dropped from the
+    // manifest and from hl_groups -- the round-5 rule: a snapshot describes the tree it has.
+    {
+        char kstore[4096], ksrc[4096], kw[4096], kcw[4096], q2[4096];
+        join(kstore, sizeof kstore, root, "hlmark-store");
+        join(ksrc, sizeof ksrc, root, "hlmark-src");
+        CHECK(mkdir(ksrc, 0755) == 0);
+        join(p, sizeof p, ksrc, "c1");
+        write_file(p, "pair\n");
+        join(q2, sizeof q2, ksrc, "c2");
+        CHECK(link(p, q2) == 0);
+
+        wfs_store *ks = NULL;
+        CHECK_OK(wfs_store_open(kstore, &ks));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "hlmark";
+        wfs_id k1 = 0;
+        CHECK_OK(wfs_snapshot_create(ks, ksrc, &sopts, &k1));
+        wfs_ref kf = {WFS_K_SNAPSHOT, k1};
+        memset(&opts, 0, sizeof opts);
+        opts.no_pool = 1;
+        join(kw, sizeof kw, worlds, "hlmark-w");
+        wfs_id kw1 = 0;
+        CHECK_OK(wfs_world_create(ks, kf, kw, &opts, &kw1));
+        join(p, sizeof p, kw, "c1");
+        join(q2, sizeof q2, kw, "c2");
+        CHECK(ino_of(p) == ino_of(q2) && nlink_of(p) == 2);
+
+        // The marker, hardlinked to an ordinary name in the world.
+        join(p, sizeof p, kw, ".world");
+        join(q2, sizeof q2, kw, "m");
+        CHECK(link(p, q2) == 0);
+        CHECK(nlink_of(p) == 2 && ino_of(p) == ino_of(q2));
+        wfs_identity kid;
+        CHECK_OK(wfs_world_verify_identity(ks, kw, &kid));   // still this world, in this store
+        CHECK(kid.world_id == kw1);
+
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "hlmark-cp";
+        wfs_id kc = 0;
+        CHECK_OK(wfs_snapshot_create(ks, kw, &sopts, &kc));
+        CHECK_OK(wfs_snapshot_info(ks, kc, &sr));
+        CHECK(sr.hl_groups == 1);     // the control pair, and no group holding the marker
+        CHECK(sr.hl_external == 1);   // `m`'s inode has a name this snapshot does not have
+        CHECK(sr.hardlinks == 3);     // c1, c2, m -- the marker is not a file of this tree
+        wfs_verify_report kvr;
+        CHECK_OK(wfs_snapshot_verify(ks, kc, &kvr));
+        CHECK(kvr.missing == 0 && kvr.modified == 0 && kvr.extra == 0 && kvr.unprotected == 0);
+        // The snapshot tree itself: the marker is gone, `m` is an ordinary file of its own, and
+        // the control pair is one inode under two names.
+        CHECK(chmod(sr.path, 0700) == 0);
+        join(p, sizeof p, sr.path, ".world");
+        CHECK(!exists(p));
+        join(p, sizeof p, sr.path, "m");
+        CHECK(nlink_of(p) == 1);
+        join(p, sizeof p, sr.path, "c1");
+        join(q2, sizeof q2, sr.path, "c2");
+        CHECK(ino_of(p) == ino_of(q2) && nlink_of(p) == 2);
+        CHECK(chmod(sr.path, 0000) == 0);
+
+        // And it forks -- which is the whole point: before this, the checkpoint published and
+        // the very next fork refused it.
+        wfs_ref kcf = {WFS_K_SNAPSHOT, kc};
+        memset(&opts, 0, sizeof opts);
+        opts.no_pool = 1;
+        join(kcw, sizeof kcw, worlds, "hlmark-cw");
+        wfs_id kcw1 = 0;
+        CHECK_OK(wfs_world_create(ks, kcf, kcw, &opts, &kcw1));
+        join(p, sizeof p, kcw, "c1");
+        join(q2, sizeof q2, kcw, "c2");
+        CHECK(ino_of(p) == ino_of(q2) && nlink_of(p) == 2);
+        join(p, sizeof p, kcw, "m");
+        CHECK(nlink_of(p) == 1);                 // the marker's old twin, an ordinary file now
+        join(q2, sizeof q2, kcw, ".world");
+        CHECK(ino_of(p) != ino_of(q2));          // and the fork's marker is the fork's own
+        CHECK(nlink_of(q2) == 1);
+
+        // The same through the pool, whose filler replays the manifest with no verify root.
+        CHECK_OK(wfs_world_discard(ks, kcw1, 1, 0));
+        uint64_t kmade = 0;
+        CHECK_OK(wfs_pool_fill(ks, kc, 1, &kmade));
+        CHECK(kmade == 1);
+        wfs_fork_result kfr;
+        memset(&opts, 0, sizeof opts);
+        memset(&kfr, 0, sizeof kfr);
+        CHECK_OK(wfs_world_create_ex(ks, kcf, kcw, &opts, &kfr));
+        kcw1 = kfr.world;
+        CHECK(kfr.from_pool == 1);
+        join(p, sizeof p, kcw, "c1");
+        join(q2, sizeof q2, kcw, "c2");
+        CHECK(ino_of(p) == ino_of(q2) && nlink_of(p) == 2);
+        join(p, sizeof p, kcw, "m");
+        CHECK(nlink_of(p) == 1);
+
+        CHECK_OK(wfs_world_discard(ks, kcw1, 1, 0));
+        CHECK_OK(wfs_world_discard(ks, kw1, 1, 0));
+        wfs_store_close(ks);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", kstore, (unsigned long long)k1);
+        chmod(p, 0700);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", kstore, (unsigned long long)kc);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
     // ---- PR #1 review (11th round, P2): a migration that failed is not a migration that ran ----
     //
     // The additive ALTERs used to be fired one by one with their results thrown away, and

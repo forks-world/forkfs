@@ -61,6 +61,7 @@ int str_cmp(const void *a, const void *b) {
 
 struct ScanCtx {
     TreeStats *stats;
+    const char *exclude;   // the one tree-relative name that is not a file of this tree
     Vec<Rec> recs;
     Vec<String> names;
     Mutex mu;
@@ -74,14 +75,29 @@ void bump(uint64_t &v) { __atomic_fetch_add(&v, 1, __ATOMIC_RELAXED); }
 int scan_entry(void *ctx, const char *, const char *rel, const struct stat &st, bool is_dir) {
     ScanCtx *c = (ScanCtx *)ctx;
     if (!*rel) return 0;   // the root itself is not an entry of the tree
+    // PR #1 review (14th round, P2): the one name the caller takes back out of the clone. A
+    // checkpoint unlinks the source world's `.world` marker from the tree it is about to
+    // publish -- the world's identity is not the snapshot's -- so the marker is not a file of
+    // that tree. A marker somebody's tool had hardlinked (a backup copy, a content-addressed
+    // store, a `cp -al` of the tree next door) otherwise went into a group whose member the
+    // snapshot did not have, and every verify and every fork of it refused the snapshot from
+    // the moment it was published. Exactly one name, matched whole: a `.world` inside a
+    // sub-world is left alone here because snapshot creation leaves it alone too.
+    const bool excluded = c->exclude && !::strcmp(rel, c->exclude);
     if (c->stats) {
         bump(c->stats->entries);
         if (is_dir) bump(c->stats->dirs);
         else {
             bump(c->stats->files);
-            if (st.st_nlink > 1) bump(c->stats->hardlinks);
+            // Nor is it one of the tree's hardlinked files, however many links its inode has.
+            // What stays behind is its twin, and that twin's inode now carries a name the
+            // snapshot does not have -- which is what the external counters have always been
+            // for, and the grouping below reaches that verdict by itself: fewer names found
+            // inside the tree than the inode's nlink.
+            if (st.st_nlink > 1 && !excluded) bump(c->stats->hardlinks);
         }
     }
+    if (excluded) return 0;
     // Directories carry nlink > 1 by construction (one link per subdirectory) and cannot be
     // hardlinked; symlinks are lstat'ed here, and link(2) on one is not what any of this means.
     if (is_dir || !S_ISREG(st.st_mode) || st.st_nlink <= 1) return 0;
@@ -98,11 +114,13 @@ int scan_entry(void *ctx, const char *, const char *rel, const struct stat &st, 
 
 } // namespace
 
-int hardlinks_scan(const char *root, TreeStats *stats, HardlinkSet &out) {
+int hardlinks_scan(const char *root, const char *exclude_rel, TreeStats *stats,
+                   HardlinkSet &out) {
     if (stats) *stats = TreeStats();
     out = HardlinkSet();
     ScanCtx c;
     c.stats = stats;
+    c.exclude = (exclude_rel && *exclude_rel) ? exclude_rel : nullptr;
     if (int rc = fs_walk_tree(root, 4, FS_DIRS_PRE, &c, scan_entry)) return rc;
     if (c.recs.empty()) return 0;
 
@@ -515,22 +533,35 @@ void restore_group(const char *tree_root, const char *verify_root, const Hardlin
 
     // The canonical file is the first name that is actually there. Promoting the next one
     // matters for a checkpoint of a live world: the first name may have been deleted between
-    // the scan and the clone, and the group is still perfectly restorable.
+    // the scan and the clone, and the rest of the group is still perfectly restorable -- but
+    // the group the manifest describes is not the group the tree then has.
+    //
+    // PR #1 review (14th round, P2): which is why a missing member is `whole = false`, here and
+    // in the loop below. It used to be counted and forgiven, so wfs_snapshot_create kept a
+    // group in the manifest and in hl_groups whose member its own tree does not contain, and
+    // every later verify and every fork lstat'ed that member and refused the snapshot as dirty
+    // -- for ever, on a snapshot that was never damaged. The round-5 rule is that a snapshot
+    // describes the tree it actually has, so the group is dropped instead. (The 14th round's
+    // other half keeps the marker out of a group in the first place; this half is what covers
+    // anything else snapshot creation takes out of the clone, and any member that vanishes in
+    // the window between the scan and the clone of a live source. A fork and a pool fill do not
+    // read `broken` at all -- their clone is published as it is -- so nothing else changes.)
     size_t base = g.paths.size();
     struct stat bst;
     for (size_t i = 0; i < g.paths.size(); ++i) {
         String c = joinp(tree_root, g.paths[i].c_str());
         if (::lstat(c.c_str(), &bst) == 0 && S_ISREG(bst.st_mode)) { base = i; break; }
         r.missing++;
+        whole = false;
     }
-    if (base == g.paths.size()) return;
+    if (base == g.paths.size()) { r.broken.emplace_back((uint64_t)index); return; }
     {
         String canon = joinp(tree_root, g.paths[base].c_str());
         bool linked = false;
         for (size_t i = base + 1; i < g.paths.size(); ++i) {
             String p = joinp(tree_root, g.paths[i].c_str());
             struct stat st;
-            if (::lstat(p.c_str(), &st) != 0) { r.missing++; continue; }
+            if (::lstat(p.c_str(), &st) != 0) { r.missing++; whole = false; continue; }
             if (st.st_dev == bst.st_dev && st.st_ino == bst.st_ino) { linked = true; continue; }
             // Not the file the scan saw any more: leave it alone. Unlinking it would throw away
             // somebody's data to save a few blocks.

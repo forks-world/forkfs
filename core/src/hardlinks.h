@@ -60,8 +60,9 @@ struct HardlinkRestore {
                            // verify root no longer agrees with
     int first_err = 0;     // first negative errno from link(2)/rename(2), 0 when there was none
     // PR #1 review (5th round): the indices, in `set.groups`, of the groups this replay did NOT
-    // leave whole -- one the verify root no longer agrees with, or one with a name that had
-    // diverged from the canonical file and was therefore left alone. wfs_snapshot_create drops
+    // leave whole -- one the verify root no longer agrees with, one with a name that had
+    // diverged from the canonical file and was therefore left alone, or (14th round) one with a
+    // name that is not in the clone at all. wfs_snapshot_create drops
     // them from the manifest it writes and from the row's hl_groups, so a snapshot never
     // advertises a group its own tree does not have: a fork from it replays the manifest without
     // a verify root (the snapshot is immutable) and would otherwise link one name over another
@@ -73,7 +74,15 @@ struct HardlinkRestore {
 // that need TreeStats pay for nothing extra) and collects the hardlink groups. Regular files
 // only: a directory's nlink is its subdirectory count, and a symlink is never a link target
 // here because the walk lstat()s.
-int hardlinks_scan(const char *root, TreeStats *stats, HardlinkSet &out);
+//
+// `exclude_rel` (PR #1 review, 14th round, P2) is the one tree-relative name, matched whole,
+// that the caller is going to take back out of the clone -- for wfs_snapshot_create, the source
+// world's `.world` marker, which a checkpoint unlinks because the world's identity is not the
+// snapshot's. It is skipped by the grouping and by the `hardlinks` count, so a marker somebody
+// had hardlinked cannot put a name into a group that the published tree does not contain; its
+// twin is then an inode with a name outside the snapshot, which the external counters already
+// describe. nullptr (or "") excludes nothing.
+int hardlinks_scan(const char *root, const char *exclude_rel, TreeStats *stats, HardlinkSet &out);
 
 // Appends the set to an open manifest, as
 //
@@ -133,7 +142,9 @@ String hardlinks_manifest_path(const char *snapshot_root);
 // A name is left alone -- never unlinked -- when it is gone (ENOENT: possible when the source
 // was a live world, whose tree can change between the scan and the clone), when it is not a
 // regular file, or when its size or mtime differ from the canonical file's, which is what a
-// name replaced between the scan and the clone looks like.
+// name replaced between the scan and the clone looks like. All three leave the group in
+// `broken` (the ENOENT one since the 14th round), because the group the set describes is then
+// not the group the tree has -- which is all wfs_snapshot_create needs to know to drop it.
 //
 // `verify_root`, when non-null, is a live tree the group is checked against first: every name
 // of the group must still exist there and still share one inode. That is how a fork from a live

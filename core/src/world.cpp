@@ -706,7 +706,14 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
     // clone can be given them back (hardlinks.h). Nothing else here changes.
     TreeStats src_stats;
     wfs::HardlinkSet hl;
-    if (int rc = wfs::hardlinks_scan(src.c_str(), &src_stats, hl)) return rc;
+    // PR #1 review (14th round, P2): and the marker this checkpoint is about to unlink out of
+    // the clone (below) is excluded from that walk. It is not a file of the tree this snapshot
+    // publishes, so a marker somebody's tool had hardlinked must not put a name into a group
+    // the published tree cannot have: the scan recorded the group, the marker was then removed,
+    // and the snapshot went out advertising a member it does not contain -- WFS_E_SNAPSHOT_DIRTY
+    // from every verify and every fork afterwards. Exactly the name that is removed, so a
+    // `.world` in a sub-world (which is not removed) is untouched.
+    if (int rc = wfs::hardlinks_scan(src.c_str(), WFS_MARKER_NAME, &src_stats, hl)) return rc;
     if (int rc = space_check(s->dir.c_str(), src_stats.entries)) return rc;
 
     char nm[WFS_NAME_MAX];
