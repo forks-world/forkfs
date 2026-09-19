@@ -309,6 +309,40 @@ if command -v sqlite3 > /dev/null 2>&1; then
                                                     || ok PR5 "and stops counting it"
 fi
 
+# ---- PR #1 review (11th round): a *.wfs-tmp the sweep cannot remove is reported and retried ----
+# `<store>/snapshots/S<n>.wfs-tmp` whose id no row has is the suffix sweep's to remove -- being
+# named by nothing is exactly what makes it the sweep's. The removal's result was dropped: one
+# that would not go (an ACL, an EPERM, a transient EIO) was counted in no report, set no
+# work_remains, and `wfs_gc_pending()` only ever classifies the trash -- so nothing ever came
+# back for it and the tree sat in the store until somebody ran gc by hand. Same ACL as the two
+# undeletable cases above: it survives chmod and chflags.
+SWEEPSTUCK="$WORLD_STORE/snapshots/S999998.wfs-tmp"
+mkdir -p "$SWEEPSTUCK/keep"
+echo x > "$SWEEPSTUCK/keep/f.txt"
+chmod +a "$(id -un) deny delete,delete_child,add_file" "$SWEEPSTUCK/keep"
+out=$("$WORLD" fs gc 2>&1)
+if [ -e "$SWEEPSTUCK/keep/f.txt" ] && echo "$out" | grep -q "could not be removed"; then
+    ok PR11 "gc reports the *.wfs-tmp it could not sweep"
+else
+    bad PR11 "gc reports the *.wfs-tmp it could not sweep"; echo "$out" | sed 's/^/        /'
+fi
+echo "$out" | grep -q "the collector will try again" \
+    && ok PR11 "and keeps work_remains set, so the worker chain comes back for it" \
+    || { bad PR11 "and keeps work_remains set, so the worker chain comes back for it"; echo "$out" | sed 's/^/        /'; }
+if "$WORLD" fs gc --status | grep -q "^abandoned: *1 half-built tree"; then
+    ok PR11 "gc --status counts it"
+else
+    bad PR11 "gc --status counts it"; "$WORLD" fs gc --status | sed 's/^/        /'
+fi
+# Take the ACL away and the next sweep finishes it -- and stops counting it.
+chmod -N "$SWEEPSTUCK/keep"
+"$WORLD" fs gc > /dev/null 2>&1
+if [ ! -e "$SWEEPSTUCK" ] && ! "$WORLD" fs gc --status | grep -q "^abandoned:"; then
+    ok PR11 "once it can be removed the next gc removes it and stops counting it"
+else
+    bad PR11 "once it can be removed the next gc removes it and stops counting it"
+fi
+
 # ---- P12: two commands at once do not corrupt the store -----------------------------------------
 "$WORLD" fs fork --from S1 --to "$SCRATCH/par-a" > "$SCRATCH/pa.log" 2>&1 &
 "$WORLD" fs fork --from S1 --to "$SCRATCH/par-b" > "$SCRATCH/pb.log" 2>&1 &

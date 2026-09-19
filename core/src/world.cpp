@@ -2440,8 +2440,23 @@ bool snap_tmp_named_by_row(wfs_store *s, const char *leaf, size_t sl) {
     return q.row();
 }
 
+// This sweep's key in the store's shared gc retry counter (internal.h). The path, exactly as
+// pool.cpp keys its own row-less trees: there is no row to key on -- that is what makes this
+// tree the sweep's business in the first place.
+String snap_tmp_fail_key(const String &path) {
+    String k("gcfail:snaptmp:");
+    k.append(path.c_str());
+    return k;
+}
+
+// PR #1 review (11th round): a tree here that will not go is reported, counted and retried, the
+// same as everything else the collector cannot remove. The result used to be dropped: a
+// row-less `S<n>.wfs-tmp` under an ACL, an EPERM or a transient EIO was neither counted in the
+// report nor allowed to set work_remains, and wfs_gc_pending() only ever classifies the trash,
+// so nothing came back for it -- the tree sat in the store until somebody ran gc by hand. It has
+// no row (that is the whole reason the sweep owns it), so the counter is keyed on its path.
 int rm_tmp_in_store_dir(wfs_store *s, const char *dir, uint64_t *removed, int64_t deadline_us,
-                        int *work_remains) {
+                        int *work_remains, uint64_t *failed) {
     if (!under_dir(dir, s->dir.c_str())) return -EINVAL;   // not ours to sweep
     if (::strcmp(dir, joinp(s->dir.c_str(), "snapshots").c_str()) != 0) return -EINVAL;
     DIR *d = ::opendir(dir);
@@ -2455,7 +2470,17 @@ int rm_tmp_in_store_dir(wfs_store *s, const char *dir, uint64_t *removed, int64_
         String p = joinp(dir, e->d_name);
         int partial = 0;
         int rc = wfs::fs_remove_tree(p.c_str(), deadline_us, &partial);
+        // Out of time, not stuck: the tree is still there and is still row-less next wake, so
+        // nothing is counted as a failure and the successor carries on from here.
         if (partial) { if (work_remains) *work_remains = 1; break; }
+        if (exists(p.c_str())) {
+            if (failed) (*failed)++;
+            if (wfs::gc_fail_bump(s, snap_tmp_fail_key(p).c_str()) < wfs::kGcFailCap && work_remains)
+                *work_remains = 1;
+            continue;
+        }
+        // Gone -- by this call or by somebody else's. Either way it is not waiting any more.
+        wfs::gc_fail_clear(s, snap_tmp_fail_key(p).c_str());
         if (rc == 0) (*removed)++;
     }
     ::closedir(d);
@@ -2904,6 +2929,25 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
             }
         }
     }
+    // PR #1 review (11th round): and the `*.wfs-tmp` under <store>/snapshots that no row names
+    // at all. Those belong to the suffix sweep rather than to the CREATING pass -- half-built
+    // clones whose row is already gone, or a name nothing in this store ever wrote -- and one
+    // the sweep cannot remove is waiting for the collector exactly as the two kinds above are.
+    // They were counted nowhere, so `gc --status` said the store was clean while the tree sat
+    // in it. Disjoint from the loop above by construction: snap_tmp_named_by_row() is what
+    // decides, and any row in any state but DEAD keeps its tree out of here.
+    {
+        String snapdir = joinp(s->dir.c_str(), "snapshots");
+        if (DIR *d = ::opendir(snapdir.c_str())) {
+            size_t sl = ::strlen(WFS_TMP_SUFFIX);
+            while (struct dirent *e = ::readdir(d)) {
+                size_t n = ::strlen(e->d_name);
+                if (n <= sl || ::strcmp(e->d_name + n - sl, WFS_TMP_SUFFIX) != 0) continue;
+                if (!snap_tmp_named_by_row(s, e->d_name, sl)) out->creating_stranded++;
+            }
+            ::closedir(d);
+        }
+    }
     // T1.5, PR #1 review (6th round): and the stale pool entries. Like the abandoned fork trees
     // above they are not in the trash -- they are clones under <store>/pool -- but they are
     // space waiting for the same collector, and a wake that ran out of time leaves them there.
@@ -3091,7 +3135,8 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
     }
     // <store>/snapshots only: a name under the store is one we made. The parent directories of
     // the worlds are the user's and are never swept (see rm_tmp_in_store_dir).
-    rm_tmp_in_store_dir(s, snaps.c_str(), &rep.tmp_removed, deadline_us, &rep.work_remains);
+    rm_tmp_in_store_dir(s, snaps.c_str(), &rep.tmp_removed, deadline_us, &rep.work_remains,
+                        &rep.tmp_failed);
 
     // ---- T2.2: reconciliation ----------------------------------------------------------------
     //

@@ -1121,7 +1121,9 @@ static int cmd_gc_status(wfs_store *s, int64_t retention) {
     // Not trash, but waiting for the same collector: a fork that died leaves its half-built
     // clone in the user's own directory, and only its CREATING row knows the name (PR #1 review).
     // Since the 7th round a half-built snapshot gc could not remove is counted here too -- its
-    // S<n> is not swept by anything either, so the row is the only record of it.
+    // S<n> is not swept by anything either, so the row is the only record of it. And since the
+    // 11th, the other half of that family: a `*.wfs-tmp` under <store>/snapshots that no row
+    // names, which is the suffix sweep's to remove and was counted by nothing while it stayed.
     if (ts.creating_stranded)
         printf("abandoned: %llu half-built tree%s still on disk (`world fs gc` retries them)\n",
                (unsigned long long)ts.creating_stranded, ts.creating_stranded == 1 ? "" : "s");
@@ -1182,11 +1184,16 @@ static int cmd_gc(wfs_store *s, int argc, char **argv) {
                     (unsigned long long)rep.snapshots_dangling, (unsigned long long)rep.worlds_dangling);
     }
     if (rep.tmp_failed) {
+        // PR #1 review (11th round): the `*.wfs-tmp` the suffix sweep could not remove is
+        // counted here too, and that one has no row at all -- being named by nothing is what
+        // makes it the sweep's -- so the note says what is true of both.
         fprintf(stderr,
                 "world: note: %llu half-built tree%s could not be removed and %s still on disk.\n"
-                "world:       The record of %s is kept; %s   (`world fs gc --status`)\n",
+                "world:       %s still counted, and any row naming %s is kept; %s"
+                "   (`world fs gc --status`)\n",
                 (unsigned long long)rep.tmp_failed, rep.tmp_failed == 1 ? "" : "s",
-                rep.tmp_failed == 1 ? "is" : "are", rep.tmp_failed == 1 ? "it" : "them",
+                rep.tmp_failed == 1 ? "is" : "are", rep.tmp_failed == 1 ? "It is" : "They are",
+                rep.tmp_failed == 1 ? "it" : "them",
                 rep.work_remains ? "the collector will try again."
                                  : "it has failed too often to keep retrying by itself.");
     }
