@@ -321,6 +321,99 @@ static void check_lines(const char *what, Collect *c, const Want *want, size_t n
     printf("  %-28s %zu lines, exact\n", what, n);
 }
 
+// ---- T2.4: the EF_NO_XATTRS shortcut may never skip a comparison that was needed --------------
+//
+// The full scan now asks the file system, per entry, whether it has any xattr at all
+// (ATTR_CMNEXT_EXT_FLAGS / EF_NO_XATTRS, via getattrlistbulk(2)) and calls listxattr only when
+// the answer is not "neither side has any". The flag only ever denies xattrs, so the danger is
+// one-sided: a file whose xattr the flag failed to mention would be silently compared as clean.
+//
+// This fixture puts every combination in one tree, with the **world** side and the **snapshot**
+// side each getting a turn at being the one that carries the attribute -- the snapshot-side case
+// is the one a naive "look at the world entry and skip" would get wrong, because there the world
+// entry genuinely has nothing.
+//
+// Note for anyone re-reading the numbers: on macOS 27 every file this process creates is stamped
+// with com.apple.provenance and it cannot be removed, so *no* file this test makes ever gets
+// EF_NO_XATTRS. That is why this case asserts the answer and not the syscall count: the shortcut
+// is exercised for real on trees that came from somewhere else (see docs/TASKS.md T2.4).
+#ifdef __APPLE__
+static void xattr_shortcut(const char *root, const char *store) {
+    char src[4096], w[4096], p[4096];
+    join(src, sizeof src, root, "xa-src");
+    join(w, sizeof w, root, "xa-w");
+    CHECK(mkdir(src, 0755) == 0);
+    // four files, all identical in every other respect
+    static const char *names[] = {"plain.txt", "both.txt", "world-only.txt", "snap-only.txt"};
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; ++i) {
+        join(p, sizeof p, src, names[i]);
+        write_file(p, "same bytes everywhere\n");
+    }
+    // the snapshot side carries an xattr on two of them
+    join(p, sizeof p, src, "both.txt");
+    CHECK(setxattr(p, "com.forks.world.t24", "old", 3, 0, XATTR_NOFOLLOW) == 0);
+    join(p, sizeof p, src, "snap-only.txt");
+    CHECK(setxattr(p, "com.forks.world.t24", "gone", 4, 0, XATTR_NOFOLLOW) == 0);
+
+    wfs_store *s = NULL;
+    CHECK_OK(wfs_store_open(store, &s));
+    wfs_id sid = 0;
+    wfs_snapshot_opts sopts;
+    memset(&sopts, 0, sizeof sopts);
+    sopts.name = "xa";
+    CHECK_OK(wfs_snapshot_create(s, src, &sopts, &sid));
+    wfs_ref from = {WFS_K_SNAPSHOT, sid};
+    wfs_fork_opts o;
+    memset(&o, 0, sizeof o);
+    wfs_id wid = 0;
+    CHECK_OK(wfs_world_create(s, from, w, &o, &wid));
+
+    // plain.txt      : nothing on either side          -> clean (the shortcut's happy case)
+    // both.txt       : the value changes in the world  -> T
+    // world-only.txt : only the world has one          -> T
+    // snap-only.txt  : only the snapshot has one       -> T  (the world entry has none at all,
+    //                                                         which is exactly what a one-sided
+    //                                                         shortcut would skip)
+    join(p, sizeof p, w, "both.txt");
+    CHECK(setxattr(p, "com.forks.world.t24", "new", 3, 0, XATTR_NOFOLLOW) == 0);
+    join(p, sizeof p, w, "world-only.txt");
+    CHECK(setxattr(p, "com.forks.world.t24", "added", 5, 0, XATTR_NOFOLLOW) == 0);
+    join(p, sizeof p, w, "snap-only.txt");
+    CHECK(removexattr(p, "com.forks.world.t24", XATTR_NOFOLLOW) == 0);
+
+    Collect c;
+    memset(&c, 0, sizeof c);
+    wfs_diff_stats st;
+    static const Want want[] = {
+        {'T', "both.txt"},
+        {'T', "snap-only.txt"},
+        {'T', "world-only.txt"},
+    };
+    settle();
+    run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
+    CHECK(st.full_scan == 1);
+    check_lines("xattr shortcut / --full", &c, want, sizeof want / sizeof want[0]);
+    run_diff(s, wid, 0, &c, &st);
+    check_lines("xattr shortcut / FSEvents", &c, want, sizeof want / sizeof want[0]);
+    // ... and with the comparison switched off, none of the three is visible.
+    run_diff(s, wid, WFS_DIFF_FULL | WFS_DIFF_NO_XATTR, &c, &st);
+    check_lines("xattr shortcut / --no-xattr", &c, NULL, 0);
+
+    // A same-valued xattr on both sides is not a change, whichever way the flag went.
+    join(p, sizeof p, w, "both.txt");
+    CHECK(setxattr(p, "com.forks.world.t24", "old", 3, 0, XATTR_NOFOLLOW) == 0);
+    join(p, sizeof p, w, "world-only.txt");
+    CHECK(removexattr(p, "com.forks.world.t24", XATTR_NOFOLLOW) == 0);
+    join(p, sizeof p, w, "snap-only.txt");
+    CHECK(setxattr(p, "com.forks.world.t24", "gone", 4, 0, XATTR_NOFOLLOW) == 0);
+    run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
+    check_lines("xattr shortcut / restored", &c, NULL, 0);
+
+    free(c.v);
+    wfs_store_close(s);
+}
+#endif
+
 static void small_cases(const char *root, const char *store) {
     char src[4096], w[4096], w2[4096], p[4096], q[4096];
     join(src, sizeof src, root, "small-src");
@@ -700,6 +793,13 @@ int main() {
         join(store2, sizeof store2, root, "store-small");
         small_cases(root, store2);
     }
+#ifdef __APPLE__
+    {
+        char store4[4096];
+        join(store4, sizeof store4, root, "store-xattr");
+        xattr_shortcut(root, store4);
+    }
+#endif
 
     const char *bp = getenv("WFS_DIFF_BENCH");
     if (bp && *bp && strcmp(bp, "0")) {
