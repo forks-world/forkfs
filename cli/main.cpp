@@ -1460,6 +1460,27 @@ int main(int argc, char **argv) {
                  WFS_STORE_SCHEMA);
         return refuse(why, "use a matching `world` build, or point --store at a new directory");
     }
+    // P17. The tempting thing to do here is to make a fresh database and carry on; it is also
+    // the one thing that loses data. Snapshot and world ids come out of that database, so a new
+    // one hands out 1 again and the next `init` writes S1 on top of the `snapshots/S1` that is
+    // still sitting there. Nothing in the core can put the rows back either: `gc --reconcile`
+    // reads the database to find rows whose trees are gone, and here it is the database that is
+    // gone. So: stop, and say what the two real ways out are.
+    if (rc == WFS_E_STORE_DAMAGED) {
+        char why[WFS_PATH_MAX + 256];
+        snprintf(why, sizeof why,
+                 "the store at %s still holds trees (snapshots/, trash/ or pool/) but its "
+                 "metadata.db is missing or unreadable.\n"
+                 "  Those trees are what the database was the index of: ids would restart at 1 "
+                 "and collide with the snapshots/S<n> already on disk, so nothing will be "
+                 "created here.\n"
+                 "  `world fs gc --reconcile` cannot help -- it needs the database to know what "
+                 "is orphaned.",
+                 sd);
+        return refuse(why,
+                      "restore metadata.db from a backup, or move the directory aside "
+                      "(`mv <store> <store>.damaged`) and start a new store");
+    }
     if (rc) { fprintf(stderr, "world: open store %s: %s\n", sd, wfs_strerror(rc)); return EX_ERR; }
 
     int ret;

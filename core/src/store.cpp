@@ -2,6 +2,7 @@
 // trees and the trash. Everything that is not snapshot/world lifecycle lives here.
 #include "db.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -153,6 +154,31 @@ int meta_get(sqlite3 *db, const char *key, String &out) {
     return 0;
 }
 
+// P17: does this store directory still hold trees? One readdir of each of the three places a
+// tree can be, stopping at the first entry that is not "." or "..". Cheap enough to do on every
+// open of a store whose metadata.db is not there.
+bool store_has_trees(const char *dir, String &what) {
+    for (const char *sub : {"/snapshots", "/trash", "/pool"}) {
+        String p(dir);
+        p.append(sub);
+        DIR *d = ::opendir(p.c_str());
+        if (!d) continue;
+        bool found = false;
+        while (struct dirent *e = ::readdir(d)) {
+            if (e->d_name[0] == '.' && (e->d_name[1] == 0 || (e->d_name[1] == '.' && e->d_name[2] == 0)))
+                continue;
+            what.assign(sub + 1);
+            what.append("/");
+            what.append(e->d_name);
+            found = true;
+            break;
+        }
+        ::closedir(d);
+        if (found) return true;
+    }
+    return false;
+}
+
 int meta_set(sqlite3 *db, const char *key, const char *value) {
     Stmt u(db, "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value");
     if (!u.ok()) return -EIO;
@@ -184,6 +210,7 @@ extern "C" const char *wfs_strerror(int rc) {
     case WFS_E_SNAPSHOT_IN_USE: return "a live world still needs this snapshot";
     case WFS_E_GC_BUSY: return "another gc worker is running";
     case WFS_E_STORE_UNREACHABLE: return "that store cannot be opened from here";
+    case WFS_E_STORE_DAMAGED: return "the store has trees in it but no readable metadata.db";
     default: return ::strerror(rc < 0 ? -rc : rc);
     }
 }
@@ -211,6 +238,20 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
     if (int rc = wfs::fs_realpath(store_dir, real)) return rc;
     if (int rc = check_version(real.c_str())) return rc;
 
+    // P17: never build a fresh database next to trees that the old one was the index of. Ids
+    // restart at 1 when the database does, and the first `init` would then be handed S1 with
+    // `snapshots/S1` already on disk -- so this is refused, loudly, before anything is created.
+    // "Unreadable" counts as missing: a database we cannot open is one whose ids we do not know.
+    {
+        String dbp(real);
+        dbp.append("/metadata.db");
+        struct stat dbst;
+        bool readable = ::stat(dbp.c_str(), &dbst) == 0 && S_ISREG(dbst.st_mode) &&
+                        dbst.st_size > 0 && ::access(dbp.c_str(), R_OK | W_OK) == 0;
+        String what;
+        if (!readable && store_has_trees(real.c_str(), what)) return WFS_E_STORE_DAMAGED;
+    }
+
     wfs_store *s = new wfs_store();
     s->dir.assign(real.c_str());
     for (const char *sub : {"/snapshots", "/trash", "/locks", "/tmp", "/pool", "/logs"}) {
@@ -228,11 +269,16 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
     }
     String dbp(s->dir);
     dbp.append("/metadata.db");
+    // A file that is there but is not a database (truncated, or something else entirely) is the
+    // same danger as one that is missing, and by here we know the store is not empty.
     int rc = sqlite3_open_v2(dbp.c_str(), &s->db,
                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nullptr);
-    if (rc != SQLITE_OK) { wfs_store_close(s); return -EIO; }
+    if (rc != SQLITE_OK) { wfs_store_close(s); return WFS_E_STORE_DAMAGED; }
     sqlite3_busy_timeout(s->db, 10000);
-    if (sqlite3_exec(s->db, kPragmas, nullptr, nullptr, nullptr) != SQLITE_OK) { wfs_store_close(s); return -EIO; }
+    if (sqlite3_exec(s->db, kPragmas, nullptr, nullptr, nullptr) != SQLITE_OK) {
+        wfs_store_close(s);
+        return WFS_E_STORE_DAMAGED;
+    }
     int user_version = 0;
     {
         Stmt q(s->db, "PRAGMA user_version");

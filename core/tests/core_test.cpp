@@ -774,6 +774,57 @@ int main() {
     CHECK_RC(wfs_store_open(other, &bad), WFS_E_SCHEMA);
     CHECK(bad == NULL);
 
+    // ---- P17: trees in the store, no database -> refuse, never rebuild ----
+    // A store whose metadata.db is gone still has its snapshot trees, and those trees are what
+    // the database was the index of. Making a fresh one would hand out id 1 again and the next
+    // `init` would write S1 over the `snapshots/S1` that is still there, so the open is refused.
+    {
+        char dstore[4096], dsrc[4096], dp[4096];
+        join(dstore, sizeof dstore, root, "damaged-store");
+        join(dsrc, sizeof dsrc, root, "damaged-src");
+        CHECK(mkdir(dsrc, 0755) == 0);
+        join(dp, sizeof dp, dsrc, "a.txt");
+        write_file(dp, "one file is enough\n");
+        wfs_store *d = NULL;
+        CHECK_OK(wfs_store_open(dstore, &d));
+        wfs_id dsid = 0;
+        wfs_snapshot_opts dopts;
+        memset(&dopts, 0, sizeof dopts);
+        dopts.name = "damaged";
+        CHECK_OK(wfs_snapshot_create(d, dsrc, &dopts, &dsid));
+        wfs_store_close(d);
+
+        // The snapshot root keeps its gate (0000) through all of this: finding the tree is a
+        // readdir of snapshots/, which never has to step inside it.
+        static const char *dbfiles[] = {"/metadata.db", "/metadata.db-wal", "/metadata.db-shm"};
+        for (size_t i = 0; i < sizeof dbfiles / sizeof dbfiles[0]; ++i) {
+            char q2[4096];
+            snprintf(q2, sizeof q2, "%s%s", dstore, dbfiles[i]);
+            unlink(q2);
+        }
+        d = NULL;
+        CHECK_RC(wfs_store_open(dstore, &d), WFS_E_STORE_DAMAGED);
+        CHECK(d == NULL);
+        // ... and it did not quietly leave a new one behind.
+        char dbp[4096];
+        join(dbp, sizeof dbp, dstore, "metadata.db");
+        CHECK(!exists(dbp));
+        // The same verdict for a database that is there but is not one.
+        write_file(dbp, "this is not a database\n");
+        CHECK_RC(wfs_store_open(dstore, &d), WFS_E_STORE_DAMAGED);
+        CHECK(d == NULL);
+        // An empty store with no trees in it is not damaged, it is new.
+        char fresh[4096];
+        join(fresh, sizeof fresh, root, "fresh-store");
+        wfs_store *f2 = NULL;
+        CHECK_OK(wfs_store_open(fresh, &f2));
+        wfs_store_close(f2);
+
+        char snap[4096];
+        snprintf(snap, sizeof snap, "%s/snapshots/S%llu", dstore, (unsigned long long)dsid);
+        CHECK(chmod(snap, 0700) == 0); // so the test's own rm_rf can clear it
+    }
+
     wfs_store_close(s);
     rm_rf(root);
     printf("core_test: all OK\n");

@@ -68,6 +68,7 @@ store 目录加 `.noindex`(Spotlight)并 `tmutil addexclusion`(Time Machine),无
 | P14 | agent 越界写 | `world exec` 套 seatbelt profile:允许写 World 根、agent 配置/缓存目录、tmp;拒绝 store、快照、其他 World。不带沙盒的 agent 也至少得到 P3 的快照保护 |
 | P15 | 原地改写大文件的 COW 首写惩罚(~1ms) | 文档说明;不做特殊处理 |
 | P16 | gc 与前台争抢(T2.1) | 物理删除是全系统最贵的操作(实测 1000 个 10k 树 = 1040 万次 unlink)。它只在**游离的后台 worker** 里做:store 级非阻塞 flock `<store>/locks/gc.lock` 保证全店一个;每次唤醒只做有限一批(N 条目或 T 秒)就退出,还有活就交给新起的后继进程;4 线程 unlink 比单线程快 1.9×,但实测会让并发 `fork` 慢 51–57%,**真正管用的是占空比**——干 2 s 停 2 s,前台代价降到 ~5%,drain 变成约两倍时长(背景工作,等得起)。`setiopolicy_np(IOPOL_THROTTLE)` 实测毫无作用:瓶颈是 APFS 元数据事务,不是磁盘带宽 |
+| P17 | store 有树但 `metadata.db` 没了(M2) | **拒绝打开,绝不重建**。id 是从数据库里发的:新建一个空库就会再发一次 1,下一次 `init` 于是往已经在磁盘上的 `snapshots/S1` 上写。`wfs_store_open` 在创建任何东西之前先看:`metadata.db` 不存在、是空文件、读不了、或者打开后连 pragma 都执行不了(不是一个数据库),而 `snapshots/` / `trash/` / `pool/` 里还有条目 → `WFS_E_STORE_DAMAGED`。检测只是对这三个目录各做一次 readdir,快照的 gate 一路关着也不影响(不需要进 `S<n>/root`)。CLI 把话说全:这些树就是那个数据库的索引、id 会撞车、**`gc --reconcile` 帮不上忙**(它要读数据库才知道哪些行的树没了,而这里没的正是数据库),出路只有两条——从备份恢复 `metadata.db`,或者把整个目录挪开(`mv <store> <store>.damaged`)重开一个。空目录不算损坏,那是新 store |
 
 ## 4. C ABI 变化
 

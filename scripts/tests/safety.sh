@@ -584,6 +584,39 @@ else
     bad T2.5 "a group reaching outside the tree stays an independent copy"
 fi
 
+# ---- P17: trees in the store but no database -> refuse, never rebuild -----------------------
+# Its own store, because the point of the rule is that the store is left exactly as it was
+# found. Snapshot and world ids live in metadata.db; a fresh one hands out 1 again and the next
+# `init` writes S1 on top of the snapshots/S1 that is still on disk.
+P17STORE="$SCRATCH/p17-store"
+mkdir -p "$SCRATCH/p17-src"
+echo one > "$SCRATCH/p17-src/a.txt"
+"$WORLD" --store "$P17STORE" fs init "$SCRATCH/p17-src" --name p17 > /dev/null 2>&1
+# The gate is opened first so that the scratch cleanup can get rid of the tree afterwards.
+# Finding the tree does not need it: a readdir of snapshots/ never steps inside S1.
+chmod 0700 "$P17STORE/snapshots/S1/root" 2>/dev/null
+rm -f "$P17STORE"/metadata.db "$P17STORE"/metadata.db-wal "$P17STORE"/metadata.db-shm
+check    P17 "a store with snapshots but no metadata.db is refused" 3 -- \
+         "$WORLD" --store "$P17STORE" fs status
+has_hint P17 "the refusal says restore the db or move the store aside" "restore metadata.db" -- \
+         "$WORLD" --store "$P17STORE" fs list
+[ ! -e "$P17STORE/metadata.db" ] && ok P17 "the refused open left no new database behind" \
+                                || bad P17 "the refused open left no new database behind"
+out=$("$WORLD" --store "$P17STORE" fs gc --reconcile 2>&1)
+if echo "$out" | grep -q "gc --reconcile.*cannot help"; then
+    ok P17 "the refusal explains that gc --reconcile cannot repair this"
+else
+    bad P17 "the refusal explains that gc --reconcile cannot repair this"; echo "$out" | sed 's/^/        /'
+fi
+echo "this is not a database" > "$P17STORE/metadata.db"
+check P17 "a metadata.db that is not a database is refused too" 3 -- \
+      "$WORLD" --store "$P17STORE" fs status
+rm -f "$P17STORE/metadata.db"
+[ -f "$P17STORE/snapshots/S1/root/a.txt" ] && ok P17 "the snapshot tree is left exactly as it was" \
+                                          || bad P17 "the snapshot tree is left exactly as it was"
+check P17 "an empty store directory is new, not damaged" 0 -- \
+      "$WORLD" --store "$SCRATCH/p17-fresh" fs status
+
 echo
 "$WORLD" fs status | sed 's/^/      /'
 echo

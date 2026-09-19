@@ -96,7 +96,13 @@ enum {
     WFS_E_TRASH_DELETING = -1013, /* T2.1: the gc worker has begun unlinking this trash entry */
     WFS_E_SNAPSHOT_IN_USE = -1014,/* T2.2: an ACTIVE world (or a pool entry) still needs it */
     WFS_E_GC_BUSY = -1015,        /* T2.1: another gc worker holds <store>/locks/gc.lock */
-    WFS_E_STORE_UNREACHABLE = -1016 /* T2.3: this store cannot be opened from where we are */
+    WFS_E_STORE_UNREACHABLE = -1016, /* T2.3: this store cannot be opened from where we are */
+    /* P17: the store directory still holds snapshot trees (or a trash, or a pool) but its
+     * metadata.db is missing or unreadable. Opening such a store would create an empty
+     * database beside the orphans and hand out id 1 again, which the first `init` would then
+     * try to write to the `snapshots/S1` that is already there. Refused instead: the database
+     * has to come back from a backup, or the directory has to be moved aside. */
+    WFS_E_STORE_DAMAGED = -1017
 };
 
 /* Human-readable text for a negative errno or a WFS_E_* code. Never NULL. */
