@@ -376,6 +376,7 @@ extern "C" const char *wfs_strerror(int rc) {
     case WFS_E_GC_BUSY: return "another gc worker is running";
     case WFS_E_STORE_UNREACHABLE: return "that store cannot be opened from here";
     case WFS_E_STORE_DAMAGED: return "the store has trees in it but no readable metadata.db";
+    case WFS_E_TRASH_BLOCKED: return "a directory is in the way of this trash entry's deletion";
     default: return ::strerror(rc < 0 ? -rc : rc);
     }
 }

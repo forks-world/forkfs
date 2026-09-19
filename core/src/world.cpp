@@ -636,18 +636,35 @@ void trash_follow_deleting(String &tp) {
     if (exists(d.c_str())) tp = d;
 }
 
-// Step 0, and the reason it is a step of its own (PR #1 review, 15th round): a `<name>.deleting`
-// left beside the entry by an earlier, interrupted attempt is folded into this one -- and folding
-// it means removing a tree, which is minutes of work, while the rename below now happens under
-// the store's write lock. So the caller does this first, outside the lock. It is safe out there:
-// a `.deleting` tree is one no restore will touch and one that belongs to this entry either way
-// (claim_trash_paths). Both callers of trash_mark_deleting() call it.
-void trash_fold_leftover(const char *path) {
-    if (ends_with(path, WFS_DELETING_SUFFIX)) return;
-    String d(path);
+// PR #1 review (20th round, P1): is something sitting on the name this entry's collection
+// needs? True when the tree is still at its own name AND `<name>.deleting` is there too -- the
+// one state the collector cannot resolve by itself, because that pair is never of its making
+// (see trash_mark_deleting below). `out` gets the name of the stray, which is what an operator
+// has to be told: it is a directory in their own `.wfs-trash` as often as in the store's trash.
+// Two probes, and "cannot tell" counts as there: a name we cannot prove absent is never renamed
+// over either (12th round).
+bool trash_blocked_by(const String &trash, String &out) {
+    if (!trash.size() || ends_with(trash.c_str(), WFS_DELETING_SUFFIX)) return false;
+    if (proven_gone(trash.c_str())) return false;
+    String d(trash);
     d.append(WFS_DELETING_SUFFIX);
-    if (exists(d.c_str())) wfs::fs_remove_tree(d.c_str());
+    if (proven_gone(d.c_str())) return false;
+    out = d;
+    return true;
 }
+
+// PR #1 review (20th round, P1): there used to be a step 0 here -- trash_fold_leftover(), which
+// removed a `<name>.deleting` sitting beside the entry, recursively, as "an interrupted attempt
+// of ours". It cannot be one. Since the 15th round the rename to `.deleting` and the row update
+// that records it are ONE transaction (gc_claim_deleting, and trash_delete_now for `--now`), so
+// by our own doing exactly one of the two names exists at any instant: a crash between the
+// rename and the commit leaves the row naming X with the tree at X.deleting and X gone, which
+// is trash_follow_deleting()'s case, and a discard (5th round: row, rename, row) never writes a
+// `.deleting` name at all. So "X and X.deleting both there" is always somebody else's directory
+// -- and a world discarded from another volume keeps its trash in `<parent>/.wfs-trash`, which
+// is the user's own directory, under the entirely predictable name `W<id>-<timestamp>`. The
+// fold deleted whatever was at `W<id>-<timestamp>.deleting` without one check that it was ours.
+// Nothing folds anything now: a name we did not create is never removed and never renamed over.
 
 // Step 1. `out` receives the name the tree now has (which may be the one it already had).
 // PR #1 review (12th round): -ENOENT out of here means "at neither name, so somebody else
@@ -667,8 +684,17 @@ int trash_mark_deleting(const char *path, String &out) {
     }
     String d(path);
     d.append(WFS_DELETING_SUFFIX);
-    // A leftover from an earlier, interrupted attempt is trash_fold_leftover()'s job, and the
-    // caller has already done it outside the lock this runs under (15th round).
+    // PR #1 review (20th round, P1): and we only ever rename onto a name that is proven not to
+    // be there. rename(2) would swallow an empty directory whole and answer ENOTEMPTY for a
+    // full one, and the fold that used to run before this removed it recursively -- a user's
+    // directory, in the user's own `.wfs-trash`, destroyed on a name coincidence. Whatever is
+    // there is left exactly as it is; the entry is skipped and reported (WFS_E_TRASH_BLOCKED),
+    // and a probe that cannot answer is not an absence either (12th round).
+    if (int prc = wfs::fs_probe(d.c_str())) {
+        if (!wfs::fs_gone(prc)) return prc;
+    } else {
+        return WFS_E_TRASH_BLOCKED;
+    }
     if (int rc = wfs::fs_rename(path, d.c_str())) return rc;
     out = d;
     return 0;
@@ -1676,7 +1702,10 @@ int trash_delete_now(wfs_store *s, wfs_id id, int is_snapshot, const String &tra
     trash_follow_deleting(tp);
     if (int hrc = trash_crash_seam(4, is_snapshot, id, tp.c_str())) return hrc;
     if (tp.size()) {
-        trash_fold_leftover(tp.c_str());   // outside the lock below: this one can take minutes
+        // PR #1 review (20th round, P1): no leftover fold here, and none anywhere else -- see
+        // trash_mark_deleting(). A directory at `<tp>.deleting` is not this call's to remove,
+        // so `--now` comes back WFS_E_TRASH_BLOCKED out of the claim below with the entry and
+        // the stray both untouched, and the CLI names the directory that is in the way.
         String deleting;
         int mrc;
         {
@@ -1813,9 +1842,20 @@ namespace {
 // T2.1: has the collector already started on this trash entry? Either the row has been updated
 // to the .deleting name, or the rename happened and the process died before the row did -- the
 // name on disk is the authority in both cases.
+//
+// PR #1 review (20th round, P1): and the second case is "the tree is at `.deleting` AND NOT at
+// its own name", which is what the rename leaves behind -- exactly the pair trash_follow_deleting
+// resolves. A bare `exists(<name>.deleting)` was enough to refuse a restore while the tree sat
+// untouched at its own name, and since the fold is gone (see trash_mark_deleting) that state is
+// no longer transient: a directory somebody else left beside the entry -- in the user's own
+// `.wfs-trash`, under a name they can guess -- would tell them for ever that their world "is
+// already being deleted by the collector", which it is not. The collector's claim and the row
+// that records it are one transaction, so a tree still at its own name has been claimed by
+// nobody. ("Cannot prove it gone" counts as still there: the restore's own rename decides.)
 bool trash_is_deleting(const String &trash) {
     size_t n = trash.size(), sl = ::strlen(WFS_DELETING_SUFFIX);
     if (n > sl && !::strcmp(trash.c_str() + n - sl, WFS_DELETING_SUFFIX)) return true;
+    if (!proven_gone(trash.c_str())) return false;
     String d(trash);
     d.append(WFS_DELETING_SUFFIX);
     return exists(d.c_str());
@@ -3160,8 +3200,10 @@ bool mark_dead(wfs_store *s, const TrashJob &j) {
 // this, so the two serialise. Either the restore is first, and this re-read sees TRASHING and
 // claims nothing; or this is first, and the restore sees the row naming `.deleting`
 // (trash_is_deleting -> WFS_E_TRASH_DELETING) with its tree untouched. What is held across the
-// rename is one rename(2) inside one transaction -- microseconds, and no tree removal: the
-// leftover fold that could take minutes is trash_fold_leftover(), done by the caller outside.
+// rename is one rename(2) inside one transaction -- microseconds, and no tree removal at all.
+// (Until the 20th round the caller first folded a `<name>.deleting` leftover into this job out
+// here, because that removal could take minutes. Nothing folds anything now: this transaction
+// is why such a leftover can never be ours -- see trash_mark_deleting().)
 //
 // A crash between the rename and the commit leaves the row naming the old name with the tree at
 // the new one, which is the state trash_follow_deleting() already resolves: both names belong to
@@ -3260,6 +3302,9 @@ void gc_fail_clear(wfs_store *s, const TrashJob &j) {
 // A positive return (PR #1 review, 8th round) means the job was resolved by somebody else while
 // this collector had it queued -- a `restore` that won the rename, or another collector. Nothing
 // was done to it and nothing may be counted or reported for it.
+// WFS_E_TRASH_BLOCKED (PR #1 review, 20th round) means a directory that is not ours is sitting
+// at the `.deleting` name: nothing was done to it either, and the entry is counted apart from
+// the ones that were tried and failed, because the remedy is the operator's.
 int gc_delete_one(wfs_store *s, TrashJob &j, int threads, uint64_t *entries_freed,
                   int64_t deadline_us, int *partial) {
     // The cheap question first, on a read: most jobs that are not the collector's any more are
@@ -3269,7 +3314,6 @@ int gc_delete_one(wfs_store *s, TrashJob &j, int threads, uint64_t *entries_free
     if (wfs_test_before_trash_delete)
         wfs_test_before_trash_delete(wfs_test_before_trash_delete_ctx, j.is_snapshot, j.row,
                                      j.path.c_str());
-    trash_fold_leftover(j.path.c_str());   // outside the lock: this one can take minutes
     String deleting;
     int rc = gc_claim_deleting(s, j, deleting);
     if (rc == 1) return 1;
@@ -3301,6 +3345,20 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
     // see block sharing and du would count blocks that other worlds still hold, so the real
     // volume numbers come along next to the estimate rather than instead of it.
     out->bytes_estimate = v.tree_entries * 308;
+    // PR #1 review (20th round, P1): and the due entries the collector will not start on --
+    // something that is not ours is sitting at the `<entry>.deleting` name it renames to. It
+    // used to remove that directory recursively, so this state was invisible by construction;
+    // now nothing touches it, which means somebody has to be told it is there and where. Only
+    // entries a row claims are counted: a row-less orphan's stray is a row-less directory in
+    // <store>/trash too, and the collector takes that one on its own (5th/9th rounds).
+    for (size_t i = 0; i < v.due.size(); ++i) {
+        if (!v.due[i].row) continue;
+        String blocked;
+        if (!trash_blocked_by(v.due[i].path, blocked)) continue;
+        out->trash_blocked++;
+        if (!out->blocked_path[0])
+            copy_str(out->blocked_path, sizeof out->blocked_path, blocked.c_str());
+    }
     wfs::fs_free_space(s->dir.c_str(), &out->volume_free_bytes, &out->volume_total_bytes);
     // PR #1 review (5th round): and the abandoned fork trees that are still on disk. They are not
     // in the trash -- they are in the user's directory, named only by their CREATING row -- but
@@ -3359,6 +3417,27 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
     wfs::pool_stranded(s, &out->pool_stranded);
     gc_worker_probe(s, &out->worker_pid, &out->worker_started_at, &out->worker_done,
                     &out->worker_remaining);
+    return 0;
+}
+
+// PR #1 review (20th round, P1): which directory is in the way of this row's collection. The
+// caller is a `discard --now` that has just been answered WFS_E_TRASH_BLOCKED, and what it owes
+// the user is the name of the thing to look at -- in the EXDEV case that is a directory in
+// their own `<parent>/.wfs-trash`, put there by something that is not this store.
+extern "C" int wfs_trash_blocked_path(wfs_store *s, wfs_id id, int is_snapshot, char *buf,
+                                      size_t cap) {
+    if (!s || !id || !buf || !cap) return -EINVAL;
+    String tp;
+    {
+        Guard g(s->mu);
+        if (int rc = is_snapshot ? snapshot_trash_path(s, id, tp) : world_trash_path(s, id, tp))
+            return rc;
+    }
+    trash_follow_deleting(tp);
+    String blocked;
+    if (!trash_blocked_by(tp, blocked)) return -ENOENT;
+    if (blocked.size() + 1 > cap) return -ENAMETOOLONG;
+    copy_str(buf, cap, blocked.c_str());
     return 0;
 }
 
@@ -3739,6 +3818,19 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                 // collector finished it. Nothing to count, nothing to report, nothing to retry
                 // (PR #1 review, 8th round).
                 rep.entries_freed += freed;
+                continue;
+            }
+            if (drc == WFS_E_TRASH_BLOCKED) {
+                // PR #1 review (20th round, P1): a directory nothing in this store named is at
+                // the `.deleting` name this entry has to be renamed to. It is not removed and
+                // not renamed over -- the fold that used to do exactly that is gone -- so the
+                // entry stays in the trash and is counted, with `gc --status` naming the
+                // directory. Same retry cap as a failure: the first few wakes come back for it
+                // (the stray may be somebody else's temporary), after that the collector stops
+                // waking itself for something only the operator can clear.
+                rep.trash_blocked++;
+                rep.entries_freed += freed;
+                if (gc_fail_bump(s, jobs[i]) < wfs::kGcFailCap) rep.work_remains = 1;
                 continue;
             }
             if (drc != 0) {

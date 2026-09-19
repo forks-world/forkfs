@@ -819,6 +819,34 @@ static int cmd_inspect(wfs_store *s, const char *arg) {
 
 // T2.2: `discard S<n>`. The refusal has to name what is holding the snapshot, because "in use"
 // with no name is the least actionable message this CLI could print.
+// PR #1 review (20th round, P1): `discard --now` on an entry whose working name is taken. The
+// collector renames a trash entry to `<name>.deleting` before it unlinks it, and that rename now
+// refuses to touch anything that is already there -- the fold that used to remove such a
+// directory recursively could not tell a leftover of ours from the user's own, and for a world
+// discarded from another volume the trash is `<parent>/.wfs-trash`, the user's directory, with
+// an entirely predictable name. So nothing is deleted here and nothing is renamed over; the one
+// thing left to do is name the directory that is in the way, because only its owner can decide
+// what happens to it.
+static int trash_blocked_refusal(wfs_store *s, wfs_id id, int is_snapshot) {
+    char path[WFS_PATH_MAX];
+    path[0] = 0;
+    wfs_trash_blocked_path(s, id, is_snapshot, path, sizeof path);
+    char why[WFS_PATH_MAX + 320];
+    if (path[0])
+        snprintf(why, sizeof why,
+                 "%c%llu: %s is in the way. The collector renames a trash entry to that name "
+                 "before deleting it, and this directory is not one it made -- so nothing here "
+                 "will remove it or rename over it",
+                 is_snapshot ? 'S' : 'W', (unsigned long long)id, path);
+    else
+        snprintf(why, sizeof why,
+                 "%c%llu: a directory with the collector's working name (`<entry>.deleting`) is "
+                 "in the way of this entry's deletion, and it is not one this store made",
+                 is_snapshot ? 'S' : 'W', (unsigned long long)id);
+    return refuse(why, "move that directory aside, then run the same command again"
+                       "   (`world fs gc --status` names it too)");
+}
+
 static int cmd_discard_snapshot(wfs_store *s, wfs_id sid, int now, int force, int64_t retention) {
     wfs_snapshot_rec sr;
     int rc = wfs_snapshot_info(s, sid, &sr);
@@ -832,6 +860,9 @@ static int cmd_discard_snapshot(wfs_store *s, wfs_id sid, int now, int force, in
         return refuse(why, "world fs discard S<n> --now   (deletes it now instead of waiting)");
     }
     rc = wfs_snapshot_discard(s, sid, now, force);
+    // Before the --force diagnosis below: this one is not about the pool at all, and the
+    // snapshot has not been touched either (PR #1 review, 20th round).
+    if (rc == WFS_E_TRASH_BLOCKED) return trash_blocked_refusal(s, sid, 1);
     if (rc == WFS_E_SNAPSHOT_IN_USE) {
         // Say who. Worlds first (they are the hard refusal), then pool entries.
         char why[512];
@@ -956,6 +987,7 @@ static int cmd_discard(wfs_store *s, int argc, char **argv) {
         return refuse(why, "world fs verify <the path it was moved to>");
     }
     int rc = wfs_world_discard(s, w, now, force);
+    if (rc == WFS_E_TRASH_BLOCKED) return trash_blocked_refusal(s, w, 0);
     if (rc == WFS_E_WORLD_BUSY) return busy_refusal(s, w, "discard");
     if (rc == WFS_E_UNREGISTERED) return explain_path(s, r.path, rc, "discard");
     if (rc == -ESTALE) {
@@ -1055,10 +1087,15 @@ static void gc_log_line(const wfs_gc_report *rep, double secs) {
         cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
     // What this wake leaves behind. An entry it could not delete is never "trash empty":
     // something is still in there and the next command has to be able to see that (PR #1 review).
-    char state[160];
-    if (rep->trash_failed)
-        snprintf(state, sizeof state, "  (%llu entr%s could not be deleted%s)",
-                 (unsigned long long)rep->trash_failed, rep->trash_failed == 1 ? "y" : "ies",
+    char state[224];
+    // PR #1 review (20th round): an entry blocked by a directory sitting on its `.deleting`
+    // working name is one more thing still in the trash, so it belongs in the same count -- with
+    // its own reason, because no number of retries will clear that one.
+    uint64_t stuck = rep->trash_failed + rep->trash_blocked;
+    if (stuck)
+        snprintf(state, sizeof state, "  (%llu entr%s could not be deleted%s%s)",
+                 (unsigned long long)stuck, stuck == 1 ? "y" : "ies",
+                 rep->trash_blocked ? ", a directory in the way of the collector's working name" : "",
                  rep->work_remains ? ", retrying" : "; left in the trash");
     else
         snprintf(state, sizeof state, "%s",
@@ -1163,6 +1200,16 @@ static int cmd_gc_status(wfs_store *s, int64_t retention) {
     if (ts.pool_stranded)
         printf("pool:      %llu stale pre-clone entr%s waiting for the collector\n",
                (unsigned long long)ts.pool_stranded, ts.pool_stranded == 1 ? "y" : "ies");
+    // PR #1 review (20th round, P1): and the due entries the collector will not start on,
+    // because a directory it did not put there holds the `<entry>.deleting` name it renames to.
+    // Naming it is the whole point: it is as likely to be in the user's own `.wfs-trash` (a
+    // world discarded from another volume keeps its trash beside itself) as in <store>/trash,
+    // and only its owner can say what should happen to it.
+    if (ts.trash_blocked)
+        printf("blocked:   %llu trash entr%s cannot be collected: %s is in the way"
+               " (not a directory this store made; move it aside)\n",
+               (unsigned long long)ts.trash_blocked, ts.trash_blocked == 1 ? "y" : "ies",
+               ts.blocked_path[0] ? ts.blocked_path : "a `<entry>.deleting` directory");
     return EX_OK;
 }
 
@@ -1249,6 +1296,24 @@ static int cmd_gc(wfs_store *s, int argc, char **argv) {
                 rep.pool_failed == 1 ? "is" : "are", rep.pool_failed == 1 ? "it" : "them",
                 rep.work_remains ? "the collector will try again."
                                  : "it has failed too often to keep retrying by itself.");
+    }
+    if (rep.trash_blocked) {
+        // PR #1 review (20th round, P1): not a failed deletion -- a deletion that was never
+        // started, because a directory this store did not make is sitting at the `.deleting`
+        // name the entry has to be renamed to. It used to be removed recursively as "a leftover
+        // of ours", which since the 15th round it cannot be (the rename and the row that
+        // records it commit together, so only one of the two names is ever ours). Nothing will
+        // clear it but its owner, so the note says where to look.
+        wfs_trash_stat bs;
+        memset(&bs, 0, sizeof bs);
+        wfs_gc_status(s, retention, &bs);
+        fprintf(stderr,
+                "world: note: %llu trash entr%s could not be collected: a directory is in the way of\n"
+                "world:       the name the collector renames to before deleting (`<entry>.deleting`),\n"
+                "world:       and it is not one this store made -- so nothing touched it%s%s\n"
+                "world:       Move it aside and the next collection takes the entry.\n",
+                (unsigned long long)rep.trash_blocked, rep.trash_blocked == 1 ? "y" : "ies",
+                bs.blocked_path[0] ? ": " : ".", bs.blocked_path[0] ? bs.blocked_path : "");
     }
     if (rep.trash_failed) {
         // Never let a failed delete read as an empty trash: say what is still in there, and

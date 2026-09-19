@@ -111,7 +111,16 @@ enum {
      * database beside the orphans and hand out id 1 again, which the first `init` would then
      * try to write to the `snapshots/S1` that is already there. Refused instead: the database
      * has to come back from a backup, or the directory has to be moved aside. */
-    WFS_E_STORE_DAMAGED = -1017
+    WFS_E_STORE_DAMAGED = -1017,
+    /* PR #1 review (20th round): a directory is already sitting at the name the collector
+     * renames a trash entry to before it deletes it (`<entry>.deleting`), and it is not ours.
+     * Since the 15th round that rename and the row that records it commit in one transaction,
+     * so exactly one of the two names is ever this store's; both existing means somebody else
+     * made the second one. A world discarded from another volume keeps its trash in a
+     * user-visible `.wfs-trash` beside it and the name is predictable, so the stray is never
+     * removed and never renamed over: the entry is skipped, reported by `gc --status` with the
+     * directory named, and `discard --now` refuses with this code. */
+    WFS_E_TRASH_BLOCKED = -1018
 };
 
 /* Human-readable text for a negative errno or a WFS_E_* code. Never NULL. */
@@ -651,6 +660,15 @@ typedef struct wfs_gc_report {
      * work_remains -- it leaked until somebody ran gc by hand. The row is kept while its tree
      * is, counted here and by `gc --status`, and retried under the same cap. */
     uint64_t pool_failed;
+    /* PR #1 review (20th round): trash entries the collector would not even start on, because a
+     * directory it did not put there is sitting at the `<entry>.deleting` name it renames to.
+     * It used to remove that directory recursively first ("an interrupted attempt of ours"),
+     * which since the 15th round it cannot be: the rename and the row that records it commit
+     * together, so one of the two names exists at a time. The entry stays in the trash, the
+     * stray is not touched, and `gc --status` names it. Counted separately from trash_failed
+     * because the remedy is the operator's -- look at that directory and move it away -- not
+     * another wake of the collector. */
+    uint64_t trash_blocked;
 } wfs_gc_report;
 
 /* retention_secs < 0 uses the default (7 days). Synchronous and complete: every due trash entry
@@ -722,6 +740,12 @@ typedef struct wfs_trash_stat {
      * also waiting for the collector: removing one is a whole tree, so a wake that runs out of
      * time leaves the rest of them for its successor. */
     uint64_t pool_stranded;
+    /* PR #1 review (20th round): due trash entries the collector cannot start on, because a
+     * directory nothing in this store named is sitting at the `<entry>.deleting` name it has to
+     * rename to. blocked_path is the first such directory (empty when trash_blocked is 0), so
+     * an operator is told which one to look at rather than only that something is stuck. */
+    uint64_t trash_blocked;
+    char blocked_path[WFS_PATH_MAX];
     /* The worker, from <store>/locks/gc.lock. pid is 0 when nobody is running. */
     int64_t worker_pid, worker_started_at;
     uint64_t worker_done, worker_remaining; /* trash entries finished / left, as it last wrote */
@@ -729,6 +753,12 @@ typedef struct wfs_trash_stat {
 
 /* `world fs gc --status`. Never blocks and never spawns anything. */
 int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_stat *out);
+
+/* PR #1 review (20th round): the directory that is in the way of THIS row's collection, for a
+ * caller that has just been answered WFS_E_TRASH_BLOCKED and has to say which one it is. Fills
+ * `buf` with `<trash_path>.deleting` and returns 0 when that directory is there and the entry is
+ * still at its own name; -ENOENT when nothing is in the way. Two lstat(2)s and one row read. */
+int wfs_trash_blocked_path(wfs_store *s, wfs_id id, int is_snapshot, char *buf, size_t cap);
 
 /* The same question reduced to what a command needs before deciding to spawn a worker: is there
  * due work, and is somebody already on it? Two indexed counts and one readdir that stops at the

@@ -1580,6 +1580,75 @@ if command -v sqlite3 > /dev/null 2>&1; then
     fi
 fi
 
+# ---- PR #1 review (20th round, P1): a directory at the collector's working name is not ours ---
+# Deleting a trash entry starts with one rename: `<entry>` -> `<entry>.deleting`. A
+# `trash_fold_leftover()` used to run before it and remove whatever was already at that name,
+# recursively, on the theory that it could only be an interrupted attempt of ours. Since the 15th
+# round it cannot be: the rename and the row update that records it commit in ONE transaction, so
+# by our own doing exactly one of the two names exists at any instant (a crash in between leaves
+# the tree at `.deleting` and the entry gone, which is the case trash_follow_deleting() resolves).
+# Both names there at once therefore means somebody else made the second one -- and for a world
+# discarded from another volume the trash is `<parent>/.wfs-trash`, the user's own directory,
+# under the entirely predictable name `W<id>-<timestamp>`. The fold deleted the user's directory.
+# Now nothing folds anything: the entry is skipped, counted and named, and `--now` refuses.
+B20STORE="$SCRATCH/blocked20-store"
+b20() { "$WORLD" --store "$B20STORE" "$@"; }
+B20SRC="$SCRATCH/blocked20-src"
+mkdir -p "$B20SRC"
+echo x > "$B20SRC/f.txt"
+B20S=$(b20 fs init "$B20SRC" --name blocked20 2>/dev/null | awk '/^S[0-9]/{print $1}')
+B20W=$(b20 fs fork --from "$B20S" --to "$SCRATCH/blocked20-w" --name b20w 2>/dev/null | awk '/^W[0-9]/{print $1}')
+b20 fs discard "$B20W" > /dev/null 2>&1
+B20ENTRY=$(ls -d "$B20STORE/trash/$B20W"-* 2>/dev/null | head -1)
+if [ -n "$B20ENTRY" ]; then
+    # The stray: a directory of the user's, with a file in it, at exactly the name the collector
+    # is about to want. Nothing in the store ever wrote this name.
+    mkdir -p "$B20ENTRY.deleting/keep"
+    echo "not the collector's" > "$B20ENTRY.deleting/keep/user.txt"
+    out=$(b20 fs discard "$B20W" --now 2>&1); rc=$?
+    if [ "$rc" = 3 ] && [ -f "$B20ENTRY.deleting/keep/user.txt" ] && [ -d "$B20ENTRY" ]; then
+        ok PR20 "--now refuses rather than remove a directory it did not name"
+    else
+        bad PR20 "--now refuses rather than remove a directory it did not name (exit $rc)"
+        echo "$out" | sed 's/^/        /'
+    fi
+    echo "$out" | grep -q "$B20ENTRY.deleting" \
+        && ok PR20 "and the refusal names the directory that is in the way" \
+        || { bad PR20 "and the refusal names the directory that is in the way"; echo "$out" | sed 's/^/        /'; }
+    out=$(b20 fs gc --now --retention 0 2>&1)
+    if [ -f "$B20ENTRY.deleting/keep/user.txt" ] && [ -d "$B20ENTRY" ]; then
+        ok PR20 "the collector leaves both the stray and the entry alone"
+    else
+        bad PR20 "the collector leaves both the stray and the entry alone"
+        echo "$out" | sed 's/^/        /'
+    fi
+    echo "$out" | grep -q "could not be collected" \
+        && ok PR20 "and gc says so instead of reporting a clean run" \
+        || { bad PR20 "and gc says so instead of reporting a clean run"; echo "$out" | sed 's/^/        /'; }
+    b20 fs gc --status --retention 0 | grep -q "^blocked: .*$B20ENTRY.deleting" \
+        && ok PR20 "and gc --status names it for whoever has to clear it" \
+        || { bad PR20 "and gc --status names it for whoever has to clear it"; b20 fs gc --status --retention 0 | sed 's/^/        /'; }
+    # The entry was never renamed, so it is not `.deleting` to anybody: `restore` still works.
+    # (Checked here rather than after the collection below, which is where it stops being true.)
+    b20 fs restore "$B20W" > /dev/null 2>&1 \
+        && ok PR20 "and the world can still be restored out of the trash" \
+        || { bad PR20 "and the world can still be restored out of the trash"; b20 fs list | sed 's/^/        /'; }
+    # Take the stray away and discard the world again: the entry the collector refused to touch
+    # is collected exactly as it always would have been. Nothing about it was ever broken.
+    rm -rf "$B20ENTRY.deleting"
+    b20 fs discard "$B20W" > /dev/null 2>&1
+    b20 fs gc --now --retention 0 > /dev/null 2>&1
+    if [ -z "$(ls -A "$B20STORE/trash" 2>/dev/null)" ]; then
+        ok PR20 "and once the stray is out of the way the entry is collected as usual"
+    else
+        bad PR20 "and once the stray is out of the way the entry is collected as usual"
+        ls -A "$B20STORE/trash" | sed 's/^/        /'
+    fi
+else
+    bad PR20 "the discarded world has a trash entry"
+fi
+
+
 echo
 "$WORLD" fs status | sed 's/^/      /'
 echo
