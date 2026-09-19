@@ -1244,6 +1244,41 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第二十一轮:正在被删的树,不能再发给任何人(2026-09-20)
+
+第二十一轮,Codex 一条 P1。第十六轮把 `wfs_pool_drain()` 改成**先删树、证明没了才删行**——这样一个
+EPERM 不会留下一棵没人认领的预克隆世界。可是**它留下的那一行还是一行普通的 READY 行**,而
+`pool_claim()` **不拿 pool 锁**(也不能拿:fork 不许等 filler),只认 `state=1` + 快照还是那个快照。
+于是 `fs_remove_tree()` 正在**遍历**那棵树的时候,一个 pool fork 可以把它认领走、`rename` 到用户的
+`--to`、提交一个 ACTIVE 世界——`fork` 返回 0,世界里少文件。修法是把"这一行还算不算发得出去的条目"
+写进行里:**两步,行先走,树后删。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `PRRT_kwDOUf7jGc6kEE_b` | `pool.cpp` `wfs_pool_drain()`,以及每一处读 `pool.state` 的地方 | drain 先把行读出来,然后逐条 `fs_remove_tree(tmp)` + `fs_remove_tree(path)`,只有两个名字都 `proven_gone()` 才删行(第十六轮)。删除**不是一步**:它是一趟 walk,中间那棵树是"删了一半"的。而这段时间里行还是 READY,`pool_claim()` 在另一个 BEGIN IMMEDIATE 里照样能把它取走——claim 不拿 pool 锁,drain 的 flock 拦不住它。结果:fork 把半棵树 rename 到 `--to`,世界行记的 `entries` 是快照的数目,树里却少文件,而且 `fork` 退出 0。反过来那一半是对的:claim 先提交的话,行已经在 claim 的事务里被删掉了 | **加第三个状态 `POOL_DRAINING = 2`(`pool.h`),drain 改成三步。**(1) 一个 BEGIN IMMEDIATE 把行 `UPDATE pool SET state=2 WHERE id=? AND path=?` 并提交;`sqlite3_changes()` 就是答案——改到了,这棵树归 drain;**改到 0 行**,说明 fork 抢先一步把行连同 claim 一起提交了,那棵树现在归它的 CREATING 世界行,drain **跳过、一根指头都不碰**。claim 与这个事务都是 BEGIN IMMEDIATE,SQLite 的写锁让两者**必有先后**。(2) 删树,和第十六轮一模一样。(3) 只在两个名字都证明没了、并且行**还是**这次 drain 写的那行时才 `DELETE … WHERE id=? AND state=2 AND path=?`。删不掉 → 行留在 DRAINING、errno 原样返回(`discard --force` 照旧失败,快照不动)。**每一个读 `state` 的地方都过了一遍**:`pool_claim` 只认 `state=1`(DRAINING 天然发不出去,这就是整条修法的支点);`ready_count`(`pool ready`、`fork` 的 `pool_left`、`pool fill` 的目标数)同样只数 `state=1`,所以 DRAINING **不算 ready、也不挡 fill 补仓**——它是一棵正在出门的树;`pool_scan`(`pool_collect` / `pool_stranded`)把 DRAINING **无条件判死**,不再走"filler 是不是还活着"那条(drain 和 fill 拿同一把 pool 锁,不可能有活 filler),于是 gc 就是它的重试路径,按共享失败上限;第九轮那次"删之前重问一遍"的 `pool_row_still_doomed_locked()` 同样接受 `state=2`;`wfs_pool_status` 把它记进 `stale`(记成 `building` 等于说"有人在克隆",记成 `ready` 等于答应 fork 一个条目);`gc --status` 的 `pool_stranded` 因此自动数到它;`pool_return` 插的是**新行**(`state=1`),不会盖在 DRAINING 上;`snapshot_refs_locked` 数的是 `COUNT(*)`,DRAINING 照样是引用,所以不带 `--force` 的 discard 仍然拒绝。**schema 不动**:`state` 是普通 INTEGER 列,没有约束,不需要迁移、不动版本号;老版本 core 读到 2 只会当成"不是 READY",既发不出去、也会被它自己的 gc 当成 filler 死掉的行收走 | `6424b47` |
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **266 passed, 0 failed**(新增 3 条 PR21,改写
+第十六轮那条关于 `gc --status` 的断言);`check-deps.sh` 全绿。(`m1_criteria.sh` 本轮跳过。)
+
+先把测试跑红过(新缝 `wfs_test_in_pool_drain`,phase 0 = 行变状态之前,phase 1 = 提交之后、删树之前):
+phase 1 的钩子先把条目里的 `b.txt` unlink 掉——`fs_remove_tree()` 是一趟 walk,fork 撞进去看见的
+正是这个形状——然后在**另一个 store 句柄**上 fork 一次。**老代码**:`fork` 返回 0、`from_pool=1`,
+世界行记 `entries=4`(快照的数目),而 `b.txt` **不在树里**(`read_file` 回 `-ENOENT`)。**新代码**:
+`from_pool=0`——fork 自己克隆一棵,`a.txt`/`b.txt`/`sub/c.txt` 三个文件都在,`entries` 与快照一致,
+drain 照样把那个条目删掉(`removed=1`)。
+
+新增测试:
+
+- `core_test`(P1,一个块三段):(1) 上面那一段;(2) 镜像——phase 0 时 fork 先提交,drain 的
+  `UPDATE` 改到 0 行、**跳过**这棵树,世界完整、`removed=0`;(3) 删不掉的那种——给条目里的 `sub`
+  加 owner deny `delete,delete_child` 的 ACL,drain 回 errno、行 `state=2`(直接查库)、
+  `pool ready` 是 0、`pool status` 记成 stale(不是 ready、不是 building)、`gc --status` 的
+  `pool_stranded ≥ 1`、这期间的 fork 只会自己克隆、`discard S<n> --force` 回**同一个** errno 而快照
+  仍是 ACTIVE;ACL 拿掉之后一趟 `gc` 把树和行都收走,`pool_stranded` 归零。
+- `safety.sh`(3 条 PR21,接在第十六轮那组后面):行是 DRAINING(`sqlite3` 查 `pool.state`)、
+  `gc --status` **数得到**它、这期间 `fork` 的输出里没有 `(pool)` 而树是完整的。第十六轮原来那条
+  "`gc --status` 什么都不该报"正是本轮要改的行为:那棵树**确实**在等 collector,报出来才对。
+
 #### PR #1 review 第二十轮:不是我们起的名字,就不是我们留下的东西(2026-09-20)
 
 第二十轮,Codex 两条(一条 P1、一条 P2),都是同一条老规矩的漏网之鱼:**一棵树是不是我们的,
