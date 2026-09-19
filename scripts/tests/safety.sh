@@ -1427,6 +1427,47 @@ else
 fi
 
 
+# ---- PR #1 review (12th round): a reconciled snapshot's stump that will not go keeps its row ---
+# `gc --reconcile` marked the row DEAD first and then removed <store>/snapshots/S<n> with the
+# result thrown away. An S<n> that would not go (an ACL, an EPERM, a transient EIO) leaked for
+# ever after that: reconciliation only ever scans ACTIVE rows and the suffix sweep only
+# `*.wfs-tmp`, so nothing left in the store knew that directory was rubbish, nothing counted it
+# and nothing came back for it. Same rule as the 5th, 7th and 8th rounds: a tree gc could not
+# remove is not a tree gc removed, so the removal comes first and the row is buried only when
+# the directory is confirmed gone.
+if command -v sqlite3 > /dev/null 2>&1; then
+    R12SRC="$SCRATCH/r12src"
+    mkdir -p "$R12SRC"
+    echo x > "$R12SRC/f.txt"
+    "$WORLD" fs init "$R12SRC" --name r12 > /dev/null 2>&1
+    R12ID=$(sqlite3 "$WORLD_STORE/metadata.db" "SELECT id FROM snapshots WHERE name='r12';")
+    R12DIR="$WORLD_STORE/snapshots/S$R12ID"
+    chmod 0700 "$R12DIR/root"          # the gate, so this test can take the root away
+    rm -rf "$R12DIR/root"              # the path the row records is gone: the row is dangling
+    mkdir -p "$R12DIR/keep"
+    echo x > "$R12DIR/keep/f.txt"
+    chmod +a "$(id -un) deny delete,delete_child,add_file" "$R12DIR/keep"
+    out=$("$WORLD" fs gc --reconcile 2>&1)
+    R12STATE=$(sqlite3 "$WORLD_STORE/metadata.db" "SELECT state FROM snapshots WHERE id=$R12ID;")
+    if [ -e "$R12DIR/keep/f.txt" ] && [ "$R12STATE" = 1 ]; then
+        ok PR12 "a stump reconcile cannot remove keeps its row"
+    else
+        bad PR12 "a stump reconcile cannot remove keeps its row (state $R12STATE)"
+        echo "$out" | sed 's/^/        /'
+    fi
+    echo "$out" | grep -q "could not be removed" \
+        && ok PR12 "and gc says so instead of reporting the snapshot reconciled" \
+        || { bad PR12 "and gc says so instead of reporting the snapshot reconciled"; echo "$out" | sed 's/^/        /'; }
+    # Take the ACL away and the next reconcile finishes what it started: stump gone, row dead.
+    chmod -N "$R12DIR/keep"
+    "$WORLD" fs gc --reconcile > /dev/null 2>&1
+    R12STATE=$(sqlite3 "$WORLD_STORE/metadata.db" "SELECT state FROM snapshots WHERE id=$R12ID;")
+    if [ ! -e "$R12DIR" ] && [ "$R12STATE" = 3 ]; then
+        ok PR12 "once it can be removed the next reconcile removes it and buries the row"
+    else
+        bad PR12 "once it can be removed the next reconcile removes it and buries the row (state $R12STATE)"
+    fi
+fi
 echo
 "$WORLD" fs status | sed 's/^/      /'
 echo

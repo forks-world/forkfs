@@ -3223,6 +3223,35 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
         // only when it was this update that changed it.
         if (o.flags & WFS_GC_RECONCILE) {
             for (size_t i = 0; i < dead_snaps.size(); ++i) {
+                // The directory the row named is gone, but <store>/snapshots/S<n> may still
+                // hold the manifest or a stump; it goes with the row.
+                //
+                // PR #1 review (12th round): it goes *before* the row, and the row is buried
+                // only once it is confirmed gone -- the same rule as the 5th, 7th and 8th
+                // rounds. The removal used to run after the UPDATE with its result thrown
+                // away, and an S<n> that would not budge (an ACL, an EPERM, a transient EIO)
+                // then leaked for ever: reconciliation scans ACTIVE rows and the suffix sweep
+                // only `*.wfs-tmp`, so the DEAD row left nothing in the store that knew the
+                // directory was rubbish, nothing counted it, and nothing ever came back. When
+                // it will not go the row stays ACTIVE -- it is already reported as dangling,
+                // which is exactly what it is -- and the tree is counted in tmp_failed and
+                // retried under the shared per-path failure cap.
+                String dir = numbered(snaps.c_str(), 'S', dead_snaps[i], nullptr);
+                TrashJob j;
+                j.path = dir;
+                j.row = dead_snaps[i];
+                j.is_snapshot = 1;
+                int partial = 0;
+                wfs::fs_remove_tree(dir.c_str(), deadline_us, &partial);
+                // Out of time, not stuck: nothing is counted as a failure and the successor
+                // carries on from here, with the row exactly as it found it.
+                if (partial) { rep.work_remains = 1; break; }
+                if (!proven_gone(dir.c_str())) {
+                    rep.tmp_failed++;
+                    if (gc_fail_bump(s, j) < wfs::kGcFailCap) rep.work_remains = 1;
+                    continue;
+                }
+                gc_fail_clear(s, j);
                 bool changed = false;
                 {
                     Guard g(s->mu);
@@ -3238,10 +3267,6 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                     t.commit();
                 }
                 if (!changed) continue;   // the row moved on: not this collector's to bury
-                // The directory the row named is gone, but <store>/snapshots/S<n> may still hold
-                // the manifest or a stump; take it with the row.
-                String dir = numbered(snaps.c_str(), 'S', dead_snaps[i], nullptr);
-                wfs::fs_remove_tree(dir.c_str());
                 rep.snapshots_reconciled++;
             }
             for (size_t i = 0; i < dead_worlds.size(); ++i) {
