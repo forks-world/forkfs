@@ -788,6 +788,14 @@ extern void *wfs_test_before_trash_delete_ctx;
 extern void (*wfs_test_before_trash_orphans)(void *ctx);
 extern void *wfs_test_before_trash_orphans_ctx;
 
+/* And the pool collector's equivalent (PR #1 review, 9th round): called once per pool_collect(),
+ * after the pool rows have been read and before the trees they doom are removed and the
+ * directories nothing claims are swept. What a test does in there is fill the pool, or fork from
+ * it, on a second handle -- both of which produce a tree the row snapshot has never heard of.
+ * NULL unless a test sets it; nothing in the library ever assigns it. */
+extern void (*wfs_test_before_pool_sweep)(void *ctx);
+extern void *wfs_test_before_pool_sweep_ctx;
+
 /* And the thing no test can provoke on a healthy machine: a pthread_create that fails for one
  * worker slot and succeeds for a later one. A bit set here refuses that slot (slots 0..31); 0,
  * the value it has everywhere else, means every slot is started normally. */

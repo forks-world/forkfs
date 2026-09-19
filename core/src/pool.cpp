@@ -18,6 +18,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// The pool collector's own scan window (PR #1 review, 9th round): between the row snapshot
+// pool_scan takes and the removals that act on it. A filler or a fork that lands in there
+// produces a tree that snapshot has never heard of. Nothing in the library ever assigns these.
+extern "C" void (*wfs_test_before_pool_sweep)(void *ctx) = nullptr;
+extern "C" void *wfs_test_before_pool_sweep_ctx = nullptr;
+
 namespace wfs {
 
 namespace {
@@ -400,6 +406,28 @@ int pool_scan(wfs_store *s, Vec<wfs_id> &rows, Vec<String> &trees, Vec<String> &
     return 0;
 }
 
+// PR #1 review (9th round), P18: the same question pool_scan's `live` answers from a snapshot,
+// asked of the live rows instead -- does any row name this tree right now? A pool row names its
+// path and that path plus `.wfs-tmp` (the name it clones into), and a fork's CREATING world row
+// names the entry it claimed through tmp_path. The caller holds s->mu.
+bool pool_path_claimed_locked(wfs_store *s, const String &p) {
+    String base(p);
+    size_t n = base.size(), sl = ::strlen(WFS_TMP_SUFFIX);
+    if (n > sl && !::strcmp(base.c_str() + n - sl, WFS_TMP_SUFFIX)) base.resize(n - sl);
+    {
+        Stmt q(s->db, "SELECT 1 FROM pool WHERE path=? OR path=?");
+        if (!q.ok()) return true;   // cannot tell, and "cannot tell" is never "delete it"
+        q.text(1, p.c_str());
+        q.text(2, base.c_str());
+        if (q.row()) return true;
+    }
+    Stmt w(s->db, "SELECT 1 FROM worlds WHERE state=0 AND (tmp_path=? OR tmp_path=?)");
+    if (!w.ok()) return true;
+    w.text(1, p.c_str());
+    w.text(2, base.c_str());
+    return w.row();
+}
+
 // One pool tree's key in the store's shared gc retry counter (internal.h). The path, because
 // that is what a pool entry is: <store>/pool/S<n>/<uuid>, drawn once and never reused. A row and
 // the row-less directory it leaves behind therefore go on counting as one thing.
@@ -419,42 +447,61 @@ uint64_t pool_sweep_orphans(wfs_store *s, const Vec<String> &live, bool remove, 
                             int *work_remains = nullptr) {
     uint64_t n = 0;
     String root = pool_root(s);
-    DIR *d = ::opendir(root.c_str());
-    if (!d) return 0;
-    while (struct dirent *e = ::readdir(d)) {
-        if (e->d_name[0] == '.') continue;
-        String sub = joinp(root.c_str(), e->d_name);
-        DIR *sd = ::opendir(sub.c_str());
-        if (!sd) continue;
-        while (struct dirent *ee = ::readdir(sd)) {
-            if (ee->d_name[0] == '.') continue;
-            String p = joinp(sub.c_str(), ee->d_name);
-            bool wanted = false;
-            for (size_t i = 0; i < live.size(); ++i)
-                if (!::strcmp(live[i].c_str(), p.c_str())) { wanted = true; break; }
-            if (wanted) continue;
-            if (!remove) { ++n; continue; }
-            if (deadline_us && fs_mono_us() >= deadline_us) {
-                if (out_of_time) *out_of_time = true;
-                break;
+    Vec<String> subs, cand;
+    {
+        DIR *d = ::opendir(root.c_str());
+        if (!d) return 0;
+        while (struct dirent *e = ::readdir(d)) {
+            if (e->d_name[0] == '.') continue;
+            String sub = joinp(root.c_str(), e->d_name);
+            DIR *sd = ::opendir(sub.c_str());
+            if (!sd) continue;
+            subs.emplace_back(sub);
+            while (struct dirent *ee = ::readdir(sd)) {
+                if (ee->d_name[0] == '.') continue;
+                String p = joinp(sub.c_str(), ee->d_name);
+                bool wanted = false;
+                for (size_t i = 0; i < live.size(); ++i)
+                    if (!::strcmp(live[i].c_str(), p.c_str())) { wanted = true; break; }
+                if (!wanted) cand.emplace_back(p);
             }
-            int partial = 0;
-            int rc = fs_remove_tree(p.c_str(), deadline_us, &partial);
-            if (partial) { if (out_of_time) *out_of_time = true; break; }
-            if (rc == 0 && !exists(p.c_str())) { ++n; gc_fail_clear(s, pool_fail_key(p).c_str()); continue; }
-            // PR #1 review (8th round): it did not go. Nothing else in the store names this
-            // directory -- the row it belonged to is gone or never existed -- so saying nothing
-            // about it means it leaks silently until somebody runs gc by hand. Count it, and
-            // keep the worker chain coming back for it under the same cap a trash entry gets.
-            if (failed) (*failed)++;
-            if (gc_fail_bump(s, pool_fail_key(p).c_str()) < kGcFailCap && work_remains)
-                *work_remains = 1;
+            ::closedir(sd);
         }
-        ::closedir(sd);
-        if (out_of_time && *out_of_time) break;
-        if (remove) ::rmdir(sub.c_str()); // empty S<n> directories go too; harmless otherwise
+        ::closedir(d);
     }
-    ::closedir(d);
+    // PR #1 review (9th round), P18: `live` is pool_scan's snapshot of the rows, and the readdir
+    // above is not. A filler that inserts its CREATING row after the scan has its `.wfs-tmp`
+    // deleted out from under the clone it is writing -- and a partially removed entry then goes
+    // on to be published READY -- while a fork that claims an entry in the same window has the
+    // tree it is about to rename taken away. So every apparent orphan is re-asked of the live
+    // rows, under the store mutex, immediately before it is removed (or, for `gc --status`,
+    // counted: the report has to say what the collector would actually touch).
+    for (size_t i = 0; i < cand.size(); ++i) {
+        const String &p = cand[i];
+        {
+            Guard g(s->mu);
+            if (pool_path_claimed_locked(s, p)) continue;
+        }
+        if (!remove) { ++n; continue; }
+        if (deadline_us && fs_mono_us() >= deadline_us) {
+            if (out_of_time) *out_of_time = true;
+            break;
+        }
+        int partial = 0;
+        int rc = fs_remove_tree(p.c_str(), deadline_us, &partial);
+        if (partial) { if (out_of_time) *out_of_time = true; break; }
+        if (rc == 0 && !exists(p.c_str())) { ++n; gc_fail_clear(s, pool_fail_key(p).c_str()); continue; }
+        // PR #1 review (8th round): it did not go. Nothing else in the store names this
+        // directory -- the row it belonged to is gone or never existed -- so saying nothing
+        // about it means it leaks silently until somebody runs gc by hand. Count it, and
+        // keep the worker chain coming back for it under the same cap a trash entry gets.
+        if (failed) (*failed)++;
+        if (gc_fail_bump(s, pool_fail_key(p).c_str()) < kGcFailCap && work_remains)
+            *work_remains = 1;
+    }
+    if (remove && !(out_of_time && *out_of_time))
+        for (size_t i = 0; i < subs.size(); ++i)
+            ::rmdir(subs[i].c_str());   // empty S<n> directories go too; harmless otherwise
     return n;
 }
 
@@ -468,6 +515,7 @@ int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us, int *work
     Vec<String> trees;
     Vec<String> live; // paths a valid row still points at
     if (int rc = pool_scan(s, rows, trees, live)) return rc;
+    if (wfs_test_before_pool_sweep) wfs_test_before_pool_sweep(wfs_test_before_pool_sweep_ctx);
     // PR #1 review (6th round): every one of these is a whole clone of a snapshot, not the
     // handful of stat(2)s the rest of gc's cheap half is made of. Under a deadline the removal
     // stops where it is and the ROW STAYS, because that is the state a successor rediscovers:

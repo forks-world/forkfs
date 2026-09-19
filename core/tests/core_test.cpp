@@ -308,6 +308,33 @@ static void restore_before_delete(void *ctx, int is_snapshot, wfs_id row, const 
     g_del_rc = wfs_world_restore(g_del_store, g_del_world);
 }
 
+// PR #1 review (9th round, P1): the pool collector's scan window. The seam runs after the pool
+// rows have been read and before anything is removed; what it does in there is a whole
+// `pool fill` and a whole pool-backed `fork`, both on a second handle. The fill's entry is a
+// tree the row snapshot has never heard of, which is exactly what the orphan sweep used to
+// delete; the fork's is a tree that changes hands in the same window.
+static wfs_store *g_pool_store = NULL;
+static wfs_id g_pool_snap;
+static const char *g_pool_target;
+static int g_pool_ran;
+static int g_pool_rc = -1;
+static wfs_fork_result g_pool_fr;
+static void fill_before_sweep(void *ctx) {
+    (void)ctx;
+    if (g_pool_ran) return;
+    g_pool_ran++;
+    wfs_fork_opts fo;
+    memset(&fo, 0, sizeof fo);
+    fo.name = "poolrace";
+    memset(&g_pool_fr, 0, sizeof g_pool_fr);
+    g_pool_rc = wfs_world_create_ex(g_pool_store, (wfs_ref){WFS_K_SNAPSHOT, g_pool_snap},
+                                    g_pool_target, &fo, &g_pool_fr);
+    if (g_pool_rc) return;
+    uint64_t made = 0;
+    g_pool_rc = wfs_pool_fill(g_pool_store, g_pool_snap, 1, &made);
+    if (!g_pool_rc && made != 1) g_pool_rc = -EINVAL;
+}
+
 // PR #1 review (9th round, P1): `discard W<n> --now`'s own window. Phase 4 is inside the helper
 // that deletes a trash entry here and now, after it has followed the tree to whatever name it
 // has and before it marks it `.deleting`. What runs in there is a whole `restore` on a second
@@ -2199,6 +2226,96 @@ int main() {
         wfs_store_close(cb);
         wfs_store_close(ca);
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", cstore, (unsigned long long)c1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
+    // ---- PR #1 review (9th round, P1): a pool entry made after the scan is not an orphan ----
+    //
+    // pool_scan takes one snapshot of the pool rows; pool_collect then removes the trees that
+    // snapshot dooms and sweeps every directory under <store>/pool that it does not name. A
+    // filler that inserts its CREATING row after the scan had its `.wfs-tmp` deleted mid-clone --
+    // and a partially removed entry then went on to be published READY -- while a fork claiming
+    // an entry in the same window had the tree it was about to rename taken away. Every apparent
+    // orphan is now re-asked of the live rows under the store mutex, and a pool row's path, that
+    // path plus `.wfs-tmp`, and a CREATING world row's tmp_path all count as naming it
+    // (docs/M1_DESIGN.md P18).
+    {
+        char pstore[4096], psrc[4096], ppool[4096], pw[4096], pw2[4096];
+        join(pstore, sizeof pstore, root, "poolrace-store");
+        join(psrc, sizeof psrc, root, "poolrace-src");
+        CHECK(mkdir(psrc, 0755) == 0);
+        join(p, sizeof p, psrc, "a.txt");
+        write_file(p, "one\n");
+        wfs_store *pa = NULL;
+        CHECK_OK(wfs_store_open(pstore, &pa));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "pb";
+        wfs_id p1 = 0;
+        CHECK_OK(wfs_snapshot_create(pa, psrc, &sopts, &p1));
+        uint64_t pmade = 0, pready = 0;
+        CHECK_OK(wfs_pool_fill(pa, p1, 1, &pmade));
+        CHECK(pmade == 1);
+        CHECK_OK(wfs_pool_ready(pa, p1, &pready));
+        CHECK(pready == 1);
+        snprintf(ppool, sizeof ppool, "%s/pool/S%llu", pstore, (unsigned long long)p1);
+
+        join(pw, sizeof pw, worlds, "prworld");
+        g_pool_store = pa;
+        g_pool_snap = p1;
+        g_pool_target = pw;
+        g_pool_ran = 0;
+        g_pool_rc = -1;
+        // The collector runs on a handle of its own, with a gc that holds nothing back.
+        wfs_store *pb = NULL;
+        CHECK_OK(wfs_store_open(pstore, &pb));
+        wfs_test_before_pool_sweep = fill_before_sweep;
+        wfs_gc_report prep;
+        memset(&prep, 0, sizeof prep);
+        CHECK_OK(wfs_gc(pb, 0, &prep));
+        wfs_test_before_pool_sweep = NULL;
+        CHECK(g_pool_ran == 1);
+        CHECK_OK(g_pool_rc);
+        CHECK(g_pool_fr.from_pool == 1);          // the fork took the entry that was waiting
+        // Nothing was removed and nothing was reported as stuck: neither tree was the
+        // collector's to touch.
+        CHECK(prep.pool_removed == 0 && prep.pool_failed == 0);
+        // The fork kept the tree it claimed...
+        CHECK(exists(pw));
+        join(p, sizeof p, pw, "a.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "one\n"));
+        wfs_world_rec pwr;
+        CHECK_OK(wfs_world_info(pa, g_pool_fr.world, &pwr));
+        CHECK(pwr.state == WFS_ST_ACTIVE && pwr.present);
+        // ... and the entry the filler built after the scan is still there, and still usable:
+        // the row says READY and the tree behind it is whole, which is the pair that used to
+        // come apart.
+        CHECK_OK(wfs_pool_ready(pa, p1, &pready));
+        CHECK(pready == 1);
+        CHECK(n_with_prefix(ppool, "") == 3);     // `.`, `..` and the one entry
+        wfs_trash_stat pst;
+        CHECK_OK(wfs_gc_status(pa, 0, &pst));
+        CHECK(pst.pool_stranded == 0);            // and `gc --status` says the same
+        join(pw2, sizeof pw2, worlds, "prworld2");
+        wfs_fork_result pfr2;
+        memset(&opts, 0, sizeof opts);
+        opts.name = "prworld2";
+        CHECK_OK(wfs_world_create_ex(pa, (wfs_ref){WFS_K_SNAPSHOT, p1}, pw2, &opts, &pfr2));
+        CHECK(pfr2.from_pool == 1);               // handed out, not re-cloned
+        join(p, sizeof p, pw2, "a.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "one\n"));
+
+        // And a directory under <store>/pool that really is row-less still goes.
+        char pjunk[4096];
+        join(pjunk, sizeof pjunk, ppool, "deadbeef");
+        CHECK(mkdir(pjunk, 0755) == 0);
+        memset(&prep, 0, sizeof prep);
+        CHECK_OK(wfs_gc(pb, 0, &prep));
+        CHECK(prep.pool_removed == 1 && !exists(pjunk));
+        wfs_store_close(pb);
+        wfs_store_close(pa);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", pstore, (unsigned long long)p1);
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 
