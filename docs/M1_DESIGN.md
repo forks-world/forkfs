@@ -88,3 +88,21 @@ store 目录加 `.noindex`(Spotlight)并 `tmutil addexclusion`(Time Machine),无
 | 1000 idle branches | 1000 个目录,元数据约 15GB(5 万文件树) |
 | 存储 ≈ divergence | 改 1% 文件物理 +0.36% |
 | diff O(changes) | FSEvents 正常时满足;丢事件时退化为 O(tree) |
+
+## 7. 快照保护的修正(2026-09-19,T1.1b)
+
+per-file `uchg` 实测 50k 文件保护 0.68s、解保护 0.73s(4 线程已是 APFS 元数据事务上限),fork 一半时间花在解保护上。
+改为**门目录保护**:快照根目录 mode 0000,内部文件不动;CLI 仅在 clonefile 窗口内临时 0500。保护不会被克隆进 World,
+fork = clonefile + 标记 + rename。per-file `uchg` 保留为 `--hard`。威胁模型是误操作,两种方式都挡不住 owner 主动解除。
+
+## 8. 其他平台对应层(结论记录)
+
+| | macOS | Linux | Windows |
+|---|---|---|---|
+| fork | `clonefile(dir)`,O(files) 但 7µs/文件 | overlayfs upper 目录,O(1) | ReFS 块克隆逐文件(需 Dev Drive);或 ProjFS 惰性投影,O(1) |
+| changed-set | FSEvents(候选)+ 比对 | upper 目录,内核维护 | USN Journal(内核维护,不丢)或 ProjFS placeholder 状态 |
+| 快照保护 | 门目录 0000 / `uchg` | lower 只读 | 只读属性 + ACL |
+| 隔离 | seatbelt / uid | mount namespace | 每 agent 用户 + ACL;AppContainer |
+| 前提 | 同一 APFS 卷 | XFS reflink / btrfs(否则 copy-up 整文件) | Windows 11 + Dev Drive(ReFS);Win10 已停服,不单独测 |
+
+Windows 测试基线:一台 Windows 11 24H2,C:(NTFS,测 ProjFS)+ 一个 Dev Drive VHDX(ReFS,测块克隆与 Defender 豁免)。
