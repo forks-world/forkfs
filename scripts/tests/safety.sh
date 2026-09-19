@@ -875,6 +875,22 @@ check    PR5 "a second discard of a trashed snapshot is still refused" 3 -- rv f
 has_hint PR5 "that refusal offers --now" "discard S<n> --now" -- rv fs discard S3
 rv fs discard S3 --now > /dev/null 2>&1
 
+# ---- PR #1 review (6th round, P1): `adopt` may not resurrect a discarded baseline -------------
+# An unregistered copy carries the marker of the world it was copied from, snapshot id included,
+# and `adopt` used to write that id onto a new ACTIVE row whatever had become of the snapshot.
+# Discard the only world, discard the snapshot (nothing references it any more), adopt the copy:
+# the result was a world whose every `diff` answers "source gone" and a store that had forgotten
+# the snapshot was ever anybody's source.
+rv fs init "$SCRATCH/review-src" --name rv4 > /dev/null 2>&1
+RW=$(rv fs fork --from S4 --to "$SCRATCH/rv4-world" 2>/dev/null | awk '{print $1}')
+cp -R "$SCRATCH/rv4-world" "$SCRATCH/rv4-copy"
+rv fs discard "$RW" --now > /dev/null 2>&1
+rv fs discard S4 --now > /dev/null 2>&1
+check    PR6 "adopting a copy whose snapshot has been discarded is refused" 3 -- rv fs adopt "$SCRATCH/rv4-copy"
+has_hint PR6 "the refusal offers the marker-less way to keep it" "world fs init" -- rv fs adopt "$SCRATCH/rv4-copy"
+rv fs status | grep -q "^worlds: *0 active" && ok PR6 "and no world row was written for it" \
+                                             || { bad PR6 "and no world row was written for it"; rv fs status | sed 's/^/        /'; }
+
 rv fs gc --now --retention 0 > /dev/null 2>&1
 
 # ---- PR #1 review (P2): the batch limit bites inside one tree, not only between trees ----------

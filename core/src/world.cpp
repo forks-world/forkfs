@@ -1652,9 +1652,14 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
 //                        something still references the snapshot, in which case the tree goes
 //                        back and the row with it. A reference cannot appear after step (a)
 //                        through fork or pool (both re-read the row under the write lock and
-//                        refuse anything that is not ACTIVE), but `adopt` registers a world from
-//                        its marker alone and does carry the snapshot id over, so the check is
-//                        made against the present rather than against that argument.
+//                        refuse anything that is not ACTIVE), and since the 6th round of the
+//                        PR #1 review it cannot appear through `adopt` either -- that used to
+//                        register a world from its marker alone, carrying the snapshot id over
+//                        whatever state the snapshot was in, and now refuses anything but an
+//                        ACTIVE snapshot under the same write lock. So the count below is
+//                        belt-and-braces: it is made against the present rather than against
+//                        that argument, and a store another binary is also writing to is
+//                        exactly the case an argument is worth nothing against.
 //   tree at home         the rename never happened: the discard did not happen either.
 //   tree nowhere         the same verdict, and the reconciliation half of gc then reports the
 //                        row as dangling (and, with --reconcile, buries it). Better a row that
@@ -1894,6 +1899,25 @@ extern "C" int wfs_world_adopt(wfs_store *s, const char *path, const char *name,
     {
         Guard g(s->mu);
         Txn t(s->db);
+        // PR #1 review (6th round): the baseline has to still be a baseline, and the question has
+        // to be asked under the same write lock `discard S<n>` decides under (BEGIN IMMEDIATE).
+        // An adopt registers a world from its marker alone -- nothing on disk is consulted about
+        // the snapshot -- so it was the one way an ACTIVE world could appear for a snapshot that
+        // was already on its way out: discard the only world, discard the snapshot (its reference
+        // count is zero), then adopt a copy, and the copy's `diff` comes back WFS_E_SOURCE_GONE
+        // for the rest of its life. Inside this transaction the two orders are the only two:
+        // either the snapshot is still ACTIVE here and this row makes the copy a reference the
+        // discard's own check will see, or the discard got there first and the adoption fails.
+        //
+        // Anything but ACTIVE is refused, TRASHING included: a TRASHING row is a discard that is
+        // either in flight (its next step renames the tree away, and with --now unlinks it) or
+        // was killed half way, and from here the two look exactly alike.
+        if (parent && m.snapshot) {
+            Stmt q(s->db, "SELECT state FROM snapshots WHERE id=?");
+            if (!q.ok()) return -EIO;
+            q.i64(1, (int64_t)m.snapshot);
+            if (!q.row() || q.col_i64(0) != WFS_ST_ACTIVE) return WFS_E_SOURCE_GONE;
+        }
         Stmt ins(s->db,
                  "INSERT INTO worlds(kind, parent_world, snapshot_id, name, path, dir_dev, dir_ino,"
                  " state, fsevents_id, entries, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)");

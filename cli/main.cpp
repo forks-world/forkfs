@@ -1245,6 +1245,20 @@ static int cmd_adopt(wfs_store *s, int argc, char **argv) {
                  (unsigned long long)ident.world_id);
         return refuse(why, "world fs list");
     }
+    // PR #1 review (6th round): the copy's marker names the snapshot the original was forked
+    // from, and that is the baseline the adopted world would diff and verify against. If it is
+    // not in the store any more, adopting would register a world whose every `diff` answers
+    // "source gone" -- so the core refuses, and this says what the copy can still be instead.
+    if (rc == WFS_E_SOURCE_GONE) {
+        wfs_identity ident;
+        wfs_world_verify_identity(s, path, &ident);
+        char why[WFS_PATH_MAX + 192];
+        snprintf(why, sizeof why,
+                 "%s was forked from S%llu, which is no longer an active snapshot of this store: "
+                 "adopting it would register a world with nothing to diff or verify against",
+                 path, (unsigned long long)ident.snapshot_id);
+        return refuse(why, "world fs list   (or remove its .world marker and `world fs init` it as a plain directory)");
+    }
     if (rc) return explain_path(s, path, rc, "adopt");
     printf("W%llu  %s  (adopted)\n", (unsigned long long)id, path);
     return EX_OK;

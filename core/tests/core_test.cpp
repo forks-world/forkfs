@@ -1448,9 +1448,12 @@ int main() {
         CHECK(exists(sdir));
         CHECK_OK(wfs_snapshot_verify(ts, t1, &vr));            // and still a usable snapshot
 
-        // (2) Killed AFTER the rename, with something that still needs the baseline. `adopt`
-        // registers a world from its marker alone and carries the snapshot id over with it, so
-        // a reference really can appear after the discard's reference check has passed.
+        // (2) Killed AFTER the rename. `adopt` used to be the one way a reference could still
+        // appear afterwards -- it registers a world from its marker alone and carries the
+        // snapshot id over with it -- and since the 6th round of the review it refuses a
+        // snapshot that is not ACTIVE, under the same write lock the discard decides under. So
+        // the copy stays a copy, nothing references the snapshot, and the recovery finishes the
+        // discard the user asked for instead of undoing it.
         wfs_ref tf = {WFS_K_SNAPSHOT, t1};
         memset(&opts, 0, sizeof opts);
         join(tw, sizeof tw, worlds, "tworld");
@@ -1471,29 +1474,13 @@ int main() {
         // delete it on sight. It is in the trash, it is counted, and it is not due.
         CHECK_OK(wfs_gc_status(ts, 0, &tst));
         CHECK(tst.entries == 1 && tst.due == 0 && tst.snapshots == 1);
+        // 6th round: a snapshot in the middle of being discarded is not a baseline anybody may
+        // be given, because from here a TRASHING row that was killed and one whose next step is
+        // `--now`'s unlink look exactly alike.
         wfs_id tw2 = 0;
-        CHECK_OK(wfs_world_adopt(ts, twcopy, "adopted", &tw2));
+        CHECK_RC(wfs_world_adopt(ts, twcopy, "adopted", &tw2), WFS_E_SOURCE_GONE);
+        CHECK(tw2 == 0);
         wfs_world_rec twr;
-        CHECK_OK(wfs_world_info(ts, tw2, &twr));
-        CHECK(twr.snapshot_id == t1);
-        g_trash_crash_phase = -1;
-        memset(&trep, 0, sizeof trep);
-        CHECK_OK(wfs_gc(ts, 0, &trep));
-        CHECK(trep.trash_orphans == 0 && trep.snapshots_deleted == 0);
-        CHECK_OK(wfs_snapshot_info(ts, t1, &tsr));
-        CHECK(tsr.state == WFS_ST_ACTIVE);                     // put back, because it is needed
-        CHECK(exists(sdir));
-        CHECK(!exists(g_trash_crash_path));
-        CHECK_OK(wfs_snapshot_verify(ts, t1, &vr));            // manifest and tree intact
-        CHECK_OK(wfs_world_diff(ts, tw2, 0, NULL, NULL));      // and the world has its baseline
-
-        // (3) The same crash with nothing referencing it: the discard the user asked for is
-        // finished, and the entry is then collected like any other.
-        CHECK_OK(wfs_world_discard(ts, tw2, 1, 0));
-        g_trash_crash_phase = 1;
-        g_trash_crash_hits = 0;
-        CHECK_RC(wfs_snapshot_discard(ts, t1, 0, 0), -EINTR);
-        CHECK(g_trash_crash_hits == 1);
         g_trash_crash_phase = -1;
         memset(&trep, 0, sizeof trep);
         CHECK_OK(wfs_gc(ts, 0, &trep));
@@ -1501,8 +1488,10 @@ int main() {
         CHECK_OK(wfs_snapshot_info(ts, t1, &tsr));
         CHECK(tsr.state == WFS_ST_DEAD);
         CHECK(!exists(sdir) && !exists(g_trash_crash_path));
+        // ... and the copy is no more adoptable once the snapshot is gone for good.
+        CHECK_RC(wfs_world_adopt(ts, twcopy, "adopted", &tw2), WFS_E_SOURCE_GONE);
 
-        // (4) A world, both ways round, and resolved by the store open rather than by gc.
+        // (3) A world, both ways round, and resolved by the store open rather than by gc.
         wfs_id t2 = 0;
         memset(&sopts, 0, sizeof sopts);
         sopts.name = "tr2";
@@ -1540,6 +1529,105 @@ int main() {
         wfs_store_close(ts);
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", tstore, (unsigned long long)t2);
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
+    // ---- PR #1 review (6th round, P1): `adopt` may not resurrect a discarded baseline ---------
+    //
+    // `wfs_world_adopt` registers a world from its `.world` marker alone: it reads the snapshot
+    // id out of the marker and writes it onto a new ACTIVE row. It used to do that whatever had
+    // become of that snapshot, and not under the write lock `discard S<n>` counts references
+    // under. So this sequence -- discard the only world, discard its snapshot (nothing
+    // references it any more), adopt a copy of the world -- produced an ACTIVE world whose
+    // baseline was in the trash or already unlinked: every `diff` it would ever answer is
+    // WFS_E_SOURCE_GONE, and `gc` would go on believing the snapshot was nobody's source.
+    //
+    // The TRASHING window of the same race is in the 5th-round block above, on the crash seam.
+    {
+        char astore[4096], asrc[4096], aw[4096], acopy[4096], acopy2[4096];
+        join(astore, sizeof astore, root, "adopt-store");
+        join(asrc, sizeof asrc, root, "adopt-src");
+        CHECK(mkdir(asrc, 0755) == 0);
+        join(p, sizeof p, asrc, "a.txt");
+        write_file(p, "one\n");
+        wfs_store *as = NULL;
+        CHECK_OK(wfs_store_open(astore, &as));
+
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "ad";
+        wfs_id a1 = 0;
+        CHECK_OK(wfs_snapshot_create(as, asrc, &sopts, &a1));
+        wfs_ref af = {WFS_K_SNAPSHOT, a1};
+        memset(&opts, 0, sizeof opts);
+        join(aw, sizeof aw, worlds, "aworld");
+        join(acopy, sizeof acopy, worlds, "aworld-copy");
+        join(acopy2, sizeof acopy2, worlds, "aworld-copy2");
+        wfs_id aw1 = 0;
+        CHECK_OK(wfs_world_create(as, af, aw, &opts, &aw1));
+        copy_dir(aw, acopy);                                   // two unregistered copies (P2)
+        copy_dir(aw, acopy2);
+
+        // The control: while the snapshot is ACTIVE, adopting a copy works and the adopted world
+        // really does inherit the baseline -- which is why it matters that the baseline is there.
+        wfs_id ac = 0;
+        wfs_world_rec awr;
+        CHECK_OK(wfs_world_adopt(as, acopy, "copy-ok", &ac));
+        CHECK_OK(wfs_world_info(as, ac, &awr));
+        CHECK(awr.snapshot_id == a1 && awr.state == WFS_ST_ACTIVE);
+        CHECK_OK(wfs_world_diff(as, ac, 0, NULL, NULL));
+        // An adopted world is a reference like any other: the snapshot cannot be discarded while
+        // it is alive. (That is the other half of the same invariant.)
+        CHECK_RC(wfs_snapshot_discard(as, a1, 0, 0), WFS_E_SNAPSHOT_IN_USE);
+
+        // Now take every reference away and discard the snapshot the ordinary way: the row is
+        // TRASHED and the tree is waiting in <store>/trash for the collector.
+        CHECK_OK(wfs_world_discard(as, ac, 1, 0));
+        CHECK_OK(wfs_world_discard(as, aw1, 1, 0));
+        CHECK_OK(wfs_snapshot_discard(as, a1, 0, 0));
+        wfs_snapshot_rec asr;
+        CHECK_OK(wfs_snapshot_info(as, a1, &asr));
+        CHECK(asr.state == WFS_ST_TRASHED);
+        wfs_id ax = 0;
+        CHECK_RC(wfs_world_adopt(as, acopy2, "no-baseline", &ax), WFS_E_SOURCE_GONE);
+        CHECK(ax == 0);
+        // Nothing was written down either: no row, and the copy is still an unregistered copy.
+        wfs_identity aid;
+        CHECK_RC(wfs_world_verify_identity(as, acopy2, &aid), WFS_E_UNREGISTERED);
+        size_t an = 0;
+        CHECK_OK(wfs_world_list(as, 0, NULL, 0, &an));
+        CHECK(an == 0);                                        // no ACTIVE world appeared
+
+        // And the same from the other end of the discard: --now, which leaves the row DEAD and
+        // no tree at all.
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "ad2";
+        wfs_id a2 = 0;
+        CHECK_OK(wfs_snapshot_create(as, asrc, &sopts, &a2));
+        wfs_ref af2 = {WFS_K_SNAPSHOT, a2};
+        char aw2[4096], acopy3[4096];
+        join(aw2, sizeof aw2, worlds, "aworld2");
+        join(acopy3, sizeof acopy3, worlds, "aworld2-copy");
+        wfs_id aw2id = 0;
+        CHECK_OK(wfs_world_create(as, af2, aw2, &opts, &aw2id));
+        copy_dir(aw2, acopy3);
+        CHECK_OK(wfs_world_discard(as, aw2id, 1, 0));
+        CHECK_OK(wfs_snapshot_discard(as, a2, 1, 0));
+        CHECK_OK(wfs_snapshot_info(as, a2, &asr));
+        CHECK(asr.state == WFS_ST_DEAD);
+        CHECK_RC(wfs_world_adopt(as, acopy3, "no-baseline", &ax), WFS_E_SOURCE_GONE);
+        CHECK(ax == 0);
+
+        // A copy of a world belonging to a *different* store is not affected: there is no parent
+        // row for it here, so it is adopted with no baseline at all (snapshot_id 0) rather than
+        // with a dead one, exactly as before. The refusal is about a baseline this store knows
+        // and has thrown away, not about every marker that mentions a snapshot id.
+        char foreign[4096];
+        join(foreign, sizeof foreign, worlds, "foreign-copy");
+        copy_dir(w1path, foreign);
+        wfs_id afid = 0;
+        CHECK_OK(wfs_world_adopt(as, foreign, "foreign", &afid));
+        CHECK_OK(wfs_world_info(as, afid, &awr));
+        CHECK(awr.snapshot_id == 0 && awr.parent_world == 0 && awr.state == WFS_ST_ACTIVE);
+        wfs_store_close(as);
     }
 
     wfs_store_close(s);

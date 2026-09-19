@@ -422,7 +422,15 @@ int wfs_marker_store_path(const char *world_root, char *buf, size_t cap);
 int wfs_world_verify_identity(wfs_store *s, const char *path, wfs_identity *out);
 /* verify W<n>: identity of the recorded path. */
 int wfs_world_verify(wfs_store *s, wfs_id id, wfs_identity *out);
-/* P2: take over an unregistered copy as a new world, rewriting its marker. */
+/* P2: take over an unregistered copy as a new world, rewriting its marker.
+ *
+ * The copy's marker names the snapshot the original was forked from, and the adopted world
+ * inherits it as its diff/verify baseline (P4/P10). So the adoption is refused, with
+ * WFS_E_SOURCE_GONE, when that snapshot is no longer ACTIVE -- discarded, being discarded, or
+ * gone from the store. The check runs inside the same BEGIN IMMEDIATE as the insert, which is
+ * the write lock `wfs_snapshot_discard` counts references under: either the new row is there to
+ * be counted, or the discard already won (PR #1 review, 6th round). A copy in that state can
+ * still be kept, as a plain directory: remove its `.world` marker and `world fs init` it. */
 int wfs_world_adopt(wfs_store *s, const char *path, const char *name, wfs_id *out);
 
 /* ---- diff (T1.3) --------------------------------------------------------------------------
