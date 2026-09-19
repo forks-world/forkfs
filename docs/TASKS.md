@@ -1244,6 +1244,49 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第五轮:崩溃窗口与"源是活的"(2026-09-19)
+
+第五轮,Codex 四条(一条 P1、三条 P2)。P1 是 discard 的崩溃窗口——**行和树之间那一瞬间**,
+谁先写决定了被 kill 之后 trash 里那棵树还有没有人认领;三条 P2 分别是:快照克隆时不校验活源、
+临时树删不掉却照样埋行、`--now` 对已经在 trash 里的 snapshot 不认。
+**一条一个提交、一条一个测试,四个测试都先验证过"没有修复就会红"。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `4053320017` | `world.cpp:1435` | snapshot discard 把 `rename` 放在**事务里面**,commit 之前。中途被 kill:SQLite 回滚,行回到 ACTIVE,树却已经躺在 `trash/` 里——**没有任何行提到它**。下一个 collector 按"无主孤儿"规则**立刻删掉**(不看保留期、不能 restore),于是每一个 fork 自它的 World 都失去了 diff/verify 的基线(P4/P10)。World discard 是反过来的顺序(先 rename 后 commit),同一个洞 | **三步协议,两条路统一走**:(a) 一个事务做引用检查 + `state=WFS_ST_TRASHING` + `trash_path` = 树**即将**拥有的名字,提交;(b) rename;(c) 一个事务 `state=TRASHED`。World 的 EXDEV 回退先把旁路 trash 名提交上去再搬。**恢复**(`wfs::trashing_recover`,每次 `wfs_store_open` 和每次 `wfs_gc_ex` 开头,两条走索引的 SELECT):树还在老位置 → ACTIVE;树在 `trash_path` → TRASHED;**snapshot 还有引用 → 搬回去 + ACTIVE**(fork/pool 都在写锁下重读行,(a) 之后拿不到它,但 `adopt` 只凭 marker 登记并带上 snapshot id,所以按**现在**数而不是按这个论证信);两边都没有 → ACTIVE,交给 reconcile 那一半去报 dangling(比这里替谁都没删的树宣判死亡强)。**孤儿规则本身**:trash 里的目录只有"**任何状态**下都没有行提到它"才是孤儿,`.deleting` 拼写算同一个名字,行也因此要跟着 collector 的那次 rename 走 | `53d3ce6` |
+| P2 `4053320021` | `world.cpp:661` | 快照/checkpoint 的重放拿到的 `verify_root` 是 `nullptr`,等于关掉唯一一个会去看源的检查。源是**用户的活目录**(checkpoint 更是活 World),scan 和 clone 是两趟遍历;这中间被换掉的组成员,只要**大小和 mtime 都一样**,就通过了 `restore_group()` 的"还是 scan 看见的那个文件"判定,被一条 link 覆盖掉——快照里两个名字装着同一份内容,一声不吭 | 把**活源**传成 verify root,`group_still_linked()` 于是在动克隆之前把整组名字在源里重新 lstat 一遍(代价:每个硬链接名一次 lstat,和头文件一直标的价钱一样)。**另一半**在下一环:fork 重放快照 manifest 时**不带 verify root**(快照是不可变的),所以 manifest 里留着一个快照自己都没有的组,等于让 fork 一步之后把这次拒绝覆盖的内容再覆盖一次。`hardlinks_restore()` 因此报出**哪些组没能完整留下**(`HardlinkRestore::broken`),`wfs_snapshot_create` 在写 manifest 和写 `hl_groups` 之前把它们剔掉——**快照说自己有什么,就得是自己树里真有什么** | `ef57559` |
+| P2 `4053320025` | `world.cpp:2210` | fork 的临时树在**用户自己的目标父目录**里,名字是抽出来的,而且故意不被后缀扫描找到——CREATING 行是它唯一的记录。删树失败(EPERM、瞬时 EIO)之后那条 UPDATE 照样把行标 DEAD 并清空 `tmp_path`:**整棵克隆永久搁浅**,没有任何东西还知道它的名字,也没有哪次 gc 还能回来重试 | 删不掉而树还在 → **行留着**(仍是 CREATING,`tmp_path` 原样),记进 `wfs_gc_report::tmp_failed` 和 `gc --status`(一行 `abandoned:`——它不在 trash 里,但在等同一个 collector),并**套用 trash 条目那套失败计数与上限**:前几次唤醒设 `work_remains` 让后继重试,之后每次都报告但不再自己把 worker 叫醒。树确实已经不在了,照旧埋行 | `bc6b18d` |
+| P2 `4053320027` | `cli/main.cpp:787` | 先 `discard S<n>` 再 `discard S<n> --now` 被拒,于是想在保留期之前把空间拿回来只能动全 store 的 `gc --now --retention 0`。World 一直是认的,`wfs_snapshot_discard` 的 API 契约也一直写着 `immediate` 会删树并把行留成 DEAD | TRASHED + `immediate` 时把删除提前:引用检查和搬迁都是历史,剩下的就是 collector 本来要做的那次 unlink——同样的两步(rename 成 `.deleting`、记下新名、unlink、行 DEAD),抽成一个两条路共用的函数;collector 已经在行底下改过名的条目跟着 `.deleting` 走而不是报找不到。不带 `--now` 仍是 `-EALREADY`,而那句拒绝现在会告诉你 `--now` 是干这个的 | `53e60a2` |
+
+**验收**:`safety.sh` **187 passed, 0 failed**(上一轮 177 → 本轮 +10:临时树删不掉那条 5 个断言、
+`--now` 那条 5 个);`ctest` 两个配置 WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的
+deprecated 警告);`check-deps.sh` 两个配置全绿。
+
+四条都先把测试跑红过:
+
+- P1:只认 TRASHED 行的 claim 列表 → `gc --status` 那条断言红;去掉恢复 → "回到 ACTIVE" 那条红。
+- 活源:把 verify root 改回 `nullptr` → `hl_groups == 0` 红;把这条断言也关掉 → 快照里的 `b.txt`
+  读出来是 `AAAA`,**数据丢失本身**。
+- 临时树:把"树还在就留着行"那个分支关掉 → 行直接进 state 3,五条里红四条。
+- `--now`:把 CLI 那个无条件拒绝放回去 → 三条红。
+
+新增测试:
+
+- `core_test`(P1):自己的一个 store,新测试缝 `wfs_test_trash_crash`(库里恒为 NULL)把 discard
+  停在 phase 0(行已提交、树没动)或 phase 1(树已搬、行没提交)。四种情况:rename 之前被杀 →
+  ACTIVE 且树没动过;rename 之后被杀、并且有一个 `adopt` 进来的 World 持有这个 snapshot →
+  **树搬回去**、World 还能 diff;rename 之后被杀、没人持有 → TRASHED 然后照常被收走;
+  以及一个 World 的两个方向,**由 store open 而不是 gc 解决**,`restore` 照样把它带回来。
+- `core_test`(活源):新测试缝 `wfs_test_before_snapshot_clone` 在克隆前一刻把硬链接对的一个成员
+  换成**不同内容、相同大小、相同 mtime**(`utimensat`)的文件。快照必须两份内容都留着、
+  `hl_groups` 报 0 而 `hardlinks` 仍报源当时的 2、verify 干净、fork 出来也是两个文件;
+  对照组(没人碰的同一棵树)照样把组连回去。
+- `safety.sh`(临时树):直接往库里写一条 CREATING 行,树用和"删不掉的 trash 条目"同一条 ACL
+  (`deny delete,delete_child`,chmod 和 chflags 都摘不掉)锁住。gc 要留下行和 `tmp_path`、
+  在 stderr 说树删不掉、`gc --status` 数得出来;摘掉 ACL,下一次 gc 把树删掉、把行埋掉、不再数它。
+- `safety.sh`(`--now`):`discard S2` 之后 `discard S2 --now` 要在返回前把树删掉、说 "S2 deleted"、
+  行读作 dead、trash 空;不带 `--now` 的第二次 discard 仍被拒,而且拒绝里给出 `--now`。
+
 #### PR #1 review 第四轮:两条"失败了却当没事"(2026-09-19)
 
 同一个 PR 的第四轮,Codex 两条 P2,主题是一样的:**一次失败被当成了一个可以接受的结果**——
