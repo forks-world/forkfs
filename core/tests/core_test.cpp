@@ -124,6 +124,34 @@ static int crash_before_publish(void *ctx, wfs_id world, const char *tmp_path) {
     return -EINTR;
 }
 
+// PR #1 review (5th round): the source of a snapshot is a live directory, and this is what a
+// user writing to it in the window between the walk and the clone looks like at its worst -- one
+// member of a hardlink group replaced by a different file of exactly the same size and exactly
+// the same mtime, which is the pair restore_group() uses to tell "still the file the scan saw"
+// from "not any more".
+static const char *g_swap_path;
+static const char *g_swap_peer;
+static int g_swap_hits;
+static void swap_member(void *ctx, const char *src_dir) {
+    (void)ctx;
+    (void)src_dir;
+    if (!g_swap_path) return;
+    struct stat st;
+    CHECK(lstat(g_swap_peer, &st) == 0);
+    CHECK(unlink(g_swap_path) == 0);
+    write_file(g_swap_path, "BBBB\n");
+    struct timespec ts[2];
+#ifdef __APPLE__
+    ts[0] = st.st_atimespec;
+    ts[1] = st.st_mtimespec;
+#else
+    ts[0] = st.st_atim;
+    ts[1] = st.st_mtim;
+#endif
+    CHECK(utimensat(AT_FDCWD, g_swap_path, ts, 0) == 0);
+    g_swap_hits++;
+}
+
 // PR #1 review (5th round): the two halves of a discard. Phase 0 is the row committed in
 // TRASHING with the tree still at home, phase 1 is the tree renamed with the row not yet
 // TRASHED. Returning non-zero is a `kill -9` right there: nothing is unwound.
@@ -1283,6 +1311,90 @@ int main() {
             CHECK(nlink_of(p) == 2);
         }
         CHECK(n_with_prefix(wth, ".wfs-hl-") == 0);
+    }
+
+    // ---- PR #1 review (5th round, P2): the source changing between the walk and the clone ----
+    //
+    // hardlinks_restore() was handed nullptr as its verify root here, which turns off the only
+    // check that looks at the source at all. A group member replaced in that window by a
+    // different file of the same size and the same mtime was therefore linked to the canonical
+    // file in the clone -- the snapshot came out holding one name's contents under both names,
+    // and said nothing about it. The live source is the verify root now, and the group the
+    // source broke stays broken in the clone and is dropped from what the snapshot claims.
+    {
+        char hsrc[4096], ha[4096], hb[4096], hw[4096];
+        join(hsrc, sizeof hsrc, root, "hl-race");
+        CHECK(mkdir(hsrc, 0755) == 0);
+        join(ha, sizeof ha, hsrc, "a.txt");
+        join(hb, sizeof hb, hsrc, "b.txt");
+        write_file(ha, "AAAA\n");
+        CHECK(link(ha, hb) == 0);
+        CHECK(ino_of(ha) == ino_of(hb));
+
+        g_swap_path = hb;
+        g_swap_peer = ha;
+        g_swap_hits = 0;
+        wfs_test_before_snapshot_clone = swap_member;
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "hlrace";
+        wfs_id hs = 0;
+        CHECK_OK(wfs_snapshot_create(s, hsrc, &sopts, &hs));
+        wfs_test_before_snapshot_clone = NULL;
+        g_swap_path = NULL;
+        CHECK(g_swap_hits == 1);
+        // The source, as the seam left it: two files, same size, same mtime, different bytes.
+        CHECK(ino_of(ha) != ino_of(hb));
+        {
+            struct stat sa, sb;
+            CHECK(lstat(ha, &sa) == 0 && lstat(hb, &sb) == 0);
+            CHECK(sa.st_size == sb.st_size);
+        }
+        // The snapshot: the two names are still two files, and it does not advertise a group it
+        // does not have -- a fork replays the manifest without a verify root.
+        wfs_snapshot_rec hr;
+        CHECK_OK(wfs_snapshot_info(s, hs, &hr));
+        CHECK(hr.hardlinks == 2);     // what the source had when it was walked
+        CHECK(hr.hl_groups == 0);     // what this tree actually has
+        CHECK(chmod(hr.path, 0700) == 0);
+        join(p, sizeof p, hr.path, "a.txt");
+        join(q, sizeof q, hr.path, "b.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "AAAA\n"));
+        CHECK_OK(read_file(q, buf, sizeof buf));
+        CHECK(!strcmp(buf, "BBBB\n"));
+        CHECK(ino_of(p) != ino_of(q));
+        CHECK(nlink_of(p) == 1 && nlink_of(q) == 1);
+        CHECK(chmod(hr.path, 0000) == 0);
+        CHECK_OK(wfs_snapshot_verify(s, hs, &vr));
+        CHECK(vr.missing == 0 && vr.modified == 0 && vr.extra == 0 && vr.unprotected == 0);
+        // And a fork from it inherits two files, not one file under two names.
+        wfs_ref hf = {WFS_K_SNAPSHOT, hs};
+        memset(&opts, 0, sizeof opts);
+        join(hw, sizeof hw, worlds, "hlrace-w");
+        wfs_id hwid = 0;
+        CHECK_OK(wfs_world_create(s, hf, hw, &opts, &hwid));
+        join(p, sizeof p, hw, "a.txt");
+        join(q, sizeof q, hw, "b.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "AAAA\n"));
+        CHECK_OK(read_file(q, buf, sizeof buf));
+        CHECK(!strcmp(buf, "BBBB\n"));
+        CHECK(ino_of(p) != ino_of(q));
+
+        // The control: the same tree, nothing touching it, still gets its group back.
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "hlrace2";
+        wfs_id hs2 = 0;
+        CHECK(link(ha, hb) == -1);                     // b.txt is in the way
+        CHECK(unlink(hb) == 0 && link(ha, hb) == 0);   // put the pair back
+        CHECK_OK(wfs_snapshot_create(s, hsrc, &sopts, &hs2));
+        CHECK_OK(wfs_snapshot_info(s, hs2, &hr));
+        CHECK(hr.hl_groups == 1);
+        CHECK(chmod(hr.path, 0700) == 0);
+        join(p, sizeof p, hr.path, "a.txt");
+        join(q, sizeof q, hr.path, "b.txt");
+        CHECK(ino_of(p) == ino_of(q) && nlink_of(p) == 2);
+        CHECK(chmod(hr.path, 0000) == 0);
     }
 
     // ---- PR #1 review (5th round, P1): a discard killed between the rename and the commit ----

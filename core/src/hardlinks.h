@@ -50,6 +50,14 @@ struct HardlinkRestore {
     uint64_t skipped = 0;  // names that had diverged from the canonical file, or groups the
                            // verify root no longer agrees with
     int first_err = 0;     // first negative errno from link(2)/rename(2), 0 when there was none
+    // PR #1 review (5th round): the indices, in `set.groups`, of the groups this replay did NOT
+    // leave whole -- one the verify root no longer agrees with, or one with a name that had
+    // diverged from the canonical file and was therefore left alone. wfs_snapshot_create drops
+    // them from the manifest it writes and from the row's hl_groups, so a snapshot never
+    // advertises a group its own tree does not have: a fork from it replays the manifest without
+    // a verify root (the snapshot is immutable) and would otherwise link one name over another
+    // name's contents, which is the very thing this replay just refused to do.
+    Vec<uint64_t> broken;
 };
 
 // One parallel walk of `root` that both counts (exactly as fs_count_entries does, so callers
@@ -91,7 +99,10 @@ String hardlinks_manifest_path(const char *snapshot_root);
 // `verify_root`, when non-null, is a live tree the group is checked against first: every name
 // of the group must still exist there and still share one inode. That is how a fork from a live
 // world uses its origin snapshot's groups without trusting them -- the cost is one lstat per
-// name, not a walk.
+// name, not a walk. A snapshot or checkpoint passes its own live source here for the same
+// reason (PR #1 review, 5th round): the scan and the clone are two separate walks of a tree
+// that nothing stops the user from writing to in between, and a member replaced in that window
+// with a file of the same size and mtime is otherwise linked over.
 int hardlinks_restore(const char *tree_root, const HardlinkSet &set, const char *verify_root,
                       HardlinkRestore *out);
 

@@ -700,6 +700,13 @@ extern void *wfs_test_before_fork_publish_ctx;
  * process cannot otherwise reach: a half-built tree whose producer is gone. */
 extern int64_t wfs_test_fork_owner_pid;
 
+/* The window a snapshot or checkpoint has between its walk of the SOURCE and the clone of it
+ * (PR #1 review, 5th round): the source is a live directory, and what a test has to be able to
+ * do there is change it. Called with the resolved source path, once, immediately before
+ * clonefile. NULL unless a test sets it. */
+extern void (*wfs_test_before_snapshot_clone)(void *ctx, const char *src_dir);
+extern void *wfs_test_before_snapshot_clone_ctx;
+
 /* And the discard's own two halves (PR #1 review, 5th round). `phase` is 0 just after the row
  * has been committed in WFS_ST_TRASHING and before the tree is renamed, 1 just after the rename
  * and before the commit that makes the row TRASHED. A non-zero return is returned straight out

@@ -21,6 +21,7 @@
 #include <sys/file.h>
 #include <sys/random.h>
 #include <unistd.h>
+#include <utility>   // std::move only
 
 using wfs::copy_str;
 using wfs::Guard;
@@ -554,6 +555,29 @@ int trash_unlink(const char *deleting_path, int threads, uint64_t *entries,
 
 } // namespace
 
+namespace {
+
+// PR #1 review (5th round): what a snapshot may say about itself is what its own tree has. The
+// groups the replay did not leave whole (hardlinks.h, HardlinkRestore::broken) come out of the
+// set before the manifest is written and before hl_groups goes on the row. Linear in the groups
+// and the handful of broken indices, and in the ordinary case it is not called at all.
+void hl_drop_broken(wfs::HardlinkSet &hl, const Vec<uint64_t> &broken) {
+    wfs::HardlinkSet kept;
+    kept.external_groups = hl.external_groups;
+    kept.external_names = hl.external_names;
+    for (size_t i = 0; i < hl.groups.size(); ++i) {
+        bool drop = false;
+        for (size_t j = 0; j < broken.size(); ++j)
+            if (broken[j] == (uint64_t)i) { drop = true; break; }
+        if (drop) continue;
+        kept.names += (uint64_t)hl.groups[i].paths.size();
+        kept.groups.emplace_back(hl.groups[i]);
+    }
+    hl = std::move(kept);
+}
+
+} // namespace
+
 // The one interleaving a test cannot produce from outside: the middle of a pool-backed fork,
 // after the claim transaction has committed this fork's CREATING world row and before the
 // marker/rename/ACTIVE tail. core_test sets it to run `discard` exactly there; nothing in the
@@ -566,6 +590,11 @@ extern "C" void *wfs_test_after_pool_claim_ctx = nullptr;
 // unwinding anything, which is what a `kill -9` there looks like to the next process.
 extern "C" int (*wfs_test_before_fork_publish)(void *ctx, wfs_id world, const char *tmp_path) = nullptr;
 extern "C" void *wfs_test_before_fork_publish_ctx = nullptr;
+
+// And the window between a snapshot's walk of its source and the clone of it: the source is the
+// user's live directory, and nothing stops it changing in there.
+extern "C" void (*wfs_test_before_snapshot_clone)(void *ctx, const char *src_dir) = nullptr;
+extern "C" void *wfs_test_before_snapshot_clone_ctx = nullptr;
 
 // And the pid a CREATING row records as its producer: 0 (always, outside a test) means getpid().
 extern "C" int64_t wfs_test_fork_owner_pid = 0;
@@ -654,6 +683,8 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         // The source here is always a plain directory or a live world: check_path refuses
         // anything inside the store, so a snapshot is never a snapshot's source and there is
         // no gate to open on this side.
+        if (wfs_test_before_snapshot_clone)
+            wfs_test_before_snapshot_clone(wfs_test_before_snapshot_clone_ctx, src.c_str());
         if ((rc = wfs::fs_clone_tree(src.c_str(), root.c_str(), false))) break;
         // A checkpoint carries the source world's marker; it is not this snapshot's identity.
         String m = joinp(root.c_str(), WFS_MARKER_NAME);
@@ -665,7 +696,18 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         // PR #1 review (4th round): a replay the file system refused is not tolerated. The
         // manifest written below and the hl_groups on the row would then describe a tree that
         // does not exist, so the snapshot fails here and the half-built tree goes away with it.
-        if (hl.groups.size() && (rc = wfs::hardlinks_restore(root.c_str(), hl, nullptr, &hlr))) break;
+        // PR #1 review (5th round): and the live source is the verify root, not nullptr. The
+        // scan and the clone are two separate walks of a tree the user may be writing to, and
+        // nullptr disabled the only check that notices -- a member replaced in that window with
+        // a file of the same size and the same mtime was linked over, silently, with the
+        // snapshot then holding one name's contents under both names. A group the source has
+        // broken since the scan is left alone here...
+        if (hl.groups.size() && (rc = wfs::hardlinks_restore(root.c_str(), hl, src.c_str(), &hlr))) break;
+        // ... and dropped from what this snapshot claims about itself. A fork replays the
+        // manifest against the snapshot without a verify root (a snapshot is immutable), so a
+        // group left in there would be rebuilt one step later, in the fork, over the very
+        // contents this replay declined to overwrite.
+        if (hlr.broken.size()) hl_drop_broken(hl, hlr.broken);
         {
             struct stat rst;
             if (::stat(root.c_str(), &rst) == 0) root_mode = (uint32_t)(rst.st_mode & 07777);

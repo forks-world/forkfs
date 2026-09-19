@@ -401,9 +401,16 @@ bool group_still_linked(const char *verify_root, const HardlinkGroup &g) {
 // One group. Everything here is the same handful of syscalls whichever thread runs it, and no
 // two groups ever touch the same name, so the workers below need no coordination at all.
 void restore_group(const char *tree_root, const char *verify_root, const HardlinkGroup &g,
-                   HardlinkRestore &r, Relender &rl) {
+                   size_t index, HardlinkRestore &r, Relender &rl) {
     if (g.paths.size() < 2) return;
-    if (verify_root && !group_still_linked(verify_root, g)) { r.skipped++; return; }
+    if (verify_root && !group_still_linked(verify_root, g)) {
+        r.skipped++;
+        r.broken.emplace_back((uint64_t)index);
+        return;
+    }
+    // Every name that is in the clone has to end up on the canonical inode, or the group is not
+    // the group any more and whoever writes it down has to know (`broken` above).
+    bool whole = true;
 
     // The canonical file is the first name that is actually there. Promoting the next one
     // matters for a checkpoint of a live world: the first name may have been deleted between
@@ -428,6 +435,7 @@ void restore_group(const char *tree_root, const char *verify_root, const Hardlin
             // somebody's data to save a few blocks.
             if (!S_ISREG(st.st_mode) || st.st_size != bst.st_size || mtime_ns(st) != mtime_ns(bst)) {
                 r.skipped++;
+                whole = false;
                 continue;
             }
             String tmp;
@@ -448,6 +456,7 @@ void restore_group(const char *tree_root, const char *verify_root, const Hardlin
             if (!ok) {
                 if (!r.first_err) r.first_err = e;
                 r.skipped++;
+                whole = false;
                 continue;
             }
             r.links++;
@@ -455,6 +464,7 @@ void restore_group(const char *tree_root, const char *verify_root, const Hardlin
         }
         if (linked) r.groups++;
     }
+    if (!whole) r.broken.emplace_back((uint64_t)index);
 }
 
 // The whole job is metadata transactions (link + rename measure 0.6 ms a pair on 27.0), and
@@ -481,13 +491,14 @@ void *restore_worker(void *arg) {
     for (;;) {
         uint64_t i = __atomic_fetch_add(&j->next, 1, __ATOMIC_RELAXED);
         if (i >= n) break;
-        restore_group(j->tree_root, j->verify_root, j->set->groups[(size_t)i], local, j->rl);
+        restore_group(j->tree_root, j->verify_root, j->set->groups[(size_t)i], (size_t)i, local, j->rl);
     }
     Guard g(j->mu);
     j->agg.groups += local.groups;
     j->agg.links += local.links;
     j->agg.missing += local.missing;
     j->agg.skipped += local.skipped;
+    for (size_t k = 0; k < local.broken.size(); ++k) j->agg.broken.emplace_back(local.broken[k]);
     if (!j->agg.first_err) j->agg.first_err = local.first_err;
     return nullptr;
 }
@@ -512,7 +523,7 @@ int hardlinks_restore(const char *tree_root, const HardlinkSet &set, const char 
         HardlinkRestore r;
         Relender rl;
         for (size_t i = 0; i < set.groups.size(); ++i)
-            restore_group(tree_root, verify_root, set.groups[i], r, rl);
+            restore_group(tree_root, verify_root, set.groups[i], i, r, rl);
         if (out) *out = r;
         return replay_verdict(r);
     }
