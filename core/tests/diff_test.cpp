@@ -21,6 +21,8 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #ifdef __APPLE__
+#include <membership.h>
+#include <sys/acl.h>
 #include <sys/clonefile.h>
 #include <sys/xattr.h>
 #endif
@@ -414,6 +416,153 @@ static void xattr_shortcut(const char *root, const char *store) {
     CHECK(setxattr(p, "com.forks.world.t24", "gone", 4, 0, XATTR_NOFOLLOW) == 0);
     run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
     check_lines("xattr shortcut / restored", &c, NULL, 0);
+
+    free(c.v);
+    wfs_store_close(s);
+}
+
+
+// ---- PR #1 review (P2): a failed xattr read is not "this file has no xattrs" -------------------
+//
+// listxattr(2) and getxattr(2) can fail for reasons that have nothing to do with the attributes:
+// an ACL denying `readextattr`, EIO, an ERANGE retry that cannot allocate. The old code read
+// every negative return as an empty list, so when the other side was also (or looked) empty the
+// two files were declared equal -- a silent "clean" over a comparison that never happened.
+//
+// The fixture makes exactly that case real: two files identical in size, mode, owner, flags and
+// mtime, one of them carrying a deny-readextattr ACL on the world side. An ACL is the right
+// instrument here because it changes nothing else the diff looks at: `st_mode` stays 0644,
+// `st_flags` stays 0, and lstat(2) keeps working, so the entry reaches the xattr leg with
+// everything else already equal -- which is the only place the old bug could be seen.
+//
+// Verified red before the fix: `--full` and the candidate path both reported 0 lines.
+static int deny_readextattr(const char *path) {
+    acl_t a = acl_init(1);
+    if (!a) return -1;
+    acl_entry_t e;
+    uuid_t u;
+    acl_permset_t ps;
+    int rc = -1;
+    if (acl_create_entry(&a, &e) == 0 && acl_set_tag_type(e, ACL_EXTENDED_DENY) == 0 &&
+        mbr_uid_to_uuid(geteuid(), u) == 0 && acl_set_qualifier(e, u) == 0 &&
+        acl_get_permset(e, &ps) == 0 && acl_clear_perms(ps) == 0 &&
+        acl_add_perm(ps, ACL_READ_EXTATTRIBUTES) == 0 && acl_set_permset(e, ps) == 0)
+        rc = acl_set_link_np(path, ACL_TYPE_EXTENDED, a) == 0 ? 0 : -errno;
+    acl_free(a);
+    return rc;
+}
+
+static int clear_acl(const char *path) {
+    acl_t empty = acl_init(0);
+    if (!empty) return -1;
+    int rc = acl_set_link_np(path, ACL_TYPE_EXTENDED, empty) == 0 ? 0 : -errno;
+    acl_free(empty);
+    return rc;
+}
+
+// True once the ACL really does make listxattr(2) fail with EACCES for this user on this
+// volume. If it does not, the case has nothing to test and says so rather than failing.
+static int xattrs_are_unreadable(const char *path) {
+    char names[4096];
+    errno = 0;
+    return listxattr(path, names, sizeof names, XATTR_NOFOLLOW) < 0 && errno == EACCES;
+}
+
+static void xattr_unreadable(const char *root, const char *store) {
+    char src[4096], w[4096], p[4096], sp[4096];
+    join(src, sizeof src, root, "xe-src");
+    join(w, sizeof w, root, "xe-w");
+    CHECK(mkdir(src, 0755) == 0);
+    join(p, sizeof p, src, "open.txt");
+    write_file(p, "same bytes everywhere\n");
+    join(p, sizeof p, src, "blocked.txt");
+    write_file(p, "same bytes everywhere\n");
+
+    wfs_store *s = NULL;
+    CHECK_OK(wfs_store_open(store, &s));
+    wfs_id sid = 0;
+    wfs_snapshot_opts sopts;
+    memset(&sopts, 0, sizeof sopts);
+    sopts.name = "xe";
+    CHECK_OK(wfs_snapshot_create(s, src, &sopts, &sid));
+    wfs_ref from = {WFS_K_SNAPSHOT, sid};
+    wfs_fork_opts o;
+    memset(&o, 0, sizeof o);
+    wfs_id wid = 0;
+    CHECK_OK(wfs_world_create(s, from, w, &o, &wid));
+
+    // An xattr *change* is also what makes FSEvents propose the path, so the candidate path has
+    // something to verify. It is set before the ACL goes on, and it is not what the assertions
+    // below are about: with the attributes readable this entry is a plain `T`, and the point is
+    // that it stays a `T` -- not a silent "clean" -- once they cannot be read at all.
+    join(p, sizeof p, w, "blocked.txt");
+    CHECK(setxattr(p, "com.forks.world.pr1", "v", 1, 0, XATTR_NOFOLLOW) == 0);
+    if (deny_readextattr(p) != 0 || !xattrs_are_unreadable(p)) {
+        printf("  %-28s skipped: a deny-readextattr ACL does not block listxattr here\n",
+               "xattr unreadable");
+        clear_acl(p);
+        wfs_store_close(s);
+        return;
+    }
+    // Everything stat(2) can see is still equal, and the file is still there: the xattr leg is
+    // the only thing between this entry and "clean".
+    struct stat ws, ss;
+    join(sp, sizeof sp, src, "blocked.txt");
+    CHECK(lstat(p, &ws) == 0 && lstat(sp, &ss) == 0);
+    CHECK((ws.st_mode & 07777) == (ss.st_mode & 07777) && ws.st_size == ss.st_size);
+
+    Collect c;
+    memset(&c, 0, sizeof c);
+    wfs_diff_stats st;
+    static const Want want[] = {{'T', "blocked.txt"}};
+    settle();
+
+    run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
+    CHECK(st.full_scan == 1);
+    check_lines("xattr unreadable / --full", &c, want, 1);
+    CHECK(st.xattr_errors == 1);
+
+    run_diff(s, wid, 0, &c, &st);
+    check_lines("xattr unreadable / FSEvents", &c, want, 1);
+    CHECK(st.xattr_errors == 1);
+
+    // With the leg switched off there is nothing to fail at, and nothing is reported.
+    run_diff(s, wid, WFS_DIFF_FULL | WFS_DIFF_NO_XATTR, &c, &st);
+    check_lines("xattr unreadable / --no-xattr", &c, NULL, 0);
+    CHECK(st.xattr_errors == 0);
+
+    // Take the ACL off and the entry goes back to being an honest `T` for the one xattr that
+    // really is different -- and the error counter goes back to zero.
+    CHECK(clear_acl(p) == 0);
+    run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
+    check_lines("xattr unreadable / readable again", &c, want, 1);
+    CHECK(st.xattr_errors == 0);
+    CHECK(removexattr(p, "com.forks.world.pr1", XATTR_NOFOLLOW) == 0);
+    run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
+    check_lines("xattr unreadable / clean again", &c, NULL, 0);
+    CHECK(st.xattr_errors == 0);
+
+    // The snapshot side is not the workspace: it is ours, we cloned it, and the comparison runs
+    // inside the SnapGate window with the gate open. EACCES there is a broken store, so the
+    // whole diff fails instead of quietly turning into a list of changes. Only the full scan can
+    // show this -- the candidate path is driven by what changed in the *world*, and nothing did.
+    wfs_snapshot_rec sr;
+    CHECK_OK(wfs_snapshot_info(s, sid, &sr));
+    CHECK(chmod(sr.path, 0700) == 0);        // behind the gate, exactly as the guard does
+    join(sp, sizeof sp, sr.path, "blocked.txt");
+    CHECK(deny_readextattr(sp) == 0);
+    int blocked = xattrs_are_unreadable(sp);
+    CHECK(chmod(sr.path, 0) == 0);
+    if (blocked) {
+        free(c.v);
+        memset(&c, 0, sizeof c);
+        CHECK_RC(wfs_world_diff_ex(s, wid, WFS_DIFF_FULL, collect_cb, &c, &st), -EACCES);
+        printf("  %-28s the diff fails with EACCES instead of reporting changes\n",
+               "xattr unreadable / snapshot");
+    }
+    CHECK(chmod(sr.path, 0700) == 0);
+    CHECK(clear_acl(sp) == 0);
+    CHECK(chmod(sr.path, 0) == 0);
 
     free(c.v);
     wfs_store_close(s);
@@ -1015,6 +1164,9 @@ int main() {
         char store5[4096];
         join(store5, sizeof store5, root, "store-prov");
         provenance_case(root, store5);
+        char store6[4096];
+        join(store6, sizeof store6, root, "store-xattr-err");
+        xattr_unreadable(root, store6);
     }
 #endif
 

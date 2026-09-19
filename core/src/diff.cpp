@@ -147,22 +147,58 @@ bool content_equal(const char *a, const char *b, uint64_t *bytes) {
     return same;
 }
 
+// PR #1 review (P2): a listxattr(2) or getxattr(2) that *fails* says nothing whatever about the
+// attributes, and the old code read every negative return as "no attributes". Two files whose
+// xattrs could not be read then came out equal -- silently, and exactly in the cases where
+// silence is worst: EACCES (an ACL denying readextattr), EIO, an ERANGE retry that could not
+// allocate. Only a successful zero-length listxattr means "none"; every failure is a third
+// answer, and the caller turns it into a `T` and a counter, or into the diff's error.
+enum XattrCmp { XA_EQUAL = 0, XA_DIFFER = 1, XA_ERROR = 2 };
+
+// On XA_ERROR, which side could not be read and why. `a` is the world side, `b` the snapshot
+// side -- classify() cares about the difference: a snapshot is ours and is read under the gate,
+// so EACCES there is a broken store and not news about the workspace.
+struct XattrErr {
+    int a = 0, b = 0;
+};
+
 #ifdef __APPLE__
+// An errno that is never 0, whatever the libc left behind.
+int errno_or(int fallback) { return errno ? errno : fallback; }
+
 // The slow path: a value too big for the stack buffer below, so its size has to be asked for
 // first. Two getxattr(2) per side instead of one, and getxattr is 14 µs on APFS.
-bool xattr_value_equal(const char *a, const char *b, const char *name) {
+XattrCmp xattr_value_equal(const char *a, const char *b, const char *name, XattrErr &e) {
+    errno = 0;
     ssize_t sa = ::getxattr(a, name, nullptr, 0, 0, XATTR_NOFOLLOW);
+    int ea = sa < 0 ? errno_or(EIO) : 0;
+    errno = 0;
     ssize_t sb = ::getxattr(b, name, nullptr, 0, 0, XATTR_NOFOLLOW);
-    if (sa != sb) return false;
-    if (sa <= 0) return true;
+    int eb = sb < 0 ? errno_or(EIO) : 0;
+    // ENOATTR is an answer, not a failure: the name listxattr(2) handed us was removed in
+    // between, so that side genuinely does not have it any more. Anything else is a failure.
+    if (ea && ea != ENOATTR) { e.a = ea; return XA_ERROR; }
+    if (eb && eb != ENOATTR) { e.b = eb; return XA_ERROR; }
+    if ((ea != 0) != (eb != 0)) return XA_DIFFER;
+    if (ea && eb) return XA_EQUAL;   // gone from both
+    if (sa != sb) return XA_DIFFER;
+    if (sa == 0) return XA_EQUAL;
     char *va = (char *)::malloc((size_t)sa * 2);
-    if (!va) return true; // cannot tell: do not invent a difference
+    if (!va) { e.a = ENOMEM; return XA_ERROR; }   // cannot tell: and "cannot tell" is not "equal"
     char *vb = va + sa;
-    bool same = ::getxattr(a, name, va, (size_t)sa, 0, XATTR_NOFOLLOW) == sa &&
-                ::getxattr(b, name, vb, (size_t)sa, 0, XATTR_NOFOLLOW) == sa &&
-                memcmp(va, vb, (size_t)sa) == 0;
+    errno = 0;
+    ssize_t ga = ::getxattr(a, name, va, (size_t)sa, 0, XATTR_NOFOLLOW);
+    int ra = ga < 0 ? errno_or(EIO) : 0;
+    errno = 0;
+    ssize_t gb = ::getxattr(b, name, vb, (size_t)sa, 0, XATTR_NOFOLLOW);
+    int rb = gb < 0 ? errno_or(EIO) : 0;
+    XattrCmp rc;
+    if (ra) { e.a = ra; rc = XA_ERROR; }
+    else if (rb) { e.b = rb; rc = XA_ERROR; }
+    else if (ga != sa || gb != sa || memcmp(va, vb, (size_t)sa) != 0) rc = XA_DIFFER;
+    else rc = XA_EQUAL;
     ::free(va);
-    return same;
+    return rc;
 }
 
 // T2.4: ask for the value straight away rather than for its size and then its value. Almost
@@ -171,7 +207,7 @@ bool xattr_value_equal(const char *a, const char *b, const char *name) {
 const size_t kXattrInline = 1024;
 
 // The values behind a list of names (NUL-separated, `n` bytes), on both sides.
-bool xattr_values_equal(const char *a, const char *b, const char *names, size_t n) {
+XattrCmp xattr_values_equal(const char *a, const char *b, const char *names, size_t n, XattrErr &e) {
     for (size_t i = 0; i < n;) {
         const char *name = names + i;
         size_t len = ::strnlen(name, n - i);
@@ -180,29 +216,60 @@ bool xattr_values_equal(const char *a, const char *b, const char *names, size_t 
         ssize_t sa = ::getxattr(a, name, va, sizeof va, 0, XATTR_NOFOLLOW);
         ssize_t sb = ::getxattr(b, name, vb, sizeof vb, 0, XATTR_NOFOLLOW);
         if (sa < 0 || sb < 0) {
-            // ERANGE (a value over kXattrInline), or the attribute went away between the
-            // listxattr and now. Ask the careful way.
-            if (!xattr_value_equal(a, b, name)) return false;
+            // ERANGE (a value over kXattrInline), the attribute going away between the
+            // listxattr and now, or a read that simply failed. Ask the careful way, which is
+            // the only one that tells the three apart.
+            XattrCmp c = xattr_value_equal(a, b, name, e);
+            if (c != XA_EQUAL) return c;
         } else if (sa != sb || memcmp(va, vb, (size_t)sa) != 0) {
-            return false;
+            return XA_DIFFER;
         }
         i += len + 1;
     }
-    return true;
+    return XA_EQUAL;
+}
+
+// listxattr(2) for one side, onto the stack when it fits and onto the heap when it does not.
+// Returns the byte count with *err == 0, or -1 with *err set -- so "empty" and "could not be
+// read" can never be confused, which is the whole point of this round of the review.
+ssize_t list_names(const char *path, char *stackbuf, size_t cap, char **heap, char **out, int *err) {
+    *heap = nullptr;
+    *err = 0;
+    errno = 0;
+    ssize_t n = ::listxattr(path, stackbuf, cap, XATTR_NOFOLLOW);
+    if (n >= 0) { *out = stackbuf; return n; }
+    if (errno != ERANGE) { *err = errno_or(EIO); return -1; }
+    errno = 0;
+    ssize_t need = ::listxattr(path, nullptr, 0, XATTR_NOFOLLOW);
+    if (need < 0) { *err = errno_or(EIO); return -1; }
+    if (need == 0) { *out = stackbuf; return 0; }
+    char *h = (char *)::malloc((size_t)need);
+    if (!h) { *err = ENOMEM; return -1; }
+    errno = 0;
+    n = ::listxattr(path, h, (size_t)need, XATTR_NOFOLLOW);
+    if (n < 0) { ::free(h); *err = errno_or(EIO); return -1; }
+    *heap = h;
+    *out = h;
+    return n;
 }
 
 // Every name both sides have, compared. The fallback for a file with more than kXattrNames
 // bytes of names, where the filtered-name path below cannot hold them.
-bool xattr_equal_raw(const char *a, const char *b) {
-    char la[4096], lb[4096];
-    ssize_t na = ::listxattr(a, la, sizeof la, XATTR_NOFOLLOW);
-    ssize_t nb = ::listxattr(b, lb, sizeof lb, XATTR_NOFOLLOW);
-    if (na < 0) na = 0;
-    if (nb < 0) nb = 0;
-    if (na != nb) return false;
-    if (na == 0) return true;
-    if (memcmp(la, lb, (size_t)na) != 0) return false; // a clone keeps the order
-    return xattr_values_equal(a, b, la, (size_t)na);
+XattrCmp xattr_equal_raw(const char *a, const char *b, XattrErr &e) {
+    char sa[4096], sb[4096], *ha = nullptr, *hb = nullptr, *la = nullptr, *lb = nullptr;
+    int ea = 0, eb = 0;
+    ssize_t na = list_names(a, sa, sizeof sa, &ha, &la, &ea);
+    ssize_t nb = list_names(b, sb, sizeof sb, &hb, &lb, &eb);
+    XattrCmp rc;
+    if (na < 0) { e.a = ea; rc = XA_ERROR; }
+    else if (nb < 0) { e.b = eb; rc = XA_ERROR; }
+    else if (na != nb) rc = XA_DIFFER;
+    else if (na == 0) rc = XA_EQUAL;
+    else if (memcmp(la, lb, (size_t)na) != 0) rc = XA_DIFFER; // a clone keeps the order
+    else rc = xattr_values_equal(a, b, la, (size_t)na, e);
+    ::free(ha);
+    ::free(hb);
+    return rc;
 }
 
 // M2: `com.apple.provenance` is not workspace state. macOS 27 stamps it on every file a local
@@ -222,27 +289,21 @@ bool xattr_ignored(const char *name, size_t len, int flags) {
 
 const size_t kXattrNames = 4096;
 
+// xattr_names() return codes, so that the three outcomes stay distinguishable all the way up.
+const ssize_t kNamesTooMany = -1;   // more names than `out` holds: fall back to xattr_equal_raw
+const ssize_t kNamesFailed = -2;    // listxattr(2) failed: NOT "no attributes"
+
 // One side's names, in the order listxattr(2) reports them, with the ignored ones dropped. A
 // side the walk already declared EF_NO_XATTRS is not asked at all -- that is the free half of
-// the shortcut. Returns the used length of `out`, or -1 when the names did not fit (then the
-// caller must fall back to xattr_equal_raw rather than guess).
-ssize_t xattr_names(const char *path, uint8_t state, int flags, char *out, size_t cap) {
+// the shortcut, and it stays, because EF_NO_XATTRS is the file system *succeeding* at saying
+// "none at all". A listxattr that fails is the opposite of that, and returns kNamesFailed.
+ssize_t xattr_names(const char *path, uint8_t state, int flags, char *out, size_t cap, int *err) {
+    *err = 0;
     if (state == wfs::FS_XATTR_NONE) return 0;
-    char stackbuf[4096];
-    char *heap = nullptr;
-    char *raw = stackbuf;
-    ssize_t n = ::listxattr(path, raw, sizeof stackbuf, XATTR_NOFOLLOW);
-    if (n < 0 && errno == ERANGE) {
-        ssize_t need = ::listxattr(path, nullptr, 0, XATTR_NOFOLLOW);
-        if (need > 0 && (heap = (char *)::malloc((size_t)need)) != nullptr) {
-            raw = heap;
-            n = ::listxattr(path, raw, (size_t)need, XATTR_NOFOLLOW);
-        }
-    }
-    if (n <= 0) { // no attributes, or the file went away under us: nothing to compare
-        ::free(heap);
-        return 0;
-    }
+    char stackbuf[4096], *heap = nullptr, *raw = nullptr;
+    ssize_t n = list_names(path, stackbuf, sizeof stackbuf, &heap, &raw, err);
+    if (n < 0) return kNamesFailed;
+    if (n == 0) { ::free(heap); return 0; } // a real, successful "this file has no attributes"
     ssize_t used = 0;
     for (ssize_t i = 0; i < n;) {
         const char *name = raw + i;
@@ -251,7 +312,7 @@ ssize_t xattr_names(const char *path, uint8_t state, int flags, char *out, size_
         if (!xattr_ignored(name, len, flags)) {
             if ((size_t)used + len + 1 > cap) {
                 ::free(heap);
-                return -1;
+                return kNamesTooMany;
             }
             memcpy(out + used, name, len + 1);
             used += (ssize_t)len + 1;
@@ -266,7 +327,10 @@ ssize_t xattr_names(const char *path, uint8_t state, int flags, char *out, size_
 //
 // T2.4 gave the walk a free verdict per entry (ATTR_CMNEXT_EXT_FLAGS / EF_NO_XATTRS): when both
 // sides say "none at all", there is nothing to list and nothing to compare, and not one syscall
-// is made. EF_NO_XATTRS only ever denies, so that shortcut can skip work but never a difference.
+// is made. EF_NO_XATTRS only ever denies, so that shortcut can skip work but never a difference
+// -- and, unlike a failed listxattr, it is an answer the file system gave on purpose, which is
+// why the PR #1 review's rule leaves it standing. The moment only *one* side has the bit, the
+// other side is listed for real, and a failure there is an error, not an empty list.
 //
 // M2 adds the other half. The flag is never set on a file this machine created (provenance is
 // always there), so on such a tree the shortcut never fired and the whole default scan paid for
@@ -274,18 +338,24 @@ ssize_t xattr_names(const char *path, uint8_t state, int flags, char *out, size_
 // file whose only xattr is provenance comes back with an empty list and counts as xattr-free,
 // exactly as if the file system had set the flag. Two listxattr(2) at 2.1 µs is what that costs;
 // the four getxattr(2) at 14 µs that used to follow are gone.
-bool xattr_equal(const char *a, const char *b, uint8_t axa, uint8_t bxa, int flags) {
-    if (axa == wfs::FS_XATTR_NONE && bxa == wfs::FS_XATTR_NONE) return true;
+XattrCmp xattr_equal(const char *a, const char *b, uint8_t axa, uint8_t bxa, int flags,
+                     XattrErr &e) {
+    if (axa == wfs::FS_XATTR_NONE && bxa == wfs::FS_XATTR_NONE) return XA_EQUAL;
     char na[kXattrNames], nb[kXattrNames];
-    ssize_t la = xattr_names(a, axa, flags, na, sizeof na);
-    ssize_t lb = xattr_names(b, bxa, flags, nb, sizeof nb);
-    if (la < 0 || lb < 0) return xattr_equal_raw(a, b); // more names than kXattrNames holds
-    if (la == 0 && lb == 0) return true;               // nothing, or only ignored names
-    if (la != lb || memcmp(na, nb, (size_t)la) != 0) return false; // a clone keeps the order
-    return xattr_values_equal(a, b, na, (size_t)la);
+    int ea = 0, eb = 0;
+    ssize_t la = xattr_names(a, axa, flags, na, sizeof na, &ea);
+    ssize_t lb = xattr_names(b, bxa, flags, nb, sizeof nb, &eb);
+    if (la == kNamesFailed) { e.a = ea; return XA_ERROR; }
+    if (lb == kNamesFailed) { e.b = eb; return XA_ERROR; }
+    if (la < 0 || lb < 0) return xattr_equal_raw(a, b, e);  // more names than kXattrNames holds
+    if (la == 0 && lb == 0) return XA_EQUAL;                // nothing, or only ignored names
+    if (la != lb || memcmp(na, nb, (size_t)la) != 0) return XA_DIFFER; // a clone keeps the order
+    return xattr_values_equal(a, b, na, (size_t)la, e);
 }
 #else
-bool xattr_equal(const char *, const char *, uint8_t, uint8_t, int) { return true; }
+XattrCmp xattr_equal(const char *, const char *, uint8_t, uint8_t, int, XattrErr &) {
+    return XA_EQUAL;
+}
 #endif
 
 // ---- the record sink -------------------------------------------------------------------------
@@ -337,7 +407,19 @@ struct Ctx {
     int flags = 0;
     Sink *sink = nullptr;
     uint64_t compared = 0, content_cmp = 0, bytes_read = 0;
+    // PR #1 review (P2): entries whose xattrs could not be read on one side. They are reported
+    // as `T` -- never as equal -- and counted here so the caller can say the comparison was
+    // incomplete rather than pretend it was clean.
+    uint64_t xattr_errors = 0;
+    int fatal = 0;   // the first error that must end the whole diff (see note_fatal)
 };
+
+// A failure that is not about the workspace but about us. Recorded once, by whichever of the
+// four walk threads gets there first, and returned instead of a diff.
+void note_fatal(Ctx &c, int rc) {
+    int none = 0;
+    __atomic_compare_exchange_n(&c.fatal, &none, rc, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+}
 
 // The other side of a path. Normally one getattrlist(2), which brings the xattr verdict with
 // it; when that verdict cannot be used -- WFS_DIFF_NO_XATTR, or a directory, whose xattrs are
@@ -386,8 +468,21 @@ int classify(Ctx &c, const char *wpath, const struct stat &ws, uint8_t wxa, cons
         mtime_of(ss, &ssec, &sns);
         if (wsec != ssec || wns != sns) return WFS_C_META;
     }
-    if (!(c.flags & WFS_DIFF_NO_XATTR) && !xattr_equal(wpath, spath, wxa, sxa, c.flags))
-        return WFS_C_META;
+    if (!(c.flags & WFS_DIFF_NO_XATTR)) {
+        XattrErr xe;
+        XattrCmp x = xattr_equal(wpath, spath, wxa, sxa, c.flags, xe);
+        if (x == XA_ERROR) {
+            // Never "equal": the attributes were not compared, so the entry is reported as the
+            // metadata change it may well be, and counted.
+            bump(c.xattr_errors);
+            // ... except on the snapshot side. That tree is ours, it was cloned by us, and it
+            // is read inside the SnapGate window with the gate open, so a permission failure
+            // there is a broken store and not news about the world. Say so, loudly.
+            if (xe.b == EACCES || xe.b == EPERM) note_fatal(c, -xe.b);
+            return WFS_C_META;
+        }
+        if (x == XA_DIFFER) return WFS_C_META;
+    }
     return 0;
 }
 
@@ -621,6 +716,9 @@ extern "C" int wfs_world_diff_ex(wfs_store *s, wfs_id world, int flags, wfs_diff
             for (size_t i = 0; i < bag.size(); ++i) verify_candidate(c, bag.at(i));
         else if (int frc = full_scan(c))
             return frc;
+        // PR #1 review (P2): an unreadable snapshot side is not a diff result. Both paths
+        // above reach it, and the guard below closes the gate on the way out either way.
+        if (c.fatal) return c.fatal;
     }
     // From here on nothing touches the snapshot: sorting and reporting are pure bookkeeping.
 
@@ -669,6 +767,7 @@ extern "C" int wfs_world_diff_ex(wfs_store *s, wfs_id world, int flags, wfs_diff
         stats->compared = c.compared;
         stats->content_cmp = c.content_cmp;
         stats->bytes_read = c.bytes_read;
+        stats->xattr_errors = c.xattr_errors;
         stats->events_id = wr.fsevents_id;
         stats->full_scan = full ? 1 : 0;
         stats->fallback = fallback;

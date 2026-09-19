@@ -516,6 +516,12 @@ typedef struct wfs_diff_stats {
     uint64_t compared;    /* paths stat'ed on both sides */
     uint64_t content_cmp; /* files whose bytes had to be read (size equal, mtime differs) */
     uint64_t bytes_read;
+    /* PR #1 review: entries whose extended attributes could not be read on one side
+     * (listxattr/getxattr failed with EACCES, EIO, ...). Such an entry is reported as 'T' --
+     * a failed read is never equality -- and counted here, so a caller can say the comparison
+     * was incomplete. A failure on the *snapshot* side is not a diff result at all: the whole
+     * call returns -EACCES/-EPERM instead. */
+    uint64_t xattr_errors;
     uint64_t events_id;   /* the cursor that was used */
     int full_scan;        /* 1 = both trees were walked */
     int fallback;         /* wfs_diff_fallback */

@@ -682,6 +682,13 @@ static int cmd_diff(wfs_store *s, int argc, char **argv) {
     const char *why = st.full_scan ? fallback_reason(st.fallback) : NULL;
     if (why) fprintf(stderr, "world: note: %s; compared both trees instead\n", why);
 
+    // PR #1 review: an entry whose xattrs could not be read is reported as a change, never as
+    // clean -- but the change is a guess, so say how many of them there were.
+    if (st.xattr_errors)
+        fprintf(stderr, "world: note: %llu path%s reported as metadata changes because their "
+                        "extended attributes could not be read\n",
+                (unsigned long long)st.xattr_errors, st.xattr_errors == 1 ? " was" : "s were");
+
     if (stat_only) {
         printf("%llu added, %llu modified, %llu deleted, %llu metadata-only\n",
                (unsigned long long)st.added, (unsigned long long)st.modified,
