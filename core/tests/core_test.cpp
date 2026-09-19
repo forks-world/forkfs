@@ -937,6 +937,123 @@ int main() {
     join(q, sizeof q, whl2, "sub/g3-0");
     CHECK(ino_of(p) != ino_of(q) && nlink_of(p) == 1);
 
+    // ---- PR #1 review (4th round, P2): a hardlink group under a read-only directory ----
+    // 0555 is an ordinary mode for a vendored tree, a generated fixture, a `chmod -R a-w`
+    // release directory. The clone wears it too, so link(2)/rename(2) inside it come back
+    // EACCES -- and the replay's result was ignored, so the snapshot was published with a
+    // manifest and a row advertising a group its tree did not have, and every fork and pool
+    // entry inherited the lie. Now the directory is lent owner write for the two calls and
+    // gets its exact mode back.
+    char rosrc[4096], snapdir[4096];
+    join(snapdir, sizeof snapdir, store, "snapshots");
+    join(rosrc, sizeof rosrc, root, "roproj");
+    CHECK(mkdir(rosrc, 0755) == 0);
+    join(p, sizeof p, rosrc, "ro");
+    CHECK(mkdir(p, 0755) == 0);
+    join(q, sizeof q, rosrc, "ro/x");
+    write_file(q, "read only\n");
+    join(p, sizeof p, rosrc, "ro/y");
+    CHECK(link(q, p) == 0);
+    join(p, sizeof p, rosrc, "ro");
+    CHECK(chmod(p, 0555) == 0);           // no owner write, and that is how it must stay
+
+    wfs_id sro = 0;
+    memset(&sopts, 0, sizeof sopts);
+    sopts.name = "ro";
+    CHECK_OK(wfs_snapshot_create(s, rosrc, &sopts, &sro));
+    CHECK_OK(wfs_snapshot_info(s, sro, &sr));
+    CHECK(sr.hl_groups == 1 && sr.hl_external == 0 && sr.hardlinks == 2);
+    CHECK_OK(wfs_snapshot_verify(s, sro, &vr));   // the lent mode was given back before this
+    CHECK(vr.missing == 0 && vr.modified == 0 && vr.extra == 0);
+    CHECK(chmod(sr.path, 0700) == 0);     // look behind the gate
+    join(p, sizeof p, sr.path, "ro/x");
+    join(q, sizeof q, sr.path, "ro/y");
+    CHECK(ino_of(p) == ino_of(q) && nlink_of(p) == 2);
+    join(p, sizeof p, sr.path, "ro");
+    CHECK(lstat(p, &st) == 0 && (st.st_mode & 07777) == 0555);   // exactly the mode it had
+    CHECK(n_with_prefix(p, ".wfs-hl-") == 0);
+    CHECK(chmod(sr.path, 0) == 0);
+
+    char wro[4096];
+    join(wro, sizeof wro, worlds, "w-ro");
+    wfs_ref from_ro = {WFS_K_SNAPSHOT, sro};
+    memset(&opts, 0, sizeof opts);
+    opts.name = "w-ro";
+    opts.no_pool = 1;
+    memset(&hfr, 0, sizeof hfr);
+    CHECK_OK(wfs_world_create_ex(s, from_ro, wro, &opts, &hfr));
+    CHECK(hfr.hardlinks == 1);            // the one name relinked to its canonical file
+    join(p, sizeof p, wro, "ro/x");
+    join(q, sizeof q, wro, "ro/y");
+    CHECK(ino_of(p) == ino_of(q) && nlink_of(p) == 2);
+    join(p, sizeof p, wro, "ro");
+    CHECK(lstat(p, &st) == 0 && (st.st_mode & 07777) == 0555);   // and in the world as well
+    CHECK(n_with_prefix(p, ".wfs-hl-") == 0);
+
+    // The same through the pool, whose filler does the replay on the entry it clones.
+    CHECK_OK(wfs_pool_fill(s, sro, 1, &made));
+    CHECK(made == 1);
+    char wropool[4096];
+    join(wropool, sizeof wropool, worlds, "w-ro-pool");
+    memset(&opts, 0, sizeof opts);
+    opts.name = "w-ro-pool";
+    memset(&hfr, 0, sizeof hfr);
+    CHECK_OK(wfs_world_create_ex(s, from_ro, wropool, &opts, &hfr));
+    CHECK(hfr.from_pool == 1);
+    join(p, sizeof p, wropool, "ro/x");
+    join(q, sizeof q, wropool, "ro/y");
+    CHECK(ino_of(p) == ino_of(q) && nlink_of(p) == 2);
+    join(p, sizeof p, wropool, "ro");
+    CHECK(lstat(p, &st) == 0 && (st.st_mode & 07777) == 0555);
+
+    // And the other half of the fix: a replay the file system really refuses must not be
+    // published at all. Nothing on a developer's disk makes link(2) fail that way, so the seam
+    // says it did -- what is being pinned down is the unwinding, not the errno.
+    size_t snaps_before = 0, trees_before = n_with_prefix(snapdir, "S");
+    CHECK_OK(wfs_snapshot_list(s, NULL, 0, &snaps_before));
+    wfs_test_hardlink_restore_err = -EIO;
+    {
+        wfs_id sfail = 0;
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "ro-fail";
+        CHECK_RC(wfs_snapshot_create(s, rosrc, &sopts, &sfail), -EIO);
+        CHECK(sfail == 0);
+        size_t snaps_after = 0;
+        CHECK_OK(wfs_snapshot_list(s, NULL, 0, &snaps_after));
+        CHECK(snaps_after == snaps_before);                      // no row
+        CHECK(n_with_prefix(snapdir, "S") == trees_before);      // no S<n>, no S<n>.wfs-tmp
+
+        // A fork unwinds the same way: no tree at --to and no world row left behind.
+        char wfail[4096];
+        join(wfail, sizeof wfail, worlds, "w-ro-fail");
+        memset(&opts, 0, sizeof opts);
+        opts.name = "w-ro-fail";
+        opts.no_pool = 1;
+        wfs_id wfailid = 0;
+        CHECK_RC(wfs_world_create(s, from_ro, wfail, &opts, &wfailid), -EIO);
+        CHECK(!exists(wfail));
+        CHECK(n_with_prefix(worlds, ".wfs-fork-") == 0);
+
+        // And a pool fill drops the entry rather than parking a tree that is not a faithful
+        // clone of the snapshot it claims to be one of.
+        CHECK_OK(wfs_pool_drain(s, sro, &removed));
+        CHECK_RC(wfs_pool_fill(s, sro, 1, &made), -EIO);
+        CHECK(made == 0);
+        CHECK_OK(wfs_pool_status(s, ps, 4, &pn));
+        CHECK(pn == 0);
+    }
+    wfs_test_hardlink_restore_err = 0;
+    // With the seam cleared the very same snapshot succeeds: nothing was poisoned on the way.
+    {
+        wfs_id sagain = 0;
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "ro-again";
+        CHECK_OK(wfs_snapshot_create(s, rosrc, &sopts, &sagain));
+        CHECK_OK(wfs_snapshot_verify(s, sagain, &vr));
+        CHECK(vr.missing == 0 && vr.modified == 0 && vr.extra == 0);
+        CHECK_OK(wfs_snapshot_discard(s, sagain, 1, 0));
+    }
+
     // ---- PR #1 review (P1): a fork in flight and `discard S<n>` cannot both win ----
     //
     // The window the review found: a pool-backed fork claims the last entry and pauses before it

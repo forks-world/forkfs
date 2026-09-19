@@ -655,7 +655,10 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         // else looks at the tree, so the manifest below records the nlinks this snapshot
         // really has and a fork from it starts from a faithful copy. The source may be a live
         // world, so a name that moved between the scan and the clone is tolerated, not fixed.
-        if (hl.groups.size()) wfs::hardlinks_restore(root.c_str(), hl, nullptr, &hlr);
+        // PR #1 review (4th round): a replay the file system refused is not tolerated. The
+        // manifest written below and the hl_groups on the row would then describe a tree that
+        // does not exist, so the snapshot fails here and the half-built tree goes away with it.
+        if (hl.groups.size() && (rc = wfs::hardlinks_restore(root.c_str(), hl, nullptr, &hlr))) break;
         {
             struct stat rst;
             if (::stat(root.c_str(), &rst) == 0) root_mode = (uint32_t)(rst.st_mode & 07777);
@@ -1065,8 +1068,11 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
             wfs::HardlinkSet hl;
             if (wfs::hardlinks_manifest_read(hl_manifest.c_str(), hl) == 0 && hl.groups.size()) {
                 wfs::HardlinkRestore hr;
-                wfs::hardlinks_restore(tmp.c_str(), hl, hl_verify, &hr);
+                rc = wfs::hardlinks_restore(tmp.c_str(), hl, hl_verify, &hr);
                 res->hardlinks = hr.links;
+                // PR #1 review (4th round): the fork's own tree would disagree with the
+                // snapshot it claims to be a copy of. Unwind rather than publish it.
+                if (rc) break;
             }
         }
         if ((rc = marker_write(tmp.c_str(), s->store_id.c_str(), s->dir.c_str(), id, nm, snapshot_id, parent_world, created)))

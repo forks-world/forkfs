@@ -198,8 +198,12 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
         if (si.hl_groups) {
             HardlinkSet hl;
             String mp = hardlinks_manifest_path(si.root.c_str());
-            if (hardlinks_manifest_read(mp.c_str(), hl) == 0 && hl.groups.size())
-                hardlinks_restore(tmp.c_str(), hl, nullptr, nullptr);
+            // PR #1 review (4th round): an entry whose groups could not be replayed is not a
+            // faithful clone of the snapshot, and a fork would hand it out as one. Drop it --
+            // the filler's error path removes the tree and the row.
+            if (hardlinks_manifest_read(mp.c_str(), hl) == 0 && hl.groups.size() &&
+                (rc = hardlinks_restore(tmp.c_str(), hl, nullptr, nullptr)))
+                break;
         }
         // The snapshot's own marker is never in there (wfs_snapshot_create removes it), so the
         // entry carries no identity at all until a fork writes one.

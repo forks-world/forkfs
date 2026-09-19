@@ -11,6 +11,12 @@
 #include <unistd.h>
 #include <utility>   // std::move only
 
+// The test seam for "the replay failed" (PR #1 review, 4th round). A link(2) that the file
+// system refuses is not something a test can produce on a developer's machine, and what has to
+// be pinned down is the unwinding: no S<n> tree, no row, no half-built world. Nothing in the
+// library ever assigns this; it is 0 in every run that is not core_test.
+extern "C" int wfs_test_hardlink_restore_err = 0;
+
 namespace wfs {
 
 namespace {
@@ -283,6 +289,98 @@ bool link_under_fresh_name(const char *canon, const String &target, String &tmp)
     return false;
 }
 
+// ---- directories the source made read-only ----------------------------------------------------
+//
+// PR #1 review (4th round, P2): a hardlink group can live under a directory whose owner-write
+// bit the source does not set -- 0555 is an ordinary mode for a vendored tree, a generated
+// fixture, a `chmod -R a-w` release directory. The clone wears that mode too, so link(2) and
+// rename(2) inside it come back EACCES, the group could not be rebuilt, and the snapshot was
+// published anyway: a tree whose manifest and database row advertise a group it does not have,
+// inherited by every fork and every pool entry made from it.
+//
+// So the replay lends the directory owner write (and search) for exactly the two syscalls and
+// puts it back the way it was -- the exact mode, and the UF_IMMUTABLE/UF_APPEND flags if it had
+// any. The lends are recorded on a stack and undone in reverse on every way out, errors
+// included, by the destructor. Two groups can live in the same directory and the replay is four
+// threads wide, so the whole lend/link/rename/restore sequence is serialized on one mutex: it
+// costs nothing in the common case, where it never runs at all.
+struct DirLend {
+    String path;
+    mode_t mode = 0;
+    uint32_t flags = 0;
+    bool had_flags = false;
+};
+
+class LendStack {
+  public:
+    LendStack() = default;
+    LendStack(const LendStack &) = delete;
+    LendStack &operator=(const LendStack &) = delete;
+    ~LendStack() {
+        // In reverse, and unconditionally: this runs on the success path and on every error
+        // path, so a directory is never left more permissive than we found it.
+        for (size_t i = v_.size(); i-- > 0;) {
+            ::chmod(v_[i].path.c_str(), v_[i].mode);
+#ifdef __APPLE__
+            if (v_[i].had_flags) ::lchflags(v_[i].path.c_str(), (u_int32_t)v_[i].flags);
+#endif
+        }
+    }
+    // Gives `dir` owner write + search. False means the directory could not be read or could not
+    // be changed at all, and the caller fails exactly as it did before.
+    bool lend(const char *dir) {
+        struct stat st;
+        if (::lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) return false;
+        DirLend u;
+        u.path.assign(dir);
+        u.mode = (mode_t)(st.st_mode & 07777);
+#ifdef __APPLE__
+        u.flags = (uint32_t)st.st_flags;
+        u.had_flags = (st.st_flags & (UF_IMMUTABLE | UF_APPEND)) != 0;
+        if (u.had_flags &&
+            ::lchflags(dir, (u_int32_t)(st.st_flags & ~(uint32_t)(UF_IMMUTABLE | UF_APPEND))) != 0)
+            return false;
+#endif
+        mode_t want = (mode_t)(u.mode | S_IWUSR | S_IXUSR);
+        if (want != u.mode && ::chmod(dir, want) != 0) {
+#ifdef __APPLE__
+            if (u.had_flags) ::lchflags(dir, (u_int32_t)u.flags);
+#endif
+            return false;
+        }
+        v_.emplace_back(std::move(u));   // recorded only once it really changed
+        return true;
+    }
+
+  private:
+    Vec<DirLend> v_;
+};
+
+// The serialization point for every lend in one replay. One per hardlinks_restore() call, on
+// its stack: nothing here is global state.
+struct Relender {
+    Mutex mu;
+};
+
+// link(2) + rename(2) again, with the target's directory lent owner write for their duration.
+// `*err` is the negative errno of whichever call failed when this returns false.
+bool relink_under_lend(Relender &rl, const char *canon, const String &target, int *err) {
+    Guard lk(rl.mu);
+    String dir;
+    dir_prefix(target, dir);
+    if (dir.size() > 1) dir.resize(dir.size() - 1);   // dir_prefix keeps the trailing '/'
+    LendStack lend;
+    if (!lend.lend(dir.c_str())) return false;
+    String tmp;
+    if (!link_under_fresh_name(canon, target, tmp)) { *err = -errno; return false; }
+    if (::rename(tmp.c_str(), target.c_str()) != 0) {
+        *err = -errno;
+        ::unlink(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
 // Every name of the group still exists in the live tree and still shares one inode. Used when
 // the groups come from a snapshot's manifest but the tree being cloned is a world that has been
 // written to since -- the group may have been broken there long ago.
@@ -303,7 +401,7 @@ bool group_still_linked(const char *verify_root, const HardlinkGroup &g) {
 // One group. Everything here is the same handful of syscalls whichever thread runs it, and no
 // two groups ever touch the same name, so the workers below need no coordination at all.
 void restore_group(const char *tree_root, const char *verify_root, const HardlinkGroup &g,
-                   HardlinkRestore &r) {
+                   HardlinkRestore &r, Relender &rl) {
     if (g.paths.size() < 2) return;
     if (verify_root && !group_still_linked(verify_root, g)) { r.skipped++; return; }
 
@@ -333,16 +431,22 @@ void restore_group(const char *tree_root, const char *verify_root, const Hardlin
                 continue;
             }
             String tmp;
-            if (!link_under_fresh_name(canon.c_str(), p, tmp)) {
-                if (!r.first_err) r.first_err = -errno;
-                r.skipped++;
-                continue;
-            }
+            int e = 0;
+            bool ok = link_under_fresh_name(canon.c_str(), p, tmp);
+            if (!ok) e = -errno;
             // rename(2), not unlink+link: the name never stops existing, so a crash or an
             // error here cannot lose the file.
-            if (::rename(tmp.c_str(), p.c_str()) != 0) {
-                if (!r.first_err) r.first_err = -errno;
+            else if (::rename(tmp.c_str(), p.c_str()) != 0) {
+                e = -errno;
                 ::unlink(tmp.c_str());
+                ok = false;
+            }
+            // The directory refused us, not the file: it is a read-only directory of the
+            // source's own making. Lend it owner write for the two calls and put it back.
+            if (!ok && (e == -EACCES || e == -EPERM))
+                ok = relink_under_lend(rl, canon.c_str(), p, &e);
+            if (!ok) {
+                if (!r.first_err) r.first_err = e;
                 r.skipped++;
                 continue;
             }
@@ -367,6 +471,7 @@ struct RestoreJob {
     uint64_t next;      // the next group to take, bumped atomically
     Mutex mu;           // the merge of a worker's counters into `agg`
     HardlinkRestore agg;
+    Relender rl;        // the read-only-directory path, shared by all four workers
 };
 
 void *restore_worker(void *arg) {
@@ -376,7 +481,7 @@ void *restore_worker(void *arg) {
     for (;;) {
         uint64_t i = __atomic_fetch_add(&j->next, 1, __ATOMIC_RELAXED);
         if (i >= n) break;
-        restore_group(j->tree_root, j->verify_root, j->set->groups[(size_t)i], local);
+        restore_group(j->tree_root, j->verify_root, j->set->groups[(size_t)i], local, j->rl);
     }
     Guard g(j->mu);
     j->agg.groups += local.groups;
@@ -387,6 +492,17 @@ void *restore_worker(void *arg) {
     return nullptr;
 }
 
+// PR #1 review (4th round, P2): what a replay failure is worth. `missing` and `skipped` stay
+// tolerated -- they are a live source changing under the clone, and the header has always said
+// so. `first_err` is different: it is a link(2) or rename(2) that the file system refused, and
+// the tree the caller is about to publish would then disagree with the manifest and the database
+// row that describe it. That is not a thriftiness question, so it is returned, and snapshot
+// creation / a fork / a pool fill unwind on it.
+int replay_verdict(const HardlinkRestore &r) {
+    if (wfs_test_hardlink_restore_err) return wfs_test_hardlink_restore_err;
+    return r.first_err;
+}
+
 } // namespace
 
 int hardlinks_restore(const char *tree_root, const HardlinkSet &set, const char *verify_root,
@@ -394,10 +510,11 @@ int hardlinks_restore(const char *tree_root, const HardlinkSet &set, const char 
     if (!tree_root || !*tree_root) return -EINVAL;
     if (set.groups.size() < kParallelFrom) {
         HardlinkRestore r;
+        Relender rl;
         for (size_t i = 0; i < set.groups.size(); ++i)
-            restore_group(tree_root, verify_root, set.groups[i], r);
+            restore_group(tree_root, verify_root, set.groups[i], r, rl);
         if (out) *out = r;
-        return 0;
+        return replay_verdict(r);
     }
     RestoreJob j;
     j.set = &set;
@@ -409,7 +526,7 @@ int hardlinks_restore(const char *tree_root, const HardlinkSet &set, const char 
     if (started == 0) restore_worker(&j);   // no threads to be had: do it here
     for (int i = 0; i < started; ++i) ::pthread_join(th[i], nullptr);
     if (out) *out = j.agg;
-    return 0;
+    return replay_verdict(j.agg);
 }
 
 } // namespace wfs

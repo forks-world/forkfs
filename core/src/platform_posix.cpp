@@ -711,10 +711,14 @@ int rm_rec(const char *path) {
     struct stat st;
     if (::lstat(path, &st) != 0) return errno == ENOENT ? 0 : -errno;
     if (!S_ISDIR(st.st_mode)) return ::unlink(path) == 0 || errno == ENOENT ? 0 : -errno;
+    // The write bit that unlink(2) needs is the directory's, not the entry's, and a tree can
+    // perfectly well contain a 0555 directory of the source's own making (PR #1 review, 4th
+    // round: the parallel deleter's rm_entry already chmods the parent on EACCES, and this is
+    // the path that has to survive the same trees). We are deleting the thing, so taking the
+    // mode off for good is exactly right -- as it is for a gate-protected 0000 root.
+    if ((st.st_mode & 0700) != 0700) ::chmod(path, (mode_t)((st.st_mode & 07777) | 0700));
     DIR *d = ::opendir(path);
     if (!d && errno == EACCES) {
-        // A gate-protected snapshot root is 0000. We are deleting the thing, so opening the
-        // gate for good is exactly right.
         ::chmod(path, 0700);
         d = ::opendir(path);
     }

@@ -700,6 +700,61 @@ else
     ls -a "$SCRATCH/w-tmpname" | sed 's/^/        /'
 fi
 
+# ---- PR #1 review (4th round, P2): a hardlink group under a read-only directory ----------------
+# 0555 is an ordinary mode for a vendored tree, a generated fixture, a `chmod -R a-w` release
+# directory. The clone wears it too, so the replay's link(2)/rename(2) inside it came back EACCES
+# -- and the result was ignored, so the snapshot was published with a manifest and a row
+# advertising a group its tree did not have, and every fork and pool entry inherited it. The
+# directory is now lent owner write for exactly those two calls and given its exact mode back.
+mkdir -p "$SCRATCH/roproj/ro"
+echo "read only" > "$SCRATCH/roproj/ro/x"
+ln "$SCRATCH/roproj/ro/x" "$SCRATCH/roproj/ro/y"
+chmod 0555 "$SCRATCH/roproj/ro"
+out=$("$WORLD" fs init "$SCRATCH/roproj" --name roproj 2>&1)
+ROSNAP=$(echo "$out" | awk '/^S[0-9]+ /{print $1}')
+ROPATH=$("$WORLD" fs inspect "$ROSNAP" | awk '/^path:/{print $2}')
+# The snapshot's own tree first, behind the gate.
+chmod 0700 "$ROPATH" 2>/dev/null
+si_x=$(stat -f %i "$ROPATH/ro/x" 2>/dev/null)
+si_y=$(stat -f %i "$ROPATH/ro/y" 2>/dev/null)
+si_n=$(stat -f %l "$ROPATH/ro/x" 2>/dev/null)
+si_m=$(stat -f %Lp "$ROPATH/ro" 2>/dev/null)
+chmod 0 "$ROPATH" 2>/dev/null
+if [ -n "$si_x" ] && [ "$si_x" = "$si_y" ] && [ "$si_n" = 2 ]; then
+    ok PR1 "the snapshot rebuilds a hardlink pair inside a 0555 directory"
+else
+    bad PR1 "the snapshot rebuilds a hardlink pair inside a 0555 directory (inodes $si_x/$si_y, $si_n links)"
+fi
+[ "$si_m" = 555 ] && ok PR1 "and the snapshot's directory is 0555 again afterwards" \
+                  || bad PR1 "and the snapshot's directory is 0555 again afterwards (mode $si_m)"
+"$WORLD" fs fork --from "$ROSNAP" --to "$SCRATCH/w-ro" --no-pool > /dev/null 2>&1
+ri_x=$(stat -f %i "$SCRATCH/w-ro/ro/x" 2>/dev/null)
+ri_y=$(stat -f %i "$SCRATCH/w-ro/ro/y" 2>/dev/null)
+ri_n=$(stat -f %l "$SCRATCH/w-ro/ro/x" 2>/dev/null)
+ri_m=$(stat -f %Lp "$SCRATCH/w-ro/ro" 2>/dev/null)
+if [ -n "$ri_x" ] && [ "$ri_x" = "$ri_y" ] && [ "$ri_n" = 2 ]; then
+    ok PR1 "the fork rebuilds it too"
+else
+    bad PR1 "the fork rebuilds it too (inodes $ri_x/$ri_y, $ri_n links)"
+fi
+[ "$ri_m" = 555 ] && ok PR1 "and the world's directory is 0555 again afterwards" \
+                  || bad PR1 "and the world's directory is 0555 again afterwards (mode $ri_m)"
+[ -z "$(ls -a "$SCRATCH/w-ro/ro" 2>/dev/null | grep '^\.wfs-hl-')" ] \
+    && ok PR1 "and no temporary of the replay's own is left in it" \
+    || { bad PR1 "and no temporary of the replay's own is left in it"; ls -a "$SCRATCH/w-ro/ro" | sed 's/^/        /'; }
+# And through the pool, whose background filler does the same replay on the entry it clones.
+"$WORLD" fs pool fill "$ROSNAP" --count 1 > /dev/null 2>&1
+WORLD_POOL_TOPUP=0 "$WORLD" fs fork --from "$ROSNAP" --to "$SCRATCH/w-ro-pool" > "$SCRATCH/ropool.log" 2>&1
+pri_x=$(stat -f %i "$SCRATCH/w-ro-pool/ro/x" 2>/dev/null)
+pri_y=$(stat -f %i "$SCRATCH/w-ro-pool/ro/y" 2>/dev/null)
+pri_m=$(stat -f %Lp "$SCRATCH/w-ro-pool/ro" 2>/dev/null)
+if grep -q "(pool)" "$SCRATCH/ropool.log" && [ -n "$pri_x" ] && [ "$pri_x" = "$pri_y" ] && [ "$pri_m" = 555 ]; then
+    ok PR1 "a pool-served world has it as well, 0555 and all"
+else
+    bad PR1 "a pool-served world has it as well, 0555 and all (inodes $pri_x/$pri_y, mode $pri_m)"
+    sed 's/^/        /' "$SCRATCH/ropool.log"
+fi
+
 # ---- P17: trees in the store but no database -> refuse, never rebuild -----------------------
 # Its own store, because the point of the rule is that the store is left exactly as it was
 # found. Snapshot and world ids live in metadata.db; a fresh one hands out 1 again and the next

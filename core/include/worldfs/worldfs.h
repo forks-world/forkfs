@@ -702,6 +702,14 @@ extern unsigned wfs_test_thread_fail_mask;
  * report how many started and how many joined. 0 = the two agree with the number that ran. */
 int wfs_test_threads_start(int want, unsigned fail_mask, int *started, int *joined);
 
+/* And a hardlink replay the file system refused (PR #1 review, 4th round). A link(2) that comes
+ * back EIO is not something a test can arrange on a developer's disk, and what has to be pinned
+ * down is what happens next: the snapshot, fork or pool entry being built must fail and take its
+ * half-built tree and its row with it, rather than publish a tree whose manifest advertises
+ * hardlink groups it does not have. Set to a negative errno to make every non-empty replay
+ * report it; 0 in every run that is not core_test. */
+extern int wfs_test_hardlink_restore_err;
+
 #ifdef __cplusplus
 }
 #endif
