@@ -256,6 +256,23 @@ static int db_user_version(const char *path) {
     return v;
 }
 
+// PR #1 review (21st round, P1): what the store's one pool row really says its state is.
+// POOL_DRAINING is internal to the core (core/src/pool.h), so the row itself is the evidence
+// that a drain which could not remove a tree left it in a state no claim can match.
+static int db_pool_state(const char *store_dir) {
+    char dbp[4096];
+    snprintf(dbp, sizeof dbp, "%s/metadata.db", store_dir);
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open_v2(dbp, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    CHECK(sqlite3_prepare_v2(db, "SELECT state FROM pool ORDER BY id", -1, &st, NULL) == SQLITE_OK);
+    int v = -1;
+    if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return v;
+}
+
 static int db_has_column(const char *path, const char *table, const char *column) {
     sqlite3 *db = NULL;
     CHECK(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
@@ -748,6 +765,39 @@ static void discard_before_pool_insert(void *ctx) {
     g_pins_rc = wfs_snapshot_discard(g_pins_store, g_pins_snap, 0, 0);
     crash_at(-1);
     wfs_test_trash_crash = NULL;
+}
+
+// PR #1 review (21st round, P1): the drain's own window. Phase 0 is before the transaction that
+// takes the row out of the hand-out set, phase 1 is after that commit, with the tree still whole
+// on disk and the removal about to start. What runs in there is a pool-backed fork on a handle
+// of its own -- the one thing the drain cannot lock out, because pool_claim() must never wait on
+// a filler. At phase 1 the hook first takes one file out of the entry, because fs_remove_tree()
+// is a walk and not one atomic step: a fork that lands in the middle of it finds exactly that,
+// a tree some of whose entries have already been unlinked.
+static wfs_store *g_drain_store = NULL;
+static wfs_id g_drain_snap;
+static const char *g_drain_target;
+static const char *g_drain_pooldir;
+static int g_drain_phase, g_drain_ran, g_drain_rc = -1;
+static wfs_fork_result g_drain_fr;
+static void fork_in_drain(void *ctx, int phase) {
+    (void)ctx;
+    if (g_drain_ran || phase != g_drain_phase) return;
+    g_drain_ran = 1;
+    if (phase == 1) {
+        char names[8][256];
+        uint64_t inos[8];
+        CHECK(list_dir(g_drain_pooldir, names, inos, 8) == 1);
+        char victim[4096];
+        snprintf(victim, sizeof victim, "%s/%s/b.txt", g_drain_pooldir, names[0]);
+        CHECK(unlink(victim) == 0);
+    }
+    wfs_fork_opts fo;
+    memset(&fo, 0, sizeof fo);
+    fo.name = "drainrace";
+    memset(&g_drain_fr, 0, sizeof g_drain_fr);
+    g_drain_rc = wfs_world_create_ex(g_drain_store, (wfs_ref){WFS_K_SNAPSHOT, g_drain_snap},
+                                     g_drain_target, &fo, &g_drain_fr);
 }
 
 // PR #1 review (9th round, P1): `discard W<n> --now`'s own window. Phase 4 is inside the helper
@@ -3683,6 +3733,172 @@ int main() {
         wfs_store_close(fb);
         wfs_store_close(fa);
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", fstore, (unsigned long long)f1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
+    // ---- PR #1 review (21st round, P1): a fork must never claim the entry a drain is -------
+    // ---- removing ---------------------------------------------------------------------------
+    //
+    // The 16th round made wfs_pool_drain() remove the tree first and delete the row only when
+    // the tree is proven gone, so an EPERM leaves something in the store that still names the
+    // clone. But the row it kept through the removal was an ordinary READY row of an ACTIVE
+    // snapshot, and pool_claim() does not take the pool lock -- it cannot, a fork must never
+    // wait on a filler. So a pool-backed fork could take that entry while fs_remove_tree() was
+    // walking it, rename the half-emptied tree to the user's `--to` and commit an ACTIVE world
+    // around whatever was left: `fork` returned 0 and the world was missing files. The drain
+    // moves the row to a state no claim matches first, in a transaction of its own, and only
+    // then touches the tree (docs/M1_DESIGN.md P18).
+    {
+        char dstore[4096], dsrc[4096], dpool[4096], dw[4096];
+        join(dstore, sizeof dstore, root, "drainrace-store");
+        join(dsrc, sizeof dsrc, root, "drainrace-src");
+        CHECK(mkdir(dsrc, 0755) == 0);
+        join(p, sizeof p, dsrc, "a.txt");
+        write_file(p, "one\n");
+        join(p, sizeof p, dsrc, "b.txt");
+        write_file(p, "two\n");
+        join(p, sizeof p, dsrc, "sub");
+        CHECK(mkdir(p, 0755) == 0);
+        join(q, sizeof q, p, "c.txt");
+        write_file(q, "three\n");
+        wfs_store *dra = NULL, *drb = NULL;
+        CHECK_OK(wfs_store_open(dstore, &dra));
+        CHECK_OK(wfs_store_open(dstore, &drb));   // the fork runs on a handle of its own
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "drb";
+        wfs_id d1 = 0;
+        CHECK_OK(wfs_snapshot_create(dra, dsrc, &sopts, &d1));
+        wfs_snapshot_rec dsr;
+        CHECK_OK(wfs_snapshot_info(dra, d1, &dsr));
+        snprintf(dpool, sizeof dpool, "%s/pool/S%llu", dstore, (unsigned long long)d1);
+        uint64_t dmade = 0, dready = 0, dremoved = 0;
+        wfs_pool_stat dps[4];
+        size_t dpn = 0;
+        wfs_world_rec dwr;
+        wfs_gc_report dgc;
+
+        // (1) The window itself: the fork lands with the row already out of the pool and the
+        // removal about to start. It must not be given the entry -- it falls back to a clone of
+        // its own -- and the world it publishes must be the whole tree, not what the remover has
+        // left of one. Before the fix this fork reported from_pool=1 and the world came out one
+        // file short, with `fork` having returned 0.
+        join(dw, sizeof dw, worlds, "drainrace-w1");
+        g_drain_store = drb;
+        g_drain_snap = d1;
+        g_drain_target = dw;
+        g_drain_pooldir = dpool;
+        g_drain_phase = 1;
+        g_drain_ran = 0;
+        g_drain_rc = -1;
+        CHECK_OK(wfs_pool_fill(dra, d1, 1, &dmade));
+        CHECK(dmade == 1);
+        wfs_test_in_pool_drain = fork_in_drain;
+        CHECK_OK(wfs_pool_drain(dra, d1, &dremoved));
+        wfs_test_in_pool_drain = NULL;
+        CHECK(g_drain_ran == 1);
+        CHECK_OK(g_drain_rc);
+        CHECK(g_drain_fr.from_pool == 0);            // not the tree that was being removed
+        CHECK_OK(wfs_world_info(dra, g_drain_fr.world, &dwr));
+        CHECK(dwr.state == WFS_ST_ACTIVE && dwr.entries == dsr.entries);
+        join(p, sizeof p, dw, "a.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "one\n"));
+        join(p, sizeof p, dw, "b.txt");              // the file the removal had already unlinked
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "two\n"));
+        join(p, sizeof p, dw, "sub/c.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "three\n"));
+        CHECK(dremoved == 1);                        // and the entry itself did go
+        // Nothing is left under <store>/pool/S<n> -- the drain rmdir's the empty directory too,
+        // so either it is gone or it holds nothing but `.` and `..`.
+        CHECK(!exists(dpool) || n_with_prefix(dpool, "") == 2);
+        CHECK_OK(wfs_pool_ready(dra, d1, &dready));
+        CHECK(dready == 0);
+
+        // (2) The mirror: the claim commits first. The drain's own update then matches no row --
+        // the claim deleted it -- and the tree it named belongs to the fork, which is about to
+        // rename it into place. The drain must skip it, and count nothing.
+        join(dw, sizeof dw, worlds, "drainrace-w2");
+        g_drain_target = dw;
+        g_drain_phase = 0;
+        g_drain_ran = 0;
+        g_drain_rc = -1;
+        CHECK_OK(wfs_pool_fill(dra, d1, 1, &dmade));
+        CHECK(dmade == 1);
+        dremoved = 0;
+        wfs_test_in_pool_drain = fork_in_drain;
+        CHECK_OK(wfs_pool_drain(dra, d1, &dremoved));
+        wfs_test_in_pool_drain = NULL;
+        CHECK(g_drain_ran == 1);
+        CHECK_OK(g_drain_rc);
+        CHECK(g_drain_fr.from_pool == 1);            // the entry was still an entry: handed out
+        CHECK(dremoved == 0);                        // and the drain took nothing of its own
+        CHECK_OK(wfs_world_info(dra, g_drain_fr.world, &dwr));
+        CHECK(dwr.state == WFS_ST_ACTIVE && dwr.entries == dsr.entries);
+        join(p, sizeof p, dw, "b.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "two\n"));
+        join(p, sizeof p, dw, "sub/c.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "three\n"));
+        // The entry left as a world, not as rubbish: nothing under <store>/pool/S<n>.
+        CHECK(!exists(dpool) || n_with_prefix(dpool, "") == 2);
+
+        // (3) And the state the drain leaves behind when the tree will not go. The row stays
+        // DRAINING: no claim can match it, `pool ready` does not count it, `pool status` calls
+        // it stale rather than ready or building, `gc --status` reports it as a stranded pool
+        // entry, and `discard S<n> --force` fails with the errno of the removal instead of
+        // trashing the snapshot on the strength of a 0 (the 16th round's rule, with the row now
+        // in a state that makes keeping it safe).
+        char dlock[4096], dentry[4096];
+        char dnames[8][256];
+        uint64_t dinos[8];
+        CHECK_OK(wfs_pool_fill(dra, d1, 1, &dmade));
+        CHECK(dmade == 1);
+        CHECK(list_dir(dpool, dnames, dinos, 8) == 1);
+        join(dentry, sizeof dentry, dpool, dnames[0]);
+        join(dlock, sizeof dlock, dentry, "sub");
+        deny_delete(dlock);
+        dremoved = 0;
+        int ddrc = wfs_pool_drain(dra, d1, &dremoved);
+        CHECK(ddrc != 0 && dremoved == 0);
+        CHECK(exists(dentry));                       // the tree is still there ...
+        CHECK(db_pool_state(dstore) == 2);           // ... and its row says DRAINING
+        CHECK_OK(wfs_pool_ready(dra, d1, &dready));
+        CHECK(dready == 0);
+        CHECK_OK(wfs_pool_status(dra, dps, 4, &dpn));
+        CHECK(dpn == 1 && dps[0].ready == 0 && dps[0].building == 0 && dps[0].stale == 1);
+        wfs_trash_stat dts;
+        CHECK_OK(wfs_gc_status(dra, 0, &dts));
+        CHECK(dts.pool_stranded >= 1);
+        // A fork in this state gets a clone of its own, never the tree that is on its way out.
+        join(dw, sizeof dw, worlds, "drainrace-w3");
+        memset(&opts, 0, sizeof opts);
+        opts.name = "drainrace-w3";
+        wfs_fork_result dfr3;
+        memset(&dfr3, 0, sizeof dfr3);
+        CHECK_OK(wfs_world_create_ex(drb, (wfs_ref){WFS_K_SNAPSHOT, d1}, dw, &opts, &dfr3));
+        CHECK(dfr3.from_pool == 0);
+        CHECK(exists(dentry));                       // and the entry was not touched by it
+        // `discard S<n> --force` drains first, gets the same errno, and leaves the snapshot be.
+        CHECK_RC(wfs_snapshot_discard(dra, d1, 0, 1), ddrc);
+        CHECK_OK(wfs_snapshot_info(dra, d1, &dsr));
+        CHECK(dsr.state == WFS_ST_ACTIVE);
+        // Take the ACL away and the collector finishes what the drain started: the DRAINING row
+        // is doomed whatever its snapshot says, so this is the retry path for it.
+        allow_delete(dlock);
+        memset(&dgc, 0, sizeof dgc);
+        CHECK_OK(wfs_gc(dra, 0, &dgc));
+        CHECK(dgc.pool_removed >= 1);
+        CHECK(!exists(dentry));
+        CHECK_OK(wfs_pool_status(dra, dps, 4, &dpn));
+        CHECK(dpn == 0);                             // row and tree both gone
+        CHECK_OK(wfs_gc_status(dra, 0, &dts));
+        CHECK(dts.pool_stranded == 0);
+        wfs_store_close(drb);
+        wfs_store_close(dra);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", dstore, (unsigned long long)d1);
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 

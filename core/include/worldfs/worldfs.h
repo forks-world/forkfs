@@ -358,7 +358,8 @@ typedef struct wfs_pool_stat {
     char snapshot_name[WFS_NAME_MAX];
     uint64_t ready;             /* entries that can be handed out right now */
     uint64_t building;          /* rows still being cloned (or left behind by a kill) */
-    uint64_t stale;             /* rows whose snapshot is gone or is a different one now */
+    uint64_t stale;             /* rows whose snapshot is gone or is a different one now, and
+                                 * rows a drain took out of the pool and could not remove */
     uint64_t entries;           /* entry count of one such world */
     int64_t oldest_at, newest_at;
 } wfs_pool_stat;
@@ -369,7 +370,11 @@ typedef struct wfs_pool_stat {
 int wfs_pool_fill(wfs_store *s, wfs_id snapshot, int target, uint64_t *made);
 /* One row per snapshot that has pool entries, ordered by snapshot id. */
 int wfs_pool_status(wfs_store *s, wfs_pool_stat *buf, size_t cap, size_t *count);
-/* Delete every entry of `snapshot` (0 = of every snapshot). *removed may be NULL. */
+/* Delete every entry of `snapshot` (0 = of every snapshot). *removed may be NULL, and counts the
+ * entries whose tree is proven gone and whose row went with it. An entry a fork claimed while
+ * this ran is left alone -- it is that fork's world now, not an entry -- and a tree that will not
+ * go stops the drain with that errno, its row kept in a state no claim can match and gc can
+ * retry (PR #1 review, 16th and 21st rounds). */
 int wfs_pool_drain(wfs_store *s, wfs_id snapshot, uint64_t *removed);
 /* Ready entries for `snapshot` right now (0 when the snapshot has none). */
 int wfs_pool_ready(wfs_store *s, wfs_id snapshot, uint64_t *out);
@@ -905,6 +910,15 @@ extern void *wfs_test_before_pool_sweep_ctx;
  * it; nothing in the library ever assigns it. */
 extern void (*wfs_test_before_pool_insert)(void *ctx);
 extern void *wfs_test_before_pool_insert_ctx;
+
+/* And the drain's own window (PR #1 review, 21st round): called twice per pool row, with phase 0
+ * before the transaction that moves the row out of the hand-out set and phase 1 after that
+ * commit, immediately before the tree the row names is removed. What a test does in there is a
+ * pool-backed fork on a second handle -- which, until the row had a state a claim cannot match,
+ * took the entry the drain was already unlinking. NULL unless a test sets it; nothing in the
+ * library ever assigns it. */
+extern void (*wfs_test_in_pool_drain)(void *ctx, int phase);
+extern void *wfs_test_in_pool_drain_ctx;
 
 /* And reconciliation's window (PR #1 review, 9th round): called once per gc, between the scan
  * that decides which ACTIVE rows have no tree at their recorded path and the updates that bury

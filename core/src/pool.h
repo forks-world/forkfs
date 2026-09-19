@@ -12,6 +12,24 @@
 
 namespace wfs {
 
+// The `state` column of a pool row (the schema is in store.cpp). An ordinary integer column
+// with no constraint on it, so a value the older cores never wrote needs no migration and does
+// not move the schema version: a core that predates DRAINING reads such a row as "not READY",
+// which is exactly what it is -- never handed out by pool_claim, and collected by its gc as a
+// row whose filler is gone.
+//
+// PR #1 review (21st round, P1): DRAINING is the state that makes wfs_pool_drain() safe. The
+// drain removes the tree first and deletes the row only when the tree is proven gone (16th
+// round), and pool_claim() does not take the pool lock -- so a fork could claim a READY row
+// while fs_remove_tree was walking the tree it names, rename the half-removed entry into place
+// and commit an ACTIVE world around it. The drain moves the row out of the hand-out set first,
+// in a transaction of its own, and only then touches the tree.
+enum pool_state : int {
+    POOL_CREATING = 0,   // a filler is cloning into <uuid>.wfs-tmp; it may still be alive
+    POOL_READY = 1,      // a finished clone, and the only state pool_claim() ever matches
+    POOL_DRAINING = 2    // the drain owns it: never handed out, and doomed whatever else is true
+};
+
 // One entry taken out of the pool. Keeping the whole row makes pool_return() exact.
 struct PoolClaim {
     wfs_id row = 0;
@@ -36,7 +54,7 @@ struct PoolClaim {
 // The hook already runs under the store mutex and inside a transaction: it must take neither.
 using PoolClaimHook = int (*)(void *ctx, const PoolClaim &c);
 
-// Takes one ready entry of `snapshot` out of the pool and deletes its row, in one
+// Takes one POOL_READY entry of `snapshot` out of the pool and deletes its row, in one
 // BEGIN IMMEDIATE transaction, so two concurrent forks can never get the same entry. An entry
 // whose recorded snap_created_at differs from `snap_created_at` is never handed out (the id
 // belongs to a different snapshot now). Returns 0, -ENOENT when the pool is empty, or -EIO.
@@ -91,7 +109,8 @@ int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us = 0,
 
 // `gc --status`: how many stale pool entries are still on disk, counted the way pool_collect
 // classifies them and without removing any of them. Rows whose snapshot is gone or is a
-// different snapshot now, rows whose filler died, and the row-less directories under
+// different snapshot now, rows whose filler died, rows a drain left POOL_DRAINING because the
+// tree would not go (PR #1 review, 21st round), and the row-less directories under
 // <store>/pool. Same query and one readdir, as in pool_collect.
 int pool_stranded(wfs_store *s, uint64_t *out);
 

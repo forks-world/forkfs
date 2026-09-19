@@ -1556,11 +1556,29 @@ if command -v sqlite3 > /dev/null 2>&1; then
         echo "$out" | grep -q "could not be removed" \
             && ok PR16 "and the refusal names the entry and the errno" \
             || { bad PR16 "and the refusal names the entry and the errno"; echo "$out" | sed 's/^/        /'; }
-        # Nothing is wrong in the store, so gc has nothing to report: the row is a normal pool
-        # entry of an ACTIVE snapshot, not a stale one.
+        # PR #1 review (21st round, P1): the row the drain keeps through the removal is not an
+        # ordinary READY entry of an ACTIVE snapshot any more -- if it were, a fork could claim
+        # the tree the drain is in the middle of unlinking and publish a world around what is
+        # left of it. It is DRAINING: out of the hand-out set for good, and waiting for the
+        # collector exactly like every other tree that would not go. So the row's state says 2,
+        # `gc --status` counts it, and a fork of that snapshot clones instead of taking it.
+        D16PSTATE=$(sqlite3 "$D16STORE/metadata.db" "SELECT state FROM pool;")
+        [ "$D16PSTATE" = 2 ] \
+            && ok PR21 "the row the drain could not remove is DRAINING, which no claim matches" \
+            || bad PR21 "the row the drain could not remove is DRAINING, which no claim matches (state $D16PSTATE)"
         d16 fs gc --status | grep -q "stale pre-clone" \
-            && { bad PR16 "and gc --status reports nothing wrong, because nothing is"; d16 fs gc --status | sed 's/^/        /'; } \
-            || ok PR16 "and gc --status reports nothing wrong, because nothing is"
+            && ok PR21 "and gc --status counts it, because it is waiting for the collector" \
+            || { bad PR21 "and gc --status counts it, because it is waiting for the collector"; d16 fs gc --status | sed 's/^/        /'; }
+        out=$(d16 fs fork --from "$D16S" --to "$SCRATCH/drain16-w" 2>&1); rc=$?
+        if [ "$rc" = 0 ] && ! echo "$out" | grep -q "(pool)" && [ -e "$SCRATCH/drain16-w/keep/f.txt" ]; then
+            ok PR21 "and a fork clones its own tree rather than the one being removed"
+        else
+            bad PR21 "and a fork clones its own tree rather than the one being removed (exit $rc)"
+            echo "$out" | sed 's/^/        /'
+        fi
+        # ... and that world goes again, so the --force below is about the pool entry alone.
+        D16W=$(echo "$out" | awk '/^W[0-9]/{print $1}')
+        d16 fs discard "$D16W" --now > /dev/null 2>&1
         # Take the ACL away and the very same command goes through: pool empty, no tree left.
         chmod -N "$D16ENTRY/keep"
         out=$(d16 fs discard "$D16S" --force 2>&1); rc=$?
