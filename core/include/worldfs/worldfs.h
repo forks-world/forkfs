@@ -632,6 +632,13 @@ int wfs_gc_pending(wfs_store *s, int64_t retention_secs, int *worker_running);
  * pre-made clones, nothing is lost) but still refuses while ACTIVE worlds remain -- never orphan
  * a world's source.
  *
+ * A world that is still being forked counts too. The reference check and the ACTIVE -> TRASHED
+ * transition run inside one BEGIN IMMEDIATE, which is the same write lock a pool claim and a
+ * world row insert take, and a fork commits its CREATING world row together with its pool claim
+ * (or before it starts cloning). So a fork that is half-way through is either counted here and
+ * the discard is refused, or it finds the snapshot TRASHED and fails instead: there is no order
+ * in which a world gets published with its baseline already in the trash.
+ *
  * TRASHED worlds are not a reason to refuse; they are already on their way out. Restoring one
  * afterwards is what fails, with WFS_E_SOURCE_GONE, because bringing a world back to life
  * without a baseline would produce a world that cannot be diffed or verified.
@@ -641,6 +648,15 @@ int wfs_gc_pending(wfs_store *s, int64_t retention_secs, int *worker_running);
  * retention period is up -- reopening the gate directory (0700) on its way in, since a 0000 root
  * cannot even be listed. */
 int wfs_snapshot_discard(wfs_store *s, wfs_id id, int force);
+
+/* ---- test seam --------------------------------------------------------------------------------
+ *
+ * core_test drives one interleaving that cannot be produced from outside the library: the middle
+ * of a pool-backed fork, after the claim transaction has committed the fork's CREATING world row
+ * and before the marker/rename/ACTIVE tail. Both are NULL unless a test sets them and nothing in
+ * the library ever assigns them. */
+extern void (*wfs_test_after_pool_claim)(void *ctx, wfs_id world);
+extern void *wfs_test_after_pool_claim_ctx;
 
 #ifdef __cplusplus
 }

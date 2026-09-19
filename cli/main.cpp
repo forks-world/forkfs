@@ -809,6 +809,16 @@ static int cmd_discard_snapshot(wfs_store *s, wfs_id sid, int force, int64_t ret
         }
         uint64_t ready = 0;
         wfs_pool_ready(s, sid, &ready);
+        if (!ready) {
+            // Neither an active world nor a pool entry: a fork from this snapshot is in flight
+            // and has its half-built world row in the book (the core counts those, so that a
+            // world can never be published with its baseline already in the trash).
+            snprintf(why, sizeof why,
+                     "a fork from S%llu is in flight; discarding it now would leave that world "
+                     "with nothing to diff or verify against",
+                     (unsigned long long)sid);
+            return refuse(why, "world fs list   (retry once the fork has finished)");
+        }
         snprintf(why, sizeof why, "S%llu still has %llu pre-cloned pool entr%s",
                  (unsigned long long)sid, (unsigned long long)ready, ready == 1 ? "y" : "ies");
         char hint[96];

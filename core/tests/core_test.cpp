@@ -85,6 +85,18 @@ static size_t list_dir(const char *dir, char names[][256], uint64_t *inos, size_
     return n;
 }
 
+// PR #1 review (P1): the test seam that puts this test inside a pool-backed fork, between the
+// claim and the moment the world becomes visible. `wfs_test_after_pool_claim` calls this there.
+static wfs_store *g_race_store;
+static wfs_id g_race_snap;
+static int g_race_rc, g_race_ran;
+static void race_discard(void *ctx, wfs_id world) {
+    (void)ctx;
+    (void)world;
+    g_race_ran = 1;
+    g_race_rc = wfs_snapshot_discard(g_race_store, g_race_snap, 0);
+}
+
 // A copy in the sense of `cp -R`: same bytes, same marker, different inode (P2).
 static void copy_dir(const char *src, const char *dst) {
     CHECK(mkdir(dst, 0755) == 0);
@@ -763,6 +775,67 @@ int main() {
     join(p, sizeof p, whl2, "g3");
     join(q, sizeof q, whl2, "sub/g3-0");
     CHECK(ino_of(p) != ino_of(q) && nlink_of(p) == 1);
+
+    // ---- PR #1 review (P1): a fork in flight and `discard S<n>` cannot both win ----
+    //
+    // The window the review found: a pool-backed fork claims the last entry and pauses before it
+    // has published its world; `discard` sees no active world and no pool entry, trashes the
+    // snapshot, and the world that appears a moment later has no baseline to diff or verify
+    // against. The claim now commits the fork's CREATING world row in its own transaction and
+    // the discard counts those, under the same write lock, so one of the two has to lose -- and
+    // it is never the fork that already holds the tree.
+    {
+        char rstore[4096], rsrc[4096], rp[4096], rw[4096];
+        join(rstore, sizeof rstore, root, "race-store");
+        join(rsrc, sizeof rsrc, root, "race-src");
+        CHECK(mkdir(rsrc, 0755) == 0);
+        join(rp, sizeof rp, rsrc, "a.txt");
+        write_file(rp, "baseline\n");
+        wfs_store *rs = NULL;
+        CHECK_OK(wfs_store_open(rstore, &rs));
+        wfs_id rsid = 0;
+        wfs_snapshot_opts ropts;
+        memset(&ropts, 0, sizeof ropts);
+        ropts.name = "race";
+        CHECK_OK(wfs_snapshot_create(rs, rsrc, &ropts, &rsid));
+        uint64_t rmade = 0;
+        CHECK_OK(wfs_pool_fill(rs, rsid, 1, &rmade));
+        CHECK(rmade == 1);
+
+        g_race_store = rs;
+        g_race_snap = rsid;
+        g_race_ran = 0;
+        g_race_rc = 0;
+        wfs_test_after_pool_claim = race_discard;
+        join(rw, sizeof rw, worlds, "w-race");
+        wfs_fork_result rfr;
+        memset(&rfr, 0, sizeof rfr);
+        memset(&opts, 0, sizeof opts);
+        opts.name = "w-race";
+        wfs_ref from_rs = {WFS_K_SNAPSHOT, rsid};
+        CHECK_OK(wfs_world_create_ex(rs, from_rs, rw, &opts, &rfr));
+        wfs_test_after_pool_claim = NULL;
+        // The fork did come out of the pool (so the claim really was the last thing between the
+        // pool and the world), and the discard really did run in the middle of it.
+        CHECK(g_race_ran == 1 && rfr.from_pool == 1 && rfr.world != 0);
+        CHECK_RC(g_race_rc, WFS_E_SNAPSHOT_IN_USE);
+        // The snapshot is untouched, so the world that was being forked has its baseline.
+        wfs_snapshot_rec rsr;
+        CHECK_OK(wfs_snapshot_info(rs, rsid, &rsr));
+        CHECK(rsr.state == WFS_ST_ACTIVE && exists(rsr.path));
+        wfs_world_rec rwr;
+        CHECK_OK(wfs_world_info(rs, rfr.world, &rwr));
+        CHECK(rwr.state == WFS_ST_ACTIVE && rwr.snapshot_id == rsid && rwr.present);
+        join(rp, sizeof rp, rw, "a.txt");
+        CHECK(exists(rp));
+        // And the refusal was about the fork, not a row it left behind: once the world is gone
+        // the discard goes through.
+        CHECK_OK(wfs_world_discard(rs, rfr.world, 1, 0));
+        CHECK_OK(wfs_snapshot_discard(rs, rsid, 0));
+        CHECK_OK(wfs_snapshot_info(rs, rsid, &rsr));
+        CHECK(rsr.state == WFS_ST_TRASHED);
+        wfs_store_close(rs);
+    }
 
     // ---- P13: a store from another schema is refused before anything is read ----
     char other[4096], ver[4096];

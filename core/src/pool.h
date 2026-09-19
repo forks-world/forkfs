@@ -25,11 +25,23 @@ struct PoolClaim {
     int64_t created_at = 0;
 };
 
+// Whatever the claimer has to record *together with* the claim. It runs inside the claim's
+// BEGIN IMMEDIATE transaction, after the pool row is gone and before the commit, and a non-zero
+// return rolls the whole claim back (the entry stays in the pool).
+//
+// This is what closes the window the PR #1 review found: a fork that has taken the last pool
+// entry but has not yet inserted its world row would be invisible to `discard S<n>`, which
+// could then trash the snapshot out from under a world that is about to be published. The fork
+// inserts its CREATING world row here, so claim and world become visible in the same commit.
+// The hook already runs under the store mutex and inside a transaction: it must take neither.
+using PoolClaimHook = int (*)(void *ctx, const PoolClaim &c);
+
 // Takes one ready entry of `snapshot` out of the pool and deletes its row, in one
 // BEGIN IMMEDIATE transaction, so two concurrent forks can never get the same entry. An entry
 // whose recorded snap_created_at differs from `snap_created_at` is never handed out (the id
 // belongs to a different snapshot now). Returns 0, -ENOENT when the pool is empty, or -EIO.
-int pool_claim(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, PoolClaim &out);
+int pool_claim(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, PoolClaim &out,
+               PoolClaimHook on_claimed = nullptr, void *hook_ctx = nullptr);
 
 // Puts a claimed entry back because the hand-out failed. Best effort: if the row cannot be
 // written the tree is removed instead, so nothing is left that gc would have to guess about.

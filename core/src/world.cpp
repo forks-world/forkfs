@@ -504,6 +504,13 @@ int trash_unlink(const char *deleting_path, int threads, uint64_t *entries) {
 
 } // namespace
 
+// The one interleaving a test cannot produce from outside: the middle of a pool-backed fork,
+// after the claim transaction has committed this fork's CREATING world row and before the
+// marker/rename/ACTIVE tail. core_test sets it to run `discard` exactly there; nothing in the
+// library ever assigns it, and the pool path pays one predictable branch for it.
+extern "C" void (*wfs_test_after_pool_claim)(void *ctx, wfs_id world) = nullptr;
+extern "C" void *wfs_test_after_pool_claim_ctx = nullptr;
+
 // ---- snapshots --------------------------------------------------------------------------------
 
 extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_snapshot_opts *opts,
@@ -668,6 +675,52 @@ extern "C" int wfs_snapshot_list(wfs_store *s, wfs_snapshot_rec *buf, size_t cap
 
 // ---- worlds -----------------------------------------------------------------------------------
 
+namespace {
+
+// What the pool claim has to write down on the fork's behalf, inside the claim's own
+// transaction. `world` comes back out of it.
+struct PoolForkRow {
+    wfs_store *s;
+    wfs_id snapshot;
+    const char *name;
+    const char *path;
+    int64_t created;
+    uint64_t fsevents;
+    wfs_id world;
+};
+
+// Runs inside pool_claim's BEGIN IMMEDIATE (pool.h): re-read the snapshot under the write lock
+// and insert the CREATING world row. Re-reading is the other half of the race -- the snapshot
+// row this fork looked at was read without the write lock, so a `discard` may have committed in
+// between; here we either see it (and refuse the claim) or it sees this row (and refuses).
+int pool_fork_insert(void *ctx, const wfs::PoolClaim &c) {
+    PoolForkRow *r = (PoolForkRow *)ctx;
+    {
+        Stmt q(r->s->db, "SELECT state FROM snapshots WHERE id=?");
+        if (!q.ok()) return -EIO;
+        q.i64(1, (int64_t)r->snapshot);
+        if (!q.row() || q.col_i64(0) != WFS_ST_ACTIVE) return -ESTALE;
+    }
+    Stmt ins(r->s->db,
+             "INSERT INTO worlds(kind, parent_world, snapshot_id, name, path, state,"
+             " fsevents_id, entries, created_at) VALUES(?,?,?,?,?,?,?,?,?)");
+    if (!ins.ok()) return -EIO;
+    ins.i64(1, WFS_O_SNAPSHOT);
+    ins.i64(2, 0);
+    ins.i64(3, (int64_t)r->snapshot);
+    ins.text(4, r->name);
+    ins.text(5, r->path);
+    ins.i64(6, WFS_ST_CREATING);
+    ins.i64(7, (int64_t)r->fsevents);
+    ins.i64(8, (int64_t)c.entries);
+    ins.i64(9, r->created);
+    if (ins.step() != SQLITE_DONE) return -EIO;
+    r->world = (wfs_id)sqlite3_last_insert_rowid(r->s->db);
+    return 0;
+}
+
+} // namespace
+
 extern "C" int wfs_world_create(wfs_store *s, wfs_ref from, const char *target_path,
                                 const wfs_fork_opts *opts, wfs_id *out) {
     if (!out) return -EINVAL;
@@ -778,35 +831,20 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
     // the tree already exists, on the store's volume, and the rename either works or tells us
     // it does not (EXDEV), in which case the entry goes back and the ordinary path runs.
     if (from.kind == WFS_K_SNAPSHOT && !o.no_pool) {
+        int64_t created = now_sec();
+        uint64_t ev = wfs::fs_events_current_id();
+        PoolForkRow row{s, snapshot_id, nm, target.c_str(), created, ev, 0};
         wfs::PoolClaim claim;
-        if (wfs::pool_claim(s, snapshot_id, snap_created_at, claim) == 0) {
-            int64_t created = now_sec();
-            uint64_t ev = wfs::fs_events_current_id();
-            wfs_id id = 0;
-            int rc = 0;
-            {
-                Guard g(s->mu);
-                Txn t(s->db);
-                Stmt ins(s->db,
-                         "INSERT INTO worlds(kind, parent_world, snapshot_id, name, path, state,"
-                         " fsevents_id, entries, created_at) VALUES(?,?,?,?,?,?,?,?,?)");
-                if (!ins.ok()) rc = -EIO;
-                else {
-                    ins.i64(1, WFS_O_SNAPSHOT);
-                    ins.i64(2, 0);
-                    ins.i64(3, (int64_t)snapshot_id);
-                    ins.text(4, nm);
-                    ins.text(5, target.c_str());
-                    ins.i64(6, WFS_ST_CREATING);
-                    ins.i64(7, (int64_t)ev);
-                    ins.i64(8, (int64_t)claim.entries);
-                    ins.i64(9, created);
-                    if (ins.step() != SQLITE_DONE) rc = -EIO;
-                    else { id = (wfs_id)sqlite3_last_insert_rowid(s->db); t.commit(); }
-                }
-            }
-            if (!rc)
-                rc = marker_write(claim.path.c_str(), s->store_id.c_str(), s->dir.c_str(), id, nm, snapshot_id, 0, created);
+        // The claim and this fork's CREATING world row commit together (pool.h): from the
+        // instant the entry leaves the pool, `discard S<n>` can see that somebody is forking
+        // from this snapshot. Anything the hook refuses -- a snapshot that has been discarded
+        // since the row above was read, a row that will not insert -- leaves the entry in the
+        // pool and falls through to the ordinary clone path, which fails the same way.
+        if (wfs::pool_claim(s, snapshot_id, snap_created_at, claim, pool_fork_insert, &row) == 0) {
+            wfs_id id = row.world;
+            if (wfs_test_after_pool_claim) wfs_test_after_pool_claim(wfs_test_after_pool_claim_ctx, id);
+            int rc = marker_write(claim.path.c_str(), s->store_id.c_str(), s->dir.c_str(), id, nm,
+                                  snapshot_id, 0, created);
             if (!rc) rc = wfs::fs_rename(claim.path.c_str(), target.c_str());
             struct stat st;
             if (!rc && ::stat(target.c_str(), &st) != 0) rc = -errno;
@@ -865,6 +903,17 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
     {
         Guard g(s->mu);
         Txn t(s->db);
+        // The same window as the pool path's, and the same answer: under the write lock, either
+        // the snapshot is still ACTIVE and this CREATING row makes the fork visible to
+        // `discard`, or a discard got here first and there is nothing to fork from. (A fork
+        // from a *world* is not asked: its snapshot is only the diff baseline, and `gc
+        // --reconcile` is allowed to bury a snapshot whose tree is gone while worlds live on.)
+        if (from.kind == WFS_K_SNAPSHOT) {
+            Stmt q(s->db, "SELECT state FROM snapshots WHERE id=?");
+            if (!q.ok()) return -EIO;
+            q.i64(1, (int64_t)snapshot_id);
+            if (!q.row() || q.col_i64(0) != WFS_ST_ACTIVE) return -ESTALE;
+        }
         Stmt ins(s->db,
                  "INSERT INTO worlds(kind, parent_world, snapshot_id, name, path, state,"
                  " fsevents_id, entries, created_at) VALUES(?,?,?,?,?,?,?,?,?)");
@@ -1146,21 +1195,29 @@ namespace {
 // and --force drains them.
 struct SnapRefs {
     uint64_t active_worlds = 0;
+    uint64_t creating_worlds = 0;
     uint64_t trashed_worlds = 0;
     uint64_t pool_entries = 0;
     wfs_id first_world = 0;
 };
 
-int snapshot_refs(wfs_store *s, wfs_id id, SnapRefs &out) {
-    Guard g(s->mu);
+// Callers already hold the store mutex *and* an open transaction: this is the reference count
+// the discard decides on, so it has to be read under the same write lock the fork's claim takes.
+int snapshot_refs_locked(wfs_store *s, wfs_id id, SnapRefs &out) {
     {
-        Stmt q(s->db, "SELECT id, state FROM worlds WHERE snapshot_id=? AND (state=1 OR state=2)");
+        Stmt q(s->db, "SELECT id, state FROM worlds WHERE snapshot_id=? AND state<=2");
         if (!q.ok()) return -EIO;
         q.i64(1, (int64_t)id);
         while (q.row()) {
-            if (q.col_i64(1) == WFS_ST_ACTIVE) {
+            int64_t st = q.col_i64(1);
+            if (st == WFS_ST_ACTIVE) {
                 if (!out.first_world) out.first_world = (wfs_id)q.col_i64(0);
                 out.active_worlds++;
+            } else if (st == WFS_ST_CREATING) {
+                // A fork in flight. It committed this row together with its pool claim, or
+                // before it started cloning, so it is about to publish a world that needs this
+                // snapshot as its baseline -- exactly the case the PR #1 review found.
+                out.creating_worlds++;
             } else {
                 out.trashed_worlds++;
             }
@@ -1179,44 +1236,46 @@ int snapshot_refs(wfs_store *s, wfs_id id, SnapRefs &out) {
 
 extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int force) {
     if (!s || !id) return -EINVAL;
-    wfs_snapshot_rec r;
+    // A look before the transaction, for the state errors only. Everything the discard *decides*
+    // is decided again below, under the write lock.
     {
+        wfs_snapshot_rec r;
         Guard g(s->mu);
         if (int rc = snapshot_row(s, id, r)) return rc;
+        if (r.state == WFS_ST_TRASHED) return -EALREADY;
+        if (r.state != WFS_ST_ACTIVE) return -ESTALE;
     }
+    // Pool entries are clones nobody has taken yet -- losing them costs a re-fill and nothing
+    // else -- so --force drains them first. The drain takes the pool lock and runs transactions
+    // of its own, so it cannot happen inside the discard's transaction; whatever a filler puts
+    // back while it runs is caught by the reference count below, under the write lock. Without
+    // --force a pool entry is a refusal, and that refusal also comes from down there.
+    if (force) {
+        uint64_t drained = 0;
+        if (int rc = wfs_pool_drain(s, id, &drained); rc && rc != -ENOENT) return rc;
+    }
+
+    // One BEGIN IMMEDIATE for the reference check *and* the state transition (PR #1 review).
+    // BEGIN IMMEDIATE takes the database write lock, which is the same lock a pool claim and a
+    // world row insert take, so a fork is either entirely before this transaction (its CREATING
+    // row is counted) or entirely after it (it finds the snapshot TRASHED and gives up). There
+    // is no longer a moment in which neither side can see the other.
+    Guard g(s->mu);
+    Txn t(s->db);
+    wfs_snapshot_rec r;
+    if (int rc = snapshot_row(s, id, r)) return rc;
     if (r.state == WFS_ST_TRASHED) return -EALREADY;
     if (r.state != WFS_ST_ACTIVE) return -ESTALE;
-
     SnapRefs refs;
-    if (int rc = snapshot_refs(s, id, refs)) return rc;
+    if (int rc = snapshot_refs_locked(s, id, refs)) return rc;
     // Never orphan a world's source: diff and verify both need the baseline (P4/P10).
-    if (refs.active_worlds) return WFS_E_SNAPSHOT_IN_USE;
-    if (refs.pool_entries) {
-        // Pool entries are clones nobody has taken yet -- losing them costs a re-fill and
-        // nothing else -- but they are still references, so without --force this is a refusal
-        // with the same remedy as a live world: say what holds it.
-        if (!force) return WFS_E_SNAPSHOT_IN_USE;
-        uint64_t drained = 0;
-        if (int rc = wfs_pool_drain(s, id, &drained)) return rc;
-        // Draining takes the pool lock; a filler that was mid-clone could have added one back.
-        SnapRefs again;
-        if (int rc = snapshot_refs(s, id, again)) return rc;
-        if (again.active_worlds || again.pool_entries) return WFS_E_SNAPSHOT_IN_USE;
-    }
+    if (refs.active_worlds || refs.creating_worlds || refs.pool_entries) return WFS_E_SNAPSHOT_IN_USE;
 
     String snapdir = snapshot_dir_of(r);
     char leaf[80];
     ::snprintf(leaf, sizeof leaf, "S%llu-%lld", (unsigned long long)id, (long long)now_sec());
     String trash = joinp(joinp(s->dir.c_str(), "trash").c_str(), leaf);
-    // The gate is on `root`, one level below what moves; renaming the directory that holds it
-    // needs no access to the tree at all, so the gate stays closed until the deleter opens it.
-    if (exists(snapdir.c_str())) {
-        if (int rc = wfs::fs_rename(snapdir.c_str(), trash.c_str())) return rc;
-    } else {
-        trash.assign("");   // already gone: this is a reconcile, not a move
-    }
-    Guard g(s->mu);
-    Txn t(s->db);
+    if (!exists(snapdir.c_str())) trash.assign("");   // already gone: a reconcile, not a move
     Stmt u(s->db, "UPDATE snapshots SET state=?, trash_path=?, trashed_at=? WHERE id=?");
     if (!u.ok()) return -EIO;
     u.i64(1, WFS_ST_TRASHED);
@@ -1224,6 +1283,12 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int force) {
     u.i64(3, now_sec());
     u.i64(4, (int64_t)id);
     if (u.step() != SQLITE_DONE) return -EIO;
+    // The row first, the tree second: a rename that fails rolls the row back, and nothing moved.
+    // The gate is on `root`, one level below what moves; renaming the directory that holds it
+    // needs no access to the tree at all, so the gate stays closed until the deleter opens it.
+    if (trash.size()) {
+        if (int rc = wfs::fs_rename(snapdir.c_str(), trash.c_str())) return rc;
+    }
     t.commit();
     return 0;
 }

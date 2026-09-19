@@ -228,7 +228,8 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
 
 } // namespace
 
-int pool_claim(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, PoolClaim &out) {
+int pool_claim(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, PoolClaim &out,
+               PoolClaimHook on_claimed, void *hook_ctx) {
     if (!s || !snapshot) return -EINVAL;
     Guard g(s->mu);
     Txn t(s->db);
@@ -252,11 +253,16 @@ int pool_claim(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, PoolClaim
     if (!del.ok()) return -EIO;
     del.i64(1, (int64_t)out.row);
     if (del.step() != SQLITE_DONE) return -EIO;
-    t.commit();
     // The tree must actually be there. A pool directory removed behind the store's back is not
-    // an error worth failing the fork for: report "empty pool" and let the caller clone.
-    if (!exists(out.path.c_str())) return -ENOENT;
-    return 0;
+    // an error worth failing the fork for: report "empty pool" and let the caller clone. The row
+    // goes either way -- an entry whose tree has vanished is never coming back -- but the hook
+    // does not run for a claim that cannot be honoured.
+    bool gone = !exists(out.path.c_str());
+    if (!gone && on_claimed) {
+        if (int rc = on_claimed(hook_ctx, out)) return rc;   // the Txn destructor rolls back
+    }
+    t.commit();
+    return gone ? -ENOENT : 0;
 }
 
 void pool_return(wfs_store *s, const PoolClaim &c) {
