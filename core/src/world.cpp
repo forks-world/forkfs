@@ -2647,14 +2647,10 @@ bool trash_row_still_ours(wfs_store *s, const TrashJob &j) {
            !::strcmp(q.col_text(1), j.row_path.c_str());
 }
 
-// PR #1 review: how many wakes in a row have failed to delete one trash entry. Every wake is a
-// new process, so the count cannot live in memory; it goes in the store's meta table, keyed by
-// the entry's name with any `.deleting` suffix stripped (the name changes under us the first
-// time). The cap is what stops a permanently undeletable entry from spawning a worker every two
-// seconds for ever -- it is a retry limit, never a licence to report the trash as empty: the
-// entry is still there, still counted by `gc --status`, and still reported by every run.
-const int64_t kGcFailCap = 5;
-
+// PR #1 review: how many wakes in a row have failed to delete one trash entry, keyed by the
+// entry's name with any `.deleting` suffix stripped (the name changes under us the first time).
+// The counter itself is the store's (wfs::gc_fail_bump, internal.h); since the 8th round the
+// pool's own stale entries share it.
 void gc_fail_key(const TrashJob &j, String &out) {
     String name(basename_of(j.path.c_str()));
     size_t n = name.size(), sl = ::strlen(WFS_DELETING_SUFFIX);
@@ -2666,44 +2662,13 @@ void gc_fail_key(const TrashJob &j, String &out) {
 int64_t gc_fail_bump(wfs_store *s, const TrashJob &j) {
     String k;
     gc_fail_key(j, k);
-    Guard g(s->mu);
-    Txn t(s->db);
-    int64_t n = 0;
-    {
-        Stmt q(s->db, "SELECT value FROM meta WHERE key=?");
-        if (!q.ok()) return kGcFailCap;   // cannot count: do not spin
-        q.text(1, k.c_str());
-        if (q.row()) n = ::strtoll(q.col_text(0), nullptr, 10);
-    }
-    ++n;
-    char v[32];
-    ::snprintf(v, sizeof v, "%lld", (long long)n);
-    Stmt u(s->db,
-           "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value");
-    if (!u.ok()) return kGcFailCap;
-    u.text(1, k.c_str());
-    u.text(2, v);
-    if (u.step() != SQLITE_DONE) return kGcFailCap;
-    t.commit();
-    return n;
+    return wfs::gc_fail_bump(s, k.c_str());
 }
 
-// The read comes first so that the ordinary case -- an entry that never failed -- costs one
-// indexed lookup instead of a transaction per deleted tree.
 void gc_fail_clear(wfs_store *s, const TrashJob &j) {
     String k;
     gc_fail_key(j, k);
-    Guard g(s->mu);
-    {
-        Stmt q(s->db, "SELECT 1 FROM meta WHERE key=?");
-        if (!q.ok()) return;
-        q.text(1, k.c_str());
-        if (!q.row()) return;
-    }
-    Txn t(s->db);
-    Stmt d(s->db, "DELETE FROM meta WHERE key=?");
-    if (d.ok()) { d.text(1, k.c_str()); d.step(); }
-    t.commit();
+    wfs::gc_fail_clear(s, k.c_str());
 }
 
 // One entry, the crash-safe way: rename first, record the new name, then unlink. `*partial`
@@ -2901,7 +2866,7 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                     // never budge stops waking a worker every two seconds without ever being
                     // reported as gone.
                     rep.tmp_failed++;
-                    if (gc_fail_bump(s, j) < kGcFailCap) rep.work_remains = 1;
+                    if (gc_fail_bump(s, j) < wfs::kGcFailCap) rep.work_remains = 1;
                     continue;
                 }
                 // Neither removed nor still there: somebody else got to it. Bury the row.
@@ -2954,7 +2919,7 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
             j.is_snapshot = 1;
             if (exists(tmp.c_str()) || exists(dir.c_str())) {
                 rep.tmp_failed++;
-                if (gc_fail_bump(s, j) < kGcFailCap) rep.work_remains = 1;
+                if (gc_fail_bump(s, j) < wfs::kGcFailCap) rep.work_remains = 1;
                 continue;
             }
             gc_fail_clear(s, j);
@@ -3037,7 +3002,7 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
     // was ever consulted, so a two-second worker wake could spend minutes here. What the
     // deadline cuts short keeps the shape its successor rediscovers (the row, or the row-less
     // directory) and sets work_remains, so the worker chain comes back for it.
-    wfs::pool_collect(s, &rep.pool_removed, deadline_us, &rep.work_remains);
+    wfs::pool_collect(s, &rep.pool_removed, deadline_us, &rep.work_remains, &rep.pool_failed);
 
     // <store>/tmp holds the seatbelt profiles `world exec` generates. They are removed when the
     // command ends; one that survives an hour belongs to a process that was killed.
@@ -3101,7 +3066,7 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                 // waking a worker every two seconds for something that will not budge.
                 rep.trash_failed++;
                 rep.entries_freed += freed;
-                if (gc_fail_bump(s, jobs[i]) < kGcFailCap) rep.work_remains = 1;
+                if (gc_fail_bump(s, jobs[i]) < wfs::kGcFailCap) rep.work_remains = 1;
                 continue;
             }
             gc_fail_clear(s, jobs[i]);

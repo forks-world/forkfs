@@ -87,6 +87,20 @@ int64_t creating_min_age_secs(void);
 // and at the start of every gc, before anything classifies the trash. Both counters may be null.
 int trashing_recover(wfs_store *s, uint64_t *restored, uint64_t *finished);
 
+// ---- PR #1 review: the retry cap for anything gc cannot remove -------------------------------
+//
+// Every gc wake is a new process, so "this has failed before" cannot live in memory: the count
+// goes in the store's meta table under `key`. The cap is what stops something that will never
+// budge -- an ACL, an EPERM, a transient EIO that is not transient -- from waking a worker every
+// two seconds for ever. It is a retry limit and never a licence to report the thing as gone:
+// whatever failed is still on disk, still counted by `gc --status`, and still reported by every
+// run. Trash entries, abandoned fork trees and half-built snapshots key on the tree's name;
+// since the 8th round stale pool entries do too (they used to be deleted from the database
+// whether or not their tree went).
+extern const int64_t kGcFailCap;
+int64_t gc_fail_bump(wfs_store *s, const char *key);
+void gc_fail_clear(wfs_store *s, const char *key);
+
 int fs_lstat(const char *path, wfs_attr &out);
 int fs_readlink(const char *path, char *buf, size_t cap, size_t *len);
 int fs_mkfile(const char *path, uint32_t mode);

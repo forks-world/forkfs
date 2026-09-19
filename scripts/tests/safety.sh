@@ -1139,6 +1139,57 @@ if command -v sqlite3 > /dev/null 2>&1; then
 fi
 
 
+# ---- PR #1 review (8th round, P2): a stale pool entry gc cannot remove keeps its row ----------
+# The third of the same shape. pool_collect() unlinked a stale pre-clone entry and then deleted
+# its row whatever the removal had actually done, so one EPERM (an ACL, a transient EIO) left a
+# whole clone of a snapshot on disk with nothing in the store that knew it was rubbish: the
+# row-less-orphan sweep would find it, but it had no retry counter and set no work_remains, so
+# nothing came back for it until somebody ran `world fs gc` by hand. The row is kept while its
+# tree is now, counted, reported, and retried under the same cap a trash entry gets. A store of
+# its own, and the same ACL as the undeletable-trash case: it survives chmod and chflags.
+if command -v sqlite3 > /dev/null 2>&1; then
+    P8STORE="$SCRATCH/pool8-store"
+    p8() { "$WORLD" --store "$P8STORE" "$@"; }
+    P8SRC="$SCRATCH/pool8-src"
+    mkdir -p "$P8SRC/keep"
+    echo x > "$P8SRC/keep/f.txt"
+    P8S=$(p8 fs init "$P8SRC" --name pool8 2>/dev/null | awk '/^S[0-9]/{print $1}')
+    p8 fs pool fill "$P8S" --count 1 > /dev/null 2>&1
+    P8ENTRY=$(ls -d "$P8STORE/pool/$P8S"/* 2>/dev/null | head -1)
+    if [ -n "$P8ENTRY" ]; then
+        # snapshot rows are immutable, so a snap_created_at that no longer matches means the id
+        # belongs to a different snapshot now -- the entry is stale and must never be handed out.
+        sqlite3 "$P8STORE/metadata.db" "UPDATE pool SET snap_created_at=snap_created_at+1;"
+        chmod +a "$(id -un) deny delete,delete_child,add_file" "$P8ENTRY/keep"
+        out=$(p8 fs gc 2>&1)
+        P8ROWS=$(sqlite3 "$P8STORE/metadata.db" "SELECT count(*) FROM pool;")
+        if [ -e "$P8ENTRY/keep/f.txt" ] && [ "$P8ROWS" = 1 ]; then
+            ok PR8 "a stale pool entry gc cannot remove keeps its row"
+        else
+            bad PR8 "a stale pool entry gc cannot remove keeps its row (rows $P8ROWS)"
+            echo "$out" | sed 's/^/        /'
+        fi
+        echo "$out" | grep -q "stale pre-clone entry could not be removed" \
+            && ok PR8 "gc says so instead of reporting it collected" \
+            || { bad PR8 "gc says so instead of reporting it collected"; echo "$out" | sed 's/^/        /'; }
+        p8 fs gc --status | grep -q "stale pre-clone" && ok PR8 "gc --status counts the stale entry" \
+            || { bad PR8 "gc --status counts the stale entry"; p8 fs gc --status | sed 's/^/        /'; }
+        # Take the ACL away and the next wake finishes what it started: tree gone, row gone.
+        chmod -N "$P8ENTRY/keep"
+        p8 fs gc > /dev/null 2>&1
+        for _ in $(seq 40); do [ ! -e "$P8ENTRY" ] && break; sleep 0.25; done
+        P8ROWS=$(sqlite3 "$P8STORE/metadata.db" "SELECT count(*) FROM pool;")
+        if [ ! -e "$P8ENTRY" ] && [ "$P8ROWS" = 0 ]; then
+            ok PR8 "once it can be removed the next gc removes the tree and the row"
+        else
+            bad PR8 "once it can be removed the next gc removes the tree and the row (rows $P8ROWS)"
+        fi
+    else
+        bad PR8 "the pool holds a pre-cloned entry for $P8S"
+    fi
+fi
+
+
 # ---- PR #1 review (7th round, P2): the gc deadline reaches the cheap half's own trees ---------
 # gc's cheap half removes three kinds of whole tree before the deadline-controlled trash loop is
 # reached: an abandoned fork's half-built clone, a half-built snapshot's S<n> and S<n>.wfs-tmp,

@@ -1174,6 +1174,17 @@ static int cmd_gc(wfs_store *s, int argc, char **argv) {
                 rep.work_remains ? "the collector will try again."
                                  : "it has failed too often to keep retrying by itself.");
     }
+    if (rep.pool_failed) {
+        // The same rule as the half-built trees above: a stale pre-clone entry that could not be
+        // removed keeps its row, so that something in the store still knows the tree is rubbish.
+        fprintf(stderr,
+                "world: note: %llu stale pre-clone entr%s could not be removed and %s still under\n"
+                "world:       <store>/pool. The record of %s is kept; %s   (`world fs gc --status`)\n",
+                (unsigned long long)rep.pool_failed, rep.pool_failed == 1 ? "y" : "ies",
+                rep.pool_failed == 1 ? "is" : "are", rep.pool_failed == 1 ? "it" : "them",
+                rep.work_remains ? "the collector will try again."
+                                 : "it has failed too often to keep retrying by itself.");
+    }
     if (rep.trash_failed) {
         // Never let a failed delete read as an empty trash: say what is still in there, and
         // whether anything will come back for it by itself.

@@ -595,6 +595,13 @@ typedef struct wfs_gc_report {
      * suffix sweep -- so an S<n> that would not go used to leak for ever, its row deleted along
      * with the failure. That row is kept now too, and counted here. */
     uint64_t tmp_failed;
+    /* PR #1 review (8th round): stale pre-clone entries under <store>/pool this run could not
+     * remove. Same rule as the two counters above and for the same reason: the removal used to
+     * be assumed to have worked and the pool row deleted with it, so a clone that would not go
+     * was left with nothing in the store that knew it was rubbish, no retry counter and no
+     * work_remains -- it leaked until somebody ran gc by hand. The row is kept while its tree
+     * is, counted here and by `gc --status`, and retried under the same cap. */
+    uint64_t pool_failed;
 } wfs_gc_report;
 
 /* retention_secs < 0 uses the default (7 days). Synchronous and complete: every due trash entry

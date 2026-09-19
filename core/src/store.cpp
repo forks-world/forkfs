@@ -213,6 +213,58 @@ int meta_set(sqlite3 *db, const char *key, const char *value) {
 
 } // namespace
 
+// ---- PR #1 review: the shared gc retry counter (internal.h) ----------------------------------
+//
+// It lives here because it is one row of the store's meta table: read, increment, write, in one
+// transaction. World.cpp keys it on a trash entry's name and pool.cpp (8th round) on a pool
+// entry's path; neither has any business owning the counter itself.
+namespace wfs {
+
+const int64_t kGcFailCap = 5;
+
+int64_t gc_fail_bump(wfs_store *s, const char *key) {
+    if (!s || !key || !*key) return kGcFailCap;   // cannot count: do not spin
+    Guard g(s->mu);
+    Txn t(s->db);
+    int64_t n = 0;
+    {
+        Stmt q(s->db, "SELECT value FROM meta WHERE key=?");
+        if (!q.ok()) return kGcFailCap;
+        q.text(1, key);
+        if (q.row()) n = ::strtoll(q.col_text(0), nullptr, 10);
+    }
+    ++n;
+    char v[32];
+    ::snprintf(v, sizeof v, "%lld", (long long)n);
+    Stmt u(s->db,
+           "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value");
+    if (!u.ok()) return kGcFailCap;
+    u.text(1, key);
+    u.text(2, v);
+    if (u.step() != SQLITE_DONE) return kGcFailCap;
+    t.commit();
+    return n;
+}
+
+// The read comes first so that the ordinary case -- something that never failed -- costs one
+// indexed lookup instead of a transaction per removed tree.
+void gc_fail_clear(wfs_store *s, const char *key) {
+    if (!s || !key || !*key) return;
+    Guard g(s->mu);
+    {
+        Stmt q(s->db, "SELECT 1 FROM meta WHERE key=?");
+        if (!q.ok()) return;
+        q.text(1, key);
+        if (!q.row()) return;
+    }
+    Txn t(s->db);
+    Stmt d(s->db, "DELETE FROM meta WHERE key=?");
+    if (d.ok()) { d.text(1, key); d.step(); }
+    t.commit();
+}
+
+} // namespace wfs
+
 extern "C" const char *wfs_version(void) { return "0.1.0-m1"; }
 
 extern "C" const char *wfs_strerror(int rc) {

@@ -60,8 +60,16 @@ int pool_ready_for(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, uint6
 // worker wake into minutes. `deadline_us` is the gc worker's fs_mono_us() stamp (0 = no limit),
 // checked before each tree and inside the walk; when it passes, what is left keeps the state its
 // successor rediscovers it in -- the row is still there, the orphan directory is still listed --
-// and *work_remains is set to 1 so the worker chain carries on. Neither pointer has to be given.
-int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us = 0, int *work_remains = nullptr);
+// and *work_remains is set to 1 so the worker chain carries on. None of the pointers has to be
+// given.
+//
+// PR #1 review (8th round): a removal that FAILS is not the same thing as one the deadline cut
+// short, and it used to be treated as one -- worse, the row was deleted anyway, so a tree that
+// would not go (an ACL, an EPERM, an EIO) was left with nothing in the store that knew it was
+// rubbish. The row is kept now, `*failed` counts it, and the shared gc retry cap
+// (wfs::gc_fail_bump) decides whether the chain comes back for it or leaves it to be reported.
+int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us = 0,
+                 int *work_remains = nullptr, uint64_t *failed = nullptr);
 
 // `gc --status`: how many stale pool entries are still on disk, counted the way pool_collect
 // classifies them and without removing any of them. Rows whose snapshot is gone or is a

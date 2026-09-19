@@ -400,13 +400,23 @@ int pool_scan(wfs_store *s, Vec<wfs_id> &rows, Vec<String> &trees, Vec<String> &
     return 0;
 }
 
+// One pool tree's key in the store's shared gc retry counter (internal.h). The path, because
+// that is what a pool entry is: <store>/pool/S<n>/<uuid>, drawn once and never reused. A row and
+// the row-less directory it leaves behind therefore go on counting as one thing.
+String pool_fail_key(const String &path) {
+    String k("gcfail:pool:");
+    k.append(path.c_str());
+    return k;
+}
+
 // The directories under <store>/pool that no row claims: half-built trees (*.wfs-tmp) and
 // entries whose row was claimed by a fork that then died before the rename. `remove` deletes
 // them and returns how many went; otherwise they are only counted. The deadline is the gc
 // worker's, and a tree it stops in the middle of is still a row-less directory next time, so
 // the successor picks it up exactly where this left off.
 uint64_t pool_sweep_orphans(wfs_store *s, const Vec<String> &live, bool remove, int64_t deadline_us,
-                            bool *out_of_time) {
+                            bool *out_of_time, uint64_t *failed = nullptr,
+                            int *work_remains = nullptr) {
     uint64_t n = 0;
     String root = pool_root(s);
     DIR *d = ::opendir(root.c_str());
@@ -431,7 +441,14 @@ uint64_t pool_sweep_orphans(wfs_store *s, const Vec<String> &live, bool remove, 
             int partial = 0;
             int rc = fs_remove_tree(p.c_str(), deadline_us, &partial);
             if (partial) { if (out_of_time) *out_of_time = true; break; }
-            if (rc == 0) ++n;
+            if (rc == 0 && !exists(p.c_str())) { ++n; gc_fail_clear(s, pool_fail_key(p).c_str()); continue; }
+            // PR #1 review (8th round): it did not go. Nothing else in the store names this
+            // directory -- the row it belonged to is gone or never existed -- so saying nothing
+            // about it means it leaks silently until somebody runs gc by hand. Count it, and
+            // keep the worker chain coming back for it under the same cap a trash entry gets.
+            if (failed) (*failed)++;
+            if (gc_fail_bump(s, pool_fail_key(p).c_str()) < kGcFailCap && work_remains)
+                *work_remains = 1;
         }
         ::closedir(sd);
         if (out_of_time && *out_of_time) break;
@@ -443,7 +460,8 @@ uint64_t pool_sweep_orphans(wfs_store *s, const Vec<String> &live, bool remove, 
 
 } // namespace
 
-int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us, int *work_remains) {
+int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us, int *work_remains,
+                 uint64_t *failed) {
     if (!s) return -EINVAL;
     uint64_t n = 0;
     Vec<wfs_id> rows;
@@ -468,6 +486,25 @@ int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us, int *work
         int partial2 = 0;
         if (!partial) fs_remove_tree(trees[i].c_str(), deadline_us, &partial2);
         if (partial || partial2) { out_of_time = true; break; }
+        // PR #1 review (8th round): the results used to be thrown away and the row deleted
+        // whatever happened. A removal that fails for a reason the deadline had nothing to do
+        // with -- an ACL, an EPERM, a transient EIO -- then left the clone on disk with its row
+        // gone, and the orphan sweep below, which would have found it, had no retry counter and
+        // set no work_remains either: it leaked until somebody ran gc by hand. So the row stays
+        // while its tree does. It is not handed out by that -- pool_claim only ever matches
+        // state=1 rows whose snapshot is the ACTIVE one being forked from, and this entry is
+        // doomed precisely because that is no longer true -- it is simply collected again.
+        String key = pool_fail_key(trees[i]);
+        if (exists(trees[i].c_str()) || exists(tmp.c_str())) {
+            if (failed) (*failed)++;
+            if (gc_fail_bump(s, key.c_str()) < kGcFailCap && work_remains) *work_remains = 1;
+            // The row stayed, so the tree is not row-less: the sweep below must not count it a
+            // second time (nor try the removal that has just failed) under the other rule.
+            live.emplace_back(trees[i]);
+            live.emplace_back(tmp);
+            continue;
+        }
+        gc_fail_clear(s, key.c_str());
         Guard g(s->mu);
         Txn t(s->db);
         Stmt d(s->db, "DELETE FROM pool WHERE id=?");
@@ -475,7 +512,8 @@ int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us, int *work
         t.commit();
         ++n;
     }
-    if (!out_of_time) n += pool_sweep_orphans(s, live, true, deadline_us, &out_of_time);
+    if (!out_of_time)
+        n += pool_sweep_orphans(s, live, true, deadline_us, &out_of_time, failed, work_remains);
     if (out_of_time && work_remains) *work_remains = 1;
     if (removed) *removed += n;
     return 0;
@@ -493,6 +531,11 @@ int pool_stranded(wfs_store *s, uint64_t *out) {
         String tmp(trees[i]);
         tmp.append(WFS_TMP_SUFFIX);
         if (exists(trees[i].c_str()) || exists(tmp.c_str())) ++n;
+        // A doomed row's tree is counted here, and it is not a row-less orphan as well: the two
+        // rules used to meet on it and `gc --status` reported one stale entry as two (PR #1
+        // review, 8th round -- the same double count the collector's own failure path had).
+        live.emplace_back(trees[i]);
+        live.emplace_back(tmp);
     }
     n += pool_sweep_orphans(s, live, false, 0, nullptr);
     *out = n;
