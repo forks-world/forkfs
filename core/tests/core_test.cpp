@@ -1689,6 +1689,28 @@ int main() {
         CHECK_OK(wfs_store_open(fresh, &f2));
         wfs_store_close(f2);
 
+        // ---- PR #1 review (13th round, P1): a scan that could not look is not an empty store --
+        //
+        // The guard's whole evidence is three readdirs. An opendir(2) that failed for any reason
+        // other than ENOENT -- EACCES, EIO, a volume that is not mounted any more -- was skipped
+        // in silence, so a store whose `snapshots/` could not be read came out "empty": the open
+        // then created a fresh metadata.db and a fresh store id right beside the trees, and
+        // every later open found that database and never ran the guard again. Only ENOENT means
+        // "no such subtree" now; anything else fails the open with that errno.
+        CHECK(unlink(dbp) == 0);
+        char dsnaps[4096];
+        join(dsnaps, sizeof dsnaps, dstore, "snapshots");
+        CHECK(chmod(dsnaps, 0000) == 0);
+        d = NULL;
+        CHECK_RC(wfs_store_open(dstore, &d), -EACCES);
+        CHECK(d == NULL);
+        CHECK(!exists(dbp));   // and nothing was created beside the trees
+        // With the mode back, the same store reports the damage it has, exactly as above.
+        CHECK(chmod(dsnaps, 0755) == 0);
+        CHECK_RC(wfs_store_open(dstore, &d), WFS_E_STORE_DAMAGED);
+        CHECK(d == NULL);
+        CHECK(!exists(dbp));
+
         char snap[4096];
         snprintf(snap, sizeof snap, "%s/snapshots/S%llu", dstore, (unsigned long long)dsid);
         CHECK(chmod(snap, 0700) == 0); // so the test's own rm_rf can clear it

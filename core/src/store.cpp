@@ -251,13 +251,30 @@ int meta_get(sqlite3 *db, const char *key, String &out) {
 // P17: does this store directory still hold trees? One readdir of each of the three places a
 // tree can be, stopping at the first entry that is not "." or "..". Cheap enough to do on every
 // open of a store whose metadata.db is not there.
-bool store_has_trees(const char *dir, String &what) {
+//
+// 1 = yes (and `what` names the first one found), 0 = no, a negative errno = the question could
+// not be answered.
+//
+// PR #1 review (13th round, P1): that third answer is the whole point. This used to be a bool
+// over three opendir(2)s whose failures were skipped in silence -- `if (!d) continue;` -- so a
+// `snapshots/` that came back EACCES, EIO, or ENOENT-because-the-volume-is-not-mounted read as
+// "nothing in there", the guard called the store empty, and the open built a fresh metadata.db
+// and a fresh store id beside trees the old database was the index of. Worse than the missing
+// guard: from then on the database IS there, so no later open ever asks again. Only ENOENT is
+// evidence of absence -- the subtree is genuinely not there, so nothing can be in it -- and
+// every other errno is the caller's to refuse on. The same rule the 12th round put on
+// exists(): presence is assumed unless absence is proven.
+int store_has_trees(const char *dir, String &what) {
     for (const char *sub : {"/snapshots", "/trash", "/pool"}) {
         String p(dir);
         p.append(sub);
         DIR *d = ::opendir(p.c_str());
-        if (!d) continue;
+        if (!d) {
+            if (errno == ENOENT) continue;   // no such subtree: there is nothing in it
+            return -errno;                   // and anything else is not an answer at all
+        }
         bool found = false;
+        errno = 0;   // readdir(3) reports its own failure only through errno
         while (struct dirent *e = ::readdir(d)) {
             if (e->d_name[0] == '.' && (e->d_name[1] == 0 || (e->d_name[1] == '.' && e->d_name[2] == 0)))
                 continue;
@@ -267,10 +284,12 @@ bool store_has_trees(const char *dir, String &what) {
             found = true;
             break;
         }
+        int rderr = found ? 0 : errno;   // a NULL return with errno set is a read that failed
         ::closedir(d);
-        if (found) return true;
+        if (found) return 1;
+        if (rderr) return -rderr;
     }
-    return false;
+    return 0;
 }
 
 int meta_set(sqlite3 *db, const char *key, const char *value) {
@@ -388,14 +407,28 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
     // restart at 1 when the database does, and the first `init` would then be handed S1 with
     // `snapshots/S1` already on disk -- so this is refused, loudly, before anything is created.
     // "Unreadable" counts as missing: a database we cannot open is one whose ids we do not know.
+    //
+    // PR #1 review (13th round, P1): and "I could not look" counts as neither. A stat(2) on
+    // metadata.db that fails for a reason other than ENOENT says nothing about whether the file
+    // is there, and a subtree scan that could not run says nothing about whether the store is
+    // empty -- so both of those end the open with the errno that caused them, before anything
+    // at all is created. The file itself is never replaced either way: a metadata.db that is
+    // there but cannot be opened fails in sqlite3_open_v2 below (SQLITE_OPEN_CREATE creates a
+    // database that is not there, it does not truncate one that is).
     {
         String dbp(real);
         dbp.append("/metadata.db");
         struct stat dbst;
-        bool readable = ::stat(dbp.c_str(), &dbst) == 0 && S_ISREG(dbst.st_mode) &&
-                        dbst.st_size > 0 && ::access(dbp.c_str(), R_OK | W_OK) == 0;
-        String what;
-        if (!readable && store_has_trees(real.c_str(), what)) return WFS_E_STORE_DAMAGED;
+        int srt = ::stat(dbp.c_str(), &dbst) == 0 ? 0 : -errno;
+        if (srt && srt != -ENOENT) return srt;
+        bool readable = srt == 0 && S_ISREG(dbst.st_mode) && dbst.st_size > 0 &&
+                        ::access(dbp.c_str(), R_OK | W_OK) == 0;
+        if (!readable) {
+            String what;
+            int trees = store_has_trees(real.c_str(), what);
+            if (trees < 0) return trees;
+            if (trees) return WFS_E_STORE_DAMAGED;
+        }
     }
 
     wfs_store *s = new wfs_store();

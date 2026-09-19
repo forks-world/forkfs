@@ -1665,7 +1665,22 @@ int main(int argc, char **argv) {
                       "restore metadata.db from a backup, or move the directory aside "
                       "(`mv <store> <store>.damaged`) and start a new store");
     }
-    if (rc) { fprintf(stderr, "world: open store %s: %s\n", sd, wfs_strerror(rc)); return EX_ERR; }
+    // P17, and PR #1 review (13th round): the guard above needs three readdirs to know whether
+    // this store still holds trees, and a `snapshots/` it cannot open answers nothing. The core
+    // returns that errno rather than guessing "empty", so nothing was created and nothing was
+    // touched -- which is worth saying, because the same errno from any other step of the open
+    // means the same thing here: stop, fix the access, try again.
+    if (rc) {
+        fprintf(stderr, "world: open store %s: %s\n", sd, wfs_strerror(rc));
+        if (rc == -EACCES || rc == -EPERM || rc == -EIO || rc == -ENOTDIR)
+            fprintf(stderr,
+                    "  nothing was created: a store that cannot be read is not an empty store "
+                    "(P17), so no metadata.db and no store id were made here.\n"
+                    "  try: fix the permissions on %s (or mount the volume it is on) and run the "
+                    "command again\n",
+                    sd);
+        return EX_ERR;
+    }
 
     int ret;
     if (is_exec) ret = cmd_exec(s, nargs, args);
