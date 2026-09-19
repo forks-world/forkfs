@@ -711,4 +711,4 @@ FSKit 传进来的不是 `WorldItem`),与本次改动无关;`error:70` 一条都
 - [ ] T2.3 store 路径统一:沙盒 appex 与 CLI 默认 store 不同(container vs ~/Library/Application Support),`world fs mount` 自动指向 container store;修正任务板中"CLI 默认同路径"
 - [ ] T2.4 diff 扫描改 `getattrlistbulk` + `EF_NO_XATTRS`,目标 50k 从 1.4s 到 ~0.2s(含 xattr 判断)
 - [ ] T2.5 fork 后按 (dev, ino) 恢复树内硬链接(P9 从警告变为修复)
-- [ ] T2.6 Linux 平台层:overlayfs + mount namespace(fork O(1)、upper 目录即 changed-set)
+- [ ] T2.6 Linux 平台层:overlayfs + mount namespace(fork O(1)、upper 目录即 changed-set)——**不在这台 Mac 上做**(用户决定),等 Linux 机器
