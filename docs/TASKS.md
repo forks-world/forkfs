@@ -1135,3 +1135,57 @@ PR [#1](https://github.com/forks-world/forkfs/pull/1) 的机器评审提了四�
 - 失败重试:用 **ACL**(`deny delete_child`,chmod 和 chflags 都解不掉,正是 deleter 遇到 EPERM 时的两招)
   造一个真删不掉的条目,`gc --status` 一直数得到它,worker 日志绝不出现 "trash empty",5 次之后
   改口"不再自动重试",ACL 一撤下次 gc 就删干净;老代码红 5 条。
+
+#### PR #1 review 第二轮修复(2026-09-19,Codex 两条)
+
+同一个 PR 的第二轮机器评审又提了两条,都是**"把一次失败读成一个肯定的答案"**这类错误,
+一条一个提交、一条一个测试:
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 | `hardlinks.cpp:284` | 硬链接重放把临时名字写死成 `<path>.wfs-tmp`,EEXIST 时**直接 unlink**。可是快照装的是别人的工作区:一个叫 `b.wfs-tmp` 的普通文件挨着硬链接的 `b`,每次 fork / checkpoint / pool 填充都会把它悄悄删掉 | 临时名字改成同目录下的 `.wfs-hl-<pid>-<计数>-<getentropy 16 位十六进制>`;`link(2)` 本身就是排他创建(EEXIST 而不是覆盖),**成功的 link 就是占位**,和 `open(2)` 的 `O_EXCL` 一个道理;EEXIST 就换个名字重来,**任何不是我们自己的东西一律不 unlink** | `59a0ad9` |
+| P2 | `diff.cpp:244` | `listxattr`/`getxattr` 失败(EACCES、EIO、ERANGE 重试分配不到内存)一律当成"没有扩展属性"。对面也是空的时候,两个文件就被判**相等**——一次根本没发生的比较,报出来是"干净" | xattr 这条腿从两值答案改成三值:只有**成功返回 0 长度**才算"没有";失败是 `XA_ERROR`,条目报 `T`(绝不报相等)并记进新的 `wfs_diff_stats::xattr_errors`(`diff --stat` 会打一行 note)。**快照那一侧失败根本不算 diff 结果**:那棵树是我们克隆的、在 SnapGate 窗口里开着门读的,EACCES/EPERM 直接让整个调用返回该 errno | `665a868` |
+
+`EF_NO_XATTRS` 那条捷径**保留**:它是文件系统**成功**地说"这个文件一个属性都没有",和一次失败的
+`listxattr` 不是一回事。但只要有一侧没这个位,另一侧就老老实实 `listxattr`,失败就是错误、不是空表。
+顺带修掉同一类的两处静默相等:`malloc` 失败(原来 `return true`)和名字超过 4096 字节的
+`xattr_equal_raw` 回退路径(原来两边都当 0 长度,于是相等)。
+
+**`.wfs-tmp` 家族审计**(评审要求的那一条):`WFS_TMP_SUFFIX` 一共六处,按"名字在谁的地盘上"分两类——
+
+| 位置 | 名字 | 判定 |
+|---|---|---|
+| `hardlinks.cpp` 重放 | `<用户树里的名字>.wfs-tmp` | **不安全,本轮已修** |
+| `world.cpp:576` 快照创建 | `<store>/snapshots/S<n>.wfs-tmp` | 安全:store 内部,名字由新行 id 决定 |
+| `world.cpp:2055` gc 清快照 | 同上 | 安全:同一个 store 内部名字 |
+| `pool.cpp:154/365/520` | `<store>/pool/S<n>/<uuid>.wfs-tmp` | 安全:store 内部 + uuid |
+| trash 的 `.deleting` | `<store>/trash/<name>.deleting` | 安全:trash 全归我们,条目名字是 discard 自己起的 |
+| `world.cpp:937` fork 目标 | `<用户选的 target>.wfs-tmp` | **仍不安全**,见下 |
+
+后两处需要单独一轮(本轮不动,以免把 publish 顺序和 gc 的清扫规则一起改了):
+
+- `wfs_world_create()` 在 `<target>.wfs-tmp` 下建树,开头是
+  `if (exists(tmp)) fs_remove_tree(tmp)`。`target` 是用户给的路径(`--to ~/w/a`),
+  所以 `~/w/a.wfs-tmp` 要是用户自己的文件或目录,fork 会**整棵删掉**。
+- `world.cpp:1688` 的 `rm_tmp_in_dir()` 更宽:gc 会把**每个 World 的父目录**(用户目录!)扫一遍,
+  凡是以 `.wfs-tmp` 结尾的条目一律 `fs_remove_tree`。`~/w/notes.wfs-tmp` 就这么没了。
+- 修法方向:临时名字同样改成唯一名(`link`/`clonefile` 都是排他创建,不必先删),
+  并且把它**记进 CREATING 那一行**,让 gc 只删自己记下来的路径,而不是按后缀猜。
+
+**验收**:`safety.sh` **161 passed, 0 failed**(上一轮 158 → 本轮新增 3 条 `PR1` 用例);
+`ctest` 两个全新配置的构建目录 WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的
+deprecated 警告);`check-deps.sh` 两个目录全绿(ACL 用的是 libSystem,没引进新库);
+`diff_test` 连跑 **8 次 8/8**。
+
+两条新测试都验证过"没有修复就会红":
+
+- P1:`core_test` 在硬链接组 `g2` / `sub/g2-b` 旁边各放一个 `*.wfs-tmp` 普通文件,要求 fork 之后
+  三者都在、内容一字不差、两个名字仍共享 inode,而且树里**不留**任何 `.wfs-hl-` 临时名;
+  pool 路径同样要过。老代码红在 `core_test.cpp:724`(`sub/g2-b.wfs-tmp` 直接不见了)。
+  `safety.sh` 用 CLI 把同一件事再做一遍(`a` / `b` / `a.wfs-tmp` / `b.wfs-tmp`)。
+- P2:`diff_test` 用 **ACL**(`deny readextattr`)让 world 侧一个文件的 `listxattr` 返回 EACCES
+  ——ACL 正好不碰 diff 比的任何东西:`st_mode` 还是 0644、`st_flags` 还是 0、`lstat` 照样能用,
+  所以条目是**带着其余全部相等**走到 xattr 这条腿上的,这是老 bug 唯一看得见的地方。要求
+  `--full` 和事件路径都报 `T` 且 `xattr_errors == 1`,`--no-xattr` 0 行,ACL 一撤回到 1 行、
+  属性删掉回到 0 行;再把 ACL 挪到**快照**那一侧,要求整个 diff 以 `-EACCES` 失败。
+  老代码红在 "xattr unreadable / --full: 0 lines, wanted 1"。
