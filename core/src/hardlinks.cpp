@@ -601,6 +601,34 @@ int replay_verdict(const HardlinkRestore &r) {
 
 } // namespace
 
+// See hardlinks.h. The manifest checked against the tree it was written from, which is the only
+// thing that can catch a manifest whose members were exchanged between two groups: every count
+// the reader looks at survives that, and so does the replay's "same size, same mtime" guard.
+int hardlinks_verify_groups(const char *tree_root, const HardlinkSet &set) {
+    if (!tree_root || !*tree_root) return -EINVAL;
+    for (size_t i = 0; i < set.groups.size(); ++i) {
+        const HardlinkGroup &g = set.groups[i];
+        // Both of these are already refusals in hardlinks_manifest_read; repeated because this
+        // function's promise is about the set it was handed, not about where it came from.
+        if (g.paths.size() < 2 || (uint64_t)g.paths.size() != g.nlink) return -EINVAL;
+        struct stat first;
+        String p = joinp(tree_root, g.paths[0].c_str());
+        if (::lstat(p.c_str(), &first) != 0 || !S_ISREG(first.st_mode)) return -EINVAL;
+        // Exactly, not "at least": a snapshot tree is published with the group's names -- and
+        // only those -- on that inode, so a bigger nlink means the tree is not the tree this
+        // manifest describes any more. (The live-source check in group_still_linked() is the
+        // one that settles for >=, because a live tree may have grown a link of its own.)
+        if ((uint64_t)first.st_nlink != (uint64_t)g.paths.size()) return -EINVAL;
+        for (size_t k = 1; k < g.paths.size(); ++k) {
+            struct stat st;
+            String q = joinp(tree_root, g.paths[k].c_str());
+            if (::lstat(q.c_str(), &st) != 0) return -EINVAL;
+            if (st.st_dev != first.st_dev || st.st_ino != first.st_ino) return -EINVAL;
+        }
+    }
+    return 0;
+}
+
 int hardlinks_restore(const char *tree_root, const HardlinkSet &set, const char *verify_root,
                       HardlinkRestore *out) {
     if (!tree_root || !*tree_root) return -EINVAL;

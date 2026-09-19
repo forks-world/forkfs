@@ -169,6 +169,38 @@ static void repath_hl_line(const char *manifest, size_t which, const char *path)
     CHECK(rename(tmp, manifest) == 0);
 }
 
+// PR #1 review (13th round): the paths of two `hl` lines exchanged. Nothing else moves -- the
+// group ids, the nlinks, the line order and the header are all exactly as the snapshot wrote
+// them -- so when the two lines belong to different groups, every structural check the reader
+// makes still passes and each group now names members of two different inodes.
+static void hl_line_path(const char *manifest, size_t which, char *out, size_t cap) {
+    char line[8192];
+    size_t seen = 0;
+    FILE *f = fopen(manifest, "r");
+    CHECK(f);
+    out[0] = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "hl ", 3) || seen++ != which) continue;
+        unsigned long long g = 0, nl = 0;
+        int used = 0;
+        CHECK(sscanf(line + 2, " %llu %llu %n", &g, &nl, &used) == 2 && used);
+        snprintf(out, cap, "%s", line + 2 + used);
+        size_t n = strlen(out);
+        while (n && (out[n - 1] == '\n' || out[n - 1] == '\r')) out[--n] = 0;
+        break;
+    }
+    fclose(f);
+    CHECK(out[0]);
+}
+
+static void swap_hl_paths(const char *manifest, size_t i, size_t j) {
+    char pi[4096], pj[4096];
+    hl_line_path(manifest, i, pi, sizeof pi);
+    hl_line_path(manifest, j, pj, sizeof pj);
+    repath_hl_line(manifest, i, pj);
+    repath_hl_line(manifest, j, pi);
+}
+
 static int exists(const char *p) { struct stat st; return lstat(p, &st) == 0; }
 
 // ---- PR #1 review (11th round): a database of the shape schema 2 had before the ALTERs -------
@@ -3474,6 +3506,121 @@ int main() {
         CHECK_OK(wfs_world_discard(ds, dw1, 1, 0));
         wfs_store_close(ds);
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", dstore, (unsigned long long)d1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
+    // ---- PR #1 review (13th round, P2): the groups are checked against the snapshot tree ----
+    //
+    // Every manifest check up to here is structural -- the header's totals, each group's size
+    // against its nlink, no name twice, no path that leaves the tree -- and all of them are
+    // blind to one damage shape: two members exchanged between two groups. (a,b),(c,d) becomes
+    // (a,c),(b,d): two groups, four names, nlink 2 each, every name once, every path inside.
+    // The replay then links `c` onto `a` and `d` onto `b`, and when the four files share a size
+    // and an mtime -- which they do, being clones of one snapshot walk -- the "is this still the
+    // file the scan saw" guard cannot tell either: the fork came back rc 0 with `a` and `c`
+    // welded and `c`'s content gone.
+    //
+    // Nothing in the manifest can catch this, because the manifest is the thing that is wrong.
+    // The snapshot TREE is the immutable original, so every group is lstat'ed against it before
+    // the replay -- one lstat per hardlinked name, the price hardlinks.h already quotes for a
+    // verify -- and a group whose members do not land on one inode with that inode's nlink is
+    // WFS_E_SNAPSHOT_DIRTY. The clone is never published. (Not against the clone: clonefile
+    // breaks every hardlink, so the clone has nothing to say about which names shared an inode.)
+    {
+        char sstore[4096], ssrc[4096], sman[4096], sbak[4096], sw[4096], q2[4096];
+        static const char *snames[4] = {"a", "b", "c", "d"};
+        join(sstore, sizeof sstore, root, "hlswap-store");
+        join(ssrc, sizeof ssrc, root, "hlswap-src");
+        CHECK(mkdir(ssrc, 0755) == 0);
+        join(p, sizeof p, ssrc, "a");
+        write_file(p, "aaaa\n");
+        join(q2, sizeof q2, ssrc, "b");
+        CHECK(link(p, q2) == 0);
+        join(p, sizeof p, ssrc, "c");
+        write_file(p, "cccc\n");   // the same size, so only the inodes tell the pairs apart
+        join(q2, sizeof q2, ssrc, "d");
+        CHECK(link(p, q2) == 0);
+        {
+            struct timespec ts[2];
+            ts[0].tv_sec = 1600000000; ts[0].tv_nsec = 0;
+            ts[1] = ts[0];
+            for (int k = 0; k < 4; ++k) {
+                join(p, sizeof p, ssrc, snames[k]);
+                CHECK(utimensat(AT_FDCWD, p, ts, 0) == 0);
+            }
+        }
+        wfs_store *ss = NULL;
+        CHECK_OK(wfs_store_open(sstore, &ss));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "hlswap";
+        wfs_id s1 = 0;
+        CHECK_OK(wfs_snapshot_create(ss, ssrc, &sopts, &s1));
+        CHECK_OK(wfs_snapshot_info(ss, s1, &sr));
+        CHECK(sr.hl_groups == 2 && sr.hardlinks == 4);
+        CHECK(sr.hard == 0);   // a gated snapshot: the verify pass has to open the gate itself
+        snprintf(sman, sizeof sman, "%s/snapshots/S%llu/manifest", sstore, (unsigned long long)s1);
+        join(sbak, sizeof sbak, root, "hlswap.bak");
+        copy_file(sman, sbak);
+
+        // Lines 1 and 2 of the `hl` section are the second member of the first group and the
+        // first member of the second, whichever order the scan wrote the groups in.
+        swap_hl_paths(sman, 1, 2);
+
+        wfs_ref sf = {WFS_K_SNAPSHOT, s1};
+        memset(&opts, 0, sizeof opts);
+        opts.no_pool = 1;
+        join(sw, sizeof sw, worlds, "hlswap-w");
+        wfs_verify_report svr;
+        CHECK_RC(wfs_snapshot_verify(ss, s1, &svr), WFS_E_SNAPSHOT_DIRTY);
+        CHECK(svr.modified == 1 && strstr(svr.first_bad, "manifest"));
+        size_t sbefore = 0;
+        CHECK_OK(wfs_world_list(ss, 1, NULL, 0, &sbefore));
+        wfs_id sw1 = 0;
+        CHECK_RC(wfs_world_create(ss, sf, sw, &opts, &sw1), WFS_E_SNAPSHOT_DIRTY);
+        CHECK(!exists(sw));                                  // nothing published at --to
+        CHECK(n_with_prefix(worlds, ".wfs-fork-") == 0);     // and no clone left behind
+        size_t safter = 0;
+        CHECK_OK(wfs_world_list(ss, 1, NULL, 0, &safter));
+        CHECK(safter == sbefore);
+        uint64_t smade = 1;
+        CHECK_RC(wfs_pool_fill(ss, s1, 1, &smade), WFS_E_SNAPSHOT_DIRTY);
+        CHECK(smade == 0);
+        uint64_t sready = 1;
+        CHECK_OK(wfs_pool_ready(ss, s1, &sready));
+        CHECK(sready == 0);
+
+        // And the manifest as the snapshot wrote it forks, through the gate, with both pairs
+        // rebuilt and neither file holding the other's bytes: the refusal is about the swap.
+        copy_file(sbak, sman);
+        CHECK_OK(wfs_snapshot_verify(ss, s1, &svr));
+        CHECK_OK(wfs_world_create(ss, sf, sw, &opts, &sw1));
+        for (int k = 0; k < 4; k += 2) {
+            join(p, sizeof p, sw, snames[k]);
+            join(q2, sizeof q2, sw, snames[k + 1]);
+            CHECK(ino_of(p) == ino_of(q2));
+            CHECK(nlink_of(p) == 2);
+            CHECK_OK(read_file(p, buf, sizeof buf));
+            CHECK(!strcmp(buf, k ? "cccc\n" : "aaaa\n"));
+        }
+        // The same through the pool, whose filler runs the same pass on its own clone.
+        CHECK_OK(wfs_world_discard(ss, sw1, 1, 0));
+        smade = 0;
+        CHECK_OK(wfs_pool_fill(ss, s1, 1, &smade));
+        CHECK(smade == 1);
+        wfs_fork_result sfr;
+        memset(&opts, 0, sizeof opts);
+        memset(&sfr, 0, sizeof sfr);
+        CHECK_OK(wfs_world_create_ex(ss, sf, sw, &opts, &sfr));
+        sw1 = sfr.world;
+        CHECK(sfr.from_pool == 1);
+        for (int k = 0; k < 4; k += 2) {
+            join(p, sizeof p, sw, snames[k]);
+            join(q2, sizeof q2, sw, snames[k + 1]);
+            CHECK(ino_of(p) == ino_of(q2) && nlink_of(p) == 2);
+        }
+        CHECK_OK(wfs_world_discard(ss, sw1, 1, 0));
+        wfs_store_close(ss);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", sstore, (unsigned long long)s1);
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 

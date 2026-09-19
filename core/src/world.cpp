@@ -1201,6 +1201,22 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
                 break;
             }
             if (hl.groups.size() != hl_groups) { rc = WFS_E_SNAPSHOT_DIRTY; break; }
+            // PR #1 review (13th round, P2): and the groups have to be the tree's groups. Every
+            // check the reader makes is a count, and a manifest whose members were exchanged
+            // between two groups -- (a,b),(c,d) written as (a,c),(b,d) -- keeps all of them; the
+            // replay then welds `a` to `c` and loses one file's content, in a fork that reported
+            // success. The snapshot tree is the immutable original, so it is the authority: one
+            // lstat per hardlinked name, inside its own gate window (the root is mode 0000 until
+            // the gate opens), before anything is linked in the clone. A fork from a live WORLD
+            // keeps the 5th round's arrangement instead -- its verify root is the world, checked
+            // group by group inside the replay, because a live tree is allowed to have moved on.
+            if (hl.groups.size() && from.kind == WFS_K_SNAPSHOT) {
+                wfs::SnapGate vgate;
+                if (src_gated) rc = vgate.open(src.c_str(), false);
+                if (!rc && wfs::hardlinks_verify_groups(src.c_str(), hl)) rc = WFS_E_SNAPSHOT_DIRTY;
+                vgate.close();
+                if (rc) break;
+            }
             if (hl.groups.size()) {
                 wfs::HardlinkRestore hr;
                 rc = wfs::hardlinks_restore(tmp.c_str(), hl, hl_verify, &hr);
@@ -2405,7 +2421,13 @@ extern "C" int wfs_snapshot_verify(wfs_store *s, wfs_id id, wfs_verify_report *o
     if (r.hl_groups) {
         wfs::HardlinkSet hl;
         int hrc = wfs::hardlinks_manifest_read(mp.c_str(), hl);
-        if (hrc || hl.groups.size() != (size_t)r.hl_groups) {
+        // PR #1 review (13th round): and the groups are asked of the tree, not only of the
+        // header. A manifest whose members were exchanged between two groups passes every count
+        // -- group total, name total, each group's nlink, no name twice -- and describes a tree
+        // nobody has: this is the command that has to be able to say so, and it is already
+        // inside the gate, which is where the lstats have to happen.
+        if (hrc || hl.groups.size() != (size_t)r.hl_groups ||
+            wfs::hardlinks_verify_groups(r.path, hl)) {
             out->modified++;
             if (!out->first_bad[0]) copy_str(out->first_bad, sizeof out->first_bad, mp.c_str());
         }

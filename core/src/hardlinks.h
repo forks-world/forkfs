@@ -135,4 +135,35 @@ String hardlinks_manifest_path(const char *snapshot_root);
 int hardlinks_restore(const char *tree_root, const HardlinkSet &set, const char *verify_root,
                       HardlinkRestore *out);
 
+// Checks `set` against the tree it was written from, before any of it is replayed anywhere.
+// Returns 0, or -EINVAL for the first group `tree_root` does not agree with. Callers map that
+// to WFS_E_SNAPSHOT_DIRTY.
+//
+// PR #1 review (13th round, P2): every check hardlinks_manifest_read makes is structural -- the
+// header's totals, each group's size against its declared nlink, no name twice, no path that
+// leaves the tree -- and a manifest whose members were exchanged between two groups passes all
+// of them. (a,b),(c,d) written as (a,c),(b,d) keeps the group count, the name count, both
+// nlinks, the uniqueness and the path sanity, and the replay then links `c` onto `a`: when the
+// four files share a size and an mtime, which clones of one snapshot walk do, restore_group's
+// "is this still the file the scan saw" guard cannot tell either, so the fork is published with
+// two names welded and one file's content gone.
+//
+// No check on the manifest can catch that, because the manifest is the thing that is wrong. The
+// snapshot's TREE is the immutable original, so that is what the groups are asked about: every
+// member must lstat to one and the same inode, and that inode's st_nlink must be exactly the
+// group's member count (the scan writes a group only when every one of the inode's links was
+// found inside the tree, so in a snapshot this library published nlink IS the member count).
+//
+// Not the clone: clonefile breaks every hardlink, so a fresh clone has nothing to say about
+// which of its names shared an inode. And not instead of hardlinks_restore's `verify_root`,
+// which is the live-source check of the 5th round and stays exactly as it was -- a live tree is
+// allowed to have moved on, so a group it no longer agrees with is skipped and reported, while
+// a snapshot that no longer agrees with its own manifest is damage and a refusal.
+//
+// Cost: one lstat(2) per hardlinked name -- what hardlinks.h already prices a verify at -- and
+// zero syscalls for the overwhelmingly common snapshot that has no groups at all. It must run
+// inside the snapshot's read window (SnapGate): a gated root is mode 0000 and no name below it
+// resolves until the gate is open.
+int hardlinks_verify_groups(const char *tree_root, const HardlinkSet &set);
+
 } // namespace wfs

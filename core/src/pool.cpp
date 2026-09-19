@@ -220,6 +220,19 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
             // place (wfs_snapshot_create), so they disagree only if the manifest was damaged.
             if ((rc = hardlinks_manifest_read(mp.c_str(), hl))) { rc = WFS_E_SNAPSHOT_DIRTY; break; }
             if (hl.groups.size() != si.hl_groups) { rc = WFS_E_SNAPSHOT_DIRTY; break; }
+            // PR #1 review (13th round, P2): the same question the fork asks, for the same
+            // reason -- a manifest whose members were exchanged between two groups passes every
+            // structural check and welds two unrelated files together on replay, and an entry
+            // built that way is handed to the next fork as a faithful clone. The snapshot tree
+            // answers it (the clone cannot: clonefile broke every link in it), one lstat per
+            // hardlinked name, inside the gate window.
+            if (hl.groups.size()) {
+                SnapGate vgate;
+                if (!si.hard) rc = vgate.open(si.root.c_str(), false);
+                if (!rc && hardlinks_verify_groups(si.root.c_str(), hl)) rc = WFS_E_SNAPSHOT_DIRTY;
+                vgate.close();
+                if (rc) break;
+            }
             if (hl.groups.size() && (rc = hardlinks_restore(tmp.c_str(), hl, nullptr, nullptr))) break;
         }
         // The snapshot's own marker is never in there (wfs_snapshot_create removes it), so the
