@@ -1244,6 +1244,62 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第八轮:正在进行的操作不是崩溃现场(2026-09-19)
+
+第八轮,Codex 四条(两条 P1、两条 P2)。两条 P1 是同一个主题的**第三个面**:前几轮管的是"谁在
+写锁下**决定**",这一轮管的是"**决定之后、树搬完之前**,别人怎么看这条行"。`trashing_recover()`
+只会 `lstat`,而 `lstat` 分不清"死在 rename 之前"和"还差一微秒就 rename";collector 也一样,
+它排队时那条行是 TRASHED,轮到它时可能已经不是了。两条 P2 还是那对老朋友:**删不掉不等于删掉了**
+(这次轮到 pool),以及**读回来的东西必须自洽**(这次轮到硬链接清单的 `#hl` 头)。
+**一条一个提交、一条一个测试,四个测试都先验证过"没有修复就会红"。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `PRRT_kwDOUf7jGc6kAj4-` | `store.cpp:328` / `world.cpp` | `trashing_recover()` 跑在**每一次 store open** 和每一次 gc 开头,把**每一条** TRASHING 行都当成崩溃现场。于是一个**活着的** `discard W<n>` / `discard S<n>` / `restore W<n>` 卡在 (a) 和 rename 之间时,隔壁进程(脚本里的下一条命令就够)看到"树还在家",把行判回 ACTIVE、清掉 `trash_path`;这个 discard 随后把树搬进 trash,它那条 `WHERE state=4` 的 (c) **一行都没改到却返回 0**——留下一条 ACTIVE 行和一棵**没有任何行提到**的树,而无主孤儿是**立刻**删的:保留期不算数、restore 不可能,快照的话那是所有 fork 自它的世界的基线。`restore` 是镜像(行被判回 TRASHED,树却已经在家) | **TRASHING 行带主人**:(a) 把 `owner_pid` + `owner_start` 写上(和 CREATING 行同一对列、同一个 `producer_alive()`,它比的是进程启动时刻,所以 pid 复用骗不过它),(c) 和 `trashing_undo()` 清掉。`trashing_recover()` **跳过主人还活着的行**——那是在飞的操作,不是崩溃。第二层:(c) 和 restore 的收尾 UPDATE 都看 `sqlite3_changes()`,**0 行不算成功**。谁把行从我们手里判掉了,树和行也绝不许就此矛盾:`trashing_reclaim()` 在"树在 trash、行却说 ACTIVE"时把行重新写成 TRASHED(那是唯一一种不许留下的组合),树已经不在我们放的地方就回 `-ESTALE`;restore 的收尾同时认 `state=4` 和 `state=2`(一个 TRASHED 却躺在家里的世界只可能是这次 restore 造出来的),行已经是 ACTIVE 且没有 `trash_path` 就是别人替我们干完了,回 0 | `b577c2b` |
+| P1 `PRRT_kwDOUf7jGc6kAj5D` | `world.cpp:2532` | collector 排队了一条 TRASHED 行,轮到它时 `restore` 已经抢先把树搬回家。`trash_mark_deleting()` 的 `-ENOENT` 此刻的意思是"**搬回家了**",不是"已经被删了",而那个分支**无条件** `mark_dead()`:一个刚刚恢复、就在家里、行是 ACTIVE 的 World 被写成 DEAD——没有任何回头路,行是那个目录之所以是 World 的全部理由 | collector 对行的**每一次**写都带上这条行的全部身份:`WHERE id=? AND state=2 AND trash_path=?`(排队时那条行的样子),并查 `sqlite3_changes()`。重命名成 `.deleting` **之前**还在 store 锁下把行重读一次,所以常见情况下它连树都不碰就跳过:TRASHING 是别人在飞的操作、ACTIVE 是被 restore 拿回去了、DEAD 是别人收了。`gc_delete_one()` 对这种任务返回 **1**,循环**不计数、不报告、不重试**。`TrashJob` 同时记住行自己的 `trash_path` 和跟过 `.deleting` 的那个:collector 先改名再记名,中间那条记录若被条件写挡掉,两个名字**本来就都属于这条行**(`claim_trash_paths`),下一趟扫描照样跟着改名找到树 | `4fd1a54` |
+| P2 `PRRT_kwDOUf7jGc6kAj5G` | `pool.cpp:470` | `pool_collect()` 对一条过期 pool 行调 `fs_remove_tree()`,**把结果扔掉**然后删行。删不掉(ACL、EPERM、瞬时 EIO)就等于:一整棵快照克隆留在磁盘上、行没了、`gc` 还报告"1 pool entries"收掉了。旁边那条无主目录规则下次会看到这棵树,但它**没有失败计数也不置 `work_remains`**,所以没人会自己回来——一直泄漏到有人手动跑 `gc` | 和第五轮(fork 临时树)、第七轮(半成品快照)同一个修法:**树还在就留着行**。这不会把它交出去——`pool_claim()` 只匹配 `state=1` 且 `snapshot_id`/`snap_created_at` 正是被 fork 的那个 ACTIVE 快照的行,而这条行之所以过期恰恰是这个前提不成立了——只是下次再收一遍。新增 `wfs_gc_report::pool_failed`,CLI 照 `tmp_failed` 的样子打一条 note,`gc --status` 本来就数(`pool_stranded`),重试套同一个上限。那个上限顺手**并成一份**:`wfs::kGcFailCap` / `gc_fail_bump` / `gc_fail_clear` 搬进 `store.cpp`(它本来就是 meta 表里的一行),按字符串键;`world.cpp` 留 `TrashJob` 形状的壳,`pool.cpp` 按条目路径做键(uuid 抽一次不复用,所以行和它可能留下的无主目录**算同一件事**)。无主目录删不掉也照此办理。另外:一条过期行的树原来会被**数两遍**(一遍过期行、一遍无主目录),`gc --status` 把一个说成两个 | `a2f66e8` |
+| P2 `PRRT_kwDOUf7jGc6kAj5K` | `hardlinks.cpp:206` | `#hl` 头里写着它下面那一段有多少组、多少名字,而 `hardlinks_manifest_read()` 把这两个数**解析完就扔**(只留外部计数)。于是**最后一个成员没落盘**的清单读回来:组数照旧(fork 和 pool filler 拿来和行上 `hl_groups` 对的就是它),某一组只剩一个名字——而一个名字的组被 `restore_group()` **一声不吭地跳过**。fork 出来是两个独立文件,而快照记的是一个 inode 两个名字:P9 存在的全部意义,就这么悄悄没了,事后也查不出来,因为下游再没人读这份清单 | `HardlinkSet` 记下头里说的数(`header_groups`/`header_names`/`header_seen`),读完对不上就 `-EINVAL`(调用方早就把它映射成 `WFS_E_SNAPSHOT_DIRTY`):有 `hl` 行却没有头、组数不符、名字数不符,或者**任何一组少于两个名字**——扫描从不写这种组(名字不全在树内的组只计外部数)。写的那一半不用动:头写在它描述的那些行之前、来自同一个 `HardlinkSet`,`hl_drop_broken()` 丢组时会重算 `names`,所以这套代码写出来的每一份清单都自洽 | `79da4e2` |
+
+**验收**:`safety.sh` **225 passed, 0 failed**(上一轮 221 → 本轮 +4:pool 条目留行);
+`ctest`(WFS_FSKIT=OFF)**2/2**;`check-deps.sh` 全绿(没有新的系统调用、没有新的库)。
+
+四条都先把测试跑红过:
+
+- 在飞的 discard:去掉主人判活 → 第二个进程把行判成 **state 1**(ACTIVE),discard 照样回 0,
+  留下"行 ACTIVE、家里没树、trash 里有树",紧接着一次**默认保留期**的 `gc` 就把它当无主孤儿
+  删了(`trash_orphans != 0`)。
+- collector 的条件写:把两条 UPDATE 换回无条件版 → `gc` 报 `worlds_deleted=1`,而那个刚被
+  restore 回来的世界是 **state 3(DEAD)、树就在家里**。
+- pool:把"树还在就留行"拿掉 → `gc: … 1 pool entries`(报告收掉了)、行没了(rows 0)、树还在
+  磁盘上、什么都没说、也没人会回来收。
+- 清单:把自洽检查拿掉 → 三种损坏(丢最后一行、丢头、头多报一组)`verify` 全回 0、fork 全回 0,
+  而丢最后一行那次 **fork 出来是两个独立文件**(same inode 0, nlink 1)。
+
+新增测试:
+
+- `core_test`(P1 之一):自己的一个 store。崩溃缝**返回 0**(不是 `-EINTR`),在窗口里开**第二个
+  store 句柄**——open 会跑恢复,再跑一次什么都不留手的 `gc`——然后本进程的操作继续跑完。
+  `discard W<n>`(phase 0)、`restore W<n>`(phase 2)、`discard S<n>`(phase 0)三处都要:第二个
+  进程必须让行停在 TRASHING,操作回 0,行和树一致,而且随后一次默认保留期的 `gc` 也不把那棵树
+  当孤儿。第四段是**崩溃本身仍然能恢复**:同一个窗口,但主人是一个**不存在的 pid**
+  (`wfs_test_fork_owner_pid`,文件里其他"生产者已死"的用例用的是同一个),store open 照旧判回
+  ACTIVE。第五轮和第七轮的崩溃用例也都改用这个 pid ——seam 的 `kill -9` 发生在一个**还活着的**
+  测试进程里,而真正的崩溃留下的是一个死掉的主人。
+- `core_test`(P1 之二):新的 collector 缝 `wfs_test_before_trash_delete`(测试之外恒为 NULL),
+  在"排队完、改名前"那一刻跑一整个 `wfs_world_restore()`,gc 跑在另一个 store 句柄上。restore
+  必须赢,世界 ACTIVE 且在家、树是完整的、还 diff 得动,gc **什么都没删、没埋、也没报成失败**
+  (它没出错,这条条目只是不再是垃圾了);再 discard 一次,同一个 collector 照常收掉。
+- `safety.sh`(pool):自己的一个 store,`pool fill` 出一条条目,把 `snap_created_at` 改掉让它
+  过期(快照行不可变,对不上就说明这个 id 现在是另一个快照了),再用"删不掉的 trash 条目"那条
+  用例同一个 `deny delete,delete_child` ACL 锁住条目里的一个子目录。gc 必须留着行、在 stderr
+  说清楚、`gc --status` 数出来;撤掉 ACL,下一次 gc 把树和行一起收掉。
+- `core_test`(清单):一份好清单,三种损坏各跑一遍 `verify` / `fork` / `pool fill`,都必须是
+  `WFS_E_SNAPSHOT_DIRTY`,而且**目标路径下什么都没发布、也不留半成品克隆**;把清单换回原样,
+  fork 出来那一对又是同一个 inode、nlink 2。
+
+另外把第七轮那条"不带预算的 gc 收干净半成品快照"的等待循环改成**同时等行消失**:那次断言在后台
+worker 正好并行收同一棵树时会假红(树先没、行差几毫秒),本轮遇到过一次。
+
 #### PR #1 review 第七轮:谁在写锁下改状态,谁在期限下删树(2026-09-19)
 
 第七轮,Codex 三条(一条 P1、两条 P2)。P1 还是那条同一个主题的下一环:**改状态的一方也得在

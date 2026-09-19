@@ -1258,7 +1258,13 @@ if command -v sqlite3 > /dev/null 2>&1; then
     echo "$out" | grep -q "being collected in the background" && ok PR7 "and that one hands the rest over too" \
                                                                || { bad PR7 "and that one hands the rest over too"; echo "$out" | sed 's/^/        /'; }
     WORLD_GC_CREATING_MIN_AGE=0 d8 fs gc --now > /dev/null 2>&1
-    for _ in $(seq 120); do [ ! -e "$D8TMP" ] && break; sleep 0.25; done
+    # The tree and the row, not the tree alone: a background worker collecting the same tree in
+    # parallel removes the two a few milliseconds apart, and reading the row in between made this
+    # assertion flaky (PR #1 review, 8th round -- seen once while the pool case below was added).
+    for _ in $(seq 120); do
+        [ ! -e "$D8TMP" ] && [ "$(sqlite3 "$D8STORE/metadata.db" "SELECT count(*) FROM snapshots WHERE id=$D8S;")" = 0 ] && break
+        sleep 0.25
+    done
     D8ROWS=$(sqlite3 "$D8STORE/metadata.db" "SELECT count(*) FROM snapshots WHERE id=$D8S;")
     if [ ! -e "$D8TMP" ] && [ "$D8ROWS" = 0 ]; then
         ok PR7 "a gc without the budget finishes the snapshot tree and its row"
