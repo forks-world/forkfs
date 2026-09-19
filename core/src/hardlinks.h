@@ -109,6 +109,16 @@ void hardlinks_manifest_write(FILE *f, const HardlinkSet &set);
 // in the header's external totals and never written as `hl` lines. So `nlink` already IS the
 // declared in-tree member count, the format is unchanged, and every manifest an older build of
 // this library wrote still reads.
+//
+// PR #1 review (14th round, P2): and every component of a member path must be a name --
+// non-empty, and neither `.` nor `..`. Refusing `..` and a leading '/' (11th round) still left
+// a file two ways to be spelled: `./d/a` and `d//a` are the same file as `d/a` to every
+// syscall and three different strings to every check above, so (d/a, ./d/a) passes the
+// uniqueness pass, the cardinality and the 13th round's tree check -- both names lstat to one
+// inode whose nlink really is 2, because they are one name -- and the replay then treats the
+// respelled member as already linked and leaves the real second member an independent file.
+// The writer joins readdir names, which are never `.`, `..` or empty, so nothing this library
+// has written is refused by this.
 int hardlinks_manifest_read(const char *manifest_path, HardlinkSet &out);
 
 // <store>/snapshots/S<n>/root -> <store>/snapshots/S<n>/manifest.

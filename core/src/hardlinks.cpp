@@ -169,12 +169,28 @@ void put_escaped(FILE *f, const char *s) {
 // we wrote, and the replay resolves these names against the clone's root: `../../x` is a name
 // outside the tree that link(2) and rename(2) would then act on, overwriting somebody else's
 // file with the group's canonical inode. Nothing checked this before.
+//
+// PR #1 review (14th round): and every component must be a NAME. Refusing `..` and a leading
+// '/' still left a file two ways to be spelled -- `./d/a` and `d//a` are the same file as `d/a`
+// to every syscall and three different strings to every check the reader makes. That is the
+// 11th round's repeat in a spelling its uniqueness pass cannot see: (d/a, ./d/a) is two
+// members, both unique, of a group whose nlink really is 2, and the 13th round's tree check
+// lstats both of them onto one inode with nlink 2 -- because they ARE one name. The replay then
+// finds the second member already on the canonical inode, counts it linked and stops, and the
+// real `d/b` is left an independent file in a fork that reported success.
+//
+// So: no empty component (`a//b`, a trailing '/', and the leading '/' that was already
+// refused), and no component that is `.` or `..`. The writer cannot produce one -- `rel` is
+// built by joining readdir names, and neither readdir(3) (which skips them explicitly) nor
+// getattrlistbulk(2) (which never returns them) yields `.`, `..` or an empty name -- so no
+// manifest this library has ever written becomes unreadable by this.
 bool manifest_path_sane(const char *p) {
     if (!p || !*p) return false;
-    if (*p == '/') return false;
     for (const char *s = p;;) {
-        if (s[0] == '.' && s[1] == '.' && (s[2] == '/' || s[2] == 0)) return false;
         const char *n = ::strchr(s, '/');
+        size_t len = n ? (size_t)(n - s) : ::strlen(s);
+        if (len == 0) return false;                                    // "", "a//b", "a/", "/a"
+        if (s[0] == '.' && (len == 1 || (len == 2 && s[1] == '.'))) return false;   // "." / ".."
         if (!n) return true;
         s = n + 1;
     }

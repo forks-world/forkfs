@@ -3624,6 +3624,97 @@ int main() {
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 
+    // ---- PR #1 review (14th round, P2): a member path is a chain of real names ---------------
+    //
+    // manifest_path_sane() refused a leading '/' and a `..` component and let everything else
+    // through -- so a member could be spelled a second way. `./d/a` and `d//a` are the same file
+    // as `d/a` to every syscall and three different strings to every check the reader makes,
+    // which is exactly the 11th round's repeat in a spelling the 11th round's uniqueness pass
+    // cannot see: (d/a, ./d/a) is two members, both unique, nlink 2 as the header says, and
+    // hardlinks_verify_groups lstats the two of them onto one inode whose nlink really is 2 --
+    // because they ARE one name. The replay then finds the second member already on the
+    // canonical inode, counts it linked and stops, and the real `d/b` stays an independent file
+    // in a fork that reported success: the group the snapshot advertises is not in the tree.
+    //
+    // Nothing this library writes can be spelled that way. Every member is `rel` from the
+    // walker, built by joining readdir names, and neither readdir(3) (which skips them
+    // explicitly) nor getattrlistbulk(2) (which never returns them) yields `.`, `..` or an
+    // empty name -- so a component is always a name and a member never has an empty one, a `.`
+    // one or a trailing slash. That is the rule now, and no manifest this library ever wrote
+    // becomes unreadable by it.
+    {
+        char pstore[4096], psrc[4096], pman[4096], pbak[4096], pw[4096], pd[4096], q2[4096];
+        static const char *kSpell[3] = {"./d/a", "d//a", "d/a/"};
+        join(pstore, sizeof pstore, root, "hlspell-store");
+        join(psrc, sizeof psrc, root, "hlspell-src");
+        CHECK(mkdir(psrc, 0755) == 0);
+        join(pd, sizeof pd, psrc, "d");
+        CHECK(mkdir(pd, 0755) == 0);
+        join(p, sizeof p, pd, "a");
+        write_file(p, "aaaa\n");
+        join(q2, sizeof q2, pd, "b");
+        CHECK(link(p, q2) == 0);
+
+        wfs_store *ps = NULL;
+        CHECK_OK(wfs_store_open(pstore, &ps));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "hlspell";
+        wfs_id p1 = 0;
+        CHECK_OK(wfs_snapshot_create(ps, psrc, &sopts, &p1));
+        CHECK_OK(wfs_snapshot_info(ps, p1, &sr));
+        CHECK(sr.hl_groups == 1 && sr.hl_external == 0 && sr.hardlinks == 2);
+        snprintf(pman, sizeof pman, "%s/snapshots/S%llu/manifest", pstore, (unsigned long long)p1);
+        join(pbak, sizeof pbak, root, "hlspell.bak");
+        copy_file(pman, pbak);
+
+        wfs_ref pf = {WFS_K_SNAPSHOT, p1};
+        join(pw, sizeof pw, worlds, "hlspell-w");
+        wfs_verify_report pvr;
+        for (int k = 0; k < 3; ++k) {
+            // The second member, `d/b`, respelled as a second `d/a`. Everything else in the
+            // manifest -- the header, the group id, the nlink, the line count -- is untouched.
+            copy_file(pbak, pman);
+            repath_hl_line(pman, 1, kSpell[k]);
+            CHECK_RC(wfs_snapshot_verify(ps, p1, &pvr), WFS_E_SNAPSHOT_DIRTY);
+            CHECK(pvr.modified == 1 && strstr(pvr.first_bad, "manifest"));
+            size_t pbefore = 0;
+            CHECK_OK(wfs_world_list(ps, 1, NULL, 0, &pbefore));
+            memset(&opts, 0, sizeof opts);
+            opts.no_pool = 1;
+            wfs_id pw1 = 0;
+            CHECK_RC(wfs_world_create(ps, pf, pw, &opts, &pw1), WFS_E_SNAPSHOT_DIRTY);
+            CHECK(!exists(pw));                                  // nothing published at --to
+            CHECK(n_with_prefix(worlds, ".wfs-fork-") == 0);     // and no clone left behind
+            size_t pafter = 0;
+            CHECK_OK(wfs_world_list(ps, 1, NULL, 0, &pafter));
+            CHECK(pafter == pbefore);
+            uint64_t pmade = 1;
+            CHECK_RC(wfs_pool_fill(ps, p1, 1, &pmade), WFS_E_SNAPSHOT_DIRTY);
+            CHECK(pmade == 0);
+            uint64_t pready = 1;
+            CHECK_OK(wfs_pool_ready(ps, p1, &pready));
+            CHECK(pready == 0);
+        }
+
+        // And the manifest as the snapshot wrote it forks with the pair rebuilt: the refusal is
+        // about the spelling, not about hardlinked snapshots.
+        copy_file(pbak, pman);
+        CHECK_OK(wfs_snapshot_verify(ps, p1, &pvr));
+        memset(&opts, 0, sizeof opts);
+        opts.no_pool = 1;
+        wfs_id pw1 = 0;
+        CHECK_OK(wfs_world_create(ps, pf, pw, &opts, &pw1));
+        join(p, sizeof p, pw, "d/a");
+        join(q2, sizeof q2, pw, "d/b");
+        CHECK(ino_of(p) == ino_of(q2) && nlink_of(p) == 2);
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "aaaa\n"));
+        CHECK_OK(wfs_world_discard(ps, pw1, 1, 0));
+        wfs_store_close(ps);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", pstore, (unsigned long long)p1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
     // ---- PR #1 review (11th round, P2): a migration that failed is not a migration that ran ----
     //
     // The additive ALTERs used to be fired one by one with their results thrown away, and
