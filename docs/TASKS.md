@@ -171,20 +171,31 @@ S1/S4 的抖动来自 mds 索引新生成的文件。)
 结论没变:页缓存/名字缓存命中的路径与 native 持平,冷 lookup、readdir、create/unlink 仍然被
 每次操作 5–7 次 XPC 往返(每次 ~50–90µs)主导。
 
-### M1 — Read-only Worlds
+### M1 — clonefile World(方案 C,2026-09-19 用户确认切换;设计见 docs/M1_DESIGN.md)
+- [ ] T1.1 core 重构:schema v2、snapshot/world/pool/trash、平台原语(clone_tree/protect/probe/free_space)
+- [ ] T1.2 CLI:init/fork/checkpoint/list/inspect/discard/restore/gc/status/verify/adopt + 防错规则 P1/P2/P4/P7/P11
+- [ ] T1.3 diff:FSEvents + 全扫回退 + 比对(P10)
+- [ ] T1.4 exec:cwd/env/lock/seatbelt(P5/P14)
+- [ ] T1.5 pool:后台预克隆
+- [ ] T1.6 safety 测试套件(P1–P14)
+- [ ] T1.7 基准:fork 延迟、diff、1000 idle World、存储增长
+- [ ] T1.8 文档:arch.md 增补章节、README
+
+### 原 M1/M2/M3(FSKit 路线,已冻结,仅存档)
+#### M1(旧)— Read-only Worlds
 - [ ] T1.1 `WorldFSCore`:World DAG(SQLite WAL,`worlds`/`entries`/`inodes`/`objects` 表)
 - [ ] T1.2 Resolver:overlay → ResolvedNameCache → ancestry;DirViewCache
 - [ ] T1.3 `world fs init` / `fork` / `list` / `inspect` / `mount`
 - [ ] T1.4 1 / 10 / 100 / 1000 Worlds:fork latency、metadata RAM、mount cost、page-cache 共享验证
 
-### M2 — Lazy APFS COW
+#### M2(旧)— Lazy APFS COW
 - [ ] T2.1 writable-open 触发 `clonefile()` → private backing(temp → finalize → metadata publish)
 - [ ] T2.2 WHITEOUT / rename namespace-only / metadata-only override
 - [ ] T2.3 `changed` 集合 + `world fs diff`(O(changes))
 - [ ] T2.4 `world fs discard` + 后台 GC
 - [ ] T2.5 100 GB 文件 × 100 Worlds × 8 KB 随机写:物理写入量、首写延迟
 
-### M3 — Real Agent Workload
+#### M3(旧)— Real Agent Workload
 - [ ] T3.1 PostgreSQL 源码树,100 Worlds,各改 1–5 文件 + 增量编译 + 测试,对比 native ≥ 90%
 - [ ] T3.2 1000 sibling Worlds 读同一源码/依赖,验证无 1000× 物理读 / page-cache 放大
 
@@ -318,3 +329,9 @@ FSKit 传进来的不是 `WorldItem`),与本次改动无关;`error:70` 一条都
   仍然过不了 ≤6 的门槛,而单次往返在 27 上反而涨了 8%。等 Xcode 27 SDK 装好之后可以作为可选实验复核,
   但不作为路线依据。
 - 冻结不等于不维护:上面三个收尾项就是把它修到"正确且安静"的状态,以后只做正确性修复,不做性能改造。
+
+**macOS 27 上的 clonefile / native-root World 成本模型复测(2026-09-19)**:见
+[`docs/CLONE_MODEL_MACOS27.md`](CLONE_MODEL_MACOS27.md) —— C 方案在 27 上 fork 快 23–44%(5 万文件 0.37s)、
+克隆内速度 99–102% native、FSEvents 实测能给 O(changes) 的 diff(800 改动 → 800 条 file-level 路径,0 丢事件),
+唯一退化是 COW 首写惩罚 392µs → 969µs;目录整 `clonefile` 比 Apple 推荐的 `copyfile(3)` 递归克隆快 15×,
+代价只是源树写者 p99 10–11ms、0 失败,主路径继续用它。
