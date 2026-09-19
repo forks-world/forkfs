@@ -1244,6 +1244,79 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第十二轮:问不出来不等于不在(2026-09-20)
+
+第十二轮,Codex 四条:一条 P1、三条 P2。其中三条是**同一个缺陷**:`exists()`——`lstat(2)` /
+`stat(2)` 上的一个 bool——被当成了"这棵树没了"的结论,可 EACCES(父目录权限)、EIO、卷没挂上、
+ENAMETOOLONG 在它眼里统统等于"不在"。于是一次读不到,就换来一行 DEAD、一行被删、或者一棵
+collector 从此再也不认识的树。**一个错误不是一次缺席。** 这一轮按第九轮 P18 那次的做法做了一遍
+**全面审计**,并把判据收进一个地方:`wfs::fs_probe()` 保留 errno,`wfs::fs_gone()` 只认
+ENOENT/ENOTDIR,`proven_gone()` 是"**能证明不在才算不在**"。
+**一条一个提交、一个测试,先验证过"没有修复就会红"。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `PRRT_kwDOUf7jGc6kB15x` | `world.cpp` `wfs_gc_ex()` 的 reconcile 扫描 | 判据是 `stat(2) == 0 && S_ISDIR`,别的一律当成"树没了"。`gc --reconcile` 于是把行标成 **DEAD**——而 DEAD 的 World `verify` 修不了、`adopt` 也认不回来:**一次瞬时错误就把一个活着的 World 永久注销**。父目录被 `chmod 000`、卷没挂上、一次 EIO,都够了。快照那一半同理 | 只有 ENOENT/ENOTDIR 算 dangling。其余一律计进新增的 `wfs_gc_report::{snapshots,worlds}_unreadable`(`wfs_store_stat` 同名字段跟上),**行原样留着**,由 `gc` / `gc --reconcile` / `status` 报出来。路径上放着一个**不是目录**的东西也归这一类:那是一个**损坏**的 World,不是一个不在的 World——埋了它就把"这里本该有什么"这条记录一起扔了,所以同样只报不埋。`wfs_store_status()` 用同一条规则,因为 `status` 那个数正是运维决定要不要跑 `--reconcile` 时看的数 | `4641ca7` |
+| P2 `PRRT_kwDOUf7jGc6kB151` | `world.cpp` `wfs_snapshot_discard()` | "树已经没了"是 discard 可以走的捷径:行直接写 DEAD、不记 trash_path(没有东西要搬、要删)。这个判断也是一个 `exists()`,所以 EACCES / EIO 也走了捷径——而树还在 `S<n>`,**之后没有任何东西会再看它一眼**(reconcile 只扫 ACTIVE 行,后缀清扫只认 `*.wfs-tmp`):一整个快照,悄悄注销、永久留在磁盘上 | 只有 ENOENT/ENOTDIR 走捷径。别的 errno 原样返回给调用者——返回点在事务里面,`Txn` 析构回滚,**行一个字节都没动**——CLI 直接把原因打出来 | `65dbac3` |
+| P2 `PRRT_kwDOUf7jGc6kB153` | `hardlinks.cpp` 清单读者 | 读者把行尾的 `\r` 连同 `\n` 一起剥掉,像是它自己刚写出来的这个文件可能是 CRLF 换行;而 `put_escaped()` 只转义反斜杠和 LF。于是名字末尾带 CR 的文件——对所有它跑的文件系统来说就是一个普通字节——原样写进去、读回来短一个字节:`a<CR>`/`b<CR>` 读成了 `a`/`b`,重放去动的是隔壁那两个真叫 `a`、`b` 的普通文件 | 写者转义 CR(`\\r`),读者只剥自己的终止符,`unescape()` 认回来。两份清单一起改:硬链接清单(`hardlinks.cpp`)和 `verify` 清单(写在 `platform_posix.cpp`、读在 `world.cpp`),它们本来就是同一对写者/读者。**老清单照样读得回来**——反斜杠一直写成两个、在看到它后面那个 `r` 之前就被成对吃掉,所以"反斜杠 + r"这个序列在老清单里不可能出现;而老写者写出来的、名字里带 CR 的清单本来就没有一种正确读法,那里没有兼容可言 | `a40fb45` |
+| P2 `PRRT_kwDOUf7jGc6kB156` | `world.cpp` reconcile 之后删 `S<n>` 残株 | 行先标 DEAD,然后删 `<store>/snapshots/S<n>`,**结果丢掉**。删不掉(ACL、EPERM、一次没那么"瞬时"的 EIO)之后这棵树就永久泄漏:reconcile 只扫 ACTIVE 行、后缀清扫只认 `*.wfs-tmp`,而唯一还记得这个目录的那条行刚被埋了——不计数、不置 `work_remains`、`gc --status` 也看不见 | 第五、七、八轮那条规则的最后一处:**先删、确认没了才埋行**。删不掉就把行留在 ACTIVE(它本来就被报成 dangling,那正是它的状态),树计进 `tmp_failed`、按 `S<n>` 记进共享失败计数器(和 CREATING 那一半用同一个键——同一个目录,而两趟按状态天然不重叠)、在 `kGcFailCap` 以内置 `work_remains`。deadline 中途停下不算失败:置 `work_remains`、不计数、行原样 | `84adc39` |
+
+**`exists()` 审计**(本轮的收尾,和第九轮 P18 那张表同一个性质):凡是 false 会导致"毁东西"或者
+"写下一条没法反悔的行"的调用,全部改判。`world.cpp`:`check_path()` 沿祖先找 `.world` 标记
+(读不到就等于放行,P7 唯一那道"别 fork 进别人的 World"的闸门自己站下了)、`trash_mark_deleting()`
+(它的 `-ENOENT` 在两个调用者那里都是"埋行")、`trashing_reclaim()` 的 `-ESTALE`、
+`wfs_world_restore()` 的 `-ENOENT`、`trashing_recover()`(读不到 trash_path 就把一条 TRASHING
+行"恢复"成 ACTIVE——树在 trash 里、家里空着,一条天生 dangling 的 ACTIVE 行,下一次
+`gc --reconcile` 正好埋掉它)、`wfs_world_verify()` 的 `WFS_E_WORLD_MISSING`(运维就是看着这句话
+去跑 `--reconcile` 的)、后缀清扫的"它删掉了"、`gc_tmp_is_removable()` 的标记检查,以及
+collector 埋 CREATING fork 树 / 半成品快照的那两处、`gc --status` 的三个计数。`pool.cpp`:
+`pool_claim()`(读不到的条目现在让 fork 失败并回滚那条 DELETE,而不是把行删掉、克隆留在磁盘上)、
+孤儿清扫的"删掉了"、过期行的删除、`pool_stranded()`。(`9bcf7ce`)
+
+`gc_tmp_is_removable()` 那处要多说一句:光回 false 只做对了一半——调用者收到 false 就把行标 DEAD
+并清空 `tmp_path`,而那正是第五轮修好的"永久搁浅"。所以"**我判断不了**"现在是它自己的一个答案
+(`*undecided`):行留在 CREATING、树计进 `tmp_failed`、下一次唤醒再问。
+
+**不改的**:纯粹"它在不在,我好建"的检查——fork 抽临时名、快照的 `tmpdir`、`PATH_TARGET`、
+`restore` 的 `-EEXIST`、recovery 往家里搬之前看家里有没有东西。这些判断错了,代价是紧接着那个
+系统调用回 EEXIST,不是一个 World。
+
+**验收**:`safety.sh` **243 passed, 0 failed**(240 → 243,第四条新增 3 例);
+`ctest`(WFS_FSKIT=OFF)**2/2**;`check-deps.sh` 全绿。
+
+先把测试跑红过:
+
+- **reconcile(P1)**:一个父目录被 `chmod 000` 的 World(`stat` 回 EACCES)、一个树被换成普通
+  文件的 World。老代码:`unreadable=0 dangling=2 reconciled=2`,两条行**都是 state 3(DEAD)**。
+  新代码:`unreadable=2 dangling=0 reconciled=0`,两条行都还 ACTIVE;权限还回去之后第一条恢复
+  常态,而树真的没了的那条照样被 reconcile 成 DEAD(这是对那条规则的收窄,不是撤退)。
+- **discard(P2)**:`<store>/snapshots` `chmod 000`。老代码 `wfs_snapshot_discard()` 回 **0**、
+  行进 state 3,而 `S<n>` 还在磁盘上;新代码回 `-EACCES`、行还是 ACTIVE、树还在,权限还回去之后
+  discard 正常完成。
+- **CR(P2)**:一棵树里一对硬链接 `a<CR>`/`b<CR>`,外加两个 size 和 mtime 都一样的普通文件
+  `a`、`b`。老代码:`verify` 对一个完好的快照回 **-1008、modified=2**;fork 报 `hardlinks=1`
+  且返回成功,而 CR 那一对出来是**两个独立 inode**(nlink 1),`a`/`b` 反倒被焊在一个 inode 上、
+  `b` 的内容没了。新代码:CR 那一对链上了,`a`/`b` 还是两个文件各自的内容,`verify` 干净——
+  走 pool filler 的重放(它**根本没有 verify root**)也一样。
+- **残株(P2)**:一个记录路径被删掉、`S<n>` 里留着一棵被 ACL 锁住的子树的快照。老代码:行
+  state 3、残株留在磁盘上、gc 一个字都不说,ACL 去掉之后也没人回来找它。新代码:行留在 ACTIVE、
+  gc 打出 "could not be removed",ACL 去掉之后下一次 `gc --reconcile` 删掉残株并埋掉行。
+- **审计**:用户目录里一棵被遗弃的 fork 树,`.world` 标记 `lstat` 不到(树 `chmod 000`)。老代码
+  把这棵树**删了**——连那道"这是不是我们的"检查都没做成。
+
+新增测试:
+
+- `core_test`(reconcile):上面那两个 World + 快照那一半(`<store>/snapshots` `chmod 000`),
+  报表和 `wfs_store_status()` 都要数进 `*_unreadable`、行都要还 ACTIVE;权限还回去、树真删掉之后
+  照样 reconcile 成 DEAD。
+- `core_test`(discard):`-EACCES`、行 ACTIVE、`S<n>` 还在;权限还回去之后 discard 正常。
+- `core_test`(CR):快照的 `hl_groups`/`hardlinks`、`verify` 干净、直接 fork 与 pool fork 两条
+  路径上 CR 那一对的 inode/nlink 和 `a`/`b` 的独立性与内容。
+- `core_test`(审计):标记读不到的遗弃 fork 树不许被删、要计进 `tmp_failed`、行留在 CREATING
+  且 `tmp_path` 原样;权限还回去之后下一次 gc 删树埋行。
+- `safety.sh`(残株):行不许变 DEAD、残株还在、stderr 说得出原因;`chmod -N` 之后下一次
+  `gc --reconcile` 收尾。
+
 #### PR #1 review 第十一轮:写下来的事情要真的做到了才算数(2026-09-20)
 
 第十一轮,Codex 三条,全是 P2,而且是同一句话的三个位置:**一件事做没做成,要以它真的做成了
