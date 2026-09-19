@@ -54,11 +54,8 @@ bool exists(const char *p) {
     return ::lstat(p, &st) == 0;
 }
 
-int64_t now_us() {
-    struct timespec ts;
-    ::clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000000 + (int64_t)ts.tv_nsec / 1000;
-}
+// The deleter checks the gc worker's deadline against the same clock (internal.h).
+int64_t now_us() { return wfs::fs_mono_us(); }
 
 bool is_dir(const char *p) {
     struct stat st;
@@ -497,9 +494,13 @@ int trash_mark_deleting(const char *path, String &out) {
     return 0;
 }
 
-// Step 2.
-int trash_unlink(const char *deleting_path, int threads, uint64_t *entries) {
-    return wfs::fs_remove_tree_parallel(deleting_path, threads > 0 ? threads : 4, entries);
+// Step 2. `deadline_us` and `partial` are the gc worker's batch limit reaching all the way into
+// the unlink walk (internal.h): a wake that runs out of time in the middle of a tree stops
+// there, and the tree keeps its `.deleting` name for the next one.
+int trash_unlink(const char *deleting_path, int threads, uint64_t *entries,
+                 int64_t deadline_us = 0, int *partial = nullptr) {
+    return wfs::fs_remove_tree_parallel(deleting_path, threads > 0 ? threads : 4, entries,
+                                        deadline_us, partial);
 }
 
 } // namespace
@@ -1859,14 +1860,19 @@ void set_trash_path(wfs_store *s, const TrashJob &j, const char *p) {
     t.commit();
 }
 
-// One entry, the crash-safe way: rename first, record the new name, then unlink.
-int gc_delete_one(wfs_store *s, const TrashJob &j, int threads, uint64_t *entries_freed) {
+// One entry, the crash-safe way: rename first, record the new name, then unlink. `*partial`
+// comes back 1 when the deadline stopped the unlink half-way: the row stays TRASHED and the
+// tree stays `.deleting`, which is exactly the state the next wake resumes from.
+int gc_delete_one(wfs_store *s, const TrashJob &j, int threads, uint64_t *entries_freed,
+                  int64_t deadline_us, int *partial) {
     String deleting;
     int rc = trash_mark_deleting(j.path.c_str(), deleting);
     if (rc == -ENOENT) { mark_dead(s, j); return 0; }   // someone else got there first
     if (rc) return rc;
     if (::strcmp(deleting.c_str(), j.path.c_str())) set_trash_path(s, j, deleting.c_str());
-    if ((rc = trash_unlink(deleting.c_str(), threads, entries_freed))) return rc;
+    if ((rc = trash_unlink(deleting.c_str(), threads, entries_freed, deadline_us, partial)))
+        return rc;
+    if (partial && *partial) return 0;
     mark_dead(s, j);
     return 0;
 }
@@ -2110,8 +2116,16 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                 goto finished;
             }
             uint64_t freed = 0;
-            if (gc_delete_one(s, jobs[i], threads, &freed) != 0) continue;
+            int partial = 0;
+            if (gc_delete_one(s, jobs[i], threads, &freed, deadline_us, &partial) != 0) continue;
             rep.entries_freed += freed;
+            if (partial) {
+                // The deadline landed in the middle of this tree. Stop here rather than finish
+                // it: the tree is `.deleting`, the successor carries on from where this wake
+                // stopped, and the foreground gets its disk back on time (P16).
+                rep.work_remains = 1;
+                goto finished;
+            }
             if (jobs[i].row == 0) rep.trash_orphans++;
             else if (jobs[i].is_snapshot) rep.snapshots_deleted++;
             else rep.worlds_deleted++;

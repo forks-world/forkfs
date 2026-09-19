@@ -644,6 +644,38 @@ rv fs discard S2 > /dev/null 2>&1
                                                    || bad PR1 "without --now the snapshot only moves to the trash"
 rv fs gc --now --retention 0 > /dev/null 2>&1
 
+# ---- PR #1 review (P2): the batch limit bites inside one tree, not only between trees ----------
+# One trash entry of 120k entries -- more than a second of unlinking on this machine -- and a
+# one-second batch. The wake has to come back on time with the tree half deleted, hand over to a
+# successor, and the chain has to finish the job on its own.
+BIG="$RSTORE/trash/big-1"
+mkdir -p "$BIG"
+python3 - "$BIG" <<'EOF'
+import os, sys
+base = sys.argv[1]
+for d in range(400):
+    p = os.path.join(base, 'd%03d' % d)
+    os.makedirs(p, exist_ok=True)
+    for i in range(300):
+        os.close(os.open(os.path.join(p, 'f%03d' % i), os.O_CREAT | os.O_WRONLY, 0o644))
+EOF
+t0=$(python3 -c 'import time;print(int(time.time()*1000))')
+WORLD_GC_PAUSE_MS=0 WORLD_GC_BATCH_SECS=1 rv fs gc --worker --retention 0 > "$SCRATCH/gcbig.log" 2>&1
+t1=$(python3 -c 'import time;print(int(time.time()*1000))')
+if [ "$((t1 - t0))" -lt 4000 ]; then ok PR1 "a one-second gc wake returns on time mid-tree ($((t1-t0)) ms)"
+else bad PR1 "a one-second gc wake returns on time mid-tree ($((t1-t0)) ms)"; sed 's/^/        /' "$SCRATCH/gcbig.log"; fi
+grep -q "work remains, handing over" "$SCRATCH/gcbig.log" && ok PR1 "it reports the work it did not get to" \
+                                                          || { bad PR1 "it reports the work it did not get to"; sed 's/^/        /' "$SCRATCH/gcbig.log"; }
+LEFT=$(find "$RSTORE/trash" 2>/dev/null | wc -l | tr -d ' ')
+if [ -d "$BIG.deleting" ] && [ "$LEFT" -gt 1 ] && [ "$LEFT" -lt 120401 ]; then
+    ok PR1 "the half-deleted tree keeps its .deleting name ($LEFT entries left)"
+else
+    bad PR1 "the half-deleted tree keeps its .deleting name ($LEFT entries left)"
+fi
+for _ in $(seq 120); do [ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && break; sleep 0.25; done
+[ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && ok PR1 "the successor chain finishes the tree" \
+                                            || { bad PR1 "the successor chain finishes the tree"; ls "$RSTORE/trash" | sed 's/^/        /'; }
+
 echo
 "$WORLD" fs status | sed 's/^/      /'
 echo

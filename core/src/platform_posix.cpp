@@ -655,6 +655,12 @@ int fs_remove_tree(const char *root) {
     return rm_rec(root);
 }
 
+int64_t fs_mono_us(void) {
+    struct timespec ts;
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + (int64_t)ts.tv_nsec / 1000;
+}
+
 // ---- T2.1: the parallel deleter --------------------------------------------------------------
 //
 // The same 4-thread walker that clones and scans, used to unlink. Files go in the parallel
@@ -670,12 +676,18 @@ namespace {
 struct RmCtx {
     uint64_t entries = 0;
     int err = 0;
+    int64_t deadline = 0;   // fs_mono_us() stamp; 0 = no limit
 };
 
 // One unlink. UF_IMMUTABLE (a --hard snapshot that was not unprotected first) and a directory
 // whose write bit was stripped both surface as EPERM/EACCES; clear them and try once more.
 int rm_entry(void *ctx, const char *path, const char *rel, const struct stat &st, bool is_dir) {
     RmCtx *c = (RmCtx *)ctx;
+    // The batch limit, enforced where the work actually is. One clock read against an unlink
+    // that measures ~50 us is not worth optimising, and -ECANCELED aborts the walk before the
+    // deepest-first directory tail runs, so what is left behind is a tree with whole
+    // subdirectories still in it rather than a scattering of empty ones.
+    if (c->deadline && fs_mono_us() >= c->deadline) return -ECANCELED;
     if (!*rel && !is_dir) { // the walker was handed a non-directory
         if (::unlink(path) != 0 && errno != ENOENT) return -errno;
         bump(c->entries);
@@ -728,7 +740,9 @@ int rm_entry(void *ctx, const char *path, const char *rel, const struct stat &st
 
 } // namespace
 
-int fs_remove_tree_parallel(const char *root, int threads, uint64_t *entries) {
+int fs_remove_tree_parallel(const char *root, int threads, uint64_t *entries, int64_t deadline_us,
+                            int *partial) {
+    if (partial) *partial = 0;
     struct stat st;
     if (::lstat(root, &st) != 0) return errno == ENOENT ? 0 : -errno;
     if (!S_ISDIR(st.st_mode)) {
@@ -740,9 +754,15 @@ int fs_remove_tree_parallel(const char *root, int threads, uint64_t *entries) {
     // the gate for good is exactly right (docs/M1_DESIGN.md §3 P4).
     if (::access(root, R_OK | X_OK | W_OK) != 0) ::chmod(root, 0700);
     RmCtx c;
+    c.deadline = deadline_us;
     int rc = fs_walk_tree(root, threads, FS_DIRS_POST, &c, rm_entry);
     if (entries) *entries += c.entries;
     if (rc == 0) return 0;
+    // Out of time, not out of luck: the tree is half gone and the caller is told to come back.
+    if (rc == -ECANCELED) {
+        if (partial) *partial = 1;
+        return 0;
+    }
     // Anything at all went wrong: finish the job the slow, certain way.
     return fs_remove_tree(root);
 }

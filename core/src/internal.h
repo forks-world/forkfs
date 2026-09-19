@@ -141,12 +141,23 @@ int fs_count_entries(const char *root, TreeStats &out);
 // counts, and changes nothing at all. The protection itself is one chmod on the root.
 int fs_scan_tree(const char *root, TreeStats *stats, Manifest *manifest);
 int fs_free_space(const char *path, uint64_t *avail, uint64_t *total);
+// One monotonic clock for everything that has a deadline: the gc worker sets its batch limit in
+// world.cpp and the deleter enforces it in platform_posix.cpp, so the two have to agree on what
+// "now" is. Microseconds, CLOCK_MONOTONIC.
+int64_t fs_mono_us(void);
 int fs_remove_tree(const char *root);   // unprotects first on Darwin
 // T2.1: the same 4-thread walker, used to unlink. Files are removed in the parallel phase,
 // directories in the serial deepest-first tail. `entries` is incremented by what was actually
 // removed (the root itself is not counted). Any error at all falls back to fs_remove_tree, so a
 // non-zero return means even that could not finish the job.
-int fs_remove_tree_parallel(const char *root, int threads, uint64_t *entries);
+//
+// PR #1 review: `deadline_us` is an fs_mono_us() stamp (0 = no limit) and it is checked per
+// entry, not per tree -- one big world is millions of unlinks, and the gc worker's whole batch
+// limit is worth nothing if it can only be enforced between trees. When the deadline passes
+// mid-tree the walk stops where it is, *partial becomes 1 and the return is 0: the caller is
+// deleting a `.deleting` tree, which is resumable by construction, so stopping is not an error.
+int fs_remove_tree_parallel(const char *root, int threads, uint64_t *entries,
+                            int64_t deadline_us = 0, int *partial = nullptr);
 
 // ---- Darwin-only primitives (stubs elsewhere) --------------------------------------------
 
