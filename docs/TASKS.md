@@ -1244,6 +1244,73 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第二十四轮:能删什么,也是 schema 的一部分(2026-09-20)
+
+第二十四轮,Codex 一条 P1,打在一句我们自己写下来、而且写了两次的话上:**增量列不动 `VERSION`**
+(第十一轮),以及**`state` 是普通 INTEGER 列,不需要迁移、不动版本号**(第二十一轮给 pool 的
+`DRAINING=2` 下的判词)。两句就**读**而言都对:M1 的 core 碰到一个多出来的列、碰到一个它不认识的
+`state`,顶多是不用它。可 store 里还有另一半——`wfs_gc()`,它**删**。M1 的 collector 只认 M1 那张
+地图,`trash/` 和 `snapshots/` 底下凡是它认不出来的都是孤儿。而 `VERSION` 一直是 2,所以 `main` 上
+的二进制照样打得开我们的 store:`world fs gc` 一跑,保留期里的快照没了,TRASHING 的世界树没了,行
+还在,指着一堆不存在的路径。**版本号不是记“库里有哪些列”的,是记“这个 store 该交给谁”的。**
+
+**schema 3 是什么意思**(一次抬版本,管住下面所有这些——它们合起来就是 M1 的 collector 看不懂的
+那部分 store):
+
+- snapshot 也走 trash(T2.2):`trash/S<n>-<ts>/`、`snapshots.trash_path` / `trashed_at`;
+- `WFS_ST_TRASHING = 4`(第五轮):行已提交、树在两个名字之一,任何收 trash 的人都不许把它当无主目录;
+- `.deleting` 后缀(T2.1):collector 开删之前先改的名,`restore` 一律拒;
+- pool 的 `POOL_DRAINING = 2`(第二十一轮):一棵正在出门的树,`claim` 发不出去、gc 无条件判死;
+- `owner_pid` / `owner_start`(第三轮起):谁在建这行,好让 gc 分得清“崩了的生产者”和“还在克隆”;
+- 硬链接清单 `hl_groups` / `hl_external`(T2.5):快照的一部分,少一个文件就是一次错误的 fork。
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `PRRT_kwDOUf7jGc6kEwaq` | `core/include/worldfs/worldfs.h` 的 `WFS_STORE_SCHEMA`、`store.cpp` `check_version()` / `wfs_store_open()`、`world.cpp` `marker_read()` | M2 改的全是“增量”的东西,于是 `VERSION` 从头到尾是 2——`main` 上的 M1 二进制打开一个 M2 store,一路绿灯。它的 `wfs_gc()` 是按 M1 那张地图画的:保 `state=2` 的 world trash 路径,`trash/` 和 `snapshots/` 底下别的一律当孤儿递归删。于是 `world fs gc` 一跑,保留期里的快照(T2.2)、行还在 TRASHING 的世界树(第五轮)、`.deleting`(T2.1)、DRAINING 的 pool 树(第二十一轮)全没了,而 M2 的行还在,指着一堆不存在的路径。**增量列是“老 core 读不到它”,新 state 值是“老 core 认不出它”,两句都只管住了读;删是另一回事** | **schema 抬到 3**,并且把这条写进 P13:凡是改变了 collector 可以删什么、或者改变了某个 `state` 的取值,就抬大版本,因为老二进制的 collector 必须**拒绝**这个 store 而不是在上面跑。落地三处:(1) `check_version()` 现在是不对称的——`3` 放行,`2` 放行但记下 `*legacy`(schema 2 的 store 就是“这个 core 还没碰过”的 store,里面没有任何上面那些东西),别的按 P13 拒;列还是第十一轮那趟表驱动事务迁移加,`VERSION` **在迁移提交之后**才由 `version_upgrade()` 重写成 3,走临时文件 + `rename`(写了一半的 `VERSION` 是一个谁都打不开的 store,而它存在的意义正是让比写它的人老的二进制读得懂),迁移失败就不重写——那还是个 M1 处理得了的 store。(2) `PRAGMA user_version` 的百位也当 schema 用,比我们新就按 P13 拒,而且**这一问挪到了对数据库写任何东西之前**(连 `journal_mode` 都还没设),于是未来 schema 的 store 原封不动地回来,而不是被我们的迁移盖成 3xx——那一下是没法撤销的。(3) `.world` 标记里那个 `schema` 字段:它的语法 2 和 3 之间没变,原地升级的 store 里的世界还带着旧标记,所以读 `2` 放行、比 3 新照拒 | `6fdcd96` |
+
+**M1 那边靠的是哪一行**(`git show main:core/src/store.cpp`,`check_version()`,那里的
+`WFS_STORE_SCHEMA` 是 2):
+
+```c
+        long v = ::strtol(buf, nullptr, 10);
+        return v == WFS_STORE_SCHEMA ? 0 : WFS_E_SCHEMA;
+```
+
+它在**打开数据库之前**读这个文件,而且是全等比较——所以 `VERSION` 里的那个 `3` 就是拦住它的全部,
+`user_version` 那一道它根本走不到(走到了也没用:它比的是 `user_version != WFS_STORE_SCHEMA`,不是
+百位)。同一个二进制的 `marker_read()` 也是全等比较,所以 M2 写的标记它一样拒。
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **266 passed, 0 failed**(P13 那条用的是
+`VERSION=99`,照旧被拒;`store status` 现在印 `schema: 3`);`check-deps.sh` 全绿。
+(`m1_criteria.sh` 本轮跳过。)
+
+先把它跑红——这一条的红比别的都直接,因为它是**现在这个二进制留在磁盘上的数字**:
+
+- 用 `fcc19aa` 的 `world` 建一个 store,`world fs --store … gc --status` 跑完之后 `cat VERSION` 是
+  **`2`**、`PRAGMA user_version` 是 **`204`**。把这两个数字放进 `main` 那行全等比较里,答案就是
+  **0,放行**——一个满是 TRASHING、`.deleting`、DRAINING 的 store,M1 的 collector 可以直接在上面跑。
+  打了补丁的二进制再开同一个目录:`VERSION` 变成 **`3`**、`user_version` 变成 **`304`**、旁边没有
+  留下 `VERSION.tmp`。
+- 只把常量抬到 3、`store.cpp` 不动:`core_test` 在第十一轮那块的第一次 `wfs_store_open` 上就红了
+  (`-1006 store schema mismatch`)——M1 的 store 被**拒绝**而不是被接管,升级路径是真的要写的。
+- 再让 `check_version()` 放 `2` 过去、但别的都不改:`user_version` 确实变成了 `304`,而 `VERSION`
+  文件**还是 `2`**(测试打出来的就是这一行:`RED: VERSION file says 2`)——也就是说库升级了,而 M1
+  唯一会看的那个文件没有升级,洞还在原处。同一次跑里第二条红:一个盖着 `400` 的库被**打开成功**
+  (`rc 0`),而且顺手盖回了 `304`。
+
+新增测试:`core_test` 末尾一块(schema3-store),三件事——
+
+- (a) 一个 M1 store(`VERSION` 写 `2`、库按 schema 2 最初的样子造、13 个后加列一个都没有):打开之后
+  13 个列全在、`user_version / 100 == 3`、`VERSION` 文件读出来是 `3`、`VERSION.tmp` 不在;再开一次
+  什么都不变(`wfs_store_status` 报 `schema == 3`)。这一条就是从另一头写下来的那个不变量:M1 自己
+  那行全等比较,现在对这个 store 的答案是 `WFS_E_SCHEMA`。
+- (b) `VERSION` 是 `3`、库盖着 `400`:`wfs_store_open` 回 `WFS_E_SCHEMA`,`user_version` **还是 400**、
+  13 个列**一个都没加**——原封不动地回来。
+- (c) 同一个 store 把 `VERSION` 改成 `4`:在数据库被打开之前就按 P13 拒,`user_version` 依旧 400。
+
+`make_v2_db()` 和那张 13 列的表从第十一轮那块里提到了文件作用域:schema 2 的库就是 M1 的 store,
+两轮问的是同一个东西——抬版本**不许**让它丢列。
+
 #### PR #1 review 第二十三轮:读不出来的那一半,不是空的那一半(2026-09-20)
 
 第二十三轮,Codex 三条 P2,三条是同一句话——第十二轮那句"**问不出来不等于不在**"——在两个还没被它
