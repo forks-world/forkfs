@@ -2550,9 +2550,17 @@ extern "C" int wfs_snapshot_verify(wfs_store *s, wfs_id id, wfs_verify_report *o
         long long sec = 0;
         long nsec = 0;
         int consumed = 0;
-        if (::sscanf(p, " %o %llu %lld.%ld %llu %n", &mode, &size, &sec, &nsec, &nlink, &consumed) != 5)
+        // PR #1 review (19th round): the head ends at the nlink, and the byte after it is the
+        // one separator Manifest::line wrote (`"%c %o %llu %lld.%ld %llu "`, one space, then the
+        // name verbatim). A trailing whitespace directive here ate that space AND every space or
+        // tab the name itself begins with, so ` a` was checked as `a`: a file this snapshot does
+        // not have, or -- worse -- a neighbour of the same name whose size and mtime decide the
+        // verdict. The root's line is the one with nothing after the separator, and it still
+        // reads as the empty rel it always did. hardlinks.cpp's reader had the same directive.
+        if (::sscanf(p, " %o %llu %lld.%ld %llu%n", &mode, &size, &sec, &nsec, &nlink, &consumed) != 5
+            || !consumed || p[consumed] != ' ')
             continue;
-        char *rel = p + consumed;
+        char *rel = p + consumed + 1;
         unescape(rel);
         out->checked++;
         String full = *rel ? joinp(r.path, rel) : String(r.path);

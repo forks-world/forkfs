@@ -125,8 +125,12 @@ static void retag_hl_line(const char *manifest, size_t which, unsigned long long
             if (seen++ == which) {
                 unsigned long long g = 0, nl = 0;
                 int used = 0;
-                CHECK(sscanf(lines[k] + 2, " %llu %llu %n", &g, &nl, &used) == 2 && used);
-                fprintf(o, "hl %llu %llu %s", gid, nl, lines[k] + 2 + used);
+                // PR #1 review (19th round): `%llu%n` and one explicit separator, the same way
+                // the reader now parses these lines -- a trailing whitespace directive would
+                // move a name that begins with a space, not just re-tag it.
+                CHECK(sscanf(lines[k] + 2, " %llu %llu%n", &g, &nl, &used) == 2 && used);
+                CHECK(lines[k][2 + used] == ' ');
+                fprintf(o, "hl %llu %llu%s", gid, nl, lines[k] + 2 + used);
                 done = 1;
                 continue;
             }
@@ -157,7 +161,7 @@ static void repath_hl_line(const char *manifest, size_t which, const char *path)
         if (!strncmp(lines[k], "hl ", 3) && seen++ == which) {
             unsigned long long g = 0, nl = 0;
             int used = 0;
-            CHECK(sscanf(lines[k] + 2, " %llu %llu %n", &g, &nl, &used) == 2 && used);
+            CHECK(sscanf(lines[k] + 2, " %llu %llu%n", &g, &nl, &used) == 2 && used);
             fprintf(o, "hl %llu %llu %s\n", g, nl, path);
             done = 1;
             continue;
@@ -183,8 +187,9 @@ static void hl_line_path(const char *manifest, size_t which, char *out, size_t c
         if (strncmp(line, "hl ", 3) || seen++ != which) continue;
         unsigned long long g = 0, nl = 0;
         int used = 0;
-        CHECK(sscanf(line + 2, " %llu %llu %n", &g, &nl, &used) == 2 && used);
-        snprintf(out, cap, "%s", line + 2 + used);
+        CHECK(sscanf(line + 2, " %llu %llu%n", &g, &nl, &used) == 2 && used);
+        CHECK(line[2 + used] == ' ');
+        snprintf(out, cap, "%s", line + 2 + used + 1);
         size_t n = strlen(out);
         while (n && (out[n - 1] == '\n' || out[n - 1] == '\r')) out[--n] = 0;
         break;
@@ -3314,6 +3319,108 @@ int main() {
         CHECK(ino_of(cra) != ino_of(crb));
         CHECK(nlink_of(cra) == 1 && nlink_of(crb) == 1);
         CHECK_OK(read_file(crb, buf, sizeof buf));
+        CHECK(!strcmp(buf, "plain b\n"));     // and not one inode's worth of "plain a"
+    }
+
+    // ---- PR #1 review (19th round, P2): a file name that BEGINS with a space ----------------
+    //
+    // Both manifest readers ended their number list with a whitespace directive -- `%llu %n` --
+    // and a whitespace directive in scanf(3) eats *all* the whitespace it can reach, not the one
+    // separator the writer put there. Both writers emit exactly one space and then the name
+    // verbatim (`fprintf(f, "hl %llu %llu ", ...)` + put_escaped in hardlinks.cpp, and the
+    // `%c %o %llu %lld.%ld %llu ` head + the same escaping in Manifest::line), so a name whose
+    // first byte is a space or a tab came back with that byte -- and every further one -- gone:
+    // ` a` and ` b` were read as `a` and `b`, which are either somebody else's files or nobody's.
+    // What that cost is the whole snapshot: `verify` right after `init` reported five findings
+    // (four entry lines lstat'ing the wrong file, plus the hardlink section, whose group check
+    // lstats the two names it was handed and finds two different inodes), and every fork and
+    // every pool fill of it then refused with WFS_E_SNAPSHOT_DIRTY -- for ever, because the
+    // manifest is on disk and the tree it describes is intact. A leading space is an ordinary
+    // byte in a file name, so this is a tree a user can simply have.
+    // The fix is on the readers alone: the separator is exactly one ' ', and everything after it
+    // is the name. Every manifest this library has ever written is still read the same way.
+    {
+        char spsrc[4096], spw[4096], spa[4096], spb[4096];
+        join(spsrc, sizeof spsrc, root, "sp-src");
+        CHECK(mkdir(spsrc, 0755) == 0);
+        join(spa, sizeof spa, spsrc, " a");
+        write_file(spa, "linked\n");
+        join(spb, sizeof spb, spsrc, " b");
+        CHECK(link(spa, spb) == 0);
+        // The tab pair, which the same directive eats just as happily.
+        join(spa, sizeof spa, spsrc, "\ta");
+        write_file(spa, "tabbed\n");
+        join(spb, sizeof spb, spsrc, "\tb");
+        CHECK(link(spa, spb) == 0);
+        // ... and the two ordinary files the old reader turned those four names into.
+        join(spa, sizeof spa, spsrc, "a");
+        write_file(spa, "plain a\n");
+        join(spb, sizeof spb, spsrc, "b");
+        write_file(spb, "plain b\n");
+        // Same size and same mtime as each other: that is all the replay's "is this still the
+        // file the scan saw" guard has to go on, so with the names misread the decoys were
+        // interchangeable to it.
+        struct timespec spts[2];
+        spts[0].tv_sec = 1000000000; spts[0].tv_nsec = 0;
+        spts[1] = spts[0];
+        CHECK(utimensat(AT_FDCWD, spa, spts, 0) == 0);
+        CHECK(utimensat(AT_FDCWD, spb, spts, 0) == 0);
+
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "sp";
+        wfs_id ssp = 0;
+        CHECK_OK(wfs_snapshot_create(s, spsrc, &sopts, &ssp));
+        wfs_snapshot_rec spr;
+        CHECK_OK(wfs_snapshot_info(s, ssp, &spr));
+        CHECK(spr.hl_groups == 2 && spr.hl_external == 0 && spr.hardlinks == 4);
+        wfs_verify_report spv;
+        CHECK_OK(wfs_snapshot_verify(s, ssp, &spv));   // the snapshot is clean the moment it is made
+        CHECK(spv.missing == 0 && spv.modified == 0 && spv.extra == 0 && spv.unprotected == 0);
+
+        join(spw, sizeof spw, worlds, "sp-world");
+        wfs_ref spf = {WFS_K_SNAPSHOT, ssp};
+        memset(&opts, 0, sizeof opts);
+        opts.name = "sp-w";
+        opts.no_pool = 1;
+        wfs_fork_result spfr;
+        memset(&spfr, 0, sizeof spfr);
+        CHECK_OK(wfs_world_create_ex(s, spf, spw, &opts, &spfr));
+        CHECK(spfr.hardlinks == 2);            // one name relinked per group
+        join(spa, sizeof spa, spw, " a");
+        join(spb, sizeof spb, spw, " b");
+        CHECK(ino_of(spa) == ino_of(spb) && nlink_of(spa) == 2);
+        join(spa, sizeof spa, spw, "\ta");
+        join(spb, sizeof spb, spw, "\tb");
+        CHECK(ino_of(spa) == ino_of(spb) && nlink_of(spa) == 2);
+        join(spa, sizeof spa, spw, "a");
+        join(spb, sizeof spb, spw, "b");
+        CHECK(ino_of(spa) != ino_of(spb));     // and the decoys are still two separate files
+        CHECK(nlink_of(spa) == 1 && nlink_of(spb) == 1);
+        CHECK_OK(read_file(spa, buf, sizeof buf));
+        CHECK(!strcmp(buf, "plain a\n"));
+        CHECK_OK(read_file(spb, buf, sizeof buf));
+        CHECK(!strcmp(buf, "plain b\n"));
+
+        // And through the pool, whose filler replays the manifest onto its own clone with no
+        // verify root at all (pool.cpp): there the misread names are acted on unconditionally.
+        uint64_t spmade = 0;
+        CHECK_OK(wfs_pool_fill(s, ssp, 1, &spmade));
+        CHECK(spmade == 1);
+        char spwp[4096];
+        join(spwp, sizeof spwp, worlds, "sp-world-pool");
+        memset(&opts, 0, sizeof opts);
+        opts.name = "sp-w-pool";
+        memset(&spfr, 0, sizeof spfr);
+        CHECK_OK(wfs_world_create_ex(s, spf, spwp, &opts, &spfr));
+        CHECK(spfr.from_pool == 1);
+        join(spa, sizeof spa, spwp, " a");
+        join(spb, sizeof spb, spwp, " b");
+        CHECK(ino_of(spa) == ino_of(spb) && nlink_of(spa) == 2);
+        join(spa, sizeof spa, spwp, "a");
+        join(spb, sizeof spb, spwp, "b");
+        CHECK(ino_of(spa) != ino_of(spb));
+        CHECK(nlink_of(spa) == 1 && nlink_of(spb) == 1);
+        CHECK_OK(read_file(spb, buf, sizeof buf));
         CHECK(!strcmp(buf, "plain b\n"));     // and not one inode's worth of "plain a"
     }
 

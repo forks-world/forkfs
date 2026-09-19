@@ -343,8 +343,22 @@ int hardlinks_manifest_read(const char *manifest_path, HardlinkSet &out) {
         if (n && line[n - 1] == '\n') line[--n] = 0;
         unsigned long long gid = 0, nlink = 0;
         int consumed = 0;
-        if (::sscanf(line + 2, " %llu %llu %n", &gid, &nlink, &consumed) != 2 || !consumed) continue;
-        char *rel = line + 2 + consumed;
+        // PR #1 review (19th round): `%llu %n`, not `%llu %n` with a space. A whitespace
+        // directive in scanf(3) consumes every space, tab, CR and LF it can reach, and the byte
+        // after the nlink is the ONE separator the writer put there -- `fprintf(f, "hl %llu
+        // %llu ", ...)` above, one space, and then the name verbatim through put_escaped. So a
+        // member whose name begins with a space or a tab (an ordinary file name, and one a
+        // download or an editor produces) had that byte -- and every further one -- swallowed
+        // by the separator: ` a` came back as `a`, somebody else's file or nobody's. The group
+        // check then lstats the misread names, finds other inodes (or none), and the snapshot
+        // is WFS_E_SNAPSHOT_DIRTY from the moment it is published: no fork of it, and no pool
+        // fill of it, ever again. Read the separator as what it is -- exactly one ' ' -- and
+        // take the rest of the line as the name. Nothing about the format changes, so every
+        // manifest already on disk reads exactly as it did.
+        if (::sscanf(line + 2, " %llu %llu%n", &gid, &nlink, &consumed) != 2 || !consumed) continue;
+        char *sep = line + 2 + consumed;
+        if (*sep != ' ') continue;
+        char *rel = sep + 1;
         if (!*rel) continue;
         unescape(rel);
         if (!manifest_path_sane(rel)) { bad_path = true; break; }
