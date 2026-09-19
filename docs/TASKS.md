@@ -1244,6 +1244,48 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第十五轮:认领是一次事务,不是事后的一条 WHERE(2026-09-20)
+
+第十五轮,Codex 两条:一条 P1、一条 P2。两条是同一句话的两面:**一个"我可以动它"的判断,
+必须和它授权的那个动作在同一个 `BEGIN IMMEDIATE` 里。** 第八轮到第十二轮把 collector 对**行**的
+每一次写都变成了条件写,可这一轮的两处,不可逆的都不是那次写——P1 是一次 `rename(2)`(做完了
+条件写才发现"这一条不归我了",而树已经改名了),P2 是一棵**克隆**(行插进去的时候快照已经在
+去 trash 的路上了)。**一条一个提交、一个测试,先验证过"没有修复就会红"。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `PRRT_kwDOUf7jGc6kCjHC` | `world.cpp` `gc_delete_one()`(以及 `--now` 的 `trash_delete_now()`) | 删一条 trash 用三步:`trash_row_still_ours()` 读行(TRASHED、还叫这个名字)→ `trash_mark_deleting()` 把树 rename 成 `<path>.deleting` → 条件 UPDATE 记下新名字 → unlink。`restore W<n>` 只要把它的 (a)(`BEGIN IMMEDIATE`:行 → TRASHING)插在**头两步之间**,树那一刻**还在 trash 里**:collector 的 rename 照样成功,它后面那条 `WHERE ... state=2 AND trash_path=?` 一行都没改到,**unlink 却照常往下走**。restore 随后的 rename 失败(树已经叫 `.deleting`),按既有逻辑回落 TRASHED——于是一条 TRASHED 行,还在邀请你 `restore`,而树已经被删光了。`--now` 里是同一个窗口:它的 rename 也在事务外,`-ESTALE` 是**树已经被改名之后**才报出来的 | **那次 rename 就是认领,所以它进事务**:`gc_claim_deleting()` 拿 store 锁 + `BEGIN IMMEDIATE`,在里面重读行(`state=2 AND trash_path=`排队时那个名字)、rename、记下新名字、提交。restore 的 (a) 也是 `BEGIN IMMEDIATE`,两者因此串行:要么 restore 在前——认领读到 TRASHING,**什么都不做**(树一根指头没碰);要么认领在前——restore 读到行写着 `.deleting`,回 `WFS_E_TRASH_DELETING`,树完好。事务里只握着一次 `rename(2)`(微秒级),那个会花上几分钟的"把上一次没删完的 `.deleting` 折进来"拆成了 `trash_fold_leftover()`、在锁外先做。rename 和提交之间崩掉 = 行记老名字、树在新名字,正是 `trash_follow_deleting()` 一直在解的状态。便宜的那次 `trash_row_still_ours()` 留着当快速跳过(不拿写锁),但**它不再作数**。无行的孤儿走同一个事务里的 `trash_path_claimed_locked()`——discard 是先提交 TRASHING 行、后搬树的,所以同一把写锁同样管得住。`--now` 照此改:先重读行,再 rename,`-ESTALE` 现在是一个**什么都没做**的 `-ESTALE` | `2c2bb14` |
+| P2 `PRRT_kwDOUf7jGc6kCjHH` | `pool.cpp` `build_one()` 插 CREATING 行那一段 | `wfs_pool_fill` 在顶上 `snap_info()` 读一次快照行,`build_one()` 随后在自己的 `BEGIN IMMEDIATE` 里插 pool 行,**再也没问过快照**。夹在中间的 `discard S<n>`(不带 `--force`)数引用时,这一行还不存在——数出来 0 个 pool 条目、0 个 World——于是提交 TRASHING。它的树那一刻**还没搬走**(discard 是行先写、树后搬),filler 的 clonefile 照样成功,条目发布成 READY:一个**已经在去 trash 路上的快照**,有了个可以被领走的 pool 条目。`pool_collect()` 下一轮会埋掉它,可中间任何一次 fork 都会把它当活基线领走 | 插入的那个事务里**重读快照行**,要求 `state == ACTIVE` 且 `created_at` 正是条目要带的那个(`snapshot_id + snap_created_at` 就是 fork 认条目的那把钥匙);对不上就 `-ESTALE`。两边都是 `BEGIN IMMEDIATE`,于是串行:要么 discard 在前、这次插入看见快照不再 ACTIVE;要么插入在前、discard 数得到这一行(不带 `--force` 是拒绝,带 `--force` 是 drain)。`-ESTALE` 沿 `wfs_pool_fill` 的循环原样返回——CLI 打的还是那句"S<n> is not an active snapshot",和一开始就冲着一个已经进 trash 的快照填是同一句话。`pool_collect()` 那一头本来就会埋掉非 ACTIVE 快照的条目,这一条把窗口从另一头关上 | `b9fda0b` |
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **243 passed, 0 failed**;`check-deps.sh` 全绿。
+(`m1_criteria.sh` 本轮跳过。)
+
+先把测试跑红过:
+
+- **认领(P1)**:`wfs_test_before_trash_delete` 这个 seam 往后挪了一格——从"重读行之前"挪到
+  **"重读行之后、认领之前"**,也就是这条 bug 真正的窗口里(原来那一格里 restore 已经把树搬回家了,
+  collector 的 rename 回 `-ENOENT`,本来就不会出事)。窗口里跑一个**跑到一半的 restore**
+  (`crash_at(2)`:行提交成 TRASHING,rename 没做,主人 pid 是个死的)。老代码:collector 把树
+  rename 成 `.deleting` 并**删光**,`exists(g_half_path)` 红;恢复之后那个 World 再也回不来。
+  新代码:认领读到 TRASHING,什么都不做。`--now` 那一半同样跑过红——把 `trash_delete_now()` 里
+  的 rename 临时挪回事务外,`exists(g_nowhalf_path)` 就红。
+- **填充(P2)**:新 seam `wfs_test_before_pool_insert`(读完快照行、插行之前)里跑一个
+  **停在 phase 0 的 `discard S<n>`**(行已提交 TRASHING,树还没搬——这是唯一会造成损失的那个形状)。
+  老代码:`wfs_pool_fill` 回 **0**,pool 里多出一个 READY 条目,而快照是 TRASHING。
+  新代码:回 `-ESTALE`,`pool ready` 0,`<store>/pool/S<n>` 是空的。
+
+新增测试:
+
+- `core_test`(P1,接第八轮那个 collector 竞态):跑到一半的 restore 之后,树还在 trash 里、
+  `.deleting` 这个名字不存在、内容还是 `one`,`worlds_deleted`/`trash_orphans`/`trash_failed`
+  全是 0,行是 TRASHING;再 open 一次 store 让恢复收尾(树没动 → 回 TRASHED),`restore` 成功、
+  World 回家、内容完好。**镜像顺序**也补了一条:在 restore 自己的窗口(phase 2)里跑一整趟 `wfs_gc`,
+  它必须什么都不动,restore 随后正常收尾。
+- `core_test`(P1,接第九轮那个 `--now` 竞态):同样那个跑到一半的 restore,`--now` 回 `-ESTALE`
+  且**什么都没做**——树还在、没有 `.deleting`、内容完好,恢复之后 `restore` 照样把 World 领回家。
+- `core_test`(P2):填充窗口里那趟停在 phase 0 的 discard 之后,`pool ready` 0、pool 目录空;
+  被打断的 discard 按老规矩恢复成 ACTIVE(树从没搬过),同一个快照再填一次,条目正常发布。
+
 #### PR #1 review 第十四轮:同一个文件的第二种拼法,和那个要被拿走的名字(2026-09-20)
 
 第十四轮,Codex 两条,都是 P2,都落在 `core/src/hardlinks.cpp`。两条凑在一起是同一句话的两面:
