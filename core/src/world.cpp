@@ -2081,26 +2081,17 @@ extern "C" int wfs_gc_pending(wfs_store *s, int64_t retention_secs, int *worker_
         *worker_running = gc_worker_probe(s, &pid, &at, &d, &r);
     }
     int64_t cutoff = now_sec() - (retention_secs < 0 ? kDefaultRetention : retention_secs);
-    {
-        Guard g(s->mu);
-        for (const char *sql : {"SELECT 1 FROM worlds WHERE state=2 AND trashed_at<=? AND trash_path<>'' LIMIT 1",
-                                "SELECT 1 FROM snapshots WHERE state=2 AND trashed_at<=? AND trash_path<>'' LIMIT 1"}) {
-            Stmt q(s->db, sql);
-            if (!q.ok()) continue;
-            q.i64(1, cutoff);
-            if (q.row()) return 1;
-        }
-    }
-    // An interrupted deletion is always work, whatever the retention says.
-    String trashdir = joinp(s->dir.c_str(), "trash");
-    if (DIR *d = ::opendir(trashdir.c_str())) {
-        int found = 0;
-        while (struct dirent *e = ::readdir(d))
-            if (ends_with(e->d_name, WFS_DELETING_SUFFIX)) { found = 1; break; }
-        ::closedir(d);
-        if (found) return 1;
-    }
-    return 0;
+    // PR #1 review (3rd round): the collector's own classification, not an approximation of it.
+    // This used to be two indexed counts plus a readdir looking for `*.deleting`, which missed
+    // the third class trash_scan knows about: an ordinary `W<n>-<t>` or `S<n>-<t>` directory
+    // that no row claims, left by a discard killed between the rename and the commit. trash_scan
+    // calls such an orphan due immediately and `gc` sets work_remains for it, but the spawn
+    // decision said "nothing waiting" -- so the CLI announced a background collection and
+    // started nothing, every fork and discard made the same call, and the orphan sat there until
+    // somebody ran `gc --now` by hand. Same cost as before: one readdir and the two row tables.
+    TrashView v;
+    if (trash_scan(s, cutoff, v) != 0) return 0;
+    return (v.deleting.size() || v.due.size()) ? 1 : 0;
 }
 
 extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *out) {

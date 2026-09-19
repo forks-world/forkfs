@@ -548,6 +548,26 @@ int main() {
     CHECK(wr.state == WFS_ST_DEAD);
     CHECK(exists(mine_dir) && exists(mine_file));
 
+    // ---- PR #1 review (3rd round): "is there work for a collector?" must ask what the ---------
+    // collector asks. A discard killed between the rename into <store>/trash and the commit of
+    // its row leaves an ordinary `W<n>-<t>` directory that no row claims and that does not wear
+    // the `.deleting` suffix. trash_scan() calls that due immediately, so `gc` reports work --
+    // but the pending check looked only at the two row tables and for a `.deleting` name, said
+    // "nothing waiting", and no worker was ever started for it. The CLI announced a background
+    // collection and spawned nothing, and every later fork and discard decided the same.
+    char orphandir[4096];
+    snprintf(orphandir, sizeof orphandir, "%s/trash/W9999-1", store);
+    CHECK(mkdir(orphandir, 0755) == 0);
+    join(p, sizeof p, orphandir, "leftover");
+    write_file(p, "x");
+    int gc_worker = 0;
+    CHECK(wfs_gc_pending(s, 7 * 24 * 3600, &gc_worker) == 1);
+    memset(&gc, 0, sizeof gc);
+    CHECK_OK(wfs_gc(s, 7 * 24 * 3600, &gc));   // a 7-day retention: nothing else is due
+    CHECK(!exists(orphandir));
+    CHECK(gc.trash_orphans >= 1);
+    CHECK(exists(w1path) && exists(w3path));
+
     // ---- P3 again: tampering with a --hard snapshot is detected ----
     CHECK_OK(wfs_snapshot_info(s, s2, &sr));
     join(p, sizeof p, sr.path, "hello.txt");                       // sr is S2 here

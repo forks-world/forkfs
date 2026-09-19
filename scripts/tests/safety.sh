@@ -214,6 +214,22 @@ touch "$SCRATCH/pr3/interrupted.wfs-tmp/sub/half"
     && ok PR3 "gc does not guess that a *.wfs-tmp tree is ours" \
     || bad PR3 "gc does not guess that a *.wfs-tmp tree is ours"
 
+# ---- PR #1 review (3rd round): an orphan in the trash starts a worker ---------------------------
+# A discard killed between the rename into <store>/trash and the commit of its row leaves an
+# ordinary `W<n>-<t>` directory that no row claims. The collector calls it due immediately; the
+# check that decides whether to spawn a collector at all used to miss it, so the orphan stayed
+# there through every later fork and discard.
+mkdir -p "$WORLD_STORE/trash/W9999-1/sub"
+touch "$WORLD_STORE/trash/W9999-1/sub/leftover"
+"$WORLD" fs fork --from S1 --to "$SCRATCH/pr3orphan" > "$SCRATCH/pr3orphan.log" 2>&1
+for _ in $(seq 60); do [ -e "$WORLD_STORE/trash/W9999-1" ] || break; sleep 0.25; done
+if [ ! -e "$WORLD_STORE/trash/W9999-1" ]; then
+    ok PR3 "a fork starts a worker for a row-less trash orphan"
+else
+    bad PR3 "a fork starts a worker for a row-less trash orphan"
+    ls "$WORLD_STORE/trash" | sed 's/^/        /'
+fi
+
 # ---- P12: two commands at once do not corrupt the store -----------------------------------------
 "$WORLD" fs fork --from S1 --to "$SCRATCH/par-a" > "$SCRATCH/pa.log" 2>&1 &
 "$WORLD" fs fork --from S1 --to "$SCRATCH/par-b" > "$SCRATCH/pb.log" 2>&1 &
