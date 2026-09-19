@@ -1860,6 +1860,65 @@ void set_trash_path(wfs_store *s, const TrashJob &j, const char *p) {
     t.commit();
 }
 
+// PR #1 review: how many wakes in a row have failed to delete one trash entry. Every wake is a
+// new process, so the count cannot live in memory; it goes in the store's meta table, keyed by
+// the entry's name with any `.deleting` suffix stripped (the name changes under us the first
+// time). The cap is what stops a permanently undeletable entry from spawning a worker every two
+// seconds for ever -- it is a retry limit, never a licence to report the trash as empty: the
+// entry is still there, still counted by `gc --status`, and still reported by every run.
+const int64_t kGcFailCap = 5;
+
+void gc_fail_key(const TrashJob &j, String &out) {
+    String name(basename_of(j.path.c_str()));
+    size_t n = name.size(), sl = ::strlen(WFS_DELETING_SUFFIX);
+    if (n > sl && !::strcmp(name.c_str() + n - sl, WFS_DELETING_SUFFIX)) name.resize(n - sl);
+    out.assign("gcfail:");
+    out.append(name.c_str());
+}
+
+int64_t gc_fail_bump(wfs_store *s, const TrashJob &j) {
+    String k;
+    gc_fail_key(j, k);
+    Guard g(s->mu);
+    Txn t(s->db);
+    int64_t n = 0;
+    {
+        Stmt q(s->db, "SELECT value FROM meta WHERE key=?");
+        if (!q.ok()) return kGcFailCap;   // cannot count: do not spin
+        q.text(1, k.c_str());
+        if (q.row()) n = ::strtoll(q.col_text(0), nullptr, 10);
+    }
+    ++n;
+    char v[32];
+    ::snprintf(v, sizeof v, "%lld", (long long)n);
+    Stmt u(s->db,
+           "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value");
+    if (!u.ok()) return kGcFailCap;
+    u.text(1, k.c_str());
+    u.text(2, v);
+    if (u.step() != SQLITE_DONE) return kGcFailCap;
+    t.commit();
+    return n;
+}
+
+// The read comes first so that the ordinary case -- an entry that never failed -- costs one
+// indexed lookup instead of a transaction per deleted tree.
+void gc_fail_clear(wfs_store *s, const TrashJob &j) {
+    String k;
+    gc_fail_key(j, k);
+    Guard g(s->mu);
+    {
+        Stmt q(s->db, "SELECT 1 FROM meta WHERE key=?");
+        if (!q.ok()) return;
+        q.text(1, k.c_str());
+        if (!q.row()) return;
+    }
+    Txn t(s->db);
+    Stmt d(s->db, "DELETE FROM meta WHERE key=?");
+    if (d.ok()) { d.text(1, k.c_str()); d.step(); }
+    t.commit();
+}
+
 // One entry, the crash-safe way: rename first, record the new name, then unlink. `*partial`
 // comes back 1 when the deadline stopped the unlink half-way: the row stays TRASHED and the
 // tree stays `.deleting`, which is exactly the state the next wake resumes from.
@@ -2117,7 +2176,18 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
             }
             uint64_t freed = 0;
             int partial = 0;
-            if (gc_delete_one(s, jobs[i], threads, &freed, deadline_us, &partial) != 0) continue;
+            if (gc_delete_one(s, jobs[i], threads, &freed, deadline_us, &partial) != 0) {
+                // The tree is still there, and the loop must not end up reporting an empty
+                // trash because of it (PR #1 review). Count it, keep the chain alive for the
+                // first few wakes so a transient error is retried, and after that leave the
+                // entry where it is -- reported by every run and by `gc --status` -- instead of
+                // waking a worker every two seconds for something that will not budge.
+                rep.trash_failed++;
+                rep.entries_freed += freed;
+                if (gc_fail_bump(s, jobs[i]) < kGcFailCap) rep.work_remains = 1;
+                continue;
+            }
+            gc_fail_clear(s, jobs[i]);
             rep.entries_freed += freed;
             if (partial) {
                 // The deadline landed in the middle of this tree. Stop here rather than finish

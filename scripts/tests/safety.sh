@@ -23,6 +23,9 @@ esac
 cleanup_scratch() {
     [ -e "$SCRATCH" ] || return 0
     chflags -R nouchg "$SCRATCH" 2>/dev/null
+    # The undeletable-trash-entry case below denies the owner delete_child with an ACL, which no
+    # chmod of the mode bits and no chflags can undo.
+    chmod -R -N "$SCRATCH" 2>/dev/null
     # u+rwX, not u+w: a gate-protected snapshot root is 0000 and has to be traversable again
     # before anything below it can be removed.
     chmod -R u+rwX "$SCRATCH" 2>/dev/null
@@ -675,6 +678,39 @@ fi
 for _ in $(seq 120); do [ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && break; sleep 0.25; done
 [ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && ok PR1 "the successor chain finishes the tree" \
                                             || { bad PR1 "the successor chain finishes the tree"; ls "$RSTORE/trash" | sed 's/^/        /'; }
+
+# ---- PR #1 review (P2): a trash entry that cannot be deleted never reads as an empty trash ----
+# An ACL that denies the owner delete_child survives both chmod and chflags, which is exactly what
+# the deleter tries when unlink(2) comes back EPERM -- so this entry really cannot be removed.
+STUCK="$RSTORE/trash/stuck-1"
+mkdir -p "$STUCK/keep"
+echo x > "$STUCK/keep/f.txt"
+echo y > "$STUCK/other.txt"
+chmod +a "$(id -un) deny delete,delete_child,add_file" "$STUCK/keep"
+out=$(rv fs gc --now --retention 0 2>&1)
+[ -d "$STUCK.deleting/keep" ] && ok PR1 "an undeletable trash entry stays in the trash" \
+                              || { bad PR1 "an undeletable trash entry stays in the trash"; echo "$out" | sed 's/^/        /'; }
+echo "$out" | grep -q "could not be deleted" && ok PR1 "gc says so instead of reporting a clean run" \
+                                              || { bad PR1 "gc says so instead of reporting a clean run"; echo "$out" | sed 's/^/        /'; }
+echo "$out" | grep -q "will try again" && ok PR1 "the first failures are retried" \
+                                        || { bad PR1 "the first failures are retried"; echo "$out" | sed 's/^/        /'; }
+rv fs gc --status | grep -q "^trash: *1 entries" && ok PR1 "gc --status still counts it" \
+                                                 || { bad PR1 "gc --status still counts it"; rv fs gc --status | sed 's/^/        /'; }
+# The retries are capped: after a few wakes the collector stops waking itself for it, but it
+# still says what is in there -- the trash is never reported as empty while it is not.
+for _ in 1 2 3 4; do out=$(rv fs gc --now --retention 0 2>&1); done
+echo "$out" | grep -q "too often" && ok PR1 "the retries are capped, with a reason" \
+                                   || { bad PR1 "the retries are capped, with a reason"; echo "$out" | sed 's/^/        /'; }
+WORLD_GC_PAUSE_MS=0 rv fs gc --worker --retention 0 > "$SCRATCH/gcstuck.log" 2>&1
+grep -q "trash empty" "$SCRATCH/gcstuck.log" && bad PR1 "the worker never calls the trash empty while it is not" \
+                                             || ok PR1 "the worker never calls the trash empty while it is not"
+grep -q "could not be deleted" "$SCRATCH/gcstuck.log" && ok PR1 "the worker log names the failure" \
+                                                      || { bad PR1 "the worker log names the failure"; sed 's/^/        /' "$SCRATCH/gcstuck.log"; }
+# Take the ACL away and the very next gc finishes the job -- the entry was never forgotten.
+chmod -N "$STUCK.deleting/keep"
+rv fs gc --now --retention 0 > /dev/null 2>&1
+[ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && ok PR1 "once it can be deleted the next gc removes it" \
+                                            || { bad PR1 "once it can be deleted the next gc removes it"; ls "$RSTORE/trash" | sed 's/^/        /'; }
 
 echo
 "$WORLD" fs status | sed 's/^/      /'

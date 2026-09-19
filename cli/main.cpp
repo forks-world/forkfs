@@ -952,11 +952,21 @@ static void gc_log_line(const wfs_gc_report *rep, double secs) {
     double cpu = 0;
     if (getrusage(RUSAGE_SELF, &ru) == 0)
         cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
+    // What this wake leaves behind. An entry it could not delete is never "trash empty":
+    // something is still in there and the next command has to be able to see that (PR #1 review).
+    char state[160];
+    if (rep->trash_failed)
+        snprintf(state, sizeof state, "  (%llu entr%s could not be deleted%s)",
+                 (unsigned long long)rep->trash_failed, rep->trash_failed == 1 ? "y" : "ies",
+                 rep->work_remains ? ", retrying" : "; left in the trash");
+    else
+        snprintf(state, sizeof state, "%s",
+                 rep->work_remains ? "  (work remains, handing over)" : "  (trash empty)");
     printf("%s  gc worker: %llu worlds, %llu snapshots, %llu orphans, %llu entries unlinked in "
            "%.2f s wall / %.2f s cpu%s\n",
            t, (unsigned long long)rep->worlds_deleted, (unsigned long long)rep->snapshots_deleted,
            (unsigned long long)rep->trash_orphans, (unsigned long long)rep->entries_freed, secs, cpu,
-           rep->work_remains ? "  (work remains, handing over)" : "  (trash empty)");
+           state);
     fflush(stdout);
 }
 
@@ -1086,6 +1096,17 @@ static int cmd_gc(wfs_store *s, int argc, char **argv) {
                     "world:       only moved looks the same from here: `world fs verify <its new path>`\n"
                     "world:       repairs that one instead (P1).\n",
                     (unsigned long long)rep.snapshots_dangling, (unsigned long long)rep.worlds_dangling);
+    }
+    if (rep.trash_failed) {
+        // Never let a failed delete read as an empty trash: say what is still in there, and
+        // whether anything will come back for it by itself.
+        fprintf(stderr,
+                "world: note: %llu trash entr%s could not be deleted and %s still in the trash.\n"
+                "world:       %s   (`world fs gc --status` lists what is left)\n",
+                (unsigned long long)rep.trash_failed, rep.trash_failed == 1 ? "y" : "ies",
+                rep.trash_failed == 1 ? "is" : "are",
+                rep.work_remains ? "The collector will try again."
+                                 : "It has failed too often to keep retrying by itself.");
     }
     if (!now && rep.work_remains) {
         spawn_gc_worker(s, retention);

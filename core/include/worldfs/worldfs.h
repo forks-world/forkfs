@@ -549,6 +549,12 @@ typedef struct wfs_gc_report {
     /* T2.1: the batch limit was reached and trash entries are still waiting. A caller that can
      * spawn a worker (the CLI does) should spawn one. */
     int work_remains;
+    /* Trash entries this run could not delete at all (a tree with something undeletable in it,
+     * a transient EIO). They are still in the trash, `gc --status` still counts them, and no
+     * report with a non-zero count here may be read as "the trash is empty". The first few
+     * wakes after a failure set work_remains as well, so the worker chain comes back for them;
+     * after that the entry is left alone rather than spun on forever. */
+    uint64_t trash_failed;
 } wfs_gc_report;
 
 /* retention_secs < 0 uses the default (7 days). Synchronous and complete: every due trash entry
