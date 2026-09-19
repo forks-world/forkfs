@@ -757,6 +757,16 @@ extern int (*wfs_test_trash_crash)(void *ctx, int phase, int is_snapshot, wfs_id
                                    const char *trash_path);
 extern void *wfs_test_trash_crash_ctx;
 
+/* And the trash collector's own window (PR #1 review, 8th round): called once per queued entry,
+ * between the scan that queued it and the rename to `<name>.deleting` that starts deleting it.
+ * `row` is 0 for a directory in the trash that no row claims. What a test does in there is win
+ * the race the collector has to survive -- restore the world it is holding -- and what has to
+ * happen next is that the collector notices and leaves the entry alone. NULL unless a test sets
+ * it; nothing in the library ever assigns it. */
+extern void (*wfs_test_before_trash_delete)(void *ctx, int is_snapshot, wfs_id row,
+                                            const char *path);
+extern void *wfs_test_before_trash_delete_ctx;
+
 /* And the thing no test can provoke on a healthy machine: a pthread_create that fails for one
  * worker slot and succeeds for a later one. A bit set here refuses that slot (slots 0..31); 0,
  * the value it has everywhere else, means every slot is started normally. */

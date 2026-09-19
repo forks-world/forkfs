@@ -259,6 +259,22 @@ static int owner_race(void *ctx, int phase, int is_snapshot, wfs_id id, const ch
     return 0;
 }
 
+// PR #1 review (8th round, P1): the trash collector's own race. The seam runs between the scan
+// that queued this entry and the rename that starts deleting it, and what it does in there is a
+// whole `restore` of the row the collector is holding -- on a different store handle, the way a
+// different process would.
+static wfs_store *g_del_store = NULL;
+static wfs_id g_del_world;
+static int g_del_ran;
+static int g_del_rc = -1;
+static void restore_before_delete(void *ctx, int is_snapshot, wfs_id row, const char *path) {
+    (void)ctx;
+    (void)path;
+    if (is_snapshot || row != g_del_world) return;
+    g_del_ran++;
+    g_del_rc = wfs_world_restore(g_del_store, g_del_world);
+}
+
 // A copy in the sense of `cp -R`: same bytes, same marker, different inode (P2).
 static void copy_dir(const char *src, const char *dst) {
     CHECK(mkdir(dst, 0755) == 0);
@@ -1969,6 +1985,78 @@ int main() {
         wfs_test_trash_crash = NULL;
         wfs_store_close(os);
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", ostore, (unsigned long long)o2);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
+    // ---- PR #1 review (8th round, P1): a restore that wins the race is not a deletion --------
+    //
+    // gc queues a TRASHED world; a `restore` that gets there first takes the row to TRASHING
+    // under BEGIN IMMEDIATE and renames the tree out of the trash and back home. The collector's
+    // rename to `<name>.deleting` then answers -ENOENT -- which means "moved home", not
+    // "deleted" -- and that branch buried the row: a DEAD row for a world sitting at its home
+    // path, restored a millisecond earlier and ACTIVE. Every write the collector makes to a row
+    // is conditional on that row now, and the state is checked once before the rename as well,
+    // so the ordinary case skips the job before touching anything.
+    {
+        char cstore[4096], csrc[4096], cw[4096];
+        join(cstore, sizeof cstore, root, "collect-store");
+        join(csrc, sizeof csrc, root, "collect-src");
+        CHECK(mkdir(csrc, 0755) == 0);
+        join(p, sizeof p, csrc, "a.txt");
+        write_file(p, "one\n");
+        wfs_store *ca = NULL;
+        CHECK_OK(wfs_store_open(cstore, &ca));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "cb";
+        wfs_id c1 = 0;
+        CHECK_OK(wfs_snapshot_create(ca, csrc, &sopts, &c1));
+        wfs_ref cf = {WFS_K_SNAPSHOT, c1};
+        memset(&opts, 0, sizeof opts);
+        join(cw, sizeof cw, worlds, "cworld");
+        wfs_id cw1 = 0;
+        CHECK_OK(wfs_world_create(ca, cf, cw, &opts, &cw1));
+        CHECK_OK(wfs_world_discard(ca, cw1, 0, 0));
+        wfs_world_rec cwr;
+        CHECK_OK(wfs_world_info(ca, cw1, &cwr));
+        CHECK(cwr.state == WFS_ST_TRASHED && !exists(cw));
+
+        // The collector runs on a handle of its own, with retention 0 so the entry is due.
+        wfs_store *cb = NULL;
+        CHECK_OK(wfs_store_open(cstore, &cb));
+        g_del_store = ca;
+        g_del_world = cw1;
+        g_del_ran = 0;
+        g_del_rc = -1;
+        wfs_test_before_trash_delete = restore_before_delete;
+        wfs_gc_report crep;
+        memset(&crep, 0, sizeof crep);
+        CHECK_OK(wfs_gc(cb, 0, &crep));
+        wfs_test_before_trash_delete = NULL;
+        CHECK(g_del_ran == 1);
+        CHECK_OK(g_del_rc);                       // the restore is the one that won
+        // ... and gc did not touch it: not deleted, not buried, not counted, not reported as a
+        // failure either -- there is nothing wrong, the entry simply stopped being trash.
+        CHECK(crep.worlds_deleted == 0 && crep.trash_orphans == 0 && crep.trash_failed == 0);
+        CHECK(crep.work_remains == 0);
+        CHECK_OK(wfs_world_info(ca, cw1, &cwr));
+        CHECK(cwr.state == WFS_ST_ACTIVE && cwr.present && exists(cw));
+        CHECK_OK(wfs_world_info(cb, cw1, &cwr));  // and the collector's own handle agrees
+        CHECK(cwr.state == WFS_ST_ACTIVE);
+        CHECK_OK(wfs_world_diff(ca, cw1, 0, NULL, NULL));
+        join(p, sizeof p, cw, "a.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "one\n"));            // the tree came home whole
+
+        // And the ordinary case is untouched: discard it again and the collector takes it.
+        CHECK_OK(wfs_world_discard(ca, cw1, 0, 0));
+        memset(&crep, 0, sizeof crep);
+        CHECK_OK(wfs_gc(cb, 0, &crep));
+        CHECK(crep.worlds_deleted == 1 && crep.trash_orphans == 0);
+        CHECK_OK(wfs_world_info(ca, cw1, &cwr));
+        CHECK(cwr.state == WFS_ST_DEAD && !exists(cw));
+        wfs_store_close(cb);
+        wfs_store_close(ca);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", cstore, (unsigned long long)c1);
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 

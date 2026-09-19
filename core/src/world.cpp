@@ -626,6 +626,13 @@ extern "C" int (*wfs_test_trash_crash)(void *ctx, int phase, int is_snapshot, wf
                                        const char *trash_path) = nullptr;
 extern "C" void *wfs_test_trash_crash_ctx = nullptr;
 
+// And the window the trash collector has between the scan that queued an entry and the rename
+// that starts deleting it (PR #1 review, 8th round): what a test has to be able to do in there
+// is a whole `restore` of the row the collector is holding.
+extern "C" void (*wfs_test_before_trash_delete)(void *ctx, int is_snapshot, wfs_id row,
+                                                const char *path) = nullptr;
+extern "C" void *wfs_test_before_trash_delete_ctx = nullptr;
+
 // ---- snapshots --------------------------------------------------------------------------------
 
 extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_snapshot_opts *opts,
@@ -2434,6 +2441,10 @@ struct GcLock {
 // One trash directory waiting to be unlinked.
 struct TrashJob {
     String path;      // where it is now
+    String row_path;  // and what the row said when this job was made (PR #1 review, 8th round):
+                      // `path` follows the collector's own `.deleting` rename, the row does not,
+                      // and every write the collector makes to that row is conditional on it
+                      // still saying this.
     wfs_id row = 0;   // 0 = an orphan: a directory in the trash that no row claims
     int is_snapshot = 0;
 };
@@ -2506,8 +2517,9 @@ int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v) {
                 if (!tp.size()) continue;
                 v.worlds++;
                 v.tree_entries += (uint64_t)q.col_i64(3);
-                trash_follow_deleting(tp);
                 TrashJob j;
+                j.row_path = tp;
+                trash_follow_deleting(tp);
                 j.path = tp;
                 j.row = (wfs_id)q.col_i64(0);
                 if (ends_with(tp.c_str(), WFS_DELETING_SUFFIX)) v.deleting.emplace_back(j);
@@ -2523,8 +2535,9 @@ int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v) {
                 if (!tp.size()) continue;
                 v.snapshots++;
                 v.tree_entries += (uint64_t)q.col_i64(3);
-                trash_follow_deleting(tp);
                 TrashJob j;
+                j.row_path = tp;
+                trash_follow_deleting(tp);
                 j.path = tp;
                 j.row = (wfs_id)q.col_i64(0);
                 j.is_snapshot = 1;
@@ -2570,26 +2583,68 @@ int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v) {
     return 0;
 }
 
+// ---- PR #1 review (8th round): every write the collector makes to a row is conditional -------
+//
+// The collector queues a TRASHED row, and by the time it gets to it the row may not be that row
+// any more. `restore W<n>` takes the row to TRASHING under BEGIN IMMEDIATE and renames the tree
+// out of the trash and back home; the collector's rename to `<name>.deleting` then answers
+// -ENOENT, which used to mean "somebody deleted it already" and buried the row -- a DEAD row for
+// a world that is back at its home path and ACTIVE, with no way back.
+//
+// So the two UPDATEs below carry the row's whole identity in their WHERE clause: still TRASHED,
+// and still naming the tree this job was made from. Zero rows changed means the job is not the
+// collector's any more, and the caller then counts nothing and reports nothing.
+//
 // Marks a row DEAD once its tree is gone. Worlds and snapshots keep their row: the DAG is
 // history, and a dangling reference has to be explainable afterwards.
-void mark_dead(wfs_store *s, const TrashJob &j) {
-    if (!j.row) return;
+bool mark_dead(wfs_store *s, const TrashJob &j) {
+    if (!j.row) return true;   // an orphan has no row to bury
     Guard g(s->mu);
     Txn t(s->db);
-    Stmt u(s->db, j.is_snapshot ? "UPDATE snapshots SET state=?, trash_path='' WHERE id=?"
-                                : "UPDATE worlds SET state=?, trash_path='' WHERE id=?");
-    if (u.ok()) { u.i64(1, WFS_ST_DEAD); u.i64(2, (int64_t)j.row); u.step(); }
+    Stmt u(s->db,
+           j.is_snapshot
+               ? "UPDATE snapshots SET state=?, trash_path='' WHERE id=? AND state=2 AND trash_path=?"
+               : "UPDATE worlds SET state=?, trash_path='' WHERE id=? AND state=2 AND trash_path=?");
+    if (!u.ok()) return false;
+    u.i64(1, WFS_ST_DEAD);
+    u.i64(2, (int64_t)j.row);
+    u.text(3, j.row_path.c_str());
+    if (u.step() != SQLITE_DONE) return false;
+    bool changed = sqlite3_changes(s->db) != 0;
     t.commit();
+    return changed;
 }
 
-void set_trash_path(wfs_store *s, const TrashJob &j, const char *p) {
-    if (!j.row) return;
+bool set_trash_path(wfs_store *s, const TrashJob &j, const char *p) {
+    if (!j.row) return false;
     Guard g(s->mu);
     Txn t(s->db);
-    Stmt u(s->db, j.is_snapshot ? "UPDATE snapshots SET trash_path=? WHERE id=?"
-                                : "UPDATE worlds SET trash_path=? WHERE id=?");
-    if (u.ok()) { u.text(1, p); u.i64(2, (int64_t)j.row); u.step(); }
+    Stmt u(s->db,
+           j.is_snapshot ? "UPDATE snapshots SET trash_path=? WHERE id=? AND state=2 AND trash_path=?"
+                         : "UPDATE worlds SET trash_path=? WHERE id=? AND state=2 AND trash_path=?");
+    if (!u.ok()) return false;
+    u.text(1, p);
+    u.i64(2, (int64_t)j.row);
+    u.text(3, j.row_path.c_str());
+    if (u.step() != SQLITE_DONE) return false;
+    bool changed = sqlite3_changes(s->db) != 0;
     t.commit();
+    return changed;
+}
+
+// Is this job still the collector's to do? Read under the store mutex immediately before the
+// rename that starts the deletion, so the ordinary case never touches a tree whose row has moved
+// on. A TRASHING row is somebody else's operation in flight, an ACTIVE one has been restored,
+// and a DEAD one has been collected by somebody else -- none of them is ours.
+bool trash_row_still_ours(wfs_store *s, const TrashJob &j) {
+    if (!j.row) return true;   // an orphan: nothing can disagree with it
+    Guard g(s->mu);
+    Stmt q(s->db, j.is_snapshot ? "SELECT state, trash_path FROM snapshots WHERE id=?"
+                                : "SELECT state, trash_path FROM worlds WHERE id=?");
+    if (!q.ok()) return false;
+    q.i64(1, (int64_t)j.row);
+    return q.row() && q.col_i64(0) == WFS_ST_TRASHED &&
+           !::strcmp(q.col_text(1), j.row_path.c_str());
 }
 
 // PR #1 review: how many wakes in a row have failed to delete one trash entry. Every wake is a
@@ -2654,18 +2709,32 @@ void gc_fail_clear(wfs_store *s, const TrashJob &j) {
 // One entry, the crash-safe way: rename first, record the new name, then unlink. `*partial`
 // comes back 1 when the deadline stopped the unlink half-way: the row stays TRASHED and the
 // tree stays `.deleting`, which is exactly the state the next wake resumes from.
-int gc_delete_one(wfs_store *s, const TrashJob &j, int threads, uint64_t *entries_freed,
+// A positive return (PR #1 review, 8th round) means the job was resolved by somebody else while
+// this collector had it queued -- a `restore` that won the rename, or another collector. Nothing
+// was done to it and nothing may be counted or reported for it.
+int gc_delete_one(wfs_store *s, TrashJob &j, int threads, uint64_t *entries_freed,
                   int64_t deadline_us, int *partial) {
+    if (wfs_test_before_trash_delete)
+        wfs_test_before_trash_delete(wfs_test_before_trash_delete_ctx, j.is_snapshot, j.row,
+                                     j.path.c_str());
+    if (!trash_row_still_ours(s, j)) return 1;
     String deleting;
     int rc = trash_mark_deleting(j.path.c_str(), deleting);
-    if (rc == -ENOENT) { mark_dead(s, j); return 0; }   // someone else got there first
+    // Not at either name. Somebody deleted it -- or a restore renamed it home between the check
+    // above and this rename, which is why burying the row is conditional on the row still being
+    // the one that was queued.
+    if (rc == -ENOENT) return mark_dead(s, j) ? 0 : 1;
     if (rc) return rc;
-    if (::strcmp(deleting.c_str(), j.path.c_str())) set_trash_path(s, j, deleting.c_str());
+    if (::strcmp(deleting.c_str(), j.path.c_str())) {
+        // Record the new name. A row that moved on since the check refuses this, and the record
+        // is then lost -- but both names belong to the row either way (claim_trash_paths), so
+        // the next scan follows the rename and finds the tree again.
+        if (set_trash_path(s, j, deleting.c_str())) j.row_path.assign(deleting.c_str());
+    }
     if ((rc = trash_unlink(deleting.c_str(), threads, entries_freed, deadline_us, partial)))
         return rc;
     if (partial && *partial) return 0;
-    mark_dead(s, j);
-    return 0;
+    return mark_dead(s, j) ? 0 : 1;
 }
 
 } // namespace
@@ -3016,7 +3085,15 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
             }
             uint64_t freed = 0;
             int partial = 0;
-            if (gc_delete_one(s, jobs[i], threads, &freed, deadline_us, &partial) != 0) {
+            int drc = gc_delete_one(s, jobs[i], threads, &freed, deadline_us, &partial);
+            if (drc > 0) {
+                // Not this collector's entry any more: a `restore` took it back, or another
+                // collector finished it. Nothing to count, nothing to report, nothing to retry
+                // (PR #1 review, 8th round).
+                rep.entries_freed += freed;
+                continue;
+            }
+            if (drc != 0) {
                 // The tree is still there, and the loop must not end up reporting an empty
                 // trash because of it (PR #1 review). Count it, keep the chain alive for the
                 // first few wakes so a transient error is retried, and after that leave the
