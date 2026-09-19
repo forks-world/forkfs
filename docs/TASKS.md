@@ -713,10 +713,30 @@ FSKit 传进来的不是 `WorldItem`),与本次改动无关;`error:70` 一条都
 代价只是源树写者 p99 10–11ms、0 失败,主路径继续用它。
 
 ### M2 — 运维与规模(2026-09-19 用户确认按此顺序)
+
+> **M2 状态(2026-09-19 收口,macOS 27.0 / M1 Mac mini):T2.1–T2.5 全部完成,T2.6 按用户决定推迟到 Linux 机器。**
+>
+> | 任务 | 头条数字 |
+> |---|---|
+> | T2.1 后台增量 gc | 1000 个 10.4k 条目的 World 在后台排空 663.6 s(真删 339.9 s,30,601 条目/s,比 M1 前台同步 gc 的 525.2 s / 19,800 条目/s **快 1.55×**);期间 200 次并发 fork p50 **0.200 s**,空闲时 0.202 s → **−1.0%**(P16 目标是不超过 ~10%);`discard` 9.1 → 11.2 ms |
+> | T2.2 `discard S<n>` + 对账 | 快照走与 World 相同的 trash/保留期/后台删除;有 ACTIVE World 引用时 `--force` 也拒绝;`gc --reconcile` 只有在"行还在、树没了"时才标 DEAD |
+> | T2.3 store 路径 | store 路径写进 `.world` marker(`store_path`),沙盒 appex 从挂载源根目录读它;CLI 默认 store 与扩展 container store **是两个目录**,mount 前自查并给可执行建议(不再是 `POSIX error 1009`) |
+> | T2.4 `getattrlistbulk(2)` + `EF_NO_XATTRS` | walker 快 1.20–1.23×(syscall 省 6×);50k 默认全扫 1.40 → 0.96 s,真实树 0.21 → 0.17 s |
+> | T2.4 后续:忽略 `com.apple.provenance` | 50k 默认全扫 **0.96 → 0.231 s**(`--all-xattrs` 1.303 s = 老默认,`--no-xattr` 0.126 s);10k **0.157 → 0.047 s**;整条 CLI 计时的 §5 复核 1.420 → **0.267 s** |
+> | T2.5 树内硬链接 | 1000 对硬链接的树 fork +274 ms = **0.27 ms/条**(4 线程);pool 命中 +2.6 ms(重放在填充时做完) |
+> | P17 store 完整性 | 有树没数据库 → `WFS_E_STORE_DAMAGED`,绝不静默重建 |
+>
+> 验收:`ctest` 2/2(WFS_FSKIT=OFF)与 3/3(ON),两个构建目录干净重建、`check-deps.sh` 全绿;
+> `safety.sh` **142 passed, 0 failed**;`diff_test` 连跑 10 次 10/10;
+> `m1_criteria.sh --only 1` fork 命中 p50 9.2/9.4/9.5 ms(M1 是 8.6/9.0/9.7,门槛 <10 ms,无退化);
+> 真实 FSKit 挂载 + `smoke.sh` **ALL OK**,卸载后无残留挂载。
+
 - [x] T2.1 后台增量 gc:discard 保持毫秒级,物理删除由后台分批完成(1000 个 10k 树的 World 实测 gc 525s)
 - [x] T2.2 `discard S<n>` + 悬空快照对账;快照有活 World/池条目引用时拒绝
 - [x] T2.3 store 路径统一:沙盒 appex 与 CLI 默认 store 不同(container vs ~/Library/Application Support),`world fs mount` 把 store 路径写进 `.world` marker 传给扩展;修正任务板中"CLI 默认同路径"
 - [x] T2.4 diff 扫描改 `getattrlistbulk` + `EF_NO_XATTRS`(2026-09-19,分支 `m2/t2.4-bulk-walker`;真实树默认全扫 0.21 → 0.17 s,合成 50k 1.40 → 0.96 s)
+  - [x] T2.4 后续:`com.apple.provenance` 不再参与比较(架构决定,见下;合成 50k 0.96 → **0.231 s**)
+- [x] P17 store 完整性:有树但 `metadata.db` 没了 → `WFS_E_STORE_DAMAGED`,拒绝并说明出路
 - [x] T2.5 fork 后按 (dev, ino) 恢复树内硬链接(P9 从警告变为修复;实测 0.27 ms/条,pool 命中不受影响)
 - [ ] T2.6 Linux 平台层:overlayfs + mount namespace(fork O(1)、upper 目录即 changed-set)——**不在这台 Mac 上做**(用户决定),等 Linux 机器
 
@@ -956,9 +976,10 @@ T1.7 里 7× 的那道口子在真实树上合上了。合成 fixture 上还剩 
 `core_test` 通过,`safety.sh` 93/93,`check-deps.sh` 三个二进制全绿。
 
 **留给以后的两条**:
-1. `com.apple.provenance` 是内核记的"谁建的这个文件",不是用户数据,却要每文件 2 次 `listxattr` + 2 次
+1. ~~`com.apple.provenance` 是内核记的"谁建的这个文件",不是用户数据,却要每文件 2 次 `listxattr` + 2 次
    `getxattr`(28 µs)才能确认它两边一样。把它(以及别的纯系统 xattr)排除在比较之外能把合成树上剩下的
-   0.97 s 直接打掉,但那是语义变更,得单独提。
+   0.97 s 直接打掉,但那是语义变更,得单独提。~~
+   → **已提、已做**,见下面"T2.4 后续"一节:默认 0.96 → 0.231 s,`--all-xattrs` 保留老行为。
 2. walker 每条目两次 `String` 分配,见上面 1.2× 那一段。
 
 #### T2.5 树内硬链接的恢复(2026-09-19 实现 + 实测)
@@ -1015,10 +1036,77 @@ pool 命中的重放(`fr.hardlinks == 0`,因为填充时就做完了)、从活 W
 `safety.sh` 新增 5 条 CLI 级用例(`ln` → init → fork → `stat -f %i` 相同、写穿、pool 路径、
 树外组只留独立副本、init 的措辞),全套 **135 passed, 0 failed**(T2.3 时是 130)。
 
-#### M2 验收(T2.1–T2.3,2026-09-19)
+#### T2.4 后续:`com.apple.provenance` 退出比较(2026-09-19,架构决定)
 
-- `scripts/tests/safety.sh`:**130 passed, 0 failed**(M1 结束时是 93;新增 37 条覆盖
-  T2.1 的崩溃安全 / 分批 / 单 worker 锁 / `--status`,T2.2 的拒绝、`--force`、对账,
-  以及 T2.3 的 marker store 路径——普通 fork 和 pool 命中两条路径都查)。
-- `ctest`:`build/Release`(WFS_FSKIT=OFF)2/2、`build/FSKit`(WFS_FSKIT=ON)3/3。
+T2.4 结尾留的第一条"以后再说"在 M2 收口时被采纳了。**这是语义变更,不是优化**,所以单独记:
+
+**事实**(实测,macOS 27.0):
+
+1. 本机进程**新建的每一个文件**都被盖 `com.apple.provenance`(11 字节)。
+2. **删不掉**:`removexattr` 和 `setxattr` 对这个名字都返回 0 而**什么也没改**(`xattr -d` 同样静默)。
+3. 盖章的时机不只是创建:**`rename(2)` 也算**——把一个没盖章的文件 `mv` 进自己的目录,它就被盖上了。
+4. **只有整目录 `clonefile(2)` 原样保留"没有 xattr"这个状态**;逐文件 `clonefile` 不保留(那个克隆是本进程创建的文件,照盖)。
+   这条同时解释了 T2.4 里"真实树 94% 命中 `EF_NO_XATTRS`、合成树一次都不命中"的差别:真实树是整目录克隆来的。
+5. 本机上它的值是常数(同一台机器、不同签名标识、sandbox-exec 里、shell 重定向,取到的 11 字节完全一样)。
+
+它是**内核记的"哪个 app 建了这个文件"**,不是工作区状态。于是:
+
+- **默认不比较它**,并且**在"要不要比较"的判断里也不算数**:`EF_NO_XATTRS` 没置位时,先 `listxattr` 拿名字、
+  把 provenance 滤掉再判——**只剩 provenance 的文件等同于"一个 xattr 都没有"**,和文件系统自己置了位一样。
+- `world fs diff --all-xattrs`(`WFS_DIFF_ALL_XATTRS`)把它放回来。
+- **`com.apple.quarantine` 和其他所有名字照常比较**——那些是工作区身上发生的事。
+
+**实测**(库内计时,合成 fixture,每个文件都有 provenance,所以捷径一次都不触发;best of 3):
+
+| `diff --full` | 50k / 800 改动 | 10k / 850 改动 |
+|---|---|---|
+| 本次之前(= 现在的 `--all-xattrs`) | 1.303–1.310 s | 0.157–0.159 s |
+| **默认(忽略 provenance)** | **0.231–0.240 s** | **0.047–0.048 s** |
+| `--no-xattr` | 0.123–0.130 s | 0.026–0.027 s |
+
+确认这一个内核写的属性两边一样,占了默认全扫的 **5/6**:每个"其他都一样"的文件 2 次 `listxattr` + 4 次 `getxattr`
+(`getxattr` 14 µs 才是大头)。剩下高出 `--no-xattr` 的那 0.11 s,是还得问一次名字的那 2 次 `listxattr`。
+整条 CLI 计时的复核(`m1_criteria.sh --only 5`,50k/800):默认 1.420 → **0.267 s**,`--no-xattr` 0.185 → 0.154 s。
+
+**测试**(`diff_test` 新增 `provenance` 一节,5 条断言)。要造一个"只差 provenance"的差异,得有一个内核没盖章的文件,
+而按上面第 4 条,唯一的来路是整目录 `clonefile`:fixture 在候选目录里找一个自己没有任何 xattr 的小目录
+(`~/Library`、`/Library`、`/Applications`,找不到就跳过并说明),整目录克隆**直接克隆进源树**(不能 `mv`,见第 3 条),
+只留那一个文件;然后在 World 里用一个字节相同的新文件覆盖它并把 mode/时间戳放回去——两边 `stat(2)` 看到的一切都相同,
+唯一的差别就是内核刚盖上的那个 provenance。结果:默认**不报**,`--all-xattrs` 报 `T`,`--no-xattr` 一条不报,
+全扫和候选(FSEvents)两条路一致。同一棵树里给邻居文件加一个 `com.apple.quarantine`,两种模式都报 `T`
+——证明这不是"忽略 `com.apple.*`"。
+
+#### P17 store 完整性(2026-09-19)
+
+**风险**:store 目录还在、`snapshots/` 里还有树,但 `metadata.db` 没了(误删、备份还原了半套、磁盘错误)。
+从前 `wfs_store_open` 会**静默新建一个空库**——id 是从库里发的,新库再发一次 1,下一次 `init` 就往已经在磁盘上的
+`snapshots/S1` 上写。
+
+**做法**:`wfs_store_open` 在创建任何东西之前先判:`metadata.db` 不存在 / 是空文件 / 读不了 /
+打开后连 pragma 都执行不过(根本不是数据库),**而** `snapshots/`、`trash/`、`pool/` 里还有条目
+→ `WFS_E_STORE_DAMAGED`(-1017)。检测只是对这三个目录各一次 readdir,**快照的 gate 一路关着也照样发现**
+(不需要进 `S<n>/root`)。空目录不算损坏,那是新 store。
+
+**CLI 把话说全**:这些树就是那个数据库的索引、id 会撞车、**`gc --reconcile` 帮不上忙**
+(它要读数据库才知道哪些行的树没了,而这里没的正是数据库),出路只有两条——从备份恢复 `metadata.db`,
+或者把整个目录挪开(`mv <store> <store>.damaged`)重开一个。**不提供 `store repair --scan`**:
+从磁盘上的树反推出 id、名字、来源快照、fork 时的 FSEvents 游标是猜,猜错比拒绝更坏。
+
+**测试**:`core_test` 一节(拒绝、拒绝之后**没有**留下新库、"文件在但不是数据库"同样拒绝、空目录照常打开);
+`safety.sh` 新增 7 条 CLI 用例(含"树一动没动"和那句 `gc --reconcile` 的解释),全套 **142 passed, 0 failed**。
+
+#### M2 验收(T2.1–T2.5 + P17,2026-09-19)
+
+- `scripts/tests/safety.sh`:**142 passed, 0 failed**(M1 结束时 93 → T2.3 时 130 → T2.5 时 135 → P17 的 7 条)。
+- `ctest`:全新配置的两个构建目录,WFS_FSKIT=OFF **2/2**、WFS_FSKIT=ON **3/3**;
+  FSKit 那侧只剩 4 条 `FSVolume*Operations` 的 deprecated 警告(冻结的旧 API,与本轮无关)。
 - `scripts/check-deps.sh`:两个构建目录的全部产物都只链接系统库。
+- `diff_test` 连跑 **10 次 10/10**。
+- `m1_criteria.sh --only 1`(fork 延迟):pool 命中 p50 **9.2 / 9.4 / 9.5 ms**(1k/10k/50k),M1 那轮是 8.6 / 9.0 / 9.7
+  ——最差格反而好了 0.2 ms,另两格 +0.4/+0.6 ms 在机器负载噪声里(开跑时 uptime 2.86),门槛 <10 ms 仍然达成。
+- `m1_criteria.sh --only 5`(diff):默认全扫 1.420 → **0.267 s**,`--no-xattr` 0.185 → **0.154 s**,
+  `--events` 0.354 → 0.228 s。结论不变:50k 上全扫仍然比事件路径快,默认不动。
+- 真实 FSKit 挂载复核(`bundle.sh Release` → `world fs mount W2` → `smoke.sh` → `umount`):
+  `mount(8)` 里看得到 `(worldfs, local, …, fskit)`,smoke **ALL OK**(read/readdir/stat/write/append/truncate/
+  mkdir/rename/unlink/rmdir/symlink/hardlink/chmod/xattr/mmap/fsync),卸载后 `mount | grep worldfs` 为空,
+  container store 里 `S1 s27` + `W1/W2/W3` 一动没动。
