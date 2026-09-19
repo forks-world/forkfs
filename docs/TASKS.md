@@ -1244,6 +1244,43 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第十三轮:看不了不是空的,数对了不是真的(2026-09-20)
+
+第十三轮,Codex 两条:一条 P1、一条 P2。两条各自是前面两轮的延伸,而且都是同一种错觉——
+**把"我没查出问题"当成了"没有问题"**。P1 是第十二轮那条 `exists()` 规则的最后一个漏网之处,
+只不过这次的系统调用是 `opendir(2)`:读不了的目录被当成了空目录。P2 是第八/九/十一轮那三道清单
+检查的尽头:那些检查全是**数数**,而清单自己数得对并不等于它描述的是那棵树——查清单查不出清单
+自己的错,得去问那棵不可变的树。
+**一条一个提交、一个测试,先验证过"没有修复就会红"。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `PRRT_kwDOUf7jGc6kCO5d` | `store.cpp` `wfs_store_open()` 里的 P17 守卫 | `metadata.db` 不在时,守卫靠对 `snapshots/`、`trash/`、`pool/` 各做一次 `opendir(2)` 来判断这个 store 是不是真的空的,而失败被静静跳过(`if (!d) continue;`)。EACCES、EIO、卷没挂上,于是统统读成"里面没东西":open 就在那些树旁边**新建了一个数据库和一个新的 store id**。这比没有守卫还糟——从那一刻起库**在**了,以后每一次 open 都走"库可读"那条路,守卫**再也不会跑第二遍**,id 从 1 重新发,下一次 `init` 写到已经在磁盘上的 `snapshots/S1` 上 | 第十二轮那条规则,这次落在 `opendir(2)` 上:只有 ENOENT 算"这个子目录不在,所以里面不可能有东西",别的 errno 都不是答案。`store_has_trees()` 从 bool 改成 `1 / 0 / -errno`(`readdir(3)` 自己那个 errno 也算进去——它只能这样报错),`wfs_store_open` 拿到负值就在**创建任何东西之前**原样返回。`metadata.db` 自己那次 `stat(2)` 同理:不是 ENOENT 的失败一律挡回去,而不是判成"文件不在"。文件本身从来不会被顶掉——`SQLITE_OPEN_CREATE` 只建不存在的库,不会截断已有的,所以"在但打不开"照旧是 `WFS_E_STORE_DAMAGED`。(ABI 里没有第二个建 store 的入口要审:`wfs_store_open` 就是唯一一个,守卫在它最前面。)CLI 对"看不了"那几个 errno 把话说全:store 路径、errno,以及**什么都没建**,因为读不了的 store 不是空 store(P17) | `7164947` |
+| P2 `PRRT_kwDOUf7jGc6kCO5g` | `hardlinks.cpp` 清单组的校验 | 到这一轮为止,清单上的检查全是**数数**:`#hl` 头的组数/名字数(第八轮)、每组成员数对上它的 nlink(第九轮)、名字不重复、路径不越界(第十一轮)。有一种损坏把这些全保住了——**两个组之间互换一个成员**:`(a,b)`、`(c,d)` 写成 `(a,c)`、`(b,d)`,还是两个组、四个名字、每组 nlink 2、名字不重复、路径都在树内。重放于是把 `c` 链到 `a`、`d` 链到 `b`;而这四个文件是同一趟快照 walk 的克隆,size 和 mtime 一模一样,`restore_group()` 那道"它还是当初扫到的那个文件吗"的闸门也拦不住。fork 回 rc 0,World 里 `a`/`c` 焊成一个 inode、`c` 的内容彻底没了 | 清单查不出清单自己的错,因为出错的正是清单。**快照树才是不可变的原件**,所以拿它当权威:`hardlinks_verify_groups()` 在重放之前对每一组挨个 `lstat`——所有成员必须落在同一个 inode 上,且那个 inode 的 `st_nlink` **正好**等于组的成员数(正好而不是至少:快照发布时那个 inode 上只有这个组的这些名字)。第一个对不上的组就是 `-EINVAL` → `WFS_E_SNAPSHOT_DIRTY`。三个读清单的地方都做:从快照 fork、pool filler 的 `build_one()`、`wfs_snapshot_verify()`(运维就是从这里知道为什么)。前两处自己开 gate 窗口(gate 关着的根是 0000,底下什么名字都解析不了),失败就回滚、克隆不发布;`verify` 本来就在窗口里。**不能拿克隆去问**:clonefile 把每一条硬链接都断开了,克隆自己说不出哪些名字本来是一个 inode。从活 World fork 仍是第五轮那条(verify root = 那个 World,逐组核对、跳过并上报,而不是拒绝),活树本来就允许变。代价:每个硬链接名字一次 `lstat`——正是 `hardlinks.h` 一直给 verify 标的价;没有组的快照一次系统调用都不用加 | `92fcba4` |
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **243 passed, 0 failed**;`check-deps.sh` 全绿。
+(`m1_criteria.sh` 本轮跳过。)
+
+先把测试跑红过:
+
+- **P17(P1)**:一个有一个快照的 store,删掉 `metadata.db`,把 `snapshots/` `chmod 000`。老代码
+  `wfs_store_open()` 回 **0**——一个崭新的数据库和一个崭新的 store id 就建在那棵快照树旁边;
+  新代码回 `-EACCES`、`metadata.db` 没被建出来,权限还回去之后同一个 store 照旧报
+  `WFS_E_STORE_DAMAGED`(这是对那条规则的收窄,不是撤退)。
+- **组校验(P2)**:两对硬链接 `(a,b)`、`(c,d)` 的快照,四个文件 size 和 mtime 一样,清单 `hl`
+  段的第 1、2 行互换路径(计数一个都没动)。老代码:`verify` 回 **0、modified=0**;fork 回
+  **0**,World 里 `a`/`c` 一个 inode、`b`/`d` 一个 inode,四个文件读出来**全是 `aaaa`**——
+  `cccc` 没了。新代码:`verify`、`wfs_world_create`、`wfs_pool_fill` 三个都回
+  `WFS_E_SNAPSHOT_DIRTY`,`--to` 上什么都没有、克隆没留下、pool 还是空的。
+
+新增测试:
+
+- `core_test`(P17,接在原来那段 P17 测试后面):上面那个 `chmod 000` 的 `snapshots/`,
+  `-EACCES` + 没有新 `metadata.db`,权限还回去之后 `WFS_E_STORE_DAMAGED` 照旧。
+- `core_test`(组校验):互换之后 `verify`/fork/`pool_fill` 三条路径的拒绝、`--to` 干净、
+  世界表没多行、pool 没多条;把清单换回来之后,**同一个带 gate 的快照**照样 fork 成功、两对都
+  重新链上、各是各的内容——直接克隆和 pool 条目两条路都验(那也是"校验跑在 gate 窗口里"的对照)。
+
 #### PR #1 review 第十二轮:问不出来不等于不在(2026-09-20)
 
 第十二轮,Codex 四条:一条 P1、三条 P2。其中三条是**同一个缺陷**:`exists()`——`lstat(2)` /
