@@ -1244,6 +1244,56 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第七轮:谁在写锁下改状态,谁在期限下删树(2026-09-19)
+
+第七轮,Codex 三条(一条 P1、两条 P2)。P1 还是那条同一个主题的下一环:**改状态的一方也得在
+写锁下决定**——前六轮把 fork、pool、adopt 都搬进了写锁,`restore` 没有,它先读一眼"基线还
+ACTIVE",再搬树,再另起一个事务把世界写成 ACTIVE,于是 `discard S<n>` 正好挤在中间时**两边都
+成功**。两条 P2 都在 gc 的"便宜那一半"里,而且是第五轮和第六轮各自那条的**镜像**:半成品快照
+删不掉却照样删行(第五轮给 fork 临时树修过的洞),以及那一半里三处整棵树的删除**不看表**
+(第六轮给 pool 修过的洞)。
+**一条一个提交、一条一个测试,三个测试都先验证过"没有修复就会红"。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `4053506303` | `world.cpp:1483` | `wfs_world_restore()` 用一次**独立的 SELECT** 确认源快照还 ACTIVE,然后把树从 trash 搬回家,再用**另一个事务**把行写成 ACTIVE。`wfs_snapshot_discard` 的引用计数跑在 `BEGIN IMMEDIATE` 里,拒的是 ACTIVE 世界、CREATING 世界和 pool 条目——而此刻这个世界还是 **TRASHED,什么都不拒**。于是:restore 读到 ACTIVE → discard S<n> 通过、快照进 trash → restore 搬完树、把世界写成 ACTIVE。**两件事都成功了**,而只能成功一件:活着的世界没有基线,`diff` 和 `verify` 此后永远是 `WFS_E_SOURCE_GONE` | restore 改成 discard 那套**三步协议倒过来跑**:(a) 一个 `BEGIN IMMEDIATE`——行必须是 TRASHED、树没有在被删(`.deleting`)、`trash_path` 还是刚才看的那个、基线必须是 ACTIVE,**全部在事务里重读**,然后行进 `WFS_ST_TRASHING`(`trash_path` 不动,树还没搬);(b) rename 回家;(c) 一个事务:ACTIVE、清 `trash_path`、写 `dir_dev`/`dir_ino`。**让这个决定生效的是 TRASHING**:`snapshot_refs_locked()` 现在把 TRASHING 世界算成**硬引用**(原来和 TRASHED 混在一起,而 TRASHED 不拒),discard 照此拒绝——从那里看不出这条行是在去 trash 的路上还是在回家的路上,而两个方向都不能丢基线。崩溃**不需要新东西**:`trashing_recover()` 早就按 lstat 判 TRASHING 行——树在 `trash_path` → 回 TRASHED(rename 没发生,restore 也就没发生),树在家 → ACTIVE。它不必重新 stat `dir_dev`/`dir_ino`:世界的 trash 永远和世界同卷(`<store>/trash`,或者 discard 撞上 EXDEV 时世界旁边的 `.wfs-trash`),同卷 rename 保 inode。(b) 失败就用 `trashing_commit()` 把行放回 TRASHED——那正是这个 helper 的意思("树在 trash 里"),也正是恢复会给出的判定。崩溃缝多了 phase 2/3,**从 phase 2 返回 0** 就能让测试在窗口里跑完一整个 `discard S<n>` 再让 restore 继续 | `455db7b` |
+| P2 `4053506313` | `world.cpp:2627` | 生产者已经死掉的 CREATING 快照行,gc 对 `S<n>.wfs-tmp` 和 `S<n>` 各调一次 `fs_remove_tree`,**把两个返回值都扔掉**,然后删行。删不掉的 `S<n>`(EPERM、ACL、瞬时 EIO)从此**永久泄漏**:旁边那趟后缀扫描(`rm_tmp_in_store_dir`)只看 `*.wfs-tmp`,而唯一记得这个目录的那条行刚刚被删了。整整一棵克隆,`gc --status` 也看不见 | 和第五轮给 fork 临时树的修法一样,就在它下面那个分支:**两棵树都确认不在了才删行**。否则行留着(仍是 CREATING),记进 `wfs_gc_report::tmp_failed`,并套上同一套每条目失败计数(`gc_fail_bump`/`gc_fail_clear`,键是 `S<n>`)——前几次唤醒设 `work_remains`,之后每次照报但不再自己叫醒 worker。`wfs_gc_status()` 也把这些树数进 `creating_stranded`:对运维来说它和搁浅的 fork 临时树是同一件事(被一条 CREATING 行独占的空间),所以共用那行 `abandoned:`,措辞从"half-built fork tree"改成"half-built tree",`gc` 打的那条 note 同理 | `d0c2701` |
+| P2 `4053506322` | `world.cpp:2583` | gc 的"便宜那一半"在有期限的 trash 循环**前面**整个跑完,而里面有**三处**整棵树的删除从不看表:被遗弃的 fork 半成品克隆、半成品快照的 `S<n>`/`S<n>.wfs-tmp`,以及紧跟其后 `<store>/snapshots` 下的 `*.wfs-tmp` 后缀扫描。每一棵都是一整个工作区或一整棵源树的克隆——新用例里量到的,12 万条目要约 5 秒——于是两秒一轮的 worker、或者一次交互式 `gc`,可以在这里花掉几分钟。和第六轮 pool 那条是同一个洞 | 三处都收下本轮的期限:每条目之前看一次表,并把期限交给 `fs_remove_tree()`(它的遍历从第四轮起就是逐条目看表的),所以大树停在半路而不是只停在树与树之间。**超时不是失败,也不按失败处理**:行保持 CREATING 和它的 `tmp_path`,每条目失败计数**不动**(那是用来放弃"永远删不掉"的树的,是另一回事),`work_remains` 置位,并且**停下整个循环**而不是再开一棵同样做不完的树——和 `pool_collect()` 一个形状,留下的也正是后继会重新发现的形状。后缀扫描必须一起改,否则前两处白改:它删的就是 CREATING 循环刚停在上面的那些 `S<n>.wfs-tmp`,而且紧接着就跑、一口气删完。两个调用方本来就带着期限(worker 来自 `WORLD_GC_BATCH_SECS`,交互式 `gc`(不带 `--now`)从第六轮起也是同一个旋钮) | `521aba3` |
+
+**验收**:`safety.sh` **221 passed, 0 failed**(上一轮 207 → 本轮 +14:半成品快照留行 5 条、
+期限两处 9 条);`ctest`(WFS_FSKIT=OFF)**2/2**;`check-deps.sh` 全绿(没有新的系统调用、
+没有新的库)。
+
+三条都先把测试跑红过:
+
+- restore:把"TRASHING 世界算硬引用"从 discard 的拒绝里拿掉 → `core_test:1727` 的
+  `g_race_rc == WFS_E_SNAPSHOT_IN_USE` 红:discard 回 0、restore 也回 0,**两个都成功了**,
+  这就是这个 bug 的一句话版本。
+- 半成品快照:把"两棵树都没了才删行"换回老写法 → 五条里红四条,行没了(rows 0)而树还在磁盘上,
+  正是那次泄漏。
+- 期限:三处都不传期限 → 同一对一秒 wake 分别跑了 **4817 ms** 和 **4882 ms**(修好之后都是
+  1032 ms),把两棵树整个删光、两条行都埋了、什么都没报,九条里红六条。
+
+新增测试:
+
+- `core_test`(P1):自己的一个 store。**窗口里的交错**——世界在 trash 里,restore 提交完
+  TRASHING 行,就在那里跑一整个 `discard S<n>`:discard 必须是 `WFS_E_SNAPSHOT_IN_USE`,
+  restore 回 0,世界 ACTIVE 且在位,快照仍 ACTIVE,而且这个世界**还 diff 得动**、快照还
+  verify 得过。**反过来的顺序**:先 discard 快照,restore 就是 `WFS_E_SOURCE_GONE`,树还在
+  trash 里、行还是 TRASHED、家里什么都没有。**两个 kill**:停在 (a) 之后 → TRASHING、树在
+  trash、这期间快照**拿不走**,store open 判回 TRASHED;停在 (b) 之后 → TRASHING、树在家,
+  store open 判成 ACTIVE 而且世界 diff 得动。
+- `safety.sh`(半成品快照):把一条生产者已死的 CREATING 快照行直接写进一个**自己的 store**
+  (别的 store 会被它占掉上面那些用例按名字点到的快照号),在 `<store>/snapshots/S<n>` 下放一个
+  文件,用"删不掉的 trash 条目"那条用例同一个 `deny delete,delete_child` ACL 锁住。gc 必须
+  留着行、说树删不掉、在 `gc --status` 里数出来;撤掉 ACL,下一次 gc 把树和行一起收掉。
+- `safety.sh`(期限):两处各一个自己的 store,免得互相花对方的预算、或者被对方的 worker 收掉。
+  一条生产者已死的 CREATING 世界行配一棵 **12 万条目**的 `tmp_path` 树,和一条 CREATING 快照行
+  配一棵 12 万条目的 `S<n>.wfs-tmp`;一秒预算的 `gc` 要按时回来、行还是 CREATING、树还剩一部分、
+  输出里说自己交班了、**并且不把超时报成删不掉**,然后一次不带预算的 `gc` 收干净。这两棵树是
+  对目录做一次 `clonefile(2)` 克隆出来的(一秒,`cp -Rc` 要十五秒),源就是上面 pool 那条用例
+  已经建好的那棵。
+
 #### PR #1 review 第六轮:还得住的基线,还得算数的期限(2026-09-19)
 
 第六轮,Codex 四条(一条 P1、三条 P2)。P1 还是"**谁在写锁下数引用**":fork 和 pool 上一轮都
