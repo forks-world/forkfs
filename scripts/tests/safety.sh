@@ -704,6 +704,59 @@ EOF
 then ok T2.3 "a pool-served world's .world names its store path too"
 else bad T2.3 "a pool-served world's .world names its store path too"; sed 's/^/        /' "$SCRATCH/t23.log"; fi
 
+# ---- PR #1 review (17th round, P2): a marker that names another store is a refusal -------------
+# The extension opens the path it finds in the marker and falls back to its own container default
+# only when it obtained no path at all (WorldVolume.mm). So a store that has moved since the world
+# was forked, or a world copied out of somebody else's store, would make a mount serve a different
+# store from the one the command is talking to -- and the CLI used to print a note promising a
+# fallback that does not happen. `fs verify` is where that is said now, and where it is fixed.
+# (`fs mount` itself only exists in an -DWFS_FSKIT=ON build and is not exercised here: nothing in
+# this script ever mounts anything. It asks the same question of the same core call.)
+w2 fs fork --from S3 --to "$SCRATCH/t-h" --no-pool > /dev/null
+mkdir -p "$SCRATCH/store3"
+python3 - "$SCRATCH/t-h/.world" "$SCRATCH/store3" <<'EOF'
+import json,sys
+m=json.load(open(sys.argv[1]))
+m["store_path"]=sys.argv[2]
+open(sys.argv[1],"w").write(json.dumps(m,indent=2))
+EOF
+check T2.3 "a world whose .world names another store path is refused" 3 -- w2 fs verify "$SCRATCH/t-h"
+w2 fs verify "$SCRATCH/t-h" > "$SCRATCH/t23b.log" 2>&1
+if grep -q "store3" "$SCRATCH/t23b.log" && grep -q "$S2" "$SCRATCH/t23b.log"; then
+    ok T2.3 "the refusal names both stores"
+else
+    bad T2.3 "the refusal names both stores"; sed 's/^/        /' "$SCRATCH/t23b.log"
+fi
+has_hint T2.3 "and says how to fix it" "refresh-marker" -- w2 fs verify "$SCRATCH/t-h"
+# The way out, for the same store under a new path: the store id still matches, so only the path
+# is rewritten -- the world id, the name, the origin snapshot and created_at stay as they were.
+before=$(python3 -c 'import json,sys;m=json.load(open(sys.argv[1]));print(m["world"],m["name"],m["snapshot"],m["created_at"])' "$SCRATCH/t-h/.world")
+w2 fs verify "$SCRATCH/t-h" --refresh-marker > "$SCRATCH/t23c.log" 2>&1
+grep -q "store path refreshed" "$SCRATCH/t23c.log" && ok T2.3 "--refresh-marker rewrites the path" \
+                                                   || { bad T2.3 "--refresh-marker rewrites the path"; sed 's/^/        /' "$SCRATCH/t23c.log"; }
+check T2.3 "and the world verifies clean afterwards" 0 -- w2 fs verify "$SCRATCH/t-h"
+after=$(python3 -c 'import json,sys;m=json.load(open(sys.argv[1]));print(m["world"],m["name"],m["snapshot"],m["created_at"])' "$SCRATCH/t-h/.world")
+if [ "$before" = "$after" ] && python3 - "$SCRATCH/t-h/.world" "$S2" <<'EOF'
+import json,sys,os
+m=json.load(open(sys.argv[1]))
+sys.exit(0 if os.path.realpath(m.get("store_path","")) == os.path.realpath(sys.argv[2]) else 1)
+EOF
+then ok T2.3 "the refresh changes the store path and nothing else"
+else bad T2.3 "the refresh changes the store path and nothing else"; fi
+# A marker whose store ID is somebody else's is not a relocation: P1/P2 say that is another
+# store's world, and --refresh-marker will not take it over (that is what `adopt` is for).
+python3 - "$SCRATCH/t-h/.world" <<'EOF'
+import json,sys
+m=json.load(open(sys.argv[1]))
+m["store"]="0123456789abcdef0123456789abcdef"
+open(sys.argv[1],"w").write(json.dumps(m,indent=2))
+EOF
+check T2.3 "a marker from a foreign store is refused" 3 -- w2 fs verify "$SCRATCH/t-h"
+check T2.3 "and --refresh-marker does not take it over" 3 -- w2 fs verify "$SCRATCH/t-h" --refresh-marker
+python3 -c 'import json,sys;sys.exit(0 if json.load(open(sys.argv[1]))["store"]=="0123456789abcdef0123456789abcdef" else 1)' "$SCRATCH/t-h/.world" \
+    && ok T2.3 "the foreign marker is left exactly as it was" \
+    || bad T2.3 "the foreign marker is left exactly as it was"
+
 # ---- T2.5 (P9): hardlinks inside a tree are rebuilt inside every clone of it --------------------
 # $PROJ/src/a.c and $PROJ/src/a-link.c are one file with two names (line 56). clonefile breaks
 # that (CLONE_MODEL_MACOS27 §11); the snapshot's manifest carries the group and every clone --

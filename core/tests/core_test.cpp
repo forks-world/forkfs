@@ -203,6 +203,25 @@ static void swap_hl_paths(const char *manifest, size_t i, size_t j) {
 
 static int exists(const char *p) { struct stat st; return lstat(p, &st) == 0; }
 
+// PR #1 review (17th round, P2): one string value of a world's `.world` marker, rewritten. The
+// marker is the small JSON marker_text() writes, and what a relocated store or a stale marker
+// leaves behind is exactly this: one key with another store's path in it.
+static void marker_set_str(const char *world_root, const char *key, const char *value) {
+    char mp[4096], buf[8192], out[8192], pat[128];
+    join(mp, sizeof mp, world_root, ".world");
+    CHECK_OK(read_file(mp, buf, sizeof buf));
+    snprintf(pat, sizeof pat, "\"%s\": \"", key);
+    char *at = strstr(buf, pat);
+    CHECK(at);
+    char *val = at + strlen(pat);
+    char *end = strchr(val, '"');
+    CHECK(end);
+    size_t head = (size_t)(val - buf);
+    memcpy(out, buf, head);
+    snprintf(out + head, sizeof out - head, "%s%s", value, end);
+    write_file(mp, out);
+}
+
 // ---- PR #1 review (11th round): a database of the shape schema 2 had before the ALTERs -------
 static void db_exec(const char *path, const char *sql) {
     sqlite3 *db = NULL;
@@ -4358,6 +4377,106 @@ int main() {
         CHECK_OK(wfs_world_discard(ys, yw1, 1, 0));
         wfs_store_close(ys);
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", ystore, (unsigned long long)y1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
+    // ---- PR #1 review (17th round, P2): the marker's store path is a verdict, not a note ----
+    //
+    // `-o` options do not reach an FSKit module on macOS 27, so the extension reads the store's
+    // location out of the mount source's `.world` marker -- and it uses that path whenever it is
+    // non-empty, falling back to its own container default only when it obtained no path at all
+    // (macos/fskit/WorldVolume.mm). A marker naming a store that is not the one the command
+    // opened therefore mounts a DIFFERENT store: its world ids mean other worlds, and `world=<n>`
+    // in the mount options is resolved against it. The CLI used to print a note promising a
+    // fallback that the extension does not perform, and mount anyway.
+    //
+    // So the question is asked of the core, with the two answers P1/P2 already distinguish: the
+    // same store under a new path (same store id -- refreshable) or somebody else's store
+    // (different store id -- `adopt`'s business, never rewritten here).
+    {
+        char nstore[4096], nother[4096], nsrc[4096], nw[4096], nw2[4096];
+        join(nstore, sizeof nstore, root, "mk-store");
+        join(nother, sizeof nother, root, "mk-other");
+        join(nsrc, sizeof nsrc, root, "mk-src");
+        CHECK(mkdir(nsrc, 0755) == 0);
+        join(p, sizeof p, nsrc, "f.txt");
+        write_file(p, "mk\n");
+
+        wfs_store *ns = NULL, *no = NULL;
+        CHECK_OK(wfs_store_open(nstore, &ns));
+        CHECK_OK(wfs_store_open(nother, &no));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "mk";
+        wfs_id n1 = 0, o1 = 0;
+        CHECK_OK(wfs_snapshot_create(ns, nsrc, &sopts, &n1));
+        CHECK_OK(wfs_snapshot_create(no, nsrc, &sopts, &o1));
+        wfs_ref nf = {WFS_K_SNAPSHOT, n1}, of = {WFS_K_SNAPSHOT, o1};
+        memset(&opts, 0, sizeof opts);
+        opts.no_pool = 1;
+        join(nw, sizeof nw, worlds, "mk-w");
+        join(nw2, sizeof nw2, worlds, "mk-w-other");
+        wfs_id nw1 = 0, ow1 = 0;
+        CHECK_OK(wfs_world_create(ns, nf, nw, &opts, &nw1));
+        CHECK_OK(wfs_world_create(no, of, nw2, &opts, &ow1));
+
+        // As forked: this store, this path.
+        wfs_marker_store ms;
+        CHECK_OK(wfs_world_marker_store(ns, nw, &ms));
+        CHECK(ms.has_path == 1 && ms.same_store == 1 && ms.same_path == 1);
+        CHECK(!strcmp(ms.path, wfs_store_dir(ns)));
+
+        // The store moved (or the marker is stale): same store id, another path. This is what
+        // the CLI called "the extension will fall back" and mounted anyway.
+        marker_set_str(nw, "store_path", nother);
+        CHECK_OK(wfs_world_marker_store(ns, nw, &ms));
+        CHECK(ms.has_path == 1 && ms.same_store == 1 && ms.same_path == 0);
+        CHECK(!strcmp(ms.path, nother));
+        // A path that resolves nowhere at all is not this store either -- the extension's open(2)
+        // is the question being asked, not a spelling comparison.
+        join(p, sizeof p, root, "mk-gone");
+        marker_set_str(nw, "store_path", p);
+        CHECK_OK(wfs_world_marker_store(ns, nw, &ms));
+        CHECK(ms.has_path == 1 && ms.same_store == 1 && ms.same_path == 0);
+
+        // The way out: the path, and nothing else.
+        wfs_identity nid;
+        CHECK_OK(wfs_world_verify_identity(ns, nw, &nid));
+        wfs_world_rec nrec;
+        CHECK_OK(wfs_world_info(ns, nw1, &nrec));
+        CHECK_OK(wfs_world_marker_refresh(ns, nw));
+        CHECK_OK(wfs_world_marker_store(ns, nw, &ms));
+        CHECK(ms.has_path == 1 && ms.same_store == 1 && ms.same_path == 1);
+        wfs_identity nid2;
+        CHECK_OK(wfs_world_verify_identity(ns, nw, &nid2));
+        CHECK(nid2.world_id == nid.world_id && nid2.snapshot_id == nid.snapshot_id);
+        CHECK(!strcmp(nid2.name, nid.name) && !strcmp(nid2.store_id, nid.store_id));
+        CHECK(nid2.registered == 1);
+
+        // A marker written before T2.3 carries no path at all, and there the fallback is real:
+        // has_path 0, no refusal to make -- and the refresh is what writes one.
+        marker_set_str(nw, "store_path", "");
+        CHECK_OK(wfs_world_marker_store(ns, nw, &ms));
+        CHECK(ms.has_path == 0 && ms.same_store == 1 && ms.same_path == 0 && !ms.path[0]);
+        CHECK_OK(wfs_world_marker_refresh(ns, nw));
+        CHECK_OK(wfs_world_marker_store(ns, nw, &ms));
+        CHECK(ms.has_path == 1 && ms.same_path == 1);
+
+        // And somebody else's world: the store id says so, and the refresh refuses to take it
+        // over (P1/P2 -- that is what `adopt` is for) without touching a byte of its marker.
+        CHECK_OK(wfs_world_marker_store(ns, nw2, &ms));
+        CHECK(ms.has_path == 1 && ms.same_store == 0 && ms.same_path == 0);
+        CHECK(!strcmp(ms.path, wfs_store_dir(no)));
+        CHECK_RC(wfs_world_marker_refresh(ns, nw2), WFS_E_FOREIGN_STORE);
+        CHECK_OK(wfs_world_marker_store(no, nw2, &ms));
+        CHECK(ms.same_store == 1 && ms.same_path == 1);
+
+        CHECK_OK(wfs_world_discard(ns, nw1, 1, 0));
+        CHECK_OK(wfs_world_discard(no, ow1, 1, 0));
+        wfs_store_close(ns);
+        wfs_store_close(no);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", nstore, (unsigned long long)n1);
+        chmod(p, 0700);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", nother, (unsigned long long)o1);
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 

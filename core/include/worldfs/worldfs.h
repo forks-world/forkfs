@@ -423,6 +423,40 @@ typedef struct wfs_identity {
  * marker written before T2.3). */
 int wfs_marker_store_path(const char *world_root, char *buf, size_t cap);
 
+/* PR #1 review (17th round, P2): the same marker, asked about from the store's side.
+ *
+ * The extension opens the path the marker names and falls back to its container default only
+ * when it obtained no path at all (macos/fskit/WorldVolume.mm). So a marker whose store path is
+ * non-empty and is NOT this store's directory means a mount would open a different store from
+ * the one the command is talking to -- a store that has been moved since the world was forked,
+ * or a world copied out of somebody else's store. That is a refusal, not a note.
+ *
+ * `same_store` compares the marker's store id with this store's: the same store, wherever it
+ * now lives, or somebody else's (P1/P2). `same_path` is whether the recorded path resolves to
+ * this store's directory -- resolves, not is spelled the same, because that is the question the
+ * extension's open(2) will ask; a path that cannot be resolved at all is not this store.
+ * `has_path` is 0 for a marker written before T2.3, which carries no path and for which the
+ * extension's fallback is real.
+ *
+ * Returns 0 with `out` filled, or what marker_read says: WFS_E_NOT_A_WORLD, WFS_E_SCHEMA. */
+typedef struct wfs_marker_store {
+    int has_path;    /* the marker carries a store path at all */
+    int same_store;  /* its store id is this store's store id */
+    int same_path;   /* its store path resolves to this store's directory */
+    char path[WFS_PATH_MAX];   /* what it says, empty when has_path is 0 */
+} wfs_marker_store;
+int wfs_world_marker_store(wfs_store *s, const char *world_root, wfs_marker_store *out);
+
+/* The way out of the refusal above, when the store id still matches: the marker's store path is
+ * rewritten to where this store actually is, and nothing else in it changes -- same world id,
+ * same name, same origin snapshot, same created_at. P1/P2 decide who may: the world must be
+ * registered in THIS store (marker store id, row, and inode all agreeing), so a copy is
+ * WFS_E_UNREGISTERED and somebody else's world is WFS_E_FOREIGN_STORE, both of which are
+ * `adopt`'s business and not a refresh's. Takes the world lock (P12) like every other
+ * world-level operation, so it cannot run under a fork or a checkpoint of the same world, and
+ * the new marker is written beside the old one and renamed over it. */
+int wfs_world_marker_refresh(wfs_store *s, const char *world_root);
+
 /* P1/P2. On a registered-but-moved world the store row is updated to `path` before returning.
  * Returns WFS_E_NOT_A_WORLD, WFS_E_UNREGISTERED or WFS_E_FOREIGN_STORE as appropriate; the
  * report is filled in either way. */

@@ -180,6 +180,9 @@ struct MarkerData {
     char store_path[WFS_PATH_MAX] = {0};   // T2.3; empty in markers written before T2.3
     char name[WFS_NAME_MAX] = {0};
     wfs_id world = 0, snapshot = 0, parent = 0;
+    // PR #1 review (17th round, P2): parsed since the marker's store path can now be refreshed
+    // in place, and a refresh that forgot this would silently re-date the world.
+    int64_t created = 0;
 };
 
 int marker_read(const char *world_root, MarkerData &out) {
@@ -199,6 +202,7 @@ int marker_read(const char *world_root, MarkerData &out) {
     if (json_u64(buf, "world", &v)) out.world = v;
     if (json_u64(buf, "snapshot", &v)) out.snapshot = v;
     if (json_u64(buf, "parent", &v)) out.parent = v;
+    if (json_u64(buf, "created_at", &v)) out.created = (int64_t)v;
     if (out.schema != WFS_STORE_SCHEMA) return WFS_E_SCHEMA;
     return 0;
 }
@@ -2198,6 +2202,64 @@ extern "C" int wfs_marker_store_path(const char *world_root, char *buf, size_t c
     if (!m.store_path[0]) return -ENOENT;
     copy_str(buf, cap, m.store_path);
     return 0;
+}
+
+extern "C" int wfs_world_marker_store(wfs_store *s, const char *world_root, wfs_marker_store *out) {
+    if (!s || !world_root || !out) return -EINVAL;
+    memset(out, 0, sizeof *out);
+    String real;
+    if (int rc = wfs::fs_realpath(world_root, real)) return rc;
+    MarkerData m;
+    if (int rc = marker_read(real.c_str(), m)) return rc;
+    out->same_store = ::strcmp(m.store_id, s->store_id.c_str()) == 0 ? 1 : 0;
+    if (!m.store_path[0]) return 0;   // written before T2.3: the extension's fallback is real
+    out->has_path = 1;
+    copy_str(out->path, sizeof out->path, m.store_path);
+    // Resolved, not compared as text: the extension will open(2) this path, so the question is
+    // which directory it reaches. One that resolves nowhere is not this store's directory.
+    String mreal;
+    if (wfs::fs_realpath(m.store_path, mreal) == 0 && !::strcmp(mreal.c_str(), s->dir.c_str()))
+        out->same_path = 1;
+    return 0;
+}
+
+extern "C" int wfs_world_marker_refresh(wfs_store *s, const char *world_root) {
+    if (!s || !world_root) return -EINVAL;
+    wfs_identity id;
+    // P1/P2 decide who may: the marker's store id has to be this store's (anything else is
+    // WFS_E_FOREIGN_STORE from here), the row has to exist and the inode has to match it
+    // (WFS_E_UNREGISTERED otherwise). Both of those are `adopt`'s business, not a refresh's.
+    if (int rc = wfs_world_verify_identity(s, world_root, &id)) return rc;
+    if (!id.registered) return WFS_E_UNREGISTERED;
+    // P12: rewriting the marker is a world-level operation, so it serialises with the fork, the
+    // checkpoint and the discard that read it.
+    WorldLock lock;
+    if (int rc = lock.take(id.path)) return rc;
+    MarkerData m;
+    if (int rc = marker_read(id.path, m)) return rc;
+    // Everything but the path stays exactly as it was; the file is written beside the marker and
+    // renamed over it, so a crash leaves the old marker whole rather than a truncated one.
+    String text;
+    marker_text(text, s->store_id.c_str(), s->dir.c_str(), m.world, m.name, m.snapshot, m.parent,
+                m.created);
+    String dst = joinp(id.path, WFS_MARKER_NAME);
+    String tmp;
+    int fd = -1;
+    for (int t = 0; t < 8 && fd < 0; ++t) {
+        char leaf[96];
+        ::snprintf(leaf, sizeof leaf, ".world.wfs-%d-%d", (int)::getpid(), t);
+        tmp = joinp(id.path, leaf);
+        // O_EXCL is the claim: nothing that is not ours is ever written to or unlinked here.
+        fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (fd < 0 && errno != EEXIST) return -errno;
+    }
+    if (fd < 0) return -EEXIST;
+    ssize_t n = ::write(fd, text.c_str(), text.size());
+    int rc = (n == (ssize_t)text.size()) ? 0 : -EIO;
+    ::close(fd);
+    if (!rc) rc = wfs::fs_rename(tmp.c_str(), dst.c_str());
+    if (rc) ::unlink(tmp.c_str());
+    return rc;
 }
 
 extern "C" int wfs_world_verify_identity(wfs_store *s, const char *path, wfs_identity *out) {

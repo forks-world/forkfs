@@ -63,7 +63,12 @@ static void usage(void) {
           "  pool fill S<n> [--count K]       top the pool up to K ready entries (default 2)\n"
           "  pool drain S<n>|--all            delete the pool entries of a snapshot\n"
           "  status                           store, counts, free space\n"
-          "  verify S<n>|W<n>|<path>          snapshot integrity, or world identity\n"
+          "  verify S<n>|W<n>|<path> [--refresh-marker]\n"
+          "                                   snapshot integrity, or world identity. A world whose\n"
+          "                                   .world marker names a store path that is not this\n"
+          "                                   store's is refused (a mount would open that one);\n"
+          "                                   --refresh-marker rewrites the path when the store id\n"
+          "                                   still matches -- i.e. when this store has moved\n"
           "  adopt <path> [--name N]          register an unregistered copy as a new world\n"
 #ifdef WFS_FSKIT
           "  mount <W> <mountpoint> | umount <mountpoint> | fsstatus   (FSKit frontend)\n"
@@ -1310,9 +1315,27 @@ static int cmd_status(wfs_store *s) {
     return EX_OK;
 }
 
-static int cmd_verify(wfs_store *s, const char *arg) {
+// PR #1 review (17th round, P2): `--refresh-marker`. The FSKit extension reads the store's
+// location out of the world's `.world` marker and opens exactly that path, so a store that has
+// moved since the world was forked leaves every one of its worlds pointing at a directory that
+// is not this store any more. `verify` is the command that asks whether a world is what it says
+// it is, so it is also the one that can put that right -- for THIS store's own worlds only
+// (P1/P2: same store id, same row, same inode), and only the path changes.
+static int cmd_verify(wfs_store *s, int argc, char **argv) {
+    const char *arg = NULL;
+    int refresh = 0;
+    for (int i = 0; i < argc; ++i) {
+        if (!strcmp(argv[i], "--refresh-marker")) refresh = 1;
+        else if (argv[i][0] != '-' && !arg) arg = argv[i];
+        else usage();
+    }
+    if (!arg) usage();
     wfs_ref r = parse_ref(arg);
     if (r.kind == WFS_K_SNAPSHOT && r.id) {
+        if (refresh) {
+            fprintf(stderr, "world: --refresh-marker is about a world's .world marker; %s is a snapshot\n", arg);
+            return EX_USAGE;
+        }
         wfs_verify_report rep;
         int rc = wfs_snapshot_verify(s, r.id, &rep);
         printf("S%llu: %llu entries checked, %llu missing, %llu modified, %llu unprotected, %llu extra,"
@@ -1343,6 +1366,43 @@ static int cmd_verify(wfs_store *s, const char *arg) {
     if (rc == 0) {
         printf("%s: world W%llu '%s' at %s (inode %llu)%s\n", where, (unsigned long long)id.world_id, id.name,
                id.path, (unsigned long long)id.ino, id.moved ? " [path repaired]" : "");
+        // T2.3, and PR #1 review (17th round, P2): the marker's store path is the only channel a
+        // mount has to tell the sandboxed extension which store this world belongs to, and the
+        // extension opens it as it stands. One that does not resolve to this store's directory
+        // is therefore a mount of a different store -- so it is said here, where it can still be
+        // fixed, rather than discovered as "POSIX error 1009" or, worse, not discovered at all.
+        wfs_marker_store ms;
+        int mrc = wfs_world_marker_store(s, id.path, &ms);
+        if (mrc == 0 && !(ms.has_path && ms.same_path)) {
+            if (refresh && ms.same_store) {
+                int frc = wfs_world_marker_refresh(s, id.path);
+                if (frc) return fail("verify", frc);
+                printf("%s: .world store path refreshed: %s -> %s\n", where,
+                       ms.has_path ? ms.path : "(none)", wfs_store_dir(s));
+                return EX_OK;
+            }
+            // No path at all (a world forked before T2.3): the extension's fallback to its own
+            // container default is real there, so this one is a note.
+            if (!ms.has_path) {
+                printf("%s: .world carries no store path; a mount falls back to the extension's "
+                       "container default\n", where);
+                return EX_OK;
+            }
+            char why[2 * WFS_PATH_MAX + 256];
+            snprintf(why, sizeof why,
+                     "%s/.world names the store at %s, but this is the store at %s.\n"
+                     "world:   a mount hands that path to the FSKit extension, which opens it as it "
+                     "stands -- %s",
+                     id.path, ms.path, wfs_store_dir(s),
+                     ms.same_store
+                         ? "this is the same store, moved since the world was forked"
+                         : "and that is a DIFFERENT store id: this world was forked out of somebody "
+                           "else's store (P1/P2)");
+            return refuse(why, ms.same_store ? "world fs verify <world> --refresh-marker"
+                                             : "open the store its marker names, or `world fs adopt <path>` "
+                                               "to take the copy over as a world of this store");
+        }
+        if (refresh) printf("%s: .world already names this store (%s)\n", where, wfs_store_dir(s));
         return EX_OK;
     }
     if (rc == WFS_E_UNREGISTERED || rc == WFS_E_NOT_A_WORLD) return explain_path(s, id.path[0] ? id.path : arg, rc, "verify");
@@ -1720,7 +1780,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(sub, "gc")) ret = cmd_gc(s, nargs, args);
     else if (!strcmp(sub, "pool")) ret = cmd_pool(s, nargs, args);
     else if (!strcmp(sub, "status")) ret = cmd_status(s);
-    else if (!strcmp(sub, "verify")) ret = (nargs == 1) ? cmd_verify(s, args[0]) : (usage(), EX_USAGE);
+    else if (!strcmp(sub, "verify")) ret = cmd_verify(s, nargs, args);
     else if (!strcmp(sub, "adopt")) ret = cmd_adopt(s, nargs, args);
 #ifdef WFS_FSKIT
     else if (!strcmp(sub, "mount")) {
@@ -1758,13 +1818,43 @@ int main(int argc, char **argv) {
                 return refuse(why, hint);
             }
             // The marker is how the path gets there; a world forked by an older build has none.
-            char sp[WFS_PATH_MAX] = {0};
-            int mrc = wfs_marker_store_path(r.path, sp, sizeof sp);
-            if (mrc != 0 || strcmp(sp, store) != 0)
+            //
+            // PR #1 review (17th round, P2): and a marker that names a DIFFERENT store is not a
+            // note. WorldVolume.mm / WorldVolumeHandler.mm take the marker's path whenever it is
+            // non-empty and fall back to the container default only when they obtained no path
+            // at all -- so a store that has moved, or a world copied out of another store, makes
+            // the mount open the store the marker names while every other command in this
+            // invocation is talking to the store the CLI opened. Two stores, one mount point,
+            // and the world ids in `-o world=<n>` mean different things in each.
+            wfs_marker_store ms;
+            int mrc = wfs_world_marker_store(s, r.path, &ms);
+            if (mrc == 0 && ms.has_path && !ms.same_path) {
+                char why[2 * WFS_PATH_MAX + 320], hint[WFS_PATH_MAX + 96];
+                snprintf(why, sizeof why,
+                         "%s/.world names the store at %s, but this command opened the store at %s.\n"
+                         "world:   the extension cannot be told which store to use (`-o` options do not\n"
+                         "world:   reach an FSKit module on macOS 27): it opens the path in the marker,\n"
+                         "world:   so this mount would serve a different store from the one you asked\n"
+                         "world:   about -- %s",
+                         r.path, ms.path, store,
+                         ms.same_store ? "the same store, moved since this world was forked"
+                                       : "and its store id is not this store's either (P1/P2)");
+                if (ms.same_store)
+                    snprintf(hint, sizeof hint,
+                             "world fs verify W%llu --refresh-marker   (then mount again)",
+                             (unsigned long long)w);
+                else
+                    snprintf(hint, sizeof hint,
+                             "mount it from the store its marker names, or `world fs adopt %s`", r.path);
+                wfs_store_close(s);
+                return refuse(why, hint);
+            }
+            if (mrc != 0 || !ms.has_path)
                 fprintf(stderr,
-                        "world: note: %s/.world does not name this store, so the extension will fall\n"
-                        "world:       back to its container default. Re-fork the world to refresh it.\n",
-                        r.path);
+                        "world: note: %s/.world carries no store path (it was forked before T2.3), so\n"
+                        "world:       the extension will fall back to its container default.\n"
+                        "world:       `world fs verify W%llu --refresh-marker` writes it.\n",
+                        r.path, (unsigned long long)w);
         }
         char opt[64];
         mkdir(args[1], 0755);
