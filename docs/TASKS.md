@@ -1244,6 +1244,51 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第十一轮:写下来的事情要真的做到了才算数(2026-09-20)
+
+第十一轮,Codex 三条,全是 P2,而且是同一句话的三个位置:**一件事做没做成,要以它真的做成了
+为准,不能以"我发了那条指令"为准。** 迁移发了 `ALTER TABLE` 就盖上版本戳、清单读回来只数数不查
+名字、清扫删完了树不看树还在不在——三处都是把"我试过了"当成了"它成了"。
+**一条一个提交、一个测试,先验证过"没有修复就会红"。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P2 `PRRT_kwDOUf7jGc6kBfvv` | `store.cpp` `wfs_store_open()` | 增量迁移的每条 `ALTER TABLE` 结果都被丢掉,然后照样把 `PRAGMA user_version` 盖成当前修订号。这只有在"ALTER 唯一可能的失败是 duplicate column name"时才成立,而它不是:EIO、磁盘满、熬过 10 s busy timeout 的 SQLITE_BUSY、SQLite 只能只读打开的库,失败的都是同一个调用。于是 store 被盖成"已迁移"而列是缺的——**而版本戳正是决定要不要跑迁移的唯一依据**,所以之后每一次打开都不会再试,凡是提到那个列的 prepare 从此永远失败,store 里没有任何东西说得出为什么 | 整个迁移放进**一个事务**,而且**结论来自 schema 而不是来自语句的返回值**:`kMigrations` 每条带上它要加的表名和列名;`PRAGMA table_info` 说列已经在了就**跳过**(列已经在不是"要容忍的失败",是"这一步没事可做",因此全程不匹配任何错误字符串);真正跑的每一步都查返回值;最后再拿 `table_info` 问一遍**每一个列都在**,才写版本戳。任何一步不对就整体回滚(建表 DDL 一起回滚,`PRAGMA user_version` 是库头的一次写,也跟着事务回滚),`wfs_store_open` 返回 `-EIO`,store 原封不动、**没有盖戳**,所以下一次打开就是重试。`Txn` 加 `begin_rc` / `commit_rc()` 给这唯一一个必须知道结果的调用者用 | `a321da3` |
+| P2 `PRRT_kwDOUf7jGc6kBfvy` | `hardlinks.cpp` `hardlinks_manifest_read()` | 第八、第九轮加的清单校验全是**计数**:`#hl` 头里的组数/名字数,以及每组正好是它声明的 `nlink` 那么大。有一种损坏把这些全保住了——**某个成员重复出现**:重复在自己组里,或者顶掉邻组的一个成员。重放拿这个重复的名字没辙(它本来就是正身那个 inode,于是被记成"已经链好了"),而被它顶掉的那个成员根本不在清单里了,于是 fork 回 0、快照里是一个 inode 两个名字的地方,克隆出来是两个独立 inode。跨组更糟:被塞进来的名字会拿**另一个组**的正身去链,而两边的 size/mtime 都来自同一次克隆,重放那道"这还是扫描时看到的那个文件吗"的闸门放行,**克隆里的内容被覆盖** | 名字是一条 dirent,扫描只会记一次,所以重复**按构造就是损坏**。读回来之后把所有成员路径收进一个 `Vec`、排序、相邻相等就 `-EINVAL`(到调用者是 `WFS_E_SNAPSHOT_DIRTY`)——一次 qsort,而且绝大多数树里这个集合是空的。顺带按要求审了路径本身,又揪出一个洞:**成员路径从来没有被校验过是不是树内相对路径**。重放是拿这些名字对着克隆的根解析的,所以 `../escape` 就是用户自己目录里、fork 临时名旁边的一个文件,`link(2)` + `rename(2)` 会把组的正身 inode 盖上去。空路径、开头的 `/`、任何 `..` 分量现在一并拒绝 | `779ed84` |
+| P2 `PRRT_kwDOUf7jGc6kBfv0` | `world.cpp` `rm_tmp_in_store_dir` | 清扫把 `fs_remove_tree` 的结果丢了。`<store>/snapshots` 下没有任何行认领的 `S<n>.wfs-tmp` 要是删不掉(ACL、EPERM、一次没那么"瞬时"的 EIO),它不进报表、不置 `work_remains`,而 `wfs_gc_pending()` 只给 trash 分类,于是**没有任何人会回来找它**:树一直留在 store 里,直到有人手动跑 gc。collector 里别的删不掉的东西从第五、第七、第八轮起都会说话,就剩这一处不说 | 试完之后树还在,就计进 `rep.tmp_failed`、给共享失败计数器加一、在 `kGcFailCap` 以内置 `work_remains`——和 trash 条目、半成品 fork 树、过期 pool 条目同一个上限、同一条"报出来,但永远不报成已经没了"的规则。它**没有行**可以做 key(没人认领正是它归清扫管的原因),所以按**路径**记,跟 `pool.cpp` 给自己那些无行树的做法一样。deadline 中途停下**不算失败**、不计数(下次唤醒它照样是棵无行的树);树没了就清掉计数器。`wfs_gc_status` 也数它们,就数在第七轮给半成品快照的那条 `abandoned:` 里:一次 readdir,由 `snap_tmp_named_by_row()` 判定,所以和上面那趟 CREATING 循环**按构造不重叠**。交互式 `gc` 本来就看 `rep.work_remains` 决定要不要起 worker(第六轮),链条原样接上;那条提示改成"任何认领它的行都会留着"——原来的"它的记录会留着"对这一种树从来不成立 | `8f25a2f` |
+
+**验收**:`safety.sh` **240 passed, 0 failed**(236 → 240,第三条新增 4 例);
+`ctest`(WFS_FSKIT=OFF)**2/2**;`check-deps.sh` 全绿。
+
+先把测试跑红过:
+
+- **迁移**:按 schema 2 最初的样子造一个库(基础表,后来加的 13 个列一个都没有),再把
+  `snapshots` 换成一个 view(`CREATE TABLE IF NOT EXISTS` 于是静静地什么都不做,第一条 ALTER
+  回 `Cannot add a column to a view`,而它后面那条 `PRAGMA` 成功)——这正是 EIO / 丢掉的
+  SQLITE_BUSY 的形状,也是唯一一种测试能随时造出来的。老代码:`wfs_store_open()` 返回 **0**,
+  `user_version` 从 **200 变成 204**,`snapshots` 的 8 个列一个都没加上,而碰巧能跑的 5 个
+  自己加上了。
+- **清单**:两个三成员组,六个文件同一个 size 同一个 mtime(免得重放那道闸门误打误撞救了场),
+  三份损坏的清单 —— `a3` 换成第二个 `a1`、`b1` 换成 `a1`(a1 同时在两个组里)、某个成员换成
+  `../escape` 且隔壁真有这么个文件。老代码三份**全是** verify 0、fork 0、pool fill 0:
+  (a) `a1` 停在 nlink 2、`a3` 是个独立 inode;(b) `b2`/`b3` 被链到 `a1` 上——`a1` nlink 5,
+  fork 里再也没有 `bbb`;(c) `a1` 被 rename 到隔壁那个文件上,它的内容读出来是 `aaa`。
+- **清扫**:一个没有任何行的 `S999998.wfs-tmp`,里面一棵被 ACL 锁住的子树。老代码 4 例里红 3 例
+  ——gc 什么都不说、`work_remains` 不置、`gc --status` 什么都不数,树还在;第 4 例是对照
+  (ACL 去掉之后下一次 gc 删掉它并停止计数),前后都绿。
+
+新增测试:
+
+- `core_test`(迁移):(1) 老库打开就迁移、迁移完才盖戳,再打开一次什么都不变,`wfs_store_status`
+  正常;(2) 上面那份"有一条 ALTER 必然失败"的库,`wfs_store_open` 必须回 `-EIO`、`user_version`
+  停在 200、**13 个列一个都不能加上**(部分生效也是生效);(3) 把 view 换回真表,下一次打开
+  照常迁移到底——这正是 (2) 不盖戳的意义。
+- `core_test`(清单):上面三份损坏各自要 verify / fork / pool fill 三处全部 `WFS_E_SNAPSHOT_DIRTY`,
+  `--to` 上不留东西、不留 `.wfs-fork-` 克隆、World 数不变,隔壁那个文件 inode、nlink、内容
+  一概不动;把清单放回去,同一个快照照样 fork,两个组都重建、谁也没拿到对方的内容。
+- `safety.sh`(清扫):`gc` 在 stderr 上报它、说"the collector will try again"、`gc --status`
+  数到 1 棵;`chmod -N` 之后下一次 `gc` 删掉它并且不再数。
+
 #### PR #1 review 第十轮:后缀清扫也得先问过行(2026-09-20)
 
 第十轮,Codex 一条,P1,而且正是 **P18**(docs/M1_DESIGN.md §3)在 collector 里剩下的最后一处
