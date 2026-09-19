@@ -1244,6 +1244,47 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第十九轮:分隔符只有一个空格,键必须是键(2026-09-20)
+
+第十九轮,Codex 两条,都是 P2,而且是同一类毛病的两个化身:**用"找到这几个字节"代替"按语法读"**。
+第一条在两份清单的读者上——`sscanf` 的数字后面跟了一个空白指令(`%llu %n`),而 scanf(3) 的空白指令
+会把够得着的空格、制表符、CR、LF **全部**吃掉,不只是写者放的那**一个**分隔符;于是名字开头的空格
+连同名字本身的第一段一起没了(` a` 读成 `a`)。第二条在 `.world` 标记的读者上——`json_find()` 用
+`strstr` 找 `"<键>"`,而值是写在后面那些键**之前**的,值里一个转义引号就能把这几个字节凑出来,
+匹配落进路径里、冒号那一关没过,函数**当作没有这个键**返回。**一条一个提交、一个测试,先验证过
+"没有修复就会红"。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P2 `PRRT_kwDOUf7jGc6kDjTg` | `hardlinks.cpp` `hardlinks_manifest_read()` + `world.cpp` `wfs_snapshot_verify()` 的清单读者 | 两份清单的读者都用 `%llu %n` 收尾——**结尾那个空白指令**把分隔符和名字开头的空格/制表符一起吃掉了。两个写者都只写**一个**空格,后面是原样的名字:`fprintf(f, "hl %llu %llu ", …)` + `put_escaped()`,以及 `Manifest::line()` 的 `"%c %o %llu %lld.%ld %llu "` + 同一套转义。于是一个以空格或制表符开头的名字(文件名里的普通字节:下载、编辑器、`tar` 解出来的树都有)读回来就少了开头那一段:` a` 读成 `a`——要么是**隔壁那个文件**,要么谁也不是。代价是整个快照:`init` 刚做完的 `verify` 就报 5 处(4 条条目行 `lstat` 到了别的文件,再加硬链接段——第十三轮那道组检查拿着读错的名字去 `lstat`,落到两个不同的 inode 上),此后这个快照的**每一次 fork、每一次 pool 填充**都是 `WFS_E_SNAPSHOT_DIRTY`,而且是永久的:清单和树都原封不动地躺在那里 | **只在读者这边改:分隔符就是一个 `' '`,后面到行尾全是名字。** 两处都把格式改成 `%llu%n`(`verify` 那处是 `%llu%n`),`%n` 落在数字的末尾,然后**显式要求**那个偏移上正好是一个空格,名字从下一个字节开始,再走 `unescape()`。格式一个字没动,所以磁盘上已有的清单读回来一字不差——包括 `verify` 清单里根那一行:它的分隔符就是行尾最后一个字节,`rel` 依旧是空串。`#hl` 头那一行后面没有自由文本(五个数字读完就完了),不受影响;`core_test` 里那几个手工改清单的辅助函数也按同一条规矩解析了 | `0a8be3c` |
+| P2 `PRRT_kwDOUf7jGc6kDjTk` | `core/src/world.cpp` `json_find()` | `json_find()` 拿 `strstr(js, "\"<键>\"")` 在**整份标记**里找,于是这几个字节最先出现的地方就赢——而每一个值都写在它后面那些键之前。`json_escape()` 把值里的 `"` 写成 `\"`,所以只要路径里有一个引号后面跟着那个词,文本里就出现了 `"world`,再加上这个值**自己的**收尾引号,`"world"` 就凑齐了:store 目录叫 `q"world` 时,`strstr` 落在 `store_path` 里,后面一个字节是 `,` 而不是 `:`,函数于是**返回没找到**——而那个键就在两行之下。`marker_read()` 把 world id 留成 0,这个 store 里的**每一个** World 对 `verify`、`mount`、`fork` 都是 `WFS_E_UNREGISTERED`:一个目录名里的引号,废掉整个 store。World 的**名字**对它后面每一个键是同样的效果(`w"snapshot` 吃掉 snapshot id) | **改成顶层键遍历。** 从对象的 `{` 开始,一对一对地走 `"键": 值`:字符串按转义走完(`\"`、`\\`,`\uXXXX` 的四个十六进制位在跳过反斜杠对之后就是普通字节),值按种类跳过(字符串;数字/`true`/`false`/`null` 走到下一个分隔符;标记虽然是平的,`{}`/`[]` 仍按深度计数走完,里面的字符串照样先跳过,免得括号被字符串里的字符骗到),键**整体**比较。`json_str()`/`json_u64()` 一个字没动、从同一个偏移开始读,写者没动,C ABI 没动:磁盘上已有的标记解析结果完全一样——变的只是"什么才算一个键" | `7b25d5e` |
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **257 passed, 0 failed**(本轮没加,两条都在核心里);
+`check-deps.sh` 全绿。(`m1_criteria.sh` 本轮跳过。)
+
+先把测试跑红过:
+
+- **名字以空格开头(P2 其一)**:源树里两对硬链接 `(" a", " b")`、`("\ta", "\tb")`,外加两个同样
+  大小、同样 mtime 的诱饵 `a`、`b`。**老代码**:`wfs_snapshot_create` 成功,紧接着的
+  `wfs_snapshot_verify` 回 **-1008**(`modified=5`、`missing=0`、`extra=0`),而
+  `wfs_world_create_ex` 和 `wfs_pool_fill` 也都回 **-1008**——刚做出来的快照谁也用不了。
+  (第十三轮那道"组必须是那棵树的组"把"焊错文件"挡在了前面,于是损坏的形状是**永久拒绝**而不是
+  内容被盖;第十一轮那条"名字不许重复"同理:两组读错之后撞名也是 `-EINVAL`。)**新代码**:
+  `verify` 全 0,fork 把两对都重建出来,诱饵 `a`、`b` 仍是两个独立 inode、内容各是各的;
+  pool 填充 + 命中的 fork 同样。
+- **标记里的键被值吃掉(P2 其二)**:store 开在 `<root>/q"world`,World 名字 `qw"snapshot`。
+  **老代码**:`wfs_world_verify_identity` 回 **-1002**("unregistered copy of a world"),
+  world id 读成 **0**。**新代码**:`registered=1`、world id / snapshot id / 名字全对,
+  `wfs_world_marker_store()` 也认得出这就是本 store 的路径。
+
+新增测试:
+
+- `core_test`(P2 其一):`init` → `verify`(干净)→ `fork --no-pool`(两对都在、诱饵还是两个
+  独立文件、内容各是各的)→ `pool fill` + 命中的 fork(同上)。
+- `core_test`(P2 其二):带引号的那个 store 走一遍 `init`/`fork`/`verify identity`/
+  `marker_store`;另外钉住两件事——目录分量**就叫** `world`(没有引号)这种本来就不会错的形状
+  得继续对,以及别人 store 的 World 依旧是按 store id 判成 `WFS_E_FOREIGN_STORE`(键照样读得出来)。
+
 #### PR #1 review 第十八轮:源树自己上的锁要借一下,回滚也是一次会失败的 rename(2026-09-20)
 
 第十八轮,Codex 两条,都是 P2。第一条落在硬链接重放上:第四轮那个"只读目录借一下写位"借的只有
