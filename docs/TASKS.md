@@ -1160,7 +1160,7 @@ PR [#1](https://github.com/forks-world/forkfs/pull/1) 的机器评审提了四�
 | `world.cpp:2055` gc 清快照 | 同上 | 安全:同一个 store 内部名字 |
 | `pool.cpp:154/365/520` | `<store>/pool/S<n>/<uuid>.wfs-tmp` | 安全:store 内部 + uuid |
 | trash 的 `.deleting` | `<store>/trash/<name>.deleting` | 安全:trash 全归我们,条目名字是 discard 自己起的 |
-| `world.cpp:937` fork 目标 | `<用户选的 target>.wfs-tmp` | **仍不安全**,见下 |
+| `world.cpp:937` fork 目标 | `<用户选的 target>.wfs-tmp` | **仍不安全**,见下(第三轮 `fd673df` 已修) |
 
 后两处需要单独一轮(本轮不动,以免把 publish 顺序和 gc 的清扫规则一起改了):
 
@@ -1189,3 +1189,57 @@ deprecated 警告);`check-deps.sh` 两个目录全绿(ACL 用的是 libSystem,�
   `--full` 和事件路径都报 `T` 且 `xattr_errors == 1`,`--no-xattr` 0 行,ACL 一撤回到 1 行、
   属性删掉回到 0 行;再把 ACL 挪到**快照**那一侧,要求整个 diff 以 `-EACCES` 失败。
   老代码红在 "xattr unreadable / --full: 0 lines, wanted 1"。
+
+#### PR #1 review 第三轮:用户目录里的临时名(2026-09-19)
+
+上一轮那张审计表留了两处"仍不安全"的尾巴,本轮先把它们做掉;做到一半 Codex 又给同一个 PR
+提了四条,全部落在同一片代码里,于是一起收。**一条一个提交、一条一个测试。**
+
+架构决定(本轮的总纲):**store 在用户的目录里从不靠猜**。名字要么是我们抽出来的、并且记在行上,
+要么就不是我们的;凡是"以某后缀结尾就删"的扫描,只允许发生在 store 内部。
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| 尾巴 1 | `world.cpp` fork | 克隆建在 `<target>.wfs-tmp`,开头 `if (exists(tmp)) fs_remove_tree(tmp)`。`target` 是用户给的(`--to ~/w/a`),于是 `~/w/a.wfs-tmp`——用户自己的文件或整棵目录——每次 fork 都被删掉 | 临时名改成目标父目录里抽出来的 `.wfs-fork-<pid>-<计数>-<getentropy 16 位十六进制>`;`clonefile(2)` 自己创建目标、已存在返回 EEXIST 而不是覆盖,**克隆成功就是占位**(和 `open(2)` 的 `O_EXCL` 一个道理),EEXIST 就换名字重来,**任何不是我们建的东西一律不删**。名字在**克隆开始之前**写进 CREATING 行的新列 `tmp_path`(additive ALTER,`user_version` rev 2→3),崩溃之后那一行就是那棵树唯一的名字来源 | `fd673df` |
+| 尾巴 2 | `world.cpp` gc | `rm_tmp_in_dir()` 让 gc 把**每个 World 的父目录**扫一遍,凡是 `.wfs-tmp` 结尾一律 `fs_remove_tree`。一次例行 `world fs gc` 就能吃掉 `~/w/notes.wfs-tmp` | gc 只删 CREATING 行**记下来的那一条路径**,而且要先和"现在"对一遍:仍是目录、没有活行认领它的 inode、`.world` 标记若存在必须写着这一行的 world id(publish 顺序是先写标记后 rename,所以我们自己的半成品是带标记的)。删完把行标成 **DEAD**(不再 DELETE,证据留着)。按后缀扫只剩 `<store>/snapshots`,函数改名 `rm_tmp_in_store_dir()` 并加 `under_dir(store)` 守卫 | `fd673df` |
+| 顺手 | `world.cpp` / `pool.cpp` publish rename | P7 只在 `check_path` 那一刻看过"目标不存在";`rename(2)` 会**替换一个已存在的空目录**,所以从检查到 rename 之间任何人建出目标目录,就是一次静默删除 | 两条 publish 路径(普通克隆、pool 领取)都换成 `fs_rename_excl()` = `renameatx_np(..., RENAME_EXCL)`,目标存在就是 EEXIST,由 P7 去解释,绝不替换 | `fd673df` |
+| P1 `4053200895` | `cli/main.cpp:562` | gc 的 cheap pass 把**每一条 `state=0` 的行**(world / snapshot / pool)都当成"生产者死了",删树删行。可是大树克隆比自动 worker 那两秒的停顿长得多:worker 能把**正在进行的 fork** 的树和行一起删掉,fork 随后那条 UPDATE 一行都没匹配上却照样返回成功,`--to` 上就留下一个没人登记的目录 | CREATING 行记 `owner_pid` + **该进程自己的启动时间**(pid 复用就是另一个人);行只有在"生产者确实没了"**且**"行已经老过 `WORLD_GC_CREATING_MIN_AGE`(默认 60 s)"时才收。`kill(pid,0)` 说不清就当活着——不收是安全的那一边。pool 同理:还在填的条目和它的 `<uuid>.wfs-tmp` 都不动;**被 fork 领走的条目根本没有 pool 行**(claim 就删了),所以 pool 那趟"没有行认领的目录"扫描以前会把活 fork 正要 rename 的树删掉——现在 CREATING world 行把它记在 `tmp_path` 里,pool_collect 一律当作有主。另一半:fork 最后那条 UPDATE 加 `AND state=CREATING` 并校验 `sqlite3_changes()==1`,行没了就把树搬回临时名删掉(pool 路径则搬回池里)并返回 `-ESTALE` | `c9899bc` |
+| P2 `4053200896` | `world.cpp:1986` | discard 在"rename 进 trash"和"提交行"之间被杀,留下的是一个普通的 `W<n>-<t>` 目录:没有行,也没有 `.deleting` 后缀。`trash_scan()` 把它算作立即到期,`gc` 于是 `work_remains=1`,可 `wfs_gc_pending()` 另起炉灶只查两张表 + 找 `.deleting`,答案是"没活儿"——CLI 说"已交给后台",却一个 worker 都没起,后面每次 fork/discard 都同样判断,孤儿就一直躺着 | `wfs_gc_pending()` 直接跑 `trash_scan()`,从 `deleting` / `due` 给答案。**决策和干活用同一套分类**,代价还是一次 readdir + 两张表 | `b8d28e4` |
+| P2 `4053200899` | `world.cpp:1282` | 快照目录已经不在时,不带 `--now` 的 `discard S<n>` 把 `trash_path` 清空却仍把行提交成 TRASHED。这种行 `trash_scan()` 跳过(没路径),reconcile 又只看 ACTIVE——没有任何后续 collector 能推动它,`status` 里就永远"trashed" | 树已经没了就在同一个 BEGIN IMMEDIATE 里**直接 reconcile 成 DEAD** 并返回:没东西可搬、没东西可删、也不用起 worker。pool 条目不用额外处理(有引用就拒绝 discard,`--force` 事先 drain,填回来的由 pool_collect 收)。CLI 改口"its tree was already gone; the row is now dead" | `073a9ef` |
+| P2 `4053200900` | `hardlinks.cpp:412` | `pthread_create` 可能这一轮失败、下一轮成功。句柄写在 `th[i]`,`started` 却只是计数:join 循环于是 join 一个**从没写过**的 `pthread_t`,同时**漏掉**真正活着的那个 worker——它可以在调用者返回之后继续读栈上的 `RestoreJob` | 抽一个 `threads_start()`:**真起来的句柄连续写进 `th[0..n)`**,返回 n。核心里一共就两处 `pthread_create`——`hardlinks_restore`(P9 重放)和 `fs_walk_tree`(也就是所有并行遍历:克隆回退、protect/unprotect、scan、count、并行删除,pool 填充和 gc deleter 也都走它)——两处都换过去 | `7f0bb20` |
+
+**验收**:`safety.sh` **167 passed, 0 failed**(上一轮 161 → 本轮净 +6:PR3 七条新用例,减掉那条"gc 扫掉
+`*.wfs-tmp`"的旧断言——它断言的正是本轮删掉的行为);`ctest` 两个全新配置的构建目录
+WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecated 警告);
+`check-deps.sh` 两个目录全绿(新用到的 `renameatx_np`、`sysctl`、`getentropy` 都在 libSystem 里)。
+
+新增测试都验证过"没有修复就会红":
+
+- 尾巴 1/2:`core_test` 在 fork 目标旁边放一个普通文件 `wtmp.wfs-tmp`(正好是旧代码给
+  `--to .../wtmp` 起的临时名)和一个普通目录 `notes.wfs-tmp`,要求 fork 之后、gc 之后两者
+  分毫不动,而且 fork 不留任何 `.wfs-fork-` 名字。`safety.sh` 用 CLI 把同一件事再做一遍。
+- 崩溃那一刻:新测试缝 `wfs_test_before_fork_publish`(库里恒为 NULL)在"克隆已建好、已记在行上"
+  和"publish rename"之间把 fork 停住,什么都不回滚——正是 `kill -9` 留下的样子。gc 必须删掉
+  **行记下的那条路径**、别的一样不动,并把行标成 DEAD;行记的树要是早被人手删了,就只标 DEAD、
+  `tmp_removed == 0`。
+- P1:同一个缝跑两遍。第一遍生产者是**本进程**(活的),`WORLD_GC_CREATING_MIN_AGE=0` 把年龄那条
+  规则关掉,要求 gc 把树和行原样留下;第二遍用 `wfs_test_fork_owner_pid` 写一个**不存在的 pid**,
+  要求 gc 删树 + 标 DEAD。`safety.sh` 用 `sqlite3` 直接往 store 里写一行 CREATING(除了跟 fork 赛跑,
+  没有别的办法让一行在一整趟 gc 期间保持打开):`owner_pid=$$` 时树和行都在,换成死 pid 之后
+  树没了、行是 3。
+- P2 `…896`:`core_test` 造一个没有行、也没有 `.deleting` 后缀的 `W9999-1` 孤儿,要求
+  `wfs_gc_pending()` 在 7 天保留期下答 1(老代码答 0),随后那次 gc 把它删掉并计进 `trash_orphans`;
+  `safety.sh` 走 CLI:孤儿放进 trash,跑一次普通 `fork`,它起的 worker 必须把孤儿清掉。
+- P2 `…899`:`core_test` 建一个快照,绕过 store 把 `<store>/snapshots/S<n>` 删掉,然后**不带 `--now`**
+  discard,要求行是 DEAD、store 的 trashed-snapshot 计数只剩旁边那个正经 trashed 的。
+- P2 `…900`:这个 bug 本身是 UB,从调用者那边看不看得见全凭运气,所以测的是抽出来的那个 helper:
+  `wfs_test_thread_fail_mask` 拒掉指定的 slot,`wfs_test_threads_start()` 先把句柄数组清零
+  (于是"没写过的 slot"必然 join 不成),再直接查合同——写了 n 个句柄、join 成功 n 次、跑起来的
+  worker 数等于 join 掉的数。老循环 + 拒掉 slot 0 时它返回 `-EIO`(起了 3 个、join 成 2 个、跑了 3 个)。
+  另外 `core_test` 还拿一棵 12 组硬链接的树在 slot 0 被拒的情况下真做一遍 init + fork,要求每组
+  都还连着、树里不留 `.wfs-hl-` 临时名。
+
+**`.wfs-tmp` 家族审计**(上一轮那张表的收尾):`WFS_TMP_SUFFIX` 现在只出现在 store 内部——
+`world.cpp` 快照创建与 gc 清快照(`<store>/snapshots/S<n>.wfs-tmp`,名字由行 id 决定)、
+`pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
+(fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
