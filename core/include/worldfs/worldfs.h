@@ -475,7 +475,15 @@ enum {
     /* Try the FSEvents path even though the world is below WFS_DIFF_EVENTS_MIN_ENTRIES
      * (`diff --events`). It is still only a candidate source: every fallback below sends it
      * back to the full scan, silently and with the same answer. Ignored with WFS_DIFF_FULL. */
-    WFS_DIFF_EVENTS = 1 << 3
+    WFS_DIFF_EVENTS = 1 << 3,
+    /* Compare com.apple.provenance too (`diff --all-xattrs`). By default it is the one xattr
+     * left out: macOS 27 stamps it on every file a local process creates and will not let it
+     * be removed, so it is the kernel's note of which application made the file, not anything
+     * the workspace did -- and confirming that it matches costs two listxattr(2) plus two
+     * getxattr(2) on every otherwise-identical file. A file whose only xattr is provenance
+     * counts as having none at all, including for the EF_NO_XATTRS shortcut. Every other
+     * attribute, com.apple.quarantine included, is always compared. */
+    WFS_DIFF_ALL_XATTRS = 1 << 4
 };
 
 /* Why the full two-tree walk was used. */

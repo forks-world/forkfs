@@ -38,11 +38,14 @@ static void usage(void) {
           "                                   always clones here and now\n"
           "  checkpoint W<n> [--name N] [--hard] [--force]\n"
           "                                   snapshot a live world; the world stays writable\n"
-          "  diff W<n> [--full|--events] [--stat] [--no-xattr] [--no-content]\n"
+          "  diff W<n> [--full|--events] [--stat] [--no-xattr] [--all-xattrs] [--no-content]\n"
           "                                   what changed since the fork (A/M/D/T, sorted).\n"
           "                                   Walks both trees by default -- exact, and faster than\n"
           "                                   the FSEvents path below ~200k entries; --events asks\n"
-          "                                   for FSEvents anyway, --full always walks\n"
+          "                                   for FSEvents anyway, --full always walks.\n"
+          "                                   com.apple.provenance (the kernel's note of which app\n"
+          "                                   created a file, which cannot be removed) is left out\n"
+          "                                   of the xattr comparison; --all-xattrs puts it back\n"
           "  list                             snapshots and worlds\n"
           "  inspect W<n>|S<n>\n"
           "  discard W<n>|S<n> [--now] [--force]\n"
@@ -637,6 +640,7 @@ static int cmd_diff(wfs_store *s, int argc, char **argv) {
         else if (!strcmp(argv[i], "--stat")) stat_only = 1;
         else if (!strcmp(argv[i], "--no-content")) flags |= WFS_DIFF_NO_CONTENT;
         else if (!strcmp(argv[i], "--no-xattr")) flags |= WFS_DIFF_NO_XATTR;
+        else if (!strcmp(argv[i], "--all-xattrs")) flags |= WFS_DIFF_ALL_XATTRS;
         else if (argv[i][0] != '-' && !w) w = parse_world(argv[i]);
         else usage();
     }

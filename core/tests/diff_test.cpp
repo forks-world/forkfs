@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #ifdef __APPLE__
+#include <sys/clonefile.h>
 #include <sys/xattr.h>
 #endif
 #include <unistd.h>
@@ -271,7 +272,7 @@ static void bench(const char *root, const char *store) {
     Collect c;
     memset(&c, 0, sizeof c);
     wfs_diff_stats st;
-    double ev = 1e9, fl = 1e9, fx = 1e9, evx = 1e9;
+    double ev = 1e9, fl = 1e9, fx = 1e9, evx = 1e9, fa = 1e9;
     size_t n_events = 0, n_full = 0;
     uint64_t cand = 0;
     for (int i = 0; i < 3; ++i) {
@@ -287,12 +288,17 @@ static void bench(const char *root, const char *store) {
         n_full = c.n;
         run_diff(s, wid, WFS_DIFF_FULL | WFS_DIFF_NO_XATTR, &c, &st);
         if (st.elapsed_us / 1e6 < fx) fx = st.elapsed_us / 1e6;
+        // Every file in a fixture this machine built carries com.apple.provenance, so this is
+        // the whole cost of comparing it: four getxattr(2) per otherwise-identical file.
+        run_diff(s, wid, WFS_DIFF_FULL | WFS_DIFF_ALL_XATTRS, &c, &st);
+        if (st.elapsed_us / 1e6 < fa) fa = st.elapsed_us / 1e6;
     }
     printf("  diff (FSEvents)            %.3f s   %llu changes, %llu candidates\n", ev,
            (unsigned long long)n_events, (unsigned long long)cand);
     printf("  diff (FSEvents, no-xattr)  %.3f s\n", evx);
     printf("  diff (--full)              %.3f s   %llu changes\n", fl, (unsigned long long)n_full);
     printf("  diff (--full --no-xattr)   %.3f s\n", fx);
+    printf("  diff (--full --all-xattrs) %.3f s\n", fa);
     CHECK(n_full == n_events);
     free(c.v);
     wfs_store_close(s);
@@ -408,6 +414,212 @@ static void xattr_shortcut(const char *root, const char *store) {
     CHECK(setxattr(p, "com.forks.world.t24", "gone", 4, 0, XATTR_NOFOLLOW) == 0);
     run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
     check_lines("xattr shortcut / restored", &c, NULL, 0);
+
+    free(c.v);
+    wfs_store_close(s);
+}
+
+// ---- M2: com.apple.provenance is not workspace state -----------------------------------------
+//
+// macOS 27 stamps com.apple.provenance on every file a local process creates, and it cannot be
+// taken off again: setxattr(2) and removexattr(2) on that name both return 0 and change nothing
+// (probed on 27.0 -- and `xattr -d` is just as silent). It is the kernel's note of which
+// application created the file, not something a workspace did, so the diff leaves it out of the
+// xattr comparison by default, including out of the decision to skip the comparison entirely.
+// `--all-xattrs` puts it back. Every other name, com.apple.quarantine included, is compared
+// either way.
+//
+// Making a difference that is *only* provenance needs a file the kernel did not stamp, and there
+// is exactly one way to come by one: a whole-directory clonefile(2) copies the attributes
+// verbatim, absence included, while a per-file clonefile(2) does not (that clone is a file this
+// process created, and gets stamped). So the donor is a small directory that macOS's own
+// installers wrote, cloned whole, with the one unstamped file moved out of the clone. When this
+// machine has no such directory the case says so and stops rather than assert something else.
+
+// A regular file with no xattrs at all, no flags (a decmpfs-compressed donor would differ in
+// st_flags and drown the signal), on this volume, in a directory small enough to clone for the
+// sake of one file.
+static int donor_scan_dir(const char *dir, dev_t dev, char *parent_out, size_t pcap,
+                          char *name_out, size_t ncap) {
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    int entries = 0;
+    char cand[256];
+    cand[0] = 0;
+    while (struct dirent *e = readdir(d)) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if (++entries > 64) break;
+        if (cand[0]) continue;
+        char p[4096];
+        join(p, sizeof p, dir, e->d_name);
+        struct stat st;
+        if (lstat(p, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        if (st.st_dev != dev || st.st_flags != 0 || st.st_size == 0 || st.st_size > 65536) continue;
+        if (access(p, R_OK) != 0) continue;
+        if (listxattr(p, NULL, 0, XATTR_NOFOLLOW) != 0) continue;
+        snprintf(cand, sizeof cand, "%s", e->d_name);
+    }
+    closedir(d);
+    if (!cand[0] || entries > 64) return 0;
+    snprintf(parent_out, pcap, "%s", dir);
+    snprintf(name_out, ncap, "%s", cand);
+    return 1;
+}
+
+// The (skip+1)-th directory that fits. Cloning one can still fail -- a directory of someone
+// else's with an unreadable entry in it answers EPERM -- so the caller walks the matches until
+// one of them actually clones.
+static int find_donor(dev_t dev, int skip, char *parent_out, size_t pcap, char *name_out,
+                      size_t ncap) {
+    char hl[4096];
+    const char *roots[3];
+    size_t nroots = 0;
+    const char *home = getenv("HOME");
+    if (home && *home) {
+        join(hl, sizeof hl, home, "Library"); // ours, so the clone is allowed: try it first
+        roots[nroots++] = hl;
+    }
+    roots[nroots++] = "/Library";
+    roots[nroots++] = "/Applications";
+    int budget = 400; // this is a test fixture, not a search: give up and skip
+    for (size_t r = 0; r < nroots; ++r) {
+        if (donor_scan_dir(roots[r], dev, parent_out, pcap, name_out, ncap) && skip-- == 0) return 1;
+        DIR *d = opendir(roots[r]);
+        if (!d) continue;
+        while (struct dirent *e = readdir(d)) {
+            if (e->d_name[0] == '.') continue;
+            if (--budget < 0) break;
+            char sub[4096];
+            join(sub, sizeof sub, roots[r], e->d_name);
+            struct stat st;
+            if (lstat(sub, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_dev != dev) continue;
+            if (donor_scan_dir(sub, dev, parent_out, pcap, name_out, ncap) && skip-- == 0) {
+                closedir(d);
+                return 1;
+            }
+        }
+        closedir(d);
+    }
+    return 0;
+}
+
+static void provenance_case(const char *root, const char *store) {
+    struct stat rst;
+    CHECK(lstat(root, &rst) == 0);
+    char src[4096], w[4096], p[4096], q[4096];
+    char parent[4096], name[256], clonedir[4096], rel[512];
+    join(src, sizeof src, root, "prov-src");
+    join(w, sizeof w, root, "prov-w");
+    CHECK(mkdir(src, 0755) == 0);
+    join(clonedir, sizeof clonedir, src, "donor");
+
+    // The clone goes straight into the source tree and the file is never moved afterwards:
+    // rename(2) stamps a file just like creating it does (probed -- a file that arrives in a
+    // directory of ours becomes ours, provenance and all). Only the whole-directory clone gets
+    // an unstamped file into a tree this process owns.
+    int have = 0;
+    for (int skip = 0; skip < 16 && !have; ++skip) {
+        if (!find_donor(rst.st_dev, skip, parent, sizeof parent, name, sizeof name)) break;
+        rm_rf(clonedir);
+        if (clonefile(parent, clonedir, CLONE_NOFOLLOW) != 0) continue;
+        join(p, sizeof p, clonedir, name);
+        have = listxattr(p, NULL, 0, XATTR_NOFOLLOW) == 0;
+    }
+    if (!have) {
+        rm_rf(clonedir);
+        rmdir(src);
+        printf("  %-28s skipped: no unstamped file on this volume to clone from\n", "provenance");
+        return;
+    }
+    // Keep the one file and drop the donor's siblings: unlinking them cannot stamp what is left,
+    // and the fixture stays small whatever the donor directory happened to hold.
+    if (DIR *d = opendir(clonedir)) {
+        while (struct dirent *e = readdir(d)) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") || !strcmp(e->d_name, name))
+                continue;
+            join(q, sizeof q, clonedir, e->d_name);
+            rm_rf(q);
+        }
+        closedir(d);
+    }
+    snprintf(rel, sizeof rel, "donor/%s", name);
+    join(p, sizeof p, clonedir, name);
+    CHECK(listxattr(p, NULL, 0, XATTR_NOFOLLOW) == 0);
+    join(q, sizeof q, src, "other.txt");
+    write_file(q, "an ordinary, stamped file\n");
+
+    wfs_store *s = NULL;
+    CHECK_OK(wfs_store_open(store, &s));
+    wfs_id sid = 0;
+    wfs_snapshot_opts sopts;
+    memset(&sopts, 0, sizeof sopts);
+    sopts.name = "prov";
+    CHECK_OK(wfs_snapshot_create(s, src, &sopts, &sid));
+    wfs_ref from = {WFS_K_SNAPSHOT, sid};
+    wfs_fork_opts o;
+    memset(&o, 0, sizeof o);
+    wfs_id wid = 0;
+    CHECK_OK(wfs_world_create(s, from, w, &o, &wid));
+
+    join(p, sizeof p, w, rel);
+    struct stat before;
+    CHECK(lstat(p, &before) == 0);
+    CHECK(listxattr(p, NULL, 0, XATTR_NOFOLLOW) == 0); // init and fork both kept it unstamped
+
+    // Replace it with a byte-identical file *this* process creates, then put mode and timestamps
+    // back. Everything stat(2) can see is the same on both sides afterwards; the only difference
+    // left in the world is the com.apple.provenance the kernel just put on the new inode.
+    char buf[65536];
+    int fd = open(p, O_RDONLY);
+    CHECK(fd >= 0);
+    ssize_t n = read(fd, buf, sizeof buf);
+    CHECK(n == (ssize_t)before.st_size);
+    close(fd);
+    char tmp[4096];
+    join(tmp, sizeof tmp, w, ".prov.new");
+    fd = open(tmp, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    CHECK(fd >= 0);
+    CHECK(write(fd, buf, (size_t)n) == n);
+    close(fd);
+    CHECK(chmod(tmp, before.st_mode & 07777) == 0);
+    CHECK(rename(tmp, p) == 0);
+    struct timespec ts[2];
+    ts[0] = before.st_atimespec;
+    ts[1] = before.st_mtimespec;
+    CHECK(utimensat(AT_FDCWD, p, ts, AT_SYMLINK_NOFOLLOW) == 0);
+
+    char nb[512];
+    ssize_t ln = listxattr(p, nb, sizeof nb, XATTR_NOFOLLOW);
+    if (ln != (ssize_t)sizeof "com.apple.provenance" || strcmp(nb, "com.apple.provenance")) {
+        printf("  %-28s skipped: the new file was not stamped (listxattr %zd)\n", "provenance", ln);
+        wfs_store_close(s);
+        return;
+    }
+
+    // ... and one attribute that is *not* the kernel's: quarantine must still be a T.
+    join(q, sizeof q, w, "other.txt");
+    CHECK(setxattr(q, "com.apple.quarantine", "0081;00000000;world;", 20, 0, XATTR_NOFOLLOW) == 0);
+
+    Collect c;
+    memset(&c, 0, sizeof c);
+    wfs_diff_stats st;
+    const Want want_default[] = {{'T', "other.txt"}};
+    const Want want_all[] = {{'T', rel}, {'T', "other.txt"}}; // "donor/..." sorts first
+    settle();
+    // Default: the quarantined file is reported, the re-created one is not -- its whole
+    // difference is a provenance the kernel wrote and nobody can unwrite.
+    run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
+    check_lines("provenance / --full", &c, want_default, 1);
+    run_diff(s, wid, WFS_DIFF_FULL | WFS_DIFF_ALL_XATTRS, &c, &st);
+    check_lines("provenance / --all-xattrs", &c, want_all, 2);
+    run_diff(s, wid, WFS_DIFF_FULL | WFS_DIFF_NO_XATTR, &c, &st);
+    check_lines("provenance / --no-xattr", &c, NULL, 0);
+    // The same two answers down the candidate path, where the xattr leg is reached from
+    // fs_lstat_xattr rather than from the walk.
+    run_diff(s, wid, WFS_DIFF_EVENTS, &c, &st);
+    check_lines("provenance / events", &c, want_default, 1);
+    run_diff(s, wid, WFS_DIFF_EVENTS | WFS_DIFF_ALL_XATTRS, &c, &st);
+    check_lines("provenance / events --all", &c, want_all, 2);
 
     free(c.v);
     wfs_store_close(s);
@@ -771,7 +983,7 @@ int main() {
     CHECK_RC(wfs_world_diff(s, wid, 0, Stop::cb, &rc42), 42);
 
     // ---- timing, best of three, on the 10k fixture ----
-    double ev = 1e9, fl = 1e9, fx = 1e9;
+    double ev = 1e9, fl = 1e9, fx = 1e9, fa = 1e9;
     for (int i = 0; i < 3; ++i) {
         run_diff(s, wid, 0, &c, &st);
         if (st.elapsed_us / 1e6 < ev) ev = st.elapsed_us / 1e6;
@@ -779,9 +991,11 @@ int main() {
         if (st.elapsed_us / 1e6 < fl) fl = st.elapsed_us / 1e6;
         run_diff(s, wid, WFS_DIFF_FULL | WFS_DIFF_NO_XATTR, &c, &st);
         if (st.elapsed_us / 1e6 < fx) fx = st.elapsed_us / 1e6;
+        run_diff(s, wid, WFS_DIFF_FULL | WFS_DIFF_ALL_XATTRS, &c, &st);
+        if (st.elapsed_us / 1e6 < fa) fa = st.elapsed_us / 1e6;
     }
-    printf("  10k, 850 changes: FSEvents %.3f s   --full %.3f s   --full --no-xattr %.3f s\n", ev,
-           fl, fx);
+    printf("  10k, 850 changes: FSEvents %.3f s   --full %.3f s   --full --no-xattr %.3f s   "
+           "--full --all-xattrs %.3f s\n", ev, fl, fx, fa);
 
     free(c.v);
     c.v = NULL;
@@ -798,6 +1012,9 @@ int main() {
         char store4[4096];
         join(store4, sizeof store4, root, "store-xattr");
         xattr_shortcut(root, store4);
+        char store5[4096];
+        join(store5, sizeof store5, root, "store-prov");
+        provenance_case(root, store5);
     }
 #endif
 

@@ -141,7 +141,7 @@ M src/main.c
 T README.md          # same bytes, different mode / owner / flags / mtime / xattr
 $ world fs diff W1 --stat
 1 added, 1 modified, 1 deleted, 1 metadata-only
-full scan of both trees, 9900 paths compared, 1 files read, 0.158 s
+full scan of both trees, 9900 paths compared, 1 files read, 0.047 s
 $ world fs diff W1 --events --stat
 1 added, 1 modified, 1 deleted, 1 metadata-only
 FSEvents since the fork, 2 paths compared, 0 files read, 0.041 s
@@ -162,7 +162,7 @@ older than the volume's FSEvents journal (which holds roughly a day), or a world
 from another world rather than from a snapshot.
 
 Why the walk is the default, measured on 27.0 with 50 000 files and 800 changes: FSEvents
-**0.049 s**, `--full` **0.96 s**, `--full --no-xattr` **0.129 s**. The 4-thread walk is five
+**0.049 s**, `--full` **0.23 s**, `--full --no-xattr` **0.126 s**. The 4-thread walk is five
 times faster than the design assumed, so the event path wins by under 2× — and only because of
 the xattr leg of the metadata comparison, which `--no-xattr` drops at the price of not seeing a
 change that is only an xattr. Against that, the event path has a fixed cost of its own (building
@@ -172,13 +172,29 @@ through FSEvents.
 The walk reads a directory with `getattrlistbulk(2)`, one call per batch rather than one
 `fstatat(2)` per entry, and asks for `ATTR_CMNEXT_EXT_FLAGS` along the way: `EF_NO_XATTRS` tells
 it, for free, which entries have no extended attributes at all, and those never reach
-`listxattr(2)`. On a tree of ordinary files that closes the gap almost completely — a real
+`listxattr(2)`. On a tree that came from somewhere else that is most of the files — a real
 37 000-entry tree with 800 changes diffs in **0.17 s** by default against 0.14 s with
-`--no-xattr`. The 50 000-file figure above is worse than that for one reason: macOS 27 stamps
-`com.apple.provenance` on every file a local process creates and will not let it be removed, so
-in a tree this machine built itself the shortcut never fires and every file pays two
-`listxattr(2)` plus two `getxattr(2)` (14 µs each — `getxattr`, not `listxattr`, is the
-expensive one). Trees that came from anywhere else are the common case and the fast one.
+`--no-xattr`.
+
+**`com.apple.provenance` is not compared.** macOS 27 stamps it on every file a local process
+creates — a `rename(2)` into your own directory is enough — and it cannot be taken off again:
+`removexattr(2)` returns 0 and changes nothing. It is the kernel's note of *which application
+created this file*, not anything a workspace did, so `diff` leaves it out of the comparison and
+out of the decision to skip the comparison: a file whose only xattr is provenance counts as
+having none at all. `--all-xattrs` puts it back. Everything else, `com.apple.quarantine`
+included, is always compared. What that costs, on the 50 000-file tree above where every single
+file is stamped and the `EF_NO_XATTRS` shortcut therefore never fires:
+
+| `diff --full` | 50 000 files | 10 000 files |
+|---|---|---|
+| default (provenance ignored) | **0.231 s** | **0.047 s** |
+| `--all-xattrs` | 1.303 s | 0.158 s |
+| `--no-xattr` | 0.126 s | 0.027 s |
+
+Confirming that one kernel-written attribute matches was five sixths of the default scan: two
+`listxattr(2)` plus two `getxattr(2)` per otherwise-identical file, and `getxattr` is the
+expensive one at 14 µs. What is left above `--no-xattr` is the two `listxattr(2)` that still
+have to ask for the names.
 
 And it is not only slower on small trees, it is less certain: `fseventsd` writes its journal on
 a timer, so an isolated change takes 90–600 ms to become visible to a stream created after it (a

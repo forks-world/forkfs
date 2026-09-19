@@ -170,19 +170,12 @@ bool xattr_value_equal(const char *a, const char *b, const char *name) {
 // ~70), and it halves the getxattr count: 55 µs per pair measured before, 35 µs after.
 const size_t kXattrInline = 1024;
 
-bool xattr_equal(const char *a, const char *b) {
-    char la[4096], lb[4096];
-    ssize_t na = ::listxattr(a, la, sizeof la, XATTR_NOFOLLOW);
-    ssize_t nb = ::listxattr(b, lb, sizeof lb, XATTR_NOFOLLOW);
-    if (na < 0) na = 0;
-    if (nb < 0) nb = 0;
-    if (na != nb) return false;
-    if (na == 0) return true;
-    if (memcmp(la, lb, (size_t)na) != 0) return false; // a clone keeps the order
-    for (ssize_t i = 0; i < na;) {
-        const char *name = la + i;
-        size_t len = ::strnlen(name, (size_t)(na - i));
-        if (len == 0 || (ssize_t)(i + len) >= na) break;
+// The values behind a list of names (NUL-separated, `n` bytes), on both sides.
+bool xattr_values_equal(const char *a, const char *b, const char *names, size_t n) {
+    for (size_t i = 0; i < n;) {
+        const char *name = names + i;
+        size_t len = ::strnlen(name, n - i);
+        if (len == 0 || i + len >= n) break;
         char va[kXattrInline], vb[kXattrInline];
         ssize_t sa = ::getxattr(a, name, va, sizeof va, 0, XATTR_NOFOLLOW);
         ssize_t sb = ::getxattr(b, name, vb, sizeof vb, 0, XATTR_NOFOLLOW);
@@ -193,23 +186,106 @@ bool xattr_equal(const char *a, const char *b) {
         } else if (sa != sb || memcmp(va, vb, (size_t)sa) != 0) {
             return false;
         }
-        i += (ssize_t)len + 1;
+        i += len + 1;
     }
     return true;
 }
 
-// T2.4: the only reason the default full scan used to cost 7x what `--no-xattr` costs. The
-// walker already knows, from ATTR_CMNEXT_EXT_FLAGS, whether either side has any xattr at all;
-// when both sides say "none", there is nothing to compare and no syscall to make. Anything
-// less than both sides saying so -- one side unknown, one side with attributes, a file system
-// that does not report the flag -- falls through to the real comparison above. EF_NO_XATTRS
-// only ever denies, so this can skip work but never a difference.
-bool xattr_maybe_differs(uint8_t wx, uint8_t sx) {
-    return !(wx == wfs::FS_XATTR_NONE && sx == wfs::FS_XATTR_NONE);
+// Every name both sides have, compared. The fallback for a file with more than kXattrNames
+// bytes of names, where the filtered-name path below cannot hold them.
+bool xattr_equal_raw(const char *a, const char *b) {
+    char la[4096], lb[4096];
+    ssize_t na = ::listxattr(a, la, sizeof la, XATTR_NOFOLLOW);
+    ssize_t nb = ::listxattr(b, lb, sizeof lb, XATTR_NOFOLLOW);
+    if (na < 0) na = 0;
+    if (nb < 0) nb = 0;
+    if (na != nb) return false;
+    if (na == 0) return true;
+    if (memcmp(la, lb, (size_t)na) != 0) return false; // a clone keeps the order
+    return xattr_values_equal(a, b, la, (size_t)na);
+}
+
+// M2: `com.apple.provenance` is not workspace state. macOS 27 stamps it on every file a local
+// process creates, and it cannot be taken off again (removexattr fails; `xattr -d` silently
+// does nothing) -- it is the kernel's record of *which application created this file*, which
+// a fork's clone inherits and an agent never sets. Comparing it can therefore only ever
+// confirm what is never news, and it costs two listxattr(2) plus two getxattr(2) per
+// otherwise-identical file to do it. It is left out of the comparison by default;
+// `diff --all-xattrs` puts it back. `com.apple.quarantine` and everything else stay compared:
+// those are things that happen to a workspace, not to the kernel's bookkeeping.
+const char kProvenance[] = "com.apple.provenance";
+
+bool xattr_ignored(const char *name, size_t len, int flags) {
+    if (flags & WFS_DIFF_ALL_XATTRS) return false;
+    return len == sizeof kProvenance - 1 && memcmp(name, kProvenance, len) == 0;
+}
+
+const size_t kXattrNames = 4096;
+
+// One side's names, in the order listxattr(2) reports them, with the ignored ones dropped. A
+// side the walk already declared EF_NO_XATTRS is not asked at all -- that is the free half of
+// the shortcut. Returns the used length of `out`, or -1 when the names did not fit (then the
+// caller must fall back to xattr_equal_raw rather than guess).
+ssize_t xattr_names(const char *path, uint8_t state, int flags, char *out, size_t cap) {
+    if (state == wfs::FS_XATTR_NONE) return 0;
+    char stackbuf[4096];
+    char *heap = nullptr;
+    char *raw = stackbuf;
+    ssize_t n = ::listxattr(path, raw, sizeof stackbuf, XATTR_NOFOLLOW);
+    if (n < 0 && errno == ERANGE) {
+        ssize_t need = ::listxattr(path, nullptr, 0, XATTR_NOFOLLOW);
+        if (need > 0 && (heap = (char *)::malloc((size_t)need)) != nullptr) {
+            raw = heap;
+            n = ::listxattr(path, raw, (size_t)need, XATTR_NOFOLLOW);
+        }
+    }
+    if (n <= 0) { // no attributes, or the file went away under us: nothing to compare
+        ::free(heap);
+        return 0;
+    }
+    ssize_t used = 0;
+    for (ssize_t i = 0; i < n;) {
+        const char *name = raw + i;
+        size_t len = ::strnlen(name, (size_t)(n - i));
+        if (len == 0 || (ssize_t)(i + len) >= n) break;
+        if (!xattr_ignored(name, len, flags)) {
+            if ((size_t)used + len + 1 > cap) {
+                ::free(heap);
+                return -1;
+            }
+            memcpy(out + used, name, len + 1);
+            used += (ssize_t)len + 1;
+        }
+        i += (ssize_t)len + 1;
+    }
+    ::free(heap);
+    return used;
+}
+
+// The xattr leg of the comparison, *and* the decision whether to make it at all.
+//
+// T2.4 gave the walk a free verdict per entry (ATTR_CMNEXT_EXT_FLAGS / EF_NO_XATTRS): when both
+// sides say "none at all", there is nothing to list and nothing to compare, and not one syscall
+// is made. EF_NO_XATTRS only ever denies, so that shortcut can skip work but never a difference.
+//
+// M2 adds the other half. The flag is never set on a file this machine created (provenance is
+// always there), so on such a tree the shortcut never fired and the whole default scan paid for
+// it. Now, when the flag is not set, the names are listed and the ignored ones dropped first: a
+// file whose only xattr is provenance comes back with an empty list and counts as xattr-free,
+// exactly as if the file system had set the flag. Two listxattr(2) at 2.1 µs is what that costs;
+// the four getxattr(2) at 14 µs that used to follow are gone.
+bool xattr_equal(const char *a, const char *b, uint8_t axa, uint8_t bxa, int flags) {
+    if (axa == wfs::FS_XATTR_NONE && bxa == wfs::FS_XATTR_NONE) return true;
+    char na[kXattrNames], nb[kXattrNames];
+    ssize_t la = xattr_names(a, axa, flags, na, sizeof na);
+    ssize_t lb = xattr_names(b, bxa, flags, nb, sizeof nb);
+    if (la < 0 || lb < 0) return xattr_equal_raw(a, b); // more names than kXattrNames holds
+    if (la == 0 && lb == 0) return true;               // nothing, or only ignored names
+    if (la != lb || memcmp(na, nb, (size_t)la) != 0) return false; // a clone keeps the order
+    return xattr_values_equal(a, b, na, (size_t)la);
 }
 #else
-bool xattr_equal(const char *, const char *) { return true; }
-bool xattr_maybe_differs(uint8_t, uint8_t) { return false; }
+bool xattr_equal(const char *, const char *, uint8_t, uint8_t, int) { return true; }
 #endif
 
 // ---- the record sink -------------------------------------------------------------------------
@@ -310,8 +386,7 @@ int classify(Ctx &c, const char *wpath, const struct stat &ws, uint8_t wxa, cons
         mtime_of(ss, &ssec, &sns);
         if (wsec != ssec || wns != sns) return WFS_C_META;
     }
-    if (!(c.flags & WFS_DIFF_NO_XATTR) && xattr_maybe_differs(wxa, sxa) &&
-        !xattr_equal(wpath, spath))
+    if (!(c.flags & WFS_DIFF_NO_XATTR) && !xattr_equal(wpath, spath, wxa, sxa, c.flags))
         return WFS_C_META;
     return 0;
 }
