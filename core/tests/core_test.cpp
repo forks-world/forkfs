@@ -352,9 +352,23 @@ static void make_v2_db(const char *path, int snapshots_as_view) {
              "PRAGMA user_version=%d;",
              snapshots_as_view ? "snapshots_real" : "snapshots", kSnapCols,
              snapshots_as_view ? "CREATE VIEW snapshots AS SELECT * FROM snapshots_real;" : "",
-             WFS_STORE_SCHEMA * 100);
+             WFS_STORE_SCHEMA_M1 * 100);
     db_exec(path, sql);
 }
+
+// The 13 columns the migrations add. PR #1 review (24th round): hoisted out of the 11th-round
+// block, because the 24th-round block below asks the same question of the same store -- a
+// schema-2 database is exactly an M1 store, and what the bump must NOT cost it is its columns.
+static const char *kAdded[][2] = {
+    {"snapshots", "hard"},       {"snapshots", "root_mode"},
+    {"snapshots", "trash_path"}, {"snapshots", "trashed_at"},
+    {"snapshots", "hl_groups"},  {"snapshots", "hl_external"},
+    {"snapshots", "owner_pid"},  {"snapshots", "owner_start"},
+    {"worlds", "tmp_path"},      {"worlds", "owner_pid"},
+    {"worlds", "owner_start"},   {"pool", "owner_pid"},
+    {"pool", "owner_start"},
+};
+static const size_t kAddedN = sizeof kAdded / sizeof kAdded[0];
 
 // P9 (T2.5): two names are the same file when they are the same inode, and a group of n names
 // shows n links on every one of them.
@@ -5426,23 +5440,15 @@ int main() {
         join(mstore, sizeof mstore, root, "migrate-store");
         CHECK(mkdir(mstore, 0755) == 0);
         join(p, sizeof p, mstore, "VERSION");
-        write_file(p, "2\n");                 // P13: the schema number, which does not change
+        // M1's schema number. The migrations below are additive and do not move it; the 24th
+        // round did, so the first open of this store also rewrites this file to 3.
+        write_file(p, "2\n");
         join(mdb, sizeof mdb, mstore, "metadata.db");
-        static const char *kAdded[][2] = {
-            {"snapshots", "hard"},       {"snapshots", "root_mode"},
-            {"snapshots", "trash_path"}, {"snapshots", "trashed_at"},
-            {"snapshots", "hl_groups"},  {"snapshots", "hl_external"},
-            {"snapshots", "owner_pid"},  {"snapshots", "owner_start"},
-            {"worlds", "tmp_path"},      {"worlds", "owner_pid"},
-            {"worlds", "owner_start"},   {"pool", "owner_pid"},
-            {"pool", "owner_start"},
-        };
-        const size_t kAddedN = sizeof kAdded / sizeof kAdded[0];
 
         // (1) the ordinary case: a v2 store that has never seen the added columns is migrated
         //     on open, and only then stamped.
         make_v2_db(mdb, 0);
-        CHECK(db_user_version(mdb) == WFS_STORE_SCHEMA * 100);
+        CHECK(db_user_version(mdb) == WFS_STORE_SCHEMA_M1 * 100);
         for (size_t i = 0; i < kAddedN; ++i) CHECK(!db_has_column(mdb, kAdded[i][0], kAdded[i][1]));
         wfs_store *ms = NULL;
         CHECK_OK(wfs_store_open(mstore, &ms));
@@ -5464,11 +5470,11 @@ int main() {
         //     user_version stamped, `snapshots` still missing every column, and the migrations
         //     that happened to work applied on their own.
         make_v2_db(mdb, 1);
-        CHECK(db_user_version(mdb) == WFS_STORE_SCHEMA * 100);
+        CHECK(db_user_version(mdb) == WFS_STORE_SCHEMA_M1 * 100);
         ms = NULL;
         CHECK_RC(wfs_store_open(mstore, &ms), -EIO);
         CHECK(ms == NULL);
-        CHECK(db_user_version(mdb) == WFS_STORE_SCHEMA * 100);
+        CHECK(db_user_version(mdb) == WFS_STORE_SCHEMA_M1 * 100);
         for (size_t i = 0; i < kAddedN; ++i) CHECK(!db_has_column(mdb, kAdded[i][0], kAdded[i][1]));
 
         // (3) take the obstacle away and the next open migrates it, exactly as if nothing had
@@ -5478,6 +5484,74 @@ int main() {
         wfs_store_close(ms);
         CHECK(db_user_version(mdb) == stamped);
         for (size_t i = 0; i < kAddedN; ++i) CHECK(db_has_column(mdb, kAdded[i][0], kAdded[i][1]));
+    }
+
+    // ---- PR #1 review (24th round, P1): the schema is also what a collector may delete ------
+    //
+    // Everything M2 added to the store was an additive column or a new value of an existing
+    // INTEGER column -- snapshot trash rows (T2.2), WFS_ST_TRASHING with the tree at one of two
+    // names, `.deleting` entries, the pool's DRAINING, owner columns, hardlink manifests -- so
+    // VERSION stayed at 2 and an M1 binary built from `main` was still allowed to open an M2
+    // store. Its wfs_gc() protects `state=2` world trash paths and sweeps everything else it
+    // does not recognise under trash/ and snapshots/: it would recursively delete a snapshot
+    // still inside its retention window, or the tree of a world whose row says TRASHING, and
+    // leave every M2 row pointing at nothing. The schema is 3 now. M1's own first act on a
+    // store is
+    //     return v == WFS_STORE_SCHEMA ? 0 : WFS_E_SCHEMA;   // check_version(), WFS_STORE_SCHEMA == 2
+    // so the number in VERSION is exactly what refuses it, and (a) below is the assertion that
+    // the number gets there.
+    {
+        char vstore[4096], vdb[4096], vver[4096], vbuf[64];
+        join(vstore, sizeof vstore, root, "schema3-store");
+        CHECK(mkdir(vstore, 0755) == 0);
+        join(vver, sizeof vver, vstore, "VERSION");
+        join(vdb, sizeof vdb, vstore, "metadata.db");
+
+        // (a) an M1 store -- VERSION 2, user_version 2xx, not one of the added columns -- is
+        //     taken over rather than refused: the columns arrive, the stamp becomes 3xx, and
+        //     the file M1 reads first says 3.
+        write_file(vver, "2\n");
+        make_v2_db(vdb, 0);
+        CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA_M1);
+        for (size_t i = 0; i < kAddedN; ++i) CHECK(!db_has_column(vdb, kAdded[i][0], kAdded[i][1]));
+        wfs_store *vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_close(vs);
+        for (size_t i = 0; i < kAddedN; ++i) CHECK(db_has_column(vdb, kAdded[i][0], kAdded[i][1]));
+        // The hole itself: this used to come out 2xx, i.e. still a store M1 would open.
+        CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA);
+        CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
+        CHECK(atoi(vbuf) == WFS_STORE_SCHEMA);
+        char vtmp[4096];
+        join(vtmp, sizeof vtmp, vstore, "VERSION.tmp");
+        CHECK(!exists(vtmp));
+        // A second open is a no-op: the store is already schema 3 and is not upgraded twice.
+        int vstamp = db_user_version(vdb);
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_stat vst;
+        CHECK_OK(wfs_store_status(vs, &vst));
+        CHECK(vst.schema == WFS_STORE_SCHEMA);
+        wfs_store_close(vs);
+        CHECK(db_user_version(vdb) == vstamp);
+
+        // (b) a store from a schema we do not know: VERSION says 3, the database says 4xx. It
+        //     is refused with the P13 code and comes back untouched -- not migrated, and not
+        //     stamped down to 3xx, which is the one thing that would be unrecoverable.
+        make_v2_db(vdb, 0);
+        db_exec(vdb, "PRAGMA user_version=400");
+        vs = NULL;
+        CHECK_RC(wfs_store_open(vstore, &vs), WFS_E_SCHEMA);
+        CHECK(vs == NULL);
+        CHECK(db_user_version(vdb) == 400);
+        for (size_t i = 0; i < kAddedN; ++i) CHECK(!db_has_column(vdb, kAdded[i][0], kAdded[i][1]));
+
+        // ... and the same store refused one step earlier, by the file, before the database is
+        //     opened at all -- which is the check M1 itself is relying on.
+        write_file(vver, "4\n");
+        vs = NULL;
+        CHECK_RC(wfs_store_open(vstore, &vs), WFS_E_SCHEMA);
+        CHECK(vs == NULL);
+        CHECK(db_user_version(vdb) == 400);
     }
 
     wfs_store_close(s);

@@ -33,8 +33,21 @@ extern "C" {
 #define WFS_FS_SHORT_NAME "worldfs"
 #define WFS_EXTENSION_BUNDLE_ID "world.forks.fs.extension"
 
-/* Store schema. A store written by a newer core is refused (P13). */
-#define WFS_STORE_SCHEMA 2
+/* Store schema. A store written by a newer core is refused (P13).
+ *
+ * PR #1 review (24th round, P1): 3, not M1's 2. Nothing about the schema bump is about columns
+ * -- those are additive and carry defaults (see kMigrations in store.cpp). It is about what a
+ * collector is allowed to delete: M2 put snapshots through the trash, gave a discard in flight
+ * the WFS_ST_TRASHING state and a tree at one of two names, renames a trash entry to
+ * .deleting before unlinking it, and gave the pool a DRAINING state. M1's wfs_gc() knows none
+ * of that -- it protects state=2 world trash paths and sweeps the rest -- so an M1 binary let
+ * loose on an M2 store would recursively delete a snapshot still inside its retention window
+ * and leave the rows pointing at nothing. It must refuse the store instead, and the schema
+ * number is the only thing that makes it. */
+#define WFS_STORE_SCHEMA 3
+/* The schema M1 wrote. A store still carrying it has never been opened by this core, so it
+ * holds nothing an M1 collector cannot handle; wfs_store_open() upgrades it in place. */
+#define WFS_STORE_SCHEMA_M1 2
 
 #define WFS_PATH_MAX 1024
 #define WFS_NAME_MAX 128

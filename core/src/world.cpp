@@ -269,7 +269,12 @@ int marker_read(const char *world_root, MarkerData &out) {
     if (json_u64(buf, "snapshot", &v)) out.snapshot = v;
     if (json_u64(buf, "parent", &v)) out.parent = v;
     if (json_u64(buf, "created_at", &v)) out.created = (int64_t)v;
-    if (out.schema != WFS_STORE_SCHEMA) return WFS_E_SCHEMA;
+    // PR #1 review (24th round, P1): the store schema is 3 now (store.cpp), and a marker carries
+    // the schema of the core that wrote it. The marker's grammar did not change between 2 and 3
+    // -- the bump is about what a collector may delete, not about this file -- and the worlds of
+    // a store we upgrade in place keep the markers they already have, so a 2 is read rather than
+    // refused. A schema this core does not know yet still is: that is the direction P13 is about.
+    if (out.schema < WFS_STORE_SCHEMA_M1 || out.schema > WFS_STORE_SCHEMA) return WFS_E_SCHEMA;
     return 0;
 }
 

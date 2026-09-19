@@ -1,4 +1,4 @@
-// The store: a directory with a VERSION file, a SQLite metadata.db (schema v2), the snapshot
+// The store: a directory with a VERSION file, a SQLite metadata.db (schema v3), the snapshot
 // trees and the trash. Everything that is not snapshot/world lifecycle lives here.
 #include "db.h"
 
@@ -15,7 +15,7 @@ using wfs::Stmt;
 
 namespace {
 
-// Schema v2 (docs/M1_DESIGN.md §2). Snapshot ids and world ids are separate sequences, so
+// Schema v3 (docs/M1_DESIGN.md §2). Snapshot ids and world ids are separate sequences, so
 // S1 and W1 can both exist; the CLI prints the prefix.
 // Run on every open: journal_mode is persistent in the file, but `synchronous` and
 // `foreign_keys` are per-connection.
@@ -93,9 +93,11 @@ const char *kSchema =
     "CREATE INDEX IF NOT EXISTS pool_snap ON pool(snapshot_id, state);";
 
 // Columns added after the first schema-2 stores were written. They are additive and carry
-// defaults, so an older core reading such a store still works and VERSION does not change
-// (P13 is about incompatible schemas, not about new columns). One statement per exec: a
-// combined script would stop at the first column that is already there.
+// defaults, so an older core reading such a store still works and VERSION does not change on
+// their account (P13 is about incompatible schemas, not about new columns). What did move
+// VERSION, in the end, is not a column at all -- see the 24th-round note above check_version().
+// One statement per exec: a combined script would stop at the first column that is already
+// there.
 //
 // PR #1 review (11th round): each one carries the table and the column it adds, because "is
 // this migration still to be run?" and "did it work?" are questions about the schema, and the
@@ -145,11 +147,12 @@ const Migration kMigrations[] = {
      "ALTER TABLE pool ADD COLUMN owner_start INTEGER NOT NULL DEFAULT 0"},
 };
 
-// Additive revision of schema v2. `PRAGMA user_version` carries SCHEMA*100 + REV, so a store
+// Additive revision of the schema. `PRAGMA user_version` carries SCHEMA*100 + REV, so a store
 // written before a column was added still gets the migrations run exactly once: the old code
 // compared user_version against the schema number alone, which meant a store already stamped
-// with 2 never saw a later ALTER TABLE. VERSION (and therefore P13) is untouched -- an older
-// core opens such a store and simply does not use the new columns.
+// with 2 never saw a later ALTER TABLE. The revision counter keeps counting across the 2 -> 3
+// bump: it numbers additive steps, and never resetting it means no two stamps this core has
+// ever written collide.
 const int kSchemaRev = 4;
 inline int user_version_want(void) { return WFS_STORE_SCHEMA * 100 + kSchemaRev; }
 
@@ -217,7 +220,26 @@ void hex_id(char *out, size_t n) { // n = 33 for 32 hex digits + NUL
 // P13: the VERSION file is the first thing read and the first thing written. A store from a
 // different schema is refused before the database is even opened, so an old CLI cannot
 // migrate a new store by accident.
-int check_version(const char *dir) {
+//
+// ---- PR #1 review (24th round, P1): what a collector may delete is part of the schema -------
+//
+// M2 left the store looking, to an M1 binary, exactly like an M1 store -- every column it added
+// was additive, so VERSION stayed at 2 and `main`'s build was still allowed to open it. But M2
+// did not only add columns; it changed what is on disk and what may be done to it. Snapshots go
+// through the trash now (T2.2), a discard in flight commits a row in WFS_ST_TRASHING with the
+// tree at one of two names, the collector renames an entry to `.deleting` before it unlinks it,
+// a pool row can sit in DRAINING, rows carry an owner, and a snapshot carries a hardlink
+// manifest. M1's wfs_gc() knows none of it: it protects `state=2` world trash paths and treats
+// everything else under trash/ and snapshots/ as an orphan to sweep. Run it on an M2 store and
+// it recursively deletes a snapshot still inside its retention window, or the tree of a world
+// whose row says TRASHING, and every M2 row then points at nothing. So: schema 3.
+//
+// That makes "different schema" asymmetric. A store still stamped 2 is one THIS core has never
+// opened -- nothing above exists in it yet -- so it is taken over rather than refused:
+// `*legacy` says so here, and version_upgrade() below rewrites the file to 3 once the database
+// migration has committed. Anything that is neither 2 nor 3 is refused exactly as before.
+int check_version(const char *dir, bool *legacy) {
+    *legacy = false;
     String p(dir);
     p.append("/VERSION");
     int fd = ::open(p.c_str(), O_RDONLY);
@@ -227,16 +249,45 @@ int check_version(const char *dir) {
         ::close(fd);
         if (n <= 0) return -EIO;
         long v = ::strtol(buf, nullptr, 10);
-        return v == WFS_STORE_SCHEMA ? 0 : WFS_E_SCHEMA;
+        if (v == WFS_STORE_SCHEMA) return 0;
+        if (v == WFS_STORE_SCHEMA_M1) { *legacy = true; return 0; }
+        return WFS_E_SCHEMA;
     }
     if (errno != ENOENT) return -errno;
     fd = ::open(p.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
-    if (fd < 0) return errno == EEXIST ? check_version(dir) : -errno;
+    if (fd < 0) return errno == EEXIST ? check_version(dir, legacy) : -errno;
     char line[64];
     int n = ::snprintf(line, sizeof line, "%d\n", WFS_STORE_SCHEMA);
     ssize_t w = ::write(fd, line, (size_t)n);
     ::close(fd);
     return w == n ? 0 : -EIO;
+}
+
+// The 2 -> 3 rewrite of that file. Through a temporary and a rename, because a VERSION that was
+// half overwritten is a store NOTHING can open any more (a short read is -EIO above, in this
+// core and in M1's alike), and the whole value of the file is that a binary older than the one
+// that wrote it can still read it. Called only after the database migration has committed: a
+// store we failed to migrate has not become a schema-3 store, and locking M1 out of it would
+// buy nothing -- it is still the schema-2 store M1's collector can handle.
+int version_upgrade(const char *dir) {
+    String tmp(dir);
+    tmp.append("/VERSION.tmp");
+    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -errno;
+    char line[64];
+    int n = ::snprintf(line, sizeof line, "%d\n", WFS_STORE_SCHEMA);
+    ssize_t w = ::write(fd, line, (size_t)n);
+    int frc = ::fsync(fd);
+    ::close(fd);
+    if (w != n || frc != 0) { ::unlink(tmp.c_str()); return -EIO; }
+    String dst(dir);
+    dst.append("/VERSION");
+    if (::rename(tmp.c_str(), dst.c_str()) != 0) {
+        int e = -errno;
+        ::unlink(tmp.c_str());
+        return e;
+    }
+    return 0;
 }
 
 int meta_get(sqlite3 *db, const char *key, String &out) {
@@ -402,7 +453,8 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
     if (int rc = wfs::fs_mkdir_p(store_dir)) return rc;
     String real;
     if (int rc = wfs::fs_realpath(store_dir, real)) return rc;
-    if (int rc = check_version(real.c_str())) return rc;
+    bool legacy_schema = false;
+    if (int rc = check_version(real.c_str(), &legacy_schema)) return rc;
 
     // P17: never build a fresh database next to trees that the old one was the index of. Ids
     // restart at 1 when the database does, and the first `init` would then be handed S1 with
@@ -455,19 +507,36 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nullptr);
     if (rc != SQLITE_OK) { wfs_store_close(s); return WFS_E_STORE_DAMAGED; }
     sqlite3_busy_timeout(s->db, 10000);
-    if (sqlite3_exec(s->db, kPragmas, nullptr, nullptr, nullptr) != SQLITE_OK) {
-        wfs_store_close(s);
-        return WFS_E_STORE_DAMAGED;
-    }
+    // PR #1 review (24th round, P1): the database's own stamp is read before ANYTHING is written
+    // to it -- before even the journal-mode pragma, which rewrites the file header -- because a
+    // store from a schema we do not know has to come back untouched. `user_version` carries
+    // SCHEMA*100 + REV, so the schema is its hundreds: a store from a future major is refused
+    // with the same P13 code the VERSION file above would have refused it with. That file is
+    // the line of defence that normally speaks; this one is for a database whose stamp and
+    // whose VERSION file disagree, and it is the one thing an older core could not have written
+    // by accident.
     int user_version = 0;
     {
         Stmt q(s->db, "PRAGMA user_version");
         if (q.ok() && q.row()) user_version = (int)q.col_i64(0);
     }
+    if (user_version / 100 > WFS_STORE_SCHEMA) { wfs_store_close(s); return WFS_E_SCHEMA; }
+    if (sqlite3_exec(s->db, kPragmas, nullptr, nullptr, nullptr) != SQLITE_OK) {
+        wfs_store_close(s);
+        return WFS_E_STORE_DAMAGED;
+    }
     // All of it or none of it, and the stamp last (migrate_schema above). A store this fails on
-    // is left un-stamped and untouched, so the next open is the retry.
+    // is left un-stamped and untouched, so the next open is the retry. A schema-2 store gets its
+    // columns from the same table-driven pass -- they were all there already, additively -- and
+    // the 3 in `user_version_want()` is the whole of what the bump costs it.
     if (user_version != user_version_want()) {
         if (int mrc = migrate_schema(s->db)) { wfs_store_close(s); return mrc; }
+    }
+    // Only now the file an older binary reads first. M1 (`main`) does, verbatim:
+    //     return v == WFS_STORE_SCHEMA ? 0 : WFS_E_SCHEMA;   // with WFS_STORE_SCHEMA == 2
+    // so this single line is what keeps its collector off a store that is no longer its own.
+    if (legacy_schema) {
+        if (int vrc = version_upgrade(s->dir.c_str())) { wfs_store_close(s); return vrc; }
     }
     if (meta_get(s->db, "store_id", s->store_id) != 0) {
         char id[33];
