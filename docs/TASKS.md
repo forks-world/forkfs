@@ -1244,6 +1244,55 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第六轮:还得住的基线,还得算数的期限(2026-09-19)
+
+第六轮,Codex 四条(一条 P1、三条 P2)。P1 还是"**谁在写锁下数引用**":fork 和 pool 上一轮都
+已经在写锁里重读快照行了,`adopt` 没有——它只凭 marker 登记,把 marker 里的 snapshot id 原样
+写进一条 ACTIVE 世界行,快照是死是活一概不问。三条 P2 是三处"**失败/中断被当成了正常结果**":
+manifest 读不出来当成"没有硬链接"、`--now` 碰上 collector 改过的名字当成"树已经没了"、
+gc 的期限管得住 trash 却管不住 pool。
+**一条一个提交、一条一个测试,四个测试都先验证过"没有修复就会红"。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `4053405511` | `world.cpp:1604` | `wfs_world_adopt()` 找原世界的行**不看状态**,把 `m.snapshot` 写进新行时也**不在写锁里**确认那个快照还在。于是:唯一一个注册世界被 discard 掉 → 快照引用数为 0、discard 通过 → 再 `adopt` 一份副本,store 里就多了一个 ACTIVE 世界,而它的基线躺在 trash 里(或者已经被 `--now` unlink 了)。它此后每一次 `diff` 都是 `WFS_E_SOURCE_GONE`,`restore` 也是;discard 的引用检查和 rename 之间那一瞬间同样是这个洞 | 把快照行**重读进 adopt 的插入事务**——`Txn` 就是 `BEGIN IMMEDIATE`,和 discard 第 (a) 步拿的是同一把写锁:要么快照还是 ACTIVE、这条新行就是 discard 接下来会数到的引用,要么 discard 先到,`adopt` 以 `WFS_E_SOURCE_GONE` 被拒。**除 ACTIVE 之外一律拒,TRASHING 也拒**:从这里看,"被 kill 在半路的 discard"和"下一步就要 unlink 的 `--now`"长得一模一样。marker 属于**别的 store** 的副本不受影响(这边没有父行,照旧以 snapshot_id 0 收编)。CLI 报出快照号,并告诉你副本还能怎么留(删掉 `.world`、当普通目录 `init`)。`trashing_recover()` 那句"adopt 会绕过这个论证"的注释改成:现在它不会了,那里的引用计数是**双保险** | `48b9c21` |
+| P2 `4053405514` | `world.cpp:1139` | 行上的 `hl_groups` 说"这个快照有 n 组共享 inode 的名字",manifest 的那一节说"是哪些名字"。fork 和 pool 填充都按前者开门、按后者重放,而 `clonefile(2)` 已经把这些链接全断了——两处却都把"manifest 读不出来"和"读出来的组数比行上少"当成"没什么要重放的",然后**照常发布**:快照记着一个 inode 挂两个名字,世界(或者一个 READY 的 pool 条目)里是两个独立文件。没有任何声音,事后也查不出来,因为下游再没有人读 manifest | 两处都改成失败,码是 `WFS_E_SNAPSHOT_DIRTY`("行和 manifest 对不上"正是这个意思)。fork 沿着 do-block 里所有别的失败那条路回滚克隆和 CREATING 行;填充器的错误路删树删行,条目**永远不会变成 READY**。两个数是同一个 `HardlinkSet` 在同一个地方写下的(`wfs_snapshot_create`,而且是在上一轮把"没能完整留下的组"剔掉之后),所以对不上只可能是 manifest 被损坏了。**一个例外**,免得"优化"变成"拒绝":从**活 World** fork 时借的是它来源快照的候选组,现在只在那个快照还 ACTIVE 时借——基线被 trash 掉或被 reconcile 埋掉的世界仍然是世界,仍然 fork 得动,只是没有组可以重建。`wfs_snapshot_verify` 把这一节读回来对数,不一致按 modified 报(整份 manifest 不见是更早就报的错:它同时是门的锁文件) | `42a5f78` |
+| P2 `4053405516` | `world.cpp:1330` | 删一个 trash 条目是两步:先改名成 `.deleting`,再 unlink;collector 把新名字记进行里是**改名之后**另一个事务的事。这中间——以及在这中间被打断之后——行里写的还是那个已经不存在的名字,`trash_mark_deleting()` 于是回 `-ENOENT`。World 的两条 `--now` 路**把它忽略了**:`deleting` 是空的、一次 unlink 都没跑,行标 DEAD、返回 0,而 collector 还在删那棵树。`discard W<n> --now` 承诺的空间没回来,而"树还在磁盘上"的唯一记录已经被写成"dead" | Snapshot 那条路上一轮已经有 `trash_follow_deleting()` 了。把它和 `snapshot_delete_now` 合成一个 `trash_delete_now(s, id, is_snapshot, trash)`(`is_snapshot` 开关的用法和 `trashing_undo`/`trashing_commit` 一致),三个调用点共用:World 的 TRASHED + `--now` 分支、普通 discard 的 `--now` 尾巴(行一变 TRASHED,collector 就可能接手)、以及 snapshot discard。`-ENOENT` 从此是它该有的意思——**两个名字下都没有**,别人已经删完了,行进 DEAD 是因为树真的没了 | `b3fd7b1` |
+| P2 `4053405519` | `world.cpp:2657` | gc 的"便宜那一半"是几个 stat 加一趟 SQLite,所以它每次都整个跑完,跑在有期限的 trash 循环**前面**。`pool_collect()` 在里面——可 pool 条目一点都不便宜:它是**整棵快照的克隆**,一个 12 万条目的陈旧条目一口气删掉要约 5 秒(新用例里量到的)。于是两秒一轮的 worker、或者一次交互式 `gc`,可以在这里花掉几分钟而从不看表,正是 `max_secs` 要挡的前台争用(P16) | `pool_collect()` 收下本轮的期限和 report 的 `work_remains`:每棵树之前看一次表,并把期限交给 `fs_remove_tree()`(它的遍历上一轮起就是**逐条目**看表的),所以大树停在半路而不是只停在树与树之间。没删完的东西保持**后继能重新发现它**的形状:pool 行还在、无主目录还列得出来,下一轮照样被判 doomed。半删的树永远不会被当成 ready 条目发出去——`pool_claim()` 只认 `state=1` 且 `snapshot_id`/`snap_created_at` 属于某个 ACTIVE 快照的行,而 doomed 的行必定至少破一条。分类那一半拆成 `pool_scan`,于是 `gc --status` 能数而不删:`wfs_trash_stat` 多一个 `pool_stranded`(和上一轮的 `creating_stranded` 并排),CLI 多一行。交互式 `gc`(不带 `--now`——带了就是"整件事现在做")也收下 worker 的批次上限,剩下的按**这份 report** 起 worker,而不是问只懂 trash 的 `wfs_gc_pending()` | `091cb97` |
+
+**验收**:`safety.sh` **207 passed, 0 failed**(上一轮 187 → 本轮 +20:adopt 3 条、manifest 7 条、
+`--now` 跟名字 4 条、pool 期限 6 条);`ctest`(WFS_FSKIT=OFF)**2/2**;`check-deps.sh` 全绿
+(没有新的系统调用、没有新的库)。
+
+四条都先把测试跑红过:
+
+- adopt:把那段状态检查编译掉 → `core_test:1481` 的 `wfs_world_adopt(...)` 回 0,要的是 `-1011`。
+- manifest:把两处检查换回老写法 → `core_test:1716` 的 fork 和 `core_test:1723` 的 pool fill
+  都回 0(要 `-1008`);`safety.sh` 那两条 pool 断言是 "exit 0, wanted 3"。
+- `--now`:把 `trash_follow_deleting()` 从公共函数里拿掉 → "树真的没了""trash 空了"两条红,
+  而退出码仍是 0、行仍然是 dead——**这就是这个 bug 的一句话版本**。
+- pool 期限:不把期限传下去 → 同一次 wake 跑了 **4924 ms**(修好之后 1041 ms)、把整个条目删光、
+  什么都没报,六条里红四条。
+
+新增测试:
+
+- `core_test`(P1):自己的一个 store。ACTIVE 时 adopt 成功、行带着基线、`diff` 跑得通,而且
+  这个被收编的世界本身就让 `discard S<n>` 变成 `WFS_E_SNAPSHOT_IN_USE`(同一条不变量的另一半);
+  把引用全撤掉再 discard 快照,TRASHED(不带 `--now`)和 DEAD(带 `--now`)两种状态下 adopt 都
+  被拒、**什么都没写下去**(没有行、副本仍是未注册副本);另一个 store 的世界副本照旧收编得了。
+  TRASHING 那一段窗口在第五轮那个崩溃缝的块里钉着:那里原来靠 adopt 制造"检查之后才出现的引用"。
+- `core_test`(manifest):一对硬链接的快照,把 manifest 里的 `hl ` 行剥掉,要求 verify、fork、
+  pool fill 三处都拒,`--to` 上没有树、没有 `.wfs-fork-` 残留、没有留下行、pool 里没有条目;
+  把 manifest 放回去,三处都恢复正常、两个名字又是同一个 inode。"整份读不出来"那一半用
+  `--hard` 快照来测(门控快照的 manifest 就是门的锁文件,删了会更早地报错)。
+- `safety.sh`(`--now`):discard 一个世界,**手工替 collector 做它的第一步**改名
+  (`W<n>-<t>` → `W<n>-<t>.deleting`,第二步故意不做),然后 `discard W<n> --now` 必须返回 0、
+  树没了、trash 空了、行是 dead。
+- `safety.sh`(pool 期限):预克隆一个 **12 万条目**的 pool 条目,再把它的快照从 store 底下抽走
+  (于是行 dangling、`--reconcile` 埋掉它,条目就此陈旧),给一秒预算。这一轮 wake 要按时回来、
+  把没做完的留在后继找得到的地方、在输出里说自己交班了、被 `gc --status` 数出来,
+  而后继链要自己把它收干净。
+
 #### PR #1 review 第五轮:崩溃窗口与"源是活的"(2026-09-19)
 
 第五轮,Codex 四条(一条 P1、三条 P2)。P1 是 discard 的崩溃窗口——**行和树之间那一瞬间**,
