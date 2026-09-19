@@ -230,6 +230,36 @@ else
     ls "$WORLD_STORE/trash" | sed 's/^/        /'
 fi
 
+# ---- PR #1 review (3rd round): gc leaves a fork that is still running alone ---------------------
+# A CREATING row means "somebody is building this tree". gc read every one of them as "somebody
+# WAS building this tree", so a collector spawned by one command and a clone started by another
+# overlapped badly: the worker deleted the live fork's tree and its row, and the fork then
+# "succeeded" with an UPDATE that matched nothing, leaving a directory at --to that no row knew
+# about. The producer's pid is on the row now. The row here is written directly, because the only
+# other way to hold a fork open for the length of a gc is to race it.
+if command -v sqlite3 > /dev/null 2>&1; then
+    mkdir -p "$SCRATCH/pr3live/.wfs-fork-live/sub"
+    touch "$SCRATCH/pr3live/.wfs-fork-live/sub/half"
+    sqlite3 "$WORLD_STORE/metadata.db" "INSERT INTO worlds(kind,parent_world,snapshot_id,name,path,state,created_at,tmp_path,owner_pid,owner_start) VALUES(1,0,1,'pr3live','$SCRATCH/pr3live/w',0,0,'$SCRATCH/pr3live/.wfs-fork-live',$$,0);" 2>/dev/null
+    # created_at 0 and no minimum age: the producer being alive is the only thing protecting it.
+    WORLD_GC_CREATING_MIN_AGE=0 "$WORLD" fs gc > /dev/null 2>&1
+    if [ -e "$SCRATCH/pr3live/.wfs-fork-live/sub/half" ] &&
+       [ "$(sqlite3 "$WORLD_STORE/metadata.db" "SELECT state FROM worlds WHERE name='pr3live';")" = 0 ]; then
+        ok PR3 "gc leaves a CREATING row alone while its producer is alive"
+    else
+        bad PR3 "gc leaves a CREATING row alone while its producer is alive"
+    fi
+    # And once the producer is gone, that same row and that same tree are collected.
+    sqlite3 "$WORLD_STORE/metadata.db" "UPDATE worlds SET owner_pid=2147480000 WHERE name='pr3live';"
+    WORLD_GC_CREATING_MIN_AGE=0 "$WORLD" fs gc > /dev/null 2>&1
+    if [ ! -e "$SCRATCH/pr3live/.wfs-fork-live" ] &&
+       [ "$(sqlite3 "$WORLD_STORE/metadata.db" "SELECT state FROM worlds WHERE name='pr3live';")" = 3 ]; then
+        ok PR3 "gc collects it once the producer is gone"
+    else
+        bad PR3 "gc collects it once the producer is gone"
+    fi
+fi
+
 # ---- P12: two commands at once do not corrupt the store -----------------------------------------
 "$WORLD" fs fork --from S1 --to "$SCRATCH/par-a" > "$SCRATCH/pa.log" 2>&1 &
 "$WORLD" fs fork --from S1 --to "$SCRATCH/par-b" > "$SCRATCH/pb.log" 2>&1 &

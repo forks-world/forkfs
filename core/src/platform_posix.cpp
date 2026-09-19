@@ -4,6 +4,7 @@
 #include <dirent.h>
 #include <stdio.h>
 #include <errno.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -101,6 +102,53 @@ int threads_start(pthread_t *th, int want, void *(*fn)(void *), void *arg) {
         if (::pthread_create(&th[started], nullptr, fn, arg) == 0) ++started;
     }
     return started;
+}
+
+int64_t fs_pid_start_sec(int64_t pid) {
+    if (pid <= 0) return 0;
+#ifdef __APPLE__
+    struct kinfo_proc kp;
+    size_t len = sizeof kp;
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid};
+    if (::sysctl(mib, 4, &kp, &len, nullptr, 0) != 0 || len == 0) return 0;
+    return (int64_t)kp.kp_proc.p_starttime.tv_sec;
+#else
+    // /proc/<pid>/stat field 22 is the start time in clock ticks since boot. The comm field can
+    // contain spaces and parentheses, so the scan starts after the LAST ')'.
+    char path[64];
+    ::snprintf(path, sizeof path, "/proc/%lld/stat", (long long)pid);
+    FILE *f = ::fopen(path, "r");
+    if (!f) return 0;
+    char buf[4096];
+    size_t n = ::fread(buf, 1, sizeof buf - 1, f);
+    ::fclose(f);
+    buf[n] = 0;
+    char *p = ::strrchr(buf, ')');
+    if (!p) return 0;
+    int field = 2;   // the next token is field 3 (state)
+    for (char *t = ::strtok(p + 1, " "); t; t = ::strtok(nullptr, " "))
+        if (++field == 22) return ::strtoll(t, nullptr, 10);
+    return 0;
+#endif
+}
+
+bool producer_alive(int64_t pid, int64_t start_sec) {
+    if (pid <= 0) return false;                       // nobody was recorded
+    if (::kill((pid_t)pid, 0) != 0 && errno == ESRCH) return false;
+    if (start_sec > 0) {
+        int64_t now_start = fs_pid_start_sec(pid);
+        if (now_start > 0 && now_start != start_sec) return false;   // the pid was reused
+    }
+    return true;                                      // alive, or we cannot tell: leave it be
+}
+
+int64_t creating_min_age_secs(void) {
+    if (const char *e = ::getenv("WORLD_GC_CREATING_MIN_AGE")) {
+        char *end = nullptr;
+        long long v = ::strtoll(e, &end, 10);
+        if (end != e && v >= 0) return (int64_t)v;
+    }
+    return 60;
 }
 
 namespace {

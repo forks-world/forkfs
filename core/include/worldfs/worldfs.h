@@ -689,6 +689,11 @@ extern void *wfs_test_after_pool_claim_ctx;
 extern int (*wfs_test_before_fork_publish)(void *ctx, wfs_id world, const char *tmp_path);
 extern void *wfs_test_before_fork_publish_ctx;
 
+/* The pid a CREATING row records as the process building it. 0, its value in every real run,
+ * means getpid(). A test sets it to a pid that is not running to produce the one state a single
+ * process cannot otherwise reach: a half-built tree whose producer is gone. */
+extern int64_t wfs_test_fork_owner_pid;
+
 /* And the thing no test can provoke on a healthy machine: a pthread_create that fails for one
  * worker slot and succeeds for a later one. A bit set here refuses that slot (slots 0..31); 0,
  * the value it has everywhere else, means every slot is started normally. */

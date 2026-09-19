@@ -60,6 +60,24 @@ using InodeTable = stdb::container::dense_map<uint64_t, NodeRec>;
 // that is not a test of this function.
 int threads_start(pthread_t *th, int want, void *(*fn)(void *), void *arg);
 
+// ---- PR #1 review (3rd round): telling a crashed producer from a slow one --------------------
+//
+// A CREATING row means "somebody is building this tree". gc used to read it as "somebody WAS
+// building this tree and is not any more", which is only true once the producer is gone -- a
+// clone of a big tree easily outlives the two-second pause before an auto-spawned worker starts
+// its cheap pass, and that worker would then delete an in-flight fork's tree and its row.
+//
+// Who the producer was: the pid plus that process's own start time. kill(pid, 0) alone is not
+// enough, because pids are reused; a pid that is alive but started at a different second than
+// the row recorded is somebody else. Unknown (0, or a kernel that will not say) is read as
+// "still alive", because refusing to collect is always the safe mistake.
+int64_t fs_pid_start_sec(int64_t pid);
+bool producer_alive(int64_t pid, int64_t start_sec);
+// How old a CREATING row must be before gc will touch it even with its producer gone: the
+// second half of the rule, and the answer for rows written by a core that recorded no producer
+// at all. 60 s, or WORLD_GC_CREATING_MIN_AGE seconds.
+int64_t creating_min_age_secs(void);
+
 int fs_lstat(const char *path, wfs_attr &out);
 int fs_readlink(const char *path, char *buf, size_t cap, size_t *len);
 int fs_mkfile(const char *path, uint32_t mode);

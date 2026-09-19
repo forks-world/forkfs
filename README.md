@@ -119,6 +119,10 @@ Knobs, all environment variables read by the worker: `WORLD_GC_BATCH` (entries p
 `WORLD_GC_BATCH_SECS` (seconds per wake, 2), `WORLD_GC_PAUSE_MS` (the gap before a successor
 starts, 2000) and `WORLD_GC_THREADS` (unlink threads, 4). The defaults are a duty cycle: the
 collector works in bursts with gaps, which is what keeps it out of the foreground's way (P16).
+One more, `WORLD_GC_CREATING_MIN_AGE` (60 s): how old a half-built row must be before the
+collector will touch it even with its producer gone. A row being built by a process that is
+still alive is never collected, whatever its age — a fork of a large tree easily outlives the
+gap before a worker wakes, and deleting its tree out from under it is not a garbage collection.
 
 Discarding a **snapshot** goes through the same trash. It is refused while an ACTIVE world was
 forked from it — `diff` and `verify` need that baseline, so the source is never taken out from

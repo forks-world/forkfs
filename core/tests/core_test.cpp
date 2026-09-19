@@ -504,6 +504,10 @@ int main() {
 
     // The crash the temp path exists for: the clone is made and recorded, the publish rename
     // never happens. gc removes exactly the recorded path and marks the row DEAD.
+    //
+    // The row has to look abandoned for that, which from inside one process means writing a pid
+    // that is not running (PR #1 review, 3rd round: a CREATING row whose producer is alive is
+    // work in progress, not litter) and switching off the minimum age that backs that rule up.
     char crashtgt[4096];
     join(crashtgt, sizeof crashtgt, worlds, "wcrash");
     crash_seen.world = 0;
@@ -511,8 +515,28 @@ int main() {
     wfs_test_before_fork_publish = crash_before_publish;
     wfs_test_before_fork_publish_ctx = &crash_seen;
     wfs_id wcrash = 0;
+
+    // First: the same crash with THIS process recorded as the producer -- alive, by definition.
+    // gc must not touch it, which is the overlapping-worker case: a clone that outlives the
+    // pause before an auto-spawned worker starts used to have its tree and its row deleted.
+    CHECK_RC(wfs_world_create(s, from, crashtgt, &opts, &wcrash), -EINTR);
+    CHECK(crash_seen.world != 0 && exists(crash_seen.tmp));
+    setenv("WORLD_GC_CREATING_MIN_AGE", "0", 1);        // age is not what protects it here
+    memset(&gc, 0, sizeof gc);
+    CHECK_OK(wfs_gc(s, 0, &gc));
+    CHECK(exists(crash_seen.tmp));                      // still building, as far as gc knows
+    CHECK_OK(wfs_world_info(s, crash_seen.world, &wr));
+    CHECK(wr.state == WFS_ST_CREATING);
+    rm_rf(crash_seen.tmp);                              // clean up after the live-producer case
+
+    // Now the producer is gone. A pid that does not exist, the same one the lock tests use.
+    wfs_test_fork_owner_pid = 2147480000;
+    join(crashtgt, sizeof crashtgt, worlds, "wcrash2");
+    crash_seen.world = 0;
+    crash_seen.tmp[0] = 0;
     CHECK_RC(wfs_world_create(s, from, crashtgt, &opts, &wcrash), -EINTR);
     wfs_test_before_fork_publish = NULL;
+    wfs_test_fork_owner_pid = 0;
     CHECK(crash_seen.world != 0 && crash_seen.tmp[0]);
     CHECK(!exists(crashtgt));                                      // never published
     CHECK(exists(crash_seen.tmp));                                 // the clone is still there
@@ -537,8 +561,10 @@ int main() {
     crash_seen.world = 0;
     crash_seen.tmp[0] = 0;
     wfs_test_before_fork_publish = crash_before_publish;
+    wfs_test_fork_owner_pid = 2147480000;
     CHECK_RC(wfs_world_create(s, from, crashtgt, &opts, &wcrash), -EINTR);
     wfs_test_before_fork_publish = NULL;
+    wfs_test_fork_owner_pid = 0;
     CHECK(exists(crash_seen.tmp));
     rm_rf(crash_seen.tmp);
     memset(&gc, 0, sizeof gc);

@@ -158,9 +158,13 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
     {
         Guard g(s->mu);
         Txn t(s->db);
+        // PR #1 review (3rd round): who is filling this entry, so gc can tell a filler that died
+        // from one that is still cloning a 50 000-entry tree.
+        int64_t opid = (int64_t)::getpid();
+        int64_t ostart = fs_pid_start_sec(opid);
         Stmt ins(s->db,
-                 "INSERT INTO pool(snapshot_id, snap_created_at, uuid, path, entries, created_at, state)"
-                 " VALUES(?,?,?,?,?,?,0)");
+                 "INSERT INTO pool(snapshot_id, snap_created_at, uuid, path, entries, created_at,"
+                 " owner_pid, owner_start, state) VALUES(?,?,?,?,?,?,?,?,0)");
         if (!ins.ok()) return -EIO;
         ins.i64(1, (int64_t)snapshot);
         ins.i64(2, si.created_at);
@@ -168,6 +172,8 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
         ins.text(4, path.c_str());
         ins.i64(5, (int64_t)si.entries);
         ins.i64(6, created);
+        ins.i64(7, opid);
+        ins.i64(8, ostart);
         if (ins.step() != SQLITE_DONE) return -EIO;
         row = (wfs_id)sqlite3_last_insert_rowid(s->db);
         t.commit();
@@ -338,17 +344,30 @@ int pool_collect(wfs_store *s, uint64_t *removed) {
         Guard g(s->mu);
         // Left joined by hand: one pass over the pool, one lookup per row. A store has a
         // handful of snapshots, so this is cheaper than it looks.
-        Stmt q(s->db, "SELECT id, snapshot_id, snap_created_at, path, state FROM pool ORDER BY id");
+        Stmt q(s->db, "SELECT id, snapshot_id, snap_created_at, path, state, owner_pid,"
+                      " owner_start, created_at FROM pool ORDER BY id");
         if (!q.ok()) return -EIO;
         Stmt snap(s->db, "SELECT created_at, state FROM snapshots WHERE id=?");
         if (!snap.ok()) return -EIO;
+        int64_t reap_before = now_sec() - creating_min_age_secs();
         while (q.row()) {
             wfs_id id = (wfs_id)q.col_i64(0);
             wfs_id sid = (wfs_id)q.col_i64(1);
             int64_t sat = q.col_i64(2);
             String path(q.col_text(3));
             int state = (int)q.col_i64(4);
-            bool doomed = state != 1; // still CREATING: the filler died
+            // Still CREATING: the filler died -- or is still cloning. PR #1 review (3rd round):
+            // a 50 000-entry clone takes 0.6 s and a pool fill runs several of them, so a gc
+            // that started in the middle used to delete the tree the filler was still writing.
+            bool building = state != 1;
+            if (building && (producer_alive(q.col_i64(5), q.col_i64(6)) || q.col_i64(7) > reap_before)) {
+                String t(path);
+                t.append(WFS_TMP_SUFFIX);
+                live.emplace_back(path);   // and the <uuid>.wfs-tmp it is cloning into
+                live.emplace_back(t);
+                continue;
+            }
+            bool doomed = building;
             if (!doomed) {
                 sqlite3_reset(snap.s);
                 snap.i64(1, (int64_t)sid);
@@ -359,6 +378,14 @@ int pool_collect(wfs_store *s, uint64_t *removed) {
             if (doomed) { rows.emplace_back(id); trees.emplace_back(path); }
             else live.emplace_back(path);
         }
+        // PR #1 review (3rd round): an entry a fork has claimed has no pool row any more -- the
+        // claim deletes it -- so the sweep below saw an unclaimed directory and removed the tree
+        // the fork was about to rename into place. The fork's CREATING world row records that
+        // entry as its tmp_path; while such a row exists, the tree it names is somebody's work
+        // in progress, and gc's own CREATING pass is what decides when it is not.
+        Stmt w(s->db, "SELECT tmp_path FROM worlds WHERE state=0 AND tmp_path<>''");
+        if (w.ok())
+            while (w.row()) live.emplace_back(w.col_text(0));
     }
     for (size_t i = 0; i < trees.size(); ++i) {
         String tmp(trees[i]);

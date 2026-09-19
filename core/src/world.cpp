@@ -458,6 +458,15 @@ int space_check(const char *near_path, uint64_t entries) {
     return avail < need ? WFS_E_LOW_SPACE : 0;
 }
 
+// PR #1 review (3rd round): who is building this tree. The pid and this process's own start
+// time go onto every CREATING row, so gc can tell "the producer crashed" from "the producer is
+// still cloning". wfs_test_fork_owner_pid lets core_test write a pid that is not running, which
+// is the only way to produce the abandoned case from inside one process.
+void owner_now(int64_t &pid, int64_t &start) {
+    pid = wfs_test_fork_owner_pid ? wfs_test_fork_owner_pid : (int64_t)::getpid();
+    start = wfs::fs_pid_start_sec(pid);
+}
+
 // ---- the fork's temporary name ---------------------------------------------------------------
 //
 // PR #1 review, third round. A fork builds its clone next to the target -- it has to, because
@@ -558,6 +567,9 @@ extern "C" void *wfs_test_after_pool_claim_ctx = nullptr;
 extern "C" int (*wfs_test_before_fork_publish)(void *ctx, wfs_id world, const char *tmp_path) = nullptr;
 extern "C" void *wfs_test_before_fork_publish_ctx = nullptr;
 
+// And the pid a CREATING row records as its producer: 0 (always, outside a test) means getpid().
+extern "C" int64_t wfs_test_fork_owner_pid = 0;
+
 // ---- snapshots --------------------------------------------------------------------------------
 
 extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_snapshot_opts *opts,
@@ -602,9 +614,11 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
     {
         Guard g(s->mu);
         Txn t(s->db);
+        int64_t opid = 0, ostart = 0;
+        owner_now(opid, ostart);
         Stmt ins(s->db,
-                 "INSERT INTO snapshots(name, path, src_path, from_world, created_at, state, hard)"
-                 " VALUES(?,'',?,?,?,?,?)");
+                 "INSERT INTO snapshots(name, path, src_path, from_world, created_at, state, hard,"
+                 " owner_pid, owner_start) VALUES(?,'',?,?,?,?,?,?,?)");
         if (!ins.ok()) return -EIO;
         ins.text(1, nm);
         ins.text(2, src.c_str());
@@ -612,6 +626,8 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         ins.i64(4, now_sec());
         ins.i64(5, WFS_ST_CREATING);
         ins.i64(6, o.hard ? 1 : 0);
+        ins.i64(7, opid);
+        ins.i64(8, ostart);
         if (ins.step() != SQLITE_DONE) return -EIO;
         id = (wfs_id)sqlite3_last_insert_rowid(s->db);
         t.commit();
@@ -748,9 +764,14 @@ int pool_fork_insert(void *ctx, const wfs::PoolClaim &c) {
         q.i64(1, (int64_t)r->snapshot);
         if (!q.row() || q.col_i64(0) != WFS_ST_ACTIVE) return -ESTALE;
     }
+    int64_t opid = 0, ostart = 0;
+    owner_now(opid, ostart);
+    // tmp_path is the pool entry itself: it is where this fork's tree is until the rename, and
+    // it is what keeps pool_collect from sweeping a claimed entry out from under a live fork.
     Stmt ins(r->s->db,
              "INSERT INTO worlds(kind, parent_world, snapshot_id, name, path, state,"
-             " fsevents_id, entries, created_at) VALUES(?,?,?,?,?,?,?,?,?)");
+             " fsevents_id, entries, created_at, tmp_path, owner_pid, owner_start)"
+             " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)");
     if (!ins.ok()) return -EIO;
     ins.i64(1, WFS_O_SNAPSHOT);
     ins.i64(2, 0);
@@ -761,6 +782,9 @@ int pool_fork_insert(void *ctx, const wfs::PoolClaim &c) {
     ins.i64(7, (int64_t)r->fsevents);
     ins.i64(8, (int64_t)c.entries);
     ins.i64(9, r->created);
+    ins.text(10, c.path.c_str());
+    ins.i64(11, opid);
+    ins.i64(12, ostart);
     if (ins.step() != SQLITE_DONE) return -EIO;
     r->world = (wfs_id)sqlite3_last_insert_rowid(r->s->db);
     return 0;
@@ -895,20 +919,28 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
             // P7 again: the entry is store-internal, the target is not. RENAME_EXCL, so a
             // directory that appeared at `--to` since check_path looked is EEXIST and the entry
             // goes back into the pool -- never a replacement, whatever raced us.
-            if (!rc) rc = wfs::fs_rename_excl(claim.path.c_str(), target.c_str());
+            bool renamed = false;
+            if (!rc && (rc = wfs::fs_rename_excl(claim.path.c_str(), target.c_str())) == 0)
+                renamed = true;
             struct stat st;
             if (!rc && ::stat(target.c_str(), &st) != 0) rc = -errno;
             if (!rc) {
                 Guard g(s->mu);
                 Txn t(s->db);
-                Stmt u(s->db, "UPDATE worlds SET dir_dev=?, dir_ino=?, state=? WHERE id=?");
+                Stmt u(s->db, "UPDATE worlds SET dir_dev=?, dir_ino=?, state=?, tmp_path='',"
+                              " owner_pid=0, owner_start=0 WHERE id=? AND state=?");
                 if (!u.ok()) rc = -EIO;
                 else {
                     u.i64(1, (int64_t)st.st_dev);
                     u.i64(2, (int64_t)st.st_ino);
                     u.i64(3, WFS_ST_ACTIVE);
                     u.i64(4, (int64_t)id);
+                    u.i64(5, WFS_ST_CREATING);
+                    // The row has to still be there (PR #1 review, 3rd round). If it is not,
+                    // the tree goes back into the pool below rather than being left at --to
+                    // with nothing in the database that knows about it.
                     if (u.step() != SQLITE_DONE) rc = -EIO;
+                    else if (sqlite3_changes(s->db) != 1) rc = -ESTALE;
                     else t.commit();
                 }
             }
@@ -928,6 +960,10 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
                 if (del.ok()) { del.i64(1, (int64_t)id); del.step(); }
                 t.commit();
             }
+            // The rename may already have happened (the failure was the stat or the row); put
+            // the tree back under its pool name first, or pool_return would find nothing there
+            // and the entry would be left at --to with no row that knows about it.
+            if (renamed) wfs::fs_rename_excl(target.c_str(), claim.path.c_str());
             wfs::pool_return(s, claim);   // and fall through to cloning it here and now
         }
     }
@@ -964,9 +1000,12 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
             q.i64(1, (int64_t)snapshot_id);
             if (!q.row() || q.col_i64(0) != WFS_ST_ACTIVE) return -ESTALE;
         }
+        int64_t opid = 0, ostart = 0;
+        owner_now(opid, ostart);
         Stmt ins(s->db,
                  "INSERT INTO worlds(kind, parent_world, snapshot_id, name, path, state,"
-                 " fsevents_id, entries, created_at) VALUES(?,?,?,?,?,?,?,?,?)");
+                 " fsevents_id, entries, created_at, owner_pid, owner_start)"
+                 " VALUES(?,?,?,?,?,?,?,?,?,?,?)");
         if (!ins.ok()) return -EIO;
         ins.i64(1, from.kind == WFS_K_SNAPSHOT ? WFS_O_SNAPSHOT : WFS_O_WORLD);
         ins.i64(2, (int64_t)parent_world);
@@ -977,6 +1016,8 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         ins.i64(7, (int64_t)ev);
         ins.i64(8, (int64_t)entries);
         ins.i64(9, created);
+        ins.i64(10, opid);
+        ins.i64(11, ostart);
         if (ins.step() != SQLITE_DONE) return -EIO;
         id = (wfs_id)sqlite3_last_insert_rowid(s->db);
         t.commit();
@@ -1065,15 +1106,26 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         Txn t(s->db);
         // tmp_path goes with the publish: the tree is at `target` now, and a row that still
         // named the temporary would be pointing gc at a path that is not there any more.
-        Stmt u(s->db, "UPDATE worlds SET dir_dev=?, dir_ino=?, entries=?, state=?, tmp_path=''"
-                      " WHERE id=?");
+        Stmt u(s->db, "UPDATE worlds SET dir_dev=?, dir_ino=?, entries=?, state=?, tmp_path='',"
+                      " owner_pid=0, owner_start=0 WHERE id=? AND state=?");
         if (!u.ok()) return -EIO;
         u.i64(1, (int64_t)st.st_dev);
         u.i64(2, (int64_t)st.st_ino);
         u.i64(3, (int64_t)entries);
         u.i64(4, WFS_ST_ACTIVE);
         u.i64(5, (int64_t)id);
+        u.i64(6, WFS_ST_CREATING);
         if (u.step() != SQLITE_DONE) return -EIO;
+        // PR #1 review (3rd round): this used to be a fire-and-forget UPDATE. If something had
+        // buried the row in the meantime -- which is exactly what an over-eager gc did -- the
+        // fork returned success and left a directory at --to that no row knows about: not a
+        // world, not collectable, and `verify` would call it an unregistered copy. A row that
+        // is not there is a failure, and the tree goes back where it came from.
+        if (sqlite3_changes(s->db) != 1) {   // the Txn destructor rolls back
+            if (wfs::fs_rename_excl(target.c_str(), tmp.c_str()) == 0)
+                wfs::fs_remove_tree(tmp.c_str());
+            return -ESTALE;
+        }
         t.commit();
     }
     res->world = id;
@@ -2120,14 +2172,27 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
     // user's directory happens to end in .wfs-tmp". A row whose tmp_path is empty (a pool-backed
     // fork: its tree is a store-internal pool entry, collected by pool_collect below) or whose
     // tmp_path is no longer there is just marked DEAD.
+    //
+    // And only rows whose producer is gone (PR #1 review, 3rd round): a CREATING row means
+    // "somebody is building this", and gc used to read every one of them as "somebody was". A
+    // clone of a big tree outlives the two-second pause before an auto-spawned worker runs its
+    // cheap pass, so the worker deleted a live fork's tree and its row, and the fork then
+    // "succeeded" with an UPDATE that matched nothing -- an unregistered directory at --to.
+    int64_t reap_before = now_sec() - wfs::creating_min_age_secs();
     {
         Vec<wfs_id> creating;
         Vec<String> cpaths;
         {
             Guard g(s->mu);
-            Stmt q(s->db, "SELECT id, tmp_path FROM worlds WHERE state=0");
+            Stmt q(s->db, "SELECT id, tmp_path, owner_pid, owner_start, created_at"
+                          " FROM worlds WHERE state=0");
             if (!q.ok()) return -EIO;
-            while (q.row()) { creating.emplace_back((wfs_id)q.col_i64(0)); cpaths.emplace_back(q.col_text(1)); }
+            while (q.row()) {
+                if (wfs::producer_alive(q.col_i64(2), q.col_i64(3))) continue;
+                if (q.col_i64(4) > reap_before) continue;
+                creating.emplace_back((wfs_id)q.col_i64(0));
+                cpaths.emplace_back(q.col_text(1));
+            }
         }
         for (size_t i = 0; i < creating.size(); ++i) {
             if (gc_tmp_is_removable(s, creating[i], cpaths[i].c_str()) &&
@@ -2146,9 +2211,13 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
         Vec<wfs_id> snap_gone;
         {
             Guard g(s->mu);
-            Stmt q(s->db, "SELECT id FROM snapshots WHERE state=0");
+            Stmt q(s->db, "SELECT id, owner_pid, owner_start, created_at FROM snapshots WHERE state=0");
             if (!q.ok()) return -EIO;
-            while (q.row()) snap_gone.emplace_back((wfs_id)q.col_i64(0));
+            while (q.row()) {
+                if (wfs::producer_alive(q.col_i64(1), q.col_i64(2))) continue;   // still cloning
+                if (q.col_i64(3) > reap_before) continue;
+                snap_gone.emplace_back((wfs_id)q.col_i64(0));
+            }
         }
         for (size_t i = 0; i < snap_gone.size(); ++i) {
             String tmp = numbered(snaps.c_str(), 'S', snap_gone[i], WFS_TMP_SUFFIX);
