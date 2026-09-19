@@ -45,6 +45,11 @@ bool exists(const char *p) {
     return ::lstat(p, &st) == 0;
 }
 
+// PR #1 review (12th round), the same rule world.cpp states: presence is assumed unless absence
+// is proven. exists() reads an EACCES, an EIO or an unmounted volume as "not there", and every
+// verdict below that deletes a row or stops keeping track of a tree used to be made on it.
+bool proven_gone(const char *p) { return fs_gone(fs_probe(p)); }
+
 String pool_root(wfs_store *s) { return joinp(s->dir.c_str(), "pool"); }
 
 String pool_dir_of(wfs_store *s, wfs_id snapshot) {
@@ -279,7 +284,13 @@ int pool_claim(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, PoolClaim
     // an error worth failing the fork for: report "empty pool" and let the caller clone. The row
     // goes either way -- an entry whose tree has vanished is never coming back -- but the hook
     // does not run for a claim that cannot be honoured.
-    bool gone = !exists(out.path.c_str());
+    // PR #1 review (12th round): the row is deleted above either way -- an entry whose tree has
+    // vanished is never coming back -- but `gone` also decides whether the hand-out happens, and
+    // an lstat(2) that failed for EACCES or EIO is not a vanished tree. Assume it is there: the
+    // hook then fails on the tree itself and the Txn destructor rolls the DELETE back, so the
+    // entry survives to be collected properly instead of being dropped from the database with
+    // its clone left on disk.
+    bool gone = proven_gone(out.path.c_str());
     if (!gone && on_claimed) {
         if (int rc = on_claimed(hook_ctx, out)) return rc;   // the Txn destructor rolls back
     }
@@ -522,7 +533,7 @@ uint64_t pool_sweep_orphans(wfs_store *s, const Vec<String> &live, bool remove, 
         int partial = 0;
         int rc = fs_remove_tree(p.c_str(), deadline_us, &partial);
         if (partial) { if (out_of_time) *out_of_time = true; break; }
-        if (rc == 0 && !exists(p.c_str())) { ++n; gc_fail_clear(s, pool_fail_key(p).c_str()); continue; }
+        if (rc == 0 && proven_gone(p.c_str())) { ++n; gc_fail_clear(s, pool_fail_key(p).c_str()); continue; }
         // PR #1 review (8th round): it did not go. Nothing else in the store names this
         // directory -- the row it belonged to is gone or never existed -- so saying nothing
         // about it means it leaks silently until somebody runs gc by hand. Count it, and
@@ -586,7 +597,8 @@ int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us, int *work
         // state=1 rows whose snapshot is the ACTIVE one being forked from, and this entry is
         // doomed precisely because that is no longer true -- it is simply collected again.
         String key = pool_fail_key(trees[i]);
-        if (exists(trees[i].c_str()) || exists(tmp.c_str())) {
+        // PR #1 review (12th round): proven gone, both of them, or the row stays.
+        if (!proven_gone(trees[i].c_str()) || !proven_gone(tmp.c_str())) {
             if (failed) (*failed)++;
             if (gc_fail_bump(s, key.c_str()) < kGcFailCap && work_remains) *work_remains = 1;
             // The row stayed, so the tree is not row-less: the sweep below must not count it a
@@ -622,7 +634,7 @@ int pool_stranded(wfs_store *s, uint64_t *out) {
     for (size_t i = 0; i < trees.size(); ++i) {
         String tmp(trees[i]);
         tmp.append(WFS_TMP_SUFFIX);
-        if (exists(trees[i].c_str()) || exists(tmp.c_str())) ++n;
+        if (!proven_gone(trees[i].c_str()) || !proven_gone(tmp.c_str())) ++n;
         // A doomed row's tree is counted here, and it is not a row-less orphan as well: the two
         // rules used to meet on it and `gc --status` reported one stale entry as two (PR #1
         // review, 8th round -- the same double count the collector's own failure path had).

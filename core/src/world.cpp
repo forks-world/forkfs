@@ -455,7 +455,13 @@ int check_path(wfs_store *s, const char *in, PathMode mode, String &real, bool *
     bool self = true;
     for (;;) {
         String m = joinp(p.c_str(), WFS_MARKER_NAME);
-        if (exists(m.c_str())) {
+        // PR #1 review (12th round): "no marker here" has to mean no marker, not "the question
+        // could not be asked". This was a bool over lstat(2), so an EACCES or an EIO on an
+        // ancestor read as "clean" and P7's one guard against forking *into* somebody's world
+        // silently stood down. An answer that is not an answer is a refusal with its errno.
+        int prc = wfs::fs_probe(m.c_str());
+        if (prc && !wfs::fs_gone(prc)) return prc;
+        if (prc == 0) {
             if (!self) return WFS_E_PATH_REFUSED;
             if (is_world_root) *is_world_root = true;
         }
@@ -561,10 +567,21 @@ void trash_follow_deleting(String &tp) {
 }
 
 // Step 1. `out` receives the name the tree now has (which may be the one it already had).
+// PR #1 review (12th round): -ENOENT out of here means "at neither name, so somebody else
+// finished it", and both of its callers bury the row on it. It was a bool over lstat(2), so an
+// EACCES or an EIO said that too -- a DEAD row for a tree still sitting in the trash. Every
+// errno but ENOENT/ENOTDIR is now returned as itself: gc counts the entry in trash_failed and
+// retries it, and `--now` hands the reason to the caller.
 int trash_mark_deleting(const char *path, String &out) {
     out.assign(path);
-    if (ends_with(path, WFS_DELETING_SUFFIX)) return exists(path) ? 0 : -ENOENT;
-    if (!exists(path)) return -ENOENT;
+    if (ends_with(path, WFS_DELETING_SUFFIX)) {
+        int prc = wfs::fs_probe(path);
+        return wfs::fs_gone(prc) ? -ENOENT : prc;
+    }
+    if (int prc = wfs::fs_probe(path)) {
+        if (!wfs::fs_gone(prc)) return prc;
+        return -ENOENT;
+    }
     String d(path);
     d.append(WFS_DELETING_SUFFIX);
     // A leftover from an earlier, interrupted attempt: fold it into this one.
@@ -1365,7 +1382,11 @@ void trashing_own(Stmt &u, int pid_idx, int start_idx) {
 // for the moment this row was ACTIVE its tree was already in the trash -- so any such claim's
 // clone fails with ENOENT and unwinds itself.
 int trashing_reclaim(wfs_store *s, wfs_id id, int is_snapshot, const char *trash_path) {
-    if (!trash_path || !*trash_path || !exists(trash_path)) return -ESTALE;
+    // PR #1 review (12th round): -ESTALE here is the sentence "the discard did not happen".
+    // An lstat(2) that failed for a reason other than absence is not evidence of that, so it is
+    // reported as itself rather than dressed up as a verdict.
+    if (!trash_path || !*trash_path) return -ESTALE;
+    if (int prc = wfs::fs_probe(trash_path)) return wfs::fs_gone(prc) ? -ESTALE : prc;
     Guard g(s->mu);
     Txn t(s->db);
     int64_t state = -1;
@@ -1642,8 +1663,9 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
     if (r.state != WFS_ST_TRASHED) return -ESTALE;
     // T2.1: once the collector has renamed the tree, what is left of it is not a world any more.
     if (trash_is_deleting(trash)) return WFS_E_TRASH_DELETING;
-    if (!exists(trash.c_str())) return -ENOENT;
-    if (exists(r.path)) return -EEXIST;
+    // PR #1 review (12th round): and -ENOENT is reserved for a tree that is really not there.
+    if (int prc = wfs::fs_probe(trash.c_str())) return wfs::fs_gone(prc) ? -ENOENT : prc;
+    if (exists(r.path)) return -EEXIST;   // a create check: the rename below refuses anyway
     // (a). Everything the restore decides is decided again in here, under the write lock a
     // discard takes: the row, the tree's name, and the baseline.
     {
@@ -1971,7 +1993,15 @@ int trashing_recover(wfs_store *s, uint64_t *restored, uint64_t *finished) {
     }
     for (size_t i = 0; i < rows.size(); ++i) {
         const Pending &p = rows[i];
-        bool in_trash = p.trash.size() && exists(p.trash.c_str());
+        // PR #1 review (12th round): "the rename did not happen" is what puts the row back to
+        // ACTIVE with its trash_path cleared, and it was a bool over lstat(2). An EACCES or an
+        // EIO on <store>/trash therefore resurrected a row whose tree is in the trash and whose
+        // home path holds nothing -- an ACTIVE world that is dangling by construction, which
+        // the next `gc --reconcile` would then bury. A row whose tree cannot be located is left
+        // TRASHING for the next pass instead; it is nobody's work in progress either way.
+        int trc = p.trash.size() ? wfs::fs_probe(p.trash.c_str()) : -ENOENT;
+        if (trc && !wfs::fs_gone(trc)) continue;
+        bool in_trash = trc == 0;
         if (in_trash && p.is_snapshot) {
             SnapRefs refs;
             bool needed = false;
@@ -2138,7 +2168,11 @@ extern "C" int wfs_world_verify(wfs_store *s, wfs_id id, wfs_identity *out) {
         Guard g(s->mu);
         if (world_trash_path(s, id, trash) == 0 && trash.size()) where = trash.c_str();
     }
-    if (!exists(where)) {
+    // PR #1 review (12th round): WFS_E_WORLD_MISSING is what sends an operator to
+    // `gc --reconcile`, so it may only be said of a tree that is really not there. An EACCES or
+    // an EIO comes back as itself.
+    if (int prc = wfs::fs_probe(where)) {
+        if (!wfs::fs_gone(prc)) return prc;
         copy_str(out->path, sizeof out->path, where);
         return WFS_E_WORLD_MISSING;
     }
@@ -2499,7 +2533,10 @@ int rm_tmp_in_store_dir(wfs_store *s, const char *dir, uint64_t *removed, int64_
         // Out of time, not stuck: the tree is still there and is still row-less next wake, so
         // nothing is counted as a failure and the successor carries on from here.
         if (partial) { if (work_remains) *work_remains = 1; break; }
-        if (exists(p.c_str())) {
+        // PR #1 review (12th round): "it went" has to be proven, not assumed -- an lstat(2) that
+        // fails for EACCES or EIO is not evidence that the tree is gone, and this row-less tree
+        // has nothing else in the store that remembers it.
+        if (!proven_gone(p.c_str())) {
             if (failed) (*failed)++;
             if (wfs::gc_fail_bump(s, snap_tmp_fail_key(p).c_str()) < wfs::kGcFailCap && work_remains)
                 *work_remains = 1;
@@ -2523,14 +2560,38 @@ int rm_tmp_in_store_dir(wfs_store *s, const char *dir, uint64_t *removed, int64_
 //     order writes the marker before the rename, so our own half-published clone has one; a
 //     marker naming anything else is somebody else's world and is left alone.
 // Anything unreadable or unrecognised is left alone too.
-bool gc_tmp_is_removable(wfs_store *s, wfs_id id, const char *p) {
+//
+// PR #1 review (12th round): and "unreadable" is now told apart from "not ours". Both used to
+// be a bare `false`, on which the caller marks the row DEAD and clears its tmp_path -- fine for
+// a tree that is gone or that belongs to somebody else, and exactly the permanent stranding the
+// 5th round fixed for a tree that is still there and still ours. `*undecided` says which: with
+// it set, the caller keeps the CREATING row, counts the tree and comes back for it.
+bool gc_tmp_is_removable(wfs_store *s, wfs_id id, const char *p, bool *undecided) {
+    if (undecided) *undecided = false;
     if (!p || !*p) return false;
     struct stat st;
-    if (::lstat(p, &st) != 0 || !S_ISDIR(st.st_mode)) return false;
+    if (int prc = wfs::fs_probe(p, &st)) {
+        if (!wfs::fs_gone(prc) && undecided) *undecided = true;
+        return false;
+    }
+    if (!S_ISDIR(st.st_mode)) return false;
     String mp = joinp(p, WFS_MARKER_NAME);
-    if (exists(mp.c_str())) {
+    // The marker's own lstat(2) did not keep the promise above: an EACCES or an EIO read as
+    // "there is no marker", and the tree -- which is in the *user's* directory -- was then
+    // removed without the one check that says it is ours.
+    int mrc = wfs::fs_probe(mp.c_str());
+    if (mrc && !wfs::fs_gone(mrc)) {
+        if (undecided) *undecided = true;
+        return false;
+    }
+    if (mrc == 0) {
         MarkerData m;
-        if (marker_read(p, m) != 0) return false;
+        // A marker that is there and cannot be read is the same kind of not-an-answer: it may
+        // yet say this tree is ours, or that it is not.
+        if (int rrc = marker_read(p, m)) {
+            if (!wfs::fs_gone(rrc) && undecided) *undecided = true;
+            return false;
+        }
         if (m.world != id || ::strcmp(m.store_id, s->store_id.c_str()) != 0) return false;
     }
     Guard g(s->mu);
@@ -2732,7 +2793,10 @@ int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v) {
                           " UNION ALL SELECT id, trash_path, entries, 1 FROM snapshots WHERE state=4");
             if (!q.ok()) return -EIO;
             while (q.row()) {
-                if (!*q.col_text(1) || !exists(q.col_text(1))) continue;   // the rename never happened
+                // PR #1 review (12th round): counted unless its absence is proven. A tree that
+                // cannot be lstat'ed is still waiting for the collector, and `gc --status` must
+                // not answer "nothing is waiting" because it could not look.
+                if (!*q.col_text(1) || proven_gone(q.col_text(1))) continue;   // the rename never happened
                 if (q.col_i64(3)) v.snapshots++; else v.worlds++;
                 v.tree_entries += (uint64_t)q.col_i64(2);
                 v.waiting++;
@@ -2935,7 +2999,7 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
             while (q.row()) {
                 if (wfs::producer_alive(q.col_i64(1), q.col_i64(2))) continue;
                 if (q.col_i64(3) > reap_before) continue;
-                if (exists(q.col_text(0))) out->creating_stranded++;
+                if (!proven_gone(q.col_text(0))) out->creating_stranded++;
             }
         }
         // PR #1 review (7th round): and the half-built snapshots, whose two possible trees
@@ -2951,7 +3015,7 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
                 wfs_id sid = (wfs_id)sq.col_i64(0);
                 String stmp = numbered(snapd.c_str(), 'S', sid, WFS_TMP_SUFFIX);
                 String sdir = numbered(snapd.c_str(), 'S', sid, nullptr);
-                if (exists(stmp.c_str()) || exists(sdir.c_str())) out->creating_stranded++;
+                if (!proven_gone(stmp.c_str()) || !proven_gone(sdir.c_str())) out->creating_stranded++;
             }
         }
     }
@@ -3070,13 +3134,14 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
             TrashJob j;
             j.path = cpaths[i];
             j.row = creating[i];
-            if (gc_tmp_is_removable(s, creating[i], cpaths[i].c_str())) {
+            bool undecided = false;
+            if (gc_tmp_is_removable(s, creating[i], cpaths[i].c_str(), &undecided)) {
                 int partial = 0;
                 int trc = wfs::fs_remove_tree(cpaths[i].c_str(), deadline_us, &partial);
                 if (partial) { rep.work_remains = 1; break; }
                 if (trc == 0) {
                     rep.tmp_removed++;
-                } else if (exists(cpaths[i].c_str())) {
+                } else if (!proven_gone(cpaths[i].c_str())) {
                     // PR #1 review (5th round): the tree is still there and this row is the only
                     // thing in the world that knows its name -- it lives in the user's own target
                     // directory, under a name drawn at random, and is deliberately never found by
@@ -3091,6 +3156,14 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                     continue;
                 }
                 // Neither removed nor still there: somebody else got to it. Bury the row.
+            } else if (undecided) {
+                // PR #1 review (12th round): the tree could not be asked about -- an EACCES or
+                // an EIO on it or on its marker. Burying the row here would strand the clone
+                // exactly as the 5th round's failed removal did, because this row is the only
+                // name that tree has. Keep it, count it, come back for it under the same cap.
+                rep.tmp_failed++;
+                if (gc_fail_bump(s, j) < wfs::kGcFailCap) rep.work_remains = 1;
+                continue;
             }
             gc_fail_clear(s, j);
             Guard g(s->mu);
@@ -3145,7 +3218,10 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
             j.path = dir;
             j.row = snap_gone[i];
             j.is_snapshot = 1;
-            if (exists(tmp.c_str()) || exists(dir.c_str())) {
+            // PR #1 review (12th round): and the row is deleted only when both trees are
+            // *proven* gone. An lstat(2) that fails for EACCES or EIO used to count as gone,
+            // and the row -- the only name S<n> has left -- went with it.
+            if (!proven_gone(tmp.c_str()) || !proven_gone(dir.c_str())) {
                 rep.tmp_failed++;
                 if (gc_fail_bump(s, j) < wfs::kGcFailCap) rep.work_remains = 1;
                 continue;

@@ -1017,6 +1017,38 @@ int main() {
     CHECK(wr.state == WFS_ST_DEAD);
     CHECK(exists(mine_dir) && exists(mine_file));
 
+    // ---- PR #1 review (12th round), the exists() audit: a tree gc cannot ask about ------------
+    //
+    // gc_tmp_is_removable() promised in its own comment that "anything unreadable is left alone
+    // too", and the marker's lstat(2) did not keep it: an EACCES or an EIO read as "there is no
+    // marker", and the clone -- which lives in the *user's* target directory -- was removed
+    // without the one check that says it is ours. Answering "not removable" is only half the
+    // fix, because the caller then marks the row DEAD and clears its tmp_path, which is the
+    // permanent stranding the 5th round fixed. So "I cannot tell" is now its own answer: the
+    // row stays CREATING, the tree is counted, and a later wake asks again.
+    crash_seen.world = 0;
+    crash_seen.tmp[0] = 0;
+    wfs_test_before_fork_publish = crash_before_publish;
+    wfs_test_fork_owner_pid = 2147480000;
+    join(crashtgt, sizeof crashtgt, worlds, "wcrash-unreadable");
+    CHECK_RC(wfs_world_create(s, from, crashtgt, &opts, &wcrash), -EINTR);
+    wfs_test_before_fork_publish = NULL;
+    wfs_test_fork_owner_pid = 0;
+    CHECK(exists(crash_seen.tmp));
+    CHECK(chmod(crash_seen.tmp, 0) == 0);      // the marker inside cannot be lstat'ed any more
+    memset(&gc, 0, sizeof gc);
+    CHECK_OK(wfs_gc(s, 0, &gc));
+    CHECK(exists(crash_seen.tmp));             // not removed: nobody proved it was ours
+    CHECK(gc.tmp_failed >= 1);                 // ... and not silently dropped either
+    CHECK_OK(wfs_world_info(s, crash_seen.world, &wr));
+    CHECK(wr.state == WFS_ST_CREATING);        // the row is still the tree's only name
+    CHECK(chmod(crash_seen.tmp, 0755) == 0);
+    memset(&gc, 0, sizeof gc);
+    CHECK_OK(wfs_gc(s, 0, &gc));
+    CHECK(!exists(crash_seen.tmp));            // and the next wake finishes it
+    CHECK_OK(wfs_world_info(s, crash_seen.world, &wr));
+    CHECK(wr.state == WFS_ST_DEAD);
+
     // ---- PR #1 review (3rd round): "is there work for a collector?" must ask what the ---------
     // collector asks. A discard killed between the rename into <store>/trash and the commit of
     // its row leaves an ordinary `W<n>-<t>` directory that no row claims and that does not wear
