@@ -4825,6 +4825,95 @@ int main() {
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 
+    // ---- PR #1 review (19th round, P2): a marker key is a key, not a byte sequence -----------
+    //
+    // json_find() looked for its key with strstr(js, "\"<key>\"") over the whole marker, so the
+    // first place those bytes appear wins -- and the values are written before the keys that
+    // come after them. json_escape writes a `"` inside a value as `\"`, which leaves the byte
+    // sequence `"world` in the text whenever a path (or a name) contains a quote followed by
+    // that word, and the value's own closing quote completes the pattern: a store directory
+    // called `q"world` puts `"world"` into the marker's store_path, strstr lands there, the
+    // character after it is `,` rather than `:`, and json_find RETURNS NOT-FOUND instead of
+    // looking any further. The world id then read back as 0, so every world in that store was
+    // WFS_E_UNREGISTERED to `verify`, to `mount` and to every command that identifies a world
+    // by its marker -- a store nobody could use, over a quote in a directory name. The same
+    // shape reaches every later key through the name: a world called `w"snapshot` lost its
+    // snapshot id the same way.
+    //
+    // The scan is a top-level key walk now: the object's `"key": value` pairs in order, strings
+    // parsed with their escapes, values skipped by kind, keys compared whole. The marker format
+    // is untouched -- what this changes is only which bytes count as a key.
+    {
+        char qstore[4096], qsrc[4096], qw[4096], qdir[4096], qstore2[4096], qw2[4096];
+        join(qsrc, sizeof qsrc, root, "q-src");
+        CHECK(mkdir(qsrc, 0755) == 0);
+        join(p, sizeof p, qsrc, "f.txt");
+        write_file(p, "q\n");
+
+        // The store directory, whose last component ends in the bytes `"world`.
+        join(qstore, sizeof qstore, root, "q\"world");
+        wfs_store *qs = NULL;
+        CHECK_OK(wfs_store_open(qstore, &qs));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "q";
+        wfs_id q1 = 0;
+        CHECK_OK(wfs_snapshot_create(qs, qsrc, &sopts, &q1));
+        wfs_ref qf = {WFS_K_SNAPSHOT, q1};
+        memset(&opts, 0, sizeof opts);
+        opts.no_pool = 1;
+        opts.name = "qw\"snapshot";        // ... and a name that swallows the NEXT key
+        join(qw, sizeof qw, worlds, "q-w");
+        wfs_id qw1 = 0;
+        CHECK_OK(wfs_world_create(qs, qf, qw, &opts, &qw1));
+
+        wfs_identity qid;
+        CHECK_OK(wfs_world_verify_identity(qs, qw, &qid));
+        CHECK(qid.has_marker == 1 && qid.registered == 1 && qid.is_copy == 0);
+        CHECK(qid.world_id == qw1);          // 0 before this round: the `world` key was not found
+        CHECK(qid.snapshot_id == q1);        // 0 before this round: the `snapshot` key either
+        CHECK(!strcmp(qid.name, "qw\"snapshot"));
+        CHECK(qid.store_id[0]);              // the `store` key, read before either of those
+        // And the store path the FSKit extension reads out of the same marker.
+        wfs_marker_store qms;
+        CHECK_OK(wfs_world_marker_store(qs, qw, &qms));
+        CHECK(qms.has_path == 1 && qms.same_store == 1 && qms.same_path == 1);
+        CHECK(!strcmp(qms.path, wfs_store_dir(qs)));
+
+        // A directory component that is simply named `world` -- no quote anywhere -- was never
+        // the failing shape, and must stay that way now that the walker replaced the scan.
+        join(qdir, sizeof qdir, root, "world");
+        CHECK(mkdir(qdir, 0755) == 0);
+        join(qstore2, sizeof qstore2, qdir, "store");
+        wfs_store *qs2 = NULL;
+        CHECK_OK(wfs_store_open(qstore2, &qs2));
+        wfs_id q2 = 0;
+        CHECK_OK(wfs_snapshot_create(qs2, qsrc, &sopts, &q2));
+        wfs_ref qf2 = {WFS_K_SNAPSHOT, q2};
+        memset(&opts, 0, sizeof opts);
+        opts.no_pool = 1;
+        opts.name = "qw2";
+        join(qw2, sizeof qw2, worlds, "q-w2");
+        wfs_id qw2id = 0;
+        CHECK_OK(wfs_world_create(qs2, qf2, qw2, &opts, &qw2id));
+        wfs_identity qid2;
+        CHECK_OK(wfs_world_verify_identity(qs2, qw2, &qid2));
+        CHECK(qid2.registered == 1 && qid2.world_id == qw2id && qid2.snapshot_id == q2);
+
+        // The keys a marker of another store's world carries are read the same way: this one is
+        // foreign, and it is the store id -- not a missing key -- that says so.
+        CHECK_RC(wfs_world_verify_identity(qs, qw2, &qid2), WFS_E_FOREIGN_STORE);
+        CHECK(qid2.has_marker == 1 && qid2.world_id == qw2id && qid2.registered == 0);
+
+        CHECK_OK(wfs_world_discard(qs, qw1, 1, 0));
+        CHECK_OK(wfs_world_discard(qs2, qw2id, 1, 0));
+        wfs_store_close(qs);
+        wfs_store_close(qs2);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", qstore, (unsigned long long)q1);
+        chmod(p, 0700);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", qstore2, (unsigned long long)q2);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
     // ---- PR #1 review (11th round, P2): a migration that failed is not a migration that ran ----
     //
     // The additive ALTERs used to be fired one by one with their results thrown away, and

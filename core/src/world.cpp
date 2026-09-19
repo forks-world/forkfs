@@ -139,18 +139,84 @@ int marker_write(const char *world_root, const char *store_id, const char *store
     return rc;
 }
 
-const char *json_find(const char *js, const char *key) {
-    String pat("\"");
-    pat.append(key);
-    pat.append("\"");
-    const char *p = ::strstr(js, pat.c_str());
-    if (!p) return nullptr;
-    p += pat.size();
-    while (*p == ' ' || *p == '\t') ++p;
-    if (*p != ':') return nullptr;
-    ++p;
-    while (*p == ' ' || *p == '\t') ++p;
+bool json_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+
+// Past the closing quote of the string that starts at `p`, or null if it never closes. An
+// escape consumes the byte after the backslash, which is all a `\"` or a `\\` needs and is
+// enough to walk over a `\uXXXX` too (the four hex digits are ordinary bytes afterwards) --
+// this walker never has to decode a value, only to find where it ends.
+const char *json_skip_string(const char *p) {
+    if (*p != '"') return nullptr;
+    for (++p; *p; ++p) {
+        if (*p == '"') return p + 1;
+        if (*p == '\\') { if (!p[1]) return nullptr; ++p; }
+    }
+    return nullptr;
+}
+
+// Past the value that starts at `p`. The marker is flat -- strings and integers only -- but a
+// value this does not understand must still be stepped over rather than guessed at, so objects
+// and arrays are counted by depth (with their strings skipped, so a brace inside one does not
+// count) and every other literal runs to the next separator.
+const char *json_skip_value(const char *p) {
+    if (*p == '"') return json_skip_string(p);
+    if (*p == '{' || *p == '[') {
+        int depth = 0;
+        while (*p) {
+            if (*p == '"') {
+                const char *q = json_skip_string(p);
+                if (!q) return nullptr;
+                p = q;
+                continue;
+            }
+            if (*p == '{' || *p == '[') ++depth;
+            else if (*p == '}' || *p == ']') { if (--depth == 0) return p + 1; }
+            ++p;
+        }
+        return nullptr;
+    }
+    while (*p && *p != ',' && *p != '}' && *p != ']' && !json_ws(*p)) ++p;
     return p;
+}
+
+// PR #1 review (19th round): the key of a pair, not the bytes of a value. This used to be
+// strstr(js, "\"<key>\"") over the whole marker, and the values are written before the keys
+// that follow them: json_escape turns a `"` inside a value into `\"`, so a store directory
+// named `q"world` puts the sequence `"world` into the store_path value, the value's own closing
+// quote completes `"world"`, strstr stopped there, the byte after it was `,` rather than `:`,
+// and this returned not-found -- for a key that is right there, two lines below. marker_read
+// then left the world id 0 and every world in that store was WFS_E_UNREGISTERED to `verify`,
+// to `mount` and to `fork`. A world NAME does the same to every key written after it.
+// So: walk the object's pairs. Same grammar, same file, same markers -- what changes is only
+// that a key has to be a key.
+const char *json_find(const char *js, const char *key) {
+    const char *p = js;
+    while (*p && json_ws(*p)) ++p;
+    if (*p != '{') return nullptr;
+    ++p;
+    size_t klen = ::strlen(key);
+    for (;;) {
+        while (*p && json_ws(*p)) ++p;
+        if (*p != '"') return nullptr;            // `}` (no such key) or a marker we cannot read
+        const char *k = p + 1;
+        const char *after = json_skip_string(p);
+        if (!after) return nullptr;
+        size_t n = (size_t)(after - 1 - k);
+        p = after;
+        while (*p && json_ws(*p)) ++p;
+        if (*p != ':') return nullptr;
+        ++p;
+        while (*p && json_ws(*p)) ++p;
+        // The keys this file writes hold no escapes, so a raw comparison is exact: a key
+        // spelled with one simply is not one of ours.
+        if (n == klen && !::memcmp(k, key, klen)) return p;
+        const char *nv = json_skip_value(p);
+        if (!nv) return nullptr;
+        p = nv;
+        while (*p && json_ws(*p)) ++p;
+        if (*p != ',') return nullptr;
+        ++p;
+    }
 }
 
 bool json_str(const char *js, const char *key, char *out, size_t cap) {
