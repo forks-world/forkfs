@@ -474,7 +474,10 @@ int protect_entry(void *ctx, const char *path, const char *rel, const struct sta
     return 0;
 }
 
-int unprotect_entry(void *, const char *path, const char *, const struct stat &st, bool is_dir) {
+int unprotect_entry(void *ctx, const char *path, const char *, const struct stat &st, bool is_dir) {
+    // PR #1 review (4th round): the deadline of whoever asked for the walk, read per entry.
+    // fs_remove_tree's fallback runs this on trees of millions of entries.
+    if (int64_t dl = *(const int64_t *)ctx) { if (fs_mono_us() >= dl) return -ECANCELED; }
     uint32_t want = st.st_flags & ~(uint32_t)(UF_IMMUTABLE | UF_APPEND);
     if (want != st.st_flags && ::lchflags(path, want) != 0) return -errno;
     if (is_dir) {
@@ -496,9 +499,9 @@ int fs_protect_tree(const char *root, TreeStats *stats, Manifest *man) {
     return fs_walk_tree(root, 4, FS_DIRS_POST, &c, protect_entry);
 }
 
-int fs_unprotect_tree(const char *root) {
+int fs_unprotect_tree(const char *root, int64_t deadline_us) {
     // Directories first: their own flags have to go before anything else about them changes.
-    return fs_walk_tree(root, 4, FS_DIRS_PRE, nullptr, unprotect_entry);
+    return fs_walk_tree(root, 4, FS_DIRS_PRE, &deadline_us, unprotect_entry);
 }
 
 } // namespace wfs

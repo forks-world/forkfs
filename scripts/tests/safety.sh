@@ -880,6 +880,44 @@ rv fs gc --now --retention 0 > /dev/null 2>&1
 [ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && ok PR1 "once it can be deleted the next gc removes it" \
                                             || { bad PR1 "once it can be deleted the next gc removes it"; ls "$RSTORE/trash" | sed 's/^/        /'; }
 
+# ---- PR #1 review (4th round, P2): the batch limit survives the deleter's fallback -------------
+# The parallel deleter falls back to the single-threaded one on any error that is not the
+# deadline, and that fallback used to be handed no deadline at all: one unreadable directory in a
+# big trash tree turned a nominal one-second wake into an unbounded one, which is exactly the
+# foreground contention max_secs exists to bound. Here the whole tree sits under a 0000 directory
+# -- the parallel walker's opendir fails with EACCES before it has removed a single entry, so the
+# fallback is taken every time, deterministically. It must still stop at the deadline and leave a
+# resumable `.deleting` tree. (The fallback chmods the obstacle out of the way on its way in --
+# it is deleting the thing -- so the successors take the parallel path and finish the job.)
+BIG2="$RSTORE/trash/big-2"
+mkdir -p "$BIG2/blocked"
+python3 - "$BIG2/blocked" <<'EOF'
+import os, sys
+base = sys.argv[1]
+for d in range(400):
+    p = os.path.join(base, 'd%03d' % d)
+    os.makedirs(p, exist_ok=True)
+    for i in range(300):
+        os.close(os.open(os.path.join(p, 'f%03d' % i), os.O_CREAT | os.O_WRONLY, 0o644))
+EOF
+chmod 0000 "$BIG2/blocked"
+t0=$(python3 -c 'import time;print(int(time.time()*1000))')
+WORLD_GC_PAUSE_MS=0 WORLD_GC_BATCH_SECS=1 rv fs gc --worker --retention 0 > "$SCRATCH/gcfb.log" 2>&1
+t1=$(python3 -c 'import time;print(int(time.time()*1000))')
+if [ "$((t1 - t0))" -lt 2500 ]; then ok PR1 "a one-second wake that falls back still returns on time ($((t1-t0)) ms)"
+else bad PR1 "a one-second wake that falls back still returns on time ($((t1-t0)) ms)"; sed 's/^/        /' "$SCRATCH/gcfb.log"; fi
+grep -q "work remains, handing over" "$SCRATCH/gcfb.log" && ok PR1 "it hands the rest of the tree over" \
+                                                         || { bad PR1 "it hands the rest of the tree over"; sed 's/^/        /' "$SCRATCH/gcfb.log"; }
+LEFT2=$(find "$RSTORE/trash" 2>/dev/null | wc -l | tr -d ' ')
+if [ -d "$BIG2.deleting/blocked" ] && [ "$LEFT2" -gt 1 ] && [ "$LEFT2" -lt 120403 ]; then
+    ok PR1 "the fallback stopped mid-tree and kept the .deleting name ($LEFT2 entries left)"
+else
+    bad PR1 "the fallback stopped mid-tree and kept the .deleting name ($LEFT2 entries left)"
+fi
+for _ in $(seq 160); do [ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && break; sleep 0.25; done
+[ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && ok PR1 "the successor chain finishes it once the obstacle is gone" \
+                                            || { bad PR1 "the successor chain finishes it once the obstacle is gone"; ls "$RSTORE/trash" | sed 's/^/        /'; }
+
 echo
 "$WORLD" fs status | sed 's/^/      /'
 echo

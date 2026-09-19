@@ -175,11 +175,17 @@ int fs_free_space(const char *path, uint64_t *avail, uint64_t *total);
 // world.cpp and the deleter enforces it in platform_posix.cpp, so the two have to agree on what
 // "now" is. Microseconds, CLOCK_MONOTONIC.
 int64_t fs_mono_us(void);
-int fs_remove_tree(const char *root);   // unprotects first on Darwin
+// `deadline_us`/`partial` behave exactly as they do for fs_remove_tree_parallel below, and are
+// what lets the parallel deleter's fallback stay inside the gc worker's batch limit (PR #1
+// review, 4th round): the unprotect walk and the depth-first unlink both read the clock per
+// entry, and a tree the deadline cut short comes back with *partial = 1 and rc 0.
+int fs_remove_tree(const char *root, int64_t deadline_us = 0, int *partial = nullptr);   // unprotects first on Darwin
 // T2.1: the same 4-thread walker, used to unlink. Files are removed in the parallel phase,
 // directories in the serial deepest-first tail. `entries` is incremented by what was actually
 // removed (the root itself is not counted). Any error at all falls back to fs_remove_tree, so a
-// non-zero return means even that could not finish the job.
+// non-zero return means even that could not finish the job. The fallback is handed the same
+// deadline, so an error in a huge tree can no longer turn a two-second wake into a minutes-long
+// one (PR #1 review, 4th round).
 //
 // PR #1 review: `deadline_us` is an fs_mono_us() stamp (0 = no limit) and it is checked per
 // entry, not per tree -- one big world is millions of unlinks, and the gc worker's whole batch
@@ -214,8 +220,10 @@ int fs_clone_tree(const char *src, const char *dst, bool allow_fallback);
 // `--hard` protection: chflags(UF_IMMUTABLE) on every entry, directories last, write bits
 // stripped from directories. Fills stats and (optionally) the manifest in the same walk.
 int fs_protect_tree(const char *root, TreeStats *stats, Manifest *manifest);
-// The inverse: directories first, owner write restored.
-int fs_unprotect_tree(const char *root);
+// The inverse: directories first, owner write restored. `deadline_us` is an fs_mono_us() stamp
+// (0 = no limit) checked per entry; the walk stops with -ECANCELED when it passes, which is how
+// fs_remove_tree keeps its own deadline over a walk it does not otherwise control.
+int fs_unprotect_tree(const char *root, int64_t deadline_us = 0);
 // FSEventsGetCurrentEventId() — recorded at fork time for the T1.3 O(changes) diff.
 uint64_t fs_events_current_id(void);
 

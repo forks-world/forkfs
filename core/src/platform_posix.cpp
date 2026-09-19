@@ -707,7 +707,13 @@ namespace {
 // Depth-first, single threaded: what this removes is trash and half-built trees, never
 // anything on a latency path. Unlinking entries while a parallel readdir is in flight is
 // the kind of cleverness that loses a directory.
-int rm_rec(const char *path) {
+//
+// PR #1 review (4th round): `deadline` (an fs_mono_us() stamp, 0 = no limit) is read once per
+// entry, exactly as the parallel deleter's rm_entry reads it. Out of time is -ECANCELED, which
+// unwinds without rmdir'ing anything on the way out -- the tree is a `.deleting` one and what
+// is left of it is resumable by construction.
+int rm_rec(const char *path, int64_t deadline) {
+    if (deadline && fs_mono_us() >= deadline) return -ECANCELED;
     struct stat st;
     if (::lstat(path, &st) != 0) return errno == ENOENT ? 0 : -errno;
     if (!S_ISDIR(st.st_mode)) return ::unlink(path) == 0 || errno == ENOENT ? 0 : -errno;
@@ -729,7 +735,7 @@ int rm_rec(const char *path) {
         String child(path);
         child.append("/");
         child.append(e->d_name);
-        if ((rc = rm_rec(child.c_str()))) break;
+        if ((rc = rm_rec(child.c_str(), deadline))) break;
     }
     ::closedir(d);
     if (rc) return rc;
@@ -737,11 +743,23 @@ int rm_rec(const char *path) {
 }
 } // namespace
 
-int fs_remove_tree(const char *root) {
+int fs_remove_tree(const char *root, int64_t deadline_us, int *partial) {
+    if (partial) *partial = 0;
     struct stat st;
     if (::lstat(root, &st) != 0) return errno == ENOENT ? 0 : -errno;
-    if (S_ISDIR(st.st_mode)) fs_unprotect_tree(root);   // snapshots are UF_IMMUTABLE all the way down
-    return rm_rec(root);
+    // snapshots are UF_IMMUTABLE all the way down. That walk is O(tree) too, so it gets the
+    // deadline as well -- a fallback that spent its whole budget unprotecting would be the
+    // same unbounded wake by another name.
+    if (S_ISDIR(st.st_mode) && fs_unprotect_tree(root, deadline_us) == -ECANCELED) {
+        if (partial) *partial = 1;
+        return 0;
+    }
+    int rc = rm_rec(root, deadline_us);
+    if (rc == -ECANCELED) {
+        if (partial) *partial = 1;
+        return 0;
+    }
+    return rc;
 }
 
 int64_t fs_mono_us(void) {
@@ -799,7 +817,9 @@ int rm_entry(void *ctx, const char *path, const char *rel, const struct stat &st
         // rely on the same behaviour.) If it ever does happen, finish this one directory the
         // certain way rather than failing the whole tree.
         if (e == ENOTEMPTY) {
-            if (rm_rec(path) == 0) { if (*rel) bump(c->entries); return 0; }
+            int r2 = rm_rec(path, c->deadline);
+            if (r2 == 0) { if (*rel) bump(c->entries); return 0; }
+            if (r2 == -ECANCELED) return -ECANCELED;   // the batch limit, not a failure
             e = ENOTEMPTY;
         }
         return -e;
@@ -852,8 +872,11 @@ int fs_remove_tree_parallel(const char *root, int threads, uint64_t *entries, in
         if (partial) *partial = 1;
         return 0;
     }
-    // Anything at all went wrong: finish the job the slow, certain way.
-    return fs_remove_tree(root);
+    // Anything at all went wrong: finish the job the slow, certain way -- under the same
+    // deadline (PR #1 review, 4th round). Without it a single EACCES directory in a 120k-entry
+    // trash tree turned a one-second worker wake into an unbounded one, which is exactly the
+    // foreground contention max_secs exists to bound.
+    return fs_remove_tree(root, deadline_us, partial);
 }
 
 #ifndef __APPLE__
@@ -879,7 +902,7 @@ int fs_protect_tree(const char *root, TreeStats *stats, Manifest *) {
     if (stats) return fs_count_entries(root, *stats);
     return 0;
 }
-int fs_unprotect_tree(const char *) { return 0; }
+int fs_unprotect_tree(const char *, int64_t) { return 0; }
 uint64_t fs_events_current_id(void) { return 0; }
 #endif
 
