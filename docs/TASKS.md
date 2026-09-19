@@ -704,3 +704,11 @@ FSKit 传进来的不是 `WorldItem`),与本次改动无关;`error:70` 一条都
 克隆内速度 99–102% native、FSEvents 实测能给 O(changes) 的 diff(800 改动 → 800 条 file-level 路径,0 丢事件),
 唯一退化是 COW 首写惩罚 392µs → 969µs;目录整 `clonefile` 比 Apple 推荐的 `copyfile(3)` 递归克隆快 15×,
 代价只是源树写者 p99 10–11ms、0 失败,主路径继续用它。
+
+### M2 — 运维与规模(2026-09-19 用户确认按此顺序)
+- [ ] T2.1 后台增量 gc:discard 保持毫秒级,物理删除由后台分批完成(1000 个 10k 树的 World 实测 gc 525s)
+- [ ] T2.2 `discard S<n>` + 悬空快照对账;快照有活 World/池条目引用时拒绝
+- [ ] T2.3 store 路径统一:沙盒 appex 与 CLI 默认 store 不同(container vs ~/Library/Application Support),`world fs mount` 自动指向 container store;修正任务板中"CLI 默认同路径"
+- [ ] T2.4 diff 扫描改 `getattrlistbulk` + `EF_NO_XATTRS`,目标 50k 从 1.4s 到 ~0.2s(含 xattr 判断)
+- [ ] T2.5 fork 后按 (dev, ino) 恢复树内硬链接(P9 从警告变为修复)
+- [ ] T2.6 Linux 平台层:overlayfs + mount namespace(fork O(1)、upper 目录即 changed-set)
