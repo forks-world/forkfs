@@ -322,6 +322,13 @@ int fs_realpath_parent(const char *path, String &out) {
 // One dynamic queue of directories, N pthread workers (arch.md §39 forbids std::thread and
 // std::mutex, and 4 workers is where APFS metadata transactions stop scaling -- see
 // docs/CLONE_MODEL_MACOS27.md §9.2, where 8 and 16 threads were slower than 4).
+//
+// T2.4: a directory is read with getattrlistbulk(2) where the file system can (one syscall per
+// batch instead of one fstatat per entry, and every entry arrives with the EF_NO_XATTRS verdict
+// attached -- see platform_darwin.cpp for the attribute list and the measurements). readdir(3) +
+// fstatat(2) is still here, unchanged: it is the whole story on Linux, and on Darwin it is what
+// a file system that cannot serve the bulk call falls back to. The fallback verdict is taken
+// before a single entry has been reported, so nothing is ever reported twice.
 
 namespace {
 
@@ -340,42 +347,69 @@ struct Walk {
     bool done = false;
     int err = 0;
     void *ctx = nullptr;
-    fs_entry_fn fn = nullptr;
+    fs_entry_ex_fn fn = nullptr;
     fs_dir_order order = FS_DIRS_PRE;
 };
 
-void walk_child(Walk &w, const Job &parent, const char *name, size_t nlen, Job &out) {
+void walk_child(const Job &parent, const char *name, Job &out) {
     out.path = parent.path;
     if (out.path.size() && out.path.c_str()[out.path.size() - 1] != '/') out.path.append("/");
     out.path.append(name);
     out.rel = parent.rel;
     if (out.rel.size()) out.rel.append("/");
     out.rel.append(name);
-    (void)w;
-    (void)nlen;
+}
+
+// The per-entry half of walk_dir, shared by the bulk path and the readdir path so that the two
+// cannot drift apart. A non-zero return aborts the walk.
+struct DirScan {
+    Walk *w;
+    const Job *job;
+    Vec<Job> *subdirs;
+};
+
+int walk_one(DirScan &s, const char *name, const struct stat &st, uint8_t xattr) {
+    Job child;
+    walk_child(*s.job, name, child);
+    bool is_dir = S_ISDIR(st.st_mode);
+    if (is_dir) s.subdirs->emplace_back(child);
+    if (is_dir && s.w->order != FS_DIRS_PRE) return 0;
+    FsEntry e{child.path.c_str(), child.rel.c_str(), &st, is_dir, xattr};
+    return s.w->fn(s.w->ctx, e);
+}
+
+int walk_bulk_entry(void *ctx, const char *name, size_t, const struct stat &st, uint8_t xattr) {
+    return walk_one(*(DirScan *)ctx, name, st, xattr);
 }
 
 // Returns a negative errno to abort the whole walk.
 int walk_dir(Walk &w, const Job &job) {
-    DIR *d = ::opendir(job.path.c_str());
-    if (!d) return -errno;
-    int fd = ::dirfd(d);
-    int rc = 0;
     Vec<Job> subdirs;
-    while (struct dirent *e = ::readdir(d)) {
-        if (e->d_name[0] == '.' && (e->d_name[1] == 0 || (e->d_name[1] == '.' && e->d_name[2] == 0))) continue;
-        struct stat st;
-        if (::fstatat(fd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) { rc = -errno; break; }
-        Job child;
-        walk_child(w, job, e->d_name, strlen(e->d_name), child);
-        if (S_ISDIR(st.st_mode)) {
-            subdirs.emplace_back(child);
-            if (w.order == FS_DIRS_PRE) { if ((rc = w.fn(w.ctx, child.path.c_str(), child.rel.c_str(), st, true))) break; }
-        } else {
-            if ((rc = w.fn(w.ctx, child.path.c_str(), child.rel.c_str(), st, false))) break;
+    DirScan scan{&w, &job, &subdirs};
+    int rc = 0;
+
+    int fd = ::open(job.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    int bulk = fs_bulk_dir(fd, &scan, walk_bulk_entry, &rc);
+    if (bulk == 0) {
+        ::close(fd);
+    } else if (bulk != -ENOTSUP) {
+        ::close(fd);
+        return bulk;
+    } else {
+        // No bulk enumeration here (another file system, or an older kernel): readdir(3) +
+        // fstatat(2), from the top, with nothing reported yet.
+        if (::lseek(fd, 0, SEEK_SET) < 0) { ::close(fd); return -errno; }
+        DIR *d = ::fdopendir(fd);
+        if (!d) { int e = errno; ::close(fd); return -e; }
+        while (struct dirent *e = ::readdir(d)) {
+            if (e->d_name[0] == '.' && (e->d_name[1] == 0 || (e->d_name[1] == '.' && e->d_name[2] == 0))) continue;
+            struct stat st;
+            if (::fstatat(fd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) { rc = -errno; break; }
+            if ((rc = walk_one(scan, e->d_name, st, FS_XATTR_UNKNOWN))) break;
         }
+        ::closedir(d);
     }
-    ::closedir(d);
     if (rc) return rc;
     if (subdirs.size()) {
         pthread_mutex_lock(&w.mu);
@@ -413,11 +447,15 @@ void *walk_worker(void *arg) {
 
 } // namespace
 
-int fs_walk_tree(const char *root, int threads, fs_dir_order order, void *ctx, fs_entry_fn fn) {
+int fs_walk_tree_ex(const char *root, int threads, fs_dir_order order, void *ctx, fs_entry_ex_fn fn) {
     if (!root || !fn) return -EINVAL;
     struct stat rst;
-    if (::lstat(root, &rst) != 0) return -errno;
-    if (!S_ISDIR(rst.st_mode)) return fn(ctx, root, "", rst, false);
+    uint8_t rxa = FS_XATTR_UNKNOWN;
+    if (int rc = fs_lstat_xattr(root, rst, rxa)) return rc;
+    if (!S_ISDIR(rst.st_mode)) {
+        FsEntry e{root, "", &rst, false, rxa};
+        return fn(ctx, e);
+    }
 
     Walk w;
     pthread_mutex_init(&w.mu, nullptr);
@@ -433,7 +471,8 @@ int fs_walk_tree(const char *root, int threads, fs_dir_order order, void *ctx, f
     r.path.assign(root);
     r.rel.assign("");
     if (order == FS_DIRS_PRE) {
-        if (int rc = fn(ctx, r.path.c_str(), "", rst, true)) {
+        FsEntry e{r.path.c_str(), "", &rst, true, rxa};
+        if (int rc = fn(ctx, e)) {
             pthread_mutex_destroy(&w.mu);
             pthread_cond_destroy(&w.cv);
             return rc;
@@ -461,13 +500,36 @@ int fs_walk_tree(const char *root, int threads, fs_dir_order order, void *ctx, f
     if (!rc && order == FS_DIRS_POST) {
         for (size_t i = w.dirs.size(); i-- > 0;) {
             struct stat st;
+            // Directories only, and a directory's xattr verdict is never used by anyone
+            // (diff.cpp compares nothing about a directory that exists on both sides), so a
+            // plain lstat is both right and one syscall cheaper than fs_lstat_xattr here.
             if (::lstat(w.dirs[i].path.c_str(), &st) != 0) { rc = -errno; break; }
-            if ((rc = fn(ctx, w.dirs[i].path.c_str(), w.dirs[i].rel.c_str(), st, true))) break;
+            FsEntry e{w.dirs[i].path.c_str(), w.dirs[i].rel.c_str(), &st, true, FS_XATTR_UNKNOWN};
+            if ((rc = fn(ctx, e))) break;
         }
     }
     pthread_mutex_destroy(&w.mu);
     pthread_cond_destroy(&w.cv);
     return rc;
+}
+
+namespace {
+// fs_walk_tree is fs_walk_tree_ex with the xattr verdict dropped: every caller that does not
+// compare xattrs (clone, protect, count, scan, verify) keeps the signature it always had.
+struct PlainWalk {
+    void *ctx;
+    fs_entry_fn fn;
+};
+int plain_entry(void *ctx, const FsEntry &e) {
+    PlainWalk *p = (PlainWalk *)ctx;
+    return p->fn(p->ctx, e.path, e.rel, *e.st, e.is_dir);
+}
+} // namespace
+
+int fs_walk_tree(const char *root, int threads, fs_dir_order order, void *ctx, fs_entry_fn fn) {
+    if (!fn) return -EINVAL;
+    PlainWalk p{ctx, fn};
+    return fs_walk_tree_ex(root, threads, order, &p, plain_entry);
 }
 
 namespace {
@@ -686,6 +748,19 @@ int fs_remove_tree_parallel(const char *root, int threads, uint64_t *entries) {
 }
 
 #ifndef __APPLE__
+// There is no getattrlistbulk(2) outside Darwin: the walk uses readdir(3) + fstatat(2) and
+// nobody can say anything about xattrs without calling listxattr, which is exactly what
+// FS_XATTR_UNKNOWN means.
+int fs_bulk_dir(int, void *, fs_bulk_entry_fn, int *cb_rc) {
+    if (cb_rc) *cb_rc = 0;
+    return -ENOTSUP;
+}
+int fs_lstat_xattr(const char *path, struct stat &st, uint8_t &xattr) {
+    xattr = FS_XATTR_UNKNOWN;
+    if (!path) return -EINVAL;
+    return ::lstat(path, &st) == 0 ? 0 : -errno;
+}
+
 // Linux/other: the clonefile world model is Darwin-only for now. overlayfs is the planned
 // equivalent (docs/M1_DESIGN.md §4); until then these report "unsupported" honestly rather
 // than silently doing a real copy.

@@ -306,12 +306,15 @@ FSKit 前端**冻结**在 macOS 27 Handler API 上(`WorldVolumeH` 为默认,旧 
       3. **事件路径这一轮 0.354 s,比 T1.3 那次的 0.087 s 慢 4×**,而且同一棵树逐次波动 0.14–0.49 s:
          波动在建流 + 等 fseventsd 水位标,与改动数无关。全扫则稳定。T1.3 把全扫定为默认的决定,本轮复核**不变**。
 
-      **仍然挂着的一条优化**:全扫的走树现在对每个文件都发 `listxattr(2)`(两边各一次,APFS 上约 10 µs),
+      ~~**仍然挂着的一条优化**:全扫的走树现在对每个文件都发 `listxattr(2)`(两边各一次,APFS 上约 10 µs),
       5 万文件的全扫因此从 0.185 s 涨到 1.420 s——这是全扫最大的一块成本。
       `core/src/platform_posix.cpp` 的 walker 应该换成 `getattrlistbulk(2)`,
       用 `ATTR_CMNEXT_EXT_FLAGS` 拿 `EF_NO_XATTRS`,**没有 xattr 的文件直接跳过 listxattr**
       (绝大多数文件都没有),顺带一次系统调用批量拿到 stat 信息。
-      做完之后默认的全扫应该能逼近 `--no-xattr` 的数字,默认选路的阈值要跟着复核。
+      做完之后默认的全扫应该能逼近 `--no-xattr` 的数字,默认选路的阈值要跟着复核。~~
+      → **T2.4 已做**,见下面的 M2 小节。结论与预期有一处重要偏差:macOS 27 给本机进程新建的
+      **每一个**文件都盖 `com.apple.provenance`(且删不掉),所以合成 fixture 上 `EF_NO_XATTRS` 一次都不触发;
+      真实树(96% 无 xattr)上默认全扫确实逼近了 `--no-xattr`。
 - [ ] T1.8 文档:arch.md 增补章节、README
 
 #### T1.5 pool 实现(2026-09-19)
@@ -713,7 +716,7 @@ FSKit 传进来的不是 `WorldItem`),与本次改动无关;`error:70` 一条都
 - [x] T2.1 后台增量 gc:discard 保持毫秒级,物理删除由后台分批完成(1000 个 10k 树的 World 实测 gc 525s)
 - [x] T2.2 `discard S<n>` + 悬空快照对账;快照有活 World/池条目引用时拒绝
 - [x] T2.3 store 路径统一:沙盒 appex 与 CLI 默认 store 不同(container vs ~/Library/Application Support),`world fs mount` 把 store 路径写进 `.world` marker 传给扩展;修正任务板中"CLI 默认同路径"
-- [ ] T2.4 diff 扫描改 `getattrlistbulk` + `EF_NO_XATTRS`,目标 50k 从 1.4s 到 ~0.2s(含 xattr 判断)
+- [x] T2.4 diff 扫描改 `getattrlistbulk` + `EF_NO_XATTRS`(2026-09-19,分支 `m2/t2.4-bulk-walker`;真实树默认全扫 0.21 → 0.17 s,合成 50k 1.40 → 0.96 s)
 - [x] T2.5 fork 后按 (dev, ino) 恢复树内硬链接(P9 从警告变为修复;实测 0.27 ms/条,pool 命中不受影响)
 - [ ] T2.6 Linux 平台层:overlayfs + mount namespace(fork O(1)、upper 目录即 changed-set)——**不在这台 Mac 上做**(用户决定),等 Linux 机器
 
@@ -843,6 +846,120 @@ fork p50 = 并发跑 `world fs fork --no-pool` 的中位数):
 
 收尾:两个 store 都被恢复成测试前的样子(container store 里 `S1 s27` + `W1/W2/W3` 原封不动),
 结束时没有任何 worldfs 挂载。
+
+#### T2.4 diff 扫描改 `getattrlistbulk(2)` + `EF_NO_XATTRS`(2026-09-19,M1 / macOS 27.0)
+
+分支 `m2/t2.4-bulk-walker`。改的是 `core/src/platform_darwin.cpp`(新增 `fs_bulk_dir` / `fs_lstat_xattr`)、
+`core/src/platform_posix.cpp`(walker)、`core/src/diff.cpp`、`core/src/internal.h`、`core/tests/diff_test.cpp`。
+`fs_walk_tree` 的签名**没变**(它现在是 `fs_walk_tree_ex` 的一层包装),所以 clone / protect / count / verify
+一行都没改就跟着快了。
+
+**要的属性**(`FSOPT_ATTR_CMN_EXTENDED`,**不带** `FSOPT_PACK_INVAL_ATTRS`):
+
+```
+commonattr  RETURNED_ATTRS | NAME | DEVID | OBJTYPE | CRTIME | MODTIME | CHGTIME | ACCTIME
+            | OWNERID | GRPID | ACCESSMASK | FLAGS | FILEID
+fileattr    LINKCOUNT | ALLOCSIZE | DATALENGTH
+forkattr    ATTR_CMNEXT_EXT_FLAGS          ← EF_NO_XATTRS 从这里来
+```
+
+四条实测结论,都是先写探针再定的:
+
+1. **`ATTR_CMN_ACCESSMASK` 带 `S_IFMT`**:目录回来是 `0o41755`、符号链接 `0o120755`、FIFO `0o10644`。
+   所以类型和权限一次拿全,`OBJTYPE` 只当交叉校验(两者不一致就整条退回 `fstatat`)。
+2. **目录不走 bulk**:`ATTR_DIR_LINKCOUNT` 是"指向该目录的硬链接数"(实测 1,而 `lstat` 的 `st_nlink` 是 3),
+   `ATTR_DIR_DATALENGTH` 也不是 `st_size`。目录只占一棵树 ~1%,而且 walker 本来就要把它打开,
+   所以目录多花一次 `fstatat(2)`,它的 `struct stat` 与从前**逐字节相同**——这很重要,
+   `Manifest::line` 会把它写进快照清单,`snapshot verify` 要读回来比。
+   实测:用旧二进制建的 store 用新二进制 `fs verify` 干净通过,反之亦然。
+3. **不要 `FSOPT_PACK_INVAL_ATTRS`**:带上它时,文件系统答不出的属性**仍然**会把
+   `ATTR_CMN_RETURNED_ATTRS` 的位置上,只是塞个 0 进去——那就是一个悄悄错掉的 mtime 或 size。
+   不带它,位是清的,解包器当场发现,该条目退回 `fstatat`/`lstat`。
+   实测:devfs 上 353 条目里 352 条在不带标志时报告 `EXT_FLAGS` **缺失**,带标志时报告"有,值为 0";
+   APFS 上带不带两者 144,133 条目逐字段相同。
+4. **`EF_NO_XATTRS` 只会"否认",不会"承认"**:137,665 条目(/Applications + /usr/share)里 117,168 条带这个位,
+   其中 `listxattr(2)` 返回非空的有 **0** 条;另有 5,809 条没带这个位但 `listxattr` 是空的——
+   也就是说它保守的方向恰好是安全的那一侧,漏判只多花一次 `listxattr`,绝不会给出错的答案。
+
+**回退逻辑**:`fs_bulk_dir` 在**交出第一条目之前**失败一律返回 `-ENOTSUP`,walker 收到后
+`lseek(fd,0)` + `fdopendir` 重走 `readdir(3)` + `fstatat(2)` 老路——因此不可能重复上报。
+交出第一条之后再失败就是真错误,按 `-errno` 中止整个 walk(和老 walker 一样)。
+非 Darwin 平台 `fs_bulk_dir` 直接是 `-ENOTSUP` 的桩,走的就是老路。
+
+**顺带改掉的一处**:`xattr_equal()` 从前对每个 name 发 4 次 `getxattr`(两边各"问大小 + 取值"),
+现在直接用 1 KiB 栈缓冲取值,一边一次,`ERANGE` 才退回老写法。实测 55 µs/对 → 35 µs/对。
+
+**单次系统调用成本(M1 / 27.0 / APFS,热,60,001 个路径)**:
+
+| 调用 | µs |
+|---|---|
+| `lstat(2)` | 1.41 |
+| `getattrlist(2)`(上面那张表) | 1.78 |
+| `lstat` + `listxattr` | 2.56 |
+| `listxattr(2)` | 2.1 |
+| **`getxattr(2)`** | **14.0** |
+| `getattrlistbulk(2)`,摊到每条目 | 0.23 |
+
+`getxattr` 才是大头,`listxattr` 不是——旧注释里"listxattr 约 10 µs"这个数不准,
+真正贵的是它后面跟着的 4 次 `getxattr`。
+
+**walker 本身**(`fs_count_entries`,4 线程,热,best of 7):
+
+| 树 | 旧 | 新 | 倍数 |
+|---|---|---|---|
+| 平铺 50,500(500 目录 × 100 文件) | 1,490,597 条目/s | **1,793,834** | 1.20× |
+| Keynote.app 克隆出的 World,37,174 条目 | 948,851 | **1,168,038** | 1.23× |
+| `/Applications`,134,641 条目 / 10,302 目录 | 846,766 | **1,034,563** | 1.22× |
+
+syscall 省了 6×,总时间只省 1.2×:walker 自己那份(每条目两个 `String`、队列、锁)现在才是大头。
+要再往下压得先把路径拼接改成不分配的写法,那是另一件事。
+
+**diff 实测。先说一条会影响所有数字的环境事实**:macOS 27 给本机进程新建的**每一个**文件盖
+`com.apple.provenance`,`removexattr` 删不掉(实测 `xattr -d` 静默失败)。所以
+**`diff_test` 造的合成 fixture 里没有任何一个文件能拿到 `EF_NO_XATTRS`**——合成树上这条捷径一次都不触发,
+省下来的全是 walker 和 `getxattr` 那两笔。而 `clonefile(2)` 会原样保留"没有 xattr"这个状态
+(实测源树 35,548/37,072 带 `EF_NO_XATTRS`,克隆出来一模一样),所以真实树上它是实打实生效的。
+
+50k / 800 改动(`WFS_DIFF_BENCH=1 diff_test`,库内计时,合成 fixture,**每个文件都有 provenance**):
+
+| 路径 | T1.7 | 本次 base(297fe5a) | 本次 new | |
+|---|---|---|---|---|
+| 默认(全扫 + xattr) | 1.420 s | 1.402–1.410 s | **0.956–0.986 s** | 1.45× |
+| `--full --no-xattr` | 0.185 s | 0.165–0.166 s | **0.129–0.139 s** | 1.25× |
+| `--events` | 0.354 s | 0.048–0.122 s | 0.044–0.086 s | — |
+
+10k / 850 改动(同上,10 次里取最好):
+
+| 路径 | base | new | |
+|---|---|---|---|
+| `--full` | 0.232 s | **0.158 s** | 1.47× |
+| `--full --no-xattr` | 0.034 s | **0.028 s** | 1.21× |
+
+**真实树**(`clonefile /Applications/Keynote.app` 当源,37,174 条目、94% 无 xattr,
+同样 500 改 + 200 增 + 100 删),整条 CLI 计时 best of 3:
+
+| 路径 | base | new |
+|---|---|---|
+| 默认(全扫 + xattr) | 0.210 s | **0.171–0.191 s** |
+| `--full --no-xattr` | 0.167 s | **0.144–0.158 s** |
+
+**默认全扫在真实树上已经和 `--no-xattr` 同一个量级**(0.17 vs 0.14,差的是那 6% 真有 xattr 的文件),
+T1.7 里 7× 的那道口子在真实树上合上了。合成 fixture 上还剩 7×,原因只有一个:provenance。
+
+`fs verify S1`(37,073 条目,与 walker 共用):0.180 s → **0.170 s**;
+它的大头是按清单逐行 `lstat`,不是 walker。
+
+**测试**:`diff_test` 原有断言一字未改、全部精确集合通过,连跑 10 次 10/10;
+新增 `xattr_shortcut()` 一节,把四种组合摆在一棵树里——两边都没有、两边都有(值不同)、
+只有 World 有、**只有快照有**。最后一种是"只看 World 那一侧就跳过"的写法一定会漏的那种,
+现在 `--full` 与 `--events` 两条路都报 `T`,`--no-xattr` 一条都不报。
+`core_test` 通过,`safety.sh` 93/93,`check-deps.sh` 三个二进制全绿。
+
+**留给以后的两条**:
+1. `com.apple.provenance` 是内核记的"谁建的这个文件",不是用户数据,却要每文件 2 次 `listxattr` + 2 次
+   `getxattr`(28 µs)才能确认它两边一样。把它(以及别的纯系统 xattr)排除在比较之外能把合成树上剩下的
+   0.97 s 直接打掉,但那是语义变更,得单独提。
+2. walker 每条目两次 `String` 分配,见上面 1.2× 那一段。
 
 #### T2.5 树内硬链接的恢复(2026-09-19 实现 + 实测)
 

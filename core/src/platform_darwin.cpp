@@ -18,8 +18,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/attr.h>
 #include <sys/clonefile.h>
 #include <sys/stat.h>
+#include <sys/vnode.h>
 #include <unistd.h>
 
 // From CoreServices/FSEvents.h. Declared rather than included so this file keeps compiling
@@ -29,6 +31,281 @@ extern "C" uint64_t FSEventsGetCurrentEventId(void);
 namespace wfs {
 
 uint64_t fs_events_current_id(void) { return FSEventsGetCurrentEventId(); }
+
+// ---- getattrlistbulk(2): what a directory costs (T2.4) -----------------------------------------
+//
+// The old walker paid one fstatat(2) per entry, and diff.cpp paid listxattr(2) on top of it for
+// both sides of every file. Measured on this machine (M1, 27.0, APFS, warm):
+//
+//     lstat(2)                          1.41 µs      listxattr(2)              2.1 µs
+//     getattrlist(2), the list below    1.78 µs      getxattr(2)              14.0 µs
+//     lstat + listxattr                 2.56 µs      the old xattr_equal()    55 µs per pair
+//     getattrlistbulk(2), per entry     0.23 µs      the new one              35 µs per pair
+//
+// So a file with no xattrs at all is the case worth detecting, and ATTR_CMNEXT_EXT_FLAGS carries
+// EF_NO_XATTRS for exactly that. It is a one-way answer -- the file system either says "there are
+// none" or says nothing -- which is the safe direction: a missing bit costs a listxattr, never a
+// wrong result. Verified over 137,665 entries of /Applications and /usr/share: 117,168 carried
+// EF_NO_XATTRS and not one of them had a listxattr(2) that returned anything.
+//
+// What is asked for, and why:
+//   ATTR_CMN_RETURNED_ATTRS   which of the rest actually came back; always packed first
+//   ATTR_CMN_NAME             the entry's name (required for a bulk call)
+//   ATTR_CMN_DEVID            st_dev
+//   ATTR_CMN_OBJTYPE          VREG/VDIR/VLNK/...; kept as the cross-check on ACCESSMASK
+//   ATTR_CMN_CRTIME/MODTIME/CHGTIME/ACCTIME   st_birthtimespec / mtime / ctime / atime
+//   ATTR_CMN_OWNERID/GRPID    st_uid, st_gid
+//   ATTR_CMN_ACCESSMASK       st_mode -- **with S_IFMT included**: measured, a directory comes
+//                             back as 0o41755, a symlink as 0o120755, a FIFO as 0o10644
+//   ATTR_CMN_FLAGS            st_flags (P3's UF_IMMUTABLE, and the diff's flag comparison)
+//   ATTR_CMN_FILEID           st_ino
+//   ATTR_FILE_LINKCOUNT       st_nlink (P9 counts hardlinks)
+//   ATTR_FILE_ALLOCSIZE       st_blocks, as allocsize/512
+//   ATTR_FILE_DATALENGTH      st_size -- for a symlink this is the target's length, as lstat's is
+//   ATTR_CMNEXT_EXT_FLAGS     EF_NO_XATTRS; a forkattr, so it needs FSOPT_ATTR_CMN_EXTENDED
+//
+// Directories are deliberately NOT taken from the bulk buffer. ATTR_DIR_LINKCOUNT is the number
+// of hard links to the directory (measured: 1 where lstat's st_nlink is 3) and ATTR_DIR_DATALENGTH
+// is not st_size either, so a directory costs one extra fstatat(2) and its struct stat stays
+// byte-for-byte what it has always been -- which matters, because Manifest::line writes it and
+// `snapshot verify` reads those lines back. Directories are ~1% of a tree and the walker is about
+// to open each of them anyway. The same fstatat is the per-entry fallback for anything whose
+// attributes did not all come back.
+//
+// The whole synthesized struct stat was cross-checked against lstat(2) field by field --  mode,
+// uid, gid, nlink, size, blocks, flags, ino, dev and all four timestamps -- over 148,593 non
+// directory entries of /Applications, /usr/share and /usr/lib: zero mismatches.
+
+namespace {
+
+const uint32_t kBulkCommon = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_DEVID |
+                             ATTR_CMN_OBJTYPE | ATTR_CMN_CRTIME | ATTR_CMN_MODTIME |
+                             ATTR_CMN_CHGTIME | ATTR_CMN_ACCTIME | ATTR_CMN_OWNERID |
+                             ATTR_CMN_GRPID | ATTR_CMN_ACCESSMASK | ATTR_CMN_FLAGS |
+                             ATTR_CMN_FILEID;
+const uint32_t kBulkFile = ATTR_FILE_LINKCOUNT | ATTR_FILE_ALLOCSIZE | ATTR_FILE_DATALENGTH;
+const uint32_t kBulkFork = ATTR_CMNEXT_EXT_FLAGS;
+// Everything but the bitmap itself has to come back, or the entry falls back to fstatat.
+const uint32_t kBulkCommonNeeded = kBulkCommon & ~(uint32_t)ATTR_CMN_RETURNED_ATTRS;
+
+// The kernel packs attributes in ascending bit order with no alignment padding, so reading
+// them back is just "advance past each one that the bitmap says is there". `end` is the record
+// length the kernel wrote in front of the record, so nothing here can run off the buffer.
+struct Unpack {
+    const char *p;
+    const char *end;
+    bool ok = true;
+    template <typename T>
+    void take(T &out, bool present) {
+        if (!present || !ok) return;
+        if ((size_t)(end - p) < sizeof(T)) { ok = false; return; }
+        memcpy(&out, p, sizeof(T));
+        p += sizeof(T);
+    }
+};
+
+void fill_stat(struct stat &st, dev_t dv, uint32_t mode, uid_t uid, gid_t gid, uint32_t nlink,
+               uint64_t ino, int64_t size, int64_t alloc, uint32_t flags, const struct timespec &bt,
+               const struct timespec &mt, const struct timespec &ct, const struct timespec &at) {
+    memset(&st, 0, sizeof st);
+    st.st_dev = dv;
+    st.st_mode = (mode_t)mode;
+    st.st_nlink = (nlink_t)nlink;
+    st.st_ino = (ino_t)ino;
+    st.st_uid = uid;
+    st.st_gid = gid;
+    st.st_size = (off_t)size;
+    st.st_blocks = (blkcnt_t)(alloc / 512);
+    st.st_blksize = 4096;
+    st.st_flags = flags;
+    st.st_birthtimespec = bt;
+    st.st_mtimespec = mt;
+    st.st_ctimespec = ct;
+    st.st_atimespec = at;
+}
+
+bool is_dot(const char *n) {
+    // getattrlistbulk never yields "." or ".." (docs/TASKS.md T1.7); belt and braces.
+    return n[0] == '.' && (n[1] == 0 || (n[1] == '.' && n[2] == 0));
+}
+
+} // namespace
+
+int fs_bulk_dir(int dirfd, void *ctx, fs_bulk_entry_fn fn, int *cb_rc) {
+    if (dirfd < 0 || !fn) return -EINVAL;
+    if (cb_rc) *cb_rc = 0;
+    struct attrlist al;
+    memset(&al, 0, sizeof al);
+    al.bitmapcount = ATTR_BIT_MAP_COUNT;
+    al.commonattr = kBulkCommon;
+    al.fileattr = kBulkFile;
+    al.forkattr = kBulkFork;
+    // 32 KiB is ~150 entries of this shape. A real tree's syscall count is set by its directory
+    // count, not by the batch size: /Applications is 134,641 entries in 10,302 directories and
+    // 9,974 calls, one per non-empty directory plus the one that returns 0.
+    char buf[32 * 1024];
+    bool reported = false;
+    for (;;) {
+        // No FSOPT_PACK_INVAL_ATTRS on purpose. With it, an attribute the file system cannot
+        // serve still gets its ATTR_CMN_RETURNED_ATTRS bit set and a zero packed in its place --
+        // a silently wrong mtime or size. Without it the bit stays clear, the unpacker notices,
+        // and the entry falls back to fstatat(2). Measured: on devfs, 352 of 353 entries have
+        // ATTR_CMNEXT_EXT_FLAGS absent without the flag and bogus-but-"present" with it; on APFS
+        // the two are byte-identical over 144,133 entries.
+        int n = ::getattrlistbulk(dirfd, &al, buf, sizeof buf, FSOPT_ATTR_CMN_EXTENDED);
+        // Before the first entry has been handed over this means "this file system cannot",
+        // and the caller starts the directory again with readdir(3). Afterwards it is a real
+        // failure and has to be one, or entries would be reported twice.
+        if (n < 0) return reported ? -errno : -ENOTSUP;
+        if (n == 0) return 0;
+        const char *p = buf;
+        const char *bufend = buf + sizeof buf;
+        for (int i = 0; i < n; ++i) {
+            // Everything below trusts the record length the kernel wrote, so check it first:
+            // one bad length would walk the rest of the loop off the end of the buffer.
+            uint32_t reclen = 0;
+            if ((size_t)(bufend - p) < sizeof reclen) return reported ? -EIO : -ENOTSUP;
+            memcpy(&reclen, p, sizeof reclen);
+            if (reclen < sizeof(uint32_t) + sizeof(attribute_set_t) ||
+                reclen > (size_t)(bufend - p))
+                return reported ? -EIO : -ENOTSUP;
+            Unpack u{p + sizeof(uint32_t), p + reclen};
+            attribute_set_t ret;
+            memset(&ret, 0, sizeof ret);
+            u.take(ret, true);
+            const char *name = nullptr;
+            if (ret.commonattr & ATTR_CMN_NAME) {
+                const char *at = u.p;
+                attrreference_t ar;
+                u.take(ar, true);
+                if (u.ok && ar.attr_dataoffset >= 0 && ar.attr_length > 0 &&
+                    at + (size_t)ar.attr_dataoffset + ar.attr_length <= p + reclen &&
+                    at[(size_t)ar.attr_dataoffset + ar.attr_length - 1] == 0)
+                    name = at + ar.attr_dataoffset;
+            }
+            if (!name) return reported ? -EIO : -ENOTSUP;
+
+            dev_t dv = 0;
+            fsobj_type_t ot = 0;
+            struct timespec bt = {0, 0}, mt = {0, 0}, ct = {0, 0}, at = {0, 0};
+            uid_t uid = 0;
+            gid_t gid = 0;
+            uint32_t mode = 0, flags = 0, nlink = 0;
+            uint64_t ino = 0, ext = 0;
+            off_t alloc = 0, len = 0;
+            u.take(dv, (ret.commonattr & ATTR_CMN_DEVID) != 0);
+            u.take(ot, (ret.commonattr & ATTR_CMN_OBJTYPE) != 0);
+            u.take(bt, (ret.commonattr & ATTR_CMN_CRTIME) != 0);
+            u.take(mt, (ret.commonattr & ATTR_CMN_MODTIME) != 0);
+            u.take(ct, (ret.commonattr & ATTR_CMN_CHGTIME) != 0);
+            u.take(at, (ret.commonattr & ATTR_CMN_ACCTIME) != 0);
+            u.take(uid, (ret.commonattr & ATTR_CMN_OWNERID) != 0);
+            u.take(gid, (ret.commonattr & ATTR_CMN_GRPID) != 0);
+            u.take(mode, (ret.commonattr & ATTR_CMN_ACCESSMASK) != 0);
+            u.take(flags, (ret.commonattr & ATTR_CMN_FLAGS) != 0);
+            u.take(ino, (ret.commonattr & ATTR_CMN_FILEID) != 0);
+            u.take(nlink, (ret.fileattr & ATTR_FILE_LINKCOUNT) != 0);
+            u.take(alloc, (ret.fileattr & ATTR_FILE_ALLOCSIZE) != 0);
+            u.take(len, (ret.fileattr & ATTR_FILE_DATALENGTH) != 0);
+            u.take(ext, (ret.forkattr & ATTR_CMNEXT_EXT_FLAGS) != 0);
+            p += reclen;
+            if (is_dot(name)) continue;
+
+            // EF_NO_XATTRS comes back for directories too, and it costs nothing to keep it even
+            // when the struct stat below is an fstatat's.
+            uint8_t xattr = FS_XATTR_UNKNOWN;
+            if (u.ok && (ret.forkattr & ATTR_CMNEXT_EXT_FLAGS))
+                xattr = (ext & EF_NO_XATTRS) ? FS_XATTR_NONE : FS_XATTR_SOME;
+
+            bool whole = u.ok && (ret.commonattr & kBulkCommonNeeded) == kBulkCommonNeeded &&
+                         (mode & S_IFMT) != 0;
+            // OBJTYPE is the cross-check: if the two disagree, trust neither.
+            if (whole && ((ot == VDIR) != S_ISDIR((mode_t)mode) || (ot == VLNK) != S_ISLNK((mode_t)mode)))
+                whole = false;
+            bool dir = whole && S_ISDIR((mode_t)mode);
+            if (whole && !dir && (ret.fileattr & kBulkFile) != kBulkFile) whole = false;
+
+            struct stat st;
+            if (!whole || dir) {
+                if (::fstatat(dirfd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) return -errno;
+            } else {
+                fill_stat(st, dv, mode, uid, gid, nlink, ino, (int64_t)len, (int64_t)alloc, flags,
+                          bt, mt, ct, at);
+            }
+            reported = true;
+            if (int rc = fn(ctx, name, ::strlen(name), st, xattr)) {
+                if (cb_rc) *cb_rc = rc;
+                return 0;
+            }
+        }
+    }
+}
+
+int fs_lstat_xattr(const char *path, struct stat &st, uint8_t &xattr) {
+    xattr = FS_XATTR_UNKNOWN;
+    if (!path) return -EINVAL;
+    // One getattrlist(2) where the old code had one lstat(2): 1.78 µs against 1.41 µs, and it
+    // brings EF_NO_XATTRS with it, which is worth far more than the 0.37 µs (a listxattr the
+    // diff then does not have to make is 2.1 µs, and the getxattr behind it 14 µs).
+    struct attrlist al;
+    memset(&al, 0, sizeof al);
+    al.bitmapcount = ATTR_BIT_MAP_COUNT;
+    al.commonattr = kBulkCommon & ~(uint32_t)ATTR_CMN_NAME;
+    al.fileattr = kBulkFile;
+    al.forkattr = kBulkFork;
+    char buf[512];
+    bool whole = false;
+    uint32_t mode = 0;
+    if (::getattrlist(path, &al, buf, sizeof buf,
+                      FSOPT_NOFOLLOW | FSOPT_ATTR_CMN_EXTENDED) == 0) {   // see fs_bulk_dir
+        uint32_t reclen = 0;
+        memcpy(&reclen, buf, sizeof reclen);
+        if (reclen >= sizeof(uint32_t) + sizeof(attribute_set_t) && reclen <= sizeof buf) {
+            Unpack u{buf + sizeof(uint32_t), buf + reclen};
+            attribute_set_t ret;
+            memset(&ret, 0, sizeof ret);
+            u.take(ret, true);
+            dev_t dv = 0;
+            fsobj_type_t ot = 0;
+            struct timespec bt = {0, 0}, mt = {0, 0}, ct = {0, 0}, at = {0, 0};
+            uid_t uid = 0;
+            gid_t gid = 0;
+            uint32_t flags = 0, nlink = 0;
+            uint64_t ino = 0, ext = 0;
+            off_t alloc = 0, len = 0;
+            u.take(dv, (ret.commonattr & ATTR_CMN_DEVID) != 0);
+            u.take(ot, (ret.commonattr & ATTR_CMN_OBJTYPE) != 0);
+            u.take(bt, (ret.commonattr & ATTR_CMN_CRTIME) != 0);
+            u.take(mt, (ret.commonattr & ATTR_CMN_MODTIME) != 0);
+            u.take(ct, (ret.commonattr & ATTR_CMN_CHGTIME) != 0);
+            u.take(at, (ret.commonattr & ATTR_CMN_ACCTIME) != 0);
+            u.take(uid, (ret.commonattr & ATTR_CMN_OWNERID) != 0);
+            u.take(gid, (ret.commonattr & ATTR_CMN_GRPID) != 0);
+            u.take(mode, (ret.commonattr & ATTR_CMN_ACCESSMASK) != 0);
+            u.take(flags, (ret.commonattr & ATTR_CMN_FLAGS) != 0);
+            u.take(ino, (ret.commonattr & ATTR_CMN_FILEID) != 0);
+            u.take(nlink, (ret.fileattr & ATTR_FILE_LINKCOUNT) != 0);
+            u.take(alloc, (ret.fileattr & ATTR_FILE_ALLOCSIZE) != 0);
+            u.take(len, (ret.fileattr & ATTR_FILE_DATALENGTH) != 0);
+            u.take(ext, (ret.forkattr & ATTR_CMNEXT_EXT_FLAGS) != 0);
+            if (u.ok && (ret.forkattr & ATTR_CMNEXT_EXT_FLAGS))
+                xattr = (ext & EF_NO_XATTRS) ? FS_XATTR_NONE : FS_XATTR_SOME;
+            whole = u.ok && (ret.commonattr & (kBulkCommonNeeded & ~(uint32_t)ATTR_CMN_NAME)) ==
+                                (kBulkCommonNeeded & ~(uint32_t)ATTR_CMN_NAME) &&
+                    (mode & S_IFMT) != 0 && (ot == VDIR) == S_ISDIR((mode_t)mode) &&
+                    (ot == VLNK) == S_ISLNK((mode_t)mode);
+            if (whole && !S_ISDIR((mode_t)mode) && (ret.fileattr & kBulkFile) != kBulkFile)
+                whole = false;
+            if (whole && !S_ISDIR((mode_t)mode))
+                fill_stat(st, dv, mode, uid, gid, nlink, ino, (int64_t)len, (int64_t)alloc, flags,
+                          bt, mt, ct, at);
+            else
+                whole = false;   // a directory: same reason as in fs_bulk_dir
+        }
+    }
+    if (whole) return 0;
+    return ::lstat(path, &st) == 0 ? 0 : -errno;
+}
 
 // ---- EXDEV probe (P6) ---------------------------------------------------------------------
 //

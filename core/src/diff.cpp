@@ -10,6 +10,11 @@
 //   3. full scan    `--full`, or any of the fallbacks: two parallel walks (4 threads, the
 //                   walker from platform_posix.cpp) doing the same per-path comparison.
 //
+// T2.4: both the walk and the per-path lookup on the other side come from getattrlistbulk(2) /
+// getattrlist(2) now, so every entry arrives with its EF_NO_XATTRS verdict already in hand and
+// the xattr leg of the comparison is skipped entirely for the files that have no xattrs -- which
+// is most of them. See platform_darwin.cpp for the attribute list and what each call costs.
+//
 // Reading the snapshot side goes through snapshot_open_for_read() so that there is exactly one
 // place to teach about gated snapshot roots.
 //
@@ -143,6 +148,8 @@ bool content_equal(const char *a, const char *b, uint64_t *bytes) {
 }
 
 #ifdef __APPLE__
+// The slow path: a value too big for the stack buffer below, so its size has to be asked for
+// first. Two getxattr(2) per side instead of one, and getxattr is 14 µs on APFS.
 bool xattr_value_equal(const char *a, const char *b, const char *name) {
     ssize_t sa = ::getxattr(a, name, nullptr, 0, 0, XATTR_NOFOLLOW);
     ssize_t sb = ::getxattr(b, name, nullptr, 0, 0, XATTR_NOFOLLOW);
@@ -158,6 +165,11 @@ bool xattr_value_equal(const char *a, const char *b, const char *name) {
     return same;
 }
 
+// T2.4: ask for the value straight away rather than for its size and then its value. Almost
+// every xattr in the wild fits (com.apple.provenance is 11 bytes, FinderInfo 32, quarantine
+// ~70), and it halves the getxattr count: 55 µs per pair measured before, 35 µs after.
+const size_t kXattrInline = 1024;
+
 bool xattr_equal(const char *a, const char *b) {
     char la[4096], lb[4096];
     ssize_t na = ::listxattr(a, la, sizeof la, XATTR_NOFOLLOW);
@@ -171,13 +183,33 @@ bool xattr_equal(const char *a, const char *b) {
         const char *name = la + i;
         size_t len = ::strnlen(name, (size_t)(na - i));
         if (len == 0 || (ssize_t)(i + len) >= na) break;
-        if (!xattr_value_equal(a, b, name)) return false;
+        char va[kXattrInline], vb[kXattrInline];
+        ssize_t sa = ::getxattr(a, name, va, sizeof va, 0, XATTR_NOFOLLOW);
+        ssize_t sb = ::getxattr(b, name, vb, sizeof vb, 0, XATTR_NOFOLLOW);
+        if (sa < 0 || sb < 0) {
+            // ERANGE (a value over kXattrInline), or the attribute went away between the
+            // listxattr and now. Ask the careful way.
+            if (!xattr_value_equal(a, b, name)) return false;
+        } else if (sa != sb || memcmp(va, vb, (size_t)sa) != 0) {
+            return false;
+        }
         i += (ssize_t)len + 1;
     }
     return true;
 }
+
+// T2.4: the only reason the default full scan used to cost 7x what `--no-xattr` costs. The
+// walker already knows, from ATTR_CMNEXT_EXT_FLAGS, whether either side has any xattr at all;
+// when both sides say "none", there is nothing to compare and no syscall to make. Anything
+// less than both sides saying so -- one side unknown, one side with attributes, a file system
+// that does not report the flag -- falls through to the real comparison above. EF_NO_XATTRS
+// only ever denies, so this can skip work but never a difference.
+bool xattr_maybe_differs(uint8_t wx, uint8_t sx) {
+    return !(wx == wfs::FS_XATTR_NONE && sx == wfs::FS_XATTR_NONE);
+}
 #else
 bool xattr_equal(const char *, const char *) { return true; }
+bool xattr_maybe_differs(uint8_t, uint8_t) { return false; }
 #endif
 
 // ---- the record sink -------------------------------------------------------------------------
@@ -231,9 +263,22 @@ struct Ctx {
     uint64_t compared = 0, content_cmp = 0, bytes_read = 0;
 };
 
-// Both sides exist. Returns 0 (identical), 'M' or 'T'.
-int classify(Ctx &c, const char *wpath, const struct stat &ws, const char *spath,
-             const struct stat &ss) {
+// The other side of a path. Normally one getattrlist(2), which brings the xattr verdict with
+// it; when that verdict cannot be used -- WFS_DIFF_NO_XATTR, or a directory, whose xattrs are
+// never compared (a directory present on both sides says nothing, see classify) -- it is a plain
+// lstat(2) instead, which is 1.41 µs against 1.78 and, for a directory, one syscall against two.
+int other_side(const Ctx &c, const char *path, struct stat &st, uint8_t &xa, bool want_xattr) {
+    if (!want_xattr || (c.flags & WFS_DIFF_NO_XATTR)) {
+        xa = wfs::FS_XATTR_UNKNOWN;
+        return ::lstat(path, &st) == 0 ? 0 : -errno;
+    }
+    return wfs::fs_lstat_xattr(path, st, xa);
+}
+
+// Both sides exist. Returns 0 (identical), 'M' or 'T'. `wxa`/`sxa` are the two sides'
+// fs_xattr_state as the walk (or fs_lstat_xattr) already knows them.
+int classify(Ctx &c, const char *wpath, const struct stat &ws, uint8_t wxa, const char *spath,
+             const struct stat &ss, uint8_t sxa) {
     bump(c.compared);
     if ((ws.st_mode & S_IFMT) != (ss.st_mode & S_IFMT)) return WFS_C_MODIFIED;
 
@@ -265,7 +310,9 @@ int classify(Ctx &c, const char *wpath, const struct stat &ws, const char *spath
         mtime_of(ss, &ssec, &sns);
         if (wsec != ssec || wns != sns) return WFS_C_META;
     }
-    if (!(c.flags & WFS_DIFF_NO_XATTR) && !xattr_equal(wpath, spath)) return WFS_C_META;
+    if (!(c.flags & WFS_DIFF_NO_XATTR) && xattr_maybe_differs(wxa, sxa) &&
+        !xattr_equal(wpath, spath))
+        return WFS_C_META;
     return 0;
 }
 
@@ -278,19 +325,19 @@ struct ExpandCtx {
     bool skip_self;     // the root of the expansion is already being reported as something else
 };
 
-int expand_entry(void *ctx, const char *path, const char *rel, const struct stat &st, bool is_dir) {
+int expand_entry(void *ctx, const wfs::FsEntry &en) {
     ExpandCtx *e = (ExpandCtx *)ctx;
-    if (!*rel && e->skip_self) return 0;
+    if (!*en.rel && e->skip_self) return 0;
     String full(e->prefix);
-    if (*rel) {
+    if (*en.rel) {
         full.append("/");
-        full.append(rel);
+        full.append(en.rel);
     }
-    if (is_dir) {
-        if (dir_is_empty(path)) e->c->sink->add(e->change, WFS_T_DIR, 0, full.c_str());
+    if (en.is_dir) {
+        if (dir_is_empty(en.path)) e->c->sink->add(e->change, WFS_T_DIR, 0, full.c_str());
         return 0;
     }
-    e->c->sink->add(e->change, type_of(st.st_mode), (uint64_t)st.st_size, full.c_str());
+    e->c->sink->add(e->change, type_of(en.st->st_mode), (uint64_t)en.st->st_size, full.c_str());
     return 0;
 }
 
@@ -298,7 +345,7 @@ int expand_entry(void *ctx, const char *path, const char *rel, const struct stat
 // are; Sink::add is behind a mutex either way.
 void expand_side(Ctx &c, const char *rel, const char *path, int change, bool skip_self) {
     ExpandCtx e{&c, rel, change, skip_self};
-    wfs::fs_walk_tree(path, 4, wfs::FS_DIRS_PRE, &e, expand_entry);
+    wfs::fs_walk_tree_ex(path, 4, wfs::FS_DIRS_PRE, &e, expand_entry);
 }
 
 void report_one_side(Ctx &c, const char *rel, const char *path, const struct stat &st, int change) {
@@ -316,38 +363,40 @@ struct SideCtx {
     bool world_side;
 };
 
-int side_entry(void *ctx, const char *path, const char *rel, const struct stat &st, bool is_dir) {
+int side_entry(void *ctx, const wfs::FsEntry &en) {
     SideCtx *s = (SideCtx *)ctx;
     Ctx &c = *s->c;
+    const char *rel = en.rel;
     if (!*rel) return 0; // the root itself
     if (s->world_side && !::strcmp(rel, WFS_MARKER_NAME)) return 0;
 
     String other;
     join_rel(other, s->world_side ? c.sroot.c_str() : c.wroot.c_str(), rel);
     struct stat os;
-    if (::lstat(other.c_str(), &os) != 0) {
+    uint8_t oxa = wfs::FS_XATTR_UNKNOWN;
+    if (other_side(c, other.c_str(), os, oxa, !en.is_dir) != 0) {
         // Only on this side. The walk visits every descendant itself, so a non-empty directory
         // needs no expansion here -- only an empty one has nothing else to report it.
-        if (is_dir) {
-            if (dir_is_empty(path)) c.sink->add(s->world_side ? WFS_C_ADDED : WFS_C_DELETED, WFS_T_DIR, 0, rel);
+        if (en.is_dir) {
+            if (dir_is_empty(en.path)) c.sink->add(s->world_side ? WFS_C_ADDED : WFS_C_DELETED, WFS_T_DIR, 0, rel);
         } else {
-            c.sink->add(s->world_side ? WFS_C_ADDED : WFS_C_DELETED, type_of(st.st_mode),
-                        (uint64_t)st.st_size, rel);
+            c.sink->add(s->world_side ? WFS_C_ADDED : WFS_C_DELETED, type_of(en.st->st_mode),
+                        (uint64_t)en.st->st_size, rel);
         }
         return 0;
     }
     if (!s->world_side) return 0; // present on both: the world-side pass already compared it
-    if (is_dir && S_ISDIR(os.st_mode)) return 0;
-    int ch = classify(c, path, st, other.c_str(), os);
-    if (ch) c.sink->add(ch, type_of(st.st_mode), (uint64_t)st.st_size, rel);
+    if (en.is_dir && S_ISDIR(os.st_mode)) return 0;
+    int ch = classify(c, en.path, *en.st, en.xattr, other.c_str(), os, oxa);
+    if (ch) c.sink->add(ch, type_of(en.st->st_mode), (uint64_t)en.st->st_size, rel);
     return 0;
 }
 
 int full_scan(Ctx &c) {
     SideCtx w{&c, true};
-    if (int rc = wfs::fs_walk_tree(c.wroot.c_str(), 4, wfs::FS_DIRS_PRE, &w, side_entry)) return rc;
+    if (int rc = wfs::fs_walk_tree_ex(c.wroot.c_str(), 4, wfs::FS_DIRS_PRE, &w, side_entry)) return rc;
     SideCtx s{&c, false};
-    return wfs::fs_walk_tree(c.sroot.c_str(), 4, wfs::FS_DIRS_PRE, &s, side_entry);
+    return wfs::fs_walk_tree_ex(c.sroot.c_str(), 4, wfs::FS_DIRS_PRE, &s, side_entry);
 }
 
 // ---- candidate verification ---------------------------------------------------------------------
@@ -358,8 +407,9 @@ void verify_candidate(Ctx &c, const char *rel) {
     join_rel(wpath, c.wroot.c_str(), rel);
     join_rel(spath, c.sroot.c_str(), rel);
     struct stat ws, ss;
-    bool in_world = ::lstat(wpath.c_str(), &ws) == 0;
-    bool in_snap = ::lstat(spath.c_str(), &ss) == 0;
+    uint8_t wxa = wfs::FS_XATTR_UNKNOWN, sxa = wfs::FS_XATTR_UNKNOWN;
+    bool in_world = other_side(c, wpath.c_str(), ws, wxa, true) == 0;
+    bool in_snap = other_side(c, spath.c_str(), ss, sxa, true) == 0;
     if (!in_world && !in_snap) return; // created and removed again inside the same world
     if (in_world && !in_snap) {
         report_one_side(c, rel, wpath.c_str(), ws, WFS_C_ADDED);
@@ -375,7 +425,7 @@ void verify_candidate(Ctx &c, const char *rel) {
     // says nothing about it (a subtree moved in or out produces one event, for the directory).
     if (S_ISDIR(ws.st_mode)) expand_side(c, rel, wpath.c_str(), WFS_C_ADDED, true);
     else if (S_ISDIR(ss.st_mode)) expand_side(c, rel, spath.c_str(), WFS_C_DELETED, true);
-    int ch = classify(c, wpath.c_str(), ws, spath.c_str(), ss);
+    int ch = classify(c, wpath.c_str(), ws, wxa, spath.c_str(), ss, sxa);
     if (ch) c.sink->add(ch, type_of(ws.st_mode), (uint64_t)ws.st_size, rel);
 }
 
