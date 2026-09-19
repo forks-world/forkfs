@@ -11,6 +11,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <sys/file.h>
 #include <unistd.h>
@@ -199,6 +200,109 @@ struct WorldLock {
     }
 };
 
+// ---- P3, the default: the gate directory --------------------------------------------------
+//
+// A snapshot root is chmod 0000. Not being able to traverse a directory is enforced by the
+// kernel before any name below it is resolved, so nothing inside can be listed, read, written,
+// created or deleted -- and no tool, agent or `ls` even sees the contents. The entries
+// themselves are left exactly as the clone made them, which is what makes a fork cheap: there
+// is nothing to undo on the clone (T1.1b; the per-entry UF_IMMUTABLE variant costs 0.68 s to
+// apply and 0.73 s to undo per 50k entries).
+//
+// The root is reopened to 0500 only while the core has to read the tree: the EXDEV probe and
+// the clonefile(dir) of a fork, and the verify walk. That window is serialised across
+// processes by an exclusive flock on the snapshot's manifest file, which lives next to the
+// root and is never gated. Two concurrent forks from the same snapshot therefore do not share
+// the window: the second one waits for the first to close the gate and then opens it again.
+struct SnapGate {
+    String root;
+    uint32_t restore = 0;   // 0 = nothing to do (a --hard snapshot, or never opened)
+    int fd = -1;
+
+    SnapGate() = default;
+    SnapGate(const SnapGate &) = delete;
+    SnapGate &operator=(const SnapGate &) = delete;
+    ~SnapGate() { close(); }
+
+    // snap_root is <store>/snapshots/S<n>/root; the lock file is its sibling `manifest`.
+    int open(const char *snap_root, bool hard) {
+        if (hard) return 0;   // --hard snapshots are protected per entry, not by a gate
+        String dir;
+        dirname_of(snap_root, dir);
+        String lock = joinp(dir.c_str(), "manifest");
+        fd = ::open(lock.c_str(), O_RDONLY);
+        if (fd < 0) return -errno;
+        // Blocking: the window is one clonefile long and waiting is better than failing.
+        if (::flock(fd, LOCK_EX) != 0) { int e = errno; ::close(fd); fd = -1; return -e; }
+        if (::chmod(snap_root, WFS_GATE_OPEN) != 0) {
+            int e = errno;
+            ::flock(fd, LOCK_UN);
+            ::close(fd);
+            fd = -1;
+            return -e;
+        }
+        root.assign(snap_root);
+        restore = WFS_GATE_CLOSED + 1;   // non-zero marker; the mode itself is a constant
+        return 0;
+    }
+    void close() {
+        if (restore) { ::chmod(root.c_str(), WFS_GATE_CLOSED); restore = 0; }
+        if (fd >= 0) { ::flock(fd, LOCK_UN); ::close(fd); fd = -1; }
+    }
+};
+
+// ---- P5: the `world exec` lock ---------------------------------------------------------------
+
+String lock_path(wfs_store *s, wfs_id id) {
+    return numbered(joinp(s->dir.c_str(), "locks").c_str(), 'W', id, ".lock");
+}
+
+// Reads the lock file and decides whether a live holder exists. A file whose pid is gone, or
+// whose flock can be taken, was left behind by a killed process: it is removed and reported as
+// free. Returns 1 when held, 0 when free.
+int lock_probe(const char *path, wfs_lock_info *out) {
+    if (out) memset(out, 0, sizeof *out);
+    int fd = ::open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    char buf[1024] = {0};
+    ssize_t n = ::read(fd, buf, sizeof buf - 1);
+    if (n < 0) n = 0;
+    buf[n] = 0;
+    long long pid = 0, started = 0;
+    const char *cmd = "";
+    // "pid <n>\nstart <t>\ncmd <text>\n"
+    if (const char *p = ::strstr(buf, "pid ")) pid = ::strtoll(p + 4, nullptr, 10);
+    if (const char *p = ::strstr(buf, "start ")) started = ::strtoll(p + 6, nullptr, 10);
+    if (const char *p = ::strstr(buf, "cmd ")) cmd = p + 4;
+    bool alive = pid > 0 && (::kill((pid_t)pid, 0) == 0 || errno == EPERM);
+    if (alive) {
+        // The pid may have been recycled; the flock is the authority. LOCK_NB succeeding means
+        // nobody holds it any more.
+        if (::flock(fd, LOCK_EX | LOCK_NB) == 0) { ::flock(fd, LOCK_UN); alive = false; }
+    }
+    if (!alive) {
+        ::close(fd);
+        ::unlink(path);
+        return 0;
+    }
+    if (out) {
+        out->held = 1;
+        out->pid = pid;
+        out->started_at = started;
+        copy_str(out->cmd, sizeof out->cmd, cmd);
+        for (char *p = out->cmd; *p; ++p) if (*p == '\n') { *p = 0; break; }
+    }
+    ::close(fd);
+    return 1;
+}
+
+// P5 for every destructive world operation. Returns WFS_E_WORLD_BUSY when someone is in there.
+int exec_lock_guard(wfs_store *s, wfs_id id, int force) {
+    if (force) return 0;
+    String p = lock_path(s, id);
+    return lock_probe(p.c_str(), nullptr) ? WFS_E_WORLD_BUSY : 0;
+}
+
 // ---- row helpers -----------------------------------------------------------------------------
 
 const char *kWorldCols =
@@ -259,9 +363,12 @@ void fill_snapshot(Stmt &q, wfs_snapshot_rec &r) {
     r.entries = (uint64_t)q.col_i64(6);
     r.hardlinks = (uint64_t)q.col_i64(7);
     r.state = (int)q.col_i64(8);
+    r.hard = (int)q.col_i64(9);
+    r.root_mode = (uint32_t)q.col_i64(10);
 }
 
-const char *kSnapCols = "id, name, path, src_path, from_world, created_at, entries, hardlinks, state";
+const char *kSnapCols =
+    "id, name, path, src_path, from_world, created_at, entries, hardlinks, state, hard, root_mode";
 
 int snapshot_row(wfs_store *s, wfs_id id, wfs_snapshot_rec &r) {
     String sql("SELECT ");
@@ -279,6 +386,37 @@ int snapshot_row(wfs_store *s, wfs_id id, wfs_snapshot_rec &r) {
 
 enum PathMode { PATH_SOURCE, PATH_TARGET };
 
+bool under_dir(const char *path, const char *dir) {
+    size_t n = ::strlen(dir);
+    return !::strncmp(path, dir, n) && (path[n] == 0 || path[n] == '/');
+}
+
+// realpath() of a path whose ancestors cannot be searched — which is every path inside a
+// gate-protected snapshot — fails with EACCES before it can tell us where the path is. Resolve
+// the deepest ancestor that can still be resolved and re-append the rest, so P7 can recognise
+// the store and refuse with a reason instead of an errno.
+bool resolve_readable_prefix(const char *in, String &out) {
+    String path(in), tail;
+    for (int depth = 0; depth < 64; ++depth) {
+        String r;
+        if (wfs::fs_realpath(path.c_str(), r) == 0) {
+            out = r;
+            if (tail.size()) { out.append("/"); out.append(tail.c_str()); }
+            return true;
+        }
+        const char *slash = ::strrchr(path.c_str(), '/');
+        if (!slash || slash == path.c_str()) return false;
+        String leaf(slash + 1);
+        if (tail.size()) { leaf.append("/"); leaf.append(tail.c_str()); }
+        tail = leaf;
+        String up;
+        dirname_of(path.c_str(), up);
+        if (!::strcmp(up.c_str(), path.c_str())) return false;
+        path = up;
+    }
+    return false;
+}
+
 // Resolves `in` and refuses the dangerous roots: /, $HOME, anything inside the store (that is
 // every snapshot and the trash), and anything strictly below a world root. `is_world_root` tells
 // the caller whether the path itself carries a marker; init refuses that, checkpoint requires it.
@@ -286,6 +424,11 @@ int check_path(wfs_store *s, const char *in, PathMode mode, String &real, bool *
     if (is_world_root) *is_world_root = false;
     if (!in || !*in) return -EINVAL;
     int rc = (mode == PATH_TARGET) ? wfs::fs_realpath_parent(in, real) : wfs::fs_realpath(in, real);
+    if (rc == -EACCES) {
+        String approx;
+        if (resolve_readable_prefix(in, approx) && under_dir(approx.c_str(), s->dir.c_str()))
+            return WFS_E_PATH_REFUSED;   // P7: inside the store, behind a closed gate
+    }
     if (rc) return rc;
     if (mode == PATH_TARGET) {
         if (exists(real.c_str())) return -EEXIST;
@@ -298,10 +441,7 @@ int check_path(wfs_store *s, const char *in, PathMode mode, String &real, bool *
     if (!::strcmp(real.c_str(), "/")) return WFS_E_PATH_REFUSED;
     const char *home = ::getenv("HOME");
     if (home && *home && !::strcmp(real.c_str(), home)) return WFS_E_PATH_REFUSED;
-    const char *store = s->dir.c_str();
-    size_t sl = s->dir.size();
-    if (!::strncmp(real.c_str(), store, sl) && (real.c_str()[sl] == 0 || real.c_str()[sl] == '/'))
-        return WFS_E_PATH_REFUSED;
+    if (under_dir(real.c_str(), s->dir.c_str())) return WFS_E_PATH_REFUSED;
     // The path itself, then every ancestor: a marker above us means we are inside a world.
     String p(real);
     bool self = true;
@@ -341,9 +481,14 @@ int remove_tmp(const char *target) {
 
 // ---- snapshots --------------------------------------------------------------------------------
 
-extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const char *name, wfs_id *out) {
+extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_snapshot_opts *opts,
+                                   wfs_id *out) {
     if (!s || !src_dir || !out) return -EINVAL;
     *out = 0;
+    wfs_snapshot_opts o;
+    memset(&o, 0, sizeof o);
+    if (opts) o = *opts;
+    const char *name = o.name;
     String src;
     bool from_world_root = false;
     if (int rc = check_path(s, src_dir, PATH_SOURCE, src, &from_world_root)) return rc;
@@ -354,6 +499,9 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const char
         wfs_identity id;
         if (int rc = wfs_world_verify_identity(s, src.c_str(), &id)) return rc;
         from_world = id.world_id;
+        // P5: someone is working in there; a checkpoint of a moving tree is rarely what the
+        // caller meant. --force says they meant it.
+        if (int rc = exec_lock_guard(s, from_world, o.force)) return rc;
     }
     // P6: st_dev equality does not predict clonefile success, so really clone something.
     if (int rc = wfs_store_clone_probe(s, src.c_str())) return rc;
@@ -373,14 +521,15 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const char
         Guard g(s->mu);
         Txn t(s->db);
         Stmt ins(s->db,
-                 "INSERT INTO snapshots(name, path, src_path, from_world, created_at, state)"
-                 " VALUES(?,'',?,?,?,?)");
+                 "INSERT INTO snapshots(name, path, src_path, from_world, created_at, state, hard)"
+                 " VALUES(?,'',?,?,?,?,?)");
         if (!ins.ok()) return -EIO;
         ins.text(1, nm);
         ins.text(2, src.c_str());
         ins.i64(3, (int64_t)from_world);
         ins.i64(4, now_sec());
         ins.i64(5, WFS_ST_CREATING);
+        ins.i64(6, o.hard ? 1 : 0);
         if (ins.step() != SQLITE_DONE) return -EIO;
         id = (wfs_id)sqlite3_last_insert_rowid(s->db);
         t.commit();
@@ -392,21 +541,33 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const char
     String root = joinp(tmpdir.c_str(), "root");
     int rc = 0;
     TreeStats stats;
+    uint32_t root_mode = 0755;
     do {
         if (exists(tmpdir.c_str())) { if ((rc = wfs::fs_remove_tree(tmpdir.c_str()))) break; }
         if ((rc = wfs::fs_mkdir(tmpdir.c_str(), 0755))) break;
+        // The source here is always a plain directory or a live world: check_path refuses
+        // anything inside the store, so a snapshot is never a snapshot's source and there is
+        // no gate to open on this side.
         if ((rc = wfs::fs_clone_tree(src.c_str(), root.c_str(), false))) break;
         // A checkpoint carries the source world's marker; it is not this snapshot's identity.
         String m = joinp(root.c_str(), WFS_MARKER_NAME);
         ::unlink(m.c_str());
+        {
+            struct stat rst;
+            if (::stat(root.c_str(), &rst) == 0) root_mode = (uint32_t)(rst.st_mode & 07777);
+        }
         Manifest man;
         String mp = joinp(tmpdir.c_str(), "manifest");
         man.f = ::fopen(mp.c_str(), "w");
         if (!man.f) { rc = -errno; break; }
-        rc = wfs::fs_protect_tree(root.c_str(), &stats, &man);
+        // One walk either way: --hard also flips every entry to UF_IMMUTABLE, the gate does not.
+        rc = o.hard ? wfs::fs_protect_tree(root.c_str(), &stats, &man)
+                    : wfs::fs_scan_tree(root.c_str(), &stats, &man);
         if (::fclose(man.f) != 0 && !rc) rc = -EIO;
         man.f = nullptr;
         if (rc) break;
+        // Close the gate before the tree becomes visible under its final name (publish order).
+        if (!o.hard && ::chmod(root.c_str(), WFS_GATE_CLOSED) != 0) { rc = -errno; break; }
         if ((rc = wfs::fs_rename(tmpdir.c_str(), snapdir.c_str()))) break;
     } while (0);
 
@@ -422,14 +583,16 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const char
     {
         Guard g(s->mu);
         Txn t(s->db);
-        Stmt u(s->db, "UPDATE snapshots SET path=?, entries=?, hardlinks=?, state=? WHERE id=?");
+        Stmt u(s->db,
+               "UPDATE snapshots SET path=?, entries=?, hardlinks=?, state=?, root_mode=? WHERE id=?");
         if (!u.ok()) return -EIO;
         String rootfinal = joinp(snapdir.c_str(), "root");
         u.text(1, rootfinal.c_str());
         u.i64(2, (int64_t)stats.entries);
         u.i64(3, (int64_t)src_stats.hardlinks);
         u.i64(4, WFS_ST_ACTIVE);
-        u.i64(5, (int64_t)id);
+        u.i64(5, (int64_t)root_mode);
+        u.i64(6, (int64_t)id);
         if (u.step() != SQLITE_DONE) return -EIO;
         t.commit();
     }
@@ -475,7 +638,9 @@ extern "C" int wfs_world_create(wfs_store *s, wfs_ref from, const char *target_p
     uint64_t entries = 0;
     wfs_id snapshot_id = 0, parent_world = 0;
     char inherited[WFS_NAME_MAX] = {0};
-    bool src_protected = false;
+    bool src_hard = false;    // source is a --hard snapshot: the clone needs an unprotect walk
+    bool src_gated = false;   // source is a gate-protected snapshot: open it around the clone
+    uint32_t src_root_mode = 0;
     WorldLock srclock;
 
     if (from.kind == WFS_K_SNAPSHOT) {
@@ -489,7 +654,9 @@ extern "C" int wfs_world_create(wfs_store *s, wfs_ref from, const char *target_p
         entries = r.entries;
         snapshot_id = r.id;
         copy_str(inherited, sizeof inherited, r.name);
-        src_protected = true;
+        src_hard = r.hard != 0;
+        src_gated = !src_hard;
+        src_root_mode = r.root_mode ? r.root_mode : 0755;
     } else if (from.kind == WFS_K_WORLD) {
         wfs_world_rec r;
         {
@@ -505,7 +672,10 @@ extern "C" int wfs_world_create(wfs_store *s, wfs_ref from, const char *target_p
         snapshot_id = r.snapshot_id;
         parent_world = r.id;
         copy_str(inherited, sizeof inherited, r.name);
-        // P5: cloning a directory tree blocks writers in it for 10–15 ms spikes
+        // P5: someone may be running an agent in there; forking a tree that is being written
+        // gives a child world in an arbitrary half-state. --force says that is acceptable.
+        if (int rc = exec_lock_guard(s, r.id, o.force)) return rc;
+        // P5/P12: cloning a directory tree blocks writers in it for 10–15 ms spikes
         // (CLONE_MODEL_MACOS27 §10). Take the world lock so two commands cannot overlap.
         if (int rc = srclock.take(src.c_str())) return rc;
     } else {
@@ -518,8 +688,12 @@ extern "C" int wfs_world_create(wfs_store *s, wfs_ref from, const char *target_p
     dirname_of(target.c_str(), parent_dir);
 
     // P6 between the source volume and the target volume, which need not be the store's.
+    // The probe reads a file out of the source, so a gated snapshot has to be opened for it.
     if (!o.allow_fallback) {
+        SnapGate probe_gate;
+        if (src_gated) { if (int rc = probe_gate.open(src.c_str(), false)) return rc; }
         int rc = wfs::fs_clone_probe(parent_dir.c_str(), src.c_str());
+        probe_gate.close();
         if (rc == -EXDEV || rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
         if (rc) return rc;
     }
@@ -561,9 +735,22 @@ extern "C" int wfs_world_create(wfs_store *s, wfs_ref from, const char *target_p
     int rc = 0;
     do {
         if (exists(tmp.c_str())) { if ((rc = wfs::fs_remove_tree(tmp.c_str()))) break; }
-        if ((rc = wfs::fs_clone_tree(src.c_str(), tmp.c_str(), o.allow_fallback != 0))) break;
-        // The clone inherits UF_IMMUTABLE and the stripped directory modes from the snapshot.
-        if (src_protected && (rc = wfs::fs_unprotect_tree(tmp.c_str()))) break;
+        {
+            // T1.1b: the whole cost of forking from a gated snapshot is this one clonefile.
+            // The gate is open for exactly its duration and for nothing else.
+            SnapGate gate;
+            if (src_gated && (rc = gate.open(src.c_str(), false))) break;
+            rc = wfs::fs_clone_tree(src.c_str(), tmp.c_str(), o.allow_fallback != 0);
+        }
+        if (rc) break;
+        if (src_gated) {
+            // The clone copied the root's open-gate mode; give it the source tree's own mode
+            // back (plus owner write, as the unprotect walk does for --hard). Nothing below
+            // the root was ever touched, so there is nothing else to undo.
+            if (::chmod(tmp.c_str(), (mode_t)(src_root_mode | 0200)) != 0) { rc = -errno; break; }
+        }
+        // A --hard clone inherits UF_IMMUTABLE and the stripped directory modes.
+        if (src_hard && (rc = wfs::fs_unprotect_tree(tmp.c_str()))) break;
         if ((rc = marker_write(tmp.c_str(), s->store_id.c_str(), id, nm, snapshot_id, parent_world, created)))
             break;
         if ((rc = wfs::fs_rename(tmp.c_str(), target.c_str()))) break;
@@ -638,7 +825,7 @@ extern "C" int wfs_world_list(wfs_store *s, int include_trashed, wfs_world_rec *
     return 0;
 }
 
-extern "C" int wfs_world_discard(wfs_store *s, wfs_id id, int immediate) {
+extern "C" int wfs_world_discard(wfs_store *s, wfs_id id, int immediate, int force) {
     if (!s || !id) return -EINVAL;
     wfs_world_rec r;
     {
@@ -665,6 +852,8 @@ extern "C" int wfs_world_discard(wfs_store *s, wfs_id id, int immediate) {
         return 0;
     }
     if (r.state != WFS_ST_ACTIVE) return -ESTALE;
+    // P5: never pull the floor out from under a running `world exec`.
+    if (int rc = exec_lock_guard(s, id, force)) return rc;
     wfs_identity ident;
     if (int rc = wfs_world_verify_identity(s, r.path, &ident)) return rc;
 
@@ -735,6 +924,51 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
     u.i64(4, (int64_t)id);
     if (u.step() != SQLITE_DONE) return -EIO;
     t.commit();
+    return 0;
+}
+
+// ---- the exec lock (P5) -------------------------------------------------------------------------
+
+extern "C" int wfs_world_lock_exec(wfs_store *s, wfs_id id, const char *cmd, int *out_fd) {
+    if (!s || !id || !out_fd) return -EINVAL;
+    *out_fd = -1;
+    String p = lock_path(s, id);
+    if (lock_probe(p.c_str(), nullptr)) return WFS_E_WORLD_BUSY;   // also drops a stale file
+    int fd = ::open(p.c_str(), O_RDWR | O_CREAT, 0644);
+    if (fd < 0) return -errno;
+    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        int e = errno;
+        ::close(fd);
+        return (e == EWOULDBLOCK || e == EAGAIN) ? WFS_E_WORLD_BUSY : -e;
+    }
+    // The child must not inherit the lock: it belongs to the `world exec` process itself, so a
+    // daemon the child leaves behind does not keep the world busy forever.
+    ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    String text("pid ");
+    char num[64];
+    ::snprintf(num, sizeof num, "%lld\nstart %lld\ncmd ", (long long)::getpid(), (long long)now_sec());
+    text.append(num);
+    text.append(cmd && *cmd ? cmd : "-");
+    text.append("\n");
+    ::ftruncate(fd, 0);
+    ssize_t n = ::write(fd, text.c_str(), text.size());
+    if (n != (ssize_t)text.size()) { ::flock(fd, LOCK_UN); ::close(fd); return -EIO; }
+    *out_fd = fd;
+    return 0;
+}
+
+extern "C" void wfs_world_unlock_exec(wfs_store *s, wfs_id id, int fd) {
+    if (s && id) {
+        String p = lock_path(s, id);
+        ::unlink(p.c_str());
+    }
+    if (fd >= 0) { ::flock(fd, LOCK_UN); ::close(fd); }
+}
+
+extern "C" int wfs_world_lock_check(wfs_store *s, wfs_id id, wfs_lock_info *out) {
+    if (!s || !id) return -EINVAL;
+    String p = lock_path(s, id);
+    lock_probe(p.c_str(), out);
     return 0;
 }
 
@@ -929,6 +1163,20 @@ extern "C" int wfs_snapshot_verify(wfs_store *s, wfs_id id, wfs_verify_report *o
     if (r.state != WFS_ST_ACTIVE) return -ESTALE;
     String snapdir;
     dirname_of(r.path, snapdir);
+
+    // P3 for a gated snapshot: the protection is the root's mode, so check it before opening
+    // the gate. Anything other than 0000 means somebody (or a crashed command) left it open.
+    if (!r.hard) {
+        struct stat gst;
+        if (::stat(r.path, &gst) != 0) return -errno;
+        if ((gst.st_mode & 07777) != WFS_GATE_CLOSED) {
+            out->unprotected++;
+            copy_str(out->first_bad, sizeof out->first_bad, r.path);
+        }
+    }
+    SnapGate gate;
+    if (int rc = gate.open(r.path, r.hard != 0)) return rc;
+
     String mp = joinp(snapdir.c_str(), "manifest");
     FILE *f = ::fopen(mp.c_str(), "r");
     if (!f) return -errno;
@@ -958,11 +1206,18 @@ extern "C" int wfs_snapshot_verify(wfs_store *s, wfs_id id, wfs_verify_report *o
             if (!out->first_bad[0]) copy_str(out->first_bad, sizeof out->first_bad, full.c_str());
             continue;
         }
-        bool bad = kind_of(st.st_mode) != kind || (unsigned)(st.st_mode & 07777) != mode;
+        // The root of a gated snapshot is the one entry whose mode is meant to differ from
+        // the manifest: it is 0000 when closed and WFS_GATE_OPEN right now. It was checked
+        // above, on its own terms.
+        bool is_root = !*rel;
+        bool skip_mode = is_root && !r.hard;
+        bool bad = kind_of(st.st_mode) != kind || (!skip_mode && (unsigned)(st.st_mode & 07777) != mode);
         if (!S_ISDIR(st.st_mode) && (unsigned long long)st.st_size != size) bad = true;
 #ifdef __APPLE__
         if ((long long)st.st_mtimespec.tv_sec != sec) bad = true;
-        bool prot = (st.st_flags & UF_IMMUTABLE) != 0;
+        // Only a --hard snapshot carries per-entry flags; the gate protects the whole tree at
+        // its root instead, so UF_IMMUTABLE being clear there is not a finding.
+        bool prot = !r.hard || (st.st_flags & UF_IMMUTABLE) != 0;
 #else
         if ((long long)st.st_mtim.tv_sec != sec) bad = true;
         bool prot = true;
@@ -1103,6 +1358,28 @@ extern "C" int wfs_gc(wfs_store *s, int64_t retention_secs, wfs_gc_report *out) 
     }
     for (size_t i = 0; i < parents.size(); ++i) rm_tmp_in_dir(parents[i].c_str(), &rep.tmp_removed);
     rm_tmp_in_dir(snaps.c_str(), &rep.tmp_removed);
+
+    // <store>/tmp holds the seatbelt profiles `world exec` generates. They are removed when the
+    // command ends; one that survives an hour belongs to a process that was killed.
+    {
+        String tmpd = joinp(s->dir.c_str(), "tmp");
+        if (DIR *d = ::opendir(tmpd.c_str())) {
+            int64_t cut = now_sec() - 3600;
+            while (struct dirent *e = ::readdir(d)) {
+                if (e->d_name[0] == '.') continue;
+                String f = joinp(tmpd.c_str(), e->d_name);
+                struct stat st;
+                if (::lstat(f.c_str(), &st) != 0 || S_ISDIR(st.st_mode)) continue;
+#ifdef __APPLE__
+                int64_t mt = (int64_t)st.st_mtimespec.tv_sec;
+#else
+                int64_t mt = (int64_t)st.st_mtim.tv_sec;
+#endif
+                if (mt <= cut && ::unlink(f.c_str()) == 0) rep.tmp_removed++;
+            }
+            ::closedir(d);
+        }
+    }
 
     // Trash directories with no row at all.
     String trashdir = joinp(s->dir.c_str(), "trash");

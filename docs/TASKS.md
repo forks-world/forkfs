@@ -180,6 +180,7 @@ S1/S4 的抖动来自 mds 索引新生成的文件。)
       每条拒绝一行原因 + 一行"正确的命令";退出码 0 ok / 1 error / 2 usage / 3 refused-by-safety-rule。
 - [x] T1.6a safety 测试套件 `scripts/tests/safety.sh`(P1/P2/P3/P4/P6/P7/P8/P9/P12/P13,35 条全过);
       core 单测 `core/tests/core_test.cpp` 覆盖同样的规则 + P11/P13 的 API 层。
+      T1.1b/T1.4 之后扩到 71 条(加 P5/P14,P3 改写成 gate + --hard 两条路径)。
 
 #### T1.1/T1.2 实测(2026-09-19,同一台 M1 Mac mini / macOS 27.0,best of 3,机器非空闲)
 
@@ -209,16 +210,64 @@ S1/S4 的抖动来自 mds 索引新生成的文件。)
 
 与 §9.2 的 clonefile 结论一致:**4 线程就到顶**,瓶颈是 APFS 的元数据事务而不是 CPU。
 
-**结论**:fork 的一半时间花在 unprotect 上(0.73 s / 1.35 s)。P3 的逐条目保护无法省掉——
-目录 mode 只能挡住 create/unlink,挡不住对既有文件的写,所以每个文件都要自己的 chflags 或 chmod。
-真正的解法是 T1.5 的 pool:后台预克隆 + 预 unprotect,fork 只剩一次 rename。
-arch.md §1 的 `fork < 10ms` 目前只有 pool 命中时才可能满足;当场 clone 的地板是 1k 条目 40 ms(其中 4 ms 是进程启动)。
+**结论**:fork 的一半时间花在 unprotect 上(0.73 s / 1.35 s)。
+当时的判断是"P3 的逐条目保护无法省掉",这一条在 T1.1b 被推翻(见下)。
+
+- [x] **T1.1b 保护模型换成 gate 目录**(2026-09-19,架构师决定)
+      默认保护 = 快照根目录本身 `chmod 0000`,树里的条目一个都不动。内核在解析任何子路径之前
+      就挡住了 traverse/list/read/write/create/unlink,普通工具和 agent 连里面有什么都看不见;
+      因为条目没被改过,**fork 不需要任何 unprotect 遍历**,克隆出来就是可写的正常树。
+      clonefile 期间(fork / verify)core 自己把根临时开到 `0500`,用快照 `manifest` 文件上的
+      独占 flock 串行化:同一快照的并发 fork **不共享窗口**,第二个等第一个关门后再开。
+      逐条目 `UF_IMMUTABLE` 保留为显式选项 `init/checkpoint --hard`(`snapshots.hard=1`),
+      从 hard 快照 fork 仍要走 unprotect 遍历;`verify` 两种都支持
+      (gate 快照额外检查"根是不是被人留成敞开的")。
+      P9 硬链接统计与 P11 条目数仍在克隆前的源树 walk 里(50k 上 0.047 s)。
+- [x] T1.4 exec:`world exec W<n> [--no-sandbox|--require-sandbox] -- <cmd...>`(P5 + P14)
+- [x] T1.6b safety 覆盖 P5/P14,并按 gate 模型重写 P3;core 单测同步。
+
+#### T1.1b 实测(2026-09-19,同一台 M1 Mac mini / macOS 27.0,best of 3,负载 ~2–4,比 T1.1 那轮更忙)
+
+同一棵树,gate 与 `--hard` 各自独立的 store(条目数含根):
+
+| 操作 | 1 041 | 10 401 | 52 001 |
+|---|---|---|---|
+| `fork`(gate,**新默认**) | **0.048 s** | **0.141 s** | **0.615 s** |
+| `fork --hard 快照`(= a937ce0 的行为) | 0.062 s | 0.322 s | 1.509 s |
+| a937ce0 实测(50 993 条目,更空闲的机器) | 0.040 s | 0.300 s | 1.350 s |
+| `init`(gate) | 0.055 s | 0.175 s | 0.785 s |
+| `init --hard` | 0.064 s | 0.330 s | 1.507 s |
+| `verify`(gate / hard) | 0.035 / 0.034 s | 0.068 / 0.069 s | 0.213 / 0.219 s |
+
+对照:同一时刻同一棵 52 001 条目树的**裸 `clonefile(dir)`** best of 3 = **0.563 s**。
+即 gate fork = clonefile + 0.05 s(probe + chmod + marker + rename + 两次 SQLite 事务 + 进程启动),
+已经贴着 clonefile 的地板;50k 没有落到目标区间 0.45–0.5 s 纯粹是因为这轮机器上 clonefile 本身
+就要 0.563 s(a937ce0 那轮是 0.435 s,CLONE_MODEL §1.1 空闲机是 0.370 s)。
+1k 的 48 ms 里有 ~4 ms 是进程启动 + 动态链接。
+
+**结论**:fork 的成本从"clonefile + 一次全树 chflags 遍历"降到"clonefile + O(1)"。
+`fork < 10ms`(arch.md §1)仍然只有 T1.5 的 pool 能满足,但 pool 现在只需要预克隆,不再需要预 unprotect。
+
+#### T1.4 exec(P5 + P14)
+
+- 锁:`<store>/locks/W<n>.lock`(pid + 起始时间 + 命令行),flock 独占,`FD_CLOEXEC`,
+  进程退出/被杀由内核释放。`discard` / `checkpoint` / 从该 World `fork` 检测到活锁就返回
+  `WFS_E_WORLD_BUSY`(退出码 3,提示 `--force`);pid 已死或 flock 能拿到的锁算 stale,静默删除。
+  锁放在 store 而不是 World 根:World 根是用户的项目树,锁文件会进 `git status`、会被克隆进子 World。
+  (设计文档里写的是 `.world/lock`,但本实现里 `.world` 是文件不是目录。)
+- 沙盒:默认用 `sandbox-exec -f <profile>`(27.0 上仍然可用,只是 deprecated)。profile 生成到
+  `<store>/tmp/`,命令结束即删,`gc` 兜底清理超过 1 小时的残留。
+  seatbelt **后匹配的规则赢**,所以 allow 全写在前、deny 全写在后:
+  `(allow default)` → allow 本 World 根 / `$TMPDIR` / `/private/tmp` / agent 缓存目录 →
+  `deny file-write*` 整个 store、每个别的 World 根,`deny file-read*` `<store>/snapshots`。
+  profile 先拿 `/usr/bin/true` 试跑一次,跑不起来就降级为无沙盒并打印大写 WARNING,
+  `--require-sandbox` 则改为拒绝。
+- 退出码透传;子进程被信号杀死时返回 128+signo;SIGINT/SIGTERM/SIGHUP 转发给子进程,锁总是释放。
 
 - [ ] T1.3 diff:FSEvents + 全扫回退 + 比对(P10)
-- [ ] T1.4 exec:cwd/env/lock/seatbelt(P5/P14)
-- [ ] T1.5 pool:后台预克隆
-- [~] T1.6 safety 测试套件(P1–P14):P1/P2/P3/P4/P6/P7/P8/P9/P12/P13 已覆盖;
-      P5(exec lock)、P10(diff)、P11(真实磁盘写满)、P14(seatbelt)随 T1.3/T1.4 补
+- [ ] T1.5 pool:后台预克隆(现在只需预克隆,不需预 unprotect)
+- [~] T1.6 safety 测试套件(P1–P14):P1/P2/P3/P4/P5/P6/P7/P8/P9/P12/P13/P14 已覆盖(71 条全过);
+      P10(diff)随 T1.3 补,P11 的"真实磁盘写满"仍只在 API 层验证
 - [ ] T1.7 基准:fork 延迟、diff、1000 idle World、存储增长
 - [ ] T1.8 文档:arch.md 增补章节、README
 

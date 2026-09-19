@@ -492,6 +492,36 @@ int fs_count_entries(const char *root, TreeStats &out) {
     return fs_walk_tree(root, 4, FS_DIRS_PRE, &out, count_entry);
 }
 
+namespace {
+struct ScanCtx {
+    TreeStats *stats;
+    Manifest *man;
+};
+
+int scan_entry(void *ctx, const char *, const char *rel, const struct stat &st, bool is_dir) {
+    ScanCtx *c = (ScanCtx *)ctx;
+    if (*rel && c->stats) {
+        bump(c->stats->entries);
+        if (is_dir) bump(c->stats->dirs);
+        else {
+            bump(c->stats->files);
+            if (st.st_nlink > 1) bump(c->stats->hardlinks);   // always 0 on a clone; see below
+        }
+    }
+    if (c->man) c->man->line(rel, st, is_dir);
+    return 0;
+}
+} // namespace
+
+// Gate protection reads the tree once to write the manifest that `verify` checks against, and
+// touches nothing. The hardlink count here is always 0 for the same reason as in
+// fs_protect_tree (clonefile breaks them); the real P9 number comes from a walk of the source.
+int fs_scan_tree(const char *root, TreeStats *stats, Manifest *man) {
+    if (stats) *stats = TreeStats();
+    ScanCtx c{stats, man};
+    return fs_walk_tree(root, 4, FS_DIRS_PRE, &c, scan_entry);
+}
+
 void Manifest::line(const char *rel, const struct stat &st, bool is_dir) {
     char kind = is_dir ? 'd' : S_ISLNK(st.st_mode) ? 'l' : S_ISREG(st.st_mode) ? 'f'
                 : S_ISFIFO(st.st_mode) ? 'p' : S_ISCHR(st.st_mode) ? 'c' : S_ISBLK(st.st_mode) ? 'b' : 's';
@@ -535,6 +565,12 @@ int rm_rec(const char *path) {
     if (::lstat(path, &st) != 0) return errno == ENOENT ? 0 : -errno;
     if (!S_ISDIR(st.st_mode)) return ::unlink(path) == 0 || errno == ENOENT ? 0 : -errno;
     DIR *d = ::opendir(path);
+    if (!d && errno == EACCES) {
+        // A gate-protected snapshot root is 0000. We are deleting the thing, so opening the
+        // gate for good is exactly right.
+        ::chmod(path, 0700);
+        d = ::opendir(path);
+    }
     if (!d) return -errno;
     int rc = 0;
     while (struct dirent *e = ::readdir(d)) {

@@ -6,8 +6,10 @@ Design: [`arch.md`](arch.md), [`docs/M1_DESIGN.md`](docs/M1_DESIGN.md). Task boa
 ## Status
 
 M1 (clonefile Worlds). A **Snapshot** is an immutable whole-tree `clonefile()` clone inside the
-store, every entry `chflags(UF_IMMUTABLE)`; a **World** is a writable clone of a Snapshot or of
-another World, living at a path you choose. Nothing is on the data path: a World is plain APFS,
+store, protected by a *gate*: the snapshot root directory is mode `0000`, so nothing can traverse,
+list, read or write anywhere inside it, while the entries themselves are left exactly as cloned —
+which is why forking one costs a `clonefile()` and nothing else. A **World** is a writable clone of
+a Snapshot or of another World, living at a path you choose. Nothing is on the data path: a World is plain APFS,
 so everything inside it runs at native speed (measured 99–102%, [`docs/CLONE_MODEL_MACOS27.md`](docs/CLONE_MODEL_MACOS27.md)).
 
 The M0 FSKit passthrough frontend is frozen as a fallback and is not built by default
@@ -33,6 +35,7 @@ scripts/tests/safety.sh build/Release # every fool-proofing rule, end to end, PA
 world=build/Release/cli/world
 
 $world fs init ~/src/myproj            # S1: immutable snapshot of the tree (the original is untouched)
+$world fs init ~/src/myproj --hard     # ... with UF_IMMUTABLE on every entry instead of the gate
 $world fs fork --from S1 --to ~/w/a    # W1: a writable clone at ~/w/a
 $world fs fork                         # W2 at ~/worlds/W2/<name>, from the newest snapshot
 cd ~/w/a && <let an agent loose>       # plain APFS: native speed, no mount, no daemon
@@ -46,6 +49,7 @@ $world fs discard W3                   # into the store trash; restorable
 $world fs restore W3
 $world fs gc --retention 7             # delete trash older than 7 days and stray *.wfs-tmp trees
 $world fs status                       # store, counts, free space
+$world exec W1 -- make test            # run a command inside W1, sandboxed (see below)
 ```
 
 The store defaults to `~/Library/Application Support/World/fs`; `--store <dir>` or `$WORLD_STORE`
@@ -72,18 +76,62 @@ cloning, not by comparing `st_dev` (P6); `/`, `$HOME`, the store, and anything i
 Snapshot are refused (P7); a fork that dies half way leaves only a `*.wfs-tmp` tree for `gc` (P8);
 hardlinks that the clone will break are counted and reported (P9); free space is checked before
 cloning (P11); every metadata mutation is a `BEGIN IMMEDIATE` transaction and world-level
-operations take a flock on the marker (P12); a store from another schema is refused (P13).
+operations take a flock on the marker (P12); a store from another schema is refused (P13); a World
+somebody is running `world exec` in cannot be discarded, checkpointed or forked from (P5); and that
+command runs in a seatbelt sandbox that cannot write to any other World or to the store (P14).
+
+## Running an agent in a World: `world exec`
+
+```bash
+world exec W1 -- claude -p "fix the failing test"
+world exec W1 --no-sandbox -- make test        # opt out of the sandbox entirely
+world exec W1 --require-sandbox -- ./agent.sh  # refuse to run if the sandbox is unavailable
+```
+
+`world exec` chdirs into the World root, exports `WORLD_ID`, `WORLD_ROOT` and `WORLD_STORE`, and
+takes an **exec lock** (`<store>/locks/W<n>.lock`: pid, start time, command, held under `flock`).
+While it is held, `discard`, `checkpoint` and `fork --from` that World are refused with exit code 3
+and a `--force` hint (P5); a lock whose process is gone is cleaned up silently. The command's exit
+code is `world exec`'s exit code, `SIGINT`/`SIGTERM`/`SIGHUP` are forwarded to it, and a command
+killed by a signal reports `128 + signo`.
+
+Unless you pass `--no-sandbox`, the command runs under `sandbox-exec` with a generated seatbelt
+profile (P14). Seatbelt lets the **last** matching rule win, so the profile allows first and denies
+last, which makes the denies absolute:
+
+| | |
+|---|---|
+| **denied, write** | the whole store (metadata, trash and every snapshot), and every other World's root |
+| **denied, read** | `<store>/snapshots` |
+| allowed, write | this World's root |
+| | `$TMPDIR`, `/private/tmp`, `/private/var/tmp` |
+| | `~/.cache`, `~/.config`, `~/.codex`, `~/.claude`, `~/.npm`, `~/.cargo`, `~/.rustup`, `~/.local/state` |
+| | `~/Library/Caches`, `~/Library/Application Support/{Claude,Code,Cursor}` |
+| everything else | allowed (`(allow default)`): the sandbox is a fence around other Worlds, not a jail |
+
+The allow list is redundant while the profile starts from `(allow default)` — it is written out so
+the profile states what an agent is expected to need, and so that tightening the default later does
+not silently break agents. To change it, edit `kAgentHomeDirs` in `cli/main.cpp`.
+
+Two consequences worth knowing: a `world fs` command that *writes* metadata (`fork`, `init`,
+`discard`, …) fails with `Operation not permitted` when run from inside a sandboxed `world exec` —
+read-only ones like `list` work; and `sandbox-exec` is deprecated on macOS, so the profile is first
+tried on `/usr/bin/true`. If that probe fails, `world exec` falls back to running without a sandbox
+and says so loudly, unless `--require-sandbox` was given.
 
 ## Measured cost (macOS 27.0, M1 Mac mini, best of 3)
 
-| tree | `fs init` | `fs fork` | `fs verify` |
+| tree (entries incl. root) | `fs init` | `fs fork` | `fs verify` |
 |---|---|---|---|
-| 1 000 entries | 0.037 s | 0.040 s | 0.010 s |
-| 10 200 entries | 0.280 s | 0.300 s | 0.041 s |
-| 50 993 entries | 1.363 s | 1.350 s | 0.177 s |
+| 1 041 | 0.055 s | 0.048 s | 0.035 s |
+| 10 401 | 0.175 s | 0.141 s | 0.068 s |
+| 52 001 | 0.785 s | 0.615 s | 0.213 s |
 
-Half of a 50k fork is the parallel `chflags` unprotect walk (0.73 s) and 0.44 s is the
-`clonefile()` itself. Full breakdown and the thread-count scan: [`docs/TASKS.md`](docs/TASKS.md).
+A bare `clonefile()` of the same 52 001-entry tree at the same moment was 0.563 s, so a fork is
+`clonefile()` plus ~50 ms: the gate protection is one `chmod` and nothing is cloned into the World
+that has to be undone. With `--hard` the same fork costs 1.509 s, because the clone inherits
+`UF_IMMUTABLE` on all 52 001 entries and a parallel `chflags` walk has to take it off again.
+Full numbers and the thread-count scan: [`docs/TASKS.md`](docs/TASKS.md).
 
 ## FSKit passthrough frontend (frozen, optional)
 
@@ -123,6 +171,11 @@ macos/fskit/                          Objective-C++ FSKit appex (WFS_FSKIT=ON on
 cli/main.cpp                          `world` CLI (C-style C++); `world fs ...` is the FS provider surface
 third_party/                          header-only submodules: fmt, Arena, Containa, smallstring
 scripts/                              bundle.sh, check-deps.sh, mount.sh, smoke.sh, tests/safety.sh, bench/
+
+<store>/snapshots/S<n>/root           the snapshot tree; the root itself is the 0000 gate
+<store>/snapshots/S<n>/manifest       what `verify` checks against, and the lock for the gate window
+<store>/locks/W<n>.lock               the `world exec` lock (P5)
+<store>/tmp/                          seatbelt profiles generated by `world exec` (P14)
 ```
 
 Extension lifecycle and fskitd:

@@ -6,6 +6,8 @@
 #include "worldfs/worldfs.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,13 +26,15 @@ enum { EX_OK = 0, EX_ERR = 1, EX_USAGE = 2, EX_REFUSED = 3 };
 
 static void usage(void) {
     fputs("usage: world fs <command>\n"
-          "  init <dir> [--name N]            snapshot <dir> as S<n> (immutable, protected)\n"
-          "  fork [--from W<n>|S<n>] [--to <path>] [--name N] [--copy]\n"
+          "  init <dir> [--name N] [--hard]   snapshot <dir> as S<n> (the root is gated 0000;\n"
+          "                                   --hard also sets UF_IMMUTABLE on every entry)\n"
+          "  fork [--from W<n>|S<n>] [--to <path>] [--name N] [--copy] [--force]\n"
           "                                   clone into a writable world (default ~/worlds/W<n>/<name>)\n"
-          "  checkpoint W<n> [--name N]       snapshot a live world; the world stays writable\n"
+          "  checkpoint W<n> [--name N] [--hard] [--force]\n"
+          "                                   snapshot a live world; the world stays writable\n"
           "  list                             snapshots and worlds\n"
           "  inspect W<n>|S<n>\n"
-          "  discard W<n> [--now]             move to the store trash (--now deletes at once)\n"
+          "  discard W<n> [--now] [--force]   move to the store trash (--now deletes at once)\n"
           "  restore W<n>                     bring a trashed world back to its path\n"
           "  gc [--retention <days>]          delete expired trash and stray *.wfs-tmp trees\n"
           "  status                           store, counts, free space\n"
@@ -39,6 +43,10 @@ static void usage(void) {
 #ifdef WFS_FSKIT
           "  mount <W> <mountpoint> | umount <mountpoint> | fsstatus   (FSKit frontend)\n"
 #endif
+          "  world exec W<n> [--no-sandbox|--require-sandbox] -- <cmd...>\n"
+          "                                   run <cmd> in the world: cwd = its root, WORLD_* in the\n"
+          "                                   environment, an exec lock, and a seatbelt profile that\n"
+          "                                   denies writes outside this world\n"
           "  world version\n"
           "options: --store <dir> (or $WORLD_STORE) selects the metadata store\n",
           stderr);
@@ -66,6 +74,28 @@ static int refuse(const char *reason, const char *hint) {
     fprintf(stderr, "world: %s\n", reason);
     if (hint) fprintf(stderr, "  try: %s\n", hint);
     return EX_REFUSED;
+}
+
+// P5: someone is running `world exec` in this world right now.
+static int busy_refusal(wfs_store *s, wfs_id w, const char *verb) {
+    wfs_lock_info li;
+    memset(&li, 0, sizeof li);
+    wfs_world_lock_check(s, w, &li);
+    char why[512], hint[128];
+    if (li.held) {
+        char t[32];
+        time_t sec = (time_t)li.started_at;
+        struct tm tmv;
+        localtime_r(&sec, &tmv);
+        strftime(t, sizeof t, "%H:%M:%S", &tmv);
+        snprintf(why, sizeof why, "refusing to %s W%llu: pid %lld has been running `%s` in it since %s",
+                 verb, (unsigned long long)w, (long long)li.pid, li.cmd, t);
+    } else {
+        snprintf(why, sizeof why, "refusing to %s W%llu: another command holds its lock", verb,
+                 (unsigned long long)w);
+    }
+    snprintf(hint, sizeof hint, "wait for it to finish, or pass --force");
+    return refuse(why, hint);
 }
 
 static wfs_ref parse_ref(const char *s) {
@@ -194,9 +224,12 @@ static int explain_path(wfs_store *s, const char *path, int rc, const char *verb
 // ---- commands ----------------------------------------------------------------------------------
 
 static int cmd_init(wfs_store *s, int argc, char **argv) {
-    const char *dir = NULL, *name = NULL;
+    const char *dir = NULL;
+    wfs_snapshot_opts opts;
+    memset(&opts, 0, sizeof opts);
     for (int i = 0; i < argc; ++i) {
-        if (!strcmp(argv[i], "--name") && i + 1 < argc) name = argv[++i];
+        if (!strcmp(argv[i], "--name") && i + 1 < argc) opts.name = argv[++i];
+        else if (!strcmp(argv[i], "--hard")) opts.hard = 1;
         else if (argv[i][0] != '-' && !dir) dir = argv[i];
         else usage();
     }
@@ -205,10 +238,11 @@ static int cmd_init(wfs_store *s, int argc, char **argv) {
     if (rc) return explain_path(s, dir, rc, "init");
     if ((rc = wfs_store_clone_probe(s, dir))) return explain_path(s, dir, rc, "init");
     wfs_id id = 0;
-    if ((rc = wfs_snapshot_create(s, dir, name, &id))) return explain_path(s, dir, rc, "init");
+    if ((rc = wfs_snapshot_create(s, dir, &opts, &id))) return explain_path(s, dir, rc, "init");
     wfs_snapshot_rec r;
     if (wfs_snapshot_info(s, id, &r) == 0) {
-        printf("S%llu  %s  %llu entries\n", (unsigned long long)id, r.name, (unsigned long long)r.entries);
+        printf("S%llu  %s  %llu entries  (%s)\n", (unsigned long long)id, r.name,
+               (unsigned long long)r.entries, r.hard ? "hard: UF_IMMUTABLE per entry" : "gated 0000");
         if (r.hardlinks)
             fprintf(stderr,
                     "world: warning: %llu entries in this tree have more than one link; clonefile "
@@ -245,6 +279,7 @@ static int cmd_fork(wfs_store *s, int argc, char **argv) {
         else if (!strcmp(argv[i], "--name") && i + 1 < argc) name = argv[++i];
         else if (!strcmp(argv[i], "--copy")) opts.allow_fallback = 1;
         else if (!strcmp(argv[i], "--skip-space-check")) opts.skip_space_check = 1;
+        else if (!strcmp(argv[i], "--force")) opts.force = 1;
         else usage();
     }
     if (from.kind == WFS_K_NONE) {
@@ -285,6 +320,7 @@ static int cmd_fork(wfs_store *s, int argc, char **argv) {
         wfs_id id = 0;
         rc = wfs_world_create(s, from, target, &opts, &id);
         if (rc == -EEXIST && !to) continue; // someone else took that id; ask again
+        if (rc == WFS_E_WORLD_BUSY && from.kind == WFS_K_WORLD) return busy_refusal(s, from.id, "fork from");
         if (rc) return explain_path(s, target, rc, "fork");
         printf("W%llu  %s\n", (unsigned long long)id, target);
         return EX_OK;
@@ -293,10 +329,13 @@ static int cmd_fork(wfs_store *s, int argc, char **argv) {
 }
 
 static int cmd_checkpoint(wfs_store *s, int argc, char **argv) {
-    const char *name = NULL;
     wfs_id w = 0;
+    wfs_snapshot_opts opts;
+    memset(&opts, 0, sizeof opts);
     for (int i = 0; i < argc; ++i) {
-        if (!strcmp(argv[i], "--name") && i + 1 < argc) name = argv[++i];
+        if (!strcmp(argv[i], "--name") && i + 1 < argc) opts.name = argv[++i];
+        else if (!strcmp(argv[i], "--hard")) opts.hard = 1;
+        else if (!strcmp(argv[i], "--force")) opts.force = 1;
         else if (argv[i][0] != '-' && !w) w = parse_world(argv[i]);
         else usage();
     }
@@ -315,7 +354,10 @@ static int cmd_checkpoint(wfs_store *s, int argc, char **argv) {
         return refuse(why, "world fs verify <the path it was moved to>");
     }
     wfs_id id = 0;
-    if ((rc = wfs_snapshot_create(s, r.path, name, &id))) return explain_path(s, r.path, rc, "checkpoint");
+    if ((rc = wfs_snapshot_create(s, r.path, &opts, &id))) {
+        if (rc == WFS_E_WORLD_BUSY) return busy_refusal(s, w, "checkpoint");
+        return explain_path(s, r.path, rc, "checkpoint");
+    }
     wfs_snapshot_rec sr;
     if (wfs_snapshot_info(s, id, &sr) == 0)
         printf("S%llu  %s  %llu entries  (from W%llu)\n", (unsigned long long)id, sr.name,
@@ -372,9 +414,11 @@ static int cmd_inspect(wfs_store *s, const char *arg) {
         if (rc) return fail("inspect", rc);
         fmt_time(t, sizeof t, v.created_at);
         printf("snapshot:  S%llu\nname:      %s\nstate:     %s\ncreated:   %s\n"
-               "entries:   %llu (%llu with >1 link)\npath:      %s\nsource:    %s\n",
+               "entries:   %llu (%llu with >1 link)\nprotection: %s\npath:      %s\nsource:    %s\n",
                (unsigned long long)v.id, v.name, state_name(v.state), t, (unsigned long long)v.entries,
-               (unsigned long long)v.hardlinks, v.path, v.src_path);
+               (unsigned long long)v.hardlinks,
+               v.hard ? "hard (UF_IMMUTABLE on every entry)" : "gate (the root directory is 0000)",
+               v.path, v.src_path);
         if (v.from_world) printf("from:      W%llu\n", (unsigned long long)v.from_world);
         return EX_OK;
     }
@@ -395,9 +439,10 @@ static int cmd_inspect(wfs_store *s, const char *arg) {
 
 static int cmd_discard(wfs_store *s, int argc, char **argv) {
     wfs_id w = 0;
-    int now = 0;
+    int now = 0, force = 0;
     for (int i = 0; i < argc; ++i) {
         if (!strcmp(argv[i], "--now")) now = 1;
+        else if (!strcmp(argv[i], "--force")) force = 1;
         else if (argv[i][0] != '-' && !w) w = parse_world(argv[i]);
         else usage();
     }
@@ -409,9 +454,8 @@ static int cmd_discard(wfs_store *s, int argc, char **argv) {
                  (unsigned long long)w, r.path);
         return refuse(why, "world fs verify <the path it was moved to>");
     }
-    int rc = wfs_world_discard(s, w, now);
-    if (rc == WFS_E_WORLD_BUSY)
-        return refuse("another world command holds this world's lock", "wait for it, then retry");
+    int rc = wfs_world_discard(s, w, now, force);
+    if (rc == WFS_E_WORLD_BUSY) return busy_refusal(s, w, "discard");
     if (rc == WFS_E_UNREGISTERED) return explain_path(s, r.path, rc, "discard");
     if (rc) return fail("discard", rc);
     if (now) printf("W%llu deleted\n", (unsigned long long)w);
@@ -540,20 +584,256 @@ static int cmd_adopt(wfs_store *s, int argc, char **argv) {
     return EX_OK;
 }
 
+// ---- P5 / P14: `world exec` -------------------------------------------------------------------
+//
+// The command runs with the world root as its cwd, WORLD_ID / WORLD_ROOT / WORLD_STORE in the
+// environment, an exec lock held for the lifetime of this process (P5), and — unless
+// --no-sandbox — inside a seatbelt profile that cannot write outside the world (P14).
+//
+// Seatbelt rule order matters: the LAST matching rule wins, so every allow is written first
+// and the denies come last, which makes them absolute.
+
+static pid_t g_child = 0;
+
+static void forward_signal(int sig) {
+    if (g_child > 0) kill(g_child, sig);
+}
+
+static void sb_quote(FILE *f, const char *path) {
+    fputc('"', f);
+    for (const char *p = path; *p; ++p) {
+        if (*p == '"' || *p == '\\') fputc('\\', f);
+        fputc(*p, f);
+    }
+    fputc('"', f);
+}
+
+static void sb_subpath(FILE *f, const char *rule, const char *path) {
+    if (!path || !*path) return;
+    fprintf(f, "(%s (subpath ", rule);
+    sb_quote(f, path);
+    fputs("))\n", f);
+}
+
+// $HOME/<rel>, resolved; skipped silently when it does not exist.
+static void sb_home(FILE *f, const char *rule, const char *rel) {
+    const char *home = getenv("HOME");
+    if (!home || !*home) return;
+    char p[WFS_PATH_MAX];
+    snprintf(p, sizeof p, "%s/%s", home, rel);
+    struct stat st;
+    if (stat(p, &st) != 0) return;
+    sb_subpath(f, rule, p);
+}
+
+// The writable whitelist. Everything here is also allowed by `(allow default)`; it is written
+// out so the profile says what an agent is expected to need, and so that tightening the
+// default later does not silently break agents. Documented in README.md.
+static const char *kAgentHomeDirs[] = {
+    ".cache", ".config", ".codex", ".claude", ".npm", ".cargo", ".rustup", ".local/state",
+    "Library/Caches", "Library/Application Support/Claude", "Library/Application Support/Code",
+    "Library/Application Support/Cursor",
+};
+
+static int write_profile(wfs_store *s, wfs_id w, const char *world_root, const char *path) {
+    FILE *f = fopen(path, "w");
+    if (!f) return -errno;
+    fputs("; generated by `world exec` (P14). Last matching rule wins: allows first, denies last.\n"
+          "(version 1)\n(allow default)\n\n; --- writable: this world, tmp, agent caches ---\n", f);
+    sb_subpath(f, "allow file-write*", world_root);
+    const char *tmpdir = getenv("TMPDIR");
+    char real[WFS_PATH_MAX];
+    if (tmpdir && *tmpdir && realpath(tmpdir, real)) sb_subpath(f, "allow file-write*", real);
+    sb_subpath(f, "allow file-write*", "/private/tmp");
+    sb_subpath(f, "allow file-write*", "/private/var/tmp");
+    for (size_t i = 0; i < sizeof kAgentHomeDirs / sizeof kAgentHomeDirs[0]; ++i)
+        sb_home(f, "allow file-write*", kAgentHomeDirs[i]);
+
+    fputs("\n; --- denied: the store (metadata + every snapshot) and every other world ---\n", f);
+    const char *store = wfs_store_dir(s);
+    sb_subpath(f, "deny file-write*", store);
+    char snaps[WFS_PATH_MAX];
+    snprintf(snaps, sizeof snaps, "%s/snapshots", store);
+    sb_subpath(f, "deny file-read*", snaps);
+
+    size_t n = 0;
+    wfs_world_list(s, 1, NULL, 0, &n);
+    if (n) {
+        wfs_world_rec *v = (wfs_world_rec *)calloc(n, sizeof *v);
+        if (v) {
+            wfs_world_list(s, 1, v, n, &n);
+            for (size_t i = 0; i < n; ++i) {
+                if (v[i].id == w || !v[i].path[0]) continue;
+                sb_subpath(f, "deny file-write*", v[i].path);
+            }
+            free(v);
+        }
+    }
+    int rc = ferror(f) ? -EIO : 0;
+    if (fclose(f) != 0 && !rc) rc = -EIO;
+    return rc;
+}
+
+// sandbox-exec is deprecated but present on 27.0. Rather than guess whether a failure came
+// from the profile or from the command, apply the profile to /usr/bin/true first.
+static int sandbox_usable(const char *profile) {
+    if (access("/usr/bin/sandbox-exec", X_OK) != 0) return 0;
+    pid_t pid = fork();
+    if (pid < 0) return 0;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); close(devnull); }
+        execl("/usr/bin/sandbox-exec", "sandbox-exec", "-f", profile, "/usr/bin/true", (char *)NULL);
+        _exit(127);
+    }
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+static int cmd_exec(wfs_store *s, int argc, char **argv) {
+    wfs_id w = 0;
+    int sandbox = 1, require_sandbox = 0, cmd_at = -1;
+    for (int i = 0; i < argc; ++i) {
+        if (!strcmp(argv[i], "--")) { cmd_at = i + 1; break; }
+        else if (!strcmp(argv[i], "--no-sandbox")) sandbox = 0;
+        else if (!strcmp(argv[i], "--require-sandbox")) require_sandbox = 1;
+        else if (argv[i][0] != '-' && !w) w = parse_world(argv[i]);
+        else usage();
+    }
+    if (!w || cmd_at < 0 || cmd_at >= argc) usage();
+    if (!sandbox && require_sandbox) {
+        return refuse("--no-sandbox and --require-sandbox contradict each other", "pick one");
+    }
+
+    wfs_world_rec r;
+    int rc = wfs_world_info(s, w, &r);
+    if (rc) return fail("exec", rc);
+    if (r.state != WFS_ST_ACTIVE) {
+        char why[128];
+        snprintf(why, sizeof why, "W%llu is %s, not active", (unsigned long long)w, state_name(r.state));
+        return refuse(why, r.state == WFS_ST_TRASHED ? "world fs restore W<n>" : "world fs list");
+    }
+    // P1/P2: the path is only a hint; the marker plus the inode decide, and a moved world has
+    // its row repaired here.
+    wfs_identity id;
+    rc = wfs_world_verify_identity(s, r.path, &id);
+    if (rc) return explain_path(s, r.path, rc, "exec");
+
+    // What the lock file records, and what a refusal shows the next person.
+    char cmdline[256];
+    size_t at = 0;
+    for (int i = cmd_at; i < argc && at + 1 < sizeof cmdline; ++i)
+        at += (size_t)snprintf(cmdline + at, sizeof cmdline - at, "%s%s", i > cmd_at ? " " : "", argv[i]);
+
+    int lockfd = -1;
+    rc = wfs_world_lock_exec(s, w, cmdline, &lockfd);
+    if (rc == WFS_E_WORLD_BUSY) return busy_refusal(s, w, "exec in");
+    if (rc) return fail("exec: lock", rc);
+
+    char prof[WFS_PATH_MAX] = {0};
+    if (sandbox) {
+        snprintf(prof, sizeof prof, "%s/tmp/exec-W%llu-%d.sb", wfs_store_dir(s), (unsigned long long)w,
+                 (int)getpid());
+        rc = write_profile(s, w, id.path, prof);
+        if (rc) {
+            wfs_world_unlock_exec(s, w, lockfd);
+            return fail("exec: sandbox profile", rc);
+        }
+        if (!sandbox_usable(prof)) {
+            unlink(prof);
+            if (require_sandbox) {
+                wfs_world_unlock_exec(s, w, lockfd);
+                return refuse("sandbox-exec is unavailable or rejected the generated profile",
+                              "world exec W<n> --no-sandbox -- <cmd>   (the command can then write anywhere)");
+            }
+            fprintf(stderr,
+                    "world: WARNING: sandbox-exec is unavailable or failed to initialise; running "
+                    "`%s` WITHOUT a sandbox. It can write to other worlds and to the store.\n"
+                    "world: pass --require-sandbox to refuse instead.\n",
+                    cmdline);
+            sandbox = 0;
+            prof[0] = 0;
+        }
+    }
+
+    char idbuf[32];
+    snprintf(idbuf, sizeof idbuf, "W%llu", (unsigned long long)w);
+    setenv("WORLD_ID", idbuf, 1);
+    setenv("WORLD_ROOT", id.path, 1);
+    setenv("WORLD_STORE", wfs_store_dir(s), 1);
+
+    int nargs = argc - cmd_at;
+    char **cav = (char **)calloc((size_t)nargs + 4, sizeof(char *));
+    if (!cav) { wfs_world_unlock_exec(s, w, lockfd); return fail("exec", -ENOMEM); }
+    int k = 0;
+    if (sandbox) {
+        cav[k++] = (char *)"/usr/bin/sandbox-exec";
+        cav[k++] = (char *)"-f";
+        cav[k++] = prof;
+    }
+    for (int i = 0; i < nargs; ++i) cav[k++] = argv[cmd_at + i];
+    cav[k] = NULL;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        int e = -errno;
+        free(cav);
+        if (prof[0]) unlink(prof);
+        wfs_world_unlock_exec(s, w, lockfd);
+        return fail("exec: fork", e);
+    }
+    if (pid == 0) {
+        if (chdir(id.path) != 0) {
+            fprintf(stderr, "world: exec: chdir %s: %s\n", id.path, strerror(errno));
+            _exit(126);
+        }
+        execvp(cav[0], cav);
+        fprintf(stderr, "world: exec: %s: %s\n", cav[0], strerror(errno));
+        _exit(127);
+    }
+    g_child = pid;
+    // Ctrl-C reaches the whole process group anyway; forwarding covers the case where this
+    // process is signalled on its own, and either way the lock is released below.
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = forward_signal;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0) {
+        if (errno != EINTR) { st = 0; break; }
+    }
+    g_child = 0;
+    if (prof[0]) unlink(prof);
+    wfs_world_unlock_exec(s, w, lockfd);
+    free(cav);
+    if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : EX_ERR;
+}
+
 int main(int argc, char **argv) {
-    // --store may appear anywhere; strip it before dispatch.
-    char *av[64];
+    // --store may appear anywhere before a `--`; strip it before dispatch. Everything after
+    // `--` belongs to the command `world exec` will run and is passed through untouched.
+    char **av = (char **)calloc((size_t)argc + 1, sizeof(char *));
+    if (!av) { fprintf(stderr, "world: out of memory\n"); return EX_ERR; }
     int ac = 0;
-    for (int i = 0; i < argc && ac < 64; ++i) {
-        if (!strcmp(argv[i], "--store") && i + 1 < argc) { g_store_override = argv[++i]; continue; }
+    bool passthrough = false;
+    for (int i = 0; i < argc; ++i) {
+        if (!passthrough && !strcmp(argv[i], "--store") && i + 1 < argc) { g_store_override = argv[++i]; continue; }
+        if (!strcmp(argv[i], "--")) passthrough = true;
         av[ac++] = argv[i];
     }
     if (ac < 2) usage();
     if (!strcmp(av[1], "version")) { printf("world %s\n", wfs_version()); return EX_OK; }
-    if (strcmp(av[1], "fs") || ac < 3) usage();
-    const char *sub = av[2];
-    int nargs = ac - 3;
-    char **args = av + 3;
+    // `world exec` is a World-level command, not a provider command: no `fs` in front of it.
+    const int is_exec = !strcmp(av[1], "exec");
+    if (!is_exec && (strcmp(av[1], "fs") || ac < 3)) usage();
+    const char *sub = is_exec ? "exec" : av[2];
+    int nargs = is_exec ? ac - 2 : ac - 3;
+    char **args = av + (is_exec ? 2 : 3);
 
 #ifdef WFS_FSKIT
     if (!strcmp(sub, "fsstatus")) {
@@ -584,7 +864,8 @@ int main(int argc, char **argv) {
     if (rc) { fprintf(stderr, "world: open store %s: %s\n", sd, wfs_strerror(rc)); return EX_ERR; }
 
     int ret;
-    if (!strcmp(sub, "init")) ret = cmd_init(s, nargs, args);
+    if (is_exec) ret = cmd_exec(s, nargs, args);
+    else if (!strcmp(sub, "init")) ret = cmd_init(s, nargs, args);
     else if (!strcmp(sub, "fork")) ret = cmd_fork(s, nargs, args);
     else if (!strcmp(sub, "checkpoint")) ret = cmd_checkpoint(s, nargs, args);
     else if (!strcmp(sub, "list")) ret = (nargs == 0) ? cmd_list(s) : (usage(), EX_USAGE);

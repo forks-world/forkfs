@@ -106,6 +106,8 @@ int main() {
     join(p, sizeof p, base, "src/a-link.c");
     CHECK(link(q, p) == 0);
 
+    int lockfd2 = -1;
+    wfs_id sbusy = 0, wbusy = 0;
     wfs_store *s = NULL;
     CHECK_OK(wfs_store_open(store, &s));
     CHECK(strlen(wfs_version()) > 0);
@@ -119,9 +121,12 @@ int main() {
 #endif
     CHECK_OK(wfs_store_clone_probe(s, base));
 
-    // ---- init: a protected snapshot ----
+    // ---- init: a gate-protected snapshot (T1.1b, the default) ----
     wfs_id s1 = 0;
-    CHECK_OK(wfs_snapshot_create(s, base, "proj", &s1));
+    wfs_snapshot_opts sopts;
+    memset(&sopts, 0, sizeof sopts);
+    sopts.name = "proj";
+    CHECK_OK(wfs_snapshot_create(s, base, &sopts, &s1));
     wfs_snapshot_rec sr;
     CHECK_OK(wfs_snapshot_info(s, s1, &sr));
     CHECK(sr.state == WFS_ST_ACTIVE);
@@ -130,24 +135,39 @@ int main() {
     CHECK(!strcmp(sr.name, "proj"));
     CHECK(!strcmp(sr.src_path, base));
     CHECK(sr.from_world == 0);
+    CHECK(sr.hard == 0);
+    CHECK((sr.root_mode & 0700) == 0700);   // the source root's own mode, kept for the fork
 
-    // P3: nothing inside a snapshot can be written, created or deleted.
-    join(p, sizeof p, sr.path, "hello.txt");
-    CHECK_OK(read_file(p, buf, sizeof buf));
-    CHECK(!strcmp(buf, "hello\n"));
-    CHECK(open(p, O_WRONLY) < 0 && errno == EPERM);
-    CHECK(unlink(p) != 0 && errno == EPERM);
-    join(q, sizeof q, sr.path, "new.txt");
-    CHECK(open(q, O_WRONLY | O_CREAT, 0644) < 0 && (errno == EPERM || errno == EACCES));
-    CHECK(!exists(q));
+    // P3: the gate is the snapshot root itself. Nothing below it can be reached at all —
+    // not listed, not opened, not stat'ed — and nothing inside was touched to achieve that.
     struct stat st;
-    CHECK(stat(sr.path, &st) == 0 && (st.st_mode & 0222) == 0);   // write bits stripped
+    CHECK(stat(sr.path, &st) == 0 && (st.st_mode & 07777) == 0);
+    CHECK(opendir(sr.path) == NULL && errno == EACCES);
+    join(p, sizeof p, sr.path, "hello.txt");
+    CHECK(open(p, O_RDONLY) < 0 && errno == EACCES);
+    CHECK(open(p, O_WRONLY) < 0 && errno == EACCES);
+    CHECK(lstat(p, &st) != 0 && errno == EACCES);
+    CHECK(unlink(p) != 0 && errno == EACCES);
+    join(q, sizeof q, sr.path, "new.txt");
+    CHECK(open(q, O_WRONLY | O_CREAT, 0644) < 0 && errno == EACCES);
+    // The entries themselves carry no flags: that is exactly what makes the fork cheap.
+    CHECK(chmod(sr.path, 0700) == 0);
+    CHECK(lstat(p, &st) == 0 && (st.st_flags & UF_IMMUTABLE) == 0);
+    CHECK(read_file(p, buf, sizeof buf) == 0 && !strcmp(buf, "hello\n"));
+    CHECK(chmod(sr.path, 0) == 0);
 
-    // P3: verify agrees with the manifest it wrote.
+    // P3: verify agrees with the manifest it wrote, and opens the gate itself to do so.
     wfs_verify_report vr;
     CHECK_OK(wfs_snapshot_verify(s, s1, &vr));
     CHECK(vr.checked == sr.entries + 1);   // + the root itself
     CHECK(vr.missing == 0 && vr.modified == 0 && vr.unprotected == 0 && vr.extra == 0);
+    CHECK(stat(sr.path, &st) == 0 && (st.st_mode & 07777) == 0);   // and closes it again
+    // A gate left open is a finding of its own.
+    CHECK(chmod(sr.path, 0755) == 0);
+    CHECK_RC(wfs_snapshot_verify(s, s1, &vr), WFS_E_SNAPSHOT_DIRTY);
+    CHECK(vr.unprotected == 1 && strstr(vr.first_bad, "root") != NULL);
+    CHECK(chmod(sr.path, 0) == 0);
+    CHECK_OK(wfs_snapshot_verify(s, s1, &vr));
 
     // ---- P7: which paths may be initialised ----
     CHECK_RC(wfs_path_check(s, "/", 0), WFS_E_PATH_REFUSED);
@@ -179,12 +199,23 @@ int main() {
     write_file(q, "new\n");
     CHECK(exists(q));
     join(p, sizeof p, sr.path, "hello.txt");                       // the snapshot did not move
+    CHECK(chmod(sr.path, 0700) == 0);                              // (look behind the gate)
     CHECK_OK(read_file(p, buf, sizeof buf));
     CHECK(!strcmp(buf, "hello\n"));
+    CHECK(chmod(sr.path, 0) == 0);
     join(p, sizeof p, w1path, ".world");
     CHECK(exists(p));
     join(p, sizeof p, w1path, "src");
     CHECK(stat(p, &st) == 0 && (st.st_mode & 0200) != 0);          // directories writable again
+    // T1.1b: a fork from a gated snapshot copies nothing but the tree. The world root has the
+    // source's own mode back (never the 0500 of the open gate, never 0000), and no entry
+    // anywhere carries UF_IMMUTABLE, because none ever did.
+    CHECK(stat(w1path, &st) == 0 && (st.st_mode & 0700) == 0700 && (st.st_mode & 07777) != 0500);
+    CHECK(lstat(w1path, &st) == 0 && (st.st_flags & UF_IMMUTABLE) == 0);
+    join(p, sizeof p, w1path, "hello.txt");
+    CHECK(lstat(p, &st) == 0 && (st.st_flags & UF_IMMUTABLE) == 0);
+    join(p, sizeof p, w1path, "src/a.c");
+    CHECK(lstat(p, &st) == 0 && (st.st_flags & UF_IMMUTABLE) == 0);
 
     wfs_world_rec wr;
     CHECK_OK(wfs_world_info(s, w1, &wr));
@@ -238,17 +269,44 @@ int main() {
     CHECK_OK(wfs_world_info(s, w1, &wr));                          // and the original is untouched
     CHECK(wr.present == 1);
 
-    // ---- checkpoint: the same call as init, from a live world ----
+    // ---- checkpoint: the same call as init, from a live world. --hard this time, so the
+    // ---- per-entry UF_IMMUTABLE variant is exercised end to end. ----
     wfs_id s2 = 0;
-    CHECK_OK(wfs_snapshot_create(s, w1path, "after-edit", &s2));
+    memset(&sopts, 0, sizeof sopts);
+    sopts.name = "after-edit";
+    sopts.hard = 1;
+    CHECK_OK(wfs_snapshot_create(s, w1path, &sopts, &s2));
     CHECK_OK(wfs_snapshot_info(s, s2, &sr));
     CHECK(sr.from_world == w1);
+    CHECK(sr.hard == 1);
     CHECK(sr.entries == 5);                                        // b.c was added in the world
     join(p, sizeof p, sr.path, "hello.txt");
     CHECK_OK(read_file(p, buf, sizeof buf));
     CHECK(!strcmp(buf, "changed\n"));
     join(p, sizeof p, sr.path, ".world");
     CHECK(!exists(p));            // the source world's marker is not part of the snapshot
+    // --hard: every entry is chflagged and no gate is needed, so the tree stays traversable.
+    CHECK(stat(sr.path, &st) == 0 && (st.st_mode & 07777) != 0 && (st.st_mode & 0222) == 0);
+    join(p, sizeof p, sr.path, "hello.txt");
+    CHECK(lstat(p, &st) == 0 && (st.st_flags & UF_IMMUTABLE) != 0);
+    CHECK(open(p, O_WRONLY) < 0 && errno == EPERM);
+    CHECK(unlink(p) != 0 && errno == EPERM);
+    join(q, sizeof q, sr.path, "new.txt");
+    CHECK(open(q, O_WRONLY | O_CREAT, 0644) < 0 && (errno == EPERM || errno == EACCES));
+    CHECK(!exists(q));
+    CHECK_OK(wfs_snapshot_verify(s, s2, &vr));
+    CHECK(vr.missing == 0 && vr.modified == 0 && vr.unprotected == 0 && vr.extra == 0);
+    // A fork from a --hard snapshot has to undo all of that on the clone.
+    char whardpath[4096];
+    join(whardpath, sizeof whardpath, worlds, "w-hard");
+    wfs_ref fromhard = {WFS_K_SNAPSHOT, s2};
+    wfs_id whard = 0;
+    memset(&opts, 0, sizeof opts);
+    CHECK_OK(wfs_world_create(s, fromhard, whardpath, &opts, &whard));
+    join(p, sizeof p, whardpath, "hello.txt");
+    CHECK(lstat(p, &st) == 0 && (st.st_flags & UF_IMMUTABLE) == 0);
+    write_file(p, "writable\n");
+    CHECK_OK(wfs_world_discard(s, whard, 1, 0));
     // The world it came from is still writable.
     join(p, sizeof p, w1path, "hello.txt");
     write_file(p, "changed again\n");
@@ -270,7 +328,7 @@ int main() {
     CHECK_RC(wfs_world_create(s, from, w3path, &opts, &w2), -EEXIST);
 
     // ---- P4: discard to the trash, then restore ----
-    CHECK_OK(wfs_world_discard(s, w3, 0));
+    CHECK_OK(wfs_world_discard(s, w3, 0, 0));
     CHECK(!exists(w3path));
     CHECK_OK(wfs_world_info(s, w3, &wr));
     CHECK(wr.state == WFS_ST_TRASHED && wr.trashed_at > 0);
@@ -293,7 +351,7 @@ int main() {
 
     // gc must not touch a world that is still inside its retention window.
     wfs_gc_report gc;
-    CHECK_OK(wfs_world_discard(s, w3, 0));
+    CHECK_OK(wfs_world_discard(s, w3, 0, 0));
     CHECK_OK(wfs_gc(s, 3600, &gc));
     CHECK(gc.worlds_deleted == 0);
     CHECK_OK(wfs_world_restore(s, w3));
@@ -303,10 +361,57 @@ int main() {
     join(w4path, sizeof w4path, worlds, "w4");
     wfs_id w4 = 0;
     CHECK_OK(wfs_world_create(s, from, w4path, &opts, &w4));
-    CHECK_OK(wfs_world_discard(s, w4, 1));
+    CHECK_OK(wfs_world_discard(s, w4, 1, 0));
     CHECK(!exists(w4path));
     CHECK_OK(wfs_world_info(s, w4, &wr));
     CHECK(wr.state == WFS_ST_DEAD);
+
+    // ---- P5: the exec lock ----
+    // w1 is the world under test; the lock lives in the store, not in the world tree.
+    int lockfd = -1;
+    CHECK_OK(wfs_world_lock_exec(s, w1, "sleep 30", &lockfd));
+    CHECK(lockfd >= 0);
+    char lockpath[4096];
+    snprintf(lockpath, sizeof lockpath, "%s/locks/W%llu.lock", store, (unsigned long long)w1);
+    CHECK(exists(lockpath));
+    wfs_lock_info li;
+    CHECK_OK(wfs_world_lock_check(s, w1, &li));
+    CHECK(li.held == 1 && li.pid == (int64_t)getpid() && li.started_at > 0);
+    CHECK(!strcmp(li.cmd, "sleep 30"));
+    // Nothing destructive may touch a world somebody is working in...
+    CHECK_RC(wfs_world_lock_exec(s, w1, "another", &lockfd2), WFS_E_WORLD_BUSY);
+    CHECK_RC(wfs_world_discard(s, w1, 0, 0), WFS_E_WORLD_BUSY);
+    memset(&sopts, 0, sizeof sopts);
+    sopts.name = "busy";
+    CHECK_RC(wfs_snapshot_create(s, w1path, &sopts, &sbusy), WFS_E_WORLD_BUSY);
+    char wbusypath[4096];
+    join(wbusypath, sizeof wbusypath, worlds, "w-busy");
+    wfs_ref fromw1 = {WFS_K_WORLD, w1};
+    memset(&opts, 0, sizeof opts);
+    CHECK_RC(wfs_world_create(s, fromw1, wbusypath, &opts, &wbusy), WFS_E_WORLD_BUSY);
+    // ... unless the caller insists.
+    opts.force = 1;
+    CHECK_OK(wfs_world_create(s, fromw1, wbusypath, &opts, &wbusy));
+    CHECK_OK(wfs_world_discard(s, wbusy, 1, 0));
+    // A world that is not locked is not affected by W1's lock.
+    CHECK_OK(wfs_world_lock_check(s, w3, &li));
+    CHECK(li.held == 0);
+    wfs_world_unlock_exec(s, w1, lockfd);
+    CHECK(!exists(lockpath));
+    CHECK_OK(wfs_world_discard(s, w1, 0, 0));
+    CHECK_OK(wfs_world_restore(s, w1));
+
+    // A lock left behind by a process that is gone is stale: it is removed, not obeyed. pid 1
+    // is alive but cannot be holding the flock, which is the case that a bare kill(pid, 0)
+    // check would get wrong.
+    write_file(lockpath, "pid 1\nstart 1\ncmd ghost\n");
+    CHECK_OK(wfs_world_lock_check(s, w1, &li));
+    CHECK(li.held == 0);
+    CHECK(!exists(lockpath));
+    write_file(lockpath, "pid 2147480000\nstart 1\ncmd ghost\n");   // a pid that does not exist
+    CHECK_OK(wfs_world_discard(s, w1, 0, 0));
+    CHECK(!exists(lockpath));
+    CHECK_OK(wfs_world_restore(s, w1));
 
     // ---- P8: a half-built tree is collected ----
     char stray[4096], strayfile[4096];
@@ -319,7 +424,8 @@ int main() {
     CHECK(gc.tmp_removed >= 1);
     CHECK(exists(w1path) && exists(w3path));                       // and nothing else went with it
 
-    // ---- P3 again: tampering with a snapshot is detected ----
+    // ---- P3 again: tampering with a --hard snapshot is detected ----
+    CHECK_OK(wfs_snapshot_info(s, s2, &sr));
     join(p, sizeof p, sr.path, "hello.txt");                       // sr is S2 here
     CHECK(lchflags(p, 0) == 0);
     write_file(p, "tampered\n");

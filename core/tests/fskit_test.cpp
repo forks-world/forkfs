@@ -78,7 +78,10 @@ int main() {
 
     // snapshot the project, then fork a world out of it: that world is what a mount exposes.
     wfs_id snap = 0;
-    CHECK_OK(wfs_snapshot_create(s, base, "proj", &snap));
+    wfs_snapshot_opts sopts;
+    memset(&sopts, 0, sizeof sopts);
+    sopts.name = "proj";
+    CHECK_OK(wfs_snapshot_create(s, base, &sopts, &snap));
     char wpath[4096], wpath2[4096];
     join(wpath, sizeof wpath, root, "/w1");
     join(wpath2, sizeof wpath2, root, "/w2");
@@ -177,7 +180,7 @@ int main() {
     wfs_view_close(v);
 
     // a discarded world cannot be mounted
-    CHECK_OK(wfs_world_discard(s, w2, 0));
+    CHECK_OK(wfs_world_discard(s, w2, 0, 0));
     CHECK(wfs_view_open(s, w2, &v) == -ESTALE);
     CHECK_OK(wfs_world_list(s, 0, NULL, 0, &n));
     CHECK(n == 1);

@@ -3,8 +3,10 @@
  *
  * The core owns two kinds of object (docs/M1_DESIGN.md §1):
  *
- *   Snapshot S<n>  an immutable whole-tree clone living inside the store, every entry
- *                  chflags(UF_IMMUTABLE) and directories stripped of their write bits.
+ *   Snapshot S<n>  an immutable whole-tree clone living inside the store, protected by a gate:
+ *                  the snapshot root directory is mode 0000, so nothing can traverse, list,
+ *                  read or write anywhere inside it, and the entries themselves are untouched.
+ *                  `--hard` instead protects every entry with chflags(UF_IMMUTABLE).
  *                  Produced by `init` (from an arbitrary directory) and by `checkpoint`
  *                  (from a live World) — both go through wfs_snapshot_create().
  *   World    W<n>  a writable clonefile() clone of a Snapshot or of another World, living
@@ -39,6 +41,10 @@ extern "C" {
 
 /* Name of the marker file in every World root. */
 #define WFS_MARKER_NAME ".world"
+/* Mode of a gate-protected snapshot root: nothing gets in. */
+#define WFS_GATE_CLOSED 0000
+/* Mode of the same root while a clone of it is in flight (fork / checkpoint / verify). */
+#define WFS_GATE_OPEN 0500
 /* Suffix of a half-built tree; removed by wfs_gc (P8). */
 #define WFS_TMP_SUFFIX ".wfs-tmp"
 
@@ -163,10 +169,27 @@ typedef struct wfs_snapshot_rec {
     int64_t created_at;          /* unix seconds */
     uint64_t entries, hardlinks; /* hardlinks = entries with nlink > 1 (P9) */
     int state;                   /* wfs_state */
+    int hard;                    /* 1 = per-entry UF_IMMUTABLE, 0 = gate directory (default) */
+    uint32_t root_mode;          /* the source root's own mode, restored on the fork's clone */
 } wfs_snapshot_rec;
 
-/* init and checkpoint are the same operation: clone src_dir into the store and protect it. */
-int wfs_snapshot_create(wfs_store *s, const char *src_dir, const char *name, wfs_id *out);
+typedef struct wfs_snapshot_opts {
+    const char *name; /* NULL = the source directory's basename */
+    /* P3, the slow variant: chflags(UF_IMMUTABLE) on every entry and write bits stripped from
+     * every directory. Costs a full parallel walk here (0.68 s / 50k entries) and a second one
+     * on every fork from this snapshot (0.73 s / 50k). The default gate protection costs one
+     * chmod and forks need no unprotect walk at all. */
+    int hard;
+    /* P5: proceed even when the source world has a live `world exec` lock. */
+    int force;
+} wfs_snapshot_opts;
+
+/* init and checkpoint are the same operation: clone src_dir into the store and protect it.
+ * Default protection is the gate: the snapshot root becomes mode 0000 and everything below it
+ * is left exactly as cloned. The root is briefly reopened to WFS_GATE_OPEN, under an exclusive
+ * flock on the snapshot's manifest, whenever the core has to read the tree (fork, checkpoint
+ * from the snapshot, verify). opts may be NULL. */
+int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_snapshot_opts *opts, wfs_id *out);
 int wfs_snapshot_info(wfs_store *s, wfs_id id, wfs_snapshot_rec *out);
 int wfs_snapshot_list(wfs_store *s, wfs_snapshot_rec *buf, size_t cap, size_t *count);
 
@@ -174,7 +197,7 @@ typedef struct wfs_verify_report {
     uint64_t checked;     /* manifest lines examined */
     uint64_t missing;     /* recorded but gone */
     uint64_t modified;    /* type/size/mode/mtime differ */
-    uint64_t unprotected; /* UF_IMMUTABLE cleared (P3) */
+    uint64_t unprotected; /* P3: UF_IMMUTABLE cleared (--hard), or the gate left open */
     uint64_t extra;       /* entries present that the manifest does not list */
     char first_bad[WFS_PATH_MAX];
 } wfs_verify_report;
@@ -203,6 +226,7 @@ typedef struct wfs_fork_opts {
     const char *name;    /* world name, recorded in the marker; NULL = inherit the source's */
     int allow_fallback;  /* on EXDEV/ENOTSUP fall back to a 4-thread per-file clone/copy */
     int skip_space_check; /* bypass P11 */
+    int force;            /* P5: fork from a world that has a live `world exec` lock */
 } wfs_fork_opts;
 
 /* Fork: clone `from` (a snapshot or a live world) into target_path. Publish order (P8):
@@ -217,9 +241,36 @@ int wfs_world_info(wfs_store *s, wfs_id id, wfs_world_rec *out);
 int wfs_world_next_id(wfs_store *s, wfs_id *out);
 int wfs_world_list(wfs_store *s, int include_trashed, wfs_world_rec *buf, size_t cap, size_t *count);
 
-/* P4: rename into <store>/trash and mark TRASHED; immediate != 0 deletes right away. */
-int wfs_world_discard(wfs_store *s, wfs_id id, int immediate);
+/* P4: rename into <store>/trash and mark TRASHED; immediate != 0 deletes right away.
+ * P5: refused with WFS_E_WORLD_BUSY while a `world exec` lock is live, unless force != 0. */
+int wfs_world_discard(wfs_store *s, wfs_id id, int immediate, int force);
 int wfs_world_restore(wfs_store *s, wfs_id id);
+
+/* ---- the exec lock (P5) ----------------------------------------------------------------
+ *
+ * `world exec W<n>` holds <store>/locks/W<n>.lock: pid, start time and command line, under an
+ * exclusive flock that the kernel drops when the process dies. discard, checkpoint and fork
+ * from that world refuse while it is live. A lock whose pid is gone (kill(pid, 0) fails, or
+ * the flock can be taken) is stale and is removed silently.
+ *
+ * The lock lives in the store rather than in the World root on purpose: the World root is the
+ * user's project tree, and a lock file there would show up in `git status` and be cloned into
+ * every child world. */
+typedef struct wfs_lock_info {
+    int held;           /* a live holder was found */
+    int64_t pid;
+    int64_t started_at; /* unix seconds */
+    char cmd[256];
+} wfs_lock_info;
+
+/* Takes the lock. *out_fd receives the descriptor that holds the flock (close-on-exec); it
+ * must be handed back to wfs_world_unlock_exec(). Returns WFS_E_WORLD_BUSY if a live lock
+ * already exists. */
+int wfs_world_lock_exec(wfs_store *s, wfs_id id, const char *cmd, int *out_fd);
+/* Releases and removes the lock file. */
+void wfs_world_unlock_exec(wfs_store *s, wfs_id id, int fd);
+/* Reports the live holder, if any, and removes a stale lock as a side effect. */
+int wfs_world_lock_check(wfs_store *s, wfs_id id, wfs_lock_info *out);
 
 typedef struct wfs_identity {
     int has_marker;  /* a .world file was read */

@@ -29,7 +29,9 @@ const char *kSchema =
     "  created_at INTEGER NOT NULL,"
     "  entries INTEGER NOT NULL DEFAULT 0,"
     "  hardlinks INTEGER NOT NULL DEFAULT 0,"
-    "  state INTEGER NOT NULL DEFAULT 0);"
+    "  state INTEGER NOT NULL DEFAULT 0,"
+    "  hard INTEGER NOT NULL DEFAULT 0,"
+    "  root_mode INTEGER NOT NULL DEFAULT 0);"
     "CREATE TABLE IF NOT EXISTS worlds("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  kind INTEGER NOT NULL DEFAULT 1,"
@@ -47,6 +49,16 @@ const char *kSchema =
     "  trashed_at INTEGER NOT NULL DEFAULT 0);"
     "CREATE INDEX IF NOT EXISTS worlds_ino ON worlds(dir_ino);"
     "CREATE INDEX IF NOT EXISTS worlds_path ON worlds(path);";
+
+// Columns added after the first schema-2 stores were written. They are additive and carry
+// defaults, so an older core reading such a store still works and VERSION does not change
+// (P13 is about incompatible schemas, not about new columns). Run one statement per exec:
+// each one fails harmlessly with "duplicate column name" once it has been applied, and a
+// combined script would stop at the first of those.
+const char *kMigrations[] = {
+    "ALTER TABLE snapshots ADD COLUMN hard INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE snapshots ADD COLUMN root_mode INTEGER NOT NULL DEFAULT 0",
+};
 
 void hex_id(char *out, size_t n) { // n = 33 for 32 hex digits + NUL
     unsigned char raw[16];
@@ -151,7 +163,7 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
 
     wfs_store *s = new wfs_store();
     s->dir.assign(real.c_str());
-    for (const char *sub : {"/snapshots", "/trash"}) {
+    for (const char *sub : {"/snapshots", "/trash", "/locks", "/tmp"}) {
         String p(s->dir);
         p.append(sub);
         if (int rc = wfs::fs_mkdir_p(p.c_str())) { wfs_store_close(s); return rc; }
@@ -171,6 +183,7 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
     if (rc != SQLITE_OK) { wfs_store_close(s); return -EIO; }
     sqlite3_busy_timeout(s->db, 10000);
     if (sqlite3_exec(s->db, kSchema, nullptr, nullptr, nullptr) != SQLITE_OK) { wfs_store_close(s); return -EIO; }
+    for (const char *m : kMigrations) sqlite3_exec(s->db, m, nullptr, nullptr, nullptr);
     if (meta_get(s->db, "store_id", s->store_id) != 0) {
         char id[33];
         hex_id(id, sizeof id);

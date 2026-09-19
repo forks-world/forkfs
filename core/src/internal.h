@@ -110,6 +110,9 @@ enum fs_dir_order {
 int fs_walk_tree(const char *root, int threads, fs_dir_order order, void *ctx, fs_entry_fn fn);
 
 int fs_count_entries(const char *root, TreeStats &out);
+// The gate-protection equivalent of fs_protect_tree: one walk that writes the manifest and
+// counts, and changes nothing at all. The protection itself is one chmod on the root.
+int fs_scan_tree(const char *root, TreeStats *stats, Manifest *manifest);
 int fs_free_space(const char *path, uint64_t *avail, uint64_t *total);
 int fs_remove_tree(const char *root);   // unprotects first on Darwin
 
@@ -120,8 +123,8 @@ int fs_clone_probe(const char *store_dir, const char *src_dir);
 // clonefile(src, dst, CLONE_NOFOLLOW). With allow_fallback, EXDEV/ENOTSUP degrade to a
 // 4-thread per-file clonefileat walk (per-file copy across volumes).
 int fs_clone_tree(const char *src, const char *dst, bool allow_fallback);
-// chflags(UF_IMMUTABLE) on every entry, directories last, write bits stripped from
-// directories. Fills stats and (optionally) the manifest in the same walk.
+// `--hard` protection: chflags(UF_IMMUTABLE) on every entry, directories last, write bits
+// stripped from directories. Fills stats and (optionally) the manifest in the same walk.
 int fs_protect_tree(const char *root, TreeStats *stats, Manifest *manifest);
 // The inverse: directories first, owner write restored.
 int fs_unprotect_tree(const char *root);
