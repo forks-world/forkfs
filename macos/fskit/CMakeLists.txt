@@ -3,6 +3,7 @@
 add_executable(WorldFSExtension
     WorldItem.mm
     WorldVolume.mm
+    WorldVolumeHandler.mm
     WorldFileSystem.mm
 )
 target_compile_options(WorldFSExtension PRIVATE -fobjc-arc -Wall)

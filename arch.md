@@ -1583,3 +1583,60 @@ cli/           C 风格 C++
 只允许系统库(/usr/lib、/System/Library)出现。
 
 后续裁剪方向:三件套增加无 fmt / 无 pmr / 无异常的 lean 模式后,再评估 `-nostdlib++`。
+
+---
+
+# 40. 实测修正与 M1 转向(2026-09-19)
+
+本章记录 M0 的测量结论,以及据此对 §2–§8 的修正。§1 的产品目标和成功标准不变。
+
+## 40.1 FSKit 不能做 BranchFS 的命名空间层
+
+在 macOS 26.6.2 与 27.0 上实测(`docs/MACOS27_MEASUREMENTS.md`、`docs/PERF_STUDY_RT_PARALLEL.md`、`docs/FSKIT_HANDLER_API_MACOS27.md`):
+
+```text
+单次内核→扩展往返            66–75µs(Apple 自带 msdos 模块 72–78µs,我们的代码占 ≤2%)
+create+unlink 的往返次数     16(旧 API)/ 11(27 Handler API)
+元数据写密集负载            native 的 6–20%
+读 / exec / 页缓存命中      native 的 90–110%
+单个挂载                    fskitd 一条 serial 队列;8 个活跃挂载时 fskitd 独占 2 核
+```
+
+往返次数由内核决定(每个未缓存名字两次 lookup、provenance xattr 探测、父目录 getattr),
+Handler API 只去掉了最便宜的几次。§29 的 "≥ 90%" 在任何 mutation 上都不可能达到。
+FSKit 前端保留为实验性备选(超大仓库、跨卷),不再投入。
+
+## 40.2 转向:APFS 做命名空间和数据,BranchFS 只记分支 DAG
+
+§2 的分工改为:
+
+```text
+BranchFS 自己负责:  branch DAG、快照生命周期、fork/checkpoint/discard/diff、预克隆池、防误操作
+APFS 负责:          命名空间、COW、页缓存、崩溃一致性(§10–§19 的 overlay/whiteout/override 全部不再需要)
+```
+
+World 是 APFS 目录的 `clonefile(dir)` 克隆;Snapshot 是不可变克隆(门目录 0000)。
+§4 "fork 绝不能走整棵树"被放弃:目录克隆实测 7–13µs/条目,50k 文件 0.37–0.5s;
+fork < 10ms 由预克隆池实现(命中 p50 8.6–9.7ms,与树大小无关)。
+§25 的 O(changes) diff 由 FSEvents 提供候选,但默认走 4 线程全扫(0.16–1.4s/50k),
+因为 fseventsd 落日志不保证全局有序,精确性优先。
+
+## 40.3 M1 对 §1 判据的实测(`docs/M1_RESULTS.md`)
+
+```text
+fork latency < 10ms p50        PASS  池命中 8.6–9.7ms;未命中 26ms/1k、110ms/10k、505ms/50k
+git/build >= 90% native        PASS  99–117%
+1000 idle branches             PASS  102–114s 创建,3.2–3.4GB 元数据,list 10ms;删除 525s(M2:后台增量 gc)
+storage ~ divergence           PASS  100 World 各改 1% = 真实复制的 13.6%;每次 append 摊 4KiB 块
+diff O(changes)                PASS  全扫 0.19–1.4s/50k;事件路径 0.35s 但抖动 0.14–0.49s
+```
+
+## 40.4 防误操作(`docs/M1_DESIGN.md` §3,P1–P15)
+
+身份靠标记文件 + inode 而非路径;快照门目录保护;discard 进 trash 可 restore;`world exec` 持锁 + seatbelt;
+跨卷探针;危险路径拒绝;tmp→rename→commit 的发布顺序;93 项安全用例。
+
+## 40.5 其他平台
+
+Linux:overlayfs + mount namespace(fork O(1)、upper 目录即 changed-set、内核级隔离,需 XFS reflink / btrfs)。
+Windows:Windows 11 + Dev Drive(ReFS 块克隆逐文件)+ USN Journal;或 ProjFS 惰性投影。core 的 C ABI 不变,平台层各自实现。
