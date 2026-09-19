@@ -308,6 +308,23 @@ static void restore_before_delete(void *ctx, int is_snapshot, wfs_id row, const 
     g_del_rc = wfs_world_restore(g_del_store, g_del_world);
 }
 
+// PR #1 review (9th round, P1): reconciliation's window. The seam runs between the scan that
+// found an ACTIVE row with no tree at its recorded path and the update that buries it; what it
+// does in there is `world fs verify <the new path>`, which is how a world that was merely moved
+// teaches its row where it went.
+static wfs_store *g_rec_store = NULL;
+static const char *g_rec_path;
+static int g_rec_ran;
+static int g_rec_rc = -1;
+static void verify_before_reconcile(void *ctx) {
+    (void)ctx;
+    if (g_rec_ran) return;
+    g_rec_ran++;
+    wfs_identity id;
+    g_rec_rc = wfs_world_verify_identity(g_rec_store, g_rec_path, &id);
+    if (!g_rec_rc && !id.moved) g_rec_rc = -EINVAL;
+}
+
 // PR #1 review (9th round, P1): the pool collector's scan window. The seam runs after the pool
 // rows have been read and before anything is removed; what it does in there is a whole
 // `pool fill` and a whole pool-backed `fork`, both on a second handle. The fill's entry is a
@@ -2226,6 +2243,76 @@ int main() {
         wfs_store_close(cb);
         wfs_store_close(ca);
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", cstore, (unsigned long long)c1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
+    // ---- PR #1 review (9th round, P1): a world that was moved is not a world that is gone ----
+    //
+    // `gc --reconcile` scans for ACTIVE rows whose recorded path holds no directory and buries
+    // them. That verdict is true of a world that was deleted and equally true of one that was
+    // merely moved -- until somebody runs `world fs verify <its new path>`, which relocates the
+    // row by inode (P1). A verify landing between the scan and the update had its work buried:
+    // the update named only the id, so it marked DEAD a world that was ACTIVE at a path the row
+    // had just been taught. The update now carries the state and the path the scan observed, and
+    // worlds_reconciled counts only rows it actually changed (docs/M1_DESIGN.md P18).
+    {
+        char cstore2[4096], csrc2[4096], cold[4096], cnew[4096];
+        join(cstore2, sizeof cstore2, root, "recon-store");
+        join(csrc2, sizeof csrc2, root, "recon-src");
+        CHECK(mkdir(csrc2, 0755) == 0);
+        join(p, sizeof p, csrc2, "a.txt");
+        write_file(p, "one\n");
+        wfs_store *ra = NULL;
+        CHECK_OK(wfs_store_open(cstore2, &ra));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "rc";
+        wfs_id rc1 = 0;
+        CHECK_OK(wfs_snapshot_create(ra, csrc2, &sopts, &rc1));
+        wfs_ref rcf = {WFS_K_SNAPSHOT, rc1};
+        memset(&opts, 0, sizeof opts);
+        join(cold, sizeof cold, worlds, "recon-old");
+        join(cnew, sizeof cnew, worlds, "recon-new");
+        wfs_id rcw = 0;
+        CHECK_OK(wfs_world_create(ra, rcf, cold, &opts, &rcw));
+        CHECK(rename(cold, cnew) == 0);           // the user moved it; the row still says `cold`
+
+        wfs_store *rb = NULL;
+        CHECK_OK(wfs_store_open(cstore2, &rb));
+        g_rec_store = ra;
+        g_rec_path = cnew;
+        g_rec_ran = 0;
+        g_rec_rc = -1;
+        wfs_test_before_reconcile = verify_before_reconcile;
+        wfs_gc_opts gopts;
+        memset(&gopts, 0, sizeof gopts);
+        gopts.retention_secs = 0;
+        gopts.flags = WFS_GC_RECONCILE;
+        wfs_gc_report rrep;
+        memset(&rrep, 0, sizeof rrep);
+        CHECK_OK(wfs_gc_ex(rb, &gopts, &rrep));
+        wfs_test_before_reconcile = NULL;
+        CHECK(g_rec_ran == 1);
+        CHECK_OK(g_rec_rc);                       // the verify relocated the row
+        CHECK(rrep.worlds_dangling == 1);         // the scan did see it, and says so
+        CHECK(rrep.worlds_reconciled == 0);       // ... and buried nothing
+        wfs_world_rec rwr2;
+        CHECK_OK(wfs_world_info(ra, rcw, &rwr2));
+        CHECK(rwr2.state == WFS_ST_ACTIVE && !strcmp(rwr2.path, cnew) && rwr2.present);
+        CHECK_OK(wfs_world_diff(ra, rcw, 0, NULL, NULL));
+        CHECK_OK(wfs_world_info(rb, rcw, &rwr2));   // and the collector's own handle agrees
+        CHECK(rwr2.state == WFS_ST_ACTIVE);
+
+        // And a world whose tree really is gone is still reconciled, which is the rule this is a
+        // refinement of, not a retreat from.
+        rm_rf(cnew);
+        memset(&rrep, 0, sizeof rrep);
+        CHECK_OK(wfs_gc_ex(rb, &gopts, &rrep));
+        CHECK(rrep.worlds_dangling == 1 && rrep.worlds_reconciled == 1);
+        CHECK_OK(wfs_world_info(ra, rcw, &rwr2));
+        CHECK(rwr2.state == WFS_ST_DEAD);
+        wfs_store_close(rb);
+        wfs_store_close(ra);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", cstore2, (unsigned long long)rc1);
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 

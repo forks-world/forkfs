@@ -796,6 +796,14 @@ extern void *wfs_test_before_trash_orphans_ctx;
 extern void (*wfs_test_before_pool_sweep)(void *ctx);
 extern void *wfs_test_before_pool_sweep_ctx;
 
+/* And reconciliation's window (PR #1 review, 9th round): called once per gc, between the scan
+ * that decides which ACTIVE rows have no tree at their recorded path and the updates that bury
+ * them. What a test does in there is `world fs verify <the new path>` on a world that was merely
+ * moved, which relocates the row by inode. NULL unless a test sets it; nothing in the library
+ * ever assigns it. */
+extern void (*wfs_test_before_reconcile)(void *ctx);
+extern void *wfs_test_before_reconcile_ctx;
+
 /* And the thing no test can provoke on a healthy machine: a pthread_create that fails for one
  * worker slot and succeeds for a later one. A bit set here refuses that slot (slots 0..31); 0,
  * the value it has everywhere else, means every slot is started normally. */

@@ -639,6 +639,12 @@ extern "C" void *wfs_test_before_trash_delete_ctx = nullptr;
 extern "C" void (*wfs_test_before_trash_orphans)(void *ctx) = nullptr;
 extern "C" void *wfs_test_before_trash_orphans_ctx = nullptr;
 
+// And reconciliation's window (PR #1 review, 9th round): between the scan that finds an ACTIVE
+// row with no tree at its recorded path and the update that buries it. A `world fs verify` on
+// the path the directory was moved to relocates the row by inode in exactly that window.
+extern "C" void (*wfs_test_before_reconcile)(void *ctx) = nullptr;
+extern "C" void *wfs_test_before_reconcile_ctx = nullptr;
+
 // ---- snapshots --------------------------------------------------------------------------------
 
 extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_snapshot_opts *opts,
@@ -3019,6 +3025,7 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
     // is the operator saying "yes, those are gone".
     {
         Vec<wfs_id> dead_snaps, dead_worlds;
+        Vec<String> dead_snap_paths, dead_world_paths;
         {
             Guard g(s->mu);
             struct stat st;
@@ -3030,6 +3037,7 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                     if (*p && ::stat(p, &st) == 0 && S_ISDIR(st.st_mode)) continue;
                     rep.snapshots_dangling++;
                     dead_snaps.emplace_back((wfs_id)q.col_i64(0));
+                    dead_snap_paths.emplace_back(p);
                 }
             }
             {
@@ -3040,18 +3048,36 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                     if (*p && ::stat(p, &st) == 0 && S_ISDIR(st.st_mode)) continue;
                     rep.worlds_dangling++;
                     dead_worlds.emplace_back((wfs_id)q.col_i64(0));
+                    dead_world_paths.emplace_back(p);
                 }
             }
         }
+        if (wfs_test_before_reconcile) wfs_test_before_reconcile(wfs_test_before_reconcile_ctx);
+        // PR #1 review (9th round), P18: the verdict above is "there is no tree at the path this
+        // row records", and it was acted on with an unconditional UPDATE. A World that was merely
+        // moved looks exactly like that until somebody runs `world fs verify <its new path>`,
+        // which relocates the row by inode -- and a verify landing between the scan and the
+        // update had its work buried: an ACTIVE world at a path it had just been taught, marked
+        // DEAD by a reconcile that was reading a path nobody uses any more. So each update
+        // carries the state and the path the scan observed, and a row is counted as reconciled
+        // only when it was this update that changed it.
         if (o.flags & WFS_GC_RECONCILE) {
             for (size_t i = 0; i < dead_snaps.size(); ++i) {
+                bool changed = false;
                 {
                     Guard g(s->mu);
                     Txn t(s->db);
-                    Stmt u(s->db, "UPDATE snapshots SET state=?, trash_path='' WHERE id=?");
-                    if (u.ok()) { u.i64(1, WFS_ST_DEAD); u.i64(2, (int64_t)dead_snaps[i]); u.step(); }
+                    Stmt u(s->db, "UPDATE snapshots SET state=?, trash_path=''"
+                                  " WHERE id=? AND state=1 AND path=?");
+                    if (!u.ok()) continue;
+                    u.i64(1, WFS_ST_DEAD);
+                    u.i64(2, (int64_t)dead_snaps[i]);
+                    u.text(3, dead_snap_paths[i].c_str());
+                    if (u.step() != SQLITE_DONE) continue;
+                    changed = sqlite3_changes(s->db) != 0;
                     t.commit();
                 }
+                if (!changed) continue;   // the row moved on: not this collector's to bury
                 // The directory the row named is gone, but <store>/snapshots/S<n> may still hold
                 // the manifest or a stump; take it with the row.
                 String dir = numbered(snaps.c_str(), 'S', dead_snaps[i], nullptr);
@@ -3061,10 +3087,15 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
             for (size_t i = 0; i < dead_worlds.size(); ++i) {
                 Guard g(s->mu);
                 Txn t(s->db);
-                Stmt u(s->db, "UPDATE worlds SET state=? WHERE id=?");
-                if (u.ok()) { u.i64(1, WFS_ST_DEAD); u.i64(2, (int64_t)dead_worlds[i]); u.step(); }
+                Stmt u(s->db, "UPDATE worlds SET state=? WHERE id=? AND state=1 AND path=?");
+                if (!u.ok()) continue;
+                u.i64(1, WFS_ST_DEAD);
+                u.i64(2, (int64_t)dead_worlds[i]);
+                u.text(3, dead_world_paths[i].c_str());
+                if (u.step() != SQLITE_DONE) continue;
+                bool changed = sqlite3_changes(s->db) != 0;
                 t.commit();
-                rep.worlds_reconciled++;
+                if (changed) rep.worlds_reconciled++;
             }
         }
     }
