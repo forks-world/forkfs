@@ -2,8 +2,19 @@
 #import <FSKit/FSKit.h>
 #import <os/log.h>
 #import "WorldVolume.h"
+#import "WorldVolumeHandler.h"
 #include "worldfs/worldfs.h"
 #include "worldfs/worldfs_fskit.h"
+
+// Which FSKit API surface a new mount uses. macOS 27's Handler-style protocols are the default when
+// they exist; a `wfs_api_old` marker file in the store directory forces the frozen
+// `FSVolumeOperations` frontend instead, so both can be measured from one installed binary without
+// a reinstall (which would drop every live mount).
+static BOOL wfs_marker(NSString *name) {
+    NSString *as = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
+    return [[NSFileManager defaultManager] fileExistsAtPath:
+                [[as stringByAppendingPathComponent:@"World/fs"] stringByAppendingPathComponent:name]];
+}
 
 os_log_t wfs_log(void) {
     static os_log_t l;
@@ -47,8 +58,19 @@ os_log_t wfs_log(void) {
     BOOL scoped = [r.url startAccessingSecurityScopedResource];
     os_log_info(wfs_log(), "security-scoped access: %d", scoped);
     NSError *err = nil;
-    WorldVolume *v = [[WorldVolume alloc] initWithBasePath:r.url.path scopedURL:(scoped ? r.url : nil)
-                                                   options:options.taskOptions error:&err];
+    FSVolume *v = nil;
+    if (@available(macOS 27.0, *)) {
+        if (!wfs_marker(@"wfs_api_old")) {
+            v = [[WorldVolumeH alloc] initWithBasePath:r.url.path scopedURL:(scoped ? r.url : nil)
+                                               options:options.taskOptions error:&err];
+            os_log_info(wfs_log(), "api=handler");
+        }
+    }
+    if (!v && !err) {
+        v = [[WorldVolume alloc] initWithBasePath:r.url.path scopedURL:(scoped ? r.url : nil)
+                                          options:options.taskOptions error:&err];
+        os_log_info(wfs_log(), "api=operations");
+    }
     if (!v) { reply(nil, err); return; }
     self.containerStatus = FSContainerStatus.ready;
     reply(v, nil);

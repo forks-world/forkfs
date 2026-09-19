@@ -364,6 +364,69 @@ S1/S4 的抖动来自 mds 索引新生成的文件。)
 27 SDK Handler API 的改造降级为"装好 Xcode 27 之后的可选实验",不作为路线依据。**
 另外补三个 M0 收尾项(2026-09-19 已全部做完,见下节)。
 
+### Handler API 实测(2026-09-19 晚,Command Line Tools 27.0 SDK 已装,真的用新 API 重写了一遍)
+
+上一节说的"可选实验"当天就做了:`macos/fskit/WorldVolumeHandler.{h,mm}` 新增 `WorldVolumeH`,
+实现 `FSVolumeHandler` / `FSVolumeXattrHandler` / `FSVolumeReadWriteHandler` /
+`FSVolumeDataCacheHandler`,每个回复都用带 `FSItem.Attributes` 的结果对象,并把该类
+`requestedAttributes` 要求的 14 个属性全部填满(运行时反射确认 21 个结果类要的是同一组
+`0x3fff`,core 的 `wfs_attr` 本来就够)。冻结的 `WorldVolume` 一字未改,两个类共存在同一个
+appex 里,靠 store 目录下的 marker 文件(`wfs_api_old` / `wfs_nodatacache`)**按挂载点**切换,
+所以下表的"旧 API"列是同一天、同一台机器、同一个二进制、间隔几分钟测出来的真对照。
+完整数据见 [`docs/FSKIT_HANDLER_API_MACOS27.md`](FSKIT_HANDLER_API_MACOS27.md)。
+
+**门槛判定(两条仍然都不满足):**
+
+| 门槛 | 阈值 | 26.6.2 | 27.0 旧 API | **27.0 Handler API** | 判定 |
+|---|---|---|---|---|---|
+| create+unlink 往返次数 | ≤ 6 | 16.06 | 16.04 | **11.04** | **FAIL**(超 1.84×) |
+| 单次往返(lookup-miss) | ≤ 40µs | 68.1µs | 74.27µs | **74.64µs** | **FAIL**(超 1.87×) |
+| (派生)元数据写 native% | 40–60% | 6.6% | 5.5% | **6.1%** | **FAIL** |
+
+- **`getattr` 刷新彻底消失**:7.04 → 2.06 次/轮,而且剩下的 2 次全是对**父目录**的。
+  `FSLookupItemResult` / `FSCreateItemResult` / `FSRemoveItemResult` 里带的属性内核确实缓存了。
+  冷 `lstat` 从每文件 3.08 次往返(lookup 2.04 + getattr 1.04)降到 **2.04 次(纯 lookup)**。
+- **`lookup` 3.00 和 provenance `getxattr` 2.00 一次没少。** 新发现:macOS 27 对一个**未缓存的名字
+  固定发两次 lookup**(冷 lstat 5000 个不同名字 = 10201 次 lookup,两套 API 完全一样,
+  把目录改名成 `*.noindex` 也一样),这一条约占 create+unlink 全部往返成本的 9%,不在模块 API 射程内。
+- **`FSVolumeDataCacheHandler` 是净亏,必须 `dataCacheInhibited = YES`。**
+  实测 open/close **每一次都真的发到扩展**(2000 次 open+close → 2051 open + 2051 close),
+  **没有 deferred close、没有合并**;读写行为一点没变(冷读仍每个页缓存 miss 一次 `read`,热读零往返)。
+  代价是 `open`+`close` 从 11.0µs 涨到 **141.0µs(13×)**、`ls -l` 50 项从 52 次往返涨到 104 次、
+  create+unlink 从 11.04 涨到 13.04。关掉它等价于 M0 的 `openCloseInhibited=YES`(逐项实测相同)。
+- **墙钟收益只有往返次数收益的三分之一**:次数 -31%,create+unlink 延迟只 -9.4%
+  (1097.9 → 995.2µs)。原因是**被消掉的 getattr 是最便宜的往返**:旧 API 68.4µs/往返,
+  Handler 90.1µs/往返 —— 省掉的 5 次每次只值约 20µs。
+- 有收益的地方(Handler+noDC vs 旧 API):tmp+rename **-22.6%**、create+write+close+unlink **-10.5%**、
+  冷 lstat **-12.4%**、并发 create+unlink 吞吐 **+9%(P=1)→ +26%(P=8)**;
+  `realwork` 的 **"touch 头文件 + 增量编译" 1.533s → 0.433–0.522s(快 3×,24% → 68–82% native)**,
+  把上一节 §7.2 唯一那个稳定复现的真实负载回归补回来了。
+- 读路径、缓存命中路径**逐项不变**(stat_cached 0.92µs / pread 0.45µs / open+read+close 11.60µs,
+  都是 native 的 105–108%),**单次 XPC 往返成本一动没动**(74.27 → 74.64µs)。
+- 正确性:两套配置各跑一遍 `smoke.sh`(同一活挂载连跑两次)、readdir 完整性 100/1000/5000、
+  `ls -fa` dot 项、exec + dlopen、git init/add/commit、硬链接兄弟 unlink、agentstress 十场景 —— **全过**;
+  quarantine 隐藏仍然有效(新产物只有 `com.apple.provenance`)。
+
+**订正上一节的两处数据(在 `4582150` 上复现不出来):**
+
+- 上一节问题 2 的"写随 mount 存活时间劣化 3–12×":**50,000 次 create+unlink churn 之后,
+  两套 API 都只变化 ±2%**(旧 API 1103→1129µs,Handler 1012→1003µs)。最可能的原因是
+  `d1a2a3c` 把"删除后那次 getattr"从回 `ESTALE` 改成回属性快照,不再让 FSKit 攒住 `FSFileHandle`。
+  **偶发的多倍尖峰仍在**(agentstress 三轮里 S4 一次 6.4→34.8s、S5 一次 24.4→75.0s),
+  但微基准量不到,Handler API 没有解决。
+- `MACOS27_MEASUREMENTS` §4.2 的 writebench 表(create 1242 / close 418 / open_trunc 832 /
+  fsync 319 / unlink 1737 µs)是劣化态下测的:今天旧 API 是 **599 / 173 / 241 / 66 / 493**,
+  Handler+noDC 是 **563 / 143 / 230 / 66 / 435**。由它推出的"几百个文件同时打开每个额外付 ~3ms"
+  的反常结论同样需要带这个注脚。
+
+**结论:T0.5 的 Go/No-Go 仍然不变,M1 维持 C(native-root clonefile World)主线。**
+这一轮的额外价值是把"再等 FSKit 一版"的期待关掉了:属性缓存是新 API 里最被寄予厚望的一条路,
+走完之后 create+unlink 仍有 11 次往返,剩下的每一次(2 次冷名字 lookup、1 次热 lookup、
+2 次 provenance getxattr、create/remove/sync/reclaim 各 1 次、2 次父目录 getattr)都在内核里,
+没有一条是模块能动的;单次往返 74.6µs 更是 27 相对 26.6.2 涨了 8%(Apple 自己的 msdos 同向涨)。
+Handler 版作为冻结前端的新默认留在仓库里(旧 `FSVolumeOperations` 在 27 上已 deprecated),
+默认 `dataCacheInhibited = YES`。
+
 ### M0 收尾 — 2026-09-19(macOS 27.0 实测暴露的三个问题)
 
 - [x] **T0.6 `readdir` 的 `.` / `..`**(`core/src/view.cpp` + `core/src/platform_posix.cpp`)
