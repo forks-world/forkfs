@@ -7,6 +7,10 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+// PR #1 review (11th round): the schema-migration block at the end of main() has to build a
+// database as schema 2 first wrote it -- older than anything this library can produce any more.
+// worldfs_core links SQLite publicly, so this is the same library the core itself opens.
+#include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -135,6 +139,94 @@ static void retag_hl_line(const char *manifest, size_t which, unsigned long long
 }
 
 static int exists(const char *p) { struct stat st; return lstat(p, &st) == 0; }
+
+// ---- PR #1 review (11th round): a database of the shape schema 2 had before the ALTERs -------
+static void db_exec(const char *path, const char *sql) {
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) == SQLITE_OK);
+    char *err = NULL;
+    int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
+    if (rc != SQLITE_OK) fprintf(stderr, "db_exec(%s): %s\n", path, err ? err : "?");
+    CHECK(rc == SQLITE_OK);
+    sqlite3_close(db);
+}
+
+static int db_user_version(const char *path) {
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    CHECK(sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &st, NULL) == SQLITE_OK);
+    CHECK(sqlite3_step(st) == SQLITE_ROW);
+    int v = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return v;
+}
+
+static int db_has_column(const char *path, const char *table, const char *column) {
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    char sql[256];
+    snprintf(sql, sizeof sql, "PRAGMA table_info(%s)", table);
+    sqlite3_stmt *st = NULL;
+    CHECK(sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK);
+    int found = 0;
+    while (!found && sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *n = sqlite3_column_text(st, 1);
+        if (n && !strcmp((const char *)n, column)) found = 1;
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return found;
+}
+
+// The v2 tables as they were before any of the ALTER TABLE migrations: no `hard`, `root_mode`,
+// `trash_path`, `trashed_at`, `hl_groups`, `hl_external` on snapshots, no `tmp_path` and no
+// owner columns anywhere. `snapshots_as_view` builds the same thing with `snapshots` as a view
+// over a real table: `CREATE TABLE IF NOT EXISTS snapshots` is then a silent no-op and the very
+// first migration comes back "Cannot add a column to a view" while the `PRAGMA user_version`
+// write after it succeeds -- which is exactly the shape an EIO, a full disk or a SQLITE_BUSY
+// that outlives the busy timeout has, and the only one of them a test can produce on demand.
+static void make_v2_db(const char *path, int snapshots_as_view) {
+    char wal[4096], shm[4096];
+    snprintf(wal, sizeof wal, "%s-wal", path);
+    snprintf(shm, sizeof shm, "%s-shm", path);
+    unlink(path);
+    unlink(wal);
+    unlink(shm);
+    static const char *kSnapCols =
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL DEFAULT '',"
+        " path TEXT NOT NULL DEFAULT '', src_path TEXT NOT NULL DEFAULT '',"
+        " from_world INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,"
+        " entries INTEGER NOT NULL DEFAULT 0, hardlinks INTEGER NOT NULL DEFAULT 0,"
+        " state INTEGER NOT NULL DEFAULT 0";
+    char sql[4096];
+    snprintf(sql, sizeof sql,
+             "PRAGMA journal_mode=WAL;"
+             "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+             "CREATE TABLE %s(%s);"
+             "%s"
+             "CREATE TABLE worlds(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+             " kind INTEGER NOT NULL DEFAULT 1, parent_world INTEGER NOT NULL DEFAULT 0,"
+             " snapshot_id INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL DEFAULT '',"
+             " path TEXT NOT NULL DEFAULT '', trash_path TEXT NOT NULL DEFAULT '',"
+             " dir_dev INTEGER NOT NULL DEFAULT 0, dir_ino INTEGER NOT NULL DEFAULT 0,"
+             " state INTEGER NOT NULL DEFAULT 0, fsevents_id INTEGER NOT NULL DEFAULT 0,"
+             " entries INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,"
+             " trashed_at INTEGER NOT NULL DEFAULT 0);"
+             "CREATE TABLE pool(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+             " snapshot_id INTEGER NOT NULL, snap_created_at INTEGER NOT NULL,"
+             " uuid TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT '',"
+             " entries INTEGER NOT NULL DEFAULT 0, root_mode INTEGER NOT NULL DEFAULT 0,"
+             " root_mtime INTEGER NOT NULL DEFAULT 0, dir_dev INTEGER NOT NULL DEFAULT 0,"
+             " dir_ino INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,"
+             " state INTEGER NOT NULL DEFAULT 0);"
+             "PRAGMA user_version=%d;",
+             snapshots_as_view ? "snapshots_real" : "snapshots", kSnapCols,
+             snapshots_as_view ? "CREATE VIEW snapshots AS SELECT * FROM snapshots_real;" : "",
+             WFS_STORE_SCHEMA * 100);
+    db_exec(path, sql);
+}
 
 // P9 (T2.5): two names are the same file when they are the same inode, and a group of n names
 // shows n links on every one of them.
@@ -2946,6 +3038,75 @@ int main() {
         wfs_store_close(ta);
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", tstore, (unsigned long long)t1);
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
+    // ---- PR #1 review (11th round, P2): a migration that failed is not a migration that ran ----
+    //
+    // The additive ALTERs used to be fired one by one with their results thrown away, and
+    // `user_version` stamped with the current revision afterwards no matter what happened. Only
+    // one kind of failure was being thought about -- "duplicate column name", i.e. the column is
+    // already there -- and everything else (EIO, a full disk, a SQLITE_BUSY that outlives the
+    // busy timeout, a database SQLite could only open read-only) left the store stamped as
+    // migrated with a column missing. The stamp is the only thing that decides whether the
+    // migrations run at all, so no later open ever retried: every prepare naming that column
+    // failed from then on, for ever.
+    {
+        char mstore[4096], mdb[4096];
+        join(mstore, sizeof mstore, root, "migrate-store");
+        CHECK(mkdir(mstore, 0755) == 0);
+        join(p, sizeof p, mstore, "VERSION");
+        write_file(p, "2\n");                 // P13: the schema number, which does not change
+        join(mdb, sizeof mdb, mstore, "metadata.db");
+        static const char *kAdded[][2] = {
+            {"snapshots", "hard"},       {"snapshots", "root_mode"},
+            {"snapshots", "trash_path"}, {"snapshots", "trashed_at"},
+            {"snapshots", "hl_groups"},  {"snapshots", "hl_external"},
+            {"snapshots", "owner_pid"},  {"snapshots", "owner_start"},
+            {"worlds", "tmp_path"},      {"worlds", "owner_pid"},
+            {"worlds", "owner_start"},   {"pool", "owner_pid"},
+            {"pool", "owner_start"},
+        };
+        const size_t kAddedN = sizeof kAdded / sizeof kAdded[0];
+
+        // (1) the ordinary case: a v2 store that has never seen the added columns is migrated
+        //     on open, and only then stamped.
+        make_v2_db(mdb, 0);
+        CHECK(db_user_version(mdb) == WFS_STORE_SCHEMA * 100);
+        for (size_t i = 0; i < kAddedN; ++i) CHECK(!db_has_column(mdb, kAdded[i][0], kAdded[i][1]));
+        wfs_store *ms = NULL;
+        CHECK_OK(wfs_store_open(mstore, &ms));
+        wfs_store_close(ms);
+        for (size_t i = 0; i < kAddedN; ++i) CHECK(db_has_column(mdb, kAdded[i][0], kAdded[i][1]));
+        int stamped = db_user_version(mdb);
+        CHECK(stamped > WFS_STORE_SCHEMA * 100);   // SCHEMA*100 + the revision
+        // ... and the store is usable, which is what the columns were for.
+        CHECK_OK(wfs_store_open(mstore, &ms));
+        wfs_store_stat mst;
+        CHECK_OK(wfs_store_status(ms, &mst));
+        CHECK(mst.schema == WFS_STORE_SCHEMA);
+        wfs_store_close(ms);
+        CHECK(db_user_version(mdb) == stamped);    // a second open changes nothing
+
+        // (2) the same store, with one ALTER that cannot succeed and a `PRAGMA user_version`
+        //     that can. The open has to fail and leave the database exactly as it found it --
+        //     un-stamped, so the next open is the retry. This used to come back 0 with
+        //     user_version stamped, `snapshots` still missing every column, and the migrations
+        //     that happened to work applied on their own.
+        make_v2_db(mdb, 1);
+        CHECK(db_user_version(mdb) == WFS_STORE_SCHEMA * 100);
+        ms = NULL;
+        CHECK_RC(wfs_store_open(mstore, &ms), -EIO);
+        CHECK(ms == NULL);
+        CHECK(db_user_version(mdb) == WFS_STORE_SCHEMA * 100);
+        for (size_t i = 0; i < kAddedN; ++i) CHECK(!db_has_column(mdb, kAdded[i][0], kAdded[i][1]));
+
+        // (3) take the obstacle away and the next open migrates it, exactly as if nothing had
+        //     ever gone wrong -- which is the whole point of not stamping it in (2).
+        db_exec(mdb, "DROP VIEW snapshots; ALTER TABLE snapshots_real RENAME TO snapshots;");
+        CHECK_OK(wfs_store_open(mstore, &ms));
+        wfs_store_close(ms);
+        CHECK(db_user_version(mdb) == stamped);
+        for (size_t i = 0; i < kAddedN; ++i) CHECK(db_has_column(mdb, kAdded[i][0], kAdded[i][1]));
     }
 
     wfs_store_close(s);

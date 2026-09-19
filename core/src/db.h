@@ -50,14 +50,30 @@ struct Stmt {
 inline void exec(sqlite3 *db, const char *sql) { sqlite3_exec(db, sql, nullptr, nullptr, nullptr); }
 
 // RAII BEGIN IMMEDIATE. Rolls back unless commit() was called (P12).
+// PR #1 review (11th round): `begin_rc` and `commit_rc()` are for the one caller that has to
+// know -- the schema migration in store.cpp, which must not stamp a store as migrated on the
+// strength of statements it never checked. Everything else is a row write whose own
+// sqlite3_changes() is the answer, and goes on using commit().
 struct Txn {
     sqlite3 *db;
     bool open_ = false;
-    explicit Txn(sqlite3 *d) : db(d) { exec(db, "BEGIN IMMEDIATE"); open_ = true; }
+    int begin_rc = SQLITE_OK;
+    explicit Txn(sqlite3 *d) : db(d) {
+        begin_rc = sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
+        open_ = true;
+    }
     ~Txn() { if (open_) exec(db, "ROLLBACK"); }
     Txn(const Txn &) = delete;
     Txn &operator=(const Txn &) = delete;
     void commit() { if (open_) { exec(db, "COMMIT"); open_ = false; } }
+    // The COMMIT whose result is looked at. A commit that fails leaves the transaction open, so
+    // the destructor still rolls it back.
+    int commit_rc() {
+        if (!open_) return SQLITE_OK;
+        int rc = sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
+        if (rc == SQLITE_OK) open_ = false;
+        return rc;
+    }
 };
 
 inline int64_t now_sec() {

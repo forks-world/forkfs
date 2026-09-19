@@ -94,31 +94,55 @@ const char *kSchema =
 
 // Columns added after the first schema-2 stores were written. They are additive and carry
 // defaults, so an older core reading such a store still works and VERSION does not change
-// (P13 is about incompatible schemas, not about new columns). Run one statement per exec:
-// each one fails harmlessly with "duplicate column name" once it has been applied, and a
-// combined script would stop at the first of those.
-const char *kMigrations[] = {
-    "ALTER TABLE snapshots ADD COLUMN hard INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE snapshots ADD COLUMN root_mode INTEGER NOT NULL DEFAULT 0",
+// (P13 is about incompatible schemas, not about new columns). One statement per exec: a
+// combined script would stop at the first column that is already there.
+//
+// PR #1 review (11th round): each one carries the table and the column it adds, because "is
+// this migration still to be run?" and "did it work?" are questions about the schema, and the
+// schema is what PRAGMA table_info answers. They used to be bare SQL whose result was thrown
+// away, on the assumption that the only way an ALTER can fail is "duplicate column name" --
+// see migrate_schema() below for what that assumption cost.
+struct Migration {
+    const char *table;
+    const char *column;
+    const char *ddl;
+};
+
+const Migration kMigrations[] = {
+    {"snapshots", "hard",
+     "ALTER TABLE snapshots ADD COLUMN hard INTEGER NOT NULL DEFAULT 0"},
+    {"snapshots", "root_mode",
+     "ALTER TABLE snapshots ADD COLUMN root_mode INTEGER NOT NULL DEFAULT 0"},
     // T2.2
-    "ALTER TABLE snapshots ADD COLUMN trash_path TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE snapshots ADD COLUMN trashed_at INTEGER NOT NULL DEFAULT 0",
+    {"snapshots", "trash_path",
+     "ALTER TABLE snapshots ADD COLUMN trash_path TEXT NOT NULL DEFAULT ''"},
+    {"snapshots", "trashed_at",
+     "ALTER TABLE snapshots ADD COLUMN trashed_at INTEGER NOT NULL DEFAULT 0"},
     // T2.5 (P9): the hardlink groups recorded in the snapshot's manifest. hl_groups is what a
     // fork checks to decide whether the manifest has to be read at all.
-    "ALTER TABLE snapshots ADD COLUMN hl_groups INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE snapshots ADD COLUMN hl_external INTEGER NOT NULL DEFAULT 0",
+    {"snapshots", "hl_groups",
+     "ALTER TABLE snapshots ADD COLUMN hl_groups INTEGER NOT NULL DEFAULT 0"},
+    {"snapshots", "hl_external",
+     "ALTER TABLE snapshots ADD COLUMN hl_external INTEGER NOT NULL DEFAULT 0"},
     // PR #1 review, third round: where a fork in flight is building its clone. The name is
     // drawn, not derived, so the row is the only record of it.
-    "ALTER TABLE worlds ADD COLUMN tmp_path TEXT NOT NULL DEFAULT ''",
+    {"worlds", "tmp_path",
+     "ALTER TABLE worlds ADD COLUMN tmp_path TEXT NOT NULL DEFAULT ''"},
     // PR #1 review, third round: who is building a CREATING row, so that gc can tell a crashed
     // producer from one that is simply still cloning. owner_start is that process's own start
     // time: a pid that has been reused since is not the producer.
-    "ALTER TABLE worlds ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE worlds ADD COLUMN owner_start INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE snapshots ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE snapshots ADD COLUMN owner_start INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE pool ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE pool ADD COLUMN owner_start INTEGER NOT NULL DEFAULT 0",
+    {"worlds", "owner_pid",
+     "ALTER TABLE worlds ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0"},
+    {"worlds", "owner_start",
+     "ALTER TABLE worlds ADD COLUMN owner_start INTEGER NOT NULL DEFAULT 0"},
+    {"snapshots", "owner_pid",
+     "ALTER TABLE snapshots ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0"},
+    {"snapshots", "owner_start",
+     "ALTER TABLE snapshots ADD COLUMN owner_start INTEGER NOT NULL DEFAULT 0"},
+    {"pool", "owner_pid",
+     "ALTER TABLE pool ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0"},
+    {"pool", "owner_start",
+     "ALTER TABLE pool ADD COLUMN owner_start INTEGER NOT NULL DEFAULT 0"},
 };
 
 // Additive revision of schema v2. `PRAGMA user_version` carries SCHEMA*100 + REV, so a store
@@ -128,6 +152,52 @@ const char *kMigrations[] = {
 // core opens such a store and simply does not use the new columns.
 const int kSchemaRev = 4;
 inline int user_version_want(void) { return WFS_STORE_SCHEMA * 100 + kSchemaRev; }
+
+// Does `table` have a column called `column`, right now, in this database? The table names are
+// this file's own string literals, so the interpolation is not a place a name can come from.
+bool has_column(sqlite3 *db, const char *table, const char *column) {
+    String sql("PRAGMA table_info(");
+    sql.append(table);
+    sql.append(")");
+    Stmt q(db, sql.c_str());
+    if (!q.ok()) return false;
+    while (q.row())
+        if (!::strcmp(q.col_text(1), column)) return true;   // 1 = name
+    return false;
+}
+
+// ---- PR #1 review (11th round): migrating is a transaction, and its verdict is the schema ----
+//
+// Every ALTER's result used to be discarded and `user_version` stamped with the current revision
+// regardless. That is only safe if the one thing an ALTER can do is fail with "duplicate column
+// name", and it is not: an EIO, a full disk, a SQLITE_BUSY that outlives the busy timeout, or a
+// database SQLite could only open read-only all fail the same call. The store was then stamped
+// as migrated with a column missing -- and since the stamp is the only thing that decides
+// whether the migrations run at all, no later open ever tried again. Every prepare that names
+// the missing column fails from then on, for ever, and nothing in the store says why.
+//
+// So: one transaction around the whole thing; each step run only when PRAGMA table_info says the
+// column is not there yet (no error-string matching, and a column that is already there is not a
+// failure to tolerate but a step with nothing to do); every step's result checked; and the stamp
+// written only after the schema has been asked, again, whether every column this core needs is
+// present. Anything else rolls the whole thing back and fails the open with -EIO, leaving the
+// store exactly as it was -- un-stamped, so the next open retries it.
+int migrate_schema(sqlite3 *db) {
+    wfs::Txn t(db);
+    if (t.begin_rc != SQLITE_OK) return -EIO;
+    if (sqlite3_exec(db, kSchema, nullptr, nullptr, nullptr) != SQLITE_OK) return -EIO;
+    for (const Migration &m : kMigrations) {
+        if (has_column(db, m.table, m.column)) continue;
+        if (sqlite3_exec(db, m.ddl, nullptr, nullptr, nullptr) != SQLITE_OK) return -EIO;
+    }
+    // The verdict, from the schema rather than from the fact that the statements returned OK.
+    for (const Migration &m : kMigrations)
+        if (!has_column(db, m.table, m.column)) return -EIO;
+    char pragma[64];
+    ::snprintf(pragma, sizeof pragma, "PRAGMA user_version=%d", user_version_want());
+    if (sqlite3_exec(db, pragma, nullptr, nullptr, nullptr) != SQLITE_OK) return -EIO;
+    return t.commit_rc() == SQLITE_OK ? 0 : -EIO;
+}
 
 void hex_id(char *out, size_t n) { // n = 33 for 32 hex digits + NUL
     unsigned char raw[16];
@@ -360,12 +430,10 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
         Stmt q(s->db, "PRAGMA user_version");
         if (q.ok() && q.row()) user_version = (int)q.col_i64(0);
     }
+    // All of it or none of it, and the stamp last (migrate_schema above). A store this fails on
+    // is left un-stamped and untouched, so the next open is the retry.
     if (user_version != user_version_want()) {
-        if (sqlite3_exec(s->db, kSchema, nullptr, nullptr, nullptr) != SQLITE_OK) { wfs_store_close(s); return -EIO; }
-        for (const char *m : kMigrations) sqlite3_exec(s->db, m, nullptr, nullptr, nullptr);
-        char pragma[64];
-        ::snprintf(pragma, sizeof pragma, "PRAGMA user_version=%d", user_version_want());
-        sqlite3_exec(s->db, pragma, nullptr, nullptr, nullptr);
+        if (int mrc = migrate_schema(s->db)) { wfs_store_close(s); return mrc; }
     }
     if (meta_get(s->db, "store_id", s->store_id) != 0) {
         char id[33];
