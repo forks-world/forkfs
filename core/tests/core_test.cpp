@@ -4181,6 +4181,186 @@ int main() {
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 
+    // ---- PR #1 review (17th round, P1): a member path is a chain of names, and a name is -----
+    // ---- not a symlink ------------------------------------------------------------------------
+    //
+    // manifest_path_sane() is lexical: no leading '/', no `..`, no empty or `.` component. Every
+    // one of those passes for `s/x` when `s` is a symlink to a directory -- and the three
+    // syscalls the group is made of all follow it. lstat(2) does not follow the LAST component
+    // and follows every one before it, so hardlinks_verify_groups approved the inode the symlink
+    // led to on the SNAPSHOT side; link(2) and rename(2) follow everything, so the replay acted
+    // on whatever the same symlink leads to on the CLONE side. A relative symlink lands in a
+    // different place in the two trees -- the snapshot's root and a fork's temporary sit at
+    // different depths, under different parents -- so a manifest that names `s/x`, `s/y` can be
+    // verified against a pair planted beside the snapshot and then replayed over two files that
+    // are not in the clone at all.
+    //
+    // Both sides now descend the member path themselves, one component at a time, with
+    // O_DIRECTORY|O_NOFOLLOW, and do their work with fstatat/linkat/renameat relative to the
+    // parent's descriptor: the check and the operation are the same syscall path, and a symlink
+    // component is ELOOP before anything is linked anywhere.
+    {
+        char ystore[4096], ysrc[4096], yd[4096], yman[4096], ybak[4096], yw[4096], yw2[4096];
+        char yside[4096], yx[4096], yy[4096], q2[4096];
+        join(ystore, sizeof ystore, root, "hlsym-store");
+        join(ysrc, sizeof ysrc, root, "hlsym-src");
+        CHECK(mkdir(ysrc, 0755) == 0);
+        join(yd, sizeof yd, ysrc, "d");
+        CHECK(mkdir(yd, 0755) == 0);
+        join(p, sizeof p, yd, "a");
+        write_file(p, "aaaa\n");
+        join(q2, sizeof q2, yd, "b");
+        CHECK(link(p, q2) == 0);
+        // The symlink, spelled relative to the tree root so that it leaves the tree: `../x` is
+        // one place under <store>/snapshots/S<n>/root and another under <worlds>/<fork>.
+        join(p, sizeof p, ysrc, "s");
+        CHECK(symlink("../hlsym-side/d", p) == 0);
+
+        wfs_store *ys = NULL;
+        CHECK_OK(wfs_store_open(ystore, &ys));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "hlsym";
+        wfs_id y1 = 0;
+        CHECK_OK(wfs_snapshot_create(ys, ysrc, &sopts, &y1));
+        CHECK_OK(wfs_snapshot_info(ys, y1, &sr));
+        CHECK(sr.hl_groups == 1 && sr.hardlinks == 2);
+        snprintf(yman, sizeof yman, "%s/snapshots/S%llu/manifest", ystore, (unsigned long long)y1);
+        join(ybak, sizeof ybak, root, "hlsym.bak");
+        copy_file(yman, ybak);
+
+        // What the symlink leads to on the snapshot side: a hardlinked pair of its own, beside
+        // the snapshot's root (not inside it -- the gate never sees it). This is what makes the
+        // forged manifest verifiable: both members lstat to one inode whose nlink is exactly 2.
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/hlsym-side", ystore, (unsigned long long)y1);
+        CHECK(mkdir(p, 0755) == 0);
+        snprintf(yside, sizeof yside, "%s/snapshots/S%llu/hlsym-side/d", ystore,
+                 (unsigned long long)y1);
+        CHECK(mkdir(yside, 0755) == 0);
+        join(p, sizeof p, yside, "x");
+        write_file(p, "vvvv\n");
+        join(q2, sizeof q2, yside, "y");
+        CHECK(link(p, q2) == 0);
+
+        // And what it leads to on the clone side: two ordinary files of somebody else's, in the
+        // directory the fork's temporary is made next to. Same size and same mtime, which is
+        // what every clone of one snapshot walk looks like -- so restore_group's "is this still
+        // the file the scan saw" guard cannot tell them apart either.
+        join(p, sizeof p, worlds, "hlsym-side");
+        CHECK(mkdir(p, 0755) == 0);
+        join(p, sizeof p, worlds, "hlsym-side/d");
+        CHECK(mkdir(p, 0755) == 0);
+        join(yx, sizeof yx, worlds, "hlsym-side/d/x");
+        write_file(yx, "outx\n");
+        join(yy, sizeof yy, worlds, "hlsym-side/d/y");
+        write_file(yy, "outy\n");
+        {
+            struct stat xs;
+            CHECK(lstat(yx, &xs) == 0);
+            struct timespec ts[2];
+            ts[0] = xs.st_atimespec;
+            ts[1] = xs.st_mtimespec;
+            CHECK(utimensat(AT_FDCWD, yy, ts, AT_SYMLINK_NOFOLLOW) == 0);
+        }
+
+        // The forgery: the group's two members respelled through the symlink. The header, the
+        // group id, the nlink and the line count are exactly as the snapshot wrote them.
+        repath_hl_line(yman, 0, "s/x");
+        repath_hl_line(yman, 1, "s/y");
+
+        wfs_ref yf = {WFS_K_SNAPSHOT, y1};
+        join(yw, sizeof yw, worlds, "hlsym-w");
+        wfs_verify_report yvr;
+        CHECK_RC(wfs_snapshot_verify(ys, y1, &yvr), WFS_E_SNAPSHOT_DIRTY);
+        CHECK(yvr.modified == 1 && strstr(yvr.first_bad, "manifest"));
+        size_t ybefore = 0;
+        CHECK_OK(wfs_world_list(ys, 1, NULL, 0, &ybefore));
+        memset(&opts, 0, sizeof opts);
+        opts.no_pool = 1;
+        wfs_id yw1 = 0;
+        CHECK_RC(wfs_world_create(ys, yf, yw, &opts, &yw1), WFS_E_SNAPSHOT_DIRTY);
+        CHECK(!exists(yw));                                  // nothing published at --to
+        CHECK(n_with_prefix(worlds, ".wfs-fork-") == 0);     // and no clone left behind
+        size_t yafter = 0;
+        CHECK_OK(wfs_world_list(ys, 1, NULL, 0, &yafter));
+        CHECK(yafter == ybefore);
+        uint64_t ymade = 1;
+        CHECK_RC(wfs_pool_fill(ys, y1, 1, &ymade), WFS_E_SNAPSHOT_DIRTY);
+        CHECK(ymade == 0);
+        uint64_t yready = 1;
+        CHECK_OK(wfs_pool_ready(ys, y1, &yready));
+        CHECK(yready == 0);
+        // The two files outside the clone are exactly as they were: this is what the replay did
+        // to them before this round -- `y` linked onto `x` and its own five bytes gone.
+        CHECK(ino_of(yx) != ino_of(yy));
+        CHECK(nlink_of(yx) == 1 && nlink_of(yy) == 1);
+        CHECK_OK(read_file(yx, buf, sizeof buf));
+        CHECK(!strcmp(buf, "outx\n"));
+        CHECK_OK(read_file(yy, buf, sizeof buf));
+        CHECK(!strcmp(buf, "outy\n"));
+
+        // The manifest as the snapshot wrote it still forks, with the pair rebuilt: the refusal
+        // is about the spelling, not about hardlinked snapshots.
+        copy_file(ybak, yman);
+        CHECK_OK(wfs_snapshot_verify(ys, y1, &yvr));
+        memset(&opts, 0, sizeof opts);
+        opts.no_pool = 1;
+        CHECK_OK(wfs_world_create(ys, yf, yw, &opts, &yw1));
+        join(p, sizeof p, yw, "d/a");
+        join(q2, sizeof q2, yw, "d/b");
+        CHECK(ino_of(p) == ino_of(q2) && nlink_of(p) == 2);
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "aaaa\n"));
+
+        // ---- and the same on the clone side, where no verify runs at all ---------------------
+        //
+        // A fork from a live WORLD replays its origin snapshot's manifest without
+        // hardlinks_verify_groups: the authority there is the live tree, group by group, inside
+        // the replay (5th round). So the symlink has to be refused by the replay itself -- and
+        // by the live-tree check, which followed it just as happily. The world's own `s` leads
+        // to a genuine pair, so the group "is still linked" there; the fork's temporary sits
+        // under a different parent, where the same `s` leads to two files of somebody else's.
+        join(p, sizeof p, worlds, "hlsym-side/d/y");
+        CHECK(unlink(p) == 0);
+        CHECK(link(yx, p) == 0);                 // the verify root's pair: one inode, nlink 2
+        join(p, sizeof p, root, "hlsym-side");
+        CHECK(mkdir(p, 0755) == 0);
+        join(p, sizeof p, root, "hlsym-side/d");
+        CHECK(mkdir(p, 0755) == 0);
+        char yx2[4096], yy2[4096];
+        join(yx2, sizeof yx2, root, "hlsym-side/d/x");
+        write_file(yx2, "farx\n");
+        join(yy2, sizeof yy2, root, "hlsym-side/d/y");
+        write_file(yy2, "fary\n");
+        {
+            struct stat xs;
+            CHECK(lstat(yx2, &xs) == 0);
+            struct timespec ts[2];
+            ts[0] = xs.st_atimespec;
+            ts[1] = xs.st_mtimespec;
+            CHECK(utimensat(AT_FDCWD, yy2, ts, AT_SYMLINK_NOFOLLOW) == 0);
+        }
+        repath_hl_line(yman, 0, "s/x");
+        repath_hl_line(yman, 1, "s/y");
+        wfs_ref yfw = {WFS_K_WORLD, yw1};
+        join(yw2, sizeof yw2, root, "hlsym-w2");
+        memset(&opts, 0, sizeof opts);
+        opts.no_pool = 1;
+        wfs_id yw3 = 0;
+        // The group is dropped (the live tree is allowed to have moved on, and a member behind a
+        // symlink is not a member), so the fork itself succeeds -- and nothing outside it moved.
+        CHECK_OK(wfs_world_create(ys, yfw, yw2, &opts, &yw3));
+        CHECK(ino_of(yx2) != ino_of(yy2));
+        CHECK(nlink_of(yx2) == 1 && nlink_of(yy2) == 1);
+        CHECK_OK(read_file(yy2, buf, sizeof buf));
+        CHECK(!strcmp(buf, "fary\n"));
+
+        CHECK_OK(wfs_world_discard(ys, yw3, 1, 0));
+        CHECK_OK(wfs_world_discard(ys, yw1, 1, 0));
+        wfs_store_close(ys);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", ystore, (unsigned long long)y1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
     // ---- PR #1 review (11th round, P2): a migration that failed is not a migration that ran ----
     //
     // The additive ALTERs used to be fired one by one with their results thrown away, and

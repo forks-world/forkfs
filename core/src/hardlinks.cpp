@@ -3,6 +3,7 @@
 #include "hardlinks.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,12 +22,70 @@ namespace wfs {
 
 namespace {
 
-String joinp(const char *a, const char *b) {
-    String p(a);
-    size_t n = p.size();
-    if (n && p.c_str()[n - 1] != '/') p.append("/");
-    p.append(b);
-    return p;
+// ---- the member path, walked the way it is meant to be read ------------------------------
+//
+// PR #1 review (17th round, P1): a member path is a chain of real NAMES, and a name is not a
+// symlink either. manifest_path_sane() below is lexical -- no leading '/', no `..`, no empty
+// and no `.` component -- and `s/a` passes every one of those when `s` is a symlink to a
+// directory. The syscalls a group is made of then follow it: lstat(2) does not follow the LAST
+// component and follows every one before it, link(2) and rename(2) follow all of them. So
+// hardlinks_verify_groups approved whatever the symlink led to beside the SNAPSHOT and the
+// replay linked and renamed over whatever the same symlink leads to beside the CLONE -- and a
+// relative symlink lands somewhere else in every copy of the tree, because a snapshot's root
+// and a fork's temporary sit at different depths under different parents. A manifest naming
+// `s/x`, `s/y` could therefore be verified against a hardlinked pair planted next to the
+// snapshot and replayed over two files that are not in the clone at all.
+//
+// So the path is walked from the tree root, one component at a time, each opened with
+// O_DIRECTORY|O_NOFOLLOW, and every operation on the leaf is an *at(2) call relative to the
+// parent directory's descriptor. The check and the operation are then the same syscall path --
+// nothing is resolved twice and there is no window in between -- and a symlink component is
+// ELOOP before anything has been created anywhere.
+//
+// O_RDONLY rather than O_SEARCH: the lend in the replay needs fchmod(2) on the descriptor, and
+// a directory that can hold a member was enumerated by readdir(3) in the scan that produced
+// that member's name, so it is readable by construction.
+const int kDirFlags = O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW;
+
+// The tree root itself. Its last component is the caller's own path, never a manifest's: a
+// store-internal directory of ours, or a source the caller has already put through realpath(3)
+// (check_path, PATH_SOURCE). Returns the fd or -errno.
+int open_tree_root(const char *root) {
+    if (!root || !*root) return -EINVAL;
+    int fd = ::open(root, kDirFlags);
+    return fd < 0 ? -errno : fd;
+}
+
+// The directory holding `rel`'s last component, descended from `rootfd`; `leaf` gets that last
+// component. Always a fresh descriptor, so every caller closes what it gets. -ELOOP means a
+// component was a symlink, -ENOTDIR that it was not a directory at all.
+int open_parent(int rootfd, const char *rel, String &leaf) {
+    if (!rel || !*rel) return -EINVAL;
+    int cur = ::dup(rootfd);
+    if (cur < 0) return -errno;
+    for (const char *s = rel;;) {
+        const char *n = ::strchr(s, '/');
+        if (!n) { leaf.assign(s); return cur; }
+        String comp;
+        comp.assign(s, (size_t)(n - s));
+        int nx = ::openat(cur, comp.c_str(), kDirFlags);
+        int e = nx < 0 ? -errno : 0;
+        ::close(cur);
+        if (nx < 0) return e;
+        cur = nx;
+        s = n + 1;
+    }
+}
+
+// lstat(2) of a member, asked of its parent's descriptor: every component above the leaf has
+// been proven a real directory by the descent, and the leaf itself is not followed.
+int member_lstat(int rootfd, const char *rel, struct stat &st) {
+    String leaf;
+    int fd = open_parent(rootfd, rel, leaf);
+    if (fd < 0) return fd;
+    int rc = ::fstatat(fd, leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 ? 0 : -errno;
+    ::close(fd);
+    return rc;
 }
 
 int64_t mtime_ns(const struct stat &st) {
@@ -382,30 +441,36 @@ void hl_tmp_leaf(char *out, size_t cap) {
                (unsigned long long)r);
 }
 
-// `target`'s directory, trailing '/' included. `target` is always joinp(tree_root, rel) and
-// tree_root is absolute, so there is always a '/' to find.
-void dir_prefix(const String &target, String &out) {
-    const char *s = target.c_str();
-    const char *slash = ::strrchr(s, '/');
-    if (!slash) { out.assign("./"); return; }
-    out.assign(s, (size_t)(slash - s) + 1);
-}
-
-// Hardlink `canon` into the directory of `target` under a name of ours. On success `tmp` is
-// that name and the link exists; on failure `errno` says why and nothing was created.
-bool link_under_fresh_name(const char *canon, const String &target, String &tmp) {
-    String dir;
-    dir_prefix(target, dir);
+// Hardlink the canonical file into `dirfd` -- the target's own directory, because rename(2) is
+// only atomic within one -- under a name of ours. On success `tmp` is that name and the link
+// exists; on failure `errno` says why and nothing was created.
+bool link_at_fresh_name(int canon_fd, const char *canon_leaf, int dirfd, String &tmp) {
     for (int t = 0; t < kTmpTries; ++t) {
         char leaf[64];
         hl_tmp_leaf(leaf, sizeof leaf);
-        tmp.assign(dir);
-        tmp.append(leaf);
-        if (::link(canon, tmp.c_str()) == 0) return true;
+        tmp.assign(leaf);
+        // Flag 0, not AT_SYMLINK_FOLLOW: the canonical name has been fstatat'ed as a regular
+        // file through this very descriptor and is linked as itself.
+        if (::linkat(canon_fd, canon_leaf, dirfd, tmp.c_str(), 0) == 0) return true;
         if (errno != EEXIST) return false;
     }
     errno = EEXIST;
     return false;
+}
+
+// link(2) + rename(2), both relative to descriptors the descent opened. `*err` is the negative
+// errno of whichever call failed when this returns false; nothing of ours is left behind.
+bool relink_at(int canon_fd, const char *canon_leaf, int dirfd, const char *leaf, int *err) {
+    String tmp;
+    if (!link_at_fresh_name(canon_fd, canon_leaf, dirfd, tmp)) { *err = -errno; return false; }
+    // rename(2), not unlink+link: the name never stops existing, so a crash or an error here
+    // cannot lose the file.
+    if (::renameat(dirfd, tmp.c_str(), dirfd, leaf) != 0) {
+        *err = -errno;
+        ::unlinkat(dirfd, tmp.c_str(), 0);
+        return false;
+    }
+    return true;
 }
 
 // ---- directories the source made read-only ----------------------------------------------------
@@ -424,7 +489,7 @@ bool link_under_fresh_name(const char *canon, const String &target, String &tmp)
 // threads wide, so the whole lend/link/rename/restore sequence is serialized on one mutex: it
 // costs nothing in the common case, where it never runs at all.
 struct DirLend {
-    String path;
+    int fd = -1;        // borrowed: the caller holds it open for the whole lend
     mode_t mode = 0;
     uint32_t flags = 0;
     bool had_flags = false;
@@ -439,31 +504,34 @@ class LendStack {
         // In reverse, and unconditionally: this runs on the success path and on every error
         // path, so a directory is never left more permissive than we found it.
         for (size_t i = v_.size(); i-- > 0;) {
-            ::chmod(v_[i].path.c_str(), v_[i].mode);
+            ::fchmod(v_[i].fd, v_[i].mode);
 #ifdef __APPLE__
-            if (v_[i].had_flags) ::lchflags(v_[i].path.c_str(), (u_int32_t)v_[i].flags);
+            if (v_[i].had_flags) ::fchflags(v_[i].fd, (u_int32_t)v_[i].flags);
 #endif
         }
     }
-    // Gives `dir` owner write + search. False means the directory could not be read or could not
-    // be changed at all, and the caller fails exactly as it did before.
-    bool lend(const char *dir) {
+    // Gives the directory behind `dirfd` owner write + search. False means it could not be
+    // asked or could not be changed at all, and the caller fails exactly as it did before.
+    // The descriptor is the one the descent opened (17th round), so the directory being lent is
+    // the very directory the link and the rename below will go into -- not a path resolved a
+    // second time.
+    bool lend(int dirfd) {
         struct stat st;
-        if (::lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) return false;
+        if (::fstat(dirfd, &st) != 0 || !S_ISDIR(st.st_mode)) return false;
         DirLend u;
-        u.path.assign(dir);
+        u.fd = dirfd;
         u.mode = (mode_t)(st.st_mode & 07777);
 #ifdef __APPLE__
         u.flags = (uint32_t)st.st_flags;
         u.had_flags = (st.st_flags & (UF_IMMUTABLE | UF_APPEND)) != 0;
         if (u.had_flags &&
-            ::lchflags(dir, (u_int32_t)(st.st_flags & ~(uint32_t)(UF_IMMUTABLE | UF_APPEND))) != 0)
+            ::fchflags(dirfd, (u_int32_t)(st.st_flags & ~(uint32_t)(UF_IMMUTABLE | UF_APPEND))) != 0)
             return false;
 #endif
         mode_t want = (mode_t)(u.mode | S_IWUSR | S_IXUSR);
-        if (want != u.mode && ::chmod(dir, want) != 0) {
+        if (want != u.mode && ::fchmod(dirfd, want) != 0) {
 #ifdef __APPLE__
-            if (u.had_flags) ::lchflags(dir, (u_int32_t)u.flags);
+            if (u.had_flags) ::fchflags(dirfd, (u_int32_t)u.flags);
 #endif
             return false;
         }
@@ -481,40 +549,37 @@ struct Relender {
     Mutex mu;
 };
 
-// link(2) + rename(2) again, with the target's directory lent owner write for their duration.
-// `*err` is the negative errno of whichever call failed when this returns false.
-bool relink_under_lend(Relender &rl, const char *canon, const String &target, int *err) {
+// relink_at() again, with the target's own directory lent owner write for its duration.
+bool relink_under_lend(Relender &rl, int canon_fd, const char *canon_leaf, int dirfd,
+                       const char *leaf, int *err) {
     Guard lk(rl.mu);
-    String dir;
-    dir_prefix(target, dir);
-    if (dir.size() > 1) dir.resize(dir.size() - 1);   // dir_prefix keeps the trailing '/'
     LendStack lend;
-    if (!lend.lend(dir.c_str())) return false;
-    String tmp;
-    if (!link_under_fresh_name(canon, target, tmp)) { *err = -errno; return false; }
-    if (::rename(tmp.c_str(), target.c_str()) != 0) {
-        *err = -errno;
-        ::unlink(tmp.c_str());
-        return false;
-    }
-    return true;
+    if (!lend.lend(dirfd)) return false;
+    return relink_at(canon_fd, canon_leaf, dirfd, leaf, err);
 }
 
 // Every name of the group still exists in the live tree and still shares one inode. Used when
 // the groups come from a snapshot's manifest but the tree being cloned is a world that has been
 // written to since -- the group may have been broken there long ago.
 bool group_still_linked(const char *verify_root, const HardlinkGroup &g) {
+    int rootfd = open_tree_root(verify_root);
+    if (rootfd < 0) return false;
+    bool ok = true;
     struct stat first;
-    String p = joinp(verify_root, g.paths[0].c_str());
-    if (::lstat(p.c_str(), &first) != 0 || !S_ISREG(first.st_mode)) return false;
-    if ((uint64_t)first.st_nlink < (uint64_t)g.paths.size()) return false;
-    for (size_t i = 1; i < g.paths.size(); ++i) {
+    // PR #1 review (17th round, P1): the descent, here too. This is the only check a fork from
+    // a live world makes -- hardlinks_verify_groups does not run on that path, because a live
+    // tree is allowed to have moved on -- so a member behind a symlink was approved against
+    // whatever the symlink leads to in the WORLD and then replayed against whatever it leads to
+    // beside the fork's temporary, which is a different directory entirely.
+    if (member_lstat(rootfd, g.paths[0].c_str(), first) != 0 || !S_ISREG(first.st_mode)) ok = false;
+    else if ((uint64_t)first.st_nlink < (uint64_t)g.paths.size()) ok = false;
+    for (size_t i = 1; ok && i < g.paths.size(); ++i) {
         struct stat st;
-        String q = joinp(verify_root, g.paths[i].c_str());
-        if (::lstat(q.c_str(), &st) != 0) return false;
-        if (st.st_dev != first.st_dev || st.st_ino != first.st_ino) return false;
+        if (member_lstat(rootfd, g.paths[i].c_str(), st) != 0) ok = false;
+        else if (st.st_dev != first.st_dev || st.st_ino != first.st_ino) ok = false;
     }
-    return true;
+    ::close(rootfd);
+    return ok;
 }
 
 // One group. Everything here is the same handful of syscalls whichever thread runs it, and no
@@ -530,6 +595,17 @@ void restore_group(const char *tree_root, const char *verify_root, const Hardlin
     // Every name that is in the clone has to end up on the canonical inode, or the group is not
     // the group any more and whoever writes it down has to know (`broken` above).
     bool whole = true;
+
+    // PR #1 review (17th round, P1): every name below is reached by descending from this
+    // descriptor, one component at a time and never through a symlink (open_parent). A tree
+    // root that cannot be opened at all is what an absent tree has always been here: every name
+    // is missing and the group is not the group the set describes.
+    int rootfd = open_tree_root(tree_root);
+    if (rootfd < 0) {
+        r.missing += (uint64_t)g.paths.size();
+        r.broken.emplace_back((uint64_t)index);
+        return;
+    }
 
     // The canonical file is the first name that is actually there. Promoting the next one
     // matters for a checkpoint of a live world: the first name may have been deleted between
@@ -549,42 +625,65 @@ void restore_group(const char *tree_root, const char *verify_root, const Hardlin
     size_t base = g.paths.size();
     struct stat bst;
     for (size_t i = 0; i < g.paths.size(); ++i) {
-        String c = joinp(tree_root, g.paths[i].c_str());
-        if (::lstat(c.c_str(), &bst) == 0 && S_ISREG(bst.st_mode)) { base = i; break; }
-        r.missing++;
+        int e = member_lstat(rootfd, g.paths[i].c_str(), bst);
+        if (e == 0 && S_ISREG(bst.st_mode)) { base = i; break; }
+        // A name that is not there is `missing`, as it always was; a name that is not a chain
+        // of real directory names is one this replay declines to touch, which is `skipped`.
+        if (e == 0 || e == -ENOENT) r.missing++;
+        else r.skipped++;
         whole = false;
     }
-    if (base == g.paths.size()) { r.broken.emplace_back((uint64_t)index); return; }
+    if (base == g.paths.size()) {
+        ::close(rootfd);
+        r.broken.emplace_back((uint64_t)index);
+        return;
+    }
     {
-        String canon = joinp(tree_root, g.paths[base].c_str());
+        String canon_leaf;
+        int canon_fd = open_parent(rootfd, g.paths[base].c_str(), canon_leaf);
+        if (canon_fd < 0) {
+            ::close(rootfd);
+            r.skipped++;
+            r.broken.emplace_back((uint64_t)index);
+            return;
+        }
         bool linked = false;
         for (size_t i = base + 1; i < g.paths.size(); ++i) {
-            String p = joinp(tree_root, g.paths[i].c_str());
+            String leaf;
+            int pfd = open_parent(rootfd, g.paths[i].c_str(), leaf);
+            if (pfd < 0) {
+                if (pfd == -ENOENT) r.missing++;
+                else r.skipped++;
+                whole = false;
+                continue;
+            }
             struct stat st;
-            if (::lstat(p.c_str(), &st) != 0) { r.missing++; whole = false; continue; }
-            if (st.st_dev == bst.st_dev && st.st_ino == bst.st_ino) { linked = true; continue; }
+            if (::fstatat(pfd, leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) {
+                r.missing++;
+                whole = false;
+                ::close(pfd);
+                continue;
+            }
+            if (st.st_dev == bst.st_dev && st.st_ino == bst.st_ino) {
+                linked = true;
+                ::close(pfd);
+                continue;
+            }
             // Not the file the scan saw any more: leave it alone. Unlinking it would throw away
             // somebody's data to save a few blocks.
             if (!S_ISREG(st.st_mode) || st.st_size != bst.st_size || mtime_ns(st) != mtime_ns(bst)) {
                 r.skipped++;
                 whole = false;
+                ::close(pfd);
                 continue;
             }
-            String tmp;
             int e = 0;
-            bool ok = link_under_fresh_name(canon.c_str(), p, tmp);
-            if (!ok) e = -errno;
-            // rename(2), not unlink+link: the name never stops existing, so a crash or an
-            // error here cannot lose the file.
-            else if (::rename(tmp.c_str(), p.c_str()) != 0) {
-                e = -errno;
-                ::unlink(tmp.c_str());
-                ok = false;
-            }
+            bool ok = relink_at(canon_fd, canon_leaf.c_str(), pfd, leaf.c_str(), &e);
             // The directory refused us, not the file: it is a read-only directory of the
             // source's own making. Lend it owner write for the two calls and put it back.
             if (!ok && (e == -EACCES || e == -EPERM))
-                ok = relink_under_lend(rl, canon.c_str(), p, &e);
+                ok = relink_under_lend(rl, canon_fd, canon_leaf.c_str(), pfd, leaf.c_str(), &e);
+            ::close(pfd);
             if (!ok) {
                 if (!r.first_err) r.first_err = e;
                 r.skipped++;
@@ -594,8 +693,10 @@ void restore_group(const char *tree_root, const char *verify_root, const Hardlin
             r.links++;
             linked = true;
         }
+        ::close(canon_fd);
         if (linked) r.groups++;
     }
+    ::close(rootfd);
     if (!whole) r.broken.emplace_back((uint64_t)index);
 }
 
@@ -653,27 +754,41 @@ int replay_verdict(const HardlinkRestore &r) {
 // the reader looks at survives that, and so does the replay's "same size, same mtime" guard.
 int hardlinks_verify_groups(const char *tree_root, const HardlinkSet &set) {
     if (!tree_root || !*tree_root) return -EINVAL;
-    for (size_t i = 0; i < set.groups.size(); ++i) {
+    if (set.groups.empty()) return 0;
+    // PR #1 review (17th round, P1): the lstats are asked of descriptors this function opens
+    // itself, one path component at a time and never through a symlink. lstat(2) leaves the
+    // last component alone and follows every one before it, so `s/x` with `s` a symlink was
+    // answered by whatever the symlink leads to NEXT TO THE SNAPSHOT -- a hardlinked pair a
+    // manifest's author can plant there -- while the replay, resolving the same relative
+    // symlink from a clone that sits somewhere else entirely, linked and renamed over two files
+    // outside the clone. A member whose parent is not a real directory is now -EINVAL here,
+    // which is WFS_E_SNAPSHOT_DIRTY to every caller, before anything is cloned or linked.
+    int rootfd = open_tree_root(tree_root);
+    if (rootfd < 0) return -EINVAL;
+    int rc = 0;
+    for (size_t i = 0; i < set.groups.size() && !rc; ++i) {
         const HardlinkGroup &g = set.groups[i];
         // Both of these are already refusals in hardlinks_manifest_read; repeated because this
         // function's promise is about the set it was handed, not about where it came from.
-        if (g.paths.size() < 2 || (uint64_t)g.paths.size() != g.nlink) return -EINVAL;
+        if (g.paths.size() < 2 || (uint64_t)g.paths.size() != g.nlink) { rc = -EINVAL; break; }
         struct stat first;
-        String p = joinp(tree_root, g.paths[0].c_str());
-        if (::lstat(p.c_str(), &first) != 0 || !S_ISREG(first.st_mode)) return -EINVAL;
+        if (member_lstat(rootfd, g.paths[0].c_str(), first) != 0 || !S_ISREG(first.st_mode)) {
+            rc = -EINVAL;
+            break;
+        }
         // Exactly, not "at least": a snapshot tree is published with the group's names -- and
         // only those -- on that inode, so a bigger nlink means the tree is not the tree this
         // manifest describes any more. (The live-source check in group_still_linked() is the
         // one that settles for >=, because a live tree may have grown a link of its own.)
-        if ((uint64_t)first.st_nlink != (uint64_t)g.paths.size()) return -EINVAL;
+        if ((uint64_t)first.st_nlink != (uint64_t)g.paths.size()) { rc = -EINVAL; break; }
         for (size_t k = 1; k < g.paths.size(); ++k) {
             struct stat st;
-            String q = joinp(tree_root, g.paths[k].c_str());
-            if (::lstat(q.c_str(), &st) != 0) return -EINVAL;
-            if (st.st_dev != first.st_dev || st.st_ino != first.st_ino) return -EINVAL;
+            if (member_lstat(rootfd, g.paths[k].c_str(), st) != 0) { rc = -EINVAL; break; }
+            if (st.st_dev != first.st_dev || st.st_ino != first.st_ino) { rc = -EINVAL; break; }
         }
     }
-    return 0;
+    ::close(rootfd);
+    return rc;
 }
 
 int hardlinks_restore(const char *tree_root, const HardlinkSet &set, const char *verify_root,
