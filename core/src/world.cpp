@@ -1970,20 +1970,30 @@ int trashing_recover(wfs_store *s, uint64_t *restored, uint64_t *finished) {
         }
         Guard g(s->mu);
         Txn t(s->db);
+        // PR #1 review (9th round), P18: the verdict above was reached by lstat'ing the very
+        // trash_path this row recorded when the scan read it, so the write carries that path as
+        // well as the state. Two recoveries running at once then agree by construction, and a
+        // row whose path changed under us is left for the next pass rather than resolved from a
+        // name nobody uses any more.
         Stmt u(s->db,
                in_trash
                    ? (p.is_snapshot
-                          ? "UPDATE snapshots SET state=2, owner_pid=0, owner_start=0 WHERE id=? AND state=4"
-                          : "UPDATE worlds SET state=2, owner_pid=0, owner_start=0 WHERE id=? AND state=4")
+                          ? "UPDATE snapshots SET state=2, owner_pid=0, owner_start=0"
+                            " WHERE id=? AND state=4 AND trash_path=?"
+                          : "UPDATE worlds SET state=2, owner_pid=0, owner_start=0"
+                            " WHERE id=? AND state=4 AND trash_path=?")
                    : (p.is_snapshot
                           ? "UPDATE snapshots SET state=1, trash_path='', trashed_at=0, owner_pid=0,"
-                            " owner_start=0 WHERE id=? AND state=4"
+                            " owner_start=0 WHERE id=? AND state=4 AND trash_path=?"
                           : "UPDATE worlds SET state=1, trash_path='', trashed_at=0, owner_pid=0,"
-                            " owner_start=0 WHERE id=? AND state=4"));
+                            " owner_start=0 WHERE id=? AND state=4 AND trash_path=?"));
         if (!u.ok()) return -EIO;
         u.i64(1, (int64_t)p.id);
+        u.text(2, p.trash.c_str());
         if (u.step() != SQLITE_DONE) return -EIO;
+        int changed = sqlite3_changes(s->db);
         t.commit();
+        if (!changed) continue;
         if (in_trash) { if (finished) (*finished)++; }
         else if (restored) (*restored)++;
     }
@@ -2425,6 +2435,17 @@ bool gc_tmp_is_removable(wfs_store *s, wfs_id id, const char *p) {
         if (m.world != id || ::strcmp(m.store_id, s->store_id.c_str()) != 0) return false;
     }
     Guard g(s->mu);
+    // PR #1 review (9th round), P18: and the row still has to be the row this job was made from
+    // -- CREATING, still naming this tree. The scan is a snapshot; a fork whose producer this
+    // wake judged dead may have published in the meantime, and the published world's tree is
+    // not gc's to remove.
+    {
+        Stmt r(s->db, "SELECT 1 FROM worlds WHERE id=? AND state=0 AND tmp_path=?");
+        if (!r.ok()) return false;
+        r.i64(1, (int64_t)id);
+        r.text(2, p);
+        if (!r.row()) return false;
+    }
     Stmt q(s->db, "SELECT COUNT(*) FROM worlds WHERE dir_dev=? AND dir_ino=? AND state<>3 AND id<>?");
     if (!q.ok()) return false;
     q.i64(1, (int64_t)st.st_dev);
@@ -2956,8 +2977,15 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
             gc_fail_clear(s, j);
             Guard g(s->mu);
             Txn t(s->db);
-            Stmt d(s->db, "UPDATE worlds SET state=?, tmp_path='' WHERE id=? AND state=0");
-            if (d.ok()) { d.i64(1, WFS_ST_DEAD); d.i64(2, (int64_t)creating[i]); d.step(); }
+            // P18: still CREATING, and still naming the tree this job was made from.
+            Stmt d(s->db,
+                   "UPDATE worlds SET state=?, tmp_path='' WHERE id=? AND state=0 AND tmp_path=?");
+            if (d.ok()) {
+                d.i64(1, WFS_ST_DEAD);
+                d.i64(2, (int64_t)creating[i]);
+                d.text(3, cpaths[i].c_str());
+                d.step();
+            }
             t.commit();
         }
     }

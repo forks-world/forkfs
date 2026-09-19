@@ -406,6 +406,38 @@ int pool_scan(wfs_store *s, Vec<wfs_id> &rows, Vec<String> &trees, Vec<String> &
     return 0;
 }
 
+// PR #1 review (9th round), P18: pool_scan is a snapshot too, and what it dooms is removed one
+// whole clone at a time. So the doom is re-asked of the live row, under the store mutex,
+// immediately before the tree goes: the row must still be there, must still name this tree, and
+// must still fail the same test it failed at scan time. The caller holds s->mu.
+bool pool_row_still_doomed_locked(wfs_store *s, wfs_id id, const String &path) {
+    wfs_id sid = 0;
+    int64_t sat = 0, opid = 0, ostart = 0, made = 0;
+    int state = 0;
+    {
+        Stmt q(s->db, "SELECT snapshot_id, snap_created_at, path, state, owner_pid, owner_start,"
+                      " created_at FROM pool WHERE id=?");
+        if (!q.ok()) return false;
+        q.i64(1, (int64_t)id);
+        if (!q.row()) return false;                                   // claimed, drained, gone
+        if (::strcmp(q.col_text(2), path.c_str())) return false;      // not the tree we queued
+        sid = (wfs_id)q.col_i64(0);
+        sat = q.col_i64(1);
+        state = (int)q.col_i64(3);
+        opid = q.col_i64(4);
+        ostart = q.col_i64(5);
+        made = q.col_i64(6);
+    }
+    if (state != 1)   // still CREATING: doomed only while its filler really is gone
+        return !(producer_alive(opid, ostart) || made > now_sec() - creating_min_age_secs());
+    Stmt snap(s->db, "SELECT created_at, state FROM snapshots WHERE id=?");
+    if (!snap.ok()) return false;
+    snap.i64(1, (int64_t)sid);
+    if (!snap.row()) return true;                             // snapshot gone
+    if (snap.col_i64(1) != WFS_ST_ACTIVE) return true;        // not usable
+    return snap.col_i64(0) != sat;                            // a different snapshot now
+}
+
 // PR #1 review (9th round), P18: the same question pool_scan's `live` answers from a snapshot,
 // asked of the live rows instead -- does any row name this tree right now? A pool row names its
 // path and that path plus `.wfs-tmp` (the name it clones into), and a fork's CREATING world row
@@ -527,6 +559,17 @@ int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us, int *work
     bool out_of_time = false;
     for (size_t i = 0; i < trees.size(); ++i) {
         if (deadline_us && fs_mono_us() >= deadline_us) { out_of_time = true; break; }
+        {
+            // P18: the verdict is re-asked of the live row immediately before the clone goes.
+            Guard g(s->mu);
+            if (!pool_row_still_doomed_locked(s, rows[i], trees[i])) {
+                live.emplace_back(trees[i]);   // and it is not the sweep's to take either
+                String t(trees[i]);
+                t.append(WFS_TMP_SUFFIX);
+                live.emplace_back(t);
+                continue;
+            }
+        }
         String tmp(trees[i]);
         tmp.append(WFS_TMP_SUFFIX);
         int partial = 0;
@@ -555,8 +598,9 @@ int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us, int *work
         gc_fail_clear(s, key.c_str());
         Guard g(s->mu);
         Txn t(s->db);
-        Stmt d(s->db, "DELETE FROM pool WHERE id=?");
-        if (d.ok()) { d.i64(1, (int64_t)rows[i]); d.step(); }
+        // P18: and the row this deletes is the row that named the tree that has just gone.
+        Stmt d(s->db, "DELETE FROM pool WHERE id=? AND path=?");
+        if (d.ok()) { d.i64(1, (int64_t)rows[i]); d.text(2, trees[i].c_str()); d.step(); }
         t.commit();
         ++n;
     }
