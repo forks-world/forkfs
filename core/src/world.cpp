@@ -1328,6 +1328,51 @@ int trash_crash_seam(int phase, int is_snapshot, wfs_id id, const char *trash_pa
     return wfs_test_trash_crash(wfs_test_trash_crash_ctx, phase, is_snapshot, id, trash_path);
 }
 
+// --now: delete the trash entry here instead of leaving it to the collector, which is what
+// `discard --now` has always advertised for a world and (since the 5th round) for a snapshot.
+// The same two steps in the same order as the collector's: rename to *.deleting first, so an
+// interrupted delete is visibly not a world (or a snapshot) any more, record the new name,
+// unlink, and only then is the row DEAD.
+//
+// PR #1 review (6th round): and the entry is followed to whatever name it has right now. The
+// collector renames it to `<name>.deleting` and records that a moment later, so in between --
+// and after any interruption in that window -- the row still names the tree by the name it no
+// longer has and trash_mark_deleting() answers -ENOENT. The world paths read that as "already
+// gone", marked the row DEAD and returned while the collector was still unlinking: `--now`
+// returning before the space was back, and a DEAD row for a tree that is still on disk. The
+// snapshot path already followed the rename; both go through here now, and -ENOENT means what
+// it is supposed to mean -- at neither name, so somebody else finished it.
+int trash_delete_now(wfs_store *s, wfs_id id, int is_snapshot, const String &trash) {
+    String tp(trash);
+    trash_follow_deleting(tp);
+    if (tp.size()) {
+        String deleting;
+        int mrc = trash_mark_deleting(tp.c_str(), deleting);
+        if (mrc && mrc != -ENOENT) return mrc;
+        if (!mrc) {
+            {
+                Guard g(s->mu);
+                Txn t(s->db);
+                Stmt u(s->db, is_snapshot ? "UPDATE snapshots SET trash_path=? WHERE id=?"
+                                          : "UPDATE worlds SET trash_path=? WHERE id=?");
+                if (u.ok()) { u.text(1, deleting.c_str()); u.i64(2, (int64_t)id); u.step(); }
+                t.commit();
+            }
+            if (int rc = trash_unlink(deleting.c_str(), 4, nullptr)) return rc;
+        }
+    }
+    Guard g(s->mu);
+    Txn t(s->db);
+    Stmt u(s->db, is_snapshot ? "UPDATE snapshots SET state=?, trash_path='' WHERE id=?"
+                              : "UPDATE worlds SET state=?, trash_path='' WHERE id=?");
+    if (!u.ok()) return -EIO;
+    u.i64(1, WFS_ST_DEAD);
+    u.i64(2, (int64_t)id);
+    if (u.step() != SQLITE_DONE) return -EIO;
+    t.commit();
+    return 0;
+}
+
 } // namespace
 
 extern "C" int wfs_world_discard(wfs_store *s, wfs_id id, int immediate, int force) {
@@ -1339,31 +1384,15 @@ extern "C" int wfs_world_discard(wfs_store *s, wfs_id id, int immediate, int for
     }
     if (r.state == WFS_ST_TRASHED) {
         if (!immediate) return -EALREADY;
-        // Already in the trash: --now just brings the deletion forward.
+        // Already in the trash: --now just brings the deletion forward -- including over a
+        // collector that has already renamed the entry to `.deleting` under this row
+        // (PR #1 review, 6th round: that used to leave the tree and bury the row).
         String tp;
         {
             Guard g(s->mu);
             if (int rc = world_trash_path(s, id, tp)) return rc;
         }
-        String deleting;
-        if (int rc = trash_mark_deleting(tp.c_str(), deleting)) { if (rc != -ENOENT) return rc; }
-        else {
-            Guard g(s->mu);
-            Txn t(s->db);
-            Stmt u(s->db, "UPDATE worlds SET trash_path=? WHERE id=?");
-            if (u.ok()) { u.text(1, deleting.c_str()); u.i64(2, (int64_t)id); u.step(); }
-            t.commit();
-        }
-        if (deleting.size()) { if (int rc = trash_unlink(deleting.c_str(), 4, nullptr)) return rc; }
-        Guard g(s->mu);
-        Txn t(s->db);
-        Stmt u(s->db, "UPDATE worlds SET state=?, trash_path='' WHERE id=?");
-        if (!u.ok()) return -EIO;
-        u.i64(1, WFS_ST_DEAD);
-        u.i64(2, (int64_t)id);
-        if (u.step() != SQLITE_DONE) return -EIO;
-        t.commit();
-        return 0;
+        return trash_delete_now(s, id, 0, tp);
     }
     if (r.state != WFS_ST_ACTIVE) return -ESTALE;
     // P5: never pull the floor out from under a running `world exec`.
@@ -1412,27 +1441,9 @@ extern "C" int wfs_world_discard(wfs_store *s, wfs_id id, int immediate, int for
     // (c)
     if (int crc = trashing_commit(s, id, 0)) return crc;
     if (!immediate) return 0;
-    {
-        String deleting;
-        if (int frc = trash_mark_deleting(trash.c_str(), deleting)) return frc;
-        {
-            Guard g(s->mu);
-            Txn t(s->db);
-            Stmt u(s->db, "UPDATE worlds SET trash_path=? WHERE id=?");
-            if (u.ok()) { u.text(1, deleting.c_str()); u.i64(2, (int64_t)id); u.step(); }
-            t.commit();
-        }
-        if (int frc = trash_unlink(deleting.c_str(), 4, nullptr)) return frc;
-    }
-    Guard g(s->mu);
-    Txn t(s->db);
-    Stmt u(s->db, "UPDATE worlds SET state=?, trash_path='' WHERE id=?");
-    if (!u.ok()) return -EIO;
-    u.i64(1, WFS_ST_DEAD);
-    u.i64(2, (int64_t)id);
-    if (u.step() != SQLITE_DONE) return -EIO;
-    t.commit();
-    return 0;
+    // The row is TRASHED now, so a collector running beside us may already have picked this
+    // entry up: the same helper, following the same rename (PR #1 review, 6th round).
+    return trash_delete_now(s, id, 0, trash);
 }
 
 namespace {
@@ -1536,37 +1547,6 @@ int snapshot_refs_locked(wfs_store *s, wfs_id id, SnapRefs &out) {
     return 0;
 }
 
-// --now: delete the trash entry here instead of leaving it to the collector, which is what
-// `discard W<n> --now` has always done and what the CLI has always advertised for S<n> as well
-// (PR #1 review). The same two steps in the same order: rename to *.deleting first, so an
-// interrupted delete is visibly not a snapshot any more, then unlink, then the row is DEAD.
-int snapshot_delete_now(wfs_store *s, wfs_id id, const String &trash) {
-    if (trash.size()) {
-        String deleting;
-        int mrc = trash_mark_deleting(trash.c_str(), deleting);
-        if (mrc && mrc != -ENOENT) return mrc;
-        if (!mrc) {
-            {
-                Guard g(s->mu);
-                Txn t(s->db);
-                Stmt u(s->db, "UPDATE snapshots SET trash_path=? WHERE id=?");
-                if (u.ok()) { u.text(1, deleting.c_str()); u.i64(2, (int64_t)id); u.step(); }
-                t.commit();
-            }
-            if (int rc = trash_unlink(deleting.c_str(), 4, nullptr)) return rc;
-        }
-    }
-    Guard g(s->mu);
-    Txn t(s->db);
-    Stmt u(s->db, "UPDATE snapshots SET state=?, trash_path='' WHERE id=?");
-    if (!u.ok()) return -EIO;
-    u.i64(1, WFS_ST_DEAD);
-    u.i64(2, (int64_t)id);
-    if (u.step() != SQLITE_DONE) return -EIO;
-    t.commit();
-    return 0;
-}
-
 } // namespace
 
 extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int force) {
@@ -1589,8 +1569,9 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
             // sending the caller to a store-wide gc. The reference check happened when it was
             // trashed; what is left is the unlink the collector would have done later.
             if (!immediate) return -EALREADY;
-            trash_follow_deleting(tp);   // an interrupted collection is still this row's entry
-            return snapshot_delete_now(s, id, tp);
+            // An interrupted collection is still this row's entry: trash_delete_now() follows
+            // the collector's rename rather than calling the tree gone.
+            return trash_delete_now(s, id, 1, tp);
         }
         if (r.state != WFS_ST_ACTIVE) return -ESTALE;
     }
@@ -1659,7 +1640,7 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
     // (c)
     if (int crc = trashing_commit(s, id, 1)) return crc;
     if (!immediate) return 0;
-    return snapshot_delete_now(s, id, trash);
+    return trash_delete_now(s, id, 1, trash);
 }
 
 // ---- PR #1 review (5th round): resolving a discard that was killed in the middle ---------------

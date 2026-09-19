@@ -916,6 +916,28 @@ rv fs pool status | grep -q "^pool: empty" && ok PR6 "and leaves no ready entry 
 
 rv fs gc --now --retention 0 > /dev/null 2>&1
 
+# ---- PR #1 review (6th round, P2): --now follows a collector that has already renamed ---------
+# The collector's first step is one rename, `W<n>-<t>` -> `W<n>-<t>.deleting`, and it records the
+# new name in a second step. In between -- and after any interruption in that window -- the row
+# still names the tree by the name it no longer has. `discard W<n> --now` read the resulting
+# -ENOENT as "already gone", marked the row DEAD and returned: the space it promised back was
+# still on disk, under a name the row no longer mentioned. Here that window is reproduced by
+# doing the collector's rename by hand.
+rv fs init "$SCRATCH/review-src" --name rv6 > /dev/null 2>&1
+RW6=$(rv fs fork --from S6 --to "$SCRATCH/rv6-world" 2>/dev/null | awk '{print $1}')
+rv fs discard "$RW6" > /dev/null 2>&1
+TE=$(ls -d "$RSTORE"/trash/W*-* 2>/dev/null | head -1)
+mv "$TE" "$TE.deleting"
+out=$(rv fs discard "$RW6" --now 2>&1); rc=$?
+[ "$rc" = 0 ] && ok PR6 "--now on an entry the collector has renamed still returns 0" \
+               || { bad PR6 "--now on an entry the collector has renamed still returns 0 (exit $rc)"; echo "$out" | sed 's/^/        /'; }
+[ ! -e "$TE.deleting" ] && ok PR6 "and the tree is really gone when it returns" \
+                         || { bad PR6 "and the tree is really gone when it returns"; ls "$RSTORE/trash" | sed 's/^/        /'; }
+[ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && ok PR6 "and the trash is empty" \
+                                           || { bad PR6 "and the trash is empty"; ls "$RSTORE/trash" | sed 's/^/        /'; }
+rv fs inspect "$RW6" | grep -q "^state: *dead" && ok PR6 "and the row is dead" \
+                                               || { bad PR6 "and the row is dead"; rv fs inspect "$RW6" | sed 's/^/        /'; }
+
 # ---- PR #1 review (P2): the batch limit bites inside one tree, not only between trees ----------
 # One trash entry of 120k entries -- more than a second of unlinking on this machine -- and a
 # one-second batch. The wake has to come back on time with the tree half deleted, hand over to a
