@@ -1244,6 +1244,45 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第十四轮:同一个文件的第二种拼法,和那个要被拿走的名字(2026-09-20)
+
+第十四轮,Codex 两条,都是 P2,都落在 `core/src/hardlinks.cpp`。两条凑在一起是同一句话的两面:
+**清单里的名字必须和树里的名字一一对应**。一条是名字可以有第二种拼法(`./d/a`、`d//a` 和
+`d/a` 是同一个文件),前面十一轮那道"名字不许重复"于是形同虚设;另一条是树里那个名字
+**本来就要被拿走**(checkpoint 会把克隆里的 `.world` 标记删掉),而扫描把它当成了树的一部分。
+**一条一个提交、一个测试,先验证过"没有修复就会红"。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P2 `PRRT_kwDOUf7jGc6kCZpO` | `hardlinks.cpp` `manifest_path_sane()` | 第十一轮只拒了开头的 `/` 和 `..` 分量,于是同一个文件还剩两种拼法:`./d/a` 和 `d//a`,对任何一次系统调用都是 `d/a`,对清单上的每一道检查却是三个不同的字符串。这正是**第十一轮那种"成员重复"换了个拼法**——`(d/a, ./d/a)` 是两个成员、互不相同、组的 `nlink` 声明的就是 2,连第十三轮问树的那一道也放行:两个名字 `lstat` 到同一个 inode、那个 inode 的 `st_nlink` 确实是 2,**因为它们本来就是一个名字**。重放于是发现第二个成员已经在正身那个 inode 上,记成"已链好"就收工,真正的 `d/b` 在 fork 出来的 World 里还是一个独立文件——快照宣称的组,它自己的树里没有 | **每一个分量都必须是一个名字**:不许为空(这一条顺带管了 `a//b`、结尾的 `/`,和本来就拒掉的开头 `/`),也不许是 `.` 或 `..`。写者写不出别的东西来——成员就是 `fs_walk_tree` 的 `rel`,由 readdir 出来的名字拼接而成,而 `readdir(3)`(显式跳过点目录项)和 `getattrlistbulk(2)`(从来不返回它们)都不会给出 `.`、`..` 或空名字,所以**这个库写过的任何一份清单都不会因此读不回来**。`hardlinks_verify_groups()` 里不再加第二道机制:有了这条,一组里的两个成员不可能再是同一个文件的两种拼法,`lstat` 之后再做一次规范化比对已经无事可做 | `b15c7fc` |
+| P2 `PRRT_kwDOUf7jGc6kCZpT` | `hardlinks.cpp` 扫描 + 重放里那个"成员不在"的分支 | checkpoint 克隆完活 World 之后会把克隆里的 `.world` 标记 `unlink` 掉——源 World 的身份不是这个快照的身份。可收集硬链接组的那一趟扫描是**连标记一起**走的:标记被人硬链接过(备份副本、内容寻址的存储、隔壁树的 `cp -al`;在工作区里再平常不过,World 的身份校验也不在乎),它就和它的孪生名字进了同一个组。重放随后发现标记在克隆里没了,记了一笔 `missing`,却**没有把 `whole` 置否**,于是这个组留在清单里、留在 `hl_groups` 上。快照发布了,而从那一刻起每一次 `verify`、每一次 fork 都会去 `lstat` 一个树里根本没有的成员:`WFS_E_SNAPSHOT_DIRTY`,永远,发生在一个从来没有损坏过的快照上 | **两半都补,因为它们管的不是一回事。**(1)`hardlinks_scan()` 多收一个"调用方待会儿要拿走的那个相对名",`wfs_snapshot_create` 传 `WFS_MARKER_NAME`——和它 `unlink` 的**正好是同一个名字**,所以子 World 里的 `.world`(不会被删)原样保留。标记于是既不进分组、也不计进 `hardlinks`;留下的那个孪生名字所在的 inode,链接数就比树内找到的名字多——那正是**外部组**,计数而不认领,和这个库一贯的做法一致。(2)重放时**不在克隆里的成员一律把组判为 broken**,`wfs_snapshot_create` 把它从清单和 `hl_groups` 上一起去掉(第五轮那条规矩:快照只说自己那棵树有的东西)。这一半管的是别的——快照创建从克隆里拿走的任何东西,以及活源树在"扫描"和"克隆"之间消失的成员(源端那道核对看不见它,因为去问源树时它还在)。fork 和 pool 填充从不读 `broken`,它们的克隆照发,所以除快照创建外没有任何行为变化 | `4e8f726` |
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **243 passed, 0 failed**;`check-deps.sh` 全绿。
+(`m1_criteria.sh` 本轮跳过。)
+
+先把测试跑红过:
+
+- **拼法(P2)**:一个 `(d/a, d/b)` 的快照,把清单里 `d/b` 那一行的路径分别换成 `./d/a`、
+  `d//a`、`d/a/`(头、组号、nlink、行数一个都没动)。老代码:`./d/a` 和 `d//a` 两种拼法
+  `verify` 都回 **0**、`wfs_world_create` 都回 **0**,发布出来的 World 里 `d/a` 和 `d/b` 是
+  两个 inode、`nlink` 各为 1——快照宣称的那个组不在树里。新代码三种拼法都是
+  `WFS_E_SNAPSHOT_DIRTY`。(`d/a/` 本来就被第十三轮那道问树的检查挡住了:对一个普通文件用
+  结尾带斜杠的路径 `lstat`,回的是 ENOTDIR。)
+- **标记(P2)**:一个把 `.world` 硬链接到普通名字 `m` 的 World,外加一对普通硬链接做对照。
+  老代码:checkpoint **发布成功**,`hl_groups=2`、`hl_external=0`、`hardlinks=4`,紧接着
+  `wfs_snapshot_verify` 和 `wfs_world_create` **都回 `-1008`**(`WFS_E_SNAPSHOT_DIRTY`)。
+  新代码:`hl_groups=1`、`hl_external=1`、`hardlinks=3`,`verify` 干净,fork 成功。
+
+新增测试:
+
+- `core_test`(拼法):三种拼法各自要让 `verify`、`wfs_world_create`、`wfs_pool_fill` 三条路
+  都回 `WFS_E_SNAPSHOT_DIRTY`,`--to` 上什么都没有、克隆没留下、世界表没多行、pool 还是空的;
+  把清单换回原样,同一个快照照旧 fork 成功、那一对重新链上、内容还是 `aaaa`。
+- `core_test`(标记):checkpoint 之后查 `hl_groups` / `hl_external` / `hardlinks` 三个数
+  (这三个数把"扫描那一半"钉死),`verify` 干净;掀开 gate 看快照树本身——标记没了、`m` 是
+  自己一个 inode、对照那一对是一个 inode 两个名字;再 fork(直接克隆和 pool 条目两条路都走),
+  那一对重新链上,`m` 是 `nlink` 1 的普通文件,和 fork 自己那个新写的 `.world` 不是一个 inode。
+
 #### PR #1 review 第十三轮:看不了不是空的,数对了不是真的(2026-09-20)
 
 第十三轮,Codex 两条:一条 P1、一条 P2。两条各自是前面两轮的延伸,而且都是同一种错觉——
