@@ -497,6 +497,51 @@ static void restore_before_delete(void *ctx, int is_snapshot, wfs_id row, const 
     g_del_rc = wfs_world_restore(g_del_store, g_del_world);
 }
 
+// PR #1 review (15th round, P1): the same window, entered by a restore that stops in the middle
+// of itself -- row committed in WFS_ST_TRASHING, tree still sitting in the trash under its own
+// name. That is the state the collector's claim has to lose to: the rename it is about to make
+// would succeed (the tree is exactly where the job says it is) while the row that authorised it
+// has stopped being TRASHED. The restoring process dies there (crash_at(2) records an owner that
+// is not running), because the disk state between a restore's row and its rename is the same
+// whether that process carries on or not, and both endings need the tree.
+static wfs_store *g_half_store = NULL;
+static wfs_id g_half_world;
+static int g_half_ran;
+static int g_half_rc;
+static char g_half_path[4096];
+static void restore_half_before_delete(void *ctx, int is_snapshot, wfs_id row, const char *path) {
+    (void)ctx;
+    if (is_snapshot || row != g_half_world) return;
+    g_half_ran++;
+    snprintf(g_half_path, sizeof g_half_path, "%s", path ? path : "");
+    wfs_test_trash_crash = trash_crash;
+    crash_at(2);
+    g_half_rc = wfs_world_restore(g_half_store, g_half_world);
+    crash_at(-1);
+    wfs_test_trash_crash = NULL;
+}
+
+// PR #1 review (15th round, P1): and the mirror order -- the restore's row first, the collector's
+// claim second. A whole `wfs_gc` on a second handle, run inside the restore's window; it must
+// leave the tree exactly where it is, and the restore then carries on to its end, which is why
+// this returns 0 rather than the seam's usual -EINTR.
+static wfs_store *g_mirror_store = NULL;
+static int g_mirror_ran;
+static int g_mirror_rc = -1;
+static wfs_gc_report g_mirror_rep;
+static int gc_inside_restore(void *ctx, int phase, int is_snapshot, wfs_id id,
+                             const char *trash_path) {
+    (void)ctx;
+    (void)is_snapshot;
+    (void)id;
+    if (phase != 2) return 0;
+    g_mirror_ran++;
+    snprintf(g_trash_crash_path, sizeof g_trash_crash_path, "%s", trash_path ? trash_path : "");
+    memset(&g_mirror_rep, 0, sizeof g_mirror_rep);
+    g_mirror_rc = wfs_gc(g_mirror_store, 0, &g_mirror_rep);
+    return 0;
+}
+
 // PR #1 review (9th round, P1): reconciliation's window. The seam runs between the scan that
 // found an ACTIVE row with no tree at its recorded path and the update that buries it; what it
 // does in there is `world fs verify <the new path>`, which is how a world that was merely moved
@@ -559,6 +604,32 @@ static int restore_before_now(void *ctx, int phase, int is_snapshot, wfs_id id,
     if (phase != 4 || g_now_ran) return 0;
     g_now_ran++;
     g_now_rc = wfs_world_restore(g_now_store, g_now_world);
+    return 0;
+}
+
+// PR #1 review (15th round, P1): the same window, entered by a restore that stops in the middle
+// of itself -- row in WFS_ST_TRASHING, tree still in the trash. `--now` used to rename it to
+// `.deleting` out here, discover on the UPDATE behind the rename that the row was not its row
+// any more, and return -ESTALE having already made the world unrestorable. The claim is one
+// transaction with the row now, so the loser does nothing at all.
+static wfs_store *g_nowhalf_store = NULL;
+static wfs_id g_nowhalf_world;
+static int g_nowhalf_ran;
+static int g_nowhalf_rc;
+static char g_nowhalf_path[4096];
+static int restore_half_before_now(void *ctx, int phase, int is_snapshot, wfs_id id,
+                                   const char *trash_path) {
+    (void)ctx;
+    (void)is_snapshot;
+    (void)id;
+    if (phase != 4 || g_nowhalf_ran) return 0;
+    g_nowhalf_ran++;
+    snprintf(g_nowhalf_path, sizeof g_nowhalf_path, "%s", trash_path ? trash_path : "");
+    wfs_test_trash_crash = trash_crash;
+    crash_at(2);
+    g_nowhalf_rc = wfs_world_restore(g_nowhalf_store, g_nowhalf_world);
+    crash_at(-1);
+    wfs_test_trash_crash = NULL;   // and `--now` carries on into its claim
     return 0;
 }
 
@@ -2497,6 +2568,78 @@ int main() {
         CHECK_OK(read_file(p, buf, sizeof buf));
         CHECK(!strcmp(buf, "one\n"));            // the tree came home whole
 
+        // ---- PR #1 review (15th round, P1): the claim is the rename, and it is the row's -----
+        //
+        // The case above is the restore that got all the way home: the collector's rename then
+        // answers -ENOENT and there is nothing to lose. This is the one where it did not. The
+        // restore commits its row in TRASHING and dies before the rename, so the tree is still
+        // in the trash under the name the collector queued -- and the collector's rename, made
+        // outside any transaction, used to succeed there: the conditional UPDATE behind it
+        // matched nothing (the row is not TRASHED any anymore) and the unlink went ahead
+        // regardless. A world one `restore` away from coming back, deleted.
+        CHECK_OK(wfs_world_discard(ca, cw1, 0, 0));
+        CHECK_OK(wfs_world_info(ca, cw1, &cwr));
+        CHECK(cwr.state == WFS_ST_TRASHED && !exists(cw));
+        g_half_store = ca;
+        g_half_world = cw1;
+        g_half_ran = 0;
+        g_half_rc = 0;
+        g_half_path[0] = 0;
+        wfs_test_before_trash_delete = restore_half_before_delete;
+        memset(&crep, 0, sizeof crep);
+        CHECK_OK(wfs_gc(cb, 0, &crep));
+        wfs_test_before_trash_delete = NULL;
+        CHECK(g_half_ran == 1);
+        CHECK_RC(g_half_rc, -EINTR);              // the restore died between its row and its rename
+        CHECK(g_half_path[0]);
+        // The collector claimed nothing: no rename, no `.deleting` name, no unlink, and no row
+        // write either. The entry is not trash it may touch -- it is a restore in flight.
+        CHECK(exists(g_half_path));
+        join(p, sizeof p, g_half_path, "a.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "one\n"));
+        char cdel[4200];
+        snprintf(cdel, sizeof cdel, "%s.deleting", g_half_path);
+        CHECK(!exists(cdel));
+        CHECK(crep.worlds_deleted == 0 && crep.trash_orphans == 0 && crep.trash_failed == 0);
+        CHECK_OK(wfs_world_info(ca, cw1, &cwr));
+        CHECK(cwr.state == WFS_ST_TRASHING);
+        // ... and because the tree is still there, the interrupted restore resolves the way it
+        // always did -- back to TRASHED -- and the world comes home whole.
+        wfs_store *cc = NULL;
+        CHECK_OK(wfs_store_open(cstore, &cc));    // the open runs the TRASHING recovery
+        CHECK_OK(wfs_world_info(cc, cw1, &cwr));
+        CHECK(cwr.state == WFS_ST_TRASHED);
+        CHECK_OK(wfs_world_restore(cc, cw1));
+        CHECK_OK(wfs_world_info(cc, cw1, &cwr));
+        CHECK(cwr.state == WFS_ST_ACTIVE && cwr.present && exists(cw));
+        join(p, sizeof p, cw, "a.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "one\n"));
+        wfs_store_close(cc);
+
+        // ---- and the mirror order: the restore's row first, the collector second -------------
+        //
+        // A whole gc, on a handle of its own, inside the restore's own window. The row is
+        // TRASHING and its owner is alive, so there is no job to queue and no orphan to sweep;
+        // the restore then finishes normally.
+        CHECK_OK(wfs_world_discard(ca, cw1, 0, 0));
+        g_mirror_store = cb;
+        g_mirror_ran = 0;
+        g_mirror_rc = -1;
+        wfs_test_trash_crash = gc_inside_restore;
+        CHECK_OK(wfs_world_restore(ca, cw1));
+        wfs_test_trash_crash = NULL;
+        CHECK(g_mirror_ran == 1);
+        CHECK_OK(g_mirror_rc);
+        CHECK(g_mirror_rep.worlds_deleted == 0 && g_mirror_rep.trash_orphans == 0 &&
+              g_mirror_rep.trash_failed == 0);
+        CHECK_OK(wfs_world_info(ca, cw1, &cwr));
+        CHECK(cwr.state == WFS_ST_ACTIVE && cwr.present && exists(cw));
+        join(p, sizeof p, cw, "a.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "one\n"));
+
         // And the ordinary case is untouched: discard it again and the collector takes it.
         CHECK_OK(wfs_world_discard(ca, cw1, 0, 0));
         memset(&crep, 0, sizeof crep);
@@ -3017,6 +3160,39 @@ int main() {
         CHECK_OK(read_file(p, buf, sizeof buf));
         CHECK(!strcmp(buf, "one\n"));            // the tree came home whole
         CHECK_OK(wfs_world_diff(ma, mw1, 0, NULL, NULL));
+
+        // PR #1 review (15th round, P1): and the restore that did not get all the way home. Its
+        // row is TRASHING and its tree is still in the trash under the name `--now` followed, so
+        // the rename would succeed -- and the -ESTALE below has to be an -ESTALE that did
+        // nothing, not one reported after the tree was already renamed out from under a
+        // restorable world.
+        CHECK_OK(wfs_world_discard(ma, mw1, 0, 0));
+        g_nowhalf_store = mb;
+        g_nowhalf_world = mw1;
+        g_nowhalf_ran = 0;
+        g_nowhalf_rc = 0;
+        g_nowhalf_path[0] = 0;
+        wfs_test_trash_crash = restore_half_before_now;
+        CHECK_RC(wfs_world_discard(ma, mw1, 1, 0), -ESTALE);
+        wfs_test_trash_crash = NULL;
+        CHECK(g_nowhalf_ran == 1);
+        CHECK_RC(g_nowhalf_rc, -EINTR);           // the restore died between its row and its rename
+        CHECK(g_nowhalf_path[0] && exists(g_nowhalf_path));
+        char mdel[4200];
+        snprintf(mdel, sizeof mdel, "%s.deleting", g_nowhalf_path);
+        CHECK(!exists(mdel));
+        join(p, sizeof p, g_nowhalf_path, "a.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "one\n"));
+        // The interrupted restore resolves the way it always did, and the world comes back.
+        wfs_store *mc = NULL;
+        CHECK_OK(wfs_store_open(mstore, &mc));    // the open runs the TRASHING recovery
+        CHECK_OK(wfs_world_info(mc, mw1, &mwr));
+        CHECK(mwr.state == WFS_ST_TRASHED);
+        CHECK_OK(wfs_world_restore(mc, mw1));
+        CHECK_OK(wfs_world_info(mc, mw1, &mwr));
+        CHECK(mwr.state == WFS_ST_ACTIVE && mwr.present && exists(mw));
+        wfs_store_close(mc);
 
         // And the ordinary `--now` is untouched, from both of its two entry points: straight
         // from ACTIVE, and brought forward on a world that is already in the trash.

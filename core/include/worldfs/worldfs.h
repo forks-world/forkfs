@@ -789,7 +789,12 @@ extern void *wfs_test_trash_crash_ctx;
  * `row` is 0 for a directory in the trash that no row claims. What a test does in there is win
  * the race the collector has to survive -- restore the world it is holding -- and what has to
  * happen next is that the collector notices and leaves the entry alone. NULL unless a test sets
- * it; nothing in the library ever assigns it. */
+ * it; nothing in the library ever assigns it.
+ *
+ * PR #1 review (15th round): it sits one step later than it used to -- after the cheap re-check
+ * of the row and immediately before the transaction that claims the entry by renaming it. That
+ * is the window that had to be closed: a restore which commits its row in TRASHING in there and
+ * has not yet renamed the tree home leaves the tree exactly where the collector expects it. */
 extern void (*wfs_test_before_trash_delete)(void *ctx, int is_snapshot, wfs_id row,
                                             const char *path);
 extern void *wfs_test_before_trash_delete_ctx;

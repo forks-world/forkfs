@@ -566,6 +566,19 @@ void trash_follow_deleting(String &tp) {
     if (exists(d.c_str())) tp = d;
 }
 
+// Step 0, and the reason it is a step of its own (PR #1 review, 15th round): a `<name>.deleting`
+// left beside the entry by an earlier, interrupted attempt is folded into this one -- and folding
+// it means removing a tree, which is minutes of work, while the rename below now happens under
+// the store's write lock. So the caller does this first, outside the lock. It is safe out there:
+// a `.deleting` tree is one no restore will touch and one that belongs to this entry either way
+// (claim_trash_paths). Both callers of trash_mark_deleting() call it.
+void trash_fold_leftover(const char *path) {
+    if (ends_with(path, WFS_DELETING_SUFFIX)) return;
+    String d(path);
+    d.append(WFS_DELETING_SUFFIX);
+    if (exists(d.c_str())) wfs::fs_remove_tree(d.c_str());
+}
+
 // Step 1. `out` receives the name the tree now has (which may be the one it already had).
 // PR #1 review (12th round): -ENOENT out of here means "at neither name, so somebody else
 // finished it", and both of its callers bury the row on it. It was a bool over lstat(2), so an
@@ -584,8 +597,8 @@ int trash_mark_deleting(const char *path, String &out) {
     }
     String d(path);
     d.append(WFS_DELETING_SUFFIX);
-    // A leftover from an earlier, interrupted attempt: fold it into this one.
-    if (exists(d.c_str())) wfs::fs_remove_tree(d.c_str());
+    // A leftover from an earlier, interrupted attempt is trash_fold_leftover()'s job, and the
+    // caller has already done it outside the lock this runs under (15th round).
     if (int rc = wfs::fs_rename(path, d.c_str())) return rc;
     out = d;
     return 0;
@@ -1505,36 +1518,53 @@ int trash_crash_seam(int phase, int is_snapshot, wfs_id id, const char *trash_pa
 // mark then answers -ENOENT ("already gone"), and the final UPDATE -- which had no predicate at
 // all -- buried the world that had just come back. Zero rows changed is -ESTALE, never 0: the
 // caller is told its `--now` did not happen rather than told the tree is gone.
+// PR #1 review (15th round), P1: and the predicate on the *first* of those two writes moved into
+// the transaction that makes the rename, because the rename is the claim -- see
+// gc_claim_deleting(). The row is re-read there, the tree is renamed there, and the new name is
+// recorded there; a restore that has taken the row to TRASHING wins or loses that transaction
+// whole, and never in between.
 int trash_delete_now(wfs_store *s, wfs_id id, int is_snapshot, const String &trash) {
     String expect(trash);   // the trash_path this call is acting on behalf of
     String tp(trash);
     trash_follow_deleting(tp);
     if (int hrc = trash_crash_seam(4, is_snapshot, id, tp.c_str())) return hrc;
     if (tp.size()) {
+        trash_fold_leftover(tp.c_str());   // outside the lock below: this one can take minutes
         String deleting;
-        int mrc = trash_mark_deleting(tp.c_str(), deleting);
-        if (mrc && mrc != -ENOENT) return mrc;
-        if (!mrc) {
-            if (::strcmp(deleting.c_str(), expect.c_str())) {
-                Guard g(s->mu);
-                Txn t(s->db);
-                Stmt u(s->db,
-                       is_snapshot
-                           ? "UPDATE snapshots SET trash_path=? WHERE id=? AND state=2 AND trash_path=?"
-                           : "UPDATE worlds SET trash_path=? WHERE id=? AND state=2 AND trash_path=?");
+        int mrc;
+        {
+            // PR #1 review (15th round, P1): the collector's claim, made the same way here. The
+            // rename used to happen out here and the UPDATE behind it to be the conditional one,
+            // which left `--now` the same window gc_claim_deleting() closes: a `restore W<n>`
+            // that has committed its row in TRASHING and not yet renamed the tree home would
+            // find the tree renamed to `.deleting` under it, and fall back to TRASHED with
+            // nothing left to restore. Row and rename are one transaction now, and because
+            // restore's step (a) is BEGIN IMMEDIATE too, the loser of the two does nothing at
+            // all: -ESTALE, tree untouched.
+            Guard g(s->mu);
+            Txn t(s->db);
+            Stmt q(s->db, is_snapshot ? "SELECT state, trash_path FROM snapshots WHERE id=?"
+                                      : "SELECT state, trash_path FROM worlds WHERE id=?");
+            if (!q.ok()) return -EIO;
+            q.i64(1, (int64_t)id);
+            if (!q.row() || q.col_i64(0) != WFS_ST_TRASHED ||
+                ::strcmp(q.col_text(1), expect.c_str()))
+                return -ESTALE;
+            mrc = trash_mark_deleting(tp.c_str(), deleting);
+            if (mrc && mrc != -ENOENT) return mrc;
+            if (!mrc && ::strcmp(deleting.c_str(), expect.c_str())) {
+                // Unconditional: the SELECT above read this row in this transaction.
+                Stmt u(s->db, is_snapshot ? "UPDATE snapshots SET trash_path=? WHERE id=?"
+                                          : "UPDATE worlds SET trash_path=? WHERE id=?");
                 if (!u.ok()) return -EIO;
                 u.text(1, deleting.c_str());
                 u.i64(2, (int64_t)id);
-                u.text(3, expect.c_str());
                 if (u.step() != SQLITE_DONE) return -EIO;
-                int changed = sqlite3_changes(s->db);
-                t.commit();
-                // The row moved on between the lstat and the rename. The tree now wears the
-                // `.deleting` name, which is a name no restore will touch and the next collector
-                // finishes -- so stop here rather than unlink a tree this row no longer owns.
-                if (!changed) return -ESTALE;
                 expect = deleting;
             }
+            t.commit();
+        }
+        if (!mrc) {
             if (int rc = trash_unlink(deleting.c_str(), 4, nullptr)) return rc;
         }
     }
@@ -2902,21 +2932,66 @@ bool mark_dead(wfs_store *s, const TrashJob &j) {
     return changed;
 }
 
-bool set_trash_path(wfs_store *s, const TrashJob &j, const char *p) {
-    if (!j.row) return false;
+// PR #1 review (15th round, P1): the rename to `<name>.deleting` IS the collector's claim on the
+// entry, so it happens inside the transaction that checks the claim -- not after it.
+//
+// It used to be three separate steps: trash_row_still_ours() read the row, the rename followed,
+// and a conditional UPDATE recorded the new name. A `restore W<n>` landing between the first two
+// took the row to TRASHING under BEGIN IMMEDIATE and had not yet renamed the tree home, so the
+// collector's rename found the tree exactly where its job said it was and succeeded; the UPDATE
+// behind it then matched nothing (the row is not TRASHED any more) and the unlink went ahead all
+// the same. The restore's own rename then failed -- the tree is at the `.deleting` name -- and it
+// fell back to TRASHED: a restorable world, deleted, with a row still offering to restore it.
+//
+// Both sides now take the SQLite write lock: restore's step (a) is BEGIN IMMEDIATE and so is
+// this, so the two serialise. Either the restore is first, and this re-read sees TRASHING and
+// claims nothing; or this is first, and the restore sees the row naming `.deleting`
+// (trash_is_deleting -> WFS_E_TRASH_DELETING) with its tree untouched. What is held across the
+// rename is one rename(2) inside one transaction -- microseconds, and no tree removal: the
+// leftover fold that could take minutes is trash_fold_leftover(), done by the caller outside.
+//
+// A crash between the rename and the commit leaves the row naming the old name with the tree at
+// the new one, which is the state trash_follow_deleting() already resolves: both names belong to
+// the row.
+//
+// Returns 0 with `deleting` set to the name the tree now has, 1 if the entry is not the
+// collector's any more, -ENOENT if it is at neither name, and any other errno as itself.
+int gc_claim_deleting(wfs_store *s, TrashJob &j, String &deleting) {
     Guard g(s->mu);
     Txn t(s->db);
-    Stmt u(s->db,
-           j.is_snapshot ? "UPDATE snapshots SET trash_path=? WHERE id=? AND state=2 AND trash_path=?"
-                         : "UPDATE worlds SET trash_path=? WHERE id=? AND state=2 AND trash_path=?");
-    if (!u.ok()) return false;
-    u.text(1, p);
-    u.i64(2, (int64_t)j.row);
-    u.text(3, j.row_path.c_str());
-    if (u.step() != SQLITE_DONE) return false;
-    bool changed = sqlite3_changes(s->db) != 0;
+    if (j.row) {
+        Stmt q(s->db, j.is_snapshot ? "SELECT state, trash_path FROM snapshots WHERE id=?"
+                                    : "SELECT state, trash_path FROM worlds WHERE id=?");
+        if (!q.ok()) return -EIO;
+        q.i64(1, (int64_t)j.row);
+        if (!q.row() || q.col_i64(0) != WFS_ST_TRASHED ||
+            ::strcmp(q.col_text(1), j.row_path.c_str()))
+            return 1;
+    } else if (trash_path_claimed_locked(s, j.path.c_str())) {
+        // P18: an orphan has no row to claim, so what it re-asks is "does any row name this
+        // tree now?" -- and it asks it in here, under the same write lock, because a `discard`
+        // commits its TRASHING row before it renames its tree into the trash. Asking outside
+        // left the window this whole helper exists to close, one step earlier in the protocol.
+        return 1;
+    }
+    int rc = trash_mark_deleting(j.path.c_str(), deleting);
+    if (rc) return rc;   // including -ENOENT: the Txn destructor rolls back, no row was written
+    if (j.row && ::strcmp(deleting.c_str(), j.row_path.c_str())) {
+        // The row's own name for the tree, kept current. Unconditional on purpose: the SELECT
+        // above read this row in this transaction, so there is nothing left that could have
+        // changed it. If the write itself fails the rollback leaves the row naming the old name,
+        // which trash_follow_deleting() resolves on the next wake.
+        Stmt u(s->db,
+               j.is_snapshot ? "UPDATE snapshots SET trash_path=? WHERE id=?"
+                             : "UPDATE worlds SET trash_path=? WHERE id=?");
+        if (!u.ok()) return -EIO;
+        u.text(1, deleting.c_str());
+        u.i64(2, (int64_t)j.row);
+        if (u.step() != SQLITE_DONE) return -EIO;
+        j.row_path.assign(deleting.c_str());
+    }
     t.commit();
-    return changed;
+    return 0;
 }
 
 // Is this job still the collector's to do? Read under the store mutex immediately before the
@@ -2974,23 +3049,21 @@ void gc_fail_clear(wfs_store *s, const TrashJob &j) {
 // was done to it and nothing may be counted or reported for it.
 int gc_delete_one(wfs_store *s, TrashJob &j, int threads, uint64_t *entries_freed,
                   int64_t deadline_us, int *partial) {
+    // The cheap question first, on a read: most jobs that are not the collector's any more are
+    // settled here, without taking the store's write lock at all. It is not the one that
+    // decides -- gc_claim_deleting() asks it again inside the transaction that renames.
+    if (!trash_row_still_ours(s, j)) return 1;
     if (wfs_test_before_trash_delete)
         wfs_test_before_trash_delete(wfs_test_before_trash_delete_ctx, j.is_snapshot, j.row,
                                      j.path.c_str());
-    if (!trash_row_still_ours(s, j)) return 1;
+    trash_fold_leftover(j.path.c_str());   // outside the lock: this one can take minutes
     String deleting;
-    int rc = trash_mark_deleting(j.path.c_str(), deleting);
-    // Not at either name. Somebody deleted it -- or a restore renamed it home between the check
-    // above and this rename, which is why burying the row is conditional on the row still being
-    // the one that was queued.
+    int rc = gc_claim_deleting(s, j, deleting);
+    if (rc == 1) return 1;
+    // Not at either name. Somebody deleted it -- or a restore renamed it home before the claim,
+    // which is why burying the row is conditional on the row still being the one that was queued.
     if (rc == -ENOENT) return mark_dead(s, j) ? 0 : 1;
     if (rc) return rc;
-    if (::strcmp(deleting.c_str(), j.path.c_str())) {
-        // Record the new name. A row that moved on since the check refuses this, and the record
-        // is then lost -- but both names belong to the row either way (claim_trash_paths), so
-        // the next scan follows the rename and finds the tree again.
-        if (set_trash_path(s, j, deleting.c_str())) j.row_path.assign(deleting.c_str());
-    }
     if ((rc = trash_unlink(deleting.c_str(), threads, entries_freed, deadline_us, partial)))
         return rc;
     if (partial && *partial) return 0;
