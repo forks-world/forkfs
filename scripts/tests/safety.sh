@@ -45,6 +45,14 @@ check() {
     local out; out=$("$@" 2>&1); local rc=$?
     if [ "$rc" = "$want" ]; then ok "$rule" "$desc"; else bad "$rule" "$desc (exit $rc, wanted $want)"; echo "$out" | sed 's/^/        /'; fi
 }
+# PR #1 review (7th round): a 120k-entry tree, made once and then cloned. clonefile(2) on a
+# directory takes the whole subtree in about a second, where `cp -Rc` copies it entry by entry
+# and takes fifteen -- and what the deadline cases below need is a big tree, not a slow test.
+clone_tree() {
+    python3 -c 'import ctypes, sys
+sys.exit(0 if ctypes.CDLL("/usr/lib/libSystem.B.dylib").clonefile(sys.argv[1].encode(), sys.argv[2].encode(), 0) == 0 else 1)' "$1" "$2"
+}
+
 # The refusal has to say what to do instead, not just complain.
 has_hint() {
     local rule=$1 desc=$2 needle=$3; shift 4
@@ -1128,6 +1136,84 @@ if command -v sqlite3 > /dev/null 2>&1; then
     fi
     h7 fs gc --status | grep -q "^abandoned:" && bad PR7 "and stops counting it" \
                                               || ok PR7 "and stops counting it"
+fi
+
+
+# ---- PR #1 review (7th round, P2): the gc deadline reaches the cheap half's own trees ---------
+# gc's cheap half removes three kinds of whole tree before the deadline-controlled trash loop is
+# reached: an abandoned fork's half-built clone, a half-built snapshot's S<n> and S<n>.wfs-tmp,
+# and the `*.wfs-tmp` suffix sweep under <store>/snapshots. None of them looked at the clock, so
+# a two-second worker wake -- or an interactive `gc` -- could spend minutes there on
+# workspace-sized clones, which is the foreground contention max_secs exists to bound (P16).
+# Same shape as the pool case above: a 120k-entry tree (about five seconds to unlink on this
+# machine) and a one-second budget. A store of its own for each, so the two cases cannot spend
+# each other's budget and neither can be finished by the other's worker.
+if command -v sqlite3 > /dev/null 2>&1; then
+    D7STORE="$SCRATCH/deadline-fork-store"
+    d7() { "$WORLD" --store "$D7STORE" "$@"; }
+    d7 fs status > /dev/null 2>&1
+    mkdir -p "$SCRATCH/d7fork"
+    D7TMP="$SCRATCH/d7fork/.wfs-fork-abandoned"
+    clone_tree "$POOLSRC" "$D7TMP"
+    sqlite3 "$D7STORE/metadata.db" "INSERT INTO worlds(kind,parent_world,snapshot_id,name,path,state,created_at,tmp_path,owner_pid,owner_start) VALUES(1,0,0,'d7fork','$SCRATCH/d7fork/w',0,0,'$D7TMP',2147480000,0);" 2>/dev/null
+    t0=$(python3 -c 'import time;print(int(time.time()*1000))')
+    out=$(WORLD_GC_BATCH_SECS=1 d7 fs gc 2>&1)
+    t1=$(python3 -c 'import time;print(int(time.time()*1000))')
+    if [ "$((t1 - t0))" -lt 2500 ]; then ok PR7 "a one-second gc does not unlink a whole abandoned fork tree ($((t1-t0)) ms)"
+    else bad PR7 "a one-second gc does not unlink a whole abandoned fork tree ($((t1-t0)) ms)"; echo "$out" | sed 's/^/        /'; fi
+    D7LEFT=$(find "$D7TMP" 2>/dev/null | wc -l | tr -d ' ')
+    D7STATE=$(sqlite3 "$D7STORE/metadata.db" "SELECT state FROM worlds WHERE name='d7fork';")
+    if [ "$D7STATE" = 0 ] && [ "$D7LEFT" -gt 0 ] && [ "$D7LEFT" -lt 120401 ]; then
+        ok PR7 "what it did not finish keeps its CREATING row and its tmp_path ($D7LEFT entries left)"
+    else
+        bad PR7 "what it did not finish keeps its CREATING row and its tmp_path (state $D7STATE, $D7LEFT entries left)"
+    fi
+    echo "$out" | grep -q "being collected in the background" && ok PR7 "and it hands the rest over" \
+                                                               || { bad PR7 "and it hands the rest over"; echo "$out" | sed 's/^/        /'; }
+    # Running out of time is not a failure: nothing is reported as undeletable, and a gc with no
+    # budget at all finishes the job.
+    echo "$out" | grep -q "could not be removed" && bad PR7 "out of time is not reported as a failure" \
+                                                  || ok PR7 "out of time is not reported as a failure"
+    WORLD_GC_CREATING_MIN_AGE=0 d7 fs gc --now > /dev/null 2>&1
+    for _ in $(seq 120); do [ ! -e "$D7TMP" ] && break; sleep 0.25; done
+    D7STATE=$(sqlite3 "$D7STORE/metadata.db" "SELECT state FROM worlds WHERE name='d7fork';")
+    if [ ! -e "$D7TMP" ] && [ "$D7STATE" = 3 ]; then
+        ok PR7 "a gc without the budget finishes the tree and buries the row"
+    else
+        bad PR7 "a gc without the budget finishes the tree and buries the row (state $D7STATE)"
+    fi
+
+    # The same for a half-built snapshot: its S<n>.wfs-tmp is a clone of the source tree, and it
+    # is removed twice over -- once by the CREATING loop, once by the suffix sweep right after it.
+    D8STORE="$SCRATCH/deadline-snap-store"
+    d8() { "$WORLD" --store "$D8STORE" "$@"; }
+    d8 fs status > /dev/null 2>&1
+    sqlite3 "$D8STORE/metadata.db" "INSERT INTO snapshots(name,path,src_path,from_world,created_at,state,owner_pid,owner_start) VALUES('d8snap','','',0,0,0,2147480000,0);" 2>/dev/null
+    D8S=$(sqlite3 "$D8STORE/metadata.db" "SELECT id FROM snapshots WHERE name='d8snap';")
+    D8TMP="$D8STORE/snapshots/S$D8S.wfs-tmp"
+    clone_tree "$POOLSRC" "$D8TMP"
+    t0=$(python3 -c 'import time;print(int(time.time()*1000))')
+    out=$(WORLD_GC_BATCH_SECS=1 d8 fs gc 2>&1)
+    t1=$(python3 -c 'import time;print(int(time.time()*1000))')
+    if [ "$((t1 - t0))" -lt 2500 ]; then ok PR7 "a one-second gc does not unlink a whole half-built snapshot ($((t1-t0)) ms)"
+    else bad PR7 "a one-second gc does not unlink a whole half-built snapshot ($((t1-t0)) ms)"; echo "$out" | sed 's/^/        /'; fi
+    D8LEFT=$(find "$D8TMP" 2>/dev/null | wc -l | tr -d ' ')
+    D8ROWS=$(sqlite3 "$D8STORE/metadata.db" "SELECT count(*) FROM snapshots WHERE id=$D8S;")
+    if [ "$D8ROWS" = 1 ] && [ "$D8LEFT" -gt 0 ] && [ "$D8LEFT" -lt 120401 ]; then
+        ok PR7 "what it did not finish keeps its CREATING row ($D8LEFT entries left)"
+    else
+        bad PR7 "what it did not finish keeps its CREATING row (rows $D8ROWS, $D8LEFT entries left)"
+    fi
+    echo "$out" | grep -q "being collected in the background" && ok PR7 "and that one hands the rest over too" \
+                                                               || { bad PR7 "and that one hands the rest over too"; echo "$out" | sed 's/^/        /'; }
+    WORLD_GC_CREATING_MIN_AGE=0 d8 fs gc --now > /dev/null 2>&1
+    for _ in $(seq 120); do [ ! -e "$D8TMP" ] && break; sleep 0.25; done
+    D8ROWS=$(sqlite3 "$D8STORE/metadata.db" "SELECT count(*) FROM snapshots WHERE id=$D8S;")
+    if [ ! -e "$D8TMP" ] && [ "$D8ROWS" = 0 ]; then
+        ok PR7 "a gc without the budget finishes the snapshot tree and its row"
+    else
+        bad PR7 "a gc without the budget finishes the snapshot tree and its row (rows $D8ROWS)"
+    fi
 fi
 
 echo

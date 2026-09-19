@@ -2206,7 +2206,12 @@ const uint64_t kDefaultGcThreads = 4;
 // parent directory of every world as well, i.e. over the user's own directories, where it
 // destroyed `~/w/notes.wfs-tmp` on a routine `world fs gc`. A fork's leftovers are now found
 // from the path its CREATING row recorded (gc_creating_tmp below), never from a name pattern.
-int rm_tmp_in_store_dir(wfs_store *s, const char *dir, uint64_t *removed) {
+// PR #1 review (7th round): under the wake's deadline, like everything else in the cheap half
+// that removes a whole tree. What this sweeps are half-built snapshots -- clones of a source
+// tree, not a handful of files -- and it used to run flat out right after the CREATING loop,
+// which made that loop's own deadline pointless for exactly the trees it had just stopped on.
+int rm_tmp_in_store_dir(wfs_store *s, const char *dir, uint64_t *removed, int64_t deadline_us,
+                        int *work_remains) {
     if (!under_dir(dir, s->dir.c_str())) return -EINVAL;   // not ours to sweep
     DIR *d = ::opendir(dir);
     if (!d) return 0;
@@ -2214,8 +2219,12 @@ int rm_tmp_in_store_dir(wfs_store *s, const char *dir, uint64_t *removed) {
     while (struct dirent *e = ::readdir(d)) {
         size_t n = ::strlen(e->d_name);
         if (n <= sl || ::strcmp(e->d_name + n - sl, WFS_TMP_SUFFIX) != 0) continue;
+        if (deadline_us && now_us() >= deadline_us) { if (work_remains) *work_remains = 1; break; }
         String p = joinp(dir, e->d_name);
-        if (wfs::fs_remove_tree(p.c_str()) == 0) (*removed)++;
+        int partial = 0;
+        int rc = wfs::fs_remove_tree(p.c_str(), deadline_us, &partial);
+        if (partial) { if (work_remains) *work_remains = 1; break; }
+        if (rc == 0) (*removed)++;
     }
     ::closedir(d);
     return 0;
@@ -2665,12 +2674,23 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                 cpaths.emplace_back(q.col_text(1));
             }
         }
+        // PR #1 review (7th round): under this wake's deadline. An abandoned fork tree is a
+        // half-built clone of a whole workspace, not the handful of stat(2)s the rest of gc's
+        // cheap half is made of, and this ran flat out in front of the deadline-controlled trash
+        // loop -- so a two-second worker wake, or an interactive `gc`, could spend minutes here.
+        // Running out of time is not a failure: the row stays CREATING with its tmp_path, the
+        // failure counter is left alone, work_remains is set, and the loop stops rather than
+        // start another tree it also cannot finish (the same shape pool_collect has).
         for (size_t i = 0; i < creating.size(); ++i) {
+            if (deadline_us && now_us() >= deadline_us) { rep.work_remains = 1; break; }
             TrashJob j;
             j.path = cpaths[i];
             j.row = creating[i];
             if (gc_tmp_is_removable(s, creating[i], cpaths[i].c_str())) {
-                if (wfs::fs_remove_tree(cpaths[i].c_str()) == 0) {
+                int partial = 0;
+                int trc = wfs::fs_remove_tree(cpaths[i].c_str(), deadline_us, &partial);
+                if (partial) { rep.work_remains = 1; break; }
+                if (trc == 0) {
                     rep.tmp_removed++;
                 } else if (exists(cpaths[i].c_str())) {
                     // PR #1 review (5th round): the tree is still there and this row is the only
@@ -2710,11 +2730,19 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                 snap_gone.emplace_back((wfs_id)q.col_i64(0));
             }
         }
+        // The same deadline as the fork trees above, and for the same reason: a half-built
+        // snapshot is a clone of the source tree (PR #1 review, 7th round).
         for (size_t i = 0; i < snap_gone.size(); ++i) {
+            if (deadline_us && now_us() >= deadline_us) { rep.work_remains = 1; break; }
             String tmp = numbered(snaps.c_str(), 'S', snap_gone[i], WFS_TMP_SUFFIX);
             String dir = numbered(snaps.c_str(), 'S', snap_gone[i], nullptr);
-            wfs::fs_remove_tree(tmp.c_str());
-            wfs::fs_remove_tree(dir.c_str());
+            int partial = 0;
+            wfs::fs_remove_tree(tmp.c_str(), deadline_us, &partial);
+            int partial2 = 0;
+            if (!partial) wfs::fs_remove_tree(dir.c_str(), deadline_us, &partial2);
+            // Out of time, not stuck: the row keeps its CREATING state and its trees, nothing
+            // is counted as a failure, and the successor carries on from here.
+            if (partial || partial2) { rep.work_remains = 1; break; }
             // PR #1 review (7th round): the row goes only when both trees are confirmed gone.
             // The results used to be thrown away and the row deleted regardless, and an S<n>
             // that would not budge (EPERM, an ACL, a transient EIO) then leaked for ever: the
@@ -2742,7 +2770,7 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
     }
     // <store>/snapshots only: a name under the store is one we made. The parent directories of
     // the worlds are the user's and are never swept (see rm_tmp_in_store_dir).
-    rm_tmp_in_store_dir(s, snaps.c_str(), &rep.tmp_removed);
+    rm_tmp_in_store_dir(s, snaps.c_str(), &rep.tmp_removed, deadline_us, &rep.work_remains);
 
     // ---- T2.2: reconciliation ----------------------------------------------------------------
     //
