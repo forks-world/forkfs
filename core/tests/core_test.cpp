@@ -138,6 +138,37 @@ static void retag_hl_line(const char *manifest, size_t which, unsigned long long
     CHECK(rename(tmp, manifest) == 0);
 }
 
+// PR #1 review (11th round): the path of the `which`-th `hl` line, replaced. Group number,
+// nlink and the number of lines all stay exactly as they were, so every count the manifest
+// checks look at still agrees -- which is the whole point of this damage shape.
+static void repath_hl_line(const char *manifest, size_t which, const char *path) {
+    char lines[256][8192];
+    size_t n = 0, seen = 0;
+    FILE *i = fopen(manifest, "r");
+    CHECK(i);
+    while (n < 256 && fgets(lines[n], sizeof lines[n], i)) n++;
+    fclose(i);
+    char tmp[4096];
+    snprintf(tmp, sizeof tmp, "%s.repath", manifest);
+    FILE *o = fopen(tmp, "w");
+    CHECK(o);
+    int done = 0;
+    for (size_t k = 0; k < n; ++k) {
+        if (!strncmp(lines[k], "hl ", 3) && seen++ == which) {
+            unsigned long long g = 0, nl = 0;
+            int used = 0;
+            CHECK(sscanf(lines[k] + 2, " %llu %llu %n", &g, &nl, &used) == 2 && used);
+            fprintf(o, "hl %llu %llu %s\n", g, nl, path);
+            done = 1;
+            continue;
+        }
+        fputs(lines[k], o);
+    }
+    CHECK(done);
+    CHECK(fclose(o) == 0);
+    CHECK(rename(tmp, manifest) == 0);
+}
+
 static int exists(const char *p) { struct stat st; return lstat(p, &st) == 0; }
 
 // ---- PR #1 review (11th round): a database of the shape schema 2 had before the ALTERs -------
@@ -3037,6 +3068,132 @@ int main() {
         wfs_store_close(tb);
         wfs_store_close(ta);
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", tstore, (unsigned long long)t1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
+    // ---- PR #1 review (11th round, P2): no name may be in a manifest twice ------------------
+    //
+    // The manifest checks of the 8th and 9th rounds are all counts: the header's group and name
+    // totals, and every group being exactly as big as its nlink. One damage shape keeps all of
+    // them -- a member repeated, either inside its own group or pasted over a member of the next
+    // one. The replay treats the repeat as already linked (it IS the canonical inode) and the
+    // member it displaced is simply not in the manifest any anymore, so the fork comes back rc 0
+    // with an independent inode where the snapshot has a link; across two groups the pasted-in
+    // name is replayed against the other group's canonical file and a clone's content is lost.
+    {
+        char dstore[4096], dsrc[4096], dman[4096], dbak[4096], dw[4096], q2[4096];
+        static const char *dnames[2][3] = {{"a1", "a2", "a3"}, {"b1", "b2", "b3"}};
+        join(dstore, sizeof dstore, root, "hldup-store");
+        join(dsrc, sizeof dsrc, root, "hldup-src");
+        CHECK(mkdir(dsrc, 0755) == 0);
+        for (int gi = 0; gi < 2; ++gi) {
+            join(p, sizeof p, dsrc, dnames[gi][0]);
+            write_file(p, gi ? "bbb\n" : "aaa\n");
+            for (int k = 1; k < 3; ++k) {
+                join(q2, sizeof q2, dsrc, dnames[gi][k]);
+                CHECK(link(p, q2) == 0);
+            }
+        }
+        // One size and one mtime for all six, so that the replay's "this name is still the file
+        // the scan saw" guard cannot accidentally save a group handed another group's member.
+        {
+            struct timespec ts[2];
+            ts[0].tv_sec = 1600000000; ts[0].tv_nsec = 0;
+            ts[1] = ts[0];
+            for (int gi = 0; gi < 2; ++gi)
+                for (int k = 0; k < 3; ++k) {
+                    join(p, sizeof p, dsrc, dnames[gi][k]);
+                    CHECK(utimensat(AT_FDCWD, p, ts, 0) == 0);
+                }
+        }
+        wfs_store *ds = NULL;
+        CHECK_OK(wfs_store_open(dstore, &ds));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "hldup";
+        wfs_id d1 = 0;
+        CHECK_OK(wfs_snapshot_create(ds, dsrc, &sopts, &d1));
+        CHECK_OK(wfs_snapshot_info(ds, d1, &sr));
+        CHECK(sr.hl_groups == 2);
+        snprintf(dman, sizeof dman, "%s/snapshots/S%llu/manifest", dstore, (unsigned long long)d1);
+        join(dbak, sizeof dbak, root, "hldup.bak");
+        copy_file(dman, dbak);
+
+        wfs_ref df = {WFS_K_SNAPSHOT, d1};
+        memset(&opts, 0, sizeof opts);
+        opts.no_pool = 1;
+        join(dw, sizeof dw, worlds, "hldup-w");
+        wfs_verify_report dvr;
+
+        // Three damaged manifests, each of which used to fork with rc 0:
+        //   (a) `a3` replaced by a second `a1`: group 0 is {a1, a2, a1}, three names, nlink 3.
+        //       a3 in the clone stays an inode of its own.
+        //   (b) `b1` replaced by `a1`: a1 is now in both groups. Group 1 replays b2 and b3 onto
+        //       *a1*, which is a different inode with the same size and mtime -- so the guard
+        //       lets it through and "bbb" is gone from the fork.
+        //   (c) a member replaced by a path that leaves the tree. Nothing ever checked that
+        //       either, and the replay resolves these names against the clone's root -- so
+        //       `../escape` is a file in the user's own directory, beside the fork's temporary,
+        //       and the replay renamed the group's canonical inode onto it. `escape` below is
+        //       that file, with the same size and mtime as the group so the guard cannot save
+        //       it; it has to come through untouched.
+        char desc[4096];
+        join(desc, sizeof desc, worlds, "escape");
+        write_file(desc, "xxx\n");
+        {
+            struct timespec ets[2];
+            ets[0].tv_sec = 1600000000; ets[0].tv_nsec = 0;
+            ets[1] = ets[0];
+            CHECK(utimensat(AT_FDCWD, desc, ets, 0) == 0);
+        }
+        uint64_t desc_ino = ino_of(desc);
+        for (int kind = 0; kind < 3; ++kind) {
+            copy_file(dbak, dman);
+            if (kind == 0) repath_hl_line(dman, 2, "a1");
+            else if (kind == 1) repath_hl_line(dman, 3, "a1");
+            else repath_hl_line(dman, 2, "../escape");
+            CHECK_RC(wfs_snapshot_verify(ds, d1, &dvr), WFS_E_SNAPSHOT_DIRTY);
+            CHECK(dvr.modified == 1 && strstr(dvr.first_bad, "manifest"));
+            size_t dbefore = 0;
+            CHECK_OK(wfs_world_list(ds, 1, NULL, 0, &dbefore));
+            wfs_id dw1 = 0;
+            CHECK_RC(wfs_world_create(ds, df, dw, &opts, &dw1), WFS_E_SNAPSHOT_DIRTY);
+            CHECK(!exists(dw));                                  // nothing published at --to
+            CHECK(n_with_prefix(worlds, ".wfs-fork-") == 0);     // and no clone left behind
+            size_t dafter = 0;
+            CHECK_OK(wfs_world_list(ds, 1, NULL, 0, &dafter));
+            CHECK(dafter == dbefore);
+            uint64_t dmade = 1;
+            CHECK_RC(wfs_pool_fill(ds, d1, 1, &dmade), WFS_E_SNAPSHOT_DIRTY);
+            CHECK(dmade == 0);
+            uint64_t dready = 1;
+            CHECK_OK(wfs_pool_ready(ds, d1, &dready));
+            CHECK(dready == 0);
+            // The file next door is the file next door, whatever a manifest says.
+            CHECK(ino_of(desc) == desc_ino && nlink_of(desc) == 1);
+            CHECK_OK(read_file(desc, buf, sizeof buf));
+            CHECK(!strcmp(buf, "xxx\n"));
+        }
+        CHECK(unlink(desc) == 0);
+
+        // Put the manifest back and the same snapshot forks with both groups rebuilt: the
+        // refusal is about the repeat, not about hardlinked snapshots.
+        copy_file(dbak, dman);
+        CHECK_OK(wfs_snapshot_verify(ds, d1, &dvr));
+        wfs_id dw1 = 0;
+        CHECK_OK(wfs_world_create(ds, df, dw, &opts, &dw1));
+        for (int gi = 0; gi < 2; ++gi) {
+            join(p, sizeof p, dw, dnames[gi][0]);
+            CHECK(nlink_of(p) == 3);
+            for (int k = 1; k < 3; ++k) {
+                join(q2, sizeof q2, dw, dnames[gi][k]);
+                CHECK(ino_of(p) == ino_of(q2));
+            }
+            CHECK_OK(read_file(p, buf, sizeof buf));
+            CHECK(!strcmp(buf, gi ? "bbb\n" : "aaa\n"));   // and no group took the other's file
+        }
+        CHECK_OK(wfs_world_discard(ds, dw1, 1, 0));
+        wfs_store_close(ds);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", dstore, (unsigned long long)d1);
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 

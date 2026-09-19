@@ -156,6 +156,23 @@ void put_escaped(FILE *f, const char *s) {
     }
 }
 
+// PR #1 review (11th round): what a member path is allowed to be. Every path this library
+// writes is a tree-relative path produced by the walker -- `rel` from fs_walk_tree, which never
+// begins with '/' and never contains a `..` component. A manifest that says otherwise is not one
+// we wrote, and the replay resolves these names against the clone's root: `../../x` is a name
+// outside the tree that link(2) and rename(2) would then act on, overwriting somebody else's
+// file with the group's canonical inode. Nothing checked this before.
+bool manifest_path_sane(const char *p) {
+    if (!p || !*p) return false;
+    if (*p == '/') return false;
+    for (const char *s = p;;) {
+        if (s[0] == '.' && s[1] == '.' && (s[2] == '/' || s[2] == 0)) return false;
+        const char *n = ::strchr(s, '/');
+        if (!n) return true;
+        s = n + 1;
+    }
+}
+
 // The manifest's own escaping, in reverse (world.cpp's reader does the same thing).
 void unescape(char *s) {
     char *w = s;
@@ -195,6 +212,7 @@ int hardlinks_manifest_read(const char *manifest_path, HardlinkSet &out) {
     char line[8192];
     uint64_t cur = 0;
     bool have_cur = false;
+    bool bad_path = false;
     while (::fgets(line, sizeof line, f)) {
         // Entry lines are the overwhelming majority and are of no interest here; rejecting them
         // on three bytes keeps this a memcpy-speed pass over the file.
@@ -221,6 +239,7 @@ int hardlinks_manifest_read(const char *manifest_path, HardlinkSet &out) {
         char *rel = line + 2 + consumed;
         if (!*rel) continue;
         unescape(rel);
+        if (!manifest_path_sane(rel)) { bad_path = true; break; }
         if (!have_cur || gid != cur || out.groups.empty()) {
             HardlinkGroup g;
             g.nlink = nlink;
@@ -232,6 +251,7 @@ int hardlinks_manifest_read(const char *manifest_path, HardlinkSet &out) {
         out.names++;
     }
     ::fclose(f);
+    if (bad_path) return -EINVAL;
     // PR #1 review (8th round): does the section match the header that describes it? A manifest
     // cut short -- a truncated write, a full disk, a store somebody has been editing -- keeps
     // the group count and loses a name, and a group of one name is replayed as nothing at all.
@@ -253,6 +273,29 @@ int hardlinks_manifest_read(const char *manifest_path, HardlinkSet &out) {
         const HardlinkGroup &g = out.groups[i];
         if (g.paths.size() < 2) return -EINVAL;
         if ((uint64_t)g.paths.size() != g.nlink) return -EINVAL;
+    }
+    // PR #1 review (11th round): and no name may appear twice in the whole section. This is the
+    // last damage shape that keeps every count the checks above look at: repeat a member inside
+    // its own group, or paste one group's member over another group's, and the group count, the
+    // name count and every group's size are all still exactly what the header says. What the
+    // replay then does with the repeat is nothing -- the name is already on the canonical inode,
+    // so it is counted as linked -- and the member that was displaced to make room is simply not
+    // in the manifest any more: the fork comes back rc 0 with an independent inode where the
+    // snapshot has a link. Across two groups it is worse: the member pasted in is replayed
+    // against the *other* group's canonical file, and a clone's content is overwritten.
+    // The scan can never write a repeat (a name is one dirent and is recorded once), so this is
+    // damage by construction. Sort the names and look at the neighbours -- one qsort of
+    // `out.names` pointers, on a set that is empty in almost every tree.
+    {
+        Vec<const char *> all;
+        for (size_t i = 0; i < out.groups.size(); ++i)
+            for (size_t k = 0; k < out.groups[i].paths.size(); ++k)
+                all.emplace_back(out.groups[i].paths[k].c_str());
+        if (all.size() > 1) {
+            ::qsort(all.data(), all.size(), sizeof(const char *), str_cmp);
+            for (size_t i = 1; i < all.size(); ++i)
+                if (!::strcmp(all[i - 1], all[i])) return -EINVAL;
+        }
     }
     return 0;
 }
