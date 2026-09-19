@@ -172,12 +172,53 @@ S1/S4 的抖动来自 mds 索引新生成的文件。)
 每次操作 5–7 次 XPC 往返(每次 ~50–90µs)主导。
 
 ### M1 — clonefile World(方案 C,2026-09-19 用户确认切换;设计见 docs/M1_DESIGN.md)
-- [ ] T1.1 core 重构:schema v2、snapshot/world/pool/trash、平台原语(clone_tree/protect/probe/free_space)
-- [ ] T1.2 CLI:init/fork/checkpoint/list/inspect/discard/restore/gc/status/verify/adopt + 防错规则 P1/P2/P4/P7/P11
+- [x] T1.1 core 重构:schema v2、snapshot/world/trash、平台原语(clone_tree/protect/probe/free_space/count)
+      C ABI 换成 snapshot + world 两类对象;M0 的 view/namespace API 移到 `core/include/worldfs/worldfs_fskit.h`,
+      由 CMake 选项 `WFS_FSKIT`(默认 OFF)决定是否编译 `core/src/view.cpp` 与 `macos/fskit/`(ON 时已验证可编译、测试通过)。
+      pool(T1.5)未做,fork 走当场 clone。
+- [x] T1.2 CLI:init/fork/checkpoint/list/inspect/discard/restore/gc/status/verify/adopt + 防错规则,
+      每条拒绝一行原因 + 一行"正确的命令";退出码 0 ok / 1 error / 2 usage / 3 refused-by-safety-rule。
+- [x] T1.6a safety 测试套件 `scripts/tests/safety.sh`(P1/P2/P3/P4/P6/P7/P8/P9/P12/P13,35 条全过);
+      core 单测 `core/tests/core_test.cpp` 覆盖同样的规则 + P11/P13 的 API 层。
+
+#### T1.1/T1.2 实测(2026-09-19,同一台 M1 Mac mini / macOS 27.0,best of 3,机器非空闲)
+
+| 操作 | 1k 条目 | 10k 条目(10200) | 50k 条目(50993) |
+|---|---|---|---|
+| `world fs init`(count + probe + clonefile + protect + manifest + SQLite) | 0.037 s | 0.280 s | **1.363 s** |
+| `world fs fork`(clonefile + unprotect + marker + rename + SQLite) | 0.040 s | 0.300 s | **1.350 s** |
+| `world fs verify S<n>`(读清单 + 逐项 lstat + 计数) | 0.010 s | 0.041 s | 0.177 s |
+| `world version`(进程 + 动态链接的地板) | 0.004 s | — | — |
+
+分解(50k):
+
+| 成分 | 实测 | 对照 |
+|---|---|---|
+| `clonefile(dir)` 本身 | 0.435 s | CLONE_MODEL §1.1 在空闲机上是 0.370 s;本轮机器更忙 |
+| 源树一次 walk(P9 硬链接统计 + P11 条目数) | 0.047 s | 新增成本;克隆后再数是数不出硬链接的(§11) |
+| `fs_protect_tree`(4 线程 chflags+chmod,不含 manifest) | **0.679 s** | M1_DESIGN 假设 ~0.4 s,**实际慢 1.7×** |
+| `fs_unprotect_tree`(4 线程) | **0.730 s** | 同上 |
+| manifest 写入 + rename + SQLite | ~0.20 s | |
+
+线程数扫描(50k 克隆树,同一棵):
+
+| 线程 | 1 | 2 | **4** | 8 | 16 |
+|---|---|---|---|---|---|
+| protect | 1.899 s | 1.031 s | **0.679 s** | 0.700 s | 0.728 s |
+| unprotect | 1.649 s | 1.007 s | **0.730 s** | 0.654 s | 0.704 s |
+
+与 §9.2 的 clonefile 结论一致:**4 线程就到顶**,瓶颈是 APFS 的元数据事务而不是 CPU。
+
+**结论**:fork 的一半时间花在 unprotect 上(0.73 s / 1.35 s)。P3 的逐条目保护无法省掉——
+目录 mode 只能挡住 create/unlink,挡不住对既有文件的写,所以每个文件都要自己的 chflags 或 chmod。
+真正的解法是 T1.5 的 pool:后台预克隆 + 预 unprotect,fork 只剩一次 rename。
+arch.md §1 的 `fork < 10ms` 目前只有 pool 命中时才可能满足;当场 clone 的地板是 1k 条目 40 ms(其中 4 ms 是进程启动)。
+
 - [ ] T1.3 diff:FSEvents + 全扫回退 + 比对(P10)
 - [ ] T1.4 exec:cwd/env/lock/seatbelt(P5/P14)
 - [ ] T1.5 pool:后台预克隆
-- [ ] T1.6 safety 测试套件(P1–P14)
+- [~] T1.6 safety 测试套件(P1–P14):P1/P2/P3/P4/P6/P7/P8/P9/P12/P13 已覆盖;
+      P5(exec lock)、P10(diff)、P11(真实磁盘写满)、P14(seatbelt)随 T1.3/T1.4 补
 - [ ] T1.7 基准:fork 延迟、diff、1000 idle World、存储增长
 - [ ] T1.8 文档:arch.md 增补章节、README
 

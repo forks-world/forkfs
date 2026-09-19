@@ -79,15 +79,18 @@ void fill_parent(wfs_view *v, wfs_attr &a) {
 
 extern "C" int wfs_view_open(wfs_store *s, wfs_world w, wfs_view **out) {
     if (!s || !out || w == 0) return -EINVAL;
-    wfs_world parent = 0;
-    wfs_world_state st = WFS_W_ACTIVE;
-    if (int rc = wfs_world_info(s, w, &parent, &st, nullptr, 0)) return rc;
-    if (st != WFS_W_ACTIVE) return -ESTALE;
+    // M1: a world is a real directory tree of its own, so a view is a passthrough of that
+    // root and every world is writable. (In M0 a fork was one metadata row and the view had
+    // to resolve the base world's directory through the parent chain.)
+    wfs_world_rec rec;
+    if (int rc = wfs_world_info(s, w, &rec)) return rc;
+    if (rec.state != WFS_ST_ACTIVE) return -ESTALE;
+    if (!rec.present) return -ESTALE;
     wfs_view *v = new wfs_view();
     v->store = s;
     v->world = w;
-    if (int rc = wfs::store_world_base_dir(s, w, v->base_dir)) { delete v; return rc; }
-    v->writable = (parent == 0);   // M0: forks are read-only views of their base
+    v->base_dir.assign(rec.path);
+    v->writable = true;
     v->nodes.try_emplace(WFS_INO_ROOT, NodeRec{WFS_INO_ROOT, WFS_T_DIR, String()});
     *out = v;
     return 0;

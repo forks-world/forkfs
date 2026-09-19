@@ -44,13 +44,20 @@ static NSError *perr(int negerrno) { return fs_errorForPOSIXError(negerrno < 0 ?
     wfs_store *s = NULL;
     int rc = wfs_store_open(storeDir.fileSystemRepresentation, &s);
     if (rc) { os_log_error(wfs_log(), "store open %{public}@: %d", storeDir, rc); if (err) *err = perr(rc); return nil; }
+    // M1: a world is a real directory tree, so the backing path identifies it. Without an
+    // explicit -o world=N the marker in the backing directory is asked who it belongs to.
     wfs_world w = (wfs_world)world;
-    if (w == 0) rc = wfs_world_init(s, base.fileSystemRepresentation, &w);
+    if (w == 0) {
+        wfs_identity id;
+        rc = wfs_world_verify_identity(s, base.fileSystemRepresentation, &id);
+        if (rc) { wfs_store_close(s); if (err) *err = perr(rc); return nil; }
+        w = id.world_id;
+    }
+    wfs_world_rec rec;
+    rc = wfs_world_info(s, w, &rec);
     if (rc) { wfs_store_close(s); if (err) *err = perr(rc); return nil; }
-    // The resource path must be the base of the requested world.
-    char wbase[4096] = {0};
-    rc = wfs_world_info(s, w, NULL, NULL, wbase, sizeof wbase);
-    if (rc) { wfs_store_close(s); if (err) *err = perr(rc); return nil; }
+    char wbase[WFS_PATH_MAX] = {0};
+    snprintf(wbase, sizeof wbase, "%s", rec.path);
     char rbase[4096] = {0};
     if (!realpath(base.fileSystemRepresentation, rbase) || strcmp(rbase, wbase) != 0) {
         os_log_error(wfs_log(), "world %llu base is %{public}s, resource is %{public}s", world, wbase, rbase);

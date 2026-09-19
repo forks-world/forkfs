@@ -8,7 +8,8 @@ BUILD=build/$CONFIG
 APP=build/WorldFS.app
 APPEX=$APP/Contents/Extensions/WorldFSExtension.appex
 
-cmake -S . -B "$BUILD" -DCMAKE_BUILD_TYPE="$CONFIG" >/dev/null
+# The appex only exists when the (frozen) FSKit frontend is built.
+cmake -S . -B "$BUILD" -DCMAKE_BUILD_TYPE="$CONFIG" -DWFS_FSKIT=ON >/dev/null
 cmake --build "$BUILD" --parallel
 (cd "$BUILD" && ctest --output-on-failure)
 
@@ -37,4 +38,4 @@ open -g -j "$INSTALL"
 sleep 2
 echo "installed: $INSTALL"
 echo "cli: $BUILD/cli/world"
-"$BUILD/cli/world" fs status || true
+"$BUILD/cli/world" fs fsstatus || true

@@ -3,6 +3,7 @@
 #import <os/log.h>
 #import "WorldVolume.h"
 #include "worldfs/worldfs.h"
+#include "worldfs/worldfs_fskit.h"
 
 os_log_t wfs_log(void) {
     static os_log_t l;

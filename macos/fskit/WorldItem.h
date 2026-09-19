@@ -1,5 +1,6 @@
 #import <FSKit/FSKit.h>
 #import "worldfs/worldfs.h"
+#import "worldfs/worldfs_fskit.h"
 
 NS_ASSUME_NONNULL_BEGIN
 

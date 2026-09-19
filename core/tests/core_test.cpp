@@ -1,7 +1,12 @@
-// Core tests: plain asserts, libc only, so they run anywhere with a C++ compiler.
+// M1 core tests: snapshots, worlds and every safety rule the core owns.
+// Plain asserts, libc only, so this runs anywhere with a C++ compiler (arch.md §39).
+//
+// Each block is labelled with the rule from docs/M1_DESIGN.md §3 that it pins down.
 #include "worldfs/worldfs.h"
 
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,172 +14,347 @@
 #include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
-#define CHECK_OK(x) do { int _rc = (x); if (_rc != 0) { fprintf(stderr, "%s:%d: %s -> %d (%s)\n", __FILE__, __LINE__, #x, _rc, strerror(-_rc)); exit(1); } } while (0)
+#define CHECK_OK(x) do { int _rc = (x); if (_rc != 0) { fprintf(stderr, "%s:%d: %s -> %d (%s)\n", __FILE__, __LINE__, #x, _rc, wfs_strerror(_rc)); exit(1); } } while (0)
+#define CHECK_RC(x, want) do { int _rc = (x); if (_rc != (want)) { fprintf(stderr, "%s:%d: %s -> %d (%s), wanted %d\n", __FILE__, __LINE__, #x, _rc, wfs_strerror(_rc), (want)); exit(1); } } while (0)
 
-static void write_file(const char *p, const char *s) { FILE *f = fopen(p, "w"); CHECK(f); fputs(s, f); fclose(f); }
-static void join(char *out, size_t cap, const char *a, const char *b) { snprintf(out, cap, "%s%s", a, b); }
+static void write_file(const char *p, const char *s) {
+    FILE *f = fopen(p, "w");
+    CHECK(f);
+    fputs(s, f);
+    fclose(f);
+}
 
-struct Ent { char name[256]; wfs_ino ino; wfs_type type; uint64_t next_cookie; int has_attr; wfs_attr attr; };
-struct Ents { Ent e[64]; size_t n; };
-static int collect(void *ctx, const wfs_dirent *d) {
-    Ents *es = (Ents *)ctx;
-    if (es->n < 64) {
-        Ent &e = es->e[es->n++];
-        snprintf(e.name, sizeof e.name, "%.*s", (int)d->name_len, d->name);
-        e.ino = d->ino; e.type = d->type; e.next_cookie = d->next_cookie;
-        e.has_attr = d->attr != NULL;
-        if (d->attr) e.attr = *d->attr;
-    }
+static int read_file(const char *p, char *buf, size_t cap) {
+    FILE *f = fopen(p, "r");
+    if (!f) return -errno;
+    size_t n = fread(buf, 1, cap - 1, f);
+    buf[n] = 0;
+    fclose(f);
     return 0;
 }
 
-// The same runtime decision readdir makes (core/src/platform_posix.cpp). Declared rather than
-// included so this file stays libc-only.
-namespace wfs { bool fs_readdir_emits_dots(bool with_attrs); }
+static void join(char *out, size_t cap, const char *a, const char *b) { snprintf(out, cap, "%s/%s", a, b); }
 
-// Checks the dot entries of one enumeration of `dir`, whose logical parent is `parent`.
-// Returns the number of dot entries that should be there for this host and enumeration kind.
-static size_t check_dots(const Ents &es, wfs_ino dir, wfs_ino parent, int want_attr) {
-    const bool emit = wfs::fs_readdir_emits_dots(want_attr != 0);
-    size_t dots = 0, dotdots = 0;
-    for (size_t i = 0; i < es.n; ++i) {
-        const Ent &e = es.e[i];
-        bool is_dot = !strcmp(e.name, "."), is_dotdot = !strcmp(e.name, "..");
-        if (!is_dot && !is_dotdot) continue;
-        CHECK(emit);                                   // must not appear when the kernel synthesizes
-        CHECK(e.type == WFS_T_DIR);
-        CHECK(e.ino == (is_dot ? dir : parent));       // logical inode, not the backing st_ino
-        if (want_attr) {
-            CHECK(e.has_attr);
-            CHECK(e.attr.type == WFS_T_DIR);
-            CHECK(e.attr.ino == (is_dot ? dir : parent));
+static int exists(const char *p) { struct stat st; return lstat(p, &st) == 0; }
+
+// Only ever called on paths under this test's own mkdtemp root.
+static void rm_rf(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return;
+    lchflags(path, 0);
+    if (S_ISDIR(st.st_mode)) {
+        chmod(path, 0755);
+        DIR *d = opendir(path);
+        if (d) {
+            while (struct dirent *e = readdir(d)) {
+                if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+                char child[4096];
+                join(child, sizeof child, path, e->d_name);
+                rm_rf(child);
+            }
+            closedir(d);
         }
-        (is_dot ? dots : dotdots)++;
+        rmdir(path);
+    } else {
+        unlink(path);
     }
-    CHECK(dots == (emit ? 1u : 0u) && dotdots == (emit ? 1u : 0u));
-    return dots + dotdots;
+}
+
+// A copy in the sense of `cp -R`: same bytes, same marker, different inode (P2).
+static void copy_dir(const char *src, const char *dst) {
+    CHECK(mkdir(dst, 0755) == 0);
+    DIR *d = opendir(src);
+    CHECK(d);
+    while (struct dirent *e = readdir(d)) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char s[4096], t[4096];
+        join(s, sizeof s, src, e->d_name);
+        join(t, sizeof t, dst, e->d_name);
+        struct stat st;
+        CHECK(lstat(s, &st) == 0);
+        if (S_ISDIR(st.st_mode)) { copy_dir(s, t); continue; }
+        char buf[65536];
+        CHECK_OK(read_file(s, buf, sizeof buf));
+        write_file(t, buf);
+    }
+    closedir(d);
 }
 
 int main() {
-    char root[] = "/tmp/wfs-core-test.XXXXXX";
-    CHECK(mkdtemp(root));
-    char base[4096], store[4096], p[4096], q[4096];
-    join(base, sizeof base, root, "/base");
-    join(store, sizeof store, root, "/store");
+    const char *tmp = getenv("TMPDIR");
+    char tpl[4096];
+    snprintf(tpl, sizeof tpl, "%swfs-m1-test.XXXXXX", (tmp && *tmp) ? tmp : "/tmp/");
+    CHECK(mkdtemp(tpl));
+    char root[4096];
+    // The world is identified by its inode, but the test compares paths too, so work from the
+    // resolved root (/tmp is a symlink to /private/tmp on Darwin).
+    CHECK(realpath(tpl, root));
+
+    char base[4096], store[4096], worlds[4096], p[4096], q[4096], buf[4096];
+    join(base, sizeof base, root, "project");
+    join(store, sizeof store, root, "store");
+    join(worlds, sizeof worlds, root, "worlds");
     CHECK(mkdir(base, 0755) == 0);
-    join(p, sizeof p, base, "/src"); CHECK(mkdir(p, 0755) == 0);
-    join(p, sizeof p, base, "/hello.txt"); write_file(p, "hello\n");
-    join(p, sizeof p, base, "/src/a.c"); write_file(p, "int main(){}\n");
+    CHECK(mkdir(worlds, 0755) == 0);
+    join(p, sizeof p, base, "src");
+    CHECK(mkdir(p, 0755) == 0);
+    join(p, sizeof p, base, "hello.txt");
+    write_file(p, "hello\n");
+    join(q, sizeof q, base, "src/a.c");
+    write_file(q, "int main(){}\n");
+    // A hardlink pair: clonefile breaks these, and init must say so (P9).
+    join(p, sizeof p, base, "src/a-link.c");
+    CHECK(link(q, p) == 0);
 
     wfs_store *s = NULL;
     CHECK_OK(wfs_store_open(store, &s));
     CHECK(strlen(wfs_version()) > 0);
+    CHECK(strcmp(wfs_strerror(WFS_E_CROSS_VOLUME), wfs_strerror(-EINVAL)) != 0);
 
-    // init is idempotent per base dir
-    wfs_world w0 = 0, again = 0;
-    CHECK_OK(wfs_world_init(s, base, &w0));
-    CHECK_OK(wfs_world_init(s, base, &again));
-    CHECK(w0 == again);
+    // ---- P6: a cross-volume clone is detected by really cloning, not by comparing st_dev ----
+    // /System and the data volume report the same st_dev on 27.0 and clonefile still returns
+    // EXDEV (docs/CLONE_MODEL_MACOS27.md §7).
+#ifdef __APPLE__
+    CHECK_RC(wfs_store_clone_probe(s, "/System/Library/CoreServices"), WFS_E_CROSS_VOLUME);
+#endif
+    CHECK_OK(wfs_store_clone_probe(s, base));
 
-    // fork is one row; info resolves base_dir through the parent chain
-    wfs_world w1 = 0, w2 = 0;
-    CHECK_OK(wfs_world_fork(s, w0, &w1));
-    CHECK_OK(wfs_world_fork(s, w1, &w2));
-    CHECK(w1 != w0 && w2 != w1);
-    wfs_world parent = 0; wfs_world_state st = WFS_W_ACTIVE; char bd[4096];
-    CHECK_OK(wfs_world_info(s, w2, &parent, &st, bd, sizeof bd));
-    CHECK(parent == w1 && st == WFS_W_ACTIVE);
-    CHECK(strstr(bd, "/base") != NULL);
-    size_t n = 0; wfs_world ids[8];
-    CHECK_OK(wfs_world_list(s, ids, 8, &n));
-    CHECK(n == 3);
+    // ---- init: a protected snapshot ----
+    wfs_id s1 = 0;
+    CHECK_OK(wfs_snapshot_create(s, base, "proj", &s1));
+    wfs_snapshot_rec sr;
+    CHECK_OK(wfs_snapshot_info(s, s1, &sr));
+    CHECK(sr.state == WFS_ST_ACTIVE);
+    CHECK(sr.entries == 4);          // src, hello.txt, src/a.c, src/a-link.c
+    CHECK(sr.hardlinks == 2);        // P9: both ends of the pair are reported
+    CHECK(!strcmp(sr.name, "proj"));
+    CHECK(!strcmp(sr.src_path, base));
+    CHECK(sr.from_world == 0);
 
-    // view over base: lookup / getattr / readdir / readlink / backing path
-    wfs_view *v = NULL;
-    CHECK_OK(wfs_view_open(s, w0, &v));
-    wfs_attr a;
-    CHECK_OK(wfs_getattr(v, WFS_INO_ROOT, &a));
-    CHECK(a.type == WFS_T_DIR && a.ino == WFS_INO_ROOT);
-    CHECK_OK(wfs_lookup(v, WFS_INO_ROOT, "src", 3, &a));
-    CHECK(a.type == WFS_T_DIR && a.parent == WFS_INO_ROOT);
-    wfs_ino src = a.ino;
-    CHECK_OK(wfs_lookup(v, src, "a.c", 3, &a));
-    CHECK(a.type == WFS_T_FILE && a.size == 13);
-    wfs_ino ac = a.ino;
-    CHECK(wfs_lookup(v, src, "nope", 4, &a) == -ENOENT);
-    CHECK(wfs_lookup(v, src, "..", 2, &a) == -EINVAL);
-    char pb[4096];
-    CHECK_OK(wfs_backing_path(v, ac, 0, pb, sizeof pb));
-    join(q, sizeof q, bd, "/src/a.c"); CHECK(strcmp(pb, q) == 0);
-    // Root, attribute-less enumeration: "." is the root itself and ".." is the root too (the mount
-    // has no parent to expose). Whether the dot entries appear at all is the host's call.
-    Ents ents = {};
-    CHECK_OK(wfs_readdir(v, WFS_INO_ROOT, 0, 0, collect, &ents));
-    size_t ndots = check_dots(ents, WFS_INO_ROOT, WFS_INO_ROOT, 0);
-    bool saw_src = false;
-    for (size_t i = 0; i < ents.n; ++i)
-        if (!strcmp(ents.e[i].name, "src")) { saw_src = true; CHECK(ents.e[i].ino == src); }
-    CHECK(saw_src && ents.n == ndots + 2);   // hello.txt + src
-    // cookies stay monotonic and resumable whichever way the dot entries go
-    for (size_t i = 1; i < ents.n; ++i) CHECK(ents.e[i].next_cookie > ents.e[i - 1].next_cookie);
-    Ents rest = {};
-    CHECK_OK(wfs_readdir(v, WFS_INO_ROOT, ents.e[0].next_cookie, 0, collect, &rest));
-    CHECK(rest.n == ents.n - 1);
-    for (size_t i = 0; i < rest.n; ++i) CHECK(!strcmp(rest.e[i].name, ents.e[i + 1].name));
-    // The attribute-bearing enumeration is the other branch of the same decision, and carries the
-    // same non-dot entries either way.
-    Ents wa = {};
-    CHECK_OK(wfs_readdir(v, WFS_INO_ROOT, 0, 1, collect, &wa));
-    size_t ndots_attr = check_dots(wa, WFS_INO_ROOT, WFS_INO_ROOT, 1);
-    CHECK(wa.n == ndots_attr + 2);
-    // A subdirectory: ".." must carry the parent's logical ino, not the subdirectory's own.
-    Ents sub = {};
-    CHECK_OK(wfs_readdir(v, src, 0, 0, collect, &sub));
-    CHECK(check_dots(sub, src, WFS_INO_ROOT, 0) == ndots);
-    CHECK(sub.n == ndots + 1);   // a.c
+    // P3: nothing inside a snapshot can be written, created or deleted.
+    join(p, sizeof p, sr.path, "hello.txt");
+    CHECK_OK(read_file(p, buf, sizeof buf));
+    CHECK(!strcmp(buf, "hello\n"));
+    CHECK(open(p, O_WRONLY) < 0 && errno == EPERM);
+    CHECK(unlink(p) != 0 && errno == EPERM);
+    join(q, sizeof q, sr.path, "new.txt");
+    CHECK(open(q, O_WRONLY | O_CREAT, 0644) < 0 && (errno == EPERM || errno == EACCES));
+    CHECK(!exists(q));
+    struct stat st;
+    CHECK(stat(sr.path, &st) == 0 && (st.st_mode & 0222) == 0);   // write bits stripped
 
-    // mutations land in the base dir; rename keeps children resolvable
-    CHECK_OK(wfs_create(v, src, "b.c", 3, WFS_T_FILE, 0644, &a));
-    join(q, sizeof q, base, "/src/b.c"); CHECK(access(q, F_OK) == 0);
-    CHECK_OK(wfs_rename(v, WFS_INO_ROOT, "src", 3, WFS_INO_ROOT, "lib", 3, src));
-    CHECK_OK(wfs_backing_path(v, ac, 0, pb, sizeof pb));
-    join(q, sizeof q, bd, "/lib/a.c"); CHECK(strcmp(pb, q) == 0);
-    CHECK_OK(wfs_symlink(v, WFS_INO_ROOT, "l", 1, "hello.txt", 9, &a));
-    char lb[256]; size_t ll = 0;
-    CHECK_OK(wfs_readlink(v, a.ino, lb, sizeof lb, &ll));
-    CHECK(ll == 9 && !memcmp(lb, "hello.txt", 9));
-    wfs_setattr_req sa; memset(&sa, 0, sizeof sa); sa.valid = WFS_SET_MODE | WFS_SET_SIZE; sa.mode = 0600; sa.size = 2;
-    CHECK_OK(wfs_setattr(v, ac, &sa, &a));
-    CHECK(a.mode == 0600 && a.size == 2);
-    CHECK_OK(wfs_setxattr(v, ac, "user.k", "v", 1, 0));
-    char xb[16]; size_t xl = 0;
-    CHECK_OK(wfs_getxattr(v, ac, "user.k", xb, sizeof xb, &xl));
-    CHECK(xl == 1 && xb[0] == 'v');
-    CHECK_OK(wfs_removexattr(v, ac, "user.k"));
-    CHECK_OK(wfs_unlink(v, WFS_INO_ROOT, "l", 1, a.ino));
-    CHECK_OK(wfs_forget(v, ac));
-    CHECK(wfs_backing_path(v, ac, 0, pb, sizeof pb) == -ESTALE);
-    wfs_statfs_info sf;
-    CHECK_OK(wfs_statfs(v, &sf));
-    CHECK(sf.total_blocks > 0);
-    // many inodes: exercise table growth and deletion
-    for (uint64_t i = 0; i < 5000; ++i) { char nm[32]; snprintf(nm, sizeof nm, "f%llu", (unsigned long long)i); join(q, sizeof q, base, "/lib/"); strcat(q, nm); write_file(q, "x"); CHECK_OK(wfs_lookup(v, src, nm, strlen(nm), &a)); if (i % 3 == 0) CHECK_OK(wfs_forget(v, a.ino)); }
-    CHECK_OK(wfs_lookup(v, src, "f4999", 5, &a));
-    wfs_view_close(v);
+    // P3: verify agrees with the manifest it wrote.
+    wfs_verify_report vr;
+    CHECK_OK(wfs_snapshot_verify(s, s1, &vr));
+    CHECK(vr.checked == sr.entries + 1);   // + the root itself
+    CHECK(vr.missing == 0 && vr.modified == 0 && vr.unprotected == 0 && vr.extra == 0);
 
-    // forks are read-only in M0 but resolve the same base
-    CHECK_OK(wfs_view_open(s, w2, &v));
-    CHECK_OK(wfs_lookup(v, WFS_INO_ROOT, "hello.txt", 9, &a));
-    CHECK(wfs_create(v, WFS_INO_ROOT, "x", 1, WFS_T_FILE, 0644, &a) == -EROFS);
-    wfs_view_close(v);
+    // ---- P7: which paths may be initialised ----
+    CHECK_RC(wfs_path_check(s, "/", 0), WFS_E_PATH_REFUSED);
+    CHECK_RC(wfs_path_check(s, store, 0), WFS_E_PATH_REFUSED);
+    CHECK_RC(wfs_path_check(s, sr.path, 0), WFS_E_PATH_REFUSED);       // a snapshot root
+    join(p, sizeof p, sr.path, "src");
+    CHECK_RC(wfs_path_check(s, p, 0), WFS_E_PATH_REFUSED);             // inside a snapshot
+    CHECK_OK(wfs_path_check(s, base, 0));
 
-    // discard hides the world
-    CHECK_OK(wfs_world_discard(s, w2));
-    CHECK(wfs_view_open(s, w2, &v) == -ESTALE);
-    CHECK_OK(wfs_world_list(s, ids, 8, &n));
-    CHECK(n == 2);
+    // ---- fork: a writable world with identical content ----
+    char w1path[4096];
+    join(w1path, sizeof w1path, worlds, "w1");
+    wfs_id next = 0;
+    CHECK_OK(wfs_world_next_id(s, &next));
+    CHECK(next == 1);
+    wfs_ref from = {WFS_K_SNAPSHOT, s1};
+    wfs_fork_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.name = "w1";
+    wfs_id w1 = 0;
+    CHECK_OK(wfs_world_create(s, from, w1path, &opts, &w1));
+    CHECK(w1 == next);
+
+    join(p, sizeof p, w1path, "hello.txt");
+    CHECK_OK(read_file(p, buf, sizeof buf));
+    CHECK(!strcmp(buf, "hello\n"));
+    write_file(p, "changed\n");                                   // writable, unlike its source
+    join(q, sizeof q, w1path, "src/b.c");
+    write_file(q, "new\n");
+    CHECK(exists(q));
+    join(p, sizeof p, sr.path, "hello.txt");                       // the snapshot did not move
+    CHECK_OK(read_file(p, buf, sizeof buf));
+    CHECK(!strcmp(buf, "hello\n"));
+    join(p, sizeof p, w1path, ".world");
+    CHECK(exists(p));
+    join(p, sizeof p, w1path, "src");
+    CHECK(stat(p, &st) == 0 && (st.st_mode & 0200) != 0);          // directories writable again
+
+    wfs_world_rec wr;
+    CHECK_OK(wfs_world_info(s, w1, &wr));
+    CHECK(wr.state == WFS_ST_ACTIVE && wr.present == 1);
+    CHECK(wr.snapshot_id == s1 && wr.parent_world == 0 && wr.origin == WFS_O_SNAPSHOT);
+    CHECK(!strcmp(wr.path, w1path));
+    CHECK(wr.dir_ino != 0);
+    CHECK(wr.entries == sr.entries);
+
+    // P7 again: a world root is not a legal init target, and neither is anything inside it.
+    CHECK_RC(wfs_path_check(s, w1path, 0), WFS_E_PATH_REFUSED);
+    join(p, sizeof p, w1path, "src");
+    CHECK_RC(wfs_path_check(s, p, 0), WFS_E_PATH_REFUSED);
+    join(p, sizeof p, w1path, "src/deeper");
+    CHECK_RC(wfs_path_check(s, p, 1), WFS_E_PATH_REFUSED);         // as a fork target, too
+
+    // ---- P1: identity survives a move ----
+    char moved[4096];
+    join(moved, sizeof moved, worlds, "renamed");
+    CHECK(rename(w1path, moved) == 0);
+    wfs_identity id;
+    CHECK_OK(wfs_world_verify_identity(s, moved, &id));
+    CHECK(id.registered == 1 && id.is_copy == 0 && id.moved == 1);
+    CHECK(id.world_id == w1 && id.snapshot_id == s1);
+    CHECK(!strcmp(id.path, moved));
+    CHECK_OK(wfs_world_info(s, w1, &wr));
+    CHECK(!strcmp(wr.path, moved) && wr.present == 1);             // the row followed the tree
+    CHECK_OK(wfs_world_verify_identity(s, moved, &id));
+    CHECK(id.moved == 0);                                          // ... and only reports it once
+    CHECK(rename(moved, w1path) == 0);
+    CHECK_OK(wfs_world_verify_identity(s, w1path, &id));
+
+    // ---- P2: a copy is refused ----
+    char copy[4096];
+    join(copy, sizeof copy, worlds, "w1-copy");
+    copy_dir(w1path, copy);
+    wfs_identity cid;
+    CHECK_RC(wfs_world_verify_identity(s, copy, &cid), WFS_E_UNREGISTERED);
+    CHECK(cid.has_marker == 1 && cid.is_copy == 1 && cid.registered == 0);
+    CHECK(cid.world_id == w1);
+    CHECK(cid.ino != wr.dir_ino);
+    // `adopt` is the remedy: the copy becomes a world of its own, with the original as parent.
+    wfs_id w2 = 0;
+    CHECK_OK(wfs_world_adopt(s, copy, "adopted", &w2));
+    CHECK(w2 != w1);
+    CHECK_OK(wfs_world_verify_identity(s, copy, &cid));
+    CHECK(cid.registered == 1 && cid.world_id == w2);
+    CHECK_OK(wfs_world_info(s, w2, &wr));
+    CHECK(wr.origin == WFS_O_ADOPTED && wr.parent_world == w1);
+    CHECK_RC(wfs_world_adopt(s, copy, NULL, &w2), -EEXIST);
+    CHECK_OK(wfs_world_info(s, w1, &wr));                          // and the original is untouched
+    CHECK(wr.present == 1);
+
+    // ---- checkpoint: the same call as init, from a live world ----
+    wfs_id s2 = 0;
+    CHECK_OK(wfs_snapshot_create(s, w1path, "after-edit", &s2));
+    CHECK_OK(wfs_snapshot_info(s, s2, &sr));
+    CHECK(sr.from_world == w1);
+    CHECK(sr.entries == 5);                                        // b.c was added in the world
+    join(p, sizeof p, sr.path, "hello.txt");
+    CHECK_OK(read_file(p, buf, sizeof buf));
+    CHECK(!strcmp(buf, "changed\n"));
+    join(p, sizeof p, sr.path, ".world");
+    CHECK(!exists(p));            // the source world's marker is not part of the snapshot
+    // The world it came from is still writable.
+    join(p, sizeof p, w1path, "hello.txt");
+    write_file(p, "changed again\n");
+
+    // fork from a world, not a snapshot
+    char w3path[4096];
+    join(w3path, sizeof w3path, worlds, "w3");
+    wfs_ref fw = {WFS_K_WORLD, w1};
+    wfs_id w3 = 0;
+    memset(&opts, 0, sizeof opts);
+    CHECK_OK(wfs_world_create(s, fw, w3path, &opts, &w3));
+    CHECK_OK(wfs_world_info(s, w3, &wr));
+    CHECK(wr.parent_world == w1 && wr.origin == WFS_O_WORLD);
+    join(p, sizeof p, w3path, "hello.txt");
+    CHECK_OK(read_file(p, buf, sizeof buf));
+    CHECK(!strcmp(buf, "changed again\n"));
+
+    // A fork target that already exists is refused before anything is cloned.
+    CHECK_RC(wfs_world_create(s, from, w3path, &opts, &w2), -EEXIST);
+
+    // ---- P4: discard to the trash, then restore ----
+    CHECK_OK(wfs_world_discard(s, w3, 0));
+    CHECK(!exists(w3path));
+    CHECK_OK(wfs_world_info(s, w3, &wr));
+    CHECK(wr.state == WFS_ST_TRASHED && wr.trashed_at > 0);
+    CHECK(wr.present == 1);                                        // it is intact, just elsewhere
+    size_t n = 0;
+    CHECK_OK(wfs_world_list(s, 0, NULL, 0, &n));
+    size_t active_without_w3 = n;
+    CHECK_OK(wfs_world_list(s, 1, NULL, 0, &n));
+    CHECK(n == active_without_w3 + 1);
+    CHECK_OK(wfs_world_restore(s, w3));
+    CHECK(exists(w3path));
+    join(p, sizeof p, w3path, "hello.txt");
+    CHECK_OK(read_file(p, buf, sizeof buf));
+    CHECK(!strcmp(buf, "changed again\n"));
+    CHECK_OK(wfs_world_info(s, w3, &wr));
+    CHECK(wr.state == WFS_ST_ACTIVE && wr.present == 1);
+    CHECK_OK(wfs_world_verify_identity(s, w3path, &id));
+    CHECK(id.registered == 1);
+    CHECK_RC(wfs_world_restore(s, w3), -ESTALE);                   // not trashed any more
+
+    // gc must not touch a world that is still inside its retention window.
+    wfs_gc_report gc;
+    CHECK_OK(wfs_world_discard(s, w3, 0));
+    CHECK_OK(wfs_gc(s, 3600, &gc));
+    CHECK(gc.worlds_deleted == 0);
+    CHECK_OK(wfs_world_restore(s, w3));
+
+    // --now deletes immediately.
+    char w4path[4096];
+    join(w4path, sizeof w4path, worlds, "w4");
+    wfs_id w4 = 0;
+    CHECK_OK(wfs_world_create(s, from, w4path, &opts, &w4));
+    CHECK_OK(wfs_world_discard(s, w4, 1));
+    CHECK(!exists(w4path));
+    CHECK_OK(wfs_world_info(s, w4, &wr));
+    CHECK(wr.state == WFS_ST_DEAD);
+
+    // ---- P8: a half-built tree is collected ----
+    char stray[4096], strayfile[4096];
+    join(stray, sizeof stray, worlds, "interrupted.wfs-tmp");
+    CHECK(mkdir(stray, 0755) == 0);
+    join(strayfile, sizeof strayfile, stray, "half");
+    write_file(strayfile, "x");
+    CHECK_OK(wfs_gc(s, 0, &gc));
+    CHECK(!exists(stray));
+    CHECK(gc.tmp_removed >= 1);
+    CHECK(exists(w1path) && exists(w3path));                       // and nothing else went with it
+
+    // ---- P3 again: tampering with a snapshot is detected ----
+    join(p, sizeof p, sr.path, "hello.txt");                       // sr is S2 here
+    CHECK(lchflags(p, 0) == 0);
+    write_file(p, "tampered\n");
+    CHECK_RC(wfs_snapshot_verify(s, s2, &vr), WFS_E_SNAPSHOT_DIRTY);
+    CHECK(vr.modified == 1 && vr.first_bad[0]);
+    CHECK(strstr(vr.first_bad, "hello.txt") != NULL);
+    // An entry nobody recorded is caught by the count, not by the manifest.
+    CHECK(lchflags(sr.path, 0) == 0 && chmod(sr.path, 0755) == 0);
+    join(p, sizeof p, sr.path, "smuggled.txt");
+    write_file(p, "x");
+    CHECK_RC(wfs_snapshot_verify(s, s2, &vr), WFS_E_SNAPSHOT_DIRTY);
+    CHECK(vr.extra == 1);
+
+    // ---- store status ----
+    wfs_store_stat ss;
+    CHECK_OK(wfs_store_status(s, &ss));
+    CHECK(ss.schema == WFS_STORE_SCHEMA);
+    CHECK(ss.snapshots == 2);
+    CHECK(ss.worlds_active >= 2);
+    CHECK(ss.volume_total_bytes > 0 && ss.volume_free_bytes > 0);
+    CHECK(ss.metadata_estimate_bytes > 0);
+    CHECK(!strcmp(ss.dir, store));
+
+    // ---- P13: a store from another schema is refused before anything is read ----
+    char other[4096], ver[4096];
+    join(other, sizeof other, root, "other-store");
+    CHECK(mkdir(other, 0755) == 0);
+    join(ver, sizeof ver, other, "VERSION");
+    write_file(ver, "99\n");
+    wfs_store *bad = NULL;
+    CHECK_RC(wfs_store_open(other, &bad), WFS_E_SCHEMA);
+    CHECK(bad == NULL);
 
     wfs_store_close(s);
-    printf("core_test: all OK (%s)\n", root);
+    rm_rf(root);
+    printf("core_test: all OK\n");
     return 0;
 }

@@ -1,82 +1,182 @@
-// Metadata store: SQLite in WAL mode (arch.md §12, §20, §27). The only third-party
-// dependency of the core; isolated to this file so it can be swapped later.
-#include "internal.h"
+// The store: a directory with a VERSION file, a SQLite metadata.db (schema v2), the snapshot
+// trees and the trash. Everything that is not snapshot/world lifecycle lives here.
+#include "db.h"
 
-#include <errno.h>
-#include <sqlite3.h>
-#include <string.h>
-#include <time.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/random.h>
+#include <unistd.h>
 
 using wfs::Guard;
 using wfs::String;
+using wfs::Stmt;
 
 namespace {
 
+// Schema v2 (docs/M1_DESIGN.md §2). Snapshot ids and world ids are separate sequences, so
+// S1 and W1 can both exist; the CLI prints the prefix.
 const char *kSchema =
     "PRAGMA journal_mode=WAL;"
     "PRAGMA synchronous=NORMAL;"
+    "PRAGMA foreign_keys=OFF;"
+    "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+    "CREATE TABLE IF NOT EXISTS snapshots("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  name TEXT NOT NULL DEFAULT '',"
+    "  path TEXT NOT NULL DEFAULT '',"
+    "  src_path TEXT NOT NULL DEFAULT '',"
+    "  from_world INTEGER NOT NULL DEFAULT 0,"
+    "  created_at INTEGER NOT NULL,"
+    "  entries INTEGER NOT NULL DEFAULT 0,"
+    "  hardlinks INTEGER NOT NULL DEFAULT 0,"
+    "  state INTEGER NOT NULL DEFAULT 0);"
     "CREATE TABLE IF NOT EXISTS worlds("
-    "  world_id INTEGER PRIMARY KEY AUTOINCREMENT, parent_world_id INTEGER,"
-    "  generation INTEGER NOT NULL DEFAULT 0, state INTEGER NOT NULL DEFAULT 0,"
-    "  base_dir TEXT, created_at INTEGER NOT NULL);"
-    "CREATE INDEX IF NOT EXISTS worlds_base ON worlds(base_dir) WHERE parent_world_id IS NULL;"
-    "CREATE TABLE IF NOT EXISTS entries("
-    "  world_id INTEGER NOT NULL, parent_inode INTEGER NOT NULL, name BLOB NOT NULL,"
-    "  logical_inode INTEGER, operation INTEGER NOT NULL,"
-    "  PRIMARY KEY(world_id, parent_inode, name));"
-    "CREATE TABLE IF NOT EXISTS inodes("
-    "  logical_inode INTEGER PRIMARY KEY, backing_object INTEGER, type INTEGER NOT NULL,"
-    "  mode INTEGER, uid INTEGER, gid INTEGER, size INTEGER,"
-    "  metadata_generation INTEGER NOT NULL DEFAULT 0);"
-    "CREATE TABLE IF NOT EXISTS changed("
-    "  world_id INTEGER NOT NULL, logical_inode INTEGER NOT NULL, change_type INTEGER NOT NULL,"
-    "  PRIMARY KEY(world_id, logical_inode));"
-    "CREATE TABLE IF NOT EXISTS objects("
-    "  object_id INTEGER PRIMARY KEY AUTOINCREMENT, backing_path TEXT NOT NULL,"
-    "  immutable INTEGER NOT NULL DEFAULT 0, state INTEGER NOT NULL DEFAULT 0);";
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  kind INTEGER NOT NULL DEFAULT 1,"
+    "  parent_world INTEGER NOT NULL DEFAULT 0,"
+    "  snapshot_id INTEGER NOT NULL DEFAULT 0,"
+    "  name TEXT NOT NULL DEFAULT '',"
+    "  path TEXT NOT NULL DEFAULT '',"
+    "  trash_path TEXT NOT NULL DEFAULT '',"
+    "  dir_dev INTEGER NOT NULL DEFAULT 0,"
+    "  dir_ino INTEGER NOT NULL DEFAULT 0,"
+    "  state INTEGER NOT NULL DEFAULT 0,"
+    "  fsevents_id INTEGER NOT NULL DEFAULT 0,"
+    "  entries INTEGER NOT NULL DEFAULT 0,"
+    "  created_at INTEGER NOT NULL,"
+    "  trashed_at INTEGER NOT NULL DEFAULT 0);"
+    "CREATE INDEX IF NOT EXISTS worlds_ino ON worlds(dir_ino);"
+    "CREATE INDEX IF NOT EXISTS worlds_path ON worlds(path);";
 
-int map_sqlite(int rc) {
-    switch (rc) {
-    case SQLITE_OK: case SQLITE_DONE: case SQLITE_ROW: return 0;
-    case SQLITE_BUSY: case SQLITE_LOCKED: return -EBUSY;
-    case SQLITE_NOMEM: return -ENOMEM;
-    case SQLITE_CONSTRAINT: return -EEXIST;
-    default: return -EIO;
+void hex_id(char *out, size_t n) { // n = 33 for 32 hex digits + NUL
+    unsigned char raw[16];
+    if (::getentropy(raw, sizeof raw) != 0) {
+        // Never fails on Darwin/Linux for <= 256 bytes; keep a deterministic fallback anyway.
+        for (size_t i = 0; i < sizeof raw; ++i) raw[i] = (unsigned char)(::getpid() + i * 31 + (int)::time(nullptr));
     }
+    static const char h[] = "0123456789abcdef";
+    size_t j = 0;
+    for (size_t i = 0; i < sizeof raw && j + 2 < n; ++i) {
+        out[j++] = h[raw[i] >> 4];
+        out[j++] = h[raw[i] & 15];
+    }
+    out[j] = 0;
 }
 
-struct Stmt {
-    sqlite3_stmt *s = nullptr;
-    Stmt(sqlite3 *db, const char *sql) { sqlite3_prepare_v2(db, sql, -1, &s, nullptr); }
-    ~Stmt() { if (s) sqlite3_finalize(s); }
-    Stmt(const Stmt &) = delete;
-    Stmt &operator=(const Stmt &) = delete;
-    bool ok() const { return s != nullptr; }
-};
-
-int64_t now_ns() {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+// P13: the VERSION file is the first thing read and the first thing written. A store from a
+// different schema is refused before the database is even opened, so an old CLI cannot
+// migrate a new store by accident.
+int check_version(const char *dir) {
+    String p(dir);
+    p.append("/VERSION");
+    int fd = ::open(p.c_str(), O_RDONLY);
+    if (fd >= 0) {
+        char buf[64] = {0};
+        ssize_t n = ::read(fd, buf, sizeof buf - 1);
+        ::close(fd);
+        if (n <= 0) return -EIO;
+        long v = ::strtol(buf, nullptr, 10);
+        return v == WFS_STORE_SCHEMA ? 0 : WFS_E_SCHEMA;
+    }
+    if (errno != ENOENT) return -errno;
+    fd = ::open(p.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) return errno == EEXIST ? check_version(dir) : -errno;
+    char line[64];
+    int n = ::snprintf(line, sizeof line, "%d\n", WFS_STORE_SCHEMA);
+    ssize_t w = ::write(fd, line, (size_t)n);
+    ::close(fd);
+    return w == n ? 0 : -EIO;
 }
 
-void exec(sqlite3 *db, const char *sql) { sqlite3_exec(db, sql, nullptr, nullptr, nullptr); }
+int meta_get(sqlite3 *db, const char *key, String &out) {
+    Stmt q(db, "SELECT value FROM meta WHERE key=?");
+    if (!q.ok()) return -EIO;
+    q.text(1, key);
+    if (!q.row()) return -ENOENT;
+    out.assign(q.col_text(0));
+    return 0;
+}
+
+int meta_set(sqlite3 *db, const char *key, const char *value) {
+    Stmt u(db, "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value");
+    if (!u.ok()) return -EIO;
+    u.text(1, key);
+    u.text(2, value);
+    return u.step() == SQLITE_DONE ? 0 : -EIO;
+}
 
 } // namespace
 
-extern "C" const char *wfs_version(void) { return "0.0.3-m0"; }
+extern "C" const char *wfs_version(void) { return "0.1.0-m1"; }
+
+extern "C" const char *wfs_strerror(int rc) {
+    switch (rc) {
+    case 0: return "ok";
+    case WFS_E_CROSS_VOLUME: return "clonefile across volumes (EXDEV)";
+    case WFS_E_UNREGISTERED: return "unregistered copy of a world";
+    case WFS_E_NOT_A_WORLD: return "not a world (no .world marker)";
+    case WFS_E_PATH_REFUSED: return "path refused by a safety rule";
+    case WFS_E_LOW_SPACE: return "not enough free space";
+    case WFS_E_SCHEMA: return "store schema mismatch";
+    case WFS_E_WORLD_BUSY: return "world is locked by another command";
+    case WFS_E_SNAPSHOT_DIRTY: return "snapshot no longer matches its manifest";
+    case WFS_E_FOREIGN_STORE: return "marker belongs to a different store";
+    case WFS_E_WORLD_MISSING: return "world is not at its recorded path";
+    default: return ::strerror(rc < 0 ? -rc : rc);
+    }
+}
+
+extern "C" int wfs_store_default_dir(char *buf, size_t cap) {
+    if (!buf || cap == 0) return -EINVAL;
+    const char *home = ::getenv("HOME");
+    if (!home || !*home) return -ENOENT;
+#ifdef __APPLE__
+    int n = ::snprintf(buf, cap, "%s/Library/Application Support/World/fs", home);
+#else
+    const char *x = ::getenv("XDG_DATA_HOME");
+    int n = (x && *x) ? ::snprintf(buf, cap, "%s/world/fs", x)
+                      : ::snprintf(buf, cap, "%s/.local/share/world/fs", home);
+#endif
+    return (n < 0 || (size_t)n >= cap) ? -ENAMETOOLONG : 0;
+}
+
+extern "C" const char *wfs_store_dir(const wfs_store *s) { return s ? s->dir.c_str() : ""; }
 
 extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
     if (!store_dir || !out) return -EINVAL;
     if (int rc = wfs::fs_mkdir_p(store_dir)) return rc;
+    String real;
+    if (int rc = wfs::fs_realpath(store_dir, real)) return rc;
+    if (int rc = check_version(real.c_str())) return rc;
+
     wfs_store *s = new wfs_store();
-    s->dir.assign(store_dir);
-    String dbp(store_dir);
+    s->dir.assign(real.c_str());
+    for (const char *sub : {"/snapshots", "/trash"}) {
+        String p(s->dir);
+        p.append(sub);
+        if (int rc = wfs::fs_mkdir_p(p.c_str())) { wfs_store_close(s); return rc; }
+    }
+    // Keep Spotlight out of the store: indexing a snapshot tree is pure waste and it was the
+    // only reproducible outlier source in the benchmarks (CLONE_MODEL_MACOS27 §0).
+    {
+        String p(s->dir);
+        p.append("/.metadata_never_index");
+        int fd = ::open(p.c_str(), O_WRONLY | O_CREAT, 0644);
+        if (fd >= 0) ::close(fd);
+    }
+    String dbp(s->dir);
     dbp.append("/metadata.db");
-    int rc = sqlite3_open_v2(dbp.c_str(), &s->db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nullptr);
+    int rc = sqlite3_open_v2(dbp.c_str(), &s->db,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nullptr);
     if (rc != SQLITE_OK) { wfs_store_close(s); return -EIO; }
-    sqlite3_busy_timeout(s->db, 5000);
+    sqlite3_busy_timeout(s->db, 10000);
     if (sqlite3_exec(s->db, kSchema, nullptr, nullptr, nullptr) != SQLITE_OK) { wfs_store_close(s); return -EIO; }
+    if (meta_get(s->db, "store_id", s->store_id) != 0) {
+        char id[33];
+        hex_id(id, sizeof id);
+        if (meta_set(s->db, "store_id", id) != 0) { wfs_store_close(s); return -EIO; }
+        s->store_id.assign(id);
+    }
     *out = s;
     return 0;
 }
@@ -87,143 +187,44 @@ extern "C" void wfs_store_close(wfs_store *s) {
     delete s;
 }
 
-extern "C" int wfs_world_init(wfs_store *s, const char *base_dir, wfs_world *out) {
-    if (!s || !base_dir || !out) return -EINVAL;
-    String real;
-    if (int rc = wfs::fs_realpath(base_dir, real)) return rc;
-    wfs_attr a;
-    if (int rc = wfs::fs_lstat(real.c_str(), a)) return rc;
-    if (a.type != WFS_T_DIR) return -ENOTDIR;
-
+extern "C" int wfs_store_status(wfs_store *s, wfs_store_stat *out) {
+    if (!s || !out) return -EINVAL;
+    memset(out, 0, sizeof *out);
+    wfs::copy_str(out->dir, sizeof out->dir, s->dir.c_str());
+    wfs::copy_str(out->store_id, sizeof out->store_id, s->store_id.c_str());
+    out->schema = WFS_STORE_SCHEMA;
     Guard g(s->mu);
     {
-        Stmt q(s->db, "SELECT world_id FROM worlds WHERE parent_world_id IS NULL AND base_dir=? AND state=0");
+        Stmt q(s->db, "SELECT COUNT(*), COALESCE(SUM(entries),0) FROM snapshots WHERE state=?");
         if (!q.ok()) return -EIO;
-        sqlite3_bind_text(q.s, 1, real.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(q.s) == SQLITE_ROW) { *out = (wfs_world)sqlite3_column_int64(q.s, 0); return 0; }
+        q.i64(1, WFS_ST_ACTIVE);
+        if (q.row()) { out->snapshots = (uint64_t)q.col_i64(0); out->snapshot_entries = (uint64_t)q.col_i64(1); }
     }
-    Stmt ins(s->db, "INSERT INTO worlds(parent_world_id, generation, state, base_dir, created_at) VALUES(NULL,0,0,?,?)");
-    if (!ins.ok()) return -EIO;
-    sqlite3_bind_text(ins.s, 1, real.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(ins.s, 2, now_ns());
-    int rc = sqlite3_step(ins.s);
-    if (rc != SQLITE_DONE) return map_sqlite(rc);
-    *out = (wfs_world)sqlite3_last_insert_rowid(s->db);
+    {
+        Stmt q(s->db, "SELECT state, COUNT(*), COALESCE(SUM(entries),0) FROM worlds GROUP BY state");
+        if (!q.ok()) return -EIO;
+        while (q.row()) {
+            uint64_t n = (uint64_t)q.col_i64(1);
+            switch ((int)q.col_i64(0)) {
+            case WFS_ST_ACTIVE: out->worlds_active = n; out->world_entries = (uint64_t)q.col_i64(2); break;
+            case WFS_ST_TRASHED: out->worlds_trashed = n; break;
+            case WFS_ST_DEAD: out->worlds_dead = n; break;
+            default: break;
+            }
+        }
+    }
+    uint64_t avail = 0, total = 0;
+    if (int rc = wfs::fs_free_space(s->dir.c_str(), &avail, &total)) return rc;
+    out->volume_free_bytes = avail;
+    out->volume_total_bytes = total;
+    // 308 B/entry, measured on 27.0 for a 50k-file clone (CLONE_MODEL_MACOS27 §4).
+    out->metadata_estimate_bytes = (out->snapshot_entries + out->world_entries) * 308;
     return 0;
 }
 
-extern "C" int wfs_world_fork(wfs_store *s, wfs_world parent, wfs_world *out) {
-    if (!s || !out || parent == 0) return -EINVAL;
-    Guard g(s->mu);
-    // One transaction, one row: fork cost is independent of workspace size (arch.md §20).
-    exec(s->db, "BEGIN IMMEDIATE");
-    int rc = -EIO;
-    {
-        Stmt chk(s->db, "SELECT generation, state FROM worlds WHERE world_id=?");
-        if (!chk.ok()) goto fail;
-        sqlite3_bind_int64(chk.s, 1, (sqlite3_int64)parent);
-        if (sqlite3_step(chk.s) != SQLITE_ROW) { rc = -ENOENT; goto fail; }
-        if (sqlite3_column_int(chk.s, 1) != WFS_W_ACTIVE) { rc = -ESTALE; goto fail; }
-        int64_t gen = sqlite3_column_int64(chk.s, 0);
-        // Parent's currently visible backing versions become immutable/shared (arch.md §10).
-        Stmt bump(s->db, "UPDATE worlds SET generation=generation+1 WHERE world_id=?");
-        if (!bump.ok()) goto fail;
-        sqlite3_bind_int64(bump.s, 1, (sqlite3_int64)parent);
-        sqlite3_step(bump.s);
-        Stmt ins(s->db, "INSERT INTO worlds(parent_world_id, generation, state, base_dir, created_at) VALUES(?,?,0,NULL,?)");
-        if (!ins.ok()) goto fail;
-        sqlite3_bind_int64(ins.s, 1, (sqlite3_int64)parent);
-        sqlite3_bind_int64(ins.s, 2, gen + 1);
-        sqlite3_bind_int64(ins.s, 3, now_ns());
-        int src = sqlite3_step(ins.s);
-        if (src != SQLITE_DONE) { rc = map_sqlite(src); goto fail; }
-        *out = (wfs_world)sqlite3_last_insert_rowid(s->db);
-    }
-    exec(s->db, "COMMIT");
-    return 0;
-fail:
-    exec(s->db, "ROLLBACK");
+extern "C" int wfs_store_clone_probe(wfs_store *s, const char *src_dir) {
+    if (!s || !src_dir) return -EINVAL;
+    int rc = wfs::fs_clone_probe(s->dir.c_str(), src_dir);
+    if (rc == -EXDEV || rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
     return rc;
 }
-
-extern "C" int wfs_world_discard(wfs_store *s, wfs_world w) {
-    if (!s || w == 0) return -EINVAL;
-    Guard g(s->mu);
-    // Mark only; physical cleanup is background GC (arch.md §17, §27).
-    Stmt u(s->db, "UPDATE worlds SET state=? WHERE world_id=? AND state=0");
-    if (!u.ok()) return -EIO;
-    sqlite3_bind_int(u.s, 1, WFS_W_DISCARDED);
-    sqlite3_bind_int64(u.s, 2, (sqlite3_int64)w);
-    int rc = sqlite3_step(u.s);
-    if (rc != SQLITE_DONE) return map_sqlite(rc);
-    return sqlite3_changes(s->db) == 1 ? 0 : -ENOENT;
-}
-
-extern "C" int wfs_world_list(wfs_store *s, wfs_world *buf, size_t cap, size_t *count) {
-    if (!s || !count) return -EINVAL;
-    Guard g(s->mu);
-    Stmt q(s->db, "SELECT world_id FROM worlds WHERE state=0 ORDER BY world_id");
-    if (!q.ok()) return -EIO;
-    size_t n = 0;
-    while (sqlite3_step(q.s) == SQLITE_ROW) {
-        if (buf && n < cap) buf[n] = (wfs_world)sqlite3_column_int64(q.s, 0);
-        ++n;
-    }
-    *count = n;
-    return 0;
-}
-
-extern "C" int wfs_world_info(wfs_store *s, wfs_world w, wfs_world *parent, wfs_world_state *state,
-                              char *base_dir, size_t cap) {
-    if (!s || w == 0) return -EINVAL;
-    wfs_world p = 0;
-    int st = 0;
-    {
-        Guard g(s->mu);
-        Stmt q(s->db, "SELECT parent_world_id, state FROM worlds WHERE world_id=?");
-        if (!q.ok()) return -EIO;
-        sqlite3_bind_int64(q.s, 1, (sqlite3_int64)w);
-        if (sqlite3_step(q.s) != SQLITE_ROW) return -ENOENT;
-        p = sqlite3_column_type(q.s, 0) == SQLITE_NULL ? 0 : (wfs_world)sqlite3_column_int64(q.s, 0);
-        st = sqlite3_column_int(q.s, 1);
-    }
-    if (parent) *parent = p;
-    if (state) *state = (wfs_world_state)st;
-    if (base_dir && cap) {
-        String base;
-        if (int rc = wfs::store_world_base_dir(s, w, base)) return rc;
-        if (base.size() + 1 > cap) return -ENAMETOOLONG;
-        memcpy(base_dir, base.c_str(), base.size() + 1);
-    }
-    return 0;
-}
-
-extern "C" int wfs_diff(wfs_store *s, wfs_world w, wfs_change_cb cb, void *ctx) {
-    (void)s; (void)w; (void)cb; (void)ctx;
-    return -ENOTSUP; // M2: driven by the `changed` table
-}
-
-namespace wfs {
-
-// Walk parents until the base world and return its base_dir. Bounded by branch
-// depth; runs once per view open, never on the lookup path.
-int store_world_base_dir(wfs_store *s, wfs_world w, String &base_dir) {
-    Guard g(s->mu);
-    Stmt q(s->db, "SELECT parent_world_id, base_dir FROM worlds WHERE world_id=?");
-    if (!q.ok()) return -EIO;
-    for (int depth = 0; depth < 4096; ++depth) {
-        sqlite3_reset(q.s);
-        sqlite3_bind_int64(q.s, 1, (sqlite3_int64)w);
-        if (sqlite3_step(q.s) != SQLITE_ROW) return -ENOENT;
-        if (sqlite3_column_type(q.s, 0) == SQLITE_NULL) {
-            const unsigned char *t = sqlite3_column_text(q.s, 1);
-            if (!t) return -EIO;
-            base_dir.assign((const char *)t);
-            return 0;
-        }
-        w = (wfs_world)sqlite3_column_int64(q.s, 0);
-    }
-    return -ELOOP;
-}
-
-} // namespace wfs
