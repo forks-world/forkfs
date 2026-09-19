@@ -94,7 +94,7 @@ static void race_discard(void *ctx, wfs_id world) {
     (void)ctx;
     (void)world;
     g_race_ran = 1;
-    g_race_rc = wfs_snapshot_discard(g_race_store, g_race_snap, 0);
+    g_race_rc = wfs_snapshot_discard(g_race_store, g_race_snap, 0, 0);
 }
 
 // A copy in the sense of `cp -R`: same bytes, same marker, different inode (P2).
@@ -831,9 +831,30 @@ int main() {
         // And the refusal was about the fork, not a row it left behind: once the world is gone
         // the discard goes through.
         CHECK_OK(wfs_world_discard(rs, rfr.world, 1, 0));
-        CHECK_OK(wfs_snapshot_discard(rs, rsid, 0));
+
+        // PR #1 review (P2): --now means for a snapshot what it means for a world. The tree is
+        // gone when the call returns, the row is DEAD, and the trash is empty afterwards.
+        char sdir[4096];
+        snprintf(sdir, sizeof sdir, "%s/snapshots/S%llu", rstore, (unsigned long long)rsid);
+        CHECK(exists(sdir));
+        CHECK_OK(wfs_snapshot_discard(rs, rsid, 1, 0));
+        CHECK(!exists(sdir));
         CHECK_OK(wfs_snapshot_info(rs, rsid, &rsr));
+        CHECK(rsr.state == WFS_ST_DEAD);
+        wfs_trash_stat rts;
+        memset(&rts, 0, sizeof rts);
+        CHECK_OK(wfs_gc_status(rs, 0, &rts));
+        CHECK(rts.entries == 0 && rts.snapshots == 0);
+        // Without --now it is still a rename into the trash and nothing more.
+        wfs_id rsid2 = 0;
+        ropts.name = "race-later";
+        CHECK_OK(wfs_snapshot_create(rs, rsrc, &ropts, &rsid2));
+        CHECK_OK(wfs_snapshot_discard(rs, rsid2, 0, 0));
+        CHECK_OK(wfs_snapshot_info(rs, rsid2, &rsr));
         CHECK(rsr.state == WFS_ST_TRASHED);
+        memset(&rts, 0, sizeof rts);
+        CHECK_OK(wfs_gc_status(rs, 0, &rts));
+        CHECK(rts.entries == 1 && rts.snapshots == 1);
         wfs_store_close(rs);
     }
 

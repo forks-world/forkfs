@@ -646,8 +646,13 @@ int wfs_gc_pending(wfs_store *s, int64_t retention_secs, int *worker_running);
  * The discard itself is P4, the same path a world takes: <store>/snapshots/S<n> is renamed into
  * <store>/trash, the row becomes TRASHED, and the background collector unlinks it once the
  * retention period is up -- reopening the gate directory (0700) on its way in, since a 0000 root
- * cannot even be listed. */
-int wfs_snapshot_discard(wfs_store *s, wfs_id id, int force);
+ * cannot even be listed.
+ *
+ * `immediate` is `--now`, and means the same thing it means for a world: do not wait for the
+ * collector, unlink the tree before returning and leave the row DEAD. It is still the crash-safe
+ * two-step (rename to *.deleting, then unlink), so an interrupted --now leaves something the
+ * next collector finishes rather than something that looks restorable. */
+int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int force);
 
 /* ---- test seam --------------------------------------------------------------------------------
  *

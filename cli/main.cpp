@@ -770,7 +770,7 @@ static int cmd_inspect(wfs_store *s, const char *arg) {
 
 // T2.2: `discard S<n>`. The refusal has to name what is holding the snapshot, because "in use"
 // with no name is the least actionable message this CLI could print.
-static int cmd_discard_snapshot(wfs_store *s, wfs_id sid, int force, int64_t retention) {
+static int cmd_discard_snapshot(wfs_store *s, wfs_id sid, int now, int force, int64_t retention) {
     wfs_snapshot_rec sr;
     int rc = wfs_snapshot_info(s, sid, &sr);
     if (rc) return fail("discard", rc);
@@ -779,7 +779,7 @@ static int cmd_discard_snapshot(wfs_store *s, wfs_id sid, int force, int64_t ret
         snprintf(why, sizeof why, "S%llu is already in the trash", (unsigned long long)sid);
         return refuse(why, "world fs gc --status");
     }
-    rc = wfs_snapshot_discard(s, sid, force);
+    rc = wfs_snapshot_discard(s, sid, now, force);
     if (rc == WFS_E_SNAPSHOT_IN_USE) {
         // Say who. Worlds first (they are the hard refusal), then pool entries.
         char why[512];
@@ -832,6 +832,10 @@ static int cmd_discard_snapshot(wfs_store *s, wfs_id sid, int force, int64_t ret
         return refuse(why, "world fs list");
     }
     if (rc) return fail("discard", rc);
+    if (now) {
+        printf("S%llu deleted\n", (unsigned long long)sid);
+        return EX_OK;
+    }
     printf("S%llu moved to the trash; the collector deletes it after the retention period\n",
            (unsigned long long)sid);
     spawn_gc_worker(s, retention);
@@ -851,7 +855,7 @@ static int cmd_discard(wfs_store *s, int argc, char **argv) {
         else if (argv[i][0] != '-' && target.kind == WFS_K_NONE) target = parse_ref(argv[i]);
         else usage();
     }
-    if (target.kind == WFS_K_SNAPSHOT && target.id) return cmd_discard_snapshot(s, target.id, force, retention);
+    if (target.kind == WFS_K_SNAPSHOT && target.id) return cmd_discard_snapshot(s, target.id, now, force, retention);
     if (target.kind != WFS_K_WORLD || !target.id) usage();
     w = target.id;
     wfs_world_rec r;

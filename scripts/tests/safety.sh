@@ -617,6 +617,33 @@ rm -f "$P17STORE/metadata.db"
 check P17 "an empty store directory is new, not damaged" 0 -- \
       "$WORLD" --store "$SCRATCH/p17-fresh" fs status
 
+# ---- PR #1 review (P2): `discard S<n> --now` deletes, it does not just move -------------------
+# A store of its own: the case is a snapshot nobody references, and the stores above are full of
+# worlds holding theirs.
+RSTORE="$SCRATCH/review-store"
+rv() { "$WORLD" --store "$RSTORE" "$@"; }
+mkdir -p "$SCRATCH/review-src/sub"
+echo one > "$SCRATCH/review-src/a.txt"
+echo two > "$SCRATCH/review-src/sub/b.txt"
+rv fs init "$SCRATCH/review-src" --name rv1 > /dev/null 2>&1
+out=$(rv fs discard S1 --now 2>&1)
+if [ ! -e "$RSTORE/snapshots/S1" ] && [ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ]; then
+    ok PR1 "discard S<n> --now deletes the snapshot tree before it returns"
+else
+    bad PR1 "discard S<n> --now deletes the snapshot tree before it returns"
+    echo "$out" | sed 's/^/        /'; ls "$RSTORE/trash" 2>/dev/null | sed 's/^/        /'
+fi
+echo "$out" | grep -q "^S1 deleted" && ok PR1 "it says the snapshot is deleted, not collected later" \
+                                    || { bad PR1 "it says the snapshot is deleted, not collected later"; echo "$out" | sed 's/^/        /'; }
+rv fs gc --status | grep -q "^trash: *0 entries" && ok PR1 "and leaves nothing in the trash" \
+                                                 || { bad PR1 "and leaves nothing in the trash"; rv fs gc --status | sed 's/^/        /'; }
+# Without --now it still only moves the tree into the trash.
+rv fs init "$SCRATCH/review-src" --name rv2 > /dev/null 2>&1
+rv fs discard S2 > /dev/null 2>&1
+[ -n "$(ls -d "$RSTORE"/trash/S2-* 2>/dev/null)" ] && ok PR1 "without --now the snapshot only moves to the trash" \
+                                                   || bad PR1 "without --now the snapshot only moves to the trash"
+rv fs gc --now --retention 0 > /dev/null 2>&1
+
 echo
 "$WORLD" fs status | sed 's/^/      /'
 echo

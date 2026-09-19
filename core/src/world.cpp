@@ -1234,7 +1234,7 @@ int snapshot_refs_locked(wfs_store *s, wfs_id id, SnapRefs &out) {
 
 } // namespace
 
-extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int force) {
+extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int force) {
     if (!s || !id) return -EINVAL;
     // A look before the transaction, for the state errors only. Everything the discard *decides*
     // is decided again below, under the write lock.
@@ -1255,6 +1255,8 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int force) {
         if (int rc = wfs_pool_drain(s, id, &drained); rc && rc != -ENOENT) return rc;
     }
 
+    String trash;
+    {
     // One BEGIN IMMEDIATE for the reference check *and* the state transition (PR #1 review).
     // BEGIN IMMEDIATE takes the database write lock, which is the same lock a pool claim and a
     // world row insert take, so a fork is either entirely before this transaction (its CREATING
@@ -1274,7 +1276,7 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int force) {
     String snapdir = snapshot_dir_of(r);
     char leaf[80];
     ::snprintf(leaf, sizeof leaf, "S%llu-%lld", (unsigned long long)id, (long long)now_sec());
-    String trash = joinp(joinp(s->dir.c_str(), "trash").c_str(), leaf);
+    trash = joinp(joinp(s->dir.c_str(), "trash").c_str(), leaf);
     if (!exists(snapdir.c_str())) trash.assign("");   // already gone: a reconcile, not a move
     Stmt u(s->db, "UPDATE snapshots SET state=?, trash_path=?, trashed_at=? WHERE id=?");
     if (!u.ok()) return -EIO;
@@ -1289,6 +1291,36 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int force) {
     if (trash.size()) {
         if (int rc = wfs::fs_rename(snapdir.c_str(), trash.c_str())) return rc;
     }
+    t.commit();
+    }
+    if (!immediate) return 0;
+
+    // --now: delete it here instead of leaving it to the collector, which is what `discard
+    // W<n> --now` has always done and what the CLI has always advertised for S<n> as well
+    // (PR #1 review). The same two steps in the same order: rename to *.deleting first, so an
+    // interrupted delete is visibly not a snapshot any more, then unlink, then the row is DEAD.
+    if (trash.size()) {
+        String deleting;
+        int mrc = trash_mark_deleting(trash.c_str(), deleting);
+        if (mrc && mrc != -ENOENT) return mrc;
+        if (!mrc) {
+            {
+                Guard g(s->mu);
+                Txn t(s->db);
+                Stmt u(s->db, "UPDATE snapshots SET trash_path=? WHERE id=?");
+                if (u.ok()) { u.text(1, deleting.c_str()); u.i64(2, (int64_t)id); u.step(); }
+                t.commit();
+            }
+            if (int rc = trash_unlink(deleting.c_str(), 4, nullptr)) return rc;
+        }
+    }
+    Guard g(s->mu);
+    Txn t(s->db);
+    Stmt u(s->db, "UPDATE snapshots SET state=?, trash_path='' WHERE id=?");
+    if (!u.ok()) return -EIO;
+    u.i64(1, WFS_ST_DEAD);
+    u.i64(2, (int64_t)id);
+    if (u.step() != SQLITE_DONE) return -EIO;
     t.commit();
     return 0;
 }
