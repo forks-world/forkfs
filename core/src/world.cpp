@@ -1437,35 +1437,61 @@ int trash_crash_seam(int phase, int is_snapshot, wfs_id id, const char *trash_pa
 // returning before the space was back, and a DEAD row for a tree that is still on disk. The
 // snapshot path already followed the rename; both go through here now, and -ENOENT means what
 // it is supposed to mean -- at neither name, so somebody else finished it.
+// PR #1 review (9th round), P18: and every row write it makes is predicated on the row it
+// followed. `trash` is what the row said when this call started, and both UPDATEs below carry
+// it -- still TRASHED, still naming the tree this call is deleting. `discard W<n> --now`
+// overlapping `restore W<n>` was the case that had to answer for it: the restore renames the
+// tree home and marks the row ACTIVE while this helper is between its lstat and its mark, the
+// mark then answers -ENOENT ("already gone"), and the final UPDATE -- which had no predicate at
+// all -- buried the world that had just come back. Zero rows changed is -ESTALE, never 0: the
+// caller is told its `--now` did not happen rather than told the tree is gone.
 int trash_delete_now(wfs_store *s, wfs_id id, int is_snapshot, const String &trash) {
+    String expect(trash);   // the trash_path this call is acting on behalf of
     String tp(trash);
     trash_follow_deleting(tp);
+    if (int hrc = trash_crash_seam(4, is_snapshot, id, tp.c_str())) return hrc;
     if (tp.size()) {
         String deleting;
         int mrc = trash_mark_deleting(tp.c_str(), deleting);
         if (mrc && mrc != -ENOENT) return mrc;
         if (!mrc) {
-            {
+            if (::strcmp(deleting.c_str(), expect.c_str())) {
                 Guard g(s->mu);
                 Txn t(s->db);
-                Stmt u(s->db, is_snapshot ? "UPDATE snapshots SET trash_path=? WHERE id=?"
-                                          : "UPDATE worlds SET trash_path=? WHERE id=?");
-                if (u.ok()) { u.text(1, deleting.c_str()); u.i64(2, (int64_t)id); u.step(); }
+                Stmt u(s->db,
+                       is_snapshot
+                           ? "UPDATE snapshots SET trash_path=? WHERE id=? AND state=2 AND trash_path=?"
+                           : "UPDATE worlds SET trash_path=? WHERE id=? AND state=2 AND trash_path=?");
+                if (!u.ok()) return -EIO;
+                u.text(1, deleting.c_str());
+                u.i64(2, (int64_t)id);
+                u.text(3, expect.c_str());
+                if (u.step() != SQLITE_DONE) return -EIO;
+                int changed = sqlite3_changes(s->db);
                 t.commit();
+                // The row moved on between the lstat and the rename. The tree now wears the
+                // `.deleting` name, which is a name no restore will touch and the next collector
+                // finishes -- so stop here rather than unlink a tree this row no longer owns.
+                if (!changed) return -ESTALE;
+                expect = deleting;
             }
             if (int rc = trash_unlink(deleting.c_str(), 4, nullptr)) return rc;
         }
     }
     Guard g(s->mu);
     Txn t(s->db);
-    Stmt u(s->db, is_snapshot ? "UPDATE snapshots SET state=?, trash_path='' WHERE id=?"
-                              : "UPDATE worlds SET state=?, trash_path='' WHERE id=?");
+    Stmt u(s->db,
+           is_snapshot
+               ? "UPDATE snapshots SET state=?, trash_path='' WHERE id=? AND state=2 AND trash_path=?"
+               : "UPDATE worlds SET state=?, trash_path='' WHERE id=? AND state=2 AND trash_path=?");
     if (!u.ok()) return -EIO;
     u.i64(1, WFS_ST_DEAD);
     u.i64(2, (int64_t)id);
+    u.text(3, expect.c_str());
     if (u.step() != SQLITE_DONE) return -EIO;
+    int changed = sqlite3_changes(s->db);
     t.commit();
-    return 0;
+    return changed ? 0 : -ESTALE;
 }
 
 } // namespace

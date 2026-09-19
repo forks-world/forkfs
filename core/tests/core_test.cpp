@@ -308,6 +308,27 @@ static void restore_before_delete(void *ctx, int is_snapshot, wfs_id row, const 
     g_del_rc = wfs_world_restore(g_del_store, g_del_world);
 }
 
+// PR #1 review (9th round, P1): `discard W<n> --now`'s own window. Phase 4 is inside the helper
+// that deletes a trash entry here and now, after it has followed the tree to whatever name it
+// has and before it marks it `.deleting`. What runs in there is a whole `restore` on a second
+// handle -- the tree goes home, the row goes ACTIVE -- and what must happen next is that `--now`
+// notices the row is not its row any more instead of burying it.
+static wfs_store *g_now_store = NULL;
+static wfs_id g_now_world;
+static int g_now_ran;
+static int g_now_rc = -1;
+static int restore_before_now(void *ctx, int phase, int is_snapshot, wfs_id id,
+                              const char *trash_path) {
+    (void)ctx;
+    (void)is_snapshot;
+    (void)id;
+    (void)trash_path;
+    if (phase != 4 || g_now_ran) return 0;
+    g_now_ran++;
+    g_now_rc = wfs_world_restore(g_now_store, g_now_world);
+    return 0;
+}
+
 // PR #1 review (9th round, P1): the collector's own *scan* window. The seam runs after the scan
 // has read which trash paths the rows claim and before the readdir that decides what nothing
 // claims; what it does in there is a whole `discard` on a second handle, so the tree lands in
@@ -2249,6 +2270,85 @@ int main() {
         wfs_store_close(nb);
         wfs_store_close(na);
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", nstore, (unsigned long long)n1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
+    // ---- PR #1 review (9th round, P1): `--now` never buries a world that came back -----------
+    //
+    // The helper behind `discard W<n> --now` followed the tree to whatever name it had, unlinked
+    // it, and then wrote `state=DEAD, trash_path=''` with no predicate at all. A `restore W<n>`
+    // landing between the lstat and the mark renames the tree home and marks the row ACTIVE; the
+    // mark then answers -ENOENT, which reads as "somebody deleted it already", and that final
+    // unconditional UPDATE buried a live world sitting at its home path. Both writes now carry
+    // the state and the trash path this call is acting on behalf of, and zero rows changed is
+    // -ESTALE rather than a silent success (docs/M1_DESIGN.md P18).
+    {
+        char mstore[4096], msrc[4096], mw[4096];
+        join(mstore, sizeof mstore, root, "now-store");
+        join(msrc, sizeof msrc, root, "now-src");
+        CHECK(mkdir(msrc, 0755) == 0);
+        join(p, sizeof p, msrc, "a.txt");
+        write_file(p, "one\n");
+        wfs_store *ma = NULL;
+        CHECK_OK(wfs_store_open(mstore, &ma));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "mb";
+        wfs_id m1 = 0;
+        CHECK_OK(wfs_snapshot_create(ma, msrc, &sopts, &m1));
+        wfs_ref mf = {WFS_K_SNAPSHOT, m1};
+        memset(&opts, 0, sizeof opts);
+        join(mw, sizeof mw, worlds, "mworld");
+        wfs_id mw1 = 0;
+        CHECK_OK(wfs_world_create(ma, mf, mw, &opts, &mw1));
+        CHECK_OK(wfs_world_discard(ma, mw1, 0, 0));
+        wfs_world_rec mwr;
+        CHECK_OK(wfs_world_info(ma, mw1, &mwr));
+        CHECK(mwr.state == WFS_ST_TRASHED && !exists(mw));
+
+        // The restore runs on a handle of its own, the way another process would.
+        wfs_store *mb = NULL;
+        CHECK_OK(wfs_store_open(mstore, &mb));
+        g_now_store = mb;
+        g_now_world = mw1;
+        g_now_ran = 0;
+        g_now_rc = -1;
+        wfs_test_trash_crash = restore_before_now;
+        CHECK_RC(wfs_world_discard(ma, mw1, 1, 0), -ESTALE);
+        wfs_test_trash_crash = NULL;
+        CHECK(g_now_ran == 1);
+        CHECK_OK(g_now_rc);                       // the restore is the one that won
+        CHECK_OK(wfs_world_info(ma, mw1, &mwr));
+        CHECK(mwr.state == WFS_ST_ACTIVE && mwr.present && exists(mw));
+        join(p, sizeof p, mw, "a.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "one\n"));            // the tree came home whole
+        CHECK_OK(wfs_world_diff(ma, mw1, 0, NULL, NULL));
+
+        // And the ordinary `--now` is untouched, from both of its two entry points: straight
+        // from ACTIVE, and brought forward on a world that is already in the trash.
+        CHECK_OK(wfs_world_discard(ma, mw1, 1, 0));
+        CHECK_OK(wfs_world_info(ma, mw1, &mwr));
+        CHECK(mwr.state == WFS_ST_DEAD && !exists(mw));
+        wfs_id mw2 = 0;
+        char mw2p[4096];
+        join(mw2p, sizeof mw2p, worlds, "mworld2");
+        CHECK_OK(wfs_world_create(ma, mf, mw2p, &opts, &mw2));
+        CHECK_OK(wfs_world_discard(ma, mw2, 0, 0));
+        CHECK_OK(wfs_world_discard(ma, mw2, 1, 0));
+        CHECK_OK(wfs_world_info(ma, mw2, &mwr));
+        CHECK(mwr.state == WFS_ST_DEAD && !exists(mw2p));
+        // ... and a snapshot's `--now` still goes all the way through the same helper.
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "mb2";
+        wfs_id m2 = 0;
+        CHECK_OK(wfs_snapshot_create(ma, msrc, &sopts, &m2));
+        CHECK_OK(wfs_snapshot_discard(ma, m2, 1, 0));
+        wfs_snapshot_rec msr;
+        CHECK_OK(wfs_snapshot_info(ma, m2, &msr));
+        CHECK(msr.state == WFS_ST_DEAD);
+        wfs_store_close(mb);
+        wfs_store_close(ma);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", mstore, (unsigned long long)m1);
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 

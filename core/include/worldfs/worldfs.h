@@ -759,7 +759,12 @@ extern void *wfs_test_before_snapshot_clone_ctx;
  * protocol run backwards -- 2 just after the row has been committed in WFS_ST_TRASHING with the
  * tree still in the trash, 3 just after the rename home and before the commit that makes the row
  * ACTIVE. `trash_path` is the name the tree has in the trash. Returning 0 from phase 2 is what
- * lets a test run a whole `wfs_snapshot_discard()` inside the restore's window. */
+ * lets a test run a whole `wfs_snapshot_discard()` inside the restore's window.
+ *
+ * PR #1 review (9th round): phase 4 is `--now`'s own window -- inside the helper that deletes a
+ * trash entry here and now, after the tree has been followed to whatever name it has and before
+ * it is marked `.deleting`. `trash_path` is the name that was found. A whole
+ * `wfs_world_restore()` run in there is the race the predicated row writes exist for. */
 extern int (*wfs_test_trash_crash)(void *ctx, int phase, int is_snapshot, wfs_id id,
                                    const char *trash_path);
 extern void *wfs_test_trash_crash_ctx;

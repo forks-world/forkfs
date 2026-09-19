@@ -874,8 +874,13 @@ static int cmd_discard_snapshot(wfs_store *s, wfs_id sid, int now, int force, in
         return refuse(why, hint);
     }
     if (rc == -ESTALE) {
+        // PR #1 review (9th round): with --now this can also mean the row moved on while the
+        // discard was following its tree, so the state is re-read rather than reported from the
+        // snapshot taken before the call.
+        wfs_snapshot_rec after;
+        int st = wfs_snapshot_info(s, sid, &after) == 0 ? after.state : sr.state;
         char why[96];
-        snprintf(why, sizeof why, "S%llu is %s, not active", (unsigned long long)sid, state_name(sr.state));
+        snprintf(why, sizeof why, "S%llu is %s, not active", (unsigned long long)sid, state_name(st));
         return refuse(why, "world fs list");
     }
     if (rc) return fail("discard", rc);
@@ -923,6 +928,17 @@ static int cmd_discard(wfs_store *s, int argc, char **argv) {
     int rc = wfs_world_discard(s, w, now, force);
     if (rc == WFS_E_WORLD_BUSY) return busy_refusal(s, w, "discard");
     if (rc == WFS_E_UNREGISTERED) return explain_path(s, r.path, rc, "discard");
+    if (rc == -ESTALE) {
+        // PR #1 review (9th round): the row moved on while this discard was following its tree
+        // -- a `restore` that won the race, or a collector that finished the entry first.
+        // Nothing was deleted and nothing was buried; say which state it is in now.
+        wfs_world_rec after;
+        int st = wfs_world_info(s, w, &after) == 0 ? after.state : r.state;
+        char why[160];
+        snprintf(why, sizeof why, "W%llu is %s now; it moved on while this discard was running",
+                 (unsigned long long)w, state_name(st));
+        return refuse(why, "world fs list");
+    }
     if (rc) return fail("discard", rc);
     if (now) printf("W%llu deleted\n", (unsigned long long)w);
     else {
