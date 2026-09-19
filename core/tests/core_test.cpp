@@ -1034,6 +1034,56 @@ int main() {
         CHECK(chmod(snap, 0700) == 0); // so the test's own rm_rf can clear it
     }
 
+    // ---- PR #1 review (3rd round): a pthread_create that fails for one slot and not the next --
+    //
+    // Both parallel loops in the core wrote the handle to th[i] while `started` merely counted,
+    // so a refused slot 0 followed by three successes made the join loop join th[0] (never
+    // written) and never join the live worker in th[3] -- which is then free to keep reading a
+    // RestoreJob on a stack frame that has already returned. They both go through
+    // threads_start() now, which writes the handles it really started contiguously. With slot 0
+    // refused, everything still has to come out exactly right, one worker fewer.
+    {
+        // The helper's own contract first: slot 0 refused, slots 1..3 taken. Three workers
+        // start, three handles are written contiguously, all three join. The old loop wrote
+        // th[1..3] and joined th[0..2]: one uninitialised join, one worker never joined.
+        int started = 0, joined = 0;
+        CHECK_OK(wfs_test_threads_start(4, 0x1u, &started, &joined));
+        CHECK(started == 3 && joined == 3);
+        CHECK_OK(wfs_test_threads_start(4, 0x5u, &started, &joined));   // slots 0 and 2
+        CHECK(started == 2 && joined == 2);
+        CHECK_OK(wfs_test_threads_start(4, 0u, &started, &joined));
+        CHECK(started == 4 && joined == 4);
+
+        char tsrc[4096], wth[4096];
+        join(tsrc, sizeof tsrc, root, "threads");
+        CHECK(mkdir(tsrc, 0755) == 0);
+        for (int i = 0; i < 12; ++i) {   // 12 groups: past hardlinks.cpp's parallel threshold
+            snprintf(p, sizeof p, "%s/g%d", tsrc, i);
+            write_file(p, "linked\n");
+            snprintf(q, sizeof q, "%s/g%d-b", tsrc, i);
+            CHECK(link(p, q) == 0);
+        }
+        wfs_test_thread_fail_mask = 1;                 // slot 0 never starts
+        wfs_id sth = 0;
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "threads";
+        CHECK_OK(wfs_snapshot_create(s, tsrc, &sopts, &sth));   // the scan walk is 4 threads
+        wfs_ref fth = {WFS_K_SNAPSHOT, sth};
+        join(wth, sizeof wth, worlds, "wthreads");
+        memset(&opts, 0, sizeof opts);
+        wfs_id wthid = 0;
+        CHECK_OK(wfs_world_create(s, fth, wth, &opts, &wthid));  // and the hardlink replay
+        wfs_test_thread_fail_mask = 0;
+        CHECK_OK(wfs_snapshot_verify(s, sth, &vr));
+        for (int i = 0; i < 12; ++i) {
+            snprintf(p, sizeof p, "%s/g%d", wth, i);
+            snprintf(q, sizeof q, "%s/g%d-b", wth, i);
+            CHECK(ino_of(p) == ino_of(q));
+            CHECK(nlink_of(p) == 2);
+        }
+        CHECK(n_with_prefix(wth, ".wfs-hl-") == 0);
+    }
+
     wfs_store_close(s);
     rm_rf(root);
     printf("core_test: all OK\n");

@@ -689,6 +689,14 @@ extern void *wfs_test_after_pool_claim_ctx;
 extern int (*wfs_test_before_fork_publish)(void *ctx, wfs_id world, const char *tmp_path);
 extern void *wfs_test_before_fork_publish_ctx;
 
+/* And the thing no test can provoke on a healthy machine: a pthread_create that fails for one
+ * worker slot and succeeds for a later one. A bit set here refuses that slot (slots 0..31); 0,
+ * the value it has everywhere else, means every slot is started normally. */
+extern unsigned wfs_test_thread_fail_mask;
+/* A unit test of that starter: start `want` workers with `fail_mask` refused, join them, and
+ * report how many started and how many joined. 0 = the two agree with the number that ran. */
+int wfs_test_threads_start(int want, unsigned fail_mask, int *started, int *joined);
+
 #ifdef __cplusplus
 }
 #endif

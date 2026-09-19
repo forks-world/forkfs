@@ -21,6 +21,9 @@
 #define WFS_XATTR_NOFOLLOW 0
 #endif
 
+// PR #1 review (3rd round): the seam for a partial pthread_create failure. See threads_start.
+extern "C" unsigned wfs_test_thread_fail_mask = 0;
+
 namespace wfs {
 
 namespace {
@@ -90,6 +93,23 @@ int fs_readlink(const char *path, char *buf, size_t cap, size_t *len) {
 // workspace) stays visible. Do not try removexattr here: it is denied, and every sandbox denial
 // costs ~1ms of kernel violation reporting per create.
 #endif
+
+int threads_start(pthread_t *th, int want, void *(*fn)(void *), void *arg) {
+    int started = 0;
+    for (int i = 0; i < want; ++i) {
+        if (i < 32 && (wfs_test_thread_fail_mask & (1u << i))) continue;
+        if (::pthread_create(&th[started], nullptr, fn, arg) == 0) ++started;
+    }
+    return started;
+}
+
+namespace {
+struct ThreadsProbe { unsigned ran = 0; };
+void *threads_probe_worker(void *p) {
+    __atomic_fetch_add(&((ThreadsProbe *)p)->ran, 1u, __ATOMIC_RELAXED);
+    return nullptr;
+}
+} // namespace
 
 int fs_mkfile(const char *path, uint32_t mode) {
     int fd = ::open(path, O_CREAT | O_EXCL | O_WRONLY, (mode_t)mode);
@@ -505,9 +525,7 @@ int fs_walk_tree_ex(const char *root, int threads, fs_dir_order order, void *ctx
         walk_worker(&w);
     } else {
         pthread_t th[16];
-        int started = 0;
-        for (int i = 0; i < threads; ++i)
-            if (pthread_create(&th[i], nullptr, walk_worker, &w) == 0) ++started;
+        int started = threads_start(th, threads, walk_worker, &w);
         if (started == 0) { w.threads = 1; walk_worker(&w); }
         else {
             if (started != threads) { pthread_mutex_lock(&w.mu); w.threads = started; pthread_cond_broadcast(&w.cv); pthread_mutex_unlock(&w.mu); }
@@ -814,3 +832,26 @@ uint64_t fs_events_current_id(void) { return 0; }
 #endif
 
 } // namespace wfs
+
+// PR #1 review (3rd round). A unit test of threads_start, because the bug it fixes is not one a
+// caller can reliably observe: joining a pthread_t that was never written is undefined, and on a
+// good day it merely fails. Here the array is zeroed first, so an unwritten slot is a handle no
+// join can succeed on, and the contract is checked directly: threads_start writes the handles it
+// really started into th[0..n), every one of them joins, and the number of workers that ran is
+// the number that were joined -- nobody left running behind the caller's back.
+extern "C" int wfs_test_threads_start(int want, unsigned fail_mask, int *started, int *joined) {
+    if (want <= 0 || want > 16 || !started || !joined) return -EINVAL;
+    pthread_t th[16];
+    memset(th, 0, sizeof th);
+    unsigned save = wfs_test_thread_fail_mask;
+    wfs_test_thread_fail_mask = fail_mask;
+    wfs::ThreadsProbe probe;
+    int n = wfs::threads_start(th, want, wfs::threads_probe_worker, &probe);
+    wfs_test_thread_fail_mask = save;
+    int ok = 0;
+    for (int i = 0; i < n; ++i)
+        if (::pthread_join(th[i], nullptr) == 0) ++ok;
+    *started = n;
+    *joined = ok;
+    return (unsigned)ok == __atomic_load_n(&probe.ran, __ATOMIC_RELAXED) ? 0 : -EIO;
+}

@@ -405,9 +405,7 @@ int hardlinks_restore(const char *tree_root, const HardlinkSet &set, const char 
     j.verify_root = verify_root;
     j.next = 0;
     pthread_t th[kThreads];
-    int started = 0;
-    for (int i = 0; i < kThreads; ++i)
-        if (::pthread_create(&th[i], nullptr, restore_worker, &j) == 0) ++started;
+    int started = threads_start(th, kThreads, restore_worker, &j);
     if (started == 0) restore_worker(&j);   // no threads to be had: do it here
     for (int i = 0; i < started; ++i) ::pthread_join(th[i], nullptr);
     if (out) *out = j.agg;

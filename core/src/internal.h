@@ -51,6 +51,15 @@ using InodeTable = stdb::container::dense_map<uint64_t, NodeRec>;
 // ---- platform layer ----------------------------------------------------------------------
 // platform_posix.cpp: everything POSIX. platform_darwin.cpp: clonefile / chflags / FSEvents.
 
+// Starts up to `want` workers running fn(arg) and returns how many really started, writing THEIR
+// handles into th[0..n). The handles must be contiguous: pthread_create can fail for one slot and
+// succeed for the next, and a loop that writes th[i] while counting into `started` then joins an
+// uninitialised handle and never joins the live worker -- which is free to keep reading the
+// caller's stack after the caller has returned. `th` must have room for `want` handles.
+// wfs_test_thread_fail_mask (worldfs.h) refuses the slots whose bit is set; it is 0 in every run
+// that is not a test of this function.
+int threads_start(pthread_t *th, int want, void *(*fn)(void *), void *arg);
+
 int fs_lstat(const char *path, wfs_attr &out);
 int fs_readlink(const char *path, char *buf, size_t cap, size_t *len);
 int fs_mkfile(const char *path, uint32_t mode);
