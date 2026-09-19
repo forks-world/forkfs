@@ -203,7 +203,8 @@ inode of its root, so moving it is fine (P1) and copying it is caught (P2); snap
 immutable and verifiable (P3); `discard` is reversible (P4); cross-volume clones are detected by
 cloning, not by comparing `st_dev` (P6); `/`, `$HOME`, the store, and anything inside a World or
 Snapshot are refused (P7); a fork that dies half way leaves only a `*.wfs-tmp` tree for `gc` (P8);
-hardlinks that the clone will break are counted and reported (P9); `diff` treats FSEvents as
+hardlinks that the clone breaks are recorded in the snapshot's manifest and rebuilt inside every
+clone of it -- fork, checkpoint and pool entry -- so two names stay one file (P9, T2.5); `diff` treats FSEvents as
 candidates and decides by comparing against the snapshot, falling back to a full scan the moment
 the event stream cannot account for everything (P10); free space is checked before
 cloning (P11); every metadata mutation is a `BEGIN IMMEDIATE` transaction and world-level

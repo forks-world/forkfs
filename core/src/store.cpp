@@ -90,6 +90,10 @@ const char *kMigrations[] = {
     // T2.2
     "ALTER TABLE snapshots ADD COLUMN trash_path TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE snapshots ADD COLUMN trashed_at INTEGER NOT NULL DEFAULT 0",
+    // T2.5 (P9): the hardlink groups recorded in the snapshot's manifest. hl_groups is what a
+    // fork checks to decide whether the manifest has to be read at all.
+    "ALTER TABLE snapshots ADD COLUMN hl_groups INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE snapshots ADD COLUMN hl_external INTEGER NOT NULL DEFAULT 0",
 };
 
 // Additive revision of schema v2. `PRAGMA user_version` carries SCHEMA*100 + REV, so a store
@@ -97,7 +101,7 @@ const char *kMigrations[] = {
 // compared user_version against the schema number alone, which meant a store already stamped
 // with 2 never saw a later ALTER TABLE. VERSION (and therefore P13) is untouched -- an older
 // core opens such a store and simply does not use the new columns.
-const int kSchemaRev = 1;
+const int kSchemaRev = 2;
 inline int user_version_want(void) { return WFS_STORE_SCHEMA * 100 + kSchemaRev; }
 
 void hex_id(char *out, size_t n) { // n = 33 for 32 hex digits + NUL

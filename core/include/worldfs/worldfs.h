@@ -189,6 +189,12 @@ typedef struct wfs_snapshot_rec {
     int hard;                    /* 1 = per-entry UF_IMMUTABLE, 0 = gate directory (default) */
     uint32_t root_mode;          /* the source root's own mode, restored on the fork's clone */
     int64_t trashed_at;          /* T2.2: unix seconds, non-zero once discarded */
+    /* T2.5, P9: the hardlink groups this snapshot recorded. hl_groups counts the groups whose
+     * names are all inside the tree -- those are rebuilt inside every clone of it, so link
+     * identity survives a fork. hl_external counts the names whose inode also has names
+     * outside the tree: those cannot be rebuilt and stay independent copies. */
+    uint64_t hl_groups;
+    uint64_t hl_external;
 } wfs_snapshot_rec;
 
 typedef struct wfs_snapshot_opts {
@@ -262,6 +268,9 @@ typedef struct wfs_fork_result {
     int from_pool;        /* 1 = a pre-cloned world was handed out (T1.5) */
     uint64_t pool_left;   /* ready entries left in that snapshot's pool afterwards */
     int64_t elapsed_us;   /* wall time inside the core, without process start */
+    uint64_t hardlinks;   /* T2.5: names relinked to their canonical file inside the clone.
+                           * 0 on a pool hit -- the entry was given its hardlinks back when it
+                           * was filled, so the hand-out stays O(1). */
 } wfs_fork_result;
 
 /* Fork: clone `from` (a snapshot or a live world) into target_path. Publish order (P8):

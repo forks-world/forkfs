@@ -64,8 +64,8 @@ has_hint P6 "the refusal names --store / --copy" "--store" -- "$WORLD" fs init /
 # ---- init: a protected snapshot -------------------------------------------------------------
 out=$("$WORLD" fs init "$PROJ" --name proj 2>&1) || { echo "$out"; echo "init failed"; exit 1; }
 echo "$out" | sed 's/^/      /'
-if echo "$out" | grep -qi "hardlink"; then ok P9 "init warns that the tree has hardlinks"
-else bad P9 "init warns that the tree has hardlinks"; fi
+if echo "$out" | grep -qi "hardlink"; then ok P9 "init reports the hardlinks it found in the tree"
+else bad P9 "init reports the hardlinks it found in the tree"; fi
 
 SNAP=$("$WORLD" fs inspect S1 | awk '/^path:/{print $2}')
 
@@ -539,6 +539,50 @@ sys.exit(0 if os.path.realpath(m.get("store_path","")) == os.path.realpath(sys.a
 EOF
 then ok T2.3 "a pool-served world's .world names its store path too"
 else bad T2.3 "a pool-served world's .world names its store path too"; sed 's/^/        /' "$SCRATCH/t23.log"; fi
+
+# ---- T2.5 (P9): hardlinks inside a tree are rebuilt inside every clone of it --------------------
+# $PROJ/src/a.c and $PROJ/src/a-link.c are one file with two names (line 56). clonefile breaks
+# that (CLONE_MODEL_MACOS27 §11); the snapshot's manifest carries the group and every clone --
+# fork, pool entry, checkpoint -- gets it back.
+"$WORLD" fs fork --from S1 --to "$SCRATCH/w-hl" --no-pool > /dev/null 2>&1
+hi_a=$(stat -f %i "$SCRATCH/w-hl/src/a.c" 2>/dev/null)
+hi_b=$(stat -f %i "$SCRATCH/w-hl/src/a-link.c" 2>/dev/null)
+hl_n=$(stat -f %l "$SCRATCH/w-hl/src/a.c" 2>/dev/null)
+if [ -n "$hi_a" ] && [ "$hi_a" = "$hi_b" ] && [ "$hl_n" = 2 ]; then
+    ok T2.5 "fork: the two names are one file again (same inode, 2 links)"
+else
+    bad T2.5 "fork: the two names are one file again (inodes $hi_a/$hi_b, $hl_n links)"
+fi
+echo relinked > "$SCRATCH/w-hl/src/a-link.c"
+[ "$(cat "$SCRATCH/w-hl/src/a.c")" = relinked ] && ok T2.5 "a write through one name is visible through the other" \
+                                                || bad T2.5 "a write through one name is visible through the other"
+# The pool hands out a clone that was made minutes ago: the rebuild happens when it is filled,
+# so the hand-out stays a marker plus a rename.
+"$WORLD" fs pool fill S1 --count 1 > /dev/null 2>&1
+WORLD_POOL_TOPUP=0 "$WORLD" fs fork --from S1 --to "$SCRATCH/w-hl-pool" > "$SCRATCH/hlpool.log" 2>&1
+pi_a=$(stat -f %i "$SCRATCH/w-hl-pool/src/a.c" 2>/dev/null)
+pi_b=$(stat -f %i "$SCRATCH/w-hl-pool/src/a-link.c" 2>/dev/null)
+if grep -q "(pool)" "$SCRATCH/hlpool.log" && [ -n "$pi_a" ] && [ "$pi_a" = "$pi_b" ]; then
+    ok T2.5 "a pool-served world has its hardlinks too"
+else
+    bad T2.5 "a pool-served world has its hardlinks too"; sed 's/^/        /' "$SCRATCH/hlpool.log"
+fi
+# A group whose other name lives outside the tree cannot be rebuilt -- there is nothing inside
+# the clone to link to -- so init says so and the fork gets independent copies.
+mkdir -p "$SCRATCH/extproj"
+echo shared > "$SCRATCH/extproj/shared.txt"
+ln "$SCRATCH/extproj/shared.txt" "$SCRATCH/outside.txt"
+out=$("$WORLD" fs init "$SCRATCH/extproj" --name extproj 2>&1)
+EXTSNAP=$(echo "$out" | awk '/^S[0-9]+ /{print $1}')
+if echo "$out" | grep -q "outside this tree"; then ok T2.5 "init warns about the links it cannot rebuild"
+else bad T2.5 "init warns about the links it cannot rebuild"; echo "$out" | sed 's/^/        /'; fi
+"$WORLD" fs fork --from "$EXTSNAP" --to "$SCRATCH/w-ext" --no-pool > /dev/null 2>&1
+if [ "$(stat -f %l "$SCRATCH/w-ext/shared.txt" 2>/dev/null)" = 1 ] &&
+   [ "$(cat "$SCRATCH/w-ext/shared.txt")" = shared ]; then
+    ok T2.5 "a group reaching outside the tree stays an independent copy"
+else
+    bad T2.5 "a group reaching outside the tree stays an independent copy"
+fi
 
 echo
 "$WORLD" fs status | sed 's/^/      /'

@@ -7,6 +7,7 @@
 //   * identity is marker + inode (P1/P2), never the path. Any command that touches a world
 //     re-checks it and repairs the row when the directory has merely moved.
 #include "db.h"
+#include "hardlinks.h"
 #include "pool.h"
 #include "snapshot_access.h"
 
@@ -337,11 +338,13 @@ void fill_snapshot(Stmt &q, wfs_snapshot_rec &r) {
     r.hard = (int)q.col_i64(9);
     r.root_mode = (uint32_t)q.col_i64(10);
     r.trashed_at = q.col_i64(11);
+    r.hl_groups = (uint64_t)q.col_i64(12);
+    r.hl_external = (uint64_t)q.col_i64(13);
 }
 
 const char *kSnapCols =
     "id, name, path, src_path, from_world, created_at, entries, hardlinks, state, hard, root_mode,"
-    " trashed_at";
+    " trashed_at, hl_groups, hl_external";
 
 // <store>/snapshots/S<n> -- the directory that holds `root` and `manifest`. The row records the
 // root; a discard moves the whole thing, because the manifest is what `verify` needs.
@@ -531,8 +534,11 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
     // how many entries there will be (P11) and how many of them have more than one link. The
     // clone breaks every hardlink into independent inodes (CLONE_MODEL_MACOS27 §11), so
     // counting nlink>1 afterwards would always return zero.
+    // T2.5 folds the P9 groups into that same walk: which names share a backing inode, so the
+    // clone can be given them back (hardlinks.h). Nothing else here changes.
     TreeStats src_stats;
-    if (int rc = wfs::fs_count_entries(src.c_str(), src_stats)) return rc;
+    wfs::HardlinkSet hl;
+    if (int rc = wfs::hardlinks_scan(src.c_str(), &src_stats, hl)) return rc;
     if (int rc = space_check(s->dir.c_str(), src_stats.entries)) return rc;
 
     char nm[WFS_NAME_MAX];
@@ -563,6 +569,7 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
     String root = joinp(tmpdir.c_str(), "root");
     int rc = 0;
     TreeStats stats;
+    wfs::HardlinkRestore hlr;
     uint32_t root_mode = 0755;
     do {
         if (exists(tmpdir.c_str())) { if ((rc = wfs::fs_remove_tree(tmpdir.c_str()))) break; }
@@ -574,6 +581,11 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         // A checkpoint carries the source world's marker; it is not this snapshot's identity.
         String m = joinp(root.c_str(), WFS_MARKER_NAME);
         ::unlink(m.c_str());
+        // P9: the clone broke every hardlink the source had. Put them back before anything
+        // else looks at the tree, so the manifest below records the nlinks this snapshot
+        // really has and a fork from it starts from a faithful copy. The source may be a live
+        // world, so a name that moved between the scan and the clone is tolerated, not fixed.
+        if (hl.groups.size()) wfs::hardlinks_restore(root.c_str(), hl, nullptr, &hlr);
         {
             struct stat rst;
             if (::stat(root.c_str(), &rst) == 0) root_mode = (uint32_t)(rst.st_mode & 07777);
@@ -585,6 +597,9 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         // One walk either way: --hard also flips every entry to UF_IMMUTABLE, the gate does not.
         rc = o.hard ? wfs::fs_protect_tree(root.c_str(), &stats, &man)
                     : wfs::fs_scan_tree(root.c_str(), &stats, &man);
+        // T2.5: the groups ride along at the end of the manifest, in a form every older reader
+        // skips (hardlinks.h). This is what a fork from this snapshot replays.
+        if (!rc) wfs::hardlinks_manifest_write(man.f, hl);
         if (::fclose(man.f) != 0 && !rc) rc = -EIO;
         man.f = nullptr;
         if (rc) break;
@@ -606,7 +621,8 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         Guard g(s->mu);
         Txn t(s->db);
         Stmt u(s->db,
-               "UPDATE snapshots SET path=?, entries=?, hardlinks=?, state=?, root_mode=? WHERE id=?");
+               "UPDATE snapshots SET path=?, entries=?, hardlinks=?, state=?, root_mode=?,"
+               " hl_groups=?, hl_external=? WHERE id=?");
         if (!u.ok()) return -EIO;
         String rootfinal = joinp(snapdir.c_str(), "root");
         u.text(1, rootfinal.c_str());
@@ -614,7 +630,11 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         u.i64(3, (int64_t)src_stats.hardlinks);
         u.i64(4, WFS_ST_ACTIVE);
         u.i64(5, (int64_t)root_mode);
-        u.i64(6, (int64_t)id);
+        // hl_groups is what lets a fork skip reading the manifest entirely when there is
+        // nothing to replay, which is the common case.
+        u.i64(6, (int64_t)hl.groups.size());
+        u.i64(7, (int64_t)hl.external_names);
+        u.i64(8, (int64_t)id);
         if (u.step() != SQLITE_DONE) return -EIO;
         t.commit();
     }
@@ -678,6 +698,12 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
     bool src_hard = false;    // source is a --hard snapshot: the clone needs an unprotect walk
     bool src_gated = false;   // source is a gate-protected snapshot: open it around the clone
     uint32_t src_root_mode = 0;
+    // P9 (T2.5): where the hardlink groups of this source are written down, and whether there
+    // are any at all. The manifest belongs to a snapshot; a live world borrows its origin
+    // snapshot's groups and has every one of them checked against the tree being cloned.
+    uint64_t hl_groups = 0;
+    String hl_manifest;
+    const char *hl_verify = nullptr;
     WorldLock srclock;
 
     if (from.kind == WFS_K_SNAPSHOT) {
@@ -695,6 +721,8 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         src_hard = r.hard != 0;
         src_gated = !src_hard;
         src_root_mode = r.root_mode ? r.root_mode : 0755;
+        hl_groups = r.hl_groups;
+        if (hl_groups) hl_manifest = wfs::hardlinks_manifest_path(r.path);
     } else if (from.kind == WFS_K_WORLD) {
         wfs_world_rec r;
         {
@@ -710,6 +738,20 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         snapshot_id = r.snapshot_id;
         parent_world = r.id;
         copy_str(inherited, sizeof inherited, r.name);
+        // The world was cloned from a snapshot and has been written to since. Its groups are
+        // the snapshot's, minus whatever the agent broke, so they are candidates only:
+        // hardlinks_restore() lstats each name in the live tree before it touches the clone.
+        // (A hardlink an agent made inside the world is not carried over -- there is no cheap
+        // way to find it, and a `checkpoint` rescans the tree and records it properly.)
+        if (snapshot_id) {
+            wfs_snapshot_rec sn;
+            Guard g2(s->mu);
+            if (snapshot_row(s, snapshot_id, sn) == 0 && sn.hl_groups) {
+                hl_groups = sn.hl_groups;
+                hl_manifest = wfs::hardlinks_manifest_path(sn.path);
+                hl_verify = src.c_str();
+            }
+        }
         // P5: someone may be running an agent in there; forking a tree that is being written
         // gives a child world in an arbitrary half-state. --force says that is acceptable.
         if (int rc = exec_lock_guard(s, r.id, o.force)) return rc;
@@ -862,6 +904,17 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         }
         // A --hard clone inherits UF_IMMUTABLE and the stripped directory modes.
         if (src_hard && (rc = wfs::fs_unprotect_tree(tmp.c_str()))) break;
+        // P9 (T2.5): clonefile broke every hardlink again; replay the source's groups on the
+        // clone. After the unprotect (linking onto a UF_IMMUTABLE name fails) and before the
+        // marker and the rename, so a crash here leaves nothing but a .wfs-tmp tree.
+        if (hl_groups) {
+            wfs::HardlinkSet hl;
+            if (wfs::hardlinks_manifest_read(hl_manifest.c_str(), hl) == 0 && hl.groups.size()) {
+                wfs::HardlinkRestore hr;
+                wfs::hardlinks_restore(tmp.c_str(), hl, hl_verify, &hr);
+                res->hardlinks = hr.links;
+            }
+        }
         if ((rc = marker_write(tmp.c_str(), s->store_id.c_str(), s->dir.c_str(), id, nm, snapshot_id, parent_world, created)))
             break;
         if ((rc = wfs::fs_rename(tmp.c_str(), target.c_str()))) break;

@@ -714,7 +714,7 @@ FSKit 传进来的不是 `WorldItem`),与本次改动无关;`error:70` 一条都
 - [x] T2.2 `discard S<n>` + 悬空快照对账;快照有活 World/池条目引用时拒绝
 - [x] T2.3 store 路径统一:沙盒 appex 与 CLI 默认 store 不同(container vs ~/Library/Application Support),`world fs mount` 把 store 路径写进 `.world` marker 传给扩展;修正任务板中"CLI 默认同路径"
 - [ ] T2.4 diff 扫描改 `getattrlistbulk` + `EF_NO_XATTRS`,目标 50k 从 1.4s 到 ~0.2s(含 xattr 判断)
-- [ ] T2.5 fork 后按 (dev, ino) 恢复树内硬链接(P9 从警告变为修复)
+- [x] T2.5 fork 后按 (dev, ino) 恢复树内硬链接(P9 从警告变为修复;实测 0.27 ms/条,pool 命中不受影响)
 - [ ] T2.6 Linux 平台层:overlayfs + mount namespace(fork O(1)、upper 目录即 changed-set)——**不在这台 Mac 上做**(用户决定),等 Linux 机器
 
 #### T2.1 后台增量 gc(2026-09-19 实现 + 实测)
@@ -843,6 +843,60 @@ fork p50 = 并发跑 `world fs fork --no-pool` 的中位数):
 
 收尾:两个 store 都被恢复成测试前的样子(container store 里 `S1 s27` + `W1/W2/W3` 原封不动),
 结束时没有任何 worldfs 挂载。
+
+#### T2.5 树内硬链接的恢复(2026-09-19 实现 + 实测)
+
+`clonefile(dir)` 和所有替代方案一样会把树内硬链接打断(`docs/CLONE_MODEL_MACOS27.md` §11):
+nlink 掉到 1,每个名字变成一个独立克隆。对 pnpm/uv 的 store、git 的 pack、cargo 的 target 缓存
+来说这是"两份文件"而不是"一份文件两个名字",而且往任一个名字写一下,存储就默默地分叉了。
+M1 只数了个数并警告(P9),T2.5 把它修掉。
+
+**做法**(新文件 `core/src/hardlinks.{h,cpp}`,没有碰任何 walker):
+
+1. **扫**:init / checkpoint 本来就要走一趟源树数条目(P11 要条目数),这趟顺带把
+   `S_ISREG && nlink>1` 的条目按 (dev, ino) 分组。名字全在树内的组(组内名字数 == nlink)
+   可以重建;有名字在树外的组重建不了(克隆里没有可以链接的对象),只计数。
+   目录天生 nlink>1、symlink 用 `lstat` 看,两者都不是候选。
+2. **清单**:组写在快照 `manifest` 末尾,**纯增量格式**——
+   `#hl 1 <组> <名字> <树外组> <树外名字>` 加每个名字一行 `hl <组号> <nlink> <相对路径>`。
+   老的 manifest 读者(`wfs_snapshot_verify`)要求 `line[1] == ' '` 才解析,`#hl` 和 `hl ` 都不满足,
+   一律被跳过,所以 `verify`、`checked`、`extra` 全都不受影响。转义沿用清单自己的(`\\`、`\n`)。
+   另加两列 `snapshots.hl_groups` / `hl_external`(schema rev 2 的 additive ALTER):
+   `hl_groups == 0` 时 fork 连 manifest 都不用读。
+3. **重放**:每一次克隆——fork、checkpoint、pool 填充——在 **rename 之前**(`--hard` 的
+   unprotect 之后)按组重放:第一个存在的名字是正身,其余 `link` 到正身的临时名再 `rename` 覆盖。
+   用 `link`+`rename` 而不是 `unlink`+`link`:名字一刻也不消失,link 失败也丢不了文件;
+   崩在中间只留一棵 `.wfs-tmp`(P8)。组之间互不相干,所以 4 线程跑(APFS 元数据事务的老规矩)。
+4. **不动的东西**:名字在克隆里不存在(活 World 在扫和克隆之间被改了)→ 跳过,容忍 ENOENT;
+   大小或 mtime 和正身对不上(名字在这中间被换掉了)→ 跳过,绝不 unlink 别人的数据。
+5. **从活 World fork**:活树没有清单,用**来源快照的组当候选**,重放前逐个名字在活树上 `lstat`,
+   要求仍是同一个 inode,否则整组跳过。代价是每个名字一次 `lstat`,不是一趟 walk。
+   换来的缺口是:agent 在 World 里**新建**的硬链接不会被带到它的 fork 里(找它们只能全树扫);
+   `checkpoint` 会重新扫源树,所以走一次 checkpoint 就记上了。
+6. **pool**:池条目也是克隆,重放放在**填充时**(后台 filler 里),所以领取仍然是"写 marker + rename"的 O(1)。
+
+**实测**(M1 Mac mini,macOS 27.0;两棵除了硬链接以外完全一样的树,各 11 100 个条目、100 个目录,
+其中 1000 对硬链接 = 2000 个名字共享 1000 个 inode;对照组是同样 11 100 个各自独立的文件):
+
+| | 对照(无硬链接) | 1000 对硬链接 | 差 |
+|---|---|---|---|
+| `init`(扫 + clone + 重放 + manifest) | 197.6 ms | 462.5 ms | **+265 ms** |
+| `fork --no-pool` | 120.7 ms | 395.0 ms | **+274 ms** |
+| `fork`(pool 命中) | 9.0 ms | 11.6 ms | +2.6 ms(重放在填充时做完了) |
+
+- **0.27 ms/条**(4 线程)。单线程实测 `link`+`rename` 0.62 ms/条、`unlink`+`link` 0.32 ms/条
+  ——`rename` 比 `unlink` 贵一倍,但它买到的是"名字不消失",所以留着它,靠 4 线程(2.4×)补回来。
+- **清单读**:11 100 条目的 manifest(528 KB)2.1 ms,50 000 条目的(2.2 MB)也是 2.1 ms
+  ——非 `hl ` 行三个字节就被拒掉,整趟是 memcpy 速度;而且 `hl_groups == 0` 时根本不读。
+- **清单变大**:2000 个名字 = 41.8 KB(487.8 KB → 528.4 KB,+8%),一个名字一行。
+- **一对硬链接的树**:fork 相对同样大小的对照树看不出差别(<1 ms),固定开销是噪声级。
+
+**测试**:`core_test` 新增一整节(3 个组:2/3/5 个名字,外加一个有名字在树外的组)——
+snapshot 行的 `hl_groups`/`hl_external`、fork 后的 `st_ino` 相同与 nlink 正确、
+穿过一个名字写另一个名字看得见、源树不受影响、`verify` 不被新行干扰、checkpoint 的重放、
+pool 命中的重放(`fr.hardlinks == 0`,因为填充时就做完了)、从活 World fork 时被破坏的组会被跳过。
+`safety.sh` 新增 5 条 CLI 级用例(`ln` → init → fork → `stat -f %i` 相同、写穿、pool 路径、
+树外组只留独立副本、init 的措辞),全套 **135 passed, 0 failed**(T2.3 时是 130)。
 
 #### M2 验收(T2.1–T2.3,2026-09-19)
 

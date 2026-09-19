@@ -8,6 +8,7 @@
 #include "pool.h"
 
 #include "db.h"
+#include "hardlinks.h"
 #include "snapshot_access.h"
 
 #include <dirent.h>
@@ -79,11 +80,14 @@ struct SnapInfo {
     int hard = 0;
     uint32_t root_mode = 0755;
     String name;
+    uint64_t hl_groups = 0;   // T2.5: P9 groups to replay on the entry, 0 = nothing to do
 };
 
 int snap_info(wfs_store *s, wfs_id id, SnapInfo &out) {
     Guard g(s->mu);
-    Stmt q(s->db, "SELECT path, created_at, entries, state, hard, root_mode, name FROM snapshots WHERE id=?");
+    Stmt q(s->db,
+           "SELECT path, created_at, entries, state, hard, root_mode, name, hl_groups"
+           " FROM snapshots WHERE id=?");
     if (!q.ok()) return -EIO;
     q.i64(1, (int64_t)id);
     if (!q.row()) return -ENOENT;
@@ -95,6 +99,7 @@ int snap_info(wfs_store *s, wfs_id id, SnapInfo &out) {
     uint32_t m = (uint32_t)q.col_i64(5);
     out.root_mode = m ? m : 0755;
     out.name.assign(q.col_text(6));
+    out.hl_groups = (uint64_t)q.col_i64(7);
     return 0;
 }
 
@@ -181,6 +186,15 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
         // A --hard snapshot clones its UF_IMMUTABLE flags along; undo them here, once, so the
         // hand-out stays O(1) for hard snapshots too.
         if (si.hard && (rc = fs_unprotect_tree(tmp.c_str()))) break;
+        // P9 (T2.5): and the same for the hardlinks clonefile broke. Doing it here, in the
+        // background filler, is the whole point: the fork that takes this entry does not pay
+        // for it, and the hand-out stays a marker plus a rename.
+        if (si.hl_groups) {
+            HardlinkSet hl;
+            String mp = hardlinks_manifest_path(si.root.c_str());
+            if (hardlinks_manifest_read(mp.c_str(), hl) == 0 && hl.groups.size())
+                hardlinks_restore(tmp.c_str(), hl, nullptr, nullptr);
+        }
         // The snapshot's own marker is never in there (wfs_snapshot_create removes it), so the
         // entry carries no identity at all until a fork writes one.
         if ((rc = fs_rename(tmp.c_str(), path.c_str()))) break;

@@ -265,11 +265,21 @@ static int cmd_init(wfs_store *s, int argc, char **argv) {
     if (wfs_snapshot_info(s, id, &r) == 0) {
         printf("S%llu  %s  %llu entries  (%s)\n", (unsigned long long)id, r.name,
                (unsigned long long)r.entries, r.hard ? "hard: UF_IMMUTABLE per entry" : "gated 0000");
-        if (r.hardlinks)
+        // P9 (T2.5): clonefile still breaks every hardlink, but the groups that live entirely
+        // inside the tree are written down here and rebuilt inside every clone of this
+        // snapshot. Only the ones reaching outside it are a warning now.
+        if (r.hardlinks && r.hl_external)
             fprintf(stderr,
-                    "world: warning: %llu entries in this tree have more than one link; clonefile "
-                    "breaks hardlinks, so forks will see independent copies (P9)\n",
-                    (unsigned long long)r.hardlinks);
+                    "world: warning: %llu entries in this tree have more than one link; %llu "
+                    "hardlink groups are rebuilt in every fork, but %llu of those entries also "
+                    "have names outside this tree and will be independent copies (P9)\n",
+                    (unsigned long long)r.hardlinks, (unsigned long long)r.hl_groups,
+                    (unsigned long long)r.hl_external);
+        else if (r.hardlinks)
+            fprintf(stderr,
+                    "world: note: %llu entries in this tree have more than one link; the %llu "
+                    "hardlink groups they form are rebuilt inside every fork (P9)\n",
+                    (unsigned long long)r.hardlinks, (unsigned long long)r.hl_groups);
     } else {
         printf("S%llu\n", (unsigned long long)id);
     }
@@ -532,7 +542,11 @@ static int cmd_fork(wfs_store *s, int argc, char **argv) {
         if (rc == -EEXIST && !to) continue; // someone else took that id; ask again
         if (rc == WFS_E_WORLD_BUSY && from.kind == WFS_K_WORLD) return busy_refusal(s, from.id, "fork from");
         if (rc) return explain_path(s, target, rc, "fork");
-        printf("W%llu  %s%s\n", (unsigned long long)res.world, target, res.from_pool ? "  (pool)" : "");
+        printf("W%llu  %s%s", (unsigned long long)res.world, target, res.from_pool ? "  (pool)" : "");
+        // P9 (T2.5): only worth a word when there was something to rebuild. A pool hit says
+        // nothing because the filler did it when the entry was made.
+        if (res.hardlinks) printf("  (%llu hardlinks rebuilt)", (unsigned long long)res.hardlinks);
+        printf("\n");
         // Put back what this fork took, in the background, so the next one is fast too --
         // unless a filler is already at work, in which case spawning a second one would only
         // cost this fork a process start to have the child exit on the lock.
@@ -728,6 +742,10 @@ static int cmd_inspect(wfs_store *s, const char *arg) {
                (unsigned long long)v.hardlinks,
                v.hard ? "hard (UF_IMMUTABLE on every entry)" : "gate (the root directory is 0000)",
                v.path, v.src_path);
+        if (v.hardlinks)
+            printf("hardlinks: %llu groups rebuilt in every fork, %llu entries also linked from "
+                   "outside the tree (P9)\n",
+                   (unsigned long long)v.hl_groups, (unsigned long long)v.hl_external);
         if (v.from_world) printf("from:      W%llu\n", (unsigned long long)v.from_world);
         return EX_OK;
     }

@@ -10,6 +10,7 @@ set(WFS_CORE_SOURCES
     src/world.cpp
     src/diff.cpp
     src/snapshot_access.cpp
+    src/hardlinks.cpp
     src/pool.cpp
     src/platform_posix.cpp
 )

@@ -60,7 +60,7 @@ store 目录加 `.noindex`(Spotlight)并 `tmutil addexclusion`(Time Machine),无
 | P6 | 跨卷 clonefile EXDEV(`st_dev` 相同也可能) | init 前实际探针克隆一个临时文件;失败则明确报错,提供 `--store <同卷路径>` 或 `--copy`(真实复制,提示耗时) |
 | P7 | 在危险路径上 init/fork | 拒绝 `/`、`$HOME`、store 自身、已是 World/Snapshot 的目录、另一个 World 内部;fork 目标不能在任何 World 或 Snapshot 内 |
 | P8 | fork 中途崩溃留下半棵树 | 克隆到 `<target>.wfs-tmp` → 成功后 rename → 再写 metadata(arch.md §27 的 publish 顺序);gc 清理 `.wfs-tmp` |
-| P9 | 树内硬链接被克隆断开 | init/checkpoint 的保护遍历顺带统计 nlink>1,写入清单并警告;fork 后按 (dev, ino) 恢复为硬链接(M1 只警告,M2 恢复) |
+| P9 | 树内硬链接被克隆断开 | **T2.5 已修复**。init/checkpoint 扫源树的那一趟顺带按 (dev, ino) 分组:全部名字都在树内的组写进清单(`#hl` / `hl` 行,老读者一律跳过),有名字在树外的组只计数(克隆里没有可链接的对象)。之后每一次克隆——fork、checkpoint、pool 填充——在 rename 之前重放这些组:第一个名字是正身,其余 `link` 到它再 `rename` 覆盖(名字一刻也不消失,崩溃只留 `.wfs-tmp`)。代价 O(硬链接数),实测 0.27 ms/条(4 线程);pool 条目在填充时就做完,命中仍是 O(1)。从活 World fork 时用来源快照的组当候选,逐个名字在活树上 `lstat` 核对后才动手 |
 | P10 | diff 漏报 | 事件只当候选,最终以 stat/内容比对为准;收到 Dropped/MustScanSubDirs 立即全树 walk;`diff --full` 强制全扫 |
 | P11 | 磁盘写满 | fork/init 前检查剩余空间 ≥ 条目数 × 1KB + 阈值;`world fs status` 用 df 差值报告真实占用(du 看不出块共享) |
 | P12 | 并发命令互踩 | metadata 用 `BEGIN IMMEDIATE`;每条命令幂等;World 级操作先拿 flock |

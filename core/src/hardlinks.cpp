@@ -1,0 +1,366 @@
+// See hardlinks.h: collecting the hardlink groups of a tree, carrying them in the manifest, and
+// replaying them onto a clone (P9, T2.5).
+#include "hardlinks.h"
+
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <utility>   // std::move only
+
+namespace wfs {
+
+namespace {
+
+String joinp(const char *a, const char *b) {
+    String p(a);
+    size_t n = p.size();
+    if (n && p.c_str()[n - 1] != '/') p.append("/");
+    p.append(b);
+    return p;
+}
+
+int64_t mtime_ns(const struct stat &st) {
+#ifdef __APPLE__
+    return (int64_t)st.st_mtimespec.tv_sec * 1000000000 + (int64_t)st.st_mtimespec.tv_nsec;
+#else
+    return (int64_t)st.st_mtim.tv_sec * 1000000000 + (int64_t)st.st_mtim.tv_nsec;
+#endif
+}
+
+// ---- the scan --------------------------------------------------------------------------------
+
+// One name with more than one link. POD on purpose: the grouping is a qsort of these, and the
+// name itself stays put in a vector that is never reordered, so `idx` keeps pointing at it.
+struct Rec {
+    uint64_t dev;
+    uint64_t ino;
+    uint64_t nlink;
+    uint32_t idx;
+};
+
+int rec_cmp(const void *a, const void *b) {
+    const Rec *x = (const Rec *)a, *y = (const Rec *)b;
+    if (x->dev != y->dev) return x->dev < y->dev ? -1 : 1;
+    if (x->ino != y->ino) return x->ino < y->ino ? -1 : 1;
+    return x->idx < y->idx ? -1 : (x->idx > y->idx ? 1 : 0);
+}
+
+int str_cmp(const void *a, const void *b) {
+    return ::strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+struct ScanCtx {
+    TreeStats *stats;
+    Vec<Rec> recs;
+    Vec<String> names;
+    Mutex mu;
+};
+
+void bump(uint64_t &v) { __atomic_fetch_add(&v, 1, __ATOMIC_RELAXED); }
+
+// Runs on four walker threads. The lock is only taken for entries that actually have more than
+// one link, which in the trees this exists for (a pnpm store, a git pack) is a small minority
+// and in every other tree is nobody.
+int scan_entry(void *ctx, const char *, const char *rel, const struct stat &st, bool is_dir) {
+    ScanCtx *c = (ScanCtx *)ctx;
+    if (!*rel) return 0;   // the root itself is not an entry of the tree
+    if (c->stats) {
+        bump(c->stats->entries);
+        if (is_dir) bump(c->stats->dirs);
+        else {
+            bump(c->stats->files);
+            if (st.st_nlink > 1) bump(c->stats->hardlinks);
+        }
+    }
+    // Directories carry nlink > 1 by construction (one link per subdirectory) and cannot be
+    // hardlinked; symlinks are lstat'ed here, and link(2) on one is not what any of this means.
+    if (is_dir || !S_ISREG(st.st_mode) || st.st_nlink <= 1) return 0;
+    Guard g(c->mu);
+    Rec r;
+    r.dev = (uint64_t)st.st_dev;
+    r.ino = (uint64_t)st.st_ino;
+    r.nlink = (uint64_t)st.st_nlink;
+    r.idx = (uint32_t)c->names.size();
+    c->names.emplace_back(rel);
+    c->recs.emplace_back(r);
+    return 0;
+}
+
+} // namespace
+
+int hardlinks_scan(const char *root, TreeStats *stats, HardlinkSet &out) {
+    if (stats) *stats = TreeStats();
+    out = HardlinkSet();
+    ScanCtx c;
+    c.stats = stats;
+    if (int rc = fs_walk_tree(root, 4, FS_DIRS_PRE, &c, scan_entry)) return rc;
+    if (c.recs.empty()) return 0;
+
+    // Group by backing inode. The walk order is four threads deep, so the names of a group are
+    // sorted afterwards: the canonical name must not depend on which thread got there first.
+    ::qsort(c.recs.data(), c.recs.size(), sizeof(Rec), rec_cmp);
+    size_t i = 0;
+    while (i < c.recs.size()) {
+        size_t j = i + 1;
+        while (j < c.recs.size() && c.recs[j].dev == c.recs[i].dev && c.recs[j].ino == c.recs[i].ino) ++j;
+        size_t k = j - i;
+        // Fewer names here than the inode has links: the rest are outside this tree, and a
+        // clone cannot be given links to files it does not contain. Count and move on.
+        if (k != (size_t)c.recs[i].nlink || k < 2) {
+            out.external_groups++;
+            out.external_names += (uint64_t)k;
+            i = j;
+            continue;
+        }
+        Vec<const char *> ptr;
+        for (size_t t = i; t < j; ++t) ptr.emplace_back(c.names[c.recs[t].idx].c_str());
+        if (ptr.size() > 1) ::qsort(ptr.data(), ptr.size(), sizeof(const char *), str_cmp);
+        HardlinkGroup g;
+        g.nlink = c.recs[i].nlink;
+        for (size_t t = 0; t < ptr.size(); ++t) g.paths.emplace_back(ptr[t]);
+        out.names += (uint64_t)g.paths.size();
+        out.groups.emplace_back(std::move(g));
+        i = j;
+    }
+    return 0;
+}
+
+// ---- the manifest section ----------------------------------------------------------------------
+
+String hardlinks_manifest_path(const char *snapshot_root) {
+    String p(snapshot_root ? snapshot_root : "");
+    const char *slash = snapshot_root ? ::strrchr(snapshot_root, '/') : nullptr;
+    if (!slash) { p.assign("manifest"); return p; }
+    p.resize((size_t)(slash - snapshot_root) + 1);
+    p.append("manifest");
+    return p;
+}
+
+namespace {
+
+void put_escaped(FILE *f, const char *s) {
+    for (const char *p = s; *p; ++p) {
+        if (*p == '\\') ::fputs("\\\\", f);
+        else if (*p == '\n') ::fputs("\\n", f);
+        else ::fputc(*p, f);
+    }
+}
+
+// The manifest's own escaping, in reverse (world.cpp's reader does the same thing).
+void unescape(char *s) {
+    char *w = s;
+    for (char *r = s; *r; ++r) {
+        if (*r == '\\' && r[1]) {
+            ++r;
+            *w++ = (*r == 'n') ? '\n' : *r;
+        } else {
+            *w++ = *r;
+        }
+    }
+    *w = 0;
+}
+
+} // namespace
+
+void hardlinks_manifest_write(FILE *f, const HardlinkSet &set) {
+    if (!f) return;
+    if (set.groups.empty() && !set.external_groups) return;
+    ::fprintf(f, "#hl 1 %llu %llu %llu %llu\n", (unsigned long long)set.groups.size(),
+              (unsigned long long)set.names, (unsigned long long)set.external_groups,
+              (unsigned long long)set.external_names);
+    for (size_t g = 0; g < set.groups.size(); ++g) {
+        const HardlinkGroup &grp = set.groups[g];
+        for (size_t i = 0; i < grp.paths.size(); ++i) {
+            ::fprintf(f, "hl %llu %llu ", (unsigned long long)g, (unsigned long long)grp.nlink);
+            put_escaped(f, grp.paths[i].c_str());
+            ::fputc('\n', f);
+        }
+    }
+}
+
+int hardlinks_manifest_read(const char *manifest_path, HardlinkSet &out) {
+    out = HardlinkSet();
+    FILE *f = ::fopen(manifest_path, "r");
+    if (!f) return -errno;
+    char line[8192];
+    uint64_t cur = 0;
+    bool have_cur = false;
+    while (::fgets(line, sizeof line, f)) {
+        // Entry lines are the overwhelming majority and are of no interest here; rejecting them
+        // on three bytes keeps this a memcpy-speed pass over the file.
+        if (line[0] != 'h' || line[1] != 'l' || line[2] != ' ') {
+            if (line[0] == '#' && line[1] == 'h' && line[2] == 'l') {
+                unsigned long long gs = 0, ns = 0, eg = 0, en = 0, ver = 0;
+                if (::sscanf(line + 3, " %llu %llu %llu %llu %llu", &ver, &gs, &ns, &eg, &en) == 5) {
+                    out.external_groups = eg;
+                    out.external_names = en;
+                }
+            }
+            continue;
+        }
+        size_t n = ::strlen(line);
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+        unsigned long long gid = 0, nlink = 0;
+        int consumed = 0;
+        if (::sscanf(line + 2, " %llu %llu %n", &gid, &nlink, &consumed) != 2 || !consumed) continue;
+        char *rel = line + 2 + consumed;
+        if (!*rel) continue;
+        unescape(rel);
+        if (!have_cur || gid != cur || out.groups.empty()) {
+            HardlinkGroup g;
+            g.nlink = nlink;
+            out.groups.emplace_back(std::move(g));
+            cur = gid;
+            have_cur = true;
+        }
+        out.groups[out.groups.size() - 1].paths.emplace_back(rel);
+        out.names++;
+    }
+    ::fclose(f);
+    return 0;
+}
+
+// ---- the replay ----------------------------------------------------------------------------
+
+namespace {
+
+// Every name of the group still exists in the live tree and still shares one inode. Used when
+// the groups come from a snapshot's manifest but the tree being cloned is a world that has been
+// written to since -- the group may have been broken there long ago.
+bool group_still_linked(const char *verify_root, const HardlinkGroup &g) {
+    struct stat first;
+    String p = joinp(verify_root, g.paths[0].c_str());
+    if (::lstat(p.c_str(), &first) != 0 || !S_ISREG(first.st_mode)) return false;
+    if ((uint64_t)first.st_nlink < (uint64_t)g.paths.size()) return false;
+    for (size_t i = 1; i < g.paths.size(); ++i) {
+        struct stat st;
+        String q = joinp(verify_root, g.paths[i].c_str());
+        if (::lstat(q.c_str(), &st) != 0) return false;
+        if (st.st_dev != first.st_dev || st.st_ino != first.st_ino) return false;
+    }
+    return true;
+}
+
+// One group. Everything here is the same handful of syscalls whichever thread runs it, and no
+// two groups ever touch the same name, so the workers below need no coordination at all.
+void restore_group(const char *tree_root, const char *verify_root, const HardlinkGroup &g,
+                   HardlinkRestore &r) {
+    if (g.paths.size() < 2) return;
+    if (verify_root && !group_still_linked(verify_root, g)) { r.skipped++; return; }
+
+    // The canonical file is the first name that is actually there. Promoting the next one
+    // matters for a checkpoint of a live world: the first name may have been deleted between
+    // the scan and the clone, and the group is still perfectly restorable.
+    size_t base = g.paths.size();
+    struct stat bst;
+    for (size_t i = 0; i < g.paths.size(); ++i) {
+        String c = joinp(tree_root, g.paths[i].c_str());
+        if (::lstat(c.c_str(), &bst) == 0 && S_ISREG(bst.st_mode)) { base = i; break; }
+        r.missing++;
+    }
+    if (base == g.paths.size()) return;
+    {
+        String canon = joinp(tree_root, g.paths[base].c_str());
+        bool linked = false;
+        for (size_t i = base + 1; i < g.paths.size(); ++i) {
+            String p = joinp(tree_root, g.paths[i].c_str());
+            struct stat st;
+            if (::lstat(p.c_str(), &st) != 0) { r.missing++; continue; }
+            if (st.st_dev == bst.st_dev && st.st_ino == bst.st_ino) { linked = true; continue; }
+            // Not the file the scan saw any more: leave it alone. Unlinking it would throw away
+            // somebody's data to save a few blocks.
+            if (!S_ISREG(st.st_mode) || st.st_size != bst.st_size || mtime_ns(st) != mtime_ns(bst)) {
+                r.skipped++;
+                continue;
+            }
+            String tmp(p);
+            tmp.append(WFS_TMP_SUFFIX);
+            if (::link(canon.c_str(), tmp.c_str()) != 0) {
+                // Only a leftover from a killed run can be in the way, and only in a tree that
+                // is being rebuilt after one; the ordinary path does not pay for the unlink.
+                if (errno != EEXIST || (::unlink(tmp.c_str()) != 0) ||
+                    ::link(canon.c_str(), tmp.c_str()) != 0) {
+                    if (!r.first_err) r.first_err = -errno;
+                    r.skipped++;
+                    continue;
+                }
+            }
+            // rename(2), not unlink+link: the name never stops existing, so a crash or an
+            // error here cannot lose the file.
+            if (::rename(tmp.c_str(), p.c_str()) != 0) {
+                if (!r.first_err) r.first_err = -errno;
+                ::unlink(tmp.c_str());
+                r.skipped++;
+                continue;
+            }
+            r.links++;
+            linked = true;
+        }
+        if (linked) r.groups++;
+    }
+}
+
+// The whole job is metadata transactions (link + rename measure 0.6 ms a pair on 27.0), and
+// APFS takes those about 2.5x faster from four threads -- the same sweet spot the walkers and
+// the collector use (docs/CLONE_MODEL_MACOS27.md §9, P16). Below a handful of groups the
+// threads cost more than they save.
+const size_t kParallelFrom = 8;
+const int kThreads = 4;
+
+struct RestoreJob {
+    const HardlinkSet *set;
+    const char *tree_root;
+    const char *verify_root;
+    uint64_t next;      // the next group to take, bumped atomically
+    Mutex mu;           // the merge of a worker's counters into `agg`
+    HardlinkRestore agg;
+};
+
+void *restore_worker(void *arg) {
+    RestoreJob *j = (RestoreJob *)arg;
+    HardlinkRestore local;
+    size_t n = j->set->groups.size();
+    for (;;) {
+        uint64_t i = __atomic_fetch_add(&j->next, 1, __ATOMIC_RELAXED);
+        if (i >= n) break;
+        restore_group(j->tree_root, j->verify_root, j->set->groups[(size_t)i], local);
+    }
+    Guard g(j->mu);
+    j->agg.groups += local.groups;
+    j->agg.links += local.links;
+    j->agg.missing += local.missing;
+    j->agg.skipped += local.skipped;
+    if (!j->agg.first_err) j->agg.first_err = local.first_err;
+    return nullptr;
+}
+
+} // namespace
+
+int hardlinks_restore(const char *tree_root, const HardlinkSet &set, const char *verify_root,
+                      HardlinkRestore *out) {
+    if (!tree_root || !*tree_root) return -EINVAL;
+    if (set.groups.size() < kParallelFrom) {
+        HardlinkRestore r;
+        for (size_t i = 0; i < set.groups.size(); ++i)
+            restore_group(tree_root, verify_root, set.groups[i], r);
+        if (out) *out = r;
+        return 0;
+    }
+    RestoreJob j;
+    j.set = &set;
+    j.tree_root = tree_root;
+    j.verify_root = verify_root;
+    j.next = 0;
+    pthread_t th[kThreads];
+    int started = 0;
+    for (int i = 0; i < kThreads; ++i)
+        if (::pthread_create(&th[i], nullptr, restore_worker, &j) == 0) ++started;
+    if (started == 0) restore_worker(&j);   // no threads to be had: do it here
+    for (int i = 0; i < started; ++i) ::pthread_join(th[i], nullptr);
+    if (out) *out = j.agg;
+    return 0;
+}
+
+} // namespace wfs

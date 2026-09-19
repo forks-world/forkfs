@@ -37,6 +37,11 @@ static void join(char *out, size_t cap, const char *a, const char *b) { snprintf
 
 static int exists(const char *p) { struct stat st; return lstat(p, &st) == 0; }
 
+// P9 (T2.5): two names are the same file when they are the same inode, and a group of n names
+// shows n links on every one of them.
+static uint64_t ino_of(const char *p) { struct stat st; CHECK(lstat(p, &st) == 0); return (uint64_t)st.st_ino; }
+static uint64_t nlink_of(const char *p) { struct stat st; CHECK(lstat(p, &st) == 0); return (uint64_t)st.st_nlink; }
+
 // Only ever called on paths under this test's own mkdtemp root.
 static void rm_rf(const char *path) {
     struct stat st;
@@ -605,6 +610,159 @@ int main() {
     CHECK(removed == 1);
     CHECK_OK(wfs_pool_status(s, ps, 4, &pn));
     CHECK(pn == 0);
+
+    // ---- P9 (T2.5): hardlinks inside a tree are rebuilt inside every clone of it ----
+    // clonefile breaks them all (CLONE_MODEL_MACOS27 §11). Three groups live entirely inside
+    // the tree (2, 3 and 5 names) and one has a fifth name outside it, which no clone can be
+    // given: that one is counted and left as independent copies.
+    char hlsrc[4096];
+    join(hlsrc, sizeof hlsrc, root, "hlproj");
+    CHECK(mkdir(hlsrc, 0755) == 0);
+    join(p, sizeof p, hlsrc, "sub");
+    CHECK(mkdir(p, 0755) == 0);
+    join(p, sizeof p, hlsrc, "g2");
+    write_file(p, "two\n");
+    join(q, sizeof q, hlsrc, "sub/g2-b");
+    CHECK(link(p, q) == 0);
+    join(p, sizeof p, hlsrc, "g3");
+    write_file(p, "three\n");
+    for (int i = 0; i < 2; ++i) {
+        snprintf(q, sizeof q, "%s/sub/g3-%d", hlsrc, i);
+        CHECK(link(p, q) == 0);
+    }
+    join(p, sizeof p, hlsrc, "g5");
+    write_file(p, "five\n");
+    for (int i = 0; i < 4; ++i) {
+        snprintf(q, sizeof q, "%s/g5-%d", hlsrc, i);
+        CHECK(link(p, q) == 0);
+    }
+    join(p, sizeof p, hlsrc, "ext");
+    write_file(p, "ext\n");
+    join(q, sizeof q, root, "ext-outside");
+    CHECK(link(p, q) == 0);
+
+    wfs_id shl = 0;
+    memset(&sopts, 0, sizeof sopts);
+    sopts.name = "hl";
+    CHECK_OK(wfs_snapshot_create(s, hlsrc, &sopts, &shl));
+    CHECK_OK(wfs_snapshot_info(s, shl, &sr));
+    CHECK(sr.hardlinks == 11);    // 2 + 3 + 5 names inside, plus the one that reaches outside
+    CHECK(sr.hl_groups == 3);     // only the groups that are entirely inside the tree
+    CHECK(sr.hl_external == 1);   // and the name whose inode also lives outside it
+    CHECK_OK(wfs_snapshot_verify(s, shl, &vr));   // the manifest's new section is skipped, not read as an entry
+    CHECK(vr.missing == 0 && vr.modified == 0 && vr.extra == 0);
+
+    char whl[4096];
+    join(whl, sizeof whl, worlds, "w-hl");
+    wfs_ref from_hl = {WFS_K_SNAPSHOT, shl};
+    memset(&opts, 0, sizeof opts);
+    opts.name = "w-hl";
+    opts.no_pool = 1;
+    wfs_fork_result hfr;
+    memset(&hfr, 0, sizeof hfr);
+    CHECK_OK(wfs_world_create_ex(s, from_hl, whl, &opts, &hfr));
+    CHECK(hfr.from_pool == 0);
+    CHECK(hfr.hardlinks == 1 + 2 + 4);   // names relinked to their group's canonical file
+
+    char hn[4096];
+    join(p, sizeof p, whl, "g2");
+    join(q, sizeof q, whl, "sub/g2-b");
+    CHECK(ino_of(p) == ino_of(q));
+    CHECK(nlink_of(p) == 2 && nlink_of(q) == 2);
+    join(p, sizeof p, whl, "g3");
+    CHECK(nlink_of(p) == 3);
+    for (int i = 0; i < 2; ++i) {
+        snprintf(hn, sizeof hn, "%s/sub/g3-%d", whl, i);
+        CHECK(ino_of(hn) == ino_of(p) && nlink_of(hn) == 3);
+    }
+    join(p, sizeof p, whl, "g5");
+    CHECK(nlink_of(p) == 5);
+    for (int i = 0; i < 4; ++i) {
+        snprintf(hn, sizeof hn, "%s/g5-%d", whl, i);
+        CHECK(ino_of(hn) == ino_of(p) && nlink_of(hn) == 5);
+    }
+    // The group with a name outside the tree is exactly what it was before T2.5: same bytes,
+    // separate inodes.
+    join(p, sizeof p, whl, "ext");
+    CHECK(nlink_of(p) == 1);
+    CHECK(read_file(p, buf, sizeof buf) == 0 && !strcmp(buf, "ext\n"));
+    join(q, sizeof q, root, "ext-outside");
+    CHECK(ino_of(p) != ino_of(q));
+    // Mode and content come from the canonical file, as they do on the source.
+    join(p, sizeof p, whl, "g5");
+    CHECK(read_file(p, buf, sizeof buf) == 0 && !strcmp(buf, "five\n"));
+    CHECK(lstat(p, &st) == 0 && (st.st_mode & 07777) == 0644);
+
+    // A write through one name is a write to the file, so the other names see it -- which is
+    // the whole point of keeping the links (a pnpm store, a git pack, a cargo cache).
+    join(p, sizeof p, whl, "sub/g2-b");
+    write_file(p, "written\n");
+    join(q, sizeof q, whl, "g2");
+    CHECK(read_file(q, buf, sizeof buf) == 0 && !strcmp(buf, "written\n"));
+    CHECK(nlink_of(q) == 2 && ino_of(p) == ino_of(q));
+    join(p, sizeof p, hlsrc, "g2");   // and the source tree is untouched by any of it
+    CHECK(read_file(p, buf, sizeof buf) == 0 && !strcmp(buf, "two\n"));
+
+    // checkpoint: the same rebuild on the snapshot's own clone, from a live world this time.
+    // The world has no name outside itself any more, so the external group is gone.
+    wfs_id shl2 = 0;
+    memset(&sopts, 0, sizeof sopts);
+    sopts.name = "hl-after";
+    CHECK_OK(wfs_snapshot_create(s, whl, &sopts, &shl2));
+    CHECK_OK(wfs_snapshot_info(s, shl2, &sr));
+    CHECK(sr.hl_groups == 3 && sr.hl_external == 0 && sr.hardlinks == 10);
+    CHECK(chmod(sr.path, 0700) == 0);   // look behind the gate
+    join(p, sizeof p, sr.path, "g5");
+    join(q, sizeof q, sr.path, "g5-3");
+    CHECK(ino_of(p) == ino_of(q) && nlink_of(p) == 5);
+    join(p, sizeof p, sr.path, "ext");
+    CHECK(nlink_of(p) == 1);
+    CHECK(chmod(sr.path, 0) == 0);
+
+    // T1.5: a pool entry is a clone as well, so the groups are replayed when it is filled --
+    // not when it is handed out, which stays a marker plus a rename.
+    CHECK_OK(wfs_pool_fill(s, shl, 1, &made));
+    CHECK(made == 1);
+    // The replay happens before the entry is published, so `verify` (which checks that nobody
+    // has written to a waiting entry since it was cloned) sees nothing out of place.
+    CHECK_OK(wfs_snapshot_verify(s, shl, &vr));
+    CHECK(vr.pool_checked == 1 && vr.pool_dirty == 0);
+    char wplhl[4096];
+    join(wplhl, sizeof wplhl, worlds, "w-hl-pool");
+    memset(&opts, 0, sizeof opts);
+    opts.name = "w-hl-pool";
+    memset(&hfr, 0, sizeof hfr);
+    CHECK_OK(wfs_world_create_ex(s, from_hl, wplhl, &opts, &hfr));
+    CHECK(hfr.from_pool == 1 && hfr.hardlinks == 0);
+    join(p, sizeof p, wplhl, "g3");
+    join(q, sizeof q, wplhl, "sub/g3-1");
+    CHECK(ino_of(p) == ino_of(q) && nlink_of(p) == 3);
+    join(p, sizeof p, wplhl, "g5");
+    CHECK(nlink_of(p) == 5);
+    CHECK_OK(wfs_pool_drain(s, shl, &removed));
+
+    // A fork of a live world carries the groups too: they are the origin snapshot's, checked
+    // name by name against the world before anything in the clone is touched (one lstat per
+    // name, never a walk). A group the agent broke in the world stays broken in the fork.
+    join(p, sizeof p, whl, "sub/g3-1");
+    CHECK(unlink(p) == 0);            // 3 names become 2: the group no longer matches
+    char whl2[4096];
+    join(whl2, sizeof whl2, worlds, "w-hl-child");
+    CHECK_OK(wfs_world_verify_identity(s, whl, &id));
+    wfs_ref from_whl = {WFS_K_WORLD, id.world_id};
+    memset(&opts, 0, sizeof opts);
+    opts.name = "w-hl-child";
+    memset(&hfr, 0, sizeof hfr);
+    CHECK_OK(wfs_world_create_ex(s, from_whl, whl2, &opts, &hfr));
+    CHECK(hfr.hardlinks == 1 + 4);    // g2 and g5; g3 no longer matches the world
+    join(p, sizeof p, whl2, "g2");
+    join(q, sizeof q, whl2, "sub/g2-b");
+    CHECK(ino_of(p) == ino_of(q) && nlink_of(p) == 2);
+    join(p, sizeof p, whl2, "g5");
+    CHECK(nlink_of(p) == 5);
+    join(p, sizeof p, whl2, "g3");
+    join(q, sizeof q, whl2, "sub/g3-0");
+    CHECK(ino_of(p) != ino_of(q) && nlink_of(p) == 1);
 
     // ---- P13: a store from another schema is refused before anything is read ----
     char other[4096], ver[4096];
