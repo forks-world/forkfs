@@ -1244,6 +1244,39 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第十轮:后缀清扫也得先问过行(2026-09-20)
+
+第十轮,Codex 一条,P1,而且正是 **P18**(docs/M1_DESIGN.md §3)在 collector 里剩下的最后一处
+缺口:**按名字模式下的判断也是一个关于活行的判断**。上一轮把"没有任何行认领这棵树"这句话在
+trash、pool、reconcile 三处都改成了"在 store 锁下拿活行再问一遍",却漏了最古老也最粗的那一处
+——`<store>/snapshots` 下的 `*.wfs-tmp` 后缀清扫,它一行都不问,见一个删一个。
+**一条一个提交、一个测试,先验证过"没有修复就会红"。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `PRRT_kwDOUf7jGc6kBXLy` | `world.cpp:2409` `rm_tmp_in_store_dir` | `wfs_gc_ex` 的 CREATING 那一趟对半成品快照很小心:**生产者还活着的行一律跳过**,因为 `S<n>.wfs-tmp` 这时候是一棵正在写的克隆。紧接着跑的后缀清扫却什么都不问,把那一趟刚刚放过的树当场删掉——`wfs_snapshot_create()` 正在往 `<tmp>/root` 里 `clonefile`,父目录没了,于是整个创建在克隆中途拿到 `-ENOENT` | 每个条目的 `S<n>` 解析回行 id,在 **store 锁下**、**紧挨着删除之前**问一遍 snapshots 表:**任何不是 DEAD 的行都算认领这棵树**。生产者活着的 CREATING 是正在建的克隆;生产者死了的 CREATING 归上面那一趟——它删不掉时会**故意**留着行按失败上限重试,清扫插进来只会把树删了、行留着变成谁也数不着的垃圾;ACTIVE/TRASHING/TRASHED 说明旁边的 `S<n>` 是真快照,这种 `.wfs-tmp` 本就不该存在,真有也宁可留一个空目录(下次用到这个 id 时 `wfs_snapshot_create()` 自己会清)。行读不出来同样算"别删"——清扫是 collector 里最靠后也最没信息的一趟,它的猜测不许压过行。另外这个清扫从此**只肯扫 `<store>/snapshots`**:它带的认领规则就是那张表,换个目录就不成立,新的调用点必须自己带规则(`pool.cpp` 那个清扫本来就是这么做的,上一轮已核) | `eb4b036` |
+
+**其余按后缀扫的地方**:`pool.cpp` 的 `pool_sweep_orphans` 上一轮已经改成重查活行
+(`path`、`path + .wfs-tmp`、fork 的 CREATING 行的 `tmp_path` 都算认领),本轮复核无误;
+用户目录里一处都没有(第七轮的 `.wfs-tmp` 家族审计的结论未变)。
+
+**验收**:`safety.sh` **236 passed, 0 failed**(本轮不变——这条竞态只有库内的 seam 能驱动,
+CLI 层没有对应的检查点);`ctest`(WFS_FSKIT=OFF)**2/2**;`check-deps.sh` 全绿。
+
+先把测试跑红过:把重查去掉 → `wfs_snapshot_create()` 当场返回 **-2(`-ENOENT`)**,
+报表 `tmp_removed=1`,半棵克隆被删走(创建自己会回滚,所以发布不出半成品,但它**失败了**)。
+
+新增测试(复用既有 seam,测试之外恒为 NULL):
+
+- `wfs_test_before_snapshot_clone`:这个 seam 的位置正好——`S<n>.wfs-tmp` 已经 `mkdir` 好、行是
+  CREATING 且生产者就是本进程、克隆还没开始。在里面拿**第二个 store 句柄**跑一整个
+  `wfs_gc_ex`(保留期 0、不设 deadline,清扫最凶的那一档)。创建必须回 0,`verify` 干净,
+  `fork` 出来的 `a.txt`/`sub/b.txt` 内容对得上,collector 那个句柄读到的也是 ACTIVE,
+  报表 `tmp_removed=0`、`tmp_failed=0`、`snapshots_deleted=0`。
+- 三个对照,把清扫剩下的行为钉在原地:没有任何行认领的 `S999999.wfs-tmp` 照样立刻删;
+  根本不是 `S<n>` 的 `stray.wfs-tmp` 照样删;而一条 **ACTIVE** 行的 id 所对应的 `.wfs-tmp`
+  留着不动。
+
 #### PR #1 review 第九轮:collector 手里的那份快照已经旧了(2026-09-20)
 
 第九轮,Codex 六条(四条 P1、两条 P2)。四条 P1 是同一条规则的最后四个缺口,这一轮把它写成
