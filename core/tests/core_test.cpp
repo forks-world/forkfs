@@ -2494,6 +2494,104 @@ int main() {
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 
+    // ---- PR #1 review (12th round, P1): an unreadable path is not a missing world ------------
+    //
+    // Reconciliation asked `stat(2) == 0 && S_ISDIR` and read every other answer as "the tree is
+    // gone". stat(2) says no for reasons that have nothing to do with absence: EACCES on a
+    // parent directory, an EIO, a volume that is not mounted this minute, an ENAMETOOLONG. The
+    // row was then marked DEAD -- and a DEAD world cannot be repaired by `verify` and cannot be
+    // adopted, so a transient error unregistered a live world for good. Only ENOENT/ENOTDIR is
+    // an absence now; everything else, including a path that holds something which is not a
+    // directory (that is a damaged world, not a missing one), is counted as unreadable, left
+    // ACTIVE, and reported (docs/M1_DESIGN.md P17/P18).
+    {
+        char ustore[4096], usrc[4096], uhold[4096], uw[4096], udmg[4096], usnaps[4096];
+        join(ustore, sizeof ustore, root, "unread-store");
+        join(usrc, sizeof usrc, root, "unread-src");
+        CHECK(mkdir(usrc, 0755) == 0);
+        join(p, sizeof p, usrc, "a.txt");
+        write_file(p, "one\n");
+        wfs_store *ua = NULL;
+        CHECK_OK(wfs_store_open(ustore, &ua));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "ur";
+        wfs_id us1 = 0;
+        CHECK_OK(wfs_snapshot_create(ua, usrc, &sopts, &us1));
+        wfs_ref uref = {WFS_K_SNAPSHOT, us1};
+        join(uhold, sizeof uhold, worlds, "unread-hold");
+        CHECK(mkdir(uhold, 0755) == 0);
+        join(uw, sizeof uw, uhold, "w");
+        memset(&opts, 0, sizeof opts);
+        opts.name = "ur-w";
+        opts.no_pool = 1;
+        wfs_id uwid = 0;
+        CHECK_OK(wfs_world_create(ua, uref, uw, &opts, &uwid));
+        // And one whose tree somebody replaced with a plain file: the row's path resolves, it is
+        // simply not a directory any more. Damage, not absence.
+        join(udmg, sizeof udmg, worlds, "unread-dmg");
+        opts.name = "ur-d";
+        wfs_id udid = 0;
+        CHECK_OK(wfs_world_create(ua, uref, udmg, &opts, &udid));
+        rm_rf(udmg);
+        write_file(udmg, "not a directory\n");
+
+        CHECK(chmod(uhold, 0) == 0);   // stat(uw) is EACCES from here, not ENOENT
+        wfs_gc_opts ugo;
+        memset(&ugo, 0, sizeof ugo);
+        ugo.retention_secs = 0;
+        ugo.flags = WFS_GC_RECONCILE;
+        wfs_gc_report urep;
+        memset(&urep, 0, sizeof urep);
+        CHECK_OK(wfs_gc_ex(ua, &ugo, &urep));
+        CHECK(urep.worlds_unreadable == 2);     // the EACCES one and the damaged one
+        CHECK(urep.worlds_dangling == 0 && urep.worlds_reconciled == 0);
+        wfs_world_rec uwr;
+        CHECK_OK(wfs_world_info(ua, uwid, &uwr));
+        CHECK(uwr.state == WFS_ST_ACTIVE);      // still registered, still repairable
+        CHECK_OK(wfs_world_info(ua, udid, &uwr));
+        CHECK(uwr.state == WFS_ST_ACTIVE);
+        wfs_store_stat ust;
+        CHECK_OK(wfs_store_status(ua, &ust));   // and `status` says the same thing
+        CHECK(ust.worlds_unreadable == 2 && ust.worlds_dangling == 0);
+
+        // The snapshot half of the same scan, made unreadable the same way.
+        join(usnaps, sizeof usnaps, ustore, "snapshots");
+        CHECK(chmod(usnaps, 0) == 0);
+        memset(&urep, 0, sizeof urep);
+        CHECK_OK(wfs_gc_ex(ua, &ugo, &urep));
+        CHECK(urep.snapshots_unreadable == 1);
+        CHECK(urep.snapshots_dangling == 0 && urep.snapshots_reconciled == 0);
+        CHECK(chmod(usnaps, 0755) == 0);
+        wfs_snapshot_rec usr;
+        CHECK_OK(wfs_snapshot_info(ua, us1, &usr));
+        CHECK(usr.state == WFS_ST_ACTIVE);
+
+        // Give the access back and the world is ordinary again -- nothing to repair, because
+        // nothing was buried.
+        CHECK(chmod(uhold, 0755) == 0);
+        memset(&urep, 0, sizeof urep);
+        CHECK_OK(wfs_gc_ex(ua, &ugo, &urep));
+        CHECK(urep.worlds_unreadable == 1);     // only the one that really is damaged
+        CHECK(urep.worlds_dangling == 0 && urep.worlds_reconciled == 0);
+        CHECK_OK(wfs_world_info(ua, uwid, &uwr));
+        CHECK(uwr.state == WFS_ST_ACTIVE && uwr.present);
+
+        // And a world whose tree really is gone still reconciles to DEAD: this is a refinement
+        // of that rule, not a retreat from it.
+        CHECK(unlink(udmg) == 0);
+        memset(&urep, 0, sizeof urep);
+        CHECK_OK(wfs_gc_ex(ua, &ugo, &urep));
+        CHECK(urep.worlds_unreadable == 0);
+        CHECK(urep.worlds_dangling == 1 && urep.worlds_reconciled == 1);
+        CHECK_OK(wfs_world_info(ua, udid, &uwr));
+        CHECK(uwr.state == WFS_ST_DEAD);
+        CHECK_OK(wfs_world_info(ua, uwid, &uwr));
+        CHECK(uwr.state == WFS_ST_ACTIVE);      // the unreadable one was never in question
+        wfs_store_close(ua);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", ustore, (unsigned long long)us1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
     // ---- PR #1 review (9th round, P1): a pool entry made after the scan is not an orphan ----
     //
     // pool_scan takes one snapshot of the pool rows; pool_collect then removes the trees that

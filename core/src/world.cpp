@@ -58,6 +58,16 @@ bool exists(const char *p) {
     return ::lstat(p, &st) == 0;
 }
 
+// PR #1 review (12th round): "there is nothing at this path" -- proven, not assumed.
+// exists() folds every lstat(2) failure into "no", and three of this round's findings were the
+// same consequence of that: an EACCES on a parent directory, an EIO, a volume that went away
+// mid-run, and the collector marked a row DEAD, deleted a row, or quietly stopped keeping track
+// of a tree that is still on disk. Presence is assumed unless absence is proven: every verdict
+// that destroys something, or writes a row nothing can walk back, asks this instead. The plain
+// "does this exist, so may I create it" checks keep exists() -- getting those wrong costs an
+// EEXIST from the create itself, not a world.
+bool proven_gone(const char *p) { return wfs::fs_gone(wfs::fs_probe(p)); }
+
 // The deleter checks the gc worker's deadline against the same clock (internal.h).
 int64_t now_us() { return wfs::fs_mono_us(); }
 
@@ -3150,12 +3160,23 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
         {
             Guard g(s->mu);
             struct stat st;
+            // PR #1 review (12th round): and "the tree is not there" has to be *proven*.
+            // This was a bool over stat(2), so every reason stat(2) can fail read as absence:
+            // EACCES on a parent directory, an EIO, a volume that is not mounted this minute,
+            // an ENAMETOOLONG. --reconcile then marked the row DEAD -- and a DEAD world is not
+            // repairable by `verify` and not adoptable, so one transient error unregistered a
+            // live world permanently. Only ENOENT/ENOTDIR is an absence. Anything else, and
+            // that includes a path which holds something that is *not* a directory (a damaged
+            // world, not a missing one: burying it would throw away the row that says what
+            // belongs there), is counted as unreadable, reported, and left exactly as it is.
             {
                 Stmt q(s->db, "SELECT id, path FROM snapshots WHERE state=1");
                 if (!q.ok()) return -EIO;
                 while (q.row()) {
                     const char *p = q.col_text(1);
-                    if (*p && ::stat(p, &st) == 0 && S_ISDIR(st.st_mode)) continue;
+                    int prc = *p ? wfs::fs_probe(p, &st, true) : -ENOENT;
+                    if (prc == 0 && S_ISDIR(st.st_mode)) continue;
+                    if (!wfs::fs_gone(prc)) { rep.snapshots_unreadable++; continue; }
                     rep.snapshots_dangling++;
                     dead_snaps.emplace_back((wfs_id)q.col_i64(0));
                     dead_snap_paths.emplace_back(p);
@@ -3166,7 +3187,9 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                 if (!q.ok()) return -EIO;
                 while (q.row()) {
                     const char *p = q.col_text(1);
-                    if (*p && ::stat(p, &st) == 0 && S_ISDIR(st.st_mode)) continue;
+                    int prc = *p ? wfs::fs_probe(p, &st, true) : -ENOENT;
+                    if (prc == 0 && S_ISDIR(st.st_mode)) continue;
+                    if (!wfs::fs_gone(prc)) { rep.worlds_unreadable++; continue; }
                     rep.worlds_dangling++;
                     dead_worlds.emplace_back((wfs_id)q.col_i64(0));
                     dead_world_paths.emplace_back(p);

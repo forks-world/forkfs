@@ -1183,6 +1183,18 @@ static int cmd_gc(wfs_store *s, int argc, char **argv) {
                     "world:       repairs that one instead (P1).\n",
                     (unsigned long long)rep.snapshots_dangling, (unsigned long long)rep.worlds_dangling);
     }
+    if (rep.snapshots_unreadable || rep.worlds_unreadable) {
+        // PR #1 review (12th round): a row the scan could not reach a verdict about. It is not
+        // reconciled and it is not silently counted as present either: --reconcile buries only
+        // what is proven absent, and an operator who sees this is being told that the answer is
+        // missing rather than that the answer is "gone".
+        fprintf(stderr,
+                "world: note: %llu snapshot(s) and %llu world(s) could not be checked: the path is\n"
+                "world:       unreadable (a permission, an I/O error, a volume that is not mounted), or\n"
+                "world:       something that is not a directory is in the way. They are left registered --\n"
+                "world:       an error is not an absence -- so fix the access and run this again.\n",
+                (unsigned long long)rep.snapshots_unreadable, (unsigned long long)rep.worlds_unreadable);
+    }
     if (rep.tmp_failed) {
         // PR #1 review (11th round): the `*.wfs-tmp` the suffix sweep could not remove is
         // counted here too, and that one has no row at all -- being named by nothing is what
@@ -1262,6 +1274,14 @@ static int cmd_status(wfs_store *s) {
         printf("dangling:  %llu snapshot(s) and %llu world(s) registered but not on disk"
                "  (`world fs gc --reconcile`, or `world fs verify <new path>` for a moved world)\n",
                (unsigned long long)st.snapshots_dangling, (unsigned long long)st.worlds_dangling);
+    // PR #1 review (12th round): and the rows whose path could not be read at all. They are
+    // deliberately not in the line above: `--reconcile` will not touch them, because an EACCES,
+    // an EIO or an unmounted volume is not evidence that anything is gone.
+    if (st.snapshots_unreadable || st.worlds_unreadable)
+        printf("unreadable: %llu snapshot(s) and %llu world(s) registered but their path cannot be"
+               " checked (permissions, I/O, an unmounted volume, or something that is not a"
+               " directory in the way)\n",
+               (unsigned long long)st.snapshots_unreadable, (unsigned long long)st.worlds_unreadable);
     return EX_OK;
 }
 

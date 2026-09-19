@@ -493,13 +493,23 @@ extern "C" int wfs_store_status(wfs_store *s, wfs_store_stat *out) {
     // tens of snapshots and (measured) a thousand worlds at most, so `status` stays a 7 ms
     // command. A world that was merely moved shows up here too until someone runs
     // `world fs verify <its new path>`; that is why `gc --reconcile` is explicit.
+    // PR #1 review (12th round): the same rule the collector reconciles by (world.cpp). A
+    // stat(2) that fails for a reason other than absence -- EACCES on a parent, EIO, a volume
+    // that is not mounted -- is not evidence that anything is gone, and neither is a path that
+    // holds something which is not a directory. `status` is the number an operator reads before
+    // running `gc --reconcile`, so it must not call either of those dangling.
     {
         Stmt q(s->db, "SELECT path FROM snapshots WHERE state=?");
         if (q.ok()) {
             q.i64(1, WFS_ST_ACTIVE);
             struct stat st;
-            while (q.row())
-                if (::stat(q.col_text(0), &st) != 0 || !S_ISDIR(st.st_mode)) out->snapshots_dangling++;
+            while (q.row()) {
+                const char *p = q.col_text(0);
+                int prc = *p ? wfs::fs_probe(p, &st, true) : -ENOENT;
+                if (prc == 0 && S_ISDIR(st.st_mode)) continue;
+                if (wfs::fs_gone(prc)) out->snapshots_dangling++;
+                else out->snapshots_unreadable++;
+            }
         }
     }
     {
@@ -511,8 +521,13 @@ extern "C" int wfs_store_status(wfs_store *s, wfs_store_stat *out) {
         if (q.ok()) {
             q.i64(1, WFS_ST_ACTIVE);
             struct stat st;
-            while (q.row())
-                if (::stat(q.col_text(0), &st) != 0 || !S_ISDIR(st.st_mode)) out->worlds_dangling++;
+            while (q.row()) {
+                const char *p = q.col_text(0);
+                int prc = *p ? wfs::fs_probe(p, &st, true) : -ENOENT;
+                if (prc == 0 && S_ISDIR(st.st_mode)) continue;
+                if (wfs::fs_gone(prc)) out->worlds_dangling++;
+                else out->worlds_unreadable++;
+            }
         }
     }
     uint64_t avail = 0, total = 0;

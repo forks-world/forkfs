@@ -182,6 +182,13 @@ typedef struct wfs_store_stat {
      * more. `gc --reconcile` is what turns them into DEAD rows. */
     uint64_t snapshots_dangling;
     uint64_t worlds_dangling;
+    /* PR #1 review (12th round): rows whose tree could not be *asked about*. stat(2) fails for
+     * reasons that are not absence -- EACCES on a parent, EIO, a volume that is not mounted,
+     * ENAMETOOLONG -- and a row whose path holds something that is not a directory is damaged
+     * rather than gone. Neither is dangling: `gc --reconcile` buries only what is proven
+     * absent, so these are reported separately and left registered. */
+    uint64_t snapshots_unreadable;
+    uint64_t worlds_unreadable;
     uint64_t snapshots_trashed; /* T2.2: snapshots waiting in the trash */
 } wfs_store_stat;
 int wfs_store_status(wfs_store *s, wfs_store_stat *out);
@@ -574,6 +581,14 @@ typedef struct wfs_gc_report {
      * one stat per row); the `*_reconciled` ones only when WFS_GC_RECONCILE was asked for. */
     uint64_t snapshots_dangling, worlds_dangling;
     uint64_t snapshots_reconciled, worlds_reconciled;
+    /* PR #1 review (12th round): rows the scan could not reach a verdict about. "The tree is
+     * not there" used to be a bool over stat(2), so EACCES on a parent directory, an EIO, an
+     * unmounted volume or an ENAMETOOLONG all read as "gone" -- and --reconcile then marked the
+     * row DEAD, which neither `verify` nor `adopt` can undo: one transient error unregistered a
+     * live world for good. Only ENOENT/ENOTDIR is an absence now. Anything else (including a
+     * path that holds something which is not a directory: a damaged world, not a missing one)
+     * is counted here, left ACTIVE, and printed by `gc`/`gc --reconcile`. */
+    uint64_t snapshots_unreadable, worlds_unreadable;
     /* T2.1: the batch limit was reached and trash entries are still waiting. A caller that can
      * spawn a worker (the CLI does) should spawn one. */
     int work_remains;

@@ -9,6 +9,7 @@
 #include <container/small_vectra.hpp>
 #include <smallstring.hpp>
 
+#include <errno.h>
 #include <mutex>   // std::lock_guard only (header-only)
 #include <pthread.h>
 #include <stdio.h>
@@ -100,6 +101,18 @@ int trashing_recover(wfs_store *s, uint64_t *restored, uint64_t *finished);
 extern const int64_t kGcFailCap;
 int64_t gc_fail_bump(wfs_store *s, const char *key);
 void gc_fail_clear(wfs_store *s, const char *key);
+
+// PR #1 review (12th round): "is there anything at this path?", with the errno kept.
+// A bool over lstat(2) -- the `exists()` every file in this core had one of -- answers "no" for
+// EACCES on a parent directory, for EIO, for a volume that is not mounted any more and for
+// ENAMETOOLONG, and the collector then acted on that "no": a row marked DEAD, a row deleted, a
+// tree nothing in the store knew about any more. An error is not an absence. So the question is
+// asked here and the answer is the errno -- 0 (something is there, `st` filled when it is given)
+// or -errno -- and fs_gone() is the only verdict that means "genuinely not there". Everything
+// about to destroy something, or to write a row it cannot be talked out of, asks fs_gone(); a
+// plain "does this exist so I can create it" may still ask the bool. `follow` picks stat(2).
+int fs_probe(const char *path, struct stat *st = nullptr, bool follow = false);
+inline bool fs_gone(int rc) { return rc == -ENOENT || rc == -ENOTDIR; }
 
 int fs_lstat(const char *path, wfs_attr &out);
 int fs_readlink(const char *path, char *buf, size_t cap, size_t *len);

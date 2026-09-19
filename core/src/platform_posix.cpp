@@ -55,6 +55,13 @@ wfs_type type_of_dt(unsigned char t) {
 wfs_timespec ts(const struct timespec &t) { return wfs_timespec{(int64_t)t.tv_sec, (int64_t)t.tv_nsec}; }
 } // namespace
 
+int fs_probe(const char *path, struct stat *st, bool follow) {
+    struct stat local;
+    struct stat &out = st ? *st : local;
+    if ((follow ? ::stat(path, &out) : ::lstat(path, &out)) != 0) return errno ? -errno : -EIO;
+    return 0;
+}
+
 int fs_lstat(const char *path, wfs_attr &a) {
     struct stat st;
     if (::lstat(path, &st) != 0) return -errno;
