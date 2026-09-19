@@ -496,7 +496,20 @@ int walk_dir(Walk &w, const Job &job) {
         if (::lseek(fd, 0, SEEK_SET) < 0) { ::close(fd); return -errno; }
         DIR *d = ::fdopendir(fd);
         if (!d) { int e = errno; ::close(fd); return -e; }
-        while (struct dirent *e = ::readdir(d)) {
+        // PR #1 review (23rd round, P2): readdir(3) returns NULL for the end of the directory
+        // AND for a failure part way through it, and the two are told apart by errno alone.
+        // Read as "the directory ended", an EIO or a stale handle made this walk return 0 with
+        // fewer entries than the tree has -- a clone missing files, a manifest missing lines, a
+        // diff missing changes, all of them reported as success. Same rule as the 12th round:
+        // an error is not an absence. errno is cleared before every call, so what is read after
+        // a NULL is this readdir's own.
+        for (;;) {
+            errno = 0;
+            struct dirent *e = ::readdir(d);
+            if (!e) {
+                if (errno) rc = -errno;
+                break;
+            }
             if (e->d_name[0] == '.' && (e->d_name[1] == 0 || (e->d_name[1] == '.' && e->d_name[2] == 0))) continue;
             struct stat st;
             if (::fstatat(fd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) { rc = -errno; break; }

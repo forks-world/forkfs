@@ -104,18 +104,40 @@ void join_rel(String &out, const char *root, const char *rel) {
     }
 }
 
-bool dir_is_empty(const char *p) {
+// PR #1 review (23rd round, P2): "is this directory empty?" with the errno kept -- the round-12
+// rule, in the one place of the diff that asks a directory a question. A bool over opendir(3)
+// answered "not empty" for EACCES, for EIO and for a volume that went away, and the caller then
+// reported nothing at all for a directory that exists on exactly one side: a silent hole in the
+// diff. Only a directory that was really read, to its end, is really empty; a directory that is
+// not there any more (a candidate the world removed while we were looking at it) is the one
+// failure that is an answer, and it reports nothing, as it always did. Returns 0 or -errno.
+int dir_is_empty(const char *p, bool &empty) {
+    empty = false;
     DIR *d = ::opendir(p);
-    if (!d) return false;
-    bool empty = true;
-    while (struct dirent *e = ::readdir(d)) {
+    if (!d) {
+        int rc = errno ? -errno : -EIO;
+        return wfs::fs_gone(rc) ? 0 : rc;
+    }
+    bool none = true;
+    int rc = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *e = ::readdir(d);
+        if (!e) {
+            // readdir(3) returns NULL for the end of the directory AND for a failure; the two
+            // are told apart by errno, and only the first one means "there was nothing".
+            if (errno) rc = -errno;
+            break;
+        }
         if (e->d_name[0] == '.' && (e->d_name[1] == 0 || (e->d_name[1] == '.' && e->d_name[2] == 0)))
             continue;
-        empty = false;
+        none = false;
         break;
     }
     ::closedir(d);
-    return empty;
+    if (rc) return rc;
+    empty = none;
+    return 0;
 }
 
 bool link_target_equal(const char *a, const char *b) {
@@ -550,7 +572,9 @@ int expand_entry(void *ctx, const wfs::FsEntry &en) {
         full.append(en.rel);
     }
     if (en.is_dir) {
-        if (dir_is_empty(en.path)) e->c->sink->add(e->change, WFS_T_DIR, 0, full.c_str());
+        bool empty = false;
+        if (int rc = dir_is_empty(en.path, empty)) return rc;
+        if (empty) e->c->sink->add(e->change, WFS_T_DIR, 0, full.c_str());
         return 0;
     }
     e->c->sink->add(e->change, type_of(en.st->st_mode), (uint64_t)en.st->st_size, full.c_str());
@@ -559,17 +583,25 @@ int expand_entry(void *ctx, const wfs::FsEntry &en) {
 
 // Called only from the single-threaded candidate loop, so the four workers below are all there
 // are; Sink::add is behind a mutex either way.
-void expand_side(Ctx &c, const char *rel, const char *path, int change, bool skip_self) {
+//
+// PR #1 review (23rd round, P2): the walk's result is the expansion's result. It was dropped
+// here, and a directory that moved into or out of the world and could not be read -- mode 0000,
+// an EIO half way down -- then contributed nothing, or the prefix of its entries that the walk
+// managed before it stopped, to a diff that was reported as complete and exited 0. The walker
+// reports a directory it could not open or read as that directory's errno (fs_walk_tree_ex, and
+// see the readdir(3) note in platform_posix.cpp), so the only thing missing was to pass it on:
+// the verification returns it, and wfs_world_diff() returns it instead of a partial answer.
+int expand_side(Ctx &c, const char *rel, const char *path, int change, bool skip_self) {
     ExpandCtx e{&c, rel, change, skip_self};
-    wfs::fs_walk_tree_ex(path, 4, wfs::FS_DIRS_PRE, &e, expand_entry);
+    return wfs::fs_walk_tree_ex(path, 4, wfs::FS_DIRS_PRE, &e, expand_entry);
 }
 
-void report_one_side(Ctx &c, const char *rel, const char *path, const struct stat &st, int change) {
+int report_one_side(Ctx &c, const char *rel, const char *path, const struct stat &st, int change) {
     if (!S_ISDIR(st.st_mode)) {
         c.sink->add(change, type_of(st.st_mode), (uint64_t)st.st_size, rel);
-        return;
+        return 0;
     }
-    expand_side(c, rel, path, change, false);
+    return expand_side(c, rel, path, change, false);
 }
 
 // ---- full scan ---------------------------------------------------------------------------------
@@ -594,7 +626,9 @@ int side_entry(void *ctx, const wfs::FsEntry &en) {
         // Only on this side. The walk visits every descendant itself, so a non-empty directory
         // needs no expansion here -- only an empty one has nothing else to report it.
         if (en.is_dir) {
-            if (dir_is_empty(en.path)) c.sink->add(s->world_side ? WFS_C_ADDED : WFS_C_DELETED, WFS_T_DIR, 0, rel);
+            bool empty = false;
+            if (int rc = dir_is_empty(en.path, empty)) return rc;
+            if (empty) c.sink->add(s->world_side ? WFS_C_ADDED : WFS_C_DELETED, WFS_T_DIR, 0, rel);
         } else {
             c.sink->add(s->world_side ? WFS_C_ADDED : WFS_C_DELETED, type_of(en.st->st_mode),
                         (uint64_t)en.st->st_size, rel);
@@ -617,8 +651,8 @@ int full_scan(Ctx &c) {
 
 // ---- candidate verification ---------------------------------------------------------------------
 
-void verify_candidate(Ctx &c, const char *rel) {
-    if (!*rel || !::strcmp(rel, WFS_MARKER_NAME)) return;
+int verify_candidate(Ctx &c, const char *rel) {
+    if (!*rel || !::strcmp(rel, WFS_MARKER_NAME)) return 0;
     String wpath, spath;
     join_rel(wpath, c.wroot.c_str(), rel);
     join_rel(spath, c.sroot.c_str(), rel);
@@ -626,23 +660,21 @@ void verify_candidate(Ctx &c, const char *rel) {
     uint8_t wxa = wfs::FS_XATTR_UNKNOWN, sxa = wfs::FS_XATTR_UNKNOWN;
     bool in_world = other_side(c, wpath.c_str(), ws, wxa, true) == 0;
     bool in_snap = other_side(c, spath.c_str(), ss, sxa, true) == 0;
-    if (!in_world && !in_snap) return; // created and removed again inside the same world
-    if (in_world && !in_snap) {
-        report_one_side(c, rel, wpath.c_str(), ws, WFS_C_ADDED);
-        return;
-    }
-    if (!in_world && in_snap) {
-        report_one_side(c, rel, spath.c_str(), ss, WFS_C_DELETED);
-        return;
-    }
-    if (S_ISDIR(ws.st_mode) && S_ISDIR(ss.st_mode)) return;
+    if (!in_world && !in_snap) return 0; // created and removed again inside the same world
+    if (in_world && !in_snap) return report_one_side(c, rel, wpath.c_str(), ws, WFS_C_ADDED);
+    if (!in_world && in_snap) return report_one_side(c, rel, spath.c_str(), ss, WFS_C_DELETED);
+    if (S_ISDIR(ws.st_mode) && S_ISDIR(ss.st_mode)) return 0;
     // A directory replaced by a file (or the other way round): the path itself is an M, but
     // everything that used to live under the directory is gone, or newly here, and FSEvents
     // says nothing about it (a subtree moved in or out produces one event, for the directory).
-    if (S_ISDIR(ws.st_mode)) expand_side(c, rel, wpath.c_str(), WFS_C_ADDED, true);
-    else if (S_ISDIR(ss.st_mode)) expand_side(c, rel, spath.c_str(), WFS_C_DELETED, true);
+    if (S_ISDIR(ws.st_mode)) {
+        if (int rc = expand_side(c, rel, wpath.c_str(), WFS_C_ADDED, true)) return rc;
+    } else if (S_ISDIR(ss.st_mode)) {
+        if (int rc = expand_side(c, rel, spath.c_str(), WFS_C_DELETED, true)) return rc;
+    }
     int ch = classify(c, wpath.c_str(), ws, wxa, spath.c_str(), ss, sxa);
     if (ch) c.sink->add(ch, type_of(ws.st_mode), (uint64_t)ws.st_size, rel);
+    return 0;
 }
 
 // How many recorded entries a world needs before the FSEvents path is worth its fixed cost.
@@ -758,10 +790,13 @@ extern "C" int wfs_world_diff_ex(wfs_store *s, wfs_id world, int flags, wfs_diff
         if (gate.rc == -ENOENT || gate.rc == -ENOTDIR) return WFS_E_SOURCE_GONE;
         if (gate.rc) return gate.rc;
 
-        if (!full)
-            for (size_t i = 0; i < bag.size(); ++i) verify_candidate(c, bag.at(i));
-        else if (int frc = full_scan(c))
+        if (!full) {
+            // PR #1 review (23rd round): a candidate that could not be verified ends the diff.
+            for (size_t i = 0; i < bag.size(); ++i)
+                if (int vrc = verify_candidate(c, bag.at(i))) return vrc;
+        } else if (int frc = full_scan(c)) {
             return frc;
+        }
         // PR #1 review (P2): an unreadable snapshot side is not a diff result. Both paths
         // above reach it, and the guard below closes the gate on the way out either way.
         if (c.fatal) return c.fatal;

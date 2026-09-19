@@ -204,6 +204,17 @@ static void run_diff(wfs_store *s, wfs_id w, int flags, Collect *c, wfs_diff_sta
     CHECK_OK(wfs_world_diff_ex(s, w, flags, collect_cb, c, st));
 }
 
+// A diff that must fail: the return code is the assertion, and nothing may have been reported
+// through the callback -- a diff that could not be finished is not a diff (PR #1 review, 23rd
+// round).
+static void run_diff_err(wfs_store *s, wfs_id w, int flags, Collect *c, int want) {
+    free(c->v);
+    memset(c, 0, sizeof *c);
+    wfs_diff_stats st;
+    CHECK_RC(wfs_world_diff_ex(s, w, flags, collect_cb, c, &st), want);
+    CHECK(c->n == 0);
+}
+
 // ---- poking the recorded cursor (the only reason sqlite3 is here) ------------------------------
 
 static void set_cursor(const char *store, wfs_id w, unsigned long long id) {
@@ -861,6 +872,63 @@ static void provenance_case(const char *root, const char *store) {
 }
 #endif
 
+// ---- PR #1 review (23rd round, P2): a directory that could not be read is not an empty one ---
+//
+// A directory that came into the world (or went out of it) is reported by walking it: the files
+// under it are the change, and the walk's result was thrown away. A directory the walk cannot
+// open -- mode 0000, an EIO half way down -- then produced nothing at all, or a prefix of its
+// entries, and `world fs diff` printed an incomplete diff and exited 0. The same rule as the
+// 12th round: an error is not an absence, and a partial answer is not an answer. The walk's
+// errno now comes back through the candidate verification and out of wfs_world_diff().
+static void unreadable_dir(const char *root, const char *store) {
+    char src[4096], w[4096], p[4096], q[4096];
+    join(src, sizeof src, root, "unreadable-src");
+    join(w, sizeof w, root, "unreadable-w");
+    CHECK(mkdir(src, 0755) == 0);
+    join(p, sizeof p, src, "keep.txt");
+    write_file(p, "keep\n");
+
+    wfs_store *s = NULL;
+    CHECK_OK(wfs_store_open(store, &s));
+    wfs_id sid = 0;
+    wfs_snapshot_opts sopts;
+    memset(&sopts, 0, sizeof sopts);
+    sopts.name = "unreadable";
+    CHECK_OK(wfs_snapshot_create(s, src, &sopts, &sid));
+    wfs_ref from = {WFS_K_SNAPSHOT, sid};
+    wfs_fork_opts o;
+    memset(&o, 0, sizeof o);
+    wfs_id wid = 0;
+    CHECK_OK(wfs_world_create(s, from, w, &o, &wid));
+
+    // A whole directory added to the world: the candidate path has to expand it, because
+    // FSEvents says nothing about a subtree that was moved in beyond the directory itself.
+    join(p, sizeof p, w, "d");
+    CHECK(mkdir(p, 0755) == 0);
+    join(q, sizeof q, p, "f.txt");
+    write_file(q, "added\n");
+    settle();
+    CHECK(chmod(p, 0000) == 0);
+
+    Collect c;
+    memset(&c, 0, sizeof c);
+    // Neither path may report a diff it could not finish. (Before the fix the events path
+    // returned 0 with `d/f.txt` simply missing.)
+    run_diff_err(s, wid, WFS_DIFF_EVENTS, &c, -EACCES);
+    run_diff_err(s, wid, WFS_DIFF_FULL, &c, -EACCES);
+
+    CHECK(chmod(p, 0755) == 0);
+    wfs_diff_stats st;
+    static const Want want[] = {{'A', "d/f.txt"}};
+    run_diff(s, wid, WFS_DIFF_EVENTS, &c, &st);
+    check_lines("added dir / --events", &c, want, 1);
+    run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
+    check_lines("added dir / --full", &c, want, 1);
+
+    free(c.v);
+    wfs_store_close(s);
+}
+
 static void small_cases(const char *root, const char *store) {
     char src[4096], w[4096], w2[4096], p[4096], q[4096];
     join(src, sizeof src, root, "small-src");
@@ -1235,6 +1303,13 @@ int main() {
     free(c.v);
     c.v = NULL;
     wfs_store_close(s);
+
+    printf("unreadable directories\n");
+    {
+        char store8[4096];
+        join(store8, sizeof store8, root, "store-unreadable");
+        unreadable_dir(root, store8);
+    }
 
     printf("small cases\n");
     {
