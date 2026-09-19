@@ -42,6 +42,18 @@ static int exists(const char *p) { struct stat st; return lstat(p, &st) == 0; }
 static uint64_t ino_of(const char *p) { struct stat st; CHECK(lstat(p, &st) == 0); return (uint64_t)st.st_ino; }
 static uint64_t nlink_of(const char *p) { struct stat st; CHECK(lstat(p, &st) == 0); return (uint64_t)st.st_nlink; }
 
+// PR #1 review (P1): how many entries of a directory start with `prefix`. Used to assert that
+// the hardlink replay left none of its own temporaries behind.
+static size_t n_with_prefix(const char *dir, const char *prefix) {
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    size_t n = 0, pl = strlen(prefix);
+    while (struct dirent *e = readdir(d))
+        if (!strncmp(e->d_name, prefix, pl)) n++;
+    closedir(d);
+    return n;
+}
+
 // Only ever called on paths under this test's own mkdtemp root.
 static void rm_rf(const char *path) {
     struct stat st;
@@ -652,6 +664,15 @@ int main() {
     write_file(p, "ext\n");
     join(q, sizeof q, root, "ext-outside");
     CHECK(link(p, q) == 0);
+    // PR #1 review (P1): `.wfs-tmp` is not a name reserved to us inside somebody's workspace.
+    // The replay used to make its temporary link at `<name>.wfs-tmp` and, on EEXIST, *unlink*
+    // whatever was already there -- so these two ordinary files, sitting next to the two names
+    // of a hardlink group, were silently destroyed by every fork. Both of them, because which
+    // name of the group is the canonical one and which gets relinked is the scan's business.
+    join(p, sizeof p, hlsrc, "g2.wfs-tmp");
+    write_file(p, "not a temporary, mine\n");
+    join(p, sizeof p, hlsrc, "sub/g2-b.wfs-tmp");
+    write_file(p, "nor is this one\n");
 
     wfs_id shl = 0;
     memset(&sopts, 0, sizeof sopts);
@@ -693,6 +714,19 @@ int main() {
         snprintf(hn, sizeof hn, "%s/g5-%d", whl, i);
         CHECK(ino_of(hn) == ino_of(p) && nlink_of(hn) == 5);
     }
+    // PR #1 review (P1): all three of `g2`, `sub/g2-b` and their `.wfs-tmp` namesakes are in
+    // the fork; the two hardlinked names share an inode and the two ordinary files are exactly
+    // the bytes the snapshot had. And the replay left no temporary of its own behind.
+    join(p, sizeof p, whl, "g2.wfs-tmp");
+    CHECK(read_file(p, buf, sizeof buf) == 0 && !strcmp(buf, "not a temporary, mine\n"));
+    CHECK(nlink_of(p) == 1);
+    join(p, sizeof p, whl, "sub/g2-b.wfs-tmp");
+    CHECK(read_file(p, buf, sizeof buf) == 0 && !strcmp(buf, "nor is this one\n"));
+    CHECK(nlink_of(p) == 1);
+    CHECK(n_with_prefix(whl, ".wfs-hl-") == 0);
+    join(p, sizeof p, whl, "sub");
+    CHECK(n_with_prefix(p, ".wfs-hl-") == 0);
+
     // The group with a name outside the tree is exactly what it was before T2.5: same bytes,
     // separate inodes.
     join(p, sizeof p, whl, "ext");
@@ -751,6 +785,12 @@ int main() {
     CHECK(ino_of(p) == ino_of(q) && nlink_of(p) == 3);
     join(p, sizeof p, wplhl, "g5");
     CHECK(nlink_of(p) == 5);
+    // The pool entry was cloned and replayed at fill time, so the same two files have to have
+    // come through that path untouched as well.
+    join(p, sizeof p, wplhl, "sub/g2-b.wfs-tmp");
+    CHECK(read_file(p, buf, sizeof buf) == 0 && !strcmp(buf, "nor is this one\n"));
+    join(p, sizeof p, wplhl, "g2.wfs-tmp");
+    CHECK(read_file(p, buf, sizeof buf) == 0 && !strcmp(buf, "not a temporary, mine\n"));
     CHECK_OK(wfs_pool_drain(s, shl, &removed));
 
     // A fork of a live world carries the groups too: they are the origin snapshot's, checked

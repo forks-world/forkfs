@@ -587,6 +587,41 @@ else
     bad T2.5 "a group reaching outside the tree stays an independent copy"
 fi
 
+# ---- PR #1 review (P1): `.wfs-tmp` is a perfectly legal file name in somebody's workspace -----
+# The hardlink replay used to build its temporary link at `<name>.wfs-tmp` and, on EEXIST,
+# unlink whatever was already there. A tree with `a` and `b` (one file, two names) and an
+# ordinary `b.wfs-tmp` beside them therefore lost that third file on every fork. The replay now
+# draws a name of its own and never unlinks anything that is not its own.
+mkdir -p "$SCRATCH/tmpname"
+echo linked > "$SCRATCH/tmpname/a"
+ln "$SCRATCH/tmpname/a" "$SCRATCH/tmpname/b"
+echo "mine, not a temporary" > "$SCRATCH/tmpname/b.wfs-tmp"
+echo "nor is this one" > "$SCRATCH/tmpname/a.wfs-tmp"
+out=$("$WORLD" fs init "$SCRATCH/tmpname" --name tmpname 2>&1)
+TNSNAP=$(echo "$out" | awk '/^S[0-9]+ /{print $1}')
+"$WORLD" fs fork --from "$TNSNAP" --to "$SCRATCH/w-tmpname" --no-pool > /dev/null 2>&1
+ti_a=$(stat -f %i "$SCRATCH/w-tmpname/a" 2>/dev/null)
+ti_b=$(stat -f %i "$SCRATCH/w-tmpname/b" 2>/dev/null)
+ti_n=$(stat -f %l "$SCRATCH/w-tmpname/a" 2>/dev/null)
+if [ -n "$ti_a" ] && [ "$ti_a" = "$ti_b" ] && [ "$ti_n" = 2 ]; then
+    ok PR1 "a and b are one file again beside a user's own .wfs-tmp"
+else
+    bad PR1 "a and b are one file again beside a user's own .wfs-tmp (inodes $ti_a/$ti_b, $ti_n links)"
+fi
+if [ "$(cat "$SCRATCH/w-tmpname/b.wfs-tmp" 2>/dev/null)" = "mine, not a temporary" ] &&
+   [ "$(cat "$SCRATCH/w-tmpname/a.wfs-tmp" 2>/dev/null)" = "nor is this one" ]; then
+    ok PR1 "the user's own *.wfs-tmp files come through the fork intact"
+else
+    bad PR1 "the user's own *.wfs-tmp files come through the fork intact"
+    ls -la "$SCRATCH/w-tmpname" | sed 's/^/        /'
+fi
+if [ -z "$(ls -a "$SCRATCH/w-tmpname" 2>/dev/null | grep '^\.wfs-hl-')" ]; then
+    ok PR1 "and the replay leaves no temporary of its own behind"
+else
+    bad PR1 "and the replay leaves no temporary of its own behind"
+    ls -a "$SCRATCH/w-tmpname" | sed 's/^/        /'
+fi
+
 # ---- P17: trees in the store but no database -> refuse, never rebuild -----------------------
 # Its own store, because the point of the rule is that the store is left exactly as it was
 # found. Snapshot and world ids live in metadata.db; a fresh one hands out 1 again and the next

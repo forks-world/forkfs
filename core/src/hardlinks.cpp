@@ -3,8 +3,10 @@
 #include "hardlinks.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <utility>   // std::move only
@@ -226,6 +228,61 @@ int hardlinks_manifest_read(const char *manifest_path, HardlinkSet &out) {
 
 namespace {
 
+// ---- the temporary name -----------------------------------------------------------------------
+//
+// PR #1 review (P1): the temporary link used to be `<target>.wfs-tmp`, on the assumption that no
+// user tree contains that name -- and the EEXIST branch then *unlinked* whatever was there. A
+// snapshot is somebody's workspace: a file called `b.wfs-tmp` next to a hardlinked `b` is an
+// ordinary file, and the replay threw it away. Nothing outside the store may be assumed to be
+// ours, so the temporary is drawn instead from a name nothing else can be holding:
+//
+//     .wfs-hl-<pid>-<counter>-<16 hex from getentropy(2)>
+//
+// in the same directory as the target (rename(2) is only atomic within one directory). link(2)
+// is an exclusive create -- it returns EEXIST rather than overwriting -- so the successful link
+// *is* the claim, exactly as O_EXCL is for open(2). On EEXIST a fresh name is drawn and the
+// claim tried again; nothing that is not ours is ever unlinked, at any point.
+const int kTmpTries = 8;
+
+void hl_tmp_leaf(char *out, size_t cap) {
+    static uint64_t seq = 0;
+    uint64_t n = __atomic_fetch_add(&seq, 1, __ATOMIC_RELAXED);
+    unsigned char raw[8];
+    if (::getentropy(raw, sizeof raw) != 0)
+        for (size_t i = 0; i < sizeof raw; ++i)
+            raw[i] = (unsigned char)(::getpid() + i * 31 + (int)n);
+    uint64_t r = 0;
+    for (size_t i = 0; i < sizeof raw; ++i) r = (r << 8) | raw[i];
+    ::snprintf(out, cap, ".wfs-hl-%d-%llu-%016llx", (int)::getpid(), (unsigned long long)n,
+               (unsigned long long)r);
+}
+
+// `target`'s directory, trailing '/' included. `target` is always joinp(tree_root, rel) and
+// tree_root is absolute, so there is always a '/' to find.
+void dir_prefix(const String &target, String &out) {
+    const char *s = target.c_str();
+    const char *slash = ::strrchr(s, '/');
+    if (!slash) { out.assign("./"); return; }
+    out.assign(s, (size_t)(slash - s) + 1);
+}
+
+// Hardlink `canon` into the directory of `target` under a name of ours. On success `tmp` is
+// that name and the link exists; on failure `errno` says why and nothing was created.
+bool link_under_fresh_name(const char *canon, const String &target, String &tmp) {
+    String dir;
+    dir_prefix(target, dir);
+    for (int t = 0; t < kTmpTries; ++t) {
+        char leaf[64];
+        hl_tmp_leaf(leaf, sizeof leaf);
+        tmp.assign(dir);
+        tmp.append(leaf);
+        if (::link(canon, tmp.c_str()) == 0) return true;
+        if (errno != EEXIST) return false;
+    }
+    errno = EEXIST;
+    return false;
+}
+
 // Every name of the group still exists in the live tree and still shares one inode. Used when
 // the groups come from a snapshot's manifest but the tree being cloned is a world that has been
 // written to since -- the group may have been broken there long ago.
@@ -275,17 +332,11 @@ void restore_group(const char *tree_root, const char *verify_root, const Hardlin
                 r.skipped++;
                 continue;
             }
-            String tmp(p);
-            tmp.append(WFS_TMP_SUFFIX);
-            if (::link(canon.c_str(), tmp.c_str()) != 0) {
-                // Only a leftover from a killed run can be in the way, and only in a tree that
-                // is being rebuilt after one; the ordinary path does not pay for the unlink.
-                if (errno != EEXIST || (::unlink(tmp.c_str()) != 0) ||
-                    ::link(canon.c_str(), tmp.c_str()) != 0) {
-                    if (!r.first_err) r.first_err = -errno;
-                    r.skipped++;
-                    continue;
-                }
+            String tmp;
+            if (!link_under_fresh_name(canon.c_str(), p, tmp)) {
+                if (!r.first_err) r.first_err = -errno;
+                r.skipped++;
+                continue;
             }
             // rename(2), not unlink+link: the name never stops existing, so a crash or an
             // error here cannot lose the file.
