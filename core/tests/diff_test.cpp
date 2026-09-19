@@ -422,6 +422,92 @@ static void xattr_shortcut(const char *root, const char *store) {
 }
 
 
+// ---- PR #1 review (9th round, P2): the large-name fallback obeys the ignore rule too ----------
+//
+// The filtered path holds one side's retained names in a 4096-byte buffer. A file with more
+// names than that falls back to comparing the two raw listxattr(2) lists on the heap -- and that
+// fallback did no filtering at all, so com.apple.provenance was back in the comparison for
+// exactly those files: one-sided on any pair the kernel stamped separately, and a `T` in the
+// default diff on a file nothing had done anything to.
+//
+// Provenance itself cannot be driven from a test: the kernel stamps it on every file this
+// process creates, with the same value every time, and setxattr(2)/removexattr(2) on it silently
+// do nothing (probed). So the library carries one test seam for the rule -- wfs_test_xattr_ignore
+// names a second xattr that the filtering treats exactly as it treats provenance -- and this
+// case drives both halves of the fallback with it: a name only one side has, and a name both
+// sides have with different values.
+#ifdef __APPLE__
+static const char kIgnoredName[] = "com.forks.world.ignored";
+
+static void xattr_many_names(const char *root, const char *store) {
+    char src[4096], w[4096], p[4096], nm[64];
+    join(src, sizeof src, root, "xamany-src");
+    join(w, sizeof w, root, "xamany-w");
+    CHECK(mkdir(src, 0755) == 0);
+    // 200 names of 24 bytes each is 4800 bytes of names, so both sides of both files take the
+    // heap fallback rather than the bounded, filtered path.
+    static const char *files[] = {"namecase.txt", "valuecase.txt"};
+    for (size_t f = 0; f < sizeof files / sizeof files[0]; ++f) {
+        join(p, sizeof p, src, files[f]);
+        write_file(p, "same bytes everywhere\n");
+        for (int i = 0; i < 200; ++i) {
+            snprintf(nm, sizeof nm, "com.forks.world.big.%03d", i);
+            CHECK(setxattr(p, nm, "v", 1, 0, XATTR_NOFOLLOW) == 0);
+        }
+        CHECK(listxattr(p, NULL, 0, XATTR_NOFOLLOW) > 4096);
+    }
+    // valuecase.txt carries the ignored name on both sides; only its value will differ.
+    join(p, sizeof p, src, "valuecase.txt");
+    CHECK(setxattr(p, kIgnoredName, "old", 3, 0, XATTR_NOFOLLOW) == 0);
+
+    wfs_store *s = NULL;
+    CHECK_OK(wfs_store_open(store, &s));
+    wfs_id sid = 0;
+    wfs_snapshot_opts sopts;
+    memset(&sopts, 0, sizeof sopts);
+    sopts.name = "xamany";
+    CHECK_OK(wfs_snapshot_create(s, src, &sopts, &sid));
+    wfs_ref from = {WFS_K_SNAPSHOT, sid};
+    wfs_fork_opts o;
+    memset(&o, 0, sizeof o);
+    wfs_id wid = 0;
+    CHECK_OK(wfs_world_create(s, from, w, &o, &wid));
+
+    // namecase.txt: the name exists on the world side and nowhere else.
+    join(p, sizeof p, w, "namecase.txt");
+    CHECK(setxattr(p, kIgnoredName, "added", 5, 0, XATTR_NOFOLLOW) == 0);
+    // valuecase.txt: the same name on both sides, a different value on this one.
+    join(p, sizeof p, w, "valuecase.txt");
+    CHECK(setxattr(p, kIgnoredName, "new", 3, 0, XATTR_NOFOLLOW) == 0);
+
+    Collect c;
+    memset(&c, 0, sizeof c);
+    wfs_diff_stats st;
+    static const Want want_all[] = {{'T', "namecase.txt"}, {'T', "valuecase.txt"}};
+    settle();
+    wfs_test_xattr_ignore = kIgnoredName;
+    // By default neither file is a change: an ignored name is dropped from both lists before
+    // they are compared, and the values that are read afterwards are the ones behind what is
+    // left. Both halves matter -- the first file differs in the list, the second in a value.
+    run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
+    CHECK(st.full_scan == 1);
+    check_lines("many names / --full", &c, NULL, 0);
+    run_diff(s, wid, WFS_DIFF_EVENTS, &c, &st);
+    check_lines("many names / events", &c, NULL, 0);
+    // ... and with --all-xattrs nothing is ignored, so both are back.
+    run_diff(s, wid, WFS_DIFF_FULL | WFS_DIFF_ALL_XATTRS, &c, &st);
+    check_lines("many names / --all-xattrs", &c, want_all, 2);
+    wfs_test_xattr_ignore = NULL;
+    // With the rule switched off again the seam's name is an ordinary xattr like any other,
+    // which is the control that says the filtering is what did the work above.
+    run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
+    check_lines("many names / not ignored", &c, want_all, 2);
+
+    free(c.v);
+    wfs_store_close(s);
+}
+#endif
+
 // ---- PR #1 review (P2): a failed xattr read is not "this file has no xattrs" -------------------
 //
 // listxattr(2) and getxattr(2) can fail for reasons that have nothing to do with the attributes:
@@ -1167,6 +1253,9 @@ int main() {
         char store6[4096];
         join(store6, sizeof store6, root, "store-xattr-err");
         xattr_unreadable(root, store6);
+        char store7[4096];
+        join(store7, sizeof store7, root, "store-xattr-many");
+        xattr_many_names(root, store7);
     }
 #endif
 

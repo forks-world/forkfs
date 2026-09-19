@@ -47,6 +47,12 @@ using wfs::Mutex;
 using wfs::String;
 using wfs::Vec;
 
+// The test seam for the diff's xattr ignore rule (PR #1 review, 9th round). See worldfs.h:
+// com.apple.provenance is the one name the default diff drops and the one name a test cannot
+// make differ, so diff_test names an ordinary xattr here instead. Nothing in the library ever
+// assigns this; it is NULL in every run that is not diff_test.
+extern "C" const char *wfs_test_xattr_ignore = nullptr;
+
 namespace {
 
 const size_t kCmpChunk = 128 * 1024;
@@ -253,25 +259,6 @@ ssize_t list_names(const char *path, char *stackbuf, size_t cap, char **heap, ch
     return n;
 }
 
-// Every name both sides have, compared. The fallback for a file with more than kXattrNames
-// bytes of names, where the filtered-name path below cannot hold them.
-XattrCmp xattr_equal_raw(const char *a, const char *b, XattrErr &e) {
-    char sa[4096], sb[4096], *ha = nullptr, *hb = nullptr, *la = nullptr, *lb = nullptr;
-    int ea = 0, eb = 0;
-    ssize_t na = list_names(a, sa, sizeof sa, &ha, &la, &ea);
-    ssize_t nb = list_names(b, sb, sizeof sb, &hb, &lb, &eb);
-    XattrCmp rc;
-    if (na < 0) { e.a = ea; rc = XA_ERROR; }
-    else if (nb < 0) { e.b = eb; rc = XA_ERROR; }
-    else if (na != nb) rc = XA_DIFFER;
-    else if (na == 0) rc = XA_EQUAL;
-    else if (memcmp(la, lb, (size_t)na) != 0) rc = XA_DIFFER; // a clone keeps the order
-    else rc = xattr_values_equal(a, b, la, (size_t)na, e);
-    ::free(ha);
-    ::free(hb);
-    return rc;
-}
-
 // M2: `com.apple.provenance` is not workspace state. macOS 27 stamps it on every file a local
 // process creates, and it cannot be taken off again (removexattr fails; `xattr -d` silently
 // does nothing) -- it is the kernel's record of *which application created this file*, which
@@ -284,7 +271,66 @@ const char kProvenance[] = "com.apple.provenance";
 
 bool xattr_ignored(const char *name, size_t len, int flags) {
     if (flags & WFS_DIFF_ALL_XATTRS) return false;
-    return len == sizeof kProvenance - 1 && memcmp(name, kProvenance, len) == 0;
+    if (len == sizeof kProvenance - 1 && memcmp(name, kProvenance, len) == 0) return true;
+    // The test seam (PR #1 review, 9th round). Provenance is the one name the default diff
+    // drops and the one name a test cannot produce a difference in: the kernel stamps it on
+    // every file this process creates, with the same value every time, and setxattr(2) and
+    // removexattr(2) on it silently do nothing. So diff_test names a second, ordinary xattr
+    // here and the filtering treats it exactly like provenance. NULL in every run that is not
+    // diff_test; nothing in the library ever assigns it.
+    const char *t = wfs_test_xattr_ignore;
+    return t && ::strlen(t) == len && memcmp(name, t, len) == 0;
+}
+
+// PR #1 review (9th round): the ignored names, dropped from a raw listxattr(2) list in place.
+// The result is never longer than the input, so this is one pass and no allocation. The large-
+// name fallback below needs it for the same reason xattr_names() needs it: a list that still
+// holds provenance compares two otherwise-identical files as different, and the values behind
+// the filtered list are the ones that then get read.
+ssize_t filter_names(char *buf, ssize_t n, int flags) {
+    ssize_t used = 0;
+    for (ssize_t i = 0; i < n;) {
+        const char *name = buf + i;
+        size_t len = ::strnlen(name, (size_t)(n - i));
+        if (len == 0 || (ssize_t)(i + len) >= n) break;
+        if (!xattr_ignored(name, len, flags)) {
+            if (used != (ssize_t)i) memmove(buf + used, buf + i, len + 1);
+            used += (ssize_t)len + 1;
+        }
+        i += (ssize_t)len + 1;
+    }
+    return used;
+}
+
+// Every name both sides have, compared. The fallback for a file with more than kXattrNames
+// bytes of names, where the filtered-name path below cannot hold them.
+//
+// PR #1 review (9th round): and it filters too. It used to compare the raw lists and then the
+// raw values, so a file with enough retained names to overflow the bounded buffer was compared
+// by a different rule from every other file -- com.apple.provenance back in the comparison,
+// where it is one-sided on any pair of files the kernel stamped separately, and the default
+// diff reporting `T` on a file nothing had done anything to. The ignored names come out of both
+// lists first, exactly as xattr_names() takes them out of the bounded path, and the values that
+// are read afterwards are the ones behind the filtered list.
+XattrCmp xattr_equal_raw(const char *a, const char *b, int flags, XattrErr &e) {
+    char sa[4096], sb[4096], *ha = nullptr, *hb = nullptr, *la = nullptr, *lb = nullptr;
+    int ea = 0, eb = 0;
+    ssize_t na = list_names(a, sa, sizeof sa, &ha, &la, &ea);
+    ssize_t nb = list_names(b, sb, sizeof sb, &hb, &lb, &eb);
+    XattrCmp rc;
+    if (na < 0) { e.a = ea; rc = XA_ERROR; }
+    else if (nb < 0) { e.b = eb; rc = XA_ERROR; }
+    else {
+        na = filter_names(la, na, flags);
+        nb = filter_names(lb, nb, flags);
+        if (na != nb) rc = XA_DIFFER;
+        else if (na == 0) rc = XA_EQUAL;
+        else if (memcmp(la, lb, (size_t)na) != 0) rc = XA_DIFFER; // a clone keeps the order
+        else rc = xattr_values_equal(a, b, la, (size_t)na, e);
+    }
+    ::free(ha);
+    ::free(hb);
+    return rc;
 }
 
 const size_t kXattrNames = 4096;
@@ -347,7 +393,7 @@ XattrCmp xattr_equal(const char *a, const char *b, uint8_t axa, uint8_t bxa, int
     ssize_t lb = xattr_names(b, bxa, flags, nb, sizeof nb, &eb);
     if (la == kNamesFailed) { e.a = ea; return XA_ERROR; }
     if (lb == kNamesFailed) { e.b = eb; return XA_ERROR; }
-    if (la < 0 || lb < 0) return xattr_equal_raw(a, b, e);  // more names than kXattrNames holds
+    if (la < 0 || lb < 0) return xattr_equal_raw(a, b, flags, e);  // more names than kXattrNames holds
     if (la == 0 && lb == 0) return XA_EQUAL;                // nothing, or only ignored names
     if (la != lb || memcmp(na, nb, (size_t)la) != 0) return XA_DIFFER; // a clone keeps the order
     return xattr_values_equal(a, b, na, (size_t)la, e);

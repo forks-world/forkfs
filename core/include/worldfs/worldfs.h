@@ -820,6 +820,14 @@ int wfs_test_threads_start(int want, unsigned fail_mask, int *started, int *join
  * report it; 0 in every run that is not core_test. */
 extern int wfs_test_hardlink_restore_err;
 
+/* And the one xattr rule a test cannot drive from outside (PR #1 review, 9th round). The default
+ * diff leaves com.apple.provenance out of the comparison, and provenance is precisely the name a
+ * test cannot make differ: the kernel stamps it on every file this process creates, with the
+ * same value every time, and setxattr(2)/removexattr(2) on it silently do nothing. Set this to
+ * an ordinary xattr name and the diff's ignore rule treats that name exactly as it treats
+ * provenance. NULL in every run that is not diff_test. */
+extern const char *wfs_test_xattr_ignore;
+
 #ifdef __cplusplus
 }
 #endif
