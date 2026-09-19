@@ -837,6 +837,16 @@ extern void *wfs_test_in_pool_unwind_ctx;
 extern void (*wfs_test_after_pool_publish)(void *ctx, wfs_id world, const char *target);
 extern void *wfs_test_after_pool_publish_ctx;
 
+/* And the fifth (PR #1 review, 23rd round): the instant inside a fork between the clone and the
+ * hardlink replay onto it -- the tree is built, unprotected and recorded on the CREATING row,
+ * and not one link(2) has been made yet. What a test does in there is make a directory of the
+ * clone unreadable, because that is the one way to produce a member lookup that fails without
+ * the member being absent, which is exactly what the replay must not mistake for absence.
+ * Called with the world id and the temp tree's path. NULL unless a test sets it, and nothing in
+ * the library ever assigns it. */
+extern void (*wfs_test_before_hl_replay)(void *ctx, wfs_id world, const char *tmp_path);
+extern void *wfs_test_before_hl_replay_ctx;
+
 /* The pid a CREATING row records as the process building it. 0, its value in every real run,
  * means getpid(). A test sets it to a pid that is not running to produce the one state a single
  * process cannot otherwise reach: a half-built tree whose producer is gone. */

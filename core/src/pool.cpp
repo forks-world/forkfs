@@ -266,7 +266,14 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
             if (hl.groups.size()) {
                 SnapGate vgate;
                 if (!si.hard) rc = vgate.open(si.root.c_str(), false);
-                if (!rc && hardlinks_verify_groups(si.root.c_str(), hl)) rc = WFS_E_SNAPSHOT_DIRTY;
+                // PR #1 review (23rd round): -EINVAL is the manifest disagreeing with the
+                // tree; any other errno is a tree that could not be read, and it is returned
+                // as itself rather than as "your snapshot is damaged".
+                if (!rc) {
+                    int vrc = hardlinks_verify_groups(si.root.c_str(), hl);
+                    if (vrc == -EINVAL) rc = WFS_E_SNAPSHOT_DIRTY;
+                    else if (vrc) rc = vrc;
+                }
                 vgate.close();
                 if (rc) break;
             }

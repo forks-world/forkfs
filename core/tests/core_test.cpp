@@ -416,6 +416,17 @@ static size_t list_dir(const char *dir, char names[][256], uint64_t *inos, size_
     return n;
 }
 
+// PR #1 review (23rd round, P2): the seam that makes one directory of a fork's clone unreadable
+// in the instant before the hardlink replay walks it -- a member lookup that fails without the
+// member being absent, which is the one thing the replay must not read as absence.
+static void hl_shut_dir(void *ctx, wfs_id world, const char *tmp_path) {
+    (void)ctx;
+    (void)world;
+    char p[4096];
+    snprintf(p, sizeof p, "%s/d", tmp_path);
+    CHECK(chmod(p, 0000) == 0);
+}
+
 // PR #1 review (P1): the test seam that puts this test inside a pool-backed fork, between the
 // claim and the moment the world becomes visible. `wfs_test_after_pool_claim` calls this there.
 static wfs_store *g_race_store;
@@ -1975,6 +1986,61 @@ int main() {
         join(q, sizeof q, flw, "d/b");
         CHECK(ino_of(p) == ino_of(q) && nlink_of(p) == 2);
         CHECK(lstat(p, &st) == 0 && (st.st_flags & uflag) == uflag);
+    }
+
+    // ---- PR #1 review (23rd round, P2): a member we could not look at is not one that is gone ----
+    //
+    // The replay counts a member whose fstatat/openat failed as `missing` and carries on, and
+    // `missing` is tolerated on purpose: a live source may have changed between the scan and
+    // the clone (5th round). But a fork from an IMMUTABLE snapshot has no such excuse, and an
+    // EACCES or an EIO is not a changed source in any case -- it is a lookup that did not
+    // happen. The clone was published with the group's names on separate inodes, the fork
+    // returned 0, and nothing downstream ever looks at `broken`.
+    //
+    // The seam shuts the clone's `d` in the window between the clone and the replay, which is
+    // the only way to produce that failure on a developer's disk.
+    {
+        char hlsrc[4096], hlw[4096];
+        size_t worlds_before = 0, worlds_after = 0;
+        join(hlsrc, sizeof hlsrc, root, "hl-shut");
+        CHECK(mkdir(hlsrc, 0755) == 0);
+        join(p, sizeof p, hlsrc, "d");
+        CHECK(mkdir(p, 0755) == 0);
+        join(p, sizeof p, hlsrc, "d/a");
+        write_file(p, "pair\n");
+        join(q, sizeof q, hlsrc, "d/b");
+        CHECK(link(p, q) == 0);
+
+        wfs_id shl = 0;
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "hl-shut";
+        CHECK_OK(wfs_snapshot_create(s, hlsrc, &sopts, &shl));
+        CHECK_OK(wfs_snapshot_info(s, shl, &sr));
+        CHECK(sr.hl_groups == 1 && sr.hl_external == 0 && sr.hardlinks == 2);
+
+        wfs_ref from_hl = {WFS_K_SNAPSHOT, shl};
+        join(hlw, sizeof hlw, worlds, "w-hl-shut");
+        memset(&opts, 0, sizeof opts);
+        opts.name = "w-hl-shut";
+        opts.no_pool = 1;
+        CHECK_OK(wfs_world_list(s, 1, NULL, 0, &worlds_before));
+        wfs_test_before_hl_replay = hl_shut_dir;
+        wfs_id hlid = 0;
+        CHECK_RC(wfs_world_create(s, from_hl, hlw, &opts, &hlid), -EACCES);
+        wfs_test_before_hl_replay = NULL;
+        CHECK(hlid == 0);
+        CHECK(!exists(hlw));                              // nothing at --to
+        CHECK(n_with_prefix(worlds, ".wfs-fork-") == 0);  // and no temp tree left of it
+        CHECK_OK(wfs_world_list(s, 1, NULL, 0, &worlds_after));
+        CHECK(worlds_after == worlds_before);             // nor a row
+
+        // With the directory left alone the very same fork succeeds and the pair is a pair.
+        memset(&hfr, 0, sizeof hfr);
+        CHECK_OK(wfs_world_create_ex(s, from_hl, hlw, &opts, &hfr));
+        CHECK(hfr.hardlinks == 1);
+        join(p, sizeof p, hlw, "d/a");
+        join(q, sizeof q, hlw, "d/b");
+        CHECK(ino_of(p) == ino_of(q) && nlink_of(p) == 2);
     }
 
     // ---- PR #1 review (P1): a fork in flight and `discard S<n>` cannot both win ----

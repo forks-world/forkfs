@@ -706,12 +706,27 @@ bool relink_under_lend(Relender &rl, int canon_fd, const char *canon_leaf, int d
     return ok;
 }
 
+// PR #1 review (23rd round, P2): a lookup that failed is not a name that is not there. Every
+// fstatat(2)/openat(2) below used to be read as "missing" whatever went wrong, and `missing` is
+// tolerated on purpose -- the 5th round's rule, that a LIVE source may have changed between the
+// scan and the clone. An EACCES, an EIO, an ELOOP is not a changed source; it is a question
+// that was not answered, and answering it "the name is gone" made a fork from an immutable
+// snapshot publish a clone whose group members are separate inodes, with rc 0, since the fork
+// and the pool fill only ever fail on `first_err` and never read `broken`. fs_gone() --
+// ENOENT/ENOTDIR -- is the only absence; everything else becomes the replay's error.
+void note_err(HardlinkRestore &r, int e) {
+    if (!r.first_err) r.first_err = e;
+}
+
 // Every name of the group still exists in the live tree and still shares one inode. Used when
 // the groups come from a snapshot's manifest but the tree being cloned is a world that has been
 // written to since -- the group may have been broken there long ago.
-bool group_still_linked(const char *verify_root, const HardlinkGroup &g) {
+//
+// Returns 0 with `linked` set, or -errno when the live tree could not be asked at all.
+int group_still_linked(const char *verify_root, const HardlinkGroup &g, bool &linked) {
+    linked = false;
     int rootfd = open_tree_root(verify_root);
-    if (rootfd < 0) return false;
+    if (rootfd < 0) return fs_gone(rootfd) ? 0 : rootfd;
     bool ok = true;
     struct stat first;
     // PR #1 review (17th round, P1): the descent, here too. This is the only check a fork from
@@ -719,15 +734,22 @@ bool group_still_linked(const char *verify_root, const HardlinkGroup &g) {
     // tree is allowed to have moved on -- so a member behind a symlink was approved against
     // whatever the symlink leads to in the WORLD and then replayed against whatever it leads to
     // beside the fork's temporary, which is a different directory entirely.
-    if (member_lstat(rootfd, g.paths[0].c_str(), first) != 0 || !S_ISREG(first.st_mode)) ok = false;
+    int err = 0;
+    int e = member_lstat(rootfd, g.paths[0].c_str(), first);
+    if (e && !fs_gone(e)) err = e;
+    else if (e || !S_ISREG(first.st_mode)) ok = false;
     else if ((uint64_t)first.st_nlink < (uint64_t)g.paths.size()) ok = false;
-    for (size_t i = 1; ok && i < g.paths.size(); ++i) {
+    for (size_t i = 1; ok && !err && i < g.paths.size(); ++i) {
         struct stat st;
-        if (member_lstat(rootfd, g.paths[i].c_str(), st) != 0) ok = false;
+        e = member_lstat(rootfd, g.paths[i].c_str(), st);
+        if (e && !fs_gone(e)) err = e;
+        else if (e) ok = false;
         else if (st.st_dev != first.st_dev || st.st_ino != first.st_ino) ok = false;
     }
     ::close(rootfd);
-    return ok;
+    if (err) return err;
+    linked = ok;
+    return 0;
 }
 
 // One group. Everything here is the same handful of syscalls whichever thread runs it, and no
@@ -735,10 +757,19 @@ bool group_still_linked(const char *verify_root, const HardlinkGroup &g) {
 void restore_group(const char *tree_root, const char *verify_root, const HardlinkGroup &g,
                    size_t index, HardlinkRestore &r, Relender &rl) {
     if (g.paths.size() < 2) return;
-    if (verify_root && !group_still_linked(verify_root, g)) {
-        r.skipped++;
-        r.broken.emplace_back((uint64_t)index);
-        return;
+    if (verify_root) {
+        bool linked = false;
+        if (int e = group_still_linked(verify_root, g, linked)) {
+            note_err(r, e);
+            r.skipped++;
+            r.broken.emplace_back((uint64_t)index);
+            return;
+        }
+        if (!linked) {
+            r.skipped++;
+            r.broken.emplace_back((uint64_t)index);
+            return;
+        }
     }
     // Every name that is in the clone has to end up on the canonical inode, or the group is not
     // the group any more and whoever writes it down has to know (`broken` above).
@@ -750,6 +781,7 @@ void restore_group(const char *tree_root, const char *verify_root, const Hardlin
     // is missing and the group is not the group the set describes.
     int rootfd = open_tree_root(tree_root);
     if (rootfd < 0) {
+        if (!fs_gone(rootfd)) note_err(r, rootfd);   // not there, or could not be asked
         r.missing += (uint64_t)g.paths.size();
         r.broken.emplace_back((uint64_t)index);
         return;
@@ -777,8 +809,10 @@ void restore_group(const char *tree_root, const char *verify_root, const Hardlin
         if (e == 0 && S_ISREG(bst.st_mode)) { base = i; break; }
         // A name that is not there is `missing`, as it always was; a name that is not a chain
         // of real directory names is one this replay declines to touch, which is `skipped`.
-        if (e == 0 || e == -ENOENT) r.missing++;
-        else r.skipped++;
+        // And a lookup that failed for any other reason is the replay's error (23rd round):
+        // absence is what a live source is allowed to produce, an EACCES is not.
+        if (e == 0 || fs_gone(e)) r.missing++;
+        else { note_err(r, e); r.skipped++; }
         whole = false;
     }
     if (base == g.paths.size()) {
@@ -790,6 +824,7 @@ void restore_group(const char *tree_root, const char *verify_root, const Hardlin
         String canon_leaf;
         int canon_fd = open_parent(rootfd, g.paths[base].c_str(), canon_leaf);
         if (canon_fd < 0) {
+            if (!fs_gone(canon_fd)) note_err(r, canon_fd);
             ::close(rootfd);
             r.skipped++;
             r.broken.emplace_back((uint64_t)index);
@@ -800,14 +835,16 @@ void restore_group(const char *tree_root, const char *verify_root, const Hardlin
             String leaf;
             int pfd = open_parent(rootfd, g.paths[i].c_str(), leaf);
             if (pfd < 0) {
-                if (pfd == -ENOENT) r.missing++;
-                else r.skipped++;
+                if (fs_gone(pfd)) r.missing++;
+                else { note_err(r, pfd); r.skipped++; }
                 whole = false;
                 continue;
             }
             struct stat st;
             if (::fstatat(pfd, leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) {
-                r.missing++;
+                int e = errno ? -errno : -EIO;
+                if (fs_gone(e)) r.missing++;
+                else { note_err(r, e); r.skipped++; }
                 whole = false;
                 ::close(pfd);
                 continue;
@@ -833,7 +870,7 @@ void restore_group(const char *tree_root, const char *verify_root, const Hardlin
                 ok = relink_under_lend(rl, canon_fd, canon_leaf.c_str(), pfd, leaf.c_str(), &e);
             ::close(pfd);
             if (!ok) {
-                if (!r.first_err) r.first_err = e;
+                note_err(r, e);
                 r.skipped++;
                 whole = false;
                 continue;
@@ -911,8 +948,14 @@ int hardlinks_verify_groups(const char *tree_root, const HardlinkSet &set) {
     // symlink from a clone that sits somewhere else entirely, linked and renamed over two files
     // outside the clone. A member whose parent is not a real directory is now -EINVAL here,
     // which is WFS_E_SNAPSHOT_DIRTY to every caller, before anything is cloned or linked.
+    // PR #1 review (23rd round, P2): -EINVAL is this function's word for "this tree is not the
+    // tree the manifest describes", and every caller turns it into WFS_E_SNAPSHOT_DIRTY, which
+    // tells the user their snapshot is damaged and to make another one. An lstat that could not
+    // be made says nothing of the kind: an EACCES or an EIO under the gate is our own store
+    // being unreadable, and it is returned as itself so the caller can say so. fs_gone() is a
+    // member that really is not there, which IS the manifest disagreeing with the tree.
     int rootfd = open_tree_root(tree_root);
-    if (rootfd < 0) return -EINVAL;
+    if (rootfd < 0) return fs_gone(rootfd) ? -EINVAL : rootfd;
     int rc = 0;
     for (size_t i = 0; i < set.groups.size() && !rc; ++i) {
         const HardlinkGroup &g = set.groups[i];
@@ -920,7 +963,9 @@ int hardlinks_verify_groups(const char *tree_root, const HardlinkSet &set) {
         // function's promise is about the set it was handed, not about where it came from.
         if (g.paths.size() < 2 || (uint64_t)g.paths.size() != g.nlink) { rc = -EINVAL; break; }
         struct stat first;
-        if (member_lstat(rootfd, g.paths[0].c_str(), first) != 0 || !S_ISREG(first.st_mode)) {
+        int e = member_lstat(rootfd, g.paths[0].c_str(), first);
+        if (e && !fs_gone(e)) { rc = e; break; }
+        if (e || !S_ISREG(first.st_mode)) {
             rc = -EINVAL;
             break;
         }
@@ -931,7 +976,8 @@ int hardlinks_verify_groups(const char *tree_root, const HardlinkSet &set) {
         if ((uint64_t)first.st_nlink != (uint64_t)g.paths.size()) { rc = -EINVAL; break; }
         for (size_t k = 1; k < g.paths.size(); ++k) {
             struct stat st;
-            if (member_lstat(rootfd, g.paths[k].c_str(), st) != 0) { rc = -EINVAL; break; }
+            e = member_lstat(rootfd, g.paths[k].c_str(), st);
+            if (e) { rc = fs_gone(e) ? -EINVAL : e; break; }
             if (st.st_dev != first.st_dev || st.st_ino != first.st_ino) { rc = -EINVAL; break; }
         }
     }

@@ -746,6 +746,8 @@ extern "C" void *wfs_test_after_pool_claim_ctx = nullptr;
 // unwinding anything, which is what a `kill -9` there looks like to the next process.
 extern "C" int (*wfs_test_before_fork_publish)(void *ctx, wfs_id world, const char *tmp_path) = nullptr;
 extern "C" void *wfs_test_before_fork_publish_ctx = nullptr;
+extern "C" void (*wfs_test_before_hl_replay)(void *ctx, wfs_id world, const char *tmp_path) = nullptr;
+extern "C" void *wfs_test_before_hl_replay_ctx = nullptr;
 
 // And the unwind of a pool hand-out that failed (PR #1 review, 16th round): the entry is out of
 // the pool, its tree is back under its pool name, and nothing but this fork's CREATING world row
@@ -1406,12 +1408,24 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
             if (hl.groups.size() && from.kind == WFS_K_SNAPSHOT) {
                 wfs::SnapGate vgate;
                 if (src_gated) rc = vgate.open(src.c_str(), false);
-                if (!rc && wfs::hardlinks_verify_groups(src.c_str(), hl)) rc = WFS_E_SNAPSHOT_DIRTY;
+                // PR #1 review (23rd round): -EINVAL is "this snapshot is not what its
+                // manifest says"; any other errno is a tree we could not read, and saying
+                // SNAPSHOT_DIRTY about an EACCES would send the user off to rebuild a
+                // perfectly good snapshot.
+                if (!rc) {
+                    int vrc = wfs::hardlinks_verify_groups(src.c_str(), hl);
+                    if (vrc == -EINVAL) rc = WFS_E_SNAPSHOT_DIRTY;
+                    else if (vrc) rc = vrc;
+                }
                 vgate.close();
                 if (rc) break;
             }
             if (hl.groups.size()) {
                 wfs::HardlinkRestore hr;
+                // The test seam for "a member of the clone cannot be looked at" (PR #1 review,
+                // 23rd round): the clone is here, nothing has been linked yet.
+                if (wfs_test_before_hl_replay)
+                    wfs_test_before_hl_replay(wfs_test_before_hl_replay_ctx, id, tmp.c_str());
                 rc = wfs::hardlinks_restore(tmp.c_str(), hl, hl_verify, &hr);
                 res->hardlinks = hr.links;
                 // PR #1 review (4th round): the fork's own tree would disagree with the
