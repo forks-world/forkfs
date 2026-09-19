@@ -547,7 +547,7 @@ w2 fs restore W1 > /dev/null && [ -f "$SCRATCH/t-a/hello.txt" ] \
 # The background collector: `gc` hands the trash over and returns, the worker empties it.
 w2 fs discard W1 > /dev/null
 w2 fs gc --retention 0 > "$SCRATCH/gc2.log" 2>&1
-grep -q "emptied in the background" "$SCRATCH/gc2.log" && ok T2.1 "gc hands due trash to the background worker" \
+grep -q "collected in the background" "$SCRATCH/gc2.log" && ok T2.1 "gc hands due trash to the background worker" \
                                                        || { bad T2.1 "gc hands due trash to the background worker"; sed 's/^/        /' "$SCRATCH/gc2.log"; }
 for _ in $(seq 60); do [ -z "$(ls "$S2"/trash 2>/dev/null)" ] && break; sleep 0.25; done
 [ -z "$(ls "$S2"/trash 2>/dev/null)" ] && ok T2.1 "the worker empties the trash on its own" \
@@ -1040,6 +1040,48 @@ fi
 for _ in $(seq 160); do [ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && break; sleep 0.25; done
 [ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && ok PR1 "the successor chain finishes it once the obstacle is gone" \
                                             || { bad PR1 "the successor chain finishes it once the obstacle is gone"; ls "$RSTORE/trash" | sed 's/^/        /'; }
+
+# ---- PR #1 review (6th round, P2): the gc deadline reaches the pool, too ----------------------
+# A pool entry is a whole clone of a snapshot. Collecting stale ones ran in front of the
+# deadline-controlled trash loop and never looked at the clock, so a two-second worker wake -- or
+# an interactive `gc` -- could spend minutes unlinking full-size clones. Here: one 120k-entry
+# entry whose snapshot is then taken away behind the store's back (which is what `--reconcile`
+# is for), and a one-second budget (the same entry takes ~5 s to unlink in one go). The wake has to come back on time, leave the entry where a
+# successor finds it, say so, and the chain has to finish the job on its own.
+POOLSRC="$SCRATCH/pool-src"
+mkdir -p "$POOLSRC"
+python3 - "$POOLSRC" <<'EOF'
+import os, sys
+base = sys.argv[1]
+for d in range(400):
+    p = os.path.join(base, 'd%03d' % d)
+    os.makedirs(p, exist_ok=True)
+    for i in range(300):
+        os.close(os.open(os.path.join(p, 'f%03d' % i), os.O_CREAT | os.O_WRONLY, 0o644))
+EOF
+PS=$(rv fs init "$POOLSRC" --name poolbig 2>/dev/null | awk '/^S[0-9]/{print $1}')
+rv fs pool fill "$PS" --count 1 > /dev/null 2>&1
+PDIR="$RSTORE/pool/$PS"
+[ -n "$(ls "$PDIR" 2>/dev/null)" ] && ok PR6 "the pool holds a pre-cloned entry for $PS" \
+                                    || bad PR6 "the pool holds a pre-cloned entry for $PS"
+# The snapshot's tree, gone from under the store: its row is then dangling and --reconcile buries
+# it, which is what makes the pool entry stale.
+chmod 0700 "$RSTORE/snapshots/$PS/root"
+rm -rf "${RSTORE:?}/snapshots/${PS:?}"
+t0=$(python3 -c 'import time;print(int(time.time()*1000))')
+out=$(WORLD_GC_BATCH_SECS=1 rv fs gc --reconcile --retention 0 2>&1)
+t1=$(python3 -c 'import time;print(int(time.time()*1000))')
+if [ "$((t1 - t0))" -lt 2500 ]; then ok PR6 "a one-second gc does not unlink a whole pool clone ($((t1-t0)) ms)"
+else bad PR6 "a one-second gc does not unlink a whole pool clone ($((t1-t0)) ms)"; echo "$out" | sed 's/^/        /'; fi
+[ -n "$(ls "$PDIR" 2>/dev/null)" ] && ok PR6 "what it did not finish is still where a successor finds it" \
+                                    || { bad PR6 "what it did not finish is still where a successor finds it"; echo "$out" | sed 's/^/        /'; }
+echo "$out" | grep -q "being collected in the background" && ok PR6 "and it hands the rest over" \
+                                                           || { bad PR6 "and it hands the rest over"; echo "$out" | sed 's/^/        /'; }
+rv fs gc --status | grep -q "stale pre-clone" && ok PR6 "gc --status counts the stale entry" \
+                                               || { bad PR6 "gc --status counts the stale entry"; rv fs gc --status | sed 's/^/        /'; }
+for _ in $(seq 240); do [ -z "$(ls "$PDIR" 2>/dev/null)" ] && break; sleep 0.25; done
+[ -z "$(ls "$PDIR" 2>/dev/null)" ] && ok PR6 "the successor chain finishes the pool entry" \
+                                    || { bad PR6 "the successor chain finishes the pool entry"; ls -d "$PDIR"/* | sed 's/^/        /'; }
 
 echo
 "$WORLD" fs status | sed 's/^/      /'

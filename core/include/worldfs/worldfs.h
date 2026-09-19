@@ -655,6 +655,11 @@ typedef struct wfs_trash_stat {
      * they are outside the store -- but the same thing from an operator's point of view: space
      * that is waiting for a collector. */
     uint64_t creating_stranded;
+    /* PR #1 review (6th round): stale pre-clone pool entries still on disk -- a snapshot that is
+     * gone or is a different snapshot now, or a filler that died. Also not trash entries, and
+     * also waiting for the collector: removing one is a whole tree, so a wake that runs out of
+     * time leaves the rest of them for its successor. */
+    uint64_t pool_stranded;
     /* The worker, from <store>/locks/gc.lock. pid is 0 when nobody is running. */
     int64_t worker_pid, worker_started_at;
     uint64_t worker_done, worker_remaining; /* trash entries finished / left, as it last wrote */

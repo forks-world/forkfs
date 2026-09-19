@@ -2491,6 +2491,10 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
             }
         }
     }
+    // T1.5, PR #1 review (6th round): and the stale pool entries. Like the abandoned fork trees
+    // above they are not in the trash -- they are clones under <store>/pool -- but they are
+    // space waiting for the same collector, and a wake that ran out of time leaves them there.
+    wfs::pool_stranded(s, &out->pool_stranded);
     gc_worker_probe(s, &out->worker_pid, &out->worker_started_at, &out->worker_done,
                     &out->worker_remaining);
     return 0;
@@ -2694,7 +2698,13 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
     // T1.5: pool entries whose snapshot is gone or is a different snapshot now, rows whose
     // filler was killed mid-clone, and trees under <store>/pool that no row claims. After the
     // snapshot sweeps above, so a snapshot that died in this same run takes its pool with it.
-    wfs::pool_collect(s, &rep.pool_removed);
+    // PR #1 review (6th round): under this wake's deadline, and not in front of it. A pool entry
+    // is a whole clone of a snapshot -- a stale 120k-entry one is seconds of unlink(2), which is
+    // what the batch limit exists to bound -- and this used to run flat out before the deadline
+    // was ever consulted, so a two-second worker wake could spend minutes here. What the
+    // deadline cuts short keeps the shape its successor rediscovers (the row, or the row-less
+    // directory) and sets work_remains, so the worker chain comes back for it.
+    wfs::pool_collect(s, &rep.pool_removed, deadline_us, &rep.work_remains);
 
     // <store>/tmp holds the seatbelt profiles `world exec` generates. They are removed when the
     // command ends; one that survives an hour belongs to a process that was killed.

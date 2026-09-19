@@ -377,9 +377,11 @@ static int gc_work_waiting(wfs_store *s, int64_t retention, int *worker_running)
     return wfs_gc_pending(s, retention, worker_running);
 }
 
-static void spawn_gc_worker(wfs_store *s, int64_t retention) {
-    int running = 0;
-    if (!gc_work_waiting(s, retention, &running) || running) return;
+// Start one, whatever the trash looks like. The caller has already decided there is work --
+// a gc report that says work_remains, or a worker handing over to its successor -- and since
+// the 6th round of the PR #1 review that work can be stale pool entries, which wfs_gc_pending()
+// (a trash question) knows nothing about.
+static void spawn_gc_worker_now(wfs_store *s, int64_t retention) {
     // The worker has to inherit the retention this command was given, or a `gc --retention 0`
     // would hand over work that the worker then decides is not due yet.
     char days[32];
@@ -387,6 +389,12 @@ static void spawn_gc_worker(wfs_store *s, int64_t retention) {
     const char *tail_r[] = {"gc", "--worker", "--retention", days, NULL};
     const char *tail_d[] = {"gc", "--worker", NULL};
     spawn_detached(s, "gc.log", retention >= 0 ? tail_r : tail_d);
+}
+
+static void spawn_gc_worker(wfs_store *s, int64_t retention) {
+    int running = 0;
+    if (!gc_work_waiting(s, retention, &running) || running) return;
+    spawn_gc_worker_now(s, retention);
 }
 
 static int cmd_pool(wfs_store *s, int argc, char **argv) {
@@ -1068,13 +1076,7 @@ static int cmd_gc_worker(wfs_store *s, int64_t retention, int reconcile) {
     if (rc == WFS_E_GC_BUSY) return EX_OK;   // someone else is on it; nothing to say
     if (rc) return fail("gc worker", rc);
     gc_log_line(&rep, (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
-    if (rep.work_remains) {
-        char days[32];
-        snprintf(days, sizeof days, "%.6f", (double)retention / 86400.0);
-        const char *tail_r[] = {"gc", "--worker", "--retention", days, NULL};
-        const char *tail_d[] = {"gc", "--worker", NULL};
-        spawn_detached(s, "gc.log", retention >= 0 ? tail_r : tail_d);
-    }
+    if (rep.work_remains) spawn_gc_worker_now(s, retention);
     return EX_OK;
 }
 
@@ -1105,6 +1107,12 @@ static int cmd_gc_status(wfs_store *s, int64_t retention) {
     if (ts.creating_stranded)
         printf("abandoned: %llu half-built fork tree%s still on disk (`world fs gc` retries them)\n",
                (unsigned long long)ts.creating_stranded, ts.creating_stranded == 1 ? "" : "s");
+    // Nor are these: stale pre-clone entries under <store>/pool, whose snapshot is gone or is a
+    // different snapshot now. Removing one is a whole tree, so a bounded wake can leave some
+    // behind for its successor (PR #1 review, 6th round).
+    if (ts.pool_stranded)
+        printf("pool:      %llu stale pre-clone entr%s waiting for the collector\n",
+               (unsigned long long)ts.pool_stranded, ts.pool_stranded == 1 ? "y" : "ies");
     return EX_OK;
 }
 
@@ -1129,6 +1137,12 @@ static int cmd_gc(wfs_store *s, int argc, char **argv) {
     // Without --now the trash is left to the worker: unlinking it is minutes of work and no
     // interactive command should sit on that (T2.1, P16). Everything cheap still happens here.
     o.flags = (now ? 0 : WFS_GC_NO_TRASH) | (reconcile ? WFS_GC_RECONCILE : 0);
+    // PR #1 review (6th round): and "everything cheap" is not quite everything -- a stale pool
+    // entry is a whole clone of a snapshot to unlink. The interactive run takes the worker's own
+    // batch limit so it cannot sit there for minutes either; what it does not finish sets
+    // work_remains and goes to the worker spawned below. With --now the caller has asked for the
+    // whole job, so there is no limit.
+    if (!now) o.max_secs = gc_batch_secs();
     wfs_gc_report rep;
     int rc = wfs_gc_ex(s, &o, &rep);
     if (rc) return fail("gc", rc);
@@ -1170,8 +1184,12 @@ static int cmd_gc(wfs_store *s, int argc, char **argv) {
                                  : "It has failed too often to keep retrying by itself.");
     }
     if (!now && rep.work_remains) {
-        spawn_gc_worker(s, retention);
-        printf("gc: the trash is being emptied in the background (`world fs gc --status`)\n");
+        // On this report, not on a second opinion: wfs_gc_pending() answers a question about the
+        // trash, and what this run ran out of time for may be under <store>/pool instead.
+        int running = 0;
+        wfs_gc_pending(s, retention, &running);
+        if (!running) spawn_gc_worker_now(s, retention);
+        printf("gc: the rest is being collected in the background (`world fs gc --status`)\n");
     }
     return EX_OK;
 }

@@ -344,12 +344,12 @@ int pool_verify(wfs_store *s, wfs_id snapshot, uint64_t *checked, uint64_t *dirt
     return 0;
 }
 
-int pool_collect(wfs_store *s, uint64_t *removed) {
-    if (!s) return -EINVAL;
-    uint64_t n = 0;
-    Vec<wfs_id> rows;
-    Vec<String> trees;
-    Vec<String> live; // paths a valid row still points at
+namespace {
+
+// The classification half, split out of pool_collect (PR #1 review, 6th round) so that
+// `gc --status` can count what is waiting without removing any of it: `rows`/`trees` are the
+// doomed entries, `live` every path something still alive is using.
+int pool_scan(wfs_store *s, Vec<wfs_id> &rows, Vec<String> &trees, Vec<String> &live) {
     {
         Guard g(s->mu);
         // Left joined by hand: one pass over the pool, one lookup per row. A store has a
@@ -397,11 +397,77 @@ int pool_collect(wfs_store *s, uint64_t *removed) {
         if (w.ok())
             while (w.row()) live.emplace_back(w.col_text(0));
     }
+    return 0;
+}
+
+// The directories under <store>/pool that no row claims: half-built trees (*.wfs-tmp) and
+// entries whose row was claimed by a fork that then died before the rename. `remove` deletes
+// them and returns how many went; otherwise they are only counted. The deadline is the gc
+// worker's, and a tree it stops in the middle of is still a row-less directory next time, so
+// the successor picks it up exactly where this left off.
+uint64_t pool_sweep_orphans(wfs_store *s, const Vec<String> &live, bool remove, int64_t deadline_us,
+                            bool *out_of_time) {
+    uint64_t n = 0;
+    String root = pool_root(s);
+    DIR *d = ::opendir(root.c_str());
+    if (!d) return 0;
+    while (struct dirent *e = ::readdir(d)) {
+        if (e->d_name[0] == '.') continue;
+        String sub = joinp(root.c_str(), e->d_name);
+        DIR *sd = ::opendir(sub.c_str());
+        if (!sd) continue;
+        while (struct dirent *ee = ::readdir(sd)) {
+            if (ee->d_name[0] == '.') continue;
+            String p = joinp(sub.c_str(), ee->d_name);
+            bool wanted = false;
+            for (size_t i = 0; i < live.size(); ++i)
+                if (!::strcmp(live[i].c_str(), p.c_str())) { wanted = true; break; }
+            if (wanted) continue;
+            if (!remove) { ++n; continue; }
+            if (deadline_us && fs_mono_us() >= deadline_us) {
+                if (out_of_time) *out_of_time = true;
+                break;
+            }
+            int partial = 0;
+            int rc = fs_remove_tree(p.c_str(), deadline_us, &partial);
+            if (partial) { if (out_of_time) *out_of_time = true; break; }
+            if (rc == 0) ++n;
+        }
+        ::closedir(sd);
+        if (out_of_time && *out_of_time) break;
+        if (remove) ::rmdir(sub.c_str()); // empty S<n> directories go too; harmless otherwise
+    }
+    ::closedir(d);
+    return n;
+}
+
+} // namespace
+
+int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us, int *work_remains) {
+    if (!s) return -EINVAL;
+    uint64_t n = 0;
+    Vec<wfs_id> rows;
+    Vec<String> trees;
+    Vec<String> live; // paths a valid row still points at
+    if (int rc = pool_scan(s, rows, trees, live)) return rc;
+    // PR #1 review (6th round): every one of these is a whole clone of a snapshot, not the
+    // handful of stat(2)s the rest of gc's cheap half is made of. Under a deadline the removal
+    // stops where it is and the ROW STAYS, because that is the state a successor rediscovers:
+    // the entry is doomed for a reason that does not go away (its snapshot is gone, is not
+    // ACTIVE, or is a different snapshot now, or its filler died), and none of those can be
+    // handed to a fork -- pool_claim only ever matches state=1 rows whose snapshot_id and
+    // snap_created_at are those of an ACTIVE snapshot somebody is forking from. So a half
+    // removed tree is never mistaken for a ready entry; it is simply collected again.
+    bool out_of_time = false;
     for (size_t i = 0; i < trees.size(); ++i) {
+        if (deadline_us && fs_mono_us() >= deadline_us) { out_of_time = true; break; }
         String tmp(trees[i]);
         tmp.append(WFS_TMP_SUFFIX);
-        fs_remove_tree(tmp.c_str());
-        fs_remove_tree(trees[i].c_str());
+        int partial = 0;
+        fs_remove_tree(tmp.c_str(), deadline_us, &partial);
+        int partial2 = 0;
+        if (!partial) fs_remove_tree(trees[i].c_str(), deadline_us, &partial2);
+        if (partial || partial2) { out_of_time = true; break; }
         Guard g(s->mu);
         Txn t(s->db);
         Stmt d(s->db, "DELETE FROM pool WHERE id=?");
@@ -409,31 +475,27 @@ int pool_collect(wfs_store *s, uint64_t *removed) {
         t.commit();
         ++n;
     }
-    // Directories under <store>/pool that no row claims: half-built trees (*.wfs-tmp) and
-    // entries whose row was claimed by a fork that then died before the rename.
-    String root = pool_root(s);
-    DIR *d = ::opendir(root.c_str());
-    if (d) {
-        while (struct dirent *e = ::readdir(d)) {
-            if (e->d_name[0] == '.') continue;
-            String sub = joinp(root.c_str(), e->d_name);
-            DIR *sd = ::opendir(sub.c_str());
-            if (!sd) continue;
-            while (struct dirent *ee = ::readdir(sd)) {
-                if (ee->d_name[0] == '.') continue;
-                String p = joinp(sub.c_str(), ee->d_name);
-                bool wanted = false;
-                for (size_t i = 0; i < live.size(); ++i)
-                    if (!::strcmp(live[i].c_str(), p.c_str())) { wanted = true; break; }
-                if (wanted) continue;
-                if (fs_remove_tree(p.c_str()) == 0) ++n;
-            }
-            ::closedir(sd);
-            ::rmdir(sub.c_str()); // empty S<n> directories go too; fails harmlessly otherwise
-        }
-        ::closedir(d);
-    }
+    if (!out_of_time) n += pool_sweep_orphans(s, live, true, deadline_us, &out_of_time);
+    if (out_of_time && work_remains) *work_remains = 1;
     if (removed) *removed += n;
+    return 0;
+}
+
+int pool_stranded(wfs_store *s, uint64_t *out) {
+    if (!s || !out) return -EINVAL;
+    *out = 0;
+    Vec<wfs_id> rows;
+    Vec<String> trees;
+    Vec<String> live;
+    if (int rc = pool_scan(s, rows, trees, live)) return rc;
+    uint64_t n = 0;
+    for (size_t i = 0; i < trees.size(); ++i) {
+        String tmp(trees[i]);
+        tmp.append(WFS_TMP_SUFFIX);
+        if (exists(trees[i].c_str()) || exists(tmp.c_str())) ++n;
+    }
+    n += pool_sweep_orphans(s, live, false, 0, nullptr);
+    *out = n;
     return 0;
 }
 

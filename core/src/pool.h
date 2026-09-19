@@ -53,7 +53,21 @@ int pool_ready_for(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, uint6
 // gc: entries of snapshots that are gone or no longer the same snapshot, rows left in the
 // CREATING state, the *.wfs-tmp trees those rows name, and directories under <store>/pool that no
 // row claims. Every one of those paths is inside the store.
-int pool_collect(wfs_store *s, uint64_t *removed);
+//
+// PR #1 review (6th round): a pool entry is a full clone of a snapshot, so this is not the cheap
+// work the rest of gc's first half is -- unlinking a stale 120k-entry entry is seconds, and it
+// used to run flat out in front of the deadline-controlled trash loop, which turned a two-second
+// worker wake into minutes. `deadline_us` is the gc worker's fs_mono_us() stamp (0 = no limit),
+// checked before each tree and inside the walk; when it passes, what is left keeps the state its
+// successor rediscovers it in -- the row is still there, the orphan directory is still listed --
+// and *work_remains is set to 1 so the worker chain carries on. Neither pointer has to be given.
+int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us = 0, int *work_remains = nullptr);
+
+// `gc --status`: how many stale pool entries are still on disk, counted the way pool_collect
+// classifies them and without removing any of them. Rows whose snapshot is gone or is a
+// different snapshot now, rows whose filler died, and the row-less directories under
+// <store>/pool. Same query and one readdir, as in pool_collect.
+int pool_stranded(wfs_store *s, uint64_t *out);
 
 // verify S<n>: every pool entry must still be there and must not have been written to since it
 // was cloned (the root's mtime is the whole check -- see worldfs.h).
