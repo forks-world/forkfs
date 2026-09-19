@@ -1485,7 +1485,7 @@ int main() {
         CHECK(exists(sdir));
         CHECK(!exists(g_trash_crash_path));
         CHECK_OK(wfs_snapshot_verify(ts, t1, &vr));            // manifest and tree intact
-        CHECK_OK(wfs_world_diff(ts, tw2, NULL, NULL, NULL));   // and the world has its baseline
+        CHECK_OK(wfs_world_diff(ts, tw2, 0, NULL, NULL));      // and the world has its baseline
 
         // (3) The same crash with nothing referencing it: the discard the user asked for is
         // finished, and the entry is then collected like any other.

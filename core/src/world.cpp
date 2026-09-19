@@ -316,6 +316,15 @@ int world_row(wfs_store *s, wfs_id id, wfs_world_rec &r) {
     return 0;
 }
 
+int snapshot_trash_path(wfs_store *s, wfs_id id, String &out) {
+    Stmt q(s->db, "SELECT trash_path FROM snapshots WHERE id=?");
+    if (!q.ok()) return -EIO;
+    q.i64(1, (int64_t)id);
+    if (!q.row()) return -ENOENT;
+    out.assign(q.col_text(0));
+    return 0;
+}
+
 int world_trash_path(wfs_store *s, wfs_id id, String &out) {
     Stmt q(s->db, "SELECT trash_path FROM worlds WHERE id=?");
     if (!q.ok()) return -EIO;
@@ -528,6 +537,17 @@ int world_set_tmp_path(wfs_store *s, wfs_id id, const char *p) {
 bool ends_with(const char *s_, const char *suffix) {
     size_t n = ::strlen(s_), m = ::strlen(suffix);
     return n > m && !::strcmp(s_ + n - m, suffix);
+}
+
+// The collector renames a trash entry to `<name>.deleting` first and records the new name
+// second, so between the two -- and after any interruption in that window -- the row still names
+// the tree by the name it no longer has. Both names now belong to the row (claim_trash_paths),
+// which means the row has to be the one that finishes it: follow the rename.
+void trash_follow_deleting(String &tp) {
+    if (ends_with(tp.c_str(), WFS_DELETING_SUFFIX) || exists(tp.c_str())) return;
+    String d(tp);
+    d.append(WFS_DELETING_SUFFIX);
+    if (exists(d.c_str())) tp = d;
 }
 
 // Step 1. `out` receives the name the tree now has (which may be the one it already had).
@@ -1496,6 +1516,37 @@ int snapshot_refs_locked(wfs_store *s, wfs_id id, SnapRefs &out) {
     return 0;
 }
 
+// --now: delete the trash entry here instead of leaving it to the collector, which is what
+// `discard W<n> --now` has always done and what the CLI has always advertised for S<n> as well
+// (PR #1 review). The same two steps in the same order: rename to *.deleting first, so an
+// interrupted delete is visibly not a snapshot any more, then unlink, then the row is DEAD.
+int snapshot_delete_now(wfs_store *s, wfs_id id, const String &trash) {
+    if (trash.size()) {
+        String deleting;
+        int mrc = trash_mark_deleting(trash.c_str(), deleting);
+        if (mrc && mrc != -ENOENT) return mrc;
+        if (!mrc) {
+            {
+                Guard g(s->mu);
+                Txn t(s->db);
+                Stmt u(s->db, "UPDATE snapshots SET trash_path=? WHERE id=?");
+                if (u.ok()) { u.text(1, deleting.c_str()); u.i64(2, (int64_t)id); u.step(); }
+                t.commit();
+            }
+            if (int rc = trash_unlink(deleting.c_str(), 4, nullptr)) return rc;
+        }
+    }
+    Guard g(s->mu);
+    Txn t(s->db);
+    Stmt u(s->db, "UPDATE snapshots SET state=?, trash_path='' WHERE id=?");
+    if (!u.ok()) return -EIO;
+    u.i64(1, WFS_ST_DEAD);
+    u.i64(2, (int64_t)id);
+    if (u.step() != SQLITE_DONE) return -EIO;
+    t.commit();
+    return 0;
+}
+
 } // namespace
 
 extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int force) {
@@ -1504,9 +1555,23 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
     // is decided again below, under the write lock.
     {
         wfs_snapshot_rec r;
-        Guard g(s->mu);
-        if (int rc = snapshot_row(s, id, r)) return rc;
-        if (r.state == WFS_ST_TRASHED) return -EALREADY;
+        String tp;
+        {
+            Guard g(s->mu);
+            if (int rc = snapshot_row(s, id, r)) return rc;
+            if (r.state == WFS_ST_TRASHED && immediate) {
+                if (int rc = snapshot_trash_path(s, id, tp)) return rc;
+            }
+        }
+        if (r.state == WFS_ST_TRASHED) {
+            // PR #1 review (5th round): --now on a snapshot that is already in the trash brings
+            // the deletion forward, exactly as it does for a world, instead of being refused and
+            // sending the caller to a store-wide gc. The reference check happened when it was
+            // trashed; what is left is the unlink the collector would have done later.
+            if (!immediate) return -EALREADY;
+            trash_follow_deleting(tp);   // an interrupted collection is still this row's entry
+            return snapshot_delete_now(s, id, tp);
+        }
         if (r.state != WFS_ST_ACTIVE) return -ESTALE;
     }
     // Pool entries are clones nobody has taken yet -- losing them costs a re-fill and nothing
@@ -1574,35 +1639,7 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
     // (c)
     if (int crc = trashing_commit(s, id, 1)) return crc;
     if (!immediate) return 0;
-
-    // --now: delete it here instead of leaving it to the collector, which is what `discard
-    // W<n> --now` has always done and what the CLI has always advertised for S<n> as well
-    // (PR #1 review). The same two steps in the same order: rename to *.deleting first, so an
-    // interrupted delete is visibly not a snapshot any more, then unlink, then the row is DEAD.
-    if (trash.size()) {
-        String deleting;
-        int mrc = trash_mark_deleting(trash.c_str(), deleting);
-        if (mrc && mrc != -ENOENT) return mrc;
-        if (!mrc) {
-            {
-                Guard g(s->mu);
-                Txn t(s->db);
-                Stmt u(s->db, "UPDATE snapshots SET trash_path=? WHERE id=?");
-                if (u.ok()) { u.text(1, deleting.c_str()); u.i64(2, (int64_t)id); u.step(); }
-                t.commit();
-            }
-            if (int rc = trash_unlink(deleting.c_str(), 4, nullptr)) return rc;
-        }
-    }
-    Guard g(s->mu);
-    Txn t(s->db);
-    Stmt u(s->db, "UPDATE snapshots SET state=?, trash_path='' WHERE id=?");
-    if (!u.ok()) return -EIO;
-    u.i64(1, WFS_ST_DEAD);
-    u.i64(2, (int64_t)id);
-    if (u.step() != SQLITE_DONE) return -EIO;
-    t.commit();
-    return 0;
+    return snapshot_delete_now(s, id, trash);
 }
 
 // ---- PR #1 review (5th round): resolving a discard that was killed in the middle ---------------
@@ -2202,17 +2239,6 @@ void claim_trash_paths(wfs_store *s, Vec<String> &claimed) {
             claimed.emplace_back(tp);
         }
     }
-}
-
-// The collector renames a trash entry to `<name>.deleting` first and records the new name
-// second, so between the two -- and after any interruption in that window -- the row still names
-// the tree by the name it no longer has. Both names now belong to the row (claim_trash_paths),
-// which means the row has to be the one that finishes it: follow the rename.
-void trash_follow_deleting(String &tp) {
-    if (ends_with(tp.c_str(), WFS_DELETING_SUFFIX) || exists(tp.c_str())) return;
-    String d(tp);
-    d.append(WFS_DELETING_SUFFIX);
-    if (exists(d.c_str())) tp = d;
 }
 
 int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v) {

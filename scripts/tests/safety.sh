@@ -854,6 +854,27 @@ rv fs init "$SCRATCH/review-src" --name rv2 > /dev/null 2>&1
 rv fs discard S2 > /dev/null 2>&1
 [ -n "$(ls -d "$RSTORE"/trash/S2-* 2>/dev/null)" ] && ok PR1 "without --now the snapshot only moves to the trash" \
                                                    || bad PR1 "without --now the snapshot only moves to the trash"
+# ---- PR #1 review (5th round, P2): --now finishes a snapshot that is already in the trash -----
+# `discard S<n>` then `discard S<n> --now` used to be a refusal, so the only way to get the space
+# back before the retention period was a store-wide gc. A world has always accepted exactly this.
+out=$(rv fs discard S2 --now 2>&1)
+if [ -z "$(ls -d "$RSTORE"/trash/S2-* 2>/dev/null)" ] && echo "$out" | grep -q "^S2 deleted"; then
+    ok PR5 "discard S<n> --now finishes a snapshot that was already trashed"
+else
+    bad PR5 "discard S<n> --now finishes a snapshot that was already trashed"
+    echo "$out" | sed 's/^/        /'; ls "$RSTORE/trash" 2>/dev/null | sed 's/^/        /'
+fi
+rv fs inspect S2 | grep -q "^state: *dead" && ok PR5 "and the row is dead, not still trashed" \
+                                           || { bad PR5 "and the row is dead, not still trashed"; rv fs inspect S2 | sed 's/^/        /'; }
+rv fs gc --status | grep -q "^trash: *0 entries" && ok PR5 "and the trash is empty again" \
+                                                 || { bad PR5 "and the trash is empty again"; rv fs gc --status | sed 's/^/        /'; }
+# Without --now it is still a refusal, and the refusal now says what --now is for.
+rv fs init "$SCRATCH/review-src" --name rv3 > /dev/null 2>&1
+rv fs discard S3 > /dev/null 2>&1
+check    PR5 "a second discard of a trashed snapshot is still refused" 3 -- rv fs discard S3
+has_hint PR5 "that refusal offers --now" "discard S<n> --now" -- rv fs discard S3
+rv fs discard S3 --now > /dev/null 2>&1
+
 rv fs gc --now --retention 0 > /dev/null 2>&1
 
 # ---- PR #1 review (P2): the batch limit bites inside one tree, not only between trees ----------

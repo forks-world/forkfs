@@ -782,10 +782,13 @@ static int cmd_discard_snapshot(wfs_store *s, wfs_id sid, int now, int force, in
     wfs_snapshot_rec sr;
     int rc = wfs_snapshot_info(s, sid, &sr);
     if (rc) return fail("discard", rc);
-    if (sr.state == WFS_ST_TRASHED) {
+    // PR #1 review (5th round): already in the trash is a refusal only without --now. With it,
+    // this is the one command that brings the deletion forward, which is what it does for a
+    // world and what the API has always documented for a snapshot.
+    if (sr.state == WFS_ST_TRASHED && !now) {
         char why[96];
         snprintf(why, sizeof why, "S%llu is already in the trash", (unsigned long long)sid);
-        return refuse(why, "world fs gc --status");
+        return refuse(why, "world fs discard S<n> --now   (deletes it now instead of waiting)");
     }
     rc = wfs_snapshot_discard(s, sid, now, force);
     if (rc == WFS_E_SNAPSHOT_IN_USE) {
