@@ -172,6 +172,14 @@ S1/S4 的抖动来自 mds 索引新生成的文件。)
 每次操作 5–7 次 XPC 往返(每次 ~50–90µs)主导。
 
 ### M1 — clonefile World(方案 C,2026-09-19 用户确认切换;设计见 docs/M1_DESIGN.md)
+
+**状态(2026-09-19 收尾)**:T1.1–T1.7 全部完成,T1.8 文档(arch.md 增补 + README)由架构师进行中。
+门禁:`safety.sh` **93/93**;`ctest` 默认配置 2/2(core_test、diff_test)、`-DWFS_FSKIT=ON` 3/3(加 fskit_test);`check-deps.sh` 两个 build 目录只链系统库。
+**arch.md §1 五条判据全部 PASS**(详见 [`docs/M1_RESULTS.md`](M1_RESULTS.md)):fork 延迟 pool 命中 p50 **8.6 / 9.0 / 9.7 ms**(1k/10k/50k,< 10 ms);
+git/build **99%** native(> 0.5 s 的步骤最差)、agentstress 10 场景 99–147%;1000 个 idle World **3.40 GB / 建完 114 s / `fs list` 10 ms**;
+存储 = 100 份真副本的 **13.6%**(100 个 50k World 各改 1%);diff O(changes),50k/800 改动全扫 **0.185 s**(`--events` 0.354 s)。
+FSKit 前端**冻结**在 macOS 27 Handler API 上(`WorldVolumeH` 为默认,旧 `FSVolumeOperations` 以 marker 保留为回退),门槛**仍不达标**:create+unlink **11.04** 次往返(≤ 6)、单次往返 **74.64µs**(≤ 40µs),见 [`docs/FSKIT_HANDLER_API_MACOS27.md`](FSKIT_HANDLER_API_MACOS27.md)。
+
 - [x] T1.1 core 重构:schema v2、snapshot/world/trash、平台原语(clone_tree/protect/probe/free_space/count)
       C ABI 换成 snapshot + world 两类对象;M0 的 view/namespace API 移到 `core/include/worldfs/worldfs_fskit.h`,
       由 CMake 选项 `WFS_FSKIT`(默认 OFF)决定是否编译 `core/src/view.cpp` 与 `macos/fskit/`(ON 时已验证可编译、测试通过)。
