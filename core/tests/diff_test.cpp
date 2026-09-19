@@ -929,6 +929,108 @@ static void unreadable_dir(const char *root, const char *store) {
     wfs_store_close(s);
 }
 
+// ---- PR #1 review (23rd round, P2): a side that could not be read is not a side without it ---
+//
+// Every candidate is stat'ed on both sides, and both lookups turned any failure into "not
+// there". One side failing was then an A or a D that never happened -- a file whose directory
+// could not be read on the snapshot side is reported as added, and `world fs diff` says so and
+// exits 0 -- and both failing dropped the candidate without a word. The same in the full
+// scan's side_entry(). fs_gone() is the only absence; every other errno is the diff's error.
+//
+// The unreadable side here is the SNAPSHOT's, for a reason worth writing down: FSEvents
+// resolves the paths it replays at replay time, so a directory made unreadable in the WORLD
+// hides its own candidates and the fixture tests nothing (measured: with `a` at 0000 the
+// replay returns `a` alone, and with it gone from the journal's reach, nothing at all). The
+// snapshot side is not in that resolution at all, and it is read inside the gate, which is
+// exactly where a broken store shows up. The world-side half of the same lookup is the ELOOP
+// case at the end.
+static void unreadable_lookup(const char *root, const char *store) {
+    char src[4096], w[4096], w2[4096], p[4096], q[4096];
+    join(src, sizeof src, root, "lookup-src");
+    join(w, sizeof w, root, "lookup-w");
+    join(w2, sizeof w2, root, "lookup-w2");
+    CHECK(mkdir(src, 0755) == 0);
+    join(p, sizeof p, src, "keep.txt");
+    write_file(p, "keep\n");
+    join(p, sizeof p, src, "a");
+    CHECK(mkdir(p, 0755) == 0);
+    join(p, sizeof p, src, "a/b");
+    CHECK(mkdir(p, 0755) == 0);
+    join(q, sizeof q, p, "h.txt");
+    write_file(q, "h\n");
+
+    wfs_store *s = NULL;
+    CHECK_OK(wfs_store_open(store, &s));
+    wfs_id sid = 0;
+    wfs_snapshot_opts sopts;
+    memset(&sopts, 0, sizeof sopts);
+    sopts.name = "lookup";
+    CHECK_OK(wfs_snapshot_create(s, src, &sopts, &sid));
+    wfs_snapshot_rec sr;
+    CHECK_OK(wfs_snapshot_info(s, sid, &sr));
+    wfs_ref from = {WFS_K_SNAPSHOT, sid};
+    wfs_fork_opts o;
+    memset(&o, 0, sizeof o);
+    wfs_id wid = 0;
+    CHECK_OK(wfs_world_create(s, from, w, &o, &wid));
+
+    // `a/b/h.txt` is changed, so it is a candidate; and `a/b/gone.txt` is created and removed
+    // again, which is the candidate that is on neither side -- the one whose two failing
+    // lookups used to cancel each other out into silence.
+    join(p, sizeof p, w, "a/b/h.txt");
+    write_file(p, "h, changed and longer\n");
+    join(q, sizeof q, w, "a/b/gone.txt");
+    write_file(q, "gone\n");
+    CHECK(unlink(q) == 0);
+    settle();
+
+    // Behind the gate, for the length of this case only: the snapshot's own `a` cannot be
+    // searched, so every lookup under it is EACCES rather than an answer.
+    char snap_a[4096];
+    join(snap_a, sizeof snap_a, sr.path, "a");
+    CHECK(chmod(sr.path, 0700) == 0);
+    CHECK(chmod(snap_a, 0000) == 0);
+    CHECK(chmod(sr.path, WFS_GATE_CLOSED) == 0);
+
+    Collect c;
+    memset(&c, 0, sizeof c);
+    // Before the fix: rc 0 and a spurious `A a/b/h.txt`, with `a/b/gone.txt` dropped in silence.
+    run_diff_err(s, wid, WFS_DIFF_EVENTS, &c, -EACCES);
+    // The full scan asks the same question of the same side, one entry at a time -- though
+    // there its own walk of the snapshot cannot open `a` either, so it was already failing
+    // for that reason; the world-side half of side_entry's lookup is the ELOOP case below.
+    run_diff_err(s, wid, WFS_DIFF_FULL, &c, -EACCES);
+    // ... and the gate is where it was, on both ways out.
+    CHECK(mode_of(sr.path) == WFS_GATE_CLOSED);
+
+    CHECK(chmod(sr.path, 0700) == 0);
+    CHECK(chmod(snap_a, 0755) == 0);
+    CHECK(chmod(sr.path, WFS_GATE_CLOSED) == 0);
+    wfs_diff_stats st;
+    static const Want want[] = {{'M', "a/b/h.txt"}};
+    run_diff(s, wid, WFS_DIFF_EVENTS, &c, &st);
+    check_lines("unreadable snapshot dir / events", &c, want, 1);
+    run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
+    check_lines("unreadable snapshot dir / --full", &c, want, 1);
+
+    // The other half, in the full scan: the walk is on the SNAPSHOT side and it is the lookup
+    // of the WORLD side that fails. A directory replaced by a symlink to itself is ELOOP for
+    // every path under it -- not a permission at all, and just as much not an absence. Before
+    // the fix the snapshot-side pass reported `D a/b/h.txt`.
+    wfs_id wid2 = 0;
+    CHECK_OK(wfs_world_create(s, from, w2, &o, &wid2));
+    join(p, sizeof p, w2, "a/b/h.txt");
+    CHECK(unlink(p) == 0);
+    join(p, sizeof p, w2, "a/b");
+    CHECK(rmdir(p) == 0);
+    CHECK(symlink("b", p) == 0);
+    run_diff_err(s, wid2, WFS_DIFF_FULL, &c, -ELOOP);
+    CHECK(unlink(p) == 0);
+
+    free(c.v);
+    wfs_store_close(s);
+}
+
 static void small_cases(const char *root, const char *store) {
     char src[4096], w[4096], w2[4096], p[4096], q[4096];
     join(src, sizeof src, root, "small-src");
@@ -1309,6 +1411,10 @@ int main() {
         char store8[4096];
         join(store8, sizeof store8, root, "store-unreadable");
         unreadable_dir(root, store8);
+
+        char store9[4096];
+        join(store9, sizeof store9, root, "store-lookup");
+        unreadable_lookup(root, store9);
     }
 
     printf("small cases\n");

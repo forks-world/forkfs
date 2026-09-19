@@ -501,6 +501,21 @@ int other_side(const Ctx &c, const char *path, struct stat &st, uint8_t &xa, boo
     return wfs::fs_lstat_xattr(path, st, xa);
 }
 
+// PR #1 review (23rd round, P2): and what a failing lookup is worth. Both sides of a candidate,
+// and the other side of every entry in the full scan, were looked up with a bool: 0 or "not
+// there". An EACCES on a parent directory, an EIO, an ELOOP where a directory used to be, a
+// volume that went away -- all of them came back as "not there", and the diff then *reported*
+// that: one side failing is a fabricated A or D (a file nobody touched, printed as deleted),
+// both failing is a candidate dropped without a word. Neither is a thing a caller can notice.
+// So the 12th round's rule holds here too: fs_gone() -- ENOENT/ENOTDIR -- is the only absence,
+// and every other errno ends the diff with itself. Returns 0 with `there` set, or -errno.
+int side_lookup(const Ctx &c, const char *path, struct stat &st, uint8_t &xa, bool want_xattr,
+                bool &there) {
+    int rc = other_side(c, path, st, xa, want_xattr);
+    there = rc == 0;
+    return (rc == 0 || wfs::fs_gone(rc)) ? 0 : rc;
+}
+
 // Both sides exist. Returns 0 (identical), 'M' or 'T'. `wxa`/`sxa` are the two sides'
 // fs_xattr_state as the walk (or fs_lstat_xattr) already knows them.
 int classify(Ctx &c, const char *wpath, const struct stat &ws, uint8_t wxa, const char *spath,
@@ -622,7 +637,9 @@ int side_entry(void *ctx, const wfs::FsEntry &en) {
     join_rel(other, s->world_side ? c.sroot.c_str() : c.wroot.c_str(), rel);
     struct stat os;
     uint8_t oxa = wfs::FS_XATTR_UNKNOWN;
-    if (other_side(c, other.c_str(), os, oxa, !en.is_dir) != 0) {
+    bool on_other = false;
+    if (int rc = side_lookup(c, other.c_str(), os, oxa, !en.is_dir, on_other)) return rc;
+    if (!on_other) {
         // Only on this side. The walk visits every descendant itself, so a non-empty directory
         // needs no expansion here -- only an empty one has nothing else to report it.
         if (en.is_dir) {
@@ -658,8 +675,9 @@ int verify_candidate(Ctx &c, const char *rel) {
     join_rel(spath, c.sroot.c_str(), rel);
     struct stat ws, ss;
     uint8_t wxa = wfs::FS_XATTR_UNKNOWN, sxa = wfs::FS_XATTR_UNKNOWN;
-    bool in_world = other_side(c, wpath.c_str(), ws, wxa, true) == 0;
-    bool in_snap = other_side(c, spath.c_str(), ss, sxa, true) == 0;
+    bool in_world = false, in_snap = false;
+    if (int rc = side_lookup(c, wpath.c_str(), ws, wxa, true, in_world)) return rc;
+    if (int rc = side_lookup(c, spath.c_str(), ss, sxa, true, in_snap)) return rc;
     if (!in_world && !in_snap) return 0; // created and removed again inside the same world
     if (in_world && !in_snap) return report_one_side(c, rel, wpath.c_str(), ws, WFS_C_ADDED);
     if (!in_world && in_snap) return report_one_side(c, rel, spath.c_str(), ss, WFS_C_DELETED);
@@ -727,8 +745,14 @@ extern "C" int wfs_world_diff_ex(wfs_store *s, wfs_id world, int flags, wfs_diff
     // The snapshot has to still be on disk to be compared against; the gate on it is opened
     // further down, around the comparison itself.
     {
+        // PR #1 review (23rd round): a snapshot tree that cannot be read is not a snapshot tree
+        // that is gone -- WFS_E_SOURCE_GONE says "fork it again from somewhere else", which is
+        // the wrong thing to tell anyone about an EACCES or an EIO inside our own store.
         struct stat sst;
-        if (::lstat(sr.path, &sst) != 0 || !S_ISDIR(sst.st_mode)) return WFS_E_SOURCE_GONE;
+        int prc = wfs::fs_probe(sr.path, &sst);
+        if (wfs::fs_gone(prc)) return WFS_E_SOURCE_GONE;
+        if (prc) return prc;
+        if (!S_ISDIR(sst.st_mode)) return WFS_E_SOURCE_GONE;
     }
 
     Ctx c;
@@ -787,7 +811,7 @@ extern "C" int wfs_world_diff_ex(wfs_store *s, wfs_id world, int flags, wfs_diff
         // milliseconds). It is opened as late as possible and the guard closes it -- restoring
         // mode 0000 -- on every path out, including the error returns below.
         wfs::SnapshotReadGuard gate(sr.path);
-        if (gate.rc == -ENOENT || gate.rc == -ENOTDIR) return WFS_E_SOURCE_GONE;
+        if (wfs::fs_gone(gate.rc)) return WFS_E_SOURCE_GONE;
         if (gate.rc) return gate.rc;
 
         if (!full) {
