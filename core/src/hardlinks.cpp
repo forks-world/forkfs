@@ -240,8 +240,20 @@ int hardlinks_manifest_read(const char *manifest_path, HardlinkSet &out) {
     if (!out.header_seen) return (out.groups.size() || out.names) ? -EINVAL : 0;
     if ((uint64_t)out.groups.size() != out.header_groups || out.names != out.header_names)
         return -EINVAL;
-    for (size_t i = 0; i < out.groups.size(); ++i)
-        if (out.groups[i].paths.size() < 2) return -EINVAL;
+    // PR #1 review (9th round): and every group must be as big as it says it is. "At least two
+    // names" was too weak by exactly one damage shape: a member re-tagged into the neighbouring
+    // group keeps the group count and the name count intact, so the header agrees, and the
+    // replay then links a name from one inode's group onto another group's canonical file --
+    // cloned content overwritten, in a fork that reported success. `nlink` is the authority: the
+    // scan puts a group in `groups` only when every one of the inode's links was found inside
+    // the tree (k == nlink), and a group that reaches outside is counted in the header's
+    // external totals and never written as `hl` lines at all. So in a manifest this library
+    // wrote, a group's member count IS its nlink, and anything else is damage.
+    for (size_t i = 0; i < out.groups.size(); ++i) {
+        const HardlinkGroup &g = out.groups[i];
+        if (g.paths.size() < 2) return -EINVAL;
+        if ((uint64_t)g.paths.size() != g.nlink) return -EINVAL;
+    }
     return 0;
 }
 

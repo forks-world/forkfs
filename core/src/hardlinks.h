@@ -99,6 +99,16 @@ void hardlinks_manifest_write(FILE *f, const HardlinkSet &set);
 // again to notice. So: there must be a header when there are `hl` lines, the groups and the
 // names must be exactly what it says, and no group may hold fewer than two names (the scan never
 // writes one -- a group whose names are not all inside the tree is counted as external instead).
+//
+// PR #1 review (9th round): and every group must hold exactly `nlink` names. "At least two" was
+// too weak by one damage shape -- a member re-tagged into the neighbouring group leaves both the
+// group count and the name count intact, so the header agrees, and the replay then links a name
+// belonging to one inode onto another group's canonical file. The manifest needs no new field
+// for this: a group is written only when the scan found every one of the inode's links inside
+// the tree (paths.size() == nlink by construction), and a group that reaches outside is counted
+// in the header's external totals and never written as `hl` lines. So `nlink` already IS the
+// declared in-tree member count, the format is unchanged, and every manifest an older build of
+// this library wrote still reads.
 int hardlinks_manifest_read(const char *manifest_path, HardlinkSet &out);
 
 // <store>/snapshots/S<n>/root -> <store>/snapshots/S<n>/manifest.

@@ -100,6 +100,40 @@ static void rewrite_manifest(const char *manifest, int drop_last, int drop_heade
     CHECK(rename(tmp, manifest) == 0);
 }
 
+// PR #1 review (9th round): one `hl` line moved into the neighbouring group. The group count and
+// the name count are untouched, so the `#hl` header still agrees with the section -- what does
+// not agree any more is each group's member count with the nlink it declares. `which` is the
+// index among the `hl ` lines; `gid` is the group id to write on it.
+static void retag_hl_line(const char *manifest, size_t which, unsigned long long gid) {
+    char lines[256][8192];
+    size_t n = 0, seen = 0;
+    FILE *i = fopen(manifest, "r");
+    CHECK(i);
+    while (n < 256 && fgets(lines[n], sizeof lines[n], i)) n++;
+    fclose(i);
+    char tmp[4096];
+    snprintf(tmp, sizeof tmp, "%s.retag", manifest);
+    FILE *o = fopen(tmp, "w");
+    CHECK(o);
+    int done = 0;
+    for (size_t k = 0; k < n; ++k) {
+        if (!strncmp(lines[k], "hl ", 3)) {
+            if (seen++ == which) {
+                unsigned long long g = 0, nl = 0;
+                int used = 0;
+                CHECK(sscanf(lines[k] + 2, " %llu %llu %n", &g, &nl, &used) == 2 && used);
+                fprintf(o, "hl %llu %llu %s", gid, nl, lines[k] + 2 + used);
+                done = 1;
+                continue;
+            }
+        }
+        fputs(lines[k], o);
+    }
+    CHECK(done);
+    CHECK(fclose(o) == 0);
+    CHECK(rename(tmp, manifest) == 0);
+}
+
 static int exists(const char *p) { struct stat st; return lstat(p, &st) == 0; }
 
 // P9 (T2.5): two names are the same file when they are the same inode, and a group of n names
@@ -2666,6 +2700,134 @@ int main() {
         CHECK_OK(wfs_pool_ready(hs, h1, &ready));
         CHECK(ready == 1);
         wfs_store_close(hs);
+    }
+
+    // ---- PR #1 review (9th round, P2): a group that is not the size it declares is damage ----
+    //
+    // The 8th round's check only asked that a group hold at least two names. That catches a
+    // manifest cut short, and misses the shape where a member is re-tagged into the neighbouring
+    // group: the group count and the name count are both untouched, so the `#hl` header still
+    // agrees with its own section, and the replay then links a name belonging to one inode onto
+    // another group's canonical file -- cloned content overwritten, in a fork that reported
+    // success. `nlink` is the authority and needs no new manifest field: the scan writes a group
+    // only when every one of the inode's links was found inside the tree, and a group that
+    // reaches outside it is counted in the header's external totals and never written as `hl`
+    // lines at all. So a group's member count IS its nlink, and this fixture has one of each.
+    {
+        char gstore[4096], gsrc[4096], gext[4096], gman[4096], gbak[4096], gw[4096], q2[4096];
+        join(gstore, sizeof gstore, root, "hlsize-store");
+        join(gsrc, sizeof gsrc, root, "hlsize-src");
+        join(gext, sizeof gext, root, "hlsize-ext");
+        CHECK(mkdir(gsrc, 0755) == 0);
+        CHECK(mkdir(gext, 0755) == 0);
+        // two three-member groups, entirely inside the tree
+        static const char *gnames[2][3] = {{"a1", "a2", "a3"}, {"b1", "b2", "b3"}};
+        for (int gi = 0; gi < 2; ++gi) {
+            join(p, sizeof p, gsrc, gnames[gi][0]);
+            write_file(p, gi ? "bbb\n" : "aaa\n");
+            for (int k = 1; k < 3; ++k) {
+                join(q2, sizeof q2, gsrc, gnames[gi][k]);
+                CHECK(link(p, q2) == 0);
+            }
+        }
+        // ... and one group with a genuine link outside it: nlink 3, two names in the tree.
+        join(p, sizeof p, gext, "shared");
+        write_file(p, "ext\n");
+        join(q2, sizeof q2, gsrc, "e1");
+        CHECK(link(p, q2) == 0);
+        join(q2, sizeof q2, gsrc, "e2");
+        CHECK(link(p, q2) == 0);
+        // One mtime and one length for all of them, so that the replay's "this name is still the
+        // file the scan saw" check (size + mtime) cannot accidentally save a group that has been
+        // handed a member belonging to another inode. That accident is what makes the damage
+        // below silent rather than merely wrong.
+        {
+            struct timespec ts[2];
+            ts[0].tv_sec = 1600000000; ts[0].tv_nsec = 0;
+            ts[1] = ts[0];
+            for (int gi = 0; gi < 2; ++gi)
+                for (int k = 0; k < 3; ++k) {
+                    join(p, sizeof p, gsrc, gnames[gi][k]);
+                    CHECK(utimensat(AT_FDCWD, p, ts, 0) == 0);
+                }
+        }
+
+        wfs_store *gs = NULL;
+        CHECK_OK(wfs_store_open(gstore, &gs));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "hlsize";
+        wfs_id g1 = 0;
+        CHECK_OK(wfs_snapshot_create(gs, gsrc, &sopts, &g1));
+        CHECK_OK(wfs_snapshot_info(gs, g1, &sr));
+        CHECK(sr.hl_groups == 2);                 // the external group is counted, not claimed
+        snprintf(gman, sizeof gman, "%s/snapshots/S%llu/manifest", gstore, (unsigned long long)g1);
+        join(gbak, sizeof gbak, root, "hlsize.bak");
+        copy_file(gman, gbak);
+
+        // The control: a fork replays both full groups, and the external one is simply not
+        // rebuilt -- which is what "a clone cannot be given links to files it does not contain"
+        // has always meant, and it is not an error.
+        wfs_ref gf = {WFS_K_SNAPSHOT, g1};
+        memset(&opts, 0, sizeof opts);
+        opts.no_pool = 1;
+        join(gw, sizeof gw, worlds, "hlsize-w");
+        wfs_id gw1 = 0;
+        CHECK_OK(wfs_world_create(gs, gf, gw, &opts, &gw1));
+        for (int gi = 0; gi < 2; ++gi) {
+            join(p, sizeof p, gw, gnames[gi][0]);
+            CHECK(nlink_of(p) == 3);
+            for (int k = 1; k < 3; ++k) {
+                join(q2, sizeof q2, gw, gnames[gi][k]);
+                CHECK(ino_of(p) == ino_of(q2));
+            }
+        }
+        join(p, sizeof p, gw, "e1");
+        join(q2, sizeof q2, gw, "e2");
+        CHECK(ino_of(p) != ino_of(q2));           // never claimed, never replayed
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "ext\n"));
+        wfs_verify_report gvr;
+        CHECK_OK(wfs_snapshot_verify(gs, g1, &gvr));
+        CHECK_OK(wfs_world_discard(gs, gw1, 1, 0));
+
+        // The damage: the last member of the first group re-tagged into the second. 2 + 4 names,
+        // the totals preserved, the header still right -- and the second group would replay four
+        // names onto one inode, one of which is the first group's.
+        retag_hl_line(gman, 2, 1);
+        CHECK_RC(wfs_snapshot_verify(gs, g1, &gvr), WFS_E_SNAPSHOT_DIRTY);
+        CHECK(gvr.modified == 1 && strstr(gvr.first_bad, "manifest"));
+        size_t gbefore = 0;
+        CHECK_OK(wfs_world_list(gs, 1, NULL, 0, &gbefore));
+        CHECK_RC(wfs_world_create(gs, gf, gw, &opts, &gw1), WFS_E_SNAPSHOT_DIRTY);
+        CHECK(!exists(gw));                                     // nothing published at --to
+        CHECK(n_with_prefix(worlds, ".wfs-fork-") == 0);        // and no clone left behind
+        size_t gafter = 0;
+        CHECK_OK(wfs_world_list(gs, 1, NULL, 0, &gafter));
+        CHECK(gafter == gbefore);
+        uint64_t gmade = 1;
+        CHECK_RC(wfs_pool_fill(gs, g1, 1, &gmade), WFS_E_SNAPSHOT_DIRTY);
+        CHECK(gmade == 0);
+        uint64_t gready = 1;
+        CHECK_OK(wfs_pool_ready(gs, g1, &gready));
+        CHECK(gready == 0);
+
+        // Put it back and everything works again, external group and all: the refusal is about
+        // the damage, not about hardlinked snapshots or about links that reach outside a tree.
+        copy_file(gbak, gman);
+        CHECK_OK(wfs_snapshot_verify(gs, g1, &gvr));
+        CHECK_OK(wfs_world_create(gs, gf, gw, &opts, &gw1));
+        join(p, sizeof p, gw, "a1");
+        join(q2, sizeof q2, gw, "a3");
+        CHECK(ino_of(p) == ino_of(q2) && nlink_of(p) == 3);
+        join(p, sizeof p, gw, "b1");
+        join(q2, sizeof q2, gw, "b3");
+        CHECK(ino_of(p) == ino_of(q2) && nlink_of(p) == 3);
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "bbb\n"));            // and nobody's content came from the other group
+        gmade = 0;
+        CHECK_OK(wfs_pool_fill(gs, g1, 1, &gmade));
+        CHECK(gmade == 1);
+        wfs_store_close(gs);
     }
 
     wfs_store_close(s);
