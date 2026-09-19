@@ -740,7 +740,13 @@ extern void *wfs_test_before_snapshot_clone_ctx;
  * and before the commit that makes the row TRASHED. A non-zero return is returned straight out
  * of wfs_world_discard()/wfs_snapshot_discard() with nothing unwound -- row and tree stay
  * exactly as a kill -9 there leaves them, which is the state the recovery has to resolve.
- * NULL unless a test sets it; nothing in the library ever assigns it. */
+ * NULL unless a test sets it; nothing in the library ever assigns it.
+ *
+ * PR #1 review (7th round): phases 2 and 3 are wfs_world_restore()'s own two halves, the same
+ * protocol run backwards -- 2 just after the row has been committed in WFS_ST_TRASHING with the
+ * tree still in the trash, 3 just after the rename home and before the commit that makes the row
+ * ACTIVE. `trash_path` is the name the tree has in the trash. Returning 0 from phase 2 is what
+ * lets a test run a whole `wfs_snapshot_discard()` inside the restore's window. */
 extern int (*wfs_test_trash_crash)(void *ctx, int phase, int is_snapshot, wfs_id id,
                                    const char *trash_path);
 extern void *wfs_test_trash_crash_ctx;

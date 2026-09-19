@@ -200,6 +200,21 @@ static int trash_crash(void *ctx, int phase, int is_snapshot, wfs_id id, const c
     return -EINTR;
 }
 
+// PR #1 review (7th round): the window `restore W<n>` has between the row it commits (phase 2,
+// the world TRASHING, the tree still in the trash) and the rename that brings the tree home.
+// What has to happen inside that window is a whole `discard S<n>`, run to completion -- and then
+// the restore carries on, which is why this returns 0 rather than the seam's usual -EINTR.
+static int restore_race(void *ctx, int phase, int is_snapshot, wfs_id id, const char *trash_path) {
+    (void)ctx;
+    (void)is_snapshot;
+    (void)id;
+    if (phase != 2) return 0;
+    g_race_ran = 1;
+    snprintf(g_trash_crash_path, sizeof g_trash_crash_path, "%s", trash_path ? trash_path : "");
+    g_race_rc = wfs_snapshot_discard(g_race_store, g_race_snap, 0, 0);
+    return 0;
+}
+
 // A copy in the sense of `cp -R`: same bytes, same marker, different inode (P2).
 static void copy_dir(const char *src, const char *dst) {
     CHECK(mkdir(dst, 0755) == 0);
@@ -1660,6 +1675,128 @@ int main() {
         CHECK_OK(wfs_world_info(as, afid, &awr));
         CHECK(awr.snapshot_id == 0 && awr.parent_world == 0 && awr.state == WFS_ST_ACTIVE);
         wfs_store_close(as);
+    }
+
+    // ---- PR #1 review (7th round, P1): `restore W<n>` and `discard S<n>` cannot both win -----
+    //
+    // `restore` used to read "the baseline is still ACTIVE" in a standalone SELECT, rename the
+    // tree out of the trash, and mark the row ACTIVE in a transaction of its own. `discard S<n>`
+    // counts references under BEGIN IMMEDIATE and refuses ACTIVE worlds, CREATING worlds and
+    // pool entries -- and a world that is still TRASHED is none of those. So a discard landing
+    // in that window was allowed, and the restore then published a live world whose baseline was
+    // in the trash: `diff` and `verify` answer WFS_E_SOURCE_GONE for the rest of its life.
+    //
+    // Now the restore is the discard's own three-step protocol run backwards, and the world's
+    // WFS_ST_TRASHING row -- the one the rename happens under -- is a hard reference. Exactly
+    // one of the two operations can succeed, and which one is decided by the write lock.
+    {
+        char rstore[4096], rsrc[4096], rw[4096];
+        join(rstore, sizeof rstore, root, "restore-store");
+        join(rsrc, sizeof rsrc, root, "restore-src");
+        CHECK(mkdir(rsrc, 0755) == 0);
+        join(p, sizeof p, rsrc, "a.txt");
+        write_file(p, "one\n");
+        wfs_store *rs = NULL;
+        CHECK_OK(wfs_store_open(rstore, &rs));
+
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "rb";
+        wfs_id r1 = 0;
+        CHECK_OK(wfs_snapshot_create(rs, rsrc, &sopts, &r1));
+        wfs_ref rf = {WFS_K_SNAPSHOT, r1};
+        memset(&opts, 0, sizeof opts);
+        join(rw, sizeof rw, worlds, "rworld");
+        wfs_id rw1 = 0;
+        CHECK_OK(wfs_world_create(rs, rf, rw, &opts, &rw1));
+        wfs_world_rec rwr;
+        wfs_snapshot_rec rsnr;
+
+        // (1) The race itself, driven from inside the window: the world is in the trash, the
+        // restore commits its TRASHING row, and right there a whole `discard S<n>` runs.
+        CHECK_OK(wfs_world_discard(rs, rw1, 0, 0));
+        CHECK_OK(wfs_world_info(rs, rw1, &rwr));
+        CHECK(rwr.state == WFS_ST_TRASHED && !exists(rw));
+        g_race_store = rs;
+        g_race_snap = r1;
+        g_race_rc = 0;
+        g_race_ran = 0;
+        wfs_test_trash_crash = restore_race;
+        CHECK_OK(wfs_world_restore(rs, rw1));
+        wfs_test_trash_crash = NULL;
+        CHECK(g_race_ran == 1);
+        CHECK(g_race_rc == WFS_E_SNAPSHOT_IN_USE);   // the discard was the one that had to lose
+        CHECK_OK(wfs_world_info(rs, rw1, &rwr));
+        CHECK(rwr.state == WFS_ST_ACTIVE && rwr.present && exists(rw));
+        CHECK_OK(wfs_snapshot_info(rs, r1, &rsnr));
+        CHECK(rsnr.state == WFS_ST_ACTIVE);
+        // The whole point of the baseline: the restored world can still be diffed against it.
+        CHECK_OK(wfs_world_diff(rs, rw1, 0, NULL, NULL));
+        CHECK_OK(wfs_snapshot_verify(rs, r1, &vr));
+        CHECK(vr.missing == 0 && vr.modified == 0);
+
+        // (2) The other order, and the other verdict: the discard gets there first, so the
+        // restore is the one that is refused -- and refused without touching anything. The tree
+        // stays in the trash (a TRASHED world whose tree is at trash_path reads as `present`),
+        // the row stays TRASHED, and nothing has been published at the world's home path.
+        CHECK_OK(wfs_world_discard(rs, rw1, 0, 0));
+        CHECK_OK(wfs_snapshot_discard(rs, r1, 0, 0));
+        CHECK_OK(wfs_snapshot_info(rs, r1, &rsnr));
+        CHECK(rsnr.state == WFS_ST_TRASHED);
+        CHECK_RC(wfs_world_restore(rs, rw1), WFS_E_SOURCE_GONE);
+        CHECK_OK(wfs_world_info(rs, rw1, &rwr));
+        CHECK(rwr.state == WFS_ST_TRASHED && rwr.present && !exists(rw));
+
+        // (3) And the two kills. A fresh pair, because the one above has no baseline left.
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "rb2";
+        wfs_id r2 = 0;
+        CHECK_OK(wfs_snapshot_create(rs, rsrc, &sopts, &r2));
+        wfs_ref rf2 = {WFS_K_SNAPSHOT, r2};
+        char rw2[4096];
+        join(rw2, sizeof rw2, worlds, "rworld2");
+        wfs_id rw2id = 0;
+        CHECK_OK(wfs_world_create(rs, rf2, rw2, &opts, &rw2id));
+        CHECK_OK(wfs_world_discard(rs, rw2id, 0, 0));
+        wfs_test_trash_crash = trash_crash;
+
+        // Killed after the row and before the rename: the restore did not happen, and the
+        // recovery says so -- the tree is where the discard put it and the row goes back to
+        // TRASHED. A `restore` after that still works, which is the proof nothing was lost.
+        g_trash_crash_phase = 2;
+        g_trash_crash_hits = 0;
+        CHECK_RC(wfs_world_restore(rs, rw2id), -EINTR);
+        CHECK(g_trash_crash_hits == 1);
+        CHECK_OK(wfs_world_info(rs, rw2id, &rwr));
+        CHECK(rwr.state == WFS_ST_TRASHING);
+        CHECK(exists(g_trash_crash_path) && !exists(rw2));
+        // And while it is in flight it is a reference: the baseline cannot be taken away.
+        CHECK_RC(wfs_snapshot_discard(rs, r2, 0, 0), WFS_E_SNAPSHOT_IN_USE);
+        g_trash_crash_phase = -1;
+        wfs_store_close(rs);
+        CHECK_OK(wfs_store_open(rstore, &rs));               // the open resolves it
+        CHECK_OK(wfs_world_info(rs, rw2id, &rwr));
+        CHECK(rwr.state == WFS_ST_TRASHED && rwr.present);
+        CHECK(exists(g_trash_crash_path) && !exists(rw2));
+
+        // Killed after the rename and before the commit: the restore did happen, and the
+        // recovery finishes it rather than sending the tree back.
+        g_trash_crash_phase = 3;
+        g_trash_crash_hits = 0;
+        CHECK_RC(wfs_world_restore(rs, rw2id), -EINTR);
+        CHECK(g_trash_crash_hits == 1);
+        CHECK_OK(wfs_world_info(rs, rw2id, &rwr));
+        CHECK(rwr.state == WFS_ST_TRASHING);
+        CHECK(exists(rw2) && !exists(g_trash_crash_path));
+        g_trash_crash_phase = -1;
+        wfs_store_close(rs);
+        CHECK_OK(wfs_store_open(rstore, &rs));
+        CHECK_OK(wfs_world_info(rs, rw2id, &rwr));
+        CHECK(rwr.state == WFS_ST_ACTIVE && rwr.present && exists(rw2));
+        CHECK_OK(wfs_world_diff(rs, rw2id, 0, NULL, NULL));   // baseline intact, inode intact
+        wfs_test_trash_crash = NULL;
+        wfs_store_close(rs);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", rstore, (unsigned long long)r2);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 
     // ---- PR #1 review (6th round, P2): a hardlink manifest that will not read is a failure -----

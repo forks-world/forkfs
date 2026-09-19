@@ -1461,6 +1461,34 @@ bool trash_is_deleting(const String &trash) {
 
 } // namespace
 
+// T2.1: bringing a trashed world back. Symmetrical to the discard above, and for the same
+// reason: a rename and a row that must never disagree about where the tree is.
+//
+// PR #1 review (7th round): and the decision has to be made under the write lock, not read and
+// then acted on. It used to check "the source snapshot is still ACTIVE" in a standalone SELECT,
+// rename the tree home, and only then mark the row ACTIVE in a transaction of its own. A
+// `discard S<n>` running in that window counts references under BEGIN IMMEDIATE and refuses
+// ACTIVE worlds, CREATING worlds and pool entries -- and this world was still TRASHED, which
+// refuses nothing. So both succeeded: the snapshot went to the trash and the restore published
+// a live world whose baseline was gone, one whose every `diff` and `verify` answers
+// WFS_E_SOURCE_GONE for ever.
+//
+// So restore is the discard's own three-step protocol run backwards:
+//
+//   (a) one BEGIN IMMEDIATE: the row is TRASHED, its tree is not already being deleted, and the
+//       baseline is ACTIVE -- checked here, inside the transaction, and the row goes to
+//       WFS_ST_TRASHING. That is the state that means "in flight, lstat decides", and it is a
+//       hard reference: snapshot_refs_locked() counts it and wfs_snapshot_discard() refuses it.
+//       trash_path is left exactly as it was, because the tree has not moved yet.
+//   (b) rename the tree from the trash back home.
+//   (c) one transaction: ACTIVE, trash_path cleared.
+//
+// A kill anywhere in there leaves the same TRASHING row trashing_recover() already resolves by
+// lstat: the tree is at trash_path (the rename never happened, so neither did the restore -- the
+// row goes back to TRASHED) or at home (it did -- ACTIVE). dir_dev/dir_ino need no re-stat on
+// that path: a world's trash is always on the world's own volume -- <store>/trash when the store
+// shares it, and a `.wfs-trash` beside the world when the discard hit EXDEV -- so both renames
+// keep the inode. We set them again in (c) anyway, since we have the stat in hand.
 extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
     if (!s || !id) return -EINVAL;
     wfs_world_rec r;
@@ -1473,23 +1501,55 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
     if (r.state != WFS_ST_TRASHED) return -ESTALE;
     // T2.1: once the collector has renamed the tree, what is left of it is not a world any more.
     if (trash_is_deleting(trash)) return WFS_E_TRASH_DELETING;
-    // T2.2: a world whose source snapshot has been discarded cannot be brought back to life --
-    // it would have no baseline to diff or verify against, which is the whole point of a World.
-    if (r.snapshot_id) {
-        Guard g(s->mu);
-        Stmt q(s->db, "SELECT state FROM snapshots WHERE id=?");
-        if (!q.ok()) return -EIO;
-        q.i64(1, (int64_t)r.snapshot_id);
-        if (!q.row() || q.col_i64(0) != WFS_ST_ACTIVE) return WFS_E_SOURCE_GONE;
-    }
     if (!exists(trash.c_str())) return -ENOENT;
     if (exists(r.path)) return -EEXIST;
-    if (int rc = wfs::fs_rename(trash.c_str(), r.path)) return rc;
+    // (a). Everything the restore decides is decided again in here, under the write lock a
+    // discard takes: the row, the tree's name, and the baseline.
+    {
+        Guard g(s->mu);
+        Txn t(s->db);
+        wfs_world_rec rr;
+        if (int rc = world_row(s, id, rr)) return rc;
+        if (rr.state != WFS_ST_TRASHED) return -ESTALE;
+        String tp;
+        if (int rc = world_trash_path(s, id, tp)) return rc;
+        if (::strcmp(tp.c_str(), trash.c_str())) return -ESTALE;   // it moved under us
+        if (trash_is_deleting(tp)) return WFS_E_TRASH_DELETING;
+        // T2.2: a world whose source snapshot has been discarded cannot be brought back to life
+        // -- it would have no baseline to diff or verify against, which is the whole point of a
+        // World. Under the write lock, so "the snapshot is ACTIVE" is still true when the row
+        // becomes a reference a paragraph further down.
+        if (rr.snapshot_id) {
+            Stmt q(s->db, "SELECT state FROM snapshots WHERE id=?");
+            if (!q.ok()) return -EIO;
+            q.i64(1, (int64_t)rr.snapshot_id);
+            if (!q.row() || q.col_i64(0) != WFS_ST_ACTIVE) return WFS_E_SOURCE_GONE;
+        }
+        Stmt u(s->db, "UPDATE worlds SET state=? WHERE id=? AND state=2");
+        if (!u.ok()) return -EIO;
+        u.i64(1, WFS_ST_TRASHING);
+        u.i64(2, (int64_t)id);
+        if (u.step() != SQLITE_DONE) return -EIO;
+        if (sqlite3_changes(s->db) == 0) return -ESTALE;
+        t.commit();
+    }
+    if (int hrc = trash_crash_seam(2, 0, id, trash.c_str())) return hrc;
+    // (b)
+    if (int rc = wfs::fs_rename(trash.c_str(), r.path)) {
+        // The tree never left the trash, so the row says what it said before: TRASHED, with the
+        // same trash_path. That is trashing_commit()'s whole job -- "the tree is in the trash"
+        // -- and it is the verdict trashing_recover() would reach here by itself.
+        trashing_commit(s, id, 0);
+        return rc;
+    }
+    if (int hrc = trash_crash_seam(3, 0, id, trash.c_str())) return hrc;
+    // (c)
     struct stat st;
     if (::stat(r.path, &st) != 0) return -errno;
     Guard g(s->mu);
     Txn t(s->db);
-    Stmt u(s->db, "UPDATE worlds SET state=?, trash_path='', trashed_at=0, dir_dev=?, dir_ino=? WHERE id=?");
+    Stmt u(s->db, "UPDATE worlds SET state=?, trash_path='', trashed_at=0, dir_dev=?, dir_ino=?"
+                  " WHERE id=? AND state=4");
     if (!u.ok()) return -EIO;
     u.i64(1, WFS_ST_ACTIVE);
     u.i64(2, (int64_t)st.st_dev);
@@ -1509,6 +1569,11 @@ namespace {
 struct SnapRefs {
     uint64_t active_worlds = 0;
     uint64_t creating_worlds = 0;
+    // PR #1 review (7th round): a world in flight between the trash and its home, either way
+    // round. `discard W<n>` and `restore W<n>` both park the row in WFS_ST_TRASHING while the
+    // rename happens, and a restore that is about to finish is a world that will need this
+    // baseline a millisecond from now. It used to land in trashed_worlds, which refuses nothing.
+    uint64_t trashing_worlds = 0;
     uint64_t trashed_worlds = 0;
     uint64_t pool_entries = 0;
     wfs_id first_world = 0;
@@ -1533,6 +1598,13 @@ int snapshot_refs_locked(wfs_store *s, wfs_id id, SnapRefs &out) {
                 // before it started cloning, so it is about to publish a world that needs this
                 // snapshot as its baseline -- exactly the case the PR #1 review found.
                 out.creating_worlds++;
+            } else if (st == WFS_ST_TRASHING) {
+                // A discard or a restore between its row and its rename. Which of the two it is
+                // cannot be told from here, and neither can be allowed to lose its baseline: a
+                // restore finishes into an ACTIVE world, and a discard's own recovery may yet
+                // put it back. Hence a refusal, not a count (PR #1 review, 7th round).
+                if (!out.first_world) out.first_world = (wfs_id)q.col_i64(0);
+                out.trashing_worlds++;
             } else {
                 out.trashed_worlds++;
             }
@@ -1602,7 +1674,8 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
     SnapRefs refs;
     if (int rc = snapshot_refs_locked(s, id, refs)) return rc;
     // Never orphan a world's source: diff and verify both need the baseline (P4/P10).
-    if (refs.active_worlds || refs.creating_worlds || refs.pool_entries) return WFS_E_SNAPSHOT_IN_USE;
+    if (refs.active_worlds || refs.creating_worlds || refs.trashing_worlds || refs.pool_entries)
+        return WFS_E_SNAPSHOT_IN_USE;
 
     snapdir = snapshot_dir_of(r);
     char leaf[80];
@@ -1715,7 +1788,8 @@ int trashing_recover(wfs_store *s, uint64_t *restored, uint64_t *finished) {
             {
                 Guard g(s->mu);
                 if (snapshot_refs_locked(s, p.id, refs) == 0)
-                    needed = refs.active_worlds || refs.creating_worlds || refs.pool_entries;
+                    needed = refs.active_worlds || refs.creating_worlds || refs.trashing_worlds ||
+                             refs.pool_entries;
             }
             // Somebody's baseline. Put it back before anything else can call it due.
             if (needed) {
