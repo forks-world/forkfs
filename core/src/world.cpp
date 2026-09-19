@@ -1849,7 +1849,17 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
     // collector that could ever finish it. The row goes straight to DEAD instead; pool entries
     // are already gone by here (a ref refuses the discard, --force drained them), and
     // pool_collect buries anything a filler puts back for a snapshot that is no longer ACTIVE.
-    if (!exists(snapdir.c_str())) { trash.assign(""); tree_gone = true; }
+    // PR #1 review (12th round): and "already gone" has to be an absence, not any lstat(2)
+    // failure. An EACCES on <store>/snapshots or an EIO took this branch too, and the row then
+    // went DEAD with the tree still sitting at S<n> -- where nothing would ever look at it
+    // again: reconciliation scans ACTIVE rows and the suffix sweep only `*.wfs-tmp`. Any errno
+    // that is not ENOENT/ENOTDIR is handed back to the caller instead (the Txn rolls back, so
+    // the row is untouched) and `discard` fails with the reason the operator can act on.
+    if (int prc = wfs::fs_probe(snapdir.c_str())) {
+        if (!wfs::fs_gone(prc)) return prc;
+        trash.assign("");
+        tree_gone = true;
+    }
     // Step (a) of the three-step protocol above: the reference check and the state change in one
     // transaction, with the name the tree is about to get written down. The rename used to be
     // *inside* this transaction, which meant a crash between the two rolled the row back to

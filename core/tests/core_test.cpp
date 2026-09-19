@@ -2592,6 +2592,45 @@ int main() {
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 
+    // ---- PR #1 review (12th round, P2): `discard` does not bury a row over an lstat error ----
+    //
+    // "The tree is already gone" is a shortcut a discard is allowed to take: it writes the row
+    // straight to DEAD, with no trash_path, because there is nothing to move and nothing to
+    // unlink. It was decided by a bool over lstat(2), so an EACCES or an EIO took it too -- and
+    // then nothing ever revisited <store>/snapshots/S<n>, because both halves of gc look at
+    // rows (reconciliation at ACTIVE ones, the suffix sweep at `*.wfs-tmp` only). A whole
+    // snapshot, silently unregistered and permanently on disk. Only ENOENT/ENOTDIR takes that
+    // path now; every other errno is returned to the caller with the row untouched.
+    {
+        char dstore[4096], dsrc[4096], dsnaps[4096];
+        join(dstore, sizeof dstore, root, "discard-probe-store");
+        join(dsrc, sizeof dsrc, root, "discard-probe-src");
+        CHECK(mkdir(dsrc, 0755) == 0);
+        join(p, sizeof p, dsrc, "a.txt");
+        write_file(p, "one\n");
+        wfs_store *da = NULL;
+        CHECK_OK(wfs_store_open(dstore, &da));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "dp";
+        wfs_id ds1 = 0;
+        CHECK_OK(wfs_snapshot_create(da, dsrc, &sopts, &ds1));
+        join(dsnaps, sizeof dsnaps, dstore, "snapshots");
+        CHECK(chmod(dsnaps, 0) == 0);          // lstat(<store>/snapshots/S<n>) is EACCES now
+        CHECK_RC(wfs_snapshot_discard(da, ds1, 0, 0), -EACCES);
+        wfs_snapshot_rec dsr;
+        CHECK_OK(wfs_snapshot_info(da, ds1, &dsr));
+        CHECK(dsr.state == WFS_ST_ACTIVE);     // nothing was buried
+        CHECK(chmod(dsnaps, 0755) == 0);
+        snprintf(p, sizeof p, "%s/S%llu", dsnaps, (unsigned long long)ds1);
+        CHECK(exists(p));                      // ... and the tree is exactly where it was
+        // And with the access back, the discard the caller asked for happens.
+        CHECK_OK(wfs_snapshot_discard(da, ds1, 1, 0));
+        CHECK_OK(wfs_snapshot_info(da, ds1, &dsr));
+        CHECK(dsr.state == WFS_ST_DEAD);
+        CHECK(!exists(p));
+        wfs_store_close(da);
+    }
+
     // ---- PR #1 review (9th round, P1): a pool entry made after the scan is not an orphan ----
     //
     // pool_scan takes one snapshot of the pool rows; pool_collect then removes the trees that
