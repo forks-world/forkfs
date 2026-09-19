@@ -774,6 +774,15 @@ extern void (*wfs_test_before_trash_delete)(void *ctx, int is_snapshot, wfs_id r
                                             const char *path);
 extern void *wfs_test_before_trash_delete_ctx;
 
+/* And the window the collector's own *scan* has (PR #1 review, 9th round): called once per
+ * trash scan -- wfs_gc(), wfs_gc_status(), wfs_gc_pending() -- after the store mutex has been
+ * dropped and the trash paths the rows claim have been read, and before the readdir of
+ * <store>/trash that decides which directories nothing claims. What a test does in there is a
+ * whole `discard` on a second handle, which is the one thing that turns a claimed tree into an
+ * apparent orphan. NULL unless a test sets it; nothing in the library ever assigns it. */
+extern void (*wfs_test_before_trash_orphans)(void *ctx);
+extern void *wfs_test_before_trash_orphans_ctx;
+
 /* And the thing no test can provoke on a healthy machine: a pthread_create that fails for one
  * worker slot and succeeds for a later one. A bit set here refuses that slot (slots 0..31); 0,
  * the value it has everywhere else, means every slot is started normally. */

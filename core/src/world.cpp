@@ -633,6 +633,12 @@ extern "C" void (*wfs_test_before_trash_delete)(void *ctx, int is_snapshot, wfs_
                                                 const char *path) = nullptr;
 extern "C" void *wfs_test_before_trash_delete_ctx = nullptr;
 
+// And the window the collector's own *scan* has (PR #1 review, 9th round): between the snapshot
+// of the trash paths the rows claim and the readdir that decides what nothing claims. A
+// `discard` that lands in there leaves a tree that snapshot has never heard of.
+extern "C" void (*wfs_test_before_trash_orphans)(void *ctx) = nullptr;
+extern "C" void *wfs_test_before_trash_orphans_ctx = nullptr;
+
 // ---- snapshots --------------------------------------------------------------------------------
 
 extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_snapshot_opts *opts,
@@ -2504,6 +2510,26 @@ void claim_trash_paths(wfs_store *s, Vec<String> &claimed) {
     }
 }
 
+// PR #1 review (9th round), P18: the same question claim_trash_paths answers from a snapshot,
+// asked of the live rows instead -- does ANY world or snapshot row, in ANY state, name this
+// trash path right now? "Names" has claim_trash_paths' meaning: a row's trash_path claims both
+// that name and that name with `.deleting` appended, because the collector renames the tree
+// first and records the new name second. The caller holds s->mu.
+bool trash_path_claimed_locked(wfs_store *s, const char *p) {
+    String base(p);
+    size_t n = base.size(), sl = ::strlen(WFS_DELETING_SUFFIX);
+    if (n > sl && !::strcmp(base.c_str() + n - sl, WFS_DELETING_SUFFIX)) base.resize(n - sl);
+    for (int table = 0; table < 2; ++table) {
+        Stmt q(s->db, table ? "SELECT 1 FROM snapshots WHERE trash_path=? OR trash_path=?"
+                            : "SELECT 1 FROM worlds WHERE trash_path=? OR trash_path=?");
+        if (!q.ok()) return true;   // cannot tell, and "cannot tell" is never "delete it"
+        q.text(1, p);
+        q.text(2, base.c_str());
+        if (q.row()) return true;
+    }
+    return false;
+}
+
 int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v) {
     Vec<String> claimed;   // trash paths a row points at, whatever state that row is in
     {
@@ -2561,10 +2587,12 @@ int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v) {
             }
         }
     }
+    if (wfs_test_before_trash_orphans) wfs_test_before_trash_orphans(wfs_test_before_trash_orphans_ctx);
     // Directories in <store>/trash that no row claims: a store restored from a backup, or a
     // *.deleting tree whose row was already marked DEAD. They go immediately -- there is nothing
     // left that could restore them.
     String trashdir = joinp(s->dir.c_str(), "trash");
+    Vec<String> maybe_orphans;
     if (DIR *d = ::opendir(trashdir.c_str())) {
         while (struct dirent *e = ::readdir(d)) {
             if (e->d_name[0] == '.') continue;
@@ -2573,12 +2601,26 @@ int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v) {
             for (size_t i = 0; i < claimed.size(); ++i)
                 if (!::strcmp(claimed[i].c_str(), p.c_str())) { wanted = true; break; }
             if (wanted) continue;
-            TrashJob j;
-            j.path = p;
-            if (ends_with(p.c_str(), WFS_DELETING_SUFFIX)) v.deleting.emplace_back(j);
-            else v.due.emplace_back(j);
+            maybe_orphans.emplace_back(p);
         }
         ::closedir(d);
+    }
+    // PR #1 review (9th round), P18: `claimed` is a snapshot, and the readdir above is not.
+    // A `discard` that commits its TRASHING row and renames its tree into the trash between the
+    // two produces a directory `claimed` has never heard of -- and a row-less orphan is deleted
+    // on sight, retention, restorability and "this is somebody's baseline" all skipped, right
+    // beside a discard that is still running. So the verdict is re-asked of the live rows, under
+    // the store mutex, immediately before the tree is queued; gc_delete_one asks again under the
+    // same mutex immediately before it starts deleting.
+    if (maybe_orphans.size()) {
+        Guard g(s->mu);
+        for (size_t i = 0; i < maybe_orphans.size(); ++i) {
+            if (trash_path_claimed_locked(s, maybe_orphans[i].c_str())) continue;
+            TrashJob j;
+            j.path = maybe_orphans[i];
+            if (ends_with(j.path.c_str(), WFS_DELETING_SUFFIX)) v.deleting.emplace_back(j);
+            else v.due.emplace_back(j);
+        }
     }
     return 0;
 }
@@ -2636,8 +2678,16 @@ bool set_trash_path(wfs_store *s, const TrashJob &j, const char *p) {
 // rename that starts the deletion, so the ordinary case never touches a tree whose row has moved
 // on. A TRASHING row is somebody else's operation in flight, an ACTIVE one has been restored,
 // and a DEAD one has been collected by somebody else -- none of them is ours.
+//
+// PR #1 review (9th round), P18: and an orphan is re-asked too. "Nothing names this tree" was
+// decided from trash_scan's snapshot of the rows; by the time the job comes up a discard may
+// have committed its TRASHING row over exactly this name, and the tree is then the newest thing
+// in the store rather than the oldest.
 bool trash_row_still_ours(wfs_store *s, const TrashJob &j) {
-    if (!j.row) return true;   // an orphan: nothing can disagree with it
+    if (!j.row) {
+        Guard g(s->mu);
+        return !trash_path_claimed_locked(s, j.path.c_str());
+    }
     Guard g(s->mu);
     Stmt q(s->db, j.is_snapshot ? "SELECT state, trash_path FROM snapshots WHERE id=?"
                                 : "SELECT state, trash_path FROM worlds WHERE id=?");

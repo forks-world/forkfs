@@ -308,6 +308,22 @@ static void restore_before_delete(void *ctx, int is_snapshot, wfs_id row, const 
     g_del_rc = wfs_world_restore(g_del_store, g_del_world);
 }
 
+// PR #1 review (9th round, P1): the collector's own *scan* window. The seam runs after the scan
+// has read which trash paths the rows claim and before the readdir that decides what nothing
+// claims; what it does in there is a whole `discard` on a second handle, so the tree lands in
+// the trash after the claim list was built and the readdir sees a directory that list has never
+// heard of. That is the one shape "row-less orphan" must not be read as.
+static wfs_store *g_orph_store = NULL;
+static wfs_id g_orph_world;
+static int g_orph_ran;
+static int g_orph_rc = -1;
+static void discard_before_orphans(void *ctx) {
+    (void)ctx;
+    if (g_orph_ran) return;
+    g_orph_ran++;
+    g_orph_rc = wfs_world_discard(g_orph_store, g_orph_world, 0, 0);
+}
+
 // A copy in the sense of `cp -R`: same bytes, same marker, different inode (P2).
 static void copy_dir(const char *src, const char *dst) {
     CHECK(mkdir(dst, 0755) == 0);
@@ -2162,6 +2178,77 @@ int main() {
         wfs_store_close(cb);
         wfs_store_close(ca);
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", cstore, (unsigned long long)c1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
+    // ---- PR #1 review (9th round, P1): a tree a discard has just moved in is not an orphan ----
+    //
+    // trash_scan reads the trash paths the rows claim, drops the store mutex, and then reads the
+    // directory. A `discard` that commits its TRASHING row and renames its tree into the trash
+    // between the two leaves a directory the claim list has never heard of -- and a row-less
+    // orphan is deleted on sight: retention skipped, restore impossible, and the discard that is
+    // still running finds its tree gone. So both verdicts -- the one that queues the job and the
+    // one taken immediately before the deletion starts -- are re-asked of the live rows under the
+    // store mutex (docs/M1_DESIGN.md P18).
+    {
+        char nstore[4096], nsrc[4096], nw[4096], ntrash[4096];
+        join(nstore, sizeof nstore, root, "orphan-store");
+        join(nsrc, sizeof nsrc, root, "orphan-src");
+        CHECK(mkdir(nsrc, 0755) == 0);
+        join(p, sizeof p, nsrc, "a.txt");
+        write_file(p, "one\n");
+        wfs_store *na = NULL;
+        CHECK_OK(wfs_store_open(nstore, &na));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "nb";
+        wfs_id n1 = 0;
+        CHECK_OK(wfs_snapshot_create(na, nsrc, &sopts, &n1));
+        wfs_ref nf = {WFS_K_SNAPSHOT, n1};
+        memset(&opts, 0, sizeof opts);
+        join(nw, sizeof nw, worlds, "nworld");
+        wfs_id nw1 = 0;
+        CHECK_OK(wfs_world_create(na, nf, nw, &opts, &nw1));
+
+        // The collector runs on a handle of its own, with retention 0 so anything due goes now.
+        wfs_store *nb = NULL;
+        CHECK_OK(wfs_store_open(nstore, &nb));
+        g_orph_store = na;
+        g_orph_world = nw1;
+        g_orph_ran = 0;
+        g_orph_rc = -1;
+        wfs_test_before_trash_orphans = discard_before_orphans;
+        wfs_gc_report nrep;
+        memset(&nrep, 0, sizeof nrep);
+        CHECK_OK(wfs_gc(nb, 0, &nrep));
+        wfs_test_before_trash_orphans = NULL;
+        CHECK(g_orph_ran == 1);
+        CHECK_OK(g_orph_rc);                     // the discard ran to completion inside the window
+        // Nothing was deleted, nothing was counted, and nothing is reported as a failure: the
+        // tree is not trash the collector may touch, it is a discard that finished a moment ago.
+        CHECK(nrep.trash_orphans == 0 && nrep.worlds_deleted == 0 && nrep.trash_failed == 0);
+        wfs_world_rec nwr;
+        CHECK_OK(wfs_world_info(na, nw1, &nwr));
+        CHECK(nwr.state == WFS_ST_TRASHED && nwr.present && !exists(nw));
+        // The proof that the tree really is whole: it comes back.
+        CHECK_OK(wfs_world_restore(na, nw1));
+        CHECK_OK(wfs_world_info(na, nw1, &nwr));
+        CHECK(nwr.state == WFS_ST_ACTIVE && exists(nw));
+        join(p, sizeof p, nw, "a.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "one\n"));
+
+        // And a directory in the trash that really is row-less still goes immediately, which is
+        // the rule this is a refinement of, not a retreat from.
+        snprintf(ntrash, sizeof ntrash, "%s/trash/W999-1", nstore);
+        CHECK(mkdir(ntrash, 0755) == 0);
+        join(p, sizeof p, ntrash, "junk.txt");
+        write_file(p, "junk\n");
+        memset(&nrep, 0, sizeof nrep);
+        CHECK_OK(wfs_gc(nb, 0, &nrep));
+        CHECK(nrep.trash_orphans == 1 && !exists(ntrash));
+        wfs_store_close(nb);
+        wfs_store_close(na);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", nstore, (unsigned long long)n1);
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 
