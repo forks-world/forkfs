@@ -1244,6 +1244,47 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第二十轮:不是我们起的名字,就不是我们留下的东西(2026-09-20)
+
+第二十轮,Codex 两条(一条 P1、一条 P2),都是同一条老规矩的漏网之鱼:**一棵树是不是我们的,
+要有证据,不能靠名字长得像。** P1 在 trash 删除的第 0 步——`trash_fold_leftover()` 把 `<条目>.deleting`
+当成"我们上一次没删完的",递归删掉;可是从第十五轮起 rename 和记名字在**同一个事务**里,两个名字
+**按构造不可能同时是我们的**,所以那个兄弟目录永远是别人的——而跨卷 discard 的 trash 就在用户自己的
+`<parent>/.wfs-trash` 里,名字 `W<id>-<时间戳>` 完全可以猜。P2 在 fork 失败的 unwind 上:临时树删不掉
+的时候,那条 CREATING 行——树名字的**唯一**记录——照样被删掉了。**一条一个提交、一个测试,先验证过
+"没有修复就会红"。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `PRRT_kwDOUf7jGc6kDwWf` | `world.cpp` `trash_fold_leftover()`(collector 与 `--now` 两个调用点) | 删一条 trash 条目的第一步是一次 rename:`<条目>` → `<条目>.deleting`。这一步前面跑的 `trash_fold_leftover()` 把已经在那个名字上的东西**递归删掉**,理由是"只可能是我们自己上一次被打断的尝试"。从**第十五轮**起这个理由不成立了:`gc_claim_deleting()`(以及 `--now` 的 `trash_delete_now()`)在**一个事务**里重读行、rename、记下新名字,所以我们自己造成的状态里,两个名字**任何一刻只有一个存在**——rename 和提交之间崩掉是"行记 X、树在 X.deleting、X 不在",正是 `trash_follow_deleting()` 解的那个;而 discard 本身(第五轮:行、rename、行)从不写出 `.deleting` 名字。于是"X 和 X.deleting 同时在"**永远**意味着第二个名字是别人造的——而 World 与 store 不同卷时,trash 是**用户自己目录**里的 `<parent>/.wfs-trash`,条目名 `W<id>-<时间戳>` 完全可以猜。用户在那里放一个目录,`gc` 或者 `discard --now` 就把它连同里面的文件递归删光,而且 `--now` 还报成功退出 0 | **折叠整个删掉,并且只往"证明了不在"的名字上 rename。** `trash_mark_deleting()` 现在先 `fs_probe()` 那个 `.deleting` 名字:在 → `WFS_E_TRASH_BLOCKED`(新错误码),问不出来 → 把 errno 原样返回(第十二轮那条"证明不了不在就当它还在"),只有证明不在才 rename——`rename(2)` 本身会把一个**空**目录整个吞掉、对非空的回 ENOTEMPTY,所以这道检查不能省。collector 碰到这种条目:树和兄弟目录**一根指头都不碰**,计进新的 `trash_blocked`,按路径共享的失败计数器重试几次(兄弟目录可能是别人的临时名)、到上限就不再自己唤醒自己,`gc --status` 用新的 `trash_blocked`/`blocked_path` **把那个目录的路径说出来**,`gc` 的提示同理。`discard --now` 返回 `WFS_E_TRASH_BLOCKED`,CLI 用新的 `wfs_trash_blocked_path()` 把挡路的目录名报出来——跨卷那种情况下,要看的是用户**自己的**一个目录。**同一条规矩再往前一步**:`trash_is_deleting()` 原来拿一句 `exists(<名字>.deleting)` 判"collector 已经开始删了",于是那个兄弟目录会让 `restore` 一直回 `WFS_E_TRASH_DELETING`(而这句话是假的)。以前这个状态是瞬态的(折叠会把兄弟目录删掉),现在不是了,所以改成问 rename 真正留下的形状:树在 `.deleting` **且不在**自己的名字上。**顺带审计"按后缀折叠 / 删一个不是我们命名的兄弟"**:`rm_tmp_in_store_dir()` 只扫 `<store>/snapshots` 且逐个回 snapshots 表问(第十轮),pool 的孤儿清扫问 pool 行和 World 行(第九轮),trash 的孤儿判定只读 `<store>/trash` 且在 store 锁下重问活行(第五/九轮),`<store>/tmp` 按年龄清 store 内部的文件;剩下两处 `if (exists) remove` 都在 `<store>/…<id>.wfs-tmp` 上,名字由 store 自己分配。**trash 是唯一一处手能伸进用户可见目录的** | `c1eeb6a` |
+| P2 `PRRT_kwDOUf7jGc6kDwWk` | `world.cpp` `wfs_world_create_ex()` 的 unwind | fork 在克隆已经建出来之后失败,unwind 先 `fs_remove_tree(tmp)`、再 `DELETE FROM worlds`——**删除的结果被扔掉**。而那条 CREATING 行是这棵树名字的**唯一**记录:临时树在**用户自己**的目标目录里,名字是 64 位随机数,gc **故意**从不按后缀扫用户目录(`rm_tmp_in_store_dir`,第三轮那条规矩)。于是一个 EPERM(ACL、只读父目录、瞬时 EIO)就留下一棵完整的半成品克隆,store 里没有任何东西叫得出它的名字:`gc --status` 数不到、collector 不会重试、`adopt` 也认不回来 | **`proven_gone()` 说了算**(第十二轮):证明没了 → 照旧删行;还在 → 行留着,保持 CREATING、`tmp_path` 不动,把**原始的那个错误**还给调用者。这正是"fork 在发布前被 kill"留下的那种行,所以下游本来就认:`gc_tmp_is_removable()` 问标记这棵树归谁、问行是不是还 CREATING 且还记着这个 `tmp_path`,生产者判死之后的那趟扫描按共享失败上限重试,`wfs_gc_status()` 计进 `creating_stranded`。pool 那条路(第十六/十八轮)不用改也是一致的:它的树是 `<store>/pool/S<n>/<uuid>`,store 内部的名字、pool 清扫自己问行就能找到;而树真的落在用户 `--to` 上的那一种,第十八轮已经改成留行 | `61a9f00` |
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **264 passed, 0 failed**(新增 7 条 PR20);
+`check-deps.sh` 全绿。(`m1_criteria.sh` 本轮跳过。)
+
+先把测试跑红过:
+
+- **P1**:一个 discard 进 trash 的 World,旁边手工造一个用户目录 `<条目>.deleting/keep/user.txt`。
+  **老代码**:`world fs discard W1 --now` **退出 0、打印 "W1 deleted"**,而 `user.txt` 连同整个
+  `.deleting` 目录**没了**(手工复现同样确认)。**新代码**:`--now` 退出 3 并把挡路的那个目录的
+  完整路径说出来;`gc --now --retention 0` 两样都不碰、输出 "could not be collected";
+  `gc --status` 打出 `blocked: … is in the way`;`restore W1` 仍然成功(不再谎称"正在被删除");
+  把那个目录拿走之后,同一条 discard + gc 照常把条目收掉。
+- **P2**:`wfs_test_before_fork_publish` 这次**返回 0**(不是 kill -9),在缝里给刚克隆出来的树里
+  一个子目录加上 owner deny `delete,delete_child` 的 ACL(remover 会 chmod、会清 chflags,只有 ACL
+  拦得住),再在 `--to` 上造一个目录,于是发布那次 rename 是 P7 的拒绝、unwind 带着树跑。
+  **老代码**:树还在磁盘上,而 `wfs_world_info()` 回 **-ENOENT**——行没了。**新代码**:fork 回
+  `-EEXIST`,行是 CREATING 且 `tmp_path` 还在,`gc --status` 的 `creating_stranded ≥ 1`,ACL 还在时
+  gc 留着行并计 `tmp_failed`,把 ACL 去掉之后下一趟 gc 删树、行落 DEAD。
+
+新增测试:
+
+- `safety.sh`(P1,7 条 PR20):`--now` 的拒绝与它报出的路径、collector 两样都不动、`gc` 的提示、
+  `gc --status` 的 `blocked:` 行、条目仍可 `restore`、清掉兄弟目录之后照常收。放在 CLI 上是因为
+  这条 bug 的受害者是用户目录里的一个目录,CLI 正是他看见这件事的地方。(跨卷那一半没法在测试里
+  造真的第二个卷,逻辑完全相同:`trash_mark_deleting()` 只认路径。)
+- `core_test`(P2):上面那个缝跑一遍,断言行、树、`gc --status`、两趟 gc 的行为。
+
 #### PR #1 review 第十九轮:分隔符只有一个空格,键必须是键(2026-09-20)
 
 第十九轮,Codex 两条,都是 P2,而且是同一类毛病的两个化身:**用"找到这几个字节"代替"按语法读"**。
