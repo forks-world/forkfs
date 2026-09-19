@@ -204,6 +204,11 @@ int hardlinks_manifest_read(const char *manifest_path, HardlinkSet &out) {
                 if (::sscanf(line + 3, " %llu %llu %llu %llu %llu", &ver, &gs, &ns, &eg, &en) == 5) {
                     out.external_groups = eg;
                     out.external_names = en;
+                    // PR #1 review (8th round): the two counts that say how much of this section
+                    // there is supposed to be. They used to be parsed and dropped.
+                    out.header_groups = gs;
+                    out.header_names = ns;
+                    out.header_seen = true;
                 }
             }
             continue;
@@ -227,6 +232,16 @@ int hardlinks_manifest_read(const char *manifest_path, HardlinkSet &out) {
         out.names++;
     }
     ::fclose(f);
+    // PR #1 review (8th round): does the section match the header that describes it? A manifest
+    // cut short -- a truncated write, a full disk, a store somebody has been editing -- keeps
+    // the group count and loses a name, and a group of one name is replayed as nothing at all.
+    // Everything a caller does with this set assumes it is the set the snapshot was published
+    // with, so anything else is a refusal here rather than a quiet half-replay there.
+    if (!out.header_seen) return (out.groups.size() || out.names) ? -EINVAL : 0;
+    if ((uint64_t)out.groups.size() != out.header_groups || out.names != out.header_names)
+        return -EINVAL;
+    for (size_t i = 0; i < out.groups.size(); ++i)
+        if (out.groups[i].paths.size() < 2) return -EINVAL;
     return 0;
 }
 

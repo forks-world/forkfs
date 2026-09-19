@@ -67,6 +67,39 @@ static void strip_hl_lines(const char *manifest) {
     CHECK(rename(tmp, manifest) == 0);
 }
 
+// PR #1 review (8th round): three ways a manifest's hardlink section stops describing itself.
+// The first is what a truncated write leaves -- the last member never reached the disk -- and it
+// is the one that used to fork fine, with two independent files where the snapshot records one
+// inode under two names.
+static void rewrite_manifest(const char *manifest, int drop_last, int drop_header,
+                             unsigned long long header_groups) {
+    char lines[256][8192];
+    size_t n = 0;
+    FILE *i = fopen(manifest, "r");
+    CHECK(i);
+    while (n < 256 && fgets(lines[n], sizeof lines[n], i)) n++;
+    fclose(i);
+    if (drop_last) { CHECK(n > 0); n--; }
+    char tmp[4096];
+    snprintf(tmp, sizeof tmp, "%s.edit", manifest);
+    FILE *o = fopen(tmp, "w");
+    CHECK(o);
+    for (size_t k = 0; k < n; ++k) {
+        if (!strncmp(lines[k], "#hl ", 4)) {
+            if (drop_header) continue;
+            if (header_groups) {
+                unsigned long long ver = 0, gs = 0, ns = 0, eg = 0, en = 0;
+                CHECK(sscanf(lines[k] + 3, " %llu %llu %llu %llu %llu", &ver, &gs, &ns, &eg, &en) == 5);
+                fprintf(o, "#hl %llu %llu %llu %llu %llu\n", ver, header_groups, ns, eg, en);
+                continue;
+            }
+        }
+        fputs(lines[k], o);
+    }
+    CHECK(fclose(o) == 0);
+    CHECK(rename(tmp, manifest) == 0);
+}
+
 static int exists(const char *p) { struct stat st; return lstat(p, &st) == 0; }
 
 // P9 (T2.5): two names are the same file when they are the same inode, and a group of n names
@@ -1733,6 +1766,78 @@ int main() {
         CHECK_OK(wfs_world_info(as, afid, &awr));
         CHECK(awr.snapshot_id == 0 && awr.parent_world == 0 && awr.state == WFS_ST_ACTIVE);
         wfs_store_close(as);
+    }
+
+    // ---- PR #1 review (8th round, P2): a manifest that stops mid-group is damage --------------
+    //
+    // The `#hl` header carries the group and name counts of the section under it, and the reader
+    // parsed them and kept only the external ones. So a manifest whose last member never reached
+    // the disk -- a truncated write, a full disk, a store somebody has been editing -- read back
+    // with the full group count (which is all the fork and the pool filler checked) and one group
+    // holding a single name. A group of one name is replayed as nothing at all: the fork was
+    // published with two independent files where the snapshot records one inode under two names,
+    // silently, and nothing downstream reads the manifest again to notice.
+    {
+        char tstore[4096], tsrc2[4096], tman[4096], tbak[4096], tw[4096], tlk[4096];
+        join(tstore, sizeof tstore, root, "hltrunc-store");
+        join(tsrc2, sizeof tsrc2, root, "hltrunc-src");
+        CHECK(mkdir(tsrc2, 0755) == 0);
+        join(p, sizeof p, tsrc2, "a.txt");
+        write_file(p, "linked\n");
+        join(tlk, sizeof tlk, tsrc2, "b.txt");
+        CHECK(link(p, tlk) == 0);
+        wfs_store *ts2 = NULL;
+        CHECK_OK(wfs_store_open(tstore, &ts2));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "hltrunc";
+        wfs_id t1 = 0;
+        CHECK_OK(wfs_snapshot_create(ts2, tsrc2, &sopts, &t1));
+        CHECK_OK(wfs_snapshot_info(ts2, t1, &sr));
+        CHECK(sr.hl_groups == 1 && sr.hardlinks == 2);
+        snprintf(tman, sizeof tman, "%s/snapshots/S%llu/manifest", tstore, (unsigned long long)t1);
+        join(tbak, sizeof tbak, root, "hltrunc.bak");
+        copy_file(tman, tbak);
+
+        wfs_ref tf = {WFS_K_SNAPSHOT, t1};
+        memset(&opts, 0, sizeof opts);
+        opts.no_pool = 1;
+        join(tw, sizeof tw, worlds, "hltrunc-w");
+        wfs_id tw1 = 0;
+        wfs_verify_report tvr;
+        uint64_t tmade = 0, tready = 0;
+
+        // Three ways for the section to stop describing itself: the last member gone (the group
+        // count still says 1), the header gone, and a header that claims a group too many.
+        for (int kind = 0; kind < 3; ++kind) {
+            copy_file(tbak, tman);
+            rewrite_manifest(tman, kind == 0, kind == 1, kind == 2 ? 2 : 0);
+            memset(&tvr, 0, sizeof tvr);
+            CHECK_RC(wfs_snapshot_verify(ts2, t1, &tvr), WFS_E_SNAPSHOT_DIRTY);
+            CHECK(tvr.modified == 1 && strstr(tvr.first_bad, "manifest"));
+            CHECK_RC(wfs_world_create(ts2, tf, tw, &opts, &tw1), WFS_E_SNAPSHOT_DIRTY);
+            CHECK(!exists(tw));                                  // nothing published at --to
+            CHECK(n_with_prefix(worlds, ".wfs-fork-") == 0);     // and no clone left behind
+            tmade = 1;
+            CHECK_RC(wfs_pool_fill(ts2, t1, 1, &tmade), WFS_E_SNAPSHOT_DIRTY);
+            CHECK(tmade == 0);
+            tready = 1;
+            CHECK_OK(wfs_pool_ready(ts2, t1, &tready));
+            CHECK(tready == 0);
+        }
+
+        // And the manifest as the snapshot wrote it still forks, with the pair one inode again:
+        // the refusal is about the damage, not about hardlinked snapshots.
+        copy_file(tbak, tman);
+        CHECK_OK(wfs_snapshot_verify(ts2, t1, &tvr));
+        CHECK_OK(wfs_world_create(ts2, tf, tw, &opts, &tw1));
+        join(p, sizeof p, tw, "a.txt");
+        join(q, sizeof q, tw, "b.txt");
+        CHECK(ino_of(p) == ino_of(q) && nlink_of(p) == 2);
+        CHECK_OK(wfs_world_discard(ts2, tw1, 1, 0));
+        tmade = 0;
+        CHECK_OK(wfs_pool_fill(ts2, t1, 1, &tmade));
+        CHECK(tmade == 1);
+        wfs_store_close(ts2);
     }
 
     // ---- PR #1 review (7th round, P1): `restore W<n>` and `discard S<n>` cannot both win -----

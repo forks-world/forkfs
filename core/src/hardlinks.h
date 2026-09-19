@@ -39,6 +39,15 @@ struct HardlinkSet {
     uint64_t names = 0;           // total names in `groups`
     uint64_t external_groups = 0; // groups with at least one name outside the tree
     uint64_t external_names = 0;  // the names of those groups that are inside it
+    // PR #1 review (8th round): what the manifest's own `#hl` header said, when this set was
+    // read back from one. The header is written before the lines it describes, so it is the only
+    // thing that can tell a manifest that ends where it was meant to from one that was cut
+    // short: a truncated last member leaves the group count intact and one group a name short,
+    // and a group with a single name is silently skipped by the replay. Filled by
+    // hardlinks_manifest_read, which refuses a set that does not match them; zero after a scan.
+    uint64_t header_groups = 0;
+    uint64_t header_names = 0;
+    bool header_seen = false;
 };
 
 // What one replay did. Nothing here is fatal: a fork whose hardlinks could not all be rebuilt
@@ -80,6 +89,16 @@ void hardlinks_manifest_write(FILE *f, const HardlinkSet &set);
 // hardlinks) yields an empty set and rc 0; a missing manifest yields -ENOENT. The entry lines
 // are skipped without being parsed, so the cost is one pass over the file -- which is why
 // callers gate this on the snapshot row's hl_groups being non-zero.
+//
+// PR #1 review (8th round): and a section that does not agree with its own header is -EINVAL,
+// which every caller maps to WFS_E_SNAPSHOT_DIRTY. The header's counts used to be parsed and
+// thrown away except for the external ones, so a manifest whose last member never reached the
+// disk read back with the full group count and one group holding a single name -- which
+// restore_group() skips without a word. The fork was published with two independent files where
+// the snapshot records one inode under two names, and nothing downstream ever reads the manifest
+// again to notice. So: there must be a header when there are `hl` lines, the groups and the
+// names must be exactly what it says, and no group may hold fewer than two names (the scan never
+// writes one -- a group whose names are not all inside the tree is counted as external instead).
 int hardlinks_manifest_read(const char *manifest_path, HardlinkSet &out);
 
 // <store>/snapshots/S<n>/root -> <store>/snapshots/S<n>/manifest.
