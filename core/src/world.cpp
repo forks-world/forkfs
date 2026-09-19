@@ -2409,6 +2409,22 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
     // volume numbers come along next to the estimate rather than instead of it.
     out->bytes_estimate = v.tree_entries * 308;
     wfs::fs_free_space(s->dir.c_str(), &out->volume_free_bytes, &out->volume_total_bytes);
+    // PR #1 review (5th round): and the abandoned fork trees that are still on disk. They are not
+    // in the trash -- they are in the user's directory, named only by their CREATING row -- but
+    // an operator asking what is waiting for the collector has to be told about them too.
+    {
+        int64_t reap_before = now_sec() - wfs::creating_min_age_secs();
+        Guard g(s->mu);
+        Stmt q(s->db, "SELECT tmp_path, owner_pid, owner_start, created_at FROM worlds"
+                      " WHERE state=0 AND tmp_path<>''");
+        if (q.ok()) {
+            while (q.row()) {
+                if (wfs::producer_alive(q.col_i64(1), q.col_i64(2))) continue;
+                if (q.col_i64(3) > reap_before) continue;
+                if (exists(q.col_text(0))) out->creating_stranded++;
+            }
+        }
+    }
     gc_worker_probe(s, &out->worker_pid, &out->worker_started_at, &out->worker_done,
                     &out->worker_remaining);
     return 0;
@@ -2490,9 +2506,29 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
             }
         }
         for (size_t i = 0; i < creating.size(); ++i) {
-            if (gc_tmp_is_removable(s, creating[i], cpaths[i].c_str()) &&
-                wfs::fs_remove_tree(cpaths[i].c_str()) == 0)
-                rep.tmp_removed++;
+            TrashJob j;
+            j.path = cpaths[i];
+            j.row = creating[i];
+            if (gc_tmp_is_removable(s, creating[i], cpaths[i].c_str())) {
+                if (wfs::fs_remove_tree(cpaths[i].c_str()) == 0) {
+                    rep.tmp_removed++;
+                } else if (exists(cpaths[i].c_str())) {
+                    // PR #1 review (5th round): the tree is still there and this row is the only
+                    // thing in the world that knows its name -- it lives in the user's own target
+                    // directory, under a name drawn at random, and is deliberately never found by
+                    // a suffix sweep (rm_tmp_in_store_dir). Marking the row DEAD and clearing
+                    // tmp_path here stranded the whole clone permanently. So the row stays
+                    // CREATING with its tmp_path, the tree is counted, and a later wake tries
+                    // again -- under the same failure cap as a trash entry, so a tree that will
+                    // never budge stops waking a worker every two seconds without ever being
+                    // reported as gone.
+                    rep.tmp_failed++;
+                    if (gc_fail_bump(s, j) < kGcFailCap) rep.work_remains = 1;
+                    continue;
+                }
+                // Neither removed nor still there: somebody else got to it. Bury the row.
+            }
+            gc_fail_clear(s, j);
             Guard g(s->mu);
             Txn t(s->db);
             Stmt d(s->db, "UPDATE worlds SET state=?, tmp_path='' WHERE id=? AND state=0");

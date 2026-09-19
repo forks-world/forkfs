@@ -1069,6 +1069,11 @@ static int cmd_gc_status(wfs_store *s, int64_t retention) {
     } else {
         printf("worker:    none%s\n", (ts.due + ts.deleting) ? " (work waiting: `world fs gc` starts one)" : "");
     }
+    // Not trash, but waiting for the same collector: a fork that died leaves its half-built
+    // clone in the user's own directory, and only its CREATING row knows the name (PR #1 review).
+    if (ts.creating_stranded)
+        printf("abandoned: %llu half-built fork tree%s still on disk (`world fs gc` retries them)\n",
+               (unsigned long long)ts.creating_stranded, ts.creating_stranded == 1 ? "" : "s");
     return EX_OK;
 }
 
@@ -1112,6 +1117,15 @@ static int cmd_gc(wfs_store *s, int argc, char **argv) {
                     "world:       only moved looks the same from here: `world fs verify <its new path>`\n"
                     "world:       repairs that one instead (P1).\n",
                     (unsigned long long)rep.snapshots_dangling, (unsigned long long)rep.worlds_dangling);
+    }
+    if (rep.tmp_failed) {
+        fprintf(stderr,
+                "world: note: %llu half-built fork tree%s could not be removed and %s still on disk.\n"
+                "world:       The record of %s is kept; %s   (`world fs gc --status`)\n",
+                (unsigned long long)rep.tmp_failed, rep.tmp_failed == 1 ? "" : "s",
+                rep.tmp_failed == 1 ? "is" : "are", rep.tmp_failed == 1 ? "it" : "them",
+                rep.work_remains ? "the collector will try again."
+                                 : "it has failed too often to keep retrying by itself.");
     }
     if (rep.trash_failed) {
         // Never let a failed delete read as an empty trash: say what is still in there, and

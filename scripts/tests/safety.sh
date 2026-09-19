@@ -260,6 +260,47 @@ if command -v sqlite3 > /dev/null 2>&1; then
     fi
 fi
 
+# ---- PR #1 review (5th round): a fork tree gc cannot remove keeps its row ----------------------
+# A fork's temporary lives in the user's own target directory under a name drawn at random, and is
+# deliberately never found by a suffix sweep -- the CREATING row is the only record of it. gc used
+# to mark that row DEAD and clear tmp_path whether or not the tree actually went, so one EPERM
+# stranded the whole clone permanently, with nothing left that knew its name. Same ACL as the
+# undeletable-trash-entry case below: it survives chmod and chflags, so the tree really cannot go.
+if command -v sqlite3 > /dev/null 2>&1; then
+    STUCKTMP="$SCRATCH/pr5stuck/.wfs-fork-stuck"
+    mkdir -p "$STUCKTMP/keep"
+    echo x > "$STUCKTMP/keep/f.txt"
+    sqlite3 "$WORLD_STORE/metadata.db" "INSERT INTO worlds(kind,parent_world,snapshot_id,name,path,state,created_at,tmp_path,owner_pid,owner_start) VALUES(1,0,1,'pr5stuck','$SCRATCH/pr5stuck/w',0,0,'$STUCKTMP',2147480000,0);" 2>/dev/null
+    chmod +a "$(id -un) deny delete,delete_child,add_file" "$STUCKTMP/keep"
+    out=$(WORLD_GC_CREATING_MIN_AGE=0 "$WORLD" fs gc 2>&1)
+    STUCKSTATE=$(sqlite3 "$WORLD_STORE/metadata.db" "SELECT state FROM worlds WHERE name='pr5stuck';")
+    STUCKPATH=$(sqlite3 "$WORLD_STORE/metadata.db" "SELECT tmp_path FROM worlds WHERE name='pr5stuck';")
+    if [ -e "$STUCKTMP/keep/f.txt" ] && [ "$STUCKSTATE" = 0 ] && [ "$STUCKPATH" = "$STUCKTMP" ]; then
+        ok PR5 "a fork tree gc cannot remove keeps its row and its tmp_path"
+    else
+        bad PR5 "a fork tree gc cannot remove keeps its row and its tmp_path (state $STUCKSTATE)"
+        echo "$out" | sed 's/^/        /'
+    fi
+    echo "$out" | grep -q "could not be removed" && ok PR5 "gc says so instead of reporting it collected" \
+                                                 || { bad PR5 "gc says so instead of reporting it collected"; echo "$out" | sed 's/^/        /'; }
+    if "$WORLD" fs gc --status | grep -q "^abandoned: *1 half-built fork tree"; then
+        ok PR5 "gc --status counts the abandoned tree"
+    else
+        bad PR5 "gc --status counts the abandoned tree"; "$WORLD" fs gc --status | sed 's/^/        /'
+    fi
+    # Take the ACL away and the next wake finishes what it started: tree gone, row dead.
+    chmod -N "$STUCKTMP/keep"
+    WORLD_GC_CREATING_MIN_AGE=0 "$WORLD" fs gc > /dev/null 2>&1
+    STUCKSTATE=$(sqlite3 "$WORLD_STORE/metadata.db" "SELECT state FROM worlds WHERE name='pr5stuck';")
+    if [ ! -e "$STUCKTMP" ] && [ "$STUCKSTATE" = 3 ]; then
+        ok PR5 "once it can be removed the next gc removes it and buries the row"
+    else
+        bad PR5 "once it can be removed the next gc removes it and buries the row (state $STUCKSTATE)"
+    fi
+    "$WORLD" fs gc --status | grep -q "^abandoned:" && bad PR5 "and stops counting it" \
+                                                    || ok PR5 "and stops counting it"
+fi
+
 # ---- P12: two commands at once do not corrupt the store -----------------------------------------
 "$WORLD" fs fork --from S1 --to "$SCRATCH/par-a" > "$SCRATCH/pa.log" 2>&1 &
 "$WORLD" fs fork --from S1 --to "$SCRATCH/par-b" > "$SCRATCH/pb.log" 2>&1 &

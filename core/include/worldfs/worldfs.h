@@ -575,6 +575,14 @@ typedef struct wfs_gc_report {
      * wakes after a failure set work_remains as well, so the worker chain comes back for them;
      * after that the entry is left alone rather than spun on forever. */
     uint64_t trash_failed;
+    /* PR #1 review (5th round): abandoned fork trees this run could not remove. A fork's
+     * temporary lives in the user's own target directory, under a name drawn at random, so the
+     * CREATING row is the only record of it and it is deliberately never found by a suffix
+     * sweep. The row is therefore kept, CREATING and with its tmp_path intact, and the tree is
+     * counted here and by `gc --status` until some later wake can remove it. Same retry cap as
+     * a trash entry: the first few failures set work_remains, after that it is reported and left
+     * alone rather than spun on. */
+    uint64_t tmp_failed;
 } wfs_gc_report;
 
 /* retention_secs < 0 uses the default (7 days). Synchronous and complete: every due trash entry
@@ -634,6 +642,11 @@ typedef struct wfs_trash_stat {
      * alongside the volume's real df numbers so an operator can see both. */
     uint64_t bytes_estimate;
     uint64_t volume_free_bytes, volume_total_bytes;
+    /* PR #1 review (5th round): abandoned fork trees whose producer is gone and which are still
+     * on disk in the user's directory, named only by their CREATING row. Not trash entries --
+     * they are outside the store -- but the same thing from an operator's point of view: space
+     * that is waiting for a collector. */
+    uint64_t creating_stranded;
     /* The worker, from <store>/locks/gc.lock. pid is 0 when nobody is running. */
     int64_t worker_pid, worker_started_at;
     uint64_t worker_done, worker_remaining; /* trash entries finished / left, as it last wrote */
