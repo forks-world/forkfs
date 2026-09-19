@@ -1243,3 +1243,38 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `world.cpp` 快照创建与 gc 清快照(`<store>/snapshots/S<n>.wfs-tmp`,名字由行 id 决定)、
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
+
+#### PR #1 review 第四轮:两条"失败了却当没事"(2026-09-19)
+
+同一个 PR 的第四轮,Codex 两条 P2,主题是一样的:**一次失败被当成了一个可以接受的结果**——
+一次是重放硬链接失败了照样发布,一次是并行删除失败了就退回到一条没有期限的慢路。
+**一条一个提交、一条一个测试,两个测试都先验证过"没有修复就会红"。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P2 `4053275996` | `world.cpp:658` | 硬链接组落在一个**没有 owner-write 位**的目录里(`0555`:vendor 进来的树、生成的 fixture、`chmod -R a-w` 过的发布目录),克隆把这个模式一起带过去,于是重放的 `link(2)`/`rename(2)` 全是 EACCES。而这里**把返回值丢掉了**:快照照样发布,manifest 和 `hl_groups` 行都声称有这个组,树里却没有——之后每一个 fork、每一个 pool 条目都继承了这份不一致 | 两半都做。**借**:`link`/`rename` 吃到 EACCES/EPERM 时,把目标所在目录借出 owner write(和 search),**只借这两个调用的工夫**,然后把**原样的 mode** 还回去(以及 `UF_IMMUTABLE`/`UF_APPEND`,如果它本来有)。借出记在一个栈上,由析构函数**逆序**归还,成功路径和每一条错误路径都走同一个出口。两个组可能落在同一个目录里、重放又是四线程的,所以整个"借→link→rename→还"用调用自己的一把锁串起来:常见情况下它一次都不会跑,代价是零。**败**:`hardlinks_restore()` 从此返回 `first_err`——`missing`/`skipped` 仍然容忍(那是活源在克隆底下变),但**文件系统拒绝过的 link 不行**,快照创建删掉半成品树并删行、fork 回滚克隆和行、pool 填充丢掉这个条目。顺手:`rm_rec()` 能打开 `0555` 目录却不能在里面 unlink(`discard --now` 因此 EACCES),现在进门就把模式摘掉——和并行删除的 `rm_entry` 一直在做的一样,**我们本来就是在删它** | `c0b5e2f` |
+| P2 `4053276002` | `platform_posix.cpp:852` | 并行删除每条目检查期限,可**只要错误不是 `-ECANCELED` 就退回 `fs_remove_tree()`**——而它一个期限都没收到:一趟 O(树) 的 unprotect 遍历加一趟 O(树) 的深度优先 unlink。大 trash 树里一个读不动的目录,就能把"两秒一轮"的 worker 拖成几分钟,正是 `max_secs` 要挡的前台争用 | `fs_remove_tree()` 收下同一对 `(deadline_us, partial)`,带默认值,所有旧调用点一字不改:`rm_rec()` 每条目读一次时钟(和 `rm_entry` 一样),超时以 `-ECANCELED` 退出并且**回程上不 rmdir 任何东西**,剩下的是一棵 `.deleting` 树,天生可续;unprotect 遍历也拿到期限(`fs_unprotect_tree` 多一个可选时间戳,回调超时返回 `-ECANCELED`)——一个能把整份预算花在清 `UF_IMMUTABLE` 上的回退路,不过是换个名字的无界 wake;`rm_entry` 的 ENOTEMPTY 补救把自己的期限传下去,被期限打断时报 `-ECANCELED` 而不是失败 | `5f5dfd3` |
+
+**验收**:`safety.sh` **177 passed, 0 failed**(上一轮 167 → 本轮净 +10:0555 那条 7 个断言、
+回退期限那条 4 个断言,减去合并的计数差);`ctest` 两个配置 WFS_FSKIT=OFF **2/2**、ON **3/3**
+(只剩 FSKit 那 4 条冻结 API 的 deprecated 警告);`check-deps.sh` 全绿(没有新的系统调用)。
+
+两条都先把测试跑红过:
+
+- 0555:关掉"借"这一半,`core_test` 在 `wfs_snapshot_create` 就 `-13`(以前是静静发布一棵
+  和 manifest 对不上的树,现在至少会失败),`safety.sh` 五条断言全红。
+- 回退期限:把 `fs_remove_tree(root, deadline_us, partial)` 改回 `fs_remove_tree(root)`,
+  一次 `WORLD_GC_BATCH_SECS=1` 的 wake 跑了 **4713 ms**、把整棵树删光、一句 "work remains" 都没有。
+
+新增测试:
+
+- `core_test`(P2 `…996`):`0555` 目录里的一对硬链接,在**快照、fork、pool 发出来的 world**
+  三处都要重新连上,而且三处的目录模式都要是 `0555`、里面不留 `.wfs-hl-` 临时名。另一半用新测试缝
+  `wfs_test_hardlink_restore_err`(库里恒为 0)强制重放报错,钉死回滚:**没有 `S<n>`、没有
+  `S<n>.wfs-tmp`、没有行、`--to` 上没有树、pool 里没有条目**;缝一清,同一个快照照样建得出来。
+- `safety.sh`(P2 `…996`):同一件事走 CLI 再做一遍,快照(开一下门看)、fork、pool 三条路。
+- `safety.sh`(P2 `…002`):一棵 12 万条目的 trash 树,**全部内容压在一个 `0000` 目录底下**——
+  并行遍历的 `opendir` 在删掉任何一个条目之前就 EACCES,回退路**确定地**每次都会走到。
+  `WORLD_GC_BATCH_SECS=1` 下 wake 要在 ~1 s 回来、报 "work remains, handing over"、
+  留下 `.deleting` 和大半棵树;删除器进门时把那个 `0000` 摘掉(它本来就是在删它),
+  于是后继链走回并行路并把树收干净。
