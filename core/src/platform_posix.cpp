@@ -692,9 +692,14 @@ void Manifest::line(const char *rel, const struct stat &st, bool is_dir) {
     Guard g(mu);
     if (!f) return;
     fwrite(head, 1, (size_t)n, f);
+    // PR #1 review (12th round): backslash, LF and CR -- the three bytes a line-oriented format
+    // cannot carry raw. CR was missing, and wfs_snapshot_verify's reader stripped a trailing one
+    // as if this file had CRLF line endings, so every name ending in CR was read back one byte
+    // short: `verify` called a perfectly good snapshot modified.
     for (const char *p = rel; *p; ++p) {
         if (*p == '\\') fputs("\\\\", f);
         else if (*p == '\n') fputs("\\n", f);
+        else if (*p == '\r') fputs("\\r", f);
         else fputc(*p, f);
     }
     fputc('\n', f);

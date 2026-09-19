@@ -148,10 +148,17 @@ String hardlinks_manifest_path(const char *snapshot_root) {
 
 namespace {
 
+// PR #1 review (12th round): and CR. A file name may hold one -- it is an ordinary byte to
+// every file system this runs on -- and the reader below used to strip a trailing one as if the
+// file this very function writes might have CRLF line endings. So `a\r` was written raw and read
+// back as `a`, and the replay then acted on a name that is somebody else's file. The three bytes
+// that cannot survive a line-oriented format unescaped are backslash, LF and CR; nothing else in
+// a path needs quoting here, because the terminator is the only structure a line has left.
 void put_escaped(FILE *f, const char *s) {
     for (const char *p = s; *p; ++p) {
         if (*p == '\\') ::fputs("\\\\", f);
         else if (*p == '\n') ::fputs("\\n", f);
+        else if (*p == '\r') ::fputs("\\r", f);
         else ::fputc(*p, f);
     }
 }
@@ -173,13 +180,16 @@ bool manifest_path_sane(const char *p) {
     }
 }
 
-// The manifest's own escaping, in reverse (world.cpp's reader does the same thing).
+// The manifest's own escaping, in reverse (world.cpp's reader does the same thing). `\\r` is new
+// in the 12th round and costs nothing in compatibility: an older manifest cannot contain the
+// two-byte sequence backslash-r, because a literal backslash was always written `\\\\` and is
+// consumed as a pair here before its `r` is ever looked at.
 void unescape(char *s) {
     char *w = s;
     for (char *r = s; *r; ++r) {
         if (*r == '\\' && r[1]) {
             ++r;
-            *w++ = (*r == 'n') ? '\n' : *r;
+            *w++ = (*r == 'n') ? '\n' : (*r == 'r') ? '\r' : *r;
         } else {
             *w++ = *r;
         }
@@ -231,8 +241,13 @@ int hardlinks_manifest_read(const char *manifest_path, HardlinkSet &out) {
             }
             continue;
         }
+        // PR #1 review (12th round): the terminator, and only the terminator. This used to eat a
+        // trailing CR as well, so a name that ends in one came back a byte short -- `a\r` read as
+        // `a` -- and the replay linked whatever `a` happened to be. (A manifest written before
+        // this round with a CR in a name was already unreadable in exactly that way; there is no
+        // compatibility to keep, because there was never a correct reading of it.)
         size_t n = ::strlen(line);
-        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+        if (n && line[n - 1] == '\n') line[--n] = 0;
         unsigned long long gid = 0, nlink = 0;
         int consumed = 0;
         if (::sscanf(line + 2, " %llu %llu %n", &gid, &nlink, &consumed) != 2 || !consumed) continue;

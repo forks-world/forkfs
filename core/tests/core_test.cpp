@@ -2631,6 +2631,95 @@ int main() {
         wfs_store_close(da);
     }
 
+    // ---- PR #1 review (12th round, P2): a file name that ends in a carriage return ----------
+    //
+    // The hardlink manifest's reader stripped a trailing `\r` along with the `\n`, as if the
+    // file it had just written itself might have CRLF line endings. The writer escaped `\\` and
+    // `\n` and nothing else, so a name ending in CR went in raw and came back out one byte
+    // shorter -- and the replay then linked *that* name: `a\r` and `b\r` were read as `a` and
+    // `b`, two perfectly ordinary files next to them, which the fork duly welded onto one
+    // inode. Cloned content overwritten, in a fork that reported success. The writer escapes
+    // CR now (`\\r`) and the reader strips only its terminator; the verify manifest, which had
+    // the same writer/reader pair, goes with it.
+    {
+        char crsrc[4096], crw[4096], cra[4096], crb[4096];
+        join(crsrc, sizeof crsrc, root, "cr-src");
+        CHECK(mkdir(crsrc, 0755) == 0);
+        join(cra, sizeof cra, crsrc, "a\r");
+        write_file(cra, "linked\n");
+        join(crb, sizeof crb, crsrc, "b\r");
+        CHECK(link(cra, crb) == 0);
+        // ... and the two ordinary files whose names the old reader turned those into.
+        join(cra, sizeof cra, crsrc, "a");
+        write_file(cra, "plain a\n");
+        join(crb, sizeof crb, crsrc, "b");
+        write_file(crb, "plain b\n");
+        // Same size and same mtime: two generated files, a checkout, a tar extract. That is all
+        // the replay's "is this still the file the scan saw" guard has to go on, so with the
+        // names misread these two were interchangeable to it.
+        struct timespec crts[2];
+        crts[0].tv_sec = 1000000000; crts[0].tv_nsec = 0;
+        crts[1] = crts[0];
+        CHECK(utimensat(AT_FDCWD, cra, crts, 0) == 0);
+        CHECK(utimensat(AT_FDCWD, crb, crts, 0) == 0);
+
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "cr";
+        wfs_id scr = 0;
+        CHECK_OK(wfs_snapshot_create(s, crsrc, &sopts, &scr));
+        wfs_snapshot_rec crr;
+        CHECK_OK(wfs_snapshot_info(s, scr, &crr));
+        CHECK(crr.hl_groups == 1 && crr.hl_external == 0 && crr.hardlinks == 2);
+        wfs_verify_report crv;
+        CHECK_OK(wfs_snapshot_verify(s, scr, &crv));   // the verify manifest reads its own names
+        CHECK(crv.missing == 0 && crv.modified == 0 && crv.extra == 0);
+
+        join(crw, sizeof crw, worlds, "cr-world");
+        wfs_ref crf = {WFS_K_SNAPSHOT, scr};
+        memset(&opts, 0, sizeof opts);
+        opts.name = "cr-w";
+        opts.no_pool = 1;
+        wfs_fork_result crfr;
+        memset(&crfr, 0, sizeof crfr);
+        CHECK_OK(wfs_world_create_ex(s, crf, crw, &opts, &crfr));
+        CHECK(crfr.hardlinks == 1);            // the one name relinked to its canonical file
+        join(cra, sizeof cra, crw, "a\r");
+        join(crb, sizeof crb, crw, "b\r");
+        CHECK(ino_of(cra) == ino_of(crb) && nlink_of(cra) == 2);
+        join(cra, sizeof cra, crw, "a");
+        join(crb, sizeof crb, crw, "b");
+        CHECK(ino_of(cra) != ino_of(crb));     // and the plain pair is still two separate files
+        CHECK(nlink_of(cra) == 1 && nlink_of(crb) == 1);
+        CHECK_OK(read_file(cra, buf, sizeof buf));
+        CHECK(!strcmp(buf, "plain a\n"));
+        CHECK_OK(read_file(crb, buf, sizeof buf));
+        CHECK(!strcmp(buf, "plain b\n"));
+
+        // And through the pool, whose filler replays the manifest onto its own clone with no
+        // verify root at all (pool.cpp): there the misread names are acted on unconditionally,
+        // so the two ordinary files really were welded onto one inode and one of them lost its
+        // contents -- a fork that reported success and handed back a damaged tree.
+        uint64_t crmade = 0;
+        CHECK_OK(wfs_pool_fill(s, scr, 1, &crmade));
+        CHECK(crmade == 1);
+        char crwp[4096];
+        join(crwp, sizeof crwp, worlds, "cr-world-pool");
+        memset(&opts, 0, sizeof opts);
+        opts.name = "cr-w-pool";
+        memset(&crfr, 0, sizeof crfr);
+        CHECK_OK(wfs_world_create_ex(s, crf, crwp, &opts, &crfr));
+        CHECK(crfr.from_pool == 1);
+        join(cra, sizeof cra, crwp, "a\r");
+        join(crb, sizeof crb, crwp, "b\r");
+        CHECK(ino_of(cra) == ino_of(crb) && nlink_of(cra) == 2);
+        join(cra, sizeof cra, crwp, "a");
+        join(crb, sizeof crb, crwp, "b");
+        CHECK(ino_of(cra) != ino_of(crb));
+        CHECK(nlink_of(cra) == 1 && nlink_of(crb) == 1);
+        CHECK_OK(read_file(crb, buf, sizeof buf));
+        CHECK(!strcmp(buf, "plain b\n"));     // and not one inode's worth of "plain a"
+    }
+
     // ---- PR #1 review (9th round, P1): a pool entry made after the scan is not an orphan ----
     //
     // pool_scan takes one snapshot of the pool rows; pool_collect then removes the trees that

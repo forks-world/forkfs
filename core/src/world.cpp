@@ -2261,12 +2261,15 @@ char kind_of(mode_t m) {
     return 's';
 }
 
+// The manifest's escaping in reverse (hardlinks.cpp does the same thing). `\\r` since the 12th
+// round of the PR #1 review: an older manifest cannot hold the two-byte sequence backslash-r,
+// because a literal backslash was always written `\\\\` and is consumed as a pair here.
 void unescape(char *s) {
     char *w = s;
     for (char *r = s; *r; ++r) {
         if (*r == '\\' && r[1]) {
             ++r;
-            *w++ = (*r == 'n') ? '\n' : *r;
+            *w++ = (*r == 'n') ? '\n' : (*r == 'r') ? '\r' : *r;
         } else {
             *w++ = *r;
         }
@@ -2307,8 +2310,11 @@ extern "C" int wfs_snapshot_verify(wfs_store *s, wfs_id id, wfs_verify_report *o
 
     char line[8192];
     while (::fgets(line, sizeof line, f)) {
+        // PR #1 review (12th round): the terminator only. A trailing CR belongs to the name --
+        // the writer escapes it now -- and eating it made `verify` report a file that is
+        // perfectly intact as modified, and its neighbour as extra.
         size_t n = ::strlen(line);
-        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+        if (n && line[n - 1] == '\n') line[--n] = 0;
         if (!n) continue;
         char kind = line[0];
         char *p = line + 1;
