@@ -201,9 +201,15 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
             // PR #1 review (4th round): an entry whose groups could not be replayed is not a
             // faithful clone of the snapshot, and a fork would hand it out as one. Drop it --
             // the filler's error path removes the tree and the row.
-            if (hardlinks_manifest_read(mp.c_str(), hl) == 0 && hl.groups.size() &&
-                (rc = hardlinks_restore(tmp.c_str(), hl, nullptr, nullptr)))
-                break;
+            // PR #1 review (6th round): and the same for a manifest that cannot be read or that
+            // holds fewer groups than the row says. Both were swallowed here, and the entry then
+            // went into the pool as READY with independent files where the snapshot records one
+            // inode under n names -- handed to the next fork as a faithful clone. The row's
+            // hl_groups and the manifest's group count come from one HardlinkSet written in one
+            // place (wfs_snapshot_create), so they disagree only if the manifest was damaged.
+            if ((rc = hardlinks_manifest_read(mp.c_str(), hl))) { rc = WFS_E_SNAPSHOT_DIRTY; break; }
+            if (hl.groups.size() != si.hl_groups) { rc = WFS_E_SNAPSHOT_DIRTY; break; }
+            if (hl.groups.size() && (rc = hardlinks_restore(tmp.c_str(), hl, nullptr, nullptr))) break;
         }
         // The snapshot's own marker is never in there (wfs_snapshot_create removes it), so the
         // entry carries no identity at all until a fork writes one.

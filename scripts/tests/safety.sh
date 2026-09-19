@@ -891,6 +891,29 @@ has_hint PR6 "the refusal offers the marker-less way to keep it" "world fs init"
 rv fs status | grep -q "^worlds: *0 active" && ok PR6 "and no world row was written for it" \
                                              || { bad PR6 "and no world row was written for it"; rv fs status | sed 's/^/        /'; }
 
+# ---- PR #1 review (6th round, P2): a damaged hardlink manifest is not "no hardlinks" ----------
+# `hl_groups` on the row says how many groups of names share an inode; the manifest's own section
+# says which names. clonefile(2) breaks every one of those links, so the replay of that section
+# is the only thing that puts them back -- and a manifest that will not read, or that holds fewer
+# groups than the row claims, used to be read as "nothing to replay". The fork then published a
+# tree with independent files where the snapshot records one inode under two names.
+mkdir -p "$SCRATCH/hl-src"
+echo linked > "$SCRATCH/hl-src/a.txt"
+ln "$SCRATCH/hl-src/a.txt" "$SCRATCH/hl-src/b.txt"
+rv fs init "$SCRATCH/hl-src" --name hl > /dev/null 2>&1
+HMAN="$RSTORE/snapshots/S5/manifest"
+[ "$(grep -c '^hl ' "$HMAN" 2>/dev/null)" = 2 ] && ok PR6 "the snapshot manifest records the hardlink group" \
+                                                 || { bad PR6 "the snapshot manifest records the hardlink group"; cat "$HMAN" | sed 's/^/        /'; }
+grep -v '^hl ' "$HMAN" > "$SCRATCH/hl-man.stripped" && cat "$SCRATCH/hl-man.stripped" > "$HMAN"
+check    PR6 "a fork from a snapshot whose manifest lost its groups is refused" 3 -- rv fs fork --from S5 --to "$SCRATCH/hl-w"
+has_hint PR6 "the refusal sends you to verify" "world fs verify S5" -- rv fs fork --from S5 --to "$SCRATCH/hl-w"
+[ ! -e "$SCRATCH/hl-w" ] && ok PR6 "and nothing was published at --to" \
+                          || bad PR6 "and nothing was published at --to"
+check    PR6 "verify reports the damaged manifest" 3 -- rv fs verify S5
+check    PR6 "pool fill refuses it too" 3 -- rv fs pool fill S5 --count 1
+rv fs pool status | grep -q "^pool: empty" && ok PR6 "and leaves no ready entry behind" \
+                                            || { bad PR6 "and leaves no ready entry behind"; rv fs pool status | sed 's/^/        /'; }
+
 rv fs gc --now --retention 0 > /dev/null 2>&1
 
 # ---- PR #1 review (P2): the batch limit bites inside one tree, not only between trees ----------

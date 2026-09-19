@@ -439,6 +439,16 @@ static int cmd_pool(wfs_store *s, int argc, char **argv) {
             snprintf(why, sizeof why, "S%llu is not an active snapshot", (unsigned long long)r.id);
             return refuse(why, "world fs list");
         }
+        // PR #1 review (6th round): the entry would be a clone with the snapshot's hardlinks
+        // broken, handed to the next fork as a faithful one. The filler drops it instead.
+        if (rc == WFS_E_SNAPSHOT_DIRTY) {
+            char why[192], hint[64];
+            snprintf(why, sizeof why,
+                     "S%llu's hardlink manifest is missing or damaged, so a pool entry cannot be "
+                     "made to match it", (unsigned long long)r.id);
+            snprintf(hint, sizeof hint, "world fs verify S%llu", (unsigned long long)r.id);
+            return refuse(why, hint);
+        }
         uint64_t ready = 0;
         wfs_pool_ready(s, r.id, &ready);
         if (rc) {
@@ -545,6 +555,24 @@ static int cmd_fork(wfs_store *s, int argc, char **argv) {
         rc = wfs_world_create_ex(s, from, target, &opts, &res);
         if (rc == -EEXIST && !to) continue; // someone else took that id; ask again
         if (rc == WFS_E_WORLD_BUSY && from.kind == WFS_K_WORLD) return busy_refusal(s, from.id, "fork from");
+        // PR #1 review (6th round): the snapshot's hardlink manifest is the only record of which
+        // names share an inode, and clonefile(2) breaks every one of them. Unreadable, or
+        // shorter than the row says, means this fork cannot be made to match the snapshot -- the
+        // core refuses rather than publishing a tree with the links silently gone.
+        if (rc == WFS_E_SNAPSHOT_DIRTY) {
+            wfs_id sid = from.id;
+            if (from.kind == WFS_K_WORLD) {
+                wfs_world_rec wr;
+                sid = wfs_world_info(s, from.id, &wr) == 0 ? wr.snapshot_id : 0;
+            }
+            char why[224], hint[64];
+            snprintf(why, sizeof why,
+                     "S%llu's hardlink manifest is missing or damaged: the fork would be a copy "
+                     "with the hardlinks the snapshot records silently broken",
+                     (unsigned long long)sid);
+            snprintf(hint, sizeof hint, "world fs verify S%llu", (unsigned long long)sid);
+            return refuse(why, hint);
+        }
         if (rc) return explain_path(s, target, rc, "fork");
         printf("W%llu  %s%s", (unsigned long long)res.world, target, res.from_pool ? "  (pool)" : "");
         // P9 (T2.5): only worth a word when there was something to rebuild. A pool hit says

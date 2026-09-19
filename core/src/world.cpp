@@ -939,10 +939,16 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         // hardlinks_restore() lstats each name in the live tree before it touches the clone.
         // (A hardlink an agent made inside the world is not carried over -- there is no cheap
         // way to find it, and a `checkpoint` rescans the tree and records it properly.)
+        // PR #1 review (6th round): and only while that snapshot is ACTIVE. Reading the manifest
+        // is fatal when it fails from here on (see the replay below), and a snapshot that has
+        // been trashed or reconciled away has no manifest where its row says any more -- a world
+        // whose baseline is gone is still a world, and forking it must not fail for the sake of
+        // an optimisation. Without the groups the clone simply has none of them rebuilt, which
+        // is what a `checkpoint` of the world then records properly.
         if (snapshot_id) {
             wfs_snapshot_rec sn;
             Guard g2(s->mu);
-            if (snapshot_row(s, snapshot_id, sn) == 0 && sn.hl_groups) {
+            if (snapshot_row(s, snapshot_id, sn) == 0 && sn.state == WFS_ST_ACTIVE && sn.hl_groups) {
                 hl_groups = sn.hl_groups;
                 hl_manifest = wfs::hardlinks_manifest_path(sn.path);
                 hl_verify = src.c_str();
@@ -1135,7 +1141,21 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         // marker and the rename, so a crash here leaves nothing but the recorded temp tree.
         if (hl_groups) {
             wfs::HardlinkSet hl;
-            if (wfs::hardlinks_manifest_read(hl_manifest.c_str(), hl) == 0 && hl.groups.size()) {
+            // PR #1 review (6th round): a manifest that cannot be read, or that holds fewer
+            // groups than the row says, is a failed fork -- not a fork without hardlinks. The
+            // read error and the short manifest were both swallowed here, and the tree was then
+            // published with independent files where the snapshot records one inode under n
+            // names: the very thing P9 exists to prevent, and invisible afterwards, because
+            // nothing downstream re-reads the manifest. hl_groups and the manifest's group
+            // count are written from the same HardlinkSet, after the broken groups have been
+            // dropped from both (wfs_snapshot_create), so they agree in every store this code
+            // ever wrote; disagreeing means the manifest has been damaged since.
+            if ((rc = wfs::hardlinks_manifest_read(hl_manifest.c_str(), hl))) {
+                rc = WFS_E_SNAPSHOT_DIRTY;
+                break;
+            }
+            if (hl.groups.size() != hl_groups) { rc = WFS_E_SNAPSHOT_DIRTY; break; }
+            if (hl.groups.size()) {
                 wfs::HardlinkRestore hr;
                 rc = wfs::hardlinks_restore(tmp.c_str(), hl, hl_verify, &hr);
                 res->hardlinks = hr.links;
@@ -2076,6 +2096,21 @@ extern "C" int wfs_snapshot_verify(wfs_store *s, wfs_id id, wfs_verify_report *o
         }
     }
     ::fclose(f);
+
+    // T2.5, and PR #1 review (6th round): the row says how many hardlink groups this snapshot
+    // has, and the manifest's own section is where every fork and every pool filler reads them
+    // back from. A manifest that has lost that section -- or part of it -- is a snapshot that
+    // cannot be cloned faithfully any more, and both of those now refuse it outright, so this is
+    // the command that has to be able to say why. (A manifest that is missing altogether was
+    // already an error above: the fopen fails.)
+    if (r.hl_groups) {
+        wfs::HardlinkSet hl;
+        int hrc = wfs::hardlinks_manifest_read(mp.c_str(), hl);
+        if (hrc || hl.groups.size() != (size_t)r.hl_groups) {
+            out->modified++;
+            if (!out->first_bad[0]) copy_str(out->first_bad, sizeof out->first_bad, mp.c_str());
+        }
+    }
 
     CountCtx cc = {0};
     if (int rc = wfs::fs_walk_tree(r.path, 4, wfs::FS_DIRS_PRE, &cc, count_cb)) return rc;

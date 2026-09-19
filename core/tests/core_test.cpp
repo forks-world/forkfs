@@ -35,6 +35,38 @@ static int read_file(const char *p, char *buf, size_t cap) {
 
 static void join(char *out, size_t cap, const char *a, const char *b) { snprintf(out, cap, "%s/%s", a, b); }
 
+// PR #1 review (6th round): a snapshot's manifest, kept aside and put back. Byte for byte, so
+// the restored snapshot is the one that was made, not one this test rewrote.
+static void copy_file(const char *from, const char *to) {
+    FILE *i = fopen(from, "r");
+    CHECK(i);
+    FILE *o = fopen(to, "w");
+    CHECK(o);
+    char b[8192];
+    size_t n;
+    while ((n = fread(b, 1, sizeof b, i)) > 0) CHECK(fwrite(b, 1, n, o) == n);
+    fclose(i);
+    CHECK(fclose(o) == 0);
+}
+
+// The damage: every `hl ` line out of a manifest, nothing else touched. That is a manifest that
+// reads fine and holds fewer hardlink groups than the snapshot row claims -- what a truncated
+// write, or a manifest from a store somebody has been editing, looks like.
+static void strip_hl_lines(const char *manifest) {
+    FILE *i = fopen(manifest, "r");
+    CHECK(i);
+    char tmp[4096];
+    snprintf(tmp, sizeof tmp, "%s.stripped", manifest);
+    FILE *o = fopen(tmp, "w");
+    CHECK(o);
+    char line[8192];
+    while (fgets(line, sizeof line, i))
+        if (strncmp(line, "hl ", 3) != 0) fputs(line, o);
+    fclose(i);
+    CHECK(fclose(o) == 0);
+    CHECK(rename(tmp, manifest) == 0);
+}
+
 static int exists(const char *p) { struct stat st; return lstat(p, &st) == 0; }
 
 // P9 (T2.5): two names are the same file when they are the same inode, and a group of n names
@@ -1628,6 +1660,118 @@ int main() {
         CHECK_OK(wfs_world_info(as, afid, &awr));
         CHECK(awr.snapshot_id == 0 && awr.parent_world == 0 && awr.state == WFS_ST_ACTIVE);
         wfs_store_close(as);
+    }
+
+    // ---- PR #1 review (6th round, P2): a hardlink manifest that will not read is a failure -----
+    //
+    // The row's hl_groups says "this snapshot has n groups of names that share an inode"; the
+    // manifest's own section says which names. A fork and a pool filler both gate on the first
+    // and replay the second, and both used to treat an unreadable manifest -- or one holding
+    // fewer groups than the row claims -- as "nothing to replay". clonefile(2) breaks every
+    // intra-tree hardlink, so what they published was a tree with independent files where the
+    // snapshot records one inode under n names: silent, and invisible afterwards, because
+    // nothing downstream reads the manifest again.
+    {
+        char hstore[4096], hsrc[4096], hman[4096], hbak[4096], hw[4096], hlk[4096];
+        join(hstore, sizeof hstore, root, "hlman-store");
+        join(hsrc, sizeof hsrc, root, "hlman-src");
+        CHECK(mkdir(hsrc, 0755) == 0);
+        join(p, sizeof p, hsrc, "a.txt");
+        write_file(p, "linked\n");
+        join(hlk, sizeof hlk, hsrc, "b.txt");
+        CHECK(link(p, hlk) == 0);
+        wfs_store *hs = NULL;
+        CHECK_OK(wfs_store_open(hstore, &hs));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "hlman";
+        wfs_id h1 = 0;
+        CHECK_OK(wfs_snapshot_create(hs, hsrc, &sopts, &h1));
+        CHECK_OK(wfs_snapshot_info(hs, h1, &sr));
+        CHECK(sr.hl_groups == 1);
+        snprintf(hman, sizeof hman, "%s/snapshots/S%llu/manifest", hstore, (unsigned long long)h1);
+        join(hbak, sizeof hbak, root, "hlman.bak");
+        copy_file(hman, hbak);
+
+        // The control, with the manifest as the snapshot wrote it: the pair is one inode again
+        // on the other side of the clone.
+        wfs_ref hf = {WFS_K_SNAPSHOT, h1};
+        memset(&opts, 0, sizeof opts);
+        opts.no_pool = 1;
+        join(hw, sizeof hw, worlds, "hlman-w");
+        wfs_id hw1 = 0;
+        CHECK_OK(wfs_world_create(hs, hf, hw, &opts, &hw1));
+        join(p, sizeof p, hw, "a.txt");
+        join(q, sizeof q, hw, "b.txt");
+        CHECK(ino_of(p) == ino_of(q) && nlink_of(p) == 2);
+        CHECK_OK(wfs_world_discard(hs, hw1, 1, 0));
+
+        // (a) the section is gone but the manifest is otherwise intact: fewer groups than the
+        // row says. The old code called that "nothing to replay".
+        strip_hl_lines(hman);
+        wfs_verify_report hvr;
+        CHECK_RC(wfs_snapshot_verify(hs, h1, &hvr), WFS_E_SNAPSHOT_DIRTY);
+        CHECK(hvr.modified == 1 && strstr(hvr.first_bad, "manifest"));
+        size_t before = 0;
+        CHECK_OK(wfs_world_list(hs, 1, NULL, 0, &before));
+        CHECK_RC(wfs_world_create(hs, hf, hw, &opts, &hw1), WFS_E_SNAPSHOT_DIRTY);
+        CHECK(!exists(hw));                                     // nothing published at --to
+        CHECK(n_with_prefix(worlds, ".wfs-fork-") == 0);        // and no clone left behind
+        size_t after = 0;
+        CHECK_OK(wfs_world_list(hs, 1, NULL, 0, &after));
+        CHECK(after == before);                                 // the CREATING row went with it
+        uint64_t made = 1;
+        CHECK_RC(wfs_pool_fill(hs, h1, 1, &made), WFS_E_SNAPSHOT_DIRTY);
+        CHECK(made == 0);
+        uint64_t ready = 1;
+        CHECK_OK(wfs_pool_ready(hs, h1, &ready));
+        CHECK(ready == 0);                                      // never a READY entry
+
+        // (b) no manifest at all. On a gated snapshot the manifest is also the gate's lock file
+        // (snapshot_access.cpp), so nothing ever gets as far as the replay: the gate cannot be
+        // opened and the fork stops with plain -ENOENT. A --hard snapshot has no gate, and there
+        // the replay is the only thing that reads the manifest -- which is where the read error
+        // used to be swallowed.
+        CHECK(unlink(hman) == 0);
+        CHECK_RC(wfs_world_create(hs, hf, hw, &opts, &hw1), -ENOENT);
+        copy_file(hbak, hman);
+
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "hlman-hard";
+        sopts.hard = 1;
+        wfs_id h2 = 0;
+        CHECK_OK(wfs_snapshot_create(hs, hsrc, &sopts, &h2));
+        CHECK_OK(wfs_snapshot_info(hs, h2, &sr));
+        CHECK(sr.hl_groups == 1);
+        char hman2[4096];
+        snprintf(hman2, sizeof hman2, "%s/snapshots/S%llu/manifest", hstore, (unsigned long long)h2);
+        CHECK(unlink(hman2) == 0);
+        wfs_ref hf2 = {WFS_K_SNAPSHOT, h2};
+        char hw2[4096];
+        join(hw2, sizeof hw2, worlds, "hlman-w2");
+        wfs_id hw2id = 0;
+        CHECK_RC(wfs_world_create(hs, hf2, hw2, &opts, &hw2id), WFS_E_SNAPSHOT_DIRTY);
+        CHECK(!exists(hw2));
+        CHECK(n_with_prefix(worlds, ".wfs-fork-") == 0);
+        made = 1;
+        CHECK_RC(wfs_pool_fill(hs, h2, 1, &made), WFS_E_SNAPSHOT_DIRTY);
+        CHECK(made == 0);
+        CHECK_OK(wfs_pool_ready(hs, h2, &ready));
+        CHECK(ready == 0);
+
+        // Put S<n>'s section back and everything works again: the refusal is about the damage,
+        // not about hardlinked snapshots.
+        copy_file(hbak, hman);
+        CHECK_OK(wfs_snapshot_verify(hs, h1, &hvr));
+        CHECK_OK(wfs_world_create(hs, hf, hw, &opts, &hw1));
+        join(p, sizeof p, hw, "a.txt");
+        join(q, sizeof q, hw, "b.txt");
+        CHECK(ino_of(p) == ino_of(q) && nlink_of(p) == 2);
+        made = 0;
+        CHECK_OK(wfs_pool_fill(hs, h1, 1, &made));
+        CHECK(made == 1);
+        CHECK_OK(wfs_pool_ready(hs, h1, &ready));
+        CHECK(ready == 1);
+        wfs_store_close(hs);
     }
 
     wfs_store_close(s);
