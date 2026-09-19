@@ -593,6 +593,89 @@ int fs_remove_tree(const char *root) {
     return rm_rec(root);
 }
 
+// ---- T2.1: the parallel deleter --------------------------------------------------------------
+//
+// The same 4-thread walker that clones and scans, used to unlink. Files go in the parallel
+// phase (one unlinkat per entry, spread over the workers), directories in the serial tail the
+// walker already does deepest-first -- a parent must not be rmdir'ed before its children.
+//
+// `entries` counts what was actually removed, which is what the gc worker reports as progress.
+// Every failure path degrades to the single-threaded rm_rec above rather than leaving half a
+// tree: this is deletion, and a partially deleted tree is exactly what the .deleting rename in
+// world.cpp exists to make safe.
+namespace {
+
+struct RmCtx {
+    uint64_t entries = 0;
+    int err = 0;
+};
+
+// One unlink. UF_IMMUTABLE (a --hard snapshot that was not unprotected first) and a directory
+// whose write bit was stripped both surface as EPERM/EACCES; clear them and try once more.
+int rm_entry(void *ctx, const char *path, const char *rel, const struct stat &st, bool is_dir) {
+    RmCtx *c = (RmCtx *)ctx;
+    if (!*rel && !is_dir) { // the walker was handed a non-directory
+        if (::unlink(path) != 0 && errno != ENOENT) return -errno;
+        bump(c->entries);
+        return 0;
+    }
+    if (is_dir) {
+        if (::rmdir(path) == 0 || errno == ENOENT) { if (*rel) bump(c->entries); return 0; }
+        int e = errno;
+        if (e == EPERM || e == EACCES || e == ENOTEMPTY) {
+#ifdef __APPLE__
+            ::lchflags(path, 0);
+#endif
+            ::chmod(path, 0700);
+            if (::rmdir(path) == 0 || errno == ENOENT) { if (*rel) bump(c->entries); return 0; }
+            e = errno;
+        }
+        return -e;
+    }
+    if (::unlink(path) == 0 || errno == ENOENT) { bump(c->entries); return 0; }
+    int e = errno;
+    if (e == EPERM || e == EACCES) {
+#ifdef __APPLE__
+        ::lchflags(path, 0);
+#endif
+        // The write bit that matters for unlink(2) is the parent's, not the entry's.
+        const char *slash = ::strrchr(path, '/');
+        if (slash && slash != path) {
+            String parent;
+            parent.append(path, (size_t)(slash - path));
+#ifdef __APPLE__
+            ::lchflags(parent.c_str(), 0);
+#endif
+            ::chmod(parent.c_str(), 0700);
+        }
+        if (::unlink(path) == 0 || errno == ENOENT) { bump(c->entries); return 0; }
+        e = errno;
+    }
+    (void)st;
+    return -e;
+}
+
+} // namespace
+
+int fs_remove_tree_parallel(const char *root, int threads, uint64_t *entries) {
+    struct stat st;
+    if (::lstat(root, &st) != 0) return errno == ENOENT ? 0 : -errno;
+    if (!S_ISDIR(st.st_mode)) {
+        if (::unlink(root) != 0 && errno != ENOENT) return -errno;
+        if (entries) (*entries)++;
+        return 0;
+    }
+    // A gate-protected root is 0000 and cannot even be opened. We are deleting it, so opening
+    // the gate for good is exactly right (docs/M1_DESIGN.md §3 P4).
+    if (::access(root, R_OK | X_OK | W_OK) != 0) ::chmod(root, 0700);
+    RmCtx c;
+    int rc = fs_walk_tree(root, threads, FS_DIRS_POST, &c, rm_entry);
+    if (entries) *entries += c.entries;
+    if (rc == 0) return 0;
+    // Anything at all went wrong: finish the job the slow, certain way.
+    return fs_remove_tree(root);
+}
+
 #ifndef __APPLE__
 // Linux/other: the clonefile world model is Darwin-only for now. overlayfs is the planned
 // equivalent (docs/M1_DESIGN.md §4); until then these report "unsupported" honestly rather

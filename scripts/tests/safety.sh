@@ -165,7 +165,8 @@ else
     bad P4 "restore brings it back with its content"
 fi
 "$WORLD" fs discard W2 > /dev/null
-"$WORLD" fs gc --retention 0 > /dev/null
+# --now is the synchronous gc: without it the trash is handed to the background collector (T2.1).
+"$WORLD" fs gc --retention 0 --now > /dev/null
 if "$WORLD" fs list | grep -q "^W2"; then bad P4 "gc past the retention window deletes it"
 else ok P4 "gc past the retention window deletes it"; fi
 
@@ -382,6 +383,162 @@ fi
 "$WORLD" fs pool drain S1 > /dev/null
 "$WORLD" fs pool status | grep -q "^pool: empty" && ok T1.5 "pool drain empties it" \
                                                  || bad T1.5 "pool drain empties it"
+
+# ---- M2 ----------------------------------------------------------------------------------------
+# A store of its own, so the T2 cases cannot be confused by the nine worlds above.
+
+S2="$SCRATCH/store2"
+w2() { "$WORLD" --store "$S2" "$@"; }
+P2DIR="$SCRATCH/proj2"
+mkdir -p "$P2DIR/src"
+for i in $(seq 1 40); do echo "line $i" > "$P2DIR/src/f$i.txt"; done
+echo hello > "$P2DIR/hello.txt"
+w2 fs init "$P2DIR" --name p2 > /dev/null || { echo "store2 init failed"; exit 1; }
+w2 fs fork --from S1 --to "$SCRATCH/t-a" --no-pool > /dev/null
+w2 fs fork --from S1 --to "$SCRATCH/t-b" --no-pool > /dev/null
+w2 fs fork --from S1 --to "$SCRATCH/t-c" --no-pool > /dev/null
+
+# ---- T2.1: discard is O(1), the deleting is somebody else's problem --------------------------
+t0=$(python3 -c 'import time;print(int(time.time()*1000))')
+w2 fs discard W1 > /dev/null
+t1=$(python3 -c 'import time;print(int(time.time()*1000))')
+if [ "$((t1 - t0))" -lt 500 ]; then ok T2.1 "discard of a 42-entry world is O(1) ($((t1-t0)) ms)"
+else bad T2.1 "discard of a 42-entry world is O(1) ($((t1-t0)) ms)"; fi
+# Nothing was unlinked: the tree is still whole, in the trash.
+TRASHED=$(ls -d "$S2"/trash/W1-* 2>/dev/null | head -1)
+if [ -n "$TRASHED" ] && [ -f "$TRASHED/hello.txt" ]; then ok T2.1 "the tree is intact in <store>/trash"
+else bad T2.1 "the tree is intact in <store>/trash"; fi
+w2 fs gc --status | grep -q "^trash: *1 entries" && ok T2.1 "gc --status counts the trash" \
+                                                 || { bad T2.1 "gc --status counts the trash"; w2 fs gc --status | sed 's/^/        /'; }
+w2 fs gc --status | grep -qE "contents: *42 tree entries, ~" && ok T2.1 "gc --status reports entries and an estimated size" \
+                                                             || { bad T2.1 "gc --status reports entries and an estimated size"; w2 fs gc --status | sed 's/^/        /'; }
+w2 fs gc --status | grep -q "^worker: *none" && ok T2.1 "gc --status says when no worker is running" \
+                                             || bad T2.1 "gc --status says when no worker is running"
+# Inside the retention window nothing is due and no worker is started.
+w2 fs gc > "$SCRATCH/gc1.log" 2>&1
+grep -q "background" "$SCRATCH/gc1.log" && bad T2.1 "gc starts no worker when nothing is due" \
+                                        || ok T2.1 "gc starts no worker when nothing is due"
+w2 fs restore W1 > /dev/null && [ -f "$SCRATCH/t-a/hello.txt" ] \
+    && ok T2.1 "a world inside the retention window still restores" \
+    || bad T2.1 "a world inside the retention window still restores"
+
+# The background collector: `gc` hands the trash over and returns, the worker empties it.
+w2 fs discard W1 > /dev/null
+w2 fs gc --retention 0 > "$SCRATCH/gc2.log" 2>&1
+grep -q "emptied in the background" "$SCRATCH/gc2.log" && ok T2.1 "gc hands due trash to the background worker" \
+                                                       || { bad T2.1 "gc hands due trash to the background worker"; sed 's/^/        /' "$SCRATCH/gc2.log"; }
+for _ in $(seq 60); do [ -z "$(ls "$S2"/trash 2>/dev/null)" ] && break; sleep 0.25; done
+[ -z "$(ls "$S2"/trash 2>/dev/null)" ] && ok T2.1 "the worker empties the trash on its own" \
+                                       || { bad T2.1 "the worker empties the trash on its own"; ls "$S2/trash" | sed 's/^/        /'; }
+w2 fs list | grep -q "^W1 .*trashed" && bad T2.1 "the collected world is marked dead" \
+                                     || ok T2.1 "the collected world is marked dead"
+[ -s "$S2/logs/gc.log" ] && ok T2.1 "the worker logs to <store>/logs/gc.log" \
+                         || bad T2.1 "the worker logs to <store>/logs/gc.log"
+grep -q "entries unlinked" "$S2/logs/gc.log" && ok T2.1 "the log says how many entries it unlinked" \
+                                             || { bad T2.1 "the log says how many entries it unlinked"; sed 's/^/        /' "$S2/logs/gc.log"; }
+
+# Crash safety: a tree renamed to *.deleting is not a world any more, whatever the row says.
+w2 fs discard W2 > /dev/null
+TRASHED=$(ls -d "$S2"/trash/W2-* 2>/dev/null | head -1)
+mv "$TRASHED" "$TRASHED$( : ).deleting"
+check    T2.1 "restore refuses a trash entry that is being deleted" 3 -- w2 fs restore W2
+has_hint T2.1 "that refusal says what to do instead" "fork" -- w2 fs restore W2
+w2 fs gc --now --retention 0 > /dev/null 2>&1
+[ -z "$(ls "$S2"/trash 2>/dev/null)" ] && ok T2.1 "the next gc finishes the interrupted deletion" \
+                                       || { bad T2.1 "the next gc finishes the interrupted deletion"; ls "$S2/trash" | sed 's/^/        /'; }
+
+# One collector per store: a worker that cannot take <store>/locks/gc.lock does nothing at all.
+w2 fs fork --from S1 --to "$SCRATCH/t-d" --no-pool > /dev/null
+w2 fs discard W4 > /dev/null
+python3 -c 'import fcntl,sys,time; f=open(sys.argv[1],"a+"); fcntl.flock(f,fcntl.LOCK_EX); time.sleep(4)' \
+    "$S2/locks/gc.lock" &
+HOLDER=$!
+sleep 0.5
+w2 fs gc --worker --retention 0 > "$SCRATCH/gcw.log" 2>&1
+if [ -n "$(ls "$S2"/trash 2>/dev/null)" ] && [ ! -s "$SCRATCH/gcw.log" ]; then
+    ok T2.1 "a second worker exits on the store's gc lock without touching the trash"
+else
+    bad T2.1 "a second worker exits on the store's gc lock without touching the trash"
+    ls "$S2/trash" | sed 's/^/        /'; sed 's/^/        /' "$SCRATCH/gcw.log"
+fi
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+w2 fs gc --now --retention 0 > /dev/null 2>&1
+
+# ---- T2.2: discarding a snapshot ---------------------------------------------------------------
+check    T2.2 "discard S<n> is refused while an active world needs it" 3 -- w2 fs discard S1
+out=$(w2 fs discard S1 2>&1)
+echo "$out" | grep -qE "source of [0-9]+ active world\(s\) \(W[0-9]+" && ok T2.2 "that refusal names the worlds holding it" \
+                                                                       || { bad T2.2 "that refusal names the worlds holding it"; echo "$out" | sed 's/^/        /'; }
+has_hint  T2.2 "the refusal offers checkpoint as the way out" "checkpoint" -- w2 fs discard S1
+# --force must NOT be a way to orphan a live world's source.
+check    T2.2 "--force does not override a live world" 3 -- w2 fs discard S1 --force
+# Take the worlds out of the way, keeping one in the trash: a trashed world is not a reason to refuse.
+w2 fs discard W5 > /dev/null 2>&1
+w2 fs discard W3 > /dev/null 2>&1   # stays in the trash, inside the retention window
+w2 fs pool fill S1 --count 1 > /dev/null 2>&1
+check    T2.2 "a pool entry alone still refuses" 3 -- w2 fs discard S1
+has_hint T2.2 "that refusal offers --force" "--force" -- w2 fs discard S1
+check    T2.2 "--force drains the pool and discards" 0 -- w2 fs discard S1 --force
+w2 fs status | grep -qE "^snapshots: .*1 trashed" && ok T2.2 "fs status counts the trashed snapshot" \
+                                                  || { bad T2.2 "fs status counts the trashed snapshot"; w2 fs status | sed 's/^/        /'; }
+w2 fs pool status | grep -q "^pool: empty" && ok T2.2 "--force drained its pool entries" \
+                                           || bad T2.2 "--force drained its pool entries"
+# A world in the trash whose source is gone cannot come back.
+check    T2.2 "restoring a world whose snapshot was discarded is refused" 3 -- w2 fs restore W3
+out=$(w2 fs restore W3 2>&1)
+echo "$out" | grep -q "no baseline" && ok T2.2 "that refusal explains why (no baseline to diff against)" \
+                                   || { bad T2.2 "that refusal explains why"; echo "$out" | sed 's/^/        /'; }
+# The gate is 0000; the deleter has to reopen it or nothing below it can be unlinked.
+SNAPTRASH=$(ls -d "$S2"/trash/S1-* 2>/dev/null | head -1)
+[ -n "$SNAPTRASH" ] && [ "$(stat -f '%Lp' "$SNAPTRASH/root")" = "0" ] \
+    && ok T2.2 "the discarded snapshot is still gated in the trash" \
+    || bad T2.2 "the discarded snapshot is still gated in the trash"
+w2 fs gc --now --retention 0 > "$SCRATCH/gc3.log" 2>&1
+[ ! -e "$SNAPTRASH" ] && ok T2.2 "gc deletes the trashed snapshot through the closed gate" \
+                      || { bad T2.2 "gc deletes the trashed snapshot through the closed gate"; sed 's/^/        /' "$SCRATCH/gc3.log"; }
+
+# ---- T2.2: reconciliation ------------------------------------------------------------------------
+w2 fs init "$P2DIR" --name recon > /dev/null           # S2
+w2 fs fork --from S2 --to "$SCRATCH/t-e" --no-pool > /dev/null
+SNAP2=$(w2 fs inspect S2 | awk '/^path:/{print $2}')
+chmod 0700 "$SNAP2"; rm -rf "${SNAP2%/root}"           # the tree vanishes behind the store's back
+rm -rf "$SCRATCH/t-e"                                  # and so does a world
+w2 fs gc --retention 7 > "$SCRATCH/rec1.log" 2>&1
+grep -q "1 snapshot(s) and 1 world(s)" "$SCRATCH/rec1.log" && ok T2.2 "gc reports dangling rows without touching them" \
+                                                           || { bad T2.2 "gc reports dangling rows without touching them"; sed 's/^/        /' "$SCRATCH/rec1.log"; }
+w2 fs status | grep -q "^dangling:" && ok T2.2 "fs status reports them too" \
+                                    || { bad T2.2 "fs status reports them too"; w2 fs status | sed 's/^/        /'; }
+w2 fs list | grep -q "^S2" && ok T2.2 "a plain gc leaves the dangling rows alone" \
+                           || bad T2.2 "a plain gc leaves the dangling rows alone"
+w2 fs gc --reconcile --retention 7 > "$SCRATCH/rec2.log" 2>&1
+grep -q "reconciled: 1 snapshots and 1 worlds" "$SCRATCH/rec2.log" && ok T2.2 "gc --reconcile marks them dead" \
+                                                                   || { bad T2.2 "gc --reconcile marks them dead"; sed 's/^/        /' "$SCRATCH/rec2.log"; }
+w2 fs list | grep -q "^S2" && bad T2.2 "the dead snapshot is gone from the listing" \
+                           || ok T2.2 "the dead snapshot is gone from the listing"
+w2 fs status | grep -q "^dangling:" && bad T2.2 "nothing dangles afterwards" \
+                                    || ok T2.2 "nothing dangles afterwards"
+
+# ---- T2.3: the world marker carries its store's path ---------------------------------------------
+# `-o` options do not reach the FSKit extension on macOS 27, so this is how a mount finds the
+# store that owns the world it is being pointed at.
+w2 fs init "$P2DIR" --name t23 > /dev/null             # S3
+w2 fs fork --from S3 --to "$SCRATCH/t-f" --no-pool > /dev/null
+python3 - "$SCRATCH/t-f/.world" "$S2" <<'EOF' && ok T2.3 "a forked world's .world names its store path" \
+                                              || bad T2.3 "a forked world's .world names its store path"
+import json,sys,os
+m=json.load(open(sys.argv[1]))
+sys.exit(0 if os.path.realpath(m.get("store_path","")) == os.path.realpath(sys.argv[2]) else 1)
+EOF
+# ... and so does one handed out by the pool, which takes a different code path.
+w2 fs pool fill S3 --count 1 > /dev/null 2>&1
+WORLD_POOL_TOPUP=0 w2 fs fork --from S3 --to "$SCRATCH/t-g" > "$SCRATCH/t23.log" 2>&1
+if grep -q "(pool)" "$SCRATCH/t23.log" && python3 - "$SCRATCH/t-g/.world" "$S2" <<'EOF'
+import json,sys,os
+m=json.load(open(sys.argv[1]))
+sys.exit(0 if os.path.realpath(m.get("store_path","")) == os.path.realpath(sys.argv[2]) else 1)
+EOF
+then ok T2.3 "a pool-served world's .world names its store path too"
+else bad T2.3 "a pool-served world's .world names its store path too"; sed 's/^/        /' "$SCRATCH/t23.log"; fi
 
 echo
 "$WORLD" fs status | sed 's/^/      /'

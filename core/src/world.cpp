@@ -89,12 +89,17 @@ void json_escape(String &out, const char *s) {
     }
 }
 
-void marker_text(String &out, const char *store_id, wfs_id world, const char *name, wfs_id snapshot,
-                 wfs_id parent, int64_t created) {
+void marker_text(String &out, const char *store_id, const char *store_path, wfs_id world,
+                 const char *name, wfs_id snapshot, wfs_id parent, int64_t created) {
     char num[64];
     out.assign("{\n  \"schema\": ");
     ::snprintf(num, sizeof num, "%d", WFS_STORE_SCHEMA); out.append(num);
     out.append(",\n  \"store\": \""); json_escape(out, store_id);
+    // T2.3: the store's *path*, not just its id. The sandboxed FSKit appex resolves
+    // NSApplicationSupportDirectory inside its own container, so it cannot guess where the store
+    // a world belongs to actually is; `-o` options do not reach it on macOS 27, and the marker in
+    // the mount source root is the one channel that does. See macos/fskit/WorldVolume.mm.
+    out.append("\",\n  \"store_path\": \""); json_escape(out, store_path ? store_path : "");
     out.append("\",\n  \"world\": ");
     ::snprintf(num, sizeof num, "%llu", (unsigned long long)world); out.append(num);
     out.append(",\n  \"name\": \""); json_escape(out, name);
@@ -107,10 +112,10 @@ void marker_text(String &out, const char *store_id, wfs_id world, const char *na
     out.append("\n}\n");
 }
 
-int marker_write(const char *world_root, const char *store_id, wfs_id world, const char *name,
-                 wfs_id snapshot, wfs_id parent, int64_t created) {
+int marker_write(const char *world_root, const char *store_id, const char *store_path, wfs_id world,
+                 const char *name, wfs_id snapshot, wfs_id parent, int64_t created) {
     String text;
-    marker_text(text, store_id, world, name, snapshot, parent, created);
+    marker_text(text, store_id, store_path, world, name, snapshot, parent, created);
     String p = joinp(world_root, WFS_MARKER_NAME);
     // The marker may already exist (cloned from the source world); replace it wholesale.
     ::unlink(p.c_str());
@@ -160,6 +165,7 @@ bool json_u64(const char *js, const char *key, uint64_t *out) {
 struct MarkerData {
     int schema = 0;
     char store_id[40] = {0};
+    char store_path[WFS_PATH_MAX] = {0};   // T2.3; empty in markers written before T2.3
     char name[WFS_NAME_MAX] = {0};
     wfs_id world = 0, snapshot = 0, parent = 0;
 };
@@ -176,6 +182,7 @@ int marker_read(const char *world_root, MarkerData &out) {
     uint64_t v = 0;
     if (json_u64(buf, "schema", &v)) out.schema = (int)v;
     json_str(buf, "store", out.store_id, sizeof out.store_id);
+    json_str(buf, "store_path", out.store_path, sizeof out.store_path);
     json_str(buf, "name", out.name, sizeof out.name);
     if (json_u64(buf, "world", &v)) out.world = v;
     if (json_u64(buf, "snapshot", &v)) out.snapshot = v;
@@ -329,10 +336,20 @@ void fill_snapshot(Stmt &q, wfs_snapshot_rec &r) {
     r.state = (int)q.col_i64(8);
     r.hard = (int)q.col_i64(9);
     r.root_mode = (uint32_t)q.col_i64(10);
+    r.trashed_at = q.col_i64(11);
 }
 
 const char *kSnapCols =
-    "id, name, path, src_path, from_world, created_at, entries, hardlinks, state, hard, root_mode";
+    "id, name, path, src_path, from_world, created_at, entries, hardlinks, state, hard, root_mode,"
+    " trashed_at";
+
+// <store>/snapshots/S<n> -- the directory that holds `root` and `manifest`. The row records the
+// root; a discard moves the whole thing, because the manifest is what `verify` needs.
+String snapshot_dir_of(const wfs_snapshot_rec &r) {
+    String d;
+    dirname_of(r.path, d);
+    return d;
+}
 
 int snapshot_row(wfs_store *s, wfs_id id, wfs_snapshot_rec &r) {
     String sql("SELECT ");
@@ -443,6 +460,43 @@ int remove_tmp(const char *target) {
     tmp.append(WFS_TMP_SUFFIX);
     if (!exists(tmp.c_str())) return 0;
     return wfs::fs_remove_tree(tmp.c_str());
+}
+
+// ---- T2.1: deleting a trash entry ------------------------------------------------------------
+//
+// Two steps, in this order and never the other way round:
+//
+//   1. rename <trash>/X to <trash>/X.deleting. One rename(2), atomic, and after it the tree is
+//      visibly not a world any more no matter what happens next. A worker killed half-way
+//      through step 2 leaves a .deleting tree, which the next wake finishes and which
+//      wfs_world_restore() refuses (WFS_E_TRASH_DELETING) instead of handing back a tree with
+//      an arbitrary fraction of its files missing.
+//   2. unlink it with the 4-thread walker.
+//
+// The measured cost of step 2 is what all of this is for: ~50 us per entry, 525 s for the 1000
+// worlds of docs/M1_RESULTS.md §3.
+bool ends_with(const char *s_, const char *suffix) {
+    size_t n = ::strlen(s_), m = ::strlen(suffix);
+    return n > m && !::strcmp(s_ + n - m, suffix);
+}
+
+// Step 1. `out` receives the name the tree now has (which may be the one it already had).
+int trash_mark_deleting(const char *path, String &out) {
+    out.assign(path);
+    if (ends_with(path, WFS_DELETING_SUFFIX)) return exists(path) ? 0 : -ENOENT;
+    if (!exists(path)) return -ENOENT;
+    String d(path);
+    d.append(WFS_DELETING_SUFFIX);
+    // A leftover from an earlier, interrupted attempt: fold it into this one.
+    if (exists(d.c_str())) wfs::fs_remove_tree(d.c_str());
+    if (int rc = wfs::fs_rename(path, d.c_str())) return rc;
+    out = d;
+    return 0;
+}
+
+// Step 2.
+int trash_unlink(const char *deleting_path, int threads, uint64_t *entries) {
+    return wfs::fs_remove_tree_parallel(deleting_path, threads > 0 ? threads : 4, entries);
 }
 
 } // namespace
@@ -710,7 +764,7 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
                 }
             }
             if (!rc)
-                rc = marker_write(claim.path.c_str(), s->store_id.c_str(), id, nm, snapshot_id, 0, created);
+                rc = marker_write(claim.path.c_str(), s->store_id.c_str(), s->dir.c_str(), id, nm, snapshot_id, 0, created);
             if (!rc) rc = wfs::fs_rename(claim.path.c_str(), target.c_str());
             struct stat st;
             if (!rc && ::stat(target.c_str(), &st) != 0) rc = -errno;
@@ -808,7 +862,7 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         }
         // A --hard clone inherits UF_IMMUTABLE and the stripped directory modes.
         if (src_hard && (rc = wfs::fs_unprotect_tree(tmp.c_str()))) break;
-        if ((rc = marker_write(tmp.c_str(), s->store_id.c_str(), id, nm, snapshot_id, parent_world, created)))
+        if ((rc = marker_write(tmp.c_str(), s->store_id.c_str(), s->dir.c_str(), id, nm, snapshot_id, parent_world, created)))
             break;
         if ((rc = wfs::fs_rename(tmp.c_str(), target.c_str()))) break;
     } while (0);
@@ -898,7 +952,16 @@ extern "C" int wfs_world_discard(wfs_store *s, wfs_id id, int immediate, int for
             Guard g(s->mu);
             if (int rc = world_trash_path(s, id, tp)) return rc;
         }
-        if (int rc = wfs::fs_remove_tree(tp.c_str())) return rc;
+        String deleting;
+        if (int rc = trash_mark_deleting(tp.c_str(), deleting)) { if (rc != -ENOENT) return rc; }
+        else {
+            Guard g(s->mu);
+            Txn t(s->db);
+            Stmt u(s->db, "UPDATE worlds SET trash_path=? WHERE id=?");
+            if (u.ok()) { u.text(1, deleting.c_str()); u.i64(2, (int64_t)id); u.step(); }
+            t.commit();
+        }
+        if (deleting.size()) { if (int rc = trash_unlink(deleting.c_str(), 4, nullptr)) return rc; }
         Guard g(s->mu);
         Txn t(s->db);
         Stmt u(s->db, "UPDATE worlds SET state=?, trash_path='' WHERE id=?");
@@ -945,7 +1008,18 @@ extern "C" int wfs_world_discard(wfs_store *s, wfs_id id, int immediate, int for
         t.commit();
     }
     if (!immediate) return 0;
-    if (int frc = wfs::fs_remove_tree(trash.c_str())) return frc;
+    {
+        String deleting;
+        if (int frc = trash_mark_deleting(trash.c_str(), deleting)) return frc;
+        {
+            Guard g(s->mu);
+            Txn t(s->db);
+            Stmt u(s->db, "UPDATE worlds SET trash_path=? WHERE id=?");
+            if (u.ok()) { u.text(1, deleting.c_str()); u.i64(2, (int64_t)id); u.step(); }
+            t.commit();
+        }
+        if (int frc = trash_unlink(deleting.c_str(), 4, nullptr)) return frc;
+    }
     Guard g(s->mu);
     Txn t(s->db);
     Stmt u(s->db, "UPDATE worlds SET state=?, trash_path='' WHERE id=?");
@@ -957,6 +1031,21 @@ extern "C" int wfs_world_discard(wfs_store *s, wfs_id id, int immediate, int for
     return 0;
 }
 
+namespace {
+
+// T2.1: has the collector already started on this trash entry? Either the row has been updated
+// to the .deleting name, or the rename happened and the process died before the row did -- the
+// name on disk is the authority in both cases.
+bool trash_is_deleting(const String &trash) {
+    size_t n = trash.size(), sl = ::strlen(WFS_DELETING_SUFFIX);
+    if (n > sl && !::strcmp(trash.c_str() + n - sl, WFS_DELETING_SUFFIX)) return true;
+    String d(trash);
+    d.append(WFS_DELETING_SUFFIX);
+    return exists(d.c_str());
+}
+
+} // namespace
+
 extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
     if (!s || !id) return -EINVAL;
     wfs_world_rec r;
@@ -967,6 +1056,17 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
         if (int rc = world_trash_path(s, id, trash)) return rc;
     }
     if (r.state != WFS_ST_TRASHED) return -ESTALE;
+    // T2.1: once the collector has renamed the tree, what is left of it is not a world any more.
+    if (trash_is_deleting(trash)) return WFS_E_TRASH_DELETING;
+    // T2.2: a world whose source snapshot has been discarded cannot be brought back to life --
+    // it would have no baseline to diff or verify against, which is the whole point of a World.
+    if (r.snapshot_id) {
+        Guard g(s->mu);
+        Stmt q(s->db, "SELECT state FROM snapshots WHERE id=?");
+        if (!q.ok()) return -EIO;
+        q.i64(1, (int64_t)r.snapshot_id);
+        if (!q.row() || q.col_i64(0) != WFS_ST_ACTIVE) return WFS_E_SOURCE_GONE;
+    }
     if (!exists(trash.c_str())) return -ENOENT;
     if (exists(r.path)) return -EEXIST;
     if (int rc = wfs::fs_rename(trash.c_str(), r.path)) return rc;
@@ -979,6 +1079,96 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
     u.i64(1, WFS_ST_ACTIVE);
     u.i64(2, (int64_t)st.st_dev);
     u.i64(3, (int64_t)st.st_ino);
+    u.i64(4, (int64_t)id);
+    if (u.step() != SQLITE_DONE) return -EIO;
+    t.commit();
+    return 0;
+}
+
+// ---- T2.2: discarding a snapshot --------------------------------------------------------------
+
+namespace {
+
+// Who still needs S<n>? ACTIVE worlds are a hard refusal; pool entries are only pre-made clones
+// and --force drains them.
+struct SnapRefs {
+    uint64_t active_worlds = 0;
+    uint64_t trashed_worlds = 0;
+    uint64_t pool_entries = 0;
+    wfs_id first_world = 0;
+};
+
+int snapshot_refs(wfs_store *s, wfs_id id, SnapRefs &out) {
+    Guard g(s->mu);
+    {
+        Stmt q(s->db, "SELECT id, state FROM worlds WHERE snapshot_id=? AND (state=1 OR state=2)");
+        if (!q.ok()) return -EIO;
+        q.i64(1, (int64_t)id);
+        while (q.row()) {
+            if (q.col_i64(1) == WFS_ST_ACTIVE) {
+                if (!out.first_world) out.first_world = (wfs_id)q.col_i64(0);
+                out.active_worlds++;
+            } else {
+                out.trashed_worlds++;
+            }
+        }
+    }
+    {
+        Stmt q(s->db, "SELECT COUNT(*) FROM pool WHERE snapshot_id=?");
+        if (!q.ok()) return -EIO;
+        q.i64(1, (int64_t)id);
+        if (q.row()) out.pool_entries = (uint64_t)q.col_i64(0);
+    }
+    return 0;
+}
+
+} // namespace
+
+extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int force) {
+    if (!s || !id) return -EINVAL;
+    wfs_snapshot_rec r;
+    {
+        Guard g(s->mu);
+        if (int rc = snapshot_row(s, id, r)) return rc;
+    }
+    if (r.state == WFS_ST_TRASHED) return -EALREADY;
+    if (r.state != WFS_ST_ACTIVE) return -ESTALE;
+
+    SnapRefs refs;
+    if (int rc = snapshot_refs(s, id, refs)) return rc;
+    // Never orphan a world's source: diff and verify both need the baseline (P4/P10).
+    if (refs.active_worlds) return WFS_E_SNAPSHOT_IN_USE;
+    if (refs.pool_entries) {
+        // Pool entries are clones nobody has taken yet -- losing them costs a re-fill and
+        // nothing else -- but they are still references, so without --force this is a refusal
+        // with the same remedy as a live world: say what holds it.
+        if (!force) return WFS_E_SNAPSHOT_IN_USE;
+        uint64_t drained = 0;
+        if (int rc = wfs_pool_drain(s, id, &drained)) return rc;
+        // Draining takes the pool lock; a filler that was mid-clone could have added one back.
+        SnapRefs again;
+        if (int rc = snapshot_refs(s, id, again)) return rc;
+        if (again.active_worlds || again.pool_entries) return WFS_E_SNAPSHOT_IN_USE;
+    }
+
+    String snapdir = snapshot_dir_of(r);
+    char leaf[80];
+    ::snprintf(leaf, sizeof leaf, "S%llu-%lld", (unsigned long long)id, (long long)now_sec());
+    String trash = joinp(joinp(s->dir.c_str(), "trash").c_str(), leaf);
+    // The gate is on `root`, one level below what moves; renaming the directory that holds it
+    // needs no access to the tree at all, so the gate stays closed until the deleter opens it.
+    if (exists(snapdir.c_str())) {
+        if (int rc = wfs::fs_rename(snapdir.c_str(), trash.c_str())) return rc;
+    } else {
+        trash.assign("");   // already gone: this is a reconcile, not a move
+    }
+    Guard g(s->mu);
+    Txn t(s->db);
+    Stmt u(s->db, "UPDATE snapshots SET state=?, trash_path=?, trashed_at=? WHERE id=?");
+    if (!u.ok()) return -EIO;
+    u.i64(1, WFS_ST_TRASHED);
+    u.text(2, trash.c_str());
+    u.i64(3, now_sec());
     u.i64(4, (int64_t)id);
     if (u.step() != SQLITE_DONE) return -EIO;
     t.commit();
@@ -1031,6 +1221,16 @@ extern "C" int wfs_world_lock_check(wfs_store *s, wfs_id id, wfs_lock_info *out)
 }
 
 // ---- identity (P1 / P2) -------------------------------------------------------------------------
+
+extern "C" int wfs_marker_store_path(const char *world_root, char *buf, size_t cap) {
+    if (!world_root || !buf || !cap) return -EINVAL;
+    buf[0] = 0;
+    MarkerData m;
+    if (int rc = marker_read(world_root, m)) return rc;
+    if (!m.store_path[0]) return -ENOENT;
+    copy_str(buf, cap, m.store_path);
+    return 0;
+}
 
 extern "C" int wfs_world_verify_identity(wfs_store *s, const char *path, wfs_identity *out) {
     if (!s || !path || !out) return -EINVAL;
@@ -1150,7 +1350,7 @@ extern "C" int wfs_world_adopt(wfs_store *s, const char *path, const char *name,
         id = (wfs_id)sqlite3_last_insert_rowid(s->db);
         t.commit();
     }
-    if (int rc = marker_write(real.c_str(), s->store_id.c_str(), id, nm, parent ? m.snapshot : 0, parent,
+    if (int rc = marker_write(real.c_str(), s->store_id.c_str(), s->dir.c_str(), id, nm, parent ? m.snapshot : 0, parent,
                               created)) {
         Guard g(s->mu);
         Txn t(s->db);
@@ -1303,9 +1503,25 @@ extern "C" int wfs_snapshot_verify(wfs_store *s, wfs_id id, wfs_verify_report *o
     return 0;
 }
 
-// ---- gc ---------------------------------------------------------------------------------------
+// ---- gc (T2.1 / T2.2) --------------------------------------------------------------------------
+//
+// Everything gc does falls into two classes with very different costs:
+//
+//   cheap    half-built rows and their *.wfs-tmp trees (P8), stale seatbelt profiles, pool
+//            entries of dead snapshots (T1.5), and -- new in T2.2 -- noticing rows whose tree is
+//            not on disk any more. All of it is a handful of stat(2)s and one SQLite pass, so it
+//            runs inline on every gc, whatever the batch limits say.
+//   expensive the trash. 1000 discarded worlds of 10k entries are 10.4M unlink(2) calls and 525 s
+//            (docs/M1_RESULTS.md §3). This is what the batch limits and the background worker
+//            exist for: bounded work per wake, four threads, and P16 -- it must not make the
+//            foreground wait.
+//
+// The lock is store-level and non-blocking, so `world fs gc --worker` started by two different
+// commands collapses into one worker; the loser exits without touching anything.
 
 namespace {
+
+const uint64_t kDefaultGcThreads = 4;
 
 // Collect the parent directories of every world we know about; that is where a crashed fork
 // can have left a <target>.wfs-tmp tree.
@@ -1329,63 +1545,236 @@ int rm_tmp_in_dir(const char *dir, uint64_t *removed) {
     return 0;
 }
 
-} // namespace
+String gc_lock_path(wfs_store *s) {
+    return joinp(joinp(s->dir.c_str(), "locks").c_str(), "gc.lock");
+}
 
-extern "C" int wfs_gc(wfs_store *s, int64_t retention_secs, wfs_gc_report *out) {
-    if (!s) return -EINVAL;
-    wfs_gc_report rep;
-    memset(&rep, 0, sizeof rep);
-    int64_t retention = retention_secs < 0 ? kDefaultRetention : retention_secs;
-    int64_t cutoff = now_sec() - retention;
+// One collector per store. Non-blocking on purpose, exactly like the pool filler's lock: a
+// second worker would only double the unlink pressure on the same trash.
+struct GcLock {
+    int fd = -1;
+    // The file is never unlinked: flock(2) locks an inode, so removing the file and letting the
+    // next worker create a fresh one would let two workers hold "the" lock at once. It also
+    // keeps the last progress line readable after the worker is gone.
+    ~GcLock() { if (fd >= 0) { ::flock(fd, LOCK_UN); ::close(fd); } }
+    String path;
+    GcLock() = default;
+    GcLock(const GcLock &) = delete;
+    GcLock &operator=(const GcLock &) = delete;
+    int take(wfs_store *s) {
+        path = gc_lock_path(s);
+        fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
+        if (fd < 0) return -errno;
+        if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+            int e = errno;
+            ::close(fd);
+            fd = -1;
+            return (e == EWOULDBLOCK || e == EAGAIN) ? WFS_E_GC_BUSY : -e;
+        }
+        progress(0, 0);
+        return 0;
+    }
+    // Rewritten in place after every trash entry, so `gc --status` can say where the worker is
+    // without any IPC. Four short lines; the file never grows.
+    void progress(uint64_t done, uint64_t remaining) {
+        if (fd < 0) return;
+        char buf[256];
+        int n = ::snprintf(buf, sizeof buf, "pid %lld\nstart %lld\ndone %llu\nremaining %llu\n",
+                           (long long)::getpid(), (long long)now_sec(), (unsigned long long)done,
+                           (unsigned long long)remaining);
+        if (n <= 0) return;
+        ::ftruncate(fd, 0);
+        ::pwrite(fd, buf, (size_t)n, 0);
+    }
+};
 
-    Vec<String> trees;   // trees to delete
-    Vec<wfs_id> ids;     // worlds to mark DEAD
-    Vec<String> parents; // directories to sweep for *.wfs-tmp
-    Vec<String> keep;    // trash directories that must stay
-    Vec<wfs_id> snap_gone;
-    Vec<String> snap_tmp;
+// One trash directory waiting to be unlinked.
+struct TrashJob {
+    String path;      // where it is now
+    wfs_id row = 0;   // 0 = an orphan: a directory in the trash that no row claims
+    int is_snapshot = 0;
+};
 
+// Reads the gc lock file the way lock_probe reads an exec lock: a pid that is gone, or a flock
+// that can be taken, means nobody is collecting.
+int gc_worker_probe(wfs_store *s, int64_t *pid, int64_t *started, uint64_t *done, uint64_t *remaining) {
+    String p = gc_lock_path(s);
+    int fd = ::open(p.c_str(), O_RDONLY);
+    if (fd < 0) return 0;
+    char buf[512] = {0};
+    ssize_t n = ::read(fd, buf, sizeof buf - 1);
+    if (n < 0) n = 0;
+    buf[n] = 0;
+    bool free_now = ::flock(fd, LOCK_EX | LOCK_NB) == 0;
+    if (free_now) ::flock(fd, LOCK_UN);
+    ::close(fd);
+    if (free_now) return 0;
+    if (const char *t = ::strstr(buf, "pid ")) *pid = ::strtoll(t + 4, nullptr, 10);
+    if (const char *t = ::strstr(buf, "start ")) *started = ::strtoll(t + 6, nullptr, 10);
+    if (const char *t = ::strstr(buf, "done ")) *done = ::strtoull(t + 5, nullptr, 10);
+    if (const char *t = ::strstr(buf, "remaining ")) *remaining = ::strtoull(t + 10, nullptr, 10);
+    return 1;
+}
+
+// Everything the trash currently holds, classified. One readdir plus the two row tables.
+struct TrashView {
+    Vec<TrashJob> deleting;  // interrupted: finish these first, retention does not apply
+    Vec<TrashJob> due;       // past the retention period
+    uint64_t waiting = 0;    // inside the retention window
+    uint64_t worlds = 0, snapshots = 0;
+    uint64_t tree_entries = 0;
+};
+
+int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v) {
+    Vec<String> claimed;   // trash paths a row points at
     {
         Guard g(s->mu);
         {
-            Stmt q(s->db, "SELECT id, trash_path, trashed_at, path FROM worlds WHERE state=2");
+            Stmt q(s->db, "SELECT id, trash_path, trashed_at, entries FROM worlds WHERE state=2");
             if (!q.ok()) return -EIO;
             while (q.row()) {
-                wfs_id id = (wfs_id)q.col_i64(0);
                 String tp(q.col_text(1));
-                int64_t ts = q.col_i64(2);
-                String p;
-                dirname_of(q.col_text(3), p);
-                add_unique(parents, p.c_str());
-                if (tp.size() && ts <= cutoff) { trees.emplace_back(tp); ids.emplace_back(id); }
-                else if (tp.size()) keep.emplace_back(tp);
+                if (!tp.size()) continue;
+                claimed.emplace_back(tp);
+                v.worlds++;
+                v.tree_entries += (uint64_t)q.col_i64(3);
+                TrashJob j;
+                j.path = tp;
+                j.row = (wfs_id)q.col_i64(0);
+                if (ends_with(tp.c_str(), WFS_DELETING_SUFFIX)) v.deleting.emplace_back(j);
+                else if (q.col_i64(2) <= cutoff) v.due.emplace_back(j);
+                else v.waiting++;
             }
         }
         {
-            Stmt q(s->db, "SELECT id, path FROM worlds WHERE state=0 OR state=1");
+            Stmt q(s->db, "SELECT id, trash_path, trashed_at, entries FROM snapshots WHERE state=2");
             if (!q.ok()) return -EIO;
             while (q.row()) {
-                String p;
-                dirname_of(q.col_text(1), p);
-                add_unique(parents, p.c_str());
+                String tp(q.col_text(1));
+                if (!tp.size()) continue;
+                claimed.emplace_back(tp);
+                v.snapshots++;
+                v.tree_entries += (uint64_t)q.col_i64(3);
+                TrashJob j;
+                j.path = tp;
+                j.row = (wfs_id)q.col_i64(0);
+                j.is_snapshot = 1;
+                if (ends_with(tp.c_str(), WFS_DELETING_SUFFIX)) v.deleting.emplace_back(j);
+                else if (q.col_i64(2) <= cutoff) v.due.emplace_back(j);
+                else v.waiting++;
             }
-        }
-        {
-            // Half-built snapshots: the row is the only trace of the tmp tree's name.
-            Stmt q(s->db, "SELECT id FROM snapshots WHERE state=0");
-            if (!q.ok()) return -EIO;
-            while (q.row()) snap_gone.emplace_back((wfs_id)q.col_i64(0));
         }
     }
+    // Directories in <store>/trash that no row claims: a killed discard, a store restored from a
+    // backup, or a *.deleting tree whose row was already marked DEAD. They go immediately --
+    // there is nothing left that could restore them.
+    String trashdir = joinp(s->dir.c_str(), "trash");
+    if (DIR *d = ::opendir(trashdir.c_str())) {
+        while (struct dirent *e = ::readdir(d)) {
+            if (e->d_name[0] == '.') continue;
+            String p = joinp(trashdir.c_str(), e->d_name);
+            bool wanted = false;
+            for (size_t i = 0; i < claimed.size(); ++i)
+                if (!::strcmp(claimed[i].c_str(), p.c_str())) { wanted = true; break; }
+            if (wanted) continue;
+            TrashJob j;
+            j.path = p;
+            if (ends_with(p.c_str(), WFS_DELETING_SUFFIX)) v.deleting.emplace_back(j);
+            else v.due.emplace_back(j);
+        }
+        ::closedir(d);
+    }
+    return 0;
+}
 
-    for (size_t i = 0; i < trees.size(); ++i) {
-        if (wfs::fs_remove_tree(trees[i].c_str()) != 0) continue;
-        rep.worlds_deleted++;
+// Marks a row DEAD once its tree is gone. Worlds and snapshots keep their row: the DAG is
+// history, and a dangling reference has to be explainable afterwards.
+void mark_dead(wfs_store *s, const TrashJob &j) {
+    if (!j.row) return;
+    Guard g(s->mu);
+    Txn t(s->db);
+    Stmt u(s->db, j.is_snapshot ? "UPDATE snapshots SET state=?, trash_path='' WHERE id=?"
+                                : "UPDATE worlds SET state=?, trash_path='' WHERE id=?");
+    if (u.ok()) { u.i64(1, WFS_ST_DEAD); u.i64(2, (int64_t)j.row); u.step(); }
+    t.commit();
+}
+
+void set_trash_path(wfs_store *s, const TrashJob &j, const char *p) {
+    if (!j.row) return;
+    Guard g(s->mu);
+    Txn t(s->db);
+    Stmt u(s->db, j.is_snapshot ? "UPDATE snapshots SET trash_path=? WHERE id=?"
+                                : "UPDATE worlds SET trash_path=? WHERE id=?");
+    if (u.ok()) { u.text(1, p); u.i64(2, (int64_t)j.row); u.step(); }
+    t.commit();
+}
+
+// One entry, the crash-safe way: rename first, record the new name, then unlink.
+int gc_delete_one(wfs_store *s, const TrashJob &j, int threads, uint64_t *entries_freed) {
+    String deleting;
+    int rc = trash_mark_deleting(j.path.c_str(), deleting);
+    if (rc == -ENOENT) { mark_dead(s, j); return 0; }   // someone else got there first
+    if (rc) return rc;
+    if (::strcmp(deleting.c_str(), j.path.c_str())) set_trash_path(s, j, deleting.c_str());
+    if ((rc = trash_unlink(deleting.c_str(), threads, entries_freed))) return rc;
+    mark_dead(s, j);
+    return 0;
+}
+
+} // namespace
+
+extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_stat *out) {
+    if (!s || !out) return -EINVAL;
+    memset(out, 0, sizeof *out);
+    int64_t retention = retention_secs < 0 ? kDefaultRetention : retention_secs;
+    TrashView v;
+    if (int rc = trash_scan(s, now_sec() - retention, v)) return rc;
+    out->deleting = v.deleting.size();
+    out->due = v.due.size();
+    out->entries = v.deleting.size() + v.due.size() + v.waiting;
+    out->worlds = v.worlds;
+    out->snapshots = v.snapshots;
+    out->tree_entries = v.tree_entries;
+    // 308 B/entry, the measured clone metadata cost on 27.0 (CLONE_MODEL_MACOS27 §4). df cannot
+    // see block sharing and du would count blocks that other worlds still hold, so the real
+    // volume numbers come along next to the estimate rather than instead of it.
+    out->bytes_estimate = v.tree_entries * 308;
+    wfs::fs_free_space(s->dir.c_str(), &out->volume_free_bytes, &out->volume_total_bytes);
+    gc_worker_probe(s, &out->worker_pid, &out->worker_started_at, &out->worker_done,
+                    &out->worker_remaining);
+    return 0;
+}
+
+extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *out) {
+    if (!s) return -EINVAL;
+    wfs_gc_opts o;
+    memset(&o, 0, sizeof o);
+    o.retention_secs = -1;
+    if (opts) o = *opts;
+    int threads = o.threads > 0 ? (int)o.threads : (int)kDefaultGcThreads;
+    wfs_gc_report rep;
+    memset(&rep, 0, sizeof rep);
+    int64_t retention = o.retention_secs < 0 ? kDefaultRetention : o.retention_secs;
+    int64_t cutoff = now_sec() - retention;
+    int64_t deadline_us = o.max_secs > 0 ? now_us() + o.max_secs * 1000000 : 0;
+    uint64_t budget = o.max_entries ? o.max_entries : UINT64_MAX;
+
+    GcLock lock;
+    if (o.flags & WFS_GC_BACKGROUND) {
+        if (int rc = lock.take(s)) return rc;
+    }
+
+    // ---- the cheap half, always run in full ------------------------------------------------
+    Vec<String> parents;
+    {
         Guard g(s->mu);
-        Txn t(s->db);
-        Stmt u(s->db, "UPDATE worlds SET state=?, trash_path='' WHERE id=?");
-        if (u.ok()) { u.i64(1, WFS_ST_DEAD); u.i64(2, (int64_t)ids[i]); u.step(); }
-        t.commit();
+        Stmt q(s->db, "SELECT path FROM worlds WHERE state<=2");
+        if (!q.ok()) return -EIO;
+        while (q.row()) {
+            String p;
+            dirname_of(q.col_text(0), p);
+            add_unique(parents, p.c_str());
+        }
     }
     // Worlds whose fork never finished: drop the row and the half-built tree (P8).
     {
@@ -1407,26 +1796,93 @@ extern "C" int wfs_gc(wfs_store *s, int64_t retention_secs, wfs_gc_report *out) 
             t.commit();
         }
     }
+    // Half-built snapshots: the row is the only trace of the tmp tree's name.
     String snaps = joinp(s->dir.c_str(), "snapshots");
-    for (size_t i = 0; i < snap_gone.size(); ++i) {
-        String tmp = numbered(snaps.c_str(), 'S', snap_gone[i], WFS_TMP_SUFFIX);
-        wfs::fs_remove_tree(tmp.c_str());
-        String dir = numbered(snaps.c_str(), 'S', snap_gone[i], nullptr);
-        wfs::fs_remove_tree(dir.c_str());
-        rep.snapshots_deleted++;
-        Guard g(s->mu);
-        Txn t(s->db);
-        Stmt d(s->db, "DELETE FROM snapshots WHERE id=? AND state=0");
-        if (d.ok()) { d.i64(1, (int64_t)snap_gone[i]); d.step(); }
-        t.commit();
+    {
+        Vec<wfs_id> snap_gone;
+        {
+            Guard g(s->mu);
+            Stmt q(s->db, "SELECT id FROM snapshots WHERE state=0");
+            if (!q.ok()) return -EIO;
+            while (q.row()) snap_gone.emplace_back((wfs_id)q.col_i64(0));
+        }
+        for (size_t i = 0; i < snap_gone.size(); ++i) {
+            String tmp = numbered(snaps.c_str(), 'S', snap_gone[i], WFS_TMP_SUFFIX);
+            wfs::fs_remove_tree(tmp.c_str());
+            String dir = numbered(snaps.c_str(), 'S', snap_gone[i], nullptr);
+            wfs::fs_remove_tree(dir.c_str());
+            rep.snapshots_deleted++;
+            Guard g(s->mu);
+            Txn t(s->db);
+            Stmt d(s->db, "DELETE FROM snapshots WHERE id=? AND state=0");
+            if (d.ok()) { d.i64(1, (int64_t)snap_gone[i]); d.step(); }
+            t.commit();
+        }
     }
     for (size_t i = 0; i < parents.size(); ++i) rm_tmp_in_dir(parents[i].c_str(), &rep.tmp_removed);
     rm_tmp_in_dir(snaps.c_str(), &rep.tmp_removed);
 
+    // ---- T2.2: reconciliation ----------------------------------------------------------------
+    //
+    // A row whose tree is not on disk. Detection is free and unconditional; acting on it is not,
+    // because a World that was merely moved looks exactly the same from here until someone runs
+    // `world fs verify <its new path>` (P1). So the default is to report, and WFS_GC_RECONCILE
+    // is the operator saying "yes, those are gone".
+    {
+        Vec<wfs_id> dead_snaps, dead_worlds;
+        {
+            Guard g(s->mu);
+            struct stat st;
+            {
+                Stmt q(s->db, "SELECT id, path FROM snapshots WHERE state=1");
+                if (!q.ok()) return -EIO;
+                while (q.row()) {
+                    const char *p = q.col_text(1);
+                    if (*p && ::stat(p, &st) == 0 && S_ISDIR(st.st_mode)) continue;
+                    rep.snapshots_dangling++;
+                    dead_snaps.emplace_back((wfs_id)q.col_i64(0));
+                }
+            }
+            {
+                Stmt q(s->db, "SELECT id, path FROM worlds WHERE state=1");
+                if (!q.ok()) return -EIO;
+                while (q.row()) {
+                    const char *p = q.col_text(1);
+                    if (*p && ::stat(p, &st) == 0 && S_ISDIR(st.st_mode)) continue;
+                    rep.worlds_dangling++;
+                    dead_worlds.emplace_back((wfs_id)q.col_i64(0));
+                }
+            }
+        }
+        if (o.flags & WFS_GC_RECONCILE) {
+            for (size_t i = 0; i < dead_snaps.size(); ++i) {
+                {
+                    Guard g(s->mu);
+                    Txn t(s->db);
+                    Stmt u(s->db, "UPDATE snapshots SET state=?, trash_path='' WHERE id=?");
+                    if (u.ok()) { u.i64(1, WFS_ST_DEAD); u.i64(2, (int64_t)dead_snaps[i]); u.step(); }
+                    t.commit();
+                }
+                // The directory the row named is gone, but <store>/snapshots/S<n> may still hold
+                // the manifest or a stump; take it with the row.
+                String dir = numbered(snaps.c_str(), 'S', dead_snaps[i], nullptr);
+                wfs::fs_remove_tree(dir.c_str());
+                rep.snapshots_reconciled++;
+            }
+            for (size_t i = 0; i < dead_worlds.size(); ++i) {
+                Guard g(s->mu);
+                Txn t(s->db);
+                Stmt u(s->db, "UPDATE worlds SET state=? WHERE id=?");
+                if (u.ok()) { u.i64(1, WFS_ST_DEAD); u.i64(2, (int64_t)dead_worlds[i]); u.step(); }
+                t.commit();
+                rep.worlds_reconciled++;
+            }
+        }
+    }
+
     // T1.5: pool entries whose snapshot is gone or is a different snapshot now, rows whose
-    // filler was killed mid-clone, and trees under <store>/pool that no row claims. Done after
-    // the snapshot sweep above so that a snapshot deleted in this same run takes its pool with
-    // it.
+    // filler was killed mid-clone, and trees under <store>/pool that no row claims. After the
+    // snapshot sweeps above, so a snapshot that died in this same run takes its pool with it.
     wfs::pool_collect(s, &rep.pool_removed);
 
     // <store>/tmp holds the seatbelt profiles `world exec` generates. They are removed when the
@@ -1451,20 +1907,46 @@ extern "C" int wfs_gc(wfs_store *s, int64_t retention_secs, wfs_gc_report *out) 
         }
     }
 
-    // Trash directories with no row at all.
-    String trashdir = joinp(s->dir.c_str(), "trash");
-    if (DIR *d = ::opendir(trashdir.c_str())) {
-        while (struct dirent *e = ::readdir(d)) {
-            if (e->d_name[0] == '.') continue;
-            String p = joinp(trashdir.c_str(), e->d_name);
-            bool wanted = false;
-            for (size_t i = 0; i < keep.size(); ++i)
-                if (!::strcmp(keep[i].c_str(), p.c_str())) { wanted = true; break; }
-            if (wanted) continue;
-            if (wfs::fs_remove_tree(p.c_str()) == 0) rep.trash_orphans++;
-        }
-        ::closedir(d);
+    // ---- the expensive half: the trash -------------------------------------------------------
+    if (o.flags & WFS_GC_NO_TRASH) {
+        TrashView left;
+        if (trash_scan(s, cutoff, left) == 0 && (left.deleting.size() || left.due.size()))
+            rep.work_remains = 1;
+        if (out) *out = rep;
+        return 0;
     }
+    TrashView v;
+    if (int rc = trash_scan(s, cutoff, v)) return rc;
+    uint64_t total = v.deleting.size() + v.due.size();
+    uint64_t done = 0;
+    lock.progress(0, total);
+    // Interrupted trees first: they are already past the point of no return, and leaving them
+    // around is the one state in which the trash lies about what it holds.
+    for (size_t pass = 0; pass < 2; ++pass) {
+        Vec<TrashJob> &jobs = pass == 0 ? v.deleting : v.due;
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            if (done >= budget || (deadline_us && now_us() >= deadline_us)) {
+                rep.work_remains = 1;
+                goto finished;
+            }
+            uint64_t freed = 0;
+            if (gc_delete_one(s, jobs[i], threads, &freed) != 0) continue;
+            rep.entries_freed += freed;
+            if (jobs[i].row == 0) rep.trash_orphans++;
+            else if (jobs[i].is_snapshot) rep.snapshots_deleted++;
+            else rep.worlds_deleted++;
+            ++done;
+            lock.progress(done, total > done ? total - done : 0);
+        }
+    }
+finished:
     if (out) *out = rep;
     return 0;
+}
+
+extern "C" int wfs_gc(wfs_store *s, int64_t retention_secs, wfs_gc_report *out) {
+    wfs_gc_opts o;
+    memset(&o, 0, sizeof o);
+    o.retention_secs = retention_secs;
+    return wfs_gc_ex(s, &o, out);
 }

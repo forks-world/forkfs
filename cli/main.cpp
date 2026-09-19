@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -44,9 +45,17 @@ static void usage(void) {
           "                                   for FSEvents anyway, --full always walks\n"
           "  list                             snapshots and worlds\n"
           "  inspect W<n>|S<n>\n"
-          "  discard W<n> [--now] [--force]   move to the store trash (--now deletes at once)\n"
+          "  discard W<n>|S<n> [--now] [--force]\n"
+          "                                   move to the store trash (--now deletes at once).\n"
+          "                                   A snapshot is refused while an active world or a pool\n"
+          "                                   entry still needs it; --force drains the pool\n"
           "  restore W<n>                     bring a trashed world back to its path\n"
-          "  gc [--retention <days>]          delete expired trash and stray *.wfs-tmp trees\n"
+          "  gc [--retention <days>] [--now] [--status] [--reconcile]\n"
+          "                                   collect half-built trees, stale profiles and dead pool\n"
+          "                                   entries; the trash itself is emptied by a background\n"
+          "                                   worker unless --now says do it here. --status reports\n"
+          "                                   what is waiting and who is on it; --reconcile marks rows\n"
+          "                                   whose tree is gone as dead\n"
           "  pool status                      pre-cloned worlds waiting per snapshot\n"
           "  pool fill S<n> [--count K]       top the pool up to K ready entries (default 2)\n"
           "  pool drain S<n>|--all            delete the pool entries of a snapshot\n"
@@ -301,14 +310,16 @@ static int pool_topup_target(void) {
     return v < 0 ? 0 : v;
 }
 
-static void spawn_pool_fill(wfs_store *s, wfs_id snap, int target) {
-    if (target <= 0 || !g_exe[0]) return;
-    char sid[32], cnt[32], logp[WFS_PATH_MAX];
-    snprintf(sid, sizeof sid, "S%llu", (unsigned long long)snap);
-    snprintf(cnt, sizeof cnt, "%d", target);
-    snprintf(logp, sizeof logp, "%s/logs/pool.log", wfs_store_dir(s));
-    // Double fork: the intermediate child is reaped right here, and the filler itself is
-    // reparented to launchd, so it outlives this command without ever becoming a zombie.
+// The one way this CLI starts background work. Double fork: the intermediate child is reaped
+// right here, and the grandchild is reparented to launchd, so it outlives this command without
+// ever becoming a zombie. stdout and stderr go to <store>/logs/<logname>; stdin to /dev/null.
+// `tail` is the argv after `world --store <dir> fs`, NULL-terminated.
+static void spawn_detached(wfs_store *s, const char *logname, const char *const tail[]) {
+    if (!g_exe[0]) return;
+    char logp[WFS_PATH_MAX];
+    snprintf(logp, sizeof logp, "%s/logs/%s", wfs_store_dir(s), logname);
+    char store[WFS_PATH_MAX];
+    snprintf(store, sizeof store, "%s", wfs_store_dir(s));
     pid_t pid = fork();
     if (pid < 0) return;
     if (pid > 0) { int st; while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {} return; }
@@ -321,9 +332,50 @@ static void spawn_pool_fill(wfs_store *s, wfs_id snap, int target) {
     if (log >= 0) { dup2(log, 1); dup2(log, 2); }
     if (devnull > 2) close(devnull);
     if (log > 2) close(log);
-    execl(g_exe, "world", "--store", wfs_store_dir(s), "fs", "pool", "fill", sid, "--count", cnt,
-          (char *)NULL);
+    char *av[16];
+    int k = 0;
+    av[k++] = (char *)"world";
+    av[k++] = (char *)"--store";
+    av[k++] = store;
+    av[k++] = (char *)"fs";
+    for (int i = 0; tail[i] && k < 15; ++i) av[k++] = (char *)tail[i];
+    av[k] = NULL;
+    execv(g_exe, av);
     _exit(127);
+}
+
+static void spawn_pool_fill(wfs_store *s, wfs_id snap, int target) {
+    if (target <= 0) return;
+    char sid[32], cnt[32];
+    snprintf(sid, sizeof sid, "S%llu", (unsigned long long)snap);
+    snprintf(cnt, sizeof cnt, "%d", target);
+    const char *tail[] = {"pool", "fill", sid, "--count", cnt, NULL};
+    spawn_detached(s, "pool.log", tail);
+}
+
+// ---- T2.1: the background collector ----------------------------------------------------------
+//
+// `discard` is a rename; the unlinking behind it is minutes of work (measured: 525 s for 1000
+// worlds of 10k entries). Anything that leaves due work in the trash therefore starts a worker,
+// unless one is already on it -- the store-level flock in the core would make a second one exit
+// immediately anyway, and that would still cost this command a process start.
+static int gc_work_waiting(wfs_store *s, int64_t retention, int *worker_running) {
+    wfs_trash_stat ts;
+    if (wfs_gc_status(s, retention, &ts) != 0) return 0;
+    if (worker_running) *worker_running = ts.worker_pid ? 1 : 0;
+    return (ts.due + ts.deleting) > 0;
+}
+
+static void spawn_gc_worker(wfs_store *s, int64_t retention) {
+    int running = 0;
+    if (!gc_work_waiting(s, retention, &running) || running) return;
+    // The worker has to inherit the retention this command was given, or a `gc --retention 0`
+    // would hand over work that the worker then decides is not due yet.
+    char days[32];
+    snprintf(days, sizeof days, "%.6f", (double)retention / 86400.0);
+    const char *tail_r[] = {"gc", "--worker", "--retention", days, NULL};
+    const char *tail_d[] = {"gc", "--worker", NULL};
+    spawn_detached(s, "gc.log", retention >= 0 ? tail_r : tail_d);
 }
 
 static int cmd_pool(wfs_store *s, int argc, char **argv) {
@@ -692,16 +744,82 @@ static int cmd_inspect(wfs_store *s, const char *arg) {
     return EX_OK;
 }
 
+// T2.2: `discard S<n>`. The refusal has to name what is holding the snapshot, because "in use"
+// with no name is the least actionable message this CLI could print.
+static int cmd_discard_snapshot(wfs_store *s, wfs_id sid, int force, int64_t retention) {
+    wfs_snapshot_rec sr;
+    int rc = wfs_snapshot_info(s, sid, &sr);
+    if (rc) return fail("discard", rc);
+    if (sr.state == WFS_ST_TRASHED) {
+        char why[96];
+        snprintf(why, sizeof why, "S%llu is already in the trash", (unsigned long long)sid);
+        return refuse(why, "world fs gc --status");
+    }
+    rc = wfs_snapshot_discard(s, sid, force);
+    if (rc == WFS_E_SNAPSHOT_IN_USE) {
+        // Say who. Worlds first (they are the hard refusal), then pool entries.
+        char why[512];
+        size_t n = 0, listed = 0;
+        char names[160] = {0};
+        wfs_world_list(s, 0, NULL, 0, &n);
+        if (n) {
+            wfs_world_rec *v = (wfs_world_rec *)calloc(n, sizeof *v);
+            if (v) {
+                wfs_world_list(s, 0, v, n, &n);
+                for (size_t i = 0; i < n; ++i) {
+                    if (v[i].snapshot_id != sid || v[i].state != WFS_ST_ACTIVE) continue;
+                    if (listed < 6)
+                        snprintf(names + strlen(names), sizeof names - strlen(names), "%sW%llu",
+                                 listed ? " " : "", (unsigned long long)v[i].id);
+                    ++listed;
+                }
+                free(v);
+            }
+        }
+        if (listed) {
+            snprintf(why, sizeof why,
+                     "S%llu is the source of %zu active world(s) (%s%s); discarding it would leave them "
+                     "with nothing to diff or verify against",
+                     (unsigned long long)sid, listed, names, listed > 6 ? " ..." : "");
+            return refuse(why, "discard those worlds first, or `world fs checkpoint` them to a new baseline");
+        }
+        uint64_t ready = 0;
+        wfs_pool_ready(s, sid, &ready);
+        snprintf(why, sizeof why, "S%llu still has %llu pre-cloned pool entr%s",
+                 (unsigned long long)sid, (unsigned long long)ready, ready == 1 ? "y" : "ies");
+        char hint[96];
+        snprintf(hint, sizeof hint, "world fs discard S%llu --force   (drains the pool first)",
+                 (unsigned long long)sid);
+        return refuse(why, hint);
+    }
+    if (rc == -ESTALE) {
+        char why[96];
+        snprintf(why, sizeof why, "S%llu is %s, not active", (unsigned long long)sid, state_name(sr.state));
+        return refuse(why, "world fs list");
+    }
+    if (rc) return fail("discard", rc);
+    printf("S%llu moved to the trash; the collector deletes it after the retention period\n",
+           (unsigned long long)sid);
+    spawn_gc_worker(s, retention);
+    return EX_OK;
+}
+
 static int cmd_discard(wfs_store *s, int argc, char **argv) {
     wfs_id w = 0;
     int now = 0, force = 0;
+    int64_t retention = -1;
+    wfs_ref target = {WFS_K_NONE, 0};
+    // Flags may follow the id, so the whole line is parsed before anything is decided.
     for (int i = 0; i < argc; ++i) {
         if (!strcmp(argv[i], "--now")) now = 1;
         else if (!strcmp(argv[i], "--force")) force = 1;
-        else if (argv[i][0] != '-' && !w) w = parse_world(argv[i]);
+        else if (!strcmp(argv[i], "--retention") && i + 1 < argc) retention = (int64_t)(atof(argv[++i]) * 86400.0);
+        else if (argv[i][0] != '-' && target.kind == WFS_K_NONE) target = parse_ref(argv[i]);
         else usage();
     }
-    if (!w) usage();
+    if (target.kind == WFS_K_SNAPSHOT && target.id) return cmd_discard_snapshot(s, target.id, force, retention);
+    if (target.kind != WFS_K_WORLD || !target.id) usage();
+    w = target.id;
     wfs_world_rec r;
     if (wfs_world_info(s, w, &r) == 0 && r.state == WFS_ST_ACTIVE && !r.present) {
         char why[WFS_PATH_MAX + 64];
@@ -714,8 +832,13 @@ static int cmd_discard(wfs_store *s, int argc, char **argv) {
     if (rc == WFS_E_UNREGISTERED) return explain_path(s, r.path, rc, "discard");
     if (rc) return fail("discard", rc);
     if (now) printf("W%llu deleted\n", (unsigned long long)w);
-    else printf("W%llu moved to the trash; `world fs restore W%llu` brings it back\n",
-                (unsigned long long)w, (unsigned long long)w);
+    else {
+        printf("W%llu moved to the trash; `world fs restore W%llu` brings it back\n",
+               (unsigned long long)w, (unsigned long long)w);
+        // T2.1: the rename is done, the unlinking is not. If anything in the trash is already
+        // past its retention, start the collector now rather than at the next `gc`.
+        spawn_gc_worker(s, retention);
+    }
     return EX_OK;
 }
 
@@ -736,25 +859,196 @@ static int cmd_restore(wfs_store *s, const char *arg) {
         snprintf(why, sizeof why, "W%llu is %s, not trashed", (unsigned long long)w, state_name(r.state));
         return refuse(why, "world fs list");
     }
+    if (rc == WFS_E_TRASH_DELETING) {
+        char why[160];
+        snprintf(why, sizeof why,
+                 "W%llu is already being deleted by the collector; what is left of it is not a world",
+                 (unsigned long long)w);
+        return refuse(why, "world fs fork --from <a snapshot>   (and `world fs gc --status` to watch)");
+    }
+    if (rc == WFS_E_SOURCE_GONE) {
+        char why[192];
+        snprintf(why, sizeof why,
+                 "W%llu was forked from S%llu, which has since been discarded: restoring it would "
+                 "produce a world with no baseline to diff or verify against",
+                 (unsigned long long)w, (unsigned long long)r.snapshot_id);
+        return refuse(why, "world fs list   (the snapshot is gone; fork from a live one instead)");
+    }
     if (rc) return fail("restore", rc);
     printf("W%llu restored to %s\n", (unsigned long long)w, r.path);
     return EX_OK;
 }
 
+// How much one wake of the background worker does before it exits. Both limits apply, whichever
+// comes first; a wake that runs out of budget hands over to a fresh successor, so the trash
+// always drains even if nobody runs another command.
+static int gc_batch_entries(void) {
+    const char *e = getenv("WORLD_GC_BATCH");
+    int v = (e && *e) ? atoi(e) : 64;
+    return v < 1 ? 1 : v;
+}
+static int gc_batch_secs(void) {
+    const char *e = getenv("WORLD_GC_BATCH_SECS");
+    int v = (e && *e) ? atoi(e) : 2;
+    return v < 1 ? 1 : v;
+}
+// P16, and the knob that actually buys it. Measured on 27.0 (docs/TASKS.md T2.1): a collector
+// unlinking flat out costs a concurrent `fork` +51..57% at 3-4 threads and +15..17% even at one
+// thread -- the floor is APFS metadata contention, not CPU and not disk bandwidth, which is why
+// setiopolicy_np() changes nothing. What does work is not running all the time: 2 s of work
+// followed by a 2 s gap halves the contention window and brings the foreground cost to ~5%,
+// at the price of a drain that takes about twice as long. It is background work; it can wait.
+static long gc_pause_ms(void) {
+    const char *e = getenv("WORLD_GC_PAUSE_MS");
+    long v = (e && *e) ? atol(e) : 2000;
+    return v < 0 ? 0 : v;
+}
+
+static void gc_log_line(const wfs_gc_report *rep, double secs) {
+    char t[32];
+    fmt_time(t, sizeof t, (int64_t)time(NULL));
+    // CPU as well as wall: the whole point of the worker is that the machine is doing this work
+    // somewhere else, and "somewhere else" still costs something. Summing this column over
+    // <store>/logs/gc.log is how a drain's total cost gets measured.
+    struct rusage ru;
+    double cpu = 0;
+    if (getrusage(RUSAGE_SELF, &ru) == 0)
+        cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
+    printf("%s  gc worker: %llu worlds, %llu snapshots, %llu orphans, %llu entries unlinked in "
+           "%.2f s wall / %.2f s cpu%s\n",
+           t, (unsigned long long)rep->worlds_deleted, (unsigned long long)rep->snapshots_deleted,
+           (unsigned long long)rep->trash_orphans, (unsigned long long)rep->entries_freed, secs, cpu,
+           rep->work_remains ? "  (work remains, handing over)" : "  (trash empty)");
+    fflush(stdout);
+}
+
+// How many unlink threads. 4 is the APFS metadata sweet spot the clone walk found; deletion is
+// measured separately in docs/TASKS.md (T2.1) because more threads there buy less and cost the
+// foreground more.
+static int gc_threads(void) {
+    const char *e = getenv("WORLD_GC_THREADS");
+    int v = (e && *e) ? atoi(e) : 4;
+    return v < 1 ? 1 : (v > 16 ? 16 : v);
+}
+
+// P16, the part that actually moves the needle: the collector asks the kernel to put it behind
+// everybody else on the disk. IOPOL_THROTTLE is what Spotlight and Time Machine use -- a
+// throttled process yields to unthrottled I/O and runs at close to full speed when the machine
+// is idle, which is exactly the bargain a trash collector wants.
+static void gc_lower_priority(void) {
+#ifdef __APPLE__
+    const char *e = getenv("WORLD_GC_IOPOL");
+    const char *want = (e && *e) ? e : "throttle";
+    int pol = -1;
+    if (!strcmp(want, "throttle")) pol = IOPOL_THROTTLE;
+    else if (!strcmp(want, "utility")) pol = IOPOL_UTILITY;
+    else if (!strcmp(want, "standard")) pol = IOPOL_STANDARD;
+    if (pol >= 0) setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, pol);
+    if (strcmp(want, "normal") != 0) setpriority(PRIO_PROCESS, 0, 5);
+#endif
+}
+
+// One wake of the detached worker: take the store's gc lock, delete a bounded batch, exit. If
+// the batch limit cut it short, start a successor -- that is the whole scheduler.
+static int cmd_gc_worker(wfs_store *s, int64_t retention, int reconcile) {
+    gc_lower_priority();
+    long pause = gc_pause_ms();
+    if (pause > 0) { struct timespec ts = {pause / 1000, (pause % 1000) * 1000000L}; nanosleep(&ts, NULL); }
+    wfs_gc_opts o;
+    memset(&o, 0, sizeof o);
+    o.retention_secs = retention;
+    o.threads = gc_threads();
+    o.max_entries = (uint64_t)gc_batch_entries();
+    o.max_secs = gc_batch_secs();
+    o.flags = WFS_GC_BACKGROUND | (reconcile ? WFS_GC_RECONCILE : 0);
+    wfs_gc_report rep;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rc = wfs_gc_ex(s, &o, &rep);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (rc == WFS_E_GC_BUSY) return EX_OK;   // someone else is on it; nothing to say
+    if (rc) return fail("gc worker", rc);
+    gc_log_line(&rep, (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
+    if (rep.work_remains) {
+        char days[32];
+        snprintf(days, sizeof days, "%.6f", (double)retention / 86400.0);
+        const char *tail_r[] = {"gc", "--worker", "--retention", days, NULL};
+        const char *tail_d[] = {"gc", "--worker", NULL};
+        spawn_detached(s, "gc.log", retention >= 0 ? tail_r : tail_d);
+    }
+    return EX_OK;
+}
+
+static int cmd_gc_status(wfs_store *s, int64_t retention) {
+    wfs_trash_stat ts;
+    int rc = wfs_gc_status(s, retention, &ts);
+    if (rc) return fail("gc --status", rc);
+    char est[32], freeb[32];
+    fmt_bytes(est, sizeof est, ts.bytes_estimate);
+    fmt_bytes(freeb, sizeof freeb, ts.volume_free_bytes);
+    printf("trash:     %llu entries (%llu worlds, %llu snapshots), %llu due, %llu being deleted\n"
+           "contents:  %llu tree entries, ~%s of clone metadata (df cannot see block sharing)\n"
+           "volume:    %s free\n",
+           (unsigned long long)ts.entries, (unsigned long long)ts.worlds,
+           (unsigned long long)ts.snapshots, (unsigned long long)ts.due,
+           (unsigned long long)ts.deleting, (unsigned long long)ts.tree_entries, est, freeb);
+    if (ts.worker_pid) {
+        char t[32];
+        fmt_time(t, sizeof t, ts.worker_started_at);
+        printf("worker:    pid %lld since %s, %llu done / %llu left in this batch\n",
+               (long long)ts.worker_pid, t, (unsigned long long)ts.worker_done,
+               (unsigned long long)ts.worker_remaining);
+    } else {
+        printf("worker:    none%s\n", (ts.due + ts.deleting) ? " (work waiting: `world fs gc` starts one)" : "");
+    }
+    return EX_OK;
+}
+
 static int cmd_gc(wfs_store *s, int argc, char **argv) {
     int64_t retention = -1;
+    int now = 0, status = 0, worker = 0, reconcile = 0;
     for (int i = 0; i < argc; ++i) {
         if (!strcmp(argv[i], "--retention") && i + 1 < argc) retention = (int64_t)(atof(argv[++i]) * 86400.0);
+        else if (!strcmp(argv[i], "--now")) now = 1;
+        else if (!strcmp(argv[i], "--status")) status = 1;
+        else if (!strcmp(argv[i], "--worker")) worker = 1;
+        else if (!strcmp(argv[i], "--reconcile")) reconcile = 1;
         else usage();
     }
+    if (status) return cmd_gc_status(s, retention);
+    if (worker) return cmd_gc_worker(s, retention, reconcile);
+
+    wfs_gc_opts o;
+    memset(&o, 0, sizeof o);
+    o.retention_secs = retention;
+    o.threads = gc_threads();
+    // Without --now the trash is left to the worker: unlinking it is minutes of work and no
+    // interactive command should sit on that (T2.1, P16). Everything cheap still happens here.
+    o.flags = (now ? 0 : WFS_GC_NO_TRASH) | (reconcile ? WFS_GC_RECONCILE : 0);
     wfs_gc_report rep;
-    int rc = wfs_gc(s, retention, &rep);
+    int rc = wfs_gc_ex(s, &o, &rep);
     if (rc) return fail("gc", rc);
-    printf("gc: %llu worlds deleted, %llu half-built snapshots, %llu stray %s trees, %llu orphan trash dirs,"
+    printf("gc: %llu worlds deleted, %llu snapshots deleted, %llu stray %s trees, %llu orphan trash dirs,"
            " %llu pool entries\n",
            (unsigned long long)rep.worlds_deleted, (unsigned long long)rep.snapshots_deleted,
            (unsigned long long)rep.tmp_removed, WFS_TMP_SUFFIX, (unsigned long long)rep.trash_orphans,
            (unsigned long long)rep.pool_removed);
+    if (rep.snapshots_dangling || rep.worlds_dangling) {
+        if (reconcile)
+            printf("reconciled: %llu snapshots and %llu worlds whose tree is gone are now DEAD\n",
+                   (unsigned long long)rep.snapshots_reconciled, (unsigned long long)rep.worlds_reconciled);
+        else
+            fprintf(stderr,
+                    "world: note: %llu snapshot(s) and %llu world(s) are registered but their tree is\n"
+                    "world:       not on disk. `world fs gc --reconcile` marks them dead. A world that was\n"
+                    "world:       only moved looks the same from here: `world fs verify <its new path>`\n"
+                    "world:       repairs that one instead (P1).\n",
+                    (unsigned long long)rep.snapshots_dangling, (unsigned long long)rep.worlds_dangling);
+    }
+    if (!now && rep.work_remains) {
+        spawn_gc_worker(s, retention);
+        printf("gc: the trash is being emptied in the background (`world fs gc --status`)\n");
+    }
     return EX_OK;
 }
 
@@ -767,14 +1061,29 @@ static int cmd_status(wfs_store *s) {
     fmt_bytes(totalb, sizeof totalb, st.volume_total_bytes);
     fmt_bytes(meta, sizeof meta, st.metadata_estimate_bytes);
     printf("store:     %s\nschema:    %d (store %s)\n"
-           "snapshots: %llu (%llu entries)\nworlds:    %llu active, %llu trashed, %llu dead (%llu entries)\n"
+           "snapshots: %llu (%llu entries), %llu trashed\n"
+           "worlds:    %llu active, %llu trashed, %llu dead (%llu entries)\n"
            "pool:      %llu ready (%llu entries)\n"
            "volume:    %s free of %s\nclone cost: ~%s of metadata for those entries (df cannot see block sharing)\n",
            st.dir, st.schema, st.store_id, (unsigned long long)st.snapshots,
-           (unsigned long long)st.snapshot_entries, (unsigned long long)st.worlds_active,
+           (unsigned long long)st.snapshot_entries, (unsigned long long)st.snapshots_trashed,
+           (unsigned long long)st.worlds_active,
            (unsigned long long)st.worlds_trashed, (unsigned long long)st.worlds_dead,
            (unsigned long long)st.world_entries, (unsigned long long)st.pool_ready,
            (unsigned long long)st.pool_entries, freeb, totalb, meta);
+    // T2.1/T2.2: what the collector still owes, and rows whose tree is not there any more.
+    wfs_trash_stat ts;
+    if (wfs_gc_status(s, -1, &ts) == 0 && (ts.entries || ts.worker_pid)) {
+        char est[32];
+        fmt_bytes(est, sizeof est, ts.bytes_estimate);
+        printf("trash:     %llu entries, %llu due, %llu being deleted (~%s), worker %s\n",
+               (unsigned long long)ts.entries, (unsigned long long)ts.due,
+               (unsigned long long)ts.deleting, est, ts.worker_pid ? "running" : "idle");
+    }
+    if (st.snapshots_dangling || st.worlds_dangling)
+        printf("dangling:  %llu snapshot(s) and %llu world(s) registered but not on disk"
+               "  (`world fs gc --reconcile`, or `world fs verify <new path>` for a moved world)\n",
+               (unsigned long long)st.snapshots_dangling, (unsigned long long)st.worlds_dangling);
     return EX_OK;
 }
 
@@ -1146,6 +1455,44 @@ int main(int argc, char **argv) {
         wfs_id w = parse_world(args[0]);
         wfs_world_rec r;
         if ((rc = wfs_world_info(s, w, &r))) { wfs_store_close(s); return fail("mount", rc); }
+        // T2.3. Two facts decide everything here:
+        //   * `-o` options do not reach an FSKit module on macOS 27, so the extension cannot be
+        //     told which store to use on the command line. It reads the store path out of the
+        //     `.world` marker in the mount source root instead (wfs_marker_store_path), which is
+        //     why a fork must have written one.
+        //   * the extension is sandboxed (pkd refuses a non-sandboxed appex outright), so it can
+        //     reach its own container and the security-scoped mount source and nothing else.
+        //     ~/Library/Application Support -- the CLI's default store -- is denied.
+        // So a mount only works when the store is inside the extension's container. Saying that
+        // here is the difference between a fix and "mount: POSIX error 1009".
+        {
+            const char *store = wfs_store_dir(s);
+            const char *home = getenv("HOME");
+            char container[WFS_PATH_MAX], want[WFS_PATH_MAX];
+            snprintf(container, sizeof container, "%s/Library/Containers/%s/Data",
+                     home ? home : "", WFS_EXTENSION_BUNDLE_ID);
+            snprintf(want, sizeof want, "%s/Library/Application Support/World/fs", container);
+            size_t cn = strlen(container);
+            if (strncmp(store, container, cn) != 0 || (store[cn] != 0 && store[cn] != '/')) {
+                char why[WFS_PATH_MAX + 256], hint[WFS_PATH_MAX + 64];
+                snprintf(why, sizeof why,
+                         "the FSKit extension is sandboxed and cannot read the store at %s:\n"
+                         "world:   it only has access to its own container, and mount options do not\n"
+                         "world:   reach an FSKit module on macOS 27, so a mount needs the store to live\n"
+                         "world:   somewhere the extension can open", store);
+                snprintf(hint, sizeof hint, "WORLD_STORE='%s' world fs init <dir> && ... fs mount W<n> <mnt>", want);
+                wfs_store_close(s);
+                return refuse(why, hint);
+            }
+            // The marker is how the path gets there; a world forked by an older build has none.
+            char sp[WFS_PATH_MAX] = {0};
+            int mrc = wfs_marker_store_path(r.path, sp, sizeof sp);
+            if (mrc != 0 || strcmp(sp, store) != 0)
+                fprintf(stderr,
+                        "world: note: %s/.world does not name this store, so the extension will fall\n"
+                        "world:       back to its container default. Re-fork the world to refresh it.\n",
+                        r.path);
+        }
         char opt[64];
         mkdir(args[1], 0755);
         wfs_store_close(s);

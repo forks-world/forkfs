@@ -47,6 +47,10 @@ extern "C" {
 #define WFS_GATE_OPEN 0500
 /* Suffix of a half-built tree; removed by wfs_gc (P8). */
 #define WFS_TMP_SUFFIX ".wfs-tmp"
+/* T2.1: a trash entry the collector has started to unlink. The rename to this name is the FIRST
+ * thing the deleter does, so a worker that is killed half-way through leaves a tree that is
+ * visibly not restorable instead of one that looks intact. wfs_world_restore() refuses it. */
+#define WFS_DELETING_SUFFIX ".deleting"
 
 typedef struct wfs_store wfs_store; /* metadata store for many snapshots and worlds */
 
@@ -88,7 +92,11 @@ enum {
     WFS_E_FOREIGN_STORE = -1009,  /* marker belongs to a different store */
     WFS_E_WORLD_MISSING = -1010,  /* the recorded path no longer holds this world */
     WFS_E_SOURCE_GONE = -1011,    /* the snapshot this world was forked from is no longer there */
-    WFS_E_POOL_BUSY = -1012       /* T1.5: another `pool fill` holds the store's pool lock */
+    WFS_E_POOL_BUSY = -1012,      /* T1.5: another `pool fill` holds the store's pool lock */
+    WFS_E_TRASH_DELETING = -1013, /* T2.1: the gc worker has begun unlinking this trash entry */
+    WFS_E_SNAPSHOT_IN_USE = -1014,/* T2.2: an ACTIVE world (or a pool entry) still needs it */
+    WFS_E_GC_BUSY = -1015,        /* T2.1: another gc worker holds <store>/locks/gc.lock */
+    WFS_E_STORE_UNREACHABLE = -1016 /* T2.3: this store cannot be opened from where we are */
 };
 
 /* Human-readable text for a negative errno or a WFS_E_* code. Never NULL. */
@@ -155,6 +163,11 @@ typedef struct wfs_store_stat {
     uint64_t metadata_estimate_bytes;
     uint64_t pool_ready;    /* T1.5: pre-cloned worlds waiting to be handed out */
     uint64_t pool_entries;  /* sum of their entry counts */
+    /* T2.2 reconciliation, computed by one stat(2) per row: rows whose tree is not there any
+     * more. `gc --reconcile` is what turns them into DEAD rows. */
+    uint64_t snapshots_dangling;
+    uint64_t worlds_dangling;
+    uint64_t snapshots_trashed; /* T2.2: snapshots waiting in the trash */
 } wfs_store_stat;
 int wfs_store_status(wfs_store *s, wfs_store_stat *out);
 
@@ -175,6 +188,7 @@ typedef struct wfs_snapshot_rec {
     int state;                   /* wfs_state */
     int hard;                    /* 1 = per-entry UF_IMMUTABLE, 0 = gate directory (default) */
     uint32_t root_mode;          /* the source root's own mode, restored on the fork's clone */
+    int64_t trashed_at;          /* T2.2: unix seconds, non-zero once discarded */
 } wfs_snapshot_rec;
 
 typedef struct wfs_snapshot_opts {
@@ -359,6 +373,21 @@ typedef struct wfs_identity {
     uint64_t dev, ino;
 } wfs_identity;
 
+/* T2.3: the store path recorded in <world_root>/.world, read without opening any store.
+ *
+ * This exists for the sandboxed FSKit appex. NSApplicationSupportDirectory resolves inside its
+ * container, so the extension's idea of "the default store" is
+ * ~/Library/Containers/world.forks.fs.extension/Data/Library/Application Support/World/fs while
+ * the CLI's is ~/Library/Application Support/World/fs -- and `mount -o` options do not reach an
+ * FSKit module on macOS 27. The marker file in the mount source root does reach it, because that
+ * root is exactly the resource the extension is handed, so the marker is where the store's
+ * location travels.
+ *
+ * Returns 0 and writes the path, WFS_E_NOT_A_WORLD when there is no marker, WFS_E_SCHEMA when it
+ * was written by a different schema, or -ENOENT when the marker carries no store path (every
+ * marker written before T2.3). */
+int wfs_marker_store_path(const char *world_root, char *buf, size_t cap);
+
 /* P1/P2. On a registered-but-moved world the store row is updated to `path` before returning.
  * Returns WFS_E_NOT_A_WORLD, WFS_E_UNREGISTERED or WFS_E_FOREIGN_STORE as appropriate; the
  * report is filled in either way. */
@@ -485,15 +514,102 @@ int wfs_path_check(wfs_store *s, const char *path, int for_target);
 
 typedef struct wfs_gc_report {
     uint64_t worlds_deleted;    /* trashed past the retention period */
-    uint64_t snapshots_deleted; /* half-built snapshots */
+    uint64_t snapshots_deleted; /* half-built snapshots, plus T2.2 trashed ones past retention */
     uint64_t tmp_removed;       /* stray *.wfs-tmp trees (P8) */
     uint64_t trash_orphans;     /* trash directories with no row */
     uint64_t pool_removed;      /* T1.5: pool entries of dead snapshots, half-built or orphaned */
-    uint64_t entries_freed;
+    uint64_t entries_freed;     /* T2.1: directory entries actually unlinked */
+    /* T2.2 reconciliation. The `*_dangling` counters are always filled in (detection is free:
+     * one stat per row); the `*_reconciled` ones only when WFS_GC_RECONCILE was asked for. */
+    uint64_t snapshots_dangling, worlds_dangling;
+    uint64_t snapshots_reconciled, worlds_reconciled;
+    /* T2.1: the batch limit was reached and trash entries are still waiting. A caller that can
+     * spawn a worker (the CLI does) should spawn one. */
+    int work_remains;
 } wfs_gc_report;
 
-/* retention_secs < 0 uses the default (7 days). */
+/* retention_secs < 0 uses the default (7 days). Synchronous and complete: every due trash entry
+ * is unlinked before this returns. `world fs gc --now`. */
 int wfs_gc(wfs_store *s, int64_t retention_secs, wfs_gc_report *out);
+
+/* ---- T2.1: incremental, background gc -------------------------------------------------------
+ *
+ * `discard` is O(1) by construction -- it renames a world into <store>/trash and nothing more --
+ * but the physical deletion behind it is the most expensive thing this system does: measured,
+ * 1000 worlds of 10k entries are 10.4M unlink(2) calls, ~50 us each, 525 s in total, which is
+ * 4.6x what creating them cost (docs/M1_RESULTS.md §3). That work must not sit on a command's
+ * critical path and must not fight the foreground for the disk (P16).
+ *
+ * So: the trash is drained by a detached worker (`world fs gc --worker`, spawned exactly the way
+ * `fork` spawns a pool filler) that holds a non-blocking store-level flock on
+ * <store>/locks/gc.lock, so at most one worker per store ever runs. It works in bounded batches
+ * -- at most `max_entries` trash entries or `max_secs` seconds per wake -- writes its progress
+ * into the lock file, logs to <store>/logs/gc.log, and exits. Anything that creates work
+ * (`discard`, `gc`, `fork`) spawns one if there is work and nobody is on it.
+ *
+ * Crash safety: before a single unlink, the trash entry is renamed to <name>.deleting. A worker
+ * killed mid-tree therefore leaves a tree that is visibly half-gone rather than one that looks
+ * restorable, wfs_world_restore() refuses it with WFS_E_TRASH_DELETING, and the next wake
+ * finishes it -- *.deleting trees are collected first, before and regardless of retention.
+ */
+
+enum {
+    WFS_GC_RECONCILE = 1 << 0, /* T2.2: mark dangling snapshot/world rows DEAD, not just report */
+    WFS_GC_BACKGROUND = 1 << 1,/* take <store>/locks/gc.lock; WFS_E_GC_BUSY when another has it */
+    /* Do the cheap half only and leave the trash to the worker. This is what plain `world fs gc`
+     * asks for: the half-built trees, the stale profiles, the dead pool entries and the
+     * reconciliation report are all a handful of syscalls, while the trash is minutes. */
+    WFS_GC_NO_TRASH = 1 << 2
+};
+
+typedef struct wfs_gc_opts {
+    int64_t retention_secs;  /* < 0 = the default, 7 days */
+    uint64_t max_entries;    /* trash entries per wake; 0 = no limit */
+    int64_t max_secs;        /* wall seconds per wake; 0 = no limit */
+    int flags;               /* WFS_GC_* */
+    int threads;             /* unlink workers; 0 = 4, the measured APFS sweet spot */
+} wfs_gc_opts;
+
+/* The one implementation; wfs_gc() is this with no limits and no flags. opts may be NULL. */
+int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *out);
+
+typedef struct wfs_trash_stat {
+    uint64_t entries;          /* directories sitting in <store>/trash right now */
+    uint64_t deleting;         /* of those, ones already renamed *.deleting */
+    uint64_t due;              /* of those, ones past the retention period */
+    uint64_t worlds, snapshots;/* trashed rows, by kind */
+    uint64_t tree_entries;     /* recorded entry counts of what is in there */
+    /* Physical bytes are an estimate for the same reason `wfs_store_status` estimates them:
+     * du(1) counts cloned blocks that are shared with other worlds, df(1) only moves when the
+     * last reference goes. This is tree_entries x the measured 308 B/entry clone metadata cost,
+     * alongside the volume's real df numbers so an operator can see both. */
+    uint64_t bytes_estimate;
+    uint64_t volume_free_bytes, volume_total_bytes;
+    /* The worker, from <store>/locks/gc.lock. pid is 0 when nobody is running. */
+    int64_t worker_pid, worker_started_at;
+    uint64_t worker_done, worker_remaining; /* trash entries finished / left, as it last wrote */
+} wfs_trash_stat;
+
+/* `world fs gc --status`. Never blocks and never spawns anything. */
+int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_stat *out);
+
+/* ---- T2.2: discarding a snapshot ------------------------------------------------------------
+ *
+ * A snapshot is the baseline `diff` and `verify` compare against, so it is never taken away from
+ * a world that still needs it: an ACTIVE world whose snapshot_id is this one makes the discard a
+ * WFS_E_SNAPSHOT_IN_USE refusal. `force` drains the snapshot's pool entries (they are only
+ * pre-made clones, nothing is lost) but still refuses while ACTIVE worlds remain -- never orphan
+ * a world's source.
+ *
+ * TRASHED worlds are not a reason to refuse; they are already on their way out. Restoring one
+ * afterwards is what fails, with WFS_E_SOURCE_GONE, because bringing a world back to life
+ * without a baseline would produce a world that cannot be diffed or verified.
+ *
+ * The discard itself is P4, the same path a world takes: <store>/snapshots/S<n> is renamed into
+ * <store>/trash, the row becomes TRASHED, and the background collector unlinks it once the
+ * retention period is up -- reopening the gate directory (0700) on its way in, since a 0000 root
+ * cannot even be listed. */
+int wfs_snapshot_discard(wfs_store *s, wfs_id id, int force);
 
 #ifdef __cplusplus
 }

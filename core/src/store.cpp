@@ -4,6 +4,7 @@
 
 #include <fcntl.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <sys/random.h>
 #include <unistd.h>
 
@@ -38,7 +39,10 @@ const char *kSchema =
     "  hardlinks INTEGER NOT NULL DEFAULT 0,"
     "  state INTEGER NOT NULL DEFAULT 0,"
     "  hard INTEGER NOT NULL DEFAULT 0,"
-    "  root_mode INTEGER NOT NULL DEFAULT 0);"
+    "  root_mode INTEGER NOT NULL DEFAULT 0,"
+    /* T2.2: snapshots go through the same trash as worlds do (P4). */
+    "  trash_path TEXT NOT NULL DEFAULT '',"
+    "  trashed_at INTEGER NOT NULL DEFAULT 0);"
     "CREATE TABLE IF NOT EXISTS worlds("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  kind INTEGER NOT NULL DEFAULT 1,"
@@ -83,7 +87,18 @@ const char *kSchema =
 const char *kMigrations[] = {
     "ALTER TABLE snapshots ADD COLUMN hard INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE snapshots ADD COLUMN root_mode INTEGER NOT NULL DEFAULT 0",
+    // T2.2
+    "ALTER TABLE snapshots ADD COLUMN trash_path TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE snapshots ADD COLUMN trashed_at INTEGER NOT NULL DEFAULT 0",
 };
+
+// Additive revision of schema v2. `PRAGMA user_version` carries SCHEMA*100 + REV, so a store
+// written before a column was added still gets the migrations run exactly once: the old code
+// compared user_version against the schema number alone, which meant a store already stamped
+// with 2 never saw a later ALTER TABLE. VERSION (and therefore P13) is untouched -- an older
+// core opens such a store and simply does not use the new columns.
+const int kSchemaRev = 1;
+inline int user_version_want(void) { return WFS_STORE_SCHEMA * 100 + kSchemaRev; }
 
 void hex_id(char *out, size_t n) { // n = 33 for 32 hex digits + NUL
     unsigned char raw[16];
@@ -161,6 +176,10 @@ extern "C" const char *wfs_strerror(int rc) {
     case WFS_E_WORLD_MISSING: return "world is not at its recorded path";
     case WFS_E_SOURCE_GONE: return "the snapshot this world was forked from is gone";
     case WFS_E_POOL_BUSY: return "another pool fill is running";
+    case WFS_E_TRASH_DELETING: return "this trash entry is already being deleted";
+    case WFS_E_SNAPSHOT_IN_USE: return "a live world still needs this snapshot";
+    case WFS_E_GC_BUSY: return "another gc worker is running";
+    case WFS_E_STORE_UNREACHABLE: return "that store cannot be opened from here";
     default: return ::strerror(rc < 0 ? -rc : rc);
     }
 }
@@ -215,11 +234,11 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
         Stmt q(s->db, "PRAGMA user_version");
         if (q.ok() && q.row()) user_version = (int)q.col_i64(0);
     }
-    if (user_version != WFS_STORE_SCHEMA) {
+    if (user_version != user_version_want()) {
         if (sqlite3_exec(s->db, kSchema, nullptr, nullptr, nullptr) != SQLITE_OK) { wfs_store_close(s); return -EIO; }
         for (const char *m : kMigrations) sqlite3_exec(s->db, m, nullptr, nullptr, nullptr);
         char pragma[64];
-        ::snprintf(pragma, sizeof pragma, "PRAGMA user_version=%d", WFS_STORE_SCHEMA);
+        ::snprintf(pragma, sizeof pragma, "PRAGMA user_version=%d", user_version_want());
         sqlite3_exec(s->db, pragma, nullptr, nullptr, nullptr);
     }
     if (meta_get(s->db, "store_id", s->store_id) != 0) {
@@ -269,6 +288,32 @@ extern "C" int wfs_store_status(wfs_store *s, wfs_store_stat *out) {
         if (q.ok() && q.row()) {
             out->pool_ready = (uint64_t)q.col_i64(0);
             out->pool_entries = (uint64_t)q.col_i64(1);
+        }
+    }
+    // T2.2 reconciliation: a row whose tree is not there. One stat(2) per row, and a store has
+    // tens of snapshots and (measured) a thousand worlds at most, so `status` stays a 7 ms
+    // command. A world that was merely moved shows up here too until someone runs
+    // `world fs verify <its new path>`; that is why `gc --reconcile` is explicit.
+    {
+        Stmt q(s->db, "SELECT path FROM snapshots WHERE state=?");
+        if (q.ok()) {
+            q.i64(1, WFS_ST_ACTIVE);
+            struct stat st;
+            while (q.row())
+                if (::stat(q.col_text(0), &st) != 0 || !S_ISDIR(st.st_mode)) out->snapshots_dangling++;
+        }
+    }
+    {
+        Stmt q(s->db, "SELECT COUNT(*) FROM snapshots WHERE state=?");
+        if (q.ok()) { q.i64(1, WFS_ST_TRASHED); if (q.row()) out->snapshots_trashed = (uint64_t)q.col_i64(0); }
+    }
+    {
+        Stmt q(s->db, "SELECT path, dir_ino FROM worlds WHERE state=?");
+        if (q.ok()) {
+            q.i64(1, WFS_ST_ACTIVE);
+            struct stat st;
+            while (q.row())
+                if (::stat(q.col_text(0), &st) != 0 || !S_ISDIR(st.st_mode)) out->worlds_dangling++;
         }
     }
     uint64_t avail = 0, total = 0;

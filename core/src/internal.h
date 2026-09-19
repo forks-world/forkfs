@@ -115,6 +115,11 @@ int fs_count_entries(const char *root, TreeStats &out);
 int fs_scan_tree(const char *root, TreeStats *stats, Manifest *manifest);
 int fs_free_space(const char *path, uint64_t *avail, uint64_t *total);
 int fs_remove_tree(const char *root);   // unprotects first on Darwin
+// T2.1: the same 4-thread walker, used to unlink. Files are removed in the parallel phase,
+// directories in the serial deepest-first tail. `entries` is incremented by what was actually
+// removed (the root itself is not counted). Any error at all falls back to fs_remove_tree, so a
+// non-zero return means even that could not finish the job.
+int fs_remove_tree_parallel(const char *root, int threads, uint64_t *entries);
 
 // ---- Darwin-only primitives (stubs elsewhere) --------------------------------------------
 
