@@ -630,6 +630,15 @@ int rm_entry(void *ctx, const char *path, const char *rel, const struct stat &st
             if (::rmdir(path) == 0 || errno == ENOENT) { if (*rel) bump(c->entries); return 0; }
             e = errno;
         }
+        // Still not empty: the walk unlinks entries while the same DIR stream is being read,
+        // and POSIX leaves it unspecified whether readdir(3) returns an entry removed after
+        // opendir(3). (Measured on APFS: 4 x 10 401 entries, none missed -- fts(3) and rm -rf
+        // rely on the same behaviour.) If it ever does happen, finish this one directory the
+        // certain way rather than failing the whole tree.
+        if (e == ENOTEMPTY) {
+            if (rm_rec(path) == 0) { if (*rel) bump(c->entries); return 0; }
+            e = ENOTEMPTY;
+        }
         return -e;
     }
     if (::unlink(path) == 0 || errno == ENOENT) { bump(c->entries); return 0; }

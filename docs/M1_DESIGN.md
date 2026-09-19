@@ -21,7 +21,7 @@ DAG              SQLite:谁从谁 fork、来源快照、fork 时的 FSEvents id
 | `fork [--from W\|S]` | 从 pool 领预克隆的 World(快照来源)或当场 `clonefile(dir)`(活 World 来源) | pool 命中 <10ms;当场 0.07s/10k、0.37s/50k |
 | `checkpoint W` | `clonefile(W.root)` → S<n+1>,W 继续可写 | 同上 |
 | `diff W` | FSEvents(since fork id)候选 → 与来源快照 stat/内容比对;Dropped/MustScanSubDirs 时全树 walk | O(changes);全扫 0.8s/50k |
-| `discard W` | rename 到 trash,保留期后 GC 真删 | 毫秒 |
+| `discard W` / `discard S`(T2.2) | rename 到 trash,保留期后由后台 collector 真删(T2.1) | rename 毫秒级;真删 4 线程 ~37k 条目/s |
 
 数据面零介入:World 里所有读写都是原生 APFS。
 
@@ -33,10 +33,15 @@ DAG              SQLite:谁从谁 fork、来源快照、fork 时的 FSEvents id
 ├── metadata.db                  SQLite WAL
 ├── snapshots/S<n>/root/         gate 保护:根目录 0000(`--hard` 时改为逐条目 uchg)
 ├── locks/W<n>.lock              `world exec` 的锁(pid + flock,P5)
+├── locks/pool.lock              后台 filler 的 store 级锁(T1.5)
+├── locks/gc.lock                后台 collector 的 store 级锁 + 进度(pid/start/done/remaining;T2.1)
 ├── tmp/                         `world exec` 生成的 seatbelt profile
 ├── pool/S<n>/<uuid>/            预克隆的 World,尚未分配(无 marker、无 worlds 行;T1.5)
 ├── logs/pool.log                后台 filler 的输出(T1.5)
+├── logs/gc.log                  后台 collector 的输出,每次唤醒一行(wall/cpu;T2.1)
 ├── trash/W<n>-<ts>/             discard 后的 World,保留期(默认 7 天)内可 restore
+├── trash/S<n>-<ts>/             discard 后的 Snapshot(T2.2),gate 仍关着,由 deleter 开到 0700
+├── trash/*.deleting/            collector 已经开始删的条目;restore 一律拒绝(T2.1)
 └── worlds/W<n> -> <user path>   仅记录,World 真身在用户路径
 ~/worlds/W<n>/<name>/            World 根;含 .world 标记文件
 ```
@@ -50,7 +55,7 @@ store 目录加 `.noindex`(Spotlight)并 `tmutil addexclusion`(Time Machine),无
 | P1 | World 目录被移动/改名 | 身份不靠路径:根目录 `.world` 标记(world id、store id、snapshot id)+ metadata 记 dir inode。命令执行时按 inode 反查并自动修正路径 |
 | P2 | World 被 `cp -R` 复制出未登记副本 | 标记存在但 inode 不符 → 视为"未登记副本",所有破坏性命令拒绝,提示 `world fs adopt` 或 `fork` |
 | P3 | 快照被改动,污染后代 | **默认**:快照根目录 `chmod 0000`(gate),里面的条目一律不动;clonefile 期间才临时开到 0500,由 `manifest` 上的 flock 串行化。fork 因此不需要 unprotect 遍历(T1.1b)。`--hard`:每个文件/目录 `chflags uchg` + 目录去掉写位,fork 时在克隆上并行 `nouchg`。`world fs verify S<n>` 用清单校验两种模式,gate 模式额外检查根是否被留成敞开 |
-| P4 | 误删 World | `discard` = rename 进 trash,`world fs restore W<n>` 可恢复;保留期后 `gc` 真删;`--now` 才立即删 |
+| P4 | 误删 World / Snapshot | `discard` = rename 进 trash(一次 rename,毫秒级,与树大小无关),`world fs restore W<n>` 可恢复;保留期后由**后台 collector** 真删,`--now` 才在前台立即删。**T2.2 起 Snapshot 走同一条路**:`world fs discard S<n>`,有 ACTIVE World 引用时拒绝(`--force` 也不行,绝不让 World 失去 diff/verify 的基线),有 pool 条目时 `--force` 先 drain;trash 里的 World 不算引用,但它之后 `restore` 会以 `WFS_E_SOURCE_GONE` 拒绝。**崩溃安全(T2.1)**:真删之前先 rename 成 `<name>.deleting`,被 kill 的 worker 留下的东西一眼就不是 World,`restore` 以 `WFS_E_TRASH_DELETING` 拒绝,下一次唤醒继续删完 |
 | P5 | 对正在使用的 World 做 discard/checkpoint/fork | `world exec` 写 `<store>/locks/W<n>.lock`(pid + flock;`.world` 在实现里是文件不是目录,而且锁不该进项目树);discard / checkpoint / 从该 World fork 遇到活锁一律 `WFS_E_WORLD_BUSY`,`--force` 继续;pid 已死的锁静默清理 |
 | P6 | 跨卷 clonefile EXDEV(`st_dev` 相同也可能) | init 前实际探针克隆一个临时文件;失败则明确报错,提供 `--store <同卷路径>` 或 `--copy`(真实复制,提示耗时) |
 | P7 | 在危险路径上 init/fork | 拒绝 `/`、`$HOME`、store 自身、已是 World/Snapshot 的目录、另一个 World 内部;fork 目标不能在任何 World 或 Snapshot 内 |
@@ -62,6 +67,7 @@ store 目录加 `.noindex`(Spotlight)并 `tmutil addexclusion`(Time Machine),无
 | P13 | 用旧版 CLI 打开新 store | `VERSION` 文件 + schema 版本检查,拒绝并提示升级 |
 | P14 | agent 越界写 | `world exec` 套 seatbelt profile:允许写 World 根、agent 配置/缓存目录、tmp;拒绝 store、快照、其他 World。不带沙盒的 agent 也至少得到 P3 的快照保护 |
 | P15 | 原地改写大文件的 COW 首写惩罚(~1ms) | 文档说明;不做特殊处理 |
+| P16 | gc 与前台争抢(T2.1) | 物理删除是全系统最贵的操作(实测 1000 个 10k 树 = 1040 万次 unlink)。它只在**游离的后台 worker** 里做:store 级非阻塞 flock `<store>/locks/gc.lock` 保证全店一个;每次唤醒只做有限一批(N 条目或 T 秒)就退出,还有活就交给新起的后继进程;4 线程 unlink 比单线程快 1.9×,但实测会让并发 `fork` 慢 51–57%,**真正管用的是占空比**——干 2 s 停 2 s,前台代价降到 ~5%,drain 变成约两倍时长(背景工作,等得起)。`setiopolicy_np(IOPOL_THROTTLE)` 实测毫无作用:瓶颈是 APFS 元数据事务,不是磁盘带宽 |
 
 ## 4. C ABI 变化
 

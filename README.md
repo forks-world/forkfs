@@ -47,9 +47,12 @@ $world fs list                         # snapshots and worlds
 $world fs inspect W1                   # path, inode, origin, entry count, FSEvents cursor
 $world fs verify S1                    # snapshot still matches the manifest written at init
 $world fs verify ~/w/a                 # identity of a world (repairs the row if it was moved)
-$world fs discard W3                   # into the store trash; restorable
+$world fs discard W3                   # into the store trash (a rename: milliseconds); restorable
 $world fs restore W3
-$world fs gc --retention 7             # delete trash older than 7 days and stray *.wfs-tmp trees
+$world fs discard S2                   # a snapshot too -- refused while a live world needs it
+$world fs gc --retention 7             # collect; the trash itself is emptied in the background
+$world fs gc --status                  # what is in the trash, and what the collector is doing
+$world fs gc --reconcile               # mark rows whose tree is no longer on disk as dead
 $world fs pool fill S1 --count 4       # keep 4 pre-cloned worlds ready: a fork then costs ~7 ms
 $world fs pool status                  # what is waiting, per snapshot
 $world fs pool drain S1                # give the space back
@@ -93,6 +96,40 @@ tree's worth of APFS metadata (~308 B/entry) until it is used or drained. `world
 checks the waiting entries too (still there, not written to since they were cloned), and
 `world fs gc` removes the entries of snapshots that are gone, half-built trees and anything under
 `<store>/pool` that no row claims.
+
+### `world fs discard` and the background collector
+
+`discard` is a `rename(2)` into `<store>/trash` and two SQLite statements — milliseconds, whatever
+the size of the tree. The unlinking behind it is the most expensive thing this system does:
+measured, 1000 worlds of 10 400 entries are 10.4M `unlink(2)` calls, which the M1 synchronous
+`gc` took 525 s over ([`docs/M1_RESULTS.md`](docs/M1_RESULTS.md) §3) — 4.6× what creating them cost.
+
+So nothing on a command's critical path does it. A detached worker (`world fs gc --worker`,
+started by `discard`, `fork` or `gc` and never by a daemon) holds a non-blocking store-level
+`flock` on `<store>/locks/gc.lock`, deletes a bounded batch, logs to `<store>/logs/gc.log` and
+exits; if the batch limit cut it short it hands over to a fresh successor, so the trash drains
+without anyone running another command. `world fs gc --now` still does everything here and now.
+
+Crash safety: before a single `unlink`, the trash entry is renamed to `<name>.deleting`. A worker
+that is killed half-way through therefore leaves a tree that is visibly not a world any more
+rather than one that looks restorable — `world fs restore` refuses it — and the next wake finishes
+it, before and regardless of the retention period.
+
+Knobs, all environment variables read by the worker: `WORLD_GC_BATCH` (entries per wake, 64),
+`WORLD_GC_BATCH_SECS` (seconds per wake, 2), `WORLD_GC_PAUSE_MS` (the gap before a successor
+starts, 2000) and `WORLD_GC_THREADS` (unlink threads, 4). The defaults are a duty cycle: the
+collector works in bursts with gaps, which is what keeps it out of the foreground's way (P16).
+
+Discarding a **snapshot** goes through the same trash. It is refused while an ACTIVE world was
+forked from it — `diff` and `verify` need that baseline, so the source is never taken out from
+under a live world — and refused while pre-cloned pool entries exist, which `--force` drains.
+Worlds already in the trash are not a reason to refuse; restoring one afterwards is what fails,
+with a message that says why.
+
+`world fs gc` also reconciles: it reports snapshot rows whose directory is gone and world rows
+whose root is gone, and `--reconcile` marks them dead (and drops the pool entries of dead
+snapshots). It reports rather than acts by default because a World that was merely *moved* looks
+exactly the same from the store's side until `world fs verify <its new path>` repairs the row (P1).
 
 ### `world fs diff`
 
@@ -237,9 +274,28 @@ cmake -S . -B build/Fskit -DCMAKE_BUILD_TYPE=Release -DWFS_FSKIT=ON && cmake --b
 scripts/bundle.sh Release          # .app + appex → ad-hoc sign → ~/Applications → lsregister
 # One-time, manual: System Settings > General > Login Items & Extensions > File System Extensions
 build/Fskit/cli/world fs fsstatus  # must list world.forks.fs.extension enabled=true
+# The extension is sandboxed, so the store has to live where it can reach it:
+export WORLD_STORE="$HOME/Library/Containers/world.forks.fs.extension/Data/Library/Application Support/World/fs"
+build/Fskit/cli/world fs init <dir> && build/Fskit/cli/world fs fork --from S1 --to <world>
 build/Fskit/cli/world fs mount W1 <mountpoint>
 scripts/smoke.sh <dir> <mountpoint>
 ```
+
+**Where the store has to be for a mount to work.** `pkd` refuses an appex that is not sandboxed,
+so the extension runs inside the App Sandbox with access to its own container and to the
+security-scoped mount source and to nothing else: `~/Library/Application Support` — the CLI's
+default store — is denied, and `NSApplicationSupportDirectory` resolves *inside the container*, so
+the extension's own default store is
+`~/Library/Containers/world.forks.fs.extension/Data/Library/Application Support/World/fs`. The two
+defaults are therefore different directories, which is why a mount of a world from the CLI's
+default store used to fail with `mount: POSIX error 1009` (`WFS_E_FOREIGN_STORE`).
+
+`-o` options do not reach an FSKit module on macOS 27 (the options array arrives empty), so the
+store's location travels in the `.world` marker of the mount source root — the one file the
+extension is guaranteed to be able to read, because that root is the resource it was handed. The
+extension reads `store_path` out of it and opens that store, falling back to its container default
+for worlds forked before this existed. `world fs mount` checks the same thing first and refuses
+with the fix instead of an errno when the store is somewhere the extension cannot open.
 
 Why it is frozen: metadata-write workloads run at 17–40% of native through FSKit because the
 kernel sends 5–7 XPC round trips per mutation, and 68 µs per round trip is the FSKit floor

@@ -1745,6 +1745,36 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
     return 0;
 }
 
+extern "C" int wfs_gc_pending(wfs_store *s, int64_t retention_secs, int *worker_running) {
+    if (!s) return 0;
+    if (worker_running) {
+        int64_t pid = 0, at = 0;
+        uint64_t d = 0, r = 0;
+        *worker_running = gc_worker_probe(s, &pid, &at, &d, &r);
+    }
+    int64_t cutoff = now_sec() - (retention_secs < 0 ? kDefaultRetention : retention_secs);
+    {
+        Guard g(s->mu);
+        for (const char *sql : {"SELECT 1 FROM worlds WHERE state=2 AND trashed_at<=? AND trash_path<>'' LIMIT 1",
+                                "SELECT 1 FROM snapshots WHERE state=2 AND trashed_at<=? AND trash_path<>'' LIMIT 1"}) {
+            Stmt q(s->db, sql);
+            if (!q.ok()) continue;
+            q.i64(1, cutoff);
+            if (q.row()) return 1;
+        }
+    }
+    // An interrupted deletion is always work, whatever the retention says.
+    String trashdir = joinp(s->dir.c_str(), "trash");
+    if (DIR *d = ::opendir(trashdir.c_str())) {
+        int found = 0;
+        while (struct dirent *e = ::readdir(d))
+            if (ends_with(e->d_name, WFS_DELETING_SUFFIX)) { found = 1; break; }
+        ::closedir(d);
+        if (found) return 1;
+    }
+    return 0;
+}
+
 extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *out) {
     if (!s) return -EINVAL;
     wfs_gc_opts o;

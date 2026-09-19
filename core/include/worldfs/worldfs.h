@@ -593,6 +593,14 @@ typedef struct wfs_trash_stat {
 /* `world fs gc --status`. Never blocks and never spawns anything. */
 int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_stat *out);
 
+/* The same question reduced to what a command needs before deciding to spawn a worker: is there
+ * due work, and is somebody already on it? Two indexed counts and one readdir that stops at the
+ * first *.deleting name -- wfs_gc_status() classifies every trash directory against every trashed
+ * row, which is quadratic in the size of the trash and measurably not free on `discard` once a
+ * thousand worlds are in there. Returns 1 when there is work, 0 when there is not.
+ * `worker_running` may be NULL. */
+int wfs_gc_pending(wfs_store *s, int64_t retention_secs, int *worker_running);
+
 /* ---- T2.2: discarding a snapshot ------------------------------------------------------------
  *
  * A snapshot is the baseline `diff` and `verify` compare against, so it is never taken away from

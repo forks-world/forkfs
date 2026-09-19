@@ -16,7 +16,11 @@
   未沙盒的 appex 会被 pkd 静默丢弃,表现为 `mount` 报 "No extension with fsShortName found"。
   解决:entitlements 里 `com.apple.security.app-sandbox=true`,plist `FSRequiresSecurityScopedPathURLResources=true`,
   扩展在 loadResource 里 `startAccessingSecurityScopedResource`。元数据 store 因此位于扩展 container:
-  `~/Library/Containers/world.forks.fs.extension/Data/Library/Application Support/World/fs`,CLI 默认同路径。
+  `~/Library/Containers/world.forks.fs.extension/Data/Library/Application Support/World/fs`。
+  **订正(T2.3,2026-09-19):"CLI 默认同路径"是错的。** CLI 的默认 store 是 `~/Library/Application Support/World/fs`
+  ——扩展因为被沙盒,`NSApplicationSupportDirectory` 解析到自己的 container 里,两者是两个不同的目录,
+  而且沙盒**拒绝**扩展读 `~/Library/Application Support`。于是 `world fs mount W<n>` 会以 `WFS_E_FOREIGN_STORE`
+  (`mount: POSIX error 1009`)失败,除非 `WORLD_STORE` 指向 container store。修法见下面的 T2.3。
 - 用 `pluginkit -a` 注册过的临时副本会留下指向已删除路径的记录,要用 `pluginkit -r <path>` 撤销;`lsregister -u` 对不存在的路径无效。
 - `bundle.sh` 改为 rsync 原地更新 + `open -g -j` 启动一次宿主 app(macOS 在 app 启动时登记其扩展)。
 - **沙盒扩展创建的文件会被打 `com.apple.quarantine`**(agent 字段是 WorldFSExtension)。隔离 + ad-hoc 签名的
@@ -706,9 +710,144 @@ FSKit 传进来的不是 `WorldItem`),与本次改动无关;`error:70` 一条都
 代价只是源树写者 p99 10–11ms、0 失败,主路径继续用它。
 
 ### M2 — 运维与规模(2026-09-19 用户确认按此顺序)
-- [ ] T2.1 后台增量 gc:discard 保持毫秒级,物理删除由后台分批完成(1000 个 10k 树的 World 实测 gc 525s)
-- [ ] T2.2 `discard S<n>` + 悬空快照对账;快照有活 World/池条目引用时拒绝
-- [ ] T2.3 store 路径统一:沙盒 appex 与 CLI 默认 store 不同(container vs ~/Library/Application Support),`world fs mount` 自动指向 container store;修正任务板中"CLI 默认同路径"
+- [x] T2.1 后台增量 gc:discard 保持毫秒级,物理删除由后台分批完成(1000 个 10k 树的 World 实测 gc 525s)
+- [x] T2.2 `discard S<n>` + 悬空快照对账;快照有活 World/池条目引用时拒绝
+- [x] T2.3 store 路径统一:沙盒 appex 与 CLI 默认 store 不同(container vs ~/Library/Application Support),`world fs mount` 把 store 路径写进 `.world` marker 传给扩展;修正任务板中"CLI 默认同路径"
 - [ ] T2.4 diff 扫描改 `getattrlistbulk` + `EF_NO_XATTRS`,目标 50k 从 1.4s 到 ~0.2s(含 xattr 判断)
 - [ ] T2.5 fork 后按 (dev, ino) 恢复树内硬链接(P9 从警告变为修复)
 - [ ] T2.6 Linux 平台层:overlayfs + mount namespace(fork O(1)、upper 目录即 changed-set)——**不在这台 Mac 上做**(用户决定),等 Linux 机器
+
+#### T2.1 后台增量 gc(2026-09-19 实现 + 实测)
+
+**为什么**:`discard` 本来就是一次 rename,毫秒级;贵的是它欠下的那笔 unlink。M1 实测
+1000 个 10,400 条目的 World = **1040 万次 unlink、525 s**(M1_RESULTS §3),是建它们的 4.6 倍。
+这笔账不能挂在任何一条命令的关键路径上,也不能跟前台抢盘(P16)。
+
+**设计**(实现在 `core/src/world.cpp` 的 `wfs_gc_ex` / `wfs_gc_status` / `wfs_gc_pending`,
+调度在 `cli/main.cpp`):
+
+- **崩溃安全先于一切**:真删之前先 `rename(<trash>/X, <trash>/X.deleting)`。这一步是原子的,
+  之后无论发生什么,那棵树都"一眼不是 World"。被 kill 的 worker 因此绝不会留下一棵
+  *看起来可以 restore、实际少了一半文件* 的树:`restore` 以 `WFS_E_TRASH_DELETING` 拒绝,
+  下一次唤醒把 `*.deleting` **排在最前面**删完(不看保留期)。
+- **一次唤醒 = 一批**:`WORLD_GC_BATCH`(默认 64 个 trash 条目)或 `WORLD_GC_BATCH_SECS`
+  (默认 2 s)先到者为准,然后进程退出。还有活就**自己起一个新的游离后继进程**
+  (`spawn_detached`,和 T1.5 的 pool filler 同一套 setsid + double fork),
+  所以没人再敲命令 trash 也会排空;`discard` / `fork` / `gc` 发现有到期的活而没人干时也会起一个。
+- **全店一个 worker**:`<store>/locks/gc.lock` 上的非阻塞 `flock`。这个锁文件**永远不 unlink**——
+  `flock` 锁的是 inode,删了再建会让两个 worker 同时"持有"同一把锁。worker 每删完一条就把
+  `pid/start/done/remaining` 重写进这个文件,`gc --status` 因此不需要任何 IPC 就能报进度。
+- **删除用 4 线程**(`fs_remove_tree_parallel`,复用 clone 用的那个并行 walker):文件在并行阶段
+  unlink,目录在它本来就有的"最深优先"串行尾巴里 rmdir。任何一步出错都退回单线程 `rm_rec`,
+  宁可慢也不留半棵树。
+- **前台命令的语义**:`world fs gc` 只做便宜的一半(半成品树、过期 seatbelt profile、死快照的
+  pool 条目、对账报告)然后把 trash 交给 worker;`world fs gc --now` 是同步跑完的老行为
+  (safety.sh 的 P4 用例改用它);`--status` 报 trash 大小与 worker;`--reconcile` 见 T2.2。
+
+**4 线程到底值不值 / 怎么才不抢前台**(30 个 10.4k World 一轮,M1 Mac mini / 27.0,
+fork p50 = 并发跑 `world fs fork --no-pool` 的中位数):
+
+| 线程 | io policy / 占空比 | drain | 条目/s | 并发 fork p50 | 相对空闲 |
+|---|---|---|---|---|---|
+| 1 | throttle,连续 | 15.6 s | 19,941 | 0.161 s | **+15%** |
+| 2 | throttle,连续 | 11.2 s | 27,880 | 0.163 s | **+16%** |
+| 3 | throttle,连续 | 9.0 s | 34,635 | 0.211 s | **+51%** |
+| 4 | normal,连续 | 8.4 s | 37,071 | 0.221 s | **+57%** |
+| 4 | throttle,连续 | 8.4 s | 37,314 | 0.221 s | +57% |
+| 4 | utility,连续 | 8.4 s | 37,199 | 0.221 s | +57% |
+| **4** | **干 2 s / 停 2 s** | 16.1 s | 19,332 | 0.145 s | **+5%** |
+
+- **4 线程确实有用**:37k 条目/s,比 M1 单线程 `rm_rec` 的 19.8k(1040 万 / 525 s)快 **1.9×**,
+  和克隆那边"4 线程是 APFS 元数据事务甜点"的结论一致。
+- **`setiopolicy_np()` 一点用都没有**(normal / utility / throttle 三档逐项相同)。
+  瓶颈不是磁盘带宽也不是 CPU,是 APFS 的元数据事务——Spotlight/Time Machine 那套 IO 节流对它无效。
+- **真正管用的是占空比**。连续跑时哪怕只用 1 个线程,并发 fork 也要慢 15%(那是"同一个卷上
+  有人在 unlink"的地板);**干 2 s 停 2 s** 把争抢窗口砍掉一半,前台代价降到 ~5%,
+  代价是 drain 大约翻倍。背景工作,等得起——于是 `WORLD_GC_BATCH_SECS=2` / `WORLD_GC_PAUSE_MS=2000`
+  成了默认值。
+
+**1000 个 World 的完整一轮**(和 M1_RESULTS §3 同一棵 10,400 条目的树,同一台机器):
+
+| | M1(同步 `gc`) | T2.1(后台 collector) |
+|---|---|---|
+| 1000 次 fork(`--no-pool`) | 113.7 s | 122.6 s |
+| 1000 次 `discard` | 9.1 s(9.1 ms/次) | **11.2 s(11.2 ms/次)** |
+| trash 里的内容 | — | 1000 条目 / 1040 万 tree entries / ~3.0 GB(估) |
+| 真删的墙钟 | **525.2 s**(前台,命令一直卡着) | **663.6 s**(后台;158 次唤醒,其中真正在删 339.9 s,其余是每轮之间 2 s 的故意停顿) |
+| worker CPU | —(全在前台) | 850.7 s(干活时约 2.5 个核),共 158 次唤醒 |
+| 期间并发 fork p50 | —(不可能并发) | 0.200 s,空闲时 0.202 s → **-1.0%** |
+
+- `discard` 从 9.1 → 11.2 ms:多出来的 2 ms 是"顺手看一眼 trash 里有没有到期的活"。
+  第一版用 `wfs_gc_status()` 做这件事,它要把 trash 里每个目录和每个 trashed 行比对一遍
+  (trash 一千条时是 100 万次 strcmp),于是换成 `wfs_gc_pending()`:两条带索引的 count
+  加一次在第一个 `*.deleting` 就停的 readdir。
+- **P16 达成**:collector 全程在跑的情况下,200 次并发 fork 的 p50 是 **0.200 s**,
+  空闲时是 **0.202 s** —— **-1.0%**,在噪声里(目标是"不超过 ~10%")。
+- 真正在删的那 339.9 s 里是 **30,601 条目/s**(比上面 30 个 World 那轮的 37k 低,
+  因为每次唤醒都要重新开 store、扫一遍 trash——1000 条目的 trash 扫描不是免费的)。
+  对比 M1 同步 `gc` 的 1040 万 / 525.2 s = 19,800 条目/s,**快 1.55×**;
+  而这 663.6 s 里没有任何一条命令在等它。
+
+#### T2.2 `discard S<n>` 与对账(2026-09-19)
+
+- `wfs_snapshot_discard(store, id, force)` + `world fs discard S<n>`。
+  **有 ACTIVE World 从它 fork 出来就拒绝,`--force` 也不行**——`diff` 和 `verify` 都要拿它当基线,
+  绝不能让一个活着的 World 失去来源。拒绝信息会把是哪几个 World 列出来。
+  有 pool 条目时同样拒绝,`--force` 先 drain 再删(pool 条目只是预克隆,丢了只是再克隆一次)。
+- trash 里的 World **不算**引用(它们本来就在路上了);但它之后 `restore` 会以
+  `WFS_E_SOURCE_GONE` 拒绝,并说明"恢复出来的 World 没有基线可 diff / verify"。
+- 快照走和 World 完全相同的 trash / 保留期 / 后台删除路径。搬的是 `<store>/snapshots/S<n>`
+  整个目录(`manifest` 要跟着走),**gate 一路关着**——rename 不需要进树里——
+  由 deleter 在真删时 `chmod 0700` 打开。
+- **对账**:`world fs gc` 和 `fs status` 检查每个 ACTIVE 行的树是否还在
+  (快照看 `snapshots.path`,World 看 `worlds.path`,一行一次 `stat`),有就报告;
+  `gc --reconcile` 才真的把它们标成 DEAD,并让 `pool_collect` 顺手清掉死快照的 pool 条目。
+  **默认只报不动**,因为一个只是被 `mv` 走的 World 从 store 这边看起来一模一样,
+  那种情况的正解是 `world fs verify <新路径>`(P1),不是标死。
+
+**两个遗留 store 的实际处理**(用户点名的那两个 `m1final` 快照):
+
+| store | 里面有什么 | `gc --reconcile` 的结论 | 处理 |
+|---|---|---|---|
+| `~/Library/Application Support/World/fs` | `S1 m1final`(1040 条目),0 个活 World | **没有悬空行**:`snapshots/S1/root` 还在,只是没人引用 | `discard S1` → `gc --reconcile --now --retention 0` 删掉;store 现在是空的 |
+| `~/Library/Containers/world.forks.fs.extension/.../World/fs` | `S1 s27` + `W1/W2/W3`,以及 `S2 m1final` | 同上,0 悬空 | 只 `discard S2` → 同一条命令删掉;**`S1 s27` 和 `W1/W2/W3` 一动没动** |
+
+**订正任务描述**:这两个快照并不是"悬空"(dangling)——它们的目录都还在磁盘上,
+所以 `gc --reconcile` 看它们是完全正常的行,什么也不会做。它们只是**没人引用的遗留快照**,
+对应的新命令是 `discard S<n>`(T2.2),不是 `--reconcile`。`--reconcile` 的真实用例
+(行还在、树没了)由 safety.sh 的两个用例覆盖。
+
+#### T2.3 store 路径(2026-09-19)
+
+两条硬事实决定了一切:
+
+1. **`-o` 选项到不了 macOS 27 的 FSKit 模块**(options 数组是空的)。T0.6 已经踩过一次。
+2. **appex 必须沙盒**(pkd 直接丢弃非沙盒 appex),于是它只能碰自己的 container 和那个
+   security-scoped 的挂载源;`~/Library/Application Support` 被拒,而且
+   `NSApplicationSupportDirectory` 解析进 container —— 扩展的"默认 store"和 CLI 的
+   **是两个目录**。这就是 `world fs mount W<n>` 报 `POSIX error 1009`(`WFS_E_FOREIGN_STORE`)的原因。
+
+修法:**store 的路径写进 `.world` marker**(新字段 `store_path`),扩展从挂载源根目录的 marker 里读它
+——那个根目录正是它被交付的 resource,是唯一一条一定到得了的通道。没有 `store_path` 的旧 World
+退回 container 默认值。打不开时日志里说清楚是哪个 store、为什么(沙盒),而不是漏一个裸 errno 出去。
+`world fs mount` 自己先查一遍,store 不在 container 里就直接以可执行的建议拒绝。
+
+`wfs_marker_store_path()` 是为此加的一个不需要先打开 store 的读 marker 接口。
+
+**真挂载验收(2026-09-19,`scripts/bundle.sh Release` 之后):**
+
+| | store | 结果 |
+|---|---|---|
+| A | CLI 默认 `~/Library/Application Support/World/fs` | `world fs mount W2 <mnt>` **exit 3**,打印"扩展被沙盒、读不到这个 store、`-o` 到不了模块",并给出 `WORLD_STORE=<container>` 的可执行建议——不再是 `POSIX error 1009` |
+| B | container store | `.world` 里有 `store_path`;`mount` exit 0,`mount(8)` 里能看到 `(worldfs, local, ..., fskit)`;`scripts/smoke.sh` **ALL OK**(read/readdir/stat/write/append/truncate/mkdir/rename/unlink/rmdir/symlink/hardlink/chmod/xattr/mmap/fsync);`umount` 后 `mount | grep worldfs` 为空 |
+
+收尾:两个 store 都被恢复成测试前的样子(container store 里 `S1 s27` + `W1/W2/W3` 原封不动),
+结束时没有任何 worldfs 挂载。
+
+#### M2 验收(T2.1–T2.3,2026-09-19)
+
+- `scripts/tests/safety.sh`:**130 passed, 0 failed**(M1 结束时是 93;新增 37 条覆盖
+  T2.1 的崩溃安全 / 分批 / 单 worker 锁 / `--status`,T2.2 的拒绝、`--force`、对账,
+  以及 T2.3 的 marker store 路径——普通 fork 和 pool 命中两条路径都查)。
+- `ctest`:`build/Release`(WFS_FSKIT=OFF)2/2、`build/FSKit`(WFS_FSKIT=ON)3/3。
+- `scripts/check-deps.sh`:两个构建目录的全部产物都只链接系统库。

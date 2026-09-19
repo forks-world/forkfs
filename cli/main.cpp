@@ -360,10 +360,7 @@ static void spawn_pool_fill(wfs_store *s, wfs_id snap, int target) {
 // unless one is already on it -- the store-level flock in the core would make a second one exit
 // immediately anyway, and that would still cost this command a process start.
 static int gc_work_waiting(wfs_store *s, int64_t retention, int *worker_running) {
-    wfs_trash_stat ts;
-    if (wfs_gc_status(s, retention, &ts) != 0) return 0;
-    if (worker_running) *worker_running = ts.worker_pid ? 1 : 0;
-    return (ts.due + ts.deleting) > 0;
+    return wfs_gc_pending(s, retention, worker_running);
 }
 
 static void spawn_gc_worker(wfs_store *s, int64_t retention) {
@@ -541,6 +538,11 @@ static int cmd_fork(wfs_store *s, int argc, char **argv) {
         // cost this fork a process start to have the child exit on the lock.
         if (res.from_pool && !opts.no_pool && !wfs_pool_filling(s))
             spawn_pool_fill(s, from.id, pool_topup_target());
+        // T2.1: a fork is also a good moment to notice that the trash has work waiting and
+        // nobody on it -- a machine that only ever forks would otherwise never collect. The
+        // check is two indexed counts and one readdir (wfs_gc_pending), and it happens after
+        // the result has been printed, not on the way to it.
+        spawn_gc_worker(s, -1);
         return EX_OK;
     }
     return fail("fork", rc ? rc : -EEXIST);
@@ -931,10 +933,14 @@ static int gc_threads(void) {
     return v < 1 ? 1 : (v > 16 ? 16 : v);
 }
 
-// P16, the part that actually moves the needle: the collector asks the kernel to put it behind
-// everybody else on the disk. IOPOL_THROTTLE is what Spotlight and Time Machine use -- a
-// throttled process yields to unthrottled I/O and runs at close to full speed when the machine
-// is idle, which is exactly the bargain a trash collector wants.
+// The collector asks the kernel to put it behind everybody else: IOPOL_THROTTLE is what
+// Spotlight and Time Machine use, plus nice +5.
+//
+// Measured, and worth writing down: this changes *nothing*. normal / utility / throttle all give
+// the same drain rate and the same 57% penalty on a concurrent `fork` (docs/TASKS.md T2.1). The
+// contention is APFS metadata transactions, not disk bandwidth and not CPU, and the disk I/O
+// throttle has no opinion about those. What does work is the duty cycle in gc_pause_ms(). This
+// is kept because it costs nothing and is the right declaration of intent, not because it helps.
 static void gc_lower_priority(void) {
 #ifdef __APPLE__
     const char *e = getenv("WORLD_GC_IOPOL");
