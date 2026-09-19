@@ -843,6 +843,14 @@ static int cmd_discard_snapshot(wfs_store *s, wfs_id sid, int now, int force, in
         printf("S%llu deleted\n", (unsigned long long)sid);
         return EX_OK;
     }
+    // PR #1 review (3rd round): a snapshot whose tree had already vanished is reconciled straight
+    // to DEAD, because there is nothing to move and nothing for a collector to find. Say that,
+    // instead of promising a retention period that no longer applies to anything.
+    wfs_snapshot_rec after;
+    if (wfs_snapshot_info(s, sid, &after) == 0 && after.state == WFS_ST_DEAD) {
+        printf("S%llu: its tree was already gone; the row is now dead\n", (unsigned long long)sid);
+        return EX_OK;
+    }
     printf("S%llu moved to the trash; the collector deletes it after the retention period\n",
            (unsigned long long)sid);
     spawn_gc_worker(s, retention);

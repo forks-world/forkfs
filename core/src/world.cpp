@@ -1333,6 +1333,7 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
     }
 
     String trash;
+    bool tree_gone = false;
     {
     // One BEGIN IMMEDIATE for the reference check *and* the state transition (PR #1 review).
     // BEGIN IMMEDIATE takes the database write lock, which is the same lock a pool claim and a
@@ -1354,10 +1355,17 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
     char leaf[80];
     ::snprintf(leaf, sizeof leaf, "S%llu-%lld", (unsigned long long)id, (long long)now_sec());
     trash = joinp(joinp(s->dir.c_str(), "trash").c_str(), leaf);
-    if (!exists(snapdir.c_str())) trash.assign("");   // already gone: a reconcile, not a move
+    // PR #1 review (3rd round): already gone is a reconcile, not a move -- and it has to be
+    // written down as one. A TRASHED row with an empty trash_path is invisible to both halves of
+    // gc (trash_scan skips a row with no path, reconciliation only looks at ACTIVE rows), so
+    // without --now the snapshot stayed "trashed" in `status` and `list` forever, with no
+    // collector that could ever finish it. The row goes straight to DEAD instead; pool entries
+    // are already gone by here (a ref refuses the discard, --force drained them), and
+    // pool_collect buries anything a filler puts back for a snapshot that is no longer ACTIVE.
+    if (!exists(snapdir.c_str())) { trash.assign(""); tree_gone = true; }
     Stmt u(s->db, "UPDATE snapshots SET state=?, trash_path=?, trashed_at=? WHERE id=?");
     if (!u.ok()) return -EIO;
-    u.i64(1, WFS_ST_TRASHED);
+    u.i64(1, tree_gone ? WFS_ST_DEAD : WFS_ST_TRASHED);
     u.text(2, trash.c_str());
     u.i64(3, now_sec());
     u.i64(4, (int64_t)id);
@@ -1370,6 +1378,7 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
     }
     t.commit();
     }
+    if (tree_gone) return 0;   // nothing to move, nothing to unlink, and the row is already DEAD
     if (!immediate) return 0;
 
     // --now: delete it here instead of leaving it to the collector, which is what `discard

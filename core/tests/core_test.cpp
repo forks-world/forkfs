@@ -970,6 +970,28 @@ int main() {
         memset(&rts, 0, sizeof rts);
         CHECK_OK(wfs_gc_status(rs, 0, &rts));
         CHECK(rts.entries == 1 && rts.snapshots == 1);
+
+        // PR #1 review (3rd round): a snapshot whose tree is already gone. There is nothing to
+        // move into the trash, so the row used to be committed TRASHED with an empty trash_path
+        // -- invisible to trash_scan (which skips a row with no path) and to reconciliation
+        // (which only looks at ACTIVE rows), i.e. trashed forever, with `status` saying so. It
+        // is reconciled straight to DEAD now.
+        wfs_id rsid3 = 0;
+        ropts.name = "race-gone";
+        CHECK_OK(wfs_snapshot_create(rs, rsrc, &ropts, &rsid3));
+        char gdir[4096];
+        snprintf(gdir, sizeof gdir, "%s/snapshots/S%llu", rstore, (unsigned long long)rsid3);
+        CHECK(exists(gdir));
+        rm_rf(gdir);                                   // somebody deleted it behind the store
+        CHECK_OK(wfs_snapshot_discard(rs, rsid3, 0, 0));   // no --now: the old stuck path
+        CHECK_OK(wfs_snapshot_info(rs, rsid3, &rsr));
+        CHECK(rsr.state == WFS_ST_DEAD);
+        wfs_store_stat rss;
+        CHECK_OK(wfs_store_status(rs, &rss));
+        CHECK(rss.snapshots_trashed == 1);             // rsid2's, and only rsid2's
+        memset(&rts, 0, sizeof rts);
+        CHECK_OK(wfs_gc_status(rs, 0, &rts));
+        CHECK(rts.entries == 1 && rts.snapshots == 1);
         wfs_store_close(rs);
     }
 
