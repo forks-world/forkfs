@@ -338,35 +338,63 @@ int pool_claim(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, PoolClaim
     return gone ? -ENOENT : 0;
 }
 
-void pool_return(wfs_store *s, const PoolClaim &c) {
-    if (!s || !c.path.size()) return;
+int pool_return(wfs_store *s, const PoolClaim &c, PoolReturnHook on_returned, void *hook_ctx) {
+    if (!s || !c.path.size()) return -EINVAL;
     // The hand-out may have written a marker into it; an entry never carries one.
     String m = joinp(c.path.c_str(), WFS_MARKER_NAME);
     ::unlink(m.c_str());
     struct stat st;
-    if (::stat(c.path.c_str(), &st) != 0) return;
-    Guard g(s->mu);
-    Txn t(s->db);
-    Stmt ins(s->db,
-             "INSERT INTO pool(snapshot_id, snap_created_at, uuid, path, entries, root_mode,"
-             " root_mtime, dir_dev, dir_ino, created_at, state) VALUES(?,?,?,?,?,?,?,?,?,?,1)");
-    if (!ins.ok()) { t.commit(); fs_remove_tree(c.path.c_str()); return; }
-    ins.i64(1, (int64_t)c.snapshot);
-    ins.i64(2, c.snap_created_at);
-    ins.text(3, c.uuid.c_str());
-    ins.text(4, c.path.c_str());
-    ins.i64(5, (int64_t)c.entries);
-    ins.i64(6, (int64_t)(st.st_mode & 07777));
-    ins.i64(7, mtime_ns(st));
-    ins.i64(8, (int64_t)st.st_dev);
-    ins.i64(9, (int64_t)st.st_ino);
-    ins.i64(10, c.created_at ? c.created_at : now_sec());
-    if (ins.step() != SQLITE_DONE) {
-        t.commit();
-        fs_remove_tree(c.path.c_str());
-        return;
+    if (::stat(c.path.c_str(), &st) != 0) return -errno;   // nothing to put back
+    int rc = 0;
+    {
+        Guard g(s->mu);
+        Txn t(s->db);
+        // PR #1 review (16th round, P2): the same question build_one's insert asks (15th round)
+        // and for the same reason -- a READY entry is a promise that the snapshot it names is
+        // ACTIVE and is still the snapshot this tree was cloned from. The caller's hook is what
+        // holds that true while the entry is out of the pool (the fork's CREATING world row is
+        // the snapshot's reference, and it is deleted in this transaction, not before it), so
+        // in the unwind this was written for the check cannot fail; it is the entry's identity,
+        // asked under the same write lock the discard's reference count is taken under, for
+        // this caller and any other.
+        {
+            Stmt sq(s->db, "SELECT state, created_at FROM snapshots WHERE id=?");
+            if (!sq.ok()) rc = -EIO;
+            else {
+                sq.i64(1, (int64_t)c.snapshot);
+                if (!sq.row()) rc = -ESTALE;
+                else if (sq.col_i64(0) != WFS_ST_ACTIVE || sq.col_i64(1) != c.snap_created_at)
+                    rc = -ESTALE;
+            }
+        }
+        if (!rc) {
+            Stmt ins(s->db,
+                     "INSERT INTO pool(snapshot_id, snap_created_at, uuid, path, entries, root_mode,"
+                     " root_mtime, dir_dev, dir_ino, created_at, state) VALUES(?,?,?,?,?,?,?,?,?,?,1)");
+            if (!ins.ok()) rc = -EIO;
+            else {
+                ins.i64(1, (int64_t)c.snapshot);
+                ins.i64(2, c.snap_created_at);
+                ins.text(3, c.uuid.c_str());
+                ins.text(4, c.path.c_str());
+                ins.i64(5, (int64_t)c.entries);
+                ins.i64(6, (int64_t)(st.st_mode & 07777));
+                ins.i64(7, mtime_ns(st));
+                ins.i64(8, (int64_t)st.st_dev);
+                ins.i64(9, (int64_t)st.st_ino);
+                ins.i64(10, c.created_at ? c.created_at : now_sec());
+                if (ins.step() != SQLITE_DONE) rc = -EIO;
+            }
+        }
+        // The claimer's own bookkeeping, in the same transaction as the row that replaces it.
+        if (!rc && on_returned) rc = on_returned(hook_ctx, c);
+        if (!rc) t.commit();     // and the Txn destructor rolls everything back otherwise
     }
-    t.commit();
+    // The entry did not go back, so its tree is not an entry: remove it rather than leave a
+    // row-less clone for the orphan sweep to find. No deadline -- this is a failed fork's
+    // unwind, not the gc worker -- and if it will not go, the sweep is where it belongs.
+    if (rc) fs_remove_tree(c.path.c_str());
+    return rc;
 }
 
 int pool_ready_for(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, uint64_t *out) {

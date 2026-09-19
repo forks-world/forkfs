@@ -378,6 +378,25 @@ static int crash_before_publish(void *ctx, wfs_id world, const char *tmp_path) {
     return -EINTR;
 }
 
+// PR #1 review (16th round, P2): the two halves of "a pool-backed fork that fails after the
+// claim". The first makes the hand-out fail the way P7 says it must -- a directory appears at
+// --to after check_path looked, so the publish rename is EEXIST -- and the second runs a whole
+// `discard S<n>` inside the unwind, at the instant the entry is out of the pool.
+static char unwind_target[4096];
+static void unwind_block_target(void *ctx, wfs_id world) {
+    (void)ctx;
+    (void)world;
+    mkdir(unwind_target, 0755);
+}
+static wfs_store *g_unwind_store;
+static wfs_id g_unwind_snap;
+static int g_unwind_rc, g_unwind_ran;
+static void unwind_discard(void *ctx) {
+    (void)ctx;
+    g_unwind_ran = 1;
+    g_unwind_rc = wfs_snapshot_discard(g_unwind_store, g_unwind_snap, 0, 0);
+}
+
 // PR #1 review (5th round): the source of a snapshot is a live directory, and this is what a
 // user writing to it in the window between the walk and the clone looks like at its worst -- one
 // member of a hardlink group replaced by a different file of exactly the same size and exactly
@@ -1755,6 +1774,77 @@ int main() {
         CHECK_OK(wfs_gc_status(rs, 0, &rts));
         CHECK(rts.entries == 1 && rts.snapshots == 1);
         wfs_store_close(rs);
+    }
+
+    // ---- PR #1 review (16th round, P2): the unwind of a pool hand-out is a reference too ----
+    //
+    // The other half of the window the first round closed. The claim commits the fork's CREATING
+    // world row, so `discard S<n>` can see a fork that has taken an entry -- but the unwind of a
+    // hand-out that then failed used to delete that row first and put the entry back afterwards,
+    // in two transactions. In between, the reference count saw neither the world nor the entry:
+    // the discard committed the snapshot in WFS_ST_TRASHING, and pool_return() then inserted a
+    // READY entry for a snapshot on its way to the trash -- a full stale clone that the next
+    // fork would take as a live baseline and that pool_collect() only buries a wake later. Row
+    // out and entry in are one transaction now, so there is no instant at which the snapshot has
+    // no reference at all.
+    {
+        char ustore[4096], usrc[4096], up[4096], uw[4096];
+        join(ustore, sizeof ustore, root, "unwind-store");
+        join(usrc, sizeof usrc, root, "unwind-src");
+        CHECK(mkdir(usrc, 0755) == 0);
+        join(up, sizeof up, usrc, "a.txt");
+        write_file(up, "baseline\n");
+        wfs_store *us = NULL;
+        CHECK_OK(wfs_store_open(ustore, &us));
+        wfs_id usid = 0;
+        wfs_snapshot_opts uopts;
+        memset(&uopts, 0, sizeof uopts);
+        uopts.name = "unwind";
+        CHECK_OK(wfs_snapshot_create(us, usrc, &uopts, &usid));
+        uint64_t umade = 0;
+        CHECK_OK(wfs_pool_fill(us, usid, 1, &umade));
+        CHECK(umade == 1);
+
+        join(uw, sizeof uw, worlds, "w-unwind");
+        snprintf(unwind_target, sizeof unwind_target, "%s", uw);
+        g_unwind_store = us;
+        g_unwind_snap = usid;
+        g_unwind_ran = 0;
+        g_unwind_rc = 0;
+        wfs_test_after_pool_claim = unwind_block_target;   // the hand-out's rename now fails
+        wfs_test_in_pool_unwind = unwind_discard;          // ... and the discard runs in there
+        memset(&opts, 0, sizeof opts);
+        opts.name = "w-unwind";
+        wfs_ref from_us = {WFS_K_SNAPSHOT, usid};
+        // The fork fails, as it must: the directory that appeared at --to is never renamed over.
+        wfs_id uwid = 0;
+        CHECK(wfs_world_create(us, from_us, uw, &opts, &uwid) != 0);
+        wfs_test_after_pool_claim = NULL;
+        wfs_test_in_pool_unwind = NULL;
+        CHECK(g_unwind_ran == 1);
+        // The fork was still holding the snapshot when the discard asked, so the discard lost.
+        CHECK_RC(g_unwind_rc, WFS_E_SNAPSHOT_IN_USE);
+        wfs_snapshot_rec usr;
+        CHECK_OK(wfs_snapshot_info(us, usid, &usr));
+        CHECK(usr.state == WFS_ST_ACTIVE && exists(usr.path));
+        // And the entry is back in the pool with a row: not a stale clone of a trashed
+        // snapshot, and not a row-less tree either.
+        uint64_t uready = 0;
+        CHECK_OK(wfs_pool_ready(us, usid, &uready));
+        CHECK(uready == 1);
+        char udir[4096];
+        snprintf(udir, sizeof udir, "%s/pool/S%llu", ustore, (unsigned long long)usid);
+        char unames[8][256];
+        uint64_t uinos[8];
+        CHECK(list_dir(udir, unames, uinos, 8) == 1);
+        // It is an ordinary pool entry again: a refusal without --force, drained with it, and
+        // nothing the failed fork left behind refusing on its own account.
+        CHECK_RC(wfs_snapshot_discard(us, usid, 0, 0), WFS_E_SNAPSHOT_IN_USE);
+        CHECK_OK(wfs_snapshot_discard(us, usid, 1, 1));
+        CHECK(list_dir(udir, unames, uinos, 8) == 0);
+        CHECK(!exists(usr.path));
+        wfs_store_close(us);
+        rm_rf(uw);
     }
 
     // ---- P13: a store from another schema is refused before anything is read ----

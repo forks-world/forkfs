@@ -751,6 +751,15 @@ extern void *wfs_test_after_pool_claim_ctx;
 extern int (*wfs_test_before_fork_publish)(void *ctx, wfs_id world, const char *tmp_path);
 extern void *wfs_test_before_fork_publish_ctx;
 
+/* And the third (PR #1 review, 16th round): the pool hand-out's unwind, at the instant the
+ * claimed entry is out of the pool and the hand-out has already failed -- after the tree has
+ * been put back under its pool name and before the transaction that returns it. What a test
+ * does in there is run a whole `discard S<n>`, because that is the one instant at which the
+ * fork's own CREATING world row is the snapshot's only reference. NULL unless a test sets it,
+ * and nothing in the library ever assigns it. */
+extern void (*wfs_test_in_pool_unwind)(void *ctx);
+extern void *wfs_test_in_pool_unwind_ctx;
+
 /* The pid a CREATING row records as the process building it. 0, its value in every real run,
  * means getpid(). A test sets it to a pid that is not running to produce the one state a single
  * process cannot otherwise reach: a half-built tree whose producer is gone. */

@@ -651,6 +651,12 @@ extern "C" void *wfs_test_after_pool_claim_ctx = nullptr;
 extern "C" int (*wfs_test_before_fork_publish)(void *ctx, wfs_id world, const char *tmp_path) = nullptr;
 extern "C" void *wfs_test_before_fork_publish_ctx = nullptr;
 
+// And the unwind of a pool hand-out that failed (PR #1 review, 16th round): the entry is out of
+// the pool, its tree is back under its pool name, and nothing but this fork's CREATING world row
+// says the snapshot is still needed. core_test runs `discard S<n>` exactly there.
+extern "C" void (*wfs_test_in_pool_unwind)(void *ctx) = nullptr;
+extern "C" void *wfs_test_in_pool_unwind_ctx = nullptr;
+
 // And the window between a snapshot's walk of its source and the clone of it: the source is the
 // user's live directory, and nothing stops it changing in there.
 extern "C" void (*wfs_test_before_snapshot_clone)(void *ctx, const char *src_dir) = nullptr;
@@ -894,6 +900,26 @@ struct PoolForkRow {
 // and insert the CREATING world row. Re-reading is the other half of the race -- the snapshot
 // row this fork looked at was read without the write lock, so a `discard` may have committed in
 // between; here we either see it (and refuse the claim) or it sees this row (and refuses).
+// The other half of the same arrangement (PR #1 review, 16th round): the row this fork wrote
+// with its claim, deleted inside pool_return's BEGIN IMMEDIATE, in the transaction that puts the
+// entry back. While the entry is out of the pool this row is the snapshot's only reference, so
+// it can go out only as the pool row comes in.
+struct PoolUnwind {
+    wfs_store *s;
+    wfs_id world;
+};
+
+int pool_fork_unwind(void *ctx, const wfs::PoolClaim &c) {
+    (void)c;
+    PoolUnwind *u = (PoolUnwind *)ctx;
+    if (!u->world) return 0;
+    Stmt del(u->s->db, "DELETE FROM worlds WHERE id=?");
+    if (!del.ok()) return -EIO;
+    del.i64(1, (int64_t)u->world);
+    if (del.step() != SQLITE_DONE) return -EIO;
+    return 0;
+}
+
 int pool_fork_insert(void *ctx, const wfs::PoolClaim &c) {
     PoolForkRow *r = (PoolForkRow *)ctx;
     {
@@ -1097,18 +1123,30 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
                 res->elapsed_us = now_us() - t_begin;
                 return 0;
             }
-            if (id) {
+            // The rename may already have happened (the failure was the stat or the row); put
+            // the tree back under its pool name first, or pool_return would find nothing there
+            // and the entry would be left at --to with no row that knows about it.
+            if (renamed) wfs::fs_rename_excl(target.c_str(), claim.path.c_str());
+            if (wfs_test_in_pool_unwind) wfs_test_in_pool_unwind(wfs_test_in_pool_unwind_ctx);
+            // PR #1 review (16th round, P2): the CREATING row goes out in the very transaction
+            // the entry comes back in. It used to be deleted first, and in the gap between the
+            // two commits nothing at all referenced the snapshot: `discard S<n>` counted no
+            // world and no pool row, committed WFS_ST_TRASHING, and the return then inserted a
+            // READY entry for a snapshot on its way to the trash -- a whole stale clone, handed
+            // to the next fork as a live baseline until pool_collect() got to it. A reference
+            // exists at every instant between the claim and the return now: the world row until
+            // the commit, the pool row after it.
+            PoolUnwind uw{s, id};
+            if (wfs::pool_return(s, claim, pool_fork_unwind, &uw) && id) {
+                // The entry did not go back -- pool_return has removed its tree -- so nothing
+                // references the snapshot through it any more and the row goes on its own.
                 Guard g(s->mu);
                 Txn t(s->db);
                 Stmt del(s->db, "DELETE FROM worlds WHERE id=?");
                 if (del.ok()) { del.i64(1, (int64_t)id); del.step(); }
                 t.commit();
             }
-            // The rename may already have happened (the failure was the stat or the row); put
-            // the tree back under its pool name first, or pool_return would find nothing there
-            // and the entry would be left at --to with no row that knows about it.
-            if (renamed) wfs::fs_rename_excl(target.c_str(), claim.path.c_str());
-            wfs::pool_return(s, claim);   // and fall through to cloning it here and now
+            // ... and fall through to cloning it here and now
         }
     }
 

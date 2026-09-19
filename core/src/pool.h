@@ -43,9 +43,27 @@ using PoolClaimHook = int (*)(void *ctx, const PoolClaim &c);
 int pool_claim(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, PoolClaim &out,
                PoolClaimHook on_claimed = nullptr, void *hook_ctx = nullptr);
 
-// Puts a claimed entry back because the hand-out failed. Best effort: if the row cannot be
-// written the tree is removed instead, so nothing is left that gc would have to guess about.
-void pool_return(wfs_store *s, const PoolClaim &c);
+// Whatever the returner has to un-write *together with* the return. It runs inside
+// pool_return's BEGIN IMMEDIATE, after the entry's row is back and before the commit, and a
+// non-zero return rolls the whole return back.
+//
+// PR #1 review (16th round): the mirror of PoolClaimHook, closing the other half of the same
+// window. The fork's CREATING world row is what makes a claimed entry visible to `discard
+// S<n>`; deleting it before the entry was back in the pool left an instant in which the
+// reference count saw neither of the two, and the return then published a READY entry for a
+// snapshot that had been trashed in between -- a full stale clone, handed to the next fork as a
+// live baseline. The hook already runs under the store mutex and inside a transaction: it must
+// take neither.
+using PoolReturnHook = int (*)(void *ctx, const PoolClaim &c);
+
+// Puts a claimed entry back because the hand-out failed, together with whatever `on_returned`
+// has to write in the same transaction. Returns 0 when the entry is in the pool again, and
+// non-zero when it is not -- the tree is gone from under the claimer, the row will not insert,
+// the snapshot is not this snapshot any more, or the hook refused. In that case the tree is
+// removed instead (best effort), so nothing is left that gc would have to guess about, and the
+// caller still owns whatever it was holding.
+int pool_return(wfs_store *s, const PoolClaim &c, PoolReturnHook on_returned = nullptr,
+                void *hook_ctx = nullptr);
 
 // Ready entries for `snapshot` whose identity still matches. Cheap enough for `fork` to report.
 int pool_ready_for(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, uint64_t *out);
