@@ -315,6 +315,10 @@ int wfs_pool_status(wfs_store *s, wfs_pool_stat *buf, size_t cap, size_t *count)
 int wfs_pool_drain(wfs_store *s, wfs_id snapshot, uint64_t *removed);
 /* Ready entries for `snapshot` right now (0 when the snapshot has none). */
 int wfs_pool_ready(wfs_store *s, wfs_id snapshot, uint64_t *out);
+/* 1 when a filler holds the store's pool lock right now. A caller about to spawn a background
+ * top-up asks first: starting a second filler only to have it exit on the lock costs a process
+ * start on the fork's own critical path. */
+int wfs_pool_filling(wfs_store *s);
 
 /* ---- the exec lock (P5) ----------------------------------------------------------------
  *

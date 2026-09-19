@@ -34,7 +34,8 @@ DAG              SQLite:谁从谁 fork、来源快照、fork 时的 FSEvents id
 ├── snapshots/S<n>/root/         gate 保护:根目录 0000(`--hard` 时改为逐条目 uchg)
 ├── locks/W<n>.lock              `world exec` 的锁(pid + flock,P5)
 ├── tmp/                         `world exec` 生成的 seatbelt profile
-├── pool/S<n>/<uuid>/            预克隆的 World,尚未分配
+├── pool/S<n>/<uuid>/            预克隆的 World,尚未分配(无 marker、无 worlds 行;T1.5)
+├── logs/pool.log                后台 filler 的输出(T1.5)
 ├── trash/W<n>-<ts>/             discard 后的 World,保留期(默认 7 天)内可 restore
 └── worlds/W<n> -> <user path>   仅记录,World 真身在用户路径
 ~/worlds/W<n>/<name>/            World 根;含 .world 标记文件
@@ -75,22 +76,23 @@ store 目录加 `.noindex`(Spotlight)并 `tmutil addexclusion`(Time Machine),无
 - [x] T1.2 CLI:init/fork/checkpoint/list/inspect/discard/restore/gc/status/verify/adopt,错误信息可读,P1/P2/P4/P7/P11
 - T1.3 diff:FSEvents 层 + 全扫回退 + 比对,P10;输出格式同 arch.md §25
 - [x] T1.4 exec:cwd/env/lock/seatbelt profile,P5/P14
-- T1.5 pool:后台预克隆(launchd agent 或 `world fs pool fill`),fork 命中率统计
+- [x] T1.5 pool:预克隆(`world fs pool fill/status/drain`;命中后由 fork 自己起一个游离的后台 filler,
+      不用 launchd agent —— 没有常驻进程要管,store 级 flock 保证只有一个 filler)
 - T1.6 safety 测试套件 `scripts/tests/safety.sh`:P1–P14 每条一个用例,全部必须过
-- T1.7 基准:fork 延迟(带/不带保护)、diff O(changes) 验证、1000 idle World、存储增长;对照 arch.md §1 判据
+- [x] T1.7 基准:`scripts/bench/m1_criteria.sh` → [`docs/M1_RESULTS.md`](M1_RESULTS.md),六节全部对照 arch.md §1
 - T1.8 文档:arch.md 增补测量结论与转向章节;README 改写
 
 顺序:T1.1 → T1.2 → T1.3/T1.4/T1.5 → T1.6/T1.7 → T1.8。
 
 ## 6. 对 arch.md §1 判据的预期
 
-| 判据 | 预期 |
-|---|---|
-| fork < 10ms p50 | pool 命中时满足;pool 空时 0.07–0.4s(10k–50k 文件) |
-| git/build ≥ 90% | 99–102% |
-| 1000 idle branches | 1000 个目录,元数据约 15GB(5 万文件树) |
-| 存储 ≈ divergence | 改 1% 文件物理 +0.36% |
-| diff O(changes) | FSEvents 正常时满足;丢事件时退化为 O(tree) |
+| 判据 | 预期 | T1.7 实测(docs/M1_RESULTS.md) |
+|---|---|---|
+| fork < 10ms p50 | pool 命中时满足;pool 空时 0.07–0.4s(10k–50k 文件) | 命中 8.7–9.3 ms(与树大小无关),未命中 0.025/0.111/0.514 s |
+| git/build ≥ 90% | 99–102% | 99–117%(重步骤最差 99%),agentstress 10 场景 99–147% |
+| 1000 idle branches | 1000 个目录,元数据约 15GB(5 万文件树) | 1 万条目树 × 1000 = 3.40 GB 物理、351 B/条目;`fs list` 10 ms;`gc` 真删要 525 s |
+| 存储 ≈ divergence | 改 1% 文件物理 +0.36% | 100 个 50k World + 各改 1% = 100 份真副本的 13.6%(克隆元数据占大头) |
+| diff O(changes) | FSEvents 正常时满足;丢事件时退化为 O(tree) | 事件路径只比对 800 个候选(0.354 s);但全扫常数太小(0.185 s),默认仍是全扫 |
 
 ## 7. 快照保护的修正(2026-09-19,T1.1b)
 

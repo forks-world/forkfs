@@ -78,8 +78,15 @@ W7  /Users/me/w/c  (pool)
 
 The fork that took an entry puts one back: it spawns a detached `world fs pool fill S<n>` whose
 output goes to `<store>/logs/pool.log`, so the next fork is fast again and this one does not wait
-for it. `$WORLD_POOL_TOPUP` sets how many to keep ready (default 2; `0` turns the automatic top-up
-off). A store-level `flock` makes two fillers one. `--no-pool` on `fork` always clones here and now.
+for it (and if a filler is already running, it does not even spawn one). `$WORLD_POOL_TOPUP` sets
+how many to keep ready (default 2; `0` turns the automatic top-up off). A store-level `flock` makes
+two fillers one. `--no-pool` on `fork` always clones here and now.
+
+Measured (T1.7, [`docs/M1_RESULTS.md`](docs/M1_RESULTS.md)): a pool hit is **8.6 / 9.0 / 9.7 ms**
+for a 1k / 10k / 50k-entry tree, whole command, process start included — against 0.026 / 0.110 /
+0.505 s when the pool is empty. What the pool buys is latency, not throughput: 1000 forks back to
+back are only 10% faster with it, because the machine still does 1000 `clonefile`s, just not while
+the fork is waiting.
 
 The pool is opt-in: nothing is pre-cloned until you ask for it, because every entry costs a real
 tree's worth of APFS metadata (~308 B/entry) until it is used or drained. `world fs verify S<n>`
@@ -207,6 +214,9 @@ tried on `/usr/bin/true`. If that probe fails, `world exec` falls back to runnin
 and says so loudly, unless `--require-sandbox` was given.
 
 ## Measured cost (macOS 27.0, M1 Mac mini, best of 3)
+
+Against the arch.md §1 success criteria: [`docs/M1_RESULTS.md`](docs/M1_RESULTS.md)
+(`scripts/bench/m1_criteria.sh`, six sections, re-runnable one at a time with `--only N`).
 
 | tree (entries incl. root) | `fs init` | `fs fork` | `fs verify` |
 |---|---|---|---|

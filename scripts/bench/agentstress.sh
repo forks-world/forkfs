@@ -1,9 +1,17 @@
 #!/bin/bash
 # Coding-agent IO stress suite: native dir vs worldfs mount. No network; all data is generated locally.
-# Usage: scripts/bench/agentstress.sh <native-dir> <mount-dir> [scale=1]
+# Usage: scripts/bench/agentstress.sh [--plain] <native-dir> <world-dir> [scale=1]
 # Each scenario prints: name  native_s  worldfs_s  native%  [check]
+#
+# --plain: the second directory is an ordinary directory (an M1 clonefile World), not a worldfs
+# mount. The aliasing guard below compares mount points, which would refuse a World: a World is
+# plain APFS on the same volume as the native side, which is the whole point of the M1 design.
+# The guard still has a job there -- the two sides must not be the same tree -- so --plain keeps
+# that part and drops the mount-point part.
 set -uo pipefail
 export PATH=/opt/homebrew/bin:$PATH
+PLAIN=0
+if [ "${1:-}" = --plain ]; then PLAIN=1; shift; fi
 N=$1; W=$2; SCALE=${3:-1}
 HERE=$(cd "$(dirname "$0")" && pwd)
 PY=python3
@@ -15,6 +23,16 @@ guard_native_not_aliased() {
     local nat mnt nat_mp mnt_mp back
     nat=$(cd "$N" && pwd -P) || exit 2
     mnt=$(cd "$W" && pwd -P) || exit 2
+    if [ "$nat" = "$mnt" ]; then
+        echo "refusing to run: both sides are $nat" >&2
+        exit 2
+    fi
+    if [ "$PLAIN" = 1 ]; then
+        # Two different directories on real APFS is all this mode needs.
+        case "$mnt/" in "$nat/"*) echo "refusing to run: $mnt is inside $nat" >&2; exit 2;; esac
+        case "$nat/" in "$mnt/"*) echo "refusing to run: $nat is inside $mnt" >&2; exit 2;; esac
+        return 0
+    fi
     mountpoint_of() { df "$1" | tail -1 | awk '{for(i=9;i<=NF;i++) printf "%s%s", $i, (i<NF?" ":"")}'; }
     inside() { case "$1/" in "$2/"*) return 0;; *) return 1;; esac; }
     nat_mp=$(mountpoint_of "$nat"); mnt_mp=$(mountpoint_of "$mnt")
@@ -66,7 +84,8 @@ PY
 }
 noop() { :; }
 ok() { :; }
-echo "scenario                  native    worldfs  native%  correctness   (scale=$SCALE)"
+RIGHT=worldfs; [ "$PLAIN" = 1 ] && RIGHT=world
+echo "scenario                  native    $RIGHT  native%  correctness   (scale=$SCALE)"
 
 # S1 context-read: grep + find + random reads over a 10k-file tree
 s1_setup() { gen_tree "$1/tree" $((200*SCALE)) 50 4; }

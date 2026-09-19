@@ -482,8 +482,11 @@ static int cmd_fork(wfs_store *s, int argc, char **argv) {
         if (rc == WFS_E_WORLD_BUSY && from.kind == WFS_K_WORLD) return busy_refusal(s, from.id, "fork from");
         if (rc) return explain_path(s, target, rc, "fork");
         printf("W%llu  %s%s\n", (unsigned long long)res.world, target, res.from_pool ? "  (pool)" : "");
-        // Put back what this fork took, in the background, so the next one is fast too.
-        if (res.from_pool && !opts.no_pool) spawn_pool_fill(s, from.id, pool_topup_target());
+        // Put back what this fork took, in the background, so the next one is fast too --
+        // unless a filler is already at work, in which case spawning a second one would only
+        // cost this fork a process start to have the child exit on the lock.
+        if (res.from_pool && !opts.no_pool && !wfs_pool_filling(s))
+            spawn_pool_fill(s, from.id, pool_topup_target());
         return EX_OK;
     }
     return fail("fork", rc ? rc : -EEXIST);

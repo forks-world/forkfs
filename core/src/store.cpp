@@ -15,10 +15,17 @@ namespace {
 
 // Schema v2 (docs/M1_DESIGN.md §2). Snapshot ids and world ids are separate sequences, so
 // S1 and W1 can both exist; the CLI prints the prefix.
-const char *kSchema =
+// Run on every open: journal_mode is persistent in the file, but `synchronous` and
+// `foreign_keys` are per-connection.
+const char *kPragmas =
     "PRAGMA journal_mode=WAL;"
     "PRAGMA synchronous=NORMAL;"
-    "PRAGMA foreign_keys=OFF;"
+    "PRAGMA foreign_keys=OFF;";
+
+// Run only when `PRAGMA user_version` says this store has not seen this schema yet. Parsing and
+// executing a dozen DDL statements is ~1 ms, which is a lot next to a pool-served fork's 9 ms
+// (T1.7), and every `world` invocation opens the store exactly once.
+const char *kSchema =
     "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);"
     "CREATE TABLE IF NOT EXISTS snapshots("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -202,8 +209,19 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nullptr);
     if (rc != SQLITE_OK) { wfs_store_close(s); return -EIO; }
     sqlite3_busy_timeout(s->db, 10000);
-    if (sqlite3_exec(s->db, kSchema, nullptr, nullptr, nullptr) != SQLITE_OK) { wfs_store_close(s); return -EIO; }
-    for (const char *m : kMigrations) sqlite3_exec(s->db, m, nullptr, nullptr, nullptr);
+    if (sqlite3_exec(s->db, kPragmas, nullptr, nullptr, nullptr) != SQLITE_OK) { wfs_store_close(s); return -EIO; }
+    int user_version = 0;
+    {
+        Stmt q(s->db, "PRAGMA user_version");
+        if (q.ok() && q.row()) user_version = (int)q.col_i64(0);
+    }
+    if (user_version != WFS_STORE_SCHEMA) {
+        if (sqlite3_exec(s->db, kSchema, nullptr, nullptr, nullptr) != SQLITE_OK) { wfs_store_close(s); return -EIO; }
+        for (const char *m : kMigrations) sqlite3_exec(s->db, m, nullptr, nullptr, nullptr);
+        char pragma[64];
+        ::snprintf(pragma, sizeof pragma, "PRAGMA user_version=%d", WFS_STORE_SCHEMA);
+        sqlite3_exec(s->db, pragma, nullptr, nullptr, nullptr);
+    }
     if (meta_get(s->db, "store_id", s->store_id) != 0) {
         char id[33];
         hex_id(id, sizeof id);

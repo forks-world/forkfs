@@ -268,18 +268,83 @@ S1/S4 的抖动来自 mds 索引新生成的文件。)
       CLI `world fs diff W<n> [--full|--events] [--stat] [--no-xattr] [--no-content]`。
       新文件:`core/src/diff.cpp`、`core/src/platform_darwin_events.cpp`、`core/src/events.h`、
       `core/src/snapshot_access.{h,cpp}`、`core/tests/diff_test.cpp`。详见下节。
-- [ ] T1.5 pool:后台预克隆(现在只需预克隆,不需预 unprotect)
+- [x] T1.5 pool:预克隆池(见下节"T1.5 pool 实现")
 - [~] T1.6 safety 测试套件(P1–P14):P1/P2/P3/P4/P5/P6/P7/P8/P9/**P10**/P12/P13/P14 已覆盖
-      (71 条 + 6 条 P10 全过;更细的精确集合断言在 `core/tests/diff_test.cpp`);
+      (**93 条全过**,含 T1.5 pool 的 13 条;更细的精确集合断言在 `core/tests/diff_test.cpp`);
       P11 的"真实磁盘写满"仍只在 API 层验证
-- [ ] T1.7 基准:fork 延迟、diff、1000 idle World、存储增长
-      **附带一条优化**:全扫的走树现在对每个文件都发 `listxattr(2)`(两边各一次,APFS 上约 10 µs),
-      5 万文件的全扫因此从 0.164 s 涨到 1.354 s——这是全扫最大的一块成本。
+- [x] T1.7 基准:`scripts/bench/m1_criteria.sh`(六节,可 `--only N` 单独重跑)
+      → [`docs/M1_RESULTS.md`](M1_RESULTS.md)。**arch.md §1 五条判据全部达成**:
+
+      | 判据 | 目标 | 实测 | |
+      |---|---|---|---|
+      | fork 延迟 | < 10 ms p50 | pool 命中 **8.6 / 9.0 / 9.7 ms**(1k/10k/50k,含进程启动;地板 4.4 ms) | 达成 |
+      | | | pool 空:0.026 / 0.110 / 0.505 s(裸 `clonefile` 0.006 / 0.082 / 0.455 s) | 参考 |
+      | git/build | ≥ 90% native | 99–117%(> 0.5 s 的步骤最差 99%);agentstress 10 场景 99–147% | 达成 |
+      | 1000 idle World | 可承受 | 建完 114 s、3.40 GB 物理(351 B/条目)、metadata.db 0.4 MB、`fs list` 10 ms / 7.8 MB RSS | 达成 |
+      | 存储 ≈ divergence | — | 100 个 50k World + 各改 1% = 100 份真副本的 **13.6%**;改动部分放大 44×(4 KiB COW 块) | 达成 |
+      | diff | O(changes) | 50k/800 改动:`--events` 0.354 s(只比对 800 个候选)、`--full --no-xattr` 0.185 s、默认 1.420 s | 达成 |
+      | safety + ctest | 全过 | safety 93/93,ctest 2/2 | 达成 |
+
+      三条值得记下来的结论:
+      1. **pool 买的是延迟,不是吞吐**。1000 次背靠背 fork,pool 命中 1000/1000,但总时间只从 114 s 降到 102 s:
+         那 1000 次 clonefile 还是这台机器做的,只是挪出了 fork 的关键路径。单次 p50 在这种打法下是 102 ms 而不是 9 ms。
+         9 ms 是 agent 真实的场景——偶尔 fork 一次,克隆早被别人做完了。
+      2. **最贵的一步是删**。`gc --retention 0` 真删 1000 个 1 万条目的 World = 1040 万次 unlink,**525 s**(≈50 µs/条目),
+         比建它们贵 4.6×。要频繁回收就得把 gc 做成后台增量的(M2)。
+      3. **事件路径这一轮 0.354 s,比 T1.3 那次的 0.087 s 慢 4×**,而且同一棵树逐次波动 0.14–0.49 s:
+         波动在建流 + 等 fseventsd 水位标,与改动数无关。全扫则稳定。T1.3 把全扫定为默认的决定,本轮复核**不变**。
+
+      **仍然挂着的一条优化**:全扫的走树现在对每个文件都发 `listxattr(2)`(两边各一次,APFS 上约 10 µs),
+      5 万文件的全扫因此从 0.185 s 涨到 1.420 s——这是全扫最大的一块成本。
       `core/src/platform_posix.cpp` 的 walker 应该换成 `getattrlistbulk(2)`,
       用 `ATTR_CMNEXT_EXT_FLAGS` 拿 `EF_NO_XATTRS`,**没有 xattr 的文件直接跳过 listxattr**
       (绝大多数文件都没有),顺带一次系统调用批量拿到 stat 信息。
       做完之后默认的全扫应该能逼近 `--no-xattr` 的数字,默认选路的阈值要跟着复核。
 - [ ] T1.8 文档:arch.md 增补章节、README
+
+#### T1.5 pool 实现(2026-09-19)
+
+**一个 pool 条目 = 一个"等着被领走的 World"**:`<store>/pool/S<n>/<uuid>/` 是快照的一次完整
+`clonefile`(经同一把 `SnapGate`,根已经 chmod 回源树自己的 mode),**没有 `.world` 标记、
+`worlds` 表里也没有行**。所以它还不是 World,外面也够不着它:P7 拒绝 store 里的任何路径
+(这次连"路径还不存在"的情况也拒绝了 —— `<store>/pool/S1/mine` 以前会先撞上 ENOENT),
+`world exec` 的 seatbelt profile 本来就 deny 整个 store。
+
+**领取 = 原有 publish 顺序的尾巴**,条目扮演 `<target>.wfs-tmp` 的角色:
+插入 CREATING 行 → 写 marker → `rename(2)` 到目标 → 提交 ACTIVE。
+认领本身是一条 `BEGIN IMMEDIATE` 里的 `DELETE`,两个并发 fork 拿到的一定是不同条目;
+中间任何一步失败就把条目放回去(`pool_return`)并退回当场 clone,调用方看不出区别。
+条目按 **snapshot id + 该快照的 `created_at`** 建键:快照行不可变,所以对不上就说明这个 id
+现在是另一个快照,永远不发放,`gc` 收走。
+
+| 命令 | 作用 |
+|---|---|
+| `world fs pool fill S<n> [--count K]` | **补到** K 个 ready(不是加 K;默认 2) |
+| `world fs pool status` | 每个快照的 ready / building / stale / 条目数 |
+| `world fs pool drain S<n>\|--all` | 删掉这些预克隆,把空间还回去 |
+| `world fs fork ... --no-pool` | 无视 pool,当场 clone(基准测试用) |
+
+**自动补种**:命中的那次 fork 用 setsid + 双 fork 起一个游离的 `world fs pool fill S<n>`,
+stdin 走 `/dev/null`,stdout/stderr 追加到 `<store>/logs/pool.log`,所以下一次 fork 还是快的,
+而这一次不为它买单。`$WORLD_POOL_TOPUP` 改目标数(0 = 关掉自动补种,基准测试用);
+store 级 `flock`(`<store>/locks/pool.lock`,**非阻塞**)保证同时只有一个 filler,
+抢不到的直接返回 `WFS_E_POOL_BUSY` 而不是排队再克隆一棵。
+**pool 是 opt-in 的**:不 `fill` 就一棵都不预克隆 —— 每个条目要占一棵树的 APFS 元数据
+(~308 B/条目),不能替用户默认决定这笔开销。
+
+`verify S<n>` 顺带检查等着的条目(还在不在、根 mtime 有没有比克隆那一刻新 —— 每条一次 `lstat`,
+不走全树,否则 verify 会和 fill 一样贵);`gc` 收快照已经没了/换了身份的条目、filler 被杀留下的
+`*.wfs-tmp`、以及 `<store>/pool` 下没有任何行认领的目录;`fs status` 多一行 pool 计数。
+
+**顺带的两处优化**:
+(a) `wfs_store_open()` 以前每次都执行一遍建表 DDL。改成用 `PRAGMA user_version` 记录 schema,
+已经初始化过的 store 直接跳过 DDL(PRAGMA 仍然每次执行,`synchronous` 是 per-connection 的)。
+命中一次 pool 总共才 ~9 ms,这一步省下来的 ~1 ms 不是小数。
+(b) 命中后先问一句 `wfs_pool_filling()`(store 的 pool flock 探一下):已经有 filler 在跑就不再起第二个,
+否则那个子进程除了撞锁退出什么也不干,而这次 fork 白付一次 ~4 ms 的进程启动。
+(M1_RESULTS §3 的 pool 那一列是加 (b) 之前测的。)
+
+数字见 [`docs/M1_RESULTS.md`](M1_RESULTS.md) §1。
 
 #### T1.3 diff 实测与结论(2026-09-19,M1 Mac mini / macOS 27.0)
 

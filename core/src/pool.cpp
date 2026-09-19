@@ -417,6 +417,13 @@ extern "C" int wfs_pool_ready(wfs_store *s, wfs_id snapshot, uint64_t *out) {
     return wfs::ready_count(s, snapshot, si.created_at, out);
 }
 
+extern "C" int wfs_pool_filling(wfs_store *s) {
+    if (!s) return 0;
+    wfs::PoolLock probe;
+    int rc = probe.take(s);          // released again by the destructor
+    return rc == WFS_E_POOL_BUSY ? 1 : 0;
+}
+
 extern "C" int wfs_pool_status(wfs_store *s, wfs_pool_stat *buf, size_t cap, size_t *count) {
     if (!s || !count) return -EINVAL;
     *count = 0;
