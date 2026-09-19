@@ -1244,6 +1244,52 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第十八轮:源树自己上的锁要借一下,回滚也是一次会失败的 rename(2026-09-20)
+
+第十八轮,Codex 两条,都是 P2。第一条落在硬链接重放上:第四轮那个"只读目录借一下写位"借的只有
+**目录**,而 `UF_IMMUTABLE`/`UF_APPEND` 是**用户**标志、`clonefile` 会原样复制到克隆的每一个名字
+上,`link(2)` 和 `rename(2)` 对它们一律 EPERM——一棵源树上有人 `chflags uchg` 过一个硬链接文件,
+`snapshot create`/`pool fill`/`fork` 就全都拒绝。第二条落在 pool 命中那条路的 unwind 上:把树从
+`--to` 搬回 pool 名下的那次 rename**也会失败**,而它的返回值被扔掉了,于是 CREATING 行被删掉、
+一棵带着 `.world` 标记的树留在用户目录里没有任何东西叫得出它的名字。**一条一个提交、一个测试,
+先验证过"没有修复就会红"。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P2 `PRRT_kwDOUf7jGc6kDTs4` | `hardlinks.cpp` `LendStack` / `relink_under_lend()` | `UF_IMMUTABLE` 和 `UF_APPEND` 是**用户**标志——`chflags uchg`,vendor 进来的树、发布目录、被人冻住的 fixture 都可能带着——而 `clonefile(2)` 会把它们原样复制到克隆的**每一个名字**上(实测:源里一个 inode 两个名字带 `uchg`,克隆出来是两个 inode、两个都带 `0x2`)。重放那一对系统调用于是一个都跑不了:`link(2)` 对 immutable / append-only 的**源**回 EPERM,`rename(2)` 要顶掉一个 immutable 的**目标**也回 EPERM。第四轮那条重试只借**目录**的写位,帮不上忙;而第四轮起重放失败是致命的(`first_err` 一路返回,快照/fork/pool 填充全部 unwind),所以一棵完全正常的源树会让 `snapshot create`、`pool fill` 和每一次 fork 都回 `-EPERM`,而且是因为用户在树里某个文件上有意设的一个标志 | **那两个 inode 也照目录的办法借。** 重试路径上除了目录,还把这一对调用真正碰到的两个文件借下来:**正身文件**(每一个新名字最后都是它)和 **rename 要顶掉的那个名字**。fd 都是从第十七轮那个目录描述符 `openat(O_RDONLY\|O_NOFOLLOW)` 拿的——成员路径的叶子同样不许是符号链接,而且借的就是 link/rename 要进去的那个目录里的那个文件;immutable 的文件是允许只读打开的,清掉自己文件上的 `UF_` 标志是属主的权利。清标志 → link + rename → **一字不差地还回去**,成功和失败两条路都还(和目录模式同一个 `LendStack`,析构里倒着还)。一组只还一次:`link` 之后每一个名字就是同一个 inode 了,还它就是还整组。唯一不还的是被 rename 顶掉的那个 inode——它已经没有名字了,标志没有东西可穿。(`--hard` 快照不走这条:fork 会先 `fs_unprotect_tree` 把整棵克隆解开再重放。这一条管的是**源树自己**带的标志) | `1a92a21` |
+| P2 `PRRT_kwDOUf7jGc6kDTs9` | `world.cpp` `wfs_world_create_ex()` pool 命中那条路的 unwind | pool 命中那条路的尾巴是 marker、rename、stat、UPDATE。stat 或 UPDATE 失败时树**已经在**用户的 `--to` 上了,所以 unwind 先把它 rename 回 pool 名下——而这次 rename 的返回值是**扔掉**的。`pool_return()` 于是 `stat` 到一个空的 pool 路径、回 `-ENOENT`,调用方把这个非零读成"条目没回去,那 CREATING 行只能自己走"并**删掉了那条行**:`--to` 上留着一棵带 `.world` 标记的完整世界,而 store 里没有任何东西叫得出它的名字——gc 的半成品 fork 清扫是从 CREATING 行的 `tmp_path` 出发的(第五、七轮),`world fs adopt` 要 marker 指着本店**有**的那个 world。更糟的是 fork 并不停:它接着掉进普通克隆那条路,在**同一个 `--to`** 上又克隆一棵树,然后报成功 | **回滚的结果要查。** 真回去了才进 `pool_return()` 和第十六轮那个"行出去和条目回来在同一个事务里"的 unwind;没回去就到此为止:行**留在 CREATING**,`tmp_path` 改写成这棵树现在真正的名字,也就是那个已经发布的 `--to`。这样的行正是"fork 在 publish 之前被 kill"留下的那一种——树在数据库里唯一的名字(P8)——所以 `gc_tmp_is_removable()` 原样接受它:它问 marker 这棵树是谁的(`.world` 里的 world id 就是这一行),问行是不是还写着 CREATING + 这个 `tmp_path`,两问都对得上;`world fs adopt` 也一样能收。调用方拿到的是**最初那个错误**,而不是一棵没人认领的树旁边一份新克隆。整段时间里快照始终有引用(那条 CREATING 行),第十六轮那条不变量照旧 | `84d22e8` |
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **257 passed, 0 failed**(本轮没加,两条都在核心里);
+`check-deps.sh` 全绿。(`m1_criteria.sh` 本轮跳过。)
+
+先把测试跑红过:
+
+- **源树带 `uchg`(P2 其一)**:`d/a`、`d/b` 一个 inode 两个名字,`chflags uchg d/a`。**老代码**:
+  `wfs_snapshot_create` 回 **-1(Operation not permitted)**——快照根本做不出来。单独探过底层:
+  `clonefile` 之后克隆里两个名字**各带 `0x2`**,`link(克隆的 a, 临时名)` → EPERM;把正身的标志清掉
+  之后 link 过了,`rename(临时名, 克隆的 b)` 又 → EPERM(**被顶掉的那个名字自己也是 immutable 的**),
+  所以两个 inode 都得借。`uappnd`(`0x4`)一模一样。**新代码**:快照做得出来、组记在案,gate 后面
+  `d/a`、`d/b` 还是一个 inode 两个名字、标志还在;fork 和 pool 命中的 fork 都把这一对重建出来,
+  标志还在,树里不留 `.wfs-hl-` 临时名。
+- **回滚跑不了(P2 其二)**:新的 `wfs_test_after_pool_publish` 在 publish rename 之后、拥有这棵树的
+  那条 UPDATE 之前把树搬到旁边一个名字上,于是 stat 和回滚 rename 都回 ENOENT。**老代码**:
+  `wfs_world_create` 回 **0**(而且新建了 **W2**——在同一个 `--to` 上又克隆了一棵),
+  `wfs_world_info(W1)` 回 **-2**(CREATING 行被删了),被发布出去的那棵树读回来是
+  **"unregistered copy of a world"**(`registered=0`、`has_marker=1`)——没人认领,`pool ready=0`。
+  **新代码**:fork 失败,行还是 CREATING、`tmp_path` 写着那个 `--to`,pool 里没有条目回去,
+  `discard S<n>` 还是 `WFS_E_SNAPSHOT_IN_USE`,`world fs adopt` 把搬走的那棵树收编。
+
+新增测试:
+
+- `core_test`(P2 其一):`uchg` 和 `uappnd` 两趟,每趟三条路——`snapshot create`(组记在案、gate
+  后面标志还在、`.wfs-hl-` 不留)、`fork --no-pool`(重建那一对、标志还在)、`pool fill` + 命中的
+  fork(同上)。
+- `core_test`(P2 其二):同一条 seam 的两个形状。**树被搬走**:回滚 ENOENT,行留 CREATING 且
+  `tmp_path` 指着 `--to`(直接读 `metadata.db` 的那一列——没有任何公开结构带它),pool 没有条目
+  回去,快照仍被引用,`world fs adopt` 收编搬走的那棵树。**树留在原地**:把 `--to` 的父目录 `chmod 0`,
+  stat 和回滚 rename 都回 EACCES,树就留在发布出去的位置上——这正是 gc 要认的那一种,
+  `wfs_test_fork_owner_pid` 把生产者写成一个死 pid 之后,`wfs_gc` 报 `tmp_removed`、树没了、行落 DEAD。
+
 #### PR #1 review 第十七轮:分量必须是真名字,标记指着谁是判决不是提示(2026-09-20)
 
 第十七轮,Codex 两条:一条 P1、一条 P2。P1 是第十一、十四轮那条"成员路径必须是树内相对路径"
