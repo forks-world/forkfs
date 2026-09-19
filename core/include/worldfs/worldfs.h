@@ -816,6 +816,15 @@ extern void *wfs_test_before_trash_orphans_ctx;
 extern void (*wfs_test_before_pool_sweep)(void *ctx);
 extern void *wfs_test_before_pool_sweep_ctx;
 
+/* And the pool filler's own window (PR #1 review, 15th round): called once per entry, after the
+ * snapshot row has been read and before the transaction that inserts the entry's CREATING pool
+ * row. What a test does in there is a `discard S<n>` on a second handle -- which, until the
+ * insert re-read the snapshot under its own write lock, counted no pool rows at all and let the
+ * filler publish a READY clone of a snapshot on its way to the trash. NULL unless a test sets
+ * it; nothing in the library ever assigns it. */
+extern void (*wfs_test_before_pool_insert)(void *ctx);
+extern void *wfs_test_before_pool_insert_ctx;
+
 /* And reconciliation's window (PR #1 review, 9th round): called once per gc, between the scan
  * that decides which ACTIVE rows have no tree at their recorded path and the updates that bury
  * them. What a test does in there is `world fs verify <the new path>` on a world that was merely

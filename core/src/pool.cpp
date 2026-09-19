@@ -24,6 +24,12 @@
 extern "C" void (*wfs_test_before_pool_sweep)(void *ctx) = nullptr;
 extern "C" void *wfs_test_before_pool_sweep_ctx = nullptr;
 
+// And the filler's own window (PR #1 review, 15th round): between the snapshot row wfs_pool_fill
+// reads once and the transaction that inserts an entry's CREATING pool row. Nothing in the
+// library ever assigns these either.
+extern "C" void (*wfs_test_before_pool_insert)(void *ctx) = nullptr;
+extern "C" void *wfs_test_before_pool_insert_ctx = nullptr;
+
 namespace wfs {
 
 namespace {
@@ -166,9 +172,30 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
     int64_t created = now_sec();
 
     wfs_id row = 0;
+    if (wfs_test_before_pool_insert) wfs_test_before_pool_insert(wfs_test_before_pool_insert_ctx);
     {
         Guard g(s->mu);
         Txn t(s->db);
+        // PR #1 review (15th round, P2): the snapshot, re-read here rather than carried in from
+        // the single read at the top of wfs_pool_fill. A `discard S<n>` in between counts its
+        // references under BEGIN IMMEDIATE, sees no pool row for an entry that does not exist
+        // yet, and commits its row in WFS_ST_TRASHING -- and the filler, whose source tree has
+        // not moved yet, cloned it and published a READY entry for a snapshot on its way to the
+        // trash. pool_collect() buries such an entry a wake later, but a fork in between takes
+        // it as a live baseline.
+        //
+        // This transaction is BEGIN IMMEDIATE too, so the two serialise: either the discard is
+        // first and this read sees a snapshot that is not ACTIVE, or this insert is first and
+        // the discard counts the row it just wrote (a refusal without --force, a drain with it).
+        // created_at is part of the question because it is the identity the entry carries:
+        // snapshot_id plus snap_created_at is what a fork claims an entry by.
+        {
+            Stmt sq(s->db, "SELECT state, created_at FROM snapshots WHERE id=?");
+            if (!sq.ok()) return -EIO;
+            sq.i64(1, (int64_t)snapshot);
+            if (!sq.row()) return -ESTALE;
+            if (sq.col_i64(0) != WFS_ST_ACTIVE || sq.col_i64(1) != si.created_at) return -ESTALE;
+        }
         // PR #1 review (3rd round): who is filling this entry, so gc can tell a filler that died
         // from one that is still cloning a 50 000-entry tree.
         int64_t opid = (int64_t)::getpid();
@@ -682,6 +709,11 @@ extern "C" int wfs_pool_fill(wfs_store *s, wfs_id snapshot, int target, uint64_t
     if (int rc = wfs::fs_mkdir_p(dir.c_str())) return rc;
     while (ready < (uint64_t)target) {
         if (int rc = wfs::space_for(s, si.entries)) return rc;
+        // PR #1 review (15th round, P2): -ESTALE out of build_one() is "the snapshot stopped
+        // being this snapshot while we were filling" -- the insert re-read it under the write
+        // lock and it is not ACTIVE any more. Stop, and hand the caller the same -ESTALE a fill
+        // aimed at an already-discarded snapshot gets from the check above: `pool fill` prints
+        // "S<n> is not an active snapshot", which is what happened.
         if (int rc = wfs::build_one(s, snapshot, si, dir)) return rc;
         ++ready;
         if (made) (*made)++;

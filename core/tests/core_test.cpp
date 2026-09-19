@@ -586,6 +586,27 @@ static void fill_before_sweep(void *ctx) {
     if (!g_pool_rc && made != 1) g_pool_rc = -EINVAL;
 }
 
+// PR #1 review (15th round, P2): the filler's own window. The seam runs after wfs_pool_fill has
+// read the snapshot row and before the transaction that inserts an entry's CREATING pool row;
+// what it does in there is a `discard S<n>` on a second handle, stopped (phase 0) at the point
+// where the row is committed in TRASHING and the tree has not moved yet -- so the clone that
+// follows would still succeed, and the entry would be published READY for a snapshot on its way
+// to the trash.
+static wfs_store *g_pins_store = NULL;
+static wfs_id g_pins_snap;
+static int g_pins_ran;
+static int g_pins_rc;
+static void discard_before_pool_insert(void *ctx) {
+    (void)ctx;
+    if (g_pins_ran) return;
+    g_pins_ran++;
+    wfs_test_trash_crash = trash_crash;
+    crash_at(0);
+    g_pins_rc = wfs_snapshot_discard(g_pins_store, g_pins_snap, 0, 0);
+    crash_at(-1);
+    wfs_test_trash_crash = NULL;
+}
+
 // PR #1 review (9th round, P1): `discard W<n> --now`'s own window. Phase 4 is inside the helper
 // that deletes a trash entry here and now, after it has followed the tree to whatever name it
 // has and before it marks it `.deleting`. What runs in there is a whole `restore` on a second
@@ -3036,6 +3057,66 @@ int main() {
         wfs_store_close(pb);
         wfs_store_close(pa);
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", pstore, (unsigned long long)p1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
+    // ---- PR #1 review (15th round, P2): the filler's entry is a reference, taken under the ----
+    // ---- same write lock the discard counts references under ---------------------------------
+    //
+    // wfs_pool_fill reads the snapshot row once and then inserts one CREATING pool row per
+    // entry. A `discard S<n>` landing between the two counts references under BEGIN IMMEDIATE,
+    // finds no pool row (this one does not exist yet) and commits its row in TRASHING -- and the
+    // filler, whose source tree has not moved yet, went on to clone it and publish a READY entry
+    // for a snapshot that is on its way to the trash, which the next fork takes as a live
+    // baseline. The insert re-reads the snapshot inside its own transaction now: ACTIVE, and the
+    // same created_at the entry would carry, or the fill stops (docs/M1_DESIGN.md P18).
+    {
+        char fstore[4096], fsrc[4096], fpool[4096];
+        join(fstore, sizeof fstore, root, "fillrace-store");
+        join(fsrc, sizeof fsrc, root, "fillrace-src");
+        CHECK(mkdir(fsrc, 0755) == 0);
+        join(p, sizeof p, fsrc, "a.txt");
+        write_file(p, "one\n");
+        wfs_store *fa = NULL, *fb = NULL;
+        CHECK_OK(wfs_store_open(fstore, &fa));
+        CHECK_OK(wfs_store_open(fstore, &fb));   // the discard runs on a handle of its own
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "fb";
+        wfs_id f1 = 0;
+        CHECK_OK(wfs_snapshot_create(fa, fsrc, &sopts, &f1));
+        snprintf(fpool, sizeof fpool, "%s/pool/S%llu", fstore, (unsigned long long)f1);
+        g_pins_store = fb;
+        g_pins_snap = f1;
+        g_pins_ran = 0;
+        g_pins_rc = 0;
+        wfs_test_before_pool_insert = discard_before_pool_insert;
+        uint64_t fmade = 0, fready = 0;
+        CHECK_RC(wfs_pool_fill(fa, f1, 1, &fmade), -ESTALE);
+        wfs_test_before_pool_insert = NULL;
+        CHECK(g_pins_ran == 1);
+        CHECK_RC(g_pins_rc, -EINTR);              // row committed in TRASHING, tree still in place
+        CHECK(fmade == 0);
+        CHECK_OK(wfs_pool_ready(fa, f1, &fready));
+        CHECK(fready == 0);                       // nothing was published ...
+        CHECK(n_with_prefix(fpool, "") == 2);     // ... and nothing was left on disk either
+        wfs_snapshot_rec fsr;
+        CHECK_OK(wfs_snapshot_info(fa, f1, &fsr));
+        CHECK(fsr.state == WFS_ST_TRASHING);
+        // The interrupted discard resolves the way it always did -- the tree never moved, so the
+        // snapshot goes back to ACTIVE -- and a fill then does exactly what it was asked to do.
+        wfs_store *fc = NULL;
+        CHECK_OK(wfs_store_open(fstore, &fc));    // the open runs the TRASHING recovery
+        CHECK_OK(wfs_snapshot_info(fc, f1, &fsr));
+        CHECK(fsr.state == WFS_ST_ACTIVE);
+        CHECK_OK(wfs_pool_fill(fc, f1, 1, &fmade));
+        CHECK(fmade == 1);
+        CHECK_OK(wfs_pool_ready(fc, f1, &fready));
+        CHECK(fready == 1);
+        CHECK(n_with_prefix(fpool, "") == 3);
+        wfs_store_close(fc);
+        wfs_store_close(fb);
+        wfs_store_close(fa);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", fstore, (unsigned long long)f1);
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 
