@@ -33,7 +33,10 @@ static void usage(void) {
           "  checkpoint W<n> [--name N] [--hard] [--force]\n"
           "                                   snapshot a live world; the world stays writable\n"
           "  diff W<n> [--full|--events] [--stat] [--no-xattr] [--no-content]\n"
-          "                                   what changed since the fork (A/M/D/T, sorted)\n"
+          "                                   what changed since the fork (A/M/D/T, sorted).\n"
+          "                                   Walks both trees by default -- exact, and faster than\n"
+          "                                   the FSEvents path below ~200k entries; --events asks\n"
+          "                                   for FSEvents anyway, --full always walks\n"
           "  list                             snapshots and worlds\n"
           "  inspect W<n>|S<n>\n"
           "  discard W<n> [--now] [--force]   move to the store trash (--now deletes at once)\n"
@@ -377,6 +380,9 @@ static int diff_print(void *ctx, const wfs_diff_entry *e) {
     return 0;
 }
 
+// Only the reasons worth printing: the full scan is the default path (WFS_DF_SMALL_TREE) and
+// `--full` is what the user asked for, so neither is news. The rest mean "you asked for
+// O(changes) and could not have it", which P10 promises to say out loud.
 static const char *fallback_reason(int f) {
     switch (f) {
     case WFS_DF_NO_CURSOR: return "no FSEvents cursor was recorded when this world was forked";
@@ -398,6 +404,7 @@ static int cmd_diff(wfs_store *s, int argc, char **argv) {
     int flags = 0, stat_only = 0;
     for (int i = 0; i < argc; ++i) {
         if (!strcmp(argv[i], "--full")) flags |= WFS_DIFF_FULL;
+        else if (!strcmp(argv[i], "--events")) flags |= WFS_DIFF_EVENTS;
         else if (!strcmp(argv[i], "--stat")) stat_only = 1;
         else if (!strcmp(argv[i], "--no-content")) flags |= WFS_DIFF_NO_CONTENT;
         else if (!strcmp(argv[i], "--no-xattr")) flags |= WFS_DIFF_NO_XATTR;

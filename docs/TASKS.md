@@ -273,6 +273,12 @@ S1/S4 的抖动来自 mds 索引新生成的文件。)
       (71 条 + 6 条 P10 全过;更细的精确集合断言在 `core/tests/diff_test.cpp`);
       P11 的"真实磁盘写满"仍只在 API 层验证
 - [ ] T1.7 基准:fork 延迟、diff、1000 idle World、存储增长
+      **附带一条优化**:全扫的走树现在对每个文件都发 `listxattr(2)`(两边各一次,APFS 上约 10 µs),
+      5 万文件的全扫因此从 0.164 s 涨到 1.354 s——这是全扫最大的一块成本。
+      `core/src/platform_posix.cpp` 的 walker 应该换成 `getattrlistbulk(2)`,
+      用 `ATTR_CMNEXT_EXT_FLAGS` 拿 `EF_NO_XATTRS`,**没有 xattr 的文件直接跳过 listxattr**
+      (绝大多数文件都没有),顺带一次系统调用批量拿到 stat 信息。
+      做完之后默认的全扫应该能逼近 `--no-xattr` 的数字,默认选路的阈值要跟着复核。
 - [ ] T1.8 文档:arch.md 增补章节、README
 
 #### T1.3 diff 实测与结论(2026-09-19,M1 Mac mini / macOS 27.0)
@@ -323,6 +329,10 @@ S1/S4 的抖动来自 mds 索引新生成的文件。)
 **但它不能证明完整性**:journal 的 flush 不是全局有序的——实测后写的哨兵会比另一个目录里更早的改动先回来。
 再等 150 ms 静默也试过,10k diff 变成 0.22–0.70 s,**比直接走两棵树还慢**,已回退。
 → **结论:最近 ~100–600 ms 内的孤立改动,事件路径可能看不到;`--full` 是确定的答案,而且很便宜。**
+**合并时的新数据:成批改动也不是 100% 安全。**850 条改动的 fixture 在"改完立刻 diff"下,
+27 次里有 2 次事件路径少报(精确集合断言当场失败);journal flush 不是全局有序的,
+哨兵可能比这批里最后一个文件先回来。`diff_test` 因此在这一步也加了 `settle()`——
+它测的是 diff,不是 fseventsd 的定时器。这条数据也是把全扫定为默认的理由之一。
 `core/tests/diff_test.cpp` 里的 `settle()` 就是为此存在:它测的是 diff,不是 fseventsd 的定时器。
 
 **比对(P10:事件只是候选,永远不是答案):**
@@ -332,8 +342,14 @@ S1/S4 的抖动来自 mds 索引新生成的文件。)
 **候选是目录时必须展开**:实测目录改名只产生两条事件(旧名、新名),里面的文件一条都没有,
 所以只在一侧存在的目录要在那一侧走一遍,把每个文件报出来;空目录报它自己。
 只报文件,空目录的 A/D 除外。
-读快照一侧一律经过 `snapshot_open_for_read()`(`core/src/snapshot_access.{h,cpp}`),今天是 no-op,
-gate-directory 落地后 0500 的窗口就开在那一个地方。
+读快照一侧一律经过 `snapshot_open_for_read()`(`core/src/snapshot_access.{h,cpp}`)。
+**合并 T1.1b 之后这不再是 no-op**:`SnapGate` 从 `world.cpp` 搬进 `snapshot_access.{h,cpp}`,
+fork / checkpoint / verify / diff 共用同一份实现、同一把 manifest 上的 flock,
+`snapshot_open_for_read()` 按根目录当前是否可 traverse 决定要不要开门(`--hard` 快照 0555,什么都不用做)。
+**门只在比对阶段开**:FSEvents 建流 + 等水位标(几百 ms)在门外做,
+比对(50k 全扫 0.16–1.4 s)在门内做,排序和回调在门外做。代价要说清楚:
+比对期间同一快照的 `fork` 会阻塞等这把 flock。RAII guard 保证任何错误路径出去时根都被 chmod 回 0000
+(`diff_test` 里有一条专门制造"门开着时走树失败"的用例来验证这一点)。
 
 **xattr 的代价(新发现):** `listxattr(2)` 在 APFS 上约 10 µs/次,两边各一次。
 候选路径上几百个文件无所谓,全扫时是 10 万次系统调用:5 万文件全扫 **0.157 s → 1.339 s(8.6×)**。
@@ -356,8 +372,24 @@ gate-directory 落地后 0500 的窗口就开在那一个地方。
 真正拉开差距的是"要不要比 xattr"(8.6×),不是"要不要用事件"。
 树再大一个数量级时事件路径才重新变成决定性的。
 更糟的是事件路径有一笔固定开销(建流 + 等水位标):**6 个文件的小 World,`--full` 0.002 s,事件路径 0.4 s**,
-交叉点大约在几万文件。这一条建议在 T1.7 里复核后写回 arch.md §25——
-如果结论稳定,`diff` 的默认或许应该按 World 的 `entries` 自动选路,而不是无条件先试事件。
+交叉点大约在几万文件。
+
+**默认路径(2026-09-19 合并时架构师拍板,依据就是上面这些数字):**
+
+- **全扫是默认。** 理由三条:(a) 50k 上事件路径只快 1.9×(0.087 vs 0.164),真正的差距在 xattr 而不在事件;
+  (b) 事件路径的固定开销让小树慢两个数量级(0.002 s → 0.4 s);
+  (c) fseventsd 的 journal flush 不是全局有序的,**最近 ~100–600 ms 内的孤立改动事件路径可能看不见**,
+  而全扫永远是准的。精确优先。
+- **事件路径只在两种情况下走**:World 记录的 `entries` 超过 `WFS_DIFF_EVENTS_MIN_ENTRIES`
+  (常量,默认 **200000**,可用同名环境变量覆盖,0 = 总是先试事件),或者显式 `--events`
+  (C ABI `WFS_DIFF_EVENTS`)。阈值取在实测交叉点(几万)之上一个数量级:全扫是准确答案,事件是优化。
+- **`--full`(`WFS_DIFF_FULL`)压倒一切**,永远走全扫。
+- 哨兵和**全部回退触发条件一条不动**:走事件路径时 MustScan / Dropped / Wrapped / Stale / Timeout /
+  没有 cursor / fork 自 World 仍然静默退回全扫,并在 stderr 打一行原因。
+  新增的 `WFS_DF_SMALL_TREE` 只是 stats 里"这次是按默认走的全扫"的标记,**不是**回退,CLI 不为它打提示。
+- xattr 比对仍然默认开(精确优先),`--no-xattr` 仍然可以关。
+
+这一条在 T1.7 里复核后写回 arch.md §25。
 
 **测试(`core/tests/diff_test.cpp`,独立 ctest target,600 s 超时):**
 10k fixture(100 目录 × 100 文件)+ 500 改 / 200 增 / 100 删 / 50 只改 mode,
@@ -369,9 +401,16 @@ gate-directory 落地后 0500 的窗口就开在那一个地方。
 纯 xattr 改动(事件路径与 `--full` 都报 `T`,`--no-xattr` 故意报不出来)、
 fork 自 World 的子 World 自动全扫、World 被移动后仍能 diff(P1)、
 **来源快照没了(行不是 ACTIVE / 树被移走)→ `WFS_E_SOURCE_GONE`,退出码 3**。
+合并 T1.1b 之后又加了两组:
+**门**(gate 快照的根在 diff 前/后/出错后都必须是 0000;错误路径是在 World 里放一个 0000 的目录让走树失败;
+出错之后紧接着还能从同一快照 fork,证明 flock 放掉了)、
+**默认选路**(阈值取真实值时 `flags=0` 必须是 `full_scan=1 / fallback=WFS_DF_SMALL_TREE`,
+`--events` 必须走事件,`--events --full` 仍然全扫,阈值调小则自动走事件)。
+整个 `diff_test` 跑之前把 `WFS_DIFF_EVENTS_MIN_ENTRIES` 设成 0,否则 10k fixture 下事件路径一条都测不到。
 `WFS_DIFF_BENCH=1` 另跑 5 万文件的基准。
 
-**CLI:** `world fs diff W<n>`;`--stat` 只打计数;回退时在 stderr 打一行原因(P10 是承诺,做不到就要说);
+**CLI:** `world fs diff W<n> [--full|--events] [--stat] [--no-xattr] [--no-content]`;
+`--stat` 只打计数;回退时在 stderr 打一行原因(P10 是承诺,做不到就要说),但默认的全扫和 `--full` 不打;
 trashed / dead World、来源快照没了、World 不在记录的路径上 → 退出码 3;**diff 不拿 World 锁**,
 被人占用的 World 照样可以 diff(`WFS_E_WORLD_BUSY` 不是 diff 的拒绝理由)。
 

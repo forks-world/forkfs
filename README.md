@@ -64,32 +64,45 @@ M src/main.c
 T README.md          # same bytes, different mode / owner / flags / mtime / xattr
 $ world fs diff W1 --stat
 1 added, 1 modified, 1 deleted, 1 metadata-only
+full scan of both trees, 9900 paths compared, 1 files read, 0.233 s
+$ world fs diff W1 --events --stat
+1 added, 1 modified, 1 deleted, 1 metadata-only
 FSEvents since the fork, 2 paths compared, 0 files read, 0.041 s
 ```
 
-The world is compared against the snapshot it was forked from. Candidates come from an FSEvents
-replay starting at the event id recorded at fork time, so the usual cost is O(changes); every
-candidate is then stat'ed on both sides and, when size and mtime disagree, its bytes are read.
-Events are a hint, never the answer (P10). Only files are reported; an empty directory that
-exists on one side only gets its own line, and a rename is a `D` plus an `A` in M1.
+The world is compared against the snapshot it was forked from. **By default `diff` walks both
+trees**: every path is stat'ed on both sides and, when size and mtime disagree, its bytes are
+read. Only files are reported; an empty directory that exists on one side only gets its own
+line, and a rename is a `D` plus an `A` in M1.
 
-`--full` skips FSEvents and walks both trees. The core does that by itself, printing one line of
-reason on stderr, whenever the event stream cannot account for everything: a dropped event, a
-`MustScanSubDirs`, a cursor older than the volume's FSEvents journal (which holds roughly a day),
-or a world that was forked from another world rather than from a snapshot.
+The other path replays FSEvents from the event id recorded at fork time, which makes the cost
+O(changes) rather than O(tree). It is used when the world has more than 200 000 recorded entries,
+or when you ask for it with `--events`; `--full` forces the walk. Events are a hint, never the
+answer (P10): every candidate is verified against the snapshot exactly as the scan verifies it,
+and the core silently falls back to the walk — printing one line of reason on stderr — whenever
+the event stream cannot account for everything: a dropped event, a `MustScanSubDirs`, a cursor
+older than the volume's FSEvents journal (which holds roughly a day), or a world that was forked
+from another world rather than from a snapshot.
 
-Measured on 27.0, 50 000 files with 800 changes: FSEvents **0.087 s**, `--full` 1.354 s, and
-`--full --no-xattr` **0.164 s**. Most of the full scan is the xattr leg of the metadata
-comparison — `listxattr(2)` costs ~10 µs per call on APFS and a full scan makes two per file;
-`--no-xattr` drops it, at the price of not seeing a change that is only an xattr.
+Why the walk is the default, measured on 27.0 with 50 000 files and 800 changes: FSEvents
+**0.087 s**, `--full` 1.354 s, `--full --no-xattr` **0.164 s**. The 4-thread walk is five times
+faster than the design assumed, so the event path wins by under 2× — and only because of the
+xattr leg of the metadata comparison (`listxattr(2)` is ~10 µs per call on APFS and a full scan
+makes two per file; `--no-xattr` drops it, at the price of not seeing a change that is only an
+xattr). Against that, the event path has a fixed cost of its own (building the stream and waiting
+for its watermark): a six-file world diffs in 0.002 s by walking and 0.4 s through FSEvents.
 
-The event path pays a fixed cost of its own (building the stream and waiting for its watermark),
-so on a small tree `--full` wins outright: a six-file world diffs in 0.002 s with `--full` and
-0.4 s through FSEvents. The crossover is somewhere in the tens of thousands of files.
+And it is not only slower on small trees, it is less certain: `fseventsd` writes its journal on
+a timer, so an isolated change takes 90–600 ms to become visible to a stream created after it (a
+burst flushes at once). A `--events` diff run in the same breath as a single edit can miss that
+edit; the walk always sees it. Exactness first, O(changes) when the tree is big enough for it to
+pay — the threshold is `WFS_DIFF_EVENTS_MIN_ENTRIES` (200 000), overridable through the
+environment variable of the same name.
 
-One caveat worth knowing: `fseventsd` writes its journal on a timer, and an isolated change takes
-90–600 ms to become visible to a stream created after it (a burst flushes at once). A diff run in
-the same breath as a single edit can therefore miss that edit; `--full` is always exact.
+Both paths read the source snapshot through its gate: the root is briefly reopened to `0500`
+under an exclusive `flock` on the snapshot's manifest, and only for the comparison phase, so a
+diff delays a concurrent `fork` from that same snapshot by the length of the comparison and not
+by the length of the command.
 
 The store defaults to `~/Library/Application Support/World/fs`; `--store <dir>` or `$WORLD_STORE`
 override it. **The store must be on the same APFS volume as the project**: `clonefile()` returns

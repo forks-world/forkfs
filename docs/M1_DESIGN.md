@@ -98,8 +98,10 @@ per-file `uchg` 实测 50k 文件保护 0.68s、解保护 0.73s(4 线程已是 A
 改为**门目录保护**:快照根目录 mode 0000,内部文件不动;只在 clonefile 窗口内临时 0500。保护不会被克隆进 World,
 fork = clonefile + 标记 + rename。per-file `uchg` 保留为 `--hard`。威胁模型是误操作,两种方式都挡不住 owner 主动解除。
 
-实现(T1.1b 已完成):开关门在 core 里(`SnapGate`),不在 CLI —— 这样每个调用方(fork / verify / 将来的 pool)
-都拿到同一套串行化。窗口用快照 `manifest` 文件上的独占 flock 保护,跨进程串行;克隆出来的根会被 chmod 回源树自己的
+实现(T1.1b 已完成,T1.3 合并后 `SnapGate` 搬到 `core/src/snapshot_access.{h,cpp}`):
+开关门在 core 里(`SnapGate`),不在 CLI —— 这样每个调用方(fork / verify / diff / 将来的 pool)
+都拿到同一套串行化;`diff` 经 `snapshot_open_for_read()` 用的就是这把门,且**只在比对阶段开**
+(建流、排序、回调都在门外),因为门开着的时候同一快照的 fork 要等这把 flock。窗口用快照 `manifest` 文件上的独占 flock 保护,跨进程串行;克隆出来的根会被 chmod 回源树自己的
 mode(记在 `snapshots.root_mode`),所以 World 里看不到 0500 的痕迹。实测见 docs/TASKS.md 的 T1.1b 一节。
 
 ## 8. 其他平台对应层(结论记录)

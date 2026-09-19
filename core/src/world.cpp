@@ -7,6 +7,7 @@
 //   * identity is marker + inode (P1/P2), never the path. Any command that touches a world
 //     re-checks it and repairs the row when the directory has merely moved.
 #include "db.h"
+#include "snapshot_access.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -202,54 +203,10 @@ struct WorldLock {
 
 // ---- P3, the default: the gate directory --------------------------------------------------
 //
-// A snapshot root is chmod 0000. Not being able to traverse a directory is enforced by the
-// kernel before any name below it is resolved, so nothing inside can be listed, read, written,
-// created or deleted -- and no tool, agent or `ls` even sees the contents. The entries
-// themselves are left exactly as the clone made them, which is what makes a fork cheap: there
-// is nothing to undo on the clone (T1.1b; the per-entry UF_IMMUTABLE variant costs 0.68 s to
-// apply and 0.73 s to undo per 50k entries).
-//
-// The root is reopened to 0500 only while the core has to read the tree: the EXDEV probe and
-// the clonefile(dir) of a fork, and the verify walk. That window is serialised across
-// processes by an exclusive flock on the snapshot's manifest file, which lives next to the
-// root and is never gated. Two concurrent forks from the same snapshot therefore do not share
-// the window: the second one waits for the first to close the gate and then opens it again.
-struct SnapGate {
-    String root;
-    uint32_t restore = 0;   // 0 = nothing to do (a --hard snapshot, or never opened)
-    int fd = -1;
-
-    SnapGate() = default;
-    SnapGate(const SnapGate &) = delete;
-    SnapGate &operator=(const SnapGate &) = delete;
-    ~SnapGate() { close(); }
-
-    // snap_root is <store>/snapshots/S<n>/root; the lock file is its sibling `manifest`.
-    int open(const char *snap_root, bool hard) {
-        if (hard) return 0;   // --hard snapshots are protected per entry, not by a gate
-        String dir;
-        dirname_of(snap_root, dir);
-        String lock = joinp(dir.c_str(), "manifest");
-        fd = ::open(lock.c_str(), O_RDONLY);
-        if (fd < 0) return -errno;
-        // Blocking: the window is one clonefile long and waiting is better than failing.
-        if (::flock(fd, LOCK_EX) != 0) { int e = errno; ::close(fd); fd = -1; return -e; }
-        if (::chmod(snap_root, WFS_GATE_OPEN) != 0) {
-            int e = errno;
-            ::flock(fd, LOCK_UN);
-            ::close(fd);
-            fd = -1;
-            return -e;
-        }
-        root.assign(snap_root);
-        restore = WFS_GATE_CLOSED + 1;   // non-zero marker; the mode itself is a constant
-        return 0;
-    }
-    void close() {
-        if (restore) { ::chmod(root.c_str(), WFS_GATE_CLOSED); restore = 0; }
-        if (fd >= 0) { ::flock(fd, LOCK_UN); ::close(fd); fd = -1; }
-    }
-};
+// The gate itself lives in snapshot_access.{h,cpp}: `fork`, `checkpoint`, `verify` and `diff`
+// all have to open the same door, so there is one implementation and one flock. See the header
+// for what the gate is and why the entries below the root are never touched.
+using wfs::SnapGate;
 
 // ---- P5: the `world exec` lock ---------------------------------------------------------------
 

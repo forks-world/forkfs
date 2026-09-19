@@ -312,7 +312,27 @@ int wfs_world_adopt(wfs_store *s, const char *path, const char *name, wfs_id *ou
  *
  * Only files are reported. A directory shows up only when it is empty and exists on just one
  * side; otherwise its files carry the news. Renames are reported as D + A (M1).
+ *
+ * Which path is taken by default (measured on 27.0, and the reason the events path is NOT the
+ * default): the 4-thread C walk of both trees is far cheaper than the design assumed. On 50k
+ * entries with 800 changes a full scan is 0.164 s without the xattr leg and 1.354 s with it,
+ * against 0.087 s for the events path -- under 2x, and only because of xattr. The events path
+ * also carries a fixed cost of its own (building the stream and waiting for its watermark):
+ * a six-file world is 0.002 s by scan and 0.4 s by events. On top of that, fseventsd flushes
+ * its journal on a timer, so an isolated change made in the last ~100-600 ms may not be in a
+ * stream created after it, while a scan always sees it.
+ *
+ * So: the scan is the default, and FSEvents is used only when the world is big enough for
+ * O(changes) to matter -- more than WFS_DIFF_EVENTS_MIN_ENTRIES recorded entries -- or when the
+ * caller asks for it with WFS_DIFF_EVENTS. WFS_DIFF_FULL forces the scan either way. Every
+ * fallback trigger below still applies to the events path when it is taken.
  */
+
+/* Entry count above which the events path is chosen on its own. The measured crossover is in
+ * the tens of thousands; this sits an order of magnitude above it because the scan is the exact
+ * answer and the events path is the optimisation. Overridable at run time with the environment
+ * variable of the same name (0 = always use events when nothing else forbids it). */
+#define WFS_DIFF_EVENTS_MIN_ENTRIES 200000
 
 typedef enum wfs_change {
     WFS_C_ADDED = 'A',    /* in the world, not in the snapshot */
@@ -340,7 +360,11 @@ enum {
      * few hundred candidates of an FSEvents diff but is 8x the cost of a whole full scan
      * (measured 50k: 0.16 s -> 1.35 s). A file whose only change is an xattr then reads as
      * unchanged, so this is a speed-for-completeness trade the caller has to ask for. */
-    WFS_DIFF_NO_XATTR = 1 << 2
+    WFS_DIFF_NO_XATTR = 1 << 2,
+    /* Try the FSEvents path even though the world is below WFS_DIFF_EVENTS_MIN_ENTRIES
+     * (`diff --events`). It is still only a candidate source: every fallback below sends it
+     * back to the full scan, silently and with the same answer. Ignored with WFS_DIFF_FULL. */
+    WFS_DIFF_EVENTS = 1 << 3
 };
 
 /* Why the full two-tree walk was used. */
@@ -355,7 +379,10 @@ typedef enum wfs_diff_fallback {
     WFS_DF_WRAPPED,     /* the event id space wrapped or was reset */
     WFS_DF_STALE,       /* the cursor is older than the volume's event journal */
     WFS_DF_TIMEOUT,     /* HistoryDone never arrived */
-    WFS_DF_UNSUPPORTED  /* no FSEvents on this platform */
+    WFS_DF_UNSUPPORTED, /* no FSEvents on this platform */
+    WFS_DF_SMALL_TREE   /* the default: fewer than WFS_DIFF_EVENTS_MIN_ENTRIES entries, so the
+                         * two-tree walk is the cheaper and the exact answer. Not a fallback --
+                         * nothing went wrong -- and callers do not report it. */
 } wfs_diff_fallback;
 
 typedef struct wfs_diff_stats {

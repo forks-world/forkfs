@@ -379,6 +379,18 @@ void verify_candidate(Ctx &c, const char *rel) {
     if (ch) c.sink->add(ch, type_of(ws.st_mode), (uint64_t)ws.st_size, rel);
 }
 
+// How many recorded entries a world needs before the FSEvents path is worth its fixed cost.
+// WFS_DIFF_EVENTS_MIN_ENTRIES by default; the environment variable of the same name overrides
+// it (that is how the tests exercise both paths on a 10k fixture). Garbage is ignored.
+uint64_t events_min_entries() {
+    const char *e = ::getenv("WFS_DIFF_EVENTS_MIN_ENTRIES");
+    if (!e || !*e) return WFS_DIFF_EVENTS_MIN_ENTRIES;
+    char *end = nullptr;
+    unsigned long long v = ::strtoull(e, &end, 10);
+    if (end == e || (end && *end)) return WFS_DIFF_EVENTS_MIN_ENTRIES;
+    return (uint64_t)v;
+}
+
 int fallback_for(int ev_status) {
     switch (ev_status) {
     case wfs::FS_EV_MUST_SCAN: return WFS_DF_MUST_SCAN;
@@ -414,10 +426,12 @@ extern "C" int wfs_world_diff_ex(wfs_store *s, wfs_id world, int flags, wfs_diff
     if (rc) return rc;
     if (sr.state != WFS_ST_ACTIVE || !sr.path[0]) return WFS_E_SOURCE_GONE;
 
-    // The only door into a snapshot's bytes; today a no-op, tomorrow the 0500 window.
-    wfs::SnapshotReadGuard gate(sr.path);
-    if (gate.rc == -ENOENT || gate.rc == -ENOTDIR) return WFS_E_SOURCE_GONE;
-    if (gate.rc) return gate.rc;
+    // The snapshot has to still be on disk to be compared against; the gate on it is opened
+    // further down, around the comparison itself.
+    {
+        struct stat sst;
+        if (::lstat(sr.path, &sst) != 0 || !S_ISDIR(sst.st_mode)) return WFS_E_SOURCE_GONE;
+    }
 
     Ctx c;
     c.wroot.assign(ident.path[0] ? ident.path : wr.path);
@@ -431,6 +445,12 @@ extern "C" int wfs_world_diff_ex(wfs_store *s, wfs_id world, int flags, wfs_diff
     bool full = (flags & WFS_DIFF_FULL) != 0;
     if (full) {
         fallback = WFS_DF_REQUESTED;
+    } else if (!(flags & WFS_DIFF_EVENTS) && wr.entries < events_min_entries()) {
+        // The default. See the header: on anything short of a very large tree the two-tree walk
+        // is both cheaper and exact, and the events path has a fixed cost plus a journal-flush
+        // race that can hide a change made moments ago.
+        full = true;
+        fallback = WFS_DF_SMALL_TREE;
     } else if (wr.origin != WFS_O_SNAPSHOT) {
         // The cursor was taken when THIS world forked, but the comparison is against the
         // snapshot its parent came from: everything the parent changed before the fork happened
@@ -444,6 +464,9 @@ extern "C" int wfs_world_diff_ex(wfs_store *s, wfs_id world, int flags, wfs_diff
 
     wfs::PathBag bag;
     if (!full) {
+        // Gathering candidates reads the world and the FSEvents journal, never the snapshot, so
+        // it happens outside the gate: building the stream and waiting for its watermark can
+        // take hundreds of milliseconds and no fork should queue behind that.
 #ifdef __APPLE__
         int ev = wfs::fs_events_replay(c.wroot.c_str(), wr.fsevents_id, wr.dir_dev, wr.created_at,
                                        wfs_store_dir(s), bag);
@@ -456,12 +479,25 @@ extern "C" int wfs_world_diff_ex(wfs_store *s, wfs_id world, int flags, wfs_diff
         } else {
             bag.finish();
             candidates = bag.size();
-            for (size_t i = 0; i < bag.size(); ++i) verify_candidate(c, bag.at(i));
         }
     }
-    if (full) {
-        if (int frc = full_scan(c)) return frc;
+
+    {
+        // The comparison phase, and the only part that reads snapshot bytes. The gate holds an
+        // exclusive flock on the snapshot's manifest, so every fork from this same snapshot
+        // waits here (a full scan is 0.16-1.4 s on 50k entries, a candidate list is
+        // milliseconds). It is opened as late as possible and the guard closes it -- restoring
+        // mode 0000 -- on every path out, including the error returns below.
+        wfs::SnapshotReadGuard gate(sr.path);
+        if (gate.rc == -ENOENT || gate.rc == -ENOTDIR) return WFS_E_SOURCE_GONE;
+        if (gate.rc) return gate.rc;
+
+        if (!full)
+            for (size_t i = 0; i < bag.size(); ++i) verify_candidate(c, bag.at(i));
+        else if (int frc = full_scan(c))
+            return frc;
     }
+    // From here on nothing touches the snapshot: sorting and reporting are pure bookkeeping.
 
     // Sort, drop the duplicates an expanded directory can produce, then hand them over.
     Vec<Rec> recs;

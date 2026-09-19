@@ -1,71 +1,83 @@
-// See snapshot_access.h: the single place that opens and closes a snapshot's read window.
+// See snapshot_access.h: the gate on a snapshot root, and the single place that opens and
+// closes a snapshot's read window.
 #include "snapshot_access.h"
 
 #include <errno.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 namespace wfs {
 
+namespace {
+
+// <store>/snapshots/S<n>/root -> <store>/snapshots/S<n>/manifest. The manifest is the lock
+// file: it is a sibling of the root, so it is never behind the gate.
+String manifest_of(const char *snap_root) {
+    String p(snap_root);
+    const char *slash = ::strrchr(snap_root, '/');
+    if (!slash) { p.assign("manifest"); return p; }
+    p.resize((size_t)(slash - snap_root) + 1);
+    p.append("manifest");
+    return p;
+}
+
+} // namespace
+
+int SnapGate::open(const char *snap_root, bool hard) {
+    if (hard) return 0;   // --hard snapshots are protected per entry, not by a gate
+    if (!snap_root || !*snap_root) return -EINVAL;
+    String lock = manifest_of(snap_root);
+    fd = ::open(lock.c_str(), O_RDONLY);
+    if (fd < 0) return -errno;
+    // Blocking: the window is one clonefile (or one comparison) long, and waiting is better
+    // than failing.
+    if (::flock(fd, LOCK_EX) != 0) { int e = errno; ::close(fd); fd = -1; return -e; }
+    if (::chmod(snap_root, WFS_GATE_OPEN) != 0) {
+        int e = errno;
+        ::flock(fd, LOCK_UN);
+        ::close(fd);
+        fd = -1;
+        return -e;
+    }
+    root.assign(snap_root);
+    restore = WFS_GATE_CLOSED + 1;   // non-zero marker; the mode itself is a constant
+    return 0;
+}
+
+void SnapGate::close() {
+    if (restore) { ::chmod(root.c_str(), WFS_GATE_CLOSED); restore = 0; }
+    if (fd >= 0) { ::flock(fd, LOCK_UN); ::close(fd); fd = -1; }
+}
+
 int snapshot_open_for_read(const char *snapshot_root, SnapshotRead &h) {
-    h = SnapshotRead();
+    snapshot_close_after_read(h);
     if (!snapshot_root || !*snapshot_root) return -EINVAL;
     struct stat st;
     if (::lstat(snapshot_root, &st) != 0) return -errno;
     if (!S_ISDIR(st.st_mode)) return -ENOTDIR;
-    h.root.assign(snapshot_root);
-    h.saved_mode = (uint32_t)(st.st_mode & 07777);
-#ifdef __APPLE__
-    h.saved_flags = (uint32_t)st.st_flags;
-#endif
     h.open = true;
 
-    // The common case today: 0555, readable and traversable, nothing to do.
+    // A --hard snapshot keeps a 0555 root (the protection is UF_IMMUTABLE on the entries), and
+    // so does a source that is not a snapshot at all: nothing to open, nothing to serialise on.
     if (::access(snapshot_root, R_OK | X_OK) == 0) return 0;
 
-    // The gate-directory case: widen the root to 0500 for the duration. Only the owner can do
-    // this, and only after UF_IMMUTABLE is out of the way; anything else is a genuine refusal
-    // rather than something to work around.
+    // Gated. Only the owner can lift it; anything else is a genuine refusal rather than
+    // something to work around.
     if (st.st_uid != ::geteuid()) {
         snapshot_close_after_read(h);
         return -EACCES;
     }
-    mode_t want = (mode_t)(h.saved_mode | 0500);
-    if (::chmod(snapshot_root, want) != 0) {
-#ifdef __APPLE__
-        if (errno == EPERM && (h.saved_flags & (UF_IMMUTABLE | SF_IMMUTABLE)) != 0) {
-            if (::lchflags(snapshot_root, h.saved_flags & ~(uint32_t)(UF_IMMUTABLE | SF_IMMUTABLE)) != 0) {
-                int e = errno;
-                snapshot_close_after_read(h);
-                return -e;
-            }
-            h.restore_flags = true;
-            if (::chmod(snapshot_root, want) != 0) {
-                int e = errno;
-                snapshot_close_after_read(h);
-                return -e;
-            }
-            h.restore_mode = true;
-            return 0;
-        }
-#endif
-        int e = errno;
+    if (int rc = h.gate.open(snapshot_root, false)) {
         snapshot_close_after_read(h);
-        return -e;
+        return rc;
     }
-    h.restore_mode = true;
     return 0;
 }
 
 void snapshot_close_after_read(SnapshotRead &h) {
-    if (!h.open) return;
-    if (h.restore_mode) ::chmod(h.root.c_str(), (mode_t)h.saved_mode);
-#ifdef __APPLE__
-    if (h.restore_flags) ::lchflags(h.root.c_str(), h.saved_flags);
-#endif
-    h.restore_mode = false;
-    h.restore_flags = false;
+    h.gate.close();
     h.open = false;
 }
 

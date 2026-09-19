@@ -53,6 +53,12 @@ static void write_file(const char *p, const char *s) {
 
 static int exists(const char *p) { struct stat st; return lstat(p, &st) == 0; }
 
+static unsigned mode_of(const char *p) {
+    struct stat st;
+    CHECK(lstat(p, &st) == 0);
+    return (unsigned)(st.st_mode & 07777);
+}
+
 // fseventsd writes its journal on a timer: a lone change takes 90-600 ms to become visible to
 // a stream created after it (the measurements are in core/src/platform_darwin_events.cpp). A
 // burst flushes promptly, which is why the 850-change fixture never needs this; the single
@@ -467,11 +473,70 @@ static void small_cases(const char *root, const char *store) {
     CHECK(removexattr(p, "com.forks.world.difftest", XATTR_NOFOLLOW) == 0);
 #endif
 
+    // ---- the gate stays shut (T1.1b x T1.3) ----
+    // The snapshot this world came from is gate-protected: its root is WFS_GATE_CLOSED and the
+    // only thing that opens it is SnapGate, under a flock on the manifest. A diff has to be
+    // able to read through it, and has to leave it exactly as it found it -- on every way out.
+    CHECK_OK(wfs_snapshot_info(s, sid, &sr));
+    CHECK(sr.hard == 0);
+    CHECK(mode_of(sr.path) == WFS_GATE_CLOSED);
+    run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
+    check_lines("gated snapshot / --full", &c, want, sizeof want / sizeof want[0]);
+    CHECK(mode_of(sr.path) == WFS_GATE_CLOSED);
+    run_diff(s, wid, 0, &c, &st);
+    CHECK(mode_of(sr.path) == WFS_GATE_CLOSED);
+
+    // An error raised while the gate is open: a directory in the WORLD that cannot be opened
+    // makes the walk fail after SnapGate has already widened the root. The guard has to close
+    // it anyway, and the flock has to come back, or every later fork from this snapshot hangs.
+    join(p, sizeof p, w, "moved");
+    CHECK(chmod(p, 0000) == 0);
+    int blocked = wfs_world_diff(s, wid, WFS_DIFF_FULL, NULL, NULL);
+    CHECK(blocked == -EACCES);
+    CHECK(mode_of(sr.path) == WFS_GATE_CLOSED);
+    CHECK(chmod(p, 0755) == 0);
+    // ... and the gate is usable again right afterwards, from another clone of the snapshot.
+    char wgate[4096];
+    join(wgate, sizeof wgate, root, "small-w-gate");
+    wfs_id wid3 = 0;
+    CHECK_OK(wfs_world_create(s, from, wgate, &o, &wid3));
+    CHECK(mode_of(sr.path) == WFS_GATE_CLOSED);
+    rm_rf(wgate);
+
+    // ---- which path is the default ----
+    // The world is far below WFS_DIFF_EVENTS_MIN_ENTRIES, so with the threshold at its real
+    // value the scan is chosen without anything having gone wrong; --events asks for the other
+    // one, and --full still overrides both. (The rest of this test runs with the threshold
+    // pinned to 0 so that flags == 0 means the events path.)
+    char thr[32];
+    snprintf(thr, sizeof thr, "%d", WFS_DIFF_EVENTS_MIN_ENTRIES);
+    CHECK(setenv("WFS_DIFF_EVENTS_MIN_ENTRIES", thr, 1) == 0);
+    run_diff(s, wid, 0, &c, &st);
+    CHECK(st.full_scan == 1 && st.fallback == WFS_DF_SMALL_TREE && st.candidates == 0);
+    check_lines("default / scan", &c, want, sizeof want / sizeof want[0]);
+    run_diff(s, wid, WFS_DIFF_EVENTS, &c, &st);
+    CHECK(st.full_scan == 0 && st.fallback == WFS_DF_NONE);
+    check_lines("--events", &c, want, sizeof want / sizeof want[0]);
+    run_diff(s, wid, WFS_DIFF_EVENTS | WFS_DIFF_FULL, &c, &st);
+    CHECK(st.full_scan == 1 && st.fallback == WFS_DF_REQUESTED);
+    // A world above the threshold picks the events path on its own.
+    CHECK(setenv("WFS_DIFF_EVENTS_MIN_ENTRIES", "2", 1) == 0);
+    run_diff(s, wid, 0, &c, &st);
+    CHECK(st.full_scan == 0 && st.fallback == WFS_DF_NONE);
+    CHECK(setenv("WFS_DIFF_EVENTS_MIN_ENTRIES", "0", 1) == 0);
+
     free(c.v);
     wfs_store_close(s);
 }
 
 int main() {
+    // Everything below is a 10k-entry fixture, three orders of magnitude under
+    // WFS_DIFF_EVENTS_MIN_ENTRIES, so the default would be the full scan everywhere and the
+    // event path would never be exercised. Pin the threshold to 0 for the run: flags == 0 then
+    // means "events, unless something forces the scan", which is what these cases assert.
+    // small_cases() puts the real threshold back for the two cases that test the default.
+    CHECK(setenv("WFS_DIFF_EVENTS_MIN_ENTRIES", "0", 1) == 0);
+
     const char *tmp = getenv("TMPDIR");
     char tpl[4096];
     snprintf(tpl, sizeof tpl, "%swfs-diff-test.XXXXXX", (tmp && *tmp) ? tmp : "/tmp/");
@@ -538,7 +603,13 @@ int main() {
         CHECK(chmod(p, 0600) == 0);
     }
 
-    // (a) the FSEvents path
+    // (a) the FSEvents path.
+    // settle() first: a burst this size usually flushes at once, but not always -- measured
+    // 2 incomplete replays in 27 runs without it, and the journal flush is not globally
+    // ordered, so the diff's own watermark can come back before the last file of the burst
+    // (docs/TASKS.md T1.3). That is fseventsd's timer, not the diff, and it is exactly why the
+    // full scan is the default path now; here it would just make the exact-set assertion flaky.
+    settle();
     run_diff(s, wid, 0, &c, &st);
     CHECK(st.full_scan == 0 && st.fallback == WFS_DF_NONE);
     CHECK(st.candidates >= N_MOD + N_ADD + N_DEL + N_META);

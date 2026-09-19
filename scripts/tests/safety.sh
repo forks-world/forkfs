@@ -282,7 +282,9 @@ else
     chmod 0600 "$SCRATCH/wdiff/src/a-link.c"      # T
     mkdir "$SCRATCH/wdiff/emptydir"               # A (a directory with nothing to speak for it)
     sleep 1                                       # fseventsd journals on a timer; see TASKS.md T1.3
-    "$WORLD" fs diff "$WD" > "$SCRATCH/d-ev.txt" 2> "$SCRATCH/d-ev.err"
+    # --events asks for the FSEvents path explicitly: the default on a tree this small is the
+    # full scan (TASKS.md T1.3, "which path is the default"), and the two must agree line for line.
+    "$WORLD" fs diff "$WD" --events > "$SCRATCH/d-ev.txt" 2> "$SCRATCH/d-ev.err"
     evrc=$?
     "$WORLD" fs diff "$WD" --full > "$SCRATCH/d-full.txt" 2>/dev/null
     # Sorted by path, so the changes are interleaved rather than grouped by kind.
@@ -296,7 +298,7 @@ else
     [ "$(cat "$SCRATCH/d-full.txt")" = "$want" ] && ok P10 "diff --full agrees line for line" \
                                                  || { bad P10 "diff --full agrees line for line"; sed 's/^/        /' "$SCRATCH/d-full.txt"; }
     "$WORLD" fs diff "$WD" --stat | grep -q '^2 added, 1 modified, 1 deleted, 1 metadata-only$' \
-        && ok P10 "diff --stat counts them" || bad P10 "diff --stat counts them"
+        && ok P10 "diff --stat counts them (default path)" || bad P10 "diff --stat counts them (default path)"
     # The source snapshot going away is a refusal with a reason, not a wrong answer.
     SP=$("$WORLD" fs inspect S1 | awk '/^path:/{print $2}')
     mv "${SP%/root}" "$SCRATCH/s1-away"
