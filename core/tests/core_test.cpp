@@ -124,6 +124,22 @@ static int crash_before_publish(void *ctx, wfs_id world, const char *tmp_path) {
     return -EINTR;
 }
 
+// PR #1 review (5th round): the two halves of a discard. Phase 0 is the row committed in
+// TRASHING with the tree still at home, phase 1 is the tree renamed with the row not yet
+// TRASHED. Returning non-zero is a `kill -9` right there: nothing is unwound.
+static int g_trash_crash_phase = -1;
+static int g_trash_crash_hits;
+static char g_trash_crash_path[4096];
+static int trash_crash(void *ctx, int phase, int is_snapshot, wfs_id id, const char *trash_path) {
+    (void)ctx;
+    (void)is_snapshot;
+    (void)id;
+    if (phase != g_trash_crash_phase) return 0;
+    g_trash_crash_hits++;
+    snprintf(g_trash_crash_path, sizeof g_trash_crash_path, "%s", trash_path ? trash_path : "");
+    return -EINTR;
+}
+
 // A copy in the sense of `cp -R`: same bytes, same marker, different inode (P2).
 static void copy_dir(const char *src, const char *dst) {
     CHECK(mkdir(dst, 0755) == 0);
@@ -1267,6 +1283,151 @@ int main() {
             CHECK(nlink_of(p) == 2);
         }
         CHECK(n_with_prefix(wth, ".wfs-hl-") == 0);
+    }
+
+    // ---- PR #1 review (5th round, P1): a discard killed between the rename and the commit ----
+    //
+    // The hole: the rename moved the tree into <store>/trash and the commit that was to name it
+    // there never landed, so the row said ACTIVE (worlds) or was rolled back to ACTIVE
+    // (snapshots) while the tree sat in the trash with nothing pointing at it. The collector's
+    // row-less-orphan rule then deleted it on the next wake -- immediately, retention skipped,
+    // restore impossible -- and for a snapshot that is the baseline every world forked from it
+    // diffs and verifies against (P4/P10).
+    //
+    // Now the row is written first, in WFS_ST_TRASHING, with the name the tree is about to get,
+    // and the recovery decides which of the two names the tree really has. Its own store, so the
+    // retention-0 collections below cannot touch anything the rest of this file built.
+    {
+        char tstore[4096], tsrc[4096], tw[4096], twcopy[4096], sdir[4096];
+        join(tstore, sizeof tstore, root, "trash-store");
+        join(tsrc, sizeof tsrc, root, "trash-src");
+        CHECK(mkdir(tsrc, 0755) == 0);
+        join(p, sizeof p, tsrc, "a.txt");
+        write_file(p, "one\n");
+        wfs_store *ts = NULL;
+        CHECK_OK(wfs_store_open(tstore, &ts));
+        wfs_test_trash_crash = trash_crash;
+
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "tr";
+        wfs_id t1 = 0;
+        CHECK_OK(wfs_snapshot_create(ts, tsrc, &sopts, &t1));
+        snprintf(sdir, sizeof sdir, "%s/snapshots/S%llu", tstore, (unsigned long long)t1);
+        wfs_snapshot_rec tsr;
+        wfs_trash_stat tst;
+        wfs_gc_report trep;
+
+        // (1) Killed BEFORE the rename: the discard did not happen, and the recovery says so.
+        g_trash_crash_phase = 0;
+        g_trash_crash_hits = 0;
+        CHECK_RC(wfs_snapshot_discard(ts, t1, 0, 0), -EINTR);
+        CHECK(g_trash_crash_hits == 1);
+        CHECK_OK(wfs_snapshot_info(ts, t1, &tsr));
+        CHECK(tsr.state == WFS_ST_TRASHING);
+        CHECK(exists(sdir));                                   // never moved
+        CHECK_OK(wfs_gc_status(ts, 0, &tst));
+        CHECK(tst.due == 0);                                   // and nothing to collect
+        g_trash_crash_phase = -1;
+        memset(&trep, 0, sizeof trep);
+        CHECK_OK(wfs_gc(ts, 0, &trep));
+        CHECK(trep.trash_orphans == 0);
+        CHECK_OK(wfs_snapshot_info(ts, t1, &tsr));
+        CHECK(tsr.state == WFS_ST_ACTIVE);
+        CHECK(exists(sdir));
+        CHECK_OK(wfs_snapshot_verify(ts, t1, &vr));            // and still a usable snapshot
+
+        // (2) Killed AFTER the rename, with something that still needs the baseline. `adopt`
+        // registers a world from its marker alone and carries the snapshot id over with it, so
+        // a reference really can appear after the discard's reference check has passed.
+        wfs_ref tf = {WFS_K_SNAPSHOT, t1};
+        memset(&opts, 0, sizeof opts);
+        join(tw, sizeof tw, worlds, "tworld");
+        join(twcopy, sizeof twcopy, worlds, "tworld-copy");
+        wfs_id tw1 = 0;
+        CHECK_OK(wfs_world_create(ts, tf, tw, &opts, &tw1));
+        copy_dir(tw, twcopy);                                  // an unregistered copy (P2)
+        CHECK_OK(wfs_world_discard(ts, tw1, 1, 0));            // no ACTIVE world left
+        g_trash_crash_phase = 1;
+        g_trash_crash_hits = 0;
+        CHECK_RC(wfs_snapshot_discard(ts, t1, 0, 0), -EINTR);
+        CHECK(g_trash_crash_hits == 1);
+        CHECK(!exists(sdir));                                  // the tree is in the trash
+        CHECK(exists(g_trash_crash_path));
+        CHECK_OK(wfs_snapshot_info(ts, t1, &tsr));
+        CHECK(tsr.state == WFS_ST_TRASHING);
+        // The regression itself: the collector used to call that directory a row-less orphan and
+        // delete it on sight. It is in the trash, it is counted, and it is not due.
+        CHECK_OK(wfs_gc_status(ts, 0, &tst));
+        CHECK(tst.entries == 1 && tst.due == 0 && tst.snapshots == 1);
+        wfs_id tw2 = 0;
+        CHECK_OK(wfs_world_adopt(ts, twcopy, "adopted", &tw2));
+        wfs_world_rec twr;
+        CHECK_OK(wfs_world_info(ts, tw2, &twr));
+        CHECK(twr.snapshot_id == t1);
+        g_trash_crash_phase = -1;
+        memset(&trep, 0, sizeof trep);
+        CHECK_OK(wfs_gc(ts, 0, &trep));
+        CHECK(trep.trash_orphans == 0 && trep.snapshots_deleted == 0);
+        CHECK_OK(wfs_snapshot_info(ts, t1, &tsr));
+        CHECK(tsr.state == WFS_ST_ACTIVE);                     // put back, because it is needed
+        CHECK(exists(sdir));
+        CHECK(!exists(g_trash_crash_path));
+        CHECK_OK(wfs_snapshot_verify(ts, t1, &vr));            // manifest and tree intact
+        CHECK_OK(wfs_world_diff(ts, tw2, NULL, NULL, NULL));   // and the world has its baseline
+
+        // (3) The same crash with nothing referencing it: the discard the user asked for is
+        // finished, and the entry is then collected like any other.
+        CHECK_OK(wfs_world_discard(ts, tw2, 1, 0));
+        g_trash_crash_phase = 1;
+        g_trash_crash_hits = 0;
+        CHECK_RC(wfs_snapshot_discard(ts, t1, 0, 0), -EINTR);
+        CHECK(g_trash_crash_hits == 1);
+        g_trash_crash_phase = -1;
+        memset(&trep, 0, sizeof trep);
+        CHECK_OK(wfs_gc(ts, 0, &trep));
+        CHECK(trep.trash_orphans == 0 && trep.snapshots_deleted == 1);
+        CHECK_OK(wfs_snapshot_info(ts, t1, &tsr));
+        CHECK(tsr.state == WFS_ST_DEAD);
+        CHECK(!exists(sdir) && !exists(g_trash_crash_path));
+
+        // (4) A world, both ways round, and resolved by the store open rather than by gc.
+        wfs_id t2 = 0;
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "tr2";
+        CHECK_OK(wfs_snapshot_create(ts, tsrc, &sopts, &t2));
+        wfs_ref tf2 = {WFS_K_SNAPSHOT, t2};
+        char tw3[4096];
+        join(tw3, sizeof tw3, worlds, "tworld3");
+        wfs_id tw3id = 0;
+        CHECK_OK(wfs_world_create(ts, tf2, tw3, &opts, &tw3id));
+        g_trash_crash_phase = 0;
+        CHECK_RC(wfs_world_discard(ts, tw3id, 0, 0), -EINTR);
+        CHECK(exists(tw3));                                    // the rename never happened
+        wfs_store_close(ts);
+        CHECK_OK(wfs_store_open(tstore, &ts));                 // the open resolves it
+        CHECK_OK(wfs_world_info(ts, tw3id, &twr));
+        CHECK(twr.state == WFS_ST_ACTIVE && twr.present);
+        // ... and after the rename it is finished, not lost: `restore` still brings it back.
+        g_trash_crash_phase = 1;
+        CHECK_RC(wfs_world_discard(ts, tw3id, 0, 0), -EINTR);
+        CHECK(!exists(tw3) && exists(g_trash_crash_path));
+        CHECK_OK(wfs_world_info(ts, tw3id, &twr));
+        CHECK(twr.state == WFS_ST_TRASHING);
+        CHECK_OK(wfs_gc_status(ts, 0, &tst));
+        CHECK(tst.entries == 1 && tst.due == 0 && tst.worlds == 1);
+        g_trash_crash_phase = -1;
+        wfs_store_close(ts);
+        CHECK_OK(wfs_store_open(tstore, &ts));
+        CHECK_OK(wfs_world_info(ts, tw3id, &twr));
+        CHECK(twr.state == WFS_ST_TRASHED);
+        CHECK_OK(wfs_world_restore(ts, tw3id));
+        CHECK_OK(wfs_world_info(ts, tw3id, &twr));
+        CHECK(twr.state == WFS_ST_ACTIVE && twr.present && exists(tw3));
+
+        wfs_test_trash_crash = NULL;
+        wfs_store_close(ts);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", tstore, (unsigned long long)t2);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 
     wfs_store_close(s);

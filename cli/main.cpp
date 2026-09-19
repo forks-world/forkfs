@@ -149,6 +149,7 @@ static const char *state_name(int st) {
     case WFS_ST_CREATING: return "creating";
     case WFS_ST_ACTIVE: return "active";
     case WFS_ST_TRASHED: return "trashed";
+    case WFS_ST_TRASHING: return "being discarded";
     default: return "dead";
     }
 }

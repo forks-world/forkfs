@@ -321,6 +321,11 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
         if (meta_set(s->db, "store_id", id) != 0) { wfs_store_close(s); return -EIO; }
         s->store_id.assign(id);
     }
+    // PR #1 review (5th round): a discard killed between its rename and its commit leaves one
+    // row in WFS_ST_TRASHING and a tree at one of two names. Resolving it is two indexed
+    // SELECTs that normally return nothing, and it has to happen before anything in this process
+    // reads a state or classifies the trash -- `gc --status` and the orphan rule both do.
+    wfs::trashing_recover(s, nullptr, nullptr);
     *out = s;
     return 0;
 }

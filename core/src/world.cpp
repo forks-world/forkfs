@@ -570,6 +570,13 @@ extern "C" void *wfs_test_before_fork_publish_ctx = nullptr;
 // And the pid a CREATING row records as its producer: 0 (always, outside a test) means getpid().
 extern "C" int64_t wfs_test_fork_owner_pid = 0;
 
+// And the two halves of a discard (PR #1 review, 5th round): phase 0 is the row committed in
+// TRASHING with the tree still at home, phase 1 is the tree renamed with the row not yet
+// TRASHED. A non-zero return comes straight back out of the discard with nothing unwound.
+extern "C" int (*wfs_test_trash_crash)(void *ctx, int phase, int is_snapshot, wfs_id id,
+                                       const char *trash_path) = nullptr;
+extern "C" void *wfs_test_trash_crash_ctx = nullptr;
+
 // ---- snapshots --------------------------------------------------------------------------------
 
 extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_snapshot_opts *opts,
@@ -1174,6 +1181,73 @@ extern "C" int wfs_world_list(wfs_store *s, int include_trashed, wfs_world_rec *
     return 0;
 }
 
+namespace {
+
+// ---- PR #1 review (5th round): the three-step trashing protocol -------------------------------
+//
+// A discard used to be one rename and one commit, in one order for worlds (tree first) and the
+// other for snapshots (row first, inside the transaction). Both orders have the same hole: a
+// process killed between the two leaves a tree in <store>/trash that no row names -- the row was
+// either never updated or rolled back to ACTIVE -- and the collector's row-less-orphan rule then
+// deletes it. For a snapshot that is the baseline of every world forked from it (P4/P10).
+//
+// So the row is written twice, and it names the tree's future place before the tree is anywhere
+// near it:
+//
+//   (a) one transaction: the reference check, state = TRASHING, trash_path = the name the tree
+//       is about to get. Commit.
+//   (b) rename the tree to that name.
+//   (c) one transaction: state = TRASHED.
+//
+// A kill anywhere in there leaves a TRASHING row whose trash_path is the only name the tree can
+// have besides its own, which is what trashing_recover() below resolves -- and which is why the
+// orphan rule now spares every directory any row names, in any state.
+int trashing_set_path(wfs_store *s, wfs_id id, int is_snapshot, const char *p) {
+    Guard g(s->mu);
+    Txn t(s->db);
+    Stmt u(s->db, is_snapshot ? "UPDATE snapshots SET trash_path=? WHERE id=? AND state=4"
+                              : "UPDATE worlds SET trash_path=? WHERE id=? AND state=4");
+    if (!u.ok()) return -EIO;
+    u.text(1, p);
+    u.i64(2, (int64_t)id);
+    if (u.step() != SQLITE_DONE) return -EIO;
+    t.commit();
+    return 0;
+}
+
+// Step (c). Only ever applied to a row this process put in TRASHING.
+int trashing_commit(wfs_store *s, wfs_id id, int is_snapshot) {
+    Guard g(s->mu);
+    Txn t(s->db);
+    Stmt u(s->db, is_snapshot ? "UPDATE snapshots SET state=? WHERE id=? AND state=4"
+                              : "UPDATE worlds SET state=? WHERE id=? AND state=4");
+    if (!u.ok()) return -EIO;
+    u.i64(1, WFS_ST_TRASHED);
+    u.i64(2, (int64_t)id);
+    if (u.step() != SQLITE_DONE) return -EIO;
+    t.commit();
+    return 0;
+}
+
+// The rename never happened, so neither did the discard: put the row back exactly where
+// trashing_recover() would put it, rather than leave the next process to work it out.
+void trashing_undo(wfs_store *s, wfs_id id, int is_snapshot) {
+    Guard g(s->mu);
+    Txn t(s->db);
+    Stmt u(s->db,
+           is_snapshot ? "UPDATE snapshots SET state=?, trash_path='', trashed_at=0 WHERE id=? AND state=4"
+                       : "UPDATE worlds SET state=?, trash_path='', trashed_at=0 WHERE id=? AND state=4");
+    if (u.ok()) { u.i64(1, WFS_ST_ACTIVE); u.i64(2, (int64_t)id); u.step(); }
+    t.commit();
+}
+
+int trash_crash_seam(int phase, int is_snapshot, wfs_id id, const char *trash_path) {
+    if (!wfs_test_trash_crash) return 0;
+    return wfs_test_trash_crash(wfs_test_trash_crash_ctx, phase, is_snapshot, id, trash_path);
+}
+
+} // namespace
+
 extern "C" int wfs_world_discard(wfs_store *s, wfs_id id, int immediate, int force) {
     if (!s || !id) return -EINVAL;
     wfs_world_rec r;
@@ -1221,29 +1295,40 @@ extern "C" int wfs_world_discard(wfs_store *s, wfs_id id, int immediate, int for
     char leaf[80];
     ::snprintf(leaf, sizeof leaf, "W%llu-%lld", (unsigned long long)id, (long long)now_sec());
     String trash = joinp(joinp(s->dir.c_str(), "trash").c_str(), leaf);
+    // (a) the row first, in TRASHING, naming the place the tree is about to move to. A crash
+    // from here to (c) leaves a tree that one row names, never a row-less orphan.
+    {
+        Guard g(s->mu);
+        Txn t(s->db);
+        Stmt u(s->db, "UPDATE worlds SET state=?, trash_path=?, trashed_at=? WHERE id=? AND state=1");
+        if (!u.ok()) return -EIO;
+        u.i64(1, WFS_ST_TRASHING);
+        u.text(2, trash.c_str());
+        u.i64(3, now_sec());
+        u.i64(4, (int64_t)id);
+        if (u.step() != SQLITE_DONE) return -EIO;
+        if (sqlite3_changes(s->db) == 0) return -ESTALE;   // somebody else moved it meanwhile
+        t.commit();
+    }
+    if (int hrc = trash_crash_seam(0, 0, id, trash.c_str())) return hrc;
+    // (b)
     int rc = wfs::fs_rename(ident.path, trash.c_str());
     if (rc == -EXDEV) {
-        // The world lives on another volume than the store: keep the trash next to it.
+        // The world lives on another volume than the store: keep the trash next to it. The row
+        // has to name the new place before the tree can be there, so this is an extra commit --
+        // and until it lands the tree is still at home, which is what the recovery reads.
         String side;
         dirname_of(ident.path, side);
         side = joinp(side.c_str(), ".wfs-trash");
         wfs::fs_mkdir_p(side.c_str());
         trash = joinp(side.c_str(), leaf);
+        if (int urc = trashing_set_path(s, id, 0, trash.c_str())) { trashing_undo(s, id, 0); return urc; }
         rc = wfs::fs_rename(ident.path, trash.c_str());
     }
-    if (rc) return rc;
-    {
-        Guard g(s->mu);
-        Txn t(s->db);
-        Stmt u(s->db, "UPDATE worlds SET state=?, trash_path=?, trashed_at=? WHERE id=?");
-        if (!u.ok()) return -EIO;
-        u.i64(1, WFS_ST_TRASHED);
-        u.text(2, trash.c_str());
-        u.i64(3, now_sec());
-        u.i64(4, (int64_t)id);
-        if (u.step() != SQLITE_DONE) return -EIO;
-        t.commit();
-    }
+    if (rc) { trashing_undo(s, id, 0); return rc; }
+    if (int hrc = trash_crash_seam(1, 0, id, trash.c_str())) return hrc;
+    // (c)
+    if (int crc = trashing_commit(s, id, 0)) return crc;
     if (!immediate) return 0;
     {
         String deleting;
@@ -1340,7 +1425,9 @@ struct SnapRefs {
 // the discard decides on, so it has to be read under the same write lock the fork's claim takes.
 int snapshot_refs_locked(wfs_store *s, wfs_id id, SnapRefs &out) {
     {
-        Stmt q(s->db, "SELECT id, state FROM worlds WHERE snapshot_id=? AND state<=2");
+        // Every state but DEAD: a world in the middle of its own discard (TRASHING) is a row
+        // that still names this snapshot, and its own recovery may yet put it back (5th round).
+        Stmt q(s->db, "SELECT id, state FROM worlds WHERE snapshot_id=? AND state<>3");
         if (!q.ok()) return -EIO;
         q.i64(1, (int64_t)id);
         while (q.row()) {
@@ -1390,7 +1477,7 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
         if (int rc = wfs_pool_drain(s, id, &drained); rc && rc != -ENOENT) return rc;
     }
 
-    String trash;
+    String trash, snapdir;
     bool tree_gone = false;
     {
     // One BEGIN IMMEDIATE for the reference check *and* the state transition (PR #1 review).
@@ -1409,7 +1496,7 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
     // Never orphan a world's source: diff and verify both need the baseline (P4/P10).
     if (refs.active_worlds || refs.creating_worlds || refs.pool_entries) return WFS_E_SNAPSHOT_IN_USE;
 
-    String snapdir = snapshot_dir_of(r);
+    snapdir = snapshot_dir_of(r);
     char leaf[80];
     ::snprintf(leaf, sizeof leaf, "S%llu-%lld", (unsigned long long)id, (long long)now_sec());
     trash = joinp(joinp(s->dir.c_str(), "trash").c_str(), leaf);
@@ -1421,22 +1508,29 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
     // are already gone by here (a ref refuses the discard, --force drained them), and
     // pool_collect buries anything a filler puts back for a snapshot that is no longer ACTIVE.
     if (!exists(snapdir.c_str())) { trash.assign(""); tree_gone = true; }
+    // Step (a) of the three-step protocol above: the reference check and the state change in one
+    // transaction, with the name the tree is about to get written down. The rename used to be
+    // *inside* this transaction, which meant a crash between the two rolled the row back to
+    // ACTIVE while the tree sat in the trash with nothing naming it -- and the next collector
+    // deleted it as an orphan, taking the baseline of every world forked from it with it
+    // (PR #1 review, 5th round).
     Stmt u(s->db, "UPDATE snapshots SET state=?, trash_path=?, trashed_at=? WHERE id=?");
     if (!u.ok()) return -EIO;
-    u.i64(1, tree_gone ? WFS_ST_DEAD : WFS_ST_TRASHED);
+    u.i64(1, tree_gone ? WFS_ST_DEAD : WFS_ST_TRASHING);
     u.text(2, trash.c_str());
     u.i64(3, now_sec());
     u.i64(4, (int64_t)id);
     if (u.step() != SQLITE_DONE) return -EIO;
-    // The row first, the tree second: a rename that fails rolls the row back, and nothing moved.
-    // The gate is on `root`, one level below what moves; renaming the directory that holds it
-    // needs no access to the tree at all, so the gate stays closed until the deleter opens it.
-    if (trash.size()) {
-        if (int rc = wfs::fs_rename(snapdir.c_str(), trash.c_str())) return rc;
-    }
     t.commit();
     }
     if (tree_gone) return 0;   // nothing to move, nothing to unlink, and the row is already DEAD
+    if (int hrc = trash_crash_seam(0, 1, id, trash.c_str())) return hrc;
+    // (b). The gate is on `root`, one level below what moves; renaming the directory that holds
+    // it needs no access to the tree at all, so the gate stays closed until the deleter opens it.
+    if (int rc = wfs::fs_rename(snapdir.c_str(), trash.c_str())) { trashing_undo(s, id, 1); return rc; }
+    if (int hrc = trash_crash_seam(1, 1, id, trash.c_str())) return hrc;
+    // (c)
+    if (int crc = trashing_commit(s, id, 1)) return crc;
     if (!immediate) return 0;
 
     // --now: delete it here instead of leaving it to the collector, which is what `discard
@@ -1468,6 +1562,102 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
     t.commit();
     return 0;
 }
+
+// ---- PR #1 review (5th round): resolving a discard that was killed in the middle ---------------
+//
+// One TRASHING row means: the tree is at its home path or at trash_path, and at no third place.
+// Which one it is, is the only question, and lstat answers it. Everything here is idempotent and
+// runs under the store mutex a row at a time, so two processes doing it at once agree.
+//
+//   tree at trash_path   the rename happened. Finish the discard the user asked for -- unless
+//                        something still references the snapshot, in which case the tree goes
+//                        back and the row with it. A reference cannot appear after step (a)
+//                        through fork or pool (both re-read the row under the write lock and
+//                        refuse anything that is not ACTIVE), but `adopt` registers a world from
+//                        its marker alone and does carry the snapshot id over, so the check is
+//                        made against the present rather than against that argument.
+//   tree at home         the rename never happened: the discard did not happen either.
+//   tree nowhere         the same verdict, and the reconciliation half of gc then reports the
+//                        row as dangling (and, with --reconcile, buries it). Better a row that
+//                        says "active, not present" -- which `verify <path>` can repair when the
+//                        directory merely moved -- than one that says "deleted" about a tree
+//                        nobody deleted.
+namespace wfs {
+
+int trashing_recover(wfs_store *s, uint64_t *restored, uint64_t *finished) {
+    if (!s) return -EINVAL;
+    struct Pending {
+        wfs_id id = 0;
+        int is_snapshot = 0;
+        String home;    // where the tree lives when the rename did not happen
+        String trash;   // where it lives when it did
+    };
+    Vec<Pending> rows;
+    {
+        Guard g(s->mu);
+        {
+            Stmt q(s->db, "SELECT id, path, trash_path FROM worlds WHERE state=4");
+            if (!q.ok()) return -EIO;
+            while (q.row()) {
+                Pending p;
+                p.id = (wfs_id)q.col_i64(0);
+                p.home.assign(q.col_text(1));
+                p.trash.assign(q.col_text(2));
+                rows.emplace_back(p);
+            }
+        }
+        {
+            Stmt q(s->db, "SELECT id, path, trash_path FROM snapshots WHERE state=4");
+            if (!q.ok()) return -EIO;
+            while (q.row()) {
+                Pending p;
+                p.id = (wfs_id)q.col_i64(0);
+                p.is_snapshot = 1;
+                // The row records <store>/snapshots/S<n>/root; what a discard moves is the
+                // directory above it, which holds the manifest `verify` needs.
+                dirname_of(q.col_text(1), p.home);
+                p.trash.assign(q.col_text(2));
+                rows.emplace_back(p);
+            }
+        }
+    }
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const Pending &p = rows[i];
+        bool in_trash = p.trash.size() && exists(p.trash.c_str());
+        if (in_trash && p.is_snapshot) {
+            SnapRefs refs;
+            bool needed = false;
+            {
+                Guard g(s->mu);
+                if (snapshot_refs_locked(s, p.id, refs) == 0)
+                    needed = refs.active_worlds || refs.creating_worlds || refs.pool_entries;
+            }
+            // Somebody's baseline. Put it back before anything else can call it due.
+            if (needed) {
+                if (exists(p.home.c_str())) continue;               // cannot: leave it TRASHING
+                if (wfs::fs_rename(p.trash.c_str(), p.home.c_str())) continue;
+                in_trash = false;
+            }
+        }
+        Guard g(s->mu);
+        Txn t(s->db);
+        Stmt u(s->db, in_trash
+                          ? (p.is_snapshot ? "UPDATE snapshots SET state=2 WHERE id=? AND state=4"
+                                           : "UPDATE worlds SET state=2 WHERE id=? AND state=4")
+                          : (p.is_snapshot
+                                 ? "UPDATE snapshots SET state=1, trash_path='', trashed_at=0 WHERE id=? AND state=4"
+                                 : "UPDATE worlds SET state=1, trash_path='', trashed_at=0 WHERE id=? AND state=4"));
+        if (!u.ok()) return -EIO;
+        u.i64(1, (int64_t)p.id);
+        if (u.step() != SQLITE_DONE) return -EIO;
+        t.commit();
+        if (in_trash) { if (finished) (*finished)++; }
+        else if (restored) (*restored)++;
+    }
+    return 0;
+}
+
+} // namespace wfs
 
 // ---- the exec lock (P5) -------------------------------------------------------------------------
 
@@ -1859,7 +2049,7 @@ bool gc_tmp_is_removable(wfs_store *s, wfs_id id, const char *p) {
         if (m.world != id || ::strcmp(m.store_id, s->store_id.c_str()) != 0) return false;
     }
     Guard g(s->mu);
-    Stmt q(s->db, "SELECT COUNT(*) FROM worlds WHERE dir_dev=? AND dir_ino=? AND state<=2 AND id<>?");
+    Stmt q(s->db, "SELECT COUNT(*) FROM worlds WHERE dir_dev=? AND dir_ino=? AND state<>3 AND id<>?");
     if (!q.ok()) return false;
     q.i64(1, (int64_t)st.st_dev);
     q.i64(2, (int64_t)st.st_ino);
@@ -1947,19 +2137,56 @@ struct TrashView {
     uint64_t tree_entries = 0;
 };
 
+// PR #1 review (5th round): a directory in the trash is row-less only when NO row names it, in
+// ANY state. The collector used to build this list from the TRASHED rows alone, so a row in the
+// middle of its discard (TRASHING) -- or one whose state the same wake was about to change --
+// left its tree looking like an orphan, and an orphan is deleted immediately, retention and
+// restorability and "this is somebody's baseline" all skipped. The `.deleting` spelling counts
+// as the same name: the collector renames the tree first and records it second, so between the
+// two the row still names the tree by its old name.
+void claim_trash_paths(wfs_store *s, Vec<String> &claimed) {
+    for (int table = 0; table < 2; ++table) {
+        Stmt q(s->db, table ? "SELECT trash_path FROM snapshots WHERE trash_path<>''"
+                            : "SELECT trash_path FROM worlds WHERE trash_path<>''");
+        if (!q.ok()) continue;
+        while (q.row()) {
+            String tp(q.col_text(0));
+            if (!tp.size()) continue;
+            if (!ends_with(tp.c_str(), WFS_DELETING_SUFFIX)) {
+                String d(tp);
+                d.append(WFS_DELETING_SUFFIX);
+                claimed.emplace_back(d);
+            }
+            claimed.emplace_back(tp);
+        }
+    }
+}
+
+// The collector renames a trash entry to `<name>.deleting` first and records the new name
+// second, so between the two -- and after any interruption in that window -- the row still names
+// the tree by the name it no longer has. Both names now belong to the row (claim_trash_paths),
+// which means the row has to be the one that finishes it: follow the rename.
+void trash_follow_deleting(String &tp) {
+    if (ends_with(tp.c_str(), WFS_DELETING_SUFFIX) || exists(tp.c_str())) return;
+    String d(tp);
+    d.append(WFS_DELETING_SUFFIX);
+    if (exists(d.c_str())) tp = d;
+}
+
 int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v) {
-    Vec<String> claimed;   // trash paths a row points at
+    Vec<String> claimed;   // trash paths a row points at, whatever state that row is in
     {
         Guard g(s->mu);
+        claim_trash_paths(s, claimed);
         {
             Stmt q(s->db, "SELECT id, trash_path, trashed_at, entries FROM worlds WHERE state=2");
             if (!q.ok()) return -EIO;
             while (q.row()) {
                 String tp(q.col_text(1));
                 if (!tp.size()) continue;
-                claimed.emplace_back(tp);
                 v.worlds++;
                 v.tree_entries += (uint64_t)q.col_i64(3);
+                trash_follow_deleting(tp);
                 TrashJob j;
                 j.path = tp;
                 j.row = (wfs_id)q.col_i64(0);
@@ -1974,9 +2201,9 @@ int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v) {
             while (q.row()) {
                 String tp(q.col_text(1));
                 if (!tp.size()) continue;
-                claimed.emplace_back(tp);
                 v.snapshots++;
                 v.tree_entries += (uint64_t)q.col_i64(3);
+                trash_follow_deleting(tp);
                 TrashJob j;
                 j.path = tp;
                 j.row = (wfs_id)q.col_i64(0);
@@ -1986,10 +2213,24 @@ int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v) {
                 else v.waiting++;
             }
         }
+        // A discard that was killed in the middle. Its tree is in the trash and it is nobody's
+        // orphan; it is also not collectable until trashing_recover() has said which way it
+        // goes, so it is counted and never queued.
+        {
+            Stmt q(s->db, "SELECT id, trash_path, entries, 0 FROM worlds WHERE state=4"
+                          " UNION ALL SELECT id, trash_path, entries, 1 FROM snapshots WHERE state=4");
+            if (!q.ok()) return -EIO;
+            while (q.row()) {
+                if (!*q.col_text(1) || !exists(q.col_text(1))) continue;   // the rename never happened
+                if (q.col_i64(3)) v.snapshots++; else v.worlds++;
+                v.tree_entries += (uint64_t)q.col_i64(2);
+                v.waiting++;
+            }
+        }
     }
-    // Directories in <store>/trash that no row claims: a killed discard, a store restored from a
-    // backup, or a *.deleting tree whose row was already marked DEAD. They go immediately --
-    // there is nothing left that could restore them.
+    // Directories in <store>/trash that no row claims: a store restored from a backup, or a
+    // *.deleting tree whose row was already marked DEAD. They go immediately -- there is nothing
+    // left that could restore them.
     String trashdir = joinp(s->dir.c_str(), "trash");
     if (DIR *d = ::opendir(trashdir.c_str())) {
         while (struct dirent *e = ::readdir(d)) {
@@ -2170,6 +2411,12 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
     if (o.flags & WFS_GC_BACKGROUND) {
         if (int rc = lock.take(s)) return rc;
     }
+
+    // Before anything classifies anything: a discard that was killed between its rename and its
+    // commit (PR #1 review, 5th round). wfs_store_open() has already done this once, but a
+    // worker's wake can be minutes long and the store handle older still, so the row a *different*
+    // process left behind since is resolved here rather than mistaken for something else below.
+    wfs::trashing_recover(s, nullptr, nullptr);
 
     // ---- the cheap half, always run in full ------------------------------------------------
     //

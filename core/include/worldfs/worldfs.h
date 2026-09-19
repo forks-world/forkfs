@@ -71,8 +71,14 @@ typedef struct wfs_ref {
 typedef enum wfs_state {
     WFS_ST_CREATING = 0,
     WFS_ST_ACTIVE = 1,
-    WFS_ST_TRASHED = 2, /* worlds only: sitting in <store>/trash, restorable */
-    WFS_ST_DEAD = 3
+    WFS_ST_TRASHED = 2, /* sitting in <store>/trash, restorable */
+    WFS_ST_DEAD = 3,
+    /* PR #1 review (5th round): the middle of a discard. The row is committed with the name the
+     * tree is about to have, the rename has not necessarily happened yet, and the tree is at
+     * exactly one of the two names. Every store open and every gc resolves it: back to ACTIVE
+     * when the tree never moved (or something still references it), on to TRASHED when it did.
+     * Nothing that collects the trash may treat a directory a TRASHING row names as row-less. */
+    WFS_ST_TRASHING = 4
 } wfs_state;
 
 /* Where a world came from. */
@@ -693,6 +699,16 @@ extern void *wfs_test_before_fork_publish_ctx;
  * means getpid(). A test sets it to a pid that is not running to produce the one state a single
  * process cannot otherwise reach: a half-built tree whose producer is gone. */
 extern int64_t wfs_test_fork_owner_pid;
+
+/* And the discard's own two halves (PR #1 review, 5th round). `phase` is 0 just after the row
+ * has been committed in WFS_ST_TRASHING and before the tree is renamed, 1 just after the rename
+ * and before the commit that makes the row TRASHED. A non-zero return is returned straight out
+ * of wfs_world_discard()/wfs_snapshot_discard() with nothing unwound -- row and tree stay
+ * exactly as a kill -9 there leaves them, which is the state the recovery has to resolve.
+ * NULL unless a test sets it; nothing in the library ever assigns it. */
+extern int (*wfs_test_trash_crash)(void *ctx, int phase, int is_snapshot, wfs_id id,
+                                   const char *trash_path);
+extern void *wfs_test_trash_crash_ctx;
 
 /* And the thing no test can provoke on a healthy machine: a pthread_create that fails for one
  * worker slot and succeeds for a later one. A bit set here refuses that slot (slots 0..31); 0,

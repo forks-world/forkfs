@@ -78,6 +78,15 @@ bool producer_alive(int64_t pid, int64_t start_sec);
 // at all. 60 s, or WORLD_GC_CREATING_MIN_AGE seconds.
 int64_t creating_min_age_secs(void);
 
+// ---- PR #1 review (5th round): the middle of a discard ---------------------------------------
+//
+// Resolves every WFS_ST_TRASHING row in the store: the tree is either still at its home path
+// (the rename never happened -- back to ACTIVE) or already at trash_path (it did -- on to
+// TRASHED, unless the snapshot is still somebody's baseline, in which case it goes back). Cheap
+// when there is nothing to do: two indexed SELECTs that return no rows. Run on every store open
+// and at the start of every gc, before anything classifies the trash. Both counters may be null.
+int trashing_recover(wfs_store *s, uint64_t *restored, uint64_t *finished);
+
 int fs_lstat(const char *path, wfs_attr &out);
 int fs_readlink(const char *path, char *buf, size_t cap, size_t *len);
 int fs_mkfile(const char *path, uint32_t mode);
