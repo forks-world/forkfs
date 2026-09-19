@@ -1244,6 +1244,55 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第二十三轮:读不出来的那一半,不是空的那一半(2026-09-20)
+
+第二十三轮,Codex 三条 P2,三条是同一句话——第十二轮那句"**问不出来不等于不在**"——在两个还没被它
+管到的文件里的实例。第十二轮管的是 collector:它要毁东西、要写没法反悔的行,所以"树不在了"必须证明。
+这一轮的两个文件不毁任何东西,可它们**报数**:`world fs diff` 报出来的那份清单是人拿去看代码改了什么
+的,硬链接重放报出来的 0 是"这棵克隆和快照一模一样"。一份报错成"没有"的答案,和一次删错的树一样没法
+事后发现——它退出 0,没有任何一处留下痕迹。
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P2 `PRRT_kwDOUf7jGc6kEbHC` | `core/src/diff.cpp` `expand_side()`(候选路径),以及 `platform_posix.cpp` 的 walker | 搬进/搬出 World 的**目录**是靠走一遍它来报的(FSEvents 对整棵搬进来的子树只给一条目录事件),而这趟 walk 的返回值**被丢掉了**:目录是 `0000`、或者中途 EIO,于是它一条不报、或者只报到断掉的地方,`world fs diff --events` 把这份残缺的清单印出来、退出 0。同一个 bug 往下一层还有一份:`dir_is_empty()` 是 `opendir(3)` 上的一个 bool,EACCES/EIO 在它眼里等于"非空",于是只在一侧存在的目录那一行**悄悄没了** | walk 的 errno 就是这次展开的结果:`expand_side()`/`report_one_side()`/`verify_candidate()` 一路往上传,候选循环遇到就停,`wfs_world_diff()` 回的是这个 errno 而不是半份 diff(CLI 照常印出来、非 0 退出)。`dir_is_empty()` 改成回 `0/-errno`,**只有真读到底的目录才算空**;`fs_gone()`(候选在我们看它的时候被删了)仍旧是"什么都不报",和原来一样。顺带把 walker 本身审了(全扫那条路也靠它):`fs_walk_tree_ex()` 的 readdir(3) 回退路把 NULL **一律当成目录读完了**,而 NULL 也是 readdir 报错的方式——一次 EIO 于是让整趟 walk 回 0、条目少几个:克隆少文件、清单少行、diff 少变更,全都报成功。现在每次调用前清 `errno`、NULL 之后读它。`getattrlistbulk(2)` 那条路、`open(2)`/`fstatat(2)`/`FS_DIRS_POST` 的收尾 `lstat(2)` 本来就是传 errno 的 | `7bef4c9` |
+| P2 `PRRT_kwDOUf7jGc6kEbHD` | `core/src/diff.cpp` 候选的两侧查找、全扫的 `side_entry()` | 两侧的 `lstat` 都是 bool:0 是"在",别的一律是"不在"。父目录 EACCES、EIO、目录位置上现在是一个指向自己的符号链接(ELOOP)、卷没挂上——全被读成"不在",而 diff **把它报出去**:一侧失败是一条凭空的 A 或 D(谁都没碰过的文件,印成"已删除",退出 0),两侧都失败是这个候选**一声不吭地消失** | `side_lookup()` 一处问、三处用,errno 留着:`fs_gone()`(ENOENT/ENOTDIR——候选在我们看它的时候被删了、父路径上是个文件)是唯一的"不在",别的 errno 直接结束这次 diff。同一轮的审计还包括:`wfs_world_diff_ex()` 顶上快照根那次 `lstat` 原来把**任何**失败都读成 `WFS_E_SOURCE_GONE`(那是在叫人去别处重新 fork,对自己 store 里的一个 EACCES 是错的建议),改走 `fs_probe`/`fs_gone`;xattr 比对(第九轮)本来就把 `XA_ERROR` 和 `XA_EQUAL` 分开、报 `T`、计进 `stats.xattr_errors`、快照侧的 EACCES/EPERM 直接致命——确认无改;`content_equal()`/`link_target_equal()` 读不到时回"不相等",那不是"不在"的判词,而且它倒向**报出一处变更**(M)、从不倒向沉默,和第九轮给 xattr 选的方向一致,维持原样 | `3f8e58e` |
+| P2 `PRRT_kwDOUf7jGc6kEbHE` | `core/src/hardlinks.cpp` `restore_group()` / `group_still_linked()` / `hardlinks_verify_groups()` | 重放里每一次查成员(`fstatat`/`openat`)失败都记成 `missing` 然后接着放。`missing` 是**故意**容忍的——第五轮那条:**活的**源可能在扫描和克隆之间变了。可 EACCES/EIO/ELOOP 不是源变了,是这个问题**没被回答**;而从一个 **IMMUTABLE 快照** fork 根本没有这个借口。fork 和 pool 填充只认 `first_err`、从不读 `broken`,于是克隆被发布出去、组里的名字是各自独立的 inode、fork 回 0 | `fs_gone()` 是重放里唯一的"不在",树根、找正身的那一趟、每个成员的父目录下降、每个成员的 `fstatat` 都照这条办;别的 errno 进 `first_err`,和第四轮起被拒的 `link(2)` 一样让快照创建 / fork / pool 填充整个回退。`group_still_linked()` 改成回 `0` + 一个 bool("这棵活树上这个组已经断了")或 `-errno`("这棵活树问不出来"),于是活源那条路留着它对**不在**的容忍、失去它对**错误**的容忍。`hardlinks_verify_groups()`(第十三轮)是同一件事的另一头:它对**任何** lstat 失败都回 `-EINVAL`,而每个调用者把 `-EINVAL` 读成 `WFS_E_SNAPSHOT_DIRTY`——那是在告诉用户快照坏了、去重新做一个,对"成员不在"是对的,对"这棵树读不出来"是错的。非 `fs_gone` 的 errno 原样返回,fork 和 pool filler 透传,只有 `-EINVAL` 还变 SNAPSHOT_DIRTY;`wfs_snapshot_verify` 仍旧把它计进 `modified`——它是一份报告不是一次拒绝,而且它自己两行之后对同一棵树的 walk 本来就会把那个 errno 返回来 | `50e0e5a` |
+
+**新增的测试接缝**:`wfs_test_before_hl_replay`(fork 里克隆已经建好、一条 `link` 都还没做的那一瞬,
+给的是临时树的路径)。开发机上没有别的办法造出"成员查不了但成员在"这种状态。
+
+**FSEvents 有一条值得写下来的性质**(它决定了 P2 `…HD` 的 fixture 怎么搭):**重放时它会重新解析路径**。
+把 World 里的 `a` 改成 `0000`,重放回来的就只剩 `a` 一条(实测),它自己底下的候选根本不出现——
+于是"用 World 侧不可读的目录"去测候选查找是测不到东西的。所以那个 fixture 把**快照侧**的 `a` 关掉:
+它完全不参与 FSEvents 的解析,而且它是在 gate 窗口里读的,正是一个坏掉的 store 该现形的地方。World
+侧那一半由末尾的 ELOOP 用例覆盖。
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **266 passed, 0 failed**;`check-deps.sh` 全绿。
+(`m1_criteria.sh` 本轮跳过。)
+
+先把三个都跑红过:
+
+- P2 `…HC`:World 里新增目录 `d/`(里面一个文件),`d` 改 `0000`。**老代码** `--events` 回 **0、0 行**
+  ——`A d/f.txt` 就这么没了。
+- P2 `…HD`:快照侧的 `a` 改 `0000`(`a/b/h.txt` 两边都在、World 侧改过)。**老代码** `--events` 回
+  **0**,印出一行 **`A a/b/h.txt`**——一个两棵树里都有的文件,报成"新增";同一趟里
+  `a/b/gone.txt`(World 里建了又删,快照侧 ENOENT)被**悄悄丢掉**。ELOOP 那一半:World 的 `a/b` 换成
+  指向自己的符号链接,**老代码** `--full` 回 **0**,印出 `M a/b` 和一条凭空的 `D a/b/h.txt`。
+- P2 `…HE`:快照里一对 `(d/a, d/b)`,fork 时用新接缝把克隆的 `d` 改成 `0000`。**老代码** fork 回
+  **0**,发布出 W26,里面 `d/a` ino 288091848、`d/b` ino 288091849、`nlink` 1——快照记的是一个 inode
+  两个名字,发出去的是两个独立文件。
+
+新增测试:
+
+- `diff_test` `unreadable_dir()`(P2 `…HC`):上面那棵树,`--events` 和 `--full` 都要回 `-EACCES`
+  **且一行都不报**(回调一次都不许进);把模式改回去,两条路都列出 `A d/f.txt`。
+- `diff_test` `unreadable_lookup()`(P2 `…HD`):快照侧 `a` 关掉时两条路都回 `-EACCES`、一行不报,
+  而且 gate 在两条出门的路上都回到 `WFS_GATE_CLOSED`;改回去两条路都列出 `M a/b/h.txt`。末尾是
+  `side_entry()` 那一半:World 的 `a/b` 是指向自己的符号链接,`--full` 回 `-ELOOP`。
+- `core_test`(P2 `…HE`,接在第十八轮那一块后面):新接缝把克隆的 `d` 关掉,fork 必须回 `-EACCES`,
+  `--to` 上什么都没有、旁边不留 `.wfs-fork-` 临时树、World 行数一条没多;接缝清掉之后同一次 fork
+  成功,`d/a` 和 `d/b` 是一个 inode、`nlink` 2。
+
 #### PR #1 review 第二十二轮:我们要拿走的名字,不算别人身上的一条链接(2026-09-20)
 
 第二十二轮,Codex 一条 P2,落在第十四轮那半条修法上。checkpoint 会把克隆里的 `.world` 标记删掉
