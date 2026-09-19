@@ -283,7 +283,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
     fi
     echo "$out" | grep -q "could not be removed" && ok PR5 "gc says so instead of reporting it collected" \
                                                  || { bad PR5 "gc says so instead of reporting it collected"; echo "$out" | sed 's/^/        /'; }
-    if "$WORLD" fs gc --status | grep -q "^abandoned: *1 half-built fork tree"; then
+    if "$WORLD" fs gc --status | grep -q "^abandoned: *1 half-built tree"; then
         ok PR5 "gc --status counts the abandoned tree"
     else
         bad PR5 "gc --status counts the abandoned tree"; "$WORLD" fs gc --status | sed 's/^/        /'
@@ -1082,6 +1082,53 @@ rv fs gc --status | grep -q "stale pre-clone" && ok PR6 "gc --status counts the 
 for _ in $(seq 240); do [ -z "$(ls "$PDIR" 2>/dev/null)" ] && break; sleep 0.25; done
 [ -z "$(ls "$PDIR" 2>/dev/null)" ] && ok PR6 "the successor chain finishes the pool entry" \
                                     || { bad PR6 "the successor chain finishes the pool entry"; ls -d "$PDIR"/* | sed 's/^/        /'; }
+
+
+# ---- PR #1 review (7th round, P2): a half-built snapshot gc cannot remove keeps its row -------
+# The mirror of the abandoned-fork-tree case above, and it had the opposite bug: gc called
+# fs_remove_tree() on S<n>.wfs-tmp and on S<n>, threw both results away, and deleted the row. The
+# suffix sweep only ever looks at `*.wfs-tmp`, so an S<n> that would not go was left with nothing
+# in the store that knew it was rubbish -- leaked for ever, and invisible to `gc --status`. A
+# store of its own, because the row is written straight into the database and would otherwise
+# take a snapshot id the tests above name by hand. Same ACL as the undeletable-trash case: it
+# survives both chmod and chflags, so the tree really cannot go.
+if command -v sqlite3 > /dev/null 2>&1; then
+    H7STORE="$SCRATCH/half-store"
+    h7() { "$WORLD" --store "$H7STORE" "$@"; }
+    h7 fs status > /dev/null 2>&1
+    sqlite3 "$H7STORE/metadata.db" "INSERT INTO snapshots(name,path,src_path,from_world,created_at,state,owner_pid,owner_start) VALUES('pr7half','','',0,0,0,2147480000,0);" 2>/dev/null
+    H7S=$(sqlite3 "$H7STORE/metadata.db" "SELECT id FROM snapshots WHERE name='pr7half';")
+    H7DIR="$H7STORE/snapshots/S$H7S"
+    mkdir -p "$H7DIR/keep"
+    echo x > "$H7DIR/keep/f.txt"
+    chmod +a "$(id -un) deny delete,delete_child,add_file" "$H7DIR/keep"
+    out=$(WORLD_GC_CREATING_MIN_AGE=0 h7 fs gc 2>&1)
+    H7ROWS=$(sqlite3 "$H7STORE/metadata.db" "SELECT count(*) FROM snapshots WHERE id=$H7S;")
+    if [ -e "$H7DIR/keep/f.txt" ] && [ "$H7ROWS" = 1 ]; then
+        ok PR7 "a half-built snapshot gc cannot remove keeps its row"
+    else
+        bad PR7 "a half-built snapshot gc cannot remove keeps its row (rows $H7ROWS)"
+        echo "$out" | sed 's/^/        /'
+    fi
+    echo "$out" | grep -q "could not be removed" && ok PR7 "gc says so instead of reporting it collected" \
+                                                 || { bad PR7 "gc says so instead of reporting it collected"; echo "$out" | sed 's/^/        /'; }
+    if h7 fs gc --status | grep -q "^abandoned: *1 half-built tree"; then
+        ok PR7 "gc --status counts the half-built snapshot"
+    else
+        bad PR7 "gc --status counts the half-built snapshot"; h7 fs gc --status | sed 's/^/        /'
+    fi
+    # Take the ACL away and the next wake finishes what it started: tree gone, row gone.
+    chmod -N "$H7DIR/keep"
+    WORLD_GC_CREATING_MIN_AGE=0 h7 fs gc > /dev/null 2>&1
+    H7ROWS=$(sqlite3 "$H7STORE/metadata.db" "SELECT count(*) FROM snapshots WHERE id=$H7S;")
+    if [ ! -e "$H7DIR" ] && [ "$H7ROWS" = 0 ]; then
+        ok PR7 "once it can be removed the next gc removes the tree and the row"
+    else
+        bad PR7 "once it can be removed the next gc removes the tree and the row (rows $H7ROWS)"
+    fi
+    h7 fs gc --status | grep -q "^abandoned:" && bad PR7 "and stops counting it" \
+                                              || ok PR7 "and stops counting it"
+fi
 
 echo
 "$WORLD" fs status | sed 's/^/      /'

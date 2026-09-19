@@ -2564,6 +2564,22 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
                 if (exists(q.col_text(0))) out->creating_stranded++;
             }
         }
+        // PR #1 review (7th round): and the half-built snapshots, whose two possible trees
+        // (<store>/snapshots/S<n> and its .wfs-tmp) are named by nothing but the CREATING row
+        // once the producer is gone. gc keeps that row when it cannot remove them, so an
+        // operator asking what is waiting has to be told about those as well.
+        String snapd = joinp(s->dir.c_str(), "snapshots");
+        Stmt sq(s->db, "SELECT id, owner_pid, owner_start, created_at FROM snapshots WHERE state=0");
+        if (sq.ok()) {
+            while (sq.row()) {
+                if (wfs::producer_alive(sq.col_i64(1), sq.col_i64(2))) continue;
+                if (sq.col_i64(3) > reap_before) continue;
+                wfs_id sid = (wfs_id)sq.col_i64(0);
+                String stmp = numbered(snapd.c_str(), 'S', sid, WFS_TMP_SUFFIX);
+                String sdir = numbered(snapd.c_str(), 'S', sid, nullptr);
+                if (exists(stmp.c_str()) || exists(sdir.c_str())) out->creating_stranded++;
+            }
+        }
     }
     // T1.5, PR #1 review (6th round): and the stale pool entries. Like the abandoned fork trees
     // above they are not in the trash -- they are clones under <store>/pool -- but they are
@@ -2696,9 +2712,26 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
         }
         for (size_t i = 0; i < snap_gone.size(); ++i) {
             String tmp = numbered(snaps.c_str(), 'S', snap_gone[i], WFS_TMP_SUFFIX);
-            wfs::fs_remove_tree(tmp.c_str());
             String dir = numbered(snaps.c_str(), 'S', snap_gone[i], nullptr);
+            wfs::fs_remove_tree(tmp.c_str());
             wfs::fs_remove_tree(dir.c_str());
+            // PR #1 review (7th round): the row goes only when both trees are confirmed gone.
+            // The results used to be thrown away and the row deleted regardless, and an S<n>
+            // that would not budge (EPERM, an ACL, a transient EIO) then leaked for ever: the
+            // suffix sweep below only ever looks at `*.wfs-tmp`, so nothing left in the store
+            // knew that directory was rubbish. The CREATING row is kept instead -- exactly as
+            // the abandoned fork trees above keep theirs -- so it is counted, reported by
+            // `gc --status`, and retried under the same failure cap.
+            TrashJob j;
+            j.path = dir;
+            j.row = snap_gone[i];
+            j.is_snapshot = 1;
+            if (exists(tmp.c_str()) || exists(dir.c_str())) {
+                rep.tmp_failed++;
+                if (gc_fail_bump(s, j) < kGcFailCap) rep.work_remains = 1;
+                continue;
+            }
+            gc_fail_clear(s, j);
             rep.snapshots_deleted++;
             Guard g(s->mu);
             Txn t(s->db);

@@ -1104,8 +1104,10 @@ static int cmd_gc_status(wfs_store *s, int64_t retention) {
     }
     // Not trash, but waiting for the same collector: a fork that died leaves its half-built
     // clone in the user's own directory, and only its CREATING row knows the name (PR #1 review).
+    // Since the 7th round a half-built snapshot gc could not remove is counted here too -- its
+    // S<n> is not swept by anything either, so the row is the only record of it.
     if (ts.creating_stranded)
-        printf("abandoned: %llu half-built fork tree%s still on disk (`world fs gc` retries them)\n",
+        printf("abandoned: %llu half-built tree%s still on disk (`world fs gc` retries them)\n",
                (unsigned long long)ts.creating_stranded, ts.creating_stranded == 1 ? "" : "s");
     // Nor are these: stale pre-clone entries under <store>/pool, whose snapshot is gone or is a
     // different snapshot now. Removing one is a whole tree, so a bounded wake can leave some
@@ -1165,7 +1167,7 @@ static int cmd_gc(wfs_store *s, int argc, char **argv) {
     }
     if (rep.tmp_failed) {
         fprintf(stderr,
-                "world: note: %llu half-built fork tree%s could not be removed and %s still on disk.\n"
+                "world: note: %llu half-built tree%s could not be removed and %s still on disk.\n"
                 "world:       The record of %s is kept; %s   (`world fs gc --status`)\n",
                 (unsigned long long)rep.tmp_failed, rep.tmp_failed == 1 ? "" : "s",
                 rep.tmp_failed == 1 ? "is" : "are", rep.tmp_failed == 1 ? "it" : "them",
