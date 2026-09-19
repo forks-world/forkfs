@@ -1284,6 +1284,16 @@ namespace {
 // A kill anywhere in there leaves a TRASHING row whose trash_path is the only name the tree can
 // have besides its own, which is what trashing_recover() below resolves -- and which is why the
 // orphan rule now spares every directory any row names, in any state.
+//
+// PR #1 review (8th round): "a kill" -- and only a kill. Step (a) also writes the owner (this
+// pid and this process's own start time, exactly as a CREATING row records its producer), and
+// trashing_recover() skips a TRASHING row whose owner is still alive. Without that, a second
+// process opening the store in the middle of a live discard -- every `world fs ...` invocation
+// opens the store, and the open runs the recovery -- read "the tree is still at home" and put
+// the row back to ACTIVE with an empty trash_path. The discard then renamed the tree into the
+// trash, its conditional step (c) matched no row, and it returned 0: an ACTIVE row whose tree
+// is a row-less orphan in the trash, which the very next collector deletes. `restore` has the
+// mirror image, and both are gone now: while the owner runs, the row is in flight, not crashed.
 int trashing_set_path(wfs_store *s, wfs_id id, int is_snapshot, const char *p) {
     Guard g(s->mu);
     Txn t(s->db);
@@ -1297,18 +1307,88 @@ int trashing_set_path(wfs_store *s, wfs_id id, int is_snapshot, const char *p) {
     return 0;
 }
 
-// Step (c). Only ever applied to a row this process put in TRASHING.
-int trashing_commit(wfs_store *s, wfs_id id, int is_snapshot) {
+// Who is moving this tree: the pid and that process's own start time, so a reused pid is not
+// mistaken for the owner. The same two columns a CREATING row uses, filled the same way, and
+// cleared again by step (c) and by the undo -- a row that is not in flight has no owner.
+void trashing_own(Stmt &u, int pid_idx, int start_idx) {
+    int64_t pid = 0, start = 0;
+    owner_now(pid, start);
+    u.i64(pid_idx, pid);
+    u.i64(start_idx, start);
+}
+
+// The one combination that may never outlive a discard: the tree is in the trash and the row
+// says ACTIVE. It can only be reached by somebody resolving our row from under us -- a recovery
+// in another process whose lstat ran before our rename -- which the ownership above already
+// rules out. Belt and braces, then, and the cheapest honest outcome for each case:
+//
+//   the row is TRASHED at our path   somebody finished the discard for us. That is what the
+//                                    caller asked for: 0.
+//   the row is ACTIVE                the verdict was made against a tree that has since moved.
+//                                    Re-mark it TRASHED, naming the tree where it actually is,
+//                                    and the row and the tree agree again: 0.
+//   the tree is not at our path,     the tree is home (or gone) and the row was resolved to
+//   or the row is neither            match it. The discard did not happen: -ESTALE, and the
+//                                    caller is told rather than handed a silent success.
+//
+// A reference cannot have appeared for a snapshot in that window: fork, pool fill, adopt and
+// restore all re-read the snapshot row under the write lock and refuse anything but ACTIVE, and
+// for the moment this row was ACTIVE its tree was already in the trash -- so any such claim's
+// clone fails with ENOENT and unwinds itself.
+int trashing_reclaim(wfs_store *s, wfs_id id, int is_snapshot, const char *trash_path) {
+    if (!trash_path || !*trash_path || !exists(trash_path)) return -ESTALE;
     Guard g(s->mu);
     Txn t(s->db);
-    Stmt u(s->db, is_snapshot ? "UPDATE snapshots SET state=? WHERE id=? AND state=4"
-                              : "UPDATE worlds SET state=? WHERE id=? AND state=4");
+    int64_t state = -1;
+    String tp;
+    {
+        Stmt q(s->db, is_snapshot ? "SELECT state, trash_path FROM snapshots WHERE id=?"
+                                  : "SELECT state, trash_path FROM worlds WHERE id=?");
+        if (!q.ok()) return -EIO;
+        q.i64(1, (int64_t)id);
+        if (!q.row()) return -ESTALE;
+        state = q.col_i64(0);
+        tp.assign(q.col_text(1));
+    }
+    if (state == WFS_ST_TRASHED && !::strcmp(tp.c_str(), trash_path)) return 0;
+    if (state != WFS_ST_ACTIVE) return -ESTALE;
+    Stmt u(s->db, is_snapshot
+                      ? "UPDATE snapshots SET state=?, trash_path=?, trashed_at=?, owner_pid=0,"
+                        " owner_start=0 WHERE id=? AND state=1"
+                      : "UPDATE worlds SET state=?, trash_path=?, trashed_at=?, owner_pid=0,"
+                        " owner_start=0 WHERE id=? AND state=1");
     if (!u.ok()) return -EIO;
     u.i64(1, WFS_ST_TRASHED);
-    u.i64(2, (int64_t)id);
+    u.text(2, trash_path);
+    u.i64(3, now_sec());
+    u.i64(4, (int64_t)id);
     if (u.step() != SQLITE_DONE) return -EIO;
+    if (sqlite3_changes(s->db) == 0) return -ESTALE;
     t.commit();
     return 0;
+}
+
+// Step (c). Only ever applied to a row this process put in TRASHING -- and since the 8th round
+// of the PR #1 review it says so: zero rows changed means the row is not ours any more, and the
+// tree that is now in the trash has to be squared with whatever the row says before this can
+// return anything (trashing_reclaim above). It used to return 0 on a no-op UPDATE.
+int trashing_commit(wfs_store *s, wfs_id id, int is_snapshot, const char *trash_path) {
+    {
+        Guard g(s->mu);
+        Txn t(s->db);
+        Stmt u(s->db,
+               is_snapshot
+                   ? "UPDATE snapshots SET state=?, owner_pid=0, owner_start=0 WHERE id=? AND state=4"
+                   : "UPDATE worlds SET state=?, owner_pid=0, owner_start=0 WHERE id=? AND state=4");
+        if (!u.ok()) return -EIO;
+        u.i64(1, WFS_ST_TRASHED);
+        u.i64(2, (int64_t)id);
+        if (u.step() != SQLITE_DONE) return -EIO;
+        int changed = sqlite3_changes(s->db);
+        t.commit();
+        if (changed) return 0;
+    }
+    return trashing_reclaim(s, id, is_snapshot, trash_path);
 }
 
 // The rename never happened, so neither did the discard: put the row back exactly where
@@ -1317,8 +1397,10 @@ void trashing_undo(wfs_store *s, wfs_id id, int is_snapshot) {
     Guard g(s->mu);
     Txn t(s->db);
     Stmt u(s->db,
-           is_snapshot ? "UPDATE snapshots SET state=?, trash_path='', trashed_at=0 WHERE id=? AND state=4"
-                       : "UPDATE worlds SET state=?, trash_path='', trashed_at=0 WHERE id=? AND state=4");
+           is_snapshot ? "UPDATE snapshots SET state=?, trash_path='', trashed_at=0, owner_pid=0,"
+                         " owner_start=0 WHERE id=? AND state=4"
+                       : "UPDATE worlds SET state=?, trash_path='', trashed_at=0, owner_pid=0,"
+                         " owner_start=0 WHERE id=? AND state=4");
     if (u.ok()) { u.i64(1, WFS_ST_ACTIVE); u.i64(2, (int64_t)id); u.step(); }
     t.commit();
 }
@@ -1406,17 +1488,21 @@ extern "C" int wfs_world_discard(wfs_store *s, wfs_id id, int immediate, int for
     char leaf[80];
     ::snprintf(leaf, sizeof leaf, "W%llu-%lld", (unsigned long long)id, (long long)now_sec());
     String trash = joinp(joinp(s->dir.c_str(), "trash").c_str(), leaf);
-    // (a) the row first, in TRASHING, naming the place the tree is about to move to. A crash
-    // from here to (c) leaves a tree that one row names, never a row-less orphan.
+    // (a) the row first, in TRASHING, naming the place the tree is about to move to, and owned
+    // by this process for as long as the move takes (8th round). A crash from here to (c) leaves
+    // a tree that one row names, never a row-less orphan; a *live* discard leaves a row no other
+    // process may resolve.
     {
         Guard g(s->mu);
         Txn t(s->db);
-        Stmt u(s->db, "UPDATE worlds SET state=?, trash_path=?, trashed_at=? WHERE id=? AND state=1");
+        Stmt u(s->db, "UPDATE worlds SET state=?, trash_path=?, trashed_at=?, owner_pid=?,"
+                      " owner_start=? WHERE id=? AND state=1");
         if (!u.ok()) return -EIO;
         u.i64(1, WFS_ST_TRASHING);
         u.text(2, trash.c_str());
         u.i64(3, now_sec());
-        u.i64(4, (int64_t)id);
+        trashing_own(u, 4, 5);
+        u.i64(6, (int64_t)id);
         if (u.step() != SQLITE_DONE) return -EIO;
         if (sqlite3_changes(s->db) == 0) return -ESTALE;   // somebody else moved it meanwhile
         t.commit();
@@ -1439,7 +1525,7 @@ extern "C" int wfs_world_discard(wfs_store *s, wfs_id id, int immediate, int for
     if (rc) { trashing_undo(s, id, 0); return rc; }
     if (int hrc = trash_crash_seam(1, 0, id, trash.c_str())) return hrc;
     // (c)
-    if (int crc = trashing_commit(s, id, 0)) return crc;
+    if (int crc = trashing_commit(s, id, 0, trash.c_str())) return crc;
     if (!immediate) return 0;
     // The row is TRASHED now, so a collector running beside us may already have picked this
     // entry up: the same helper, following the same rename (PR #1 review, 6th round).
@@ -1525,10 +1611,16 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
             q.i64(1, (int64_t)rr.snapshot_id);
             if (!q.row() || q.col_i64(0) != WFS_ST_ACTIVE) return WFS_E_SOURCE_GONE;
         }
-        Stmt u(s->db, "UPDATE worlds SET state=? WHERE id=? AND state=2");
+        // ... and owned by this process while the rename runs (8th round): a TRASHING row whose
+        // owner is alive is an operation in flight, and no other process's recovery may decide
+        // for it. Without that, a store opened next door read "the tree is still at trash_path"
+        // and put the row back to TRASHED, after which this restore renamed the tree home and
+        // its step (c) matched nothing -- a TRASHED row for a world sitting at its home path.
+        Stmt u(s->db, "UPDATE worlds SET state=?, owner_pid=?, owner_start=? WHERE id=? AND state=2");
         if (!u.ok()) return -EIO;
         u.i64(1, WFS_ST_TRASHING);
-        u.i64(2, (int64_t)id);
+        trashing_own(u, 2, 3);
+        u.i64(4, (int64_t)id);
         if (u.step() != SQLITE_DONE) return -EIO;
         if (sqlite3_changes(s->db) == 0) return -ESTALE;
         t.commit();
@@ -1539,25 +1631,39 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
         // The tree never left the trash, so the row says what it said before: TRASHED, with the
         // same trash_path. That is trashing_commit()'s whole job -- "the tree is in the trash"
         // -- and it is the verdict trashing_recover() would reach here by itself.
-        trashing_commit(s, id, 0);
+        trashing_commit(s, id, 0, trash.c_str());
         return rc;
     }
     if (int hrc = trash_crash_seam(3, 0, id, trash.c_str())) return hrc;
-    // (c)
+    // (c). The tree is at home: whatever the row says, that is now the only fact on disk, and
+    // this UPDATE has to be the one that makes the row agree with it. PR #1 review (8th round):
+    // it is conditional and it is checked. A row somebody else put back in TRASHED while our
+    // rename was in flight is picked up too -- a TRASHED world whose tree is at its home path is
+    // a state only this restore can have produced -- and a row that is ACTIVE with no trash_path
+    // is the outcome we wanted, reached by somebody else. Anything else is not ours to overwrite.
     struct stat st;
     if (::stat(r.path, &st) != 0) return -errno;
+    {
+        Guard g(s->mu);
+        Txn t(s->db);
+        Stmt u(s->db, "UPDATE worlds SET state=?, trash_path='', trashed_at=0, dir_dev=?,"
+                      " dir_ino=?, owner_pid=0, owner_start=0 WHERE id=? AND (state=4 OR state=2)");
+        if (!u.ok()) return -EIO;
+        u.i64(1, WFS_ST_ACTIVE);
+        u.i64(2, (int64_t)st.st_dev);
+        u.i64(3, (int64_t)st.st_ino);
+        u.i64(4, (int64_t)id);
+        if (u.step() != SQLITE_DONE) return -EIO;
+        int changed = sqlite3_changes(s->db);
+        t.commit();
+        if (changed) return 0;
+    }
     Guard g(s->mu);
-    Txn t(s->db);
-    Stmt u(s->db, "UPDATE worlds SET state=?, trash_path='', trashed_at=0, dir_dev=?, dir_ino=?"
-                  " WHERE id=? AND state=4");
-    if (!u.ok()) return -EIO;
-    u.i64(1, WFS_ST_ACTIVE);
-    u.i64(2, (int64_t)st.st_dev);
-    u.i64(3, (int64_t)st.st_ino);
-    u.i64(4, (int64_t)id);
-    if (u.step() != SQLITE_DONE) return -EIO;
-    t.commit();
-    return 0;
+    Stmt q(s->db, "SELECT state, trash_path FROM worlds WHERE id=?");
+    if (!q.ok()) return -EIO;
+    q.i64(1, (int64_t)id);
+    if (q.row() && q.col_i64(0) == WFS_ST_ACTIVE && !*q.col_text(1)) return 0;
+    return -ESTALE;
 }
 
 // ---- T2.2: discarding a snapshot --------------------------------------------------------------
@@ -1695,12 +1801,18 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
     // ACTIVE while the tree sat in the trash with nothing naming it -- and the next collector
     // deleted it as an orphan, taking the baseline of every world forked from it with it
     // (PR #1 review, 5th round).
-    Stmt u(s->db, "UPDATE snapshots SET state=?, trash_path=?, trashed_at=? WHERE id=?");
+    // PR #1 review (8th round): and owned by this process while the rename runs, so that a
+    // recovery in another process leaves this row alone until it is either finished or orphaned.
+    // A row that goes straight to DEAD (the tree was already gone) is nobody's work in progress
+    // and gets no owner.
+    Stmt u(s->db, "UPDATE snapshots SET state=?, trash_path=?, trashed_at=?, owner_pid=?,"
+                  " owner_start=? WHERE id=?");
     if (!u.ok()) return -EIO;
     u.i64(1, tree_gone ? WFS_ST_DEAD : WFS_ST_TRASHING);
     u.text(2, trash.c_str());
     u.i64(3, now_sec());
-    u.i64(4, (int64_t)id);
+    if (tree_gone) { u.i64(4, 0); u.i64(5, 0); } else { trashing_own(u, 4, 5); }
+    u.i64(6, (int64_t)id);
     if (u.step() != SQLITE_DONE) return -EIO;
     t.commit();
     }
@@ -1711,7 +1823,7 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
     if (int rc = wfs::fs_rename(snapdir.c_str(), trash.c_str())) { trashing_undo(s, id, 1); return rc; }
     if (int hrc = trash_crash_seam(1, 1, id, trash.c_str())) return hrc;
     // (c)
-    if (int crc = trashing_commit(s, id, 1)) return crc;
+    if (int crc = trashing_commit(s, id, 1, trash.c_str())) return crc;
     if (!immediate) return 0;
     return trash_delete_now(s, id, 1, trash);
 }
@@ -1721,6 +1833,14 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
 // One TRASHING row means: the tree is at its home path or at trash_path, and at no third place.
 // Which one it is, is the only question, and lstat answers it. Everything here is idempotent and
 // runs under the store mutex a row at a time, so two processes doing it at once agree.
+//
+// PR #1 review (8th round): and only for a row nobody is working on. A TRASHING row carries its
+// owner -- the pid of the `discard` or `restore` that wrote it, plus that process's own start
+// time -- exactly as a CREATING row carries its producer's, and while that process is alive the
+// row is in flight rather than crashed. lstat cannot tell the two apart: "the tree is still at
+// home" is equally true of a discard that died before its rename and of one that is a
+// microsecond away from making it, and this runs on every single store open. So a row whose
+// owner is alive is skipped, whole, and the operation that owns it finishes it.
 //
 //   tree at trash_path   the rename happened. Finish the discard the user asked for -- unless
 //                        something still references the snapshot, in which case the tree goes
@@ -1754,9 +1874,13 @@ int trashing_recover(wfs_store *s, uint64_t *restored, uint64_t *finished) {
     {
         Guard g(s->mu);
         {
-            Stmt q(s->db, "SELECT id, path, trash_path FROM worlds WHERE state=4");
+            Stmt q(s->db, "SELECT id, path, trash_path, owner_pid, owner_start FROM worlds WHERE state=4");
             if (!q.ok()) return -EIO;
             while (q.row()) {
+                // PR #1 review (8th round): its owner is still running, so this is a `discard`
+                // or a `restore` in flight -- not a crash. Deciding for it would flip the row
+                // under an operation that is about to do its own rename.
+                if (wfs::producer_alive(q.col_i64(3), q.col_i64(4))) continue;
                 Pending p;
                 p.id = (wfs_id)q.col_i64(0);
                 p.home.assign(q.col_text(1));
@@ -1765,9 +1889,10 @@ int trashing_recover(wfs_store *s, uint64_t *restored, uint64_t *finished) {
             }
         }
         {
-            Stmt q(s->db, "SELECT id, path, trash_path FROM snapshots WHERE state=4");
+            Stmt q(s->db, "SELECT id, path, trash_path, owner_pid, owner_start FROM snapshots WHERE state=4");
             if (!q.ok()) return -EIO;
             while (q.row()) {
+                if (wfs::producer_alive(q.col_i64(3), q.col_i64(4))) continue;
                 Pending p;
                 p.id = (wfs_id)q.col_i64(0);
                 p.is_snapshot = 1;
@@ -1800,12 +1925,16 @@ int trashing_recover(wfs_store *s, uint64_t *restored, uint64_t *finished) {
         }
         Guard g(s->mu);
         Txn t(s->db);
-        Stmt u(s->db, in_trash
-                          ? (p.is_snapshot ? "UPDATE snapshots SET state=2 WHERE id=? AND state=4"
-                                           : "UPDATE worlds SET state=2 WHERE id=? AND state=4")
-                          : (p.is_snapshot
-                                 ? "UPDATE snapshots SET state=1, trash_path='', trashed_at=0 WHERE id=? AND state=4"
-                                 : "UPDATE worlds SET state=1, trash_path='', trashed_at=0 WHERE id=? AND state=4"));
+        Stmt u(s->db,
+               in_trash
+                   ? (p.is_snapshot
+                          ? "UPDATE snapshots SET state=2, owner_pid=0, owner_start=0 WHERE id=? AND state=4"
+                          : "UPDATE worlds SET state=2, owner_pid=0, owner_start=0 WHERE id=? AND state=4")
+                   : (p.is_snapshot
+                          ? "UPDATE snapshots SET state=1, trash_path='', trashed_at=0, owner_pid=0,"
+                            " owner_start=0 WHERE id=? AND state=4"
+                          : "UPDATE worlds SET state=1, trash_path='', trashed_at=0, owner_pid=0,"
+                            " owner_start=0 WHERE id=? AND state=4"));
         if (!u.ok()) return -EIO;
         u.i64(1, (int64_t)p.id);
         if (u.step() != SQLITE_DONE) return -EIO;
