@@ -1110,3 +1110,28 @@ T2.4 结尾留的第一条"以后再说"在 M2 收口时被采纳了。**这是�
   `mount(8)` 里看得到 `(worldfs, local, …, fskit)`,smoke **ALL OK**(read/readdir/stat/write/append/truncate/
   mkdir/rename/unlink/rmdir/symlink/hardlink/chmod/xattr/mmap/fsync),卸载后 `mount | grep worldfs` 为空,
   container store 里 `S1 s27` + `W1/W2/W3` 一动没动。
+
+#### PR #1 review 修复(2026-09-19,Codex 四条)
+
+PR [#1](https://github.com/forks-world/forkfs/pull/1) 的机器评审提了四条,全部认领并修掉,
+一条一个提交、一条一个测试:
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 | `world.cpp` 快照 discard | 池化 fork 先 claim、后插 world 行,中间那一瞬 `discard S<n>` 既看不到活 World 也看不到池条目,于是把快照扔进 trash——随后发布的 World 没有基线可 diff/verify/restore | claim 和 CREATING world 行**在同一个 BEGIN IMMEDIATE 里提交**(`pool_claim()` 收一个在事务内跑的 hook);普通克隆路径在插行的同一事务里复查快照状态;`wfs_snapshot_discard()` 把**引用检查 + 状态迁移 + rename 整体放进一个 BEGIN IMMEDIATE**,并把 CREATING 的 World 也算作引用 | `250a846` |
+| P2 | `cli/main.cpp:844` | CLI 明明写着 `discard W<n>\|S<n> [--now]`,快照分支却把 `now` 丢了,只搬进 trash | `wfs_snapshot_discard(s, id, immediate, force)`,和 World 同一位置同一语义:`.deleting` 改名 → 真删 → 行 DEAD;CLI 打印 `S<n> deleted` 且不再起 worker | `ad9de61` |
+| P2 | `world.cpp` gc worker | 时限只在**两棵树之间**检查,一棵大 World 就能把"2 秒"的唤醒拖成几分钟,正好毁掉 T2.1 的占空比(P16) | `fs_remove_tree_parallel()` 收一个 `fs_mono_us()` deadline,**逐条目**检查;超时返回 `-ECANCELED` 中止 walk(目录尾巴一并跳过),`partial` 上报给 worker,树保持 `.deleting` 名字等后继进程接手 | `32d9f28` |
+| P2 | `world.cpp` gc worker | `gc_delete_one` 失败只是 `continue`,`work_remains` 可能是 0,于是日志写"trash empty"、不起后继——一次瞬时 unlink 错误就让一棵不可 restore 的树留在那里没人管 | 新增 `wfs_gc_report::trash_failed`(非零就绝不能读成"trash 空");失败的**连续唤醒次数记在 store 的 meta 表**里(每次唤醒都是新进程),前 5 次照常 `work_remains=1` 重试,之后只报告不再自唤醒;删成功即清零 | `2e225c6` |
+
+**验收**:`safety.sh` **158 passed, 0 failed**(P17 那轮的 142 → 本轮新增 16 条 `PR1` 用例);
+`ctest` 两个全新配置的构建目录 WFS_FSKIT=OFF **2/2**、ON **3/3**;`check-deps.sh` 两个目录全绿。
+
+新增测试都验证过"没有修复就会红":
+
+- P1:`core_test` 用一个测试缝(`wfs_test_after_pool_claim`,库里恒为 NULL)在 claim 与发布之间跑一次
+  `discard`,要求 `WFS_E_SNAPSHOT_IN_USE`,再确认 fork 出来的 World 基线还在;不数 CREATING 行时它返回 0(红)。
+- 时限:12 万条目的 trash 树 + `WORLD_GC_BATCH_SECS=1`,唤醒 **1.03 s** 返回、留下 41,647 条目、
+  后继链把它删完;老代码是 1.77 s 一口气删完并报告 trash 空(红 2 条)。
+- 失败重试:用 **ACL**(`deny delete_child`,chmod 和 chflags 都解不掉,正是 deleter 遇到 EPERM 时的两招)
+  造一个真删不掉的条目,`gc --status` 一直数得到它,worker 日志绝不出现 "trash empty",5 次之后
+  改口"不再自动重试",ACL 一撤下次 gc 就删干净;老代码红 5 条。
