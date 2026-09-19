@@ -1244,6 +1244,57 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第十七轮:分量必须是真名字,标记指着谁是判决不是提示(2026-09-20)
+
+第十七轮,Codex 两条:一条 P1、一条 P2。P1 是第十一、十四轮那条"成员路径必须是树内相对路径"
+最后没盖住的一层:那两轮管的都是**拼法**(`/` 开头、`..`、空分量、`.`),而 `s/x` 里的 `s` 是一条
+**符号链接**时每一条拼法规则都满足——`lstat(2)` 只放过最后一个分量、前面的照跟,`link(2)` 和
+`rename(2)` 一个都不放过。于是核对在快照那边跟着链接走,重放在克隆这边跟着**同一条相对链接**走到
+另一个地方去了。P2 是 T2.3 那条"store 路径搭着 marker 旅行"的另一头:CLI 说"扩展会退回容器默认
+值",而扩展在 marker 里的路径非空时根本不退。**一条一个提交、一个测试,先验证过"没有修复就会红"。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `PRRT_kwDOUf7jGc6kDBZ4` | `hardlinks.cpp` `manifest_path_sane()` / `hardlinks_verify_groups()` / `restore_group()` / `group_still_linked()` | 路径检查是**纯字面**的,中间分量是符号链接时一路放行,而这一组用到的三个系统调用**全都跟着它走**:`lstat(2)` 只放过最后一个分量,`link(2)`、`rename(2)` 连最后一个也跟。相对链接在树的两份拷贝里落到**不同的地方**——快照根是 `<store>/snapshots/S<n>/root`,fork 的临时目录在 `--to` 的父目录下,深度和父目录都不一样——所以一份写着 `s/x`、`s/y` 的清单可以拿**快照旁边**种下的一对硬链接验过(两个成员 `lstat` 到同一个 inode、nlink 正好是 2),重放却在**克隆旁边**把两个完全不相干的文件 link + rename 焊在一起:其中一个的内容没了,而 fork 报成功。从活 World fork 那条路上更直接——那条路上没有 `hardlinks_verify_groups`,唯一的把关是 `group_still_linked()`,它同样跟着链接走 | **把成员路径当成它本来的样子走一遍**:从树根起,一个分量一个分量地 `openat(O_DIRECTORY\|O_NOFOLLOW)` 下去,叶子上的每一个动作都是相对父目录描述符的 `*at(2)`——`fstatat(AT_SYMLINK_NOFOLLOW)`、`linkat`、`renameat`、`unlinkat`。检查和动作因此**是同一条系统调用路径**:名字不会被解析第二遍,中间没有窗口,分量是符号链接就是 `ELOOP`,而且是在任何地方创建任何东西**之前**。第四轮那个"只读目录借一下写位"也搬到同一个描述符上(`fstat`/`fchmod`/`fchflags`),借的于是就是 link 要进去的那个目录。`hardlinks_verify_groups` 把这种成员判成 `-EINVAL`(调用方一律映射成 `WFS_E_SNAPSHOT_DIRTY`),重放那边把它当成"不去碰的名字"(`skipped`),组判 broken——快照创建于是把它从清单和 `hl_groups` 上去掉。写者这边确认过:walker 只对 `S_ISDIR`(来自 `AT_SYMLINK_NOFOLLOW` 的 `fstatat`/`lstat`)递归,符号链接在它眼里从来不是目录,所以扫描写不出这种路径,`exclude` 是整条 `rel` 的全等匹配、diff 的 walker 同理,都不受影响 | `76ee115` |
+| P2 `PRRT_kwDOUf7jGc6kDBZ6` | `cli/main.cpp` `world fs mount`(+ 新的 `wfs_world_marker_store()` / `wfs_world_marker_refresh()`) | macOS 27 上 `-o` 选项到不了 FSKit 模块,所以扩展是从挂载源根目录的 `.world` 里读 store 路径的——而 `WorldVolume.mm` / `WorldVolumeHandler.mm` 只要读到的路径**非空就直接用**,只有一个路径都没拿到时才退回自己容器里的默认 store。CLI 却在路径对不上时打一句"扩展会退回容器默认值",然后照挂不误:store 搬过家、或者 marker 是从别人 store 里拷出来的,挂上来的就是**另一个 store**,`-o world=<n>` 里的 id 是拿它去解析的,而同一条命令里其它所有事都是对着 CLI 打开的那个 store 做的 | **问核心,而且按 P1/P2 已有的那条界线分两种答案。** 新的 `wfs_world_marker_store()` 报三件事:marker 到底带不带路径、它的 store id 是不是**这个** store 的、它的路径**解析之后**是不是这个 store 的目录(解析,不是比字符串——扩展要 `open(2)` 的就是它;解析不出来的路径当然不是这个 store)。`mount` 于是在非空且不是本 store 时**拒绝**,两个路径都说出来,并说清是哪一种;只有"marker 根本没带路径"那一种才还是提示,因为那时扩展的退路是真的。`macos/fskit` 一个字没动。出路是 `wfs_world_marker_refresh()`,命令是 `world fs verify <world> --refresh-marker`:只改路径,world id、名字、来源 snapshot、`created_at` 全部原样(`marker_read` 为此补了 `created_at` 的解析),而且只对**这个 store 真正拥有**的 World 动手——marker 的 store id 得是本店的、行和 inode 都得对得上,所以副本是 `WFS_E_UNREGISTERED`、别人的 World 是 `WFS_E_FOREIGN_STORE`,两样都是 `adopt` 的事。它按 P12 拿 World 锁(和 fork/checkpoint/discard 串行),新 marker 写在旁边再 rename 盖上去,崩在中间留下的是**完整的老 marker**。`fs verify` 自己也这么报:它本来就是"这个 World 是不是它自称的那个"这个问题 | `7e7cb57` |
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **257 passed, 0 failed**(新增 9 条);
+`check-deps.sh` 全绿。(`m1_criteria.sh` 本轮跳过。)
+
+先把测试跑红过:
+
+- **符号链接分量(P1)**:一棵树里有一对硬链接 `d/a`、`d/b`,外加一条 `s -> ../hlsym-side/d`;
+  快照根旁边种一对真硬链接(让伪造的清单验得过),fork 临时目录旁边种两个**size 和 mtime 相同**
+  的普通文件(让重放那道"还是不是扫描看见的那个文件"闸门也拦不住),然后把清单那一组的两个成员
+  改写成 `s/x`、`s/y`。**老代码**:`wfs_snapshot_verify` 回 **0**(ok),`wfs_world_create` 回
+  **0**,而 `<worlds>/hlsym-side/d/y`——完全在克隆之外的一个文件——回来时 inode 267451317、
+  nlink 2、内容是 `x` 的,自己那五个字节没了。从活 World fork 那条路(没有任何 verify)再来一遍:
+  `<root>/hlsym-side/d` 那一对同样被焊上(inode 267453124、nlink 2、内容 `farx`)。
+  **新代码**:verify、fork、pool fill 全是 `WFS_E_SNAPSHOT_DIRTY`,`--to` 上什么都没发布、
+  `.wfs-fork-` 一个不剩,外面那两个文件 inode 各是各的、nlink 1、内容原样;活 World 那条路把组
+  丢掉(活树本来就允许变),fork 成功而外面纹丝不动;把清单换回快照自己写的那一份,fork 照常、
+  `d/a`/`d/b` 还是一个 inode 两个名字。
+- **marker 指着别的 store(P2)**:用**改之前**的二进制跑——把一个 World 的 marker `store_path`
+  改写成另一个 store 的路径之后,`world fs verify <path>` **退出 0**、只报"world W1 'p' at …",
+  一个字都没提这个 marker 会让挂载开到另一个 store 去;`--refresh-marker` 根本不存在(usage,
+  退出 2);而扩展会去 `open(2)` 的那个路径,确确实实是**另一个 store**。**新代码**:退出 3,
+  refusal 把两个 store 都说出来、并说是哪一种,`try:` 里给出 `--refresh-marker`。
+
+新增测试:
+
+- `core_test`(P1):上面那棵 `hlsym` 树的两条路——从快照 fork(verify/fork/pool fill 三处拒绝,
+  外面的文件一个字节没动)和从活 World fork(`group_still_linked` 拒绝,组被丢掉,外面的文件
+  同样没动)。
+- `core_test`(P2):三个判决位(`has_path` / `same_store` / `same_path`)各自的取值——原样、
+  换成另一个 store 的路径、换成一个解析不出来的路径、清空(T2.3 之前的 marker,那时退路是真的);
+  refresh 之后身份、名字、来源 snapshot 一样都没变;别人 store 的 World 是 `WFS_E_FOREIGN_STORE`,
+  marker 一个字节没改。
+- `safety.sh`(P2,9 条):marker 指着另一个 store 时 `fs verify` 退 3、refusal 里两个 store 都在、
+  `try:` 里有 `--refresh-marker`;`--refresh-marker` 改完之后 verify 干净、marker 里除了路径别的
+  没变;marker 的 store id 是别人的时候拒绝、`--refresh-marker` 也不接管、marker 原封不动。
+  (`fs mount` 只在 `-DWFS_FSKIT=ON` 的构建里存在,这个脚本从不挂载任何东西;它问的是和
+  `fs verify` 同一个核心调用。)
+
 #### PR #1 review 第十六轮:引用要在每一个瞬间都在,删不掉的树不算删掉了(2026-09-20)
 
 第十六轮,Codex 两条,都是 P2,都落在 pool 上。第一条是第一轮那道"fork 和 `discard S<n>` 不能
