@@ -873,6 +873,31 @@ static int cmd_discard_snapshot(wfs_store *s, wfs_id sid, int now, int force, in
                  (unsigned long long)sid);
         return refuse(why, hint);
     }
+    // PR #1 review (16th round, P2): --force drains the pool before the reference count is
+    // taken, and an entry whose tree will not go (an ACL, an EPERM, a transient EIO) now keeps
+    // its row and fails the discard rather than leaving a row-less clone under <store>/pool
+    // that nothing would ever come back for. The snapshot has not been touched, so what is left
+    // to say is which directory is in the way and that the same command is the retry.
+    if (force && rc && rc != WFS_E_SNAPSHOT_IN_USE && rc != -ESTALE) {
+        uint64_t left = 0;
+        wfs_pool_stat pst[64];
+        size_t pn = 0;
+        if (wfs_pool_status(s, pst, 64, &pn) == 0)
+            for (size_t i = 0; i < pn && i < 64; ++i)
+                if (pst[i].snapshot == sid) left = pst[i].ready + pst[i].building + pst[i].stale;
+        if (left) {
+            char why[640];
+            snprintf(why, sizeof why,
+                     "S%llu: a pre-cloned pool entry under %s/pool/S%llu could not be removed: %s",
+                     (unsigned long long)sid, wfs_store_dir(s), (unsigned long long)sid,
+                     wfs_strerror(rc));
+            char hint[192];
+            snprintf(hint, sizeof hint,
+                     "fix that, then `world fs discard S%llu --force` again   (the snapshot is untouched)",
+                     (unsigned long long)sid);
+            return refuse(why, hint);
+        }
+    }
     if (rc == -ESTALE) {
         // PR #1 review (9th round): with --now this can also mean the row moved on while the
         // discard was following its tree, so the state is re-read rather than reported from the

@@ -825,20 +825,35 @@ extern "C" int wfs_pool_drain(wfs_store *s, wfs_id snapshot, uint64_t *removed) 
             paths.emplace_back(q.col_text(1));
         }
     }
+    // PR #1 review (16th round, P2): the tree first, the row only when the tree is gone. This
+    // used to delete the row and then remove the trees with both results thrown away, and
+    // returned 0 whatever had happened -- so one EPERM (an ACL, a transient EIO) left a whole
+    // pre-cloned world under <store>/pool with no row at all, and `discard S<n> --force`, whose
+    // drain this is, went on to trash the snapshot on the strength of that 0. Nothing came back
+    // for the clone after that: the orphan sweep would find it, but gc's pending check only
+    // scans the trash and the snapshot's own entry is not due for days. Same rule as
+    // pool_collect's (8th and 12th rounds): proven gone, both names, or the row stays and the
+    // errno goes to the caller -- who then fails the discard before touching the snapshot, so
+    // the entry is left as what it is, an ordinary pool row of a snapshot that is still ACTIVE.
     for (size_t i = 0; i < rows.size(); ++i) {
+        wfs::String tmp(paths[i]);
+        tmp.append(WFS_TMP_SUFFIX);
+        int trc = wfs::fs_remove_tree(tmp.c_str());
+        int prc = wfs::fs_remove_tree(paths[i].c_str());
+        if (!wfs::proven_gone(paths[i].c_str()) || !wfs::proven_gone(tmp.c_str()))
+            return prc ? prc : (trc ? trc : -EIO);
         {
             wfs::Guard g(s->mu);
             wfs::Txn t(s->db);
-            wfs::Stmt d(s->db, "DELETE FROM pool WHERE id=?");
+            // The row that named the tree that has just gone, as in pool_collect (P18).
+            wfs::Stmt d(s->db, "DELETE FROM pool WHERE id=? AND path=?");
             if (!d.ok()) return -EIO;
             d.i64(1, (int64_t)rows[i]);
+            d.text(2, paths[i].c_str());
             d.step();
             t.commit();
         }
-        wfs::String tmp(paths[i]);
-        tmp.append(WFS_TMP_SUFFIX);
-        wfs::fs_remove_tree(tmp.c_str());
-        if (wfs::fs_remove_tree(paths[i].c_str()) == 0 && removed) (*removed)++;
+        if (removed) (*removed)++;
     }
     if (snapshot) {
         wfs::String dir = wfs::pool_dir_of(s, snapshot);

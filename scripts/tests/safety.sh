@@ -1468,6 +1468,65 @@ if command -v sqlite3 > /dev/null 2>&1; then
         bad PR12 "once it can be removed the next reconcile removes it and buries the row (state $R12STATE)"
     fi
 fi
+
+# ---- PR #1 review (16th round, P2): a forced discard cannot drop a pool entry it cannot remove -
+# wfs_pool_drain() deleted each pool row first and then removed its trees with the result thrown
+# away, and returned 0 whatever had happened. One EPERM (an ACL, a transient EIO) therefore left
+# a whole pre-cloned world under <store>/pool with no row at all -- and `discard S<n> --force`
+# went on to trash the snapshot on the strength of that 0, so nothing ever came back for the
+# clone: gc's pending check only scans the trash, and the snapshot's own trash entry is not due
+# for days. The same rule as the 5th, 7th, 8th and 12th rounds, one command further on: the tree
+# first, the row only when it and its `.wfs-tmp` name are both proven gone, and a removal that
+# failed fails the discard with the errno the operator can act on.
+if command -v sqlite3 > /dev/null 2>&1; then
+    D16STORE="$SCRATCH/drain16-store"
+    d16() { "$WORLD" --store "$D16STORE" "$@"; }
+    D16SRC="$SCRATCH/drain16-src"
+    mkdir -p "$D16SRC/keep"
+    echo x > "$D16SRC/keep/f.txt"
+    D16S=$(d16 fs init "$D16SRC" --name drain16 2>/dev/null | awk '/^S[0-9]/{print $1}')
+    d16 fs pool fill "$D16S" --count 1 > /dev/null 2>&1
+    D16ENTRY=$(ls -d "$D16STORE/pool/$D16S"/* 2>/dev/null | head -1)
+    if [ -n "$D16ENTRY" ]; then
+        # The same ACL the undeletable-trash and stale-entry cases use: it survives chmod and
+        # chflags, so the entry's tree genuinely will not go.
+        chmod +a "$(id -un) deny delete,delete_child,add_file" "$D16ENTRY/keep"
+        out=$(d16 fs discard "$D16S" --force 2>&1); rc=$?
+        D16STATE=$(sqlite3 "$D16STORE/metadata.db" "SELECT state FROM snapshots WHERE name='drain16';")
+        D16ROWS=$(sqlite3 "$D16STORE/metadata.db" "SELECT count(*) FROM pool;")
+        if [ "$rc" != 0 ] && [ "$D16STATE" = 1 ] && [ "$D16ROWS" = 1 ] && [ -e "$D16ENTRY/keep/f.txt" ]; then
+            ok PR16 "a forced discard whose pool entry will not go leaves the snapshot and the row alone"
+        else
+            bad PR16 "a forced discard whose pool entry will not go leaves the snapshot and the row alone (exit $rc, state $D16STATE, rows $D16ROWS)"
+            echo "$out" | sed 's/^/        /'
+        fi
+        echo "$out" | grep -q "could not be removed" \
+            && ok PR16 "and the refusal names the entry and the errno" \
+            || { bad PR16 "and the refusal names the entry and the errno"; echo "$out" | sed 's/^/        /'; }
+        # Nothing is wrong in the store, so gc has nothing to report: the row is a normal pool
+        # entry of an ACTIVE snapshot, not a stale one.
+        d16 fs gc --status | grep -q "stale pre-clone" \
+            && { bad PR16 "and gc --status reports nothing wrong, because nothing is"; d16 fs gc --status | sed 's/^/        /'; } \
+            || ok PR16 "and gc --status reports nothing wrong, because nothing is"
+        # Take the ACL away and the very same command goes through: pool empty, no tree left.
+        chmod -N "$D16ENTRY/keep"
+        out=$(d16 fs discard "$D16S" --force 2>&1); rc=$?
+        D16STATE=$(sqlite3 "$D16STORE/metadata.db" "SELECT state FROM snapshots WHERE name='drain16';")
+        D16ROWS=$(sqlite3 "$D16STORE/metadata.db" "SELECT count(*) FROM pool;")
+        if [ "$rc" = 0 ] && [ ! -e "$D16ENTRY" ] && [ "$D16ROWS" = 0 ] && [ "$D16STATE" = 2 ]; then
+            ok PR16 "and once it can be removed the same --force drains the pool and trashes it"
+        else
+            bad PR16 "and once it can be removed the same --force drains the pool and trashes it (exit $rc, state $D16STATE, rows $D16ROWS)"
+            echo "$out" | sed 's/^/        /'
+        fi
+        [ -z "$(ls -A "$D16STORE/pool" 2>/dev/null)" ] \
+            && ok PR16 "with nothing left under <store>/pool" \
+            || { bad PR16 "with nothing left under <store>/pool"; ls -R "$D16STORE/pool" | sed 's/^/        /'; }
+    else
+        bad PR16 "the pool holds a pre-cloned entry for $D16S"
+    fi
+fi
+
 echo
 "$WORLD" fs status | sed 's/^/      /'
 echo
