@@ -1273,6 +1273,126 @@ if command -v sqlite3 > /dev/null 2>&1; then
     fi
 fi
 
+# ---- PR #1 review (9th round) -----------------------------------------------------------------
+#
+# Three of this round's rules, driven through the CLI. The two races themselves need a seam
+# inside the library (core_test has them); what is checked here is the classification and the
+# refusal an operator actually meets.
+if command -v sqlite3 > /dev/null 2>&1; then
+    N9STORE="$SCRATCH/round9-store"
+    n9() { "$WORLD" --store "$N9STORE" "$@"; }
+    N9SRC="$SCRATCH/round9-src"
+    mkdir -p "$N9SRC"
+    echo one > "$N9SRC/a.txt"
+    N9S=$(n9 fs init "$N9SRC" --name r9 2>/dev/null | awk '/^S[0-9]/{print $1}')
+
+    # (1) P18, the orphan rule: a row's trash_path claims the tree under BOTH of its names. A
+    # collector renames a trash entry to `<name>.deleting` first and records that second, so a
+    # tree wearing the `.deleting` name while its row still says the plain one is that row's
+    # entry -- deleted with the row buried, never counted as a row-less orphan.
+    N9W=$(n9 fs fork --from "$N9S" --to "$PROJ/r9w" --name r9w 2>/dev/null | awk '/^W[0-9]/{print $1}')
+    n9 fs discard "$N9W" > /dev/null 2>&1
+    N9ID=${N9W#W}
+    N9TP=$(sqlite3 "$N9STORE/metadata.db" "SELECT trash_path FROM worlds WHERE id=$N9ID;")
+    if [ -n "$N9TP" ] && [ -d "$N9TP" ]; then
+        mv "$N9TP" "$N9TP.deleting"
+        out=$(n9 fs gc --retention 0 --now 2>&1)
+        N9STATE=$(sqlite3 "$N9STORE/metadata.db" "SELECT state FROM worlds WHERE id=$N9ID;")
+        if [ ! -e "$N9TP.deleting" ] && [ "$N9STATE" = 3 ]; then
+            ok PR9 "a tree wearing .deleting is still its row's entry, not an orphan"
+        else
+            bad PR9 "a tree wearing .deleting is still its row's entry, not an orphan (state $N9STATE)"
+            echo "$out" | sed 's/^/        /'
+        fi
+        # gc's summary line always names the class; what must be zero is the count.
+        echo "$out" | grep -q "0 orphan trash dirs" && ok PR9 "and gc does not report it as one" \
+            || { bad PR9 "and gc does not report it as one"; echo "$out" | sed 's/^/        /'; }
+    else
+        bad PR9 "the discarded world has a tree in the trash"
+    fi
+    # ... and a directory in the trash that really is row-less still goes immediately.
+    mkdir -p "$N9STORE/trash/W9999-1/sub"
+    echo junk > "$N9STORE/trash/W9999-1/sub/j.txt"
+    out=$(n9 fs gc --retention 0 --now 2>&1)
+    if [ ! -e "$N9STORE/trash/W9999-1" ]; then
+        ok PR9 "a directory in the trash that no row names still goes at once"
+    else
+        bad PR9 "a directory in the trash that no row names still goes at once"
+        echo "$out" | sed 's/^/        /'
+    fi
+
+    # (2) P18, reconciliation: a world that was merely moved and then verified keeps its row.
+    # `gc --reconcile` reads "no tree at the recorded path" and used to write DEAD with no
+    # predicate at all, so a verify that relocated the row by inode had its work buried.
+    N9W2=$(n9 fs fork --from "$N9S" --to "$PROJ/r9move" --name r9move 2>/dev/null | awk '/^W[0-9]/{print $1}')
+    N9ID2=${N9W2#W}
+    mv "$PROJ/r9move" "$PROJ/r9moved"
+    n9 fs verify "$PROJ/r9moved" > /dev/null 2>&1
+    out=$(n9 fs gc --reconcile 2>&1)
+    N9STATE2=$(sqlite3 "$N9STORE/metadata.db" "SELECT state FROM worlds WHERE id=$N9ID2;")
+    N9PATH2=$(sqlite3 "$N9STORE/metadata.db" "SELECT path FROM worlds WHERE id=$N9ID2;")
+    if [ "$N9STATE2" = 1 ] && [ "$N9PATH2" = "$PROJ/r9moved" ]; then
+        ok PR9 "a moved world that has been verified survives --reconcile"
+    else
+        bad PR9 "a moved world that has been verified survives --reconcile (state $N9STATE2, path $N9PATH2)"
+        echo "$out" | sed 's/^/        /'
+    fi
+    # ... and one whose tree really is gone is still reconciled.
+    rm -rf "$PROJ/r9moved"
+    n9 fs gc --reconcile > /dev/null 2>&1
+    N9STATE2=$(sqlite3 "$N9STORE/metadata.db" "SELECT state FROM worlds WHERE id=$N9ID2;")
+    if [ "$N9STATE2" = 3 ]; then ok PR9 "a world whose tree really is gone is still reconciled"
+    else bad PR9 "a world whose tree really is gone is still reconciled (state $N9STATE2)"; fi
+fi
+
+# ---- PR #1 review (9th round, P2): a hardlink group that is not the size it declares ----------
+# The manifest's `hl <group> <nlink> <path>` lines only ever describe groups every one of whose
+# links is inside the tree, so a group's member count IS its nlink. Moving one member's group id
+# to its neighbour keeps the #hl header's group and name totals intact -- which is all the 8th
+# round's check looked at -- and the replay then links a name belonging to one inode onto another
+# group's canonical file.
+H9STORE="$SCRATCH/hl9-store"
+h9() { "$WORLD" --store "$H9STORE" "$@"; }
+H9SRC="$SCRATCH/hl9-src"
+mkdir -p "$H9SRC"
+echo aaa > "$H9SRC/a1"; ln "$H9SRC/a1" "$H9SRC/a2"; ln "$H9SRC/a1" "$H9SRC/a3"
+echo bbb > "$H9SRC/b1"; ln "$H9SRC/b1" "$H9SRC/b2"; ln "$H9SRC/b1" "$H9SRC/b3"
+H9S=$(h9 fs init "$H9SRC" --name hl9 2>/dev/null | awk '/^S[0-9]/{print $1}')
+H9MAN="$H9STORE/snapshots/$H9S/manifest"
+if [ -f "$H9MAN" ]; then
+    check PR9 "the snapshot verifies as written" 0 -- h9 fs verify "$H9S"
+    cp "$H9MAN" "$H9MAN.bak"
+    # the third `hl` line -- the last member of group 0 -- re-tagged into group 1
+    python3 - "$H9MAN" <<'EOF'
+import sys
+p = sys.argv[1]
+lines = open(p).read().splitlines(True)
+seen = 0
+for i, l in enumerate(lines):
+    if l.startswith("hl "):
+        seen += 1
+        if seen == 3:
+            f = l.split(" ", 3)
+            lines[i] = " ".join(["hl", "1", f[2], f[3]])
+            break
+open(p, "w").writelines(lines)
+EOF
+    check PR9 "a group that is not the size it declares is damage" 3 -- h9 fs verify "$H9S"
+    check PR9 "and a fork from it is refused" 3 -- h9 fs fork --from "$H9S" --to "$PROJ/hl9w" --name hl9w
+    [ -e "$PROJ/hl9w" ] && bad PR9 "and nothing is published at --to" || ok PR9 "and nothing is published at --to"
+    cp "$H9MAN.bak" "$H9MAN"
+    check PR9 "the undamaged manifest forks again" 0 -- h9 fs fork --from "$H9S" --to "$PROJ/hl9w" --name hl9w
+    if [ "$(cat "$PROJ/hl9w/b1" 2>/dev/null)" = bbb ] && \
+       [ "$(stat -f %l "$PROJ/hl9w/b1" 2>/dev/null)" = 3 ]; then
+        ok PR9 "and the groups come out whole, with nobody's content from the other group"
+    else
+        bad PR9 "and the groups come out whole, with nobody's content from the other group"
+    fi
+else
+    bad PR9 "the hardlinked snapshot has a manifest"
+fi
+
+
 echo
 "$WORLD" fs status | sed 's/^/      /'
 echo

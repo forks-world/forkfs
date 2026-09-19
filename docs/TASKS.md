@@ -1244,6 +1244,75 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第九轮:collector 手里的那份快照已经旧了(2026-09-20)
+
+第九轮,Codex 六条(四条 P1、两条 P2)。四条 P1 是同一条规则的最后四个缺口,这一轮把它写成
+**P18**(docs/M1_DESIGN.md §3):**collector 只拥有它扫描那一刻看到的东西**——它对行的每一次写
+都以"扫描时看到的状态和路径"为条件并查 `sqlite3_changes()`,它每一个"没有任何行认领这棵树"的
+孤儿判断都要在**排队之前**和**真正开删之前**,在 store 锁下拿活行再问一遍。第五到第八轮修的是这
+条规则的一个个实例;这一轮补齐剩下的,并且**按这条规则把 `wfs_gc_ex`、`pool_collect` /
+`pool_sweep_orphans`、`trash_delete_now`、`trashing_reclaim` / `trashing_recover`、reconcile 和
+`wfs_gc_status` 通审了一遍**,另外揪出四处(见下)。两条 P2 各自是老朋友的下一层:**读回来的东西
+必须自洽**(这次是硬链接组的大小),以及**同一条规则要在每一条路径上成立**(这次是 xattr 名字太
+多时那条 fallback)。
+**一条一个提交、一条一个测试,六个测试都先验证过"没有修复就会红"。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `PRRT_kwDOUf7jGc6kA-m3` | `world.cpp:2575` | `trash_scan()` 先读"哪些行认领了 trash 路径"(`claim_trash_paths()`),**放掉 store 锁**,然后才 readdir `<store>/trash`。正好挤在中间提交 TRASHING 并把树 rename 进来的 `discard`,留下一个这份快照从没听说过的目录——而**无主孤儿是立刻删的**:保留期不算数、`restore` 不可能、"这是谁的基线"也不问,而且旁边那个 discard 还在跑,它的树就这么没了 | 两个判断都改成**问活行**:排队之前(`trash_scan`)、以及开删之前(`gc_delete_one` → `trash_row_still_ours`,它原来对孤儿一律答"是我的")都在 store 锁下重查一次。"认领"沿用 `claim_trash_paths` 的定义——一条行的 `trash_path` 同时认领这个名字和它加上 `.deleting` 的那个(collector 先改名、后记名)。`wfs_gc_status()` 和 `wfs_gc_pending()` 共用 `trash_scan`,所以报表数的就是 collector 真会动的东西 | `baaed52` |
+| P1 `PRRT_kwDOUf7jGc6kA-m4` | `world.cpp:1459` | `trash_delete_now()`(`discard --now` 的那个 helper)跟着树走到它现在的名字、删掉,然后写 `state=DEAD, trash_path=''`——**一个条件都不带**。`restore W<n>` 挤在它 `lstat` 和改名之间时:树搬回家、行写成 ACTIVE,于是这边的改名回 `-ENOENT`(它读成"已经被别人删了"),最后那条无条件 UPDATE 把一个**刚刚活过来、就在家里**的世界写成 DEAD | 两条写都带上这次调用所依据的状态和路径(`state=2 AND trash_path=?`)并查 `sqlite3_changes()`,**改不到行就是 `-ESTALE`,绝不是悄悄的 0**。记 `.deleting` 那一步同样带条件,对不上就停在那里:树此刻顶着一个 `restore` 不会碰的名字,下一个 collector 会收完它,而不是由这次调用去删一棵行已经不认的树。两个常规入口天然成立——(c) 之后行就是 TRASHED 且 `trash_path=trash`,"已经在 trash 里"那条路径的 `trash_path` 是**现读的**。CLI 把这条新拒绝在 `discard W<n>` 和 `discard S<n>` 上都说清楚(并且**重读**状态,而不是报调用之前那一眼) | `02fbc01` |
+| P1 `PRRT_kwDOUf7jGc6kA-m5` | `pool.cpp:435` | `pool_scan()` 取一份 pool 行快照,`pool_collect()` 照它删树、并把 `<store>/pool` 下它没提到的目录当无主目录扫掉。扫描**之后**才插 CREATING 行的 filler,`.wfs-tmp` 被当场删掉(半棵树还会接着被发布成 READY);扫描之后才**建好**的条目被整棵删走,留下一条说 READY、树却没了的行 | 每一个"看起来无主"的目录在**删之前**(以及只计数的那一趟——`gc --status` 得说 collector 真会动的东西)在 store 锁下重查一遍活行:pool 行的 `path`、`path + .wfs-tmp`、以及 fork 的 CREATING World 行的 `tmp_path` 都算认领。**`pool_claim()` 本身不需要宽限期**:删 pool 行和插 fork 的 CREATING 行是同一个 `BEGIN IMMEDIATE`,rename 在它提交之后,所以树一刻也不会无行可依——重查会看 `worlds.tmp_path` 正是为此 | `b8e18f3` |
+| P1 `PRRT_kwDOUf7jGc6kA-m9` | `world.cpp:2989` | `gc --reconcile` 扫出"这条 ACTIVE 行记的路径上没有目录"就**无条件** UPDATE 成 DEAD。可这句话对**被删掉的**和**只是被搬走的** World 同样成立,直到有人跑 `world fs verify <新路径>` 按 inode 把行挪过去——那次 verify 要是正好挤在扫描和 UPDATE 之间,它的成果就被埋了:一个 ACTIVE、就在新路径上的世界,被一条读着没人用的老路径的 reconcile 判死 | 两条 UPDATE 都带上扫描时看到的 `state=1 AND path=?`,`worlds_reconciled` / `snapshots_reconciled` 只数**真的被这条 UPDATE 改到**的行;快照那边,行没改到就连 `<store>/snapshots/S<n>` 也不动。`*_dangling` 不变——它报的是扫描看见了什么 | `7ec714b` |
+| P2 `PRRT_kwDOUf7jGc6kA-nB` | `hardlinks.cpp:244` | 第八轮的清单自洽检查只要求"每组至少两个名字"。这挡得住**写到一半**的清单,挡不住**把一个成员改挂到邻组**:组数和名字数都不变,`#hl` 头依然自洽,而重放会把属于甲 inode 的名字 `link` 到乙组的正身上——克隆出来的内容被覆盖,`verify` 和 `fork` 都还报成功 | 读回来时**每一组还必须正好是它声明的 `nlink` 那么大**。**格式不动、版本不升、老清单照读**:先看了写的那一半——`hardlinks_scan()` 只在"这个 inode 的每一条链接都在树内"(`k == nlink`)时才把组写进 `groups`,名字不全在树内的组只进头里的 external 计数、一行 `hl` 都不写,所以 `nlink` **本来就是**这一组声明的树内成员数,不需要给清单加字段 | `98cfdec` |
+| P2 `PRRT_kwDOUf7jGc6kA-nE` | `diff.cpp:350` | 一侧保留下来的 xattr 名字超过 4096 字节的有界缓冲时,比较落到堆上那条 fallback——而它**完全不过滤**:`com.apple.provenance` 就此回到比较里(内核分别盖章的两个文件上它是单边的),默认 `diff` 于是对一个谁都没动过的文件报 `T`;名字过了之后读的值也是没过滤的那一份,所以两侧都有、值不同的被忽略名字同样算一处改动 | `xattr_equal_raw()` 接过 diff 的 flags,**就地**把被忽略的名字从两份清单里去掉再比,随后读的值就是剩下那些的——一趟、不分配,`--all-xattrs` 照旧什么都比。provenance 本身没法从测试里驱动(内核给本进程建的每个文件都盖同一个值,`setxattr`/`removexattr` 对它**静默无效**,已实测),所以库里留一个 seam `wfs_test_xattr_ignore`:它指名的那个普通 xattr 被过滤规则当成 provenance 一样对待 | `a91d447` |
+
+**P18 通审顺手揪出来的四处**(并入第六条之后的同一批改动,规则同上):`gc_tmp_is_removable()`
+和 CREATING 行的收尾 UPDATE 都加上 `tmp_path` 条件(生产者被判死之后才发布的 fork,它的树不归
+gc 删);`trashing_recover()` 的收尾 UPDATE 加上 `trash_path` 条件(那个判定正是拿这条路径
+`lstat` 出来的),改不到行就不计数;`pool_collect()` 在删整棵克隆**之前**在锁下重问一遍"这一行
+还该死吗";`DELETE FROM pool` 带上 `path`。
+
+**验收**:`safety.sh` **236 passed, 0 failed**(上一轮 225 → 本轮 +11);`ctest`(WFS_FSKIT=OFF)
+**2/2**;`check-deps.sh` 全绿(没有新的系统调用、没有新的库)。
+
+六条都先把测试跑红过:
+
+- trash 孤儿:把两处重查去掉 → `gc` 报 `trash_orphans=1`,窗口里那个 discard 的树被当场删掉。
+- `--now`:把收尾 UPDATE 换回无条件版 → `--now` **返回 0**,而那个刚被 restore 回来的世界的行
+  已经不是 ACTIVE 了。
+- pool:把重查去掉 → `pool_removed=1`、pool 目录空了,而 `wfs_pool_ready()` 还答 1。
+- reconcile:把 `path` 条件去掉 → `worlds_reconciled=1`,那个刚被 verify 挪过去的世界是 DEAD。
+- 清单:把 `nlink` 检查去掉 → `verify` 回 0、`fork` 回 0,而 fork 出来的 `b1`/`b2`/`b3` 里装的是
+  `a1` 的内容、nlink 4(`aaa`,`bbb` 没了)。
+- xattr fallback:把过滤去掉 → `many names / --full: 2 lines, wanted 0`。
+
+新增测试(三个新 seam,测试之外恒为 NULL):
+
+- `wfs_test_before_trash_orphans`:在"认领快照取完、readdir 之前"那一刻,拿第二个 store 句柄跑
+  一整个 `discard`。gc 必须什么都不删、不数、也不报成失败,行停在 TRASHED、树完整、`restore`
+  拿得回来;而一个**真的**无主目录照样立刻被删。
+- `wfs_test_trash_crash` 的 **phase 4**:在 `--now` 的 `lstat` 和改名之间跑一整个
+  `wfs_world_restore()`。`--now` 必须回 `-ESTALE`,世界 ACTIVE 且在家、内容完整、还 diff 得动;
+  常规的两个 `--now` 入口和快照的 `--now` 一并复核。
+- `wfs_test_before_pool_sweep`:在 `pool_scan` 和删除之间,拿第二个句柄跑一整个 pool 后备 fork
+  **和**一整个 `pool fill`。两棵树都必须留下,fork 的世界 ACTIVE 且内容完整,新条目仍是 READY
+  且真的能被下一次 fork 领走(`from_pool == 1`),`gc --status` 的 `pool_stranded` 是 0;真的无主
+  目录照样被删。
+- `wfs_test_before_reconcile`:在扫描和 UPDATE 之间跑 `wfs_world_verify_identity(<新路径>)`。世界
+  必须留在 ACTIVE、`path` 是新路径、还 diff 得动;树真的没了的世界照样被 reconcile。
+- `core_test`(清单):两个三成员组 + 一个**真的有树外链接**的组(`nlink 3`,树内两个名字),六个
+  文件统一长度和 mtime(免得重放那道"还是扫描时那个文件吗"的 size+mtime 检查替损坏兜底),把第
+  一组的最后一个成员改挂到第二组(2+4,总数不变)。`verify` / `fork` / `pool fill` 全是
+  `WFS_E_SNAPSHOT_DIRTY`,目标路径下什么都没发布、也不留半成品克隆;换回原样后连那个外部组一起
+  照常工作。
+- `diff_test`:两个各带 200 个名字(4800 字节,超过有界缓冲)的文件,把 fallback 的两半都驱动一
+  遍——一个名字只有 world 那边有,一个名字两边都有而值不同。默认一条都不报,`--all-xattrs` 两条
+  都报;把 seam 关掉,那个名字就是普通 xattr,两条又都报(这是"确实是过滤在起作用"的对照)。
+- `safety.sh`(+11):`.deleting` 名字下的树仍然是它那条行的条目(删掉、行落 DEAD、**不**计成孤
+  儿),真的无主目录照样立刻删;被搬走又 `verify` 过的世界扛得住 `--reconcile`,树真没了的照样被
+  reconcile;硬链接组改挂之后 `verify` 和 `fork` 都拒、`--to` 下什么都不留,换回原样 fork 出来
+  `b1` 还是 `bbb`、nlink 3。
+
 #### PR #1 review 第八轮:正在进行的操作不是崩溃现场(2026-09-19)
 
 第八轮,Codex 四条(两条 P1、两条 P2)。两条 P1 是同一个主题的**第三个面**:前几轮管的是"谁在
