@@ -262,6 +262,24 @@ static int db_has_column(const char *path, const char *table, const char *column
     return found;
 }
 
+// PR #1 review (18th round, P2): one text column of the store's own database. `tmp_path` is a
+// column no public struct carries, and it is the whole of what the fix writes down.
+static int db_query_text(const char *path, const char *sql, char *out, size_t cap) {
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    CHECK(sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK);
+    int rows = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *t = sqlite3_column_text(st, 0);
+        snprintf(out, cap, "%s", t ? (const char *)t : "");
+        rows = 1;
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return rows;
+}
+
 // The v2 tables as they were before any of the ALTER TABLE migrations: no `hard`, `root_mode`,
 // `trash_path`, `trashed_at`, `hl_groups`, `hl_external` on snapshots, no `tmp_path` and no
 // owner columns anywhere. `snapshots_as_view` builds the same thing with `snapshots` as a view
@@ -414,6 +432,32 @@ static void unwind_discard(void *ctx) {
     (void)ctx;
     g_unwind_ran = 1;
     g_unwind_rc = wfs_snapshot_discard(g_unwind_store, g_unwind_snap, 0, 0);
+}
+
+// PR #1 review (18th round, P2): the seam that fires with a pool entry's clone already at the
+// user's --to and no row owning it there yet. Moving it away makes the stat that follows fail,
+// and -- the point of the whole thing -- makes the unwind's rollback rename fail too.
+static char publish_target[4096];
+static char publish_moved[4096];
+static wfs_id g_publish_world;
+static int g_publish_ran;
+static void publish_move_away(void *ctx, wfs_id world, const char *target) {
+    (void)ctx;
+    (void)target;
+    g_publish_ran = 1;
+    g_publish_world = world;
+    CHECK(rename(publish_target, publish_moved) == 0);
+}
+
+// And the same failure with the tree left where the hand-out put it: the directory --to lives in
+// is shut, so the stat of the published tree and the rollback rename both come back EACCES.
+static char publish_shut[4096];
+static void publish_shut_parent(void *ctx, wfs_id world, const char *target) {
+    (void)ctx;
+    (void)target;
+    g_publish_ran = 1;
+    g_publish_world = world;
+    CHECK(chmod(publish_shut, 0) == 0);
 }
 
 // PR #1 review (5th round): the source of a snapshot is a live directory, and this is what a
@@ -1939,6 +1983,125 @@ int main() {
         CHECK(!exists(usr.path));
         wfs_store_close(us);
         rm_rf(uw);
+    }
+
+    // ---- PR #1 review (18th round, P2): a pool hand-out whose rollback cannot run ----
+    //
+    // The tail of a pool-backed fork is marker, rename, stat, row UPDATE. When the stat or the
+    // UPDATE fails the tree is already at the user's --to, so the unwind renames it back under
+    // its pool name first -- and that rename's result was dropped on the floor. pool_return()
+    // then stat'ed a pool path with nothing at it, came back -ENOENT, and the caller read that
+    // as "the entry did not go back, so the row goes on its own" and deleted the CREATING row:
+    // a published tree at --to, with a `.world` marker in it, that nothing in the store knew
+    // about -- not gc's abandoned-fork sweep, which works from CREATING rows, and not a
+    // `world fs adopt`, which needs the marker to name a world this store has. The rollback is
+    // checked now: only a rollback that really happened goes on into pool_return, and one that
+    // did not keeps the row and points its tmp_path at the tree it left behind.
+    {
+        char pstore[4096], psrc[4096], pp[4096], ptgt[4096], pmoved[4096], pdb[4096];
+        join(pstore, sizeof pstore, root, "publish-store");
+        join(psrc, sizeof psrc, root, "publish-src");
+        CHECK(mkdir(psrc, 0755) == 0);
+        join(pp, sizeof pp, psrc, "a.txt");
+        write_file(pp, "baseline\n");
+        wfs_store *pst = NULL;
+        CHECK_OK(wfs_store_open(pstore, &pst));
+        wfs_id psid = 0;
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "publish";
+        CHECK_OK(wfs_snapshot_create(pst, psrc, &sopts, &psid));
+        uint64_t pmade = 0;
+        CHECK_OK(wfs_pool_fill(pst, psid, 1, &pmade));
+        CHECK(pmade == 1);
+
+        join(ptgt, sizeof ptgt, worlds, "w-publish");
+        snprintf(pmoved, sizeof pmoved, "%s-moved", ptgt);
+        snprintf(publish_target, sizeof publish_target, "%s", ptgt);
+        snprintf(publish_moved, sizeof publish_moved, "%s", pmoved);
+        g_publish_ran = 0;
+        g_publish_world = 0;
+        wfs_test_after_pool_publish = publish_move_away;
+        memset(&opts, 0, sizeof opts);
+        opts.name = "w-publish";
+        wfs_ref from_pst = {WFS_K_SNAPSHOT, psid};
+        wfs_id pwid = 0;
+        // The stat of --to then answers ENOENT, and so does the rollback rename.
+        CHECK(wfs_world_create(pst, from_pst, ptgt, &opts, &pwid) != 0);
+        wfs_test_after_pool_publish = NULL;
+        CHECK(g_publish_ran == 1 && g_publish_world != 0);
+        CHECK(!exists(ptgt) && exists(pmoved));
+
+        // The row is still there, still CREATING, and it names the tree the fork published.
+        wfs_world_rec pwr;
+        CHECK_OK(wfs_world_info(pst, g_publish_world, &pwr));
+        CHECK(pwr.state == WFS_ST_CREATING);
+        char tmp_path[4096], sql[512];
+        join(pdb, sizeof pdb, pstore, "metadata.db");
+        snprintf(sql, sizeof sql, "SELECT tmp_path FROM worlds WHERE id=%llu",
+                 (unsigned long long)g_publish_world);
+        CHECK(db_query_text(pdb, sql, tmp_path, sizeof tmp_path) == 1);
+        CHECK(!strcmp(tmp_path, ptgt));        // the tree's last known name, not the pool's
+        // And no entry went back into the pool: its tree is not in the pool any more.
+        uint64_t pready = 0;
+        CHECK_OK(wfs_pool_ready(pst, psid, &pready));
+        CHECK(pready == 0);
+        char pooldir[4096];
+        snprintf(pooldir, sizeof pooldir, "%s/pool/S%llu", pstore, (unsigned long long)psid);
+        char pnames[8][256];
+        uint64_t pinos[8];
+        CHECK(list_dir(pooldir, pnames, pinos, 8) == 0);
+        // The snapshot is still referenced by that CREATING row, so it is still in use.
+        CHECK_RC(wfs_snapshot_discard(pst, psid, 0, 0), WFS_E_SNAPSHOT_IN_USE);
+
+        // What resolves it: the tree kept its marker, so `world fs adopt` registers it.
+        wfs_id padopted = 0;
+        CHECK_OK(wfs_world_adopt(pst, pmoved, "w-publish", &padopted));
+        CHECK(padopted != 0 && padopted != g_publish_world);
+        wfs_identity pident;
+        CHECK_OK(wfs_world_verify(pst, padopted, &pident));
+        CHECK(pident.registered == 1);
+        rm_rf(pmoved);
+
+        // The same failure with the tree still AT the target, which is the shape gc has to
+        // recognise: the rollback rename cannot run because its whole parent directory is shut
+        // (so is the stat that fails the hand-out in the first place), and what is left is a
+        // published tree that only this CREATING row names. gc's abandoned-fork sweep asks the
+        // marker who owns the tree and the row whether it still says CREATING with that
+        // tmp_path -- both true here -- and removes it once its producer is gone.
+        CHECK_OK(wfs_pool_fill(pst, psid, 1, &pmade));
+        CHECK(pmade == 1);
+        char ptgt2[4096];
+        join(ptgt2, sizeof ptgt2, worlds, "w-publish-2");
+        snprintf(publish_target, sizeof publish_target, "%s", ptgt2);
+        snprintf(publish_shut, sizeof publish_shut, "%s", worlds);   // shut the parent instead
+        g_publish_ran = 0;
+        g_publish_world = 0;
+        wfs_test_after_pool_publish = publish_shut_parent;
+        wfs_test_fork_owner_pid = 2147480000;    // ... and the fork's producer is gone with it
+        memset(&opts, 0, sizeof opts);
+        opts.name = "w-publish-2";
+        pwid = 0;
+        CHECK(wfs_world_create(pst, from_pst, ptgt2, &opts, &pwid) != 0);
+        wfs_test_after_pool_publish = NULL;
+        wfs_test_fork_owner_pid = 0;
+        CHECK(chmod(worlds, 0755) == 0);
+        CHECK(g_publish_ran == 1 && g_publish_world != 0);
+        CHECK(exists(ptgt2));                    // published, and never rolled back
+        CHECK_OK(wfs_world_info(pst, g_publish_world, &pwr));
+        CHECK(pwr.state == WFS_ST_CREATING);
+        snprintf(sql, sizeof sql, "SELECT tmp_path FROM worlds WHERE id=%llu",
+                 (unsigned long long)g_publish_world);
+        CHECK(db_query_text(pdb, sql, tmp_path, sizeof tmp_path) == 1);
+        CHECK(!strcmp(tmp_path, ptgt2));
+        setenv("WORLD_GC_CREATING_MIN_AGE", "0", 1);
+        wfs_gc_report prep;
+        memset(&prep, 0, sizeof prep);
+        CHECK_OK(wfs_gc(pst, 0, &prep));
+        CHECK(prep.tmp_removed >= 1);
+        CHECK(!exists(ptgt2));
+        CHECK_OK(wfs_world_info(pst, g_publish_world, &pwr));
+        CHECK(pwr.state == WFS_ST_DEAD);
+        wfs_store_close(pst);
     }
 
     // ---- P13: a store from another schema is refused before anything is read ----

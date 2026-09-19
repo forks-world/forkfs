@@ -794,6 +794,14 @@ extern void *wfs_test_before_fork_publish_ctx;
 extern void (*wfs_test_in_pool_unwind)(void *ctx);
 extern void *wfs_test_in_pool_unwind_ctx;
 
+/* And the fourth (PR #1 review, 18th round): the instant after a pool hand-out's publish rename
+ * and before the row that owns the tree is committed -- the entry's clone is at the user's --to
+ * with a `.world` marker in it and nothing in the database points at it there yet. What a test
+ * does in there is move the tree away, because that is the one way to make the unwind's own
+ * rollback rename fail. NULL unless a test sets it, and nothing in the library ever assigns it. */
+extern void (*wfs_test_after_pool_publish)(void *ctx, wfs_id world, const char *target);
+extern void *wfs_test_after_pool_publish_ctx;
+
 /* The pid a CREATING row records as the process building it. 0, its value in every real run,
  * means getpid(). A test sets it to a pid that is not running to produce the one state a single
  * process cannot otherwise reach: a half-built tree whose producer is gone. */

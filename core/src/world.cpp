@@ -661,6 +661,13 @@ extern "C" void *wfs_test_before_fork_publish_ctx = nullptr;
 extern "C" void (*wfs_test_in_pool_unwind)(void *ctx) = nullptr;
 extern "C" void *wfs_test_in_pool_unwind_ctx = nullptr;
 
+// And the instant after the publish rename of a pool hand-out, with the entry's tree sitting at
+// the user's --to under a marker and the row that owns it not committed yet (PR #1 review, 18th
+// round). core_test moves the tree away in there, which is the one way to make the unwind's own
+// rollback rename fail.
+extern "C" void (*wfs_test_after_pool_publish)(void *ctx, wfs_id world, const char *target) = nullptr;
+extern "C" void *wfs_test_after_pool_publish_ctx = nullptr;
+
 // And the window between a snapshot's walk of its source and the clone of it: the source is the
 // user's live directory, and nothing stops it changing in there.
 extern "C" void (*wfs_test_before_snapshot_clone)(void *ctx, const char *src_dir) = nullptr;
@@ -1096,6 +1103,8 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
             bool renamed = false;
             if (!rc && (rc = wfs::fs_rename_excl(claim.path.c_str(), target.c_str())) == 0)
                 renamed = true;
+            if (renamed && wfs_test_after_pool_publish)
+                wfs_test_after_pool_publish(wfs_test_after_pool_publish_ctx, id, target.c_str());
             struct stat st;
             if (!rc && ::stat(target.c_str(), &st) != 0) rc = -errno;
             if (!rc) {
@@ -1130,7 +1139,37 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
             // The rename may already have happened (the failure was the stat or the row); put
             // the tree back under its pool name first, or pool_return would find nothing there
             // and the entry would be left at --to with no row that knows about it.
-            if (renamed) wfs::fs_rename_excl(target.c_str(), claim.path.c_str());
+            //
+            // PR #1 review (18th round, P2): and that rollback is a rename that can fail. Its
+            // result was dropped, so pool_return() then stat'ed a pool path with nothing at it,
+            // returned -ENOENT, and the branch below read that as "the entry did not go back,
+            // so the row goes on its own" and deleted the CREATING row -- while the tree sat at
+            // the user's --to with a `.world` marker in it and nothing in the store naming it.
+            // Not gc's abandoned-fork sweep, which works from CREATING rows and their tmp_path
+            // (5th/7th rounds), and not `world fs adopt`, whose marker has to name a world this
+            // store has. The fork then fell through and cloned a SECOND tree over the same --to.
+            //
+            // So a rollback that did not happen ends the fork here: the row stays CREATING and
+            // its tmp_path is moved to the tree's real name, which is the published target. The
+            // row is then exactly the row a fork killed before its publish leaves -- the tree's
+            // only name in the database -- and gc_tmp_is_removable(), which asks the marker who
+            // it belongs to and the row whether it still says CREATING with that tmp_path,
+            // accepts it as it stands. The caller gets the failure that started all this rather
+            // than a fresh clone beside a tree nobody owns.
+            if (renamed) {
+                if (wfs::fs_rename_excl(target.c_str(), claim.path.c_str()) != 0) {
+                    Guard g(s->mu);
+                    Txn t(s->db);
+                    Stmt u(s->db, "UPDATE worlds SET tmp_path=? WHERE id=? AND state=?");
+                    if (u.ok()) {
+                        u.text(1, target.c_str());
+                        u.i64(2, (int64_t)id);
+                        u.i64(3, WFS_ST_CREATING);
+                        if (u.step() == SQLITE_DONE) t.commit();
+                    }
+                    return rc;
+                }
+            }
             if (wfs_test_in_pool_unwind) wfs_test_in_pool_unwind(wfs_test_in_pool_unwind_ctx);
             // PR #1 review (16th round, P2): the CREATING row goes out in the very transaction
             // the entry comes back in. It used to be deleted first, and in the gap between the
