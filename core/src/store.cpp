@@ -122,6 +122,7 @@ extern "C" const char *wfs_strerror(int rc) {
     case WFS_E_SNAPSHOT_DIRTY: return "snapshot no longer matches its manifest";
     case WFS_E_FOREIGN_STORE: return "marker belongs to a different store";
     case WFS_E_WORLD_MISSING: return "world is not at its recorded path";
+    case WFS_E_SOURCE_GONE: return "the snapshot this world was forked from is gone";
     default: return ::strerror(rc < 0 ? -rc : rc);
     }
 }

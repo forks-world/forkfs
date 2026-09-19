@@ -8,10 +8,12 @@ option(WFS_FSKIT "Build the FSKit view/namespace layer and frontend" OFF)
 set(WFS_CORE_SOURCES
     src/store.cpp
     src/world.cpp
+    src/diff.cpp
+    src/snapshot_access.cpp
     src/platform_posix.cpp
 )
 if(APPLE)
-    list(APPEND WFS_CORE_SOURCES src/platform_darwin.cpp)
+    list(APPEND WFS_CORE_SOURCES src/platform_darwin.cpp src/platform_darwin_events.cpp)
 endif()
 if(WFS_FSKIT)
     list(APPEND WFS_CORE_SOURCES src/view.cpp)
@@ -35,6 +37,13 @@ endif()
 add_executable(core_test tests/core_test.cpp)
 target_link_libraries(core_test PRIVATE worldfs_core)
 add_test(NAME core_test COMMAND core_test)
+
+# T1.3. Its own binary because it builds 10k-entry trees: keeping it out of core_test leaves
+# the rule-by-rule test fast. WFS_DIFF_BENCH=1 in the environment adds the 50k measurement.
+add_executable(diff_test tests/diff_test.cpp)
+target_link_libraries(diff_test PRIVATE worldfs_core)
+add_test(NAME diff_test COMMAND diff_test)
+set_tests_properties(diff_test PROPERTIES TIMEOUT 600)
 
 if(WFS_FSKIT)
     add_executable(fskit_test tests/fskit_test.cpp)

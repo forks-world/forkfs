@@ -214,13 +214,117 @@ S1/S4 的抖动来自 mds 索引新生成的文件。)
 真正的解法是 T1.5 的 pool:后台预克隆 + 预 unprotect,fork 只剩一次 rename。
 arch.md §1 的 `fork < 10ms` 目前只有 pool 命中时才可能满足;当场 clone 的地板是 1k 条目 40 ms(其中 4 ms 是进程启动)。
 
-- [ ] T1.3 diff:FSEvents + 全扫回退 + 比对(P10)
+- [x] T1.3 diff:FSEvents 候选 + 全扫回退 + 逐项比对(P10);C ABI `wfs_world_diff` / `wfs_world_diff_ex`,
+      CLI `world fs diff W<n> [--full] [--stat] [--no-xattr] [--no-content]`。
+      新文件:`core/src/diff.cpp`、`core/src/platform_darwin_events.cpp`、`core/src/events.h`、
+      `core/src/snapshot_access.{h,cpp}`、`core/tests/diff_test.cpp`。详见下节。
 - [ ] T1.4 exec:cwd/env/lock/seatbelt(P5/P14)
 - [ ] T1.5 pool:后台预克隆
-- [~] T1.6 safety 测试套件(P1–P14):P1/P2/P3/P4/P6/P7/P8/P9/P12/P13 已覆盖;
-      P5(exec lock)、P10(diff)、P11(真实磁盘写满)、P14(seatbelt)随 T1.3/T1.4 补
+- [~] T1.6 safety 测试套件(P1–P14):P1/P2/P3/P4/P6/P7/P8/P9/**P10**/P12/P13 已覆盖
+      (T1.3 给 `safety.sh` 加了 6 条 P10,41 条全过;更细的精确集合断言在 `core/tests/diff_test.cpp`);
+      P5(exec lock)、P11(真实磁盘写满)、P14(seatbelt)随 T1.4 补
 - [ ] T1.7 基准:fork 延迟、diff、1000 idle World、存储增长
 - [ ] T1.8 文档:arch.md 增补章节、README
+
+#### T1.3 diff 实测与结论(2026-09-19,M1 Mac mini / macOS 27.0)
+
+**FSEvents 参数(先写探针实测再定,探针在 scratchpad,结论写进 `core/src/platform_darwin_events.cpp` 顶注释):**
+
+| flag | 取 | 理由 |
+|---|---|---|
+| `kFSEventStreamCreateFlagFileEvents` | **是** | 不开就只有目录粒度,每次 diff 退化成目录扫描。实测 800 改动 → 800 条 file-level 路径 |
+| `kFSEventStreamCreateFlagNoDefer` | **是** | 第一批立即投递而不是等 latency 窗口;latency 已经是 0,但这是 §6.2 测的那一套 |
+| `kFSEventStreamCreateFlagIgnoreSelf` | **否** | 它压制的是"持流进程当场产生的事件",对**历史回放**没有意义(事件是别的进程很久以前记的)。而且没用:fork 自己的写全部发生在 `<target>.wfs-tmp` 下,**实测**不出现在 world 根的回放里(2000 文件克隆 + unprotect + rename,回放只有 21 条 = 20 改动 + world 根那一条 rename)。再说 P10 下多一个候选只值一次 lstat,少一个候选才是漏报 |
+| `kFSEventStreamCreateFlagWatchRoot` | **否** | 那是给长命 live 流跟随被移动的根用的;这条流活几十毫秒,回放过去 |
+| `kFSEventStreamCreateFlagUseCFTypes` | **否** | `char**` 路径,省掉每条事件一个 CFString |
+| 消费者 | **专用 serial dispatch queue** | §6.2 的反例:消费者被阻塞才丢事件。回调只 memcpy 路径,校验全部在 join 之后做。用 dispatch queue 而不是 runloop,因为 `FSEventStreamScheduleWithRunLoop` 在 13.0 起 deprecated,两者实测结果逐字相同 |
+
+**回退(任何一条都走全扫,且不打断调用方):**
+
+| 触发 | 判据 |
+|---|---|
+| `WFS_DF_REQUESTED` | `--full` |
+| `WFS_DF_FROM_WORLD` | World fork 自另一个 World(或 adopt 而来):cursor 是**本次** fork 的,盖不住父 World 在 fork 之前已经改掉的东西 |
+| `WFS_DF_NO_CURSOR` | 行里没有 fsevents id |
+| `WFS_DF_MUST_SCAN` | `kFSEventStreamEventFlagMustScanSubDirs` |
+| `WFS_DF_DROPPED` | `UserDropped` / `KernelDropped` |
+| `WFS_DF_WRAPPED` | `EventIdsWrapped`,或记录的 id 比 `FSEventsGetCurrentEventId()` 还大 |
+| `WFS_DF_STALE` | `FSEventsCopyUUIDForDevice` 返回 NULL,或 cursor 比卷的 journal 还老 |
+| `WFS_DF_TIMEOUT` | HistoryDone / 水位标在 2 s 内没回来 |
+
+**`FSEventsGetLastEventIdForDeviceBeforeTime` 在 27.0 上吃的是 unix 秒,不是 CFAbsoluteTime**(签名写的是 `CFAbsoluteTime`)。
+传真正的 CFAbsoluteTime 一律返回 0;传 unix 秒返回合理的 id,并在时间早于 journal 保留期时返回 0。
+本机数据卷的保留期实测约 **18–24 h**(`now-64800` 还有 id,`now-86400` 是 0)。
+→ 昨天 fork 的 World 今天 diff 会自动全扫,这正是想要的。
+**陈旧 cursor 必须挡在建流之前**:实测 `sinceWhen` 早于 journal 时,FSEvents **一条事件都不投,也永远不发 HistoryDone**——
+看起来和"没有任何改动"一模一样。这是本任务里最危险的一个坑。
+
+**fseventsd 的 journal 延迟(新测,决定了这个特性的上限):**
+
+| 改动类型 | 从改完到一条**新建**的流能回放到它(5 次) |
+|---|---|
+| write | 99 / 592 / 395 / 105 / 287 ms |
+| chmod | 97 / 91 / 326 / 89 / 91 ms |
+| setxattr | 91 / 90 / 155 / 296 / 91 ms |
+
+§6.2 的"最后一条 +3.1/+11.8 ms"是**已经跑着的 live 流**;diff 是事后建流,必须先等 fseventsd 把事件写进 journal。
+成批改动会立刻 flush(850 条的 fixture 从没漏过),**孤立的一次改动要等定时器**。
+为此 diff 在 HistoryDone 之后还会等一个自己的水位标:建流前在 **store 目录**(绝不在 World 里,diff 不能改 World)
+建一个 `.wfs-diff-<pid>`,并把 store 一起 watch;它绕回来就说明流是活的、journal 已经越过了 diff 开始的时刻。
+**但它不能证明完整性**:journal 的 flush 不是全局有序的——实测后写的哨兵会比另一个目录里更早的改动先回来。
+再等 150 ms 静默也试过,10k diff 变成 0.22–0.70 s,**比直接走两棵树还慢**,已回退。
+→ **结论:最近 ~100–600 ms 内的孤立改动,事件路径可能看不到;`--full` 是确定的答案,而且很便宜。**
+`core/tests/diff_test.cpp` 里的 `settle()` 就是为此存在:它测的是 diff,不是 fseventsd 的定时器。
+
+**比对(P10:事件只是候选,永远不是答案):**
+两边都在 → 类型/大小/mode/mtime;大小相等而 mtime 不同就**读两边的字节**(克隆共享 extent,但用户态看不出来,也没有"这两个是不是同一批 extent"的调用);
+内容相同而 mode/uid/gid/flags/mtime/xattr 不同 → `T`;只在 World → `A`;只在快照 → `D`;rename 在 M1 就是 `D` + `A`。
+`UF_IMMUTABLE`/`UF_APPEND` 在比对时被掩掉——那是 P3 的保护,不是用户改的。
+**候选是目录时必须展开**:实测目录改名只产生两条事件(旧名、新名),里面的文件一条都没有,
+所以只在一侧存在的目录要在那一侧走一遍,把每个文件报出来;空目录报它自己。
+只报文件,空目录的 A/D 除外。
+读快照一侧一律经过 `snapshot_open_for_read()`(`core/src/snapshot_access.{h,cpp}`),今天是 no-op,
+gate-directory 落地后 0500 的窗口就开在那一个地方。
+
+**xattr 的代价(新发现):** `listxattr(2)` 在 APFS 上约 10 µs/次,两边各一次。
+候选路径上几百个文件无所谓,全扫时是 10 万次系统调用:5 万文件全扫 **0.157 s → 1.339 s(8.6×)**。
+默认仍然比(回退来的全扫必须至少和事件路径一样完整),`WFS_DIFF_NO_XATTR` / `--no-xattr` 可以关掉
+(关掉后纯 xattr 改动会被当成没变)。
+
+**实测(best of 3,机器非空闲):**
+
+| 树 / 改动 | FSEvents | `--full` | `--full --no-xattr` |
+|---|---|---|---|
+| 10 100 条目 / 850 改动(500 M + 200 A + 100 D + 50 T) | **0.048 s** | 0.233 s | 0.035 s |
+| 50 500 条目 / 800 改动(500 M + 200 A + 100 D) | **0.087 s** | 1.354 s | **0.164 s** |
+
+(同一轮的 `init` 1.46 s / `fork` 1.47 s,与 T1.1 的 50k 数字一致。机器变忙时三列一起涨:
+并发跑压力测试那一轮是 0.159 / 1.895 / 0.271。12 次连跑 `diff_test` 全过。)
+
+对照 M1_DESIGN §1 的"全扫 0.8 s / 5 万":我们的 4 线程 C 走树 **0.157 s**,比设计假设快 5×
+(§6.1 那 0.647 s 是单线程 python `os.scandir`)。
+**于是 O(changes) 的优势比设计预期小得多**:事件路径 0.087 s vs 最便宜的全扫 0.164 s,只有 1.9×;
+真正拉开差距的是"要不要比 xattr"(8.6×),不是"要不要用事件"。
+树再大一个数量级时事件路径才重新变成决定性的。
+更糟的是事件路径有一笔固定开销(建流 + 等水位标):**6 个文件的小 World,`--full` 0.002 s,事件路径 0.4 s**,
+交叉点大约在几万文件。这一条建议在 T1.7 里复核后写回 arch.md §25——
+如果结论稳定,`diff` 的默认或许应该按 World 的 `entries` 自动选路,而不是无条件先试事件。
+
+**测试(`core/tests/diff_test.cpp`,独立 ctest target,600 s 超时):**
+10k fixture(100 目录 × 100 文件)+ 500 改 / 200 增 / 100 删 / 50 只改 mode,
+每条断言都是**精确集合**:输出必须有序、无重复、每一行都等于 fixture 对那个路径做的事,四个计数分毫不差。
+覆盖 (a) 事件路径、(b) `--full`、(c) 三种坏 cursor(stale / wrapped / 没有)——都必须静默回退且结果一致、
+(d) 再叠 5000 次快速改写之后仍然精确(消费者是只 memcpy 的专用队列,§6.2 让探针丢事件的那种负载在这里不丢)、
+(e) `--no-content`、(f) 回调提前返回能中断、(g) 未改动的 World 两条路径都是 0 行。
+小 fixture 另外覆盖:空目录 A/D、目录改名 → `D` + `A`、symlink 改指向、内容相同只有 mtime 变 → `T`、
+纯 xattr 改动(事件路径与 `--full` 都报 `T`,`--no-xattr` 故意报不出来)、
+fork 自 World 的子 World 自动全扫、World 被移动后仍能 diff(P1)、
+**来源快照没了(行不是 ACTIVE / 树被移走)→ `WFS_E_SOURCE_GONE`,退出码 3**。
+`WFS_DIFF_BENCH=1` 另跑 5 万文件的基准。
+
+**CLI:** `world fs diff W<n>`;`--stat` 只打计数;回退时在 stderr 打一行原因(P10 是承诺,做不到就要说);
+trashed / dead World、来源快照没了、World 不在记录的路径上 → 退出码 3;**diff 不拿 World 锁**,
+被人占用的 World 照样可以 diff(`WFS_E_WORLD_BUSY` 不是 diff 的拒绝理由)。
 
 ### 原 M1/M2/M3(FSKit 路线,已冻结,仅存档)
 #### M1(旧)— Read-only Worlds

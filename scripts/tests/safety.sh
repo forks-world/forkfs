@@ -175,6 +175,44 @@ chflags nouchg "$S2/hello.txt"
 echo tampered > "$S2/hello.txt"
 check P3 "verify reports a tampered snapshot" 3 -- "$WORLD" fs verify S2
 
+# ---- P10: diff never trusts the event stream on its own (T1.3) -----------------------------------
+# A fresh world, a change of every kind, and then the two paths have to agree line for line.
+"$WORLD" fs fork --from S1 --to "$SCRATCH/wdiff" --name wdiff > "$SCRATCH/wd.log" 2>&1
+WD=$(awk '{print $1}' "$SCRATCH/wd.log")
+if ! echo "$WD" | grep -qE '^W[0-9]+$' || [ ! -d "$SCRATCH/wdiff" ]; then
+    bad P10 "fork a world to diff"; cat "$SCRATCH/wd.log" | sed 's/^/        /'
+else
+    [ -z "$("$WORLD" fs diff "$WD")" ] && ok P10 "an untouched world diffs to nothing" \
+                                       || bad P10 "an untouched world diffs to nothing"
+    echo changed > "$SCRATCH/wdiff/hello.txt"     # M
+    echo new > "$SCRATCH/wdiff/src/new.c"         # A
+    rm "$SCRATCH/wdiff/src/a.c"                   # D
+    chmod 0600 "$SCRATCH/wdiff/src/a-link.c"      # T
+    mkdir "$SCRATCH/wdiff/emptydir"               # A (a directory with nothing to speak for it)
+    sleep 1                                       # fseventsd journals on a timer; see TASKS.md T1.3
+    "$WORLD" fs diff "$WD" > "$SCRATCH/d-ev.txt" 2> "$SCRATCH/d-ev.err"
+    evrc=$?
+    "$WORLD" fs diff "$WD" --full > "$SCRATCH/d-full.txt" 2>/dev/null
+    # Sorted by path, so the changes are interleaved rather than grouped by kind.
+    want=$'A emptydir\nM hello.txt\nT src/a-link.c\nD src/a.c\nA src/new.c'
+    if [ "$evrc" = 0 ] && [ "$(cat "$SCRATCH/d-ev.txt")" = "$want" ]; then
+        ok P10 "diff via FSEvents reports exactly A/M/D/T"
+    else
+        bad P10 "diff via FSEvents reports exactly A/M/D/T (exit $evrc)"
+        cat "$SCRATCH/d-ev.txt" "$SCRATCH/d-ev.err" | sed 's/^/        /'
+    fi
+    [ "$(cat "$SCRATCH/d-full.txt")" = "$want" ] && ok P10 "diff --full agrees line for line" \
+                                                 || { bad P10 "diff --full agrees line for line"; sed 's/^/        /' "$SCRATCH/d-full.txt"; }
+    "$WORLD" fs diff "$WD" --stat | grep -q '^2 added, 1 modified, 1 deleted, 1 metadata-only$' \
+        && ok P10 "diff --stat counts them" || bad P10 "diff --stat counts them"
+    # The source snapshot going away is a refusal with a reason, not a wrong answer.
+    SP=$("$WORLD" fs inspect S1 | awk '/^path:/{print $2}')
+    mv "${SP%/root}" "$SCRATCH/s1-away"
+    check    P10 "diff refuses when the source snapshot is gone" 3 -- "$WORLD" fs diff "$WD"
+    has_hint P10 "the refusal says what to do instead" "world fs list" -- "$WORLD" fs diff "$WD"
+    mv "$SCRATCH/s1-away" "${SP%/root}"
+fi
+
 echo
 "$WORLD" fs status | sed 's/^/      /'
 echo
