@@ -32,6 +32,8 @@ static void usage(void) {
           "                                   clone into a writable world (default ~/worlds/W<n>/<name>)\n"
           "  checkpoint W<n> [--name N] [--hard] [--force]\n"
           "                                   snapshot a live world; the world stays writable\n"
+          "  diff W<n> [--full|--events] [--stat] [--no-xattr] [--no-content]\n"
+          "                                   what changed since the fork (A/M/D/T, sorted)\n"
           "  list                             snapshots and worlds\n"
           "  inspect W<n>|S<n>\n"
           "  discard W<n> [--now] [--force]   move to the store trash (--now deletes at once)\n"
@@ -364,6 +366,91 @@ static int cmd_checkpoint(wfs_store *s, int argc, char **argv) {
                (unsigned long long)sr.entries, (unsigned long long)w);
     else
         printf("S%llu\n", (unsigned long long)id);
+    return EX_OK;
+}
+
+// ---- diff (T1.3) -----------------------------------------------------------------------------
+
+static int diff_print(void *ctx, const wfs_diff_entry *e) {
+    (void)ctx;
+    printf("%c %s\n", (char)e->change, e->path);
+    return 0;
+}
+
+static const char *fallback_reason(int f) {
+    switch (f) {
+    case WFS_DF_NO_CURSOR: return "no FSEvents cursor was recorded when this world was forked";
+    case WFS_DF_FROM_WORLD:
+        return "this world was forked from another world, so its cursor cannot cover what the "
+               "parent had already changed";
+    case WFS_DF_MUST_SCAN: return "the kernel asked for a rescan of a subtree (MustScanSubDirs)";
+    case WFS_DF_DROPPED: return "FSEvents dropped events";
+    case WFS_DF_WRAPPED: return "the FSEvents id space was reset";
+    case WFS_DF_STALE: return "the cursor is older than this volume's FSEvents journal";
+    case WFS_DF_TIMEOUT: return "the FSEvents replay did not finish in time";
+    case WFS_DF_UNSUPPORTED: return "FSEvents is not available here";
+    default: return NULL;
+    }
+}
+
+static int cmd_diff(wfs_store *s, int argc, char **argv) {
+    wfs_id w = 0;
+    int flags = 0, stat_only = 0;
+    for (int i = 0; i < argc; ++i) {
+        if (!strcmp(argv[i], "--full")) flags |= WFS_DIFF_FULL;
+        else if (!strcmp(argv[i], "--stat")) stat_only = 1;
+        else if (!strcmp(argv[i], "--no-content")) flags |= WFS_DIFF_NO_CONTENT;
+        else if (!strcmp(argv[i], "--no-xattr")) flags |= WFS_DIFF_NO_XATTR;
+        else if (argv[i][0] != '-' && !w) w = parse_world(argv[i]);
+        else usage();
+    }
+    if (!w) usage();
+
+    wfs_world_rec r;
+    int rc = wfs_world_info(s, w, &r);
+    if (rc) return fail("diff", rc);
+
+    wfs_diff_stats st;
+    // A diff never takes the world's lock: it only reads, so a world someone is working in is
+    // diffable (WFS_E_WORLD_BUSY is not a diff refusal).
+    rc = wfs_world_diff_ex(s, w, flags, stat_only ? NULL : diff_print, NULL, &st);
+    if (rc == WFS_E_SOURCE_GONE) {
+        char why[256];
+        if (r.snapshot_id)
+            snprintf(why, sizeof why,
+                     "W%llu was forked from S%llu, which is no longer in the store: there is "
+                     "nothing left to compare against",
+                     (unsigned long long)w, (unsigned long long)r.snapshot_id);
+        else
+            snprintf(why, sizeof why, "W%llu has no source snapshot recorded", (unsigned long long)w);
+        return refuse(why, "world fs list   (and `world fs checkpoint W<n>` to give it a new baseline)");
+    }
+    if (rc == WFS_E_WORLD_MISSING) {
+        char why[WFS_PATH_MAX + 64];
+        snprintf(why, sizeof why, "W%llu is not at %s any more", (unsigned long long)w, r.path);
+        return refuse(why, "world fs verify <the path it was moved to>");
+    }
+    if (rc == -ESTALE) {
+        char why[128];
+        snprintf(why, sizeof why, "W%llu is %s, not active", (unsigned long long)w, state_name(r.state));
+        return refuse(why, r.state == WFS_ST_TRASHED ? "world fs restore W<n>" : "world fs list");
+    }
+    if (rc) return fail("diff", rc);
+
+    // P10 is a promise, so say out loud when the event stream could not keep it: the answer is
+    // the same either way, but the cost was not.
+    const char *why = st.full_scan ? fallback_reason(st.fallback) : NULL;
+    if (why) fprintf(stderr, "world: note: %s; compared both trees instead\n", why);
+
+    if (stat_only) {
+        printf("%llu added, %llu modified, %llu deleted, %llu metadata-only\n",
+               (unsigned long long)st.added, (unsigned long long)st.modified,
+               (unsigned long long)st.deleted, (unsigned long long)st.meta);
+        printf("%s, %llu paths compared, %llu files read, %.3f s\n",
+               st.full_scan ? "full scan of both trees" : "FSEvents since the fork",
+               (unsigned long long)st.compared, (unsigned long long)st.content_cmp,
+               st.elapsed_us / 1e6);
+    }
     return EX_OK;
 }
 
@@ -868,6 +955,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(sub, "init")) ret = cmd_init(s, nargs, args);
     else if (!strcmp(sub, "fork")) ret = cmd_fork(s, nargs, args);
     else if (!strcmp(sub, "checkpoint")) ret = cmd_checkpoint(s, nargs, args);
+    else if (!strcmp(sub, "diff")) ret = cmd_diff(s, nargs, args);
     else if (!strcmp(sub, "list")) ret = (nargs == 0) ? cmd_list(s) : (usage(), EX_USAGE);
     else if (!strcmp(sub, "inspect")) ret = (nargs == 1) ? cmd_inspect(s, args[0]) : (usage(), EX_USAGE);
     else if (!strcmp(sub, "discard")) ret = cmd_discard(s, nargs, args);

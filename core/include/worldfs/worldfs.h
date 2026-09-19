@@ -86,7 +86,8 @@ enum {
     WFS_E_WORLD_BUSY = -1007,     /* P5/P12: another command holds this world's lock */
     WFS_E_SNAPSHOT_DIRTY = -1008, /* P3: snapshot content no longer matches its manifest */
     WFS_E_FOREIGN_STORE = -1009,  /* marker belongs to a different store */
-    WFS_E_WORLD_MISSING = -1010   /* the recorded path no longer holds this world */
+    WFS_E_WORLD_MISSING = -1010,  /* the recorded path no longer holds this world */
+    WFS_E_SOURCE_GONE = -1011     /* the snapshot this world was forked from is no longer there */
 };
 
 /* Human-readable text for a negative errno or a WFS_E_* code. Never NULL. */
@@ -293,6 +294,90 @@ int wfs_world_verify_identity(wfs_store *s, const char *path, wfs_identity *out)
 int wfs_world_verify(wfs_store *s, wfs_id id, wfs_identity *out);
 /* P2: take over an unregistered copy as a new world, rewriting its marker. */
 int wfs_world_adopt(wfs_store *s, const char *path, const char *name, wfs_id *out);
+
+/* ---- diff (T1.3) --------------------------------------------------------------------------
+ *
+ * What changed in a world since it was forked, against the snapshot it came from. Two ways to
+ * find out, one way to decide:
+ *
+ *   candidates   an FSEvents replay from the event id recorded at fork time gives the changed
+ *                paths in O(changes) (measured: 800 changes over a 50k tree, 799 file-level
+ *                paths, 21 ms). When FSEvents cannot account for everything -- MustScanSubDirs,
+ *                a dropped event, a wrapped id, a cursor older than the volume's journal, or
+ *                a world that was forked from another world rather than from a snapshot --
+ *                the candidate set is the whole world, i.e. a full walk of both trees.
+ *   verification every candidate is stat'ed on both sides and, when size and mtime disagree,
+ *                its bytes are compared. Events are never trusted on their own (P10), so a
+ *                spurious candidate costs one lstat and cannot produce a wrong answer.
+ *
+ * Only files are reported. A directory shows up only when it is empty and exists on just one
+ * side; otherwise its files carry the news. Renames are reported as D + A (M1).
+ */
+
+typedef enum wfs_change {
+    WFS_C_ADDED = 'A',    /* in the world, not in the snapshot */
+    WFS_C_MODIFIED = 'M', /* in both, contents differ (or the type changed) */
+    WFS_C_DELETED = 'D',  /* in the snapshot, not in the world */
+    WFS_C_META = 'T'      /* in both, same contents, different mode/owner/flags/mtime/xattr */
+} wfs_change;
+
+typedef struct wfs_diff_entry {
+    int change;        /* wfs_change */
+    wfs_type type;     /* type in the world, or in the snapshot for WFS_C_DELETED */
+    uint64_t size;     /* size in the world, or in the snapshot for WFS_C_DELETED */
+    const char *path;  /* relative to the world root; only valid during the callback */
+} wfs_diff_entry;
+
+/* Called once per change, in ascending path order. A non-zero return stops the walk and
+ * becomes the return value of wfs_world_diff(). */
+typedef int (*wfs_diff_cb)(void *ctx, const wfs_diff_entry *e);
+
+enum {
+    WFS_DIFF_FULL = 1 << 0,       /* skip FSEvents: walk both trees (`diff --full`) */
+    WFS_DIFF_NO_CONTENT = 1 << 1, /* never read bytes: size or mtime differing means M */
+    /* Leave the xattr leg out of the T classification. It is two listxattr(2) calls per
+     * otherwise-identical file and those cost ~10 us each on APFS, which is nothing for the
+     * few hundred candidates of an FSEvents diff but is 8x the cost of a whole full scan
+     * (measured 50k: 0.16 s -> 1.35 s). A file whose only change is an xattr then reads as
+     * unchanged, so this is a speed-for-completeness trade the caller has to ask for. */
+    WFS_DIFF_NO_XATTR = 1 << 2
+};
+
+/* Why the full two-tree walk was used. */
+typedef enum wfs_diff_fallback {
+    WFS_DF_NONE = 0,
+    WFS_DF_REQUESTED,   /* WFS_DIFF_FULL */
+    WFS_DF_NO_CURSOR,   /* no FSEvents id was recorded at fork */
+    WFS_DF_FROM_WORLD,  /* forked from a live world (or adopted): the cursor does not cover
+                         * the changes its parent had already made to the snapshot */
+    WFS_DF_MUST_SCAN,   /* kFSEventStreamEventFlagMustScanSubDirs */
+    WFS_DF_DROPPED,     /* UserDropped / KernelDropped: the consumer or the kernel fell behind */
+    WFS_DF_WRAPPED,     /* the event id space wrapped or was reset */
+    WFS_DF_STALE,       /* the cursor is older than the volume's event journal */
+    WFS_DF_TIMEOUT,     /* HistoryDone never arrived */
+    WFS_DF_UNSUPPORTED  /* no FSEvents on this platform */
+} wfs_diff_fallback;
+
+typedef struct wfs_diff_stats {
+    uint64_t added, modified, deleted, meta;
+    uint64_t candidates;  /* paths FSEvents proposed (0 for a full scan) */
+    uint64_t compared;    /* paths stat'ed on both sides */
+    uint64_t content_cmp; /* files whose bytes had to be read (size equal, mtime differs) */
+    uint64_t bytes_read;
+    uint64_t events_id;   /* the cursor that was used */
+    int full_scan;        /* 1 = both trees were walked */
+    int fallback;         /* wfs_diff_fallback */
+    int64_t elapsed_us;
+} wfs_diff_stats;
+
+/* Diff a world against the snapshot it was forked from. The world's lock is never taken: a
+ * diff is read-only, so a busy world is not a refusal. Returns 0 when the diff was computed
+ * (even if nothing changed), WFS_E_SOURCE_GONE when the snapshot is no longer in the store,
+ * WFS_E_WORLD_MISSING when the world is not at its recorded path, or a negative errno. */
+int wfs_world_diff(wfs_store *s, wfs_id world, int flags, wfs_diff_cb cb, void *ctx);
+/* The same, with the counters and the reason the full scan was used. `stats` may be NULL. */
+int wfs_world_diff_ex(wfs_store *s, wfs_id world, int flags, wfs_diff_cb cb, void *ctx,
+                      wfs_diff_stats *stats);
 
 /* P7: refuse dangerous roots. for_target != 0 means "a fork is about to create this path"
  * (it must not exist yet); otherwise the path must already be a directory. */

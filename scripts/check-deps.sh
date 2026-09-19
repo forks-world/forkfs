@@ -4,6 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 BUILD=${1:-build/Release}
 BINS=("$BUILD/cli/world" "$BUILD/core/core_test")
+[ -f "$BUILD/core/diff_test" ] && BINS+=("$BUILD/core/diff_test")
 [ -f "$BUILD/macos/fskit/WorldFSExtension" ] && BINS+=("$BUILD/macos/fskit/WorldFSExtension")
 rc=0
 for b in "${BINS[@]}"; do
