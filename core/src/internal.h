@@ -60,6 +60,9 @@ int fs_symlink(const char *target, const char *path);
 int fs_link(const char *existing, const char *path);
 int fs_unlink(const char *path, bool is_dir);
 int fs_rename(const char *from, const char *to);
+// rename(2) that refuses to replace anything already at `to` (-EEXIST). Used for the one rename
+// whose destination is a path outside the store: the fork's publish (P7/P8).
+int fs_rename_excl(const char *from, const char *to);
 int fs_setattr(const char *path, const wfs_setattr_req &req);
 int fs_getxattr(const char *path, const char *name, void *buf, size_t cap, size_t *len);
 int fs_setxattr(const char *path, const char *name, const void *data, size_t len, int flags);

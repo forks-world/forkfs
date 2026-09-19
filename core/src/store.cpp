@@ -58,6 +58,10 @@ const char *kSchema =
     "  fsevents_id INTEGER NOT NULL DEFAULT 0,"
     "  entries INTEGER NOT NULL DEFAULT 0,"
     "  created_at INTEGER NOT NULL,"
+    /* The exact path this fork is building its clone at, written before the clone starts and
+     * cleared when the tree is published. A CREATING row is the only thing that names it, and
+     * gc removes that path and nothing else: the store never guesses in a user's directory. */
+    "  tmp_path TEXT NOT NULL DEFAULT '',"
     "  trashed_at INTEGER NOT NULL DEFAULT 0);"
     "CREATE INDEX IF NOT EXISTS worlds_ino ON worlds(dir_ino);"
     "CREATE INDEX IF NOT EXISTS worlds_path ON worlds(path);"
@@ -95,6 +99,9 @@ const char *kMigrations[] = {
     // fork checks to decide whether the manifest has to be read at all.
     "ALTER TABLE snapshots ADD COLUMN hl_groups INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE snapshots ADD COLUMN hl_external INTEGER NOT NULL DEFAULT 0",
+    // PR #1 review, third round: where a fork in flight is building its clone. The name is
+    // drawn, not derived, so the row is the only record of it.
+    "ALTER TABLE worlds ADD COLUMN tmp_path TEXT NOT NULL DEFAULT ''",
 };
 
 // Additive revision of schema v2. `PRAGMA user_version` carries SCHEMA*100 + REV, so a store
@@ -102,7 +109,7 @@ const char *kMigrations[] = {
 // compared user_version against the schema number alone, which meant a store already stamped
 // with 2 never saw a later ALTER TABLE. VERSION (and therefore P13) is untouched -- an older
 // core opens such a store and simply does not use the new columns.
-const int kSchemaRev = 2;
+const int kSchemaRev = 3;
 inline int user_version_want(void) { return WFS_STORE_SCHEMA * 100 + kSchemaRev; }
 
 void hex_id(char *out, size_t n) { // n = 33 for 32 hex digits + NUL

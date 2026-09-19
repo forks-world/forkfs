@@ -109,6 +109,21 @@ static void race_discard(void *ctx, wfs_id world) {
     g_race_rc = wfs_snapshot_discard(g_race_store, g_race_snap, 0, 0);
 }
 
+// PR #1 review (3rd round): the seam that stops a fork dead between the recorded clone and the
+// publish rename, and remembers what it was about to publish. Returning non-zero unwinds
+// nothing, so the CREATING row and the tree it names survive exactly as a `kill -9` leaves them.
+struct CrashSeen {
+    wfs_id world;
+    char tmp[4096];
+};
+static CrashSeen crash_seen;
+static int crash_before_publish(void *ctx, wfs_id world, const char *tmp_path) {
+    CrashSeen *c = (CrashSeen *)ctx;
+    c->world = world;
+    snprintf(c->tmp, sizeof c->tmp, "%s", tmp_path);
+    return -EINTR;
+}
+
 // A copy in the sense of `cp -R`: same bytes, same marker, different inode (P2).
 static void copy_dir(const char *src, const char *dst) {
     CHECK(mkdir(dst, 0755) == 0);
@@ -462,16 +477,76 @@ int main() {
     CHECK(!exists(lockpath));
     CHECK_OK(wfs_world_restore(s, w1));
 
-    // ---- P8: a half-built tree is collected ----
-    char stray[4096], strayfile[4096];
-    join(stray, sizeof stray, worlds, "interrupted.wfs-tmp");
-    CHECK(mkdir(stray, 0755) == 0);
-    join(strayfile, sizeof strayfile, stray, "half");
-    write_file(strayfile, "x");
+    // ---- P8 + PR #1 review (3rd round): a half-built tree is collected, by name, not by guess --
+    //
+    // The fork's temporary used to be `<target>.wfs-tmp`, removed on sight before cloning, and
+    // gc swept every `*.wfs-tmp` out of the parent directory of every world -- both of which are
+    // the user's directory. `~/w/a.wfs-tmp` and `~/w/notes.wfs-tmp` are somebody's own file and
+    // somebody's own directory; `fork --to ~/w/a` and a routine `gc` destroyed them.
+    char mine_file[4096], mine_dir[4096], mine_inner[4096], tmptgt[4096];
+    join(mine_file, sizeof mine_file, worlds, "wtmp.wfs-tmp");     // == <target>.wfs-tmp below
+    write_file(mine_file, "mine, not a temporary\n");
+    join(mine_dir, sizeof mine_dir, worlds, "notes.wfs-tmp");
+    CHECK(mkdir(mine_dir, 0755) == 0);
+    join(mine_inner, sizeof mine_inner, mine_dir, "keep");
+    write_file(mine_inner, "keep me\n");
+
+    join(tmptgt, sizeof tmptgt, worlds, "wtmp");
+    wfs_id wtmp = 0;
+    memset(&opts, 0, sizeof opts);
+    opts.name = "wtmp";
+    CHECK_OK(wfs_world_create(s, from, tmptgt, &opts, &wtmp));
+    CHECK_OK(read_file(mine_file, buf, sizeof buf));
+    CHECK(!strcmp(buf, "mine, not a temporary\n"));                // the fork did not eat it
+    CHECK_OK(read_file(mine_inner, buf, sizeof buf));
+    CHECK(!strcmp(buf, "keep me\n"));
+    CHECK(n_with_prefix(worlds, ".wfs-fork-") == 0);               // and left nothing of its own
+
+    // The crash the temp path exists for: the clone is made and recorded, the publish rename
+    // never happens. gc removes exactly the recorded path and marks the row DEAD.
+    char crashtgt[4096];
+    join(crashtgt, sizeof crashtgt, worlds, "wcrash");
+    crash_seen.world = 0;
+    crash_seen.tmp[0] = 0;
+    wfs_test_before_fork_publish = crash_before_publish;
+    wfs_test_before_fork_publish_ctx = &crash_seen;
+    wfs_id wcrash = 0;
+    CHECK_RC(wfs_world_create(s, from, crashtgt, &opts, &wcrash), -EINTR);
+    wfs_test_before_fork_publish = NULL;
+    CHECK(crash_seen.world != 0 && crash_seen.tmp[0]);
+    CHECK(!exists(crashtgt));                                      // never published
+    CHECK(exists(crash_seen.tmp));                                 // the clone is still there
+    CHECK_OK(wfs_world_info(s, crash_seen.world, &wr));
+    CHECK(wr.state == WFS_ST_CREATING);
+    // ... and it is inside the user's directory, under a name of ours.
+    CHECK(!strncmp(crash_seen.tmp + strlen(worlds) + 1, ".wfs-fork-", 10));
+
+    memset(&gc, 0, sizeof gc);
     CHECK_OK(wfs_gc(s, 0, &gc));
-    CHECK(!exists(stray));
+    CHECK(!exists(crash_seen.tmp));
     CHECK(gc.tmp_removed >= 1);
-    CHECK(exists(w1path) && exists(w3path));                       // and nothing else went with it
+    CHECK_OK(wfs_world_info(s, crash_seen.world, &wr));
+    CHECK(wr.state == WFS_ST_DEAD);
+    CHECK(exists(w1path) && exists(w3path) && exists(tmptgt));     // nothing else went with it
+    CHECK_OK(read_file(mine_file, buf, sizeof buf));
+    CHECK(!strcmp(buf, "mine, not a temporary\n"));                // nor did gc
+    CHECK(exists(mine_dir) && exists(mine_inner));
+
+    // A CREATING row whose recorded tree is gone already (somebody deleted it by hand): the row
+    // is buried, and gc counts nothing removed for it.
+    crash_seen.world = 0;
+    crash_seen.tmp[0] = 0;
+    wfs_test_before_fork_publish = crash_before_publish;
+    CHECK_RC(wfs_world_create(s, from, crashtgt, &opts, &wcrash), -EINTR);
+    wfs_test_before_fork_publish = NULL;
+    CHECK(exists(crash_seen.tmp));
+    rm_rf(crash_seen.tmp);
+    memset(&gc, 0, sizeof gc);
+    CHECK_OK(wfs_gc(s, 0, &gc));
+    CHECK(gc.tmp_removed == 0);
+    CHECK_OK(wfs_world_info(s, crash_seen.world, &wr));
+    CHECK(wr.state == WFS_ST_DEAD);
+    CHECK(exists(mine_dir) && exists(mine_file));
 
     // ---- P3 again: tampering with a --hard snapshot is detected ----
     CHECK_OK(wfs_snapshot_info(s, s2, &sr));

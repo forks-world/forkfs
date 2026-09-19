@@ -16,7 +16,7 @@
 //             replayed: the first name is the canonical file, the others are unlinked and
 //             linked to it. That is O(hardlinked names), not O(tree).
 //
-// Every restore happens before the publish rename (P8), so a crash leaves a `.wfs-tmp` tree and
+// Every restore happens before the publish rename (P8), so a crash leaves the half-built tree and
 // nothing else. The groups travel in the snapshot's manifest, as an additive section that the
 // existing manifest reader skips (see hardlinks_manifest_write).
 #pragma once
@@ -78,7 +78,7 @@ int hardlinks_manifest_read(const char *manifest_path, HardlinkSet &out);
 String hardlinks_manifest_path(const char *snapshot_root);
 
 // Replays `set` inside `tree_root`, which must be a freshly cloned tree that nobody can see yet
-// (a `.wfs-tmp` tree or an unclaimed pool entry). For each group the first name that exists
+// (a fork's recorded temporary or an unclaimed pool entry). For each group the first name that exists
 // becomes the canonical file and the others are relinked to it: link(2) to a temporary name in
 // the same directory, then rename(2) over the target, so a failure half way leaves the original
 // file in place rather than a hole.

@@ -1,9 +1,11 @@
 // Snapshot and World lifecycle: the M1 clonefile model (docs/M1_DESIGN.md §1–§4).
 //
 // Two invariants run through this file:
-//   * publish order (P8): every tree is built under <target>.wfs-tmp, made correct there, then
+//   * publish order (P8): every tree is built under a temporary name, made correct there, then
 //     renamed into place, and only then does the row become ACTIVE. A crash anywhere leaves a
-//     CREATING row plus a .wfs-tmp tree, both of which wfs_gc() removes.
+//     CREATING row plus the tree it names, both of which wfs_gc() collects. Inside the store the
+//     temporary is derived from the row id; in a user's directory it is drawn at random and
+//     written onto the row first, because nothing out there may be assumed to be ours.
 //   * identity is marker + inode (P1/P2), never the path. Any command that touches a world
 //     re-checks it and repairs the row when the directory has merely moved.
 #include "db.h"
@@ -17,6 +19,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/file.h>
+#include <sys/random.h>
 #include <unistd.h>
 
 using wfs::copy_str;
@@ -455,11 +458,48 @@ int space_check(const char *near_path, uint64_t entries) {
     return avail < need ? WFS_E_LOW_SPACE : 0;
 }
 
-int remove_tmp(const char *target) {
-    String tmp(target);
-    tmp.append(WFS_TMP_SUFFIX);
-    if (!exists(tmp.c_str())) return 0;
-    return wfs::fs_remove_tree(tmp.c_str());
+// ---- the fork's temporary name ---------------------------------------------------------------
+//
+// PR #1 review, third round. A fork builds its clone next to the target -- it has to, because
+// rename(2) is only atomic within one directory and the target's parent is the only directory
+// guaranteed to be on the target's volume. That parent is the *user's*, so the name has to come
+// from somewhere no user name can collide with, and nothing already sitting there may be
+// touched. The old name was `<target>.wfs-tmp` with an `if (exists) fs_remove_tree()` in front
+// of it, which destroyed `~/w/a.wfs-tmp` on `fork --to ~/w/a`.
+//
+//     .wfs-fork-<pid>-<counter>-<16 hex from getentropy(2)>
+//
+// clonefile(2) creates the destination and fails with EEXIST rather than replacing it, exactly
+// as O_EXCL does for open(2), so the successful clone *is* the claim. EEXIST means "draw
+// another name", never "remove what is there". The name that was drawn goes on the CREATING row
+// before the clone starts (worlds.tmp_path), so a crash leaves a row that names the leftover and
+// gc has something to remove that it did not have to guess.
+const int kTmpTries = 8;
+
+void fork_tmp_leaf(char *out, size_t cap) {
+    static uint64_t seq = 0;
+    uint64_t n = __atomic_fetch_add(&seq, 1, __ATOMIC_RELAXED);
+    unsigned char raw[8];
+    if (::getentropy(raw, sizeof raw) != 0)
+        for (size_t i = 0; i < sizeof raw; ++i)
+            raw[i] = (unsigned char)(::getpid() + i * 31 + (int)n);
+    uint64_t r = 0;
+    for (size_t i = 0; i < sizeof raw; ++i) r = (r << 8) | raw[i];
+    ::snprintf(out, cap, ".wfs-fork-%d-%llu-%016llx", (int)::getpid(), (unsigned long long)n,
+               (unsigned long long)r);
+}
+
+// Write (or clear) the temporary path a CREATING row is building at.
+int world_set_tmp_path(wfs_store *s, wfs_id id, const char *p) {
+    Guard g(s->mu);
+    Txn t(s->db);
+    Stmt u(s->db, "UPDATE worlds SET tmp_path=? WHERE id=?");
+    if (!u.ok()) return -EIO;
+    u.text(1, p ? p : "");
+    u.i64(2, (int64_t)id);
+    if (u.step() != SQLITE_DONE) return -EIO;
+    t.commit();
+    return 0;
 }
 
 // ---- T2.1: deleting a trash entry ------------------------------------------------------------
@@ -511,6 +551,12 @@ int trash_unlink(const char *deleting_path, int threads, uint64_t *entries,
 // library ever assigns it, and the pool path pays one predictable branch for it.
 extern "C" void (*wfs_test_after_pool_claim)(void *ctx, wfs_id world) = nullptr;
 extern "C" void *wfs_test_after_pool_claim_ctx = nullptr;
+
+// And the other one: the instant before the publish rename, with the CREATING row and the clone
+// it recorded both on disk. Returning non-zero makes wfs_world_create() return that code without
+// unwinding anything, which is what a `kill -9` there looks like to the next process.
+extern "C" int (*wfs_test_before_fork_publish)(void *ctx, wfs_id world, const char *tmp_path) = nullptr;
+extern "C" void *wfs_test_before_fork_publish_ctx = nullptr;
 
 // ---- snapshots --------------------------------------------------------------------------------
 
@@ -846,7 +892,10 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
             if (wfs_test_after_pool_claim) wfs_test_after_pool_claim(wfs_test_after_pool_claim_ctx, id);
             int rc = marker_write(claim.path.c_str(), s->store_id.c_str(), s->dir.c_str(), id, nm,
                                   snapshot_id, 0, created);
-            if (!rc) rc = wfs::fs_rename(claim.path.c_str(), target.c_str());
+            // P7 again: the entry is store-internal, the target is not. RENAME_EXCL, so a
+            // directory that appeared at `--to` since check_path looked is EEXIST and the entry
+            // goes back into the pool -- never a replacement, whatever raced us.
+            if (!rc) rc = wfs::fs_rename_excl(claim.path.c_str(), target.c_str());
             struct stat st;
             if (!rc && ::stat(target.c_str(), &st) != 0) rc = -errno;
             if (!rc) {
@@ -933,17 +982,31 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         t.commit();
     }
 
-    String tmp(target);
-    tmp.append(WFS_TMP_SUFFIX);
+    // The clone goes to a name of ours in the target's parent directory, recorded on the row
+    // before it exists. Nothing that was already there is ever removed: EEXIST is answered with
+    // another name, and after kTmpTries draws of 64 random bits we give up rather than insist.
+    String tmp;
+    bool tmp_is_ours = false;   // did our own clonefile create it?
     int rc = 0;
     do {
-        if (exists(tmp.c_str())) { if ((rc = wfs::fs_remove_tree(tmp.c_str()))) break; }
-        {
-            // T1.1b: the whole cost of forking from a gated snapshot is this one clonefile.
-            // The gate is open for exactly its duration and for nothing else.
-            SnapGate gate;
-            if (src_gated && (rc = gate.open(src.c_str(), false))) break;
-            rc = wfs::fs_clone_tree(src.c_str(), tmp.c_str(), o.allow_fallback != 0);
+        for (int t = 0; t < kTmpTries; ++t) {
+            char leaf[64];
+            fork_tmp_leaf(leaf, sizeof leaf);
+            tmp = joinp(parent_dir.c_str(), leaf);
+            if (exists(tmp.c_str())) { rc = -EEXIST; continue; }
+            // Before the clone, so a crash between here and the rename leaves a CREATING row
+            // that names the leftover tree (P8).
+            if ((rc = world_set_tmp_path(s, id, tmp.c_str()))) break;
+            {
+                // T1.1b: the whole cost of forking from a gated snapshot is this one clonefile.
+                // The gate is open for exactly its duration and for nothing else.
+                SnapGate gate;
+                if (src_gated && (rc = gate.open(src.c_str(), false))) break;
+                rc = wfs::fs_clone_tree(src.c_str(), tmp.c_str(), o.allow_fallback != 0);
+            }
+            if (rc == -EEXIST) continue;   // somebody else's name, drawn against all odds
+            tmp_is_ours = true;
+            break;
         }
         if (rc) break;
         if (src_gated) {
@@ -956,7 +1019,7 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         if (src_hard && (rc = wfs::fs_unprotect_tree(tmp.c_str()))) break;
         // P9 (T2.5): clonefile broke every hardlink again; replay the source's groups on the
         // clone. After the unprotect (linking onto a UF_IMMUTABLE name fails) and before the
-        // marker and the rename, so a crash here leaves nothing but a .wfs-tmp tree.
+        // marker and the rename, so a crash here leaves nothing but the recorded temp tree.
         if (hl_groups) {
             wfs::HardlinkSet hl;
             if (wfs::hardlinks_manifest_read(hl_manifest.c_str(), hl) == 0 && hl.groups.size()) {
@@ -967,11 +1030,21 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         }
         if ((rc = marker_write(tmp.c_str(), s->store_id.c_str(), s->dir.c_str(), id, nm, snapshot_id, parent_world, created)))
             break;
-        if ((rc = wfs::fs_rename(tmp.c_str(), target.c_str()))) break;
+        // The test seam for "the process died here": the CREATING row and the tree it names are
+        // left exactly as they are, which is what gc has to be able to clean up.
+        if (wfs_test_before_fork_publish) {
+            int hrc = wfs_test_before_fork_publish(wfs_test_before_fork_publish_ctx, id, tmp.c_str());
+            if (hrc) return hrc;
+        }
+        // P7: the target is the user's path. A directory that appeared there since check_path
+        // looked is a refusal, not something to rename over.
+        if ((rc = wfs::fs_rename_excl(tmp.c_str(), target.c_str()))) break;
     } while (0);
 
     if (rc) {
-        wfs::fs_remove_tree(tmp.c_str());
+        // Only ever our own clone. A name we drew but never created (EEXIST, or a gate that
+        // would not open) belongs to whoever else is holding it.
+        if (tmp_is_ours) wfs::fs_remove_tree(tmp.c_str());
         Guard g(s->mu);
         Txn t(s->db);
         Stmt del(s->db, "DELETE FROM worlds WHERE id=?");
@@ -990,7 +1063,10 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
     {
         Guard g(s->mu);
         Txn t(s->db);
-        Stmt u(s->db, "UPDATE worlds SET dir_dev=?, dir_ino=?, entries=?, state=? WHERE id=?");
+        // tmp_path goes with the publish: the tree is at `target` now, and a row that still
+        // named the temporary would be pointing gc at a path that is not there any more.
+        Stmt u(s->db, "UPDATE worlds SET dir_dev=?, dir_ino=?, entries=?, state=?, tmp_path=''"
+                      " WHERE id=?");
         if (!u.ok()) return -EIO;
         u.i64(1, (int64_t)st.st_dev);
         u.i64(2, (int64_t)st.st_ino);
@@ -1658,7 +1734,7 @@ extern "C" int wfs_snapshot_verify(wfs_store *s, wfs_id id, wfs_verify_report *o
 //
 // Everything gc does falls into two classes with very different costs:
 //
-//   cheap    half-built rows and their *.wfs-tmp trees (P8), stale seatbelt profiles, pool
+//   cheap    half-built rows and the trees they RECORD (P8), stale seatbelt profiles, pool
 //            entries of dead snapshots (T1.5), and -- new in T2.2 -- noticing rows whose tree is
 //            not on disk any more. All of it is a handful of stat(2)s and one SQLite pass, so it
 //            runs inline on every gc, whatever the batch limits say.
@@ -1674,15 +1750,14 @@ namespace {
 
 const uint64_t kDefaultGcThreads = 4;
 
-// Collect the parent directories of every world we know about; that is where a crashed fork
-// can have left a <target>.wfs-tmp tree.
-void add_unique(Vec<String> &v, const char *p) {
-    for (size_t i = 0; i < v.size(); ++i)
-        if (!::strcmp(v[i].c_str(), p)) return;
-    v.emplace_back(p);
-}
-
-int rm_tmp_in_dir(const char *dir, uint64_t *removed) {
+// A suffix sweep, and therefore a guess: every `*.wfs-tmp` in `dir` goes. That is only ever
+// allowable inside the store, where every name was made by us -- `<store>/snapshots/S<n>.wfs-tmp`
+// is derived from a row id and nothing else can be called that. It used to be run over the
+// parent directory of every world as well, i.e. over the user's own directories, where it
+// destroyed `~/w/notes.wfs-tmp` on a routine `world fs gc`. A fork's leftovers are now found
+// from the path its CREATING row recorded (gc_creating_tmp below), never from a name pattern.
+int rm_tmp_in_store_dir(wfs_store *s, const char *dir, uint64_t *removed) {
+    if (!under_dir(dir, s->dir.c_str())) return -EINVAL;   // not ours to sweep
     DIR *d = ::opendir(dir);
     if (!d) return 0;
     size_t sl = ::strlen(WFS_TMP_SUFFIX);
@@ -1694,6 +1769,35 @@ int rm_tmp_in_dir(const char *dir, uint64_t *removed) {
     }
     ::closedir(d);
     return 0;
+}
+
+// Is `p` still the half-built clone that CREATING row `id` recorded? The row is evidence about
+// the past and this is a directory in somebody's workspace, so it is re-checked against the
+// present before anything is removed:
+//   * it is a directory that is there (gone, or not a directory: nothing to do);
+//   * no live row claims its inode -- that would mean the tree reached its target and was
+//     registered, and the path we are looking at is a second name for a real world;
+//   * a `.world` marker, if there is one, names this very world in this very store. The publish
+//     order writes the marker before the rename, so our own half-published clone has one; a
+//     marker naming anything else is somebody else's world and is left alone.
+// Anything unreadable or unrecognised is left alone too.
+bool gc_tmp_is_removable(wfs_store *s, wfs_id id, const char *p) {
+    if (!p || !*p) return false;
+    struct stat st;
+    if (::lstat(p, &st) != 0 || !S_ISDIR(st.st_mode)) return false;
+    String mp = joinp(p, WFS_MARKER_NAME);
+    if (exists(mp.c_str())) {
+        MarkerData m;
+        if (marker_read(p, m) != 0) return false;
+        if (m.world != id || ::strcmp(m.store_id, s->store_id.c_str()) != 0) return false;
+    }
+    Guard g(s->mu);
+    Stmt q(s->db, "SELECT COUNT(*) FROM worlds WHERE dir_dev=? AND dir_ino=? AND state<=2 AND id<>?");
+    if (!q.ok()) return false;
+    q.i64(1, (int64_t)st.st_dev);
+    q.i64(2, (int64_t)st.st_ino);
+    q.i64(3, (int64_t)id);
+    return q.row() && q.col_i64(0) == 0;
 }
 
 String gc_lock_path(wfs_store *s) {
@@ -2010,34 +2114,29 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
     }
 
     // ---- the cheap half, always run in full ------------------------------------------------
-    Vec<String> parents;
-    {
-        Guard g(s->mu);
-        Stmt q(s->db, "SELECT path FROM worlds WHERE state<=2");
-        if (!q.ok()) return -EIO;
-        while (q.row()) {
-            String p;
-            dirname_of(q.col_text(0), p);
-            add_unique(parents, p.c_str());
-        }
-    }
-    // Worlds whose fork never finished: drop the row and the half-built tree (P8).
+    //
+    // Worlds whose fork never finished (P8). The tree, if there is one, is at the exact path the
+    // row recorded before it started cloning -- nowhere else, and certainly not "whatever in the
+    // user's directory happens to end in .wfs-tmp". A row whose tmp_path is empty (a pool-backed
+    // fork: its tree is a store-internal pool entry, collected by pool_collect below) or whose
+    // tmp_path is no longer there is just marked DEAD.
     {
         Vec<wfs_id> creating;
         Vec<String> cpaths;
         {
             Guard g(s->mu);
-            Stmt q(s->db, "SELECT id, path FROM worlds WHERE state=0");
+            Stmt q(s->db, "SELECT id, tmp_path FROM worlds WHERE state=0");
             if (!q.ok()) return -EIO;
             while (q.row()) { creating.emplace_back((wfs_id)q.col_i64(0)); cpaths.emplace_back(q.col_text(1)); }
         }
         for (size_t i = 0; i < creating.size(); ++i) {
-            remove_tmp(cpaths[i].c_str());
-            rep.tmp_removed++;
+            if (gc_tmp_is_removable(s, creating[i], cpaths[i].c_str()) &&
+                wfs::fs_remove_tree(cpaths[i].c_str()) == 0)
+                rep.tmp_removed++;
             Guard g(s->mu);
             Txn t(s->db);
-            Stmt d(s->db, "DELETE FROM worlds WHERE id=? AND state=0");
-            if (d.ok()) { d.i64(1, (int64_t)creating[i]); d.step(); }
+            Stmt d(s->db, "UPDATE worlds SET state=?, tmp_path='' WHERE id=? AND state=0");
+            if (d.ok()) { d.i64(1, WFS_ST_DEAD); d.i64(2, (int64_t)creating[i]); d.step(); }
             t.commit();
         }
     }
@@ -2064,8 +2163,9 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
             t.commit();
         }
     }
-    for (size_t i = 0; i < parents.size(); ++i) rm_tmp_in_dir(parents[i].c_str(), &rep.tmp_removed);
-    rm_tmp_in_dir(snaps.c_str(), &rep.tmp_removed);
+    // <store>/snapshots only: a name under the store is one we made. The parent directories of
+    // the worlds are the user's and are never swept (see rm_tmp_in_store_dir).
+    rm_tmp_in_store_dir(s, snaps.c_str(), &rep.tmp_removed);
 
     // ---- T2.2: reconciliation ----------------------------------------------------------------
     //

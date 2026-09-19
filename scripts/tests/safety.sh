@@ -173,14 +173,46 @@ fi
 if "$WORLD" fs list | grep -q "^W2"; then bad P4 "gc past the retention window deletes it"
 else ok P4 "gc past the retention window deletes it"; fi
 
-# ---- P8: a half-built tree is collected --------------------------------------------------------
-mkdir -p "$SCRATCH/interrupted.wfs-tmp/sub"
-touch "$SCRATCH/interrupted.wfs-tmp/sub/half"
+# ---- P8 + PR #1 review (3rd round): `.wfs-tmp` in a user's directory is the user's ------------
+# The fork used to build its clone at `<target>.wfs-tmp` and remove whatever was there first, and
+# gc used to sweep every `*.wfs-tmp` out of the parent directory of every world. Both of those
+# directories belong to the user. Here `wtmp.wfs-tmp` is a file that is exactly the old temporary
+# name of the fork below, and `notes.wfs-tmp` is an ordinary directory in the same place.
+mkdir -p "$SCRATCH/pr3"
+echo "mine, not a temporary" > "$SCRATCH/pr3/wtmp.wfs-tmp"
+mkdir -p "$SCRATCH/pr3/notes.wfs-tmp/sub"
+echo keep > "$SCRATCH/pr3/notes.wfs-tmp/sub/keep"
+"$WORLD" fs fork --from S1 --to "$SCRATCH/pr3/wtmp" > /dev/null 2>&1
+if [ -e "$SCRATCH/pr3/wtmp/hello.txt" ] &&
+   [ "$(cat "$SCRATCH/pr3/wtmp.wfs-tmp" 2>/dev/null)" = "mine, not a temporary" ] &&
+   [ "$(cat "$SCRATCH/pr3/notes.wfs-tmp/sub/keep" 2>/dev/null)" = keep ]; then
+    ok PR3 "fork --to X leaves the user's own X.wfs-tmp alone"
+else
+    bad PR3 "fork --to X leaves the user's own X.wfs-tmp alone"
+fi
+# The fork's own temporary is drawn, not derived, and it is gone by the time the fork returns.
+if [ -z "$(find "$SCRATCH/pr3" -maxdepth 1 -name '.wfs-fork-*' -print -quit)" ]; then
+    ok PR3 "the fork leaves no temporary of its own behind"
+else
+    bad PR3 "the fork leaves no temporary of its own behind"
+fi
 "$WORLD" fs gc > /dev/null
-if [ -e "$SCRATCH/interrupted.wfs-tmp" ]; then bad P8 "gc removes a stray *.wfs-tmp tree"
-else ok P8 "gc removes a stray *.wfs-tmp tree"; fi
+if [ "$(cat "$SCRATCH/pr3/wtmp.wfs-tmp" 2>/dev/null)" = "mine, not a temporary" ] &&
+   [ "$(cat "$SCRATCH/pr3/notes.wfs-tmp/sub/keep" 2>/dev/null)" = keep ]; then
+    ok PR3 "gc does not sweep *.wfs-tmp out of a user's directory"
+else
+    bad PR3 "gc does not sweep *.wfs-tmp out of a user's directory"
+fi
 [ -e "$SCRATCH/w1-moved/hello.txt" ] && ok P8 "gc left the live world alone" \
                                      || bad P8 "gc left the live world alone"
+# A stray `*.wfs-tmp` directory is no longer something gc acts on at all: what it collects is the
+# path a CREATING row recorded (core_test drives that crash through the test seam).
+mkdir -p "$SCRATCH/pr3/interrupted.wfs-tmp/sub"
+touch "$SCRATCH/pr3/interrupted.wfs-tmp/sub/half"
+"$WORLD" fs gc > /dev/null
+[ -e "$SCRATCH/pr3/interrupted.wfs-tmp/sub/half" ] \
+    && ok PR3 "gc does not guess that a *.wfs-tmp tree is ours" \
+    || bad PR3 "gc does not guess that a *.wfs-tmp tree is ours"
 
 # ---- P12: two commands at once do not corrupt the store -----------------------------------------
 "$WORLD" fs fork --from S1 --to "$SCRATCH/par-a" > "$SCRATCH/pa.log" 2>&1 &

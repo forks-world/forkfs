@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/syscall.h>
 #include <sys/sysctl.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -102,6 +103,24 @@ int fs_symlink(const char *target, const char *path) { return ::symlink(target, 
 int fs_link(const char *existing, const char *path) { return ::link(existing, path) ? -errno : 0; }
 int fs_unlink(const char *path, bool is_dir) { return (is_dir ? ::rmdir(path) : ::unlink(path)) ? -errno : 0; }
 int fs_rename(const char *from, const char *to) { return ::rename(from, to) ? -errno : 0; }
+
+// The publish rename (P8), for the one case where `to` is a path the user chose. rename(2) is
+// happy to replace an existing empty directory, so the plain call would turn "there is already
+// something at --to" into a silent deletion the moment anything creates that directory between
+// P7's check and here. RENAME_EXCL makes the kernel do the check at the instant of the rename:
+// EEXIST, never a replacement.
+int fs_rename_excl(const char *from, const char *to) {
+#ifdef __APPLE__
+    return ::renameatx_np(AT_FDCWD, from, AT_FDCWD, to, RENAME_EXCL) ? -errno : 0;
+#elif defined(RENAME_NOREPLACE) && defined(SYS_renameat2)
+    return ::syscall(SYS_renameat2, AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE) ? -errno : 0;
+#else
+    // Last resort: a window remains, but a target that is there *now* is still never replaced.
+    struct stat st;
+    if (::lstat(to, &st) == 0) return -EEXIST;
+    return ::rename(from, to) ? -errno : 0;
+#endif
+}
 
 int fs_setattr(const char *path, const wfs_setattr_req &r) {
     if (r.valid & WFS_SET_SIZE) { if (::truncate(path, (off_t)r.size) != 0) return -errno; }

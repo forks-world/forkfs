@@ -51,7 +51,8 @@ void pool_return(wfs_store *s, const PoolClaim &c);
 int pool_ready_for(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, uint64_t *out);
 
 // gc: entries of snapshots that are gone or no longer the same snapshot, rows left in the
-// CREATING state, stray *.wfs-tmp trees and directories under <store>/pool that no row claims.
+// CREATING state, the *.wfs-tmp trees those rows name, and directories under <store>/pool that no
+// row claims. Every one of those paths is inside the store.
 int pool_collect(wfs_store *s, uint64_t *removed);
 
 // verify S<n>: every pool entry must still be there and must not have been written to since it

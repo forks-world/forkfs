@@ -1087,10 +1087,10 @@ static int cmd_gc(wfs_store *s, int argc, char **argv) {
     wfs_gc_report rep;
     int rc = wfs_gc_ex(s, &o, &rep);
     if (rc) return fail("gc", rc);
-    printf("gc: %llu worlds deleted, %llu snapshots deleted, %llu stray %s trees, %llu orphan trash dirs,"
+    printf("gc: %llu worlds deleted, %llu snapshots deleted, %llu half-built trees, %llu orphan trash dirs,"
            " %llu pool entries\n",
            (unsigned long long)rep.worlds_deleted, (unsigned long long)rep.snapshots_deleted,
-           (unsigned long long)rep.tmp_removed, WFS_TMP_SUFFIX, (unsigned long long)rep.trash_orphans,
+           (unsigned long long)rep.tmp_removed, (unsigned long long)rep.trash_orphans,
            (unsigned long long)rep.pool_removed);
     if (rep.snapshots_dangling || rep.worlds_dangling) {
         if (reconcile)

@@ -45,7 +45,10 @@ extern "C" {
 #define WFS_GATE_CLOSED 0000
 /* Mode of the same root while a clone of it is in flight (fork / checkpoint / verify). */
 #define WFS_GATE_OPEN 0500
-/* Suffix of a half-built tree; removed by wfs_gc (P8). */
+/* Suffix of a half-built tree INSIDE THE STORE -- <store>/snapshots/S<n>.wfs-tmp and the pool's
+ * <uuid>.wfs-tmp -- where every name is one we made and wfs_gc may sweep by suffix (P8). It is
+ * never a name in a directory of the user's: `~/w/a.wfs-tmp` is somebody's own file, not our
+ * scratch space. A fork's temporary is drawn instead, and recorded (see wfs_world_create). */
 #define WFS_TMP_SUFFIX ".wfs-tmp"
 /* T2.1: a trash entry the collector has started to unlink. The rename to this name is the FIRST
  * thing the deleter does, so a worker that is killed half-way through leaves a tree that is
@@ -279,13 +282,17 @@ typedef struct wfs_fork_result {
                            * was filled, so the hand-out stays O(1). */
 } wfs_fork_result;
 
-/* Fork: clone `from` (a snapshot or a live world) into target_path. Publish order (P8):
- * clone into <target>.wfs-tmp, unprotect, write the marker, rename, then commit the row.
+/* Fork: clone `from` (a snapshot or a live world) into target_path. Publish order (P8): clone
+ * into a temporary directory in the target's parent, unprotect, write the marker, rename, then
+ * commit the row. The temporary is `.wfs-fork-<pid>-<counter>-<16 hex>`, drawn until one is free
+ * and recorded on the CREATING row before the clone starts -- the parent directory belongs to
+ * the user, so nothing there is assumed to be ours and nothing pre-existing is ever removed.
+ * The publish rename is exclusive: something already at the target is EEXIST, never replaced.
  *
  * T1.5: when `from` is a snapshot and the pool holds a ready entry for it, that entry is the
  * clone -- already made, already given the source root's mode -- and the fork is reduced to
  * "write the marker, rename it into place, commit the row", which is O(1) and milliseconds.
- * The publish order is the same one, with the pool entry playing the part of <target>.wfs-tmp. */
+ * The publish order is the same one, with the pool entry playing the part of the temporary. */
 int wfs_world_create(wfs_store *s, wfs_ref from, const char *target_path, const wfs_fork_opts *opts,
                      wfs_id *out);
 /* The same, and says whether the pool served it. `res` may be NULL. */
@@ -544,7 +551,8 @@ int wfs_path_check(wfs_store *s, const char *path, int for_target);
 typedef struct wfs_gc_report {
     uint64_t worlds_deleted;    /* trashed past the retention period */
     uint64_t snapshots_deleted; /* half-built snapshots, plus T2.2 trashed ones past retention */
-    uint64_t tmp_removed;       /* stray *.wfs-tmp trees (P8) */
+    uint64_t tmp_removed;       /* half-built trees (P8): the path a CREATING row recorded, plus
+                                 * *.wfs-tmp under <store>/snapshots and stale <store>/tmp files */
     uint64_t trash_orphans;     /* trash directories with no row */
     uint64_t pool_removed;      /* T1.5: pool entries of dead snapshots, half-built or orphaned */
     uint64_t entries_freed;     /* T2.1: directory entries actually unlinked */
@@ -668,12 +676,18 @@ int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int force);
 
 /* ---- test seam --------------------------------------------------------------------------------
  *
- * core_test drives one interleaving that cannot be produced from outside the library: the middle
- * of a pool-backed fork, after the claim transaction has committed the fork's CREATING world row
- * and before the marker/rename/ACTIVE tail. Both are NULL unless a test sets them and nothing in
- * the library ever assigns them. */
+ * core_test drives two interleavings that cannot be produced from outside the library. The first
+ * is the middle of a pool-backed fork, after the claim transaction has committed the fork's
+ * CREATING world row and before the marker/rename/ACTIVE tail. The second is a fork dying in the
+ * window the temp path exists for: the clone is built and recorded on the CREATING row, the
+ * publish rename has not happened. A non-zero return from wfs_test_before_fork_publish is
+ * returned straight out of wfs_world_create() with nothing unwound -- row and tree stay, exactly
+ * as a killed process leaves them. All four are NULL unless a test sets them and nothing in the
+ * library ever assigns them. */
 extern void (*wfs_test_after_pool_claim)(void *ctx, wfs_id world);
 extern void *wfs_test_after_pool_claim_ctx;
+extern int (*wfs_test_before_fork_publish)(void *ctx, wfs_id world, const char *tmp_path);
+extern void *wfs_test_before_fork_publish_ctx;
 
 #ifdef __cplusplus
 }
