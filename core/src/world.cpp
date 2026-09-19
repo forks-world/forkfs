@@ -7,6 +7,7 @@
 //   * identity is marker + inode (P1/P2), never the path. Any command that touches a world
 //     re-checks it and repairs the row when the directory has merely moved.
 #include "db.h"
+#include "pool.h"
 #include "snapshot_access.h"
 
 #include <dirent.h>
@@ -50,6 +51,12 @@ String numbered(const char *dir, char prefix, uint64_t id, const char *suffix) {
 bool exists(const char *p) {
     struct stat st;
     return ::lstat(p, &st) == 0;
+}
+
+int64_t now_us() {
+    struct timespec ts;
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + (int64_t)ts.tv_nsec / 1000;
 }
 
 bool is_dir(const char *p) {
@@ -381,12 +388,16 @@ int check_path(wfs_store *s, const char *in, PathMode mode, String &real, bool *
     if (is_world_root) *is_world_root = false;
     if (!in || !*in) return -EINVAL;
     int rc = (mode == PATH_TARGET) ? wfs::fs_realpath_parent(in, real) : wfs::fs_realpath(in, real);
-    if (rc == -EACCES) {
+    if (rc) {
+        // The path cannot be resolved: it is behind a closed gate (EACCES) or its parent does
+        // not exist (ENOENT, e.g. <store>/pool/S1/mine when that snapshot has no pool yet).
+        // Resolve as much of it as we can: if that lands inside the store, P7 owns the answer
+        // and the caller gets a reason instead of an errno.
         String approx;
         if (resolve_readable_prefix(in, approx) && under_dir(approx.c_str(), s->dir.c_str()))
-            return WFS_E_PATH_REFUSED;   // P7: inside the store, behind a closed gate
+            return WFS_E_PATH_REFUSED;
+        return rc;
     }
-    if (rc) return rc;
     if (mode == PATH_TARGET) {
         if (exists(real.c_str())) return -EEXIST;
         String parent;
@@ -585,14 +596,29 @@ extern "C" int wfs_snapshot_list(wfs_store *s, wfs_snapshot_rec *buf, size_t cap
 
 extern "C" int wfs_world_create(wfs_store *s, wfs_ref from, const char *target_path,
                                 const wfs_fork_opts *opts, wfs_id *out) {
-    if (!s || !target_path || !out || from.id == 0) return -EINVAL;
-    *out = 0;
+    if (!out) return -EINVAL;
+    wfs_fork_result res;
+    memset(&res, 0, sizeof res);
+    int rc = wfs_world_create_ex(s, from, target_path, opts, &res);
+    *out = res.world;
+    return rc;
+}
+
+extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *target_path,
+                                   const wfs_fork_opts *opts, wfs_fork_result *res) {
+    wfs_fork_result local;
+    memset(&local, 0, sizeof local);
+    if (!res) res = &local;
+    memset(res, 0, sizeof *res);
+    int64_t t_begin = now_us();
+    if (!s || !target_path || from.id == 0) return -EINVAL;
     wfs_fork_opts o;
     memset(&o, 0, sizeof o);
     if (opts) o = *opts;
 
     String src;
     uint64_t entries = 0;
+    int64_t snap_created_at = 0;
     wfs_id snapshot_id = 0, parent_world = 0;
     char inherited[WFS_NAME_MAX] = {0};
     bool src_hard = false;    // source is a --hard snapshot: the clone needs an unprotect walk
@@ -610,6 +636,7 @@ extern "C" int wfs_world_create(wfs_store *s, wfs_ref from, const char *target_p
         src.assign(r.path);
         entries = r.entries;
         snapshot_id = r.id;
+        snap_created_at = r.created_at;
         copy_str(inherited, sizeof inherited, r.name);
         src_hard = r.hard != 0;
         src_gated = !src_hard;
@@ -644,6 +671,83 @@ extern "C" int wfs_world_create(wfs_store *s, wfs_ref from, const char *target_p
     String parent_dir;
     dirname_of(target.c_str(), parent_dir);
 
+    char nm[WFS_NAME_MAX];
+    copy_str(nm, sizeof nm, (o.name && *o.name) ? o.name
+                            : (*inherited ? inherited : basename_of(target.c_str())));
+
+    // ---- T1.5: the pool ------------------------------------------------------------------
+    // A ready entry for this snapshot IS the clone, made earlier and already wearing the source
+    // root's mode. What is left of the fork is the publish order's tail: marker, rename, row.
+    // The clone probe (P6) and the space check (P11) are skipped on this path on purpose --
+    // the tree already exists, on the store's volume, and the rename either works or tells us
+    // it does not (EXDEV), in which case the entry goes back and the ordinary path runs.
+    if (from.kind == WFS_K_SNAPSHOT && !o.no_pool) {
+        wfs::PoolClaim claim;
+        if (wfs::pool_claim(s, snapshot_id, snap_created_at, claim) == 0) {
+            int64_t created = now_sec();
+            uint64_t ev = wfs::fs_events_current_id();
+            wfs_id id = 0;
+            int rc = 0;
+            {
+                Guard g(s->mu);
+                Txn t(s->db);
+                Stmt ins(s->db,
+                         "INSERT INTO worlds(kind, parent_world, snapshot_id, name, path, state,"
+                         " fsevents_id, entries, created_at) VALUES(?,?,?,?,?,?,?,?,?)");
+                if (!ins.ok()) rc = -EIO;
+                else {
+                    ins.i64(1, WFS_O_SNAPSHOT);
+                    ins.i64(2, 0);
+                    ins.i64(3, (int64_t)snapshot_id);
+                    ins.text(4, nm);
+                    ins.text(5, target.c_str());
+                    ins.i64(6, WFS_ST_CREATING);
+                    ins.i64(7, (int64_t)ev);
+                    ins.i64(8, (int64_t)claim.entries);
+                    ins.i64(9, created);
+                    if (ins.step() != SQLITE_DONE) rc = -EIO;
+                    else { id = (wfs_id)sqlite3_last_insert_rowid(s->db); t.commit(); }
+                }
+            }
+            if (!rc)
+                rc = marker_write(claim.path.c_str(), s->store_id.c_str(), id, nm, snapshot_id, 0, created);
+            if (!rc) rc = wfs::fs_rename(claim.path.c_str(), target.c_str());
+            struct stat st;
+            if (!rc && ::stat(target.c_str(), &st) != 0) rc = -errno;
+            if (!rc) {
+                Guard g(s->mu);
+                Txn t(s->db);
+                Stmt u(s->db, "UPDATE worlds SET dir_dev=?, dir_ino=?, state=? WHERE id=?");
+                if (!u.ok()) rc = -EIO;
+                else {
+                    u.i64(1, (int64_t)st.st_dev);
+                    u.i64(2, (int64_t)st.st_ino);
+                    u.i64(3, WFS_ST_ACTIVE);
+                    u.i64(4, (int64_t)id);
+                    if (u.step() != SQLITE_DONE) rc = -EIO;
+                    else t.commit();
+                }
+            }
+            if (rc == 0) {
+                uint64_t left = 0;
+                wfs::pool_ready_for(s, snapshot_id, snap_created_at, &left);
+                res->world = id;
+                res->from_pool = 1;
+                res->pool_left = left;
+                res->elapsed_us = now_us() - t_begin;
+                return 0;
+            }
+            if (id) {
+                Guard g(s->mu);
+                Txn t(s->db);
+                Stmt del(s->db, "DELETE FROM worlds WHERE id=?");
+                if (del.ok()) { del.i64(1, (int64_t)id); del.step(); }
+                t.commit();
+            }
+            wfs::pool_return(s, claim);   // and fall through to cloning it here and now
+        }
+    }
+
     // P6 between the source volume and the target volume, which need not be the store's.
     // The probe reads a file out of the source, so a gated snapshot has to be opened for it.
     if (!o.allow_fallback) {
@@ -657,10 +761,6 @@ extern "C" int wfs_world_create(wfs_store *s, wfs_ref from, const char *target_p
     if (!o.skip_space_check) {
         if (int rc = space_check(parent_dir.c_str(), entries)) return rc;
     }
-
-    char nm[WFS_NAME_MAX];
-    copy_str(nm, sizeof nm, (o.name && *o.name) ? o.name
-                            : (*inherited ? inherited : basename_of(target.c_str())));
 
     int64_t created = now_sec();
     uint64_t ev = wfs::fs_events_current_id();
@@ -743,7 +843,8 @@ extern "C" int wfs_world_create(wfs_store *s, wfs_ref from, const char *target_p
         if (u.step() != SQLITE_DONE) return -EIO;
         t.commit();
     }
-    *out = id;
+    res->world = id;
+    res->elapsed_us = now_us() - t_begin;
     return 0;
 }
 
@@ -1192,7 +1293,13 @@ extern "C" int wfs_snapshot_verify(wfs_store *s, wfs_id id, wfs_verify_report *o
     CountCtx cc = {0};
     if (int rc = wfs::fs_walk_tree(r.path, 4, wfs::FS_DIRS_PRE, &cc, count_cb)) return rc;
     if (cc.n > out->checked) out->extra = cc.n - out->checked;
-    if (out->missing || out->modified || out->unprotected || out->extra) return WFS_E_SNAPSHOT_DIRTY;
+    // T1.5: the snapshot's untaken clones. One lstat each -- a full walk per pool entry would
+    // cost as much as the fill did, and the entry is nobody's world yet, so the cheap check
+    // ("still there, and not written to since it was cloned") is the right one.
+    wfs::pool_verify(s, id, &out->pool_checked, &out->pool_dirty, out->first_bad,
+                     sizeof out->first_bad);
+    if (out->missing || out->modified || out->unprotected || out->extra || out->pool_dirty)
+        return WFS_E_SNAPSHOT_DIRTY;
     return 0;
 }
 
@@ -1315,6 +1422,12 @@ extern "C" int wfs_gc(wfs_store *s, int64_t retention_secs, wfs_gc_report *out) 
     }
     for (size_t i = 0; i < parents.size(); ++i) rm_tmp_in_dir(parents[i].c_str(), &rep.tmp_removed);
     rm_tmp_in_dir(snaps.c_str(), &rep.tmp_removed);
+
+    // T1.5: pool entries whose snapshot is gone or is a different snapshot now, rows whose
+    // filler was killed mid-clone, and trees under <store>/pool that no row claims. Done after
+    // the snapshot sweep above so that a snapshot deleted in this same run takes its pool with
+    // it.
+    wfs::pool_collect(s, &rep.pool_removed);
 
     // <store>/tmp holds the seatbelt profiles `world exec` generates. They are removed when the
     // command ends; one that survives an hour belongs to a process that was killed.

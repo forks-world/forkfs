@@ -60,6 +60,26 @@ static void rm_rf(const char *path) {
     }
 }
 
+// Lists the entries of a pool directory: names and inodes, so a hand-out can be checked to be
+// the very tree that was waiting there (T1.5).
+static size_t list_dir(const char *dir, char names[][256], uint64_t *inos, size_t cap) {
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    size_t n = 0;
+    while (struct dirent *e = readdir(d)) {
+        if (e->d_name[0] == '.') continue;
+        if (n >= cap) break;
+        snprintf(names[n], 256, "%s", e->d_name);
+        char full[4096];
+        join(full, sizeof full, dir, e->d_name);
+        struct stat st;
+        inos[n] = (stat(full, &st) == 0) ? (uint64_t)st.st_ino : 0;
+        ++n;
+    }
+    closedir(d);
+    return n;
+}
+
 // A copy in the sense of `cp -R`: same bytes, same marker, different inode (P2).
 static void copy_dir(const char *src, const char *dst) {
     CHECK(mkdir(dst, 0755) == 0);
@@ -448,6 +468,143 @@ int main() {
     CHECK(ss.volume_total_bytes > 0 && ss.volume_free_bytes > 0);
     CHECK(ss.metadata_estimate_bytes > 0);
     CHECK(!strcmp(ss.dir, store));
+
+    // ---- T1.5: the pre-clone pool ----
+    // An entry is a finished clone of the snapshot with no marker and no world row. Filling is
+    // a top-up to a target, handing one out is a rename, and everything that can go wrong with
+    // it (a stale snapshot identity, a touched entry, a killed filler) is caught here.
+    wfs_snapshot_rec s1rec;
+    CHECK_OK(wfs_snapshot_info(s, s1, &s1rec));
+    uint64_t made = 0, ready = 0, removed = 0;
+    CHECK_OK(wfs_pool_fill(s, s1, 2, &made));
+    CHECK(made == 2);
+    CHECK_OK(wfs_pool_ready(s, s1, &ready));
+    CHECK(ready == 2);
+    // `fill` is a top-up, not an addition: asking for 2 again makes nothing.
+    CHECK_OK(wfs_pool_fill(s, s1, 2, &made));
+    CHECK(made == 0);
+    CHECK_OK(wfs_pool_ready(s, s1, &ready));
+    CHECK(ready == 2);
+
+    wfs_pool_stat ps[4];
+    size_t pn = 0;
+    CHECK_OK(wfs_pool_status(s, ps, 4, &pn));
+    CHECK(pn == 1);
+    CHECK(ps[0].snapshot == s1 && ps[0].ready == 2 && ps[0].building == 0 && ps[0].stale == 0);
+    CHECK(ps[0].entries == s1rec.entries && !strcmp(ps[0].snapshot_name, s1rec.name));
+
+    // P7: the entries live in the store, so they are neither a legal source nor a legal target.
+    char pooldir[4096], poolpath[4096];
+    snprintf(pooldir, sizeof pooldir, "%s/pool/S%llu", store, (unsigned long long)s1);
+    CHECK_RC(wfs_path_check(s, pooldir, 0), WFS_E_PATH_REFUSED);
+    snprintf(poolpath, sizeof poolpath, "%s/taken", pooldir);
+    CHECK_RC(wfs_path_check(s, poolpath, 1), WFS_E_PATH_REFUSED);
+
+    char pnames[8][256];
+    uint64_t pinos[8];
+    CHECK(list_dir(pooldir, pnames, pinos, 8) == 2);
+
+    // The hit: the world IS one of those trees, renamed. Same inode, one entry fewer, and a
+    // marker where there was none.
+    char wpool[4096];
+    join(wpool, sizeof wpool, worlds, "w-pool");
+    memset(&opts, 0, sizeof opts);
+    opts.name = "w-pool";
+    wfs_fork_result fr;
+    memset(&fr, 0, sizeof fr);
+    wfs_ref from_s1 = {WFS_K_SNAPSHOT, s1};
+    CHECK_OK(wfs_world_create_ex(s, from_s1, wpool, &opts, &fr));
+    CHECK(fr.from_pool == 1 && fr.world != 0 && fr.pool_left == 1);
+    CHECK(stat(wpool, &st) == 0);
+    CHECK((uint64_t)st.st_ino == pinos[0] || (uint64_t)st.st_ino == pinos[1]);
+    char gone[4096];
+    join(gone, sizeof gone, pooldir, ((uint64_t)st.st_ino == pinos[0]) ? pnames[0] : pnames[1]);
+    CHECK(!exists(gone));
+    join(p, sizeof p, wpool, "hello.txt");
+    CHECK_OK(read_file(p, buf, sizeof buf));
+    CHECK(!strcmp(buf, "hello\n"));
+    join(p, sizeof p, wpool, ".world");
+    CHECK(exists(p));
+    CHECK_OK(wfs_world_verify_identity(s, wpool, &id));
+    CHECK(id.registered && id.world_id == fr.world);
+    CHECK_OK(wfs_world_info(s, fr.world, &wr));
+    CHECK(wr.origin == WFS_O_SNAPSHOT && wr.snapshot_id == s1 && wr.state == WFS_ST_ACTIVE);
+    CHECK(wr.entries == s1rec.entries && wr.dir_ino == (uint64_t)st.st_ino);
+    CHECK_OK(wfs_pool_ready(s, s1, &ready));
+    CHECK(ready == 1);
+
+    // --no-pool clones here and now even with a warm pool.
+    char wnop[4096];
+    join(wnop, sizeof wnop, worlds, "w-nopool");
+    memset(&opts, 0, sizeof opts);
+    opts.name = "w-nopool";
+    opts.no_pool = 1;
+    memset(&fr, 0, sizeof fr);
+    CHECK_OK(wfs_world_create_ex(s, from_s1, wnop, &opts, &fr));
+    CHECK(fr.from_pool == 0);
+    CHECK_OK(wfs_pool_ready(s, s1, &ready));
+    CHECK(ready == 1);
+
+    // The miss path: an empty pool is not an error, it is a clonefile.
+    CHECK_OK(wfs_pool_drain(s, s1, &removed));
+    CHECK(removed == 1);
+    CHECK_OK(wfs_pool_ready(s, s1, &ready));
+    CHECK(ready == 0);
+    char wmiss[4096];
+    join(wmiss, sizeof wmiss, worlds, "w-miss");
+    memset(&opts, 0, sizeof opts);
+    opts.name = "w-miss";
+    memset(&fr, 0, sizeof fr);
+    CHECK_OK(wfs_world_create_ex(s, from_s1, wmiss, &opts, &fr));
+    CHECK(fr.from_pool == 0 && fr.world != 0);
+    join(p, sizeof p, wmiss, "hello.txt");
+    CHECK_OK(read_file(p, buf, sizeof buf));
+    CHECK(!strcmp(buf, "hello\n"));
+
+    // verify S<n> also looks at what is waiting: an entry somebody wrote to is a finding.
+    CHECK_OK(wfs_pool_fill(s, s1, 1, &made));
+    CHECK(made == 1);
+    CHECK_OK(wfs_snapshot_verify(s, s1, &vr));
+    CHECK(vr.pool_checked == 1 && vr.pool_dirty == 0);
+    CHECK(list_dir(pooldir, pnames, pinos, 8) == 1);
+    join(p, sizeof p, pooldir, pnames[0]);
+    join(q, sizeof q, p, "smuggled.txt");
+    write_file(q, "x");
+    CHECK_RC(wfs_snapshot_verify(s, s1, &vr), WFS_E_SNAPSHOT_DIRTY);
+    CHECK(vr.pool_dirty == 1 && strstr(vr.first_bad, pnames[0]) != NULL);
+    CHECK_OK(wfs_pool_drain(s, s1, &removed));
+    CHECK(removed == 1);
+    CHECK_OK(wfs_snapshot_verify(s, s1, &vr));
+    CHECK(vr.pool_dirty == 0);
+
+    // gc: a filler that was killed leaves a *.wfs-tmp tree, and a fork that died between the
+    // claim and the rename leaves a directory no row points at. Both go; what is ready stays.
+    CHECK_OK(wfs_pool_fill(s, s1, 1, &made));
+    CHECK(list_dir(pooldir, pnames, pinos, 8) == 1);
+    char half[4096], orphan[4096];
+    snprintf(half, sizeof half, "%s/deadbeef%s", pooldir, WFS_TMP_SUFFIX);
+    CHECK(mkdir(half, 0755) == 0);
+    join(p, sizeof p, half, "partial");
+    write_file(p, "x");
+    snprintf(orphan, sizeof orphan, "%s/0123456789abcdef", pooldir);
+    CHECK(mkdir(orphan, 0755) == 0);
+    memset(&gc, 0, sizeof gc);
+    CHECK_OK(wfs_gc(s, 0, &gc));
+    CHECK(gc.pool_removed >= 2);
+    CHECK(!exists(half) && !exists(orphan));
+    CHECK_OK(wfs_pool_ready(s, s1, &ready));
+    CHECK(ready == 1);
+    CHECK(list_dir(pooldir, pnames, pinos, 8) == 1);
+
+    // An entry whose snapshot is no longer the snapshot it was cloned from is never handed out.
+    // (Snapshot rows are immutable, so this is only reachable by a store surviving an id reuse;
+    // the pool keys on created_at to make it impossible.)
+    CHECK_OK(wfs_pool_status(s, ps, 4, &pn));
+    CHECK(pn == 1 && ps[0].ready == 1 && ps[0].stale == 0);
+    CHECK_OK(wfs_pool_drain(s, 0, &removed));
+    CHECK(removed == 1);
+    CHECK_OK(wfs_pool_status(s, ps, 4, &pn));
+    CHECK(pn == 0);
 
     // ---- P13: a store from another schema is refused before anything is read ----
     char other[4096], ver[4096];

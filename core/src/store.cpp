@@ -48,7 +48,25 @@ const char *kSchema =
     "  created_at INTEGER NOT NULL,"
     "  trashed_at INTEGER NOT NULL DEFAULT 0);"
     "CREATE INDEX IF NOT EXISTS worlds_ino ON worlds(dir_ino);"
-    "CREATE INDEX IF NOT EXISTS worlds_path ON worlds(path);";
+    "CREATE INDEX IF NOT EXISTS worlds_path ON worlds(path);"
+    // T1.5, the pre-clone pool. A row is a finished clone of `snapshot_id` with no marker and
+    // no world: <store>/pool/S<n>/<uuid>. `snap_created_at` is the snapshot's created_at as it
+    // was when the entry was cloned -- snapshot rows are immutable, so a mismatch means the id
+    // now belongs to a different snapshot and the entry must never be handed out.
+    "CREATE TABLE IF NOT EXISTS pool("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  snapshot_id INTEGER NOT NULL,"
+    "  snap_created_at INTEGER NOT NULL,"
+    "  uuid TEXT NOT NULL DEFAULT '',"
+    "  path TEXT NOT NULL DEFAULT '',"
+    "  entries INTEGER NOT NULL DEFAULT 0,"
+    "  root_mode INTEGER NOT NULL DEFAULT 0,"
+    "  root_mtime INTEGER NOT NULL DEFAULT 0,"   /* nanoseconds */
+    "  dir_dev INTEGER NOT NULL DEFAULT 0,"
+    "  dir_ino INTEGER NOT NULL DEFAULT 0,"
+    "  created_at INTEGER NOT NULL,"
+    "  state INTEGER NOT NULL DEFAULT 0);"   /* 0 = being cloned, 1 = ready */
+    "CREATE INDEX IF NOT EXISTS pool_snap ON pool(snapshot_id, state);";
 
 // Columns added after the first schema-2 stores were written. They are additive and carry
 // defaults, so an older core reading such a store still works and VERSION does not change
@@ -135,6 +153,7 @@ extern "C" const char *wfs_strerror(int rc) {
     case WFS_E_FOREIGN_STORE: return "marker belongs to a different store";
     case WFS_E_WORLD_MISSING: return "world is not at its recorded path";
     case WFS_E_SOURCE_GONE: return "the snapshot this world was forked from is gone";
+    case WFS_E_POOL_BUSY: return "another pool fill is running";
     default: return ::strerror(rc < 0 ? -rc : rc);
     }
 }
@@ -164,7 +183,7 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
 
     wfs_store *s = new wfs_store();
     s->dir.assign(real.c_str());
-    for (const char *sub : {"/snapshots", "/trash", "/locks", "/tmp"}) {
+    for (const char *sub : {"/snapshots", "/trash", "/locks", "/tmp", "/pool", "/logs"}) {
         String p(s->dir);
         p.append(sub);
         if (int rc = wfs::fs_mkdir_p(p.c_str())) { wfs_store_close(s); return rc; }
@@ -227,12 +246,20 @@ extern "C" int wfs_store_status(wfs_store *s, wfs_store_stat *out) {
             }
         }
     }
+    {
+        Stmt q(s->db, "SELECT COUNT(*), COALESCE(SUM(entries),0) FROM pool WHERE state=1");
+        if (q.ok() && q.row()) {
+            out->pool_ready = (uint64_t)q.col_i64(0);
+            out->pool_entries = (uint64_t)q.col_i64(1);
+        }
+    }
     uint64_t avail = 0, total = 0;
     if (int rc = wfs::fs_free_space(s->dir.c_str(), &avail, &total)) return rc;
     out->volume_free_bytes = avail;
     out->volume_total_bytes = total;
     // 308 B/entry, measured on 27.0 for a 50k-file clone (CLONE_MODEL_MACOS27 §4).
-    out->metadata_estimate_bytes = (out->snapshot_entries + out->world_entries) * 308;
+    out->metadata_estimate_bytes =
+        (out->snapshot_entries + out->world_entries + out->pool_entries) * 308;
     return 0;
 }
 

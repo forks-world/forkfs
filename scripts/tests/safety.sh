@@ -307,6 +307,82 @@ else
     mv "$SCRATCH/s1-away" "${SP%/root}"
 fi
 
+# ---- T1.5: the pre-clone pool ------------------------------------------------------------------
+# An entry is a finished clone of S1 waiting under the store with no marker and no world row.
+# A fork that finds one renames it into place; one that does not, clones as before.
+"$WORLD" fs pool drain --all > /dev/null
+"$WORLD" fs pool status | grep -q "^pool: empty" && ok T1.5 "pool status says when the pool is empty" \
+                                                 || bad T1.5 "pool status says when the pool is empty"
+
+# P7: the entries live inside the store, which is not a legal fork target.
+check    P7 "forking into the pool directory is refused" 3 -- \
+         "$WORLD" fs fork --from S1 --to "$WORLD_STORE/pool/S1/stolen"
+has_hint P7 "that refusal explains why" "plain project directory" -- \
+         "$WORLD" fs fork --from S1 --to "$WORLD_STORE/pool/S1/stolen"
+
+# The miss path: an empty pool is not an error.
+"$WORLD" fs fork --from S1 --to "$SCRATCH/w-miss" > "$SCRATCH/miss.log" 2>&1
+if [ "$(cat "$SCRATCH/w-miss/hello.txt" 2>/dev/null)" = hello ] && ! grep -q "(pool)" "$SCRATCH/miss.log"; then
+    ok T1.5 "a fork with an empty pool clones as before"
+else
+    bad T1.5 "a fork with an empty pool clones as before"; sed 's/^/        /' "$SCRATCH/miss.log"
+fi
+
+ready_S1() { "$WORLD" fs pool status | awk '$1=="S1"{print $3}'; }
+"$WORLD" fs pool fill S1 --count 2 > "$SCRATCH/fill.log" 2>&1
+[ "$(ready_S1)" = 2 ] && ok T1.5 "pool fill S1 --count 2 leaves 2 ready" \
+                      || { bad T1.5 "pool fill S1 --count 2 leaves 2 ready"; sed 's/^/        /' "$SCRATCH/fill.log"; }
+# fill is a top-up, not an addition
+"$WORLD" fs pool fill S1 --count 2 > /dev/null 2>&1
+[ "$(ready_S1)" = 2 ] && ok T1.5 "filling again to the same count makes nothing" \
+                      || bad T1.5 "filling again to the same count makes nothing"
+
+# The hit: the world IS one of those trees, renamed into place.
+for d in "$WORLD_STORE"/pool/S1/*; do printf '%s %s\n' "$(basename "$d")" "$(stat -f %i "$d")"; done > "$SCRATCH/pool-before.txt"
+"$WORLD" fs fork --from S1 --to "$SCRATCH/w-hit" > "$SCRATCH/hit.log" 2>&1
+WINO=$(stat -f %i "$SCRATCH/w-hit" 2>/dev/null || echo 0)
+HITDIR=$(awk -v i="$WINO" '$2==i{print $1}' "$SCRATCH/pool-before.txt")
+if grep -q "(pool)" "$SCRATCH/hit.log" && [ -n "$HITDIR" ]; then
+    ok T1.5 "a fork with a filled pool is served from the pool (same inode)"
+else
+    bad T1.5 "a fork with a filled pool is served from the pool (same inode)"; sed 's/^/        /' "$SCRATCH/hit.log"
+fi
+[ -n "$HITDIR" ] && [ ! -e "$WORLD_STORE/pool/S1/$HITDIR" ] \
+    && ok T1.5 "the pool entry's directory is gone afterwards" \
+    || bad T1.5 "the pool entry's directory is gone afterwards"
+[ "$(cat "$SCRATCH/w-hit/hello.txt" 2>/dev/null)" = hello ] && [ -f "$SCRATCH/w-hit/.world" ] \
+    && ok T1.5 "the handed-out world has the content and a marker" \
+    || bad T1.5 "the handed-out world has the content and a marker"
+"$WORLD" fs verify "$SCRATCH/w-hit" > /dev/null 2>&1 && ok T1.5 "it is a registered world (P1/P2)" \
+                                                     || bad T1.5 "it is a registered world (P1/P2)"
+
+# The hit re-fills the pool in a detached background process.
+for _ in $(seq 40); do [ "$(ready_S1)" = 2 ] && break; sleep 0.25; done
+[ "$(ready_S1)" = 2 ] && ok T1.5 "a hit triggers a background top-up back to 2" \
+                      || bad T1.5 "a hit triggers a background top-up back to 2 (got $(ready_S1))"
+[ -s "$WORLD_STORE/logs/pool.log" ] && ok T1.5 "the background filler logs to <store>/logs/pool.log" \
+                                    || bad T1.5 "the background filler logs to <store>/logs/pool.log"
+# --no-pool ignores a warm pool
+"$WORLD" fs fork --from S1 --to "$SCRATCH/w-nopool" --no-pool > "$SCRATCH/nopool.log" 2>&1
+grep -q "(pool)" "$SCRATCH/nopool.log" && bad T1.5 "--no-pool clones here and now" \
+                                       || ok T1.5 "--no-pool clones here and now"
+
+# verify S1 also checks what is waiting, and gc cleans up after a killed filler.
+"$WORLD" fs verify S1 | grep -q "pool entries (0 touched)" && ok T1.5 "verify S1 reports the pool entries" \
+                                                           || bad T1.5 "verify S1 reports the pool entries"
+mkdir -p "$WORLD_STORE/pool/S1/dead.wfs-tmp" "$WORLD_STORE/pool/S1/0000000000000000"
+before=$(ready_S1)
+"$WORLD" fs gc --retention 7 > "$SCRATCH/gc-pool.log" 2>&1
+if [ ! -e "$WORLD_STORE/pool/S1/dead.wfs-tmp" ] && [ ! -e "$WORLD_STORE/pool/S1/0000000000000000" ] &&
+   [ "$(ready_S1)" = "$before" ]; then
+    ok T1.5 "gc removes half-built and orphaned entries, keeps the ready ones"
+else
+    bad T1.5 "gc removes half-built and orphaned entries, keeps the ready ones"; sed 's/^/        /' "$SCRATCH/gc-pool.log"
+fi
+"$WORLD" fs pool drain S1 > /dev/null
+"$WORLD" fs pool status | grep -q "^pool: empty" && ok T1.5 "pool drain empties it" \
+                                                 || bad T1.5 "pool drain empties it"
+
 echo
 "$WORLD" fs status | sed 's/^/      /'
 echo

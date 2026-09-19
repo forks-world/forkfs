@@ -15,6 +15,9 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 #ifdef WFS_FSKIT
 #ifdef __APPLE__
@@ -42,6 +45,9 @@ static void usage(void) {
           "  discard W<n> [--now] [--force]   move to the store trash (--now deletes at once)\n"
           "  restore W<n>                     bring a trashed world back to its path\n"
           "  gc [--retention <days>]          delete expired trash and stray *.wfs-tmp trees\n"
+          "  pool status                      pre-cloned worlds waiting per snapshot\n"
+          "  pool fill S<n> [--count K]       top the pool up to K ready entries (default 2)\n"
+          "  pool drain S<n>|--all            delete the pool entries of a snapshot\n"
           "  status                           store, counts, free space\n"
           "  verify S<n>|W<n>|<path>          snapshot integrity, or world identity\n"
           "  adopt <path> [--name N]          register an unregistered copy as a new world\n"
@@ -259,6 +265,152 @@ static int cmd_init(wfs_store *s, int argc, char **argv) {
     return EX_OK;
 }
 
+static int latest_snapshot(wfs_store *s, wfs_id *out);
+
+// ---- T1.5: the pre-clone pool ----------------------------------------------------------------
+//
+// A fork served from the pool leaves it one entry poorer, so the fork re-fills it in a detached
+// background process: the next fork is fast again and this one does not pay for it. The filler
+// is an ordinary `world fs pool fill`, so there is nothing to keep running and nothing to
+// supervise; the store-level flock in the core makes two of them one.
+
+#define POOL_DEFAULT_TARGET 2
+
+static char g_exe[WFS_PATH_MAX];
+
+static void resolve_exe(const char *argv0) {
+#ifdef __APPLE__
+    uint32_t n = (uint32_t)sizeof g_exe;
+    if (_NSGetExecutablePath(g_exe, &n) == 0) {
+        char r[WFS_PATH_MAX];
+        if (realpath(g_exe, r)) snprintf(g_exe, sizeof g_exe, "%s", r);
+        return;
+    }
+#endif
+    snprintf(g_exe, sizeof g_exe, "%s", (argv0 && *argv0) ? argv0 : "world");
+}
+
+// How many entries a fork tries to keep ready. $WORLD_POOL_TOPUP overrides it; 0 turns the
+// automatic top-up off (the benchmarks use that to keep a measured series honest).
+static int pool_topup_target(void) {
+    const char *e = getenv("WORLD_POOL_TOPUP");
+    if (!e || !*e) return POOL_DEFAULT_TARGET;
+    int v = atoi(e);
+    return v < 0 ? 0 : v;
+}
+
+static void spawn_pool_fill(wfs_store *s, wfs_id snap, int target) {
+    if (target <= 0 || !g_exe[0]) return;
+    char sid[32], cnt[32], logp[WFS_PATH_MAX];
+    snprintf(sid, sizeof sid, "S%llu", (unsigned long long)snap);
+    snprintf(cnt, sizeof cnt, "%d", target);
+    snprintf(logp, sizeof logp, "%s/logs/pool.log", wfs_store_dir(s));
+    // Double fork: the intermediate child is reaped right here, and the filler itself is
+    // reparented to launchd, so it outlives this command without ever becoming a zombie.
+    pid_t pid = fork();
+    if (pid < 0) return;
+    if (pid > 0) { int st; while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {} return; }
+    setsid();
+    if (fork() != 0) _exit(0);
+    int devnull = open("/dev/null", O_RDWR);
+    if (devnull >= 0) dup2(devnull, 0);
+    int log = open(logp, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (log < 0) log = devnull;
+    if (log >= 0) { dup2(log, 1); dup2(log, 2); }
+    if (devnull > 2) close(devnull);
+    if (log > 2) close(log);
+    execl(g_exe, "world", "--store", wfs_store_dir(s), "fs", "pool", "fill", sid, "--count", cnt,
+          (char *)NULL);
+    _exit(127);
+}
+
+static int cmd_pool(wfs_store *s, int argc, char **argv) {
+    if (argc < 1) usage();
+    const char *verb = argv[0];
+    if (!strcmp(verb, "status")) {
+        size_t n = 0;
+        wfs_pool_status(s, NULL, 0, &n);
+        if (!n) { printf("pool: empty\n"); return EX_OK; }
+        wfs_pool_stat *v = (wfs_pool_stat *)calloc(n, sizeof *v);
+        if (!v) return fail("pool status", -ENOMEM);
+        wfs_pool_status(s, v, n, &n);
+        printf("%-6s %-20s %7s %9s %7s %10s  %s\n", "SNAP", "NAME", "READY", "BUILDING", "STALE",
+               "ENTRIES", "NEWEST");
+        for (size_t i = 0; i < n; ++i) {
+            char id[16], t[32];
+            snprintf(id, sizeof id, "S%llu", (unsigned long long)v[i].snapshot);
+            fmt_time(t, sizeof t, v[i].newest_at);
+            printf("%-6s %-20s %7llu %9llu %7llu %10llu  %s\n", id, v[i].snapshot_name,
+                   (unsigned long long)v[i].ready, (unsigned long long)v[i].building,
+                   (unsigned long long)v[i].stale, (unsigned long long)v[i].entries, t);
+        }
+        free(v);
+        return EX_OK;
+    }
+    if (!strcmp(verb, "fill")) {
+        wfs_ref r = {WFS_K_NONE, 0};
+        int target = POOL_DEFAULT_TARGET;
+        for (int i = 1; i < argc; ++i) {
+            if (!strcmp(argv[i], "--count") && i + 1 < argc) target = atoi(argv[++i]);
+            else if (argv[i][0] != '-' && r.kind == WFS_K_NONE) r = parse_ref(argv[i]);
+            else usage();
+        }
+        if (r.kind != WFS_K_SNAPSHOT || !r.id) {
+            // The default target is the same one `fork` uses: the newest snapshot.
+            wfs_id sid = 0;
+            if (r.kind != WFS_K_NONE || latest_snapshot(s, &sid) != 0)
+                return refuse("pool fill needs a snapshot", "world fs pool fill S<n> [--count K]");
+            r.kind = WFS_K_SNAPSHOT;
+            r.id = sid;
+        }
+        if (target < 0 || target > 4096) return refuse("--count is out of range", "--count 0..4096");
+        uint64_t made = 0;
+        int rc = wfs_pool_fill(s, r.id, target, &made);
+        if (rc == WFS_E_POOL_BUSY)
+            return refuse("another `world fs pool fill` is running for this store",
+                          "wait for it to finish (see <store>/logs/pool.log)");
+        if (rc == -ESTALE || rc == -ENOENT) {
+            char why[96];
+            snprintf(why, sizeof why, "S%llu is not an active snapshot", (unsigned long long)r.id);
+            return refuse(why, "world fs list");
+        }
+        uint64_t ready = 0;
+        wfs_pool_ready(s, r.id, &ready);
+        if (rc) {
+            fprintf(stderr, "world: pool fill S%llu: %s (made %llu, ready %llu)\n",
+                    (unsigned long long)r.id, wfs_strerror(rc), (unsigned long long)made,
+                    (unsigned long long)ready);
+            return is_refusal(rc) ? EX_REFUSED : EX_ERR;
+        }
+        char t[32];
+        fmt_time(t, sizeof t, (int64_t)time(NULL));
+        printf("%s  pool fill S%llu: +%llu, %llu ready\n", t, (unsigned long long)r.id,
+               (unsigned long long)made, (unsigned long long)ready);
+        return EX_OK;
+    }
+    if (!strcmp(verb, "drain")) {
+        wfs_ref r = {WFS_K_NONE, 0};
+        int all = 0;
+        for (int i = 1; i < argc; ++i) {
+            if (!strcmp(argv[i], "--all")) all = 1;
+            else if (argv[i][0] != '-' && r.kind == WFS_K_NONE) r = parse_ref(argv[i]);
+            else usage();
+        }
+        if (!all && r.kind != WFS_K_SNAPSHOT)
+            return refuse("pool drain needs a snapshot", "world fs pool drain S<n>   (or --all)");
+        uint64_t removed = 0;
+        int rc = wfs_pool_drain(s, all ? 0 : r.id, &removed);
+        if (rc == WFS_E_POOL_BUSY)
+            return refuse("another `world fs pool fill` is running for this store",
+                          "wait for it to finish (see <store>/logs/pool.log)");
+        if (rc) return fail("pool drain", rc);
+        printf("pool: %llu entries removed\n", (unsigned long long)removed);
+        return EX_OK;
+    }
+    usage();
+    return EX_USAGE;
+}
+
 static int latest_snapshot(wfs_store *s, wfs_id *out) {
     size_t n = 0;
     wfs_snapshot_list(s, NULL, 0, &n);
@@ -283,6 +435,7 @@ static int cmd_fork(wfs_store *s, int argc, char **argv) {
         } else if (!strcmp(argv[i], "--to") && i + 1 < argc) to = argv[++i];
         else if (!strcmp(argv[i], "--name") && i + 1 < argc) name = argv[++i];
         else if (!strcmp(argv[i], "--copy")) opts.allow_fallback = 1;
+        else if (!strcmp(argv[i], "--no-pool")) opts.no_pool = 1;
         else if (!strcmp(argv[i], "--skip-space-check")) opts.skip_space_check = 1;
         else if (!strcmp(argv[i], "--force")) opts.force = 1;
         else usage();
@@ -322,12 +475,15 @@ static int cmd_fork(wfs_store *s, int argc, char **argv) {
             snprintf(target + strlen(target), sizeof target - strlen(target), "/%s",
                      (name && *name) ? name : "world");
         }
-        wfs_id id = 0;
-        rc = wfs_world_create(s, from, target, &opts, &id);
+        wfs_fork_result res;
+        memset(&res, 0, sizeof res);
+        rc = wfs_world_create_ex(s, from, target, &opts, &res);
         if (rc == -EEXIST && !to) continue; // someone else took that id; ask again
         if (rc == WFS_E_WORLD_BUSY && from.kind == WFS_K_WORLD) return busy_refusal(s, from.id, "fork from");
         if (rc) return explain_path(s, target, rc, "fork");
-        printf("W%llu  %s\n", (unsigned long long)id, target);
+        printf("W%llu  %s%s\n", (unsigned long long)res.world, target, res.from_pool ? "  (pool)" : "");
+        // Put back what this fork took, in the background, so the next one is fast too.
+        if (res.from_pool && !opts.no_pool) spawn_pool_fill(s, from.id, pool_topup_target());
         return EX_OK;
     }
     return fail("fork", rc ? rc : -EEXIST);
@@ -589,9 +745,11 @@ static int cmd_gc(wfs_store *s, int argc, char **argv) {
     wfs_gc_report rep;
     int rc = wfs_gc(s, retention, &rep);
     if (rc) return fail("gc", rc);
-    printf("gc: %llu worlds deleted, %llu half-built snapshots, %llu stray %s trees, %llu orphan trash dirs\n",
+    printf("gc: %llu worlds deleted, %llu half-built snapshots, %llu stray %s trees, %llu orphan trash dirs,"
+           " %llu pool entries\n",
            (unsigned long long)rep.worlds_deleted, (unsigned long long)rep.snapshots_deleted,
-           (unsigned long long)rep.tmp_removed, WFS_TMP_SUFFIX, (unsigned long long)rep.trash_orphans);
+           (unsigned long long)rep.tmp_removed, WFS_TMP_SUFFIX, (unsigned long long)rep.trash_orphans,
+           (unsigned long long)rep.pool_removed);
     return EX_OK;
 }
 
@@ -605,11 +763,13 @@ static int cmd_status(wfs_store *s) {
     fmt_bytes(meta, sizeof meta, st.metadata_estimate_bytes);
     printf("store:     %s\nschema:    %d (store %s)\n"
            "snapshots: %llu (%llu entries)\nworlds:    %llu active, %llu trashed, %llu dead (%llu entries)\n"
+           "pool:      %llu ready (%llu entries)\n"
            "volume:    %s free of %s\nclone cost: ~%s of metadata for those entries (df cannot see block sharing)\n",
            st.dir, st.schema, st.store_id, (unsigned long long)st.snapshots,
            (unsigned long long)st.snapshot_entries, (unsigned long long)st.worlds_active,
            (unsigned long long)st.worlds_trashed, (unsigned long long)st.worlds_dead,
-           (unsigned long long)st.world_entries, freeb, totalb, meta);
+           (unsigned long long)st.world_entries, (unsigned long long)st.pool_ready,
+           (unsigned long long)st.pool_entries, freeb, totalb, meta);
     return EX_OK;
 }
 
@@ -618,10 +778,12 @@ static int cmd_verify(wfs_store *s, const char *arg) {
     if (r.kind == WFS_K_SNAPSHOT && r.id) {
         wfs_verify_report rep;
         int rc = wfs_snapshot_verify(s, r.id, &rep);
-        printf("S%llu: %llu entries checked, %llu missing, %llu modified, %llu unprotected, %llu extra\n",
+        printf("S%llu: %llu entries checked, %llu missing, %llu modified, %llu unprotected, %llu extra,"
+               " %llu pool entries (%llu touched)\n",
                (unsigned long long)r.id, (unsigned long long)rep.checked, (unsigned long long)rep.missing,
                (unsigned long long)rep.modified, (unsigned long long)rep.unprotected,
-               (unsigned long long)rep.extra);
+               (unsigned long long)rep.extra, (unsigned long long)rep.pool_checked,
+               (unsigned long long)rep.pool_dirty);
         if (rc == WFS_E_SNAPSHOT_DIRTY) {
             char why[WFS_PATH_MAX + 64];
             snprintf(why, sizeof why, "S%llu no longer matches its manifest (first: %s)",
@@ -909,6 +1071,7 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    resolve_exe(argc > 0 ? argv[0] : NULL);
     // --store may appear anywhere before a `--`; strip it before dispatch. Everything after
     // `--` belongs to the command `world exec` will run and is passed through untouched.
     char **av = (char **)calloc((size_t)argc + 1, sizeof(char *));
@@ -968,6 +1131,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(sub, "discard")) ret = cmd_discard(s, nargs, args);
     else if (!strcmp(sub, "restore")) ret = (nargs == 1) ? cmd_restore(s, args[0]) : (usage(), EX_USAGE);
     else if (!strcmp(sub, "gc")) ret = cmd_gc(s, nargs, args);
+    else if (!strcmp(sub, "pool")) ret = cmd_pool(s, nargs, args);
     else if (!strcmp(sub, "status")) ret = cmd_status(s);
     else if (!strcmp(sub, "verify")) ret = (nargs == 1) ? cmd_verify(s, args[0]) : (usage(), EX_USAGE);
     else if (!strcmp(sub, "adopt")) ret = cmd_adopt(s, nargs, args);

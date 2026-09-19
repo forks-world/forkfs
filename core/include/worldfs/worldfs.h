@@ -87,7 +87,8 @@ enum {
     WFS_E_SNAPSHOT_DIRTY = -1008, /* P3: snapshot content no longer matches its manifest */
     WFS_E_FOREIGN_STORE = -1009,  /* marker belongs to a different store */
     WFS_E_WORLD_MISSING = -1010,  /* the recorded path no longer holds this world */
-    WFS_E_SOURCE_GONE = -1011     /* the snapshot this world was forked from is no longer there */
+    WFS_E_SOURCE_GONE = -1011,    /* the snapshot this world was forked from is no longer there */
+    WFS_E_POOL_BUSY = -1012       /* T1.5: another `pool fill` holds the store's pool lock */
 };
 
 /* Human-readable text for a negative errno or a WFS_E_* code. Never NULL. */
@@ -152,6 +153,8 @@ typedef struct wfs_store_stat {
     /* df cannot see block sharing, so physical usage is estimated from the measured
      * 308 B/entry metadata cost of a clone on macOS 27.0 (CLONE_MODEL_MACOS27 §4). */
     uint64_t metadata_estimate_bytes;
+    uint64_t pool_ready;    /* T1.5: pre-cloned worlds waiting to be handed out */
+    uint64_t pool_entries;  /* sum of their entry counts */
 } wfs_store_stat;
 int wfs_store_status(wfs_store *s, wfs_store_stat *out);
 
@@ -200,6 +203,12 @@ typedef struct wfs_verify_report {
     uint64_t modified;    /* type/size/mode/mtime differ */
     uint64_t unprotected; /* P3: UF_IMMUTABLE cleared (--hard), or the gate left open */
     uint64_t extra;       /* entries present that the manifest does not list */
+    /* T1.5: the pool entries of this snapshot are clones of it that nobody has taken yet.
+     * They are checked the cheap way -- the root must still be there and its mtime must not be
+     * newer than the moment the entry was cloned -- because a full walk per entry would make
+     * `verify` cost as much as the fill did. */
+    uint64_t pool_checked;
+    uint64_t pool_dirty;
     char first_bad[WFS_PATH_MAX];
 } wfs_verify_report;
 
@@ -228,12 +237,31 @@ typedef struct wfs_fork_opts {
     int allow_fallback;  /* on EXDEV/ENOTSUP fall back to a 4-thread per-file clone/copy */
     int skip_space_check; /* bypass P11 */
     int force;            /* P5: fork from a world that has a live `world exec` lock */
+    /* T1.5: do not take a pre-cloned world out of the pool, clone here and now instead. The
+     * benchmarks use it to measure the miss path; nothing else should need it. */
+    int no_pool;
 } wfs_fork_opts;
 
+/* What a fork did, beyond which world it produced. */
+typedef struct wfs_fork_result {
+    wfs_id world;
+    int from_pool;        /* 1 = a pre-cloned world was handed out (T1.5) */
+    uint64_t pool_left;   /* ready entries left in that snapshot's pool afterwards */
+    int64_t elapsed_us;   /* wall time inside the core, without process start */
+} wfs_fork_result;
+
 /* Fork: clone `from` (a snapshot or a live world) into target_path. Publish order (P8):
- * clone into <target>.wfs-tmp, unprotect, write the marker, rename, then commit the row. */
+ * clone into <target>.wfs-tmp, unprotect, write the marker, rename, then commit the row.
+ *
+ * T1.5: when `from` is a snapshot and the pool holds a ready entry for it, that entry is the
+ * clone -- already made, already given the source root's mode -- and the fork is reduced to
+ * "write the marker, rename it into place, commit the row", which is O(1) and milliseconds.
+ * The publish order is the same one, with the pool entry playing the part of <target>.wfs-tmp. */
 int wfs_world_create(wfs_store *s, wfs_ref from, const char *target_path, const wfs_fork_opts *opts,
                      wfs_id *out);
+/* The same, and says whether the pool served it. `res` may be NULL. */
+int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *target_path,
+                        const wfs_fork_opts *opts, wfs_fork_result *res);
 int wfs_world_info(wfs_store *s, wfs_id id, wfs_world_rec *out);
 /* The id the next world will most likely get, so a caller can build the default target path
  * ~/worlds/W<n>/<name> before the row exists. Racy by construction: two concurrent forks get
@@ -246,6 +274,47 @@ int wfs_world_list(wfs_store *s, int include_trashed, wfs_world_rec *buf, size_t
  * P5: refused with WFS_E_WORLD_BUSY while a `world exec` lock is live, unless force != 0. */
 int wfs_world_discard(wfs_store *s, wfs_id id, int immediate, int force);
 int wfs_world_restore(wfs_store *s, wfs_id id);
+
+/* ---- the pre-clone pool (T1.5) -------------------------------------------------------------
+ *
+ * A pool entry is a World-in-waiting: <store>/pool/S<n>/<uuid> is a finished clone of snapshot
+ * S<n> -- taken through the same gate a fork would open, with the source root's own mode
+ * already restored -- that carries NO `.world` marker and has NO row in `worlds`. It is not a
+ * world yet and nothing outside the core can reach it: it lives inside the store, which P7
+ * refuses as a path and which `world exec`'s seatbelt profile denies (P14).
+ *
+ * Handing one out is a rename(2) on the same volume, so a fork from a snapshot with a warm pool
+ * costs the marker, the rename and two SQLite transactions instead of a whole clonefile of the
+ * tree -- single-digit milliseconds including process start, which is what arch.md §1 asks for.
+ *
+ * Entries are keyed by snapshot id AND the snapshot's created_at. Snapshot rows are immutable,
+ * so a mismatch means the id was reused by a different snapshot; such an entry is never handed
+ * out and wfs_gc() removes it.
+ *
+ * Filling is explicit (`world fs pool fill`) or automatic: the CLI re-fills in a detached
+ * background process after a hit. One store-level flock (<store>/locks/pool.lock) makes two
+ * fillers serialise into one; the loser returns WFS_E_POOL_BUSY rather than cloning twice. */
+
+typedef struct wfs_pool_stat {
+    wfs_id snapshot;
+    char snapshot_name[WFS_NAME_MAX];
+    uint64_t ready;             /* entries that can be handed out right now */
+    uint64_t building;          /* rows still being cloned (or left behind by a kill) */
+    uint64_t stale;             /* rows whose snapshot is gone or is a different one now */
+    uint64_t entries;           /* entry count of one such world */
+    int64_t oldest_at, newest_at;
+} wfs_pool_stat;
+
+/* Bring the number of ready entries for `snapshot` up to `target` (a top-up, not an addition:
+ * calling it twice with target=2 leaves 2, not 4). *made receives how many were cloned.
+ * Returns WFS_E_POOL_BUSY when another filler holds the store's pool lock. */
+int wfs_pool_fill(wfs_store *s, wfs_id snapshot, int target, uint64_t *made);
+/* One row per snapshot that has pool entries, ordered by snapshot id. */
+int wfs_pool_status(wfs_store *s, wfs_pool_stat *buf, size_t cap, size_t *count);
+/* Delete every entry of `snapshot` (0 = of every snapshot). *removed may be NULL. */
+int wfs_pool_drain(wfs_store *s, wfs_id snapshot, uint64_t *removed);
+/* Ready entries for `snapshot` right now (0 when the snapshot has none). */
+int wfs_pool_ready(wfs_store *s, wfs_id snapshot, uint64_t *out);
 
 /* ---- the exec lock (P5) ----------------------------------------------------------------
  *
@@ -415,6 +484,7 @@ typedef struct wfs_gc_report {
     uint64_t snapshots_deleted; /* half-built snapshots */
     uint64_t tmp_removed;       /* stray *.wfs-tmp trees (P8) */
     uint64_t trash_orphans;     /* trash directories with no row */
+    uint64_t pool_removed;      /* T1.5: pool entries of dead snapshots, half-built or orphaned */
     uint64_t entries_freed;
 } wfs_gc_report;
 
