@@ -1244,6 +1244,49 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第十六轮:引用要在每一个瞬间都在,删不掉的树不算删掉了(2026-09-20)
+
+第十六轮,Codex 两条,都是 P2,都落在 pool 上。第一条是第一轮那道"fork 和 `discard S<n>` 不能
+都赢"的**另一半**:认领时那条 CREATING World 行把引用立起来了,可**归还**时是先把它删掉、再把条目
+插回去的——夹在两次提交之间的那一格,**谁都没有引用这个快照**。第二条是第八轮、第十二轮那句
+"删不掉的树不算删掉了"还没走到的最后一条命令:`discard S<n> --force` 的 drain。
+**一条一个提交、一个测试,先验证过"没有修复就会红"。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P2 `PRRT_kwDOUf7jGc6kCz5H` | `world.cpp` pool fork 失败后的 unwind + `pool.cpp` `pool_return()` | 从 pool 领走一个条目的 fork,如果**领走之后**失败(marker 写不下去、`--to` 上凭空冒出一个目录于是 `RENAME_EXCL` 回 EEXIST、收尾那条条件 UPDATE 改不到行),unwind 是**两个事务**:先删掉自己那条 CREATING World 行,再 `pool_return()` 把条目插回去。中间那一格,`discard S<n>` 数引用**两样都数不到**——World 没了,pool 行还没回来——于是提交 TRASHING、把树搬进 trash;`pool_return()` 随后照插不误,插出一个 **READY 条目,属于一个已经在 trash 里的快照**,而且它自己既不看快照状态也不拿 pool 锁。`pool_collect()` 要到下一次唤醒才埋它,中间任何一次 fork 都会把这棵完整的陈旧克隆当活基线领走 | **行出去和条目回来是同一个事务。** `pool_return()` 多收一个 `PoolReturnHook`(`PoolClaimHook` 的镜像):它在归还自己的 `BEGIN IMMEDIATE` 里、插完 pool 行之后、提交之前跑,fork 的 `DELETE FROM worlds` 就放在那里。于是**从认领到归还的每一个瞬间都有一条引用在**——提交之前是 World 行,提交之后是 pool 行——`discard` 的 `BEGIN IMMEDIATE` 必然看见其中一条(本轮的测试里看见的是前者:`WFS_E_SNAPSHOT_IN_USE`)。顺带把第十五轮给 `build_one()` 的那道身份检查也给了 `pool_return()`:同一把写锁下重读快照行,要求 ACTIVE 且 `created_at` 正是条目带着的那个,对不上就不插——树删掉、非 0 返回,调用方再单独把自己那条行埋掉。`pool_return()` 因此从 `void` 变成返回 `int`("条目回去了没有"),调用方只有 unwind 这一处 | `c89c171` |
+| P2 `PRRT_kwDOUf7jGc6kCz5J` | `pool.cpp` `wfs_pool_drain()`(`discard S<n> --force` 先调它) | drain 是**先删行、后删树**,而且两次 `fs_remove_tree()` 的返回值都扔掉,整个函数无论如何返回 0。一个删不掉的条目(ACL、EPERM、偶发 EIO)于是变成 `<store>/pool` 下一棵**完全没有行的**完整克隆——而 `--force` 拿着那个 0 继续往下走,把快照搬进了 trash。之后**再也没有人回来收**:孤儿清扫确实会找到它,但 `wfs_gc_pending()` 只扫 trash,而这个快照自己那条 trash 条目要过好几天才到期,所以连一个 worker 都不会被起起来 | 和第八轮给 `pool_collect()`、第十二轮给 `gc --reconcile` 的是同一条规矩,只是往前挪了一条命令:**树先删**(条目本体和它旁边的 `.wfs-tmp`),两个名字都 `proven_gone` 了才删行(而且和 `pool_collect()` 一样带上 `path`),删不掉就**留着行、把 errno 还给调用方**。`wfs_snapshot_discard --force` 于是在**碰快照之前**就失败了,条目留下来仍旧是它本来的样子——一条 ACTIVE 快照的普通 pool 行,所以 `gc --status` 什么都不报,因为确实什么都没坏;CLI 把挡路的那个目录和 errno 一起说出来,并且告诉用户修好权限之后**同一条 `--force` 就是重试**。另外确认了一遍:drain 全程在 store 的 pool 锁下,所以没有 filler 在旁边加条目;而万一有 fill 挤在 drain 和引用计数之间,那次计数在 discard 自己的 `BEGIN IMMEDIATE` 里、且**不分状态**地数 pool 行,照样拒绝;挤在 discard 提交之后的,撞上第十五轮 `build_one()` 那道重读,`-ESTALE` | `fa5a8c6` |
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **248 passed, 0 failed**(新增 5 条);
+`check-deps.sh` 全绿。(`m1_criteria.sh` 本轮跳过。)
+
+先把测试跑红过:
+
+- **归还(P2)**:新 seam `wfs_test_in_pool_unwind`——unwind 里、树已经改回 pool 名字之后、条目
+  回去之前。让 hand-out 失败的办法是 `wfs_test_after_pool_claim` 里在 `--to` 上 `mkdir` 一个目录
+  (P7:`RENAME_EXCL` 于是 EEXIST,谁也不许被盖掉),窗口里跑一整趟 `discard S<n>`(不带
+  `--force`、不带 `--now`)。**老代码**:discard 回 **0**,快照落到 `WFS_ST_TRASHED`,
+  `wfs_pool_ready()` 却还报**这个快照有 1 个 READY 条目**——正是 Codex 说的那棵无人认领的陈旧克隆。
+  **新代码**:`WFS_E_SNAPSHOT_IN_USE`,快照还是 ACTIVE、树还在原处。
+- **drain(P2)**:一个只有一个 pool 条目的快照,给条目的树挂上 `deny delete,delete_child,add_file`
+  (和第五、第八、第十二轮同一个 ACL,`chmod`/`chflags` 都解不掉)。**老代码**:
+  `discard S1 --force` **退出 0**,快照行变 TRASHED、pool 表被清空,而克隆还原样待在
+  `<store>/pool/S1/<uuid>`,谁都不认识它(`gc --status` 随后把它算成一个 stale pre-clone entry
+  ——store 自己报出来的损失)。**新代码**:退出 3,打出"a pre-cloned pool entry under
+  .../pool/S1 could not be removed: Operation not permitted",快照还是 ACTIVE、行还在、
+  `gc --status` 无话可说。
+
+新增测试:
+
+- `core_test`(归还,接第一轮那个 fork/discard 竞态):失败的那次 pool fork 之后,窗口里的
+  discard 是 `WFS_E_SNAPSHOT_IN_USE`,快照 ACTIVE 且树在,`pool ready` 回到 1、
+  `<store>/pool/S<n>` 下正好一个目录;而且它就是一个普通条目——不带 `--force` 的 `discard` 仍以
+  `WFS_E_SNAPSHOT_IN_USE` 拒绝(那条失败的 fork 没留下任何东西在替它拒绝),带 `--force --now`
+  则干净地把 pool 清空、快照删掉。
+- `safety.sh`(drain,5 条):ACL 挂着时 `--force` 失败、快照 ACTIVE、pool 行还在、树没动、
+  refusal 里有目录和 errno、`gc --status` 不报任何异常;ACL 拿掉之后**同一条命令**把 pool drain
+  干净、快照进 trash,`<store>/pool` 下什么都不剩。
+
 #### PR #1 review 第十五轮:认领是一次事务,不是事后的一条 WHERE(2026-09-20)
 
 第十五轮,Codex 两条:一条 P1、一条 P2。两条是同一句话的两面:**一个"我可以动它"的判断,
