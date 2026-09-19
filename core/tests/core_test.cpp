@@ -1691,6 +1691,81 @@ int main() {
         CHECK_OK(wfs_snapshot_discard(s, sagain, 1, 0));
     }
 
+    // ---- PR #1 review (18th round, P2): a hardlink group whose inode the source locked ----
+    //
+    // UF_IMMUTABLE and UF_APPEND are USER flags -- `chflags uchg` on a vendored tree, a release
+    // directory, a fixture somebody froze -- and clonefile(2) copies them onto every name of the
+    // clone. link(2) refuses an immutable or append-only source with EPERM, and rename(2)
+    // refuses to replace an immutable target with EPERM, so neither half of the replay's
+    // link+rename could run: the 4th round's lend unlocks the parent DIRECTORY and nothing else,
+    // and since that round a replay error is fatal. `snapshot create`, `pool fill` and `fork`
+    // therefore all refused a tree that is perfectly valid, with the errno of a flag the user
+    // set on purpose. The file's own flags come off for exactly those two calls now and go back
+    // on the way out -- once, because by then every name of the group is one inode.
+    for (int pass = 0; pass < 2; ++pass) {
+        const unsigned int uflag = (pass == 0) ? UF_IMMUTABLE : UF_APPEND;
+        const char *tag = (pass == 0) ? "uchg" : "uappnd";
+        char flsrc[4096], fldir[4096], flw[4096];
+        snprintf(flsrc, sizeof flsrc, "%s/flag-%s", root, tag);
+        CHECK(mkdir(flsrc, 0755) == 0);
+        snprintf(fldir, sizeof fldir, "%s/d", flsrc);
+        CHECK(mkdir(fldir, 0755) == 0);
+        join(p, sizeof p, fldir, "a");
+        write_file(p, "locked\n");
+        join(q, sizeof q, fldir, "b");
+        CHECK(link(p, q) == 0);
+        CHECK(chflags(p, uflag) == 0);     // one inode, two names, and the flag is on the inode
+
+        wfs_id sfl = 0;
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = tag;
+        CHECK_OK(wfs_snapshot_create(s, flsrc, &sopts, &sfl));
+        CHECK_OK(wfs_snapshot_info(s, sfl, &sr));
+        CHECK(sr.hl_groups == 1 && sr.hl_external == 0 && sr.hardlinks == 2);
+        CHECK_OK(wfs_snapshot_verify(s, sfl, &vr));
+        CHECK(vr.missing == 0 && vr.modified == 0 && vr.extra == 0);
+        CHECK(chmod(sr.path, 0700) == 0);             // look behind the gate
+        join(p, sizeof p, sr.path, "d/a");
+        join(q, sizeof q, sr.path, "d/b");
+        CHECK(ino_of(p) == ino_of(q) && nlink_of(p) == 2);
+        CHECK(lstat(p, &st) == 0 && (st.st_flags & uflag) == uflag);   // exactly as it was
+        CHECK(lstat(q, &st) == 0 && (st.st_flags & uflag) == uflag);
+        join(p, sizeof p, sr.path, "d");
+        CHECK(n_with_prefix(p, ".wfs-hl-") == 0);
+        CHECK(chmod(sr.path, 0) == 0);
+
+        // A fork off that snapshot rebuilds the pair, flag and all.
+        snprintf(flw, sizeof flw, "%s/w-%s", worlds, tag);
+        wfs_ref from_fl = {WFS_K_SNAPSHOT, sfl};
+        memset(&opts, 0, sizeof opts);
+        opts.name = tag;
+        opts.no_pool = 1;
+        memset(&hfr, 0, sizeof hfr);
+        CHECK_OK(wfs_world_create_ex(s, from_fl, flw, &opts, &hfr));
+        CHECK(hfr.hardlinks == 1);         // the one name relinked to its canonical file
+        join(p, sizeof p, flw, "d/a");
+        join(q, sizeof q, flw, "d/b");
+        CHECK(ino_of(p) == ino_of(q) && nlink_of(p) == 2);
+        CHECK(lstat(p, &st) == 0 && (st.st_flags & uflag) == uflag);
+        CHECK(lstat(q, &st) == 0 && (st.st_flags & uflag) == uflag);
+        join(p, sizeof p, flw, "d");
+        CHECK(n_with_prefix(p, ".wfs-hl-") == 0);
+
+        // And so does the pool filler, which replays on the entry it clones.
+        CHECK_OK(wfs_pool_fill(s, sfl, 1, &made));
+        CHECK(made == 1);
+        snprintf(flw, sizeof flw, "%s/w-%s-pool", worlds, tag);
+        memset(&opts, 0, sizeof opts);
+        opts.name = tag;
+        memset(&hfr, 0, sizeof hfr);
+        CHECK_OK(wfs_world_create_ex(s, from_fl, flw, &opts, &hfr));
+        CHECK(hfr.from_pool == 1);
+        join(p, sizeof p, flw, "d/a");
+        join(q, sizeof q, flw, "d/b");
+        CHECK(ino_of(p) == ino_of(q) && nlink_of(p) == 2);
+        CHECK(lstat(p, &st) == 0 && (st.st_flags & uflag) == uflag);
+    }
+
     // ---- PR #1 review (P1): a fork in flight and `discard S<n>` cannot both win ----
     //
     // The window the review found: a pool-backed fork claims the last entry and pauses before it

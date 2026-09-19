@@ -488,8 +488,24 @@ bool relink_at(int canon_fd, const char *canon_leaf, int dirfd, const char *leaf
 // included, by the destructor. Two groups can live in the same directory and the replay is four
 // threads wide, so the whole lend/link/rename/restore sequence is serialized on one mutex: it
 // costs nothing in the common case, where it never runs at all.
-struct DirLend {
-    int fd = -1;        // borrowed: the caller holds it open for the whole lend
+//
+// PR #1 review (18th round, P2): and the same question about the FILE. UF_IMMUTABLE and
+// UF_APPEND are USER flags -- `chflags uchg` on a vendored tree, a release directory, a fixture
+// somebody froze -- and clonefile(2) copies them onto every name of the clone. link(2) refuses
+// an immutable or append-only SOURCE with EPERM and rename(2) refuses to replace an immutable
+// TARGET with EPERM, so neither half of relink_at() could run and the lend above, which unlocks
+// the directory and nothing else, did not help: a valid source tree came back -EPERM out of
+// `snapshot create`, `pool fill` and every fork, because a replay error is fatal (4th round).
+// So the two inodes those two calls touch are lent as well -- the canonical file, and the name
+// the rename replaces -- through descriptors opened from the descent's own directory fd with
+// O_NOFOLLOW, which is the 17th round's rule about where a member's name may lead. Opening an
+// immutable file O_RDONLY is allowed, and clearing a UF_ flag on it is the owner's to do.
+// (`--hard` snapshots are a different matter: a fork unprotects the whole clone before the
+// replay runs. This is about flags the SOURCE tree carries.)
+struct Lend {
+    int fd = -1;        // a directory's is borrowed; a file's is opened by lend_file and owned
+    bool owned = false;
+    bool had_mode = false;
     mode_t mode = 0;
     uint32_t flags = 0;
     bool had_flags = false;
@@ -502,12 +518,13 @@ class LendStack {
     LendStack &operator=(const LendStack &) = delete;
     ~LendStack() {
         // In reverse, and unconditionally: this runs on the success path and on every error
-        // path, so a directory is never left more permissive than we found it.
+        // path, so nothing is ever left more permissive than we found it.
         for (size_t i = v_.size(); i-- > 0;) {
-            ::fchmod(v_[i].fd, v_[i].mode);
+            if (v_[i].had_mode) ::fchmod(v_[i].fd, v_[i].mode);
 #ifdef __APPLE__
             if (v_[i].had_flags) ::fchflags(v_[i].fd, (u_int32_t)v_[i].flags);
 #endif
+            if (v_[i].owned) ::close(v_[i].fd);
         }
     }
     // Gives the directory behind `dirfd` owner write + search. False means it could not be
@@ -518,8 +535,9 @@ class LendStack {
     bool lend(int dirfd) {
         struct stat st;
         if (::fstat(dirfd, &st) != 0 || !S_ISDIR(st.st_mode)) return false;
-        DirLend u;
+        Lend u;
         u.fd = dirfd;
+        u.had_mode = true;
         u.mode = (mode_t)(st.st_mode & 07777);
 #ifdef __APPLE__
         u.flags = (uint32_t)st.st_flags;
@@ -539,8 +557,47 @@ class LendStack {
         return true;
     }
 
+    // Takes UF_IMMUTABLE/UF_APPEND off the file `leaf` names inside `dirfd`. False means the
+    // file could not be opened or its flags could not be changed, and the caller fails exactly
+    // as it did before; a file that carries neither flag is true and is not recorded at all,
+    // because there is nothing to put back. `at` receives the entry's index, for forget().
+    bool lend_file(int dirfd, const char *leaf, size_t *at = nullptr) {
+        if (at) *at = (size_t)-1;
+#ifdef __APPLE__
+        // O_NOFOLLOW: the leaf of a member path is not a symlink either (17th round), and this
+        // is the same directory descriptor the link and the rename below use.
+        int fd = ::openat(dirfd, leaf, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) return false;
+        struct stat st;
+        if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) { ::close(fd); return false; }
+        if ((st.st_flags & (UF_IMMUTABLE | UF_APPEND)) == 0) { ::close(fd); return true; }
+        if (::fchflags(fd, (u_int32_t)(st.st_flags & ~(uint32_t)(UF_IMMUTABLE | UF_APPEND))) != 0) {
+            ::close(fd);
+            return false;
+        }
+        Lend u;
+        u.fd = fd;
+        u.owned = true;
+        u.flags = (uint32_t)st.st_flags;
+        u.had_flags = true;
+        if (at) *at = v_.size();
+        v_.emplace_back(std::move(u));
+        return true;
+#else
+        (void)dirfd;
+        (void)leaf;
+        return true;
+#endif
+    }
+
+    // "That inode has no name any more": the descriptor is still closed, but its flags are not
+    // put back, because there is nothing left to wear them.
+    void forget(size_t at) {
+        if (at < v_.size()) v_[at].had_flags = false;
+    }
+
   private:
-    Vec<DirLend> v_;
+    Vec<Lend> v_;
 };
 
 // The serialization point for every lend in one replay. One per hardlinks_restore() call, on
@@ -549,13 +606,27 @@ struct Relender {
     Mutex mu;
 };
 
-// relink_at() again, with the target's own directory lent owner write for its duration.
+// relink_at() again, with the target's own directory lent owner write for its duration -- and
+// (18th round) with the two files it touches lent the flags they carry. The canonical file is
+// lent once per name linked rather than once per group, which ends in the same place: after the
+// link the new name IS the canonical inode, so restoring that inode's flags restores the whole
+// group's, and the next name starts from the file exactly as the source left it.
 bool relink_under_lend(Relender &rl, int canon_fd, const char *canon_leaf, int dirfd,
                        const char *leaf, int *err) {
     Guard lk(rl.mu);
     LendStack lend;
     if (!lend.lend(dirfd)) return false;
-    return relink_at(canon_fd, canon_leaf, dirfd, leaf, err);
+    // Neither of these is a reason to give up on its own: a file with no flags on it says true
+    // without being recorded, and one that will not open or will not change simply leaves
+    // relink_at to fail the way it already did, with the file system's own errno.
+    lend.lend_file(canon_fd, canon_leaf);
+    size_t victim = (size_t)-1;
+    lend.lend_file(dirfd, leaf, &victim);
+    bool ok = relink_at(canon_fd, canon_leaf, dirfd, leaf, err);
+    // The rename unlinked the file `leaf` used to name; only its inode is left, held open by
+    // this lend alone, and an unlinked inode has no flags worth restoring.
+    if (ok) lend.forget(victim);
+    return ok;
 }
 
 // Every name of the group still exists in the live tree and still shares one inode. Used when
