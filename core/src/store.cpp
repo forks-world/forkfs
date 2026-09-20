@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <strings.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/random.h>
 #include <unistd.h>
@@ -47,6 +48,20 @@ extern "C" void *wfs_test_after_db_move_ctx = nullptr;
 // not core_test; nothing in the library ever assigns it. Declared in worldfs.h.
 extern "C" void (*wfs_test_between_db_steps)(void *ctx, const char *dir, int phase) = nullptr;
 extern "C" void *wfs_test_between_db_steps_ctx = nullptr;
+
+// The two interruptible points of the REVERT (PR #1 review, 37th round): 1 = after the exchange
+// has put the database back at `metadata.db` and before its schema-3 name is unlinked, 2 = after
+// that unlink and before VERSION goes back to 2. NULL in every run that is not core_test;
+// nothing in the library ever assigns it. Declared in worldfs.h.
+extern "C" void (*wfs_test_in_revert)(void *ctx, const char *dir, int phase) = nullptr;
+extern "C" void *wfs_test_in_revert_ctx = nullptr;
+
+// The instant the upgrade lock is taken and before anything is read under it (PR #1 review,
+// 37th round). What a second opener sees HERE is the whole point of the lock: whatever the
+// process it waited for left behind, finished or put back. NULL in every run that is not
+// core_test; nothing in the library ever assigns it. Declared in worldfs.h.
+extern "C" void (*wfs_test_in_upgrade_lock)(void *ctx, const char *dir) = nullptr;
+extern "C" void *wfs_test_in_upgrade_lock_ctx = nullptr;
 
 namespace {
 
@@ -562,6 +577,112 @@ void db_stub_sweep(const char *dir, uint64_t db_ino) {
     ::closedir(d);
 }
 
+// ---- PR #1 review (37th round, P1): one direction of the protocol at a time -----------------
+//
+// Everything above is written so that a crash can be resumed from the shapes on disk -- by ONE
+// process at a time. Two M2 processes running the protocol in OPPOSITE directions at once read
+// each other's half-finished states as their own to resume, and between them they can free the
+// database's last link:
+//
+//   * A is REVERTING (legacy_holders_gate below): it has linked the database back under a
+//     private name, exchanged that name with the stub, and `metadata.db` is the database again
+//     with `metadata3.db` still its second name. Its next syscall is the unlink of
+//     `metadata3.db`.
+//   * B opens the store in exactly that instant. VERSION still says 3 and both names are
+//     regular files on the SAME inode -- which is, to the letter, the table's "a crash between
+//     steps 2 and 3 of the move", and that row is taken FORWARD, always. So B makes its own
+//     stub, exchanges it into `metadata.db`, and the database is now at `metadata3.db` and at
+//     B's private stub name.
+//   * A unlinks `metadata3.db`. B unlinks what it believes is its own extra link -- which by
+//     then is the only name the database has left. The inode is freed. What is left of the
+//     store is an empty 0500 directory.
+//
+// Neither process did anything its own half of the protocol forbids. The shapes on disk cannot
+// tell the two directions apart, because the direction is not on disk: it is in the process
+// that chose it. So the CHOICE is serialised, and two things are done about it -- a lock so
+// that the interleaving cannot happen, and a guard on every unlink so that it could not lose
+// the database even if it did.
+//
+// The lock is an exclusive flock(2) on `<store>/upgrade.lock`, a file of its own, created on
+// demand. It is taken BEFORE the layout that decides is read and held through the whole of one
+// direction: the forward move, the holder gate, the migration and the VERSION re-read -- or the
+// whole of the revert. The second opener blocks on it (the upgrade is one checkpoint, three
+// renames and a dozen DDL statements -- sub-second) and then reads the layout AGAIN under the
+// lock: what it finds is either a finished schema-3 store, which it opens, or a store that was
+// reverted back to schema 2, which it runs the gate over itself -- and that gate answers BUSY
+// or takes the store over. Both are ordinary outcomes of a first open.
+//
+// M1 does not take it, and is not asked to. M1 takes no store-wide lock of any kind -- that is
+// the premise of this entire section -- and it is excluded by the file (32nd round), by the
+// stub (35th/36th) and by the holder gate (34th). This lock is M2 <-> M2 only, and it exists
+// for the one hazard those three cannot touch: another process running the SAME protocol
+// backwards.
+//
+// The hot path does not pay for it. An open of a schema-3 store that owes nothing -- stub at
+// `metadata.db`, database at `metadata3.db` with one link, VERSION 3 -- never opens the lock
+// file at all: it is taken only when store_layout() says a move, a stub, a sweep or a bump is
+// owed (and once more, lazily, before the late holder gate, which can revert too).
+//
+// It is a descriptor on a file of its own, never on either database name, so it can never be
+// mistaken for a holder: fs_other_holders() asks proc_listpidspath(3) about `metadata3.db` and
+// is answered about that vnode. core_test asserts it -- a child holding `upgrade.lock` open is
+// listed by wfs_store_holders() as nobody at all.
+const char *kUpgradeLock = "/upgrade.lock";
+
+struct UpgradeLock {
+    int fd = -1;
+    bool held() const { return fd >= 0; }
+    // 0, or a negative errno. Blocking, like SnapGate's flock: an open that waits half a
+    // millisecond is better than one that fails for a reason the user cannot act on. A holder
+    // that dies has its lock released by the kernel, so there is no stale-lock case to sweep.
+    int take(const char *dir) {
+        if (fd >= 0) return 0;
+        String p(dir);
+        p.append(kUpgradeLock);
+        int f = ::open(p.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (f < 0) return -errno;
+        while (::flock(f, LOCK_EX) != 0) {
+            if (errno == EINTR) continue;
+            int e = errno;
+            ::close(f);
+            return -e;
+        }
+        fd = f;
+        return 0;
+    }
+    ~UpgradeLock() {
+        if (fd >= 0) { ::flock(fd, LOCK_UN); ::close(fd); }
+    }
+    UpgradeLock() = default;
+    UpgradeLock(const UpgradeLock &) = delete;
+    UpgradeLock &operator=(const UpgradeLock &) = delete;
+};
+
+// ---- and the belt to that pair of braces: never unlink the last link ------------------------
+//
+// Both directions end by dropping a name that is the database's SECOND link -- the forward
+// move's `stub_tmp` (step 4), the revert's `metadata3.db`. That is true by construction of each
+// protocol on its own, and the interleaving above is what makes it false. So it is CHECKED,
+// every time, instead of assumed: the name about to go and the name that must survive have to
+// be the same inode, and that inode has to carry at least two links.
+//
+// This is what makes the data-loss outcome impossible even when the lock is not in the way --
+// an older M2 build that does not take it, a future bug, a store on a filesystem where flock is
+// a no-op. A refusal leaves BOTH names exactly where they are, which is a shape the table above
+// resumes from; losing the inode is not.
+//
+// 0 = the name is gone, or was never there. WFS_E_STORE_DAMAGED = it is not the extra link this
+// protocol made, and it is left alone. A negative errno = the unlink itself failed.
+int unlink_extra_link(const char *go, const char *keep) {
+    struct stat g, k;
+    if (::lstat(go, &g) != 0) return errno == ENOENT ? 0 : -errno;
+    if (::stat(keep, &k) != 0) return WFS_E_STORE_DAMAGED;   // the survivor is not there
+    if (!S_ISREG(g.st_mode)) return WFS_E_STORE_DAMAGED;
+    if (g.st_dev != k.st_dev || g.st_ino != k.st_ino) return WFS_E_STORE_DAMAGED;
+    if (g.st_nlink < 2) return WFS_E_STORE_DAMAGED;          // this IS the last link
+    return ::unlink(go) == 0 ? 0 : -errno;
+}
+
 // 0, or the error the upgrade ends with. Every failure leaves the store in one of the states
 // store_layout() below resumes from, and in all of them `metadata.db` is still there.
 int db_move_to_schema3(const char *dir) {
@@ -644,8 +765,20 @@ int db_move_to_schema3(const char *dir) {
     // ---- 4. the extra link ------------------------------------------------------------------
     // A DIRECTORY at our own stub name is another upgrader that exchanged between our 3 and our
     // 4: its stub and ours changed places. Both are empty and `metadata.db` is a stub either
-    // way, so the only difference is which call removes this one.
-    if (::unlink(stub.c_str()) != 0 && (errno == EPERM || errno == EISDIR)) ::rmdir(stub.c_str());
+    // way, so the only difference is which call removes this one. (PR #1 review, 37th round:
+    // under the upgrade lock there is no other upgrader to do that any more -- this stays for
+    // the store an older M2 build left mid-move.)
+    struct stat sst;
+    if (::lstat(stub.c_str(), &sst) == 0 && S_ISDIR(sst.st_mode)) {
+        ::rmdir(stub.c_str());
+    } else if (int urc = unlink_extra_link(stub.c_str(), newdb.c_str())) {
+        // The move itself is done -- `metadata.db` is the stub and the database is at its new
+        // name -- and what is refused here is only the removal of a name that is not the extra
+        // link this call made. Both names stay, and the open ends: the layout is one the next
+        // open reads again, and pressing on would mean opening a database this core can no
+        // longer account for every name of.
+        return urc;
+    }
     if (wfs_test_between_db_steps)
         wfs_test_between_db_steps(wfs_test_between_db_steps_ctx, dir, 3);
     return 0;
@@ -774,12 +907,23 @@ int legacy_holders_gate(const char *dir) {
         if (wfs::fs_rename_swap(stub.c_str(), olddb.c_str()) == 0) {
             // `metadata.db` is the database again -- its second link -- and `stub` is the stub
             // directory. The schema-3 name can go now, and not one instant earlier.
-            if (::unlink(newdb.c_str()) == 0) {
+            //
+            // PR #1 review (37th round, P1): and it goes only if it really is the second link.
+            // This instant -- both names on one inode, VERSION still 3 -- is the one another
+            // M2 opener used to read as "an interrupted move" and take forward, and between the
+            // two of them the inode lost every name it had. The upgrade lock is what keeps
+            // anybody else out of it; unlink_extra_link() is what makes the loss impossible
+            // rather than merely unreachable.
+            if (wfs_test_in_revert) wfs_test_in_revert(wfs_test_in_revert_ctx, dir, 1);
+            if (unlink_extra_link(newdb.c_str(), olddb.c_str()) == 0) {
                 ::rmdir(stub.c_str());
+                if (wfs_test_in_revert) wfs_test_in_revert(wfs_test_in_revert_ctx, dir, 2);
                 version_put(dir, WFS_STORE_SCHEMA_M1, false);   // best effort; see above
             }
         } else {
-            ::unlink(stub.c_str());   // the extra link, and nothing else, goes back
+            // The extra link, and nothing else, goes back -- and by the same rule: `stub` is
+            // the database's second name here only if `metadata3.db` is still its first.
+            unlink_extra_link(stub.c_str(), newdb.c_str());
         }
     }
     version_tmp_sweep(dir);
@@ -1188,6 +1332,29 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
         int fd = ::open(p.c_str(), O_WRONLY | O_CREAT, 0644);
         if (fd >= 0) ::close(fd);
     }
+    // ---- PR #1 review (37th round, P1): and only one of us runs the protocol ---------------
+    //
+    // The lock, and the second look under it. Taken when -- and only when -- the layout says
+    // this store is owed a step: the move, the stub, the sweep, or the bump. A schema-3 store
+    // that owes nothing is the whole of the hot path and does not open the file.
+    //
+    // Under the lock everything is read again, because whoever we waited for has been changing
+    // exactly these two names and that one file: the layout may now be a finished schema-3
+    // store (nothing owed, straight through), or a store that was reverted back to schema 2
+    // (owed the move, and the gate below decides it again, on this open's own behalf). See
+    // UpgradeLock above for the interleaving this exists for.
+    UpgradeLock ulock;
+    if (lay.move_needed || lay.stub_needed || lay.sweep_needed || legacy_schema) {
+        if (int lrc = ulock.take(s->dir.c_str())) { wfs_store_close(s); return lrc; }
+        if (wfs_test_in_upgrade_lock)
+            wfs_test_in_upgrade_lock(wfs_test_in_upgrade_lock_ctx, s->dir.c_str());
+        bool legacy_again = false;
+        int vrc = check_version(s->dir.c_str(), &legacy_again);
+        if (vrc) { wfs_store_close(s); return vrc; }
+        if (int lrc2 = store_layout(s->dir.c_str(), lay)) { wfs_store_close(s); return lrc2; }
+        legacy_schema = legacy_again;
+    }
+
     // ---- PR #1 review (36th round, P1): the leftovers of an interrupted move ---------------
     //
     // A stub that was never exchanged, or an extra link that was never dropped. Both are ours,
@@ -1329,7 +1496,34 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
         if (int src = db_stub_make(s->dir.c_str())) { wfs_store_close(s); return src; }
     }
     if (!gated && lay.db_existed && user_version / 100 <= WFS_STORE_SCHEMA_M1) {
-        if (int hrc = legacy_holders_gate(s->dir.c_str())) { wfs_store_close(s); return hrc; }
+        // PR #1 review (37th round, P1): this gate reverts too, so it runs under the same lock
+        // as the move does. It is the one path the layout could not predict -- a store whose
+        // names are all in place and whose migration never committed -- so the lock is taken
+        // here, late, and the database we have OPEN is checked against the name we opened it
+        // under: a reverter that finished while we were waiting has moved that inode back to
+        // `metadata.db`, and this handle is then a name nobody will ever look under again.
+        if (!ulock.held()) {
+            if (int lrc = ulock.take(s->dir.c_str())) { wfs_store_close(s); return lrc; }
+            struct stat nst;
+            if (::stat(dbp.c_str(), &nst) != 0 || lay.db_ino == 0 ||
+                (uint64_t)nst.st_ino != lay.db_ino) {
+                wfs_store_close(s);
+                return WFS_E_STORE_BUSY;   // somebody else's upgrade; this open is the retry
+            }
+            // ... and the stamp that says the gate is owed at all is read AGAIN, under the
+            // lock, because the 2xx above was read outside it: the process we waited for has
+            // been migrating this very database, and a gate run on its finished work would
+            // list that process as a holder and put its whole upgrade back. Measured before
+            // this line existed -- a second opener arriving between the move and the commit
+            // came back WFS_E_STORE_BUSY and reverted a store that was already schema 3.
+            Stmt q2(s->db, "PRAGMA user_version");
+            if (!q2.ok() || !q2.row()) { wfs_store_close(s); return WFS_E_STORE_DAMAGED; }
+            user_version = (int)q2.col_i64(0);
+            if (user_version / 100 > WFS_STORE_SCHEMA) { wfs_store_close(s); return WFS_E_SCHEMA; }
+        }
+        if (user_version / 100 <= WFS_STORE_SCHEMA_M1) {
+            if (int hrc = legacy_holders_gate(s->dir.c_str())) { wfs_store_close(s); return hrc; }
+        }
     }
     if (sqlite3_exec(s->db, kPragmas, nullptr, nullptr, nullptr) != SQLITE_OK) {
         wfs_store_close(s);

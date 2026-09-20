@@ -10,6 +10,7 @@
 // PR #1 review (11th round): the schema-migration block at the end of main() has to build a
 // database as schema 2 first wrote it -- older than anything this library can produce any more.
 // worldfs_core links SQLite publicly, so this is the same library the core itself opens.
+#include <poll.h>
 #include <signal.h>
 #include <sqlite3.h>
 #include <stdio.h>
@@ -962,21 +963,58 @@ static void gc_before_snapshot_clone(void *ctx, const char *src_dir) {
 // PR #1 review (31st round, P2): the first open of a schema-2 store, run twice at once. The
 // seam fires inside handle A's version_upgrade(), after A has written its VERSION temporary and
 // before A renames it over VERSION; what runs in there is a whole wfs_store_open() of the same
-// store on a second handle, which migrates (a no-op -- A's migration has committed), upgrades,
-// and renames FIRST. A's rename then lands second, and A's open must still come back 0. It used
-// to come back -ENOENT: both processes wrote one shared `<store>/VERSION.tmp`, and B's rename
-// took the very file A was about to rename.
+// store, which migrates (a no-op -- A's migration has committed), upgrades, and renames. Both
+// opens must come back 0. A's used to come back -ENOENT: both processes wrote one shared
+// `<store>/VERSION.tmp`, and the second rename took the very file the first was about to
+// rename.
+//
+// PR #1 review (37th round, P1): in a SECOND PROCESS, which is what the case always described,
+// and forked BEFORE this open starts. Two things make that necessary now. The upgrade is
+// serialised by an exclusive flock on `<store>/upgrade.lock`, and an flock belongs to an open
+// file description: a nested wfs_store_open() in THIS process, inside the seam, under the lock
+// this process is holding, blocks on itself for ever -- and a child forked from inside the seam
+// inherits the descriptor that holds it and blocks on that. So the child is forked first, waits
+// on a pipe, is let go from inside the seam, and is joined only once this open has returned and
+// the lock with it. What it proves is unchanged, and one thing more: the second opener blocks
+// and then finds a store that is already schema 3.
 static char g_vrace_store[4096];
 static int g_vrace_rc = -1;
 static int g_vrace_ran;
+static pid_t g_vrace_child;
+static int g_vrace_go = -1, g_vrace_rep = -1;
+static pid_t spawn_opener(const char *dir, int gofd, int startfd, int exchfd, int donefd);
+static void vrace_spawn(void) {
+    int go[2], rep[2];
+    CHECK(pipe(go) == 0);
+    CHECK(pipe(rep) == 0);
+    g_vrace_child = spawn_opener(g_vrace_store, go[0], -1, -1, rep[1]);
+    close(go[0]);
+    close(rep[1]);
+    g_vrace_go = go[1];
+    g_vrace_rep = rep[0];
+}
 static void vrace_before_version_rename(void *ctx, const char *dir) {
     (void)ctx;
     (void)dir;
     if (g_vrace_ran) return;
     g_vrace_ran++;
-    wfs_store *vb = NULL;
-    g_vrace_rc = wfs_store_open(g_vrace_store, &vb);
-    if (vb) wfs_store_close(vb);
+    CHECK(write(g_vrace_go, "g", 1) == 1);
+}
+// ... and its answer, read once the lock this process is holding has been dropped.
+static void vrace_join(void) {
+    CHECK(g_vrace_child > 0);
+    int vrep[6] = {-9, -9, -9, -9, -9, -9};
+    CHECK(read(g_vrace_rep, vrep, sizeof vrep) == (ssize_t)sizeof vrep);
+    g_vrace_rc = vrep[0];
+    int st = 0;
+    CHECK(waitpid(g_vrace_child, &st, 0) == g_vrace_child);
+    CHECK(WIFEXITED(st));
+    CHECK(WEXITSTATUS(st) == 0);
+    close(g_vrace_go);
+    close(g_vrace_rep);
+    g_vrace_child = 0;
+    g_vrace_go = -1;
+    g_vrace_rep = -1;
 }
 
 // PR #1 review (32nd round, P1): the window between the two halves of the 2 -> 3 upgrade. The
@@ -1043,6 +1081,7 @@ static int g_steps_count = -2;  // SELECT count(*) FROM worlds; -1 = no such tab
 static int g_steps_uv = -2;
 static pid_t g_steps_child;
 static int g_steps_ctl = -1;
+static pid_t spawn_m1_opener(const char *dbp, int repfd, int ctlfd);   // 37th round: exec'd
 static void steps_m1_open(void *ctx, const char *dir, int phase) {
     (void)ctx;
     if (phase != g_steps_phase || g_steps_ran) return;
@@ -1052,40 +1091,11 @@ static void steps_m1_open(void *ctx, const char *dir, int phase) {
     int rep[2], ctl[2];
     CHECK(pipe(rep) == 0);
     CHECK(pipe(ctl) == 0);
-    pid_t pid = fork();
-    CHECK(pid >= 0);
-    if (pid == 0) {
-        // Nothing of the parent's but the two pipes (the 34th round's rules): no stdout to
-        // outlive the test on the reader's end, and a wait on the control pipe rather than on
-        // a signal, so that the parent going away -- for any reason -- ends this child.
-        close(rep[0]);
-        close(ctl[1]);
-        int devnull = open("/dev/null", O_RDWR);
-        if (devnull >= 0) { dup2(devnull, 0); dup2(devnull, 1); dup2(devnull, 2); }
-        int out[3] = {-1, -2, -2};
-        sqlite3 *h = NULL;
-        // `main`'s M1 core, exactly: SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_FULLMUTEX.
-        out[0] = sqlite3_open_v2(
-            dbp, &h, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
-        if (out[0] == SQLITE_OK) {
-            out[1] = -1;   // not even a `worlds` table: a database SQLite has just created
-            sqlite3_stmt *st = NULL;
-            if (sqlite3_prepare_v2(h, "SELECT count(*) FROM worlds", -1, &st, NULL) == SQLITE_OK &&
-                sqlite3_step(st) == SQLITE_ROW)
-                out[1] = sqlite3_column_int(st, 0);
-            sqlite3_finalize(st);
-            st = NULL;
-            if (sqlite3_prepare_v2(h, "PRAGMA user_version", -1, &st, NULL) == SQLITE_OK &&
-                sqlite3_step(st) == SQLITE_ROW)
-                out[2] = sqlite3_column_int(st, 0);
-            sqlite3_finalize(st);
-        }
-        ssize_t wn = write(rep[1], out, sizeof out);
-        (void)wn;
-        char z;
-        while (read(ctl[0], &z, 1) > 0) {}   // ... and the handle stays open until told to go
-        _exit(0);
-    }
+    // PR #1 review (37th round): spawned, not forked -- sqlite3_open() in a forked child of
+    // this process crashes inside libsystem_trace about one run in ten (see spawn_opener).
+    // The child reports through `rep` and then holds the handle until `ctl` closes, so that
+    // the parent going away -- for any reason -- ends it, exactly as before.
+    pid_t pid = spawn_m1_opener(dbp, rep[1], ctl[0]);
     close(rep[1]);
     close(ctl[0]);
     int got[3] = {-9, -9, -9};
@@ -1107,6 +1117,242 @@ static void steps_release(void) {
     }
     g_steps_child = 0;
     g_steps_ctl = -1;
+}
+
+// ---- PR #1 review (37th round, P1): the revert, and a second M2 opener on top of it ---------
+//
+// Two processes running the same protocol in OPPOSITE directions. A -- this process -- is
+// reverting: it has exchanged the database back to `metadata.db` and its next syscall is the
+// unlink of `metadata3.db`. B is a child that calls wfs_store_open() in exactly that instant,
+// and what it finds on disk (VERSION 3, both names regular, one inode) is, to the letter, the
+// shape an interrupted FORWARD move leaves -- so before this round B resumed forward, and
+// between them the two of them unlinked every name the database had.
+//
+// The child is forked BEFORE the seam is armed, so it carries none of the parent's seams into
+// its own open, and it waits on a pipe until the parent is in the window.
+static int g_r37_go_w = -1;        // A -> B: the window is open, start your open
+static int g_r37_started_r = -1;   // B -> A: armed, and about to call wfs_store_open
+static int g_r37_exch_r = -1;      // B -> A: I have exchanged my own stub into metadata.db
+static int g_r37_done_r = -1;      // B -> A: my open has returned
+static char g_r37_db[4096], g_r37_db3[4096];
+static int g_r37_ran;
+static int g_r37_win_nlink, g_r37_win_same_ino;      // the window's own shape
+static int g_r37_exchanged_in_window, g_r37_done_in_window;
+
+// Readable without consuming: the report is one array and the parent reads it whole, later.
+static int r37_readable(int fd) {
+    struct pollfd pf;
+    pf.fd = fd;
+    pf.events = POLLIN;
+    pf.revents = 0;
+    return poll(&pf, 1, 0) == 1 && (pf.revents & POLLIN) != 0;
+}
+
+static void r37_in_revert(void *ctx, const char *dir, int phase) {
+    (void)ctx;
+    (void)dir;
+    if (phase != 1 || g_r37_ran) return;
+    g_r37_ran++;
+    struct stat a, b;
+    g_r37_win_nlink = lstat(g_r37_db, &a) == 0 && S_ISREG(a.st_mode) ? (int)a.st_nlink : -1;
+    g_r37_win_same_ino = lstat(g_r37_db3, &b) == 0 && a.st_ino == b.st_ino ? 1 : 0;
+    char c = 0;
+    CHECK(write(g_r37_go_w, "g", 1) == 1);
+    CHECK(read(g_r37_started_r, &c, 1) == 1);   // B is armed and inside wfs_store_open
+    usleep(250 * 1000);
+    // With the lock, B cannot have got past flock(2) -- so it has neither exchanged anything
+    // into `metadata.db` nor finished. Both of these were true here before the fix, and the
+    // second of them is what freed the inode.
+    g_r37_exchanged_in_window = r37_readable(g_r37_exch_r);
+    g_r37_done_in_window = r37_readable(g_r37_done_r);
+}
+
+// ... and the child's own two seams: what it found the instant it got the lock, and whether it
+// ever reached the exchange (it must not, while the parent holds the lock).
+static int g_r37_c_exch_w = -1;
+static int g_r37_c_ver, g_r37_c_kind, g_r37_c_nlink, g_r37_c_db3;
+static char g_r37_c_dir[4096];
+static void r37_child_in_lock(void *ctx, const char *dir) {
+    (void)ctx;
+    (void)dir;
+    char p[4096], buf[64];
+    struct stat st;
+    join(p, sizeof p, g_r37_c_dir, "VERSION");
+    g_r37_c_ver = read_file(p, buf, sizeof buf) == 0 ? atoi(buf) : -1;
+    join(p, sizeof p, g_r37_c_dir, "metadata.db");
+    g_r37_c_kind = lstat(p, &st) != 0 ? 0 : (S_ISREG(st.st_mode) ? 1 : (S_ISDIR(st.st_mode) ? 2 : 3));
+    g_r37_c_nlink = g_r37_c_kind == 1 ? (int)st.st_nlink : -1;
+    join(p, sizeof p, g_r37_c_dir, "metadata3.db");
+    g_r37_c_db3 = lstat(p, &st) == 0;
+}
+static void r37_child_exchanged(void *ctx, const char *dir, int phase) {
+    (void)ctx;
+    (void)dir;
+    if (phase != 2) return;
+    ssize_t n = write(g_r37_c_exch_w, "x", 1);
+    (void)n;
+}
+
+// ---- PR #1 review (37th round, P1): a second PROCESS, and why it is exec'd ------------------
+//
+// Every "second opener" in this file used to be a nested call or a bare fork. A bare fork will
+// not do for one that opens a store: os_log's state is not fork-safe on this platform, and
+// sqlite3_open() in a forked child of a process that has logged anything crashes inside
+// libsystem_trace -- measured here, 2 runs in 15, EXC_BAD_ACCESS in
+// _os_log_preferences_refresh under openDatabase, with nothing of ours on the stack. execv(2)
+// gives the child a fresh address space and costs a millisecond, and "a second process" is
+// what every one of these cases is describing anyway.
+//
+// The child re-runs this binary in `--open-store` mode. Descriptors survive exec (the pipes are
+// passed by number on the command line); the upgrade lock does not travel with it, because the
+// core opens that one O_CLOEXEC.
+static char g_exe[4096];
+
+// `--open-store <store> <gofd> <startfd> <exchfd> <donefd>`; -1 for the pipes this caller does
+// not want. It waits for `go`, arms the two seams a second opener is interesting for, says
+// `start`, opens the store, and reports six ints: the rc, then what it saw the instant it had
+// the upgrade lock (VERSION, the kind of `metadata.db`, its link count, whether `metadata3.db`
+// was there) and its link count again once the open had returned.
+static int helper_open_store(char **argv) {
+    const char *dir = argv[2];
+    int gofd = atoi(argv[3]), startfd = atoi(argv[4]);
+    int exchfd = atoi(argv[5]), donefd = atoi(argv[6]);
+    snprintf(g_r37_c_dir, sizeof g_r37_c_dir, "%s", dir);
+    char c = 0;
+    if (gofd >= 0 && read(gofd, &c, 1) != 1) return 31;
+    if (exchfd >= 0) {
+        g_r37_c_exch_w = exchfd;
+        wfs_test_between_db_steps = r37_child_exchanged;
+    }
+    wfs_test_in_upgrade_lock = r37_child_in_lock;
+    if (startfd >= 0 && write(startfd, "s", 1) != 1) return 32;
+    wfs_store *bs = NULL;
+    int rc = wfs_store_open(dir, &bs);
+    if (bs) wfs_store_close(bs);
+    char p[4096];
+    struct stat st;
+    join(p, sizeof p, dir, "metadata.db");
+    int rep[6];
+    rep[0] = rc;
+    rep[1] = g_r37_c_ver;
+    rep[2] = g_r37_c_kind;
+    rep[3] = g_r37_c_nlink;
+    rep[4] = g_r37_c_db3;
+    rep[5] = lstat(p, &st) == 0 && S_ISREG(st.st_mode) ? (int)st.st_nlink : -1;
+    if (donefd >= 0 && write(donefd, rep, sizeof rep) != (ssize_t)sizeof rep) return 33;
+    return 0;
+}
+
+// `--m1-open <database> <repfd> <ctlfd>`: M1's own open, in a process of its own. It reports
+// the rc, `SELECT count(*) FROM worlds` (-1 = no such table at all) and `PRAGMA user_version`,
+// and then keeps the handle until the control pipe closes -- because what the upgrade asks next
+// is who ELSE has this database open.
+static int helper_m1_open(char **argv) {
+    const char *dbp = argv[2];
+    int repfd = atoi(argv[3]), ctlfd = atoi(argv[4]);
+    int out[3] = {-1, -2, -2};
+    sqlite3 *h = NULL;
+    // `main`'s M1 core, exactly: SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_FULLMUTEX.
+    out[0] = sqlite3_open_v2(
+        dbp, &h, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
+    if (out[0] == SQLITE_OK) {
+        out[1] = -1;   // not even a `worlds` table: a database SQLite has just created
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(h, "SELECT count(*) FROM worlds", -1, &st, NULL) == SQLITE_OK &&
+            sqlite3_step(st) == SQLITE_ROW)
+            out[1] = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+        st = NULL;
+        if (sqlite3_prepare_v2(h, "PRAGMA user_version", -1, &st, NULL) == SQLITE_OK &&
+            sqlite3_step(st) == SQLITE_ROW)
+            out[2] = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    if (write(repfd, out, sizeof out) != (ssize_t)sizeof out) return 34;
+    char z;
+    while (read(ctlfd, &z, 1) > 0) {}
+    return 0;
+}
+
+static pid_t spawn_m1_opener(const char *dbp, int repfd, int ctlfd) {
+    char a[2][16];
+    snprintf(a[0], sizeof a[0], "%d", repfd);
+    snprintf(a[1], sizeof a[1], "%d", ctlfd);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) { dup2(devnull, 0); dup2(devnull, 1); dup2(devnull, 2); }
+        char *av[6];
+        av[0] = g_exe;
+        av[1] = (char *)"--m1-open";
+        av[2] = (char *)dbp;
+        av[3] = a[0];
+        av[4] = a[1];
+        av[5] = NULL;
+        execv(g_exe, av);
+        _exit(41);
+    }
+    return pid;
+}
+
+static pid_t spawn_opener(const char *dir, int gofd, int startfd, int exchfd, int donefd) {
+    char a[4][16];
+    snprintf(a[0], sizeof a[0], "%d", gofd);
+    snprintf(a[1], sizeof a[1], "%d", startfd);
+    snprintf(a[2], sizeof a[2], "%d", exchfd);
+    snprintf(a[3], sizeof a[3], "%d", donefd);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        // Between fork(2) and execv(2): nothing but the calls that are safe there.
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) { dup2(devnull, 0); dup2(devnull, 1); dup2(devnull, 2); }
+        char *av[8];
+        av[0] = g_exe;
+        av[1] = (char *)"--open-store";
+        av[2] = (char *)dir;
+        av[3] = a[0];
+        av[4] = a[1];
+        av[5] = a[2];
+        av[6] = a[3];
+        av[7] = NULL;
+        execv(g_exe, av);
+        _exit(41);
+    }
+    return pid;
+}
+
+// ---- and the guard the lock is only the first half of ---------------------------------------
+//
+// Every unlink of a database name in both protocols now asks whether the name it is about to
+// remove really is the SECOND link of the name it is keeping. This fires in the forward move's
+// own window -- after the exchange, before step 4's unlink -- and puts the store into the two
+// shapes where the answer is no: `metadata3.db` taken away from under it (which is precisely
+// what a concurrent revert did), and a stranger's file at the private stub name.
+static int g_r37_guard_mode;
+static int g_r37_guard_ran;
+static char g_r37_guard_stub[4096];
+static void r37_guard(void *ctx, const char *dir, int phase) {
+    (void)ctx;
+    if (phase != 2 || g_r37_guard_ran) return;
+    g_r37_guard_ran++;
+    g_r37_guard_stub[0] = 0;
+    DIR *d = opendir(dir);
+    CHECK(d != NULL);
+    while (struct dirent *e = readdir(d))
+        if (!strncmp(e->d_name, "metadata.db.stub.", 17))
+            join(g_r37_guard_stub, sizeof g_r37_guard_stub, dir, e->d_name);
+    closedir(d);
+    CHECK(g_r37_guard_stub[0] != 0);
+    char p[4096];
+    join(p, sizeof p, dir, "metadata3.db");
+    if (g_r37_guard_mode == 1) {
+        CHECK(unlink(p) == 0);            // the revert's own next syscall, from outside
+    } else {
+        CHECK(unlink(g_r37_guard_stub) == 0);
+        write_file(g_r37_guard_stub, "not the database\n");
+    }
 }
 
 // PR #1 review (26th round, P1): the user's own `mv`, run in the one window no transaction of
@@ -1171,7 +1417,14 @@ static void copy_dir(const char *src, const char *dst) {
     closedir(d);
 }
 
-int main() {
+int main(int argc, char **argv) {
+    // PR #1 review (37th round, P1): the second-process mode. It must come before anything
+    // else -- the helper is this same binary, re-executed.
+    CHECK(argc >= 1);
+    if (!realpath(argv[0], g_exe)) snprintf(g_exe, sizeof g_exe, "%s", argv[0]);
+    if (argc == 7 && !strcmp(argv[1], "--open-store")) return helper_open_store(argv);
+    if (argc == 5 && !strcmp(argv[1], "--m1-open")) return helper_m1_open(argv);
+
     const char *tmp = getenv("TMPDIR");
     char tpl[4096];
     snprintf(tpl, sizeof tpl, "%swfs-m1-test.XXXXXX", (tmp && *tmp) ? tmp : "/tmp/");
@@ -5922,19 +6175,37 @@ int main() {
         snprintf(g_vrace_store, sizeof g_vrace_store, "%s", vstore);
         g_vrace_rc = -1;
         g_vrace_ran = 0;
+        vrace_spawn();                 // 37th round: a second PROCESS, forked before the lock
         wfs_test_before_version_rename = vrace_before_version_rename;
         vs = NULL;
         int vrace_a = wfs_store_open(vstore, &vs);
         wfs_test_before_version_rename = NULL;
+        vrace_join();                  // ... and joined once the lock has been dropped
         CHECK(g_vrace_ran == 1);
-        CHECK_OK(g_vrace_rc);          // the open that renamed first
-        CHECK_OK(vrace_a);             // and the one that renamed second: -ENOENT before the fix
-        CHECK(vs != NULL);
+        //     PR #1 review (37th round, P1): the second opener is a second PROCESS now, and
+        //     that brings the 34th round's trade with it -- whichever of the two reaches the
+        //     holder gate while the other has the database open is refused, puts its own
+        //     upgrade back, and says WFS_E_STORE_BUSY. ("Two upgraders that refuse each other
+        //     is a retry on the first open of a store", legacy_holders_gate().) Both coming
+        //     back 0 was only ever possible while the "second opener" was a nested call in
+        //     THIS process, which fs_other_holders() excludes by pid -- and a nested call is
+        //     not possible any more either: the upgrade lock is an flock, and this process
+        //     holding it would block on itself. So what is asserted is what was promised:
+        //     neither open invents a failure of its own (-ENOENT is the 31st round's bug,
+        //     -EIO and DAMAGED would be new ones), neither leaves a temporary behind, and the
+        //     store is sound afterwards.
+        CHECK(vrace_a == 0 || vrace_a == WFS_E_STORE_BUSY);
+        CHECK(g_vrace_rc == 0 || g_vrace_rc == WFS_E_STORE_BUSY);
+        if (vs) wfs_store_close(vs);
+        CHECK(n_with_prefix(vstore, "VERSION.tmp") == 0);   // and neither left a temporary
+        //     ... and one more open, with nobody else in the store, takes it over.
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
         wfs_store_close(vs);
         CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
         CHECK(atoi(vbuf) == WFS_STORE_SCHEMA);      // read once, and it says 3
         CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
-        CHECK(n_with_prefix(vstore, "VERSION.tmp") == 0);   // and neither left a temporary
+        CHECK(n_with_prefix(vstore, "VERSION.tmp") == 0);
 
         // ... and the crashed upgrader: a temporary from a process that died between writing it
         //     and renaming it. It is ours -- nothing but this core writes that name, in that
@@ -6306,6 +6577,219 @@ int main() {
         CHECK(atoi(vbuf) == WFS_STORE_SCHEMA);
         CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
         for (size_t i = 0; i < kAddedN; ++i) CHECK(db_has_column(vdb3, kAdded[i][0], kAdded[i][1]));
+
+        // (f) PR #1 review (37th round, P1): the revert, and a second M2 opener on top of it ---
+        //
+        //     The gate above reverts; the store's two names in the middle of that revert are
+        //     one inode under both of them, which is EXACTLY the shape an interrupted forward
+        //     move leaves -- and the table says that shape is taken forward. So a second M2
+        //     process opening the store in that instant resumed the move while the first was
+        //     undoing it, and the two of them unlinked every name the database had: A's
+        //     `unlink(metadata3.db)` and then B's unlink of its own "extra" link, which by then
+        //     was the last one. Measured on the parent commit (scratchpad probe, both opens
+        //     returning WFS_E_STORE_BUSY): `metadata.db` an empty 0500 directory,
+        //     `metadata3.db` gone, the inode with no name at all, and the next open
+        //     WFS_E_STORE_DAMAGED over a store with trees in it.
+        //
+        //     Both halves of the fix are pinned here. The lock: B blocks on
+        //     `<store>/upgrade.lock` until A's whole revert is done, so it never gets into the
+        //     window at all, and what it finds when it does get in is the schema-2 store A put
+        //     back. The guard: below, where a move is made to unlink a name that is not the
+        //     second link of the database.
+        {
+            store_as_m1(vstore, 0);
+            db_exec(vdb, "INSERT INTO worlds(id,name,created_at) VALUES(1,'r37a',1);"
+                         "INSERT INTO worlds(id,name,created_at) VALUES(2,'r37b',2);");
+            CHECK(db_i64(vdb, "SELECT count(*) FROM worlds") == 2);
+            snprintf(g_r37_db, sizeof g_r37_db, "%s", vdb);
+            snprintf(g_r37_db3, sizeof g_r37_db3, "%s", vdb3);
+            snprintf(g_r37_c_dir, sizeof g_r37_c_dir, "%s", vstore);
+
+            // The holder: what makes this open revert at all (34th round). Same rules as every
+            // child here -- nothing of the parent's but its pipes, and it dies when they do.
+            int hp[2], hc[2];
+            CHECK(pipe(hp) == 0);
+            CHECK(pipe(hc) == 0);
+            pid_t h2 = fork();
+            CHECK(h2 >= 0);
+            if (h2 == 0) {
+                close(hp[0]);
+                close(hc[1]);
+                int devnull = open("/dev/null", O_RDWR);
+                if (devnull >= 0) { dup2(devnull, 0); dup2(devnull, 1); dup2(devnull, 2); }
+                int f = open(vdb, O_RDWR);
+                char ok = f >= 0 ? 'y' : 'n';
+                ssize_t wn = write(hp[1], &ok, 1);
+                (void)wn;
+                char z;
+                while (read(hc[0], &z, 1) > 0) {}
+                _exit(0);
+            }
+            close(hp[1]);
+            close(hc[0]);
+            char hgot = 0;
+            CHECK(read(hp[0], &hgot, 1) == 1);
+            CHECK(hgot == 'y');
+
+            // B: a second PROCESS -- spawned, not forked (see spawn_opener above) -- and
+            // started before the seam is armed, so its own open carries none of this one's.
+            int gop[2], stp[2], exp2[2], dnp[2];
+            CHECK(pipe(gop) == 0);
+            CHECK(pipe(stp) == 0);
+            CHECK(pipe(exp2) == 0);
+            CHECK(pipe(dnp) == 0);
+            pid_t bpid = spawn_opener(vstore, gop[0], stp[1], exp2[1], dnp[1]);
+            close(gop[0]);
+            close(stp[1]);
+            close(exp2[1]);
+            close(dnp[1]);
+            g_r37_go_w = gop[1];
+            g_r37_started_r = stp[0];
+            g_r37_exch_r = exp2[0];
+            g_r37_done_r = dnp[0];
+
+            g_r37_ran = 0;
+            g_r37_exchanged_in_window = -1;
+            g_r37_done_in_window = -1;
+            wfs_test_in_revert = r37_in_revert;
+            vs = NULL;
+            int arc = wfs_store_open(vstore, &vs);
+            wfs_test_in_revert = NULL;
+            CHECK_RC(arc, WFS_E_STORE_BUSY);
+            CHECK(vs == NULL);
+            CHECK(g_r37_ran == 1);
+            // The window really is the one the finding is about: one inode, both names.
+            CHECK(g_r37_win_nlink == 2);
+            CHECK(g_r37_win_same_ino == 1);
+            // ... and B spent all of it on the lock. Both of these were true before the fix,
+            //     and the second of them is the unlink that freed the inode.
+            CHECK(g_r37_exchanged_in_window == 0);
+            CHECK(g_r37_done_in_window == 0);
+
+            // What B found the instant it did get in: the schema-2 store A put back, whole.
+            int brep[6] = {-9, -9, -9, -9, -9, -9};
+            CHECK(read(g_r37_done_r, brep, sizeof brep) == (ssize_t)sizeof brep);
+            CHECK(brep[1] == WFS_STORE_SCHEMA_M1);   // VERSION back at 2
+            CHECK(brep[2] == 1);                     // a REGULAR metadata.db...
+            CHECK(brep[3] == 1);                     // ...carrying one link...
+            CHECK(brep[4] == 0);                     // ...and no metadata3.db beside it
+            CHECK(brep[5] == 1);                     // and its own open left it that way
+            CHECK(brep[0] == WFS_E_STORE_BUSY);      // the holder is still there: BUSY, again
+            int bst2 = 0;
+            CHECK(waitpid(bpid, &bst2, 0) == bpid);
+            CHECK(WIFEXITED(bst2));
+            CHECK(WEXITSTATUS(bst2) == 0);
+            close(gop[1]);
+            close(stp[0]);
+            close(exp2[0]);
+            close(dnp[0]);
+
+            // The assertion this round exists for: the database is still where M1 left it,
+            // under one name, with its rows.
+            CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
+            CHECK(atoi(vbuf) == WFS_STORE_SCHEMA_M1);
+            CHECK(stat(vdb, &vst0) == 0 && S_ISREG(vst0.st_mode));
+            CHECK(nlink_of(vdb) == 1);
+            CHECK(!exists(vdb3));
+            CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA_M1);
+            CHECK(db_i64(vdb, "SELECT count(*) FROM worlds") == 2);
+            CHECK(n_with_prefix(vstore, "metadata.db.stub.") == 0);
+            CHECK(n_with_prefix(vstore, "VERSION.tmp") == 0);
+
+            // ... and with the holder gone, the next open takes the store over as usual.
+            CHECK(kill(h2, SIGKILL) == 0);
+            int hst2 = 0;
+            CHECK(waitpid(h2, &hst2, 0) == h2);
+            close(hp[0]);
+            close(hc[1]);
+            vs = NULL;
+            CHECK_OK(wfs_store_open(vstore, &vs));
+            wfs_store_close(vs);
+            CHECK(stat(vdb, &vst0) == 0 && S_ISDIR(vst0.st_mode));
+            CHECK(nlink_of(vdb3) == 1);
+            CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
+            CHECK(db_i64(vdb3, "SELECT count(*) FROM worlds") == 2);
+
+            // The lock is a file of its own, and never a holder of the database: a process
+            // with `upgrade.lock` open is nobody as far as the gate is concerned.
+            char vlock[4096];
+            join(vlock, sizeof vlock, vstore, "upgrade.lock");
+            CHECK(exists(vlock));
+            int lp[2], lc[2];
+            CHECK(pipe(lp) == 0);
+            CHECK(pipe(lc) == 0);
+            pid_t lpid = fork();
+            CHECK(lpid >= 0);
+            if (lpid == 0) {
+                close(lp[0]);
+                close(lc[1]);
+                int devnull = open("/dev/null", O_RDWR);
+                if (devnull >= 0) { dup2(devnull, 0); dup2(devnull, 1); dup2(devnull, 2); }
+                int f = open(vlock, O_RDWR);
+                char ok = f >= 0 ? 'y' : 'n';
+                ssize_t wn = write(lp[1], &ok, 1);
+                (void)wn;
+                char z;
+                while (read(lc[0], &z, 1) > 0) {}
+                _exit(0);
+            }
+            close(lp[1]);
+            close(lc[0]);
+            char lgot = 0;
+            CHECK(read(lp[0], &lgot, 1) == 1);
+            CHECK(lgot == 'y');
+            size_t ln = 1;
+            CHECK_OK(wfs_store_holders(vstore, NULL, 0, &ln));
+            CHECK(ln == 0);
+            CHECK(kill(lpid, SIGKILL) == 0);
+            int lst = 0;
+            CHECK(waitpid(lpid, &lst, 0) == lpid);
+            close(lp[0]);
+            close(lc[1]);
+        }
+
+        // ... and the belt to that pair of braces: no unlink of a database name ever takes the
+        //     last link, whether or not anybody was holding the lock. The seam fires in the
+        //     forward move's own window -- after the exchange, before step 4 -- and does to the
+        //     store what a concurrent revert did: takes `metadata3.db` away. Step 4's name is
+        //     then the database's ONLY link, and removing it is what the probe measured.
+        store_as_m1(vstore, 0);
+        db_exec(vdb, "INSERT INTO worlds(id,name,created_at) VALUES(1,'r37c',1);"
+                     "INSERT INTO worlds(id,name,created_at) VALUES(2,'r37d',2);");
+        g_r37_guard_mode = 1;
+        g_r37_guard_ran = 0;
+        wfs_test_between_db_steps = r37_guard;
+        vs = NULL;
+        CHECK_RC(wfs_store_open(vstore, &vs), WFS_E_STORE_DAMAGED);
+        wfs_test_between_db_steps = NULL;
+        CHECK(vs == NULL);
+        CHECK(g_r37_guard_ran == 1);
+        CHECK(!exists(vdb3));
+        // The refusal left the name where it was -- so the inode still has one, and it is
+        // still the database, with both of its rows. Before the fix it had none.
+        CHECK(stat(g_r37_guard_stub, &vst0) == 0 && S_ISREG(vst0.st_mode));
+        CHECK(nlink_of(g_r37_guard_stub) == 1);
+        CHECK(db_i64(g_r37_guard_stub, "SELECT count(*) FROM worlds") == 2);
+
+        // ... and the other shape of "that is not my link": a stranger's file at the private
+        //     stub name. Not ours, not removed -- and the move itself is done, so this open
+        //     carries on and the store is an ordinary schema-3 store afterwards.
+        store_as_m1(vstore, 0);
+        g_r37_guard_mode = 2;
+        g_r37_guard_ran = 0;
+        wfs_test_between_db_steps = r37_guard;
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_test_between_db_steps = NULL;
+        wfs_store_close(vs);
+        CHECK(g_r37_guard_ran == 1);
+        CHECK(read_file(g_r37_guard_stub, vbuf, sizeof vbuf) == 0);
+        CHECK(strcmp(vbuf, "not the database\n") == 0);
+        CHECK(stat(vdb, &vst0) == 0 && S_ISDIR(vst0.st_mode));
+        CHECK(stat(vdb3, &vst0) == 0 && S_ISREG(vst0.st_mode));
+        CHECK(nlink_of(vdb3) == 1);
+        CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
+        CHECK(unlink(g_r37_guard_stub) == 0);
     }
     // ---- PR #1 review (25th round, P1): a trash entry is the row's tree, not the row's name --
     //

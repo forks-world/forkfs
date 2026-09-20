@@ -1104,6 +1104,25 @@ extern void *wfs_test_after_db_move_ctx;
 extern void (*wfs_test_between_db_steps)(void *ctx, const char *dir, int phase);
 extern void *wfs_test_between_db_steps_ctx;
 
+/* And the same window on the way BACK (PR #1 review, 37th round, P1). The revert the holder
+ * gate makes goes through the same exchange in reverse, and between the exchange and the unlink
+ * of `metadata3.db` the database is a regular file under BOTH names -- which is, to the letter,
+ * the shape an interrupted forward move leaves, and which another M2 process opening the store
+ * in that instant used to resume FORWARD until the two of them had unlinked every name the
+ * inode had. `phase` is 1 after the exchange back and before `metadata3.db` goes, 2 after it
+ * has gone and before VERSION is put back to 2. Called with the store directory. NULL unless a
+ * test sets it; nothing in the library ever assigns it. */
+extern void (*wfs_test_in_revert)(void *ctx, const char *dir, int phase);
+extern void *wfs_test_in_revert_ctx;
+
+/* And the far side of the lock those two directions now take (PR #1 review, 37th round, P1).
+ * This fires in the process that WAITED, the instant it has `<store>/upgrade.lock` and before
+ * it has read a single byte of the store under it -- so what a test reads from inside it is
+ * exactly what the protocol it waited for left on disk. Called with the store directory. NULL
+ * unless a test sets it; nothing in the library ever assigns it. */
+extern void (*wfs_test_in_upgrade_lock)(void *ctx, const char *dir);
+extern void *wfs_test_in_upgrade_lock_ctx;
+
 /* One step(2) of one query, failed on demand (PR #1 review, 32nd round, P2). Every count and
  * every lookup that decides a destructive step now tells SQLITE_DONE from an error, and the only
  * way to test that from outside is to make a step fail. Set this to a substring of the SQL of
