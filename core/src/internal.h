@@ -230,6 +230,22 @@ int fs_remove_tree(const char *root, int64_t deadline_us = 0, int *partial = nul
 // deleting a `.deleting` tree, which is resumable by construction, so stopping is not an error.
 int fs_remove_tree_parallel(const char *root, int threads, uint64_t *entries,
                             int64_t deadline_us = 0, int *partial = nullptr);
+// PR #1 review (26th round, P1): the same deletion done through a descriptor instead of a name.
+// Both removers above re-resolve the whole path on every opendir/unlink/rmdir, so what they
+// delete is whatever the name leads to at the instant of each call -- and the trash collector's
+// authority to delete comes from an identity check (the row's dev/ino) made one call earlier.
+// This removes everything INSIDE `dirfd` and leaves the now-empty directory itself to the
+// caller, whose descriptor `dirfd` is: nothing in the walk ever names the root, every step is
+// openat/fstatat/unlinkat relative to a descriptor already held, and O_NOFOLLOW /
+// AT_SYMLINK_NOFOLLOW are on every one of them, so nothing outside the tree that descriptor
+// points at can be reached however the names underneath it are moved while the walk runs.
+// `entries`, `deadline_us` and `partial` mean exactly what they mean for fs_remove_tree_parallel
+// (the root is not counted; the deadline is read per entry; a walk the deadline cut short comes
+// back 0 with *partial = 1). `threads` is accepted and ignored: this walk is serial, because
+// making the parallel walker descend by descriptor is a rewrite of the walker -- the measured
+// cost is in docs/TASKS.md (26th round).
+int fs_remove_tree_fd(int dirfd, int threads, uint64_t *entries, int64_t deadline_us = 0,
+                      int *partial = nullptr);
 
 // ---- Darwin-only primitives (stubs elsewhere) --------------------------------------------
 

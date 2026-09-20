@@ -874,6 +874,188 @@ int rm_entry(void *ctx, const char *path, const char *rel, const struct stat &st
 
 } // namespace
 
+// ---- PR #1 review (26th round, P1): the same deletion, by descriptor ------------------------
+//
+// fs_remove_tree/fs_remove_tree_parallel above walk a tree by NAME: every opendir, unlink and
+// rmdir re-resolves the whole path from the root, so what they remove is whatever the name
+// happens to lead to at the instant of each call. For the trash that is one guarantee short.
+// The collector proves an entry is the row's tree (its dev/ino), and it is that proof, not the
+// name, that authorises the deletion -- so the deletion has to be done through the descriptor
+// the proof was made on. `dirfd` is the caller's, already opened and already checked; this
+// removes everything INSIDE it and leaves the (now empty) directory itself for the caller,
+// which is the one name it still has to use and which it re-checks against this descriptor
+// before it rmdirs it (world.cpp, trash_unlink_claim).
+//
+// Nothing here ever names the root. Every step is openat/fstatat/unlinkat relative to a
+// descriptor we already hold, O_NOFOLLOW and AT_SYMLINK_NOFOLLOW everywhere, so no symlink is
+// ever followed and nothing outside the tree the descriptor points at can be reached, whatever
+// anybody renames underneath us while the walk runs.
+//
+// Serial, unlike fs_remove_tree_parallel: the parallel walker hands its workers paths and does
+// its rmdirs from a deepest-first list of paths, so making it descend by descriptor is a
+// rewrite of the walker rather than a change to the deleter. The cost is measured in
+// docs/TASKS.md (26th round). One descriptor per level of depth, like the path-based
+// single-threaded remover's one DIR per level.
+namespace {
+
+// The write/search bits and the immutable flag of the directory we are standing in -- cleared
+// through the descriptor, never by name. We are deleting what is under it, so taking the mode
+// off for good is exactly right (docs/M1_DESIGN.md §3 P4, and the 4th/18th rounds for the
+// path-based remover's version of the same lend).
+void rm_fd_unlock_dir(int fd) {
+#ifdef __APPLE__
+    ::fchflags(fd, 0);
+#endif
+    struct stat st;
+    if (::fstat(fd, &st) == 0 && (st.st_mode & 0700) != 0700)
+        ::fchmod(fd, (mode_t)((st.st_mode & 07777) | 0700));
+}
+
+// The same for one child, which needs a descriptor of its own because there is no fchflagsat(2).
+// Only the three types a world tree is made of are opened: a fifo or a device would block or
+// have side effects on open(2), and an immutable one of those is not a state this core can
+// produce (only `--hard` snapshots set UF_IMMUTABLE, and their trash entry is inside the store
+// and keeps the path-based remover -- see world.cpp).
+void rm_fd_unlock_child(int fd, const char *name, const struct stat &st) {
+#ifdef __APPLE__
+    int flags = O_RDONLY | O_NONBLOCK | O_CLOEXEC;
+    if (S_ISLNK(st.st_mode)) flags |= O_SYMLINK;
+    else if (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode)) flags |= O_NOFOLLOW;
+    else return;
+    int cfd = ::openat(fd, name, flags);
+    if (cfd < 0) return;
+    ::fchflags(cfd, 0);
+    if (S_ISDIR(st.st_mode)) ::fchmod(cfd, 0700);
+    ::close(cfd);
+#else
+    (void)fd;
+    (void)name;
+    (void)st;
+#endif
+}
+
+// Open a child directory for the walk. The one case that cannot be done through a descriptor is
+// a directory whose own bits keep it from being opened at all (a 0555 of the source's making, a
+// gate-protected 0000 root): there is no fchmod without a descriptor, so the bits are lent by
+// name -- AT_SYMLINK_NOFOLLOW where the platform has it, and the O_NOFOLLOW|O_DIRECTORY open
+// that follows is what proves again that the name is the directory we stat'ed and not a symlink
+// somebody has just put there. Returns the fd, or a negative errno.
+int rm_fd_open_child(int fd, const char *name, const struct stat &st) {
+    int cfd = ::openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (cfd >= 0) return cfd;
+    int e = errno;
+    if (e != EACCES && e != EPERM) return -e;
+    mode_t want = (mode_t)((st.st_mode & 07777) | 0700);
+#ifdef AT_SYMLINK_NOFOLLOW
+    if (::fchmodat(fd, name, want, AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOTSUP)
+        ::fchmodat(fd, name, want, 0);
+#else
+    ::fchmodat(fd, name, want, 0);
+#endif
+    cfd = ::openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    return cfd >= 0 ? cfd : -errno;
+}
+
+// rmdir of one emptied child, from the descriptor of the directory it is in.
+int rm_fd_rmdir(int fd, const char *name) {
+    if (::unlinkat(fd, name, AT_REMOVEDIR) == 0 || errno == ENOENT) return 0;
+    int e = errno;
+    if (e == EPERM || e == EACCES) {
+        rm_fd_unlock_dir(fd);
+        struct stat st;
+        if (::fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0) rm_fd_unlock_child(fd, name, st);
+        if (::unlinkat(fd, name, AT_REMOVEDIR) == 0 || errno == ENOENT) return 0;
+        e = errno;
+    }
+    return -e;
+}
+
+// Empties the directory `d` reads and closes `d`. `deadline` is an fs_mono_us() stamp checked
+// per entry, exactly as rm_rec and rm_entry check it, and -ECANCELED unwinds without rmdir'ing
+// anything on the way out.
+int rm_fd_walk(DIR *d, uint64_t *entries, int64_t deadline) {
+    int fd = ::dirfd(d);
+    int rc = 0;
+    while (struct dirent *e = ::readdir(d)) {
+        const char *nm = e->d_name;
+        if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) continue;
+        if (deadline && fs_mono_us() >= deadline) { rc = -ECANCELED; break; }
+        struct stat st;
+        if (::fstatat(fd, nm, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno == ENOENT) continue;
+            rc = -errno;
+            break;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            // Twice at most: the walk unlinks entries while the same DIR stream is being read,
+            // and POSIX leaves it unspecified whether readdir(3) hands back an entry removed
+            // after opendir(3). The path-based deleter answers an ENOTEMPTY here by finishing
+            // that one directory with rm_rec; this starts it again instead, which is the same
+            // remedy without a name.
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                int cfd = rm_fd_open_child(fd, nm, st);
+                if (cfd < 0) { rc = cfd == -ENOENT ? 0 : cfd; break; }
+                DIR *cd = ::fdopendir(cfd);
+                if (!cd) { rc = -errno; ::close(cfd); break; }
+                rc = rm_fd_walk(cd, entries, deadline);   // closes cd
+                if (rc) break;
+                rc = rm_fd_rmdir(fd, nm);
+                if (rc != -ENOTEMPTY) break;
+            }
+            if (rc) break;
+            if (entries) bump(*entries);
+            continue;
+        }
+        if (::unlinkat(fd, nm, 0) == 0 || errno == ENOENT) { if (entries) bump(*entries); continue; }
+        int e2 = errno;
+        if (e2 == EPERM || e2 == EACCES) {
+            // The write bit that unlink(2) needs is this directory's, not the entry's; and
+            // UF_IMMUTABLE can be on either. Both are cleared through descriptors.
+            rm_fd_unlock_dir(fd);
+            rm_fd_unlock_child(fd, nm, st);
+            if (::unlinkat(fd, nm, 0) == 0 || errno == ENOENT) {
+                if (entries) bump(*entries);
+                continue;
+            }
+            e2 = errno;
+        }
+        rc = -e2;
+        break;
+    }
+    ::closedir(d);
+    return rc;
+}
+
+} // namespace
+
+int fs_remove_tree_fd(int dirfd, int threads, uint64_t *entries, int64_t deadline_us, int *partial) {
+    (void)threads;   // serial by construction; see the note above
+    if (partial) *partial = 0;
+    if (dirfd < 0) return -EBADF;
+    struct stat st;
+    if (::fstat(dirfd, &st) != 0) return -errno;
+    if (!S_ISDIR(st.st_mode)) return -ENOTDIR;
+    rm_fd_unlock_dir(dirfd);
+    // fdopendir(3) takes the descriptor it is given, and this one is the caller's -- it has to
+    // outlive the walk, because the caller's last two checks are made against it.
+    int dup_fd = ::dup(dirfd);
+    if (dup_fd < 0) return -errno;
+    DIR *d = ::fdopendir(dup_fd);
+    if (!d) {
+        int e = errno;
+        ::close(dup_fd);
+        return -e;
+    }
+    ::rewinddir(d);
+    int rc = rm_fd_walk(d, entries, deadline_us);
+    if (rc == -ECANCELED) {
+        // Out of time, not out of luck: exactly the contract fs_remove_tree_parallel has.
+        if (partial) *partial = 1;
+        return 0;
+    }
+    return rc;
+}
+
 int fs_remove_tree_parallel(const char *root, int threads, uint64_t *entries, int64_t deadline_us,
                             int *partial) {
     if (partial) *partial = 0;
