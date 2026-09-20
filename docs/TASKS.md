@@ -1244,6 +1244,44 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第三十轮:借来的权限位要还回去(2026-09-20)
+
+第三十轮,Codex 一条 P2,打在第二十七轮**的另一半**上。第二十七轮把认领里那次 `chmod 0700` 挪到了
+身份核对**之后**,于是"一次拒绝不在被拒的东西上留痕迹";可它只说了**陌生人**那一半。另一半是:
+这些位是**借**的——认领如果**不删这棵树**,就得还。
+
+`wfs_world_restore()` 正是那个不删树的认领。一个 `0311` 的 World 根(可进、可写、**不可列**,
+目录最寻常不过的一种模式)discard 时一根指头都没被碰过:整条 discard 路上没有人以读的方式打开过根
+(`.world` 是**穿过**它读的,rename 是父目录的事)。restore 随后 `open(O_RDONLY|O_DIRECTORY)` 拿
+EACCES → 核对身份 → `chmod 0700` → 重开 → rename 回家 → 返回 0,**而那 0700 从此再没人改回去**。
+discard + restore 本该是一个**往返**,现在它成了一次静悄悄地改写用户目录权限、并且退出 0 的操作。
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P2 `PRRT_kwDOUf7jGc6kF7js` | `world.cpp` `trash_claim_open()`(`core/src/world.cpp` ~877)与 `wfs_world_restore()` | 打不开的条目被 `chmod 0700` 之后,**没有任何人记得它原来是什么模式**。collector 和 `--now` 无所谓(那棵树马上就没了),`restore` 把树搬回家却什么也不还:一个 `0311`(或 `0111`、`0711`…)的 World 根,discard 一次再 restore 一次就永久变成 `0700` | `TrashClaim` 记下身份 `lstat` 看到的那个模式(`lent` / `orig_mode`),`return_lend()` 用 **`fchmod(fd, orig_mode)`** 还——**打在描述符上,绝不打在名字上**(第二十六轮的规矩用在回程):①`~TrashClaim` 兜住**每一个**出口;②`restore` 在"树已到家且核对是我们的"那一刻**显式**还,让这件事是**成功路径**自己的属性,不是析构的副作用;③`trash_claim_verify_rename()` 在"rename 搬的是陌生人、原样撤回"那条拒绝里还(我们自己的树被 `mv` 挪走了,但 fd 找得到它)。**删树的那两条不欠**:`trash_unlink_claim()` 在树**真的没了**的那一刻 `forget_lend()`;而**超时只删了一半**的那棵树保留 `.deleting` 名字、**模式照还**,下一次 wake 的认领重新借——没删完的树必须和我们发现它时一模一样。`trash_claim_open()` 里两个**没有描述符可用**的出口(第二次 `open` 失败、其上的 `fstat` 失败)走 `trash_unlend_path()`:按名字还,但**只还给那个 inode**——重新 `lstat` 必须仍是我们借给的那一个,中间搬进来的陌生人保留他自己的模式(第二十七轮那条界限一字未变) | `6b9c91b` |
+
+**其余"借位"一处一处查过了**:
+
+| 位置 | 结论 |
+|---|---|
+| `gc_tmp_is_removable()`(被放弃的 fork 临时树) | **根本不 chmod**:那里的证据在树**里面**(marker),所以打不开的目录只能是"还没证明过任何事"的目录,原样留着、记 `undecided`(第十二轮)。不借,也就不用还 |
+| `fs_remove_tree_fd()` 的 `rm_fd_unlock_dir` / `rm_fd_unlock_child` / `rm_fd_open_child` | **借在正被删的树上**:调用它的时候整棵树已经在删了,不还是对的(M1_DESIGN.md §3 P4) |
+| `trash_unlink_claim()` 里 EPERM/EACCES 那次 `fchmod(c.parent, …|0700)` | 那是 trash **父目录**(`<store>/trash` 或用户的 `.wfs-trash`),不是被认领的树;本轮不动 |
+| `wfs_world_discard()` | **确认不改 World 根的任何位**:`verify_identity` 只 `realpath`+`stat`+穿过根读 `.world`,`WorldLock` 打开的是 `.world` 本身,rename 要的是**父目录**的写权限。`SnapGate` / unprotect 那一套是快照的事,与 World 根无关 |
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **298 passed, 0 failed**;`check-deps.sh`
+全绿。(`m1_criteria.sh` 本轮跳过。)
+
+先跑红(`core_test` 新增一段):World 根 `chmod 0311`,discard → restore。修之前三处全是 **0700**——
+`RED: restored root mode 0700`、`RED: gc-refused tree mode 0700`、`RED: restore-refused tree mode 0700`。
+
+新增测试(`core_test.cpp` 末尾一段,第三十轮):①`0311` 的根 discard **不被改动**(trash 条目仍是
+`0311`);②restore 之后**根还是 `0311`**,而且它仍然是个 World——`wfs_world_verify()` 认得出、
+marker 穿过 `0311` 读得出、里面的文件读得出;③两个**借了又拒**的窗口(`wfs_test_between_trash_claim`
+把树挪走、放一个陌生目录进来):collector 判 `trash_foreign`、`restore` 回 `WFS_E_TRASH_FOREIGN`,
+而**被借的那棵树(已被挪到一边)回到 `0311`**;④最后 collector 照常把这个 `0311` 条目删掉
+(`worlds_deleted == 1`,`entries_freed == 2`)——那个认领本来就不欠。
+
 #### PR #1 review 第二十九轮:报表也要把那四个目录都看一遍(2026-09-20)
 
 第二十九轮,Codex 一条 P2,打在第二十八轮**只差一步**的地方。上一轮把"读不出来就报出来、按上限
