@@ -1244,6 +1244,61 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第二十八轮:读不出来的目录,一个都不算空的(2026-09-20)
+
+第二十八轮,Codex 两条 P2,和第二十七轮那条 pool 的是**同一句话**,只是换了两个目录:`<store>/trash`
+和 `<store>/snapshots`。**我们说"那里什么都没有"的时候,必须先有证据**——而 `opendir` 失败、
+`readdir(3)` 中途停下,都不是证据,是**没看见**。
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P2 `PRRT_kwDOUf7jGc6kFfnz` | `world.cpp` `trash_scan()` 里 `<store>/trash` 的无行孤儿 readdir(collector / `gc --status` / `wfs_gc_pending()` 三条路共用) | `if (DIR *d = opendir(trashdir)) { while (readdir(d)) … }`:trash 目录一个 EACCES/EIO,或者 `readdir` 中途失败(它只用 errno 报自己的失败),都被读成"没有无行孤儿"。于是 `trash_scan` 成功返回、`gc` 一声不吭、`gc --status` 报"trash 是干净的",而 `wfs_gc_pending()` **就是这个扫描**,所以 fork 和 discard 都不会再起 collector——**worker 链停在一个谁都没看进去的目录上** | 只有 **ENOENT** 算"里面没有东西"(第十三轮的规矩)。其余 errno,以及 `errno = 0` 后逐条读、NULL 且 errno 非零的那次 readdir,都记进共享的 `wfs::DirUnreadable{count, err, path}`:**collector 那一趟**按**目录路径**bump 共享失败计数器(新前缀 `gcfail:dir:<path>`——读不出来的目录和删不掉的树不是一回事)、在 `kGcFailCap` 以内置 `work_remains`;读通了就 `gc_note_readable` 清零;**计数那两趟(`gc --status`、`wfs_gc_pending`)一个字都不写库**。`wfs_gc_pending()` 自己也认这件事了,链才不会断:trash 那一处它本来就扫,其余目录靠 `gc_dirs_unreadable_pending()`——meta 上一次带索引的 `GLOB` 范围查询,fork 那条路上**不多走一次 readdir**(每次 gc wake 都是新进程,计数器就是上一次 wake 留下的事实),另加 `gc_fail_get()` 读计数而**不花掉一次重试**(提问不是失败) | `266cbae` |
+| P2 `PRRT_kwDOUf7jGc6kFfn2` | `world.cpp` `rm_tmp_in_store_dir()`,`<store>/snapshots` 的 `*.wfs-tmp` 清扫 | 同一处沉默的另一半:`if (!d) return 0;`——目录打不开就当"扫过了,里面没有东西";`readdir` 的 errno 同样从来没问过,中途停下就是目录读完了。于是一个无行的 `S<n>.wfs-tmp` 既没被删、也没被数、更没被重试 | 同上,一字不差。另外**这一轮顺手补齐的两处**:`wfs_gc_status()` 里数 `<store>/snapshots` 下 `*.wfs-tmp` 的那一趟(计数,不写库),和 `wfs_gc_ex()` 里 `<store>/tmp` 那个一小时的沙箱配置清扫(collector,照样 bump/重试) | `266cbae` |
+
+**对外只说一次**:第二十七轮的 `pool_unreadable` / `pool_unreadable_path` / `pool_unreadable_errno`
+换成 `wfs_gc_report.dirs_unreadable` 和 `wfs_trash_stat.dirs_unreadable` / `_path` / `_errno`——三个
+目录三套字段读起来比一套差,而且读者要知道的事在三种情况下完全一样:**上面那些数少算了东西,少算的
+那个目录叫什么、errno 是什么**。`gc` 在 stderr 上一条 note(哪个目录、什么 errno、会不会再来),
+`gc --status` 一行 `unread:`(里面的东西没算进上面那个数)。
+
+**全部 `opendir` / `readdir` 查过了**(core 里一个不漏):
+
+| 位置 | 结论 |
+|---|---|
+| `world.cpp` `trash_scan()`(`<store>/trash`) | F1,已修 |
+| `world.cpp` `rm_tmp_in_store_dir()`(`<store>/snapshots`) | F2,已修 |
+| `world.cpp` `wfs_gc_status()` 里 `<store>/snapshots` 的 `*.wfs-tmp` 计数 | 同一处沉默,已修(计数趟,不写库) |
+| `world.cpp` `wfs_gc_ex()` 里 `<store>/tmp` 的过期沙箱配置清扫 | 同一处沉默,已修(collector 趟) |
+| `pool.cpp` `pool_sweep_orphans()`(收集 + 计数) | 第二十七轮修的,这轮换到共享结构上 |
+| `store.cpp` `store_has_trees()` | 第十三轮就是这条规矩,不动 |
+| `diff.cpp` `dir_is_empty()` | 第二十三轮就是这条规矩,而且不是 gc 的路 |
+| `platform_posix.cpp` `rm_rec()` / `rm_fd_walk()` / bulk walk | **删除**的走法,不是扫描:每个目录清空之后都有一次 `rmdir`/`unlinkat(AT_REMOVEDIR)`,漏了一条就是 `ENOTEMPTY`;而"它没了"从第十二轮起由 `proven_gone()` 说了算,从来不是走法的返回值 |
+| `platform_darwin.cpp` `find_regular()`(EXDEV 探测) | "先建再查"那一类,失败原样回 `-errno` |
+| `view.cpp` `wfs_readdir()` | FSKit 视图的 ABI,不是 gc |
+| gc 里那些 `S<n>` 编号目录的探测 | 是 `lstat(2)` 不是 readdir,第十二轮已经换成 `proven_gone()` |
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **290 passed, 0 failed**(+12);`check-deps.sh`
+全绿。(`m1_criteria.sh` 本轮跳过。)
+
+先跑红(`safety.sh`,新增 11 条):trash 目录 `chmod 000`、里面放一个无行孤儿;`<store>/snapshots`
+`chmod 000`、里面放一个无行的 `S999999.wfs-tmp`。修之前 **11 条里红了 9 条**——`gc` 只打印
+`gc: 0 worlds deleted, …` 那一行,stderr 上一个字都没有,`gc --status` 照样报干净;绿的那 2 条是
+对照组(权限改回来之后两样东西都会被收掉,本来就绿)。
+
+新增测试(`safety.sh` 末尾一段):
+
+- (a) `<store>/trash` 0000 + 无行孤儿:`gc --now` 报"store 下有 1 个目录读不出来"、**报出目录名**、
+  说"会再来试"(`work_remains`);`gc --status` 不把这个 trash 说成干净的;`chmod 700` 之后下一次
+  `gc` 把孤儿收掉。
+- (a′) **链没断**:另起一个 store(gc 从没在里面跑过),trash 0000 + 无行孤儿,删掉
+  `<store>/logs/gc.log`,然后跑一次 `fork`——`spawn_gc_worker()` 问的就是 `wfs_gc_pending()`,
+  修之前它回"没事做",现在 worker 起来了,`gc.log` 有内容。
+- (b) `<store>/snapshots` 0000 + 无行 `S999999.wfs-tmp`:`gc --now` 报出目录名,`gc --status` 不把
+  它说成干净的;`chmod 700` 之后 `gc --now` 把那棵无行克隆收掉。
+- (b′) **链没断**:同一个 store 里 `discard W1`(默认保留期,trash 里没有一条到期),删掉 `gc.log`
+  之后 worker 照样起来——这一次 `wfs_gc_pending()` 的依据是 `gcfail:dir:` 计数器,正好把
+  `<store>/snapshots`、`<store>/pool` 这些它不走 readdir 的目录也盖住了。
+
 #### PR #1 review 第二十七轮:拒绝的时候不许留下痕迹,看不了的目录不算空的目录(2026-09-20)
 
 第二十七轮,Codex 两条 P2,一条打在**认领的顺序**上,一条打在**扫描的沉默**上。两条其实是同一句话的
