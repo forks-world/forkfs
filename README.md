@@ -30,6 +30,29 @@ scripts/tests/safety.sh build/Release # every fool-proofing rule, end to end, PA
 WFS_DIFF_BENCH=1 build/Release/core/diff_test   # adds the 50 000-file diff benchmark
 ```
 
+## Continuous integration
+
+GitHub Actions runs the Release build on macOS 15 arm64 for pushes, pull requests, and manual
+dispatches. It configures the Apple SDK and system SQLite, builds with `WFS_FSKIT=OFF`, runs
+CTest, checks linked dependencies, and runs the end-to-end safety suite. To reproduce the CI job
+locally on macOS:
+
+```bash
+sdk="$(xcrun --sdk macosx --show-sdk-path)"
+export TMPDIR="$PWD/build/ci-tmp/"
+mkdir -p "$TMPDIR"
+cmake -S . -B build/ci -DCMAKE_BUILD_TYPE=Release -DWFS_FSKIT=OFF \
+  -DCMAKE_C_COMPILER="$(xcrun --sdk macosx --find clang)" \
+  -DCMAKE_CXX_COMPILER="$(xcrun --sdk macosx --find clang++)" \
+  -DCMAKE_OSX_SYSROOT="$sdk" \
+  -DSQLite3_INCLUDE_DIR="$sdk/usr/include" \
+  -DSQLite3_LIBRARY="$sdk/usr/lib/libsqlite3.tbd"
+cmake --build build/ci --parallel
+ctest --test-dir build/ci --output-on-failure --timeout 600 --no-tests=error
+scripts/check-deps.sh build/ci
+scripts/tests/safety.sh build/ci "$TMPDIR/m1test"
+```
+
 ## Usage
 
 ```bash
