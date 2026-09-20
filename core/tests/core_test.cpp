@@ -244,6 +244,20 @@ static void db_exec(const char *path, const char *sql) {
     sqlite3_close(db);
 }
 
+// One number out of a store's database, read from outside the core: the state of a row the
+// core has just refused to touch (PR #1 review, 33rd round).
+static int64_t db_i64(const char *path, const char *sql) {
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    CHECK(sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK);
+    CHECK(sqlite3_step(st) == SQLITE_ROW);
+    int64_t v = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return v;
+}
+
 static int db_user_version(const char *path) {
     sqlite3 *db = NULL;
     CHECK(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
@@ -6272,6 +6286,65 @@ int main() {
         CHECK(!exists(forph));
         wfs_store_close(fs);
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", fstore, (unsigned long long)f1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
+    // ---- PR #1 review (33rd round, P2): a helper's error is the caller's error ---------------
+    //
+    // The 32nd round taught the reads to fail; this one is about the callers that then threw the
+    // failure away. `wfs_store_open()` ran trashing_recover() -- the pass that resolves a discard
+    // killed between its rename and its commit, and which every reader after it assumes has run --
+    // and discarded its rc, so an open whose recovery could not be read reported success with the
+    // TRASHING rows still in it.
+    {
+        char rstore[4096], rsrc[4096], rw[4096], rdb[4096], rsql[256];
+        join(rstore, sizeof rstore, root, "rc-store");
+        join(rsrc, sizeof rsrc, root, "rc-src");
+        CHECK(mkdir(rsrc, 0755) == 0);
+        join(p, sizeof p, rsrc, "a.txt");
+        write_file(p, "one\n");
+        join(rdb, sizeof rdb, rstore, "metadata.db");
+        wfs_store *rs = NULL;
+        CHECK_OK(wfs_store_open(rstore, &rs));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "rc";
+        wfs_id r1 = 0;
+        CHECK_OK(wfs_snapshot_create(rs, rsrc, &sopts, &r1));
+        memset(&opts, 0, sizeof opts);
+        opts.name = "rcworld";
+        join(rw, sizeof rw, worlds, "rcworld");
+        wfs_id rw1 = 0;
+        wfs_ref rref = {WFS_K_SNAPSHOT, r1};
+        CHECK_OK(wfs_world_create(rs, rref, rw, &opts, &rw1));
+        wfs_store_close(rs);
+        // The shape the recovery exists for: a row left in TRASHING by a process that is gone,
+        // with its tree still at home (the rename never happened).
+        snprintf(rsql, sizeof rsql,
+                 "UPDATE worlds SET state=4, owner_pid=0, owner_start=0 WHERE id=%llu;",
+                 (unsigned long long)rw1);
+        db_exec(rdb, rsql);
+        snprintf(rsql, sizeof rsql, "SELECT state FROM worlds WHERE id=%llu",
+                 (unsigned long long)rw1);
+
+        // (a) the recovery's scan fails once -> the open fails with it and hands back no handle.
+        //     Before the fix: rc=0, a usable store, and the row still TRASHING inside it.
+        wfs_test_stmt_fail_sql = "FROM worlds WHERE state=4";
+        rs = NULL;
+        CHECK_RC(wfs_store_open(rstore, &rs), -EIO);
+        CHECK(wfs_test_stmt_fail_sql == NULL);          // the seam fired
+        CHECK(rs == NULL);                              // and nothing was handed out
+        CHECK(db_i64(rdb, rsql) == WFS_ST_TRASHING);    // the row is exactly as it was
+        CHECK(exists(rw));
+
+        // ... and the next open, with the scan readable, resolves it: the rename never happened,
+        // so the world goes back to ACTIVE at the path it never left.
+        CHECK_OK(wfs_store_open(rstore, &rs));
+        wfs_world_rec rwr;
+        CHECK_OK(wfs_world_info(rs, rw1, &rwr));
+        CHECK(rwr.state == WFS_ST_ACTIVE);
+        CHECK(exists(rw));
+        wfs_store_close(rs);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", rstore, (unsigned long long)r1);
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 

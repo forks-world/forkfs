@@ -4308,7 +4308,15 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
     // commit (PR #1 review, 5th round). wfs_store_open() has already done this once, but a
     // worker's wake can be minutes long and the store handle older still, so the row a *different*
     // process left behind since is resolved here rather than mistaken for something else below.
-    wfs::trashing_recover(s, nullptr, nullptr);
+    //
+    // PR #1 review (33rd round, P2): the same discarded rc as wfs_store_open's, and here it is
+    // the collector that carries on over it. "Before anything classifies anything" is the whole
+    // reason this line exists: a TRASHING row the recovery could not read is a row whose tree
+    // the orphan pass below then finds unclaimed, and an unclaimed tree in <store>/trash is
+    // deleted on sight -- no retention, no `restore`, no "this is somebody's baseline". A run
+    // that cannot establish its own premise does not get to act on it, so the wake ends with the
+    // errno and the next one starts over.
+    if (int rc = wfs::trashing_recover(s, nullptr, nullptr)) return rc;
 
     // ---- the cheap half, always run in full ------------------------------------------------
     //

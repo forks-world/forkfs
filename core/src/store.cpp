@@ -751,7 +751,27 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
     // row in WFS_ST_TRASHING and a tree at one of two names. Resolving it is two indexed
     // SELECTs that normally return nothing, and it has to happen before anything in this process
     // reads a state or classifies the trash -- `gc --status` and the orphan rule both do.
-    wfs::trashing_recover(s, nullptr, nullptr);
+    //
+    // PR #1 review (33rd round, P2): "has to happen" is a requirement, and a requirement whose
+    // result is thrown away is a wish. The recovery's own queries fail the way every other read
+    // in this core does (the 32nd round: a step that comes back SQLITE_IOERR, SQLITE_CORRUPT, a
+    // SQLITE_BUSY that outlived the busy timeout), and it now reports that as -EIO instead of
+    // resolving what it could not read. Dropping that rc handed the caller an open store with
+    // TRASHING rows still in it -- and every reader that follows is entitled to assume there are
+    // none: `gc --status` counts such a row's tree as a trash entry nothing may collect, the
+    // orphan rule treats a tree whose row was never resolved as unclaimed, and `restore` reads a
+    // state that is about to change. So the open ends here with the errno that ended the
+    // recovery, the handle is closed rather than returned, and the user's next command runs the
+    // recovery again -- the one thing it must not do is carry on over a store it could not put
+    // back in order.
+    //
+    // SQLITE_BUSY is not a special case here: sqlite3_busy_timeout() is set to 10 s on this very
+    // handle above, before anything is read, so another process's write lock is waited out
+    // rather than returned -- by these SELECTs and by the BEGIN IMMEDIATE the resolution writes
+    // under alike. What survives ten seconds of contention is not the transient a retry would
+    // paper over, and a retry loop here would be a second busy timeout on top of the one SQLite
+    // already runs. A store open is also the cheapest thing in this core to repeat.
+    if (int rc = wfs::trashing_recover(s, nullptr, nullptr)) { wfs_store_close(s); return rc; }
     *out = s;
     return 0;
 }
