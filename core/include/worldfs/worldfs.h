@@ -1036,6 +1036,16 @@ int wfs_test_threads_start(int want, unsigned fail_mask, int *started, int *join
  * report it; 0 in every run that is not core_test. */
 extern int wfs_test_hardlink_restore_err;
 
+/* And the legacy 2 -> 3 upgrade's own window (PR #1 review, 31st round): the instant inside
+ * version_upgrade(), after this process has written its private VERSION temporary and before it
+ * renames that temporary over VERSION. What a test does in there is run a whole wfs_store_open()
+ * on the same store from a second handle -- which migrates, upgrades and renames first -- because
+ * that is the interleaving two processes reach on the first open of a schema-2 store, and the
+ * open whose rename lands second must still succeed. Called with the store directory. NULL
+ * unless a test sets it; nothing in the library ever assigns it. */
+extern void (*wfs_test_before_version_rename)(void *ctx, const char *dir);
+extern void *wfs_test_before_version_rename_ctx;
+
 /* And the one xattr rule a test cannot drive from outside (PR #1 review, 9th round). The default
  * diff leaves com.apple.provenance out of the comparison, and provenance is precisely the name a
  * test cannot make differ: the kernel stamps it on every file this process creates, with the

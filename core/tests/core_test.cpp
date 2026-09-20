@@ -909,6 +909,26 @@ static void gc_before_snapshot_clone(void *ctx, const char *src_dir) {
     g_sweep_rc = wfs_gc_ex(g_sweep_store, &go, &g_sweep_rep);
 }
 
+// PR #1 review (31st round, P2): the first open of a schema-2 store, run twice at once. The
+// seam fires inside handle A's version_upgrade(), after A has written its VERSION temporary and
+// before A renames it over VERSION; what runs in there is a whole wfs_store_open() of the same
+// store on a second handle, which migrates (a no-op -- A's migration has committed), upgrades,
+// and renames FIRST. A's rename then lands second, and A's open must still come back 0. It used
+// to come back -ENOENT: both processes wrote one shared `<store>/VERSION.tmp`, and B's rename
+// took the very file A was about to rename.
+static char g_vrace_store[4096];
+static int g_vrace_rc = -1;
+static int g_vrace_ran;
+static void vrace_before_version_rename(void *ctx, const char *dir) {
+    (void)ctx;
+    (void)dir;
+    if (g_vrace_ran) return;
+    g_vrace_ran++;
+    wfs_store *vb = NULL;
+    g_vrace_rc = wfs_store_open(g_vrace_store, &vb);
+    if (vb) wfs_store_close(vb);
+}
+
 // PR #1 review (26th round, P1): the user's own `mv`, run in the one window no transaction of
 // ours can serialise -- after the entry's identity has been checked against the row and before
 // the rename that claims it. The world's tree goes aside and a directory of somebody else's,
@@ -5579,6 +5599,48 @@ int main() {
         CHECK_RC(wfs_store_open(vstore, &vs), WFS_E_SCHEMA);
         CHECK(vs == NULL);
         CHECK(db_user_version(vdb) == 400);
+
+        // (c) PR #1 review (31st round, P2): two processes opening that schema-2 store for the
+        //     first time at the same time. Both pass check_version() as legacy, both migrate
+        //     (one transaction wins, the other finds every column already there), and both then
+        //     rewrite VERSION. The temporary is per-process now, so the rename that lands
+        //     second simply overwrites a VERSION that already says 3 -- with the shared
+        //     `VERSION.tmp` it used to be, the second process's rename found its own temporary
+        //     gone and a perfectly valid open failed with -ENOENT.
+        write_file(vver, "2\n");
+        make_v2_db(vdb, 0);
+        snprintf(g_vrace_store, sizeof g_vrace_store, "%s", vstore);
+        g_vrace_rc = -1;
+        g_vrace_ran = 0;
+        wfs_test_before_version_rename = vrace_before_version_rename;
+        vs = NULL;
+        int vrace_a = wfs_store_open(vstore, &vs);
+        wfs_test_before_version_rename = NULL;
+        CHECK(g_vrace_ran == 1);
+        CHECK_OK(g_vrace_rc);          // the open that renamed first
+        CHECK_OK(vrace_a);             // and the one that renamed second: -ENOENT before the fix
+        CHECK(vs != NULL);
+        wfs_store_close(vs);
+        CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
+        CHECK(atoi(vbuf) == WFS_STORE_SCHEMA);      // read once, and it says 3
+        CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA);
+        CHECK(n_with_prefix(vstore, "VERSION.tmp") == 0);   // and neither left a temporary
+
+        // ... and the crashed upgrader: a temporary from a process that died between writing it
+        //     and renaming it. It is ours -- nothing but this core writes that name, in that
+        //     directory -- so the next upgrade of the store sweeps it.
+        write_file(vver, "2\n");
+        make_v2_db(vdb, 0);
+        join(vtmp, sizeof vtmp, vstore, "VERSION.tmp.999.deadbeef");
+        write_file(vtmp, "3\n");
+        CHECK(exists(vtmp));
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_close(vs);
+        CHECK(!exists(vtmp));
+        CHECK(n_with_prefix(vstore, "VERSION.tmp") == 0);
+        CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
+        CHECK(atoi(vbuf) == WFS_STORE_SCHEMA);
     }
 
     // ---- PR #1 review (25th round, P1): a trash entry is the row's tree, not the row's name --

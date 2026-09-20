@@ -13,6 +13,11 @@ using wfs::Guard;
 using wfs::String;
 using wfs::Stmt;
 
+// The 2 -> 3 upgrade's rename window (PR #1 review, 31st round). NULL in every run that is not
+// core_test; nothing in the library ever assigns it. Declared in worldfs.h.
+extern "C" void (*wfs_test_before_version_rename)(void *ctx, const char *dir) = nullptr;
+extern "C" void *wfs_test_before_version_rename_ctx = nullptr;
+
 namespace {
 
 // Schema v3 (docs/M1_DESIGN.md §2). Snapshot ids and world ids are separate sequences, so
@@ -263,16 +268,81 @@ int check_version(const char *dir, bool *legacy) {
     return w == n ? 0 : -EIO;
 }
 
+// What the VERSION file says right now, or a negative errno. Unlike check_version() this one
+// never writes: it is the second look, after a rename that did not land, at a file somebody
+// else may have finished writing in the meantime.
+int version_read(const char *dir, long *out) {
+    String p(dir);
+    p.append("/VERSION");
+    int fd = ::open(p.c_str(), O_RDONLY);
+    if (fd < 0) return -errno;
+    char buf[64] = {0};
+    ssize_t n = ::read(fd, buf, sizeof buf - 1);
+    ::close(fd);
+    if (n <= 0) return -EIO;
+    *out = ::strtol(buf, nullptr, 10);
+    return 0;
+}
+
+// The leftovers of an upgrader that was killed between creating its temporary and renaming it.
+//
+// P18 / PR #1 review (20th round): a sweep is only ever allowed to delete names this core
+// itself allocated. These are: the name is inside `<store>` (never a subdirectory, never
+// followed through a symlink -- unlink(2) does not follow), and it begins with `VERSION.tmp`,
+// which is the whole of the namespace this file has ever written there -- `VERSION.tmp.<pid>.<hex>`
+// now, and the single shared `VERSION.tmp` that older builds of this core used. Nothing else
+// writes a name under that prefix in a store directory, and a user's own file there is not a
+// name they can reach by accident. Called only from the upgrade below, i.e. only by a process
+// that is itself the upgrader, so the readdir is not on any other open's path; failures are
+// ignored, because a temporary left behind is 2 bytes and never read by anything.
+void version_tmp_sweep(const char *dir) {
+    DIR *d = ::opendir(dir);
+    if (!d) return;
+    while (struct dirent *e = ::readdir(d)) {
+        if (::strncmp(e->d_name, "VERSION.tmp", 11) != 0) continue;
+        String p(dir);
+        p.append("/");
+        p.append(e->d_name);
+        ::unlink(p.c_str());
+    }
+    ::closedir(d);
+}
+
 // The 2 -> 3 rewrite of that file. Through a temporary and a rename, because a VERSION that was
 // half overwritten is a store NOTHING can open any more (a short read is -EIO above, in this
 // core and in M1's alike), and the whole value of the file is that a binary older than the one
 // that wrote it can still read it. Called only after the database migration has committed: a
 // store we failed to migrate has not become a schema-3 store, and locking M1 out of it would
 // buy nothing -- it is still the schema-2 store M1's collector can handle.
+//
+// ---- PR #1 review (31st round, P2): and two of us may be doing it at once -----------------
+//
+// The first open of a schema-2 store is not serialised by anything. wfs_store_open() takes no
+// lock of its own; the only mutual exclusion in the whole path is the migration's own BEGIN
+// IMMEDIATE, which is enough for the database -- one transaction wins and the other finds every
+// column already there -- and is no help at all for the file. So both processes read VERSION as
+// 2, both migrate, and both arrive here. This used to write one shared `<store>/VERSION.tmp`:
+// the two of them truncated the same file, and after the first rename consumed it the second
+// process renamed a name that was no longer there and returned -ENOENT out of an open that had
+// done nothing wrong -- a valid `world` invocation failing on a perfectly healthy store, and
+// only ever on its very first open, which is the one nobody is watching.
+//
+// The temporary is private now: O_CREAT|O_EXCL on `VERSION.tmp.<pid>.<hex>`, hex from the same
+// getentropy() the store id is drawn with, so no two upgraders can be holding the same one. The
+// rename that lands second then simply replaces a VERSION that already says 3 with a VERSION
+// that says 3, which is the idempotent write it always was. A rename that fails anyway asks the
+// file itself: if it reads 3, the upgrade is done -- by us or by whoever got there first -- and
+// this returns 0, because what the caller needs is a schema-3 store on disk, not the authorship
+// of it. Only an errno with VERSION still at 2 is a failure, and it is returned as one.
 int version_upgrade(const char *dir) {
+    char rnd[33];
+    hex_id(rnd, sizeof rnd);
+    char name[80];
+    ::snprintf(name, sizeof name, "VERSION.tmp.%lld.%s", (long long)::getpid(), rnd);
     String tmp(dir);
-    tmp.append("/VERSION.tmp");
-    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    tmp.append("/");
+    tmp.append(name);
+    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd < 0) return -errno;
     char line[64];
     int n = ::snprintf(line, sizeof line, "%d\n", WFS_STORE_SCHEMA);
@@ -282,11 +352,18 @@ int version_upgrade(const char *dir) {
     if (w != n || frc != 0) { ::unlink(tmp.c_str()); return -EIO; }
     String dst(dir);
     dst.append("/VERSION");
+    if (wfs_test_before_version_rename) wfs_test_before_version_rename(wfs_test_before_version_rename_ctx, dir);
     if (::rename(tmp.c_str(), dst.c_str()) != 0) {
         int e = -errno;
         ::unlink(tmp.c_str());
+        long v = 0;
+        // Somebody else's rename may have landed while ours was failing -- including a sweep
+        // like the one below, run by a concurrent upgrader, that took our temporary out from
+        // under us. The store is schema 3 either way, so this open has nothing to refuse.
+        if (version_read(dir, &v) == 0 && v == WFS_STORE_SCHEMA) { version_tmp_sweep(dir); return 0; }
         return e;
     }
+    version_tmp_sweep(dir);
     return 0;
 }
 
