@@ -1244,6 +1244,120 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第三十七轮:方向不在磁盘上,在选了方向的那个进程里(2026-09-20)
+
+第三十七轮,Codex 一条 P1。前三轮把升级协议的**每一个中间形状**都写成「可以接着做」的,这一轮指出:
+**这套协议有两个方向,而磁盘上的形状分不出方向**——一个正在回滚的进程留下的形状,和一次没做完的
+前进留下的形状,**逐字**是同一个;于是第二个 M2 进程把别人的回滚当成自己的续做,两个人一人删一个
+名字,库的 inode 一个名字都不剩。
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `PRRT_kwDOUf7jGc6kHIsy` | `core/src/store.cpp` `legacy_holders_gate()` / `wfs_store_open()`(~777) | A 在回滚:交换回来之后、`unlink(metadata3.db)` 之前。B 这一刻 open,看到「`VERSION` 还是 3 + 两个名字都是普通文件 + 同一个 inode」——上表里「崩在第 2、3 步之间」,**一律往前做**。B 于是交换进自己的空目录;A `unlink(metadata3.db)`;B `unlink` 掉它以为多出来的链接——**那是最后一个名字**。store 里只剩一个 0500 空目录 | 两条,一条防住一条兜住:① `<store>/upgrade.lock` 上的独占 `flock`,在**读判据之前**取,整段持有(前进的四步 + 闸门 + 迁移 + `VERSION` 复读,或者整个回滚),锁里再重读一遍布局;② **永远不删最后一条链接**——每次 `unlink` 库的名字之前比 `st_dev`/`st_ino` 并要求 `st_nlink >= 2`,否则拒绝并把两个名字都留下 | `be88326` |
+
+##### 那条交错,和它的实测(先跑红)
+
+```
+A(回滚)                                   B(另一个 M2 进程 open)
+  link(metadata3.db, stub_tmp)
+  SWAP stub_tmp <-> metadata.db
+  ── 窗口:metadata.db 和 metadata3.db 是同一个 inode,nlink=2 ──
+                                            store_layout(): 两个名字都是普通文件、同一个
+                                            inode → 「崩在第 2、3 步之间」→ 往前做
+                                            mkdir stub_B; link 已在; SWAP stub_B <-> metadata.db
+  unlink(metadata3.db)                      (metadata.db 现在是 B 的空目录,库在 stub_B)
+                                            unlink(stub_B)   ← 最后一条链接
+```
+
+`scratchpad/r37/red37.c`,链接父提交 `bfbd38e` 编出来的 `libworldfs_core.a`(只加了一条回滚缝):
+
+```
+before: VERSION=2, metadata.db is the database, 2 rows in worlds
+  A@window    metadata.db: file ino=312691916 nlink=2 | metadata3.db: file ino=312691916 nlink=2
+B: has exchanged its stub into metadata.db (no lock stopped it)
+  A@afterB    metadata.db: dir  ino=312691929 nlink=2 | metadata3.db: file ino=312691916 nlink=2
+A: unlinked metadata3.db; letting B run its step 4
+A: wfs_store_open rc=-1020   B: wfs_store_open rc=-1020
+  after both  metadata.db: dir  ino=312691929 nlink=2 | metadata3.db: ABSENT
+  VERSION=2
+  the database inode: HAS NO NAME AT ALL -- the rows are gone
+  a later open of the store: rc=-1017
+```
+
+两个进程都「按协议办事」,两次 open 都回 `WFS_E_STORE_BUSY`(看起来只是两次重试),而 store 里只剩
+`dr-x------ metadata.db/` 和一个 `VERSION`。**方向不在磁盘上,在选了方向的那个进程里**——所以要么把
+选方向这件事串起来,要么让那个致命的 `unlink` 自己长出眼睛。两样都做了。
+
+##### 一、`upgrade.lock`:只在欠着一步的时候取
+
+```
+布局说欠着(搬库 / 补空目录 / 清扫 / VERSION 还是 2)?  → flock(LOCK_EX) → 锁里重读 VERSION + 布局
+布局说什么都不欠(schema 3、空目录在、库一条链接)?    → 这个文件根本不打开
+```
+
+- **整段持有**:往前是「搬库四步 → 持有者闸门 → 迁移 → 最后那次 `VERSION` 复读」,往后是整个回滚。
+- **双重检查**:等到的那个进程在锁里重读 `VERSION` 和布局——要么是已经做完的 schema 3 store(直接开),
+  要么是被放回 schema 2 的 store(自己再跑一遍闸门:`WFS_E_STORE_BUSY`,或者接管)。
+- **迟到的那道闸门也在锁里**,而且 `user_version` 要在锁里**重读**:锁外读到的 2xx 可能是我们正在等的
+  那个进程迁移做到一半,拿它去跑闸门,会把别人刚做完的升级整段放回去(这一条是写完测试才发现的,
+  测试当场就把它抓出来了)。
+- **M1 不取这把锁,也不需要取**:M1 全程不取任何 store 级的锁——这一整节的前提就是这个。挡 M1 的是
+  文件(第三十二轮)、空目录(第三十五 / 三十六轮)、持有者闸门(第三十四轮);这把锁是 **M2↔M2**,
+  只管那三样管不了的那一种:另一个进程**反着**跑同一套协议。
+- **它不会被当成库的持有者**:`proc_listpidspath(3)` 问的是 `metadata3.db` 的 vnode,`upgrade.lock`
+  是另一个文件(`core_test` 里按住它的子进程,`wfs_store_holders()` 一个都列不出来)。
+- **进程死了锁自动没**,`flock` 是内核维护的,没有「陈旧锁」要扫。
+
+##### 二、`unlink_extra_link()`:要删的和要留的,必须是同一个 inode 而且 `nlink >= 2`
+
+前进的第 4 步删 `stub_tmp`、回滚删 `metadata3.db`,两处都改成先问再删:`stat` 两个名字,
+`st_dev`/`st_ino` 必须相同、而且 `st_nlink >= 2`,否则**原地拒绝**(`WFS_E_STORE_DAMAGED`),
+两个名字都留着。留下的形状上一轮那张表都接得住,**丢掉 inode 接不住**。这一条让丢数据这个结局
+**即使绕过锁也不成立**——老的 M2 二进制没这把锁、将来再出一个 bug、`flock` 在某个文件系统上是空操作,
+都一样。
+
+##### 三、第三十六轮那个疑问,现在可以关掉
+
+`metadata.db.stub.` 的清扫(空目录 `rmdir`、和库同 inode 的普通文件 `unlink`)在**锁里**做,
+并发的另一个升级者的 stub 已经不可能存在,所以这次清扫是安全的,原样保留。
+
+##### 还剩的那一种:两个升级者互相拒绝(第三十四轮那笔交易,照旧)
+
+两个 M2 进程同时**第一次**打开同一个 schema 2 store:一个取到锁往前做,另一个可能在**取锁之前**就已经
+打开了库(布局看起来什么都不欠、`user_version` 才是 2xx 的那条路),于是前者的闸门把它列成持有者,
+整段回滚 + `WFS_E_STORE_BUSY`。**一个 store 一生一次的重试,数据一行不少**——这正是第三十四轮写下的
+那笔交易(「两个升级者互相拒绝,不过是一个 store 第一次 open 时重试一次」)。第三十一轮那个用例的断言
+因此从「两个都回 0」改成「两个都只可能是 0 或 `WFS_E_STORE_BUSY`、都不留临时文件、随后单独一次 open
+一定接管」——因为那个「第二个打开者」现在是**真的第二个进程**,而以前它是本进程的一次嵌套调用,
+`fs_other_holders()` 按定义把自己的 pid 排除在外。
+
+##### 新增测试
+
+- 新缝 `wfs_test_in_revert(ctx, dir, phase)`(`worldfs.h`,非测试运行恒为 NULL):1 = 交换回来之后、
+  `unlink(metadata3.db)` 之前;2 = 那个 unlink 之后、`VERSION` 放回 2 之前。
+- 新缝 `wfs_test_in_upgrade_lock(ctx, dir)`:**等到锁的那个进程**刚拿到锁、还没读任何东西的那一刻——
+  它在里面看到什么,就是这把锁的全部意义。
+- 交错用例:持有者子进程(让闸门回滚)+ **B 进程**,B 在缝之前就起好、等一个管道字节。A 在窗口里
+  断言「`metadata.db` 是普通文件、`nlink == 2`、和 `metadata3.db` 同一个 inode」,放 B 走,等 B 说
+  「我进 `wfs_store_open` 了」,睡 250 ms,然后**非阻塞地**确认 B **既没有**交换、**也没有**做完——
+  修之前这两件事都成立,而第二件就是那次致命的 unlink。B 在锁里报回来:`VERSION == 2`、
+  `metadata.db` 是**普通文件**、`nlink == 1`、没有 `metadata3.db`;它自己那次 open 回
+  `WFS_E_STORE_BUSY`(持有者还在)。收尾断言库还在、两行还在、没有多余的名字;放走持有者之后,
+  同一个 store 被正常接管。
+- 兜底那条单独测:在前进的第 2 步之后(交换完、还没 unlink)把 `metadata3.db` **从外面删掉**——
+  正是回滚做的那件事——于是第 4 步要删的名字成了**最后一条链接**:`WFS_E_STORE_DAMAGED`,名字留着,
+  那个文件还是那个库、两行还在。另一种形状:把私有名换成**别人的**文件(不同 inode)→ 同样拒绝、
+  原样留着,而搬库本身已经完成,这次 open 照常把 store 开出来。
+- `upgrade.lock` 不是库的持有者:一个子进程按住它,`wfs_store_holders()` 答 0 个。
+- **测试里的「第二个进程」一律改成 `fork` + `execv` 自己**(`core_test --open-store` / `--m1-open`):
+  这台机器上 `os_log` 的状态不是 fork-safe 的,一个 fork 出来的子进程调 `sqlite3_open()` 会在
+  `libsystem_trace` 里段错误(实测 15 次跑挂 2 次,栈上没有我们一行代码)。`execv` 给它一个干净的地址
+  空间,而且「第二个进程」本来就是这些用例要说的事。顺带把第三十六轮那两个 fork 出来的 M1 开库子进程
+  也一起换掉了。
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**,`core_test` 连跑 12 次全绿;`safety.sh` **298 passed, 0 failed**;
+`check-deps.sh` 全绿(5 个系统库)。(`m1_criteria.sh` 本轮跳过:没有碰到它量的任何东西。)
+
 #### PR #1 review 第三十六轮:改名的那一瞬间,那个名字不能是空的(2026-09-20)
 
 第三十六轮,Codex 一条 P1。上一轮把「能拒 M1 的只剩库本身」这件事做对了,但**做法本身开了一个更小、
