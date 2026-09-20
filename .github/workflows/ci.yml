@@ -57,6 +57,15 @@ jobs:
       - name: Run CTest
         run: ctest --test-dir build/ci --output-on-failure --timeout 600 --no-tests=error
 
+      - name: Test disk-full wrapper cleanup paths
+        run: PYTHONPATH=scripts/tests python3 -m unittest discover -s scripts/tests -p 'test_disk_full_wrapper.py'
+
+      - name: Run bounded APFS disk-full regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/tests/disk_full.py build/ci 2>&1 | tee build/ci/disk-full.log
+
       - name: Check linked dependencies
         run: scripts/check-deps.sh build/ci
 
@@ -75,3 +84,4 @@ jobs:
           path: |
             build/ci/Testing/Temporary/*.log
             build/ci/safety.log
+            build/ci/disk-full.log

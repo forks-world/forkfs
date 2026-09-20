@@ -2,6 +2,10 @@
 
 依据 `arch.md` v0.3。本文件是唯一的任务看板,状态用 `[ ]` / `[~]` / `[x]` 标记。
 
+当前 macOS 支持范围、测试命令和剩余验收边界见
+[`MACOS_VALIDATION.md`](MACOS_VALIDATION.md)。本文件按时间保留历史测试数量与测量结果;
+旧的 93/142 等通过数不代表当前测试总数,应以当前 CI/测试输出为准。
+
 ## 环境事实(2026-09-18, Mac mini M1, macOS 26.6.2)
 
 - 只有 Command Line Tools,**没有 Xcode.app**。SwiftPM(Swift 6.3)可以直接链接 FSKit.framework,已验证。
@@ -283,7 +287,9 @@ FSKit 前端**冻结**在 macOS 27 Handler API 上(`WorldVolumeH` 为默认,旧 
 - [x] T1.5 pool:预克隆池(见下节"T1.5 pool 实现")
 - [~] T1.6 safety 测试套件(P1–P14):P1/P2/P3/P4/P5/P6/P7/P8/P9/**P10**/P12/P13/P14 已覆盖
       (**93 条全过**,含 T1.5 pool 的 13 条;更细的精确集合断言在 `core/tests/diff_test.cpp`);
-      P11 的"真实磁盘写满"仍只在 API 层验证
+      当时 P11 的"真实磁盘写满"仅在 API 层验证;后续新增独立
+      `scripts/tests/disk_full.py` + `core/disk_full_test`,在私有 APFS 映像中验证真实 ENOSPC,
+      不填宿主卷。范围和复现方式见 `MACOS_VALIDATION.md`。
 - [x] T1.7 基准:`scripts/bench/m1_criteria.sh`(六节,可 `--only N` 单独重跑)
       → [`docs/M1_RESULTS.md`](M1_RESULTS.md)。**arch.md §1 五条判据全部达成**:
 
@@ -315,7 +321,7 @@ FSKit 前端**冻结**在 macOS 27 Handler API 上(`WorldVolumeH` 为默认,旧 
       → **T2.4 已做**,见下面的 M2 小节。结论与预期有一处重要偏差:macOS 27 给本机进程新建的
       **每一个**文件都盖 `com.apple.provenance`(且删不掉),所以合成 fixture 上 `EF_NO_XATTRS` 一次都不触发;
       真实树(96% 无 xattr)上默认全扫确实逼近了 `--no-xattr`。
-- [ ] T1.8 文档:arch.md 增补章节、README
+- [x] T1.8 文档:arch.md §40、README 与 `MACOS_VALIDATION.md` 说明当前 clonefile 路线、验证边界和复现方式
 
 #### T1.5 pool 实现(2026-09-19)
 

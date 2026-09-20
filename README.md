@@ -5,7 +5,11 @@ Design: [`arch.md`](arch.md), [`docs/M1_DESIGN.md`](docs/M1_DESIGN.md). Task boa
 
 ## Status
 
-M1 (clonefile Worlds). A **Snapshot** is an immutable whole-tree `clonefile()` clone inside the
+The macOS clonefile World implementation includes the M1 lifecycle and M2 background GC,
+snapshot disposal, reconciliation, and hardlink preservation. See
+[`docs/MACOS_VALIDATION.md`](docs/MACOS_VALIDATION.md) for validation coverage and remaining limits.
+
+A **Snapshot** is an immutable whole-tree `clonefile()` clone inside the
 store, protected by a *gate*: the snapshot root directory is mode `0000`, so nothing can traverse,
 list, read or write anywhere inside it, while the entries themselves are left exactly as cloned —
 which is why forking one costs a `clonefile()` and nothing else. A **World** is a writable clone of
@@ -27,6 +31,7 @@ cmake --build build/Release --parallel
 (cd build/Release && ctest --output-on-failure)
 scripts/check-deps.sh build/Release   # binaries link only system libraries
 scripts/tests/safety.sh build/Release # every fool-proofing rule, end to end, PASS/FAIL per rule
+python3 scripts/tests/disk_full.py build/Release # real ENOSPC in a disposable 512 MiB APFS image
 WFS_DIFF_BENCH=1 build/Release/core/diff_test   # adds the 50 000-file diff benchmark
 ```
 
@@ -34,7 +39,7 @@ WFS_DIFF_BENCH=1 build/Release/core/diff_test   # adds the 50 000-file diff benc
 
 GitHub Actions runs the Release build on macOS 15 arm64 for pushes, pull requests, and manual
 dispatches. It configures the Apple SDK and system SQLite, builds with `WFS_FSKIT=OFF`, runs
-CTest, checks linked dependencies, and runs the end-to-end safety suite. To reproduce the CI job
+CTest, checks linked dependencies, and runs the end-to-end safety and disk-full suites. To reproduce the CI job
 locally on macOS:
 
 ```bash
@@ -51,7 +56,12 @@ cmake --build build/ci --parallel
 ctest --test-dir build/ci --output-on-failure --timeout 600 --no-tests=error
 scripts/check-deps.sh build/ci
 scripts/tests/safety.sh build/ci "$TMPDIR/m1test"
+python3 scripts/tests/disk_full.py build/ci
 ```
+
+The disk-full test needs at least 2 GiB free on the host and permission to attach a local disk
+image. It fills only its own bounded APFS image, never the host volume. It does not require
+`sudo`. See the [validation guide](docs/MACOS_VALIDATION.md) for cleanup and coverage details.
 
 ## Usage
 
