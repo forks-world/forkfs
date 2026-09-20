@@ -1244,6 +1244,140 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第三十六轮:改名的那一瞬间,那个名字不能是空的(2026-09-20)
+
+第三十六轮,Codex 一条 P1。上一轮把「能拒 M1 的只剩库本身」这件事做对了,但**做法本身开了一个更小、
+更糟的窗口**:库先 `rename` 走、空目录后 `mkdir` 回来,这两个系统调用之间 `<store>/metadata.db`
+**不存在**——而上一轮要拒的正是那个「已经验过票、还没推门」的进程,它那句 open 带着
+`SQLITE_OPEN_CREATE`。**一个不存在的名字,对带 CREATE 的 open 来说不是拒绝,是邀请。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `PRRT_kwDOUf7jGc6kHCa8` | `core/src/store.cpp` `db_move_to_schema3()` / `wfs_store_open()`(~495) | `rename(metadata.db → metadata3.db)` 和 `db_stub_make()` 之间那个名字是空的。已经被放行的 M1 进程醒在这里:`sqlite3_open_v2(metadata.db, READWRITE\|CREATE)` **新建一个空库**,M1 把它戳成 2、一行都读不到,它的 collector 于是把整个 store 的快照树和 trash 当孤儿删光;M2 随后在自己空目录的位置上看到一个普通文件,报 `WFS_E_STORE_DAMAGED` | 搬库和建空目录合成**一步**,那个名字全程有人占着:私有名 `metadata.db.stub.<pid>.<hex>` 先 `mkdir` → `link(metadata.db, metadata3.db)`(一个 inode 两个名字)→ `renameatx_np(..., RENAME_SWAP)` 把两个目录项**原子对调** → `unlink` 掉多出来的链接。回滚反着走同样四步 | `d42ac8d` |
+
+##### 四步,和每一步里 M1 看得见什么
+
+```
+1. mkdir <store>/metadata.db.stub.<pid>.<hex>   0500 空目录;metadata.db 还一动没动
+2. link  metadata.db -> metadata3.db            库拿到新名字、留着老名字:一个 inode,两个名字
+3. SWAP  stub_tmp <-> metadata.db               两个目录项原子对调:metadata.db 从「是库」变成
+                                                「是目录」,中间没有第三种状态
+4. unlink stub_tmp                              去掉多出来的那条链接;库只剩 metadata3.db
+```
+
+| 时刻 | M1 的 `sqlite3_open_v2(metadata.db, RW\|CREATE)` | 谁来拒它 |
+|---|---|---|
+| 第 3 步之前(含 2 和 3 之间) | **成功**,拿到的是**真正的**库和真正的行 | 第三十四轮那道持有者闸门:`proc_listpidspath(3)` 把 `metadata3.db` 解析成同一个 vnode,找得到它 → 整体回滚 + `WFS_E_STORE_BUSY` |
+| 第 3 步之后 | `SQLITE_CANTOPEN` | 空目录本身(第三十五轮的实测) |
+
+没有第三种,而且两种里都不会凭空多出一个新库——这就是「红」那一行和「绿」那一行的全部差别。
+
+**第 2 步为什么安全**:硬链接的是一个**关着**的 SQLite 库。上一轮的 (b) 已经用本 core 的连接跑过
+`PRAGMA journal_mode=DELETE`、关掉、删掉三个 sidecar,所以链的是一个没人开着、旁边什么都没有的普通
+文件;而硬链接是第二个**名字**、不是副本,没有第二个库可以分叉。(反过来说:`metadata3.db-wal` /
+`-shm` / `-journal` 只要还在——只有「崩在 2 和 3 之间」的 store 才可能带着它——就说明有一个这个 core
+不认识的进程按**新名字**开过它,而下面这次 checkpoint 走的是**老名字**、根本看不见那个 WAL,所以一律
+`WFS_E_STORE_BUSY`、原样不动。)
+
+**第 3 步先探针、后写代码**(scratchpad,APFS,本机):
+
+```
+before swap: metadata.db ino=311809154 nlink=2, metadata3.db ino=311809154
+renameatx_np(dir <-> regfile, RENAME_SWAP) = 0 (ok)
+after swap: metadata.db isdir=1 mode=500; stub_tmp isreg=1 size=14 ino=311809154 nlink=2
+unlink(stub_tmp) = 0
+metadata3.db nlink=1 size=14; metadata.db isdir=1
+-- revert --
+link(metadata3.db, tmp2) = 0
+swap back = 0 (ok)
+metadata.db isreg=1 size=14 ; tmp2 isdir=1
+```
+
+目录保住 0500,文件保住 inode / 大小 / 链接数,**两个方向都行**。本项目的 publish 本来就在用
+`renameatx_np(RENAME_EXCL)`(P7/P8),这只是换一个 flag;为了不让唯一一处不可移植的调用散在
+`store.cpp` 里,它封成 `wfs::fs_rename_swap()`(macOS `RENAME_SWAP`,Linux
+`renameat2(RENAME_EXCHANGE)`,两样都没有就 `-ENOSYS` 并拒绝升级)。**没有「无缝的退路」**:任何
+一串普通 `rename` 都有一个瞬间某个名字是空的——那正是这一轮要修的东西,所以退路只能是这个交换本身。
+
+##### 回滚也反着走这四步
+
+```
+link(metadata3.db, stub_tmp)  ->  SWAP stub_tmp <-> metadata.db  ->  unlink(metadata3.db)
+                              ->  rmdir(stub_tmp)  ->  VERSION := 2
+```
+
+每一步同样让 `metadata.db` 有人占着:交换之前它是那个空目录,交换之后它就是库(的第二个链接)。
+任一步失败就停在原地,留下的仍然是下面那张表里可以接着做的形状;上一轮那条「库旁边还有
+`-wal`/`-shm`/`-journal` 就**不回滚**」的规矩原样保留。
+
+##### 崩溃态:两个新形状,判据还是布局
+
+| `metadata.db` | `metadata3.db` | 是什么 | 这次 open 做什么 |
+|---|---|---|---|
+| 不在 | 不在 | 一个没有库的 store | 有树 → `WFS_E_STORE_DAMAGED`;没树 → 新建 |
+| 普通文件 | 不在 | schema 2,或者崩在第 2 步之前 | `VERSION` 是 2 就先 (a),然后 1–4、(d) |
+| 普通文件 | **同一个 inode** | 崩在第 2 步和第 3 步之间 | 同上;`link()` 发现自己那步已经做过了,接着从第 3 步走 |
+| 普通文件 | 另一个 inode | 协议产生不出来 | `WFS_E_STORE_DAMAGED` |
+| 不在 | 在 | 空目录被人删了的 schema 3 store | `VERSION` 是 2 就先 (a),然后补空目录、(d) |
+| 目录 | 在 | schema 3;或者崩在 (d) 之前;或者崩在第 3、4 步之间(`st_nlink` 是 2) | `VERSION` 是 2 就先 (a),然后 (d);`st_nlink > 1` 就顺手把那条多余链接扫掉 |
+| 目录 | 不在 | 空目录旁边没有库 | `WFS_E_STORE_DAMAGED`,绝不新建 |
+
+**不变量**:凡是这个协议能产生的、**有库**的状态,`metadata.db` 都**存在**——要么是库本身,要么是库的
+第二个链接,要么是那个空目录。表里两行「不在」是「还没有库的新 store」和「空目录被人删掉的 store」,
+都不是这个 core 开出来的窗口(`db_move_to_schema3()` 里在交换之后还当场 `stat` 确认它是目录)。
+
+##### 清扫:`metadata.db.stub.` 是第二个前缀
+
+按 P18 那条规矩(在 `<store>` 里、不进子目录、前缀只有我们自己写):**空目录** `rmdir`(崩在第 3 步
+之前那个没用上的),**inode 和 `metadata3.db` 一样的普通文件** `unlink`(崩在第 3、4 步之间那条多余
+链接——这就是迟到的第 4 步),别的一概不碰。什么时候扫:`metadata.db` 还是普通文件,或者库的
+`st_nlink > 1`——正常那条路两个都不成立,**一次 readdir 都不做**。并发的另一个升级者的 stub 有可能被
+扫掉,那么它那次交换失败、它那次 open 重试,和第三十一轮 `VERSION.tmp` 那次清扫做的是同一笔交易。
+
+##### 先跑红
+
+老办法:把断言换成打印,跑在**修改前**的 core 上(`scratchpad/r36/red36.c`,链接 `64a64b1` 编出来的
+`libworldfs_core.a`,并把缝临时挪到 `rename` 和 `mkdir` 之间)。库里先放两行 `worlds`:
+
+```
+before: VERSION=2, metadata.db user_version=200, 2 rows in worlds
+seam ran: 1
+M1-shaped sqlite3_open_v2("<store>/metadata.db", RW|CREATE): rc=0 (not an error)
+  SELECT count(*) FROM worlds = -1   (-1 = no such table: a FRESH EMPTY database)
+  PRAGMA user_version = 0
+wfs_store_open rc=-1017 (the store has trees in it but no readable metadata3.db)
+<store>/metadata.db  exists=1 isdir=0 size=0
+<store>/metadata3.db exists=1 user_version=200
+```
+
+`count(*)` 那一行是这一轮的全部证据:一瞬间之前还有两行的库,在 M1 眼里连 `worlds` 表都没有——它
+打开的是 SQLite **刚刚替它新建**的那个空库。修完之后同一个窗口(缝现在是三步制的第 1 步):
+`rc=0`、`count(*)=2`、`user_version=200`,拿到的是**真库**,而这次 open 以 `WFS_E_STORE_BUSY` 整体
+回滚;第 2、3 步那两个窗口是 `SQLITE_CANTOPEN`,升级照常做完。
+
+##### 新增测试
+
+- `core_test` 新缝 `wfs_test_between_db_steps(ctx, dir, phase)`(`worldfs.h`,非测试运行里恒为 NULL),
+  在第 2、3、4 步之后各开一次火。缝里 **fork 一个子进程**做 M1 的那句 open
+  (`READWRITE|CREATE|FULLMUTEX`)——因为升级下一步要问的正是「**别人**谁开着」,而
+  `fs_other_holders()` 按定义排除自己的 pid;子进程把 `rc` / `SELECT count(*) FROM worlds` /
+  `PRAGMA user_version` 通过管道报回来,然后**攥着句柄不放**,直到父进程放它走。
+- 第 1 步(link 之后):`rc == SQLITE_OK`、`count(*) == 2`(**不是** 0、**不是** -1)、`user_version`
+  是 200;这次 `wfs_store_open()` 回 `WFS_E_STORE_BUSY`,而且整体回滚——`VERSION` 回 2、库是
+  `metadata.db` 上的普通文件、`nlink == 1`、两行还在、一个增量列都没加、没有 `metadata3.db`、
+  `metadata.db.stub.` 前缀下一个都不剩;放走子进程之后同一句 open 照样把 store 接管过来。
+- 第 2、3 步:`rc == SQLITE_CANTOPEN`,什么都没读到、什么都没建;这次 open 照常成功。
+- 三种情况收尾都断言同一件事:`metadata.db` 是 0500 空目录、`metadata3.db` 是普通文件且 `nlink == 1`、
+  两行 `worlds` 一行不少、`user_version` 3xx、`metadata.db.stub.` 和 `metadata.db-` 前缀都是 0 个。
+- 手搓两个崩溃态:①「link 完没交换」(两个名字同一个 inode,外加一个没用上的 stub 空目录)→ 接着做完,
+  stub 被扫掉;②「交换完没 unlink」(`nlink == 2`,`user_version` 戳回 200)→ 接着做完,多余链接被扫掉。
+- 再加一个「M1 store 旁边一个陈年 stub 空目录」→ 升级照常,空目录被扫掉。
+- 第三十四轮那个子进程持有者的用例补两条断言:回滚之后库的 `nlink == 1`、`metadata.db.stub.` 前缀下
+  一个都不剩(回滚现在也走交换)。
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **298 passed, 0 failed**;`check-deps.sh`
+全绿(5 个系统库)。(`m1_criteria.sh` 本轮跳过:没有碰到它量的任何东西。)
+
 #### PR #1 review 第三十五轮:库的名字就是 schema 的一部分、删不掉的临时名还是一条链接(2026-09-20)
 
 第三十五轮,Codex 一条 P1 一条 P2。P1 把前两轮那道门补完:**一个只拦得住「还没进门」和「已经站在
