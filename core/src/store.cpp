@@ -18,6 +18,11 @@ using wfs::Stmt;
 extern "C" void (*wfs_test_before_version_rename)(void *ctx, const char *dir) = nullptr;
 extern "C" void *wfs_test_before_version_rename_ctx = nullptr;
 
+// The window between the VERSION bump and the database migration (PR #1 review, 32nd round).
+// Same rules: NULL in every run that is not core_test. Declared in worldfs.h.
+extern "C" void (*wfs_test_after_version_bump)(void *ctx, const char *dir) = nullptr;
+extern "C" void *wfs_test_after_version_bump_ctx = nullptr;
+
 namespace {
 
 // Schema v3 (docs/M1_DESIGN.md §2). Snapshot ids and world ids are separate sequences, so
@@ -657,6 +662,40 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
         if (q.ok() && q.row()) user_version = (int)q.col_i64(0);
     }
     if (user_version / 100 > WFS_STORE_SCHEMA) { wfs_store_close(s); return WFS_E_SCHEMA; }
+
+    // ---- PR #1 review (32nd round, P1): the file first, and only then the database ----------
+    //
+    // The 24th round bumped the schema so that an M1 binary would be refused this store; the
+    // order in which the bump was applied gave it a window in which it was not. The upgrade ran
+    //     check_version() -> migrate_schema() (committed, user_version 3xx) -> VERSION := 3
+    // and M1 gates on the file alone, so an M1 process starting anywhere between the commit and
+    // the rename read `2`, was admitted, and kept the handle it opened there for the rest of its
+    // command -- against a database that is already M2's. What it does with it is worse than
+    // reading it: M1's own open is
+    //     if (user_version != WFS_STORE_SCHEMA) { ...kSchema...; PRAGMA user_version=2; }
+    // with WFS_STORE_SCHEMA == 2, so the first thing it does to a store stamped 3xx is stamp it
+    // back down to 2 -- and then it runs M1's wfs_gc() over M2 trash semantics: a `state=2`
+    // snapshot row's tree is not one of the paths it protects, so a snapshot still inside its
+    // retention window is deleted whole.
+    //
+    // So the bump comes first. From the instant the rename lands, M1's check_version() refuses
+    // the store, and everything the migration then writes is written behind a closed door. The
+    // two orders fail differently, which is the point:
+    //   * old order, crash after the commit: VERSION says 2, the database says 3xx -- a store
+    //     that every M1 binary may open and no M2 binary can tell from an M1 store;
+    //   * new order, crash after the rename: VERSION says 3, the database says 2xx -- refused
+    //     by M1, and finished by the next M2 open, because a 2xx stamp under a 3 file is read
+    //     right here as "an upgrade that got half-way", not as a schema to refuse. The hundreds
+    //     check above is what has to be careful about that, and is: only a stamp HIGHER than
+    //     ours is refused, so 2xx-under-3 falls through to the migration below, which has been
+    //     idempotent by column presence since the 11th round.
+    // Nothing else changes: a store that is already 3 does not come through here at all, and a
+    // migration that fails leaves a VERSION the older binary is refused by -- which costs it an
+    // M1 store it could have collected, and is the safe half of that trade.
+    if (legacy_schema) {
+        if (int vrc = version_upgrade(s->dir.c_str())) { wfs_store_close(s); return vrc; }
+        if (wfs_test_after_version_bump) wfs_test_after_version_bump(wfs_test_after_version_bump_ctx, s->dir.c_str());
+    }
     if (sqlite3_exec(s->db, kPragmas, nullptr, nullptr, nullptr) != SQLITE_OK) {
         wfs_store_close(s);
         return WFS_E_STORE_DAMAGED;
@@ -667,12 +706,13 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
     // the 3 in `user_version_want()` is the whole of what the bump costs it.
     if (user_version != user_version_want()) {
         if (int mrc = migrate_schema(s->db)) { wfs_store_close(s); return mrc; }
-    }
-    // Only now the file an older binary reads first. M1 (`main`) does, verbatim:
-    //     return v == WFS_STORE_SCHEMA ? 0 : WFS_E_SCHEMA;   // with WFS_STORE_SCHEMA == 2
-    // so this single line is what keeps its collector off a store that is no longer its own.
-    if (legacy_schema) {
-        if (int vrc = version_upgrade(s->dir.c_str())) { wfs_store_close(s); return vrc; }
+        // Belt and braces: the door this open migrated behind is asked, once, whether it is
+        // really shut. The rename above said so; a VERSION that says anything else by now is a
+        // store somebody is rewriting under us, and the one thing this open must not do is hand
+        // back a migrated database that an M1 binary is still allowed to open.
+        long v = 0;
+        if (int vrc = version_read(s->dir.c_str(), &v)) { wfs_store_close(s); return vrc; }
+        if (v != WFS_STORE_SCHEMA) { wfs_store_close(s); return WFS_E_SCHEMA; }
     }
     if (meta_get(s->db, "store_id", s->store_id) != 0) {
         char id[33];

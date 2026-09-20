@@ -929,6 +929,24 @@ static void vrace_before_version_rename(void *ctx, const char *dir) {
     if (vb) wfs_store_close(vb);
 }
 
+// PR #1 review (32nd round, P1): the window between the two halves of the 2 -> 3 upgrade. The
+// file is bumped first now, so from in here VERSION must already read 3 while the database is
+// still stamped 2xx -- i.e. every M1 binary is refused the store before one migrated byte of it
+// exists. With the old order (migrate, then rename) the same window showed 2 and 3xx: an M1
+// process starting in it is admitted, stamps user_version back down to 2, and collects.
+static int g_bump_ran;
+static int g_bump_file;   // what VERSION said from inside the window
+static int g_bump_uv;     // and what the database's own stamp said
+static void vbump_after_version_bump(void *ctx, const char *dir) {
+    (void)ctx;
+    char vp[4096], dbp[4096], buf[64];
+    join(vp, sizeof vp, dir, "VERSION");
+    join(dbp, sizeof dbp, dir, "metadata.db");
+    g_bump_ran++;
+    g_bump_file = read_file(vp, buf, sizeof buf) == 0 ? atoi(buf) : -1;
+    g_bump_uv = db_user_version(dbp);
+}
+
 // PR #1 review (26th round, P1): the user's own `mv`, run in the one window no transaction of
 // ours can serialise -- after the entry's identity has been checked against the row and before
 // the rename that claims it. The world's tree goes aside and a directory of somebody else's,
@@ -5639,6 +5657,57 @@ int main() {
         wfs_store_close(vs);
         CHECK(!exists(vtmp));
         CHECK(n_with_prefix(vstore, "VERSION.tmp") == 0);
+        CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
+        CHECK(atoi(vbuf) == WFS_STORE_SCHEMA);
+
+        // (d) PR #1 review (32nd round, P1): the ORDER of the two halves. The file is bumped
+        //     before the database is migrated, so the instant anything migrated exists in this
+        //     store, the one file M1 checks first has already refused it. The seam fires in
+        //     between and reads both: 3 on disk, 2xx in the database. With the old order it
+        //     read 2 and 3xx -- and an M1 binary starting in that window is admitted, stamps
+        //     `user_version` back down to 2 (its open does exactly that for any stamp that is
+        //     not 2), and then runs M1's wfs_gc() over M2 trash semantics.
+        write_file(vver, "2\n");
+        make_v2_db(vdb, 0);
+        g_bump_ran = 0;
+        g_bump_file = 0;
+        g_bump_uv = 0;
+        wfs_test_after_version_bump = vbump_after_version_bump;
+        vs = NULL;
+        int vbump_rc = wfs_store_open(vstore, &vs);
+        wfs_test_after_version_bump = NULL;
+        CHECK_OK(vbump_rc);
+        CHECK(g_bump_ran == 1);
+        CHECK(g_bump_file == WFS_STORE_SCHEMA);              // the door is shut...
+        CHECK(g_bump_uv / 100 == WFS_STORE_SCHEMA_M1);       // ...before the database moves
+        CHECK(vs != NULL);
+        wfs_store_close(vs);
+        CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
+        CHECK(atoi(vbuf) == WFS_STORE_SCHEMA);
+        CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA);
+        for (size_t i = 0; i < kAddedN; ++i) CHECK(db_has_column(vdb, kAdded[i][0], kAdded[i][1]));
+
+        // ... and the crash this order can leave behind: VERSION already 3 with a database
+        //     still stamped 2xx. Every M1 binary is refused it, and the next M2 open finishes
+        //     the upgrade -- the 2xx under a 3 is an upgrade in progress, not a schema to
+        //     refuse (only a stamp HIGHER than ours is refused, case (b) above).
+        write_file(vver, "3\n");
+        make_v2_db(vdb, 0);
+        CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA_M1);
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_close(vs);
+        CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA);
+        for (size_t i = 0; i < kAddedN; ++i) CHECK(db_has_column(vdb, kAdded[i][0], kAdded[i][1]));
+
+        // ... and the crash the OLD order left, which stores in the wild may still be in:
+        //     VERSION says 2, the database is already 3xx. The bump runs whatever the stamp
+        //     says, so the next open shuts the door on it.
+        write_file(vver, "2\n");
+        CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA);
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_close(vs);
         CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
         CHECK(atoi(vbuf) == WFS_STORE_SCHEMA);
     }

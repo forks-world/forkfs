@@ -1046,6 +1046,15 @@ extern int wfs_test_hardlink_restore_err;
 extern void (*wfs_test_before_version_rename)(void *ctx, const char *dir);
 extern void *wfs_test_before_version_rename_ctx;
 
+/* The other end of that upgrade (PR #1 review, 32nd round, P1). The VERSION file is bumped to 3
+ * BEFORE the database migration now, so that the instant anything migrated exists in the store,
+ * every older binary has already been locked out of it by the one file it checks first. This
+ * seam fires in the window between the two: from inside it, VERSION reads 3 and `user_version`
+ * still reads 2xx. Called with the store directory. NULL unless a test sets it; nothing in the
+ * library ever assigns it. */
+extern void (*wfs_test_after_version_bump)(void *ctx, const char *dir);
+extern void *wfs_test_after_version_bump_ctx;
+
 /* And the one xattr rule a test cannot drive from outside (PR #1 review, 9th round). The default
  * diff leaves com.apple.provenance out of the comparison, and provenance is precisely the name a
  * test cannot make differ: the kernel stamps it on every file this process creates, with the
