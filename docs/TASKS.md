@@ -1244,6 +1244,81 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第二十六轮:核对过的那个身份,必须就是被删掉的那个身份(2026-09-20)
+
+第二十六轮,Codex 一条 P1,打在**第二十五轮自己**身上。第二十五轮把"这条 trash 条目是不是这一行的
+树"写成了一次 `lstat` + 比 `dev`/`ino`,然后——**换两次新的名字查找**去动它:`trash_mark_deleting()`
+按路径 rename,`trash_unlink()` 按路径递归删。SQLite 那个 `BEGIN IMMEDIATE` 串行化的是**我们自己的
+写者**;可这条洞里的另一方根本不是写者,是**那个目录的主人**——跨卷 discard 的条目就在用户自己的
+`<parent>/.wfs-trash` 里,名字还可以猜。一条 `mv` 落在 `lstat` 和 `rename` 之间:核对通过的是世界的
+树,被改名成 `.deleting`、被连内容删光的是别人的目录。第二十五轮把窗口从"整个保留期"缩到"两次系统
+调用之间",但**没有关上它**。
+
+**规矩写成一句**:**核对是在一个描述符上做的,动手也必须在同一个描述符上。** 一个名字每解析一次就是
+一次新的提问,而 `open()` 之后的那个 fd 就是**那个 inode 本身**,别人在名字上做什么都换不掉它。
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `PRRT_kwDOUf7jGc6kFGX_` | `world.cpp` `gc_claim_deleting()` / `trash_delete_now()`(`--now`)/ `wfs_world_restore()` / `gc_tmp_is_removable()`,`platform_posix.cpp` | 第二十五轮的 `trash_identity()`(lstat + 比 dev/ino)、随后的 `trash_mark_deleting()`(按路径 rename)、再随后的 `trash_unlink()`(按路径递归删)是**三次独立的文件系统操作**。事务挡得住我们自己的 collector/`--now`/`restore` 互相插队,挡不住一个在 lstat 与 rename 之间把真树挪走、在 `j.path` 上放另一个目录的用户:按路径的 rename 于是认领了陌生人,按路径的递归删把它删光。`restore` 同样——核对完再 rename 回家,回家的可以是别人的树 | **认领 = 描述符**(新结构 `TrashClaim`)。(1) `open(path, O_RDONLY\|O_DIRECTORY\|O_NOFOLLOW\|O_CLOEXEC)` + `fstat` 与行的 `dir_dev`/`dir_ino` 比对(不符 `WFS_E_TRASH_FOREIGN`,和第二十五轮一样),这个 fd **握到整件事做完**;(2) rename 照旧按名字(**rename 只搬目录,永远删不掉东西**,所以就算搬的是陌生人也没损失);(3) 打开 trash 父目录(`O_DIRECTORY\|O_NOFOLLOW`),`fstatat(父fd, "<leaf>.deleting", AT_SYMLINK_NOFOLLOW)` 必须等于 fd 的 dev/ino——不等就是刚才搬的是陌生人:`renameat` **原样搬回去**、报 foreign、这一条跳过(事务回滚,行一个字没改);(4) 内容**穿过 fd 删**——新增 `wfs::fs_remove_tree_fd(dirfd, threads, entries, deadline_us, partial)`:`fdopendir(dup(fd))`,每条 `fstatat(AT_SYMLINK_NOFOLLOW)`,文件/符号链接 `unlinkat`,子目录 `openat(O_DIRECTORY\|O_NOFOLLOW)` 递归后 `unlinkat(AT_REMOVEDIR)`,免疫标志与权限借位(第四/十八轮)也都打在子 fd 上(`fchflags`/`fchmod`),`deadline`/`partial` 语义与 `fs_remove_tree_parallel` 逐字相同;(5) 条目本体那次 rmdir:`fstatat(父fd, leaf.deleting)` 再对一次 fd 的身份,然后 `unlinkat(父fd, leaf.deleting, AT_REMOVEDIR)`。`--now` 同一套协议;`restore` 是 rename 回家之后用 `fstatat(家的父目录, leaf)` 对 fd,不符就 rename 回去、`WFS_E_TRASH_FOREIGN`,(c) 写回行的那一对就是 fd 上核对过的那一对 | `4f7437f`(remover)+ `8c7f76d`(协议) |
+| 配套 | `world.cpp` `gc_tmp_is_removable()` + CREATING 收尾,`marker_read_at()` | 被放弃的 fork 临时树(第五/二十轮)是同一个形状:`.world` 标记**按路径读**、树**按路径删**。而这棵树就在**用户自己的**目标目录里,名字只有行记得 | 先 `open(O_DIRECTORY\|O_NOFOLLOW)`,标记穿过这个 fd 读(新 `marker_read_at()` = `openat(fd, ".world", O_NOFOLLOW)`,并把"根本没有标记"(-ENOENT)和"有但读不出来"分开,后者照第十二轮算 `undecided`),问数据库用的 inode 就是这个 fd 的,删除走 `trash_unlink_claim()`(同样的 fd + 最后那次带身份核对的 rmdir)。**这里故意不 chmod**:trash 那边是行的 dev/ino 先证明了树是我们的,这里的证据在树**里面**,一个打不开的用户目录就是"还没证明任何事",保持第十二轮的 `undecided` | `8c7f76d` |
+
+**最后那次 rmdir 的界限,写明白**:整条协议里唯一还由名字决定的一步,是 `unlinkat(父fd, leaf,
+AT_REMOVEDIR)`——它前面那次 `fstatat` 和它之间仍然有一个瞬间。可这一步的界限是**精确**的:
+`AT_REMOVEDIR` 要么删掉一个**空目录**,要么什么都不删(非空是 `ENOTEMPTY`)。也就是说,在那个瞬间
+被塞进来的东西,最多赔掉一个空目录,**一个字节的数据都丢不了**。代码注释和回帖里都把这句话说死。
+
+**哪些地方仍走按名字的并行删除,为什么**:(a) **快照条目**——它的树永远在 `<store>/trash`、名字由
+store 分配,而且 snapshots 表压根没有 `dir_dev`/`dir_ino`(第二十五轮已经解释过为什么不补),没有
+身份可核对,也就没有身份需要一路带下去;它们还整棵 `UF_IMMUTABLE`(`--hard`),按名字那条路一趟
+`fs_unprotect_tree` 就解开了。(b) **`<store>/trash` 下无行的孤儿**——没有行可以当它的树。(c) **早于
+身份列的老行**(本 store 从来不产生):没记过身份就没得核对,这本来就是第二十五轮自己的规矩。这三类
+继续用 4 线程的 `fs_remove_tree_parallel`,而它们正是"大树"最常出现的地方。
+
+**代价量了**(50 000 个条目 = 100 个目录 × 500 个文件,APFS,同一台机器,各跑三遍取平均,
+`fs_remove_tree_parallel` / `fs_remove_tree_fd` / `fs_remove_tree` 各删一棵一模一样的树):
+
+| 删法 | 均值 | 相对 |
+|---|---|---|
+| 按名字,4 线程(`fs_remove_tree_parallel`,原路径) | **844 ms** | 1.00x |
+| 按 fd,串行(`fs_remove_tree_fd`,本轮新增) | **2242 ms** | 2.66x |
+| 按名字,串行(`fs_remove_tree`,老的单线程 remover) | **2216 ms** | 2.62x |
+
+结论很干净:**贵的是并行度,不是描述符**——fd 版本比同样串行的按名字版本只慢 ~1%(2242 vs 2216 ms)。
+并行版的 walker 把**路径**发给 worker、rmdir 又要按"最深优先"的路径表收尾,让它改成按描述符下降是把
+walker 重写一遍,不是换个 remover;而 gc 的批次**deadline 逐条目检查**这条没变,所以代价的形状是
+"同样的一秒唤醒删掉的条目变少、唤醒次数变多",不是"一次唤醒变长"。真要把这 2.6x 拿回来,是另开一轮
+"按描述符下降的并行 walker"的事。
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **274 passed, 0 failed**;`check-deps.sh` 全绿。
+(`m1_criteria.sh` 本轮跳过。)`safety.sh` 没有新增:本轮这条竞态的另一方必须**恰好落在核对与 rename
+之间**,只有库内的 seam 能造出来,CLI 造不出来——所以测试全在 `core_test`。
+
+先跑红(新 seam `wfs_test_between_trash_claim`,库外恒为 NULL;在里面把真树 `mv` 走、在 `j.path` 上
+`mkdir` 一个带 `user.txt` 的目录):
+
+- `wfs_gc()`:陌生人的目录**和里面的 `user.txt` 一起没了**(`exists=0`),`entries_freed=1`,
+  `worlds_deleted=1`,行落 **DEAD**——gc 报"删掉了一个世界",而世界自己的树好端端躺在被挪去的地方。
+  断言 `CHECK(exists(g_swap_file))` 在 `core_test.cpp` 当场红。
+- 修完之后同一条 seam:`trash_foreign=1`、`worlds_deleted=0`、`entries_freed=0`,`.deleting` 名字
+  **压根没留下**(搬过去又搬回来了),用户的文件逐字节还在,真树也逐字节还在,行还是 TRASHED 且
+  `dir_dev`/`dir_ino` 没变。
+
+新增测试(`core_test` 末尾一块,和第二十五轮那块并排):
+
+- **collector**:seam 里换掉 → `wfs_gc()` 报 `trash_foreign == 1`、`worlds_deleted == 0`、
+  `entries_freed == 0`;陌生人的 `user.txt` 内容逐字节比对;`<条目>.deleting` 不存在(rename 被原样
+  撤回);被挪走的真树里的 `sub/b.txt` 还在;行 TRASHED、身份列没动。
+- **`--now`**:同一个 seam → `wfs_world_discard(..., immediate=1, ...)` 回 `WFS_E_TRASH_FOREIGN`,
+  一样什么都没动。
+- **`restore`**:同一个 seam → `wfs_world_restore()` 回 `WFS_E_TRASH_FOREIGN`,**家目录没有被创建出来**
+  (陌生人没有被登记成这个世界),陌生人被 rename 回条目的名字上、文件还在,真树还在,行还是 TRASHED。
+- **普通路径**:不装 seam 再收一次 → `worlds_deleted == 1`、`trash_foreign == 0`,
+  `entries_freed == 4`(`a.txt`、`sub`、`sub/b.txt`、`.world`——条目本体不计),条目和 `.deleting`
+  两个名字都没了,行 DEAD。**这一条就是新 remover 的计数契约**。
+- deadline/partial 走的是既有的 `safety.sh` PR7 那块(120k 条目的被放弃 fork 树 + 一秒预算):它现在
+  **正好穿过新的 fd remover**(CREATING 那条路本轮也改成了按 fd),仍旧一秒返回、留一棵可续的树、
+  不报失败,下一次无预算的 gc 收干净。
+
 #### PR #1 review 第二十五轮:名字不是所有权,inode 才是(2026-09-20)
 
 第二十五轮,Codex 一条 P1,打在第二十轮那条规矩的**另一半**上。第二十轮写的是"**不是我们起的名字,
