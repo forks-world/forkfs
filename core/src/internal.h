@@ -190,6 +190,10 @@ int fs_rename(const char *from, const char *to);
 // rename(2) that refuses to replace anything already at `to` (-EEXIST). Used for the one rename
 // whose destination is a path outside the store: the fork's publish (P7/P8).
 int fs_rename_excl(const char *from, const char *to);
+// rename(2) that EXCHANGES the two entries instead of replacing one with the other, atomically
+// (PR #1 review, 36th round). The one caller is the 2 -> 3 upgrade, which may not leave the name
+// an M1 binary opens free even for an instant. -ENOSYS where the platform cannot do it.
+int fs_rename_swap(const char *a, const char *b);
 int fs_setattr(const char *path, const wfs_setattr_req &req);
 int fs_getxattr(const char *path, const char *name, void *buf, size_t cap, size_t *len);
 int fs_setxattr(const char *path, const char *name, const void *data, size_t len, int flags);

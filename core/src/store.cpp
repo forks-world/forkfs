@@ -42,6 +42,12 @@ extern "C" int wfs_test_txn_fail_once = 0;
 extern "C" void (*wfs_test_after_db_move)(void *ctx, const char *dir) = nullptr;
 extern "C" void *wfs_test_after_db_move_ctx = nullptr;
 
+// The three steps the database's move is made of (PR #1 review, 36th round): 1 = after the
+// link, 2 = after the exchange, 3 = after the extra link is dropped. NULL in every run that is
+// not core_test; nothing in the library ever assigns it. Declared in worldfs.h.
+extern "C" void (*wfs_test_between_db_steps)(void *ctx, const char *dir, int phase) = nullptr;
+extern "C" void *wfs_test_between_db_steps_ctx = nullptr;
+
 namespace {
 
 // ---- PR #1 review (35th round, P1): the database's name is part of the schema ----------------
@@ -461,11 +467,119 @@ int version_upgrade(const char *dir) {
 // under a prefix nothing but SQLite writes there -- and everything they held is in the database
 // we have just checkpointed and closed, so what is unlinked is a file with nothing in it.
 //
-// 0, or the error the upgrade ends with. Nothing has been renamed unless this returns 0.
+// ---- PR #1 review (36th round, P1): and `metadata.db` is never absent, not for an instant ---
+//
+// The 35th round moved the database with one rename and made the stub with one mkdir, and
+// between those two syscalls the name M1 opens is NOT THERE. An M1 process that read VERSION as
+// 2, was admitted, and resumes in exactly that window opens `<store>/metadata.db` with
+// SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE -- and CREATE is what it then does: SQLite makes a
+// fresh, empty database under the name, M1 stamps it 2 and finds no rows at all, so its
+// collector walks the store and deletes every snapshot tree and every trash entry in it as an
+// orphan. This core, arriving a moment later, finds a regular file where its stub should be and
+// reports the store damaged. Measured on the parent commit with a seam in that window: the
+// M1-shaped open returned SQLITE_OK, `SELECT count(*) FROM worlds` failed with "no such table"
+// on a database that had two rows a moment earlier, `PRAGMA user_version` read 0, and
+// wfs_store_open() then returned WFS_E_STORE_DAMAGED.
+//
+// So the move and the stub are ONE step, and the name is occupied throughout it:
+//
+//   1. mkdir <store>/metadata.db.stub.<pid>.<hex>    0500 and empty -- the stub, built under a
+//                                                    private name, so nothing at `metadata.db`
+//                                                    has moved yet
+//   2. link  metadata.db -> metadata3.db             the database gains its new name while
+//                                                    keeping the old one: one inode, two names
+//   3. EXCHANGE stub_tmp with metadata.db            fs_rename_swap(): the two entries change
+//                                                    places in one atomic step, so
+//                                                    `metadata.db` goes from being the database
+//                                                    to being the directory with no instant in
+//                                                    between, and `stub_tmp` becomes the
+//                                                    database's second link
+//   4. unlink stub_tmp                               the extra link goes; the database is at
+//                                                    `metadata3.db` and nowhere else
+//
+// Step 2 hard-links a CLOSED SQLite database, which is safe precisely because it is closed:
+// step (b) above ran `PRAGMA journal_mode=DELETE` through this core's own connection and then
+// unlinked the three sidecar names, so what is linked is a plain file with nothing open on it
+// and nothing beside it. A hard link is a second NAME for one inode, not a copy -- there is no
+// second database, so there is nothing that can diverge.
+//
+// Step 3 was measured before it was written (scratchpad probe, APFS, this machine):
+// renameatx_np(AT_FDCWD, <directory>, AT_FDCWD, <regular file>, RENAME_SWAP) returns 0 and the
+// entries change places -- the directory keeps its 0500 mode, the file keeps its inode, its
+// size and its link count -- and the reverse exchange the revert makes was measured the same
+// way. The project already uses renameatx_np(RENAME_EXCL) for every publish; this is the same
+// call with the other flag, behind fs_rename_swap() so that the one non-portable syscall stays
+// in the platform layer.
+//
+// What an M1 process sees, at every instant of the four steps:
+//   * before 3 (including between 2 and 3): `metadata.db` IS the database -- one of its two
+//     names. That open SUCCEEDS and gets the real database with all of its rows, which is the
+//     case the 34th round's holder gate exists for, and the gate finds it: proc_listpidspath(3)
+//     resolves `metadata3.db` to the same vnode. A holder there is a full revert and
+//     WFS_E_STORE_BUSY.
+//   * after 3: `metadata.db` is the directory. SQLITE_CANTOPEN in every open mode M1 could use
+//     (the 35th round's measurement), so M1's command ends before its collector runs.
+// There is no third instant, and in neither of them does an M1 open create a database.
+//
+// The private name the stub is built under. The other prefix this core sweeps inside a store
+// directory, by the same P18 rule the VERSION temporaries follow: ours, never in a
+// subdirectory, and nothing but the code below ever writes it.
+const char *kStubPrefix = "metadata.db.stub.";
+
+void db_stub_tmp(const char *dir, String &out) {
+    char rnd[33];
+    hex_id(rnd, sizeof rnd);
+    char name[96];
+    ::snprintf(name, sizeof name, "/%s%lld.%s", kStubPrefix, (long long)::getpid(), rnd);
+    out.assign(dir);
+    out.append(name);
+}
+
+// What an interrupted move left under that prefix, and nothing else:
+//   * a DIRECTORY is a stub that was never exchanged (a crash before step 3). It is empty by
+//     construction, so rmdir(2) is the whole of removing it.
+//   * a REGULAR FILE whose inode is `metadata3.db`'s is the extra link of step 4 (a crash
+//     between 3 and 4). Unlinking it IS step 4, done late.
+// Anything else under the prefix stays exactly where it is: this removes only what it can prove
+// is ours. A concurrent upgrader's stub can be taken out from under it, and then that
+// upgrader's exchange fails and its open retries -- the same trade the 31st round's VERSION.tmp
+// sweep makes, for the same reason: there is no lock on this path and there does not need to be.
+void db_stub_sweep(const char *dir, uint64_t db_ino) {
+    DIR *d = ::opendir(dir);
+    if (!d) return;
+    size_t pl = ::strlen(kStubPrefix);
+    while (struct dirent *e = ::readdir(d)) {
+        if (::strncmp(e->d_name, kStubPrefix, pl) != 0) continue;
+        String p(dir);
+        p.append("/");
+        p.append(e->d_name);
+        struct stat st;
+        if (::lstat(p.c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) ::rmdir(p.c_str());
+        else if (S_ISREG(st.st_mode) && db_ino != 0 && (uint64_t)st.st_ino == db_ino)
+            ::unlink(p.c_str());
+    }
+    ::closedir(d);
+}
+
+// 0, or the error the upgrade ends with. Every failure leaves the store in one of the states
+// store_layout() below resumes from, and in all of them `metadata.db` is still there.
 int db_move_to_schema3(const char *dir) {
     String olddb, newdb;
     db_path(dir, olddb, true);
     db_path(dir, newdb, false);
+    // A sidecar at the SCHEMA-3 name. Only a resumed run reaches this function with
+    // `metadata3.db` already present (a crash between steps 2 and 3), and a `-wal` or a hot
+    // `-journal` under that name belongs to an opener this core knows nothing about: the
+    // checkpoint below goes through the OLD name, so SQLite would not even look at it, and
+    // carrying on would strand it. That is the one shape of this that loses data, so it is
+    // refused with the store left exactly as it is.
+    for (const char *sfx : {"-wal", "-shm", "-journal"}) {
+        String p(newdb);
+        p.append(sfx);
+        struct stat st;
+        if (::stat(p.c_str(), &st) == 0) return WFS_E_STORE_BUSY;
+    }
     sqlite3 *h = nullptr;
     // No SQLITE_OPEN_CREATE: this is called only when `metadata.db` is a regular file, and a
     // database that has gone missing under us is not one to create here.
@@ -492,7 +606,49 @@ int db_move_to_schema3(const char *dir) {
         p.append(sfx);
         ::unlink(p.c_str());
     }
-    return ::rename(olddb.c_str(), newdb.c_str()) == 0 ? 0 : -errno;
+    // ---- 1. the stub, under a name nothing else can be holding ------------------------------
+    String stub;
+    db_stub_tmp(dir, stub);
+    if (::mkdir(stub.c_str(), 0500) != 0) return -errno;
+    // ---- 2. the second name -----------------------------------------------------------------
+    if (::link(olddb.c_str(), newdb.c_str()) != 0) {
+        int e = errno;
+        struct stat a, b;
+        if (e != EEXIST) rc = -e;
+        else if (::stat(olddb.c_str(), &a) != 0 || ::stat(newdb.c_str(), &b) != 0) rc = -errno;
+        // The same inode under both names is a run that crashed between 2 and 3: the link we
+        // were about to make is already there, so this step is simply done. Two DIFFERENT
+        // inodes is a shape the protocol cannot produce, and is never written over.
+        else if (a.st_dev != b.st_dev || a.st_ino != b.st_ino) rc = WFS_E_STORE_DAMAGED;
+    }
+    if (!rc && wfs_test_between_db_steps)
+        wfs_test_between_db_steps(wfs_test_between_db_steps_ctx, dir, 1);
+    // ---- 3. the exchange --------------------------------------------------------------------
+    if (!rc) {
+        if (int src = wfs::fs_rename_swap(stub.c_str(), olddb.c_str())) rc = src;
+    }
+    if (rc) {
+        // Nothing left behind here is a state the next open cannot pick up: `metadata.db` is
+        // either the database alone, or the database with `metadata3.db` as its second name.
+        // Our own stub goes -- it is empty and nothing was ever put in it.
+        ::rmdir(stub.c_str());
+        return rc;
+    }
+    // The invariant this round is about, checked once, where it is cheapest to check: from here
+    // on `metadata.db` is a DIRECTORY, and an instant ago it was the database. It is never
+    // absent in between, and an M1 open can therefore never create one here.
+    struct stat ost;
+    if (::stat(olddb.c_str(), &ost) != 0 || !S_ISDIR(ost.st_mode)) return WFS_E_STORE_DAMAGED;
+    if (wfs_test_between_db_steps)
+        wfs_test_between_db_steps(wfs_test_between_db_steps_ctx, dir, 2);
+    // ---- 4. the extra link ------------------------------------------------------------------
+    // A DIRECTORY at our own stub name is another upgrader that exchanged between our 3 and our
+    // 4: its stub and ours changed places. Both are empty and `metadata.db` is a stub either
+    // way, so the only difference is which call removes this one.
+    if (::unlink(stub.c_str()) != 0 && (errno == EPERM || errno == EISDIR)) ::rmdir(stub.c_str());
+    if (wfs_test_between_db_steps)
+        wfs_test_between_db_steps(wfs_test_between_db_steps_ctx, dir, 3);
+    return 0;
 }
 
 // The database's own stamp, read from the file at `path` without writing a byte of it. Used on
@@ -518,8 +674,15 @@ int db_user_version_at(const char *path, int *out) {
     return rc;
 }
 
-// Step (c): the stub. An empty directory, mode 0500, at the name M1 opens. Idempotent, because
+// The stub on its own: an empty directory, mode 0500, at the name M1 opens. Idempotent, because
 // every crash state of the upgrade is resumed by re-running the steps that are still owed.
+//
+// PR #1 review (36th round, P1): this is no longer how the stub arrives at the end of a MOVE --
+// there it is exchanged into place with the database, in one step, so that the name is never
+// free (db_move_to_schema3 above). What is left for this are the two states where there is
+// nothing at the M1 name to exchange with: a brand new store, whose database this open created
+// itself a moment ago, and a schema-3 store whose stub somebody removed. In neither is there a
+// database at `metadata.db` for an M1 open to find, so a plain mkdir is the whole of it.
 int db_stub_make(const char *dir) {
     String p;
     db_path(dir, p, true);
@@ -593,11 +756,32 @@ int legacy_holders_gate(const char *dir) {
         struct stat st;
         if (::stat(p.c_str(), &st) == 0) { version_tmp_sweep(dir); return WFS_E_STORE_BUSY; }
     }
-    // rmdir(2) on the stub first, so the name is free for the database to come back to. An
-    // rmdir or a rename that fails stops the revert: what is on disk then is one of the crash
+    // PR #1 review (36th round, P1): and backwards through the same four steps, so that the
+    // revert does not open the hole the move just closed. `metadata.db` is the stub directory
+    // at this point; an rmdir of it followed by a rename of the database back to it would leave
+    // that name ABSENT in between -- the very window an admitted M1 process turns into a fresh
+    // empty database. So the database is linked under a private name first, and that name is
+    // EXCHANGED with the stub: the directory leaves for the private name and the database
+    // arrives at `metadata.db` in one step. Only then does the schema-3 name go, and only then
+    // is what is now an empty directory at the private name removed.
+    //
+    // A step that fails stops the revert where it is: what is on disk then is one of the crash
     // states store_layout() below resumes from, and pressing on would make it one that is not.
-    if (::rmdir(olddb.c_str()) == 0 && ::rename(newdb.c_str(), olddb.c_str()) == 0)
-        version_put(dir, WFS_STORE_SCHEMA_M1, false);   // best effort; see above
+    // The stub left over in that case is swept by the next open (db_stub_sweep above).
+    String stub;
+    db_stub_tmp(dir, stub);
+    if (::link(newdb.c_str(), stub.c_str()) == 0) {
+        if (wfs::fs_rename_swap(stub.c_str(), olddb.c_str()) == 0) {
+            // `metadata.db` is the database again -- its second link -- and `stub` is the stub
+            // directory. The schema-3 name can go now, and not one instant earlier.
+            if (::unlink(newdb.c_str()) == 0) {
+                ::rmdir(stub.c_str());
+                version_put(dir, WFS_STORE_SCHEMA_M1, false);   // best effort; see above
+            }
+        } else {
+            ::unlink(stub.c_str());   // the extra link, and nothing else, goes back
+        }
+    }
     version_tmp_sweep(dir);
     return WFS_E_STORE_BUSY;
 }
@@ -665,19 +849,32 @@ int store_has_trees(const char *dir, String &what) {
 //     (c) mkdir the stub at  metadata.db  (0500, empty)
 //     (d) list who holds metadata3.db open; holders ? revert : migrate and stamp 3xx
 //
-// in that order, and every prefix of it is a state a crash can leave. The rename in (b) is
-// atomic, so `metadata.db` is a regular file on one side of it and absent on the other, and the
-// stub in (c) only ever appears once (b) has landed. That is what makes the table below total:
+// in that order, and every prefix of it is a state a crash can leave.
+//
+// PR #1 review (36th round, P1): (b) and (c) are one step now -- link, exchange, unlink -- so
+// that `metadata.db` is never free for an M1 open to create a database at. That adds two
+// intermediate shapes, and both are resumable:
 //
 //   metadata.db  metadata3.db   what it is                          what this open does
 //   -----------  ------------   ---------------------------------   ---------------------------
 //   absent       absent         a store with no database at all     trees ? DAMAGED : create
-//   regular      absent         schema 2, or a crash before (b)     (a) if VERSION 2, then (b)(c)(d)
-//   absent       present        a crash between (b) and (c)         (a) if VERSION 2, then (c)(d)
-//   directory    present        schema 3 -- or a crash before (d)   (a) if VERSION 2, then (d)
+//   regular      absent         schema 2, or a crash before 2       (a) if VERSION 2, then 1-4, (d)
+//   regular      SAME inode     a crash between 2 and 3             the same, and link() finds
+//                               (one file, two names)               its own work already done
+//   regular      other inode    a state the protocol cannot reach   DAMAGED
+//   absent       present        a store whose stub was removed      (a) if VERSION 2, then the
+//                               from under it                       stub, then (d)
+//   directory    present        schema 3 -- or a crash before (d),  (a) if VERSION 2, then (d);
+//                               or one between 3 and 4, which the   nlink > 1 also sweeps the
+//                               link count gives away               extra link away
 //   directory    absent         the stub with no database           DAMAGED
-//   regular      present        a state the protocol cannot reach   DAMAGED
 //   anything else at either name                                    DAMAGED
+//
+// The invariant, stated once: in every state this protocol can produce from a store that HAS a
+// database, `metadata.db` EXISTS -- as the database, as a second link to it, or as the stub
+// directory. The two rows above where it is absent are the store that has no database yet (a
+// brand new one, where an M1 open would create nothing anybody wants either) and one whose stub
+// somebody removed; neither is a window this core opens.
 //
 // VERSION is not in the table because it does not decide anything: the LAYOUT decides, and the
 // file only says whether the bump in (a) is still owed. That settles the one direction the
@@ -692,9 +889,14 @@ int store_has_trees(const char *dir, String &what) {
 // neither a readable `metadata3.db` nor a readable `metadata.db` to upgrade, and a store that
 // still has trees in it is refused rather than given a fresh database and a fresh store id.
 struct StoreLayout {
-    bool move_needed = false;    // (b) is still owed
-    bool stub_needed = false;    // (c) is still owed
+    bool move_needed = false;    // the four steps of the move are still owed
+    bool stub_needed = false;    // the stub is owed on its own: there is nothing to exchange it
+                                 // with, because nothing at all is at the M1 name
     bool db_existed = false;     // metadata3.db was there before this open touched anything
+    bool sweep_needed = false;   // an interrupted move may have left something under the stub
+                                 // prefix: a stub it never exchanged, or a link it never dropped
+    uint64_t db_ino = 0;         // metadata3.db's inode, so the sweep can tell that extra link
+                                 // from a stranger's file under the same prefix
 };
 
 int store_layout(const char *dir, StoreLayout &lay) {
@@ -712,11 +914,19 @@ int store_layout(const char *dir, StoreLayout &lay) {
     bool old_dir = orc == 0 && S_ISDIR(ost.st_mode);
     if (orc == 0 && !old_reg && !old_dir) return WFS_E_STORE_DAMAGED;
     if (nrc == 0 && !S_ISREG(nst.st_mode)) return WFS_E_STORE_DAMAGED;
-    if (old_reg && nrc == 0) return WFS_E_STORE_DAMAGED;
+    // Both names on a regular file: the same inode under both is the crash between steps 2 and
+    // 3 of the move and is resumed; two different inodes is a shape nothing in this protocol
+    // writes, and is never written over (36th round).
+    if (old_reg && nrc == 0 && (ost.st_dev != nst.st_dev || ost.st_ino != nst.st_ino))
+        return WFS_E_STORE_DAMAGED;
     if (old_dir && nrc != 0) return WFS_E_STORE_DAMAGED;
     lay.move_needed = old_reg;
-    lay.stub_needed = !old_dir;
+    lay.stub_needed = orc != 0;   // nothing at the M1 name at all: a mkdir is the whole of it
     lay.db_existed = nrc == 0;
+    lay.db_ino = nrc == 0 ? (uint64_t)nst.st_ino : 0;
+    // A second link to the database is one an interrupted move left under the stub prefix --
+    // st_nlink is what says so without a readdir on the ordinary path, where there is none.
+    lay.sweep_needed = old_reg || (nrc == 0 && nst.st_nlink > 1);
 
     // P17, over whichever of the two names the database is under at this moment. "Unreadable"
     // counts as missing, exactly as it did when there was one name: a database we cannot open is
@@ -978,13 +1188,25 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
         int fd = ::open(p.c_str(), O_WRONLY | O_CREAT, 0644);
         if (fd >= 0) ::close(fd);
     }
-    // ---- PR #1 review (32nd/34th/35th rounds): the 2 -> 3 upgrade, in order -----------------
+    // ---- PR #1 review (36th round, P1): the leftovers of an interrupted move ---------------
     //
-    // (a) VERSION := 3, (b) move the database, (c) the stub, (d) the holder gate -- and only
-    // then is anything opened. The 32nd round's reasoning for putting the file first is below;
-    // the 35th round's for the move is on store_layout() and db_move_to_schema3() above. The
-    // stamp is read here, from the database where it still lies, because a store from a schema
-    // we do not know has to come back untouched and step (b) would already have moved it.
+    // A stub that was never exchanged, or an extra link that was never dropped. Both are ours,
+    // both are under a prefix nothing else writes, and neither is in the way of anything --
+    // they are swept here, before the upgrade, so that what the steps below find is the shape
+    // the table above describes. On the ordinary path this does not even open the directory:
+    // `sweep_needed` is false unless the M1 name is still a regular file or the database is
+    // carrying a second link.
+    if (lay.sweep_needed) db_stub_sweep(s->dir.c_str(), lay.db_ino);
+
+    // ---- PR #1 review (32nd/34th/35th/36th rounds): the 2 -> 3 upgrade, in order ------------
+    //
+    // (a) VERSION := 3, (b) move the database -- link, exchange, unlink, which makes the stub
+    // in the same step (36th round) -- (d) the holder gate, and only then is anything opened.
+    // The 32nd round's reasoning for putting the file first is below; the 35th round's for
+    // moving the database at all, and the 36th's for moving it this way, are on store_layout()
+    // and db_move_to_schema3() above. The stamp is read here, from the database where it still
+    // lies, because a store from a schema we do not know has to come back untouched and step
+    // (b) would already have moved it.
     bool gated = false;
     if (lay.move_needed) {
         String olddb;
@@ -1012,7 +1234,8 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
             }
             lay = again;
         } else {
-            if (int src = db_stub_make(s->dir.c_str())) { wfs_store_close(s); return src; }
+            // No db_stub_make() here any more: the exchange in step 3 put the stub at
+            // `metadata.db` itself, which is the whole of the 36th round's finding.
             // ... and the door is only shut for those who were not already through it. See
             // legacy_holders_gate() above: this is the one open in a store's life that pays
             // for it.
@@ -1093,9 +1316,11 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
     // M1 store it could have collected, and is the safe half of that trade.
     //
     // PR #1 review (35th round, P1): the steps above ran before the open, and what is left here
-    // is the crash states they can be resumed from. The stub is made good whenever it is not
-    // there -- which is also how a brand new store gets one, right after its database is
-    // created -- and the holder gate is owed by exactly the stores whose database has moved but
+    // is the crash states they can be resumed from. The stub is made good whenever there is
+    // nothing at all at the M1 name -- which is also how a brand new store gets one, right
+    // after its database is created (36th round: a store whose database is still at that name
+    // gets its stub from the exchange instead, never from a mkdir into a name that was just
+    // freed) -- and the holder gate is owed by exactly the stores whose database has moved but
     // whose migration has not committed: `user_version` still in the 2xx, on a file that was
     // already on disk when this open started. A store that is stamped 3xx does not pay
     // proc_listpidspath(3)'s ~100 ms, and a database this open created itself has no holder

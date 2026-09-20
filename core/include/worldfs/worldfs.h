@@ -1093,6 +1093,17 @@ extern void *wfs_test_after_version_bump_ctx;
 extern void (*wfs_test_after_db_move)(void *ctx, const char *dir);
 extern void *wfs_test_after_db_move_ctx;
 
+/* And the three steps that move itself is made of (PR #1 review, 36th round, P1). The database
+ * is linked under its new name, the stub directory and the old name are EXCHANGED, and the
+ * extra link is dropped -- so that the name an M1 binary opens is never absent, not for an
+ * instant, and an admitted M1 process can never create a fresh empty database at it. `phase` is
+ * 1 after the link, 2 after the exchange, 3 after the unlink. From phase 1 an M1-shaped open of
+ * `<store>/metadata.db` gets the REAL database (one of its two names) and is refused by the
+ * holder gate; from phase 2 on it gets SQLITE_CANTOPEN. Called with the store directory. NULL
+ * unless a test sets it; nothing in the library ever assigns it. */
+extern void (*wfs_test_between_db_steps)(void *ctx, const char *dir, int phase);
+extern void *wfs_test_between_db_steps_ctx;
+
 /* One step(2) of one query, failed on demand (PR #1 review, 32nd round, P2). Every count and
  * every lookup that decides a destructive step now tells SQLITE_DONE from an error, and the only
  * way to test that from outside is to make a step fail. Set this to a substring of the SQL of

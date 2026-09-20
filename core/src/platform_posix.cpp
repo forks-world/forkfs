@@ -214,6 +214,32 @@ int fs_rename_excl(const char *from, const char *to) {
 #endif
 }
 
+// ---- PR #1 review (36th round, P1): the exchange ---------------------------------------------
+//
+// rename(2) with the two entries swapped instead of one replacing the other. The 2 -> 3 upgrade
+// needs it because the name M1 opens must never be free for an instant: the stub directory and
+// the database change places in one step, and there is no window in between for an
+// SQLITE_OPEN_CREATE to slip into. Measured on APFS (scratchpad probe): a DIRECTORY and a
+// REGULAR FILE exchange cleanly in both directions -- the directory keeps its mode, the file
+// keeps its inode, its size and its link count.
+//
+// Linux has the same thing as renameat2(RENAME_EXCHANGE) and is deferred anyway
+// (docs/M1_DESIGN.md P13); a platform with neither says so with -ENOSYS, and the caller refuses
+// the upgrade rather than taking it apart in two steps. There is no gapless fallback: every
+// sequence of plain renames has an instant with nothing at one of the two names, which is the
+// whole of what this call exists to avoid.
+int fs_rename_swap(const char *a, const char *b) {
+#ifdef __APPLE__
+    return ::renameatx_np(AT_FDCWD, a, AT_FDCWD, b, RENAME_SWAP) ? -errno : 0;
+#elif defined(RENAME_EXCHANGE) && defined(SYS_renameat2)
+    return ::syscall(SYS_renameat2, AT_FDCWD, a, AT_FDCWD, b, RENAME_EXCHANGE) ? -errno : 0;
+#else
+    (void)a;
+    (void)b;
+    return -ENOSYS;
+#endif
+}
+
 int fs_setattr(const char *path, const wfs_setattr_req &r) {
     if (r.valid & WFS_SET_SIZE) { if (::truncate(path, (off_t)r.size) != 0) return -errno; }
     if (r.valid & WFS_SET_MODE) {

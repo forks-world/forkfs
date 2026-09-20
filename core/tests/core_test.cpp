@@ -387,6 +387,19 @@ static void store_as_m1(const char *dir, int snapshots_as_view) {
     }
     join(p, sizeof p, dir, "metadata.db");
     rmdir(p);                              // the stub, if the last case left one
+    // PR #1 review (36th round, P1): and anything a case left under the move's private prefix,
+    // so that every case below starts from an M1 store and from nothing else.
+    {
+        DIR *d = opendir(dir);
+        if (d) {
+            while (struct dirent *e = readdir(d)) {
+                if (strncmp(e->d_name, "metadata.db.stub.", 17) != 0) continue;
+                join(p, sizeof p, dir, e->d_name);
+                if (rmdir(p) != 0) unlink(p);
+            }
+            closedir(d);
+        }
+    }
     join(p, sizeof p, dir, "VERSION");
     write_file(p, "2\n");
     join(p, sizeof p, dir, "metadata.db");
@@ -1013,6 +1026,87 @@ static void gap_m1_open(void *ctx, const char *dir) {
         sqlite3_finalize(st);
     }
     if (h) sqlite3_close(h);
+}
+
+// ---- PR #1 review (36th round, P1): the same open, at each of the move's three steps --------
+//
+// The move is link -> exchange -> unlink now, so that the name M1 opens is never absent. This
+// seam fires at each of those three points and runs M1's own open there -- in a CHILD process,
+// because the question the upgrade asks next is "who else has this database open", and
+// fs_other_holders() answers it about other processes. The child reports what its open did and
+// then holds the handle, so that phase 1 -- the one window where the open still succeeds,
+// because `metadata.db` is one of the database's two names -- is a holder the gate must refuse.
+static int g_steps_phase;       // which of the three points to fire at
+static int g_steps_ran;
+static int g_steps_open_rc = -1;
+static int g_steps_count = -2;  // SELECT count(*) FROM worlds; -1 = no such table at all
+static int g_steps_uv = -2;
+static pid_t g_steps_child;
+static int g_steps_ctl = -1;
+static void steps_m1_open(void *ctx, const char *dir, int phase) {
+    (void)ctx;
+    if (phase != g_steps_phase || g_steps_ran) return;
+    g_steps_ran++;
+    char dbp[4096];
+    join(dbp, sizeof dbp, dir, "metadata.db");
+    int rep[2], ctl[2];
+    CHECK(pipe(rep) == 0);
+    CHECK(pipe(ctl) == 0);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        // Nothing of the parent's but the two pipes (the 34th round's rules): no stdout to
+        // outlive the test on the reader's end, and a wait on the control pipe rather than on
+        // a signal, so that the parent going away -- for any reason -- ends this child.
+        close(rep[0]);
+        close(ctl[1]);
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) { dup2(devnull, 0); dup2(devnull, 1); dup2(devnull, 2); }
+        int out[3] = {-1, -2, -2};
+        sqlite3 *h = NULL;
+        // `main`'s M1 core, exactly: SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_FULLMUTEX.
+        out[0] = sqlite3_open_v2(
+            dbp, &h, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
+        if (out[0] == SQLITE_OK) {
+            out[1] = -1;   // not even a `worlds` table: a database SQLite has just created
+            sqlite3_stmt *st = NULL;
+            if (sqlite3_prepare_v2(h, "SELECT count(*) FROM worlds", -1, &st, NULL) == SQLITE_OK &&
+                sqlite3_step(st) == SQLITE_ROW)
+                out[1] = sqlite3_column_int(st, 0);
+            sqlite3_finalize(st);
+            st = NULL;
+            if (sqlite3_prepare_v2(h, "PRAGMA user_version", -1, &st, NULL) == SQLITE_OK &&
+                sqlite3_step(st) == SQLITE_ROW)
+                out[2] = sqlite3_column_int(st, 0);
+            sqlite3_finalize(st);
+        }
+        ssize_t wn = write(rep[1], out, sizeof out);
+        (void)wn;
+        char z;
+        while (read(ctl[0], &z, 1) > 0) {}   // ... and the handle stays open until told to go
+        _exit(0);
+    }
+    close(rep[1]);
+    close(ctl[0]);
+    int got[3] = {-9, -9, -9};
+    CHECK(read(rep[0], got, sizeof got) == (ssize_t)sizeof got);
+    close(rep[0]);
+    g_steps_open_rc = got[0];
+    g_steps_count = got[1];
+    g_steps_uv = got[2];
+    g_steps_child = pid;
+    g_steps_ctl = ctl[1];
+}
+
+static void steps_release(void) {
+    if (g_steps_child > 0) {
+        if (g_steps_ctl >= 0) close(g_steps_ctl);
+        kill(g_steps_child, SIGKILL);
+        int st = 0;
+        CHECK(waitpid(g_steps_child, &st, 0) == g_steps_child);
+    }
+    g_steps_child = 0;
+    g_steps_ctl = -1;
 }
 
 // PR #1 review (26th round, P1): the user's own `mv`, run in the one window no transaction of
@@ -5919,6 +6013,136 @@ int main() {
         CHECK_OK(wfs_store_open(vstore, &vs));
         wfs_store_close(vs);
 
+        // ---- PR #1 review (36th round, P1): and the name is never FREE either ---------------
+        //
+        //     The seam above fires after the whole move. Inside it, the move used to be a
+        //     rename and then a mkdir, and between those two syscalls `<store>/metadata.db` was
+        //     ABSENT -- so an admitted M1 process resuming there did not fail at all: its
+        //     SQLITE_OPEN_CREATE created a fresh, empty database under the name, its collector
+        //     saw no rows and would have deleted every tree in the store as an orphan, and this
+        //     core then found a regular file where its stub belongs and called the store
+        //     damaged. Measured before the fix, in exactly that window: rc=SQLITE_OK,
+        //     `SELECT count(*) FROM worlds` = "no such table" on a database that had two rows,
+        //     `PRAGMA user_version` = 0, and wfs_store_open() = WFS_E_STORE_DAMAGED.
+        //
+        //     The move is link -> exchange -> unlink now, and these are its three steps. At
+        //     step 1 the database has two names, so M1's open SUCCEEDS -- and what it gets is
+        //     the real database, with its rows; the holder gate is what refuses that process,
+        //     and the whole upgrade goes back. From step 2 on `metadata.db` is the stub
+        //     directory and the open is SQLITE_CANTOPEN. There is no instant of any other kind.
+        char vstub[4096];
+        join(vstub, sizeof vstub, vstore, "metadata.db.stub.999.deadbeef");
+        for (int phase = 1; phase <= 3; ++phase) {
+            store_as_m1(vstore, 0);
+            db_exec(vdb, "INSERT INTO worlds(id,name,created_at) VALUES(1,'r36a',1);"
+                         "INSERT INTO worlds(id,name,created_at) VALUES(2,'r36b',2);");
+            CHECK(db_i64(vdb, "SELECT count(*) FROM worlds") == 2);
+            g_steps_phase = phase;
+            g_steps_ran = 0;
+            g_steps_open_rc = -1;
+            g_steps_count = -2;
+            g_steps_uv = -2;
+            wfs_test_between_db_steps = steps_m1_open;
+            vs = NULL;
+            int vstep_rc = wfs_store_open(vstore, &vs);
+            wfs_test_between_db_steps = NULL;
+            CHECK(g_steps_ran == 1);
+            if (phase == 1) {
+                // The one window where M1's open still works -- and it works on the REAL
+                // database. The count is the assertion that matters: a fresh empty database
+                // has no `worlds` table at all (-1), and one that is merely empty would be 0.
+                CHECK(g_steps_open_rc == SQLITE_OK);
+                CHECK(g_steps_count == 2);
+                CHECK(g_steps_uv == WFS_STORE_SCHEMA_M1 * 100);
+                // ... and a process holding it is exactly what the holder gate exists for.
+                CHECK_RC(vstep_rc, WFS_E_STORE_BUSY);
+                CHECK(vs == NULL);
+                // The revert is total, and every step of it kept `metadata.db` occupied too:
+                // the database is a regular file at the M1 name, with one link and its rows,
+                // there is no schema-3 name and nothing under the move's private prefix.
+                CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
+                CHECK(atoi(vbuf) == WFS_STORE_SCHEMA_M1);
+                CHECK(stat(vdb, &vst0) == 0 && S_ISREG(vst0.st_mode));
+                CHECK(nlink_of(vdb) == 1);
+                CHECK(!exists(vdb3));
+                CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA_M1);
+                CHECK(db_i64(vdb, "SELECT count(*) FROM worlds") == 2);
+                CHECK(n_with_prefix(vstore, "metadata.db.stub.") == 0);
+                for (size_t i = 0; i < kAddedN; ++i)
+                    CHECK(!db_has_column(vdb, kAdded[i][0], kAdded[i][1]));
+                // ... and with the holder gone the very same open takes the store over.
+                steps_release();
+                vs = NULL;
+                CHECK_OK(wfs_store_open(vstore, &vs));
+                wfs_store_close(vs);
+            } else {
+                CHECK(g_steps_open_rc == SQLITE_CANTOPEN);   // SQLITE_OK before the fix
+                CHECK(g_steps_count == -2);                  // and nothing was read or created
+                steps_release();
+                CHECK_OK(vstep_rc);                          // the upgrade itself is unaffected
+                CHECK(vs != NULL);
+                wfs_store_close(vs);
+            }
+            // Whichever way it went, the store is an ordinary schema-3 store now: the stub is
+            // the directory M1 cannot open, the database is at the schema-3 name with ONE link
+            // and every row it started with, and the move left nothing of its own behind.
+            CHECK(stat(vdb, &vst0) == 0 && S_ISDIR(vst0.st_mode));
+            CHECK((vst0.st_mode & 07777) == 0500);
+            CHECK(stat(vdb3, &vst0) == 0 && S_ISREG(vst0.st_mode));
+            CHECK(nlink_of(vdb3) == 1);
+            CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
+            CHECK(db_i64(vdb3, "SELECT count(*) FROM worlds") == 2);
+            CHECK(n_with_prefix(vstore, "metadata.db.stub.") == 0);
+            CHECK(n_with_prefix(vstore, "metadata.db-") == 0);
+        }
+
+        // ... and the two intermediate shapes the move can now crash in, made by hand. First
+        //     the one between the link and the exchange: one file under both names, plus the
+        //     stub that run never exchanged. `metadata.db` is the database here, so an M1 open
+        //     would find the real thing -- and this open finishes the move over the top of it.
+        store_as_m1(vstore, 0);
+        CHECK(link(vdb, vdb3) == 0);
+        CHECK(ino_of(vdb) == ino_of(vdb3));
+        CHECK(mkdir(vstub, 0500) == 0);
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_close(vs);
+        CHECK(stat(vdb, &vst0) == 0 && S_ISDIR(vst0.st_mode));
+        CHECK(stat(vdb3, &vst0) == 0 && S_ISREG(vst0.st_mode));
+        CHECK(nlink_of(vdb3) == 1);
+        CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
+        CHECK(n_with_prefix(vstore, "metadata.db.stub.") == 0);   // the stale stub was swept
+
+        // ... and the one between the exchange and the unlink: the stub is at the M1 name and
+        //     the database still carries the extra link under the private one. st_nlink is
+        //     what gives it away, so the sweep costs a readdir only when there is one.
+        store_as_m1(vstore, 0);
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_close(vs);
+        CHECK(link(vdb3, vstub) == 0);
+        CHECK(nlink_of(vdb3) == 2);
+        db_exec(vdb3, "PRAGMA user_version=200");   // ... with the migration not committed yet
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_close(vs);
+        CHECK(!exists(vstub));
+        CHECK(nlink_of(vdb3) == 1);
+        CHECK(n_with_prefix(vstore, "metadata.db.stub.") == 0);
+        CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
+
+        // ... and a stale stub DIRECTORY beside an untouched M1 store -- a run that died
+        //     between the mkdir and the link. It is ours, under our own prefix, and empty.
+        store_as_m1(vstore, 0);
+        CHECK(mkdir(vstub, 0500) == 0);
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_close(vs);
+        CHECK(!exists(vstub));
+        CHECK(n_with_prefix(vstore, "metadata.db.stub.") == 0);
+        CHECK(stat(vdb, &vst0) == 0 && S_ISDIR(vst0.st_mode));
+        CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
+
         // ... and the crash this order can leave behind: VERSION already 3 with the database
         //     still at the name M1 uses, stamped 2xx. Every M1 binary is refused it by the
         //     file, and the next M2 open picks the upgrade up at step (b) -- the 2xx under a 3
@@ -6054,6 +6278,10 @@ int main() {
         CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA_M1);  // ...and nothing was migrated
         for (size_t i = 0; i < kAddedN; ++i) CHECK(!db_has_column(vdb, kAdded[i][0], kAdded[i][1]));
         CHECK(n_with_prefix(vstore, "VERSION.tmp") == 0);
+        // PR #1 review (36th round, P1): the revert goes back through the exchange as well, so
+        // it leaves neither a second link on the database nor a stub under the private prefix.
+        CHECK(nlink_of(vdb) == 1);
+        CHECK(n_with_prefix(vstore, "metadata.db.stub.") == 0);
         // ... and the refusal can be explained: the holder is named, with its executable.
         wfs_store_holder hbuf[4];
         size_t hn = 0;
