@@ -356,7 +356,12 @@ void version_tmp_sweep(const char *dir) {
 // file itself: if it reads 3, the upgrade is done -- by us or by whoever got there first -- and
 // this returns 0, because what the caller needs is a schema-3 store on disk, not the authorship
 // of it. Only an errno with VERSION still at 2 is a failure, and it is returned as one.
-int version_upgrade(const char *dir) {
+//
+// PR #1 review (34th round, P1): `value`, because the same write is now made in both directions.
+// The bump to 3 is one of them; the other is the revert back to 2 that undoes it when the
+// holder check below finds the door was shut on somebody who was already inside. `seam` is the
+// 31st round's test window, which belongs to the upgrade only.
+int version_put(const char *dir, int value, bool seam) {
     char rnd[33];
     hex_id(rnd, sizeof rnd);
     char name[80];
@@ -367,26 +372,78 @@ int version_upgrade(const char *dir) {
     int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd < 0) return -errno;
     char line[64];
-    int n = ::snprintf(line, sizeof line, "%d\n", WFS_STORE_SCHEMA);
+    int n = ::snprintf(line, sizeof line, "%d\n", value);
     ssize_t w = ::write(fd, line, (size_t)n);
     int frc = ::fsync(fd);
     ::close(fd);
     if (w != n || frc != 0) { ::unlink(tmp.c_str()); return -EIO; }
     String dst(dir);
     dst.append("/VERSION");
-    if (wfs_test_before_version_rename) wfs_test_before_version_rename(wfs_test_before_version_rename_ctx, dir);
+    if (seam && wfs_test_before_version_rename)
+        wfs_test_before_version_rename(wfs_test_before_version_rename_ctx, dir);
     if (::rename(tmp.c_str(), dst.c_str()) != 0) {
         int e = -errno;
         ::unlink(tmp.c_str());
+        return e;
+    }
+    return 0;
+}
+
+int version_upgrade(const char *dir) {
+    if (int rc = version_put(dir, WFS_STORE_SCHEMA, true)) {
         long v = 0;
         // Somebody else's rename may have landed while ours was failing -- including a sweep
         // like the one below, run by a concurrent upgrader, that took our temporary out from
         // under us. The store is schema 3 either way, so this open has nothing to refuse.
         if (version_read(dir, &v) == 0 && v == WFS_STORE_SCHEMA) { version_tmp_sweep(dir); return 0; }
-        return e;
+        return rc;
     }
     version_tmp_sweep(dir);
     return 0;
+}
+
+// ---- PR #1 review (34th round, P1): the handle that was already inside -----------------------
+//
+// The 32nd round put the VERSION bump before the migration, so that from the instant anything
+// migrated exists in this store, every M1 binary has already been refused it by the one file it
+// checks first. That shuts the door on M1 processes that START after the rename. It can do
+// nothing about one that completed wfs_store_open() a millisecond BEFORE it: that process holds
+// an open sqlite3 handle on a database that is about to become M2's, and M1 takes no store-wide
+// lock of any kind, so the exclusion cannot be made to need M1's cooperation. What such a
+// process does with the handle is the whole of the 24th round's finding -- it stamps
+// `user_version` back down to 2, and then its wfs_gc() deletes M2 trash: a snapshot still inside
+// its retention window, the tree of a world whose row says TRASHING.
+//
+// So the question is asked of the operating system, in this order:
+//
+//     bump VERSION to 3  ->  list who has metadata.db open  ->  holders ? revert + refuse
+//                                                             : migrate
+//
+// and the order is what makes the answer complete. A holder that appears AFTER the listing was
+// admitted after the rename, and the file already refused it (32nd round). A holder the listing
+// names was admitted before the bump -- exactly the set this exists for. Nothing can slip
+// between the two, because there is no third case.
+//
+// Every foreign holder is treated the same. Another M2 upgrader is indistinguishable from an M1
+// one by pid, and guessing wrong in that direction is the expensive mistake; two upgraders that
+// refuse each other is a retry on the first open of a store, which is a cost nobody notices.
+// "Cannot tell" -- an errno from the platform, or the -ENOSYS of a platform that cannot ask
+// (Linux is deferred: docs/M1_DESIGN.md P13) -- is a holder for this purpose, because the whole
+// point is that admitting one is not recoverable.
+//
+// The revert is the same private-temporary write the bump is, so a store that is refused is a
+// store an M1 binary may still open and collect normally -- which is what it was a moment ago. A
+// revert that itself fails leaves VERSION at 3 over a 2xx database: refused by M1, finished by
+// the next M2 open, which is the safe half of the same trade the 32nd round made.
+int legacy_holders_gate(const char *dir) {
+    String dbp(dir);
+    dbp.append("/metadata.db");
+    wfs::Vec<int64_t> holders;
+    int rc = wfs::fs_other_holders(dbp.c_str(), holders);
+    if (rc == 0 && holders.size() == 0) return 0;
+    version_put(dir, WFS_STORE_SCHEMA_M1, false);   // best effort; see above
+    version_tmp_sweep(dir);
+    return WFS_E_STORE_BUSY;
 }
 
 int meta_get(sqlite3 *db, const char *key, String &out) {
@@ -591,6 +648,8 @@ extern "C" const char *wfs_strerror(int rc) {
     case WFS_E_GC_BUSY: return "another gc worker is running";
     case WFS_E_STORE_UNREACHABLE: return "that store cannot be opened from here";
     case WFS_E_STORE_DAMAGED: return "the store has trees in it but no readable metadata.db";
+    case WFS_E_STORE_BUSY:
+        return "older clients still have the store open; stop them and retry";
     case WFS_E_TRASH_BLOCKED: return "a directory is in the way of this trash entry's deletion";
     case WFS_E_TRASH_FOREIGN:
         return "the directory at this trash entry's path is not the tree this record was written for";
@@ -613,6 +672,29 @@ extern "C" int wfs_store_default_dir(char *buf, size_t cap) {
 }
 
 extern "C" const char *wfs_store_dir(const wfs_store *s) { return s ? s->dir.c_str() : ""; }
+
+// PR #1 review (34th round, P1): who else has this store's database open. The one caller is the
+// CLI, after a WFS_E_STORE_BUSY refusal, so that the operator is told what to stop rather than
+// left to find it. Read-only and stateless: it opens nothing and writes nothing.
+extern "C" int wfs_store_holders(const char *store_dir, wfs_store_holder *buf, size_t cap,
+                                 size_t *count) {
+    if (!store_dir || !count) return -EINVAL;
+    *count = 0;
+    String real;
+    if (int rc = wfs::fs_realpath(store_dir, real)) return rc;
+    String dbp(real);
+    dbp.append("/metadata.db");
+    wfs::Vec<int64_t> pids;
+    if (int rc = wfs::fs_other_holders(dbp.c_str(), pids)) return rc;
+    *count = pids.size();
+    for (size_t i = 0; buf && i < pids.size() && i < cap; ++i) {
+        buf[i].pid = pids[i];
+        String exe;
+        wfs::fs_pid_exe(pids[i], exe);
+        wfs::copy_str(buf[i].exe, sizeof buf[i].exe, exe.c_str());
+    }
+    return 0;
+}
 
 extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
     if (!store_dir || !out) return -EINVAL;
@@ -728,6 +810,9 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
     if (legacy_schema) {
         if (int vrc = version_upgrade(s->dir.c_str())) { wfs_store_close(s); return vrc; }
         if (wfs_test_after_version_bump) wfs_test_after_version_bump(wfs_test_after_version_bump_ctx, s->dir.c_str());
+        // ... and the door is only shut for those who were not already through it. See
+        // legacy_holders_gate() above: this is the one open in a store's life that pays for it.
+        if (int hrc = legacy_holders_gate(s->dir.c_str())) { wfs_store_close(s); return hrc; }
     }
     if (sqlite3_exec(s->db, kPragmas, nullptr, nullptr, nullptr) != SQLITE_OK) {
         wfs_store_close(s);

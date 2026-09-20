@@ -10,11 +10,13 @@
 // PR #1 review (11th round): the schema-migration block at the end of main() has to build a
 // database as schema 2 first wrote it -- older than anything this library can produce any more.
 // worldfs_core links SQLite publicly, so this is the same library the core itself opens.
+#include <signal.h>
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 // PR #1 review (20th round, P2): a tree the remover genuinely cannot remove. Mode bits are no
 // use -- rm_rec() chmods its way in and fs_unprotect_tree() clears chflags, because it is
@@ -5739,6 +5741,81 @@ int main() {
         wfs_store_close(vs);
         CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
         CHECK(atoi(vbuf) == WFS_STORE_SCHEMA);
+
+        // (e) PR #1 review (34th round, P1): the handle that was already inside ----------------
+        //
+        //     The 32nd round's order shuts the door on every M1 process that STARTS after the
+        //     rename. It can do nothing about one that finished wfs_store_open() a moment
+        //     before it: that process holds a usable handle on a database that is about to
+        //     become M2's, and M1 takes no store-wide lock of any kind, so the exclusion cannot
+        //     need M1's cooperation. The upgrade asks the operating system instead -- who else
+        //     has <store>/metadata.db open? -- and a foreign holder puts VERSION back to 2 and
+        //     refuses, because the alternative is an M1 collector let loose on M2 trash.
+        //
+        //     A child process with the file open is exactly that holder. It is forked after the
+        //     schema-2 database is in place, so the path it opens is the one the upgrade asks
+        //     about, and it reports through a pipe that it really has it.
+        write_file(vver, "2\n");
+        make_v2_db(vdb, 0);
+        int hpipe[2], hctl[2];
+        CHECK(pipe(hpipe) == 0);
+        CHECK(pipe(hctl) == 0);
+        pid_t holder = fork();
+        CHECK(holder >= 0);
+        if (holder == 0) {
+            // Nothing of the parent's but the two pipes: a child holding this test's stdout
+            // would outlive it on the reader's end, and a child that waits on a signal would
+            // outlive it altogether. It waits on the control pipe instead, so the parent going
+            // away -- for any reason, including a failed CHECK -- ends it.
+            close(hpipe[0]);
+            close(hctl[1]);
+            int devnull = open("/dev/null", O_RDWR);
+            if (devnull >= 0) { dup2(devnull, 0); dup2(devnull, 1); dup2(devnull, 2); }
+            int hfd = open(vdb, O_RDWR);
+            char ok = hfd >= 0 ? 'y' : 'n';
+            ssize_t wn = write(hpipe[1], &ok, 1);
+            (void)wn;
+            char z;
+            while (read(hctl[0], &z, 1) > 0) {}
+            _exit(0);
+        }
+        close(hpipe[1]);
+        close(hctl[0]);
+        char hgot = 0;
+        CHECK(read(hpipe[0], &hgot, 1) == 1);
+        CHECK(hgot == 'y');
+        vs = NULL;
+        CHECK_RC(wfs_store_open(vstore, &vs), WFS_E_STORE_BUSY);   // 0, and migrated, before
+        CHECK(vs == NULL);
+        CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
+        CHECK(atoi(vbuf) == WFS_STORE_SCHEMA_M1);                  // the bump was put back...
+        CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA_M1);  // ...and nothing was migrated
+        for (size_t i = 0; i < kAddedN; ++i) CHECK(!db_has_column(vdb, kAdded[i][0], kAdded[i][1]));
+        CHECK(n_with_prefix(vstore, "VERSION.tmp") == 0);
+        // ... and the refusal can be explained: the holder is named, with its executable.
+        wfs_store_holder hbuf[4];
+        size_t hn = 0;
+        memset(hbuf, 0, sizeof hbuf);
+        CHECK_OK(wfs_store_holders(vstore, hbuf, 4, &hn));
+        CHECK(hn == 1);
+        CHECK(hbuf[0].pid == (int64_t)holder);
+        CHECK(hbuf[0].exe[0] != 0);
+        // ... and with the holder gone the very same open takes the store over.
+        CHECK(kill(holder, SIGKILL) == 0);
+        int hst = 0;
+        CHECK(waitpid(holder, &hst, 0) == holder);
+        close(hpipe[0]);
+        close(hctl[1]);
+        hn = 1;
+        CHECK_OK(wfs_store_holders(vstore, NULL, 0, &hn));
+        CHECK(hn == 0);
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_close(vs);
+        CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
+        CHECK(atoi(vbuf) == WFS_STORE_SCHEMA);
+        CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA);
+        for (size_t i = 0; i < kAddedN; ++i) CHECK(db_has_column(vdb, kAdded[i][0], kAdded[i][1]));
     }
 
     // ---- PR #1 review (25th round, P1): a trash entry is the row's tree, not the row's name --

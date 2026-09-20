@@ -139,6 +139,23 @@ int64_t fs_pid_start_sec(int64_t pid) {
 #endif
 }
 
+#ifndef __APPLE__
+// PR #1 review (34th round, P1): the stub. Linux is deferred (docs/M1_DESIGN.md P13), and
+// "cannot tell" is the answer the 2 -> 3 upgrade refuses on -- it does not proceed on silence.
+// A real implementation here reads /proc/<pid>/fd, which needs no privilege for this user's own
+// processes either.
+int fs_other_holders(const char *path, Vec<int64_t> &out) {
+    (void)path;
+    out.clear();
+    return -ENOSYS;
+}
+
+void fs_pid_exe(int64_t pid, String &out) {
+    (void)pid;
+    out.assign("");
+}
+#endif
+
 bool producer_alive(int64_t pid, int64_t start_sec) {
     if (pid <= 0) return false;                       // nobody was recorded
     if (::kill((pid_t)pid, 0) != 0 && errno == ESRCH) return false;

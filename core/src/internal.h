@@ -74,6 +74,28 @@ int threads_start(pthread_t *th, int want, void *(*fn)(void *), void *arg);
 // "still alive", because refusing to collect is always the safe mistake.
 int64_t fs_pid_start_sec(int64_t pid);
 bool producer_alive(int64_t pid, int64_t start_sec);
+
+// ---- PR #1 review (34th round, P1): who else has this file open right now? -------------------
+//
+// The 2 -> 3 upgrade (store.cpp) shuts the door on M1 binaries by bumping the VERSION file
+// before it migrates the database -- which stops every M1 process that STARTS after the rename.
+// It does nothing about one that completed wfs_store_open() a millisecond before it: M1 holds no
+// store-wide lock of any kind, so exclusion cannot need M1's cooperation and has to be asked of
+// the operating system instead.
+//
+// Fills `out` with the pid of every process other than this one that has `path` open, and
+// answers 0 even when there are none. A negative errno means the question could not be asked at
+// all, and -ENOSYS means this platform cannot ask it -- both of which the upgrade must read as
+// "cannot tell", never as "nobody". Darwin implements it with proc_listpidspath(3) from libproc
+// (part of libSystem: no new dependency), which an unprivileged process may run for its own
+// processes; Linux is deferred with the -ENOSYS stub (docs/M1_DESIGN.md P13).
+//
+// It costs ~100 ms on a machine with ~900 processes, because it is a scan of all of them. That
+// is paid once, on the one open that takes a schema-2 store over, and never again.
+int fs_other_holders(const char *path, Vec<int64_t> &out);
+// That process's executable path, for the message that names it. Empty when the kernel will not
+// say -- which is normal for a process belonging to another user.
+void fs_pid_exe(int64_t pid, String &out);
 // How old a CREATING row must be before gc will touch it even with its producer gone: the
 // second half of the rule, and the answer for rows written by a core that recorded no producer
 // at all. 60 s, or WORLD_GC_CREATING_MIN_AGE seconds.

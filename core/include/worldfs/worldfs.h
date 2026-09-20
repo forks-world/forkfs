@@ -144,8 +144,29 @@ enum {
      * something else there. Nothing is renamed or removed until the identity matches -- the
      * collector counts the entry and `gc --status` names the path, `discard --now` and
      * `restore` refuse with this code. */
-    WFS_E_TRASH_FOREIGN = -1019
+    WFS_E_TRASH_FOREIGN = -1019,
+
+    /* P13, T2.6 (PR #1 review, 34th round): this store is being taken over from schema 2 to
+     * schema 3 and another process still has its metadata.db open. That process was admitted
+     * before the VERSION file was bumped, so the file cannot lock it out any more, and an M1
+     * binary among them would run M1's collector over M2 trash semantics. The upgrade is put
+     * back (VERSION returns to 2) and refused; wfs_store_holders() names who to stop. */
+    WFS_E_STORE_BUSY = -1020
 };
+
+/* One process, other than this one, that has a store's metadata.db open (PR #1 review, 34th
+ * round). `exe` is that process's executable path, or "" when the kernel will not say. */
+typedef struct wfs_store_holder {
+    int64_t pid;
+    char exe[WFS_PATH_MAX];
+} wfs_store_holder;
+
+/* Who else has `store_dir`/metadata.db open right now, this process excluded. Fills up to `cap`
+ * entries and always writes the total through `count` (which may exceed `cap`). Returns 0, or a
+ * negative errno; -ENOSYS on a platform that cannot answer the question. Intended for the one
+ * caller that has just been refused with WFS_E_STORE_BUSY and has to say what to stop -- the
+ * answer is a moment in time, and a process that appears or exits after it is not in it. */
+int wfs_store_holders(const char *store_dir, wfs_store_holder *buf, size_t cap, size_t *count);
 
 /* Human-readable text for a negative errno or a WFS_E_* code. Never NULL. */
 const char *wfs_strerror(int rc);

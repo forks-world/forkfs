@@ -11,6 +11,7 @@
 #include "internal.h"
 
 #include <copyfile.h>
+#include <libproc.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -31,6 +32,49 @@ extern "C" uint64_t FSEventsGetCurrentEventId(void);
 namespace wfs {
 
 uint64_t fs_events_current_id(void) { return FSEventsGetCurrentEventId(); }
+
+// ---- PR #1 review (34th round, P1): the processes that have a file open ----------------------
+//
+// proc_listpidspath(3) answers exactly the question the 2 -> 3 upgrade has to ask (internal.h):
+// which pids hold this path open. Called with a null buffer it returns the size a buffer would
+// have to have for EVERY pid on the machine -- that is the sizing call, not a count of matches
+// -- and called with one it returns the bytes it filled. Measured here: 106 ms for ~900
+// processes, unprivileged, and it does report this user's own processes (verified with a child
+// holding the file and with the same child gone).
+//
+// A pid that appears twice (two descriptors on the same file) is reported once: the caller wants
+// processes, not descriptors.
+int fs_other_holders(const char *path, Vec<int64_t> &out) {
+    out.clear();
+    if (!path || !*path) return -EINVAL;
+    int cap = ::proc_listpidspath(PROC_ALL_PIDS, 0, path, 0, nullptr, 0);
+    if (cap < 0) return -errno;
+    if (cap == 0) return 0;
+    Vec<pid_t> pids;
+    pids.resize((size_t)cap / sizeof(pid_t) + 1);
+    int n = ::proc_listpidspath(PROC_ALL_PIDS, 0, path, 0, pids.data(),
+                                (int)(pids.size() * sizeof(pid_t)));
+    if (n < 0) return -errno;
+    int64_t self = (int64_t)::getpid();
+    size_t count = (size_t)n / sizeof(pid_t);
+    for (size_t i = 0; i < count; ++i) {
+        int64_t pid = (int64_t)pids[i];
+        if (pid <= 0 || pid == self) continue;
+        bool seen = false;
+        for (size_t j = 0; j < out.size(); ++j)
+            if (out[j] == pid) { seen = true; break; }
+        if (!seen) out.emplace_back(pid);
+    }
+    return 0;
+}
+
+void fs_pid_exe(int64_t pid, String &out) {
+    out.assign("");
+    if (pid <= 0) return;
+    char buf[PROC_PIDPATHINFO_MAXSIZE];
+    buf[0] = 0;
+    if (::proc_pidpath((pid_t)pid, buf, sizeof buf) > 0) out.assign(buf);
+}
 
 // ---- getattrlistbulk(2): what a directory costs (T2.4) -----------------------------------------
 //

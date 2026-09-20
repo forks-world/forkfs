@@ -1908,6 +1908,38 @@ int main(int argc, char **argv) {
                  WFS_STORE_SCHEMA);
         return refuse(why, "use a matching `world` build, or point --store at a new directory");
     }
+    // P13, and PR #1 review (34th round, P1): this store is still schema 2 and somebody else
+    // has its metadata.db open. They were admitted before the VERSION file was bumped, so the
+    // file cannot lock them out any more -- and if any of them is an M1 build, its collector
+    // treats M2 trash as orphans and deletes snapshots that are still inside their retention
+    // window. The core put VERSION back to 2 and touched nothing; all that is left to do here
+    // is say who to stop.
+    if (rc == WFS_E_STORE_BUSY) {
+        wfs_store_holder hs[8];
+        size_t n = 0;
+        memset(hs, 0, sizeof hs);
+        char why[WFS_PATH_MAX + 512];
+        int off = snprintf(why, sizeof why,
+                           "the store at %s is still schema %d and another process has its "
+                           "metadata.db open.\n"
+                           "  Taking it to schema %d behind a handle that is already open would "
+                           "leave that process able to run an older collector over this store's "
+                           "trash, so nothing was migrated and the store was left as it was.",
+                           sd, WFS_STORE_SCHEMA_M1, WFS_STORE_SCHEMA);
+        // snprintf reports what it WOULD have written, so a truncated first part must not be
+        // appended to past the end of the buffer.
+        if (off < 0 || (size_t)off >= sizeof why) off = (int)sizeof why - 1;
+        if (wfs_store_holders(sd, hs, 8, &n) == 0 && n) {
+            off += snprintf(why + off, sizeof why - (size_t)off, "\n  Still holding it:");
+            for (size_t i = 0; i < n && i < 8 && off > 0 && (size_t)off < sizeof why; ++i)
+                off += snprintf(why + off, sizeof why - (size_t)off, "\n    pid %lld  %s",
+                                (long long)hs[i].pid, hs[i].exe[0] ? hs[i].exe : "(unknown)");
+            if (n > 8 && off > 0 && (size_t)off < sizeof why)
+                snprintf(why + off, sizeof why - (size_t)off, "\n    ... and %zu more", n - 8);
+        }
+        return refuse(why, "stop those processes (or wait for them to finish) and run the "
+                           "command again");
+    }
     // P17. The tempting thing to do here is to make a fresh database and carry on; it is also
     // the one thing that loses data. Snapshot and world ids come out of that database, so a new
     // one hands out 1 again and the next `init` writes S1 on top of the `snapshots/S1` that is
