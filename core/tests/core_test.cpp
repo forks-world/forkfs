@@ -909,6 +909,33 @@ static void gc_before_snapshot_clone(void *ctx, const char *src_dir) {
     g_sweep_rc = wfs_gc_ex(g_sweep_store, &go, &g_sweep_rep);
 }
 
+// PR #1 review (26th round, P1): the user's own `mv`, run in the one window no transaction of
+// ours can serialise -- after the entry's identity has been checked against the row and before
+// the rename that claims it. The world's tree goes aside and a directory of somebody else's,
+// with a file in it, takes the name the row still holds. Three callers enter that window (the
+// collector, `--now` and `restore`) and none of them may touch what it leaves behind.
+static char g_swap_aside[4096];
+static char g_swap_file[4096];
+static char g_swap_entry[4096];
+static wfs_id g_swap_world;
+static int g_swap_ran;
+static void swap_between_claim(void *ctx, int is_snapshot, wfs_id row, const char *path) {
+    (void)ctx;
+    if (is_snapshot || row != g_swap_world || g_swap_ran) return;
+    g_swap_ran++;
+    snprintf(g_swap_entry, sizeof g_swap_entry, "%s", path);
+    CHECK(rename(path, g_swap_aside) == 0);
+    CHECK(mkdir(path, 0755) == 0);
+    snprintf(g_swap_file, sizeof g_swap_file, "%s/user.txt", path);
+    write_file(g_swap_file, "not the world\n");
+}
+
+// Puts it all back: the stranger removed, the world's own tree returned to the entry's name.
+static void swap_undo(const char *entry) {
+    rm_rf(entry);
+    CHECK(rename(g_swap_aside, entry) == 0);
+}
+
 // A copy in the sense of `cp -R`: same bytes, same marker, different inode (P2).
 static void copy_dir(const char *src, const char *dst) {
     CHECK(mkdir(dst, 0755) == 0);
@@ -5679,6 +5706,134 @@ int main() {
         wfs_store_close(fb);
         wfs_store_close(fa);
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", fstore, (unsigned long long)f1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
+    // ---- PR #1 review (26th round, P1): the identity that was checked is the identity deleted --
+    //
+    // The 25th round asks the entry at `j.path` whether it is the row's tree, and then renames
+    // that path and deletes that path -- three separate file system calls. The SQLite
+    // transaction around them serialises this core's own writers and nothing else, and the
+    // other party here is not a writer of ours: for a world discarded across volumes the entry
+    // sits in the user's own `<parent>/.wfs-trash`, so between the lstat and the rename they can
+    // move the genuine tree away and leave a directory of their own at the name. The identity
+    // check then passed on the world's tree and everything after it acted on the stranger's.
+    //
+    // So the claim opens the entry, checks the descriptor's dev/ino, and keeps that descriptor:
+    // the tree is emptied through it (fs_remove_tree_fd), and both names it still has to use --
+    // the `.deleting` one after the rename and the final rmdir -- are re-checked against it.
+    // The seam below is that exact window, and what it leaves behind may not lose one byte.
+    {
+        char xstore[4096], xsrc[4096], xw[4096], xdb[4096], xentry[4096], xdel[4200], xsql[256];
+        join(xstore, sizeof xstore, root, "swap-store");
+        join(xsrc, sizeof xsrc, root, "swap-src");
+        join(g_swap_aside, sizeof g_swap_aside, root, "swap-aside");
+        CHECK(mkdir(xsrc, 0755) == 0);
+        join(p, sizeof p, xsrc, "a.txt");
+        write_file(p, "one\n");
+        join(p, sizeof p, xsrc, "sub");
+        CHECK(mkdir(p, 0755) == 0);
+        join(p, sizeof p, xsrc, "sub/b.txt");
+        write_file(p, "two\n");
+        wfs_store *xa = NULL;
+        CHECK_OK(wfs_store_open(xstore, &xa));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "xb";
+        wfs_id x1 = 0;
+        CHECK_OK(wfs_snapshot_create(xa, xsrc, &sopts, &x1));
+        wfs_ref xf = {WFS_K_SNAPSHOT, x1};
+        memset(&opts, 0, sizeof opts);
+        join(xw, sizeof xw, worlds, "xworld");
+        wfs_id xw1 = 0;
+        CHECK_OK(wfs_world_create(xa, xf, xw, &opts, &xw1));
+        wfs_world_rec xwr;
+        CHECK_OK(wfs_world_info(xa, xw1, &xwr));
+        uint64_t xdev = xwr.dir_dev, xino = xwr.dir_ino;
+        CHECK(xino != 0);
+        CHECK_OK(wfs_world_discard(xa, xw1, 0, 0));
+        snprintf(xdb, sizeof xdb, "%s/metadata.db", xstore);
+        snprintf(xsql, sizeof xsql, "SELECT trash_path FROM worlds WHERE id=%llu",
+                 (unsigned long long)xw1);
+        CHECK(db_query_text(xdb, xsql, xentry, sizeof xentry) == 1);
+        CHECK(xentry[0]);
+        snprintf(xdel, sizeof xdel, "%s.deleting", xentry);
+
+        wfs_store *xb = NULL;
+        CHECK_OK(wfs_store_open(xstore, &xb));
+        g_swap_world = xw1;
+
+        // (1) the collector. The swap happens after the claim has accepted the entry, so what
+        // the rename moves is the stranger -- and a rename moves a directory, it never removes
+        // one, which is why undoing it is enough. Nothing of theirs is unlinked, the row stays
+        // TRASHED, and the entry is counted where an operator will see it.
+        g_swap_ran = 0;
+        wfs_test_between_trash_claim = swap_between_claim;
+        wfs_gc_report xrep;
+        memset(&xrep, 0, sizeof xrep);
+        CHECK_OK(wfs_gc(xb, 0, &xrep));
+        wfs_test_between_trash_claim = NULL;
+        CHECK(g_swap_ran == 1);
+        CHECK(!strcmp(g_swap_entry, xentry));
+        CHECK(exists(g_swap_file));                       // the stranger's file, byte for byte
+        CHECK_OK(read_file(g_swap_file, buf, sizeof buf));
+        CHECK(!strcmp(buf, "not the world\n"));
+        CHECK(!exists(xdel));                             // and put back at its own name
+        join(p, sizeof p, g_swap_aside, "sub/b.txt");     // the world's tree, where it was moved
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "two\n"));
+        CHECK(xrep.trash_foreign == 1);
+        CHECK(xrep.worlds_deleted == 0 && xrep.trash_orphans == 0 && xrep.trash_failed == 0);
+        CHECK(xrep.entries_freed == 0);
+        CHECK_OK(wfs_world_info(xa, xw1, &xwr));
+        CHECK(xwr.state == WFS_ST_TRASHED && xwr.dir_dev == xdev && xwr.dir_ino == xino);
+        swap_undo(xentry);
+
+        // (2) `--now` refuses in the same window, and refuses without touching anything.
+        g_swap_ran = 0;
+        wfs_test_between_trash_claim = swap_between_claim;
+        CHECK_RC(wfs_world_discard(xa, xw1, 1, 0), WFS_E_TRASH_FOREIGN);
+        wfs_test_between_trash_claim = NULL;
+        CHECK(g_swap_ran == 1);
+        CHECK(exists(g_swap_file));
+        CHECK_OK(read_file(g_swap_file, buf, sizeof buf));
+        CHECK(!strcmp(buf, "not the world\n"));
+        CHECK(!exists(xdel));
+        CHECK_OK(wfs_world_info(xa, xw1, &xwr));
+        CHECK(xwr.state == WFS_ST_TRASHED && xwr.dir_ino == xino);
+        swap_undo(xentry);
+
+        // (3) `restore` refuses too. Its rename home is the one that moves the stranger, so the
+        // check after it has to undo that rename: no world at the home path, the stranger back
+        // at the entry's name with its file, and the row still TRASHED with its own identity.
+        g_swap_ran = 0;
+        wfs_test_between_trash_claim = swap_between_claim;
+        CHECK_RC(wfs_world_restore(xa, xw1), WFS_E_TRASH_FOREIGN);
+        wfs_test_between_trash_claim = NULL;
+        CHECK(g_swap_ran == 1);
+        CHECK(!exists(xw));                               // nothing was registered as the world
+        CHECK(exists(g_swap_file));
+        CHECK_OK(read_file(g_swap_file, buf, sizeof buf));
+        CHECK(!strcmp(buf, "not the world\n"));
+        join(p, sizeof p, g_swap_aside, "a.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "one\n"));
+        CHECK_OK(wfs_world_info(xa, xw1, &xwr));
+        CHECK(xwr.state == WFS_ST_TRASHED && xwr.dir_dev == xdev && xwr.dir_ino == xino);
+        swap_undo(xentry);
+
+        // (4) and with nobody swapping anything the entry is collected exactly as before --
+        // through the descriptor now, which is also what counts the entries it freed (the tree
+        // is `a.txt`, `sub`, `sub/b.txt` and the `.world` marker; the entry itself is not one).
+        memset(&xrep, 0, sizeof xrep);
+        CHECK_OK(wfs_gc(xb, 0, &xrep));
+        CHECK(xrep.worlds_deleted == 1 && xrep.trash_foreign == 0 && xrep.trash_failed == 0);
+        CHECK(xrep.entries_freed == 4);
+        CHECK(!exists(xentry) && !exists(xdel));
+        CHECK_OK(wfs_world_info(xa, xw1, &xwr));
+        CHECK(xwr.state == WFS_ST_DEAD);
+        wfs_store_close(xb);
+        wfs_store_close(xa);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", xstore, (unsigned long long)x1);
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 

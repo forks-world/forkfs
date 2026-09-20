@@ -92,6 +92,14 @@ bool proven_gone(const char *p) { return wfs::fs_gone(wfs::fs_probe(p)); }
 // dir_ino == 0 is a row from before the columns were written (the schema defaults them), which
 // nothing this store produces leaves behind: there is no identity to compare with, so the entry
 // is treated as the row's, exactly as it was before this round.
+//
+// PR #1 review (26th round, P1): and this is now the READING half only -- `gc --status`, which
+// counts and names the entries the collector will refuse, and trash_is_deleting(), which
+// answers a restore's "is the collector already on this". Neither of them touches anything, so
+// a question asked of a path is the right shape for them. Everything that renames, deletes or
+// registers asks the same question of a descriptor it then keeps (TrashClaim, below): between
+// an answer about a path and an act on that path there is a window, and the party on the other
+// side of it is the owner of the directory the entry sits in.
 int trash_identity(const char *path, uint64_t dev, uint64_t ino) {
     if (!ino) return 0;
     struct stat st;
@@ -283,13 +291,9 @@ struct MarkerData {
     int64_t created = 0;
 };
 
-int marker_read(const char *world_root, MarkerData &out) {
-    String p = joinp(world_root, WFS_MARKER_NAME);
-    int fd = ::open(p.c_str(), O_RDONLY);
-    if (fd < 0) return errno == ENOENT ? WFS_E_NOT_A_WORLD : -errno;
+int marker_parse_fd(int fd, MarkerData &out) {
     char buf[4096];
     ssize_t n = ::read(fd, buf, sizeof buf - 1);
-    ::close(fd);
     if (n <= 0) return WFS_E_NOT_A_WORLD;
     buf[n] = 0;
     uint64_t v = 0;
@@ -308,6 +312,32 @@ int marker_read(const char *world_root, MarkerData &out) {
     // refused. A schema this core does not know yet still is: that is the direction P13 is about.
     if (out.schema < WFS_STORE_SCHEMA_M1 || out.schema > WFS_STORE_SCHEMA) return WFS_E_SCHEMA;
     return 0;
+}
+
+int marker_read(const char *world_root, MarkerData &out) {
+    String p = joinp(world_root, WFS_MARKER_NAME);
+    int fd = ::open(p.c_str(), O_RDONLY);
+    if (fd < 0) return errno == ENOENT ? WFS_E_NOT_A_WORLD : -errno;
+    int rc = marker_parse_fd(fd, out);
+    ::close(fd);
+    return rc;
+}
+
+// PR #1 review (26th round, P1): the same read, through a descriptor on the world root, for the
+// one caller that then DELETES the tree it just asked about (gc_tmp_is_removable). Reading the
+// marker by name and removing the tree by name are two lookups of the same name, and that tree
+// lives in the user's own directory -- so the marker is read through the descriptor the removal
+// uses, and the two cannot come apart. Unlike marker_read this tells "there is no marker"
+// (-ENOENT, which gc reads as "nothing claims this tree either way") from "there is one and it
+// does not read as a marker" (WFS_E_NOT_A_WORLD), which gc may not act on at all. O_NOFOLLOW: a
+// symlink standing in for the marker is refused rather than followed, and a tree we could not
+// ask about is kept rather than removed (12th round).
+int marker_read_at(int dirfd, MarkerData &out) {
+    int fd = ::openat(dirfd, WFS_MARKER_NAME, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    int rc = marker_parse_fd(fd, out);
+    ::close(fd);
+    return rc;
 }
 
 // P12: a world-level operation (fork from it, checkpoint it, discard it) takes an exclusive
@@ -746,6 +776,183 @@ int trash_unlink(const char *deleting_path, int threads, uint64_t *entries,
                                         deadline_us, partial);
 }
 
+// ---- PR #1 review (26th round, P1): the identity that was checked is the identity deleted ----
+//
+// The 25th round put an identity check in front of all this: lstat the entry, compare its
+// dev/ino with the row's. What it did not change is that everything after the check is done by
+// NAME -- trash_mark_deleting renames `j.path`, trash_unlink deletes `<j.path>.deleting` -- and
+// those are separate file system calls. The transaction around them serialises this core's own
+// writers and nothing else; the other party here is not a writer of ours but the owner of the
+// directory the entry sits in, and for a world discarded across volumes that directory is the
+// user's own `<parent>/.wfs-trash`. One `mv` between the lstat and the rename and the check
+// passed on the world's tree while the rename and the recursive delete took a directory of
+// theirs, contents and all (core_test, "the identity that was checked is the identity
+// deleted": before this round the stranger's file was gone and gc reported `1 world deleted`).
+//
+// So the claim is a descriptor, not a name. The entry is opened (O_DIRECTORY|O_NOFOLLOW), the
+// descriptor's dev/ino are what is compared with the row, and that descriptor is held for the
+// whole job:
+//
+//   1. open + fstat: this fd IS the row's tree, or WFS_E_TRASH_FOREIGN and nothing is touched.
+//   2. rename `<entry>` -> `<entry>.deleting`, by name, exactly as before. Harmless whatever it
+//      moves: a rename moves a directory, it never removes one.
+//   3. fstatat(parent_fd, "<leaf>.deleting") must be the fd from step 1. If it is not, the
+//      rename moved somebody else's directory: it is renamed straight back, the entry is
+//      reported foreign, and the transaction rolls back -- nothing was deleted, and the only
+//      thing that happened to the stranger is that it had a different name for a few
+//      microseconds.
+//   4. the contents go through the fd (fs_remove_tree_fd): no name is resolved again, and no
+//      symlink is ever followed, so nothing outside the tree we proved can be reached.
+//   5. the entry itself: fstatat(parent_fd, "<leaf>.deleting") is checked against the fd once
+//      more and then unlinkat(..., AT_REMOVEDIR). That last pair is the one place a name still
+//      decides anything, and the bound on it is exact: AT_REMOVEDIR removes an empty directory
+//      or nothing at all, so the worst a directory swapped in between those two calls can cost
+//      is an empty directory -- no data can be lost there.
+//
+// What keeps the path-based remover, and why:
+//   * snapshot trash entries. A snapshot's tree is always inside the store (<store>/trash), the
+//     store allocates that directory, and a snapshot row has no dev/ino columns to check
+//     against in the first place -- there is no identity here to keep, so there is nothing to
+//     keep it through. They also carry UF_IMMUTABLE all the way down (`--hard`), which the
+//     path-based remover unprotects in one walk.
+//   * row-less orphans, for the first half of the same reason: a directory under <store>/trash
+//     that no row claims has no row to be the tree of.
+//   * a world row from before the dir_dev/dir_ino columns (nothing this store writes leaves
+//     one): no identity was recorded, so none can be checked -- the 25th round's own rule.
+// Those three keep the 4-thread deleter as well, which is where it matters most.
+struct TrashClaim {
+    int fd = -1;       // the entry, opened and proven to be the row's tree
+    int parent = -1;   // the directory it sits in
+    String leaf;       // its name under `parent` -- the `.deleting` one once step 2 has run
+    uint64_t dev = 0, ino = 0;
+    TrashClaim() = default;
+    TrashClaim(const TrashClaim &) = delete;
+    TrashClaim &operator=(const TrashClaim &) = delete;
+    ~TrashClaim() {
+        if (fd >= 0) ::close(fd);
+        if (parent >= 0) ::close(parent);
+    }
+    bool held() const { return fd >= 0; }
+};
+
+// Step 1. Returns 0 with the claim held, WFS_E_TRASH_FOREIGN when what is there is provably
+// something else, and any other errno as itself -- including fs_gone(), which the callers read
+// exactly as they read trash_identity's: a tree that is genuinely gone goes on to
+// trash_mark_deleting and its -ENOENT, and the row is buried the way it always was.
+int trash_claim_open(const char *path, uint64_t dev, uint64_t ino, TrashClaim &c) {
+    int fd = ::open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0 && (errno == EACCES || errno == EPERM)) {
+        // A gate-protected root is 0000 and cannot be opened at all (docs/M1_DESIGN.md §3 P4);
+        // the path-based deleter chmods it for the same reason. We are deleting the thing, so
+        // opening the gate for good is right -- and the fstat below is what then says the thing
+        // we opened is the row's tree. If it is not, all that was done to the stranger is that
+        // a directory nobody could open got its owner bits back, which loses nothing.
+        ::chmod(path, 0700);
+        fd = ::open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    }
+    if (fd < 0) {
+        int e = -errno;
+        // ENOTDIR (not a directory) and ELOOP (a symlink, which O_NOFOLLOW refuses) are not
+        // absences: a world tree is a directory, so anything else standing at that name is
+        // provably not it. fs_probe tells the two apart -- "nothing is there" keeps the old
+        // -ENOENT path, and an errno that cannot answer is returned as itself (12th round).
+        if (wfs::fs_gone(e) || e == -ELOOP) {
+            int prc = wfs::fs_probe(path);
+            if (prc) return prc;
+            return WFS_E_TRASH_FOREIGN;
+        }
+        return e;
+    }
+    struct stat st;
+    if (::fstat(fd, &st) != 0) {
+        int e = -errno;
+        ::close(fd);
+        return e;
+    }
+    if ((uint64_t)st.st_ino != ino || (uint64_t)st.st_dev != dev) {
+        ::close(fd);
+        return WFS_E_TRASH_FOREIGN;
+    }
+    c.fd = fd;
+    c.dev = (uint64_t)st.st_dev;
+    c.ino = (uint64_t)st.st_ino;
+    return 0;
+}
+
+// Opens the directory `path` sits in and records its leaf name, so that every later step can be
+// taken relative to a descriptor. O_NOFOLLOW: a symlink standing in for <store>/trash or for a
+// `.wfs-trash` is refused rather than followed.
+int trash_claim_parent(TrashClaim &c, const char *path) {
+    String dir;
+    dirname_of(path, dir);
+    c.leaf.assign(basename_of(path));
+    if (c.parent >= 0) {
+        ::close(c.parent);
+        c.parent = -1;
+    }
+    c.parent = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    return c.parent < 0 ? -errno : 0;
+}
+
+// Is `c.leaf` (under `c.parent`) still the tree the claim was made on?
+int trash_claim_is_ours(const TrashClaim &c, bool *gone = nullptr) {
+    if (gone) *gone = false;
+    struct stat st;
+    if (::fstatat(c.parent, c.leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        int e = -errno;
+        if (wfs::fs_gone(e) && gone) *gone = true;
+        return e;
+    }
+    if ((uint64_t)st.st_ino != c.ino || (uint64_t)st.st_dev != c.dev) return WFS_E_TRASH_FOREIGN;
+    return 0;
+}
+
+// Step 3. `renamed` is false when the entry was already at its `.deleting` name and step 2 did
+// nothing, in which case there is no rename to undo.
+int trash_claim_verify_rename(TrashClaim &c, const char *deleting, bool renamed) {
+    if (int rc = trash_claim_parent(c, deleting)) return rc;
+    int vrc = trash_claim_is_ours(c);
+    if (vrc != WFS_E_TRASH_FOREIGN) return vrc;
+    if (renamed) {
+        // Somebody else's directory went to the `.deleting` name. Put it back where they had
+        // it. Best effort: if the old name has been filled in the meantime the rename fails and
+        // the directory stays where it is, under a name the operator is told about -- nothing
+        // of theirs has been removed either way.
+        String back(c.leaf);
+        back.resize(back.size() - ::strlen(WFS_DELETING_SUFFIX));
+        ::renameat(c.parent, c.leaf.c_str(), c.parent, back.c_str());
+    }
+    return WFS_E_TRASH_FOREIGN;
+}
+
+// Steps 4 and 5.
+int trash_unlink_claim(TrashClaim &c, uint64_t *entries, int64_t deadline_us = 0,
+                       int *partial = nullptr) {
+    if (int rc = wfs::fs_remove_tree_fd(c.fd, 0, entries, deadline_us, partial)) return rc;
+    if (partial && *partial) return 0;   // the deadline: the tree keeps its `.deleting` name
+    bool gone = false;
+    int vrc = trash_claim_is_ours(c, &gone);
+    if (gone) return 0;                  // somebody else finished it; it is empty and it is not there
+    if (vrc) return vrc;
+    // The only name-decided step left, and its bound is exact: AT_REMOVEDIR removes an empty
+    // directory or nothing at all, so a directory swapped in between the fstatat above and this
+    // call can cost an empty directory and cannot cost one byte of anybody's data.
+    if (::unlinkat(c.parent, c.leaf.c_str(), AT_REMOVEDIR) == 0 || errno == ENOENT) return 0;
+    int e = errno;
+    if (e == EPERM || e == EACCES) {
+        struct stat pst;
+        if (::fstat(c.parent, &pst) == 0 && (pst.st_mode & 0700) != 0700)
+            ::fchmod(c.parent, (mode_t)((pst.st_mode & 07777) | 0700));
+#ifdef __APPLE__
+        ::fchflags(c.parent, 0);
+        ::fchflags(c.fd, 0);
+#endif
+        if (::unlinkat(c.parent, c.leaf.c_str(), AT_REMOVEDIR) == 0 || errno == ENOENT) return 0;
+        e = errno;
+    }
+    return -e;
+}
+
 } // namespace
 
 namespace {
@@ -820,6 +1027,14 @@ extern "C" void *wfs_test_trash_crash_ctx = nullptr;
 extern "C" void (*wfs_test_before_trash_delete)(void *ctx, int is_snapshot, wfs_id row,
                                                 const char *path) = nullptr;
 extern "C" void *wfs_test_before_trash_delete_ctx = nullptr;
+
+// And the window INSIDE the claim (PR #1 review, 26th round): between the identity check on the
+// trash entry and the rename that takes it, which is the one seam the store's own transaction
+// cannot serialise -- the other side of it is a user with a `mv`, not another writer. What a
+// test does in there is move the genuine tree away and put a directory of its own at the name.
+extern "C" void (*wfs_test_between_trash_claim)(void *ctx, int is_snapshot, wfs_id row,
+                                                const char *path) = nullptr;
+extern "C" void *wfs_test_between_trash_claim_ctx = nullptr;
 
 // And the window the collector's own *scan* has (PR #1 review, 9th round): between the snapshot
 // of the trash paths the rows claim and the readdir that decides what nothing claims. A
@@ -1738,6 +1953,13 @@ int trash_crash_seam(int phase, int is_snapshot, wfs_id id, const char *trash_pa
     return wfs_test_trash_crash(wfs_test_trash_crash_ctx, phase, is_snapshot, id, trash_path);
 }
 
+// PR #1 review (26th round, P1): the seam between "this is the row's tree" and the rename that
+// takes it. All three claims call it in the same place, because all three had the same split.
+void trash_claim_seam(int is_snapshot, wfs_id row, const char *path) {
+    if (wfs_test_between_trash_claim)
+        wfs_test_between_trash_claim(wfs_test_between_trash_claim_ctx, is_snapshot, row, path);
+}
+
 // --now: delete the trash entry here instead of leaving it to the collector, which is what
 // `discard --now` has always advertised for a world and (since the 5th round) for a snapshot.
 // The same two steps in the same order as the collector's: rename to *.deleting first, so an
@@ -1776,6 +1998,7 @@ int trash_delete_now(wfs_store *s, wfs_id id, int is_snapshot, const String &tra
         // so `--now` comes back WFS_E_TRASH_BLOCKED out of the claim below with the entry and
         // the stray both untouched, and the CLI names the directory that is in the way.
         String deleting;
+        TrashClaim claim;   // PR #1 review (26th round, P1): held from the check to the rmdir
         int mrc;
         {
             // PR #1 review (15th round, P1): the collector's claim, made the same way here. The
@@ -1805,10 +2028,24 @@ int trash_delete_now(wfs_store *s, wfs_id id, int is_snapshot, const String &tra
             // (A tree that is genuinely gone is not a foreign one: trash_mark_deleting()
             // answers -ENOENT for it a line further down and the row is buried the way it
             // always was.)
-            int irc = trash_identity(tp.c_str(), (uint64_t)q.col_i64(2), (uint64_t)q.col_i64(3));
-            if (irc && !wfs::fs_gone(irc)) return irc;
+            // PR #1 review (26th round, P1): and the check is made on a descriptor that is
+            // then held for the rest of the job, because the rename and the delete below are
+            // fresh name lookups and the owner of the directory the entry sits in is not one of
+            // the writers this transaction serialises. Same protocol as the collector's, same
+            // exceptions (a snapshot row has no identity to hold on to) -- see TrashClaim.
+            uint64_t rdev = (uint64_t)q.col_i64(2), rino = (uint64_t)q.col_i64(3);
+            if (rino) {
+                int irc = trash_claim_open(tp.c_str(), rdev, rino, claim);
+                if (irc && !wfs::fs_gone(irc)) return irc;
+            }
+            trash_claim_seam(is_snapshot, id, tp.c_str());
             mrc = trash_mark_deleting(tp.c_str(), deleting);
             if (mrc && mrc != -ENOENT) return mrc;
+            if (!mrc && claim.held()) {
+                if (int vrc = trash_claim_verify_rename(
+                        claim, deleting.c_str(), ::strcmp(deleting.c_str(), tp.c_str()) != 0))
+                    return vrc;
+            }
             if (!mrc && ::strcmp(deleting.c_str(), expect.c_str())) {
                 // Unconditional: the SELECT above read this row in this transaction.
                 Stmt u(s->db, is_snapshot ? "UPDATE snapshots SET trash_path=? WHERE id=?"
@@ -1822,7 +2059,9 @@ int trash_delete_now(wfs_store *s, wfs_id id, int is_snapshot, const String &tra
             t.commit();
         }
         if (!mrc) {
-            if (int rc = trash_unlink(deleting.c_str(), 4, nullptr)) return rc;
+            int rc = claim.held() ? trash_unlink_claim(claim, nullptr)
+                                  : trash_unlink(deleting.c_str(), 4, nullptr);
+            if (rc) return rc;
         }
     }
     Guard g(s->mu);
@@ -2006,6 +2245,12 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
     // (a). Everything the restore decides is decided again in here, under the write lock a
     // discard takes: the row, the tree's name, the tree's identity, and the baseline.
     uint64_t ident_dev = 0, ident_ino = 0;   // what the row says its tree is, read under (a)
+    // PR #1 review (26th round, P1): and the descriptor that check is made on, held across the
+    // rename home -- see TrashClaim. (a) proves the entry is this world's tree with an lstat and
+    // (b) renames a path; between the two the owner of the directory the entry sits in can put
+    // another one there, and for the EXDEV trash that directory is their own `.wfs-trash`. The
+    // rename would then carry a stranger's tree home and the row would be made ACTIVE over it.
+    TrashClaim claim;
     {
         Guard g(s->mu);
         Txn t(s->db);
@@ -2025,9 +2270,15 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
         // registered as the world, exit 0, and the world's own tree left with nothing naming
         // it. Checked in here, under the write lock the discard takes, and nothing else may
         // make the row TRASHING while we hold it.
-        if (int irc = trash_identity(tp.c_str(), rr.dir_dev, rr.dir_ino)) return irc;
-        ident_dev = rr.dir_dev;
-        ident_ino = rr.dir_ino;
+        if (rr.dir_ino) {
+            if (int irc = trash_claim_open(tp.c_str(), rr.dir_dev, rr.dir_ino, claim)) return irc;
+        }
+        trash_claim_seam(0, id, tp.c_str());
+        // The pair step (c) writes back is the pair the descriptor was accepted on -- the same
+        // numbers as the row's by construction, and read from the thing itself rather than from
+        // the row or, as before the 25th round, from a stat of whatever ends up at the home path.
+        ident_dev = claim.held() ? claim.dev : rr.dir_dev;
+        ident_ino = claim.held() ? claim.ino : rr.dir_ino;
         // T2.2: a world whose source snapshot has been discarded cannot be brought back to life
         // -- it would have no baseline to diff or verify against, which is the whole point of a
         // World. Under the write lock, so "the snapshot is ACTIVE" is still true when the row
@@ -2060,6 +2311,22 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
         // -- and it is the verdict trashing_recover() would reach here by itself.
         trashing_commit(s, id, 0, trash.c_str());
         return rc;
+    }
+    if (claim.held()) {
+        // The rename moved *a* directory home; this is what says it moved this world's. If it
+        // did not, the rename is undone and the restore refuses: nothing of the stranger's is
+        // touched, nothing is registered, and the row goes back to TRASHED exactly where the
+        // failed-rename branch above puts it. (If the undo itself cannot be made -- the entry's
+        // old name has been filled in the meantime -- the row is left TRASHING, which is the
+        // "in flight, lstat decides" state trashing_recover() resolves; the refusal stands
+        // either way, and nothing has been deleted.)
+        int vrc = trash_claim_parent(claim, r.path);
+        if (!vrc) vrc = trash_claim_is_ours(claim);
+        if (vrc) {
+            if (wfs::fs_rename(r.path, trash.c_str()) == 0)
+                trashing_commit(s, id, 0, trash.c_str());
+            return vrc;
+        }
     }
     if (int hrc = trash_crash_seam(3, 0, id, trash.c_str())) return hrc;
     // (c). The tree is at home: whatever the row says, that is now the only fact on disk, and
@@ -3001,33 +3268,58 @@ int rm_tmp_in_store_dir(wfs_store *s, const char *dir, uint64_t *removed, int64_
 // a tree that is gone or that belongs to somebody else, and exactly the permanent stranding the
 // 5th round fixed for a tree that is still there and still ours. `*undecided` says which: with
 // it set, the caller keeps the CREATING row, counts the tree and comes back for it.
-bool gc_tmp_is_removable(wfs_store *s, wfs_id id, const char *p, bool *undecided) {
+//
+// PR #1 review (26th round, P1): and the answer is a descriptor, for the same reason the trash
+// claim is one. Everything here used to be a fresh lookup of the same name -- lstat the tree,
+// lstat its marker, read its marker, and then, back in the caller, remove the tree -- and that
+// name is a path in the *user's own* target directory (the 5th round: a fork's temporary is
+// deliberately never found by a suffix sweep, it is named by the row alone). A `mv` between the
+// marker read and the removal and gc deleted whatever had taken the name. So the tree is opened
+// once, the marker is read through that descriptor (marker_read_at), the inode the database is
+// asked about is that descriptor's, and the caller removes the tree through it as well. `c` is
+// the claim the caller then deletes with; it is only filled when this returns true.
+bool gc_tmp_is_removable(wfs_store *s, wfs_id id, const char *p, bool *undecided, TrashClaim &c) {
     if (undecided) *undecided = false;
     if (!p || !*p) return false;
-    struct stat st;
-    if (int prc = wfs::fs_probe(p, &st)) {
-        if (!wfs::fs_gone(prc) && undecided) *undecided = true;
+    // No chmod on the way in, unlike the trash claim: there the row's dev/ino prove the tree is
+    // ours before anything else happens, and here the proof is *inside* the tree (its marker).
+    // A directory in the user's workspace that we cannot open is one we have not proved
+    // anything about yet, so it keeps its bits and its row -- which is exactly what the 12th
+    // round's `undecided` was for, when the same case was an EACCES on the marker's lstat.
+    int fd = ::open(p, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        int e = -errno;
+        // fs_gone(): nothing is there, or what is there is not a directory -- nothing to do,
+        // exactly as before. Anything else (an EACCES, an EIO, a symlink O_NOFOLLOW refused) is
+        // a tree we could not ask about, and the caller keeps the row rather than bury it.
+        if (!wfs::fs_gone(e) && undecided) *undecided = true;
         return false;
     }
-    if (!S_ISDIR(st.st_mode)) return false;
-    String mp = joinp(p, WFS_MARKER_NAME);
-    // The marker's own lstat(2) did not keep the promise above: an EACCES or an EIO read as
-    // "there is no marker", and the tree -- which is in the *user's* directory -- was then
-    // removed without the one check that says it is ours.
-    int mrc = wfs::fs_probe(mp.c_str());
-    if (mrc && !wfs::fs_gone(mrc)) {
+    struct stat st;
+    if (::fstat(fd, &st) != 0) {
+        ::close(fd);
         if (undecided) *undecided = true;
         return false;
     }
+    c.fd = fd;
+    c.dev = (uint64_t)st.st_dev;
+    c.ino = (uint64_t)st.st_ino;
+    // The name the final rmdir will use, and the descriptor of the directory it is in.
+    if (trash_claim_parent(c, p)) {
+        if (undecided) *undecided = true;
+        return false;
+    }
+    MarkerData m;
+    // A marker that is there and cannot be read is a not-an-answer: it may yet say this tree is
+    // ours, or that it is not. Only a marker that is genuinely absent lets the checks below
+    // decide by themselves (the publish order writes the marker before the rename, so a tree
+    // that never got one is a clone that never got that far).
+    int mrc = marker_read_at(c.fd, m);
     if (mrc == 0) {
-        MarkerData m;
-        // A marker that is there and cannot be read is the same kind of not-an-answer: it may
-        // yet say this tree is ours, or that it is not.
-        if (int rrc = marker_read(p, m)) {
-            if (!wfs::fs_gone(rrc) && undecided) *undecided = true;
-            return false;
-        }
         if (m.world != id || ::strcmp(m.store_id, s->store_id.c_str()) != 0) return false;
+    } else if (!wfs::fs_gone(mrc)) {
+        if (undecided) *undecided = true;
+        return false;
     }
     Guard g(s->mu);
     // PR #1 review (9th round), P18: and the row still has to be the row this job was made from
@@ -3341,7 +3633,7 @@ bool mark_dead(wfs_store *s, const TrashJob &j) {
 //
 // Returns 0 with `deleting` set to the name the tree now has, 1 if the entry is not the
 // collector's any more, -ENOENT if it is at neither name, and any other errno as itself.
-int gc_claim_deleting(wfs_store *s, TrashJob &j, String &deleting) {
+int gc_claim_deleting(wfs_store *s, TrashJob &j, String &deleting, TrashClaim &claim) {
     Guard g(s->mu);
     Txn t(s->db);
     if (j.row) {
@@ -3367,8 +3659,17 @@ int gc_claim_deleting(wfs_store *s, TrashJob &j, String &deleting) {
         // trash_follow_deleting() found the tree at, and a same-volume rename keeps the inode,
         // so our own half-deleted tree matches and somebody else's directory at that name does
         // not.
-        int irc = trash_identity(j.path.c_str(), (uint64_t)q.col_i64(2), (uint64_t)q.col_i64(3));
-        if (irc && !wfs::fs_gone(irc)) return irc;
+        // PR #1 review (26th round, P1): and the answer is a descriptor, because everything
+        // after this question is a fresh name lookup -- see TrashClaim above. A world row with
+        // an identity recorded (every one this store writes) is claimed through the fd from
+        // here on; a snapshot row has no dev/ino to check, and neither has a row older than the
+        // columns, so those two keep the name-based protocol they have always had.
+        uint64_t rdev = (uint64_t)q.col_i64(2), rino = (uint64_t)q.col_i64(3);
+        if (rino) {
+            int irc = trash_claim_open(j.path.c_str(), rdev, rino, claim);
+            if (irc && !wfs::fs_gone(irc)) return irc;
+        }
+        trash_claim_seam(j.is_snapshot, j.row, j.path.c_str());
     } else if (trash_path_claimed_locked(s, j.path.c_str())) {
         // P18: an orphan has no row to claim, so what it re-asks is "does any row name this
         // tree now?" -- and it asks it in here, under the same write lock, because a `discard`
@@ -3378,6 +3679,13 @@ int gc_claim_deleting(wfs_store *s, TrashJob &j, String &deleting) {
     }
     int rc = trash_mark_deleting(j.path.c_str(), deleting);
     if (rc) return rc;   // including -ENOENT: the Txn destructor rolls back, no row was written
+    if (claim.held()) {
+        // Step 3: the rename moved *a* directory to the `.deleting` name. This is what says it
+        // moved ours -- and if it did not, it is put straight back and nothing is deleted.
+        if (int vrc = trash_claim_verify_rename(claim, deleting.c_str(),
+                                                ::strcmp(deleting.c_str(), j.path.c_str()) != 0))
+            return vrc;
+    }
     if (j.row && ::strcmp(deleting.c_str(), j.row_path.c_str())) {
         // The row's own name for the tree, kept current. Unconditional on purpose: the SELECT
         // above read this row in this transaction, so there is nothing left that could have
@@ -3464,14 +3772,19 @@ int gc_delete_one(wfs_store *s, TrashJob &j, int threads, uint64_t *entries_free
         wfs_test_before_trash_delete(wfs_test_before_trash_delete_ctx, j.is_snapshot, j.row,
                                      j.path.c_str());
     String deleting;
-    int rc = gc_claim_deleting(s, j, deleting);
+    TrashClaim claim;
+    int rc = gc_claim_deleting(s, j, deleting, claim);
     if (rc == 1) return 1;
     // Not at either name. Somebody deleted it -- or a restore renamed it home before the claim,
     // which is why burying the row is conditional on the row still being the one that was queued.
     if (rc == -ENOENT) return mark_dead(s, j) ? 0 : 1;
     if (rc) return rc;
-    if ((rc = trash_unlink(deleting.c_str(), threads, entries_freed, deadline_us, partial)))
-        return rc;
+    // PR #1 review (26th round, P1): through the descriptor the claim proved, when there was an
+    // identity to prove (a world row). A snapshot entry, a row-less orphan and a row older than
+    // the dir_dev/dir_ino columns have none, and keep the 4-thread path-based deleter.
+    rc = claim.held() ? trash_unlink_claim(claim, entries_freed, deadline_us, partial)
+                      : trash_unlink(deleting.c_str(), threads, entries_freed, deadline_us, partial);
+    if (rc) return rc;
     if (partial && *partial) return 0;
     return mark_dead(s, j) ? 0 : 1;
 }
@@ -3718,9 +4031,13 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
             j.path = cpaths[i];
             j.row = creating[i];
             bool undecided = false;
-            if (gc_tmp_is_removable(s, creating[i], cpaths[i].c_str(), &undecided)) {
+            // PR #1 review (26th round, P1): the claim is the descriptor the marker was read
+            // through, and the removal goes through it -- contents by fd, and the tree's own
+            // name re-checked against that fd before the one rmdir that still uses a name.
+            TrashClaim claim;
+            if (gc_tmp_is_removable(s, creating[i], cpaths[i].c_str(), &undecided, claim)) {
                 int partial = 0;
-                int trc = wfs::fs_remove_tree(cpaths[i].c_str(), deadline_us, &partial);
+                int trc = trash_unlink_claim(claim, nullptr, deadline_us, &partial);
                 if (partial) { rep.work_remains = 1; break; }
                 if (trc == 0) {
                     rep.tmp_removed++;

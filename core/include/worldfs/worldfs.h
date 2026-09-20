@@ -942,6 +942,18 @@ extern void (*wfs_test_before_trash_delete)(void *ctx, int is_snapshot, wfs_id r
                                             const char *path);
 extern void *wfs_test_before_trash_delete_ctx;
 
+/* And the window inside the claim itself (PR #1 review, 26th round): called after the entry's
+ * identity has been checked against the row and before the rename to `<name>.deleting` that
+ * takes it -- the collector's, `--now`'s and `restore`'s, all three. The SQLite transaction
+ * around the claim serialises this core's own writers; it does not serialise the owner of the
+ * directory the entry sits in, who can move the genuine tree away and leave another one at the
+ * name in exactly this window. What a test does in there is precisely that, and what has to
+ * happen next is that nothing of the stranger's is renamed, deleted or registered. NULL unless
+ * a test sets it; nothing in the library ever assigns it. */
+extern void (*wfs_test_between_trash_claim)(void *ctx, int is_snapshot, wfs_id row,
+                                            const char *path);
+extern void *wfs_test_between_trash_claim_ctx;
+
 /* And the window the collector's own *scan* has (PR #1 review, 9th round): called once per
  * trash scan -- wfs_gc(), wfs_gc_status(), wfs_gc_pending() -- after the store mutex has been
  * dropped and the trash paths the rows claim have been read, and before the readdir of
