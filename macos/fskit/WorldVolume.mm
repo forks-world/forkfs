@@ -48,7 +48,27 @@ static NSError *perr(int negerrno) { return fs_errorForPOSIXError(negerrno < 0 ?
     if (!storeDir) {
         char sp[WFS_PATH_MAX] = {0};
         if (wfs_marker_store_path(base.fileSystemRepresentation, sp, sizeof sp) == 0 && sp[0]) {
-            storeDir = [NSString stringWithUTF8String:sp];
+            // PR #1 review (34th round, P2): a path is bytes, and +stringWithUTF8String: is the
+            // one decoder that refuses bytes that are not UTF-8 -- it returns nil for a perfectly
+            // valid store path with, say, a Latin-1 component in it. The fallback below then
+            // opened this extension's own container default instead, silently, while the CLI's
+            // mount pre-check had compared the marker byte for byte and approved the mount: the
+            // volume comes up backed by a DIFFERENT store than the one the user asked for.
+            // -[NSFileManager stringWithFileSystemRepresentation:length:] is the decoder for
+            // file system bytes and has no such rule...
+            storeDir = [[NSFileManager defaultManager] stringWithFileSystemRepresentation:sp
+                                                                                   length:strlen(sp)];
+            // ... and when even that cannot represent them, the answer is to fail the load. A
+            // marker that HAS a store path is never answered with the default store: that is
+            // the substitution this finding is about, one line further down.
+            if (!storeDir) {
+                os_log_error(wfs_log(),
+                             "the .world marker at %{public}@ names a store path this system "
+                             "cannot decode; refusing the mount rather than opening a different "
+                             "store", base);
+                if (err) *err = perr(EILSEQ);
+                return nil;
+            }
             fromMarker = YES;
         }
     }
