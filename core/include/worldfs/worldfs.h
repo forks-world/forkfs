@@ -788,9 +788,11 @@ typedef struct wfs_trash_stat {
      * also waiting for the collector: removing one is a whole tree, so a wake that runs out of
      * time leaves the rest of them for its successor. */
     uint64_t pool_stranded;
-    /* PR #1 review (27th/28th rounds): the directories the counts above are made from that
+    /* PR #1 review (27th/28th/29th rounds): the directories the counts above are made from that
      * could not be read -- <store>/trash, <store>/snapshots, <store>/pool and its S<n>s, the
-     * <store>/tmp sweep. It is what keeps every "0 waiting" above honest: the store is clean
+     * <store>/tmp sweep (that last one from the 29th round: the report scanned the first three
+     * only, so the one directory whose failure `gc` could print was the one `gc --status` could
+     * not). It is what keeps every "0 waiting" above honest: the store is clean
      * only when this is 0 too, and a status that could not look into a directory says so
      * instead of reporting an empty one. dirs_unreadable_path is the first such directory and
      * dirs_unreadable_errno the errno that stopped it (both empty/0 when the count is 0),

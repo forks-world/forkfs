@@ -1867,6 +1867,56 @@ s28 fs gc --now --retention 0 > "$U28/s-gc2.log" 2>&1
     || { bad PR28 "and the row-less clone goes as soon as it can be read again"; sed 's/^/        /' "$U28/s-gc2.log"; }
 
 
+# ---- PR #1 review (29th round, P2): the fourth directory, and the report that never looked ----
+# The 28th round taught the collector to record and retry an unreadable <store>/tmp (the seatbelt
+# profiles `world exec` leaves behind), so `gc` says so -- but wfs_gc_status() walked <store>/trash,
+# <store>/snapshots and <store>/pool and not that one, so `gc --status` called the store clean.
+# The two halves matter together: once the retry cap stops the worker chain, the run that prints
+# the note is the run that no longer happens, and `gc --status` is the only thing left to ask.
+U29="$SCRATCH/unread29"
+mkdir -p "$U29/src"
+echo x > "$U29/src/f.txt"
+T29STORE="$U29/tmp-store"
+t29() { "$WORLD" --store "$T29STORE" "$@"; }
+t29 fs init "$U29/src" --name unread29 > /dev/null 2>&1
+mkdir -p "$T29STORE/tmp"
+chmod 000 "$T29STORE/tmp"
+t29 fs gc --status --retention 0 > "$U29/status.log" 2>&1
+grep -q "could not be read" "$U29/status.log" \
+    && ok PR29 "gc --status does not call a <store>/tmp it cannot read a clean one" \
+    || { bad PR29 "gc --status does not call a <store>/tmp it cannot read a clean one"; sed 's/^/        /' "$U29/status.log"; }
+grep -q "$T29STORE/tmp" "$U29/status.log" \
+    && ok PR29 "and names the directory" \
+    || { bad PR29 "and names the directory"; sed 's/^/        /' "$U29/status.log"; }
+grep -q "^unread:" "$U29/status.log" \
+    && ok PR29 "on the unread: line, with the errno" \
+    || { bad PR29 "on the unread: line, with the errno"; sed 's/^/        /' "$U29/status.log"; }
+grep -qi "Permission denied" "$U29/status.log" \
+    && ok PR29 "and the errno is the one that stopped it" \
+    || { bad PR29 "and the errno is the one that stopped it"; sed 's/^/        /' "$U29/status.log"; }
+grep -q "^unread:    1 directory" "$U29/status.log" \
+    && ok PR29 "and dirs_unreadable counts it" \
+    || { bad PR29 "and dirs_unreadable counts it"; sed 's/^/        /' "$U29/status.log"; }
+# The counting pass writes nothing: asking is not failing, and the cap is the collector's to
+# spend. So the status above cannot have bumped the counter past it -- the line is still there.
+t29 fs gc --status --retention 0 > "$U29/status2.log" 2>&1
+grep -q "$T29STORE/tmp" "$U29/status2.log" \
+    && ok PR29 "and says it again: a counting pass spends no retries" \
+    || { bad PR29 "and says it again: a counting pass spends no retries"; sed 's/^/        /' "$U29/status2.log"; }
+# And past the retry cap, when nothing wakes a collector any more, the status is still the one
+# thing that says the directory is there. Ten collector passes is more than kGcFailCap.
+for _ in $(seq 10); do t29 fs gc --now --retention 0 > /dev/null 2>&1; done
+t29 fs gc --status --retention 0 > "$U29/status-capped.log" 2>&1
+grep -q "$T29STORE/tmp" "$U29/status-capped.log" \
+    && ok PR29 "and still says it once the retry cap has stopped the worker chain" \
+    || { bad PR29 "and still says it once the retry cap has stopped the worker chain"; sed 's/^/        /' "$U29/status-capped.log"; }
+chmod 700 "$T29STORE/tmp"
+t29 fs gc --status --retention 0 > "$U29/status-clean.log" 2>&1
+grep -q "could not be read" "$U29/status-clean.log" \
+    && { bad PR29 "and the line goes as soon as the directory can be read again"; sed 's/^/        /' "$U29/status-clean.log"; } \
+    || ok PR29 "and the line goes as soon as the directory can be read again"
+
+
 echo
 "$WORLD" fs status | sed 's/^/      /'
 echo

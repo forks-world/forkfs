@@ -1231,9 +1231,9 @@ static int cmd_gc_status(wfs_store *s, int64_t retention) {
     if (ts.pool_stranded)
         printf("pool:      %llu stale pre-clone entr%s waiting for the collector\n",
                (unsigned long long)ts.pool_stranded, ts.pool_stranded == 1 ? "y" : "ies");
-    // PR #1 review (27th/28th rounds, P2): and what the counts above could not look at. An
-    // unreadable <store>/trash, <store>/snapshots, pool root or S<n> used to be passed over in
-    // silence, so this report said nothing at all while a row-less tree sat in there -- "0 stale
+    // PR #1 review (27th/28th/29th rounds, P2): and what the counts above could not look at. An
+    // unreadable <store>/trash, <store>/snapshots, <store>/tmp, pool root or S<n> used to be
+    // passed over in silence, so this report said nothing at all while a row-less tree sat in there -- "0 stale
     // entries" read as "the store is clean" when the truth was "it could not be read". The
     // directory and the errno, because whatever is to be done about it is done by whoever owns
     // that directory.

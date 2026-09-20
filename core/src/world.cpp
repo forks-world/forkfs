@@ -3891,10 +3891,10 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
     int64_t retention = retention_secs < 0 ? kDefaultRetention : retention_secs;
     TrashView v;
     if (int rc = trash_scan(s, now_sec() - retention, v)) return rc;
-    // PR #1 review (27th/28th rounds, P2): every directory this report's counts are made from,
-    // and whether it could be read at all. One count for all of them -- <store>/trash, the
-    // <store>/snapshots sweep, <store>/pool and its S<n>s -- because what the reader has to know
-    // is the same in each case: a number below is missing what is in there, and here is which
+    // PR #1 review (27th/28th/29th rounds, P2): every directory this report's counts are made
+    // from, and whether it could be read at all. One count for all of them -- <store>/trash, the
+    // <store>/snapshots sweep, <store>/pool and its S<n>s, <store>/tmp -- because what the
+    // reader has to know is the same in each case: a number below is missing what is in there, and here is which
     // directory and why. The first one's path and errno, since only its owner can do anything
     // about it. Nothing here writes: a counting pass that bumped the retry counter would be a
     // `gc --status` that decides how often the collector comes back.
@@ -4032,6 +4032,48 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
         wfs::DirUnreadable pu;
         wfs::pool_stranded(s, &out->pool_stranded, &pu);
         note(pu);
+    }
+    // PR #1 review (29th round, P2): and <store>/tmp, the fourth and last directory the
+    // collector scans. The 28th round taught the collector's own pass there -- the seatbelt
+    // profiles `world exec` leaves behind -- to record an unreadable directory and retry it,
+    // but this report walked trash, snapshots and pool and not that one, so an EACCES on
+    // <store>/tmp produced an `unread:` line from `gc` and none at all from `gc --status`; and
+    // once the retry cap stopped the worker chain, the run that would have printed it was the
+    // run that no longer happens. `gc --status` is then the only thing left that can say it,
+    // which is exactly why it is the thing that has to.
+    //
+    // A direct scan, not the persisted `gcfail:dir:` record: status answers for the present, and
+    // a counter says only that some wake once failed here. It costs nothing to be exact --
+    // every directory that counter can name is a directory this report now opens for itself
+    // (<store>/trash by trash_scan, <store>/snapshots and <store>/pool and its S<n>s by the two
+    // passes above, <store>/tmp by this one), so folding the counter in would add no directory
+    // and would risk reporting one that has been readable for a week.
+    //
+    // Nothing is counted per entry -- what the trash stat says about <store>/tmp is only whether
+    // it could be read, since the profiles themselves are the collector's business (tmp_removed)
+    // and no field here holds them. The loop still runs to the end of the directory, because
+    // readdir(3) reports its own failure through errno alone: a stream that stopped halfway is
+    // the silence this whole round is about. And it writes nothing, like every counting pass.
+    {
+        String tmpd = joinp(s->dir.c_str(), "tmp");
+        wfs::DirUnreadable tu;
+        DIR *d = ::opendir(tmpd.c_str());
+        if (!d) {
+            if (errno != ENOENT)
+                wfs::gc_note_unreadable(s, &tu, tmpd.c_str(), errno, false, nullptr);
+        } else {
+            for (;;) {
+                errno = 0;
+                struct dirent *e = ::readdir(d);
+                if (!e) {
+                    if (errno)
+                        wfs::gc_note_unreadable(s, &tu, tmpd.c_str(), errno, false, nullptr);
+                    break;
+                }
+            }
+            ::closedir(d);
+        }
+        note(tu);
     }
     gc_worker_probe(s, &out->worker_pid, &out->worker_started_at, &out->worker_done,
                     &out->worker_remaining);
