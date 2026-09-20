@@ -1068,6 +1068,15 @@ extern void *wfs_test_after_version_bump_ctx;
  * is not a test; nothing in the library ever assigns it a value. */
 extern const char *wfs_test_stmt_fail_sql;
 
+/* One BEGIN IMMEDIATE, failed on demand (PR #1 review, 34th round, P1). Every mutation in this
+ * core is "the check and the change in one write transaction" (P12); what that rests on is a
+ * BEGIN IMMEDIATE that succeeded, and the only way to test the other case from outside is to
+ * make one fail. Set this to the SQLite result code the next `wfs::Txn` is to report:
+ * SQLITE_BUSY for a busy timeout that ran out, SQLITE_IOERR for a write error -- and that Txn
+ * starts no transaction, reports the code, and clears this back to 0. 0 in every run that is
+ * not a test; nothing in the library ever assigns it a value. */
+extern int wfs_test_txn_fail_once;
+
 /* And the one xattr rule a test cannot drive from outside (PR #1 review, 9th round). The default
  * diff leaves com.apple.provenance out of the comparison, and provenance is precisely the name a
  * test cannot make differ: the kernel stamps it on every file this process creates, with the

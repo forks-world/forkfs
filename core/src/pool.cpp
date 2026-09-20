@@ -189,6 +189,7 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
     {
         Guard g(s->mu);
         Txn t(s->db);
+        if (!t.ok()) return t.err();   // 34th round, P1
         // PR #1 review (15th round, P2): the snapshot, re-read here rather than carried in from
         // the single read at the top of wfs_pool_fill. A `discard S<n>` in between counts its
         // references under BEGIN IMMEDIATE, sees no pool row for an entry that does not exist
@@ -227,7 +228,9 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
         ins.i64(8, ostart);
         if (ins.step() != SQLITE_DONE) return -EIO;
         row = (wfs_id)sqlite3_last_insert_rowid(s->db);
-        t.commit();
+        // Nothing is cloned until this row is on disk: it is the only name the entry's tree
+        // will have (34th round, P1).
+        if (int crc = t.commit()) return crc;
     }
 
     int rc = 0;
@@ -291,9 +294,13 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
         fs_remove_tree(tmp.c_str());
         Guard g(s->mu);
         Txn t(s->db);
-        Stmt del(s->db, "DELETE FROM pool WHERE id=?");
-        if (del.ok()) { del.i64(1, (int64_t)row); del.step(); }
-        t.commit();
+        // 34th round, P1: a row left behind is a CREATING pool row with no tree, which
+        // pool_collect() dooms on the next wake; the caller is owed the clone's own error.
+        if (t.ok()) {
+            Stmt del(s->db, "DELETE FROM pool WHERE id=?");
+            if (del.ok()) { del.i64(1, (int64_t)row); del.step(); }
+            (void)t.commit();   // best effort: pool_collect() is the backstop either way
+        }
         return rc;
     }
 
@@ -301,6 +308,7 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
     if (::stat(path.c_str(), &st) != 0) return -errno;
     Guard g(s->mu);
     Txn t(s->db);
+    if (!t.ok()) return t.err();   // 34th round, P1
     Stmt u(s->db, "UPDATE pool SET dir_dev=?, dir_ino=?, root_mode=?, root_mtime=?, state=1 WHERE id=?");
     if (!u.ok()) return -EIO;
     u.i64(1, (int64_t)st.st_dev);
@@ -309,8 +317,8 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
     u.i64(4, mtime_ns(st));
     u.i64(5, (int64_t)row);
     if (u.step() != SQLITE_DONE) return -EIO;
-    t.commit();
-    return 0;
+    // state=1 is the promise a fork claims this entry on (34th round, P1).
+    return t.commit();
 }
 
 } // namespace
@@ -320,6 +328,10 @@ int pool_claim(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, PoolClaim
     if (!s || !snapshot) return -EINVAL;
     Guard g(s->mu);
     Txn t(s->db);
+    // 34th round, P1: the claim and the caller's hook are one write -- the fork's CREATING row
+    // is what keeps the snapshot referenced while the entry is out of the pool -- so without
+    // the write lock there is no claim to make.
+    if (!t.ok()) return t.err();
     // state=1 (POOL_READY) and nothing else, which is what makes the drain's two steps work:
     // a row it has moved to POOL_DRAINING is invisible here, so the tree it is about to remove
     // can never be handed to a fork (PR #1 review, 21st round). A claim and the drain's own
@@ -358,7 +370,7 @@ int pool_claim(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, PoolClaim
     if (!gone && on_claimed) {
         if (int rc = on_claimed(hook_ctx, out)) return rc;   // the Txn destructor rolls back
     }
-    t.commit();
+    if (int crc = t.commit()) return crc;
     return gone ? -ENOENT : 0;
 }
 
@@ -373,6 +385,7 @@ int pool_return(wfs_store *s, const PoolClaim &c, PoolReturnHook on_returned, vo
     {
         Guard g(s->mu);
         Txn t(s->db);
+        if (!t.ok()) rc = t.err();   // 34th round, P1
         // PR #1 review (16th round, P2): the same question build_one's insert asks (15th round)
         // and for the same reason -- a READY entry is a promise that the snapshot it names is
         // ACTIVE and is still the snapshot this tree was cloned from. The caller's hook is what
@@ -381,7 +394,7 @@ int pool_return(wfs_store *s, const PoolClaim &c, PoolReturnHook on_returned, vo
         // in the unwind this was written for the check cannot fail; it is the entry's identity,
         // asked under the same write lock the discard's reference count is taken under, for
         // this caller and any other.
-        {
+        if (!rc) {
             Stmt sq(s->db, "SELECT state, created_at FROM snapshots WHERE id=?");
             if (!sq.ok()) rc = -EIO;
             else {
@@ -412,7 +425,7 @@ int pool_return(wfs_store *s, const PoolClaim &c, PoolReturnHook on_returned, vo
         }
         // The claimer's own bookkeeping, in the same transaction as the row that replaces it.
         if (!rc && on_returned) rc = on_returned(hook_ctx, c);
-        if (!rc) t.commit();     // and the Txn destructor rolls everything back otherwise
+        if (!rc) rc = t.commit();   // and the Txn destructor rolls everything back otherwise
     }
     // The entry did not go back, so its tree is not an entry: remove it rather than leave a
     // row-less clone for the orphan sweep to find. No deadline -- this is a failed fork's
@@ -766,10 +779,13 @@ int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us, int *work
         gc_fail_clear(s, key.c_str());
         Guard g(s->mu);
         Txn t(s->db);
+        // 34th round, P1: the trees are gone; a row that could not be deleted with them is work
+        // for the next wake, not an entry to count as removed.
+        if (!t.ok()) { if (work_remains) *work_remains = 1; continue; }
         // P18: and the row this deletes is the row that named the tree that has just gone.
         Stmt d(s->db, "DELETE FROM pool WHERE id=? AND path=?");
         if (d.ok()) { d.i64(1, (int64_t)rows[i]); d.text(2, trees[i].c_str()); d.step(); }
-        t.commit();
+        if (t.commit()) { if (work_remains) *work_remains = 1; continue; }
         ++n;
     }
     if (!out_of_time)
@@ -960,6 +976,10 @@ extern "C" int wfs_pool_drain(wfs_store *s, wfs_id snapshot, uint64_t *removed) 
         {
             wfs::Guard g(s->mu);
             wfs::Txn t(s->db);
+            // 34th round, P1: the tree below is removed only behind a row this transaction
+            // moved to DRAINING. Without the write lock a fork's claim and this update do not
+            // serialise, and the tree could be a live world's by the time it is unlinked.
+            if (!t.ok()) return t.err();
             // No state in the WHERE: a CREATING row of a filler that died is drained too (the
             // fill holds the same pool lock this call holds, so no live filler is in here), and
             // a row this drain -- or an earlier one -- already moved to DRAINING is retried.
@@ -971,7 +991,8 @@ extern "C" int wfs_pool_drain(wfs_store *s, wfs_id snapshot, uint64_t *removed) 
             u.text(2, paths[i].c_str());
             if (u.step() != SQLITE_DONE) return -EIO;
             mine = sqlite3_changes(s->db) == 1;
-            if (mine) t.commit();   // and the destructor rolls the nothing back otherwise
+            // and the destructor rolls the nothing back otherwise
+            if (mine) { if (int crc = t.commit()) return crc; }
         }
         if (!mine) continue;        // a fork claimed it first: the tree is its world now
         if (wfs_test_in_pool_drain) wfs_test_in_pool_drain(wfs_test_in_pool_drain_ctx, 1);
@@ -984,6 +1005,7 @@ extern "C" int wfs_pool_drain(wfs_store *s, wfs_id snapshot, uint64_t *removed) 
         {
             wfs::Guard g(s->mu);
             wfs::Txn t(s->db);
+            if (!t.ok()) return t.err();   // 34th round, P1
             // The row that named the tree that has just gone, as in pool_collect (P18), and in
             // the state this drain put it in -- nothing else may have written it since.
             wfs::Stmt d(s->db, "DELETE FROM pool WHERE id=? AND state=2 AND path=?");
@@ -991,7 +1013,7 @@ extern "C" int wfs_pool_drain(wfs_store *s, wfs_id snapshot, uint64_t *removed) 
             d.i64(1, (int64_t)rows[i]);
             d.text(2, paths[i].c_str());
             d.step();
-            t.commit();
+            if (int crc = t.commit()) return crc;
         }
         if (removed) (*removed)++;
     }

@@ -27,6 +27,10 @@ extern "C" void *wfs_test_after_version_bump_ctx = nullptr;
 // test; nothing in the library ever assigns it a value. Read by Stmt::row() in db.h.
 extern "C" const char *wfs_test_stmt_fail_sql = nullptr;
 
+// One BEGIN IMMEDIATE, failed on demand (PR #1 review, 34th round). Same rules: 0 in every run
+// that is not a test, and nothing in the library ever assigns it. Read by wfs::Txn in db.h.
+extern "C" int wfs_test_txn_fail_once = 0;
+
 namespace {
 
 // Schema v3 (docs/M1_DESIGN.md §2). Snapshot ids and world ids are separate sequences, so
@@ -208,7 +212,7 @@ int has_column(sqlite3 *db, const char *table, const char *column) {
 // store exactly as it was -- un-stamped, so the next open retries it.
 int migrate_schema(sqlite3 *db) {
     wfs::Txn t(db);
-    if (t.begin_rc != SQLITE_OK) return -EIO;
+    if (!t.ok()) return t.err();
     if (sqlite3_exec(db, kSchema, nullptr, nullptr, nullptr) != SQLITE_OK) return -EIO;
     for (const Migration &m : kMigrations) {
         int hc = has_column(db, m.table, m.column);
@@ -222,7 +226,7 @@ int migrate_schema(sqlite3 *db) {
     char pragma[64];
     ::snprintf(pragma, sizeof pragma, "PRAGMA user_version=%d", user_version_want());
     if (sqlite3_exec(db, pragma, nullptr, nullptr, nullptr) != SQLITE_OK) return -EIO;
-    return t.commit_rc() == SQLITE_OK ? 0 : -EIO;
+    return t.commit();
 }
 
 void hex_id(char *out, size_t n) { // n = 33 for 32 hex digits + NUL
@@ -461,6 +465,7 @@ int64_t gc_fail_bump(wfs_store *s, const char *key) {
     if (!s || !key || !*key) return kGcFailCap;   // cannot count: do not spin
     Guard g(s->mu);
     Txn t(s->db);
+    if (!t.ok()) return kGcFailCap;   // 34th round, P1: cannot count, so do not spin
     int64_t n = 0;
     {
         Stmt q(s->db, "SELECT value FROM meta WHERE key=?");
@@ -480,7 +485,7 @@ int64_t gc_fail_bump(wfs_store *s, const char *key) {
     u.text(1, key);
     u.text(2, v);
     if (u.step() != SQLITE_DONE) return kGcFailCap;
-    t.commit();
+    if (t.commit()) return kGcFailCap;
     return n;
 }
 
@@ -506,9 +511,10 @@ void gc_fail_clear(wfs_store *s, const char *key) {
         if (!q.row()) return;   // 32nd round, P2: no row and no answer both mean "clear nothing"
     }
     Txn t(s->db);
+    if (!t.ok()) return;   // 34th round, P1: a counter that stayed costs one more wake
     Stmt d(s->db, "DELETE FROM meta WHERE key=?");
     if (d.ok()) { d.text(1, key); d.step(); }
-    t.commit();
+    (void)t.commit();   // best effort: the same, one wake later
 }
 
 // ---- PR #1 review (28th round, P2): the directories the collector could not read -------------

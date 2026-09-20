@@ -667,13 +667,13 @@ void fork_tmp_leaf(char *out, size_t cap) {
 int world_set_tmp_path(wfs_store *s, wfs_id id, const char *p) {
     Guard g(s->mu);
     Txn t(s->db);
+    if (!t.ok()) return t.err();   // 34th round, P1
     Stmt u(s->db, "UPDATE worlds SET tmp_path=? WHERE id=?");
     if (!u.ok()) return -EIO;
     u.text(1, p ? p : "");
     u.i64(2, (int64_t)id);
     if (u.step() != SQLITE_DONE) return -EIO;
-    t.commit();
-    return 0;
+    return t.commit();
 }
 
 // ---- T2.1: deleting a trash entry ------------------------------------------------------------
@@ -1194,6 +1194,7 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
     {
         Guard g(s->mu);
         Txn t(s->db);
+        if (!t.ok()) return t.err();   // 34th round, P1
         int64_t opid = 0, ostart = 0;
         owner_now(opid, ostart);
         Stmt ins(s->db,
@@ -1210,7 +1211,7 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         ins.i64(8, ostart);
         if (ins.step() != SQLITE_DONE) return -EIO;
         id = (wfs_id)sqlite3_last_insert_rowid(s->db);
-        t.commit();
+        if (int crc = t.commit()) return crc;
     }
 
     String snapdir = numbered(joinp(s->dir.c_str(), "snapshots").c_str(), 'S', id, nullptr);
@@ -1278,14 +1279,20 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         wfs::fs_remove_tree(tmpdir.c_str());
         Guard g(s->mu);
         Txn t(s->db);
-        Stmt del(s->db, "DELETE FROM snapshots WHERE id=?");
-        if (del.ok()) { del.i64(1, (int64_t)id); del.step(); }
-        t.commit();
+        // 34th round, P1: no transaction, no tidying up. The row stays CREATING with no tree,
+        // which is the shape gc's half-built-snapshot sweep is for, and what the caller is owed
+        // is the error that brought us here rather than one about the clean-up.
+        if (t.ok()) {
+            Stmt del(s->db, "DELETE FROM snapshots WHERE id=?");
+            if (del.ok()) { del.i64(1, (int64_t)id); del.step(); }
+            (void)t.commit();   // best effort: the sweep is the backstop either way
+        }
         return rc;
     }
     {
         Guard g(s->mu);
         Txn t(s->db);
+        if (!t.ok()) return t.err();   // 34th round, P1
         Stmt u(s->db,
                "UPDATE snapshots SET path=?, entries=?, hardlinks=?, state=?, root_mode=?,"
                " hl_groups=?, hl_external=? WHERE id=?");
@@ -1302,7 +1309,10 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         u.i64(7, (int64_t)hl.external_names);
         u.i64(8, (int64_t)id);
         if (u.step() != SQLITE_DONE) return -EIO;
-        t.commit();
+        // 34th round, P1: this row IS the publish -- it is what makes the tree at S<n> an ACTIVE
+        // snapshot. A COMMIT that failed leaves it CREATING, and handing back an id for it would
+        // be reporting a snapshot the store does not have.
+        if (int crc = t.commit()) return crc;
     }
     *out = id;
     return 0;
@@ -1555,7 +1565,8 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
                 Txn t(s->db);
                 Stmt u(s->db, "UPDATE worlds SET dir_dev=?, dir_ino=?, state=?, tmp_path='',"
                               " owner_pid=0, owner_start=0 WHERE id=? AND state=?");
-                if (!u.ok()) rc = -EIO;
+                if (!t.ok()) rc = t.err();   // 34th round, P1
+                else if (!u.ok()) rc = -EIO;
                 else {
                     u.i64(1, (int64_t)st.st_dev);
                     u.i64(2, (int64_t)st.st_ino);
@@ -1567,7 +1578,7 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
                     // with nothing in the database that knows about it.
                     if (u.step() != SQLITE_DONE) rc = -EIO;
                     else if (sqlite3_changes(s->db) != 1) rc = -ESTALE;
-                    else t.commit();
+                    else if (int crc = t.commit()) rc = crc;   // and the entry goes back below
                 }
             }
             if (rc == 0) {
@@ -1603,12 +1614,17 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
                 if (wfs::fs_rename_excl(target.c_str(), claim.path.c_str()) != 0) {
                     Guard g(s->mu);
                     Txn t(s->db);
-                    Stmt u(s->db, "UPDATE worlds SET tmp_path=? WHERE id=? AND state=?");
-                    if (u.ok()) {
-                        u.text(1, target.c_str());
-                        u.i64(2, (int64_t)id);
-                        u.i64(3, WFS_ST_CREATING);
-                        if (u.step() == SQLITE_DONE) t.commit();
+                    // 34th round, P1: with no transaction the row keeps the tmp_path it has --
+                    // the pool entry's name, which pool_collect() will not sweep while a
+                    // CREATING row claims it -- and the caller still gets the original failure.
+                    if (t.ok()) {
+                        Stmt u(s->db, "UPDATE worlds SET tmp_path=? WHERE id=? AND state=?");
+                        if (u.ok()) {
+                            u.text(1, target.c_str());
+                            u.i64(2, (int64_t)id);
+                            u.i64(3, WFS_ST_CREATING);
+                            if (u.step() == SQLITE_DONE) (void)t.commit();   // best effort
+                        }
                     }
                     return rc;
                 }
@@ -1628,9 +1644,13 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
                 // references the snapshot through it any more and the row goes on its own.
                 Guard g(s->mu);
                 Txn t(s->db);
+                // 34th round, P1: falling through to a fresh clone with that row still CREATING
+                // would put a second tree at --to under a row that names neither. The fork ends
+                // here instead; the row is the abandoned-fork shape gc already collects.
+                if (!t.ok()) return rc;
                 Stmt del(s->db, "DELETE FROM worlds WHERE id=?");
                 if (del.ok()) { del.i64(1, (int64_t)id); del.step(); }
-                t.commit();
+                (void)t.commit();   // best effort: gc's CREATING sweep is the backstop
             }
             // ... and fall through to cloning it here and now
         }
@@ -1657,6 +1677,7 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
     {
         Guard g(s->mu);
         Txn t(s->db);
+        if (!t.ok()) return t.err();   // 34th round, P1
         // The same window as the pool path's, and the same answer: under the write lock, either
         // the snapshot is still ACTIVE and this CREATING row makes the fork visible to
         // `discard`, or a discard got here first and there is nothing to fork from. (A fork
@@ -1689,7 +1710,9 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         ins.i64(11, ostart);
         if (ins.step() != SQLITE_DONE) return -EIO;
         id = (wfs_id)sqlite3_last_insert_rowid(s->db);
-        t.commit();
+        // 34th round, P1: nothing is cloned until this row is committed -- it is the only name
+        // the tree about to be built will have.
+        if (int crc = t.commit()) return crc;
     }
 
     // The clone goes to a name of ours in the target's parent directory, recorded on the row
@@ -1820,9 +1843,14 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         }
         Guard g(s->mu);
         Txn t(s->db);
-        Stmt del(s->db, "DELETE FROM worlds WHERE id=?");
-        if (del.ok()) { del.i64(1, (int64_t)id); del.step(); }
-        t.commit();
+        // 34th round, P1: the tree is proven gone by here, so a row left behind is a CREATING
+        // row naming nothing -- what gc's abandoned-fork sweep buries -- and the caller is owed
+        // the failure that brought it here, not the one from the tidying up.
+        if (t.ok()) {
+            Stmt del(s->db, "DELETE FROM worlds WHERE id=?");
+            if (del.ok()) { del.i64(1, (int64_t)id); del.step(); }
+            (void)t.commit();   // best effort: the sweep is the backstop either way
+        }
         if (rc == -EXDEV || rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
         return rc;
     }
@@ -1836,6 +1864,7 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
     {
         Guard g(s->mu);
         Txn t(s->db);
+        if (!t.ok()) return t.err();   // 34th round, P1
         // tmp_path goes with the publish: the tree is at `target` now, and a row that still
         // named the temporary would be pointing gc at a path that is not there any more.
         Stmt u(s->db, "UPDATE worlds SET dir_dev=?, dir_ino=?, entries=?, state=?, tmp_path='',"
@@ -1858,7 +1887,13 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
                 wfs::fs_remove_tree(tmp.c_str());
             return -ESTALE;
         }
-        t.commit();
+        // 34th round, P1: and a COMMIT that failed is the same situation one step later -- the
+        // tree is at --to with a row that still says CREATING -- so it takes the same way out.
+        if (int crc = t.commit()) {
+            if (wfs::fs_rename_excl(target.c_str(), tmp.c_str()) == 0)
+                wfs::fs_remove_tree(tmp.c_str());
+            return crc;
+        }
     }
     res->world = id;
     res->elapsed_us = now_us() - t_begin;
@@ -1938,14 +1973,16 @@ namespace {
 int trashing_set_path(wfs_store *s, wfs_id id, int is_snapshot, const char *p) {
     Guard g(s->mu);
     Txn t(s->db);
+    if (!t.ok()) return t.err();   // 34th round, P1
     Stmt u(s->db, is_snapshot ? "UPDATE snapshots SET trash_path=? WHERE id=? AND state=4"
                               : "UPDATE worlds SET trash_path=? WHERE id=? AND state=4");
     if (!u.ok()) return -EIO;
     u.text(1, p);
     u.i64(2, (int64_t)id);
     if (u.step() != SQLITE_DONE) return -EIO;
-    t.commit();
-    return 0;
+    // The row has to name the new place before the tree can be there: a commit that failed is a
+    // rename that must not happen (34th round, P1).
+    return t.commit();
 }
 
 // Who is moving this tree: the pid and that process's own start time, so a reused pid is not
@@ -1984,6 +2021,7 @@ int trashing_reclaim(wfs_store *s, wfs_id id, int is_snapshot, const char *trash
     if (int prc = wfs::fs_probe(trash_path)) return wfs::fs_gone(prc) ? -ESTALE : prc;
     Guard g(s->mu);
     Txn t(s->db);
+    if (!t.ok()) return t.err();   // 34th round, P1
     int64_t state = -1;
     String tp;
     {
@@ -2009,8 +2047,7 @@ int trashing_reclaim(wfs_store *s, wfs_id id, int is_snapshot, const char *trash
     u.i64(4, (int64_t)id);
     if (u.step() != SQLITE_DONE) return -EIO;
     if (sqlite3_changes(s->db) == 0) return -ESTALE;
-    t.commit();
-    return 0;
+    return t.commit();
 }
 
 // Step (c). Only ever applied to a row this process put in TRASHING -- and since the 8th round
@@ -2021,6 +2058,7 @@ int trashing_commit(wfs_store *s, wfs_id id, int is_snapshot, const char *trash_
     {
         Guard g(s->mu);
         Txn t(s->db);
+        if (!t.ok()) return t.err();   // 34th round, P1
         Stmt u(s->db,
                is_snapshot
                    ? "UPDATE snapshots SET state=?, owner_pid=0, owner_start=0 WHERE id=? AND state=4"
@@ -2030,7 +2068,7 @@ int trashing_commit(wfs_store *s, wfs_id id, int is_snapshot, const char *trash_
         u.i64(2, (int64_t)id);
         if (u.step() != SQLITE_DONE) return -EIO;
         int changed = sqlite3_changes(s->db);
-        t.commit();
+        if (int crc = t.commit()) return crc;
         if (changed) return 0;
     }
     return trashing_reclaim(s, id, is_snapshot, trash_path);
@@ -2041,13 +2079,17 @@ int trashing_commit(wfs_store *s, wfs_id id, int is_snapshot, const char *trash_
 void trashing_undo(wfs_store *s, wfs_id id, int is_snapshot) {
     Guard g(s->mu);
     Txn t(s->db);
+    // 34th round, P1: with no transaction the row is left TRASHING, owned by this process --
+    // which is the "in flight" state trashing_recover() resolves from the tree's own position
+    // the moment this process is gone. Putting it back is what this is for; guessing is not.
+    if (!t.ok()) return;
     Stmt u(s->db,
            is_snapshot ? "UPDATE snapshots SET state=?, trash_path='', trashed_at=0, owner_pid=0,"
                          " owner_start=0 WHERE id=? AND state=4"
                        : "UPDATE worlds SET state=?, trash_path='', trashed_at=0, owner_pid=0,"
                          " owner_start=0 WHERE id=? AND state=4");
     if (u.ok()) { u.i64(1, WFS_ST_ACTIVE); u.i64(2, (int64_t)id); u.step(); }
-    t.commit();
+    (void)t.commit();   // best effort: trashing_recover() reaches the same verdict from the tree
 }
 
 int trash_crash_seam(int phase, int is_snapshot, wfs_id id, const char *trash_path) {
@@ -2113,6 +2155,7 @@ int trash_delete_now(wfs_store *s, wfs_id id, int is_snapshot, const String &tra
             // all: -ESTALE, tree untouched.
             Guard g(s->mu);
             Txn t(s->db);
+            if (!t.ok()) return t.err();   // 34th round, P1
             Stmt q(s->db,
                    is_snapshot ? "SELECT state, trash_path, 0, 0 FROM snapshots WHERE id=?"
                                : "SELECT state, trash_path, dir_dev, dir_ino FROM worlds WHERE id=?");
@@ -2158,7 +2201,10 @@ int trash_delete_now(wfs_store *s, wfs_id id, int is_snapshot, const String &tra
                 if (u.step() != SQLITE_DONE) return -EIO;
                 expect = deleting;
             }
-            t.commit();
+            // The rename has happened; the unlink below follows it. A commit that failed rolls
+            // the recorded name back, so the unlink must not run on it (34th round, P1) --
+            // trash_follow_deleting() picks the tree up at either name on the next attempt.
+            if (int crc = t.commit()) return crc;
         }
         if (!mrc) {
             int rc = claim.held() ? trash_unlink_claim(claim, nullptr)
@@ -2168,6 +2214,7 @@ int trash_delete_now(wfs_store *s, wfs_id id, int is_snapshot, const String &tra
     }
     Guard g(s->mu);
     Txn t(s->db);
+    if (!t.ok()) return t.err();   // 34th round, P1
     Stmt u(s->db,
            is_snapshot
                ? "UPDATE snapshots SET state=?, trash_path='' WHERE id=? AND state=2 AND trash_path=?"
@@ -2178,7 +2225,7 @@ int trash_delete_now(wfs_store *s, wfs_id id, int is_snapshot, const String &tra
     u.text(3, expect.c_str());
     if (u.step() != SQLITE_DONE) return -EIO;
     int changed = sqlite3_changes(s->db);
-    t.commit();
+    if (int crc = t.commit()) return crc;
     return changed ? 0 : -ESTALE;
 }
 
@@ -2222,6 +2269,7 @@ extern "C" int wfs_world_discard(wfs_store *s, wfs_id id, int immediate, int for
     {
         Guard g(s->mu);
         Txn t(s->db);
+        if (!t.ok()) return t.err();   // 34th round, P1
         Stmt u(s->db, "UPDATE worlds SET state=?, trash_path=?, trashed_at=?, owner_pid=?,"
                       " owner_start=? WHERE id=? AND state=1");
         if (!u.ok()) return -EIO;
@@ -2232,7 +2280,10 @@ extern "C" int wfs_world_discard(wfs_store *s, wfs_id id, int immediate, int for
         u.i64(6, (int64_t)id);
         if (u.step() != SQLITE_DONE) return -EIO;
         if (sqlite3_changes(s->db) == 0) return -ESTALE;   // somebody else moved it meanwhile
-        t.commit();
+        // 34th round, P1: the rename in (b) is allowed only once this row is on disk. A commit
+        // that failed leaves an ACTIVE world, and moving its tree into the trash behind that is
+        // exactly the row-less orphan the three-step protocol exists to make impossible.
+        if (int crc = t.commit()) return crc;
     }
     if (int hrc = trash_crash_seam(0, 0, id, trash.c_str())) return hrc;
     // (b)
@@ -2356,6 +2407,7 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
     {
         Guard g(s->mu);
         Txn t(s->db);
+        if (!t.ok()) return t.err();   // 34th round, P1
         wfs_world_rec rr;
         if (int rc = world_row(s, id, rr)) return rc;
         if (rr.state != WFS_ST_TRASHED) return -ESTALE;
@@ -2404,7 +2456,9 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
         u.i64(4, (int64_t)id);
         if (u.step() != SQLITE_DONE) return -EIO;
         if (sqlite3_changes(s->db) == 0) return -ESTALE;
-        t.commit();
+        // The mirror of the discard's (a): the rename home in (b) may only follow a row that is
+        // on disk in TRASHING and owned by us (34th round, P1).
+        if (int crc = t.commit()) return crc;
     }
     if (int hrc = trash_crash_seam(2, 0, id, trash.c_str())) return hrc;
     // (b)
@@ -2464,6 +2518,7 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
     {
         Guard g(s->mu);
         Txn t(s->db);
+        if (!t.ok()) return t.err();   // 34th round, P1
         Stmt u(s->db, "UPDATE worlds SET state=?, trash_path='', trashed_at=0, dir_dev=?,"
                       " dir_ino=?, owner_pid=0, owner_start=0 WHERE id=? AND (state=4 OR state=2)");
         if (!u.ok()) return -EIO;
@@ -2473,7 +2528,7 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
         u.i64(4, (int64_t)id);
         if (u.step() != SQLITE_DONE) return -EIO;
         int changed = sqlite3_changes(s->db);
-        t.commit();
+        if (int crc = t.commit()) return crc;
         if (changed) return 0;
     }
     Guard g(s->mu);
@@ -2599,6 +2654,11 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
     // is no longer a moment in which neither side can see the other.
     Guard g(s->mu);
     Txn t(s->db);
+    // 34th round, P1: and it is one transaction only if the BEGIN took the write lock. Without
+    // it the reference count below and the UPDATE that follows are two separate writes, with a
+    // fork free to commit its CREATING row between them -- the very interleaving this whole
+    // transaction was written to make impossible.
+    if (!t.ok()) return t.err();
     wfs_snapshot_rec r;
     if (int rc = snapshot_row(s, id, r)) return rc;
     if (r.state == WFS_ST_TRASHED) return -EALREADY;
@@ -2650,7 +2710,9 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
     if (tree_gone) { u.i64(4, 0); u.i64(5, 0); } else { trashing_own(u, 4, 5); }
     u.i64(6, (int64_t)id);
     if (u.step() != SQLITE_DONE) return -EIO;
-    t.commit();
+    // Step (b) renames the tree into the trash, and it may do that only behind a row that is on
+    // disk naming the place it is going (34th round, P1).
+    if (int crc = t.commit()) return crc;
     }
     if (tree_gone) return 0;   // nothing to move, nothing to unlink, and the row is already DEAD
     if (int hrc = trash_crash_seam(0, 1, id, trash.c_str())) return hrc;
@@ -2779,6 +2841,7 @@ int trashing_recover(wfs_store *s, uint64_t *restored, uint64_t *finished) {
         }
         Guard g(s->mu);
         Txn t(s->db);
+        if (!t.ok()) return t.err();   // 34th round, P1
         // PR #1 review (9th round), P18: the verdict above was reached by lstat'ing the very
         // trash_path this row recorded when the scan read it, so the write carries that path as
         // well as the state. Two recoveries running at once then agree by construction, and a
@@ -2801,7 +2864,7 @@ int trashing_recover(wfs_store *s, uint64_t *restored, uint64_t *finished) {
         u.text(2, p.trash.c_str());
         if (u.step() != SQLITE_DONE) return -EIO;
         int changed = sqlite3_changes(s->db);
-        t.commit();
+        if (int crc = t.commit()) return crc;
         if (!changed) continue;
         if (in_trash) { if (finished) (*finished)++; }
         else if (restored) (*restored)++;
@@ -2961,12 +3024,13 @@ extern "C" int wfs_world_verify_identity(wfs_store *s, const char *path, wfs_ide
         out->moved = 1;
         Guard g(s->mu);
         Txn t(s->db);
+        if (!t.ok()) return t.err();   // 34th round, P1
         Stmt u(s->db, "UPDATE worlds SET path=? WHERE id=?");
         if (!u.ok()) return -EIO;
         u.text(1, real.c_str());
         u.i64(2, (int64_t)m.world);
         if (u.step() != SQLITE_DONE) return -EIO;
-        t.commit();
+        if (int crc = t.commit()) return crc;
     }
     return 0;
 }
@@ -3029,6 +3093,7 @@ extern "C" int wfs_world_adopt(wfs_store *s, const char *path, const char *name,
     {
         Guard g(s->mu);
         Txn t(s->db);
+        if (!t.ok()) return t.err();   // 34th round, P1
         // PR #1 review (6th round): the baseline has to still be a baseline, and the question has
         // to be asked under the same write lock `discard S<n>` decides under (BEGIN IMMEDIATE).
         // An adopt registers a world from its marker alone -- nothing on disk is consulted about
@@ -3066,15 +3131,22 @@ extern "C" int wfs_world_adopt(wfs_store *s, const char *path, const char *name,
         ins.i64(11, created);
         if (ins.step() != SQLITE_DONE) return -EIO;
         id = (wfs_id)sqlite3_last_insert_rowid(s->db);
-        t.commit();
+        // The marker below is written for a row that exists; a commit that failed has none
+        // (34th round, P1).
+        if (int crc = t.commit()) return crc;
     }
     if (int rc = marker_write(real.c_str(), s->store_id.c_str(), s->dir.c_str(), id, nm, parent ? m.snapshot : 0, parent,
                               created)) {
         Guard g(s->mu);
         Txn t(s->db);
-        Stmt del(s->db, "DELETE FROM worlds WHERE id=?");
-        if (del.ok()) { del.i64(1, (int64_t)id); del.step(); }
-        t.commit();
+        // 34th round, P1: no transaction, no undo. The row is left ACTIVE for a directory with
+        // no marker, which is what `gc --reconcile` reports and buries, and the caller gets the
+        // marker's own error.
+        if (t.ok()) {
+            Stmt del(s->db, "DELETE FROM worlds WHERE id=?");
+            if (del.ok()) { del.i64(1, (int64_t)id); del.step(); }
+            (void)t.commit();   // best effort: reconciliation is the backstop either way
+        }
         return rc;
     }
     *out = id;
@@ -3810,7 +3882,8 @@ bool mark_dead(wfs_store *s, const TrashJob &j) {
     if (!j.row) return true;   // an orphan has no row to bury
     Guard g(s->mu);
     Txn t(s->db);
-    Stmt u(s->db,
+    if (!t.ok()) return false;   // 34th round, P1: false is "not buried", which is this
+    Stmt u(s->db,                //          collector's safe answer -- nothing is deleted for it
            j.is_snapshot
                ? "UPDATE snapshots SET state=?, trash_path='' WHERE id=? AND state=2 AND trash_path=?"
                : "UPDATE worlds SET state=?, trash_path='' WHERE id=? AND state=2 AND trash_path=?");
@@ -3820,7 +3893,7 @@ bool mark_dead(wfs_store *s, const TrashJob &j) {
     u.text(3, j.row_path.c_str());
     if (u.step() != SQLITE_DONE) return false;
     bool changed = sqlite3_changes(s->db) != 0;
-    t.commit();
+    if (t.commit()) return false;
     return changed;
 }
 
@@ -3853,6 +3926,10 @@ bool mark_dead(wfs_store *s, const TrashJob &j) {
 int gc_claim_deleting(wfs_store *s, TrashJob &j, String &deleting, TrashClaim &claim) {
     Guard g(s->mu);
     Txn t(s->db);
+    // 34th round, P1: the rename to `.deleting` below and the row that records it are one write
+    // or they are nothing. Without the write lock the claim proves nothing -- a restore could
+    // take the row between the check and the rename -- so the entry is left exactly as it is.
+    if (!t.ok()) return t.err();
     if (j.row) {
         Stmt q(s->db,
                j.is_snapshot ? "SELECT state, trash_path, 0, 0 FROM snapshots WHERE id=?"
@@ -3919,8 +3996,7 @@ int gc_claim_deleting(wfs_store *s, TrashJob &j, String &deleting, TrashClaim &c
         if (u.step() != SQLITE_DONE) return -EIO;
         j.row_path.assign(deleting.c_str());
     }
-    t.commit();
-    return 0;
+    return t.commit();
 }
 
 // Is this job still the collector's to do? Read under the store mutex immediately before the
@@ -4424,6 +4500,9 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
             gc_fail_clear(s, j);
             Guard g(s->mu);
             Txn t(s->db);
+            // 34th round, P1: the tree is gone either way; a row that could not be buried is
+            // work for the next wake rather than a silent no-op.
+            if (!t.ok()) { rep.work_remains = 1; continue; }
             // P18: still CREATING, and still naming the tree this job was made from.
             Stmt d(s->db,
                    "UPDATE worlds SET state=?, tmp_path='' WHERE id=? AND state=0 AND tmp_path=?");
@@ -4433,7 +4512,7 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                 d.text(3, cpaths[i].c_str());
                 d.step();
             }
-            t.commit();
+            if (t.commit()) rep.work_remains = 1;
         }
     }
     // Half-built snapshots: the row is the only trace of the tmp tree's name.
@@ -4487,9 +4566,10 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
             rep.snapshots_deleted++;
             Guard g(s->mu);
             Txn t(s->db);
+            if (!t.ok()) { rep.work_remains = 1; continue; }   // 34th round, P1: as above
             Stmt d(s->db, "DELETE FROM snapshots WHERE id=? AND state=0");
             if (d.ok()) { d.i64(1, (int64_t)snap_gone[i]); d.step(); }
-            t.commit();
+            if (t.commit()) rep.work_remains = 1;
         }
     }
     // <store>/snapshots only: a name under the store is one we made. The parent directories of
@@ -4603,6 +4683,7 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                 {
                     Guard g(s->mu);
                     Txn t(s->db);
+                    if (!t.ok()) continue;   // 34th round, P1
                     Stmt u(s->db, "UPDATE snapshots SET state=?, trash_path=''"
                                   " WHERE id=? AND state=1 AND path=?");
                     if (!u.ok()) continue;
@@ -4611,7 +4692,7 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                     u.text(3, dead_snap_paths[i].c_str());
                     if (u.step() != SQLITE_DONE) continue;
                     changed = sqlite3_changes(s->db) != 0;
-                    t.commit();
+                    if (t.commit()) changed = false;
                 }
                 if (!changed) continue;   // the row moved on: not this collector's to bury
                 rep.snapshots_reconciled++;
@@ -4619,6 +4700,7 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
             for (size_t i = 0; i < dead_worlds.size(); ++i) {
                 Guard g(s->mu);
                 Txn t(s->db);
+                if (!t.ok()) continue;   // 34th round, P1
                 Stmt u(s->db, "UPDATE worlds SET state=? WHERE id=? AND state=1 AND path=?");
                 if (!u.ok()) continue;
                 u.i64(1, WFS_ST_DEAD);
@@ -4626,7 +4708,7 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                 u.text(3, dead_world_paths[i].c_str());
                 if (u.step() != SQLITE_DONE) continue;
                 bool changed = sqlite3_changes(s->db) != 0;
-                t.commit();
+                if (t.commit()) continue;
                 if (changed) rep.worlds_reconciled++;
             }
         }

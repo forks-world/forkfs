@@ -971,6 +971,21 @@ static char g_swap_file[4096];
 static char g_swap_entry[4096];
 static wfs_id g_swap_world;
 static int g_swap_ran;
+// PR #1 review (34th round, P1): the failed BEGIN IMMEDIATE, armed at the one instant the
+// collector's own transaction is about to start. The seam fires immediately before
+// gc_claim_deleting(), which is where the rename to `.deleting` and the row that records it
+// are made one write -- so the next Txn the collector constructs is that one.
+static int g_txnfail_armed;
+static void txnfail_before_trash_delete(void *ctx, int is_snapshot, wfs_id row, const char *path) {
+    (void)ctx;
+    (void)is_snapshot;
+    (void)row;
+    (void)path;
+    if (g_txnfail_armed) return;
+    g_txnfail_armed++;
+    wfs_test_txn_fail_once = SQLITE_IOERR;
+}
+
 static void swap_between_claim(void *ctx, int is_snapshot, wfs_id row, const char *path) {
     (void)ctx;
     if (is_snapshot || row != g_swap_world || g_swap_ran) return;
@@ -6368,6 +6383,114 @@ int main() {
         CHECK(rts.pool_stranded == 1);
         wfs_store_close(rs);
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", rstore, (unsigned long long)r1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
+    // ---- PR #1 review (34th round, P1): a BEGIN IMMEDIATE that failed is not a transaction ---
+    //
+    // The 11th round recorded what BEGIN IMMEDIATE returned and left it to one caller to read.
+    // Everything else went on as if the write lock had been taken: the statements ran, one at a
+    // time, in autocommit, and the destructor's ROLLBACK rolled back nothing. Every invariant
+    // this core rests on is "the check and the change are one write transaction" (P12), so what
+    // the silence cost is the whole of it -- a discard's reference count and its state change as
+    // two separate writes, with a fork free to commit its CREATING row in between.
+    //
+    // The seam makes the next BEGIN report a code of the test's choosing. Three of the places it
+    // matters, one per shape: a state change with a reference check in front of it, a row insert
+    // that a tree is about to be built for, and the collector's claim.
+    {
+        char xstore[4096], xsrc[4096], xw[4096], xdb[4096], xsql[256];
+        join(xstore, sizeof xstore, root, "txn-store");
+        join(xsrc, sizeof xsrc, root, "txn-src");
+        CHECK(mkdir(xsrc, 0755) == 0);
+        join(p, sizeof p, xsrc, "a.txt");
+        write_file(p, "one\n");
+        join(xdb, sizeof xdb, xstore, "metadata.db");
+        wfs_store *xs = NULL;
+        CHECK_OK(wfs_store_open(xstore, &xs));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "txn";
+        wfs_id x1 = 0;
+        CHECK_OK(wfs_snapshot_create(xs, xsrc, &sopts, &x1));
+
+        // (a) `discard S<n>`. The reference check and the move to TRASHING are one transaction;
+        //     with no transaction there is nothing to hold them together, and the discard must
+        //     not happen at all. Before the fix it happened anyway: the UPDATE went in by
+        //     itself, the tree was renamed into the trash, and the snapshot came out TRASHED.
+        snprintf(xsql, sizeof xsql, "SELECT state FROM snapshots WHERE id=%llu",
+                 (unsigned long long)x1);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu", xstore, (unsigned long long)x1);
+        CHECK(exists(p));
+        wfs_test_txn_fail_once = SQLITE_IOERR;
+        CHECK_RC(wfs_snapshot_discard(xs, x1, 0, 0), -EIO);
+        CHECK(wfs_test_txn_fail_once == 0);             // the seam fired
+        CHECK(db_i64(xdb, xsql) == WFS_ST_ACTIVE);      // WFS_ST_TRASHED before the fix
+        CHECK(exists(p));                               // and the tree never moved
+        join(q, sizeof q, xstore, "trash");
+        CHECK(n_with_prefix(q, "S") == 0);
+        // ... and the same call with the lock taken: -EBUSY, so the CLI can say who holds it.
+        wfs_test_txn_fail_once = SQLITE_BUSY;
+        CHECK_RC(wfs_snapshot_discard(xs, x1, 0, 0), -EBUSY);
+        CHECK(db_i64(xdb, xsql) == WFS_ST_ACTIVE);
+        CHECK(exists(p));
+
+        // (b) `fork`. The CREATING row is inserted first and IS the record of the tree that is
+        //     about to be cloned; an insert outside a transaction is a row this fork never
+        //     agreed to. --no-pool so the insert is the first transaction of the call.
+        join(xw, sizeof xw, worlds, "txnworld");
+        memset(&opts, 0, sizeof opts);
+        opts.name = "txnworld";
+        opts.no_pool = 1;
+        wfs_ref xref = {WFS_K_SNAPSHOT, x1};
+        wfs_id xw1 = 0;
+        wfs_test_txn_fail_once = SQLITE_BUSY;
+        CHECK_RC(wfs_world_create(xs, xref, xw, &opts, &xw1), -EBUSY);
+        CHECK(wfs_test_txn_fail_once == 0);
+        CHECK(xw1 == 0);
+        CHECK(!exists(xw));                             // a whole world, published, before the fix
+        CHECK(db_i64(xdb, "SELECT COUNT(*) FROM worlds") == 0);
+        CHECK(n_with_prefix(worlds, ".wfs-fork-") == 0);
+        // ... and unarmed the very same call works, so the refusal is the seam and nothing else.
+        CHECK_OK(wfs_world_create(xs, xref, xw, &opts, &xw1));
+        CHECK(exists(xw));
+
+        // (c) the collector's claim. gc_claim_deleting() renames the entry to `.deleting` and
+        //     records the new name in one transaction; without one, the rename happens and the
+        //     unlink follows it. A world in the trash, retention 0, and the seam armed for the
+        //     instant before the claim.
+        CHECK_OK(wfs_world_discard(xs, xw1, 0, 0));
+        snprintf(xsql, sizeof xsql, "SELECT state FROM worlds WHERE id=%llu",
+                 (unsigned long long)xw1);
+        CHECK(db_i64(xdb, xsql) == WFS_ST_TRASHED);
+        char xtrash[4096];
+        snprintf(xtrash, sizeof xtrash, "%s/trash", xstore);
+        CHECK(n_with_prefix(xtrash, "W") == 1);
+        g_txnfail_armed = 0;
+        wfs_test_before_trash_delete = txnfail_before_trash_delete;
+        wfs_gc_opts xgo;
+        memset(&xgo, 0, sizeof xgo);
+        xgo.retention_secs = 0;
+        wfs_gc_report xrep;
+        memset(&xrep, 0, sizeof xrep);
+        CHECK_RC(wfs_gc_ex(xs, &xgo, &xrep), 0);        // one entry failed, the run did not
+        wfs_test_before_trash_delete = NULL;
+        CHECK(g_txnfail_armed == 1);
+        CHECK(wfs_test_txn_fail_once == 0);
+        CHECK(xrep.worlds_deleted == 0);                // 1 before the fix
+        CHECK(db_i64(xdb, xsql) == WFS_ST_TRASHED);     // WFS_ST_DEAD before the fix
+        CHECK(n_with_prefix(xtrash, "W") == 1);         // the tree is still there...
+        // ... and still at the name the row gives it, not at `<entry>.deleting`.
+        snprintf(xsql, sizeof xsql,
+                 "SELECT trash_path LIKE '%%.deleting' FROM worlds WHERE id=%llu",
+                 (unsigned long long)xw1);
+        CHECK(db_i64(xdb, xsql) == 0);
+        // ... and the next wake, unarmed, finishes it.
+        memset(&xrep, 0, sizeof xrep);
+        CHECK_OK(wfs_gc_ex(xs, &xgo, &xrep));
+        CHECK(xrep.worlds_deleted == 1);
+        CHECK(n_with_prefix(xtrash, "W") == 0);
+        wfs_store_close(xs);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", xstore, (unsigned long long)x1);
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 
