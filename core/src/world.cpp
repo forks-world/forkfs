@@ -845,10 +845,38 @@ int trash_claim_open(const char *path, uint64_t dev, uint64_t ino, TrashClaim &c
         // A gate-protected root is 0000 and cannot be opened at all (docs/M1_DESIGN.md §3 P4);
         // the path-based deleter chmods it for the same reason. We are deleting the thing, so
         // opening the gate for good is right -- and the fstat below is what then says the thing
-        // we opened is the row's tree. If it is not, all that was done to the stranger is that
-        // a directory nobody could open got its owner bits back, which loses nothing.
-        ::chmod(path, 0700);
-        fd = ::open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        // we opened is the row's tree.
+        //
+        // PR #1 review (27th round, P2): but the gate is opened only after what is standing
+        // there has been shown to be ours. The chmod used to come first and the identity check
+        // after it, so a directory somebody else had put at this name -- and for a world
+        // discarded across volumes the entry sits in the user's own `<parent>/.wfs-trash`,
+        // whose names they can work out -- was chmod'ed to 0700 on its way to being refused as
+        // foreign. A refusal may not leave a mark on the thing it refuses: a 0000 directory is
+        // 0000 because its owner wants it shut, and gc, `discard --now` and `restore` all come
+        // through here.
+        //
+        // The check in front of the chmod has to be made on the name, because there is no
+        // descriptor to make it on yet: a 0000 directory cannot be opened at all on this
+        // platform, not even for a stat -- O_EVTONLY|O_DIRECTORY|O_NOFOLLOW is refused with
+        // EACCES exactly as O_RDONLY is (measured, Darwin 27/APFS, as the owner), and macOS has
+        // no O_PATH. So it is lstat, compare, chmod, open -- and the fstat below then proves
+        // the identity a second time, on the descriptor every later step actually uses. The
+        // bound on what a swap between the lstat and the chmod can achieve is exact, and it is
+        // not a deletion: a stranger moved in there gets its mode set to 0700, after which the
+        // fstat refuses it and nothing else is done to it. Nothing of theirs can be renamed or
+        // unlinked, because from here on only the descriptor decides (26th round).
+        int oe = errno;
+        struct stat lst;
+        if (::lstat(path, &lst) != 0) {
+            errno = oe;   // why the open failed is the answer here; why the lstat did is not
+        } else if (!S_ISDIR(lst.st_mode) || (uint64_t)lst.st_ino != ino ||
+                   (uint64_t)lst.st_dev != dev) {
+            return WFS_E_TRASH_FOREIGN;
+        } else {
+            ::chmod(path, 0700);
+            fd = ::open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        }
     }
     if (fd < 0) {
         int e = -errno;

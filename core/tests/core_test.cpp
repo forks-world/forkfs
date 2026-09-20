@@ -5837,6 +5837,94 @@ int main() {
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 
+    // ---- PR #1 review (27th round, P2): a refusal leaves no mark on what it refuses --------
+    //
+    // An entry the claim cannot open it chmods to 0700 and opens again: a gate-protected root
+    // is 0000 and cannot be opened at all (M1_DESIGN.md P4), and we are deleting the thing.
+    // That chmod used to be done BEFORE the descriptor's inode was compared with the row's, so
+    // a stranger's 0000 directory standing at the entry's path -- the cross-volume entry sits
+    // in the user's own `.wfs-trash`, under a name they can work out -- came back 0700 from a
+    // claim that then refused it as foreign. The identity is checked on the name first now
+    // (lstat: a 0000 directory cannot be opened on this platform at all, not even O_EVTONLY),
+    // so a refused stranger is left exactly as its owner had it. All three ways in -- the
+    // collector, `discard --now` and `restore` -- go through the one claim.
+    {
+        char mstore[4096], msrc[4096], mw[4096], mdb[4096], mentry[4096], maside[4096];
+        char msql[256];
+        struct stat mst;
+        join(mstore, sizeof mstore, root, "mode-store");
+        join(msrc, sizeof msrc, root, "mode-src");
+        join(maside, sizeof maside, root, "mode-aside");
+        CHECK(mkdir(msrc, 0755) == 0);
+        join(p, sizeof p, msrc, "a.txt");
+        write_file(p, "one\n");
+        wfs_store *ma = NULL;
+        CHECK_OK(wfs_store_open(mstore, &ma));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "mb";
+        wfs_id m1 = 0;
+        CHECK_OK(wfs_snapshot_create(ma, msrc, &sopts, &m1));
+        wfs_ref mf = {WFS_K_SNAPSHOT, m1};
+        memset(&opts, 0, sizeof opts);
+        join(mw, sizeof mw, worlds, "mworld");
+        wfs_id mw1 = 0;
+        CHECK_OK(wfs_world_create(ma, mf, mw, &opts, &mw1));
+        wfs_world_rec mwr;
+        CHECK_OK(wfs_world_info(ma, mw1, &mwr));
+        uint64_t mino = mwr.dir_ino;
+        CHECK(mino != 0);
+        CHECK_OK(wfs_world_discard(ma, mw1, 0, 0));
+        snprintf(mdb, sizeof mdb, "%s/metadata.db", mstore);
+        snprintf(msql, sizeof msql, "SELECT trash_path FROM worlds WHERE id=%llu",
+                 (unsigned long long)mw1);
+        CHECK(db_query_text(mdb, msql, mentry, sizeof mentry) == 1);
+        CHECK(mentry[0]);
+
+        // The world's tree goes aside and a stranger's shut directory takes the name.
+        CHECK(rename(mentry, maside) == 0);
+        CHECK(mkdir(mentry, 0755) == 0);
+        join(p, sizeof p, mentry, "user.txt");
+        write_file(p, "not the world\n");
+        CHECK(chmod(mentry, 0000) == 0);
+
+        wfs_store *mb = NULL;
+        CHECK_OK(wfs_store_open(mstore, &mb));
+        // (1) the collector refuses it -- and leaves its mode alone.
+        wfs_gc_report mrep;
+        memset(&mrep, 0, sizeof mrep);
+        CHECK_OK(wfs_gc(mb, 0, &mrep));
+        CHECK(mrep.trash_foreign == 1);
+        CHECK(mrep.worlds_deleted == 0 && mrep.trash_failed == 0 && mrep.entries_freed == 0);
+        CHECK(stat(mentry, &mst) == 0 && (mst.st_mode & 07777) == 0);
+        // (2) `--now` refuses in the same way.
+        CHECK_RC(wfs_world_discard(ma, mw1, 1, 0), WFS_E_TRASH_FOREIGN);
+        CHECK(stat(mentry, &mst) == 0 && (mst.st_mode & 07777) == 0);
+        // (3) and so does `restore`, which does not register anything at the home path either.
+        CHECK_RC(wfs_world_restore(ma, mw1), WFS_E_TRASH_FOREIGN);
+        CHECK(!exists(mw));
+        CHECK(stat(mentry, &mst) == 0 && (mst.st_mode & 07777) == 0);
+        CHECK_OK(wfs_world_info(ma, mw1, &mwr));
+        CHECK(mwr.state == WFS_ST_TRASHED && mwr.dir_ino == mino);
+
+        // The stranger's own file is still in there, byte for byte, once its owner opens it.
+        CHECK(chmod(mentry, 0700) == 0);
+        join(p, sizeof p, mentry, "user.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "not the world\n"));
+        // Put the world's tree back and the entry is collected exactly as it always was.
+        rm_rf(mentry);
+        CHECK(rename(maside, mentry) == 0);
+        memset(&mrep, 0, sizeof mrep);
+        CHECK_OK(wfs_gc(mb, 0, &mrep));
+        CHECK(mrep.worlds_deleted == 1 && mrep.trash_foreign == 0 && mrep.trash_failed == 0);
+        CHECK_OK(wfs_world_info(ma, mw1, &mwr));
+        CHECK(mwr.state == WFS_ST_DEAD);
+        wfs_store_close(mb);
+        wfs_store_close(ma);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", mstore, (unsigned long long)m1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
     wfs_store_close(s);
     rm_rf(root);
     printf("core_test: all OK\n");
