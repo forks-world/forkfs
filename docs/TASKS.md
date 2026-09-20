@@ -736,7 +736,7 @@ FSKit 传进来的不是 `WorldItem`),与本次改动无关;`error:70` 一条都
 - [x] T2.3 store 路径统一:沙盒 appex 与 CLI 默认 store 不同(container vs ~/Library/Application Support),`world fs mount` 把 store 路径写进 `.world` marker 传给扩展;修正任务板中"CLI 默认同路径"
 - [x] T2.4 diff 扫描改 `getattrlistbulk` + `EF_NO_XATTRS`(2026-09-19,分支 `m2/t2.4-bulk-walker`;真实树默认全扫 0.21 → 0.17 s,合成 50k 1.40 → 0.96 s)
   - [x] T2.4 后续:`com.apple.provenance` 不再参与比较(架构决定,见下;合成 50k 0.96 → **0.231 s**)
-- [x] P17 store 完整性:有树但 `metadata.db` 没了 → `WFS_E_STORE_DAMAGED`,拒绝并说明出路
+- [x] P17 store 完整性:有树但库(`metadata3.db`;schema 2 是 `metadata.db`)没了 → `WFS_E_STORE_DAMAGED`,拒绝并说明出路
 - [x] T2.5 fork 后按 (dev, ino) 恢复树内硬链接(P9 从警告变为修复;实测 0.27 ms/条,pool 命中不受影响)
 - [ ] T2.6 Linux 平台层:overlayfs + mount namespace(fork O(1)、upper 目录即 changed-set)——**不在这台 Mac 上做**(用户决定),等 Linux 机器
 
@@ -1078,17 +1078,17 @@ T2.4 结尾留的第一条"以后再说"在 M2 收口时被采纳了。**这是�
 
 #### P17 store 完整性(2026-09-19)
 
-**风险**:store 目录还在、`snapshots/` 里还有树,但 `metadata.db` 没了(误删、备份还原了半套、磁盘错误)。
+**风险**:store 目录还在、`snapshots/` 里还有树,但库(`metadata3.db`;schema 2 时叫 `metadata.db`)没了(误删、备份还原了半套、磁盘错误)。
 从前 `wfs_store_open` 会**静默新建一个空库**——id 是从库里发的,新库再发一次 1,下一次 `init` 就往已经在磁盘上的
 `snapshots/S1` 上写。
 
-**做法**:`wfs_store_open` 在创建任何东西之前先判:`metadata.db` 不存在 / 是空文件 / 读不了 /
+**做法**:`wfs_store_open` 在创建任何东西之前先判:库不存在 / 是空文件 / 读不了 /
 打开后连 pragma 都执行不过(根本不是数据库),**而** `snapshots/`、`trash/`、`pool/` 里还有条目
 → `WFS_E_STORE_DAMAGED`(-1017)。检测只是对这三个目录各一次 readdir,**快照的 gate 一路关着也照样发现**
 (不需要进 `S<n>/root`)。空目录不算损坏,那是新 store。
 
 **CLI 把话说全**:这些树就是那个数据库的索引、id 会撞车、**`gc --reconcile` 帮不上忙**
-(它要读数据库才知道哪些行的树没了,而这里没的正是数据库),出路只有两条——从备份恢复 `metadata.db`,
+(它要读数据库才知道哪些行的树没了,而这里没的正是数据库),出路只有两条——从备份恢复 `metadata3.db`,
 或者把整个目录挪开(`mv <store> <store>.damaged`)重开一个。**不提供 `store repair --scan`**:
 从磁盘上的树反推出 id、名字、来源快照、fork 时的 FSEvents 游标是猜,猜错比拒绝更坏。
 
@@ -1243,6 +1243,140 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `world.cpp` 快照创建与 gc 清快照(`<store>/snapshots/S<n>.wfs-tmp`,名字由行 id 决定)、
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
+
+#### PR #1 review 第三十五轮:库的名字就是 schema 的一部分、删不掉的临时名还是一条链接(2026-09-20)
+
+第三十五轮,Codex 一条 P1 一条 P2。P1 把前两轮那道门补完:**一个只拦得住「还没进门」和「已经站在
+屋里」的防线,漏掉的是「已经验过票、还没推门」的那个人**;P2 是同一种形状的另一头——**一个失败了
+没人读的清理,让下一次重试变成了第二条链接**。
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `PRRT_kwDOUf7jGc6kGzla` | `core/src/store.cpp` `wfs_store_open()`(~443) | 第三十二轮拦的是抬 `VERSION` **之后**才启动的 M1,第三十四轮拦的是**已经拿到描述符**的 M1。中间还有一种:读完 `VERSION` 拿到 2、被放行、**却还没跑到自己那句 `sqlite3_open_v2()`** 的进程。它手上什么都没开,`proc_listpidspath(3)` 看不见;它已经读过那唯一一个文件,抬文件也拒不到它。恢复执行之后,它打开的是刚刚被迁移过的库,把 `user_version` 戳回 2,然后跑 M1 的 collector | M1 之后不再读任何别的文件,所以能拒它的只剩**库本身**:schema 3 的库改名成 `<store>/metadata3.db`,M1 认的 `<store>/metadata.db` 变成一个**空目录(0500)**。实测(SQLite 3.54.0):对目录 `sqlite3_open_v2` 在 `READWRITE\|CREATE`、`READWRITE`、`READONLY` 三种模式下一律 `SQLITE_CANTOPEN`(14) | `7e978b7` |
+| P2 `PRRT_kwDOUf7jGc6kGzld` | `core/src/hardlinks.cpp` `relink_at()` / `relink_under_lend()`(~547) | 克隆出来的目录带着 `UF_APPEND` 时,`linkat` 出临时名**成功**(加东西正是这个标志允许的),`renameat` 被拒,收尾的 `unlinkat` 同样被拒**而且返回值被丢掉**;第十八轮那条「借目录写位重试」换一个新临时名重新 link + rename,**成功了**。没有任何一步报错,快照照常发布,正身 inode 上比组的成员数多一条链接 → `hardlinks_verify_groups()` 要求 `nlink` **正好**等于成员数,于是这个 `snapshot create` 回 0 的快照永远 `WFS_E_SNAPSHOT_DIRTY` | `relink_at()` 在 unlink 也失败时把临时名**交回调用者**;借到写位之后**第一件事**是 `unlinkat` 掉它,然后才重试。连借着写位都删不掉就是致命错(`first_err` → 整棵克隆回退),而不是发布出去 | `2f6939f` |
+
+##### 升级协议:五步,判据是磁盘布局而不是 `VERSION`(P1)
+
+```
+(a) VERSION := 3
+(b) 打开老库 -> PRAGMA journal_mode=DELETE -> 关 -> unlink 三个 sidecar -> rename(metadata.db -> metadata3.db)
+(c) mkdir(metadata.db, 0500)                    <- 空目录,M1 的 open 在这里 CANTOPEN
+(d) fs_other_holders(metadata3.db) ? 整体回滚 + WFS_E_STORE_BUSY : 迁移 + 盖 3xx
+```
+
+**(b) 里 sidecar 是必须先处理的**:`main` 的 M1 每次 open 都跑
+`PRAGMA journal_mode=WAL`(读过 `main:core/src/store.cpp` 的 `kPragmas` 和 `wfs_store_open()`),
+所以一个活着的 M1 store 一定带着 `metadata.db-wal` / `metadata.db-shm`,被打断在设 WAL 之前的还可能
+带一个回滚日志 `metadata.db-journal`。只 rename 库本身会把这三个留在一个**同名目录**旁边——一个
+数据库已经不在了的热日志,是这件事里唯一会丢数据的形状。所以先用本 core 的连接打开老库(这一次打开
+本身就让 SQLite 回放热日志),`PRAGMA journal_mode=DELETE` 把 WAL checkpoint 回主库并删掉
+`-wal`/`-shm`;pragma 的答案要**读**:别人占着 WAL 时 SQLite 是用一个「wal」的答案、而不是错误码
+告诉你没改成,不是 `delete` 就按 `WFS_E_STORE_BUSY` 拒,库还留在 M1 认得的名字上。关掉之后把三个
+sidecar 名字一并 unlink(内容已经都在主库里),**然后**才 rename。
+
+**(d) 问的是新名字,而它依然找得到旧名字上的持有者**——scratchpad 探针验过:
+
+```
+child 61627 opened old name: y
+holders(metadata.db) before rename: 1 61627
+holders(metadata3.db) AFTER rename: 1 61627      <- proc_listpidspath 比的是 vnode,不是名字
+holders(metadata.db) after rename: -1 (ENOENT)   <- 所以问题必须问新名字
+holders(metadata3.db) after stub dir: 1 61627
+holders(metadata3.db) with child gone: 0
+```
+
+回滚按相反次序:`rmdir` 空目录 → `rename` 回去 → `VERSION` 放回 2。任一步失败就停在原地,留下
+`VERSION` 3 压着一个 M1 两个名字都够不到的库——被 M1 拒、被下一次 M2 open 做完,和第三十二轮同一笔
+交易里安全的那一半。库旁边只要还有 `-wal`/`-shm`/`-journal` 就**不回滚**:一个留在 schema 3 名字上的
+WAL 配着一个在 schema 2 名字上的库,等于让 M1 读一个缺了整段已提交页的库,比任何一次拒绝都糟。
+
+**崩在任何一步都能接着做**,而且判据是布局:
+
+| `metadata.db` | `metadata3.db` | 是什么 | 这次 open 做什么 |
+|---|---|---|---|
+| 不在 | 不在 | 一个没有库的 store | 有树 → `WFS_E_STORE_DAMAGED`;没树 → 新建 |
+| 普通文件 | 不在 | schema 2,或者崩在 (b) 之前 | `VERSION` 是 2 就先 (a),然后 (b)(c)(d) |
+| 不在 | 在 | 崩在 (b) 和 (c) 之间 | `VERSION` 是 2 就先 (a),然后 (c)(d) |
+| 目录 | 在 | schema 3——或者崩在 (d) 之前 | `VERSION` 是 2 就先 (a),然后 (d) |
+| 目录 | 不在 | 空目录旁边没有库 | `WFS_E_STORE_DAMAGED`,绝不新建 |
+| 普通文件 | 在 | rename 是原子的,协议产生不出来 | `WFS_E_STORE_DAMAGED` |
+
+`VERSION` 不在表里,因为它不决定任何事:**布局决定**,文件只说 (a) 还欠不欠。唯一可能两读的方向是
+「`VERSION` 还是 2 而 `metadata3.db` 已经在」(一次没做完的回滚),**一律往前做**——库已经搬过去了,
+再搬回来是第二次无同步的 rename,而把文件抬到 3 才让 store 的两半重新一致。回滚方向只由**手里正握着
+这次升级**的那个进程走(`legacy_holders_gate()`),之后读这些名字的 open 一律不走。
+
+持有者闸门也只有欠着迁移的 store 付:`user_version` 还在 2xx、而且库在这次 open 开始前就已经在磁盘上,
+才问 `proc_listpidspath(3)` 那 ~106 ms;盖了 3xx 的 store 和这次 open 自己刚建的库都不问。
+
+##### M1 那边到底会发生什么(引 `main`)
+
+`main:core/src/store.cpp` 的 `wfs_store_open()`:
+
+```c++
+String dbp(s->dir);
+dbp.append("/metadata.db");
+int rc = sqlite3_open_v2(dbp.c_str(), &s->db,
+                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nullptr);
+if (rc != SQLITE_OK) { wfs_store_close(s); return -EIO; }
+```
+
+`SQLITE_OPEN_CREATE` 只创建**不存在**的库,它不会在一个目录旁边另起炉灶——路径上是目录,
+`sqlite3_open_v2` 直接 `SQLITE_CANTOPEN`,这里就 `-EIO` 返回,句柄不发。M1 的 `wfs_gc()` 是
+`wfs_store_open()` 成功之后才被 CLI 调用的(它的第一个参数就是那个 `wfs_store *`),所以 open
+失败等于 collector 根本没有机会跑;M1 也没有 P17 那种「有树没库」的守卫——它连 `store_has_trees()`
+都没有,`main` 的 open 里在 `sqlite3_open_v2` 之前只有 `check_version()` 和六个 `mkdir`。
+也就是说:这条路径上 M1 不会删任何东西,它只是打不开。
+
+##### 波及面
+
+`.world` 标记和 FSKit 扩展都是通过 core 读 store 的(`wfs_store_open()` / `wfs_world_marker_*`),
+库改名对它们不可见,本轮一行 FSKit 代码都没动。改到的是:`world fs status` 现在印
+`schema: 3 (store <id>), database metadata3.db`;`WFS_E_STORE_DAMAGED` 的文案和 CLI 的出路提示改成
+`metadata3.db`;`safety.sh` 里直接 `sqlite3` 戳库的 11 处、P17 那一段、`core_test`/`diff_test` 里
+同样的 13 处、`scripts/bench/m1_criteria.sh` 的库大小统计,全部跟着改名。
+
+##### 先跑红
+
+两条都用「把断言换成打印、跑在修改前的 core 上」的老办法(`scratchpad/red_f1.c`、`red_f2.c`,
+链接的是 `66524e8` 上编出来的 `libworldfs_core.a`):
+
+```
+##### F1 #####
+before: VERSION=2, metadata.db user_version=200
+M1-shaped sqlite3_open_v2("<store>/metadata.db", RW|CREATE) in the gap: rc=0 (not an error)
+user_version after M1's `PRAGMA user_version=2`: 2
+##### F2 #####
+snapshot create rc=0 sid=1
+snapshot d/a nlink=3 (want 2)
+leftover .wfs-hl-* under the snapshot's d/: 1 .wfs-hl-62455-0-0d6bc0539ff1e512
+verify rc=-1008 modified=2
+```
+
+修完之后同一个探针:F1 那一句 open 在同一个窗口里是 `rc=14 (unable to open database file)`、
+什么都没戳到;F2 是 `verify rc=0`、`nlink=2`、`leftover 0`。
+
+新增测试:
+
+- `core_test` 版本那一段新增一个新缝 `wfs_test_after_db_move`(`worldfs.h`,非测试运行里恒为 NULL),
+  它正好在 (c) 之后 (d') 之前(库已搬、空目录已建、持有者闸门已过、还没迁移)开火;缝里做的就是
+  M1 的那句 open(`READWRITE|CREATE|FULLMUTEX`)加 `PRAGMA user_version=2`,断言它回
+  `SQLITE_CANTOPEN`、什么都没戳到,而这次 open 本身照常成功、第二次 open 也照常成功。
+- 布局断言:升级完之后 `metadata.db` 是一个 0500 的空目录、`metadata3.db` 是一个非空普通文件、
+  `metadata.db-` 前缀的 sidecar 一个不剩。
+- 崩溃态逐个走一遍:上表的六行,加上「`VERSION` 2 + `metadata3.db` 在」(往前做)和
+  「`VERSION` 2 + 库已经是 3xx」(老次序留下的那种)。
+- 第三十四轮那个子进程持有者的用例扩展成**整体回滚**的断言:`VERSION` 回到 2、库是**普通文件**
+  回到 `metadata.db`、没有空目录挡路、没有 `metadata3.db`、一个增量列都没加;
+  `wfs_store_holders()` 照样报得出那个 pid(它现在先问 `metadata3.db`、没有再问 `metadata.db`)。
+- P17 那一段跟着改:空目录 + 没有 `metadata3.db` → `WFS_E_STORE_DAMAGED` 且什么都不建;
+  把空目录也删掉之后才是第十三轮那个「`snapshots/` 读不出来 → 原样返回 errno」的形状。
+- `core_test` 新的 `flag-dir-uappnd` 一段(F2):源树里一个带 `UF_APPEND` 的目录 `d/` 装着一对
+  硬链接 `(a, b)` → `snapshot create` 成功、`verify` 干净、快照里 `d/a` 的 nlink **正好 2**、
+  `d/` 下没有 `.wfs-hl-*`;从它 fork 出来的世界同样把这一对重建出来、也没有残骸。收尾把标志清掉。
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **298 passed, 0 failed**;`check-deps.sh`
+全绿(5 个系统库)。(`m1_criteria.sh` 本轮跳过,只跟着改了库名。)
 
 #### PR #1 review 第三十四轮:没开起来的事务、已经在屋里的人、按字节读的路径(2026-09-20)
 
