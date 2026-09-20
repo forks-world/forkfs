@@ -1244,6 +1244,112 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第三十二轮:先关门,再搬家具;查询失败不是查询没结果(2026-09-20)
+
+第三十二轮,Codex 一条 P1 一条 P2。P1 打在第二十四轮那次 schema 2 → 3 的**次序**上:门关得太晚。
+P2 打在一件比它更底层的事上——这个 core 从第一天起就把「`row()` 返回 false」读成「行走完了」,
+而 SQLite 从来没答应过这件事。
+
+##### P1:`VERSION` 抬到 3 必须发生在数据库迁移**之前**
+
+第二十四轮的结论是对的:M2 改变了 collector 可以删什么,所以必须抬 schema 大版本,让 `main` 上的
+M1 二进制**打不开**这个 store。但那一轮的实现是
+
+```
+check_version()(文件说 2 → legacy)→ 数据库迁移(事务,提交时盖 user_version 3xx)→ VERSION := 3
+```
+
+M1 只认那个文件。于是**提交之后、rename 之前**这一小段里起来的 M1 进程,读到 2,被放进来,然后:
+
+```c
+// main:core/src/store.cpp,WFS_STORE_SCHEMA == 2
+if (user_version != WFS_STORE_SCHEMA) {
+    ...kSchema...;
+    sqlite3_exec(s->db, "PRAGMA user_version=2", ...);
+}
+```
+
+它把 3xx **戳回 2**,而且它拿到的句柄在文件变成 3 之后照样有效——接着就是 M1 的 `wfs_gc()` 跑在
+M2 的 trash 语义上:`state=2` 的快照行的树不在它保护的名单里,一个还在保留期里的快照被整棵删掉。
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `PRRT_kwDOUf7jGc6kGMj-` | `core/src/store.cpp` `wfs_store_open()`(~675) | 升级的两半次序反了:**先迁移、后抬文件**,中间留出一个「库已经是 M2、文件还说是 M1」的窗口,M1 在这个窗口里起来就被放进来,而且会把 `user_version` 戳回 2 | ①**文件先抬**:`version_upgrade()` 挪到第二十四轮那条「百位比我们新就拒」的检查**之后**、写数据库的任何一步**之前**(连 `journal_mode` 都还没设),rename 一落地,M1 的 `check_version()` 就开始拒绝这个 store;②新的中间态「文件 3 + 库 2xx」被认成**升级做了一半**:百位检查只拒**比我们新**的,2xx 在 3 底下照常走迁移(第十一轮起按列在不在幂等),于是「抬完文件、还没提交迁移」的崩溃由下一次 M2 open 收尾;③迁移之后**再读一遍**文件并要求它是 3;④老次序崩出来的「文件 2 + 库 3xx」也一并救回来——抬文件这一步现在不看库戳,照抬 | `25a231e` |
+
+**两种崩法换了位置**,这是这次改动的全部内容:老次序崩完留下「文件 2 + 库 3xx」——每一个 M1
+二进制都打得开,而且没有任何 M2 代码看得出它和一个真正的 M1 store 有什么区别;新次序崩完留下
+「文件 3 + 库 2xx」——M1 一律被拒,M2 接着做完。迁移**失败**的 store 现在也停在「文件 3」上:代价是
+M1 从此打不开一个它本来还处理得了的 schema 2 store,而这是这笔交易里安全的那一半。
+
+**边界,说清楚**:这条防线只挡「启动」,挡不住「已经在跑」。M1 全程不持有任何 store 级的锁
+(`gc.lock` 是 M2 才加的;M1 只有 `pool.lock`、per-world 的 `W<n>.lock` 和快照 manifest 上那把),
+所以**没有任何锁可以拿来等一个在飞的 M1 命令**,也没有任何文件能挡住一个在第一次 M2 open **之前**
+就拿到句柄的 M1 进程。换新二进制之前,先把老二进制全停掉——这句话现在写在 M1_DESIGN.md P13 里。
+
+**并发的两个 M2 首次 open**:两个都抬文件(私有临时名 + 幂等 rename,第三十一轮),两个都跑迁移
+(`BEGIN IMMEDIATE` 序列化,后进来的那个发现列全在),谁也不多做什么——这一轮没有改变这件事。
+
+##### P2:`row()` 的 false 里混着「读失败」
+
+`Stmt::row()` 是 `sqlite3_step(s) == SQLITE_ROW`。prepare 成功之后,step 照样会失败:SQLITE_IOERR
+(数据库文件本身的 I/O 错)、熬过 busy timeout 的 SQLITE_BUSY、SQLITE_NOMEM、SQLITE_CORRUPT——
+这些和 SQLITE_DONE 一样,都是 false。于是 `while (q.row())` 出来的是一个**少数了几行**的计数,
+`if (!q.row())` 出来的是一句**「没有任何行认领它」**,而这两句正好是这个 core 里每一个**破坏性**
+步骤的前提:快照的引用计数、「还有行认领这个 trash 路径吗」、「这个 pool 条目还该死吗」。
+一次 EIO 落在对的地方,gc 就会删掉活着的世界正在用的基线。
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P2 `PRRT_kwDOUf7jGc6kGMkB` | `core/src/world.cpp` `snapshot_refs_locked()`(~2531)以及所有「拿查询结果决定要不要删」的地方 | `row()` 把 step 期的错误报成「没有更多行」,判决因此可以凭一次读失败成立 | `Stmt` 记住最后一次 step 的结果:`row()` 对只要行的调用者一字不变,新增 `done()`(上一次 step 是 SQLITE_DONE)和 `err()`。然后**全仓审计 66 处**(`world.cpp` 36、`pool.cpp` 16、`store.cpp` 14;`diff.cpp` 一处 `Stmt` 都没有),统一成三个可 grep 的写法:决定什么的循环之后 `if (!q.done()) return -EIO;`;单行查找 `return q.done() ? -ENOENT : -EIO;`;答 bool 的帮手,失败倒向**什么也不删**的那一边 | `4177393` |
+
+改到的几处要紧的:`snapshot_refs_locked()`(discard 的引用计数,少一行就是「没人用」);
+`trashing_recover()` 的两个 select 和它里面那次引用计数(失败过去读成「没人要这个基线」,于是把
+discard **做完**——活着的世界的基线留在 trash 里等收);`claim_trash_paths()`(改成返回 int:少几行
+就等于凭空造出一个孤儿,而孤儿是**立刻删**的);`trash_path_claimed_locked()` / `pool_path_claimed_locked()`
+(失败现在答 true——「说不准」永远不等于「删掉」);`pool_scan()` 里那次快照查找(失败过去把一个
+快照活得好好的 pool 条目判成 doomed)和 `pool_row_still_doomed_locked()` 里对称的那次(失败过去答
+`true` = 删);`has_column()`(改成 `int`:1/0/负——读不到 schema 不等于列不在,否则迁移会去跑一条
+注定重复的 ALTER,或者把一个迁好的 store 判成没迁);`wfs_store_open()` 里读 `PRAGMA user_version`
+那一次(读不出来不再当 0,按第十三轮的规矩给 `WFS_E_STORE_DAMAGED`);`wfs_world_next_id()`
+(读不出来不再答 1 —— 那是一个 store 已经发过的 id);`gc_fail_bump()` / `gc_fail_get()`
+(读不出来不再当「一次都没失败过」,否则 collector 会在同一棵树上打转)。另外 8 处**本来就**倒向
+安全一侧(`snap_tmp_named_by_row()`、`trash_row_still_ours()`、`gc_tmp_is_removable()` 的两次查询、
+`gc_dirs_unreadable_pending()`、`gc_fail_clear()` 的读、`pool_row_still_doomed_locked()` 的行重读、
+`wfs_gc_pending()` 对 `trash_scan` 失败答「没有待办」),这次把这件事写进注释,让审计结果可复查。
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **298 passed, 0 failed**;`check-deps.sh`
+全绿。(`m1_criteria.sh` 本轮跳过。)
+
+**先跑红**。P1(新缝 `wfs_test_after_version_bump`,在抬文件和迁移之间触发,从里面同时读文件和
+库戳):老次序下把缝放在数据库提交之后,读出来是
+
+```
+[seam] VERSION=2 user_version=304
+```
+
+——库已经是 M2 的了,而 M1 的那道门还开着。修完之后同一个缝读出 `VERSION=3`、`user_version` 百位是 2。
+
+P2(新缝 `wfs_test_stmt_fail_sql`:下一条 SQL 里含这个子串的语句,`row()` 报一次 SQLITE_IOERR;
+库里恒为 NULL)。把 `world.cpp` 退回修前:
+
+```
+[a] discard rc=0 snapshot state=2 (TRASHED) tree at home=0      ← 还有一个 ACTIVE 世界是从它 fork 的
+[b] after the recovery: snapshot state=2 (TRASHED) tree in trash=1 at home=0
+[c] gc with the claim lookup failing: trash_orphans=1 orphan still there=0
+```
+
+新增测试(`core_test`):
+
+- 第二十四轮那段 schema3-store 里新增 (d):抬文件和迁移之间的窗口里 `VERSION` 读 3、`user_version`
+  百位读 2;再加两种崩溃形态——「文件 3 + 库 2xx」下一次 open 迁完,「文件 2 + 库 3xx」(老次序留下的)
+  下一次 open 把门关上。
+- 独立的一段 step-store:(a) 一个 ACTIVE 世界指着的快照,引用计数那条 SQL 的 step 失败一次 →
+  `discard` 返回 `-EIO`、快照**还是 ACTIVE**、树还在原处;缝一撤,它按 `WFS_E_SNAPSHOT_IN_USE` 拒。
+  (b) 用 `wfs_test_trash_crash` 造一个「rename 之后被打死」的 TRASHING 快照,再把一个 world 行改回
+  ACTIVE 指着它,带缝重开 store:recovery 的引用计数失败 → 行**留在 TRASHING**,树留在 trash;
+  缝撤掉再开一次,基线被搬回家、行回 ACTIVE。(c) `<store>/trash` 里一个没有行认领的目录 +
+  认领查询失败一次 → `gc` 报 `trash_orphans == 0`、目录**还在**;缝撤掉再跑,它照常被收走。
+
 #### PR #1 review 第三十一轮:升级 VERSION 的临时文件不能是共用的(2026-09-20)
 
 第三十一轮,Codex 一条 P2,打在第二十四轮那次 schema 2 → 3 的**收尾动作**上。那一轮把
