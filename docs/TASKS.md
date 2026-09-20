@@ -1244,6 +1244,70 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第三十三轮:帮手的错误就是调用者的错误(2026-09-20)
+
+第三十三轮,Codex 两条 P2,形状一模一样:**一个返回 int 的帮手失败了,调用者把它的返回值扔掉,
+然后报成功**。上一轮(第三十二轮)教会了这些帮手「读失败」和「没有行」不是一回事;这一轮管的是
+它们把失败讲出来之后,**没有人听**。
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P2 `PRRT_kwDOUf7jGc6kGYCC` | `core/src/store.cpp` `wfs_store_open()`(~754) | `trashing_recover(s, nullptr, nullptr)` 的返回值被丢掉:recovery 的查询失败(I/O、损坏、熬过 busy timeout 的 BUSY)时,TRASHING 行原封不动留着,而 open **报成功**——正好违背它自己那句「这件事必须在这个进程读任何状态、给 trash 分类之前完成」 | 查 rc:非 0 就 `wfs_store_close(s)` 并把 errno 还回去(CLI 打印 errno / `WFS_E_STORE_DAMAGED`,用户重跑一次)。`wfs_gc_ex()` 开头那次同样的调用一并改掉——collector 更不能在一个它没能整理好的 store 上做分类 | `f215b77` |
+| P2 `PRRT_kwDOUf7jGc6kGYCF` | `core/src/world.cpp` `wfs_gc_status()`(~4162) | `pool_stranded(...)` 的返回值被丢掉:pool 的分类查询失败时,报表里 `pool_stranded` 是 **0**——「<store>/pool 底下没有陈旧条目」,而真相是「没问出来」 | 传播。`gc --status` 是诊断命令,一句错的「干净」比一个能照着做的错误更糟,而且这里没有「局部」可以抢救:失败的是分类本身,不是四个目录里的一个 | `231f5d0` |
+
+##### `SQLITE_BUSY` 要不要重试(Codex 在 P2 里专门问了)
+
+**不要,busy timeout 已经把它盖住了**。`wfs_store_open()` 在 `sqlite3_open_v2` 之后、读任何东西
+之前就 `sqlite3_busy_timeout(s->db, 10000)`,这个超时对 `trashing_recover()` 的两次 SELECT 和它
+写回时那次 `BEGIN IMMEDIATE` **一样有效**(P12:写锁在 BEGIN 就拿,所以两个 `world` 进程是排队,
+不是半路 BUSY)。熬过 10 秒争用的东西已经不是「瞬时」了,在它上面再套一个重试循环,等于在 SQLite
+自己那个超时之上再加一个超时。另外 `trashing_recover()` 本身也不会返回 `-EBUSY`:它按第三十二轮的
+写法一律答 `-EIO`,真正的 BUSY 是被 timeout 吃掉之后才会走到那里。而 store open 是这个 core 里
+最便宜的可重复动作——失败就是让用户再敲一次命令。
+
+##### 同形状的全路径审计(open / gc / gc --status / gc --pending / CLI)
+
+| 位置 | 原来 | 现在 |
+|---|---|---|
+| `wfs_store_open()` → `trashing_recover()` | 丢 rc,报成功 | **传播**(P2 本体) |
+| `wfs_gc_ex()` → `trashing_recover()` | 丢 rc,接着分类 | **传播**:读不出 TRASHING 行,它的树在下面那趟孤儿扫描里就是「没有行认领」,而无主孤儿是**立刻删**的 |
+| `wfs_gc_status()` → `pool_stranded()` | 丢 rc,报 0 | **传播**(P2 本体) |
+| `wfs_gc_status()` → `fs_free_space()` | 丢 rc,`volume: 0 B free` | **传播**(`wfs_store_status()` 里同一个调用从第一天起就是传播的) |
+| `wfs_gc_ex()` → `rm_tmp_in_store_dir()` | 丢 rc | **传播**:它只在「这不是我扫的那个目录」时返回非 0,而一次什么都没扫的 run 不该报一个它没看过的干净 store |
+| `wfs_gc_ex()` → `pool_collect()` | 丢 rc,报 `pool_removed 0` | **传播**:分类是它做的第一件事、也是唯一会失败的一件事,所以非 0 == 一根指头都没动 |
+| `wfs_gc_ex()` → `--no-trash` 分支的 `trash_scan()` | `if (... == 0) {...}`,没有 else:失败时 rc 被丢掉且 `work_remains` **不置位** | **传播**:不置 `work_remains` 正好是唯一能让 worker 链不再回来的事 |
+| `wfs_gc_pending()` → `trash_scan()` | 失败答 **0**(「没有待办」) | 失败答 **1**。这个函数是 bool,没有错误通道,所以按第三十二轮那条规矩倒向**什么都不丢**的一边:起一个 collector,让它把 errno 报出来;答 0 则是把扫不到的活彻底埋掉(第三轮那个 bug,只是这次从 EIO 走过来)。不是空转:这句话只在一个刚刚成功读过同一个库的命令之后才问 |
+| CLI `cmd_gc()` 的「第二意见」`wfs_gc_status`(unread 那条 note) | 丢 rc,`strerror(0)` 打出 `Undefined error: 0` | 看 rc:读不回来就说「读不回来」,不编一个理由出来 |
+| CLI `cmd_gc()` 另两处第二意见(blocked / foreign 的路径) | 丢 rc | **有意不看**:结构体先 memset,用到的只有一个路径字段,失败自然落到「没有路径」那句措辞上——这里没有可以报错的东西。注释写清楚 |
+| CLI `cmd_status()` → `wfs_gc_status(-1)` | `== 0 && (...)`:失败时**整行不打**,读起来正好是「trash 空的、没有 worker」 | **标成局部**:`trash:     not counted: <errno>`。`status` 是这一圈里唯一值得局部打印的报表(上面每一行都已经成功读出来了),所以失败是**说出来**,不是传播,也不是沉默 |
+| CLI `cmd_gc()` → `wfs_gc_pending(s, retention, &running)` | 返回值不用,只要出参 | 不变:要的是 `running`,返回值本来就不是这里的答案 |
+| `wfs_gc_status()` / `wfs_gc_pending()` → `gc_worker_probe()` | 返回 bool | 不变:它是对锁文件的探测,不是 errno 通道 |
+| `wfs_store_open()` 的其余帮手(`store_has_trees` / `check_version` / `version_upgrade` / `migrate_schema` / `version_read` / `meta_get` / `meta_set`) | — | 第十一/十三/二十四轮已经全部传播,本轮逐个确认过 |
+| `gc_dirs_unreadable_pending()` | 读失败答 `false` | 不变,第三十二轮就是这么定的:「说不准」永远不唤醒 worker 链,而它答 true 会让每一次 fork 都起一个进程 |
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **298 passed, 0 failed**;`check-deps.sh`
+全绿。(`m1_criteria.sh` 本轮跳过。)
+
+**先跑红**(同一个 `wfs_test_stmt_fail_sql` 缝,把断言换成打印,跑在修改前的 core 上):
+
+```
+[a] wfs_store_open rc=0 handle=yes world state=4 (4 = TRASHING) seam=fired
+[b] wfs_gc_status rc=0 pool_stranded=0 seam=fired
+[b] unarmed         rc=0 pool_stranded=1
+```
+
+——(a) open 报成功、句柄照发,而那条 TRASHING 行一动没动;(b) 报表把「问不出来」报成了「没有」,
+而同一个 store 问得出来的时候是 1。
+
+新增测试(`core_test`,新的 `rc-store` 一段):
+
+- (a) 一个 owner 已死、树还在原处的 TRASHING 世界行 + recovery 的 `FROM worlds WHERE state=4`
+  失败一次 → `wfs_store_open` 返回 `-EIO`、`*out` **没被写**、行还是 `state=4`;缝一撤,下一次
+  open 把它放回 ACTIVE,树还在它从没离开过的路径上。
+- (b) 一个快照已经不存在的 pool 行(树还在)+ `pool_scan` 的 `FROM pool ORDER BY id` 失败一次
+  → `wfs_gc_status` 返回 `-EIO`(而不是 0 带一个 `pool_stranded == 0`);缝一撤,同一个调用数到
+  那条陈旧条目。
+
 #### PR #1 review 第三十二轮:先关门,再搬家具;查询失败不是查询没结果(2026-09-20)
 
 第三十二轮,Codex 一条 P1 一条 P2。P1 打在第二十四轮那次 schema 2 → 3 的**次序**上:门关得太晚。
