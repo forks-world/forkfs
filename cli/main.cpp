@@ -1448,7 +1448,10 @@ static int cmd_status(wfs_store *s) {
     fmt_bytes(freeb, sizeof freeb, st.volume_free_bytes);
     fmt_bytes(totalb, sizeof totalb, st.volume_total_bytes);
     fmt_bytes(meta, sizeof meta, st.metadata_estimate_bytes);
-    printf("store:     %s\nschema:    %d (store %s)\n"
+    // PR #1 review (35th round, P1): the database's name is part of the schema, so `status`
+    // says it. A schema-3 store keeps it at `metadata3.db`; `metadata.db` is the empty stub
+    // directory that makes an M1 binary's own open fail rather than let it at this store.
+    printf("store:     %s\nschema:    %d (store %s), database metadata3.db\n"
            "snapshots: %llu (%llu entries), %llu trashed\n"
            "worlds:    %llu active, %llu trashed, %llu dead (%llu entries)\n"
            "pool:      %llu ready (%llu entries)\n"
@@ -1909,11 +1912,12 @@ int main(int argc, char **argv) {
         return refuse(why, "use a matching `world` build, or point --store at a new directory");
     }
     // P13, and PR #1 review (34th round, P1): this store is still schema 2 and somebody else
-    // has its metadata.db open. They were admitted before the VERSION file was bumped, so the
+    // has its database open. They were admitted before the VERSION file was bumped, so the
     // file cannot lock them out any more -- and if any of them is an M1 build, its collector
     // treats M2 trash as orphans and deletes snapshots that are still inside their retention
-    // window. The core put VERSION back to 2 and touched nothing; all that is left to do here
-    // is say who to stop.
+    // window. The core put the whole upgrade back -- the database to `metadata.db`, VERSION to
+    // 2 (35th round) -- and touched nothing else; all that is left to do here is say who to
+    // stop.
     if (rc == WFS_E_STORE_BUSY) {
         wfs_store_holder hs[8];
         size_t n = 0;
@@ -1950,7 +1954,7 @@ int main(int argc, char **argv) {
         char why[WFS_PATH_MAX + 256];
         snprintf(why, sizeof why,
                  "the store at %s still holds trees (snapshots/, trash/ or pool/) but its "
-                 "metadata.db is missing or unreadable.\n"
+                 "metadata3.db is missing or unreadable.\n"
                  "  Those trees are what the database was the index of: ids would restart at 1 "
                  "and collide with the snapshots/S<n> already on disk, so nothing will be "
                  "created here.\n"
@@ -1958,7 +1962,7 @@ int main(int argc, char **argv) {
                  "is orphaned.",
                  sd);
         return refuse(why,
-                      "restore metadata.db from a backup, or move the directory aside "
+                      "restore metadata3.db from a backup, or move the directory aside "
                       "(`mv <store> <store>.damaged`) and start a new store");
     }
     // P17, and PR #1 review (13th round): the guard above needs three readdirs to know whether
@@ -1971,7 +1975,7 @@ int main(int argc, char **argv) {
         if (rc == -EACCES || rc == -EPERM || rc == -EIO || rc == -ENOTDIR)
             fprintf(stderr,
                     "  nothing was created: a store that cannot be read is not an empty store "
-                    "(P17), so no metadata.db and no store id were made here.\n"
+                    "(P17), so no metadata3.db and no store id were made here.\n"
                     "  try: fix the permissions on %s (or mount the volume it is on) and run the "
                     "command again\n",
                     sd);

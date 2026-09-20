@@ -120,7 +120,7 @@ enum {
     WFS_E_GC_BUSY = -1015,        /* T2.1: another gc worker holds <store>/locks/gc.lock */
     WFS_E_STORE_UNREACHABLE = -1016, /* T2.3: this store cannot be opened from where we are */
     /* P17: the store directory still holds snapshot trees (or a trash, or a pool) but its
-     * metadata.db is missing or unreadable. Opening such a store would create an empty
+     * metadata3.db is missing or unreadable. Opening such a store would create an empty
      * database beside the orphans and hand out id 1 again, which the first `init` would then
      * try to write to the `snapshots/S1` that is already there. Refused instead: the database
      * has to come back from a backup, or the directory has to be moved aside. */
@@ -147,21 +147,23 @@ enum {
     WFS_E_TRASH_FOREIGN = -1019,
 
     /* P13, T2.6 (PR #1 review, 34th round): this store is being taken over from schema 2 to
-     * schema 3 and another process still has its metadata.db open. That process was admitted
+     * schema 3 and another process still has its database open. That process was admitted
      * before the VERSION file was bumped, so the file cannot lock it out any more, and an M1
      * binary among them would run M1's collector over M2 trash semantics. The upgrade is put
-     * back (VERSION returns to 2) and refused; wfs_store_holders() names who to stop. */
+     * back (the database returns to `metadata.db`, VERSION to 2) and refused;
+     * wfs_store_holders() names who to stop. */
     WFS_E_STORE_BUSY = -1020
 };
 
-/* One process, other than this one, that has a store's metadata.db open (PR #1 review, 34th
+/* One process, other than this one, that has a store's database open (PR #1 review, 34th
  * round). `exe` is that process's executable path, or "" when the kernel will not say. */
 typedef struct wfs_store_holder {
     int64_t pid;
     char exe[WFS_PATH_MAX];
 } wfs_store_holder;
 
-/* Who else has `store_dir`/metadata.db open right now, this process excluded. Fills up to `cap`
+/* Who else has this store's database open right now, this process excluded -- `metadata3.db`
+ * when it is there, `metadata.db` otherwise (PR #1 review, 35th round). Fills up to `cap`
  * entries and always writes the total through `count` (which may exceed `cap`). Returns 0, or a
  * negative errno; -ENOSYS on a platform that cannot answer the question. Intended for the one
  * caller that has just been refused with WFS_E_STORE_BUSY and has to say what to stop -- the
@@ -211,7 +213,9 @@ typedef struct wfs_statfs_info {
 
 /* ---- store ---- */
 
-/* Opens (creating if needed) a store directory: VERSION, metadata.db, snapshots/, trash/. */
+/* Opens (creating if needed) a store directory: VERSION, metadata3.db, snapshots/, trash/.
+ * `metadata.db` is an empty directory in a schema-3 store: the name schema 2 kept the database
+ * under, left as something no sqlite3_open_v2() can open (PR #1 review, 35th round). */
 int wfs_store_open(const char *store_dir, wfs_store **out);
 void wfs_store_close(wfs_store *s);
 /* ~/Library/Application Support/World/fs (macOS) or $XDG_DATA_HOME/world/fs. */
@@ -1080,6 +1084,14 @@ extern void *wfs_test_before_version_rename_ctx;
  * library ever assigns it. */
 extern void (*wfs_test_after_version_bump)(void *ctx, const char *dir);
 extern void *wfs_test_after_version_bump_ctx;
+
+/* And the gap the 35th round's P1 is about: the database has been moved to `metadata3.db`, the
+ * stub directory is at `metadata.db`, the holder gate has passed, and nothing has been migrated
+ * yet. This is the window an M1 process that paused before its own sqlite3_open_v2() would
+ * resume into; from inside it, that open has to fail. Called with the store directory. NULL
+ * unless a test sets it; nothing in the library ever assigns it. */
+extern void (*wfs_test_after_db_move)(void *ctx, const char *dir);
+extern void *wfs_test_after_db_move_ctx;
 
 /* One step(2) of one query, failed on demand (PR #1 review, 32nd round, P2). Every count and
  * every lookup that decides a destructive step now tells SQLITE_DONE from an error, and the only

@@ -277,7 +277,7 @@ static int db_user_version(const char *path) {
 // that a drain which could not remove a tree left it in a state no claim can match.
 static int db_pool_state(const char *store_dir) {
     char dbp[4096];
-    snprintf(dbp, sizeof dbp, "%s/metadata.db", store_dir);
+    snprintf(dbp, sizeof dbp, "%s/metadata3.db", store_dir);
     sqlite3 *db = NULL;
     CHECK(sqlite3_open_v2(dbp, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
     sqlite3_stmt *st = NULL;
@@ -370,6 +370,27 @@ static void make_v2_db(const char *path, int snapshots_as_view) {
              snapshots_as_view ? "CREATE VIEW snapshots AS SELECT * FROM snapshots_real;" : "",
              WFS_STORE_SCHEMA_M1 * 100);
     db_exec(path, sql);
+}
+
+// PR #1 review (35th round, P1): the two shapes a store's database can be in. A schema-3 store
+// keeps it at `metadata3.db` and leaves an empty directory at `metadata.db`; a schema-2 store --
+// an M1 store -- keeps it at `metadata.db` and has no `metadata3.db` at all. This puts a store
+// back into the second shape whatever the case before it left behind, so every case below starts
+// from an M1 store and from nothing else.
+static void store_as_m1(const char *dir, int snapshots_as_view) {
+    char p[4096];
+    static const char *gone[] = {"metadata3.db", "metadata3.db-wal", "metadata3.db-shm",
+                                 "metadata3.db-journal"};
+    for (size_t i = 0; i < sizeof gone / sizeof gone[0]; ++i) {
+        join(p, sizeof p, dir, gone[i]);
+        unlink(p);
+    }
+    join(p, sizeof p, dir, "metadata.db");
+    rmdir(p);                              // the stub, if the last case left one
+    join(p, sizeof p, dir, "VERSION");
+    write_file(p, "2\n");
+    join(p, sizeof p, dir, "metadata.db");
+    make_v2_db(p, snapshots_as_view);      // unlinks the file and its own sidecars first
 }
 
 // The 13 columns the migrations add. PR #1 review (24th round): hoisted out of the 11th-round
@@ -957,10 +978,41 @@ static void vbump_after_version_bump(void *ctx, const char *dir) {
     (void)ctx;
     char vp[4096], dbp[4096], buf[64];
     join(vp, sizeof vp, dir, "VERSION");
+    // PR #1 review (35th round): the OLD name on purpose. This seam fires after the VERSION
+    // bump and before the move, which is exactly where the database still is.
     join(dbp, sizeof dbp, dir, "metadata.db");
     g_bump_ran++;
     g_bump_file = read_file(vp, buf, sizeof buf) == 0 ? atoi(buf) : -1;
     g_bump_uv = db_user_version(dbp);
+}
+
+// PR #1 review (35th round, P1): an M1 binary's own open, run in the window between the
+// database's move and its migration. This is the process the finding is about: one that read
+// VERSION as 2, was admitted, and only now reaches its sqlite3_open_v2() -- it holds no
+// descriptor for the holder gate to find and it has already read the only file it checks, so
+// the one thing left that can refuse it is the database not being where it looks.
+static int g_gap_ran;
+static int g_gap_open_rc;
+static int g_gap_uv;
+static void gap_m1_open(void *ctx, const char *dir) {
+    (void)ctx;
+    char dbp[4096];
+    join(dbp, sizeof dbp, dir, "metadata.db");
+    g_gap_ran++;
+    sqlite3 *h = NULL;
+    // `main`'s M1 core, exactly: SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_FULLMUTEX.
+    g_gap_open_rc = sqlite3_open_v2(
+        dbp, &h, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
+    if (g_gap_open_rc == SQLITE_OK) {
+        // ... and the first thing M1 does with the handle: stamp the schema back down to 2.
+        sqlite3_exec(h, "PRAGMA user_version=2", NULL, NULL, NULL);
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(h, "PRAGMA user_version", -1, &st, NULL) == SQLITE_OK &&
+            sqlite3_step(st) == SQLITE_ROW)
+            g_gap_uv = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    if (h) sqlite3_close(h);
 }
 
 // PR #1 review (26th round, P1): the user's own `mv`, run in the one window no transaction of
@@ -2446,7 +2498,7 @@ int main() {
         CHECK_OK(wfs_world_info(pst, g_publish_world, &pwr));
         CHECK(pwr.state == WFS_ST_CREATING);
         char tmp_path[4096], sql[512];
-        join(pdb, sizeof pdb, pstore, "metadata.db");
+        join(pdb, sizeof pdb, pstore, "metadata3.db");
         snprintf(sql, sizeof sql, "SELECT tmp_path FROM worlds WHERE id=%llu",
                  (unsigned long long)g_publish_world);
         CHECK(db_query_text(pdb, sql, tmp_path, sizeof tmp_path) == 1);
@@ -2525,9 +2577,14 @@ int main() {
     CHECK(bad == NULL);
 
     // ---- P17: trees in the store, no database -> refuse, never rebuild ----
-    // A store whose metadata.db is gone still has its snapshot trees, and those trees are what
+    // A store whose database is gone still has its snapshot trees, and those trees are what
     // the database was the index of. Making a fresh one would hand out id 1 again and the next
     // `init` would write S1 over the `snapshots/S1` that is still there, so the open is refused.
+    //
+    // PR #1 review (35th round, P1): "the database" is `metadata3.db` now, and `metadata.db` is
+    // the empty stub directory a schema-3 store carries. "Missing" therefore means neither a
+    // readable `metadata3.db` nor a readable regular `metadata.db` to upgrade -- and a stub
+    // with no database beside it is damage on its own, whatever is in the store.
     {
         char dstore[4096], dsrc[4096], dp[4096];
         join(dstore, sizeof dstore, root, "damaged-store");
@@ -2546,7 +2603,7 @@ int main() {
 
         // The snapshot root keeps its gate (0000) through all of this: finding the tree is a
         // readdir of snapshots/, which never has to step inside it.
-        static const char *dbfiles[] = {"/metadata.db", "/metadata.db-wal", "/metadata.db-shm"};
+        static const char *dbfiles[] = {"/metadata3.db", "/metadata3.db-wal", "/metadata3.db-shm"};
         for (size_t i = 0; i < sizeof dbfiles / sizeof dbfiles[0]; ++i) {
             char q2[4096];
             snprintf(q2, sizeof q2, "%s%s", dstore, dbfiles[i]);
@@ -2557,7 +2614,7 @@ int main() {
         CHECK(d == NULL);
         // ... and it did not quietly leave a new one behind.
         char dbp[4096];
-        join(dbp, sizeof dbp, dstore, "metadata.db");
+        join(dbp, sizeof dbp, dstore, "metadata3.db");
         CHECK(!exists(dbp));
         // The same verdict for a database that is there but is not one.
         write_file(dbp, "this is not a database\n");
@@ -2579,6 +2636,13 @@ int main() {
         // every later open found that database and never ran the guard again. Only ENOENT means
         // "no such subtree" now; anything else fails the open with that errno.
         CHECK(unlink(dbp) == 0);
+        // ... and the stub with it, so that what is left is a store whose database has vanished
+        // altogether -- which is the shape the 13th round's question has to be asked of. (With
+        // the stub still there the verdict is WFS_E_STORE_DAMAGED before any readdir happens,
+        // which the case above is the assertion for.)
+        char dstub[4096];
+        join(dstub, sizeof dstub, dstore, "metadata.db");
+        CHECK(rmdir(dstub) == 0);
         char dsnaps[4096];
         join(dsnaps, sizeof dsnaps, dstore, "snapshots");
         CHECK(chmod(dsnaps, 0000) == 0);
@@ -5599,20 +5663,20 @@ int main() {
     // migrations run at all, so no later open ever retried: every prepare naming that column
     // failed from then on, for ever.
     {
-        char mstore[4096], mdb[4096];
+        char mstore[4096], mdb[4096], mdb1[4096];
         join(mstore, sizeof mstore, root, "migrate-store");
         CHECK(mkdir(mstore, 0755) == 0);
-        join(p, sizeof p, mstore, "VERSION");
-        // M1's schema number. The migrations below are additive and do not move it; the 24th
-        // round did, so the first open of this store also rewrites this file to 3.
-        write_file(p, "2\n");
-        join(mdb, sizeof mdb, mstore, "metadata.db");
+        // PR #1 review (35th round, P1): `mdb1` is where an M1 store keeps its database and
+        // `mdb` is where this core's is, once the upgrade has moved it. The fixture is written
+        // to the first and every question about the result is asked of the second.
+        join(mdb1, sizeof mdb1, mstore, "metadata.db");
+        join(mdb, sizeof mdb, mstore, "metadata3.db");
 
         // (1) the ordinary case: a v2 store that has never seen the added columns is migrated
         //     on open, and only then stamped.
-        make_v2_db(mdb, 0);
-        CHECK(db_user_version(mdb) == WFS_STORE_SCHEMA_M1 * 100);
-        for (size_t i = 0; i < kAddedN; ++i) CHECK(!db_has_column(mdb, kAdded[i][0], kAdded[i][1]));
+        store_as_m1(mstore, 0);
+        CHECK(db_user_version(mdb1) == WFS_STORE_SCHEMA_M1 * 100);
+        for (size_t i = 0; i < kAddedN; ++i) CHECK(!db_has_column(mdb1, kAdded[i][0], kAdded[i][1]));
         wfs_store *ms = NULL;
         CHECK_OK(wfs_store_open(mstore, &ms));
         wfs_store_close(ms);
@@ -5632,8 +5696,11 @@ int main() {
         //     un-stamped, so the next open is the retry. This used to come back 0 with
         //     user_version stamped, `snapshots` still missing every column, and the migrations
         //     that happened to work applied on their own.
-        make_v2_db(mdb, 1);
-        CHECK(db_user_version(mdb) == WFS_STORE_SCHEMA_M1 * 100);
+        //     (35th round: the move runs before the migration, so the database this failure
+        //     leaves un-stamped is the one at the schema-3 name -- which is the crash state
+        //     "VERSION 3, stub in place, database still 2xx" that (3) then finishes from.)
+        store_as_m1(mstore, 1);
+        CHECK(db_user_version(mdb1) == WFS_STORE_SCHEMA_M1 * 100);
         ms = NULL;
         CHECK_RC(wfs_store_open(mstore, &ms), -EIO);
         CHECK(ms == NULL);
@@ -5664,49 +5731,79 @@ int main() {
     // so the number in VERSION is exactly what refuses it, and (a) below is the assertion that
     // the number gets there.
     {
-        char vstore[4096], vdb[4096], vver[4096], vbuf[64];
+        char vstore[4096], vdb[4096], vdb3[4096], vver[4096], vbuf[64];
         join(vstore, sizeof vstore, root, "schema3-store");
         CHECK(mkdir(vstore, 0755) == 0);
         join(vver, sizeof vver, vstore, "VERSION");
+        // PR #1 review (35th round, P1): two names. `vdb` is where an M1 store keeps its
+        // database -- and where, in a schema-3 store, the stub directory is -- and `vdb3` is
+        // where this core's database lives once the upgrade has moved it there.
         join(vdb, sizeof vdb, vstore, "metadata.db");
+        join(vdb3, sizeof vdb3, vstore, "metadata3.db");
 
         // (a) an M1 store -- VERSION 2, user_version 2xx, not one of the added columns -- is
         //     taken over rather than refused: the columns arrive, the stamp becomes 3xx, and
         //     the file M1 reads first says 3.
-        write_file(vver, "2\n");
-        make_v2_db(vdb, 0);
+        store_as_m1(vstore, 0);
         CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA_M1);
         for (size_t i = 0; i < kAddedN; ++i) CHECK(!db_has_column(vdb, kAdded[i][0], kAdded[i][1]));
         wfs_store *vs = NULL;
         CHECK_OK(wfs_store_open(vstore, &vs));
         wfs_store_close(vs);
-        for (size_t i = 0; i < kAddedN; ++i) CHECK(db_has_column(vdb, kAdded[i][0], kAdded[i][1]));
+        for (size_t i = 0; i < kAddedN; ++i) CHECK(db_has_column(vdb3, kAdded[i][0], kAdded[i][1]));
         // The hole itself: this used to come out 2xx, i.e. still a store M1 would open.
-        CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA);
+        CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
         CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
         CHECK(atoi(vbuf) == WFS_STORE_SCHEMA);
         char vtmp[4096];
         join(vtmp, sizeof vtmp, vstore, "VERSION.tmp");
         CHECK(!exists(vtmp));
+        // ... and the layout a schema-3 store has (35th round): the database is at the new
+        //     name, and the old one is an empty directory, mode 0500, that no sqlite3_open_v2()
+        //     can open -- which is the whole of the exclusion.
+        struct stat vst0;
+        CHECK(stat(vdb, &vst0) == 0 && S_ISDIR(vst0.st_mode));
+        CHECK((vst0.st_mode & 07777) == 0500);
+        CHECK(n_with_prefix(vdb, "") == 2);   // "." and "..", and nothing else in it
+        CHECK(stat(vdb3, &vst0) == 0 && S_ISREG(vst0.st_mode) && vst0.st_size > 0);
+        // ... and the sidecars of the name it came from did not stay behind next to that
+        //     directory: a hot journal belonging to a database that is no longer there is the
+        //     one shape of this that loses data.
+        CHECK(n_with_prefix(vstore, "metadata.db-") == 0);
         // A second open is a no-op: the store is already schema 3 and is not upgraded twice.
-        int vstamp = db_user_version(vdb);
+        int vstamp = db_user_version(vdb3);
         CHECK_OK(wfs_store_open(vstore, &vs));
         wfs_store_stat vst;
         CHECK_OK(wfs_store_status(vs, &vst));
         CHECK(vst.schema == WFS_STORE_SCHEMA);
         wfs_store_close(vs);
-        CHECK(db_user_version(vdb) == vstamp);
+        CHECK(db_user_version(vdb3) == vstamp);
 
-        // (b) a store from a schema we do not know: VERSION says 3, the database says 4xx. It
-        //     is refused with the P13 code and comes back untouched -- not migrated, and not
-        //     stamped down to 3xx, which is the one thing that would be unrecoverable.
-        make_v2_db(vdb, 0);
+        // (b) a store from a schema we do not know: the database says 4xx. It is refused with
+        //     the P13 code and comes back untouched -- not migrated, not stamped down to 3xx,
+        //     and (35th round) not moved either: the stamp is read from the database where it
+        //     still lies, before step (b) of the upgrade can take it anywhere.
+        store_as_m1(vstore, 0);
         db_exec(vdb, "PRAGMA user_version=400");
+        write_file(vver, "3\n");
         vs = NULL;
         CHECK_RC(wfs_store_open(vstore, &vs), WFS_E_SCHEMA);
         CHECK(vs == NULL);
         CHECK(db_user_version(vdb) == 400);
+        CHECK(!exists(vdb3));
         for (size_t i = 0; i < kAddedN; ++i) CHECK(!db_has_column(vdb, kAdded[i][0], kAdded[i][1]));
+
+        // ... and the same refusal from a store that is already in schema-3 shape: the stamp is
+        //     read from metadata3.db and the open ends there.
+        store_as_m1(vstore, 0);
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_close(vs);
+        db_exec(vdb3, "PRAGMA user_version=400");
+        vs = NULL;
+        CHECK_RC(wfs_store_open(vstore, &vs), WFS_E_SCHEMA);
+        CHECK(vs == NULL);
+        CHECK(db_user_version(vdb3) == 400);
 
         // ... and the same store refused one step earlier, by the file, before the database is
         //     opened at all -- which is the check M1 itself is relying on.
@@ -5714,7 +5811,7 @@ int main() {
         vs = NULL;
         CHECK_RC(wfs_store_open(vstore, &vs), WFS_E_SCHEMA);
         CHECK(vs == NULL);
-        CHECK(db_user_version(vdb) == 400);
+        CHECK(db_user_version(vdb3) == 400);
 
         // (c) PR #1 review (31st round, P2): two processes opening that schema-2 store for the
         //     first time at the same time. Both pass check_version() as legacy, both migrate
@@ -5723,8 +5820,11 @@ int main() {
         //     second simply overwrites a VERSION that already says 3 -- with the shared
         //     `VERSION.tmp` it used to be, the second process's rename found its own temporary
         //     gone and a perfectly valid open failed with -ENOENT.
-        write_file(vver, "2\n");
-        make_v2_db(vdb, 0);
+        //     (35th round: and only one of the two renames of the DATABASE can land either. The
+        //     loser finds a directory where the database was, which is not an error in either
+        //     process -- it is the move having already been made -- so both opens still come
+        //     back 0.)
+        store_as_m1(vstore, 0);
         snprintf(g_vrace_store, sizeof g_vrace_store, "%s", vstore);
         g_vrace_rc = -1;
         g_vrace_ran = 0;
@@ -5739,14 +5839,13 @@ int main() {
         wfs_store_close(vs);
         CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
         CHECK(atoi(vbuf) == WFS_STORE_SCHEMA);      // read once, and it says 3
-        CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA);
+        CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
         CHECK(n_with_prefix(vstore, "VERSION.tmp") == 0);   // and neither left a temporary
 
         // ... and the crashed upgrader: a temporary from a process that died between writing it
         //     and renaming it. It is ours -- nothing but this core writes that name, in that
         //     directory -- so the next upgrade of the store sweeps it.
-        write_file(vver, "2\n");
-        make_v2_db(vdb, 0);
+        store_as_m1(vstore, 0);
         join(vtmp, sizeof vtmp, vstore, "VERSION.tmp.999.deadbeef");
         write_file(vtmp, "3\n");
         CHECK(exists(vtmp));
@@ -5765,8 +5864,9 @@ int main() {
         //     read 2 and 3xx -- and an M1 binary starting in that window is admitted, stamps
         //     `user_version` back down to 2 (its open does exactly that for any stamp that is
         //     not 2), and then runs M1's wfs_gc() over M2 trash semantics.
-        write_file(vver, "2\n");
-        make_v2_db(vdb, 0);
+        //     (35th round: the seam still fires before the move, so what it reads is the
+        //     database at the name M1 knows.)
+        store_as_m1(vstore, 0);
         g_bump_ran = 0;
         g_bump_file = 0;
         g_bump_uv = 0;
@@ -5782,32 +5882,121 @@ int main() {
         wfs_store_close(vs);
         CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
         CHECK(atoi(vbuf) == WFS_STORE_SCHEMA);
-        CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA);
-        for (size_t i = 0; i < kAddedN; ++i) CHECK(db_has_column(vdb, kAdded[i][0], kAdded[i][1]));
+        CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
+        for (size_t i = 0; i < kAddedN; ++i) CHECK(db_has_column(vdb3, kAdded[i][0], kAdded[i][1]));
 
-        // ... and the crash this order can leave behind: VERSION already 3 with a database
-        //     still stamped 2xx. Every M1 binary is refused it, and the next M2 open finishes
-        //     the upgrade -- the 2xx under a 3 is an upgrade in progress, not a schema to
-        //     refuse (only a stamp HIGHER than ours is refused, case (b) above).
+        // ---- PR #1 review (35th round, P1): the M1 process that had not opened anything yet --
+        //
+        //     The 32nd round shuts the door on M1 processes that START after the rename and the
+        //     34th round on those that already hold a descriptor. Neither reaches the one in
+        //     between: a process that read VERSION as 2, was admitted, and has not reached its
+        //     own sqlite3_open_v2() yet. It holds nothing proc_listpidspath(3) can see and it
+        //     has already read the only file it checks, so the only thing left that can refuse
+        //     it is the database, by not being where it looks for it.
+        //
+        //     This seam fires in exactly that window -- database moved, stub in place, holder
+        //     gate passed, nothing migrated -- and does what M1's open does: open
+        //     `<store>/metadata.db` with SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE and stamp
+        //     `user_version` back down to 2. It has to FAIL. Before this round it came back
+        //     SQLITE_OK and the stamp read back 2.
+        store_as_m1(vstore, 0);
+        g_gap_ran = 0;
+        g_gap_open_rc = -1;
+        g_gap_uv = -1;
+        wfs_test_after_db_move = gap_m1_open;
+        vs = NULL;
+        int vgap_rc = wfs_store_open(vstore, &vs);
+        wfs_test_after_db_move = NULL;
+        CHECK(g_gap_ran == 1);
+        CHECK(g_gap_open_rc == SQLITE_CANTOPEN);   // SQLITE_OK before the fix
+        CHECK(g_gap_uv == -1);                     // and nothing was stamped: 2 before the fix
+        CHECK_OK(vgap_rc);                         // the upgrade itself is unaffected
+        CHECK(vs != NULL);
+        wfs_store_close(vs);
+        CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
+        // ... and the store is an ordinary schema-3 store afterwards: a second open works.
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_close(vs);
+
+        // ... and the crash this order can leave behind: VERSION already 3 with the database
+        //     still at the name M1 uses, stamped 2xx. Every M1 binary is refused it by the
+        //     file, and the next M2 open picks the upgrade up at step (b) -- the 2xx under a 3
+        //     is an upgrade in progress, not a schema to refuse (only a stamp HIGHER than ours
+        //     is refused, case (b) above).
+        store_as_m1(vstore, 0);
         write_file(vver, "3\n");
-        make_v2_db(vdb, 0);
         CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA_M1);
         vs = NULL;
         CHECK_OK(wfs_store_open(vstore, &vs));
         wfs_store_close(vs);
-        CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA);
-        for (size_t i = 0; i < kAddedN; ++i) CHECK(db_has_column(vdb, kAdded[i][0], kAdded[i][1]));
+        CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
+        for (size_t i = 0; i < kAddedN; ++i) CHECK(db_has_column(vdb3, kAdded[i][0], kAdded[i][1]));
 
-        // ... and the crash the OLD order left, which stores in the wild may still be in:
-        //     VERSION says 2, the database is already 3xx. The bump runs whatever the stamp
-        //     says, so the next open shuts the door on it.
+        // ... and the crash between (b) and (c): the database has arrived at the new name and
+        //     the stub was never made. The next open makes it and finishes.
+        CHECK(rmdir(vdb) == 0);
+        CHECK(!exists(vdb));
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_close(vs);
+        CHECK(stat(vdb, &vst0) == 0 && S_ISDIR(vst0.st_mode));
+
+        // ... and the crash between (c) and (d): everything is in place and the migration has
+        //     not committed. The next open runs it, and the holder gate with it.
+        db_exec(vdb3, "PRAGMA user_version=200");
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_close(vs);
+        CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
+
+        // ... and a revert that did not finish: VERSION back at 2 with the database already at
+        //     the schema-3 name. The layout decides, and the layout says the move has happened,
+        //     so this is taken FORWARD -- the file is put back to 3 and the store is opened.
         write_file(vver, "2\n");
-        CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA);
         vs = NULL;
         CHECK_OK(wfs_store_open(vstore, &vs));
         wfs_store_close(vs);
         CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
         CHECK(atoi(vbuf) == WFS_STORE_SCHEMA);
+        CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
+
+        // ... and the crash the OLD order left, which stores in the wild may still be in:
+        //     VERSION says 2, the database is already 3xx.
+        store_as_m1(vstore, 0);
+        db_exec(vdb, "PRAGMA user_version=300");
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_close(vs);
+        CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
+        CHECK(atoi(vbuf) == WFS_STORE_SCHEMA);
+        CHECK(!exists(vdb) || (stat(vdb, &vst0) == 0 && S_ISDIR(vst0.st_mode)));
+
+        // ... and the two layouts the protocol cannot produce, which are damage and are not
+        //     created over (35th round, point 3). A stub with no database beside it is the
+        //     first: the database has gone and a fresh one here would hand out id 1 again.
+        store_as_m1(vstore, 0);
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_close(vs);
+        CHECK(unlink(vdb3) == 0);
+        vs = NULL;
+        CHECK_RC(wfs_store_open(vstore, &vs), WFS_E_STORE_DAMAGED);
+        CHECK(vs == NULL);
+        CHECK(!exists(vdb3));                    // and nothing was created beside the stub
+        CHECK(stat(vdb, &vst0) == 0 && S_ISDIR(vst0.st_mode));
+        // ... and the second: a regular file at the M1 name with a schema-3 database already
+        //     there. The rename is atomic, so no crash of this protocol can leave both.
+        store_as_m1(vstore, 0);
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_close(vs);
+        CHECK(rmdir(vdb) == 0);        // the stub out of the way, a database in its place
+        make_v2_db(vdb, 0);
+        vs = NULL;
+        CHECK_RC(wfs_store_open(vstore, &vs), WFS_E_STORE_DAMAGED);
+        CHECK(vs == NULL);
+        CHECK(exists(vdb) && exists(vdb3));   // and neither of them was touched
 
         // (e) PR #1 review (34th round, P1): the handle that was already inside ----------------
         //
@@ -5816,14 +6005,15 @@ int main() {
         //     before it: that process holds a usable handle on a database that is about to
         //     become M2's, and M1 takes no store-wide lock of any kind, so the exclusion cannot
         //     need M1's cooperation. The upgrade asks the operating system instead -- who else
-        //     has <store>/metadata.db open? -- and a foreign holder puts VERSION back to 2 and
-        //     refuses, because the alternative is an M1 collector let loose on M2 trash.
+        //     has this store's database open? -- and a foreign holder puts the whole upgrade
+        //     back, because the alternative is an M1 collector let loose on M2 trash.
         //
         //     A child process with the file open is exactly that holder. It is forked after the
-        //     schema-2 database is in place, so the path it opens is the one the upgrade asks
-        //     about, and it reports through a pipe that it really has it.
-        write_file(vver, "2\n");
-        make_v2_db(vdb, 0);
+        //     schema-2 database is in place, so the inode it opens is the one the upgrade moves,
+        //     and it reports through a pipe that it really has it. The question is asked of the
+        //     NEW name (35th round) and still finds it: proc_listpidspath(3) compares vnodes,
+        //     not names.
+        store_as_m1(vstore, 0);
         int hpipe[2], hctl[2];
         CHECK(pipe(hpipe) == 0);
         CHECK(pipe(hctl) == 0);
@@ -5856,6 +6046,11 @@ int main() {
         CHECK(vs == NULL);
         CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
         CHECK(atoi(vbuf) == WFS_STORE_SCHEMA_M1);                  // the bump was put back...
+        // ... and so was the move: the database is a regular file at the name M1 opens, there
+        //     is no stub in the way of it and no schema-3 name beside it, which is exactly the
+        //     store M1 was working on a moment ago.
+        CHECK(stat(vdb, &vst0) == 0 && S_ISREG(vst0.st_mode));
+        CHECK(!exists(vdb3));
         CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA_M1);  // ...and nothing was migrated
         for (size_t i = 0; i < kAddedN; ++i) CHECK(!db_has_column(vdb, kAdded[i][0], kAdded[i][1]));
         CHECK(n_with_prefix(vstore, "VERSION.tmp") == 0);
@@ -5881,10 +6076,9 @@ int main() {
         wfs_store_close(vs);
         CHECK(read_file(vver, vbuf, sizeof vbuf) == 0);
         CHECK(atoi(vbuf) == WFS_STORE_SCHEMA);
-        CHECK(db_user_version(vdb) / 100 == WFS_STORE_SCHEMA);
-        for (size_t i = 0; i < kAddedN; ++i) CHECK(db_has_column(vdb, kAdded[i][0], kAdded[i][1]));
+        CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
+        for (size_t i = 0; i < kAddedN; ++i) CHECK(db_has_column(vdb3, kAdded[i][0], kAdded[i][1]));
     }
-
     // ---- PR #1 review (25th round, P1): a trash entry is the row's tree, not the row's name --
     //
     // The collector's last question before renaming an entry to `.deleting` and deleting it was
@@ -5930,7 +6124,7 @@ int main() {
         // The row, read from the database: where it says the tree is, and what it says the tree
         // is. The discard does not touch the two identity columns, and the rename into
         // <store>/trash kept the inode.
-        snprintf(fdb, sizeof fdb, "%s/metadata.db", fstore);
+        snprintf(fdb, sizeof fdb, "%s/metadata3.db", fstore);
         char sql[256], val[4096];
         snprintf(sql, sizeof sql, "SELECT trash_path FROM worlds WHERE id=%llu",
                  (unsigned long long)fw1);
@@ -6055,7 +6249,7 @@ int main() {
         uint64_t xdev = xwr.dir_dev, xino = xwr.dir_ino;
         CHECK(xino != 0);
         CHECK_OK(wfs_world_discard(xa, xw1, 0, 0));
-        snprintf(xdb, sizeof xdb, "%s/metadata.db", xstore);
+        snprintf(xdb, sizeof xdb, "%s/metadata3.db", xstore);
         snprintf(xsql, sizeof xsql, "SELECT trash_path FROM worlds WHERE id=%llu",
                  (unsigned long long)xw1);
         CHECK(db_query_text(xdb, xsql, xentry, sizeof xentry) == 1);
@@ -6178,7 +6372,7 @@ int main() {
         uint64_t mino = mwr.dir_ino;
         CHECK(mino != 0);
         CHECK_OK(wfs_world_discard(ma, mw1, 0, 0));
-        snprintf(mdb, sizeof mdb, "%s/metadata.db", mstore);
+        snprintf(mdb, sizeof mdb, "%s/metadata3.db", mstore);
         snprintf(msql, sizeof msql, "SELECT trash_path FROM worlds WHERE id=%llu",
                  (unsigned long long)mw1);
         CHECK(db_query_text(mdb, msql, mentry, sizeof mentry) == 1);
@@ -6275,7 +6469,7 @@ int main() {
 
         // (1) the discard leaves it alone -- it renames the tree, it does not open it.
         CHECK_OK(wfs_world_discard(la, lw1, 0, 0));
-        snprintf(ldb, sizeof ldb, "%s/metadata.db", lstore);
+        snprintf(ldb, sizeof ldb, "%s/metadata3.db", lstore);
         snprintf(lsql, sizeof lsql, "SELECT trash_path FROM worlds WHERE id=%llu",
                  (unsigned long long)lw1);
         CHECK(db_query_text(ldb, lsql, lentry, sizeof lentry) == 1);
@@ -6360,7 +6554,7 @@ int main() {
         CHECK(mkdir(fsrc, 0755) == 0);
         join(p, sizeof p, fsrc, "a.txt");
         write_file(p, "one\n");
-        join(fdb, sizeof fdb, fstore, "metadata.db");
+        join(fdb, sizeof fdb, fstore, "metadata3.db");
         wfs_store *fs = NULL;
         CHECK_OK(wfs_store_open(fstore, &fs));
         memset(&sopts, 0, sizeof sopts);
@@ -6462,7 +6656,7 @@ int main() {
         CHECK(mkdir(rsrc, 0755) == 0);
         join(p, sizeof p, rsrc, "a.txt");
         write_file(p, "one\n");
-        join(rdb, sizeof rdb, rstore, "metadata.db");
+        join(rdb, sizeof rdb, rstore, "metadata3.db");
         wfs_store *rs = NULL;
         CHECK_OK(wfs_store_open(rstore, &rs));
         memset(&sopts, 0, sizeof sopts);
@@ -6549,7 +6743,7 @@ int main() {
         CHECK(mkdir(xsrc, 0755) == 0);
         join(p, sizeof p, xsrc, "a.txt");
         write_file(p, "one\n");
-        join(xdb, sizeof xdb, xstore, "metadata.db");
+        join(xdb, sizeof xdb, xstore, "metadata3.db");
         wfs_store *xs = NULL;
         CHECK_OK(wfs_store_open(xstore, &xs));
         memset(&sopts, 0, sizeof sopts);

@@ -219,7 +219,7 @@ static void run_diff_err(wfs_store *s, wfs_id w, int flags, Collect *c, int want
 
 static void set_cursor(const char *store, wfs_id w, unsigned long long id) {
     char db[4096];
-    join(db, sizeof db, store, "metadata.db");
+    join(db, sizeof db, store, "metadata3.db");
     sqlite3 *h = NULL;
     CHECK(sqlite3_open(db, &h) == SQLITE_OK);
     char sql[256];
@@ -231,7 +231,7 @@ static void set_cursor(const char *store, wfs_id w, unsigned long long id) {
 
 static void set_snapshot_state(const char *store, wfs_id sid, int state) {
     char db[4096];
-    join(db, sizeof db, store, "metadata.db");
+    join(db, sizeof db, store, "metadata3.db");
     sqlite3 *h = NULL;
     CHECK(sqlite3_open(db, &h) == SQLITE_OK);
     char sql[256];

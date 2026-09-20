@@ -1,10 +1,15 @@
-// The store: a directory with a VERSION file, a SQLite metadata.db (schema v3), the snapshot
+// The store: a directory with a VERSION file, a SQLite metadata3.db (schema v3), the snapshot
 // trees and the trash. Everything that is not snapshot/world lifecycle lives here.
+//
+// The database's name is part of the schema (PR #1 review, 35th round): schema 2 -- M1's -- kept
+// it at `metadata.db`, schema 3 keeps it at `metadata3.db`, and the old name becomes an empty
+// directory that no sqlite3_open_v2() can open. See store_layout() below for why.
 #include "db.h"
 
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/random.h>
 #include <unistd.h>
@@ -31,7 +36,38 @@ extern "C" const char *wfs_test_stmt_fail_sql = nullptr;
 // that is not a test, and nothing in the library ever assigns it. Read by wfs::Txn in db.h.
 extern "C" int wfs_test_txn_fail_once = 0;
 
+// The gap between the database's move and its migration (PR #1 review, 35th round): the stub is
+// in place, the holder gate has passed, nothing has been migrated yet. NULL in every run that is
+// not core_test; nothing in the library ever assigns it. Declared in worldfs.h.
+extern "C" void (*wfs_test_after_db_move)(void *ctx, const char *dir) = nullptr;
+extern "C" void *wfs_test_after_db_move_ctx = nullptr;
+
 namespace {
+
+// ---- PR #1 review (35th round, P1): the database's name is part of the schema ----------------
+//
+// The 32nd round put the VERSION bump before the migration and the 34th round added the holder
+// gate, and between them they cover every M1 process except one: the process that read
+// `VERSION` as 2, was admitted, and then paused BEFORE its sqlite3_open_v2(). It holds no
+// descriptor, so proc_listpidspath(3) cannot see it; it has already read the file, so the bump
+// cannot refuse it. When it resumes it opens the database this core has just migrated, stamps
+// `user_version` back down to 2 (M1's open does exactly that for any stamp that is not 2) and
+// runs M1's collector over M2 trash.
+//
+// There is no file M1 reads later that could exclude it -- M1 reads VERSION once and then opens
+// the database. So the database itself has to be the exclusion: a schema-3 store keeps it under
+// a name M1 does not know, and the name M1 does know is left as something M1 cannot open.
+// Measured here (scratchpad probe, SQLite 3.54.0): sqlite3_open_v2() on a DIRECTORY returns
+// SQLITE_CANTOPEN (14) with SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE, with READWRITE alone and
+// with READONLY alone -- every mode M1 could use -- so an empty directory at `metadata.db` fails
+// M1's open outright, and M1's open failing ends M1's command before its collector runs.
+const char *kDbLeaf = "/metadata3.db";     // schema 3: this core's database
+const char *kDbLeafM1 = "/metadata.db";    // schema 2: M1's, and afterwards the stub directory
+
+void db_path(const char *dir, String &out, bool m1_name) {
+    out.assign(dir);
+    out.append(m1_name ? kDbLeafM1 : kDbLeaf);
+}
 
 // Schema v3 (docs/M1_DESIGN.md §2). Snapshot ids and world ids are separate sequences, so
 // S1 and W1 can both exist; the CLI prints the prefix.
@@ -402,6 +438,100 @@ int version_upgrade(const char *dir) {
     return 0;
 }
 
+// ---- PR #1 review (35th round, P1): moving the database out from under the old name ----------
+//
+// Step (b) of the upgrade. The rename itself is one syscall; what takes care is what SQLite
+// leaves NEXT to the file. `main`'s M1 core runs
+//     "PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;PRAGMA foreign_keys=OFF;"
+// on every open, so a live M1 store carries `metadata.db-wal` and `metadata.db-shm`, and one
+// that was interrupted before WAL was set can carry a rollback `metadata.db-journal`. Renaming
+// the database alone would strand all three beside a DIRECTORY of that name -- a hot journal
+// whose database is no longer there is the one shape of this that loses data.
+//
+// So the old file is opened with this core's own connection first. That open is what recovers a
+// hot rollback journal (SQLite replays it on the first read), and `PRAGMA journal_mode=DELETE`
+// is what checkpoints the WAL back into the database and removes the `-wal` and the `-shm`. The
+// pragma answers with the mode that is now in force, so it is READ rather than assumed: another
+// connection holding the WAL makes the change fail, and SQLite reports that by answering "wal",
+// not by an error code. Anything that is not "delete" is a store somebody else is in --
+// WFS_E_STORE_BUSY, with the file still where M1 expects it.
+//
+// After the close, the three sidecar names are unlinked unconditionally. They are ours by the
+// same P18 rule the VERSION temporaries follow -- inside `<store>`, never a subdirectory, and
+// under a prefix nothing but SQLite writes there -- and everything they held is in the database
+// we have just checkpointed and closed, so what is unlinked is a file with nothing in it.
+//
+// 0, or the error the upgrade ends with. Nothing has been renamed unless this returns 0.
+int db_move_to_schema3(const char *dir) {
+    String olddb, newdb;
+    db_path(dir, olddb, true);
+    db_path(dir, newdb, false);
+    sqlite3 *h = nullptr;
+    // No SQLITE_OPEN_CREATE: this is called only when `metadata.db` is a regular file, and a
+    // database that has gone missing under us is not one to create here.
+    if (sqlite3_open_v2(olddb.c_str(), &h, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK) {
+        if (h) sqlite3_close(h);
+        return WFS_E_STORE_DAMAGED;
+    }
+    sqlite3_busy_timeout(h, 10000);
+    int rc = 0;
+    {
+        Stmt q(h, "PRAGMA journal_mode=DELETE");
+        // A file that is not a database comes back here as SQLITE_NOTADB, from the step -- the
+        // same verdict the 13th round gave every other shape of that.
+        if (!q.ok() || !q.row()) rc = WFS_E_STORE_DAMAGED;
+        else {
+            const char *mode = q.col_text(0);
+            if (!mode || ::strcasecmp(mode, "delete") != 0) rc = WFS_E_STORE_BUSY;
+        }
+    }
+    sqlite3_close(h);
+    if (rc) return rc;
+    for (const char *sfx : {"-wal", "-shm", "-journal"}) {
+        String p(olddb);
+        p.append(sfx);
+        ::unlink(p.c_str());
+    }
+    return ::rename(olddb.c_str(), newdb.c_str()) == 0 ? 0 : -errno;
+}
+
+// The database's own stamp, read from the file at `path` without writing a byte of it. Used on
+// the upgrade path, where the stamp has to be read from the database where it still LIES -- a
+// store from a schema we do not know comes back exactly as it was found (24th round), and after
+// (b) it would already have been moved. READWRITE and not READONLY: a schema-2 store is in WAL
+// mode, and a read-only connection to a WAL database needs the `-shm` it may not be allowed to
+// make. Reading a pragma writes nothing to the database file either way.
+int db_user_version_at(const char *path, int *out) {
+    sqlite3 *h = nullptr;
+    if (sqlite3_open_v2(path, &h, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK) {
+        if (h) sqlite3_close(h);
+        return WFS_E_STORE_DAMAGED;
+    }
+    sqlite3_busy_timeout(h, 10000);
+    int rc = 0;
+    {
+        Stmt q(h, "PRAGMA user_version");
+        if (!q.ok() || !q.row()) rc = WFS_E_STORE_DAMAGED;
+        else *out = (int)q.col_i64(0);
+    }
+    sqlite3_close(h);
+    return rc;
+}
+
+// Step (c): the stub. An empty directory, mode 0500, at the name M1 opens. Idempotent, because
+// every crash state of the upgrade is resumed by re-running the steps that are still owed.
+int db_stub_make(const char *dir) {
+    String p;
+    db_path(dir, p, true);
+    if (::mkdir(p.c_str(), 0500) == 0) return 0;
+    if (errno != EEXIST) return -errno;
+    struct stat st;
+    if (::stat(p.c_str(), &st) != 0) return -errno;
+    // Something that is not our directory took the name while we were not looking. That is not
+    // a store to carry on migrating.
+    return S_ISDIR(st.st_mode) ? 0 : WFS_E_STORE_DAMAGED;
+}
+
 // ---- PR #1 review (34th round, P1): the handle that was already inside -----------------------
 //
 // The 32nd round put the VERSION bump before the migration, so that from the instant anything
@@ -416,13 +546,22 @@ int version_upgrade(const char *dir) {
 //
 // So the question is asked of the operating system, in this order:
 //
-//     bump VERSION to 3  ->  list who has metadata.db open  ->  holders ? revert + refuse
-//                                                             : migrate
+//     bump VERSION to 3  ->  move the database  ->  list who has it open  ->  holders ? revert
+//                                                                                     : migrate
 //
 // and the order is what makes the answer complete. A holder that appears AFTER the listing was
 // admitted after the rename, and the file already refused it (32nd round). A holder the listing
 // names was admitted before the bump -- exactly the set this exists for. Nothing can slip
 // between the two, because there is no third case.
+//
+// PR #1 review (35th round, P1): the question is asked of the NEW name, and it still finds the
+// handles that were opened under the old one. proc_listpidspath(3) resolves the path it is given
+// to a vnode and compares vnodes, not names, so a process holding the renamed inode is reported
+// against `metadata3.db`. Verified in a scratchpad probe: a child opens `<dir>/metadata.db`, the
+// parent renames it to `<dir>/metadata3.db`, and proc_listpidspath on the new name returns that
+// child's pid -- before the rename, after the rename, and with the stub directory created at the
+// old name; asking about the old name after the rename returns ENOENT, which is why the question
+// has to be asked about the new one.
 //
 // Every foreign holder is treated the same. Another M2 upgrader is indistinguishable from an M1
 // one by pid, and guessing wrong in that direction is the expensive mistake; two upgraders that
@@ -431,17 +570,34 @@ int version_upgrade(const char *dir) {
 // (Linux is deferred: docs/M1_DESIGN.md P13) -- is a holder for this purpose, because the whole
 // point is that admitting one is not recoverable.
 //
-// The revert is the same private-temporary write the bump is, so a store that is refused is a
-// store an M1 binary may still open and collect normally -- which is what it was a moment ago. A
-// revert that itself fails leaves VERSION at 3 over a 2xx database: refused by M1, finished by
-// the next M2 open, which is the safe half of the same trade the 32nd round made.
+// The revert undoes the three steps in reverse: the stub directory, the rename, the VERSION
+// file. A store that is refused is a store an M1 binary may still open and collect normally --
+// which is what it was a moment ago. A revert that cannot finish stops where it is and leaves
+// VERSION at 3 over a database M1 cannot reach under either name: refused by M1, finished by the
+// next M2 open, which is the safe half of the same trade the 32nd round made.
 int legacy_holders_gate(const char *dir) {
-    String dbp(dir);
-    dbp.append("/metadata.db");
+    String newdb, olddb;
+    db_path(dir, newdb, false);
+    db_path(dir, olddb, true);
     wfs::Vec<int64_t> holders;
-    int rc = wfs::fs_other_holders(dbp.c_str(), holders);
+    int rc = wfs::fs_other_holders(newdb.c_str(), holders);
     if (rc == 0 && holders.size() == 0) return 0;
-    version_put(dir, WFS_STORE_SCHEMA_M1, false);   // best effort; see above
+    // The database goes back alone or not at all: a `-wal` left at the schema-3 name beside a
+    // database at the schema-2 one is an M1 open that silently reads a database missing every
+    // committed page in that WAL, which is worse than any refusal. db_move_to_schema3() leaves
+    // none behind and the gate runs before this core's own journal-mode pragma, so on the
+    // ordinary path there are none to find.
+    for (const char *sfx : {"-wal", "-shm", "-journal"}) {
+        String p(newdb);
+        p.append(sfx);
+        struct stat st;
+        if (::stat(p.c_str(), &st) == 0) { version_tmp_sweep(dir); return WFS_E_STORE_BUSY; }
+    }
+    // rmdir(2) on the stub first, so the name is free for the database to come back to. An
+    // rmdir or a rename that fails stops the revert: what is on disk then is one of the crash
+    // states store_layout() below resumes from, and pressing on would make it one that is not.
+    if (::rmdir(olddb.c_str()) == 0 && ::rename(newdb.c_str(), olddb.c_str()) == 0)
+        version_put(dir, WFS_STORE_SCHEMA_M1, false);   // best effort; see above
     version_tmp_sweep(dir);
     return WFS_E_STORE_BUSY;
 }
@@ -457,7 +613,7 @@ int meta_get(sqlite3 *db, const char *key, String &out) {
 
 // P17: does this store directory still hold trees? One readdir of each of the three places a
 // tree can be, stopping at the first entry that is not "." or "..". Cheap enough to do on every
-// open of a store whose metadata.db is not there.
+// open of a store whose database is not there.
 //
 // 1 = yes (and `what` names the first one found), 0 = no, a negative errno = the question could
 // not be answered.
@@ -465,7 +621,7 @@ int meta_get(sqlite3 *db, const char *key, String &out) {
 // PR #1 review (13th round, P1): that third answer is the whole point. This used to be a bool
 // over three opendir(2)s whose failures were skipped in silence -- `if (!d) continue;` -- so a
 // `snapshots/` that came back EACCES, EIO, or ENOENT-because-the-volume-is-not-mounted read as
-// "nothing in there", the guard called the store empty, and the open built a fresh metadata.db
+// "nothing in there", the guard called the store empty, and the open built a fresh database
 // and a fresh store id beside trees the old database was the index of. Worse than the missing
 // guard: from then on the database IS there, so no later open ever asks again. Only ENOENT is
 // evidence of absence -- the subtree is genuinely not there, so nothing can be in it -- and
@@ -495,6 +651,84 @@ int store_has_trees(const char *dir, String &what) {
         ::closedir(d);
         if (found) return 1;
         if (rderr) return -rderr;
+    }
+    return 0;
+}
+
+// ---- PR #1 review (35th round, P1): what is on disk, before anything is opened ---------------
+//
+// Two names and one VERSION file, and between them they say which step of the upgrade this store
+// is owed. The protocol is
+//
+//     (a) VERSION := 3
+//     (b) checkpoint the sidecars away and rename  metadata.db -> metadata3.db
+//     (c) mkdir the stub at  metadata.db  (0500, empty)
+//     (d) list who holds metadata3.db open; holders ? revert : migrate and stamp 3xx
+//
+// in that order, and every prefix of it is a state a crash can leave. The rename in (b) is
+// atomic, so `metadata.db` is a regular file on one side of it and absent on the other, and the
+// stub in (c) only ever appears once (b) has landed. That is what makes the table below total:
+//
+//   metadata.db  metadata3.db   what it is                          what this open does
+//   -----------  ------------   ---------------------------------   ---------------------------
+//   absent       absent         a store with no database at all     trees ? DAMAGED : create
+//   regular      absent         schema 2, or a crash before (b)     (a) if VERSION 2, then (b)(c)(d)
+//   absent       present        a crash between (b) and (c)         (a) if VERSION 2, then (c)(d)
+//   directory    present        schema 3 -- or a crash before (d)   (a) if VERSION 2, then (d)
+//   directory    absent         the stub with no database           DAMAGED
+//   regular      present        a state the protocol cannot reach   DAMAGED
+//   anything else at either name                                    DAMAGED
+//
+// VERSION is not in the table because it does not decide anything: the LAYOUT decides, and the
+// file only says whether the bump in (a) is still owed. That settles the one direction the
+// upgrade could otherwise be read two ways -- VERSION still 2 with `metadata3.db` already there,
+// which is a revert that did not finish. It is taken FORWARD, always: the database has already
+// moved, moving it back would be a second unsynchronised rename for no gain, and the bump is
+// what makes the store's two halves agree again. The revert direction is only ever taken by the
+// process that is holding the upgrade in its hand (legacy_holders_gate above), never by a later
+// open reading these names.
+//
+// `*trees_checked` is the 13th round's guard, folded in: "the metadata is missing" now means
+// neither a readable `metadata3.db` nor a readable `metadata.db` to upgrade, and a store that
+// still has trees in it is refused rather than given a fresh database and a fresh store id.
+struct StoreLayout {
+    bool move_needed = false;    // (b) is still owed
+    bool stub_needed = false;    // (c) is still owed
+    bool db_existed = false;     // metadata3.db was there before this open touched anything
+};
+
+int store_layout(const char *dir, StoreLayout &lay) {
+    String olddb, newdb;
+    db_path(dir, olddb, true);
+    db_path(dir, newdb, false);
+    struct stat ost, nst;
+    int orc = ::stat(olddb.c_str(), &ost) == 0 ? 0 : -errno;
+    int nrc = ::stat(newdb.c_str(), &nst) == 0 ? 0 : -errno;
+    // "I could not look" is neither presence nor absence (13th round): it ends the open with the
+    // errno that caused it, before anything at all is created.
+    if (orc && orc != -ENOENT) return orc;
+    if (nrc && nrc != -ENOENT) return nrc;
+    bool old_reg = orc == 0 && S_ISREG(ost.st_mode);
+    bool old_dir = orc == 0 && S_ISDIR(ost.st_mode);
+    if (orc == 0 && !old_reg && !old_dir) return WFS_E_STORE_DAMAGED;
+    if (nrc == 0 && !S_ISREG(nst.st_mode)) return WFS_E_STORE_DAMAGED;
+    if (old_reg && nrc == 0) return WFS_E_STORE_DAMAGED;
+    if (old_dir && nrc != 0) return WFS_E_STORE_DAMAGED;
+    lay.move_needed = old_reg;
+    lay.stub_needed = !old_dir;
+    lay.db_existed = nrc == 0;
+
+    // P17, over whichever of the two names the database is under at this moment. "Unreadable"
+    // counts as missing, exactly as it did when there was one name: a database we cannot open is
+    // one whose ids we do not know, and a zero-length file is a database SQLite would happily
+    // start counting from 1 again.
+    bool readable = (nrc == 0 && nst.st_size > 0 && ::access(newdb.c_str(), R_OK | W_OK) == 0) ||
+                    (old_reg && ost.st_size > 0 && ::access(olddb.c_str(), R_OK | W_OK) == 0);
+    if (!readable) {
+        String what;
+        int trees = store_has_trees(dir, what);
+        if (trees < 0) return trees;
+        if (trees) return WFS_E_STORE_DAMAGED;
     }
     return 0;
 }
@@ -647,7 +881,7 @@ extern "C" const char *wfs_strerror(int rc) {
     case WFS_E_SNAPSHOT_IN_USE: return "a live world still needs this snapshot";
     case WFS_E_GC_BUSY: return "another gc worker is running";
     case WFS_E_STORE_UNREACHABLE: return "that store cannot be opened from here";
-    case WFS_E_STORE_DAMAGED: return "the store has trees in it but no readable metadata.db";
+    case WFS_E_STORE_DAMAGED: return "the store has trees in it but no readable metadata3.db";
     case WFS_E_STORE_BUSY:
         return "older clients still have the store open; stop them and retry";
     case WFS_E_TRASH_BLOCKED: return "a directory is in the way of this trash entry's deletion";
@@ -676,14 +910,20 @@ extern "C" const char *wfs_store_dir(const wfs_store *s) { return s ? s->dir.c_s
 // PR #1 review (34th round, P1): who else has this store's database open. The one caller is the
 // CLI, after a WFS_E_STORE_BUSY refusal, so that the operator is told what to stop rather than
 // left to find it. Read-only and stateless: it opens nothing and writes nothing.
+//
+// PR #1 review (35th round, P1): under whichever of the two names the database is at right now.
+// The refusal this explains has already put the store back the way M1 left it -- the database is
+// at `metadata.db` again -- so asking only about the schema-3 name would name nobody at all.
 extern "C" int wfs_store_holders(const char *store_dir, wfs_store_holder *buf, size_t cap,
                                  size_t *count) {
     if (!store_dir || !count) return -EINVAL;
     *count = 0;
     String real;
     if (int rc = wfs::fs_realpath(store_dir, real)) return rc;
-    String dbp(real);
-    dbp.append("/metadata.db");
+    String dbp;
+    db_path(real.c_str(), dbp, false);
+    struct stat dbst;
+    if (::stat(dbp.c_str(), &dbst) != 0) db_path(real.c_str(), dbp, true);
     wfs::Vec<int64_t> pids;
     if (int rc = wfs::fs_other_holders(dbp.c_str(), pids)) return rc;
     *count = pids.size();
@@ -709,28 +949,19 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
     // `snapshots/S1` already on disk -- so this is refused, loudly, before anything is created.
     // "Unreadable" counts as missing: a database we cannot open is one whose ids we do not know.
     //
-    // PR #1 review (13th round, P1): and "I could not look" counts as neither. A stat(2) on
-    // metadata.db that fails for a reason other than ENOENT says nothing about whether the file
-    // is there, and a subtree scan that could not run says nothing about whether the store is
-    // empty -- so both of those end the open with the errno that caused them, before anything
-    // at all is created. The file itself is never replaced either way: a metadata.db that is
-    // there but cannot be opened fails in sqlite3_open_v2 below (SQLITE_OPEN_CREATE creates a
-    // database that is not there, it does not truncate one that is).
-    {
-        String dbp(real);
-        dbp.append("/metadata.db");
-        struct stat dbst;
-        int srt = ::stat(dbp.c_str(), &dbst) == 0 ? 0 : -errno;
-        if (srt && srt != -ENOENT) return srt;
-        bool readable = srt == 0 && S_ISREG(dbst.st_mode) && dbst.st_size > 0 &&
-                        ::access(dbp.c_str(), R_OK | W_OK) == 0;
-        if (!readable) {
-            String what;
-            int trees = store_has_trees(real.c_str(), what);
-            if (trees < 0) return trees;
-            if (trees) return WFS_E_STORE_DAMAGED;
-        }
-    }
+    // PR #1 review (13th round, P1): and "I could not look" counts as neither. A stat(2) that
+    // fails for a reason other than ENOENT says nothing about whether the file is there, and a
+    // subtree scan that could not run says nothing about whether the store is empty -- so both
+    // of those end the open with the errno that caused them, before anything at all is created.
+    // The file itself is never replaced either way: a database that is there but cannot be
+    // opened fails in sqlite3_open_v2 below (SQLITE_OPEN_CREATE creates a database that is not
+    // there, it does not truncate one that is).
+    //
+    // PR #1 review (35th round, P1): both of those questions are now asked of two names, and
+    // the answer also says which step of the 2 -> 3 upgrade this store is owed. See
+    // store_layout() above for the table.
+    StoreLayout lay;
+    if (int rc = store_layout(real.c_str(), lay)) return rc;
 
     wfs_store *s = new wfs_store();
     s->dir.assign(real.c_str());
@@ -747,8 +978,61 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
         int fd = ::open(p.c_str(), O_WRONLY | O_CREAT, 0644);
         if (fd >= 0) ::close(fd);
     }
-    String dbp(s->dir);
-    dbp.append("/metadata.db");
+    // ---- PR #1 review (32nd/34th/35th rounds): the 2 -> 3 upgrade, in order -----------------
+    //
+    // (a) VERSION := 3, (b) move the database, (c) the stub, (d) the holder gate -- and only
+    // then is anything opened. The 32nd round's reasoning for putting the file first is below;
+    // the 35th round's for the move is on store_layout() and db_move_to_schema3() above. The
+    // stamp is read here, from the database where it still lies, because a store from a schema
+    // we do not know has to come back untouched and step (b) would already have moved it.
+    bool gated = false;
+    if (lay.move_needed) {
+        String olddb;
+        db_path(s->dir.c_str(), olddb, true);
+        int old_uv = 0;
+        int mrc = db_user_version_at(olddb.c_str(), &old_uv);
+        if (!mrc && old_uv / 100 > WFS_STORE_SCHEMA) { wfs_store_close(s); return WFS_E_SCHEMA; }
+        if (!mrc && legacy_schema) {
+            if (int vrc = version_upgrade(s->dir.c_str())) { wfs_store_close(s); return vrc; }
+            if (wfs_test_after_version_bump)
+                wfs_test_after_version_bump(wfs_test_after_version_bump_ctx, s->dir.c_str());
+        }
+        if (!mrc) mrc = db_move_to_schema3(s->dir.c_str());
+        if (mrc) {
+            // PR #1 review (31st round, P2, one step further along): the first open of a
+            // schema-2 store is serialised by nothing, so two of them can be here at once and
+            // only one rename can land. The loser finds a DIRECTORY where the database was and
+            // fails every way there is to fail -- which is not an error in either process, it
+            // is the move having already been made. So the layout is asked again, and only a
+            // layout that still owes the move ends this open.
+            StoreLayout again;
+            if (store_layout(s->dir.c_str(), again) || again.move_needed) {
+                wfs_store_close(s);
+                return mrc;
+            }
+            lay = again;
+        } else {
+            if (int src = db_stub_make(s->dir.c_str())) { wfs_store_close(s); return src; }
+            // ... and the door is only shut for those who were not already through it. See
+            // legacy_holders_gate() above: this is the one open in a store's life that pays
+            // for it.
+            if (int hrc = legacy_holders_gate(s->dir.c_str())) { wfs_store_close(s); return hrc; }
+            gated = true;
+            lay.stub_needed = false;
+            lay.db_existed = true;
+            if (wfs_test_after_db_move)
+                wfs_test_after_db_move(wfs_test_after_db_move_ctx, s->dir.c_str());
+        }
+    } else if (legacy_schema) {
+        // The layout says the move has already happened -- or that there was never a database
+        // to move -- so all this store is owed is the bump. Forward, always (store_layout()).
+        if (int vrc = version_upgrade(s->dir.c_str())) { wfs_store_close(s); return vrc; }
+        if (wfs_test_after_version_bump)
+            wfs_test_after_version_bump(wfs_test_after_version_bump_ctx, s->dir.c_str());
+    }
+
+    String dbp;
+    db_path(s->dir.c_str(), dbp, false);
     // A file that is there but is not a database (truncated, or something else entirely) is the
     // same danger as one that is missing, and by here we know the store is not empty.
     int rc = sqlite3_open_v2(dbp.c_str(), &s->db,
@@ -807,11 +1091,19 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
     // Nothing else changes: a store that is already 3 does not come through here at all, and a
     // migration that fails leaves a VERSION the older binary is refused by -- which costs it an
     // M1 store it could have collected, and is the safe half of that trade.
-    if (legacy_schema) {
-        if (int vrc = version_upgrade(s->dir.c_str())) { wfs_store_close(s); return vrc; }
-        if (wfs_test_after_version_bump) wfs_test_after_version_bump(wfs_test_after_version_bump_ctx, s->dir.c_str());
-        // ... and the door is only shut for those who were not already through it. See
-        // legacy_holders_gate() above: this is the one open in a store's life that pays for it.
+    //
+    // PR #1 review (35th round, P1): the steps above ran before the open, and what is left here
+    // is the crash states they can be resumed from. The stub is made good whenever it is not
+    // there -- which is also how a brand new store gets one, right after its database is
+    // created -- and the holder gate is owed by exactly the stores whose database has moved but
+    // whose migration has not committed: `user_version` still in the 2xx, on a file that was
+    // already on disk when this open started. A store that is stamped 3xx does not pay
+    // proc_listpidspath(3)'s ~100 ms, and a database this open created itself has no holder
+    // that predates it.
+    if (lay.stub_needed) {
+        if (int src = db_stub_make(s->dir.c_str())) { wfs_store_close(s); return src; }
+    }
+    if (!gated && lay.db_existed && user_version / 100 <= WFS_STORE_SCHEMA_M1) {
         if (int hrc = legacy_holders_gate(s->dir.c_str())) { wfs_store_close(s); return hrc; }
     }
     if (sqlite3_exec(s->db, kPragmas, nullptr, nullptr, nullptr) != SQLITE_OK) {

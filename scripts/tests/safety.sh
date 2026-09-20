@@ -248,20 +248,20 @@ fi
 if command -v sqlite3 > /dev/null 2>&1; then
     mkdir -p "$SCRATCH/pr3live/.wfs-fork-live/sub"
     touch "$SCRATCH/pr3live/.wfs-fork-live/sub/half"
-    sqlite3 "$WORLD_STORE/metadata.db" "INSERT INTO worlds(kind,parent_world,snapshot_id,name,path,state,created_at,tmp_path,owner_pid,owner_start) VALUES(1,0,1,'pr3live','$SCRATCH/pr3live/w',0,0,'$SCRATCH/pr3live/.wfs-fork-live',$$,0);" 2>/dev/null
+    sqlite3 "$WORLD_STORE/metadata3.db" "INSERT INTO worlds(kind,parent_world,snapshot_id,name,path,state,created_at,tmp_path,owner_pid,owner_start) VALUES(1,0,1,'pr3live','$SCRATCH/pr3live/w',0,0,'$SCRATCH/pr3live/.wfs-fork-live',$$,0);" 2>/dev/null
     # created_at 0 and no minimum age: the producer being alive is the only thing protecting it.
     WORLD_GC_CREATING_MIN_AGE=0 "$WORLD" fs gc > /dev/null 2>&1
     if [ -e "$SCRATCH/pr3live/.wfs-fork-live/sub/half" ] &&
-       [ "$(sqlite3 "$WORLD_STORE/metadata.db" "SELECT state FROM worlds WHERE name='pr3live';")" = 0 ]; then
+       [ "$(sqlite3 "$WORLD_STORE/metadata3.db" "SELECT state FROM worlds WHERE name='pr3live';")" = 0 ]; then
         ok PR3 "gc leaves a CREATING row alone while its producer is alive"
     else
         bad PR3 "gc leaves a CREATING row alone while its producer is alive"
     fi
     # And once the producer is gone, that same row and that same tree are collected.
-    sqlite3 "$WORLD_STORE/metadata.db" "UPDATE worlds SET owner_pid=2147480000 WHERE name='pr3live';"
+    sqlite3 "$WORLD_STORE/metadata3.db" "UPDATE worlds SET owner_pid=2147480000 WHERE name='pr3live';"
     WORLD_GC_CREATING_MIN_AGE=0 "$WORLD" fs gc > /dev/null 2>&1
     if [ ! -e "$SCRATCH/pr3live/.wfs-fork-live" ] &&
-       [ "$(sqlite3 "$WORLD_STORE/metadata.db" "SELECT state FROM worlds WHERE name='pr3live';")" = 3 ]; then
+       [ "$(sqlite3 "$WORLD_STORE/metadata3.db" "SELECT state FROM worlds WHERE name='pr3live';")" = 3 ]; then
         ok PR3 "gc collects it once the producer is gone"
     else
         bad PR3 "gc collects it once the producer is gone"
@@ -278,11 +278,11 @@ if command -v sqlite3 > /dev/null 2>&1; then
     STUCKTMP="$SCRATCH/pr5stuck/.wfs-fork-stuck"
     mkdir -p "$STUCKTMP/keep"
     echo x > "$STUCKTMP/keep/f.txt"
-    sqlite3 "$WORLD_STORE/metadata.db" "INSERT INTO worlds(kind,parent_world,snapshot_id,name,path,state,created_at,tmp_path,owner_pid,owner_start) VALUES(1,0,1,'pr5stuck','$SCRATCH/pr5stuck/w',0,0,'$STUCKTMP',2147480000,0);" 2>/dev/null
+    sqlite3 "$WORLD_STORE/metadata3.db" "INSERT INTO worlds(kind,parent_world,snapshot_id,name,path,state,created_at,tmp_path,owner_pid,owner_start) VALUES(1,0,1,'pr5stuck','$SCRATCH/pr5stuck/w',0,0,'$STUCKTMP',2147480000,0);" 2>/dev/null
     chmod +a "$(id -un) deny delete,delete_child,add_file" "$STUCKTMP/keep"
     out=$(WORLD_GC_CREATING_MIN_AGE=0 "$WORLD" fs gc 2>&1)
-    STUCKSTATE=$(sqlite3 "$WORLD_STORE/metadata.db" "SELECT state FROM worlds WHERE name='pr5stuck';")
-    STUCKPATH=$(sqlite3 "$WORLD_STORE/metadata.db" "SELECT tmp_path FROM worlds WHERE name='pr5stuck';")
+    STUCKSTATE=$(sqlite3 "$WORLD_STORE/metadata3.db" "SELECT state FROM worlds WHERE name='pr5stuck';")
+    STUCKPATH=$(sqlite3 "$WORLD_STORE/metadata3.db" "SELECT tmp_path FROM worlds WHERE name='pr5stuck';")
     if [ -e "$STUCKTMP/keep/f.txt" ] && [ "$STUCKSTATE" = 0 ] && [ "$STUCKPATH" = "$STUCKTMP" ]; then
         ok PR5 "a fork tree gc cannot remove keeps its row and its tmp_path"
     else
@@ -299,7 +299,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
     # Take the ACL away and the next wake finishes what it started: tree gone, row dead.
     chmod -N "$STUCKTMP/keep"
     WORLD_GC_CREATING_MIN_AGE=0 "$WORLD" fs gc > /dev/null 2>&1
-    STUCKSTATE=$(sqlite3 "$WORLD_STORE/metadata.db" "SELECT state FROM worlds WHERE name='pr5stuck';")
+    STUCKSTATE=$(sqlite3 "$WORLD_STORE/metadata3.db" "SELECT state FROM worlds WHERE name='pr5stuck';")
     if [ ! -e "$STUCKTMP" ] && [ "$STUCKSTATE" = 3 ]; then
         ok PR5 "once it can be removed the next gc removes it and buries the row"
     else
@@ -920,7 +920,7 @@ fi
 
 # ---- P17: trees in the store but no database -> refuse, never rebuild -----------------------
 # Its own store, because the point of the rule is that the store is left exactly as it was
-# found. Snapshot and world ids live in metadata.db; a fresh one hands out 1 again and the next
+# found. Snapshot and world ids live in metadata3.db; a fresh one hands out 1 again and the next
 # `init` writes S1 on top of the snapshots/S1 that is still on disk.
 P17STORE="$SCRATCH/p17-store"
 mkdir -p "$SCRATCH/p17-src"
@@ -929,23 +929,26 @@ echo one > "$SCRATCH/p17-src/a.txt"
 # The gate is opened first so that the scratch cleanup can get rid of the tree afterwards.
 # Finding the tree does not need it: a readdir of snapshots/ never steps inside S1.
 chmod 0700 "$P17STORE/snapshots/S1/root" 2>/dev/null
-rm -f "$P17STORE"/metadata.db "$P17STORE"/metadata.db-wal "$P17STORE"/metadata.db-shm
-check    P17 "a store with snapshots but no metadata.db is refused" 3 -- \
+# PR #1 review (35th round, P1): the database is `metadata3.db` now, and `metadata.db` is the
+# empty stub directory a schema-3 store carries. Removing the database and leaving the stub is
+# exactly the damage this guard is for.
+rm -f "$P17STORE"/metadata3.db "$P17STORE"/metadata3.db-wal "$P17STORE"/metadata3.db-shm
+check    P17 "a store with snapshots but no metadata3.db is refused" 3 -- \
          "$WORLD" --store "$P17STORE" fs status
-has_hint P17 "the refusal says restore the db or move the store aside" "restore metadata.db" -- \
+has_hint P17 "the refusal says restore the db or move the store aside" "restore metadata3.db" -- \
          "$WORLD" --store "$P17STORE" fs list
-[ ! -e "$P17STORE/metadata.db" ] && ok P17 "the refused open left no new database behind" \
-                                || bad P17 "the refused open left no new database behind"
+[ ! -e "$P17STORE/metadata3.db" ] && ok P17 "the refused open left no new database behind" \
+                                 || bad P17 "the refused open left no new database behind"
 out=$("$WORLD" --store "$P17STORE" fs gc --reconcile 2>&1)
 if echo "$out" | grep -q "gc --reconcile.*cannot help"; then
     ok P17 "the refusal explains that gc --reconcile cannot repair this"
 else
     bad P17 "the refusal explains that gc --reconcile cannot repair this"; echo "$out" | sed 's/^/        /'
 fi
-echo "this is not a database" > "$P17STORE/metadata.db"
-check P17 "a metadata.db that is not a database is refused too" 3 -- \
+echo "this is not a database" > "$P17STORE/metadata3.db"
+check P17 "a metadata3.db that is not a database is refused too" 3 -- \
       "$WORLD" --store "$P17STORE" fs status
-rm -f "$P17STORE/metadata.db"
+rm -f "$P17STORE/metadata3.db"
 [ -f "$P17STORE/snapshots/S1/root/a.txt" ] && ok P17 "the snapshot tree is left exactly as it was" \
                                           || bad P17 "the snapshot tree is left exactly as it was"
 check P17 "an empty store directory is new, not damaged" 0 -- \
@@ -1218,14 +1221,14 @@ if command -v sqlite3 > /dev/null 2>&1; then
     H7STORE="$SCRATCH/half-store"
     h7() { "$WORLD" --store "$H7STORE" "$@"; }
     h7 fs status > /dev/null 2>&1
-    sqlite3 "$H7STORE/metadata.db" "INSERT INTO snapshots(name,path,src_path,from_world,created_at,state,owner_pid,owner_start) VALUES('pr7half','','',0,0,0,2147480000,0);" 2>/dev/null
-    H7S=$(sqlite3 "$H7STORE/metadata.db" "SELECT id FROM snapshots WHERE name='pr7half';")
+    sqlite3 "$H7STORE/metadata3.db" "INSERT INTO snapshots(name,path,src_path,from_world,created_at,state,owner_pid,owner_start) VALUES('pr7half','','',0,0,0,2147480000,0);" 2>/dev/null
+    H7S=$(sqlite3 "$H7STORE/metadata3.db" "SELECT id FROM snapshots WHERE name='pr7half';")
     H7DIR="$H7STORE/snapshots/S$H7S"
     mkdir -p "$H7DIR/keep"
     echo x > "$H7DIR/keep/f.txt"
     chmod +a "$(id -un) deny delete,delete_child,add_file" "$H7DIR/keep"
     out=$(WORLD_GC_CREATING_MIN_AGE=0 h7 fs gc 2>&1)
-    H7ROWS=$(sqlite3 "$H7STORE/metadata.db" "SELECT count(*) FROM snapshots WHERE id=$H7S;")
+    H7ROWS=$(sqlite3 "$H7STORE/metadata3.db" "SELECT count(*) FROM snapshots WHERE id=$H7S;")
     if [ -e "$H7DIR/keep/f.txt" ] && [ "$H7ROWS" = 1 ]; then
         ok PR7 "a half-built snapshot gc cannot remove keeps its row"
     else
@@ -1242,7 +1245,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
     # Take the ACL away and the next wake finishes what it started: tree gone, row gone.
     chmod -N "$H7DIR/keep"
     WORLD_GC_CREATING_MIN_AGE=0 h7 fs gc > /dev/null 2>&1
-    H7ROWS=$(sqlite3 "$H7STORE/metadata.db" "SELECT count(*) FROM snapshots WHERE id=$H7S;")
+    H7ROWS=$(sqlite3 "$H7STORE/metadata3.db" "SELECT count(*) FROM snapshots WHERE id=$H7S;")
     if [ ! -e "$H7DIR" ] && [ "$H7ROWS" = 0 ]; then
         ok PR7 "once it can be removed the next gc removes the tree and the row"
     else
@@ -1273,10 +1276,10 @@ if command -v sqlite3 > /dev/null 2>&1; then
     if [ -n "$P8ENTRY" ]; then
         # snapshot rows are immutable, so a snap_created_at that no longer matches means the id
         # belongs to a different snapshot now -- the entry is stale and must never be handed out.
-        sqlite3 "$P8STORE/metadata.db" "UPDATE pool SET snap_created_at=snap_created_at+1;"
+        sqlite3 "$P8STORE/metadata3.db" "UPDATE pool SET snap_created_at=snap_created_at+1;"
         chmod +a "$(id -un) deny delete,delete_child,add_file" "$P8ENTRY/keep"
         out=$(p8 fs gc 2>&1)
-        P8ROWS=$(sqlite3 "$P8STORE/metadata.db" "SELECT count(*) FROM pool;")
+        P8ROWS=$(sqlite3 "$P8STORE/metadata3.db" "SELECT count(*) FROM pool;")
         if [ -e "$P8ENTRY/keep/f.txt" ] && [ "$P8ROWS" = 1 ]; then
             ok PR8 "a stale pool entry gc cannot remove keeps its row"
         else
@@ -1292,7 +1295,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
         chmod -N "$P8ENTRY/keep"
         p8 fs gc > /dev/null 2>&1
         for _ in $(seq 40); do [ ! -e "$P8ENTRY" ] && break; sleep 0.25; done
-        P8ROWS=$(sqlite3 "$P8STORE/metadata.db" "SELECT count(*) FROM pool;")
+        P8ROWS=$(sqlite3 "$P8STORE/metadata3.db" "SELECT count(*) FROM pool;")
         if [ ! -e "$P8ENTRY" ] && [ "$P8ROWS" = 0 ]; then
             ok PR8 "once it can be removed the next gc removes the tree and the row"
         else
@@ -1320,14 +1323,14 @@ if command -v sqlite3 > /dev/null 2>&1; then
     mkdir -p "$SCRATCH/d7fork"
     D7TMP="$SCRATCH/d7fork/.wfs-fork-abandoned"
     clone_tree "$POOLSRC" "$D7TMP"
-    sqlite3 "$D7STORE/metadata.db" "INSERT INTO worlds(kind,parent_world,snapshot_id,name,path,state,created_at,tmp_path,owner_pid,owner_start) VALUES(1,0,0,'d7fork','$SCRATCH/d7fork/w',0,0,'$D7TMP',2147480000,0);" 2>/dev/null
+    sqlite3 "$D7STORE/metadata3.db" "INSERT INTO worlds(kind,parent_world,snapshot_id,name,path,state,created_at,tmp_path,owner_pid,owner_start) VALUES(1,0,0,'d7fork','$SCRATCH/d7fork/w',0,0,'$D7TMP',2147480000,0);" 2>/dev/null
     t0=$(python3 -c 'import time;print(int(time.time()*1000))')
     out=$(WORLD_GC_BATCH_SECS=1 d7 fs gc 2>&1)
     t1=$(python3 -c 'import time;print(int(time.time()*1000))')
     if [ "$((t1 - t0))" -lt 2500 ]; then ok PR7 "a one-second gc does not unlink a whole abandoned fork tree ($((t1-t0)) ms)"
     else bad PR7 "a one-second gc does not unlink a whole abandoned fork tree ($((t1-t0)) ms)"; echo "$out" | sed 's/^/        /'; fi
     D7LEFT=$(find "$D7TMP" 2>/dev/null | wc -l | tr -d ' ')
-    D7STATE=$(sqlite3 "$D7STORE/metadata.db" "SELECT state FROM worlds WHERE name='d7fork';")
+    D7STATE=$(sqlite3 "$D7STORE/metadata3.db" "SELECT state FROM worlds WHERE name='d7fork';")
     if [ "$D7STATE" = 0 ] && [ "$D7LEFT" -gt 0 ] && [ "$D7LEFT" -lt 120401 ]; then
         ok PR7 "what it did not finish keeps its CREATING row and its tmp_path ($D7LEFT entries left)"
     else
@@ -1341,7 +1344,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
                                                   || ok PR7 "out of time is not reported as a failure"
     WORLD_GC_CREATING_MIN_AGE=0 d7 fs gc --now > /dev/null 2>&1
     for _ in $(seq 120); do [ ! -e "$D7TMP" ] && break; sleep 0.25; done
-    D7STATE=$(sqlite3 "$D7STORE/metadata.db" "SELECT state FROM worlds WHERE name='d7fork';")
+    D7STATE=$(sqlite3 "$D7STORE/metadata3.db" "SELECT state FROM worlds WHERE name='d7fork';")
     if [ ! -e "$D7TMP" ] && [ "$D7STATE" = 3 ]; then
         ok PR7 "a gc without the budget finishes the tree and buries the row"
     else
@@ -1353,8 +1356,8 @@ if command -v sqlite3 > /dev/null 2>&1; then
     D8STORE="$SCRATCH/deadline-snap-store"
     d8() { "$WORLD" --store "$D8STORE" "$@"; }
     d8 fs status > /dev/null 2>&1
-    sqlite3 "$D8STORE/metadata.db" "INSERT INTO snapshots(name,path,src_path,from_world,created_at,state,owner_pid,owner_start) VALUES('d8snap','','',0,0,0,2147480000,0);" 2>/dev/null
-    D8S=$(sqlite3 "$D8STORE/metadata.db" "SELECT id FROM snapshots WHERE name='d8snap';")
+    sqlite3 "$D8STORE/metadata3.db" "INSERT INTO snapshots(name,path,src_path,from_world,created_at,state,owner_pid,owner_start) VALUES('d8snap','','',0,0,0,2147480000,0);" 2>/dev/null
+    D8S=$(sqlite3 "$D8STORE/metadata3.db" "SELECT id FROM snapshots WHERE name='d8snap';")
     D8TMP="$D8STORE/snapshots/S$D8S.wfs-tmp"
     clone_tree "$POOLSRC" "$D8TMP"
     t0=$(python3 -c 'import time;print(int(time.time()*1000))')
@@ -1363,7 +1366,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
     if [ "$((t1 - t0))" -lt 2500 ]; then ok PR7 "a one-second gc does not unlink a whole half-built snapshot ($((t1-t0)) ms)"
     else bad PR7 "a one-second gc does not unlink a whole half-built snapshot ($((t1-t0)) ms)"; echo "$out" | sed 's/^/        /'; fi
     D8LEFT=$(find "$D8TMP" 2>/dev/null | wc -l | tr -d ' ')
-    D8ROWS=$(sqlite3 "$D8STORE/metadata.db" "SELECT count(*) FROM snapshots WHERE id=$D8S;")
+    D8ROWS=$(sqlite3 "$D8STORE/metadata3.db" "SELECT count(*) FROM snapshots WHERE id=$D8S;")
     if [ "$D8ROWS" = 1 ] && [ "$D8LEFT" -gt 0 ] && [ "$D8LEFT" -lt 120401 ]; then
         ok PR7 "what it did not finish keeps its CREATING row ($D8LEFT entries left)"
     else
@@ -1376,10 +1379,10 @@ if command -v sqlite3 > /dev/null 2>&1; then
     # parallel removes the two a few milliseconds apart, and reading the row in between made this
     # assertion flaky (PR #1 review, 8th round -- seen once while the pool case below was added).
     for _ in $(seq 120); do
-        [ ! -e "$D8TMP" ] && [ "$(sqlite3 "$D8STORE/metadata.db" "SELECT count(*) FROM snapshots WHERE id=$D8S;")" = 0 ] && break
+        [ ! -e "$D8TMP" ] && [ "$(sqlite3 "$D8STORE/metadata3.db" "SELECT count(*) FROM snapshots WHERE id=$D8S;")" = 0 ] && break
         sleep 0.25
     done
-    D8ROWS=$(sqlite3 "$D8STORE/metadata.db" "SELECT count(*) FROM snapshots WHERE id=$D8S;")
+    D8ROWS=$(sqlite3 "$D8STORE/metadata3.db" "SELECT count(*) FROM snapshots WHERE id=$D8S;")
     if [ ! -e "$D8TMP" ] && [ "$D8ROWS" = 0 ]; then
         ok PR7 "a gc without the budget finishes the snapshot tree and its row"
     else
@@ -1407,11 +1410,11 @@ if command -v sqlite3 > /dev/null 2>&1; then
     N9W=$(n9 fs fork --from "$N9S" --to "$PROJ/r9w" --name r9w 2>/dev/null | awk '/^W[0-9]/{print $1}')
     n9 fs discard "$N9W" > /dev/null 2>&1
     N9ID=${N9W#W}
-    N9TP=$(sqlite3 "$N9STORE/metadata.db" "SELECT trash_path FROM worlds WHERE id=$N9ID;")
+    N9TP=$(sqlite3 "$N9STORE/metadata3.db" "SELECT trash_path FROM worlds WHERE id=$N9ID;")
     if [ -n "$N9TP" ] && [ -d "$N9TP" ]; then
         mv "$N9TP" "$N9TP.deleting"
         out=$(n9 fs gc --retention 0 --now 2>&1)
-        N9STATE=$(sqlite3 "$N9STORE/metadata.db" "SELECT state FROM worlds WHERE id=$N9ID;")
+        N9STATE=$(sqlite3 "$N9STORE/metadata3.db" "SELECT state FROM worlds WHERE id=$N9ID;")
         if [ ! -e "$N9TP.deleting" ] && [ "$N9STATE" = 3 ]; then
             ok PR9 "a tree wearing .deleting is still its row's entry, not an orphan"
         else
@@ -1443,8 +1446,8 @@ if command -v sqlite3 > /dev/null 2>&1; then
     mv "$PROJ/r9move" "$PROJ/r9moved"
     n9 fs verify "$PROJ/r9moved" > /dev/null 2>&1
     out=$(n9 fs gc --reconcile 2>&1)
-    N9STATE2=$(sqlite3 "$N9STORE/metadata.db" "SELECT state FROM worlds WHERE id=$N9ID2;")
-    N9PATH2=$(sqlite3 "$N9STORE/metadata.db" "SELECT path FROM worlds WHERE id=$N9ID2;")
+    N9STATE2=$(sqlite3 "$N9STORE/metadata3.db" "SELECT state FROM worlds WHERE id=$N9ID2;")
+    N9PATH2=$(sqlite3 "$N9STORE/metadata3.db" "SELECT path FROM worlds WHERE id=$N9ID2;")
     if [ "$N9STATE2" = 1 ] && [ "$N9PATH2" = "$PROJ/r9moved" ]; then
         ok PR9 "a moved world that has been verified survives --reconcile"
     else
@@ -1454,7 +1457,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
     # ... and one whose tree really is gone is still reconciled.
     rm -rf "$PROJ/r9moved"
     n9 fs gc --reconcile > /dev/null 2>&1
-    N9STATE2=$(sqlite3 "$N9STORE/metadata.db" "SELECT state FROM worlds WHERE id=$N9ID2;")
+    N9STATE2=$(sqlite3 "$N9STORE/metadata3.db" "SELECT state FROM worlds WHERE id=$N9ID2;")
     if [ "$N9STATE2" = 3 ]; then ok PR9 "a world whose tree really is gone is still reconciled"
     else bad PR9 "a world whose tree really is gone is still reconciled (state $N9STATE2)"; fi
 fi
@@ -1520,7 +1523,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
     mkdir -p "$R12SRC"
     echo x > "$R12SRC/f.txt"
     "$WORLD" fs init "$R12SRC" --name r12 > /dev/null 2>&1
-    R12ID=$(sqlite3 "$WORLD_STORE/metadata.db" "SELECT id FROM snapshots WHERE name='r12';")
+    R12ID=$(sqlite3 "$WORLD_STORE/metadata3.db" "SELECT id FROM snapshots WHERE name='r12';")
     R12DIR="$WORLD_STORE/snapshots/S$R12ID"
     chmod 0700 "$R12DIR/root"          # the gate, so this test can take the root away
     rm -rf "$R12DIR/root"              # the path the row records is gone: the row is dangling
@@ -1528,7 +1531,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
     echo x > "$R12DIR/keep/f.txt"
     chmod +a "$(id -un) deny delete,delete_child,add_file" "$R12DIR/keep"
     out=$("$WORLD" fs gc --reconcile 2>&1)
-    R12STATE=$(sqlite3 "$WORLD_STORE/metadata.db" "SELECT state FROM snapshots WHERE id=$R12ID;")
+    R12STATE=$(sqlite3 "$WORLD_STORE/metadata3.db" "SELECT state FROM snapshots WHERE id=$R12ID;")
     if [ -e "$R12DIR/keep/f.txt" ] && [ "$R12STATE" = 1 ]; then
         ok PR12 "a stump reconcile cannot remove keeps its row"
     else
@@ -1541,7 +1544,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
     # Take the ACL away and the next reconcile finishes what it started: stump gone, row dead.
     chmod -N "$R12DIR/keep"
     "$WORLD" fs gc --reconcile > /dev/null 2>&1
-    R12STATE=$(sqlite3 "$WORLD_STORE/metadata.db" "SELECT state FROM snapshots WHERE id=$R12ID;")
+    R12STATE=$(sqlite3 "$WORLD_STORE/metadata3.db" "SELECT state FROM snapshots WHERE id=$R12ID;")
     if [ ! -e "$R12DIR" ] && [ "$R12STATE" = 3 ]; then
         ok PR12 "once it can be removed the next reconcile removes it and buries the row"
     else
@@ -1572,8 +1575,8 @@ if command -v sqlite3 > /dev/null 2>&1; then
         # chflags, so the entry's tree genuinely will not go.
         chmod +a "$(id -un) deny delete,delete_child,add_file" "$D16ENTRY/keep"
         out=$(d16 fs discard "$D16S" --force 2>&1); rc=$?
-        D16STATE=$(sqlite3 "$D16STORE/metadata.db" "SELECT state FROM snapshots WHERE name='drain16';")
-        D16ROWS=$(sqlite3 "$D16STORE/metadata.db" "SELECT count(*) FROM pool;")
+        D16STATE=$(sqlite3 "$D16STORE/metadata3.db" "SELECT state FROM snapshots WHERE name='drain16';")
+        D16ROWS=$(sqlite3 "$D16STORE/metadata3.db" "SELECT count(*) FROM pool;")
         if [ "$rc" != 0 ] && [ "$D16STATE" = 1 ] && [ "$D16ROWS" = 1 ] && [ -e "$D16ENTRY/keep/f.txt" ]; then
             ok PR16 "a forced discard whose pool entry will not go leaves the snapshot and the row alone"
         else
@@ -1589,7 +1592,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
         # left of it. It is DRAINING: out of the hand-out set for good, and waiting for the
         # collector exactly like every other tree that would not go. So the row's state says 2,
         # `gc --status` counts it, and a fork of that snapshot clones instead of taking it.
-        D16PSTATE=$(sqlite3 "$D16STORE/metadata.db" "SELECT state FROM pool;")
+        D16PSTATE=$(sqlite3 "$D16STORE/metadata3.db" "SELECT state FROM pool;")
         [ "$D16PSTATE" = 2 ] \
             && ok PR21 "the row the drain could not remove is DRAINING, which no claim matches" \
             || bad PR21 "the row the drain could not remove is DRAINING, which no claim matches (state $D16PSTATE)"
@@ -1609,8 +1612,8 @@ if command -v sqlite3 > /dev/null 2>&1; then
         # Take the ACL away and the very same command goes through: pool empty, no tree left.
         chmod -N "$D16ENTRY/keep"
         out=$(d16 fs discard "$D16S" --force 2>&1); rc=$?
-        D16STATE=$(sqlite3 "$D16STORE/metadata.db" "SELECT state FROM snapshots WHERE name='drain16';")
-        D16ROWS=$(sqlite3 "$D16STORE/metadata.db" "SELECT count(*) FROM pool;")
+        D16STATE=$(sqlite3 "$D16STORE/metadata3.db" "SELECT state FROM snapshots WHERE name='drain16';")
+        D16ROWS=$(sqlite3 "$D16STORE/metadata3.db" "SELECT count(*) FROM pool;")
         if [ "$rc" = 0 ] && [ ! -e "$D16ENTRY" ] && [ "$D16ROWS" = 0 ] && [ "$D16STATE" = 2 ]; then
             ok PR16 "and once it can be removed the same --force drains the pool and trashes it"
         else
