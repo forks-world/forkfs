@@ -28,6 +28,13 @@ jobs:
         shell: bash
         run: echo "TMPDIR=${RUNNER_TEMP}/" >> "$GITHUB_ENV"
 
+      - name: Verify runner architecture
+        shell: bash
+        run: |
+          runner_arch="$(uname -m)"
+          echo "Runner architecture: ${runner_arch}"
+          test "$runner_arch" = arm64
+
       - name: Configure Release build
         shell: bash
         run: |
