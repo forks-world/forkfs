@@ -840,7 +840,12 @@ int wfs_trash_entry_path(wfs_store *s, wfs_id id, int is_snapshot, char *buf, si
  * first *.deleting name -- wfs_gc_status() classifies every trash directory against every trashed
  * row, which is quadratic in the size of the trash and measurably not free on `discard` once a
  * thousand worlds are in there. Returns 1 when there is work, 0 when there is not.
- * `worker_running` may be NULL. */
+ * `worker_running` may be NULL.
+ *
+ * PR #1 review (33rd round): a scan that could not be read answers 1 as well. There is no error
+ * channel in a bool, so the failure takes the side that throws nothing away -- a collector that
+ * starts and reports the errno, rather than work nobody is told about and nothing comes back
+ * for. */
 int wfs_gc_pending(wfs_store *s, int64_t retention_secs, int *worker_running);
 
 /* ---- T2.2: discarding a snapshot ------------------------------------------------------------

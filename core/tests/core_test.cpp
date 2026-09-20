@@ -6343,6 +6343,29 @@ int main() {
         CHECK_OK(wfs_world_info(rs, rw1, &rwr));
         CHECK(rwr.state == WFS_ST_ACTIVE);
         CHECK(exists(rw));
+
+        // (b) the same shape in `gc --status`: pool_stranded()'s rc was dropped, so the report
+        //     printed no `pool:` line at all -- "nothing stale under <store>/pool" -- exactly
+        //     when the query that classifies pool work could not be read. One stale entry here
+        //     (a pool row whose snapshot does not exist, its tree still on disk) so that the
+        //     armed and the unarmed answers differ by more than an rc.
+        uint64_t rmade = 0;
+        CHECK_OK(wfs_pool_fill(rs, r1, 1, &rmade));
+        CHECK(rmade == 1);
+        wfs_store_close(rs);
+        db_exec(rdb, "UPDATE pool SET snapshot_id=9999;");
+        rs = NULL;
+        CHECK_OK(wfs_store_open(rstore, &rs));
+        wfs_trash_stat rts;
+        memset(&rts, 0, sizeof rts);
+        wfs_test_stmt_fail_sql = "created_at FROM pool ORDER BY id";
+        CHECK_RC(wfs_gc_status(rs, 0, &rts), -EIO);
+        CHECK(wfs_test_stmt_fail_sql == NULL);
+        CHECK(rts.pool_stranded == 0);                  // and 0 is not a report, it is the errno
+        // ... unarmed, the same call finds the entry it could not see before.
+        memset(&rts, 0, sizeof rts);
+        CHECK_OK(wfs_gc_status(rs, 0, &rts));
+        CHECK(rts.pool_stranded == 1);
         wfs_store_close(rs);
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", rstore, (unsigned long long)r1);
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree

@@ -4078,7 +4078,13 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
                 copy_str(out->foreign_path, sizeof out->foreign_path, jobs[i].path.c_str());
         }
     }
-    wfs::fs_free_space(s->dir.c_str(), &out->volume_free_bytes, &out->volume_total_bytes);
+    // PR #1 review (33rd round, P2): and the volume's own numbers, whose rc was dropped while
+    // `wfs_store_status()` two files away has propagated the identical call since it was written.
+    // A statvfs(2) that fails leaves both fields 0, and `gc --status` printed `volume: 0 B free`
+    // -- a number, in the line an operator reads to decide whether to collect now.
+    if (int rc = wfs::fs_free_space(s->dir.c_str(), &out->volume_free_bytes,
+                                    &out->volume_total_bytes))
+        return rc;
     // PR #1 review (5th round): and the abandoned fork trees that are still on disk. They are not
     // in the trash -- they are in the user's directory, named only by their CREATING row -- but
     // an operator asking what is waiting for the collector has to be told about them too.
@@ -4157,9 +4163,18 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
     // PR #1 review (27th round, P2): and what the count above could not look at. A pool root
     // or an S<n> that answers EACCES/EIO is not an empty pool, and this line is what stops the
     // report from saying it is.
+    // PR #1 review (33rd round, P2): and the count is the count, or this report does not come
+    // back. pool_stranded() answers -EIO when the query that classifies pool work could not be
+    // stepped (the 32nd round put that answer there), and its rc was dropped -- so the one case
+    // in which `gc --status` printed no `pool:` line at all was the case in which it had no idea
+    // whether there was one to print. That is the opposite of what this command is for: it is a
+    // diagnostic an operator reads before deciding a store is clean, and a wrong "clean" is
+    // worse than an error they can act on. There is nothing partial to salvage either -- the
+    // failure is in the classification, not in one directory of many, so the honest report is
+    // the errno.
     {
         wfs::DirUnreadable pu;
-        wfs::pool_stranded(s, &out->pool_stranded, &pu);
+        if (int rc = wfs::pool_stranded(s, &out->pool_stranded, &pu)) return rc;
         note(pu);
     }
     // PR #1 review (29th round, P2): and <store>/tmp, the fourth and last directory the
@@ -4266,8 +4281,19 @@ extern "C" int wfs_gc_pending(wfs_store *s, int64_t retention_secs, int *worker_
     // decision said "nothing waiting" -- so the CLI announced a background collection and
     // started nothing, every fork and discard made the same call, and the orphan sat there until
     // somebody ran `gc --now` by hand. Same cost as before: one readdir and the two row tables.
+    // PR #1 review (33rd round, P2): and a scan that failed answers 1, not 0. This function has
+    // no error channel -- it is a bool, "is there work" -- so the rc cannot be propagated and
+    // has to be turned into whichever answer does nothing irreversible, the rule the 32nd round
+    // wrote for every helper that returns a verdict instead of an errno. Here the two answers
+    // are "start a collector" and "there is nothing to collect", and it is the second that
+    // throws something away: the work the failed scan could not see stops waking the chain and
+    // sits in the trash until somebody runs `gc --now` by hand (the 3rd round's bug, reached
+    // through an EIO instead of through a classification gap). A collector started on a scan
+    // that turns out to fail again costs one process that returns the errno and exits -- and it
+    // is not a spin: this is only ever asked after a command that read the same database
+    // successfully, so a read that fails here is the transient, not the steady state.
     TrashView v;
-    if (trash_scan(s, cutoff, v) != 0) return 0;
+    if (trash_scan(s, cutoff, v) != 0) return 1;
     if (v.deleting.size() || v.due.size()) return 1;
     // PR #1 review (28th round, P2): and a directory the collector could not READ is work too --
     // it is the one kind of work whose size nobody knows, which is exactly why the chain has to
@@ -4472,10 +4498,15 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
         // 28th round: and the sweep says whether it could read <store>/snapshots at all. What it
         // could not look at is not a clean directory, so it is reported and retried rather than
         // passed over -- the same rule the pool got in the 27th.
+        // 33rd round, P2: and the sweep's own rc is this run's rc. It answers non-zero only for
+        // "this is not the directory I sweep" -- which would mean the collector had been asked
+        // to apply <store>/snapshots' claim rule somewhere else -- and a run that silently did
+        // no sweep at all is a run that reports a clean store it never looked at.
         wfs::DirUnreadable tu;
-        rm_tmp_in_store_dir(s, snaps.c_str(), &rep.tmp_removed, deadline_us, &rep.work_remains,
-                            &rep.tmp_failed, &tu);
+        int src = rm_tmp_in_store_dir(s, snaps.c_str(), &rep.tmp_removed, deadline_us,
+                                      &rep.work_remains, &rep.tmp_failed, &tu);
         rep.dirs_unreadable += tu.count;
+        if (src) return src;
     }
 
     // ---- T2.2: reconciliation ----------------------------------------------------------------
@@ -4613,10 +4644,16 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
     {
         // 27th round: a pool the collector could not read is reported, not passed over. The
         // sweep sets work_remains under the shared cap, so the worker chain comes back for it.
+        // 33rd round, P2: and its rc. pool_collect() answers -EIO when the classification it
+        // removes trees on the strength of could not be read (the 32nd round), and the run used
+        // to report `pool_removed 0` -- "there was nothing stale in the pool" -- for it. The
+        // classification is the first thing it does and the only thing that can fail, so a
+        // non-zero rc here means nothing was touched, let alone left half counted.
         wfs::DirUnreadable pu;
-        wfs::pool_collect(s, &rep.pool_removed, deadline_us, &rep.work_remains, &rep.pool_failed,
-                          &pu);
+        int prc = wfs::pool_collect(s, &rep.pool_removed, deadline_us, &rep.work_remains,
+                                    &rep.pool_failed, &pu);
         rep.dirs_unreadable += pu.count;
+        if (prc) return prc;
     }
 
     // <store>/tmp holds the seatbelt profiles `world exec` generates. They are removed when the
@@ -4669,11 +4706,14 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
         // The collector's pass all the same, although this one deletes nothing: it is the run
         // that finds a trash it cannot read, and the finding has to be recorded and retried
         // (28th round) exactly as the full pass below records it.
+        // 33rd round, P2: and a scan that failed is not a scan that found an empty trash. The
+        // rc was tested and then dropped on the floor -- `if (... == 0)` with no else -- so a
+        // `gc --no-trash` whose scan could not be read returned 0 with `work_remains` unset,
+        // which is the one thing that stops the worker chain from coming back.
         TrashView left;
-        if (trash_scan(s, cutoff, left, true, &rep.work_remains) == 0) {
-            if (left.deleting.size() || left.due.size()) rep.work_remains = 1;
-            rep.dirs_unreadable += left.unreadable.count;
-        }
+        if (int lrc = trash_scan(s, cutoff, left, true, &rep.work_remains)) return lrc;
+        if (left.deleting.size() || left.due.size()) rep.work_remains = 1;
+        rep.dirs_unreadable += left.unreadable.count;
         if (out) *out = rep;
         return 0;
     }

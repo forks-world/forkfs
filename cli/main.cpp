@@ -1357,16 +1357,26 @@ static int cmd_gc(wfs_store *s, int argc, char **argv) {
         // open and why -- the path and the errno come from a status read, which is the same
         // scan again. The trash, <store>/snapshots and the pool all arrive here: the collector
         // owes the same sentence for each of them.
+        //
+        // PR #1 review (33rd round, P2): and that second read can itself fail, so its rc is
+        // looked at. It used to be dropped, and `strerror(0)` printed "Undefined error: 0" as
+        // the reason a directory could not be read -- a note about a failure, ending in a
+        // sentence invented by a second failure nobody was told about. The run's own count is
+        // what is reported either way; only the path and the errno come from here, and when
+        // they cannot be had the line says so instead of making them up.
         wfs_trash_stat us;
         memset(&us, 0, sizeof us);
-        wfs_gc_status(s, retention, &us);
+        int urc = wfs_gc_status(s, retention, &us);
         fprintf(stderr,
                 "world: note: %llu director%s under the store could not be read (%s: %s), so\n"
                 "world:       whatever is in %s was neither collected nor counted. %s\n"
                 "world:       (`world fs gc --status`)\n",
                 (unsigned long long)rep.dirs_unreadable, rep.dirs_unreadable == 1 ? "y" : "ies",
-                us.dirs_unreadable_path[0] ? us.dirs_unreadable_path : "a directory of the store",
-                strerror(us.dirs_unreadable_errno), rep.dirs_unreadable == 1 ? "it" : "them",
+                (urc == 0 && us.dirs_unreadable_path[0]) ? us.dirs_unreadable_path
+                                                         : "a directory of the store",
+                (urc == 0 && us.dirs_unreadable_errno) ? strerror(us.dirs_unreadable_errno)
+                                                       : "the reason could not be read back",
+                rep.dirs_unreadable == 1 ? "it" : "them",
                 rep.work_remains ? "The collector will try again."
                                  : "It has failed too often to keep retrying by itself.");
     }
@@ -1377,9 +1387,12 @@ static int cmd_gc(wfs_store *s, int argc, char **argv) {
         // of ours", which since the 15th round it cannot be (the rename and the row that
         // records it commit together, so only one of the two names is ever ours). Nothing will
         // clear it but its owner, so the note says where to look.
+        // 33rd round, P2: the rc is deliberately not tested here. The struct is zeroed first
+        // and the only field used is a path, so a status read that fails falls through to the
+        // same sentence an empty path gets -- there is nothing this note could report wrongly.
         wfs_trash_stat bs;
         memset(&bs, 0, sizeof bs);
-        wfs_gc_status(s, retention, &bs);
+        (void)wfs_gc_status(s, retention, &bs);
         fprintf(stderr,
                 "world: note: %llu trash entr%s could not be collected: a directory is in the way of\n"
                 "world:       the name the collector renames to before deleting (`<entry>.deleting`),\n"
@@ -1394,9 +1407,9 @@ static int cmd_gc(wfs_store *s, int argc, char **argv) {
         // different inode from the one the record has carried since the world was published,
         // and for a world discarded across volumes that path is in the user's own `.wfs-trash`
         // under a predictable name. Nothing was renamed and nothing was removed.
-        wfs_trash_stat fs_;
+        wfs_trash_stat fs_;                       // 33rd round, P2: as above -- a path or nothing
         memset(&fs_, 0, sizeof fs_);
-        wfs_gc_status(s, retention, &fs_);
+        (void)wfs_gc_status(s, retention, &fs_);
         fprintf(stderr,
                 "world: note: %llu trash entr%s could not be collected: what is at %s is not the\n"
                 "world:       tree that record was written for (a different inode), so nothing\n"
@@ -1447,8 +1460,19 @@ static int cmd_status(wfs_store *s) {
            (unsigned long long)st.world_entries, (unsigned long long)st.pool_ready,
            (unsigned long long)st.pool_entries, freeb, totalb, meta);
     // T2.1/T2.2: what the collector still owes, and rows whose tree is not there any more.
+    //
+    // PR #1 review (33rd round, P2): `status` is the one report here that is worth printing in
+    // part -- everything above this line has already been read successfully, and refusing to
+    // print it because the trash could not be classified would be a worse answer than printing
+    // it. So the failure is not propagated; it is SAID. A silent omission used to read as "the
+    // trash is empty and no worker is running", which is the shape of wrong answer this whole
+    // round is about. `gc --status` is the command that then gives the errno.
     wfs_trash_stat ts;
-    if (wfs_gc_status(s, -1, &ts) == 0 && (ts.entries || ts.worker_pid)) {
+    memset(&ts, 0, sizeof ts);
+    int trc = wfs_gc_status(s, -1, &ts);
+    if (trc != 0)
+        printf("trash:     not counted: %s (`world fs gc --status`)\n", wfs_strerror(trc));
+    else if (ts.entries || ts.worker_pid) {
         char est[32];
         fmt_bytes(est, sizeof est, ts.bytes_estimate);
         printf("trash:     %llu entries, %llu due, %llu being deleted (~%s), worker %s\n",
