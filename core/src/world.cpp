@@ -825,21 +825,57 @@ struct TrashClaim {
     int parent = -1;   // the directory it sits in
     String leaf;       // its name under `parent` -- the `.deleting` one once step 2 has run
     uint64_t dev = 0, ino = 0;
+    // PR #1 review (30th round, P2): the bits are LENT, not taken. trash_claim_open() chmods an
+    // entry it cannot open (the 0000 gate, and any root whose owner left it searchable but not
+    // readable -- 0311 is an ordinary mode for a directory meant to be entered and not listed),
+    // and the mode it found is kept here so that every exit which does not delete the tree can
+    // put it back. `restore` is the exit that has to: it opens the entry through this chmod,
+    // renames the tree home and returns 0, so before this round a discard/restore round trip
+    // silently rewrote the world root's mode to 0700 and left it there. The two refusals after
+    // a lend (the rename verification finds a stranger and the tree is put back) are the same
+    // debt, and the collector and `--now` have none: trash_unlink_claim() drops the lend the
+    // moment the tree is actually gone, because there is nothing left to give it back to.
+    bool lent = false;
+    mode_t orig_mode = 0;
     TrashClaim() = default;
     TrashClaim(const TrashClaim &) = delete;
     TrashClaim &operator=(const TrashClaim &) = delete;
     ~TrashClaim() {
+        return_lend();
         if (fd >= 0) ::close(fd);
         if (parent >= 0) ::close(parent);
     }
     bool held() const { return fd >= 0; }
+    // Best effort, idempotent, and through the DESCRIPTOR: the mode goes back on the inode the
+    // claim proved, wherever that inode's name is by now -- never on whatever a name resolves
+    // to at this instant. That is the 26th round's rule applied to the way back out.
+    void return_lend() {
+        if (!lent) return;
+        lent = false;
+        if (fd >= 0) ::fchmod(fd, orig_mode);
+    }
+    // The tree is gone: the lend died with it.
+    void forget_lend() { lent = false; }
 };
+
+// The same, for the two exits of trash_claim_open() that have no descriptor to give it back
+// with -- the second open failed, or the fstat on it did. By name, so it is guarded the way the
+// chmod out was: only an lstat that still shows the very inode we lent to gets its mode back. A
+// stranger who has moved in since keeps whatever mode they have (27th round).
+void trash_unlend_path(const char *path, uint64_t dev, uint64_t ino, mode_t mode) {
+    struct stat st;
+    if (::lstat(path, &st) == 0 && S_ISDIR(st.st_mode) && (uint64_t)st.st_ino == ino &&
+        (uint64_t)st.st_dev == dev)
+        ::chmod(path, mode);
+}
 
 // Step 1. Returns 0 with the claim held, WFS_E_TRASH_FOREIGN when what is there is provably
 // something else, and any other errno as itself -- including fs_gone(), which the callers read
 // exactly as they read trash_identity's: a tree that is genuinely gone goes on to
 // trash_mark_deleting and its -ENOENT, and the row is buried the way it always was.
 int trash_claim_open(const char *path, uint64_t dev, uint64_t ino, TrashClaim &c) {
+    bool lent = false;        // PR #1 review (30th round, P2): see TrashClaim::lent
+    mode_t orig_mode = 0;
     int fd = ::open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0 && (errno == EACCES || errno == EPERM)) {
         // A gate-protected root is 0000 and cannot be opened at all (docs/M1_DESIGN.md §3 P4);
@@ -874,12 +910,17 @@ int trash_claim_open(const char *path, uint64_t dev, uint64_t ino, TrashClaim &c
                    (uint64_t)lst.st_dev != dev) {
             return WFS_E_TRASH_FOREIGN;
         } else {
-            ::chmod(path, 0700);
+            // PR #1 review (30th round, P2): and the mode it had is remembered here, because
+            // this is a loan. The caller that deletes the tree owes nothing; every other one
+            // gives it back (TrashClaim::return_lend, and the two exits below).
+            orig_mode = (mode_t)(lst.st_mode & 07777);
+            if (::chmod(path, 0700) == 0) lent = true;
             fd = ::open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         }
     }
     if (fd < 0) {
         int e = -errno;
+        if (lent) trash_unlend_path(path, dev, ino, orig_mode);
         // ENOTDIR (not a directory) and ELOOP (a symlink, which O_NOFOLLOW refuses) are not
         // absences: a world tree is a directory, so anything else standing at that name is
         // provably not it. fs_probe tells the two apart -- "nothing is there" keeps the old
@@ -895,15 +936,23 @@ int trash_claim_open(const char *path, uint64_t dev, uint64_t ino, TrashClaim &c
     if (::fstat(fd, &st) != 0) {
         int e = -errno;
         ::close(fd);
+        if (lent) trash_unlend_path(path, dev, ino, orig_mode);
         return e;
     }
     if ((uint64_t)st.st_ino != ino || (uint64_t)st.st_dev != dev) {
         ::close(fd);
+        // A swap landed between the chmod and the open. The descriptor is the stranger's and
+        // gets nothing done to it; the lend is offered back by name, which by construction
+        // reaches our tree only if it is still standing there -- and if it is not, the bound is
+        // the 27th round's unchanged one: a mode, never a rename and never an unlink.
+        if (lent) trash_unlend_path(path, dev, ino, orig_mode);
         return WFS_E_TRASH_FOREIGN;
     }
     c.fd = fd;
     c.dev = (uint64_t)st.st_dev;
     c.ino = (uint64_t)st.st_ino;
+    c.lent = lent;
+    c.orig_mode = orig_mode;
     return 0;
 }
 
@@ -950,6 +999,12 @@ int trash_claim_verify_rename(TrashClaim &c, const char *deleting, bool renamed)
         back.resize(back.size() - ::strlen(WFS_DELETING_SUFFIX));
         ::renameat(c.parent, c.leaf.c_str(), c.parent, back.c_str());
     }
+    // PR #1 review (30th round, P2): and this claim deletes nothing, so anything it borrowed on
+    // the way in goes back. The tree that was lent to is ours (a stranger is never lent to --
+    // 27th round) and it is wherever the swap put it; the fchmod is on the descriptor, so it
+    // finds it there. ~TrashClaim would do it a few lines later in both callers anyway; saying
+    // it here is what makes "a refusal gives the lend back" a property of the refusal itself.
+    c.return_lend();
     return WFS_E_TRASH_FOREIGN;
 }
 
@@ -957,15 +1012,22 @@ int trash_claim_verify_rename(TrashClaim &c, const char *deleting, bool renamed)
 int trash_unlink_claim(TrashClaim &c, uint64_t *entries, int64_t deadline_us = 0,
                        int *partial = nullptr) {
     if (int rc = wfs::fs_remove_tree_fd(c.fd, 0, entries, deadline_us, partial)) return rc;
-    if (partial && *partial) return 0;   // the deadline: the tree keeps its `.deleting` name
+    // The deadline: the tree keeps its `.deleting` name, and keeps the lend with it -- the
+    // claim is about to be dropped, so ~TrashClaim gives the mode back and the next wake's
+    // claim borrows it again (PR #1 review, 30th round). A tree we did not finish deleting is
+    // left exactly as we found it, which is the whole of this round's rule.
+    if (partial && *partial) return 0;
     bool gone = false;
     int vrc = trash_claim_is_ours(c, &gone);
-    if (gone) return 0;                  // somebody else finished it; it is empty and it is not there
+    if (gone) { c.forget_lend(); return 0; }   // somebody else finished it; it is not there
     if (vrc) return vrc;
     // The only name-decided step left, and its bound is exact: AT_REMOVEDIR removes an empty
     // directory or nothing at all, so a directory swapped in between the fstatat above and this
     // call can cost an empty directory and cannot cost one byte of anybody's data.
-    if (::unlinkat(c.parent, c.leaf.c_str(), AT_REMOVEDIR) == 0 || errno == ENOENT) return 0;
+    if (::unlinkat(c.parent, c.leaf.c_str(), AT_REMOVEDIR) == 0 || errno == ENOENT) {
+        c.forget_lend();   // 30th round: nothing left to give the mode back to
+        return 0;
+    }
     int e = errno;
     if (e == EPERM || e == EACCES) {
         struct stat pst;
@@ -975,7 +1037,10 @@ int trash_unlink_claim(TrashClaim &c, uint64_t *entries, int64_t deadline_us = 0
         ::fchflags(c.parent, 0);
         ::fchflags(c.fd, 0);
 #endif
-        if (::unlinkat(c.parent, c.leaf.c_str(), AT_REMOVEDIR) == 0 || errno == ENOENT) return 0;
+        if (::unlinkat(c.parent, c.leaf.c_str(), AT_REMOVEDIR) == 0 || errno == ENOENT) {
+            c.forget_lend();
+            return 0;
+        }
         e = errno;
     }
     return -e;
@@ -2353,8 +2418,16 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
         if (vrc) {
             if (wfs::fs_rename(r.path, trash.c_str()) == 0)
                 trashing_commit(s, id, 0, trash.c_str());
-            return vrc;
+            return vrc;   // the lend goes back with ~TrashClaim (30th round)
         }
+        // PR #1 review (30th round, P2): the tree is home and proven ours, so the bits the
+        // claim borrowed to open it are given back HERE rather than at the end of the function
+        // -- a restore is a round trip, and the mode the world comes home with has to be the
+        // mode the discard found on it. (A world root that is searchable and not readable, 0311
+        // and its relatives, discards untouched and used to come back 0700 for ever.) Every
+        // other exit of this function after the claim -- the refusals above, a failed row
+        // write, an -ESTALE below -- is covered by ~TrashClaim, which does exactly this.
+        claim.return_lend();
     }
     if (int hrc = trash_crash_seam(3, 0, id, trash.c_str())) return hrc;
     // (c). The tree is at home: whatever the row says, that is now the only fact on disk, and

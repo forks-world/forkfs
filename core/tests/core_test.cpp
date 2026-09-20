@@ -5925,6 +5925,122 @@ int main() {
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 
+    // ---- PR #1 review (30th round, P2): the bits are lent, and a lend is returned ----------
+    //
+    // The 27th round made the claim's chmod wait for the identity check, so a stranger is never
+    // lent anything. What it did not say is what happens to the mode of a tree that IS ours and
+    // that the claim then does not delete. A world root may be searchable and not readable --
+    // 0311 is a perfectly ordinary mode for a directory somebody wants entered and not listed --
+    // and it discards unharmed: nothing on the discard path opens the root for reading (the
+    // marker is read through it, the rename is the parent's business). `restore` then cannot
+    // open the entry, chmods it to 0700 to get its descriptor, renames the tree home and
+    // returns 0 -- and the world came back with a mode its owner never gave it. A discard
+    // followed by a restore is supposed to be a round trip.
+    //
+    // So the claim remembers what the lstat found and gives it back on every exit that does not
+    // delete the tree: the restore (home, refused, or failed) and the two refusals after a
+    // lend. The collector and `--now` keep nothing, because there is nothing left to keep it on.
+    {
+        char lstore[4096], lsrc[4096], lw[4096], ldb[4096], lentry[4096], lsql[256];
+        struct stat lst;
+        join(lstore, sizeof lstore, root, "lend-store");
+        join(lsrc, sizeof lsrc, root, "lend-src");
+        join(g_swap_aside, sizeof g_swap_aside, root, "lend-aside");
+        CHECK(mkdir(lsrc, 0755) == 0);
+        join(p, sizeof p, lsrc, "a.txt");
+        write_file(p, "one\n");
+        wfs_store *la = NULL;
+        CHECK_OK(wfs_store_open(lstore, &la));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "lb";
+        wfs_id l1 = 0;
+        CHECK_OK(wfs_snapshot_create(la, lsrc, &sopts, &l1));
+        wfs_ref lf = {WFS_K_SNAPSHOT, l1};
+        memset(&opts, 0, sizeof opts);
+        join(lw, sizeof lw, worlds, "lworld");
+        wfs_id lw1 = 0;
+        CHECK_OK(wfs_world_create(la, lf, lw, &opts, &lw1));
+        wfs_world_rec lwr;
+        CHECK_OK(wfs_world_info(la, lw1, &lwr));
+        uint64_t lino = lwr.dir_ino;
+        CHECK(lino != 0);
+
+        // The mode the owner gave it: enter it, write in it, do not list it.
+        CHECK(chmod(lw, 0311) == 0);
+        CHECK(stat(lw, &lst) == 0 && (lst.st_mode & 07777) == 0311);
+
+        // (1) the discard leaves it alone -- it renames the tree, it does not open it.
+        CHECK_OK(wfs_world_discard(la, lw1, 0, 0));
+        snprintf(ldb, sizeof ldb, "%s/metadata.db", lstore);
+        snprintf(lsql, sizeof lsql, "SELECT trash_path FROM worlds WHERE id=%llu",
+                 (unsigned long long)lw1);
+        CHECK(db_query_text(ldb, lsql, lentry, sizeof lentry) == 1);
+        CHECK(lentry[0]);
+        CHECK(stat(lentry, &lst) == 0 && (lst.st_mode & 07777) == 0311);
+
+        // (2) and the restore gives back what it borrowed. Before this round the root came home
+        // 0700 and stayed that way: a silent chmod of the user's own directory, exit 0.
+        CHECK_OK(wfs_world_restore(la, lw1));
+        CHECK(stat(lw, &lst) == 0 && (lst.st_mode & 07777) == 0311);
+        CHECK_OK(wfs_world_info(la, lw1, &lwr));
+        CHECK(lwr.state == WFS_ST_ACTIVE && lwr.present && lwr.dir_ino == lino);
+        // ... and it is a world, not just a directory: the marker still reads through 0311.
+        wfs_identity lident;
+        CHECK_OK(wfs_world_verify(la, lw1, &lident));
+        CHECK(lident.registered && lident.world_id == lw1 && lident.ino == lino);
+        join(p, sizeof p, lw, "a.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "one\n"));
+
+        // (3) a claim that lends and then refuses returns the lend too. The seam moves the
+        // world's own tree aside after the claim has accepted (and lent to) it, so the rename
+        // that follows carries a stranger and the claim refuses -- the tree we lent to is off
+        // at `g_swap_aside`, and it may not keep our 0700 either. Both callers that refuse
+        // this way go through it: the collector...
+        CHECK_OK(wfs_world_discard(la, lw1, 0, 0));
+        CHECK(db_query_text(ldb, lsql, lentry, sizeof lentry) == 1);
+        wfs_store *lb = NULL;
+        CHECK_OK(wfs_store_open(lstore, &lb));
+        g_swap_world = lw1;
+        g_swap_ran = 0;
+        wfs_test_between_trash_claim = swap_between_claim;
+        wfs_gc_report lrep;
+        memset(&lrep, 0, sizeof lrep);
+        CHECK_OK(wfs_gc(lb, 0, &lrep));
+        wfs_test_between_trash_claim = NULL;
+        CHECK(g_swap_ran == 1);
+        CHECK(lrep.trash_foreign == 1 && lrep.worlds_deleted == 0 && lrep.entries_freed == 0);
+        CHECK(stat(g_swap_aside, &lst) == 0 && (lst.st_mode & 07777) == 0311);
+        swap_undo(lentry);
+        CHECK(stat(lentry, &lst) == 0 && (lst.st_mode & 07777) == 0311);
+
+        // ... and `restore`, whose refusal comes after the rename home has been undone.
+        g_swap_ran = 0;
+        wfs_test_between_trash_claim = swap_between_claim;
+        CHECK_RC(wfs_world_restore(la, lw1), WFS_E_TRASH_FOREIGN);
+        wfs_test_between_trash_claim = NULL;
+        CHECK(g_swap_ran == 1);
+        CHECK(!exists(lw));
+        CHECK(stat(g_swap_aside, &lst) == 0 && (lst.st_mode & 07777) == 0311);
+        swap_undo(lentry);
+        CHECK_OK(wfs_world_info(la, lw1, &lwr));
+        CHECK(lwr.state == WFS_ST_TRASHED && lwr.dir_ino == lino);
+
+        // (4) and the collector deletes a 0311 entry exactly as it always did: that claim keeps
+        // its lend, because the thing it was lent by is gone.
+        memset(&lrep, 0, sizeof lrep);
+        CHECK_OK(wfs_gc(lb, 0, &lrep));
+        CHECK(lrep.worlds_deleted == 1 && lrep.trash_foreign == 0 && lrep.trash_failed == 0);
+        CHECK(lrep.entries_freed == 2);   // a.txt and the .world marker
+        CHECK(!exists(lentry));
+        CHECK_OK(wfs_world_info(la, lw1, &lwr));
+        CHECK(lwr.state == WFS_ST_DEAD);
+        wfs_store_close(lb);
+        wfs_store_close(la);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", lstore, (unsigned long long)l1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
     wfs_store_close(s);
     rm_rf(root);
     printf("core_test: all OK\n");
