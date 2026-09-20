@@ -1244,6 +1244,47 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第三十一轮:升级 VERSION 的临时文件不能是共用的(2026-09-20)
+
+第三十一轮,Codex 一条 P2,打在第二十四轮那次 schema 2 → 3 的**收尾动作**上。那一轮把
+"schema 2 的 store 原地接管"写进了 `wfs_store_open`:`check_version()` 判 legacy,迁移提交之后
+`version_upgrade()` 把 `VERSION` 重写成 3。问题是**这条路上没有锁**。`wfs_store_open()` 自己不加
+任何 flock,整条路上唯一的互斥是迁移那次 `BEGIN IMMEDIATE`——它足够保住**数据库**(一个事务赢,
+另一个进来发现列全在),对那个**文件**一点忙也帮不上。
+
+于是两个进程同时第一次打开一个 schema 2 的 store:两个都把 `VERSION` 读成 2,两个都迁移,两个都走到
+`version_upgrade()`,而它写的是**同一个** `<store>/VERSION.tmp`——两边 `O_TRUNC` 同一个文件,第一个
+`rename` 把它消耗掉之后,第二个 `rename` 的源已经不在了,`ENOENT` 一路返回出去:一次**完全正常**的
+`world` 调用,在一个**健康**的 store 上失败,而且只在它**第一次**被打开的时候失败——最没人盯着的那一次。
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P2 `PRRT_kwDOUf7jGc6kGFgG` | `core/src/store.cpp` `version_upgrade()`(~275) | 临时文件名是**共用**的 `<store>/VERSION.tmp`。两个 legacy open 并发时,后 `rename` 的那个源文件已被前一个搬走,`-ENOENT` 失败;两边还会互相 `O_TRUNC` 对方正在写的字节 | ①临时名**私有**:`VERSION.tmp.<pid>.<hex>`,hex 取自 store id 用的那把 `getentropy()`,建的时候 `O_CREAT\|O_EXCL`(不再 `O_TRUNC`),写、`fsync`、`rename`。两个升级者不可能拿到同一个名字,于是后落地的那次 `rename` 只是把一个写着 3 的 `VERSION` 换成另一个写着 3 的 `VERSION`——它本来就是幂等写。②`rename` 真失败了就**回头问文件本身**(新的 `version_read()`,和 `check_version()` 不同,它**从不写**):`VERSION` 已经是 3 就返回 0——不管是我们干的还是先到的人干的,调用者要的是盘上有一个 schema 3 的 store,不是这件事的署名权;只有"errno + `VERSION` 还是 2"才算失败。③崩在"建好临时文件还没 rename"之间的升级者留下的残骸,由下一次升级清掉 | `c8c1eb3` |
+
+**清扫遵第二十轮那条 P18 的规矩**(只删这个 core 自己分配的名字):只在 `<store>` **本级**
+(不进子目录,`unlink(2)` 不穿符号链接),只删 `VERSION.tmp` 前缀的名字——这个文件在那里写过的**全部**
+命名空间就是它,新的 `VERSION.tmp.<pid>.<hex>` 和老版本用的那个共用 `VERSION.tmp`,别的东西不会在一个
+store 目录里占这个前缀;而且**只在 `version_upgrade()` 里扫**,也就是只有升级者自己付这次 readdir,
+普通 open(每次 `world` 调用都有一次)一点都不多花。清扫**可能**把另一个并发升级者的临时文件端掉——
+那个升级者的 `rename` 于是失败、回头读 `VERSION` 读到 3、返回 0,正好是上面②那条路。
+
+**为什么不加 flock**:`wfs_store_open()` 目前不持有任何锁,为了这件事引一把新锁要覆盖"迁移 + 重写
+文件"整段,而数据库那半本来就是安全的(`BEGIN IMMEDIATE`),剩下的文件那半靠"私有临时名 + 幂等
+rename + 回头读"就够了——这条路上没有任何需要序列化的**读改写**。老的共用名 `VERSION.tmp` 现在全仓
+grep 不到第二处(只剩 `core_test` 的前缀断言和本节)。
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **298 passed, 0 failed**;`check-deps.sh`
+全绿。(`m1_criteria.sh` 本轮跳过。)
+
+先跑红(`core_test` 第二十四轮那段 schema3-store 里新增 (c)):新的 seam
+`wfs_test_before_version_rename` 在句柄 A 写完临时文件、还没 `rename` 的那一瞬间触发,在里面对同一个
+store 跑一次**完整的** `wfs_store_open()`(句柄 B),B 迁移(空转)、升级、**先** rename。修之前 A 的
+open 是 `core_test.cpp:5621: vrace_a -> -2 (No such file or directory)`。
+
+新增测试:①A 的 open 回 0、B 的 open 回 0、`VERSION` 读出来是 3、`user_version` 的百位是 3、
+store 目录里 `VERSION.tmp` 前缀的条目**一个不剩**;②崩掉的升级者:store 里先放一个
+`VERSION.tmp.999.deadbeef`,再开一次(legacy),它**没了**,`VERSION` 是 3。
+
 #### PR #1 review 第三十轮:借来的权限位要还回去(2026-09-20)
 
 第三十轮,Codex 一条 P2,打在第二十七轮**的另一半**上。第二十七轮把认领里那次 `chmod 0700` 挪到了
