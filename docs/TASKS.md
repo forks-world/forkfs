@@ -1244,6 +1244,66 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第二十五轮:名字不是所有权,inode 才是(2026-09-20)
+
+第二十五轮,Codex 一条 P1,打在第二十轮那条规矩的**另一半**上。第二十轮写的是"**不是我们起的名字,
+就不是我们留下的东西**":collector 不再把 `<条目>.deleting` 当成自己上一次没删完的折叠掉。可它那一趟
+真正要删的那个东西——条目本身——依旧只问了一个问题:**行里还写着这个路径吗?** 而跨卷 discard 的
+trash 就在用户自己的 `<parent>/.wfs-trash` 里,条目名 `W<id>-<时间戳>` 完全可以猜。保留期里用户把树
+挪走、在同一个路径上放一个**别的**目录,行照样"写着这个路径":collector 把它改名成 `.deleting`、连
+里面的文件一起递归删光;`discard --now` 同样删、而且退出 0 报成功;`restore` 更糟——它把那棵树 rename
+回家,**再 stat 一遍、把它的 dev/ino 写进行里**,于是别人的目录成了这个 World,而世界自己的树没有任何
+东西还记得它。
+
+**规矩写成一句**:**一棵树归不归这一行,看的是 inode,不是名字。** World 行从发布那一刻起就带着
+`dir_dev`/`dir_ino`(fork/adopt 写的),`wfs_world_discard` 在搬树之前用
+`wfs_world_verify_identity()` 核对过它们、之后再没碰过这两列,而这条路上的每一次 rename 都是**同卷**
+的(store 同卷时是 `<store>/trash`,撞上 EXDEV 时是世界旁边的 `.wfs-trash`)——同卷 rename 保 inode,
+所以**条目只要还在,行记的那个 inode 就是它的身份**,`.deleting` 那个拼写也一样。这正是 P18 那句
+"ownership is an invariant we wrote, not a lookalike name" 的字面意思:第二十轮管的是我们**放**出去的
+名字,这一轮管的是我们**拿**回来的树。
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `PRRT_kwDOUf7jGc6kE555` | `world.cpp` `gc_claim_deleting()` / `trash_delete_now()`(`--now`)/ `wfs_world_restore()` / `trash_is_deleting()`,`wfs_gc_status()`,`cli/main.cpp` | 认领一条 trash 条目只问"行里还写着这个路径吗"。跨卷 discard 的条目在用户自己的 `<parent>/.wfs-trash` 里、名字可以猜,所以保留期里"把树挪走、放一个同名目录"是用户一条 `mv` 就能造出来的状态——而它对这三条路径全都成立:`gc`(保留期一到就递归删掉用户的目录,报"1 worlds deleted",退出 0)、`discard --now`(同样删,同样报成功)、`restore`(把陌生人的树 rename 回家,**再 stat 一遍写进 `dir_dev`/`dir_ino`**,行从此指着别人的数据,`fs list` 里 HERE 是 yes) | **改名/删除/搬回家之前,先核对 `st_dev`/`st_ino` 和行里的 `dir_dev`/`dir_ino`**(新 helper `trash_identity()`,新错误码 `WFS_E_TRASH_FOREIGN`)。三处都在**决定那一刻所在的那个事务里**读行、在同一个事务里核对:collector 的 `gc_claim_deleting()`(第十五轮起 rename 和记名字就在这一个 `BEGIN IMMEDIATE` 里,所以身份和认领不可能分家)、`--now` 的 `trash_delete_now()`、`restore` 的 (a)。对不上就**一根指头都不碰**:行留在 TRASHED,collector 计进新的 `trash_foreign`、按共享失败计数器重试到上限(和第二十轮的 `trash_blocked` 同一套,因为同样只有操作者能解),`gc --status` 用新的 `foreign_path` **把那个路径说出来**,`--now` 和 `restore` 回 `WFS_E_TRASH_FOREIGN`,CLI 用新的 `wfs_trash_entry_path()` 报出路径并说清"这是别人的数据"。第十二轮那条照旧:**问不出来不算不在也不算不是**(probe 的 errno 原样返回、条目留着);而**真的不在**(ENOENT)仍旧走老路——行进 DEAD,因为树是真的没了。配套两处:(a) `restore` 的 (c) 不再拿 `stat(<家>)` 去喂行的 `dir_dev`/`dir_ino`,写回去的就是 (a) 核对过的那一对——同卷 rename 保 inode,合法情况下本来就是同一个数,而"从地上捡一个身份给行"正是这条 bug 的最后一步;(b) `trash_is_deleting()` 也核对身份:`.deleting` 上的那棵树是不是 collector 在删**这个世界**,同样要 inode 说了算,否则别人放的一个同名目录会永远替我们回答"collector 正在删它"(第二十轮刚把这句假话从另一半里拿掉) | `6e5dca9` |
+
+**快照怎么办**:快照的 trash 永远在 store 里(`<store>/trash/S<n>-<ts>`),不在任何用户目录,名字也是
+store 自己分配的;snapshots 表没有 `dir_dev`/`dir_ino` 两列(worlds 有、pool 有,snapshots 从来没有),
+补这两列要一次迁移加一轮"在哪儿写、在哪儿核对"的审计,而它换来的不是本轮这条洞——本轮这条洞的前提
+就是"**手伸进了用户可见的目录**"。所以身份检查**只对 World 成立**,snapshot 的条目照旧按行+路径认领。
+同理,`<store>/trash` 底下**无行的孤儿**没有行可以比,它归的是既有那条规矩:**store 自己分配名字的
+目录里,按名字模式判断才成立**(第二十轮 (b))。
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **274 passed, 0 failed**(新增 8 条 PR25);
+`check-deps.sh` 全绿。(`m1_criteria.sh` 本轮跳过。)
+
+先跑红(用 `3f458bc` 的二进制,store 里 discard 一个世界,把条目 `mv` 走,在同一个路径上
+`mkdir` 一个带 `keep/user.txt` 的目录):
+
+- `world fs gc --now --retention 0` → `gc: 1 worlds deleted, …`,**退出 0**,`keep/user.txt` 连同那个
+  目录一起没了。
+- `world fs restore W1` → `W1 restored to …/w`,**退出 0**;`ls -R …/w` 印的是 `keep/user.txt`,
+  `fs list` 说 W1 是 `active`、`HERE yes`——别人的目录被登记成了这个世界,而世界自己的树没人记得。
+- `safety.sh` 的新块:8 条里 7 条红(最后一条"把树放回去再收"本来就该绿)。
+- `core_test` 的新块:把 `trash_identity()` 短路成永远 0,第一条断言
+  `frep.trash_foreign == 1` 就红。
+
+新增测试:
+
+- `safety.sh` 新块 **PR25**(8 条,走 CLI):discard 一个世界 → 把条目挪走、在同一路径放一个带
+  `user.txt` 的目录 → `gc --now --retention 0` **不删它**、`gc` 说"could not be collected"、
+  `gc --status` 有 `foreign:` 一行且**印出那个路径** → `discard W<n> --now` 拒绝并印出路径 →
+  `restore W<n>` 拒绝、家目录没有被创建出来 → 把世界自己的树放回那个路径 → `restore` 成功、
+  `f.txt` 在 → 再 discard 一次、`gc` 照常收掉,trash 空。**跨卷(EXDEV)那条 `.wfs-trash` 路径没法
+  在单卷的测试机上造出来,而身份检查跑的是同一段代码——它比的是行,不是条目碰巧在哪儿。**
+- `core_test` 末尾一块(foreign-store):同一个剧本,但断言直接读行——`dir_ino` 从
+  `metadata.db` 里 `SELECT` 出来、和 `lstat(条目)` 的 `st_ino` 相等(discard 不动这两列、同卷 rename
+  保 inode),换成陌生目录之后 `st_ino` 不等;于是 `wfs_gc()` 的 `trash_foreign == 1` 且
+  `worlds_deleted == 0`、`<条目>.deleting` **压根没被建出来**、用户的文件原样在、行还是 TRASHED 且
+  `dir_ino` 没变;`wfs_gc_status()` 的 `foreign_path` 正是那个条目;`wfs_trash_entry_path()` 也是;
+  `--now` 和 `restore` 都回 `WFS_E_TRASH_FOREIGN`,家目录没被建出来;把真树放回去之后 `restore` 成功、
+  行的 `dir_ino`/`dir_dev` 还是原来那一对(不是从地上捡的),最后 `wfs_gc()` 正常收掉、行进 DEAD。
+
 #### PR #1 review 第二十四轮:能删什么,也是 schema 的一部分(2026-09-20)
 
 第二十四轮,Codex 一条 P1,打在一句我们自己写下来、而且写了两次的话上:**增量列不动 `VERSION`**
