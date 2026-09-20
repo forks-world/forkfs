@@ -1055,6 +1055,14 @@ extern void *wfs_test_before_version_rename_ctx;
 extern void (*wfs_test_after_version_bump)(void *ctx, const char *dir);
 extern void *wfs_test_after_version_bump_ctx;
 
+/* One step(2) of one query, failed on demand (PR #1 review, 32nd round, P2). Every count and
+ * every lookup that decides a destructive step now tells SQLITE_DONE from an error, and the only
+ * way to test that from outside is to make a step fail. Set this to a substring of the SQL of
+ * the statement to hit: the next `row()` on a prepared statement whose SQL contains it reports
+ * SQLITE_IOERR instead of stepping, once, and clears this back to NULL. NULL in every run that
+ * is not a test; nothing in the library ever assigns it a value. */
+extern const char *wfs_test_stmt_fail_sql;
+
 /* And the one xattr rule a test cannot drive from outside (PR #1 review, 9th round). The default
  * diff leaves com.apple.provenance out of the comparison, and provenance is precisely the name a
  * test cannot make differ: the kernel stamps it on every file this process creates, with the

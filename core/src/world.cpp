@@ -458,7 +458,9 @@ int world_row(wfs_store *s, wfs_id id, wfs_world_rec &r) {
     Stmt q(s->db, sql.c_str());
     if (!q.ok()) return -EIO;
     q.i64(1, (int64_t)id);
-    if (!q.row()) return -ENOENT;
+    // PR #1 review (32nd round, P2): a row that is not there and a read that failed are two
+    // different answers, and every caller of this one branches on -ENOENT.
+    if (!q.row()) return q.done() ? -ENOENT : -EIO;
     fill_world(q, r);
     return 0;
 }
@@ -467,7 +469,7 @@ int snapshot_trash_path(wfs_store *s, wfs_id id, String &out) {
     Stmt q(s->db, "SELECT trash_path FROM snapshots WHERE id=?");
     if (!q.ok()) return -EIO;
     q.i64(1, (int64_t)id);
-    if (!q.row()) return -ENOENT;
+    if (!q.row()) return q.done() ? -ENOENT : -EIO;   // 32nd round, P2
     out.assign(q.col_text(0));
     return 0;
 }
@@ -476,7 +478,7 @@ int world_trash_path(wfs_store *s, wfs_id id, String &out) {
     Stmt q(s->db, "SELECT trash_path FROM worlds WHERE id=?");
     if (!q.ok()) return -EIO;
     q.i64(1, (int64_t)id);
-    if (!q.row()) return -ENOENT;
+    if (!q.row()) return q.done() ? -ENOENT : -EIO;   // 32nd round, P2
     out.assign(q.col_text(0));
     return 0;
 }
@@ -518,7 +520,7 @@ int snapshot_row(wfs_store *s, wfs_id id, wfs_snapshot_rec &r) {
     Stmt q(s->db, sql.c_str());
     if (!q.ok()) return -EIO;
     q.i64(1, (int64_t)id);
-    if (!q.row()) return -ENOENT;
+    if (!q.row()) return q.done() ? -ENOENT : -EIO;   // 32nd round, P2
     fill_snapshot(q, r);
     return 0;
 }
@@ -1326,6 +1328,7 @@ extern "C" int wfs_snapshot_list(wfs_store *s, wfs_snapshot_rec *buf, size_t cap
         if (buf && n < cap) fill_snapshot(q, buf[n]);
         ++n;
     }
+    if (!q.done()) return -EIO;   // 32nd round, P2: a listing that stopped is not a listing
     *count = n;
     return 0;
 }
@@ -1376,7 +1379,8 @@ int pool_fork_insert(void *ctx, const wfs::PoolClaim &c) {
         Stmt q(r->s->db, "SELECT state FROM snapshots WHERE id=?");
         if (!q.ok()) return -EIO;
         q.i64(1, (int64_t)r->snapshot);
-        if (!q.row() || q.col_i64(0) != WFS_ST_ACTIVE) return -ESTALE;
+        if (!q.row()) return q.done() ? -ESTALE : -EIO;   // 32nd round, P2
+        if (q.col_i64(0) != WFS_ST_ACTIVE) return -ESTALE;
     }
     int64_t opid = 0, ostart = 0;
     owner_now(opid, ostart);
@@ -1662,7 +1666,8 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
             Stmt q(s->db, "SELECT state FROM snapshots WHERE id=?");
             if (!q.ok()) return -EIO;
             q.i64(1, (int64_t)snapshot_id);
-            if (!q.row() || q.col_i64(0) != WFS_ST_ACTIVE) return -ESTALE;
+            if (!q.row()) return q.done() ? -ESTALE : -EIO;   // 32nd round, P2
+            if (q.col_i64(0) != WFS_ST_ACTIVE) return -ESTALE;
         }
         int64_t opid = 0, ostart = 0;
         owner_now(opid, ostart);
@@ -1871,7 +1876,10 @@ extern "C" int wfs_world_next_id(wfs_store *s, wfs_id *out) {
     Guard g(s->mu);
     Stmt q(s->db, "SELECT COALESCE(MAX(id),0)+1 FROM worlds");
     if (!q.ok()) return -EIO;
-    *out = q.row() ? (wfs_id)q.col_i64(0) : 1;
+    // 32nd round, P2: COALESCE always has a row to give, so no row at all is a failed read --
+    // and answering 1 to "what is the next id" would hand out an id the store already used.
+    if (!q.row()) return -EIO;
+    *out = (wfs_id)q.col_i64(0);
     return 0;
 }
 
@@ -1891,6 +1899,7 @@ extern "C" int wfs_world_list(wfs_store *s, int include_trashed, wfs_world_rec *
         if (buf && n < cap) fill_world(q, buf[n]);
         ++n;
     }
+    if (!q.done()) return -EIO;   // 32nd round, P2: a listing that stopped is not a listing
     *count = n;
     return 0;
 }
@@ -1982,7 +1991,7 @@ int trashing_reclaim(wfs_store *s, wfs_id id, int is_snapshot, const char *trash
                                   : "SELECT state, trash_path FROM worlds WHERE id=?");
         if (!q.ok()) return -EIO;
         q.i64(1, (int64_t)id);
-        if (!q.row()) return -ESTALE;
+        if (!q.row()) return q.done() ? -ESTALE : -EIO;   // 32nd round, P2
         state = q.col_i64(0);
         tp.assign(q.col_text(1));
     }
@@ -2109,8 +2118,8 @@ int trash_delete_now(wfs_store *s, wfs_id id, int is_snapshot, const String &tra
                                : "SELECT state, trash_path, dir_dev, dir_ino FROM worlds WHERE id=?");
             if (!q.ok()) return -EIO;
             q.i64(1, (int64_t)id);
-            if (!q.row() || q.col_i64(0) != WFS_ST_TRASHED ||
-                ::strcmp(q.col_text(1), expect.c_str()))
+            if (!q.row()) return q.done() ? -ESTALE : -EIO;   // 32nd round, P2
+            if (q.col_i64(0) != WFS_ST_TRASHED || ::strcmp(q.col_text(1), expect.c_str()))
                 return -ESTALE;
             // PR #1 review (25th round, P1): and it is this row's tree, not merely this row's
             // name. Read from the row in the same transaction as the rename below, so what is
@@ -2380,7 +2389,8 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
             Stmt q(s->db, "SELECT state FROM snapshots WHERE id=?");
             if (!q.ok()) return -EIO;
             q.i64(1, (int64_t)rr.snapshot_id);
-            if (!q.row() || q.col_i64(0) != WFS_ST_ACTIVE) return WFS_E_SOURCE_GONE;
+            if (!q.row()) return q.done() ? WFS_E_SOURCE_GONE : -EIO;   // 32nd round, P2
+            if (q.col_i64(0) != WFS_ST_ACTIVE) return WFS_E_SOURCE_GONE;
         }
         // ... and owned by this process while the rename runs (8th round): a TRASHING row whose
         // owner is alive is an operation in flight, and no other process's recovery may decide
@@ -2470,8 +2480,8 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
     Stmt q(s->db, "SELECT state, trash_path FROM worlds WHERE id=?");
     if (!q.ok()) return -EIO;
     q.i64(1, (int64_t)id);
-    if (q.row() && q.col_i64(0) == WFS_ST_ACTIVE && !*q.col_text(1)) return 0;
-    return -ESTALE;
+    if (q.row()) return (q.col_i64(0) == WFS_ST_ACTIVE && !*q.col_text(1)) ? 0 : -ESTALE;
+    return q.done() ? -ESTALE : -EIO;   // 32nd round, P2
 }
 
 // ---- T2.2: discarding a snapshot --------------------------------------------------------------
@@ -2523,12 +2533,20 @@ int snapshot_refs_locked(wfs_store *s, wfs_id id, SnapRefs &out) {
                 out.trashed_worlds++;
             }
         }
+        // PR #1 review (32nd round, P2): and the loop has to have ended because the rows ran
+        // out. sqlite3_step(2) fails at step time as well as at prepare time -- an EIO off the
+        // database file, a BUSY past the busy timeout, a NOMEM -- and `row()` reported all of
+        // those exactly as it reports SQLITE_DONE. This is the count `wfs_snapshot_discard()`
+        // decides on: a short read here is a baseline with no references, so the snapshot goes
+        // to the trash under live worlds and the collector deletes it out from under them.
+        if (!q.done()) return -EIO;
     }
     {
         Stmt q(s->db, "SELECT COUNT(*) FROM pool WHERE snapshot_id=?");
         if (!q.ok()) return -EIO;
         q.i64(1, (int64_t)id);
-        if (q.row()) out.pool_entries = (uint64_t)q.col_i64(0);
+        if (!q.row()) return -EIO;   // COUNT(*) always has a row: no row is a failed read
+        out.pool_entries = (uint64_t)q.col_i64(0);
     }
     return 0;
 }
@@ -2705,6 +2723,10 @@ int trashing_recover(wfs_store *s, uint64_t *restored, uint64_t *finished) {
                 p.trash.assign(q.col_text(2));
                 rows.emplace_back(p);
             }
+            // 32nd round, P2: a scan that stopped half way leaves TRASHING rows unresolved and
+            // their trees looking like orphans to the sweep below. Nothing is resolved from a
+            // list that is not the whole list.
+            if (!q.done()) return -EIO;
         }
         {
             Stmt q(s->db, "SELECT id, path, trash_path, owner_pid, owner_start FROM snapshots WHERE state=4");
@@ -2720,6 +2742,7 @@ int trashing_recover(wfs_store *s, uint64_t *restored, uint64_t *finished) {
                 p.trash.assign(q.col_text(2));
                 rows.emplace_back(p);
             }
+            if (!q.done()) return -EIO;   // 32nd round, P2
         }
     }
     for (size_t i = 0; i < rows.size(); ++i) {
@@ -2738,9 +2761,14 @@ int trashing_recover(wfs_store *s, uint64_t *restored, uint64_t *finished) {
             bool needed = false;
             {
                 Guard g(s->mu);
-                if (snapshot_refs_locked(s, p.id, refs) == 0)
-                    needed = refs.active_worlds || refs.creating_worlds || refs.trashing_worlds ||
-                             refs.pool_entries;
+                // PR #1 review (32nd round, P2): this decides whether a baseline in the trash is
+                // put back or left there for the collector, and its failure used to read as "no
+                // references". A row whose references cannot be counted stays TRASHING for the
+                // next pass -- nobody's work in progress, exactly like a tree that cannot be
+                // located two lines above.
+                if (int rrc = snapshot_refs_locked(s, p.id, refs)) { (void)rrc; continue; }
+                needed = refs.active_worlds || refs.creating_worlds || refs.trashing_worlds ||
+                         refs.pool_entries;
             }
             // Somebody's baseline. Put it back before anything else can call it due.
             if (needed) {
@@ -3018,7 +3046,8 @@ extern "C" int wfs_world_adopt(wfs_store *s, const char *path, const char *name,
             Stmt q(s->db, "SELECT state FROM snapshots WHERE id=?");
             if (!q.ok()) return -EIO;
             q.i64(1, (int64_t)m.snapshot);
-            if (!q.row() || q.col_i64(0) != WFS_ST_ACTIVE) return WFS_E_SOURCE_GONE;
+            if (!q.row()) return q.done() ? WFS_E_SOURCE_GONE : -EIO;   // 32nd round, P2
+            if (q.col_i64(0) != WFS_ST_ACTIVE) return WFS_E_SOURCE_GONE;
         }
         Stmt ins(s->db,
                  "INSERT INTO worlds(kind, parent_world, snapshot_id, name, path, dir_dev, dir_ino,"
@@ -3300,7 +3329,9 @@ bool snap_tmp_named_by_row(wfs_store *s, const char *leaf, size_t sl) {
     if (!q.ok()) return true;
     q.i64(1, (int64_t)id);
     q.i64(2, (int64_t)WFS_ST_DEAD);
-    return q.row();
+    // PR #1 review (32nd round, P2): and a step that failed is a row that could not be read,
+    // not a row that is not there. Same answer: do not delete.
+    return q.row() || !q.done();
 }
 
 // This sweep's key in the store's shared gc retry counter (internal.h). The path, exactly as
@@ -3463,6 +3494,8 @@ bool gc_tmp_is_removable(wfs_store *s, wfs_id id, const char *p, bool *undecided
         if (!r.ok()) return false;
         r.i64(1, (int64_t)id);
         r.text(2, p);
+        // 32nd round, P2: no row and a failed read both come out false here, and false is
+        // "leave it alone" -- the one answer that removes nothing.
         if (!r.row()) return false;
     }
     Stmt q(s->db, "SELECT COUNT(*) FROM worlds WHERE dir_dev=? AND dir_ino=? AND state<>3 AND id<>?");
@@ -3470,6 +3503,8 @@ bool gc_tmp_is_removable(wfs_store *s, wfs_id id, const char *p, bool *undecided
     q.i64(1, (int64_t)st.st_dev);
     q.i64(2, (int64_t)st.st_ino);
     q.i64(3, (int64_t)id);
+    // 32nd round, P2: likewise. A count that could not be read is not a count of zero, and
+    // only a count of zero lets this tree go.
     return q.row() && q.col_i64(0) == 0;
 }
 
@@ -3574,11 +3609,17 @@ struct TrashView {
 // restorability and "this is somebody's baseline" all skipped. The `.deleting` spelling counts
 // as the same name: the collector renames the tree first and records it second, so between the
 // two the row still names the tree by its old name.
-void claim_trash_paths(wfs_store *s, Vec<String> &claimed) {
+//
+// PR #1 review (32nd round, P2): and the list is either the whole list or no answer at all. A
+// prepare that failed was skipped with `continue` and a step that failed ended the loop, and
+// either one drops rows out of `claimed` -- which is precisely how a tree that a row does name
+// becomes an orphan, and an orphan is deleted on sight. It returns its verdict now, and
+// trash_scan() hands the caller -EIO rather than a classification built on half the rows.
+int claim_trash_paths(wfs_store *s, Vec<String> &claimed) {
     for (int table = 0; table < 2; ++table) {
         Stmt q(s->db, table ? "SELECT trash_path FROM snapshots WHERE trash_path<>''"
                             : "SELECT trash_path FROM worlds WHERE trash_path<>''");
-        if (!q.ok()) continue;
+        if (!q.ok()) return -EIO;
         while (q.row()) {
             String tp(q.col_text(0));
             if (!tp.size()) continue;
@@ -3589,7 +3630,9 @@ void claim_trash_paths(wfs_store *s, Vec<String> &claimed) {
             }
             claimed.emplace_back(tp);
         }
+        if (!q.done()) return -EIO;
     }
+    return 0;
 }
 
 // PR #1 review (9th round), P18: the same question claim_trash_paths answers from a snapshot,
@@ -3607,7 +3650,9 @@ bool trash_path_claimed_locked(wfs_store *s, const char *p) {
         if (!q.ok()) return true;   // cannot tell, and "cannot tell" is never "delete it"
         q.text(1, p);
         q.text(2, base.c_str());
-        if (q.row()) return true;
+        // PR #1 review (32nd round, P2): a step that failed is "cannot tell" too. It used to
+        // fall through as "no row names this tree", which is the verdict that deletes it.
+        if (q.row() || !q.done()) return true;
     }
     return false;
 }
@@ -3620,7 +3665,7 @@ int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v, bool collector = fals
     Vec<String> claimed;   // trash paths a row points at, whatever state that row is in
     {
         Guard g(s->mu);
-        claim_trash_paths(s, claimed);
+        if (int crc = claim_trash_paths(s, claimed)) return crc;
         {
             Stmt q(s->db, "SELECT id, trash_path, trashed_at, entries, dir_dev, dir_ino"
                           " FROM worlds WHERE state=2");
@@ -3641,6 +3686,9 @@ int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v, bool collector = fals
                 else if (q.col_i64(2) <= cutoff) v.due.emplace_back(j);
                 else v.waiting++;
             }
+            // PR #1 review (32nd round, P2): every row of it, or nothing. A row this loop never
+            // reached is a row whose tree the orphan pass below then finds unclaimed.
+            if (!q.done()) return -EIO;
         }
         {
             Stmt q(s->db, "SELECT id, trash_path, trashed_at, entries FROM snapshots WHERE state=2");
@@ -3660,6 +3708,7 @@ int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v, bool collector = fals
                 else if (q.col_i64(2) <= cutoff) v.due.emplace_back(j);
                 else v.waiting++;
             }
+            if (!q.done()) return -EIO;   // 32nd round, P2
         }
         // A discard that was killed in the middle. Its tree is in the trash and it is nobody's
         // orphan; it is also not collectable until trashing_recover() has said which way it
@@ -3677,6 +3726,7 @@ int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v, bool collector = fals
                 v.tree_entries += (uint64_t)q.col_i64(2);
                 v.waiting++;
             }
+            if (!q.done()) return -EIO;   // 32nd round, P2
         }
     }
     if (wfs_test_before_trash_orphans) wfs_test_before_trash_orphans(wfs_test_before_trash_orphans_ctx);
@@ -3809,8 +3859,10 @@ int gc_claim_deleting(wfs_store *s, TrashJob &j, String &deleting, TrashClaim &c
                              : "SELECT state, trash_path, dir_dev, dir_ino FROM worlds WHERE id=?");
         if (!q.ok()) return -EIO;
         q.i64(1, (int64_t)j.row);
-        if (!q.row() || q.col_i64(0) != WFS_ST_TRASHED ||
-            ::strcmp(q.col_text(1), j.row_path.c_str()))
+        // 32nd round, P2: 1 is "not the collector's any more", which is a safe thing to say
+        // about a row we could read. A row we could NOT read is a different answer and gets one.
+        if (!q.row()) return q.done() ? 1 : -EIO;
+        if (q.col_i64(0) != WFS_ST_TRASHED || ::strcmp(q.col_text(1), j.row_path.c_str()))
             return 1;
         // PR #1 review (25th round, P1): and the last question before the rename is whether the
         // thing at that path IS this row's tree. The row naming it is not enough -- the
@@ -3890,6 +3942,8 @@ bool trash_row_still_ours(wfs_store *s, const TrashJob &j) {
                                 : "SELECT state, trash_path FROM worlds WHERE id=?");
     if (!q.ok()) return false;
     q.i64(1, (int64_t)j.row);
+    // 32nd round, P2: no row and a failed read both come out false, and false here stops the
+    // deletion -- the one answer that cannot lose a tree.
     return q.row() && q.col_i64(0) == WFS_ST_TRASHED &&
            !::strcmp(q.col_text(1), j.row_path.c_str());
 }
@@ -4033,29 +4087,31 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
         Guard g(s->mu);
         Stmt q(s->db, "SELECT tmp_path, owner_pid, owner_start, created_at FROM worlds"
                       " WHERE state=0 AND tmp_path<>''");
-        if (q.ok()) {
-            while (q.row()) {
-                if (wfs::producer_alive(q.col_i64(1), q.col_i64(2))) continue;
-                if (q.col_i64(3) > reap_before) continue;
-                if (!proven_gone(q.col_text(0))) out->creating_stranded++;
-            }
+        // 32nd round, P2: a count that stopped half way is not the count. `gc --status` is
+        // what an operator reads before deciding the store is clean.
+        if (!q.ok()) return -EIO;
+        while (q.row()) {
+            if (wfs::producer_alive(q.col_i64(1), q.col_i64(2))) continue;
+            if (q.col_i64(3) > reap_before) continue;
+            if (!proven_gone(q.col_text(0))) out->creating_stranded++;
         }
+        if (!q.done()) return -EIO;
         // PR #1 review (7th round): and the half-built snapshots, whose two possible trees
         // (<store>/snapshots/S<n> and its .wfs-tmp) are named by nothing but the CREATING row
         // once the producer is gone. gc keeps that row when it cannot remove them, so an
         // operator asking what is waiting has to be told about those as well.
         String snapd = joinp(s->dir.c_str(), "snapshots");
         Stmt sq(s->db, "SELECT id, owner_pid, owner_start, created_at FROM snapshots WHERE state=0");
-        if (sq.ok()) {
-            while (sq.row()) {
-                if (wfs::producer_alive(sq.col_i64(1), sq.col_i64(2))) continue;
-                if (sq.col_i64(3) > reap_before) continue;
-                wfs_id sid = (wfs_id)sq.col_i64(0);
-                String stmp = numbered(snapd.c_str(), 'S', sid, WFS_TMP_SUFFIX);
-                String sdir = numbered(snapd.c_str(), 'S', sid, nullptr);
-                if (!proven_gone(stmp.c_str()) || !proven_gone(sdir.c_str())) out->creating_stranded++;
-            }
+        if (!sq.ok()) return -EIO;
+        while (sq.row()) {
+            if (wfs::producer_alive(sq.col_i64(1), sq.col_i64(2))) continue;
+            if (sq.col_i64(3) > reap_before) continue;
+            wfs_id sid = (wfs_id)sq.col_i64(0);
+            String stmp = numbered(snapd.c_str(), 'S', sid, WFS_TMP_SUFFIX);
+            String sdir = numbered(snapd.c_str(), 'S', sid, nullptr);
+            if (!proven_gone(stmp.c_str()) || !proven_gone(sdir.c_str())) out->creating_stranded++;
         }
+        if (!sq.done()) return -EIO;   // 32nd round, P2
     }
     // PR #1 review (11th round): and the `*.wfs-tmp` under <store>/snapshots that no row names
     // at all. Those belong to the suffix sweep rather than to the CREATING pass -- half-built
@@ -4282,6 +4338,7 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                 creating.emplace_back((wfs_id)q.col_i64(0));
                 cpaths.emplace_back(q.col_text(1));
             }
+            if (!q.done()) return -EIO;   // 32nd round, P2
         }
         // PR #1 review (7th round): under this wake's deadline. An abandoned fork tree is a
         // half-built clone of a whole workspace, not the handful of stat(2)s the rest of gc's
@@ -4358,6 +4415,7 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                 if (q.col_i64(3) > reap_before) continue;
                 snap_gone.emplace_back((wfs_id)q.col_i64(0));
             }
+            if (!q.done()) return -EIO;   // 32nd round, P2
         }
         // The same deadline as the fork trees above, and for the same reason: a half-built
         // snapshot is a clone of the source tree (PR #1 review, 7th round).
@@ -4445,6 +4503,7 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                     dead_snaps.emplace_back((wfs_id)q.col_i64(0));
                     dead_snap_paths.emplace_back(p);
                 }
+                if (!q.done()) return -EIO;   // 32nd round, P2
             }
             {
                 Stmt q(s->db, "SELECT id, path FROM worlds WHERE state=1");
@@ -4458,6 +4517,7 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                     dead_worlds.emplace_back((wfs_id)q.col_i64(0));
                     dead_world_paths.emplace_back(p);
                 }
+                if (!q.done()) return -EIO;   // 32nd round, P2
             }
         }
         if (wfs_test_before_reconcile) wfs_test_before_reconcile(wfs_test_before_reconcile_ctx);

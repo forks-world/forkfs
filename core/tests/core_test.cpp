@@ -6172,6 +6172,109 @@ int main() {
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
 
+    // ---- PR #1 review (32nd round, P2): a failed step is not "the rows ran out" -------------
+    //
+    // sqlite3_step(2) fails long after a successful prepare -- SQLITE_IOERR off the database
+    // file, a SQLITE_BUSY that outlives the busy timeout, SQLITE_NOMEM -- and Stmt::row()
+    // reported every one of those exactly as it reports SQLITE_DONE: false. Every count and
+    // every lookup in this core that decides a destructive step read that false as a verdict.
+    // wfs_test_stmt_fail_sql fails the next step of one named query, once, which is the only
+    // way to ask those verdicts the question from outside.
+    {
+        char fstore[4096], fsrc[4096], fw[4096], fdb[4096], fsdir[4096], forph[4096], fsql[256];
+        join(fstore, sizeof fstore, root, "step-store");
+        join(fsrc, sizeof fsrc, root, "step-src");
+        CHECK(mkdir(fsrc, 0755) == 0);
+        join(p, sizeof p, fsrc, "a.txt");
+        write_file(p, "one\n");
+        join(fdb, sizeof fdb, fstore, "metadata.db");
+        wfs_store *fs = NULL;
+        CHECK_OK(wfs_store_open(fstore, &fs));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "st";
+        wfs_id f1 = 0;
+        CHECK_OK(wfs_snapshot_create(fs, fsrc, &sopts, &f1));
+        snprintf(fsdir, sizeof fsdir, "%s/snapshots/S%llu", fstore, (unsigned long long)f1);
+        wfs_ref fref = {WFS_K_SNAPSHOT, f1};
+        memset(&opts, 0, sizeof opts);
+        join(fw, sizeof fw, worlds, "stepworld");
+        wfs_id fw1 = 0;
+        CHECK_OK(wfs_world_create(fs, fref, fw, &opts, &fw1));
+        wfs_snapshot_rec fsr;
+
+        // (a) the reference count `discard S<n>` is decided on (snapshot_refs_locked). One
+        //     ACTIVE world names this snapshot, so the discard owes it a refusal. Fail that
+        //     count's step and it used to come back empty: the discard returned 0 and the
+        //     snapshot went to the trash with a live world forked from it, for the collector
+        //     to delete when its retention ran out.
+        wfs_test_stmt_fail_sql = "FROM worlds WHERE snapshot_id=?";
+        CHECK_RC(wfs_snapshot_discard(fs, f1, 0, 0), -EIO);
+        CHECK(wfs_test_stmt_fail_sql == NULL);          // the seam fired
+        CHECK_OK(wfs_snapshot_info(fs, f1, &fsr));
+        CHECK(fsr.state == WFS_ST_ACTIVE);              // and nothing moved
+        CHECK(exists(fsdir));
+        // ... and with the count readable it refuses for the reason it should.
+        CHECK_RC(wfs_snapshot_discard(fs, f1, 0, 0), WFS_E_SNAPSHOT_IN_USE);
+
+        // (b) the same count, asked by trashing_recover() about a discard that was killed after
+        //     its rename. A failure there used to read as "nothing needs this baseline", so the
+        //     recovery finished the discard -- the tree stays in the trash and the collector
+        //     takes it, out from under a world that is forked from it. The row is left TRASHING
+        //     for the next pass now.
+        CHECK_OK(wfs_world_discard(fs, fw1, 1, 0));     // nothing references it for a moment
+        wfs_test_trash_crash = trash_crash;
+        crash_at(1);
+        CHECK_RC(wfs_snapshot_discard(fs, f1, 0, 0), -EINTR);
+        CHECK(g_trash_crash_hits == 1);                 // (crash_at() resets the counter)
+        crash_at(-1);
+        wfs_test_trash_crash = NULL;
+        CHECK(!exists(fsdir) && exists(g_trash_crash_path));
+        wfs_store_close(fs);
+        // The world row back on its feet, naming this snapshot: somebody needs the baseline.
+        snprintf(fsql, sizeof fsql, "UPDATE worlds SET state=1, snapshot_id=%llu WHERE id=%llu;",
+                 (unsigned long long)f1, (unsigned long long)fw1);
+        db_exec(fdb, fsql);
+        wfs_test_stmt_fail_sql = "FROM worlds WHERE snapshot_id=?";
+        fs = NULL;
+        CHECK_OK(wfs_store_open(fstore, &fs));          // the recovery runs inside the open
+        CHECK(wfs_test_stmt_fail_sql == NULL);
+        CHECK_OK(wfs_snapshot_info(fs, f1, &fsr));
+        CHECK(fsr.state == WFS_ST_TRASHING);            // TRASHED before the fix
+        CHECK(exists(g_trash_crash_path) && !exists(fsdir));
+        wfs_store_close(fs);
+        // ... and the next pass, with the count readable, puts the baseline back where the
+        //     world can reach it.
+        fs = NULL;
+        CHECK_OK(wfs_store_open(fstore, &fs));
+        CHECK_OK(wfs_snapshot_info(fs, f1, &fsr));
+        CHECK(fsr.state == WFS_ST_ACTIVE);
+        CHECK(exists(fsdir) && !exists(g_trash_crash_path));
+
+        // (c) the orphan sweep (trash_path_claimed_locked). A directory in <store>/trash that
+        //     no row names is deleted on sight -- retention, restorability and "this is
+        //     somebody's baseline" all skipped -- so "no row names it" is the one verdict that
+        //     must never be reached because a lookup failed.
+        snprintf(forph, sizeof forph, "%s/trash/W9999-1", fstore);
+        CHECK(mkdir(forph, 0755) == 0);
+        join(p, sizeof p, forph, "leftover");
+        write_file(p, "x");
+        wfs_gc_report frep;
+        memset(&frep, 0, sizeof frep);
+        wfs_test_stmt_fail_sql = "FROM worlds WHERE trash_path=? OR trash_path=?";
+        CHECK_OK(wfs_gc(fs, 0, &frep));
+        CHECK(wfs_test_stmt_fail_sql == NULL);
+        CHECK(frep.trash_orphans == 0);
+        CHECK(exists(forph));                           // deleted, with its file, before the fix
+        // ... and once the lookup answers, it goes, exactly as it always did.
+        memset(&frep, 0, sizeof frep);
+        CHECK_OK(wfs_gc(fs, 0, &frep));
+        CHECK(frep.trash_orphans == 1);
+        CHECK(!exists(forph));
+        wfs_store_close(fs);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", fstore, (unsigned long long)f1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
     wfs_store_close(s);
     rm_rf(root);
     printf("core_test: all OK\n");

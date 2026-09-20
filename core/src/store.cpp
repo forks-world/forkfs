@@ -23,6 +23,10 @@ extern "C" void *wfs_test_before_version_rename_ctx = nullptr;
 extern "C" void (*wfs_test_after_version_bump)(void *ctx, const char *dir) = nullptr;
 extern "C" void *wfs_test_after_version_bump_ctx = nullptr;
 
+// One step(2), failed on demand (PR #1 review, 32nd round). NULL in every run that is not a
+// test; nothing in the library ever assigns it a value. Read by Stmt::row() in db.h.
+extern "C" const char *wfs_test_stmt_fail_sql = nullptr;
+
 namespace {
 
 // Schema v3 (docs/M1_DESIGN.md §2). Snapshot ids and world ids are separate sequences, so
@@ -168,15 +172,22 @@ inline int user_version_want(void) { return WFS_STORE_SCHEMA * 100 + kSchemaRev;
 
 // Does `table` have a column called `column`, right now, in this database? The table names are
 // this file's own string literals, so the interpolation is not a place a name can come from.
-bool has_column(sqlite3 *db, const char *table, const char *column) {
+//
+// PR #1 review (32nd round, P2): 1 = yes, 0 = no, negative = the schema could not be asked. It
+// used to answer a bool, so a prepare that failed and a step that failed both came back "the
+// column is not there" -- which is the answer that runs the ALTER (it then fails with duplicate
+// column name and the whole migration is rolled back) and, in the verification pass below, the
+// answer that calls a perfectly migrated store un-migrated. Neither is a lie the migration is
+// allowed to tell about the schema.
+int has_column(sqlite3 *db, const char *table, const char *column) {
     String sql("PRAGMA table_info(");
     sql.append(table);
     sql.append(")");
     Stmt q(db, sql.c_str());
-    if (!q.ok()) return false;
+    if (!q.ok()) return -EIO;
     while (q.row())
-        if (!::strcmp(q.col_text(1), column)) return true;   // 1 = name
-    return false;
+        if (!::strcmp(q.col_text(1), column)) return 1;   // 1 = name
+    return q.done() ? 0 : -EIO;
 }
 
 // ---- PR #1 review (11th round): migrating is a transaction, and its verdict is the schema ----
@@ -200,12 +211,14 @@ int migrate_schema(sqlite3 *db) {
     if (t.begin_rc != SQLITE_OK) return -EIO;
     if (sqlite3_exec(db, kSchema, nullptr, nullptr, nullptr) != SQLITE_OK) return -EIO;
     for (const Migration &m : kMigrations) {
-        if (has_column(db, m.table, m.column)) continue;
+        int hc = has_column(db, m.table, m.column);
+        if (hc < 0) return -EIO;
+        if (hc) continue;
         if (sqlite3_exec(db, m.ddl, nullptr, nullptr, nullptr) != SQLITE_OK) return -EIO;
     }
     // The verdict, from the schema rather than from the fact that the statements returned OK.
     for (const Migration &m : kMigrations)
-        if (!has_column(db, m.table, m.column)) return -EIO;
+        if (has_column(db, m.table, m.column) != 1) return -EIO;
     char pragma[64];
     ::snprintf(pragma, sizeof pragma, "PRAGMA user_version=%d", user_version_want());
     if (sqlite3_exec(db, pragma, nullptr, nullptr, nullptr) != SQLITE_OK) return -EIO;
@@ -376,7 +389,7 @@ int meta_get(sqlite3 *db, const char *key, String &out) {
     Stmt q(db, "SELECT value FROM meta WHERE key=?");
     if (!q.ok()) return -EIO;
     q.text(1, key);
-    if (!q.row()) return -ENOENT;
+    if (!q.row()) return q.done() ? -ENOENT : -EIO;   // 32nd round, P2
     out.assign(q.col_text(0));
     return 0;
 }
@@ -453,7 +466,10 @@ int64_t gc_fail_bump(wfs_store *s, const char *key) {
         Stmt q(s->db, "SELECT value FROM meta WHERE key=?");
         if (!q.ok()) return kGcFailCap;
         q.text(1, key);
+        // 32nd round, P2: a counter that could not be read is not a counter at zero -- that
+        // would reset the cap on every failed read and put the collector back in a loop.
         if (q.row()) n = ::strtoll(q.col_text(0), nullptr, 10);
+        else if (!q.done()) return kGcFailCap;
     }
     ++n;
     char v[32];
@@ -474,7 +490,8 @@ int64_t gc_fail_get(wfs_store *s, const char *key) {
     Stmt q(s->db, "SELECT value FROM meta WHERE key=?");
     if (!q.ok()) return kGcFailCap;
     q.text(1, key);
-    return q.row() ? ::strtoll(q.col_text(0), nullptr, 10) : 0;
+    if (q.row()) return ::strtoll(q.col_text(0), nullptr, 10);
+    return q.done() ? 0 : kGcFailCap;   // 32nd round, P2: cannot tell, so treat it as spent
 }
 
 // The read comes first so that the ordinary case -- something that never failed -- costs one
@@ -486,7 +503,7 @@ void gc_fail_clear(wfs_store *s, const char *key) {
         Stmt q(s->db, "SELECT 1 FROM meta WHERE key=?");
         if (!q.ok()) return;
         q.text(1, key);
-        if (!q.row()) return;
+        if (!q.row()) return;   // 32nd round, P2: no row and no answer both mean "clear nothing"
     }
     Txn t(s->db);
     Stmt d(s->db, "DELETE FROM meta WHERE key=?");
@@ -539,6 +556,8 @@ bool gc_dirs_unreadable_pending(wfs_store *s) {
                   " AND CAST(value AS INTEGER) < ? LIMIT 1");
     if (!q.ok()) return false;   // cannot tell, and "cannot tell" never spawns a worker chain
     q.i64(1, kGcFailCap);
+    // 32nd round, P2: same for a step that failed. Both answers are false here, and false is
+    // the one that does nothing.
     return q.row();
 }
 
@@ -656,10 +675,18 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
     // the line of defence that normally speaks; this one is for a database whose stamp and
     // whose VERSION file disagree, and it is the one thing an older core could not have written
     // by accident.
+    // PR #1 review (32nd round, P2): and it is READ, or this open ends. A PRAGMA that could
+    // not be stepped used to leave `user_version` at 0 -- which is neither the refusal the
+    // hundreds check owes a future schema nor a stamp this core wrote, and it would have sent
+    // an unreadable database straight into the migration below.
     int user_version = 0;
     {
         Stmt q(s->db, "PRAGMA user_version");
-        if (q.ok() && q.row()) user_version = (int)q.col_i64(0);
+        // A stamp that cannot be read is a database that cannot be read -- SQLITE_NOTADB comes
+        // back here, from the step, for a file that is not one -- so it gets the verdict the
+        // 13th round gave every other shape of that: WFS_E_STORE_DAMAGED, and nothing written.
+        if (!q.ok() || !q.row()) { wfs_store_close(s); return WFS_E_STORE_DAMAGED; }
+        user_version = (int)q.col_i64(0);
     }
     if (user_version / 100 > WFS_STORE_SCHEMA) { wfs_store_close(s); return WFS_E_SCHEMA; }
 
@@ -746,7 +773,11 @@ extern "C" int wfs_store_status(wfs_store *s, wfs_store_stat *out) {
         Stmt q(s->db, "SELECT COUNT(*), COALESCE(SUM(entries),0) FROM snapshots WHERE state=?");
         if (!q.ok()) return -EIO;
         q.i64(1, WFS_ST_ACTIVE);
-        if (q.row()) { out->snapshots = (uint64_t)q.col_i64(0); out->snapshot_entries = (uint64_t)q.col_i64(1); }
+        // PR #1 review (32nd round, P2): a count that could not be read is not a count of zero.
+        // `status` is what an operator reads before deciding what to collect.
+        if (!q.row()) return -EIO;
+        out->snapshots = (uint64_t)q.col_i64(0);
+        out->snapshot_entries = (uint64_t)q.col_i64(1);
     }
     {
         Stmt q(s->db, "SELECT state, COUNT(*), COALESCE(SUM(entries),0) FROM worlds GROUP BY state");
@@ -760,13 +791,13 @@ extern "C" int wfs_store_status(wfs_store *s, wfs_store_stat *out) {
             default: break;
             }
         }
+        if (!q.done()) return -EIO;   // 32nd round, P2
     }
     {
         Stmt q(s->db, "SELECT COUNT(*), COALESCE(SUM(entries),0) FROM pool WHERE state=1");
-        if (q.ok() && q.row()) {
-            out->pool_ready = (uint64_t)q.col_i64(0);
-            out->pool_entries = (uint64_t)q.col_i64(1);
-        }
+        if (!q.ok() || !q.row()) return -EIO;   // 32nd round, P2
+        out->pool_ready = (uint64_t)q.col_i64(0);
+        out->pool_entries = (uint64_t)q.col_i64(1);
     }
     // T2.2 reconciliation: a row whose tree is not there. One stat(2) per row, and a store has
     // tens of snapshots and (measured) a thousand worlds at most, so `status` stays a 7 ms
@@ -779,35 +810,38 @@ extern "C" int wfs_store_status(wfs_store *s, wfs_store_stat *out) {
     // running `gc --reconcile`, so it must not call either of those dangling.
     {
         Stmt q(s->db, "SELECT path FROM snapshots WHERE state=?");
-        if (q.ok()) {
-            q.i64(1, WFS_ST_ACTIVE);
-            struct stat st;
-            while (q.row()) {
-                const char *p = q.col_text(0);
-                int prc = *p ? wfs::fs_probe(p, &st, true) : -ENOENT;
-                if (prc == 0 && S_ISDIR(st.st_mode)) continue;
-                if (wfs::fs_gone(prc)) out->snapshots_dangling++;
-                else out->snapshots_unreadable++;
-            }
+        if (!q.ok()) return -EIO;   // 32nd round, P2
+        q.i64(1, WFS_ST_ACTIVE);
+        struct stat st;
+        while (q.row()) {
+            const char *p = q.col_text(0);
+            int prc = *p ? wfs::fs_probe(p, &st, true) : -ENOENT;
+            if (prc == 0 && S_ISDIR(st.st_mode)) continue;
+            if (wfs::fs_gone(prc)) out->snapshots_dangling++;
+            else out->snapshots_unreadable++;
         }
+        if (!q.done()) return -EIO;
     }
     {
         Stmt q(s->db, "SELECT COUNT(*) FROM snapshots WHERE state=?");
-        if (q.ok()) { q.i64(1, WFS_ST_TRASHED); if (q.row()) out->snapshots_trashed = (uint64_t)q.col_i64(0); }
+        if (!q.ok()) return -EIO;   // 32nd round, P2
+        q.i64(1, WFS_ST_TRASHED);
+        if (!q.row()) return -EIO;
+        out->snapshots_trashed = (uint64_t)q.col_i64(0);
     }
     {
         Stmt q(s->db, "SELECT path, dir_ino FROM worlds WHERE state=?");
-        if (q.ok()) {
-            q.i64(1, WFS_ST_ACTIVE);
-            struct stat st;
-            while (q.row()) {
-                const char *p = q.col_text(0);
-                int prc = *p ? wfs::fs_probe(p, &st, true) : -ENOENT;
-                if (prc == 0 && S_ISDIR(st.st_mode)) continue;
-                if (wfs::fs_gone(prc)) out->worlds_dangling++;
-                else out->worlds_unreadable++;
-            }
+        if (!q.ok()) return -EIO;   // 32nd round, P2
+        q.i64(1, WFS_ST_ACTIVE);
+        struct stat st;
+        while (q.row()) {
+            const char *p = q.col_text(0);
+            int prc = *p ? wfs::fs_probe(p, &st, true) : -ENOENT;
+            if (prc == 0 && S_ISDIR(st.st_mode)) continue;
+            if (wfs::fs_gone(prc)) out->worlds_dangling++;
+            else out->worlds_unreadable++;
         }
+        if (!q.done()) return -EIO;
     }
     uint64_t avail = 0, total = 0;
     if (int rc = wfs::fs_free_space(s->dir.c_str(), &avail, &total)) return rc;

@@ -113,7 +113,9 @@ int snap_info(wfs_store *s, wfs_id id, SnapInfo &out) {
            " FROM snapshots WHERE id=?");
     if (!q.ok()) return -EIO;
     q.i64(1, (int64_t)id);
-    if (!q.row()) return -ENOENT;
+    // PR #1 review (32nd round, P2): -ENOENT is "there is no such snapshot", which every caller
+    // acts on. A read that failed says nothing of the sort.
+    if (!q.row()) return q.done() ? -ENOENT : -EIO;
     out.root.assign(q.col_text(0));
     out.created_at = q.col_i64(1);
     out.entries = (uint64_t)q.col_i64(2);
@@ -166,7 +168,8 @@ int ready_count(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, uint64_t
     if (!q.ok()) return -EIO;
     q.i64(1, (int64_t)snapshot);
     q.i64(2, snap_created_at);
-    if (q.row()) *out = (uint64_t)q.col_i64(0);
+    if (!q.row()) return -EIO;   // 32nd round, P2: COUNT(*) has a row unless the read failed
+    *out = (uint64_t)q.col_i64(0);
     return 0;
 }
 
@@ -203,7 +206,7 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
             Stmt sq(s->db, "SELECT state, created_at FROM snapshots WHERE id=?");
             if (!sq.ok()) return -EIO;
             sq.i64(1, (int64_t)snapshot);
-            if (!sq.row()) return -ESTALE;
+            if (!sq.row()) return sq.done() ? -ESTALE : -EIO;   // 32nd round, P2
             if (sq.col_i64(0) != WFS_ST_ACTIVE || sq.col_i64(1) != si.created_at) return -ESTALE;
         }
         // PR #1 review (3rd round): who is filling this entry, so gc can tell a filler that died
@@ -327,7 +330,7 @@ int pool_claim(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, PoolClaim
     if (!q.ok()) return -EIO;
     q.i64(1, (int64_t)snapshot);
     q.i64(2, snap_created_at);
-    if (!q.row()) return -ENOENT;
+    if (!q.row()) return q.done() ? -ENOENT : -EIO;   // 32nd round, P2
     out.row = (wfs_id)q.col_i64(0);
     out.uuid.assign(q.col_text(1));
     out.path.assign(q.col_text(2));
@@ -383,7 +386,7 @@ int pool_return(wfs_store *s, const PoolClaim &c, PoolReturnHook on_returned, vo
             if (!sq.ok()) rc = -EIO;
             else {
                 sq.i64(1, (int64_t)c.snapshot);
-                if (!sq.row()) rc = -ESTALE;
+                if (!sq.row()) rc = sq.done() ? -ESTALE : -EIO;   // 32nd round, P2
                 else if (sq.col_i64(0) != WFS_ST_ACTIVE || sq.col_i64(1) != c.snap_created_at)
                     rc = -ESTALE;
             }
@@ -437,6 +440,7 @@ int pool_verify(wfs_store *s, wfs_id snapshot, uint64_t *checked, uint64_t *dirt
             paths.emplace_back(q.col_text(0));
             mtimes.emplace_back(q.col_i64(1));
         }
+        if (!q.done()) return -EIO;   // 32nd round, P2
     }
     for (size_t i = 0; i < paths.size(); ++i) {
         if (checked) (*checked)++;
@@ -494,21 +498,31 @@ int pool_scan(wfs_store *s, Vec<wfs_id> &rows, Vec<String> &trees, Vec<String> &
             if (!doomed) {
                 sqlite3_reset(snap.s);
                 snap.i64(1, (int64_t)sid);
-                if (!snap.row()) doomed = true;                                  // snapshot gone
-                else if (snap.col_i64(1) != WFS_ST_ACTIVE) doomed = true;        // not usable
+                if (!snap.row()) {
+                    // PR #1 review (32nd round, P2): "no such snapshot" is a row that is not
+                    // there, not a step that failed. A failed read here dooms a pool entry
+                    // whose snapshot is perfectly alive, and a doomed entry is a tree the
+                    // collector deletes.
+                    if (!snap.done()) return -EIO;
+                    doomed = true;                                               // snapshot gone
+                } else if (snap.col_i64(1) != WFS_ST_ACTIVE) doomed = true;      // not usable
                 else if (snap.col_i64(0) != sat) doomed = true;                  // a different snapshot now
             }
             if (doomed) { rows.emplace_back(id); trees.emplace_back(path); }
             else live.emplace_back(path);
         }
+        if (!q.done()) return -EIO;   // 32nd round, P2
         // PR #1 review (3rd round): an entry a fork has claimed has no pool row any more -- the
         // claim deletes it -- so the sweep below saw an unclaimed directory and removed the tree
         // the fork was about to rename into place. The fork's CREATING world row records that
         // entry as its tmp_path; while such a row exists, the tree it names is somebody's work
         // in progress, and gc's own CREATING pass is what decides when it is not.
         Stmt w(s->db, "SELECT tmp_path FROM worlds WHERE state=0 AND tmp_path<>''");
-        if (w.ok())
-            while (w.row()) live.emplace_back(w.col_text(0));
+        // 32nd round, P2: `live` is the list of trees the sweep must not touch, so a query that
+        // could not be run or could not be finished is not a shorter list -- it is no answer.
+        if (!w.ok()) return -EIO;
+        while (w.row()) live.emplace_back(w.col_text(0));
+        if (!w.done()) return -EIO;
     }
     return 0;
 }
@@ -526,6 +540,8 @@ bool pool_row_still_doomed_locked(wfs_store *s, wfs_id id, const String &path) {
                       " created_at FROM pool WHERE id=?");
         if (!q.ok()) return false;
         q.i64(1, (int64_t)id);
+        // 32nd round, P2: false is "leave it alone", which is what a read that failed must
+        // also say. Only a row that is genuinely not there is a row that has moved on.
         if (!q.row()) return false;                                   // claimed, drained, gone
         if (::strcmp(q.col_text(2), path.c_str())) return false;      // not the tree we queued
         sid = (wfs_id)q.col_i64(0);
@@ -542,7 +558,9 @@ bool pool_row_still_doomed_locked(wfs_store *s, wfs_id id, const String &path) {
     Stmt snap(s->db, "SELECT created_at, state FROM snapshots WHERE id=?");
     if (!snap.ok()) return false;
     snap.i64(1, (int64_t)sid);
-    if (!snap.row()) return true;                             // snapshot gone
+    // 32nd round, P2: every `return true` below is "delete this tree". A snapshot row that
+    // could not be READ is not a snapshot that is gone, so that one answers false.
+    if (!snap.row()) return snap.done();                      // snapshot gone (or unreadable)
     if (snap.col_i64(1) != WFS_ST_ACTIVE) return true;        // not usable
     return snap.col_i64(0) != sat;                            // a different snapshot now
 }
@@ -560,13 +578,15 @@ bool pool_path_claimed_locked(wfs_store *s, const String &p) {
         if (!q.ok()) return true;   // cannot tell, and "cannot tell" is never "delete it"
         q.text(1, p.c_str());
         q.text(2, base.c_str());
-        if (q.row()) return true;
+        // 32nd round, P2: and a step that failed is "cannot tell" exactly as a prepare that
+        // failed is. It used to read as "no row names this tree", which is what deletes it.
+        if (q.row() || !q.done()) return true;
     }
     Stmt w(s->db, "SELECT 1 FROM worlds WHERE state=0 AND (tmp_path=? OR tmp_path=?)");
     if (!w.ok()) return true;
     w.text(1, p.c_str());
     w.text(2, base.c_str());
-    return w.row();
+    return w.row() || !w.done();
 }
 
 // One pool tree's key in the store's shared gc retry counter (internal.h). The path, because
@@ -841,6 +861,7 @@ extern "C" int wfs_pool_status(wfs_store *s, wfs_pool_stat *buf, size_t cap, siz
         wfs::Stmt q(s->db, "SELECT DISTINCT snapshot_id FROM pool ORDER BY snapshot_id");
         if (!q.ok()) return -EIO;
         while (q.row()) ids.emplace_back((wfs_id)q.col_i64(0));
+        if (!q.done()) return -EIO;   // 32nd round, P2
     }
     size_t n = 0;
     for (size_t i = 0; i < ids.size(); ++i) {
@@ -872,6 +893,7 @@ extern "C" int wfs_pool_status(wfs_store *s, wfs_pool_stat *buf, size_t cap, siz
             if (!st.oldest_at || at < st.oldest_at) st.oldest_at = at;
             if (at > st.newest_at) st.newest_at = at;
         }
+        if (!q.done()) return -EIO;   // 32nd round, P2
         if (buf && n < cap) buf[n] = st;
         ++n;
     }
@@ -897,6 +919,7 @@ extern "C" int wfs_pool_drain(wfs_store *s, wfs_id snapshot, uint64_t *removed) 
             rows.emplace_back((wfs_id)q.col_i64(0));
             paths.emplace_back(q.col_text(1));
         }
+        if (!q.done()) return -EIO;   // 32nd round, P2
     }
     // PR #1 review (16th round, P2): the tree first, the row only when the tree is gone. This
     // used to delete the row and then remove the trees with both results thrown away, and
