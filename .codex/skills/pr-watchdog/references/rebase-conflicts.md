@@ -3,6 +3,15 @@
 Use this reference when a PR base has advanced through a stacked series or has
 rewritten equivalent commits.
 
+For forkfs, the ordinary base is `main`; use another base only for an explicitly
+documented stack. Read `docs/M1_DESIGN.md`, `arch.md`, and the affected core/CLI
+tests when resolving storage behavior. Preserve snapshot gates and immutable
+flags, hardlink groups, store/world identity checks, SQLite transaction
+boundaries, and the pool/GC state transitions touched by the change. In
+particular, a conflict fix must not let GC delete a live world or a tree still
+being created. Use the macOS/APFS validation in `../SKILL.md`; a Linux compile
+or an unrelated database test suite is not evidence for these invariants.
+
 ## Establish the commit mapping
 
 Record the remote head and base before mutation. In an isolated worktree,
