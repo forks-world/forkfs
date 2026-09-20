@@ -2098,6 +2098,73 @@ int main() {
         CHECK(lstat(p, &st) == 0 && (st.st_flags & uflag) == uflag);
     }
 
+    // ---- PR #1 review (35th round, P2): the DIRECTORY the source made append-only ----------
+    //
+    // The 18th round's flags were on the file; this is the same flag on its parent. UF_APPEND on
+    // a directory permits link(2) -- an add is what the flag is for -- and refuses rename(2) and
+    // unlink(2) alike, both EPERM. So the replay's temporary was created, the rename was
+    // refused, and the cleanup unlink that was supposed to take the temporary away was refused
+    // too, with its result thrown away. The retry under the 18th round's lend then linked a
+    // SECOND temporary, under a fresh name, and succeeded -- so nothing failed and the snapshot
+    // was published: three names on the canonical inode of a group of two, a `.wfs-hl-` left in
+    // the tree, and hardlinks_verify_groups(), which wants that nlink to be EXACTLY the member
+    // count, calling the snapshot dirty from then on. Measured before the fix: `snapshot
+    // create` rc 0, `d/a` nlink 3, one `.wfs-hl-*` under `d/`, and verify -1008 with modified 2.
+    {
+        char apsrc[4096], apdir[4096], apw[4096], apsnapd[4096];
+        join(apsrc, sizeof apsrc, root, "flag-dir-uappnd");
+        CHECK(mkdir(apsrc, 0755) == 0);
+        join(apdir, sizeof apdir, apsrc, "d");
+        CHECK(mkdir(apdir, 0755) == 0);
+        join(p, sizeof p, apdir, "a");
+        write_file(p, "pair\n");
+        join(q, sizeof q, apdir, "b");
+        CHECK(link(p, q) == 0);
+        CHECK(nlink_of(p) == 2);
+        CHECK(chflags(apdir, UF_APPEND) == 0);   // the directory, not the files in it
+
+        wfs_id sap = 0;
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "uappnd-dir";
+        CHECK_OK(wfs_snapshot_create(s, apsrc, &sopts, &sap));
+        CHECK_OK(wfs_snapshot_info(s, sap, &sr));
+        CHECK(sr.hl_groups == 1 && sr.hl_external == 0 && sr.hardlinks == 2);
+        // The verdict the whole finding is about: WFS_E_SNAPSHOT_DIRTY, on a snapshot whose
+        // creation returned 0, before the fix.
+        CHECK_OK(wfs_snapshot_verify(s, sap, &vr));
+        CHECK(vr.missing == 0 && vr.modified == 0 && vr.extra == 0);
+        CHECK(chmod(sr.path, 0700) == 0);        // the gate; `d` keeps its own flag throughout
+        join(apsnapd, sizeof apsnapd, sr.path, "d");
+        join(p, sizeof p, apsnapd, "a");
+        join(q, sizeof q, apsnapd, "b");
+        CHECK(ino_of(p) == ino_of(q));
+        CHECK(nlink_of(p) == 2);                         // 3 before the fix
+        CHECK(n_with_prefix(apsnapd, ".wfs-hl-") == 0);  // one temporary before the fix
+        CHECK(lstat(apsnapd, &st) == 0 && (st.st_flags & UF_APPEND) == UF_APPEND);
+        CHECK(chmod(sr.path, 0) == 0);
+
+        // And a fork off it rebuilds the pair through an append-only directory of its own.
+        wfs_ref from_ap = {WFS_K_SNAPSHOT, sap};
+        join(apw, sizeof apw, worlds, "w-uappnd-dir");
+        memset(&opts, 0, sizeof opts);
+        opts.name = "uappnd-dir";
+        opts.no_pool = 1;
+        memset(&hfr, 0, sizeof hfr);
+        CHECK_OK(wfs_world_create_ex(s, from_ap, apw, &opts, &hfr));
+        CHECK(hfr.hardlinks == 1);
+        join(p, sizeof p, apw, "d");
+        CHECK(n_with_prefix(p, ".wfs-hl-") == 0);
+        join(p, sizeof p, apw, "d/a");
+        join(q, sizeof q, apw, "d/b");
+        CHECK(ino_of(p) == ino_of(q) && nlink_of(p) == 2);
+
+        // Teardown: the flag comes off the source and off the fork, so this test's own cleanup
+        // can clear them. (The snapshot's copy is behind the gate and rm_rf lchflags its way in.)
+        join(p, sizeof p, apw, "d");
+        CHECK(chflags(p, 0) == 0);
+        CHECK(chflags(apdir, 0) == 0);
+    }
+
     // ---- PR #1 review (23rd round, P2): a member we could not look at is not one that is gone ----
     //
     // The replay counts a member whose fstatat/openat failed as `missing` and carries on, and

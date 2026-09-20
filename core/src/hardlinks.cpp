@@ -536,15 +536,36 @@ bool link_at_fresh_name(int canon_fd, const char *canon_leaf, int dirfd, String 
 }
 
 // link(2) + rename(2), both relative to descriptors the descent opened. `*err` is the negative
-// errno of whichever call failed when this returns false; nothing of ours is left behind.
-bool relink_at(int canon_fd, const char *canon_leaf, int dirfd, const char *leaf, int *err) {
+// errno of whichever call failed when this returns false.
+//
+// ---- PR #1 review (35th round, P2): and what is left behind when the rename fails -----------
+//
+// "Nothing of ours is left behind" was what the unlinkat(2) below was for, and its result was
+// thrown away -- which is exactly wrong in the one case that matters. A cloned directory
+// carrying UF_APPEND (the 18th round's case: `chflags uappnd` on a source tree, copied onto the
+// clone by clonefile(2)) takes the link -- link(2) into an append-only directory is an ADD --
+// and refuses the rename and the unlink alike, both EPERM. So the temporary survived, the
+// caller lent the directory and retried under a FRESH name, and that retry succeeded: the
+// canonical inode came out of the replay with one more link than the group has names. Nothing
+// failed, so the snapshot was published -- and then hardlinks_verify_groups() refuses it,
+// because a group's nlink must be EXACTLY its member count. `snapshot create` returned 0 and
+// every `verify` and every fork of that snapshot called it dirty from then on.
+//
+// So the temporary's name comes back to the caller when it could not be removed, and the retry
+// under the lend removes it FIRST (relink_under_lend below). `leftover` is set only in that
+// case: on every other exit -- the link that never happened, the rename that succeeded, the
+// unlink that worked -- it is left empty, because there is nothing there.
+bool relink_at(int canon_fd, const char *canon_leaf, int dirfd, const char *leaf, int *err,
+               String *leftover) {
+    if (leftover) leftover->assign("");
     String tmp;
     if (!link_at_fresh_name(canon_fd, canon_leaf, dirfd, tmp)) { *err = -errno; return false; }
     // rename(2), not unlink+link: the name never stops existing, so a crash or an error here
     // cannot lose the file.
     if (::renameat(dirfd, tmp.c_str(), dirfd, leaf) != 0) {
         *err = -errno;
-        ::unlinkat(dirfd, tmp.c_str(), 0);
+        if (::unlinkat(dirfd, tmp.c_str(), 0) != 0 && errno != ENOENT && leftover)
+            leftover->assign(tmp.c_str());
         return false;
     }
     return true;
@@ -688,18 +709,36 @@ struct Relender {
 // lent once per name linked rather than once per group, which ends in the same place: after the
 // link the new name IS the canonical inode, so restoring that inode's flags restores the whole
 // group's, and the next name starts from the file exactly as the source left it.
+//
+// PR #1 review (35th round, P2): and the first thing done under the lend is to take away what
+// the attempt that failed left behind. `leftover` is the temporary relink_at() above linked and
+// could not unlink -- an extra name on the canonical inode, inside the very directory this lend
+// has just unlocked. Removing it is what makes the retry a retry rather than a second link, and
+// a removal that fails is FATAL: the caller records `*err` and the clone is unwound, because a
+// `.wfs-hl-` that survives into a published tree is a manifest whose group's nlink no longer
+// matches its member count -- a snapshot that verifies dirty for ever, created by a command
+// that returned 0.
 bool relink_under_lend(Relender &rl, int canon_fd, const char *canon_leaf, int dirfd,
-                       const char *leaf, int *err) {
+                       const char *leaf, int *err, const String &leftover) {
     Guard lk(rl.mu);
     LendStack lend;
     if (!lend.lend(dirfd)) return false;
+    if (!leftover.empty() && ::unlinkat(dirfd, leftover.c_str(), 0) != 0 && errno != ENOENT) {
+        *err = errno ? -errno : -EIO;
+        return false;
+    }
     // Neither of these is a reason to give up on its own: a file with no flags on it says true
     // without being recorded, and one that will not open or will not change simply leaves
     // relink_at to fail the way it already did, with the file system's own errno.
     lend.lend_file(canon_fd, canon_leaf);
     size_t victim = (size_t)-1;
     lend.lend_file(dirfd, leaf, &victim);
-    bool ok = relink_at(canon_fd, canon_leaf, dirfd, leaf, err);
+    // A temporary this retry cannot remove either -- under a lend that has given the directory
+    // owner write -- is the same damage and there is nothing left to try; the retry has already
+    // failed in that case, so `*err` carries the rename's own errno up to the caller, which
+    // makes it the replay's `first_err` and unwinds the clone.
+    String again;
+    bool ok = relink_at(canon_fd, canon_leaf, dirfd, leaf, err, &again);
     // The rename unlinked the file `leaf` used to name; only its inode is left, held open by
     // this lend alone, and an unlinked inode has no flags worth restoring.
     if (ok) lend.forget(victim);
@@ -863,11 +902,19 @@ void restore_group(const char *tree_root, const char *verify_root, const Hardlin
                 continue;
             }
             int e = 0;
-            bool ok = relink_at(canon_fd, canon_leaf.c_str(), pfd, leaf.c_str(), &e);
+            // PR #1 review (35th round, P2): `leftover` is the temporary the attempt linked and
+            // then could not unlink -- an append-only directory refuses the rename and the
+            // unlink with the same EPERM. It is passed to the retry, which removes it under the
+            // lend before it links anything of its own; without that, the retry's success left
+            // the first temporary on the canonical inode and the group came out one link too
+            // big.
+            String leftover;
+            bool ok = relink_at(canon_fd, canon_leaf.c_str(), pfd, leaf.c_str(), &e, &leftover);
             // The directory refused us, not the file: it is a read-only directory of the
             // source's own making. Lend it owner write for the two calls and put it back.
             if (!ok && (e == -EACCES || e == -EPERM))
-                ok = relink_under_lend(rl, canon_fd, canon_leaf.c_str(), pfd, leaf.c_str(), &e);
+                ok = relink_under_lend(rl, canon_fd, canon_leaf.c_str(), pfd, leaf.c_str(), &e,
+                                       leftover);
             ::close(pfd);
             if (!ok) {
                 note_err(r, e);
