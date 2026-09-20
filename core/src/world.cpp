@@ -3245,24 +3245,52 @@ String snap_tmp_fail_key(const String &path) {
 // report nor allowed to set work_remains, and wfs_gc_pending() only ever classifies the trash,
 // so nothing came back for it -- the tree sat in the store until somebody ran gc by hand. It has
 // no row (that is the whole reason the sweep owns it), so the counter is keyed on its path.
+//
+// PR #1 review (28th round, P2): and a <store>/snapshots that cannot be READ is not an empty
+// one. `if (!d) return 0;` -- an EACCES on the directory, an EIO -- reported the sweep as having
+// run and found nothing, and readdir(3), which reports its own failure through errno alone, was
+// never asked, so a scan that stopped halfway was an end of directory. Either way a row-less
+// `S<n>.wfs-tmp` was neither removed, nor counted, nor retried. Only ENOENT is absence now; the
+// rest goes to wfs::gc_note_unreadable (internal.h), which keys the shared retry counter on the
+// DIRECTORY and sets work_remains under the cap, so the worker chain comes back for it.
 int rm_tmp_in_store_dir(wfs_store *s, const char *dir, uint64_t *removed, int64_t deadline_us,
-                        int *work_remains, uint64_t *failed) {
+                        int *work_remains, uint64_t *failed, wfs::DirUnreadable *unreadable) {
     if (!under_dir(dir, s->dir.c_str())) return -EINVAL;   // not ours to sweep
     if (::strcmp(dir, joinp(s->dir.c_str(), "snapshots").c_str()) != 0) return -EINVAL;
     DIR *d = ::opendir(dir);
-    if (!d) return 0;
+    if (!d) {
+        if (errno == ENOENT) return 0;   // no such directory: there is nothing in it
+        wfs::gc_note_unreadable(s, unreadable, dir, errno, true, work_remains);
+        return 0;
+    }
+    bool read_through = true;
     size_t sl = ::strlen(WFS_TMP_SUFFIX);
-    while (struct dirent *e = ::readdir(d)) {
+    for (;;) {
+        errno = 0;
+        struct dirent *e = ::readdir(d);
+        if (!e) {
+            if (errno) {
+                wfs::gc_note_unreadable(s, unreadable, dir, errno, true, work_remains);
+                read_through = false;
+            }
+            break;
+        }
         size_t n = ::strlen(e->d_name);
         if (n <= sl || ::strcmp(e->d_name + n - sl, WFS_TMP_SUFFIX) != 0) continue;
-        if (deadline_us && now_us() >= deadline_us) { if (work_remains) *work_remains = 1; break; }
+        // Out of time. The directory was not read to its end, so its retry counter is left
+        // exactly as it was -- this wake proved nothing about what is further down it.
+        if (deadline_us && now_us() >= deadline_us) {
+            if (work_remains) *work_remains = 1;
+            read_through = false;
+            break;
+        }
         if (snap_tmp_named_by_row(s, e->d_name, sl)) continue;
         String p = joinp(dir, e->d_name);
         int partial = 0;
         int rc = wfs::fs_remove_tree(p.c_str(), deadline_us, &partial);
         // Out of time, not stuck: the tree is still there and is still row-less next wake, so
         // nothing is counted as a failure and the successor carries on from here.
-        if (partial) { if (work_remains) *work_remains = 1; break; }
+        if (partial) { if (work_remains) *work_remains = 1; read_through = false; break; }
         // PR #1 review (12th round): "it went" has to be proven, not assumed -- an lstat(2) that
         // fails for EACCES or EIO is not evidence that the tree is gone, and this row-less tree
         // has nothing else in the store that remembers it.
@@ -3277,6 +3305,9 @@ int rm_tmp_in_store_dir(wfs_store *s, const char *dir, uint64_t *removed, int64_
         if (rc == 0) (*removed)++;
     }
     ::closedir(d);
+    // Read right through: whatever a previous wake could not read here it can read now, so the
+    // directory's retry counter goes back to zero (the same thing a tree that finally went does).
+    wfs::gc_note_readable(s, dir, read_through);
     return 0;
 }
 
@@ -3455,6 +3486,12 @@ struct TrashView {
     uint64_t waiting = 0;    // inside the retention window
     uint64_t worlds = 0, snapshots = 0;
     uint64_t tree_entries = 0;
+    // PR #1 review (28th round, P2): and what this scan could not look at. <store>/trash is
+    // read by every one of trash_scan's three callers -- the collector, `gc --status` and
+    // wfs_gc_pending() -- and an opendir/readdir that failed there used to leave all three of
+    // them saying "no row-less orphans": nothing was collected, nothing was counted, and the
+    // spawn decision that is the head of the worker chain said there was nothing to do.
+    wfs::DirUnreadable unreadable;
 };
 
 // PR #1 review (5th round): a directory in the trash is row-less only when NO row names it, in
@@ -3502,7 +3539,11 @@ bool trash_path_claimed_locked(wfs_store *s, const char *p) {
     return false;
 }
 
-int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v) {
+// `collector` is the one caller that may write: it bumps the shared retry counter for a trash
+// directory it could not read (and clears it for one it read right through) and sets
+// *work_remains under the cap. `gc --status` and wfs_gc_pending() pass false and only count.
+int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v, bool collector = false,
+               int *work_remains = nullptr) {
     Vec<String> claimed;   // trash paths a row points at, whatever state that row is in
     {
         Guard g(s->mu);
@@ -3569,10 +3610,34 @@ int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v) {
     // Directories in <store>/trash that no row claims: a store restored from a backup, or a
     // *.deleting tree whose row was already marked DEAD. They go immediately -- there is nothing
     // left that could restore them.
+    //
+    // PR #1 review (28th round, P2): and a trash that cannot be READ is not an empty trash. The
+    // `if (DIR *d = opendir(...))` below swallowed every failure -- an EACCES on <store>/trash,
+    // an EIO -- and readdir(3), which reports its own failure through errno alone (13th round),
+    // was never asked, so a scan that stopped halfway looked like the end of the directory. The
+    // orphan in there was then not collected, not counted by `gc --status`, and not seen by
+    // wfs_gc_pending(), which is what decides whether a collector runs at all. Only ENOENT is
+    // absence; everything else is recorded and, on the collector's pass, retried under the cap.
     String trashdir = joinp(s->dir.c_str(), "trash");
     Vec<String> maybe_orphans;
-    if (DIR *d = ::opendir(trashdir.c_str())) {
-        while (struct dirent *e = ::readdir(d)) {
+    DIR *d = ::opendir(trashdir.c_str());
+    if (!d) {
+        if (errno != ENOENT)
+            wfs::gc_note_unreadable(s, &v.unreadable, trashdir.c_str(), errno, collector,
+                                    work_remains);
+    } else {
+        bool read_through = true;
+        for (;;) {
+            errno = 0;
+            struct dirent *e = ::readdir(d);
+            if (!e) {
+                if (errno) {
+                    wfs::gc_note_unreadable(s, &v.unreadable, trashdir.c_str(), errno, collector,
+                                            work_remains);
+                    read_through = false;
+                }
+                break;
+            }
             if (e->d_name[0] == '.') continue;
             String p = joinp(trashdir.c_str(), e->d_name);
             bool wanted = false;
@@ -3582,6 +3647,7 @@ int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v) {
             maybe_orphans.emplace_back(p);
         }
         ::closedir(d);
+        wfs::gc_note_readable(s, trashdir.c_str(), collector && read_through);
     }
     // PR #1 review (9th round), P18: `claimed` is a snapshot, and the readdir above is not.
     // A `discard` that commits its TRASHING row and renames its tree into the trash between the
@@ -3825,6 +3891,22 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
     int64_t retention = retention_secs < 0 ? kDefaultRetention : retention_secs;
     TrashView v;
     if (int rc = trash_scan(s, now_sec() - retention, v)) return rc;
+    // PR #1 review (27th/28th rounds, P2): every directory this report's counts are made from,
+    // and whether it could be read at all. One count for all of them -- <store>/trash, the
+    // <store>/snapshots sweep, <store>/pool and its S<n>s -- because what the reader has to know
+    // is the same in each case: a number below is missing what is in there, and here is which
+    // directory and why. The first one's path and errno, since only its owner can do anything
+    // about it. Nothing here writes: a counting pass that bumped the retry counter would be a
+    // `gc --status` that decides how often the collector comes back.
+    auto note = [&](const wfs::DirUnreadable &u) {
+        if (!u.count) return;
+        out->dirs_unreadable += u.count;
+        if (!out->dirs_unreadable_path[0]) {
+            out->dirs_unreadable_errno = u.err;
+            copy_str(out->dirs_unreadable_path, sizeof out->dirs_unreadable_path, u.path.c_str());
+        }
+    };
+    note(v.unreadable);
     out->deleting = v.deleting.size();
     out->due = v.due.size();
     out->entries = v.deleting.size() + v.due.size() + v.waiting;
@@ -3909,17 +3991,36 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
     // They were counted nowhere, so `gc --status` said the store was clean while the tree sat
     // in it. Disjoint from the loop above by construction: snap_tmp_named_by_row() is what
     // decides, and any row in any state but DEAD keeps its tree out of here.
+    //
+    // PR #1 review (28th round, P2): and, as for the sweep itself, a <store>/snapshots that
+    // cannot be read is not an empty one -- this pass answered an opendir failure with "nothing
+    // to count" and its readdir was never asked about its own errno, so the report called the
+    // store clean because it could not look at it. It records the failure and, being a counting
+    // pass, writes nothing.
     {
         String snapdir = joinp(s->dir.c_str(), "snapshots");
-        if (DIR *d = ::opendir(snapdir.c_str())) {
+        wfs::DirUnreadable su;
+        DIR *d = ::opendir(snapdir.c_str());
+        if (!d) {
+            if (errno != ENOENT)
+                wfs::gc_note_unreadable(s, &su, snapdir.c_str(), errno, false, nullptr);
+        } else {
             size_t sl = ::strlen(WFS_TMP_SUFFIX);
-            while (struct dirent *e = ::readdir(d)) {
+            for (;;) {
+                errno = 0;
+                struct dirent *e = ::readdir(d);
+                if (!e) {
+                    if (errno)
+                        wfs::gc_note_unreadable(s, &su, snapdir.c_str(), errno, false, nullptr);
+                    break;
+                }
                 size_t n = ::strlen(e->d_name);
                 if (n <= sl || ::strcmp(e->d_name + n - sl, WFS_TMP_SUFFIX) != 0) continue;
                 if (!snap_tmp_named_by_row(s, e->d_name, sl)) out->creating_stranded++;
             }
             ::closedir(d);
         }
+        note(su);
     }
     // T1.5, PR #1 review (6th round): and the stale pool entries. Like the abandoned fork trees
     // above they are not in the trash -- they are clones under <store>/pool -- but they are
@@ -3928,12 +4029,9 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
     // or an S<n> that answers EACCES/EIO is not an empty pool, and this line is what stops the
     // report from saying it is.
     {
-        wfs::PoolUnreadable pu;
+        wfs::DirUnreadable pu;
         wfs::pool_stranded(s, &out->pool_stranded, &pu);
-        out->pool_unreadable = pu.count;
-        out->pool_unreadable_errno = pu.err;
-        if (pu.count)
-            copy_str(out->pool_unreadable_path, sizeof out->pool_unreadable_path, pu.path.c_str());
+        note(pu);
     }
     gc_worker_probe(s, &out->worker_pid, &out->worker_started_at, &out->worker_done,
                     &out->worker_remaining);
@@ -3999,7 +4097,21 @@ extern "C" int wfs_gc_pending(wfs_store *s, int64_t retention_secs, int *worker_
     // somebody ran `gc --now` by hand. Same cost as before: one readdir and the two row tables.
     TrashView v;
     if (trash_scan(s, cutoff, v) != 0) return 0;
-    return (v.deleting.size() || v.due.size()) ? 1 : 0;
+    if (v.deleting.size() || v.due.size()) return 1;
+    // PR #1 review (28th round, P2): and a directory the collector could not READ is work too --
+    // it is the one kind of work whose size nobody knows, which is exactly why the chain has to
+    // come back for it. The trash's own failure is in `v` (this scan just found it, and on a
+    // store where no collector has run yet that is the only record there is); the counter covers
+    // the directories this cheap pass does not walk -- <store>/snapshots, <store>/pool and its
+    // S<n>s -- because every gc wake is a new process and the counter is where a wake that could
+    // not read one of them left that fact. Both stop at kGcFailCap: past it the thing is still
+    // reported by every run and by `gc --status`, it just no longer wakes a worker every two
+    // seconds. Nothing here writes; the spawn decision is not allowed to spend the retries.
+    if (v.unreadable.count &&
+        wfs::gc_fail_get(s, wfs::gc_dir_fail_key(v.unreadable.path.c_str()).c_str()) <
+            wfs::kGcFailCap)
+        return 1;
+    return wfs::gc_dirs_unreadable_pending(s) ? 1 : 0;
 }
 
 extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *out) {
@@ -4175,8 +4287,15 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
     }
     // <store>/snapshots only: a name under the store is one we made. The parent directories of
     // the worlds are the user's and are never swept (see rm_tmp_in_store_dir).
-    rm_tmp_in_store_dir(s, snaps.c_str(), &rep.tmp_removed, deadline_us, &rep.work_remains,
-                        &rep.tmp_failed);
+    {
+        // 28th round: and the sweep says whether it could read <store>/snapshots at all. What it
+        // could not look at is not a clean directory, so it is reported and retried rather than
+        // passed over -- the same rule the pool got in the 27th.
+        wfs::DirUnreadable tu;
+        rm_tmp_in_store_dir(s, snaps.c_str(), &rep.tmp_removed, deadline_us, &rep.work_remains,
+                            &rep.tmp_failed, &tu);
+        rep.dirs_unreadable += tu.count;
+    }
 
     // ---- T2.2: reconciliation ----------------------------------------------------------------
     //
@@ -4311,19 +4430,40 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
     {
         // 27th round: a pool the collector could not read is reported, not passed over. The
         // sweep sets work_remains under the shared cap, so the worker chain comes back for it.
-        wfs::PoolUnreadable pu;
+        wfs::DirUnreadable pu;
         wfs::pool_collect(s, &rep.pool_removed, deadline_us, &rep.work_remains, &rep.pool_failed,
                           &pu);
-        rep.pool_unreadable = pu.count;
+        rep.dirs_unreadable += pu.count;
     }
 
     // <store>/tmp holds the seatbelt profiles `world exec` generates. They are removed when the
     // command ends; one that survives an hour belongs to a process that was killed.
+    //
+    // PR #1 review (28th round, P2): the third directory the collector scans, and it was silent
+    // in the same way -- `if (DIR *d = opendir(...))` and a readdir never asked about its errno,
+    // so a profile nobody could see went on sitting there while the run reported a clean sweep.
+    // Only ENOENT is absence; the rest is recorded and retried under the shared cap.
     {
         String tmpd = joinp(s->dir.c_str(), "tmp");
-        if (DIR *d = ::opendir(tmpd.c_str())) {
+        wfs::DirUnreadable tu;
+        DIR *d = ::opendir(tmpd.c_str());
+        if (!d) {
+            if (errno != ENOENT)
+                wfs::gc_note_unreadable(s, &tu, tmpd.c_str(), errno, true, &rep.work_remains);
+        } else {
+            bool read_through = true;
             int64_t cut = now_sec() - 3600;
-            while (struct dirent *e = ::readdir(d)) {
+            for (;;) {
+                errno = 0;
+                struct dirent *e = ::readdir(d);
+                if (!e) {
+                    if (errno) {
+                        wfs::gc_note_unreadable(s, &tu, tmpd.c_str(), errno, true,
+                                                &rep.work_remains);
+                        read_through = false;
+                    }
+                    break;
+                }
                 if (e->d_name[0] == '.') continue;
                 String f = joinp(tmpd.c_str(), e->d_name);
                 struct stat st;
@@ -4336,19 +4476,27 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                 if (mt <= cut && ::unlink(f.c_str()) == 0) rep.tmp_removed++;
             }
             ::closedir(d);
+            wfs::gc_note_readable(s, tmpd.c_str(), read_through);
         }
+        rep.dirs_unreadable += tu.count;
     }
 
     // ---- the expensive half: the trash -------------------------------------------------------
     if (o.flags & WFS_GC_NO_TRASH) {
+        // The collector's pass all the same, although this one deletes nothing: it is the run
+        // that finds a trash it cannot read, and the finding has to be recorded and retried
+        // (28th round) exactly as the full pass below records it.
         TrashView left;
-        if (trash_scan(s, cutoff, left) == 0 && (left.deleting.size() || left.due.size()))
-            rep.work_remains = 1;
+        if (trash_scan(s, cutoff, left, true, &rep.work_remains) == 0) {
+            if (left.deleting.size() || left.due.size()) rep.work_remains = 1;
+            rep.dirs_unreadable += left.unreadable.count;
+        }
         if (out) *out = rep;
         return 0;
     }
     TrashView v;
-    if (int rc = trash_scan(s, cutoff, v)) return rc;
+    if (int rc = trash_scan(s, cutoff, v, true, &rep.work_remains)) return rc;
+    rep.dirs_unreadable += v.unreadable.count;
     uint64_t total = v.deleting.size() + v.due.size();
     uint64_t done = 0;
     lock.progress(0, total);

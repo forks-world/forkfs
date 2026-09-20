@@ -110,17 +110,15 @@ int pool_ready_for(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, uint6
 // so an EACCES or an EIO there answered "there is nothing in the pool": a row-less tree left by
 // a crashed fork or filler was never found, `gc --status` called the pool clean, and because
 // wfs_gc_pending() only looks at the trash the worker chain stopped as well. Only ENOENT is
-// evidence of absence (the 13th round's rule for the store scan). Anything else is counted
-// here, named, and retried under the shared gc cap like any other failure.
-struct PoolUnreadable {
-    uint64_t count = 0;   // directories under <store>/pool that could not be scanned
-    int err = 0;          // the first one's errno, positive
-    String path;          // and which directory it was
-};
-
+// evidence of absence (the 13th round's rule for the store scan). Anything else is counted in
+// `*unreadable`, named, and retried under the shared gc cap like any other failure.
+//
+// PR #1 review (28th round, P2): that record is wfs::DirUnreadable now (internal.h). The trash
+// and <store>/snapshots were silent in exactly the same way, and the collector's answer to "a
+// directory I could not read" has no business differing by which directory it was.
 int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us = 0,
                  int *work_remains = nullptr, uint64_t *failed = nullptr,
-                 PoolUnreadable *unreadable = nullptr);
+                 DirUnreadable *unreadable = nullptr);
 
 // `gc --status`: how many stale pool entries are still on disk, counted the way pool_collect
 // classifies them and without removing any of them. Rows whose snapshot is gone or is a
@@ -132,7 +130,7 @@ int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us = 0,
 // entries means "the pool is clean" only when that count is 0 too -- the status pass reports
 // the failure instead of reporting a clean pool. Unlike the collector's pass it bumps no retry
 // counter: `gc --status` never writes.
-int pool_stranded(wfs_store *s, uint64_t *out, PoolUnreadable *unreadable = nullptr);
+int pool_stranded(wfs_store *s, uint64_t *out, DirUnreadable *unreadable = nullptr);
 
 // verify S<n>: every pool entry must still be there and must not have been written to since it
 // was cloned (the root's mtime is the whole check -- see worldfs.h).

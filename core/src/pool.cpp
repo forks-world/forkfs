@@ -578,23 +578,6 @@ String pool_fail_key(const String &path) {
     return k;
 }
 
-// PR #1 review (27th round, P2): a directory under <store>/pool the sweep could not read. Not
-// a removal that failed -- a scan that never happened -- so it is recorded apart from `failed`
-// (PoolUnreadable, pool.h) and, on the collector's pass, counted towards the shared retry cap
-// so that the worker chain comes back for it. The status pass writes nothing.
-void pool_note_unreadable(wfs_store *s, PoolUnreadable *u, const String &dir, int err, bool remove,
-                          int *work_remains) {
-    if (u) {
-        u->count++;
-        if (!u->err) {
-            u->err = err;
-            u->path.assign(dir.c_str());
-        }
-    }
-    if (!remove) return;
-    if (gc_fail_bump(s, pool_fail_key(dir).c_str()) < kGcFailCap && work_remains) *work_remains = 1;
-}
-
 // The directories under <store>/pool that no row claims: half-built trees (*.wfs-tmp) and
 // entries whose row was claimed by a fork that then died before the rename. `remove` deletes
 // them and returns how many went; otherwise they are only counted. The deadline is the gc
@@ -602,7 +585,7 @@ void pool_note_unreadable(wfs_store *s, PoolUnreadable *u, const String &dir, in
 // the successor picks it up exactly where this left off.
 uint64_t pool_sweep_orphans(wfs_store *s, const Vec<String> &live, bool remove, int64_t deadline_us,
                             bool *out_of_time, uint64_t *failed = nullptr,
-                            int *work_remains = nullptr, PoolUnreadable *unreadable = nullptr) {
+                            int *work_remains = nullptr, DirUnreadable *unreadable = nullptr) {
     uint64_t n = 0;
     String root = pool_root(s);
     Vec<String> subs, cand;
@@ -613,7 +596,7 @@ uint64_t pool_sweep_orphans(wfs_store *s, const Vec<String> &live, bool remove, 
         // see, and returning 0 from it used to read as "no orphans".
         DIR *d = ::opendir(root.c_str());
         if (!d) {
-            if (errno != ENOENT) pool_note_unreadable(s, unreadable, root, errno, remove, work_remains);
+            if (errno != ENOENT) gc_note_unreadable(s, unreadable, root.c_str(), errno, remove, work_remains);
             return 0;
         }
         bool root_read = true;
@@ -622,7 +605,7 @@ uint64_t pool_sweep_orphans(wfs_store *s, const Vec<String> &live, bool remove, 
             struct dirent *e = ::readdir(d);
             if (!e) {
                 if (errno) {
-                    pool_note_unreadable(s, unreadable, root, errno, remove, work_remains);
+                    gc_note_unreadable(s, unreadable, root.c_str(), errno, remove, work_remains);
                     root_read = false;
                 }
                 break;
@@ -634,7 +617,7 @@ uint64_t pool_sweep_orphans(wfs_store *s, const Vec<String> &live, bool remove, 
                 // ENOENT: an empty S<n> a previous sweep's rmdir took, or one drained away
                 // under us. Anything else is a subtree we cannot account for.
                 if (errno != ENOENT)
-                    pool_note_unreadable(s, unreadable, sub, errno, remove, work_remains);
+                    gc_note_unreadable(s, unreadable, sub.c_str(), errno, remove, work_remains);
                 continue;
             }
             subs.emplace_back(sub);
@@ -644,7 +627,7 @@ uint64_t pool_sweep_orphans(wfs_store *s, const Vec<String> &live, bool remove, 
                 struct dirent *ee = ::readdir(sd);
                 if (!ee) {
                     if (errno) {
-                        pool_note_unreadable(s, unreadable, sub, errno, remove, work_remains);
+                        gc_note_unreadable(s, unreadable, sub.c_str(), errno, remove, work_remains);
                         sub_read = false;
                     }
                     break;
@@ -660,10 +643,10 @@ uint64_t pool_sweep_orphans(wfs_store *s, const Vec<String> &live, bool remove, 
             // Read right through, so whatever a previous run could not read here it can read
             // now: the retry counter goes back to zero, exactly as it does for a tree that
             // finally went (gc_fail_clear below).
-            if (remove && sub_read) gc_fail_clear(s, pool_fail_key(sub).c_str());
+            gc_note_readable(s, sub.c_str(), remove && sub_read);
         }
         ::closedir(d);
-        if (remove && root_read) gc_fail_clear(s, pool_fail_key(root).c_str());
+        gc_note_readable(s, root.c_str(), remove && root_read);
     }
     // PR #1 review (9th round), P18: `live` is pool_scan's snapshot of the rows, and the readdir
     // above is not. A filler that inserts its CREATING row after the scan has its `.wfs-tmp`
@@ -704,7 +687,7 @@ uint64_t pool_sweep_orphans(wfs_store *s, const Vec<String> &live, bool remove, 
 } // namespace
 
 int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us, int *work_remains,
-                 uint64_t *failed, PoolUnreadable *unreadable) {
+                 uint64_t *failed, DirUnreadable *unreadable) {
     if (!s) return -EINVAL;
     uint64_t n = 0;
     Vec<wfs_id> rows;
@@ -777,7 +760,7 @@ int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us, int *work
     return 0;
 }
 
-int pool_stranded(wfs_store *s, uint64_t *out, PoolUnreadable *unreadable) {
+int pool_stranded(wfs_store *s, uint64_t *out, DirUnreadable *unreadable) {
     if (!s || !out) return -EINVAL;
     *out = 0;
     Vec<wfs_id> rows;

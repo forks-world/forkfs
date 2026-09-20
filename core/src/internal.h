@@ -101,6 +101,48 @@ int trashing_recover(wfs_store *s, uint64_t *restored, uint64_t *finished);
 extern const int64_t kGcFailCap;
 int64_t gc_fail_bump(wfs_store *s, const char *key);
 void gc_fail_clear(wfs_store *s, const char *key);
+// The same count, read without spending one of the retries: wfs_gc_pending() asks whether a
+// directory that cannot be read is still worth waking a worker for, and a question is not a
+// failure (PR #1 review, 28th round). 0 when nothing has ever failed under `key`.
+int64_t gc_fail_get(wfs_store *s, const char *key);
+
+// ---- PR #1 review (27th/28th rounds, P2): a directory the collector could not READ -----------
+//
+// Every directory the collector scans -- <store>/trash's row-less orphans, the `*.wfs-tmp` sweep
+// and the counting pass of <store>/snapshots, <store>/pool and its S<n>s, the <store>/tmp age
+// sweep -- used to skip an opendir(2) that failed, in silence, and readdir(3), which reports its
+// own failure through errno alone, was never asked at all. One EACCES or EIO there therefore
+// answered "there is nothing in here": what was in the directory was neither collected nor
+// counted, the run said nothing, `gc --status` reported a clean store, and since wfs_gc_pending()
+// is the same scan the worker chain stopped as well.
+//
+// Only ENOENT is evidence of absence -- the 13th round's rule for the store scan. Everything
+// else is recorded here (the 27th round's PoolUnreadable, made the store's in the 28th because
+// the trash and snapshots need exactly the same thing and one count reads better than three):
+// the collector's pass bumps the shared retry counter keyed on the DIRECTORY's path and sets
+// work_remains under the cap, so the chain comes back for it; a pass that reads a directory
+// right through clears its counter again; and a pass that only counts (`gc --status`,
+// wfs_gc_pending) writes nothing at all, which is what keeps its "0 waiting" honest.
+struct DirUnreadable {
+    uint64_t count = 0;   // directories the collector could not scan
+    int err = 0;          // the first one's errno, positive
+    String path;          // and which directory it was
+};
+
+// The counter's key for a directory (`gcfail:dir:<path>`). Its own prefix: a directory that
+// cannot be read is not a tree that would not go, and wfs_gc_pending() asks for exactly these.
+String gc_dir_fail_key(const char *dir);
+// Record one. `collector` is false on the counting passes, which then only fill `*u`.
+void gc_note_unreadable(wfs_store *s, DirUnreadable *u, const char *dir, int err, bool collector,
+                        int *work_remains);
+// And the other half: this pass read `dir` right through, so whatever it could not read before
+// is behind it. Only the collector's pass clears; the counting passes write nothing.
+void gc_note_readable(wfs_store *s, const char *dir, bool collector);
+// Is some directory still unreadable and still under the retry cap? The counter is the record --
+// every gc wake is a new process -- so this is one indexed range over meta and no readdir at
+// all, which is what lets wfs_gc_pending() answer for <store>/snapshots and <store>/pool
+// without walking them on the fork path.
+bool gc_dirs_unreadable_pending(wfs_store *s);
 
 // PR #1 review (12th round): "is there anything at this path?", with the errno kept.
 // A bool over lstat(2) -- the `exists()` every file in this core had one of -- answers "no" for

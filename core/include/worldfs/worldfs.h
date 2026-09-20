@@ -689,14 +689,17 @@ typedef struct wfs_gc_report {
      * work_remains -- it leaked until somebody ran gc by hand. The row is kept while its tree
      * is, counted here and by `gc --status`, and retried under the same cap. */
     uint64_t pool_failed;
-    /* PR #1 review (27th round): directories under <store>/pool this run could not READ, which
-     * is not the same thing as a tree it could not remove. An opendir/readdir that fails with
-     * anything but ENOENT -- an EACCES on the pool root, an EIO on an S<n> -- used to be
-     * skipped in silence and the scan reported as complete, so a row-less tree left by a
-     * crashed fork or filler was missed, nothing said so, and since wfs_gc_pending() only looks
-     * at the trash the worker chain stopped too. Counted here, retried under the same cap as
-     * everything else (the first few failures set work_remains), and named by `gc --status`. */
-    uint64_t pool_unreadable;
+    /* PR #1 review (27th/28th rounds): directories this run could not READ, which is not the
+     * same thing as a tree it could not remove. An opendir/readdir that fails with anything but
+     * ENOENT -- an EACCES on <store>/trash, on <store>/snapshots, on the pool root, an EIO on an
+     * S<n> -- used to be skipped in silence and the scan reported as complete, so a row-less
+     * tree left by a crashed discard, fork or filler was missed, nothing said so, and since
+     * wfs_gc_pending() is the same scan the worker chain stopped too. One count for all of the
+     * collector's directories (the 27th round had the pool's alone), because what it tells the
+     * reader is the same in every case: something below is not counted, and `gc --status` names
+     * the directory and the errno. Retried under the same cap as everything else -- the first
+     * few failures set work_remains, so the chain comes back for it. */
+    uint64_t dirs_unreadable;
     /* PR #1 review (20th round): trash entries the collector would not even start on, because a
      * directory it did not put there is sitting at the `<entry>.deleting` name it renames to.
      * It used to remove that directory recursively first ("an interrupted attempt of ours"),
@@ -785,15 +788,16 @@ typedef struct wfs_trash_stat {
      * also waiting for the collector: removing one is a whole tree, so a wake that runs out of
      * time leaves the rest of them for its successor. */
     uint64_t pool_stranded;
-    /* PR #1 review (27th round): directories under <store>/pool the count above could not read.
-     * It is what keeps `pool_stranded == 0` honest: the pool is clean only when nothing was
-     * unreadable, and a status that cannot see into the pool says so instead of reporting an
-     * empty one. pool_unreadable_path is the first such directory and pool_unreadable_errno the
-     * errno that stopped it (both empty/0 when the count is 0), because only whoever owns that
-     * directory can do anything about it. */
-    uint64_t pool_unreadable;
-    char pool_unreadable_path[WFS_PATH_MAX];
-    int pool_unreadable_errno;
+    /* PR #1 review (27th/28th rounds): the directories the counts above are made from that
+     * could not be read -- <store>/trash, <store>/snapshots, <store>/pool and its S<n>s, the
+     * <store>/tmp sweep. It is what keeps every "0 waiting" above honest: the store is clean
+     * only when this is 0 too, and a status that could not look into a directory says so
+     * instead of reporting an empty one. dirs_unreadable_path is the first such directory and
+     * dirs_unreadable_errno the errno that stopped it (both empty/0 when the count is 0),
+     * because only whoever owns that directory can do anything about it. */
+    uint64_t dirs_unreadable;
+    char dirs_unreadable_path[WFS_PATH_MAX];
+    int dirs_unreadable_errno;
     /* PR #1 review (20th round): due trash entries the collector cannot start on, because a
      * directory nothing in this store named is sitting at the `<entry>.deleting` name it has to
      * rename to. blocked_path is the first such directory (empty when trash_blocked is 0), so

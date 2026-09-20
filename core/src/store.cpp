@@ -386,6 +386,15 @@ int64_t gc_fail_bump(wfs_store *s, const char *key) {
     return n;
 }
 
+int64_t gc_fail_get(wfs_store *s, const char *key) {
+    if (!s || !key || !*key) return kGcFailCap;   // cannot tell: treat it as spent, never spin
+    Guard g(s->mu);
+    Stmt q(s->db, "SELECT value FROM meta WHERE key=?");
+    if (!q.ok()) return kGcFailCap;
+    q.text(1, key);
+    return q.row() ? ::strtoll(q.col_text(0), nullptr, 10) : 0;
+}
+
 // The read comes first so that the ordinary case -- something that never failed -- costs one
 // indexed lookup instead of a transaction per removed tree.
 void gc_fail_clear(wfs_store *s, const char *key) {
@@ -401,6 +410,54 @@ void gc_fail_clear(wfs_store *s, const char *key) {
     Stmt d(s->db, "DELETE FROM meta WHERE key=?");
     if (d.ok()) { d.text(1, key); d.step(); }
     t.commit();
+}
+
+// ---- PR #1 review (28th round, P2): the directories the collector could not read -------------
+//
+// The 27th round put this on <store>/pool alone; it lives here now because the trash and the
+// snapshots directory need the identical thing, and because the counter it keys on is the
+// store's. See internal.h for what the silence used to cost.
+String gc_dir_fail_key(const char *dir) {
+    String k("gcfail:dir:");
+    k.append(dir);
+    return k;
+}
+
+void gc_note_unreadable(wfs_store *s, DirUnreadable *u, const char *dir, int err, bool collector,
+                        int *work_remains) {
+    if (!dir || !*dir) return;
+    if (u) {
+        u->count++;
+        if (!u->err) {
+            u->err = err;
+            u->path.assign(dir);
+        }
+    }
+    // `gc --status` and wfs_gc_pending() are counting passes: they report the failure and do not
+    // write a byte to the database for it.
+    if (!collector) return;
+    if (gc_fail_bump(s, gc_dir_fail_key(dir).c_str()) < kGcFailCap && work_remains)
+        *work_remains = 1;
+}
+
+void gc_note_readable(wfs_store *s, const char *dir, bool collector) {
+    if (!collector || !dir || !*dir) return;
+    gc_fail_clear(s, gc_dir_fail_key(dir).c_str());
+}
+
+bool gc_dirs_unreadable_pending(wfs_store *s) {
+    if (!s) return false;
+    Guard g(s->mu);
+    // GLOB, not LIKE: it is the one of the two SQLite turns into a range over the primary key,
+    // and this runs on the fork path. `value` is the failure count the cap is compared against,
+    // so a directory that has failed kGcFailCap times stops waking workers -- what it is still
+    // doing is being reported by every run and by `gc --status`, which is the whole contract of
+    // the shared cap (internal.h).
+    Stmt q(s->db, "SELECT 1 FROM meta WHERE key GLOB 'gcfail:dir:*'"
+                  " AND CAST(value AS INTEGER) < ? LIMIT 1");
+    if (!q.ok()) return false;   // cannot tell, and "cannot tell" never spawns a worker chain
+    q.i64(1, kGcFailCap);
+    return q.row();
 }
 
 } // namespace wfs

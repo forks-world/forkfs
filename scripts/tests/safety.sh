@@ -552,14 +552,17 @@ fi
 mkdir -p "$WORLD_STORE/pool/S1/0000000000000001"
 chmod 000 "$WORLD_STORE/pool"
 "$WORLD" fs gc --retention 7 > "$SCRATCH/gc-blindpool.log" 2>&1
-grep -q "under <store>/pool could not be read" "$SCRATCH/gc-blindpool.log" \
+grep -q "under the store could not be read" "$SCRATCH/gc-blindpool.log" \
     && ok T1.5 "gc reports a pool directory it could not read" \
     || { bad T1.5 "gc reports a pool directory it could not read"; sed 's/^/        /' "$SCRATCH/gc-blindpool.log"; }
+grep -q "$WORLD_STORE/pool" "$SCRATCH/gc-blindpool.log" \
+    && ok T1.5 "and names it" \
+    || { bad T1.5 "and names it"; sed 's/^/        /' "$SCRATCH/gc-blindpool.log"; }
 grep -q "collector will try again" "$SCRATCH/gc-blindpool.log" \
     && ok T1.5 "and says it will come back for it (work remains)" \
     || bad T1.5 "and says it will come back for it (work remains)"
 "$WORLD" fs gc --status > "$SCRATCH/gc-blindpool-status.log" 2>&1
-grep -q "under <store>/pool could not be read" "$SCRATCH/gc-blindpool-status.log" \
+grep -q "under the store could not be read" "$SCRATCH/gc-blindpool-status.log" \
     && ok T1.5 "gc --status does not call a pool it cannot read a clean one" \
     || { bad T1.5 "gc --status does not call a pool it cannot read a clean one"; sed 's/^/        /' "$SCRATCH/gc-blindpool-status.log"; }
 chmod 700 "$WORLD_STORE/pool"
@@ -1771,6 +1774,97 @@ if [ -n "$F25ENTRY" ]; then
 else
     bad PR25 "the discarded world has a trash entry"
 fi
+
+
+# ---- PR #1 review (28th round, P2): the other two directories the collector scans -------------
+# The 27th round's rule -- only ENOENT is evidence of absence -- now for <store>/trash's
+# row-less-orphan readdir and for the `*.wfs-tmp` sweep of <store>/snapshots. Both used to answer
+# an opendir(2) that failed with EACCES/EIO with "there is nothing in there": the run said
+# nothing, `gc --status` called the store clean, and because wfs_gc_pending() reads the same scan
+# a fork or a discard started no collector either -- the worker chain stopped on a directory
+# nobody had looked into.
+U28="$SCRATCH/unread28"
+mkdir -p "$U28/src"
+echo x > "$U28/src/f.txt"
+
+# (a) <store>/trash: a row-less orphan under a trash directory that cannot be read.
+T28STORE="$U28/trash-store"
+t28() { "$WORLD" --store "$T28STORE" "$@"; }
+t28 fs init "$U28/src" --name unread28t > /dev/null 2>&1
+mkdir -p "$T28STORE/trash/W9999-1/sub"
+echo junk > "$T28STORE/trash/W9999-1/sub/j.txt"
+chmod 000 "$T28STORE/trash"
+# --now, so this run collects in the foreground and hands nothing to a worker: the retry counter
+# this case is about is bumped exactly once, by this run.
+out=$(t28 fs gc --now --retention 0 2>&1)
+echo "$out" | grep -q "could not be read" \
+    && ok PR28 "gc reports a trash directory it could not read" \
+    || { bad PR28 "gc reports a trash directory it could not read"; echo "$out" | sed 's/^/        /'; }
+echo "$out" | grep -q "$T28STORE/trash" \
+    && ok PR28 "and names the directory" \
+    || { bad PR28 "and names the directory"; echo "$out" | sed 's/^/        /'; }
+echo "$out" | grep -q "collector will try again" \
+    && ok PR28 "and says it will come back for it (work remains)" \
+    || { bad PR28 "and says it will come back for it (work remains)"; echo "$out" | sed 's/^/        /'; }
+t28 fs gc --status --retention 0 > "$U28/t-status.log" 2>&1
+grep -q "could not be read" "$U28/t-status.log" \
+    && ok PR28 "gc --status does not call a trash it cannot read a clean one" \
+    || { bad PR28 "gc --status does not call a trash it cannot read a clean one"; sed 's/^/        /' "$U28/t-status.log"; }
+chmod 700 "$T28STORE/trash"
+t28 fs gc --now --retention 0 > "$U28/t-gc2.log" 2>&1
+[ ! -e "$T28STORE/trash/W9999-1" ] \
+    && ok PR28 "and the orphan goes as soon as the trash can be read again" \
+    || { bad PR28 "and the orphan goes as soon as the trash can be read again"; sed 's/^/        /' "$U28/t-gc2.log"; }
+
+# And the chain does not stop on it: a fork's spawn decision is wfs_gc_pending(), which used to
+# read an unreadable trash as an empty one. A store of its own, so that the worker this starts is
+# the only thing that has ever written <store>/logs/gc.log.
+F28STORE="$U28/fork-store"
+f28() { "$WORLD" --store "$F28STORE" "$@"; }
+f28 fs init "$U28/src" --name unread28f > /dev/null 2>&1
+mkdir -p "$F28STORE/trash/W9999-1/sub"
+echo junk > "$F28STORE/trash/W9999-1/sub/j.txt"
+chmod 000 "$F28STORE/trash"
+rm -f "$F28STORE/logs/gc.log"
+f28 fs fork --from S1 --to "$U28/w-fork" --no-pool > /dev/null 2>&1
+for _ in $(seq 60); do [ -s "$F28STORE/logs/gc.log" ] && break; sleep 0.25; done
+[ -s "$F28STORE/logs/gc.log" ] \
+    && ok PR28 "a fork still starts a collector while the trash cannot be read" \
+    || bad PR28 "a fork still starts a collector while the trash cannot be read"
+chmod 700 "$F28STORE/trash"
+
+# (b) <store>/snapshots: a row-less `S<n>.wfs-tmp` under a snapshots directory that cannot be read.
+S28STORE="$U28/snap-store"
+s28() { "$WORLD" --store "$S28STORE" "$@"; }
+s28 fs init "$U28/src" --name unread28s > /dev/null 2>&1
+s28 fs fork --from S1 --to "$U28/w-snap" --no-pool > /dev/null 2>&1
+mkdir -p "$S28STORE/snapshots/S999999.wfs-tmp/sub"
+echo junk > "$S28STORE/snapshots/S999999.wfs-tmp/sub/j.txt"
+chmod 000 "$S28STORE/snapshots"
+out=$(s28 fs gc --now --retention 0 2>&1)
+echo "$out" | grep -q "could not be read" \
+    && ok PR28 "gc reports a snapshots directory it could not read" \
+    || { bad PR28 "gc reports a snapshots directory it could not read"; echo "$out" | sed 's/^/        /'; }
+echo "$out" | grep -q "$S28STORE/snapshots" \
+    && ok PR28 "and names the directory" \
+    || { bad PR28 "and names the directory"; echo "$out" | sed 's/^/        /'; }
+s28 fs gc --status --retention 0 > "$U28/s-status.log" 2>&1
+grep -q "could not be read" "$U28/s-status.log" \
+    && ok PR28 "gc --status does not call a snapshots directory it cannot read a clean one" \
+    || { bad PR28 "gc --status does not call a snapshots directory it cannot read a clean one"; sed 's/^/        /' "$U28/s-status.log"; }
+# Nothing in this trash is due (the discard below uses the default retention), so the only
+# reason left for a collector to start is the directory nobody could read.
+rm -f "$S28STORE/logs/gc.log"
+s28 fs discard W1 > /dev/null 2>&1
+for _ in $(seq 60); do [ -s "$S28STORE/logs/gc.log" ] && break; sleep 0.25; done
+[ -s "$S28STORE/logs/gc.log" ] \
+    && ok PR28 "a discard still starts a collector while <store>/snapshots cannot be read" \
+    || bad PR28 "a discard still starts a collector while <store>/snapshots cannot be read"
+chmod 700 "$S28STORE/snapshots"
+s28 fs gc --now --retention 0 > "$U28/s-gc2.log" 2>&1
+[ ! -e "$S28STORE/snapshots/S999999.wfs-tmp" ] \
+    && ok PR28 "and the row-less clone goes as soon as it can be read again" \
+    || { bad PR28 "and the row-less clone goes as soon as it can be read again"; sed 's/^/        /' "$U28/s-gc2.log"; }
 
 
 echo
