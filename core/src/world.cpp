@@ -3924,7 +3924,17 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
     // T1.5, PR #1 review (6th round): and the stale pool entries. Like the abandoned fork trees
     // above they are not in the trash -- they are clones under <store>/pool -- but they are
     // space waiting for the same collector, and a wake that ran out of time leaves them there.
-    wfs::pool_stranded(s, &out->pool_stranded);
+    // PR #1 review (27th round, P2): and what the count above could not look at. A pool root
+    // or an S<n> that answers EACCES/EIO is not an empty pool, and this line is what stops the
+    // report from saying it is.
+    {
+        wfs::PoolUnreadable pu;
+        wfs::pool_stranded(s, &out->pool_stranded, &pu);
+        out->pool_unreadable = pu.count;
+        out->pool_unreadable_errno = pu.err;
+        if (pu.count)
+            copy_str(out->pool_unreadable_path, sizeof out->pool_unreadable_path, pu.path.c_str());
+    }
     gc_worker_probe(s, &out->worker_pid, &out->worker_started_at, &out->worker_done,
                     &out->worker_remaining);
     return 0;
@@ -4298,7 +4308,14 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
     // was ever consulted, so a two-second worker wake could spend minutes here. What the
     // deadline cuts short keeps the shape its successor rediscovers (the row, or the row-less
     // directory) and sets work_remains, so the worker chain comes back for it.
-    wfs::pool_collect(s, &rep.pool_removed, deadline_us, &rep.work_remains, &rep.pool_failed);
+    {
+        // 27th round: a pool the collector could not read is reported, not passed over. The
+        // sweep sets work_remains under the shared cap, so the worker chain comes back for it.
+        wfs::PoolUnreadable pu;
+        wfs::pool_collect(s, &rep.pool_removed, deadline_us, &rep.work_remains, &rep.pool_failed,
+                          &pu);
+        rep.pool_unreadable = pu.count;
+    }
 
     // <store>/tmp holds the seatbelt profiles `world exec` generates. They are removed when the
     // command ends; one that survives an hour belongs to a process that was killed.

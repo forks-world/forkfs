@@ -578,6 +578,23 @@ String pool_fail_key(const String &path) {
     return k;
 }
 
+// PR #1 review (27th round, P2): a directory under <store>/pool the sweep could not read. Not
+// a removal that failed -- a scan that never happened -- so it is recorded apart from `failed`
+// (PoolUnreadable, pool.h) and, on the collector's pass, counted towards the shared retry cap
+// so that the worker chain comes back for it. The status pass writes nothing.
+void pool_note_unreadable(wfs_store *s, PoolUnreadable *u, const String &dir, int err, bool remove,
+                          int *work_remains) {
+    if (u) {
+        u->count++;
+        if (!u->err) {
+            u->err = err;
+            u->path.assign(dir.c_str());
+        }
+    }
+    if (!remove) return;
+    if (gc_fail_bump(s, pool_fail_key(dir).c_str()) < kGcFailCap && work_remains) *work_remains = 1;
+}
+
 // The directories under <store>/pool that no row claims: half-built trees (*.wfs-tmp) and
 // entries whose row was claimed by a fork that then died before the rename. `remove` deletes
 // them and returns how many went; otherwise they are only counted. The deadline is the gc
@@ -585,20 +602,53 @@ String pool_fail_key(const String &path) {
 // the successor picks it up exactly where this left off.
 uint64_t pool_sweep_orphans(wfs_store *s, const Vec<String> &live, bool remove, int64_t deadline_us,
                             bool *out_of_time, uint64_t *failed = nullptr,
-                            int *work_remains = nullptr) {
+                            int *work_remains = nullptr, PoolUnreadable *unreadable = nullptr) {
     uint64_t n = 0;
     String root = pool_root(s);
     Vec<String> subs, cand;
     {
+        // 27th round: only ENOENT says there is nothing in there. Every other errno on the root
+        // or on an S<n> -- and every readdir that stops on an error of its own, which readdir(3)
+        // reports through errno alone (13th round) -- is a piece of the pool this run did not
+        // see, and returning 0 from it used to read as "no orphans".
         DIR *d = ::opendir(root.c_str());
-        if (!d) return 0;
-        while (struct dirent *e = ::readdir(d)) {
+        if (!d) {
+            if (errno != ENOENT) pool_note_unreadable(s, unreadable, root, errno, remove, work_remains);
+            return 0;
+        }
+        bool root_read = true;
+        for (;;) {
+            errno = 0;
+            struct dirent *e = ::readdir(d);
+            if (!e) {
+                if (errno) {
+                    pool_note_unreadable(s, unreadable, root, errno, remove, work_remains);
+                    root_read = false;
+                }
+                break;
+            }
             if (e->d_name[0] == '.') continue;
             String sub = joinp(root.c_str(), e->d_name);
             DIR *sd = ::opendir(sub.c_str());
-            if (!sd) continue;
+            if (!sd) {
+                // ENOENT: an empty S<n> a previous sweep's rmdir took, or one drained away
+                // under us. Anything else is a subtree we cannot account for.
+                if (errno != ENOENT)
+                    pool_note_unreadable(s, unreadable, sub, errno, remove, work_remains);
+                continue;
+            }
             subs.emplace_back(sub);
-            while (struct dirent *ee = ::readdir(sd)) {
+            bool sub_read = true;
+            for (;;) {
+                errno = 0;
+                struct dirent *ee = ::readdir(sd);
+                if (!ee) {
+                    if (errno) {
+                        pool_note_unreadable(s, unreadable, sub, errno, remove, work_remains);
+                        sub_read = false;
+                    }
+                    break;
+                }
                 if (ee->d_name[0] == '.') continue;
                 String p = joinp(sub.c_str(), ee->d_name);
                 bool wanted = false;
@@ -607,8 +657,13 @@ uint64_t pool_sweep_orphans(wfs_store *s, const Vec<String> &live, bool remove, 
                 if (!wanted) cand.emplace_back(p);
             }
             ::closedir(sd);
+            // Read right through, so whatever a previous run could not read here it can read
+            // now: the retry counter goes back to zero, exactly as it does for a tree that
+            // finally went (gc_fail_clear below).
+            if (remove && sub_read) gc_fail_clear(s, pool_fail_key(sub).c_str());
         }
         ::closedir(d);
+        if (remove && root_read) gc_fail_clear(s, pool_fail_key(root).c_str());
     }
     // PR #1 review (9th round), P18: `live` is pool_scan's snapshot of the rows, and the readdir
     // above is not. A filler that inserts its CREATING row after the scan has its `.wfs-tmp`
@@ -649,7 +704,7 @@ uint64_t pool_sweep_orphans(wfs_store *s, const Vec<String> &live, bool remove, 
 } // namespace
 
 int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us, int *work_remains,
-                 uint64_t *failed) {
+                 uint64_t *failed, PoolUnreadable *unreadable) {
     if (!s) return -EINVAL;
     uint64_t n = 0;
     Vec<wfs_id> rows;
@@ -715,13 +770,14 @@ int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us, int *work
         ++n;
     }
     if (!out_of_time)
-        n += pool_sweep_orphans(s, live, true, deadline_us, &out_of_time, failed, work_remains);
+        n += pool_sweep_orphans(s, live, true, deadline_us, &out_of_time, failed, work_remains,
+                                unreadable);
     if (out_of_time && work_remains) *work_remains = 1;
     if (removed) *removed += n;
     return 0;
 }
 
-int pool_stranded(wfs_store *s, uint64_t *out) {
+int pool_stranded(wfs_store *s, uint64_t *out, PoolUnreadable *unreadable) {
     if (!s || !out) return -EINVAL;
     *out = 0;
     Vec<wfs_id> rows;
@@ -739,7 +795,7 @@ int pool_stranded(wfs_store *s, uint64_t *out) {
         live.emplace_back(trees[i]);
         live.emplace_back(tmp);
     }
-    n += pool_sweep_orphans(s, live, false, 0, nullptr);
+    n += pool_sweep_orphans(s, live, false, 0, nullptr, nullptr, nullptr, unreadable);
     *out = n;
     return 0;
 }

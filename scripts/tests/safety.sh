@@ -544,6 +544,30 @@ if [ ! -e "$WORLD_STORE/pool/S1/dead.wfs-tmp" ] && [ ! -e "$WORLD_STORE/pool/S1/
 else
     bad T1.5 "gc removes half-built and orphaned entries, keeps the ready ones"; sed 's/^/        /' "$SCRATCH/gc-pool.log"
 fi
+# PR #1 review (27th round, P2): a pool the collector cannot READ is not an empty pool. An
+# opendir/readdir that failed with anything but ENOENT used to be skipped in silence and the
+# scan reported as complete, so a row-less tree left by a crashed fork or filler was missed,
+# neither the run nor --status said anything, and since gc's "is there work?" probe only looks
+# at the trash the worker chain stopped there as well.
+mkdir -p "$WORLD_STORE/pool/S1/0000000000000001"
+chmod 000 "$WORLD_STORE/pool"
+"$WORLD" fs gc --retention 7 > "$SCRATCH/gc-blindpool.log" 2>&1
+grep -q "under <store>/pool could not be read" "$SCRATCH/gc-blindpool.log" \
+    && ok T1.5 "gc reports a pool directory it could not read" \
+    || { bad T1.5 "gc reports a pool directory it could not read"; sed 's/^/        /' "$SCRATCH/gc-blindpool.log"; }
+grep -q "collector will try again" "$SCRATCH/gc-blindpool.log" \
+    && ok T1.5 "and says it will come back for it (work remains)" \
+    || bad T1.5 "and says it will come back for it (work remains)"
+"$WORLD" fs gc --status > "$SCRATCH/gc-blindpool-status.log" 2>&1
+grep -q "under <store>/pool could not be read" "$SCRATCH/gc-blindpool-status.log" \
+    && ok T1.5 "gc --status does not call a pool it cannot read a clean one" \
+    || { bad T1.5 "gc --status does not call a pool it cannot read a clean one"; sed 's/^/        /' "$SCRATCH/gc-blindpool-status.log"; }
+chmod 700 "$WORLD_STORE/pool"
+"$WORLD" fs gc --retention 7 > "$SCRATCH/gc-blindpool2.log" 2>&1
+[ ! -e "$WORLD_STORE/pool/S1/0000000000000001" ] \
+    && ok T1.5 "and the orphan goes as soon as the pool can be read again" \
+    || { bad T1.5 "and the orphan goes as soon as the pool can be read again"; sed 's/^/        /' "$SCRATCH/gc-blindpool2.log"; }
+
 "$WORLD" fs pool drain S1 > /dev/null
 "$WORLD" fs pool status | grep -q "^pool: empty" && ok T1.5 "pool drain empties it" \
                                                  || bad T1.5 "pool drain empties it"

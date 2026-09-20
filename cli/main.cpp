@@ -1231,6 +1231,17 @@ static int cmd_gc_status(wfs_store *s, int64_t retention) {
     if (ts.pool_stranded)
         printf("pool:      %llu stale pre-clone entr%s waiting for the collector\n",
                (unsigned long long)ts.pool_stranded, ts.pool_stranded == 1 ? "y" : "ies");
+    // PR #1 review (27th round, P2): and what the count above could not look at. An unreadable
+    // pool root or S<n> used to be passed over in silence, so this report said nothing at all
+    // while a row-less clone sat in there -- "0 stale entries" read as "the pool is clean"
+    // when the truth was "the pool could not be read". The directory and the errno, because
+    // whatever is to be done about it is done by whoever owns that directory.
+    if (ts.pool_unreadable)
+        printf("pool:      %llu director%s under <store>/pool could not be read: %s (%s)\n"
+               "           what is in there is not counted above (`world fs gc` retries it)\n",
+               (unsigned long long)ts.pool_unreadable, ts.pool_unreadable == 1 ? "y" : "ies",
+               ts.pool_unreadable_path[0] ? ts.pool_unreadable_path : "<store>/pool",
+               strerror(ts.pool_unreadable_errno));
     // PR #1 review (20th round, P1): and the due entries the collector will not start on,
     // because a directory it did not put there holds the `<entry>.deleting` name it renames to.
     // Naming it is the whole point: it is as likely to be in the user's own `.wfs-trash` (a
@@ -1337,6 +1348,24 @@ static int cmd_gc(wfs_store *s, int argc, char **argv) {
                 rep.pool_failed == 1 ? "is" : "are", rep.pool_failed == 1 ? "it" : "them",
                 rep.work_remains ? "the collector will try again."
                                  : "it has failed too often to keep retrying by itself.");
+    }
+    if (rep.pool_unreadable) {
+        // PR #1 review (27th round, P2): and a pool the scan could not READ is neither of the
+        // two above. Nothing was removed there and nothing was counted there either, so the
+        // only honest thing this run can say is which directory it could not open and why --
+        // the path and the errno come from a status read, which is the same scan again.
+        wfs_trash_stat us;
+        memset(&us, 0, sizeof us);
+        wfs_gc_status(s, retention, &us);
+        fprintf(stderr,
+                "world: note: %llu director%s under <store>/pool could not be read (%s: %s), so\n"
+                "world:       whatever is in %s was neither collected nor counted. %s\n"
+                "world:       (`world fs gc --status`)\n",
+                (unsigned long long)rep.pool_unreadable, rep.pool_unreadable == 1 ? "y" : "ies",
+                us.pool_unreadable_path[0] ? us.pool_unreadable_path : "<store>/pool",
+                strerror(us.pool_unreadable_errno), rep.pool_unreadable == 1 ? "it" : "them",
+                rep.work_remains ? "The collector will try again."
+                                 : "It has failed too often to keep retrying by itself.");
     }
     if (rep.trash_blocked) {
         // PR #1 review (20th round, P1): not a failed deletion -- a deletion that was never
