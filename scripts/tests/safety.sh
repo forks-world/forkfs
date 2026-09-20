@@ -1666,6 +1666,88 @@ else
     bad PR20 "the discarded world has a trash entry"
 fi
 
+# ---- PR #1 review (25th round, P1): a trash entry is ours only if it IS our tree ---------------
+# The collector asked one question before renaming an entry to `.deleting` and deleting it: does
+# the row still NAME this path? For a world discarded across volumes the entry lives at
+# `<parent>/.wfs-trash/W<id>-<timestamp>` -- the user's own directory, under a name they can
+# work out -- so during the retention period they can move the real tree away and leave something
+# else at exactly that path, and the collector would delete THAT, contents and all. `discard
+# --now` did the same and reported success; `restore` renamed the stranger home, re-stat'ed it
+# and wrote its dev/ino into the row, registering somebody else's directory as the world.
+# The row carries dir_dev/dir_ino from the moment the world was published, and every rename on
+# this path is same-volume (the store's trash, or a `.wfs-trash` beside the world), so the
+# inode is the world's identity all the way through the trash. Nothing is renamed or removed
+# until it matches. (The EXDEV side-trash cannot be exercised without a second volume; the entry
+# below is in <store>/trash, which is the same code path -- the check runs off the row, not off
+# where the entry happens to live.)
+F25STORE="$SCRATCH/foreign25-store"
+f25() { "$WORLD" --store "$F25STORE" "$@"; }
+F25SRC="$SCRATCH/foreign25-src"
+mkdir -p "$F25SRC"
+echo x > "$F25SRC/f.txt"
+F25S=$(f25 fs init "$F25SRC" --name foreign25 2>/dev/null | awk '/^S[0-9]/{print $1}')
+F25W=$(f25 fs fork --from "$F25S" --to "$SCRATCH/foreign25-w" --name f25w 2>/dev/null | awk '/^W[0-9]/{print $1}')
+f25 fs discard "$F25W" > /dev/null 2>&1
+F25ENTRY=$(ls -d "$F25STORE/trash/$F25W"-* 2>/dev/null | head -1)
+if [ -n "$F25ENTRY" ]; then
+    # The substitution: the world's tree moved aside, and a directory of the user's -- with a
+    # file in it -- put at the exact path the row names.
+    mv "$F25ENTRY" "$SCRATCH/foreign25-real"
+    mkdir -p "$F25ENTRY/keep"
+    echo "not the world" > "$F25ENTRY/keep/user.txt"
+    out=$(f25 fs gc --now --retention 0 2>&1)
+    if [ -f "$F25ENTRY/keep/user.txt" ]; then
+        ok PR25 "the collector does not delete a directory that is not the world's tree"
+    else
+        bad PR25 "the collector does not delete a directory that is not the world's tree"
+        echo "$out" | sed 's/^/        /'
+    fi
+    echo "$out" | grep -q "could not be collected" \
+        && ok PR25 "and gc says so instead of reporting a clean run" \
+        || { bad PR25 "and gc says so instead of reporting a clean run"; echo "$out" | sed 's/^/        /'; }
+    f25 fs gc --status --retention 0 | grep -q "^foreign: .*$F25ENTRY" \
+        && ok PR25 "and gc --status names the path it refused to touch" \
+        || { bad PR25 "and gc --status names the path it refused to touch"; f25 fs gc --status --retention 0 | sed 's/^/        /'; }
+    out=$(f25 fs discard "$F25W" --now 2>&1); rc=$?
+    if [ "$rc" != 0 ] && [ -f "$F25ENTRY/keep/user.txt" ]; then
+        ok PR25 "--now refuses rather than delete it"
+    else
+        bad PR25 "--now refuses rather than delete it (exit $rc)"
+        echo "$out" | sed 's/^/        /'
+    fi
+    echo "$out" | grep -q "$F25ENTRY" \
+        && ok PR25 "and the refusal names the path" \
+        || { bad PR25 "and the refusal names the path"; echo "$out" | sed 's/^/        /'; }
+    out=$(f25 fs restore "$F25W" 2>&1); rc=$?
+    if [ "$rc" != 0 ] && [ -f "$F25ENTRY/keep/user.txt" ] && [ ! -e "$SCRATCH/foreign25-w" ]; then
+        ok PR25 "and restore refuses to bring a stranger home as the world"
+    else
+        bad PR25 "and restore refuses to bring a stranger home as the world (exit $rc)"
+        echo "$out" | sed 's/^/        /'
+        ls -A "$SCRATCH/foreign25-w" 2>/dev/null | sed 's/^/        /'
+    fi
+    # Put the world's own tree back where the row says it is: everything works exactly as it
+    # always did. Nothing about the entry was ever broken -- it just was not there.
+    rm -rf "$F25ENTRY"
+    mv "$SCRATCH/foreign25-real" "$F25ENTRY"
+    if f25 fs restore "$F25W" > /dev/null 2>&1 && [ -f "$SCRATCH/foreign25-w/f.txt" ]; then
+        ok PR25 "and with the world's own tree back at that path restore works"
+    else
+        bad PR25 "and with the world's own tree back at that path restore works"
+        f25 fs list | sed 's/^/        /'
+    fi
+    f25 fs discard "$F25W" > /dev/null 2>&1
+    f25 fs gc --now --retention 0 > /dev/null 2>&1
+    if [ -z "$(ls -A "$F25STORE/trash" 2>/dev/null)" ]; then
+        ok PR25 "and the collector takes it as usual"
+    else
+        bad PR25 "and the collector takes it as usual"
+        ls -A "$F25STORE/trash" | sed 's/^/        /'
+    fi
+else
+    bad PR25 "the discarded world has a trash entry"
+fi
+
 
 echo
 "$WORLD" fs status | sed 's/^/      /'

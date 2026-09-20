@@ -847,6 +847,31 @@ static int trash_blocked_refusal(wfs_store *s, wfs_id id, int is_snapshot) {
                        "   (`world fs gc --status` names it too)");
 }
 
+// PR #1 review (25th round, P1): the entry at that path is not this record's tree. A world row
+// has carried the dev/ino of its tree since the world was published and every rename on the way
+// into the trash is same-volume, so the inode is the world's identity for as long as the entry
+// exists -- while the NAME is not: a world discarded from another volume keeps its trash in
+// `<parent>/.wfs-trash`, the user's own directory, under a name they can work out. So the tree
+// can be moved away and a directory of theirs left in its place, and until this round the
+// collector deleted that one, `--now` deleted it and reported success, and `restore` carried it
+// home and wrote its dev/ino into the row. Nothing is touched now; what is owed is the path,
+// because whoever moved the world's tree is the only one who can put it back.
+static int trash_foreign_refusal(wfs_store *s, wfs_id id, int is_snapshot, const char *verb) {
+    char path[WFS_PATH_MAX];
+    path[0] = 0;
+    wfs_trash_entry_path(s, id, is_snapshot, path, sizeof path);
+    char why[WFS_PATH_MAX + 320];
+    snprintf(why, sizeof why,
+             "%c%llu: the directory at %s is not %c%llu's tree -- it has a different inode from "
+             "the one this store recorded, so %s it would %s somebody else's data",
+             is_snapshot ? 'S' : 'W', (unsigned long long)id,
+             path[0] ? path : "that trash entry's path", is_snapshot ? 'S' : 'W',
+             (unsigned long long)id, verb,
+             !strcmp(verb, "restoring") ? "register" : "delete");
+    return refuse(why, "put the tree back at that path (or move that directory aside and let the"
+                       " record go)   (`world fs gc --status` names it too)");
+}
+
 static int cmd_discard_snapshot(wfs_store *s, wfs_id sid, int now, int force, int64_t retention) {
     wfs_snapshot_rec sr;
     int rc = wfs_snapshot_info(s, sid, &sr);
@@ -863,6 +888,7 @@ static int cmd_discard_snapshot(wfs_store *s, wfs_id sid, int now, int force, in
     // Before the --force diagnosis below: this one is not about the pool at all, and the
     // snapshot has not been touched either (PR #1 review, 20th round).
     if (rc == WFS_E_TRASH_BLOCKED) return trash_blocked_refusal(s, sid, 1);
+    if (rc == WFS_E_TRASH_FOREIGN) return trash_foreign_refusal(s, sid, 1, "deleting");
     if (rc == WFS_E_SNAPSHOT_IN_USE) {
         // Say who. Worlds first (they are the hard refusal), then pool entries.
         char why[512];
@@ -988,6 +1014,7 @@ static int cmd_discard(wfs_store *s, int argc, char **argv) {
     }
     int rc = wfs_world_discard(s, w, now, force);
     if (rc == WFS_E_TRASH_BLOCKED) return trash_blocked_refusal(s, w, 0);
+    if (rc == WFS_E_TRASH_FOREIGN) return trash_foreign_refusal(s, w, 0, "deleting");
     if (rc == WFS_E_WORLD_BUSY) return busy_refusal(s, w, "discard");
     if (rc == WFS_E_UNREGISTERED) return explain_path(s, r.path, rc, "discard");
     if (rc == -ESTALE) {
@@ -1037,6 +1064,7 @@ static int cmd_restore(wfs_store *s, const char *arg) {
                  (unsigned long long)w);
         return refuse(why, "world fs fork --from <a snapshot>   (and `world fs gc --status` to watch)");
     }
+    if (rc == WFS_E_TRASH_FOREIGN) return trash_foreign_refusal(s, w, 0, "restoring");
     if (rc == WFS_E_SOURCE_GONE) {
         char why[192];
         snprintf(why, sizeof why,
@@ -1091,11 +1119,14 @@ static void gc_log_line(const wfs_gc_report *rep, double secs) {
     // PR #1 review (20th round): an entry blocked by a directory sitting on its `.deleting`
     // working name is one more thing still in the trash, so it belongs in the same count -- with
     // its own reason, because no number of retries will clear that one.
-    uint64_t stuck = rep->trash_failed + rep->trash_blocked;
+    // PR #1 review (25th round): and so is an entry whose path holds something that is not its
+    // tree -- nothing was deleted there either, and for the same kind of reason.
+    uint64_t stuck = rep->trash_failed + rep->trash_blocked + rep->trash_foreign;
     if (stuck)
-        snprintf(state, sizeof state, "  (%llu entr%s could not be deleted%s%s)",
+        snprintf(state, sizeof state, "  (%llu entr%s could not be deleted%s%s%s)",
                  (unsigned long long)stuck, stuck == 1 ? "y" : "ies",
                  rep->trash_blocked ? ", a directory in the way of the collector's working name" : "",
+                 rep->trash_foreign ? ", a directory that is not the recorded tree" : "",
                  rep->work_remains ? ", retrying" : "; left in the trash");
     else
         snprintf(state, sizeof state, "%s",
@@ -1210,6 +1241,16 @@ static int cmd_gc_status(wfs_store *s, int64_t retention) {
                " (not a directory this store made; move it aside)\n",
                (unsigned long long)ts.trash_blocked, ts.trash_blocked == 1 ? "y" : "ies",
                ts.blocked_path[0] ? ts.blocked_path : "a `<entry>.deleting` directory");
+    // PR #1 review (25th round, P1): and the entries whose path holds a directory that is not
+    // the tree the record was written for. The path is the point: for a world discarded across
+    // volumes the entry is in the user's own `.wfs-trash` under a name they can work out, so
+    // this line is as likely to be about something they put there themselves as about a tree
+    // that was moved away -- and either way nothing moves again until somebody looks.
+    if (ts.trash_foreign)
+        printf("foreign:   %llu trash entr%s cannot be collected: %s is not the tree that record"
+               " was written for (a different inode; nothing here will touch it)\n",
+               (unsigned long long)ts.trash_foreign, ts.trash_foreign == 1 ? "y" : "ies",
+               ts.foreign_path[0] ? ts.foreign_path : "what is at its path");
     return EX_OK;
 }
 
@@ -1314,6 +1355,23 @@ static int cmd_gc(wfs_store *s, int argc, char **argv) {
                 "world:       Move it aside and the next collection takes the entry.\n",
                 (unsigned long long)rep.trash_blocked, rep.trash_blocked == 1 ? "y" : "ies",
                 bs.blocked_path[0] ? ": " : ".", bs.blocked_path[0] ? bs.blocked_path : "");
+    }
+    if (rep.trash_foreign) {
+        // PR #1 review (25th round, P1): not a failed deletion and not a blocked one -- a
+        // deletion that was never this store's to make. What is at the entry's path has a
+        // different inode from the one the record has carried since the world was published,
+        // and for a world discarded across volumes that path is in the user's own `.wfs-trash`
+        // under a predictable name. Nothing was renamed and nothing was removed.
+        wfs_trash_stat fs_;
+        memset(&fs_, 0, sizeof fs_);
+        wfs_gc_status(s, retention, &fs_);
+        fprintf(stderr,
+                "world: note: %llu trash entr%s could not be collected: what is at %s is not the\n"
+                "world:       tree that record was written for (a different inode), so nothing\n"
+                "world:       touched it. Put the tree back at that path, or move that directory\n"
+                "world:       aside and let the record go.\n",
+                (unsigned long long)rep.trash_foreign, rep.trash_foreign == 1 ? "y" : "ies",
+                fs_.foreign_path[0] ? fs_.foreign_path : "the entry's path");
     }
     if (rep.trash_failed) {
         // Never let a failed delete read as an empty trash: say what is still in there, and

@@ -133,7 +133,18 @@ enum {
      * user-visible `.wfs-trash` beside it and the name is predictable, so the stray is never
      * removed and never renamed over: the entry is skipped, reported by `gc --status` with the
      * directory named, and `discard --now` refuses with this code. */
-    WFS_E_TRASH_BLOCKED = -1018
+    WFS_E_TRASH_BLOCKED = -1018,
+    /* PR #1 review (25th round): the directory at this trash entry's path is not the tree the
+     * row was written for. A world's row carries the dev/ino of its tree from the moment it was
+     * published, and every rename on the way into and out of the trash is same-volume (the
+     * store's trash, or a `.wfs-trash` beside the world when the discard hit EXDEV), so the
+     * inode is the world's identity for as long as the entry exists. A name is not: the
+     * cross-volume entry lives at `<parent>/.wfs-trash/W<id>-<timestamp>` in the user's own
+     * directory, and during the retention period they can move the tree away and leave
+     * something else there. Nothing is renamed or removed until the identity matches -- the
+     * collector counts the entry and `gc --status` names the path, `discard --now` and
+     * `restore` refuse with this code. */
+    WFS_E_TRASH_FOREIGN = -1019
 };
 
 /* Human-readable text for a negative errno or a WFS_E_* code. Never NULL. */
@@ -687,6 +698,14 @@ typedef struct wfs_gc_report {
      * because the remedy is the operator's -- look at that directory and move it away -- not
      * another wake of the collector. */
     uint64_t trash_blocked;
+    /* PR #1 review (25th round): trash entries whose path holds a directory that is not the
+     * tree the row was written for -- the row's dir_dev/dir_ino do not match what is there.
+     * The collector renamed and then deleted whatever the row NAMED, and the cross-volume
+     * entry's name is the user's own to occupy, so this is the other half of the rule above: a
+     * name is not a title. Nothing is touched, the row stays TRASHED, and `gc --status` names
+     * the path. Same retry cap as trash_blocked, and for the same reason -- only the operator
+     * can clear it. */
+    uint64_t trash_foreign;
 } wfs_gc_report;
 
 /* retention_secs < 0 uses the default (7 days). Synchronous and complete: every due trash entry
@@ -764,6 +783,15 @@ typedef struct wfs_trash_stat {
      * an operator is told which one to look at rather than only that something is stuck. */
     uint64_t trash_blocked;
     char blocked_path[WFS_PATH_MAX];
+    /* PR #1 review (25th round): due trash entries whose path is not the tree the row was
+     * written for (dir_dev/dir_ino do not match what is on disk). foreign_path is the first
+     * such path -- and it is the ENTRY's own path, not a sibling: what has to be looked at is
+     * the directory standing where the world's tree used to be, which for a world discarded
+     * across volumes is in the user's own `.wfs-trash`. Counted apart from trash_blocked
+     * because the two say different things: "something is on the name I rename to" and "this
+     * is not my tree". */
+    uint64_t trash_foreign;
+    char foreign_path[WFS_PATH_MAX];
     /* The worker, from <store>/locks/gc.lock. pid is 0 when nobody is running. */
     int64_t worker_pid, worker_started_at;
     uint64_t worker_done, worker_remaining; /* trash entries finished / left, as it last wrote */
@@ -777,6 +805,12 @@ int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_stat *out);
  * `buf` with `<trash_path>.deleting` and returns 0 when that directory is there and the entry is
  * still at its own name; -ENOENT when nothing is in the way. Two lstat(2)s and one row read. */
 int wfs_trash_blocked_path(wfs_store *s, wfs_id id, int is_snapshot, char *buf, size_t cap);
+
+/* PR #1 review (25th round): the path this row's trash entry is at, for a caller that has just
+ * been answered WFS_E_TRASH_FOREIGN and has to say which directory it refused to touch. It is
+ * the row's trash_path, followed to the `.deleting` name when that is where the tree went.
+ * Returns 0 and writes the path, or -ENOENT when the row names nothing. One row read. */
+int wfs_trash_entry_path(wfs_store *s, wfs_id id, int is_snapshot, char *buf, size_t cap);
 
 /* The same question reduced to what a command needs before deciding to spawn a worker: is there
  * due work, and is somebody already on it? Two indexed counts and one readdir that stops at the

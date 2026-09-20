@@ -68,6 +68,38 @@ bool exists(const char *p) {
 // EEXIST from the create itself, not a world.
 bool proven_gone(const char *p) { return wfs::fs_gone(wfs::fs_probe(p)); }
 
+// PR #1 review (25th round, P1): is the tree at this path the one that row was written for?
+//
+// Ownership of a trash entry used to be decided by the row still NAMING the path -- and for a
+// world discarded across volumes that path is `<parent>/.wfs-trash/W<id>-<timestamp>`, a
+// directory of the user's under a name anybody can work out. During the retention period they
+// can move the tree away and leave something else there, and every name-only check then says
+// the stranger is the world: the collector renamed it to `.deleting` and deleted it whole,
+// `--now` did the same and exited 0, and `restore` carried it home and wrote its dev/ino into
+// the row. Ownership is an invariant we wrote down, not a lookalike name (P18).
+//
+// The invariant is the inode. A world row carries dir_dev/dir_ino from the moment its tree was
+// published (fork/adopt), `wfs_world_discard` verifies them against the tree before it moves
+// anything and does not touch the two columns afterwards, and every rename on the way into and
+// out of the trash is same-volume -- <store>/trash when the store shares the world's volume, a
+// `.wfs-trash` beside the world when the discard hit EXDEV -- so the inode the row remembers is
+// the entry's identity for as long as the entry exists, `.deleting` spelling included.
+//
+// Returns 0 when it matches, WFS_E_TRASH_FOREIGN when what is there is provably something else,
+// and any other errno as itself: a probe that could not answer is not an identity either (12th
+// round), so the entry is left alone and reported rather than deleted on a guess.
+//
+// dir_ino == 0 is a row from before the columns were written (the schema defaults them), which
+// nothing this store produces leaves behind: there is no identity to compare with, so the entry
+// is treated as the row's, exactly as it was before this round.
+int trash_identity(const char *path, uint64_t dev, uint64_t ino) {
+    if (!ino) return 0;
+    struct stat st;
+    if (int prc = wfs::fs_probe(path, &st)) return prc;
+    if ((uint64_t)st.st_ino != ino || (uint64_t)st.st_dev != dev) return WFS_E_TRASH_FOREIGN;
+    return 0;
+}
+
 // The deleter checks the gc worker's deadline against the same clock (internal.h).
 int64_t now_us() { return wfs::fs_mono_us(); }
 
@@ -1756,13 +1788,25 @@ int trash_delete_now(wfs_store *s, wfs_id id, int is_snapshot, const String &tra
             // all: -ESTALE, tree untouched.
             Guard g(s->mu);
             Txn t(s->db);
-            Stmt q(s->db, is_snapshot ? "SELECT state, trash_path FROM snapshots WHERE id=?"
-                                      : "SELECT state, trash_path FROM worlds WHERE id=?");
+            Stmt q(s->db,
+                   is_snapshot ? "SELECT state, trash_path, 0, 0 FROM snapshots WHERE id=?"
+                               : "SELECT state, trash_path, dir_dev, dir_ino FROM worlds WHERE id=?");
             if (!q.ok()) return -EIO;
             q.i64(1, (int64_t)id);
             if (!q.row() || q.col_i64(0) != WFS_ST_TRASHED ||
                 ::strcmp(q.col_text(1), expect.c_str()))
                 return -ESTALE;
+            // PR #1 review (25th round, P1): and it is this row's tree, not merely this row's
+            // name. Read from the row in the same transaction as the rename below, so what is
+            // checked is what the claim acts on. `--now` refuses rather than delete a
+            // directory somebody else put at the name -- the same shape as the 20th round's
+            // WFS_E_TRASH_BLOCKED, one step earlier: there the stray was on the working name,
+            // here it is on the entry itself.
+            // (A tree that is genuinely gone is not a foreign one: trash_mark_deleting()
+            // answers -ENOENT for it a line further down and the row is buried the way it
+            // always was.)
+            int irc = trash_identity(tp.c_str(), (uint64_t)q.col_i64(2), (uint64_t)q.col_i64(3));
+            if (irc && !wfs::fs_gone(irc)) return irc;
             mrc = trash_mark_deleting(tp.c_str(), deleting);
             if (mrc && mrc != -ENOENT) return mrc;
             if (!mrc && ::strcmp(deleting.c_str(), expect.c_str())) {
@@ -1889,13 +1933,21 @@ namespace {
 // already being deleted by the collector", which it is not. The collector's claim and the row
 // that records it are one transaction, so a tree still at its own name has been claimed by
 // nobody. ("Cannot prove it gone" counts as still there: the restore's own rename decides.)
-bool trash_is_deleting(const String &trash) {
+//
+// PR #1 review (25th round, P1): and the tree at that `.deleting` name is the collector's work
+// on THIS world only if it is this world's tree. A same-volume rename keeps the inode and every
+// rename on this path is same-volume, so the row's dir_dev/dir_ino answer it. Without that, a
+// directory somebody else left at `<entry>.deleting` while the world's own tree was moved away
+// still told the owner for ever that "the collector is deleting this world" -- which is exactly
+// the false statement the 20th round removed from the other half of this check.
+bool trash_is_deleting(const String &trash, uint64_t dev, uint64_t ino) {
     size_t n = trash.size(), sl = ::strlen(WFS_DELETING_SUFFIX);
     if (n > sl && !::strcmp(trash.c_str() + n - sl, WFS_DELETING_SUFFIX)) return true;
     if (!proven_gone(trash.c_str())) return false;
     String d(trash);
     d.append(WFS_DELETING_SUFFIX);
-    return exists(d.c_str());
+    if (!exists(d.c_str())) return false;
+    return trash_identity(d.c_str(), dev, ino) != WFS_E_TRASH_FOREIGN;
 }
 
 } // namespace
@@ -1927,7 +1979,15 @@ bool trash_is_deleting(const String &trash) {
 // row goes back to TRASHED) or at home (it did -- ACTIVE). dir_dev/dir_ino need no re-stat on
 // that path: a world's trash is always on the world's own volume -- <store>/trash when the store
 // shares it, and a `.wfs-trash` beside the world when the discard hit EXDEV -- so both renames
-// keep the inode. We set them again in (c) anyway, since we have the stat in hand.
+// keep the inode.
+//
+// PR #1 review (25th round, P1): which is also what makes the entry identifiable, and step (a)
+// now requires it. The `.wfs-trash` half of that sentence is a directory of the user's under a
+// name they can work out, so "the row names this path" never meant "this path holds the world":
+// the tree could be moved away and another directory left in its place, and the restore renamed
+// that one home and wrote its dev/ino into the row -- somebody else's data registered as the
+// world, exit 0. (c) no longer takes the row's identity from a stat of the home path either;
+// the numbers it writes are the ones (a) checked.
 extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
     if (!s || !id) return -EINVAL;
     wfs_world_rec r;
@@ -1939,12 +1999,13 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
     }
     if (r.state != WFS_ST_TRASHED) return -ESTALE;
     // T2.1: once the collector has renamed the tree, what is left of it is not a world any more.
-    if (trash_is_deleting(trash)) return WFS_E_TRASH_DELETING;
+    if (trash_is_deleting(trash, r.dir_dev, r.dir_ino)) return WFS_E_TRASH_DELETING;
     // PR #1 review (12th round): and -ENOENT is reserved for a tree that is really not there.
     if (int prc = wfs::fs_probe(trash.c_str())) return wfs::fs_gone(prc) ? -ENOENT : prc;
     if (exists(r.path)) return -EEXIST;   // a create check: the rename below refuses anyway
     // (a). Everything the restore decides is decided again in here, under the write lock a
-    // discard takes: the row, the tree's name, and the baseline.
+    // discard takes: the row, the tree's name, the tree's identity, and the baseline.
+    uint64_t ident_dev = 0, ident_ino = 0;   // what the row says its tree is, read under (a)
     {
         Guard g(s->mu);
         Txn t(s->db);
@@ -1954,7 +2015,19 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
         String tp;
         if (int rc = world_trash_path(s, id, tp)) return rc;
         if (::strcmp(tp.c_str(), trash.c_str())) return -ESTALE;   // it moved under us
-        if (trash_is_deleting(tp)) return WFS_E_TRASH_DELETING;
+        if (trash_is_deleting(tp, rr.dir_dev, rr.dir_ino)) return WFS_E_TRASH_DELETING;
+        // PR #1 review (25th round, P1): and what is at that path has to BE this world's tree.
+        // The row has carried dir_dev/dir_ino since the world was published and every rename on
+        // the way into the trash is same-volume, so the inode is the world's identity while it
+        // sits there -- and the cross-volume entry sits in the user's own `.wfs-trash` under a
+        // name they can guess. Without this the restore renamed whatever was at that path home,
+        // re-stat'ed it and wrote ITS dev/ino into the row in step (c): a stranger's directory
+        // registered as the world, exit 0, and the world's own tree left with nothing naming
+        // it. Checked in here, under the write lock the discard takes, and nothing else may
+        // make the row TRASHING while we hold it.
+        if (int irc = trash_identity(tp.c_str(), rr.dir_dev, rr.dir_ino)) return irc;
+        ident_dev = rr.dir_dev;
+        ident_ino = rr.dir_ino;
         // T2.2: a world whose source snapshot has been discarded cannot be brought back to life
         // -- it would have no baseline to diff or verify against, which is the whole point of a
         // World. Under the write lock, so "the snapshot is ACTIVE" is still true when the row
@@ -1995,8 +2068,21 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
     // rename was in flight is picked up too -- a TRASHED world whose tree is at its home path is
     // a state only this restore can have produced -- and a row that is ACTIVE with no trash_path
     // is the outcome we wanted, reached by somebody else. Anything else is not ours to overwrite.
-    struct stat st;
-    if (::stat(r.path, &st) != 0) return -errno;
+    // PR #1 review (25th round, P1): the row's own dev/ino go back in, and they are not read
+    // off the path we just renamed to. A same-volume rename keeps the inode, so in every
+    // legitimate case the two are the same number -- but a stat of the home path is a question
+    // about whatever is standing there, and answering the row with it is how a substituted tree
+    // used to become the world (the identity check in (a) is what now keeps one out, and a row
+    // must not be able to learn a new identity from the floor in the first place).
+    if (!ident_ino) {
+        // No identity was recorded for this world, so there was none to check either and the
+        // path is all there is to go on -- the pre-25th-round behaviour, kept for a row the
+        // columns predate. Nothing this store writes leaves a published world without them.
+        struct stat st;
+        if (::stat(r.path, &st) != 0) return -errno;
+        ident_dev = (uint64_t)st.st_dev;
+        ident_ino = (uint64_t)st.st_ino;
+    }
     {
         Guard g(s->mu);
         Txn t(s->db);
@@ -2004,8 +2090,8 @@ extern "C" int wfs_world_restore(wfs_store *s, wfs_id id) {
                       " dir_ino=?, owner_pid=0, owner_start=0 WHERE id=? AND (state=4 OR state=2)");
         if (!u.ok()) return -EIO;
         u.i64(1, WFS_ST_ACTIVE);
-        u.i64(2, (int64_t)st.st_dev);
-        u.i64(3, (int64_t)st.st_ino);
+        u.i64(2, (int64_t)ident_dev);
+        u.i64(3, (int64_t)ident_ino);
         u.i64(4, (int64_t)id);
         if (u.step() != SQLITE_DONE) return -EIO;
         int changed = sqlite3_changes(s->db);
@@ -3015,6 +3101,10 @@ struct TrashJob {
                       // still saying this.
     wfs_id row = 0;   // 0 = an orphan: a directory in the trash that no row claims
     int is_snapshot = 0;
+    // PR #1 review (25th round, P1): what the row says its tree IS, not only where it is.
+    // Worlds only -- a snapshot's trash is always inside the store (see trash_scan) and its row
+    // has no dev/ino columns to compare with. 0 means "no identity recorded": don't compare.
+    uint64_t dir_dev = 0, dir_ino = 0;
 };
 
 // Reads the gc lock file the way lock_probe reads an exec lock: a pid that is gone, or a flock
@@ -3098,7 +3188,8 @@ int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v) {
         Guard g(s->mu);
         claim_trash_paths(s, claimed);
         {
-            Stmt q(s->db, "SELECT id, trash_path, trashed_at, entries FROM worlds WHERE state=2");
+            Stmt q(s->db, "SELECT id, trash_path, trashed_at, entries, dir_dev, dir_ino"
+                          " FROM worlds WHERE state=2");
             if (!q.ok()) return -EIO;
             while (q.row()) {
                 String tp(q.col_text(1));
@@ -3106,6 +3197,8 @@ int trash_scan(wfs_store *s, int64_t cutoff, TrashView &v) {
                 v.worlds++;
                 v.tree_entries += (uint64_t)q.col_i64(3);
                 TrashJob j;
+                j.dir_dev = (uint64_t)q.col_i64(4);
+                j.dir_ino = (uint64_t)q.col_i64(5);
                 j.row_path = tp;
                 trash_follow_deleting(tp);
                 j.path = tp;
@@ -3252,13 +3345,30 @@ int gc_claim_deleting(wfs_store *s, TrashJob &j, String &deleting) {
     Guard g(s->mu);
     Txn t(s->db);
     if (j.row) {
-        Stmt q(s->db, j.is_snapshot ? "SELECT state, trash_path FROM snapshots WHERE id=?"
-                                    : "SELECT state, trash_path FROM worlds WHERE id=?");
+        Stmt q(s->db,
+               j.is_snapshot ? "SELECT state, trash_path, 0, 0 FROM snapshots WHERE id=?"
+                             : "SELECT state, trash_path, dir_dev, dir_ino FROM worlds WHERE id=?");
         if (!q.ok()) return -EIO;
         q.i64(1, (int64_t)j.row);
         if (!q.row() || q.col_i64(0) != WFS_ST_TRASHED ||
             ::strcmp(q.col_text(1), j.row_path.c_str()))
             return 1;
+        // PR #1 review (25th round, P1): and the last question before the rename is whether the
+        // thing at that path IS this row's tree. The row naming it is not enough -- the
+        // cross-volume entry sits at `<parent>/.wfs-trash/W<id>-<timestamp>`, which is the
+        // user's directory and a name they can guess, so during the retention period they can
+        // move the tree away and leave a directory of their own there; the collector renamed it
+        // to `.deleting` and deleted it whole. The row's dev/ino are read here, inside the
+        // transaction that makes the claim, so identity and claim cannot come apart. A tree
+        // that is genuinely gone still goes the way it always did (-ENOENT out of
+        // trash_mark_deleting below); anything else that cannot be proven ours is left exactly
+        // as it is, counted and named.
+        // This covers the `.deleting` spelling too: j.path is whichever of the two names
+        // trash_follow_deleting() found the tree at, and a same-volume rename keeps the inode,
+        // so our own half-deleted tree matches and somebody else's directory at that name does
+        // not.
+        int irc = trash_identity(j.path.c_str(), (uint64_t)q.col_i64(2), (uint64_t)q.col_i64(3));
+        if (irc && !wfs::fs_gone(irc)) return irc;
     } else if (trash_path_claimed_locked(s, j.path.c_str())) {
         // P18: an orphan has no row to claim, so what it re-asks is "does any row name this
         // tree now?" -- and it asks it in here, under the same write lock, because a `discard`
@@ -3342,6 +3452,8 @@ void gc_fail_clear(wfs_store *s, const TrashJob &j) {
 // WFS_E_TRASH_BLOCKED (PR #1 review, 20th round) means a directory that is not ours is sitting
 // at the `.deleting` name: nothing was done to it either, and the entry is counted apart from
 // the ones that were tried and failed, because the remedy is the operator's.
+// WFS_E_TRASH_FOREIGN (PR #1 review, 25th round) is the same answer one step earlier: the
+// directory at the entry's OWN path is not the tree this row was written for.
 int gc_delete_one(wfs_store *s, TrashJob &j, int threads, uint64_t *entries_freed,
                   int64_t deadline_us, int *partial) {
     // The cheap question first, on a read: most jobs that are not the collector's any more are
@@ -3395,6 +3507,26 @@ extern "C" int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_sta
         out->trash_blocked++;
         if (!out->blocked_path[0])
             copy_str(out->blocked_path, sizeof out->blocked_path, blocked.c_str());
+    }
+    // PR #1 review (25th round, P1): and the entries the collector will not start on because
+    // what is at their path is not their tree. Same audience and the same reason to name the
+    // path: for a world discarded across volumes it is a directory in the user's own
+    // `.wfs-trash`, and the only way anything moves again is for them to look at it. Both
+    // passes the collector makes are covered -- an entry already at its `.deleting` name has
+    // the same identity, because the rename that gave it that name was same-volume. Orphans are
+    // skipped: a row-less directory has no row to be the tree of, and it is a directory under
+    // <store>/trash, which the store allocated (5th/9th/20th rounds).
+    for (size_t pass = 0; pass < 2; ++pass) {
+        const Vec<TrashJob> &jobs = pass == 0 ? v.deleting : v.due;
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            if (!jobs[i].row) continue;
+            if (trash_identity(jobs[i].path.c_str(), jobs[i].dir_dev, jobs[i].dir_ino) !=
+                WFS_E_TRASH_FOREIGN)
+                continue;
+            out->trash_foreign++;
+            if (!out->foreign_path[0])
+                copy_str(out->foreign_path, sizeof out->foreign_path, jobs[i].path.c_str());
+        }
     }
     wfs::fs_free_space(s->dir.c_str(), &out->volume_free_bytes, &out->volume_total_bytes);
     // PR #1 review (5th round): and the abandoned fork trees that are still on disk. They are not
@@ -3475,6 +3607,26 @@ extern "C" int wfs_trash_blocked_path(wfs_store *s, wfs_id id, int is_snapshot, 
     if (!trash_blocked_by(tp, blocked)) return -ENOENT;
     if (blocked.size() + 1 > cap) return -ENAMETOOLONG;
     copy_str(buf, cap, blocked.c_str());
+    return 0;
+}
+
+// PR #1 review (25th round, P1): which directory this row's collection refused to touch. The
+// caller is a `discard --now` (or a `restore`) answered WFS_E_TRASH_FOREIGN, and what it owes
+// the user is the path where their world's tree should be and something else is -- in the EXDEV
+// case a directory in their own `<parent>/.wfs-trash`.
+extern "C" int wfs_trash_entry_path(wfs_store *s, wfs_id id, int is_snapshot, char *buf,
+                                    size_t cap) {
+    if (!s || !id || !buf || !cap) return -EINVAL;
+    String tp;
+    {
+        Guard g(s->mu);
+        if (int rc = is_snapshot ? snapshot_trash_path(s, id, tp) : world_trash_path(s, id, tp))
+            return rc;
+    }
+    if (!tp.size()) return -ENOENT;
+    trash_follow_deleting(tp);
+    if (tp.size() + 1 > cap) return -ENAMETOOLONG;
+    copy_str(buf, cap, tp.c_str());
     return 0;
 }
 
@@ -3866,6 +4018,20 @@ extern "C" int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *o
                 // (the stray may be somebody else's temporary), after that the collector stops
                 // waking itself for something only the operator can clear.
                 rep.trash_blocked++;
+                rep.entries_freed += freed;
+                if (gc_fail_bump(s, jobs[i]) < wfs::kGcFailCap) rep.work_remains = 1;
+                continue;
+            }
+            if (drc == WFS_E_TRASH_FOREIGN) {
+                // PR #1 review (25th round, P1): the directory at this entry's path is not the
+                // tree the row was written for -- its dev/ino do not match what the row has
+                // carried since the world was published. Until now the row NAMING the path was
+                // the whole of the check, and the cross-volume entry's name is the user's own
+                // to occupy, so what got renamed to `.deleting` and deleted could be a
+                // directory of theirs. Nothing is touched. Counted apart from trash_failed for
+                // the same reason as trash_blocked: no number of retries clears it, only
+                // putting the world's own tree back does, and `gc --status` names the path.
+                rep.trash_foreign++;
                 rep.entries_freed += freed;
                 if (gc_fail_bump(s, jobs[i]) < wfs::kGcFailCap) rep.work_remains = 1;
                 continue;

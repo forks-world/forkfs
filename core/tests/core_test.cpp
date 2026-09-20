@@ -5554,6 +5554,134 @@ int main() {
         CHECK(db_user_version(vdb) == 400);
     }
 
+    // ---- PR #1 review (25th round, P1): a trash entry is the row's tree, not the row's name --
+    //
+    // The collector's last question before renaming an entry to `.deleting` and deleting it was
+    // whether the row still NAMED that path. For a world discarded across volumes the entry is
+    // `<parent>/.wfs-trash/W<id>-<timestamp>` -- the user's own directory, under a name they can
+    // work out -- so during the retention period the tree can be moved away and another
+    // directory left in its place, and the collector deleted that one, contents and all.
+    // `discard --now` did the same and exited 0, and `restore` renamed it home and wrote its
+    // dev/ino into the row: somebody else's data registered as the world.
+    //
+    // The row has carried dir_dev/dir_ino since the world was published and every rename on the
+    // way into and out of the trash is same-volume, so the inode is the entry's identity for as
+    // long as it exists. This checks it against the row itself, straight out of the database.
+    // (The EXDEV side trash needs a second volume to exercise; the entry below is in
+    // <store>/trash and goes through the same code, because the check is made against the row,
+    // not against where the entry happens to live. A snapshot's trash is always inside the
+    // store, and its row has no dev/ino columns -- see the reply on the thread.)
+    {
+        char fstore[4096], fsrc[4096], fw[4096], fdb[4096], fentry[4096], faside[4096];
+        join(fstore, sizeof fstore, root, "foreign-store");
+        join(fsrc, sizeof fsrc, root, "foreign-src");
+        join(faside, sizeof faside, root, "foreign-aside");
+        CHECK(mkdir(fsrc, 0755) == 0);
+        join(p, sizeof p, fsrc, "a.txt");
+        write_file(p, "one\n");
+        wfs_store *fa = NULL;
+        CHECK_OK(wfs_store_open(fstore, &fa));
+        memset(&sopts, 0, sizeof sopts);
+        sopts.name = "fb";
+        wfs_id f1 = 0;
+        CHECK_OK(wfs_snapshot_create(fa, fsrc, &sopts, &f1));
+        wfs_ref ff = {WFS_K_SNAPSHOT, f1};
+        memset(&opts, 0, sizeof opts);
+        join(fw, sizeof fw, worlds, "fworld");
+        wfs_id fw1 = 0;
+        CHECK_OK(wfs_world_create(fa, ff, fw, &opts, &fw1));
+        wfs_world_rec fwr;
+        CHECK_OK(wfs_world_info(fa, fw1, &fwr));
+        CHECK(fwr.dir_ino != 0);
+        uint64_t want_dev = fwr.dir_dev, want_ino = fwr.dir_ino;
+        CHECK_OK(wfs_world_discard(fa, fw1, 0, 0));
+
+        // The row, read from the database: where it says the tree is, and what it says the tree
+        // is. The discard does not touch the two identity columns, and the rename into
+        // <store>/trash kept the inode.
+        snprintf(fdb, sizeof fdb, "%s/metadata.db", fstore);
+        char sql[256], val[4096];
+        snprintf(sql, sizeof sql, "SELECT trash_path FROM worlds WHERE id=%llu",
+                 (unsigned long long)fw1);
+        CHECK(db_query_text(fdb, sql, fentry, sizeof fentry) == 1);
+        CHECK(fentry[0]);
+        snprintf(sql, sizeof sql, "SELECT dir_ino FROM worlds WHERE id=%llu",
+                 (unsigned long long)fw1);
+        CHECK(db_query_text(fdb, sql, val, sizeof val) == 1);
+        CHECK(strtoull(val, NULL, 10) == want_ino);
+        struct stat fst;
+        CHECK(lstat(fentry, &fst) == 0);
+        CHECK((uint64_t)fst.st_ino == want_ino && (uint64_t)fst.st_dev == want_dev);
+
+        // The substitution: the world's tree moved aside, a directory of somebody else's -- with
+        // a file in it -- at exactly the path the row names. Different inode, same name.
+        CHECK(rename(fentry, faside) == 0);
+        CHECK(mkdir(fentry, 0755) == 0);
+        join(p, sizeof p, fentry, "user.txt");
+        write_file(p, "not the world\n");
+        CHECK(lstat(fentry, &fst) == 0);
+        CHECK((uint64_t)fst.st_ino != want_ino);
+
+        // The collector will not start on it: nothing renamed, nothing unlinked, the row left
+        // TRASHED, and the entry counted where an operator will see it.
+        wfs_store *fb = NULL;
+        CHECK_OK(wfs_store_open(fstore, &fb));
+        wfs_gc_report frep;
+        memset(&frep, 0, sizeof frep);
+        CHECK_OK(wfs_gc(fb, 0, &frep));
+        CHECK(frep.trash_foreign == 1);
+        CHECK(frep.worlds_deleted == 0 && frep.trash_orphans == 0 && frep.trash_failed == 0);
+        CHECK(exists(p));                          // the user's file, untouched
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "not the world\n"));
+        char fdel[4200];
+        snprintf(fdel, sizeof fdel, "%s.deleting", fentry);
+        CHECK(!exists(fdel));                      // and it was never even renamed
+        CHECK_OK(wfs_world_info(fa, fw1, &fwr));
+        CHECK(fwr.state == WFS_ST_TRASHED);
+        CHECK(fwr.dir_ino == want_ino && fwr.dir_dev == want_dev);
+        wfs_trash_stat fts;
+        memset(&fts, 0, sizeof fts);
+        CHECK_OK(wfs_gc_status(fb, 0, &fts));
+        CHECK(fts.trash_foreign == 1 && !strcmp(fts.foreign_path, fentry));
+        char shown[WFS_PATH_MAX];
+        shown[0] = 0;
+        CHECK_OK(wfs_trash_entry_path(fb, fw1, 0, shown, sizeof shown));
+        CHECK(!strcmp(shown, fentry));
+
+        // `--now` refuses instead of deleting it, and `restore` refuses instead of adopting it.
+        CHECK_RC(wfs_world_discard(fa, fw1, 1, 0), WFS_E_TRASH_FOREIGN);
+        CHECK(exists(p));
+        CHECK_RC(wfs_world_restore(fa, fw1), WFS_E_TRASH_FOREIGN);
+        CHECK(exists(p) && !exists(fw));
+        CHECK_OK(wfs_world_info(fa, fw1, &fwr));
+        CHECK(fwr.state == WFS_ST_TRASHED && fwr.dir_ino == want_ino);
+
+        // Put the world's own tree back at that path and nothing about the entry was ever
+        // broken: it restores, and the row's identity is the one it always had.
+        rm_rf(fentry);
+        CHECK(rename(faside, fentry) == 0);
+        CHECK_OK(wfs_world_restore(fa, fw1));
+        CHECK_OK(wfs_world_info(fa, fw1, &fwr));
+        CHECK(fwr.state == WFS_ST_ACTIVE && fwr.present && exists(fw));
+        CHECK(fwr.dir_ino == want_ino && fwr.dir_dev == want_dev);
+        join(p, sizeof p, fw, "a.txt");
+        CHECK_OK(read_file(p, buf, sizeof buf));
+        CHECK(!strcmp(buf, "one\n"));
+
+        // ... and the collector takes it exactly as it always did.
+        CHECK_OK(wfs_world_discard(fa, fw1, 0, 0));
+        memset(&frep, 0, sizeof frep);
+        CHECK_OK(wfs_gc(fb, 0, &frep));
+        CHECK(frep.worlds_deleted == 1 && frep.trash_foreign == 0 && frep.trash_failed == 0);
+        CHECK_OK(wfs_world_info(fa, fw1, &fwr));
+        CHECK(fwr.state == WFS_ST_DEAD);
+        wfs_store_close(fb);
+        wfs_store_close(fa);
+        snprintf(p, sizeof p, "%s/snapshots/S%llu/root", fstore, (unsigned long long)f1);
+        chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
+    }
+
     wfs_store_close(s);
     rm_rf(root);
     printf("core_test: all OK\n");
