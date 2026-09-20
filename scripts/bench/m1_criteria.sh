@@ -370,8 +370,8 @@ for mode in ("nopool", "pool"):
             if line.startswith("S1"): left_in_pool = int(line.split()[2])
         subprocess.run([world,"fs","pool","drain","--all"], capture_output=True, env=env_for(store))
     grown = used_kb() - base
-    dbsize = os.path.getsize(os.path.join(store, "metadata.db"))
-    wal = os.path.join(store, "metadata.db-wal")
+    dbsize = os.path.getsize(os.path.join(store, "metadata3.db"))
+    wal = os.path.join(store, "metadata3.db-wal")
     dbsize += os.path.getsize(wal) if os.path.exists(wal) else 0
     t_list, r = run([world, "fs", "list"], store)
     assert r.returncode == 0
@@ -418,7 +418,7 @@ with open(out, "w") as f:
     row("单次 p50", "p50")
     row("单次 p95", "p95")
     row("df 物理增长", "grown", lambda v: f"{v/1048576:.2f} GB")
-    row("metadata.db(+wal)", "dbsize", lambda v: f"{v/1048576:.1f} MB")
+    row("metadata3.db(+wal)", "dbsize", lambda v: f"{v/1048576:.1f} MB")
     row("`fs list`(1000 行)", "t_list")
     row("`fs list` 常驻内存", "mem", lambda v: f"{v:.1f} MB")
     row("`fs status`", "t_status")
@@ -443,7 +443,7 @@ with open(out, "w") as f:
           f"{nz['t_gc']*1e6/(1000*nz['entries']):.0f} µs/条目),两列一样。"
           "建 1000 个 World 比毁掉它们便宜一个数量级——真要频繁回收,得把 `gc` 做成后台增量的。\n", file=f)
     print(f"**判据:达成(可承受)** —— 1000 个 World 共 {nz['grown']/1048576:.2f} GB 物理、"
-          f"metadata.db {nz['dbsize']/1048576:.1f} MB、`fs list` {nz['t_list']:.3f} s / {nz['mem']:.0f} MB 内存,"
+          f"metadata3.db {nz['dbsize']/1048576:.1f} MB、`fs list` {nz['t_list']:.3f} s / {nz['mem']:.0f} MB 内存,"
           f"清理 {nz['t_discard']:.0f} s + {nz['t_gc']:.1f} s。\n", file=f)
 
 with open(vfile, "a") as f:

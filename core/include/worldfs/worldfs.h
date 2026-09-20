@@ -33,8 +33,21 @@ extern "C" {
 #define WFS_FS_SHORT_NAME "worldfs"
 #define WFS_EXTENSION_BUNDLE_ID "world.forks.fs.extension"
 
-/* Store schema. A store written by a newer core is refused (P13). */
-#define WFS_STORE_SCHEMA 2
+/* Store schema. A store written by a newer core is refused (P13).
+ *
+ * PR #1 review (24th round, P1): 3, not M1's 2. Nothing about the schema bump is about columns
+ * -- those are additive and carry defaults (see kMigrations in store.cpp). It is about what a
+ * collector is allowed to delete: M2 put snapshots through the trash, gave a discard in flight
+ * the WFS_ST_TRASHING state and a tree at one of two names, renames a trash entry to
+ * .deleting before unlinking it, and gave the pool a DRAINING state. M1's wfs_gc() knows none
+ * of that -- it protects state=2 world trash paths and sweeps the rest -- so an M1 binary let
+ * loose on an M2 store would recursively delete a snapshot still inside its retention window
+ * and leave the rows pointing at nothing. It must refuse the store instead, and the schema
+ * number is the only thing that makes it. */
+#define WFS_STORE_SCHEMA 3
+/* The schema M1 wrote. A store still carrying it has never been opened by this core, so it
+ * holds nothing an M1 collector cannot handle; wfs_store_open() upgrades it in place. */
+#define WFS_STORE_SCHEMA_M1 2
 
 #define WFS_PATH_MAX 1024
 #define WFS_NAME_MAX 128
@@ -45,8 +58,15 @@ extern "C" {
 #define WFS_GATE_CLOSED 0000
 /* Mode of the same root while a clone of it is in flight (fork / checkpoint / verify). */
 #define WFS_GATE_OPEN 0500
-/* Suffix of a half-built tree; removed by wfs_gc (P8). */
+/* Suffix of a half-built tree INSIDE THE STORE -- <store>/snapshots/S<n>.wfs-tmp and the pool's
+ * <uuid>.wfs-tmp -- where every name is one we made and wfs_gc may sweep by suffix (P8). It is
+ * never a name in a directory of the user's: `~/w/a.wfs-tmp` is somebody's own file, not our
+ * scratch space. A fork's temporary is drawn instead, and recorded (see wfs_world_create). */
 #define WFS_TMP_SUFFIX ".wfs-tmp"
+/* T2.1: a trash entry the collector has started to unlink. The rename to this name is the FIRST
+ * thing the deleter does, so a worker that is killed half-way through leaves a tree that is
+ * visibly not restorable instead of one that looks intact. wfs_world_restore() refuses it. */
+#define WFS_DELETING_SUFFIX ".deleting"
 
 typedef struct wfs_store wfs_store; /* metadata store for many snapshots and worlds */
 
@@ -64,8 +84,14 @@ typedef struct wfs_ref {
 typedef enum wfs_state {
     WFS_ST_CREATING = 0,
     WFS_ST_ACTIVE = 1,
-    WFS_ST_TRASHED = 2, /* worlds only: sitting in <store>/trash, restorable */
-    WFS_ST_DEAD = 3
+    WFS_ST_TRASHED = 2, /* sitting in <store>/trash, restorable */
+    WFS_ST_DEAD = 3,
+    /* PR #1 review (5th round): the middle of a discard. The row is committed with the name the
+     * tree is about to have, the rename has not necessarily happened yet, and the tree is at
+     * exactly one of the two names. Every store open and every gc resolves it: back to ACTIVE
+     * when the tree never moved (or something still references it), on to TRASHED when it did.
+     * Nothing that collects the trash may treat a directory a TRASHING row names as row-less. */
+    WFS_ST_TRASHING = 4
 } wfs_state;
 
 /* Where a world came from. */
@@ -88,8 +114,61 @@ enum {
     WFS_E_FOREIGN_STORE = -1009,  /* marker belongs to a different store */
     WFS_E_WORLD_MISSING = -1010,  /* the recorded path no longer holds this world */
     WFS_E_SOURCE_GONE = -1011,    /* the snapshot this world was forked from is no longer there */
-    WFS_E_POOL_BUSY = -1012       /* T1.5: another `pool fill` holds the store's pool lock */
+    WFS_E_POOL_BUSY = -1012,      /* T1.5: another `pool fill` holds the store's pool lock */
+    WFS_E_TRASH_DELETING = -1013, /* T2.1: the gc worker has begun unlinking this trash entry */
+    WFS_E_SNAPSHOT_IN_USE = -1014,/* T2.2: an ACTIVE world (or a pool entry) still needs it */
+    WFS_E_GC_BUSY = -1015,        /* T2.1: another gc worker holds <store>/locks/gc.lock */
+    WFS_E_STORE_UNREACHABLE = -1016, /* T2.3: this store cannot be opened from where we are */
+    /* P17: the store directory still holds snapshot trees (or a trash, or a pool) but its
+     * metadata3.db is missing or unreadable. Opening such a store would create an empty
+     * database beside the orphans and hand out id 1 again, which the first `init` would then
+     * try to write to the `snapshots/S1` that is already there. Refused instead: the database
+     * has to come back from a backup, or the directory has to be moved aside. */
+    WFS_E_STORE_DAMAGED = -1017,
+    /* PR #1 review (20th round): a directory is already sitting at the name the collector
+     * renames a trash entry to before it deletes it (`<entry>.deleting`), and it is not ours.
+     * Since the 15th round that rename and the row that records it commit in one transaction,
+     * so exactly one of the two names is ever this store's; both existing means somebody else
+     * made the second one. A world discarded from another volume keeps its trash in a
+     * user-visible `.wfs-trash` beside it and the name is predictable, so the stray is never
+     * removed and never renamed over: the entry is skipped, reported by `gc --status` with the
+     * directory named, and `discard --now` refuses with this code. */
+    WFS_E_TRASH_BLOCKED = -1018,
+    /* PR #1 review (25th round): the directory at this trash entry's path is not the tree the
+     * row was written for. A world's row carries the dev/ino of its tree from the moment it was
+     * published, and every rename on the way into and out of the trash is same-volume (the
+     * store's trash, or a `.wfs-trash` beside the world when the discard hit EXDEV), so the
+     * inode is the world's identity for as long as the entry exists. A name is not: the
+     * cross-volume entry lives at `<parent>/.wfs-trash/W<id>-<timestamp>` in the user's own
+     * directory, and during the retention period they can move the tree away and leave
+     * something else there. Nothing is renamed or removed until the identity matches -- the
+     * collector counts the entry and `gc --status` names the path, `discard --now` and
+     * `restore` refuse with this code. */
+    WFS_E_TRASH_FOREIGN = -1019,
+
+    /* P13, T2.6 (PR #1 review, 34th round): this store is being taken over from schema 2 to
+     * schema 3 and another process still has its database open. That process was admitted
+     * before the VERSION file was bumped, so the file cannot lock it out any more, and an M1
+     * binary among them would run M1's collector over M2 trash semantics. The upgrade is put
+     * back (the database returns to `metadata.db`, VERSION to 2) and refused;
+     * wfs_store_holders() names who to stop. */
+    WFS_E_STORE_BUSY = -1020
 };
+
+/* One process, other than this one, that has a store's database open (PR #1 review, 34th
+ * round). `exe` is that process's executable path, or "" when the kernel will not say. */
+typedef struct wfs_store_holder {
+    int64_t pid;
+    char exe[WFS_PATH_MAX];
+} wfs_store_holder;
+
+/* Who else has this store's database open right now, this process excluded -- `metadata3.db`
+ * when it is there, `metadata.db` otherwise (PR #1 review, 35th round). Fills up to `cap`
+ * entries and always writes the total through `count` (which may exceed `cap`). Returns 0, or a
+ * negative errno; -ENOSYS on a platform that cannot answer the question. Intended for the one
+ * caller that has just been refused with WFS_E_STORE_BUSY and has to say what to stop -- the
+ * answer is a moment in time, and a process that appears or exits after it is not in it. */
+int wfs_store_holders(const char *store_dir, wfs_store_holder *buf, size_t cap, size_t *count);
 
 /* Human-readable text for a negative errno or a WFS_E_* code. Never NULL. */
 const char *wfs_strerror(int rc);
@@ -134,7 +213,9 @@ typedef struct wfs_statfs_info {
 
 /* ---- store ---- */
 
-/* Opens (creating if needed) a store directory: VERSION, metadata.db, snapshots/, trash/. */
+/* Opens (creating if needed) a store directory: VERSION, metadata3.db, snapshots/, trash/.
+ * `metadata.db` is an empty directory in a schema-3 store: the name schema 2 kept the database
+ * under, left as something no sqlite3_open_v2() can open (PR #1 review, 35th round). */
 int wfs_store_open(const char *store_dir, wfs_store **out);
 void wfs_store_close(wfs_store *s);
 /* ~/Library/Application Support/World/fs (macOS) or $XDG_DATA_HOME/world/fs. */
@@ -155,6 +236,18 @@ typedef struct wfs_store_stat {
     uint64_t metadata_estimate_bytes;
     uint64_t pool_ready;    /* T1.5: pre-cloned worlds waiting to be handed out */
     uint64_t pool_entries;  /* sum of their entry counts */
+    /* T2.2 reconciliation, computed by one stat(2) per row: rows whose tree is not there any
+     * more. `gc --reconcile` is what turns them into DEAD rows. */
+    uint64_t snapshots_dangling;
+    uint64_t worlds_dangling;
+    /* PR #1 review (12th round): rows whose tree could not be *asked about*. stat(2) fails for
+     * reasons that are not absence -- EACCES on a parent, EIO, a volume that is not mounted,
+     * ENAMETOOLONG -- and a row whose path holds something that is not a directory is damaged
+     * rather than gone. Neither is dangling: `gc --reconcile` buries only what is proven
+     * absent, so these are reported separately and left registered. */
+    uint64_t snapshots_unreadable;
+    uint64_t worlds_unreadable;
+    uint64_t snapshots_trashed; /* T2.2: snapshots waiting in the trash */
 } wfs_store_stat;
 int wfs_store_status(wfs_store *s, wfs_store_stat *out);
 
@@ -175,6 +268,13 @@ typedef struct wfs_snapshot_rec {
     int state;                   /* wfs_state */
     int hard;                    /* 1 = per-entry UF_IMMUTABLE, 0 = gate directory (default) */
     uint32_t root_mode;          /* the source root's own mode, restored on the fork's clone */
+    int64_t trashed_at;          /* T2.2: unix seconds, non-zero once discarded */
+    /* T2.5, P9: the hardlink groups this snapshot recorded. hl_groups counts the groups whose
+     * names are all inside the tree -- those are rebuilt inside every clone of it, so link
+     * identity survives a fork. hl_external counts the names whose inode also has names
+     * outside the tree: those cannot be rebuilt and stay independent copies. */
+    uint64_t hl_groups;
+    uint64_t hl_external;
 } wfs_snapshot_rec;
 
 typedef struct wfs_snapshot_opts {
@@ -248,15 +348,22 @@ typedef struct wfs_fork_result {
     int from_pool;        /* 1 = a pre-cloned world was handed out (T1.5) */
     uint64_t pool_left;   /* ready entries left in that snapshot's pool afterwards */
     int64_t elapsed_us;   /* wall time inside the core, without process start */
+    uint64_t hardlinks;   /* T2.5: names relinked to their canonical file inside the clone.
+                           * 0 on a pool hit -- the entry was given its hardlinks back when it
+                           * was filled, so the hand-out stays O(1). */
 } wfs_fork_result;
 
-/* Fork: clone `from` (a snapshot or a live world) into target_path. Publish order (P8):
- * clone into <target>.wfs-tmp, unprotect, write the marker, rename, then commit the row.
+/* Fork: clone `from` (a snapshot or a live world) into target_path. Publish order (P8): clone
+ * into a temporary directory in the target's parent, unprotect, write the marker, rename, then
+ * commit the row. The temporary is `.wfs-fork-<pid>-<counter>-<16 hex>`, drawn until one is free
+ * and recorded on the CREATING row before the clone starts -- the parent directory belongs to
+ * the user, so nothing there is assumed to be ours and nothing pre-existing is ever removed.
+ * The publish rename is exclusive: something already at the target is EEXIST, never replaced.
  *
  * T1.5: when `from` is a snapshot and the pool holds a ready entry for it, that entry is the
  * clone -- already made, already given the source root's mode -- and the fork is reduced to
  * "write the marker, rename it into place, commit the row", which is O(1) and milliseconds.
- * The publish order is the same one, with the pool entry playing the part of <target>.wfs-tmp. */
+ * The publish order is the same one, with the pool entry playing the part of the temporary. */
 int wfs_world_create(wfs_store *s, wfs_ref from, const char *target_path, const wfs_fork_opts *opts,
                      wfs_id *out);
 /* The same, and says whether the pool served it. `res` may be NULL. */
@@ -300,7 +407,8 @@ typedef struct wfs_pool_stat {
     char snapshot_name[WFS_NAME_MAX];
     uint64_t ready;             /* entries that can be handed out right now */
     uint64_t building;          /* rows still being cloned (or left behind by a kill) */
-    uint64_t stale;             /* rows whose snapshot is gone or is a different one now */
+    uint64_t stale;             /* rows whose snapshot is gone or is a different one now, and
+                                 * rows a drain took out of the pool and could not remove */
     uint64_t entries;           /* entry count of one such world */
     int64_t oldest_at, newest_at;
 } wfs_pool_stat;
@@ -311,7 +419,11 @@ typedef struct wfs_pool_stat {
 int wfs_pool_fill(wfs_store *s, wfs_id snapshot, int target, uint64_t *made);
 /* One row per snapshot that has pool entries, ordered by snapshot id. */
 int wfs_pool_status(wfs_store *s, wfs_pool_stat *buf, size_t cap, size_t *count);
-/* Delete every entry of `snapshot` (0 = of every snapshot). *removed may be NULL. */
+/* Delete every entry of `snapshot` (0 = of every snapshot). *removed may be NULL, and counts the
+ * entries whose tree is proven gone and whose row went with it. An entry a fork claimed while
+ * this ran is left alone -- it is that fork's world now, not an entry -- and a tree that will not
+ * go stops the drain with that errno, its row kept in a state no claim can match and gc can
+ * retry (PR #1 review, 16th and 21st rounds). */
 int wfs_pool_drain(wfs_store *s, wfs_id snapshot, uint64_t *removed);
 /* Ready entries for `snapshot` right now (0 when the snapshot has none). */
 int wfs_pool_ready(wfs_store *s, wfs_id snapshot, uint64_t *out);
@@ -359,13 +471,70 @@ typedef struct wfs_identity {
     uint64_t dev, ino;
 } wfs_identity;
 
+/* T2.3: the store path recorded in <world_root>/.world, read without opening any store.
+ *
+ * This exists for the sandboxed FSKit appex. NSApplicationSupportDirectory resolves inside its
+ * container, so the extension's idea of "the default store" is
+ * ~/Library/Containers/world.forks.fs.extension/Data/Library/Application Support/World/fs while
+ * the CLI's is ~/Library/Application Support/World/fs -- and `mount -o` options do not reach an
+ * FSKit module on macOS 27. The marker file in the mount source root does reach it, because that
+ * root is exactly the resource the extension is handed, so the marker is where the store's
+ * location travels.
+ *
+ * Returns 0 and writes the path, WFS_E_NOT_A_WORLD when there is no marker, WFS_E_SCHEMA when it
+ * was written by a different schema, or -ENOENT when the marker carries no store path (every
+ * marker written before T2.3). */
+int wfs_marker_store_path(const char *world_root, char *buf, size_t cap);
+
+/* PR #1 review (17th round, P2): the same marker, asked about from the store's side.
+ *
+ * The extension opens the path the marker names and falls back to its container default only
+ * when it obtained no path at all (macos/fskit/WorldVolume.mm). So a marker whose store path is
+ * non-empty and is NOT this store's directory means a mount would open a different store from
+ * the one the command is talking to -- a store that has been moved since the world was forked,
+ * or a world copied out of somebody else's store. That is a refusal, not a note.
+ *
+ * `same_store` compares the marker's store id with this store's: the same store, wherever it
+ * now lives, or somebody else's (P1/P2). `same_path` is whether the recorded path resolves to
+ * this store's directory -- resolves, not is spelled the same, because that is the question the
+ * extension's open(2) will ask; a path that cannot be resolved at all is not this store.
+ * `has_path` is 0 for a marker written before T2.3, which carries no path and for which the
+ * extension's fallback is real.
+ *
+ * Returns 0 with `out` filled, or what marker_read says: WFS_E_NOT_A_WORLD, WFS_E_SCHEMA. */
+typedef struct wfs_marker_store {
+    int has_path;    /* the marker carries a store path at all */
+    int same_store;  /* its store id is this store's store id */
+    int same_path;   /* its store path resolves to this store's directory */
+    char path[WFS_PATH_MAX];   /* what it says, empty when has_path is 0 */
+} wfs_marker_store;
+int wfs_world_marker_store(wfs_store *s, const char *world_root, wfs_marker_store *out);
+
+/* The way out of the refusal above, when the store id still matches: the marker's store path is
+ * rewritten to where this store actually is, and nothing else in it changes -- same world id,
+ * same name, same origin snapshot, same created_at. P1/P2 decide who may: the world must be
+ * registered in THIS store (marker store id, row, and inode all agreeing), so a copy is
+ * WFS_E_UNREGISTERED and somebody else's world is WFS_E_FOREIGN_STORE, both of which are
+ * `adopt`'s business and not a refresh's. Takes the world lock (P12) like every other
+ * world-level operation, so it cannot run under a fork or a checkpoint of the same world, and
+ * the new marker is written beside the old one and renamed over it. */
+int wfs_world_marker_refresh(wfs_store *s, const char *world_root);
+
 /* P1/P2. On a registered-but-moved world the store row is updated to `path` before returning.
  * Returns WFS_E_NOT_A_WORLD, WFS_E_UNREGISTERED or WFS_E_FOREIGN_STORE as appropriate; the
  * report is filled in either way. */
 int wfs_world_verify_identity(wfs_store *s, const char *path, wfs_identity *out);
 /* verify W<n>: identity of the recorded path. */
 int wfs_world_verify(wfs_store *s, wfs_id id, wfs_identity *out);
-/* P2: take over an unregistered copy as a new world, rewriting its marker. */
+/* P2: take over an unregistered copy as a new world, rewriting its marker.
+ *
+ * The copy's marker names the snapshot the original was forked from, and the adopted world
+ * inherits it as its diff/verify baseline (P4/P10). So the adoption is refused, with
+ * WFS_E_SOURCE_GONE, when that snapshot is no longer ACTIVE -- discarded, being discarded, or
+ * gone from the store. The check runs inside the same BEGIN IMMEDIATE as the insert, which is
+ * the write lock `wfs_snapshot_discard` counts references under: either the new row is there to
+ * be counted, or the discard already won (PR #1 review, 6th round). A copy in that state can
+ * still be kept, as a plain directory: remove its `.world` marker and `world fs init` it. */
 int wfs_world_adopt(wfs_store *s, const char *path, const char *name, wfs_id *out);
 
 /* ---- diff (T1.3) --------------------------------------------------------------------------
@@ -437,7 +606,15 @@ enum {
     /* Try the FSEvents path even though the world is below WFS_DIFF_EVENTS_MIN_ENTRIES
      * (`diff --events`). It is still only a candidate source: every fallback below sends it
      * back to the full scan, silently and with the same answer. Ignored with WFS_DIFF_FULL. */
-    WFS_DIFF_EVENTS = 1 << 3
+    WFS_DIFF_EVENTS = 1 << 3,
+    /* Compare com.apple.provenance too (`diff --all-xattrs`). By default it is the one xattr
+     * left out: macOS 27 stamps it on every file a local process creates and will not let it
+     * be removed, so it is the kernel's note of which application made the file, not anything
+     * the workspace did -- and confirming that it matches costs two listxattr(2) plus two
+     * getxattr(2) on every otherwise-identical file. A file whose only xattr is provenance
+     * counts as having none at all, including for the EF_NO_XATTRS shortcut. Every other
+     * attribute, com.apple.quarantine included, is always compared. */
+    WFS_DIFF_ALL_XATTRS = 1 << 4
 };
 
 /* Why the full two-tree walk was used. */
@@ -464,6 +641,12 @@ typedef struct wfs_diff_stats {
     uint64_t compared;    /* paths stat'ed on both sides */
     uint64_t content_cmp; /* files whose bytes had to be read (size equal, mtime differs) */
     uint64_t bytes_read;
+    /* PR #1 review: entries whose extended attributes could not be read on one side
+     * (listxattr/getxattr failed with EACCES, EIO, ...). Such an entry is reported as 'T' --
+     * a failed read is never equality -- and counted here, so a caller can say the comparison
+     * was incomplete. A failure on the *snapshot* side is not a diff result at all: the whole
+     * call returns -EACCES/-EPERM instead. */
+    uint64_t xattr_errors;
     uint64_t events_id;   /* the cursor that was used */
     int full_scan;        /* 1 = both trees were walked */
     int fallback;         /* wfs_diff_fallback */
@@ -485,15 +668,485 @@ int wfs_path_check(wfs_store *s, const char *path, int for_target);
 
 typedef struct wfs_gc_report {
     uint64_t worlds_deleted;    /* trashed past the retention period */
-    uint64_t snapshots_deleted; /* half-built snapshots */
-    uint64_t tmp_removed;       /* stray *.wfs-tmp trees (P8) */
+    uint64_t snapshots_deleted; /* half-built snapshots, plus T2.2 trashed ones past retention */
+    uint64_t tmp_removed;       /* half-built trees (P8): the path a CREATING row recorded, plus
+                                 * *.wfs-tmp under <store>/snapshots and stale <store>/tmp files */
     uint64_t trash_orphans;     /* trash directories with no row */
     uint64_t pool_removed;      /* T1.5: pool entries of dead snapshots, half-built or orphaned */
-    uint64_t entries_freed;
+    uint64_t entries_freed;     /* T2.1: directory entries actually unlinked */
+    /* T2.2 reconciliation. The `*_dangling` counters are always filled in (detection is free:
+     * one stat per row); the `*_reconciled` ones only when WFS_GC_RECONCILE was asked for. */
+    uint64_t snapshots_dangling, worlds_dangling;
+    uint64_t snapshots_reconciled, worlds_reconciled;
+    /* PR #1 review (12th round): rows the scan could not reach a verdict about. "The tree is
+     * not there" used to be a bool over stat(2), so EACCES on a parent directory, an EIO, an
+     * unmounted volume or an ENAMETOOLONG all read as "gone" -- and --reconcile then marked the
+     * row DEAD, which neither `verify` nor `adopt` can undo: one transient error unregistered a
+     * live world for good. Only ENOENT/ENOTDIR is an absence now. Anything else (including a
+     * path that holds something which is not a directory: a damaged world, not a missing one)
+     * is counted here, left ACTIVE, and printed by `gc`/`gc --reconcile`. */
+    uint64_t snapshots_unreadable, worlds_unreadable;
+    /* T2.1: the batch limit was reached and trash entries are still waiting. A caller that can
+     * spawn a worker (the CLI does) should spawn one. */
+    int work_remains;
+    /* Trash entries this run could not delete at all (a tree with something undeletable in it,
+     * a transient EIO). They are still in the trash, `gc --status` still counts them, and no
+     * report with a non-zero count here may be read as "the trash is empty". The first few
+     * wakes after a failure set work_remains as well, so the worker chain comes back for them;
+     * after that the entry is left alone rather than spun on forever. */
+    uint64_t trash_failed;
+    /* PR #1 review (5th round): abandoned half-built trees this run could not remove. A fork's
+     * temporary lives in the user's own target directory, under a name drawn at random, so the
+     * CREATING row is the only record of it and it is deliberately never found by a suffix
+     * sweep. The row is therefore kept, CREATING and with its tmp_path intact, and the tree is
+     * counted here and by `gc --status` until some later wake can remove it. Same retry cap as
+     * a trash entry: the first few failures set work_remains, after that it is reported and left
+     * alone rather than spun on.
+     * PR #1 review (7th round): and the half-built snapshots, for the same reason. Their trees
+     * are <store>/snapshots/S<n> and S<n>.wfs-tmp, and only the second is ever found by a
+     * suffix sweep -- so an S<n> that would not go used to leak for ever, its row deleted along
+     * with the failure. That row is kept now too, and counted here. */
+    uint64_t tmp_failed;
+    /* PR #1 review (8th round): stale pre-clone entries under <store>/pool this run could not
+     * remove. Same rule as the two counters above and for the same reason: the removal used to
+     * be assumed to have worked and the pool row deleted with it, so a clone that would not go
+     * was left with nothing in the store that knew it was rubbish, no retry counter and no
+     * work_remains -- it leaked until somebody ran gc by hand. The row is kept while its tree
+     * is, counted here and by `gc --status`, and retried under the same cap. */
+    uint64_t pool_failed;
+    /* PR #1 review (27th/28th rounds): directories this run could not READ, which is not the
+     * same thing as a tree it could not remove. An opendir/readdir that fails with anything but
+     * ENOENT -- an EACCES on <store>/trash, on <store>/snapshots, on the pool root, an EIO on an
+     * S<n> -- used to be skipped in silence and the scan reported as complete, so a row-less
+     * tree left by a crashed discard, fork or filler was missed, nothing said so, and since
+     * wfs_gc_pending() is the same scan the worker chain stopped too. One count for all of the
+     * collector's directories (the 27th round had the pool's alone), because what it tells the
+     * reader is the same in every case: something below is not counted, and `gc --status` names
+     * the directory and the errno. Retried under the same cap as everything else -- the first
+     * few failures set work_remains, so the chain comes back for it. */
+    uint64_t dirs_unreadable;
+    /* PR #1 review (20th round): trash entries the collector would not even start on, because a
+     * directory it did not put there is sitting at the `<entry>.deleting` name it renames to.
+     * It used to remove that directory recursively first ("an interrupted attempt of ours"),
+     * which since the 15th round it cannot be: the rename and the row that records it commit
+     * together, so one of the two names exists at a time. The entry stays in the trash, the
+     * stray is not touched, and `gc --status` names it. Counted separately from trash_failed
+     * because the remedy is the operator's -- look at that directory and move it away -- not
+     * another wake of the collector. */
+    uint64_t trash_blocked;
+    /* PR #1 review (25th round): trash entries whose path holds a directory that is not the
+     * tree the row was written for -- the row's dir_dev/dir_ino do not match what is there.
+     * The collector renamed and then deleted whatever the row NAMED, and the cross-volume
+     * entry's name is the user's own to occupy, so this is the other half of the rule above: a
+     * name is not a title. Nothing is touched, the row stays TRASHED, and `gc --status` names
+     * the path. Same retry cap as trash_blocked, and for the same reason -- only the operator
+     * can clear it. */
+    uint64_t trash_foreign;
 } wfs_gc_report;
 
-/* retention_secs < 0 uses the default (7 days). */
+/* retention_secs < 0 uses the default (7 days). Synchronous and complete: every due trash entry
+ * is unlinked before this returns. `world fs gc --now`. */
 int wfs_gc(wfs_store *s, int64_t retention_secs, wfs_gc_report *out);
+
+/* ---- T2.1: incremental, background gc -------------------------------------------------------
+ *
+ * `discard` is O(1) by construction -- it renames a world into <store>/trash and nothing more --
+ * but the physical deletion behind it is the most expensive thing this system does: measured,
+ * 1000 worlds of 10k entries are 10.4M unlink(2) calls, ~50 us each, 525 s in total, which is
+ * 4.6x what creating them cost (docs/M1_RESULTS.md §3). That work must not sit on a command's
+ * critical path and must not fight the foreground for the disk (P16).
+ *
+ * So: the trash is drained by a detached worker (`world fs gc --worker`, spawned exactly the way
+ * `fork` spawns a pool filler) that holds a non-blocking store-level flock on
+ * <store>/locks/gc.lock, so at most one worker per store ever runs. It works in bounded batches
+ * -- at most `max_entries` trash entries or `max_secs` seconds per wake -- writes its progress
+ * into the lock file, logs to <store>/logs/gc.log, and exits. Anything that creates work
+ * (`discard`, `gc`, `fork`) spawns one if there is work and nobody is on it.
+ *
+ * Crash safety: before a single unlink, the trash entry is renamed to <name>.deleting. A worker
+ * killed mid-tree therefore leaves a tree that is visibly half-gone rather than one that looks
+ * restorable, wfs_world_restore() refuses it with WFS_E_TRASH_DELETING, and the next wake
+ * finishes it -- *.deleting trees are collected first, before and regardless of retention.
+ */
+
+enum {
+    WFS_GC_RECONCILE = 1 << 0, /* T2.2: mark dangling snapshot/world rows DEAD, not just report */
+    WFS_GC_BACKGROUND = 1 << 1,/* take <store>/locks/gc.lock; WFS_E_GC_BUSY when another has it */
+    /* Do the cheap half only and leave the trash to the worker. This is what plain `world fs gc`
+     * asks for: the half-built trees, the stale profiles, the dead pool entries and the
+     * reconciliation report are all a handful of syscalls, while the trash is minutes. */
+    WFS_GC_NO_TRASH = 1 << 2
+};
+
+typedef struct wfs_gc_opts {
+    int64_t retention_secs;  /* < 0 = the default, 7 days */
+    uint64_t max_entries;    /* trash entries per wake; 0 = no limit */
+    int64_t max_secs;        /* wall seconds per wake; 0 = no limit */
+    int flags;               /* WFS_GC_* */
+    int threads;             /* unlink workers; 0 = 4, the measured APFS sweet spot */
+} wfs_gc_opts;
+
+/* The one implementation; wfs_gc() is this with no limits and no flags. opts may be NULL. */
+int wfs_gc_ex(wfs_store *s, const wfs_gc_opts *opts, wfs_gc_report *out);
+
+typedef struct wfs_trash_stat {
+    uint64_t entries;          /* directories sitting in <store>/trash right now */
+    uint64_t deleting;         /* of those, ones already renamed *.deleting */
+    uint64_t due;              /* of those, ones past the retention period */
+    uint64_t worlds, snapshots;/* trashed rows, by kind */
+    uint64_t tree_entries;     /* recorded entry counts of what is in there */
+    /* Physical bytes are an estimate for the same reason `wfs_store_status` estimates them:
+     * du(1) counts cloned blocks that are shared with other worlds, df(1) only moves when the
+     * last reference goes. This is tree_entries x the measured 308 B/entry clone metadata cost,
+     * alongside the volume's real df numbers so an operator can see both. */
+    uint64_t bytes_estimate;
+    uint64_t volume_free_bytes, volume_total_bytes;
+    /* PR #1 review (5th round): abandoned fork trees whose producer is gone and which are still
+     * on disk in the user's directory, named only by their CREATING row. Not trash entries --
+     * they are outside the store -- but the same thing from an operator's point of view: space
+     * that is waiting for a collector. PR #1 review (7th round): half-built snapshot trees a
+     * collection could not remove are counted here as well; their CREATING row is likewise the
+     * only thing that names them. */
+    uint64_t creating_stranded;
+    /* PR #1 review (6th round): stale pre-clone pool entries still on disk -- a snapshot that is
+     * gone or is a different snapshot now, or a filler that died. Also not trash entries, and
+     * also waiting for the collector: removing one is a whole tree, so a wake that runs out of
+     * time leaves the rest of them for its successor. */
+    uint64_t pool_stranded;
+    /* PR #1 review (27th/28th/29th rounds): the directories the counts above are made from that
+     * could not be read -- <store>/trash, <store>/snapshots, <store>/pool and its S<n>s, the
+     * <store>/tmp sweep (that last one from the 29th round: the report scanned the first three
+     * only, so the one directory whose failure `gc` could print was the one `gc --status` could
+     * not). It is what keeps every "0 waiting" above honest: the store is clean
+     * only when this is 0 too, and a status that could not look into a directory says so
+     * instead of reporting an empty one. dirs_unreadable_path is the first such directory and
+     * dirs_unreadable_errno the errno that stopped it (both empty/0 when the count is 0),
+     * because only whoever owns that directory can do anything about it. */
+    uint64_t dirs_unreadable;
+    char dirs_unreadable_path[WFS_PATH_MAX];
+    int dirs_unreadable_errno;
+    /* PR #1 review (20th round): due trash entries the collector cannot start on, because a
+     * directory nothing in this store named is sitting at the `<entry>.deleting` name it has to
+     * rename to. blocked_path is the first such directory (empty when trash_blocked is 0), so
+     * an operator is told which one to look at rather than only that something is stuck. */
+    uint64_t trash_blocked;
+    char blocked_path[WFS_PATH_MAX];
+    /* PR #1 review (25th round): due trash entries whose path is not the tree the row was
+     * written for (dir_dev/dir_ino do not match what is on disk). foreign_path is the first
+     * such path -- and it is the ENTRY's own path, not a sibling: what has to be looked at is
+     * the directory standing where the world's tree used to be, which for a world discarded
+     * across volumes is in the user's own `.wfs-trash`. Counted apart from trash_blocked
+     * because the two say different things: "something is on the name I rename to" and "this
+     * is not my tree". */
+    uint64_t trash_foreign;
+    char foreign_path[WFS_PATH_MAX];
+    /* The worker, from <store>/locks/gc.lock. pid is 0 when nobody is running. */
+    int64_t worker_pid, worker_started_at;
+    uint64_t worker_done, worker_remaining; /* trash entries finished / left, as it last wrote */
+} wfs_trash_stat;
+
+/* `world fs gc --status`. Never blocks and never spawns anything. */
+int wfs_gc_status(wfs_store *s, int64_t retention_secs, wfs_trash_stat *out);
+
+/* PR #1 review (20th round): the directory that is in the way of THIS row's collection, for a
+ * caller that has just been answered WFS_E_TRASH_BLOCKED and has to say which one it is. Fills
+ * `buf` with `<trash_path>.deleting` and returns 0 when that directory is there and the entry is
+ * still at its own name; -ENOENT when nothing is in the way. Two lstat(2)s and one row read. */
+int wfs_trash_blocked_path(wfs_store *s, wfs_id id, int is_snapshot, char *buf, size_t cap);
+
+/* PR #1 review (25th round): the path this row's trash entry is at, for a caller that has just
+ * been answered WFS_E_TRASH_FOREIGN and has to say which directory it refused to touch. It is
+ * the row's trash_path, followed to the `.deleting` name when that is where the tree went.
+ * Returns 0 and writes the path, or -ENOENT when the row names nothing. One row read. */
+int wfs_trash_entry_path(wfs_store *s, wfs_id id, int is_snapshot, char *buf, size_t cap);
+
+/* The same question reduced to what a command needs before deciding to spawn a worker: is there
+ * due work, and is somebody already on it? Two indexed counts and one readdir that stops at the
+ * first *.deleting name -- wfs_gc_status() classifies every trash directory against every trashed
+ * row, which is quadratic in the size of the trash and measurably not free on `discard` once a
+ * thousand worlds are in there. Returns 1 when there is work, 0 when there is not.
+ * `worker_running` may be NULL.
+ *
+ * PR #1 review (33rd round): a scan that could not be read answers 1 as well. There is no error
+ * channel in a bool, so the failure takes the side that throws nothing away -- a collector that
+ * starts and reports the errno, rather than work nobody is told about and nothing comes back
+ * for. */
+int wfs_gc_pending(wfs_store *s, int64_t retention_secs, int *worker_running);
+
+/* ---- T2.2: discarding a snapshot ------------------------------------------------------------
+ *
+ * A snapshot is the baseline `diff` and `verify` compare against, so it is never taken away from
+ * a world that still needs it: an ACTIVE world whose snapshot_id is this one makes the discard a
+ * WFS_E_SNAPSHOT_IN_USE refusal. `force` drains the snapshot's pool entries (they are only
+ * pre-made clones, nothing is lost) but still refuses while ACTIVE worlds remain -- never orphan
+ * a world's source.
+ *
+ * A world that is still being forked counts too. The reference check and the ACTIVE -> TRASHED
+ * transition run inside one BEGIN IMMEDIATE, which is the same write lock a pool claim and a
+ * world row insert take, and a fork commits its CREATING world row together with its pool claim
+ * (or before it starts cloning). So a fork that is half-way through is either counted here and
+ * the discard is refused, or it finds the snapshot TRASHED and fails instead: there is no order
+ * in which a world gets published with its baseline already in the trash.
+ *
+ * TRASHED worlds are not a reason to refuse; they are already on their way out. Restoring one
+ * afterwards is what fails, with WFS_E_SOURCE_GONE, because bringing a world back to life
+ * without a baseline would produce a world that cannot be diffed or verified.
+ *
+ * The discard itself is P4, the same path a world takes: <store>/snapshots/S<n> is renamed into
+ * <store>/trash, the row becomes TRASHED, and the background collector unlinks it once the
+ * retention period is up -- reopening the gate directory (0700) on its way in, since a 0000 root
+ * cannot even be listed.
+ *
+ * `immediate` is `--now`, and means the same thing it means for a world: do not wait for the
+ * collector, unlink the tree before returning and leave the row DEAD. It is still the crash-safe
+ * two-step (rename to *.deleting, then unlink), so an interrupted --now leaves something the
+ * next collector finishes rather than something that looks restorable. On a snapshot that is
+ * already in the trash it is the whole of the operation -- the deletion is simply brought
+ * forward -- and only without it is an already-trashed snapshot -EALREADY. */
+int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int force);
+
+/* ---- test seam --------------------------------------------------------------------------------
+ *
+ * core_test drives two interleavings that cannot be produced from outside the library. The first
+ * is the middle of a pool-backed fork, after the claim transaction has committed the fork's
+ * CREATING world row and before the marker/rename/ACTIVE tail. The second is a fork dying in the
+ * window the temp path exists for: the clone is built and recorded on the CREATING row, the
+ * publish rename has not happened. A non-zero return from wfs_test_before_fork_publish is
+ * returned straight out of wfs_world_create() with nothing unwound -- row and tree stay, exactly
+ * as a killed process leaves them. All four are NULL unless a test sets them and nothing in the
+ * library ever assigns them. */
+extern void (*wfs_test_after_pool_claim)(void *ctx, wfs_id world);
+extern void *wfs_test_after_pool_claim_ctx;
+extern int (*wfs_test_before_fork_publish)(void *ctx, wfs_id world, const char *tmp_path);
+extern void *wfs_test_before_fork_publish_ctx;
+
+/* And the third (PR #1 review, 16th round): the pool hand-out's unwind, at the instant the
+ * claimed entry is out of the pool and the hand-out has already failed -- after the tree has
+ * been put back under its pool name and before the transaction that returns it. What a test
+ * does in there is run a whole `discard S<n>`, because that is the one instant at which the
+ * fork's own CREATING world row is the snapshot's only reference. NULL unless a test sets it,
+ * and nothing in the library ever assigns it. */
+extern void (*wfs_test_in_pool_unwind)(void *ctx);
+extern void *wfs_test_in_pool_unwind_ctx;
+
+/* And the fourth (PR #1 review, 18th round): the instant after a pool hand-out's publish rename
+ * and before the row that owns the tree is committed -- the entry's clone is at the user's --to
+ * with a `.world` marker in it and nothing in the database points at it there yet. What a test
+ * does in there is move the tree away, because that is the one way to make the unwind's own
+ * rollback rename fail. NULL unless a test sets it, and nothing in the library ever assigns it. */
+extern void (*wfs_test_after_pool_publish)(void *ctx, wfs_id world, const char *target);
+extern void *wfs_test_after_pool_publish_ctx;
+
+/* And the fifth (PR #1 review, 23rd round): the instant inside a fork between the clone and the
+ * hardlink replay onto it -- the tree is built, unprotected and recorded on the CREATING row,
+ * and not one link(2) has been made yet. What a test does in there is make a directory of the
+ * clone unreadable, because that is the one way to produce a member lookup that fails without
+ * the member being absent, which is exactly what the replay must not mistake for absence.
+ * Called with the world id and the temp tree's path. NULL unless a test sets it, and nothing in
+ * the library ever assigns it. */
+extern void (*wfs_test_before_hl_replay)(void *ctx, wfs_id world, const char *tmp_path);
+extern void *wfs_test_before_hl_replay_ctx;
+
+/* The pid a CREATING row records as the process building it. 0, its value in every real run,
+ * means getpid(). A test sets it to a pid that is not running to produce the one state a single
+ * process cannot otherwise reach: a half-built tree whose producer is gone. */
+extern int64_t wfs_test_fork_owner_pid;
+
+/* The window a snapshot or checkpoint has between its walk of the SOURCE and the clone of it
+ * (PR #1 review, 5th round): the source is a live directory, and what a test has to be able to
+ * do there is change it. Called with the resolved source path, once, immediately before
+ * clonefile. NULL unless a test sets it. */
+extern void (*wfs_test_before_snapshot_clone)(void *ctx, const char *src_dir);
+extern void *wfs_test_before_snapshot_clone_ctx;
+
+/* And the discard's own two halves (PR #1 review, 5th round). `phase` is 0 just after the row
+ * has been committed in WFS_ST_TRASHING and before the tree is renamed, 1 just after the rename
+ * and before the commit that makes the row TRASHED. A non-zero return is returned straight out
+ * of wfs_world_discard()/wfs_snapshot_discard() with nothing unwound -- row and tree stay
+ * exactly as a kill -9 there leaves them, which is the state the recovery has to resolve.
+ * NULL unless a test sets it; nothing in the library ever assigns it.
+ *
+ * PR #1 review (7th round): phases 2 and 3 are wfs_world_restore()'s own two halves, the same
+ * protocol run backwards -- 2 just after the row has been committed in WFS_ST_TRASHING with the
+ * tree still in the trash, 3 just after the rename home and before the commit that makes the row
+ * ACTIVE. `trash_path` is the name the tree has in the trash. Returning 0 from phase 2 is what
+ * lets a test run a whole `wfs_snapshot_discard()` inside the restore's window.
+ *
+ * PR #1 review (9th round): phase 4 is `--now`'s own window -- inside the helper that deletes a
+ * trash entry here and now, after the tree has been followed to whatever name it has and before
+ * it is marked `.deleting`. `trash_path` is the name that was found. A whole
+ * `wfs_world_restore()` run in there is the race the predicated row writes exist for. */
+extern int (*wfs_test_trash_crash)(void *ctx, int phase, int is_snapshot, wfs_id id,
+                                   const char *trash_path);
+extern void *wfs_test_trash_crash_ctx;
+
+/* And the trash collector's own window (PR #1 review, 8th round): called once per queued entry,
+ * between the scan that queued it and the rename to `<name>.deleting` that starts deleting it.
+ * `row` is 0 for a directory in the trash that no row claims. What a test does in there is win
+ * the race the collector has to survive -- restore the world it is holding -- and what has to
+ * happen next is that the collector notices and leaves the entry alone. NULL unless a test sets
+ * it; nothing in the library ever assigns it.
+ *
+ * PR #1 review (15th round): it sits one step later than it used to -- after the cheap re-check
+ * of the row and immediately before the transaction that claims the entry by renaming it. That
+ * is the window that had to be closed: a restore which commits its row in TRASHING in there and
+ * has not yet renamed the tree home leaves the tree exactly where the collector expects it. */
+extern void (*wfs_test_before_trash_delete)(void *ctx, int is_snapshot, wfs_id row,
+                                            const char *path);
+extern void *wfs_test_before_trash_delete_ctx;
+
+/* And the window inside the claim itself (PR #1 review, 26th round): called after the entry's
+ * identity has been checked against the row and before the rename to `<name>.deleting` that
+ * takes it -- the collector's, `--now`'s and `restore`'s, all three. The SQLite transaction
+ * around the claim serialises this core's own writers; it does not serialise the owner of the
+ * directory the entry sits in, who can move the genuine tree away and leave another one at the
+ * name in exactly this window. What a test does in there is precisely that, and what has to
+ * happen next is that nothing of the stranger's is renamed, deleted or registered. NULL unless
+ * a test sets it; nothing in the library ever assigns it. */
+extern void (*wfs_test_between_trash_claim)(void *ctx, int is_snapshot, wfs_id row,
+                                            const char *path);
+extern void *wfs_test_between_trash_claim_ctx;
+
+/* And the window the collector's own *scan* has (PR #1 review, 9th round): called once per
+ * trash scan -- wfs_gc(), wfs_gc_status(), wfs_gc_pending() -- after the store mutex has been
+ * dropped and the trash paths the rows claim have been read, and before the readdir of
+ * <store>/trash that decides which directories nothing claims. What a test does in there is a
+ * whole `discard` on a second handle, which is the one thing that turns a claimed tree into an
+ * apparent orphan. NULL unless a test sets it; nothing in the library ever assigns it. */
+extern void (*wfs_test_before_trash_orphans)(void *ctx);
+extern void *wfs_test_before_trash_orphans_ctx;
+
+/* And the pool collector's equivalent (PR #1 review, 9th round): called once per pool_collect(),
+ * after the pool rows have been read and before the trees they doom are removed and the
+ * directories nothing claims are swept. What a test does in there is fill the pool, or fork from
+ * it, on a second handle -- both of which produce a tree the row snapshot has never heard of.
+ * NULL unless a test sets it; nothing in the library ever assigns it. */
+extern void (*wfs_test_before_pool_sweep)(void *ctx);
+extern void *wfs_test_before_pool_sweep_ctx;
+
+/* And the pool filler's own window (PR #1 review, 15th round): called once per entry, after the
+ * snapshot row has been read and before the transaction that inserts the entry's CREATING pool
+ * row. What a test does in there is a `discard S<n>` on a second handle -- which, until the
+ * insert re-read the snapshot under its own write lock, counted no pool rows at all and let the
+ * filler publish a READY clone of a snapshot on its way to the trash. NULL unless a test sets
+ * it; nothing in the library ever assigns it. */
+extern void (*wfs_test_before_pool_insert)(void *ctx);
+extern void *wfs_test_before_pool_insert_ctx;
+
+/* And the drain's own window (PR #1 review, 21st round): called twice per pool row, with phase 0
+ * before the transaction that moves the row out of the hand-out set and phase 1 after that
+ * commit, immediately before the tree the row names is removed. What a test does in there is a
+ * pool-backed fork on a second handle -- which, until the row had a state a claim cannot match,
+ * took the entry the drain was already unlinking. NULL unless a test sets it; nothing in the
+ * library ever assigns it. */
+extern void (*wfs_test_in_pool_drain)(void *ctx, int phase);
+extern void *wfs_test_in_pool_drain_ctx;
+
+/* And reconciliation's window (PR #1 review, 9th round): called once per gc, between the scan
+ * that decides which ACTIVE rows have no tree at their recorded path and the updates that bury
+ * them. What a test does in there is `world fs verify <the new path>` on a world that was merely
+ * moved, which relocates the row by inode. NULL unless a test sets it; nothing in the library
+ * ever assigns it. */
+extern void (*wfs_test_before_reconcile)(void *ctx);
+extern void *wfs_test_before_reconcile_ctx;
+
+/* And the thing no test can provoke on a healthy machine: a pthread_create that fails for one
+ * worker slot and succeeds for a later one. A bit set here refuses that slot (slots 0..31); 0,
+ * the value it has everywhere else, means every slot is started normally. */
+extern unsigned wfs_test_thread_fail_mask;
+/* A unit test of that starter: start `want` workers with `fail_mask` refused, join them, and
+ * report how many started and how many joined. 0 = the two agree with the number that ran. */
+int wfs_test_threads_start(int want, unsigned fail_mask, int *started, int *joined);
+
+/* And a hardlink replay the file system refused (PR #1 review, 4th round). A link(2) that comes
+ * back EIO is not something a test can arrange on a developer's disk, and what has to be pinned
+ * down is what happens next: the snapshot, fork or pool entry being built must fail and take its
+ * half-built tree and its row with it, rather than publish a tree whose manifest advertises
+ * hardlink groups it does not have. Set to a negative errno to make every non-empty replay
+ * report it; 0 in every run that is not core_test. */
+extern int wfs_test_hardlink_restore_err;
+
+/* And the legacy 2 -> 3 upgrade's own window (PR #1 review, 31st round): the instant inside
+ * version_upgrade(), after this process has written its private VERSION temporary and before it
+ * renames that temporary over VERSION. What a test does in there is run a whole wfs_store_open()
+ * on the same store from a second handle -- which migrates, upgrades and renames first -- because
+ * that is the interleaving two processes reach on the first open of a schema-2 store, and the
+ * open whose rename lands second must still succeed. Called with the store directory. NULL
+ * unless a test sets it; nothing in the library ever assigns it. */
+extern void (*wfs_test_before_version_rename)(void *ctx, const char *dir);
+extern void *wfs_test_before_version_rename_ctx;
+
+/* The other end of that upgrade (PR #1 review, 32nd round, P1). The VERSION file is bumped to 3
+ * BEFORE the database migration now, so that the instant anything migrated exists in the store,
+ * every older binary has already been locked out of it by the one file it checks first. This
+ * seam fires in the window between the two: from inside it, VERSION reads 3 and `user_version`
+ * still reads 2xx. Called with the store directory. NULL unless a test sets it; nothing in the
+ * library ever assigns it. */
+extern void (*wfs_test_after_version_bump)(void *ctx, const char *dir);
+extern void *wfs_test_after_version_bump_ctx;
+
+/* And the gap the 35th round's P1 is about: the database has been moved to `metadata3.db`, the
+ * stub directory is at `metadata.db`, the holder gate has passed, and nothing has been migrated
+ * yet. This is the window an M1 process that paused before its own sqlite3_open_v2() would
+ * resume into; from inside it, that open has to fail. Called with the store directory. NULL
+ * unless a test sets it; nothing in the library ever assigns it. */
+extern void (*wfs_test_after_db_move)(void *ctx, const char *dir);
+extern void *wfs_test_after_db_move_ctx;
+
+/* And the three steps that move itself is made of (PR #1 review, 36th round, P1). The database
+ * is linked under its new name, the stub directory and the old name are EXCHANGED, and the
+ * extra link is dropped -- so that the name an M1 binary opens is never absent, not for an
+ * instant, and an admitted M1 process can never create a fresh empty database at it. `phase` is
+ * 1 after the link, 2 after the exchange, 3 after the unlink. From phase 1 an M1-shaped open of
+ * `<store>/metadata.db` gets the REAL database (one of its two names) and is refused by the
+ * holder gate; from phase 2 on it gets SQLITE_CANTOPEN. Called with the store directory. NULL
+ * unless a test sets it; nothing in the library ever assigns it. */
+extern void (*wfs_test_between_db_steps)(void *ctx, const char *dir, int phase);
+extern void *wfs_test_between_db_steps_ctx;
+
+/* And the same window on the way BACK (PR #1 review, 37th round, P1). The revert the holder
+ * gate makes goes through the same exchange in reverse, and between the exchange and the unlink
+ * of `metadata3.db` the database is a regular file under BOTH names -- which is, to the letter,
+ * the shape an interrupted forward move leaves, and which another M2 process opening the store
+ * in that instant used to resume FORWARD until the two of them had unlinked every name the
+ * inode had. `phase` is 1 after the exchange back and before `metadata3.db` goes, 2 after it
+ * has gone and before VERSION is put back to 2. Called with the store directory. NULL unless a
+ * test sets it; nothing in the library ever assigns it. */
+extern void (*wfs_test_in_revert)(void *ctx, const char *dir, int phase);
+extern void *wfs_test_in_revert_ctx;
+
+/* And the far side of the lock those two directions now take (PR #1 review, 37th round, P1).
+ * This fires in the process that WAITED, the instant it has `<store>/upgrade.lock` and before
+ * it has read a single byte of the store under it -- so what a test reads from inside it is
+ * exactly what the protocol it waited for left on disk. Called with the store directory. NULL
+ * unless a test sets it; nothing in the library ever assigns it. */
+extern void (*wfs_test_in_upgrade_lock)(void *ctx, const char *dir);
+extern void *wfs_test_in_upgrade_lock_ctx;
+
+/* One step(2) of one query, failed on demand (PR #1 review, 32nd round, P2). Every count and
+ * every lookup that decides a destructive step now tells SQLITE_DONE from an error, and the only
+ * way to test that from outside is to make a step fail. Set this to a substring of the SQL of
+ * the statement to hit: the next `row()` on a prepared statement whose SQL contains it reports
+ * SQLITE_IOERR instead of stepping, once, and clears this back to NULL. NULL in every run that
+ * is not a test; nothing in the library ever assigns it a value. */
+extern const char *wfs_test_stmt_fail_sql;
+
+/* One BEGIN IMMEDIATE, failed on demand (PR #1 review, 34th round, P1). Every mutation in this
+ * core is "the check and the change in one write transaction" (P12); what that rests on is a
+ * BEGIN IMMEDIATE that succeeded, and the only way to test the other case from outside is to
+ * make one fail. Set this to the SQLite result code the next `wfs::Txn` is to report:
+ * SQLITE_BUSY for a busy timeout that ran out, SQLITE_IOERR for a write error -- and that Txn
+ * starts no transaction, reports the code, and clears this back to 0. 0 in every run that is
+ * not a test; nothing in the library ever assigns it a value. */
+extern int wfs_test_txn_fail_once;
+
+/* And the one xattr rule a test cannot drive from outside (PR #1 review, 9th round). The default
+ * diff leaves com.apple.provenance out of the comparison, and provenance is precisely the name a
+ * test cannot make differ: the kernel stamps it on every file this process creates, with the
+ * same value every time, and setxattr(2)/removexattr(2) on it silently do nothing. Set this to
+ * an ordinary xattr name and the diff's ignore rule treats that name exactly as it treats
+ * provenance. NULL in every run that is not diff_test. */
+extern const char *wfs_test_xattr_ignore;
 
 #ifdef __cplusplus
 }

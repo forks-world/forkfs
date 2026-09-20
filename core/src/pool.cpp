@@ -8,6 +8,7 @@
 #include "pool.h"
 
 #include "db.h"
+#include "hardlinks.h"
 #include "snapshot_access.h"
 
 #include <dirent.h>
@@ -16,6 +17,24 @@
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+// The pool collector's own scan window (PR #1 review, 9th round): between the row snapshot
+// pool_scan takes and the removals that act on it. A filler or a fork that lands in there
+// produces a tree that snapshot has never heard of. Nothing in the library ever assigns these.
+extern "C" void (*wfs_test_before_pool_sweep)(void *ctx) = nullptr;
+extern "C" void *wfs_test_before_pool_sweep_ctx = nullptr;
+
+// And the filler's own window (PR #1 review, 15th round): between the snapshot row wfs_pool_fill
+// reads once and the transaction that inserts an entry's CREATING pool row. Nothing in the
+// library ever assigns these either.
+extern "C" void (*wfs_test_before_pool_insert)(void *ctx) = nullptr;
+extern "C" void *wfs_test_before_pool_insert_ctx = nullptr;
+
+// And the drain's own window (PR #1 review, 21st round): phase 0 is before the row leaves the
+// hand-out set, phase 1 is after that commit and before the tree it names is removed. Nothing in
+// the library ever assigns these either.
+extern "C" void (*wfs_test_in_pool_drain)(void *ctx, int phase) = nullptr;
+extern "C" void *wfs_test_in_pool_drain_ctx = nullptr;
 
 namespace wfs {
 
@@ -37,6 +56,11 @@ bool exists(const char *p) {
     struct stat st;
     return ::lstat(p, &st) == 0;
 }
+
+// PR #1 review (12th round), the same rule world.cpp states: presence is assumed unless absence
+// is proven. exists() reads an EACCES, an EIO or an unmounted volume as "not there", and every
+// verdict below that deletes a row or stops keeping track of a tree used to be made on it.
+bool proven_gone(const char *p) { return fs_gone(fs_probe(p)); }
 
 String pool_root(wfs_store *s) { return joinp(s->dir.c_str(), "pool"); }
 
@@ -79,14 +103,19 @@ struct SnapInfo {
     int hard = 0;
     uint32_t root_mode = 0755;
     String name;
+    uint64_t hl_groups = 0;   // T2.5: P9 groups to replay on the entry, 0 = nothing to do
 };
 
 int snap_info(wfs_store *s, wfs_id id, SnapInfo &out) {
     Guard g(s->mu);
-    Stmt q(s->db, "SELECT path, created_at, entries, state, hard, root_mode, name FROM snapshots WHERE id=?");
+    Stmt q(s->db,
+           "SELECT path, created_at, entries, state, hard, root_mode, name, hl_groups"
+           " FROM snapshots WHERE id=?");
     if (!q.ok()) return -EIO;
     q.i64(1, (int64_t)id);
-    if (!q.row()) return -ENOENT;
+    // PR #1 review (32nd round, P2): -ENOENT is "there is no such snapshot", which every caller
+    // acts on. A read that failed says nothing of the sort.
+    if (!q.row()) return q.done() ? -ENOENT : -EIO;
     out.root.assign(q.col_text(0));
     out.created_at = q.col_i64(1);
     out.entries = (uint64_t)q.col_i64(2);
@@ -95,6 +124,7 @@ int snap_info(wfs_store *s, wfs_id id, SnapInfo &out) {
     uint32_t m = (uint32_t)q.col_i64(5);
     out.root_mode = m ? m : 0755;
     out.name.assign(q.col_text(6));
+    out.hl_groups = (uint64_t)q.col_i64(7);
     return 0;
 }
 
@@ -130,11 +160,16 @@ struct PoolLock {
 int ready_count(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, uint64_t *out) {
     *out = 0;
     Guard g(s->mu);
+    // state=1 (POOL_READY), the same set pool_claim() hands out of. So a row a drain has taken
+    // over is not "ready" for `fork`'s report or for `wfs_pool_ready`, and it does not hold
+    // `pool fill` back from topping the pool up either: the fill would be counting a tree that
+    // is on its way out (PR #1 review, 21st round).
     Stmt q(s->db, "SELECT COUNT(*) FROM pool WHERE snapshot_id=? AND snap_created_at=? AND state=1");
     if (!q.ok()) return -EIO;
     q.i64(1, (int64_t)snapshot);
     q.i64(2, snap_created_at);
-    if (q.row()) *out = (uint64_t)q.col_i64(0);
+    if (!q.row()) return -EIO;   // 32nd round, P2: COUNT(*) has a row unless the read failed
+    *out = (uint64_t)q.col_i64(0);
     return 0;
 }
 
@@ -150,12 +185,38 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
     int64_t created = now_sec();
 
     wfs_id row = 0;
+    if (wfs_test_before_pool_insert) wfs_test_before_pool_insert(wfs_test_before_pool_insert_ctx);
     {
         Guard g(s->mu);
         Txn t(s->db);
+        if (!t.ok()) return t.err();   // 34th round, P1
+        // PR #1 review (15th round, P2): the snapshot, re-read here rather than carried in from
+        // the single read at the top of wfs_pool_fill. A `discard S<n>` in between counts its
+        // references under BEGIN IMMEDIATE, sees no pool row for an entry that does not exist
+        // yet, and commits its row in WFS_ST_TRASHING -- and the filler, whose source tree has
+        // not moved yet, cloned it and published a READY entry for a snapshot on its way to the
+        // trash. pool_collect() buries such an entry a wake later, but a fork in between takes
+        // it as a live baseline.
+        //
+        // This transaction is BEGIN IMMEDIATE too, so the two serialise: either the discard is
+        // first and this read sees a snapshot that is not ACTIVE, or this insert is first and
+        // the discard counts the row it just wrote (a refusal without --force, a drain with it).
+        // created_at is part of the question because it is the identity the entry carries:
+        // snapshot_id plus snap_created_at is what a fork claims an entry by.
+        {
+            Stmt sq(s->db, "SELECT state, created_at FROM snapshots WHERE id=?");
+            if (!sq.ok()) return -EIO;
+            sq.i64(1, (int64_t)snapshot);
+            if (!sq.row()) return sq.done() ? -ESTALE : -EIO;   // 32nd round, P2
+            if (sq.col_i64(0) != WFS_ST_ACTIVE || sq.col_i64(1) != si.created_at) return -ESTALE;
+        }
+        // PR #1 review (3rd round): who is filling this entry, so gc can tell a filler that died
+        // from one that is still cloning a 50 000-entry tree.
+        int64_t opid = (int64_t)::getpid();
+        int64_t ostart = fs_pid_start_sec(opid);
         Stmt ins(s->db,
-                 "INSERT INTO pool(snapshot_id, snap_created_at, uuid, path, entries, created_at, state)"
-                 " VALUES(?,?,?,?,?,?,0)");
+                 "INSERT INTO pool(snapshot_id, snap_created_at, uuid, path, entries, created_at,"
+                 " owner_pid, owner_start, state) VALUES(?,?,?,?,?,?,?,?,0)");
         if (!ins.ok()) return -EIO;
         ins.i64(1, (int64_t)snapshot);
         ins.i64(2, si.created_at);
@@ -163,9 +224,13 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
         ins.text(4, path.c_str());
         ins.i64(5, (int64_t)si.entries);
         ins.i64(6, created);
+        ins.i64(7, opid);
+        ins.i64(8, ostart);
         if (ins.step() != SQLITE_DONE) return -EIO;
         row = (wfs_id)sqlite3_last_insert_rowid(s->db);
-        t.commit();
+        // Nothing is cloned until this row is on disk: it is the only name the entry's tree
+        // will have (34th round, P1).
+        if (int crc = t.commit()) return crc;
     }
 
     int rc = 0;
@@ -181,6 +246,45 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
         // A --hard snapshot clones its UF_IMMUTABLE flags along; undo them here, once, so the
         // hand-out stays O(1) for hard snapshots too.
         if (si.hard && (rc = fs_unprotect_tree(tmp.c_str()))) break;
+        // P9 (T2.5): and the same for the hardlinks clonefile broke. Doing it here, in the
+        // background filler, is the whole point: the fork that takes this entry does not pay
+        // for it, and the hand-out stays a marker plus a rename.
+        if (si.hl_groups) {
+            HardlinkSet hl;
+            String mp = hardlinks_manifest_path(si.root.c_str());
+            // PR #1 review (4th round): an entry whose groups could not be replayed is not a
+            // faithful clone of the snapshot, and a fork would hand it out as one. Drop it --
+            // the filler's error path removes the tree and the row.
+            // PR #1 review (6th round): and the same for a manifest that cannot be read or that
+            // holds fewer groups than the row says. Both were swallowed here, and the entry then
+            // went into the pool as READY with independent files where the snapshot records one
+            // inode under n names -- handed to the next fork as a faithful clone. The row's
+            // hl_groups and the manifest's group count come from one HardlinkSet written in one
+            // place (wfs_snapshot_create), so they disagree only if the manifest was damaged.
+            if ((rc = hardlinks_manifest_read(mp.c_str(), hl))) { rc = WFS_E_SNAPSHOT_DIRTY; break; }
+            if (hl.groups.size() != si.hl_groups) { rc = WFS_E_SNAPSHOT_DIRTY; break; }
+            // PR #1 review (13th round, P2): the same question the fork asks, for the same
+            // reason -- a manifest whose members were exchanged between two groups passes every
+            // structural check and welds two unrelated files together on replay, and an entry
+            // built that way is handed to the next fork as a faithful clone. The snapshot tree
+            // answers it (the clone cannot: clonefile broke every link in it), one lstat per
+            // hardlinked name, inside the gate window.
+            if (hl.groups.size()) {
+                SnapGate vgate;
+                if (!si.hard) rc = vgate.open(si.root.c_str(), false);
+                // PR #1 review (23rd round): -EINVAL is the manifest disagreeing with the
+                // tree; any other errno is a tree that could not be read, and it is returned
+                // as itself rather than as "your snapshot is damaged".
+                if (!rc) {
+                    int vrc = hardlinks_verify_groups(si.root.c_str(), hl);
+                    if (vrc == -EINVAL) rc = WFS_E_SNAPSHOT_DIRTY;
+                    else if (vrc) rc = vrc;
+                }
+                vgate.close();
+                if (rc) break;
+            }
+            if (hl.groups.size() && (rc = hardlinks_restore(tmp.c_str(), hl, nullptr, nullptr))) break;
+        }
         // The snapshot's own marker is never in there (wfs_snapshot_create removes it), so the
         // entry carries no identity at all until a fork writes one.
         if ((rc = fs_rename(tmp.c_str(), path.c_str()))) break;
@@ -190,9 +294,13 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
         fs_remove_tree(tmp.c_str());
         Guard g(s->mu);
         Txn t(s->db);
-        Stmt del(s->db, "DELETE FROM pool WHERE id=?");
-        if (del.ok()) { del.i64(1, (int64_t)row); del.step(); }
-        t.commit();
+        // 34th round, P1: a row left behind is a CREATING pool row with no tree, which
+        // pool_collect() dooms on the next wake; the caller is owed the clone's own error.
+        if (t.ok()) {
+            Stmt del(s->db, "DELETE FROM pool WHERE id=?");
+            if (del.ok()) { del.i64(1, (int64_t)row); del.step(); }
+            (void)t.commit();   // best effort: pool_collect() is the backstop either way
+        }
         return rc;
     }
 
@@ -200,6 +308,7 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
     if (::stat(path.c_str(), &st) != 0) return -errno;
     Guard g(s->mu);
     Txn t(s->db);
+    if (!t.ok()) return t.err();   // 34th round, P1
     Stmt u(s->db, "UPDATE pool SET dir_dev=?, dir_ino=?, root_mode=?, root_mtime=?, state=1 WHERE id=?");
     if (!u.ok()) return -EIO;
     u.i64(1, (int64_t)st.st_dev);
@@ -208,23 +317,32 @@ int build_one(wfs_store *s, wfs_id snapshot, const SnapInfo &si, const String &d
     u.i64(4, mtime_ns(st));
     u.i64(5, (int64_t)row);
     if (u.step() != SQLITE_DONE) return -EIO;
-    t.commit();
-    return 0;
+    // state=1 is the promise a fork claims this entry on (34th round, P1).
+    return t.commit();
 }
 
 } // namespace
 
-int pool_claim(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, PoolClaim &out) {
+int pool_claim(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, PoolClaim &out,
+               PoolClaimHook on_claimed, void *hook_ctx) {
     if (!s || !snapshot) return -EINVAL;
     Guard g(s->mu);
     Txn t(s->db);
+    // 34th round, P1: the claim and the caller's hook are one write -- the fork's CREATING row
+    // is what keeps the snapshot referenced while the entry is out of the pool -- so without
+    // the write lock there is no claim to make.
+    if (!t.ok()) return t.err();
+    // state=1 (POOL_READY) and nothing else, which is what makes the drain's two steps work:
+    // a row it has moved to POOL_DRAINING is invisible here, so the tree it is about to remove
+    // can never be handed to a fork (PR #1 review, 21st round). A claim and the drain's own
+    // transaction are both BEGIN IMMEDIATE, so one of them is wholly before the other.
     Stmt q(s->db,
            "SELECT id, uuid, path, entries, root_mode, root_mtime, created_at FROM pool"
            " WHERE snapshot_id=? AND snap_created_at=? AND state=1 ORDER BY id LIMIT 1");
     if (!q.ok()) return -EIO;
     q.i64(1, (int64_t)snapshot);
     q.i64(2, snap_created_at);
-    if (!q.row()) return -ENOENT;
+    if (!q.row()) return q.done() ? -ENOENT : -EIO;   // 32nd round, P2
     out.row = (wfs_id)q.col_i64(0);
     out.uuid.assign(q.col_text(1));
     out.path.assign(q.col_text(2));
@@ -238,42 +356,82 @@ int pool_claim(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, PoolClaim
     if (!del.ok()) return -EIO;
     del.i64(1, (int64_t)out.row);
     if (del.step() != SQLITE_DONE) return -EIO;
-    t.commit();
     // The tree must actually be there. A pool directory removed behind the store's back is not
-    // an error worth failing the fork for: report "empty pool" and let the caller clone.
-    if (!exists(out.path.c_str())) return -ENOENT;
-    return 0;
+    // an error worth failing the fork for: report "empty pool" and let the caller clone. The row
+    // goes either way -- an entry whose tree has vanished is never coming back -- but the hook
+    // does not run for a claim that cannot be honoured.
+    // PR #1 review (12th round): the row is deleted above either way -- an entry whose tree has
+    // vanished is never coming back -- but `gone` also decides whether the hand-out happens, and
+    // an lstat(2) that failed for EACCES or EIO is not a vanished tree. Assume it is there: the
+    // hook then fails on the tree itself and the Txn destructor rolls the DELETE back, so the
+    // entry survives to be collected properly instead of being dropped from the database with
+    // its clone left on disk.
+    bool gone = proven_gone(out.path.c_str());
+    if (!gone && on_claimed) {
+        if (int rc = on_claimed(hook_ctx, out)) return rc;   // the Txn destructor rolls back
+    }
+    if (int crc = t.commit()) return crc;
+    return gone ? -ENOENT : 0;
 }
 
-void pool_return(wfs_store *s, const PoolClaim &c) {
-    if (!s || !c.path.size()) return;
+int pool_return(wfs_store *s, const PoolClaim &c, PoolReturnHook on_returned, void *hook_ctx) {
+    if (!s || !c.path.size()) return -EINVAL;
     // The hand-out may have written a marker into it; an entry never carries one.
     String m = joinp(c.path.c_str(), WFS_MARKER_NAME);
     ::unlink(m.c_str());
     struct stat st;
-    if (::stat(c.path.c_str(), &st) != 0) return;
-    Guard g(s->mu);
-    Txn t(s->db);
-    Stmt ins(s->db,
-             "INSERT INTO pool(snapshot_id, snap_created_at, uuid, path, entries, root_mode,"
-             " root_mtime, dir_dev, dir_ino, created_at, state) VALUES(?,?,?,?,?,?,?,?,?,?,1)");
-    if (!ins.ok()) { t.commit(); fs_remove_tree(c.path.c_str()); return; }
-    ins.i64(1, (int64_t)c.snapshot);
-    ins.i64(2, c.snap_created_at);
-    ins.text(3, c.uuid.c_str());
-    ins.text(4, c.path.c_str());
-    ins.i64(5, (int64_t)c.entries);
-    ins.i64(6, (int64_t)(st.st_mode & 07777));
-    ins.i64(7, mtime_ns(st));
-    ins.i64(8, (int64_t)st.st_dev);
-    ins.i64(9, (int64_t)st.st_ino);
-    ins.i64(10, c.created_at ? c.created_at : now_sec());
-    if (ins.step() != SQLITE_DONE) {
-        t.commit();
-        fs_remove_tree(c.path.c_str());
-        return;
+    if (::stat(c.path.c_str(), &st) != 0) return -errno;   // nothing to put back
+    int rc = 0;
+    {
+        Guard g(s->mu);
+        Txn t(s->db);
+        if (!t.ok()) rc = t.err();   // 34th round, P1
+        // PR #1 review (16th round, P2): the same question build_one's insert asks (15th round)
+        // and for the same reason -- a READY entry is a promise that the snapshot it names is
+        // ACTIVE and is still the snapshot this tree was cloned from. The caller's hook is what
+        // holds that true while the entry is out of the pool (the fork's CREATING world row is
+        // the snapshot's reference, and it is deleted in this transaction, not before it), so
+        // in the unwind this was written for the check cannot fail; it is the entry's identity,
+        // asked under the same write lock the discard's reference count is taken under, for
+        // this caller and any other.
+        if (!rc) {
+            Stmt sq(s->db, "SELECT state, created_at FROM snapshots WHERE id=?");
+            if (!sq.ok()) rc = -EIO;
+            else {
+                sq.i64(1, (int64_t)c.snapshot);
+                if (!sq.row()) rc = sq.done() ? -ESTALE : -EIO;   // 32nd round, P2
+                else if (sq.col_i64(0) != WFS_ST_ACTIVE || sq.col_i64(1) != c.snap_created_at)
+                    rc = -ESTALE;
+            }
+        }
+        if (!rc) {
+            Stmt ins(s->db,
+                     "INSERT INTO pool(snapshot_id, snap_created_at, uuid, path, entries, root_mode,"
+                     " root_mtime, dir_dev, dir_ino, created_at, state) VALUES(?,?,?,?,?,?,?,?,?,?,1)");
+            if (!ins.ok()) rc = -EIO;
+            else {
+                ins.i64(1, (int64_t)c.snapshot);
+                ins.i64(2, c.snap_created_at);
+                ins.text(3, c.uuid.c_str());
+                ins.text(4, c.path.c_str());
+                ins.i64(5, (int64_t)c.entries);
+                ins.i64(6, (int64_t)(st.st_mode & 07777));
+                ins.i64(7, mtime_ns(st));
+                ins.i64(8, (int64_t)st.st_dev);
+                ins.i64(9, (int64_t)st.st_ino);
+                ins.i64(10, c.created_at ? c.created_at : now_sec());
+                if (ins.step() != SQLITE_DONE) rc = -EIO;
+            }
+        }
+        // The claimer's own bookkeeping, in the same transaction as the row that replaces it.
+        if (!rc && on_returned) rc = on_returned(hook_ctx, c);
+        if (!rc) rc = t.commit();   // and the Txn destructor rolls everything back otherwise
     }
-    t.commit();
+    // The entry did not go back, so its tree is not an entry: remove it rather than leave a
+    // row-less clone for the orphan sweep to find. No deadline -- this is a failed fork's
+    // unwind, not the gc worker -- and if it will not go, the sweep is where it belongs.
+    if (rc) fs_remove_tree(c.path.c_str());
+    return rc;
 }
 
 int pool_ready_for(wfs_store *s, wfs_id snapshot, int64_t snap_created_at, uint64_t *out) {
@@ -295,6 +453,7 @@ int pool_verify(wfs_store *s, wfs_id snapshot, uint64_t *checked, uint64_t *dirt
             paths.emplace_back(q.col_text(0));
             mtimes.emplace_back(q.col_i64(1));
         }
+        if (!q.done()) return -EIO;   // 32nd round, P2
     }
     for (size_t i = 0; i < paths.size(); ++i) {
         if (checked) (*checked)++;
@@ -308,75 +467,355 @@ int pool_verify(wfs_store *s, wfs_id snapshot, uint64_t *checked, uint64_t *dirt
     return 0;
 }
 
-int pool_collect(wfs_store *s, uint64_t *removed) {
-    if (!s) return -EINVAL;
-    uint64_t n = 0;
-    Vec<wfs_id> rows;
-    Vec<String> trees;
-    Vec<String> live; // paths a valid row still points at
+namespace {
+
+// The classification half, split out of pool_collect (PR #1 review, 6th round) so that
+// `gc --status` can count what is waiting without removing any of it: `rows`/`trees` are the
+// doomed entries, `live` every path something still alive is using.
+int pool_scan(wfs_store *s, Vec<wfs_id> &rows, Vec<String> &trees, Vec<String> &live) {
     {
         Guard g(s->mu);
         // Left joined by hand: one pass over the pool, one lookup per row. A store has a
         // handful of snapshots, so this is cheaper than it looks.
-        Stmt q(s->db, "SELECT id, snapshot_id, snap_created_at, path, state FROM pool ORDER BY id");
+        Stmt q(s->db, "SELECT id, snapshot_id, snap_created_at, path, state, owner_pid,"
+                      " owner_start, created_at FROM pool ORDER BY id");
         if (!q.ok()) return -EIO;
         Stmt snap(s->db, "SELECT created_at, state FROM snapshots WHERE id=?");
         if (!snap.ok()) return -EIO;
+        int64_t reap_before = now_sec() - creating_min_age_secs();
         while (q.row()) {
             wfs_id id = (wfs_id)q.col_i64(0);
             wfs_id sid = (wfs_id)q.col_i64(1);
             int64_t sat = q.col_i64(2);
             String path(q.col_text(3));
             int state = (int)q.col_i64(4);
-            bool doomed = state != 1; // still CREATING: the filler died
+            // PR #1 review (21st round, P1): POOL_DRAINING is a drain that took the row out of
+            // the hand-out set and then could not remove the tree (an ACL, an EPERM, an EIO).
+            // It is doomed whatever the snapshot says -- it is not an entry any more and will
+            // never be handed out again -- and it is not a live producer either: the drain and
+            // the fill hold the same store-wide pool lock, so nobody is writing that tree. This
+            // is the retry path for it, under the shared failure cap like everything else.
+            bool draining = state == POOL_DRAINING;
+            // Still CREATING: the filler died -- or is still cloning. PR #1 review (3rd round):
+            // a 50 000-entry clone takes 0.6 s and a pool fill runs several of them, so a gc
+            // that started in the middle used to delete the tree the filler was still writing.
+            bool building = !draining && state != POOL_READY;
+            if (building && (producer_alive(q.col_i64(5), q.col_i64(6)) || q.col_i64(7) > reap_before)) {
+                String t(path);
+                t.append(WFS_TMP_SUFFIX);
+                live.emplace_back(path);   // and the <uuid>.wfs-tmp it is cloning into
+                live.emplace_back(t);
+                continue;
+            }
+            bool doomed = building || draining;
             if (!doomed) {
                 sqlite3_reset(snap.s);
                 snap.i64(1, (int64_t)sid);
-                if (!snap.row()) doomed = true;                                  // snapshot gone
-                else if (snap.col_i64(1) != WFS_ST_ACTIVE) doomed = true;        // not usable
+                if (!snap.row()) {
+                    // PR #1 review (32nd round, P2): "no such snapshot" is a row that is not
+                    // there, not a step that failed. A failed read here dooms a pool entry
+                    // whose snapshot is perfectly alive, and a doomed entry is a tree the
+                    // collector deletes.
+                    if (!snap.done()) return -EIO;
+                    doomed = true;                                               // snapshot gone
+                } else if (snap.col_i64(1) != WFS_ST_ACTIVE) doomed = true;      // not usable
                 else if (snap.col_i64(0) != sat) doomed = true;                  // a different snapshot now
             }
             if (doomed) { rows.emplace_back(id); trees.emplace_back(path); }
             else live.emplace_back(path);
         }
+        if (!q.done()) return -EIO;   // 32nd round, P2
+        // PR #1 review (3rd round): an entry a fork has claimed has no pool row any more -- the
+        // claim deletes it -- so the sweep below saw an unclaimed directory and removed the tree
+        // the fork was about to rename into place. The fork's CREATING world row records that
+        // entry as its tmp_path; while such a row exists, the tree it names is somebody's work
+        // in progress, and gc's own CREATING pass is what decides when it is not.
+        Stmt w(s->db, "SELECT tmp_path FROM worlds WHERE state=0 AND tmp_path<>''");
+        // 32nd round, P2: `live` is the list of trees the sweep must not touch, so a query that
+        // could not be run or could not be finished is not a shorter list -- it is no answer.
+        if (!w.ok()) return -EIO;
+        while (w.row()) live.emplace_back(w.col_text(0));
+        if (!w.done()) return -EIO;
     }
-    for (size_t i = 0; i < trees.size(); ++i) {
-        String tmp(trees[i]);
-        tmp.append(WFS_TMP_SUFFIX);
-        fs_remove_tree(tmp.c_str());
-        fs_remove_tree(trees[i].c_str());
-        Guard g(s->mu);
-        Txn t(s->db);
-        Stmt d(s->db, "DELETE FROM pool WHERE id=?");
-        if (d.ok()) { d.i64(1, (int64_t)rows[i]); d.step(); }
-        t.commit();
-        ++n;
+    return 0;
+}
+
+// PR #1 review (9th round), P18: pool_scan is a snapshot too, and what it dooms is removed one
+// whole clone at a time. So the doom is re-asked of the live row, under the store mutex,
+// immediately before the tree goes: the row must still be there, must still name this tree, and
+// must still fail the same test it failed at scan time. The caller holds s->mu.
+bool pool_row_still_doomed_locked(wfs_store *s, wfs_id id, const String &path) {
+    wfs_id sid = 0;
+    int64_t sat = 0, opid = 0, ostart = 0, made = 0;
+    int state = 0;
+    {
+        Stmt q(s->db, "SELECT snapshot_id, snap_created_at, path, state, owner_pid, owner_start,"
+                      " created_at FROM pool WHERE id=?");
+        if (!q.ok()) return false;
+        q.i64(1, (int64_t)id);
+        // 32nd round, P2: false is "leave it alone", which is what a read that failed must
+        // also say. Only a row that is genuinely not there is a row that has moved on.
+        if (!q.row()) return false;                                   // claimed, drained, gone
+        if (::strcmp(q.col_text(2), path.c_str())) return false;      // not the tree we queued
+        sid = (wfs_id)q.col_i64(0);
+        sat = q.col_i64(1);
+        state = (int)q.col_i64(3);
+        opid = q.col_i64(4);
+        ostart = q.col_i64(5);
+        made = q.col_i64(6);
     }
-    // Directories under <store>/pool that no row claims: half-built trees (*.wfs-tmp) and
-    // entries whose row was claimed by a fork that then died before the rename.
+    if (state == POOL_DRAINING)   // 21st round: the drain owns it; nothing makes it an entry again
+        return true;
+    if (state != POOL_READY)   // still CREATING: doomed only while its filler really is gone
+        return !(producer_alive(opid, ostart) || made > now_sec() - creating_min_age_secs());
+    Stmt snap(s->db, "SELECT created_at, state FROM snapshots WHERE id=?");
+    if (!snap.ok()) return false;
+    snap.i64(1, (int64_t)sid);
+    // 32nd round, P2: every `return true` below is "delete this tree". A snapshot row that
+    // could not be READ is not a snapshot that is gone, so that one answers false.
+    if (!snap.row()) return snap.done();                      // snapshot gone (or unreadable)
+    if (snap.col_i64(1) != WFS_ST_ACTIVE) return true;        // not usable
+    return snap.col_i64(0) != sat;                            // a different snapshot now
+}
+
+// PR #1 review (9th round), P18: the same question pool_scan's `live` answers from a snapshot,
+// asked of the live rows instead -- does any row name this tree right now? A pool row names its
+// path and that path plus `.wfs-tmp` (the name it clones into), and a fork's CREATING world row
+// names the entry it claimed through tmp_path. The caller holds s->mu.
+bool pool_path_claimed_locked(wfs_store *s, const String &p) {
+    String base(p);
+    size_t n = base.size(), sl = ::strlen(WFS_TMP_SUFFIX);
+    if (n > sl && !::strcmp(base.c_str() + n - sl, WFS_TMP_SUFFIX)) base.resize(n - sl);
+    {
+        Stmt q(s->db, "SELECT 1 FROM pool WHERE path=? OR path=?");
+        if (!q.ok()) return true;   // cannot tell, and "cannot tell" is never "delete it"
+        q.text(1, p.c_str());
+        q.text(2, base.c_str());
+        // 32nd round, P2: and a step that failed is "cannot tell" exactly as a prepare that
+        // failed is. It used to read as "no row names this tree", which is what deletes it.
+        if (q.row() || !q.done()) return true;
+    }
+    Stmt w(s->db, "SELECT 1 FROM worlds WHERE state=0 AND (tmp_path=? OR tmp_path=?)");
+    if (!w.ok()) return true;
+    w.text(1, p.c_str());
+    w.text(2, base.c_str());
+    return w.row() || !w.done();
+}
+
+// One pool tree's key in the store's shared gc retry counter (internal.h). The path, because
+// that is what a pool entry is: <store>/pool/S<n>/<uuid>, drawn once and never reused. A row and
+// the row-less directory it leaves behind therefore go on counting as one thing.
+String pool_fail_key(const String &path) {
+    String k("gcfail:pool:");
+    k.append(path.c_str());
+    return k;
+}
+
+// The directories under <store>/pool that no row claims: half-built trees (*.wfs-tmp) and
+// entries whose row was claimed by a fork that then died before the rename. `remove` deletes
+// them and returns how many went; otherwise they are only counted. The deadline is the gc
+// worker's, and a tree it stops in the middle of is still a row-less directory next time, so
+// the successor picks it up exactly where this left off.
+uint64_t pool_sweep_orphans(wfs_store *s, const Vec<String> &live, bool remove, int64_t deadline_us,
+                            bool *out_of_time, uint64_t *failed = nullptr,
+                            int *work_remains = nullptr, DirUnreadable *unreadable = nullptr) {
+    uint64_t n = 0;
     String root = pool_root(s);
-    DIR *d = ::opendir(root.c_str());
-    if (d) {
-        while (struct dirent *e = ::readdir(d)) {
+    Vec<String> subs, cand;
+    {
+        // 27th round: only ENOENT says there is nothing in there. Every other errno on the root
+        // or on an S<n> -- and every readdir that stops on an error of its own, which readdir(3)
+        // reports through errno alone (13th round) -- is a piece of the pool this run did not
+        // see, and returning 0 from it used to read as "no orphans".
+        DIR *d = ::opendir(root.c_str());
+        if (!d) {
+            if (errno != ENOENT) gc_note_unreadable(s, unreadable, root.c_str(), errno, remove, work_remains);
+            return 0;
+        }
+        bool root_read = true;
+        for (;;) {
+            errno = 0;
+            struct dirent *e = ::readdir(d);
+            if (!e) {
+                if (errno) {
+                    gc_note_unreadable(s, unreadable, root.c_str(), errno, remove, work_remains);
+                    root_read = false;
+                }
+                break;
+            }
             if (e->d_name[0] == '.') continue;
             String sub = joinp(root.c_str(), e->d_name);
             DIR *sd = ::opendir(sub.c_str());
-            if (!sd) continue;
-            while (struct dirent *ee = ::readdir(sd)) {
+            if (!sd) {
+                // ENOENT: an empty S<n> a previous sweep's rmdir took, or one drained away
+                // under us. Anything else is a subtree we cannot account for.
+                if (errno != ENOENT)
+                    gc_note_unreadable(s, unreadable, sub.c_str(), errno, remove, work_remains);
+                continue;
+            }
+            subs.emplace_back(sub);
+            bool sub_read = true;
+            for (;;) {
+                errno = 0;
+                struct dirent *ee = ::readdir(sd);
+                if (!ee) {
+                    if (errno) {
+                        gc_note_unreadable(s, unreadable, sub.c_str(), errno, remove, work_remains);
+                        sub_read = false;
+                    }
+                    break;
+                }
                 if (ee->d_name[0] == '.') continue;
                 String p = joinp(sub.c_str(), ee->d_name);
                 bool wanted = false;
                 for (size_t i = 0; i < live.size(); ++i)
                     if (!::strcmp(live[i].c_str(), p.c_str())) { wanted = true; break; }
-                if (wanted) continue;
-                if (fs_remove_tree(p.c_str()) == 0) ++n;
+                if (!wanted) cand.emplace_back(p);
             }
             ::closedir(sd);
-            ::rmdir(sub.c_str()); // empty S<n> directories go too; fails harmlessly otherwise
+            // Read right through, so whatever a previous run could not read here it can read
+            // now: the retry counter goes back to zero, exactly as it does for a tree that
+            // finally went (gc_fail_clear below).
+            gc_note_readable(s, sub.c_str(), remove && sub_read);
         }
         ::closedir(d);
+        gc_note_readable(s, root.c_str(), remove && root_read);
     }
+    // PR #1 review (9th round), P18: `live` is pool_scan's snapshot of the rows, and the readdir
+    // above is not. A filler that inserts its CREATING row after the scan has its `.wfs-tmp`
+    // deleted out from under the clone it is writing -- and a partially removed entry then goes
+    // on to be published READY -- while a fork that claims an entry in the same window has the
+    // tree it is about to rename taken away. So every apparent orphan is re-asked of the live
+    // rows, under the store mutex, immediately before it is removed (or, for `gc --status`,
+    // counted: the report has to say what the collector would actually touch).
+    for (size_t i = 0; i < cand.size(); ++i) {
+        const String &p = cand[i];
+        {
+            Guard g(s->mu);
+            if (pool_path_claimed_locked(s, p)) continue;
+        }
+        if (!remove) { ++n; continue; }
+        if (deadline_us && fs_mono_us() >= deadline_us) {
+            if (out_of_time) *out_of_time = true;
+            break;
+        }
+        int partial = 0;
+        int rc = fs_remove_tree(p.c_str(), deadline_us, &partial);
+        if (partial) { if (out_of_time) *out_of_time = true; break; }
+        if (rc == 0 && proven_gone(p.c_str())) { ++n; gc_fail_clear(s, pool_fail_key(p).c_str()); continue; }
+        // PR #1 review (8th round): it did not go. Nothing else in the store names this
+        // directory -- the row it belonged to is gone or never existed -- so saying nothing
+        // about it means it leaks silently until somebody runs gc by hand. Count it, and
+        // keep the worker chain coming back for it under the same cap a trash entry gets.
+        if (failed) (*failed)++;
+        if (gc_fail_bump(s, pool_fail_key(p).c_str()) < kGcFailCap && work_remains)
+            *work_remains = 1;
+    }
+    if (remove && !(out_of_time && *out_of_time))
+        for (size_t i = 0; i < subs.size(); ++i)
+            ::rmdir(subs[i].c_str());   // empty S<n> directories go too; harmless otherwise
+    return n;
+}
+
+} // namespace
+
+int pool_collect(wfs_store *s, uint64_t *removed, int64_t deadline_us, int *work_remains,
+                 uint64_t *failed, DirUnreadable *unreadable) {
+    if (!s) return -EINVAL;
+    uint64_t n = 0;
+    Vec<wfs_id> rows;
+    Vec<String> trees;
+    Vec<String> live; // paths a valid row still points at
+    if (int rc = pool_scan(s, rows, trees, live)) return rc;
+    if (wfs_test_before_pool_sweep) wfs_test_before_pool_sweep(wfs_test_before_pool_sweep_ctx);
+    // PR #1 review (6th round): every one of these is a whole clone of a snapshot, not the
+    // handful of stat(2)s the rest of gc's cheap half is made of. Under a deadline the removal
+    // stops where it is and the ROW STAYS, because that is the state a successor rediscovers:
+    // the entry is doomed for a reason that does not go away (its snapshot is gone, is not
+    // ACTIVE, or is a different snapshot now, or its filler died), and none of those can be
+    // handed to a fork -- pool_claim only ever matches state=1 rows whose snapshot_id and
+    // snap_created_at are those of an ACTIVE snapshot somebody is forking from. So a half
+    // removed tree is never mistaken for a ready entry; it is simply collected again.
+    bool out_of_time = false;
+    for (size_t i = 0; i < trees.size(); ++i) {
+        if (deadline_us && fs_mono_us() >= deadline_us) { out_of_time = true; break; }
+        {
+            // P18: the verdict is re-asked of the live row immediately before the clone goes.
+            Guard g(s->mu);
+            if (!pool_row_still_doomed_locked(s, rows[i], trees[i])) {
+                live.emplace_back(trees[i]);   // and it is not the sweep's to take either
+                String t(trees[i]);
+                t.append(WFS_TMP_SUFFIX);
+                live.emplace_back(t);
+                continue;
+            }
+        }
+        String tmp(trees[i]);
+        tmp.append(WFS_TMP_SUFFIX);
+        int partial = 0;
+        fs_remove_tree(tmp.c_str(), deadline_us, &partial);
+        int partial2 = 0;
+        if (!partial) fs_remove_tree(trees[i].c_str(), deadline_us, &partial2);
+        if (partial || partial2) { out_of_time = true; break; }
+        // PR #1 review (8th round): the results used to be thrown away and the row deleted
+        // whatever happened. A removal that fails for a reason the deadline had nothing to do
+        // with -- an ACL, an EPERM, a transient EIO -- then left the clone on disk with its row
+        // gone, and the orphan sweep below, which would have found it, had no retry counter and
+        // set no work_remains either: it leaked until somebody ran gc by hand. So the row stays
+        // while its tree does. It is not handed out by that -- pool_claim only ever matches
+        // state=1 rows whose snapshot is the ACTIVE one being forked from, and this entry is
+        // doomed precisely because that is no longer true -- it is simply collected again.
+        String key = pool_fail_key(trees[i]);
+        // PR #1 review (12th round): proven gone, both of them, or the row stays.
+        if (!proven_gone(trees[i].c_str()) || !proven_gone(tmp.c_str())) {
+            if (failed) (*failed)++;
+            if (gc_fail_bump(s, key.c_str()) < kGcFailCap && work_remains) *work_remains = 1;
+            // The row stayed, so the tree is not row-less: the sweep below must not count it a
+            // second time (nor try the removal that has just failed) under the other rule.
+            live.emplace_back(trees[i]);
+            live.emplace_back(tmp);
+            continue;
+        }
+        gc_fail_clear(s, key.c_str());
+        Guard g(s->mu);
+        Txn t(s->db);
+        // 34th round, P1: the trees are gone; a row that could not be deleted with them is work
+        // for the next wake, not an entry to count as removed.
+        if (!t.ok()) { if (work_remains) *work_remains = 1; continue; }
+        // P18: and the row this deletes is the row that named the tree that has just gone.
+        Stmt d(s->db, "DELETE FROM pool WHERE id=? AND path=?");
+        if (d.ok()) { d.i64(1, (int64_t)rows[i]); d.text(2, trees[i].c_str()); d.step(); }
+        if (t.commit()) { if (work_remains) *work_remains = 1; continue; }
+        ++n;
+    }
+    if (!out_of_time)
+        n += pool_sweep_orphans(s, live, true, deadline_us, &out_of_time, failed, work_remains,
+                                unreadable);
+    if (out_of_time && work_remains) *work_remains = 1;
     if (removed) *removed += n;
+    return 0;
+}
+
+int pool_stranded(wfs_store *s, uint64_t *out, DirUnreadable *unreadable) {
+    if (!s || !out) return -EINVAL;
+    *out = 0;
+    Vec<wfs_id> rows;
+    Vec<String> trees;
+    Vec<String> live;
+    if (int rc = pool_scan(s, rows, trees, live)) return rc;
+    uint64_t n = 0;
+    for (size_t i = 0; i < trees.size(); ++i) {
+        String tmp(trees[i]);
+        tmp.append(WFS_TMP_SUFFIX);
+        if (!proven_gone(trees[i].c_str()) || !proven_gone(tmp.c_str())) ++n;
+        // A doomed row's tree is counted here, and it is not a row-less orphan as well: the two
+        // rules used to meet on it and `gc --status` reported one stale entry as two (PR #1
+        // review, 8th round -- the same double count the collector's own failure path had).
+        live.emplace_back(trees[i]);
+        live.emplace_back(tmp);
+    }
+    n += pool_sweep_orphans(s, live, false, 0, nullptr, nullptr, nullptr, unreadable);
+    *out = n;
     return 0;
 }
 
@@ -403,6 +842,11 @@ extern "C" int wfs_pool_fill(wfs_store *s, wfs_id snapshot, int target, uint64_t
     if (int rc = wfs::fs_mkdir_p(dir.c_str())) return rc;
     while (ready < (uint64_t)target) {
         if (int rc = wfs::space_for(s, si.entries)) return rc;
+        // PR #1 review (15th round, P2): -ESTALE out of build_one() is "the snapshot stopped
+        // being this snapshot while we were filling" -- the insert re-read it under the write
+        // lock and it is not ACTIVE any more. Stop, and hand the caller the same -ESTALE a fill
+        // aimed at an already-discarded snapshot gets from the check above: `pool fill` prints
+        // "S<n> is not an active snapshot", which is what happened.
         if (int rc = wfs::build_one(s, snapshot, si, dir)) return rc;
         ++ready;
         if (made) (*made)++;
@@ -433,6 +877,7 @@ extern "C" int wfs_pool_status(wfs_store *s, wfs_pool_stat *buf, size_t cap, siz
         wfs::Stmt q(s->db, "SELECT DISTINCT snapshot_id FROM pool ORDER BY snapshot_id");
         if (!q.ok()) return -EIO;
         while (q.row()) ids.emplace_back((wfs_id)q.col_i64(0));
+        if (!q.done()) return -EIO;   // 32nd round, P2
     }
     size_t n = 0;
     for (size_t i = 0; i < ids.size(); ++i) {
@@ -454,12 +899,17 @@ extern "C" int wfs_pool_status(wfs_store *s, wfs_pool_stat *buf, size_t cap, siz
             int64_t sat = q.col_i64(1);
             int64_t at = q.col_i64(2);
             bool fresh = have == 0 && si.state == WFS_ST_ACTIVE && sat == si.created_at;
-            if (!fresh) st.stale++;
-            else if (state == 1) st.ready++;
+            // PR #1 review (21st round): a row a drain took out of the pool is stale even when
+            // its snapshot is perfectly fresh -- it is a tree waiting for the collector, which
+            // is what this column means. Counting it as `building` would have said a filler was
+            // at work on it, and counting it as `ready` would have promised a fork an entry.
+            if (!fresh || state == wfs::POOL_DRAINING) st.stale++;
+            else if (state == wfs::POOL_READY) st.ready++;
             else st.building++;
             if (!st.oldest_at || at < st.oldest_at) st.oldest_at = at;
             if (at > st.newest_at) st.newest_at = at;
         }
+        if (!q.done()) return -EIO;   // 32nd round, P2
         if (buf && n < cap) buf[n] = st;
         ++n;
     }
@@ -485,21 +935,87 @@ extern "C" int wfs_pool_drain(wfs_store *s, wfs_id snapshot, uint64_t *removed) 
             rows.emplace_back((wfs_id)q.col_i64(0));
             paths.emplace_back(q.col_text(1));
         }
+        if (!q.done()) return -EIO;   // 32nd round, P2
     }
+    // PR #1 review (16th round, P2): the tree first, the row only when the tree is gone. This
+    // used to delete the row and then remove the trees with both results thrown away, and
+    // returned 0 whatever had happened -- so one EPERM (an ACL, a transient EIO) left a whole
+    // pre-cloned world under <store>/pool with no row at all, and `discard S<n> --force`, whose
+    // drain this is, went on to trash the snapshot on the strength of that 0. Nothing came back
+    // for the clone after that: the orphan sweep would find it, but gc's pending check only
+    // scans the trash and the snapshot's own entry is not due for days. Same rule as
+    // pool_collect's (8th and 12th rounds): proven gone, both names, or the row stays and the
+    // errno goes to the caller -- who then fails the discard before touching the snapshot, so
+    // the entry is left as what it is, an ordinary pool row of a snapshot that is still ACTIVE.
+    //
+    // PR #1 review (21st round, P1): and keeping the row through the removal is only safe if
+    // the row is not a hand-out any more. pool_claim() does not take the pool lock -- it cannot,
+    // a fork must never wait on a filler -- and it matches every READY row of an ACTIVE
+    // snapshot, which is exactly what this loop's rows still were. So a fork could take one
+    // while fs_remove_tree() was walking it, rename the half-emptied tree to the user's --to and
+    // commit an ACTIVE world around whatever was left of it: `fork` returned 0 and the world was
+    // missing files. Two steps under the row now, in this order:
+    //
+    //   (1) one BEGIN IMMEDIATE that moves the row to POOL_DRAINING, which pool_claim's
+    //       `state=1` does not match. The claim is a BEGIN IMMEDIATE too, so the two serialise:
+    //       either this update is first and the entry is out of reach for ever, or the claim is
+    //       first, the row is gone with it, this update matches nothing -- and then the tree is
+    //       the fork's, named by its CREATING world row, and the drain must not touch it. That
+    //       is what `changed` is for.
+    //   (2) the removal, exactly as the 16th round left it.
+    //   (3) the row deleted only when both names are proven gone, and only while it is still
+    //       the DRAINING row this drain wrote for this tree.
+    //
+    // A row left DRAINING by a removal that failed is not an entry any anything: pool_scan()
+    // dooms it whatever its snapshot says, `gc --status` counts it under pool_stranded, `pool
+    // status` calls it stale, and `pool ready` does not see it -- so `pool fill` tops the pool
+    // up past it instead of waiting for a tree that is on its way out.
     for (size_t i = 0; i < rows.size(); ++i) {
+        if (wfs_test_in_pool_drain) wfs_test_in_pool_drain(wfs_test_in_pool_drain_ctx, 0);
+        bool mine = false;
         {
             wfs::Guard g(s->mu);
             wfs::Txn t(s->db);
-            wfs::Stmt d(s->db, "DELETE FROM pool WHERE id=?");
-            if (!d.ok()) return -EIO;
-            d.i64(1, (int64_t)rows[i]);
-            d.step();
-            t.commit();
+            // 34th round, P1: the tree below is removed only behind a row this transaction
+            // moved to DRAINING. Without the write lock a fork's claim and this update do not
+            // serialise, and the tree could be a live world's by the time it is unlinked.
+            if (!t.ok()) return t.err();
+            // No state in the WHERE: a CREATING row of a filler that died is drained too (the
+            // fill holds the same pool lock this call holds, so no live filler is in here), and
+            // a row this drain -- or an earlier one -- already moved to DRAINING is retried.
+            // SQLite counts a row the UPDATE matched even when the value does not change, so
+            // `changed` answers "is this still the row that names this tree", nothing else.
+            wfs::Stmt u(s->db, "UPDATE pool SET state=2 WHERE id=? AND path=?");
+            if (!u.ok()) return -EIO;
+            u.i64(1, (int64_t)rows[i]);
+            u.text(2, paths[i].c_str());
+            if (u.step() != SQLITE_DONE) return -EIO;
+            mine = sqlite3_changes(s->db) == 1;
+            // and the destructor rolls the nothing back otherwise
+            if (mine) { if (int crc = t.commit()) return crc; }
         }
+        if (!mine) continue;        // a fork claimed it first: the tree is its world now
+        if (wfs_test_in_pool_drain) wfs_test_in_pool_drain(wfs_test_in_pool_drain_ctx, 1);
         wfs::String tmp(paths[i]);
         tmp.append(WFS_TMP_SUFFIX);
-        wfs::fs_remove_tree(tmp.c_str());
-        if (wfs::fs_remove_tree(paths[i].c_str()) == 0 && removed) (*removed)++;
+        int trc = wfs::fs_remove_tree(tmp.c_str());
+        int prc = wfs::fs_remove_tree(paths[i].c_str());
+        if (!wfs::proven_gone(paths[i].c_str()) || !wfs::proven_gone(tmp.c_str()))
+            return prc ? prc : (trc ? trc : -EIO);   // and the row stays DRAINING
+        {
+            wfs::Guard g(s->mu);
+            wfs::Txn t(s->db);
+            if (!t.ok()) return t.err();   // 34th round, P1
+            // The row that named the tree that has just gone, as in pool_collect (P18), and in
+            // the state this drain put it in -- nothing else may have written it since.
+            wfs::Stmt d(s->db, "DELETE FROM pool WHERE id=? AND state=2 AND path=?");
+            if (!d.ok()) return -EIO;
+            d.i64(1, (int64_t)rows[i]);
+            d.text(2, paths[i].c_str());
+            d.step();
+            if (int crc = t.commit()) return crc;
+        }
+        if (removed) (*removed)++;
     }
     if (snapshot) {
         wfs::String dir = wfs::pool_dir_of(s, snapshot);

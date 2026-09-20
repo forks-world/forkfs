@@ -36,14 +36,62 @@ static NSError *perr(int negerrno) { return fs_errorForPOSIXError(negerrno < 0 ?
             else if ([kv isEqualToString:@"openclose=forward"]) inhibitOpen = NO;
         }
     }
+    // T2.3: where is this world's store? `-o` options do not reach an FSKit module on macOS 27
+    // (verified: the options array arrives empty), and this process is sandboxed, so
+    // NSApplicationSupportDirectory resolves inside
+    // ~/Library/Containers/world.forks.fs.extension/Data/... while the CLI's default store is
+    // ~/Library/Application Support/World/fs. The `.world` marker in the mount source root is the
+    // one thing that does reach us -- it is the resource we were handed -- so it carries the
+    // store's path, and that is what we open. No marker path (a world forked before T2.3): fall
+    // back to this extension's own container default.
+    BOOL fromMarker = NO;
     if (!storeDir) {
-        // Sandboxed: resolves inside ~/Library/Containers/world.forks.fs.extension/Data/...
+        char sp[WFS_PATH_MAX] = {0};
+        if (wfs_marker_store_path(base.fileSystemRepresentation, sp, sizeof sp) == 0 && sp[0]) {
+            // PR #1 review (34th round, P2): a path is bytes, and +stringWithUTF8String: is the
+            // one decoder that refuses bytes that are not UTF-8 -- it returns nil for a perfectly
+            // valid store path with, say, a Latin-1 component in it. The fallback below then
+            // opened this extension's own container default instead, silently, while the CLI's
+            // mount pre-check had compared the marker byte for byte and approved the mount: the
+            // volume comes up backed by a DIFFERENT store than the one the user asked for.
+            // -[NSFileManager stringWithFileSystemRepresentation:length:] is the decoder for
+            // file system bytes and has no such rule...
+            storeDir = [[NSFileManager defaultManager] stringWithFileSystemRepresentation:sp
+                                                                                   length:strlen(sp)];
+            // ... and when even that cannot represent them, the answer is to fail the load. A
+            // marker that HAS a store path is never answered with the default store: that is
+            // the substitution this finding is about, one line further down.
+            if (!storeDir) {
+                os_log_error(wfs_log(),
+                             "the .world marker at %{public}@ names a store path this system "
+                             "cannot decode; refusing the mount rather than opening a different "
+                             "store", base);
+                if (err) *err = perr(EILSEQ);
+                return nil;
+            }
+            fromMarker = YES;
+        }
+    }
+    if (!storeDir) {
         NSString *as = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
         storeDir = [as stringByAppendingPathComponent:@"World/fs"];
     }
     wfs_store *s = NULL;
     int rc = wfs_store_open(storeDir.fileSystemRepresentation, &s);
-    if (rc) { os_log_error(wfs_log(), "store open %{public}@: %d", storeDir, rc); if (err) *err = perr(rc); return nil; }
+    if (rc) {
+        // Almost always the App Sandbox: the appex is granted its own container plus the
+        // security-scoped mount source, and nothing else. A store under
+        // ~/Library/Application Support is therefore unreadable from in here, and the honest
+        // answer is to say which store and why rather than to let a bare errno reach `mount`.
+        os_log_error(wfs_log(),
+                     "cannot open the store %{public}@ (%d)%{public}s -- this extension is sandboxed "
+                     "and can only reach its own container; keep the store inside "
+                     "~/Library/Containers/%{public}s/Data/Library/Application Support/World/fs",
+                     storeDir, rc, fromMarker ? " named by the world's .world marker" : "",
+                     WFS_EXTENSION_BUNDLE_ID);
+        if (err) *err = perr(rc == WFS_E_STORE_UNREACHABLE ? EPERM : rc);
+        return nil;
+    }
     // M1: a world is a real directory tree, so the backing path identifies it. Without an
     // explicit -o world=N the marker in the backing directory is asked who it belongs to.
     wfs_world w = (wfs_world)world;

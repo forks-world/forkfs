@@ -47,9 +47,12 @@ $world fs list                         # snapshots and worlds
 $world fs inspect W1                   # path, inode, origin, entry count, FSEvents cursor
 $world fs verify S1                    # snapshot still matches the manifest written at init
 $world fs verify ~/w/a                 # identity of a world (repairs the row if it was moved)
-$world fs discard W3                   # into the store trash; restorable
+$world fs discard W3                   # into the store trash (a rename: milliseconds); restorable
 $world fs restore W3
-$world fs gc --retention 7             # delete trash older than 7 days and stray *.wfs-tmp trees
+$world fs discard S2                   # a snapshot too -- refused while a live world needs it
+$world fs gc --retention 7             # collect; the trash itself is emptied in the background
+$world fs gc --status                  # what is in the trash, and what the collector is doing
+$world fs gc --reconcile               # mark rows whose tree is no longer on disk as dead
 $world fs pool fill S1 --count 4       # keep 4 pre-cloned worlds ready: a fork then costs ~7 ms
 $world fs pool status                  # what is waiting, per snapshot
 $world fs pool drain S1                # give the space back
@@ -94,6 +97,44 @@ checks the waiting entries too (still there, not written to since they were clon
 `world fs gc` removes the entries of snapshots that are gone, half-built trees and anything under
 `<store>/pool` that no row claims.
 
+### `world fs discard` and the background collector
+
+`discard` is a `rename(2)` into `<store>/trash` and two SQLite statements — milliseconds, whatever
+the size of the tree. The unlinking behind it is the most expensive thing this system does:
+measured, 1000 worlds of 10 400 entries are 10.4M `unlink(2)` calls, which the M1 synchronous
+`gc` took 525 s over ([`docs/M1_RESULTS.md`](docs/M1_RESULTS.md) §3) — 4.6× what creating them cost.
+
+So nothing on a command's critical path does it. A detached worker (`world fs gc --worker`,
+started by `discard`, `fork` or `gc` and never by a daemon) holds a non-blocking store-level
+`flock` on `<store>/locks/gc.lock`, deletes a bounded batch, logs to `<store>/logs/gc.log` and
+exits; if the batch limit cut it short it hands over to a fresh successor, so the trash drains
+without anyone running another command. `world fs gc --now` still does everything here and now.
+
+Crash safety: before a single `unlink`, the trash entry is renamed to `<name>.deleting`. A worker
+that is killed half-way through therefore leaves a tree that is visibly not a world any more
+rather than one that looks restorable — `world fs restore` refuses it — and the next wake finishes
+it, before and regardless of the retention period.
+
+Knobs, all environment variables read by the worker: `WORLD_GC_BATCH` (entries per wake, 64),
+`WORLD_GC_BATCH_SECS` (seconds per wake, 2), `WORLD_GC_PAUSE_MS` (the gap before a successor
+starts, 2000) and `WORLD_GC_THREADS` (unlink threads, 4). The defaults are a duty cycle: the
+collector works in bursts with gaps, which is what keeps it out of the foreground's way (P16).
+One more, `WORLD_GC_CREATING_MIN_AGE` (60 s): how old a half-built row must be before the
+collector will touch it even with its producer gone. A row being built by a process that is
+still alive is never collected, whatever its age — a fork of a large tree easily outlives the
+gap before a worker wakes, and deleting its tree out from under it is not a garbage collection.
+
+Discarding a **snapshot** goes through the same trash. It is refused while an ACTIVE world was
+forked from it — `diff` and `verify` need that baseline, so the source is never taken out from
+under a live world — and refused while pre-cloned pool entries exist, which `--force` drains.
+Worlds already in the trash are not a reason to refuse; restoring one afterwards is what fails,
+with a message that says why.
+
+`world fs gc` also reconciles: it reports snapshot rows whose directory is gone and world rows
+whose root is gone, and `--reconcile` marks them dead (and drops the pool entries of dead
+snapshots). It reports rather than acts by default because a World that was merely *moved* looks
+exactly the same from the store's side until `world fs verify <its new path>` repairs the row (P1).
+
 ### `world fs diff`
 
 ```console
@@ -104,7 +145,7 @@ M src/main.c
 T README.md          # same bytes, different mode / owner / flags / mtime / xattr
 $ world fs diff W1 --stat
 1 added, 1 modified, 1 deleted, 1 metadata-only
-full scan of both trees, 9900 paths compared, 1 files read, 0.233 s
+full scan of both trees, 9900 paths compared, 1 files read, 0.047 s
 $ world fs diff W1 --events --stat
 1 added, 1 modified, 1 deleted, 1 metadata-only
 FSEvents since the fork, 2 paths compared, 0 files read, 0.041 s
@@ -125,12 +166,39 @@ older than the volume's FSEvents journal (which holds roughly a day), or a world
 from another world rather than from a snapshot.
 
 Why the walk is the default, measured on 27.0 with 50 000 files and 800 changes: FSEvents
-**0.087 s**, `--full` 1.354 s, `--full --no-xattr` **0.164 s**. The 4-thread walk is five times
-faster than the design assumed, so the event path wins by under 2× — and only because of the
-xattr leg of the metadata comparison (`listxattr(2)` is ~10 µs per call on APFS and a full scan
-makes two per file; `--no-xattr` drops it, at the price of not seeing a change that is only an
-xattr). Against that, the event path has a fixed cost of its own (building the stream and waiting
-for its watermark): a six-file world diffs in 0.002 s by walking and 0.4 s through FSEvents.
+**0.049 s**, `--full` **0.23 s**, `--full --no-xattr` **0.126 s**. The 4-thread walk is five
+times faster than the design assumed, so the event path wins by under 2× — and only because of
+the xattr leg of the metadata comparison, which `--no-xattr` drops at the price of not seeing a
+change that is only an xattr. Against that, the event path has a fixed cost of its own (building
+the stream and waiting for its watermark): a six-file world diffs in 0.002 s by walking and 0.4 s
+through FSEvents.
+
+The walk reads a directory with `getattrlistbulk(2)`, one call per batch rather than one
+`fstatat(2)` per entry, and asks for `ATTR_CMNEXT_EXT_FLAGS` along the way: `EF_NO_XATTRS` tells
+it, for free, which entries have no extended attributes at all, and those never reach
+`listxattr(2)`. On a tree that came from somewhere else that is most of the files — a real
+37 000-entry tree with 800 changes diffs in **0.17 s** by default against 0.14 s with
+`--no-xattr`.
+
+**`com.apple.provenance` is not compared.** macOS 27 stamps it on every file a local process
+creates — a `rename(2)` into your own directory is enough — and it cannot be taken off again:
+`removexattr(2)` returns 0 and changes nothing. It is the kernel's note of *which application
+created this file*, not anything a workspace did, so `diff` leaves it out of the comparison and
+out of the decision to skip the comparison: a file whose only xattr is provenance counts as
+having none at all. `--all-xattrs` puts it back. Everything else, `com.apple.quarantine`
+included, is always compared. What that costs, on the 50 000-file tree above where every single
+file is stamped and the `EF_NO_XATTRS` shortcut therefore never fires:
+
+| `diff --full` | 50 000 files | 10 000 files |
+|---|---|---|
+| default (provenance ignored) | **0.231 s** | **0.047 s** |
+| `--all-xattrs` | 1.303 s | 0.158 s |
+| `--no-xattr` | 0.126 s | 0.027 s |
+
+Confirming that one kernel-written attribute matches was five sixths of the default scan: two
+`listxattr(2)` plus two `getxattr(2)` per otherwise-identical file, and `getxattr` is the
+expensive one at 14 µs. What is left above `--no-xattr` is the two `listxattr(2)` that still
+have to ask for the names.
 
 And it is not only slower on small trees, it is less certain: `fseventsd` writes its journal on
 a timer, so an isolated change takes 90–600 ms to become visible to a stream created after it (a
@@ -166,7 +234,8 @@ inode of its root, so moving it is fine (P1) and copying it is caught (P2); snap
 immutable and verifiable (P3); `discard` is reversible (P4); cross-volume clones are detected by
 cloning, not by comparing `st_dev` (P6); `/`, `$HOME`, the store, and anything inside a World or
 Snapshot are refused (P7); a fork that dies half way leaves only a `*.wfs-tmp` tree for `gc` (P8);
-hardlinks that the clone will break are counted and reported (P9); `diff` treats FSEvents as
+hardlinks that the clone breaks are recorded in the snapshot's manifest and rebuilt inside every
+clone of it -- fork, checkpoint and pool entry -- so two names stay one file (P9, T2.5); `diff` treats FSEvents as
 candidates and decides by comparing against the snapshot, falling back to a full scan the moment
 the event stream cannot account for everything (P10); free space is checked before
 cloning (P11); every metadata mutation is a `BEGIN IMMEDIATE` transaction and world-level
@@ -237,9 +306,28 @@ cmake -S . -B build/Fskit -DCMAKE_BUILD_TYPE=Release -DWFS_FSKIT=ON && cmake --b
 scripts/bundle.sh Release          # .app + appex → ad-hoc sign → ~/Applications → lsregister
 # One-time, manual: System Settings > General > Login Items & Extensions > File System Extensions
 build/Fskit/cli/world fs fsstatus  # must list world.forks.fs.extension enabled=true
+# The extension is sandboxed, so the store has to live where it can reach it:
+export WORLD_STORE="$HOME/Library/Containers/world.forks.fs.extension/Data/Library/Application Support/World/fs"
+build/Fskit/cli/world fs init <dir> && build/Fskit/cli/world fs fork --from S1 --to <world>
 build/Fskit/cli/world fs mount W1 <mountpoint>
 scripts/smoke.sh <dir> <mountpoint>
 ```
+
+**Where the store has to be for a mount to work.** `pkd` refuses an appex that is not sandboxed,
+so the extension runs inside the App Sandbox with access to its own container and to the
+security-scoped mount source and to nothing else: `~/Library/Application Support` — the CLI's
+default store — is denied, and `NSApplicationSupportDirectory` resolves *inside the container*, so
+the extension's own default store is
+`~/Library/Containers/world.forks.fs.extension/Data/Library/Application Support/World/fs`. The two
+defaults are therefore different directories, which is why a mount of a world from the CLI's
+default store used to fail with `mount: POSIX error 1009` (`WFS_E_FOREIGN_STORE`).
+
+`-o` options do not reach an FSKit module on macOS 27 (the options array arrives empty), so the
+store's location travels in the `.world` marker of the mount source root — the one file the
+extension is guaranteed to be able to read, because that root is the resource it was handed. The
+extension reads `store_path` out of it and opens that store, falling back to its container default
+for worlds forked before this existed. `world fs mount` checks the same thing first and refuses
+with the fix instead of an errno when the store is somewhere the extension cannot open.
 
 Why it is frozen: metadata-write workloads run at 17–40% of native through FSKit because the
 kernel sends 5–7 XPC round trips per mutation, and 68 µs per round trip is the FSKit floor
@@ -266,7 +354,8 @@ core/src/pool.{h,cpp}                 the pre-clone pool: fill, claim, status, d
 core/src/events.h                     candidate collection interface + the path bag
 core/src/platform_darwin_events.cpp   the FSEvents replay: flags, journal-age check, dedicated queue
 core/src/platform_posix.cpp           parallel tree walk, manifest, free space, recursive delete
-core/src/platform_darwin.cpp          clonefile, per-file fallback, chflags protect/unprotect, FSEvents cursor
+core/src/platform_darwin.cpp          clonefile, per-file fallback, chflags protect/unprotect, FSEvents cursor,
+                                      getattrlistbulk enumeration + the EF_NO_XATTRS verdict
 core/src/view.cpp                     M0 inode table + namespace (WFS_FSKIT=ON only)
 core/tests/                           core_test.cpp (M1), diff_test.cpp (T1.3), fskit_test.cpp (WFS_FSKIT=ON)
 macos/fskit/                          Objective-C++ FSKit appex (WFS_FSKIT=ON only)

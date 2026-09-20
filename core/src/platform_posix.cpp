@@ -4,12 +4,14 @@
 #include <dirent.h>
 #include <stdio.h>
 #include <errno.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/syscall.h>
 #include <sys/sysctl.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -19,6 +21,9 @@
 #else
 #define WFS_XATTR_NOFOLLOW 0
 #endif
+
+// PR #1 review (3rd round): the seam for a partial pthread_create failure. See threads_start.
+extern "C" unsigned wfs_test_thread_fail_mask = 0;
 
 namespace wfs {
 
@@ -49,6 +54,13 @@ wfs_type type_of_dt(unsigned char t) {
 }
 wfs_timespec ts(const struct timespec &t) { return wfs_timespec{(int64_t)t.tv_sec, (int64_t)t.tv_nsec}; }
 } // namespace
+
+int fs_probe(const char *path, struct stat *st, bool follow) {
+    struct stat local;
+    struct stat &out = st ? *st : local;
+    if ((follow ? ::stat(path, &out) : ::lstat(path, &out)) != 0) return errno ? -errno : -EIO;
+    return 0;
+}
 
 int fs_lstat(const char *path, wfs_attr &a) {
     struct stat st;
@@ -90,6 +102,87 @@ int fs_readlink(const char *path, char *buf, size_t cap, size_t *len) {
 // costs ~1ms of kernel violation reporting per create.
 #endif
 
+int threads_start(pthread_t *th, int want, void *(*fn)(void *), void *arg) {
+    int started = 0;
+    for (int i = 0; i < want; ++i) {
+        if (i < 32 && (wfs_test_thread_fail_mask & (1u << i))) continue;
+        if (::pthread_create(&th[started], nullptr, fn, arg) == 0) ++started;
+    }
+    return started;
+}
+
+int64_t fs_pid_start_sec(int64_t pid) {
+    if (pid <= 0) return 0;
+#ifdef __APPLE__
+    struct kinfo_proc kp;
+    size_t len = sizeof kp;
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid};
+    if (::sysctl(mib, 4, &kp, &len, nullptr, 0) != 0 || len == 0) return 0;
+    return (int64_t)kp.kp_proc.p_starttime.tv_sec;
+#else
+    // /proc/<pid>/stat field 22 is the start time in clock ticks since boot. The comm field can
+    // contain spaces and parentheses, so the scan starts after the LAST ')'.
+    char path[64];
+    ::snprintf(path, sizeof path, "/proc/%lld/stat", (long long)pid);
+    FILE *f = ::fopen(path, "r");
+    if (!f) return 0;
+    char buf[4096];
+    size_t n = ::fread(buf, 1, sizeof buf - 1, f);
+    ::fclose(f);
+    buf[n] = 0;
+    char *p = ::strrchr(buf, ')');
+    if (!p) return 0;
+    int field = 2;   // the next token is field 3 (state)
+    for (char *t = ::strtok(p + 1, " "); t; t = ::strtok(nullptr, " "))
+        if (++field == 22) return ::strtoll(t, nullptr, 10);
+    return 0;
+#endif
+}
+
+#ifndef __APPLE__
+// PR #1 review (34th round, P1): the stub. Linux is deferred (docs/M1_DESIGN.md P13), and
+// "cannot tell" is the answer the 2 -> 3 upgrade refuses on -- it does not proceed on silence.
+// A real implementation here reads /proc/<pid>/fd, which needs no privilege for this user's own
+// processes either.
+int fs_other_holders(const char *path, Vec<int64_t> &out) {
+    (void)path;
+    out.clear();
+    return -ENOSYS;
+}
+
+void fs_pid_exe(int64_t pid, String &out) {
+    (void)pid;
+    out.assign("");
+}
+#endif
+
+bool producer_alive(int64_t pid, int64_t start_sec) {
+    if (pid <= 0) return false;                       // nobody was recorded
+    if (::kill((pid_t)pid, 0) != 0 && errno == ESRCH) return false;
+    if (start_sec > 0) {
+        int64_t now_start = fs_pid_start_sec(pid);
+        if (now_start > 0 && now_start != start_sec) return false;   // the pid was reused
+    }
+    return true;                                      // alive, or we cannot tell: leave it be
+}
+
+int64_t creating_min_age_secs(void) {
+    if (const char *e = ::getenv("WORLD_GC_CREATING_MIN_AGE")) {
+        char *end = nullptr;
+        long long v = ::strtoll(e, &end, 10);
+        if (end != e && v >= 0) return (int64_t)v;
+    }
+    return 60;
+}
+
+namespace {
+struct ThreadsProbe { unsigned ran = 0; };
+void *threads_probe_worker(void *p) {
+    __atomic_fetch_add(&((ThreadsProbe *)p)->ran, 1u, __ATOMIC_RELAXED);
+    return nullptr;
+}
+} // namespace
+
 int fs_mkfile(const char *path, uint32_t mode) {
     int fd = ::open(path, O_CREAT | O_EXCL | O_WRONLY, (mode_t)mode);
     if (fd < 0) return -errno;
@@ -102,6 +195,50 @@ int fs_symlink(const char *target, const char *path) { return ::symlink(target, 
 int fs_link(const char *existing, const char *path) { return ::link(existing, path) ? -errno : 0; }
 int fs_unlink(const char *path, bool is_dir) { return (is_dir ? ::rmdir(path) : ::unlink(path)) ? -errno : 0; }
 int fs_rename(const char *from, const char *to) { return ::rename(from, to) ? -errno : 0; }
+
+// The publish rename (P8), for the one case where `to` is a path the user chose. rename(2) is
+// happy to replace an existing empty directory, so the plain call would turn "there is already
+// something at --to" into a silent deletion the moment anything creates that directory between
+// P7's check and here. RENAME_EXCL makes the kernel do the check at the instant of the rename:
+// EEXIST, never a replacement.
+int fs_rename_excl(const char *from, const char *to) {
+#ifdef __APPLE__
+    return ::renameatx_np(AT_FDCWD, from, AT_FDCWD, to, RENAME_EXCL) ? -errno : 0;
+#elif defined(RENAME_NOREPLACE) && defined(SYS_renameat2)
+    return ::syscall(SYS_renameat2, AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE) ? -errno : 0;
+#else
+    // Last resort: a window remains, but a target that is there *now* is still never replaced.
+    struct stat st;
+    if (::lstat(to, &st) == 0) return -EEXIST;
+    return ::rename(from, to) ? -errno : 0;
+#endif
+}
+
+// ---- PR #1 review (36th round, P1): the exchange ---------------------------------------------
+//
+// rename(2) with the two entries swapped instead of one replacing the other. The 2 -> 3 upgrade
+// needs it because the name M1 opens must never be free for an instant: the stub directory and
+// the database change places in one step, and there is no window in between for an
+// SQLITE_OPEN_CREATE to slip into. Measured on APFS (scratchpad probe): a DIRECTORY and a
+// REGULAR FILE exchange cleanly in both directions -- the directory keeps its mode, the file
+// keeps its inode, its size and its link count.
+//
+// Linux has the same thing as renameat2(RENAME_EXCHANGE) and is deferred anyway
+// (docs/M1_DESIGN.md P13); a platform with neither says so with -ENOSYS, and the caller refuses
+// the upgrade rather than taking it apart in two steps. There is no gapless fallback: every
+// sequence of plain renames has an instant with nothing at one of the two names, which is the
+// whole of what this call exists to avoid.
+int fs_rename_swap(const char *a, const char *b) {
+#ifdef __APPLE__
+    return ::renameatx_np(AT_FDCWD, a, AT_FDCWD, b, RENAME_SWAP) ? -errno : 0;
+#elif defined(RENAME_EXCHANGE) && defined(SYS_renameat2)
+    return ::syscall(SYS_renameat2, AT_FDCWD, a, AT_FDCWD, b, RENAME_EXCHANGE) ? -errno : 0;
+#else
+    (void)a;
+    (void)b;
+    return -ENOSYS;
+#endif
+}
 
 int fs_setattr(const char *path, const wfs_setattr_req &r) {
     if (r.valid & WFS_SET_SIZE) { if (::truncate(path, (off_t)r.size) != 0) return -errno; }
@@ -322,6 +459,13 @@ int fs_realpath_parent(const char *path, String &out) {
 // One dynamic queue of directories, N pthread workers (arch.md §39 forbids std::thread and
 // std::mutex, and 4 workers is where APFS metadata transactions stop scaling -- see
 // docs/CLONE_MODEL_MACOS27.md §9.2, where 8 and 16 threads were slower than 4).
+//
+// T2.4: a directory is read with getattrlistbulk(2) where the file system can (one syscall per
+// batch instead of one fstatat per entry, and every entry arrives with the EF_NO_XATTRS verdict
+// attached -- see platform_darwin.cpp for the attribute list and the measurements). readdir(3) +
+// fstatat(2) is still here, unchanged: it is the whole story on Linux, and on Darwin it is what
+// a file system that cannot serve the bulk call falls back to. The fallback verdict is taken
+// before a single entry has been reported, so nothing is ever reported twice.
 
 namespace {
 
@@ -340,42 +484,82 @@ struct Walk {
     bool done = false;
     int err = 0;
     void *ctx = nullptr;
-    fs_entry_fn fn = nullptr;
+    fs_entry_ex_fn fn = nullptr;
     fs_dir_order order = FS_DIRS_PRE;
 };
 
-void walk_child(Walk &w, const Job &parent, const char *name, size_t nlen, Job &out) {
+void walk_child(const Job &parent, const char *name, Job &out) {
     out.path = parent.path;
     if (out.path.size() && out.path.c_str()[out.path.size() - 1] != '/') out.path.append("/");
     out.path.append(name);
     out.rel = parent.rel;
     if (out.rel.size()) out.rel.append("/");
     out.rel.append(name);
-    (void)w;
-    (void)nlen;
+}
+
+// The per-entry half of walk_dir, shared by the bulk path and the readdir path so that the two
+// cannot drift apart. A non-zero return aborts the walk.
+struct DirScan {
+    Walk *w;
+    const Job *job;
+    Vec<Job> *subdirs;
+};
+
+int walk_one(DirScan &s, const char *name, const struct stat &st, uint8_t xattr) {
+    Job child;
+    walk_child(*s.job, name, child);
+    bool is_dir = S_ISDIR(st.st_mode);
+    if (is_dir) s.subdirs->emplace_back(child);
+    if (is_dir && s.w->order != FS_DIRS_PRE) return 0;
+    FsEntry e{child.path.c_str(), child.rel.c_str(), &st, is_dir, xattr};
+    return s.w->fn(s.w->ctx, e);
+}
+
+int walk_bulk_entry(void *ctx, const char *name, size_t, const struct stat &st, uint8_t xattr) {
+    return walk_one(*(DirScan *)ctx, name, st, xattr);
 }
 
 // Returns a negative errno to abort the whole walk.
 int walk_dir(Walk &w, const Job &job) {
-    DIR *d = ::opendir(job.path.c_str());
-    if (!d) return -errno;
-    int fd = ::dirfd(d);
-    int rc = 0;
     Vec<Job> subdirs;
-    while (struct dirent *e = ::readdir(d)) {
-        if (e->d_name[0] == '.' && (e->d_name[1] == 0 || (e->d_name[1] == '.' && e->d_name[2] == 0))) continue;
-        struct stat st;
-        if (::fstatat(fd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) { rc = -errno; break; }
-        Job child;
-        walk_child(w, job, e->d_name, strlen(e->d_name), child);
-        if (S_ISDIR(st.st_mode)) {
-            subdirs.emplace_back(child);
-            if (w.order == FS_DIRS_PRE) { if ((rc = w.fn(w.ctx, child.path.c_str(), child.rel.c_str(), st, true))) break; }
-        } else {
-            if ((rc = w.fn(w.ctx, child.path.c_str(), child.rel.c_str(), st, false))) break;
+    DirScan scan{&w, &job, &subdirs};
+    int rc = 0;
+
+    int fd = ::open(job.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    int bulk = fs_bulk_dir(fd, &scan, walk_bulk_entry, &rc);
+    if (bulk == 0) {
+        ::close(fd);
+    } else if (bulk != -ENOTSUP) {
+        ::close(fd);
+        return bulk;
+    } else {
+        // No bulk enumeration here (another file system, or an older kernel): readdir(3) +
+        // fstatat(2), from the top, with nothing reported yet.
+        if (::lseek(fd, 0, SEEK_SET) < 0) { ::close(fd); return -errno; }
+        DIR *d = ::fdopendir(fd);
+        if (!d) { int e = errno; ::close(fd); return -e; }
+        // PR #1 review (23rd round, P2): readdir(3) returns NULL for the end of the directory
+        // AND for a failure part way through it, and the two are told apart by errno alone.
+        // Read as "the directory ended", an EIO or a stale handle made this walk return 0 with
+        // fewer entries than the tree has -- a clone missing files, a manifest missing lines, a
+        // diff missing changes, all of them reported as success. Same rule as the 12th round:
+        // an error is not an absence. errno is cleared before every call, so what is read after
+        // a NULL is this readdir's own.
+        for (;;) {
+            errno = 0;
+            struct dirent *e = ::readdir(d);
+            if (!e) {
+                if (errno) rc = -errno;
+                break;
+            }
+            if (e->d_name[0] == '.' && (e->d_name[1] == 0 || (e->d_name[1] == '.' && e->d_name[2] == 0))) continue;
+            struct stat st;
+            if (::fstatat(fd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) { rc = -errno; break; }
+            if ((rc = walk_one(scan, e->d_name, st, FS_XATTR_UNKNOWN))) break;
         }
+        ::closedir(d);
     }
-    ::closedir(d);
     if (rc) return rc;
     if (subdirs.size()) {
         pthread_mutex_lock(&w.mu);
@@ -413,11 +597,15 @@ void *walk_worker(void *arg) {
 
 } // namespace
 
-int fs_walk_tree(const char *root, int threads, fs_dir_order order, void *ctx, fs_entry_fn fn) {
+int fs_walk_tree_ex(const char *root, int threads, fs_dir_order order, void *ctx, fs_entry_ex_fn fn) {
     if (!root || !fn) return -EINVAL;
     struct stat rst;
-    if (::lstat(root, &rst) != 0) return -errno;
-    if (!S_ISDIR(rst.st_mode)) return fn(ctx, root, "", rst, false);
+    uint8_t rxa = FS_XATTR_UNKNOWN;
+    if (int rc = fs_lstat_xattr(root, rst, rxa)) return rc;
+    if (!S_ISDIR(rst.st_mode)) {
+        FsEntry e{root, "", &rst, false, rxa};
+        return fn(ctx, e);
+    }
 
     Walk w;
     pthread_mutex_init(&w.mu, nullptr);
@@ -433,7 +621,8 @@ int fs_walk_tree(const char *root, int threads, fs_dir_order order, void *ctx, f
     r.path.assign(root);
     r.rel.assign("");
     if (order == FS_DIRS_PRE) {
-        if (int rc = fn(ctx, r.path.c_str(), "", rst, true)) {
+        FsEntry e{r.path.c_str(), "", &rst, true, rxa};
+        if (int rc = fn(ctx, e)) {
             pthread_mutex_destroy(&w.mu);
             pthread_cond_destroy(&w.cv);
             return rc;
@@ -447,9 +636,7 @@ int fs_walk_tree(const char *root, int threads, fs_dir_order order, void *ctx, f
         walk_worker(&w);
     } else {
         pthread_t th[16];
-        int started = 0;
-        for (int i = 0; i < threads; ++i)
-            if (pthread_create(&th[i], nullptr, walk_worker, &w) == 0) ++started;
+        int started = threads_start(th, threads, walk_worker, &w);
         if (started == 0) { w.threads = 1; walk_worker(&w); }
         else {
             if (started != threads) { pthread_mutex_lock(&w.mu); w.threads = started; pthread_cond_broadcast(&w.cv); pthread_mutex_unlock(&w.mu); }
@@ -461,13 +648,36 @@ int fs_walk_tree(const char *root, int threads, fs_dir_order order, void *ctx, f
     if (!rc && order == FS_DIRS_POST) {
         for (size_t i = w.dirs.size(); i-- > 0;) {
             struct stat st;
+            // Directories only, and a directory's xattr verdict is never used by anyone
+            // (diff.cpp compares nothing about a directory that exists on both sides), so a
+            // plain lstat is both right and one syscall cheaper than fs_lstat_xattr here.
             if (::lstat(w.dirs[i].path.c_str(), &st) != 0) { rc = -errno; break; }
-            if ((rc = fn(ctx, w.dirs[i].path.c_str(), w.dirs[i].rel.c_str(), st, true))) break;
+            FsEntry e{w.dirs[i].path.c_str(), w.dirs[i].rel.c_str(), &st, true, FS_XATTR_UNKNOWN};
+            if ((rc = fn(ctx, e))) break;
         }
     }
     pthread_mutex_destroy(&w.mu);
     pthread_cond_destroy(&w.cv);
     return rc;
+}
+
+namespace {
+// fs_walk_tree is fs_walk_tree_ex with the xattr verdict dropped: every caller that does not
+// compare xattrs (clone, protect, count, scan, verify) keeps the signature it always had.
+struct PlainWalk {
+    void *ctx;
+    fs_entry_fn fn;
+};
+int plain_entry(void *ctx, const FsEntry &e) {
+    PlainWalk *p = (PlainWalk *)ctx;
+    return p->fn(p->ctx, e.path, e.rel, *e.st, e.is_dir);
+}
+} // namespace
+
+int fs_walk_tree(const char *root, int threads, fs_dir_order order, void *ctx, fs_entry_fn fn) {
+    if (!fn) return -EINVAL;
+    PlainWalk p{ctx, fn};
+    return fs_walk_tree_ex(root, threads, order, &p, plain_entry);
 }
 
 namespace {
@@ -538,9 +748,14 @@ void Manifest::line(const char *rel, const struct stat &st, bool is_dir) {
     Guard g(mu);
     if (!f) return;
     fwrite(head, 1, (size_t)n, f);
+    // PR #1 review (12th round): backslash, LF and CR -- the three bytes a line-oriented format
+    // cannot carry raw. CR was missing, and wfs_snapshot_verify's reader stripped a trailing one
+    // as if this file had CRLF line endings, so every name ending in CR was read back one byte
+    // short: `verify` called a perfectly good snapshot modified.
     for (const char *p = rel; *p; ++p) {
         if (*p == '\\') fputs("\\\\", f);
         else if (*p == '\n') fputs("\\n", f);
+        else if (*p == '\r') fputs("\\r", f);
         else fputc(*p, f);
     }
     fputc('\n', f);
@@ -560,14 +775,24 @@ namespace {
 // Depth-first, single threaded: what this removes is trash and half-built trees, never
 // anything on a latency path. Unlinking entries while a parallel readdir is in flight is
 // the kind of cleverness that loses a directory.
-int rm_rec(const char *path) {
+//
+// PR #1 review (4th round): `deadline` (an fs_mono_us() stamp, 0 = no limit) is read once per
+// entry, exactly as the parallel deleter's rm_entry reads it. Out of time is -ECANCELED, which
+// unwinds without rmdir'ing anything on the way out -- the tree is a `.deleting` one and what
+// is left of it is resumable by construction.
+int rm_rec(const char *path, int64_t deadline) {
+    if (deadline && fs_mono_us() >= deadline) return -ECANCELED;
     struct stat st;
     if (::lstat(path, &st) != 0) return errno == ENOENT ? 0 : -errno;
     if (!S_ISDIR(st.st_mode)) return ::unlink(path) == 0 || errno == ENOENT ? 0 : -errno;
+    // The write bit that unlink(2) needs is the directory's, not the entry's, and a tree can
+    // perfectly well contain a 0555 directory of the source's own making (PR #1 review, 4th
+    // round: the parallel deleter's rm_entry already chmods the parent on EACCES, and this is
+    // the path that has to survive the same trees). We are deleting the thing, so taking the
+    // mode off for good is exactly right -- as it is for a gate-protected 0000 root.
+    if ((st.st_mode & 0700) != 0700) ::chmod(path, (mode_t)((st.st_mode & 07777) | 0700));
     DIR *d = ::opendir(path);
     if (!d && errno == EACCES) {
-        // A gate-protected snapshot root is 0000. We are deleting the thing, so opening the
-        // gate for good is exactly right.
         ::chmod(path, 0700);
         d = ::opendir(path);
     }
@@ -578,7 +803,7 @@ int rm_rec(const char *path) {
         String child(path);
         child.append("/");
         child.append(e->d_name);
-        if ((rc = rm_rec(child.c_str()))) break;
+        if ((rc = rm_rec(child.c_str(), deadline))) break;
     }
     ::closedir(d);
     if (rc) return rc;
@@ -586,14 +811,338 @@ int rm_rec(const char *path) {
 }
 } // namespace
 
-int fs_remove_tree(const char *root) {
+int fs_remove_tree(const char *root, int64_t deadline_us, int *partial) {
+    if (partial) *partial = 0;
     struct stat st;
     if (::lstat(root, &st) != 0) return errno == ENOENT ? 0 : -errno;
-    if (S_ISDIR(st.st_mode)) fs_unprotect_tree(root);   // snapshots are UF_IMMUTABLE all the way down
-    return rm_rec(root);
+    // snapshots are UF_IMMUTABLE all the way down. That walk is O(tree) too, so it gets the
+    // deadline as well -- a fallback that spent its whole budget unprotecting would be the
+    // same unbounded wake by another name.
+    if (S_ISDIR(st.st_mode) && fs_unprotect_tree(root, deadline_us) == -ECANCELED) {
+        if (partial) *partial = 1;
+        return 0;
+    }
+    int rc = rm_rec(root, deadline_us);
+    if (rc == -ECANCELED) {
+        if (partial) *partial = 1;
+        return 0;
+    }
+    return rc;
+}
+
+int64_t fs_mono_us(void) {
+    struct timespec ts;
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + (int64_t)ts.tv_nsec / 1000;
+}
+
+// ---- T2.1: the parallel deleter --------------------------------------------------------------
+//
+// The same 4-thread walker that clones and scans, used to unlink. Files go in the parallel
+// phase (one unlinkat per entry, spread over the workers), directories in the serial tail the
+// walker already does deepest-first -- a parent must not be rmdir'ed before its children.
+//
+// `entries` counts what was actually removed, which is what the gc worker reports as progress.
+// Every failure path degrades to the single-threaded rm_rec above rather than leaving half a
+// tree: this is deletion, and a partially deleted tree is exactly what the .deleting rename in
+// world.cpp exists to make safe.
+namespace {
+
+struct RmCtx {
+    uint64_t entries = 0;
+    int err = 0;
+    int64_t deadline = 0;   // fs_mono_us() stamp; 0 = no limit
+};
+
+// One unlink. UF_IMMUTABLE (a --hard snapshot that was not unprotected first) and a directory
+// whose write bit was stripped both surface as EPERM/EACCES; clear them and try once more.
+int rm_entry(void *ctx, const char *path, const char *rel, const struct stat &st, bool is_dir) {
+    RmCtx *c = (RmCtx *)ctx;
+    // The batch limit, enforced where the work actually is. One clock read against an unlink
+    // that measures ~50 us is not worth optimising, and -ECANCELED aborts the walk before the
+    // deepest-first directory tail runs, so what is left behind is a tree with whole
+    // subdirectories still in it rather than a scattering of empty ones.
+    if (c->deadline && fs_mono_us() >= c->deadline) return -ECANCELED;
+    if (!*rel && !is_dir) { // the walker was handed a non-directory
+        if (::unlink(path) != 0 && errno != ENOENT) return -errno;
+        bump(c->entries);
+        return 0;
+    }
+    if (is_dir) {
+        if (::rmdir(path) == 0 || errno == ENOENT) { if (*rel) bump(c->entries); return 0; }
+        int e = errno;
+        if (e == EPERM || e == EACCES || e == ENOTEMPTY) {
+#ifdef __APPLE__
+            ::lchflags(path, 0);
+#endif
+            ::chmod(path, 0700);
+            if (::rmdir(path) == 0 || errno == ENOENT) { if (*rel) bump(c->entries); return 0; }
+            e = errno;
+        }
+        // Still not empty: the walk unlinks entries while the same DIR stream is being read,
+        // and POSIX leaves it unspecified whether readdir(3) returns an entry removed after
+        // opendir(3). (Measured on APFS: 4 x 10 401 entries, none missed -- fts(3) and rm -rf
+        // rely on the same behaviour.) If it ever does happen, finish this one directory the
+        // certain way rather than failing the whole tree.
+        if (e == ENOTEMPTY) {
+            int r2 = rm_rec(path, c->deadline);
+            if (r2 == 0) { if (*rel) bump(c->entries); return 0; }
+            if (r2 == -ECANCELED) return -ECANCELED;   // the batch limit, not a failure
+            e = ENOTEMPTY;
+        }
+        return -e;
+    }
+    if (::unlink(path) == 0 || errno == ENOENT) { bump(c->entries); return 0; }
+    int e = errno;
+    if (e == EPERM || e == EACCES) {
+#ifdef __APPLE__
+        ::lchflags(path, 0);
+#endif
+        // The write bit that matters for unlink(2) is the parent's, not the entry's.
+        const char *slash = ::strrchr(path, '/');
+        if (slash && slash != path) {
+            String parent;
+            parent.append(path, (size_t)(slash - path));
+#ifdef __APPLE__
+            ::lchflags(parent.c_str(), 0);
+#endif
+            ::chmod(parent.c_str(), 0700);
+        }
+        if (::unlink(path) == 0 || errno == ENOENT) { bump(c->entries); return 0; }
+        e = errno;
+    }
+    (void)st;
+    return -e;
+}
+
+} // namespace
+
+// ---- PR #1 review (26th round, P1): the same deletion, by descriptor ------------------------
+//
+// fs_remove_tree/fs_remove_tree_parallel above walk a tree by NAME: every opendir, unlink and
+// rmdir re-resolves the whole path from the root, so what they remove is whatever the name
+// happens to lead to at the instant of each call. For the trash that is one guarantee short.
+// The collector proves an entry is the row's tree (its dev/ino), and it is that proof, not the
+// name, that authorises the deletion -- so the deletion has to be done through the descriptor
+// the proof was made on. `dirfd` is the caller's, already opened and already checked; this
+// removes everything INSIDE it and leaves the (now empty) directory itself for the caller,
+// which is the one name it still has to use and which it re-checks against this descriptor
+// before it rmdirs it (world.cpp, trash_unlink_claim).
+//
+// Nothing here ever names the root. Every step is openat/fstatat/unlinkat relative to a
+// descriptor we already hold, O_NOFOLLOW and AT_SYMLINK_NOFOLLOW everywhere, so no symlink is
+// ever followed and nothing outside the tree the descriptor points at can be reached, whatever
+// anybody renames underneath us while the walk runs.
+//
+// Serial, unlike fs_remove_tree_parallel: the parallel walker hands its workers paths and does
+// its rmdirs from a deepest-first list of paths, so making it descend by descriptor is a
+// rewrite of the walker rather than a change to the deleter. The cost is measured in
+// docs/TASKS.md (26th round). One descriptor per level of depth, like the path-based
+// single-threaded remover's one DIR per level.
+namespace {
+
+// The write/search bits and the immutable flag of the directory we are standing in -- cleared
+// through the descriptor, never by name. We are deleting what is under it, so taking the mode
+// off for good is exactly right (docs/M1_DESIGN.md §3 P4, and the 4th/18th rounds for the
+// path-based remover's version of the same lend).
+void rm_fd_unlock_dir(int fd) {
+#ifdef __APPLE__
+    ::fchflags(fd, 0);
+#endif
+    struct stat st;
+    if (::fstat(fd, &st) == 0 && (st.st_mode & 0700) != 0700)
+        ::fchmod(fd, (mode_t)((st.st_mode & 07777) | 0700));
+}
+
+// The same for one child, which needs a descriptor of its own because there is no fchflagsat(2).
+// Only the three types a world tree is made of are opened: a fifo or a device would block or
+// have side effects on open(2), and an immutable one of those is not a state this core can
+// produce (only `--hard` snapshots set UF_IMMUTABLE, and their trash entry is inside the store
+// and keeps the path-based remover -- see world.cpp).
+void rm_fd_unlock_child(int fd, const char *name, const struct stat &st) {
+#ifdef __APPLE__
+    int flags = O_RDONLY | O_NONBLOCK | O_CLOEXEC;
+    if (S_ISLNK(st.st_mode)) flags |= O_SYMLINK;
+    else if (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode)) flags |= O_NOFOLLOW;
+    else return;
+    int cfd = ::openat(fd, name, flags);
+    if (cfd < 0) return;
+    ::fchflags(cfd, 0);
+    if (S_ISDIR(st.st_mode)) ::fchmod(cfd, 0700);
+    ::close(cfd);
+#else
+    (void)fd;
+    (void)name;
+    (void)st;
+#endif
+}
+
+// Open a child directory for the walk. The one case that cannot be done through a descriptor is
+// a directory whose own bits keep it from being opened at all (a 0555 of the source's making, a
+// gate-protected 0000 root): there is no fchmod without a descriptor, so the bits are lent by
+// name -- AT_SYMLINK_NOFOLLOW where the platform has it, and the O_NOFOLLOW|O_DIRECTORY open
+// that follows is what proves again that the name is the directory we stat'ed and not a symlink
+// somebody has just put there. Returns the fd, or a negative errno.
+int rm_fd_open_child(int fd, const char *name, const struct stat &st) {
+    int cfd = ::openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (cfd >= 0) return cfd;
+    int e = errno;
+    if (e != EACCES && e != EPERM) return -e;
+    mode_t want = (mode_t)((st.st_mode & 07777) | 0700);
+#ifdef AT_SYMLINK_NOFOLLOW
+    if (::fchmodat(fd, name, want, AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOTSUP)
+        ::fchmodat(fd, name, want, 0);
+#else
+    ::fchmodat(fd, name, want, 0);
+#endif
+    cfd = ::openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    return cfd >= 0 ? cfd : -errno;
+}
+
+// rmdir of one emptied child, from the descriptor of the directory it is in.
+int rm_fd_rmdir(int fd, const char *name) {
+    if (::unlinkat(fd, name, AT_REMOVEDIR) == 0 || errno == ENOENT) return 0;
+    int e = errno;
+    if (e == EPERM || e == EACCES) {
+        rm_fd_unlock_dir(fd);
+        struct stat st;
+        if (::fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0) rm_fd_unlock_child(fd, name, st);
+        if (::unlinkat(fd, name, AT_REMOVEDIR) == 0 || errno == ENOENT) return 0;
+        e = errno;
+    }
+    return -e;
+}
+
+// Empties the directory `d` reads and closes `d`. `deadline` is an fs_mono_us() stamp checked
+// per entry, exactly as rm_rec and rm_entry check it, and -ECANCELED unwinds without rmdir'ing
+// anything on the way out.
+int rm_fd_walk(DIR *d, uint64_t *entries, int64_t deadline) {
+    int fd = ::dirfd(d);
+    int rc = 0;
+    while (struct dirent *e = ::readdir(d)) {
+        const char *nm = e->d_name;
+        if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) continue;
+        if (deadline && fs_mono_us() >= deadline) { rc = -ECANCELED; break; }
+        struct stat st;
+        if (::fstatat(fd, nm, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno == ENOENT) continue;
+            rc = -errno;
+            break;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            // Twice at most: the walk unlinks entries while the same DIR stream is being read,
+            // and POSIX leaves it unspecified whether readdir(3) hands back an entry removed
+            // after opendir(3). The path-based deleter answers an ENOTEMPTY here by finishing
+            // that one directory with rm_rec; this starts it again instead, which is the same
+            // remedy without a name.
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                int cfd = rm_fd_open_child(fd, nm, st);
+                if (cfd < 0) { rc = cfd == -ENOENT ? 0 : cfd; break; }
+                DIR *cd = ::fdopendir(cfd);
+                if (!cd) { rc = -errno; ::close(cfd); break; }
+                rc = rm_fd_walk(cd, entries, deadline);   // closes cd
+                if (rc) break;
+                rc = rm_fd_rmdir(fd, nm);
+                if (rc != -ENOTEMPTY) break;
+            }
+            if (rc) break;
+            if (entries) bump(*entries);
+            continue;
+        }
+        if (::unlinkat(fd, nm, 0) == 0 || errno == ENOENT) { if (entries) bump(*entries); continue; }
+        int e2 = errno;
+        if (e2 == EPERM || e2 == EACCES) {
+            // The write bit that unlink(2) needs is this directory's, not the entry's; and
+            // UF_IMMUTABLE can be on either. Both are cleared through descriptors.
+            rm_fd_unlock_dir(fd);
+            rm_fd_unlock_child(fd, nm, st);
+            if (::unlinkat(fd, nm, 0) == 0 || errno == ENOENT) {
+                if (entries) bump(*entries);
+                continue;
+            }
+            e2 = errno;
+        }
+        rc = -e2;
+        break;
+    }
+    ::closedir(d);
+    return rc;
+}
+
+} // namespace
+
+int fs_remove_tree_fd(int dirfd, int threads, uint64_t *entries, int64_t deadline_us, int *partial) {
+    (void)threads;   // serial by construction; see the note above
+    if (partial) *partial = 0;
+    if (dirfd < 0) return -EBADF;
+    struct stat st;
+    if (::fstat(dirfd, &st) != 0) return -errno;
+    if (!S_ISDIR(st.st_mode)) return -ENOTDIR;
+    rm_fd_unlock_dir(dirfd);
+    // fdopendir(3) takes the descriptor it is given, and this one is the caller's -- it has to
+    // outlive the walk, because the caller's last two checks are made against it.
+    int dup_fd = ::dup(dirfd);
+    if (dup_fd < 0) return -errno;
+    DIR *d = ::fdopendir(dup_fd);
+    if (!d) {
+        int e = errno;
+        ::close(dup_fd);
+        return -e;
+    }
+    ::rewinddir(d);
+    int rc = rm_fd_walk(d, entries, deadline_us);
+    if (rc == -ECANCELED) {
+        // Out of time, not out of luck: exactly the contract fs_remove_tree_parallel has.
+        if (partial) *partial = 1;
+        return 0;
+    }
+    return rc;
+}
+
+int fs_remove_tree_parallel(const char *root, int threads, uint64_t *entries, int64_t deadline_us,
+                            int *partial) {
+    if (partial) *partial = 0;
+    struct stat st;
+    if (::lstat(root, &st) != 0) return errno == ENOENT ? 0 : -errno;
+    if (!S_ISDIR(st.st_mode)) {
+        if (::unlink(root) != 0 && errno != ENOENT) return -errno;
+        if (entries) (*entries)++;
+        return 0;
+    }
+    // A gate-protected root is 0000 and cannot even be opened. We are deleting it, so opening
+    // the gate for good is exactly right (docs/M1_DESIGN.md §3 P4).
+    if (::access(root, R_OK | X_OK | W_OK) != 0) ::chmod(root, 0700);
+    RmCtx c;
+    c.deadline = deadline_us;
+    int rc = fs_walk_tree(root, threads, FS_DIRS_POST, &c, rm_entry);
+    if (entries) *entries += c.entries;
+    if (rc == 0) return 0;
+    // Out of time, not out of luck: the tree is half gone and the caller is told to come back.
+    if (rc == -ECANCELED) {
+        if (partial) *partial = 1;
+        return 0;
+    }
+    // Anything at all went wrong: finish the job the slow, certain way -- under the same
+    // deadline (PR #1 review, 4th round). Without it a single EACCES directory in a 120k-entry
+    // trash tree turned a one-second worker wake into an unbounded one, which is exactly the
+    // foreground contention max_secs exists to bound.
+    return fs_remove_tree(root, deadline_us, partial);
 }
 
 #ifndef __APPLE__
+// There is no getattrlistbulk(2) outside Darwin: the walk uses readdir(3) + fstatat(2) and
+// nobody can say anything about xattrs without calling listxattr, which is exactly what
+// FS_XATTR_UNKNOWN means.
+int fs_bulk_dir(int, void *, fs_bulk_entry_fn, int *cb_rc) {
+    if (cb_rc) *cb_rc = 0;
+    return -ENOTSUP;
+}
+int fs_lstat_xattr(const char *path, struct stat &st, uint8_t &xattr) {
+    xattr = FS_XATTR_UNKNOWN;
+    if (!path) return -EINVAL;
+    return ::lstat(path, &st) == 0 ? 0 : -errno;
+}
+
 // Linux/other: the clonefile world model is Darwin-only for now. overlayfs is the planned
 // equivalent (docs/M1_DESIGN.md §4); until then these report "unsupported" honestly rather
 // than silently doing a real copy.
@@ -603,8 +1152,31 @@ int fs_protect_tree(const char *root, TreeStats *stats, Manifest *) {
     if (stats) return fs_count_entries(root, *stats);
     return 0;
 }
-int fs_unprotect_tree(const char *) { return 0; }
+int fs_unprotect_tree(const char *, int64_t) { return 0; }
 uint64_t fs_events_current_id(void) { return 0; }
 #endif
 
 } // namespace wfs
+
+// PR #1 review (3rd round). A unit test of threads_start, because the bug it fixes is not one a
+// caller can reliably observe: joining a pthread_t that was never written is undefined, and on a
+// good day it merely fails. Here the array is zeroed first, so an unwritten slot is a handle no
+// join can succeed on, and the contract is checked directly: threads_start writes the handles it
+// really started into th[0..n), every one of them joins, and the number of workers that ran is
+// the number that were joined -- nobody left running behind the caller's back.
+extern "C" int wfs_test_threads_start(int want, unsigned fail_mask, int *started, int *joined) {
+    if (want <= 0 || want > 16 || !started || !joined) return -EINVAL;
+    pthread_t th[16];
+    memset(th, 0, sizeof th);
+    unsigned save = wfs_test_thread_fail_mask;
+    wfs_test_thread_fail_mask = fail_mask;
+    wfs::ThreadsProbe probe;
+    int n = wfs::threads_start(th, want, wfs::threads_probe_worker, &probe);
+    wfs_test_thread_fail_mask = save;
+    int ok = 0;
+    for (int i = 0; i < n; ++i)
+        if (::pthread_join(th[i], nullptr) == 0) ++ok;
+    *started = n;
+    *joined = ok;
+    return (unsigned)ok == __atomic_load_n(&probe.ran, __ATOMIC_RELAXED) ? 0 : -EIO;
+}

@@ -10,6 +10,11 @@
 //   3. full scan    `--full`, or any of the fallbacks: two parallel walks (4 threads, the
 //                   walker from platform_posix.cpp) doing the same per-path comparison.
 //
+// T2.4: both the walk and the per-path lookup on the other side come from getattrlistbulk(2) /
+// getattrlist(2) now, so every entry arrives with its EF_NO_XATTRS verdict already in hand and
+// the xattr leg of the comparison is skipped entirely for the files that have no xattrs -- which
+// is most of them. See platform_darwin.cpp for the attribute list and what each call costs.
+//
 // Reading the snapshot side goes through snapshot_open_for_read() so that there is exactly one
 // place to teach about gated snapshot roots.
 //
@@ -41,6 +46,12 @@ using wfs::Guard;
 using wfs::Mutex;
 using wfs::String;
 using wfs::Vec;
+
+// The test seam for the diff's xattr ignore rule (PR #1 review, 9th round). See worldfs.h:
+// com.apple.provenance is the one name the default diff drops and the one name a test cannot
+// make differ, so diff_test names an ordinary xattr here instead. Nothing in the library ever
+// assigns this; it is NULL in every run that is not diff_test.
+extern "C" const char *wfs_test_xattr_ignore = nullptr;
 
 namespace {
 
@@ -93,18 +104,40 @@ void join_rel(String &out, const char *root, const char *rel) {
     }
 }
 
-bool dir_is_empty(const char *p) {
+// PR #1 review (23rd round, P2): "is this directory empty?" with the errno kept -- the round-12
+// rule, in the one place of the diff that asks a directory a question. A bool over opendir(3)
+// answered "not empty" for EACCES, for EIO and for a volume that went away, and the caller then
+// reported nothing at all for a directory that exists on exactly one side: a silent hole in the
+// diff. Only a directory that was really read, to its end, is really empty; a directory that is
+// not there any more (a candidate the world removed while we were looking at it) is the one
+// failure that is an answer, and it reports nothing, as it always did. Returns 0 or -errno.
+int dir_is_empty(const char *p, bool &empty) {
+    empty = false;
     DIR *d = ::opendir(p);
-    if (!d) return false;
-    bool empty = true;
-    while (struct dirent *e = ::readdir(d)) {
+    if (!d) {
+        int rc = errno ? -errno : -EIO;
+        return wfs::fs_gone(rc) ? 0 : rc;
+    }
+    bool none = true;
+    int rc = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *e = ::readdir(d);
+        if (!e) {
+            // readdir(3) returns NULL for the end of the directory AND for a failure; the two
+            // are told apart by errno, and only the first one means "there was nothing".
+            if (errno) rc = -errno;
+            break;
+        }
         if (e->d_name[0] == '.' && (e->d_name[1] == 0 || (e->d_name[1] == '.' && e->d_name[2] == 0)))
             continue;
-        empty = false;
+        none = false;
         break;
     }
     ::closedir(d);
-    return empty;
+    if (rc) return rc;
+    empty = none;
+    return 0;
 }
 
 bool link_target_equal(const char *a, const char *b) {
@@ -142,42 +175,255 @@ bool content_equal(const char *a, const char *b, uint64_t *bytes) {
     return same;
 }
 
+// PR #1 review (P2): a listxattr(2) or getxattr(2) that *fails* says nothing whatever about the
+// attributes, and the old code read every negative return as "no attributes". Two files whose
+// xattrs could not be read then came out equal -- silently, and exactly in the cases where
+// silence is worst: EACCES (an ACL denying readextattr), EIO, an ERANGE retry that could not
+// allocate. Only a successful zero-length listxattr means "none"; every failure is a third
+// answer, and the caller turns it into a `T` and a counter, or into the diff's error.
+enum XattrCmp { XA_EQUAL = 0, XA_DIFFER = 1, XA_ERROR = 2 };
+
+// On XA_ERROR, which side could not be read and why. `a` is the world side, `b` the snapshot
+// side -- classify() cares about the difference: a snapshot is ours and is read under the gate,
+// so EACCES there is a broken store and not news about the workspace.
+struct XattrErr {
+    int a = 0, b = 0;
+};
+
 #ifdef __APPLE__
-bool xattr_value_equal(const char *a, const char *b, const char *name) {
+// An errno that is never 0, whatever the libc left behind.
+int errno_or(int fallback) { return errno ? errno : fallback; }
+
+// The slow path: a value too big for the stack buffer below, so its size has to be asked for
+// first. Two getxattr(2) per side instead of one, and getxattr is 14 µs on APFS.
+XattrCmp xattr_value_equal(const char *a, const char *b, const char *name, XattrErr &e) {
+    errno = 0;
     ssize_t sa = ::getxattr(a, name, nullptr, 0, 0, XATTR_NOFOLLOW);
+    int ea = sa < 0 ? errno_or(EIO) : 0;
+    errno = 0;
     ssize_t sb = ::getxattr(b, name, nullptr, 0, 0, XATTR_NOFOLLOW);
-    if (sa != sb) return false;
-    if (sa <= 0) return true;
+    int eb = sb < 0 ? errno_or(EIO) : 0;
+    // ENOATTR is an answer, not a failure: the name listxattr(2) handed us was removed in
+    // between, so that side genuinely does not have it any more. Anything else is a failure.
+    if (ea && ea != ENOATTR) { e.a = ea; return XA_ERROR; }
+    if (eb && eb != ENOATTR) { e.b = eb; return XA_ERROR; }
+    if ((ea != 0) != (eb != 0)) return XA_DIFFER;
+    if (ea && eb) return XA_EQUAL;   // gone from both
+    if (sa != sb) return XA_DIFFER;
+    if (sa == 0) return XA_EQUAL;
     char *va = (char *)::malloc((size_t)sa * 2);
-    if (!va) return true; // cannot tell: do not invent a difference
+    if (!va) { e.a = ENOMEM; return XA_ERROR; }   // cannot tell: and "cannot tell" is not "equal"
     char *vb = va + sa;
-    bool same = ::getxattr(a, name, va, (size_t)sa, 0, XATTR_NOFOLLOW) == sa &&
-                ::getxattr(b, name, vb, (size_t)sa, 0, XATTR_NOFOLLOW) == sa &&
-                memcmp(va, vb, (size_t)sa) == 0;
+    errno = 0;
+    ssize_t ga = ::getxattr(a, name, va, (size_t)sa, 0, XATTR_NOFOLLOW);
+    int ra = ga < 0 ? errno_or(EIO) : 0;
+    errno = 0;
+    ssize_t gb = ::getxattr(b, name, vb, (size_t)sa, 0, XATTR_NOFOLLOW);
+    int rb = gb < 0 ? errno_or(EIO) : 0;
+    XattrCmp rc;
+    if (ra) { e.a = ra; rc = XA_ERROR; }
+    else if (rb) { e.b = rb; rc = XA_ERROR; }
+    else if (ga != sa || gb != sa || memcmp(va, vb, (size_t)sa) != 0) rc = XA_DIFFER;
+    else rc = XA_EQUAL;
     ::free(va);
-    return same;
+    return rc;
 }
 
-bool xattr_equal(const char *a, const char *b) {
-    char la[4096], lb[4096];
-    ssize_t na = ::listxattr(a, la, sizeof la, XATTR_NOFOLLOW);
-    ssize_t nb = ::listxattr(b, lb, sizeof lb, XATTR_NOFOLLOW);
-    if (na < 0) na = 0;
-    if (nb < 0) nb = 0;
-    if (na != nb) return false;
-    if (na == 0) return true;
-    if (memcmp(la, lb, (size_t)na) != 0) return false; // a clone keeps the order
-    for (ssize_t i = 0; i < na;) {
-        const char *name = la + i;
-        size_t len = ::strnlen(name, (size_t)(na - i));
-        if (len == 0 || (ssize_t)(i + len) >= na) break;
-        if (!xattr_value_equal(a, b, name)) return false;
+// T2.4: ask for the value straight away rather than for its size and then its value. Almost
+// every xattr in the wild fits (com.apple.provenance is 11 bytes, FinderInfo 32, quarantine
+// ~70), and it halves the getxattr count: 55 µs per pair measured before, 35 µs after.
+const size_t kXattrInline = 1024;
+
+// The values behind a list of names (NUL-separated, `n` bytes), on both sides.
+XattrCmp xattr_values_equal(const char *a, const char *b, const char *names, size_t n, XattrErr &e) {
+    for (size_t i = 0; i < n;) {
+        const char *name = names + i;
+        size_t len = ::strnlen(name, n - i);
+        if (len == 0 || i + len >= n) break;
+        char va[kXattrInline], vb[kXattrInline];
+        ssize_t sa = ::getxattr(a, name, va, sizeof va, 0, XATTR_NOFOLLOW);
+        ssize_t sb = ::getxattr(b, name, vb, sizeof vb, 0, XATTR_NOFOLLOW);
+        if (sa < 0 || sb < 0) {
+            // ERANGE (a value over kXattrInline), the attribute going away between the
+            // listxattr and now, or a read that simply failed. Ask the careful way, which is
+            // the only one that tells the three apart.
+            XattrCmp c = xattr_value_equal(a, b, name, e);
+            if (c != XA_EQUAL) return c;
+        } else if (sa != sb || memcmp(va, vb, (size_t)sa) != 0) {
+            return XA_DIFFER;
+        }
+        i += len + 1;
+    }
+    return XA_EQUAL;
+}
+
+// listxattr(2) for one side, onto the stack when it fits and onto the heap when it does not.
+// Returns the byte count with *err == 0, or -1 with *err set -- so "empty" and "could not be
+// read" can never be confused, which is the whole point of this round of the review.
+ssize_t list_names(const char *path, char *stackbuf, size_t cap, char **heap, char **out, int *err) {
+    *heap = nullptr;
+    *err = 0;
+    errno = 0;
+    ssize_t n = ::listxattr(path, stackbuf, cap, XATTR_NOFOLLOW);
+    if (n >= 0) { *out = stackbuf; return n; }
+    if (errno != ERANGE) { *err = errno_or(EIO); return -1; }
+    errno = 0;
+    ssize_t need = ::listxattr(path, nullptr, 0, XATTR_NOFOLLOW);
+    if (need < 0) { *err = errno_or(EIO); return -1; }
+    if (need == 0) { *out = stackbuf; return 0; }
+    char *h = (char *)::malloc((size_t)need);
+    if (!h) { *err = ENOMEM; return -1; }
+    errno = 0;
+    n = ::listxattr(path, h, (size_t)need, XATTR_NOFOLLOW);
+    if (n < 0) { ::free(h); *err = errno_or(EIO); return -1; }
+    *heap = h;
+    *out = h;
+    return n;
+}
+
+// M2: `com.apple.provenance` is not workspace state. macOS 27 stamps it on every file a local
+// process creates, and it cannot be taken off again (removexattr fails; `xattr -d` silently
+// does nothing) -- it is the kernel's record of *which application created this file*, which
+// a fork's clone inherits and an agent never sets. Comparing it can therefore only ever
+// confirm what is never news, and it costs two listxattr(2) plus two getxattr(2) per
+// otherwise-identical file to do it. It is left out of the comparison by default;
+// `diff --all-xattrs` puts it back. `com.apple.quarantine` and everything else stay compared:
+// those are things that happen to a workspace, not to the kernel's bookkeeping.
+const char kProvenance[] = "com.apple.provenance";
+
+bool xattr_ignored(const char *name, size_t len, int flags) {
+    if (flags & WFS_DIFF_ALL_XATTRS) return false;
+    if (len == sizeof kProvenance - 1 && memcmp(name, kProvenance, len) == 0) return true;
+    // The test seam (PR #1 review, 9th round). Provenance is the one name the default diff
+    // drops and the one name a test cannot produce a difference in: the kernel stamps it on
+    // every file this process creates, with the same value every time, and setxattr(2) and
+    // removexattr(2) on it silently do nothing. So diff_test names a second, ordinary xattr
+    // here and the filtering treats it exactly like provenance. NULL in every run that is not
+    // diff_test; nothing in the library ever assigns it.
+    const char *t = wfs_test_xattr_ignore;
+    return t && ::strlen(t) == len && memcmp(name, t, len) == 0;
+}
+
+// PR #1 review (9th round): the ignored names, dropped from a raw listxattr(2) list in place.
+// The result is never longer than the input, so this is one pass and no allocation. The large-
+// name fallback below needs it for the same reason xattr_names() needs it: a list that still
+// holds provenance compares two otherwise-identical files as different, and the values behind
+// the filtered list are the ones that then get read.
+ssize_t filter_names(char *buf, ssize_t n, int flags) {
+    ssize_t used = 0;
+    for (ssize_t i = 0; i < n;) {
+        const char *name = buf + i;
+        size_t len = ::strnlen(name, (size_t)(n - i));
+        if (len == 0 || (ssize_t)(i + len) >= n) break;
+        if (!xattr_ignored(name, len, flags)) {
+            if (used != (ssize_t)i) memmove(buf + used, buf + i, len + 1);
+            used += (ssize_t)len + 1;
+        }
         i += (ssize_t)len + 1;
     }
-    return true;
+    return used;
+}
+
+// Every name both sides have, compared. The fallback for a file with more than kXattrNames
+// bytes of names, where the filtered-name path below cannot hold them.
+//
+// PR #1 review (9th round): and it filters too. It used to compare the raw lists and then the
+// raw values, so a file with enough retained names to overflow the bounded buffer was compared
+// by a different rule from every other file -- com.apple.provenance back in the comparison,
+// where it is one-sided on any pair of files the kernel stamped separately, and the default
+// diff reporting `T` on a file nothing had done anything to. The ignored names come out of both
+// lists first, exactly as xattr_names() takes them out of the bounded path, and the values that
+// are read afterwards are the ones behind the filtered list.
+XattrCmp xattr_equal_raw(const char *a, const char *b, int flags, XattrErr &e) {
+    char sa[4096], sb[4096], *ha = nullptr, *hb = nullptr, *la = nullptr, *lb = nullptr;
+    int ea = 0, eb = 0;
+    ssize_t na = list_names(a, sa, sizeof sa, &ha, &la, &ea);
+    ssize_t nb = list_names(b, sb, sizeof sb, &hb, &lb, &eb);
+    XattrCmp rc;
+    if (na < 0) { e.a = ea; rc = XA_ERROR; }
+    else if (nb < 0) { e.b = eb; rc = XA_ERROR; }
+    else {
+        na = filter_names(la, na, flags);
+        nb = filter_names(lb, nb, flags);
+        if (na != nb) rc = XA_DIFFER;
+        else if (na == 0) rc = XA_EQUAL;
+        else if (memcmp(la, lb, (size_t)na) != 0) rc = XA_DIFFER; // a clone keeps the order
+        else rc = xattr_values_equal(a, b, la, (size_t)na, e);
+    }
+    ::free(ha);
+    ::free(hb);
+    return rc;
+}
+
+const size_t kXattrNames = 4096;
+
+// xattr_names() return codes, so that the three outcomes stay distinguishable all the way up.
+const ssize_t kNamesTooMany = -1;   // more names than `out` holds: fall back to xattr_equal_raw
+const ssize_t kNamesFailed = -2;    // listxattr(2) failed: NOT "no attributes"
+
+// One side's names, in the order listxattr(2) reports them, with the ignored ones dropped. A
+// side the walk already declared EF_NO_XATTRS is not asked at all -- that is the free half of
+// the shortcut, and it stays, because EF_NO_XATTRS is the file system *succeeding* at saying
+// "none at all". A listxattr that fails is the opposite of that, and returns kNamesFailed.
+ssize_t xattr_names(const char *path, uint8_t state, int flags, char *out, size_t cap, int *err) {
+    *err = 0;
+    if (state == wfs::FS_XATTR_NONE) return 0;
+    char stackbuf[4096], *heap = nullptr, *raw = nullptr;
+    ssize_t n = list_names(path, stackbuf, sizeof stackbuf, &heap, &raw, err);
+    if (n < 0) return kNamesFailed;
+    if (n == 0) { ::free(heap); return 0; } // a real, successful "this file has no attributes"
+    ssize_t used = 0;
+    for (ssize_t i = 0; i < n;) {
+        const char *name = raw + i;
+        size_t len = ::strnlen(name, (size_t)(n - i));
+        if (len == 0 || (ssize_t)(i + len) >= n) break;
+        if (!xattr_ignored(name, len, flags)) {
+            if ((size_t)used + len + 1 > cap) {
+                ::free(heap);
+                return kNamesTooMany;
+            }
+            memcpy(out + used, name, len + 1);
+            used += (ssize_t)len + 1;
+        }
+        i += (ssize_t)len + 1;
+    }
+    ::free(heap);
+    return used;
+}
+
+// The xattr leg of the comparison, *and* the decision whether to make it at all.
+//
+// T2.4 gave the walk a free verdict per entry (ATTR_CMNEXT_EXT_FLAGS / EF_NO_XATTRS): when both
+// sides say "none at all", there is nothing to list and nothing to compare, and not one syscall
+// is made. EF_NO_XATTRS only ever denies, so that shortcut can skip work but never a difference
+// -- and, unlike a failed listxattr, it is an answer the file system gave on purpose, which is
+// why the PR #1 review's rule leaves it standing. The moment only *one* side has the bit, the
+// other side is listed for real, and a failure there is an error, not an empty list.
+//
+// M2 adds the other half. The flag is never set on a file this machine created (provenance is
+// always there), so on such a tree the shortcut never fired and the whole default scan paid for
+// it. Now, when the flag is not set, the names are listed and the ignored ones dropped first: a
+// file whose only xattr is provenance comes back with an empty list and counts as xattr-free,
+// exactly as if the file system had set the flag. Two listxattr(2) at 2.1 µs is what that costs;
+// the four getxattr(2) at 14 µs that used to follow are gone.
+XattrCmp xattr_equal(const char *a, const char *b, uint8_t axa, uint8_t bxa, int flags,
+                     XattrErr &e) {
+    if (axa == wfs::FS_XATTR_NONE && bxa == wfs::FS_XATTR_NONE) return XA_EQUAL;
+    char na[kXattrNames], nb[kXattrNames];
+    int ea = 0, eb = 0;
+    ssize_t la = xattr_names(a, axa, flags, na, sizeof na, &ea);
+    ssize_t lb = xattr_names(b, bxa, flags, nb, sizeof nb, &eb);
+    if (la == kNamesFailed) { e.a = ea; return XA_ERROR; }
+    if (lb == kNamesFailed) { e.b = eb; return XA_ERROR; }
+    if (la < 0 || lb < 0) return xattr_equal_raw(a, b, flags, e);  // more names than kXattrNames holds
+    if (la == 0 && lb == 0) return XA_EQUAL;                // nothing, or only ignored names
+    if (la != lb || memcmp(na, nb, (size_t)la) != 0) return XA_DIFFER; // a clone keeps the order
+    return xattr_values_equal(a, b, na, (size_t)la, e);
 }
 #else
-bool xattr_equal(const char *, const char *) { return true; }
+XattrCmp xattr_equal(const char *, const char *, uint8_t, uint8_t, int, XattrErr &) {
+    return XA_EQUAL;
+}
 #endif
 
 // ---- the record sink -------------------------------------------------------------------------
@@ -229,11 +475,51 @@ struct Ctx {
     int flags = 0;
     Sink *sink = nullptr;
     uint64_t compared = 0, content_cmp = 0, bytes_read = 0;
+    // PR #1 review (P2): entries whose xattrs could not be read on one side. They are reported
+    // as `T` -- never as equal -- and counted here so the caller can say the comparison was
+    // incomplete rather than pretend it was clean.
+    uint64_t xattr_errors = 0;
+    int fatal = 0;   // the first error that must end the whole diff (see note_fatal)
 };
 
-// Both sides exist. Returns 0 (identical), 'M' or 'T'.
-int classify(Ctx &c, const char *wpath, const struct stat &ws, const char *spath,
-             const struct stat &ss) {
+// A failure that is not about the workspace but about us. Recorded once, by whichever of the
+// four walk threads gets there first, and returned instead of a diff.
+void note_fatal(Ctx &c, int rc) {
+    int none = 0;
+    __atomic_compare_exchange_n(&c.fatal, &none, rc, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+}
+
+// The other side of a path. Normally one getattrlist(2), which brings the xattr verdict with
+// it; when that verdict cannot be used -- WFS_DIFF_NO_XATTR, or a directory, whose xattrs are
+// never compared (a directory present on both sides says nothing, see classify) -- it is a plain
+// lstat(2) instead, which is 1.41 µs against 1.78 and, for a directory, one syscall against two.
+int other_side(const Ctx &c, const char *path, struct stat &st, uint8_t &xa, bool want_xattr) {
+    if (!want_xattr || (c.flags & WFS_DIFF_NO_XATTR)) {
+        xa = wfs::FS_XATTR_UNKNOWN;
+        return ::lstat(path, &st) == 0 ? 0 : -errno;
+    }
+    return wfs::fs_lstat_xattr(path, st, xa);
+}
+
+// PR #1 review (23rd round, P2): and what a failing lookup is worth. Both sides of a candidate,
+// and the other side of every entry in the full scan, were looked up with a bool: 0 or "not
+// there". An EACCES on a parent directory, an EIO, an ELOOP where a directory used to be, a
+// volume that went away -- all of them came back as "not there", and the diff then *reported*
+// that: one side failing is a fabricated A or D (a file nobody touched, printed as deleted),
+// both failing is a candidate dropped without a word. Neither is a thing a caller can notice.
+// So the 12th round's rule holds here too: fs_gone() -- ENOENT/ENOTDIR -- is the only absence,
+// and every other errno ends the diff with itself. Returns 0 with `there` set, or -errno.
+int side_lookup(const Ctx &c, const char *path, struct stat &st, uint8_t &xa, bool want_xattr,
+                bool &there) {
+    int rc = other_side(c, path, st, xa, want_xattr);
+    there = rc == 0;
+    return (rc == 0 || wfs::fs_gone(rc)) ? 0 : rc;
+}
+
+// Both sides exist. Returns 0 (identical), 'M' or 'T'. `wxa`/`sxa` are the two sides'
+// fs_xattr_state as the walk (or fs_lstat_xattr) already knows them.
+int classify(Ctx &c, const char *wpath, const struct stat &ws, uint8_t wxa, const char *spath,
+             const struct stat &ss, uint8_t sxa) {
     bump(c.compared);
     if ((ws.st_mode & S_IFMT) != (ss.st_mode & S_IFMT)) return WFS_C_MODIFIED;
 
@@ -265,7 +551,21 @@ int classify(Ctx &c, const char *wpath, const struct stat &ws, const char *spath
         mtime_of(ss, &ssec, &sns);
         if (wsec != ssec || wns != sns) return WFS_C_META;
     }
-    if (!(c.flags & WFS_DIFF_NO_XATTR) && !xattr_equal(wpath, spath)) return WFS_C_META;
+    if (!(c.flags & WFS_DIFF_NO_XATTR)) {
+        XattrErr xe;
+        XattrCmp x = xattr_equal(wpath, spath, wxa, sxa, c.flags, xe);
+        if (x == XA_ERROR) {
+            // Never "equal": the attributes were not compared, so the entry is reported as the
+            // metadata change it may well be, and counted.
+            bump(c.xattr_errors);
+            // ... except on the snapshot side. That tree is ours, it was cloned by us, and it
+            // is read inside the SnapGate window with the gate open, so a permission failure
+            // there is a broken store and not news about the world. Say so, loudly.
+            if (xe.b == EACCES || xe.b == EPERM) note_fatal(c, -xe.b);
+            return WFS_C_META;
+        }
+        if (x == XA_DIFFER) return WFS_C_META;
+    }
     return 0;
 }
 
@@ -278,35 +578,45 @@ struct ExpandCtx {
     bool skip_self;     // the root of the expansion is already being reported as something else
 };
 
-int expand_entry(void *ctx, const char *path, const char *rel, const struct stat &st, bool is_dir) {
+int expand_entry(void *ctx, const wfs::FsEntry &en) {
     ExpandCtx *e = (ExpandCtx *)ctx;
-    if (!*rel && e->skip_self) return 0;
+    if (!*en.rel && e->skip_self) return 0;
     String full(e->prefix);
-    if (*rel) {
+    if (*en.rel) {
         full.append("/");
-        full.append(rel);
+        full.append(en.rel);
     }
-    if (is_dir) {
-        if (dir_is_empty(path)) e->c->sink->add(e->change, WFS_T_DIR, 0, full.c_str());
+    if (en.is_dir) {
+        bool empty = false;
+        if (int rc = dir_is_empty(en.path, empty)) return rc;
+        if (empty) e->c->sink->add(e->change, WFS_T_DIR, 0, full.c_str());
         return 0;
     }
-    e->c->sink->add(e->change, type_of(st.st_mode), (uint64_t)st.st_size, full.c_str());
+    e->c->sink->add(e->change, type_of(en.st->st_mode), (uint64_t)en.st->st_size, full.c_str());
     return 0;
 }
 
 // Called only from the single-threaded candidate loop, so the four workers below are all there
 // are; Sink::add is behind a mutex either way.
-void expand_side(Ctx &c, const char *rel, const char *path, int change, bool skip_self) {
+//
+// PR #1 review (23rd round, P2): the walk's result is the expansion's result. It was dropped
+// here, and a directory that moved into or out of the world and could not be read -- mode 0000,
+// an EIO half way down -- then contributed nothing, or the prefix of its entries that the walk
+// managed before it stopped, to a diff that was reported as complete and exited 0. The walker
+// reports a directory it could not open or read as that directory's errno (fs_walk_tree_ex, and
+// see the readdir(3) note in platform_posix.cpp), so the only thing missing was to pass it on:
+// the verification returns it, and wfs_world_diff() returns it instead of a partial answer.
+int expand_side(Ctx &c, const char *rel, const char *path, int change, bool skip_self) {
     ExpandCtx e{&c, rel, change, skip_self};
-    wfs::fs_walk_tree(path, 4, wfs::FS_DIRS_PRE, &e, expand_entry);
+    return wfs::fs_walk_tree_ex(path, 4, wfs::FS_DIRS_PRE, &e, expand_entry);
 }
 
-void report_one_side(Ctx &c, const char *rel, const char *path, const struct stat &st, int change) {
+int report_one_side(Ctx &c, const char *rel, const char *path, const struct stat &st, int change) {
     if (!S_ISDIR(st.st_mode)) {
         c.sink->add(change, type_of(st.st_mode), (uint64_t)st.st_size, rel);
-        return;
+        return 0;
     }
-    expand_side(c, rel, path, change, false);
+    return expand_side(c, rel, path, change, false);
 }
 
 // ---- full scan ---------------------------------------------------------------------------------
@@ -316,67 +626,73 @@ struct SideCtx {
     bool world_side;
 };
 
-int side_entry(void *ctx, const char *path, const char *rel, const struct stat &st, bool is_dir) {
+int side_entry(void *ctx, const wfs::FsEntry &en) {
     SideCtx *s = (SideCtx *)ctx;
     Ctx &c = *s->c;
+    const char *rel = en.rel;
     if (!*rel) return 0; // the root itself
     if (s->world_side && !::strcmp(rel, WFS_MARKER_NAME)) return 0;
 
     String other;
     join_rel(other, s->world_side ? c.sroot.c_str() : c.wroot.c_str(), rel);
     struct stat os;
-    if (::lstat(other.c_str(), &os) != 0) {
+    uint8_t oxa = wfs::FS_XATTR_UNKNOWN;
+    bool on_other = false;
+    if (int rc = side_lookup(c, other.c_str(), os, oxa, !en.is_dir, on_other)) return rc;
+    if (!on_other) {
         // Only on this side. The walk visits every descendant itself, so a non-empty directory
         // needs no expansion here -- only an empty one has nothing else to report it.
-        if (is_dir) {
-            if (dir_is_empty(path)) c.sink->add(s->world_side ? WFS_C_ADDED : WFS_C_DELETED, WFS_T_DIR, 0, rel);
+        if (en.is_dir) {
+            bool empty = false;
+            if (int rc = dir_is_empty(en.path, empty)) return rc;
+            if (empty) c.sink->add(s->world_side ? WFS_C_ADDED : WFS_C_DELETED, WFS_T_DIR, 0, rel);
         } else {
-            c.sink->add(s->world_side ? WFS_C_ADDED : WFS_C_DELETED, type_of(st.st_mode),
-                        (uint64_t)st.st_size, rel);
+            c.sink->add(s->world_side ? WFS_C_ADDED : WFS_C_DELETED, type_of(en.st->st_mode),
+                        (uint64_t)en.st->st_size, rel);
         }
         return 0;
     }
     if (!s->world_side) return 0; // present on both: the world-side pass already compared it
-    if (is_dir && S_ISDIR(os.st_mode)) return 0;
-    int ch = classify(c, path, st, other.c_str(), os);
-    if (ch) c.sink->add(ch, type_of(st.st_mode), (uint64_t)st.st_size, rel);
+    if (en.is_dir && S_ISDIR(os.st_mode)) return 0;
+    int ch = classify(c, en.path, *en.st, en.xattr, other.c_str(), os, oxa);
+    if (ch) c.sink->add(ch, type_of(en.st->st_mode), (uint64_t)en.st->st_size, rel);
     return 0;
 }
 
 int full_scan(Ctx &c) {
     SideCtx w{&c, true};
-    if (int rc = wfs::fs_walk_tree(c.wroot.c_str(), 4, wfs::FS_DIRS_PRE, &w, side_entry)) return rc;
+    if (int rc = wfs::fs_walk_tree_ex(c.wroot.c_str(), 4, wfs::FS_DIRS_PRE, &w, side_entry)) return rc;
     SideCtx s{&c, false};
-    return wfs::fs_walk_tree(c.sroot.c_str(), 4, wfs::FS_DIRS_PRE, &s, side_entry);
+    return wfs::fs_walk_tree_ex(c.sroot.c_str(), 4, wfs::FS_DIRS_PRE, &s, side_entry);
 }
 
 // ---- candidate verification ---------------------------------------------------------------------
 
-void verify_candidate(Ctx &c, const char *rel) {
-    if (!*rel || !::strcmp(rel, WFS_MARKER_NAME)) return;
+int verify_candidate(Ctx &c, const char *rel) {
+    if (!*rel || !::strcmp(rel, WFS_MARKER_NAME)) return 0;
     String wpath, spath;
     join_rel(wpath, c.wroot.c_str(), rel);
     join_rel(spath, c.sroot.c_str(), rel);
     struct stat ws, ss;
-    bool in_world = ::lstat(wpath.c_str(), &ws) == 0;
-    bool in_snap = ::lstat(spath.c_str(), &ss) == 0;
-    if (!in_world && !in_snap) return; // created and removed again inside the same world
-    if (in_world && !in_snap) {
-        report_one_side(c, rel, wpath.c_str(), ws, WFS_C_ADDED);
-        return;
-    }
-    if (!in_world && in_snap) {
-        report_one_side(c, rel, spath.c_str(), ss, WFS_C_DELETED);
-        return;
-    }
-    if (S_ISDIR(ws.st_mode) && S_ISDIR(ss.st_mode)) return;
+    uint8_t wxa = wfs::FS_XATTR_UNKNOWN, sxa = wfs::FS_XATTR_UNKNOWN;
+    bool in_world = false, in_snap = false;
+    if (int rc = side_lookup(c, wpath.c_str(), ws, wxa, true, in_world)) return rc;
+    if (int rc = side_lookup(c, spath.c_str(), ss, sxa, true, in_snap)) return rc;
+    if (!in_world && !in_snap) return 0; // created and removed again inside the same world
+    if (in_world && !in_snap) return report_one_side(c, rel, wpath.c_str(), ws, WFS_C_ADDED);
+    if (!in_world && in_snap) return report_one_side(c, rel, spath.c_str(), ss, WFS_C_DELETED);
+    if (S_ISDIR(ws.st_mode) && S_ISDIR(ss.st_mode)) return 0;
     // A directory replaced by a file (or the other way round): the path itself is an M, but
     // everything that used to live under the directory is gone, or newly here, and FSEvents
     // says nothing about it (a subtree moved in or out produces one event, for the directory).
-    if (S_ISDIR(ws.st_mode)) expand_side(c, rel, wpath.c_str(), WFS_C_ADDED, true);
-    else if (S_ISDIR(ss.st_mode)) expand_side(c, rel, spath.c_str(), WFS_C_DELETED, true);
-    int ch = classify(c, wpath.c_str(), ws, spath.c_str(), ss);
+    if (S_ISDIR(ws.st_mode)) {
+        if (int rc = expand_side(c, rel, wpath.c_str(), WFS_C_ADDED, true)) return rc;
+    } else if (S_ISDIR(ss.st_mode)) {
+        if (int rc = expand_side(c, rel, spath.c_str(), WFS_C_DELETED, true)) return rc;
+    }
+    int ch = classify(c, wpath.c_str(), ws, wxa, spath.c_str(), ss, sxa);
     if (ch) c.sink->add(ch, type_of(ws.st_mode), (uint64_t)ws.st_size, rel);
+    return 0;
 }
 
 // How many recorded entries a world needs before the FSEvents path is worth its fixed cost.
@@ -429,8 +745,14 @@ extern "C" int wfs_world_diff_ex(wfs_store *s, wfs_id world, int flags, wfs_diff
     // The snapshot has to still be on disk to be compared against; the gate on it is opened
     // further down, around the comparison itself.
     {
+        // PR #1 review (23rd round): a snapshot tree that cannot be read is not a snapshot tree
+        // that is gone -- WFS_E_SOURCE_GONE says "fork it again from somewhere else", which is
+        // the wrong thing to tell anyone about an EACCES or an EIO inside our own store.
         struct stat sst;
-        if (::lstat(sr.path, &sst) != 0 || !S_ISDIR(sst.st_mode)) return WFS_E_SOURCE_GONE;
+        int prc = wfs::fs_probe(sr.path, &sst);
+        if (wfs::fs_gone(prc)) return WFS_E_SOURCE_GONE;
+        if (prc) return prc;
+        if (!S_ISDIR(sst.st_mode)) return WFS_E_SOURCE_GONE;
     }
 
     Ctx c;
@@ -489,13 +811,19 @@ extern "C" int wfs_world_diff_ex(wfs_store *s, wfs_id world, int flags, wfs_diff
         // milliseconds). It is opened as late as possible and the guard closes it -- restoring
         // mode 0000 -- on every path out, including the error returns below.
         wfs::SnapshotReadGuard gate(sr.path);
-        if (gate.rc == -ENOENT || gate.rc == -ENOTDIR) return WFS_E_SOURCE_GONE;
+        if (wfs::fs_gone(gate.rc)) return WFS_E_SOURCE_GONE;
         if (gate.rc) return gate.rc;
 
-        if (!full)
-            for (size_t i = 0; i < bag.size(); ++i) verify_candidate(c, bag.at(i));
-        else if (int frc = full_scan(c))
+        if (!full) {
+            // PR #1 review (23rd round): a candidate that could not be verified ends the diff.
+            for (size_t i = 0; i < bag.size(); ++i)
+                if (int vrc = verify_candidate(c, bag.at(i))) return vrc;
+        } else if (int frc = full_scan(c)) {
             return frc;
+        }
+        // PR #1 review (P2): an unreadable snapshot side is not a diff result. Both paths
+        // above reach it, and the guard below closes the gate on the way out either way.
+        if (c.fatal) return c.fatal;
     }
     // From here on nothing touches the snapshot: sorting and reporting are pure bookkeeping.
 
@@ -544,6 +872,7 @@ extern "C" int wfs_world_diff_ex(wfs_store *s, wfs_id world, int flags, wfs_diff
         stats->compared = c.compared;
         stats->content_cmp = c.content_cmp;
         stats->bytes_read = c.bytes_read;
+        stats->xattr_errors = c.xattr_errors;
         stats->events_id = wr.fsevents_id;
         stats->full_scan = full ? 1 : 0;
         stats->fallback = fallback;
