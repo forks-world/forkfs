@@ -1244,6 +1244,52 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第二十九轮:报表也要把那四个目录都看一遍(2026-09-20)
+
+第二十九轮,Codex 一条 P2,打在第二十八轮**只差一步**的地方。上一轮把"读不出来就报出来、按上限
+重试"推到了 collector 扫的每一个目录,`<store>/tmp`(`world exec` 留下的沙箱配置)也在内;可是
+`wfs_gc_status()` 的报表是从 `<store>/trash`(`trash_scan`)、`<store>/snapshots` 的 `*.wfs-tmp`
+计数趟、`pool_stranded()` 这三处拼出来的,**没有第四处**。于是 `<store>/tmp` 一个 EACCES:`gc` 有
+note,`gc --status` **一行都没有**。
+
+两半合起来才是真正的洞:`gc` 那条 note 只有 collector 真跑了才印,而一个目录失败到 `kGcFailCap`
+之后 collector 就**不再被唤醒**了——这是设计:过了上限它仍然"每次都被报出来",只是不再每两秒叫醒一个
+worker(`internal.h`)。过了上限之后负责报的那个人就是 `gc --status`,而它对这一个目录恰好是哑的。
+于是那些读不出来的沙箱配置落到了这一串 review 从头到尾就在防的那个状态里:**东西在盘上、没人收、
+也没有任何一条命令叫得出它的名字**。
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P2 `PRRT_kwDOUf7jGc6kFyRB` | `world.cpp` `wfs_gc_status()`(`core/src/world.cpp` ~4035) | 报表扫 trash / snapshots / pool 三处,不扫 `<store>/tmp`。`unread:` 行因此永远不会提到它,`dirs_unreadable` 也不把它算进去;一旦重试上限停掉 worker 链,就再也没有任何东西会说出这个目录 | 在报表里**直接扫**一趟 `<store>/tmp`:`opendir` 只有 ENOENT 算"里面没有东西",其余 errno 记进同一个 `wfs::DirUnreadable`;逐条 `readdir` 之前 `errno = 0`,NULL 且 errno 非零同样记——中途停下的流正是这一轮要修的那种沉默。**一条都不数**(`wfs_trash_stat` 里没有放沙箱配置的字段,那是 collector 的 `tmp_removed`),它欠读者的只是"这个目录到底读不读得了",但循环照样走到流的尽头;并且和别的计数趟一样**一个字都不写库**——上限是 collector 的,提问不花重试。复用已有的 `note()` lambda,所以 CLI 的 `unread:` 行原样印出、计数原样加上,**不加字段、不动 ABI** | `cb20ff5` |
+
+**为什么是直接扫,不是把 `gcfail:dir:<path>` 那条记录翻出来**:`gc --status` 回答的是**现在**,
+而计数器只说"某一次 wake 在这里失败过"——一个已经好了一个星期的目录,在 collector 把它清零之前仍然
+在计数器里。何况翻出来也**多不出一个目录**:计数器能装的每一条路径,这份报表现在都自己打开了一遍
+(`<store>/trash`、`<store>/snapshots`、`<store>/pool` 及其 `S<n>`、`<store>/tmp`)。
+
+**审计**(collector 碰的目录 vs 报表扫的目录):
+
+| 目录 | 结论 |
+|---|---|
+| `<store>/trash` | `trash_scan`,两边都有(第二十八轮) |
+| `<store>/snapshots` | 清扫 + 计数趟,两边都有(第二十八轮) |
+| `<store>/pool` 及其 `S<n>` | `pool_collect` / `pool_stranded`,两边都有(第二十七轮) |
+| `<store>/tmp` | collector 第二十八轮,**报表这一轮补上** |
+| `<parent>/.wfs-trash`(EXDEV 世界的旁路 trash) | **确认不是 readdir**:里面每一条都由行的 `trash_path` 叫出名字(扫描的行循环、`trash_blocked_by`、`trash_identity`、`wfs_trash_blocked_path` / `wfs_trash_entry_path`),根本没有一次目录列举会失败,也就没有东西要记 |
+| `<store>/snapshots/S<n>`、`S<n>.wfs-tmp` 这些 gate 目录 | **确认是 `lstat(2)` 不是 readdir**:结论由 `proven_gone()` 给(第十二轮);而且带 gate 的快照根是 0000,本来就不会被当目录打开 |
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **298 passed, 0 failed**(+8);`check-deps.sh`
+全绿。(`m1_criteria.sh` 本轮跳过。)
+
+先跑红(`safety.sh`,新增 8 条):`<store>/tmp` `chmod 000`。修之前 **8 条里红了 7 条**——
+`gc --status` 连 `unread:` 这一行都没有、没有目录名、数目是 0;绿的那 1 条是对照组(权限改回来之后
+报表干净,本来就绿)。
+
+新增测试(`safety.sh` 末尾一段,`PR29`):`gc --status` 说得出"1 directory … could not be read"、
+**报出目录名**、在 `unread:` 行上、errno 是 `Permission denied`、`dirs_unreadable` 数得上它;**再问
+一次还是这句**(计数趟不花重试);**连跑 10 次 `gc --now` 把上限用光之后,`gc --status` 照样说得出
+这个目录**(这一条才是这个修复真正要的);`chmod 700` 之后报表干净。
+
 #### PR #1 review 第二十八轮:读不出来的目录,一个都不算空的(2026-09-20)
 
 第二十八轮,Codex 两条 P2,和第二十七轮那条 pool 的是**同一句话**,只是换了两个目录:`<store>/trash`
