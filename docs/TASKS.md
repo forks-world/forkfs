@@ -1244,6 +1244,59 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第二十七轮:拒绝的时候不许留下痕迹,看不了的目录不算空的目录(2026-09-20)
+
+第二十七轮,Codex 两条 P2,一条打在**认领的顺序**上,一条打在**扫描的沉默**上。两条其实是同一句话的
+两面:**我们对别人的东西做的每一件事,都要先有证据;我们说"那里什么都没有"的时候,也要先有证据。**
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P2 `PRRT_kwDOUf7jGc6kFUbS` | `world.cpp` `trash_claim_open()`(gc / `--now` / `restore` 三条路共用) | 条目打不开(EACCES,比如一个 0000 的目录)时,认领先 `chmod 0700` 再 open——**而身份是在 open 之后的 `fstat` 上才比的**。于是一个被放在条目路径上的陌生目录(跨卷 discard 的条目就在用户自己的 `<parent>/.wfs-trash` 里,名字还能猜),在被判成 `WFS_E_TRASH_FOREIGN` 之前,模式已经被我们从 0000 改成了 0700。一次**拒绝**在被拒的东西身上留下了痕迹——而 0000 是它主人的意思 | 顺序反过来:`lstat` → 比行的 `dir_dev`/`dir_ino`(外加 `S_ISDIR`)→ 不符直接 `WFS_E_TRASH_FOREIGN`,**一个字节都不碰** → 符了才 `chmod 0700` → 再 open → open 之后的 `fstat` 在**真正要用的那个描述符**上把身份再证一遍(第二十六轮的协议一点没动)。`lstat` 失败时把 errno 还原成 open 自己那个,按老路返回。**先量了 (a) 再退到 (b)**:macOS 上 `open(path, O_EVTONLY\|O_DIRECTORY\|O_NOFOLLOW)` 打一个 0000 目录**照样 EACCES**(实测 Darwin 27 / APFS,文件属主自己跑),`O_EVTONLY` 去掉 `O_DIRECTORY` 也一样,而 macOS 没有 `O_PATH`——所以"先拿到一个不需要读权限的描述符"这条路在这个平台上不存在,只能在**名字**上先核对 | `6034e95` |
+| P2 `PRRT_kwDOUf7jGc6kFUbV` | `pool.cpp` `pool_sweep_orphans()`(收集与计数两条路共用) | `opendir(<store>/pool)` 失败就 `return 0`、`opendir(<store>/pool/S<n>)` 失败就 `continue`、`readdir(3)` 自己的 errno 从来没问过——**一次 EACCES/EIO 于是回答"这里没有孤儿"**。崩掉的 fork 或 filler 留下的无行克隆被整个漏掉:`gc` 一声不吭,`gc --status` 报"0 stale pre-clone entries"(等于"pool 是干净的"),而 `wfs_gc_pending()` 只看 trash,worker 链也跟着停 | 只有 **ENOENT** 算"里面没有东西"(第十三轮给 store 扫描定的同一条规矩)。其余 errno——pool 根的、某个 `S<n>` 的、以及中途停下的 `readdir` 的(`errno = 0` 后逐条读,NULL 且 errno 非零就是读失败)——都记进新的 `PoolUnreadable{count, err, path}`:**收集那一趟**按**目录路径**bump 共享失败计数器、在 `kGcFailCap` 以内置 `work_remains`(worker 链因此会回来),**计数那一趟(`gc --status`)一个字都不写库**;读通了的目录 `gc_fail_clear` 把自己的计数清零。对外是 `wfs_gc_report.pool_unreadable` 和 `wfs_trash_stat.pool_unreadable` / `_path` / `_errno`:`gc` 在 stderr 上报"哪个目录、什么 errno、会不会再来",`gc --status` 单独一行说"里面的东西没算进上面那个数" | `b7f3998` |
+
+**为什么 F1 选了 (b) 而不是 (a)**:(a) 是"先拿一个不需要读权限的描述符,核对完再 `fchmod` 那个已经证明
+过的 inode"。在 macOS 上拿不到——写了个小程序,以属主身份对一个 0000 的目录:
+`open(O_EVTONLY|O_DIRECTORY|O_NOFOLLOW)` → `EACCES`;去掉 `O_DIRECTORY` → 还是 `EACCES`;`O_PATH` 这个
+平台没有。所以只剩 (b):先 `lstat` 按名字核对,再 `chmod`,再 `open` + `fstat` 二次核对。**界限写死**:
+在 `lstat` 和 `chmod` 之间被换进来的陌生目录,能拿到的**全部**后果就是模式变成 0700,随即被 `fstat`
+拒掉;**永远不可能是一次删除**——从 `fstat` 往后,rename、递归删、rmdir 全部由那个描述符说了算
+(第二十六轮),名字再也决定不了任何不可逆的事。
+
+**同一个形状的另外两处,查过了**:(1) `fs_remove_tree_fd()` 里的免疫标志/权限借位(第四/十八轮)是
+`fchflags`/`fchmod` **打在子 fd 上**,而那个子 fd 是从已经核对过的父 fd `openat` 出来的——顺序本来就是
+"先证明、后动手",不用改(第二十六轮就是这么排的)。(2) 被放弃的 fork 临时树走的 `gc_tmp_is_removable()`
+**故意就不 chmod**:那里的证据在树**里面**(`.world` 标记),一个打不开的用户目录就是"还没证明任何事",
+保持第十二轮的 `undecided`、把行和树都留着。
+
+**F2 的旁证也查过了**:`pool_scan()`(行那一侧)不受影响——它只读数据库,`Stmt` prepare 不出来本来就
+回 `-EIO`;而它喂给 `pool_collect()` / `pool_stranded()` 的树侧判断,第十二轮就已经从 `exists()` 换成
+`proven_gone()`(只有 ENOENT/ENOTDIR 算"没了")。
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **278 passed, 0 failed**(+4);`check-deps.sh` 全绿。
+(`m1_criteria.sh` 本轮跳过。)
+
+先跑红:
+
+- **F1**(`core_test`,新增一块):把世界的树挪走,在条目路径上 `mkdir` 一个带 `user.txt` 的目录、
+  `chmod 0000`。修之前 `wfs_gc()` 确实报 `trash_foreign == 1`(第二十五轮那条规矩在起作用),**但
+  陌生人的模式回来是 0700**——`core_test.cpp:5898` 的 `CHECK(stat(mentry, &mst) == 0 &&
+  (mst.st_mode & 07777) == 0)` 当场红。
+- **F2**(`safety.sh`,新增四条):`<store>/pool/S1/` 下放一个无行的孤儿、pool 根 `chmod 000`。修之前
+  `gc` 只打印 `gc: 0 worlds deleted, …, 0 pool entries` 就完了,stderr 上一个字都没有,`gc --status`
+  也什么都不说——四条里红了三条(第四条"权限改回来之后孤儿会被收掉"两边都绿,它本来就是对照组)。
+
+新增测试:
+
+- `core_test`(F1,排在第二十六轮那块后面):0000 的陌生目录站在条目路径上 → (1) `wfs_gc()` 报
+  `trash_foreign == 1`、`worlds_deleted == 0`、`entries_freed == 0`,**模式还是 0000**;(2)
+  `wfs_world_discard(..., immediate=1, ...)` 回 `WFS_E_TRASH_FOREIGN`,模式还是 0000;(3)
+  `wfs_world_restore()` 回 `WFS_E_TRASH_FOREIGN`、家目录没被创建出来,模式还是 0000;行始终 TRASHED、
+  身份列没动。最后自己 `chmod 0700` 进去,陌生人的 `user.txt` 逐字节还在;把真树搬回来再收一次,
+  `worlds_deleted == 1`,行 DEAD。
+- `safety.sh`(F2,T1.5 那一段末尾):`gc` 报出"`<store>/pool` 下有 1 个目录读不出来(Permission
+  denied)"并说"会再来试"(`work_remains`);`gc --status` 不把这个 pool 说成干净的;`chmod 700` 之后
+  下一次 `gc` 把那个孤儿收掉。
+
 #### PR #1 review 第二十六轮:核对过的那个身份,必须就是被删掉的那个身份(2026-09-20)
 
 第二十六轮,Codex 一条 P1,打在**第二十五轮自己**身上。第二十五轮把"这条 trash 条目是不是这一行的
