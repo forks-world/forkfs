@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Release (macOS arm64)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Configure test temporary directory
+        shell: bash
+        run: echo "TMPDIR=${RUNNER_TEMP}/" >> "$GITHUB_ENV"
+
+      - name: Verify runner architecture
+        shell: bash
+        run: |
+          runner_arch="$(uname -m)"
+          echo "Runner architecture: ${runner_arch}"
+          test "$runner_arch" = arm64
+
+      - name: Configure Release build
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk="$(xcrun --sdk macosx --show-sdk-path)"
+          clang="$(xcrun --sdk macosx --find clang)"
+          clangxx="$(xcrun --sdk macosx --find clang++)"
+          cmake -S . -B build/ci \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DWFS_FSKIT=OFF \
+            -DCMAKE_C_COMPILER="$clang" \
+            -DCMAKE_CXX_COMPILER="$clangxx" \
+            -DCMAKE_OSX_SYSROOT="$sdk" \
+            -DSQLite3_INCLUDE_DIR="$sdk/usr/include" \
+            -DSQLite3_LIBRARY="$sdk/usr/lib/libsqlite3.tbd"
+
+      - name: Build
+        run: cmake --build build/ci --parallel
+
+      - name: Run CTest
+        run: ctest --test-dir build/ci --output-on-failure --timeout 600 --no-tests=error
+
+      - name: Check linked dependencies
+        run: scripts/check-deps.sh build/ci
+
+      - name: Run safety tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/tests/safety.sh build/ci "${RUNNER_TEMP}/forkfs-ci/m1test" 2>&1 | tee build/ci/safety.log
+
+      - name: Upload failure logs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ci-failure-logs
+          if-no-files-found: ignore
+          path: |
+            build/ci/Testing/Temporary/*.log
+            build/ci/safety.log
