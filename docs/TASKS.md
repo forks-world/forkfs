@@ -1244,6 +1244,89 @@ WFS_FSKIT=OFF **2/2**、ON **3/3**(只剩 FSKit 那 4 条冻结 API 的 deprecat
 `pool.cpp` 三处(`<store>/pool/S<n>/<uuid>.wfs-tmp`)、trash 的 `.deleting`。用户目录里的两处
 (fork 目标、gc 扫父目录)本轮都没了,硬链接重放那处上一轮已改成 `.wfs-hl-<…>`。
 
+#### PR #1 review 第三十四轮:没开起来的事务、已经在屋里的人、按字节读的路径(2026-09-20)
+
+第三十四轮,Codex 两条 P1 一条 P2。两条 P1 是同一个主题的两半:**一个防线只有在它真的成立的时候
+才是防线**——一个失败了没人读的 `BEGIN IMMEDIATE`,和一个只挡「后来者」的 `VERSION` 文件。
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 `PRRT_kwDOUf7jGc6kGghX` | `core/src/db.h` `Txn` 构造函数(~102) | 第十一轮把 `BEGIN IMMEDIATE` 的返回码记进 `begin_rc`,**只有 schema 迁移一个调用者会读**。busy timeout 熬完的 `SQLITE_BUSY`、库上的 `SQLITE_IOERR` 之后,调用者的语句全跑在 autocommit 里,析构那句 `ROLLBACK` 回滚的是「什么都没有」——「检查和改动是同一个写事务」(P12;第一、五、十五、十六、二十一轮)整体失效:`discard` 的引用计数和它的 UPDATE 成了两次写,一个 fork 的 CREATING 行正好塞得进中间 | `ok()`/`err()`,**41 个 `Txn` 构造点每一个**一行 `if (!t.ok()) return t.err();`(或那一处的「什么都不做」),41 处 `t.ok()`,可以 grep;`commit()` 返回 rc 且 `[[nodiscard]]`;BEGIN 失败的连接记进线程局部指针,`Stmt` 在它上面拒绝 prepare——忘了写检查的地方「什么都不写」,而不是「写在事务外」。`open_` 跟着 BEGIN 走。`err()` 把 BUSY 映射成 `-EBUSY` | `cce6759` |
+| P1 `PRRT_kwDOUf7jGc6kGghY` | `core/src/store.cpp` `wfs_store_open()`(~724) | 第三十二轮把门关在了迁移之前,挡住的是**抬文件之后才启动**的 M1 进程。一个在抬文件**之前**刚刚 `wfs_store_open()` 完的 M1 进程,手上那个句柄照样能用——而 M1 全程不持有任何 store 级的锁,所以排他不能指望 M1 配合 | 抬文件之后、迁移之前,问操作系统谁还开着 `<store>/metadata.db`(`wfs::fs_other_holders()`;macOS 用 libproc 的 `proc_listpidspath(3)`,Linux `-ENOSYS` 桩)。有外来持有者就把 `VERSION` 放回 2 并返回新的 `WFS_E_STORE_BUSY`;CLI 把 pid 和可执行文件路径都说出来(`wfs_store_holders()`) | `49312cf` |
+| P2 `PRRT_kwDOUf7jGc6kGghZ` | `macos/fskit/WorldVolume.mm`(~52)、`WorldVolumeHandler.mm` | marker 里的 store 路径用 `+[NSString stringWithUTF8String:]` 解码:合法但不是 UTF-8 的路径分量会让它返回 **nil**,下一行的 fallback 于是打开了扩展自己的默认 store——而 CLI 的挂载预检(第十七轮)是按**字节**比对的,它放行了 | 两处都改用 `-[NSFileManager stringWithFileSystemRepresentation:length:]`;连它都答 nil 就带 `EILSEQ` **让卷加载失败**。marker 里**有**路径时,永远不再退回默认 store | `ed37971` |
+
+##### 次序即完备性(P1 第二条)
+
+```
+抬 VERSION 到 3  ->  列举谁开着 metadata.db  ->  有人 ? 放回 2 并拒绝
+                                                : 迁移
+```
+
+在列举**之后**才出现的持有者,是在 rename 之后启动的,文件已经拒了它(第三十二轮);列举**列到的**
+持有者,是在抬文件之前被放进来的——正是这条 finding 说的那一批。没有第三种。外来持有者一律同等对待:
+另一个 M2 升级者和一个 M1 进程按 pid 分不出来,而两个升级者互相拒绝不过是「一个 store 第一次 open
+时重试一次」。**「问不出来」算持有者**(平台报错,或者问不了的平台的 `-ENOSYS`),因为放进来才是
+不可挽回的那一边。第三十一轮那个两句柄竞争测试**不用改**:两个句柄是同一个进程,而列举按定义排除
+自己的 pid。libproc 先在 scratchpad 里探过:非特权可用,列得出本用户自己那个开着文件的子进程、
+子进程回收之后就不再列出来,~900 个进程约 106 ms——只在一个 store 一生中接管它的那一次 open 上付。
+
+##### 纵深防御:M1 的 `wfs_gc()` 到底会删掉 M2 的什么(Codex 让一并分析)
+
+`main` 上的 `wfs_gc()` 里,「该留下的 trash 条目」(`keep`)**只**来自
+`SELECT id, trash_path, trashed_at, path FROM worlds WHERE state=2`。`<store>/trash` 底下凡是
+不在这张表里的一级条目,一律 `fs_remove_tree` 整棵删掉。于是:
+
+| M2 的东西 | M1 会怎样 | 后果 |
+|---|---|---|
+| 快照的 trash 条目 `S<n>-<ts>`(T2.2) | M1 **从不**查 snapshots 表的 `trash_path`,所以每一个都是「没有行认领的孤儿」 | **不看保留期,立刻整棵删**。保留期内的快照再也 restore 不回来,从它 fork 出来的世界失去 diff/verify 的基线 |
+| `state=4`(`WFS_ST_TRASHING`)的世界/快照条目 | M1 只查 `state=2`,所以这条行的 `trash_path` 不在 `keep` 里;rename 已经发生的话树就在 trash 里 | **删**。行永远停在 TRASHING 指着空气;之后 M2 的 `trashing_recover()` 读到「树两处都不在」,判成「rename 从没发生」,把世界放回 **ACTIVE**——一个树已经没了的 ACTIVE 世界 |
+| `<entry>.deleting` | 世界那侧:行更新和 rename 在同一个事务里(第十五轮),所以 `keep` 里就是 `.deleting` 这个名字,保留期内**保得住**;快照那侧同上表第一行 | 不额外新增损失,但会把一个正在跑的 M2 collector 脚下的树删掉 |
+| 跨卷 trash `<parent>/.wfs-trash/W<id>-<ts>` | M1 只 readdir `<store>/trash`,够不到 | 安全(过了保留期按行删是 M1/M2 一致的正确行为) |
+| `state=0` 的快照行 + `S<n>.wfs-tmp` / `S<n>` | M1 照删,但**没有 owner 存活判定**(第三轮加的 `owner_pid`/`owner_start` 它不认),也没有最小年龄 | **删掉一个正在跑的 `snapshot create` 的半成品树**,并删掉它的行 |
+| `state=0` 的世界行(正在跑的 fork) | M1 `remove_tmp(path)` 按 `<path>.wfs-tmp` 猜临时名(M2 用的是行上记的 `tmp_path`,名字是 `.wfs-fork-<hex>`,猜不中),但 `DELETE FROM worlds WHERE id=? AND state=0` 照删 | **树留下、行没了**:`--to` 上出现一棵没有任何行认领的树;pool 供的那种 fork 还会让 pool 条目变成无主,被 `pool_collect` 在活着的 fork 脚下删掉 |
+| pool 的 `DRAINING`(`state=2`) | M1 的 `pool_collect` 是 `doomed = state != 1` | 删树删行——和 M2 drain 想要的结果一致,不算损失;但它同样会删掉一个**活着的** filler 正在克隆的 `state=0` 条目 |
+| `<store>/tmp`、`<store>/VERSION.tmp.*` | M1 只清 `<store>/tmp` 里超过一小时的**非目录**;`VERSION.tmp.*` 在 `<store>` 根上,M1 不 readdir 那里 | 安全 |
+
+**「把 M2 的 trash 挪到一个 M1 不扫的目录」够不够?** 不够,但挡得住最贵的那一半。M1 的孤儿扫描
+只 readdir `<store>/trash` 这**一层**,并且跳过 `.` 开头的名字——所以放进 `<store>/trash/.m2/`
+(或者 `<store>/trash2/`)之后,上表**第一、二行**(快照条目、TRASHING 条目)对 M1 **完全不可见**,
+也就是不可挽回的那部分损失没有了。挡不住的是**创建那一半**:`state=0` 的世界行和快照行是按**行**
+和 store 外的路径删的,跟 trash 放在哪里无关。而且这是一次磁盘布局变更(T2.2 的名字写在文档里、
+出现在 `gc --status` 的输出和 `safety.sh` 的断言里),所以**记在这里作为后备方案**,不实现:
+真正的防线是上面那道持有者闸门,它连「创建那一半」一起挡住。
+
+**验收**:`ctest`(WFS_FSKIT=OFF)**2/2**;`safety.sh` **298 passed, 0 failed**;`check-deps.sh`
+全绿(5 个系统库,libproc 属于 libSystem);FSKit 两处改动在单独的 `build/fskit-check`
+(`-DWFS_FSKIT=ON`)里编过,没有打包、注册或挂载。(`m1_criteria.sh` 本轮跳过。)
+
+**先跑红**(把断言换成打印,跑在修改前的 core 上):
+
+```
+[F1 a] discard rc=0 state=2 (TRASHED) tree_at_S<n>=0 trash/S*=1
+[F1 b] fork    rc=0 world=1 tree=1 rows=1
+[F1 c] gc      rc=0 armed=1 worlds_deleted=1 state=3 (DEAD) trash/W*=0
+[F2  ] open    rc=0 handle=1 VERSION=3 user_version=304 cols=1
+```
+
+——F1:BEGIN 一失败,discard 照样把快照搬进了 trash、fork 照样发布了一整个世界、collector 照样
+把 trash 条目改名删掉并把行埋了,三次都返回 0;F2:M1 那种持有者还活着,open 报成功、句柄照发,
+store 被接管到 schema 3(`user_version=304`、列都加上了)。
+
+新增测试:
+
+- `core_test` 新的 `txn-store` 一段,新缝 `wfs_test_txn_fail_once`(`worldfs.h`,非测试运行里恒为 0):
+  (a) `discard S<n>` → `-EIO`,快照仍 ACTIVE、树仍在 `snapshots/S<n>`、trash 里没有 `S*`;同一个
+  调用把缝设成 `SQLITE_BUSY` 时是 `-EBUSY`。(b) `--no-pool` 的 fork → `-EBUSY`,没有世界、没有行、
+  目标目录上没有临时树;撤掉缝同一个调用成功。(c) 一个在 trash 里的世界 + retention 0 的 `gc`,
+  缝在 `wfs_test_before_trash_delete` 里装弹(它正好在 `gc_claim_deleting()` 之前)→ `worlds_deleted=0`、
+  行仍 TRASHED、条目还在它自己的名字上(没有 `.deleting`);下一次不装弹的 wake 正常收掉。
+- `core_test` 版本那一段新增 (e):一个 schema 2 的 store,一个**子进程**开着它的 `metadata.db`
+  (通过管道确认真的开到了,并且用第二根控制管道保证父进程一走它就退出)→ `wfs_store_open` 返回
+  `WFS_E_STORE_BUSY`、不发句柄、`VERSION` 回到 2、`user_version` 仍是 2xx、一个增量列都没加、
+  没有 `VERSION.tmp` 残骸;`wfs_store_holders()` 报出这个子进程的 pid 和可执行文件路径;子进程
+  收掉之后,同一个 open 正常接管(`VERSION` 3、`user_version` 3xx、列齐)。
+- F3 没有可执行的测试:前端是冻结的、默认不编译,证据就是那次单独的编译检查。
+
 #### PR #1 review 第三十三轮:帮手的错误就是调用者的错误(2026-09-20)
 
 第三十三轮,Codex 两条 P2,形状一模一样:**一个返回 int 的帮手失败了,调用者把它的返回值扔掉,
