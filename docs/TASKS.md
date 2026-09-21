@@ -3374,3 +3374,40 @@ COMMIT 失败——事务还开着,析构函数回滚,一行记录都没动。
 还是 2xx、`VERSION` 已经是 3,而下一次 open 把迁移做完、两行一个不少。这条用例**本来就是绿的**
 (判据的活前几轮已经做完),它新钉的是那句承诺所依赖的**可续性**。红的是文案那一条:
 `disk_full_test.cpp:256: CHECK failed: strstr(out, "nothing that was already here was changed or removed") == NULL`。
+
+**同一类的第七处(PR #8 review 第四轮,`d909dc6` + `e6c1fe3`)**:错误阶梯**最后**那个通用分支。
+它对 `-EACCES` / `-EPERM` / `-EIO` / `-ENOTDIR` 说的是「nothing was created: … no metadata3.db
+and no store id were made here」——这句是给**早期**失败(P17 那三次 readdir)写的,而这个 PR
+让**同样的 errno** 也能从 open 的**后期**回来:目录、`VERSION`、`upgrade.lock`、甚至一个零长度的
+`metadata3.db` 都可能已经建好了,老 store 的库甚至已经搬完了。而且「fix the permissions」
+对一个 SQLite 的 I/O 错误根本不是建议。
+
+逐条列出各个 errno 能从哪些步骤回来:**`-EACCES`/`-EPERM`/`-ENOTDIR`**——早期(store 路径上的
+`fs_mkdir_p`/`fs_realpath`、`check_version`、`store_layout` 的两次 `stat(2)`、守卫的三次 readdir),
+**也有**后期(六个子目录的 mkdir、`upgrade.lock`、schema-2 搬库的 mkdir/link/rename、
+`db_stub_make`、P17 判据里那次 16 字节的文件头读取);**`-EIO`**——早期(`check_version` 的读、
+`readdir(3)`),**也有**后期(ENOSPC 那批改动碰过的每一个站点:SQLite 在一个文件头完好的库上失败,
+判据说的是「读失败了,不是文件不对」,外加 `migrate_schema`、store id 的 `meta_set`、
+每次 open 收尾的 `trashing_recover`)。
+
+修法:把**两个分支共用的那一句承诺**抽成 `open_guarantee()`,一处定义——两份文案一定会走样,
+这四轮 review 每一轮都是「对某条路成立、对另一条不成立」的一句话。留下的是:什么都没**丢**、
+**读不了的 store 从来没有被当成空 store**(P17:没有在它看不见的树上发过 id、建过库)、
+已经做了的原样留着、同一条命令接着做,以及绝不挪开/重建/恢复。`try:` 按 errno 分开:
+权限/挂载给 `-EACCES`/`-EPERM`/`-ENOTDIR`,`-EIO` 则说清这是卷或者 SQLite 读库的 I/O 错误、
+**库并没有被判定损坏**,去查卷再重跑。
+
+**顺带核对的其它分支**:`WFS_E_SCHEMA`(没有这类断言)、`WFS_E_STORE_DAMAGED`(只说
+"nothing will be created here",守卫确实在建任何东西之前就返回了)、`WFS_E_STORE_UNREACHABLE`
+以及 `-EROFS`/`-EBUSY`/`-ENOMEM`(落到 errno 那一行,什么都不断言)。又抓到一处:
+`WFS_E_STORE_BUSY` 说「nothing was migrated and the store was left as it was」——而
+`db_move_to_schema3()` 在 `version_upgrade()` 已经把 `VERSION` 写成 3 之后失败时,
+store **不是**原样;改成「库没有迁移、库里一行都没改」,并点明 `VERSION` 可能已经是 3
+(那正是对老二进制关上的那扇门)。
+
+红:`safety.sh` 的 P17 段新增用例(`snapshots/` 0000;要先把 `metadata.db` 那个空目录也去掉,
+否则布局在任何 readdir 之前就判损坏了),在未修复的代码上
+`FAIL PR8 an unreadable store is told what was not lost, not what was not created (exit 1)`,
+输出里正是那句 "nothing was created … no metadata3.db and no store id were made here"。
+**后期 `-EIO` 的 CLI 文案没有加测试**:CLI 到 core 的 open 之间没有缝,而为此加一个生产环境
+的开关是不划算的;后期 `-EIO` 这条判据本身在 core 层已经钉住(`SQLITE_IOERR` → `-EIO`)。
