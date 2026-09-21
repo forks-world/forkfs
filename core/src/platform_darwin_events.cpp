@@ -86,6 +86,10 @@ struct Replay {
     dispatch_semaphore_t sem = nullptr;
 };
 
+// The barrier below. A serial queue runs one thing at a time and in order, so a dispatch_sync
+// of nothing at all returns only once everything already on the queue has run.
+void drain_noop(void *) {}
+
 int64_t mono_us(void) {
     struct timespec ts;
     ::clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -283,6 +287,17 @@ int fs_events_replay(const char *root, uint64_t since, uint64_t dev, int64_t sin
         FSEventStreamStop(stream);
     }
     FSEventStreamInvalidate(stream);
+    // Everything the callback touches -- `r`, and the `alt` string `r.alt` points into -- is on
+    // this function's stack, so the callback must be proven finished before the return below,
+    // not merely told to stop. FSEventStreamStop() and FSEventStreamInvalidate() run here,
+    // while a batch that FSEvents has already handed to the queue runs there; neither of them
+    // waits for it. Measured, on the paths that abandon the stream early (a HistoryDone that
+    // never came, MustScanSubDirs, a dropped batch -- exactly the cases where events are still
+    // arriving when we give up): the callback carried on into a returned frame and
+    // strip_root()'s strncmp took a SIGSEGV off a `root` pointer that was not there any more.
+    // The queue is serial, so a dispatch_sync onto it after the stream is invalidated -- after
+    // which nothing new can be enqueued -- returns only once the last callback has returned.
+    dispatch_sync_f(q, nullptr, drain_noop);
     FSEventStreamRelease(stream);
     dispatch_release(q);
     dispatch_release(r.sem);
