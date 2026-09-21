@@ -892,7 +892,11 @@ int rm_entry(void *ctx, const char *path, const char *rel, const struct stat &st
         // rely on the same behaviour.) If it ever does happen, finish this one directory the
         // certain way rather than failing the whole tree.
         if (e == ENOTEMPTY) {
-            int r2 = rm_rec(path, c->deadline);
+            // The same counter: whatever this recovery removes is removed for this walk, and
+            // leaving it out understated `gc.log`'s "entries unlinked" by everything the walk
+            // had missed. rm_rec() counts what is BELOW the path it is given, and the directory
+            // itself is bumped once below, so nothing is counted twice.
+            int r2 = rm_rec(path, c->deadline, &c->entries);
             if (r2 == 0) { if (*rel) bump(c->entries); return 0; }
             if (r2 == -ECANCELED) return -ECANCELED;   // the batch limit, not a failure
             e = ENOTEMPTY;
