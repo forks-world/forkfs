@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <strings.h>
 #include <sys/file.h>
+#include <sys/mount.h>
+#include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/random.h>
 #include <unistd.h>
@@ -684,6 +686,111 @@ int unlink_extra_link(const char *go, const char *keep) {
     return ::unlink(go) == 0 ? 0 : -errno;
 }
 
+// ---- P17, narrowed: a database we could not OPEN is not a database that is damaged ---------
+//
+// WFS_E_STORE_DAMAGED is the verdict whose advice is "restore metadata3.db from a backup, or
+// move the directory aside (`mv <store> <store>.damaged`) and start a new store" -- advice that
+// orphans every snapshot and every world in the store. It used to be reached from every failed
+// open and every failed first read of the database, whatever it was that had failed.
+//
+// Measured on 2026-09-21 (macOS 27 arm64, APFS): with the volume that holds the store full,
+// EVERY `world fs` command -- read-only `status` and `list` included, and `gc` and `discard`
+// with them -- exited 3 with exactly that advice, over a 40 960-byte metadata3.db that was
+// perfectly intact. The store is in WAL mode, so SQLite has to make a `-shm` even to READ it,
+// and on a full volume it cannot: SQLITE_IOERR_SHMOPEN. Freeing 8 MiB made every command work
+// again with nothing lost, and the user who had followed the advice in between would have had
+// no store to come back to.
+//
+// This is the 32nd round's rule one step along -- "a query that failed is not a query that
+// found nothing" -- so the verdict is split in two. WFS_E_STORE_DAMAGED now means the database
+// is POSITIVELY not a usable one: it is gone, it is not a regular file, it is shorter than the
+// 100-byte file header every SQLite database starts with, its first 16 bytes are not SQLite's
+// magic, or SQLite read it and answered SQLITE_NOTADB / SQLITE_CORRUPT. Everything else comes
+// back as the errno of whatever stopped us. Nothing on either path writes to the store: the
+// header is a plain 16-byte read(2), and the file itself is never replaced (SQLITE_OPEN_CREATE
+// creates a database that is not there, it does not truncate one that is).
+
+// A volume with less than this available is one this core would refuse to do anything but read
+// on in any case: P11 already refuses to start a clone under 256 MiB. See volume_out_of_space().
+constexpr uint64_t kNoSpaceCeiling = 32ull * 1024 * 1024;
+
+// 1 = a regular file that begins the way a SQLite database begins, 0 = positively not one (gone,
+// not a regular file, truncated below the header, or a different magic), -errno = we could not
+// look, which is neither of those (13th round).
+int db_header_shape(const char *path) {
+    struct stat st;
+    if (::stat(path, &st) != 0) return errno == ENOENT ? 0 : -errno;
+    if (!S_ISREG(st.st_mode)) return 0;
+    // SQLite's file header is 100 bytes; anything shorter cannot be a database, whatever its
+    // first bytes say, and a zero-length file is the one SQLite would happily start counting
+    // ids from 1 in.
+    if (st.st_size < 100) return 0;
+    int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    char hdr[16];
+    ssize_t n = ::read(fd, hdr, sizeof hdr);
+    int e = errno;
+    ::close(fd);
+    if (n < 0) return -e;
+    if (n < (ssize_t)sizeof hdr) return 0;
+    return ::memcmp(hdr, "SQLite format 3", sizeof hdr) == 0 ? 1 : 0;
+}
+
+// Is the volume that holds this store out of room? Asked only after SQLite has already failed
+// with an I/O-class error on a database whose header is intact, and only to choose between
+// -ENOSPC and -EIO. Neither answer can become WFS_E_STORE_DAMAGED, which is what makes a
+// generous rule here safe.
+//
+// SQLITE_FULL says it outright. sqlite3_system_errno() is asked next and is often no help:
+// measured on the bounded APFS image scripts/tests/disk_full.py makes, SQLITE_IOERR_SHMOPEN
+// came back with system errno 3 (ESRCH) -- whatever the shm path had stored last, not the
+// reason it failed.
+//
+// So the volume is asked, and the predicate is deliberately NOT `avail == 0`. Same measurement:
+// statfs(2) reported 11 247 616 bytes available -- 10.7 MiB, 2.1% of a 512 MiB image -- on a
+// volume where a 4 KiB write, a mkdir(2) and SQLite's 32 KiB `-shm` alike came back ENOSPC.
+// APFS keeps allocation back for its own metadata and for space it has not reclaimed yet, so
+// f_bavail is an upper bound on what a writer can get, never a promise. The threshold is
+// therefore a size, with room over that measurement rather than a hair's breadth: guessing high
+// costs a truthful "this volume is full" on a store that had some other I/O error with 32 MiB
+// free, and guessing low costs -EIO, which is what this path answered before.
+bool volume_out_of_space(int ext, sqlite3 *h, const char *dir) {
+    if ((ext & 0xff) == SQLITE_FULL) return true;
+    if (h) {
+        int se = sqlite3_system_errno(h);
+        if (se == ENOSPC || se == EDQUOT) return true;
+    }
+    struct statfs fs;
+    if (::statfs(dir, &fs) != 0) return false;
+    return (uint64_t)fs.f_bavail * (uint64_t)fs.f_bsize < kNoSpaceCeiling;
+}
+
+// The verdict itself. `rc` is what SQLite returned, `h` the connection it returned it on (which
+// carries the extended code and the system errno), `dbp` the database file and `dir` the store.
+int open_failure_verdict(const char *dir, const char *dbp, sqlite3 *h, int rc) {
+    int ext = rc;
+    if (h) {
+        int e = sqlite3_extended_errcode(h);
+        // The connection's code is the one with the detail on it. The caller's rc is what is
+        // left when the connection never took an error of its own -- a prepare that failed on a
+        // clean handle, a step that ended SQLITE_DONE where a row was owed.
+        if (e != SQLITE_OK) ext = e;
+        else if (ext == SQLITE_OK || ext == SQLITE_DONE || ext == SQLITE_ROW) ext = SQLITE_ERROR;
+    }
+    int prim = ext & 0xff;
+    // SQLite read the file and rejected it: that is P17's shape, whatever else is wrong.
+    if (prim == SQLITE_NOTADB || prim == SQLITE_CORRUPT) return WFS_E_STORE_DAMAGED;
+    int shape = db_header_shape(dbp);
+    if (shape == 0) return WFS_E_STORE_DAMAGED;
+    // ... and these say what they are. None of them is "the file is not a database".
+    if (prim == SQLITE_BUSY || prim == SQLITE_LOCKED || prim == SQLITE_NOMEM ||
+        prim == SQLITE_READONLY)
+        return wfs::map_sqlite(prim);
+    if (volume_out_of_space(ext, h, dir)) return -ENOSPC;
+    if (shape < 0) return shape;   // we could not even read the header: that errno, not a guess
+    return -EIO;
+}
+
 // 0, or the error the upgrade ends with. Every failure leaves the store in one of the states
 // store_layout() below resumes from, and in all of them `metadata.db` is still there.
 int db_move_to_schema3(const char *dir) {
@@ -705,17 +812,19 @@ int db_move_to_schema3(const char *dir) {
     sqlite3 *h = nullptr;
     // No SQLITE_OPEN_CREATE: this is called only when `metadata.db` is a regular file, and a
     // database that has gone missing under us is not one to create here.
-    if (sqlite3_open_v2(olddb.c_str(), &h, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK) {
+    if (int orc = sqlite3_open_v2(olddb.c_str(), &h, SQLITE_OPEN_READWRITE, nullptr)) {
+        int v = open_failure_verdict(dir, olddb.c_str(), h, orc);
         if (h) sqlite3_close(h);
-        return WFS_E_STORE_DAMAGED;
+        return v;
     }
     sqlite3_busy_timeout(h, 10000);
     int rc = 0;
     {
         Stmt q(h, "PRAGMA journal_mode=DELETE");
         // A file that is not a database comes back here as SQLITE_NOTADB, from the step -- the
-        // same verdict the 13th round gave every other shape of that.
-        if (!q.ok() || !q.row()) rc = WFS_E_STORE_DAMAGED;
+        // same verdict the 13th round gave every other shape of that. Anything else that stops
+        // the step is not damage and does not get that verdict (open_failure_verdict above).
+        if (!q.ok() || !q.row()) rc = open_failure_verdict(dir, olddb.c_str(), h, q.err());
         else {
             const char *mode = q.col_text(0);
             if (!mode || ::strcasecmp(mode, "delete") != 0) rc = WFS_E_STORE_BUSY;
@@ -791,17 +900,18 @@ int db_move_to_schema3(const char *dir) {
 // (b) it would already have been moved. READWRITE and not READONLY: a schema-2 store is in WAL
 // mode, and a read-only connection to a WAL database needs the `-shm` it may not be allowed to
 // make. Reading a pragma writes nothing to the database file either way.
-int db_user_version_at(const char *path, int *out) {
+int db_user_version_at(const char *dir, const char *path, int *out) {
     sqlite3 *h = nullptr;
-    if (sqlite3_open_v2(path, &h, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK) {
+    if (int orc = sqlite3_open_v2(path, &h, SQLITE_OPEN_READWRITE, nullptr)) {
+        int v = open_failure_verdict(dir, path, h, orc);
         if (h) sqlite3_close(h);
-        return WFS_E_STORE_DAMAGED;
+        return v;
     }
     sqlite3_busy_timeout(h, 10000);
     int rc = 0;
     {
         Stmt q(h, "PRAGMA user_version");
-        if (!q.ok() || !q.row()) rc = WFS_E_STORE_DAMAGED;
+        if (!q.ok() || !q.row()) rc = open_failure_verdict(dir, path, h, q.err());
         else *out = (int)q.col_i64(0);
     }
     sqlite3_close(h);
@@ -1236,7 +1346,7 @@ extern "C" const char *wfs_strerror(int rc) {
     case WFS_E_SNAPSHOT_IN_USE: return "a live world still needs this snapshot";
     case WFS_E_GC_BUSY: return "another gc worker is running";
     case WFS_E_STORE_UNREACHABLE: return "that store cannot be opened from here";
-    case WFS_E_STORE_DAMAGED: return "the store has trees in it but no readable metadata3.db";
+    case WFS_E_STORE_DAMAGED: return "the store has trees in it but metadata3.db is gone or is not a database";
     case WFS_E_STORE_BUSY:
         return "older clients still have the store open; stop them and retry";
     case WFS_E_TRASH_BLOCKED: return "a directory is in the way of this trash entry's deletion";
@@ -1380,7 +1490,7 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
         String olddb;
         db_path(s->dir.c_str(), olddb, true);
         int old_uv = 0;
-        int mrc = db_user_version_at(olddb.c_str(), &old_uv);
+        int mrc = db_user_version_at(s->dir.c_str(), olddb.c_str(), &old_uv);
         if (!mrc && old_uv / 100 > WFS_STORE_SCHEMA) { wfs_store_close(s); return WFS_E_SCHEMA; }
         if (!mrc && legacy_schema) {
             if (int vrc = version_upgrade(s->dir.c_str())) { wfs_store_close(s); return vrc; }
@@ -1434,7 +1544,11 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
         rc = wfs_test_db_open_fail_once;
         wfs_test_db_open_fail_once = 0;
     }
-    if (rc != SQLITE_OK) { wfs_store_close(s); return WFS_E_STORE_DAMAGED; }
+    if (rc != SQLITE_OK) {
+        int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, rc);
+        wfs_store_close(s);
+        return v;
+    }
     sqlite3_busy_timeout(s->db, 10000);
     // PR #1 review (24th round, P1): the database's own stamp is read before ANYTHING is written
     // to it -- before even the journal-mode pragma, which rewrites the file header -- because a
@@ -1454,7 +1568,14 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
         // A stamp that cannot be read is a database that cannot be read -- SQLITE_NOTADB comes
         // back here, from the step, for a file that is not one -- so it gets the verdict the
         // 13th round gave every other shape of that: WFS_E_STORE_DAMAGED, and nothing written.
-        if (!q.ok() || !q.row()) { wfs_store_close(s); return WFS_E_STORE_DAMAGED; }
+        // But only that shape of it: a database we could not READ is not a database that is
+        // damaged either, and on a full volume this is the step that fails first, because WAL
+        // needs a `-shm` before it can give anybody page 1 (open_failure_verdict above).
+        if (!q.ok() || !q.row()) {
+            int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, q.err());
+            wfs_store_close(s);
+            return v;
+        }
         user_version = (int)q.col_i64(0);
     }
     if (user_version / 100 > WFS_STORE_SCHEMA) { wfs_store_close(s); return WFS_E_SCHEMA; }
@@ -1524,7 +1645,11 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
             // this line existed -- a second opener arriving between the move and the commit
             // came back WFS_E_STORE_BUSY and reverted a store that was already schema 3.
             Stmt q2(s->db, "PRAGMA user_version");
-            if (!q2.ok() || !q2.row()) { wfs_store_close(s); return WFS_E_STORE_DAMAGED; }
+            if (!q2.ok() || !q2.row()) {
+                int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, q2.err());
+                wfs_store_close(s);
+                return v;
+            }
             user_version = (int)q2.col_i64(0);
             if (user_version / 100 > WFS_STORE_SCHEMA) { wfs_store_close(s); return WFS_E_SCHEMA; }
         }
@@ -1532,9 +1657,10 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
             if (int hrc = legacy_holders_gate(s->dir.c_str())) { wfs_store_close(s); return hrc; }
         }
     }
-    if (sqlite3_exec(s->db, kPragmas, nullptr, nullptr, nullptr) != SQLITE_OK) {
+    if (int prc = sqlite3_exec(s->db, kPragmas, nullptr, nullptr, nullptr)) {
+        int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, prc);
         wfs_store_close(s);
-        return WFS_E_STORE_DAMAGED;
+        return v;
     }
     // All of it or none of it, and the stamp last (migrate_schema above). A store this fails on
     // is left un-stamped and untouched, so the next open is the retry. A schema-2 store gets its

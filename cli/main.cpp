@@ -1954,7 +1954,7 @@ int main(int argc, char **argv) {
         char why[WFS_PATH_MAX + 256];
         snprintf(why, sizeof why,
                  "the store at %s still holds trees (snapshots/, trash/ or pool/) but its "
-                 "metadata3.db is missing or unreadable.\n"
+                 "metadata3.db is gone, or is a file that is not a database.\n"
                  "  Those trees are what the database was the index of: ids would restart at 1 "
                  "and collide with the snapshots/S<n> already on disk, so nothing will be "
                  "created here.\n"
@@ -1964,6 +1964,33 @@ int main(int argc, char **argv) {
         return refuse(why,
                       "restore metadata3.db from a backup, or move the directory aside "
                       "(`mv <store> <store>.damaged`) and start a new store");
+    }
+    // ---- P17, narrowed: the store whose volume filled up --------------------------------
+    //
+    // Measured on 2026-09-21 (macOS 27 arm64): with the volume that holds the store full, EVERY
+    // `world fs` command -- read-only `status` and `list` included -- took the branch above and
+    // printed "move the directory aside (`mv <store> <store>.damaged`) and start a new store"
+    // over a metadata3.db that was perfectly intact. It is WAL, so SQLite could not make the
+    // `-shm` it needs even to read it. Doing what that advice said would have orphaned every
+    // snapshot and every world in the store; freeing 8 MiB made everything work again.
+    //
+    // The core tells the two apart now (store.cpp, open_failure_verdict), so this says what is
+    // actually true -- and says the opposite of the advice above, because a store that is
+    // merely unreachable is the one store that must NOT be moved or rebuilt. Exit 1: 3 means
+    // "refused by a safety rule", and a volume that filled up is the environment, which is what
+    // every other non-refusal open error below exits with.
+    if (rc == -ENOSPC) {
+        fprintf(stderr, "world: open store %s: %s\n", sd, wfs_strerror(rc));
+        fprintf(stderr,
+                "  the volume that holds the store is full, so its metadata3.db could not be "
+                "opened -- SQLite writes a -wal/-shm sidecar even to read it.\n"
+                "  the database itself is intact and nothing here was created, changed or "
+                "removed. This is not damage: do not move this directory aside, do not start a "
+                "new store, and do not recover anything from a backup.\n"
+                "  try: free space on the volume that holds %s (`df -h %s`) and run the same "
+                "command again\n",
+                sd, sd);
+        return EX_ERR;
     }
     // P17, and PR #1 review (13th round): the guard above needs three readdirs to know whether
     // this store still holds trees, and a `snapshots/` it cannot open answers nothing. The core

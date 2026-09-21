@@ -25,6 +25,10 @@ inline int map_sqlite(int rc) {
     case SQLITE_NOMEM: return -ENOMEM;
     case SQLITE_CONSTRAINT: return -EEXIST;
     case SQLITE_READONLY: return -EROFS;
+    // The volume filled up. -EIO used to swallow this, and what the CLI then said about it was
+    // an I/O error on a store that is in perfect health (store.cpp, open_failure_verdict): the
+    // one thing a user can do about a full volume is free space, and they have to be told that.
+    case SQLITE_FULL: return -ENOSPC;
     default: return -EIO;
     }
 }
