@@ -215,6 +215,43 @@ static void run_diff_err(wfs_store *s, wfs_id w, int flags, Collect *c, int want
     CHECK(c->n == 0);
 }
 
+// The names of the wfs_diff_fallback reasons. A failure below has to say which reason came
+// back, not leave a number in a quoted CHECK expression for somebody to look up.
+static const char *fallback_name(int f) {
+    switch (f) {
+    case WFS_DF_NONE: return "NONE";
+    case WFS_DF_REQUESTED: return "REQUESTED";
+    case WFS_DF_NO_CURSOR: return "NO_CURSOR";
+    case WFS_DF_FROM_WORLD: return "FROM_WORLD";
+    case WFS_DF_MUST_SCAN: return "MUST_SCAN";
+    case WFS_DF_DROPPED: return "DROPPED";
+    case WFS_DF_WRAPPED: return "WRAPPED";
+    case WFS_DF_STALE: return "STALE";
+    case WFS_DF_TIMEOUT: return "TIMEOUT";
+    case WFS_DF_UNSUPPORTED: return "UNSUPPORTED";
+    case WFS_DF_SMALL_TREE: return "SMALL_TREE";
+    default: return "?";
+    }
+}
+
+// Every "this diff had to take the FSEvents path" assertion goes through here.
+// `CHECK(st.full_scan == 0 && st.fallback == WFS_DF_NONE)` printed the expression and nothing
+// else: on a CI machine, where this is the only thing anybody can read afterwards, that does
+// not say which of the two terms failed, nor which fallback reason the diff chose, nor how
+// long the replay waited before giving up. `what` names the case, because a run has a dozen
+// of these.
+static void want_events_path(const char *what, const wfs_diff_stats *st, const char *file, int line) {
+    if (st->full_scan == 0 && st->fallback == WFS_DF_NONE) return;
+    fprintf(stderr,
+            "%s:%d: %s: wanted the FSEvents path, got full_scan=%d fallback=%s(%d), "
+            "%llu candidates, %llu compared, %llu content compares, %.1f ms\n",
+            file, line, what, st->full_scan, fallback_name(st->fallback), st->fallback,
+            (unsigned long long)st->candidates, (unsigned long long)st->compared,
+            (unsigned long long)st->content_cmp, st->elapsed_us / 1000.0);
+    exit(1);
+}
+#define WANT_EVENTS(what, st) want_events_path((what), (st), __FILE__, __LINE__)
+
 // ---- poking the recorded cursor (the only reason sqlite3 is here) ------------------------------
 
 static void set_cursor(const char *store, wfs_id w, unsigned long long id) {
@@ -290,7 +327,7 @@ static void bench(const char *root, const char *store) {
     uint64_t cand = 0;
     for (int i = 0; i < 3; ++i) {
         run_diff(s, wid, 0, &c, &st);
-        CHECK(st.full_scan == 0);
+        WANT_EVENTS("timing / FSEvents", &st);
         if (st.elapsed_us / 1e6 < ev) ev = st.elapsed_us / 1e6;
         n_events = c.n;
         cand = st.candidates;
@@ -1106,7 +1143,7 @@ static void small_cases(const char *root, const char *store) {
         {'D', "turns-into-a-file/buried.txt"},
     };
     run_diff(s, wid, 0, &c, &st);
-    CHECK(st.full_scan == 0);
+    WANT_EVENTS("small / FSEvents", &st);
     check_lines("small / FSEvents", &c, want, sizeof want / sizeof want[0]);
     run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
     CHECK(st.full_scan == 1 && st.fallback == WFS_DF_REQUESTED);
@@ -1174,7 +1211,7 @@ static void small_cases(const char *root, const char *store) {
         {'D', "turns-into-a-file/buried.txt"},
     };
     run_diff(s, wid, 0, &c, &st);
-    CHECK(st.full_scan == 0);
+    WANT_EVENTS("xattr-only / FSEvents", &st);
     check_lines("xattr-only / FSEvents", &c, want_x, sizeof want_x / sizeof want_x[0]);
     run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
     check_lines("xattr-only / --full", &c, want_x, sizeof want_x / sizeof want_x[0]);
@@ -1225,14 +1262,14 @@ static void small_cases(const char *root, const char *store) {
     CHECK(st.full_scan == 1 && st.fallback == WFS_DF_SMALL_TREE && st.candidates == 0);
     check_lines("default / scan", &c, want, sizeof want / sizeof want[0]);
     run_diff(s, wid, WFS_DIFF_EVENTS, &c, &st);
-    CHECK(st.full_scan == 0 && st.fallback == WFS_DF_NONE);
+    WANT_EVENTS("--events", &st);
     check_lines("--events", &c, want, sizeof want / sizeof want[0]);
     run_diff(s, wid, WFS_DIFF_EVENTS | WFS_DIFF_FULL, &c, &st);
     CHECK(st.full_scan == 1 && st.fallback == WFS_DF_REQUESTED);
     // A world above the threshold picks the events path on its own.
     CHECK(setenv("WFS_DIFF_EVENTS_MIN_ENTRIES", "2", 1) == 0);
     run_diff(s, wid, 0, &c, &st);
-    CHECK(st.full_scan == 0 && st.fallback == WFS_DF_NONE);
+    WANT_EVENTS("above the threshold / events by default", &st);
     CHECK(setenv("WFS_DIFF_EVENTS_MIN_ENTRIES", "0", 1) == 0);
 
     free(c.v);
@@ -1284,7 +1321,8 @@ int main() {
     memset(&c, 0, sizeof c);
     wfs_diff_stats st;
     run_diff(s, wid, 0, &c, &st);
-    CHECK(c.n == 0 && st.full_scan == 0 && st.fallback == WFS_DF_NONE);
+    CHECK(c.n == 0);
+    WANT_EVENTS("untouched world", &st);
     run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
     CHECK(c.n == 0 && st.full_scan == 1);
     printf("  untouched world             0 lines, both paths\n");
@@ -1321,7 +1359,7 @@ int main() {
     // full scan is the default path now; here it would just make the exact-set assertion flaky.
     settle();
     run_diff(s, wid, 0, &c, &st);
-    CHECK(st.full_scan == 0 && st.fallback == WFS_DF_NONE);
+    WANT_EVENTS("10k / FSEvents", &st);
     CHECK(st.candidates >= N_MOD + N_ADD + N_DEL + N_META);
     CHECK(st.content_cmp >= N_FILES); // d004 had to be read on both sides
     check_exact("10k / FSEvents", &c, &st);
