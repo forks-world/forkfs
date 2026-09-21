@@ -247,8 +247,15 @@ static void check_cli_message(const char *world_bin, const char *store) {
     // there was touched, and that a half-made new store is finished by running the same command
     // again.
     CHECK(strstr(out, "nothing here was created, changed or removed") == NULL);
-    CHECK(strstr(out, "nothing that was already here was changed or removed") != NULL);
-    CHECK(strstr(out, "finishes the setup") != NULL);
+    // ... and not this either (PR #8 review, round 3): opening a SCHEMA-2 store rewrites its
+    // VERSION and moves its database before anything can run out of room, and the final
+    // trashing_recover() resolves rows a killed `discard` left behind one transaction at a
+    // time, so some of them can have been written when a later one fails. What is true of every
+    // path that can end here is that nothing was LOST and that the command can simply be run
+    // again.
+    CHECK(strstr(out, "nothing that was already here was changed or removed") == NULL);
+    CHECK(strstr(out, "no record in the store's database was lost") != NULL);
+    CHECK(strstr(out, "carries on from there") != NULL);
 }
 
 static void check_integrity(const char *store) {

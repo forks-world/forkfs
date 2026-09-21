@@ -1045,6 +1045,12 @@ static void vbump_after_version_bump(void *ctx, const char *dir) {
 static int g_gap_ran;
 static int g_gap_open_rc;
 static int g_gap_uv;
+// PR #8 review (round 3): the store runs out of room AFTER the 2 -> 3 move has happened. The
+// seam fires right where the move ends, and arms the open that comes next.
+static void r8_fail_after_move(void *, const char *) {
+    wfs_test_db_open_fail_once = SQLITE_FULL;
+}
+
 static void gap_m1_open(void *ctx, const char *dir) {
     (void)ctx;
     char dbp[4096];
@@ -7099,6 +7105,40 @@ int main(int argc, char **argv) {
         CHECK(nlink_of(vdb3) == 1);
         CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
         CHECK(unlink(g_r37_guard_stub) == 0);
+
+        // ---- PR #8 review (round 3): out of room in the middle of the upgrade --------------
+        //
+        // What the -ENOSPC message promises the user is that the command can simply be run
+        // again, and this is the path where most has already been done when the room runs out:
+        // VERSION has been rewritten to 3, the journal mode has been switched, the database has
+        // been exchanged into its new name and the old name is the stub -- and the migration
+        // has NOT committed. So the verdict has to be -ENOSPC (not damage, and not "somebody
+        // else has it open"), the store has to be left standing exactly as it is, and the next
+        // open has to carry on from there with every row where it was.
+        store_as_m1(vstore, 0);
+        db_exec(vdb, "INSERT INTO worlds(id,name,created_at) VALUES(1,'r8a',1);"
+                     "INSERT INTO worlds(id,name,created_at) VALUES(2,'r8b',2);");
+        CHECK(db_i64(vdb, "SELECT count(*) FROM worlds") == 2);
+        wfs_test_after_db_move = r8_fail_after_move;
+        vs = NULL;
+        CHECK_RC(wfs_store_open(vstore, &vs), -ENOSPC);
+        wfs_test_after_db_move = NULL;
+        CHECK(vs == NULL);
+        CHECK(wfs_test_db_open_fail_once == 0);          // the seam fired
+        // The move stands, un-migrated, and both rows are in it.
+        CHECK(stat(vdb, &vst0) == 0 && S_ISDIR(vst0.st_mode));
+        CHECK(stat(vdb3, &vst0) == 0 && S_ISREG(vst0.st_mode));
+        CHECK(nlink_of(vdb3) == 1);
+        CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA_M1);
+        CHECK(db_i64(vdb3, "SELECT count(*) FROM worlds") == 2);
+        CHECK(read_file(vver, vbuf, sizeof vbuf) == 0 && atoi(vbuf) == WFS_STORE_SCHEMA);
+        // ... and the same command, run again, finishes it.
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_close(vs);
+        CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
+        CHECK(db_i64(vdb3, "SELECT count(*) FROM worlds") == 2);
+        for (size_t i = 0; i < kAddedN; ++i) CHECK(db_has_column(vdb3, kAdded[i][0], kAdded[i][1]));
     }
     // ---- PR #1 review (25th round, P1): a trash entry is the row's tree, not the row's name --
     //
