@@ -399,7 +399,7 @@ static void bench(const char *root, const char *store) {
     memset(&c, 0, sizeof c);
     wfs_diff_stats st;
     double ev = 1e9, fl = 1e9, fx = 1e9, evx = 1e9, fa = 1e9;
-    size_t n_events = 0, n_full = 0;
+    size_t n_events = 0, n_default = 0, n_full = 0;
     uint64_t cand = 0;
     // Only a run that really took the events path is a sample of the events path. A fallback
     // the environment forced is accepted above, and timing it under the FSEvents label would
@@ -408,6 +408,10 @@ static void bench(const char *root, const char *store) {
     int ev_n = 0, evx_n = 0;
     for (int i = 0; i < 3; ++i) {
         run_diff(s, wid, 0, &c, &st);
+        // The answer of the default diff, whichever path it took: that is what has to agree
+        // with the full scan below. n_events is only the benchmark's sample and stays 0 when
+        // every run fell back, so it is not what the closing CHECK may compare.
+        n_default = c.n;
         if (WANT_EVENTS("timing / FSEvents", &st)) {
             if (st.elapsed_us / 1e6 < ev) ev = st.elapsed_us / 1e6;
             n_events = c.n;
@@ -441,7 +445,8 @@ static void bench(const char *root, const char *store) {
     printf("  diff (--full)              %.3f s   %llu changes\n", fl, (unsigned long long)n_full);
     printf("  diff (--full --no-xattr)   %.3f s\n", fx);
     printf("  diff (--full --all-xattrs) %.3f s\n", fa);
-    CHECK(n_full == n_events);
+    CHECK(n_full == n_default);
+    if (ev_n) CHECK(n_events == n_default);
     free(c.v);
     wfs_store_close(s);
 }
