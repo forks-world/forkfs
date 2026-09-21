@@ -2,8 +2,9 @@
 # End-to-end check of the fool-proofing rules of docs/M1_DESIGN.md §3, driven through the CLI.
 # One line of PASS/FAIL per rule; exit 1 if any rule failed.
 #
-# Everything happens inside $WORLD_TEST_DIR (default: a scratch directory whose last component
-# must be `m1test`, which is the only thing this script ever deletes).
+# Everything happens inside the scratch directory: the second argument, or $WORLD_TEST_DIR, or
+# `m1test` inside a fresh `mktemp -d` when neither is given. Its last component must be
+# `m1test`, and it is the only thing this script ever deletes.
 #
 #   scripts/tests/safety.sh [build-dir] [scratch-dir]
 set -uo pipefail
@@ -14,7 +15,20 @@ BUILD=$(cd "$BUILD" && pwd)
 WORLD="$BUILD/cli/world"
 [ -x "$WORLD" ] || { echo "no world CLI at $WORLD; build first"; exit 2; }
 
-SCRATCH=${2:-${WORLD_TEST_DIR:-/private/tmp/claude-501/-Users-hurricane-private-code-forks-world-forkfs/5b03ff32-c328-4b45-93c8-d8077b5207cc/scratchpad/m1test}}
+SCRATCH=${2:-${WORLD_TEST_DIR:-$(mktemp -d)/m1test}}
+
+# Canonicalise it before anything else looks at it, the guard below included. A dozen cases
+# further down compare a path the CLI printed against a string built out of $SCRATCH, and the
+# CLI prints paths it has resolved -- so `a//b`, a trailing slash, a `./` segment, or a prefix
+# that is a symlink (on macOS /tmp is one: it is /private/tmp) makes those cases fail one by
+# one while nothing is actually wrong.
+#
+# The PARENT is resolved and the last component appended by hand, rather than resolving
+# $SCRATCH itself: that last component is the thing this script deletes, and following it would
+# mean deleting whatever a symlink left in its place points at instead.
+SCRATCH_PARENT=$(cd "$(dirname "$SCRATCH")" 2>/dev/null && pwd -P) || SCRATCH_PARENT=""
+[ -n "$SCRATCH_PARENT" ] || { echo "refusing to use $SCRATCH: its parent directory does not exist"; exit 2; }
+SCRATCH="$SCRATCH_PARENT/$(basename "$SCRATCH")"
 case "$SCRATCH" in
     */m1test) ;;
     *) echo "refusing to use $SCRATCH: the scratch directory must be named m1test"; exit 2 ;;
@@ -33,6 +47,11 @@ cleanup_scratch() {
 }
 cleanup_scratch
 mkdir -p "$SCRATCH"
+# Said once, here, rather than as twelve scattered path mismatches three hundred lines down:
+# from this point on $SCRATCH is what the CLI will print for anything inside it.
+SCRATCH_REAL=$(cd "$SCRATCH" && pwd -P)
+[ "$SCRATCH_REAL" = "$SCRATCH" ] \
+    || { echo "refusing to run: \$SCRATCH is $SCRATCH but resolves to $SCRATCH_REAL"; exit 2; }
 export WORLD_STORE="$SCRATCH/store"
 PROJ="$SCRATCH/proj"
 
