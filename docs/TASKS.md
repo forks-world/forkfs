@@ -3341,3 +3341,36 @@ open 停在 `snapshots/` 的第一个 `mkdir(2)` 上、根本走不到 SQLite �
   串都写着 store「still holds trees」,而 `store_layout()` 有好几条路**没有树也会**判损坏
   (两个库名处在协议产生不出来的状态);两处都改成对所有这些情况都成立的说法,树那句保留下来
   当作「为什么 id 会撞车」的理由。
+
+**同一类的第六处(PR #8 review 第三轮,`b75f133` + `e762df6`)**:`-ENOSPC` / `-EDQUOT` 那段
+第二轮改成的「nothing that was already here was changed or removed」**还是说过头了**。
+**两条**路让它不成立,不是一条:
+
+- **schema 2 的老 store**。`wfs_store_open()` 先跑 `version_upgrade()`(`VERSION` 2→3),
+  再跑 `db_move_to_schema3()`(改 journal mode、`link` + `RENAME_SWAP` 把库换到新名字、
+  旧名字变成空目录),**然后**才轮到那次可能没空间的 open。到这一步为止,本来就在的
+  `VERSION` 已经被重写了。
+- **`trashing_recover()`**,每一次 open 的最后一步:它把被 kill 的 `discard` 留下的 state=4
+  行**一行一个事务**地收尾,于是前面的行可能已经提交、后面的行才撞上 `SQLITE_FULL`。
+
+迁移本身**不是**第三条:`migrate_schema()` 是**一个**事务,它唯一能走到这里的 `-ENOSPC` 是
+COMMIT 失败——事务还开着,析构函数回滚,一行记录都没动。
+
+于是保证改成按**「丢没丢」**说,这在每一条路上都成立:没有快照、没有 World、没有库里的记录
+**丢失**,这里什么都没被删掉;已经做了的那部分(新 store 的目录和空文件、把老 store 往当前布局
+搬的头几步、或者替一条被中断的 `discard` 收的尾)**原样留着就行**,同一条命令有空间之后
+**从那儿接着做**。其余性质全留。两句「为什么失败」也有同样的毛病——老 store 那条路上用光空间的
+可能是 `mkdir`、`link`、`rename` 或者 `VERSION` 的重写,而不是「打开数据库」——改成
+「这条命令写不下它需要写的东西」,`-wal`/`-shm` 那句保留作为「连读都要先写」的理由。
+
+**逐条核对过的路**(每一条都能从 `wfs_store_open()` 返回 `-ENOSPC`/`-EDQUOT`):新 store、
+已经是 schema 3 的 store、老 store 在升级的每一步(`VERSION` 重写、搬库的 1~4 步、搬了一半、
+迟到的持有者闸门、迁移事务、`kPragmas`)、以及最后那次 `trashing_recover()`。
+**没有发现不可续的状态**:每一种都落在 `store_layout()` 那张表的某一行上,下一次 open 接着做,
+既不会判 `WFS_E_STORE_DAMAGED` 也不会判 `WFS_E_STORE_BUSY`(`WFS_E_STORE_BUSY` 只在真有别的
+进程开着库时出现,那是它本来的语义)。最长的那条由 `core_test` 钉住:用现成的 schema 2 夹具加
+`wfs_test_after_db_move` 缝,在**搬完库、迁移还没提交**的那一刻让 open 撞上 `SQLITE_FULL`——
+判据是 `-ENOSPC`,`metadata.db` 是空目录、`metadata3.db` 是普通文件、两行都在、`user_version`
+还是 2xx、`VERSION` 已经是 3,而下一次 open 把迁移做完、两行一个不少。这条用例**本来就是绿的**
+(判据的活前几轮已经做完),它新钉的是那句承诺所依赖的**可续性**。红的是文案那一条:
+`disk_full_test.cpp:256: CHECK failed: strstr(out, "nothing that was already here was changed or removed") == NULL`。
