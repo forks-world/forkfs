@@ -4,7 +4,9 @@
 #
 # Everything happens inside the scratch directory: the second argument, or $WORLD_TEST_DIR, or
 # `m1test` inside a fresh `mktemp -d` when neither is given. Its last component must be
-# `m1test`, and it is the only thing this script ever deletes.
+# `m1test`, and it is the only thing this script ever deletes recursively. A scratch the
+# script made for itself is removed again after a successful run (and its empty mktemp parent
+# with a plain rmdir); after a failed run it is kept and its path printed.
 #
 #   scripts/tests/safety.sh [build-dir] [scratch-dir]
 set -uo pipefail
@@ -28,6 +30,10 @@ if [ -z "$SCRATCH" ]; then
         exit 2
     fi
     SCRATCH="$SCRATCH_TMP/m1test"
+    # A scratch this script made for itself is this script's to take away again. A path the
+    # caller named is cleared by the next run that names it, as it always was; a fresh mktemp
+    # directory has no next run, and every one of them would keep a 120k-entry fixture.
+    SCRATCH_AUTO=1
 fi
 
 # The guard, asked of the name as given, before anything at all is created or removed. It needs
@@ -513,6 +519,7 @@ check P14 "the sandboxed child cannot write the store"         1 -- "$WORLD" exe
 check P14 "the sandboxed child cannot read the snapshots"      1 -- "$WORLD" exec W1 -- /bin/sh -c "ls '$WORLD_STORE/snapshots'"
 check P14 "--no-sandbox runs the command unrestricted"         0 -- "$WORLD" exec W1 --no-sandbox -- /bin/sh -c "touch '$OTHER/allowed'"
 rm -f "$OTHER/allowed" "$SCRATCH/w1-moved/sandbox-ok" /private/tmp/wfs-sandbox-ok
+[ -n "${TMPDIR:-}" ] && rm -f "${TMPDIR%/}/wfs-sandbox-ok"
 [ ! -e "$OTHER/evil" ] && ok P14 "nothing the sandbox refused actually landed" \
                        || bad P14 "nothing the sandbox refused actually landed"
 [ -z "$(ls "$WORLD_STORE/tmp" 2>/dev/null)" ] && ok P14 "the generated profile is removed afterwards" \
@@ -2083,4 +2090,15 @@ echo
 "$WORLD" fs status | sed 's/^/      /'
 echo
 echo "safety: $pass passed, $fail failed"
+if [ "${SCRATCH_AUTO:-0}" = 1 ]; then
+    if [ "$fail" = 0 ]; then
+        # Only what this run created: the m1test tree through the same cleanup the start of a
+        # run uses, then the mktemp parent with a plain rmdir, which removes it only if nothing
+        # else was put there.
+        cleanup_scratch
+        rmdir "$SCRATCH_PARENT" 2>/dev/null
+    else
+        echo "safety: kept $SCRATCH for diagnosis; remove it when done"
+    fi
+fi
 [ "$fail" = 0 ] || exit 1
