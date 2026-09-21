@@ -3445,6 +3445,27 @@ macOS 15 arm64 runner 上三次(纯文档提交)红在同一条断言,另有一�
 给的**,后者就是本代码自己的错,必须红。留在"环境造成"里的是 TIMEOUT / MUST_SCAN / DROPPED /
 UNSUPPORTED / STALE,逐条理由写在 `environment_forced()` 上面。
 
-**验收**:`ctest` 2/2;`check-deps.sh` 绿;`safety.sh` **298 passed, 0 failed**,四种拼法
-(双斜杠、尾斜杠、`/tmp` 符号链接前缀、不给参数)都是 298/0;`test_disk_full_wrapper.py` 与
-`disk_full.py` 全绿。
+评审后又补了四处:
+
+- **CI 回归(我们自己造的)**:「父目录不存在就拒绝」是新加的,不是需求,而它正好打掉了唯一
+  要紧的调用方 —— 工作流传 `"${RUNNER_TEMP}/forkfs-ci/m1test"`,`forkfs-ci` 还没人建过,
+  于是两次 CI 都 exit 2。恢复旧契约:**只 `mkdir -p` 父目录**,最后一段仍归
+  `cleanup_scratch` 删、归下面的 `mkdir` 建;m1test 守卫改成在**创建或删除任何东西之前**先按
+  basename 问一次,规范化之后再问一次。
+- **默认值(Codex P1)**:`$(mktemp -d)/m1test` 里 mktemp 失败时替换为空,`$SCRATCH` 成了
+  `/m1test` —— 守卫放行,`cleanup_scratch` 会去递归删根目录下的 `/m1test`。现在单独接住
+  mktemp 的结果、查退出码并确认是个真目录,否则直接退出;顺带把「父目录是 `/`」整类拒掉
+  (没人需要它)。
+- **基准(Codex P2)**:`WANT_EVENTS` 现在对「环境造成的全树遍历」返回 0,而三处标着
+  FSEvents 的计时仍然照记 —— 那会把双树遍历的数字印成重放的数字。三处都只在真走了事件路时
+  取样,一次都没取到就印「no sample」,不印全树遍历的数。
+- **计数(Codex P2)**:`rm_entry` 的 ENOTEMPTY 补救走 `rm_rec(path, c->deadline)`,漏了计数器,
+  于是这条路上删掉的后代不进 `gc.log`。补上;目录自身在下面单独 bump,`rm_rec` 只数它下面的
+  东西,不会重复。这条路**没能确定性地跑红**:它只在 `readdir(3)` 漏报了一个在 `opendir(3)`
+  之后才被删掉的条目时才走(APFS 上实测 4 × 10 401 条一次没漏),没有测试缝,人为制造要靠
+  「遍历途中往目录里加条目」这种本身就不确定的竞争 —— 所以是按代码论证改的,不是按红改的。
+
+**验收**(rebase 到 PR #8 之后):`ctest` 2/2;`check-deps.sh` 绿;`safety.sh` **301 passed,
+0 failed**,七种拼法(工作流那种父目录不存在的、README 的 `${TMPDIR}m1test`、双斜杠、尾斜杠、
+`/tmp` 符号链接前缀、不给参数、以及 `TMPDIR` 无效)都是 301/0;`mktemp` 失败与显式 `/m1test`
+都在删任何东西之前退出;`test_disk_full_wrapper.py` 与 `disk_full.py` 全绿。
