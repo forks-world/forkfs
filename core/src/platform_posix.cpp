@@ -810,7 +810,9 @@ int rm_rec(const char *path, int64_t deadline, uint64_t *entries = nullptr) {
         child.append("/");
         child.append(e->d_name);
         if ((rc = rm_rec(child.c_str(), deadline, entries))) break;
-        if (entries) (*entries)++;   // that child is gone, whatever it was
+        // Atomic, like every other increment of this counter: the parallel deleter's ENOTEMPTY
+        // recovery runs this on one walker thread while the others bump() the same counter.
+        if (entries) bump(*entries);   // that child is gone, whatever it was
     }
     ::closedir(d);
     if (rc) return rc;
