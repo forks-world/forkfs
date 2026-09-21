@@ -975,7 +975,7 @@ chmod 0000 "$P17STORE/snapshots"
 p17out=$("$WORLD" --store "$P17STORE" fs status 2>&1); p17rc=$?
 chmod 0755 "$P17STORE/snapshots"
 if [ "$p17rc" = 1 ] \
-   && echo "$p17out" | grep -q "was lost" \
+   && echo "$p17out" | grep -q "this command removed no snapshot" \
    && echo "$p17out" | grep -q "never taken for an empty one" \
    && echo "$p17out" | grep -q "carries on from there" \
    && ! echo "$p17out" | grep -q "nothing was created" \

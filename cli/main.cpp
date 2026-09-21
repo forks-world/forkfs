@@ -122,7 +122,7 @@ static int fail(const char *what, int rc) {
 //     repair, and moving or rebuilding the store is never it.
 static void open_guarantee(void) {
     fprintf(stderr,
-            "  no snapshot, no World and no record in the store's database was lost, and a "
+            "  this command removed no snapshot, no World and no record in the store's database, and a "
             "store this command could not read was never taken for an empty one: no id was "
             "handed out and no database was created over trees it could not see (P17).\n"
             "  whatever this command had already done -- the directories and empty files of a "

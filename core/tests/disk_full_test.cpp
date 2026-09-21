@@ -254,7 +254,7 @@ static void check_cli_message(const char *world_bin, const char *store) {
     // path that can end here is that nothing was LOST and that the command can simply be run
     // again.
     CHECK(strstr(out, "nothing that was already here was changed or removed") == NULL);
-    CHECK(strstr(out, "no record in the store's database was lost") != NULL);
+    CHECK(strstr(out, "this command removed no snapshot, no World and no record") != NULL);
     CHECK(strstr(out, "carries on from there") != NULL);
 }
 
