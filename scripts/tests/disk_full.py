@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import re
 from pathlib import Path
 
 
@@ -19,6 +20,7 @@ MIN_HOST_FREE = 2 * 1024 * 1024 * 1024
 MIN_IMAGE_BYTES = 300 * 1024 * 1024
 MAX_IMAGE_BYTES = 1024 * 1024 * 1024
 TEST_TIMEOUT = 600
+MAX_DETACH_ATTEMPTS = 8
 
 
 def fail(message: str) -> "NoReturn":
@@ -88,6 +90,74 @@ def main() -> int:
         except OSError:
             return None
 
+    def attached_devices():
+        """Return this image's devices, [] when absent, or None when unknown.
+
+        hdiutil's plist is deliberately treated as an allow-list: a malformed plist, a
+        matching image without usable device entries, or an unexpected schema is not evidence
+        that the image is detached.
+        """
+        try:
+            info_result = run(
+                ["hdiutil", "info", "-plist"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if info_result.returncode:
+            return None
+        try:
+            info = plistlib.loads(info_result.stdout)
+            images = info["images"]
+            if not isinstance(images, list):
+                return None
+        except (KeyError, TypeError, ValueError, plistlib.InvalidFileException):
+            return None
+        image_path = str(image.resolve())
+        if any(not isinstance(item, dict) or not isinstance(item.get("image-path"), str) for item in images):
+            return None
+        for item in images:
+            if not isinstance(item.get("system-entities"), list):
+                return None
+            if any("whole-disk" in entity and not isinstance(entity["whole-disk"], bool)
+                   for entity in item["system-entities"] if isinstance(entity, dict)):
+                return None
+        try:
+            matches = [item for item in images if str(Path(item["image-path"]).resolve()) == image_path]
+        except (OSError, ValueError):
+            return None
+        if not matches:
+            return []
+        devices = []
+        for item in matches:
+            entities = item.get("system-entities")
+            if not isinstance(entities, list):
+                return None
+            for entity in entities:
+                if not isinstance(entity, dict) or not isinstance(entity.get("dev-entry"), str):
+                    return None
+                device = entity["dev-entry"]
+                if not re.fullmatch(r"/dev/disk[0-9]+(?:s[0-9]+)*", device):
+                    return None
+                if device not in devices:
+                    devices.append(device)
+        if not devices:
+            return None
+        # Detaching the whole disk also removes any child partitions. Prefer an explicit
+        # whole-disk entity; otherwise use only devices explicitly reported by hdiutil.
+        whole = []
+        for item in matches:
+            for entity in item.get("system-entities", []):
+                if not isinstance(entity, dict):
+                    continue
+                device = entity.get("dev-entry")
+                if entity.get("whole-disk") is True and device not in whole:
+                    whole.append(device)
+        if whole:
+            return whole
+        return devices
+
     result_code = 0
     try:
         # Keep every post-mkdtemp operation inside the guarded cleanup path.  A failed mkdir must
@@ -122,6 +192,7 @@ def main() -> int:
                 [
                     "hdiutil",
                     "attach",
+                    "-plist",
                     "-nobrowse",
                     "-owners",
                     "on",
@@ -171,43 +242,59 @@ def main() -> int:
         result_code = 1
     finally:
         mounted = mount_state() if attach_attempted else False
+        cleanup_known = (not attach_attempted) and mounted is False
+        devices = attached_devices() if attach_attempted else []
         if mounted is None:
             print(
                 f"disk-full wrapper: cannot determine mount state; preserving private image at {private}",
                 file=sys.stderr,
             )
             result_code = 1
-        elif mounted:
-            try:
-                detached_result = run(
-                    ["hdiutil", "detach", str(mount)],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                print(
-                    f"disk-full wrapper: detach failed; preserving private image at {private}: {exc}",
-                    file=sys.stderr,
-                )
+        elif attach_attempted:
+            attempts = 0
+            while devices and attempts < MAX_DETACH_ATTEMPTS:
+                attempts += 1
+                try:
+                    detached_result = run(
+                        ["hdiutil", "detach", devices[0]],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    print(f"disk-full wrapper: detach failed; preserving private image at {private}: {exc}", file=sys.stderr)
+                    result_code = 1
+                    devices = None
+                    break
+                print(detached_result.stdout, end="")
+                if detached_result.returncode:
+                    print(f"disk-full wrapper: detach failed; preserving private image at {private}", file=sys.stderr)
+                    result_code = 1
+                    devices = None
+                    break
+                # Re-probe before detaching another device; this bounds cleanup and avoids
+                # acting on stale device names after a partial detach.
+                devices = attached_devices()
+            if devices is None or devices:
+                if devices:
+                    print(f"disk-full wrapper: too many attached devices; preserving private image at {private}", file=sys.stderr)
                 result_code = 1
             else:
-                print(detached_result.stdout, end="")
-                detached = detached_result.returncode == 0 and mount_state() is False
-                if not detached:
-                    # Never recursively remove a path that may still be a mounted volume.  Keep
-                    # the private directory so a CI failure can be inspected and report its path.
-                    print(
-                        f"disk-full wrapper: detach failed; preserving private image at {private}",
-                        file=sys.stderr,
-                    )
+                final_mount = mount_state()
+                cleanup_known = final_mount is False
+                if final_mount is None:
                     result_code = 1
-        if (not attach_attempted) or detached or mount_state() is False:
+                elif final_mount:
+                    result_code = 1
+        if cleanup_known:
             try:
                 shutil.rmtree(private)
             except OSError as exc:
                 print(f"disk-full wrapper: cleanup failed for {private}: {exc}", file=sys.stderr)
                 result_code = 1
+        else:
+            print(f"disk-full wrapper: attachment or mount not confirmed clear; preserving private image at {private}", file=sys.stderr)
+            result_code = 1
     return result_code
 
 
