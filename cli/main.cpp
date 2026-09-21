@@ -1986,26 +1986,37 @@ int main(int argc, char **argv) {
         // every store this branch can be reached for.
         if (rc == -ENOSPC)
             fprintf(stderr,
-                    "  the volume that holds the store is full, so the store's database could "
-                    "not be opened or created: on a full volume even reading one fails, because "
-                    "a WAL database needs its -wal/-shm sidecar written first.\n");
+                    "  the volume that holds the store is full, so this command could not write "
+                    "what it needed to. Even opening the store's database needs a write: a WAL "
+                    "database cannot be read until its -wal/-shm sidecar has been made.\n");
         else
             fprintf(stderr,
                     "  a disk quota for this user or group on the volume that holds the store "
-                    "is exhausted, so the store's database could not be opened or created. The "
+                    "is exhausted, so this command could not write what it needed to. The "
                     "volume itself may have plenty of room; the quota is what ran out.\n");
         // What is guaranteed. NOT "nothing was created": by the time this open failed it may
         // itself have made the store directory, VERSION, the subdirectories, upgrade.lock or a
-        // zero-length metadata3.db (PR #8 review, round 2). What holds in every case is that
-        // nothing that was already here was touched -- and that a half-made new store is not a
-        // mess to clean up, it is a setup to finish.
+        // zero-length metadata3.db (PR #8 review, round 2). NOT "nothing that was already here
+        // was changed" either (round 3): opening a SCHEMA-2 store rewrites its VERSION, switches
+        // its journal mode and exchanges its database into the schema-3 name before it can run
+        // out of room, and the trashing_recover() that ends every open resolves the rows a
+        // killed `discard` left behind one transaction per row, so some of them can be written
+        // when a later one fails. (The migration itself is not a third case: it is one
+        // transaction, and its only way to end here is a COMMIT that failed and rolled back.)
+        //
+        // What holds on EVERY path that can reach this line is that nothing was LOST, and that
+        // every half-finished state this open can leave is one the next open resumes from --
+        // store_layout()'s table is what makes that true, and core_test drives the longest of
+        // them (out of room with the move done and the migration not committed).
         fprintf(stderr,
-                "  nothing that was already here was changed or removed: no snapshot, no World, "
-                "and no metadata3.db that already existed. If this is a new store, the "
-                "directories and empty files made so far are harmless -- the same command "
-                "finishes the setup once there is room. This is not damage: do not move this "
-                "directory aside, do not start a new store, and do not recover anything from a "
-                "backup.\n");
+                "  no snapshot, no World and no record in the store's database was lost: "
+                "nothing here was deleted. Whatever this command had already done when it ran "
+                "out of room -- the directories and empty files of a new store, the first steps "
+                "of bringing an older store up to the current layout, or finishing off a "
+                "discard that an earlier command was killed in the middle of -- is safe to "
+                "leave exactly as it is: the same command carries on from there once there is "
+                "room. This is not damage: do not move this directory aside, do not start a new "
+                "store, and do not recover anything from a backup.\n");
         char hint[WFS_PATH_MAX + 128];
         if (rc == -ENOSPC)
             snprintf(hint, sizeof hint, "free space on the volume that holds %s (`df -h %s`)",
