@@ -2009,8 +2009,8 @@ int main(int argc, char **argv) {
         // store_layout()'s table is what makes that true, and core_test drives the longest of
         // them (out of room with the move done and the migration not committed).
         fprintf(stderr,
-                "  no snapshot, no World and no record in the store's database was lost: "
-                "nothing here was deleted. Whatever this command had already done when it ran "
+                "  no snapshot, no World and no record in the store's database was lost. "
+                "Whatever this command had already done when it ran "
                 "out of room -- the directories and empty files of a new store, the first steps "
                 "of bringing an older store up to the current layout, or finishing off a "
                 "discard that an earlier command was killed in the middle of -- is safe to "
