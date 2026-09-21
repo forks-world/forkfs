@@ -15,23 +15,56 @@ BUILD=$(cd "$BUILD" && pwd)
 WORLD="$BUILD/cli/world"
 [ -x "$WORLD" ] || { echo "no world CLI at $WORLD; build first"; exit 2; }
 
-SCRATCH=${2:-${WORLD_TEST_DIR:-$(mktemp -d)/m1test}}
+SCRATCH=${2:-${WORLD_TEST_DIR:-}}
+if [ -z "$SCRATCH" ]; then
+    # The default, and the one place a failure must not be read as a path. `mktemp -d` can fail
+    # -- an invalid, unwritable or full temporary directory -- and with the result substituted
+    # straight into `$(mktemp -d)/m1test` that failure produced "/m1test": a name the guard
+    # below accepts and cleanup_scratch then removes recursively, at the root of the machine.
+    # So the result is taken on its own and has to be a directory that is really there.
+    SCRATCH_TMP=$(mktemp -d) || SCRATCH_TMP=""
+    if [ -z "$SCRATCH_TMP" ] || [ ! -d "$SCRATCH_TMP" ]; then
+        echo "refusing to run: mktemp -d produced no usable directory (is TMPDIR valid and writable?)"
+        exit 2
+    fi
+    SCRATCH="$SCRATCH_TMP/m1test"
+fi
 
-# Canonicalise it before anything else looks at it, the guard below included. A dozen cases
-# further down compare a path the CLI printed against a string built out of $SCRATCH, and the
-# CLI prints paths it has resolved -- so `a//b`, a trailing slash, a `./` segment, or a prefix
-# that is a symlink (on macOS /tmp is one: it is /private/tmp) makes those cases fail one by
-# one while nothing is actually wrong.
+# The guard, asked of the name as given, before anything at all is created or removed. It needs
+# only the last component, so asking first costs nothing; it is asked again below, of the
+# canonical path, because canonicalisation is what decides what finally gets deleted.
+if [ "$(basename "$SCRATCH")" != m1test ]; then
+    echo "refusing to use $SCRATCH: the scratch directory must be named m1test"
+    exit 2
+fi
+
+# The parent chain, made if it is not there. This script has always created the whole path, and
+# the CI workflow relies on it: it passes "${RUNNER_TEMP}/forkfs-ci/m1test" and nothing has made
+# `forkfs-ci` yet. Only the PARENT is created here -- the last component is cleanup_scratch's to
+# remove and the mkdir below's to make.
+SCRATCH_DIR=$(dirname "$SCRATCH")
+mkdir -p "$SCRATCH_DIR" 2>/dev/null
+# Canonicalise it before anything else looks at it, the guard included. A dozen cases further
+# down compare a path the CLI printed against a string built out of $SCRATCH, and the CLI prints
+# paths it has resolved -- so `a//b`, a trailing slash, a `./` segment, or a prefix that is a
+# symlink (on macOS /tmp is one: it is /private/tmp) makes those cases fail one by one while
+# nothing is actually wrong.
 #
-# The PARENT is resolved and the last component appended by hand, rather than resolving
-# $SCRATCH itself: that last component is the thing this script deletes, and following it would
-# mean deleting whatever a symlink left in its place points at instead.
-SCRATCH_PARENT=$(cd "$(dirname "$SCRATCH")" 2>/dev/null && pwd -P) || SCRATCH_PARENT=""
-[ -n "$SCRATCH_PARENT" ] || { echo "refusing to use $SCRATCH: its parent directory does not exist"; exit 2; }
-# `pwd -P` prints "/" for the root and no trailing slash for anything else, so the one parent
-# that must not be pasted on as-is is the root itself -- "/" + "/" + "m1test" is the very
-# doubled slash this is here to remove.
-[ "$SCRATCH_PARENT" = "/" ] && SCRATCH_PARENT=""
+# The PARENT is resolved and the last component appended by hand, rather than resolving $SCRATCH
+# itself: that last component is the thing this script deletes, and following it would mean
+# deleting whatever a symlink left in its place points at instead.
+SCRATCH_PARENT=$(cd "$SCRATCH_DIR" 2>/dev/null && pwd -P) || SCRATCH_PARENT=""
+if [ -z "$SCRATCH_PARENT" ]; then
+    echo "refusing to use $SCRATCH: its parent directory does not exist and could not be created"
+    exit 2
+fi
+# The root is refused outright. `pwd -P` prints "/" for it, so pasting it on would rebuild the
+# doubled slash this is here to remove -- and a scratch directory sitting directly under the
+# root is something nobody needs and this script would delete recursively.
+if [ "$SCRATCH_PARENT" = "/" ]; then
+    echo "refusing to use $SCRATCH: the scratch directory must not sit directly under /"
+    exit 2
+fi
 SCRATCH="$SCRATCH_PARENT/$(basename "$SCRATCH")"
 case "$SCRATCH" in
     */m1test) ;;
