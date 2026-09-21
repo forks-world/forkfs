@@ -36,6 +36,7 @@ extern "C" const char *wfs_test_stmt_fail_sql = nullptr;
 // One BEGIN IMMEDIATE, failed on demand (PR #1 review, 34th round). Same rules: 0 in every run
 // that is not a test, and nothing in the library ever assigns it. Read by wfs::Txn in db.h.
 extern "C" int wfs_test_txn_fail_once = 0;
+extern "C" int wfs_test_db_open_fail_once = 0;
 
 // The gap between the database's move and its migration (PR #1 review, 35th round): the stub is
 // in place, the holder gate has passed, nothing has been migrated yet. NULL in every run that is
@@ -1427,6 +1428,12 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
     // same danger as one that is missing, and by here we know the store is not empty.
     int rc = sqlite3_open_v2(dbp.c_str(), &s->db,
                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nullptr);
+    if (rc == SQLITE_OK && wfs_test_db_open_fail_once) {
+        // The test seam (worldfs.h). 0 in every run that is not a test, so this is one
+        // predictable branch on an int that is never written.
+        rc = wfs_test_db_open_fail_once;
+        wfs_test_db_open_fail_once = 0;
+    }
     if (rc != SQLITE_OK) { wfs_store_close(s); return WFS_E_STORE_DAMAGED; }
     sqlite3_busy_timeout(s->db, 10000);
     // PR #1 review (24th round, P1): the database's own stamp is read before ANYTHING is written

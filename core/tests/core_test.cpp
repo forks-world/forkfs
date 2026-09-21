@@ -3008,6 +3008,127 @@ int main(int argc, char **argv) {
         CHECK(chmod(snap, 0700) == 0); // so the test's own rm_rf can clear it
     }
 
+    // ---- P17: a database we could not open is not a database that is damaged ----------------
+    //
+    // Measured on 2026-09-21 (macOS 27 arm64, APFS): with the volume that holds the store full,
+    // EVERY `world fs` command -- read-only `status` and `list` included, and `gc` and `discard`
+    // with them -- exited 3 with "its metadata3.db is missing or unreadable ... restore
+    // metadata3.db from a backup, or move the directory aside". The 40 960-byte metadata3.db was
+    // perfectly intact. The store is in WAL mode, so SQLite has to make a `-shm` even to READ
+    // it, and on a full volume it cannot (SQLITE_IOERR_SHMOPEN). Following the printed advice
+    // would have orphaned every snapshot and every world in that store for a condition that
+    // freeing 8 MiB undid, with no data lost.
+    //
+    // This is the 32nd round's rule one step along -- "a query that failed is not a query that
+    // found nothing" -- applied to the open itself. WFS_E_STORE_DAMAGED is for a database that
+    // is positively not one: gone, not a regular file, or a file SQLite reads and rejects.
+    // Everything else comes back as the errno of whatever stopped us, and the caller is told the
+    // truth: nothing here is damaged, and nothing was written.
+    {
+        char nstore[4096], nsrc[4096], nfile[4096], ndb[4096], nkept[4096];
+        join(nstore, sizeof nstore, root, "nospc-store");
+        join(nsrc, sizeof nsrc, root, "nospc-src");
+        CHECK(mkdir(nsrc, 0755) == 0);
+        join(nfile, sizeof nfile, nsrc, "a.txt");
+        write_file(nfile, "one file is enough\n");
+        wfs_store *n = NULL;
+        CHECK_OK(wfs_store_open(nstore, &n));
+        wfs_id nsid = 0;
+        wfs_snapshot_opts nopts;
+        memset(&nopts, 0, sizeof nopts);
+        nopts.name = "nospc";
+        CHECK_OK(wfs_snapshot_create(n, nsrc, &nopts, &nsid));
+        wfs_store_close(n);
+        join(ndb, sizeof ndb, nstore, "metadata3.db");
+        join(nkept, sizeof nkept, root, "nospc-kept.db");
+        struct stat nst0;
+        CHECK(stat(ndb, &nst0) == 0 && S_ISREG(nst0.st_mode) && nst0.st_size > 0);
+
+        // The store has trees in it and a database that is beyond reproach. An open that fails
+        // for a reason that is not the database says so, with the errno that stopped it.
+        n = NULL;
+        wfs_test_db_open_fail_once = SQLITE_FULL;
+        CHECK_RC(wfs_store_open(nstore, &n), -ENOSPC);
+        CHECK(n == NULL);
+        CHECK(wfs_test_db_open_fail_once == 0);         // the seam fired
+        n = NULL;
+        wfs_test_db_open_fail_once = SQLITE_IOERR;
+        CHECK_RC(wfs_store_open(nstore, &n), -EIO);
+        CHECK(n == NULL);
+        n = NULL;
+        wfs_test_db_open_fail_once = SQLITE_BUSY;
+        CHECK_RC(wfs_store_open(nstore, &n), -EBUSY);
+        CHECK(n == NULL);
+        // None of those wrote a byte of it, and the next open is an ordinary one.
+        struct stat nst1;
+        CHECK(stat(ndb, &nst1) == 0 && nst1.st_size == nst0.st_size);
+        n = NULL;
+        CHECK_OK(wfs_store_open(nstore, &n));
+        wfs_snapshot_rec nrecs[4];
+        size_t nrn = 0;
+        CHECK_OK(wfs_snapshot_list(n, nrecs, 4, &nrn));
+        CHECK(nrn == 1 && nrecs[0].id == nsid);
+        wfs_store_close(n);
+
+        // ... and the narrowing is only that. Every shape P17 was written for is still damage,
+        // and every one of them is a database that is positively not one.
+        char nstub[4096];
+        join(nstub, sizeof nstub, nstore, "metadata.db");
+        CHECK(rename(ndb, nkept) == 0);                 // gone altogether
+        n = NULL;
+        CHECK_RC(wfs_store_open(nstore, &n), WFS_E_STORE_DAMAGED);
+        CHECK(n == NULL);
+        CHECK(!exists(ndb));
+        CHECK(mkdir(ndb, 0700) == 0);                   // not a regular file
+        n = NULL;
+        CHECK_RC(wfs_store_open(nstore, &n), WFS_E_STORE_DAMAGED);
+        CHECK(n == NULL);
+        CHECK(rmdir(ndb) == 0);
+        write_file(ndb, "this is not a database\n");    // a header that is not SQLite's
+        n = NULL;
+        CHECK_RC(wfs_store_open(nstore, &n), WFS_E_STORE_DAMAGED);
+        CHECK(n == NULL);
+        {
+            // ... truncated below the 100-byte file header SQLite writes: too little of a
+            // database to be one, whatever the first 16 bytes say.
+            int tfd = open(ndb, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            CHECK(tfd >= 0);
+            CHECK(write(tfd, "SQLite format 3", 16) == 16);
+            CHECK(close(tfd) == 0);
+        }
+        n = NULL;
+        CHECK_RC(wfs_store_open(nstore, &n), WFS_E_STORE_DAMAGED);
+        CHECK(n == NULL);
+        {
+            // ... and the one SQLite itself rejects: the magic is right and nothing after it
+            // is, which comes back from the first read as SQLITE_NOTADB.
+            char junk[4096];
+            memset(junk, 0xab, sizeof junk);
+            memcpy(junk, "SQLite format 3", 16);
+            int tfd = open(ndb, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            CHECK(tfd >= 0);
+            CHECK(write(tfd, junk, sizeof junk) == (ssize_t)sizeof junk);
+            CHECK(close(tfd) == 0);
+        }
+        n = NULL;
+        CHECK_RC(wfs_store_open(nstore, &n), WFS_E_STORE_DAMAGED);
+        CHECK(n == NULL);
+        // The store is whole again once its own database is back where it belongs.
+        CHECK(unlink(ndb) == 0);
+        CHECK(rename(nkept, ndb) == 0);
+        CHECK(exists(nstub));
+        n = NULL;
+        CHECK_OK(wfs_store_open(nstore, &n));
+        nrn = 0;
+        CHECK_OK(wfs_snapshot_list(n, nrecs, 4, &nrn));
+        CHECK(nrn == 1 && nrecs[0].id == nsid);
+        wfs_store_close(n);
+
+        char nsnap[4096];
+        snprintf(nsnap, sizeof nsnap, "%s/snapshots/S%llu", nstore, (unsigned long long)nsid);
+        CHECK(chmod(nsnap, 0700) == 0); // so the test's own rm_rf can clear it
+    }
+
     // ---- PR #1 review (3rd round): a pthread_create that fails for one slot and not the next --
     //
     // Both parallel loops in the core wrote the handle to th[i] while `started` merely counted,

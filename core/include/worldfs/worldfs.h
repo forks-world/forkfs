@@ -1140,6 +1140,17 @@ extern const char *wfs_test_stmt_fail_sql;
  * not a test; nothing in the library ever assigns it a value. */
 extern int wfs_test_txn_fail_once;
 
+/* One store open, failed on demand. A database we could not open is not a database that is
+ * damaged: wfs_store_open() has to tell "this file is positively not a SQLite database" (P17,
+ * WFS_E_STORE_DAMAGED, whose advice is to move the store aside) from "the database is fine and
+ * this process could not get at it" (the errno -- -ENOSPC on a volume that has filled up), and
+ * the second half of that cannot be produced from outside without filling a real volume. Set
+ * this to the SQLite result code the next sqlite3_open_v2() of the store's database is to be
+ * treated as having returned: SQLITE_FULL, SQLITE_IOERR, SQLITE_BUSY. That open reports the
+ * code -- through exactly the verdict the real failure goes through -- and clears this back
+ * to 0. 0 in every run that is not a test; nothing in the library ever assigns it a value. */
+extern int wfs_test_db_open_fail_once;
+
 /* And the one xattr rule a test cannot drive from outside (PR #1 review, 9th round). The default
  * diff leaves com.apple.provenance out of the comparison, and provenance is precisely the name a
  * test cannot make differ: the kernel stamps it on every file this process creates, with the

@@ -227,9 +227,15 @@ def main() -> int:
                     fail(f"test image capacity is unreasonable: {capacity} bytes")
                 print(f"private APFS image: capacity={capacity} st_dev={mount_dev}", flush=True)
 
+                # The `world` CLI from the same build: the test's last phase checks the
+                # message a full volume makes it print, not only what the library returns.
+                world = binary.parent.parent / "cli" / "world"
+                if not world.is_file() or not os.access(world, os.X_OK):
+                    fail(f"no `world` binary beside the test at {world}")
+
                 try:
                     test_result = subprocess.run(
-                        [str(binary), str(mount)],
+                        [str(binary), str(mount), str(world)],
                         check=False,
                         timeout=TEST_TIMEOUT,
                     )
