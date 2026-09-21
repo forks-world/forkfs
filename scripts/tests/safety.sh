@@ -53,6 +53,36 @@ clone_tree() {
 sys.exit(0 if ctypes.CDLL("/usr/lib/libSystem.B.dylib").clonefile(sys.argv[1].encode(), sys.argv[2].encode(), 0) == 0 else 1)' "$1" "$2"
 }
 
+# Wait for the background collector to finish something big, and fail only if its chain stops.
+#
+# Not a fixed number of seconds: one wake works for WORLD_GC_BATCH_SECS and its successor then
+# sleeps WORLD_GC_PAUSE_MS before starting, so the wall clock is about twice the unlinking --
+# and the unlinking itself is several times slower on a busy machine (measured here: a
+# one-second wake clears ~42k entries on an idle machine and ~10k under heavy concurrent load).
+# A fixed bound is therefore an assertion about the machine, which is how the 60 s bound on the
+# 120k-entry pool clone below failed once under load while the chain was working perfectly.
+# What is waited for is PROGRESS: every wake appends a line to <store>/logs/gc.log, so while
+# that file keeps growing the chain is alive and the wait goes on. It gives up only once
+# nothing has been written for `stall` seconds -- many times the gap between two wakes -- which
+# is the failure worth reporting: a chain that stopped with work still to do.
+wait_collected() {   # wait_collected <store> <dir-that-must-become-empty> [stall-seconds]
+    local store=$1 target=$2 stall=${3:-30}
+    local log="$store/logs/gc.log" last=x quiet=0 now
+    while [ -n "$(ls "$target" 2>/dev/null)" ]; do
+        now=$(wc -c < "$log" 2>/dev/null || echo 0)
+        if [ "$now" != "$last" ]; then last=$now; quiet=0; else quiet=$((quiet + 1)); fi
+        [ "$quiet" -ge "$((stall * 4))" ] && return 1
+        sleep 0.25
+    done
+    return 0
+}
+
+# What one wake of the collector reported it unlinked. The worker's own log line is the only
+# account of a bounded wake that nothing else can have changed in the meantime: it is written
+# before the successor is started, and a detached successor's output goes to <store>/logs/gc.log,
+# never to the file the wake in the foreground was redirected into.
+freed_entries() { sed -n 's/.* \([0-9][0-9]*\) entries unlinked in .*/\1/p' "$1" | tail -1; }
+
 # The refusal has to say what to do instead, not just complain.
 has_hint() {
     local rule=$1 desc=$2 needle=$3; shift 4
@@ -1128,13 +1158,25 @@ if [ "$((t1 - t0))" -lt 4000 ]; then ok PR1 "a one-second gc wake returns on tim
 else bad PR1 "a one-second gc wake returns on time mid-tree ($((t1-t0)) ms)"; sed 's/^/        /' "$SCRATCH/gcbig.log"; fi
 grep -q "work remains, handing over" "$SCRATCH/gcbig.log" && ok PR1 "it reports the work it did not get to" \
                                                           || { bad PR1 "it reports the work it did not get to"; sed 's/^/        /' "$SCRATCH/gcbig.log"; }
-LEFT=$(find "$RSTORE/trash" 2>/dev/null | wc -l | tr -d ' ')
-if [ -d "$BIG.deleting" ] && [ "$LEFT" -gt 1 ] && [ "$LEFT" -lt 120401 ]; then
-    ok PR1 "the half-deleted tree keeps its .deleting name ($LEFT entries left)"
+# What is left of the tree cannot be counted from here. This wake set `work_remains` and
+# started its successor before it returned, and with WORLD_GC_PAUSE_MS=0 that successor is
+# already unlinking by the time the shell has its prompt back: a `find` and a `-d` test are two
+# observations of a tree a different process is deleting between them (measured on this machine:
+# ~17k entries went between the wake returning and the `find` finishing, and the python3 start
+# on the line above is most of that window). The witness that races nobody is what the wake
+# itself reported -- it unlinked part of the tree and not the whole of it, which is the batch
+# limit biting inside one tree, which is what this case is for. That what it left behind is
+# resumable is what the chain finishing below proves end to end, and that a tree stopped
+# mid-deletion keeps its `.deleting` working name is asserted where nothing hands over: on
+# `gc --now`, in the undeletable-entry case further down.
+FREED=$(freed_entries "$SCRATCH/gcbig.log")
+if [ -n "$FREED" ] && [ "$FREED" -gt 0 ] && [ "$FREED" -lt 120400 ]; then
+    ok PR1 "the wake stopped mid-tree ($FREED of 120400 entries unlinked)"
 else
-    bad PR1 "the half-deleted tree keeps its .deleting name ($LEFT entries left)"
+    bad PR1 "the wake stopped mid-tree (${FREED:-no} entries unlinked, wanted 1..120399)"
+    sed 's/^/        /' "$SCRATCH/gcbig.log"
 fi
-for _ in $(seq 120); do [ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && break; sleep 0.25; done
+wait_collected "$RSTORE" "$RSTORE/trash"
 [ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && ok PR1 "the successor chain finishes the tree" \
                                             || { bad PR1 "the successor chain finishes the tree"; ls "$RSTORE/trash" | sed 's/^/        /'; }
 
@@ -1199,13 +1241,19 @@ if [ "$((t1 - t0))" -lt 2500 ]; then ok PR1 "a one-second wake that falls back s
 else bad PR1 "a one-second wake that falls back still returns on time ($((t1-t0)) ms)"; sed 's/^/        /' "$SCRATCH/gcfb.log"; fi
 grep -q "work remains, handing over" "$SCRATCH/gcfb.log" && ok PR1 "it hands the rest of the tree over" \
                                                          || { bad PR1 "it hands the rest of the tree over"; sed 's/^/        /' "$SCRATCH/gcfb.log"; }
-LEFT2=$(find "$RSTORE/trash" 2>/dev/null | wc -l | tr -d ' ')
-if [ -d "$BIG2.deleting/blocked" ] && [ "$LEFT2" -gt 1 ] && [ "$LEFT2" -lt 120403 ]; then
-    ok PR1 "the fallback stopped mid-tree and kept the .deleting name ($LEFT2 entries left)"
+# The same reason as the case above: the successor this wake started is already deleting the
+# rest of the tree, so `find` and `-d` would be reporting on a tree three processes are taking
+# apart (this is the assertion that failed three times on CI, with 3 entries left -- the chain
+# had all but finished between the two observations). The wake's own report cannot be raced:
+# the fallback unlinked part of the tree, and the deadline stopped it before the end.
+FREED2=$(freed_entries "$SCRATCH/gcfb.log")
+if [ -n "$FREED2" ] && [ "$FREED2" -gt 0 ] && [ "$FREED2" -lt 120401 ]; then
+    ok PR1 "the fallback stopped mid-tree ($FREED2 of 120401 entries unlinked)"
 else
-    bad PR1 "the fallback stopped mid-tree and kept the .deleting name ($LEFT2 entries left)"
+    bad PR1 "the fallback stopped mid-tree (${FREED2:-no} entries unlinked, wanted 1..120400)"
+    sed 's/^/        /' "$SCRATCH/gcfb.log"
 fi
-for _ in $(seq 160); do [ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && break; sleep 0.25; done
+wait_collected "$RSTORE" "$RSTORE/trash"
 [ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && ok PR1 "the successor chain finishes it once the obstacle is gone" \
                                             || { bad PR1 "the successor chain finishes it once the obstacle is gone"; ls "$RSTORE/trash" | sed 's/^/        /'; }
 
@@ -1247,7 +1295,7 @@ echo "$out" | grep -q "being collected in the background" && ok PR6 "and it hand
                                                            || { bad PR6 "and it hands the rest over"; echo "$out" | sed 's/^/        /'; }
 rv fs gc --status | grep -q "stale pre-clone" && ok PR6 "gc --status counts the stale entry" \
                                                || { bad PR6 "gc --status counts the stale entry"; rv fs gc --status | sed 's/^/        /'; }
-for _ in $(seq 240); do [ -z "$(ls "$PDIR" 2>/dev/null)" ] && break; sleep 0.25; done
+wait_collected "$RSTORE" "$PDIR"
 [ -z "$(ls "$PDIR" 2>/dev/null)" ] && ok PR6 "the successor chain finishes the pool entry" \
                                     || { bad PR6 "the successor chain finishes the pool entry"; ls -d "$PDIR"/* | sed 's/^/        /'; }
 
