@@ -234,14 +234,53 @@ static const char *fallback_name(int f) {
     }
 }
 
+// A fallback nothing in this process decided: the machine the test runs on did. fseventsd has
+// to have caught up before it can answer a historical replay for a world forked milliseconds
+// ago -- measured here on an idle 27.0 machine: HistoryDone arrives 330-370 ms later, against
+// the 5 s the replay waits -- the volume's journal has to still reach back past the fork, and
+// the kernel must not have dropped anything on the way. Under P10 every one of these means the
+// diff does the two-tree walk and returns the same answer, which is the behaviour, not a bug.
+static int environment_forced(int f) {
+    return f == WFS_DF_MUST_SCAN || f == WFS_DF_DROPPED || f == WFS_DF_WRAPPED ||
+           f == WFS_DF_STALE || f == WFS_DF_TIMEOUT || f == WFS_DF_UNSUPPORTED;
+}
+
+static int events_path_taken = 0, events_path_asked = 0;
+
 // Every "this diff had to take the FSEvents path" assertion goes through here.
+//
 // `CHECK(st.full_scan == 0 && st.fallback == WFS_DF_NONE)` printed the expression and nothing
 // else: on a CI machine, where this is the only thing anybody can read afterwards, that does
 // not say which of the two terms failed, nor which fallback reason the diff chose, nor how
 // long the replay waited before giving up. `what` names the case, because a run has a dozen
 // of these.
-static void want_events_path(const char *what, const wfs_diff_stats *st, const char *file, int line) {
-    if (st->full_scan == 0 && st->fallback == WFS_DF_NONE) return;
+//
+// And the assertion itself was an assertion about the machine. One macOS 15 runner fell back
+// here once, on the untouched-world case below, with a world forked milliseconds earlier;
+// requiring "no fallback" is requiring that the runner's fseventsd answered in time, which is
+// not a property of this code and not one P10 promises. So a fallback the ENVIRONMENT forced
+// is accepted and printed; a fallback the diff CHOSE -- REQUESTED, SMALL_TREE, FROM_WORLD,
+// NO_CURSOR -- is still a failure, because each of those means it took the wrong path for the
+// flags it was given and no machine can excuse it.
+//
+// What is never conditional is the answer. Every caller checks the exact set of changes right
+// afterwards, through check_lines() or check_exact(), with no `if` in front of it: the two
+// paths must agree, whichever one ran. The return value is 1 when the events path really was
+// taken, so a caller can keep the few assertions that only mean something there (candidate
+// counts) behind it.
+static int want_events_path(const char *what, const wfs_diff_stats *st, const char *file, int line) {
+    events_path_asked++;
+    if (st->full_scan == 0 && st->fallback == WFS_DF_NONE) {
+        events_path_taken++;
+        return 1;
+    }
+    if (st->full_scan == 1 && environment_forced(st->fallback)) {
+        printf("  note: %s took the full scan instead: %s. That is this machine's FSEvents, not\n"
+               "        the diff (P10); the answer is checked exactly either way.\n",
+               what, fallback_name(st->fallback));
+        fflush(stdout);
+        return 0;
+    }
     fprintf(stderr,
             "%s:%d: %s: wanted the FSEvents path, got full_scan=%d fallback=%s(%d), "
             "%llu candidates, %llu compared, %llu content compares, %.1f ms\n",
@@ -1359,9 +1398,11 @@ int main() {
     // full scan is the default path now; here it would just make the exact-set assertion flaky.
     settle();
     run_diff(s, wid, 0, &c, &st);
-    WANT_EVENTS("10k / FSEvents", &st);
-    CHECK(st.candidates >= N_MOD + N_ADD + N_DEL + N_META);
-    CHECK(st.content_cmp >= N_FILES); // d004 had to be read on both sides
+    if (WANT_EVENTS("10k / FSEvents", &st)) {
+        // Only the events path has candidates; a full scan compares everything and counts none.
+        CHECK(st.candidates >= N_MOD + N_ADD + N_DEL + N_META);
+        CHECK(st.content_cmp >= N_FILES); // d004 had to be read on both sides
+    }
     check_exact("10k / FSEvents", &c, &st);
 
     // (b) the full scan
@@ -1487,6 +1528,17 @@ int main() {
 
     CHECK(exists(root));
     rm_rf(root);
+    // Which path this run actually exercised. A machine whose fseventsd never answers in time
+    // makes every case above take the full scan, and every case above still checks its answer
+    // exactly -- so the run is not wrong, but the events path went untested and the log has to
+    // say so. It is not made a failure: that would be the same assertion about the runner that
+    // this test just stopped making.
+    if (events_path_taken == events_path_asked)
+        printf("diff_test: the FSEvents path ran in all %d cases that asked for it\n", events_path_asked);
+    else
+        printf("diff_test: NOTE the FSEvents path ran in only %d of the %d cases that asked for\n"
+               "           it; the rest fell back to the full scan (reasons above)\n",
+               events_path_taken, events_path_asked);
     printf("diff_test: all OK\n");
     return 0;
 }
