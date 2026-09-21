@@ -1982,11 +1982,12 @@ int main(int argc, char **argv) {
     if (rc == -ENOSPC) {
         fprintf(stderr, "world: open store %s: %s\n", sd, wfs_strerror(rc));
         fprintf(stderr,
-                "  the volume that holds the store is full, so its metadata3.db could not be "
-                "opened -- SQLite writes a -wal/-shm sidecar even to read it.\n"
-                "  the database itself is intact and nothing here was created, changed or "
-                "removed. This is not damage: do not move this directory aside, do not start a "
-                "new store, and do not recover anything from a backup.\n"
+                "  the volume that holds the store is full, so the store's database could not "
+                "be opened or created -- SQLite writes a -wal/-shm sidecar even to read one.\n"
+                "  nothing here was created, changed or removed, and a metadata3.db that was "
+                "already there has not been touched. This is not damage: do not move this "
+                "directory aside, do not start a new store, and do not recover anything from a "
+                "backup.\n"
                 "  try: free space on the volume that holds %s (`df -h %s`) and run the same "
                 "command again\n",
                 sd, sd);

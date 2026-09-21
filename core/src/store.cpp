@@ -767,7 +767,18 @@ bool volume_out_of_space(int ext, sqlite3 *h, const char *dir) {
 
 // The verdict itself. `rc` is what SQLite returned, `h` the connection it returned it on (which
 // carries the extended code and the system errno), `dbp` the database file and `dir` the store.
-int open_failure_verdict(const char *dir, const char *dbp, sqlite3 *h, int rc) {
+//
+// `db_existed` is the layout's answer from BEFORE this open touched anything (store_layout), and
+// it is passed in rather than read off the file afterwards, because afterwards is too late: a
+// database we could not CREATE is not a database that is damaged either. The main open carries
+// SQLITE_OPEN_CREATE, so a store that has no database yet fails there on a full volume -- and
+// what is at that name by then is nothing at all, or the zero-length file SQLite's open(O_CREAT)
+// made before it ran out of room. Both are "absent or shorter than a header", which is P17's
+// shape; over an empty store it is a lie, and `world fs init` printed "move the directory aside"
+// for it. P17's own guard has already run by then: store_layout() refuses a store that has TREES
+// and no readable database before the open is even reached, so what is left here is the store
+// that has neither, and the only true thing to say about it is what stopped us.
+int open_failure_verdict(const char *dir, const char *dbp, sqlite3 *h, int rc, bool db_existed) {
     int ext = rc;
     if (h) {
         int e = sqlite3_extended_errcode(h);
@@ -781,7 +792,10 @@ int open_failure_verdict(const char *dir, const char *dbp, sqlite3 *h, int rc) {
     // SQLite read the file and rejected it: that is P17's shape, whatever else is wrong.
     if (prim == SQLITE_NOTADB || prim == SQLITE_CORRUPT) return WFS_E_STORE_DAMAGED;
     int shape = db_header_shape(dbp);
-    if (shape == 0) return WFS_E_STORE_DAMAGED;
+    // "Positively not a database" is a verdict only about a database that WAS there. For one
+    // this open was going to create, absence and a zero-length file are what a create that never
+    // finished leaves, and neither is damage.
+    if (shape == 0 && db_existed) return WFS_E_STORE_DAMAGED;
     // ... and these say what they are. None of them is "the file is not a database".
     if (prim == SQLITE_BUSY || prim == SQLITE_LOCKED || prim == SQLITE_NOMEM ||
         prim == SQLITE_READONLY)
@@ -813,7 +827,9 @@ int db_move_to_schema3(const char *dir) {
     // No SQLITE_OPEN_CREATE: this is called only when `metadata.db` is a regular file, and a
     // database that has gone missing under us is not one to create here.
     if (int orc = sqlite3_open_v2(olddb.c_str(), &h, SQLITE_OPEN_READWRITE, nullptr)) {
-        int v = open_failure_verdict(dir, olddb.c_str(), h, orc);
+        // The upgrade's own sites are unchanged: this is called only for a `metadata.db` the
+        // layout found as a regular file, so gone-under-us is still damage.
+        int v = open_failure_verdict(dir, olddb.c_str(), h, orc, true);
         if (h) sqlite3_close(h);
         return v;
     }
@@ -824,7 +840,7 @@ int db_move_to_schema3(const char *dir) {
         // A file that is not a database comes back here as SQLITE_NOTADB, from the step -- the
         // same verdict the 13th round gave every other shape of that. Anything else that stops
         // the step is not damage and does not get that verdict (open_failure_verdict above).
-        if (!q.ok() || !q.row()) rc = open_failure_verdict(dir, olddb.c_str(), h, q.err());
+        if (!q.ok() || !q.row()) rc = open_failure_verdict(dir, olddb.c_str(), h, q.err(), true);
         else {
             const char *mode = q.col_text(0);
             if (!mode || ::strcasecmp(mode, "delete") != 0) rc = WFS_E_STORE_BUSY;
@@ -903,7 +919,7 @@ int db_move_to_schema3(const char *dir) {
 int db_user_version_at(const char *dir, const char *path, int *out) {
     sqlite3 *h = nullptr;
     if (int orc = sqlite3_open_v2(path, &h, SQLITE_OPEN_READWRITE, nullptr)) {
-        int v = open_failure_verdict(dir, path, h, orc);
+        int v = open_failure_verdict(dir, path, h, orc, true);
         if (h) sqlite3_close(h);
         return v;
     }
@@ -911,7 +927,7 @@ int db_user_version_at(const char *dir, const char *path, int *out) {
     int rc = 0;
     {
         Stmt q(h, "PRAGMA user_version");
-        if (!q.ok() || !q.row()) rc = open_failure_verdict(dir, path, h, q.err());
+        if (!q.ok() || !q.row()) rc = open_failure_verdict(dir, path, h, q.err(), true);
         else *out = (int)q.col_i64(0);
     }
     sqlite3_close(h);
@@ -1545,7 +1561,7 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
         wfs_test_db_open_fail_once = 0;
     }
     if (rc != SQLITE_OK) {
-        int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, rc);
+        int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, rc, lay.db_existed);
         wfs_store_close(s);
         return v;
     }
@@ -1572,7 +1588,7 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
         // damaged either, and on a full volume this is the step that fails first, because WAL
         // needs a `-shm` before it can give anybody page 1 (open_failure_verdict above).
         if (!q.ok() || !q.row()) {
-            int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, q.err());
+            int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, q.err(), lay.db_existed);
             wfs_store_close(s);
             return v;
         }
@@ -1646,7 +1662,7 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
             // came back WFS_E_STORE_BUSY and reverted a store that was already schema 3.
             Stmt q2(s->db, "PRAGMA user_version");
             if (!q2.ok() || !q2.row()) {
-                int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, q2.err());
+                int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, q2.err(), lay.db_existed);
                 wfs_store_close(s);
                 return v;
             }
@@ -1658,7 +1674,7 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
         }
     }
     if (int prc = sqlite3_exec(s->db, kPragmas, nullptr, nullptr, nullptr)) {
-        int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, prc);
+        int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, prc, lay.db_existed);
         wfs_store_close(s);
         return v;
     }
