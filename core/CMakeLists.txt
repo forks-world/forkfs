@@ -47,6 +47,13 @@ target_link_libraries(diff_test PRIVATE worldfs_core)
 add_test(NAME diff_test COMMAND diff_test)
 set_tests_properties(diff_test PROPERTIES TIMEOUT 600)
 
+# The disk-full regression owns a private APFS image through scripts/tests/disk_full.py.  Keep it
+# out of CTest so a developer cannot accidentally fill a real volume with a direct ctest run.
+if(APPLE)
+    add_executable(disk_full_test tests/disk_full_test.cpp)
+    target_link_libraries(disk_full_test PRIVATE worldfs_core)
+endif()
+
 if(WFS_FSKIT)
     add_executable(fskit_test tests/fskit_test.cpp)
     target_include_directories(fskit_test PRIVATE src)
