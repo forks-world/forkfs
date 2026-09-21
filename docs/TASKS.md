@@ -3318,3 +3318,26 @@ open 停在 `snapshots/` 的第一个 `mkdir(2)` 上、根本走不到 SQLite �
 零长度文件(不然整条用例是空跑),然后把邻居一并盖住:再 `SQLITE_FULL` 三次(每次 `-ENOSPC`)、
 空间充足时的 `SQLITE_IOERR`(`-EIO`)、失败消失后 open 成功且 id 从 1 发、**有树**时同一个零长度库
 仍然 `WFS_E_STORE_DAMAGED`、空 store 里 16 字节和 magic 不对的文件仍然 `WFS_E_STORE_DAMAGED`。
+
+**同一类的第四、第五处(PR #8 review 第二轮,`e02b5ee` + `ee1188d`)**:
+
+- **EDQUOT 不是「卷满了」**。per-user / per-group 配额可以在卷半空的时候用光,
+  「在这个卷上腾空间」对它毫无用处。`volume_out_of_space()` 原来把 EDQUOT 和 ENOSPC 并在一起;
+  现在 `sqlite3_system_errno()` 说 EDQUOT 就**单独**回 `-EDQUOT`(而且只有这一条路),
+  `SQLITE_FULL` 和 statfs 那条规矩照旧 `-ENOSPC`,`map_sqlite()` 不动。注释里记下:
+  2026-09-21 实测的 APFS **卷**配额报的是 ENOSPC、从不报 EDQUOT,所以 EDQUOT 下剩的是经典的
+  用户/组配额。`wfs_strerror` 通过 `strerror` 覆盖 `-EDQUOT`。驱动它需要第二条测试缝——
+  已有的那条注入的是 SQLite 结果码,而这是系统 errno——`wfs_test_db_system_errno`,
+  同样的规矩:读一次、清回 0、非测试运行里恒为 0。红:
+  `core_test.cpp:3302: wfs_store_open(qstore, &q) -> -28 … wanted -69`。
+- **文案不许说过头的话**。`-ENOSPC` 那段原来写「nothing here was created, changed or removed」,
+  对一个**新的或做了一半的** store 是假话:open 失败之前它自己可能已经建了 store 目录、`VERSION`、
+  那几个子目录、`upgrade.lock`,或者那个零长度的 `metadata3.db`。改成每种情况下都成立的说法:
+  **本来就在的**东西一样没动(没有快照、没有 World、没有原本就在的 `metadata3.db`),
+  而一个做了一半的新 store 不是要收拾的烂摊子,是**同一条命令有空间之后接着做完**的安装。
+  其余性质全留:为什么失败、腾空间(或腾/抬配额)再跑一遍、绝不提挪开/重建/恢复、退出码 1。
+  红:`disk_full_test.cpp:249: CHECK failed: strstr(out, "nothing here was created, changed or removed") == NULL`。
+  同一趟顺手查出并改掉另外两处同类的话:`WFS_E_STORE_DAMAGED` 的 CLI 文案和它的 `wfs_strerror`
+  串都写着 store「still holds trees」,而 `store_layout()` 有好几条路**没有树也会**判损坏
+  (两个库名处在协议产生不出来的状态);两处都改成对所有这些情况都成立的说法,树那句保留下来
+  当作「为什么 id 会撞车」的理由。
