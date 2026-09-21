@@ -283,7 +283,11 @@ int64_t fs_mono_us(void);
 // what lets the parallel deleter's fallback stay inside the gc worker's batch limit (PR #1
 // review, 4th round): the unprotect walk and the depth-first unlink both read the clock per
 // entry, and a tree the deadline cut short comes back with *partial = 1 and rc 0.
-int fs_remove_tree(const char *root, int64_t deadline_us = 0, int *partial = nullptr);   // unprotects first on Darwin
+// `entries`, when given, is incremented by what was removed below `root` (the root itself is
+// not counted), exactly as for fs_remove_tree_parallel -- which is where it matters: the
+// parallel deleter's fallback is this function, and its work belongs in the same count.
+int fs_remove_tree(const char *root, int64_t deadline_us = 0, int *partial = nullptr,
+                   uint64_t *entries = nullptr);   // unprotects first on Darwin
 // T2.1: the same 4-thread walker, used to unlink. Files are removed in the parallel phase,
 // directories in the serial deepest-first tail. `entries` is incremented by what was actually
 // removed (the root itself is not counted). Any error at all falls back to fs_remove_tree, so a
