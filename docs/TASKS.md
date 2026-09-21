@@ -3433,6 +3433,18 @@ macOS 15 arm64 runner 上三次(纯文档提交)红在同一条断言,另有一�
 一切正常。`wait_collected()` 改等**进展**:每次 wake 都往 `<store>/logs/gc.log` 追一行,只要它
 还在长就继续等,连着 30 s 一个字都没写才判红 —— 那才是值得报的失败:链子停了,活还没干完。
 
+`diff_test` 那条还有一层:**单条 case 上"机器一时不灵"和"重放坏了"长得一样,整趟跑下来就不一样**。
+把重放改成永远回 MUST_SCAN(模拟 since-id 一直不对、问错设备、history 永不完成这类回归),
+六条 case 全部退回全树遍历、答案依旧精确 —— 以前这样也是安静通过。现在收尾处
+**`taken == 0` 且 `asked > 0` 判红**,并逐条列出每个站点给的原因;真的没有可用 FSEvents 的机器
+(卷上没有 journal、fseventsd 没跑)用 `WFS_TEST_ALLOW_NO_EVENTS=1` 显式放行 —— 这是测试程序
+自己的环境变量,产品一个字都不读,CI 工作流里**不设**。
+另外 `WFS_DF_WRAPPED` 从"环境造成"里拿掉了:它要么来自 64 位计数器回绕(现实中不会),
+要么来自 `cursor_usable()` 里的 `since > now` —— 一个几毫秒前才 fork 的 world,自己记下的 id
+不可能比卷当前的 id 还新,除非卷的计数器被重置,或者**这个 id 根本不是 `FSEventsGetCurrentEventId()`
+给的**,后者就是本代码自己的错,必须红。留在"环境造成"里的是 TIMEOUT / MUST_SCAN / DROPPED /
+UNSUPPORTED / STALE,逐条理由写在 `environment_forced()` 上面。
+
 **验收**:`ctest` 2/2;`check-deps.sh` 绿;`safety.sh` **298 passed, 0 failed**,四种拼法
 (双斜杠、尾斜杠、`/tmp` 符号链接前缀、不给参数)都是 298/0;`test_disk_full_wrapper.py` 与
 `disk_full.py` 全绿。

@@ -234,18 +234,50 @@ static const char *fallback_name(int f) {
     }
 }
 
-// A fallback nothing in this process decided: the machine the test runs on did. fseventsd has
-// to have caught up before it can answer a historical replay for a world forked milliseconds
-// ago -- measured here on an idle 27.0 machine: HistoryDone arrives 330-370 ms later, against
-// the 5 s the replay waits -- the volume's journal has to still reach back past the fork, and
-// the kernel must not have dropped anything on the way. Under P10 every one of these means the
-// diff does the two-tree walk and returns the same answer, which is the behaviour, not a bug.
+// A fallback nothing in this process decided: the machine the test runs on did. Which of the
+// FSEvents statuses those are is decided one by one, from what the code can and cannot cause:
+//
+//   TIMEOUT      the replay waits for a historical HistoryDone, which fseventsd answers only
+//                once it has flushed its journal (measured on an idle 27.0 machine: 330-370 ms
+//                for a world forked milliseconds earlier, against the 5 s allowed). How long
+//                that takes is the machine's.                              -> environment
+//   MUST_SCAN    kFSEventStreamEventFlagMustScanSubDirs: fseventsd itself saying it cannot
+//                enumerate what changed. Nothing here produces it.         -> environment
+//   DROPPED      UserDropped/KernelDropped. The stream gets a serial queue of its own whose
+//                callback does nothing but copy path bytes, which is the whole defence a
+//                consumer has (CLONE_MODEL_MACOS27 6.2); past that it is the kernel's buffer
+//                against a loaded machine.                                 -> environment
+//   UNSUPPORTED  no FSEvents for this volume at all, or the stream would not start.
+//                                                                          -> environment
+//   STALE        the volume's journal answering "I cannot serve this cursor": no journal for
+//                that device, or one that does not reach back to the fork. Both are properties
+//                of the volume. The code COULD cause it too, by recording the wrong device or
+//                the wrong second at fork -- but that mistake is not intermittent, and the
+//                end-of-run guard below is what catches it: it would make every case fall back.
+//                                                                          -> environment
+//   WRAPPED      NOT environment. It is reached by kFSEventStreamEventFlagEventIdsWrapped --
+//                a 64-bit counter that does not wrap in practice -- or by `since > now` in
+//                cursor_usable(), which compares the id this fork recorded against the volume's
+//                current one. For a world forked milliseconds before the diff there is no
+//                healthy way for the first to be ahead of the second: either the volume's
+//                counter was reset behind our back, or the id recorded at fork never came from
+//                FSEventsGetCurrentEventId(). The second is this code's own mistake and has to
+//                be red. (The case that pokes a wrapped cursor into the row on purpose asserts
+//                WFS_DF_WRAPPED directly; it does not come through here.)
+//
+// For the five that are the environment's, P10's rule is that the diff does the two-tree walk
+// and returns the same answer -- the behaviour, not a bug.
 static int environment_forced(int f) {
-    return f == WFS_DF_MUST_SCAN || f == WFS_DF_DROPPED || f == WFS_DF_WRAPPED ||
-           f == WFS_DF_STALE || f == WFS_DF_TIMEOUT || f == WFS_DF_UNSUPPORTED;
+    return f == WFS_DF_MUST_SCAN || f == WFS_DF_DROPPED || f == WFS_DF_STALE ||
+           f == WFS_DF_TIMEOUT || f == WFS_DF_UNSUPPORTED;
 }
 
 static int events_path_taken = 0, events_path_asked = 0;
+// Every case that asked for the events path and did not get it, kept for the end-of-run guard:
+// one reason per site is a machine having a bad moment, all of them is a regression.
+static const char *events_path_why[32];
+static const char *events_path_where[32];
+static int events_path_fell_back = 0;
 
 // Every "this diff had to take the FSEvents path" assertion goes through here.
 //
@@ -279,6 +311,11 @@ static int want_events_path(const char *what, const wfs_diff_stats *st, const ch
                "        the diff (P10); the answer is checked exactly either way.\n",
                what, fallback_name(st->fallback));
         fflush(stdout);
+        if (events_path_fell_back < (int)(sizeof events_path_why / sizeof events_path_why[0])) {
+            events_path_where[events_path_fell_back] = what;
+            events_path_why[events_path_fell_back] = fallback_name(st->fallback);
+        }
+        events_path_fell_back++;
         return 0;
     }
     fprintf(stderr,
@@ -1528,17 +1565,37 @@ int main() {
 
     CHECK(exists(root));
     rm_rf(root);
-    // Which path this run actually exercised. A machine whose fseventsd never answers in time
-    // makes every case above take the full scan, and every case above still checks its answer
-    // exactly -- so the run is not wrong, but the events path went untested and the log has to
-    // say so. It is not made a failure: that would be the same assertion about the runner that
-    // this test just stopped making.
-    if (events_path_taken == events_path_asked)
-        printf("diff_test: the FSEvents path ran in all %d cases that asked for it\n", events_path_asked);
-    else
-        printf("diff_test: NOTE the FSEvents path ran in only %d of the %d cases that asked for\n"
-               "           it; the rest fell back to the full scan (reasons above)\n",
-               events_path_taken, events_path_asked);
+    // Which path this run actually exercised, and the one thing a per-case verdict cannot say.
+    //
+    // Each site above accepts a fallback the environment forced, because at that site a bad
+    // moment on the machine and a broken replay look exactly alike. Across a whole run they do
+    // not: a regression that makes the replay always come back TIMEOUT or STALE or MUST_SCAN --
+    // a since-id that is never right, the wrong device asked about, a history wait that never
+    // completes -- takes the events path away entirely, and that must not be a quiet pass.
+    // So not one single case having used it is a failure, and the run says which reason each
+    // site gave. A machine where FSEvents genuinely does not work (no journal for the volume,
+    // fseventsd not running) sets WFS_TEST_ALLOW_NO_EVENTS=1; it is the test binary's own
+    // variable, nothing in the product reads it, and CI does not set it.
+    printf("diff_test: the FSEvents path ran in %d of the %d cases that asked for it\n",
+           events_path_taken, events_path_asked);
+    if (events_path_asked > 0 && events_path_taken == 0) {
+        const char *allow = getenv("WFS_TEST_ALLOW_NO_EVENTS");
+        int n = events_path_fell_back;
+        if ((int)(sizeof events_path_why / sizeof events_path_why[0]) < n)
+            n = (int)(sizeof events_path_why / sizeof events_path_why[0]);
+        for (int i = 0; i < n; ++i)
+            fprintf(allow && *allow ? stdout : stderr, "           %s: %s\n",
+                    events_path_where[i], events_path_why[i]);
+        if (!(allow && *allow)) {
+            fprintf(stderr,
+                    "diff_test: the FSEvents path was never exercised. Every case fell back, so\n"
+                    "           nothing here tested it -- which is what a replay that can never\n"
+                    "           succeed looks like. If this machine really has no working\n"
+                    "           FSEvents, run with WFS_TEST_ALLOW_NO_EVENTS=1.\n");
+            exit(1);
+        }
+        printf("diff_test: WFS_TEST_ALLOW_NO_EVENTS is set, so that is not a failure here\n");
+    }
     printf("diff_test: all OK\n");
     return 0;
 }
