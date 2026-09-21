@@ -959,6 +959,44 @@ rm -f "$P17STORE/metadata3.db"
 check P17 "an empty store directory is new, not damaged" 0 -- \
       "$WORLD" --store "$SCRATCH/p17-fresh" fs status
 
+# ---- PR #8 review (round 4): the same store, unreadable ------------------------------------
+# `snapshots/` at 0000 is the 13th round's case: the guard's readdir answers nothing, so the
+# open ends with -EACCES before anything is created. The message for it used to say "nothing
+# was created ... no metadata3.db and no store id were made here" -- a claim this branch cannot
+# make any more, because since the ENOSPC work the SAME errno reaches it from LATE in the open
+# too, after the directories and possibly a zero-length database have been made. What holds on
+# every path is that nothing was LOST, that an unreadable store was never taken for an empty one
+# (P17), and that the command is safe to run again.
+# The stub goes with the database: `metadata.db` as an empty directory with no `metadata3.db`
+# beside it is damage in its own right, decided from the layout before any readdir happens, so
+# the guard's own case is only reachable once both names are gone.
+rmdir "$P17STORE/metadata.db" 2>/dev/null
+chmod 0000 "$P17STORE/snapshots"
+p17out=$("$WORLD" --store "$P17STORE" fs status 2>&1); p17rc=$?
+chmod 0755 "$P17STORE/snapshots"
+if [ "$p17rc" = 1 ] \
+   && echo "$p17out" | grep -q "was lost" \
+   && echo "$p17out" | grep -q "never taken for an empty one" \
+   && echo "$p17out" | grep -q "carries on from there" \
+   && ! echo "$p17out" | grep -q "nothing was created" \
+   && ! echo "$p17out" | grep -q "no metadata3.db and no store id"; then
+    ok PR8 "an unreadable store is told what was not lost, not what was not created"
+else
+    bad PR8 "an unreadable store is told what was not lost, not what was not created (exit $p17rc)"
+    echo "$p17out" | sed 's/^/        /'
+fi
+if echo "$p17out" | grep -q "mv " || echo "$p17out" | grep -q "restore metadata3.db" \
+   || echo "$p17out" | grep -q "move the directory aside"; then
+    bad PR8 "and never sent anywhere near moving or rebuilding the store"
+    echo "$p17out" | sed 's/^/        /'
+else
+    ok PR8 "and never sent anywhere near moving or rebuilding the store"
+fi
+chmod 0000 "$P17STORE/snapshots"
+has_hint PR8 "and the hint is the permissions, not the disk" "fix the permissions" -- \
+         "$WORLD" --store "$P17STORE" fs status
+chmod 0755 "$P17STORE/snapshots"
+
 # ---- PR #1 review (P2): `discard S<n> --now` deletes, it does not just move -------------------
 # A store of its own: the case is a snapshot nobody references, and the stores above are full of
 # worlds holding theirs.
