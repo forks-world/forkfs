@@ -72,6 +72,20 @@ checkpoint/fork operations. A failed operation must not publish a usable partial
 snapshot or alter existing data. This does not promise rollback of arbitrary
 application writes that partially succeed before ENOSPC.
 
+The last phase reopens the store on a volume that is genuinely full, which is the
+one condition that used to be reported as damage. `wfs_store_open()` must return
+`-ENOSPC` and never `WFS_E_STORE_DAMAGED`, `metadata3.db` must be byte-identical
+before and after that failed open, `world fs status` (the wrapper hands the test
+the `world` binary from the same build for this) must exit `1` and must not
+suggest `mv`-ing the store aside or restoring `metadata3.db`, and after the
+filler is removed every snapshot and world row must still be there. Observed on
+2026-09-21, macOS 27 arm64: SQLite `rc=10`, extended `4618`
+(`SQLITE_IOERR_SHMOPEN` -- the store is WAL, so the `-shm` has to be written even
+to read it), `sqlite3_system_errno()` `3` (`ESRCH`, no help), and `statfs(2)`
+still reporting 11,247,616 bytes available on a volume where a 4 KiB write and a
+`mkdir(2)` both failed with `ENOSPC`. These are observations, not fixed expected
+thresholds; what the test pins down is the verdict, not the codes.
+
 The wrapper detaches the image on success and failure. If detach fails, it leaves
 the temporary directory in place and prints the location; it must not recursively
 remove a directory while that image is mounted. Inspect the reported image and
@@ -80,10 +94,13 @@ An unsupported environment or failed image setup is an error, not a passing test
 CI retains its test log when a run fails.
 
 Local validation on macOS 27 arm64 passed CTest (2/2), the safety suite
-(298 cases), wrapper cleanup tests (4/4), dependency checks, and the real
+(298 cases), wrapper cleanup tests (12/12), dependency checks, and the real
 disk-full regression. The latter observed data `ENOSPC` after 523,239,424 bytes
 and metadata exhaustion after 996 directories; these are observations, not
-fixed expected thresholds. The new disk-full CI step still requires its first
+fixed expected thresholds. Pass `safety.sh` a scratch path with no doubled
+slash in it: `TMPDIR` as the CI recipe sets it ends in `/`, so `"$TMPDIR/m1test"`
+makes one, and twelve cases that compare a printed path against the one they
+passed in fail on the difference alone. The new disk-full CI step still requires its first
 GitHub run; local success does not establish a macOS 15 result for this test.
 
 ## Isolation and performance limits

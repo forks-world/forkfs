@@ -3234,3 +3234,40 @@ deprecated 警告);`check-deps.sh` 两个配置全绿。
   `WORLD_GC_BATCH_SECS=1` 下 wake 要在 ~1 s 回来、报 "work remains, handing over"、
   留下 `.deleting` 和大半棵树;删除器进门时把那个 `0000` 摘掉(它本来就是在删它),
   于是后继链走回并行路并把树收干净。
+
+#### P17 收窄:打不开的库不等于坏掉的库(2026-09-21)
+
+实测(macOS 27 arm64,APFS):store 所在卷写满之后,**每一条** `world fs` 命令——连只读的
+`status`/`list`,以及 `discard` 和 `gc`——都以退出码 3 报
+「`its metadata3.db is missing or unreadable` … `restore metadata3.db from a backup, or move the
+directory aside (`mv <store> <store>.damaged`)`」,而那个 40 960 字节的 `metadata3.db` 好好的。
+store 是 WAL,SQLite 连**读**都要先建 `-shm`,满卷上建不出来(`SQLITE_IOERR_SHMOPEN`);
+腾出 8 MiB,所有命令立刻恢复,一行数据都没丢。照着那句提示做的人,会为一个瞬时状态
+把整个 store 里的每一个快照、每一个 world 变成孤儿。
+
+这就是第三十二轮那条规矩再往前一步——**「查询失败不等于查到了空」,于是「库打不开不等于库坏了」**。
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 | `core/src/store.cpp` `wfs_store_open()`(~1428 / ~1450 / ~1520 / ~1530)、`db_move_to_schema3()`、`db_user_version_at()` | `sqlite3_open_v2()` 失败、`PRAGMA user_version` 读不出来、pragma 执行不了,一律 `WFS_E_STORE_DAMAGED`——**不问为什么**。满卷、EACCES、熬过 busy timeout 的 BUSY,拿到的都是那句「挪走重建」的提示 | 判据拆成两半,由 `open_failure_verdict()` 出结论。`WFS_E_STORE_DAMAGED` 从此只表示库**确实**不是一个能用的库:不在、不是普通文件、比 SQLite 那 100 字节文件头还短、头 16 字节不是 `SQLite format 3\0`,或者 SQLite 自己读完了报 `SQLITE_NOTADB` / `SQLITE_CORRUPT`。别的一律把**原因**还回去。这条路上一个字节都不写:文件头是一次 16 字节的 `read(2)`,库本身从来不会被顶掉(`SQLITE_OPEN_CREATE` 只建不存在的库) | `825589a` |
+| P1 | 同上,`volume_out_of_space()` | 「是不是满了」——判据**不是** `avail == 0`。实测:`statfs(2)` 在一个 4 KiB 写、`mkdir(2)` 和 SQLite 那 32 KiB `-shm` 全部 ENOSPC 的卷上,仍然报 **11 247 616 字节可用**(512 MiB 镜像的 2.1%);`SQLITE_IOERR_SHMOPEN` 的 `sqlite3_system_errno()` 是 **3(ESRCH)**,完全帮不上忙 | 先问 `SQLITE_FULL`,再问 `sqlite3_system_errno()`(ENOSPC/EDQUOT),都问不出来才问卷:**可用空间低于 32 MiB** 算满。阈值是个尺寸而不是零,而且比实测留出余量:这个函数**只在** SQLite 已经在一个文件头完好的库上报了 I/O 类错误之后才被问到,它的两个答案(`-ENOSPC` / `-EIO`)**都变不成 `WFS_E_STORE_DAMAGED`**,所以往宽里猜是安全的——猜高,代价是一条「这个卷满了」说在一个 32 MiB 可用时出别的 I/O 错的 store 上;猜低,代价是 `-EIO`,也就是这条路原来的答案 | `825589a` |
+| P2 | `core/src/db.h` `map_sqlite()` | `SQLITE_FULL` 落到 `default` 上,变成 `-EIO`:一个满卷上失败的事务,CLI 说的是「I/O 错误」 | `SQLITE_FULL` → `-ENOSPC`。调用者只有 `Txn::err()` 和 `Txn::commit()`,没有测试钉过它的 `-EIO` | `825589a` |
+| P1 | `cli/main.cpp`(~1953 之后) | 那句致命的提示 | 新增 `-ENOSPC` 分支,说的正好是上面那句的**反面**:卷满了、库本身完好、这里什么都没建没改没删、**不要**把目录挪开、不要重开 store、不要从备份恢复,腾空间再跑一遍。退出码 **1**——3 是「被安全规则拒绝」,卷写满是环境,和这个函数里其它非拒绝的 open 错误一致。`WFS_E_STORE_DAMAGED` 的文案同时改准:「gone, or is a file that is not a database」 | `825589a` |
+
+**先验证会红**(`2b46d30`,三条测试都先在未修复的代码上跑过):
+
+- `core_test`:一个有树、`metadata3.db` 完好的 store,用新测试缝 `wfs_test_db_open_fail_once`
+  (库里恒为 0,形状和 `wfs_test_txn_fail_once` 一样)让那次 open 因为**不是库的原因**失败。
+  未修复时 `SQLITE_FULL` / `SQLITE_IOERR` / `SQLITE_BUSY` **三个都回 `-1017`**;
+  修复后分别是 `-ENOSPC` / `-EIO` / `-EBUSY`。反方向一并钉死:库不在、名字上是个目录、
+  截断到文件头以下、magic 不对、magic 对而后面是垃圾——**仍然**是 `WFS_E_STORE_DAMAGED`。
+- `disk_full_test`:同一件事在**真正写满**的卷上(`disk_full.py` 那个私有 512 MiB APFS 镜像)。
+  未修复:`wfs_store_open(...) -> -1017`。要求是 `-ENOSPC`、`metadata3.db` 前后**逐字节相同**、
+  腾出空间之后每一行都还在。
+- `disk_full_test` 的 CLI 那一半:满卷上跑 `world fs status`,退出码必须是 1,输出里不许出现
+  `move the directory aside`、`mv `、`restore metadata3.db`,而且必须说要腾空间。
+  wrapper 为此把同一次构建的 `world` 二进制作为 argv[2] 交给测试。
+
+**验收**:`ctest` **2/2**;`check-deps.sh` 全绿(没有新依赖,`statfs(2)` 在 libSystem 里);
+`safety.sh` **298 passed, 0 failed**;`test_disk_full_wrapper.py` **12/12**;
+`disk_full.py` 通过。
