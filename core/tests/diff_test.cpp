@@ -401,14 +401,24 @@ static void bench(const char *root, const char *store) {
     double ev = 1e9, fl = 1e9, fx = 1e9, evx = 1e9, fa = 1e9;
     size_t n_events = 0, n_full = 0;
     uint64_t cand = 0;
+    // Only a run that really took the events path is a sample of the events path. A fallback
+    // the environment forced is accepted above, and timing it under the FSEvents label would
+    // print a two-tree walk's numbers as if they were the replay's -- a benchmark answering
+    // about the wrong path. No sample is a result too, and it is said rather than filled in.
+    int ev_n = 0, evx_n = 0;
     for (int i = 0; i < 3; ++i) {
         run_diff(s, wid, 0, &c, &st);
-        WANT_EVENTS("timing / FSEvents", &st);
-        if (st.elapsed_us / 1e6 < ev) ev = st.elapsed_us / 1e6;
-        n_events = c.n;
-        cand = st.candidates;
+        if (WANT_EVENTS("timing / FSEvents", &st)) {
+            if (st.elapsed_us / 1e6 < ev) ev = st.elapsed_us / 1e6;
+            n_events = c.n;
+            cand = st.candidates;
+            ev_n++;
+        }
         run_diff(s, wid, WFS_DIFF_NO_XATTR, &c, &st);
-        if (st.elapsed_us / 1e6 < evx) evx = st.elapsed_us / 1e6;
+        if (st.full_scan == 0) {   // the same rule for the other events-path column
+            if (st.elapsed_us / 1e6 < evx) evx = st.elapsed_us / 1e6;
+            evx_n++;
+        }
         run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
         if (st.elapsed_us / 1e6 < fl) fl = st.elapsed_us / 1e6;
         n_full = c.n;
@@ -419,9 +429,15 @@ static void bench(const char *root, const char *store) {
         run_diff(s, wid, WFS_DIFF_FULL | WFS_DIFF_ALL_XATTRS, &c, &st);
         if (st.elapsed_us / 1e6 < fa) fa = st.elapsed_us / 1e6;
     }
-    printf("  diff (FSEvents)            %.3f s   %llu changes, %llu candidates\n", ev,
-           (unsigned long long)n_events, (unsigned long long)cand);
-    printf("  diff (FSEvents, no-xattr)  %.3f s\n", evx);
+    if (ev_n)
+        printf("  diff (FSEvents)            %.3f s   %llu changes, %llu candidates (%d of 3 runs)\n",
+               ev, (unsigned long long)n_events, (unsigned long long)cand, ev_n);
+    else
+        printf("  diff (FSEvents)            no sample: every run fell back to the full scan\n");
+    if (evx_n)
+        printf("  diff (FSEvents, no-xattr)  %.3f s (%d of 3 runs)\n", evx, evx_n);
+    else
+        printf("  diff (FSEvents, no-xattr)  no sample: every run fell back to the full scan\n");
     printf("  diff (--full)              %.3f s   %llu changes\n", fl, (unsigned long long)n_full);
     printf("  diff (--full --no-xattr)   %.3f s\n", fx);
     printf("  diff (--full --all-xattrs) %.3f s\n", fa);
@@ -1505,9 +1521,13 @@ int main() {
 
     // ---- timing, best of three, on the 10k fixture ----
     double ev = 1e9, fl = 1e9, fx = 1e9, fa = 1e9;
+    int ev_n = 0;   // as above: a full scan the machine forced is not a sample of the replay
     for (int i = 0; i < 3; ++i) {
         run_diff(s, wid, 0, &c, &st);
-        if (st.elapsed_us / 1e6 < ev) ev = st.elapsed_us / 1e6;
+        if (st.full_scan == 0) {
+            if (st.elapsed_us / 1e6 < ev) ev = st.elapsed_us / 1e6;
+            ev_n++;
+        }
         run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
         if (st.elapsed_us / 1e6 < fl) fl = st.elapsed_us / 1e6;
         run_diff(s, wid, WFS_DIFF_FULL | WFS_DIFF_NO_XATTR, &c, &st);
@@ -1515,8 +1535,12 @@ int main() {
         run_diff(s, wid, WFS_DIFF_FULL | WFS_DIFF_ALL_XATTRS, &c, &st);
         if (st.elapsed_us / 1e6 < fa) fa = st.elapsed_us / 1e6;
     }
-    printf("  10k, 850 changes: FSEvents %.3f s   --full %.3f s   --full --no-xattr %.3f s   "
-           "--full --all-xattrs %.3f s\n", ev, fl, fx, fa);
+    if (ev_n)
+        printf("  10k, 850 changes: FSEvents %.3f s (%d of 3 runs)   --full %.3f s   "
+               "--full --no-xattr %.3f s   --full --all-xattrs %.3f s\n", ev, ev_n, fl, fx, fa);
+    else
+        printf("  10k, 850 changes: FSEvents no sample (every run fell back)   --full %.3f s   "
+               "--full --no-xattr %.3f s   --full --all-xattrs %.3f s\n", fl, fx, fa);
 
     free(c.v);
     c.v = NULL;
