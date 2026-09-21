@@ -3129,6 +3129,57 @@ int main(int argc, char **argv) {
         CHECK(chmod(nsnap, 0700) == 0); // so the test's own rm_rf can clear it
     }
 
+    // ---- ... and a database we could not CREATE is not a database that is damaged either ----
+    //
+    // The same misdiagnosis one step earlier in a store's life. The main open is the one that
+    // carries SQLITE_OPEN_CREATE, so on a full volume a BRAND NEW store fails there with no
+    // metadata3.db at all -- or with the zero-length one SQLite's open(O_CREAT) left behind
+    // before it ran out of room. Both of those are "the file is absent or too short to be a
+    // database", which is exactly the shape P17 refuses... over a store that has no trees in it,
+    // was never damaged, and whose user was then told "move the directory aside".
+    //
+    // P17's own guard has already run by then (store_layout): a store with trees and no readable
+    // database never reaches the open at all. So what is left here is only the empty store, and
+    // the open knows which it is -- the layout recorded whether the database was there before it
+    // started, and that fact is passed in rather than guessed at from the file afterwards.
+    {
+        char fstore[4096], fdb[4096];
+        join(fstore, sizeof fstore, root, "fresh-nospc-store");
+        join(fdb, sizeof fdb, fstore, "metadata3.db");
+        wfs_store *f = NULL;
+        wfs_test_db_open_fail_once = SQLITE_FULL;
+        CHECK_RC(wfs_store_open(fstore, &f), -ENOSPC);
+        CHECK(f == NULL);
+        CHECK(wfs_test_db_open_fail_once == 0);         // the seam fired
+        // Whatever SQLite left at that name, the store is still the empty store it was: the
+        // next open of it -- with nothing in the way any more -- makes it an ordinary new one.
+        f = NULL;
+        CHECK_OK(wfs_store_open(fstore, &f));
+        size_t fsn = 1, fwn = 1;
+        wfs_snapshot_rec frecs[2];
+        wfs_world_rec fwrecs[2];
+        CHECK_OK(wfs_snapshot_list(f, frecs, 2, &fsn));
+        CHECK_OK(wfs_world_list(f, 0, fwrecs, 2, &fwn));
+        CHECK(fsn == 0 && fwn == 0);
+        wfs_store_close(f);
+        struct stat fst;
+        CHECK(stat(fdb, &fst) == 0 && S_ISREG(fst.st_mode) && fst.st_size > 0);
+
+        // ... and the same on a second brand new store for the other errno: plenty of room, so
+        // "out of space" must not be the answer -- but "damaged" must not be either.
+        char gstore[4096], gdb[4096];
+        join(gstore, sizeof gstore, root, "fresh-eio-store");
+        join(gdb, sizeof gdb, gstore, "metadata3.db");
+        wfs_store *g = NULL;
+        wfs_test_db_open_fail_once = SQLITE_IOERR;
+        CHECK_RC(wfs_store_open(gstore, &g), -EIO);
+        CHECK(g == NULL);
+        g = NULL;
+        CHECK_OK(wfs_store_open(gstore, &g));
+        wfs_store_close(g);
+        CHECK(stat(gdb, &fst) == 0 && fst.st_size > 0);
+    }
+
     // ---- PR #1 review (3rd round): a pthread_create that fails for one slot and not the next --
     //
     // Both parallel loops in the core wrote the handle to th[i] while `started` merely counted,

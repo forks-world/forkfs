@@ -240,6 +240,9 @@ static void check_cli_message(const char *world_bin, const char *store) {
     CHECK(strstr(out, "mv ") == NULL);
     CHECK(strstr(out, "restore metadata3.db") == NULL);
     CHECK(strstr(out, "free space") != NULL);
+    // ... and it claims nothing about the database it could not open beyond this, which is true
+    // of a store that has one and of a brand new store that has not got one yet.
+    CHECK(strstr(out, "nothing here was created, changed or removed") != NULL);
 }
 
 static void check_integrity(const char *store) {
@@ -441,8 +444,16 @@ int main(int argc, char **argv) {
     // So: with the volume genuinely full, the open comes back -ENOSPC and not
     // WFS_E_STORE_DAMAGED, the database is byte-identical before and after, and once there is
     // room again every row is where it was.
-    char dbfile[WFS_PATH_MAX];
+    char dbfile[WFS_PATH_MAX], fresh_store[WFS_PATH_MAX], fresh_db[WFS_PATH_MAX];
     join(dbfile, sizeof dbfile, store_dir, "metadata3.db");
+    // A store directory that exists and holds nothing: on a full volume its open must come back
+    // -ENOSPC too, and never WFS_E_STORE_DAMAGED over a store that was never damaged. The
+    // directory is made here, while there is still room, because a full volume stops this open
+    // at the first mkdir(2) of `snapshots/` rather than at the SQLite create -- the create
+    // itself is the seam's job in core_test.
+    join(fresh_store, sizeof fresh_store, volume, "fresh-store");
+    join(fresh_db, sizeof fresh_db, fresh_store, "metadata3.db");
+    mkdir_checked(fresh_store);
     size_t db_size = 0;
     unsigned char *db_before = read_all(dbfile, &db_size);
 
@@ -462,7 +473,20 @@ int main(int argc, char **argv) {
     CHECK(wall_rc != WFS_E_STORE_DAMAGED);
     CHECK(wall_rc == -ENOSPC);
     check_cli_message(world_bin, store_dir);
+
+    wfs_store *fresh = NULL;
+    int fresh_rc = wfs_store_open(fresh_store, &fresh);
+    printf("full volume, wfs_store_open(%s) -> %d (%s)\n", fresh_store, fresh_rc,
+           wfs_strerror(fresh_rc));
+    CHECK(fresh == NULL);
+    CHECK(fresh_rc != WFS_E_STORE_DAMAGED);
+    CHECK(fresh_rc == -ENOSPC);
     remove_filler(&wall);
+    // ... and once there is room it is an ordinary new store, with no id handed out twice.
+    CHECK_OK(wfs_store_open(fresh_store, &fresh));
+    wfs_store_close(fresh);
+    struct stat fresh_st;
+    CHECK(stat(fresh_db, &fresh_st) == 0 && fresh_st.st_size > 0);
 
     size_t db_size_after = 0;
     unsigned char *db_after = read_all(dbfile, &db_size_after);
