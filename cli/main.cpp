@@ -1953,11 +1953,12 @@ int main(int argc, char **argv) {
     if (rc == WFS_E_STORE_DAMAGED) {
         char why[WFS_PATH_MAX + 256];
         snprintf(why, sizeof why,
-                 "the store at %s still holds trees (snapshots/, trash/ or pool/) but its "
-                 "metadata3.db is gone, or is a file that is not a database.\n"
-                 "  Those trees are what the database was the index of: ids would restart at 1 "
-                 "and collide with the snapshots/S<n> already on disk, so nothing will be "
-                 "created here.\n"
+                 "the store at %s cannot be opened: its metadata3.db is gone, or is a file that "
+                 "is not a database, or its two database names are in a state this core cannot "
+                 "account for.\n"
+                 "  Any trees under snapshots/, trash/ or pool/ are what the database was the "
+                 "index of: ids would restart at 1 and collide with a snapshots/S<n> already on "
+                 "disk, so nothing will be created here.\n"
                  "  `world fs gc --reconcile` cannot help -- it needs the database to know what "
                  "is orphaned.",
                  sd);
@@ -1979,18 +1980,40 @@ int main(int argc, char **argv) {
     // merely unreachable is the one store that must NOT be moved or rebuilt. Exit 1: 3 means
     // "refused by a safety rule", and a volume that filled up is the environment, which is what
     // every other non-refusal open error below exits with.
-    if (rc == -ENOSPC) {
+    if (rc == -ENOSPC || rc == -EDQUOT) {
         fprintf(stderr, "world: open store %s: %s\n", sd, wfs_strerror(rc));
+        // Why. One line each, and neither says anything about this store that is not true of
+        // every store this branch can be reached for.
+        if (rc == -ENOSPC)
+            fprintf(stderr,
+                    "  the volume that holds the store is full, so the store's database could "
+                    "not be opened or created: on a full volume even reading one fails, because "
+                    "a WAL database needs its -wal/-shm sidecar written first.\n");
+        else
+            fprintf(stderr,
+                    "  a disk quota for this user or group on the volume that holds the store "
+                    "is exhausted, so the store's database could not be opened or created. The "
+                    "volume itself may have plenty of room; the quota is what ran out.\n");
+        // What is guaranteed. NOT "nothing was created": by the time this open failed it may
+        // itself have made the store directory, VERSION, the subdirectories, upgrade.lock or a
+        // zero-length metadata3.db (PR #8 review, round 2). What holds in every case is that
+        // nothing that was already here was touched -- and that a half-made new store is not a
+        // mess to clean up, it is a setup to finish.
         fprintf(stderr,
-                "  the volume that holds the store is full, so the store's database could not "
-                "be opened or created -- SQLite writes a -wal/-shm sidecar even to read one.\n"
-                "  nothing here was created, changed or removed, and a metadata3.db that was "
-                "already there has not been touched. This is not damage: do not move this "
+                "  nothing that was already here was changed or removed: no snapshot, no World, "
+                "and no metadata3.db that already existed. If this is a new store, the "
+                "directories and empty files made so far are harmless -- the same command "
+                "finishes the setup once there is room. This is not damage: do not move this "
                 "directory aside, do not start a new store, and do not recover anything from a "
-                "backup.\n"
-                "  try: free space on the volume that holds %s (`df -h %s`) and run the same "
-                "command again\n",
-                sd, sd);
+                "backup.\n");
+        char hint[WFS_PATH_MAX + 128];
+        if (rc == -ENOSPC)
+            snprintf(hint, sizeof hint, "free space on the volume that holds %s (`df -h %s`)",
+                     sd, sd);
+        else
+            snprintf(hint, sizeof hint,
+                     "free or raise the disk quota that covers %s (`quota -v`)", sd);
+        fprintf(stderr, "  try: %s and run the same command again\n", hint);
         return EX_ERR;
     }
     // P17, and PR #1 review (13th round): the guard above needs three readdirs to know whether

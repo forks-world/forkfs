@@ -742,6 +742,12 @@ int db_header_shape(const char *path) {
 // -ENOSPC and -EIO. Neither answer can become WFS_E_STORE_DAMAGED, which is what makes a
 // generous rule here safe.
 //
+// EDQUOT is NOT one of the answers here (PR #8 review, round 2): a per-user or per-group disk
+// quota can be exhausted with the volume half empty, and "free space on this volume" is then
+// advice that does nothing about it. It is answered above this, on its own. The APFS *volume*
+// quota measured on 2026-09-21 reports ENOSPC and never EDQUOT, so what is left under EDQUOT is
+// the classic per-user/group kind.
+//
 // SQLITE_FULL says it outright. sqlite3_system_errno() is asked next and is often no help:
 // measured on the bounded APFS image scripts/tests/disk_full.py makes, SQLITE_IOERR_SHMOPEN
 // came back with system errno 3 (ESRCH) -- whatever the shm path had stored last, not the
@@ -757,7 +763,7 @@ int db_header_shape(const char *path) {
 // free, and guessing low costs -EIO, which is what this path answered before.
 bool volume_out_of_space(int ext, int se, const char *dir) {
     if ((ext & 0xff) == SQLITE_FULL) return true;
-    if (se == ENOSPC || se == EDQUOT) return true;
+    if (se == ENOSPC) return true;
     struct statfs fs;
     if (::statfs(dir, &fs) != 0) return false;
     return (uint64_t)fs.f_bavail * (uint64_t)fs.f_bsize < kNoSpaceCeiling;
@@ -817,6 +823,9 @@ int open_failure_verdict(const char *dir, const char *dbp, sqlite3 *h, int rc, b
     if (prim == SQLITE_BUSY || prim == SQLITE_LOCKED || prim == SQLITE_NOMEM ||
         prim == SQLITE_READONLY)
         return wfs::map_sqlite(prim);
+    // A quota that has run out is not a volume that is full, and it is the one the kernel names
+    // outright, so it is answered before the volume is ever asked.
+    if (se == EDQUOT) return -EDQUOT;
     if (volume_out_of_space(ext, se, dir)) return -ENOSPC;
     if (shape < 0) return shape;   // we could not even read the header: that errno, not a guess
     return -EIO;
@@ -1392,7 +1401,10 @@ extern "C" const char *wfs_strerror(int rc) {
     case WFS_E_SNAPSHOT_IN_USE: return "a live world still needs this snapshot";
     case WFS_E_GC_BUSY: return "another gc worker is running";
     case WFS_E_STORE_UNREACHABLE: return "that store cannot be opened from here";
-    case WFS_E_STORE_DAMAGED: return "the store has trees in it but metadata3.db is gone or is not a database";
+    // Not "the store has trees in it but ...": the layout reaches this verdict for a store
+    // whose two database names are in a state the upgrade protocol cannot produce, trees or no
+    // trees (store_layout). What every one of them has in common is this.
+    case WFS_E_STORE_DAMAGED: return "the store's metadata3.db is gone, or is not a database";
     case WFS_E_STORE_BUSY:
         return "older clients still have the store open; stop them and retry";
     case WFS_E_TRASH_BLOCKED: return "a directory is in the way of this trash entry's deletion";
