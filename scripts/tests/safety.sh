@@ -28,6 +28,10 @@ SCRATCH=${2:-${WORLD_TEST_DIR:-$(mktemp -d)/m1test}}
 # mean deleting whatever a symlink left in its place points at instead.
 SCRATCH_PARENT=$(cd "$(dirname "$SCRATCH")" 2>/dev/null && pwd -P) || SCRATCH_PARENT=""
 [ -n "$SCRATCH_PARENT" ] || { echo "refusing to use $SCRATCH: its parent directory does not exist"; exit 2; }
+# `pwd -P` prints "/" for the root and no trailing slash for anything else, so the one parent
+# that must not be pasted on as-is is the root itself -- "/" + "/" + "m1test" is the very
+# doubled slash this is here to remove.
+[ "$SCRATCH_PARENT" = "/" ] && SCRATCH_PARENT=""
 SCRATCH="$SCRATCH_PARENT/$(basename "$SCRATCH")"
 case "$SCRATCH" in
     */m1test) ;;
@@ -1175,6 +1179,11 @@ WORLD_GC_PAUSE_MS=0 WORLD_GC_BATCH_SECS=1 rv fs gc --worker --retention 0 > "$SC
 t1=$(python3 -c 'import time;print(int(time.time()*1000))')
 if [ "$((t1 - t0))" -lt 4000 ]; then ok PR1 "a one-second gc wake returns on time mid-tree ($((t1-t0)) ms)"
 else bad PR1 "a one-second gc wake returns on time mid-tree ($((t1-t0)) ms)"; sed 's/^/        /' "$SCRATCH/gcbig.log"; fi
+# Both of the assertions on this log read the ONE line gc_log_line() writes, and that line is
+# printed and flushed before the successor exists: cli/main.cpp:1192 logs it, cli/main.cpp:1193
+# starts the successor on the next statement. The successor cannot reach this file either --
+# spawn_detached() reopens its stdout and stderr on <store>/logs/gc.log (cli/main.cpp:349-351)
+# before it execs -- so everything asserted here is the foreground wake's own account of itself.
 grep -q "work remains, handing over" "$SCRATCH/gcbig.log" && ok PR1 "it reports the work it did not get to" \
                                                           || { bad PR1 "it reports the work it did not get to"; sed 's/^/        /' "$SCRATCH/gcbig.log"; }
 # What is left of the tree cannot be counted from here. This wake set `work_remains` and
