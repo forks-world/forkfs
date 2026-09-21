@@ -250,7 +250,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             result_code = 1
-        elif attach_attempted:
+        if attach_attempted:
             attempts = 0
             while devices and attempts < MAX_DETACH_ATTEMPTS:
                 attempts += 1

@@ -621,6 +621,11 @@ grep -q "collected in the background" "$SCRATCH/gc2.log" && ok T2.1 "gc hands du
 for _ in $(seq 60); do [ -z "$(ls "$S2"/trash 2>/dev/null)" ] && break; sleep 0.25; done
 [ -z "$(ls "$S2"/trash 2>/dev/null)" ] && ok T2.1 "the worker empties the trash on its own" \
                                        || { bad T2.1 "the worker empties the trash on its own"; ls "$S2/trash" | sed 's/^/        /'; }
+# The worker removes the trash before its final log write; wait briefly for that log entry too.
+for _ in $(seq 60); do
+    [ -f "$S2/logs/gc.log" ] && grep -q "entries unlinked" "$S2/logs/gc.log" && break
+    sleep 0.25
+done
 w2 fs list | grep -q "^W1 .*trashed" && bad T2.1 "the collected world is marked dead" \
                                      || ok T2.1 "the collected world is marked dead"
 [ -s "$S2/logs/gc.log" ] && ok T2.1 "the worker logs to <store>/logs/gc.log" \

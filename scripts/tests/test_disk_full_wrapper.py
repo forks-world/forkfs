@@ -32,9 +32,9 @@ class ImageCleanupTests(unittest.TestCase):
 
             def lstat(path):
                 result = original_lstat(path)
+                if path == mount and unreadable:
+                    raise PermissionError("cannot inspect test mount")
                 if path == mount and mounted:
-                    if unreadable:
-                        raise PermissionError("cannot inspect test mount")
                     fields = list(result)
                     fields[2] += 1  # st_dev: emulate a mounted volume, not the host directory.
                     return os.stat_result(fields)
@@ -108,7 +108,12 @@ class ImageCleanupTests(unittest.TestCase):
     def test_unknown_mount_state_never_removes_image(self):
         rc, calls = self.exercise(unreadable=True)
         self.assertNotEqual(rc, 0)
-        self.assertEqual(calls, ["create", "attach", "info"])
+        self.assertEqual(calls, ["create", "attach", "info", "detach"])
+
+    def test_unknown_mount_state_preserves_after_successful_detach(self):
+        rc, calls = self.exercise(unreadable=True, detach_ok=True)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(calls, ["create", "attach", "info", "detach", "info"])
 
     def test_cleanup_does_not_hide_attach_failure(self):
         rc, calls = self.exercise(detach_ok=True)
