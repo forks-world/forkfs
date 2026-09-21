@@ -3234,3 +3234,180 @@ deprecated 警告);`check-deps.sh` 两个配置全绿。
   `WORLD_GC_BATCH_SECS=1` 下 wake 要在 ~1 s 回来、报 "work remains, handing over"、
   留下 `.deleting` 和大半棵树;删除器进门时把那个 `0000` 摘掉(它本来就是在删它),
   于是后继链走回并行路并把树收干净。
+
+#### P17 收窄:打不开的库不等于坏掉的库(2026-09-21)
+
+实测(macOS 27 arm64,APFS):store 所在卷写满之后,**每一条** `world fs` 命令——连只读的
+`status`/`list`,以及 `discard` 和 `gc`——都以退出码 3 报
+「`its metadata3.db is missing or unreadable` … `restore metadata3.db from a backup, or move the
+directory aside (`mv <store> <store>.damaged`)`」,而那个 40 960 字节的 `metadata3.db` 好好的。
+store 是 WAL,SQLite 连**读**都要先建 `-shm`,满卷上建不出来(`SQLITE_IOERR_SHMOPEN`);
+腾出 8 MiB,所有命令立刻恢复,一行数据都没丢。照着那句提示做的人,会为一个瞬时状态
+把整个 store 里的每一个快照、每一个 world 变成孤儿。
+
+这就是第三十二轮那条规矩再往前一步——**「查询失败不等于查到了空」,于是「库打不开不等于库坏了」**。
+
+| # | 位置 | 问题 | 修法 | 提交 |
+|---|---|---|---|---|
+| P1 | `core/src/store.cpp` `wfs_store_open()`(~1428 / ~1450 / ~1520 / ~1530)、`db_move_to_schema3()`、`db_user_version_at()` | `sqlite3_open_v2()` 失败、`PRAGMA user_version` 读不出来、pragma 执行不了,一律 `WFS_E_STORE_DAMAGED`——**不问为什么**。满卷、EACCES、熬过 busy timeout 的 BUSY,拿到的都是那句「挪走重建」的提示 | 判据拆成两半,由 `open_failure_verdict()` 出结论。`WFS_E_STORE_DAMAGED` 从此只表示库**确实**不是一个能用的库:不在、不是普通文件、比 SQLite 那 100 字节文件头还短、头 16 字节不是 `SQLite format 3\0`,或者 SQLite 自己读完了报 `SQLITE_NOTADB` / `SQLITE_CORRUPT`。别的一律把**原因**还回去。这条路上一个字节都不写:文件头是一次 16 字节的 `read(2)`,库本身从来不会被顶掉(`SQLITE_OPEN_CREATE` 只建不存在的库) | `825589a` |
+| P1 | 同上,`volume_out_of_space()` | 「是不是满了」——判据**不是** `avail == 0`。实测:`statfs(2)` 在一个 4 KiB 写、`mkdir(2)` 和 SQLite 那 32 KiB `-shm` 全部 ENOSPC 的卷上,仍然报 **11 247 616 字节可用**(512 MiB 镜像的 2.1%);`SQLITE_IOERR_SHMOPEN` 的 `sqlite3_system_errno()` 是 **3(ESRCH)**,完全帮不上忙 | 先问 `SQLITE_FULL`,再问 `sqlite3_system_errno()`(ENOSPC/EDQUOT),都问不出来才问卷:**可用空间低于 32 MiB** 算满。阈值是个尺寸而不是零,而且比实测留出余量:这个函数**只在** SQLite 已经在一个文件头完好的库上报了 I/O 类错误之后才被问到,它的两个答案(`-ENOSPC` / `-EIO`)**都变不成 `WFS_E_STORE_DAMAGED`**,所以往宽里猜是安全的——猜高,代价是一条「这个卷满了」说在一个 32 MiB 可用时出别的 I/O 错的 store 上;猜低,代价是 `-EIO`,也就是这条路原来的答案 | `825589a` |
+| P2 | `core/src/db.h` `map_sqlite()` | `SQLITE_FULL` 落到 `default` 上,变成 `-EIO`:一个满卷上失败的事务,CLI 说的是「I/O 错误」 | `SQLITE_FULL` → `-ENOSPC`。调用者只有 `Txn::err()` 和 `Txn::commit()`,没有测试钉过它的 `-EIO` | `825589a` |
+| P1 | `cli/main.cpp`(~1953 之后) | 那句致命的提示 | 新增 `-ENOSPC` 分支,说的正好是上面那句的**反面**:卷满了、库本身完好、这里什么都没建没改没删、**不要**把目录挪开、不要重开 store、不要从备份恢复,腾空间再跑一遍。退出码 **1**——3 是「被安全规则拒绝」,卷写满是环境,和这个函数里其它非拒绝的 open 错误一致。`WFS_E_STORE_DAMAGED` 的文案同时改准:「gone, or is a file that is not a database」 | `825589a` |
+
+**先验证会红**(`2b46d30`,三条测试都先在未修复的代码上跑过):
+
+- `core_test`:一个有树、`metadata3.db` 完好的 store,用新测试缝 `wfs_test_db_open_fail_once`
+  (库里恒为 0,形状和 `wfs_test_txn_fail_once` 一样)让那次 open 因为**不是库的原因**失败。
+  未修复时 `SQLITE_FULL` / `SQLITE_IOERR` / `SQLITE_BUSY` **三个都回 `-1017`**;
+  修复后分别是 `-ENOSPC` / `-EIO` / `-EBUSY`。反方向一并钉死:库不在、名字上是个目录、
+  截断到文件头以下、magic 不对、magic 对而后面是垃圾——**仍然**是 `WFS_E_STORE_DAMAGED`。
+- `disk_full_test`:同一件事在**真正写满**的卷上(`disk_full.py` 那个私有 512 MiB APFS 镜像)。
+  未修复:`wfs_store_open(...) -> -1017`。要求是 `-ENOSPC`、`metadata3.db` 前后**逐字节相同**、
+  腾出空间之后每一行都还在。
+- `disk_full_test` 的 CLI 那一半:满卷上跑 `world fs status`,退出码必须是 1,输出里不许出现
+  `move the directory aside`、`mv `、`restore metadata3.db`,而且必须说要腾空间。
+  wrapper 为此把同一次构建的 `world` 二进制作为 argv[2] 交给测试。
+
+**验收**:`ctest` **2/2**;`check-deps.sh` 全绿(没有新依赖,`statfs(2)` 在 libSystem 里);
+`safety.sh` **298 passed, 0 failed**;`test_disk_full_wrapper.py` **12/12**;
+`disk_full.py` 通过。
+
+**同一类的第二处(review 跟进,`5db1038` + `b01695c`)**:一个**全新的、还没有库的 store**,
+在满卷上打开。主 open 带着 `SQLITE_OPEN_CREATE`,于是失败发生在**创建**上,而那个名字上此时
+要么什么都没有,要么是 SQLite 的 `open(O_CREAT)` 在没空间之前留下的**零长度文件**——两者都是
+「不在,或者短过文件头」,正是 P17 的形状;于是 `world fs init` 在满卷上说的是
+「这个 store 还有树…把目录挪开」,而它是空的,也从来没坏过。
+**「创建不出来的库,也不等于坏掉的库。」**
+
+修法:`open_failure_verdict()` 多收一个 `db_existed`——`store_layout()` 在这次 open 动任何东西
+**之前**记下的事实,**显式传进来**,不是事后去 stat 猜(事后已经晚了)。「确实不是一个库」这个判断
+**只对本来就在那儿的库**成立;对一个这次 open 打算创建的库,「不在」和「零长度」是一次没做完的
+创建留下的样子。`SQLITE_NOTADB` / `SQLITE_CORRUPT` 不动;schema 2→3 那两个 helper 的站点一律
+传 `true`(它们只对「布局认定是普通文件的 `metadata.db`」调用,在那里「被人搬走了」仍然是损坏)。
+P17 一点都没松:有树而库读不出来的 store,`store_layout()` 在 open 之前就已经挡掉了,
+落到这四个站点上的只剩「既没树也没库」的那一种。CLI 的 `-ENOSPC` 文案原来断言
+"the database itself is intact",对一个还没有库的 store 是假话——改成两种情况下都成立的说法:
+这里什么都没建没改没删,**本来就在的** `metadata3.db` 没有被碰过。
+
+先验证会红:`core_test.cpp:3151` 在未修复的代码上
+`wfs_store_open(fstore, &f) -> -1017 … wanted -28`。
+`disk_full_test` 里那条端到端的(满卷上打开一个空 store 目录)**修复前就是绿的**——真·满卷会让这次
+open 停在 `snapshots/` 的第一个 `mkdir(2)` 上、根本走不到 SQLite 的 create,所以它钉的是 CLI 可见的
+行为,不是判据本身;判据那一半由 `core_test` 的测试缝钉。失败的 create 留下的零长度库**不需要清理**:
+`store_layout()` 把 size 0 读作「没有可读的库」,而一个没有树的 store 就只是个新 store,
+下一次 open 直接把它变成一个普通的新 store(`core_test` 钉了这一条和它留下的那一个库)。
+
+**同一类的第三处(PR #8 review,`ff72c7b` + `6bd79e9`)**:上面那个「零长度的 `metadata3.db`」
+在**卷还满着**的时候没有消失,于是**第二条命令**踩了同一个坑。`store_layout()` 的
+`lay.db_existed = (nrc == 0)` 问的是**名字在不在**——这是 2→3 升级协议要问的那个问题
+(这里有没有一个 inode 要闸、要 link、要数链接数);判据借用了它,于是重试时读成「这儿本来有个库」,
+看到一个短过文件头的文件,又报 `WFS_E_STORE_DAMAGED`:第一次 `world fs init` 说
+"no space left on device",紧接着的第二次说「把目录挪开」。
+
+修法:布局同时记两件事,名字分开。`db_existed` **一字不动**(升级路径和 M1 持有者闸门读的还是它),
+新增 `db_had_content`——两个名字下的 `st_size > 0`,**在搬库之前**读,所以「宣布搬完」那个分支
+不用对它说任何话;判据收的是 `db_had_content`。**零长度不是丢了的库,是没做完的创建**,
+卷拒绝多少次它都还是这个。这掩盖不了真的损坏:`store_layout()` 本来就把零长度读作「库不可读」,
+**有树**的 store 在这次 open 碰到 SQLite 之前就已经被那道守卫以 `WFS_E_STORE_DAMAGED` 拒了——
+守卫原样保留,而 `db_had_content` 有意就是那道守卫自己的尺寸判据减去 `access(2)`。
+**有字节**的文件判法不变:失败的创建留下的是零字节,绝不会是半个文件头(SQLite 第一次写就是
+一整页),所以短文件和 magic 不对的文件,是别人的文件占了库的名字。
+
+先验证会红:`core_test.cpp:3208`(第一次重试)在未修复的代码上
+`wfs_store_open(rstore, &r) -> -1017 … wanted -28`。测试先断言第一次失败**确实**留下了那个
+零长度文件(不然整条用例是空跑),然后把邻居一并盖住:再 `SQLITE_FULL` 三次(每次 `-ENOSPC`)、
+空间充足时的 `SQLITE_IOERR`(`-EIO`)、失败消失后 open 成功且 id 从 1 发、**有树**时同一个零长度库
+仍然 `WFS_E_STORE_DAMAGED`、空 store 里 16 字节和 magic 不对的文件仍然 `WFS_E_STORE_DAMAGED`。
+
+**同一类的第四、第五处(PR #8 review 第二轮,`e02b5ee` + `ee1188d`)**:
+
+- **EDQUOT 不是「卷满了」**。per-user / per-group 配额可以在卷半空的时候用光,
+  「在这个卷上腾空间」对它毫无用处。`volume_out_of_space()` 原来把 EDQUOT 和 ENOSPC 并在一起;
+  现在 `sqlite3_system_errno()` 说 EDQUOT 就**单独**回 `-EDQUOT`(而且只有这一条路),
+  `SQLITE_FULL` 和 statfs 那条规矩照旧 `-ENOSPC`,`map_sqlite()` 不动。注释里记下:
+  2026-09-21 实测的 APFS **卷**配额报的是 ENOSPC、从不报 EDQUOT,所以 EDQUOT 下剩的是经典的
+  用户/组配额。`wfs_strerror` 通过 `strerror` 覆盖 `-EDQUOT`。驱动它需要第二条测试缝——
+  已有的那条注入的是 SQLite 结果码,而这是系统 errno——`wfs_test_db_system_errno`,
+  同样的规矩:读一次、清回 0、非测试运行里恒为 0。红:
+  `core_test.cpp:3302: wfs_store_open(qstore, &q) -> -28 … wanted -69`。
+- **文案不许说过头的话**。`-ENOSPC` 那段原来写「nothing here was created, changed or removed」,
+  对一个**新的或做了一半的** store 是假话:open 失败之前它自己可能已经建了 store 目录、`VERSION`、
+  那几个子目录、`upgrade.lock`,或者那个零长度的 `metadata3.db`。改成每种情况下都成立的说法:
+  **本来就在的**东西一样没动(没有快照、没有 World、没有原本就在的 `metadata3.db`),
+  而一个做了一半的新 store 不是要收拾的烂摊子,是**同一条命令有空间之后接着做完**的安装。
+  其余性质全留:为什么失败、腾空间(或腾/抬配额)再跑一遍、绝不提挪开/重建/恢复、退出码 1。
+  红:`disk_full_test.cpp:249: CHECK failed: strstr(out, "nothing here was created, changed or removed") == NULL`。
+  同一趟顺手查出并改掉另外两处同类的话:`WFS_E_STORE_DAMAGED` 的 CLI 文案和它的 `wfs_strerror`
+  串都写着 store「still holds trees」,而 `store_layout()` 有好几条路**没有树也会**判损坏
+  (两个库名处在协议产生不出来的状态);两处都改成对所有这些情况都成立的说法,树那句保留下来
+  当作「为什么 id 会撞车」的理由。
+
+**同一类的第六处(PR #8 review 第三轮,`b75f133` + `e762df6`)**:`-ENOSPC` / `-EDQUOT` 那段
+第二轮改成的「nothing that was already here was changed or removed」**还是说过头了**。
+**两条**路让它不成立,不是一条:
+
+- **schema 2 的老 store**。`wfs_store_open()` 先跑 `version_upgrade()`(`VERSION` 2→3),
+  再跑 `db_move_to_schema3()`(改 journal mode、`link` + `RENAME_SWAP` 把库换到新名字、
+  旧名字变成空目录),**然后**才轮到那次可能没空间的 open。到这一步为止,本来就在的
+  `VERSION` 已经被重写了。
+- **`trashing_recover()`**,每一次 open 的最后一步:它把被 kill 的 `discard` 留下的 state=4
+  行**一行一个事务**地收尾,于是前面的行可能已经提交、后面的行才撞上 `SQLITE_FULL`。
+
+迁移本身**不是**第三条:`migrate_schema()` 是**一个**事务,它唯一能走到这里的 `-ENOSPC` 是
+COMMIT 失败——事务还开着,析构函数回滚,一行记录都没动。
+
+于是保证改成按**「丢没丢」**说,这在每一条路上都成立:没有快照、没有 World、没有库里的记录
+**丢失**,这里什么都没被删掉;已经做了的那部分(新 store 的目录和空文件、把老 store 往当前布局
+搬的头几步、或者替一条被中断的 `discard` 收的尾)**原样留着就行**,同一条命令有空间之后
+**从那儿接着做**。其余性质全留。两句「为什么失败」也有同样的毛病——老 store 那条路上用光空间的
+可能是 `mkdir`、`link`、`rename` 或者 `VERSION` 的重写,而不是「打开数据库」——改成
+「这条命令写不下它需要写的东西」,`-wal`/`-shm` 那句保留作为「连读都要先写」的理由。
+
+**逐条核对过的路**(每一条都能从 `wfs_store_open()` 返回 `-ENOSPC`/`-EDQUOT`):新 store、
+已经是 schema 3 的 store、老 store 在升级的每一步(`VERSION` 重写、搬库的 1~4 步、搬了一半、
+迟到的持有者闸门、迁移事务、`kPragmas`)、以及最后那次 `trashing_recover()`。
+**没有发现不可续的状态**:每一种都落在 `store_layout()` 那张表的某一行上,下一次 open 接着做,
+既不会判 `WFS_E_STORE_DAMAGED` 也不会判 `WFS_E_STORE_BUSY`(`WFS_E_STORE_BUSY` 只在真有别的
+进程开着库时出现,那是它本来的语义)。最长的那条由 `core_test` 钉住:用现成的 schema 2 夹具加
+`wfs_test_after_db_move` 缝,在**搬完库、迁移还没提交**的那一刻让 open 撞上 `SQLITE_FULL`——
+判据是 `-ENOSPC`,`metadata.db` 是空目录、`metadata3.db` 是普通文件、两行都在、`user_version`
+还是 2xx、`VERSION` 已经是 3,而下一次 open 把迁移做完、两行一个不少。这条用例**本来就是绿的**
+(判据的活前几轮已经做完),它新钉的是那句承诺所依赖的**可续性**。红的是文案那一条:
+`disk_full_test.cpp:256: CHECK failed: strstr(out, "nothing that was already here was changed or removed") == NULL`。
+
+**同一类的第七处(PR #8 review 第四轮,`d909dc6` + `e6c1fe3`)**:错误阶梯**最后**那个通用分支。
+它对 `-EACCES` / `-EPERM` / `-EIO` / `-ENOTDIR` 说的是「nothing was created: … no metadata3.db
+and no store id were made here」——这句是给**早期**失败(P17 那三次 readdir)写的,而这个 PR
+让**同样的 errno** 也能从 open 的**后期**回来:目录、`VERSION`、`upgrade.lock`、甚至一个零长度的
+`metadata3.db` 都可能已经建好了,老 store 的库甚至已经搬完了。而且「fix the permissions」
+对一个 SQLite 的 I/O 错误根本不是建议。
+
+逐条列出各个 errno 能从哪些步骤回来:**`-EACCES`/`-EPERM`/`-ENOTDIR`**——早期(store 路径上的
+`fs_mkdir_p`/`fs_realpath`、`check_version`、`store_layout` 的两次 `stat(2)`、守卫的三次 readdir),
+**也有**后期(六个子目录的 mkdir、`upgrade.lock`、schema-2 搬库的 mkdir/link/rename、
+`db_stub_make`、P17 判据里那次 16 字节的文件头读取);**`-EIO`**——早期(`check_version` 的读、
+`readdir(3)`),**也有**后期(ENOSPC 那批改动碰过的每一个站点:SQLite 在一个文件头完好的库上失败,
+判据说的是「读失败了,不是文件不对」,外加 `migrate_schema`、store id 的 `meta_set`、
+每次 open 收尾的 `trashing_recover`)。
+
+修法:把**两个分支共用的那一句承诺**抽成 `open_guarantee()`,一处定义——两份文案一定会走样,
+这四轮 review 每一轮都是「对某条路成立、对另一条不成立」的一句话。留下的是:什么都没**丢**、
+**读不了的 store 从来没有被当成空 store**(P17:没有在它看不见的树上发过 id、建过库)、
+已经做了的原样留着、同一条命令接着做,以及绝不挪开/重建/恢复。`try:` 按 errno 分开:
+权限/挂载给 `-EACCES`/`-EPERM`/`-ENOTDIR`,`-EIO` 则说清这是卷或者 SQLite 读库的 I/O 错误、
+**库并没有被判定损坏**,去查卷再重跑。
+
+**顺带核对的其它分支**:`WFS_E_SCHEMA`(没有这类断言)、`WFS_E_STORE_DAMAGED`(只说
+"nothing will be created here",守卫确实在建任何东西之前就返回了)、`WFS_E_STORE_UNREACHABLE`
+以及 `-EROFS`/`-EBUSY`/`-ENOMEM`(落到 errno 那一行,什么都不断言)。又抓到一处:
+`WFS_E_STORE_BUSY` 说「nothing was migrated and the store was left as it was」——而
+`db_move_to_schema3()` 在 `version_upgrade()` 已经把 `VERSION` 写成 3 之后失败时,
+store **不是**原样;改成「库没有迁移、库里一行都没改」,并点明 `VERSION` 可能已经是 3
+(那正是对老二进制关上的那扇门)。
+
+红:`safety.sh` 的 P17 段新增用例(`snapshots/` 0000;要先把 `metadata.db` 那个空目录也去掉,
+否则布局在任何 readdir 之前就判损坏了),在未修复的代码上
+`FAIL PR8 an unreadable store is told what was not lost, not what was not created (exit 1)`,
+输出里正是那句 "nothing was created … no metadata3.db and no store id were made here"。
+**后期 `-EIO` 的 CLI 文案没有加测试**:CLI 到 core 的 open 之间没有缝,而为此加一个生产环境
+的开关是不划算的;后期 `-EIO` 这条判据本身在 core 层已经钉住(`SQLITE_IOERR` → `-EIO`)。

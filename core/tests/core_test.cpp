@@ -1045,6 +1045,12 @@ static void vbump_after_version_bump(void *ctx, const char *dir) {
 static int g_gap_ran;
 static int g_gap_open_rc;
 static int g_gap_uv;
+// PR #8 review (round 3): the store runs out of room AFTER the 2 -> 3 move has happened. The
+// seam fires right where the move ends, and arms the open that comes next.
+static void r8_fail_after_move(void *, const char *) {
+    wfs_test_db_open_fail_once = SQLITE_FULL;
+}
+
 static void gap_m1_open(void *ctx, const char *dir) {
     (void)ctx;
     char dbp[4096];
@@ -3006,6 +3012,315 @@ int main(int argc, char **argv) {
         char snap[4096];
         snprintf(snap, sizeof snap, "%s/snapshots/S%llu", dstore, (unsigned long long)dsid);
         CHECK(chmod(snap, 0700) == 0); // so the test's own rm_rf can clear it
+    }
+
+    // ---- P17: a database we could not open is not a database that is damaged ----------------
+    //
+    // Measured on 2026-09-21 (macOS 27 arm64, APFS): with the volume that holds the store full,
+    // EVERY `world fs` command -- read-only `status` and `list` included, and `gc` and `discard`
+    // with them -- exited 3 with "its metadata3.db is missing or unreadable ... restore
+    // metadata3.db from a backup, or move the directory aside". The 40 960-byte metadata3.db was
+    // perfectly intact. The store is in WAL mode, so SQLite has to make a `-shm` even to READ
+    // it, and on a full volume it cannot (SQLITE_IOERR_SHMOPEN). Following the printed advice
+    // would have orphaned every snapshot and every world in that store for a condition that
+    // freeing 8 MiB undid, with no data lost.
+    //
+    // This is the 32nd round's rule one step along -- "a query that failed is not a query that
+    // found nothing" -- applied to the open itself. WFS_E_STORE_DAMAGED is for a database that
+    // is positively not one: gone, not a regular file, or a file SQLite reads and rejects.
+    // Everything else comes back as the errno of whatever stopped us, and the caller is told the
+    // truth: nothing here is damaged, and nothing was written.
+    {
+        char nstore[4096], nsrc[4096], nfile[4096], ndb[4096], nkept[4096];
+        join(nstore, sizeof nstore, root, "nospc-store");
+        join(nsrc, sizeof nsrc, root, "nospc-src");
+        CHECK(mkdir(nsrc, 0755) == 0);
+        join(nfile, sizeof nfile, nsrc, "a.txt");
+        write_file(nfile, "one file is enough\n");
+        wfs_store *n = NULL;
+        CHECK_OK(wfs_store_open(nstore, &n));
+        wfs_id nsid = 0;
+        wfs_snapshot_opts nopts;
+        memset(&nopts, 0, sizeof nopts);
+        nopts.name = "nospc";
+        CHECK_OK(wfs_snapshot_create(n, nsrc, &nopts, &nsid));
+        wfs_store_close(n);
+        join(ndb, sizeof ndb, nstore, "metadata3.db");
+        join(nkept, sizeof nkept, root, "nospc-kept.db");
+        struct stat nst0;
+        CHECK(stat(ndb, &nst0) == 0 && S_ISREG(nst0.st_mode) && nst0.st_size > 0);
+
+        // The store has trees in it and a database that is beyond reproach. An open that fails
+        // for a reason that is not the database says so, with the errno that stopped it.
+        n = NULL;
+        wfs_test_db_open_fail_once = SQLITE_FULL;
+        CHECK_RC(wfs_store_open(nstore, &n), -ENOSPC);
+        CHECK(n == NULL);
+        CHECK(wfs_test_db_open_fail_once == 0);         // the seam fired
+        n = NULL;
+        wfs_test_db_open_fail_once = SQLITE_IOERR;
+        CHECK_RC(wfs_store_open(nstore, &n), -EIO);
+        CHECK(n == NULL);
+        n = NULL;
+        wfs_test_db_open_fail_once = SQLITE_BUSY;
+        CHECK_RC(wfs_store_open(nstore, &n), -EBUSY);
+        CHECK(n == NULL);
+        // None of those wrote a byte of it, and the next open is an ordinary one.
+        struct stat nst1;
+        CHECK(stat(ndb, &nst1) == 0 && nst1.st_size == nst0.st_size);
+        n = NULL;
+        CHECK_OK(wfs_store_open(nstore, &n));
+        wfs_snapshot_rec nrecs[4];
+        size_t nrn = 0;
+        CHECK_OK(wfs_snapshot_list(n, nrecs, 4, &nrn));
+        CHECK(nrn == 1 && nrecs[0].id == nsid);
+        wfs_store_close(n);
+
+        // ... and the narrowing is only that. Every shape P17 was written for is still damage,
+        // and every one of them is a database that is positively not one.
+        char nstub[4096];
+        join(nstub, sizeof nstub, nstore, "metadata.db");
+        CHECK(rename(ndb, nkept) == 0);                 // gone altogether
+        n = NULL;
+        CHECK_RC(wfs_store_open(nstore, &n), WFS_E_STORE_DAMAGED);
+        CHECK(n == NULL);
+        CHECK(!exists(ndb));
+        CHECK(mkdir(ndb, 0700) == 0);                   // not a regular file
+        n = NULL;
+        CHECK_RC(wfs_store_open(nstore, &n), WFS_E_STORE_DAMAGED);
+        CHECK(n == NULL);
+        CHECK(rmdir(ndb) == 0);
+        write_file(ndb, "this is not a database\n");    // a header that is not SQLite's
+        n = NULL;
+        CHECK_RC(wfs_store_open(nstore, &n), WFS_E_STORE_DAMAGED);
+        CHECK(n == NULL);
+        {
+            // ... truncated below the 100-byte file header SQLite writes: too little of a
+            // database to be one, whatever the first 16 bytes say.
+            int tfd = open(ndb, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            CHECK(tfd >= 0);
+            CHECK(write(tfd, "SQLite format 3", 16) == 16);
+            CHECK(close(tfd) == 0);
+        }
+        n = NULL;
+        CHECK_RC(wfs_store_open(nstore, &n), WFS_E_STORE_DAMAGED);
+        CHECK(n == NULL);
+        {
+            // ... and the one SQLite itself rejects: the magic is right and nothing after it
+            // is, which comes back from the first read as SQLITE_NOTADB.
+            char junk[4096];
+            memset(junk, 0xab, sizeof junk);
+            memcpy(junk, "SQLite format 3", 16);
+            int tfd = open(ndb, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            CHECK(tfd >= 0);
+            CHECK(write(tfd, junk, sizeof junk) == (ssize_t)sizeof junk);
+            CHECK(close(tfd) == 0);
+        }
+        n = NULL;
+        CHECK_RC(wfs_store_open(nstore, &n), WFS_E_STORE_DAMAGED);
+        CHECK(n == NULL);
+        // The store is whole again once its own database is back where it belongs.
+        CHECK(unlink(ndb) == 0);
+        CHECK(rename(nkept, ndb) == 0);
+        CHECK(exists(nstub));
+        n = NULL;
+        CHECK_OK(wfs_store_open(nstore, &n));
+        nrn = 0;
+        CHECK_OK(wfs_snapshot_list(n, nrecs, 4, &nrn));
+        CHECK(nrn == 1 && nrecs[0].id == nsid);
+        wfs_store_close(n);
+
+        char nsnap[4096];
+        snprintf(nsnap, sizeof nsnap, "%s/snapshots/S%llu", nstore, (unsigned long long)nsid);
+        CHECK(chmod(nsnap, 0700) == 0); // so the test's own rm_rf can clear it
+    }
+
+    // ---- ... and a database we could not CREATE is not a database that is damaged either ----
+    //
+    // The same misdiagnosis one step earlier in a store's life. The main open is the one that
+    // carries SQLITE_OPEN_CREATE, so on a full volume a BRAND NEW store fails there with no
+    // metadata3.db at all -- or with the zero-length one SQLite's open(O_CREAT) left behind
+    // before it ran out of room. Both of those are "the file is absent or too short to be a
+    // database", which is exactly the shape P17 refuses... over a store that has no trees in it,
+    // was never damaged, and whose user was then told "move the directory aside".
+    //
+    // P17's own guard has already run by then (store_layout): a store with trees and no readable
+    // database never reaches the open at all. So what is left here is only the empty store, and
+    // the open knows which it is -- the layout recorded whether the database was there before it
+    // started, and that fact is passed in rather than guessed at from the file afterwards.
+    {
+        char fstore[4096], fdb[4096];
+        join(fstore, sizeof fstore, root, "fresh-nospc-store");
+        join(fdb, sizeof fdb, fstore, "metadata3.db");
+        wfs_store *f = NULL;
+        wfs_test_db_open_fail_once = SQLITE_FULL;
+        CHECK_RC(wfs_store_open(fstore, &f), -ENOSPC);
+        CHECK(f == NULL);
+        CHECK(wfs_test_db_open_fail_once == 0);         // the seam fired
+        // Whatever SQLite left at that name, the store is still the empty store it was: the
+        // next open of it -- with nothing in the way any more -- makes it an ordinary new one.
+        f = NULL;
+        CHECK_OK(wfs_store_open(fstore, &f));
+        size_t fsn = 1, fwn = 1;
+        wfs_snapshot_rec frecs[2];
+        wfs_world_rec fwrecs[2];
+        CHECK_OK(wfs_snapshot_list(f, frecs, 2, &fsn));
+        CHECK_OK(wfs_world_list(f, 0, fwrecs, 2, &fwn));
+        CHECK(fsn == 0 && fwn == 0);
+        wfs_store_close(f);
+        struct stat fst;
+        CHECK(stat(fdb, &fst) == 0 && S_ISREG(fst.st_mode) && fst.st_size > 0);
+
+        // ... and the same on a second brand new store for the other errno: plenty of room, so
+        // "out of space" must not be the answer -- but "damaged" must not be either.
+        char gstore[4096], gdb[4096];
+        join(gstore, sizeof gstore, root, "fresh-eio-store");
+        join(gdb, sizeof gdb, gstore, "metadata3.db");
+        wfs_store *g = NULL;
+        wfs_test_db_open_fail_once = SQLITE_IOERR;
+        CHECK_RC(wfs_store_open(gstore, &g), -EIO);
+        CHECK(g == NULL);
+        g = NULL;
+        CHECK_OK(wfs_store_open(gstore, &g));
+        wfs_store_close(g);
+        CHECK(stat(gdb, &fst) == 0 && fst.st_size > 0);
+    }
+
+    // ---- PR #8 review: and the SECOND command, with the volume still full ------------------
+    //
+    // The first open of a new store on a full volume fails after SQLite's open(O_CREAT) has
+    // already made the file, so what it leaves behind is a ZERO-LENGTH metadata3.db. The retry
+    // then finds a name that exists -- and a verdict that keyed on the NAME read that as "there
+    // was a database here", saw a file shorter than a header, and called the store damaged. So
+    // the first `world fs init` on a full volume said "no space left on device" and the second
+    // one said "move the directory aside". The verdict keys on CONTENT now: a zero-length file
+    // in a store with no trees is a create that did not finish, which is still a fresh store.
+    {
+        char rstore[4096], rdb[4096];
+        join(rstore, sizeof rstore, root, "retry-nospc-store");
+        join(rdb, sizeof rdb, rstore, "metadata3.db");
+        struct stat rst;
+        wfs_store *r = NULL;
+        wfs_test_db_open_fail_once = SQLITE_FULL;
+        CHECK_RC(wfs_store_open(rstore, &r), -ENOSPC);
+        CHECK(r == NULL);
+        // Not a vacuous retry: the first failure really did leave the file the real one leaves.
+        CHECK(stat(rdb, &rst) == 0 && S_ISREG(rst.st_mode) && rst.st_size == 0);
+        // ... and now the retry, over that leftover, with the volume just as full. Any number
+        // of times: nothing about a store that is still empty changes between them.
+        for (int i = 0; i < 3; ++i) {
+            r = NULL;
+            wfs_test_db_open_fail_once = SQLITE_FULL;
+            CHECK_RC(wfs_store_open(rstore, &r), -ENOSPC);
+            CHECK(r == NULL);
+            CHECK(stat(rdb, &rst) == 0 && rst.st_size == 0);
+        }
+        // ... and the other errno over the same leftover is that errno, not damage either.
+        r = NULL;
+        wfs_test_db_open_fail_once = SQLITE_IOERR;
+        CHECK_RC(wfs_store_open(rstore, &r), -EIO);
+        CHECK(r == NULL);
+        // ... and when whatever it was is over, the store is an ordinary new one.
+        r = NULL;
+        CHECK_OK(wfs_store_open(rstore, &r));
+        size_t rsn = 1, rwn = 1;
+        wfs_snapshot_rec rrecs[2];
+        wfs_world_rec rwrecs[2];
+        CHECK_OK(wfs_snapshot_list(r, rrecs, 2, &rsn));
+        CHECK_OK(wfs_world_list(r, 0, rwrecs, 2, &rwn));
+        CHECK(rsn == 0 && rwn == 0);
+        wfs_id rsid = 0;
+        wfs_snapshot_opts ropts;
+        memset(&ropts, 0, sizeof ropts);
+        ropts.name = "retry";
+        char rsrc[4096], rfile[4096];
+        join(rsrc, sizeof rsrc, root, "retry-src");
+        CHECK(mkdir(rsrc, 0755) == 0);
+        join(rfile, sizeof rfile, rsrc, "a.txt");
+        write_file(rfile, "one file is enough\n");
+        CHECK_OK(wfs_snapshot_create(r, rsrc, &ropts, &rsid));
+        CHECK(rsid == 1);                 // ids start where a new store's ids start
+        wfs_store_close(r);
+        CHECK(stat(rdb, &rst) == 0 && rst.st_size > 0);
+
+        // ... and the one thing that must NOT follow from any of it: the same zero-length
+        // database in a store that HAS trees is still damage, and it is still the tree guard
+        // (store_layout) that says so, before this open reaches SQLite at all.
+        int rtfd = open(rdb, O_WRONLY | O_TRUNC);
+        CHECK(rtfd >= 0 && close(rtfd) == 0);
+        CHECK(stat(rdb, &rst) == 0 && rst.st_size == 0);
+        r = NULL;
+        CHECK_RC(wfs_store_open(rstore, &r), WFS_E_STORE_DAMAGED);
+        CHECK(r == NULL);
+        char rsnap[4096];
+        snprintf(rsnap, sizeof rsnap, "%s/snapshots/S%llu", rstore, (unsigned long long)rsid);
+        CHECK(chmod(rsnap, 0700) == 0); // so the test's own rm_rf can clear it
+
+        // ... and a file with SOMETHING in it, in a store with no trees at all. A failed create
+        // does not produce this: SQLite's open(O_CREAT) leaves zero bytes, and the first thing
+        // it ever writes is a whole page. A short file or a wrong magic is therefore somebody
+        // else's file sitting on the database's name, and that stays WFS_E_STORE_DAMAGED.
+        char sstore[4096], sdb[4096];
+        join(sstore, sizeof sstore, root, "short-db-store");
+        CHECK(mkdir(sstore, 0755) == 0);
+        join(sdb, sizeof sdb, sstore, "metadata3.db");
+        {
+            int sfd = open(sdb, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            CHECK(sfd >= 0);
+            CHECK(write(sfd, "SQLite format 3", 16) == 16);   // 16 of the 100 header bytes
+            CHECK(close(sfd) == 0);
+        }
+        wfs_store *sp = NULL;
+        CHECK_RC(wfs_store_open(sstore, &sp), WFS_E_STORE_DAMAGED);
+        CHECK(sp == NULL);
+        write_file(sdb, "this is not a database, and it is not empty either\n");
+        sp = NULL;
+        CHECK_RC(wfs_store_open(sstore, &sp), WFS_E_STORE_DAMAGED);
+        CHECK(sp == NULL);
+    }
+
+    // ---- PR #8 review, round 2: a quota is not a full volume --------------------------------
+    //
+    // EDQUOT and ENOSPC arrive at the same call sites and mean different things: a per-user or
+    // per-group disk quota can be exhausted with the volume half empty, and "free space on this
+    // volume" is then advice that does nothing. (The APFS *volume* quota measured on 2026-09-21
+    // reports ENOSPC and never EDQUOT, so EDQUOT here is the classic per-user/group kind.) So
+    // the verdict keeps them apart, and the CLI has something true to say about each.
+    {
+        char qstore[4096], qsrc[4096], qfile[4096];
+        join(qstore, sizeof qstore, root, "quota-store");
+        join(qsrc, sizeof qsrc, root, "quota-src");
+        CHECK(mkdir(qsrc, 0755) == 0);
+        join(qfile, sizeof qfile, qsrc, "a.txt");
+        write_file(qfile, "one file is enough\n");
+        wfs_store *q = NULL;
+        CHECK_OK(wfs_store_open(qstore, &q));
+        wfs_id qsid = 0;
+        wfs_snapshot_opts qopts;
+        memset(&qopts, 0, sizeof qopts);
+        qopts.name = "quota";
+        CHECK_OK(wfs_snapshot_create(q, qsrc, &qopts, &qsid));
+        wfs_store_close(q);
+
+        q = NULL;
+        wfs_test_db_open_fail_once = SQLITE_IOERR;
+        wfs_test_db_system_errno = EDQUOT;
+        CHECK_RC(wfs_store_open(qstore, &q), -EDQUOT);
+        CHECK(q == NULL);
+        CHECK(wfs_test_db_system_errno == 0);           // the seam fired
+        q = NULL;
+        wfs_test_db_open_fail_once = SQLITE_IOERR;
+        wfs_test_db_system_errno = ENOSPC;
+        CHECK_RC(wfs_store_open(qstore, &q), -ENOSPC);
+        CHECK(q == NULL);
+        // ... and neither of them is ever damage, on a database that is right there.
+        q = NULL;
+        CHECK_OK(wfs_store_open(qstore, &q));
+        wfs_store_close(q);
+        CHECK(strcmp(wfs_strerror(-EDQUOT), strerror(EDQUOT)) == 0);
+        char qsnap[4096];
+        snprintf(qsnap, sizeof qsnap, "%s/snapshots/S%llu", qstore, (unsigned long long)qsid);
+        CHECK(chmod(qsnap, 0700) == 0); // so the test's own rm_rf can clear it
     }
 
     // ---- PR #1 review (3rd round): a pthread_create that fails for one slot and not the next --
@@ -6790,6 +7105,40 @@ int main(int argc, char **argv) {
         CHECK(nlink_of(vdb3) == 1);
         CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
         CHECK(unlink(g_r37_guard_stub) == 0);
+
+        // ---- PR #8 review (round 3): out of room in the middle of the upgrade --------------
+        //
+        // What the -ENOSPC message promises the user is that the command can simply be run
+        // again, and this is the path where most has already been done when the room runs out:
+        // VERSION has been rewritten to 3, the journal mode has been switched, the database has
+        // been exchanged into its new name and the old name is the stub -- and the migration
+        // has NOT committed. So the verdict has to be -ENOSPC (not damage, and not "somebody
+        // else has it open"), the store has to be left standing exactly as it is, and the next
+        // open has to carry on from there with every row where it was.
+        store_as_m1(vstore, 0);
+        db_exec(vdb, "INSERT INTO worlds(id,name,created_at) VALUES(1,'r8a',1);"
+                     "INSERT INTO worlds(id,name,created_at) VALUES(2,'r8b',2);");
+        CHECK(db_i64(vdb, "SELECT count(*) FROM worlds") == 2);
+        wfs_test_after_db_move = r8_fail_after_move;
+        vs = NULL;
+        CHECK_RC(wfs_store_open(vstore, &vs), -ENOSPC);
+        wfs_test_after_db_move = NULL;
+        CHECK(vs == NULL);
+        CHECK(wfs_test_db_open_fail_once == 0);          // the seam fired
+        // The move stands, un-migrated, and both rows are in it.
+        CHECK(stat(vdb, &vst0) == 0 && S_ISDIR(vst0.st_mode));
+        CHECK(stat(vdb3, &vst0) == 0 && S_ISREG(vst0.st_mode));
+        CHECK(nlink_of(vdb3) == 1);
+        CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA_M1);
+        CHECK(db_i64(vdb3, "SELECT count(*) FROM worlds") == 2);
+        CHECK(read_file(vver, vbuf, sizeof vbuf) == 0 && atoi(vbuf) == WFS_STORE_SCHEMA);
+        // ... and the same command, run again, finishes it.
+        vs = NULL;
+        CHECK_OK(wfs_store_open(vstore, &vs));
+        wfs_store_close(vs);
+        CHECK(db_user_version(vdb3) / 100 == WFS_STORE_SCHEMA);
+        CHECK(db_i64(vdb3, "SELECT count(*) FROM worlds") == 2);
+        for (size_t i = 0; i < kAddedN; ++i) CHECK(db_has_column(vdb3, kAdded[i][0], kAdded[i][1]));
     }
     // ---- PR #1 review (25th round, P1): a trash entry is the row's tree, not the row's name --
     //
