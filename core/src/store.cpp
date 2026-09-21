@@ -39,6 +39,7 @@ extern "C" const char *wfs_test_stmt_fail_sql = nullptr;
 // that is not a test, and nothing in the library ever assigns it. Read by wfs::Txn in db.h.
 extern "C" int wfs_test_txn_fail_once = 0;
 extern "C" int wfs_test_db_open_fail_once = 0;
+extern "C" int wfs_test_db_system_errno = 0;
 
 // The gap between the database's move and its migration (PR #1 review, 35th round): the stub is
 // in place, the holder gate has passed, nothing has been migrated yet. NULL in every run that is
@@ -754,12 +755,9 @@ int db_header_shape(const char *path) {
 // therefore a size, with room over that measurement rather than a hair's breadth: guessing high
 // costs a truthful "this volume is full" on a store that had some other I/O error with 32 MiB
 // free, and guessing low costs -EIO, which is what this path answered before.
-bool volume_out_of_space(int ext, sqlite3 *h, const char *dir) {
+bool volume_out_of_space(int ext, int se, const char *dir) {
     if ((ext & 0xff) == SQLITE_FULL) return true;
-    if (h) {
-        int se = sqlite3_system_errno(h);
-        if (se == ENOSPC || se == EDQUOT) return true;
-    }
+    if (se == ENOSPC || se == EDQUOT) return true;
     struct statfs fs;
     if (::statfs(dir, &fs) != 0) return false;
     return (uint64_t)fs.f_bavail * (uint64_t)fs.f_bsize < kNoSpaceCeiling;
@@ -800,6 +798,13 @@ int open_failure_verdict(const char *dir, const char *dbp, sqlite3 *h, int rc, b
         if (e != SQLITE_OK) ext = e;
         else if (ext == SQLITE_OK || ext == SQLITE_DONE || ext == SQLITE_ROW) ext = SQLITE_ERROR;
     }
+    int se = h ? sqlite3_system_errno(h) : 0;
+    if (wfs_test_db_system_errno) {
+        // The test seam (worldfs.h). 0 in every run that is not a test, so this is one
+        // predictable branch on an int that is never written.
+        se = wfs_test_db_system_errno;
+        wfs_test_db_system_errno = 0;
+    }
     int prim = ext & 0xff;
     // SQLite read the file and rejected it: that is P17's shape, whatever else is wrong.
     if (prim == SQLITE_NOTADB || prim == SQLITE_CORRUPT) return WFS_E_STORE_DAMAGED;
@@ -812,7 +817,7 @@ int open_failure_verdict(const char *dir, const char *dbp, sqlite3 *h, int rc, b
     if (prim == SQLITE_BUSY || prim == SQLITE_LOCKED || prim == SQLITE_NOMEM ||
         prim == SQLITE_READONLY)
         return wfs::map_sqlite(prim);
-    if (volume_out_of_space(ext, h, dir)) return -ENOSPC;
+    if (volume_out_of_space(ext, se, dir)) return -ENOSPC;
     if (shape < 0) return shape;   // we could not even read the header: that errno, not a guess
     return -EIO;
 }

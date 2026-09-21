@@ -240,9 +240,15 @@ static void check_cli_message(const char *world_bin, const char *store) {
     CHECK(strstr(out, "mv ") == NULL);
     CHECK(strstr(out, "restore metadata3.db") == NULL);
     CHECK(strstr(out, "free space") != NULL);
-    // ... and it claims nothing about the database it could not open beyond this, which is true
-    // of a store that has one and of a brand new store that has not got one yet.
-    CHECK(strstr(out, "nothing here was created, changed or removed") != NULL);
+    // ... and what it claims about the store has to be true of EVERY store it can be printed
+    // for. "nothing here was created, changed or removed" is not: by the time the open fails,
+    // it may itself have made the store directory, VERSION, the subdirectories, upgrade.lock or
+    // a zero-length metadata3.db. What is true in every case is that nothing that was ALREADY
+    // there was touched, and that a half-made new store is finished by running the same command
+    // again.
+    CHECK(strstr(out, "nothing here was created, changed or removed") == NULL);
+    CHECK(strstr(out, "nothing that was already here was changed or removed") != NULL);
+    CHECK(strstr(out, "finishes the setup") != NULL);
 }
 
 static void check_integrity(const char *store) {

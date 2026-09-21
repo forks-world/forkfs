@@ -3273,6 +3273,50 @@ int main(int argc, char **argv) {
         CHECK(sp == NULL);
     }
 
+    // ---- PR #8 review, round 2: a quota is not a full volume --------------------------------
+    //
+    // EDQUOT and ENOSPC arrive at the same call sites and mean different things: a per-user or
+    // per-group disk quota can be exhausted with the volume half empty, and "free space on this
+    // volume" is then advice that does nothing. (The APFS *volume* quota measured on 2026-09-21
+    // reports ENOSPC and never EDQUOT, so EDQUOT here is the classic per-user/group kind.) So
+    // the verdict keeps them apart, and the CLI has something true to say about each.
+    {
+        char qstore[4096], qsrc[4096], qfile[4096];
+        join(qstore, sizeof qstore, root, "quota-store");
+        join(qsrc, sizeof qsrc, root, "quota-src");
+        CHECK(mkdir(qsrc, 0755) == 0);
+        join(qfile, sizeof qfile, qsrc, "a.txt");
+        write_file(qfile, "one file is enough\n");
+        wfs_store *q = NULL;
+        CHECK_OK(wfs_store_open(qstore, &q));
+        wfs_id qsid = 0;
+        wfs_snapshot_opts qopts;
+        memset(&qopts, 0, sizeof qopts);
+        qopts.name = "quota";
+        CHECK_OK(wfs_snapshot_create(q, qsrc, &qopts, &qsid));
+        wfs_store_close(q);
+
+        q = NULL;
+        wfs_test_db_open_fail_once = SQLITE_IOERR;
+        wfs_test_db_system_errno = EDQUOT;
+        CHECK_RC(wfs_store_open(qstore, &q), -EDQUOT);
+        CHECK(q == NULL);
+        CHECK(wfs_test_db_system_errno == 0);           // the seam fired
+        q = NULL;
+        wfs_test_db_open_fail_once = SQLITE_IOERR;
+        wfs_test_db_system_errno = ENOSPC;
+        CHECK_RC(wfs_store_open(qstore, &q), -ENOSPC);
+        CHECK(q == NULL);
+        // ... and neither of them is ever damage, on a database that is right there.
+        q = NULL;
+        CHECK_OK(wfs_store_open(qstore, &q));
+        wfs_store_close(q);
+        CHECK(strcmp(wfs_strerror(-EDQUOT), strerror(EDQUOT)) == 0);
+        char qsnap[4096];
+        snprintf(qsnap, sizeof qsnap, "%s/snapshots/S%llu", qstore, (unsigned long long)qsid);
+        CHECK(chmod(qsnap, 0700) == 0); // so the test's own rm_rf can clear it
+    }
+
     // ---- PR #1 review (3rd round): a pthread_create that fails for one slot and not the next --
     //
     // Both parallel loops in the core wrote the handle to th[i] while `started` merely counted,

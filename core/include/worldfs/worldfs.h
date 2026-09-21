@@ -1151,6 +1151,14 @@ extern int wfs_test_txn_fail_once;
  * to 0. 0 in every run that is not a test; nothing in the library ever assigns it a value. */
 extern int wfs_test_db_open_fail_once;
 
+/* ... and the system errno that open is to be treated as having failed with. The verdict above
+ * asks sqlite3_system_errno() to tell a full volume (ENOSPC) from an exhausted per-user or
+ * per-group disk quota (EDQUOT), which are different conditions with different advice -- and a
+ * test cannot make SQLite report either one without a real volume or a real quota. Set this to
+ * the errno the next store open's verdict is to see; it is read once and cleared back to 0.
+ * 0 in every run that is not a test; nothing in the library ever assigns it a value. */
+extern int wfs_test_db_system_errno;
+
 /* And the one xattr rule a test cannot drive from outside (PR #1 review, 9th round). The default
  * diff leaves com.apple.provenance out of the comparison, and provenance is precisely the name a
  * test cannot make differ: the kernel stamps it on every file this process creates, with the
