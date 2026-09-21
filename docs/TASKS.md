@@ -3296,3 +3296,25 @@ open 停在 `snapshots/` 的第一个 `mkdir(2)` 上、根本走不到 SQLite �
 行为,不是判据本身;判据那一半由 `core_test` 的测试缝钉。失败的 create 留下的零长度库**不需要清理**:
 `store_layout()` 把 size 0 读作「没有可读的库」,而一个没有树的 store 就只是个新 store,
 下一次 open 直接把它变成一个普通的新 store(`core_test` 钉了这一条和它留下的那一个库)。
+
+**同一类的第三处(PR #8 review,`ff72c7b` + `6bd79e9`)**:上面那个「零长度的 `metadata3.db`」
+在**卷还满着**的时候没有消失,于是**第二条命令**踩了同一个坑。`store_layout()` 的
+`lay.db_existed = (nrc == 0)` 问的是**名字在不在**——这是 2→3 升级协议要问的那个问题
+(这里有没有一个 inode 要闸、要 link、要数链接数);判据借用了它,于是重试时读成「这儿本来有个库」,
+看到一个短过文件头的文件,又报 `WFS_E_STORE_DAMAGED`:第一次 `world fs init` 说
+"no space left on device",紧接着的第二次说「把目录挪开」。
+
+修法:布局同时记两件事,名字分开。`db_existed` **一字不动**(升级路径和 M1 持有者闸门读的还是它),
+新增 `db_had_content`——两个名字下的 `st_size > 0`,**在搬库之前**读,所以「宣布搬完」那个分支
+不用对它说任何话;判据收的是 `db_had_content`。**零长度不是丢了的库,是没做完的创建**,
+卷拒绝多少次它都还是这个。这掩盖不了真的损坏:`store_layout()` 本来就把零长度读作「库不可读」,
+**有树**的 store 在这次 open 碰到 SQLite 之前就已经被那道守卫以 `WFS_E_STORE_DAMAGED` 拒了——
+守卫原样保留,而 `db_had_content` 有意就是那道守卫自己的尺寸判据减去 `access(2)`。
+**有字节**的文件判法不变:失败的创建留下的是零字节,绝不会是半个文件头(SQLite 第一次写就是
+一整页),所以短文件和 magic 不对的文件,是别人的文件占了库的名字。
+
+先验证会红:`core_test.cpp:3208`(第一次重试)在未修复的代码上
+`wfs_store_open(rstore, &r) -> -1017 … wanted -28`。测试先断言第一次失败**确实**留下了那个
+零长度文件(不然整条用例是空跑),然后把邻居一并盖住:再 `SQLITE_FULL` 三次(每次 `-ENOSPC`)、
+空间充足时的 `SQLITE_IOERR`(`-EIO`)、失败消失后 open 成功且 id 从 1 发、**有树**时同一个零长度库
+仍然 `WFS_E_STORE_DAMAGED`、空 store 里 16 字节和 magic 不对的文件仍然 `WFS_E_STORE_DAMAGED`。
