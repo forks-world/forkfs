@@ -100,6 +100,39 @@ static int fail(const char *what, int rc) {
 }
 
 // A refusal with a remedy: one line of reason, one line of what to run instead.
+// ---- the one thing every failed store open may promise -------------------------------------
+//
+// Shared by both branches of the open's error ladder -- the volume/quota one and the generic
+// errno one -- because two copies of a guarantee drift, and every round of the PR #8 review has
+// been a clause that was true of the path somebody had in mind and false of another. What
+// survived all of them is this:
+//
+//   * nothing was LOST. Not "nothing was created": by the time an open fails it may itself have
+//     made the store directory, VERSION, the six subdirectories, upgrade.lock or the zero-length
+//     metadata3.db SQLite's open(O_CREAT) leaves. Not "nothing was changed" either: opening a
+//     schema-2 store rewrites its VERSION, switches its journal mode and exchanges its database
+//     into the schema-3 name, and the trashing_recover() that ends every open resolves the rows
+//     a killed `discard` left behind one transaction per row. Not "nothing was deleted": step 4
+//     of that move drops the extra hard link it made.
+//   * an unreadable store was never taken for an EMPTY one (P17, 13th round). That is the rule
+//     the readdir guard exists for, and it holds whatever failed: no id was handed out and no
+//     database was created over trees this command could not see.
+//   * every half-finished state an open can leave is one the next open resumes from --
+//     store_layout()'s table is what makes that true -- so the same command is the whole of the
+//     repair, and moving or rebuilding the store is never it.
+static void open_guarantee(void) {
+    fprintf(stderr,
+            "  no snapshot, no World and no record in the store's database was lost, and a "
+            "store this command could not read was never taken for an empty one: no id was "
+            "handed out and no database was created over trees it could not see (P17).\n"
+            "  whatever this command had already done -- the directories and empty files of a "
+            "new store, the first steps of bringing an older store up to the current layout, or "
+            "finishing off a discard an earlier command was killed in the middle of -- is safe "
+            "to leave exactly as it is: the same command carries on from there. This is not "
+            "damage: do not move this directory aside, do not start a new store, and do not "
+            "recover anything from a backup.\n");
+}
+
 static int refuse(const char *reason, const char *hint) {
     fprintf(stderr, "world: %s\n", reason);
     if (hint) fprintf(stderr, "  try: %s\n", hint);
@@ -1928,8 +1961,11 @@ int main(int argc, char **argv) {
                            "metadata.db open.\n"
                            "  Taking it to schema %d behind a handle that is already open would "
                            "leave that process able to run an older collector over this store's "
-                           "trash, so nothing was migrated and the store was left as it was.",
-                           sd, WFS_STORE_SCHEMA_M1, WFS_STORE_SCHEMA);
+                           "trash, so the database was not migrated and no row in it was "
+                           "changed. (Its VERSION file may already say %d -- that is the door "
+                           "being shut on older builds, and the next run carries on from "
+                           "there.)",
+                           sd, WFS_STORE_SCHEMA_M1, WFS_STORE_SCHEMA, WFS_STORE_SCHEMA);
         // snprintf reports what it WOULD have written, so a truncated first part must not be
         // appended to past the end of the buffer.
         if (off < 0 || (size_t)off >= sizeof why) off = (int)sizeof why - 1;
@@ -1994,29 +2030,10 @@ int main(int argc, char **argv) {
                     "  a disk quota for this user or group on the volume that holds the store "
                     "is exhausted, so this command could not write what it needed to. The "
                     "volume itself may have plenty of room; the quota is what ran out.\n");
-        // What is guaranteed. NOT "nothing was created": by the time this open failed it may
-        // itself have made the store directory, VERSION, the subdirectories, upgrade.lock or a
-        // zero-length metadata3.db (PR #8 review, round 2). NOT "nothing that was already here
-        // was changed" either (round 3): opening a SCHEMA-2 store rewrites its VERSION, switches
-        // its journal mode and exchanges its database into the schema-3 name before it can run
-        // out of room, and the trashing_recover() that ends every open resolves the rows a
-        // killed `discard` left behind one transaction per row, so some of them can be written
-        // when a later one fails. (The migration itself is not a third case: it is one
-        // transaction, and its only way to end here is a COMMIT that failed and rolled back.)
-        //
-        // What holds on EVERY path that can reach this line is that nothing was LOST, and that
-        // every half-finished state this open can leave is one the next open resumes from --
-        // store_layout()'s table is what makes that true, and core_test drives the longest of
-        // them (out of room with the move done and the migration not committed).
-        fprintf(stderr,
-                "  no snapshot, no World and no record in the store's database was lost. "
-                "Whatever this command had already done when it ran "
-                "out of room -- the directories and empty files of a new store, the first steps "
-                "of bringing an older store up to the current layout, or finishing off a "
-                "discard that an earlier command was killed in the middle of -- is safe to "
-                "leave exactly as it is: the same command carries on from there once there is "
-                "room. This is not damage: do not move this directory aside, do not start a new "
-                "store, and do not recover anything from a backup.\n");
+        // The guarantee is the shared one (open_guarantee above): every clause that was
+        // specific to running out of room turned out to be false of some other path, and the
+        // generic errno branch below owes the user exactly the same promise.
+        open_guarantee();
         char hint[WFS_PATH_MAX + 128];
         if (rc == -ENOSPC)
             snprintf(hint, sizeof hint, "free space on the volume that holds %s (`df -h %s`)",
@@ -2028,19 +2045,47 @@ int main(int argc, char **argv) {
         return EX_ERR;
     }
     // P17, and PR #1 review (13th round): the guard above needs three readdirs to know whether
-    // this store still holds trees, and a `snapshots/` it cannot open answers nothing. The core
-    // returns that errno rather than guessing "empty", so nothing was created and nothing was
-    // touched -- which is worth saying, because the same errno from any other step of the open
-    // means the same thing here: stop, fix the access, try again.
+    // this store still holds trees, and a `snapshots/` it cannot open answers nothing -- the
+    // core returns that errno rather than guessing "empty".
+    //
+    // PR #8 review (round 4): and that guard is no longer the only place these errnos come from.
+    // This branch used to answer all four of them with "nothing was created ... no metadata3.db
+    // and no store id were made here", which was written for the guard and is false for the
+    // rest:
+    //   * -EACCES / -EPERM / -ENOTDIR: early (fs_mkdir_p and fs_realpath on the store path,
+    //     check_version, the two stat(2)s in store_layout, the guard's three readdirs) AND late
+    //     (the six subdirectory mkdirs, upgrade.lock, the mkdir/link/rename of the schema-2
+    //     move, db_stub_make, the 16-byte header read the P17 verdict makes);
+    //   * -EIO: early (check_version's read, readdir(3)) AND late -- every site the ENOSPC work
+    //     touched, where SQLite failed on a database whose header is intact and the verdict is
+    //     "the read failed, the file is not wrong", plus migrate_schema, the store id's
+    //     meta_set, and the trashing_recover that ends every open.
+    // So the promise is the shared one, and the hint is the one that fits the errno: "fix the
+    // permissions" is no advice at all for a SQLite I/O error.
     if (rc) {
         fprintf(stderr, "world: open store %s: %s\n", sd, wfs_strerror(rc));
-        if (rc == -EACCES || rc == -EPERM || rc == -EIO || rc == -ENOTDIR)
+        char hint[WFS_PATH_MAX + 160];
+        hint[0] = 0;
+        if (rc == -EACCES || rc == -EPERM || rc == -ENOTDIR) {
             fprintf(stderr,
-                    "  nothing was created: a store that cannot be read is not an empty store "
-                    "(P17), so no metadata3.db and no store id were made here.\n"
-                    "  try: fix the permissions on %s (or mount the volume it is on) and run the "
-                    "command again\n",
+                    "  the store could not be read: something under %s could not be opened, or "
+                    "one of its names is not the kind of thing it has to be.\n",
                     sd);
+            snprintf(hint, sizeof hint,
+                     "fix the permissions on %s (or mount the volume it is on)", sd);
+        } else if (rc == -EIO) {
+            fprintf(stderr,
+                    "  an I/O error -- from the volume the store is on, or from SQLite reading "
+                    "the store's database. The database was NOT judged to be damaged: what "
+                    "failed is the reading of it, not the file itself.\n");
+            snprintf(hint, sizeof hint,
+                     "check the volume that holds %s (the system log, `diskutil verifyVolume`)",
+                     sd);
+        }
+        if (hint[0]) {
+            open_guarantee();
+            fprintf(stderr, "  try: %s and run the same command again\n", hint);
+        }
         return EX_ERR;
     }
 
