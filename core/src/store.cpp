@@ -768,17 +768,29 @@ bool volume_out_of_space(int ext, sqlite3 *h, const char *dir) {
 // The verdict itself. `rc` is what SQLite returned, `h` the connection it returned it on (which
 // carries the extended code and the system errno), `dbp` the database file and `dir` the store.
 //
-// `db_existed` is the layout's answer from BEFORE this open touched anything (store_layout), and
-// it is passed in rather than read off the file afterwards, because afterwards is too late: a
-// database we could not CREATE is not a database that is damaged either. The main open carries
+// `db_had_content` is the layout's answer from BEFORE this open touched anything (store_layout),
+// and it is passed in rather than read off the file afterwards, because afterwards is too late:
+// a database we could not CREATE is not a database that is damaged either. The main open carries
 // SQLITE_OPEN_CREATE, so a store that has no database yet fails there on a full volume -- and
 // what is at that name by then is nothing at all, or the zero-length file SQLite's open(O_CREAT)
 // made before it ran out of room. Both are "absent or shorter than a header", which is P17's
 // shape; over an empty store it is a lie, and `world fs init` printed "move the directory aside"
-// for it. P17's own guard has already run by then: store_layout() refuses a store that has TREES
-// and no readable database before the open is even reached, so what is left here is the store
-// that has neither, and the only true thing to say about it is what stopped us.
-int open_failure_verdict(const char *dir, const char *dbp, sqlite3 *h, int rc, bool db_existed) {
+// for it.
+//
+// PR #8 review: and it is CONTENT that is asked about, not the name. The zero-length file the
+// first attempt leaves is still there on the second one, so a verdict that keyed on the name
+// said "no space left on device" to the first `world fs init` and "move the directory aside" to
+// the one right after it. A zero-length metadata3.db is not a database that was lost, it is a
+// create that did not finish, and it stays that way however many times the volume refuses.
+//
+// This cannot hide real damage, because P17's own guard has already run: store_layout() reads a
+// zero-length database as "not readable" and refuses a store that has TREES and no readable
+// database -- with WFS_E_STORE_DAMAGED, before the open is even reached. What is left down here
+// is the store that has neither trees nor a database, and the only true thing to say about it is
+// what stopped us. Anything with BYTES in it is a different matter and keeps the old verdict: a
+// failed create leaves zero bytes, never a partial header (SQLite's first write is a whole
+// page), so a short file or a wrong magic is somebody else's file on the database's name.
+int open_failure_verdict(const char *dir, const char *dbp, sqlite3 *h, int rc, bool db_had_content) {
     int ext = rc;
     if (h) {
         int e = sqlite3_extended_errcode(h);
@@ -792,10 +804,10 @@ int open_failure_verdict(const char *dir, const char *dbp, sqlite3 *h, int rc, b
     // SQLite read the file and rejected it: that is P17's shape, whatever else is wrong.
     if (prim == SQLITE_NOTADB || prim == SQLITE_CORRUPT) return WFS_E_STORE_DAMAGED;
     int shape = db_header_shape(dbp);
-    // "Positively not a database" is a verdict only about a database that WAS there. For one
-    // this open was going to create, absence and a zero-length file are what a create that never
-    // finished leaves, and neither is damage.
-    if (shape == 0 && db_existed) return WFS_E_STORE_DAMAGED;
+    // "Positively not a database" is a verdict only about a database that WAS there, with bytes
+    // in it. For one this open was going to create -- or finish creating -- absence and a
+    // zero-length file are what a create that never got there leaves, and neither is damage.
+    if (shape == 0 && db_had_content) return WFS_E_STORE_DAMAGED;
     // ... and these say what they are. None of them is "the file is not a database".
     if (prim == SQLITE_BUSY || prim == SQLITE_LOCKED || prim == SQLITE_NOMEM ||
         prim == SQLITE_READONLY)
@@ -1164,6 +1176,13 @@ struct StoreLayout {
     bool stub_needed = false;    // the stub is owed on its own: there is nothing to exchange it
                                  // with, because nothing at all is at the M1 name
     bool db_existed = false;     // metadata3.db was there before this open touched anything
+    // ... and it had BYTES in it. Not the same question, and the difference is a whole class of
+    // misdiagnosis (PR #8 review): SQLite's open(O_CREAT) makes the file before it writes a
+    // page, so a create that ran out of room leaves a zero-length database behind -- the NAME
+    // exists and no database ever did. `db_existed` is what the upgrade protocol asks (is there
+    // an inode here to gate, to link, to count links of); this is what the P17 verdict asks
+    // (was there a database here to be damaged). See open_failure_verdict().
+    bool db_had_content = false;
     bool sweep_needed = false;   // an interrupted move may have left something under the stub
                                  // prefix: a stub it never exchanged, or a link it never dropped
     uint64_t db_ino = 0;         // metadata3.db's inode, so the sweep can tell that extra link
@@ -1194,6 +1213,12 @@ int store_layout(const char *dir, StoreLayout &lay) {
     lay.move_needed = old_reg;
     lay.stub_needed = orc != 0;   // nothing at the M1 name at all: a mkdir is the whole of it
     lay.db_existed = nrc == 0;
+    // Under either name, because the store's database is under either name until the move is
+    // done -- and this is read BEFORE the move, so the branch below that declares the move
+    // finished does not have to say anything about it. It is deliberately the same size test
+    // the P17 guard just below makes, minus the access(2): a store whose database has content
+    // is exactly a store whose trees that guard would have refused for.
+    lay.db_had_content = (nrc == 0 && nst.st_size > 0) || (old_reg && ost.st_size > 0);
     lay.db_ino = nrc == 0 ? (uint64_t)nst.st_ino : 0;
     // A second link to the database is one an interrupted move left under the stub prefix --
     // st_nlink is what says so without a readdir on the ordinary path, where there is none.
@@ -1561,7 +1586,7 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
         wfs_test_db_open_fail_once = 0;
     }
     if (rc != SQLITE_OK) {
-        int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, rc, lay.db_existed);
+        int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, rc, lay.db_had_content);
         wfs_store_close(s);
         return v;
     }
@@ -1588,7 +1613,7 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
         // damaged either, and on a full volume this is the step that fails first, because WAL
         // needs a `-shm` before it can give anybody page 1 (open_failure_verdict above).
         if (!q.ok() || !q.row()) {
-            int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, q.err(), lay.db_existed);
+            int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, q.err(), lay.db_had_content);
             wfs_store_close(s);
             return v;
         }
@@ -1662,7 +1687,7 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
             // came back WFS_E_STORE_BUSY and reverted a store that was already schema 3.
             Stmt q2(s->db, "PRAGMA user_version");
             if (!q2.ok() || !q2.row()) {
-                int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, q2.err(), lay.db_existed);
+                int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, q2.err(), lay.db_had_content);
                 wfs_store_close(s);
                 return v;
             }
@@ -1674,7 +1699,7 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
         }
     }
     if (int prc = sqlite3_exec(s->db, kPragmas, nullptr, nullptr, nullptr)) {
-        int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, prc, lay.db_existed);
+        int v = open_failure_verdict(s->dir.c_str(), dbp.c_str(), s->db, prc, lay.db_had_content);
         wfs_store_close(s);
         return v;
     }
