@@ -3271,3 +3271,28 @@ store 是 WAL,SQLite 连**读**都要先建 `-shm`,满卷上建不出来(`SQLITE
 **验收**:`ctest` **2/2**;`check-deps.sh` 全绿(没有新依赖,`statfs(2)` 在 libSystem 里);
 `safety.sh` **298 passed, 0 failed**;`test_disk_full_wrapper.py` **12/12**;
 `disk_full.py` 通过。
+
+**同一类的第二处(review 跟进,`5db1038` + `b01695c`)**:一个**全新的、还没有库的 store**,
+在满卷上打开。主 open 带着 `SQLITE_OPEN_CREATE`,于是失败发生在**创建**上,而那个名字上此时
+要么什么都没有,要么是 SQLite 的 `open(O_CREAT)` 在没空间之前留下的**零长度文件**——两者都是
+「不在,或者短过文件头」,正是 P17 的形状;于是 `world fs init` 在满卷上说的是
+「这个 store 还有树…把目录挪开」,而它是空的,也从来没坏过。
+**「创建不出来的库,也不等于坏掉的库。」**
+
+修法:`open_failure_verdict()` 多收一个 `db_existed`——`store_layout()` 在这次 open 动任何东西
+**之前**记下的事实,**显式传进来**,不是事后去 stat 猜(事后已经晚了)。「确实不是一个库」这个判断
+**只对本来就在那儿的库**成立;对一个这次 open 打算创建的库,「不在」和「零长度」是一次没做完的
+创建留下的样子。`SQLITE_NOTADB` / `SQLITE_CORRUPT` 不动;schema 2→3 那两个 helper 的站点一律
+传 `true`(它们只对「布局认定是普通文件的 `metadata.db`」调用,在那里「被人搬走了」仍然是损坏)。
+P17 一点都没松:有树而库读不出来的 store,`store_layout()` 在 open 之前就已经挡掉了,
+落到这四个站点上的只剩「既没树也没库」的那一种。CLI 的 `-ENOSPC` 文案原来断言
+"the database itself is intact",对一个还没有库的 store 是假话——改成两种情况下都成立的说法:
+这里什么都没建没改没删,**本来就在的** `metadata3.db` 没有被碰过。
+
+先验证会红:`core_test.cpp:3151` 在未修复的代码上
+`wfs_store_open(fstore, &f) -> -1017 … wanted -28`。
+`disk_full_test` 里那条端到端的(满卷上打开一个空 store 目录)**修复前就是绿的**——真·满卷会让这次
+open 停在 `snapshots/` 的第一个 `mkdir(2)` 上、根本走不到 SQLite 的 create,所以它钉的是 CLI 可见的
+行为,不是判据本身;判据那一半由 `core_test` 的测试缝钉。失败的 create 留下的零长度库**不需要清理**:
+`store_layout()` 把 size 0 读作「没有可读的库」,而一个没有树的 store 就只是个新 store,
+下一次 open 直接把它变成一个普通的新 store(`core_test` 钉了这一条和它留下的那一个库)。
