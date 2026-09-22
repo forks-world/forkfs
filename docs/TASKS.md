@@ -3411,3 +3411,61 @@ store **不是**原样;改成「库没有迁移、库里一行都没改」,并�
 输出里正是那句 "nothing was created … no metadata3.db and no store id were made here"。
 **后期 `-EIO` 的 CLI 文案没有加测试**:CLI 到 core 的 open 之间没有缝,而为此加一个生产环境
 的开关是不划算的;后期 `-EIO` 这条判据本身在 core 层已经钉住(`SQLITE_IOERR` → `-EIO`)。
+
+---
+
+## CI 间歇性失败:两条 flake,一条产品崩溃,一个路径拼写问题(`test/deflake-ci`)
+
+macOS 15 arm64 runner 上三次(纯文档提交)红在同一条断言,另有一次红在 `diff_test`。
+两条都不是产品逻辑错,但诊断过程里挖出一个真的 use-after-return。
+
+| 现象 | 机制 | 证据 | 修法 |
+| --- | --- | --- | --- |
+| `safety.sh` "the fallback stopped mid-tree and kept the .deleting name (3 entries left)" | 这次 wake **在返回之前就把后继起好了**,而这一块用 `WORLD_GC_PAUSE_MS=0`,后继立刻开删。`find` 和后面那个 `-d` 是对着一棵**别的进程正在拆的树**做的两次观测:中间隔着一次 `python3` 启动、一个 `ok` 和一个 `grep`。runner 够快、wake 留下的余量够小,链子就在这两次观测之间把树收完了 | 本机量到的观测窗口值 **15 000–17 000 个条目**(12 万棵树:wake 报 freed=6 040,`find` 看到的比"wake 之后该剩的"少 15 000 条)。把树调到一次 wake 差不多能收完的大小(25 586 条目,wake 留下 600–2 600),同一份代码 **旧断言 24/25 红、新断言 0/25 红**;满尺寸 12 万下两者都 0/12 红 —— 这条 flake 要的是**快机器**,不是慢机器 | 改看 wake **自己报的账**:它删了一部分、没删完,这正是"批量上限在一棵树内部生效"。这份账赛不过任何人:worker 在起后继之前就写下它,而脱离出去的后继写的是 `<store>/logs/gc.log`,不是前台这次 wake 的重定向文件。可续性仍由"后继链自己收干净"端到端证明;"停在半路的树保留 `.deleting` 工作名"仍有直接断言 —— 在 undeletable-entry 那条里,它走 `gc --now`,不交接给任何人。旁边 big-1 那条一模一样的竞态一并改掉 |
+| `gc.log` 报 "0 entries unlinked",而这次 wake 刚删了两万多条 | `fs_remove_tree_parallel()` 把自己做不了的全交给 `fs_remove_tree()`,却**没把计数器一起交过去**。树里任何一个读不动的目录都会触发回退,于是最耗时的那些树的工作量一条都没被计入 —— 而 README 让运维去累加的就是这一列 | 本机:一次 1 s 的 wake 实删 24 000 条,日志写 0 | `rm_rec()` 按 `fs_remove_tree_parallel` 已有的契约计数(不含 root 自身),回退路收下同一个计数器 |
+| `diff_test.cpp:1287` `CHECK failed: c.n == 0 && st.full_scan == 0 && st.fallback == WFS_DF_NONE` | 这条断言断的是 **runner 的 fseventsd**,不是 diff:历史重放要等 HistoryDone(本机空载量到 330–370 ms,上限 5 s),卷上的 journal 要还能回溯到 fork 之前,内核不能丢事件。按 P10,这些情况一律退回双树遍历并给出**同一个答案** | 把重放的 history 上限临时收到 300 ms,**完全复现 CI 的症状**(同一条 case、同样早退);答案仍然精确 | `want_events_path()` 接受 MUST_SCAN / DROPPED / WRAPPED / STALE / TIMEOUT / UNSUPPORTED 并把原因打出来;**diff 自己选的** REQUESTED / SMALL_TREE / FROM_WORLD / NO_CURSOR 仍然算红。答案一点没放松:每条 case 后面都无条件 `check_lines()` / `check_exact()`,收尾还会报"这一趟有几条 case 真的走了事件路",免得某台机器上它整个没跑还安静通过 |
+| `world fs diff` 偶发 SIGSEGV(诊断途中发现,**真的产品 bug**) | `on_events()` 写的 `Replay` 和它读的 root 路径都在 `fs_events_replay()` 的**栈上**。`FSEventStreamStop()` / `FSEventStreamInvalidate()` 只是停流,**不等** FSEvents 已经投递到 dispatch queue 上的那一批,于是回调可能在函数返回之后才跑,`strip_root()` 的 `strncmp` 读到一个已经不存在的 `root` | 收紧 history 上限的那个构建(重放在事件还在到的时候放弃 —— 正是生产里 HistoryDone 不来 / MustScanSubDirs / 丢批 这几条路的形状):**5 次跑挂 2 次**,`strncmp` 里 SIGSEGV | 队列是串行的:流 invalidate 之后(此后不会再有新的入队)往队列上 `dispatch_sync` 一次,返回即代表最后一个回调已经返回。同一构建再跑 **8 次,0 次挂** |
+| `safety.sh` 12 条路径比较红,只因为 scratch 路径的**拼法** | README 的 CI 配方 `export TMPDIR=".../build/ci-tmp/"`(尾斜杠是故意的:C++ 测试往它后面接字符串),然后传 `"$TMPDIR/m1test"` = `.../build/ci-tmp//m1test`。这些 case 拿 CLI 打印的路径(已 realpath)和用 `$SCRATCH` 拼出来的字符串比,双斜杠只在一边 | 照 README 原样跑:**286 passed, 12 failed** | `$SCRATCH` 在 m1test 守卫之前就规范化一次,并在顶上自检一句。规范化的是**父目录**,最后一段手工接回去 —— 那一段是本脚本唯一会删的东西,解析它就会跟着别人留下的符号链接去删它指向的地方(已验证:`m1test` 符号链接被当作符号链接删掉,它的目标毫发无损)。默认值从某台机器某个会话的硬编码路径换成 `mktemp -d` 里的 `m1test`;README 改用 `scratch="${TMPDIR}m1test"` |
+
+另外两处**固定时长**的等待也一并换掉。后继链干 `WORLD_GC_BATCH_SECS` 再睡 `WORLD_GC_PAUSE_MS`,
+墙上时间是纯删除时间的两倍,而纯删除时间在忙机器上还要慢好几倍(本机:1 s 的 wake 空载清 ~42k
+条目,重负载下 ~6k)—— 12 万条目的 pool clone 那条 60 s 上限就是这么在重负载下红的,而链子当时
+一切正常。`wait_collected()` 改等**进展**:每次 wake 都往 `<store>/logs/gc.log` 追一行,只要它
+还在长就继续等,连着 30 s 一个字都没写才判红 —— 那才是值得报的失败:链子停了,活还没干完。
+
+`diff_test` 那条还有一层:**单条 case 上"机器一时不灵"和"重放坏了"长得一样,整趟跑下来就不一样**。
+把重放改成永远回 MUST_SCAN(模拟 since-id 一直不对、问错设备、history 永不完成这类回归),
+六条 case 全部退回全树遍历、答案依旧精确 —— 以前这样也是安静通过。现在收尾处
+**`taken == 0` 且 `asked > 0` 判红**,并逐条列出每个站点给的原因;真的没有可用 FSEvents 的机器
+(卷上没有 journal、fseventsd 没跑)用 `WFS_TEST_ALLOW_NO_EVENTS=1` 显式放行 —— 这是测试程序
+自己的环境变量,产品一个字都不读,CI 工作流里**不设**。
+另外 `WFS_DF_WRAPPED` 从"环境造成"里拿掉了:它要么来自 64 位计数器回绕(现实中不会),
+要么来自 `cursor_usable()` 里的 `since > now` —— 一个几毫秒前才 fork 的 world,自己记下的 id
+不可能比卷当前的 id 还新,除非卷的计数器被重置,或者**这个 id 根本不是 `FSEventsGetCurrentEventId()`
+给的**,后者就是本代码自己的错,必须红。留在"环境造成"里的是 TIMEOUT / MUST_SCAN / DROPPED /
+UNSUPPORTED / STALE,逐条理由写在 `environment_forced()` 上面。
+
+评审后又补了四处:
+
+- **CI 回归(我们自己造的)**:「父目录不存在就拒绝」是新加的,不是需求,而它正好打掉了唯一
+  要紧的调用方 —— 工作流传 `"${RUNNER_TEMP}/forkfs-ci/m1test"`,`forkfs-ci` 还没人建过,
+  于是两次 CI 都 exit 2。恢复旧契约:**只 `mkdir -p` 父目录**,最后一段仍归
+  `cleanup_scratch` 删、归下面的 `mkdir` 建;m1test 守卫改成在**创建或删除任何东西之前**先按
+  basename 问一次,规范化之后再问一次。
+- **默认值(Codex P1)**:`$(mktemp -d)/m1test` 里 mktemp 失败时替换为空,`$SCRATCH` 成了
+  `/m1test` —— 守卫放行,`cleanup_scratch` 会去递归删根目录下的 `/m1test`。现在单独接住
+  mktemp 的结果、查退出码并确认是个真目录,否则直接退出;顺带把「父目录是 `/`」整类拒掉
+  (没人需要它)。
+- **基准(Codex P2)**:`WANT_EVENTS` 现在对「环境造成的全树遍历」返回 0,而三处标着
+  FSEvents 的计时仍然照记 —— 那会把双树遍历的数字印成重放的数字。三处都只在真走了事件路时
+  取样,一次都没取到就印「no sample」,不印全树遍历的数。
+- **计数(Codex P2)**:`rm_entry` 的 ENOTEMPTY 补救走 `rm_rec(path, c->deadline)`,漏了计数器,
+  于是这条路上删掉的后代不进 `gc.log`。补上;目录自身在下面单独 bump,`rm_rec` 只数它下面的
+  东西,不会重复。这条路**没能确定性地跑红**:它只在 `readdir(3)` 漏报了一个在 `opendir(3)`
+  之后才被删掉的条目时才走(APFS 上实测 4 × 10 401 条一次没漏),没有测试缝,人为制造要靠
+  「遍历途中往目录里加条目」这种本身就不确定的竞争 —— 所以是按代码论证改的,不是按红改的。
+
+**验收**(rebase 到 PR #8 之后):`ctest` 2/2;`check-deps.sh` 绿;`safety.sh` **301 passed,
+0 failed**,七种拼法(工作流那种父目录不存在的、README 的 `${TMPDIR}m1test`、双斜杠、尾斜杠、
+`/tmp` 符号链接前缀、不给参数、以及 `TMPDIR` 无效)都是 301/0;`mktemp` 失败与显式 `/m1test`
+都在删任何东西之前退出;`test_disk_full_wrapper.py` 与 `disk_full.py` 全绿。

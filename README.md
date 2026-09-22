@@ -44,8 +44,9 @@ locally on macOS:
 
 ```bash
 sdk="$(xcrun --sdk macosx --show-sdk-path)"
-export TMPDIR="$PWD/build/ci-tmp/"
+export TMPDIR="$PWD/build/ci-tmp/"   # the trailing slash is on purpose: the C++ tests append to it
 mkdir -p "$TMPDIR"
+scratch="${TMPDIR}m1test"
 cmake -S . -B build/ci -DCMAKE_BUILD_TYPE=Release -DWFS_FSKIT=OFF \
   -DCMAKE_C_COMPILER="$(xcrun --sdk macosx --find clang)" \
   -DCMAKE_CXX_COMPILER="$(xcrun --sdk macosx --find clang++)" \
@@ -55,7 +56,7 @@ cmake -S . -B build/ci -DCMAKE_BUILD_TYPE=Release -DWFS_FSKIT=OFF \
 cmake --build build/ci --parallel
 ctest --test-dir build/ci --output-on-failure --timeout 600 --no-tests=error
 scripts/check-deps.sh build/ci
-scripts/tests/safety.sh build/ci "$TMPDIR/m1test"
+scripts/tests/safety.sh build/ci "$scratch"
 python3 scripts/tests/disk_full.py build/ci
 ```
 

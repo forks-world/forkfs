@@ -2,8 +2,11 @@
 # End-to-end check of the fool-proofing rules of docs/M1_DESIGN.md §3, driven through the CLI.
 # One line of PASS/FAIL per rule; exit 1 if any rule failed.
 #
-# Everything happens inside $WORLD_TEST_DIR (default: a scratch directory whose last component
-# must be `m1test`, which is the only thing this script ever deletes).
+# Everything happens inside the scratch directory: the second argument, or $WORLD_TEST_DIR, or
+# `m1test` inside a fresh `mktemp -d` when neither is given. Its last component must be
+# `m1test`, and it is the only thing this script ever deletes recursively. A scratch the
+# script made for itself is removed again after a successful run (and its empty mktemp parent
+# with a plain rmdir); after a failed run it is kept and its path printed.
 #
 #   scripts/tests/safety.sh [build-dir] [scratch-dir]
 set -uo pipefail
@@ -14,7 +17,61 @@ BUILD=$(cd "$BUILD" && pwd)
 WORLD="$BUILD/cli/world"
 [ -x "$WORLD" ] || { echo "no world CLI at $WORLD; build first"; exit 2; }
 
-SCRATCH=${2:-${WORLD_TEST_DIR:-/private/tmp/claude-501/-Users-hurricane-private-code-forks-world-forkfs/5b03ff32-c328-4b45-93c8-d8077b5207cc/scratchpad/m1test}}
+SCRATCH=${2:-${WORLD_TEST_DIR:-}}
+if [ -z "$SCRATCH" ]; then
+    # The default, and the one place a failure must not be read as a path. `mktemp -d` can fail
+    # -- an invalid, unwritable or full temporary directory -- and with the result substituted
+    # straight into `$(mktemp -d)/m1test` that failure produced "/m1test": a name the guard
+    # below accepts and cleanup_scratch then removes recursively, at the root of the machine.
+    # So the result is taken on its own and has to be a directory that is really there.
+    SCRATCH_TMP=$(mktemp -d) || SCRATCH_TMP=""
+    if [ -z "$SCRATCH_TMP" ] || [ ! -d "$SCRATCH_TMP" ]; then
+        echo "refusing to run: mktemp -d produced no usable directory (is TMPDIR valid and writable?)"
+        exit 2
+    fi
+    SCRATCH="$SCRATCH_TMP/m1test"
+    # A scratch this script made for itself is this script's to take away again. A path the
+    # caller named is cleared by the next run that names it, as it always was; a fresh mktemp
+    # directory has no next run, and every one of them would keep a 120k-entry fixture.
+    SCRATCH_AUTO=1
+fi
+
+# The guard, asked of the name as given, before anything at all is created or removed. It needs
+# only the last component, so asking first costs nothing; it is asked again below, of the
+# canonical path, because canonicalisation is what decides what finally gets deleted.
+if [ "$(basename "$SCRATCH")" != m1test ]; then
+    echo "refusing to use $SCRATCH: the scratch directory must be named m1test"
+    exit 2
+fi
+
+# The parent chain, made if it is not there. This script has always created the whole path, and
+# the CI workflow relies on it: it passes "${RUNNER_TEMP}/forkfs-ci/m1test" and nothing has made
+# `forkfs-ci` yet. Only the PARENT is created here -- the last component is cleanup_scratch's to
+# remove and the mkdir below's to make.
+SCRATCH_DIR=$(dirname "$SCRATCH")
+mkdir -p "$SCRATCH_DIR" 2>/dev/null
+# Canonicalise it before anything else looks at it, the guard included. A dozen cases further
+# down compare a path the CLI printed against a string built out of $SCRATCH, and the CLI prints
+# paths it has resolved -- so `a//b`, a trailing slash, a `./` segment, or a prefix that is a
+# symlink (on macOS /tmp is one: it is /private/tmp) makes those cases fail one by one while
+# nothing is actually wrong.
+#
+# The PARENT is resolved and the last component appended by hand, rather than resolving $SCRATCH
+# itself: that last component is the thing this script deletes, and following it would mean
+# deleting whatever a symlink left in its place points at instead.
+SCRATCH_PARENT=$(cd "$SCRATCH_DIR" 2>/dev/null && pwd -P) || SCRATCH_PARENT=""
+if [ -z "$SCRATCH_PARENT" ]; then
+    echo "refusing to use $SCRATCH: its parent directory does not exist and could not be created"
+    exit 2
+fi
+# The root is refused outright. `pwd -P` prints "/" for it, so pasting it on would rebuild the
+# doubled slash this is here to remove -- and a scratch directory sitting directly under the
+# root is something nobody needs and this script would delete recursively.
+if [ "$SCRATCH_PARENT" = "/" ]; then
+    echo "refusing to use $SCRATCH: the scratch directory must not sit directly under /"
+    exit 2
+fi
+SCRATCH="$SCRATCH_PARENT/$(basename "$SCRATCH")"
 case "$SCRATCH" in
     */m1test) ;;
     *) echo "refusing to use $SCRATCH: the scratch directory must be named m1test"; exit 2 ;;
@@ -33,6 +90,11 @@ cleanup_scratch() {
 }
 cleanup_scratch
 mkdir -p "$SCRATCH"
+# Said once, here, rather than as twelve scattered path mismatches three hundred lines down:
+# from this point on $SCRATCH is what the CLI will print for anything inside it.
+SCRATCH_REAL=$(cd "$SCRATCH" && pwd -P)
+[ "$SCRATCH_REAL" = "$SCRATCH" ] \
+    || { echo "refusing to run: \$SCRATCH is $SCRATCH but resolves to $SCRATCH_REAL"; exit 2; }
 export WORLD_STORE="$SCRATCH/store"
 PROJ="$SCRATCH/proj"
 
@@ -52,6 +114,36 @@ clone_tree() {
     python3 -c 'import ctypes, sys
 sys.exit(0 if ctypes.CDLL("/usr/lib/libSystem.B.dylib").clonefile(sys.argv[1].encode(), sys.argv[2].encode(), 0) == 0 else 1)' "$1" "$2"
 }
+
+# Wait for the background collector to finish something big, and fail only if its chain stops.
+#
+# Not a fixed number of seconds: one wake works for WORLD_GC_BATCH_SECS and its successor then
+# sleeps WORLD_GC_PAUSE_MS before starting, so the wall clock is about twice the unlinking --
+# and the unlinking itself is several times slower on a busy machine (measured here: a
+# one-second wake clears ~42k entries on an idle machine and ~10k under heavy concurrent load).
+# A fixed bound is therefore an assertion about the machine, which is how the 60 s bound on the
+# 120k-entry pool clone below failed once under load while the chain was working perfectly.
+# What is waited for is PROGRESS: every wake appends a line to <store>/logs/gc.log, so while
+# that file keeps growing the chain is alive and the wait goes on. It gives up only once
+# nothing has been written for `stall` seconds -- many times the gap between two wakes -- which
+# is the failure worth reporting: a chain that stopped with work still to do.
+wait_collected() {   # wait_collected <store> <dir-that-must-become-empty> [stall-seconds]
+    local store=$1 target=$2 stall=${3:-30}
+    local log="$store/logs/gc.log" last=x quiet=0 now
+    while [ -n "$(ls "$target" 2>/dev/null)" ]; do
+        now=$(wc -c < "$log" 2>/dev/null || echo 0)
+        if [ "$now" != "$last" ]; then last=$now; quiet=0; else quiet=$((quiet + 1)); fi
+        [ "$quiet" -ge "$((stall * 4))" ] && return 1
+        sleep 0.25
+    done
+    return 0
+}
+
+# What one wake of the collector reported it unlinked. The worker's own log line is the only
+# account of a bounded wake that nothing else can have changed in the meantime: it is written
+# before the successor is started, and a detached successor's output goes to <store>/logs/gc.log,
+# never to the file the wake in the foreground was redirected into.
+freed_entries() { sed -n 's/.* \([0-9][0-9]*\) entries unlinked in .*/\1/p' "$1" | tail -1; }
 
 # The refusal has to say what to do instead, not just complain.
 has_hint() {
@@ -427,6 +519,7 @@ check P14 "the sandboxed child cannot write the store"         1 -- "$WORLD" exe
 check P14 "the sandboxed child cannot read the snapshots"      1 -- "$WORLD" exec W1 -- /bin/sh -c "ls '$WORLD_STORE/snapshots'"
 check P14 "--no-sandbox runs the command unrestricted"         0 -- "$WORLD" exec W1 --no-sandbox -- /bin/sh -c "touch '$OTHER/allowed'"
 rm -f "$OTHER/allowed" "$SCRATCH/w1-moved/sandbox-ok" /private/tmp/wfs-sandbox-ok
+[ -n "${TMPDIR:-}" ] && rm -f "${TMPDIR%/}/wfs-sandbox-ok"
 [ ! -e "$OTHER/evil" ] && ok P14 "nothing the sandbox refused actually landed" \
                        || bad P14 "nothing the sandbox refused actually landed"
 [ -z "$(ls "$WORLD_STORE/tmp" 2>/dev/null)" ] && ok P14 "the generated profile is removed afterwards" \
@@ -1126,15 +1219,32 @@ WORLD_GC_PAUSE_MS=0 WORLD_GC_BATCH_SECS=1 rv fs gc --worker --retention 0 > "$SC
 t1=$(python3 -c 'import time;print(int(time.time()*1000))')
 if [ "$((t1 - t0))" -lt 4000 ]; then ok PR1 "a one-second gc wake returns on time mid-tree ($((t1-t0)) ms)"
 else bad PR1 "a one-second gc wake returns on time mid-tree ($((t1-t0)) ms)"; sed 's/^/        /' "$SCRATCH/gcbig.log"; fi
+# Both of the assertions on this log read the ONE line gc_log_line() writes, and that line is
+# printed and flushed before the successor exists: cli/main.cpp:1192 logs it, cli/main.cpp:1193
+# starts the successor on the next statement. The successor cannot reach this file either --
+# spawn_detached() reopens its stdout and stderr on <store>/logs/gc.log (cli/main.cpp:349-351)
+# before it execs -- so everything asserted here is the foreground wake's own account of itself.
 grep -q "work remains, handing over" "$SCRATCH/gcbig.log" && ok PR1 "it reports the work it did not get to" \
                                                           || { bad PR1 "it reports the work it did not get to"; sed 's/^/        /' "$SCRATCH/gcbig.log"; }
-LEFT=$(find "$RSTORE/trash" 2>/dev/null | wc -l | tr -d ' ')
-if [ -d "$BIG.deleting" ] && [ "$LEFT" -gt 1 ] && [ "$LEFT" -lt 120401 ]; then
-    ok PR1 "the half-deleted tree keeps its .deleting name ($LEFT entries left)"
+# What is left of the tree cannot be counted from here. This wake set `work_remains` and
+# started its successor before it returned, and with WORLD_GC_PAUSE_MS=0 that successor is
+# already unlinking by the time the shell has its prompt back: a `find` and a `-d` test are two
+# observations of a tree a different process is deleting between them (measured on this machine:
+# ~17k entries went between the wake returning and the `find` finishing, and the python3 start
+# on the line above is most of that window). The witness that races nobody is what the wake
+# itself reported -- it unlinked part of the tree and not the whole of it, which is the batch
+# limit biting inside one tree, which is what this case is for. That what it left behind is
+# resumable is what the chain finishing below proves end to end, and that a tree stopped
+# mid-deletion keeps its `.deleting` working name is asserted where nothing hands over: on
+# `gc --now`, in the undeletable-entry case further down.
+FREED=$(freed_entries "$SCRATCH/gcbig.log")
+if [ -n "$FREED" ] && [ "$FREED" -gt 0 ] && [ "$FREED" -lt 120400 ]; then
+    ok PR1 "the wake stopped mid-tree ($FREED of 120400 entries unlinked)"
 else
-    bad PR1 "the half-deleted tree keeps its .deleting name ($LEFT entries left)"
+    bad PR1 "the wake stopped mid-tree (${FREED:-no} entries unlinked, wanted 1..120399)"
+    sed 's/^/        /' "$SCRATCH/gcbig.log"
 fi
-for _ in $(seq 120); do [ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && break; sleep 0.25; done
+wait_collected "$RSTORE" "$RSTORE/trash"
 [ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && ok PR1 "the successor chain finishes the tree" \
                                             || { bad PR1 "the successor chain finishes the tree"; ls "$RSTORE/trash" | sed 's/^/        /'; }
 
@@ -1199,13 +1309,19 @@ if [ "$((t1 - t0))" -lt 2500 ]; then ok PR1 "a one-second wake that falls back s
 else bad PR1 "a one-second wake that falls back still returns on time ($((t1-t0)) ms)"; sed 's/^/        /' "$SCRATCH/gcfb.log"; fi
 grep -q "work remains, handing over" "$SCRATCH/gcfb.log" && ok PR1 "it hands the rest of the tree over" \
                                                          || { bad PR1 "it hands the rest of the tree over"; sed 's/^/        /' "$SCRATCH/gcfb.log"; }
-LEFT2=$(find "$RSTORE/trash" 2>/dev/null | wc -l | tr -d ' ')
-if [ -d "$BIG2.deleting/blocked" ] && [ "$LEFT2" -gt 1 ] && [ "$LEFT2" -lt 120403 ]; then
-    ok PR1 "the fallback stopped mid-tree and kept the .deleting name ($LEFT2 entries left)"
+# The same reason as the case above: the successor this wake started is already deleting the
+# rest of the tree, so `find` and `-d` would be reporting on a tree three processes are taking
+# apart (this is the assertion that failed three times on CI, with 3 entries left -- the chain
+# had all but finished between the two observations). The wake's own report cannot be raced:
+# the fallback unlinked part of the tree, and the deadline stopped it before the end.
+FREED2=$(freed_entries "$SCRATCH/gcfb.log")
+if [ -n "$FREED2" ] && [ "$FREED2" -gt 0 ] && [ "$FREED2" -lt 120401 ]; then
+    ok PR1 "the fallback stopped mid-tree ($FREED2 of 120401 entries unlinked)"
 else
-    bad PR1 "the fallback stopped mid-tree and kept the .deleting name ($LEFT2 entries left)"
+    bad PR1 "the fallback stopped mid-tree (${FREED2:-no} entries unlinked, wanted 1..120400)"
+    sed 's/^/        /' "$SCRATCH/gcfb.log"
 fi
-for _ in $(seq 160); do [ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && break; sleep 0.25; done
+wait_collected "$RSTORE" "$RSTORE/trash"
 [ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && ok PR1 "the successor chain finishes it once the obstacle is gone" \
                                             || { bad PR1 "the successor chain finishes it once the obstacle is gone"; ls "$RSTORE/trash" | sed 's/^/        /'; }
 
@@ -1247,7 +1363,7 @@ echo "$out" | grep -q "being collected in the background" && ok PR6 "and it hand
                                                            || { bad PR6 "and it hands the rest over"; echo "$out" | sed 's/^/        /'; }
 rv fs gc --status | grep -q "stale pre-clone" && ok PR6 "gc --status counts the stale entry" \
                                                || { bad PR6 "gc --status counts the stale entry"; rv fs gc --status | sed 's/^/        /'; }
-for _ in $(seq 240); do [ -z "$(ls "$PDIR" 2>/dev/null)" ] && break; sleep 0.25; done
+wait_collected "$RSTORE" "$PDIR"
 [ -z "$(ls "$PDIR" 2>/dev/null)" ] && ok PR6 "the successor chain finishes the pool entry" \
                                     || { bad PR6 "the successor chain finishes the pool entry"; ls -d "$PDIR"/* | sed 's/^/        /'; }
 
@@ -1974,4 +2090,15 @@ echo
 "$WORLD" fs status | sed 's/^/      /'
 echo
 echo "safety: $pass passed, $fail failed"
+if [ "${SCRATCH_AUTO:-0}" = 1 ]; then
+    if [ "$fail" = 0 ]; then
+        # Only what this run created: the m1test tree through the same cleanup the start of a
+        # run uses, then the mktemp parent with a plain rmdir, which removes it only if nothing
+        # else was put there.
+        cleanup_scratch
+        rmdir "$SCRATCH_PARENT" 2>/dev/null
+    else
+        echo "safety: kept $SCRATCH for diagnosis; remove it when done"
+    fi
+fi
 [ "$fail" = 0 ] || exit 1

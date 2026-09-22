@@ -780,7 +780,13 @@ namespace {
 // entry, exactly as the parallel deleter's rm_entry reads it. Out of time is -ECANCELED, which
 // unwinds without rmdir'ing anything on the way out -- the tree is a `.deleting` one and what
 // is left of it is resumable by construction.
-int rm_rec(const char *path, int64_t deadline) {
+// `entries`, when given, is incremented once for every entry BELOW `path` that is gone when
+// this returns -- the same contract fs_remove_tree_parallel's own walk has, and the reason it
+// is here: the parallel deleter hands this function everything it could not do itself, and
+// until now none of that work was counted. A wake that fell back unlinked forty thousand
+// entries and logged "0 entries unlinked", which is the column README points at for measuring
+// what a drain costs (PR #1 review).
+int rm_rec(const char *path, int64_t deadline, uint64_t *entries = nullptr) {
     if (deadline && fs_mono_us() >= deadline) return -ECANCELED;
     struct stat st;
     if (::lstat(path, &st) != 0) return errno == ENOENT ? 0 : -errno;
@@ -803,7 +809,10 @@ int rm_rec(const char *path, int64_t deadline) {
         String child(path);
         child.append("/");
         child.append(e->d_name);
-        if ((rc = rm_rec(child.c_str(), deadline))) break;
+        if ((rc = rm_rec(child.c_str(), deadline, entries))) break;
+        // Atomic, like every other increment of this counter: the parallel deleter's ENOTEMPTY
+        // recovery runs this on one walker thread while the others bump() the same counter.
+        if (entries) bump(*entries);   // that child is gone, whatever it was
     }
     ::closedir(d);
     if (rc) return rc;
@@ -811,7 +820,7 @@ int rm_rec(const char *path, int64_t deadline) {
 }
 } // namespace
 
-int fs_remove_tree(const char *root, int64_t deadline_us, int *partial) {
+int fs_remove_tree(const char *root, int64_t deadline_us, int *partial, uint64_t *entries) {
     if (partial) *partial = 0;
     struct stat st;
     if (::lstat(root, &st) != 0) return errno == ENOENT ? 0 : -errno;
@@ -822,7 +831,7 @@ int fs_remove_tree(const char *root, int64_t deadline_us, int *partial) {
         if (partial) *partial = 1;
         return 0;
     }
-    int rc = rm_rec(root, deadline_us);
+    int rc = rm_rec(root, deadline_us, entries);
     if (rc == -ECANCELED) {
         if (partial) *partial = 1;
         return 0;
@@ -885,7 +894,11 @@ int rm_entry(void *ctx, const char *path, const char *rel, const struct stat &st
         // rely on the same behaviour.) If it ever does happen, finish this one directory the
         // certain way rather than failing the whole tree.
         if (e == ENOTEMPTY) {
-            int r2 = rm_rec(path, c->deadline);
+            // The same counter: whatever this recovery removes is removed for this walk, and
+            // leaving it out understated `gc.log`'s "entries unlinked" by everything the walk
+            // had missed. rm_rec() counts what is BELOW the path it is given, and the directory
+            // itself is bumped once below, so nothing is counted twice.
+            int r2 = rm_rec(path, c->deadline, &c->entries);
             if (r2 == 0) { if (*rel) bump(c->entries); return 0; }
             if (r2 == -ECANCELED) return -ECANCELED;   // the batch limit, not a failure
             e = ENOTEMPTY;
@@ -1126,7 +1139,12 @@ int fs_remove_tree_parallel(const char *root, int threads, uint64_t *entries, in
     // deadline (PR #1 review, 4th round). Without it a single EACCES directory in a 120k-entry
     // trash tree turned a one-second worker wake into an unbounded one, which is exactly the
     // foreground contention max_secs exists to bound.
-    return fs_remove_tree(root, deadline_us, partial);
+    //
+    // And under the same count. What the fallback removes is removed by this call, so leaving
+    // `entries` out of it made every wake that fell back report none of its work: `gc.log` said
+    // "0 entries unlinked" for a wake that had just spent its whole batch unlinking forty
+    // thousand of them, and that column is what README tells an operator to sum.
+    return fs_remove_tree(root, deadline_us, partial, entries);
 }
 
 #ifndef __APPLE__

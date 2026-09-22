@@ -36,7 +36,8 @@ Check each command's exit status; in an automated shell use `set -euo pipefail`.
 Run as an ordinary user. The safety script deletes its supplied scratch target
 on startup, so give it a fresh private directory ending in `m1test`. Do not give
 it a workspace or an existing directory containing useful data. If overriding
-`TMPDIR`, create that directory first and retain a trailing `/`.
+`TMPDIR`, create that directory first and retain a trailing `/` (the C++ tests
+append to it directly).
 
 | Check | What it establishes |
 | --- | --- |
@@ -94,13 +95,15 @@ An unsupported environment or failed image setup is an error, not a passing test
 CI retains its test log when a run fails.
 
 Local validation on macOS 27 arm64 passed CTest (2/2), the safety suite
-(298 cases), wrapper cleanup tests (12/12), dependency checks, and the real
+(301 cases), wrapper cleanup tests (12/12), dependency checks, and the real
 disk-full regression. The latter observed data `ENOSPC` after 523,239,424 bytes
 and metadata exhaustion after 996 directories; these are observations, not
-fixed expected thresholds. Pass `safety.sh` a scratch path with no doubled
-slash in it: `TMPDIR` as the CI recipe sets it ends in `/`, so `"$TMPDIR/m1test"`
-makes one, and twelve cases that compare a printed path against the one they
-passed in fail on the difference alone. The new disk-full CI step still requires its first
+fixed expected thresholds. How the scratch path is spelled no longer matters:
+`safety.sh` canonicalises it before anything is compared against it, so a
+doubled slash (`"$TMPDIR/m1test"` with the CI recipe's trailing `/`), a trailing
+slash, a `./` segment or a symlinked prefix all give the same run. It creates
+the parent chain if it is not there, and refuses a path whose last component is
+not `m1test` or whose parent is `/`. The new disk-full CI step still requires its first
 GitHub run; local success does not establish a macOS 15 result for this test.
 
 ## Isolation and performance limits

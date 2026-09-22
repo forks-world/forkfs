@@ -215,6 +215,119 @@ static void run_diff_err(wfs_store *s, wfs_id w, int flags, Collect *c, int want
     CHECK(c->n == 0);
 }
 
+// The names of the wfs_diff_fallback reasons. A failure below has to say which reason came
+// back, not leave a number in a quoted CHECK expression for somebody to look up.
+static const char *fallback_name(int f) {
+    switch (f) {
+    case WFS_DF_NONE: return "NONE";
+    case WFS_DF_REQUESTED: return "REQUESTED";
+    case WFS_DF_NO_CURSOR: return "NO_CURSOR";
+    case WFS_DF_FROM_WORLD: return "FROM_WORLD";
+    case WFS_DF_MUST_SCAN: return "MUST_SCAN";
+    case WFS_DF_DROPPED: return "DROPPED";
+    case WFS_DF_WRAPPED: return "WRAPPED";
+    case WFS_DF_STALE: return "STALE";
+    case WFS_DF_TIMEOUT: return "TIMEOUT";
+    case WFS_DF_UNSUPPORTED: return "UNSUPPORTED";
+    case WFS_DF_SMALL_TREE: return "SMALL_TREE";
+    default: return "?";
+    }
+}
+
+// A fallback nothing in this process decided: the machine the test runs on did. Which of the
+// FSEvents statuses those are is decided one by one, from what the code can and cannot cause:
+//
+//   TIMEOUT      the replay waits for a historical HistoryDone, which fseventsd answers only
+//                once it has flushed its journal (measured on an idle 27.0 machine: 330-370 ms
+//                for a world forked milliseconds earlier, against the 5 s allowed). How long
+//                that takes is the machine's.                              -> environment
+//   MUST_SCAN    kFSEventStreamEventFlagMustScanSubDirs: fseventsd itself saying it cannot
+//                enumerate what changed. Nothing here produces it.         -> environment
+//   DROPPED      UserDropped/KernelDropped. The stream gets a serial queue of its own whose
+//                callback does nothing but copy path bytes, which is the whole defence a
+//                consumer has (CLONE_MODEL_MACOS27 6.2); past that it is the kernel's buffer
+//                against a loaded machine.                                 -> environment
+//   UNSUPPORTED  no FSEvents for this volume at all, or the stream would not start.
+//                                                                          -> environment
+//   STALE        the volume's journal answering "I cannot serve this cursor": no journal for
+//                that device, or one that does not reach back to the fork. Both are properties
+//                of the volume. The code COULD cause it too, by recording the wrong device or
+//                the wrong second at fork -- but that mistake is not intermittent, and the
+//                end-of-run guard below is what catches it: it would make every case fall back.
+//                                                                          -> environment
+//   WRAPPED      NOT environment. It is reached by kFSEventStreamEventFlagEventIdsWrapped --
+//                a 64-bit counter that does not wrap in practice -- or by `since > now` in
+//                cursor_usable(), which compares the id this fork recorded against the volume's
+//                current one. For a world forked milliseconds before the diff there is no
+//                healthy way for the first to be ahead of the second: either the volume's
+//                counter was reset behind our back, or the id recorded at fork never came from
+//                FSEventsGetCurrentEventId(). The second is this code's own mistake and has to
+//                be red. (The case that pokes a wrapped cursor into the row on purpose asserts
+//                WFS_DF_WRAPPED directly; it does not come through here.)
+//
+// For the five that are the environment's, P10's rule is that the diff does the two-tree walk
+// and returns the same answer -- the behaviour, not a bug.
+static int environment_forced(int f) {
+    return f == WFS_DF_MUST_SCAN || f == WFS_DF_DROPPED || f == WFS_DF_STALE ||
+           f == WFS_DF_TIMEOUT || f == WFS_DF_UNSUPPORTED;
+}
+
+static int events_path_taken = 0, events_path_asked = 0;
+// Every case that asked for the events path and did not get it, kept for the end-of-run guard:
+// one reason per site is a machine having a bad moment, all of them is a regression.
+static const char *events_path_why[32];
+static const char *events_path_where[32];
+static int events_path_fell_back = 0;
+
+// Every "this diff had to take the FSEvents path" assertion goes through here.
+//
+// `CHECK(st.full_scan == 0 && st.fallback == WFS_DF_NONE)` printed the expression and nothing
+// else: on a CI machine, where this is the only thing anybody can read afterwards, that does
+// not say which of the two terms failed, nor which fallback reason the diff chose, nor how
+// long the replay waited before giving up. `what` names the case, because a run has a dozen
+// of these.
+//
+// And the assertion itself was an assertion about the machine. One macOS 15 runner fell back
+// here once, on the untouched-world case below, with a world forked milliseconds earlier;
+// requiring "no fallback" is requiring that the runner's fseventsd answered in time, which is
+// not a property of this code and not one P10 promises. So a fallback the ENVIRONMENT forced
+// is accepted and printed; a fallback the diff CHOSE -- REQUESTED, SMALL_TREE, FROM_WORLD,
+// NO_CURSOR -- is still a failure, because each of those means it took the wrong path for the
+// flags it was given and no machine can excuse it.
+//
+// What is never conditional is the answer. Every caller checks the exact set of changes right
+// afterwards, through check_lines() or check_exact(), with no `if` in front of it: the two
+// paths must agree, whichever one ran. The return value is 1 when the events path really was
+// taken, so a caller can keep the few assertions that only mean something there (candidate
+// counts) behind it.
+static int want_events_path(const char *what, const wfs_diff_stats *st, const char *file, int line) {
+    events_path_asked++;
+    if (st->full_scan == 0 && st->fallback == WFS_DF_NONE) {
+        events_path_taken++;
+        return 1;
+    }
+    if (st->full_scan == 1 && environment_forced(st->fallback)) {
+        printf("  note: %s took the full scan instead: %s. That is this machine's FSEvents, not\n"
+               "        the diff (P10); the answer is checked exactly either way.\n",
+               what, fallback_name(st->fallback));
+        fflush(stdout);
+        if (events_path_fell_back < (int)(sizeof events_path_why / sizeof events_path_why[0])) {
+            events_path_where[events_path_fell_back] = what;
+            events_path_why[events_path_fell_back] = fallback_name(st->fallback);
+        }
+        events_path_fell_back++;
+        return 0;
+    }
+    fprintf(stderr,
+            "%s:%d: %s: wanted the FSEvents path, got full_scan=%d fallback=%s(%d), "
+            "%llu candidates, %llu compared, %llu content compares, %.1f ms\n",
+            file, line, what, st->full_scan, fallback_name(st->fallback), st->fallback,
+            (unsigned long long)st->candidates, (unsigned long long)st->compared,
+            (unsigned long long)st->content_cmp, st->elapsed_us / 1000.0);
+    exit(1);
+}
+#define WANT_EVENTS(what, st) want_events_path((what), (st), __FILE__, __LINE__)
+
 // ---- poking the recorded cursor (the only reason sqlite3 is here) ------------------------------
 
 static void set_cursor(const char *store, wfs_id w, unsigned long long id) {
@@ -286,16 +399,30 @@ static void bench(const char *root, const char *store) {
     memset(&c, 0, sizeof c);
     wfs_diff_stats st;
     double ev = 1e9, fl = 1e9, fx = 1e9, evx = 1e9, fa = 1e9;
-    size_t n_events = 0, n_full = 0;
+    size_t n_events = 0, n_default = 0, n_full = 0;
     uint64_t cand = 0;
+    // Only a run that really took the events path is a sample of the events path. A fallback
+    // the environment forced is accepted above, and timing it under the FSEvents label would
+    // print a two-tree walk's numbers as if they were the replay's -- a benchmark answering
+    // about the wrong path. No sample is a result too, and it is said rather than filled in.
+    int ev_n = 0, evx_n = 0;
     for (int i = 0; i < 3; ++i) {
         run_diff(s, wid, 0, &c, &st);
-        CHECK(st.full_scan == 0);
-        if (st.elapsed_us / 1e6 < ev) ev = st.elapsed_us / 1e6;
-        n_events = c.n;
-        cand = st.candidates;
+        // The answer of the default diff, whichever path it took: that is what has to agree
+        // with the full scan below. n_events is only the benchmark's sample and stays 0 when
+        // every run fell back, so it is not what the closing CHECK may compare.
+        n_default = c.n;
+        if (WANT_EVENTS("timing / FSEvents", &st)) {
+            if (st.elapsed_us / 1e6 < ev) ev = st.elapsed_us / 1e6;
+            n_events = c.n;
+            cand = st.candidates;
+            ev_n++;
+        }
         run_diff(s, wid, WFS_DIFF_NO_XATTR, &c, &st);
-        if (st.elapsed_us / 1e6 < evx) evx = st.elapsed_us / 1e6;
+        if (st.full_scan == 0) {   // the same rule for the other events-path column
+            if (st.elapsed_us / 1e6 < evx) evx = st.elapsed_us / 1e6;
+            evx_n++;
+        }
         run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
         if (st.elapsed_us / 1e6 < fl) fl = st.elapsed_us / 1e6;
         n_full = c.n;
@@ -306,13 +433,20 @@ static void bench(const char *root, const char *store) {
         run_diff(s, wid, WFS_DIFF_FULL | WFS_DIFF_ALL_XATTRS, &c, &st);
         if (st.elapsed_us / 1e6 < fa) fa = st.elapsed_us / 1e6;
     }
-    printf("  diff (FSEvents)            %.3f s   %llu changes, %llu candidates\n", ev,
-           (unsigned long long)n_events, (unsigned long long)cand);
-    printf("  diff (FSEvents, no-xattr)  %.3f s\n", evx);
+    if (ev_n)
+        printf("  diff (FSEvents)            %.3f s   %llu changes, %llu candidates (%d of 3 runs)\n",
+               ev, (unsigned long long)n_events, (unsigned long long)cand, ev_n);
+    else
+        printf("  diff (FSEvents)            no sample: every run fell back to the full scan\n");
+    if (evx_n)
+        printf("  diff (FSEvents, no-xattr)  %.3f s (%d of 3 runs)\n", evx, evx_n);
+    else
+        printf("  diff (FSEvents, no-xattr)  no sample: every run fell back to the full scan\n");
     printf("  diff (--full)              %.3f s   %llu changes\n", fl, (unsigned long long)n_full);
     printf("  diff (--full --no-xattr)   %.3f s\n", fx);
     printf("  diff (--full --all-xattrs) %.3f s\n", fa);
-    CHECK(n_full == n_events);
+    CHECK(n_full == n_default);
+    if (ev_n) CHECK(n_events == n_default);
     free(c.v);
     wfs_store_close(s);
 }
@@ -1106,7 +1240,7 @@ static void small_cases(const char *root, const char *store) {
         {'D', "turns-into-a-file/buried.txt"},
     };
     run_diff(s, wid, 0, &c, &st);
-    CHECK(st.full_scan == 0);
+    WANT_EVENTS("small / FSEvents", &st);
     check_lines("small / FSEvents", &c, want, sizeof want / sizeof want[0]);
     run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
     CHECK(st.full_scan == 1 && st.fallback == WFS_DF_REQUESTED);
@@ -1174,7 +1308,7 @@ static void small_cases(const char *root, const char *store) {
         {'D', "turns-into-a-file/buried.txt"},
     };
     run_diff(s, wid, 0, &c, &st);
-    CHECK(st.full_scan == 0);
+    WANT_EVENTS("xattr-only / FSEvents", &st);
     check_lines("xattr-only / FSEvents", &c, want_x, sizeof want_x / sizeof want_x[0]);
     run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
     check_lines("xattr-only / --full", &c, want_x, sizeof want_x / sizeof want_x[0]);
@@ -1225,14 +1359,14 @@ static void small_cases(const char *root, const char *store) {
     CHECK(st.full_scan == 1 && st.fallback == WFS_DF_SMALL_TREE && st.candidates == 0);
     check_lines("default / scan", &c, want, sizeof want / sizeof want[0]);
     run_diff(s, wid, WFS_DIFF_EVENTS, &c, &st);
-    CHECK(st.full_scan == 0 && st.fallback == WFS_DF_NONE);
+    WANT_EVENTS("--events", &st);
     check_lines("--events", &c, want, sizeof want / sizeof want[0]);
     run_diff(s, wid, WFS_DIFF_EVENTS | WFS_DIFF_FULL, &c, &st);
     CHECK(st.full_scan == 1 && st.fallback == WFS_DF_REQUESTED);
     // A world above the threshold picks the events path on its own.
     CHECK(setenv("WFS_DIFF_EVENTS_MIN_ENTRIES", "2", 1) == 0);
     run_diff(s, wid, 0, &c, &st);
-    CHECK(st.full_scan == 0 && st.fallback == WFS_DF_NONE);
+    WANT_EVENTS("above the threshold / events by default", &st);
     CHECK(setenv("WFS_DIFF_EVENTS_MIN_ENTRIES", "0", 1) == 0);
 
     free(c.v);
@@ -1284,7 +1418,8 @@ int main() {
     memset(&c, 0, sizeof c);
     wfs_diff_stats st;
     run_diff(s, wid, 0, &c, &st);
-    CHECK(c.n == 0 && st.full_scan == 0 && st.fallback == WFS_DF_NONE);
+    CHECK(c.n == 0);
+    WANT_EVENTS("untouched world", &st);
     run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
     CHECK(c.n == 0 && st.full_scan == 1);
     printf("  untouched world             0 lines, both paths\n");
@@ -1321,9 +1456,11 @@ int main() {
     // full scan is the default path now; here it would just make the exact-set assertion flaky.
     settle();
     run_diff(s, wid, 0, &c, &st);
-    CHECK(st.full_scan == 0 && st.fallback == WFS_DF_NONE);
-    CHECK(st.candidates >= N_MOD + N_ADD + N_DEL + N_META);
-    CHECK(st.content_cmp >= N_FILES); // d004 had to be read on both sides
+    if (WANT_EVENTS("10k / FSEvents", &st)) {
+        // Only the events path has candidates; a full scan compares everything and counts none.
+        CHECK(st.candidates >= N_MOD + N_ADD + N_DEL + N_META);
+        CHECK(st.content_cmp >= N_FILES); // d004 had to be read on both sides
+    }
     check_exact("10k / FSEvents", &c, &st);
 
     // (b) the full scan
@@ -1389,9 +1526,13 @@ int main() {
 
     // ---- timing, best of three, on the 10k fixture ----
     double ev = 1e9, fl = 1e9, fx = 1e9, fa = 1e9;
+    int ev_n = 0;   // as above: a full scan the machine forced is not a sample of the replay
     for (int i = 0; i < 3; ++i) {
         run_diff(s, wid, 0, &c, &st);
-        if (st.elapsed_us / 1e6 < ev) ev = st.elapsed_us / 1e6;
+        if (st.full_scan == 0) {
+            if (st.elapsed_us / 1e6 < ev) ev = st.elapsed_us / 1e6;
+            ev_n++;
+        }
         run_diff(s, wid, WFS_DIFF_FULL, &c, &st);
         if (st.elapsed_us / 1e6 < fl) fl = st.elapsed_us / 1e6;
         run_diff(s, wid, WFS_DIFF_FULL | WFS_DIFF_NO_XATTR, &c, &st);
@@ -1399,8 +1540,12 @@ int main() {
         run_diff(s, wid, WFS_DIFF_FULL | WFS_DIFF_ALL_XATTRS, &c, &st);
         if (st.elapsed_us / 1e6 < fa) fa = st.elapsed_us / 1e6;
     }
-    printf("  10k, 850 changes: FSEvents %.3f s   --full %.3f s   --full --no-xattr %.3f s   "
-           "--full --all-xattrs %.3f s\n", ev, fl, fx, fa);
+    if (ev_n)
+        printf("  10k, 850 changes: FSEvents %.3f s (%d of 3 runs)   --full %.3f s   "
+               "--full --no-xattr %.3f s   --full --all-xattrs %.3f s\n", ev, ev_n, fl, fx, fa);
+    else
+        printf("  10k, 850 changes: FSEvents no sample (every run fell back)   --full %.3f s   "
+               "--full --no-xattr %.3f s   --full --all-xattrs %.3f s\n", fl, fx, fa);
 
     free(c.v);
     c.v = NULL;
@@ -1449,6 +1594,37 @@ int main() {
 
     CHECK(exists(root));
     rm_rf(root);
+    // Which path this run actually exercised, and the one thing a per-case verdict cannot say.
+    //
+    // Each site above accepts a fallback the environment forced, because at that site a bad
+    // moment on the machine and a broken replay look exactly alike. Across a whole run they do
+    // not: a regression that makes the replay always come back TIMEOUT or STALE or MUST_SCAN --
+    // a since-id that is never right, the wrong device asked about, a history wait that never
+    // completes -- takes the events path away entirely, and that must not be a quiet pass.
+    // So not one single case having used it is a failure, and the run says which reason each
+    // site gave. A machine where FSEvents genuinely does not work (no journal for the volume,
+    // fseventsd not running) sets WFS_TEST_ALLOW_NO_EVENTS=1; it is the test binary's own
+    // variable, nothing in the product reads it, and CI does not set it.
+    printf("diff_test: the FSEvents path ran in %d of the %d cases that asked for it\n",
+           events_path_taken, events_path_asked);
+    if (events_path_asked > 0 && events_path_taken == 0) {
+        const char *allow = getenv("WFS_TEST_ALLOW_NO_EVENTS");
+        int n = events_path_fell_back;
+        if ((int)(sizeof events_path_why / sizeof events_path_why[0]) < n)
+            n = (int)(sizeof events_path_why / sizeof events_path_why[0]);
+        for (int i = 0; i < n; ++i)
+            fprintf(allow && *allow ? stdout : stderr, "           %s: %s\n",
+                    events_path_where[i], events_path_why[i]);
+        if (!(allow && *allow)) {
+            fprintf(stderr,
+                    "diff_test: the FSEvents path was never exercised. Every case fell back, so\n"
+                    "           nothing here tested it -- which is what a replay that can never\n"
+                    "           succeed looks like. If this machine really has no working\n"
+                    "           FSEvents, run with WFS_TEST_ALLOW_NO_EVENTS=1.\n");
+            exit(1);
+        }
+        printf("diff_test: WFS_TEST_ALLOW_NO_EVENTS is set, so that is not a failure here\n");
+    }
     printf("diff_test: all OK\n");
     return 0;
 }
