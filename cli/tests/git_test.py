@@ -280,6 +280,49 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((self.source / 'filter-ran').exists())
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
+    def test_external_hidden_refs_are_refused(self):
+        self.git(self.source, 'update-ref', 'refs/custom/hidden', self.base.decode())
+        for key in ('transfer.hideRefs', 'uploadpack.hideRefs'):
+            with self.subTest(key=key):
+                self.git(self.source, 'config', '--local', key, 'refs/custom')
+                before = (self.source / '.git' / 'config').read_bytes()
+                result = self.world('init', str(self.source), code=3)
+                self.assertIn(b'unsupported Git layout', result.stderr)
+                self.assertEqual(self.git(self.source, 'rev-parse', 'refs/custom/hidden').stdout.strip(), self.base)
+                self.assertEqual((self.source / '.git' / 'config').read_bytes(), before)
+                self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+                self.git(self.source, 'config', '--local', '--unset-all', key)
+
+    def test_external_stash_stack_is_refused_unchanged(self):
+        for value in ('first', 'second'):
+            (self.source / 'file').write_text(value + '\n')
+            self.git(self.source, 'stash', 'push', '-m', value)
+        before = self.git(self.source, 'stash', 'list', '--format=%H:%gs').stdout
+        self.assertEqual(len(before.splitlines()), 2)
+        self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+        result = self.world('init', str(self.source), code=3)
+        self.assertIn(b'unsupported Git layout', result.stderr)
+        self.assertEqual(self.git(self.source, 'stash', 'list', '--format=%H:%gs').stdout, before)
+        self.assertEqual(self.git(self.source, 'rev-parse', 'HEAD').stdout.strip(), self.base)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_managed_stash_and_hidden_refs_survive_checkpoint(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'transfer.hideRefs', 'refs/custom')
+        self.git(one, 'update-ref', 'refs/custom/hidden', self.base.decode())
+        for value in ('first', 'second'):
+            (one / 'file').write_text(value + '\n')
+            self.git(one, 'stash', 'push', '-m', value)
+        before = self.git(one, 'stash', 'list', '--format=%H:%gs').stdout
+        self.assertEqual(len(before.splitlines()), 2)
+        self.world('checkpoint', wid)
+        two, _ = self.fork('two', 'S2')
+        self.git(two, 'gc', '--quiet')
+        self.assertEqual(self.git(two, 'stash', 'list', '--format=%H:%gs').stdout, before)
+        self.assertEqual(self.git(two, 'rev-parse', 'refs/custom/hidden').stdout.strip(), self.base)
+        self.assertEqual(self.git(two, 'status', '--porcelain').stdout, b'')
+
     def test_move_discard_restore_checkpoint_and_gc(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

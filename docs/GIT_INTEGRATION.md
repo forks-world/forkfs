@@ -110,3 +110,15 @@ before publication along with the source index and local rules.
 Effective repository `filter.*` definitions are rejected before status inspection.
 Arbitrary configuration, executable conversions, hooks, and external policy paths
 are not imported. Global and system Git configuration are disabled during import.
+
+### External reference restrictions
+
+Initial imports from external repositories reject any configured `transfer.hideRefs`
+or `uploadpack.hideRefs`, because the mirror transport may omit those refs. They
+also reject an existing `refs/stash` reflog: mirroring a ref does not preserve the
+stash stack. Ref tips without a stash reflog remain supported. Import does not
+promise preservation of other external reflog history.
+
+These restrictions do not apply to managed Worlds: their Git administration is
+cloned as part of the filesystem, retaining hidden refs and native stash stacks
+through forks and checkpoints. External eligibility is checked again around import.

@@ -284,7 +284,18 @@ int reject_configured_policy(const char *root, const char *key) {
     if (rc == WFS_E_GIT_FAILED && status == 1) return 0;
     return rc;
 }
+int reject_external_visibility_state(const char *root, bool managed) {
+    if (managed) return 0;
+    for (const char *key : {"transfer.hideRefs", "uploadpack.hideRefs"})
+        if (int rc = reject_configured_policy(root, key)) return rc;
+    const char *args[] = {"reflog", "exists", "refs/stash", nullptr};
+    int status = -1, rc = git(root, args, nullptr, &status);
+    if (!rc) return WFS_E_GIT_UNSUPPORTED;
+    if (rc == WFS_E_GIT_FAILED && status == 1) return 0;
+    return rc;
+}
 int source_unchanged(const GitSource &s) {
+    if (int rc = reject_external_visibility_state(s.root.c_str(), s.managed)) return rc;
     String head; const char *args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (int rc = value(s.root.c_str(), args, head)) return rc;
     Vec<char> index;
@@ -360,6 +371,7 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     const char *admin_args[] = {"rev-parse", "--absolute-git-dir", nullptr};
     if ((rc = value(root, common_args, common)) || (rc = value(root, admin_args, admin))) return rc;
     if (out.managed && (rc = managed_check(root, common.c_str(), admin.c_str()))) return rc;
+    if ((rc = reject_external_visibility_state(root, out.managed))) return rc;
     if ((rc = collect_symrefs(root, out.symrefs))) return rc;
     const char *unsafe[] = {"objects/info/alternates", "objects/info/http-alternates", "shallow"};
     for (const char *rel : unsafe) {
