@@ -26,6 +26,9 @@
 
 #include "events.h"
 #include "internal.h"
+#ifndef ENOATTR
+#define ENOATTR ENODATA
+#endif
 #include "snapshot_access.h"
 
 #include <dirent.h>
@@ -38,9 +41,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#ifdef __APPLE__
 #include <sys/xattr.h>
-#endif
 
 using wfs::Guard;
 using wfs::Mutex;
@@ -190,7 +191,40 @@ struct XattrErr {
     int a = 0, b = 0;
 };
 
-#ifdef __APPLE__
+// Keep the comparison shared across platforms; Linux xattrs must not be ignored.
+ssize_t read_xattr(const char *path, const char *name, void *buf, size_t cap) {
+    size_t n = 0;
+    int rc = wfs::fs_getxattr(path, name, buf, cap, &n);
+    if (rc) { errno = -rc; return -1; }
+    return (ssize_t)n;
+}
+ssize_t read_xattr_names(const char *path, char *buf, size_t cap) {
+    size_t n = 0;
+    int rc = wfs::fs_listxattr(path, buf, cap, &n);
+    if (rc) { errno = -rc; return -1; }
+#ifdef __linux__
+    // XFS enumeration order can change when attributes move from inline to leaf storage.
+    // Compare name sets in canonical order, not the filesystem's incidental layout.
+    if (buf && n) {
+        char *sorted = (char *)::malloc(n);
+        if (!sorted) { errno = ENOMEM; return -1; }
+        Vec<const char *> names;
+        for (size_t i = 0; i < n; i += ::strlen(buf + i) + 1) names.emplace_back(buf + i);
+        ::qsort(names.data(), names.size(), sizeof(const char *), [](const void *a, const void *b) {
+            return ::strcmp(*(const char *const *)a, *(const char *const *)b);
+        });
+        size_t at = 0;
+        for (const char *name : names) {
+            size_t len = ::strlen(name) + 1;
+            ::memcpy(sorted + at, name, len); at += len;
+        }
+        ::memcpy(buf, sorted, n);
+        ::free(sorted);
+    }
+#endif
+    return (ssize_t)n;
+}
+
 // An errno that is never 0, whatever the libc left behind.
 int errno_or(int fallback) { return errno ? errno : fallback; }
 
@@ -198,10 +232,10 @@ int errno_or(int fallback) { return errno ? errno : fallback; }
 // first. Two getxattr(2) per side instead of one, and getxattr is 14 µs on APFS.
 XattrCmp xattr_value_equal(const char *a, const char *b, const char *name, XattrErr &e) {
     errno = 0;
-    ssize_t sa = ::getxattr(a, name, nullptr, 0, 0, XATTR_NOFOLLOW);
+    ssize_t sa = read_xattr(a, name, nullptr, 0);
     int ea = sa < 0 ? errno_or(EIO) : 0;
     errno = 0;
-    ssize_t sb = ::getxattr(b, name, nullptr, 0, 0, XATTR_NOFOLLOW);
+    ssize_t sb = read_xattr(b, name, nullptr, 0);
     int eb = sb < 0 ? errno_or(EIO) : 0;
     // ENOATTR is an answer, not a failure: the name listxattr(2) handed us was removed in
     // between, so that side genuinely does not have it any more. Anything else is a failure.
@@ -215,10 +249,10 @@ XattrCmp xattr_value_equal(const char *a, const char *b, const char *name, Xattr
     if (!va) { e.a = ENOMEM; return XA_ERROR; }   // cannot tell: and "cannot tell" is not "equal"
     char *vb = va + sa;
     errno = 0;
-    ssize_t ga = ::getxattr(a, name, va, (size_t)sa, 0, XATTR_NOFOLLOW);
+    ssize_t ga = read_xattr(a, name, va, (size_t)sa);
     int ra = ga < 0 ? errno_or(EIO) : 0;
     errno = 0;
-    ssize_t gb = ::getxattr(b, name, vb, (size_t)sa, 0, XATTR_NOFOLLOW);
+    ssize_t gb = read_xattr(b, name, vb, (size_t)sa);
     int rb = gb < 0 ? errno_or(EIO) : 0;
     XattrCmp rc;
     if (ra) { e.a = ra; rc = XA_ERROR; }
@@ -241,8 +275,8 @@ XattrCmp xattr_values_equal(const char *a, const char *b, const char *names, siz
         size_t len = ::strnlen(name, n - i);
         if (len == 0 || i + len >= n) break;
         char va[kXattrInline], vb[kXattrInline];
-        ssize_t sa = ::getxattr(a, name, va, sizeof va, 0, XATTR_NOFOLLOW);
-        ssize_t sb = ::getxattr(b, name, vb, sizeof vb, 0, XATTR_NOFOLLOW);
+        ssize_t sa = read_xattr(a, name, va, sizeof va);
+        ssize_t sb = read_xattr(b, name, vb, sizeof vb);
         if (sa < 0 || sb < 0) {
             // ERANGE (a value over kXattrInline), the attribute going away between the
             // listxattr and now, or a read that simply failed. Ask the careful way, which is
@@ -264,17 +298,17 @@ ssize_t list_names(const char *path, char *stackbuf, size_t cap, char **heap, ch
     *heap = nullptr;
     *err = 0;
     errno = 0;
-    ssize_t n = ::listxattr(path, stackbuf, cap, XATTR_NOFOLLOW);
+    ssize_t n = read_xattr_names(path, stackbuf, cap);
     if (n >= 0) { *out = stackbuf; return n; }
     if (errno != ERANGE) { *err = errno_or(EIO); return -1; }
     errno = 0;
-    ssize_t need = ::listxattr(path, nullptr, 0, XATTR_NOFOLLOW);
+    ssize_t need = read_xattr_names(path, nullptr, 0);
     if (need < 0) { *err = errno_or(EIO); return -1; }
     if (need == 0) { *out = stackbuf; return 0; }
     char *h = (char *)::malloc((size_t)need);
     if (!h) { *err = ENOMEM; return -1; }
     errno = 0;
-    n = ::listxattr(path, h, (size_t)need, XATTR_NOFOLLOW);
+    n = read_xattr_names(path, h, (size_t)need);
     if (n < 0) { ::free(h); *err = errno_or(EIO); return -1; }
     *heap = h;
     *out = h;
@@ -420,11 +454,6 @@ XattrCmp xattr_equal(const char *a, const char *b, uint8_t axa, uint8_t bxa, int
     if (la != lb || memcmp(na, nb, (size_t)la) != 0) return XA_DIFFER; // a clone keeps the order
     return xattr_values_equal(a, b, na, (size_t)la, e);
 }
-#else
-XattrCmp xattr_equal(const char *, const char *, uint8_t, uint8_t, int, XattrErr &) {
-    return XA_EQUAL;
-}
-#endif
 
 // ---- the record sink -------------------------------------------------------------------------
 // Paths go into one growing char buffer; the slots keep offsets, so growing never moves a

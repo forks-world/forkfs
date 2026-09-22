@@ -50,7 +50,8 @@ struct NodeRec {
 using InodeTable = stdb::container::dense_map<uint64_t, NodeRec>;
 
 // ---- platform layer ----------------------------------------------------------------------
-// platform_posix.cpp: everything POSIX. platform_darwin.cpp: clonefile / chflags / FSEvents.
+// platform_posix.cpp: POSIX. platform_darwin.cpp: clonefile / chflags / FSEvents.
+// platform_linux.cpp: native directory trees backed by per-file FICLONE (XFS first).
 
 // Starts up to `want` workers running fn(arg) and returns how many really started, writing THEIR
 // handles into th[0..n). The handles must be contiguous: pthread_create can fail for one slot and

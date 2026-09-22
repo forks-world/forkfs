@@ -20,12 +20,17 @@
 #include <stdlib.h>
 #include <sys/file.h>
 #include <sys/random.h>
+#ifdef __linux__
+#include <linux/stat.h>
+#include <sys/syscall.h>
+#endif
 #include <unistd.h>
 #include <utility>   // std::move only
 
 using wfs::copy_str;
 using wfs::Guard;
 using wfs::Manifest;
+using wfs::Mutex;
 using wfs::now_sec;
 using wfs::Stmt;
 using wfs::String;
@@ -1152,6 +1157,9 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
     wfs_snapshot_opts o;
     memset(&o, 0, sizeof o);
     if (opts) o = *opts;
+#ifdef __linux__
+    if (o.hard) return -ENOTSUP;
+#endif
     const char *name = o.name;
     String src;
     bool from_world_root = false;
@@ -1663,7 +1671,10 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         if (src_gated) { if (int rc = probe_gate.open(src.c_str(), false)) return rc; }
         int rc = wfs::fs_clone_probe(parent_dir.c_str(), src.c_str());
         probe_gate.close();
-        if (rc == -EXDEV || rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
+        if (rc == -EXDEV) return WFS_E_CROSS_VOLUME;
+#ifdef __APPLE__
+        if (rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
+#endif
         if (rc) return rc;
     }
     if (!o.skip_space_check) {
@@ -1837,7 +1848,10 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
             // still naming this tree) and gc --status counts in creating_stranded -- and the
             // caller gets the error that started all this.
             if (!proven_gone(tmp.c_str())) {
-                if (rc == -EXDEV || rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
+                if (rc == -EXDEV) return WFS_E_CROSS_VOLUME;
+#ifdef __APPLE__
+                if (rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
+#endif
                 return rc;
             }
         }
@@ -1851,7 +1865,10 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
             if (del.ok()) { del.i64(1, (int64_t)id); del.step(); }
             (void)t.commit();   // best effort: the sweep is the backstop either way
         }
-        if (rc == -EXDEV || rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
+        if (rc == -EXDEV) return WFS_E_CROSS_VOLUME;
+#ifdef __APPLE__
+        if (rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
+#endif
         return rc;
     }
 
@@ -3161,6 +3178,115 @@ extern "C" int wfs_path_check(wfs_store *s, const char *path, int for_target) {
     if (rc) return rc;
     // A world root is a legal checkpoint source but never a legal init or fork target.
     return marker ? WFS_E_PATH_REFUSED : 0;
+}
+
+// Linux sandbox preflight. This deliberately does not use wfs_path_check(): that public helper
+// rejects a path carrying its own marker, while the selected world root is exactly the one marker
+// that is allowed here. The identity check comes first so a moved registered world keeps the
+// normal P1 row-repair semantics.
+namespace {
+
+struct SandboxLink {
+    uint64_t dev, ino, nlink;
+};
+
+struct SandboxScan {
+    Mutex mu;
+    Vec<SandboxLink> links;
+#ifdef __linux__
+    uint64_t root_mount_id = 0;
+#endif
+};
+
+#ifdef __linux__
+// Return the kernel mount identity for one path. This deliberately asks for no attributes other
+// than STATX_MNT_ID and does not follow a final symlink: every object reported by the tree walk,
+// including a symlink itself, must belong to the same mount as the world root.
+int sandbox_mount_id(const char *path, uint64_t *out) {
+    struct statx sx;
+    ::memset(&sx, 0, sizeof sx);
+    if (::syscall(SYS_statx, AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, STATX_MNT_ID, &sx) != 0)
+        return WFS_E_SANDBOX_MOUNT;
+    if (!(sx.stx_mask & STATX_MNT_ID)) return WFS_E_SANDBOX_MOUNT;
+    *out = (uint64_t)sx.stx_mnt_id;
+    return 0;
+}
+#endif
+
+int sandbox_scan_cb(void *opaque, const char *path, const char *rel, const struct stat &st, bool is_dir) {
+    SandboxScan &scan = *(SandboxScan *)opaque;
+#ifdef __linux__
+    // st_dev is shared by bind mounts. statx's mount ID is the kernel identity that matters to
+    // the recursive bind used by the namespace sandbox. Check every callback, including the
+    // root, before FS_DIRS_PRE queues a directory for traversal. A failed syscall or a kernel
+    // that does not return STATX_MNT_ID is unsafe to treat as an ordinary walk error: fail closed.
+    uint64_t mount_id = 0;
+    if (int rc = sandbox_mount_id(path, &mount_id)) return rc;
+    if (mount_id != scan.root_mount_id)
+        return WFS_E_SANDBOX_MOUNT;
+#endif
+    if (rel && *rel) {
+        const char *leaf = ::strrchr(rel, '/');
+        leaf = leaf ? leaf + 1 : rel;
+        if (!::strcmp(leaf, WFS_MARKER_NAME) && ::strcmp(rel, WFS_MARKER_NAME) != 0)
+            return WFS_E_PATH_REFUSED;
+    }
+    if (!is_dir && st.st_nlink > 1) {
+        SandboxLink link{(uint64_t)st.st_dev, (uint64_t)st.st_ino, (uint64_t)st.st_nlink};
+        Guard g(scan.mu);
+        scan.links.emplace_back(link);
+    }
+    return 0;
+}
+
+int sandbox_link_cmp(const void *a, const void *b) {
+    const SandboxLink &x = *(const SandboxLink *)a;
+    const SandboxLink &y = *(const SandboxLink *)b;
+    if (x.dev != y.dev) return x.dev < y.dev ? -1 : 1;
+    if (x.ino != y.ino) return x.ino < y.ino ? -1 : 1;
+    return 0;
+}
+
+} // namespace
+
+extern "C" int wfs_world_check_sandbox(wfs_store *s, wfs_id id) {
+    if (!s || !id) return -EINVAL;
+    wfs_world_rec row;
+    {
+        Guard g(s->mu);
+        if (int rc = world_row(s, id, row)) return rc;
+    }
+    if (row.state != WFS_ST_ACTIVE) return -ESTALE;
+
+    wfs_identity identity;
+    if (int rc = wfs_world_verify(s, id, &identity)) return rc;
+    if (!identity.registered) return WFS_E_UNREGISTERED;
+
+    String root;
+    bool marker = false;
+    if (int rc = check_path(s, identity.path, PATH_SOURCE, root, &marker)) return rc;
+    if (!marker) return WFS_E_NOT_A_WORLD;
+
+    SandboxScan scan;
+#ifdef __linux__
+    // Capture the root mount once. The callback compares every entry against this immutable
+    // value, so bind mounts on the same device are rejected as well as mounts on another device.
+    if (int rc = sandbox_mount_id(root.c_str(), &scan.root_mount_id)) return rc;
+#endif
+    if (int rc = wfs::fs_walk_tree(root.c_str(), 4, wfs::FS_DIRS_PRE, &scan, sandbox_scan_cb)) return rc;
+    if (scan.links.empty()) return 0;
+    ::qsort(scan.links.data(), scan.links.size(), sizeof(SandboxLink), sandbox_link_cmp);
+    for (size_t i = 0; i < scan.links.size();) {
+        size_t j = i + 1;
+        while (j < scan.links.size() && scan.links[j].dev == scan.links[i].dev &&
+               scan.links[j].ino == scan.links[i].ino)
+            ++j;
+        uint64_t observed = (uint64_t)(j - i);
+        for (size_t k = i; k < j; ++k)
+            if (scan.links[k].nlink != observed) return WFS_E_SANDBOX_UNSAFE;
+        i = j;
+    }
+    return 0;
 }
 
 // ---- snapshot verification (P3) -------------------------------------------------------------

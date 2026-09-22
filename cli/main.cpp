@@ -1,3 +1,6 @@
+#ifdef __linux__
+#include "linux_sandbox.h"
+#endif
 // `world` CLI. World is the product; `fs` is the first state provider (arch.md §23).
 // C-style C++: libc only (arch.md §39).
 //
@@ -31,7 +34,7 @@ enum { EX_OK = 0, EX_ERR = 1, EX_USAGE = 2, EX_REFUSED = 3 };
 static void usage(void) {
     fputs("usage: world fs <command>\n"
           "  init <dir> [--name N] [--hard]   snapshot <dir> as S<n> (the root is gated 0000;\n"
-          "                                   --hard also sets UF_IMMUTABLE on every entry)\n"
+          "                                   --hard is macOS-only: UF_IMMUTABLE per entry)\n"
           "  fork [--from W<n>|S<n>] [--to <path>] [--name N] [--copy] [--force] [--no-pool]\n"
           "                                   clone into a writable world (default ~/worlds/W<n>/<name>);\n"
           "                                   a snapshot with a warm pool is served in O(1), --no-pool\n"
@@ -42,7 +45,7 @@ static void usage(void) {
           "                                   what changed since the fork (A/M/D/T, sorted).\n"
           "                                   Walks both trees by default -- exact, and faster than\n"
           "                                   the FSEvents path below ~200k entries; --events asks\n"
-          "                                   for FSEvents anyway, --full always walks.\n"
+          "                                   for FSEvents anyway, --full always walks (Linux: scan only).\n"
           "                                   com.apple.provenance (the kernel's note of which app\n"
           "                                   created a file, which cannot be removed) is left out\n"
           "                                   of the xattr comparison; --all-xattrs puts it back\n"
@@ -257,7 +260,7 @@ static int explain_path(wfs_store *s, const char *path, int rc, const char *verb
         // source's volume. A fork's target is a free path, so --copy (a real per-file copy)
         // is also an answer there.
         char why[WFS_PATH_MAX + 128];
-        snprintf(why, sizeof why, "%s and the %s are on different volumes: clonefile(2) returns EXDEV",
+        snprintf(why, sizeof why, "%s and the %s are on different volumes: the filesystem cannot reflink across them",
                  path, strcmp(verb, "fork") ? "store" : "fork target");
         if (!strcmp(verb, "fork"))
             snprintf(hint, sizeof hint, "world fs fork --to <path on the same volume>   (or --copy to really copy)");
@@ -342,6 +345,10 @@ static int latest_snapshot(wfs_store *s, wfs_id *out);
 static char g_exe[WFS_PATH_MAX];
 
 static void resolve_exe(const char *argv0) {
+#ifdef __linux__
+    ssize_t n = readlink("/proc/self/exe", g_exe, sizeof g_exe - 1);
+    if (n >= 0 && (size_t)n < sizeof g_exe - 1) { g_exe[n] = 0; return; }
+#endif
 #ifdef __APPLE__
     uint32_t n = (uint32_t)sizeof g_exe;
     if (_NSGetExecutablePath(g_exe, &n) == 0) {
@@ -1681,6 +1688,7 @@ static void forward_signal(int sig) {
     if (g_child > 0) kill(g_child, sig);
 }
 
+#ifndef __linux__
 static void sb_quote(FILE *f, const char *path) {
     fputc('"', f);
     for (const char *p = path; *p; ++p) {
@@ -1773,6 +1781,8 @@ static int sandbox_usable(const char *profile) {
     return WIFEXITED(st) && WEXITSTATUS(st) == 0;
 }
 
+#endif
+
 static int cmd_exec(wfs_store *s, int argc, char **argv) {
     wfs_id w = 0;
     int sandbox = 1, require_sandbox = 0, cmd_at = -1;
@@ -1813,7 +1823,27 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
     if (rc == WFS_E_WORLD_BUSY) return busy_refusal(s, w, "exec in");
     if (rc) return fail("exec: lock", rc);
 
+#ifdef __linux__
+    if (sandbox) {
+        rc = wfs_world_check_sandbox(s, w);
+        if (rc) {
+            wfs_world_unlock_exec(s, w, lockfd);
+            if (rc == WFS_E_SANDBOX_UNSAFE)
+                return refuse("refusing sandboxed exec: a non-directory inode is hardlinked outside this world",
+                              "world exec W<n> --no-sandbox -- <cmd>   (the command can then write anywhere)");
+            if (rc == WFS_E_SANDBOX_MOUNT)
+                return refuse("refusing sandboxed exec: the world contains a nested mount or its mount identity could not be verified",
+                              "remove nested mounts from the world, or use world exec W<n> --no-sandbox -- <cmd>");
+            if (rc == WFS_E_PATH_REFUSED)
+                return refuse("refusing sandboxed exec: the world path is protected or contains a nested .world marker",
+                              "move any nested World to a sibling directory or use --no-sandbox");
+            return fail("exec: sandbox preflight", rc);
+        }
+    }
+#endif
+
     char prof[WFS_PATH_MAX] = {0};
+#ifndef __linux__
     if (sandbox) {
         snprintf(prof, sizeof prof, "%s/tmp/exec-W%llu-%d.sb", wfs_store_dir(s), (unsigned long long)w,
                  (int)getpid());
@@ -1839,6 +1869,7 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
         }
     }
 
+#endif
     char idbuf[32];
     snprintf(idbuf, sizeof idbuf, "W%llu", (unsigned long long)w);
     setenv("WORLD_ID", idbuf, 1);
@@ -1849,11 +1880,13 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
     char **cav = (char **)calloc((size_t)nargs + 4, sizeof(char *));
     if (!cav) { wfs_world_unlock_exec(s, w, lockfd); return fail("exec", -ENOMEM); }
     int k = 0;
+#ifndef __linux__
     if (sandbox) {
         cav[k++] = (char *)"/usr/bin/sandbox-exec";
         cav[k++] = (char *)"-f";
         cav[k++] = prof;
     }
+#endif
     for (int i = 0; i < nargs; ++i) cav[k++] = argv[cmd_at + i];
     cav[k] = NULL;
 
@@ -1866,6 +1899,15 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
         return fail("exec: fork", e);
     }
     if (pid == 0) {
+#ifdef __linux__
+        if (sandbox) {
+            int err = linux_sandbox_exec(id.path, wfs_store_dir(s), cav);
+            fprintf(stderr, "world: namespace sandbox: %s; command was not started. "
+                    "Install /usr/bin/bwrap and enable unprivileged user namespaces, "
+                    "or explicitly use --no-sandbox.\n", strerror(-err));
+            _exit(126);
+        }
+#endif
         if (chdir(id.path) != 0) {
             fprintf(stderr, "world: exec: chdir %s: %s\n", id.path, strerror(errno));
             _exit(126);

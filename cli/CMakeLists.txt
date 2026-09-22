@@ -1,4 +1,7 @@
 set(WORLD_SOURCES main.cpp)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    list(APPEND WORLD_SOURCES linux_sandbox.cpp)
+endif()
 if(APPLE AND WFS_FSKIT)
     list(APPEND WORLD_SOURCES macos_status.mm)
 endif()

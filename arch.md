@@ -1638,5 +1638,10 @@ diff O(changes)                PASS  全扫 0.19–1.4s/50k;事件路径 0.35s �
 
 ## 40.5 其他平台
 
-Linux:overlayfs + mount namespace(fork O(1)、upper 目录即 changed-set、内核级隔离,需 XFS reflink / btrfs)。
+Linux:先落地 XFS 原生目录后端（`FICLONE` 逐文件 reflink + 现有生命周期/预克隆池），
+普通 fork 为 O(entries)，diff 全量扫描；实测和边界见 `docs/LINUX_XFS.md`。
+执行安全独立于存储：`world exec` 默认由系统 Bubblewrap 建立 user/mount/PID/IPC/UTS namespace，
+宿主只读、当前 World 可写、store 隐藏，配合降权、seccomp 和继承 fd 清理；隔离失败拒绝启动。
+Bubblewrap 是 CLI 的 Linux 沙箱工具依赖（类似 macOS 的 sandbox-exec），不进入 core 的链接依赖。
+后续再实现 overlayfs（fork O(1)、upper 目录提供 changed-set）并验证 btrfs 等后端。
 Windows:Windows 11 + Dev Drive(ReFS 块克隆逐文件)+ USN Journal;或 ProjFS 惰性投影。core 的 C ABI 不变,平台层各自实现。

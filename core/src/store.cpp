@@ -12,6 +12,9 @@
 #include <strings.h>
 #include <sys/file.h>
 #include <sys/mount.h>
+#ifdef __linux__
+#include <sys/vfs.h>
+#endif
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/random.h>
@@ -1410,6 +1413,10 @@ extern "C" const char *wfs_strerror(int rc) {
     case WFS_E_TRASH_BLOCKED: return "a directory is in the way of this trash entry's deletion";
     case WFS_E_TRASH_FOREIGN:
         return "the directory at this trash entry's path is not the tree this record was written for";
+    case WFS_E_SANDBOX_UNSAFE:
+        return "sandbox preflight found an external hardlink";
+    case WFS_E_SANDBOX_MOUNT:
+        return "sandbox preflight found a nested mount or could not verify mount identity";
     default: return ::strerror(rc < 0 ? -rc : rc);
     }
 }
@@ -1869,6 +1876,9 @@ extern "C" int wfs_store_status(wfs_store *s, wfs_store_stat *out) {
 extern "C" int wfs_store_clone_probe(wfs_store *s, const char *src_dir) {
     if (!s || !src_dir) return -EINVAL;
     int rc = wfs::fs_clone_probe(s->dir.c_str(), src_dir);
-    if (rc == -EXDEV || rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
+    if (rc == -EXDEV) return WFS_E_CROSS_VOLUME;
+#ifdef __APPLE__
+    if (rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
+#endif
     return rc;
 }
