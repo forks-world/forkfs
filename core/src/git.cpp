@@ -476,9 +476,9 @@ int git_import(const GitSource &s, const char *clone) {
     if (int rc = config(clone, "worldfs.baseline", s.head.c_str())) return rc;
     if (int rc = config(clone, "worldfs.formatVersion", "1")) return rc;
     for (const char *key : {"user.name", "user.email"}) {
-        String identity; const char *args[] = {"config", "--get", key, nullptr};
-        if (int rc = value(s.root.c_str(), args, identity, true)) return rc;
-        if (!identity.empty()) {
+        String identity; bool present = false; const char *args[] = {"config", "--get", key, nullptr};
+        if (int rc = get_config(s.root.c_str(), args, identity, &present)) return rc;
+        if (present) {
             if (int rc = config(clone, key, identity.c_str())) return rc;
         }
     }

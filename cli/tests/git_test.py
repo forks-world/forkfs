@@ -323,6 +323,20 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(two, 'rev-parse', 'refs/custom/hidden').stdout.strip(), self.base)
         self.assertEqual(self.git(two, 'status', '--porcelain').stdout, b'')
 
+    def test_explicit_empty_identity_does_not_fall_back_to_global(self):
+        for key in ('user.name', 'user.email'):
+            self.git(self.source, 'config', '--local', key, '')
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        global_config = self.root / 'global-identity'
+        global_config.write_text('[user]\n    name = Global Name\n    email = global@example.com\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        for key in ('user.name', 'user.email'):
+            self.assertEqual(self.git(one, 'config', '--local', '--get', key).stdout, b'\n')
+            self.assertEqual(self.git(one, 'config', '--get', key).stdout, b'\n')
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.world('checkpoint', wid)
+
     def test_move_discard_restore_checkpoint_and_gc(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
