@@ -44,7 +44,7 @@ for argv in [('init', src), ('checkpoint', wid),
              ('fork', '--from', wid, '--to', dst, '--no-pool')]:
     p = subprocess.run([world, '--store', store, 'fs', *argv], capture_output=True, text=True)
     assert p.returncode != 0, (kind, argv, p.stdout, p.stderr)
-    assert 'cross-device' in p.stderr.lower() or 'cross-volume' in p.stderr.lower(), p.stderr
+    assert any(text in p.stderr.lower() for text in ('cross-device', 'different volumes')), p.stderr
 p = subprocess.run([world, '--store', store, 'fs', 'fork', '--from', wid,
                     '--to', dst, '--no-pool', '--copy'], capture_output=True, text=True)
 assert p.returncode == 0, p.stderr
