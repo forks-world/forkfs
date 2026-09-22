@@ -325,6 +325,20 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
         self.world('checkpoint', wid)
 
+    def test_status_policy_enum_case_is_preserved(self):
+        for key, value in (('core.autocrlf', 'INPUT'), ('core.safecrlf', 'WaRn')):
+            self.git(self.source, 'config', key, value)
+        self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        one, wid = self.fork()
+        self.world('checkpoint', wid)
+        two, _ = self.fork('enum-child', wid)
+        for path in (one, two):
+            for key, value in (('core.autocrlf', b'INPUT'), ('core.safecrlf', b'WaRn')):
+                self.assertEqual(self.git(path, 'config', '--get', key).stdout.strip(), value)
+            self.assertEqual(self.git(path, 'status', '--porcelain').stdout, b'')
+
     def test_filter_configuration_is_refused_before_execution(self):
         (self.source / '.gitattributes').write_text('file filter=example\n')
         self.git(self.source, 'add', '.gitattributes')

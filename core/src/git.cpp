@@ -5,6 +5,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <string.h>
+#include <strings.h>
 #include <stdint.h>
 
 extern char **environ;
@@ -249,7 +250,8 @@ int capture_settings(const char *root, Vec<GitSetting> &out) {
         String value; bool present;
         if ((rc = get_config(root, raw, value, &present))) return rc;
         if (!present) continue;
-        bool literal = (i == 0 && value == "input") || (i == 1 && value == "warn");
+        bool literal = (i == 0 && !strcasecmp(value.c_str(), "input")) ||
+                       (i == 1 && !strcasecmp(value.c_str(), "warn"));
         if (!literal) {
             const char *typed[] = {"config", "--get", "--type=bool", special[i], nullptr};
             if ((rc = get_config(root, typed, value, &present))) return rc;
