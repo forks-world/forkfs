@@ -26,6 +26,7 @@
 using wfs::copy_str;
 using wfs::Guard;
 using wfs::Manifest;
+using wfs::Mutex;
 using wfs::now_sec;
 using wfs::Stmt;
 using wfs::String;
@@ -3173,6 +3174,82 @@ extern "C" int wfs_path_check(wfs_store *s, const char *path, int for_target) {
     if (rc) return rc;
     // A world root is a legal checkpoint source but never a legal init or fork target.
     return marker ? WFS_E_PATH_REFUSED : 0;
+}
+
+// Linux sandbox preflight. This deliberately does not use wfs_path_check(): that public helper
+// rejects a path carrying its own marker, while the selected world root is exactly the one marker
+// that is allowed here. The identity check comes first so a moved registered world keeps the
+// normal P1 row-repair semantics.
+namespace {
+
+struct SandboxLink {
+    uint64_t dev, ino, nlink;
+};
+
+struct SandboxScan {
+    Mutex mu;
+    Vec<SandboxLink> links;
+};
+
+int sandbox_scan_cb(void *opaque, const char *, const char *rel, const struct stat &st, bool is_dir) {
+    SandboxScan &scan = *(SandboxScan *)opaque;
+    if (rel && *rel) {
+        const char *leaf = ::strrchr(rel, '/');
+        leaf = leaf ? leaf + 1 : rel;
+        if (!::strcmp(leaf, WFS_MARKER_NAME) && ::strcmp(rel, WFS_MARKER_NAME) != 0)
+            return WFS_E_PATH_REFUSED;
+    }
+    if (!is_dir && st.st_nlink > 1) {
+        SandboxLink link{(uint64_t)st.st_dev, (uint64_t)st.st_ino, (uint64_t)st.st_nlink};
+        Guard g(scan.mu);
+        scan.links.emplace_back(link);
+    }
+    return 0;
+}
+
+int sandbox_link_cmp(const void *a, const void *b) {
+    const SandboxLink &x = *(const SandboxLink *)a;
+    const SandboxLink &y = *(const SandboxLink *)b;
+    if (x.dev != y.dev) return x.dev < y.dev ? -1 : 1;
+    if (x.ino != y.ino) return x.ino < y.ino ? -1 : 1;
+    return 0;
+}
+
+} // namespace
+
+extern "C" int wfs_world_check_sandbox(wfs_store *s, wfs_id id) {
+    if (!s || !id) return -EINVAL;
+    wfs_world_rec row;
+    {
+        Guard g(s->mu);
+        if (int rc = world_row(s, id, row)) return rc;
+    }
+    if (row.state != WFS_ST_ACTIVE) return -ESTALE;
+
+    wfs_identity identity;
+    if (int rc = wfs_world_verify(s, id, &identity)) return rc;
+    if (!identity.registered) return WFS_E_UNREGISTERED;
+
+    String root;
+    bool marker = false;
+    if (int rc = check_path(s, identity.path, PATH_SOURCE, root, &marker)) return rc;
+    if (!marker) return WFS_E_NOT_A_WORLD;
+
+    SandboxScan scan;
+    if (int rc = wfs::fs_walk_tree(root.c_str(), 4, wfs::FS_DIRS_PRE, &scan, sandbox_scan_cb)) return rc;
+    if (scan.links.empty()) return 0;
+    ::qsort(scan.links.data(), scan.links.size(), sizeof(SandboxLink), sandbox_link_cmp);
+    for (size_t i = 0; i < scan.links.size();) {
+        size_t j = i + 1;
+        while (j < scan.links.size() && scan.links[j].dev == scan.links[i].dev &&
+               scan.links[j].ino == scan.links[i].ino)
+            ++j;
+        uint64_t observed = (uint64_t)(j - i);
+        for (size_t k = i; k < j; ++k)
+            if (scan.links[k].nlink != observed) return WFS_E_SANDBOX_UNSAFE;
+        i = j;
+    }
+    return 0;
 }
 
 // ---- snapshot verification (P3) -------------------------------------------------------------

@@ -36,7 +36,7 @@ def shared(path):
 
 with tempfile.TemporaryDirectory(prefix='wfs-xfs-', dir=args.scratch.resolve()) as temp:
     root = Path(temp)
-    store, src, a, b = (root / name for name in ('store', 'source', 'a', 'b'))
+    store, src, a, b, c = (root / name for name in ('store', 'source', 'a', 'b', 'c'))
     src.mkdir()
     env = dict(os.environ, WORLD_POOL_TOPUP='0', WORLD_GC_CREATING_MIN_AGE='0')
 
@@ -138,6 +138,68 @@ with tempfile.TemporaryDirectory(prefix='wfs-xfs-', dir=args.scratch.resolve()) 
     (a / 'escape').symlink_to(src, target_is_directory=True)
     outside = root / 'outside'
     outside.write_text('untouched')
+
+    # Sandbox preflight rejects aliases whose inode also has a name outside the World, before
+    # the payload can run. Internal hardlinks remain valid (data/linked above).
+    external_alias = root / 'external-data'
+    os.link(a / 'data', external_alias)
+    preflight_marker = a / 'preflight-ran'
+    failed = run('exec', wid, '--', '/usr/bin/touch', preflight_marker, ok=False)
+    assert 'hardlinked outside' in failed.stderr and not preflight_marker.exists()
+    assert external_alias.read_text() == 'world changed\n'
+    external_alias.unlink()
+
+    singleton = a / 'singleton-hardlink'
+    singleton.write_text('singleton\n')
+    singleton_alias = root / 'singleton-alias'
+    os.link(singleton, singleton_alias)
+    # Leave only this one recorded group so a singleton group with nlink > 1 cannot be hidden
+    # behind the fully internal data/linked group.
+    (a / 'linked').unlink()
+    failed = run('exec', wid, '--', '/usr/bin/touch', preflight_marker, ok=False)
+    assert 'hardlinked outside' in failed.stderr and not preflight_marker.exists()
+    singleton_alias.unlink()
+    singleton.unlink()
+    os.link(a / 'data', a / 'linked')
+
+    symlink_alias = root / 'external-symlink'
+    os.link(a / 'sym', symlink_alias, follow_symlinks=False)
+    failed = run('exec', wid, '--', '/usr/bin/touch', preflight_marker, ok=False)
+    assert 'hardlinked outside' in failed.stderr and not preflight_marker.exists()
+    symlink_alias.unlink()
+
+    # A verified nested World and an unregistered nested marker are both refused by the same
+    # tree walk. Move the verified fixture back so the rest of the lifecycle can use its row.
+    inner = a / 'inner'
+    b.rename(inner)
+    fs('verify', inner)
+    failed = run('exec', wid, '--', '/usr/bin/touch', preflight_marker, ok=False)
+    assert 'nested .world marker' in failed.stderr and not preflight_marker.exists()
+    failed = run('exec', wid2, '--', '/usr/bin/touch', preflight_marker, ok=False)
+    assert 'protected' in failed.stderr and not preflight_marker.exists()
+    inner.rename(b)
+    fs('verify', b)
+    unverified = a / 'unverified'
+    unverified.mkdir()
+    (unverified / '.world').write_text('{}')
+    failed = run('exec', wid, '--', '/usr/bin/touch', preflight_marker, ok=False)
+    assert 'nested .world marker' in failed.stderr and not preflight_marker.exists()
+    (unverified / '.world').unlink()
+    unverified.rmdir()
+
+    unreadable = a / 'unreadable'
+    unreadable.mkdir()
+    unreadable.chmod(0)
+    failed = run('exec', wid, '--', '/usr/bin/touch', preflight_marker, ok=False)
+    assert not preflight_marker.exists()
+    unreadable.chmod(0o755)
+    unreadable.rmdir()
+
+    # A separate trashed world is outside this walk and does not block the selected world.
+    trashed = ident(fs('fork', '--from', sid, '--to', c, '--no-pool').stdout, 'W')
+    fs('discard', trashed)
+    run('exec', wid, '--require-sandbox', '--', '/bin/true')
+
     private_name = f'world-private-{root.name}'
     probe = r"""
 import errno, hashlib, os, pathlib, socket, subprocess, sys

@@ -100,6 +100,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y g++-14 libsqlite3-dev xfsprogs bubblewrap
+      - name: Allow Bubblewrap user namespaces under Ubuntu AppArmor
+        run: |
+          # Ubuntu 24.04's AppArmor policy requires an explicit profile for unprivileged userns.
+          cat <<'EOF' | sudo tee /etc/apparmor.d/bwrap >/dev/null
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          EOF
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap
       - name: Create bounded XFS test volume
         run: |
           truncate -s 2G "$RUNNER_TEMP/forkfs-xfs.img"

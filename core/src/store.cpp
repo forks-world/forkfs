@@ -1413,6 +1413,8 @@ extern "C" const char *wfs_strerror(int rc) {
     case WFS_E_TRASH_BLOCKED: return "a directory is in the way of this trash entry's deletion";
     case WFS_E_TRASH_FOREIGN:
         return "the directory at this trash entry's path is not the tree this record was written for";
+    case WFS_E_SANDBOX_UNSAFE:
+        return "sandbox preflight found an external hardlink";
     default: return ::strerror(rc < 0 ? -rc : rc);
     }
 }

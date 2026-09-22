@@ -1823,6 +1823,22 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
     if (rc == WFS_E_WORLD_BUSY) return busy_refusal(s, w, "exec in");
     if (rc) return fail("exec: lock", rc);
 
+#ifdef __linux__
+    if (sandbox) {
+        rc = wfs_world_check_sandbox(s, w);
+        if (rc) {
+            wfs_world_unlock_exec(s, w, lockfd);
+            if (rc == WFS_E_SANDBOX_UNSAFE)
+                return refuse("refusing sandboxed exec: a non-directory inode is hardlinked outside this world",
+                              "world exec W<n> --no-sandbox -- <cmd>   (the command can then write anywhere)");
+            if (rc == WFS_E_PATH_REFUSED)
+                return refuse("refusing sandboxed exec: the world path is protected or contains a nested .world marker",
+                              "move any nested World to a sibling directory or use --no-sandbox");
+            return fail("exec: sandbox preflight", rc);
+        }
+    }
+#endif
+
     char prof[WFS_PATH_MAX] = {0};
 #ifndef __linux__
     if (sandbox) {

@@ -26,10 +26,11 @@ scripts/check-deps.sh build/Release
 python3 scripts/bench/linux_xfs.py build/Release/cli/world --scratch build/Release
 ```
 
-CTest puts fixtures under the build directory, because Linux `/tmp` is often tmpfs.
-The XFS suite fails if reflink or namespace isolation is unavailable; it does not turn
-these checks into silent skips. CI provisions a bounded 2 GiB XFS loop volume, builds
-there, and runs the tests as the ordinary runner user.
+The Linux XFS integration and diff tests put fixtures under the build directory, because
+Linux `/tmp` is often tmpfs. The small `linux_clone_test` uses its own `/tmp` fixture to
+exercise restrictive umask handling. The XFS suite fails if reflink or namespace isolation
+is unavailable; it does not turn these checks into silent skips. CI provisions a bounded
+2 GiB XFS loop volume, builds there, and runs the tests as the ordinary runner user.
 
 The default store is `$XDG_DATA_HOME/world/fs`, or `~/.local/share/world/fs`.
 Use `--store` to place it on the project's filesystem if necessary.
@@ -82,6 +83,9 @@ The policy in `cli/linux_sandbox.cpp`:
 - Drops capabilities, uses Bubblewrap's `no_new_privs`, and disables further user namespaces.
 - Keeps the host network for TCP/UDP development tools. A seccomp filter denies Unix socket creation, datagram socketpairs, io_uring setup and alternate syscall ABIs. Stream socketpairs remain available for child-process IPC.
 - Marks inherited descriptors above stderr close-on-exec before launching Bubblewrap. Standard input/output/error remain caller-authorized handles.
+- Before a sandboxed launch, the core performs one parallel O(entries) preflight over the selected
+  World. It rejects nested `.world` markers and non-directory hardlinks whose inode also has a
+  name outside the World; hardlinks fully contained in the World remain usable.
 - Uses a new session and `--die-with-parent`; the existing exec lock covers the runner's lifetime.
 
 Setup failures return an error without starting the command. `--require-sandbox` is
@@ -92,7 +96,9 @@ Tools needing writable state should be configured to place it in the World or pr
 `/tmp`. Unix-socket services such as Docker, SSH agents and session D-Bus are unavailable.
 The host network is intentionally shared, including localhost services; this policy is
 not network isolation, confidentiality of readable host files, or CPU/memory/disk quota
-control. Running a command by manually entering the directory bypasses `world exec`.
+control. The preflight is a point-in-time check while `world exec` starts; trusted host changes
+to the tree between or during execution are outside this guarantee. Running a command by
+manually entering the directory bypasses `world exec`.
 Overlayfs is not needed for these execution namespaces.
 
 References: [FICLONE API](https://man7.org/linux/man-pages/man2/ioctl_ficlone.2.html),
@@ -102,7 +108,7 @@ References: [FICLONE API](https://man7.org/linux/man-pages/man2/ioctl_ficlone.2.
 ## Local validation and initial timings
 
 2026-09-22: Fedora 44, Linux 6.19.10, x86-64 Intel i7-10700, XFS, GCC 16.2.1,
-Bubblewrap 0.12.0. Both CTest suites and the linked-dependency check passed.
+Bubblewrap 0.12.0. All three Linux CTest tests and the linked-dependency check passed.
 The integration suite checks shared extents with FIEMAP, distinct clone inodes,
 COW isolation, ACL/xattr/mode/time preservation, xattr-only diff, hardlinks, sparse files,
 symlinks, FIFO, checkpoint, pool hits, discard/restore, protected baselines, cross-volume
@@ -116,9 +122,10 @@ setup failure without fallback, command exit status, exec locks and signal termi
 Medians of three runs, 4 KiB files with 100 files per directory; milliseconds including
 CLI startup. Source construction, pool fill and deletion are outside the corresponding
 latency sample. These are warm local microbenchmarks, not a claim of optimal concurrency
-or native-workload throughput.
+or native-workload throughput. The exec column predates the O(entries) sandbox preflight and
+is retained only as a pre-preflight baseline.
 
-| Files | Init | Fork without pool | Pool fork | Clean full diff | Sandboxed exec (`true`) |
+| Files | Init | Fork without pool | Pool fork | Clean full diff | Sandboxed exec (`true`, pre-preflight) |
 |---|---:|---:|---:|---:|---:|
 | 1,000 | 26.06 | 25.07 | 3.86 | 4.80 | 4.71 |
 | 10,000 | 208.20 | 193.44 | 3.70 | 29.66 | 4.76 |

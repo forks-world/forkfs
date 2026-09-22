@@ -152,7 +152,10 @@ enum {
      * binary among them would run M1's collector over M2 trash semantics. The upgrade is put
      * back (the database returns to `metadata.db`, VERSION to 2) and refused;
      * wfs_store_holders() names who to stop. */
-    WFS_E_STORE_BUSY = -1020
+    WFS_E_STORE_BUSY = -1020,
+    /* Linux sandbox preflight: an external hardlink means the writable world mount could
+     * modify an inode that is also named outside the world. */
+    WFS_E_SANDBOX_UNSAFE = -1021
 };
 
 /* One process, other than this one, that has a store's database open (PR #1 review, 34th
@@ -457,6 +460,12 @@ int wfs_world_lock_exec(wfs_store *s, wfs_id id, const char *cmd, int *out_fd);
 void wfs_world_unlock_exec(wfs_store *s, wfs_id id, int fd);
 /* Reports the live holder, if any, and removes a stale lock as a side effect. */
 int wfs_world_lock_check(wfs_store *s, wfs_id id, wfs_lock_info *out);
+
+/* Linux sandbox preflight. Verifies the active registered world, canonicalizes its root and
+ * scans it once for nested `.world` markers and hardlinked non-directory entries whose inode has
+ * names outside the tree. Returns WFS_E_SANDBOX_UNSAFE for the latter; other walk errors are
+ * returned unchanged. The caller must hold the world's exec lock while this runs. */
+int wfs_world_check_sandbox(wfs_store *s, wfs_id id);
 
 typedef struct wfs_identity {
     int has_marker;  /* a .world file was read */

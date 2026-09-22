@@ -98,7 +98,13 @@ String target(CloneCtx *c, const char *rel) {
 int clone_entry(void *ctx, const char *src, const char *rel, const struct stat &st, bool dir) {
     auto *c = (CloneCtx *)ctx;
     String dst = target(c, rel);
-    if (dir) return ::mkdir(dst.c_str(), 0700) == 0 ? 0 : -errno;
+    if (dir) {
+        if (::mkdir(dst.c_str(), 0700)) return -errno;
+        // mkdir(2) applies the caller's umask; make the directory traversable before cloning
+        // its children. The post-order metadata pass restores the source's final mode.
+        if (::chmod(dst.c_str(), 0700)) return -errno;
+        return 0;
+    }
     int rc = 0;
     if (S_ISREG(st.st_mode)) {
         int in = ::open(src, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);

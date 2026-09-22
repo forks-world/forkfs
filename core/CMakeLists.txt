@@ -48,6 +48,11 @@ if(APPLE)
     target_link_libraries(core_test PRIVATE worldfs_core)
     add_test(NAME core_test COMMAND core_test)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(linux_clone_test tests/linux_clone_test.cpp)
+    target_include_directories(linux_clone_test PRIVATE src)
+    target_link_libraries(linux_clone_test PRIVATE worldfs_core wfs_third_party)
+    add_test(NAME linux_clone_test COMMAND linux_clone_test)
+
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_test(NAME linux_xfs_test COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_SOURCE_DIR}/scripts/tests/linux_xfs.py $<TARGET_FILE:world>
