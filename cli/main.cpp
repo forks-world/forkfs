@@ -32,7 +32,7 @@ extern "C" int world_fs_status_platform(void);
 
 enum { EX_OK = 0, EX_ERR = 1, EX_USAGE = 2, EX_REFUSED = 3 };
 
-static void usage(void) {
+static void usage(int code = EX_USAGE) {
     fputs("usage: world fs <command>\n"
           "  init <dir> [--name N] [--hard]   snapshot <dir> as S<n> (the root is gated 0000;\n"
           "                                   --hard is macOS-only: UF_IMMUTABLE per entry)\n"
@@ -61,9 +61,10 @@ static void usage(void) {
           "                                   collect half-built trees, stale profiles and dead pool\n"
           "                                   entries; the trash itself is emptied by a background\n"
           "                                   worker unless --now says do it here. --status reports\n"
-          "                                   what is waiting and who is on it; --reconcile marks rows\n"
+          "                                   what is waiting and who is on it (--json supported);\n"
+          "                                   --reconcile marks rows\n"
           "                                   whose tree is gone as dead\n"
-          "  pool status                      pre-cloned worlds waiting per snapshot\n"
+          "  pool status [--json]             pre-cloned worlds waiting per snapshot\n"
           "  pool fill S<n> [--count K]       top the pool up to K ready entries (default 2)\n"
           "  pool drain S<n>|--all            delete the pool entries of a snapshot\n"
           "  status [--json]                  store, counts, free space\n"
@@ -81,10 +82,40 @@ static void usage(void) {
           "                                   run <cmd> in the world: cwd = its root, WORLD_* in the\n"
           "                                   environment, an exec lock, and a seatbelt profile that\n"
           "                                   denies writes outside this world\n"
-          "  world version\n"
+          "  world version | --help\n"
           "options: --store <dir> (or $WORLD_STORE) selects the metadata store\n",
-          stderr);
-    exit(EX_USAGE);
+          code == EX_OK ? stdout : stderr);
+    exit(code);
+}
+
+// Reject malformed numeric options before any command can change workspace state.
+static int64_t retention_days(const char *value) {
+    for (const char *p = value; *p; ++p)
+        if ((*p < '0' || *p > '9') && *p != '.') {
+            fprintf(stderr, "world: --retention requires non-negative decimal days\n");
+            exit(EX_USAGE);
+        }
+    errno = 0;
+    char *end = NULL;
+    long double days = strtold(value, &end);
+    long double seconds = days * 86400.0L;
+    if (errno || end == value || *end || !(seconds >= 0 && seconds < (long double)INT64_MAX)) {
+        fprintf(stderr, "world: --retention is invalid or out of range\n");
+        exit(EX_USAGE);
+    }
+    return (int64_t)seconds;
+}
+
+static int pool_count(const char *value) {
+    if (!*value) { fprintf(stderr, "world: --count requires an integer in 0..4096\n"); exit(EX_USAGE); }
+    unsigned count = 0;
+    for (const char *p = value; *p; ++p) {
+        if (*p < '0' || *p > '9' || (count = count * 10 + (*p - '0')) > 4096) {
+            fprintf(stderr, "world: --count requires an integer in 0..4096\n");
+            exit(EX_USAGE);
+        }
+    }
+    return (int)count;
 }
 
 static const char *g_store_override = NULL;
@@ -449,12 +480,26 @@ static int cmd_pool(wfs_store *s, int argc, char **argv) {
     if (argc < 1) usage();
     const char *verb = argv[0];
     if (!strcmp(verb, "status")) {
+        if (argc != 1) usage();
         size_t n = 0;
-        wfs_pool_status(s, NULL, 0, &n);
-        if (!n) { printf("pool: empty\n"); return EX_OK; }
-        wfs_pool_stat *v = (wfs_pool_stat *)calloc(n, sizeof *v);
-        if (!v) return fail("pool status", -ENOMEM);
-        wfs_pool_status(s, v, n, &n);
+        wfs_pool_stat *v = NULL;
+        int rc = json_read_list(s, &v, &n);
+        if (rc) return fail("pool status", rc);
+        if (g_json) {
+            fputs("{\"schema_version\":1,\"pool\":[", g_json_out);
+            for (size_t i = 0; i < n; ++i) {
+                if (i) fputc(',', g_json_out);
+                Json j(g_json_out);
+                j.ref("snapshot", 'S', v[i].snapshot); j.str("snapshot_name", v[i].snapshot_name);
+                j.num("ready", v[i].ready); j.num("building", v[i].building);
+                j.num("stale", v[i].stale); j.num("entries", v[i].entries);
+                j.signed_num("oldest_at", v[i].oldest_at); j.signed_num("newest_at", v[i].newest_at);
+            }
+            fputs("]}", g_json_out);
+            free(v);
+            return EX_OK;
+        }
+        if (!n) { free(v); printf("pool: empty\n"); return EX_OK; }
         printf("%-6s %-20s %7s %9s %7s %10s  %s\n", "SNAP", "NAME", "READY", "BUILDING", "STALE",
                "ENTRIES", "NEWEST");
         for (size_t i = 0; i < n; ++i) {
@@ -472,7 +517,7 @@ static int cmd_pool(wfs_store *s, int argc, char **argv) {
         wfs_ref r = {WFS_K_NONE, 0};
         int target = POOL_DEFAULT_TARGET;
         for (int i = 1; i < argc; ++i) {
-            if (!strcmp(argv[i], "--count") && i + 1 < argc) target = atoi(argv[++i]);
+            if (!strcmp(argv[i], "--count") && i + 1 < argc) target = pool_count(argv[++i]);
             else if (argv[i][0] != '-' && r.kind == WFS_K_NONE) r = parse_ref(argv[i]);
             else usage();
         }
@@ -791,7 +836,7 @@ static int cmd_diff(wfs_store *s, int argc, char **argv) {
           STAT(events_id); STAT(fallback); STAT(elapsed_us);
 #undef STAT
           j.boolean("full_scan", st.full_scan); }
-        fprintf(g_json_out, ",\"stat_only\":%s}\n", stat_only ? "true" : "false");
+        fprintf(g_json_out, ",\"stat_only\":%s}", stat_only ? "true" : "false");
     } else if (stat_only) {
         printf("%llu added, %llu modified, %llu deleted, %llu metadata-only\n",
                (unsigned long long)st.added, (unsigned long long)st.modified,
@@ -844,7 +889,7 @@ static int cmd_list(wfs_store *s) {
         }
     }
     free(worlds);
-    if (g_json) fputs("]}\n", g_json_out);
+    if (g_json) fputs("]}", g_json_out);
     return EX_OK;
 }
 
@@ -1068,7 +1113,7 @@ static int cmd_discard(wfs_store *s, int argc, char **argv) {
     for (int i = 0; i < argc; ++i) {
         if (!strcmp(argv[i], "--now")) now = 1;
         else if (!strcmp(argv[i], "--force")) force = 1;
-        else if (!strcmp(argv[i], "--retention") && i + 1 < argc) retention = (int64_t)(atof(argv[++i]) * 86400.0);
+        else if (!strcmp(argv[i], "--retention") && i + 1 < argc) retention = retention_days(argv[++i]);
         else if (argv[i][0] != '-' && target.kind == WFS_K_NONE) target = parse_ref(argv[i]);
         else usage();
     }
@@ -1268,6 +1313,7 @@ static int cmd_gc_status(wfs_store *s, int64_t retention) {
     wfs_trash_stat ts;
     int rc = wfs_gc_status(s, retention, &ts);
     if (rc) return fail("gc --status", rc);
+    if (g_json) { json_trash(g_json_out, ts); return EX_OK; }
     char est[32], freeb[32];
     fmt_bytes(est, sizeof est, ts.bytes_estimate);
     fmt_bytes(freeb, sizeof freeb, ts.volume_free_bytes);
@@ -1340,12 +1386,20 @@ static int cmd_gc(wfs_store *s, int argc, char **argv) {
     int64_t retention = -1;
     int now = 0, status = 0, worker = 0, reconcile = 0;
     for (int i = 0; i < argc; ++i) {
-        if (!strcmp(argv[i], "--retention") && i + 1 < argc) retention = (int64_t)(atof(argv[++i]) * 86400.0);
+        if (!strcmp(argv[i], "--retention") && i + 1 < argc) retention = retention_days(argv[++i]);
         else if (!strcmp(argv[i], "--now")) now = 1;
         else if (!strcmp(argv[i], "--status")) status = 1;
         else if (!strcmp(argv[i], "--worker")) worker = 1;
         else if (!strcmp(argv[i], "--reconcile")) reconcile = 1;
         else usage();
+    }
+    if (status && (now || worker || reconcile)) {
+        fprintf(stderr, "world: gc --status cannot be combined with --now, --worker or --reconcile\n");
+        return EX_USAGE;
+    }
+    if (g_json && !status) {
+        fprintf(stderr, "world: gc --json requires --status\n");
+        return EX_USAGE;
     }
     if (status) return cmd_gc_status(s, retention);
     if (worker) return cmd_gc_worker(s, retention, reconcile);
@@ -2005,6 +2059,8 @@ int main(int argc, char **argv) {
         av[ac++] = argv[i];
     }
     if (ac < 2) usage();
+    if (ac == 2 && (!strcmp(av[1], "--help") || !strcmp(av[1], "-h") || !strcmp(av[1], "help")))
+        usage(EX_OK);
     if (!strcmp(av[1], "version")) { printf("world %s\n", wfs_version()); return EX_OK; }
     // `world exec` is a World-level command, not a provider command: no `fs` in front of it.
     const int is_exec = !strcmp(av[1], "exec");
@@ -2012,8 +2068,12 @@ int main(int argc, char **argv) {
     const char *sub = is_exec ? "exec" : av[2];
     int nargs = is_exec ? ac - 2 : ac - 3;
     char **args = av + (is_exec ? 2 : 3);
+    if ((!nargs && (!strcmp(sub, "--help") || !strcmp(sub, "-h") || !strcmp(sub, "help"))) ||
+        (nargs == 1 && (!strcmp(args[0], "--help") || !strcmp(args[0], "-h"))) ||
+        (!strcmp(sub, "pool") && nargs == 2 && !strcmp(args[1], "--help"))) usage(EX_OK);
     if (!is_exec && (!strcmp(sub, "list") || !strcmp(sub, "inspect") ||
-                     !strcmp(sub, "status") || !strcmp(sub, "diff"))) {
+                     !strcmp(sub, "status") || !strcmp(sub, "diff") || !strcmp(sub, "gc") ||
+                     (!strcmp(sub, "pool") && nargs && !strcmp(args[0], "status")))) {
         int kept = 0;
         for (int i = 0; i < nargs; ++i) {
             if (!strcmp(args[i], "--json")) g_json = true;
@@ -2304,6 +2364,7 @@ int main(int argc, char **argv) {
     wfs_store_close(s);
     if (g_json_out) {
         if (ret == EX_OK) {
+            fputc('\n', g_json_out);
             if (fflush(g_json_out) || ferror(g_json_out) || fseek(g_json_out, 0, SEEK_SET))
                 ret = fail("JSON buffer", -EIO);
             else {

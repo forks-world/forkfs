@@ -92,6 +92,25 @@ static int json_list(wfs_store *s, wfs_world_rec *v, size_t cap, size_t *n) {
     return wfs_world_list(s, 1, v, cap, n);
 }
 
+static int json_list(wfs_store *s, wfs_pool_stat *v, size_t cap, size_t *n) {
+    return wfs_pool_status(s, v, cap, n);
+}
+
+static void json_trash(FILE *out, const wfs_trash_stat &ts) {
+    Json j(out);
+    j.num("schema_version", 1);
+#define TRASH(field) j.num(#field, ts.field)
+    TRASH(entries); TRASH(deleting); TRASH(due); TRASH(worlds); TRASH(snapshots);
+    TRASH(tree_entries); TRASH(bytes_estimate); TRASH(volume_free_bytes); TRASH(volume_total_bytes);
+    TRASH(creating_stranded); TRASH(pool_stranded); TRASH(dirs_unreadable);
+    TRASH(dirs_unreadable_errno); TRASH(trash_blocked); TRASH(trash_foreign);
+    TRASH(worker_done); TRASH(worker_remaining);
+#undef TRASH
+    j.signed_num("worker_pid", ts.worker_pid); j.signed_num("worker_started_at", ts.worker_started_at);
+    j.str("dirs_unreadable_path", ts.dirs_unreadable_path);
+    j.str("blocked_path", ts.blocked_path); j.str("foreign_path", ts.foreign_path);
+}
+
 // The core reports the total count even when the buffer is too small. Retry boundedly if
 // another process grows the list between calls; never read past capacity or silently truncate.
 template <class T> static int json_read_list(wfs_store *s, T **out, size_t *n) {

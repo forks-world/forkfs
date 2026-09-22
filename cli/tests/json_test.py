@@ -151,6 +151,68 @@ class JsonTest(unittest.TestCase):
         self.assertEqual(result.stdout, b'')
         self.assertIn(b'list', result.stderr)
 
+    def test_pool_status(self):
+        self.assertEqual(self.query('pool', 'status')['pool'], [])
+        name = self.populate()
+        self.run_world('fs', 'pool', 'fill', 'S1', '--count', '2')
+        rows = self.query('pool', 'status')['pool']
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['snapshot'], 'S1')
+        self.assertEqual(rows[0]['snapshot_name'], name)
+        self.assertEqual(rows[0]['ready'], 2)
+        self.assertEqual(rows[0]['stale'], 0)
+        self.assertGreater(rows[0]['newest_at'], 0)
+        self.run_world('fs', 'pool', 'drain', 'S1')
+        self.assertEqual(self.query('pool', 'status')['pool'], [])
+
+    def test_gc_status(self):
+        empty = self.query('gc', '--status')
+        self.assertEqual(empty['entries'], 0)
+        self.assertEqual(empty['worker_pid'], 0)
+        self.populate()
+        self.run_world('fs', 'discard', 'W1')
+        report = self.query('gc', '--status', '--retention', '0.5')
+        self.assertEqual(report['entries'], 1)
+        self.assertEqual(report['worlds'], 1)
+        self.assertEqual(report['due'], 0)
+        self.assertEqual(report['dirs_unreadable'], 0)
+        self.assertEqual(self.query('gc', '--status', '--retention', '0')['due'], 1)
+        self.assertEqual(self.query('inspect', 'W1')['state'], 'trashed')
+        self.run_world('fs', 'restore', 'W1')
+
+    def test_reject_invalid_numbers_without_changing_worlds(self):
+        self.populate()
+        for value in ('', 'oops', '-1', 'nan', 'inf', '1junk', '1e9999', '999999999999999999999', '0x1', ' 1'):
+            for args in [('gc', '--now'), ('discard', 'W1')]:
+                with self.subTest(args=args, value=value):
+                    result = self.run_world('fs', *args, '--retention', value, code=2)
+                    self.assertEqual(result.stdout, b'')
+        for value in ('', 'oops', '-1', '1.5', '4097', '999999999999999999999'):
+            result = self.run_world('fs', 'pool', 'fill', 'S1', '--count', value, code=2)
+            self.assertEqual(result.stdout, b'')
+        self.assertEqual(self.query('pool', 'status')['pool'], [])
+        self.assertEqual(self.query('inspect', 'W1')['state'], 'active')
+        self.run_world('fs', 'pool', 'fill', 'S1', '--count', '0')
+        self.assertEqual(self.query('pool', 'status')['pool'], [])
+
+    def test_gc_rejects_conflicting_modes(self):
+        self.populate()
+        self.run_world('fs', 'discard', 'W1')
+        for flag in ('--now', '--reconcile', '--worker'):
+            result = self.run_world('fs', 'gc', '--status', '--json', flag, code=2)
+            self.assertEqual(result.stdout, b'')
+        self.run_world('fs', 'gc', '--json', code=2)
+        self.assertEqual(self.query('gc', '--status')['entries'], 1)
+        self.run_world('fs', 'restore', 'W1')
+
+    def test_help_does_not_open_store(self):
+        for args in [('--help',), ('-h',), ('help',), ('fs', '--help'),
+                     ('fs', 'list', '--help'), ('fs', 'pool', 'status', '--help')]:
+            result = self.run_world(*args)
+            self.assertIn(b'usage:', result.stdout)
+            self.assertEqual(result.stderr, b'')
+            self.assertFalse(self.store.exists())
+
     def test_text_output_and_exec_passthrough(self):
         self.populate()
         self.assertIn(b'SNAP', self.run_world('fs', 'list').stdout)

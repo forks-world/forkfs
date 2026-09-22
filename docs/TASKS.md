@@ -8,11 +8,14 @@
 
 ## 当前增量开发(2026-09-22)
 
-- [x] CLI 查询 JSON 输出:`list / inspect / status / diff --json`,报告版本 1;
+- [x] CLI 查询 JSON 输出:`list / inspect / status / diff / pool status / gc --status` 支持 `--json`,报告版本 1;
   失败查询不发布半份 JSON,诊断保留 stderr,特殊字符与 UTF-8 正确转义。
   `list` 同时补齐查询错误传播、分配检查与并发增长的容量重试。
   `cli/tests/json_test.py` 覆盖真实 store 的查询、diff、特殊名称、错误与文本兼容;
   CMake 在 Python 3 可用时注册为 `cli_json_test`。
+- [x] CLI 参数补齐:`--help` 输出到 stdout、退出 0、不开 store;
+  `pool fill --count` / `gc,discard --retention` 严格校验,错误参数退出 2;
+  `gc --status` 拒绝同时要求执行清理或对账。
 
 ## 环境事实(2026-09-18, Mac mini M1, macOS 26.6.2)
 
