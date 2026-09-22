@@ -1311,19 +1311,36 @@ grep -q "work remains, handing over" "$SCRATCH/gcfb.log" && ok PR1 "it hands the
                                                          || { bad PR1 "it hands the rest of the tree over"; sed 's/^/        /' "$SCRATCH/gcfb.log"; }
 # The same reason as the case above: the successor this wake started is already deleting the
 # rest of the tree, so `find` and `-d` would be reporting on a tree three processes are taking
-# apart (this is the assertion that failed three times on CI, with 3 entries left -- the chain
-# had all but finished between the two observations). The wake's own report cannot be raced:
-# the fallback unlinked part of the tree, and the deadline stopped it before the end.
+# apart. The wake's own report cannot be raced. The fallback may spend the whole budget in its
+# recovery/unprotect scan before the first unlink, so zero is a valid report; the successor
+# completion assertion below proves that the unfinished tree was handed over.
 FREED2=$(freed_entries "$SCRATCH/gcfb.log")
-if [ -n "$FREED2" ] && [ "$FREED2" -gt 0 ] && [ "$FREED2" -lt 120401 ]; then
-    ok PR1 "the fallback stopped mid-tree ($FREED2 of 120401 entries unlinked)"
+if [ -n "$FREED2" ] && [ "$FREED2" -ge 0 ] && [ "$FREED2" -lt 120401 ]; then
+    ok PR1 "the fallback wake reported $FREED2 of 120401 entries before handing over"
 else
-    bad PR1 "the fallback stopped mid-tree (${FREED2:-no} entries unlinked, wanted 1..120400)"
+    bad PR1 "the fallback wake reported ${FREED2:-no} entries (wanted 0..120400)"
     sed 's/^/        /' "$SCRATCH/gcfb.log"
 fi
 wait_collected "$RSTORE" "$RSTORE/trash"
 [ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && ok PR1 "the successor chain finishes it once the obstacle is gone" \
                                             || { bad PR1 "the successor chain finishes it once the obstacle is gone"; ls "$RSTORE/trash" | sed 's/^/        /'; }
+
+# A small fallback tree makes the positive work count deterministic. Three files below the
+# blocked directory are four entries in the rm_rec accounting (the directory is counted when
+# its recursive removal returns). A generous budget keeps recovery from racing the assertion;
+# the chmod forces the parallel walker to take its serial fallback path.
+SMALLSTORE="$SCRATCH/gcfb-small-store"
+WORLD_STORE="$SMALLSTORE" "$WORLD" fs list > /dev/null
+SMALLFB="$SMALLSTORE/trash/fallback-small"
+mkdir -p "$SMALLFB/blocked"
+touch "$SMALLFB/blocked/one" "$SMALLFB/blocked/two" "$SMALLFB/blocked/three"
+chmod 0000 "$SMALLFB/blocked"
+WORLD_STORE="$SMALLSTORE" WORLD_GC_PAUSE_MS=0 WORLD_GC_BATCH_SECS=10 "$WORLD" fs gc --worker --retention 0 > "$SCRATCH/gcfb-small.log" 2>&1
+FREED3=$(freed_entries "$SCRATCH/gcfb-small.log")
+if [ "$FREED3" = 4 ]; then ok PR1 "the fallback reports all four small-tree entries"
+else bad PR1 "the fallback reports all four small-tree entries (got ${FREED3:-no})"; sed 's/^/        /' "$SCRATCH/gcfb-small.log"; fi
+[ ! -e "$SMALLFB" ] && [ ! -e "$SMALLFB.deleting" ] && ok PR1 "the small fallback tree is removed" \
+                    || { bad PR1 "the small fallback tree is removed"; find "$SMALLFB" -print 2>/dev/null | sed 's/^/        /'; }
 
 # ---- PR #1 review (6th round, P2): the gc deadline reaches the pool, too ----------------------
 # A pool entry is a whole clone of a snapshot. Collecting stale ones ran in front of the
