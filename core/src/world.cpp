@@ -622,10 +622,11 @@ int check_path(wfs_store *s, const char *in, PathMode mode, String &real, bool *
 
 // P11. `entries` is the source tree's entry count; 1 KiB per entry is three times the measured
 // 308 B/entry metadata cost of a clone (CLONE_MODEL_MACOS27 §4), plus a flat floor.
-int space_check(const char *near_path, uint64_t entries) {
+int space_check(const char *near_path, uint64_t entries, uint64_t extra_bytes = 0) {
     uint64_t avail = 0, total = 0;
     if (int rc = wfs::fs_free_space(near_path, &avail, &total)) return rc;
-    uint64_t need = entries * 1024 + kSpaceFloor;
+    if (extra_bytes > UINT64_MAX - kSpaceFloor || entries > (UINT64_MAX - kSpaceFloor - extra_bytes) / 1024) return WFS_E_LOW_SPACE;
+    uint64_t need = entries * 1024 + kSpaceFloor + extra_bytes;
     return avail < need ? WFS_E_LOW_SPACE : 0;
 }
 
@@ -1197,7 +1198,7 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
     // from every verify and every fork afterwards. Exactly the name that is removed, so a
     // `.world` in a sub-world (which is not removed) is untouched.
     if (int rc = wfs::hardlinks_scan(src.c_str(), WFS_MARKER_NAME, &src_stats, hl)) return rc;
-    if (int rc = space_check(s->dir.c_str(), src_stats.entries)) return rc;
+    if (int rc = space_check(s->dir.c_str(), src_stats.entries, git_source.import_bytes)) return rc;
 
     char nm[WFS_NAME_MAX];
     copy_str(nm, sizeof nm, (name && *name) ? name : basename_of(src.c_str()));
@@ -1703,7 +1704,7 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         if (rc) return rc;
     }
     if (!o.skip_space_check) {
-        if (int rc = space_check(parent_dir.c_str(), entries)) return rc;
+        if (int rc = space_check(parent_dir.c_str(), entries, git_source.import_bytes)) return rc;
     }
 
     int64_t created = now_sec();

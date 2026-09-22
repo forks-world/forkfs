@@ -137,3 +137,8 @@ when present, and compare the complete
 ref-name/object-ID snapshot before publication. A concurrent non-HEAD ref update
 aborts the import rather than publishing a stale mirror. Sources must still remain
 quiescent during import; validation does not lock arbitrary external Git writers.
+
+External imports budget the full logical size of the common Git object directory
+in addition to filesystem clone metadata and the free-space reserve. This includes
+objects outside a linked worktree. Managed Worlds use filesystem cloning for their
+owned object databases and do not incur this additional full-copy budget.

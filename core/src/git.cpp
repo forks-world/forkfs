@@ -5,6 +5,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdint.h>
 
 extern char **environ;
 namespace wfs {
@@ -291,6 +292,37 @@ int capture_orig(const char *root, bool &present, String &oid) {
     if ((rc = value(root, verify, oid))) return rc;
     present = true; return 0;
 }
+int walk_objects_fd(int fd, unsigned depth, uint64_t &total) {
+    if (depth > 256) return WFS_E_GIT_UNSUPPORTED;
+    int dupfd = dup(fd); if (dupfd < 0) return -errno;
+    DIR *dir = fdopendir(dupfd);
+    if (!dir) { int rc = -errno; close(dupfd); return rc; }
+    int rc = 0;
+    for (;;) {
+        errno = 0; dirent *e = readdir(dir);
+        if (!e) { if (errno) rc = -errno; break; }
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        struct stat st;
+        if (fstatat(fd, e->d_name, &st, AT_SYMLINK_NOFOLLOW)) { rc = -errno; break; }
+        if (S_ISLNK(st.st_mode) || (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))) { rc = WFS_E_GIT_UNSUPPORTED; break; }
+        if (UINT64_MAX - total < 1024 || (S_ISREG(st.st_mode) && (uint64_t)st.st_size > UINT64_MAX - total - 1024)) { rc = -EOVERFLOW; break; }
+        if (S_ISREG(st.st_mode) && st.st_size < 0) { rc = -EOVERFLOW; break; }
+        total += 1024 + (S_ISREG(st.st_mode) ? (uint64_t)st.st_size : 0);
+        if (S_ISDIR(st.st_mode)) {
+            int child = openat(fd, e->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (child < 0) { rc = -errno; break; }
+            rc = walk_objects_fd(child, depth + 1, total); close(child);
+            if (rc) break;
+        }
+    }
+    closedir(dir); return rc;
+}
+int object_import_bytes(const char *common, uint64_t &total) {
+    String objects = joinp(common, "objects");
+    int fd = open(objects.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    total = 0; int rc = walk_objects_fd(fd, 0, total); close(fd); return rc;
+}
 int reject_configured_policy(const char *root, const char *key) {
     const char *args[] = {"config", "--get", key, nullptr};
     Vec<char> value_bytes; int status = -1;
@@ -363,6 +395,14 @@ int source_unchanged(const GitSource &s) {
     if (!same_bytes(direct_refs, s.refs)) return -EBUSY;
     bool orig_present; String orig; if (int orig_rc = capture_orig(s.root.c_str(), orig_present, orig)) return orig_rc;
     if (orig_present != s.orig_present || orig != s.orig_head) return -EBUSY;
+    if (!s.managed) {
+        String common;
+        const char *a[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
+        if (int rc = value(s.root.c_str(), a, common)) return rc;
+        uint64_t bytes = 0;
+        if (int rc = object_import_bytes(common.c_str(), bytes)) return rc;
+        if (bytes != s.import_bytes) return -EBUSY;
+    }
     Vec<GitSymref> refs;
     if (int symrc = collect_symrefs(s.root.c_str(), refs)) return symrc;
     if (!same_symrefs(refs, s.symrefs)) return -EBUSY;
@@ -426,6 +466,7 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
     const char *admin_args[] = {"rev-parse", "--absolute-git-dir", nullptr};
     if ((rc = value(root, common_args, common)) || (rc = value(root, admin_args, admin))) return rc;
+    if (!out.managed) { if ((rc = object_import_bytes(common.c_str(), out.import_bytes))) return rc; }
     if (out.managed && (rc = managed_check(root, common.c_str(), admin.c_str()))) return rc;
     if ((rc = reject_external_visibility_state(root, out.managed))) return rc;
     if ((rc = capture_refs(root, out.refs))) return rc;
@@ -453,11 +494,15 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
             return -EBUSY;
         i += strlen(listing.data() + i) + 1;
     }
-    const char *keys[] = {"core.sparseCheckout", "core.splitIndex", "extensions.partialClone"};
-    for (const char *key : keys) {
-        String val; const char *args[] = {"config", "--get", key, nullptr};
-        if ((rc = value(root, args, val, true))) return rc;
-        if (!val.empty() && val != "false") return WFS_E_GIT_UNSUPPORTED;
+    for (const char *key : {"core.sparseCheckout", "core.splitIndex"}) {
+        String val; bool present = false; const char *args[] = {"config", "--get", "--type=bool", key, nullptr};
+        if ((rc = get_config(root, args, val, &present))) return rc;
+        if (present && val != "false") return WFS_E_GIT_UNSUPPORTED;
+    }
+    {
+        String val; bool present = false; const char *args[] = {"config", "--get", "extensions.partialClone", nullptr};
+        if ((rc = get_config(root, args, val, &present))) return rc;
+        if (present) return WFS_E_GIT_UNSUPPORTED;
     }
     String shared;
     const char *shared_args[] = {"rev-parse", "--shared-index-path", nullptr};

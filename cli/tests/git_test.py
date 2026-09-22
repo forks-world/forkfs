@@ -58,6 +58,63 @@ class GitWorldTest(unittest.TestCase):
         p = self.world('fork', '--from', source, '--to', str(path), *args)
         return path, p.stdout.decode().split()[0]
 
+    def test_valueless_sparse_checkout_is_refused_without_mutation(self):
+        omitted = self.source / 'omitted'
+        omitted.mkdir()
+        (omitted / 'file').write_text('keep in history\n')
+        self.git(self.source, 'add', '.')
+        self.git(self.source, 'commit', '-m', 'sparse fixture')
+        self.git(self.source, 'sparse-checkout', 'set', '--no-cone', '/file')
+        self.git(self.source, 'config', '--worktree', '--unset-all', 'core.sparseCheckout')
+        config = self.source / '.git' / 'config.worktree'
+        with config.open('a') as f:
+            f.write('\n[core]\n\tsparseCheckout\n')
+        self.assertEqual(self.git(self.source, 'config', '--type=bool', '--get',
+                                  'core.sparseCheckout').stdout.strip(), b'true')
+        before = {name: (self.source / '.git' / name).read_bytes()
+                  for name in ('config', 'config.worktree', 'index', 'info/sparse-checkout')}
+        head = self.git(self.source, 'rev-parse', 'HEAD').stdout
+        result = self.world('init', str(self.source), '--include-changes', code=3)
+        self.assertIn(b'unsupported Git layout', result.stderr)
+        self.assertFalse(omitted.exists())
+        self.assertEqual(self.git(self.source, 'rev-parse', 'HEAD').stdout, head)
+        for name, data in before.items():
+            self.assertEqual((self.source / '.git' / name).read_bytes(), data)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_external_object_copy_space_is_budgeted(self):
+        import shlex
+        linked = self.root / 'linked-budget'
+        self.git(self.source, 'worktree', 'add', '-b', 'budget-linked', str(linked))
+        self.world('list', '--json')
+        objects = self.source / '.git' / 'objects'
+        oversized = objects / 'budget-fixture'
+        volume = os.statvfs(self.store)
+        size = volume.f_bavail * volume.f_frsize + 256 * 1024 * 1024
+        with oversized.open('wb') as f:
+            f.truncate(size)
+        # Never permit a regressed preflight to materialize this sparse fixture.
+        real_git = shutil.which('git')
+        wrapper = self.root / 'budget-bin'
+        wrapper.mkdir()
+        called = self.root / 'clone-called'
+        script = wrapper / 'git'
+        script.write_text('#!/bin/sh\nfor arg in "$@"; do\n'
+                          'if [ "$arg" = clone ]; then\n'
+                          ': > ' + shlex.quote(str(called)) + '\nexit 91\nfi\ndone\n'
+                          'exec ' + shlex.quote(real_git) + ' "$@"\n')
+        script.chmod(0o700)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        for source in (self.source, linked):
+            with self.subTest(source=source.name):
+                head = self.git(source, 'rev-parse', 'HEAD').stdout
+                result = self.world('init', str(source), code=3)
+                self.assertIn(b'not enough free space', result.stderr)
+                self.assertFalse(called.exists())
+                self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+                self.assertEqual(self.git(source, 'rev-parse', 'HEAD').stdout, head)
+                self.assertEqual(oversized.stat().st_size, size)
+
     def test_clean_import_fork_commit_isolation(self):
         before = self.git(self.source, 'worktree', 'list', '--porcelain').stdout
         self.world('init', str(self.source))

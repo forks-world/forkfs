@@ -30,6 +30,7 @@ struct GitSource {
     Vec<char> refs;
     bool orig_present = false;
     String orig_head;
+    uint64_t import_bytes = 0;
 };
 int git_source(const char *root, bool include_changes, GitSource &out);
 int git_import(const GitSource &source, const char *clone);
