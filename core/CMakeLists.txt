@@ -56,10 +56,15 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME linux_clone_test COMMAND linux_clone_test)
 
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    add_test(NAME linux_xfs_test COMMAND ${Python3_EXECUTABLE}
-        ${CMAKE_SOURCE_DIR}/scripts/tests/linux_xfs.py $<TARGET_FILE:world>
+    set(WFS_LINUX_TEST_FS "xfs" CACHE STRING "Filesystem for Linux integration tests (xfs or btrfs)")
+    set_property(CACHE WFS_LINUX_TEST_FS PROPERTY STRINGS xfs btrfs)
+    if(NOT WFS_LINUX_TEST_FS MATCHES "^(xfs|btrfs)$")
+        message(FATAL_ERROR "WFS_LINUX_TEST_FS must be xfs or btrfs")
+    endif()
+    add_test(NAME linux_${WFS_LINUX_TEST_FS}_test COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/scripts/tests/linux_${WFS_LINUX_TEST_FS}.py $<TARGET_FILE:world>
         --scratch ${CMAKE_CURRENT_BINARY_DIR})
-    set_tests_properties(linux_xfs_test PROPERTIES TIMEOUT 120)
+    set_tests_properties(linux_${WFS_LINUX_TEST_FS}_test PROPERTIES TIMEOUT 120)
 endif()
 
 # T1.3. Its own binary because it builds 10k-entry trees: keeping it out of core_test leaves
