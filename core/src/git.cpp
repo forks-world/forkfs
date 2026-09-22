@@ -361,8 +361,34 @@ int reject_inprogress(const char *root) {
     }
     return 0;
 }
+// Repeat the same eligibility checks before publication: configuration and layout
+// can change while an external mirror is being copied.
+int reject_import_policy(const char *root) {
+    for (const char *key : {"core.excludesFile", "core.attributesFile"})
+        if (int rc = reject_configured_policy(root, key)) return rc;
+    for (const char *key : {"core.sparseCheckout", "core.splitIndex"}) {
+        String val; bool present = false; const char *args[] = {"config", "--get", "--type=bool", key, nullptr};
+        if (int rc = get_config(root, args, val, &present)) return rc;
+        if (present && val != "false") return WFS_E_GIT_UNSUPPORTED;
+    }
+    String val; bool present = false; const char *partial[] = {"config", "--get", "extensions.partialClone", nullptr};
+    if (int rc = get_config(root, partial, val, &present)) return rc;
+    if (present) return WFS_E_GIT_UNSUPPORTED;
+    String common; const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
+    if (int rc = value(root, common_args, common)) return rc;
+    struct stat st;
+    for (const char *rel : {"objects/info/alternates", "objects/info/http-alternates", "shallow"}) {
+        String path = joinp(common.c_str(), rel);
+        if (!lstat(path.c_str(), &st)) return WFS_E_GIT_UNSUPPORTED;
+        if (errno != ENOENT) return -errno;
+    }
+    const char *shared_args[] = {"rev-parse", "--shared-index-path", nullptr};
+    if (int rc = value(root, shared_args, val)) return rc;
+    return val.empty() ? 0 : WFS_E_GIT_UNSUPPORTED;
+}
 int source_unchanged(const GitSource &s) {
     if (int rc = reject_inprogress(s.root.c_str())) return rc;
+    if (int rc = reject_import_policy(s.root.c_str())) return rc;
     if (int rc = reject_external_visibility_state(s.root.c_str(), s.managed)) return rc;
     String head; const char *args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (int rc = value(s.root.c_str(), args, head)) return rc;
@@ -434,11 +460,7 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     String real_top, real_root;
     if (fs_realpath(root, real_root) || fs_realpath(top.c_str(), real_top) || real_root != real_top)
         return WFS_E_GIT_UNSUPPORTED;
-    // These policies can point outside the repository. Preserving them would require a
-    // separate private config contract, and flattening them into info/{exclude,attributes}
-    // would change Git's precedence rules. The repository-local files remain supported.
-    for (const char *key : {"core.excludesFile", "core.attributesFile"})
-        if (int policy_rc = reject_configured_policy(root, key)) return policy_rc;
+    if (int policy_rc = reject_import_policy(root)) return policy_rc;
     if (int policy_rc = capture_settings(root, out.settings)) return policy_rc;
     const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (value(root, head_args, out.head)) return WFS_E_GIT_UNSUPPORTED;
@@ -474,12 +496,6 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     if ((rc = capture_refs(root, out.refs))) return rc;
     if ((rc = capture_orig(root, out.orig_present, out.orig_head))) return rc;
     if ((rc = collect_symrefs(root, out.symrefs))) return rc;
-    const char *unsafe[] = {"objects/info/alternates", "objects/info/http-alternates", "shallow"};
-    for (const char *rel : unsafe) {
-        String path = joinp(common.c_str(), rel);
-        if (!lstat(path.c_str(), &st)) return WFS_E_GIT_UNSUPPORTED;
-        if (errno != ENOENT) return -errno;
-    }
     if ((rc = reject_inprogress(root))) return rc;
     // Sparse/split indexes and gitlinks require a separate import contract.
     const char *ls_args[] = {"ls-files", "--stage", "-z", nullptr};
@@ -496,20 +512,6 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
             return -EBUSY;
         i += strlen(listing.data() + i) + 1;
     }
-    for (const char *key : {"core.sparseCheckout", "core.splitIndex"}) {
-        String val; bool present = false; const char *args[] = {"config", "--get", "--type=bool", key, nullptr};
-        if ((rc = get_config(root, args, val, &present))) return rc;
-        if (present && val != "false") return WFS_E_GIT_UNSUPPORTED;
-    }
-    {
-        String val; bool present = false; const char *args[] = {"config", "--get", "extensions.partialClone", nullptr};
-        if ((rc = get_config(root, args, val, &present))) return rc;
-        if (present) return WFS_E_GIT_UNSUPPORTED;
-    }
-    String shared;
-    const char *shared_args[] = {"rev-parse", "--shared-index-path", nullptr};
-    if ((rc = value(root, shared_args, shared))) return rc;
-    if (!shared.empty()) return WFS_E_GIT_UNSUPPORTED;
     if (!include_changes) {
         const char *args[] = {"status", "--porcelain=v1", "-z", "--untracked-files=normal",
             "--", ".", ":(exclude).world", ":(exclude).world-git", nullptr};

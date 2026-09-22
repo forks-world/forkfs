@@ -511,6 +511,35 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(one, 'rev-parse', 'HEAD').stdout.strip(), recovered)
         self.assertEqual((one / 'file').read_text(), 'recover this commit\n')
 
+    def test_external_policy_added_during_mirror_aborts_publication(self):
+        import shlex
+        real_git = shutil.which('git')
+        wrapper = self.root / 'policy-race-bin'
+        wrapper.mkdir()
+        script = wrapper / 'git'
+        policy = self.root / 'external-policy'
+        policy.write_text('*.log\n')
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        index = (self.source / '.git' / 'index').read_bytes()
+        for key, value in (('core.excludesFile', str(policy)), ('core.attributesFile', str(policy)),
+                           ('core.sparseCheckout', 'true'), ('core.splitIndex', 'true'),
+                           ('extensions.partialClone', 'origin')):
+            with self.subTest(key=key):
+                script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = --mirror ] && mirror=1; done\n'
+                                  + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
+                                  + 'if [ "$result" = 0 ] && [ "$mirror" = 1 ]; then\n'
+                                  + shlex.quote(real_git) + ' -C ' + shlex.quote(str(self.source))
+                                  + ' config --local ' + shlex.quote(key) + ' ' + shlex.quote(value)
+                                  + ' || exit $?\nfi\nexit "$result"\n')
+                script.chmod(0o700)
+                result = self.world('init', str(self.source), code=3)
+                self.assertIn(b'unsupported Git layout', result.stderr)
+                self.assertEqual(self.git(self.source, 'config', '--get', key).stdout.decode().strip(), value)
+                self.assertEqual((self.source / '.git' / 'index').read_bytes(), index)
+                self.assertEqual(self.git(self.source, 'rev-parse', 'HEAD').stdout.strip(), self.base)
+                self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+                self.git(self.source, 'config', '--unset-all', key)
+
     def test_direct_ref_change_during_mirror_aborts_publication(self):
         import shlex
         self.git(self.source, 'update-ref', 'refs/custom/raced', self.base.decode())
