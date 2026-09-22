@@ -98,6 +98,8 @@ jobs:
             label: XFS
           - fs: btrfs
             label: Btrfs
+          - fs: ext4
+            label: ext4
     env:
       TEST_FS: ${{ matrix.fs }}
     steps:
@@ -109,7 +111,7 @@ jobs:
       - name: Install build and namespace tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-14 libsqlite3-dev xfsprogs btrfs-progs bubblewrap
+          sudo apt-get install -y g++-14 libsqlite3-dev xfsprogs btrfs-progs e2fsprogs bubblewrap
       - name: Allow Bubblewrap user namespaces under Ubuntu AppArmor
         run: |
           # Ubuntu 24.04's AppArmor policy requires an explicit profile for unprivileged userns.
@@ -136,6 +138,14 @@ jobs:
             sudo mount -o loop,user_subvol_rm_allowed "$RUNNER_TEMP/forkfs-other.img" /mnt/forkfs-other
             sudo chown "$(id -u):$(id -g)" /mnt/forkfs-other
             echo 'WFS_BTRFS_OTHER=/mnt/forkfs-other' >> "$GITHUB_ENV"
+          elif [ "$TEST_FS" = ext4 ]; then
+            truncate -s 1536M "$RUNNER_TEMP/forkfs-other.img"
+            mkfs.ext4 -F -m 0 "$RUNNER_TEMP/forkfs-other.img"
+            sudo mkdir -p /mnt/forkfs-other
+            sudo mount -o loop "$RUNNER_TEMP/forkfs-other.img" /mnt/forkfs-other
+            sudo chown "$(id -u):$(id -g)" /mnt/forkfs-other
+            mkfs.ext4 -F "$RUNNER_TEMP/forkfs-test.img"
+            sudo mount -o loop "$RUNNER_TEMP/forkfs-test.img" /mnt/forkfs-test
           else
             mkfs.xfs -f -m reflink=1 "$RUNNER_TEMP/forkfs-test.img"
             sudo mount -o loop "$RUNNER_TEMP/forkfs-test.img" /mnt/forkfs-test
@@ -149,6 +159,9 @@ jobs:
           cmake --build /mnt/forkfs-test/build --parallel 4
           ctest --test-dir /mnt/forkfs-test/build --output-on-failure --no-tests=error
           scripts/check-deps.sh /mnt/forkfs-test/build
+      - name: Test ext4 disk-full rollback and retry
+        if: matrix.fs == 'ext4'
+        run: python3 scripts/tests/linux_ext4_full.py /mnt/forkfs-test/build/cli/world --scratch /mnt/forkfs-other
       - name: Unmount test volume
         if: always()
         run: |

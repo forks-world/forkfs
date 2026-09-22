@@ -56,10 +56,10 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME linux_clone_test COMMAND linux_clone_test)
 
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    set(WFS_LINUX_TEST_FS "xfs" CACHE STRING "Filesystem for Linux integration tests (xfs or btrfs)")
-    set_property(CACHE WFS_LINUX_TEST_FS PROPERTY STRINGS xfs btrfs)
-    if(NOT WFS_LINUX_TEST_FS MATCHES "^(xfs|btrfs)$")
-        message(FATAL_ERROR "WFS_LINUX_TEST_FS must be xfs or btrfs")
+    set(WFS_LINUX_TEST_FS "xfs" CACHE STRING "Filesystem for Linux integration tests (xfs, btrfs or ext4)")
+    set_property(CACHE WFS_LINUX_TEST_FS PROPERTY STRINGS xfs btrfs ext4)
+    if(NOT WFS_LINUX_TEST_FS MATCHES "^(xfs|btrfs|ext4)$")
+        message(FATAL_ERROR "WFS_LINUX_TEST_FS must be xfs, btrfs or ext4")
     endif()
     add_test(NAME linux_${WFS_LINUX_TEST_FS}_test COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_SOURCE_DIR}/scripts/tests/linux_${WFS_LINUX_TEST_FS}.py $<TARGET_FILE:world>

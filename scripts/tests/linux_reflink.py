@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared Linux lifecycle regression; run on a reflink-enabled XFS or Btrfs filesystem.
+"""Shared Linux lifecycle regression; run on XFS, Btrfs or ext4.
 All fixtures live under --scratch (default: current directory), never /tmp by default.
 """
 import argparse
@@ -19,10 +19,12 @@ import tempfile
 parser = argparse.ArgumentParser()
 parser.add_argument('world', type=Path)
 parser.add_argument('--scratch', type=Path, default=Path.cwd())
-parser.add_argument('--filesystem', choices=('xfs', 'btrfs'), default='xfs')
+parser.add_argument('--filesystem', choices=('xfs', 'btrfs', 'ext4'), default='xfs')
 args = parser.parse_args()
 world = args.world.resolve()
 actual_fs = subprocess.check_output(['stat', '-f', '-c', '%T', str(args.scratch)], text=True).strip()
+if args.filesystem == 'ext4':
+    actual_fs = subprocess.check_output(['findmnt', '-n', '-o', 'FSTYPE', '-T', str(args.scratch)], text=True).strip()
 assert actual_fs == args.filesystem, f'expected {args.filesystem}, got {actual_fs}'
 
 
@@ -61,8 +63,10 @@ with tempfile.TemporaryDirectory(prefix=f'wfs-{args.filesystem}-', dir=args.scra
     (src / 'data').write_bytes(b'original\n' * 8192)
     (src / 'data').chmod(0o640)
     os.setxattr(src / 'data', 'user.world-test', b'original')
-    os.setxattr(src / 'data', 'user.large', b'x' * 5000)
-    for i in range(40):
+    # Default ext4 keeps xattrs in an inode plus one block (without ea_inode).
+    os.setxattr(src / 'data', 'user.large', b'x' * (512 if args.filesystem == 'ext4' else 5000))
+    order_count = 8 if args.filesystem == 'ext4' else 40
+    for i in range(order_count):
         os.setxattr(src / 'data', f'user.order{i:02}', b'x' * 128)
     # Linux POSIX ACL xattr format: version, then tag/permissions/id entries.
     acl_uid = os.getuid()
@@ -84,11 +88,13 @@ with tempfile.TemporaryDirectory(prefix=f'wfs-{args.filesystem}-', dir=args.scra
         f.write(b'end')
     os.utime(src / 'data', ns=(1234567890123456789, 1234567890123456789))
 
-    # A real reflink is required; unsupported filesystems fail this test, not skip it.
+    # Native strategy must work without --copy: reflinks or independent ext4 copies.
     sid = ident(fs('init', src).stdout, 'S')
     fs('init', src, '--hard', ok=False)
     wid = ident(fs('fork', '--from', sid, '--to', a, '--no-pool').stdout, 'W')
-    assert shared(src / 'data') and shared(a / 'data')
+    assert shared(src / 'data') == (args.filesystem != 'ext4')
+    assert shared(a / 'data') == (args.filesystem != 'ext4')
+    assert (a / 'data').read_bytes() == (src / 'data').read_bytes()
     assert (a / 'data').stat().st_ino != (src / 'data').stat().st_ino
     assert (a / 'data').stat().st_ino == (a / 'linked').stat().st_ino
     assert (a / 'data').stat().st_mtime_ns == (src / 'data').stat().st_mtime_ns
@@ -107,9 +113,9 @@ with tempfile.TemporaryDirectory(prefix=f'wfs-{args.filesystem}-', dir=args.scra
     fs('verify', wid)
 
     # Attribute insertion order must not create a false diff (XFS inline/leaf order differs).
-    for i in range(40):
+    for i in range(order_count):
         os.removexattr(a / 'data', f'user.order{i:02}')
-    for i in reversed(range(40)):
+    for i in reversed(range(order_count)):
         os.setxattr(a / 'data', f'user.order{i:02}', b'x' * 128)
     assert not fs('diff', wid, '--full').stdout.strip()
     os.setxattr(a / 'data', 'user.world-test', b'changed')
@@ -360,4 +366,4 @@ assert subprocess.run(['unshare', '--user', '--map-root-user', 'true'],
             path = Path(parent) / name
             if not path.is_symlink():
                 path.chmod(0o700)
-    print(f'linux_{args.filesystem}: reflink, isolation, metadata, hardlinks, sparse copy, lifecycle, pool: PASS')
+    print(f'linux_{args.filesystem}: native duplication, isolation, metadata, hardlinks, sparse copy, lifecycle, pool: PASS')

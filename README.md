@@ -1,16 +1,16 @@
 # forkfs — World FS provider (BranchFS)
 
-Fork a workspace into independently writable worlds on macOS/APFS or Linux/XFS/Btrfs.
+Fork a workspace into independently writable worlds on macOS/APFS or Linux/XFS/Btrfs/ext4.
 Design: [`arch.md`](arch.md), [`docs/M1_DESIGN.md`](docs/M1_DESIGN.md). Task board: [`docs/TASKS.md`](docs/TASKS.md).
 
 ## Status
 
-Linux has an XFS/Btrfs reflink backend and namespace-isolated `world exec` through the system
+Linux has XFS/Btrfs reflink and ext4 sparse-copy backends and namespace-isolated `world exec` through the system
 Bubblewrap CLI. Build requirements, tested behavior, timings and limitations:
-[`docs/LINUX_XFS.md`](docs/LINUX_XFS.md) and [`docs/LINUX_BTRFS.md`](docs/LINUX_BTRFS.md).
+[`docs/LINUX_XFS.md`](docs/LINUX_XFS.md) and [`docs/LINUX_BTRFS.md`](docs/LINUX_BTRFS.md) and [`docs/LINUX_EXT4.md`](docs/LINUX_EXT4.md).
 Btrfs supports cross-subvolume cloning and preserves NOCOW/compression policy.
-Linux requires reflink support for snapshots;
-`--copy` is an explicit fork fallback. Linux diff uses a full scan. Sandboxed execution
+Ext4 automatically copies data for init, fork, checkpoint and pool fill; cold operations
+cost O(data + entries). XFS/Btrfs require reflinks by default; `--copy` is an explicit fork fallback. Linux diff uses a full scan. Sandboxed execution
 fails closed; only `--no-sandbox` opts out. The APFS measurements and FSEvents/seatbelt
 behavior described below apply to macOS.
 

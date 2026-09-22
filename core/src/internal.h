@@ -337,10 +337,12 @@ int fs_bulk_dir(int dirfd, void *ctx, fs_bulk_entry_fn fn, int *cb_rc);
 // FS_XATTR_UNKNOWN everywhere else. This is what the other side of a diff is read with.
 int fs_lstat_xattr(const char *path, struct stat &st, uint8_t &xattr);
 
-// P6: really clone a temp file from src_dir into store_dir. Returns 0, -EXDEV, or -errno.
+// Probe the native storage strategy and volume compatibility. Linux ext4 copies;
+// XFS/Btrfs require reflinks. Returns 0, -EXDEV, or -errno.
 int fs_clone_probe(const char *store_dir, const char *src_dir);
-// clonefile(src, dst, CLONE_NOFOLLOW). With allow_fallback, EXDEV/ENOTSUP degrade to a
-// 4-thread per-file clonefileat walk (per-file copy across volumes).
+// Native tree duplication without following symlinks: clonefile on Darwin,
+// reflinks on Linux XFS/Btrfs, sparse-aware copies on ext4. allow_fallback also
+// permits copies across volumes or when cloning is unsupported.
 int fs_clone_tree(const char *src, const char *dst, bool allow_fallback);
 // `--hard` protection: chflags(UF_IMMUTABLE) on every entry, directories last, write bits
 // stripped from directories. Fills stats and (optionally) the manifest in the same walk.

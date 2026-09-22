@@ -1,5 +1,5 @@
 // Linux native-directory backend. FICLONE shares extents on XFS and Btrfs;
-// capability is tested by the operation, not inferred from a filesystem name.
+// capability is tested by the operation. Ext4 uses sparse-aware independent copies.
 #include "internal.h"
 #include <fcntl.h>
 #include <linux/fs.h>
@@ -51,7 +51,7 @@ int btrfs_clone_flags(int src, int dst) {
     return desired == cleared || ::ioctl(dst, FS_IOC_SETFLAGS, &desired) == 0 ? 0 : -errno;
 }
 
-// Explicit --copy fallback, preserving holes rather than materialising sparse files.
+// Ext4 backend and explicit --copy fallback, preserving sparse holes.
 int copy_data(int src, int dst, off_t size) {
     char buf[128 * 1024];
     off_t pos = 0;
@@ -81,7 +81,9 @@ int copy_data(int src, int dst, off_t size) {
             pos += n;
         }
     }
-    return ::ftruncate(dst, size) == 0 ? 0 : -errno;
+    if (::ftruncate(dst, size)) return -errno;
+    // Delayed allocation can defer ENOSPC until writeback. Detect it before publication.
+    return ::fdatasync(dst) == 0 ? 0 : -errno;
 }
 
 int set_xattr_if_different(const char *dst, const char *name, const void *value, size_t len) {
@@ -150,7 +152,13 @@ int metadata(const char *src, const char *dst, const struct stat &st) {
     return ::utimensat(AT_FDCWD, dst, times, AT_SYMLINK_NOFOLLOW) == 0 ? 0 : -errno;
 }
 
-struct CloneCtx { const char *dst; bool copy; bool btrfs = false; };
+struct CloneCtx {
+    const char *dst;
+    bool copy;
+    bool btrfs = false;
+    bool ext_copy = false;
+    dev_t device = 0;
+};
 String target(CloneCtx *c, const char *rel) {
     String d(c->dst);
     if (*rel) { d.append("/"); d.append(rel); }
@@ -168,6 +176,12 @@ int clone_entry(void *ctx, const char *src, const char *rel, const struct stat &
             struct statfs fs;
             if (::statfs(dst.c_str(), &fs)) return -errno;
             c->btrfs = fs.f_type == BTRFS_SUPER_MAGIC;
+            // ext2/3 share this magic; only ext4 is covered by our support/test contract.
+            c->ext_copy = fs.f_type == EXT4_SUPER_MAGIC;
+            struct stat dest;
+            if (::stat(dst.c_str(), &dest)) return -errno;
+            c->device = dest.st_dev;
+            if (c->ext_copy && !c->copy && st.st_dev != c->device) return -EXDEV;
         }
         if (c->btrfs) {
             int in = ::open(src, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -192,7 +206,11 @@ int clone_entry(void *ctx, const char *src, const char *rel, const struct stat &
         int out = ::open(dst.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
         if (out < 0) { rc = -errno; ::close(in); return rc; }
         if (c->btrfs) rc = btrfs_clone_flags(in, out);
-        if (!rc && ::ioctl(out, FICLONE, in)) {
+        if (!rc && c->ext_copy) {
+            // Do not turn nested mounts or cross-volume callers into implicit --copy.
+            rc = !c->copy && opened.st_dev != c->device ? -EXDEV
+                 : copy_data(in, out, opened.st_size);
+        } else if (!rc && ::ioctl(out, FICLONE, in)) {
             int e = errno;
             rc = c->copy && unsupported(e) ? copy_data(in, out, opened.st_size)
                                          : -(unsupported(e) && e != EXDEV ? EOPNOTSUPP : e);
@@ -228,6 +246,8 @@ int fs_clone_probe(const char *dst, const char *src) {
         if (int rc = btrfs_fsid(dst, to)) return rc;
         if (::memcmp(from.fsid, to.fsid, sizeof from.fsid)) return -EXDEV;
     }
+    struct statfs fs;
+    if (::statfs(dst, &fs)) return -errno;
     // Probe using our own files, without touching the source or following user symlinks.
     char from[WFS_PATH_MAX], to[WFS_PATH_MAX];
     if (::snprintf(from, sizeof from, "%s/.wfs-probe-src-XXXXXX", dst) >= (int)sizeof from ||
@@ -237,7 +257,8 @@ int fs_clone_probe(const char *dst, const char *src) {
     int out = ::mkstemp(to);
     int rc = out < 0 ? -errno : 0;
     if (!rc && ::write(in, "wfs", 3) != 3) rc = errno ? -errno : -EIO;
-    if (!rc && ::ioctl(out, FICLONE, in)) rc = unsupported(errno) ? -EOPNOTSUPP : -errno;
+    if (!rc && fs.f_type == EXT4_SUPER_MAGIC) rc = copy_data(in, out, 3);
+    else if (!rc && ::ioctl(out, FICLONE, in)) rc = unsupported(errno) ? -EOPNOTSUPP : -errno;
     if (out >= 0) { ::close(out); ::unlink(to); }
     ::close(in); ::unlink(from);
     return rc;
