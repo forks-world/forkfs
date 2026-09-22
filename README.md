@@ -102,6 +102,47 @@ $world fs status                       # store, counts, free space
 $world exec W1 -- make test            # run a command inside W1, sandboxed (see below)
 ```
 
+### JSON output for scripts and agents
+
+```bash
+$world fs list --json
+$world fs inspect W1 --json
+$world fs status --json
+$world fs diff W1 --full --json
+$world fs diff W1 --stat --json
+```
+
+These four commands emit one JSON object on stdout with `schema_version: 1`.
+Diagnostics stay on stderr and the existing exit codes apply. A failed query emits
+no JSON document; consumers should always check the exit code (an output I/O failure
+can still interrupt delivery). Output is staged in a temporary file before delivery.
+Without `--json`, commands keep their human-readable output.
+
+- `list`: `snapshots` (active snapshots) and `worlds` (active and trashed worlds),
+  each sorted by numeric ID. Each record has the same fields as `inspect`.
+- `inspect`: `kind`, string `id` (`S1` / `W1`), `name`, `path`, `state`, timestamps,
+  counts and origin references. Missing references are `null`; `present` is a boolean.
+  Snapshot records include protection and hardlink details; World records include
+  inode identity, origin, snapshot and parent references.
+- `status`: store identity and schema, object counts, volume bytes, pool counts,
+  dangling/unreadable counts, trash counts and GC worker PID. Unreadable directories,
+  stranded trees, blocked and foreign trash entries are reported separately; zero
+  `trash_entries` alone does not establish that the store is clean. If trash status
+  cannot be queried, JSON mode fails instead of emitting a partial report.
+- `diff`: sorted `changes` (`{"change":"M","path":"src/main.c"}`), `stats`
+  and `stat_only`. `--stat` omits individual changes, leaving an empty array;
+  `stat_only: true` distinguishes that from a clean diff. Statistics include
+  `added`, `modified`, `deleted`, `meta`, `full_scan`, `fallback`, `xattr_errors`,
+  comparison/read counts and `elapsed_us`.
+
+Times are Unix seconds (diff duration is microseconds), sizes are bytes, and
+counters are JSON integers. Clients must preserve 64-bit integers when reading
+inode numbers and event cursors. Strings preserve UTF-8 and escape control
+characters; undecodable filesystem bytes use `\udcXX` surrogate escapes, which
+Python can round-trip with `os.fsencode()`. The report version is independent of
+the store database schema. Concurrent mutations can appear between queries;
+`list` is not a transactionally consistent snapshot of the whole store.
+
 ### `world fs pool` — forking in single-digit milliseconds
 
 A `clonefile()` of a big tree is fast but not free: 0.6 s for 50 000 entries. The pool moves that

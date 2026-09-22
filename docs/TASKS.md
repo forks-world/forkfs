@@ -6,6 +6,14 @@
 [`MACOS_VALIDATION.md`](MACOS_VALIDATION.md)。本文件按时间保留历史测试数量与测量结果;
 旧的 93/142 等通过数不代表当前测试总数,应以当前 CI/测试输出为准。
 
+## 当前增量开发(2026-09-22)
+
+- [x] CLI 查询 JSON 输出:`list / inspect / status / diff --json`,报告版本 1;
+  失败查询不发布半份 JSON,诊断保留 stderr,特殊字符与 UTF-8 正确转义。
+  `list` 同时补齐查询错误传播、分配检查与并发增长的容量重试。
+  `cli/tests/json_test.py` 覆盖真实 store 的查询、diff、特殊名称、错误与文本兼容;
+  CMake 在 Python 3 可用时注册为 `cli_json_test`。
+
 ## 环境事实(2026-09-18, Mac mini M1, macOS 26.6.2)
 
 - 只有 Command Line Tools,**没有 Xcode.app**。SwiftPM(Swift 6.3)可以直接链接 FSKit.framework,已验证。

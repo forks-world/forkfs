@@ -12,3 +12,10 @@ if(APPLE AND WFS_FSKIT)
     set_source_files_properties(macos_status.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
     target_link_libraries(world PRIVATE "-framework FSKit" "-framework Foundation")
 endif()
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME cli_json_test
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/json_test.py $<TARGET_FILE:world>)
+    set_tests_properties(cli_json_test PROPERTIES TIMEOUT 120)
+endif()

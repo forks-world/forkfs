@@ -7,6 +7,7 @@
 // Every refusal prints one line of reason and the command that would have worked, and exits 3.
 // 0 = ok, 1 = error, 2 = usage, 3 = refused by a safety rule (docs/M1_DESIGN.md §3).
 #include "worldfs/worldfs.h"
+#include "json.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -41,7 +42,7 @@ static void usage(void) {
           "                                   always clones here and now\n"
           "  checkpoint W<n> [--name N] [--hard] [--force]\n"
           "                                   snapshot a live world; the world stays writable\n"
-          "  diff W<n> [--full|--events] [--stat] [--no-xattr] [--all-xattrs] [--no-content]\n"
+          "  diff W<n> [--full|--events] [--stat] [--json] [--no-xattr] [--all-xattrs] [--no-content]\n"
           "                                   what changed since the fork (A/M/D/T, sorted).\n"
           "                                   Walks both trees by default -- exact, and faster than\n"
           "                                   the FSEvents path below ~200k entries; --events asks\n"
@@ -49,8 +50,8 @@ static void usage(void) {
           "                                   com.apple.provenance (the kernel's note of which app\n"
           "                                   created a file, which cannot be removed) is left out\n"
           "                                   of the xattr comparison; --all-xattrs puts it back\n"
-          "  list                             snapshots and worlds\n"
-          "  inspect W<n>|S<n>\n"
+          "  list [--json]                    snapshots and worlds\n"
+          "  inspect W<n>|S<n> [--json]\n"
           "  discard W<n>|S<n> [--now] [--force]\n"
           "                                   move to the store trash (--now deletes at once).\n"
           "                                   A snapshot is refused while an active world or a pool\n"
@@ -65,7 +66,7 @@ static void usage(void) {
           "  pool status                      pre-cloned worlds waiting per snapshot\n"
           "  pool fill S<n> [--count K]       top the pool up to K ready entries (default 2)\n"
           "  pool drain S<n>|--all            delete the pool entries of a snapshot\n"
-          "  status                           store, counts, free space\n"
+          "  status [--json]                  store, counts, free space\n"
           "  verify S<n>|W<n>|<path> [--refresh-marker]\n"
           "                                   snapshot integrity, or world identity. A world whose\n"
           "                                   .world marker names a store path that is not this\n"
@@ -87,6 +88,8 @@ static void usage(void) {
 }
 
 static const char *g_store_override = NULL;
+static bool g_json = false;
+static FILE *g_json_out = NULL;
 
 static void store_dir(char *out, size_t cap) {
     if (g_store_override) { snprintf(out, cap, "%s", g_store_override); return; }
@@ -689,8 +692,14 @@ static int cmd_checkpoint(wfs_store *s, int argc, char **argv) {
 // ---- diff (T1.3) -----------------------------------------------------------------------------
 
 static int diff_print(void *ctx, const wfs_diff_entry *e) {
-    (void)ctx;
-    printf("%c %s\n", (char)e->change, e->path);
+    if (g_json) {
+        bool *first = (bool *)ctx;
+        if (!*first) fputc(',', g_json_out);
+        *first = false;
+        Json j(g_json_out);
+        char change[] = {(char)e->change, 0};
+        j.str("change", change); j.str("path", e->path);
+    } else printf("%c %s\n", (char)e->change, e->path);
     return 0;
 }
 
@@ -735,7 +744,9 @@ static int cmd_diff(wfs_store *s, int argc, char **argv) {
     wfs_diff_stats st;
     // A diff never takes the world's lock: it only reads, so a world someone is working in is
     // diffable (WFS_E_WORLD_BUSY is not a diff refusal).
-    rc = wfs_world_diff_ex(s, w, flags, stat_only ? NULL : diff_print, NULL, &st);
+    bool first = true;
+    if (g_json) fputs("{\"schema_version\":1,\"changes\":[", g_json_out);
+    rc = wfs_world_diff_ex(s, w, flags, stat_only ? NULL : diff_print, &first, &st);
     if (rc == WFS_E_SOURCE_GONE) {
         char why[256];
         if (r.snapshot_id)
@@ -771,7 +782,17 @@ static int cmd_diff(wfs_store *s, int argc, char **argv) {
                         "extended attributes could not be read\n",
                 (unsigned long long)st.xattr_errors, st.xattr_errors == 1 ? " was" : "s were");
 
-    if (stat_only) {
+    if (g_json) {
+        fputs("],\"stats\":", g_json_out);
+        { Json j(g_json_out);
+#define STAT(field) j.num(#field, st.field)
+          STAT(added); STAT(modified); STAT(deleted); STAT(meta); STAT(candidates);
+          STAT(compared); STAT(content_cmp); STAT(bytes_read); STAT(xattr_errors);
+          STAT(events_id); STAT(fallback); STAT(elapsed_us);
+#undef STAT
+          j.boolean("full_scan", st.full_scan); }
+        fprintf(g_json_out, ",\"stat_only\":%s}\n", stat_only ? "true" : "false");
+    } else if (stat_only) {
         printf("%llu added, %llu modified, %llu deleted, %llu metadata-only\n",
                (unsigned long long)st.added, (unsigned long long)st.modified,
                (unsigned long long)st.deleted, (unsigned long long)st.meta);
@@ -785,12 +806,15 @@ static int cmd_diff(wfs_store *s, int argc, char **argv) {
 
 static int cmd_list(wfs_store *s) {
     size_t n = 0;
-    wfs_snapshot_list(s, NULL, 0, &n);
+    wfs_snapshot_rec *snaps = NULL;
+    int rc = json_read_list(s, &snaps, &n);
+    if (rc) return fail("list", rc);
+    if (g_json) fputs("{\"schema_version\":1,\"snapshots\":[", g_json_out);
     if (n) {
-        wfs_snapshot_rec *v = (wfs_snapshot_rec *)calloc(n, sizeof *v);
-        wfs_snapshot_list(s, v, n, &n);
-        printf("%-6s %-20s %10s %8s  %s\n", "SNAP", "NAME", "ENTRIES", "CREATED", "SOURCE");
+        wfs_snapshot_rec *v = snaps;
+        if (!g_json) printf("%-6s %-20s %10s %8s  %s\n", "SNAP", "NAME", "ENTRIES", "CREATED", "SOURCE");
         for (size_t i = 0; i < n; ++i) {
+            if (g_json) { if (i) fputc(',', g_json_out); json_snapshot(g_json_out, v[i]); continue; }
             char t[32];
             fmt_time(t, sizeof t, v[i].created_at);
             char id[16];
@@ -798,15 +822,18 @@ static int cmd_list(wfs_store *s) {
             printf("%-6s %-20s %10llu %8s  %s\n", id, v[i].name, (unsigned long long)v[i].entries, t + 5,
                    v[i].src_path);
         }
-        free(v);
     }
+    free(snaps);
     n = 0;
-    wfs_world_list(s, 1, NULL, 0, &n);
+    wfs_world_rec *worlds = NULL;
+    rc = json_read_list(s, &worlds, &n);
+    if (rc) return fail("list", rc);
+    if (g_json) fputs("],\"worlds\":[", g_json_out);
     if (n) {
-        wfs_world_rec *v = (wfs_world_rec *)calloc(n, sizeof *v);
-        wfs_world_list(s, 1, v, n, &n);
-        if (n) printf("\n%-6s %-20s %-8s %-6s %-6s %s\n", "WORLD", "NAME", "STATE", "FROM", "HERE", "PATH");
+        wfs_world_rec *v = worlds;
+        if (!g_json) printf("\n%-6s %-20s %-8s %-6s %-6s %s\n", "WORLD", "NAME", "STATE", "FROM", "HERE", "PATH");
         for (size_t i = 0; i < n; ++i) {
+            if (g_json) { if (i) fputc(',', g_json_out); json_world(g_json_out, v[i]); continue; }
             char id[16], from[16];
             snprintf(id, sizeof id, "W%llu", (unsigned long long)v[i].id);
             if (v[i].parent_world) snprintf(from, sizeof from, "W%llu", (unsigned long long)v[i].parent_world);
@@ -815,8 +842,9 @@ static int cmd_list(wfs_store *s) {
             printf("%-6s %-20s %-8s %-6s %-6s %s\n", id, v[i].name, state_name(v[i].state), from,
                    v[i].present ? "yes" : "NO", v[i].path);
         }
-        free(v);
     }
+    free(worlds);
+    if (g_json) fputs("]}\n", g_json_out);
     return EX_OK;
 }
 
@@ -828,6 +856,7 @@ static int cmd_inspect(wfs_store *s, const char *arg) {
         wfs_snapshot_rec v;
         int rc = wfs_snapshot_info(s, r.id, &v);
         if (rc) return fail("inspect", rc);
+        if (g_json) { json_snapshot(g_json_out, v); return EX_OK; }
         fmt_time(t, sizeof t, v.created_at);
         printf("snapshot:  S%llu\nname:      %s\nstate:     %s\ncreated:   %s\n"
                "entries:   %llu (%llu with >1 link)\nprotection: %s\npath:      %s\nsource:    %s\n",
@@ -845,6 +874,7 @@ static int cmd_inspect(wfs_store *s, const char *arg) {
     wfs_world_rec v;
     int rc = wfs_world_info(s, r.id, &v);
     if (rc) return fail("inspect", rc);
+    if (g_json) { json_world(g_json_out, v); return EX_OK; }
     fmt_time(t, sizeof t, v.created_at);
     printf("world:     W%llu\nname:      %s\nstate:     %s\ncreated:   %s\npath:      %s\n"
            "present:   %s\ninode:     %llu (dev %llu)\nentries:   %llu\nfsevents:  %llu\n",
@@ -1484,6 +1514,29 @@ static int cmd_status(wfs_store *s) {
     wfs_store_stat st;
     int rc = wfs_store_status(s, &st);
     if (rc) return fail("status", rc);
+    if (g_json) {
+        wfs_trash_stat ts = {};
+        int trc = wfs_gc_status(s, -1, &ts);
+        if (trc) return fail("status: trash", trc);
+        Json j(g_json_out);
+        j.num("schema_version", 1); j.str("dir", st.dir); j.str("store_id", st.store_id);
+        j.str("database", "metadata3.db");
+#define STATUS(field) j.num(#field, st.field)
+        STATUS(schema); STATUS(snapshots); STATUS(worlds_active); STATUS(worlds_trashed);
+        STATUS(worlds_dead); STATUS(snapshot_entries); STATUS(world_entries);
+        STATUS(volume_total_bytes); STATUS(volume_free_bytes); STATUS(metadata_estimate_bytes);
+        STATUS(pool_ready); STATUS(pool_entries); STATUS(snapshots_dangling); STATUS(worlds_dangling);
+        STATUS(snapshots_unreadable); STATUS(worlds_unreadable); STATUS(snapshots_trashed);
+#undef STATUS
+        j.num("trash_entries", ts.entries); j.num("trash_due", ts.due);
+        j.num("trash_deleting", ts.deleting); j.num("gc_worker_pid", ts.worker_pid);
+        j.num("creating_stranded", ts.creating_stranded); j.num("pool_stranded", ts.pool_stranded);
+        j.num("dirs_unreadable", ts.dirs_unreadable); j.str("dirs_unreadable_path", ts.dirs_unreadable_path);
+        j.num("dirs_unreadable_errno", ts.dirs_unreadable_errno);
+        j.num("trash_blocked", ts.trash_blocked); j.str("blocked_path", ts.blocked_path);
+        j.num("trash_foreign", ts.trash_foreign); j.str("foreign_path", ts.foreign_path);
+        return EX_OK;
+    }
     char freeb[32], totalb[32], meta[32];
     fmt_bytes(freeb, sizeof freeb, st.volume_free_bytes);
     fmt_bytes(totalb, sizeof totalb, st.volume_total_bytes);
@@ -1959,6 +2012,18 @@ int main(int argc, char **argv) {
     const char *sub = is_exec ? "exec" : av[2];
     int nargs = is_exec ? ac - 2 : ac - 3;
     char **args = av + (is_exec ? 2 : 3);
+    if (!is_exec && (!strcmp(sub, "list") || !strcmp(sub, "inspect") ||
+                     !strcmp(sub, "status") || !strcmp(sub, "diff"))) {
+        int kept = 0;
+        for (int i = 0; i < nargs; ++i) {
+            if (!strcmp(args[i], "--json")) g_json = true;
+            else args[kept++] = args[i];
+        }
+        nargs = kept;
+        args[kept] = NULL;
+        if ((!strcmp(sub, "list") || !strcmp(sub, "status")) && nargs) usage();
+        if (!strcmp(sub, "inspect") && nargs != 1) usage();
+    }
 
 #ifdef WFS_FSKIT
     if (!strcmp(sub, "fsstatus")) {
@@ -2131,6 +2196,11 @@ int main(int argc, char **argv) {
         return EX_ERR;
     }
 
+    // Stage machine output so a failed query cannot publish a partial success document.
+    if (g_json) {
+        g_json_out = tmpfile();
+        if (!g_json_out) { int err = errno; wfs_store_close(s); return fail("JSON buffer", -err); }
+    }
     int ret;
     if (is_exec) ret = cmd_exec(s, nargs, args);
     else if (!strcmp(sub, "init")) ret = cmd_init(s, nargs, args);
@@ -2232,5 +2302,20 @@ int main(int argc, char **argv) {
     else { wfs_store_close(s); usage(); return EX_USAGE; }
 
     wfs_store_close(s);
+    if (g_json_out) {
+        if (ret == EX_OK) {
+            if (fflush(g_json_out) || ferror(g_json_out) || fseek(g_json_out, 0, SEEK_SET))
+                ret = fail("JSON buffer", -EIO);
+            else {
+                char buf[8192];
+                size_t n;
+                while ((n = fread(buf, 1, sizeof buf, g_json_out)) != 0)
+                    if (fwrite(buf, 1, n, stdout) != n) { ret = fail("JSON output", -EIO); break; }
+                if (ferror(g_json_out) || fflush(stdout)) ret = fail("JSON output", -EIO);
+            }
+        }
+        fclose(g_json_out);
+    }
+    free(av);
     return ret;
 }
