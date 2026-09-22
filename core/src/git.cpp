@@ -281,7 +281,9 @@ int git_import(const GitSource &s, const char *clone) {
     String owned = joinp(clone, ".world-git");
     if (int rc = fs_mkdir(owned.c_str(), 0700)) return rc;
     String repo = joinp(owned.c_str(), "repo.git");
-    const char *copy[] = {"clone", "--bare", "--no-hardlinks", "--quiet", "--", s.root.c_str(), repo.c_str(), nullptr};
+    // Mirror every ref, including stash, notes, remote-tracking and custom refs; a bare clone
+    // silently keeps only heads and would lose refs when the source is later removed.
+    const char *copy[] = {"clone", "--mirror", "--no-hardlinks", "--quiet", "--", s.root.c_str(), repo.c_str(), nullptr};
     if (int rc = git(clone, copy)) return rc;
     // clone --local copies loose objects too, including blobs referenced only by the index;
     // --no-hardlinks prevents subsequent Git operations changing the source's object files.

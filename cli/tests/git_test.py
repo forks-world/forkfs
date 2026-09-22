@@ -112,6 +112,28 @@ class GitWorldTest(unittest.TestCase):
         self.git(one, 'fsck', '--full')
         self.git(one, 'commit', '-m', 'source gone')
 
+    def test_import_preserves_all_refs_after_source_is_deleted(self):
+        base = self.base.decode()
+        retained = self.git(self.source, 'commit-tree', base + '^{tree}', '-p', base,
+                            '-m', 'ref-only object').stdout.decode().strip()
+        refs = {
+            'refs/stash': retained,
+            'refs/remotes/origin/review': retained,
+            'refs/notes/test': retained,
+            'refs/custom/retained': retained,
+        }
+        for ref, oid in refs.items():
+            self.git(self.source, 'update-ref', ref, oid)
+        self.world('init', str(self.source))
+        for ref, oid in refs.items():
+            self.assertEqual(self.git(self.source, 'rev-parse', '--verify', ref).stdout.strip().decode(), oid)
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        self.git(one, 'gc', '--quiet')
+        for ref, oid in refs.items():
+            self.assertEqual(self.git(one, 'rev-parse', '--verify', ref).stdout.strip().decode(), oid)
+        self.git(one, 'config', '--get', 'remote.origin.url', code=1)
+
     def test_move_discard_restore_checkpoint_and_gc(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
@@ -160,7 +182,8 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
     def test_hard_snapshot_and_pool_refusal(self):
-        self.world('init', str(self.source), '--hard')
+        init_args = ('--hard',) if sys.platform == 'darwin' else ()
+        self.world('init', str(self.source), *init_args)
         self.world('pool', 'fill', 'S1', '--count', '1', code=3)
         self.assertEqual(json.loads(self.world('pool', 'status', '--json').stdout)['pool'], [])
         one, _ = self.fork()
