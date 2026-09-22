@@ -134,10 +134,10 @@ int nested_check(const char *root, bool top = true) {
 // administration stays inside it. Reject changed common-dir pointers and additional worktrees.
 int managed_check(const char *root, const char *common, const char *admin) {
     String repo = joinp(root, ".world-git/repo.git"), active = joinp(repo.c_str(), "worktrees/active");
-    char expected[WFS_PATH_MAX], actual[WFS_PATH_MAX];
-    if (!realpath(repo.c_str(), expected) || !realpath(common, actual) || strcmp(expected, actual))
+    String expected, actual;
+    if (fs_realpath(repo.c_str(), expected) || fs_realpath(common, actual) || expected != actual)
         return WFS_E_GIT_UNSUPPORTED;
-    if (!realpath(active.c_str(), expected) || !realpath(admin, actual) || strcmp(expected, actual))
+    if (fs_realpath(active.c_str(), expected) || fs_realpath(admin, actual) || expected != actual)
         return WFS_E_GIT_UNSUPPORTED;
     for (const char *file : {"commondir", "gitdir"}) {
         Vec<char> bytes;
@@ -212,8 +212,8 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     String top;
     const char *top_args[] = {"rev-parse", "--show-toplevel", nullptr};
     if (int rc = value(root, top_args, top)) return rc;
-    char real_top[WFS_PATH_MAX], real_root[WFS_PATH_MAX];
-    if (!realpath(root, real_root) || !realpath(top.c_str(), real_top) || strcmp(real_root, real_top))
+    String real_top, real_root;
+    if (fs_realpath(root, real_root) || fs_realpath(top.c_str(), real_top) || real_root != real_top)
         return WFS_E_GIT_UNSUPPORTED;
     const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (value(root, head_args, out.head)) return WFS_E_GIT_UNSUPPORTED;
