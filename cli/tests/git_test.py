@@ -337,6 +337,66 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
         self.world('checkpoint', wid)
 
+    def test_external_grafts_are_refused_without_changing_history(self):
+        (self.source / 'file').write_text('next\n')
+        self.git(self.source, 'commit', '-am', 'next')
+        tip = self.git(self.source, 'rev-parse', 'HEAD').stdout.strip()
+        graft = self.source / '.git' / 'info' / 'grafts'
+        graft.write_bytes(tip + b'\n')
+        before = self.git(self.source, 'rev-list', 'HEAD').stdout
+        self.assertEqual(before.strip(), tip)
+        result = self.world('init', str(self.source), code=3)
+        self.assertIn(b'unsupported Git layout', result.stderr)
+        self.assertEqual(graft.read_bytes(), tip + b'\n')
+        self.assertEqual(self.git(self.source, 'rev-list', 'HEAD').stdout, before)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_active_bisect_is_refused_without_changing_session(self):
+        for n in range(4):
+            (self.source / 'file').write_text(str(n) + '\n')
+            self.git(self.source, 'commit', '-am', 'step ' + str(n))
+        self.git(self.source, 'bisect', 'start', 'HEAD', self.base.decode())
+        before = self.git(self.source, 'bisect', 'log').stdout
+        head = self.git(self.source, 'rev-parse', 'HEAD').stdout
+        self.assertTrue((self.source / '.git' / 'BISECT_START').exists())
+        self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+        self.world('init', str(self.source), code=1)
+        self.assertEqual(self.git(self.source, 'bisect', 'log').stdout, before)
+        self.assertEqual(self.git(self.source, 'rev-parse', 'HEAD').stdout, head)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_in_progress_operation_markers_are_refused(self):
+        for name in ('sequencer', 'MERGE_AUTOSTASH'):
+            with self.subTest(name=name):
+                marker = self.source / '.git' / name
+                if name == 'sequencer':
+                    marker.mkdir()
+                    (marker / 'todo').write_text('pick ' + self.base.decode() + ' pending\n')
+                else:
+                    marker.write_bytes(self.base + b'\n')
+                self.world('init', str(self.source), '--include-changes', code=1)
+                self.assertTrue(marker.exists())
+                self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+                if marker.is_dir():
+                    shutil.rmtree(marker)
+                else:
+                    marker.unlink()
+
+    def test_conflicted_squash_merge_is_refused(self):
+        self.git(self.source, 'checkout', '-b', 'side')
+        (self.source / 'file').write_text('side\n')
+        self.git(self.source, 'commit', '-am', 'side')
+        self.git(self.source, 'checkout', 'main')
+        (self.source / 'file').write_text('main\n')
+        self.git(self.source, 'commit', '-am', 'main')
+        self.git(self.source, 'merge', '--squash', 'side', code=1)
+        self.assertFalse((self.source / '.git' / 'MERGE_HEAD').exists())
+        before = self.git(self.source, 'ls-files', '--unmerged').stdout
+        self.assertTrue(before)
+        self.world('init', str(self.source), '--include-changes', code=1)
+        self.assertEqual(self.git(self.source, 'ls-files', '--unmerged').stdout, before)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_move_discard_restore_checkpoint_and_gc(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

@@ -122,3 +122,8 @@ promise preservation of other external reflog history.
 These restrictions do not apply to managed Worlds: their Git administration is
 cloned as part of the filesystem, retaining hidden refs and native stash stacks
 through forks and checkpoints. External eligibility is checked again around import.
+
+External repositories with `info/grafts` are rejected because their local ancestry
+overrides are not transported by a mirror. Active bisect and sequencer sessions,
+like unfinished merges, cherry-picks and rebases, must be completed or aborted
+before import or checkpoint; their administrative state is not a clean baseline.

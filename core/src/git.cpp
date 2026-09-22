@@ -291,10 +291,29 @@ int reject_external_visibility_state(const char *root, bool managed) {
     const char *args[] = {"reflog", "exists", "refs/stash", nullptr};
     int status = -1, rc = git(root, args, nullptr, &status);
     if (!rc) return WFS_E_GIT_UNSUPPORTED;
-    if (rc == WFS_E_GIT_FAILED && status == 1) return 0;
-    return rc;
+    if (rc != WFS_E_GIT_FAILED || status != 1) return rc;
+    String grafts; const char *graft_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "info/grafts", nullptr};
+    if (int graft_rc = value(root, graft_args, grafts)) return graft_rc;
+    struct stat st;
+    if (!lstat(grafts.c_str(), &st)) return WFS_E_GIT_UNSUPPORTED;
+    return errno == ENOENT ? 0 : -errno;
+}
+int reject_inprogress(const char *root) {
+    String admin;
+    const char *args[] = {"rev-parse", "--absolute-git-dir", nullptr};
+    if (int rc = value(root, args, admin)) return rc;
+    const char *inprogress[] = {"index.lock", "HEAD.lock", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
+        "BISECT_START", "MERGE_AUTOSTASH", "rebase-merge", "rebase-apply", "sequencer"};
+    struct stat st;
+    for (const char *rel : inprogress) {
+        String path = joinp(admin.c_str(), rel);
+        if (!lstat(path.c_str(), &st)) return -EBUSY;
+        if (errno != ENOENT) return -errno;
+    }
+    return 0;
 }
 int source_unchanged(const GitSource &s) {
+    if (int rc = reject_inprogress(s.root.c_str())) return rc;
     if (int rc = reject_external_visibility_state(s.root.c_str(), s.managed)) return rc;
     String head; const char *args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (int rc = value(s.root.c_str(), args, head)) return rc;
@@ -379,18 +398,20 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
         if (!lstat(path.c_str(), &st)) return WFS_E_GIT_UNSUPPORTED;
         if (errno != ENOENT) return -errno;
     }
-    const char *inprogress[] = {"index.lock", "HEAD.lock", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"};
-    for (const char *rel : inprogress) {
-        String path = joinp(admin.c_str(), rel);
-        if (!lstat(path.c_str(), &st)) return -EBUSY;
-        if (errno != ENOENT) return -errno;
-    }
+    if ((rc = reject_inprogress(root))) return rc;
     // Sparse/split indexes and gitlinks require a separate import contract.
     const char *ls_args[] = {"ls-files", "--stage", "-z", nullptr};
     Vec<char> listing;
     if ((rc = git(root, ls_args, &listing))) return rc;
     for (size_t i = 0; i + 1 < listing.size();) {
-        if (!strncmp(listing.data() + i, "160000 ", 7)) return WFS_E_GIT_UNSUPPORTED;
+        const char *entry = listing.data() + i;
+        if (!strncmp(entry, "160000 ", 7)) return WFS_E_GIT_UNSUPPORTED;
+        size_t end = i;
+        while (end < listing.size() && listing[end]) ++end;
+        size_t tab = i;
+        while (tab < end && listing[tab] != '\t') ++tab;
+        if (tab < end && tab - i >= 2 && listing[tab - 1] >= '1' && listing[tab - 1] <= '3' && listing[tab - 2] == ' ')
+            return -EBUSY;
         i += strlen(listing.data() + i) + 1;
     }
     const char *keys[] = {"core.sparseCheckout", "core.splitIndex", "extensions.partialClone"};
