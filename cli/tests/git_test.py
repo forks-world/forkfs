@@ -19,7 +19,10 @@ class GitWorldTest(unittest.TestCase):
         self.store = self.root / 'store'
         self.env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
         self.env.update(WORLD_STORE=str(self.store), WORLD_POOL_TOPUP='0',
-                        GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1')
+                        GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1',
+                        GIT_CONFIG_COUNT='2', GIT_CONFIG_KEY_0='maintenance.auto',
+                        GIT_CONFIG_VALUE_0='false', GIT_CONFIG_KEY_1='gc.auto',
+                        GIT_CONFIG_VALUE_1='0')
         self.git(self.source, 'init', '-b', 'main')
         self.git(self.source, 'config', 'user.name', 'World Test')
         self.git(self.source, 'config', 'user.email', 'world@example.com')
