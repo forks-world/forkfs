@@ -339,6 +339,44 @@ class GitWorldTest(unittest.TestCase):
                 self.assertEqual(self.git(path, 'config', '--get', key).stdout.strip(), value)
             self.assertEqual(self.git(path, 'status', '--porcelain').stdout, b'')
 
+    def test_global_status_policy_is_refused_before_dirty_admission(self):
+        line = self.source / 'line.txt'
+        line.write_bytes(b'committed\r\n')
+        self.git(self.source, 'add', 'line.txt')
+        self.git(self.source, 'commit', '-m', 'literal CRLF')
+        attributes = self.root / 'global-attributes'
+        attributes.write_text('*.txt text eol=lf\n')
+        included = self.root / 'status-policy'
+        included.write_text('[core]\n attributesFile = ' + str(attributes) + '\n')
+        global_config = self.root / 'global-config'
+        global_config.write_text('[include]\n path = ' + str(included) + '\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        self.assertIn(b' M line.txt', self.git(self.source, 'status', '--porcelain').stdout)
+        before = [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index', 'config')]
+        result = self.world('init', str(self.source), code=3)
+        self.assertIn(b'unsupported Git layout', result.stderr)
+        self.assertEqual(before, [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index', 'config')])
+        self.assertEqual(line.read_bytes(), b'committed\r\n')
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_ambient_filters_are_refused_without_execution(self):
+        global_config = self.root / 'filter-global'
+        global_config.write_text('[filter "example"]\n clean = touch ambient-filter-ran; cat\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        result = self.world('init', str(self.source), '--include-changes', code=3)
+        self.assertIn(b'unsupported Git layout', result.stderr)
+        self.assertFalse((self.source / 'ambient-filter-ran').exists())
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_system_status_policy_is_refused(self):
+        system_config = self.root / 'system-config'
+        system_config.write_text('[core]\n autocrlf = false\n')
+        self.env['GIT_CONFIG_NOSYSTEM'] = '0'
+        self.env['GIT_CONFIG_SYSTEM'] = str(system_config)
+        result = self.world('init', str(self.source), code=3)
+        self.assertIn(b'unsupported Git layout', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_filter_configuration_is_refused_before_execution(self):
         (self.source / '.gitattributes').write_text('file filter=example\n')
         self.git(self.source, 'add', '.gitattributes')

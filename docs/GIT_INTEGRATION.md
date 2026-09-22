@@ -109,7 +109,14 @@ before publication along with the source index and local rules.
 
 Effective repository `filter.*` definitions are rejected before status inspection.
 Arbitrary configuration, executable conversions, hooks, and external policy paths
-are not imported. Global and system Git configuration are disabled during import.
+are not imported. A configuration-only probe reads global and system configuration
+key names, including active includes. Status-policy keys listed above, external
+attributes/ignore overrides, and filter definitions in those scopes are rejected
+before deciding cleanliness, even with `--include-changes`. This avoids silently
+changing the user's normal Git status semantics. The probe does not execute
+filters or copy configuration values; other import Git commands continue to
+disable global and system configuration. Identity-only global configuration is
+allowed and remains available to ordinary Git commands in the World.
 
 ### External reference restrictions
 

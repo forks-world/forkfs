@@ -15,7 +15,7 @@ String joinp(const char *a, const char *b) { String s(a); s.append("/"); s.appen
 constexpr const char *marker = "gitdir: .world-git/repo.git/worktrees/active\n";
 
 // Never use a shell, source hooks, inherited GIT_DIR/INDEX_FILE, or lazy network fetches.
-int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, int *exit_code = nullptr, bool quiet_stderr = false) {
+int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, int *exit_code = nullptr, bool quiet_stderr = false, bool ambient_config_probe = false) {
     if (exit_code) *exit_code = -1;
     Vec<char *> av;
     const char *prefix[] = {"git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
@@ -25,11 +25,17 @@ int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, i
     for (size_t i = 0; args[i]; ++i) av.emplace_back(const_cast<char *>(args[i]));
     av.emplace_back(nullptr);
     Vec<char *> env;
-    for (char **p = environ; *p; ++p)
-        if (strncmp(*p, "GIT_", 4)) env.emplace_back(*p);
-    const char *settings[] = {"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
-        "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1"};
+    for (char **p = environ; *p; ++p) {
+        if (strncmp(*p, "GIT_", 4) || (ambient_config_probe &&
+            (!strncmp(*p, "GIT_CONFIG_GLOBAL=", 18) || !strncmp(*p, "GIT_CONFIG_SYSTEM=", 18) ||
+             !strncmp(*p, "GIT_CONFIG_NOSYSTEM=", 20)))) env.emplace_back(*p);
+    }
+    const char *settings[] = {"GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1"};
     for (const char *p : settings) env.emplace_back(const_cast<char *>(p));
+    if (!ambient_config_probe) {
+        env.emplace_back(const_cast<char *>("GIT_CONFIG_NOSYSTEM=1"));
+        env.emplace_back(const_cast<char *>("GIT_CONFIG_GLOBAL=/dev/null"));
+    }
     env.emplace_back(nullptr);
     int pipefd[2];
     if (pipe(pipefd)) return -errno;
@@ -333,6 +339,29 @@ int reject_configured_policy(const char *root, const char *key) {
     if (rc == WFS_E_GIT_FAILED && status == 1) return 0;
     return rc;
 }
+// This fixed, read-only query is the sole caller allowed to load ambient config.
+// Git parses the files, but returns only matching key names, never their values.
+int reject_ambient_policy(const char *root) {
+    const char *args[] = {"config", "--includes", "--null", "--show-scope", "--name-only",
+        "--get-regexp", "^(core\\.(excludesfile|attributesfile|autocrlf|eol|safecrlf|filemode|symlinks|ignorecase|precomposeunicode|trustctime|checkstat|ignorestat|checkroundtripencoding)$|filter\\..*)", nullptr};
+    Vec<char> listing; int status = -1;
+    int rc = git(root, args, &listing, &status, false, true);
+    if (rc == WFS_E_GIT_FAILED && status == 1) return 0;
+    if (rc) return rc;
+    size_t i = 0;
+    while (i < listing.size() && listing[i]) {
+        size_t scope = i; while (i < listing.size() && listing[i]) ++i;
+        size_t scope_len = i - scope;
+        if (i >= listing.size()) return WFS_E_GIT_FAILED;
+        ++i;
+        size_t key = i; while (i < listing.size() && listing[i]) ++i;
+        if (i == key || i + 1 >= listing.size()) return WFS_E_GIT_FAILED;
+        if ((scope_len == 6 && !memcmp(listing.data() + scope, "global", 6)) ||
+            (scope_len == 6 && !memcmp(listing.data() + scope, "system", 6))) return WFS_E_GIT_UNSUPPORTED;
+        ++i;
+    }
+    return 0;
+}
 int reject_external_visibility_state(const char *root, bool managed) {
     if (managed) return 0;
     for (const char *key : {"transfer.hideRefs", "uploadpack.hideRefs"})
@@ -364,6 +393,7 @@ int reject_inprogress(const char *root) {
 // Repeat the same eligibility checks before publication: configuration and layout
 // can change while an external mirror is being copied.
 int reject_import_policy(const char *root) {
+    if (int rc = reject_ambient_policy(root)) return rc;
     for (const char *key : {"core.excludesFile", "core.attributesFile"})
         if (int rc = reject_configured_policy(root, key)) return rc;
     for (const char *key : {"core.sparseCheckout", "core.splitIndex"}) {
