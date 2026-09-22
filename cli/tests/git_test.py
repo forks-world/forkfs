@@ -156,6 +156,40 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(one, 'rev-parse', '--verify', 'refs/custom/alias1').stdout.strip().decode(), moved)
         self.git(one, 'config', '--get', 'remote.origin.url', code=1)
 
+    def test_import_preserves_local_excludes(self):
+        exclude = self.source / '.git' / 'info' / 'exclude'
+        exclude.write_bytes(b'local-only/\nignored.txt')
+        (self.source / 'ignored.txt').write_text('ignored\n')
+        (self.source / 'local-only').mkdir()
+        (self.source / 'local-only' / 'artifact').write_text('ignored directory\n')
+        source_exclude = exclude.read_bytes()
+        self.world('init', str(self.source))
+        self.assertEqual(exclude.read_bytes(), source_exclude)
+        shutil.rmtree(self.source)
+        one, wid = self.fork()
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.assertEqual((one / 'ignored.txt').read_text(), 'ignored\n')
+        self.assertEqual((one / 'local-only' / 'artifact').read_text(), 'ignored directory\n')
+        self.world('checkpoint', wid)
+
+    def test_import_preserves_local_attributes(self):
+        attributes = self.source / '.git' / 'info' / 'attributes'
+        attributes.write_bytes(b'*.txt text')
+        (self.source / 'line.txt').write_bytes(b'line\r\n')
+        self.git(self.source, 'add', 'line.txt')
+        self.git(self.source, 'commit', '-m', 'text file')
+        self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+        self.assertIn(b'text: set', self.git(self.source, 'check-attr', 'text', '--', 'line.txt').stdout)
+        source_attributes = attributes.read_bytes()
+        self.world('init', str(self.source))
+        self.assertEqual(attributes.read_bytes(), source_attributes)
+        shutil.rmtree(self.source)
+        one, wid = self.fork()
+        self.assertEqual((one / 'line.txt').read_bytes(), b'line\r\n')
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.assertIn(b'text: set', self.git(one, 'check-attr', 'text', '--', 'line.txt').stdout)
+        self.world('checkpoint', wid)
+
     def test_move_discard_restore_checkpoint_and_gc(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

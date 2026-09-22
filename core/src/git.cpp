@@ -103,6 +103,9 @@ bool same_symrefs(const Vec<GitSymref> &a, const Vec<GitSymref> &b) {
         if (a[i].name != b[i].name || a[i].target != b[i].target) return false;
     return true;
 }
+bool same_bytes(const Vec<char> &a, const Vec<char> &b) {
+    return a.size() == b.size() && (a.empty() || !memcmp(a.data(), b.data(), a.size()));
+}
 int read_bytes(const char *path, Vec<char> &out) {
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) return -errno;
@@ -221,6 +224,16 @@ int source_unchanged(const GitSource &s) {
     if (rc) return rc;
     if (head != s.head || index.size() != s.index.size() ||
         (!index.empty() && memcmp(index.data(), s.index.data(), index.size()))) return -EBUSY;
+    Vec<char> exclude;
+    rc = read_bytes(s.exclude_path.c_str(), exclude);
+    if (rc == -ENOENT && s.exclude.empty()) rc = 0;
+    if (rc) return rc;
+    if (!same_bytes(exclude, s.exclude)) return -EBUSY;
+    Vec<char> attributes;
+    rc = read_bytes(s.attributes_path.c_str(), attributes);
+    if (rc == -ENOENT && s.attributes.empty()) rc = 0;
+    if (rc) return rc;
+    if (!same_bytes(attributes, s.attributes)) return -EBUSY;
     Vec<GitSymref> refs;
     if (int symrc = collect_symrefs(s.root.c_str(), refs)) return symrc;
     if (!same_symrefs(refs, s.symrefs)) return -EBUSY;
@@ -255,6 +268,14 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     const char *index_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "index", nullptr};
     if (int rc = value(root, index_args, out.index_path)) return rc;
     int rc = read_bytes(out.index_path.c_str(), out.index);
+    if (rc && rc != -ENOENT) return rc;
+    const char *exclude_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "info/exclude", nullptr};
+    if ((rc = value(root, exclude_args, out.exclude_path))) return rc;
+    rc = read_bytes(out.exclude_path.c_str(), out.exclude);
+    if (rc && rc != -ENOENT) return rc;
+    const char *attributes_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "info/attributes", nullptr};
+    if ((rc = value(root, attributes_args, out.attributes_path))) return rc;
+    rc = read_bytes(out.attributes_path.c_str(), out.attributes);
     if (rc && rc != -ENOENT) return rc;
     String common, admin;
     const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
@@ -312,6 +333,8 @@ int git_import(const GitSource &s, const char *clone) {
         if (int rc = git_source(clone, true, copy)) return rc;
         if (copy.head != s.head || copy.index.size() != s.index.size() ||
             (!copy.index.empty() && memcmp(copy.index.data(), s.index.data(), s.index.size())) ||
+            !same_bytes(copy.exclude, s.exclude) ||
+            !same_bytes(copy.attributes, s.attributes) ||
             !same_symrefs(copy.symrefs, s.symrefs)) return -EBUSY;
         return 0;
     }
@@ -349,7 +372,17 @@ int git_import(const GitSource &s, const char *clone) {
         const char *empty[] = {"read-tree", "--empty", nullptr};
         if (int rc = git(clone, empty)) return rc;
     }
-    if (int rc = write_text(repo.c_str(), "info/exclude", "/.world\n/.world-git/\n")) return rc;
+    Vec<char> excludes;
+    for (char c : s.exclude) excludes.emplace_back(c);
+    if (!excludes.empty() && excludes.back() != '\n') excludes.emplace_back('\n');
+    for (const char *reserved : {"/.world\n", "/.world-git/\n"})
+        for (const char *p = reserved; *p; ++p) excludes.emplace_back(*p);
+    String exclude_path = joinp(repo.c_str(), "info/exclude");
+    if (int rc = write_bytes(exclude_path.c_str(), excludes.data(), excludes.size())) return rc;
+    if (!s.attributes.empty()) {
+        String attributes_path = joinp(repo.c_str(), "info/attributes");
+        if (int rc = write_bytes(attributes_path.c_str(), s.attributes.data(), s.attributes.size())) return rc;
+    }
     if (int rc = config(clone, "worldfs.baseline", s.head.c_str())) return rc;
     if (int rc = config(clone, "worldfs.formatVersion", "1")) return rc;
     for (const char *key : {"user.name", "user.email"}) {

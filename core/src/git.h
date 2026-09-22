@@ -12,6 +12,10 @@ struct GitSource {
     bool managed = false;
     String root, head, index_path;
     Vec<char> index;
+    String exclude_path;
+    Vec<char> exclude;
+    String attributes_path;
+    Vec<char> attributes;
     Vec<GitSymref> symrefs;
 };
 int git_source(const char *root, bool include_changes, GitSource &out);

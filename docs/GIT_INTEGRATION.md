@@ -39,7 +39,9 @@ Deleting the original source after a successful import does not remove Git objec
 by the World, including staged blobs which have not yet appeared in any commit.
 
 `.world` and `.world-git/` are excluded from Git status using the private repository's
-`info/exclude`. These are reserved administration names. Source hooks and local executable
+`info/exclude`; source-local `info/exclude` rules are preserved before those reserved entries
+are appended. Source-local `info/attributes` rules are also preserved. These are reserved
+administration names. Source hooks and local executable
 Git settings are not imported. Local `user.name` and `user.email` are preserved; normal Git
 commands in a World also use the user's usual Git configuration. Import does not create a
 remote back to the source. Fetching/pushing requires explicitly configuring a remote.
