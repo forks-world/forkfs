@@ -62,8 +62,9 @@ with tempfile.TemporaryDirectory(prefix='wfs-xfs-', dir=args.scratch.resolve()) 
     for i in range(40):
         os.setxattr(src / 'data', f'user.order{i:02}', b'x' * 128)
     # Linux POSIX ACL xattr format: version, then tag/permissions/id entries.
+    acl_uid = os.getuid()
     acl = struct.pack('<I', 2) + b''.join(struct.pack('<HHI', tag, perm, uid) for tag, perm, uid in (
-        (1, 6, 0xffffffff), (2, 4, 12345), (4, 4, 0xffffffff),
+        (1, 6, 0xffffffff), (2, 4, acl_uid), (4, 4, 0xffffffff),
         (16, 4, 0xffffffff), (32, 0, 0xffffffff)))
     os.setxattr(src / 'data', 'system.posix_acl_access', acl)
     os.link(src / 'data', src / 'linked')

@@ -29,7 +29,7 @@ endif()
 
 add_library(worldfs_core STATIC ${WFS_CORE_SOURCES})
 target_include_directories(worldfs_core PUBLIC include PRIVATE src)
-target_link_libraries(worldfs_core PUBLIC SQLite3::SQLite3 Threads::Threads PRIVATE wfs_third_party)
+target_link_libraries(worldfs_core PUBLIC SQLite::SQLite3 Threads::Threads PRIVATE wfs_third_party)
 target_compile_features(worldfs_core PUBLIC cxx_std_23)
 target_compile_options(worldfs_core PRIVATE -Wall -Wextra)
 # Darwin hides ENOATTR & friends under strict -std=; ask for the full BSD namespace.
