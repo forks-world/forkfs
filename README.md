@@ -1,9 +1,16 @@
 # forkfs — World FS provider (BranchFS)
 
-Fork a workspace into hundreds of independently writable worlds on one Mac, on top of APFS.
+Fork a workspace into independently writable worlds on macOS/APFS or Linux/XFS.
 Design: [`arch.md`](arch.md), [`docs/M1_DESIGN.md`](docs/M1_DESIGN.md). Task board: [`docs/TASKS.md`](docs/TASKS.md).
 
 ## Status
+
+Linux now has an XFS reflink backend and namespace-isolated `world exec` through the system
+Bubblewrap CLI. Build requirements, tested behavior, timings and limitations:
+[`docs/LINUX_XFS.md`](docs/LINUX_XFS.md). Linux requires reflink support for snapshots;
+`--copy` is an explicit fork fallback. Linux diff uses a full scan. Sandboxed execution
+fails closed; only `--no-sandbox` opts out. The APFS measurements and FSEvents/seatbelt
+behavior described below apply to macOS.
 
 The macOS clonefile World implementation includes the M1 lifecycle and M2 background GC,
 snapshot disposal, reconciliation, and hardlink preservation. See
@@ -19,7 +26,8 @@ so everything inside it runs at native speed (measured 99–102%, [`docs/CLONE_M
 The M0 FSKit passthrough frontend is frozen as a fallback and is not built by default
 (`-DWFS_FSKIT=ON` brings back `core/src/view.cpp`, `macos/fskit/` and `world fs mount`).
 
-C++23 core with a C ABI, C++ CLI, CMake + Command Line Tools only; no Xcode needed.
+C++23 core with a C ABI and C++ CLI. macOS builds with CMake + Command Line Tools; no Xcode needed.
+Linux build dependencies and sandbox setup are in the [XFS guide](docs/LINUX_XFS.md).
 Dependency policy: arch.md §39. Design: [`docs/M1_DESIGN.md`](docs/M1_DESIGN.md).
 
 ## Build
@@ -279,6 +287,12 @@ command runs in a seatbelt sandbox that cannot write to any other World or to th
 
 ## Running an agent in a World: `world exec`
 
+On Linux, the default is a fail-closed user/mount/PID namespace sandbox: the World is
+writable, the host filesystem is read-only, and the store is hidden. See the
+[Linux isolation policy](docs/LINUX_XFS.md#execution-isolation) for temporary directories,
+agent configuration, networking and other boundaries. The seatbelt policy below is macOS-only.
+
+
 ```bash
 world exec W1 -- claude -p "fix the failing test"
 world exec W1 --no-sandbox -- make test        # opt out of the sandbox entirely
@@ -387,6 +401,8 @@ core/src/snapshot_access.{h,cpp}      the one door into a snapshot's contents (t
 core/src/pool.{h,cpp}                 the pre-clone pool: fill, claim, status, drain, gc, verify (T1.5)
 core/src/events.h                     candidate collection interface + the path bag
 core/src/platform_darwin_events.cpp   the FSEvents replay: flags, journal-age check, dedicated queue
+core/src/platform_linux.cpp           Linux FICLONE, sparse-copy fallback, metadata preservation
+cli/linux_sandbox.cpp                Linux namespace and seccomp execution policy
 core/src/platform_posix.cpp           parallel tree walk, manifest, free space, recursive delete
 core/src/platform_darwin.cpp          clonefile, per-file fallback, chflags protect/unprotect, FSEvents cursor,
                                       getattrlistbulk enumeration + the EF_NO_XATTRS verdict

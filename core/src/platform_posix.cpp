@@ -12,7 +12,11 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
+#ifdef __APPLE__
 #include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <linux/fs.h>
+#endif
 #include <sys/xattr.h>
 #include <unistd.h>
 
@@ -1161,7 +1165,8 @@ int fs_lstat_xattr(const char *path, struct stat &st, uint8_t &xattr) {
     return ::lstat(path, &st) == 0 ? 0 : -errno;
 }
 
-// Linux/other: the clonefile world model is Darwin-only for now. overlayfs is the planned
+#ifndef __linux__
+// Other platforms: overlayfs is the planned
 // equivalent (docs/M1_DESIGN.md §4); until then these report "unsupported" honestly rather
 // than silently doing a real copy.
 int fs_clone_probe(const char *, const char *) { return -ENOTSUP; }
@@ -1171,6 +1176,7 @@ int fs_protect_tree(const char *root, TreeStats *stats, Manifest *) {
     return 0;
 }
 int fs_unprotect_tree(const char *, int64_t) { return 0; }
+#endif
 uint64_t fs_events_current_id(void) { return 0; }
 #endif
 

@@ -282,7 +282,7 @@ typedef struct wfs_snapshot_opts {
     /* P3, the slow variant: chflags(UF_IMMUTABLE) on every entry and write bits stripped from
      * every directory. Costs a full parallel walk here (0.68 s / 50k entries) and a second one
      * on every fork from this snapshot (0.73 s / 50k). The default gate protection costs one
-     * chmod and forks need no unprotect walk at all. */
+     * chmod and forks need no unprotect walk at all. Linux rejects hard with -ENOTSUP. */
     int hard;
     /* P5: proceed even when the source world has a live `world exec` lock. */
     int force;

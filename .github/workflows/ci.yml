@@ -85,3 +85,36 @@ jobs:
             build/ci/Testing/Temporary/*.log
             build/ci/safety.log
             build/ci/disk-full.log
+
+  linux-xfs:
+    name: Release (Linux XFS)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install build and namespace tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14 libsqlite3-dev xfsprogs bubblewrap
+      - name: Create bounded XFS test volume
+        run: |
+          truncate -s 2G "$RUNNER_TEMP/forkfs-xfs.img"
+          mkfs.xfs -f -m reflink=1 "$RUNNER_TEMP/forkfs-xfs.img"
+          sudo mkdir -p /mnt/forkfs-xfs
+          sudo mount -o loop "$RUNNER_TEMP/forkfs-xfs.img" /mnt/forkfs-xfs
+          sudo chown "$(id -u):$(id -g)" /mnt/forkfs-xfs
+      - name: Build and test as an unprivileged user
+        run: |
+          cmake -S . -B /mnt/forkfs-xfs/build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14 -DWFS_FSKIT=OFF
+          cmake --build /mnt/forkfs-xfs/build --parallel 4
+          ctest --test-dir /mnt/forkfs-xfs/build --output-on-failure --no-tests=error
+          scripts/check-deps.sh /mnt/forkfs-xfs/build
+      - name: Unmount test volume
+        if: always()
+        run: |
+          if mountpoint -q /mnt/forkfs-xfs; then sudo umount /mnt/forkfs-xfs; fi

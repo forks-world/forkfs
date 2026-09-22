@@ -12,6 +12,9 @@
 #include <strings.h>
 #include <sys/file.h>
 #include <sys/mount.h>
+#ifdef __linux__
+#include <sys/vfs.h>
+#endif
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/random.h>
@@ -1869,6 +1872,9 @@ extern "C" int wfs_store_status(wfs_store *s, wfs_store_stat *out) {
 extern "C" int wfs_store_clone_probe(wfs_store *s, const char *src_dir) {
     if (!s || !src_dir) return -EINVAL;
     int rc = wfs::fs_clone_probe(s->dir.c_str(), src_dir);
-    if (rc == -EXDEV || rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
+    if (rc == -EXDEV) return WFS_E_CROSS_VOLUME;
+#ifdef __APPLE__
+    if (rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
+#endif
     return rc;
 }

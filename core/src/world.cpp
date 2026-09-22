@@ -1152,6 +1152,9 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
     wfs_snapshot_opts o;
     memset(&o, 0, sizeof o);
     if (opts) o = *opts;
+#ifdef __linux__
+    if (o.hard) return -ENOTSUP;
+#endif
     const char *name = o.name;
     String src;
     bool from_world_root = false;
@@ -1663,7 +1666,10 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         if (src_gated) { if (int rc = probe_gate.open(src.c_str(), false)) return rc; }
         int rc = wfs::fs_clone_probe(parent_dir.c_str(), src.c_str());
         probe_gate.close();
-        if (rc == -EXDEV || rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
+        if (rc == -EXDEV) return WFS_E_CROSS_VOLUME;
+#ifdef __APPLE__
+        if (rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
+#endif
         if (rc) return rc;
     }
     if (!o.skip_space_check) {
@@ -1837,7 +1843,10 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
             // still naming this tree) and gc --status counts in creating_stranded -- and the
             // caller gets the error that started all this.
             if (!proven_gone(tmp.c_str())) {
-                if (rc == -EXDEV || rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
+                if (rc == -EXDEV) return WFS_E_CROSS_VOLUME;
+#ifdef __APPLE__
+                if (rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
+#endif
                 return rc;
             }
         }
@@ -1851,7 +1860,10 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
             if (del.ok()) { del.i64(1, (int64_t)id); del.step(); }
             (void)t.commit();   // best effort: the sweep is the backstop either way
         }
-        if (rc == -EXDEV || rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
+        if (rc == -EXDEV) return WFS_E_CROSS_VOLUME;
+#ifdef __APPLE__
+        if (rc == -ENOTSUP) return WFS_E_CROSS_VOLUME;
+#endif
         return rc;
     }
 

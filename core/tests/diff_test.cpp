@@ -78,7 +78,9 @@ static int64_t now_us(void) {
 static void rm_rf(const char *path) {
     struct stat st;
     if (lstat(path, &st) != 0) return;
+#ifdef __APPLE__
     lchflags(path, 0);
+#endif
     if (S_ISDIR(st.st_mode)) {
         chmod(path, 0755);
         DIR *d = opendir(path);
@@ -301,6 +303,11 @@ static int events_path_fell_back = 0;
 // taken, so a caller can keep the few assertions that only mean something there (candidate
 // counts) behind it.
 static int want_events_path(const char *what, const wfs_diff_stats *st, const char *file, int line) {
+#ifndef __APPLE__
+    CHECK(st->full_scan == 1);
+    CHECK(st->fallback == WFS_DF_NO_CURSOR || st->fallback == WFS_DF_UNSUPPORTED);
+    return 0;
+#endif
     events_path_asked++;
     if (st->full_scan == 0 && st->fallback == WFS_DF_NONE) {
         events_path_taken++;
@@ -1472,6 +1479,7 @@ int main() {
     // produces — FSEvents delivers nothing and never sends HistoryDone — and it must turn into
     // a full scan with an identical answer, without the caller being told to do anything.
     uint64_t good_cursor = 0;
+#ifdef __APPLE__
     {
         wfs_world_rec wr;
         CHECK_OK(wfs_world_info(s, wid, &wr));
@@ -1489,6 +1497,7 @@ int main() {
     CHECK(st.full_scan == 1 && st.fallback == WFS_DF_WRAPPED);
     check_exact("10k / wrapped cursor", &c, &st);
 
+#endif
     // no cursor at all (a store row written before T1.3, or a fork that could not take one)
     set_cursor(store, wid, 0);
     run_diff(s, wid, 0, &c, &st);

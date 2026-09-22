@@ -30,6 +30,10 @@ target_include_directories(wfs_third_party SYSTEM INTERFACE
 )
 target_compile_definitions(wfs_third_party INTERFACE FMT_HEADER_ONLY=1)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    add_link_options(-static-libstdc++)
+endif()
+
 enable_testing()
 add_subdirectory(core)
 add_subdirectory(cli)
