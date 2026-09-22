@@ -19,6 +19,9 @@ struct GitSource {
     Vec<char> exclude;
     String attributes_path;
     Vec<char> attributes;
+    String squash_path;
+    Vec<char> squash;
+    bool squash_present = false;
     Vec<GitSymref> symrefs;
     Vec<GitSetting> settings;
 };

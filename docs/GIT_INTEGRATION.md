@@ -127,3 +127,7 @@ External repositories with `info/grafts` are rejected because their local ancest
 overrides are not transported by a mirror. Active bisect and sequencer sessions,
 like unfinished merges, cherry-picks and rebases, must be completed or aborted
 before import or checkpoint; their administrative state is not a clean baseline.
+
+A completed, conflict-free squash merge may be imported with `--include-changes`.
+Its staged changes and passive `SQUASH_MSG` are preserved so the next Git commit
+retains the prepared message. Conflicted squash merges remain unsupported.

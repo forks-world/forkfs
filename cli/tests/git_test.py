@@ -397,6 +397,34 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(self.source, 'ls-files', '--unmerged').stdout, before)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
+    def test_pending_squash_message_survives_import_and_commit(self):
+        self.git(self.source, 'checkout', '-b', 'side')
+        (self.source / 'added').write_text('squashed content\n')
+        self.git(self.source, 'add', 'added')
+        self.git(self.source, 'commit', '-m', 'pending squash subject')
+        self.git(self.source, 'checkout', 'main')
+        self.git(self.source, 'merge', '--squash', 'side')
+        message = (self.source / '.git' / 'SQUASH_MSG').read_bytes()
+        staged = self.git(self.source, 'diff', '--cached').stdout
+        self.assertTrue(staged)
+        self.world('init', str(self.source), '--include-changes')
+        self.assertEqual((self.source / '.git' / 'SQUASH_MSG').read_bytes(), message)
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        message_path = self.git(one, 'rev-parse', '--path-format=absolute', '--git-path', 'SQUASH_MSG').stdout.decode().strip()
+        self.assertEqual(Path(message_path).read_bytes(), message)
+        self.assertEqual(self.git(one, 'diff', '--cached').stdout, staged)
+        self.git(one, '-c', 'core.editor=true', 'commit')
+        self.assertIn(b'pending squash subject', self.git(one, 'log', '-1', '--format=%B').stdout)
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+
+    def test_present_empty_squash_message_is_preserved(self):
+        (self.source / '.git' / 'SQUASH_MSG').write_bytes(b'')
+        self.world('init', str(self.source))
+        one, _ = self.fork()
+        message_path = self.git(one, 'rev-parse', '--path-format=absolute', '--git-path', 'SQUASH_MSG').stdout.decode().strip()
+        self.assertEqual(Path(message_path).read_bytes(), b'')
+
     def test_move_discard_restore_checkpoint_and_gc(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

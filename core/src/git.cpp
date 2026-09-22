@@ -333,6 +333,10 @@ int source_unchanged(const GitSource &s) {
     if (rc == -ENOENT && s.attributes.empty()) rc = 0;
     if (rc) return rc;
     if (!same_bytes(attributes, s.attributes)) return -EBUSY;
+    Vec<char> squash; int squash_rc = read_bytes(s.squash_path.c_str(), squash);
+    bool squash_present = squash_rc == 0;
+    if (squash_rc != 0 && squash_rc != -ENOENT) return squash_rc;
+    if (squash_present != s.squash_present || !same_bytes(squash, s.squash)) return -EBUSY;
     Vec<GitSetting> settings;
     if (int setting_rc = capture_settings(s.root.c_str(), settings)) return setting_rc;
     if (!same_settings(settings, s.settings)) return -EBUSY;
@@ -385,6 +389,11 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     if ((rc = value(root, attributes_args, out.attributes_path))) return rc;
     rc = read_bytes(out.attributes_path.c_str(), out.attributes);
     if (rc && rc != -ENOENT) return rc;
+    const char *squash_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "SQUASH_MSG", nullptr};
+    if ((rc = value(root, squash_args, out.squash_path))) return rc;
+    rc = read_bytes(out.squash_path.c_str(), out.squash);
+    if (!rc) out.squash_present = true;
+    else if (rc != -ENOENT) return rc;
     String common, admin;
     const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
     const char *admin_args[] = {"rev-parse", "--absolute-git-dir", nullptr};
@@ -446,6 +455,7 @@ int git_import(const GitSource &s, const char *clone) {
             (!copy.index.empty() && memcmp(copy.index.data(), s.index.data(), s.index.size())) ||
             !same_bytes(copy.exclude, s.exclude) ||
             !same_bytes(copy.attributes, s.attributes) ||
+            copy.squash_present != s.squash_present || !same_bytes(copy.squash, s.squash) ||
             !same_symrefs(copy.symrefs, s.symrefs) || !same_settings(copy.settings, s.settings)) return -EBUSY;
         return 0;
     }
@@ -508,6 +518,12 @@ int git_import(const GitSource &s, const char *clone) {
         if (int rc = unset_config(clone, key)) return rc;
     for (const auto &setting : s.settings)
         if (int rc = config(clone, setting.key.c_str(), setting.value.c_str())) return rc;
+    if (s.squash_present) {
+        const char *args[] = {"rev-parse", "--path-format=absolute", "--git-path", "SQUASH_MSG", nullptr};
+        String dest_squash;
+        if (int rc = value(clone, args, dest_squash)) return rc;
+        if (int rc = write_bytes(dest_squash.c_str(), s.squash.data(), s.squash.size())) return rc;
+    }
     // A clone is local and self-contained; its remote is not an implicit write-back channel.
     const char *remote[] = {"config", "--local", "--remove-section", "remote.origin", nullptr};
     if (int rc = git(clone, remote)) return rc;
