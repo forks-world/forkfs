@@ -117,6 +117,9 @@ changing the user's normal Git status semantics. The probe does not execute
 filters or copy configuration values; other import Git commands continue to
 disable global and system configuration. Identity-only global configuration is
 allowed and remains available to ordinary Git commands in the World.
+Conditional `includeIf` directives are unsupported in any scope, even when
+inactive at capture: moving a World or switching branches can activate policies
+that were not visible before publication. Unconditional includes remain supported.
 
 ### External reference restrictions
 

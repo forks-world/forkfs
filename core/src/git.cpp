@@ -343,7 +343,7 @@ int reject_configured_policy(const char *root, const char *key) {
 // Git parses the files, but returns only matching key names, never their values.
 int reject_ambient_policy(const char *root) {
     const char *args[] = {"config", "--includes", "--null", "--show-scope", "--name-only",
-        "--get-regexp", "^(core\\.(excludesfile|attributesfile|autocrlf|eol|safecrlf|filemode|symlinks|ignorecase|precomposeunicode|trustctime|checkstat|ignorestat|checkroundtripencoding)$|filter\\..*)", nullptr};
+        "--get-regexp", "^(core\\.(excludesfile|attributesfile|autocrlf|eol|safecrlf|filemode|symlinks|ignorecase|precomposeunicode|trustctime|checkstat|ignorestat|checkroundtripencoding)$|filter\\..*|includeif\\..*\\.path$)", nullptr};
     Vec<char> listing; int status = -1;
     int rc = git(root, args, &listing, &status, false, true);
     if (rc == WFS_E_GIT_FAILED && status == 1) return 0;
@@ -356,6 +356,9 @@ int reject_ambient_policy(const char *root) {
         ++i;
         size_t key = i; while (i < listing.size() && listing[i]) ++i;
         if (i == key || i + 1 >= listing.size()) return WFS_E_GIT_FAILED;
+        size_t key_len = i - key;
+        if (key_len >= 10 && !memcmp(listing.data() + key, "includeif.", 9) &&
+            !memcmp(listing.data() + i - 5, ".path", 5)) return WFS_E_GIT_UNSUPPORTED;
         if ((scope_len == 6 && !memcmp(listing.data() + scope, "global", 6)) ||
             (scope_len == 6 && !memcmp(listing.data() + scope, "system", 6))) return WFS_E_GIT_UNSUPPORTED;
         ++i;
@@ -729,11 +732,9 @@ extern "C" int wfs_git_inspect(const char *root, wfs_git_info *out) {
     if (int rc = wfs::read_bytes(dot.c_str(), contents)) return rc;
     if (contents.size() != strlen(wfs::marker) || memcmp(contents.data(), wfs::marker, contents.size()))
         return WFS_E_GIT_UNSUPPORTED;
-    out->present = 1;
     wfs::String branch, base, common, head;
     const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (int rc = wfs::value(root, head_args, head)) return rc;
-    snprintf(out->head, sizeof out->head, "%s", head.c_str());
     const char *branch_args[] = {"rev-parse", "--abbrev-ref", "HEAD", nullptr};
     const char *base_args[] = {"config", "--local", "--get", "worldfs.baseline", nullptr};
     const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
@@ -742,6 +743,11 @@ extern "C" int wfs_git_inspect(const char *root, wfs_git_info *out) {
     if (branch == "HEAD") branch.clear();
     if (int rc = wfs::value(root, base_args, base)) return rc;
     if (int rc = wfs::value(root, common_args, common)) return rc;
+    if (head.size() >= sizeof out->head || branch.size() >= sizeof out->branch ||
+        base.size() >= sizeof out->baseline || common.size() >= sizeof out->git_dir)
+        return -EOVERFLOW;
+    out->present = 1;
+    snprintf(out->head, sizeof out->head, "%s", head.c_str());
     snprintf(out->branch, sizeof out->branch, "%s", branch.c_str());
     snprintf(out->baseline, sizeof out->baseline, "%s", base.c_str());
     snprintf(out->git_dir, sizeof out->git_dir, "%s", common.c_str());

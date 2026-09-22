@@ -339,6 +339,41 @@ class GitWorldTest(unittest.TestCase):
                 self.assertEqual(self.git(path, 'config', '--get', key).stdout.strip(), value)
             self.assertEqual(self.git(path, 'status', '--porcelain').stdout, b'')
 
+    def test_inactive_conditional_policy_is_refused(self):
+        included = self.root / 'future-policy'
+        included.write_text('[core]\n autocrlf = true\n')
+        global_config = self.root / 'conditional-global'
+        local = self.source / '.git' / 'config'
+        original = local.read_bytes()
+        for scope in ('global', 'local'):
+            for condition in ('gitdir:' + str(self.root / 'future-world') + '/**',
+                              'onbranch:world/**'):
+                with self.subTest(scope=scope, condition=condition):
+                    directive = '[includeIf "' + condition + '"]\n path = ' + str(included) + '\n'
+                    if scope == 'global':
+                        global_config.write_text(directive)
+                        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+                    else:
+                        local.write_bytes(original + directive.encode())
+                    self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+                    result = self.world('init', str(self.source), code=3)
+                    self.assertIn(b'unsupported Git layout', result.stderr)
+                    self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+                    self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+                    local.write_bytes(original)
+
+    def test_long_branch_inspection_and_metadata_overflow(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        branch = 'long-' + 'x' * 150
+        self.git(one, 'checkout', '-b', branch)
+        data = json.loads(self.world('inspect', wid, '--json').stdout)
+        self.assertEqual(data['git']['branch'], branch)
+        self.assertIn(branch.encode(), self.world('inspect', wid).stdout)
+        self.git(one, 'config', 'worldfs.baseline', 'x' * 80)
+        result = self.world('inspect', wid, '--json', code=1)
+        self.assertNotIn(b'"git":', result.stdout)
+
     def test_global_status_policy_is_refused_before_dirty_admission(self):
         line = self.source / 'line.txt'
         line.write_bytes(b'committed\r\n')

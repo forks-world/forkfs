@@ -358,7 +358,7 @@ typedef struct wfs_fork_opts {
 /* Self-contained Git worktree metadata. Inspection requires a readable live tree. */
 typedef struct wfs_git_info {
     int present;
-    char branch[WFS_NAME_MAX]; /* empty for detached HEAD */
+    char branch[WFS_PATH_MAX]; /* empty for detached HEAD; overflow is reported */
     char head[65], baseline[65]; /* SHA-1 or SHA-256 hex commit ids */
     char git_dir[WFS_PATH_MAX]; /* common directory inside this World */
 } wfs_git_info;
