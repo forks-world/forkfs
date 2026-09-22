@@ -72,6 +72,11 @@ Btrfs ENOSPC recovery, send/receive, zoned devices and other mount-option combin
 are not covered by this test matrix. The same namespace security boundaries and trusted
 host mutation limits documented for XFS apply.
 
+World identity still uses the existing recorded device/inode pair. Btrfs subvolume
+device numbers can change across remounts or reboots; automatic identity recovery in
+that case is not implemented or covered here. A filesystem UUID in the clone probe
+does not make stored World identities persistent across device-number changes.
+
 References: [Btrfs reflink constraints](https://btrfs.readthedocs.io/en/latest/Reflink.html),
 [subvolumes](https://btrfs.readthedocs.io/en/latest/Subvolumes.html),
 [inode attributes](https://btrfs.readthedocs.io/en/latest/ch-file-attributes.html).
