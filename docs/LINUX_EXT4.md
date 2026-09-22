@@ -10,7 +10,11 @@ size when a large file has multiple names.
 
 The shared Linux metadata path preserves ownership (when permitted), permission bits,
 POSIX ACLs, xattrs, timestamps, symlinks and FIFOs. Unsupported special files or metadata
-errors fail the operation. Copy writeback is checked before publication, including
+errors fail the operation. Regular-file source descriptors enable O_NOATIME before
+copying so data reads leave source access times unchanged; copying fails if that flag is not permitted
+(normally the caller must own the source or have CAP_FOWNER). Directory traversal
+and symlink reads still follow the existing Linux behavior and can update their
+access times. Copy writeback is checked before publication, including
 delayed-allocation ENOSPC errors. Existing failure cleanup and GC handle partial trees.
 The free-space preflight is a metadata floor, not a reservation for all copied data;
 a copy can still run out of space after starting.

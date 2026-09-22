@@ -89,11 +89,17 @@ with tempfile.TemporaryDirectory(prefix=f'wfs-{args.filesystem}-', dir=args.scra
     os.utime(src / 'data', ns=(1234567890123456789, 1234567890123456789))
 
     # Native strategy must work without --copy: reflinks or independent ext4 copies.
+    source_atime = (src / 'data').stat().st_atime_ns
     sid = ident(fs('init', src).stdout, 'S')
+    if args.filesystem == 'ext4':
+        assert (src / 'data').stat().st_atime_ns == source_atime
     fs('init', src, '--hard', ok=False)
     wid = ident(fs('fork', '--from', sid, '--to', a, '--no-pool').stdout, 'W')
     assert shared(src / 'data') == (args.filesystem != 'ext4')
     assert shared(a / 'data') == (args.filesystem != 'ext4')
+    if args.filesystem == 'ext4':
+        assert (src / 'data').stat().st_atime_ns == source_atime
+        assert (a / 'data').stat().st_atime_ns == source_atime
     assert (a / 'data').read_bytes() == (src / 'data').read_bytes()
     assert (a / 'data').stat().st_ino != (src / 'data').stat().st_ino
     assert (a / 'data').stat().st_ino == (a / 'linked').stat().st_ino
@@ -127,7 +133,11 @@ with tempfile.TemporaryDirectory(prefix=f'wfs-{args.filesystem}-', dir=args.scra
     assert (src / 'data').read_bytes().startswith(b'original\n')
     assert 'M data' in fs('diff', wid, '--events').stdout
     fs('verify', sid)
+    world_stat = (a / 'data').stat()
+    os.utime(a / 'data', ns=(1234567890123456789, world_stat.st_mtime_ns))
     sid2 = ident(fs('checkpoint', wid).stdout, 'S')
+    if args.filesystem == 'ext4':
+        assert (a / 'data').stat().st_atime_ns == 1234567890123456789
     fs('pool', 'fill', sid2, '--count', '1')
     out = fs('fork', '--from', sid2, '--to', b).stdout
     assert '(pool)' in out, out

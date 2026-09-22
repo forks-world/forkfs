@@ -53,6 +53,11 @@ int btrfs_clone_flags(int src, int dst) {
 
 // Ext4 backend and explicit --copy fallback, preserving sparse holes.
 int copy_data(int src, int dst, off_t size) {
+    // Reflinks do not read source bytes. When copying is necessary, suppress atime
+    // updates on the already-verified descriptor. Fail closed if not permitted.
+    int flags = ::fcntl(src, F_GETFL);
+    if (flags < 0) return -errno;
+    if (!(flags & O_NOATIME) && ::fcntl(src, F_SETFL, flags | O_NOATIME)) return -errno;
     char buf[128 * 1024];
     off_t pos = 0;
     while (pos < size) {
@@ -166,6 +171,9 @@ String target(CloneCtx *c, const char *rel) {
 }
 int clone_entry(void *ctx, const char *src, const char *rel, const struct stat &st, bool dir) {
     auto *c = (CloneCtx *)ctx;
+    // Root initializes the strategy before children are dispatched. Check every child,
+    // including empty mount points and non-regular entries, before creating its target.
+    if (*rel && c->ext_copy && !c->copy && st.st_dev != c->device) return -EXDEV;
     String dst = target(c, rel);
     if (dir) {
         if (::mkdir(dst.c_str(), 0700)) return -errno;

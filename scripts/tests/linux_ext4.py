@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Independent ext4 lifecycle/security entry point. Requires a real ext4 scratch mount."""
 from pathlib import Path
-import runpy
+import subprocess
 import sys
 
-sys.argv.extend(['--filesystem', 'ext4'])
-runpy.run_path(str(Path(__file__).with_name('linux_reflink.py')), run_name='__main__')
+here = Path(__file__).parent
+subprocess.run([sys.executable, str(here / 'linux_reflink.py'), *sys.argv[1:],
+                '--filesystem', 'ext4'], check=True)
+subprocess.run([sys.executable, str(here / 'linux_ext4_mounts.py'), *sys.argv[1:]], check=True)
