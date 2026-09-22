@@ -13,7 +13,7 @@ String joinp(const char *a, const char *b) { String s(a); s.append("/"); s.appen
 constexpr const char *marker = "gitdir: .world-git/repo.git/worktrees/active\n";
 
 // Never use a shell, source hooks, inherited GIT_DIR/INDEX_FILE, or lazy network fetches.
-int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, int *exit_code = nullptr) {
+int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, int *exit_code = nullptr, bool quiet_stderr = false) {
     if (exit_code) *exit_code = -1;
     Vec<char *> av;
     const char *prefix[] = {"git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
@@ -36,6 +36,8 @@ int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, i
     int rc = posix_spawn_file_actions_init(&actions);
     if (rc) { close(pipefd[0]); close(pipefd[1]); return -rc; }
     rc = posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+    if (!rc && quiet_stderr)
+        rc = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
     pid_t pid = 0;
     if (!rc) rc = posix_spawnp(&pid, "git", &actions, nullptr, av.data(), env.data());
     posix_spawn_file_actions_destroy(&actions);
@@ -276,6 +278,19 @@ bool same_settings(const Vec<GitSetting> &a, const Vec<GitSetting> &b) {
         if (a[i].key != b[i].key || a[i].value != b[i].value) return false;
     return true;
 }
+int capture_refs(const char *root, Vec<char> &out) {
+    const char *args[] = {"for-each-ref", "--sort=refname", "--format=%(refname)%09%(objectname)", "refs/", nullptr};
+    return git(root, args, &out);
+}
+int capture_orig(const char *root, bool &present, String &oid) {
+    const char *exists[] = {"show-ref", "--exists", "ORIG_HEAD", nullptr};
+    int status = -1, rc = git(root, exists, nullptr, &status, true);
+    if (rc == WFS_E_GIT_FAILED && status == 2) { present = false; oid.clear(); return 0; }
+    if (rc) return rc;
+    const char *verify[] = {"rev-parse", "--verify", "--quiet", "ORIG_HEAD^{commit}", nullptr};
+    if ((rc = value(root, verify, oid))) return rc;
+    present = true; return 0;
+}
 int reject_configured_policy(const char *root, const char *key) {
     const char *args[] = {"config", "--get", key, nullptr};
     Vec<char> value_bytes; int status = -1;
@@ -337,9 +352,17 @@ int source_unchanged(const GitSource &s) {
     bool squash_present = squash_rc == 0;
     if (squash_rc != 0 && squash_rc != -ENOENT) return squash_rc;
     if (squash_present != s.squash_present || !same_bytes(squash, s.squash)) return -EBUSY;
+    Vec<char> fetch;
+    int fetch_rc = read_bytes(s.fetch_path.c_str(), fetch);
+    if (fetch_rc != 0 && fetch_rc != -ENOENT) return fetch_rc;
+    if ((fetch_rc == 0) != s.fetch_present || !same_bytes(fetch, s.fetch)) return -EBUSY;
     Vec<GitSetting> settings;
     if (int setting_rc = capture_settings(s.root.c_str(), settings)) return setting_rc;
     if (!same_settings(settings, s.settings)) return -EBUSY;
+    Vec<char> direct_refs; if (int ref_rc = capture_refs(s.root.c_str(), direct_refs)) return ref_rc;
+    if (!same_bytes(direct_refs, s.refs)) return -EBUSY;
+    bool orig_present; String orig; if (int orig_rc = capture_orig(s.root.c_str(), orig_present, orig)) return orig_rc;
+    if (orig_present != s.orig_present || orig != s.orig_head) return -EBUSY;
     Vec<GitSymref> refs;
     if (int symrc = collect_symrefs(s.root.c_str(), refs)) return symrc;
     if (!same_symrefs(refs, s.symrefs)) return -EBUSY;
@@ -394,12 +417,19 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     rc = read_bytes(out.squash_path.c_str(), out.squash);
     if (!rc) out.squash_present = true;
     else if (rc != -ENOENT) return rc;
+    const char *fetch_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "FETCH_HEAD", nullptr};
+    if ((rc = value(root, fetch_args, out.fetch_path))) return rc;
+    rc = read_bytes(out.fetch_path.c_str(), out.fetch);
+    out.fetch_present = rc == 0;
+    if (rc && rc != -ENOENT) return rc;
     String common, admin;
     const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
     const char *admin_args[] = {"rev-parse", "--absolute-git-dir", nullptr};
     if ((rc = value(root, common_args, common)) || (rc = value(root, admin_args, admin))) return rc;
     if (out.managed && (rc = managed_check(root, common.c_str(), admin.c_str()))) return rc;
     if ((rc = reject_external_visibility_state(root, out.managed))) return rc;
+    if ((rc = capture_refs(root, out.refs))) return rc;
+    if ((rc = capture_orig(root, out.orig_present, out.orig_head))) return rc;
     if ((rc = collect_symrefs(root, out.symrefs))) return rc;
     const char *unsafe[] = {"objects/info/alternates", "objects/info/http-alternates", "shallow"};
     for (const char *rel : unsafe) {
@@ -455,8 +485,11 @@ int git_import(const GitSource &s, const char *clone) {
             (!copy.index.empty() && memcmp(copy.index.data(), s.index.data(), s.index.size())) ||
             !same_bytes(copy.exclude, s.exclude) ||
             !same_bytes(copy.attributes, s.attributes) ||
+            copy.fetch_present != s.fetch_present || !same_bytes(copy.fetch, s.fetch) ||
             copy.squash_present != s.squash_present || !same_bytes(copy.squash, s.squash) ||
             !same_symrefs(copy.symrefs, s.symrefs) || !same_settings(copy.settings, s.settings)) return -EBUSY;
+        if (!same_bytes(copy.refs, s.refs) ||
+            copy.orig_present != s.orig_present || copy.orig_head != s.orig_head) return -EBUSY;
         return 0;
     }
     String owned = joinp(clone, ".world-git");
@@ -524,9 +557,22 @@ int git_import(const GitSource &s, const char *clone) {
         if (int rc = value(clone, args, dest_squash)) return rc;
         if (int rc = write_bytes(dest_squash.c_str(), s.squash.data(), s.squash.size())) return rc;
     }
+    if (s.fetch_present) {
+        const char *args[] = {"rev-parse", "--path-format=absolute", "--git-path", "FETCH_HEAD", nullptr};
+        String dest_fetch;
+        if (int rc = value(clone, args, dest_fetch)) return rc;
+        if (int rc = write_bytes(dest_fetch.c_str(), s.fetch.data(), s.fetch.size())) return rc;
+    }
+    if (s.orig_present) {
+        const char *orig_args[] = {"update-ref", "ORIG_HEAD", s.orig_head.c_str(), nullptr};
+        if (int rc = git(clone, orig_args)) return rc;
+    }
     // A clone is local and self-contained; its remote is not an implicit write-back channel.
     const char *remote[] = {"config", "--local", "--remove-section", "remote.origin", nullptr};
     if (int rc = git(clone, remote)) return rc;
+    Vec<char> imported_refs;
+    if (int rc = capture_refs(clone, imported_refs)) return rc;
+    if (!same_bytes(imported_refs, s.refs)) return -EBUSY;
     return source_unchanged(s);
 }
 

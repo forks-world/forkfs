@@ -22,8 +22,14 @@ struct GitSource {
     String squash_path;
     Vec<char> squash;
     bool squash_present = false;
+    String fetch_path;
+    Vec<char> fetch;
+    bool fetch_present = false;
     Vec<GitSymref> symrefs;
     Vec<GitSetting> settings;
+    Vec<char> refs;
+    bool orig_present = false;
+    String orig_head;
 };
 int git_source(const char *root, bool include_changes, GitSource &out);
 int git_import(const GitSource &source, const char *clone);

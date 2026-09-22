@@ -131,3 +131,9 @@ before import or checkpoint; their administrative state is not a clean baseline.
 A completed, conflict-free squash merge may be imported with `--include-changes`.
 Its staged changes and passive `SQUASH_MSG` are preserved so the next Git commit
 retains the prepared message. Conflicted squash merges remain unsupported.
+
+Imports retain `ORIG_HEAD` recovery state and exact optional `FETCH_HEAD` records
+when present, and compare the complete
+ref-name/object-ID snapshot before publication. A concurrent non-HEAD ref update
+aborts the import rather than publishing a stale mirror. Sources must still remain
+quiescent during import; validation does not lock arbitrary external Git writers.

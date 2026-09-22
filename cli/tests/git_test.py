@@ -425,6 +425,64 @@ class GitWorldTest(unittest.TestCase):
         message_path = self.git(one, 'rev-parse', '--path-format=absolute', '--git-path', 'SQUASH_MSG').stdout.decode().strip()
         self.assertEqual(Path(message_path).read_bytes(), b'')
 
+    def test_orig_head_recovery_survives_source_deletion(self):
+        (self.source / 'file').write_text('recover this commit\n')
+        self.git(self.source, 'commit', '-am', 'recoverable tip')
+        recovered = self.git(self.source, 'rev-parse', 'HEAD').stdout.strip()
+        self.git(self.source, 'reset', '--hard', self.base.decode())
+        self.assertEqual(self.git(self.source, 'rev-parse', 'ORIG_HEAD').stdout.strip(), recovered)
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        self.git(one, 'gc', '--quiet')
+        self.assertEqual(self.git(one, 'rev-parse', 'ORIG_HEAD').stdout.strip(), recovered)
+        self.git(one, 'reset', '--hard', 'ORIG_HEAD')
+        self.assertEqual(self.git(one, 'rev-parse', 'HEAD').stdout.strip(), recovered)
+        self.assertEqual((one / 'file').read_text(), 'recover this commit\n')
+
+    def test_direct_ref_change_during_mirror_aborts_publication(self):
+        import shlex
+        self.git(self.source, 'update-ref', 'refs/custom/raced', self.base.decode())
+        advanced = self.git(self.source, 'commit-tree', self.base.decode() + '^{tree}',
+                            '-p', self.base.decode(), '-m', 'concurrent ref').stdout.decode().strip()
+        real_git = shutil.which('git')
+        wrapper = self.root / 'race-bin'
+        wrapper.mkdir()
+        script = wrapper / 'git'
+        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = --mirror ] && mirror=1; done\n'
+                          + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
+                          + 'if [ "$result" = 0 ] && [ "$mirror" = 1 ]; then\n'
+                          + shlex.quote(real_git) + ' -C ' + shlex.quote(str(self.source))
+                          + ' update-ref refs/custom/raced ' + shlex.quote(advanced)
+                          + ' || exit $?\nfi\nexit "$result"\n')
+        script.chmod(0o700)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        self.world('init', str(self.source), code=1)
+        self.assertEqual(self.git(self.source, 'rev-parse', 'refs/custom/raced').stdout.decode().strip(), advanced)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_fetch_head_only_tip_survives_source_deletion(self):
+        remote = self.root / 'fetch-remote'
+        remote.mkdir()
+        self.git(remote, 'init', '-b', 'main')
+        self.git(remote, 'config', 'user.name', 'Fetch Test')
+        self.git(remote, 'config', 'user.email', 'fetch@example.com')
+        (remote / 'fetched').write_text('fetch-only content\n')
+        self.git(remote, 'add', 'fetched')
+        self.git(remote, 'commit', '-m', 'fetch-only commit')
+        tip = self.git(remote, 'rev-parse', 'HEAD').stdout.strip()
+        self.git(self.source, 'fetch', str(remote), 'main')
+        self.assertNotIn(tip, self.git(self.source, 'for-each-ref', '--format=%(objectname)').stdout)
+        before = (self.source / '.git' / 'FETCH_HEAD').read_bytes()
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        shutil.rmtree(remote)
+        one, _ = self.fork()
+        record = self.git(one, 'rev-parse', '--path-format=absolute', '--git-path', 'FETCH_HEAD').stdout.decode().strip()
+        self.assertEqual(Path(record).read_bytes(), before)
+        self.assertEqual(self.git(one, 'rev-parse', 'FETCH_HEAD').stdout.strip(), tip)
+        self.assertEqual(self.git(one, 'show', 'FETCH_HEAD:fetched').stdout, b'fetch-only content\n')
+
     def test_move_discard_restore_checkpoint_and_gc(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
