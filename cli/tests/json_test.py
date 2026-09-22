@@ -207,11 +207,17 @@ class JsonTest(unittest.TestCase):
 
     def test_help_does_not_open_store(self):
         for args in [('--help',), ('-h',), ('help',), ('fs', '--help'),
-                     ('fs', 'list', '--help'), ('fs', 'pool', 'status', '--help')]:
+                     ('fs', 'list', '--help'), ('fs', 'diff', 'W1', '--help'),
+                     ('fs', 'inspect', 'W1', '--help'),
+                     ('fs', 'pool', 'status', '--help'),
+                     ('fs', 'pool', 'fill', 'S1', '--help'),
+                     ('exec', '--help'), ('exec', '-h')]:
             result = self.run_world(*args)
             self.assertIn(b'usage:', result.stdout)
             self.assertEqual(result.stderr, b'')
             self.assertFalse(self.store.exists())
+        self.run_world('fs', 'init', str(self.source), '--name', '--help')
+        self.assertTrue(self.store.exists())
 
     def test_text_output_and_exec_passthrough(self):
         self.populate()

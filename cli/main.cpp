@@ -2068,9 +2068,16 @@ int main(int argc, char **argv) {
     const char *sub = is_exec ? "exec" : av[2];
     int nargs = is_exec ? ac - 2 : ac - 3;
     char **args = av + (is_exec ? 2 : 3);
-    if ((!nargs && (!strcmp(sub, "--help") || !strcmp(sub, "-h") || !strcmp(sub, "help"))) ||
-        (nargs == 1 && (!strcmp(args[0], "--help") || !strcmp(args[0], "-h"))) ||
-        (!strcmp(sub, "pool") && nargs == 2 && !strcmp(args[1], "--help"))) usage(EX_OK);
+    bool command_help = (!nargs && (!strcmp(sub, "--help") || !strcmp(sub, "-h") || !strcmp(sub, "help"))) ||
+                        (nargs == 1 && (!strcmp(args[0], "--help") || !strcmp(args[0], "-h")));
+    for (int i = 0; !command_help && i < nargs; ++i) {
+        if (!strcmp(args[i], "--")) break;
+        if (!strcmp(args[i], "--help") || !strcmp(args[i], "-h")) command_help = true;
+        else if (!is_exec && (!strcmp(args[i], "--name") || !strcmp(args[i], "--to") ||
+                              !strcmp(args[i], "--from") || !strcmp(args[i], "--retention") ||
+                              !strcmp(args[i], "--count")) && i + 1 < nargs) ++i;
+    }
+    if (command_help) usage(EX_OK);
     if (!is_exec && (!strcmp(sub, "list") || !strcmp(sub, "inspect") ||
                      !strcmp(sub, "status") || !strcmp(sub, "diff") || !strcmp(sub, "gc") ||
                      (!strcmp(sub, "pool") && nargs && !strcmp(args[0], "status")))) {

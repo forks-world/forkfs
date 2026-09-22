@@ -18,4 +18,9 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME cli_json_test
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/json_test.py $<TARGET_FILE:world>)
     set_tests_properties(cli_json_test PROPERTIES TIMEOUT 120)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/scratch")
+        set_tests_properties(cli_json_test PROPERTIES
+            ENVIRONMENT "TMPDIR=${CMAKE_CURRENT_BINARY_DIR}/scratch/")
+    endif()
 endif()
