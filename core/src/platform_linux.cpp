@@ -46,6 +46,29 @@ int copy_data(int src, int dst, off_t size) {
     return ::ftruncate(dst, size) == 0 ? 0 : -errno;
 }
 
+int set_xattr_if_different(const char *dst, const char *name, const void *value, size_t len) {
+    ssize_t existing_len = ::lgetxattr(dst, name, nullptr, 0);
+    if (existing_len >= 0) {
+        if ((size_t)existing_len == len) {
+            void *existing = ::malloc(len ? len : 1);
+            if (!existing) return -ENOMEM;
+            ssize_t got = ::lgetxattr(dst, name, existing, len);
+            if (got < 0) {
+                int e = errno;
+                ::free(existing);
+                return -e;
+            }
+            bool same = (size_t)got == len && !::memcmp(existing, value, len);
+            ::free(existing);
+            if (same) return 0;
+        }
+    } else {
+        int e = errno;
+        if (e != ENODATA && e != EOPNOTSUPP) return -e;
+    }
+    return ::lsetxattr(dst, name, value, len, 0) == 0 ? 0 : -errno;
+}
+
 int xattrs(const char *src, const char *dst) {
     // Creation can inherit ACLs from the destination parent. Absence on the source
     // must remove that inherited ACL, or the clone has different access semantics.
@@ -70,7 +93,7 @@ int xattrs(const char *src, const char *dst) {
         if (!value) { rc = -ENOMEM; break; }
         ssize_t got = ::lgetxattr(src, names + i, value, (size_t)len);
         if (got < 0) rc = -errno;
-        else if (::lsetxattr(dst, names + i, value, (size_t)got, 0)) rc = -errno;
+        else rc = set_xattr_if_different(dst, names + i, value, (size_t)got);
         ::free(value);
     }
     ::free(names);

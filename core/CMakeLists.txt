@@ -51,6 +51,8 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(linux_clone_test tests/linux_clone_test.cpp)
     target_include_directories(linux_clone_test PRIVATE src)
     target_link_libraries(linux_clone_test PRIVATE worldfs_core wfs_third_party)
+    target_link_options(linux_clone_test PRIVATE
+        "-Wl,--wrap=lgetxattr" "-Wl,--wrap=llistxattr" "-Wl,--wrap=lsetxattr")
     add_test(NAME linux_clone_test COMMAND linux_clone_test)
 
     find_package(Python3 REQUIRED COMPONENTS Interpreter)

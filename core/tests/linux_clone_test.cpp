@@ -1,13 +1,79 @@
 // Linux backend regression: a restrictive umask must not make cloned directories unusable.
 #include "internal.h"
 
+#include <atomic>
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <unistd.h>
+
+extern "C" ssize_t __real_lgetxattr(const char *, const char *, void *, size_t);
+extern "C" ssize_t __real_llistxattr(const char *, char *, size_t);
+extern "C" int __real_lsetxattr(const char *, const char *, const void *, size_t, int);
+
+namespace {
+constexpr const char *kFakeXattr = "security.selinux";
+const char *g_fake_src = nullptr;
+const char *g_fake_dst = nullptr;
+const unsigned char *g_fake_src_value = nullptr;
+size_t g_fake_src_len = 0;
+const unsigned char *g_fake_dst_value = nullptr;
+size_t g_fake_dst_len = 0;
+bool g_fake_enabled = false;
+bool g_fake_dst_erange = false;
+std::atomic<int> g_fake_set_calls{0};
+
+bool fake_path(const char *path, const char *expected) {
+    return g_fake_enabled && expected && !strcmp(path, expected);
+}
+
+ssize_t fake_get(const unsigned char *value, size_t len, void *out, size_t size, bool erange) {
+    if (!out) return (ssize_t)len;
+    if (erange || size < len) {
+        errno = ERANGE;
+        return -1;
+    }
+    if (len) memcpy(out, value, len);
+    return (ssize_t)len;
+}
+} // namespace
+
+extern "C" ssize_t __wrap_lgetxattr(const char *path, const char *name, void *value, size_t size) {
+    if (!strcmp(name, kFakeXattr) && fake_path(path, g_fake_src))
+        return fake_get(g_fake_src_value, g_fake_src_len, value, size, false);
+    if (!strcmp(name, kFakeXattr) && fake_path(path, g_fake_dst))
+        return fake_get(g_fake_dst_value, g_fake_dst_len, value, size, g_fake_dst_erange);
+    return __real_lgetxattr(path, name, value, size);
+}
+
+extern "C" ssize_t __wrap_llistxattr(const char *path, char *list, size_t size) {
+    if (!fake_path(path, g_fake_src)) return __real_llistxattr(path, list, size);
+    const size_t len = strlen(kFakeXattr) + 1;
+    if (!list) return (ssize_t)len;
+    if (size < len) {
+        errno = ERANGE;
+        return -1;
+    }
+    memcpy(list, kFakeXattr, len);
+    return (ssize_t)len;
+}
+
+extern "C" int __wrap_lsetxattr(const char *path, const char *name, const void *value,
+                                 size_t size, int flags) {
+    if (!strcmp(name, kFakeXattr) && fake_path(path, g_fake_dst)) {
+        (void)value;
+        (void)size;
+        (void)flags;
+        g_fake_set_calls.fetch_add(1, std::memory_order_relaxed);
+        errno = EPERM;
+        return -1;
+    }
+    return __real_lsetxattr(path, name, value, size, flags);
+}
 
 #define CHECK(x) do { \
     if (!(x)) { \
@@ -78,6 +144,33 @@ static void remove_tree(const char *path) {
     CHECK(rmdir(path) == 0);
 }
 
+static void xattr_case(const unsigned char *src_value, size_t src_len,
+                       const unsigned char *dst_value, size_t dst_len,
+                       int expected_rc, int expected_set_calls, bool destination_erange) {
+    char root[] = "/tmp/wfs-linux-xattr.XXXXXX";
+    CHECK(mkdtemp(root) != nullptr);
+    char src[4096], dst[4096];
+    join(src, sizeof src, root, "source");
+    join(dst, sizeof dst, root, "clone");
+    CHECK(mkdir(src, 0755) == 0);
+
+    g_fake_src = src;
+    g_fake_dst = dst;
+    g_fake_src_value = src_value;
+    g_fake_src_len = src_len;
+    g_fake_dst_value = dst_value;
+    g_fake_dst_len = dst_len;
+    g_fake_dst_erange = destination_erange;
+    g_fake_set_calls.store(0, std::memory_order_relaxed);
+    g_fake_enabled = true;
+    int rc = wfs::fs_clone_tree(src, dst, true);
+    g_fake_enabled = false;
+
+    CHECK(rc == expected_rc);
+    CHECK(g_fake_set_calls.load(std::memory_order_relaxed) == expected_set_calls);
+    remove_tree(root);
+}
+
 int main() {
     char root[] = "/tmp/wfs-linux-clone.XXXXXX";
     CHECK(mkdtemp(root) != nullptr);
@@ -120,7 +213,15 @@ int main() {
     check_file(dst_file, "nested contents\n");
     check_file(dst_leaf, "deep contents\n");
 
+    // A protected label may be inherited by the destination and reject writes. Matching bytes
+    // must skip the setter; differing values and an unreadable value must remain errors.
+    xattr_case((const unsigned char *)"label", 5, (const unsigned char *)"label", 5, 0, 0, false);
+    xattr_case((const unsigned char *)"label", 5, (const unsigned char *)"other", 5, -EPERM, 1, false);
+    xattr_case((const unsigned char *)"label", 5, (const unsigned char *)"different", 9, -EPERM, 1, false);
+    xattr_case(nullptr, 0, nullptr, 0, 0, 0, false);
+    xattr_case((const unsigned char *)"label", 5, (const unsigned char *)"label", 5, -ERANGE, 0, true);
+
     remove_tree(root);
-    puts("linux_clone_test: restrictive umask clone: PASS");
+    puts("linux_clone_test: restrictive umask and protected xattr clone: PASS");
     return 0;
 }
