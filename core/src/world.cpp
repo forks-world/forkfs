@@ -20,6 +20,10 @@
 #include <stdlib.h>
 #include <sys/file.h>
 #include <sys/random.h>
+#ifdef __linux__
+#include <linux/stat.h>
+#include <sys/syscall.h>
+#endif
 #include <unistd.h>
 #include <utility>   // std::move only
 
@@ -3189,10 +3193,38 @@ struct SandboxLink {
 struct SandboxScan {
     Mutex mu;
     Vec<SandboxLink> links;
+#ifdef __linux__
+    uint64_t root_mount_id = 0;
+#endif
 };
 
-int sandbox_scan_cb(void *opaque, const char *, const char *rel, const struct stat &st, bool is_dir) {
+#ifdef __linux__
+// Return the kernel mount identity for one path. This deliberately asks for no attributes other
+// than STATX_MNT_ID and does not follow a final symlink: every object reported by the tree walk,
+// including a symlink itself, must belong to the same mount as the world root.
+int sandbox_mount_id(const char *path, uint64_t *out) {
+    struct statx sx;
+    ::memset(&sx, 0, sizeof sx);
+    if (::syscall(SYS_statx, AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, STATX_MNT_ID, &sx) != 0)
+        return WFS_E_SANDBOX_MOUNT;
+    if (!(sx.stx_mask & STATX_MNT_ID)) return WFS_E_SANDBOX_MOUNT;
+    *out = (uint64_t)sx.stx_mnt_id;
+    return 0;
+}
+#endif
+
+int sandbox_scan_cb(void *opaque, const char *path, const char *rel, const struct stat &st, bool is_dir) {
     SandboxScan &scan = *(SandboxScan *)opaque;
+#ifdef __linux__
+    // st_dev is shared by bind mounts. statx's mount ID is the kernel identity that matters to
+    // the recursive bind used by the namespace sandbox. Check every callback, including the
+    // root, before FS_DIRS_PRE queues a directory for traversal. A failed syscall or a kernel
+    // that does not return STATX_MNT_ID is unsafe to treat as an ordinary walk error: fail closed.
+    uint64_t mount_id = 0;
+    if (int rc = sandbox_mount_id(path, &mount_id)) return rc;
+    if (mount_id != scan.root_mount_id)
+        return WFS_E_SANDBOX_MOUNT;
+#endif
     if (rel && *rel) {
         const char *leaf = ::strrchr(rel, '/');
         leaf = leaf ? leaf + 1 : rel;
@@ -3236,6 +3268,11 @@ extern "C" int wfs_world_check_sandbox(wfs_store *s, wfs_id id) {
     if (!marker) return WFS_E_NOT_A_WORLD;
 
     SandboxScan scan;
+#ifdef __linux__
+    // Capture the root mount once. The callback compares every entry against this immutable
+    // value, so bind mounts on the same device are rejected as well as mounts on another device.
+    if (int rc = sandbox_mount_id(root.c_str(), &scan.root_mount_id)) return rc;
+#endif
     if (int rc = wfs::fs_walk_tree(root.c_str(), 4, wfs::FS_DIRS_PRE, &scan, sandbox_scan_cb)) return rc;
     if (scan.links.empty()) return 0;
     ::qsort(scan.links.data(), scan.links.size(), sizeof(SandboxLink), sandbox_link_cmp);

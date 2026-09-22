@@ -168,6 +168,52 @@ with tempfile.TemporaryDirectory(prefix='wfs-xfs-', dir=args.scratch.resolve()) 
     assert 'hardlinked outside' in failed.stderr and not preflight_marker.exists()
     symlink_alias.unlink()
 
+    # A bind of the whole fixture root is still one mount from the selected World's point of
+    # view. The enclosing namespace therefore remains a valid way to run world exec.
+    root_bind_marker = a / 'root-bind-ran'
+    root_bound = subprocess.run([
+        '/usr/bin/bwrap', '--unshare-user', '--unshare-pid', '--ro-bind', '/', '/',
+        '--proc', '/proc',
+        '--bind', str(root), str(root), str(world), '--store', str(store),
+        'exec', wid, '--', '/usr/bin/touch', str(root_bind_marker)],
+        env=env, text=True, capture_output=True)
+    assert root_bound.returncode == 0, root_bound.stderr
+    assert root_bind_marker.exists()
+    root_bind_marker.unlink()
+
+    # Nested directory and file binds have a new mount ID even when their source is on the same
+    # filesystem as the World. The preflight must refuse both before the payload can run.
+    mounted_dir = a / 'mounted-dir'
+    mounted_dir.mkdir()
+    bind_source_dir = root / 'bind-source-dir'
+    bind_source_dir.mkdir()
+    (bind_source_dir / 'outside').write_text('directory bind untouched\n')
+    dir_mount_marker = a / 'dir-mount-preflight-ran'
+    failed = subprocess.run([
+        '/usr/bin/bwrap', '--unshare-user', '--unshare-pid', '--ro-bind', '/', '/',
+        '--proc', '/proc',
+        '--bind', str(root), str(root), '--bind', str(bind_source_dir), str(mounted_dir),
+        str(world), '--store', str(store), 'exec', wid, '--', '/usr/bin/touch', str(dir_mount_marker)],
+        env=env, text=True, capture_output=True)
+    assert failed.returncode != 0 and 'nested mount' in failed.stderr, failed.stderr
+    assert not dir_mount_marker.exists()
+    assert (bind_source_dir / 'outside').read_text() == 'directory bind untouched\n'
+
+    mounted_file = a / 'mounted-file'
+    mounted_file.write_text('world file target\n')
+    bind_source_file = root / 'bind-source-file'
+    bind_source_file.write_text('file bind untouched\n')
+    file_mount_marker = a / 'file-mount-preflight-ran'
+    failed = subprocess.run([
+        '/usr/bin/bwrap', '--unshare-user', '--unshare-pid', '--ro-bind', '/', '/',
+        '--proc', '/proc',
+        '--bind', str(root), str(root), '--bind', str(bind_source_file), str(mounted_file),
+        str(world), '--store', str(store), 'exec', wid, '--', '/usr/bin/touch', str(file_mount_marker)],
+        env=env, text=True, capture_output=True)
+    assert failed.returncode != 0 and 'nested mount' in failed.stderr, failed.stderr
+    assert not file_mount_marker.exists()
+    assert bind_source_file.read_text() == 'file bind untouched\n'
+
     # A verified nested World and an unregistered nested marker are both refused by the same
     # tree walk. Move the verified fixture back so the rest of the lifecycle can use its row.
     inner = a / 'inner'

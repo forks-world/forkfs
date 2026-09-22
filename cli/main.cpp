@@ -1831,6 +1831,9 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
             if (rc == WFS_E_SANDBOX_UNSAFE)
                 return refuse("refusing sandboxed exec: a non-directory inode is hardlinked outside this world",
                               "world exec W<n> --no-sandbox -- <cmd>   (the command can then write anywhere)");
+            if (rc == WFS_E_SANDBOX_MOUNT)
+                return refuse("refusing sandboxed exec: the world contains a nested mount or its mount identity could not be verified",
+                              "remove nested mounts from the world, or use world exec W<n> --no-sandbox -- <cmd>");
             if (rc == WFS_E_PATH_REFUSED)
                 return refuse("refusing sandboxed exec: the world path is protected or contains a nested .world marker",
                               "move any nested World to a sibling directory or use --no-sandbox");

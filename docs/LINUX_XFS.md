@@ -84,8 +84,11 @@ The policy in `cli/linux_sandbox.cpp`:
 - Keeps the host network for TCP/UDP development tools. A seccomp filter denies Unix socket creation, datagram socketpairs, io_uring setup and alternate syscall ABIs. Stream socketpairs remain available for child-process IPC.
 - Marks inherited descriptors above stderr close-on-exec before launching Bubblewrap. Standard input/output/error remain caller-authorized handles.
 - Before a sandboxed launch, the core performs one parallel O(entries) preflight over the selected
-  World. It rejects nested `.world` markers and non-directory hardlinks whose inode also has a
-  name outside the World; hardlinks fully contained in the World remain usable.
+  World. On Linux it reads each entry's `statx(2)` mount ID, including files, symlinks and
+  directories, and rejects any nested bind or other mount. This uses `STATX_MNT_ID` because
+  same-filesystem bind mounts can share `st_dev`; failure to obtain that field fails closed.
+  The same pass rejects nested `.world` markers and non-directory hardlinks whose inode also has
+  a name outside the World; hardlinks fully contained in the World remain usable.
 - Uses a new session and `--die-with-parent`; the existing exec lock covers the runner's lifetime.
 
 Setup failures return an error without starting the command. `--require-sandbox` is

@@ -1415,6 +1415,8 @@ extern "C" const char *wfs_strerror(int rc) {
         return "the directory at this trash entry's path is not the tree this record was written for";
     case WFS_E_SANDBOX_UNSAFE:
         return "sandbox preflight found an external hardlink";
+    case WFS_E_SANDBOX_MOUNT:
+        return "sandbox preflight found a nested mount or could not verify mount identity";
     default: return ::strerror(rc < 0 ? -rc : rc);
     }
 }
