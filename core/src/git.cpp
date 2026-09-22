@@ -1,0 +1,415 @@
+#include "git.h"
+#include <dirent.h>
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <string.h>
+
+extern char **environ;
+namespace wfs {
+namespace {
+String joinp(const char *a, const char *b) { String s(a); s.append("/"); s.append(b); return s; }
+constexpr const char *marker = "gitdir: .world-git/repo.git/worktrees/active\n";
+
+// Never use a shell, source hooks, inherited GIT_DIR/INDEX_FILE, or lazy network fetches.
+int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, int *exit_code = nullptr) {
+    if (exit_code) *exit_code = -1;
+    Vec<char *> av;
+    const char *prefix[] = {"git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+        "-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "submodule.recurse=false",
+        "-c", "protocol.ext.allow=never", "-C", cwd};
+    for (const char *p : prefix) av.emplace_back(const_cast<char *>(p));
+    for (size_t i = 0; args[i]; ++i) av.emplace_back(const_cast<char *>(args[i]));
+    av.emplace_back(nullptr);
+    Vec<char *> env;
+    for (char **p = environ; *p; ++p)
+        if (strncmp(*p, "GIT_", 4)) env.emplace_back(*p);
+    const char *settings[] = {"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
+        "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1"};
+    for (const char *p : settings) env.emplace_back(const_cast<char *>(p));
+    env.emplace_back(nullptr);
+    int pipefd[2];
+    if (pipe(pipefd)) return -errno;
+    fcntl(pipefd[0], F_SETFD, FD_CLOEXEC); fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
+    posix_spawn_file_actions_t actions;
+    int rc = posix_spawn_file_actions_init(&actions);
+    if (rc) { close(pipefd[0]); close(pipefd[1]); return -rc; }
+    rc = posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+    pid_t pid = 0;
+    if (!rc) rc = posix_spawnp(&pid, "git", &actions, nullptr, av.data(), env.data());
+    posix_spawn_file_actions_destroy(&actions);
+    close(pipefd[1]);
+    if (rc) { close(pipefd[0]); return rc == ENOENT ? WFS_E_GIT_FAILED : -rc; }
+    if (output) output->clear();
+    char buf[8192];
+    int err = 0;
+    for (;;) {
+        ssize_t n = read(pipefd[0], buf, sizeof buf);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { err = -errno; break; }
+        if (!n) break;
+        if (output && !err) {
+            if (output->size() + (size_t)n > 32 * 1024 * 1024) err = -EOVERFLOW;
+            else for (ssize_t i = 0; i < n; ++i) output->emplace_back(buf[i]);
+        }
+    }
+    close(pipefd[0]);
+    int status;
+    while (waitpid(pid, &status, 0) < 0) if (errno != EINTR) return -errno;
+    if (exit_code && WIFEXITED(status)) *exit_code = WEXITSTATUS(status);
+    if (output) output->emplace_back('\0');
+    if (err) return err;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : WFS_E_GIT_FAILED;
+}
+int value(const char *root, const char *const *args, String &out, bool missing_ok = false) {
+    Vec<char> bytes; int status = -1;
+    int rc = git(root, args, &bytes, &status);
+    if (rc == WFS_E_GIT_FAILED && missing_ok && status == 1) { out.clear(); return 0; }
+    if (rc) return rc;
+    out.assign(bytes.data());
+    if (!out.empty() && out.back() == '\n') out.pop_back();
+    return 0;
+}
+int read_bytes(const char *path, Vec<char> &out) {
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    struct stat st;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size > 64 * 1024 * 1024) {
+        close(fd); return WFS_E_GIT_UNSUPPORTED;
+    }
+    out.clear(); char buf[8192]; int rc = 0;
+    for (;;) {
+        ssize_t n = read(fd, buf, sizeof buf);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { rc = -errno; break; }
+        if (!n) break;
+        if (out.size() + (size_t)n > 64 * 1024 * 1024) { rc = -EFBIG; break; }
+        for (ssize_t i = 0; i < n; ++i) out.emplace_back(buf[i]);
+    }
+    close(fd); return rc;
+}
+int write_bytes(const char *path, const char *data, size_t size) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return -errno;
+    int rc = 0;
+    while (size) {
+        ssize_t n = write(fd, data, size);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { rc = n < 0 ? -errno : -EIO; break; }
+        data += n; size -= (size_t)n;
+    }
+    if (close(fd) && !rc) rc = -errno;
+    return rc;
+}
+int write_text(const char *root, const char *rel, const char *text) {
+    String path = joinp(root, rel);
+    return write_bytes(path.c_str(), text, strlen(text));
+}
+
+// A nested worktree/submodule cannot be made safe by fixing only the root's .git file.
+// Until recursive Git imports exist, reject nested repositories, including plain nested ones.
+int nested_check(const char *root, bool top = true) {
+    DIR *dir = opendir(root);
+    if (!dir) return -errno;
+    int rc = 0;
+    for (;;) {
+        errno = 0;
+        dirent *e = readdir(dir);
+        if (!e) { if (errno) rc = -errno; break; }
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if (!strcmp(e->d_name, ".git")) {
+            if (!top) { rc = WFS_E_GIT_UNSUPPORTED; break; }
+            continue;
+        }
+        if (top && !strcmp(e->d_name, ".world-git")) continue;
+        String path = joinp(root, e->d_name);
+        struct stat st;
+        if (lstat(path.c_str(), &st)) { rc = -errno; break; }
+        if (S_ISDIR(st.st_mode) && (rc = nested_check(path.c_str(), false))) break;
+    }
+    closedir(dir); return rc;
+}
+// A managed tree may be copied without consulting an external repository only when all
+// administration stays inside it. Reject changed common-dir pointers and additional worktrees.
+int managed_check(const char *root, const char *common, const char *admin) {
+    String repo = joinp(root, ".world-git/repo.git"), active = joinp(repo.c_str(), "worktrees/active");
+    char expected[WFS_PATH_MAX], actual[WFS_PATH_MAX];
+    if (!realpath(repo.c_str(), expected) || !realpath(common, actual) || strcmp(expected, actual))
+        return WFS_E_GIT_UNSUPPORTED;
+    if (!realpath(active.c_str(), expected) || !realpath(admin, actual) || strcmp(expected, actual))
+        return WFS_E_GIT_UNSUPPORTED;
+    for (const char *file : {"commondir", "gitdir"}) {
+        Vec<char> bytes;
+        String p = joinp(active.c_str(), file);
+        if (int rc = read_bytes(p.c_str(), bytes)) return rc;
+        const char *expected_text = !strcmp(file, "commondir") ? "../..\n" : "../../../../.git\n";
+        String normalized;
+        for (char c : bytes) {
+            // Git 2.54 repair emits a doubled slash before .git; it is still the same
+            // relative link. Compare its normalized spelling, never an external pathname.
+            if (c == '/' && !normalized.empty() && normalized.back() == '/') continue;
+            normalized.push_back(c);
+        }
+        if (normalized != expected_text) return WFS_E_GIT_UNSUPPORTED;
+    }
+    // Reject symlinks anywhere in the owned administration, including its root.
+    Vec<String> dirs; dirs.emplace_back(joinp(root, ".world-git"));
+    for (size_t i = 0; i < dirs.size(); ++i) {
+        String path = dirs[i]; struct stat st;
+        if (lstat(path.c_str(), &st) || !S_ISDIR(st.st_mode)) return WFS_E_GIT_UNSUPPORTED;
+        DIR *d = opendir(path.c_str()); if (!d) return -errno;
+        int rc = 0;
+        for (;;) {
+            errno = 0; dirent *e = readdir(d);
+            if (!e) { if (errno) rc = -errno; break; }
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+            String child = joinp(path.c_str(), e->d_name);
+            if (lstat(child.c_str(), &st)) { rc = -errno; break; }
+            if (S_ISDIR(st.st_mode)) dirs.emplace_back(child);
+            else if (!S_ISREG(st.st_mode)) { rc = WFS_E_GIT_UNSUPPORTED; break; }
+            if (path == joinp(repo.c_str(), "worktrees") && strcmp(e->d_name, "active")) {
+                rc = WFS_E_GIT_UNSUPPORTED; break;
+            }
+        }
+        closedir(d); if (rc) return rc;
+    }
+    return 0;
+}
+int config(const char *root, const char *key, const char *val) {
+    const char *args[] = {"config", "--local", key, val, nullptr};
+    return git(root, args);
+}
+int source_unchanged(const GitSource &s) {
+    String head; const char *args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
+    if (int rc = value(s.root.c_str(), args, head)) return rc;
+    Vec<char> index;
+    int rc = read_bytes(s.index_path.c_str(), index);
+    if (rc == -ENOENT && s.index.empty()) rc = 0;
+    if (rc) return rc;
+    if (head != s.head || index.size() != s.index.size() ||
+        (!index.empty() && memcmp(index.data(), s.index.data(), index.size()))) return -EBUSY;
+    return 0;
+}
+}
+
+int git_source(const char *root, bool include_changes, GitSource &out) {
+    if (int rc = nested_check(root)) return rc;
+    String dot = joinp(root, ".git"), managed = joinp(root, ".world-git");
+    struct stat st;
+    bool has_managed = lstat(managed.c_str(), &st) == 0;
+    if (!has_managed && errno != ENOENT) return -errno;
+    if (lstat(dot.c_str(), &st)) return errno == ENOENT && !has_managed ? 0 : WFS_E_GIT_UNSUPPORTED;
+    if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) return WFS_E_GIT_UNSUPPORTED;
+    out.present = true; out.root = root;
+    if (has_managed) {
+        Vec<char> contents;
+        if (int rc = read_bytes(dot.c_str(), contents)) return rc;
+        if (contents.size() != strlen(marker) || memcmp(contents.data(), marker, contents.size()))
+            return WFS_E_GIT_UNSUPPORTED;
+        out.managed = true;
+    }
+    String top;
+    const char *top_args[] = {"rev-parse", "--show-toplevel", nullptr};
+    if (int rc = value(root, top_args, top)) return rc;
+    char real_top[WFS_PATH_MAX], real_root[WFS_PATH_MAX];
+    if (!realpath(root, real_root) || !realpath(top.c_str(), real_top) || strcmp(real_root, real_top))
+        return WFS_E_GIT_UNSUPPORTED;
+    const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
+    if (value(root, head_args, out.head)) return WFS_E_GIT_UNSUPPORTED;
+    const char *index_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "index", nullptr};
+    if (int rc = value(root, index_args, out.index_path)) return rc;
+    int rc = read_bytes(out.index_path.c_str(), out.index);
+    if (rc && rc != -ENOENT) return rc;
+    String common, admin;
+    const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
+    const char *admin_args[] = {"rev-parse", "--absolute-git-dir", nullptr};
+    if ((rc = value(root, common_args, common)) || (rc = value(root, admin_args, admin))) return rc;
+    if (out.managed && (rc = managed_check(root, common.c_str(), admin.c_str()))) return rc;
+    const char *unsafe[] = {"objects/info/alternates", "objects/info/http-alternates", "shallow"};
+    for (const char *rel : unsafe) {
+        String path = joinp(common.c_str(), rel);
+        if (!lstat(path.c_str(), &st)) return WFS_E_GIT_UNSUPPORTED;
+        if (errno != ENOENT) return -errno;
+    }
+    const char *inprogress[] = {"index.lock", "HEAD.lock", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"};
+    for (const char *rel : inprogress) {
+        String path = joinp(admin.c_str(), rel);
+        if (!lstat(path.c_str(), &st)) return -EBUSY;
+        if (errno != ENOENT) return -errno;
+    }
+    // Sparse/split indexes and gitlinks require a separate import contract.
+    const char *ls_args[] = {"ls-files", "--stage", "-z", nullptr};
+    Vec<char> listing;
+    if ((rc = git(root, ls_args, &listing))) return rc;
+    for (size_t i = 0; i + 1 < listing.size();) {
+        if (!strncmp(listing.data() + i, "160000 ", 7)) return WFS_E_GIT_UNSUPPORTED;
+        i += strlen(listing.data() + i) + 1;
+    }
+    const char *keys[] = {"core.sparseCheckout", "core.splitIndex", "extensions.partialClone"};
+    for (const char *key : keys) {
+        String val; const char *args[] = {"config", "--get", key, nullptr};
+        if ((rc = value(root, args, val, true))) return rc;
+        if (!val.empty() && val != "false") return WFS_E_GIT_UNSUPPORTED;
+    }
+    String shared;
+    const char *shared_args[] = {"rev-parse", "--shared-index-path", nullptr};
+    if ((rc = value(root, shared_args, shared))) return rc;
+    if (!shared.empty()) return WFS_E_GIT_UNSUPPORTED;
+    if (!include_changes) {
+        const char *args[] = {"status", "--porcelain=v1", "-z", "--untracked-files=normal",
+            "--", ".", ":(exclude).world", ":(exclude).world-git", nullptr};
+        Vec<char> dirty;
+        if ((rc = git(root, args, &dirty))) return rc;
+        if (dirty.size() > 1) return WFS_E_GIT_DIRTY;
+    }
+    return 0;
+}
+
+int git_import(const GitSource &s, const char *clone) {
+    if (!s.present) return 0;
+    if (int rc = source_unchanged(s)) return rc;
+    if (s.managed) {
+        // Detect a copied HEAD/index from a different moment, even when the source looks
+        // unchanged again by the time cloning finishes.
+        GitSource copy;
+        if (int rc = git_source(clone, true, copy)) return rc;
+        if (copy.head != s.head || copy.index.size() != s.index.size() ||
+            (!copy.index.empty() && memcmp(copy.index.data(), s.index.data(), s.index.size()))) return -EBUSY;
+        return 0;
+    }
+    String owned = joinp(clone, ".world-git");
+    if (int rc = fs_mkdir(owned.c_str(), 0700)) return rc;
+    String repo = joinp(owned.c_str(), "repo.git");
+    const char *copy[] = {"clone", "--bare", "--no-hardlinks", "--quiet", "--", s.root.c_str(), repo.c_str(), nullptr};
+    if (int rc = git(clone, copy)) return rc;
+    // clone --local copies loose objects too, including blobs referenced only by the index;
+    // --no-hardlinks prevents subsequent Git operations changing the source's object files.
+    String active = joinp(owned.c_str(), "active");
+    const char *add[] = {"--git-dir", repo.c_str(), "worktree", "add", "--relative-paths", "--no-checkout",
+        "--detach", "--quiet", "--", active.c_str(), s.head.c_str(), nullptr};
+    if (int rc = git(clone, add)) return rc;
+    String dot = joinp(clone, ".git");
+    if (int rc = fs_remove_tree(dot.c_str())) return rc;
+    if (int rc = write_text(clone, ".git", marker)) return rc;
+    const char *repair[] = {"worktree", "repair", "--relative-paths", nullptr};
+    if (int rc = git(clone, repair)) return rc;
+    // The only entry in the disposable no-checkout directory is its gitfile.
+    String old_dot = joinp(active.c_str(), ".git");
+    if (unlink(old_dot.c_str()) || rmdir(active.c_str())) return -errno;
+    String index = joinp(repo.c_str(), "worktrees/active/index");
+    if (!s.index.empty()) {
+        if (int rc = write_bytes(index.c_str(), s.index.data(), s.index.size())) return rc;
+    } else {
+        // No index means all tracked files were removed from it; do not recreate HEAD's index.
+        const char *empty[] = {"read-tree", "--empty", nullptr};
+        if (int rc = git(clone, empty)) return rc;
+    }
+    if (int rc = write_text(repo.c_str(), "info/exclude", "/.world\n/.world-git/\n")) return rc;
+    if (int rc = config(clone, "worldfs.baseline", s.head.c_str())) return rc;
+    if (int rc = config(clone, "worldfs.formatVersion", "1")) return rc;
+    for (const char *key : {"user.name", "user.email"}) {
+        String identity; const char *args[] = {"config", "--get", key, nullptr};
+        if (int rc = value(s.root.c_str(), args, identity, true)) return rc;
+        if (!identity.empty()) {
+            if (int rc = config(clone, key, identity.c_str())) return rc;
+        }
+    }
+    // A clone is local and self-contained; its remote is not an implicit write-back channel.
+    const char *remote[] = {"config", "--local", "--remove-section", "remote.origin", nullptr};
+    if (int rc = git(clone, remote)) return rc;
+    return source_unchanged(s);
+}
+
+int git_discard_check(const char *root) {
+    String owned = joinp(root, ".world-git"); struct stat st;
+    bool managed = lstat(owned.c_str(), &st) == 0;
+    if (!managed && errno != ENOENT) return -errno;
+    String dir = joinp(root, managed ? ".world-git/repo.git/worktrees" : ".git/worktrees");
+    int fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return errno == ENOENT || errno == ENOTDIR ? 0 : -errno;
+    DIR *d = fdopendir(fd);
+    if (!d) { int rc = -errno; close(fd); return rc; }
+    int rc = 0;
+    for (;;) {
+        errno = 0; dirent *e = readdir(d);
+        if (!e) { if (errno) rc = -errno; break; }
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if (managed && !strcmp(e->d_name, "active")) continue;
+        rc = WFS_E_GIT_IN_USE; break;
+    }
+    closedir(d); return rc;
+}
+
+int git_branch(const char *clone, wfs_id world) {
+    String dot = joinp(clone, ".git"); struct stat st;
+    if (lstat(dot.c_str(), &st)) return errno == ENOENT ? 0 : -errno;
+    GitSource s;
+    if (int rc = git_source(clone, true, s)) return rc;
+    if (!s.managed) return WFS_E_GIT_UNSUPPORTED;
+    Vec<char> refs;
+    const char *list_refs[] = {"for-each-ref", "--format=%(refname)", "refs/heads/", nullptr};
+    if (int rc = git(clone, list_refs, &refs)) return rc;
+    Vec<String> names;
+    size_t start = 0;
+    for (size_t i = 0; i + 1 < refs.size(); ++i) if (refs[i] == '\n') {
+        names.emplace_back(refs.data() + start, i - start); start = i + 1;
+    }
+    bool root_taken = false;
+    for (const auto &name : names) if (name == "refs/heads/world") root_taken = true;
+    char branch[96];
+    bool available = false;
+    for (unsigned suffix = 0; suffix < 128; ++suffix) {
+        const char *sep = root_taken ? "-" : "/";
+        if (!suffix) snprintf(branch, sizeof branch, "refs/heads/world%sW%llu", sep, (unsigned long long)world);
+        else snprintf(branch, sizeof branch, "refs/heads/world%sW%llu-%u", sep, (unsigned long long)world, suffix);
+        available = true;
+        size_t len = strlen(branch);
+        for (const auto &name : names) {
+            size_t n = name.size(), shorter = n < len ? n : len;
+            if (!memcmp(branch, name.c_str(), shorter) &&
+                (n == len || (n < len ? branch[n] == '/' : name[len] == '/'))) {
+                available = false; break;
+            }
+        }
+        if (available) break;
+    }
+    if (!available) return -EEXIST;
+    const char *create[] = {"update-ref", branch, s.head.c_str(), "", nullptr};
+    if (int rc = git(clone, create)) return rc;
+    const char *checkout[] = {"symbolic-ref", "HEAD", branch, nullptr};
+    if (int rc = git(clone, checkout)) return rc;
+    if (int rc = config(clone, "worldfs.baseline", s.head.c_str())) return rc;
+    return 0;
+}
+} // namespace wfs
+
+extern "C" int wfs_git_inspect(const char *root, wfs_git_info *out) {
+    if (!root || !out) return -EINVAL;
+    memset(out, 0, sizeof *out);
+    wfs::String dot = wfs::joinp(root, ".git"); struct stat st;
+    if (lstat(dot.c_str(), &st)) return errno == ENOENT ? 0 : -errno;
+    wfs::String owned = wfs::joinp(root, ".world-git");
+    if (lstat(owned.c_str(), &st)) return errno == ENOENT ? 0 : -errno;
+    wfs::Vec<char> contents;
+    if (int rc = wfs::read_bytes(dot.c_str(), contents)) return rc;
+    if (contents.size() != strlen(wfs::marker) || memcmp(contents.data(), wfs::marker, contents.size()))
+        return WFS_E_GIT_UNSUPPORTED;
+    out->present = 1;
+    wfs::String branch, base, common, head;
+    const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
+    if (int rc = wfs::value(root, head_args, head)) return rc;
+    snprintf(out->head, sizeof out->head, "%s", head.c_str());
+    const char *branch_args[] = {"rev-parse", "--abbrev-ref", "HEAD", nullptr};
+    const char *base_args[] = {"config", "--local", "--get", "worldfs.baseline", nullptr};
+    const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
+    // Detached HEAD after an explicit user checkout is valid; an empty branch reports it.
+    if (int rc = wfs::value(root, branch_args, branch)) return rc;
+    if (branch == "HEAD") branch.clear();
+    if (int rc = wfs::value(root, base_args, base)) return rc;
+    if (int rc = wfs::value(root, common_args, common)) return rc;
+    snprintf(out->branch, sizeof out->branch, "%s", branch.c_str());
+    snprintf(out->baseline, sizeof out->baseline, "%s", base.c_str());
+    snprintf(out->git_dir, sizeof out->git_dir, "%s", common.c_str());
+    return 0;
+}

@@ -1408,6 +1408,16 @@ extern "C" const char *wfs_strerror(int rc) {
     // whose two database names are in a state the upgrade protocol cannot produce, trees or no
     // trees (store_layout). What every one of them has in common is this.
     case WFS_E_STORE_DAMAGED: return "the store's metadata3.db is gone, or is not a database";
+    case WFS_E_GIT_IN_USE:
+        return "additional Git worktrees depend on this World; remove them with git worktree before discarding it";
+    case WFS_E_GIT_POOL:
+        return "Git snapshots use the ordinary fork path; run world fs fork without filling a pool";
+    case WFS_E_GIT_UNSUPPORTED:
+        return "unsupported Git layout (requires committed, full repository; no nested repositories, submodules, sparse/split indexes or alternates)";
+    case WFS_E_GIT_DIRTY:
+        return "Git workspace has uncommitted changes; commit first or use --include-changes to carry staged, unstaged and untracked files";
+    case WFS_E_GIT_FAILED:
+        return "Git operation failed (Git 2.48+ with relative worktrees is required); see Git diagnostic";
     case WFS_E_STORE_BUSY:
         return "older clients still have the store open; stop them and retry";
     case WFS_E_TRASH_BLOCKED: return "a directory is in the way of this trash entry's deletion";

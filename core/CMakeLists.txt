@@ -12,6 +12,7 @@ endif()
 set(WFS_CORE_SOURCES
     src/store.cpp
     src/world.cpp
+    src/git.cpp
     src/diff.cpp
     src/snapshot_access.cpp
     src/hardlinks.cpp

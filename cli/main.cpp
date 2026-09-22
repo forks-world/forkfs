@@ -34,13 +34,13 @@ enum { EX_OK = 0, EX_ERR = 1, EX_USAGE = 2, EX_REFUSED = 3 };
 
 static void usage(int code = EX_USAGE) {
     fputs("usage: world fs <command>\n"
-          "  init <dir> [--name N] [--hard]   snapshot <dir> as S<n> (the root is gated 0000;\n"
+          "  init <dir> [--name N] [--hard] [--include-changes]   snapshot <dir> as S<n> (the root is gated 0000;\n"
           "                                   --hard is macOS-only: UF_IMMUTABLE per entry)\n"
-          "  fork [--from W<n>|S<n>] [--to <path>] [--name N] [--copy] [--force] [--no-pool]\n"
+          "  fork [--from W<n>|S<n>] [--to <path>] [--name N] [--copy] [--force] [--no-pool] [--include-changes]\n"
           "                                   clone into a writable world (default ~/worlds/W<n>/<name>);\n"
           "                                   a snapshot with a warm pool is served in O(1), --no-pool\n"
           "                                   always clones here and now\n"
-          "  checkpoint W<n> [--name N] [--hard] [--force]\n"
+          "  checkpoint W<n> [--name N] [--hard] [--force] [--include-changes]\n"
           "                                   snapshot a live world; the world stays writable\n"
           "  diff W<n> [--full|--events] [--stat] [--json] [--no-xattr] [--all-xattrs] [--no-content]\n"
           "                                   what changed since the fork (A/M/D/T, sorted).\n"
@@ -331,6 +331,7 @@ static int cmd_init(wfs_store *s, int argc, char **argv) {
     for (int i = 0; i < argc; ++i) {
         if (!strcmp(argv[i], "--name") && i + 1 < argc) opts.name = argv[++i];
         else if (!strcmp(argv[i], "--hard")) opts.hard = 1;
+        else if (!strcmp(argv[i], "--include-changes")) opts.include_changes = 1;
         else if (argv[i][0] != '-' && !dir) dir = argv[i];
         else usage();
     }
@@ -612,6 +613,7 @@ static int cmd_fork(wfs_store *s, int argc, char **argv) {
         else if (!strcmp(argv[i], "--name") && i + 1 < argc) name = argv[++i];
         else if (!strcmp(argv[i], "--copy")) opts.allow_fallback = 1;
         else if (!strcmp(argv[i], "--no-pool")) opts.no_pool = 1;
+        else if (!strcmp(argv[i], "--include-changes")) opts.include_changes = 1;
         else if (!strcmp(argv[i], "--skip-space-check")) opts.skip_space_check = 1;
         else if (!strcmp(argv[i], "--force")) opts.force = 1;
         else usage();
@@ -702,6 +704,7 @@ static int cmd_checkpoint(wfs_store *s, int argc, char **argv) {
     for (int i = 0; i < argc; ++i) {
         if (!strcmp(argv[i], "--name") && i + 1 < argc) opts.name = argv[++i];
         else if (!strcmp(argv[i], "--hard")) opts.hard = 1;
+        else if (!strcmp(argv[i], "--include-changes")) opts.include_changes = 1;
         else if (!strcmp(argv[i], "--force")) opts.force = 1;
         else if (argv[i][0] != '-' && !w) w = parse_world(argv[i]);
         else usage();
@@ -919,13 +922,20 @@ static int cmd_inspect(wfs_store *s, const char *arg) {
     wfs_world_rec v;
     int rc = wfs_world_info(s, r.id, &v);
     if (rc) return fail("inspect", rc);
-    if (g_json) { json_world(g_json_out, v); return EX_OK; }
+    wfs_git_info gi = {};
+    if (v.present && v.state == WFS_ST_ACTIVE) {
+        rc = wfs_git_inspect(v.path, &gi);
+        if (rc) return fail("inspect: Git", rc);
+    }
+    if (g_json) { json_world(g_json_out, v, &gi); return EX_OK; }
     fmt_time(t, sizeof t, v.created_at);
     printf("world:     W%llu\nname:      %s\nstate:     %s\ncreated:   %s\npath:      %s\n"
            "present:   %s\ninode:     %llu (dev %llu)\nentries:   %llu\nfsevents:  %llu\n",
            (unsigned long long)v.id, v.name, state_name(v.state), t, v.path, v.present ? "yes" : "no",
            (unsigned long long)v.dir_ino, (unsigned long long)v.dir_dev, (unsigned long long)v.entries,
            (unsigned long long)v.fsevents_id);
+    if (gi.present) printf("git:       %s\nbaseline:  %s\nHEAD:      %s\ngit dir:   %s\n",
+                           gi.branch[0] ? gi.branch : "(detached)", gi.baseline, gi.head, gi.git_dir);
     if (v.parent_world) printf("parent:    W%llu\n", (unsigned long long)v.parent_world);
     if (v.snapshot_id) printf("snapshot:  S%llu\n", (unsigned long long)v.snapshot_id);
     if (v.trashed_at) { fmt_time(t, sizeof t, v.trashed_at); printf("trashed:   %s\n", t); }

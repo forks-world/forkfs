@@ -158,7 +158,12 @@ enum {
     WFS_E_SANDBOX_UNSAFE = -1021,
     /* Linux sandbox preflight: a nested mount, or an entry whose mount identity could not be
      * verified, would make the recursive writable bind escape the checked tree. */
-    WFS_E_SANDBOX_MOUNT = -1022
+    WFS_E_SANDBOX_MOUNT = -1022,
+    WFS_E_GIT_UNSUPPORTED = -1023, /* Git layout is not safely importable. */
+    WFS_E_GIT_DIRTY = -1024,       /* Pass include_changes to preserve uncommitted state. */
+    WFS_E_GIT_FAILED = -1025,      /* Git command failed; see its diagnostic. */
+    WFS_E_GIT_POOL = -1026,        /* Git branches require the ordinary fork path. */
+    WFS_E_GIT_IN_USE = -1027       /* Additional linked worktrees depend on this tree. */
 };
 
 /* One process, other than this one, that has a store's database open (PR #1 review, 34th
@@ -292,6 +297,7 @@ typedef struct wfs_snapshot_opts {
     int hard;
     /* P5: proceed even when the source world has a live `world exec` lock. */
     int force;
+    int include_changes; /* Explicitly carry staged, unstaged and untracked Git changes. */
 } wfs_snapshot_opts;
 
 /* init and checkpoint are the same operation: clone src_dir into the store and protect it.
@@ -346,7 +352,17 @@ typedef struct wfs_fork_opts {
     /* T1.5: do not take a pre-cloned world out of the pool, clone here and now instead. The
      * benchmarks use it to measure the miss path; nothing else should need it. */
     int no_pool;
+    int include_changes; /* Required for a dirty live Git World, not an immutable snapshot. */
 } wfs_fork_opts;
+
+/* Self-contained Git worktree metadata. Inspection requires a readable live tree. */
+typedef struct wfs_git_info {
+    int present;
+    char branch[WFS_NAME_MAX]; /* empty for detached HEAD */
+    char head[65], baseline[65]; /* SHA-1 or SHA-256 hex commit ids */
+    char git_dir[WFS_PATH_MAX]; /* common directory inside this World */
+} wfs_git_info;
+int wfs_git_inspect(const char *root, wfs_git_info *out);
 
 /* What a fork did, beyond which world it produced. */
 typedef struct wfs_fork_result {
