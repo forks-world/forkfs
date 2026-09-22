@@ -215,6 +215,14 @@ int config(const char *root, const char *key, const char *val) {
     const char *args[] = {"config", "--local", key, val, nullptr};
     return git(root, args);
 }
+int reject_configured_policy(const char *root, const char *key) {
+    const char *args[] = {"config", "--get", key, nullptr};
+    Vec<char> value_bytes; int status = -1;
+    int rc = git(root, args, &value_bytes, &status);
+    if (!rc) return WFS_E_GIT_UNSUPPORTED;
+    if (rc == WFS_E_GIT_FAILED && status == 1) return 0;
+    return rc;
+}
 int source_unchanged(const GitSource &s) {
     String head; const char *args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (int rc = value(s.root.c_str(), args, head)) return rc;
@@ -263,6 +271,11 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     String real_top, real_root;
     if (fs_realpath(root, real_root) || fs_realpath(top.c_str(), real_top) || real_root != real_top)
         return WFS_E_GIT_UNSUPPORTED;
+    // These policies can point outside the repository. Preserving them would require a
+    // separate private config contract, and flattening them into info/{exclude,attributes}
+    // would change Git's precedence rules. The repository-local files remain supported.
+    for (const char *key : {"core.excludesFile", "core.attributesFile"})
+        if (int policy_rc = reject_configured_policy(root, key)) return policy_rc;
     const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (value(root, head_args, out.head)) return WFS_E_GIT_UNSUPPORTED;
     const char *index_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "index", nullptr};

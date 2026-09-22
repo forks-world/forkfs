@@ -82,6 +82,10 @@ content, including Git administrative changes such as branch/index updates.
 - Git LFS hydration, recursive submodule import, a shared refs/object service, a switch to
   discard current edits and materialize only HEAD, and cross-machine history transfer are
   not provided. This increment does not close every requirement in Issue #7.
+- Repository-local `core.excludesFile` and `core.attributesFile` overrides are unsupported.
+  They can point outside the repository, and merging their rules into `info/exclude` or
+  `info/attributes` would change Git's precedence; these overrides are not imported. Use the
+  repository-local `info/exclude` and `info/attributes` files, which are preserved.
 - Git Worlds use the ordinary temporary-tree fork path. `pool fill` rejects Git snapshots;
   it does not build entries that Git-aware forks cannot consume.
 - Git setup runs inside the uncommitted clone before the normal exclusive publish rename.

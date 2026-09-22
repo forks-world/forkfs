@@ -190,6 +190,49 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'text: set', self.git(one, 'check-attr', 'text', '--', 'line.txt').stdout)
         self.world('checkpoint', wid)
 
+    def test_configured_external_git_policies_are_refused(self):
+        # The source-local files are copied into the owned repository. An explicit config
+        # override may point anywhere (and has different precedence), so importing it is
+        # refused before a snapshot can be published, including empty and missing paths.
+        cases = (
+            ('core.excludesFile', self.root / 'external-exclude'),
+            ('core.attributesFile', self.root / 'external-attributes'),
+        )
+        for key, path in cases:
+            with self.subTest(key=key, value='existing'):
+                path.write_text('external-only/\n' if key.endswith('excludesFile') else '*.txt text\n')
+                if key.endswith('excludesFile'):
+                    (self.source / 'external-only').mkdir()
+                    (self.source / 'external-only' / 'artifact').write_text('kept\n')
+                self.git(self.source, 'config', '--local', key, str(path))
+                before = [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index', 'config')]
+                result = self.world('init', str(self.source), code=3)
+                self.assertIn(b'unsupported Git layout', result.stderr)
+                self.assertEqual(before, [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index', 'config')])
+                self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+                self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+                if key.endswith('excludesFile'):
+                    self.assertEqual((self.source / 'external-only' / 'artifact').read_text(), 'kept\n')
+                self.git(self.source, 'config', '--local', '--unset-all', key)
+                if key.endswith('excludesFile'):
+                    shutil.rmtree(self.source / 'external-only')
+            with self.subTest(key=key, value='empty'):
+                self.git(self.source, 'config', '--local', key, '')
+                before = [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index', 'config')]
+                result = self.world('init', str(self.source), code=3)
+                self.assertIn(b'unsupported Git layout', result.stderr)
+                self.assertEqual(before, [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index', 'config')])
+                self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+                self.git(self.source, 'config', '--local', '--unset-all', key)
+            with self.subTest(key=key, value='missing'):
+                self.git(self.source, 'config', '--local', key, str(path / 'missing'))
+                before = [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index', 'config')]
+                result = self.world('init', str(self.source), code=3)
+                self.assertIn(b'unsupported Git layout', result.stderr)
+                self.assertEqual(before, [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index', 'config')])
+                self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+                self.git(self.source, 'config', '--local', '--unset-all', key)
+
     def test_move_discard_restore_checkpoint_and_gc(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
