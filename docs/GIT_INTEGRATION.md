@@ -20,9 +20,15 @@ world fs checkpoint W1           # a filesystem snapshot, never an implicit Git 
 Each tree owns `.world-git/repo.git`, a private bare repository with one linked worktree.
 Its root `.git` file and the reverse worktree pointer are relative. The branch, HEAD,
 index, refs and object database belong to that tree, not the original source or another
-World. Initial import uses Git's local clone with `--no-hardlinks`; subsequent filesystem
-forks use APFS cloning, including the Git objects. Git's [worktree documentation](https://git-scm.com/docs/git-worktree)
-describes these per-worktree administrative links.
+World. Initial import mirrors resolvable `refs/*` with Git's `--mirror` mode and
+`--no-hardlinks`, then restores each captured symbolic-ref edge before creating the private
+worktree; subsequent filesystem forks use APFS cloning, including the Git objects. Git's
+[worktree documentation](https://git-scm.com/docs/git-worktree) describes these per-worktree
+administrative links.
+
+Git refs whose symbolic targets are outside `refs/`, malformed, dangling or cyclic are
+unsupported by this import contract and may be omitted by Git's mirror operation. The
+source is rechecked for the captured symbolic-ref map before publication.
 
 This deliberately does not put a shared writable repository in the store: the existing
 exec sandbox can continue denying writes to the entire store and every other World.

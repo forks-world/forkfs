@@ -71,6 +71,38 @@ int value(const char *root, const char *const *args, String &out, bool missing_o
     if (!out.empty() && out.back() == '\n') out.pop_back();
     return 0;
 }
+int collect_symrefs(const char *root, Vec<GitSymref> &out) {
+    const char *args[] = {"for-each-ref", "--format=%(refname)%09%(symref)", nullptr};
+    Vec<char> listing;
+    if (int rc = git(root, args, &listing)) return rc;
+    out.clear();
+    size_t start = 0;
+    for (size_t i = 0; i < listing.size(); ++i) {
+        if (listing[i] != '\n' && listing[i] != '\0') continue;
+        if (i == start) { start = i + 1; continue; }
+        size_t tab = start;
+        while (tab < i && listing[tab] != '\t') ++tab;
+        if (tab == i || tab == start) return WFS_E_GIT_UNSUPPORTED;
+        if (tab + 1 == i) { start = i + 1; continue; }
+        String name(listing.data() + start, tab - start), target(listing.data() + tab + 1, i - tab - 1);
+        if (strncmp(name.c_str(), "refs/", 5) || strncmp(target.c_str(), "refs/", 5) ||
+            strchr(target.c_str(), '\t') || strchr(target.c_str(), '\n')) return WFS_E_GIT_UNSUPPORTED;
+        const char *sym_args[] = {"symbolic-ref", "--quiet", "--no-recurse", name.c_str(), nullptr};
+        String immediate;
+        if (int rc = value(root, sym_args, immediate)) return rc;
+        if (strncmp(immediate.c_str(), "refs/", 5)) return WFS_E_GIT_UNSUPPORTED;
+        GitSymref sym{name, immediate};
+        out.emplace_back(sym);
+        start = i + 1;
+    }
+    return 0;
+}
+bool same_symrefs(const Vec<GitSymref> &a, const Vec<GitSymref> &b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].name != b[i].name || a[i].target != b[i].target) return false;
+    return true;
+}
 int read_bytes(const char *path, Vec<char> &out) {
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) return -errno;
@@ -189,6 +221,9 @@ int source_unchanged(const GitSource &s) {
     if (rc) return rc;
     if (head != s.head || index.size() != s.index.size() ||
         (!index.empty() && memcmp(index.data(), s.index.data(), index.size()))) return -EBUSY;
+    Vec<GitSymref> refs;
+    if (int symrc = collect_symrefs(s.root.c_str(), refs)) return symrc;
+    if (!same_symrefs(refs, s.symrefs)) return -EBUSY;
     return 0;
 }
 }
@@ -226,6 +261,7 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     const char *admin_args[] = {"rev-parse", "--absolute-git-dir", nullptr};
     if ((rc = value(root, common_args, common)) || (rc = value(root, admin_args, admin))) return rc;
     if (out.managed && (rc = managed_check(root, common.c_str(), admin.c_str()))) return rc;
+    if ((rc = collect_symrefs(root, out.symrefs))) return rc;
     const char *unsafe[] = {"objects/info/alternates", "objects/info/http-alternates", "shallow"};
     for (const char *rel : unsafe) {
         String path = joinp(common.c_str(), rel);
@@ -275,16 +311,22 @@ int git_import(const GitSource &s, const char *clone) {
         GitSource copy;
         if (int rc = git_source(clone, true, copy)) return rc;
         if (copy.head != s.head || copy.index.size() != s.index.size() ||
-            (!copy.index.empty() && memcmp(copy.index.data(), s.index.data(), s.index.size()))) return -EBUSY;
+            (!copy.index.empty() && memcmp(copy.index.data(), s.index.data(), s.index.size())) ||
+            !same_symrefs(copy.symrefs, s.symrefs)) return -EBUSY;
         return 0;
     }
     String owned = joinp(clone, ".world-git");
     if (int rc = fs_mkdir(owned.c_str(), 0700)) return rc;
     String repo = joinp(owned.c_str(), "repo.git");
-    // Mirror every ref, including stash, notes, remote-tracking and custom refs; a bare clone
-    // silently keeps only heads and would lose refs when the source is later removed.
+    // Mirror all resolvable refs, including stash, notes, remote-tracking and custom refs; a
+    // bare clone omits other ref namespaces and would lose them when the source is removed.
     const char *copy[] = {"clone", "--mirror", "--no-hardlinks", "--quiet", "--", s.root.c_str(), repo.c_str(), nullptr};
     if (int rc = git(clone, copy)) return rc;
+    for (const auto &ref : s.symrefs) {
+        const char *sym_args[] = {"--git-dir", repo.c_str(), "symbolic-ref", ref.name.c_str(),
+                                  ref.target.c_str(), nullptr};
+        if (int rc = git(clone, sym_args)) return rc;
+    }
     // clone --local copies loose objects too, including blobs referenced only by the index;
     // --no-hardlinks prevents subsequent Git operations changing the source's object files.
     String active = joinp(owned.c_str(), "active");

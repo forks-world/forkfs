@@ -122,19 +122,38 @@ class GitWorldTest(unittest.TestCase):
         refs = {
             'refs/stash': retained,
             'refs/remotes/origin/review': retained,
+            'refs/remotes/origin/main': retained,
             'refs/notes/test': retained,
             'refs/custom/retained': retained,
+            'refs/custom/target': retained,
+        }
+        symrefs = {
+            'refs/remotes/origin/HEAD': 'refs/remotes/origin/main',
+            'refs/custom/alias2': 'refs/custom/target',
+            'refs/custom/alias1': 'refs/custom/alias2',
         }
         for ref, oid in refs.items():
             self.git(self.source, 'update-ref', ref, oid)
+        for ref, target in symrefs.items():
+            self.git(self.source, 'symbolic-ref', ref, target)
         self.world('init', str(self.source))
         for ref, oid in refs.items():
             self.assertEqual(self.git(self.source, 'rev-parse', '--verify', ref).stdout.strip().decode(), oid)
+        for ref, target in symrefs.items():
+            self.assertEqual(self.git(self.source, 'symbolic-ref', '--quiet', '--no-recurse', ref).stdout.strip().decode(), target)
         shutil.rmtree(self.source)
         one, _ = self.fork()
         self.git(one, 'gc', '--quiet')
         for ref, oid in refs.items():
             self.assertEqual(self.git(one, 'rev-parse', '--verify', ref).stdout.strip().decode(), oid)
+        for ref, target in symrefs.items():
+            self.assertEqual(self.git(one, 'symbolic-ref', '--quiet', '--no-recurse', ref).stdout.strip().decode(), target)
+        moved = self.git(one, 'commit-tree', base + '^{tree}', '-p', retained,
+                         '-m', 'moved ref target').stdout.decode().strip()
+        self.git(one, 'update-ref', 'refs/remotes/origin/main', moved)
+        self.assertEqual(self.git(one, 'rev-parse', '--verify', 'refs/remotes/origin/HEAD').stdout.strip().decode(), moved)
+        self.git(one, 'update-ref', 'refs/custom/target', moved)
+        self.assertEqual(self.git(one, 'rev-parse', '--verify', 'refs/custom/alias1').stdout.strip().decode(), moved)
         self.git(one, 'config', '--get', 'remote.origin.url', code=1)
 
     def test_move_discard_restore_checkpoint_and_gc(self):
