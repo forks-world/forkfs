@@ -96,3 +96,17 @@ Validation: `cli_git_test` uses disposable real repositories and covers clean/di
 staging preservation, imported linked worktrees after source deletion, independent commits,
 branch collisions, detached HEAD, move/discard/restore/checkpoint, hard snapshots, pool
 refusal, Git setup rollback, environment isolation and Git commits inside the exec sandbox.
+
+### Repository status policy
+
+Imports preserve effective repository settings for `core.autocrlf`, `core.eol`,
+`core.safecrlf`, `core.filemode`, `core.symlinks`, `core.ignorecase`,
+`core.precomposeunicode`, `core.trustctime`, `core.checkstat`, `core.ignorestat`,
+and `core.checkRoundtripEncoding`. Included and worktree-specific values are
+captured; boolean values are normalized without losing valueless true settings.
+Absent settings stay absent in the owned repository. The policy is checked again
+before publication along with the source index and local rules.
+
+Effective repository `filter.*` definitions are rejected before status inspection.
+Arbitrary configuration, executable conversions, hooks, and external policy paths
+are not imported. Global and system Git configuration are disabled during import.

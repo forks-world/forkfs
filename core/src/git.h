@@ -5,6 +5,9 @@ namespace wfs {
 struct GitSymref {
     String name, target;
 };
+struct GitSetting {
+    String key, value;
+};
 // Git administration is owned by the tree, so the existing rename/trash/GC protocol also
 // owns all of its Git resources. No worktree is registered in the user's source repository.
 struct GitSource {
@@ -17,6 +20,7 @@ struct GitSource {
     String attributes_path;
     Vec<char> attributes;
     Vec<GitSymref> symrefs;
+    Vec<GitSetting> settings;
 };
 int git_source(const char *root, bool include_changes, GitSource &out);
 int git_import(const GitSource &source, const char *clone);

@@ -224,6 +224,7 @@ class GitWorldTest(unittest.TestCase):
                 self.assertEqual(before, [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index', 'config')])
                 self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
                 self.git(self.source, 'config', '--local', '--unset-all', key)
+
             with self.subTest(key=key, value='missing'):
                 self.git(self.source, 'config', '--local', key, str(path / 'missing'))
                 before = [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index', 'config')]
@@ -232,6 +233,52 @@ class GitWorldTest(unittest.TestCase):
                 self.assertEqual(before, [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index', 'config')])
                 self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
                 self.git(self.source, 'config', '--local', '--unset-all', key)
+
+    def test_import_preserves_autocrlf_and_filemode_settings(self):
+        self.git(self.source, 'config', '--local', 'core.autocrlf', 'true')
+        self.git(self.source, 'config', '--local', 'core.filemode', 'false')
+        line = self.source / 'line.txt'
+        line.write_bytes(b'line\r\n')
+        self.git(self.source, 'add', 'line.txt')
+        self.git(self.source, 'commit', '-m', 'crlf')
+        os.chmod(self.source / 'file', 0o755)
+        self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        one, wid = self.fork()
+        self.assertEqual((one / 'line.txt').read_bytes(), b'line\r\n')
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.git(one, 'config', '--get', 'core.autocrlf').stdout.strip(), b'true')
+        self.assertEqual(self.git(one, 'config', '--get', 'core.filemode').stdout.strip(), b'false')
+        self.world('checkpoint', wid)
+
+    def test_status_policy_types_and_absent_defaults(self):
+        self.git(self.source, 'config', '--local', 'core.ignorecase', 'true')
+        self.git(self.source, 'config', '--local', '--unset-all', 'core.ignorecase')
+        with (self.source / '.git' / 'config').open('a') as config:
+            config.write('[core]\n    autocrlf\n    safecrlf = warn\n    checkstat = minimal\n    checkRoundtripEncoding = SHIFT-JIS,UTF-16LE\n    symlinks =\n')
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        for key, expected in (('core.autocrlf', b'true'), ('core.safecrlf', b'warn'),
+                              ('core.checkstat', b'minimal'),
+                              ('core.checkRoundtripEncoding', b'SHIFT-JIS,UTF-16LE'),
+                              ('core.symlinks', b'false')):
+            self.assertEqual(self.git(one, 'config', '--get', key).stdout.strip(), expected)
+        self.git(one, 'config', '--get', 'core.ignorecase', code=1)
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.world('checkpoint', wid)
+
+    def test_filter_configuration_is_refused_before_execution(self):
+        (self.source / '.gitattributes').write_text('file filter=example\n')
+        self.git(self.source, 'add', '.gitattributes')
+        self.git(self.source, 'commit', '-m', 'filter attribute')
+        included = self.root / 'filter.config'
+        included.write_text('[filter "example"]\n    clean = touch filter-ran; cat\n')
+        self.git(self.source, 'config', '--local', 'include.path', str(included))
+        result = self.world('init', str(self.source), code=3)
+        self.assertIn(b'unsupported Git layout', result.stderr)
+        self.assertFalse((self.source / 'filter-ran').exists())
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
     def test_move_discard_restore_checkpoint_and_gc(self):
         self.world('init', str(self.source))

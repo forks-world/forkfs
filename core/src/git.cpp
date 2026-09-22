@@ -215,6 +215,67 @@ int config(const char *root, const char *key, const char *val) {
     const char *args[] = {"config", "--local", key, val, nullptr};
     return git(root, args);
 }
+int unset_config(const char *root, const char *key) {
+    const char *args[] = {"config", "--local", "--unset-all", key, nullptr};
+    int status = -1, rc = git(root, args, nullptr, &status);
+    if (rc == WFS_E_GIT_FAILED && status == 5) return 0;
+    return rc;
+}
+int get_config(const char *root, const char *const *args, String &out, bool *present = nullptr) {
+    Vec<char> bytes; int status = -1;
+    int rc = git(root, args, &bytes, &status);
+    if (rc == WFS_E_GIT_FAILED && status == 1) { out.clear(); if (present) *present = false; return 0; }
+    if (rc) return rc;
+    if (present) *present = true;
+    out.assign(bytes.data());
+    if (!out.empty() && out.back() == '\n') out.pop_back();
+    return 0;
+}
+int capture_settings(const char *root, Vec<GitSetting> &out) {
+    out.clear();
+    const char *filters[] = {"config", "--get-regexp", "^filter\\.", nullptr};
+    Vec<char> filter_bytes; int filter_status = -1;
+    int rc = git(root, filters, &filter_bytes, &filter_status);
+    if (rc != WFS_E_GIT_FAILED || filter_status != 1) {
+        if (rc) return rc;
+        return WFS_E_GIT_UNSUPPORTED;
+    }
+    const char *special[] = {"core.autocrlf", "core.safecrlf", nullptr};
+    for (size_t i = 0; special[i]; ++i) {
+        const char *raw[] = {"config", "--get", special[i], nullptr};
+        String value; bool present;
+        if ((rc = get_config(root, raw, value, &present))) return rc;
+        if (!present) continue;
+        bool literal = (i == 0 && value == "input") || (i == 1 && value == "warn");
+        if (!literal) {
+            const char *typed[] = {"config", "--get", "--type=bool", special[i], nullptr};
+            if ((rc = get_config(root, typed, value, &present))) return rc;
+            if (!present) return -EBUSY;
+        }
+        out.emplace_back(GitSetting{special[i], value});
+    }
+    const char *strings[] = {"core.eol", "core.checkstat", "core.checkRoundtripEncoding", nullptr};
+    for (size_t i = 0; strings[i]; ++i) {
+        const char *raw[] = {"config", "--get", strings[i], nullptr};
+        String value; bool present;
+        if ((rc = get_config(root, raw, value, &present))) return rc;
+        if (present) out.emplace_back(GitSetting{strings[i], value});
+    }
+    const char *bool_keys[] = {"core.filemode", "core.symlinks", "core.ignorecase", "core.precomposeunicode", "core.trustctime", "core.ignorestat", nullptr};
+    for (size_t i = 0; bool_keys[i]; ++i) {
+        const char *typed[] = {"config", "--get", "--type=bool", bool_keys[i], nullptr};
+        String value; bool present;
+        if ((rc = get_config(root, typed, value, &present))) return rc;
+        if (present) out.emplace_back(GitSetting{bool_keys[i], value});
+    }
+    return 0;
+}
+bool same_settings(const Vec<GitSetting> &a, const Vec<GitSetting> &b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].key != b[i].key || a[i].value != b[i].value) return false;
+    return true;
+}
 int reject_configured_policy(const char *root, const char *key) {
     const char *args[] = {"config", "--get", key, nullptr};
     Vec<char> value_bytes; int status = -1;
@@ -242,6 +303,9 @@ int source_unchanged(const GitSource &s) {
     if (rc == -ENOENT && s.attributes.empty()) rc = 0;
     if (rc) return rc;
     if (!same_bytes(attributes, s.attributes)) return -EBUSY;
+    Vec<GitSetting> settings;
+    if (int setting_rc = capture_settings(s.root.c_str(), settings)) return setting_rc;
+    if (!same_settings(settings, s.settings)) return -EBUSY;
     Vec<GitSymref> refs;
     if (int symrc = collect_symrefs(s.root.c_str(), refs)) return symrc;
     if (!same_symrefs(refs, s.symrefs)) return -EBUSY;
@@ -276,6 +340,7 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     // would change Git's precedence rules. The repository-local files remain supported.
     for (const char *key : {"core.excludesFile", "core.attributesFile"})
         if (int policy_rc = reject_configured_policy(root, key)) return policy_rc;
+    if (int policy_rc = capture_settings(root, out.settings)) return policy_rc;
     const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (value(root, head_args, out.head)) return WFS_E_GIT_UNSUPPORTED;
     const char *index_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "index", nullptr};
@@ -348,7 +413,7 @@ int git_import(const GitSource &s, const char *clone) {
             (!copy.index.empty() && memcmp(copy.index.data(), s.index.data(), s.index.size())) ||
             !same_bytes(copy.exclude, s.exclude) ||
             !same_bytes(copy.attributes, s.attributes) ||
-            !same_symrefs(copy.symrefs, s.symrefs)) return -EBUSY;
+            !same_symrefs(copy.symrefs, s.symrefs) || !same_settings(copy.settings, s.settings)) return -EBUSY;
         return 0;
     }
     String owned = joinp(clone, ".world-git");
@@ -405,6 +470,11 @@ int git_import(const GitSource &s, const char *clone) {
             if (int rc = config(clone, key, identity.c_str())) return rc;
         }
     }
+    for (const char *key : {"core.autocrlf", "core.safecrlf", "core.eol", "core.checkstat", "core.checkRoundtripEncoding",
+                            "core.filemode", "core.symlinks", "core.ignorecase", "core.precomposeunicode", "core.trustctime", "core.ignorestat"})
+        if (int rc = unset_config(clone, key)) return rc;
+    for (const auto &setting : s.settings)
+        if (int rc = config(clone, setting.key.c_str(), setting.value.c_str())) return rc;
     // A clone is local and self-contained; its remote is not an implicit write-back channel.
     const char *remote[] = {"config", "--local", "--remove-section", "remote.origin", nullptr};
     if (int rc = git(clone, remote)) return rc;
