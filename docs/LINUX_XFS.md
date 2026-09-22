@@ -53,8 +53,9 @@ Use `--store` to place it on the project's filesystem if necessary.
 
 The backend dispatch is separated in CMake: Darwin uses `platform_darwin.cpp`; Linux
 uses `platform_linux.cpp`. Selection inside Linux is capability-based, not a filesystem
-name allowlist. XFS is the validated target; other reflink filesystems have not yet been
-certified. Filesystem-specific inode flags, project IDs/quotas and birthtime are not
+name allowlist. [Btrfs](LINUX_BTRFS.md) has its own subvolume/inode-policy adaptation and
+test job. Other reflink filesystems have not been certified. XFS inode flags,
+project IDs/quotas and birthtime are not
 round-tripped by this first backend. This is a workspace clone, not a volume backup.
 
 There is no privileged Linux immutable-flag implementation, persistent change journal or

@@ -86,10 +86,20 @@ jobs:
             build/ci/safety.log
             build/ci/disk-full.log
 
-  linux-xfs:
-    name: Release (Linux XFS)
+  linux:
+    name: Release (Linux ${{ matrix.label }})
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fs: xfs
+            label: XFS
+          - fs: btrfs
+            label: Btrfs
+    env:
+      TEST_FS: ${{ matrix.fs }}
     steps:
       - name: Check out source
         uses: actions/checkout@v7.0.1
@@ -99,7 +109,7 @@ jobs:
       - name: Install build and namespace tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-14 libsqlite3-dev xfsprogs bubblewrap
+          sudo apt-get install -y g++-14 libsqlite3-dev xfsprogs btrfs-progs bubblewrap
       - name: Allow Bubblewrap user namespaces under Ubuntu AppArmor
         run: |
           # Ubuntu 24.04's AppArmor policy requires an explicit profile for unprivileged userns.
@@ -112,21 +122,35 @@ jobs:
           }
           EOF
           sudo apparmor_parser -r /etc/apparmor.d/bwrap
-      - name: Create bounded XFS test volume
+      - name: Create bounded filesystem test volumes
         run: |
-          truncate -s 2G "$RUNNER_TEMP/forkfs-xfs.img"
-          mkfs.xfs -f -m reflink=1 "$RUNNER_TEMP/forkfs-xfs.img"
-          sudo mkdir -p /mnt/forkfs-xfs
-          sudo mount -o loop "$RUNNER_TEMP/forkfs-xfs.img" /mnt/forkfs-xfs
-          sudo chown "$(id -u):$(id -g)" /mnt/forkfs-xfs
+          set -euo pipefail
+          truncate -s 2G "$RUNNER_TEMP/forkfs-test.img"
+          sudo mkdir -p /mnt/forkfs-test
+          if [ "$TEST_FS" = btrfs ]; then
+            mkfs.btrfs -f -n 16384 "$RUNNER_TEMP/forkfs-test.img"
+            sudo mount -o loop,user_subvol_rm_allowed "$RUNNER_TEMP/forkfs-test.img" /mnt/forkfs-test
+            truncate -s 2G "$RUNNER_TEMP/forkfs-other.img"
+            mkfs.btrfs -f -n 16384 "$RUNNER_TEMP/forkfs-other.img"
+            sudo mkdir -p /mnt/forkfs-other
+            sudo mount -o loop,user_subvol_rm_allowed "$RUNNER_TEMP/forkfs-other.img" /mnt/forkfs-other
+            sudo chown "$(id -u):$(id -g)" /mnt/forkfs-other
+            echo 'WFS_BTRFS_OTHER=/mnt/forkfs-other' >> "$GITHUB_ENV"
+          else
+            mkfs.xfs -f -m reflink=1 "$RUNNER_TEMP/forkfs-test.img"
+            sudo mount -o loop "$RUNNER_TEMP/forkfs-test.img" /mnt/forkfs-test
+          fi
+          sudo chown "$(id -u):$(id -g)" /mnt/forkfs-test
       - name: Build and test as an unprivileged user
         run: |
-          cmake -S . -B /mnt/forkfs-xfs/build -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_COMPILER=g++-14 -DWFS_FSKIT=OFF
-          cmake --build /mnt/forkfs-xfs/build --parallel 4
-          ctest --test-dir /mnt/forkfs-xfs/build --output-on-failure --no-tests=error
-          scripts/check-deps.sh /mnt/forkfs-xfs/build
+          set -euo pipefail
+          cmake -S . -B /mnt/forkfs-test/build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14 -DWFS_FSKIT=OFF -DWFS_LINUX_TEST_FS="$TEST_FS"
+          cmake --build /mnt/forkfs-test/build --parallel 4
+          ctest --test-dir /mnt/forkfs-test/build --output-on-failure --no-tests=error
+          scripts/check-deps.sh /mnt/forkfs-test/build
       - name: Unmount test volume
         if: always()
         run: |
-          if mountpoint -q /mnt/forkfs-xfs; then sudo umount /mnt/forkfs-xfs; fi
+          if mountpoint -q /mnt/forkfs-test; then sudo umount /mnt/forkfs-test; fi
+          if mountpoint -q /mnt/forkfs-other; then sudo umount /mnt/forkfs-other; fi

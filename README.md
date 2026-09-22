@@ -1,13 +1,15 @@
 # forkfs — World FS provider (BranchFS)
 
-Fork a workspace into independently writable worlds on macOS/APFS or Linux/XFS.
+Fork a workspace into independently writable worlds on macOS/APFS or Linux/XFS/Btrfs.
 Design: [`arch.md`](arch.md), [`docs/M1_DESIGN.md`](docs/M1_DESIGN.md). Task board: [`docs/TASKS.md`](docs/TASKS.md).
 
 ## Status
 
-Linux now has an XFS reflink backend and namespace-isolated `world exec` through the system
+Linux has an XFS/Btrfs reflink backend and namespace-isolated `world exec` through the system
 Bubblewrap CLI. Build requirements, tested behavior, timings and limitations:
-[`docs/LINUX_XFS.md`](docs/LINUX_XFS.md). Linux requires reflink support for snapshots;
+[`docs/LINUX_XFS.md`](docs/LINUX_XFS.md) and [`docs/LINUX_BTRFS.md`](docs/LINUX_BTRFS.md).
+Btrfs supports cross-subvolume cloning and preserves NOCOW/compression policy.
+Linux requires reflink support for snapshots;
 `--copy` is an explicit fork fallback. Linux diff uses a full scan. Sandboxed execution
 fails closed; only `--no-sandbox` opts out. The APFS measurements and FSEvents/seatbelt
 behavior described below apply to macOS.
@@ -27,7 +29,8 @@ The M0 FSKit passthrough frontend is frozen as a fallback and is not built by de
 (`-DWFS_FSKIT=ON` brings back `core/src/view.cpp`, `macos/fskit/` and `world fs mount`).
 
 C++23 core with a C ABI and C++ CLI. macOS builds with CMake + Command Line Tools; no Xcode needed.
-Linux build dependencies and sandbox setup are in the [XFS guide](docs/LINUX_XFS.md).
+Linux build dependencies and sandbox setup are in the [XFS guide](docs/LINUX_XFS.md);
+Btrfs-specific behavior and its independent test job are in the [Btrfs guide](docs/LINUX_BTRFS.md).
 Dependency policy: arch.md §39. Design: [`docs/M1_DESIGN.md`](docs/M1_DESIGN.md).
 
 ## Build

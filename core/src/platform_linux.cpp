@@ -1,9 +1,12 @@
-// Linux native-directory backend. FICLONE shares extents on reflink-enabled XFS;
+// Linux native-directory backend. FICLONE shares extents on XFS and Btrfs;
 // capability is tested by the operation, not inferred from a filesystem name.
 #include "internal.h"
 #include <fcntl.h>
 #include <linux/fs.h>
+#include <linux/btrfs.h>
+#include <linux/magic.h>
 #include <sys/ioctl.h>
+#include <sys/vfs.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -12,6 +15,41 @@
 namespace wfs {
 namespace {
 bool unsupported(int e) { return e == EXDEV || e == EOPNOTSUPP || e == ENOTTY || e == EINVAL; }
+
+// Btrfs gives each subvolume its own st_dev. Compare filesystem UUIDs before rejecting
+// a cross-subvolume clone; the real FICLONE still decides whether the operation works.
+int btrfs_fsid(const char *path, struct btrfs_ioctl_fs_info_args &info) {
+    int fd = ::open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return -errno;
+    struct statfs fs;
+    int rc = ::fstatfs(fd, &fs) ? -errno : 0;
+    if (!rc && fs.f_type != BTRFS_SUPER_MAGIC) rc = -EXDEV;
+    if (!rc && ::ioctl(fd, BTRFS_IOC_FS_INFO, &info)) rc = -errno;
+    ::close(fd);
+    return rc;
+}
+
+// A new inode may inherit +C/+c/+m from its destination parent. Match the source while
+// the inode is still empty: Btrfs refuses reflinks with incompatible NOCOW/checksums.
+// Preserve compression policy too, including on directories for future file creation.
+int btrfs_clone_flags(int src, int dst) {
+    struct statfs fs;
+    if (::fstatfs(src, &fs)) return -errno;
+    // An inherited algorithm property is an xattr, separate from +c. The metadata pass
+    // installs the source property, if any; an absent source property must stay absent.
+    if (::fremovexattr(dst, "btrfs.compression") && errno != ENODATA) return -errno;
+    int source = 0, target = 0;
+    if (fs.f_type == BTRFS_SUPER_MAGIC && ::ioctl(src, FS_IOC_GETFLAGS, &source)) return -errno;
+    if (::ioctl(dst, FS_IOC_GETFLAGS, &target)) return -errno;
+    constexpr int mask = FS_NOCOW_FL | FS_COMPR_FL | FS_NOCOMP_FL;
+    int desired = (target & ~mask) | (source & mask);
+    if (desired == target) return 0;
+    // Changing between NOCOW and compression needs two steps: the kernel checks both
+    // the previous and requested flag combinations, even on an empty inode.
+    int cleared = target & ~mask;
+    if (cleared != target && ::ioctl(dst, FS_IOC_SETFLAGS, &cleared)) return -errno;
+    return desired == cleared || ::ioctl(dst, FS_IOC_SETFLAGS, &desired) == 0 ? 0 : -errno;
+}
 
 // Explicit --copy fallback, preserving holes rather than materialising sparse files.
 int copy_data(int src, int dst, off_t size) {
@@ -112,7 +150,7 @@ int metadata(const char *src, const char *dst, const struct stat &st) {
     return ::utimensat(AT_FDCWD, dst, times, AT_SYMLINK_NOFOLLOW) == 0 ? 0 : -errno;
 }
 
-struct CloneCtx { const char *dst; bool copy; };
+struct CloneCtx { const char *dst; bool copy; bool btrfs = false; };
 String target(CloneCtx *c, const char *rel) {
     String d(c->dst);
     if (*rel) { d.append("/"); d.append(rel); }
@@ -126,6 +164,20 @@ int clone_entry(void *ctx, const char *src, const char *rel, const struct stat &
         // mkdir(2) applies the caller's umask; make the directory traversable before cloning
         // its children. The post-order metadata pass restores the source's final mode.
         if (::chmod(dst.c_str(), 0700)) return -errno;
+        if (!*rel) {
+            struct statfs fs;
+            if (::statfs(dst.c_str(), &fs)) return -errno;
+            c->btrfs = fs.f_type == BTRFS_SUPER_MAGIC;
+        }
+        if (c->btrfs) {
+            int in = ::open(src, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (in < 0) return -errno;
+            int out = ::open(dst.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            int rc = out < 0 ? -errno : btrfs_clone_flags(in, out);
+            if (out >= 0) ::close(out);
+            ::close(in);
+            if (rc) return rc;
+        }
         return 0;
     }
     int rc = 0;
@@ -139,7 +191,8 @@ int clone_entry(void *ctx, const char *src, const char *rel, const struct stat &
         }
         int out = ::open(dst.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
         if (out < 0) { rc = -errno; ::close(in); return rc; }
-        if (::ioctl(out, FICLONE, in)) {
+        if (c->btrfs) rc = btrfs_clone_flags(in, out);
+        if (!rc && ::ioctl(out, FICLONE, in)) {
             int e = errno;
             rc = c->copy && unsupported(e) ? copy_data(in, out, opened.st_size)
                                          : -(unsupported(e) && e != EXDEV ? EOPNOTSUPP : e);
@@ -169,7 +222,12 @@ int fs_clone_probe(const char *dst, const char *src) {
     if (!dst || !src) return -EINVAL;
     struct stat a, b;
     if (::stat(src, &a) || ::stat(dst, &b)) return -errno;
-    if (a.st_dev != b.st_dev) return -EXDEV;
+    if (a.st_dev != b.st_dev) {
+        struct btrfs_ioctl_fs_info_args from{}, to{};
+        if (int rc = btrfs_fsid(src, from)) return rc;
+        if (int rc = btrfs_fsid(dst, to)) return rc;
+        if (::memcmp(from.fsid, to.fsid, sizeof from.fsid)) return -EXDEV;
+    }
     // Probe using our own files, without touching the source or following user symlinks.
     char from[WFS_PATH_MAX], to[WFS_PATH_MAX];
     if (::snprintf(from, sizeof from, "%s/.wfs-probe-src-XXXXXX", dst) >= (int)sizeof from ||
