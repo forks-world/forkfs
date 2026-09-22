@@ -339,6 +339,55 @@ class GitWorldTest(unittest.TestCase):
                 self.assertEqual(self.git(path, 'config', '--get', key).stdout.strip(), value)
             self.assertEqual(self.git(path, 'status', '--porcelain').stdout, b'')
 
+    def test_injected_status_policies_are_refused(self):
+        before = [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index', 'config')]
+        for channel in ('count', 'parameters'):
+            for key, value in (('core.autocrlf', 'input'),
+                               ('core.attributesFile', '/nonexistent-policy'),
+                               ('filter.injected.clean', 'touch injected-filter-ran; cat')):
+                with self.subTest(channel=channel, key=key):
+                    if channel == 'count':
+                        self.env.update(GIT_CONFIG_COUNT='3', GIT_CONFIG_KEY_2=key, GIT_CONFIG_VALUE_2=value)
+                    else:
+                        self.env['GIT_CONFIG_PARAMETERS'] = "'" + key + '=' + value + "'"
+                    result = self.world('init', str(self.source), code=3)
+                    self.assertIn(b'unsupported Git layout', result.stderr)
+                    self.assertFalse((self.source / 'injected-filter-ran').exists())
+                    self.assertEqual(before, [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index', 'config')])
+                    self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+                    self.env['GIT_CONFIG_COUNT'] = '2'
+                    for variable in ('GIT_CONFIG_KEY_2', 'GIT_CONFIG_VALUE_2', 'GIT_CONFIG_PARAMETERS'):
+                        self.env.pop(variable, None)
+        self.world('init', str(self.source))  # benign maintenance command config remains allowed
+
+    def test_mirror_does_not_install_ambient_templates(self):
+        import shlex
+        templates = self.root / 'templates'
+        (templates / 'hooks').mkdir(parents=True)
+        (templates / 'info').mkdir()
+        hook = templates / 'hooks' / 'pre-commit'
+        hook.write_text('#!/bin/sh\ntouch template-hook-ran\n')
+        hook.chmod(0o700)
+        (templates / 'info' / 'attributes').write_text('file -text\n')
+        real_git = shutil.which('git')
+        wrapper = self.root / 'template-bin'
+        wrapper.mkdir()
+        script = wrapper / 'git'
+        script.write_text('#!/bin/sh\nexec ' + shlex.quote(real_git) + ' -c '
+                          + shlex.quote('init.templateDir=' + str(templates)) + ' "$@"\n')
+        script.chmod(0o700)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        self.world('init', str(self.source))
+        one, _ = self.fork()
+        common = one / '.world-git' / 'repo.git'
+        self.assertFalse((common / 'hooks' / 'pre-commit').exists())
+        attributes = common / 'info' / 'attributes'
+        self.assertTrue(not attributes.exists() or attributes.read_bytes() == b'')
+        (one / 'file').write_text('new commit\n')
+        self.git(one, 'commit', '-am', 'template-free commit')
+        self.assertFalse((one / 'template-hook-ran').exists())
+        self.assertEqual(self.git(self.source, 'rev-parse', 'HEAD').stdout.strip(), self.base)
+
     def test_inactive_conditional_policy_is_refused(self):
         included = self.root / 'future-policy'
         included.write_text('[core]\n autocrlf = true\n')

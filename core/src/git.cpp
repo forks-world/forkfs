@@ -28,7 +28,9 @@ int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, i
     for (char **p = environ; *p; ++p) {
         if (strncmp(*p, "GIT_", 4) || (ambient_config_probe &&
             (!strncmp(*p, "GIT_CONFIG_GLOBAL=", 18) || !strncmp(*p, "GIT_CONFIG_SYSTEM=", 18) ||
-             !strncmp(*p, "GIT_CONFIG_NOSYSTEM=", 20)))) env.emplace_back(*p);
+             !strncmp(*p, "GIT_CONFIG_NOSYSTEM=", 20) || !strncmp(*p, "GIT_CONFIG_COUNT=", 17) ||
+             !strncmp(*p, "GIT_CONFIG_KEY_", 15) || !strncmp(*p, "GIT_CONFIG_VALUE_", 17) ||
+             !strncmp(*p, "GIT_CONFIG_PARAMETERS=", 22)))) env.emplace_back(*p);
     }
     const char *settings[] = {"GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1"};
     for (const char *p : settings) env.emplace_back(const_cast<char *>(p));
@@ -360,7 +362,8 @@ int reject_ambient_policy(const char *root) {
         if (key_len >= 10 && !memcmp(listing.data() + key, "includeif.", 9) &&
             !memcmp(listing.data() + i - 5, ".path", 5)) return WFS_E_GIT_UNSUPPORTED;
         if ((scope_len == 6 && !memcmp(listing.data() + scope, "global", 6)) ||
-            (scope_len == 6 && !memcmp(listing.data() + scope, "system", 6))) return WFS_E_GIT_UNSUPPORTED;
+            (scope_len == 6 && !memcmp(listing.data() + scope, "system", 6)) ||
+            (scope_len == 7 && !memcmp(listing.data() + scope, "command", 7))) return WFS_E_GIT_UNSUPPORTED;
         ++i;
     }
     return 0;
@@ -579,7 +582,7 @@ int git_import(const GitSource &s, const char *clone) {
     String repo = joinp(owned.c_str(), "repo.git");
     // Mirror all resolvable refs, including stash, notes, remote-tracking and custom refs; a
     // bare clone omits other ref namespaces and would lose them when the source is removed.
-    const char *copy[] = {"clone", "--mirror", "--no-hardlinks", "--quiet", "--", s.root.c_str(), repo.c_str(), nullptr};
+    const char *copy[] = {"clone", "--mirror", "--no-hardlinks", "--template=", "--quiet", "--", s.root.c_str(), repo.c_str(), nullptr};
     if (int rc = git(clone, copy)) return rc;
     for (const auto &ref : s.symrefs) {
         const char *sym_args[] = {"--git-dir", repo.c_str(), "symbolic-ref", ref.name.c_str(),
@@ -613,6 +616,9 @@ int git_import(const GitSource &s, const char *clone) {
     if (!excludes.empty() && excludes.back() != '\n') excludes.emplace_back('\n');
     for (const char *reserved : {"/.world\n", "/.world-git/\n"})
         for (const char *p = reserved; *p; ++p) excludes.emplace_back(*p);
+    // Empty templates omit info/. Create only the directory needed for owned rules.
+    String info = joinp(repo.c_str(), "info");
+    if (int rc = fs_mkdir(info.c_str(), 0700)) { if (rc != -EEXIST) return rc; }
     String exclude_path = joinp(repo.c_str(), "info/exclude");
     if (int rc = write_bytes(exclude_path.c_str(), excludes.data(), excludes.size())) return rc;
     if (!s.attributes.empty()) {

@@ -120,6 +120,10 @@ allowed and remains available to ordinary Git commands in the World.
 Conditional `includeIf` directives are unsupported in any scope, even when
 inactive at capture: moving a World or switching branches can activate policies
 that were not visible before publication. Unconditional includes remain supported.
+The same policy rejection covers command configuration injected through
+`GIT_CONFIG_COUNT` and `GIT_CONFIG_PARAMETERS`. Only the read-only probe receives
+those variables; normal import commands continue to discard them. Mirror imports
+use an empty template directory so installed Git templates cannot add hooks or rules.
 
 ### External reference restrictions
 
