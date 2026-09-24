@@ -303,6 +303,70 @@ int capture_settings(const char *root, Vec<GitSetting> &out) {
     }
     return 0;
 }
+// Repository-local configuration that makes a World usable as a place to work, carried from
+// an external source into the owned repository (a mirror clone copies refs, not config):
+// remotes (URLs, refspecs, tag and prune options), branch upstreams, URL rewrites, push/fetch
+// defaults and aliases. Aliases run only when the user types them, as they would in the
+// source. Settings Git executes on its own -- hooks, remote.*.uploadpack/receivepack/vcs,
+// branch.*.mergeoptions, core.sshCommand, credential helpers -- are not carried. A relative
+// local remote path is made absolute against the source, so it keeps pointing at the same
+// repository after the source is gone.
+const char *const kCarriedConfig =
+    "^(remote\\..+\\.(url|pushurl|fetch|push|tagopt|prune|prunetags|mirror|skipdefaultupdate|skipfetchall|followremotehead)"
+    "|remotes\\..+|remote\\.pushdefault"
+    "|branch\\..+\\.(remote|merge|pushremote|rebase|description)"
+    "|url\\..+\\.(insteadof|pushinsteadof)"
+    "|push\\.(default|autosetupremote)|fetch\\.(prune|prunetags)"
+    "|alias\\..+)$";
+// Resolve "." and ".." lexically: the path must stay valid after the directory it was relative
+// to (the source) is deleted, so it cannot be resolved through that directory.
+String absolute_lexical(const char *base, const char *rel) {
+    String joined = joinp(base, rel);
+    Vec<String> parts;
+    const char *p = joined.c_str();
+    while (*p) {
+        while (*p == '/') ++p;
+        const char *start = p;
+        while (*p && *p != '/') ++p;
+        String part(start, (size_t)(p - start));
+        if (part.empty() || part == ".") continue;
+        if (part == "..") { if (!parts.empty()) parts.pop_back(); continue; }
+        parts.emplace_back(part);
+    }
+    String out;
+    for (const auto &part : parts) { out.push_back('/'); out.append(part.c_str()); }
+    if (out.empty()) out.assign("/");
+    return out;
+}
+bool is_relative_local_url(const char *url) {
+    if (!*url || url[0] == '/' || url[0] == '~' || strstr(url, "://")) return false;
+    const char *colon = strchr(url, ':'), *slash = strchr(url, '/');
+    if (colon && (!slash || colon < slash)) return false; // scp-like host:path
+    return true;
+}
+int capture_carried_config(const char *root, Vec<GitSetting> &out) {
+    out.clear();
+    const char *args[] = {"config", "--local", "--includes", "--null", "--get-regexp", kCarriedConfig, nullptr};
+    Vec<char> listing; int status = -1;
+    int rc = git(root, args, &listing, &status);
+    if (rc == WFS_E_GIT_FAILED && status == 1) return 0;
+    if (rc) return rc;
+    // Entries are "<key>\n<value>\0"; a valueless key has no newline.
+    for (size_t i = 0; i < listing.size() && listing[i];) {
+        const char *entry = listing.data() + i;
+        size_t len = strlen(entry);
+        i += len + 1;
+        const char *nl = strchr(entry, '\n');
+        String key(entry, nl ? (size_t)(nl - entry) : len), val(nl ? nl + 1 : "");
+        size_t klen = key.size();
+        bool url = !strncmp(key.c_str(), "remote.", 7) &&
+                   ((klen > 4 && !strcmp(key.c_str() + klen - 4, ".url")) ||
+                    (klen > 8 && !strcmp(key.c_str() + klen - 8, ".pushurl")));
+        if (url && is_relative_local_url(val.c_str())) val = absolute_lexical(root, val.c_str());
+        out.emplace_back(GitSetting{key, val});
+    }
+    return 0;
+}
 // The identity later World commits are attributed with. Captured with the other settings and
 // rechecked before publication, so a World never keeps an identity the source no longer has.
 int capture_identity(const char *root, Vec<GitSetting> &out) {
@@ -947,6 +1011,11 @@ int source_unchanged(const GitSource &s) {
     bool worktree_config = false; Vec<GitSetting> worktree_settings;
     if (int wt_rc = capture_worktree_config(s.root.c_str(), worktree_config, worktree_settings)) return wt_rc;
     if (worktree_config != s.worktree_config || !same_settings(worktree_settings, s.worktree_settings)) return -EBUSY;
+    if (!s.managed) {
+        Vec<GitSetting> carried;
+        if (int carry_rc = capture_carried_config(s.root.c_str(), carried)) return carry_rc;
+        if (!same_settings(carried, s.carried)) return -EBUSY;
+    }
     Vec<char> direct_refs; if (int ref_rc = capture_refs(s.root.c_str(), direct_refs)) return ref_rc;
     if (!same_bytes(direct_refs, s.refs)) return -EBUSY;
     bool orig_present; String orig; if (int orig_rc = capture_orig(s.root.c_str(), orig_present, orig)) return orig_rc;
@@ -1038,6 +1107,9 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     if (int policy_rc = capture_settings(root, out.settings)) return policy_rc;
     if (int identity_rc = capture_identity(root, out.identity)) return identity_rc;
     if (int wt_rc = capture_worktree_config(root, out.worktree_config, out.worktree_settings)) return wt_rc;
+    if (!out.managed) {
+        if (int carry_rc = capture_carried_config(root, out.carried)) return carry_rc;
+    }
     if (out.managed) {
         // A managed copy has byte-identical configuration files and import commands ignore
         // global/system scope, so the effective list can only differ through an include that
@@ -1303,9 +1375,14 @@ int git_import(const GitSource &s, const char *clone) {
         const char *orig_args[] = {"update-ref", "ORIG_HEAD", s.orig_head.c_str(), nullptr};
         if (int rc = git(clone, orig_args)) return rc;
     }
-    // A clone is local and self-contained; its remote is not an implicit write-back channel.
+    // The mirror's own remote points at the source: it is not an implicit write-back channel and
+    // is removed. The source's own remotes, upstreams and aliases are carried instead.
     const char *remote[] = {"config", "--local", "--remove-section", "remote.origin", nullptr};
     if (int rc = git(clone, remote)) return rc;
+    for (const auto &setting : s.carried) {
+        const char *args[] = {"config", "--local", "--add", setting.key.c_str(), setting.value.c_str(), nullptr};
+        if (int rc = git(clone, args)) return rc;
+    }
     Vec<char> imported_refs;
     if (int rc = capture_refs(clone, imported_refs)) return rc;
     if (!same_bytes(imported_refs, s.refs)) return -EBUSY;

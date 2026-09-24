@@ -1095,6 +1095,64 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(self.source, 'rev-parse', 'refs/custom/raced').stdout.decode().strip(), advanced)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
+    def test_remotes_upstreams_and_aliases_travel_into_the_world(self):
+        upstream = self.root / 'upstream.git'
+        self.git(self.root, 'clone', '-q', '--bare', str(self.source), str(upstream))
+        self.git(self.source, 'remote', 'add', 'origin', 'https://example.invalid/team/repo.git')
+        self.git(self.source, 'config', 'remote.origin.pushurl', 'git@example.invalid:team/repo.git')
+        self.git(self.source, 'config', '--add', 'remote.origin.fetch', '+refs/tags/*:refs/tags/*')
+        self.git(self.source, 'remote', 'add', 'up', '../upstream.git')
+        self.git(self.source, 'fetch', '-q', 'up')
+        self.git(self.source, 'config', 'branch.main.remote', 'up')
+        self.git(self.source, 'config', 'branch.main.merge', 'refs/heads/main')
+        self.git(self.source, 'config', 'url.https://mirror.invalid/.insteadOf', 'https://slow.invalid/')
+        self.git(self.source, 'config', 'push.autoSetupRemote', 'true')
+        self.git(self.source, 'config', 'alias.st', 'status --short')
+        # Settings Git would execute on its own are not carried.
+        self.git(self.source, 'config', 'remote.origin.uploadpack', 'touch uploadpack-ran; git-upload-pack')
+        self.git(self.source, 'config', 'core.hooksPath', '.husky')
+        self.git(self.source, 'config', 'branch.main.mergeOptions', '--no-ff')
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        get = lambda *key: self.git(one, 'config', *key).stdout.decode().split('\n')[:-1]
+        self.assertEqual(get('--get', 'remote.origin.url'), ['https://example.invalid/team/repo.git'])
+        self.assertEqual(get('--get', 'remote.origin.pushurl'), ['git@example.invalid:team/repo.git'])
+        self.assertEqual(get('--get-all', 'remote.origin.fetch'),
+                         ['+refs/heads/*:refs/remotes/origin/*', '+refs/tags/*:refs/tags/*'])
+        self.assertEqual(get('--get', 'remote.up.url'), [str(upstream)])
+        self.assertEqual(get('--get', 'branch.main.remote'), ['up'])
+        self.assertEqual(get('--get', 'branch.main.merge'), ['refs/heads/main'])
+        self.assertEqual(get('--get', 'url.https://mirror.invalid/.insteadof'), ['https://slow.invalid/'])
+        self.assertEqual(get('--type=bool', '--get', 'push.autosetupremote'), ['true'])
+        self.assertEqual(self.git(one, 'st').stdout, b'')
+        for key in ('remote.origin.uploadpack', 'core.hooksPath', 'branch.main.mergeoptions'):
+            self.git(one, 'config', '--get', key, code=1)
+        # The World's own branch has no upstream, so nothing is pushed to main by accident.
+        self.git(one, 'config', '--get', 'branch.world/W1.remote', code=1)
+        # The relative remote still reaches the same repository after the source is gone.
+        self.git(one, 'fetch', '-q', 'up')
+        self.assertEqual(self.git(one, 'rev-parse', 'refs/remotes/up/main').stdout.strip(), self.base)
+        self.assertFalse((one / 'uploadpack-ran').exists())
+
+    def test_remote_change_during_mirror_aborts_publication(self):
+        import shlex
+        self.git(self.source, 'remote', 'add', 'origin', 'https://example.invalid/before.git')
+        real_git = shutil.which('git')
+        wrapper = self.root / 'remote-race-bin'
+        wrapper.mkdir()
+        script = wrapper / 'git'
+        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = --mirror ] && mirror=1; done\n'
+                          + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
+                          + 'if [ "$result" = 0 ] && [ "$mirror" = 1 ]; then\n'
+                          + shlex.quote(real_git) + ' -C ' + shlex.quote(str(self.source))
+                          + ' remote set-url origin https://example.invalid/after.git || exit $?\n'
+                          + 'fi\nexit "$result"\n')
+        script.chmod(0o700)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        self.world('init', str(self.source), code=1)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_fetch_head_only_tip_survives_source_deletion(self):
         remote = self.root / 'fetch-remote'
         remote.mkdir()

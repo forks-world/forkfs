@@ -46,7 +46,20 @@ administration names. Source hooks and local executable
 Git settings are not imported. Local `user.name` and `user.email` are preserved, and so is an
 identity a conditional include supplies at the source's location; normal Git commands in a
 World also use the user's usual Git configuration. Import does not create a
-remote back to the source. Fetching/pushing requires explicitly configuring a remote.
+remote back to the source.
+
+The source's repository-local remotes travel into the World: remote URLs, push URLs,
+fetch and push refspecs, tag and prune options, remote groups, branch upstreams
+(`branch.<name>.remote`/`merge`/`pushRemote`/`rebase`), `url.<base>.insteadOf` rewrites,
+`remote.pushDefault`, `push.default`, `push.autoSetupRemote`, `fetch.prune` and aliases.
+`git fetch origin` and `git push origin <branch>` therefore work in a World as in the
+source; nothing is fetched or pushed automatically, and the World's own `world/W<n>` branch
+starts without an upstream. A relative local remote path is made absolute against the
+source, so it keeps reaching the same repository after the source is deleted. Settings Git
+runs on its own are not carried: hooks and `core.hooksPath`, `remote.<name>.uploadpack`,
+`receivepack` and `vcs`, `branch.<name>.mergeOptions`, `core.sshCommand` and credential
+helpers (a global credential helper still applies). These settings are rechecked before
+publication like the rest of the captured state.
 
 ## Uncommitted content
 
