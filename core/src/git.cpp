@@ -1479,6 +1479,45 @@ int capture_hooks(const char *root, Vec<GitHook> &out, bool &path_present, Strin
             path.assign(resolved.c_str() + n + 1);
         else path = resolved;
     }
+    if (path_present) {
+        // With core.hooksPath set, Git runs hooks from there and never from the default
+        // directory, so that is the only one that matters. An in-tree directory travels with the
+        // tree, so nothing is copied, but every component and every entry in it is checked
+        // without following links: a symlinked `.husky` or hook would make the World execute a
+        // mutable target outside it. An absolute or `~` directory is outside the tree and is used
+        // as the source used it, which is what --with-hooks opts into.
+        if (path.empty() || path[0] == '/' || path[0] == '~') return 0;
+        String real_root;
+        if (int rc = fs_realpath(root, real_root)) return rc;
+        String walk(real_root);
+        const char *p = path.c_str();
+        while (*p) {
+            while (*p == '/') ++p;
+            const char *start = p;
+            while (*p && *p != '/') ++p;
+            if (p == start) break;
+            String part(start, (size_t)(p - start));
+            if (part == ".") continue;
+            walk = joinp(walk.c_str(), part.c_str());
+            struct stat st;
+            if (lstat(walk.c_str(), &st)) return errno == ENOENT ? 0 : -errno;
+            if (S_ISLNK(st.st_mode))
+                return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s goes through a symlink (%s)", path.c_str(), walk.c_str());
+            if (!S_ISDIR(st.st_mode)) return 0;
+        }
+        int dfd = open(walk.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (dfd < 0) return errno == ENOENT ? 0 : -errno;
+        Vec<String> entries;
+        int lrc = list_names(dfd, entries);
+        for (size_t i = 0; !lrc && i < entries.size(); ++i) {
+            struct stat st;
+            if (fstatat(dfd, entries[i].c_str(), &st, AT_SYMLINK_NOFOLLOW)) { lrc = -errno; break; }
+            if (S_ISLNK(st.st_mode))
+                lrc = refuse(WFS_E_GIT_UNSUPPORTED, "hook %s/%s is a symlink; --with-hooks carries only regular files", path.c_str(), entries[i].c_str());
+        }
+        close(dfd);
+        return lrc;
+    }
     String dir;
     if (int rc = hooks_dir(root, dir)) return rc;
     int fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);

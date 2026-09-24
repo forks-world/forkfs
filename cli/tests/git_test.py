@@ -453,6 +453,24 @@ class GitWorldTest(unittest.TestCase):
         self.commit_in(one, 'shared hook runs')
         self.assertEqual(self.hook_runs(marker), ['shared ' + str(one)])
 
+    def test_with_hooks_refuses_symlinks_under_an_in_tree_hooks_path(self):
+        outside = self.root / 'outside-hooks'
+        outside.mkdir()
+        (outside / 'pre-commit').write_text('#!/bin/sh\nexit 0\n')
+        (outside / 'pre-commit').chmod(0o755)
+        self.git(self.source, 'config', 'core.hooksPath', '.husky')
+        with self.subTest(case='symlinked hooks directory'):
+            (self.source / '.husky').symlink_to(outside)
+            result = self.world('init', str(self.source), '--with-hooks', '--include-changes', code=3)
+            self.assertIn(b'core.hooksPath .husky goes through a symlink', result.stderr)
+            (self.source / '.husky').unlink()
+        with self.subTest(case='symlinked hook'):
+            (self.source / '.husky').mkdir()
+            (self.source / '.husky' / 'pre-commit').symlink_to(outside / 'pre-commit')
+            result = self.world('init', str(self.source), '--with-hooks', '--include-changes', code=3)
+            self.assertIn(b'hook .husky/pre-commit is a symlink', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_with_hooks_refuses_symlinked_hooks(self):
         marker = self.root / 'hooks-ran'
         target = self.root / 'elsewhere' / 'pre-commit'
