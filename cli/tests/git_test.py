@@ -339,6 +339,125 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'--committed-only needs --from W<n>', snap.stderr)
         self.assertFalse((self.root / 'snap').exists())
 
+    def write_hook(self, path, marker, name=None, mode=0o755):
+        import shlex
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('#!/bin/sh\necho "%s $(pwd -P)" >> %s\n' % (name or path.name, shlex.quote(str(marker))))
+        path.chmod(mode)
+
+    def hook_runs(self, marker):
+        return marker.read_text().splitlines() if marker.exists() else []
+
+    def commit_in(self, world, message):
+        (world / 'file').write_text(message + '\n')
+        self.git(world, 'commit', '-qam', message)
+
+    def test_hooks_are_left_behind_with_a_note(self):
+        marker = self.root / 'hooks-ran'
+        # The template's .sample files are not hooks: no note.
+        plain = self.world('init', str(self.source))
+        self.assertNotIn(b'--with-hooks', plain.stderr)
+        self.write_hook(self.source / '.git' / 'hooks' / 'pre-commit', marker)
+        noted = self.world('init', str(self.source))
+        notes = [line for line in noted.stderr.splitlines() if b'--with-hooks' in line]
+        self.assertEqual(len(notes), 1, noted.stderr)
+        self.assertIn(b'note:', notes[0])
+        one, _ = self.fork('one', 'S2')
+        self.assertFalse((one / '.world-git' / 'repo.git' / 'hooks' / 'pre-commit').exists())
+        self.commit_in(one, 'no hook')
+        self.assertEqual(self.hook_runs(marker), [])
+        # A repository-local core.hooksPath (husky) is noted too.
+        (self.source / '.git' / 'hooks' / 'pre-commit').unlink()
+        self.git(self.source, 'config', 'core.hooksPath', '.husky')
+        self.assertIn(b'--with-hooks', self.world('init', str(self.source)).stderr)
+        two, _ = self.fork('two', 'S3')
+        self.git(two, 'config', '--get', 'core.hooksPath', code=1)
+
+    def test_with_hooks_carries_project_hooks_without_running_them(self):
+        marker = self.root / 'hooks-ran'
+        hooks = self.source / '.git' / 'hooks'
+        for name in ('pre-commit', 'post-checkout', 'reference-transaction', 'post-index-change'):
+            self.write_hook(hooks / name, marker)
+        self.write_hook(hooks / 'prepare-commit-msg', marker, mode=0o644)   # Git would not run it
+        init = self.world('init', str(self.source), '--with-hooks')
+        self.assertNotIn(b'--with-hooks', init.stderr)
+        one, wid = self.fork()
+        carried = one / '.world-git' / 'repo.git' / 'hooks'
+        self.assertEqual(sorted(p.name for p in carried.iterdir()),
+                         ['post-checkout', 'post-index-change', 'pre-commit', 'reference-transaction'])
+        self.assertEqual((carried / 'pre-commit').read_bytes(), (hooks / 'pre-commit').read_bytes())
+        self.assertTrue(os.access(carried / 'pre-commit', os.X_OK))
+        # Neither the import nor the fork ran a hook, though both write refs and indexes.
+        self.assertEqual(self.hook_runs(marker), [])
+        self.commit_in(one, 'first')
+        self.assertIn('pre-commit ' + str(one), self.hook_runs(marker))
+        # Worlds forked or checkpointed from a World keep its hooks, and still run none.
+        before = self.hook_runs(marker)
+        two, _ = self.fork('two', wid)
+        self.world('checkpoint', wid)
+        three, _ = self.fork('three', 'S2')
+        self.assertEqual(self.hook_runs(marker), before)
+        for world in (two, three):
+            self.commit_in(world, world.name)
+            self.assertIn('pre-commit ' + str(world), self.hook_runs(marker))
+        # --with-hooks needs a repository.
+        plain = self.root / 'plain'
+        plain.mkdir()
+        refused = self.world('init', str(plain), '--with-hooks', code=3)
+        self.assertIn(b'reason: --with-hooks needs a Git repository', refused.stderr)
+
+    def test_with_hooks_carries_a_relative_hooks_path(self):
+        marker = self.root / 'hooks-ran'
+        self.write_hook(self.source / '.husky' / 'pre-commit', marker, 'husky')
+        self.git(self.source, 'add', '.husky')
+        self.git(self.source, 'commit', '-qm', 'husky')
+        self.git(self.source, 'config', 'core.hooksPath', '.husky')
+        self.world('init', str(self.source), '--with-hooks')
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'config', '--get', 'core.hooksPath').stdout.strip(), b'.husky')
+        self.assertEqual(self.hook_runs(marker), [])
+        self.commit_in(one, 'husky runs')
+        self.assertEqual(self.hook_runs(marker), ['husky ' + str(one)])
+
+    def test_with_hooks_refuses_symlinked_hooks(self):
+        marker = self.root / 'hooks-ran'
+        target = self.root / 'elsewhere' / 'pre-commit'
+        self.write_hook(target, marker)
+        hooks = self.source / '.git' / 'hooks'
+        (hooks / 'pre-commit').symlink_to(target)
+        refused = self.world('init', str(self.source), '--with-hooks', code=3)
+        self.assertIn(b'reason: hook pre-commit is a symlink', refused.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        # Left behind by default, with the note.
+        self.assertIn(b'--with-hooks', self.world('init', str(self.source)).stderr)
+        shutil.rmtree(hooks)
+        hooks.symlink_to(target.parent)
+        refused = self.world('init', str(self.source), '--with-hooks', code=3)
+        self.assertIn(b'is a symlink or not a directory', refused.stderr)
+        self.assertEqual(len(json.loads(self.world('list', '--json').stdout)['snapshots']), 1)
+        self.assertEqual(self.hook_runs(marker), [])
+
+    def test_hook_change_during_mirror_aborts_publication(self):
+        import shlex
+        marker = self.root / 'hooks-ran'
+        hook = self.source / '.git' / 'hooks' / 'pre-commit'
+        self.write_hook(hook, marker)
+        real_git = shutil.which('git')
+        wrapper = self.root / 'hook-race-bin'
+        wrapper.mkdir()
+        script = wrapper / 'git'
+        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = --mirror ] && mirror=1; done\n'
+                          + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
+                          + 'if [ "$result" = 0 ] && [ "$mirror" = 1 ]; then\n'
+                          + 'printf "exit 1\\n" >> ' + shlex.quote(str(hook)) + ' || exit $?\n'
+                          + 'fi\nexit "$result"\n')
+        script.chmod(0o700)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        self.world('init', str(self.source), '--with-hooks', code=1)
+        self.assertTrue(hook.read_text().endswith('exit 1\n'))
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_linked_source_can_be_deleted_after_import(self):
         linked = self.root / 'linked'
         self.git(self.source, 'worktree', 'add', '-b', 'linked', str(linked))

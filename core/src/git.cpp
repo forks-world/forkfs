@@ -1440,6 +1440,76 @@ int restore_rerere(const char *repo, const Vec<char> &blob) {
     }
     return 0;
 }
+// Project hooks, for --with-hooks. Git runs only executable files of the hooks directory, and
+// the directory is the common one even for a linked worktree. A symlinked directory or hook
+// would make the World run whatever the link reaches later, possibly outside it, so it is
+// refused rather than followed; `.sample` files, subdirectories, special files and files Git
+// would not execute are left out. A repository-local core.hooksPath travels verbatim: a
+// relative one (husky's `.husky`) names a directory of the World's own tree, and an absolute
+// one is what the user opted into. Only local scope counts -- global configuration is shared.
+bool is_sample(const char *name) {
+    size_t n = strlen(name);
+    return n >= 7 && !strcmp(name + n - 7, ".sample");
+}
+int hooks_dir(const char *root, String &out) {
+    String common;
+    const char *args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
+    if (int rc = value(root, args, common)) return rc;
+    out = joinp(common.c_str(), "hooks");
+    return 0;
+}
+int local_hooks_path(const char *root, bool &present, String &path) {
+    const char *args[] = {"config", "--local", "--includes", "--get", "core.hooksPath", nullptr};
+    return get_config(root, args, path, &present);
+}
+int capture_hooks(const char *root, Vec<GitHook> &out, bool &path_present, String &path) {
+    out.clear();
+    if (int rc = local_hooks_path(root, path_present, path)) return rc;
+    String dir;
+    if (int rc = hooks_dir(root, dir)) return rc;
+    int fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) return 0;
+        return errno == ENOTDIR || errno == ELOOP
+            ? refuse(WFS_E_GIT_UNSUPPORTED, "the hooks directory %s is a symlink or not a directory", dir.c_str()) : -errno;
+    }
+    Vec<String> names;
+    int rc = list_names(fd, names);
+    for (size_t i = 0; !rc && i < names.size(); ++i) {
+        const char *name = names[i].c_str();
+        if (is_sample(name)) continue;
+        struct stat st;
+        if (fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW)) { rc = -errno; break; }
+        if (S_ISLNK(st.st_mode)) { rc = refuse(WFS_E_GIT_UNSUPPORTED, "hook %s is a symlink; --with-hooks copies only regular files", name); break; }
+        if (!S_ISREG(st.st_mode) || !(st.st_mode & 0111)) continue;
+        GitHook hook;
+        hook.name.assign(name);
+        hook.mode = (uint32_t)(st.st_mode & 0777);
+        String p = joinp(dir.c_str(), name);
+        if ((rc = read_bytes(p.c_str(), hook.bytes))) break;
+        out.emplace_back(hook);
+    }
+    close(fd);
+    return rc;
+}
+bool same_hooks(const Vec<GitHook> &a, const Vec<GitHook> &b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].name != b[i].name || a[i].mode != b[i].mode || !same_bytes(a[i].bytes, b[i].bytes)) return false;
+    return true;
+}
+int install_hooks(const GitSource &s, const char *clone, const char *repo) {
+    if (!s.hooks.empty()) {
+        String dir = joinp(repo, "hooks");
+        if (int rc = fs_mkdir(dir.c_str(), 0755)) { if (rc != -EEXIST) return rc; }
+        for (const auto &hook : s.hooks) {
+            String p = joinp(dir.c_str(), hook.name.c_str());
+            if (int rc = write_bytes(p.c_str(), hook.bytes.data(), hook.bytes.size())) return rc;
+            if (chmod(p.c_str(), (mode_t)hook.mode)) return -errno;
+        }
+    }
+    return s.hooks_path_present ? config(clone, "core.hooksPath", s.hooks_path.c_str()) : 0;
+}
 // GIT_OPTIONAL_LOCKS=0 (set by git()) keeps status from refreshing the index it inspects.
 int require_clean_tree(const char *root) {
     const char *args[] = {"status", "--porcelain=v1", "-z", "--untracked-files=normal",
@@ -1591,6 +1661,11 @@ int source_unchanged(const GitSource &s) {
         if (int carry_rc = capture_carried_config(s.root.c_str(), carried)) return carry_rc;
         if (!same_settings(carried, s.carried)) return -EBUSY;
     }
+    if (s.with_hooks && !s.managed) {
+        Vec<GitHook> hooks; bool path_present = false; String path;
+        if (int hook_rc = capture_hooks(s.root.c_str(), hooks, path_present, path)) return hook_rc;
+        if (!same_hooks(hooks, s.hooks) || path_present != s.hooks_path_present || path != s.hooks_path) return -EBUSY;
+    }
     Vec<char> direct_refs; if (int ref_rc = capture_refs(s.root.c_str(), direct_refs)) return ref_rc;
     if (!same_bytes(direct_refs, s.refs)) return -EBUSY;
     bool orig_present; String orig; if (int orig_rc = capture_orig(s.root.c_str(), orig_present, orig)) return orig_rc;
@@ -1654,7 +1729,7 @@ int reject_reserved_paths(const char *root, const GitSource &s) {
     if (int rc = git(root, args.data(), &hit)) return rc;
     return hit.size() > 1 ? refuse(WFS_E_GIT_UNSUPPORTED, "a preserved commit tracks the reserved path .world or .world-git") : 0;
 }
-int git_source(const char *root, bool include_changes, GitSource &out, bool committed_only) {
+int git_source(const char *root, bool include_changes, GitSource &out, bool committed_only, bool with_hooks) {
     g_reason[0] = '\0';
     if (include_changes && committed_only) return -EINVAL;
     if (int rc = nested_check(root)) return rc;
@@ -1663,8 +1738,11 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
     bool has_managed = lstat(managed.c_str(), &st) == 0;
     if (!has_managed && errno != ENOENT) return -errno;
     if (lstat(dot.c_str(), &st)) {
-        if (errno == ENOENT && !has_managed)
-            return committed_only ? refuse(WFS_E_GIT_UNSUPPORTED, "--committed-only needs a Git repository at the source root") : 0;
+        if (errno == ENOENT && !has_managed) {
+            if (committed_only) return refuse(WFS_E_GIT_UNSUPPORTED, "--committed-only needs a Git repository at the source root");
+            if (with_hooks) return refuse(WFS_E_GIT_UNSUPPORTED, "--with-hooks needs a Git repository at the source root");
+            return 0;
+        }
         return refuse(WFS_E_GIT_UNSUPPORTED, ".world-git exists without its .git marker");
     }
     if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) return refuse(WFS_E_GIT_UNSUPPORTED, ".git is neither a directory nor a file");
@@ -1688,6 +1766,11 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
     if (int wt_rc = capture_worktree_config(root, out.worktree_config, out.worktree_settings)) return wt_rc;
     if (!out.managed) {
         if (int carry_rc = capture_carried_config(root, out.carried)) return carry_rc;
+    }
+    // A managed World's hooks and core.hooksPath are already part of the .world-git it clones.
+    out.with_hooks = with_hooks;
+    if (with_hooks && !out.managed) {
+        if (int hook_rc = capture_hooks(root, out.hooks, out.hooks_path_present, out.hooks_path)) return hook_rc;
     }
     if (out.managed) {
         // A managed copy has byte-identical configuration files and import commands ignore
@@ -1976,6 +2059,10 @@ int git_import(const GitSource &s, const char *clone) {
         const char *args[] = {"config", "--local", "--add", setting.key.c_str(), setting.value.c_str(), nullptr};
         if (int rc = git(clone, args)) return rc;
     }
+    // Installed, never run: every command here passes core.hooksPath=/dev/null.
+    if (s.with_hooks) {
+        if (int rc = install_hooks(s, clone, repo.c_str())) return rc;
+    }
     Vec<char> imported_refs;
     if (int rc = capture_refs(clone, imported_refs)) return rc;
     if (!same_bytes(imported_refs, s.refs)) return -EBUSY;
@@ -2161,6 +2248,33 @@ int branch_checked_out(const char *repo, const String &ref, bool &out) {
 }
 
 extern "C" const char *wfs_git_reason(void) { return wfs::g_reason; }
+
+extern "C" int wfs_git_uncarried_hooks(const char *root) {
+    if (!root) return -EINVAL;
+    wfs::String dot = wfs::joinp(root, ".git"), owned = wfs::joinp(root, ".world-git");
+    struct stat st;
+    if (lstat(dot.c_str(), &st)) return errno == ENOENT ? 0 : -errno;
+    if (!lstat(owned.c_str(), &st)) return 0;   // a managed World's hooks travel with it
+    if (errno != ENOENT) return -errno;
+    bool present = false; wfs::String path;
+    if (int rc = wfs::local_hooks_path(root, present, path)) return rc;
+    if (present) return 1;
+    wfs::String dir;
+    if (int rc = wfs::hooks_dir(root, dir)) return rc;
+    // Anything --with-hooks would carry or refuse to follow is worth the note.
+    DIR *d = opendir(dir.c_str());
+    if (!d) return errno == ENOENT || errno == ENOTDIR ? 0 : -errno;
+    int found = 0;
+    for (;;) {
+        errno = 0; dirent *e = readdir(d);
+        if (!e) { if (errno) found = -errno; break; }
+        if (e->d_name[0] == '.' || wfs::is_sample(e->d_name)) continue;
+        if (fstatat(dirfd(d), e->d_name, &st, AT_SYMLINK_NOFOLLOW)) continue;
+        if (S_ISLNK(st.st_mode) || (S_ISREG(st.st_mode) && (st.st_mode & 0111))) { found = 1; break; }
+    }
+    closedir(d);
+    return found;
+}
 
 extern "C" int wfs_git_inspect(const char *root, wfs_git_info *out) {
     if (!root || !out) return -EINVAL;

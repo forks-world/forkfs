@@ -1200,7 +1200,8 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         if (int rc = exec_lock_guard(s, from_world, o.force)) return rc;
     }
     wfs::GitSource git_source;
-    if (int rc = wfs::git_source(src.c_str(), o.include_changes != 0, git_source, o.committed_only != 0)) return rc;
+    if (int rc = wfs::git_source(src.c_str(), o.include_changes != 0, git_source, o.committed_only != 0,
+                                   o.with_hooks != 0)) return rc;
 
     // P6: st_dev equality does not predict clonefile success, so really clone something.
     if (int rc = wfs_store_clone_probe(s, src.c_str())) return rc;

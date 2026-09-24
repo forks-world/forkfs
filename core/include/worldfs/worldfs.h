@@ -315,6 +315,12 @@ typedef struct wfs_snapshot_opts {
      * still carried). Only the copy is reset, never the source. Exclusive with
      * include_changes (-EINVAL); a source without a Git repository is refused. */
     int committed_only;
+    /* Carry the source repository's project hooks: its executable, regular, non-.sample hook
+     * files and a repository-local core.hooksPath (a relative one names a directory of the
+     * tree). A symlinked hook or hooks directory is refused rather than followed. Hooks never
+     * run during WorldFS's own Git commands. Without it hooks are left behind (see
+     * wfs_git_uncarried_hooks); a World forked from a World always keeps its own. */
+    int with_hooks;
 } wfs_snapshot_opts;
 
 /* init and checkpoint are the same operation: clone src_dir into the store and protect it.
@@ -383,6 +389,12 @@ typedef struct wfs_git_info {
     char git_dir[WFS_PATH_MAX]; /* common directory inside this World */
 } wfs_git_info;
 int wfs_git_inspect(const char *root, wfs_git_info *out);
+
+/* 1 when `root` is an external Git repository with project hooks -- executable non-.sample
+ * files (or symlinks) in its hooks directory, or a repository-local core.hooksPath -- that an
+ * import without with_hooks leaves behind; 0 when it has none, is a managed World (whose hooks
+ * always travel with it) or is not a repository; a negative errno on failure. */
+int wfs_git_uncarried_hooks(const char *root);
 
 /* Copy a Git World's commits into another repository -- by default the directory the World was
  * imported from -- as refs/heads/<branch>, with `git fetch`. Nothing else in that repository

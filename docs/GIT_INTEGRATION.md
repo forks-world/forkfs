@@ -43,7 +43,7 @@ by the World, including staged blobs which have not yet appeared in any commit.
 `info/exclude`; source-local `info/exclude` rules are preserved before those reserved entries
 are appended. Source-local `info/attributes` rules are also preserved. These are reserved
 administration names. Source hooks and local executable
-Git settings are not imported. Local `user.name` and `user.email` are preserved, and so is an
+Git settings are not imported by default (see [Project hooks](#project-hooks)). Local `user.name` and `user.email` are preserved, and so is an
 identity a conditional include supplies at the source's location; normal Git commands in a
 World also use the user's usual Git configuration. Import does not create a
 remote back to the source.
@@ -108,10 +108,35 @@ URL, could contact a push URL twice, or (via the rewrite pass above) send the Wo
 different endpoint than the source actually reaches. Keep all of a carried remote's settings,
 including its URLs, in the repository-local configuration only.
 Settings Git
-runs on its own are not carried: hooks and `core.hooksPath`, `remote.<name>.uploadpack`,
+runs on its own are not carried: hooks and `core.hooksPath` (unless `--with-hooks`), `remote.<name>.uploadpack`,
 `receivepack` and `vcs`, `branch.<name>.mergeOptions`, `core.sshCommand` and credential
 helpers (a global credential helper still applies). These settings are rechecked before
 publication like the rest of the captured state.
+
+## Project hooks
+
+Hooks are not carried by default, so commits in a World skip the project's hooks. When the
+source has any -- executable, non-`.sample` files (or symlinks) in its hooks directory, or a
+repository-local `core.hooksPath` such as husky's `.husky` -- `init` says so in one `note:`
+line on stderr that names `--with-hooks`.
+
+`world fs init <dir> --with-hooks` carries them into the owned repository:
+
+- the executable, regular, non-`.sample` files of the source's hooks directory (the common
+  one, also for a linked worktree) are copied into `.world-git/repo.git/hooks` with their
+  modes; files Git would not run (not executable), subdirectories and special files are not;
+- a repository-local `core.hooksPath` is set in the World verbatim. A relative value refers to
+  the World's own tree (hooks run at the worktree root), so `.husky` works as-is; an absolute
+  value is kept as the user opted into it. A global `core.hooksPath` needs no carrying: global
+  configuration is shared.
+
+A symlinked hook, or a symlinked hooks directory, is refused with a reason rather than
+followed: the World would otherwise run whatever the link reaches later. The captured hooks
+and `core.hooksPath` are rechecked before publication like the rest of the captured state,
+so a hook changed during the import aborts it. Hooks never run during WorldFS's own Git
+commands (import, fork, checkpoint, publish): every one of them sets `core.hooksPath=/dev/null`.
+Worlds forked or checkpointed from a World keep its hooks, since its whole `.world-git`
+(hooks directory and configuration included) is cloned with it.
 
 ## Getting work back to the source
 
@@ -258,7 +283,7 @@ content, including Git administrative changes such as branch/index updates.
   A failed Git command does not publish a World or change the source repository; existing
   temporary-tree recovery handles interrupted work. No new store schema is introduced.
 
-Validation: `cli_git_test` uses disposable real repositories and covers clean/dirty imports, committed-only imports,
+Validation: `cli_git_test` uses disposable real repositories and covers clean/dirty imports, committed-only imports, opt-in hooks,
 staging preservation, imported linked worktrees after source deletion, independent commits,
 branch collisions, detached HEAD, move/discard/restore/checkpoint, hard snapshots, pool
 refusal, Git setup rollback, environment isolation and Git commits inside the exec sandbox.

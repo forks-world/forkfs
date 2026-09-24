@@ -34,9 +34,10 @@ enum { EX_OK = 0, EX_ERR = 1, EX_USAGE = 2, EX_REFUSED = 3 };
 
 static void usage(int code = EX_USAGE) {
     fputs("usage: world fs <command>\n"
-          "  init <dir> [--name N] [--hard] [--include-changes|--committed-only]\n"
+          "  init <dir> [--name N] [--hard] [--include-changes|--committed-only] [--with-hooks]\n"
           "                                   snapshot <dir> as S<n> (the root is gated 0000;\n"
-          "                                   --hard is macOS-only: UF_IMMUTABLE per entry)\n"
+          "                                   --hard is macOS-only: UF_IMMUTABLE per entry;\n"
+          "                                   --with-hooks carries the repository's Git hooks)\n"
           "  fork [--from W<n>|S<n>] [--to <path>] [--name N] [--copy] [--force] [--no-pool]\n"
           "       [--include-changes|--committed-only]\n"
           "                                   clone into a writable world (default ~/worlds/W<n>/<name>);\n"
@@ -356,6 +357,7 @@ static int cmd_init(wfs_store *s, int argc, char **argv) {
         else if (!strcmp(argv[i], "--hard")) opts.hard = 1;
         else if (!strcmp(argv[i], "--include-changes")) opts.include_changes = 1;
         else if (!strcmp(argv[i], "--committed-only")) opts.committed_only = 1;
+        else if (!strcmp(argv[i], "--with-hooks")) opts.with_hooks = 1;
         else if (argv[i][0] != '-' && !dir) dir = argv[i];
         else usage();
     }
@@ -388,6 +390,13 @@ static int cmd_init(wfs_store *s, int argc, char **argv) {
     } else {
         printf("S%llu\n", (unsigned long long)id);
     }
+    // Hooks are left behind unless asked for, which silently skips husky/pre-commit checks on
+    // World commits; say so once, with the way to carry them.
+    if (!opts.with_hooks && wfs_git_uncarried_hooks(dir) == 1)
+        fprintf(stderr,
+                "world: note: %s has Git hooks (hooks directory or core.hooksPath) that S%llu does "
+                "not carry, so commits in its Worlds skip them; pass --with-hooks to carry them\n",
+                dir, (unsigned long long)id);
     return EX_OK;
 }
 
