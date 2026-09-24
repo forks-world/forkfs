@@ -116,7 +116,8 @@ refusal, Git setup rollback, environment isolation and Git commits inside the ex
 Imports preserve effective repository settings for `core.autocrlf`, `core.eol`,
 `core.safecrlf`, `core.filemode`, `core.symlinks`, `core.ignorecase`,
 `core.precomposeunicode`, `core.trustctime`, `core.checkstat`, `core.ignorestat`,
-and `core.checkRoundtripEncoding`. Included and worktree-specific values are
+`core.checkRoundtripEncoding`, and `core.useReplaceRefs` (mirrored `refs/replace/*`
+must keep the meaning the source gave them). Included and worktree-specific values are
 captured; boolean values are normalized without losing valueless true settings.
 Absent settings stay absent in the owned repository. The policy is checked again
 before publication along with the source index and local rules.

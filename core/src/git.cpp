@@ -275,7 +275,10 @@ int capture_settings(const char *root, Vec<GitSetting> &out) {
         if ((rc = get_config(root, raw, value, &present))) return rc;
         if (present) out.emplace_back(GitSetting{strings[i], value});
     }
-    const char *bool_keys[] = {"core.filemode", "core.symlinks", "core.ignorecase", "core.precomposeunicode", "core.trustctime", "core.ignorestat", nullptr};
+    // core.useReplaceRefs decides whether the mirrored refs/replace/* change what commits and
+    // trees mean, so it travels with the refs rather than defaulting back to true.
+    const char *bool_keys[] = {"core.filemode", "core.symlinks", "core.ignorecase", "core.precomposeunicode", "core.trustctime", "core.ignorestat",
+                               "core.useReplaceRefs", nullptr};
     for (size_t i = 0; bool_keys[i]; ++i) {
         const char *typed[] = {"config", "--get", "--type=bool", bool_keys[i], nullptr};
         String value; bool present;
@@ -346,7 +349,7 @@ int reject_configured_policy(const char *root, const char *key) {
 // Git parses the files, but returns only matching key names, never their values.
 int reject_ambient_policy(const char *root) {
     const char *args[] = {"config", "--includes", "--null", "--show-scope", "--name-only",
-        "--get-regexp", "^(core\\.(excludesfile|attributesfile|autocrlf|eol|safecrlf|filemode|symlinks|ignorecase|precomposeunicode|trustctime|checkstat|ignorestat|checkroundtripencoding)$|filter\\..*|includeif\\..*\\.path$)", nullptr};
+        "--get-regexp", "^(core\\.(excludesfile|attributesfile|autocrlf|eol|safecrlf|filemode|symlinks|ignorecase|precomposeunicode|trustctime|checkstat|ignorestat|checkroundtripencoding|usereplacerefs)$|filter\\..*|includeif\\..*\\.path$)", nullptr};
     Vec<char> listing; int status = -1;
     int rc = git(root, args, &listing, &status, false, true);
     if (rc == WFS_E_GIT_FAILED && status == 1) return 0;
@@ -898,7 +901,8 @@ int git_import(const GitSource &s, const char *clone) {
         }
     }
     for (const char *key : {"core.autocrlf", "core.safecrlf", "core.eol", "core.checkstat", "core.checkRoundtripEncoding",
-                            "core.filemode", "core.symlinks", "core.ignorecase", "core.precomposeunicode", "core.trustctime", "core.ignorestat"})
+                            "core.filemode", "core.symlinks", "core.ignorecase", "core.precomposeunicode", "core.trustctime", "core.ignorestat",
+                            "core.useReplaceRefs"})
         if (int rc = unset_config(clone, key)) return rc;
     for (const auto &setting : s.settings)
         if (int rc = config(clone, setting.key.c_str(), setting.value.c_str())) return rc;

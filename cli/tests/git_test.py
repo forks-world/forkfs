@@ -309,6 +309,32 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(one, 'config', '--get', 'core.filemode').stdout.strip(), b'false')
         self.world('checkpoint', wid)
 
+    def test_disabled_replace_refs_stay_disabled(self):
+        self.git(self.source, 'checkout', '-q', '-b', 'replacement')
+        (self.source / 'file').write_text('replacement tree\n')
+        self.git(self.source, 'commit', '-qam', 'replacement')
+        replacement = self.git(self.source, 'rev-parse', 'HEAD').stdout.strip().decode()
+        self.git(self.source, 'checkout', '-q', 'main')
+        self.git(self.source, 'branch', '-q', '-D', 'replacement')
+        self.git(self.source, 'replace', self.base.decode(), replacement)
+        self.git(self.source, 'config', 'core.useReplaceRefs', 'false')
+        self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'config', '--get', '--type=bool', 'core.useReplaceRefs').stdout.strip(), b'false')
+        self.assertEqual(self.git(one, 'rev-parse', 'refs/replace/' + self.base.decode()).stdout.strip().decode(), replacement)
+        self.assertEqual(self.git(one, 'show', 'HEAD:file').stdout, b'original\n')
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+
+    def test_ambient_replace_ref_policy_is_refused(self):
+        global_config = self.root / 'global-config'
+        global_config.write_text('[core]\n useReplaceRefs = false\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        result = self.world('init', str(self.source), code=3)
+        self.assertIn(b'unsupported Git layout', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_status_policy_types_and_absent_defaults(self):
         self.git(self.source, 'config', '--local', 'core.ignorecase', 'true')
         self.git(self.source, 'config', '--local', '--unset-all', 'core.ignorecase')
