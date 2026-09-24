@@ -131,8 +131,9 @@ unless `init --with-hooks` asks for them (`init` notes when a source has some). 
 index or registration. Nested repositories/submodules and several advanced Git layouts
 are currently refused, each with a `reason:` line. Remotes, upstreams and aliases come
 along, so `git push origin <branch>` works from a World; `publish` fetches the World's
-commits back into the source as a branch without touching its checkout. Git snapshots use
-ordinary forks, not the pre-clone pool.
+commits back into the source as a branch without touching its checkout. Git snapshots can
+be pooled like any other: a handed-out entry gets its own `world/W<n>` branch before it is
+published, so it is indistinguishable from an ordinary fork.
 See [Git integration](docs/GIT_INTEGRATION.md) for behavior, supported layouts and limits.
 
 ### JSON output for scripts and agents

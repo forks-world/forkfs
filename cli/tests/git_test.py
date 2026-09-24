@@ -2704,14 +2704,98 @@ class GitWorldTest(unittest.TestCase):
         self.world('init', str(unborn), '--include-changes', code=3)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
-    def test_hard_snapshot_and_pool_refusal(self):
+    def pool_ready(self, snapshot='S1'):
+        rows = json.loads(self.world('pool', 'status', '--json').stdout)['pool']
+        return sum(r['ready'] for r in rows if r['snapshot'] == snapshot)
+
+    def pool_fork(self, name, pooled):
+        path = self.root / name
+        out = self.world('fork', '--from', 'S1', '--to', str(path)).stdout
+        self.assertEqual(b'(pool)' in out, pooled, out)
+        return path, out.decode().split()[0]
+
+    def test_hard_snapshot_pool(self):
         init_args = ('--hard',) if sys.platform == 'darwin' else ()
         self.world('init', str(self.source), *init_args)
-        self.world('pool', 'fill', 'S1', '--count', '1', code=3)
-        self.assertEqual(json.loads(self.world('pool', 'status', '--json').stdout)['pool'], [])
-        one, _ = self.fork()
+        self.world('pool', 'fill', 'S1', '--count', '1')
+        one, _ = self.pool_fork('one', True)
         self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.git(one, 'branch', '--show-current').stdout.strip(), b'world/W1')
         self.git(one, 'fsck', '--full')
+        two, _ = self.pool_fork('two', False)
+        self.assertEqual(self.git(two, 'status', '--porcelain').stdout, b'')
+        self.world('verify', 'S1')
+
+    def test_git_snapshot_pool_hands_out_ordinary_git_worlds(self):
+        self.world('init', str(self.source))
+        self.world('pool', 'fill', 'S1', '--count', '2')
+        self.assertEqual(self.pool_ready(), 2)
+        self.world('verify', 'S1')
+        one, w1 = self.pool_fork('one', True)
+        two, w2 = self.pool_fork('two', True)
+        self.assertEqual(self.pool_ready(), 0)
+        three, w3 = self.pool_fork('three', False)   # the ordinary path, for comparison
+        for world, wid in ((one, w1), (two, w2), (three, w3)):
+            self.assertEqual(self.git(world, 'status', '--porcelain').stdout, b'')
+            self.assertEqual(self.git(world, 'branch', '--show-current').stdout.decode().strip(), 'world/' + wid)
+            info = json.loads(self.world('inspect', wid, '--json').stdout)['git']
+            self.assertEqual(info['baseline'].encode(), self.base)
+            self.assertEqual(info['branch'], 'world/' + wid)
+            self.assertEqual(info['git_dir'], str(world / '.world-git/repo.git'))
+            self.assertIn(str(world).encode(), self.git(world, 'worktree', 'list', '--porcelain').stdout)
+            self.git(world, 'fsck', '--full')
+        # A handed-out World is configured exactly like an ordinary fork.
+        config = lambda w: self.git(w, 'config', '--local', '--list').stdout
+        self.assertEqual(config(one), config(three))
+        self.assertEqual(config(two), config(three))
+        # Independent refs, indexes and commits.
+        (one / 'file').write_text('one\n')
+        self.git(one, 'commit', '-qam', 'one')
+        (two / 'new').write_text('two\n')
+        self.git(two, 'add', 'new')
+        self.assertEqual(self.git(two, 'rev-parse', 'HEAD').stdout.strip(), self.base)
+        self.assertEqual(self.git(three, 'status', '--porcelain').stdout, b'')
+        self.git(two, 'rev-parse', '--verify', 'refs/heads/world/W1', code=128)
+        self.git(one, 'rev-parse', '--verify', 'refs/heads/world/W2', code=128)
+        self.assertEqual(self.git(self.source, 'rev-parse', 'HEAD').stdout.strip(), self.base)
+        self.world('verify', 'S1')
+
+    def test_git_pool_setup_failure_discards_the_entry(self):
+        import shlex
+        self.world('init', str(self.source))
+        entries = self.store / 'pool' / 'S1'
+        listing = lambda: sorted(p.name for p in entries.iterdir()) if entries.exists() else []
+        self.world('pool', 'fill', 'S1', '--count', '1')
+        self.assertEqual(len(listing()), 1)
+        real_git = shutil.which('git')
+        wrapper = self.root / 'bin'
+        wrapper.mkdir()
+        script = wrapper / 'git'
+        script.write_text('#!/bin/sh\nfor arg in "$@"; do [ "$arg" = update-ref ] && exit 42; done\nexec '
+                          + shlex.quote(real_git) + ' "$@"\n')
+        script.chmod(0o700)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        target = self.root / 'failed'
+        self.world('fork', '--from', 'S1', '--to', str(target), code=3)
+        self.assertFalse(target.exists())
+        self.assertEqual(list(self.root.glob('.wfs-fork-*')), [])
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['worlds'], [])
+        # The entry the failed setup touched is gone, not back in the pool.
+        self.assertEqual(self.pool_ready(), 0)
+        self.assertEqual(listing(), [])
+        self.env['PATH'] = self.env['PATH'].split(os.pathsep, 1)[1]
+        one, _ = self.pool_fork('one', False)
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        # An entry whose setup refuses it is dropped, and the fork is served by a fresh clone.
+        self.world('pool', 'fill', 'S1', '--count', '1')
+        [entry] = listing()
+        (entries / entry / '.git').write_text('gitdir: elsewhere\n')
+        two, wid = self.pool_fork('two', False)
+        self.assertEqual((two / '.git').read_text(), 'gitdir: .world-git/repo.git/worktrees/active\n')
+        self.assertEqual(self.git(two, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.git(two, 'branch', '--show-current').stdout.decode().strip(), 'world/' + wid)
+        self.assertEqual(self.pool_ready(), 0)
+        self.assertEqual(listing(), [])
         self.world('verify', 'S1')
 
     def test_main_repository_does_not_import_other_worktree_registrations(self):

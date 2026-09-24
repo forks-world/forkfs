@@ -277,16 +277,26 @@ content, including Git administrative changes such as branch/index updates.
   `extensions.objectFormat` (SHA-1 and SHA-256 repositories), the files ref backend, and the
   sparse-checkout `worktreeConfig` case above. Others, such as `extensions.preciousObjects`,
   are refused because a mirror clone does not carry them.
-- Git Worlds use the ordinary temporary-tree fork path. `pool fill` rejects Git snapshots;
-  it does not build entries that Git-aware forks cannot consume.
+- Git snapshots can be pooled (`pool fill S<n>`). An entry is a plain clone of the snapshot
+  with no branch of its own; the fork that takes it runs the same per-World Git setup an
+  ordinary fork runs on its temporary tree -- the managed-layout checks, the `world/W<n>`
+  branch and the baseline -- on the entry before it gets its marker and its public name, so
+  a handed-out Git World is indistinguishable from an ordinary fork. That setup is a few
+  Git commands and a walk for nested repositories, so a Git pool hit saves the clone but is
+  not the bare marker-and-rename hand-out of a plain snapshot. An entry the setup has touched
+  never goes back into the pool: if the setup (or anything after it) fails, the entry is
+  removed, nothing is published, and the fork falls through to an ordinary clone, which
+  fails the same way when the setup itself is the problem. `WFS_E_GIT_POOL` is no longer
+  returned; the code stays reserved in the C ABI.
 - Git setup runs inside the uncommitted clone before the normal exclusive publish rename.
   A failed Git command does not publish a World or change the source repository; existing
   temporary-tree recovery handles interrupted work. No new store schema is introduced.
 
-Validation: `cli_git_test` uses disposable real repositories and covers clean/dirty imports, committed-only imports, opt-in hooks,
-staging preservation, imported linked worktrees after source deletion, independent commits,
-branch collisions, detached HEAD, move/discard/restore/checkpoint, hard snapshots, pool
-refusal, Git setup rollback, environment isolation and Git commits inside the exec sandbox.
+Validation: `cli_git_test` uses disposable real repositories and covers clean/dirty imports,
+committed-only imports, opt-in hooks, staging preservation, imported linked worktrees after
+source deletion, independent commits, branch collisions, detached HEAD,
+move/discard/restore/checkpoint, hard snapshots, pooled Git forks and their setup failures,
+Git setup rollback, environment isolation and Git commits inside the exec sandbox.
 
 ### Repository status policy
 

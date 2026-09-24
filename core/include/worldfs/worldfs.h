@@ -162,7 +162,7 @@ enum {
     WFS_E_GIT_UNSUPPORTED = -1023, /* Git layout is not safely importable. */
     WFS_E_GIT_DIRTY = -1024,       /* Pass include_changes to preserve uncommitted state. */
     WFS_E_GIT_FAILED = -1025,      /* Git command failed; see its diagnostic. */
-    WFS_E_GIT_POOL = -1026,        /* Git branches require the ordinary fork path. */
+    WFS_E_GIT_POOL = -1026,        /* Reserved, no longer returned: Git snapshots are poolable. */
     WFS_E_GIT_IN_USE = -1027,      /* Additional linked worktrees depend on this tree. */
     /* Git configuration outside the repository would make the World's Git see files
      * differently from the source's: a filter that tracked files use (e.g. Git LFS), a

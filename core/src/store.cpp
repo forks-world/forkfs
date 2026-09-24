@@ -1411,7 +1411,8 @@ extern "C" const char *wfs_strerror(int rc) {
     case WFS_E_GIT_IN_USE:
         return "additional Git worktrees depend on this World; remove them with git worktree before discarding it";
     case WFS_E_GIT_POOL:
-        return "Git snapshots use the ordinary fork path; run world fs fork without filling a pool";
+        // Not returned any more (Git snapshots are poolable); kept for codes older cores gave.
+        return "Git snapshots cannot use the pre-clone pool in this version";
     case WFS_E_GIT_UNSUPPORTED:
         return "unsupported Git layout";
     case WFS_E_GIT_TARGET:
