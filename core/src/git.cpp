@@ -1589,6 +1589,15 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
         return refuse(WFS_E_GIT_TARGET, "%s is not a Git repository (it is not the top of one)", repo);
     if (!fs_realpath(world_root, world_real) && world_real == repo_real)
         return refuse(WFS_E_GIT_TARGET, "the target repository is the World itself");
+    // A symbolic destination would be dereferenced by the update and move whatever it points
+    // at (a checked-out main, a ref outside refs/heads); publish writes plain branches only.
+    {
+        const char *sym[] = {"symbolic-ref", "--quiet", ref.c_str(), nullptr};
+        int status = -1;
+        int src = git(repo, sym, nullptr, &status, true);
+        if (!src) return refuse(WFS_E_GIT_TARGET, "%s is a symbolic ref in the target repository; publish only writes plain branches", branch);
+        if (!(src == WFS_E_GIT_FAILED && status == 1)) return src;
+    }
     // A branch checked out in any worktree of the target would be moved under its user.
     bool checked_out = false;
     if (int rc = branch_checked_out(repo, ref, checked_out)) return rc;
@@ -1689,7 +1698,8 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
         int err = errno ? -errno : -EIO; fclose(input); return rc ? rc : err;
     }
     rewind(input);
-    const char *txn[] = {"update-ref", "-m", "world fs publish", "--stdin", nullptr};
+    // --no-deref: the transaction names the branch itself, never a ref it might point to.
+    const char *txn[] = {"update-ref", "-m", "world fs publish", "--no-deref", "--stdin", nullptr};
     int txn_rc = git(repo, txn, nullptr, nullptr, false, false, fileno(input));
     fclose(input);
     if (rc) return rc;

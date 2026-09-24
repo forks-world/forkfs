@@ -1338,6 +1338,16 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'world/W1 is checked out in the target repository', result.stderr)
         self.assertEqual(self.git(self.source, 'rev-parse', 'world/W1').stdout.strip(), self.base)
 
+    def test_publish_refuses_a_symbolic_destination(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'world change')
+        self.git(self.source, 'symbolic-ref', 'refs/heads/alias', 'refs/heads/main')
+        result = self.world('publish', wid, '--branch', 'alias', code=3)
+        self.assertIn(b'alias is a symbolic ref in the target repository', result.stderr)
+        self.assertEqual(self.git(self.source, 'rev-parse', 'main').stdout.strip(), self.base)
+        self.assertEqual(self.git(self.source, 'symbolic-ref', 'refs/heads/alias').stdout.strip(), b'refs/heads/main')
+
     def test_publish_follows_checkpoints_back_to_the_source(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
