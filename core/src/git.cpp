@@ -5,6 +5,7 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <pwd.h>
 #include <sys/random.h>
 #include <string.h>
 #include <strings.h>
@@ -504,15 +505,29 @@ String dirname_of(const char *path) {
     if (slash == path) return String("/");
     return String(path, (size_t)(slash - path));
 }
-// Resolve an include path the way Git does: "~/" is $HOME, a relative path is relative to the
-// directory of the file that contains the directive.
+// Resolve an include path the way Git does: "~" and "~/..." are $HOME, "~user/..." is that
+// user's home directory, and a relative path is relative to the directory of the file that
+// contains the directive. What cannot be resolved here with certainty (an unknown user,
+// Git's "%(prefix)/" install-relative form) is reported as unresolvable, never guessed.
 bool resolve_include(const char *value, const char *including_file, String &out) {
-    if (!strncmp(value, "~/", 2)) {
-        const char *home = getenv("HOME");
-        if (!home || !*home) return false;
-        out = joinp(home, value + 2);
+    if (value[0] == '~') {
+        const char *slash = strchr(value, '/');
+        size_t ulen = slash ? (size_t)(slash - value - 1) : strlen(value + 1);
+        String home;
+        if (!ulen) {
+            const char *env = getenv("HOME");
+            if (!env || !*env) return false;
+            home.assign(env);
+        } else {
+            String user(value + 1, ulen);
+            struct passwd *pw = getpwnam(user.c_str());
+            if (!pw || !pw->pw_dir || !*pw->pw_dir) return false;
+            home.assign(pw->pw_dir);
+        }
+        out = slash ? joinp(home.c_str(), slash + 1) : home;
         return true;
     }
+    if (!strncmp(value, "%(", 2)) return false;
     if (value[0] == '/') { out.assign(value); return true; }
     if (!including_file) return false;
     String dir = dirname_of(including_file);
@@ -1694,10 +1709,16 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
             script.append(now.c_str()); script.push_back('\n');
         }
     }
+    // If the transaction cannot even be fed, still take the staging ref back out (only with
+    // the value this call fetched), so a failure never leaves the target modified.
+    auto drop_staging = [&]() {
+        const char *drop[] = {"update-ref", "--no-deref", "-d", staging, now.c_str(), nullptr};
+        (void)git(repo, drop, nullptr, nullptr, true);
+    };
     FILE *input = tmpfile();
-    if (!input) return rc ? rc : -errno;
+    if (!input) { int err = -errno; drop_staging(); return rc ? rc : err; }
     if (fwrite(script.c_str(), 1, script.size(), input) != script.size() || fflush(input)) {
-        int err = errno ? -errno : -EIO; fclose(input); return rc ? rc : err;
+        int err = errno ? -errno : -EIO; fclose(input); drop_staging(); return rc ? rc : err;
     }
     rewind(input);
     // --no-deref: the transaction names the branch itself, never a ref it might point to.

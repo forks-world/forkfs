@@ -622,6 +622,30 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(self.source, 'rev-parse', 'world/W1').stdout.strip(), self.base)
         self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs').stdout, b'')
 
+    def test_conditional_include_paths_expand_tilde_forms(self):
+        import pwd
+        user = pwd.getpwuid(os.getuid()).pw_name
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        policy_dir = Path(tempfile.mkdtemp(prefix='.forkfs-include-', dir=str(home)))
+        self.addCleanup(shutil.rmtree, policy_dir, True)
+        (policy_dir / 'policy').write_text('[core]\n autocrlf = true\n')
+        rel = policy_dir.relative_to(home) / 'policy'
+        for form in ('~/' + str(rel), '~' + user + '/' + str(rel)):
+            with self.subTest(form=form):
+                global_config = self.root / 'tilde-global'
+                global_config.write_text('[includeIf "gitdir:' + str(self.root / 'elsewhere') + '/"]\n path = ' + form + '\n')
+                self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+                result = self.world('init', str(self.source), code=3)
+                self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+                self.assertIn(b'which sets core.autocrlf', result.stderr)
+        with self.subTest(form='unknown user'):
+            global_config.write_text('[includeIf "gitdir:' + str(self.root / 'elsewhere') + '/"]\n path = ~no-such-user-forkfs/x\n')
+            self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+            result = self.world('init', str(self.source), code=3)
+            self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+            self.assertIn(b'cannot be resolved to a file', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_used_ambient_filter_is_refused_without_execution(self):
         global_config = self.root / 'filter-global'
         global_config.write_text('[filter "example"]\n clean = touch ambient-filter-ran; cat\n')
