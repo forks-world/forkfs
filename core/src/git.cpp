@@ -1,4 +1,5 @@
 #include "git.h"
+#include <ctype.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <spawn.h>
@@ -772,6 +773,48 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     return 0;
 }
 
+// A managed World is copied with its whole administration, so a live or stale Git lock
+// (packed-refs.lock, refs/**/x.lock, config.lock, commit-graph or midx locks, ...) would be
+// published in the child and make its later ref or maintenance updates fail. Scan the copy:
+// it is exactly what gets published. Loose-object fan-out directories hold no locks and can
+// be large, so they are skipped.
+int reject_locks_fd(int dirfd, bool objects_level, int depth) {
+    if (depth > 64) return WFS_E_GIT_UNSUPPORTED;
+    int dup_fd = dup(dirfd);
+    if (dup_fd < 0) return -errno;
+    DIR *d = fdopendir(dup_fd);
+    if (!d) { int rc = -errno; close(dup_fd); return rc; }
+    rewinddir(d);
+    int rc = 0;
+    for (;;) {
+        errno = 0; dirent *e = readdir(d);
+        if (!e) { if (errno) rc = -errno; break; }
+        const char *name = e->d_name;
+        if (!strcmp(name, ".") || !strcmp(name, "..")) continue;
+        size_t len = strlen(name);
+        if (len >= 5 && !strcmp(name + len - 5, ".lock")) { rc = -EBUSY; break; }
+        struct stat st;
+        if (fstatat(dirfd, name, &st, AT_SYMLINK_NOFOLLOW)) { rc = -errno; break; }
+        if (!S_ISDIR(st.st_mode)) continue;
+        bool fanout = objects_level && len == 2 && isxdigit((unsigned char)name[0]) && isxdigit((unsigned char)name[1]);
+        if (fanout) continue;
+        int sub = openat(dirfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (sub < 0) { rc = -errno; break; }
+        rc = reject_locks_fd(sub, depth == 0 && !strcmp(name, "objects"), depth + 1);
+        close(sub);
+        if (rc) break;
+    }
+    closedir(d);
+    return rc;
+}
+int reject_copied_locks(const char *clone) {
+    String repo = joinp(clone, ".world-git/repo.git");
+    int fd = open(repo.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    int rc = reject_locks_fd(fd, false, 0);
+    close(fd);
+    return rc;
+}
 int git_import(const GitSource &s, const char *clone) {
     if (!s.present) return 0;
     if (int rc = source_unchanged(s)) return rc;
@@ -789,6 +832,7 @@ int git_import(const GitSource &s, const char *clone) {
             !same_symrefs(copy.symrefs, s.symrefs) || !same_settings(copy.settings, s.settings)) return -EBUSY;
         if (!same_bytes(copy.refs, s.refs) ||
             copy.orig_present != s.orig_present || copy.orig_head != s.orig_head) return -EBUSY;
+        if (int rc = reject_copied_locks(clone)) return rc;
         // HEAD and the index do not change when a tracked file is edited after the source's
         // clean check, so check the copy that will actually be published.
         return s.require_clean ? require_clean_tree(clone) : 0;

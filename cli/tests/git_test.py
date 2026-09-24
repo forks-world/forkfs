@@ -579,6 +579,27 @@ class GitWorldTest(unittest.TestCase):
                 else:
                     marker.unlink()
 
+    def test_git_locks_in_a_world_block_fork_and_checkpoint(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        repo = one / '.world-git' / 'repo.git'
+        before = json.loads(self.world('list', '--json').stdout)
+        for rel in ('packed-refs.lock', 'refs/heads/main.lock', 'config.lock',
+                    'objects/info/commit-graphs/commit-graph-chain.lock', 'worktrees/active/index.lock'):
+            with self.subTest(lock=rel):
+                lock = repo / rel
+                lock.parent.mkdir(parents=True, exist_ok=True)
+                lock.write_text('')
+                self.world('fork', '--from', wid, '--to', str(self.root / 'two'), code=1)
+                self.assertFalse((self.root / 'two').exists())
+                self.world('checkpoint', wid, code=1)
+                self.assertTrue(lock.exists())
+                self.assertEqual(json.loads(self.world('list', '--json').stdout), before)
+                lock.unlink()
+        two, _ = self.fork('two', wid)
+        self.assertEqual(self.git(two, 'status', '--porcelain').stdout, b'')
+        self.git(two, 'pack-refs', '--all')
+
     def test_conflicted_notes_merge_is_refused(self):
         self.git(self.source, 'notes', 'add', '-m', 'base note')
         self.git(self.source, 'update-ref', 'refs/notes/other', 'refs/notes/commits')
