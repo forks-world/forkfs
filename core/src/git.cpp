@@ -677,6 +677,10 @@ int source_unchanged(const GitSource &s) {
 // default). So the index and every commit reachable from what the import keeps -- all refs,
 // HEAD, ORIG_HEAD and FETCH_HEAD tips -- must never contain either path. --full-history keeps
 // a side branch that added the path and was merged away from being simplified out.
+// --no-replace-objects makes the walk read the commits and trees the import actually preserves:
+// a refs/replace/* entry could otherwise present a safe tree for a commit whose real tree has
+// the path, and deleting that replacement in the World would bring it back. The replacement
+// commits are still scanned, as ordinary tips under --all.
 int reject_reserved_paths(const char *root, const GitSource &s) {
     const char *tracked_args[] = {"ls-files", "-z", "--", ":(top,literal).world", ":(top,literal).world-git", nullptr};
     Vec<char> tracked;
@@ -699,7 +703,7 @@ int reject_reserved_paths(const char *root, const GitSource &s) {
         }
     }
     Vec<const char *> args;
-    for (const char *a : {"rev-list", "-n", "1", "--full-history", "--all"}) args.emplace_back(a);
+    for (const char *a : {"--no-replace-objects", "rev-list", "-n", "1", "--full-history", "--all"}) args.emplace_back(a);
     for (const auto &tip : tips) args.emplace_back(tip.c_str());
     for (const char *a : {"--", ":(top,literal).world", ":(top,literal).world-git"}) args.emplace_back(a);
     args.emplace_back(nullptr);

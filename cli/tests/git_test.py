@@ -1204,6 +1204,26 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'unsupported Git layout', result.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout), before)
 
+    def test_replacement_cannot_hide_reserved_paths_in_history(self):
+        # The real HEAD commit tracks .world; a replacement presents a tree without it.
+        (self.source / '.world').write_text('hidden\n')
+        self.git(self.source, 'add', '-f', '.world')
+        self.git(self.source, 'commit', '-qm', 'real commit tracks .world')
+        real = self.git(self.source, 'rev-parse', 'HEAD').stdout.strip().decode()
+        (self.source / '.world').unlink()
+        tree = self.git(self.source, 'rev-parse', self.base.decode() + '^{tree}').stdout.strip().decode()
+        safe = self.git(self.source, 'commit-tree', tree, '-p', self.base.decode(), '-m', 'safe').stdout.strip().decode()
+        self.git(self.source, 'replace', real, safe)
+        self.git(self.source, 'reset', '-q', '--hard', 'HEAD')
+        (self.source / '.git' / 'ORIG_HEAD').unlink(missing_ok=True)
+        self.assertEqual(self.git(self.source, 'rev-parse', 'HEAD').stdout.strip().decode(), real)
+        self.assertEqual(self.git(self.source, 'ls-files', '.world').stdout, b'')
+        self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+        self.assertFalse((self.source / '.world').exists())
+        result = self.world('init', str(self.source), code=3)
+        self.assertIn(b'unsupported Git layout', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_unsupported_nested_and_unborn_are_refused(self):
         nested = self.source / 'nested'
         nested.mkdir()
