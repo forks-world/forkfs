@@ -168,7 +168,11 @@ enum {
      * differently from the source's: a filter that tracked files use (e.g. Git LFS), a
      * conditional include that sets status or filter settings, GIT_ATTR_SOURCE/attr.tree, or
      * status settings injected on the command line. wfs_git_reason() names which. */
-    WFS_E_GIT_POLICY = -1028
+    WFS_E_GIT_POLICY = -1028,
+    /* wfs_git_publish: the target repository cannot take the branch (not a repository, the
+     * branch is checked out there, not a fast-forward, unrelated history). wfs_git_reason()
+     * says which. */
+    WFS_E_GIT_TARGET = -1029
 };
 
 /* One process, other than this one, that has a store's database open (PR #1 review, 34th
@@ -371,6 +375,21 @@ typedef struct wfs_git_info {
     char git_dir[WFS_PATH_MAX]; /* common directory inside this World */
 } wfs_git_info;
 int wfs_git_inspect(const char *root, wfs_git_info *out);
+
+/* Copy a Git World's commits into another repository -- by default the directory the World was
+ * imported from -- as refs/heads/<branch>, with `git fetch`. Nothing else in that repository
+ * changes: not its checkout, index, working tree or other branches, and nothing is merged.
+ * `branch` defaults to the World's current branch (required when HEAD is detached). Without
+ * `force`, only a new branch or a fast-forward is written, and the repository must already
+ * contain the World's baseline commit (so a branch does not land in an unrelated repository). */
+typedef struct wfs_git_publish_result {
+    char ref[WFS_PATH_MAX];  /* refs/heads/<branch> written in the target repository */
+    char old_oid[65];        /* its previous commit, "" when the branch is new */
+    char new_oid[65];        /* the World's commit it now names */
+    int dirty;               /* the World has uncommitted changes, which were not published */
+} wfs_git_publish_result;
+int wfs_git_publish(const char *world_root, const char *repo, const char *branch, int force,
+                    wfs_git_publish_result *out);
 
 /* What a fork did, beyond which world it produced. */
 typedef struct wfs_fork_result {

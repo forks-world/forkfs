@@ -61,6 +61,26 @@ runs on its own are not carried: hooks and `core.hooksPath`, `remote.<name>.uplo
 helpers (a global credential helper still applies). These settings are rechecked before
 publication like the rest of the captured state.
 
+## Getting work back to the source
+
+`world fs publish W<n>` copies a Git World's commits into the repository the World was
+imported from, as a branch named like the World's (`world/W<n>`):
+
+```sh
+world fs publish W1                          # refs/heads/world/W1 in the source repository
+world fs publish W1 --branch feature/login   # choose the name
+world fs publish W1 --repo ~/src/other-clone # another clone of the same project
+git -C ~/src/project merge world/W1          # merging stays a Git decision
+```
+
+It is an ordinary `git fetch` into that repository followed by one compare-and-swap ref
+update: the checkout, index, working tree and other branches are not touched, nothing is
+merged, and nothing is pushed anywhere. The default repository is found by following the
+World back through world forks and checkpoints to the directory `init` imported. Without
+`--force`, publishing refuses a branch that is checked out in the target, an update that is
+not a fast-forward, and a repository that shares no history with the World. A detached World
+needs `--branch`. Uncommitted World changes are not published; the command says so.
+
 ## Uncommitted content
 
 A dirty source is refused by default. Pass `--include-changes` to `init`, `checkpoint`, or

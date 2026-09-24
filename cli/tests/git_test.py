@@ -1153,6 +1153,95 @@ class GitWorldTest(unittest.TestCase):
         self.world('init', str(self.source), code=1)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
+    def test_publish_copies_world_commits_back_as_a_branch(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        (one / 'file').write_text('world change\n')
+        self.git(one, 'commit', '-qam', 'world change')
+        head = self.git(one, 'rev-parse', 'HEAD').stdout.strip()
+        source_state = [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index')]
+        result = self.world('publish', wid)
+        self.assertIn(b'new branch world/W1', result.stdout)
+        self.assertEqual(self.git(self.source, 'rev-parse', 'refs/heads/world/W1').stdout.strip(), head)
+        # Nothing else in the source changed: checkout, index, working tree, other branches.
+        self.assertEqual(source_state, [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index')])
+        self.assertEqual((self.source / 'file').read_text(), 'original\n')
+        self.assertEqual(self.git(self.source, 'rev-parse', 'main').stdout.strip(), self.base)
+        # A later commit is a fast-forward; uncommitted World changes are reported, not published.
+        (one / 'file').write_text('second change\n')
+        self.git(one, 'commit', '-qam', 'second change')
+        (one / 'draft').write_text('not committed\n')
+        second = self.git(one, 'rev-parse', 'HEAD').stdout.strip()
+        result = self.world('publish', wid)
+        self.assertIn(b'uncommitted changes; only its commits were published', result.stderr)
+        self.assertEqual(self.git(self.source, 'rev-parse', 'world/W1').stdout.strip(), second)
+        self.assertIn(b'already at', self.world('publish', wid).stdout)
+        (one / 'draft').unlink()
+        # A differently named branch, and a fork of the World publishing to the same source.
+        self.world('publish', wid, '--branch', 'feature/from-world')
+        self.assertEqual(self.git(self.source, 'rev-parse', 'feature/from-world').stdout.strip(), second)
+        two, wid2 = self.fork('two', wid)
+        self.git(two, 'commit', '-q', '--allow-empty', '-m', 'from the child')
+        self.world('publish', wid2)
+        self.assertEqual(self.git(self.source, 'rev-parse', 'world/W2').stdout.strip(),
+                         self.git(two, 'rev-parse', 'HEAD').stdout.strip())
+
+    def test_publish_refuses_what_the_target_cannot_take(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'world change')
+        head = self.git(one, 'rev-parse', 'HEAD').stdout.strip()
+        def refused(reason, *args):
+            result = self.world('publish', wid, *args, code=3)
+            self.assertIn(reason, result.stderr)
+        # The source's checked-out branch is never moved.
+        refused(b'main is checked out in the target repository', '--branch', 'main')
+        self.assertEqual(self.git(self.source, 'rev-parse', 'main').stdout.strip(), self.base)
+        # A diverged branch of the same name needs --force.
+        self.git(self.source, 'commit', '-q', '--allow-empty', '-m', 'source change')
+        self.git(self.source, 'branch', 'world/W1', 'main')
+        diverged = self.git(self.source, 'rev-parse', 'world/W1').stdout.strip()
+        refused(b'not a fast-forward (--force overwrites it)')
+        self.assertEqual(self.git(self.source, 'rev-parse', 'world/W1').stdout.strip(), diverged)
+        self.world('publish', wid, '--force')
+        self.assertEqual(self.git(self.source, 'rev-parse', 'world/W1').stdout.strip(), head)
+        # An unrelated repository, a non-repository and a bad name.
+        other = self.root / 'other'
+        self.git(self.root, 'init', '-q', '-b', 'main', str(other))
+        self.git(other, '-c', 'user.name=Other', '-c', 'user.email=other@example.com',
+                 'commit', '-q', '--allow-empty', '-m', 'unrelated')
+        refused(b'shares no history with the World', '--repo', str(other))
+        self.assertEqual(self.git(other, 'for-each-ref', 'refs/worldfs').stdout, b'')
+        self.git(other, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
+        clone = self.root / 'another-clone'
+        self.git(self.root, 'clone', '-q', str(self.source), str(clone))
+        self.world('publish', wid, '--repo', str(clone), '--branch', 'reviewed')
+        self.assertEqual(self.git(clone, 'rev-parse', 'reviewed').stdout.strip(), head)
+        bare = self.root / 'shared.git'
+        self.git(self.root, 'clone', '-q', '--bare', str(self.source), str(bare))
+        self.world('publish', wid, '--repo', str(bare), '--branch', 'reviewed')
+        self.assertEqual(self.run_cmd('git', '--git-dir', str(bare), 'rev-parse', 'reviewed').stdout.strip(), head)
+        plain = self.root / 'plain'
+        plain.mkdir()
+        refused(b'is not a Git repository', '--repo', str(plain))
+        refused(b'is not a valid branch name', '--branch', 'bad..name')
+        # A detached World must name the branch.
+        self.git(one, 'checkout', '-q', '--detach')
+        refused(b'HEAD is detached; name the branch to create with --branch')
+        self.world('publish', wid, '--branch', 'detached-work')
+        self.assertEqual(self.git(self.source, 'rev-parse', 'detached-work').stdout.strip(), head)
+
+    def test_publish_follows_checkpoints_back_to_the_source(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'before checkpoint')
+        snapshot = self.world('checkpoint', wid).stdout.split()[0].decode()
+        two, wid2 = self.fork('two', snapshot)
+        self.git(two, 'commit', '-q', '--allow-empty', '-m', 'after checkpoint')
+        self.world('publish', wid2, '--branch', 'from-checkpoint')
+        self.assertEqual(self.git(self.source, 'rev-parse', 'from-checkpoint').stdout.strip(),
+                         self.git(two, 'rev-parse', 'HEAD').stdout.strip())
+
     def test_fetch_head_only_tip_survives_source_deletion(self):
         remote = self.root / 'fetch-remote'
         remote.mkdir()

@@ -1499,3 +1499,106 @@ extern "C" int wfs_git_inspect(const char *root, wfs_git_info *out) {
     snprintf(out->git_dir, sizeof out->git_dir, "%s", common.c_str());
     return 0;
 }
+
+extern "C" int wfs_git_publish(const char *world_root, const char *repo, const char *branch, int force,
+                               wfs_git_publish_result *out) {
+    using namespace wfs;
+    if (!world_root || !repo || !*repo || !out) return -EINVAL;
+    memset(out, 0, sizeof *out);
+    g_reason[0] = '\0';
+    wfs_git_info info;
+    if (int rc = wfs_git_inspect(world_root, &info)) return rc;
+    if (!info.present) return refuse(WFS_E_GIT_UNSUPPORTED, "the World has no WorldFS-managed Git repository");
+    if (!branch || !*branch) {
+        if (!info.branch[0])
+            return refuse(WFS_E_GIT_TARGET, "the World's HEAD is detached; name the branch to create with --branch");
+        branch = info.branch;
+    }
+    String ref("refs/heads/");
+    ref.append(branch);
+    if (ref.size() >= sizeof out->ref) return -ENAMETOOLONG;
+    const char *check_ref[] = {"check-ref-format", ref.c_str(), nullptr};
+    if (git(world_root, check_ref, nullptr, nullptr, true))
+        return refuse(WFS_E_GIT_TARGET, "%s is not a valid branch name", branch);
+    // The target must be a repository of its own -- its top level, or a bare repository itself,
+    // not a directory that merely sits inside some other repository -- and not this World.
+    String world_real, repo_real, top, git_dir, bare;
+    if (fs_realpath(repo, repo_real)) return refuse(WFS_E_GIT_TARGET, "%s does not exist", repo);
+    const char *bare_args[] = {"rev-parse", "--is-bare-repository", nullptr};
+    if (value(repo, bare_args, bare)) return refuse(WFS_E_GIT_TARGET, "%s is not a Git repository", repo);
+    const char *where[] = {"rev-parse", bare == "true" ? "--absolute-git-dir" : "--show-toplevel", nullptr};
+    String real_where;
+    if (value(repo, where, top) || fs_realpath(top.c_str(), real_where) || real_where != repo_real)
+        return refuse(WFS_E_GIT_TARGET, "%s is not a Git repository (it is not the top of one)", repo);
+    if (!fs_realpath(world_root, world_real) && world_real == repo_real)
+        return refuse(WFS_E_GIT_TARGET, "the target repository is the World itself");
+    // A branch checked out in any worktree of the target would be moved under its user.
+    Vec<char> worktrees;
+    const char *wt_args[] = {"worktree", "list", "--porcelain", "-z", nullptr};
+    if (int rc = git(repo, wt_args, &worktrees)) return rc;
+    String checked("branch "); checked.append(ref.c_str());
+    for (size_t i = 0; i < worktrees.size() && worktrees[i];) {
+        const char *line = worktrees.data() + i;
+        if (!strcmp(line, checked.c_str()))
+            return refuse(WFS_E_GIT_TARGET, "%s is checked out in the target repository; choose another name with --branch", branch);
+        i += strlen(line) + 1;
+    }
+    String old;
+    const char *old_args[] = {"rev-parse", "--verify", "--quiet", ref.c_str(), nullptr};
+    if (int rc = value(repo, old_args, old, true)) return rc;
+    // Bring the World's commits over under a private name first, so nothing the user sees
+    // moves until every check has passed.
+    char staging[64];
+    snprintf(staging, sizeof staging, "refs/worldfs/publish-%d", (int)getpid());
+    String source_ref;
+    if (info.branch[0]) { source_ref.assign("refs/heads/"); source_ref.append(info.branch); }
+    else source_ref.assign("HEAD");
+    String spec("+");
+    spec.append(source_ref.c_str()); spec.push_back(':'); spec.append(staging);
+    const char *fetch[] = {"fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
+                           "--", world_root, spec.c_str(), nullptr};
+    int rc = git(repo, fetch);
+    String now;
+    if (!rc) {
+        const char *now_args[] = {"rev-parse", "--verify", staging, nullptr};
+        rc = value(repo, now_args, now);
+    }
+    if (!rc && !force) {
+        // Shared history: at least one of the World's commits is already in the repository.
+        // An unrelated repository would otherwise gain a branch with a foreign root.
+        String exclude("--exclude="); exclude.append(staging);
+        const char *all_args[] = {"rev-list", "--count", now.c_str(), nullptr};
+        const char *new_args[] = {"rev-list", "--count", now.c_str(), exclude.c_str(), "--not", "--all", nullptr};
+        String all, fresh;
+        if (!(rc = value(repo, all_args, all)) && !(rc = value(repo, new_args, fresh)) && all == fresh)
+            rc = refuse(WFS_E_GIT_TARGET, "%s shares no history with the World; is it the repository the World came from? (--force skips this check)", repo);
+    }
+    if (!rc && !force && !old.empty() && old != now) {
+        const char *ff[] = {"merge-base", "--is-ancestor", old.c_str(), now.c_str(), nullptr};
+        int status = -1;
+        int ff_rc = git(repo, ff, nullptr, &status, true);
+        if (ff_rc == WFS_E_GIT_FAILED && status == 1)
+            rc = refuse(WFS_E_GIT_TARGET, "%s in the target repository has commits the World's branch does not; this is not a fast-forward (--force overwrites it)", branch);
+        else rc = ff_rc;
+    }
+    if (!rc && old != now) {
+        // Compare-and-swap against the value checked above; hooks are disabled by git().
+        const char *zero = info.head[0] && strlen(info.head) == 64
+            ? "0000000000000000000000000000000000000000000000000000000000000000"
+            : "0000000000000000000000000000000000000000";
+        const char *update[] = {"update-ref", "-m", "world fs publish", ref.c_str(), now.c_str(),
+                                old.empty() ? zero : old.c_str(), nullptr};
+        rc = git(repo, update);
+    }
+    const char *drop[] = {"update-ref", "-d", staging, nullptr};
+    int drop_rc = git(repo, drop, nullptr, nullptr, true);
+    if (rc) return rc;
+    if (drop_rc) return drop_rc;
+    snprintf(out->ref, sizeof out->ref, "%s", ref.c_str());
+    snprintf(out->old_oid, sizeof out->old_oid, "%s", old.c_str());
+    snprintf(out->new_oid, sizeof out->new_oid, "%s", now.c_str());
+    int dirty = require_clean_tree(world_root);
+    if (dirty && dirty != WFS_E_GIT_DIRTY) return dirty;
+    out->dirty = dirty == WFS_E_GIT_DIRTY;
+    return 0;
+}

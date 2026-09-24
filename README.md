@@ -119,12 +119,16 @@ $world fs init ~/src/dirty-project --include-changes  # preserve index + working
 $world fs fork --from S1 --to ~/worlds/task          # creates the branch/worktree
 $world fs inspect W1 --json                         # includes Git branch/HEAD/baseline
 $world fs checkpoint W1 --include-changes           # filesystem snapshot, no Git commit
+$world fs publish W1                                # the World's commits -> world/W1 in ~/src/project
 ```
 
 Dirty live Git sources require `--include-changes`; ignored build/data files are
 always retained. Existing linked worktrees are imported without reusing their source
 index or registration. Nested repositories/submodules and several advanced Git layouts
-are currently refused. Git snapshots use ordinary forks, not the pre-clone pool.
+are currently refused, each with a `reason:` line. Remotes, upstreams and aliases come
+along, so `git push origin <branch>` works from a World; `publish` fetches the World's
+commits back into the source as a branch without touching its checkout. Git snapshots use
+ordinary forks, not the pre-clone pool.
 See [Git integration](docs/GIT_INTEGRATION.md) for behavior, supported layouts and limits.
 
 ### JSON output for scripts and agents
