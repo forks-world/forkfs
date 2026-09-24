@@ -435,6 +435,10 @@ class GitWorldTest(unittest.TestCase):
         global_config = self.root / 'global-config'
         global_config.write_text('[include]\n path = ' + str(included) + '\n')
         self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        # Git re-reads content only when the cached stat data no longer matches (or is racy);
+        # on a slow runner the commit's index is not racy, so move the mtime to force a re-read.
+        stamp = line.stat().st_mtime - 10
+        os.utime(line, (stamp, stamp))
         self.assertIn(b' M line.txt', self.git(self.source, 'status', '--porcelain').stdout)
         before = [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index', 'config')]
         result = self.world('init', str(self.source), code=3)
