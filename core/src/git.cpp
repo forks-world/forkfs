@@ -387,14 +387,32 @@ int reject_inprogress(const char *root) {
     const char *args[] = {"rev-parse", "--absolute-git-dir", nullptr};
     if (int rc = value(root, args, admin)) return rc;
     const char *inprogress[] = {"index.lock", "HEAD.lock", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
-        "BISECT_START", "MERGE_AUTOSTASH", "rebase-merge", "rebase-apply", "sequencer"};
+        "BISECT_START", "MERGE_AUTOSTASH", "rebase-merge", "rebase-apply", "sequencer",
+        // A conflicted `git notes merge` leaves status clean; its resumable state lives only here.
+        "NOTES_MERGE_PARTIAL", "NOTES_MERGE_REF"};
     struct stat st;
     for (const char *rel : inprogress) {
         String path = joinp(admin.c_str(), rel);
         if (!lstat(path.c_str(), &st)) return -EBUSY;
         if (errno != ENOENT) return -errno;
     }
-    return 0;
+    // `git notes merge --abort` and `--commit` leave NOTES_MERGE_WORKTREE behind as an empty
+    // directory; Git itself treats only a non-empty one as an unconcluded merge.
+    String worktree = joinp(admin.c_str(), "NOTES_MERGE_WORKTREE");
+    int fd = open(worktree.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) return 0;
+        return errno == ENOTDIR || errno == ELOOP ? -EBUSY : -errno;
+    }
+    DIR *d = fdopendir(fd);
+    if (!d) { int rc = -errno; close(fd); return rc; }
+    int rc = 0;
+    for (;;) {
+        errno = 0; dirent *e = readdir(d);
+        if (!e) { if (errno) rc = -errno; break; }
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) { rc = -EBUSY; break; }
+    }
+    closedir(d); return rc;
 }
 // Modern partial clones are marked by remote.<name>.promisor / partialclonefilter and by
 // pack-*.promisor markers; extensions.partialClone is deprecated and may be absent. A local

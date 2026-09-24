@@ -83,7 +83,8 @@ content, including Git administrative changes such as branch/index updates.
   linked worktrees are refused by fork/checkpoint. Discard also refuses registered extra
   worktrees, including with `--force`, until they have been removed with Git. Do not create
   new Git registrations in trashed trees. Merge/rebase/cherry-pick/revert in progress
-  is also refused. Re-import older snapshots that still contain an unconverted `.git`.
+  is also refused, as is an unconcluded `git notes merge`, whose state is invisible to
+  `git status`. Re-import older snapshots that still contain an unconverted `.git`.
 - Git LFS hydration, recursive submodule import, a shared refs/object service, a switch to
   discard current edits and materialize only HEAD, and cross-machine history transfer are
   not provided. This increment does not close every requirement in Issue #7.

@@ -575,6 +575,37 @@ class GitWorldTest(unittest.TestCase):
                 else:
                     marker.unlink()
 
+    def test_conflicted_notes_merge_is_refused(self):
+        self.git(self.source, 'notes', 'add', '-m', 'base note')
+        self.git(self.source, 'update-ref', 'refs/notes/other', 'refs/notes/commits')
+        self.git(self.source, 'notes', 'add', '-f', '-m', 'ours')
+        self.git(self.source, 'notes', '--ref=other', 'add', '-f', '-m', 'theirs')
+        self.git(self.source, 'notes', 'merge', '-s', 'manual', 'other', code=1)
+        admin = self.source / '.git'
+        markers = ('NOTES_MERGE_PARTIAL', 'NOTES_MERGE_REF', 'NOTES_MERGE_WORKTREE')
+        for name in markers:
+            self.assertTrue((admin / name).exists(), name)
+        self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+        partial = (admin / 'NOTES_MERGE_PARTIAL').read_bytes()
+        self.world('init', str(self.source), '--include-changes', code=1)
+        self.assertEqual((admin / 'NOTES_MERGE_PARTIAL').read_bytes(), partial)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        for keep in markers:
+            with self.subTest(marker=keep):
+                saved = {n: self.root / ('saved-' + n) for n in markers if n != keep}
+                for n, dst in saved.items():
+                    os.rename(admin / n, dst)
+                self.world('init', str(self.source), '--include-changes', code=1)
+                self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+                for n, dst in saved.items():
+                    os.rename(dst, admin / n)
+        self.git(self.source, 'notes', 'merge', '--abort')
+        self.assertTrue((admin / 'NOTES_MERGE_WORKTREE').is_dir())
+        self.assertEqual(list((admin / 'NOTES_MERGE_WORKTREE').iterdir()), [])
+        self.world('init', str(self.source))
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'notes', 'show').stdout, b'ours\n')
+
     def test_conflicted_squash_merge_is_refused(self):
         self.git(self.source, 'checkout', '-b', 'side')
         (self.source / 'file').write_text('side\n')
