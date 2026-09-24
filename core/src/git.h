@@ -31,6 +31,8 @@ struct GitSource {
     bool fetch_present = false;
     Vec<GitSymref> symrefs;
     Vec<GitSetting> settings;
+    // user.name / user.email as the source defines them (present ones only, possibly empty).
+    Vec<GitSetting> identity;
     Vec<char> refs;
     bool orig_present = false;
     String orig_head;

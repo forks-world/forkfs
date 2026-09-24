@@ -1197,7 +1197,12 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
     // and the snapshot went out advertising a member it does not contain -- WFS_E_SNAPSHOT_DIRTY
     // from every verify and every fork afterwards. Exactly the name that is removed, so a
     // `.world` in a sub-world (which is not removed) is untouched.
-    if (int rc = wfs::hardlinks_scan(src.c_str(), WFS_MARKER_NAME, &src_stats, hl)) return rc;
+    // An external Git import replaces the source's `.git` (directory or gitfile) with owned
+    // administration, so its names are not files of the published tree either: excluding them
+    // here keeps the groups and the external counts about exactly the tree that is published,
+    // including worktree files linked from outside it (a rescan of the clone would lose those).
+    const char *git_admin = git_source.present && !git_source.managed ? ".git" : nullptr;
+    if (int rc = wfs::hardlinks_scan(src.c_str(), WFS_MARKER_NAME, &src_stats, hl, git_admin)) return rc;
     if (int rc = space_check(s->dir.c_str(), src_stats.entries, git_source.import_bytes)) return rc;
 
     char nm[WFS_NAME_MAX];
@@ -1266,13 +1271,8 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         // group left in there would be rebuilt one step later, in the fork, over the very
         // contents this replay declined to overwrite.
         if (hlr.broken.size()) hl_drop_broken(hl, hlr.broken);
+        // The source scan already left the replaced `.git` out, so `hl` describes this tree.
         if ((rc = wfs::git_import(git_source, root.c_str()))) break;
-        if (git_source.present && !git_source.managed) {
-            // Git import replaces its administrative tree; manifest link groups must describe
-            // the resulting tree, never names in the source's removed .git directory.
-            hl = wfs::HardlinkSet();
-            if ((rc = wfs::hardlinks_scan(root.c_str(), WFS_MARKER_NAME, &stats, hl))) break;
-        }
         {
             struct stat rst;
             if (::stat(root.c_str(), &rst) == 0) root_mode = (uint32_t)(rst.st_mode & 07777);

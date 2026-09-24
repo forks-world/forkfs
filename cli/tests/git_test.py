@@ -832,6 +832,47 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((self.root / 'two').exists())
         self.assertEqual(json.loads(self.world('list', '--json').stdout), before)
 
+    def test_identity_change_during_mirror_aborts_publication(self):
+        import shlex
+        real_git = shutil.which('git')
+        wrapper = self.root / 'identity-race-bin'
+        wrapper.mkdir()
+        script = wrapper / 'git'
+        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = --mirror ] && mirror=1; done\n'
+                          + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
+                          + 'if [ "$result" = 0 ] && [ "$mirror" = 1 ]; then\n'
+                          + shlex.quote(real_git) + ' -C ' + shlex.quote(str(self.source))
+                          + ' config user.email changed@example.com || exit $?\n'
+                          + 'fi\nexit "$result"\n')
+        script.chmod(0o700)
+        env = dict(self.env)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        self.world('init', str(self.source), code=1)
+        self.env = env
+        self.assertEqual(self.git(self.source, 'config', 'user.email').stdout.strip(), b'changed@example.com')
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        snapshot = self.world('init', str(self.source)).stdout.split()[0].decode()
+        one, _ = self.fork('one', snapshot)
+        self.assertEqual(self.git(one, 'config', 'user.email').stdout.strip(), b'changed@example.com')
+
+    def test_external_hardlinks_are_reported_after_git_import(self):
+        (self.source / 'shared').write_text('linked from outside\n')
+        self.git(self.source, 'add', 'shared')
+        self.git(self.source, 'commit', '-qm', 'shared')
+        os.link(self.source / 'shared', self.root / 'outside-link')
+        # A link on a Git administration file is not a file of the published tree.
+        os.link(self.source / '.git' / 'description', self.root / 'outside-description')
+        # Nor does a worktree file become external because its twin lived in the replaced .git.
+        (self.source / 'twin').write_text('twin\n')
+        self.git(self.source, 'add', 'twin')
+        self.git(self.source, 'commit', '-qm', 'twin')
+        os.link(self.source / 'twin', self.source / '.git' / 'twin-copy')
+        result = self.world('init', str(self.source))
+        self.assertIn(b'names outside this tree', result.stderr)
+        snap = json.loads(self.world('list', '--json').stdout)['snapshots'][0]
+        self.assertEqual((snap['hl_groups'], snap['hl_external']), (0, 1))
+        self.assertIn(b'1 entries also linked from outside the tree', self.world('inspect', 'S1').stdout)
+
     def test_direct_ref_change_during_mirror_aborts_publication(self):
         import shlex
         self.git(self.source, 'update-ref', 'refs/custom/raced', self.base.decode())

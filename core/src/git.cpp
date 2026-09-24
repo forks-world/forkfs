@@ -287,6 +287,17 @@ int capture_settings(const char *root, Vec<GitSetting> &out) {
     }
     return 0;
 }
+// The identity later World commits are attributed with. Captured with the other settings and
+// rechecked before publication, so a World never keeps an identity the source no longer has.
+int capture_identity(const char *root, Vec<GitSetting> &out) {
+    out.clear();
+    for (const char *key : {"user.name", "user.email"}) {
+        String val; bool present = false; const char *args[] = {"config", "--get", key, nullptr};
+        if (int rc = get_config(root, args, val, &present)) return rc;
+        if (present) out.emplace_back(GitSetting{key, val});
+    }
+    return 0;
+}
 bool same_settings(const Vec<GitSetting> &a, const Vec<GitSetting> &b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i)
@@ -634,6 +645,9 @@ int source_unchanged(const GitSource &s) {
     Vec<GitSetting> settings;
     if (int setting_rc = capture_settings(s.root.c_str(), settings)) return setting_rc;
     if (!same_settings(settings, s.settings)) return -EBUSY;
+    Vec<GitSetting> identity;
+    if (int identity_rc = capture_identity(s.root.c_str(), identity)) return identity_rc;
+    if (!same_settings(identity, s.identity)) return -EBUSY;
     Vec<char> direct_refs; if (int ref_rc = capture_refs(s.root.c_str(), direct_refs)) return ref_rc;
     if (!same_bytes(direct_refs, s.refs)) return -EBUSY;
     bool orig_present; String orig; if (int orig_rc = capture_orig(s.root.c_str(), orig_present, orig)) return orig_rc;
@@ -717,6 +731,7 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
         return WFS_E_GIT_UNSUPPORTED;
     if (int policy_rc = reject_import_policy(root)) return policy_rc;
     if (int policy_rc = capture_settings(root, out.settings)) return policy_rc;
+    if (int identity_rc = capture_identity(root, out.identity)) return identity_rc;
     const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (value(root, head_args, out.head)) return WFS_E_GIT_UNSUPPORTED;
     const char *index_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "index", nullptr};
@@ -903,13 +918,8 @@ int git_import(const GitSource &s, const char *clone) {
     }
     if (int rc = config(clone, "worldfs.baseline", s.head.c_str())) return rc;
     if (int rc = config(clone, "worldfs.formatVersion", "1")) return rc;
-    for (const char *key : {"user.name", "user.email"}) {
-        String identity; bool present = false; const char *args[] = {"config", "--get", key, nullptr};
-        if (int rc = get_config(s.root.c_str(), args, identity, &present)) return rc;
-        if (present) {
-            if (int rc = config(clone, key, identity.c_str())) return rc;
-        }
-    }
+    for (const auto &id : s.identity)
+        if (int rc = config(clone, id.key.c_str(), id.value.c_str())) return rc;
     for (const char *key : {"core.autocrlf", "core.safecrlf", "core.eol", "core.checkstat", "core.checkRoundtripEncoding",
                             "core.filemode", "core.symlinks", "core.ignorecase", "core.precomposeunicode", "core.trustctime", "core.ignorestat",
                             "core.useReplaceRefs"})

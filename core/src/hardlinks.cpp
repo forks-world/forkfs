@@ -131,6 +131,8 @@ struct ExclIno {
 struct ScanCtx {
     TreeStats *stats;
     const char *exclude;   // the one tree-relative name that is not a file of this tree
+    const char *exclude_tree = nullptr; // a name removed with its whole subtree (Git's `.git`)
+    size_t exclude_tree_len = 0;
     Vec<Rec> recs;
     Vec<String> names;
     Vec<ExclIno> excl;     // (dev, ino) of the excluded name, when it has links to spare
@@ -153,7 +155,9 @@ int scan_entry(void *ctx, const char *, const char *rel, const struct stat &st, 
     // snapshot did not have, and every verify and every fork of it refused the snapshot from
     // the moment it was published. Exactly one name, matched whole: a `.world` inside a
     // sub-world is left alone here because snapshot creation leaves it alone too.
-    const bool excluded = c->exclude && !::strcmp(rel, c->exclude);
+    const bool excluded = (c->exclude && !::strcmp(rel, c->exclude)) ||
+        (c->exclude_tree && !::strncmp(rel, c->exclude_tree, c->exclude_tree_len) &&
+         (rel[c->exclude_tree_len] == '\0' || rel[c->exclude_tree_len] == '/'));
     if (c->stats) {
         bump(c->stats->entries);
         if (is_dir) bump(c->stats->dirs);
@@ -206,12 +210,13 @@ int scan_entry(void *ctx, const char *, const char *rel, const struct stat &st, 
 } // namespace
 
 int hardlinks_scan(const char *root, const char *exclude_rel, TreeStats *stats,
-                   HardlinkSet &out) {
+                   HardlinkSet &out, const char *exclude_tree) {
     if (stats) *stats = TreeStats();
     out = HardlinkSet();
     ScanCtx c;
     c.stats = stats;
     c.exclude = (exclude_rel && *exclude_rel) ? exclude_rel : nullptr;
+    if (exclude_tree && *exclude_tree) { c.exclude_tree = exclude_tree; c.exclude_tree_len = ::strlen(exclude_tree); }
     if (int rc = fs_walk_tree(root, 4, FS_DIRS_PRE, &c, scan_entry)) return rc;
     if (c.recs.empty()) return 0;
 
