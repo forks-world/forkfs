@@ -116,14 +116,16 @@ refs and indexes. Git 2.48+ is required for Git sources.
 ```bash
 $world fs init ~/src/project
 $world fs init ~/src/dirty-project --include-changes  # preserve index + working changes
+$world fs init ~/src/dirty-project --committed-only   # or start from HEAD, leaving them behind
 $world fs fork --from S1 --to ~/worlds/task          # creates the branch/worktree
 $world fs inspect W1 --json                         # includes Git branch/HEAD/baseline
 $world fs checkpoint W1 --include-changes           # filesystem snapshot, no Git commit
 $world fs publish W1                                # the World's commits -> world/W1 in ~/src/project
 ```
 
-Dirty live Git sources require `--include-changes`; ignored build/data files are
-always retained. Existing linked worktrees are imported without reusing their source
+Dirty live Git sources need an explicit choice: `--include-changes` carries staged,
+unstaged and untracked work, `--committed-only` creates from HEAD and leaves it in the
+source; ignored build/data files are always retained. Existing linked worktrees are imported without reusing their source
 index or registration. Nested repositories/submodules and several advanced Git layouts
 are currently refused, each with a `reason:` line. Remotes, upstreams and aliases come
 along, so `git push origin <branch>` works from a World; `publish` fetches the World's

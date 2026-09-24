@@ -310,6 +310,11 @@ typedef struct wfs_snapshot_opts {
     /* P5: proceed even when the source world has a live `world exec` lock. */
     int force;
     int include_changes; /* Explicitly carry staged, unstaged and untracked Git changes. */
+    /* Create from the committed version: the snapshot's Git-visible content is exactly HEAD
+     * (staged, unstaged and untracked non-ignored changes are left behind; ignored files are
+     * still carried). Only the copy is reset, never the source. Exclusive with
+     * include_changes (-EINVAL); a source without a Git repository is refused. */
+    int committed_only;
 } wfs_snapshot_opts;
 
 /* init and checkpoint are the same operation: clone src_dir into the store and protect it.
@@ -365,6 +370,9 @@ typedef struct wfs_fork_opts {
      * benchmarks use it to measure the miss path; nothing else should need it. */
     int no_pool;
     int include_changes; /* Required for a dirty live Git World, not an immutable snapshot. */
+    /* A live Git World only: fork its committed version, as wfs_snapshot_opts.committed_only.
+     * -EINVAL with include_changes or with a snapshot source. */
+    int committed_only;
 } wfs_fork_opts;
 
 /* Self-contained Git worktree metadata. Inspection requires a readable live tree. */

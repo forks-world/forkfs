@@ -1450,6 +1450,34 @@ int require_clean_tree(const char *root) {
     if (int rc = git(root, args, &dirty, nullptr, false, true)) return rc;
     return dirty.size() > 1 ? WFS_E_GIT_DIRTY : 0;
 }
+// --committed-only: make the copy's Git-visible content exactly HEAD. Only the copy is touched;
+// the source was captured read-only and is rechecked unchanged before this runs. The index is
+// refreshed first (the copy's inodes and ctimes differ from the ones it records), so the reset
+// rewrites only files whose content differs from HEAD and the rest stay clones of the source's
+// blocks. `clean` without -x removes untracked, non-ignored files and keeps ignored build/data
+// artifacts and the reserved administration; `read-tree --reset -u` then puts back modified and
+// deleted tracked files and drops files that were only staged. They run with the user's ambient
+// configuration, like the clean check, so "ignored" and "clean" mean what the user's Git says.
+// No filter can run: reject_used_filters refused any that tracked files use, and hooks are off.
+// SQUASH_MSG describes staged content that no longer exists, so it goes too.
+int reset_to_head(const char *clone) {
+    const char *refresh[] = {"update-index", "-q", "--refresh", nullptr};
+    int status = -1;
+    int rc = git(clone, refresh, nullptr, &status, true, true);
+    if (rc && !(rc == WFS_E_GIT_FAILED && status == 1)) return rc;
+    const char *clean[] = {"clean", "-f", "-d", "-q", "--", ".", ":(exclude,top,literal).world",
+                           ":(exclude,top,literal).world-git", nullptr};
+    if ((rc = git(clone, clean, nullptr, nullptr, false, true))) return rc;
+    const char *reset[] = {"read-tree", "--reset", "-u", "HEAD", nullptr};
+    if ((rc = git(clone, reset, nullptr, nullptr, false, true))) return rc;
+    // A directory the reset emptied of staged additions, or anything else left untracked.
+    if ((rc = git(clone, clean, nullptr, nullptr, false, true))) return rc;
+    String squash;
+    const char *squash_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "SQUASH_MSG", nullptr};
+    if ((rc = value(clone, squash_args, squash))) return rc;
+    if (unlink(squash.c_str()) && errno != ENOENT) return -errno;
+    return 0;
+}
 // `for-each-ref` (and therefore the mirror) silently omits a symbolic ref whose target does
 // not exist, e.g. after `git symbolic-ref refs/heads/alias refs/heads/future`, so the captured
 // map cannot be treated as complete on its own. Symbolic refs are only ever loose files in the
@@ -1626,15 +1654,19 @@ int reject_reserved_paths(const char *root, const GitSource &s) {
     if (int rc = git(root, args.data(), &hit)) return rc;
     return hit.size() > 1 ? refuse(WFS_E_GIT_UNSUPPORTED, "a preserved commit tracks the reserved path .world or .world-git") : 0;
 }
-int git_source(const char *root, bool include_changes, GitSource &out) {
+int git_source(const char *root, bool include_changes, GitSource &out, bool committed_only) {
     g_reason[0] = '\0';
+    if (include_changes && committed_only) return -EINVAL;
     if (int rc = nested_check(root)) return rc;
     String dot = joinp(root, ".git"), managed = joinp(root, ".world-git");
     struct stat st;
     bool has_managed = lstat(managed.c_str(), &st) == 0;
     if (!has_managed && errno != ENOENT) return -errno;
-    if (lstat(dot.c_str(), &st))
-        return errno == ENOENT && !has_managed ? 0 : refuse(WFS_E_GIT_UNSUPPORTED, ".world-git exists without its .git marker");
+    if (lstat(dot.c_str(), &st)) {
+        if (errno == ENOENT && !has_managed)
+            return committed_only ? refuse(WFS_E_GIT_UNSUPPORTED, "--committed-only needs a Git repository at the source root") : 0;
+        return refuse(WFS_E_GIT_UNSUPPORTED, ".world-git exists without its .git marker");
+    }
     if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) return refuse(WFS_E_GIT_UNSUPPORTED, ".git is neither a directory nor a file");
     out.present = true; out.root = root;
     if (has_managed) {
@@ -1727,8 +1759,11 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
         i += strlen(listing.data() + i) + 1;
     }
     if ((rc = reject_reserved_paths(root, out))) return rc;
+    // With --committed-only the copy is reset to HEAD and must then be clean; the source's own
+    // uncommitted state is simply not carried, so it is not a reason to refuse.
     out.require_clean = !include_changes;
-    if (!include_changes) {
+    out.committed_only = committed_only;
+    if (!include_changes && !committed_only) {
         if ((rc = require_clean_tree(root))) return rc;
     }
     return 0;
@@ -1822,6 +1857,9 @@ int git_import(const GitSource &s, const char *clone) {
             copy.orig_present != s.orig_present || copy.orig_head != s.orig_head) return -EBUSY;
         if (int rc = reject_copied_locks(clone)) return rc;
         if (int rc = pin_identity(s.root.c_str(), clone)) return rc;
+        if (s.committed_only) {
+            if (int rc = reset_to_head(clone)) return rc;
+        }
         // HEAD and the index do not change when a tracked file is edited after the source's
         // clean check, so check the copy that will actually be published. Re-probe the copy's
         // own ambient policy and filters first: GIT_CONFIG_GLOBAL/SYSTEM and other per-directory
@@ -1943,6 +1981,9 @@ int git_import(const GitSource &s, const char *clone) {
     if (!same_bytes(imported_refs, s.refs)) return -EBUSY;
     if (int rc = source_unchanged(s)) return rc;
     if (int rc = pin_identity(s.root.c_str(), clone)) return rc;
+    if (s.committed_only) {
+        if (int rc = reset_to_head(clone)) return rc;
+    }
     // The owned repository now carries the source's index and status settings, so this sees the
     // bytes that will be published, including edits made after the source's own clean check.
     // Re-probe ambient policy and filters beside the copy first, for the same reason as above:

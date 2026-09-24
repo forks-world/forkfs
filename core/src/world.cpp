@@ -1078,6 +1078,28 @@ void hl_drop_broken(wfs::HardlinkSet &hl, const Vec<uint64_t> &broken) {
     hl = std::move(kept);
 }
 
+// --committed-only resets the clone to HEAD after the replay, and Git rewrites a file by
+// replacing it: a hardlinked tracked file that differed from HEAD, or an untracked one that was
+// removed, leaves its group no longer whole in this tree. Such groups come out of the set for
+// the same reason as hl_drop_broken's -- the manifest must describe the tree it is written for.
+void hl_drop_changed(const char *root, wfs::HardlinkSet &hl) {
+    Vec<uint64_t> broken;
+    for (size_t i = 0; i < hl.groups.size(); ++i) {
+        const auto &g = hl.groups[i];
+        struct stat first;
+        bool whole = !g.paths.empty();
+        for (size_t j = 0; whole && j < g.paths.size(); ++j) {
+            String p = joinp(root, g.paths[j].c_str());
+            struct stat st;
+            if (::lstat(p.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) whole = false;
+            else if (j == 0) first = st;
+            else if (st.st_dev != first.st_dev || st.st_ino != first.st_ino) whole = false;
+        }
+        if (!whole) broken.emplace_back((uint64_t)i);
+    }
+    if (broken.size()) hl_drop_broken(hl, broken);
+}
+
 } // namespace
 
 // The one interleaving a test cannot produce from outside: the middle of a pool-backed fork,
@@ -1178,7 +1200,7 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         if (int rc = exec_lock_guard(s, from_world, o.force)) return rc;
     }
     wfs::GitSource git_source;
-    if (int rc = wfs::git_source(src.c_str(), o.include_changes != 0, git_source)) return rc;
+    if (int rc = wfs::git_source(src.c_str(), o.include_changes != 0, git_source, o.committed_only != 0)) return rc;
 
     // P6: st_dev equality does not predict clonefile success, so really clone something.
     if (int rc = wfs_store_clone_probe(s, src.c_str())) return rc;
@@ -1273,6 +1295,7 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         if (hlr.broken.size()) hl_drop_broken(hl, hlr.broken);
         // The source scan already left the replaced `.git` out, so `hl` describes this tree.
         if ((rc = wfs::git_import(git_source, root.c_str()))) break;
+        if (git_source.committed_only && hl.groups.size()) hl_drop_changed(root.c_str(), hl);
         {
             struct stat rst;
             if (::stat(root.c_str(), &rst) == 0) root_mode = (uint32_t)(rst.st_mode & 07777);
@@ -1544,8 +1567,11 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
     wfs::GitSource git_source;
     bool git_snapshot = false;
     if (from.kind == WFS_K_WORLD) {
-        if (int rc = wfs::git_source(src.c_str(), o.include_changes != 0, git_source)) return rc;
+        if (int rc = wfs::git_source(src.c_str(), o.include_changes != 0, git_source, o.committed_only != 0)) return rc;
     } else {
+        // A snapshot's content was fixed when it was taken; there is no working state to leave
+        // behind. Refused rather than ignored, since the caller asked for something specific.
+        if (o.committed_only) return -EINVAL;
         SnapGate gate;
         if (src_gated) { if (int rc = gate.open(src.c_str(), false)) return rc; }
         String dot = joinp(src.c_str(), ".git"); struct stat gst;

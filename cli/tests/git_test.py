@@ -209,6 +209,136 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(two, 'status', '--porcelain').stdout, status)
         self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, status)
 
+    def tree_bytes(self, root):
+        """Every file and symlink under root, with its bytes: the whole tree, .git included."""
+        out = {}
+        for base, dirs, files in os.walk(root):
+            for name in files + [d for d in dirs if (Path(base) / d).is_symlink()]:
+                path = Path(base) / name
+                rel = str(path.relative_to(root))
+                out[rel] = os.readlink(path) if path.is_symlink() else path.read_bytes()
+            for name in dirs:
+                out[str((Path(base) / name).relative_to(root)) + '/'] = b''
+        return out
+
+    def make_dirty(self, root):
+        """A staged change, a staged addition, an unstaged change, a deleted tracked file, new
+        untracked files (one in a new directory) and ignored artifacts."""
+        (root / 'file').write_text('staged\n')
+        (root / 'new-staged').write_text('only in index\n')
+        self.git(root, 'add', 'file', 'new-staged')
+        (root / 'sub' / 'tracked').write_text('unstaged\n')
+        (root / 'gone').unlink()
+        (root / 'untracked').write_text('untracked\n')
+        (root / 'scratch').mkdir()
+        (root / 'scratch' / 'note').write_text('untracked in a new directory\n')
+        (root / 'scratch' / 'trace.log').write_text('ignored in an untracked directory\n')
+        (root / 'build').mkdir(exist_ok=True)
+        (root / 'build' / 'model.bin').write_bytes(b'ignored artifact')
+
+    def assert_committed(self, world, head):
+        self.assertEqual(self.git(world, 'status', '--porcelain', '--untracked-files=all').stdout, b'')
+        self.assertEqual(self.git(world, 'rev-parse', 'HEAD').stdout.strip(), head)
+        self.assertEqual(self.git(world, 'diff', '--cached', '--name-only', 'HEAD').stdout, b'')
+        self.assertEqual((world / 'file').read_text(), 'original\n')
+        self.assertEqual((world / 'sub' / 'tracked').read_text(), 'tracked\n')
+        self.assertEqual((world / 'gone').read_text(), 'deleted in the source\n')
+        for absent in ('new-staged', 'untracked', 'scratch/note'):
+            self.assertFalse((world / absent).exists(), absent)
+        self.assertEqual((world / 'build' / 'model.bin').read_bytes(), b'ignored artifact')
+        self.assertEqual((world / 'scratch' / 'trace.log').read_text(), 'ignored in an untracked directory\n')
+
+    def committed_only_fixture(self):
+        (self.source / '.gitignore').write_text('build/\n*.log\n')
+        (self.source / 'sub').mkdir()
+        (self.source / 'sub' / 'tracked').write_text('tracked\n')
+        (self.source / 'gone').write_text('deleted in the source\n')
+        self.git(self.source, 'add', '.')
+        self.git(self.source, 'commit', '-qm', 'more files')
+        return self.git(self.source, 'rev-parse', 'HEAD').stdout.strip()
+
+    def test_committed_only_creates_from_head_and_leaves_the_source_alone(self):
+        head = self.committed_only_fixture()
+        self.make_dirty(self.source)
+        # A passive squash message belongs to the staged content, which is not carried.
+        (self.source / '.git' / 'SQUASH_MSG').write_text('squashed work\n')
+        before = self.tree_bytes(self.source)
+        self.world('init', str(self.source), code=3)
+        both = self.world('init', str(self.source), '--committed-only', '--include-changes', code=2)
+        self.assertIn(b'mutually exclusive', both.stderr)
+        self.world('init', str(self.source), '--committed-only')
+        self.assertEqual(self.tree_bytes(self.source), before)
+        one, _ = self.fork()
+        self.assert_committed(one, head)
+        message = self.git(one, 'rev-parse', '--path-format=absolute', '--git-path', 'SQUASH_MSG').stdout.decode().strip()
+        self.assertFalse(Path(message).exists())
+        self.world('verify', 'S1')
+        # The source keeps every staged, unstaged, deleted and untracked change it had.
+        self.assertEqual(self.tree_bytes(self.source), before)
+        self.assertEqual(self.git(self.source, 'show', ':file').stdout, b'staged\n')
+        self.assertEqual((self.source / 'sub' / 'tracked').read_text(), 'unstaged\n')
+        self.assertFalse((self.source / 'gone').exists())
+        # A World commit on top of HEAD contains none of the source's uncommitted work.
+        (one / 'file').write_text('world change\n')
+        self.git(one, 'commit', '-qam', 'world')
+        self.assertEqual(self.git(one, 'show', '--name-only', '--format=', 'HEAD').stdout, b'file\n')
+        # Without a repository there is no committed version to start from.
+        plain = self.root / 'plain'
+        plain.mkdir()
+        (plain / 'data').write_text('data\n')
+        refused = self.world('init', str(plain), '--committed-only', code=3)
+        self.assertIn(b'reason: --committed-only needs a Git repository', refused.stderr)
+
+    def test_committed_only_snapshot_records_only_hardlinks_it_still_has(self):
+        for name in ('a', 'b', 'c', 'd'):
+            (self.source / name).write_text('shared\n')
+        self.git(self.source, 'add', '.')
+        self.git(self.source, 'commit', '-qm', 'twins')
+        # Same content, so Git sees no change: a and b become one inode, as do c and d.
+        for first, second in (('a', 'b'), ('c', 'd')):
+            (self.source / second).unlink()
+            os.link(self.source / first, self.source / second)
+        # Writing through a changes b as well; the reset puts both back as separate files.
+        with open(self.source / 'a', 'w') as f:
+            f.write('changed through a hardlink\n')
+        self.world('init', str(self.source), '--committed-only')
+        self.world('verify', 'S1')
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        for name in ('a', 'b', 'c', 'd'):
+            self.assertEqual((one / name).read_text(), 'shared\n')
+        # The untouched pair is still one inode in every fork.
+        self.assertEqual((one / 'c').stat().st_ino, (one / 'd').stat().st_ino)
+        self.assertEqual((self.source / 'b').read_text(), 'changed through a hardlink\n')
+
+    def test_committed_only_fork_and_checkpoint_of_a_dirty_world(self):
+        head = self.committed_only_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.make_dirty(one)
+        status = self.git(one, 'status', '--porcelain').stdout
+        self.assertNotEqual(status, b'')
+        staged = self.git(one, 'ls-files', '--stage').stdout
+        self.world('fork', '--from', wid, '--to', str(self.root / 'refused'), code=3)
+        self.world('fork', '--from', wid, '--to', str(self.root / 'both'), '--committed-only',
+                   '--include-changes', code=2)
+        two, _ = self.fork('two', wid, '--committed-only')
+        self.assert_committed(two, head)
+        self.assertEqual(self.git(two, 'branch', '--show-current').stdout.strip(), b'world/W2')
+        self.world('checkpoint', wid, code=3)
+        self.world('checkpoint', wid, '--committed-only')
+        three, _ = self.fork('three', 'S2')
+        self.assert_committed(three, head)
+        self.world('verify', 'S2')
+        # The World the copies came from keeps its uncommitted work, index included.
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, status)
+        self.assertEqual(self.git(one, 'ls-files', '--stage').stdout, staged)
+        self.assertEqual((one / 'untracked').read_text(), 'untracked\n')
+        # A snapshot's content is already fixed.
+        snap = self.world('fork', '--from', 'S1', '--to', str(self.root / 'snap'), '--committed-only', code=2)
+        self.assertIn(b'--committed-only needs --from W<n>', snap.stderr)
+        self.assertFalse((self.root / 'snap').exists())
+
     def test_linked_source_can_be_deleted_after_import(self):
         linked = self.root / 'linked'
         self.git(self.source, 'worktree', 'add', '-b', 'linked', str(linked))

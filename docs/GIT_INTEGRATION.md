@@ -180,12 +180,26 @@ history to the checks that follow.
 
 ## Uncommitted content
 
-A dirty source is refused by default. Pass `--include-changes` to `init`, `checkpoint`, or
-`fork --from W<n>` to explicitly preserve staged changes, unstaged changes, and untracked
-files. The copied index preserves the staging boundary; no automatic `git add`, commit,
-reset or checkout is applied to user files. Ignored build/data files are always copied,
-including when a source is otherwise clean. Forking an immutable snapshot carries the
-content already captured by that snapshot without another opt-in.
+A dirty source is refused by default; `init`, `checkpoint` and `fork --from W<n>` take one
+of two explicit choices (passing both is a usage error):
+
+- `--include-changes` carries the current work: staged changes, unstaged changes, and
+  untracked files. The copied index preserves the staging boundary; no automatic `git add`,
+  commit, reset or checkout is applied to user files.
+- `--committed-only` creates from the committed version: the new snapshot or World's
+  Git-visible content is exactly HEAD, with a clean `git status`. Staged and unstaged
+  changes, deleted tracked files, files that were only staged, and untracked files that are
+  not ignored stay behind; a pending `SQUASH_MSG`, which describes staged content, is not
+  carried either. Only the copy is reset (`update-index --refresh`, `clean -fd` without
+  `-x`, `read-tree --reset -u HEAD`), never the source: its HEAD, index and files are left
+  byte-for-byte as they were. Files that already match HEAD are not rewritten, so they stay
+  clones of the source's blocks, and a hardlink group the reset replaces is dropped from the
+  snapshot's record. No filter or hook runs. A source without a Git repository is refused.
+
+Ignored build/data files are always copied, with either choice and when a source is
+otherwise clean. Forking an immutable snapshot carries the content already captured by that
+snapshot without another opt-in; `--committed-only` is refused there, since a snapshot has
+no working state to leave behind (fork it and use Git, or checkpoint a World with the flag).
 
 The source HEAD and index are checked again around import; detected changes fail the
 operation before publication. Without `--include-changes`, the copied tree is also checked
@@ -224,9 +238,8 @@ content, including Git administrative changes such as branch/index updates.
   crash) is refused, so the lock is never copied into the child. Merge/rebase/cherry-pick/revert in progress
   is also refused, as is an unconcluded `git notes merge`, whose state is invisible to
   `git status`. Re-import older snapshots that still contain an unconverted `.git`.
-- Git LFS hydration, recursive submodule import, a shared refs/object service, a switch to
-  discard current edits and materialize only HEAD, and cross-machine history transfer are
-  not provided. This increment does not close every requirement in Issue #7.
+- Git LFS hydration, recursive submodule import, a shared refs/object service, and
+  cross-machine history transfer are not provided. This increment does not close every requirement in Issue #7.
 - Repository-local `core.excludesFile` and `core.attributesFile` overrides are unsupported.
   They can point outside the repository, and merging their rules into `info/exclude` or
   `info/attributes` would change Git's precedence; these overrides are not imported. Use the
@@ -245,7 +258,7 @@ content, including Git administrative changes such as branch/index updates.
   A failed Git command does not publish a World or change the source repository; existing
   temporary-tree recovery handles interrupted work. No new store schema is introduced.
 
-Validation: `cli_git_test` uses disposable real repositories and covers clean/dirty imports,
+Validation: `cli_git_test` uses disposable real repositories and covers clean/dirty imports, committed-only imports,
 staging preservation, imported linked worktrees after source deletion, independent commits,
 branch collisions, detached HEAD, move/discard/restore/checkpoint, hard snapshots, pool
 refusal, Git setup rollback, environment isolation and Git commits inside the exec sandbox.
