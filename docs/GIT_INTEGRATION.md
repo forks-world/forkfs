@@ -3,7 +3,8 @@
 `world fs init` detects a Git repository at the source root. It imports an independent
 repository into the snapshot; each subsequent `world fs fork` automatically creates a
 native linked worktree on a new `world/W<n>` branch. A conflicting existing branch is
-preserved and a numeric suffix is chosen (`world-W<n>` if `world` itself is a branch). Ordinary directories need no Git installation.
+preserved and the first free numeric suffix is chosen, however many generated names
+already exist (`world-W<n>` if `world` itself is a branch). Ordinary directories need no Git installation.
 Git repositories require Git 2.48 or newer on PATH (relative worktree support).
 
 ```sh
@@ -158,7 +159,12 @@ ref-name/object-ID snapshot before publication. A concurrent non-HEAD ref update
 aborts the import rather than publishing a stale mirror. Sources must still remain
 quiescent during import; validation does not lock arbitrary external Git writers.
 
+Learned `git rerere` resolutions in the common `rr-cache` are copied into the owned
+repository and rechecked before publication, so recurring conflicts still resolve after
+the source is deleted. Git's layout of one directory per conflict holding regular files
+is required: a symlinked cache, nested directories or special files are refused.
+
 External imports budget the full logical size of the common Git object directory
-in addition to filesystem clone metadata and the free-space reserve. This includes
+and the rerere cache in addition to filesystem clone metadata and the free-space reserve. This includes
 objects outside a linked worktree. Managed Worlds use filesystem cloning for their
 owned object databases and do not incur this additional full-copy budget.

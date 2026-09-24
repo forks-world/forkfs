@@ -482,6 +482,110 @@ int reject_import_policy(const char *root) {
     if (int rc = value(root, shared_args, val)) return rc;
     return val.empty() ? 0 : WFS_E_GIT_UNSUPPORTED;
 }
+// Learned rerere resolutions live in the common directory's rr-cache, which a mirror clone
+// does not copy. Git's layout is one directory per conflict holding regular files; anything
+// else (a symlinked cache, nested directories, special files) is refused rather than guessed.
+// Records are "<dir>/\0" for each directory, then "<dir>/<file>\0" + 8-byte length + bytes,
+// both in byte order, so two captures of an unchanged cache compare equal.
+void sort_names(Vec<String> &v) {
+    for (size_t i = 1; i < v.size(); ++i)
+        for (size_t j = i; j > 0 && strcmp(v[j - 1].c_str(), v[j].c_str()) > 0; --j) {
+            String t(v[j]); v[j] = v[j - 1]; v[j - 1] = t;
+        }
+}
+int list_names(int fd, Vec<String> &out) {
+    int dup_fd = dup(fd);
+    if (dup_fd < 0) return -errno;
+    DIR *d = fdopendir(dup_fd);
+    if (!d) { int rc = -errno; close(dup_fd); return rc; }
+    rewinddir(d);
+    out.clear(); int rc = 0;
+    for (;;) {
+        errno = 0; dirent *e = readdir(d);
+        if (!e) { if (errno) rc = -errno; break; }
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        out.emplace_back(e->d_name);
+    }
+    closedir(d);
+    if (!rc) sort_names(out);
+    return rc;
+}
+void append_record(Vec<char> &blob, const char *a, const char *b) {
+    for (const char *p = a; *p; ++p) blob.emplace_back(*p);
+    blob.emplace_back('/');
+    if (b) for (const char *p = b; *p; ++p) blob.emplace_back(*p);
+    blob.emplace_back('\0');
+}
+int capture_rerere(const char *root, Vec<char> &blob, bool &present, uint64_t &bytes) {
+    blob.clear(); present = false; bytes = 0;
+    // rr-cache is always in the common directory. `rev-parse --git-path rr-cache` would resolve
+    // a symlinked cache to its target and hide that it lives outside the repository.
+    String common;
+    const char *args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
+    if (int rc = value(root, args, common)) return rc;
+    String cache = joinp(common.c_str(), "rr-cache");
+    int fd = open(cache.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) return 0;
+        return errno == ENOTDIR || errno == ELOOP ? WFS_E_GIT_UNSUPPORTED : -errno;
+    }
+    present = true;
+    Vec<String> dirs;
+    int rc = list_names(fd, dirs);
+    for (size_t i = 0; !rc && i < dirs.size(); ++i) {
+        struct stat st;
+        if (fstatat(fd, dirs[i].c_str(), &st, AT_SYMLINK_NOFOLLOW)) { rc = -errno; break; }
+        if (!S_ISDIR(st.st_mode)) { rc = WFS_E_GIT_UNSUPPORTED; break; }
+        int sub = openat(fd, dirs[i].c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (sub < 0) { rc = -errno; break; }
+        append_record(blob, dirs[i].c_str(), nullptr);
+        Vec<String> files;
+        rc = list_names(sub, files);
+        for (size_t j = 0; !rc && j < files.size(); ++j) {
+            if (fstatat(sub, files[j].c_str(), &st, AT_SYMLINK_NOFOLLOW)) { rc = -errno; break; }
+            if (!S_ISREG(st.st_mode)) { rc = WFS_E_GIT_UNSUPPORTED; break; }
+            String dir_path = joinp(cache.c_str(), dirs[i].c_str());
+            String path = joinp(dir_path.c_str(), files[j].c_str());
+            Vec<char> data;
+            if ((rc = read_bytes(path.c_str(), data))) break;
+            append_record(blob, dirs[i].c_str(), files[j].c_str());
+            uint64_t n = data.size();
+            for (int k = 0; k < 8; ++k) blob.emplace_back((char)(n >> (8 * k)));
+            for (char c : data) blob.emplace_back(c);
+            bytes += n + 4096;
+        }
+        close(sub);
+        bytes += 4096;
+    }
+    close(fd);
+    return rc;
+}
+int restore_rerere(const char *repo, const Vec<char> &blob) {
+    String cache = joinp(repo, "rr-cache");
+    if (int rc = fs_mkdir(cache.c_str(), 0700)) return rc;
+    size_t i = 0, n = blob.size();
+    while (i < n) {
+        size_t end = i;
+        while (end < n && blob[end]) ++end;
+        if (end == n || end == i) return -EIO;
+        String rel(blob.data() + i, end - i);
+        i = end + 1;
+        String path = joinp(cache.c_str(), rel.c_str());
+        if (rel.back() == '/') {
+            path.pop_back();
+            if (int rc = fs_mkdir(path.c_str(), 0700)) return rc;
+            continue;
+        }
+        if (n - i < 8) return -EIO;
+        uint64_t len = 0;
+        for (int k = 0; k < 8; ++k) len |= (uint64_t)(unsigned char)blob[i + k] << (8 * k);
+        i += 8;
+        if (len > n - i) return -EIO;
+        if (int rc = write_bytes(path.c_str(), blob.data() + i, (size_t)len)) return rc;
+        i += (size_t)len;
+    }
+    return 0;
+}
 int source_unchanged(const GitSource &s) {
     if (int rc = reject_inprogress(s.root.c_str())) return rc;
     if (int rc = reject_import_policy(s.root.c_str())) return rc;
@@ -525,7 +629,10 @@ int source_unchanged(const GitSource &s) {
         if (int rc = value(s.root.c_str(), a, common)) return rc;
         uint64_t bytes = 0;
         if (int rc = object_import_bytes(common.c_str(), bytes)) return rc;
-        if (bytes != s.import_bytes) return -EBUSY;
+        if (bytes + s.rerere_bytes != s.import_bytes) return -EBUSY;
+        Vec<char> rerere; bool rerere_present = false; uint64_t rerere_bytes = 0;
+        if (int rc = capture_rerere(s.root.c_str(), rerere, rerere_present, rerere_bytes)) return rc;
+        if (rerere_present != s.rerere_present || !same_bytes(rerere, s.rerere)) return -EBUSY;
     }
     Vec<GitSymref> refs;
     if (int symrc = collect_symrefs(s.root.c_str(), refs)) return symrc;
@@ -593,6 +700,10 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     if ((rc = capture_orig(root, out.orig_present, out.orig_head))) return rc;
     if ((rc = collect_symrefs(root, out.symrefs))) return rc;
     if ((rc = reject_inprogress(root))) return rc;
+    if (!out.managed) {
+        if ((rc = capture_rerere(root, out.rerere, out.rerere_present, out.rerere_bytes))) return rc;
+        out.import_bytes += out.rerere_bytes;
+    }
     // Sparse/split indexes and gitlinks require a separate import contract.
     const char *ls_args[] = {"ls-files", "--stage", "-z", nullptr};
     Vec<char> listing;
@@ -685,6 +796,9 @@ int git_import(const GitSource &s, const char *clone) {
         String attributes_path = joinp(repo.c_str(), "info/attributes");
         if (int rc = write_bytes(attributes_path.c_str(), s.attributes.data(), s.attributes.size())) return rc;
     }
+    if (s.rerere_present) {
+        if (int rc = restore_rerere(repo.c_str(), s.rerere)) return rc;
+    }
     if (int rc = config(clone, "worldfs.baseline", s.head.c_str())) return rc;
     if (int rc = config(clone, "worldfs.formatVersion", "1")) return rc;
     for (const char *key : {"user.name", "user.email"}) {
@@ -762,10 +876,13 @@ int git_branch(const char *clone, wfs_id world) {
     for (const auto &name : names) if (name == "refs/heads/world") root_taken = true;
     char branch[96];
     bool available = false;
-    for (unsigned suffix = 0; suffix < 128; ++suffix) {
+    // Each existing branch blocks at most one candidate (by equality or as a directory prefix),
+    // so names.size() + 1 candidates always include a free one.
+    for (size_t suffix = 0; suffix <= names.size(); ++suffix) {
         const char *sep = root_taken ? "-" : "/";
         if (!suffix) snprintf(branch, sizeof branch, "refs/heads/world%sW%llu", sep, (unsigned long long)world);
-        else snprintf(branch, sizeof branch, "refs/heads/world%sW%llu-%u", sep, (unsigned long long)world, suffix);
+        else snprintf(branch, sizeof branch, "refs/heads/world%sW%llu-%llu", sep, (unsigned long long)world,
+                      (unsigned long long)suffix);
         available = true;
         size_t len = strlen(branch);
         for (const auto &name : names) {

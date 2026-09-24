@@ -30,6 +30,11 @@ struct GitSource {
     Vec<char> refs;
     bool orig_present = false;
     String orig_head;
+    // rr-cache of an external source, as sorted records (see capture_rerere); managed Worlds
+    // carry theirs inside the cloned tree. import_bytes includes rerere_bytes.
+    Vec<char> rerere;
+    bool rerere_present = false;
+    uint64_t rerere_bytes = 0;
     uint64_t import_bytes = 0;
 };
 int git_source(const char *root, bool include_changes, GitSource &out);

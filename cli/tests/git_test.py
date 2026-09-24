@@ -822,6 +822,93 @@ class GitWorldTest(unittest.TestCase):
         with self.subTest(marker='promisor-pack-only'):
             refused()
 
+    def test_many_generated_branch_collisions_still_fork(self):
+        lines = ['create refs/heads/world/W1 ' + self.base.decode()]
+        lines += ['create refs/heads/world/W1-%d %s' % (i, self.base.decode()) for i in range(1, 131)]
+        subprocess.run(['git', '-C', str(self.source), 'update-ref', '--stdin'], env=self.env, check=True,
+                       input=('\n'.join(lines) + '\n').encode())
+        self.world('init', str(self.source))
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'branch', '--show-current').stdout.strip(), b'world/W1-131')
+        self.assertEqual(self.git(one, 'rev-parse', 'world/W1-130').stdout.strip(), self.base)
+
+    def make_rerere_resolution(self):
+        self.git(self.source, 'config', 'rerere.enabled', 'true')
+        self.git(self.source, 'checkout', '-q', '-b', 'side')
+        (self.source / 'file').write_text('side\n')
+        self.git(self.source, 'commit', '-qam', 'side')
+        self.git(self.source, 'checkout', '-q', 'main')
+        (self.source / 'file').write_text('main\n')
+        self.git(self.source, 'commit', '-qam', 'main')
+        before = self.git(self.source, 'rev-parse', 'HEAD').stdout.strip().decode()
+        self.git(self.source, 'merge', 'side', code=1)
+        (self.source / 'file').write_text('resolved\n')
+        self.git(self.source, 'add', 'file')
+        self.git(self.source, 'commit', '-qm', 'merge')
+        self.git(self.source, 'reset', '-q', '--hard', before)
+        self.git(self.source, 'config', '--unset', 'rerere.enabled')
+        cache = self.source / '.git' / 'rr-cache'
+        self.assertTrue(any(cache.rglob('postimage')))
+        return cache
+
+    def test_rerere_resolutions_survive_source_deletion(self):
+        cache = self.make_rerere_resolution()
+        expected = sorted((p.relative_to(cache).as_posix(), p.read_bytes()) for p in cache.rglob('*') if p.is_file())
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        path = self.git(one, 'rev-parse', '--path-format=absolute', '--git-path', 'rr-cache').stdout.decode().strip()
+        owned = Path(path)
+        self.assertEqual(sorted((p.relative_to(owned).as_posix(), p.read_bytes())
+                                for p in owned.rglob('*') if p.is_file()), expected)
+        merged = self.git(one, 'merge', 'side', code=1)
+        self.assertIn(b'previous resolution', merged.stdout + merged.stderr)
+        self.assertEqual((one / 'file').read_text(), 'resolved\n')
+
+    def test_rerere_cache_change_during_mirror_aborts_publication(self):
+        import shlex
+        cache = self.make_rerere_resolution()
+        postimage = next(cache.rglob('postimage'))
+        real_git = shutil.which('git')
+        wrapper = self.root / 'rerere-race-bin'
+        wrapper.mkdir()
+        script = wrapper / 'git'
+        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = --mirror ] && mirror=1; done\n'
+                          + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
+                          + 'if [ "$result" = 0 ] && [ "$mirror" = 1 ]; then\n'
+                          + 'printf "raced\\n" >> ' + shlex.quote(str(postimage)) + ' || exit $?\n'
+                          + 'fi\nexit "$result"\n')
+        script.chmod(0o700)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        self.world('init', str(self.source), code=1)
+        self.assertTrue(postimage.read_bytes().endswith(b'raced\n'))
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_unexpected_rerere_cache_layouts_are_refused(self):
+        cache = self.source / '.git' / 'rr-cache'
+        elsewhere = self.root / 'shared-rr-cache'
+        elsewhere.mkdir()
+        cache.symlink_to(elsewhere)
+        with self.subTest(layout='symlinked cache'):
+            result = self.world('init', str(self.source), code=3)
+            self.assertIn(b'unsupported Git layout', result.stderr)
+        cache.unlink()
+        cache.mkdir()
+        (cache / 'stray').write_text('not a conflict directory\n')
+        with self.subTest(layout='file at top level'):
+            self.world('init', str(self.source), code=3)
+        (cache / 'stray').unlink()
+        (cache / 'abc').mkdir()
+        (cache / 'abc' / 'nested').mkdir()
+        with self.subTest(layout='nested directory'):
+            self.world('init', str(self.source), code=3)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        (cache / 'abc' / 'nested').rmdir()
+        self.world('init', str(self.source))
+        one, _ = self.fork()
+        path = self.git(one, 'rev-parse', '--path-format=absolute', '--git-path', 'rr-cache').stdout.decode().strip()
+        self.assertTrue((Path(path) / 'abc').is_dir())
+
     def test_branch_prefix_collision_is_not_overwritten(self):
         self.git(self.source, 'branch', 'world')
         self.world('init', str(self.source))
