@@ -962,6 +962,45 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(one, 'branch', '--show-current').stdout.strip(), b'world-W1')
         self.assertEqual(self.git(one, 'rev-parse', 'world').stdout.strip(), self.base)
 
+    def test_tracked_reserved_paths_are_refused(self):
+        def refused(*args):
+            result = self.world(*args, code=3)
+            self.assertIn(b'unsupported Git layout', result.stderr)
+        (self.source / '.world').write_text('tracked by the user\n')
+        self.git(self.source, 'add', '-f', '.world')
+        self.git(self.source, 'commit', '-qm', 'track .world')
+        # A present `.world` makes init treat the directory as a World; the reachable case is
+        # a tracked path whose file is gone from the worktree.
+        (self.source / '.world').unlink()
+        with self.subTest(case='.world in HEAD and index'):
+            refused('init', str(self.source), '--include-changes')
+        self.git(self.source, 'rm', '-q', '--cached', '.world')
+        with self.subTest(case='.world in HEAD only'):
+            refused('init', str(self.source), '--include-changes')
+        self.git(self.source, 'commit', '-qm', 'untrack .world')
+        (self.source / '.world-git').mkdir()
+        (self.source / '.world-git' / 'note').write_text('staged only\n')
+        self.git(self.source, 'add', '-f', '.world-git/note')
+        shutil.rmtree(self.source / '.world-git')
+        with self.subTest(case='.world-git in index only'):
+            refused('init', str(self.source), '--include-changes')
+        self.git(self.source, 'rm', '-q', '--cached', '.world-git/note')
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        (self.source / 'sub').mkdir()
+        (self.source / 'sub' / '.world').write_text('not the root marker\n')
+        self.git(self.source, 'add', '-f', 'sub/.world')
+        self.git(self.source, 'commit', '-qm', 'nested .world is ordinary content')
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.assertEqual((one / 'sub' / '.world').read_text(), 'not the root marker\n')
+        before = json.loads(self.world('list', '--json').stdout)
+        self.git(one, 'add', '-f', '.world')
+        with self.subTest(case='World index picked up its own .world'):
+            refused('fork', '--from', wid, '--to', str(self.root / 'two'), '--include-changes')
+        self.assertFalse((self.root / 'two').exists())
+        self.assertEqual(json.loads(self.world('list', '--json').stdout), before)
+
     def test_unsupported_nested_and_unborn_are_refused(self):
         nested = self.source / 'nested'
         nested.mkdir()

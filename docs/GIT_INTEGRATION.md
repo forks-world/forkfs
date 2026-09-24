@@ -79,7 +79,9 @@ content, including Git administrative changes such as branch/index updates.
   unborn repositories are refused. External linked worktrees are safely imported by
   resolving their source Git administration and constructing fresh local administration.
 - Nested repositories/submodules, sparse or split indexes, shallow/partial clones, and
-  object alternates are refused. Partial clones are recognized by `extensions.partialClone`,
+  object alternates are refused. So is a repository that tracks the root `.world` file or
+  anything under `.world-git`, in HEAD or the index: WorldFS owns those paths, and
+  `info/exclude` cannot hide a tracked file. Partial clones are recognized by `extensions.partialClone`,
   by any `remote.<name>.promisor` or `remote.<name>.partialclonefilter` setting, and by
   `pack-*.promisor` markers, because a local mirror copies an object database without its
   missing objects. Managed Worlds with symlinked administration or additional

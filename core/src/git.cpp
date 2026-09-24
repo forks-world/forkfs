@@ -727,6 +727,17 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
             return -EBUSY;
         i += strlen(listing.data() + i) + 1;
     }
+    // WorldFS owns the root `.world` file and `.world-git` directory: snapshots drop the copied
+    // `.world`, forks write metadata there, and info/exclude cannot hide a tracked path. A
+    // repository tracking either (in HEAD or the index) would fork dirty or commit metadata.
+    const char *tracked_args[] = {"ls-files", "-z", "--", ":(top,literal).world", ":(top,literal).world-git", nullptr};
+    const char *head_tree_args[] = {"ls-tree", "-r", "-z", "--name-only", "HEAD", "--",
+        ":(top,literal).world", ":(top,literal).world-git", nullptr};
+    for (const char *const *args : {tracked_args, head_tree_args}) {
+        Vec<char> tracked;
+        if ((rc = git(root, args, &tracked))) return rc;
+        if (tracked.size() > 1) return WFS_E_GIT_UNSUPPORTED;
+    }
     out.require_clean = !include_changes;
     if (!include_changes) {
         if ((rc = require_clean_tree(root))) return rc;
