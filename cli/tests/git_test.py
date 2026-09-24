@@ -986,6 +986,9 @@ class GitWorldTest(unittest.TestCase):
             refused('init', str(self.source), '--include-changes')
         self.git(self.source, 'rm', '-q', '--cached', '.world-git/note')
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        # Untracking is not enough while history still has .world; start again from the base.
+        self.git(self.source, 'reset', '-q', '--hard', self.base.decode())
+        (self.source / '.git' / 'ORIG_HEAD').unlink()
         (self.source / 'sub').mkdir()
         (self.source / 'sub' / '.world').write_text('not the root marker\n')
         self.git(self.source, 'add', '-f', 'sub/.world')
@@ -999,6 +1002,72 @@ class GitWorldTest(unittest.TestCase):
         with self.subTest(case='World index picked up its own .world'):
             refused('fork', '--from', wid, '--to', str(self.root / 'two'), '--include-changes')
         self.assertFalse((self.root / 'two').exists())
+        self.assertEqual(json.loads(self.world('list', '--json').stdout), before)
+
+    def test_reserved_paths_in_preserved_history_are_refused(self):
+        def refused(case):
+            with self.subTest(case=case):
+                result = self.world('init', str(self.source), code=3)
+                self.assertIn(b'unsupported Git layout', result.stderr)
+                self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+        def commit_with(path, message):
+            target = self.source / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text('historical\n')
+            self.git(self.source, 'add', '-f', path)
+            self.git(self.source, 'commit', '-qm', message)
+            commit = self.git(self.source, 'rev-parse', 'HEAD').stdout.strip().decode()
+            self.git(self.source, 'rm', '-rq', path.split('/')[0])
+            self.git(self.source, 'commit', '-qm', 'remove ' + path)
+            return commit
+
+        # Parent of HEAD tracked .world; the current commit deleted it.
+        commit_with('.world', 'add .world')
+        refused('.world in an ancestor of HEAD')
+        self.git(self.source, 'reset', '-q', '--hard', self.base.decode())
+
+        # A side branch added .world-git content and was merged away with -s ours.
+        self.git(self.source, 'checkout', '-q', '-b', 'side')
+        commit_with('.world-git/x', 'add .world-git')
+        self.git(self.source, 'checkout', '-q', 'main')
+        self.git(self.source, 'merge', '-q', '-s', 'ours', '--no-edit', 'side')
+        self.git(self.source, 'branch', '-q', '-D', 'side')
+        refused('.world-git on a merged-away side branch')
+        self.git(self.source, 'reset', '-q', '--hard', self.base.decode())
+        self.git(self.source, 'reflog', 'expire', '--expire=now', '--all')
+
+        # Only ORIG_HEAD still reaches a commit tracking .world.
+        (self.source / '.world').write_text('historical\n')
+        self.git(self.source, 'add', '-f', '.world')
+        self.git(self.source, 'commit', '-qm', 'add .world')
+        self.git(self.source, 'reset', '-q', '--hard', self.base.decode())
+        self.assertFalse((self.source / '.world').exists())
+        refused('.world reachable only from ORIG_HEAD')
+        (self.source / '.git' / 'ORIG_HEAD').unlink()
+
+        # Only FETCH_HEAD reaches a commit tracking .world.
+        remote = self.root / 'fetch-remote'
+        self.git(self.root, 'clone', '-q', str(self.source), str(remote))
+        self.git(remote, 'config', 'user.name', 'Fetch Test')
+        self.git(remote, 'config', 'user.email', 'fetch@example.com')
+        (remote / '.world').write_text('historical\n')
+        self.git(remote, 'add', '-f', '.world')
+        self.git(remote, 'commit', '-qm', 'remote adds .world')
+        self.git(self.source, 'fetch', '-q', str(remote), 'main')
+        refused('.world reachable only from FETCH_HEAD')
+        (self.source / '.git' / 'FETCH_HEAD').unlink()
+
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        # A World whose own new history gains .world cannot be forked either.
+        self.git(one, 'add', '-f', '.world')
+        self.git(one, 'commit', '-qm', 'World commits its marker')
+        self.git(one, 'rm', '-q', '--cached', '.world')
+        self.git(one, 'commit', '-qm', 'World untracks its marker')
+        before = json.loads(self.world('list', '--json').stdout)
+        result = self.world('fork', '--from', wid, '--to', str(self.root / 'two'), code=3)
+        self.assertIn(b'unsupported Git layout', result.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout), before)
 
     def test_unsupported_nested_and_unborn_are_refused(self):

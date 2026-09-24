@@ -649,6 +649,43 @@ int source_unchanged(const GitSource &s) {
 }
 }
 
+// WorldFS owns the root `.world` file and `.world-git` directory: snapshots drop the copied
+// `.world`, forks write metadata there, and info/exclude cannot hide a tracked path. A path
+// tracked in the index would fork dirty or commit metadata; one anywhere in preserved history
+// would overwrite the World marker on an ordinary checkout (ignored files are overwritten by
+// default). So the index and every commit reachable from what the import keeps -- all refs,
+// HEAD, ORIG_HEAD and FETCH_HEAD tips -- must never contain either path. --full-history keeps
+// a side branch that added the path and was merged away from being simplified out.
+int reject_reserved_paths(const char *root, const GitSource &s) {
+    const char *tracked_args[] = {"ls-files", "-z", "--", ":(top,literal).world", ":(top,literal).world-git", nullptr};
+    Vec<char> tracked;
+    if (int rc = git(root, tracked_args, &tracked)) return rc;
+    if (tracked.size() > 1) return WFS_E_GIT_UNSUPPORTED;
+    Vec<String> tips;
+    tips.emplace_back(s.head.c_str());
+    if (s.orig_present) tips.emplace_back(s.orig_head.c_str());
+    if (s.fetch_present) {
+        // FETCH_HEAD lines start with an object ID followed by a tab.
+        size_t start = 0, n = s.fetch.size();
+        for (size_t i = 0; i <= n; ++i) {
+            if (i < n && s.fetch[i] != '\n') continue;
+            size_t hex = start;
+            while (hex < i && ((s.fetch[hex] >= '0' && s.fetch[hex] <= '9') || (s.fetch[hex] >= 'a' && s.fetch[hex] <= 'f'))) ++hex;
+            if (hex < i && s.fetch[hex] == '\t' && (hex - start == 40 || hex - start == 64))
+                tips.emplace_back(s.fetch.data() + start, hex - start);
+            else if (i > start) return WFS_E_GIT_UNSUPPORTED;
+            start = i + 1;
+        }
+    }
+    Vec<const char *> args;
+    for (const char *a : {"rev-list", "-n", "1", "--full-history", "--all"}) args.emplace_back(a);
+    for (const auto &tip : tips) args.emplace_back(tip.c_str());
+    for (const char *a : {"--", ":(top,literal).world", ":(top,literal).world-git"}) args.emplace_back(a);
+    args.emplace_back(nullptr);
+    Vec<char> hit;
+    if (int rc = git(root, args.data(), &hit)) return rc;
+    return hit.size() > 1 ? WFS_E_GIT_UNSUPPORTED : 0;
+}
 int git_source(const char *root, bool include_changes, GitSource &out) {
     if (int rc = nested_check(root)) return rc;
     String dot = joinp(root, ".git"), managed = joinp(root, ".world-git");
@@ -727,17 +764,7 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
             return -EBUSY;
         i += strlen(listing.data() + i) + 1;
     }
-    // WorldFS owns the root `.world` file and `.world-git` directory: snapshots drop the copied
-    // `.world`, forks write metadata there, and info/exclude cannot hide a tracked path. A
-    // repository tracking either (in HEAD or the index) would fork dirty or commit metadata.
-    const char *tracked_args[] = {"ls-files", "-z", "--", ":(top,literal).world", ":(top,literal).world-git", nullptr};
-    const char *head_tree_args[] = {"ls-tree", "-r", "-z", "--name-only", "HEAD", "--",
-        ":(top,literal).world", ":(top,literal).world-git", nullptr};
-    for (const char *const *args : {tracked_args, head_tree_args}) {
-        Vec<char> tracked;
-        if ((rc = git(root, args, &tracked))) return rc;
-        if (tracked.size() > 1) return WFS_E_GIT_UNSUPPORTED;
-    }
+    if ((rc = reject_reserved_paths(root, out))) return rc;
     out.require_clean = !include_changes;
     if (!include_changes) {
         if ((rc = require_clean_tree(root))) return rc;
