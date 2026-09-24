@@ -1293,6 +1293,16 @@ class GitWorldTest(unittest.TestCase):
         one, _ = self.fork(str(Path('elsewhere') / 'one'))
         self.assertEqual(self.git(one, 'config', '--show-scope', 'user.email').stdout, b'local\t\n')
 
+    def test_publish_refuses_a_branch_checked_out_in_a_linked_worktree(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'world change')
+        self.git(self.source, 'worktree', 'add', '-q', str(self.root / 'first-wt'), '-b', 'other')
+        self.git(self.source, 'worktree', 'add', '-q', str(self.root / 'second-wt'), '-b', 'world/W1')
+        result = self.world('publish', wid, code=3)
+        self.assertIn(b'world/W1 is checked out in the target repository', result.stderr)
+        self.assertEqual(self.git(self.source, 'rev-parse', 'world/W1').stdout.strip(), self.base)
+
     def test_publish_follows_checkpoints_back_to_the_source(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

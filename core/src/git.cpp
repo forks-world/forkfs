@@ -1552,7 +1552,9 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
     const char *wt_args[] = {"worktree", "list", "--porcelain", "-z", nullptr};
     if (int rc = git(repo, wt_args, &worktrees)) return rc;
     String checked("branch "); checked.append(ref.c_str());
-    for (size_t i = 0; i < worktrees.size() && worktrees[i];) {
+    // Records are NUL-terminated fields with an empty field between worktrees: walk the whole
+    // buffer (git() appends one final NUL) rather than stopping at the first separator.
+    for (size_t i = 0; i + 1 < worktrees.size();) {
         const char *line = worktrees.data() + i;
         if (!strcmp(line, checked.c_str()))
             return refuse(WFS_E_GIT_TARGET, "%s is checked out in the target repository; choose another name with --branch", branch);
@@ -1625,6 +1627,10 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
         script.append("update "); script.append(ref.c_str()); script.push_back(' ');
         script.append(now.c_str()); script.push_back(' ');
         script.append(old.empty() ? zero : old.c_str()); script.push_back('\n');
+    } else if (!rc) {
+        // Already there: still prove, in the same transaction, that nobody moved it meanwhile.
+        script.append("verify "); script.append(ref.c_str()); script.push_back(' ');
+        script.append(now.c_str()); script.push_back('\n');
     }
     script.append("delete "); script.append(staging); script.push_back(' ');
     script.append(now.c_str()); script.push_back('\n');
