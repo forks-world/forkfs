@@ -1143,6 +1143,9 @@ class GitWorldTest(unittest.TestCase):
         self.git(self.source, 'config', 'url.https://mirror.invalid/.insteadOf', 'https://slow.invalid/')
         self.git(self.source, 'config', 'push.autoSetupRemote', 'true')
         self.git(self.source, 'config', 'alias.st', 'status --short')
+        # A valueless boolean is true to Git and must stay true.
+        with open(self.source / '.git' / 'config', 'a') as config:
+            config.write('[remote "origin"]\n\tprune\n')
         # Settings Git would execute on its own are not carried.
         self.git(self.source, 'config', 'remote.origin.uploadpack', 'touch uploadpack-ran; git-upload-pack')
         self.git(self.source, 'config', 'core.hooksPath', '.husky')
@@ -1160,6 +1163,7 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(get('--get', 'branch.main.merge'), ['refs/heads/main'])
         self.assertEqual(get('--get', 'url.https://mirror.invalid/.insteadof'), ['https://slow.invalid/'])
         self.assertEqual(get('--type=bool', '--get', 'push.autosetupremote'), ['true'])
+        self.assertEqual(get('--type=bool', '--get', 'remote.origin.prune'), ['true'])
         self.assertEqual(self.git(one, 'st').stdout, b'')
         for key in ('remote.origin.uploadpack', 'core.hooksPath', 'branch.main.mergeoptions'):
             self.git(one, 'config', '--get', key, code=1)

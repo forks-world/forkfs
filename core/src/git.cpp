@@ -358,7 +358,9 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
         size_t len = strlen(entry);
         i += len + 1;
         const char *nl = strchr(entry, '\n');
-        String key(entry, nl ? (size_t)(nl - entry) : len), val(nl ? nl + 1 : "");
+        // A valueless entry (`[remote "o"] prune`) is a boolean true to Git; written back as an
+        // empty value it would read as false, so it is carried as "true".
+        String key(entry, nl ? (size_t)(nl - entry) : len), val(nl ? nl + 1 : "true");
         size_t klen = key.size();
         bool url = !strncmp(key.c_str(), "remote.", 7) &&
                    ((klen > 4 && !strcmp(key.c_str() + klen - 4, ".url")) ||
