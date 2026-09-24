@@ -587,6 +587,41 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((self.source / 'ambient-filter-ran').exists())
         self.assertFalse((one / 'ambient-filter-ran').exists())
 
+    def test_relative_ambient_attribute_paths_are_refused(self):
+        for key in ('core.attributesFile', 'core.excludesFile'):
+            with self.subTest(key=key):
+                global_config = self.root / 'relative-global'
+                global_config.write_text('[core]\n ' + key.split('.')[1] + ' = ../shared-rules\n')
+                self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+                result = self.world('init', str(self.source), code=3)
+                self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+                self.assertIn(b'in global configuration is a relative path (../shared-rules)', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_publish_rechecks_checkout_right_before_moving_the_branch(self):
+        import shlex
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'world change')
+        self.git(self.source, 'branch', 'world/W1')
+        real_git = shutil.which('git')
+        wrapper = self.root / 'checkout-race-bin'
+        wrapper.mkdir()
+        script = wrapper / 'git'
+        # After the staging fetch into the source, check the branch out in a new worktree.
+        script.write_text('#!/bin/sh\nfetch=0\nfor arg in "$@"; do [ "$arg" = fetch ] && fetch=1; done\n'
+                          + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
+                          + 'if [ "$result" = 0 ] && [ "$fetch" = 1 ] && [ ! -e ' + shlex.quote(str(self.root / 'raced-wt')) + ' ]; then\n'
+                          + shlex.quote(real_git) + ' -C ' + shlex.quote(str(self.source)) + ' worktree add -q '
+                          + shlex.quote(str(self.root / 'raced-wt')) + ' world/W1 || exit $?\n'
+                          + 'fi\nexit "$result"\n')
+        script.chmod(0o700)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        result = self.world('publish', wid, code=3)
+        self.assertIn(b'was checked out in the target repository while publishing; nothing was changed', result.stderr)
+        self.assertEqual(self.git(self.source, 'rev-parse', 'world/W1').stdout.strip(), self.base)
+        self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs').stdout, b'')
+
     def test_used_ambient_filter_is_refused_without_execution(self):
         global_config = self.root / 'filter-global'
         global_config.write_text('[filter "example"]\n clean = touch ambient-filter-ran; cat\n')

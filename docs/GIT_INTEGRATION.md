@@ -187,6 +187,9 @@ What cannot be shared is refused with a Git configuration error that names the r
   `user.name` or `user.email`, the identity the source resolves is written into the World's
   own configuration (an identity the source lacks is written as an explicit empty value), so
   the World's commits carry the source's author wherever the World is placed.
+- A relative `core.excludesFile` or `core.attributesFile` in global or system
+  configuration: Git resolves it from each repository's location, so the source and a
+  World could read different files. Use an absolute or `~/` path.
 - Status settings given as command configuration (`GIT_CONFIG_COUNT`,
   `GIT_CONFIG_PARAMETERS`, `-c`): they belong to one invocation only.
 - `GIT_ATTR_SOURCE` in the environment and `attr.tree` in any scope: they make the user's

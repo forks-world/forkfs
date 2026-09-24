@@ -579,6 +579,29 @@ int reject_ambient_policy(const char *root) {
         if (!strcmp(scope, "command"))
             return refuse(WFS_E_GIT_POLICY, "%s is set as command configuration (GIT_CONFIG_* or -c)", key);
     }
+    // A relative core.excludesFile/attributesFile is resolved from each repository's location,
+    // so the source and the copy (and every World) could read different files.
+    {
+        Vec<char> paths; int pstatus = -1;
+        const char *path_args[] = {"config", "--includes", "--null", "--show-scope", "--get-regexp",
+            "^core\\.(excludesfile|attributesfile)$", nullptr};
+        int prc = git(root, path_args, &paths, &pstatus, false, true);
+        if (prc && !(prc == WFS_E_GIT_FAILED && pstatus == 1)) return prc;
+        // Entries are "<scope>\0<key>\n<value>\0".
+        for (size_t i = 0; !prc && i < paths.size() && paths[i];) {
+            const char *scope = paths.data() + i;
+            i += strlen(scope) + 1;
+            if (i >= paths.size()) return WFS_E_GIT_FAILED;
+            const char *entry = paths.data() + i;
+            i += strlen(entry) + 1;
+            const char *nl = strchr(entry, '\n');
+            const char *val = nl ? nl + 1 : "";
+            if (strcmp(scope, "global") && strcmp(scope, "system")) continue;
+            if (*val && val[0] != '/' && strncmp(val, "~/", 2) && strcmp(val, "~"))
+                return refuse(WFS_E_GIT_POLICY, "%.*s in %s configuration is a relative path (%s), resolved differently per repository",
+                              nl ? (int)(nl - entry) : (int)strlen(entry), entry, scope, val);
+        }
+    }
     return scan_conditional_includes(root, nullptr);
 }
 // Every conditional include in the ambient configuration, active or not, followed recursively:
@@ -1474,6 +1497,25 @@ int git_branch(const char *clone, wfs_id world) {
 }
 } // namespace wfs
 
+namespace wfs {
+// Whether `ref` is checked out in any worktree of `repo`. Records of `worktree list
+// --porcelain -z` are NUL-terminated fields with an empty field between worktrees: the whole
+// buffer is walked (git() appends one final NUL), not just the first record.
+int branch_checked_out(const char *repo, const String &ref, bool &out) {
+    out = false;
+    Vec<char> worktrees;
+    const char *wt_args[] = {"worktree", "list", "--porcelain", "-z", nullptr};
+    if (int rc = git(repo, wt_args, &worktrees)) return rc;
+    String checked("branch "); checked.append(ref.c_str());
+    for (size_t i = 0; i + 1 < worktrees.size();) {
+        const char *line = worktrees.data() + i;
+        if (!strcmp(line, checked.c_str())) { out = true; return 0; }
+        i += strlen(line) + 1;
+    }
+    return 0;
+}
+}
+
 extern "C" const char *wfs_git_reason(void) { return wfs::g_reason; }
 
 extern "C" int wfs_git_inspect(const char *root, wfs_git_info *out) {
@@ -1548,18 +1590,10 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
     if (!fs_realpath(world_root, world_real) && world_real == repo_real)
         return refuse(WFS_E_GIT_TARGET, "the target repository is the World itself");
     // A branch checked out in any worktree of the target would be moved under its user.
-    Vec<char> worktrees;
-    const char *wt_args[] = {"worktree", "list", "--porcelain", "-z", nullptr};
-    if (int rc = git(repo, wt_args, &worktrees)) return rc;
-    String checked("branch "); checked.append(ref.c_str());
-    // Records are NUL-terminated fields with an empty field between worktrees: walk the whole
-    // buffer (git() appends one final NUL) rather than stopping at the first separator.
-    for (size_t i = 0; i + 1 < worktrees.size();) {
-        const char *line = worktrees.data() + i;
-        if (!strcmp(line, checked.c_str()))
-            return refuse(WFS_E_GIT_TARGET, "%s is checked out in the target repository; choose another name with --branch", branch);
-        i += strlen(line) + 1;
-    }
+    bool checked_out = false;
+    if (int rc = branch_checked_out(repo, ref, checked_out)) return rc;
+    if (checked_out)
+        return refuse(WFS_E_GIT_TARGET, "%s is checked out in the target repository; choose another name with --branch", branch);
     // The World's own status is a diagnostic for the caller; take it before anything changes, so
     // an error here can never be reported for a publication that already happened.
     // Status must not execute a filter that was installed or attached after the import.
@@ -1634,6 +1668,21 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
     }
     script.append("delete "); script.append(staging); script.push_back(' ');
     script.append(now.c_str()); script.push_back('\n');
+    if (!rc && old != now) {
+        // Git offers no way to make "not checked out in any worktree" part of a ref
+        // transaction; its own refusal to fetch into a checked-out branch is the same kind of
+        // check. Repeat it immediately before the transaction, so the window is only the
+        // transaction itself rather than the whole fetch and history checks.
+        bool checked_now = false;
+        rc = branch_checked_out(repo, ref, checked_now);
+        if (!rc && checked_now)
+            rc = refuse(WFS_E_GIT_TARGET, "%s was checked out in the target repository while publishing; nothing was changed", branch);
+        if (rc) {
+            script.clear();
+            script.append("delete "); script.append(staging); script.push_back(' ');
+            script.append(now.c_str()); script.push_back('\n');
+        }
+    }
     FILE *input = tmpfile();
     if (!input) return rc ? rc : -errno;
     if (fwrite(script.c_str(), 1, script.size(), input) != script.size() || fflush(input)) {
