@@ -58,6 +58,48 @@ class GitWorldTest(unittest.TestCase):
         p = self.world('fork', '--from', source, '--to', str(path), *args)
         return path, p.stdout.decode().split()[0]
 
+    def test_disabled_sparse_checkout_patterns_survive_source_deletion(self):
+        (self.source / 'docs').mkdir()
+        (self.source / 'docs' / 'guide').write_text('guide\n')
+        self.git(self.source, 'add', 'docs')
+        self.git(self.source, 'commit', '-qm', 'docs')
+        self.git(self.source, 'sparse-checkout', 'set', '--no-cone', '/docs/')
+        self.git(self.source, 'sparse-checkout', 'disable')
+        self.assertEqual(self.git(self.source, 'config', '--get', '--type=bool', 'core.sparseCheckout').stdout.strip(), b'false')
+        patterns = (self.source / '.git' / 'info' / 'sparse-checkout').read_bytes()
+        self.assertIn(b'/docs/', patterns)
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        one, wid = self.fork()
+        path = self.git(one, 'rev-parse', '--path-format=absolute', '--git-path', 'info/sparse-checkout').stdout.decode().strip()
+        self.assertEqual(Path(path).read_bytes(), patterns)
+        two, _ = self.fork('two', wid)
+        path = self.git(two, 'rev-parse', '--path-format=absolute', '--git-path', 'info/sparse-checkout').stdout.decode().strip()
+        self.assertEqual(Path(path).read_bytes(), patterns)
+        # A later `sparse-checkout init` reuses the preserved patterns, as it would in the source.
+        self.git(one, 'sparse-checkout', 'init', '--no-cone')
+        self.assertEqual(self.git(one, 'sparse-checkout', 'list').stdout.strip(), b'/docs/')
+
+    def test_sparse_pattern_change_during_mirror_aborts_publication(self):
+        import shlex
+        self.git(self.source, 'sparse-checkout', 'set', '--no-cone', '/file')
+        self.git(self.source, 'sparse-checkout', 'disable')
+        patterns = self.source / '.git' / 'info' / 'sparse-checkout'
+        real_git = shutil.which('git')
+        wrapper = self.root / 'sparse-race-bin'
+        wrapper.mkdir()
+        script = wrapper / 'git'
+        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = --mirror ] && mirror=1; done\n'
+                          + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
+                          + 'if [ "$result" = 0 ] && [ "$mirror" = 1 ]; then\n'
+                          + 'printf "/raced\\n" >> ' + shlex.quote(str(patterns)) + ' || exit $?\n'
+                          + 'fi\nexit "$result"\n')
+        script.chmod(0o700)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        self.world('init', str(self.source), code=1)
+        self.assertTrue(patterns.read_bytes().endswith(b'/raced\n'))
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_valueless_sparse_checkout_is_refused_without_mutation(self):
         omitted = self.source / 'omitted'
         omitted.mkdir()

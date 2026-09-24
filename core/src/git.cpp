@@ -620,6 +620,9 @@ int source_unchanged(const GitSource &s) {
     if (rc == -ENOENT && s.attributes.empty()) rc = 0;
     if (rc) return rc;
     if (!same_bytes(attributes, s.attributes)) return -EBUSY;
+    Vec<char> sparse; int sparse_rc = read_bytes(s.sparse_path.c_str(), sparse);
+    if (sparse_rc != 0 && sparse_rc != -ENOENT) return sparse_rc;
+    if ((sparse_rc == 0) != s.sparse_present || !same_bytes(sparse, s.sparse)) return -EBUSY;
     Vec<char> squash; int squash_rc = read_bytes(s.squash_path.c_str(), squash);
     bool squash_present = squash_rc == 0;
     if (squash_rc != 0 && squash_rc != -ENOENT) return squash_rc;
@@ -728,6 +731,12 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     if ((rc = value(root, attributes_args, out.attributes_path))) return rc;
     rc = read_bytes(out.attributes_path.c_str(), out.attributes);
     if (rc && rc != -ENOENT) return rc;
+    // core.sparseCheckout=true is refused above; a disabled one may still keep its patterns.
+    const char *sparse_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "info/sparse-checkout", nullptr};
+    if ((rc = value(root, sparse_args, out.sparse_path))) return rc;
+    rc = read_bytes(out.sparse_path.c_str(), out.sparse);
+    if (!rc) out.sparse_present = true;
+    else if (rc != -ENOENT) return rc;
     const char *squash_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "SQUASH_MSG", nullptr};
     if ((rc = value(root, squash_args, out.squash_path))) return rc;
     rc = read_bytes(out.squash_path.c_str(), out.squash);
@@ -832,6 +841,7 @@ int git_import(const GitSource &s, const char *clone) {
             !same_bytes(copy.attributes, s.attributes) ||
             copy.fetch_present != s.fetch_present || !same_bytes(copy.fetch, s.fetch) ||
             copy.squash_present != s.squash_present || !same_bytes(copy.squash, s.squash) ||
+            copy.sparse_present != s.sparse_present || !same_bytes(copy.sparse, s.sparse) ||
             !same_symrefs(copy.symrefs, s.symrefs) || !same_settings(copy.settings, s.settings)) return -EBUSY;
         if (!same_bytes(copy.refs, s.refs) ||
             copy.orig_present != s.orig_present || copy.orig_head != s.orig_head) return -EBUSY;
@@ -906,6 +916,14 @@ int git_import(const GitSource &s, const char *clone) {
         if (int rc = unset_config(clone, key)) return rc;
     for (const auto &setting : s.settings)
         if (int rc = config(clone, setting.key.c_str(), setting.value.c_str())) return rc;
+    if (s.sparse_present) {
+        const char *args[] = {"rev-parse", "--path-format=absolute", "--git-path", "info/sparse-checkout", nullptr};
+        String dest_sparse;
+        if (int rc = value(clone, args, dest_sparse)) return rc;
+        String dest_info(dest_sparse.c_str(), dest_sparse.size() - strlen("/sparse-checkout"));
+        if (int rc = fs_mkdir(dest_info.c_str(), 0700)) { if (rc != -EEXIST) return rc; }
+        if (int rc = write_bytes(dest_sparse.c_str(), s.sparse.data(), s.sparse.size())) return rc;
+    }
     if (s.squash_present) {
         const char *args[] = {"rev-parse", "--path-format=absolute", "--git-path", "SQUASH_MSG", nullptr};
         String dest_squash;

@@ -22,6 +22,10 @@ struct GitSource {
     String squash_path;
     Vec<char> squash;
     bool squash_present = false;
+    // Patterns a disabled sparse checkout keeps for a later `git sparse-checkout init`.
+    String sparse_path;
+    Vec<char> sparse;
+    bool sparse_present = false;
     String fetch_path;
     Vec<char> fetch;
     bool fetch_present = false;

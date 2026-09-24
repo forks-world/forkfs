@@ -99,7 +99,9 @@ content, including Git administrative changes such as branch/index updates.
 - Repository-local `core.excludesFile` and `core.attributesFile` overrides are unsupported.
   They can point outside the repository, and merging their rules into `info/exclude` or
   `info/attributes` would change Git's precedence; these overrides are not imported. Use the
-  repository-local `info/exclude` and `info/attributes` files, which are preserved.
+  repository-local `info/exclude` and `info/attributes` files, which are preserved. Patterns
+  that `git sparse-checkout disable` leaves in `info/sparse-checkout` are preserved for a later
+  `sparse-checkout init`; an enabled sparse checkout is still refused.
 - Git Worlds use the ordinary temporary-tree fork path. `pool fill` rejects Git snapshots;
   it does not build entries that Git-aware forks cannot consume.
 - Git setup runs inside the uncommitted clone before the normal exclusive publish rename.
