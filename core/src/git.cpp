@@ -564,8 +564,12 @@ int scan_include_target(const char *root, const char *path, const char *directiv
         const char *entry = values.data() + i;
         const char *nl = strchr(entry, '\n');
         String target;
-        if (nl && resolve_include(nl + 1, path, target))
-            if (int nrc = scan_include_target(root, target.c_str(), directive, depth + 1, sets_identity)) return nrc;
+        // A nested path that cannot be resolved here cannot be scanned either, and Git may still
+        // load it once the outer condition is active: refuse it, exactly like a top-level one.
+        if (!nl || !resolve_include(nl + 1, path, target))
+            return refuse(WFS_E_GIT_POLICY, "%s includes %s, whose include %s cannot be resolved to a file",
+                          directive, path, nl ? nl + 1 : entry);
+        if (int nrc = scan_include_target(root, target.c_str(), directive, depth + 1, sets_identity)) return nrc;
         i += strlen(entry) + 1;
     }
     return 0;

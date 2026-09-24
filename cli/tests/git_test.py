@@ -638,6 +638,14 @@ class GitWorldTest(unittest.TestCase):
                 result = self.world('init', str(self.source), code=3)
                 self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
                 self.assertIn(b'which sets core.autocrlf', result.stderr)
+        with self.subTest(form='unresolvable nested include'):
+            nested = self.root / 'outer-policy'
+            nested.write_text('[include]\n path = %(prefix)/etc/forkfs-nested\n')
+            global_config.write_text('[includeIf "gitdir:' + str(self.root / 'elsewhere') + '/"]\n path = ' + str(nested) + '\n')
+            self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+            result = self.world('init', str(self.source), code=3)
+            self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+            self.assertIn(b'cannot be resolved to a file', result.stderr)
         with self.subTest(form='unknown user'):
             global_config.write_text('[includeIf "gitdir:' + str(self.root / 'elsewhere') + '/"]\n path = ~no-such-user-forkfs/x\n')
             self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
