@@ -693,6 +693,52 @@ class GitWorldTest(unittest.TestCase):
                 self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
                 self.git(self.source, 'config', '--unset-all', key)
 
+    def edit_after_clean_check(self, repo, name):
+        # After the first `status` run in `repo` (the admission check), edit a tracked file:
+        # HEAD and the index stay the same, only the worktree bytes change before the copy.
+        import shlex
+        real_git = shutil.which('git')
+        wrapper = self.root / ('dirty-race-bin-' + name)
+        wrapper.mkdir()
+        done = self.root / ('dirty-race-done-' + name)
+        script = wrapper / 'git'
+        script.write_text('#!/bin/sh\ncwd=\nprev=\nstatus=0\nfor arg in "$@"; do\n'
+                          + '  [ "$prev" = -C ] && cwd=$arg\n  [ "$arg" = status ] && status=1\n  prev=$arg\ndone\n'
+                          + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
+                          + 'if [ "$result" = 0 ] && [ "$status" = 1 ] && [ "$cwd" = ' + shlex.quote(str(repo))
+                          + ' ] && [ ! -e ' + shlex.quote(str(done)) + ' ]; then\n'
+                          + '  : > ' + shlex.quote(str(done)) + ' || exit $?\n'
+                          + '  printf "edited after the check\\n" > ' + shlex.quote(str(repo / 'file')) + ' || exit $?\n'
+                          + 'fi\nexit "$result"\n')
+        script.chmod(0o700)
+        return wrapper, done
+
+    def test_tracked_edit_after_clean_check_is_not_published(self):
+        index = (self.source / '.git' / 'index').read_bytes()
+        wrapper, done = self.edit_after_clean_check(self.source, 'init')
+        env = dict(self.env)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        result = self.world('init', str(self.source), code=3)
+        self.env = env
+        self.assertTrue(done.exists())
+        self.assertIn(b'uncommitted', result.stderr.lower())
+        self.assertEqual((self.source / 'file').read_text(), 'edited after the check\n')
+        self.assertEqual((self.source / '.git' / 'index').read_bytes(), index)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        self.world('init', str(self.source), '--include-changes')
+
+    def test_tracked_edit_after_clean_check_is_not_forked_from_world(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        before = json.loads(self.world('list', '--json').stdout)
+        wrapper, done = self.edit_after_clean_check(one, 'world')
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        result = self.world('fork', '--from', wid, '--to', str(self.root / 'two'), code=3)
+        self.assertTrue(done.exists())
+        self.assertIn(b'uncommitted', result.stderr.lower())
+        self.assertFalse((self.root / 'two').exists())
+        self.assertEqual(json.loads(self.world('list', '--json').stdout), before)
+
     def test_direct_ref_change_during_mirror_aborts_publication(self):
         import shlex
         self.git(self.source, 'update-ref', 'refs/custom/raced', self.base.decode())

@@ -57,7 +57,9 @@ including when a source is otherwise clean. Forking an immutable snapshot carrie
 content already captured by that snapshot without another opt-in.
 
 The source HEAD and index are checked again around import; detected changes fail the
-operation before publication. This does not make an actively edited directory a coherent
+operation before publication. Without `--include-changes`, the copied tree is also checked
+for cleanliness before publication, so a tracked file edited after the source's own check
+is refused rather than published as uncommitted content. This does not make an actively edited directory a coherent
 point-in-time snapshot: stop editors/builds before importing or checkpointing. The existing
 World exec lock also continues to apply. `--force` bypasses that lock, not the explicit
 uncommitted-content choice.

@@ -586,6 +586,14 @@ int restore_rerere(const char *repo, const Vec<char> &blob) {
     }
     return 0;
 }
+// GIT_OPTIONAL_LOCKS=0 (set by git()) keeps status from refreshing the index it inspects.
+int require_clean_tree(const char *root) {
+    const char *args[] = {"status", "--porcelain=v1", "-z", "--untracked-files=normal",
+        "--", ".", ":(exclude).world", ":(exclude).world-git", nullptr};
+    Vec<char> dirty;
+    if (int rc = git(root, args, &dirty)) return rc;
+    return dirty.size() > 1 ? WFS_E_GIT_DIRTY : 0;
+}
 int source_unchanged(const GitSource &s) {
     if (int rc = reject_inprogress(s.root.c_str())) return rc;
     if (int rc = reject_import_policy(s.root.c_str())) return rc;
@@ -719,12 +727,9 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
             return -EBUSY;
         i += strlen(listing.data() + i) + 1;
     }
+    out.require_clean = !include_changes;
     if (!include_changes) {
-        const char *args[] = {"status", "--porcelain=v1", "-z", "--untracked-files=normal",
-            "--", ".", ":(exclude).world", ":(exclude).world-git", nullptr};
-        Vec<char> dirty;
-        if ((rc = git(root, args, &dirty))) return rc;
-        if (dirty.size() > 1) return WFS_E_GIT_DIRTY;
+        if ((rc = require_clean_tree(root))) return rc;
     }
     return 0;
 }
@@ -746,7 +751,9 @@ int git_import(const GitSource &s, const char *clone) {
             !same_symrefs(copy.symrefs, s.symrefs) || !same_settings(copy.settings, s.settings)) return -EBUSY;
         if (!same_bytes(copy.refs, s.refs) ||
             copy.orig_present != s.orig_present || copy.orig_head != s.orig_head) return -EBUSY;
-        return 0;
+        // HEAD and the index do not change when a tracked file is edited after the source's
+        // clean check, so check the copy that will actually be published.
+        return s.require_clean ? require_clean_tree(clone) : 0;
     }
     String owned = joinp(clone, ".world-git");
     if (int rc = fs_mkdir(owned.c_str(), 0700)) return rc;
@@ -835,7 +842,10 @@ int git_import(const GitSource &s, const char *clone) {
     Vec<char> imported_refs;
     if (int rc = capture_refs(clone, imported_refs)) return rc;
     if (!same_bytes(imported_refs, s.refs)) return -EBUSY;
-    return source_unchanged(s);
+    if (int rc = source_unchanged(s)) return rc;
+    // The owned repository now carries the source's index and status settings, so this sees the
+    // bytes that will be published, including edits made after the source's own clean check.
+    return s.require_clean ? require_clean_tree(clone) : 0;
 }
 
 int git_discard_check(const char *root) {

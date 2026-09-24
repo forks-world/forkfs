@@ -36,6 +36,8 @@ struct GitSource {
     bool rerere_present = false;
     uint64_t rerere_bytes = 0;
     uint64_t import_bytes = 0;
+    // Set when the caller did not pass --include-changes: the published copy must be clean too.
+    bool require_clean = false;
 };
 int git_source(const char *root, bool include_changes, GitSource &out);
 int git_import(const GitSource &source, const char *clone);
