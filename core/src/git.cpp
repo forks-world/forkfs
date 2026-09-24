@@ -875,6 +875,13 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     if (int policy_rc = capture_settings(root, out.settings)) return policy_rc;
     if (int identity_rc = capture_identity(root, out.identity)) return identity_rc;
     if (int wt_rc = capture_worktree_config(root, out.worktree_config, out.worktree_settings)) return wt_rc;
+    if (out.managed) {
+        // A managed copy has byte-identical configuration files and import commands ignore
+        // global/system scope, so the effective list can only differ through an include that
+        // resolves differently from the copy's location (hooksPath, identity, anything).
+        const char *list[] = {"config", "--list", "--includes", "--null", nullptr};
+        if (int list_rc = git(root, list, &out.effective_config)) return list_rc;
+    }
     const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (value(root, head_args, out.head)) return WFS_E_GIT_UNSUPPORTED;
     const char *index_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "index", nullptr};
@@ -1003,7 +1010,7 @@ int git_import(const GitSource &s, const char *clone) {
             copy.sparse_present != s.sparse_present || !same_bytes(copy.sparse, s.sparse) ||
             !same_symrefs(copy.symrefs, s.symrefs) || !same_settings(copy.settings, s.settings) ||
             // A relative include can resolve differently from the copy's location.
-            !same_settings(copy.identity, s.identity) ||
+            !same_settings(copy.identity, s.identity) || !same_bytes(copy.effective_config, s.effective_config) ||
             copy.worktree_config != s.worktree_config || !same_settings(copy.worktree_settings, s.worktree_settings)) return -EBUSY;
         if (!same_bytes(copy.refs, s.refs) ||
             copy.orig_present != s.orig_present || copy.orig_head != s.orig_head) return -EBUSY;

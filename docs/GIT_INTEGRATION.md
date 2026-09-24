@@ -142,7 +142,10 @@ disable global and system configuration. Identity-only global configuration is
 allowed and remains available to ordinary Git commands in the World.
 Conditional `includeIf` directives are unsupported in any scope, even when
 inactive at capture: moving a World or switching branches can activate policies
-that were not visible before publication. Unconditional includes remain supported.
+that were not visible before publication. Unconditional includes remain supported; when a
+World is forked or checkpointed, the copy's whole effective configuration must match the
+source World's, so a relative include that resolves to different content at the new
+location (hooks, identity or any other setting) makes the operation fail.
 `GIT_ATTR_SOURCE` in the environment and `attr.tree` in any configuration scope are
 refused as well: they make the user's Git read attributes from a tree-ish that import
 commands and the World would not use.

@@ -958,6 +958,26 @@ class GitWorldTest(unittest.TestCase):
         two, _ = self.fork(str(Path('elsewhere') / 'two'), wid)
         self.assertEqual(self.git(two, 'config', 'user.email').stdout.strip(), b'here@example.com')
 
+    def test_any_setting_resolving_differently_in_the_copy_is_refused(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'include.path', '../../../world-policy')
+        (self.root / 'world-policy').write_text('[core]\n hooksPath = /dev/null\n')
+        elsewhere = self.root / 'elsewhere'
+        (elsewhere / 'hooks').mkdir(parents=True)
+        hook = elsewhere / 'hooks' / 'pre-commit'
+        hook.write_text('#!/bin/sh\ntouch "$(dirname "$0")/ran"\n')
+        hook.chmod(0o755)
+        (elsewhere / 'world-policy').write_text('[core]\n hooksPath = ' + str(elsewhere / 'hooks') + '\n')
+        before = json.loads(self.world('list', '--json').stdout)
+        self.world('fork', '--from', wid, '--to', str(elsewhere / 'two'), code=1)
+        self.assertFalse((elsewhere / 'two').exists())
+        self.assertEqual(json.loads(self.world('list', '--json').stdout), before)
+        (elsewhere / 'world-policy').write_text('[core]\n hooksPath = /dev/null\n')
+        two, _ = self.fork(str(Path('elsewhere') / 'two'), wid)
+        self.git(two, 'commit', '-q', '--allow-empty', '-m', 'no hook runs')
+        self.assertFalse((elsewhere / 'hooks' / 'ran').exists())
+
     def test_external_hardlinks_are_reported_after_git_import(self):
         (self.source / 'shared').write_text('linked from outside\n')
         self.git(self.source, 'add', 'shared')

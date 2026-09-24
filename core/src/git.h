@@ -33,6 +33,9 @@ struct GitSource {
     Vec<GitSetting> settings;
     // extensions.worktreeConfig and the worktree-scoped settings it carries. Only the keys a
     // disabled sparse checkout leaves behind are admitted (see capture_worktree_config).
+    // Managed Worlds only: the whole effective configuration (`config --list --includes`), so
+    // a copy whose relative includes resolve differently at its new location is caught.
+    Vec<char> effective_config;
     bool worktree_config = false;
     Vec<GitSetting> worktree_settings;
     // user.name / user.email as the source defines them (present ones only, possibly empty).
