@@ -359,8 +359,13 @@ int reject_configured_policy(const char *root, const char *key) {
 // This fixed, read-only query is the sole caller allowed to load ambient config.
 // Git parses the files, but returns only matching key names, never their values.
 int reject_ambient_policy(const char *root) {
+    // GIT_ATTR_SOURCE (and its configuration form attr.tree, in any scope) makes the user's Git
+    // read attributes from a tree-ish instead of the worktree. Import commands never see the
+    // variable and do not carry the setting, so the clean check and the World would disagree
+    // with the user's own `git status`.
+    if (getenv("GIT_ATTR_SOURCE")) return WFS_E_GIT_UNSUPPORTED;
     const char *args[] = {"config", "--includes", "--null", "--show-scope", "--name-only",
-        "--get-regexp", "^(core\\.(excludesfile|attributesfile|autocrlf|eol|safecrlf|filemode|symlinks|ignorecase|precomposeunicode|trustctime|checkstat|ignorestat|checkroundtripencoding|usereplacerefs)$|filter\\..*|includeif\\..*\\.path$)", nullptr};
+        "--get-regexp", "^(core\\.(excludesfile|attributesfile|autocrlf|eol|safecrlf|filemode|symlinks|ignorecase|precomposeunicode|trustctime|checkstat|ignorestat|checkroundtripencoding|usereplacerefs)$|filter\\..*|includeif\\..*\\.path$|attr\\.tree$)", nullptr};
     Vec<char> listing; int status = -1;
     int rc = git(root, args, &listing, &status, false, true);
     if (rc == WFS_E_GIT_FAILED && status == 1) return 0;
@@ -376,6 +381,7 @@ int reject_ambient_policy(const char *root) {
         size_t key_len = i - key;
         if (key_len >= 10 && !memcmp(listing.data() + key, "includeif.", 9) &&
             !memcmp(listing.data() + i - 5, ".path", 5)) return WFS_E_GIT_UNSUPPORTED;
+        if (key_len == 9 && !memcmp(listing.data() + key, "attr.tree", 9)) return WFS_E_GIT_UNSUPPORTED;
         if ((scope_len == 6 && !memcmp(listing.data() + scope, "global", 6)) ||
             (scope_len == 6 && !memcmp(listing.data() + scope, "system", 6)) ||
             (scope_len == 7 && !memcmp(listing.data() + scope, "command", 7))) return WFS_E_GIT_UNSUPPORTED;
@@ -609,6 +615,72 @@ int require_clean_tree(const char *root) {
     if (int rc = git(root, args, &dirty)) return rc;
     return dirty.size() > 1 ? WFS_E_GIT_DIRTY : 0;
 }
+// `for-each-ref` (and therefore the mirror) silently omits a symbolic ref whose target does
+// not exist, e.g. after `git symbolic-ref refs/heads/alias refs/heads/future`, so the captured
+// map cannot be treated as complete on its own. Symbolic refs are only ever loose files in the
+// files backend, so every `ref: ` file under refs/ must be one the enumeration returned.
+// Reftable offers no read-only way to list them, so that backend is refused.
+int scan_loose_symrefs(int dirfd, const String &prefix, const Vec<GitSymref> &known, int depth) {
+    if (depth > 64) return WFS_E_GIT_UNSUPPORTED;
+    int dup_fd = dup(dirfd);
+    if (dup_fd < 0) return -errno;
+    DIR *d = fdopendir(dup_fd);
+    if (!d) { int rc = -errno; close(dup_fd); return rc; }
+    rewinddir(d);
+    int rc = 0;
+    for (;;) {
+        errno = 0; dirent *e = readdir(d);
+        if (!e) { if (errno) rc = -errno; break; }
+        const char *name = e->d_name;
+        if (!strcmp(name, ".") || !strcmp(name, "..")) continue;
+        String ref = prefix; ref.push_back('/');
+        for (const char *p = name; *p; ++p) ref.push_back(*p);
+        struct stat st;
+        if (fstatat(dirfd, name, &st, AT_SYMLINK_NOFOLLOW)) { rc = -errno; break; }
+        if (S_ISDIR(st.st_mode)) {
+            int sub = openat(dirfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (sub < 0) { rc = -errno; break; }
+            rc = scan_loose_symrefs(sub, ref, known, depth + 1);
+            close(sub);
+            if (rc) break;
+            continue;
+        }
+        if (!S_ISREG(st.st_mode)) continue;
+        int fd = openat(dirfd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) { rc = -errno; break; }
+        char head[5]; ssize_t n = read(fd, head, sizeof head);
+        close(fd);
+        if (n < 0) { rc = -errno; break; }
+        if (n < 5 || memcmp(head, "ref: ", 5)) continue;
+        bool listed = false;
+        for (const auto &sym : known) if (sym.name == ref) { listed = true; break; }
+        if (!listed) { rc = WFS_E_GIT_UNSUPPORTED; break; }
+    }
+    closedir(d);
+    return rc;
+}
+int reject_unlisted_symrefs(const char *root, const Vec<GitSymref> &known) {
+    String format;
+    const char *format_args[] = {"rev-parse", "--show-ref-format", nullptr};
+    if (int rc = value(root, format_args, format)) return rc;
+    if (format != "files") return WFS_E_GIT_UNSUPPORTED;
+    String common, admin;
+    const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
+    const char *admin_args[] = {"rev-parse", "--absolute-git-dir", nullptr};
+    if (int rc = value(root, common_args, common)) return rc;
+    if (int rc = value(root, admin_args, admin)) return rc;
+    for (const String *dir : {&common, &admin}) {
+        if (dir == &admin && admin == common) break;
+        String refs = joinp(dir->c_str(), "refs");
+        int fd = open(refs.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) { if (errno == ENOENT) continue; return -errno; }
+        String prefix("refs");
+        int rc = scan_loose_symrefs(fd, prefix, known, 0);
+        close(fd);
+        if (rc) return rc;
+    }
+    return 0;
+}
 int source_unchanged(const GitSource &s) {
     if (int rc = reject_inprogress(s.root.c_str())) return rc;
     if (int rc = reject_import_policy(s.root.c_str())) return rc;
@@ -666,7 +738,7 @@ int source_unchanged(const GitSource &s) {
     Vec<GitSymref> refs;
     if (int symrc = collect_symrefs(s.root.c_str(), refs)) return symrc;
     if (!same_symrefs(refs, s.symrefs)) return -EBUSY;
-    return 0;
+    return reject_unlisted_symrefs(s.root.c_str(), refs);
 }
 }
 
@@ -776,6 +848,7 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     if ((rc = capture_refs(root, out.refs))) return rc;
     if ((rc = capture_orig(root, out.orig_present, out.orig_head))) return rc;
     if ((rc = collect_symrefs(root, out.symrefs))) return rc;
+    if ((rc = reject_unlisted_symrefs(root, out.symrefs))) return rc;
     if ((rc = reject_inprogress(root))) return rc;
     if (!out.managed) {
         if ((rc = capture_rerere(root, out.rerere, out.rerere_present, out.rerere_bytes))) return rc;

@@ -545,6 +545,47 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((self.source / 'filter-ran').exists())
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
+    def test_dangling_symbolic_ref_is_refused(self):
+        self.git(self.source, 'symbolic-ref', 'refs/heads/alias', 'refs/heads/future')
+        self.assertNotIn(b'alias', self.git(self.source, 'for-each-ref').stdout)
+        result = self.world('init', str(self.source), code=3)
+        self.assertIn(b'unsupported Git layout', result.stderr)
+        self.assertEqual(self.git(self.source, 'symbolic-ref', 'refs/heads/alias').stdout.strip(), b'refs/heads/future')
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        # Once the target exists the alias is listed, mirrored and preserved.
+        self.git(self.source, 'branch', 'future')
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'symbolic-ref', 'refs/heads/alias').stdout.strip(), b'refs/heads/future')
+
+    def test_reftable_source_is_refused(self):
+        source = self.root / 'reftable'
+        self.git(self.root, 'init', '-q', '-b', 'main', '--ref-format=reftable', str(source))
+        self.git(source, 'config', 'user.name', 'World Test')
+        self.git(source, 'config', 'user.email', 'world@example.com')
+        (source / 'file').write_text('reftable\n')
+        self.git(source, 'add', 'file')
+        self.git(source, 'commit', '-qm', 'base')
+        result = self.world('init', str(source), code=3)
+        self.assertIn(b'unsupported Git layout', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_attribute_source_overrides_are_refused(self):
+        with self.subTest(source='GIT_ATTR_SOURCE'):
+            env = dict(self.env)
+            self.env['GIT_ATTR_SOURCE'] = self.base.decode()
+            result = self.world('init', str(self.source), code=3)
+            self.env = env
+            self.assertIn(b'unsupported Git layout', result.stderr)
+        with self.subTest(source='attr.tree'):
+            self.git(self.source, 'config', 'attr.tree', 'HEAD')
+            result = self.world('init', str(self.source), code=3)
+            self.assertIn(b'unsupported Git layout', result.stderr)
+            self.git(self.source, 'config', '--unset', 'attr.tree')
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        self.world('init', str(self.source))
+
     def test_external_hidden_refs_are_refused(self):
         self.git(self.source, 'update-ref', 'refs/custom/hidden', self.base.decode())
         for key in ('transfer.hideRefs', 'uploadpack.hideRefs'):

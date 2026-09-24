@@ -137,12 +137,21 @@ allowed and remains available to ordinary Git commands in the World.
 Conditional `includeIf` directives are unsupported in any scope, even when
 inactive at capture: moving a World or switching branches can activate policies
 that were not visible before publication. Unconditional includes remain supported.
+`GIT_ATTR_SOURCE` in the environment and `attr.tree` in any configuration scope are
+refused as well: they make the user's Git read attributes from a tree-ish that import
+commands and the World would not use.
 The same policy rejection covers command configuration injected through
 `GIT_CONFIG_COUNT` and `GIT_CONFIG_PARAMETERS`. Only the read-only probe receives
 those variables; normal import commands continue to discard them. Mirror imports
 use an empty template directory so installed Git templates cannot add hooks or rules.
 
 ### External reference restrictions
+
+Symbolic refs whose target does not exist (for example `git symbolic-ref
+refs/heads/alias refs/heads/future`) are refused: Git's ref listing and the mirror both
+omit them, so the import could not preserve them. Repositories using the reftable ref
+backend are refused because it offers no read-only way to find such refs; the owned
+repositories themselves always use the files backend.
 
 Initial imports from external repositories reject any configured `transfer.hideRefs`
 or `uploadpack.hideRefs`, because the mirror transport may omit those refs. They
