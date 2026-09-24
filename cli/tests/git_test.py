@@ -1265,6 +1265,34 @@ class GitWorldTest(unittest.TestCase):
         self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
         self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs').stdout, b'')
 
+    def test_publish_refuses_a_filter_attached_after_import(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        marker = self.root / 'late-filter-ran'
+        (one / '.gitattributes').write_text('file filter=late\n')
+        self.git(one, 'add', '.gitattributes')
+        self.git(one, 'commit', '-qm', 'attach a filter')
+        self.git(one, 'config', 'filter.late.clean', 'touch ' + str(marker) + '; cat')
+        os.utime(one / 'file', (1, 1))
+        result = self.world('publish', wid, code=3)
+        self.assertIn(b"uses the 'late' filter", result.stderr)
+        self.assertFalse(marker.exists())
+        self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
+
+    def test_absent_source_identity_stays_absent(self):
+        elsewhere = self.root / 'elsewhere'
+        elsewhere.mkdir()
+        identity = self.root / 'there-identity'
+        identity.write_text('[user]\n email = there@example.com\n')
+        global_config = self.root / 'identity-global'
+        global_config.write_text('[includeIf "gitdir:' + str(elsewhere) + '/"]\n path = ' + str(identity) + '\n')
+        self.git(self.source, 'config', '--unset', 'user.email')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        self.git(self.source, 'config', 'user.email', code=1)
+        self.world('init', str(self.source))
+        one, _ = self.fork(str(Path('elsewhere') / 'one'))
+        self.assertEqual(self.git(one, 'config', '--show-scope', 'user.email').stdout, b'local\t\n')
+
     def test_publish_follows_checkpoints_back_to_the_source(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

@@ -517,7 +517,8 @@ bool resolve_include(const char *value, const char *including_file, String &out)
     out = joinp(dir.c_str(), value);
     return true;
 }
-int scan_include_target(const char *root, const char *path, const char *directive, int depth) {
+int scan_include_target(const char *root, const char *path, const char *directive, int depth,
+                        bool *sets_identity = nullptr) {
     if (depth > 10) return refuse(WFS_E_GIT_POLICY, "configuration includes are nested more than 10 deep");
     struct stat st;
     if (stat(path, &st)) return errno == ENOENT ? 0 : -errno; // Git ignores a missing include
@@ -529,6 +530,8 @@ int scan_include_target(const char *root, const char *path, const char *directiv
         const char *key = listing.data() + i;
         if (is_status_or_filter_key(key))
             return refuse(WFS_E_GIT_POLICY, "%s includes %s, which sets %s", directive, path, key);
+        if (sets_identity && (!strcasecmp(key, "user.name") || !strcasecmp(key, "user.email")))
+            *sets_identity = true;
         if (!strcasecmp(key, "include.path") || (!strncasecmp(key, "includeif.", 10) &&
                                                   strlen(key) > 15 && !strcasecmp(key + strlen(key) - 5, ".path")))
             nested = true;
@@ -545,11 +548,12 @@ int scan_include_target(const char *root, const char *path, const char *directiv
         const char *nl = strchr(entry, '\n');
         String target;
         if (nl && resolve_include(nl + 1, path, target))
-            if (int nrc = scan_include_target(root, target.c_str(), directive, depth + 1)) return nrc;
+            if (int nrc = scan_include_target(root, target.c_str(), directive, depth + 1, sets_identity)) return nrc;
         i += strlen(entry) + 1;
     }
     return 0;
 }
+int scan_conditional_includes(const char *root, bool *sets_identity);
 int reject_ambient_policy(const char *root) {
     if (getenv("GIT_ATTR_SOURCE")) return refuse(WFS_E_GIT_POLICY, "GIT_ATTR_SOURCE is set in the environment");
     Vec<char> listing; int status = -1;
@@ -575,8 +579,15 @@ int reject_ambient_policy(const char *root) {
         if (!strcmp(scope, "command"))
             return refuse(WFS_E_GIT_POLICY, "%s is set as command configuration (GIT_CONFIG_* or -c)", key);
     }
-    // Conditional includes, active or not: "<origin>\0<key>\n<value>\0".
-    Vec<char> includes; status = -1;
+    return scan_conditional_includes(root, nullptr);
+}
+// Every conditional include in the ambient configuration, active or not, followed recursively:
+// refused when it sets status or filter settings; `sets_identity` reports whether any sets
+// user.name or user.email (so the identity can depend on where the repository is).
+int scan_conditional_includes(const char *root, bool *sets_identity) {
+    if (sets_identity) *sets_identity = false;
+    // Entries are "<origin>\0<key>\n<value>\0".
+    Vec<char> includes; int status = -1;
     const char *inc_args[] = {"config", "--includes", "--null", "--show-origin", "--get-regexp",
         "^includeif\\..*\\.path$", nullptr};
     int rc = git(root, inc_args, &includes, &status, false, true);
@@ -595,7 +606,7 @@ int reject_ambient_policy(const char *root) {
         String target;
         if (!resolve_include(nl + 1, file, target))
             return refuse(WFS_E_GIT_POLICY, "%s (%s) cannot be resolved to a file", directive.c_str(), origin);
-        if (int src = scan_include_target(root, target.c_str(), directive.c_str(), 0)) return src;
+        if (int src = scan_include_target(root, target.c_str(), directive.c_str(), 0, sets_identity)) return src;
     }
     return 0;
 }
@@ -1231,24 +1242,26 @@ int reject_copied_locks(const char *clone) {
     close(fd);
     return rc;
 }
-// The identity the source's commits would carry, with the user's ambient configuration: a
-// conditional include (`includeIf "gitdir:~/work/"`) can supply it at the source's location and
-// not at the World's. When the World would resolve a different identity, the source's is written
-// to the World's own configuration, so its commits are attributed the way the source's are.
+// The identity the source's commits carry, kept independent of where the World ends up. When
+// any conditional include (`includeIf "gitdir:~/work/"`) sets user.name or user.email, the
+// identity can depend on the repository's location -- and the World's final location is not
+// known here (it is copied first and moved into place later). So in that case the source's
+// effective identity is written into the World's own configuration, and an identity the
+// source does not have is written as an explicit empty value. Without such includes the
+// identity comes from unconditional configuration, which is the same everywhere, and nothing
+// is written (a global identity configured later still applies).
 int pin_identity(const char *source, const char *clone) {
+    bool conditional = false;
+    if (int rc = scan_conditional_includes(source, &conditional)) return rc;
+    if (!conditional) return 0;
     for (const char *key : {"user.name", "user.email"}) {
         const char *args[] = {"config", "--get", key, nullptr};
-        Vec<char> sv, cv; int ss = -1, cs = -1;
+        Vec<char> sv; int ss = -1;
         int rc = git(source, args, &sv, &ss, false, true);
-        if (rc == WFS_E_GIT_FAILED && ss == 1) continue; // the source has none: nothing to keep
-        if (rc) return rc;
-        rc = git(clone, args, &cv, &cs, false, true);
-        if (rc && !(rc == WFS_E_GIT_FAILED && cs == 1)) return rc;
-        String want(sv.data()), have(rc ? "" : cv.data());
+        if (rc && !(rc == WFS_E_GIT_FAILED && ss == 1)) return rc;
+        String want(rc ? "" : sv.data());
         if (!want.empty() && want.back() == '\n') want.pop_back();
-        if (!have.empty() && have.back() == '\n') have.pop_back();
-        if (rc || want != have)
-            if (int wrc = config(clone, key, want.c_str())) return wrc;
+        if (int wrc = config(clone, key, want.c_str())) return wrc;
     }
     return 0;
 }
@@ -1547,6 +1560,9 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
     }
     // The World's own status is a diagnostic for the caller; take it before anything changes, so
     // an error here can never be reported for a publication that already happened.
+    // Status must not execute a filter that was installed or attached after the import.
+    if (int rc = reject_ambient_policy(world_root)) return rc;
+    if (int rc = reject_used_filters(world_root)) return rc;
     int dirty = require_clean_tree(world_root);
     if (dirty && dirty != WFS_E_GIT_DIRTY) return dirty;
     String old;
@@ -1597,23 +1613,32 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
             rc = refuse(WFS_E_GIT_TARGET, "%s in the target repository has commits the World's branch does not; this is not a fast-forward (--force overwrites it)", branch);
         else rc = ff_rc;
     }
+    // One ref transaction: the branch moves (compare-and-swap against the value checked above)
+    // and the staging ref disappears together, or neither happens. On an earlier refusal only
+    // the staging ref is dropped, and a failure to drop it does not replace that answer.
+    const char *zero = strlen(now.c_str()) == 64
+        ? "0000000000000000000000000000000000000000000000000000000000000000"
+        : "0000000000000000000000000000000000000000";
+    if (now.empty()) return rc ? rc : WFS_E_GIT_FAILED;
+    String script;
     if (!rc && old != now) {
-        // Compare-and-swap against the value checked above; hooks are disabled by git().
-        const char *zero = info.head[0] && strlen(info.head) == 64
-            ? "0000000000000000000000000000000000000000000000000000000000000000"
-            : "0000000000000000000000000000000000000000";
-        const char *update[] = {"update-ref", "-m", "world fs publish", ref.c_str(), now.c_str(),
-                                old.empty() ? zero : old.c_str(), nullptr};
-        rc = git(repo, update);
+        script.append("update "); script.append(ref.c_str()); script.push_back(' ');
+        script.append(now.c_str()); script.push_back(' ');
+        script.append(old.empty() ? zero : old.c_str()); script.push_back('\n');
     }
-    int drop_rc = 0;
-    if (!now.empty()) {
-        // Delete only the value this call fetched there.
-        const char *drop[] = {"update-ref", "-d", staging, now.c_str(), nullptr};
-        drop_rc = git(repo, drop, nullptr, nullptr, true);
+    script.append("delete "); script.append(staging); script.push_back(' ');
+    script.append(now.c_str()); script.push_back('\n');
+    FILE *input = tmpfile();
+    if (!input) return rc ? rc : -errno;
+    if (fwrite(script.c_str(), 1, script.size(), input) != script.size() || fflush(input)) {
+        int err = errno ? -errno : -EIO; fclose(input); return rc ? rc : err;
     }
+    rewind(input);
+    const char *txn[] = {"update-ref", "-m", "world fs publish", "--stdin", nullptr};
+    int txn_rc = git(repo, txn, nullptr, nullptr, false, false, fileno(input));
+    fclose(input);
     if (rc) return rc;
-    if (drop_rc) return drop_rc;
+    if (txn_rc) return txn_rc;
     snprintf(out->ref, sizeof out->ref, "%s", ref.c_str());
     snprintf(out->old_oid, sizeof out->old_oid, "%s", old.c_str());
     snprintf(out->new_oid, sizeof out->new_oid, "%s", now.c_str());

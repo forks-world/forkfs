@@ -80,6 +80,9 @@ World back through world forks and checkpoints to the directory `init` imported.
 `--force`, publishing refuses a branch that is checked out in the target, an update that is
 not a fast-forward, and a repository that shares no history with the World. A detached World
 needs `--branch`. Uncommitted World changes are not published; the command says so.
+Publishing re-checks the configuration policy first, so reading the World's status never
+runs a filter attached after the import. The branch update and the removal of the private
+staging ref are one ref transaction.
 
 ## Uncommitted content
 
@@ -180,9 +183,10 @@ What cannot be shared is refused with a Git configuration error that names the r
 - A conditional `includeIf` whose target sets status or filter settings, in any scope and
   whether or not it is active at the source: the condition (a `gitdir:` pattern, a branch)
   can evaluate differently at the World's location. Conditional includes that set other
-  things, typically a work identity, are allowed. The identity the source resolves is
-  written into the World's own configuration when the World would otherwise resolve a
-  different one, so its commits carry the same author.
+  things, typically a work identity, are allowed. When any conditional include sets
+  `user.name` or `user.email`, the identity the source resolves is written into the World's
+  own configuration (an identity the source lacks is written as an explicit empty value), so
+  the World's commits carry the source's author wherever the World is placed.
 - Status settings given as command configuration (`GIT_CONFIG_COUNT`,
   `GIT_CONFIG_PARAMETERS`, `-c`): they belong to one invocation only.
 - `GIT_ATTR_SOURCE` in the environment and `attr.tree` in any scope: they make the user's
