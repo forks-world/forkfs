@@ -289,6 +289,25 @@ class GitWorldTest(unittest.TestCase):
         refused = self.world('init', str(plain), '--committed-only', code=3)
         self.assertIn(b'reason: --committed-only needs a Git repository', refused.stderr)
 
+    def test_committed_only_resets_index_only_marked_files(self):
+        (self.source / 'config.local').write_text('committed\n')
+        self.git(self.source, 'add', 'config.local')
+        self.git(self.source, 'commit', '-qm', 'local config')
+        self.git(self.source, 'update-index', '--skip-worktree', 'config.local')
+        self.git(self.source, 'update-index', '--assume-unchanged', 'file')
+        (self.source / 'config.local').write_text('private edit\n')
+        (self.source / 'file').write_text('hidden edit\n')
+        self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+        index = (self.source / '.git' / 'index').read_bytes()
+        snapshot = self.world('init', str(self.source), '--committed-only').stdout.split()[0].decode()
+        one, _ = self.fork('one', snapshot)
+        self.assertEqual((one / 'config.local').read_text(), 'committed\n')
+        self.assertEqual((one / 'file').read_text(), 'original\n')
+        self.assertEqual(self.git(one, 'ls-files', '-v').stdout, b'H .gitignore\nH config.local\nH file\n')
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.assertEqual((self.source / 'config.local').read_text(), 'private edit\n')
+        self.assertEqual((self.source / '.git' / 'index').read_bytes(), index)
+
     def test_committed_only_snapshot_records_only_hardlinks_it_still_has(self):
         for name in ('a', 'b', 'c', 'd'):
             (self.source / name).write_text('shared\n')
@@ -419,6 +438,20 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.hook_runs(marker), [])
         self.commit_in(one, 'husky runs')
         self.assertEqual(self.hook_runs(marker), ['husky ' + str(one)])
+
+    def test_with_hooks_resolves_escaping_relative_hooks_path_from_the_source(self):
+        marker = self.root / 'hooks-ran'
+        shared = self.root / 'shared-hooks'
+        self.write_hook(shared / 'pre-commit', marker, 'shared')
+        # A decoy beside where the World will live must never run.
+        self.write_hook(self.root / 'worlds' / 'shared-hooks' / 'pre-commit', marker, 'decoy')
+        self.git(self.source, 'config', 'core.hooksPath', '../shared-hooks')
+        self.world('init', str(self.source), '--with-hooks')
+        (self.root / 'worlds').mkdir(exist_ok=True)
+        one, _ = self.fork(str(Path('worlds') / 'one'))
+        self.assertEqual(self.git(one, 'config', '--get', 'core.hooksPath').stdout.strip(), str(shared).encode())
+        self.commit_in(one, 'shared hook runs')
+        self.assertEqual(self.hook_runs(marker), ['shared ' + str(one)])
 
     def test_with_hooks_refuses_symlinked_hooks(self):
         marker = self.root / 'hooks-ran'

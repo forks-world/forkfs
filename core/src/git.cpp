@@ -1465,6 +1465,20 @@ int local_hooks_path(const char *root, bool &present, String &path) {
 int capture_hooks(const char *root, Vec<GitHook> &out, bool &path_present, String &path) {
     out.clear();
     if (int rc = local_hooks_path(root, path_present, path)) return rc;
+    // A relative core.hooksPath is resolved from the worktree root. Resolved lexically against
+    // the source: one that stays inside the tree (husky's `.husky`) is carried as a normalized
+    // relative path, so the World uses its own copy; one that leaves it (`../shared-hooks`) is
+    // carried as the absolute directory the source used, not re-resolved beside the World.
+    if (path_present && !path.empty() && path[0] != '/' && path[0] != '~') {
+        String real_root;
+        if (int rc = fs_realpath(root, real_root)) return rc;
+        String resolved = absolute_lexical(real_root.c_str(), path.c_str());
+        size_t n = real_root.size();
+        if (resolved == real_root) path.assign(".");
+        else if (resolved.size() > n && !strncmp(resolved.c_str(), real_root.c_str(), n) && resolved[n] == '/')
+            path.assign(resolved.c_str() + n + 1);
+        else path = resolved;
+    }
     String dir;
     if (int rc = hooks_dir(root, dir)) return rc;
     int fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -1531,9 +1545,45 @@ int require_clean_tree(const char *root) {
 // No filter can run: reject_used_filters refused any that tracked files use, and hooks are off.
 // SQUASH_MSG describes staged content that no longer exists, so it goes too.
 int reset_to_head(const char *clone) {
+    // skip-worktree and assume-unchanged entries are invisible to status and left alone by
+    // read-tree, so their worktree bytes would survive the reset. Clear both marks in the
+    // copy's index first (`ls-files -v`: 'S'/'s' is skip-worktree, a lower-case tag is
+    // assume-unchanged); the index is about to become exactly HEAD anyway. Each mark is cleared
+    // by its own update-index call with the paths as arguments: the per-path options neither
+    // apply to --stdin paths nor combine in one call.
+    int rc = 0;
+    {
+        Vec<char> listing;
+        const char *ls[] = {"ls-files", "-v", "-z", nullptr};
+        if ((rc = git(clone, ls, &listing))) return rc;
+        Vec<String> skip, assume;
+        for (size_t i = 0; i + 1 < listing.size();) {
+            const char *entry = listing.data() + i;
+            size_t len = strlen(entry);
+            i += len + 1;
+            if (len < 3 || entry[1] != ' ') continue;
+            char tag = entry[0];
+            if (tag == 'S' || tag == 's') skip.emplace_back(entry + 2);
+            if (tag >= 'a' && tag <= 'z') assume.emplace_back(entry + 2);
+        }
+        struct Pass { const char *flag; Vec<String> *paths; } passes[] = {
+            {"--no-skip-worktree", &skip}, {"--no-assume-unchanged", &assume}};
+        for (auto &pass : passes) {
+            for (size_t at = 0; at < pass.paths->size();) {
+                Vec<const char *> args;
+                args.emplace_back("update-index");
+                args.emplace_back(pass.flag);
+                args.emplace_back("--");
+                for (size_t n = 0; n < 256 && at < pass.paths->size(); ++n, ++at)
+                    args.emplace_back((*pass.paths)[at].c_str());
+                args.emplace_back(nullptr);
+                if ((rc = git(clone, args.data()))) return rc;
+            }
+        }
+    }
     const char *refresh[] = {"update-index", "-q", "--refresh", nullptr};
     int status = -1;
-    int rc = git(clone, refresh, nullptr, &status, true, true);
+    rc = git(clone, refresh, nullptr, &status, true, true);
     if (rc && !(rc == WFS_E_GIT_FAILED && status == 1)) return rc;
     const char *clean[] = {"clean", "-f", "-d", "-q", "--", ".", ":(exclude,top,literal).world",
                            ":(exclude,top,literal).world-git", nullptr};

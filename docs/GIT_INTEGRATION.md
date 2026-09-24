@@ -125,9 +125,11 @@ line on stderr that names `--with-hooks`.
 - the executable, regular, non-`.sample` files of the source's hooks directory (the common
   one, also for a linked worktree) are copied into `.world-git/repo.git/hooks` with their
   modes; files Git would not run (not executable), subdirectories and special files are not;
-- a repository-local `core.hooksPath` is set in the World verbatim. A relative value refers to
-  the World's own tree (hooks run at the worktree root), so `.husky` works as-is; an absolute
-  value is kept as the user opted into it. A global `core.hooksPath` needs no carrying: global
+- a repository-local `core.hooksPath` is carried as the source resolved it. A relative value
+  that stays inside the tree refers to the World's own copy (hooks run at the worktree root),
+  so `.husky` works as-is; one that leaves the tree (`../shared-hooks`) is carried as the
+  absolute directory the source used, never re-resolved beside the World. An absolute value is
+  kept as the user opted into it. A global `core.hooksPath` needs no carrying: global
   configuration is shared.
 
 A symlinked hook, or a symlinked hooks directory, is refused with a reason rather than
@@ -220,6 +222,8 @@ of two explicit choices (passing both is a usage error):
   byte-for-byte as they were. Files that already match HEAD are not rewritten, so they stay
   clones of the source's blocks, and a hardlink group the reset replaces is dropped from the
   snapshot's record. No filter or hook runs. A source without a Git repository is refused.
+Paths marked `skip-worktree` or `assume-unchanged` in the source are reset to HEAD too; the
+marks are cleared in the copy, whose index becomes exactly HEAD.
 
 Ignored build/data files are always copied, with either choice and when a source is
 otherwise clean. Forking an immutable snapshot carries the content already captured by that
