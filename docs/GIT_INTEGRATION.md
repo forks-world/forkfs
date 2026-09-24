@@ -101,7 +101,13 @@ content, including Git administrative changes such as branch/index updates.
   `info/attributes` would change Git's precedence; these overrides are not imported. Use the
   repository-local `info/exclude` and `info/attributes` files, which are preserved. Patterns
   that `git sparse-checkout disable` leaves in `info/sparse-checkout` are preserved for a later
-  `sparse-checkout init`; an enabled sparse checkout is still refused.
+  `sparse-checkout init`, together with the `extensions.worktreeConfig` switches it leaves in
+  `config.worktree` (`core.sparseCheckout`, `core.sparseCheckoutCone`, `index.sparse`); an
+  enabled sparse checkout, or any other worktree-scoped setting, is still refused.
+- Repository extensions are admitted only when the owned repository reproduces them:
+  `extensions.objectFormat` (SHA-1 and SHA-256 repositories), the files ref backend, and the
+  sparse-checkout `worktreeConfig` case above. Others, such as `extensions.preciousObjects`,
+  are refused because a mirror clone does not carry them.
 - Git Worlds use the ordinary temporary-tree fork path. `pool fill` rejects Git snapshots;
   it does not build entries that Git-aware forks cannot consume.
 - Git setup runs inside the uncommitted clone before the normal exclusive publish rename.

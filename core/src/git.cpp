@@ -298,6 +298,41 @@ int capture_identity(const char *root, Vec<GitSetting> &out) {
     }
     return 0;
 }
+// `git sparse-checkout` turns on extensions.worktreeConfig and keeps its switches in
+// config.worktree; `disable` leaves core.sparseCheckout, core.sparseCheckoutCone and
+// index.sparse there (all false). Those are captured and restored in the owned worktree, so a
+// later `sparse-checkout init` behaves as it would in the source. Any other worktree-scoped
+// setting is outside what the import reproduces and is refused.
+int capture_worktree_config(const char *root, bool &enabled, Vec<GitSetting> &out) {
+    enabled = false; out.clear();
+    String val; bool present = false;
+    const char *ext[] = {"config", "--local", "--type=bool", "--get", "extensions.worktreeConfig", nullptr};
+    if (int rc = get_config(root, ext, val, &present)) return rc;
+    if (!present || val != "true") return 0;
+    enabled = true;
+    const char *list[] = {"config", "--worktree", "--null", "--name-only", "--list", nullptr};
+    Vec<char> names;
+    int status = -1;
+    int rc = git(root, list, &names, &status);
+    if (rc == WFS_E_GIT_FAILED && status == 1) return 0;
+    if (rc) return rc;
+    for (size_t i = 0; i < names.size() && names[i];) {
+        size_t start = i; while (i < names.size() && names[i]) ++i;
+        String key(names.data() + start, i - start);
+        ++i;
+        if (key != "core.sparsecheckout" && key != "core.sparsecheckoutcone" && key != "index.sparse")
+            return WFS_E_GIT_UNSUPPORTED;
+        bool seen = false;
+        for (const auto &have : out) if (have.key == key) seen = true;
+        if (seen) continue;
+        const char *typed[] = {"config", "--worktree", "--type=bool", "--get", key.c_str(), nullptr};
+        String typed_val; bool typed_present = false;
+        if ((rc = get_config(root, typed, typed_val, &typed_present))) return rc;
+        if (!typed_present) return -EBUSY;
+        out.emplace_back(GitSetting{key, typed_val});
+    }
+    return 0;
+}
 bool same_settings(const Vec<GitSetting> &a, const Vec<GitSetting> &b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i)
@@ -475,6 +510,33 @@ int reject_promisor_packs(const String &common) {
     }
     closedir(d); return rc;
 }
+// Repository extensions change what the object database or configuration means, and a mirror
+// clone does not carry them (e.g. preciousObjects forbids pruning objects the source protects;
+// worktreeConfig moves settings into config.worktree). Only the ones the owned repository
+// reproduces are admitted: objectFormat, which the mirror keeps, the files ref backend, and
+// relativeWorktrees, which the owned repository's own relative worktree registration sets.
+int reject_unsupported_extensions(const char *root) {
+    const char *args[] = {"config", "--local", "--null", "--get-regexp", "^extensions\\.", nullptr};
+    Vec<char> listing; int status = -1;
+    int rc = git(root, args, &listing, &status);
+    if (rc == WFS_E_GIT_FAILED && status == 1) return 0;
+    if (rc) return rc;
+    // --null prints "<key>\n<value>\0" per entry.
+    size_t i = 0, n = listing.size();
+    while (i < n && listing[i]) {
+        size_t key = i; while (i < n && listing[i] && listing[i] != '\n') ++i;
+        String name(listing.data() + key, i - key);
+        String val;
+        if (i < n && listing[i] == '\n') { size_t v = ++i; while (i < n && listing[i]) ++i; val.assign(listing.data() + v, i - v); }
+        if (i < n) ++i;
+        if (name == "extensions.objectformat" || name == "extensions.relativeworktrees") continue;
+        // Admitted only with the worktree settings capture_worktree_config accepts and restores.
+        if (name == "extensions.worktreeconfig") continue;
+        if (name == "extensions.refstorage" && !strcasecmp(val.c_str(), "files")) continue;
+        return WFS_E_GIT_UNSUPPORTED;
+    }
+    return 0;
+}
 // Repeat the same eligibility checks before publication: configuration and layout
 // can change while an external mirror is being copied.
 int reject_import_policy(const char *root) {
@@ -489,6 +551,7 @@ int reject_import_policy(const char *root) {
     String val; bool present = false; const char *partial[] = {"config", "--get", "extensions.partialClone", nullptr};
     if (int rc = get_config(root, partial, val, &present)) return rc;
     if (present) return WFS_E_GIT_UNSUPPORTED;
+    if (int rc = reject_unsupported_extensions(root)) return rc;
     if (int rc = reject_promisor_remotes(root)) return rc;
     String common; const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
     if (int rc = value(root, common_args, common)) return rc;
@@ -720,6 +783,9 @@ int source_unchanged(const GitSource &s) {
     Vec<GitSetting> identity;
     if (int identity_rc = capture_identity(s.root.c_str(), identity)) return identity_rc;
     if (!same_settings(identity, s.identity)) return -EBUSY;
+    bool worktree_config = false; Vec<GitSetting> worktree_settings;
+    if (int wt_rc = capture_worktree_config(s.root.c_str(), worktree_config, worktree_settings)) return wt_rc;
+    if (worktree_config != s.worktree_config || !same_settings(worktree_settings, s.worktree_settings)) return -EBUSY;
     Vec<char> direct_refs; if (int ref_rc = capture_refs(s.root.c_str(), direct_refs)) return ref_rc;
     if (!same_bytes(direct_refs, s.refs)) return -EBUSY;
     bool orig_present; String orig; if (int orig_rc = capture_orig(s.root.c_str(), orig_present, orig)) return orig_rc;
@@ -808,6 +874,7 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     if (int policy_rc = reject_import_policy(root)) return policy_rc;
     if (int policy_rc = capture_settings(root, out.settings)) return policy_rc;
     if (int identity_rc = capture_identity(root, out.identity)) return identity_rc;
+    if (int wt_rc = capture_worktree_config(root, out.worktree_config, out.worktree_settings)) return wt_rc;
     const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (value(root, head_args, out.head)) return WFS_E_GIT_UNSUPPORTED;
     const char *index_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "index", nullptr};
@@ -936,7 +1003,8 @@ int git_import(const GitSource &s, const char *clone) {
             copy.sparse_present != s.sparse_present || !same_bytes(copy.sparse, s.sparse) ||
             !same_symrefs(copy.symrefs, s.symrefs) || !same_settings(copy.settings, s.settings) ||
             // A relative include can resolve differently from the copy's location.
-            !same_settings(copy.identity, s.identity)) return -EBUSY;
+            !same_settings(copy.identity, s.identity) ||
+            copy.worktree_config != s.worktree_config || !same_settings(copy.worktree_settings, s.worktree_settings)) return -EBUSY;
         if (!same_bytes(copy.refs, s.refs) ||
             copy.orig_present != s.orig_present || copy.orig_head != s.orig_head) return -EBUSY;
         if (int rc = reject_copied_locks(clone)) return rc;
@@ -1005,6 +1073,19 @@ int git_import(const GitSource &s, const char *clone) {
         if (int rc = unset_config(clone, key)) return rc;
     for (const auto &setting : s.settings)
         if (int rc = config(clone, setting.key.c_str(), setting.value.c_str())) return rc;
+    if (s.worktree_config) {
+        // With worktreeConfig on, core.bare must live in the main worktree's config.worktree
+        // (git-worktree(1)); left in the common config it would make the owned linked worktree
+        // bare too. The owned repository's main worktree is the bare mirror itself.
+        if (int rc = config(clone, "extensions.worktreeConfig", "true")) return rc;
+        const char *bare[] = {"--git-dir", repo.c_str(), "config", "--worktree", "core.bare", "true", nullptr};
+        if (int rc = git(clone, bare)) return rc;
+        if (int rc = unset_config(clone, "core.bare")) return rc;
+        for (const auto &setting : s.worktree_settings) {
+            const char *args[] = {"config", "--worktree", setting.key.c_str(), setting.value.c_str(), nullptr};
+            if (int rc = git(clone, args)) return rc;
+        }
+    }
     if (s.sparse_present) {
         const char *args[] = {"rev-parse", "--path-format=absolute", "--git-path", "info/sparse-checkout", nullptr};
         String dest_sparse;

@@ -73,6 +73,14 @@ class GitWorldTest(unittest.TestCase):
         one, wid = self.fork()
         path = self.git(one, 'rev-parse', '--path-format=absolute', '--git-path', 'info/sparse-checkout').stdout.decode().strip()
         self.assertEqual(Path(path).read_bytes(), patterns)
+        # The worktree-scoped switches `disable` left behind travel with the patterns.
+        self.assertEqual(self.git(one, 'config', '--type=bool', 'extensions.worktreeConfig').stdout.strip(), b'true')
+        for key in ('core.sparseCheckout', 'core.sparseCheckoutCone', 'index.sparse'):
+            self.assertEqual(self.git(one, 'config', '--worktree', '--type=bool', key).stdout.strip(), b'false')
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.git(one, 'rev-parse', '--is-inside-work-tree').stdout.strip(), b'true')
+        repo = one / '.world-git' / 'repo.git'
+        self.assertEqual(self.run_cmd('git', '--git-dir', str(repo), 'rev-parse', '--is-bare-repository').stdout.strip(), b'true')
         two, _ = self.fork('two', wid)
         path = self.git(two, 'rev-parse', '--path-format=absolute', '--git-path', 'info/sparse-checkout').stdout.decode().strip()
         self.assertEqual(Path(path).read_bytes(), patterns)
@@ -558,6 +566,41 @@ class GitWorldTest(unittest.TestCase):
         shutil.rmtree(self.source)
         one, _ = self.fork()
         self.assertEqual(self.git(one, 'symbolic-ref', 'refs/heads/alias').stdout.strip(), b'refs/heads/future')
+
+    def test_repository_extensions_the_mirror_drops_are_refused(self):
+        self.git(self.source, 'config', 'core.repositoryformatversion', '1')
+        # (An extension Git itself does not know is already refused by Git before any import.)
+        with self.subTest(extension='preciousObjects'):
+            self.git(self.source, 'config', 'extensions.preciousObjects', 'true')
+            result = self.world('init', str(self.source), code=3)
+            self.assertIn(b'unsupported Git layout', result.stderr)
+            self.git(self.source, 'config', '--unset', 'extensions.preciousObjects')
+        with self.subTest(extension='worktreeConfig with a setting the import does not carry'):
+            self.git(self.source, 'config', 'extensions.worktreeConfig', 'true')
+            self.git(self.source, 'config', '--worktree', 'user.signingkey', 'ABC123')
+            result = self.world('init', str(self.source), code=3)
+            self.assertIn(b'unsupported Git layout', result.stderr)
+            self.git(self.source, 'config', '--worktree', '--unset', 'user.signingkey')
+            self.git(self.source, 'config', '--unset', 'extensions.worktreeConfig')
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        self.world('init', str(self.source))
+
+    def test_sha256_repository_imports(self):
+        source = self.root / 'sha256'
+        self.git(self.root, 'init', '-q', '-b', 'main', '--object-format=sha256', str(source))
+        self.git(source, 'config', 'user.name', 'World Test')
+        self.git(source, 'config', 'user.email', 'world@example.com')
+        (source / 'file').write_text('sha256\n')
+        self.git(source, 'add', 'file')
+        self.git(source, 'commit', '-qm', 'base')
+        head = self.git(source, 'rev-parse', 'HEAD').stdout.strip()
+        self.assertEqual(len(head), 64)
+        snapshot = self.world('init', str(source)).stdout.split()[0].decode()
+        shutil.rmtree(source)
+        one, _ = self.fork('one', snapshot)
+        self.assertEqual(self.git(one, 'rev-parse', 'HEAD').stdout.strip(), head)
+        self.assertEqual(self.git(one, 'rev-parse', '--show-object-format').stdout.strip(), b'sha256')
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
 
     def test_reftable_source_is_refused(self):
         source = self.root / 'reftable'

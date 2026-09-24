@@ -31,6 +31,10 @@ struct GitSource {
     bool fetch_present = false;
     Vec<GitSymref> symrefs;
     Vec<GitSetting> settings;
+    // extensions.worktreeConfig and the worktree-scoped settings it carries. Only the keys a
+    // disabled sparse checkout leaves behind are admitted (see capture_worktree_config).
+    bool worktree_config = false;
+    Vec<GitSetting> worktree_settings;
     // user.name / user.email as the source defines them (present ones only, possibly empty).
     Vec<GitSetting> identity;
     Vec<char> refs;
