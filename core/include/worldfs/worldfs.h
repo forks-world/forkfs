@@ -163,7 +163,12 @@ enum {
     WFS_E_GIT_DIRTY = -1024,       /* Pass include_changes to preserve uncommitted state. */
     WFS_E_GIT_FAILED = -1025,      /* Git command failed; see its diagnostic. */
     WFS_E_GIT_POOL = -1026,        /* Git branches require the ordinary fork path. */
-    WFS_E_GIT_IN_USE = -1027       /* Additional linked worktrees depend on this tree. */
+    WFS_E_GIT_IN_USE = -1027,      /* Additional linked worktrees depend on this tree. */
+    /* Git configuration outside the repository would make the World's Git see files
+     * differently from the source's: a filter that tracked files use (e.g. Git LFS), a
+     * conditional include that sets status or filter settings, GIT_ATTR_SOURCE/attr.tree, or
+     * status settings injected on the command line. wfs_git_reason() names which. */
+    WFS_E_GIT_POLICY = -1028
 };
 
 /* One process, other than this one, that has a store's database open (PR #1 review, 34th
@@ -183,6 +188,9 @@ int wfs_store_holders(const char *store_dir, wfs_store_holder *buf, size_t cap, 
 
 /* Human-readable text for a negative errno or a WFS_E_* code. Never NULL. */
 const char *wfs_strerror(int rc);
+/* The specific reason for the last WFS_E_GIT_UNSUPPORTED or WFS_E_GIT_POLICY returned on this
+ * thread (e.g. "reftable ref storage"), or "" when none was recorded. */
+const char *wfs_git_reason(void);
 const char *wfs_version(void);
 
 /* ---- generic file types, shared with the platform layer ---- */

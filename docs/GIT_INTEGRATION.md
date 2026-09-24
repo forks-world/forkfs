@@ -43,8 +43,9 @@ by the World, including staged blobs which have not yet appeared in any commit.
 `info/exclude`; source-local `info/exclude` rules are preserved before those reserved entries
 are appended. Source-local `info/attributes` rules are also preserved. These are reserved
 administration names. Source hooks and local executable
-Git settings are not imported. Local `user.name` and `user.email` are preserved; normal Git
-commands in a World also use the user's usual Git configuration. Import does not create a
+Git settings are not imported. Local `user.name` and `user.email` are preserved, and so is an
+identity a conditional include supplies at the source's location; normal Git commands in a
+World also use the user's usual Git configuration. Import does not create a
 remote back to the source. Fetching/pushing requires explicitly configuring a remote.
 
 ## Uncommitted content
@@ -130,28 +131,37 @@ captured; boolean values are normalized without losing valueless true settings.
 Absent settings stay absent in the owned repository. The policy is checked again
 before publication along with the source index and local rules.
 
-Effective repository `filter.*` definitions are rejected before status inspection.
-Arbitrary configuration, executable conversions, hooks, and external policy paths
-are not imported. A configuration-only probe reads global and system configuration
-key names, including active includes. Status-policy keys listed above, external
-attributes/ignore overrides, and filter definitions in those scopes are rejected
-before deciding cleanliness, even with `--include-changes`. This avoids silently
-changing the user's normal Git status semantics. The probe does not execute
-filters or copy configuration values; other import Git commands continue to
-disable global and system configuration. Identity-only global configuration is
-allowed and remains available to ordinary Git commands in the World.
-Conditional `includeIf` directives are unsupported in any scope, even when
-inactive at capture: moving a World or switching branches can activate policies
-that were not visible before publication. Unconditional includes remain supported; when a
-World is forked or checkpointed, the copy's whole effective configuration must match the
-source World's, so a relative include that resolves to different content at the new
-location (hooks, identity or any other setting) makes the operation fail.
-`GIT_ATTR_SOURCE` in the environment and `attr.tree` in any configuration scope are
-refused as well: they make the user's Git read attributes from a tree-ish that import
-commands and the World would not use.
-The same policy rejection covers command configuration injected through
-`GIT_CONFIG_COUNT` and `GIT_CONFIG_PARAMETERS`. Only the read-only probe receives
-those variables; normal import commands continue to discard them. Mirror imports
+Global and system configuration is shared: a World's Git reads the same `~/.gitconfig`
+and system file as the source's. Settings that come from them unconditionally (a global
+ignore file via `core.excludesFile`, `core.attributesFile`, `core.autocrlf` and the other
+status settings above) therefore mean the same thing on both sides, and cleanliness is
+decided with them, exactly as the user's own `git status` decides it. Other import Git
+commands still disable global and system configuration.
+
+What cannot be shared is refused with a Git configuration error that names the reason:
+
+- A filter that tracked files actually use (for example Git LFS), from any scope. A filter
+  that is only defined, such as the one a machine-wide `git lfs install` adds, is fine in a
+  repository whose files do not use it; so is a `filter=` attribute whose driver is not
+  defined anywhere. Filters are never executed by the import.
+- A conditional `includeIf` whose target sets status or filter settings, in any scope and
+  whether or not it is active at the source: the condition (a `gitdir:` pattern, a branch)
+  can evaluate differently at the World's location. Conditional includes that set other
+  things, typically a work identity, are allowed. The identity the source resolves is
+  written into the World's own configuration when the World would otherwise resolve a
+  different one, so its commits carry the same author.
+- Status settings given as command configuration (`GIT_CONFIG_COUNT`,
+  `GIT_CONFIG_PARAMETERS`, `-c`): they belong to one invocation only.
+- `GIT_ATTR_SOURCE` in the environment and `attr.tree` in any scope: they make the user's
+  Git read attributes from a tree-ish instead of the worktree.
+
+Unconditional includes remain supported; when a World is forked or checkpointed, the copy's
+whole effective repository configuration must match the source World's, so a relative
+include that resolves to different content at the new location (hooks, identity or any
+other setting) makes the operation fail.
+Other refusals report `unsupported Git layout` followed by a `reason:` line naming the
+specific cause (for example `reftable ref storage` or `nested Git repository or submodule`).
+Mirror imports
 use an empty template directory so installed Git templates cannot add hooks or rules.
 
 ### External reference restrictions

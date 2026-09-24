@@ -8,6 +8,8 @@
 #include <string.h>
 #include <strings.h>
 #include <stdint.h>
+#include <stdarg.h>
+#include <stdio.h>
 
 extern char **environ;
 namespace wfs {
@@ -15,8 +17,20 @@ namespace {
 String joinp(const char *a, const char *b) { String s(a); s.append("/"); s.append(b); return s; }
 constexpr const char *marker = "gitdir: .world-git/repo.git/worktrees/active\n";
 
+// The reason for the last Git refusal on this thread, for wfs_git_reason(). Every
+// WFS_E_GIT_UNSUPPORTED / WFS_E_GIT_POLICY this file returns goes through refuse().
+thread_local char g_reason[512];
+int refuse(int code, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(g_reason, sizeof g_reason, fmt, ap);
+    va_end(ap);
+    return code;
+}
 // Never use a shell, source hooks, inherited GIT_DIR/INDEX_FILE, or lazy network fetches.
-int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, int *exit_code = nullptr, bool quiet_stderr = false, bool ambient_config_probe = false) {
+// `ambient_config_probe` keeps the user's global/system configuration (and GIT_CONFIG_* command
+// configuration) so a check sees files the way the user's own Git does; `stdin_fd`, when >= 0,
+// becomes the child's standard input.
+int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, int *exit_code = nullptr, bool quiet_stderr = false, bool ambient_config_probe = false, int stdin_fd = -1) {
     if (exit_code) *exit_code = -1;
     Vec<char *> av;
     const char *prefix[] = {"git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
@@ -47,6 +61,7 @@ int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, i
     int rc = posix_spawn_file_actions_init(&actions);
     if (rc) { close(pipefd[0]); close(pipefd[1]); return -rc; }
     rc = posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+    if (!rc && stdin_fd >= 0) rc = posix_spawn_file_actions_adddup2(&actions, stdin_fd, STDIN_FILENO);
     if (!rc && quiet_stderr)
         rc = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
     pid_t pid = 0;
@@ -95,15 +110,17 @@ int collect_symrefs(const char *root, Vec<GitSymref> &out) {
         if (i == start) { start = i + 1; continue; }
         size_t tab = start;
         while (tab < i && listing[tab] != '\t') ++tab;
-        if (tab == i || tab == start) return WFS_E_GIT_UNSUPPORTED;
+        if (tab == i || tab == start) return refuse(WFS_E_GIT_UNSUPPORTED, "a ref listing could not be parsed");
         if (tab + 1 == i) { start = i + 1; continue; }
         String name(listing.data() + start, tab - start), target(listing.data() + tab + 1, i - tab - 1);
         if (strncmp(name.c_str(), "refs/", 5) || strncmp(target.c_str(), "refs/", 5) ||
-            strchr(target.c_str(), '\t') || strchr(target.c_str(), '\n')) return WFS_E_GIT_UNSUPPORTED;
+            strchr(target.c_str(), '\t') || strchr(target.c_str(), '\n'))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "symbolic ref %s points outside refs/", name.c_str());
         const char *sym_args[] = {"symbolic-ref", "--quiet", "--no-recurse", name.c_str(), nullptr};
         String immediate;
         if (int rc = value(root, sym_args, immediate)) return rc;
-        if (strncmp(immediate.c_str(), "refs/", 5)) return WFS_E_GIT_UNSUPPORTED;
+        if (strncmp(immediate.c_str(), "refs/", 5))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "symbolic ref %s points outside refs/", name.c_str());
         GitSymref sym{name, immediate};
         out.emplace_back(sym);
         start = i + 1;
@@ -124,7 +141,7 @@ int read_bytes(const char *path, Vec<char> &out) {
     if (fd < 0) return -errno;
     struct stat st;
     if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size > 64 * 1024 * 1024) {
-        close(fd); return WFS_E_GIT_UNSUPPORTED;
+        close(fd); return refuse(WFS_E_GIT_UNSUPPORTED, "%s is not a regular file or is larger than 64 MiB", path);
     }
     out.clear(); char buf[8192]; int rc = 0;
     for (;;) {
@@ -167,7 +184,7 @@ int nested_check(const char *root, bool top = true) {
         if (!e) { if (errno) rc = -errno; break; }
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         if (!strcmp(e->d_name, ".git")) {
-            if (!top) { rc = WFS_E_GIT_UNSUPPORTED; break; }
+            if (!top) { rc = refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository or submodule at %s", root); break; }
             continue;
         }
         if (top && !strcmp(e->d_name, ".world-git")) continue;
@@ -184,9 +201,9 @@ int managed_check(const char *root, const char *common, const char *admin) {
     String repo = joinp(root, ".world-git/repo.git"), active = joinp(repo.c_str(), "worktrees/active");
     String expected, actual;
     if (fs_realpath(repo.c_str(), expected) || fs_realpath(common, actual) || expected != actual)
-        return WFS_E_GIT_UNSUPPORTED;
+        return refuse(WFS_E_GIT_UNSUPPORTED, "the World's Git common directory is not its own .world-git/repo.git");
     if (fs_realpath(active.c_str(), expected) || fs_realpath(admin, actual) || expected != actual)
-        return WFS_E_GIT_UNSUPPORTED;
+        return refuse(WFS_E_GIT_UNSUPPORTED, "the World's worktree administration is not its own");
     for (const char *file : {"commondir", "gitdir"}) {
         Vec<char> bytes;
         String p = joinp(active.c_str(), file);
@@ -199,13 +216,15 @@ int managed_check(const char *root, const char *common, const char *admin) {
             if (c == '/' && !normalized.empty() && normalized.back() == '/') continue;
             normalized.push_back(c);
         }
-        if (normalized != expected_text) return WFS_E_GIT_UNSUPPORTED;
+        if (normalized != expected_text)
+            return refuse(WFS_E_GIT_UNSUPPORTED, "the World's worktree %s link was changed", file);
     }
     // Reject symlinks anywhere in the owned administration, including its root.
     Vec<String> dirs; dirs.emplace_back(joinp(root, ".world-git"));
     for (size_t i = 0; i < dirs.size(); ++i) {
         String path = dirs[i]; struct stat st;
-        if (lstat(path.c_str(), &st) || !S_ISDIR(st.st_mode)) return WFS_E_GIT_UNSUPPORTED;
+        if (lstat(path.c_str(), &st) || !S_ISDIR(st.st_mode))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "the World's Git administration contains a symlink at %s", path.c_str());
         DIR *d = opendir(path.c_str()); if (!d) return -errno;
         int rc = 0;
         for (;;) {
@@ -215,9 +234,12 @@ int managed_check(const char *root, const char *common, const char *admin) {
             String child = joinp(path.c_str(), e->d_name);
             if (lstat(child.c_str(), &st)) { rc = -errno; break; }
             if (S_ISDIR(st.st_mode)) dirs.emplace_back(child);
-            else if (!S_ISREG(st.st_mode)) { rc = WFS_E_GIT_UNSUPPORTED; break; }
+            else if (!S_ISREG(st.st_mode)) {
+                rc = refuse(WFS_E_GIT_UNSUPPORTED, "the World's Git administration contains a symlink or special file at %s", child.c_str());
+                break;
+            }
             if (path == joinp(repo.c_str(), "worktrees") && strcmp(e->d_name, "active")) {
-                rc = WFS_E_GIT_UNSUPPORTED; break;
+                rc = refuse(WFS_E_GIT_UNSUPPORTED, "the World has an additional linked worktree (%s)", e->d_name); break;
             }
         }
         closedir(d); if (rc) return rc;
@@ -246,13 +268,7 @@ int get_config(const char *root, const char *const *args, String &out, bool *pre
 }
 int capture_settings(const char *root, Vec<GitSetting> &out) {
     out.clear();
-    const char *filters[] = {"config", "--get-regexp", "^filter\\.", nullptr};
-    Vec<char> filter_bytes; int filter_status = -1;
-    int rc = git(root, filters, &filter_bytes, &filter_status);
-    if (rc != WFS_E_GIT_FAILED || filter_status != 1) {
-        if (rc) return rc;
-        return WFS_E_GIT_UNSUPPORTED;
-    }
+    int rc = 0;
     const char *special[] = {"core.autocrlf", "core.safecrlf", nullptr};
     for (size_t i = 0; special[i]; ++i) {
         const char *raw[] = {"config", "--get", special[i], nullptr};
@@ -321,7 +337,7 @@ int capture_worktree_config(const char *root, bool &enabled, Vec<GitSetting> &ou
         String key(names.data() + start, i - start);
         ++i;
         if (key != "core.sparsecheckout" && key != "core.sparsecheckoutcone" && key != "index.sparse")
-            return WFS_E_GIT_UNSUPPORTED;
+            return refuse(WFS_E_GIT_UNSUPPORTED, "worktree-scoped setting %s (only disabled sparse-checkout settings are carried)", key.c_str());
         bool seen = false;
         for (const auto &have : out) if (have.key == key) seen = true;
         if (seen) continue;
@@ -353,7 +369,7 @@ int capture_orig(const char *root, bool &present, String &oid) {
     present = true; return 0;
 }
 int walk_objects_fd(int fd, unsigned depth, uint64_t &total) {
-    if (depth > 256) return WFS_E_GIT_UNSUPPORTED;
+    if (depth > 256) return refuse(WFS_E_GIT_UNSUPPORTED, "the object directory is nested too deeply");
     int dupfd = dup(fd); if (dupfd < 0) return -errno;
     DIR *dir = fdopendir(dupfd);
     if (!dir) { int rc = -errno; close(dupfd); return rc; }
@@ -364,7 +380,9 @@ int walk_objects_fd(int fd, unsigned depth, uint64_t &total) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         struct stat st;
         if (fstatat(fd, e->d_name, &st, AT_SYMLINK_NOFOLLOW)) { rc = -errno; break; }
-        if (S_ISLNK(st.st_mode) || (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))) { rc = WFS_E_GIT_UNSUPPORTED; break; }
+        if (S_ISLNK(st.st_mode) || (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))) {
+            rc = refuse(WFS_E_GIT_UNSUPPORTED, "the object directory contains a symlink or special file (%s)", e->d_name); break;
+        }
         if (UINT64_MAX - total < 1024 || (S_ISREG(st.st_mode) && (uint64_t)st.st_size > UINT64_MAX - total - 1024)) { rc = -EOVERFLOW; break; }
         if (S_ISREG(st.st_mode) && st.st_size < 0) { rc = -EOVERFLOW; break; }
         total += 1024 + (S_ISREG(st.st_mode) ? (uint64_t)st.st_size : 0);
@@ -387,40 +405,176 @@ int reject_configured_policy(const char *root, const char *key) {
     const char *args[] = {"config", "--get", key, nullptr};
     Vec<char> value_bytes; int status = -1;
     int rc = git(root, args, &value_bytes, &status);
-    if (!rc) return WFS_E_GIT_UNSUPPORTED;
+    if (!rc) return refuse(WFS_E_GIT_UNSUPPORTED, "%s is set in the repository configuration", key);
     if (rc == WFS_E_GIT_FAILED && status == 1) return 0;
     return rc;
 }
-// This fixed, read-only query is the sole caller allowed to load ambient config.
-// Git parses the files, but returns only matching key names, never their values.
-int reject_ambient_policy(const char *root) {
-    // GIT_ATTR_SOURCE (and its configuration form attr.tree, in any scope) makes the user's Git
-    // read attributes from a tree-ish instead of the worktree. Import commands never see the
-    // variable and do not carry the setting, so the clean check and the World would disagree
-    // with the user's own `git status`.
-    if (getenv("GIT_ATTR_SOURCE")) return WFS_E_GIT_UNSUPPORTED;
-    const char *args[] = {"config", "--includes", "--null", "--show-scope", "--name-only",
-        "--get-regexp", "^(core\\.(excludesfile|attributesfile|autocrlf|eol|safecrlf|filemode|symlinks|ignorecase|precomposeunicode|trustctime|checkstat|ignorestat|checkroundtripencoding|usereplacerefs)$|filter\\..*|includeif\\..*\\.path$|attr\\.tree$)", nullptr};
-    Vec<char> listing; int status = -1;
-    int rc = git(root, args, &listing, &status, false, true);
+// Ambient configuration (global, system and GIT_CONFIG_* command configuration) is shared by the
+// source and every World on this machine: a World's Git reads the same ~/.gitconfig. Settings
+// that come from it unconditionally therefore mean the same thing on both sides, and the clean
+// check (require_clean_tree) evaluates the source with them, the way the user's own Git does.
+// What cannot be shared is refused here with WFS_E_GIT_POLICY:
+//   * GIT_ATTR_SOURCE / attr.tree: attributes read from a tree-ish instead of the worktree.
+//   * status settings given as command configuration: they belong to this invocation only.
+//   * a conditional include whose target sets status or filter settings: the condition
+//     (gitdir, onbranch, ...) can evaluate differently at the World's location, active or not
+//     at the source. Includes that only set other things (identity, signing, aliases) are fine;
+//     identity is pinned in the World separately (pin_identity).
+// Filters are refused only when tracked files actually use a defined one (reject_used_filters).
+const char *const kStatusKeys = "core\\.(excludesfile|attributesfile|autocrlf|eol|safecrlf|filemode|symlinks|"
+    "ignorecase|precomposeunicode|trustctime|checkstat|ignorestat|checkroundtripencoding|usereplacerefs)";
+bool is_status_or_filter_key(const char *key) {
+    static const char *const keys[] = {"core.excludesfile", "core.attributesfile", "core.autocrlf", "core.eol",
+        "core.safecrlf", "core.filemode", "core.symlinks", "core.ignorecase", "core.precomposeunicode",
+        "core.trustctime", "core.checkstat", "core.ignorestat", "core.checkroundtripencoding",
+        "core.usereplacerefs", "attr.tree", nullptr};
+    for (size_t i = 0; keys[i]; ++i) if (!strcasecmp(key, keys[i])) return true;
+    return !strncasecmp(key, "filter.", 7);
+}
+String dirname_of(const char *path) {
+    const char *slash = strrchr(path, '/');
+    if (!slash) return String(".");
+    if (slash == path) return String("/");
+    return String(path, (size_t)(slash - path));
+}
+// Resolve an include path the way Git does: "~/" is $HOME, a relative path is relative to the
+// directory of the file that contains the directive.
+bool resolve_include(const char *value, const char *including_file, String &out) {
+    if (!strncmp(value, "~/", 2)) {
+        const char *home = getenv("HOME");
+        if (!home || !*home) return false;
+        out = joinp(home, value + 2);
+        return true;
+    }
+    if (value[0] == '/') { out.assign(value); return true; }
+    if (!including_file) return false;
+    String dir = dirname_of(including_file);
+    out = joinp(dir.c_str(), value);
+    return true;
+}
+int scan_include_target(const char *root, const char *path, const char *directive, int depth) {
+    if (depth > 10) return refuse(WFS_E_GIT_POLICY, "configuration includes are nested more than 10 deep");
+    struct stat st;
+    if (stat(path, &st)) return errno == ENOENT ? 0 : -errno; // Git ignores a missing include
+    const char *names[] = {"config", "--file", path, "--null", "--name-only", "--list", nullptr};
+    Vec<char> listing;
+    if (int rc = git(root, names, &listing)) return rc;
+    bool nested = false;
+    for (size_t i = 0; i < listing.size() && listing[i];) {
+        const char *key = listing.data() + i;
+        if (is_status_or_filter_key(key))
+            return refuse(WFS_E_GIT_POLICY, "%s includes %s, which sets %s", directive, path, key);
+        if (!strcasecmp(key, "include.path") || (!strncasecmp(key, "includeif.", 10) &&
+                                                  strlen(key) > 15 && !strcasecmp(key + strlen(key) - 5, ".path")))
+            nested = true;
+        i += strlen(key) + 1;
+    }
+    if (!nested) return 0;
+    const char *paths[] = {"config", "--file", path, "--null", "--get-regexp", "^(include\\.path|includeif\\..*\\.path)$", nullptr};
+    Vec<char> values; int status = -1;
+    int rc = git(root, paths, &values, &status);
     if (rc == WFS_E_GIT_FAILED && status == 1) return 0;
     if (rc) return rc;
-    size_t i = 0;
-    while (i < listing.size() && listing[i]) {
-        size_t scope = i; while (i < listing.size() && listing[i]) ++i;
-        size_t scope_len = i - scope;
+    for (size_t i = 0; i < values.size() && values[i];) {
+        const char *entry = values.data() + i;
+        const char *nl = strchr(entry, '\n');
+        String target;
+        if (nl && resolve_include(nl + 1, path, target))
+            if (int nrc = scan_include_target(root, target.c_str(), directive, depth + 1)) return nrc;
+        i += strlen(entry) + 1;
+    }
+    return 0;
+}
+int reject_ambient_policy(const char *root) {
+    if (getenv("GIT_ATTR_SOURCE")) return refuse(WFS_E_GIT_POLICY, "GIT_ATTR_SOURCE is set in the environment");
+    Vec<char> listing; int status = -1;
+    {
+        String pattern("^(");
+        pattern.append(kStatusKeys);
+        pattern.append("$|attr\\.tree$)");
+        const char *args[] = {"config", "--includes", "--null", "--show-scope", "--name-only",
+            "--get-regexp", pattern.c_str(), nullptr};
+        int rc = git(root, args, &listing, &status, false, true);
+        if (rc && !(rc == WFS_E_GIT_FAILED && status == 1)) return rc;
+        if (rc) listing.clear();
+    }
+    // Entries are "<scope>\0<key>\0".
+    for (size_t i = 0; i < listing.size() && listing[i];) {
+        const char *scope = listing.data() + i;
+        i += strlen(scope) + 1;
         if (i >= listing.size()) return WFS_E_GIT_FAILED;
-        ++i;
-        size_t key = i; while (i < listing.size() && listing[i]) ++i;
-        if (i == key || i + 1 >= listing.size()) return WFS_E_GIT_FAILED;
-        size_t key_len = i - key;
-        if (key_len >= 10 && !memcmp(listing.data() + key, "includeif.", 9) &&
-            !memcmp(listing.data() + i - 5, ".path", 5)) return WFS_E_GIT_UNSUPPORTED;
-        if (key_len == 9 && !memcmp(listing.data() + key, "attr.tree", 9)) return WFS_E_GIT_UNSUPPORTED;
-        if ((scope_len == 6 && !memcmp(listing.data() + scope, "global", 6)) ||
-            (scope_len == 6 && !memcmp(listing.data() + scope, "system", 6)) ||
-            (scope_len == 7 && !memcmp(listing.data() + scope, "command", 7))) return WFS_E_GIT_UNSUPPORTED;
-        ++i;
+        const char *key = listing.data() + i;
+        i += strlen(key) + 1;
+        if (!strcasecmp(key, "attr.tree"))
+            return refuse(WFS_E_GIT_POLICY, "attr.tree is set (%s configuration)", scope);
+        if (!strcmp(scope, "command"))
+            return refuse(WFS_E_GIT_POLICY, "%s is set as command configuration (GIT_CONFIG_* or -c)", key);
+    }
+    // Conditional includes, active or not: "<origin>\0<key>\n<value>\0".
+    Vec<char> includes; status = -1;
+    const char *inc_args[] = {"config", "--includes", "--null", "--show-origin", "--get-regexp",
+        "^includeif\\..*\\.path$", nullptr};
+    int rc = git(root, inc_args, &includes, &status, false, true);
+    if (rc == WFS_E_GIT_FAILED && status == 1) return 0;
+    if (rc) return rc;
+    for (size_t i = 0; i < includes.size() && includes[i];) {
+        const char *origin = includes.data() + i;
+        i += strlen(origin) + 1;
+        if (i >= includes.size()) return WFS_E_GIT_FAILED;
+        const char *entry = includes.data() + i;
+        i += strlen(entry) + 1;
+        const char *nl = strchr(entry, '\n');
+        if (!nl) return WFS_E_GIT_FAILED;
+        String directive(entry, (size_t)(nl - entry));
+        const char *file = !strncmp(origin, "file:", 5) ? origin + 5 : nullptr;
+        String target;
+        if (!resolve_include(nl + 1, file, target))
+            return refuse(WFS_E_GIT_POLICY, "%s (%s) cannot be resolved to a file", directive.c_str(), origin);
+        if (int src = scan_include_target(root, target.c_str(), directive.c_str(), 0)) return src;
+    }
+    return 0;
+}
+// Tracked files whose `filter` attribute names a defined driver (Git LFS, git-crypt, ...) would
+// have that driver executed by status in the source and in the World; WorldFS neither runs nor
+// reproduces it. A driver that is defined but unused (a machine-wide `git lfs install` in a
+// repository without LFS files) or used but undefined (pointer files as plain content) is fine.
+int reject_used_filters(const char *root) {
+    const char *defined_args[] = {"config", "--null", "--name-only", "--get-regexp", "^filter\\.", nullptr};
+    Vec<char> defined; int status = -1;
+    int rc = git(root, defined_args, &defined, &status, false, true);
+    if (rc == WFS_E_GIT_FAILED && status == 1) return 0; // no driver anywhere: nothing can run
+    if (rc) return rc;
+    Vec<char> paths;
+    const char *ls_args[] = {"ls-files", "-z", nullptr};
+    if ((rc = git(root, ls_args, &paths))) return rc;
+    if (paths.size() <= 1) return 0;
+    FILE *input = tmpfile();
+    if (!input) return -errno;
+    if (fwrite(paths.data(), 1, paths.size() - 1, input) != paths.size() - 1 || fflush(input)) {
+        int err = errno ? -errno : -EIO; fclose(input); return err;
+    }
+    rewind(input);
+    const char *attr_args[] = {"check-attr", "--stdin", "-z", "filter", nullptr};
+    Vec<char> attrs;
+    rc = git(root, attr_args, &attrs, nullptr, false, true, fileno(input));
+    fclose(input);
+    if (rc) return rc;
+    // Triples "<path>\0filter\0<value>\0".
+    for (size_t i = 0; i < attrs.size() && attrs[i];) {
+        const char *path = attrs.data() + i; i += strlen(path) + 1;
+        if (i >= attrs.size()) break;
+        i += strlen(attrs.data() + i) + 1;
+        if (i >= attrs.size()) break;
+        const char *driver = attrs.data() + i; i += strlen(driver) + 1;
+        if (!strcmp(driver, "unspecified") || !strcmp(driver, "unset") || !strcmp(driver, "set")) continue;
+        size_t dlen = strlen(driver);
+        for (size_t k = 0; k < defined.size() && defined[k];) {
+            const char *key = defined.data() + k; k += strlen(key) + 1;
+            if (strncmp(key + 7, driver, dlen) || key[7 + dlen] != '.') continue;
+            const char *field = key + 8 + dlen;
+            if (!strcmp(field, "clean") || !strcmp(field, "smudge") || !strcmp(field, "process"))
+                return refuse(WFS_E_GIT_POLICY, "tracked file %s uses the '%s' filter (e.g. Git LFS), which WorldFS does not run", path, driver);
+        }
     }
     return 0;
 }
@@ -430,12 +584,12 @@ int reject_external_visibility_state(const char *root, bool managed) {
         if (int rc = reject_configured_policy(root, key)) return rc;
     const char *args[] = {"reflog", "exists", "refs/stash", nullptr};
     int status = -1, rc = git(root, args, nullptr, &status);
-    if (!rc) return WFS_E_GIT_UNSUPPORTED;
+    if (!rc) return refuse(WFS_E_GIT_UNSUPPORTED, "the stash has entries; a mirror cannot preserve the stash stack");
     if (rc != WFS_E_GIT_FAILED || status != 1) return rc;
     String grafts; const char *graft_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "info/grafts", nullptr};
     if (int graft_rc = value(root, graft_args, grafts)) return graft_rc;
     struct stat st;
-    if (!lstat(grafts.c_str(), &st)) return WFS_E_GIT_UNSUPPORTED;
+    if (!lstat(grafts.c_str(), &st)) return refuse(WFS_E_GIT_UNSUPPORTED, "info/grafts is present");
     return errno == ENOENT ? 0 : -errno;
 }
 int reject_inprogress(const char *root) {
@@ -486,14 +640,15 @@ int reject_promisor_remotes(const char *root) {
             if (i > start) {
                 size_t sp = i;
                 while (sp > start && listing[sp - 1] != ' ') --sp;
-                if (i - sp == 4 && !memcmp(listing.c_str() + sp, "true", 4)) return WFS_E_GIT_UNSUPPORTED;
+                if (i - sp == 4 && !memcmp(listing.c_str() + sp, "true", 4))
+                    return refuse(WFS_E_GIT_UNSUPPORTED, "partial clone (a promisor remote)");
             }
             start = i + 1;
         }
     }
     const char *filter[] = {"config", "--get-regexp", "^remote\\..*\\.partialclonefilter$", nullptr};
     if (int rc = get_config(root, filter, listing, &present)) return rc;
-    return present ? WFS_E_GIT_UNSUPPORTED : 0;
+    return present ? refuse(WFS_E_GIT_UNSUPPORTED, "partial clone (a partialclonefilter remote)") : 0;
 }
 int reject_promisor_packs(const String &common) {
     String dir = joinp(common.c_str(), "objects/pack");
@@ -506,7 +661,7 @@ int reject_promisor_packs(const String &common) {
         errno = 0; dirent *e = readdir(d);
         if (!e) { if (errno) rc = -errno; break; }
         size_t len = strlen(e->d_name);
-        if (len > 9 && !strcmp(e->d_name + len - 9, ".promisor")) { rc = WFS_E_GIT_UNSUPPORTED; break; }
+        if (len > 9 && !strcmp(e->d_name + len - 9, ".promisor")) { rc = refuse(WFS_E_GIT_UNSUPPORTED, "partial clone (a promisor pack)"); break; }
     }
     closedir(d); return rc;
 }
@@ -532,8 +687,11 @@ int reject_unsupported_extensions(const char *root) {
         if (name == "extensions.objectformat" || name == "extensions.relativeworktrees") continue;
         // Admitted only with the worktree settings capture_worktree_config accepts and restores.
         if (name == "extensions.worktreeconfig") continue;
-        if (name == "extensions.refstorage" && !strcasecmp(val.c_str(), "files")) continue;
-        return WFS_E_GIT_UNSUPPORTED;
+        if (name == "extensions.refstorage") {
+            if (!strcasecmp(val.c_str(), "files")) continue;
+            return refuse(WFS_E_GIT_UNSUPPORTED, "%s ref storage (only the files backend is supported)", val.c_str());
+        }
+        return refuse(WFS_E_GIT_UNSUPPORTED, "repository extension %s", name.c_str());
     }
     return 0;
 }
@@ -541,16 +699,17 @@ int reject_unsupported_extensions(const char *root) {
 // can change while an external mirror is being copied.
 int reject_import_policy(const char *root) {
     if (int rc = reject_ambient_policy(root)) return rc;
+    if (int rc = reject_used_filters(root)) return rc;
     for (const char *key : {"core.excludesFile", "core.attributesFile"})
         if (int rc = reject_configured_policy(root, key)) return rc;
     for (const char *key : {"core.sparseCheckout", "core.splitIndex"}) {
         String val; bool present = false; const char *args[] = {"config", "--get", "--type=bool", key, nullptr};
         if (int rc = get_config(root, args, val, &present)) return rc;
-        if (present && val != "false") return WFS_E_GIT_UNSUPPORTED;
+        if (present && val != "false") return refuse(WFS_E_GIT_UNSUPPORTED, "%s is enabled", key);
     }
     String val; bool present = false; const char *partial[] = {"config", "--get", "extensions.partialClone", nullptr};
     if (int rc = get_config(root, partial, val, &present)) return rc;
-    if (present) return WFS_E_GIT_UNSUPPORTED;
+    if (present) return refuse(WFS_E_GIT_UNSUPPORTED, "partial clone (extensions.partialClone)");
     if (int rc = reject_unsupported_extensions(root)) return rc;
     if (int rc = reject_promisor_remotes(root)) return rc;
     String common; const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
@@ -558,13 +717,13 @@ int reject_import_policy(const char *root) {
     struct stat st;
     for (const char *rel : {"objects/info/alternates", "objects/info/http-alternates", "shallow"}) {
         String path = joinp(common.c_str(), rel);
-        if (!lstat(path.c_str(), &st)) return WFS_E_GIT_UNSUPPORTED;
+        if (!lstat(path.c_str(), &st)) return refuse(WFS_E_GIT_UNSUPPORTED, "%s is present (alternates or shallow clone)", rel);
         if (errno != ENOENT) return -errno;
     }
     if (int rc = reject_promisor_packs(common)) return rc;
     const char *shared_args[] = {"rev-parse", "--shared-index-path", nullptr};
     if (int rc = value(root, shared_args, val)) return rc;
-    return val.empty() ? 0 : WFS_E_GIT_UNSUPPORTED;
+    return val.empty() ? 0 : refuse(WFS_E_GIT_UNSUPPORTED, "split index (a shared index file)");
 }
 // Learned rerere resolutions live in the common directory's rr-cache, which a mirror clone
 // does not copy. Git's layout is one directory per conflict holding regular files; anything
@@ -611,7 +770,7 @@ int capture_rerere(const char *root, Vec<char> &blob, bool &present, uint64_t &b
     int fd = open(cache.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
         if (errno == ENOENT) return 0;
-        return errno == ENOTDIR || errno == ELOOP ? WFS_E_GIT_UNSUPPORTED : -errno;
+        return errno == ENOTDIR || errno == ELOOP ? refuse(WFS_E_GIT_UNSUPPORTED, "rr-cache is a symlink or not a directory") : -errno;
     }
     present = true;
     Vec<String> dirs;
@@ -619,7 +778,7 @@ int capture_rerere(const char *root, Vec<char> &blob, bool &present, uint64_t &b
     for (size_t i = 0; !rc && i < dirs.size(); ++i) {
         struct stat st;
         if (fstatat(fd, dirs[i].c_str(), &st, AT_SYMLINK_NOFOLLOW)) { rc = -errno; break; }
-        if (!S_ISDIR(st.st_mode)) { rc = WFS_E_GIT_UNSUPPORTED; break; }
+        if (!S_ISDIR(st.st_mode)) { rc = refuse(WFS_E_GIT_UNSUPPORTED, "rr-cache/%s is not a conflict directory", dirs[i].c_str()); break; }
         int sub = openat(fd, dirs[i].c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (sub < 0) { rc = -errno; break; }
         append_record(blob, dirs[i].c_str(), nullptr);
@@ -627,7 +786,7 @@ int capture_rerere(const char *root, Vec<char> &blob, bool &present, uint64_t &b
         rc = list_names(sub, files);
         for (size_t j = 0; !rc && j < files.size(); ++j) {
             if (fstatat(sub, files[j].c_str(), &st, AT_SYMLINK_NOFOLLOW)) { rc = -errno; break; }
-            if (!S_ISREG(st.st_mode)) { rc = WFS_E_GIT_UNSUPPORTED; break; }
+            if (!S_ISREG(st.st_mode)) { rc = refuse(WFS_E_GIT_UNSUPPORTED, "rr-cache/%s/%s is not a regular file", dirs[i].c_str(), files[j].c_str()); break; }
             String dir_path = joinp(cache.c_str(), dirs[i].c_str());
             String path = joinp(dir_path.c_str(), files[j].c_str());
             Vec<char> data;
@@ -675,7 +834,9 @@ int require_clean_tree(const char *root) {
     const char *args[] = {"status", "--porcelain=v1", "-z", "--untracked-files=normal",
         "--", ".", ":(exclude).world", ":(exclude).world-git", nullptr};
     Vec<char> dirty;
-    if (int rc = git(root, args, &dirty)) return rc;
+    // With the user's own global/system configuration (global ignores, autocrlf, ...), so
+    // "clean" means what `git status` in the source and in the World both say.
+    if (int rc = git(root, args, &dirty, nullptr, false, true)) return rc;
     return dirty.size() > 1 ? WFS_E_GIT_DIRTY : 0;
 }
 // `for-each-ref` (and therefore the mirror) silently omits a symbolic ref whose target does
@@ -684,7 +845,7 @@ int require_clean_tree(const char *root) {
 // files backend, so every `ref: ` file under refs/ must be one the enumeration returned.
 // Reftable offers no read-only way to list them, so that backend is refused.
 int scan_loose_symrefs(int dirfd, const String &prefix, const Vec<GitSymref> &known, int depth) {
-    if (depth > 64) return WFS_E_GIT_UNSUPPORTED;
+    if (depth > 64) return refuse(WFS_E_GIT_UNSUPPORTED, "the refs directory is nested too deeply");
     int dup_fd = dup(dirfd);
     if (dup_fd < 0) return -errno;
     DIR *d = fdopendir(dup_fd);
@@ -717,7 +878,7 @@ int scan_loose_symrefs(int dirfd, const String &prefix, const Vec<GitSymref> &kn
         if (n < 5 || memcmp(head, "ref: ", 5)) continue;
         bool listed = false;
         for (const auto &sym : known) if (sym.name == ref) { listed = true; break; }
-        if (!listed) { rc = WFS_E_GIT_UNSUPPORTED; break; }
+        if (!listed) { rc = refuse(WFS_E_GIT_UNSUPPORTED, "symbolic ref %s points at a ref that does not exist", ref.c_str()); break; }
     }
     closedir(d);
     return rc;
@@ -726,7 +887,7 @@ int reject_unlisted_symrefs(const char *root, const Vec<GitSymref> &known) {
     String format;
     const char *format_args[] = {"rev-parse", "--show-ref-format", nullptr};
     if (int rc = value(root, format_args, format)) return rc;
-    if (format != "files") return WFS_E_GIT_UNSUPPORTED;
+    if (format != "files") return refuse(WFS_E_GIT_UNSUPPORTED, "%s ref storage (only the files backend is supported)", format.c_str());
     String common, admin;
     const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
     const char *admin_args[] = {"rev-parse", "--absolute-git-dir", nullptr};
@@ -823,7 +984,7 @@ int reject_reserved_paths(const char *root, const GitSource &s) {
     const char *tracked_args[] = {"ls-files", "-z", "--", ":(top,literal).world", ":(top,literal).world-git", nullptr};
     Vec<char> tracked;
     if (int rc = git(root, tracked_args, &tracked)) return rc;
-    if (tracked.size() > 1) return WFS_E_GIT_UNSUPPORTED;
+    if (tracked.size() > 1) return refuse(WFS_E_GIT_UNSUPPORTED, "the index tracks the reserved path .world or .world-git");
     Vec<String> tips;
     tips.emplace_back(s.head.c_str());
     if (s.orig_present) tips.emplace_back(s.orig_head.c_str());
@@ -836,7 +997,7 @@ int reject_reserved_paths(const char *root, const GitSource &s) {
             while (hex < i && ((s.fetch[hex] >= '0' && s.fetch[hex] <= '9') || (s.fetch[hex] >= 'a' && s.fetch[hex] <= 'f'))) ++hex;
             if (hex < i && s.fetch[hex] == '\t' && (hex - start == 40 || hex - start == 64))
                 tips.emplace_back(s.fetch.data() + start, hex - start);
-            else if (i > start) return WFS_E_GIT_UNSUPPORTED;
+            else if (i > start) return refuse(WFS_E_GIT_UNSUPPORTED, "FETCH_HEAD could not be parsed");
             start = i + 1;
         }
     }
@@ -847,22 +1008,24 @@ int reject_reserved_paths(const char *root, const GitSource &s) {
     args.emplace_back(nullptr);
     Vec<char> hit;
     if (int rc = git(root, args.data(), &hit)) return rc;
-    return hit.size() > 1 ? WFS_E_GIT_UNSUPPORTED : 0;
+    return hit.size() > 1 ? refuse(WFS_E_GIT_UNSUPPORTED, "a preserved commit tracks the reserved path .world or .world-git") : 0;
 }
 int git_source(const char *root, bool include_changes, GitSource &out) {
+    g_reason[0] = '\0';
     if (int rc = nested_check(root)) return rc;
     String dot = joinp(root, ".git"), managed = joinp(root, ".world-git");
     struct stat st;
     bool has_managed = lstat(managed.c_str(), &st) == 0;
     if (!has_managed && errno != ENOENT) return -errno;
-    if (lstat(dot.c_str(), &st)) return errno == ENOENT && !has_managed ? 0 : WFS_E_GIT_UNSUPPORTED;
-    if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) return WFS_E_GIT_UNSUPPORTED;
+    if (lstat(dot.c_str(), &st))
+        return errno == ENOENT && !has_managed ? 0 : refuse(WFS_E_GIT_UNSUPPORTED, ".world-git exists without its .git marker");
+    if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) return refuse(WFS_E_GIT_UNSUPPORTED, ".git is neither a directory nor a file");
     out.present = true; out.root = root;
     if (has_managed) {
         Vec<char> contents;
         if (int rc = read_bytes(dot.c_str(), contents)) return rc;
         if (contents.size() != strlen(marker) || memcmp(contents.data(), marker, contents.size()))
-            return WFS_E_GIT_UNSUPPORTED;
+            return refuse(WFS_E_GIT_UNSUPPORTED, "the .git file is not the WorldFS marker");
         out.managed = true;
     }
     String top;
@@ -870,7 +1033,7 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     if (int rc = value(root, top_args, top)) return rc;
     String real_top, real_root;
     if (fs_realpath(root, real_root) || fs_realpath(top.c_str(), real_top) || real_root != real_top)
-        return WFS_E_GIT_UNSUPPORTED;
+        return refuse(WFS_E_GIT_UNSUPPORTED, "the directory is not the top level of its Git repository");
     if (int policy_rc = reject_import_policy(root)) return policy_rc;
     if (int policy_rc = capture_settings(root, out.settings)) return policy_rc;
     if (int identity_rc = capture_identity(root, out.identity)) return identity_rc;
@@ -883,7 +1046,7 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
         if (int list_rc = git(root, list, &out.effective_config)) return list_rc;
     }
     const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
-    if (value(root, head_args, out.head)) return WFS_E_GIT_UNSUPPORTED;
+    if (value(root, head_args, out.head)) return refuse(WFS_E_GIT_UNSUPPORTED, "the repository has no commit yet");
     const char *index_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "index", nullptr};
     if (int rc = value(root, index_args, out.index_path)) return rc;
     int rc = read_bytes(out.index_path.c_str(), out.index);
@@ -934,7 +1097,8 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     if ((rc = git(root, ls_args, &listing))) return rc;
     for (size_t i = 0; i + 1 < listing.size();) {
         const char *entry = listing.data() + i;
-        if (!strncmp(entry, "160000 ", 7)) return WFS_E_GIT_UNSUPPORTED;
+        if (!strncmp(entry, "160000 ", 7))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "submodule (gitlink) %s", strchr(entry, '\t') ? strchr(entry, '\t') + 1 : entry);
         size_t end = i;
         while (end < listing.size() && listing[end]) ++end;
         size_t tab = i;
@@ -957,7 +1121,7 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
 // it is exactly what gets published. Loose-object fan-out directories hold no locks and can
 // be large, so they are skipped.
 int reject_locks_fd(int dirfd, bool objects_level, int depth) {
-    if (depth > 64) return WFS_E_GIT_UNSUPPORTED;
+    if (depth > 64) return refuse(WFS_E_GIT_UNSUPPORTED, "the World's Git administration is nested too deeply");
     int dup_fd = dup(dirfd);
     if (dup_fd < 0) return -errno;
     DIR *d = fdopendir(dup_fd);
@@ -993,6 +1157,27 @@ int reject_copied_locks(const char *clone) {
     close(fd);
     return rc;
 }
+// The identity the source's commits would carry, with the user's ambient configuration: a
+// conditional include (`includeIf "gitdir:~/work/"`) can supply it at the source's location and
+// not at the World's. When the World would resolve a different identity, the source's is written
+// to the World's own configuration, so its commits are attributed the way the source's are.
+int pin_identity(const char *source, const char *clone) {
+    for (const char *key : {"user.name", "user.email"}) {
+        const char *args[] = {"config", "--get", key, nullptr};
+        Vec<char> sv, cv; int ss = -1, cs = -1;
+        int rc = git(source, args, &sv, &ss, false, true);
+        if (rc == WFS_E_GIT_FAILED && ss == 1) continue; // the source has none: nothing to keep
+        if (rc) return rc;
+        rc = git(clone, args, &cv, &cs, false, true);
+        if (rc && !(rc == WFS_E_GIT_FAILED && cs == 1)) return rc;
+        String want(sv.data()), have(rc ? "" : cv.data());
+        if (!want.empty() && want.back() == '\n') want.pop_back();
+        if (!have.empty() && have.back() == '\n') have.pop_back();
+        if (rc || want != have)
+            if (int wrc = config(clone, key, want.c_str())) return wrc;
+    }
+    return 0;
+}
 int git_import(const GitSource &s, const char *clone) {
     if (!s.present) return 0;
     if (int rc = source_unchanged(s)) return rc;
@@ -1015,6 +1200,7 @@ int git_import(const GitSource &s, const char *clone) {
         if (!same_bytes(copy.refs, s.refs) ||
             copy.orig_present != s.orig_present || copy.orig_head != s.orig_head) return -EBUSY;
         if (int rc = reject_copied_locks(clone)) return rc;
+        if (int rc = pin_identity(s.root.c_str(), clone)) return rc;
         // HEAD and the index do not change when a tracked file is edited after the source's
         // clean check, so check the copy that will actually be published.
         return s.require_clean ? require_clean_tree(clone) : 0;
@@ -1124,6 +1310,7 @@ int git_import(const GitSource &s, const char *clone) {
     if (int rc = capture_refs(clone, imported_refs)) return rc;
     if (!same_bytes(imported_refs, s.refs)) return -EBUSY;
     if (int rc = source_unchanged(s)) return rc;
+    if (int rc = pin_identity(s.root.c_str(), clone)) return rc;
     // The owned repository now carries the source's index and status settings, so this sees the
     // bytes that will be published, including edits made after the source's own clean check.
     return s.require_clean ? require_clean_tree(clone) : 0;
@@ -1154,7 +1341,7 @@ int git_branch(const char *clone, wfs_id world) {
     if (lstat(dot.c_str(), &st)) return errno == ENOENT ? 0 : -errno;
     GitSource s;
     if (int rc = git_source(clone, true, s)) return rc;
-    if (!s.managed) return WFS_E_GIT_UNSUPPORTED;
+    if (!s.managed) return refuse(WFS_E_GIT_UNSUPPORTED, "not a WorldFS-managed Git World");
     Vec<char> refs;
     const char *list_refs[] = {"for-each-ref", "--format=%(refname)", "refs/heads/", nullptr};
     if (int rc = git(clone, list_refs, &refs)) return rc;
@@ -1195,6 +1382,8 @@ int git_branch(const char *clone, wfs_id world) {
 }
 } // namespace wfs
 
+extern "C" const char *wfs_git_reason(void) { return wfs::g_reason; }
+
 extern "C" int wfs_git_inspect(const char *root, wfs_git_info *out) {
     if (!root || !out) return -EINVAL;
     memset(out, 0, sizeof *out);
@@ -1205,7 +1394,7 @@ extern "C" int wfs_git_inspect(const char *root, wfs_git_info *out) {
     wfs::Vec<char> contents;
     if (int rc = wfs::read_bytes(dot.c_str(), contents)) return rc;
     if (contents.size() != strlen(wfs::marker) || memcmp(contents.data(), wfs::marker, contents.size()))
-        return WFS_E_GIT_UNSUPPORTED;
+        return wfs::refuse(WFS_E_GIT_UNSUPPORTED, "the .git file is not the WorldFS marker");
     wfs::String branch, base, common, head;
     const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (int rc = wfs::value(root, head_args, head)) return rc;

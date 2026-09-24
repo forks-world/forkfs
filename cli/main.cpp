@@ -133,6 +133,10 @@ static int is_refusal(int rc) { return rc <= -1001 && rc >= -1099; }
 
 static int fail(const char *what, int rc) {
     fprintf(stderr, "world: %s: %s\n", what, wfs_strerror(rc));
+    if (rc == WFS_E_GIT_UNSUPPORTED || rc == WFS_E_GIT_POLICY) {
+        const char *why = wfs_git_reason();
+        if (why && *why) fprintf(stderr, "  reason: %s\n", why);
+    }
     return is_refusal(rc) ? EX_REFUSED : EX_ERR;
 }
 

@@ -377,13 +377,14 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(one, 'show', 'HEAD:file').stdout, b'original\n')
         self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
 
-    def test_ambient_replace_ref_policy_is_refused(self):
+    def test_ambient_replace_ref_policy_is_shared(self):
         global_config = self.root / 'global-config'
         global_config.write_text('[core]\n useReplaceRefs = false\n')
         self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
-        result = self.world('init', str(self.source), code=3)
-        self.assertIn(b'unsupported Git layout', result.stderr)
-        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        self.world('init', str(self.source))
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'config', '--type=bool', 'core.useReplaceRefs').stdout.strip(), b'false')
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
 
     def test_status_policy_types_and_absent_defaults(self):
         self.git(self.source, 'config', '--local', 'core.ignorecase', 'true')
@@ -416,18 +417,22 @@ class GitWorldTest(unittest.TestCase):
             self.assertEqual(self.git(path, 'status', '--porcelain').stdout, b'')
 
     def test_injected_status_policies_are_refused(self):
+        (self.source / '.gitattributes').write_text('file filter=injected\n')
+        self.git(self.source, 'add', '.gitattributes')
+        self.git(self.source, 'commit', '-qm', 'file uses the injected filter')
         before = [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index', 'config')]
         for channel in ('count', 'parameters'):
-            for key, value in (('core.autocrlf', 'input'),
-                               ('core.attributesFile', '/nonexistent-policy'),
-                               ('filter.injected.clean', 'touch injected-filter-ran; cat')):
+            for key, value, reason in (('core.autocrlf', 'input', b'set as command configuration'),
+                                       ('core.attributesFile', '/nonexistent-policy', b'set as command configuration'),
+                                       ('filter.injected.clean', 'touch injected-filter-ran; cat', b"uses the 'injected' filter")):
                 with self.subTest(channel=channel, key=key):
                     if channel == 'count':
                         self.env.update(GIT_CONFIG_COUNT='3', GIT_CONFIG_KEY_2=key, GIT_CONFIG_VALUE_2=value)
                     else:
                         self.env['GIT_CONFIG_PARAMETERS'] = "'" + key + '=' + value + "'"
                     result = self.world('init', str(self.source), code=3)
-                    self.assertIn(b'unsupported Git layout', result.stderr)
+                    self.assertIn(b"would make the World's Git see files differently", result.stderr)
+                    self.assertIn(reason, result.stderr)
                     self.assertFalse((self.source / 'injected-filter-ran').exists())
                     self.assertEqual(before, [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index', 'config')])
                     self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
@@ -482,10 +487,11 @@ class GitWorldTest(unittest.TestCase):
                         local.write_bytes(original + directive.encode())
                     self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
                     result = self.world('init', str(self.source), code=3)
-                    self.assertIn(b'unsupported Git layout', result.stderr)
-                    self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
                     self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
                     local.write_bytes(original)
+                    self.assertIn(b"would make the World's Git see files differently", result.stderr)
+                    self.assertIn(b'which sets core.autocrlf', result.stderr)
+                    self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
     def test_long_branch_inspection_and_metadata_overflow(self):
         self.world('init', str(self.source))
@@ -499,7 +505,7 @@ class GitWorldTest(unittest.TestCase):
         result = self.world('inspect', wid, '--json', code=1)
         self.assertNotIn(b'"git":', result.stdout)
 
-    def test_global_status_policy_is_refused_before_dirty_admission(self):
+    def test_global_status_policy_decides_cleanliness_like_the_users_git(self):
         line = self.source / 'line.txt'
         line.write_bytes(b'committed\r\n')
         self.git(self.source, 'add', 'line.txt')
@@ -516,30 +522,101 @@ class GitWorldTest(unittest.TestCase):
         stamp = line.stat().st_mtime - 10
         os.utime(line, (stamp, stamp))
         self.assertIn(b' M line.txt', self.git(self.source, 'status', '--porcelain').stdout)
+        # The user's own Git (global attributes via an unconditional include) calls the file
+        # modified, so a plain init must refuse it as dirty rather than call it clean.
         before = [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index', 'config')]
         result = self.world('init', str(self.source), code=3)
-        self.assertIn(b'unsupported Git layout', result.stderr)
+        self.assertIn(b'uncommitted changes', result.stderr)
         self.assertEqual(before, [(self.source / '.git' / name).read_bytes() for name in ('HEAD', 'index', 'config')])
         self.assertEqual(line.read_bytes(), b'committed\r\n')
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        # Carried explicitly, the World sees exactly what the source's Git sees.
+        self.world('init', str(self.source), '--include-changes')
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b' M line.txt\n')
 
-    def test_ambient_filters_are_refused_without_execution(self):
+    def test_conditional_include_identity_is_pinned_in_the_world(self):
+        work = self.root / 'work'
+        work.mkdir()
+        source = work / 'repo'
+        self.git(self.root, 'init', '-q', '-b', 'main', str(source))
+        (source / 'file').write_text('work\n')
+        identity = self.root / 'work-identity'
+        identity.write_text('[user]\n name = Work Name\n email = work@example.com\n')
+        global_config = self.root / 'identity-global'
+        global_config.write_text('[includeIf "gitdir:' + str(work) + '/"]\n path = ' + str(identity) + '\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        self.git(source, 'add', 'file')
+        self.git(source, 'commit', '-qm', 'base')
+        self.assertEqual(self.git(source, 'config', 'user.email').stdout.strip(), b'work@example.com')
+        snapshot = self.world('init', str(source)).stdout.split()[0].decode()
+        elsewhere = self.root / 'elsewhere'
+        elsewhere.mkdir()
+        one, _ = self.fork(str(Path('elsewhere') / 'one'), snapshot)
+        self.assertEqual(self.git(one, 'config', '--show-scope', 'user.email').stdout.split(),
+                         [b'local', b'work@example.com'])
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'in the World')
+        self.assertEqual(self.git(one, 'log', '-1', '--format=%an <%ae>').stdout.strip(),
+                         b'Work Name <work@example.com>')
+
+    def test_refusals_name_their_reason(self):
+        source = self.root / 'reftable'
+        self.git(self.root, 'init', '-q', '-b', 'main', '--ref-format=reftable', str(source))
+        self.git(source, 'config', 'user.name', 'World Test')
+        self.git(source, 'config', 'user.email', 'world@example.com')
+        (source / 'file').write_text('reftable\n')
+        self.git(source, 'add', 'file')
+        self.git(source, 'commit', '-qm', 'base')
+        result = self.world('init', str(source), code=3)
+        self.assertIn(b'unsupported Git layout\n  reason: reftable ref storage', result.stderr)
+        (self.source / 'sub').mkdir()
+        self.git(self.source / 'sub', 'init', '-q')
+        result = self.world('init', str(self.source), '--include-changes', code=3)
+        self.assertIn(b'reason: nested Git repository or submodule at ', result.stderr)
+
+    def test_unused_ambient_filters_are_allowed_without_execution(self):
+        # A machine-wide `git lfs install` defines a filter every repository can see.
+        global_config = self.root / 'filter-global'
+        global_config.write_text('[filter "example"]\n clean = touch ambient-filter-ran; cat\n'
+                                 ' smudge = touch ambient-filter-ran; cat\n required = true\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        (self.source / 'changed').write_text('untracked\n')
+        self.world('init', str(self.source), '--include-changes')
+        one, _ = self.fork()
+        self.git(one, 'status', '--porcelain')
+        self.assertFalse((self.source / 'ambient-filter-ran').exists())
+        self.assertFalse((one / 'ambient-filter-ran').exists())
+
+    def test_used_ambient_filter_is_refused_without_execution(self):
         global_config = self.root / 'filter-global'
         global_config.write_text('[filter "example"]\n clean = touch ambient-filter-ran; cat\n')
+        (self.source / '.gitattributes').write_text('*.bin filter=example\n')
+        (self.source / 'model.bin').write_text('weights\n')
+        self.git(self.source, 'add', '.')
+        self.git(self.source, 'commit', '-qm', 'model')
         self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
         result = self.world('init', str(self.source), '--include-changes', code=3)
-        self.assertIn(b'unsupported Git layout', result.stderr)
+        self.assertIn(b"would make the World's Git see files differently", result.stderr)
+        self.assertIn(b"reason: tracked file model.bin uses the 'example' filter", result.stderr)
         self.assertFalse((self.source / 'ambient-filter-ran').exists())
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
-    def test_system_status_policy_is_refused(self):
+    def test_system_and_global_status_settings_are_shared(self):
         system_config = self.root / 'system-config'
         system_config.write_text('[core]\n autocrlf = false\n')
-        self.env['GIT_CONFIG_NOSYSTEM'] = '0'
-        self.env['GIT_CONFIG_SYSTEM'] = str(system_config)
-        result = self.world('init', str(self.source), code=3)
-        self.assertIn(b'unsupported Git layout', result.stderr)
-        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        ignores = self.root / 'global-ignore'
+        ignores.write_text('*.scratch\n')
+        global_config = self.root / 'global-config'
+        global_config.write_text('[core]\n excludesFile = ' + str(ignores) + '\n autocrlf = input\n')
+        self.env.update(GIT_CONFIG_NOSYSTEM='0', GIT_CONFIG_SYSTEM=str(system_config),
+                        GIT_CONFIG_GLOBAL=str(global_config))
+        (self.source / 'notes.scratch').write_text('ignored only by the global excludesFile\n')
+        self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.assertTrue((one / 'notes.scratch').exists())
 
     def test_filter_configuration_is_refused_before_execution(self):
         (self.source / '.gitattributes').write_text('file filter=example\n')
@@ -549,7 +626,8 @@ class GitWorldTest(unittest.TestCase):
         included.write_text('[filter "example"]\n    clean = touch filter-ran; cat\n')
         self.git(self.source, 'config', '--local', 'include.path', str(included))
         result = self.world('init', str(self.source), code=3)
-        self.assertIn(b'unsupported Git layout', result.stderr)
+        self.assertIn(b"would make the World's Git see files differently", result.stderr)
+        self.assertIn(b"reason: tracked file file uses the 'example' filter", result.stderr)
         self.assertFalse((self.source / 'filter-ran').exists())
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
@@ -620,12 +698,12 @@ class GitWorldTest(unittest.TestCase):
             self.env['GIT_ATTR_SOURCE'] = self.base.decode()
             result = self.world('init', str(self.source), code=3)
             self.env = env
-            self.assertIn(b'unsupported Git layout', result.stderr)
+            self.assertIn(b'reason: GIT_ATTR_SOURCE is set', result.stderr)
         with self.subTest(source='attr.tree'):
             self.git(self.source, 'config', 'attr.tree', 'HEAD')
             result = self.world('init', str(self.source), code=3)
-            self.assertIn(b'unsupported Git layout', result.stderr)
             self.git(self.source, 'config', '--unset', 'attr.tree')
+            self.assertIn(b'reason: attr.tree is set', result.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
         self.world('init', str(self.source))
 
