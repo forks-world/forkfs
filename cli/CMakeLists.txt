@@ -33,6 +33,6 @@ if(Python3_Interpreter_FOUND AND GIT_FOUND)
     add_test(NAME cli_git_test
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/git_test.py $<TARGET_FILE:world>)
     set_tests_properties(cli_git_test PROPERTIES
-        TIMEOUT 180
+        TIMEOUT 600
         ENVIRONMENT "TMPDIR=${CLI_GIT_TEST_SCRATCH}/")
 endif()

@@ -855,6 +855,25 @@ class GitWorldTest(unittest.TestCase):
         one, _ = self.fork('one', snapshot)
         self.assertEqual(self.git(one, 'config', 'user.email').stdout.strip(), b'changed@example.com')
 
+    def test_identity_resolving_differently_in_the_copy_is_refused(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        # <world>/.world-git/repo.git/config includes ../../../identity: the World's parent.
+        self.git(one, 'config', '--unset', 'user.email')
+        self.git(one, 'config', 'include.path', '../../../identity')
+        (self.root / 'identity').write_text('[user]\n email = here@example.com\n')
+        elsewhere = self.root / 'elsewhere'
+        elsewhere.mkdir()
+        (elsewhere / 'identity').write_text('[user]\n email = there@example.com\n')
+        self.assertEqual(self.git(one, 'config', 'user.email').stdout.strip(), b'here@example.com')
+        before = json.loads(self.world('list', '--json').stdout)
+        self.world('fork', '--from', wid, '--to', str(elsewhere / 'two'), code=1)
+        self.assertFalse((elsewhere / 'two').exists())
+        self.assertEqual(json.loads(self.world('list', '--json').stdout), before)
+        (elsewhere / 'identity').write_text('[user]\n email = here@example.com\n')
+        two, _ = self.fork(str(Path('elsewhere') / 'two'), wid)
+        self.assertEqual(self.git(two, 'config', 'user.email').stdout.strip(), b'here@example.com')
+
     def test_external_hardlinks_are_reported_after_git_import(self):
         (self.source / 'shared').write_text('linked from outside\n')
         self.git(self.source, 'add', 'shared')

@@ -861,7 +861,9 @@ int git_import(const GitSource &s, const char *clone) {
             copy.fetch_present != s.fetch_present || !same_bytes(copy.fetch, s.fetch) ||
             copy.squash_present != s.squash_present || !same_bytes(copy.squash, s.squash) ||
             copy.sparse_present != s.sparse_present || !same_bytes(copy.sparse, s.sparse) ||
-            !same_symrefs(copy.symrefs, s.symrefs) || !same_settings(copy.settings, s.settings)) return -EBUSY;
+            !same_symrefs(copy.symrefs, s.symrefs) || !same_settings(copy.settings, s.settings) ||
+            // A relative include can resolve differently from the copy's location.
+            !same_settings(copy.identity, s.identity)) return -EBUSY;
         if (!same_bytes(copy.refs, s.refs) ||
             copy.orig_present != s.orig_present || copy.orig_head != s.orig_head) return -EBUSY;
         if (int rc = reject_copied_locks(clone)) return rc;
