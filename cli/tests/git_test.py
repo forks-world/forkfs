@@ -733,6 +733,64 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(one, 'branch', '--show-current').stdout.strip(), b'world/W1-1')
         self.assertEqual(self.git(one, 'rev-parse', 'world/W1').stdout.strip(), self.base)
 
+    def test_branch_sharing_a_tag_name_is_reported_exactly(self):
+        self.git(self.source, 'tag', 'world/W1')
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.assertEqual(self.git(one, 'branch', '--show-current').stdout.strip(), b'world/W1')
+        self.assertEqual(self.git(one, 'rev-parse', 'refs/tags/world/W1').stdout.strip(), self.base)
+        data = json.loads(self.world('inspect', wid, '--json').stdout)
+        self.assertEqual(data['git']['branch'], 'world/W1')
+        text = self.world('inspect', wid).stdout
+        self.assertIn(b'world/W1', text)
+        self.assertNotIn(b'heads/world/W1', text)
+        self.git(one, 'symbolic-ref', 'HEAD', 'refs/tags/world/W1')
+        data = json.loads(self.world('inspect', wid, '--json').stdout)
+        self.assertEqual(data['git']['branch'], '')
+        self.assertIn(b'(detached)', self.world('inspect', wid).stdout)
+
+    def test_promisor_partial_clone_is_refused(self):
+        self.git(self.source, 'config', 'uploadpack.allowFilter', 'true')
+        (self.source / 'file').write_text('second\n')
+        self.git(self.source, 'commit', '-am', 'second')
+        partial = self.root / 'partial'
+        self.git(self.root, 'clone', '--quiet', '--no-local', '--filter=blob:none',
+                 self.source.as_uri(), str(partial))
+        self.git(partial, 'config', 'user.name', 'World Test')
+        self.git(partial, 'config', 'user.email', 'world@example.com')
+        subprocess.run(['git', '-C', str(partial), 'config', '--unset', 'extensions.partialClone'],
+                       env=self.env, capture_output=True)
+        self.git(partial, 'config', '--get', 'extensions.partialClone', code=1)
+        self.assertEqual(self.git(partial, 'status', '--porcelain').stdout, b'')
+        missing = self.git(partial, 'rev-list', '--objects', '--missing=print', '--all').stdout
+        self.assertIn(b'\n?', b'\n' + missing)
+        promisor_packs = list((partial / '.git' / 'objects' / 'pack').glob('*.promisor'))
+        self.assertTrue(promisor_packs)
+        self.assertEqual(self.git(partial, 'config', '--get', 'remote.origin.promisor').stdout.strip(), b'true')
+        self.assertEqual(self.git(partial, 'config', '--get', 'remote.origin.partialclonefilter').stdout.strip(),
+                         b'blob:none')
+        head = self.git(partial, 'rev-parse', 'HEAD').stdout.strip()
+
+        def refused():
+            result = self.world('init', str(partial), code=3)
+            self.assertIn(b'unsupported Git layout', result.stderr)
+            self.assertEqual(self.git(partial, 'rev-parse', 'HEAD').stdout.strip(), head)
+            self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+        with self.subTest(marker='promisor-and-filter'):
+            refused()
+        self.git(partial, 'config', '--unset', 'remote.origin.partialclonefilter')
+        with self.subTest(marker='promisor-only'):
+            refused()
+        self.git(partial, 'config', '--unset', 'remote.origin.promisor')
+        self.git(partial, 'config', 'remote.origin.partialclonefilter', 'blob:none')
+        with self.subTest(marker='filter-only'):
+            refused()
+        self.git(partial, 'config', '--unset', 'remote.origin.partialclonefilter')
+        self.git(partial, 'config', '--get-regexp', '^remote\\..*\\.(promisor|partialclonefilter)$', code=1)
+        with self.subTest(marker='promisor-pack-only'):
+            refused()
+
     def test_branch_prefix_collision_is_not_overwritten(self):
         self.git(self.source, 'branch', 'world')
         self.world('init', str(self.source))

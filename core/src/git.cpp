@@ -396,6 +396,46 @@ int reject_inprogress(const char *root) {
     }
     return 0;
 }
+// Modern partial clones are marked by remote.<name>.promisor / partialclonefilter and by
+// pack-*.promisor markers; extensions.partialClone is deprecated and may be absent. A local
+// mirror copies such an object database without its missing blobs, so the owned repository
+// would fail permanently once remote.origin is removed and the source goes away.
+int reject_promisor_remotes(const char *root) {
+    String listing; bool present = false;
+    const char *promisor[] = {"config", "--get-regexp", "--type=bool", "^remote\\..*\\.promisor$", nullptr};
+    if (int rc = get_config(root, promisor, listing, &present)) return rc;
+    if (present) {
+        // Each line is "<key> <bool>"; the key is a section name and may itself contain spaces.
+        size_t start = 0, n = listing.size();
+        for (size_t i = 0; i <= n; ++i) {
+            if (i < n && listing[i] != '\n') continue;
+            if (i > start) {
+                size_t sp = i;
+                while (sp > start && listing[sp - 1] != ' ') --sp;
+                if (i - sp == 4 && !memcmp(listing.c_str() + sp, "true", 4)) return WFS_E_GIT_UNSUPPORTED;
+            }
+            start = i + 1;
+        }
+    }
+    const char *filter[] = {"config", "--get-regexp", "^remote\\..*\\.partialclonefilter$", nullptr};
+    if (int rc = get_config(root, filter, listing, &present)) return rc;
+    return present ? WFS_E_GIT_UNSUPPORTED : 0;
+}
+int reject_promisor_packs(const String &common) {
+    String dir = joinp(common.c_str(), "objects/pack");
+    int fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return errno == ENOENT || errno == ENOTDIR ? 0 : -errno;
+    DIR *d = fdopendir(fd);
+    if (!d) { int rc = -errno; close(fd); return rc; }
+    int rc = 0;
+    for (;;) {
+        errno = 0; dirent *e = readdir(d);
+        if (!e) { if (errno) rc = -errno; break; }
+        size_t len = strlen(e->d_name);
+        if (len > 9 && !strcmp(e->d_name + len - 9, ".promisor")) { rc = WFS_E_GIT_UNSUPPORTED; break; }
+    }
+    closedir(d); return rc;
+}
 // Repeat the same eligibility checks before publication: configuration and layout
 // can change while an external mirror is being copied.
 int reject_import_policy(const char *root) {
@@ -410,6 +450,7 @@ int reject_import_policy(const char *root) {
     String val; bool present = false; const char *partial[] = {"config", "--get", "extensions.partialClone", nullptr};
     if (int rc = get_config(root, partial, val, &present)) return rc;
     if (present) return WFS_E_GIT_UNSUPPORTED;
+    if (int rc = reject_promisor_remotes(root)) return rc;
     String common; const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
     if (int rc = value(root, common_args, common)) return rc;
     struct stat st;
@@ -418,6 +459,7 @@ int reject_import_policy(const char *root) {
         if (!lstat(path.c_str(), &st)) return WFS_E_GIT_UNSUPPORTED;
         if (errno != ENOENT) return -errno;
     }
+    if (int rc = reject_promisor_packs(common)) return rc;
     const char *shared_args[] = {"rev-parse", "--shared-index-path", nullptr};
     if (int rc = value(root, shared_args, val)) return rc;
     return val.empty() ? 0 : WFS_E_GIT_UNSUPPORTED;
@@ -741,12 +783,18 @@ extern "C" int wfs_git_inspect(const char *root, wfs_git_info *out) {
     wfs::String branch, base, common, head;
     const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (int rc = wfs::value(root, head_args, head)) return rc;
-    const char *branch_args[] = {"rev-parse", "--abbrev-ref", "HEAD", nullptr};
+    const char *branch_args[] = {"symbolic-ref", "--quiet", "HEAD", nullptr};
     const char *base_args[] = {"config", "--local", "--get", "worldfs.baseline", nullptr};
     const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
-    // Detached HEAD after an explicit user checkout is valid; an empty branch reports it.
-    if (int rc = wfs::value(root, branch_args, branch)) return rc;
-    if (branch == "HEAD") branch.clear();
+    // Detached HEAD after an explicit user checkout is valid; an empty branch reports it
+    // (symbolic-ref exits 1 without output). The full symbolic target is read rather than
+    // rev-parse --abbrev-ref, which reports "heads/<name>" when a tag shares the branch name.
+    // Like `git branch --show-current`, a symbolic HEAD outside refs/heads/ is not a branch.
+    if (int rc = wfs::value(root, branch_args, branch, true)) return rc;
+    if (!strncmp(branch.c_str(), "refs/heads/", 11) && branch.size() > 11) {
+        wfs::String name(branch.c_str() + 11, branch.size() - 11);
+        branch = name;
+    } else branch.clear();
     if (int rc = wfs::value(root, base_args, base)) return rc;
     if (int rc = wfs::value(root, common_args, common)) return rc;
     if (head.size() >= sizeof out->head || branch.size() >= sizeof out->branch ||

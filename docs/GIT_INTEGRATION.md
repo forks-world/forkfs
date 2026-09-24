@@ -63,8 +63,10 @@ uncommitted-content choice.
 
 The fork's baseline commit is recorded as `worldfs.baseline` in its own Git configuration,
 separately from the filesystem snapshot ID. `inspect W<n>` (including JSON) reports the
-baseline, current HEAD, branch and common directory for live managed Git Worlds. A user
-may explicitly detach HEAD; inspection then reports an empty branch. Use `git diff` and
+baseline, current HEAD, branch and common directory for live managed Git Worlds. The
+branch is HEAD's symbolic target without its `refs/heads/` prefix, so a tag sharing the
+branch name does not change what is reported. A user may explicitly detach HEAD, or point
+HEAD outside `refs/heads/`; inspection then reports an empty branch. Use `git diff` and
 `git diff --cached` to review source changes. `world fs diff` still compares filesystem
 content, including Git administrative changes such as branch/index updates.
 
@@ -74,7 +76,10 @@ content, including Git administrative changes such as branch/index updates.
   unborn repositories are refused. External linked worktrees are safely imported by
   resolving their source Git administration and constructing fresh local administration.
 - Nested repositories/submodules, sparse or split indexes, shallow/partial clones, and
-  object alternates are refused. Managed Worlds with symlinked administration or additional
+  object alternates are refused. Partial clones are recognized by `extensions.partialClone`,
+  by any `remote.<name>.promisor` or `remote.<name>.partialclonefilter` setting, and by
+  `pack-*.promisor` markers, because a local mirror copies an object database without its
+  missing objects. Managed Worlds with symlinked administration or additional
   linked worktrees are refused by fork/checkpoint. Discard also refuses registered extra
   worktrees, including with `--force`, until they have been removed with Git. Do not create
   new Git registrations in trashed trees. Merge/rebase/cherry-pick/revert in progress
