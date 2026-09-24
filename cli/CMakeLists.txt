@@ -24,3 +24,15 @@ if(Python3_Interpreter_FOUND)
             ENVIRONMENT "TMPDIR=${CMAKE_CURRENT_BINARY_DIR}/scratch/")
     endif()
 endif()
+
+# Git integration is optional for plain directory worlds; its tests require relative worktrees.
+find_package(Git 2.48 QUIET)
+if(Python3_Interpreter_FOUND AND GIT_FOUND)
+    set(CLI_GIT_TEST_SCRATCH "${CMAKE_CURRENT_BINARY_DIR}/scratch")
+    file(MAKE_DIRECTORY "${CLI_GIT_TEST_SCRATCH}")
+    add_test(NAME cli_git_test
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/git_test.py $<TARGET_FILE:world>)
+    set_tests_properties(cli_git_test PROPERTIES
+        TIMEOUT 600
+        ENVIRONMENT "TMPDIR=${CLI_GIT_TEST_SCRATCH}/")
+endif()

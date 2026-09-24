@@ -73,7 +73,7 @@ static void json_snapshot(FILE *out, const wfs_snapshot_rec &v) {
     j.num("root_mode", v.root_mode); j.str("protection", v.hard ? "hard" : "gate");
 }
 
-static void json_world(FILE *out, const wfs_world_rec &v) {
+static void json_world(FILE *out, const wfs_world_rec &v, const wfs_git_info *git = nullptr) {
     Json j(out);
     j.num("schema_version", 1); j.str("kind", "world"); j.ref("id", 'W', v.id);
     j.str("name", v.name); j.str("path", v.path); j.str("state", json_state(v.state));
@@ -83,6 +83,11 @@ static void json_world(FILE *out, const wfs_world_rec &v) {
     j.signed_num("created_at", v.created_at); j.signed_num("trashed_at", v.trashed_at);
     j.num("entries", v.entries); j.num("dir_dev", v.dir_dev); j.num("dir_ino", v.dir_ino);
     j.num("fsevents_id", v.fsevents_id); j.boolean("present", v.present);
+    if (git && git->present) {
+        j.key("git"); Json g(out);
+        g.str("branch", git->branch); g.str("head", git->head);
+        g.str("baseline", git->baseline); g.str("git_dir", git->git_dir);
+    }
 }
 
 static int json_list(wfs_store *s, wfs_snapshot_rec *v, size_t cap, size_t *n) {

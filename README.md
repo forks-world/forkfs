@@ -105,6 +105,28 @@ $world fs status                       # store, counts, free space
 $world exec W1 -- make test            # run a command inside W1, sandboxed (see below)
 ```
 
+### Built-in Git worktrees
+
+A root Git repository is imported into a self-contained Git directory. Forking it
+creates a native worktree on an independent `world/W<n>` branch, records the baseline
+commit, and preserves non-Git files. Each World's Git administration moves and is
+collected with that World; the original repository and other Worlds keep independent
+refs and indexes. Git 2.48+ is required for Git sources.
+
+```bash
+$world fs init ~/src/project
+$world fs init ~/src/dirty-project --include-changes  # preserve index + working changes
+$world fs fork --from S1 --to ~/worlds/task          # creates the branch/worktree
+$world fs inspect W1 --json                         # includes Git branch/HEAD/baseline
+$world fs checkpoint W1 --include-changes           # filesystem snapshot, no Git commit
+```
+
+Dirty live Git sources require `--include-changes`; ignored build/data files are
+always retained. Existing linked worktrees are imported without reusing their source
+index or registration. Nested repositories/submodules and several advanced Git layouts
+are currently refused. Git snapshots use ordinary forks, not the pre-clone pool.
+See [Git integration](docs/GIT_INTEGRATION.md) for behavior, supported layouts and limits.
+
 ### JSON output for scripts and agents
 
 ```bash

@@ -6,6 +6,17 @@
 [`MACOS_VALIDATION.md`](MACOS_VALIDATION.md)。本文件按时间保留历史测试数量与测量结果;
 旧的 93/142 等通过数不代表当前测试总数,应以当前 CI/测试输出为准。
 
+## Git 集成增量(2026-09-22)
+
+- [x] `feat/git-worktrees`: 根 Git 仓库导入内置 `.world-git/repo.git`,fork 自动建立
+  原生 linked worktree、独立 `world/W<n>` 分支并记录基线。每个 World 的 refs/index/对象库
+  独立,相对管理指针随移动、trash/restore、checkpoint、GC 一起生效。
+- [x] `--include-changes` 显式保留暂存/未暂存/未跟踪内容,ignored 产物照常克隆;
+  `inspect` 文本/JSON 展示 Git 身份。已有外部 worktree 安全脱钩导入。
+- [x] Git 在发布前完成初始化,失败走现有临时树回滚;不复用 Git pool 条目。
+- [ ] Issue #7 剩余: 从 HEAD 丢弃修改的显式模式、嵌套仓库/submodule/LFS、共享仓库服务
+  与跨机器传输。范围及测试见 [`GIT_INTEGRATION.md`](GIT_INTEGRATION.md)。
+
 ## 当前增量开发(2026-09-22)
 
 - [x] CLI 查询 JSON 输出:`list / inspect / status / diff / pool status / gc --status` 支持 `--json`,报告版本 1;

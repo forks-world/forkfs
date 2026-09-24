@@ -92,7 +92,13 @@ struct HardlinkRestore {
 // group (its `nlink` is that count, which is what the tree will have); exactly one name left is
 // a plain file -- no group, nothing external, and not counted in `hardlinks` either; and a name
 // really outside the tree is external, exactly as before.
-int hardlinks_scan(const char *root, const char *exclude_rel, TreeStats *stats, HardlinkSet &out);
+//
+// `exclude_tree`, when given, is a tree-relative name taken out of the published tree together
+// with everything under it (a Git import replaces the source's `.git` with owned administration).
+// Its names are excluded exactly like `exclude_rel`: they are not group members, and their links
+// are subtracted from the names that stay, so they never make a group external.
+int hardlinks_scan(const char *root, const char *exclude_rel, TreeStats *stats, HardlinkSet &out,
+                   const char *exclude_tree = nullptr);
 
 // Appends the set to an open manifest, as
 //

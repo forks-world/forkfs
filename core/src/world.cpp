@@ -11,6 +11,7 @@
 #include "db.h"
 #include "hardlinks.h"
 #include "pool.h"
+#include "git.h"
 #include "snapshot_access.h"
 
 #include <dirent.h>
@@ -621,10 +622,11 @@ int check_path(wfs_store *s, const char *in, PathMode mode, String &real, bool *
 
 // P11. `entries` is the source tree's entry count; 1 KiB per entry is three times the measured
 // 308 B/entry metadata cost of a clone (CLONE_MODEL_MACOS27 §4), plus a flat floor.
-int space_check(const char *near_path, uint64_t entries) {
+int space_check(const char *near_path, uint64_t entries, uint64_t extra_bytes = 0) {
     uint64_t avail = 0, total = 0;
     if (int rc = wfs::fs_free_space(near_path, &avail, &total)) return rc;
-    uint64_t need = entries * 1024 + kSpaceFloor;
+    if (extra_bytes > UINT64_MAX - kSpaceFloor || entries > (UINT64_MAX - kSpaceFloor - extra_bytes) / 1024) return WFS_E_LOW_SPACE;
+    uint64_t need = entries * 1024 + kSpaceFloor + extra_bytes;
     return avail < need ? WFS_E_LOW_SPACE : 0;
 }
 
@@ -1175,6 +1177,9 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         // caller meant. --force says they meant it.
         if (int rc = exec_lock_guard(s, from_world, o.force)) return rc;
     }
+    wfs::GitSource git_source;
+    if (int rc = wfs::git_source(src.c_str(), o.include_changes != 0, git_source)) return rc;
+
     // P6: st_dev equality does not predict clonefile success, so really clone something.
     if (int rc = wfs_store_clone_probe(s, src.c_str())) return rc;
     // One walk of the SOURCE before cloning, for two things the clone can no longer tell us:
@@ -1192,8 +1197,13 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
     // and the snapshot went out advertising a member it does not contain -- WFS_E_SNAPSHOT_DIRTY
     // from every verify and every fork afterwards. Exactly the name that is removed, so a
     // `.world` in a sub-world (which is not removed) is untouched.
-    if (int rc = wfs::hardlinks_scan(src.c_str(), WFS_MARKER_NAME, &src_stats, hl)) return rc;
-    if (int rc = space_check(s->dir.c_str(), src_stats.entries)) return rc;
+    // An external Git import replaces the source's `.git` (directory or gitfile) with owned
+    // administration, so its names are not files of the published tree either: excluding them
+    // here keeps the groups and the external counts about exactly the tree that is published,
+    // including worktree files linked from outside it (a rescan of the clone would lose those).
+    const char *git_admin = git_source.present && !git_source.managed ? ".git" : nullptr;
+    if (int rc = wfs::hardlinks_scan(src.c_str(), WFS_MARKER_NAME, &src_stats, hl, git_admin)) return rc;
+    if (int rc = space_check(s->dir.c_str(), src_stats.entries, git_source.import_bytes)) return rc;
 
     char nm[WFS_NAME_MAX];
     copy_str(nm, sizeof nm, (name && *name) ? name : basename_of(src.c_str()));
@@ -1261,6 +1271,8 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         // group left in there would be rebuilt one step later, in the fork, over the very
         // contents this replay declined to overwrite.
         if (hlr.broken.size()) hl_drop_broken(hl, hlr.broken);
+        // The source scan already left the replaced `.git` out, so `hl` describes this tree.
+        if ((rc = wfs::git_import(git_source, root.c_str()))) break;
         {
             struct stat rst;
             if (::stat(root.c_str(), &rst) == 0) root_mode = (uint32_t)(rst.st_mode & 07777);
@@ -1529,6 +1541,20 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
     }
 
     String target;
+    wfs::GitSource git_source;
+    bool git_snapshot = false;
+    if (from.kind == WFS_K_WORLD) {
+        if (int rc = wfs::git_source(src.c_str(), o.include_changes != 0, git_source)) return rc;
+    } else {
+        SnapGate gate;
+        if (src_gated) { if (int rc = gate.open(src.c_str(), false)) return rc; }
+        String dot = joinp(src.c_str(), ".git"); struct stat gst;
+        if (::lstat(dot.c_str(), &gst) == 0) git_snapshot = true;
+        else if (errno != ENOENT) return -errno;
+    }
+    // Git branch setup mutates the clone. A failed setup must never return a modified pool
+    // entry to READY; use the normal CREATING temporary-tree rollback path for Git worlds.
+    if (git_snapshot || git_source.present) o.no_pool = 1;
     if (int rc = check_path(s, target_path, PATH_TARGET, target, nullptr)) return rc;
     String parent_dir;
     dirname_of(target.c_str(), parent_dir);
@@ -1678,7 +1704,7 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         if (rc) return rc;
     }
     if (!o.skip_space_check) {
-        if (int rc = space_check(parent_dir.c_str(), entries)) return rc;
+        if (int rc = space_check(parent_dir.c_str(), entries, git_source.import_bytes)) return rc;
     }
 
     int64_t created = now_sec();
@@ -1817,6 +1843,8 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
                 if (rc) break;
             }
         }
+        if ((rc = wfs::git_import(git_source, tmp.c_str()))) break;
+        if ((rc = wfs::git_branch(tmp.c_str(), id))) break;
         if ((rc = marker_write(tmp.c_str(), s->store_id.c_str(), s->dir.c_str(), id, nm, snapshot_id, parent_world, created)))
             break;
         // The test seam for "the process died here": the CREATING row and the tree it names are
@@ -2275,6 +2303,8 @@ extern "C" int wfs_world_discard(wfs_store *s, wfs_id id, int immediate, int for
 
     WorldLock lock;
     if (int rc = lock.take(ident.path)) return rc;
+
+    if (int rc = wfs::git_discard_check(ident.path)) return rc;
 
     char leaf[80];
     ::snprintf(leaf, sizeof leaf, "W%llu-%lld", (unsigned long long)id, (long long)now_sec());

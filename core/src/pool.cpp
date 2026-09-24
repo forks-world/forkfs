@@ -838,6 +838,14 @@ extern "C" int wfs_pool_fill(wfs_store *s, wfs_id snapshot, int target, uint64_t
     if (int rc = wfs::ready_count(s, snapshot, si.created_at, &ready)) return rc;
     if (ready >= (uint64_t)target) return 0;
 
+    {
+        wfs::SnapGate gate;
+        if (int rc = gate.open(si.root.c_str(), si.hard)) return rc;
+        wfs::String dot(si.root); dot.append("/.git"); struct stat st;
+        if (::lstat(dot.c_str(), &st) == 0) return WFS_E_GIT_POOL;
+        if (errno != ENOENT) return -errno;
+    }
+
     wfs::String dir = wfs::pool_dir_of(s, snapshot);
     if (int rc = wfs::fs_mkdir_p(dir.c_str())) return rc;
     while (ready < (uint64_t)target) {

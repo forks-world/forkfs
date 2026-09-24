@@ -76,11 +76,11 @@ static uint64_t total_bytes(const char *path) {
 
 // Write in 1 MiB chunks for speed, then 4 KiB chunks near the end.  The hard byte bound is based
 // on the image capacity, not the host volume, so a malformed mount can never fill the runner.
-static void fill_until_enospc(void *opaque, const char *) {
-    FillContext *ctx = (FillContext *)opaque;
-    CHECK(snprintf(ctx->metadata, sizeof ctx->metadata, "%s.metadata", ctx->filler) > 0);
-    mkdir_checked(ctx->metadata);
-    int fd = open(ctx->filler, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+static void refresh_until_enospc(FillContext *ctx) {
+    ctx->saw_enospc = 0;
+    ctx->saw_other_error = 0;
+    ctx->metadata_full = 0;
+    int fd = open(ctx->filler, O_WRONLY | O_CREAT | O_APPEND, 0600);
     CHECK(fd >= 0);
     uint64_t limit = total_bytes(ctx->volume) + 16 * kMiB;
     unsigned char block[1024 * 1024];
@@ -124,6 +124,13 @@ static void fill_until_enospc(void *opaque, const char *) {
            (unsigned long long)ctx->written, ctx->metadata_dirs);
 }
 
+static void fill_until_enospc(void *opaque, const char *) {
+    FillContext *ctx = (FillContext *)opaque;
+    CHECK(snprintf(ctx->metadata, sizeof ctx->metadata, "%s.metadata", ctx->filler) > 0);
+    mkdir_checked(ctx->metadata);
+    refresh_until_enospc(ctx);
+}
+
 // Leave a useful margin rather than racing the filesystem's reserved blocks.  P11 needs 256 MiB
 // plus one KiB per entry, so <=96 MiB is unambiguously a low-space result for this fixture.
 static void fill_to_low_space(FillContext *ctx, uint64_t target_free) {
@@ -158,6 +165,10 @@ static void remove_filler(FillContext *ctx) {
     }
     if (ctx->metadata[0]) CHECK(rmdir(ctx->metadata) == 0);
     ctx->written = 0;
+    ctx->metadata_dirs = 0;
+    ctx->metadata_full = 0;
+    ctx->saw_enospc = 0;
+    ctx->saw_other_error = 0;
 }
 
 static void check_file(const char *path, const unsigned char *want, size_t size) {
@@ -478,6 +489,10 @@ int main(int argc, char **argv) {
     CHECK(wall.saw_enospc && !wall.saw_other_error);
     report_open_codes(dbfile);
 
+    // Closing each SQLite probe can reclaim space. Re-establish ENOSPC immediately
+    // before each independent open, retaining the filler and cumulative capacity bounds.
+    refresh_until_enospc(&wall);
+    CHECK(wall.saw_enospc && !wall.saw_other_error && wall.metadata_full);
     wfs_store *walled = NULL;
     int wall_rc = wfs_store_open(store_dir, &walled);
     printf("full volume, wfs_store_open(%s) -> %d (%s)\n", store_dir, wall_rc,
@@ -485,8 +500,12 @@ int main(int argc, char **argv) {
     CHECK(walled == NULL);
     CHECK(wall_rc != WFS_E_STORE_DAMAGED);
     CHECK(wall_rc == -ENOSPC);
+    refresh_until_enospc(&wall);
+    CHECK(wall.saw_enospc && !wall.saw_other_error && wall.metadata_full);
     check_cli_message(world_bin, store_dir);
 
+    refresh_until_enospc(&wall);
+    CHECK(wall.saw_enospc && !wall.saw_other_error && wall.metadata_full);
     wfs_store *fresh = NULL;
     int fresh_rc = wfs_store_open(fresh_store, &fresh);
     printf("full volume, wfs_store_open(%s) -> %d (%s)\n", fresh_store, fresh_rc,

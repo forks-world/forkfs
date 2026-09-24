@@ -44,6 +44,7 @@ append to it directly).
 | `core_test` | Store/world lifecycle, identity and metadata invariants, concurrent operations, and targeted crash/interleaving regressions. |
 | `diff_test` | Exact diff results, metadata/xattr handling, event candidates and scan fallback behavior. |
 | `cli_json_test` | Versioned JSON query output, special names, multi-buffer output, pool/GC state, error handling, numeric argument validation, help without store access, unreadable directories, and text/exec compatibility (registered when Python 3 is available). |
+| `cli_git_test` | Real Git worktree imports, staging/commit isolation, lifecycle, rollback and sandbox operation (Python 3 and Git 2.48+ required). |
 | `check-deps.sh` | Built binaries link only allowed system libraries. |
 | `safety.sh` | CLI behavior and refusal paths, snapshot protection, execution locks, pool/GC behavior, and recovery regressions. |
 | `disk_full.py` | Actual low-space and kernel ENOSPC behavior within a bounded APFS image, preservation of existing data/store state, and recovery after freeing space. |
