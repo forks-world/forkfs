@@ -5,6 +5,7 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <sys/random.h>
 #include <string.h>
 #include <strings.h>
 #include <stdint.h>
@@ -630,7 +631,8 @@ int reject_used_filters(const char *root) {
         i += strlen(attrs.data() + i) + 1;
         if (i >= attrs.size()) break;
         const char *driver = attrs.data() + i; i += strlen(driver) + 1;
-        if (!strcmp(driver, "unspecified") || !strcmp(driver, "unset") || !strcmp(driver, "set")) continue;
+        // No shortcut for "set"/"unset"/"unspecified": check-attr prints a driver literally named
+        // like that the same way, and status would run it. Only a defined driver matters.
         size_t dlen = strlen(driver);
         for (size_t k = 0; k < defined.size() && defined[k];) {
             const char *key = defined.data() + k; k += strlen(key) + 1;
@@ -1543,17 +1545,31 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
             return refuse(WFS_E_GIT_TARGET, "%s is checked out in the target repository; choose another name with --branch", branch);
         i += strlen(line) + 1;
     }
+    // The World's own status is a diagnostic for the caller; take it before anything changes, so
+    // an error here can never be reported for a publication that already happened.
+    int dirty = require_clean_tree(world_root);
+    if (dirty && dirty != WFS_E_GIT_DIRTY) return dirty;
     String old;
     const char *old_args[] = {"rev-parse", "--verify", "--quiet", ref.c_str(), nullptr};
     if (int rc = value(repo, old_args, old, true)) return rc;
     // Bring the World's commits over under a private name first, so nothing the user sees
-    // moves until every check has passed.
-    char staging[64];
-    snprintf(staging, sizeof staging, "refs/worldfs/publish-%d", (int)getpid());
+    // moves until every check has passed. The name carries 128 random bits, so concurrent
+    // publishes (in this process or others) never share it, and it must not exist yet.
+    unsigned char nonce[16];
+    if (getentropy(nonce, sizeof nonce)) return -errno;
+    char staging[80];
+    int off = snprintf(staging, sizeof staging, "refs/worldfs/publish-");
+    for (unsigned char b : nonce) off += snprintf(staging + off, sizeof staging - (size_t)off, "%02x", b);
+    {
+        String existing;
+        const char *probe[] = {"rev-parse", "--verify", "--quiet", staging, nullptr};
+        if (int prc = value(repo, probe, existing, true)) return prc;
+        if (!existing.empty()) return -EEXIST;
+    }
     String source_ref;
     if (info.branch[0]) { source_ref.assign("refs/heads/"); source_ref.append(info.branch); }
     else source_ref.assign("HEAD");
-    String spec("+");
+    String spec;
     spec.append(source_ref.c_str()); spec.push_back(':'); spec.append(staging);
     const char *fetch[] = {"fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
                            "--", world_root, spec.c_str(), nullptr};
@@ -1590,15 +1606,17 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
                                 old.empty() ? zero : old.c_str(), nullptr};
         rc = git(repo, update);
     }
-    const char *drop[] = {"update-ref", "-d", staging, nullptr};
-    int drop_rc = git(repo, drop, nullptr, nullptr, true);
+    int drop_rc = 0;
+    if (!now.empty()) {
+        // Delete only the value this call fetched there.
+        const char *drop[] = {"update-ref", "-d", staging, now.c_str(), nullptr};
+        drop_rc = git(repo, drop, nullptr, nullptr, true);
+    }
     if (rc) return rc;
     if (drop_rc) return drop_rc;
     snprintf(out->ref, sizeof out->ref, "%s", ref.c_str());
     snprintf(out->old_oid, sizeof out->old_oid, "%s", old.c_str());
     snprintf(out->new_oid, sizeof out->new_oid, "%s", now.c_str());
-    int dirty = require_clean_tree(world_root);
-    if (dirty && dirty != WFS_E_GIT_DIRTY) return dirty;
     out->dirty = dirty == WFS_E_GIT_DIRTY;
     return 0;
 }

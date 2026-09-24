@@ -1177,18 +1177,34 @@ static int cmd_discard(wfs_store *s, int argc, char **argv) {
 // The directory a World's Git history was first imported from: follow world-to-world forks and
 // checkpoint snapshots back to the snapshot `init` took, whose source is that directory.
 static int publish_default_repo(wfs_store *s, wfs_id w, char *out, size_t cap) {
-    for (int hops = 0; hops < 256; ++hops) {
+    // No depth limit: the chain ends at the snapshot `init` took. Only a real cycle (a world
+    // seen twice) stops the walk early.
+    wfs_id *seen = nullptr;
+    size_t count = 0, room = 0;
+    int result = 0;
+    for (;;) {
+        bool again = false;
+        for (size_t i = 0; i < count; ++i) if (seen[i] == w) again = true;
+        if (again) { result = -ELOOP; break; }
+        if (count == room) {
+            room = room ? room * 2 : 16;
+            wfs_id *grown = (wfs_id *)realloc(seen, room * sizeof *seen);
+            if (!grown) { result = -ENOMEM; break; }
+            seen = grown;
+        }
+        seen[count++] = w;
         wfs_world_rec r;
-        if (int rc = wfs_world_info(s, w, &r)) return rc;
+        if (int rc = wfs_world_info(s, w, &r)) { result = rc; break; }
         if (r.origin == WFS_O_WORLD && r.parent_world) { w = r.parent_world; continue; }
-        if (r.origin != WFS_O_SNAPSHOT || !r.snapshot_id) return -ENOENT;
+        if (r.origin != WFS_O_SNAPSHOT || !r.snapshot_id) { result = -ENOENT; break; }
         wfs_snapshot_rec snap;
-        if (int rc = wfs_snapshot_info(s, r.snapshot_id, &snap)) return rc;
+        if (int rc = wfs_snapshot_info(s, r.snapshot_id, &snap)) { result = rc; break; }
         if (snap.from_world) { w = snap.from_world; continue; }
         snprintf(out, cap, "%s", snap.src_path);
-        return 0;
+        break;
     }
-    return -ELOOP;
+    free(seen);
+    return result;
 }
 
 static int cmd_publish(wfs_store *s, int argc, char **argv) {

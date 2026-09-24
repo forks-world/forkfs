@@ -1231,6 +1231,40 @@ class GitWorldTest(unittest.TestCase):
         self.world('publish', wid, '--branch', 'detached-work')
         self.assertEqual(self.git(self.source, 'rev-parse', 'detached-work').stdout.strip(), head)
 
+    def test_filter_named_like_an_attribute_sentinel_is_refused(self):
+        for name in ('set', 'unset', 'unspecified'):
+            with self.subTest(driver=name):
+                marker = self.root / ('ran-' + name)
+                (self.source / '.gitattributes').write_text('file filter=' + name + '\n')
+                self.git(self.source, 'add', '.gitattributes')
+                self.git(self.source, 'commit', '-qm', 'filter ' + name)
+                self.git(self.source, 'config', 'filter.' + name + '.clean', 'touch ' + str(marker) + '; cat')
+                os.utime(self.source / 'file', (1, 1))
+                result = self.world('init', str(self.source), code=3)
+                self.assertIn(b"uses the '" + name.encode() + b"' filter", result.stderr)
+                self.assertFalse(marker.exists())
+                self.git(self.source, 'config', '--remove-section', 'filter.' + name)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_publish_leaves_other_refs_and_no_staging_ref(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'world change')
+        self.git(self.source, 'update-ref', 'refs/worldfs/publish-' + str(os.getpid()), self.base.decode())
+        self.world('publish', wid)
+        refs = self.git(self.source, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/worldfs').stdout.split(b'\n')
+        self.assertEqual([r for r in refs if r], [b'refs/worldfs/publish-' + str(os.getpid()).encode() + b' ' + self.base])
+
+    def test_publish_diagnostic_failure_changes_nothing(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'world change')
+        index = self.git(one, 'rev-parse', '--path-format=absolute', '--git-path', 'index').stdout.decode().strip()
+        Path(index).write_bytes(b'not an index')
+        self.world('publish', wid, code=3)
+        self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
+        self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs').stdout, b'')
+
     def test_publish_follows_checkpoints_back_to_the_source(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
