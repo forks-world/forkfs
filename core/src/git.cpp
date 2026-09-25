@@ -701,8 +701,11 @@ int reject_used_filters(const char *root) {
         size_t dlen = strlen(driver);
         for (size_t k = 0; k < defined.size() && defined[k];) {
             const char *key = defined.data() + k; k += strlen(key) + 1;
-            if (strncmp(key + 7, driver, dlen) || key[7 + dlen] != '.') continue;
-            const char *field = key + 8 + dlen;
+            // "filter.<name>.<field>": take the name segment from the key itself and compare
+            // lengths first, so a long attribute value never indexes past a short key.
+            const char *dot = strrchr(key, '.');
+            if (!dot || dot < key + 7 || (size_t)(dot - (key + 7)) != dlen || memcmp(key + 7, driver, dlen)) continue;
+            const char *field = dot + 1;
             if (!strcmp(field, "clean") || !strcmp(field, "smudge") || !strcmp(field, "process"))
                 return refuse(WFS_E_GIT_POLICY, "tracked file %s uses the '%s' filter (e.g. Git LFS), which WorldFS does not run", path, driver);
         }

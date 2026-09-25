@@ -654,6 +654,13 @@ class GitWorldTest(unittest.TestCase):
             self.assertIn(b'cannot be resolved to a file', result.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
+    def test_long_filter_attribute_values_are_compared_safely(self):
+        (self.source / '.gitattributes').write_text('file filter=' + 'x' * 4000 + '\n')
+        self.git(self.source, 'add', '.gitattributes')
+        self.git(self.source, 'commit', '-qm', 'long filter name')
+        self.git(self.source, 'config', 'filter.x.clean', 'cat')
+        self.world('init', str(self.source))
+
     def test_used_ambient_filter_is_refused_without_execution(self):
         global_config = self.root / 'filter-global'
         global_config.write_text('[filter "example"]\n clean = touch ambient-filter-ran; cat\n')
