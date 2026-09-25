@@ -131,7 +131,9 @@ line on stderr that names `--with-hooks`.
   absolute directory the source used, never re-resolved beside the World. An absolute value is
   kept as the user opted into it. While `core.hooksPath` is set, Git ignores the default hooks
   directory, so it is neither scanned nor copied; an in-tree hooks directory travels with the
-  tree and is refused if it, a component of its path or any entry in it is a symlink. A global `core.hooksPath` needs no carrying: global
+  tree and is refused if it, a component of its path or any entry in it is a symlink. With
+  `--committed-only` the in-tree hooks directory must be committed: the reset to HEAD would
+  otherwise remove it and leave `core.hooksPath` pointing at nothing. A global `core.hooksPath` needs no carrying: global
   configuration is shared.
 
 A symlinked hook, or a symlinked hooks directory, is refused with a reason rather than

@@ -471,6 +471,22 @@ class GitWorldTest(unittest.TestCase):
             self.assertIn(b'hook .husky/pre-commit is a symlink', result.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
+    def test_committed_only_with_hooks_needs_a_committed_hooks_path(self):
+        marker = self.root / 'hooks-ran'
+        self.write_hook(self.source / '.husky' / 'pre-commit', marker, 'husky')
+        self.git(self.source, 'config', 'core.hooksPath', '.husky')
+        for staged in (False, True):
+            with self.subTest(staged=staged):
+                if staged:
+                    self.git(self.source, 'add', '.husky')
+                result = self.world('init', str(self.source), '--committed-only', '--with-hooks', code=3)
+                self.assertIn(b'core.hooksPath .husky is not committed', result.stderr)
+        self.git(self.source, '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'husky')
+        snapshot = self.world('init', str(self.source), '--committed-only', '--with-hooks').stdout.split()[0].decode()
+        one, _ = self.fork('one', snapshot)
+        self.commit_in(one, 'husky runs')
+        self.assertEqual(self.hook_runs(marker), ['husky ' + str(one)])
+
     def test_with_hooks_refuses_symlinked_hooks(self):
         marker = self.root / 'hooks-ran'
         target = self.root / 'elsewhere' / 'pre-commit'

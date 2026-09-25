@@ -1860,6 +1860,20 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
     out.with_hooks = with_hooks;
     if (with_hooks && !out.managed) {
         if (int hook_rc = capture_hooks(root, out.hooks, out.hooks_path_present, out.hooks_path)) return hook_rc;
+        // --committed-only resets the copy to HEAD, which removes an in-tree hooks directory that
+        // is only staged or untracked; the World would then point core.hooksPath at nothing and
+        // silently skip the hooks explicitly asked for. Require the directory in HEAD.
+        const String &hp = out.hooks_path;
+        if (committed_only && out.hooks_path_present && !hp.empty() && hp[0] != '/' && hp[0] != '~' && hp != ".") {
+            // `HEAD:<path>` takes everything after the colon as the path, so the type is read
+            // with cat-file rather than peeled with ^{tree}.
+            String spec("HEAD:"); spec.append(hp.c_str());
+            const char *type_args[] = {"cat-file", "-t", spec.c_str(), nullptr};
+            Vec<char> type; int tstatus = -1;
+            int trc = git(root, type_args, &type, &tstatus, true);
+            if (trc || strcmp(type.data(), "tree\n"))
+                return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s is not committed, so --committed-only would leave the hooks out; commit it or drop --committed-only", hp.c_str());
+        }
     }
     if (out.managed) {
         // A managed copy has byte-identical configuration files and import commands ignore
