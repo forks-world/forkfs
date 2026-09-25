@@ -137,7 +137,8 @@ line on stderr that names `--with-hooks`.
   hooks commonly source nested helpers -- is a symlink (for a hooks path of `.`, only the
   hook-named files at the root count). With
   `--committed-only` the in-tree hooks directory must be committed with no pending changes
-  inside it (for a hooks path of `.`, the hook-named files at the root): the reset to HEAD
+  inside it (for a hooks path of `.`, the hook-named files at the root), and none of those
+  hooks may be marked skip-worktree or assume-unchanged, which hides edits from status: the reset to HEAD
   would otherwise remove the directory or its uncommitted hooks and leave the World silently
   skipping them. A hooks path inside `.git`, `.world-git` or `.world` is refused, since the
   import replaces that administration. A global `core.hooksPath` needs no carrying: global

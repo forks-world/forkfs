@@ -511,6 +511,17 @@ class GitWorldTest(unittest.TestCase):
         result = self.world('init', str(self.source), '--committed-only', '--with-hooks', code=3)
         self.assertIn(b'core.hooksPath .husky has uncommitted changes', result.stderr)
         (self.source / '.husky' / 'commit-msg').unlink()
+        # So is an edit that an index-only mark hides from status.
+        committed = (self.source / '.husky' / 'pre-commit').read_bytes()
+        for mark in ('--skip-worktree', '--assume-unchanged'):
+            with self.subTest(mark=mark):
+                self.git(self.source, 'update-index', mark, '.husky/pre-commit')
+                (self.source / '.husky' / 'pre-commit').write_bytes(committed + b'# local edit\n')
+                self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+                result = self.world('init', str(self.source), '--committed-only', '--with-hooks', code=3)
+                self.assertIn(b'hook .husky/pre-commit is marked skip-worktree or assume-unchanged', result.stderr)
+                self.git(self.source, 'update-index', '--no' + mark[1:], '.husky/pre-commit')
+                (self.source / '.husky' / 'pre-commit').write_bytes(committed)
         snapshot = self.world('init', str(self.source), '--committed-only', '--with-hooks').stdout.split()[0].decode()
         one, _ = self.fork('one', snapshot)
         self.commit_in(one, 'husky runs')
@@ -2948,6 +2959,15 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual((two / '.git').read_text(), 'gitdir: .world-git/repo.git/worktrees/active\n')
         self.assertEqual(self.git(two, 'status', '--porcelain').stdout, b'')
         self.assertEqual(self.git(two, 'branch', '--show-current').stdout.decode().strip(), 'world/' + wid)
+        self.assertEqual(self.pool_ready(), 0)
+        self.assertEqual(listing(), [])
+        # So is an entry whose marker disappeared: it would otherwise publish without a worktree.
+        self.world('pool', 'fill', 'S1', '--count', '1')
+        [entry] = listing()
+        (entries / entry / '.git').unlink()
+        three, wid = self.pool_fork('three', False)
+        self.assertEqual((three / '.git').read_text(), 'gitdir: .world-git/repo.git/worktrees/active\n')
+        self.assertEqual(self.git(three, 'branch', '--show-current').stdout.decode().strip(), 'world/' + wid)
         self.assertEqual(self.pool_ready(), 0)
         self.assertEqual(listing(), [])
         self.world('verify', 'S1')

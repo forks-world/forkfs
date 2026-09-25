@@ -1613,7 +1613,13 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
             // an ordinary Git fork. From this call on the entry is this World's and never goes
             // back into the pool (see the unwind below).
             bool git_setup = git_snapshot;
-            int rc = git_setup ? wfs::git_branch(claim.path.c_str(), id) : 0;
+            int rc = 0;
+            if (git_setup) {
+                // git_branch takes a tree without `.git` for a plain one and succeeds; an entry
+                // of a Git snapshot that lost its marker would publish without a worktree.
+                String dot = joinp(claim.path.c_str(), ".git"); struct stat gst;
+                rc = ::lstat(dot.c_str(), &gst) ? -errno : wfs::git_branch(claim.path.c_str(), id);
+            }
             if (!rc)
                 rc = marker_write(claim.path.c_str(), s->store_id.c_str(), s->dir.c_str(), id, nm,
                                   snapshot_id, 0, created);

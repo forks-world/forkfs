@@ -1931,6 +1931,23 @@ int require_committed_hooks_path(const char *root, bool present, const String &h
     if (int src = git(root, st_args.data(), &pending, nullptr, false, true)) return src;
     if (pending.size() > 1)
         return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s has uncommitted changes, which --committed-only would drop; commit them or drop --committed-only", hp.c_str());
+    // Status cannot see edits to a hook marked skip-worktree or assume-unchanged, and the reset
+    // clears those marks and restores the committed bytes (reset_to_head), so any such hook is
+    // refused: `ls-files -v` tags skip-worktree with 'S'/'s', assume-unchanged in lower case.
+    st_args.clear();
+    for (const char *a : {"ls-files", "-v", "-z", "--"}) st_args.emplace_back(a);
+    for (const auto &scope : scopes) st_args.emplace_back(scope.c_str());
+    st_args.emplace_back(nullptr);
+    Vec<char> listing;
+    if (int lrc = git(root, st_args.data(), &listing)) return lrc;
+    for (size_t i = 0; i + 1 < listing.size();) {
+        const char *entry = listing.data() + i;
+        size_t len = strlen(entry);
+        i += len + 1;
+        if (len < 3 || entry[1] != ' ') continue;
+        if (entry[0] == 'S' || (entry[0] >= 'a' && entry[0] <= 'z'))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "hook %s is marked skip-worktree or assume-unchanged, so --committed-only would reset it to its committed version unseen; clear the mark or drop --committed-only", entry + 2);
+    }
     return 0;
 }
 int git_source(const char *root, bool include_changes, GitSource &out, bool committed_only, bool with_hooks) {
