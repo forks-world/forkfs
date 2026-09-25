@@ -257,8 +257,11 @@ What cannot be shared is refused with a Git configuration error that names the r
 - A relative `GIT_CONFIG_GLOBAL` or `GIT_CONFIG_SYSTEM` in the environment: Git resolves
   it per repository too, so it can name a different file beside the source than beside a
   World. Use an absolute path.
-- Status settings given as command configuration (`GIT_CONFIG_COUNT`,
-  `GIT_CONFIG_PARAMETERS`, `-c`): they belong to one invocation only.
+- Status settings, URL rewrites (`url.<base>.insteadOf`/`pushInsteadOf`) or per-remote or
+  per-branch settings (`remote.<name>.*`, `branch.<name>.*`) given as command configuration
+  (`GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, `-c`): they belong to one invocation only, and
+  would otherwise be recorded permanently in the World (for example a rewritten remote URL
+  pinned as if it were the source's actual configuration).
 - `GIT_ATTR_SOURCE` in the environment and `attr.tree` in any scope: they make the user's
   Git read attributes from a tree-ish instead of the worktree.
 

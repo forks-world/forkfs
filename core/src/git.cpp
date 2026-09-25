@@ -797,7 +797,10 @@ int reject_configured_policy(const char *root, const char *key) {
 // check (require_clean_tree) evaluates the source with them, the way the user's own Git does.
 // What cannot be shared is refused here with WFS_E_GIT_POLICY:
 //   * GIT_ATTR_SOURCE / attr.tree: attributes read from a tree-ish instead of the worktree.
-//   * status settings given as command configuration: they belong to this invocation only.
+//   * status settings, URL rewrites (url.<base>.insteadOf/pushInsteadOf) or per-remote/
+//     per-branch settings given as command configuration: they belong to this invocation only,
+//     yet the import would otherwise record what they produce (a pinned remote URL, a remote
+//     or branch setting) permanently into the World.
 //   * a conditional include whose target sets status or filter settings, or a per-remote or
 //     per-branch setting (remote.<name>.*, branch.<name>.*): the condition (gitdir, onbranch,
 //     ...) can evaluate differently at the World's location, active or not at the source, and
@@ -948,6 +951,29 @@ int reject_ambient_policy(const char *root) {
             return refuse(WFS_E_GIT_POLICY, "attr.tree is set (%s configuration)", scope);
         if (!strcmp(scope, "command"))
             return refuse(WFS_E_GIT_POLICY, "%s is set as command configuration (GIT_CONFIG_* or -c)", key);
+    }
+    // Command configuration (GIT_CONFIG_COUNT/GIT_CONFIG_PARAMETERS, -c) belongs to this one
+    // invocation, so a URL rewrite or a per-remote/per-branch setting given that way is visible
+    // to the ambient probes above during import but gone once the environment is gone: baking
+    // what the import would record from it (a pinned remote URL, a remote or branch setting)
+    // into the World's own configuration would leave the World carrying something the source
+    // never actually kept.
+    {
+        Vec<char> rewrite_listing; int rw_status = -1;
+        const char *rw_args[] = {"config", "--includes", "--null", "--show-scope", "--name-only",
+            "--get-regexp", "^(url\\..*\\.(insteadof|pushinsteadof)|remote\\..*|branch\\..*)$", nullptr};
+        int rc = git(root, rw_args, &rewrite_listing, &rw_status, false, true);
+        if (rc && !(rc == WFS_E_GIT_FAILED && rw_status == 1)) return rc;
+        if (rc) rewrite_listing.clear();
+        for (size_t i = 0; i < rewrite_listing.size() && rewrite_listing[i];) {
+            const char *scope = rewrite_listing.data() + i;
+            i += strlen(scope) + 1;
+            if (i >= rewrite_listing.size()) return WFS_E_GIT_FAILED;
+            const char *key = rewrite_listing.data() + i;
+            i += strlen(key) + 1;
+            if (!strcmp(scope, "command"))
+                return refuse(WFS_E_GIT_POLICY, "%s is set as command configuration (GIT_CONFIG_* or -c)", key);
+        }
     }
     // A relative core.excludesFile/attributesFile is resolved from each repository's location,
     // so the source and the copy (and every World) could read different files.

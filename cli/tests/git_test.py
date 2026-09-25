@@ -441,6 +441,28 @@ class GitWorldTest(unittest.TestCase):
                         self.env.pop(variable, None)
         self.world('init', str(self.source))  # benign maintenance command config remains allowed
 
+    def test_command_scoped_url_rewrites_are_refused(self):
+        # A url.<base>.insteadOf rule given as command configuration (GIT_CONFIG_COUNT/
+        # GIT_CONFIG_PARAMETERS, -c) is visible to the ambient probes during import, but belongs
+        # to this invocation only: baking the rewritten URL into the World's own configuration
+        # would leave the World pinned to a URL the source no longer has once the environment is
+        # gone.
+        self.git(self.source, 'remote', 'add', 'origin', 'https://example.invalid/x.git')
+        for channel in ('count', 'parameters'):
+            with self.subTest(channel=channel):
+                key, value = 'url.ssh://tmp.invalid/.insteadOf', 'https://example.invalid/'
+                if channel == 'count':
+                    self.env.update(GIT_CONFIG_COUNT='3', GIT_CONFIG_KEY_2=key, GIT_CONFIG_VALUE_2=value)
+                else:
+                    self.env['GIT_CONFIG_PARAMETERS'] = "'" + key + '=' + value + "'"
+                result = self.world('init', str(self.source), code=3)
+                self.assertIn(b'set as command configuration', result.stderr)
+                self.env['GIT_CONFIG_COUNT'] = '2'
+                for variable in ('GIT_CONFIG_KEY_2', 'GIT_CONFIG_VALUE_2', 'GIT_CONFIG_PARAMETERS'):
+                    self.env.pop(variable, None)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        self.world('init', str(self.source))
+
     def test_mirror_does_not_install_ambient_templates(self):
         import shlex
         templates = self.root / 'templates'
