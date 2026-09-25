@@ -251,8 +251,17 @@ Global and system configuration is shared: a World's Git reads the same `~/.gitc
 and system file as the source's. Settings that come from them unconditionally (a global
 ignore file via `core.excludesFile`, `core.attributesFile`, `core.autocrlf` and the other
 status settings above) therefore mean the same thing on both sides, and cleanliness is
-decided with them, exactly as the user's own `git status` decides it. Other import Git
-commands still disable global and system configuration.
+decided with them, exactly as the user's own `git status` decides it. The shared files are
+whichever ones the import's environment names: `~/.gitconfig`/XDG and the system file by
+default, or an absolute `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` (or `GIT_CONFIG_NOSYSTEM`)
+when the environment sets one. A World is meant to be used under that same configuration;
+an override set for one import command only is not recorded in the World, so identity or
+status settings that came only from it are not carried, and a later command run without it
+behaves as the user's own Git would without it, while an effective remote URL it rewrote
+stays pinned as imported, the same as any other `insteadOf` rewrite (above). To carry
+settings independent of the environment, put them in the source repository's own
+configuration, which the import does capture. Other import Git commands still disable
+global and system configuration.
 
 What cannot be shared is refused with a Git configuration error that names the reason:
 
