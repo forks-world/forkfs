@@ -1406,6 +1406,26 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b"url.*.insteadOf rewrites the World's path", result.stderr)
         self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
 
+    def test_publish_refuses_a_world_whose_tree_was_replaced(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        two, _ = self.fork('two')
+        self.git(two, 'commit', '-q', '--allow-empty', '-m', 'from W2')
+        # Overwrite W1's directory contents with W2's, keeping W1's directory inode.
+        for entry in list(one.iterdir()):
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+        for entry in two.iterdir():
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.copytree(entry, one / entry.name, symlinks=True)
+            else:
+                shutil.copy2(entry, one / entry.name, follow_symlinks=False)
+        result = self.world('publish', wid, code=3)
+        self.assertIn(b"does not carry W1's .world marker", result.stderr)
+        self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
+
     def test_publish_follows_checkpoints_back_to_the_source(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

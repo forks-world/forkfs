@@ -1226,6 +1226,19 @@ static int cmd_publish(wfs_store *s, int argc, char **argv) {
         snprintf(why, sizeof why, "W%llu is not a live world at its recorded path", (unsigned long long)w);
         return refuse(why, "world fs list");
     }
+    // `present` only compares the directory inode; the tree in it could have been replaced by
+    // another World's contents (rsync --delete from a sibling). Publish only what the .world
+    // marker at that path says is this World.
+    {
+        wfs_identity id;
+        int vrc = wfs_world_verify(s, w, &id);
+        if (vrc || !id.registered || id.world_id != w) {
+            char why[160];
+            snprintf(why, sizeof why, "the tree at W%llu's path does not carry W%llu's .world marker",
+                     (unsigned long long)w, (unsigned long long)w);
+            return refuse(why, "world fs verify W<n>");
+        }
+    }
     char default_repo[WFS_PATH_MAX];
     if (!repo) {
         int rc = publish_default_repo(s, w, default_repo, sizeof default_repo);
