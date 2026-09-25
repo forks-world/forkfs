@@ -311,10 +311,14 @@ int capture_settings(const char *root, Vec<GitSetting> &out) {
 // defaults and aliases. Aliases run only when the user types them, as they would in the
 // source. Settings Git executes on its own -- hooks, remote.*.uploadpack/receivepack/vcs,
 // branch.*.mergeoptions, core.sshCommand, credential helpers -- are not carried. A relative
-// local remote path is made absolute against the source, so it keeps pointing at the same
-// repository after the source is gone -- unless a url.<base>.insteadOf/pushInsteadOf rule
-// rewrites it, in which case the value is kept as written so the (carried or ambient) rule
-// still matches it in the World the way it did in the source.
+// local remote URL is resolved the way Git resolves it: matched by the longest unconditional
+// url.<base>.insteadOf rule, it is kept as written, so the (carried or ambient) rule still
+// matches it in the World; matched only by the longest unconditional pushInsteadOf rule (and
+// the remote has no explicit pushurl of its own), the URL is made absolute and the push
+// destination that rule computed is recorded as a new pushurl, since the absolutized value no
+// longer matches the rule Git used for pushing in the source; matched by neither, it is simply
+// made absolute; matched only through a rule reached by a conditional include, whose condition
+// may not hold at the World's eventual location, it is refused.
 const char *const kCarriedConfig =
     "^(remote\\..+\\.(url|pushurl|fetch|push|tagopt|prune|prunetags|mirror|skipdefaultupdate|skipfetchall|followremotehead)"
     "|remotes\\..+|remote\\.pushdefault"
@@ -356,35 +360,111 @@ bool is_relative_local_url(const char *url) {
     if (colon && (!slash || colon < slash)) return false; // scp-like host:path
     return true;
 }
+// A url.<base>.insteadOf/pushInsteadOf rule, as Git applies it to a URL: `push` says which
+// direction it rewrites (pushInsteadOf falls back to insteadOf only when a remote has no
+// explicit pushurl); `base` and `prefix` are the rule's <base> subsection and its value, the
+// literal prefix Git replaces. `conditional` is set once it is known that this exact triple is
+// also defined inside a conditional include's target (see capture_carried_config): such a rule
+// may be active at the source's location and not at the World's, or the reverse.
+struct UrlRewriteRule {
+    bool push;
+    String base;
+    String prefix;
+    bool conditional;
+};
+// Split a url.<base>.(insteadof|pushinsteadof) key, exactly as --get-regexp prints it (the
+// variable name lowercased, the subsection kept verbatim including any dots it contains), into
+// its direction and base. False for any other key.
+bool parse_rewrite_key(const char *key, bool &push, String &base) {
+    size_t n = strlen(key);
+    if (strncmp(key, "url.", 4)) return false;
+    static const char *const push_suffix = ".pushinsteadof";
+    static const char *const fetch_suffix = ".insteadof";
+    size_t pn = strlen(push_suffix), fn = strlen(fetch_suffix);
+    if (n > 4 + pn && !strcmp(key + n - pn, push_suffix)) {
+        push = true; base.assign(key + 4, n - 4 - pn); return true;
+    }
+    if (n > 4 + fn && !strcmp(key + n - fn, fetch_suffix)) {
+        push = false; base.assign(key + 4, n - 4 - fn); return true;
+    }
+    return false;
+}
+// Parse one "--null --get-regexp ^url\..*\.(insteadof|pushinsteadof)$" listing ("<key>\n<value>\0"
+// entries) into rules, all marked `conditional` as given. A valueless rule can never match a URL
+// and is skipped, the same as Git ignores it.
+void parse_rewrite_listing(const Vec<char> &listing, bool conditional, Vec<UrlRewriteRule> &out) {
+    for (size_t i = 0; i < listing.size() && listing[i];) {
+        const char *entry = listing.data() + i;
+        size_t len = strlen(entry);
+        i += len + 1;
+        const char *nl = strchr(entry, '\n');
+        if (!nl || !*(nl + 1)) continue;
+        String key(entry, (size_t)(nl - entry));
+        bool push; String base;
+        if (parse_rewrite_key(key.c_str(), push, base))
+            out.emplace_back(UrlRewriteRule{push, base, String(nl + 1), conditional});
+    }
+}
+// The rule with the longest matching prefix among `rules` in the given direction -- exactly how
+// Git picks which url.<base>.insteadOf/pushInsteadOf applies to a URL -- or nullptr if none does.
+const UrlRewriteRule *longest_rewrite(const Vec<UrlRewriteRule> &rules, bool push, const char *url) {
+    const UrlRewriteRule *best = nullptr;
+    for (const auto &r : rules) {
+        if (r.push != push || r.prefix.empty()) continue;
+        if (strncmp(url, r.prefix.c_str(), r.prefix.size())) continue;
+        if (!best || r.prefix.size() > best->prefix.size()) best = &r;
+    }
+    return best;
+}
+int scan_conditional_includes(const char *root, bool *sets_identity, Vec<UrlRewriteRule> *rewrites = nullptr);
 int capture_carried_config(const char *root, Vec<GitSetting> &out) {
     out.clear();
-    // Every url.<base>.insteadOf/pushInsteadOf prefix the user's own Git would apply, from every
+    // Every url.<base>.insteadOf/pushInsteadOf rule the user's own Git would apply, from every
     // scope it reads (ambient_config_probe=true covers global/system too, not just what this
-    // repository carries): a relative local remote URL one of these matches is resolved through
-    // the rule, not through the filesystem, so absolutizing it below would point the World at the
-    // wrong place and break the rewrite.
-    Vec<String> rewrite_prefixes;
+    // repository carries, and follows a conditional include whose condition currently holds).
+    Vec<UrlRewriteRule> rules;
     {
         const char *rw_args[] = {"config", "--includes", "--null", "--get-regexp",
             "^url\\..*\\.(insteadof|pushinsteadof)$", nullptr};
-        Vec<char> rewrites; int rw_status = -1;
-        int rw_rc = git(root, rw_args, &rewrites, &rw_status, false, true);
-        if (rw_rc && !(rw_rc == WFS_E_GIT_FAILED && rw_status == 1)) return rw_rc;
-        if (!rw_rc) {
-            for (size_t i = 0; i < rewrites.size() && rewrites[i];) {
-                const char *entry = rewrites.data() + i;
-                size_t len = strlen(entry);
-                i += len + 1;
-                const char *nl = strchr(entry, '\n');
-                if (nl && *(nl + 1)) rewrite_prefixes.emplace_back(nl + 1);
-            }
-        }
+        Vec<char> listing; int status = -1;
+        int rc = git(root, rw_args, &listing, &status, false, true);
+        if (rc && !(rc == WFS_E_GIT_FAILED && status == 1)) return rc;
+        if (!rc) parse_rewrite_listing(listing, false, rules);
+    }
+    // Every rule defined inside any conditional include's target, active or not (unlike the
+    // probe above, which only sees an active one): a rule found there marks the matching entry
+    // above as `conditional`, since the include's condition need not hold at the World's
+    // eventual location the way it does at the source's.
+    {
+        Vec<UrlRewriteRule> conditional_rules;
+        if (int rc = scan_conditional_includes(root, nullptr, &conditional_rules)) return rc;
+        for (auto &r : rules)
+            for (const auto &c : conditional_rules)
+                if (c.push == r.push && c.base == r.base && c.prefix == r.prefix) { r.conditional = true; break; }
     }
     const char *args[] = {"config", "--local", "--includes", "--null", "--get-regexp", kCarriedConfig, nullptr};
     Vec<char> listing; int status = -1;
     int rc = git(root, args, &listing, &status);
     if (rc == WFS_E_GIT_FAILED && status == 1) return 0;
     if (rc) return rc;
+    // First pass: which remote names have an explicit pushurl. pushInsteadOf never applies to
+    // one of those (Git uses the pushurl as given, rewritten only by insteadOf), so their url
+    // entry is never a candidate for a synthesized pushurl below.
+    Vec<String> explicit_pushurl_remotes;
+    for (size_t i = 0; i < listing.size() && listing[i];) {
+        const char *entry = listing.data() + i;
+        size_t len = strlen(entry);
+        i += len + 1;
+        const char *nl = strchr(entry, '\n');
+        String key(entry, nl ? (size_t)(nl - entry) : len);
+        size_t klen = key.size();
+        if (!strncmp(key.c_str(), "remote.", 7) && klen > 8 && !strcmp(key.c_str() + klen - 8, ".pushurl"))
+            explicit_pushurl_remotes.emplace_back(key.c_str() + 7, klen - 7 - 8);
+    }
+    auto has_explicit_pushurl = [&](const String &name) {
+        for (const auto &have : explicit_pushurl_remotes) if (have == name) return true;
+        return false;
+    };
     // Entries are "<key>\n<value>\0"; a valueless key has no newline.
     for (size_t i = 0; i < listing.size() && listing[i];) {
         const char *entry = listing.data() + i;
@@ -397,14 +477,38 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
         String key(entry, nl ? (size_t)(nl - entry) : len), val(nl ? nl + 1 : "");
         if (!nl && is_carried_boolean(key.c_str())) val.assign("true");
         size_t klen = key.size();
-        bool url = !strncmp(key.c_str(), "remote.", 7) &&
-                   ((klen > 4 && !strcmp(key.c_str() + klen - 4, ".url")) ||
-                    (klen > 8 && !strcmp(key.c_str() + klen - 8, ".pushurl")));
-        if (url && is_relative_local_url(val.c_str())) {
-            bool rewritten = false;
-            for (const auto &prefix : rewrite_prefixes)
-                if (!strncmp(val.c_str(), prefix.c_str(), prefix.size())) { rewritten = true; break; }
-            if (!rewritten) val = absolute_lexical(root, val.c_str());
+        bool is_remote = !strncmp(key.c_str(), "remote.", 7);
+        bool is_url = is_remote && klen > 4 && !strcmp(key.c_str() + klen - 4, ".url");
+        bool is_pushurl = is_remote && klen > 8 && !strcmp(key.c_str() + klen - 8, ".pushurl");
+        if ((is_url || is_pushurl) && is_relative_local_url(val.c_str())) {
+            String original(val);
+            const UrlRewriteRule *r = longest_rewrite(rules, false, val.c_str());
+            if (r && r->conditional)
+                return refuse(WFS_E_GIT_POLICY,
+                    "remote URL %s is rewritten by url.%s.insteadOf from a conditional include, "
+                    "which may not apply where the World is placed", val.c_str(), r->base.c_str());
+            if (!r) val = absolute_lexical(root, val.c_str());
+            out.emplace_back(GitSetting{key, val});
+            if (is_url && !r) {
+                String name(key.c_str() + 7, klen - 7 - 4);
+                if (!has_explicit_pushurl(name)) {
+                    const UrlRewriteRule *p = longest_rewrite(rules, true, original.c_str());
+                    if (p && p->conditional)
+                        return refuse(WFS_E_GIT_POLICY,
+                            "remote URL %s is rewritten by url.%s.pushInsteadOf from a conditional "
+                            "include, which may not apply where the World is placed",
+                            original.c_str(), p->base.c_str());
+                    if (p) {
+                        String pushurl(p->base);
+                        pushurl.append(original.c_str() + p->prefix.size());
+                        String pushkey("remote.");
+                        pushkey.append(name.c_str());
+                        pushkey.append(".pushurl");
+                        out.emplace_back(GitSetting{pushkey, pushurl});
+                    }
+                }
+            }
+            continue;
         }
         out.emplace_back(GitSetting{key, val});
     }
@@ -574,13 +678,21 @@ bool resolve_include(const char *value, const char *including_file, String &out)
     return true;
 }
 int scan_include_target(const char *root, const char *path, const char *directive, int depth,
-                        bool *sets_identity = nullptr) {
+                        bool *sets_identity = nullptr, Vec<UrlRewriteRule> *rewrites = nullptr) {
     if (depth > 10) return refuse(WFS_E_GIT_POLICY, "configuration includes are nested more than 10 deep");
     struct stat st;
     if (stat(path, &st)) return errno == ENOENT ? 0 : -errno; // Git ignores a missing include
     const char *names[] = {"config", "--file", path, "--null", "--name-only", "--list", nullptr};
     Vec<char> listing;
     if (int rc = git(root, names, &listing)) return rc;
+    if (rewrites) {
+        const char *rw_args[] = {"config", "--file", path, "--null", "--get-regexp",
+            "^url\\..*\\.(insteadof|pushinsteadof)$", nullptr};
+        Vec<char> rw_listing; int rw_status = -1;
+        int rw_rc = git(root, rw_args, &rw_listing, &rw_status);
+        if (rw_rc && !(rw_rc == WFS_E_GIT_FAILED && rw_status == 1)) return rw_rc;
+        if (!rw_rc) parse_rewrite_listing(rw_listing, true, *rewrites);
+    }
     bool nested = false;
     for (size_t i = 0; i < listing.size() && listing[i];) {
         const char *key = listing.data() + i;
@@ -608,12 +720,11 @@ int scan_include_target(const char *root, const char *path, const char *directiv
         if (!nl || !resolve_include(nl + 1, path, target))
             return refuse(WFS_E_GIT_POLICY, "%s includes %s, whose include %s cannot be resolved to a file",
                           directive, path, nl ? nl + 1 : entry);
-        if (int nrc = scan_include_target(root, target.c_str(), directive, depth + 1, sets_identity)) return nrc;
+        if (int nrc = scan_include_target(root, target.c_str(), directive, depth + 1, sets_identity, rewrites)) return nrc;
         i += strlen(entry) + 1;
     }
     return 0;
 }
-int scan_conditional_includes(const char *root, bool *sets_identity);
 int reject_ambient_policy(const char *root) {
     if (getenv("GIT_ATTR_SOURCE")) return refuse(WFS_E_GIT_POLICY, "GIT_ATTR_SOURCE is set in the environment");
     // GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM are forwarded to every ambient-config probe below
@@ -676,8 +787,10 @@ int reject_ambient_policy(const char *root) {
 }
 // Every conditional include in the ambient configuration, active or not, followed recursively:
 // refused when it sets status or filter settings; `sets_identity` reports whether any sets
-// user.name or user.email (so the identity can depend on where the repository is).
-int scan_conditional_includes(const char *root, bool *sets_identity) {
+// user.name or user.email (so the identity can depend on where the repository is); `rewrites`,
+// when given, collects every url.<base>.insteadOf/pushInsteadOf rule found in any of their
+// targets (see capture_carried_config).
+int scan_conditional_includes(const char *root, bool *sets_identity, Vec<UrlRewriteRule> *rewrites) {
     if (sets_identity) *sets_identity = false;
     // Entries are "<origin>\0<key>\n<value>\0".
     Vec<char> includes; int status = -1;
@@ -699,7 +812,7 @@ int scan_conditional_includes(const char *root, bool *sets_identity) {
         String target;
         if (!resolve_include(nl + 1, file, target))
             return refuse(WFS_E_GIT_POLICY, "%s (%s) cannot be resolved to a file", directive.c_str(), origin);
-        if (int src = scan_include_target(root, target.c_str(), directive.c_str(), 0, sets_identity)) return src;
+        if (int src = scan_include_target(root, target.c_str(), directive.c_str(), 0, sets_identity, rewrites)) return src;
     }
     return 0;
 }
@@ -1672,7 +1785,8 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
     String real_where;
     if (value(repo, where, top) || fs_realpath(top.c_str(), real_where) || real_where != repo_real)
         return refuse(WFS_E_GIT_TARGET, "%s is not a Git repository (it is not the top of one)", repo);
-    if (!fs_realpath(world_root, world_real) && world_real == repo_real)
+    if (fs_realpath(world_root, world_real)) return refuse(WFS_E_GIT_TARGET, "%s does not exist", world_root);
+    if (world_real == repo_real)
         return refuse(WFS_E_GIT_TARGET, "the target repository is the World itself");
     // A symbolic destination would be dereferenced by the update and move whatever it points
     // at (a checked-out main, a ref outside refs/heads); publish writes plain branches only.
@@ -1714,12 +1828,15 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
     }
     // The target's url.<base>.insteadOf rules apply to the fetch's repository operand: one that
     // matches the World's path would fetch the same-named branch from somewhere else. Ask Git
-    // what it would actually contact, and refuse unless that is the World itself.
+    // what it would actually contact, and refuse unless that is the World itself. The canonical
+    // (realpath'd) form is used here and for the fetch operand below, since a relative
+    // world_root is resolved by Git from the target's -C directory, not the caller's -- a
+    // different place than fs_realpath resolved it from above.
     {
         String effective;
-        const char *get_url[] = {"ls-remote", "--get-url", world_root, nullptr};
+        const char *get_url[] = {"ls-remote", "--get-url", world_real.c_str(), nullptr};
         if (int urc = value(repo, get_url, effective)) return urc;
-        if (effective != world_root)
+        if (effective != world_real)
             return refuse(WFS_E_GIT_TARGET, "the target repository's url.*.insteadOf rewrites the World's path to %s", effective.c_str());
     }
     String source_ref;
@@ -1728,7 +1845,7 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
     String spec;
     spec.append(source_ref.c_str()); spec.push_back(':'); spec.append(staging);
     const char *fetch[] = {"fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
-                           "--", world_root, spec.c_str(), nullptr};
+                           "--", world_real.c_str(), spec.c_str(), nullptr};
     int rc = git(repo, fetch);
     // Read the staging ref whatever the fetch returned: Git can write it and still exit
     // non-zero afterwards (a commit-graph or maintenance step failing), and a ref this call

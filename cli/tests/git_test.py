@@ -1243,9 +1243,43 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(one, 'config', '--get', 'remote.origin.url').stdout.decode().strip(), '../up.git')
         self.assertEqual(self.git(one, 'ls-remote', '--get-url', 'origin').stdout.decode().strip(),
                          'ssh://example.invalid/up.git')
+        # `pushy`'s URL also starts with the insteadOf rule's prefix ('../'), same as `origin`'s:
+        # fetch resolution only ever looks at insteadOf, so it is kept verbatim like `origin`, and
+        # (since insteadOf matched) no pushurl is synthesized -- the carried pushInsteadOf rule
+        # itself (below) still applies at push time in the World exactly as it did in the source.
         self.assertEqual(self.git(one, 'config', '--get', 'remote.pushy.url').stdout.decode().strip(), '../push.git')
+        self.git(one, 'config', '--get', 'remote.pushy.pushurl', code=1)
+        self.assertEqual(self.git(one, 'config', '--get', 'url.ssh://push.invalid/.pushinsteadof').stdout.decode().strip(),
+                         '../pu')
+        self.assertEqual(self.git(one, 'remote', 'get-url', '--push', 'pushy').stdout.decode().strip(),
+                         'ssh://push.invalid/sh.git')
         self.assertEqual(self.git(one, 'config', '--get', 'remote.plain.url').stdout.decode().strip(),
                          str(self.source / 'plain.git'))
+
+    def test_push_only_rewrite_keeps_fetch_and_push_behavior(self):
+        self.git(self.source, 'remote', 'add', 'origin', '../up.git')
+        self.git(self.source, 'config', 'url.ssh://push.invalid/.pushInsteadOf', '../')
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'config', '--get', 'remote.origin.url').stdout.decode().strip(),
+                         str(self.root / 'up.git'))
+        self.assertEqual(self.git(one, 'config', '--get', 'remote.origin.pushurl').stdout.decode().strip(),
+                         'ssh://push.invalid/up.git')
+        self.assertEqual(self.git(one, 'remote', 'get-url', '--push', 'origin').stdout.decode().strip(),
+                         'ssh://push.invalid/up.git')
+
+    def test_conditional_rewrite_of_relative_remote_is_refused(self):
+        included = self.root / 'conditional-rewrite'
+        included.write_text('[url "ssh://cond.invalid/"]\n insteadOf = ../\n')
+        global_config = self.root / 'conditional-rewrite-global'
+        global_config.write_text('[includeIf "gitdir:' + str(self.root) + '/"]\n path = ' + str(included) + '\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        self.git(self.source, 'remote', 'add', 'origin', '../up.git')
+        result = self.world('init', str(self.source), code=3)
+        self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+        self.assertIn(b'from a conditional include', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
     def test_remote_change_during_mirror_aborts_publication(self):
         import shlex

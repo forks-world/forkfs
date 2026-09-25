@@ -54,10 +54,16 @@ fetch and push refspecs, tag and prune options, remote groups, branch upstreams
 `remote.pushDefault`, `push.default`, `push.autoSetupRemote`, `fetch.prune` and aliases.
 `git fetch origin` and `git push origin <branch>` therefore work in a World as in the
 source; nothing is fetched or pushed automatically, and the World's own `world/W<n>` branch
-starts without an upstream. A relative local remote path is made absolute against the
-source, so it keeps reaching the same repository after the source is deleted -- unless a
-`url.<base>.insteadOf`/`pushInsteadOf` rule rewrites it, in which case it is kept as written
-so the rule still applies. Settings Git
+starts without an upstream. A relative local remote URL is resolved the way Git resolves it:
+matched by the longest unconditional `url.<base>.insteadOf` rule, it is kept as written, so
+the rule still applies; matched only by the longest unconditional `pushInsteadOf` rule, it is
+made absolute instead and the rewritten push destination that rule computed is recorded as
+the remote's `pushurl`, so push behavior is preserved even though the absolute URL no longer
+matches the rule itself; matched by neither, it is simply made absolute so it keeps reaching
+the same repository after the source is deleted. A relative URL whose only matching rule
+comes from a conditional include (`includeIf`) is refused instead, since that rule's
+condition may not hold at the World's eventual location the way it did at the source's.
+Settings Git
 runs on its own are not carried: hooks and `core.hooksPath`, `remote.<name>.uploadpack`,
 `receivepack` and `vcs`, `branch.<name>.mergeOptions`, `core.sshCommand` and credential
 helpers (a global credential helper still applies). These settings are rechecked before
@@ -77,7 +83,10 @@ git -C ~/src/project merge world/W1          # merging stays a Git decision
 
 It is an ordinary `git fetch` into that repository followed by one compare-and-swap ref
 update: the checkout, index, working tree and other branches are not touched, nothing is
-merged, and nothing is pushed anywhere. The default repository is found by following the
+merged, and nothing is pushed anywhere. The World's path is canonicalized before it is used
+as the fetch operand (and to detect a `url.*.insteadOf` rewrite of it), so a relative World
+path resolves the same way for this check as it does for the fetch itself, regardless of the
+target repository's own directory. The default repository is found by following the
 World back through world forks and checkpoints to the directory `init` imported. Without
 `--force`, publishing refuses a branch that is checked out in the target, an update that is
 not a fast-forward, and a repository that shares no history with the World. A detached World
