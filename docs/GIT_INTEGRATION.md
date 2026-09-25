@@ -119,10 +119,17 @@ rather than pick up the newer, uninspected commit, and nothing was changed. Whic
 the World or the target repository -- has active, non-empty replacement refs
 (`refs/replace/*`, under the effective `core.useReplaceRefs` policy) requires the other side to
 carry identical ones, since a replacement changes what a commit's history and tree mean and the
-fetch transfers only the branch tip; otherwise publish refuses before touching the target. The
-target repository's own replacement refs, if any, are ignored when publish judges whether it
-shares history with the World and whether the update is a fast-forward -- those checks look at
-the target's real history.
+fetch transfers only the branch tip; otherwise publish refuses before touching the target. This
+comparison reads `core.useReplaceRefs` the way the user's own Git would -- including a global
+or system setting, not just each repository's local configuration -- so a shared, ambient
+`core.useReplaceRefs = false` disables the check in both repositories rather than making a
+dormant replacement in one of them look active. The target repository's own replacement refs,
+if any, are ignored when publish judges whether it shares history with the World and whether
+the update is a fast-forward -- those checks look at the target's real history. Before any of
+this, publish refuses if either the World or the target has legacy `info/grafts`: unlike
+`refs/replace/*`, grafts are not disabled by `--no-replace-objects` and rewrite a commit's
+parents outright, so one could make a diverged branch look like a fast-forward or shared
+history to the checks that follow.
 
 ## Uncommitted content
 

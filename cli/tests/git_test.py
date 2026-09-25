@@ -682,6 +682,46 @@ class GitWorldTest(unittest.TestCase):
         self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
         self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs').stdout, b'')
 
+    def test_publish_honors_global_replace_ref_policy(self):
+        # A global core.useReplaceRefs=false (shared, per the import policy) disables
+        # replacements for the user's own Git in both repositories, so a replacement active
+        # only in the target's local config must not be treated as active for this check.
+        global_config = self.root / 'global-replace-policy'
+        global_config.write_text('[core]\n useReplaceRefs = false\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        try:
+            self.world('init', str(self.source))
+            one, wid = self.fork()
+            self.git(one, 'commit', '-q', '--allow-empty', '-m', 'world change')
+            head = self.git(one, 'rev-parse', 'HEAD').stdout.strip()
+            self.git(self.source, 'checkout', '-q', '-b', 'replacement')
+            (self.source / 'file').write_text('replacement tree\n')
+            self.git(self.source, 'commit', '-qam', 'replacement')
+            replacement = self.git(self.source, 'rev-parse', 'HEAD').stdout.strip().decode()
+            self.git(self.source, 'checkout', '-q', 'main')
+            self.git(self.source, 'branch', '-q', '-D', 'replacement')
+            self.git(self.source, 'replace', self.base.decode(), replacement)
+            result = self.world('publish', wid)
+            self.assertIn(b'new branch world/W1', result.stdout)
+            self.assertEqual(self.git(self.source, 'rev-parse', 'refs/heads/world/W1').stdout.strip(), head)
+        finally:
+            self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+
+    def test_publish_refuses_grafts(self):
+        # Legacy info/grafts rewrite a commit's parents and are not disabled by
+        # --no-replace-objects, so a graft in the target could make a diverged branch look
+        # like shared history to the checks below it. It must be refused up front instead.
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'world change')
+        grafts_dir = self.source / '.git' / 'info'
+        grafts_dir.mkdir(parents=True, exist_ok=True)
+        (grafts_dir / 'grafts').write_text(self.base.decode() + '\n')
+        result = self.world('publish', wid, code=3)
+        self.assertIn(b'info/grafts', result.stderr)
+        self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
+        self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs').stdout, b'')
+
     def test_conditional_include_paths_expand_tilde_forms(self):
         import pwd
         user = pwd.getpwuid(os.getuid()).pw_name

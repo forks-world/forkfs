@@ -2034,11 +2034,16 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
     // different once published. Check this before anything is staged, so a refusal here leaves
     // the target untouched (there is no staging ref yet to drop).
     {
+        // The user's own Git honors a global or system core.useReplaceRefs, so this reads the
+        // effective value with the ambient configuration Git itself would see (get_config's
+        // git() call disables it), rather than only the repository-local setting.
         auto active_replacements = [](const char *root, bool &active, Vec<char> &listing) -> int {
-            String use_replace; bool present = false;
+            Vec<char> buf; int status = -1;
             const char *cfg[] = {"config", "--type=bool", "--get", "core.useReplaceRefs", nullptr};
-            if (int rc = get_config(root, cfg, use_replace, &present)) return rc;
-            active = !present || use_replace == "true";
+            int rc = git(root, cfg, &buf, &status, false, true);
+            if (rc == WFS_E_GIT_FAILED && status == 1) active = true;
+            else if (rc) return rc;
+            else active = strcmp(buf.data(), "false\n") != 0;
             listing.clear();
             if (!active) return 0;
             const char *list_args[] = {"for-each-ref", "--format=%(refname) %(objectname)", "refs/replace/", nullptr};
@@ -2056,6 +2061,22 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
         if ((world_has || target_has) &&
             (world_active != target_active || !same_bytes(world_listing, target_listing)))
             return refuse(WFS_E_GIT_TARGET, "%s and the World do not have identical replacement refs (refs/replace/); the published history would mean something different there", repo);
+    }
+    // Legacy info/grafts rewrite a commit's parents and, unlike refs/replace/*, are not disabled
+    // by --no-replace-objects -- so a graft in either repository could make a diverged branch
+    // look like a fast-forward or shared history to the checks below. Refuse before they run.
+    {
+        const char *dirs[] = {world_real.c_str(), repo};
+        const char *labels[] = {"the World", repo};
+        for (size_t i = 0; i < 2; ++i) {
+            String grafts;
+            const char *graft_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "info/grafts", nullptr};
+            if (int rc = value(dirs[i], graft_args, grafts)) return rc;
+            struct stat st;
+            if (!lstat(grafts.c_str(), &st))
+                return refuse(WFS_E_GIT_TARGET, "%s has info/grafts, which changes history; remove it before publishing", labels[i]);
+            if (errno != ENOENT) return -errno;
+        }
     }
     String source_ref;
     if (info.branch[0]) { source_ref.assign("refs/heads/"); source_ref.append(info.branch); }
