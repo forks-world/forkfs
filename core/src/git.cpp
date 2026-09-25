@@ -1474,6 +1474,28 @@ int local_hooks_path(const char *root, bool &present, String &path) {
     const char *args[] = {"config", "--local", "--includes", "--get", "core.hooksPath", nullptr};
     return get_config(root, args, path, &present);
 }
+// Refuses any symlink in the in-tree hooks directory `dfd` (named `rel`), recursing into its
+// subdirectories without following links. At the worktree root (`root_only`) only the
+// hook-named entries are hook material, and they are not recursed into.
+int reject_hook_links(int dfd, const String &rel, bool root_only) {
+    Vec<String> entries;
+    if (int rc = list_names(dfd, entries)) return rc;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (root_only && !is_hook_name(entries[i].c_str())) continue;
+        struct stat st;
+        if (fstatat(dfd, entries[i].c_str(), &st, AT_SYMLINK_NOFOLLOW)) return -errno;
+        String name = joinp(rel.c_str(), entries[i].c_str());
+        if (S_ISLNK(st.st_mode))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "hook %s is a symlink; --with-hooks carries only regular files", name.c_str());
+        if (root_only || !S_ISDIR(st.st_mode)) continue;
+        int sub = openat(dfd, entries[i].c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (sub < 0) return -errno;
+        int rc = reject_hook_links(sub, name, false);
+        close(sub);
+        if (rc) return rc;
+    }
+    return 0;
+}
 int capture_hooks(const char *root, Vec<GitHook> &out, bool &path_present, String &path) {
     out.clear();
     if (int rc = local_hooks_path(root, path_present, path)) return rc;
@@ -1526,18 +1548,10 @@ int capture_hooks(const char *root, Vec<GitHook> &out, bool &path_present, Strin
         }
         int dfd = open(walk.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (dfd < 0) return errno == ENOENT ? 0 : -errno;
-        Vec<String> entries;
-        int lrc = list_names(dfd, entries);
         // At the worktree root only the hook-named files are hooks; elsewhere the whole
-        // directory is hook material (hooks commonly source their neighbours).
-        bool root_dir = path == ".";
-        for (size_t i = 0; !lrc && i < entries.size(); ++i) {
-            if (root_dir && !is_hook_name(entries[i].c_str())) continue;
-            struct stat st;
-            if (fstatat(dfd, entries[i].c_str(), &st, AT_SYMLINK_NOFOLLOW)) { lrc = -errno; break; }
-            if (S_ISLNK(st.st_mode))
-                lrc = refuse(WFS_E_GIT_UNSUPPORTED, "hook %s/%s is a symlink; --with-hooks carries only regular files", path.c_str(), entries[i].c_str());
-        }
+        // directory, subdirectories included, is hook material (hooks commonly source their
+        // neighbours and nested helpers such as husky's `_/`).
+        int lrc = reject_hook_links(dfd, path, path == ".");
         close(dfd);
         return lrc;
     }

@@ -469,6 +469,12 @@ class GitWorldTest(unittest.TestCase):
             (self.source / '.husky' / 'pre-commit').symlink_to(outside / 'pre-commit')
             result = self.world('init', str(self.source), '--with-hooks', '--include-changes', code=3)
             self.assertIn(b'hook .husky/pre-commit is a symlink', result.stderr)
+            (self.source / '.husky' / 'pre-commit').unlink()
+        with self.subTest(case='symlink nested below the hooks directory'):
+            (self.source / '.husky' / 'lib').mkdir()
+            (self.source / '.husky' / 'lib' / 'helper').symlink_to(outside / 'pre-commit')
+            result = self.world('init', str(self.source), '--with-hooks', '--include-changes', code=3)
+            self.assertIn(b'hook .husky/lib/helper is a symlink', result.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
     def test_committed_only_with_hooks_needs_a_committed_hooks_path(self):
