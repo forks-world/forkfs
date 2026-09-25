@@ -108,6 +108,17 @@ staging ref are one ref transaction; if that final update fails instead -- for e
 another process moved the branch first -- the staging ref is still removed before publish
 reports the failure, so a failed publish never leaves one behind.
 
+Publish copies exactly the commit that was inspected: if the World's branch (or detached
+HEAD) advances between that inspection and the fetch the command runs, publish refuses
+rather than pick up the newer, uninspected commit, and nothing was changed. A World that
+uses replacement refs (`refs/replace/*`) can only publish to a repository that carries
+identical replacement refs under the same `core.useReplaceRefs` policy, since a replacement
+changes what a commit's history and tree mean and the fetch transfers only the branch tip;
+otherwise publish refuses before touching the target. The target repository's own
+replacement refs, if any, are ignored when publish judges whether it shares history with
+the World and whether the update is a fast-forward -- those checks look at the target's real
+history.
+
 ## Uncommitted content
 
 A dirty source is refused by default. Pass `--include-changes` to `init`, `checkpoint`, or

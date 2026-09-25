@@ -1959,6 +1959,31 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
         if (effective != world_real)
             return refuse(WFS_E_GIT_TARGET, "the target repository's url.*.insteadOf rewrites the World's path to %s", effective.c_str());
     }
+    // Git's refs/replace/* rewrite what a commit's history and trees mean, and the fetch below
+    // transfers only the branch tip -- so a replacement active in the World that the target
+    // repository does not carry identically would let the very same commit id mean something
+    // different once published. Check this before anything is staged, so a refusal here leaves
+    // the target untouched (there is no staging ref yet to drop).
+    {
+        auto active_replacements = [](const char *root, bool &active, Vec<char> &listing) -> int {
+            String use_replace; bool present = false;
+            const char *cfg[] = {"config", "--type=bool", "--get", "core.useReplaceRefs", nullptr};
+            if (int rc = get_config(root, cfg, use_replace, &present)) return rc;
+            active = !present || use_replace == "true";
+            listing.clear();
+            if (!active) return 0;
+            const char *list_args[] = {"for-each-ref", "--format=%(refname) %(objectname)", "refs/replace/", nullptr};
+            return git(root, list_args, &listing);
+        };
+        bool world_active = false, target_active = false;
+        Vec<char> world_listing, target_listing;
+        if (int rc = active_replacements(world_real.c_str(), world_active, world_listing)) return rc;
+        if (world_active && world_listing.size() > 1) { // more than just the trailing NUL
+            if (int rc = active_replacements(repo, target_active, target_listing)) return rc;
+            if (!target_active || !same_bytes(world_listing, target_listing))
+                return refuse(WFS_E_GIT_TARGET, "the World uses replacement refs (refs/replace/) that %s does not have identically; the published history would mean something different there", repo);
+        }
+    }
     String source_ref;
     if (info.branch[0]) { source_ref.assign("refs/heads/"); source_ref.append(info.branch); }
     else source_ref.assign("HEAD");
@@ -1977,18 +2002,27 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
         if (!rc) rc = nrc;
         if (!rc && now.empty()) rc = WFS_E_GIT_FAILED;
     }
+    // info.head is the commit wfs_git_inspect actually inspected and whose dirty state is
+    // reported; the fetch above followed the live branch, so if the World's branch moved
+    // between inspection and fetch, `now` would be a newer, uninspected commit. Publish only
+    // the commit that was inspected.
+    if (!rc && now != info.head)
+        rc = refuse(WFS_E_GIT_TARGET, "the World's %s moved from %.12s to %.12s while publishing; nothing was changed",
+                    info.branch[0] ? "branch" : "HEAD", info.head, now.c_str());
     if (!rc && !force) {
         // Shared history: at least one of the World's commits is already in the repository.
         // An unrelated repository would otherwise gain a branch with a foreign root.
+        // --no-replace-objects: this judges the target's real history, ignoring any
+        // replacement refs of its own (the check above already handled the World's).
         String exclude("--exclude="); exclude.append(staging);
-        const char *all_args[] = {"rev-list", "--count", now.c_str(), nullptr};
-        const char *new_args[] = {"rev-list", "--count", now.c_str(), exclude.c_str(), "--not", "--all", nullptr};
+        const char *all_args[] = {"--no-replace-objects", "rev-list", "--count", now.c_str(), nullptr};
+        const char *new_args[] = {"--no-replace-objects", "rev-list", "--count", now.c_str(), exclude.c_str(), "--not", "--all", nullptr};
         String all, fresh;
         if (!(rc = value(repo, all_args, all)) && !(rc = value(repo, new_args, fresh)) && all == fresh)
             rc = refuse(WFS_E_GIT_TARGET, "%s shares no history with the World; is it the repository the World came from? (--force skips this check)", repo);
     }
     if (!rc && !force && !old.empty() && old != now) {
-        const char *ff[] = {"merge-base", "--is-ancestor", old.c_str(), now.c_str(), nullptr};
+        const char *ff[] = {"--no-replace-objects", "merge-base", "--is-ancestor", old.c_str(), now.c_str(), nullptr};
         int status = -1;
         int ff_rc = git(repo, ff, nullptr, &status, true);
         if (ff_rc == WFS_E_GIT_FAILED && status == 1)

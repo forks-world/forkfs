@@ -622,6 +622,48 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(self.source, 'rev-parse', 'world/W1').stdout.strip(), self.base)
         self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs').stdout, b'')
 
+    def test_publish_refuses_a_branch_that_moves_during_publish(self):
+        import shlex
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'world change')
+        real_git = shutil.which('git')
+        wrapper = self.root / 'branch-move-bin'
+        wrapper.mkdir()
+        script = wrapper / 'git'
+        marker = self.root / 'branch-moved'
+        # On the first fetch, move the World's branch before the fetch itself runs.
+        script.write_text('#!/bin/sh\nfetch=0\nfor arg in "$@"; do [ "$arg" = fetch ] && fetch=1; done\n'
+                          + 'if [ "$fetch" = 1 ] && [ ! -e ' + shlex.quote(str(marker)) + ' ]; then\n'
+                          + 'touch ' + shlex.quote(str(marker)) + '\n'
+                          + shlex.quote(real_git) + ' -C ' + shlex.quote(str(one))
+                          + ' -c user.name=W -c user.email=w@example.com commit -q --allow-empty -m moved || exit $?\n'
+                          + 'fi\n'
+                          + 'exec ' + shlex.quote(real_git) + ' "$@"\n')
+        script.chmod(0o700)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        result = self.world('publish', wid, code=3)
+        self.assertIn(b'moved from', result.stderr)
+        self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
+        self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs').stdout, b'')
+
+    def test_publish_refuses_mismatched_replacement_refs(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'checkout', '-q', '-b', 'replacement')
+        (one / 'file').write_text('replacement tree\n')
+        self.git(one, 'commit', '-qam', 'replacement')
+        replacement = self.git(one, 'rev-parse', 'HEAD').stdout.strip().decode()
+        self.git(one, 'checkout', '-q', 'world/W1')
+        self.git(one, 'branch', '-q', '-D', 'replacement')
+        self.git(one, 'replace', self.base.decode(), replacement)
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'world change')
+        # The default target (the source the World came from) has no refs/replace at all.
+        result = self.world('publish', wid, code=3)
+        self.assertIn(b'replacement refs', result.stderr)
+        self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
+        self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs').stdout, b'')
+
     def test_conditional_include_paths_expand_tilde_forms(self):
         import pwd
         user = pwd.getpwuid(os.getuid()).pw_name
