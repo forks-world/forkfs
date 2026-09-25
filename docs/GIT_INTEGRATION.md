@@ -54,16 +54,11 @@ fetch and push refspecs, tag and prune options, remote groups, branch upstreams
 `remote.pushDefault`, `push.default`, `push.autoSetupRemote`, `fetch.prune` and aliases.
 `git fetch origin` and `git push origin <branch>` therefore work in a World as in the
 source; nothing is fetched or pushed automatically, and the World's own `world/W<n>` branch
-starts without an upstream. A relative local remote URL is resolved the way Git resolves it:
-matched by the longest unconditional `url.<base>.insteadOf` rule, it is kept as written, so
-the rule still applies; matched only by the longest unconditional `pushInsteadOf` rule, it is
-made absolute instead and the rewritten push destination that rule computed is recorded as
-the remote's `pushurl`, so push behavior is preserved even though the absolute URL no longer
-matches the rule itself; matched by neither, it is simply made absolute so it keeps reaching
-the same repository after the source is deleted. A relative URL whose only matching rule
-comes from a conditional include (`includeIf`) is refused instead, since that rule's
-condition may not hold at the World's eventual location the way it did at the source's.
-Settings Git
+starts without an upstream. A relative local remote path is made absolute against the source,
+so it keeps reaching the same repository after the source is deleted. A relative remote URL
+that any `url.<base>.insteadOf` or `pushInsteadOf` rule matches is refused instead (make the
+URL absolute or remove the rule), because a rewrite of a relative path cannot be carried
+faithfully to a World in another location. Settings Git
 runs on its own are not carried: hooks and `core.hooksPath`, `remote.<name>.uploadpack`,
 `receivepack` and `vcs`, `branch.<name>.mergeOptions`, `core.sshCommand` and credential
 helpers (a global credential helper still applies). These settings are rechecked before
