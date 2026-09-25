@@ -43,7 +43,7 @@ by the World, including staged blobs which have not yet appeared in any commit.
 `info/exclude`; source-local `info/exclude` rules are preserved before those reserved entries
 are appended. Source-local `info/attributes` rules are also preserved. These are reserved
 administration names. Source hooks and local executable
-Git settings are not imported. Local `user.name` and `user.email` are preserved, and so is an
+Git settings are not imported by default (see [Project hooks](#project-hooks)). Local `user.name` and `user.email` are preserved, and so is an
 identity a conditional include supplies at the source's location; normal Git commands in a
 World also use the user's usual Git configuration. Import does not create a
 remote back to the source.
@@ -108,10 +108,51 @@ URL, could contact a push URL twice, or (via the rewrite pass above) send the Wo
 different endpoint than the source actually reaches. Keep all of a carried remote's settings,
 including its URLs, in the repository-local configuration only.
 Settings Git
-runs on its own are not carried: hooks and `core.hooksPath`, `remote.<name>.uploadpack`,
+runs on its own are not carried: hooks and `core.hooksPath` (unless `--with-hooks`), `remote.<name>.uploadpack`,
 `receivepack` and `vcs`, `branch.<name>.mergeOptions`, `core.sshCommand` and credential
 helpers (a global credential helper still applies). These settings are rechecked before
 publication like the rest of the captured state.
+
+## Project hooks
+
+Hooks are not carried by default, so commits in a World skip the project's hooks. When the
+source has any -- executable, non-`.sample` files (or symlinks) in its hooks directory, or a
+repository-local `core.hooksPath` such as husky's `.husky` -- `init` says so in one `note:`
+line on stderr that names `--with-hooks`.
+
+`world fs init <dir> --with-hooks` carries them into the owned repository:
+
+- the executable, regular, non-`.sample` files of the source's hooks directory (the common
+  one, also for a linked worktree) are copied into `.world-git/repo.git/hooks` with their
+  modes; files Git would not run (not executable), subdirectories and special files are not;
+- a repository-local `core.hooksPath` is carried as the source resolved it. A relative value
+  that stays inside the tree refers to the World's own copy (hooks run at the worktree root),
+  so `.husky` works as-is; one that leaves the tree (`../shared-hooks`) is carried as the
+  absolute directory the source used, never re-resolved beside the World. An absolute value is
+  kept as the user opted into it. A relative value with a `..` after a directory name
+  (`link/../hooks`) is refused: Git resolves it through that directory, possibly a symlink,
+  so it cannot be collapsed faithfully. While `core.hooksPath` is set, Git ignores the default hooks
+  directory, so it is neither scanned nor copied; an in-tree hooks directory travels with the
+  tree and is refused if it, a component of its path or any entry in it -- at any depth, since
+  hooks commonly source nested helpers -- is a symlink (for a hooks path of `.`, only the
+  hook-named files at the root count). With
+  `--committed-only` the in-tree hooks directory must be committed with no pending changes
+  inside it (for a hooks path of `.`, the hook-named files at the root), and none of those
+  hooks may be marked skip-worktree or assume-unchanged, which hides edits from status: the reset to HEAD
+  would otherwise remove the directory or its uncommitted hooks and leave the World silently
+  skipping them. A hooks path inside `.git`, `.world-git` or `.world` is refused, since the
+  import replaces that administration. A global `core.hooksPath` needs no carrying: global
+  configuration is shared.
+
+A symlinked hook, or a symlinked hooks directory, is refused with a reason rather than
+followed: the World would otherwise run whatever the link reaches later. The captured hooks
+and `core.hooksPath` are rechecked before publication like the rest of the captured state,
+so a hook changed during the import aborts it. Hooks never run during WorldFS's own Git
+commands (import, fork, checkpoint, publish): every one of them sets `core.hooksPath=/dev/null`.
+Worlds forked or checkpointed from a World keep its hooks, since its whole `.world-git`
+(hooks directory and configuration included) is cloned with it. So `--committed-only` from a
+World requires the same of a relative `core.hooksPath` set in it -- committed, nothing pending
+inside -- even without `--with-hooks`.
 
 ## Getting work back to the source
 
@@ -180,12 +221,28 @@ history to the checks that follow.
 
 ## Uncommitted content
 
-A dirty source is refused by default. Pass `--include-changes` to `init`, `checkpoint`, or
-`fork --from W<n>` to explicitly preserve staged changes, unstaged changes, and untracked
-files. The copied index preserves the staging boundary; no automatic `git add`, commit,
-reset or checkout is applied to user files. Ignored build/data files are always copied,
-including when a source is otherwise clean. Forking an immutable snapshot carries the
-content already captured by that snapshot without another opt-in.
+A dirty source is refused by default; `init`, `checkpoint` and `fork --from W<n>` take one
+of two explicit choices (passing both is a usage error):
+
+- `--include-changes` carries the current work: staged changes, unstaged changes, and
+  untracked files. The copied index preserves the staging boundary; no automatic `git add`,
+  commit, reset or checkout is applied to user files.
+- `--committed-only` creates from the committed version: the new snapshot or World's
+  Git-visible content is exactly HEAD, with a clean `git status`. Staged and unstaged
+  changes, deleted tracked files, files that were only staged, and untracked files that are
+  not ignored stay behind; a pending `SQUASH_MSG`, which describes staged content, is not
+  carried either. Only the copy is reset (`update-index --refresh`, `clean -fd` without
+  `-x`, `read-tree --reset -u HEAD`), never the source: its HEAD, index and files are left
+  byte-for-byte as they were. Files that already match HEAD are not rewritten, so they stay
+  clones of the source's blocks, and a hardlink group the reset replaces is dropped from the
+  snapshot's record. No filter or hook runs. A source without a Git repository is refused.
+Paths marked `skip-worktree` or `assume-unchanged` in the source are reset to HEAD too; the
+marks are cleared in the copy, whose index becomes exactly HEAD.
+
+Ignored build/data files are always copied, with either choice and when a source is
+otherwise clean. Forking an immutable snapshot carries the content already captured by that
+snapshot without another opt-in; `--committed-only` is refused there, since a snapshot has
+no working state to leave behind (fork it and use Git, or checkpoint a World with the flag).
 
 The source HEAD and index are checked again around import; detected changes fail the
 operation before publication. Without `--include-changes`, the copied tree is also checked
@@ -224,9 +281,8 @@ content, including Git administrative changes such as branch/index updates.
   crash) is refused, so the lock is never copied into the child. Merge/rebase/cherry-pick/revert in progress
   is also refused, as is an unconcluded `git notes merge`, whose state is invisible to
   `git status`. Re-import older snapshots that still contain an unconverted `.git`.
-- Git LFS hydration, recursive submodule import, a shared refs/object service, a switch to
-  discard current edits and materialize only HEAD, and cross-machine history transfer are
-  not provided. This increment does not close every requirement in Issue #7.
+- Git LFS hydration, recursive submodule import, a shared refs/object service, and
+  cross-machine history transfer are not provided. This increment does not close every requirement in Issue #7.
 - Repository-local `core.excludesFile` and `core.attributesFile` overrides are unsupported.
   They can point outside the repository, and merging their rules into `info/exclude` or
   `info/attributes` would change Git's precedence; these overrides are not imported. Use the
@@ -239,16 +295,26 @@ content, including Git administrative changes such as branch/index updates.
   `extensions.objectFormat` (SHA-1 and SHA-256 repositories), the files ref backend, and the
   sparse-checkout `worktreeConfig` case above. Others, such as `extensions.preciousObjects`,
   are refused because a mirror clone does not carry them.
-- Git Worlds use the ordinary temporary-tree fork path. `pool fill` rejects Git snapshots;
-  it does not build entries that Git-aware forks cannot consume.
+- Git snapshots can be pooled (`pool fill S<n>`). An entry is a plain clone of the snapshot
+  with no branch of its own; the fork that takes it runs the same per-World Git setup an
+  ordinary fork runs on its temporary tree -- the managed-layout checks, the `world/W<n>`
+  branch and the baseline -- on the entry before it gets its marker and its public name, so
+  a handed-out Git World is indistinguishable from an ordinary fork. That setup is a few
+  Git commands and a walk for nested repositories, so a Git pool hit saves the clone but is
+  not the bare marker-and-rename hand-out of a plain snapshot. An entry the setup has touched
+  never goes back into the pool: if the setup (or anything after it) fails, the entry is
+  removed, nothing is published, and the fork falls through to an ordinary clone, which
+  fails the same way when the setup itself is the problem. `WFS_E_GIT_POOL` is no longer
+  returned; the code stays reserved in the C ABI.
 - Git setup runs inside the uncommitted clone before the normal exclusive publish rename.
   A failed Git command does not publish a World or change the source repository; existing
   temporary-tree recovery handles interrupted work. No new store schema is introduced.
 
 Validation: `cli_git_test` uses disposable real repositories and covers clean/dirty imports,
-staging preservation, imported linked worktrees after source deletion, independent commits,
-branch collisions, detached HEAD, move/discard/restore/checkpoint, hard snapshots, pool
-refusal, Git setup rollback, environment isolation and Git commits inside the exec sandbox.
+committed-only imports, opt-in hooks, staging preservation, imported linked worktrees after
+source deletion, independent commits, branch collisions, detached HEAD,
+move/discard/restore/checkpoint, hard snapshots, pooled Git forks and their setup failures,
+Git setup rollback, environment isolation and Git commits inside the exec sandbox.
 
 ### Repository status policy
 
@@ -282,7 +348,9 @@ What cannot be shared is refused with a Git configuration error that names the r
 - A filter that tracked files actually use (for example Git LFS), from any scope. A filter
   that is only defined, such as the one a machine-wide `git lfs install` adds, is fine in a
   repository whose files do not use it; so is a `filter=` attribute whose driver is not
-  defined anywhere. Filters are never executed by the import.
+  defined anywhere. With `--committed-only`, the files and attributes of HEAD count too, so
+  a filter HEAD assigns is refused even when uncommitted edits remove the assignment. Filters
+  are never executed by the import.
 - A conditional `includeIf` whose target sets status or filter settings, in any scope and
   whether or not it is active at the source: the condition (a `gitdir:` pattern, a branch)
   can evaluate differently at the World's location. The same is refused for a target that

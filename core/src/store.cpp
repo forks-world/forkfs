@@ -1411,7 +1411,8 @@ extern "C" const char *wfs_strerror(int rc) {
     case WFS_E_GIT_IN_USE:
         return "additional Git worktrees depend on this World; remove them with git worktree before discarding it";
     case WFS_E_GIT_POOL:
-        return "Git snapshots use the ordinary fork path; run world fs fork without filling a pool";
+        // Not returned any more (Git snapshots are poolable); kept for codes older cores gave.
+        return "Git snapshots cannot use the pre-clone pool in this version";
     case WFS_E_GIT_UNSUPPORTED:
         return "unsupported Git layout";
     case WFS_E_GIT_TARGET:
@@ -1419,7 +1420,7 @@ extern "C" const char *wfs_strerror(int rc) {
     case WFS_E_GIT_POLICY:
         return "Git configuration outside this repository would make the World's Git see files differently";
     case WFS_E_GIT_DIRTY:
-        return "Git workspace has uncommitted changes; commit first or use --include-changes to carry staged, unstaged and untracked files";
+        return "Git workspace has uncommitted changes; commit first, use --include-changes to carry staged, unstaged and untracked files, or --committed-only to start from HEAD";
     case WFS_E_GIT_FAILED:
         return "Git operation failed (Git 2.48+ with relative worktrees is required); see Git diagnostic";
     case WFS_E_STORE_BUSY:

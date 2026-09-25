@@ -1141,31 +1141,8 @@ int scan_conditional_includes(const char *root, bool *sets_identity, Vec<UrlRewr
     }
     return 0;
 }
-// Tracked files whose `filter` attribute names a defined driver (Git LFS, git-crypt, ...) would
-// have that driver executed by status in the source and in the World; WorldFS neither runs nor
-// reproduces it. A driver that is defined but unused (a machine-wide `git lfs install` in a
-// repository without LFS files) or used but undefined (pointer files as plain content) is fine.
-int reject_used_filters(const char *root) {
-    const char *defined_args[] = {"config", "--null", "--name-only", "--get-regexp", "^filter\\.", nullptr};
-    Vec<char> defined; int status = -1;
-    int rc = git(root, defined_args, &defined, &status, false, true);
-    if (rc == WFS_E_GIT_FAILED && status == 1) return 0; // no driver anywhere: nothing can run
-    if (rc) return rc;
-    Vec<char> paths;
-    const char *ls_args[] = {"ls-files", "-z", nullptr};
-    if ((rc = git(root, ls_args, &paths))) return rc;
-    if (paths.size() <= 1) return 0;
-    FILE *input = tmpfile();
-    if (!input) return -errno;
-    if (fwrite(paths.data(), 1, paths.size() - 1, input) != paths.size() - 1 || fflush(input)) {
-        int err = errno ? -errno : -EIO; fclose(input); return err;
-    }
-    rewind(input);
-    const char *attr_args[] = {"check-attr", "--stdin", "-z", "filter", nullptr};
-    Vec<char> attrs;
-    rc = git(root, attr_args, &attrs, nullptr, false, true, fileno(input));
-    fclose(input);
-    if (rc) return rc;
+// Refuses a `check-attr filter` result that assigns any path a defined driver.
+int reject_filter_attrs(const Vec<char> &attrs, const Vec<char> &defined) {
     // Triples "<path>\0filter\0<value>\0".
     for (size_t i = 0; i < attrs.size() && attrs[i];) {
         const char *path = attrs.data() + i; i += strlen(path) + 1;
@@ -1186,6 +1163,43 @@ int reject_used_filters(const char *root) {
             if (!strcmp(field, "clean") || !strcmp(field, "smudge") || !strcmp(field, "process"))
                 return refuse(WFS_E_GIT_POLICY, "tracked file %s uses the '%s' filter (e.g. Git LFS), which WorldFS does not run", path, driver);
         }
+    }
+    return 0;
+}
+// Tracked files whose `filter` attribute names a defined driver (Git LFS, git-crypt, ...) would
+// have that driver executed by status in the source and in the World; WorldFS neither runs nor
+// reproduces it. A driver that is defined but unused (a machine-wide `git lfs install` in a
+// repository without LFS files) or used but undefined (pointer files as plain content) is fine.
+// With `tree` (HEAD before --committed-only resets the copy), the paths are the tree's and each
+// is checked both against the tree's own attributes -- what checking the tree out reads, once
+// it is the index -- and against the worktree's, which checkout still falls back to.
+int reject_used_filters(const char *root, const char *tree = nullptr) {
+    const char *defined_args[] = {"config", "--null", "--name-only", "--get-regexp", "^filter\\.", nullptr};
+    Vec<char> defined; int status = -1;
+    int rc = git(root, defined_args, &defined, &status, false, true);
+    if (rc == WFS_E_GIT_FAILED && status == 1) return 0; // no driver anywhere: nothing can run
+    if (rc) return rc;
+    Vec<char> paths;
+    const char *ls_args[] = {"ls-files", "-z", nullptr};
+    const char *tree_args[] = {"ls-tree", "-r", "-z", "--name-only", "--full-tree", tree, nullptr};
+    if ((rc = git(root, tree ? tree_args : ls_args, &paths))) return rc;
+    if (paths.size() <= 1) return 0;
+    String source("--source=");
+    if (tree) source.append(tree);
+    for (int pass = 0; pass < (tree ? 2 : 1); ++pass) {
+        FILE *input = tmpfile();
+        if (!input) return -errno;
+        if (fwrite(paths.data(), 1, paths.size() - 1, input) != paths.size() - 1 || fflush(input)) {
+            int err = errno ? -errno : -EIO; fclose(input); return err;
+        }
+        rewind(input);
+        const char *attr_args[] = {"check-attr", "--stdin", "-z", "filter", nullptr};
+        const char *tree_attr_args[] = {"check-attr", source.c_str(), "--stdin", "-z", "filter", nullptr};
+        Vec<char> attrs;
+        rc = git(root, pass ? tree_attr_args : attr_args, &attrs, nullptr, false, true, fileno(input));
+        fclose(input);
+        if (rc) return rc;
+        if ((rc = reject_filter_attrs(attrs, defined))) return rc;
     }
     return 0;
 }
@@ -1440,6 +1454,187 @@ int restore_rerere(const char *repo, const Vec<char> &blob) {
     }
     return 0;
 }
+// Project hooks, for --with-hooks. Git runs only executable files of the hooks directory, and
+// the directory is the common one even for a linked worktree. A symlinked directory or hook
+// would make the World run whatever the link reaches later, possibly outside it, so it is
+// refused rather than followed; `.sample` files, subdirectories, special files and files Git
+// would not execute are left out. A repository-local core.hooksPath travels verbatim: a
+// relative one (husky's `.husky`) names a directory of the World's own tree, and an absolute
+// one is what the user opted into. Only local scope counts -- global configuration is shared.
+// Every hook name Git runs (githooks(5)), for a hooks path that is the worktree root itself,
+// where only these files are hooks and everything else is ordinary content.
+const char *const kHookNames[] = {"applypatch-msg", "pre-applypatch", "post-applypatch", "pre-commit",
+    "pre-merge-commit", "prepare-commit-msg", "commit-msg", "post-commit", "pre-rebase", "post-checkout",
+    "post-merge", "pre-push", "pre-receive", "update", "proc-receive", "post-receive", "post-update",
+    "reference-transaction", "push-to-checkout", "pre-auto-gc", "post-rewrite", "sendemail-validate",
+    "fsmonitor-watchman", "p4-changelist", "p4-prepare-changelist", "p4-post-changelist", "p4-pre-submit",
+    "post-index-change", nullptr};
+bool is_hook_name(const char *name) {
+    for (size_t i = 0; kHookNames[i]; ++i) if (!strcmp(name, kHookNames[i])) return true;
+    return false;
+}
+bool is_sample(const char *name) {
+    size_t n = strlen(name);
+    return n >= 7 && !strcmp(name + n - 7, ".sample");
+}
+int hooks_dir(const char *root, String &out) {
+    String common;
+    const char *args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
+    if (int rc = value(root, args, common)) return rc;
+    out = joinp(common.c_str(), "hooks");
+    return 0;
+}
+int local_hooks_path(const char *root, bool &present, String &path) {
+    const char *args[] = {"config", "--local", "--includes", "--get", "core.hooksPath", nullptr};
+    return get_config(root, args, path, &present);
+}
+// Refuses any symlink in the in-tree hooks directory `dfd` (named `rel`), recursing into its
+// subdirectories without following links. At the worktree root (`root_only`) only the
+// hook-named entries are hook material, and they are not recursed into.
+int reject_hook_links(int dfd, const String &rel, bool root_only) {
+    Vec<String> entries;
+    if (int rc = list_names(dfd, entries)) return rc;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (root_only && !is_hook_name(entries[i].c_str())) continue;
+        struct stat st;
+        if (fstatat(dfd, entries[i].c_str(), &st, AT_SYMLINK_NOFOLLOW)) return -errno;
+        String name = joinp(rel.c_str(), entries[i].c_str());
+        if (S_ISLNK(st.st_mode))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "hook %s is a symlink; --with-hooks carries only regular files", name.c_str());
+        if (root_only || !S_ISDIR(st.st_mode)) continue;
+        int sub = openat(dfd, entries[i].c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (sub < 0) return -errno;
+        int rc = reject_hook_links(sub, name, false);
+        close(sub);
+        if (rc) return rc;
+    }
+    return 0;
+}
+// A relative core.hooksPath is resolved from the worktree root. Resolved lexically against the
+// real source root: one that stays inside the tree (husky's `.husky`) becomes a normalized
+// relative path, so the World uses its own copy; one that leaves it (`../shared-hooks`) becomes
+// the absolute directory the source used, not re-resolved beside the World. Only leading `..`
+// components collapse correctly without the filesystem (the root is already real); a `..`
+// after a directory name (`link/../hooks`) would be taken through `link` by Git, which may be a
+// symlink to anywhere, so it is refused rather than collapsed to a different directory.
+int normalize_hooks_path(const char *root, bool present, String &path) {
+    if (present && !path.empty() && path[0] != '/' && path[0] != '~') {
+        bool named = false;
+        for (const char *p = path.c_str(); *p;) {
+            while (*p == '/') ++p;
+            const char *start = p;
+            while (*p && *p != '/') ++p;
+            size_t n = (size_t)(p - start);
+            if (n == 0 || (n == 1 && *start == '.')) continue;
+            if (n == 2 && start[0] == '.' && start[1] == '.') {
+                if (named)
+                    return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s has a '..' after a directory name, which Git resolves through that directory (possibly a symlink); simplify it", path.c_str());
+                continue;
+            }
+            named = true;
+        }
+        String real_root;
+        if (int rc = fs_realpath(root, real_root)) return rc;
+        String resolved = absolute_lexical(real_root.c_str(), path.c_str());
+        size_t n = real_root.size();
+        if (resolved == real_root) path.assign(".");
+        else if (resolved.size() > n && !strncmp(resolved.c_str(), real_root.c_str(), n) && resolved[n] == '/')
+            path.assign(resolved.c_str() + n + 1);
+        else path = resolved;
+    }
+    return 0;
+}
+int capture_hooks(const char *root, Vec<GitHook> &out, bool &path_present, String &path) {
+    out.clear();
+    if (int rc = local_hooks_path(root, path_present, path)) return rc;
+    if (int rc = normalize_hooks_path(root, path_present, path)) return rc;
+    if (path_present) {
+        // With core.hooksPath set, Git runs hooks from there and never from the default
+        // directory, so that is the only one that matters. An in-tree directory travels with the
+        // tree, so nothing is copied, but every component and every entry in it is checked
+        // without following links: a symlinked `.husky` or hook would make the World execute a
+        // mutable target outside it. An absolute or `~` directory is outside the tree and is used
+        // as the source used it, which is what --with-hooks opts into.
+        if (path.empty() || path[0] == '/' || path[0] == '~') return 0;
+        // Administration the import replaces (.git becomes the WorldFS marker) or owns cannot
+        // hold hooks that travel with the tree.
+        for (const char *reserved : {".git", ".world-git", ".world"}) {
+            size_t n = strlen(reserved);
+            if (!strncmp(path.c_str(), reserved, n) && (path[n] == '\0' || path[n] == '/'))
+                return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s is inside %s, which the import replaces; move the hooks into the tree or use an absolute path", path.c_str(), reserved);
+        }
+        String real_root;
+        if (int rc = fs_realpath(root, real_root)) return rc;
+        String walk(real_root);
+        const char *p = path.c_str();
+        while (*p) {
+            while (*p == '/') ++p;
+            const char *start = p;
+            while (*p && *p != '/') ++p;
+            if (p == start) break;
+            String part(start, (size_t)(p - start));
+            if (part == ".") continue;
+            walk = joinp(walk.c_str(), part.c_str());
+            struct stat st;
+            if (lstat(walk.c_str(), &st)) return errno == ENOENT ? 0 : -errno;
+            if (S_ISLNK(st.st_mode))
+                return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s goes through a symlink (%s)", path.c_str(), walk.c_str());
+            if (!S_ISDIR(st.st_mode)) return 0;
+        }
+        int dfd = open(walk.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (dfd < 0) return errno == ENOENT ? 0 : -errno;
+        // At the worktree root only the hook-named files are hooks; elsewhere the whole
+        // directory, subdirectories included, is hook material (hooks commonly source their
+        // neighbours and nested helpers such as husky's `_/`).
+        int lrc = reject_hook_links(dfd, path, path == ".");
+        close(dfd);
+        return lrc;
+    }
+    String dir;
+    if (int rc = hooks_dir(root, dir)) return rc;
+    int fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) return 0;
+        return errno == ENOTDIR || errno == ELOOP
+            ? refuse(WFS_E_GIT_UNSUPPORTED, "the hooks directory %s is a symlink or not a directory", dir.c_str()) : -errno;
+    }
+    Vec<String> names;
+    int rc = list_names(fd, names);
+    for (size_t i = 0; !rc && i < names.size(); ++i) {
+        const char *name = names[i].c_str();
+        if (is_sample(name)) continue;
+        struct stat st;
+        if (fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW)) { rc = -errno; break; }
+        if (S_ISLNK(st.st_mode)) { rc = refuse(WFS_E_GIT_UNSUPPORTED, "hook %s is a symlink; --with-hooks copies only regular files", name); break; }
+        if (!S_ISREG(st.st_mode) || !(st.st_mode & 0111)) continue;
+        GitHook hook;
+        hook.name.assign(name);
+        hook.mode = (uint32_t)(st.st_mode & 0777);
+        String p = joinp(dir.c_str(), name);
+        if ((rc = read_bytes(p.c_str(), hook.bytes))) break;
+        out.emplace_back(hook);
+    }
+    close(fd);
+    return rc;
+}
+bool same_hooks(const Vec<GitHook> &a, const Vec<GitHook> &b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].name != b[i].name || a[i].mode != b[i].mode || !same_bytes(a[i].bytes, b[i].bytes)) return false;
+    return true;
+}
+int install_hooks(const GitSource &s, const char *clone, const char *repo) {
+    if (!s.hooks.empty()) {
+        String dir = joinp(repo, "hooks");
+        if (int rc = fs_mkdir(dir.c_str(), 0755)) { if (rc != -EEXIST) return rc; }
+        for (const auto &hook : s.hooks) {
+            String p = joinp(dir.c_str(), hook.name.c_str());
+            if (int rc = write_bytes(p.c_str(), hook.bytes.data(), hook.bytes.size())) return rc;
+            if (chmod(p.c_str(), (mode_t)hook.mode)) return -errno;
+        }
+    }
+    return s.hooks_path_present ? config(clone, "core.hooksPath", s.hooks_path.c_str()) : 0;
+}
 // GIT_OPTIONAL_LOCKS=0 (set by git()) keeps status from refreshing the index it inspects.
 int require_clean_tree(const char *root) {
     const char *args[] = {"status", "--porcelain=v1", "-z", "--untracked-files=normal",
@@ -1449,6 +1644,75 @@ int require_clean_tree(const char *root) {
     // "clean" means what `git status` in the source and in the World both say.
     if (int rc = git(root, args, &dirty, nullptr, false, true)) return rc;
     return dirty.size() > 1 ? WFS_E_GIT_DIRTY : 0;
+}
+// --committed-only: make the copy's Git-visible content exactly HEAD. Only the copy is touched;
+// the source was captured read-only and is rechecked unchanged before this runs. The index is
+// refreshed first (the copy's inodes and ctimes differ from the ones it records), so the reset
+// rewrites only files whose content differs from HEAD and the rest stay clones of the source's
+// blocks. `clean` without -x removes untracked, non-ignored files and keeps ignored build/data
+// artifacts and the reserved administration; `read-tree --reset -u` then puts back modified and
+// deleted tracked files and drops files that were only staged. They run with the user's ambient
+// configuration, like the clean check, so "ignored" and "clean" mean what the user's Git says.
+// No filter can run, and hooks are off. The source-side check saw only the source's worktree and
+// index attributes, which a dirty `.gitattributes` can differ from HEAD's, so filter use is
+// checked here first, before the refresh (which cleans stat-dirty files) or the reset (which
+// checks HEAD out), against the copy's index and worktree and against HEAD.
+// SQUASH_MSG describes staged content that no longer exists, so it goes too.
+int reset_to_head(const char *clone) {
+    if (int rc = reject_used_filters(clone)) return rc;
+    if (int rc = reject_used_filters(clone, "HEAD")) return rc;
+    // skip-worktree and assume-unchanged entries are invisible to status and left alone by
+    // read-tree, so their worktree bytes would survive the reset. Clear both marks in the
+    // copy's index first (`ls-files -v`: 'S'/'s' is skip-worktree, a lower-case tag is
+    // assume-unchanged); the index is about to become exactly HEAD anyway. Each mark is cleared
+    // by its own update-index call with the paths as arguments: the per-path options neither
+    // apply to --stdin paths nor combine in one call.
+    int rc = 0;
+    {
+        Vec<char> listing;
+        const char *ls[] = {"ls-files", "-v", "-z", nullptr};
+        if ((rc = git(clone, ls, &listing))) return rc;
+        Vec<String> skip, assume;
+        for (size_t i = 0; i + 1 < listing.size();) {
+            const char *entry = listing.data() + i;
+            size_t len = strlen(entry);
+            i += len + 1;
+            if (len < 3 || entry[1] != ' ') continue;
+            char tag = entry[0];
+            if (tag == 'S' || tag == 's') skip.emplace_back(entry + 2);
+            if (tag >= 'a' && tag <= 'z') assume.emplace_back(entry + 2);
+        }
+        struct Pass { const char *flag; Vec<String> *paths; } passes[] = {
+            {"--no-skip-worktree", &skip}, {"--no-assume-unchanged", &assume}};
+        for (auto &pass : passes) {
+            for (size_t at = 0; at < pass.paths->size();) {
+                Vec<const char *> args;
+                args.emplace_back("update-index");
+                args.emplace_back(pass.flag);
+                args.emplace_back("--");
+                for (size_t n = 0; n < 256 && at < pass.paths->size(); ++n, ++at)
+                    args.emplace_back((*pass.paths)[at].c_str());
+                args.emplace_back(nullptr);
+                if ((rc = git(clone, args.data()))) return rc;
+            }
+        }
+    }
+    const char *refresh[] = {"update-index", "-q", "--refresh", nullptr};
+    int status = -1;
+    rc = git(clone, refresh, nullptr, &status, true, true);
+    if (rc && !(rc == WFS_E_GIT_FAILED && status == 1)) return rc;
+    const char *clean[] = {"clean", "-f", "-d", "-q", "--", ".", ":(exclude,top,literal).world",
+                           ":(exclude,top,literal).world-git", nullptr};
+    if ((rc = git(clone, clean, nullptr, nullptr, false, true))) return rc;
+    const char *reset[] = {"read-tree", "--reset", "-u", "HEAD", nullptr};
+    if ((rc = git(clone, reset, nullptr, nullptr, false, true))) return rc;
+    // A directory the reset emptied of staged additions, or anything else left untracked.
+    if ((rc = git(clone, clean, nullptr, nullptr, false, true))) return rc;
+    String squash;
+    const char *squash_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "SQUASH_MSG", nullptr};
+    if ((rc = value(clone, squash_args, squash))) return rc;
+    if (unlink(squash.c_str()) && errno != ENOENT) return -errno;
+    return 0;
 }
 // `for-each-ref` (and therefore the mirror) silently omits a symbolic ref whose target does
 // not exist, e.g. after `git symbolic-ref refs/heads/alias refs/heads/future`, so the captured
@@ -1563,6 +1827,11 @@ int source_unchanged(const GitSource &s) {
         if (int carry_rc = capture_carried_config(s.root.c_str(), carried)) return carry_rc;
         if (!same_settings(carried, s.carried)) return -EBUSY;
     }
+    if (s.with_hooks && !s.managed) {
+        Vec<GitHook> hooks; bool path_present = false; String path;
+        if (int hook_rc = capture_hooks(s.root.c_str(), hooks, path_present, path)) return hook_rc;
+        if (!same_hooks(hooks, s.hooks) || path_present != s.hooks_path_present || path != s.hooks_path) return -EBUSY;
+    }
     Vec<char> direct_refs; if (int ref_rc = capture_refs(s.root.c_str(), direct_refs)) return ref_rc;
     if (!same_bytes(direct_refs, s.refs)) return -EBUSY;
     bool orig_present; String orig; if (int orig_rc = capture_orig(s.root.c_str(), orig_present, orig)) return orig_rc;
@@ -1626,15 +1895,77 @@ int reject_reserved_paths(const char *root, const GitSource &s) {
     if (int rc = git(root, args.data(), &hit)) return rc;
     return hit.size() > 1 ? refuse(WFS_E_GIT_UNSUPPORTED, "a preserved commit tracks the reserved path .world or .world-git") : 0;
 }
-int git_source(const char *root, bool include_changes, GitSource &out) {
+// --committed-only resets the copy to HEAD, which removes an in-tree hooks directory that is
+// only staged or untracked; the World would then point core.hooksPath at nothing and silently
+// skip its hooks. Require a relative (normalized) hooks path to be in HEAD with nothing pending.
+int require_committed_hooks_path(const char *root, bool present, const String &hp) {
+    if (!present || hp.empty() || hp[0] == '/' || hp[0] == '~') return 0;
+    bool at_root = hp == ".";
+    if (!at_root) {
+        // `HEAD:<path>` takes everything after the colon as the path, so the type is read
+        // with cat-file rather than peeled with ^{tree}.
+        String spec("HEAD:"); spec.append(hp.c_str());
+        const char *type_args[] = {"cat-file", "-t", spec.c_str(), nullptr};
+        Vec<char> type; int tstatus = -1;
+        int trc = git(root, type_args, &type, &tstatus, true);
+        if (trc || strcmp(type.data(), "tree\n"))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s is not committed, so --committed-only would leave the hooks out; commit it or drop --committed-only", hp.c_str());
+    }
+    // The directory being in HEAD is not enough: a hook inside it that is staged,
+    // untracked or modified would be reset away just the same. At the worktree root only
+    // the hook-named files are hooks, so only those are checked there.
+    Vec<String> scopes;
+    if (at_root) {
+        for (size_t k = 0; kHookNames[k]; ++k) {
+            String one(":(top,literal)"); one.append(kHookNames[k]); scopes.emplace_back(one);
+        }
+    } else {
+        String one(":(top,literal)"); one.append(hp.c_str()); scopes.emplace_back(one);
+    }
+    Vec<const char *> st_args;
+    for (const char *a : {"status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=no", "--"})
+        st_args.emplace_back(a);
+    for (const auto &scope : scopes) st_args.emplace_back(scope.c_str());
+    st_args.emplace_back(nullptr);
+    Vec<char> pending;
+    if (int src = git(root, st_args.data(), &pending, nullptr, false, true)) return src;
+    if (pending.size() > 1)
+        return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s has uncommitted changes, which --committed-only would drop; commit them or drop --committed-only", hp.c_str());
+    // Status cannot see edits to a hook marked skip-worktree or assume-unchanged, and the reset
+    // clears those marks and restores the committed bytes (reset_to_head), so any such hook is
+    // refused: `ls-files -v` tags skip-worktree with 'S'/'s', assume-unchanged in lower case.
+    st_args.clear();
+    for (const char *a : {"ls-files", "-v", "-z", "--"}) st_args.emplace_back(a);
+    for (const auto &scope : scopes) st_args.emplace_back(scope.c_str());
+    st_args.emplace_back(nullptr);
+    Vec<char> listing;
+    if (int lrc = git(root, st_args.data(), &listing)) return lrc;
+    for (size_t i = 0; i + 1 < listing.size();) {
+        const char *entry = listing.data() + i;
+        size_t len = strlen(entry);
+        i += len + 1;
+        if (len < 3 || entry[1] != ' ') continue;
+        if (entry[0] == 'S' || (entry[0] >= 'a' && entry[0] <= 'z'))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "hook %s is marked skip-worktree or assume-unchanged, so --committed-only would reset it to its committed version unseen; clear the mark or drop --committed-only", entry + 2);
+    }
+    return 0;
+}
+int git_source(const char *root, bool include_changes, GitSource &out, bool committed_only, bool with_hooks) {
     g_reason[0] = '\0';
+    if (include_changes && committed_only) return -EINVAL;
     if (int rc = nested_check(root)) return rc;
     String dot = joinp(root, ".git"), managed = joinp(root, ".world-git");
     struct stat st;
     bool has_managed = lstat(managed.c_str(), &st) == 0;
     if (!has_managed && errno != ENOENT) return -errno;
-    if (lstat(dot.c_str(), &st))
-        return errno == ENOENT && !has_managed ? 0 : refuse(WFS_E_GIT_UNSUPPORTED, ".world-git exists without its .git marker");
+    if (lstat(dot.c_str(), &st)) {
+        if (errno == ENOENT && !has_managed) {
+            if (committed_only) return refuse(WFS_E_GIT_UNSUPPORTED, "--committed-only needs a Git repository at the source root");
+            if (with_hooks) return refuse(WFS_E_GIT_UNSUPPORTED, "--with-hooks needs a Git repository at the source root");
+            return 0;
+        }
+        return refuse(WFS_E_GIT_UNSUPPORTED, ".world-git exists without its .git marker");
+    }
     if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) return refuse(WFS_E_GIT_UNSUPPORTED, ".git is neither a directory nor a file");
     out.present = true; out.root = root;
     if (has_managed) {
@@ -1656,6 +1987,22 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
     if (int wt_rc = capture_worktree_config(root, out.worktree_config, out.worktree_settings)) return wt_rc;
     if (!out.managed) {
         if (int carry_rc = capture_carried_config(root, out.carried)) return carry_rc;
+    }
+    // A managed World's hooks and core.hooksPath are already part of the .world-git it clones.
+    out.with_hooks = with_hooks;
+    if (with_hooks && !out.managed) {
+        if (int hook_rc = capture_hooks(root, out.hooks, out.hooks_path_present, out.hooks_path)) return hook_rc;
+        if (committed_only) {
+            if (int hrc = require_committed_hooks_path(root, out.hooks_path_present, out.hooks_path)) return hrc;
+        }
+    }
+    // A managed World carries its hooks and core.hooksPath with its .world-git, so the same
+    // committed-path check applies to it whether or not --with-hooks was given.
+    if (committed_only && out.managed) {
+        bool present = false; String hp;
+        if (int hrc = local_hooks_path(root, present, hp)) return hrc;
+        if (int hrc = normalize_hooks_path(root, present, hp)) return hrc;
+        if (int hrc = require_committed_hooks_path(root, present, hp)) return hrc;
     }
     if (out.managed) {
         // A managed copy has byte-identical configuration files and import commands ignore
@@ -1727,8 +2074,11 @@ int git_source(const char *root, bool include_changes, GitSource &out) {
         i += strlen(listing.data() + i) + 1;
     }
     if ((rc = reject_reserved_paths(root, out))) return rc;
+    // With --committed-only the copy is reset to HEAD and must then be clean; the source's own
+    // uncommitted state is simply not carried, so it is not a reason to refuse.
     out.require_clean = !include_changes;
-    if (!include_changes) {
+    out.committed_only = committed_only;
+    if (!include_changes && !committed_only) {
         if ((rc = require_clean_tree(root))) return rc;
     }
     return 0;
@@ -1822,6 +2172,9 @@ int git_import(const GitSource &s, const char *clone) {
             copy.orig_present != s.orig_present || copy.orig_head != s.orig_head) return -EBUSY;
         if (int rc = reject_copied_locks(clone)) return rc;
         if (int rc = pin_identity(s.root.c_str(), clone)) return rc;
+        if (s.committed_only) {
+            if (int rc = reset_to_head(clone)) return rc;
+        }
         // HEAD and the index do not change when a tracked file is edited after the source's
         // clean check, so check the copy that will actually be published. Re-probe the copy's
         // own ambient policy and filters first: GIT_CONFIG_GLOBAL/SYSTEM and other per-directory
@@ -1938,11 +2291,18 @@ int git_import(const GitSource &s, const char *clone) {
         const char *args[] = {"config", "--local", "--add", setting.key.c_str(), setting.value.c_str(), nullptr};
         if (int rc = git(clone, args)) return rc;
     }
+    // Installed, never run: every command here passes core.hooksPath=/dev/null.
+    if (s.with_hooks) {
+        if (int rc = install_hooks(s, clone, repo.c_str())) return rc;
+    }
     Vec<char> imported_refs;
     if (int rc = capture_refs(clone, imported_refs)) return rc;
     if (!same_bytes(imported_refs, s.refs)) return -EBUSY;
     if (int rc = source_unchanged(s)) return rc;
     if (int rc = pin_identity(s.root.c_str(), clone)) return rc;
+    if (s.committed_only) {
+        if (int rc = reset_to_head(clone)) return rc;
+    }
     // The owned repository now carries the source's index and status settings, so this sees the
     // bytes that will be published, including edits made after the source's own clean check.
     // Re-probe ambient policy and filters beside the copy first, for the same reason as above:
@@ -2120,6 +2480,33 @@ int branch_checked_out(const char *repo, const String &ref, bool &out) {
 }
 
 extern "C" const char *wfs_git_reason(void) { return wfs::g_reason; }
+
+extern "C" int wfs_git_uncarried_hooks(const char *root) {
+    if (!root) return -EINVAL;
+    wfs::String dot = wfs::joinp(root, ".git"), owned = wfs::joinp(root, ".world-git");
+    struct stat st;
+    if (lstat(dot.c_str(), &st)) return errno == ENOENT ? 0 : -errno;
+    if (!lstat(owned.c_str(), &st)) return 0;   // a managed World's hooks travel with it
+    if (errno != ENOENT) return -errno;
+    bool present = false; wfs::String path;
+    if (int rc = wfs::local_hooks_path(root, present, path)) return rc;
+    if (present) return 1;
+    wfs::String dir;
+    if (int rc = wfs::hooks_dir(root, dir)) return rc;
+    // Anything --with-hooks would carry or refuse to follow is worth the note.
+    DIR *d = opendir(dir.c_str());
+    if (!d) return errno == ENOENT || errno == ENOTDIR ? 0 : -errno;
+    int found = 0;
+    for (;;) {
+        errno = 0; dirent *e = readdir(d);
+        if (!e) { if (errno) found = -errno; break; }
+        if (e->d_name[0] == '.' || wfs::is_sample(e->d_name)) continue;
+        if (fstatat(dirfd(d), e->d_name, &st, AT_SYMLINK_NOFOLLOW)) continue;
+        if (S_ISLNK(st.st_mode) || (S_ISREG(st.st_mode) && (st.st_mode & 0111))) { found = 1; break; }
+    }
+    closedir(d);
+    return found;
+}
 
 extern "C" int wfs_git_inspect(const char *root, wfs_git_info *out) {
     if (!root || !out) return -EINVAL;
