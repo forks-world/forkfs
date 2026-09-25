@@ -1357,6 +1357,33 @@ class GitWorldTest(unittest.TestCase):
                           b'ssh://work.invalid/proj.git')
         self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
 
+    def test_conditional_rewrite_of_push_only_remote_is_pinned(self):
+        # A remote can carry only a pushurl and no url at all (Git supports this). A conditional
+        # rewrite rule active at the source still rewrites that explicit pushurl there, so it
+        # must be pinned the same way as a remote's url, not skipped for lacking a url entry.
+        included = self.root / 'conditional-pin-push-only'
+        included.write_text('[url "ssh://work.invalid/"]\n insteadOf = https://example.invalid/work/\n')
+        global_config = self.root / 'conditional-pin-push-only-global'
+        # Scoped to the source's own .git, not self.root, so it is inactive at the World's path.
+        global_config.write_text('[includeIf "gitdir:' + str(self.source) + '/"]\n path = '
+                                  + str(included) + '\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        self.git(self.source, 'config', 'remote.pushonly.pushurl', 'https://example.invalid/work/proj.git')
+        # Sanity: the condition is active at the source, so Git itself already rewrites the
+        # explicit pushurl there.
+        self.assertEqual(self.git(self.source, 'remote', 'get-url', '--push', 'pushonly').stdout.strip(),
+                          b'ssh://work.invalid/proj.git')
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        # The World does not sit under the source, so the condition is now inactive -- but the
+        # pinned literal value still reproduces what the source's Git actually used, and no url
+        # entry is synthesized for a remote that never had one.
+        self.assertEqual(self.git(one, 'config', '--get-all', 'remote.pushonly.pushurl').stdout.strip(),
+                          b'ssh://work.invalid/proj.git')
+        self.git(one, 'config', '--get', 'remote.pushonly.url', code=1)
+        self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+
     def test_pinned_remote_url_rewritten_again_is_refused(self):
         # A rewrite pinned from the source must not be rewritten again by another rule active in
         # the source's own configuration, or the World would resolve it differently than the

@@ -418,7 +418,10 @@ int scan_conditional_includes(const char *root, bool *sets_identity, Vec<UrlRewr
 // rule changes that remote's effective URL and, if so, to substitute it in. `pin_urls`, once set,
 // is what gets substituted for the remote's url entries; `pin_pushurls`, when also set, is added
 // as its pushurl entries -- always, when the remote had an explicit pushurl in the source, so it
-// stays explicit at the World rather than falling back to the (possibly rewritten) url entries.
+// stays explicit at the World rather than falling back to the (possibly rewritten) url entries. A
+// remote may have only a pushurl and no url at all (Git supports this); such a remote has
+// raw_urls/url_indices empty, and, if its effective push resolves differently, ends up with
+// pin_pushurls set but pin_urls left empty.
 struct RemoteRewriteInfo {
     String name;
     Vec<String> raw_urls, raw_pushurls;
@@ -561,9 +564,34 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
     // the source's own Git what it actually contacts, and record that instead: the World then
     // reaches the same endpoints wherever it is placed. A conditional rule that only applies at
     // the World's own location applies there, exactly as it would for any repository placed
-    // there.
+    // there. A remote can also carry only a pushurl (no url), which Git supports; that remote has
+    // no fetch side to ask about, so it is pinned separately, below, by querying only its push
+    // side.
     for (auto &info : remotes) {
-        if (info.raw_urls.empty()) continue; // only remotes with a url entry are pinned
+        if (info.raw_urls.empty() && info.raw_pushurls.empty()) continue; // nothing carried
+        if (info.raw_urls.empty()) {
+            // Push-only remote: only remote.<name>.pushurl is set. There is no url entry to ask
+            // Git to resolve, and `remote get-url` without --push would fail outright, so only the
+            // push side is queried.
+            Vec<String> effective_push;
+            const char *push_args[] = {"remote", "get-url", "--push", "--all", info.name.c_str(), nullptr};
+            if (int grc = git_lines(root, push_args, effective_push)) return grc;
+            if (effective_push == info.raw_pushurls) continue; // no rewrite applies
+            for (auto &u : effective_push) if (is_relative_local_url(u.c_str())) u = absolute_lexical(root, u.c_str());
+            // Chain guard: same as the pinned-pushurl guard below -- only an insteadOf rule active
+            // in the source's ambient configuration can rewrite an explicit pushurl again.
+            for (const auto &u : effective_push) {
+                for (const auto &r : ambient_rules) {
+                    if (r.push || r.prefix.empty() || strncmp(u.c_str(), r.prefix.c_str(), r.prefix.size())) continue;
+                    return refuse(WFS_E_GIT_POLICY,
+                        "remote %s resolves to %s, which url.%s.%s would rewrite again; simplify "
+                        "the URL rewrite rules before importing",
+                        info.name.c_str(), u.c_str(), r.base.c_str(), "insteadOf");
+                }
+            }
+            info.pin_pushurls = std::move(effective_push);
+            continue;
+        }
         Vec<String> effective_fetch;
         {
             const char *fetch_args[] = {"remote", "get-url", "--all", info.name.c_str(), nullptr};
@@ -620,25 +648,31 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
         if (pin_push) info.pin_pushurls = std::move(effective_push);
     }
     bool any_pinned = false;
-    for (const auto &info : remotes) if (!info.pin_urls.empty()) { any_pinned = true; break; }
+    for (const auto &info : remotes)
+        if (!info.pin_urls.empty() || !info.pin_pushurls.empty()) { any_pinned = true; break; }
     if (!any_pinned) return 0;
     // Replace each pinned remote's url/pushurl entries with the pinned ones, at the position of
-    // its first original url entry, and drop the rest.
+    // its first original url entry (or, for a remote pinned on the push side only -- no url entry
+    // at all -- its first original pushurl entry), and drop the rest.
     Vec<GitSetting> pinned;
     for (size_t i = 0; i < out.size(); ++i) {
         const RemoteRewriteInfo *first_owner = nullptr;
         bool drop = false;
         for (const auto &info : remotes) {
-            if (info.pin_urls.empty()) continue;
-            if (!info.url_indices.empty() && info.url_indices[0] == i) { first_owner = &info; break; }
+            if (info.pin_urls.empty() && info.pin_pushurls.empty()) continue;
+            size_t anchor = !info.url_indices.empty() ? info.url_indices[0]
+                : (info.pushurl_indices.empty() ? (size_t)-1 : info.pushurl_indices[0]);
+            if (anchor == i) { first_owner = &info; break; }
             bool matched = false;
             for (size_t idx : info.url_indices) if (idx == i) matched = true;
             for (size_t idx : info.pushurl_indices) if (idx == i) matched = true;
             if (matched) { drop = true; break; }
         }
         if (first_owner) {
-            String url_key("remote."); url_key.append(first_owner->name.c_str()); url_key.append(".url");
-            for (const auto &u : first_owner->pin_urls) pinned.emplace_back(GitSetting{url_key, u});
+            if (!first_owner->pin_urls.empty()) {
+                String url_key("remote."); url_key.append(first_owner->name.c_str()); url_key.append(".url");
+                for (const auto &u : first_owner->pin_urls) pinned.emplace_back(GitSetting{url_key, u});
+            }
             if (!first_owner->pin_pushurls.empty()) {
                 String pushurl_key("remote."); pushurl_key.append(first_owner->name.c_str()); pushurl_key.append(".pushurl");
                 for (const auto &u : first_owner->pin_pushurls) pinned.emplace_back(GitSetting{pushurl_key, u});

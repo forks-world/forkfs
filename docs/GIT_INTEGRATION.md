@@ -70,11 +70,12 @@ remote that had an explicit `remote.<name>.pushurl` at the source keeps an expli
 pushurl in the World even when it resolves to the same URL as the pinned fetch URL, since Git
 never falls back to a remote's (possibly rewritten) fetch URL once it has an explicit pushurl,
 and leaving it implicit would expose it to a `pushInsteadOf` rule active at the World's own
-location. A remote whose `url` or `pushurl` is also set in global, system, or command
-(`GIT_CONFIG_*`/`-c`) configuration is refused instead of carried: the World reads that same
-ambient configuration, so pinning the ambient value on top would duplicate the URL and could
-contact a push URL twice; keep a carried remote's URLs in the repository-local configuration
-only.
+location. A remote that has only a `pushurl` and no `url` at all -- which Git supports -- is
+pinned the same way, from its effective push URL alone. A remote whose `url` or `pushurl` is
+also set in global, system, or command (`GIT_CONFIG_*`/`-c`) configuration is refused instead
+of carried: the World reads that same ambient configuration, so pinning the ambient value on
+top would duplicate the URL and could contact a push URL twice; keep a carried remote's URLs
+in the repository-local configuration only.
 Settings Git
 runs on its own are not carried: hooks and `core.hooksPath`, `remote.<name>.uploadpack`,
 `receivepack` and `vcs`, `branch.<name>.mergeOptions`, `core.sshCommand` and credential
