@@ -74,6 +74,10 @@ missing part is refused instead of guessed, and the remote URL must be made abso
 when it contains a `..` component (there is no filesystem left to resolve it through) or when
 its first missing component is itself a dangling symlink (one whose own target does not exist,
 so where Git would actually follow it cannot be told from here).
+A remote `url` or `pushurl` containing a line break (`\n` or `\r`) is refused outright, even
+though such a value is legal Git configuration for a local path: `git remote get-url` emits a
+remote's URLs newline-separated, so a URL that itself contains one could no longer be told apart
+from two separate URLs once carried; rename the path before importing.
 A relative remote URL that any `url.<base>.insteadOf` or `pushInsteadOf` rule matches is refused instead (make the
 URL absolute or remove the rule), because a rewrite of a relative path cannot be carried
 faithfully to a World in another location. When such a rule instead rewrites an absolute

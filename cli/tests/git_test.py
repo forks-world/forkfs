@@ -1434,6 +1434,31 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'dangling symlink', result.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
+    def test_remote_url_with_a_line_break_is_refused(self):
+        # A local-path remote URL may legally contain an embedded newline -- Git accepts any
+        # byte but '\0' and '/' in a path component. `git remote get-url --all` would emit it
+        # verbatim, indistinguishable there from two separate URLs once split on '\n', so it is
+        # refused up front rather than carried wrong.
+        bare = self.root / 'up\nrepo.git'
+        bare.mkdir()
+        self.git(bare, 'init', '--bare', '-b', 'main')
+        self.git(self.source, 'remote', 'add', 'origin', str(bare))
+        result = self.world('init', str(self.source), code=3)
+        self.assertIn(b'remote origin has a url containing a line break', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_remote_pushurl_with_a_line_break_is_refused(self):
+        # Same as above, but for an explicit pushurl -- captured and checked separately from the
+        # fetch url, and just as reachable through the push-side `git remote get-url --push`.
+        bare = self.root / 'push\nrepo.git'
+        bare.mkdir()
+        self.git(bare, 'init', '--bare', '-b', 'main')
+        self.git(self.source, 'remote', 'add', 'origin', 'https://example.invalid/x.git')
+        self.git(self.source, 'config', 'remote.origin.pushurl', str(bare))
+        result = self.world('init', str(self.source), code=3)
+        self.assertIn(b'remote origin has a pushurl containing a line break', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_stale_config_for_the_world_branch_is_not_inherited(self):
         # Carried configuration can include branch.<name>.* for a branch name that has no ref
         # yet, e.g. leftover config from a branch of that name the source once had. The new

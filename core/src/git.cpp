@@ -497,7 +497,10 @@ RemoteRewriteInfo &remote_info(Vec<RemoteRewriteInfo> &remotes, const String &na
     return remotes.emplace_back(RemoteRewriteInfo{name, {}, {}, {}, {}, {}, {}});
 }
 // The newline-separated output of a command such as "git remote get-url --all <name>", with the
-// trailing newline stripped and each remaining line its own entry, in order.
+// trailing newline stripped and each remaining line its own entry, in order. Callers must first
+// rule out any value (e.g. a raw remote URL) that could itself contain an embedded '\n' -- such a
+// value would split into extra, bogus entries here, indistinguishable from genuinely separate
+// lines.
 int git_lines(const char *root, const char *const *args, Vec<String> &out) {
     out.clear();
     Vec<char> buf; int status = -1;
@@ -566,6 +569,18 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
         bool is_remote = !strncmp(key.c_str(), "remote.", 7);
         bool is_url = is_remote && klen > 4 && !strcmp(key.c_str() + klen - 4, ".url");
         bool is_pushurl = is_remote && klen > 8 && !strcmp(key.c_str() + klen - 8, ".pushurl");
+        // A local-path remote URL may legally contain an embedded newline (or carriage return).
+        // `git remote get-url --all`/`--push --all` below would emit it verbatim, and git_lines
+        // splits on every '\n', so the effective URL list would no longer match this raw value
+        // and the pinning pass could replace one working remote with several broken ones. Refuse
+        // up front, before any of that runs, rather than carry it wrong.
+        if ((is_url || is_pushurl) && strpbrk(val.c_str(), "\n\r")) {
+            String name(key.c_str() + 7, klen - 7 - (is_url ? 4 : 8));
+            return refuse(WFS_E_GIT_POLICY,
+                "remote %s has a %s containing a line break, which cannot be carried unambiguously; "
+                "rename the path before importing",
+                name.c_str(), is_url ? "url" : "pushurl");
+        }
         // The raw value, before a relative one below is made absolute: what the pinning pass
         // compares Git's effective URLs against, so a remote the source itself does not rewrite
         // is left untouched.
