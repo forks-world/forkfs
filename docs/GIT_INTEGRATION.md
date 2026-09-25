@@ -58,7 +58,15 @@ starts without an upstream. A relative local remote path is made absolute agains
 so it keeps reaching the same repository after the source is deleted. A relative remote URL
 that any `url.<base>.insteadOf` or `pushInsteadOf` rule matches is refused instead (make the
 URL absolute or remove the rule), because a rewrite of a relative path cannot be carried
-faithfully to a World in another location. Settings Git
+faithfully to a World in another location. When such a rule instead rewrites an absolute
+remote URL -- for example a per-account rule reached through a conditional include such as
+`includeIf "gitdir:~/work/"` -- the World does not carry the rewrite rule's effect raw:
+it records the fetch and push URLs Git actually uses for that remote at the source, so the
+World reaches the same endpoints wherever it is placed. A pinned URL that another rule would
+rewrite again is refused, since the World would then resolve it differently than the source
+does; simplify the rewrite rules before importing. A conditional rule that only applies at the
+World's own location applies there, exactly as it would for any repository placed there.
+Settings Git
 runs on its own are not carried: hooks and `core.hooksPath`, `remote.<name>.uploadpack`,
 `receivepack` and `vcs`, `branch.<name>.mergeOptions`, `core.sshCommand` and credential
 helpers (a global credential helper still applies). These settings are rechecked before
@@ -88,7 +96,9 @@ not a fast-forward, and a repository that shares no history with the World. A de
 needs `--branch`. Uncommitted World changes are not published; the command says so.
 Publishing re-checks the configuration policy first, so reading the World's status never
 runs a filter attached after the import. The branch update and the removal of the private
-staging ref are one ref transaction.
+staging ref are one ref transaction; if that final update fails instead -- for example
+another process moved the branch first -- the staging ref is still removed before publish
+reports the failure, so a failed publish never leaves one behind.
 
 ## Uncommitted content
 

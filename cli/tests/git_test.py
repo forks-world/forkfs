@@ -1269,6 +1269,49 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'is relative and url.', result.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
+    def test_conditional_rewrite_of_absolute_remote_is_pinned(self):
+        # A rule that lives in a conditional include active at the source -- the common
+        # per-account includeIf "gitdir:~/work/" setup -- still rewrites an absolute remote URL
+        # there, and may or may not apply once the World sits elsewhere. The World must still
+        # reach the same endpoint the source actually used, so the effective URL is pinned rather
+        # than carried raw.
+        included = self.root / 'conditional-pin'
+        included.write_text('[url "ssh://work.invalid/"]\n insteadOf = https://example.invalid/work/\n')
+        global_config = self.root / 'conditional-pin-global'
+        # Scoped to the source's own .git, not self.root, so it is inactive at the World's path.
+        global_config.write_text('[includeIf "gitdir:' + str(self.source) + '/"]\n path = '
+                                  + str(included) + '\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        self.git(self.source, 'remote', 'add', 'origin', 'https://example.invalid/work/proj.git')
+        # Sanity: the condition is active at the source, so Git itself already rewrites it there.
+        self.assertEqual(self.git(self.source, 'remote', 'get-url', 'origin').stdout.strip(),
+                          b'ssh://work.invalid/proj.git')
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        # The World does not sit under the source, so the condition is now inactive -- but the
+        # pinned literal value still reproduces what the source's Git actually used.
+        self.assertEqual(self.git(one, 'config', '--get', 'remote.origin.url').stdout.strip(),
+                          b'ssh://work.invalid/proj.git')
+        self.assertEqual(self.git(one, 'remote', 'get-url', '--push', 'origin').stdout.strip(),
+                          b'ssh://work.invalid/proj.git')
+        self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+
+    def test_pinned_remote_url_rewritten_again_is_refused(self):
+        # A rewrite pinned from the source must not be rewritten again by another rule active in
+        # the source's own configuration, or the World would resolve it differently than the
+        # source does.
+        self.git(self.source, 'config', 'url.foo://.pushInsteadOf', 'https://example.invalid/')
+        self.git(self.source, 'config', 'url.bar://.insteadOf', 'foo://')
+        self.git(self.source, 'remote', 'add', 'origin', 'https://example.invalid/up.git')
+        # Sanity: Git's own rewriting is single-pass and stops at "foo://up.git" for push,
+        # without chaining into the second rule -- the source's Git never reaches "bar://up.git".
+        self.assertEqual(self.git(self.source, 'remote', 'get-url', '--push', 'origin').stdout.strip(),
+                          b'foo://up.git')
+        result = self.world('init', str(self.source), code=3)
+        self.assertIn(b'would rewrite again', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_remote_change_during_mirror_aborts_publication(self):
         import shlex
         self.git(self.source, 'remote', 'add', 'origin', 'https://example.invalid/before.git')
@@ -1493,6 +1536,29 @@ class GitWorldTest(unittest.TestCase):
         script.write_text('#!/bin/sh\nfetch=0\nfor arg in "$@"; do [ "$arg" = fetch ] && fetch=1; done\n'
                           + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
                           + 'if [ "$fetch" = 1 ]; then exit 128; fi\nexit "$result"\n')
+        script.chmod(0o700)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        self.world('publish', wid, code=3)
+        self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs').stdout, b'')
+        self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
+
+    def test_publish_drops_staging_ref_when_final_update_fails(self):
+        import shlex
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'world change')
+        real_git = shutil.which('git')
+        wrapper = self.root / 'final-update-failure-bin'
+        wrapper.mkdir()
+        script = wrapper / 'git'
+        # The final ref transaction itself fails (e.g. another process moved the branch);
+        # every other Git invocation, including the one that drops the staging ref, behaves
+        # normally.
+        script.write_text('#!/bin/sh\nupdate=0\nstdin=0\n'
+                          + 'for arg in "$@"; do [ "$arg" = update-ref ] && update=1; '
+                          + '[ "$arg" = --stdin ] && stdin=1; done\n'
+                          + 'if [ "$update" = 1 ] && [ "$stdin" = 1 ]; then exit 1; fi\n'
+                          + shlex.quote(real_git) + ' "$@"\n')
         script.chmod(0o700)
         self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
         self.world('publish', wid, code=3)
