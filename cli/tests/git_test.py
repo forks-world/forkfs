@@ -1384,6 +1384,56 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'does not exist', result.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
+    def test_relative_remote_with_missing_leaf_through_a_symlink_resolves_like_git(self):
+        # `new.git` under the symlink does not exist yet (the remote was never fetched into the
+        # source), so there is no full path for `fs_realpath` to resolve directly. But `link`
+        # itself exists and does resolve, and Git would still reach the remote through it once
+        # fetched or pushed, so the resolution must land at the symlink's real target, not
+        # lexically next to the source.
+        target = self.root / 'target'
+        target.mkdir()
+        link = self.source / 'link'
+        link.symlink_to(target)
+        with open(self.source / '.git' / 'info' / 'exclude', 'a') as exclude:
+            exclude.write('/link\n')
+        self.git(self.source, 'remote', 'add', 'origin', 'link/new.git')
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'config', '--get', 'remote.origin.url').stdout.strip().decode(),
+                         str((target / 'new.git').resolve()))
+
+    def test_relative_remote_with_missing_multilevel_path_through_a_symlink_resolves_like_git(self):
+        # Neither `a` nor `a/b.git` exists under the symlink target, so the longest existing
+        # prefix that can be resolved through the filesystem is the symlink itself; the rest of
+        # the path (more than one missing component) is joined on lexically once that prefix is
+        # real.
+        target = self.root / 'target2'
+        target.mkdir()
+        link = self.source / 'link'
+        link.symlink_to(target)
+        with open(self.source / '.git' / 'info' / 'exclude', 'a') as exclude:
+            exclude.write('/link\n')
+        self.git(self.source, 'remote', 'add', 'origin', 'link/a/b.git')
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'config', '--get', 'remote.origin.url').stdout.strip().decode(),
+                         str((target / 'a' / 'b.git').resolve()))
+
+    def test_relative_remote_through_a_dangling_symlink_is_refused(self):
+        # `dead` exists as a symlink, but its target does not, so `realpath` cannot resolve it
+        # and there is no way to tell from here where Git would actually follow it once the
+        # target eventually exists.
+        dead = self.source / 'dead'
+        dead.symlink_to(self.root / 'nonexistent' / 'x')
+        with open(self.source / '.git' / 'info' / 'exclude', 'a') as exclude:
+            exclude.write('/dead\n')
+        self.git(self.source, 'remote', 'add', 'origin', 'dead/r.git')
+        result = self.world('init', str(self.source), code=3)
+        self.assertIn(b'dangling symlink', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_stale_config_for_the_world_branch_is_not_inherited(self):
         # Carried configuration can include branch.<name>.* for a branch name that has no ref
         # yet, e.g. leftover config from a branch of that name the source once had. The new

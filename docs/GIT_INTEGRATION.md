@@ -65,9 +65,15 @@ A relative local remote path is made absolute against the source, so it keeps re
 same repository after the source is deleted. When the path exists, it is resolved through the
 filesystem the same way Git itself would reach it -- including through a symlink a `..`
 component in the path walks back out of -- rather than collapsed lexically, which a symlink
-could make point somewhere else. A relative path that does not exist and contains a `..`
-component is refused instead, since there is no filesystem to resolve that `..` through and a
-lexical guess could be wrong once a symlink appears later; make the remote URL absolute first.
+could make point somewhere else. When the path does not exist in full (the remote was never
+fetched into the source, or names a path only `git push` would create), its longest existing
+prefix is resolved through the filesystem the same way, and whatever is still missing is
+joined onto that real path -- so a symlink earlier in the path (e.g. `link/new.git` with `link`
+a symlink elsewhere) still lands where Git would put it once the missing part exists. The
+missing part is refused instead of guessed, and the remote URL must be made absolute first,
+when it contains a `..` component (there is no filesystem left to resolve it through) or when
+its first missing component is itself a dangling symlink (one whose own target does not exist,
+so where Git would actually follow it cannot be told from here).
 A relative remote URL that any `url.<base>.insteadOf` or `pushInsteadOf` rule matches is refused instead (make the
 URL absolute or remove the rule), because a rewrite of a relative path cannot be carried
 faithfully to a World in another location. When such a rule instead rewrites an absolute

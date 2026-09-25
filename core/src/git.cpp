@@ -345,32 +345,65 @@ String absolute_lexical(const char *base, const char *rel) {
     return out;
 }
 // Make a relative local remote URL/pushurl absolute the way Git itself would reach it: through
-// the filesystem, so a symlink component before a ".." segment lands where Git actually resolves
-// it (which `absolute_lexical`'s lexical collapse of ".." cannot see) -- e.g. `link/../up.git`
-// with `link` a symlink to elsewhere resolves through that symlink, not lexically against `root`.
-// If the joined path exists, `fs_realpath` resolves it exactly as Git would. If it does not exist
-// (the remote was never fetched into the source, or names a path only `git push` would create),
-// there is no filesystem to resolve a ".." component through; refuse rather than guess, unless
-// the relative path has no ".." component at all, in which case symlinks cannot change its
-// meaning and the plain lexical join is exact. Used only for a relative local remote URL
-// (`is_relative_local_url`); other relative settings this file carries (e.g. hooksPath) still use
-// `absolute_lexical` directly.
+// the filesystem, so a symlink component before a ".." segment (or before the part of the path
+// that does not exist yet) lands where Git actually resolves it, which `absolute_lexical`'s
+// lexical collapse cannot see -- e.g. `link/../up.git` with `link` a symlink to elsewhere
+// resolves through that symlink, not lexically against `root`, and so does `link/new.git` when
+// `new.git` does not exist yet but `link` does.
+//
+// If the whole joined path exists, `fs_realpath` resolves it exactly as Git would. If it does
+// not (the remote was never fetched into the source, or names a path only `git push` would
+// create), resolve the LONGEST EXISTING PREFIX of `rel` through the filesystem instead and join
+// the missing tail onto that real path lexically: everything up to the missing tail is real, so
+// any symlink in it is honored, and only the part with nothing on disk to resolve it through is
+// taken literally. Refuse rather than guess when that missing tail itself contains a ".."
+// component (there is no filesystem left to resolve it through) or when the first missing
+// component exists per `lstat` as a symlink (a dangling one -- `realpath` fails on it, but Git
+// would still follow it to wherever its target names, which cannot be told from here). If even
+// `root` fails to resolve (should not happen), fall back to the old lexical join. Used only for
+// a relative local remote URL (`is_relative_local_url`); other relative settings this file
+// carries (e.g. hooksPath) still use `absolute_lexical` directly.
 int absolutize_remote_path(const char *root, const char *rel, String &out) {
     String joined = joinp(root, rel);
     String real;
     if (fs_realpath(joined.c_str(), real) == 0) { out = real; return 0; }
-    bool has_dotdot = false;
-    for (const char *p = rel; *p && !has_dotdot;) {
+
+    Vec<String> parts;
+    for (const char *p = rel; *p;) {
         while (*p == '/') ++p;
         const char *start = p;
         while (*p && *p != '/') ++p;
-        has_dotdot = (size_t)(p - start) == 2 && start[0] == '.' && start[1] == '.';
+        if (p != start) parts.emplace_back(start, (size_t)(p - start));
     }
-    if (has_dotdot)
-        return refuse(WFS_E_GIT_POLICY,
-            "relative remote path %s does not exist, so how its '..' resolves cannot be "
-            "preserved; make the remote URL absolute before importing",
-            rel);
+    size_t n = parts.size();
+    Vec<String> prefixes;                 // prefixes[i] = root joined with parts[0..i-1]
+    prefixes.emplace_back(root);
+    for (size_t i = 0; i < n; ++i) prefixes.emplace_back(joinp(prefixes[i].c_str(), parts[i].c_str()));
+
+    for (size_t k = n; k-- > 0;) {
+        String preal;
+        if (fs_realpath(prefixes[k].c_str(), preal) != 0) continue;   // not the longest prefix
+        for (size_t i = k; i < n; ++i) {
+            if (parts[i] == "..")
+                return refuse(WFS_E_GIT_POLICY,
+                    "relative remote path %s does not exist, so how its '..' resolves cannot be "
+                    "preserved; make the remote URL absolute before importing",
+                    rel);
+        }
+        struct stat st;
+        if (::lstat(prefixes[k + 1].c_str(), &st) == 0 && S_ISLNK(st.st_mode))
+            return refuse(WFS_E_GIT_POLICY,
+                "relative remote path %s passes through dangling symlink %s, so where it "
+                "resolves cannot be preserved; make the remote URL absolute before importing",
+                rel, prefixes[k + 1].c_str());
+        out = preal;
+        for (size_t i = k; i < n; ++i) {
+            if (parts[i] == ".") continue;
+            if (out.empty() || out.c_str()[out.size() - 1] != '/') out.append("/");
+            out.append(parts[i].c_str());
+        }
+        return 0;
+    }
     out = absolute_lexical(root, rel);
     return 0;
 }
