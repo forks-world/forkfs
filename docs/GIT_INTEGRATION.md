@@ -97,11 +97,16 @@ pushurl in the World even when it resolves to the same URL as the pinned fetch U
 never falls back to a remote's (possibly rewritten) fetch URL once it has an explicit pushurl,
 and leaving it implicit would expose it to a `pushInsteadOf` rule active at the World's own
 location. A remote that has only a `pushurl` and no `url` at all -- which Git supports -- is
-pinned the same way, from its effective push URL alone. A remote whose `url` or `pushurl` is
-also set in global, system, or command (`GIT_CONFIG_*`/`-c`) configuration is refused instead
-of carried: the World reads that same ambient configuration, so pinning the ambient value on
-top would duplicate the URL and could contact a push URL twice; keep a carried remote's URLs
-in the repository-local configuration only.
+pinned the same way, from its effective push URL alone. A remote is one unit: if any of its
+repository-local settings are carried -- not only `url`/`pushurl`, but also `fetch`, `push`,
+`tagopt`, `prune`, and the other subsectioned `remote.<name>.*` settings this section
+carries -- and that same remote's `url` or `pushurl` is also set in global, system, or command
+(`GIT_CONFIG_*`/`-c`) configuration, the import is refused, even if the remote has no
+repository-local `url`/`pushurl` of its own and its only URL is the shared one: the World
+reads that same ambient configuration, so pinning the ambient value on top would duplicate the
+URL, could contact a push URL twice, or (via the rewrite pass above) send the World to a
+different endpoint than the source actually reaches. Keep all of a carried remote's settings,
+including its URLs, in the repository-local configuration only.
 Settings Git
 runs on its own are not carried: hooks and `core.hooksPath`, `remote.<name>.uploadpack`,
 `receivepack` and `vcs`, `branch.<name>.mergeOptions`, `core.sshCommand` and credential

@@ -1746,8 +1746,46 @@ class GitWorldTest(unittest.TestCase):
         self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
         result = self.world('init', str(self.source), code=3)
         self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
-        self.assertIn(b'also has url in global configuration', result.stderr)
+        self.assertIn(b'remote origin has url in global configuration', result.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_carried_remote_with_only_ambient_url_is_refused(self):
+        # A remote can be established locally by a carried key other than url/pushurl -- here,
+        # remote.origin.fetch is local but remote.origin.url only exists in global
+        # configuration. A remote is one unit: since this remote has a carried repository-local
+        # setting at all, its URL must also come only from repository-local configuration, even
+        # though there is no local url/pushurl to pin against. Without this, the World would
+        # contact the raw ambient URL while the source, under a source-location includeIf rule,
+        # might contact a rewritten one.
+        self.git(self.source, 'remote', 'add', 'origin', 'https://example.invalid/x.git')
+        self.git(self.source, 'config', '--unset', 'remote.origin.url')
+        self.git(self.source, 'config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*')
+        # Sanity: only .fetch is local now, no url/pushurl.
+        self.assertEqual(self.git(self.source, 'config', '--local', '--get-regexp',
+                                   '^remote\\.origin\\.').stdout.strip(),
+                          b'remote.origin.fetch +refs/heads/*:refs/remotes/origin/*')
+        global_config = self.root / 'remote-fetch-only-global'
+        global_config.write_text('[remote "origin"]\n url = https://global.invalid/x.git\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        result = self.world('init', str(self.source), code=3)
+        self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+        self.assertIn(b'remote origin has url in global configuration', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_ambient_url_for_unrelated_remote_is_carried_normally(self):
+        # A remote name with no carried repository-local settings at all is unaffected by the
+        # ambient-URL refusal: only a remote that itself has carried repository-local settings
+        # must keep its URL local too.
+        self.git(self.source, 'remote', 'add', 'origin', 'https://example.invalid/x.git')
+        global_config = self.root / 'remote-unrelated-global'
+        global_config.write_text('[remote "other"]\n url = https://global.invalid/other.git\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        self.world('init', str(self.source))
+        self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'config', '--get', 'remote.origin.url').stdout.strip(),
+                          b'https://example.invalid/x.git')
 
     def test_remote_change_during_mirror_aborts_publication(self):
         import shlex

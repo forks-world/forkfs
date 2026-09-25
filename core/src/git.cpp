@@ -598,11 +598,28 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
         }
         out.emplace_back(GitSetting{key, val});
     }
-    // A carried remote's URLs must live only in the repository-local configuration the loop
-    // above just read: the World reads the same global/system/command configuration the source
-    // does, so a remote.<name>.url or .pushurl also set there would be visible to the World too.
-    // Pinning the ambient value on top would then duplicate the URL (fetch would try both, and a
-    // push URL could be contacted twice); refuse instead of guessing which one should win.
+    // A remote is one unit: if any of its repository-local settings are carried (a subsectioned
+    // remote.<name>.<var> key from kCarriedConfig above, e.g. .fetch or .prune -- not a
+    // section-wide key like remote.pushDefault, which has no <name>), its url/pushurl must also
+    // come only from that same repository-local configuration. The World reads the same
+    // global/system/command configuration the source does, so a remote.<name>.url or .pushurl
+    // set there would be visible to the World too -- duplicating the URL (fetch would try both,
+    // and a push URL could be contacted twice) even when no local url/pushurl exists to pin
+    // against, or contacting a different, source-only rewritten endpoint (see the includeIf
+    // rewrite pass above) than the one the World would reach. Refuse instead of guessing which
+    // one should win.
+    Vec<String> carried_remote_names;
+    for (const auto &s : out) {
+        const char *key = s.key.c_str();
+        if (strncmp(key, "remote.", 7)) continue;
+        const char *rest = key + 7;
+        const char *last_dot = strrchr(rest, '.');
+        if (!last_dot) continue; // section-wide key (e.g. remote.pushDefault): no <name>
+        String name(rest, (size_t)(last_dot - rest));
+        bool seen = false;
+        for (const auto &n : carried_remote_names) if (n == name) { seen = true; break; }
+        if (!seen) carried_remote_names.emplace_back(name);
+    }
     {
         Vec<char> scoped; int scope_status = -1;
         const char *scope_args[] = {"config", "--includes", "--null", "--show-scope", "--get-regexp",
@@ -625,11 +642,12 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
             if (!is_url && !is_pushurl) continue;
             String name(key.c_str() + 7, klen - 7 - (is_url ? 4 : 8));
             bool carried = false;
-            for (const auto &r : remotes) if (r.name == name) { carried = true; break; }
+            for (const auto &n : carried_remote_names) if (n == name) { carried = true; break; }
             if (!carried) continue;
             return refuse(WFS_E_GIT_POLICY,
-                "remote %s also has %s in %s configuration, which the World shares; keep a "
-                "remote's URLs in one place before importing",
+                "remote %s has %s in %s configuration, which the World shares, while its other "
+                "settings are carried from the repository; keep all of a remote's settings in "
+                "one place before importing",
                 name.c_str(), is_url ? "url" : "pushurl", scope);
         }
     }
