@@ -65,7 +65,12 @@ it records the fetch and push URLs Git actually uses for that remote at the sour
 World reaches the same endpoints wherever it is placed. A pinned URL that another rule would
 rewrite again is refused, since the World would then resolve it differently than the source
 does; simplify the rewrite rules before importing. A conditional rule that only applies at the
-World's own location applies there, exactly as it would for any repository placed there.
+World's own location applies there, exactly as it would for any repository placed there. A
+remote that had an explicit `remote.<name>.pushurl` at the source keeps an explicit pinned
+pushurl in the World even when it resolves to the same URL as the pinned fetch URL, since Git
+never falls back to a remote's (possibly rewritten) fetch URL once it has an explicit pushurl,
+and leaving it implicit would expose it to a `pushInsteadOf` rule active at the World's own
+location.
 Settings Git
 runs on its own are not carried: hooks and `core.hooksPath`, `remote.<name>.uploadpack`,
 `receivepack` and `vcs`, `branch.<name>.mergeOptions`, `core.sshCommand` and credential
@@ -90,7 +95,10 @@ merged, and nothing is pushed anywhere. The World's path is canonicalized before
 as the fetch operand (and to detect a `url.*.insteadOf` rewrite of it), so a relative World
 path resolves the same way for this check as it does for the fetch itself, regardless of the
 target repository's own directory. The default repository is found by following the
-World back through world forks and checkpoints to the directory `init` imported. Without
+World back through world forks and checkpoints to the directory `init` imported. The target
+must be a distinct repository: the World's own working tree, and any other repository that
+shares the World's own private common Git directory -- including `.world-git/repo.git` itself
+or a linked worktree of it -- are refused as a publish target. Without
 `--force`, publishing refuses a branch that is checked out in the target, an update that is
 not a fast-forward, and a repository that shares no history with the World. A detached World
 needs `--branch`. Uncommitted World changes are not published; the command says so.

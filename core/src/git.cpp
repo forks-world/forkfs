@@ -417,7 +417,8 @@ int scan_conditional_includes(const char *root, bool *sets_identity, Vec<UrlRewr
 // lands in `out`, kept only long enough for the pinning pass below to decide whether a rewrite
 // rule changes that remote's effective URL and, if so, to substitute it in. `pin_urls`, once set,
 // is what gets substituted for the remote's url entries; `pin_pushurls`, when also set, is added
-// as its pushurl entries.
+// as its pushurl entries -- always, when the remote had an explicit pushurl in the source, so it
+// stays explicit at the World rather than falling back to the (possibly rewritten) url entries.
 struct RemoteRewriteInfo {
     String name;
     Vec<String> raw_urls, raw_pushurls;
@@ -538,31 +539,38 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
             const char *push_args[] = {"remote", "get-url", "--push", "--all", info.name.c_str(), nullptr};
             if (int grc = git_lines(root, push_args, effective_push)) return grc;
         }
-        const Vec<String> &raw_push = info.raw_pushurls.empty() ? info.raw_urls : info.raw_pushurls;
+        bool has_explicit_pushurl = !info.raw_pushurls.empty();
+        const Vec<String> &raw_push = has_explicit_pushurl ? info.raw_pushurls : info.raw_urls;
         if (effective_fetch == info.raw_urls && effective_push == raw_push)
             continue; // no rewrite applies; leave this remote as captured above
         // A rewrite applies: pin the source's result. An effective URL that is itself a relative
         // local path is only possible when no rule rewrote it; absolutize it exactly as above.
         for (auto &u : effective_fetch) if (is_relative_local_url(u.c_str())) u = absolute_lexical(root, u.c_str());
         bool same = effective_fetch == effective_push;
-        if (!same) for (auto &u : effective_push) if (is_relative_local_url(u.c_str())) u = absolute_lexical(root, u.c_str());
+        // A pushurl is pinned whenever the effective push differs from the effective fetch, and
+        // also whenever the remote had an explicit remote.<name>.pushurl in the source: Git never
+        // falls back to a remote's (possibly rewritten) url entries once it has an explicit
+        // pushurl, so leaving the pushurl unpinned here would make it implicit again at the World
+        // and expose it to a pushInsteadOf rule active at the World's own location.
+        bool pin_push = has_explicit_pushurl || !same;
+        if (pin_push) for (auto &u : effective_push) if (is_relative_local_url(u.c_str())) u = absolute_lexical(root, u.c_str());
         // Chain guard: a pinned URL must not be rewritten again by a rule active in the source's
         // ambient configuration (not one reachable only through a conditional include -- see
         // `ambient_rules` above), or the World would resolve it differently than the source does.
-        // A pushInsteadOf rule is checked against a pinned fetch URL only when no pushurl is
+        // A pushInsteadOf rule is checked against a pinned fetch URL only when no pushurl will be
         // pinned for this remote, the same as Git only ever applies pushInsteadOf to
         // remote.<name>.url when there is no explicit pushurl.
         for (const auto &u : effective_fetch) {
             for (const auto &r : ambient_rules) {
                 if (r.prefix.empty() || strncmp(u.c_str(), r.prefix.c_str(), r.prefix.size())) continue;
-                if (r.push && !same) continue;
+                if (r.push && pin_push) continue;
                 return refuse(WFS_E_GIT_POLICY,
                     "remote %s resolves to %s, which url.%s.%s would rewrite again; simplify the "
                     "URL rewrite rules before importing",
                     info.name.c_str(), u.c_str(), r.base.c_str(), r.push ? "pushInsteadOf" : "insteadOf");
             }
         }
-        if (!same) {
+        if (pin_push) {
             for (const auto &u : effective_push) {
                 for (const auto &r : ambient_rules) {
                     if (r.push || r.prefix.empty() || strncmp(u.c_str(), r.prefix.c_str(), r.prefix.size())) continue;
@@ -574,7 +582,7 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
             }
         }
         info.pin_urls = std::move(effective_fetch);
-        if (!same) info.pin_pushurls = std::move(effective_push);
+        if (pin_push) info.pin_pushurls = std::move(effective_push);
     }
     bool any_pinned = false;
     for (const auto &info : remotes) if (!info.pin_urls.empty()) { any_pinned = true; break; }
@@ -1882,6 +1890,24 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
     if (fs_realpath(world_root, world_real)) return refuse(WFS_E_GIT_TARGET, "%s does not exist", world_root);
     if (world_real == repo_real)
         return refuse(WFS_E_GIT_TARGET, "the target repository is the World itself");
+    // The target may be a distinct worktree of, or a bare path naming, the World's own private
+    // repository (for instance <world>/.world-git/repo.git) rather than the World's own working
+    // tree -- same common Git directory, different top-level path -- which the check above does
+    // not catch. Compare canonical common directories instead to refuse that too.
+    {
+        String target_common;
+        const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
+        if (value(repo, common_args, target_common))
+            return refuse(WFS_E_GIT_TARGET, "%s is not a Git repository", repo);
+        String target_common_real;
+        if (fs_realpath(target_common.c_str(), target_common_real))
+            return refuse(WFS_E_GIT_TARGET, "%s does not exist", target_common.c_str());
+        String world_common_real;
+        if (int wrc = fs_realpath(info.git_dir, world_common_real)) return wrc;
+        if (target_common_real == world_common_real)
+            return refuse(WFS_E_GIT_TARGET, "the target repository is the World's own repository (%s)",
+                target_common_real.c_str());
+    }
     // A symbolic destination would be dereferenced by the update and move whatever it points
     // at (a checked-out main, a ref outside refs/heads); publish writes plain branches only.
     {

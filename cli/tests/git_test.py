@@ -1312,6 +1312,26 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'would rewrite again', result.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
+    def test_pinned_remote_keeps_explicit_pushurl(self):
+        # An explicit pushurl must stay explicit once pinned: Git never falls back to a remote's
+        # (possibly rewritten) url entries once it has an explicit pushurl, so leaving it
+        # implicit here would expose it to a pushInsteadOf rule active at the World's own
+        # location.
+        self.git(self.source, 'config', 'url.ssh://same.invalid/.insteadOf', 'https://example.invalid/')
+        self.git(self.source, 'remote', 'add', 'origin', 'https://example.invalid/proj.git')
+        self.git(self.source, 'config', 'remote.origin.pushurl', 'https://example.invalid/proj.git')
+        # Sanity: insteadOf rewrites both the fetch and the explicit push URL here, so they agree
+        # at the source even though the pushurl was set explicitly.
+        self.assertEqual(self.git(self.source, 'remote', 'get-url', 'origin').stdout.strip(),
+                          b'ssh://same.invalid/proj.git')
+        self.assertEqual(self.git(self.source, 'remote', 'get-url', '--push', 'origin').stdout.strip(),
+                          b'ssh://same.invalid/proj.git')
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'config', '--get-all', 'remote.origin.pushurl').stdout.strip(),
+                          b'ssh://same.invalid/proj.git')
+
     def test_remote_change_during_mirror_aborts_publication(self):
         import shlex
         self.git(self.source, 'remote', 'add', 'origin', 'https://example.invalid/before.git')
@@ -1502,6 +1522,15 @@ class GitWorldTest(unittest.TestCase):
         result = self.world('publish', wid, code=3)
         self.assertIn(b"url.*.insteadOf rewrites the World's path", result.stderr)
         self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
+
+    def test_publish_refuses_the_worlds_own_repository(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'world change')
+        result = self.world('publish', wid, '--repo', str(one / '.world-git' / 'repo.git'),
+                             '--branch', 'elsewhere', code=3)
+        self.assertIn(b"the target repository is the World's own repository", result.stderr)
+        self.git(one, 'rev-parse', '--verify', '-q', 'refs/heads/elsewhere', code=1)
 
     def test_publish_refuses_a_world_whose_tree_was_replaced(self):
         self.world('init', str(self.source))
