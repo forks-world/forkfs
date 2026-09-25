@@ -121,6 +121,12 @@ do: a symlinked or otherwise foreign `.world-git` (or anything beneath it) is re
 the World's repository is used for anything else, so a replaced administration cannot have
 another repository's commits published in the World's name.
 
+Import refuses `.world` or `.world-git` tracked anywhere in the history it preserves, but a
+user can force-add and commit one of those reserved paths afterwards. Publish repeats that
+check against the commit being published: if it, or any commit reachable from it, tracks
+`.world` or `.world-git`, publish refuses and nothing is fetched into the target, even if a
+later clean commit on top no longer has the path in its tree.
+
 It is an ordinary `git fetch` into that repository followed by one compare-and-swap ref
 update: the checkout, index, working tree and other branches are not touched, nothing is
 merged, and nothing is pushed anywhere. The World's path is canonicalized before it is used

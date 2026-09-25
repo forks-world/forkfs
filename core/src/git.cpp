@@ -2156,6 +2156,26 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
         if ((rc = value(world_root, common_args, common)) || (rc = value(world_root, admin_args, admin))) return rc;
         if ((rc = managed_check(world_root, common.c_str(), admin.c_str()))) return rc;
     }
+    // Import guarantees the preserved history is clean (reject_reserved_paths), so a commit that
+    // tracks .world or .world-git can only have been made afterwards, by force-adding a reserved
+    // path and committing it. info.head is the commit wfs_git_inspect just inspected; the later
+    // `now == info.head` check refuses if the fetch's live branch moved to anything else, so
+    // checking info.head here (rather than the live branch, which could move again before that
+    // check runs) is enough to cover whatever is actually published. --full-history walks every
+    // commit reachable from info.head, not only ones added since import, because the target must
+    // not receive these paths through any commit being published -- a later clean commit on top
+    // does not clear an earlier one out of history. Same pathspecs/flags as reject_reserved_paths.
+    // Run before the staging ref is created, so a refusal here needs no cleanup.
+    {
+        const char *reserved_args[] = {"--no-replace-objects", "rev-list", "-n", "1", "--full-history",
+            info.head, "--", ":(top,literal).world", ":(top,literal).world-git", nullptr};
+        Vec<char> hit;
+        if (int rc = git(world_root, reserved_args, &hit)) return rc;
+        if (hit.size() > 1)
+            return refuse(WFS_E_GIT_TARGET,
+                "the World's commit %s or its history tracks the reserved path .world or .world-git; remove it from history before publishing",
+                info.head);
+    }
     if (!branch || !*branch) {
         if (!info.branch[0])
             return refuse(WFS_E_GIT_TARGET, "the World's HEAD is detached; name the branch to create with --branch");

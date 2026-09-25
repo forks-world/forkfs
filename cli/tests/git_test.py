@@ -1957,6 +1957,39 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(self.source, 'rev-parse', 'from-checkpoint').stdout.strip(),
                          self.git(two, 'rev-parse', 'HEAD').stdout.strip())
 
+    def test_publish_refuses_a_world_marker_force_added_after_import(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        # Import only checks history it is about to preserve; force-adding and committing the
+        # World's own marker file afterwards is the only way to get a reserved path into a
+        # World's history in the first place, and publish must catch it too.
+        self.git(one, 'add', '-f', '.world')
+        self.git(one, '-c', 'user.name=Leo', '-c', 'user.email=leo@clapdb.com',
+                 'commit', '-qm', 'force-add the World marker')
+        result = self.world('publish', wid, code=3)
+        self.assertIn(b'tracks the reserved path .world or .world-git', result.stderr)
+        self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
+        self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs').stdout, b'')
+
+    def test_publish_refuses_world_git_content_even_after_a_later_clean_commit(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        (one / '.world-git' / 'extra').write_text('smuggled\n')
+        self.git(one, 'add', '-f', '.world-git/extra')
+        self.git(one, '-c', 'user.name=Leo', '-c', 'user.email=leo@clapdb.com',
+                 'commit', '-qm', 'force-add a file under .world-git')
+        # A later, clean commit that removes the path again must not clear it from history:
+        # publish walks every commit reachable from the tip, not just its tree.
+        self.git(one, 'rm', '-q', '--cached', '.world-git/extra')
+        (one / '.world-git' / 'extra').unlink()
+        self.git(one, '-c', 'user.name=Leo', '-c', 'user.email=leo@clapdb.com',
+                 'commit', '-qm', 'untrack it again')
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        result = self.world('publish', wid, code=3)
+        self.assertIn(b'tracks the reserved path .world or .world-git', result.stderr)
+        self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
+        self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs').stdout, b'')
+
     def test_fetch_head_only_tip_survives_source_deletion(self):
         remote = self.root / 'fetch-remote'
         remote.mkdir()
