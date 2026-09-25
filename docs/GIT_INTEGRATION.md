@@ -343,7 +343,9 @@ What cannot be shared is refused with a Git configuration error that names the r
 - A filter that tracked files actually use (for example Git LFS), from any scope. A filter
   that is only defined, such as the one a machine-wide `git lfs install` adds, is fine in a
   repository whose files do not use it; so is a `filter=` attribute whose driver is not
-  defined anywhere. Filters are never executed by the import.
+  defined anywhere. With `--committed-only`, the files and attributes of HEAD count too, so
+  a filter HEAD assigns is refused even when uncommitted edits remove the assignment. Filters
+  are never executed by the import.
 - A conditional `includeIf` whose target sets status or filter settings, in any scope and
   whether or not it is active at the source: the condition (a `gitdir:` pattern, a branch)
   can evaluate differently at the World's location. The same is refused for a target that

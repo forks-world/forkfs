@@ -308,6 +308,24 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual((self.source / 'config.local').read_text(), 'private edit\n')
         self.assertEqual((self.source / '.git' / 'index').read_bytes(), index)
 
+    def test_committed_only_checks_head_filters_before_resetting_the_copy(self):
+        # HEAD assigns a filter; the dirty source removes the assignment, so only the reset to
+        # HEAD would check the file out through it.
+        marker = self.root / 'head-filter-ran'
+        (self.source / '.gitattributes').write_text('*.bin filter=example\n')
+        (self.source / 'model.bin').write_text('weights\n')
+        self.git(self.source, 'add', '.')
+        self.git(self.source, 'commit', '-qm', 'model')
+        global_config = self.root / 'filter-global'
+        global_config.write_text('[filter "example"]\n smudge = touch ' + str(marker) + '; cat\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        (self.source / '.gitattributes').write_text('')
+        (self.source / 'model.bin').write_text('edited weights\n')
+        result = self.world('init', str(self.source), '--committed-only', code=3)
+        self.assertIn(b"reason: tracked file model.bin uses the 'example' filter", result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_committed_only_snapshot_records_only_hardlinks_it_still_has(self):
         for name in ('a', 'b', 'c', 'd'):
             (self.source / name).write_text('shared\n')

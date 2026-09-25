@@ -1141,31 +1141,8 @@ int scan_conditional_includes(const char *root, bool *sets_identity, Vec<UrlRewr
     }
     return 0;
 }
-// Tracked files whose `filter` attribute names a defined driver (Git LFS, git-crypt, ...) would
-// have that driver executed by status in the source and in the World; WorldFS neither runs nor
-// reproduces it. A driver that is defined but unused (a machine-wide `git lfs install` in a
-// repository without LFS files) or used but undefined (pointer files as plain content) is fine.
-int reject_used_filters(const char *root) {
-    const char *defined_args[] = {"config", "--null", "--name-only", "--get-regexp", "^filter\\.", nullptr};
-    Vec<char> defined; int status = -1;
-    int rc = git(root, defined_args, &defined, &status, false, true);
-    if (rc == WFS_E_GIT_FAILED && status == 1) return 0; // no driver anywhere: nothing can run
-    if (rc) return rc;
-    Vec<char> paths;
-    const char *ls_args[] = {"ls-files", "-z", nullptr};
-    if ((rc = git(root, ls_args, &paths))) return rc;
-    if (paths.size() <= 1) return 0;
-    FILE *input = tmpfile();
-    if (!input) return -errno;
-    if (fwrite(paths.data(), 1, paths.size() - 1, input) != paths.size() - 1 || fflush(input)) {
-        int err = errno ? -errno : -EIO; fclose(input); return err;
-    }
-    rewind(input);
-    const char *attr_args[] = {"check-attr", "--stdin", "-z", "filter", nullptr};
-    Vec<char> attrs;
-    rc = git(root, attr_args, &attrs, nullptr, false, true, fileno(input));
-    fclose(input);
-    if (rc) return rc;
+// Refuses a `check-attr filter` result that assigns any path a defined driver.
+int reject_filter_attrs(const Vec<char> &attrs, const Vec<char> &defined) {
     // Triples "<path>\0filter\0<value>\0".
     for (size_t i = 0; i < attrs.size() && attrs[i];) {
         const char *path = attrs.data() + i; i += strlen(path) + 1;
@@ -1186,6 +1163,43 @@ int reject_used_filters(const char *root) {
             if (!strcmp(field, "clean") || !strcmp(field, "smudge") || !strcmp(field, "process"))
                 return refuse(WFS_E_GIT_POLICY, "tracked file %s uses the '%s' filter (e.g. Git LFS), which WorldFS does not run", path, driver);
         }
+    }
+    return 0;
+}
+// Tracked files whose `filter` attribute names a defined driver (Git LFS, git-crypt, ...) would
+// have that driver executed by status in the source and in the World; WorldFS neither runs nor
+// reproduces it. A driver that is defined but unused (a machine-wide `git lfs install` in a
+// repository without LFS files) or used but undefined (pointer files as plain content) is fine.
+// With `tree` (HEAD before --committed-only resets the copy), the paths are the tree's and each
+// is checked both against the tree's own attributes -- what checking the tree out reads, once
+// it is the index -- and against the worktree's, which checkout still falls back to.
+int reject_used_filters(const char *root, const char *tree = nullptr) {
+    const char *defined_args[] = {"config", "--null", "--name-only", "--get-regexp", "^filter\\.", nullptr};
+    Vec<char> defined; int status = -1;
+    int rc = git(root, defined_args, &defined, &status, false, true);
+    if (rc == WFS_E_GIT_FAILED && status == 1) return 0; // no driver anywhere: nothing can run
+    if (rc) return rc;
+    Vec<char> paths;
+    const char *ls_args[] = {"ls-files", "-z", nullptr};
+    const char *tree_args[] = {"ls-tree", "-r", "-z", "--name-only", "--full-tree", tree, nullptr};
+    if ((rc = git(root, tree ? tree_args : ls_args, &paths))) return rc;
+    if (paths.size() <= 1) return 0;
+    String source("--source=");
+    if (tree) source.append(tree);
+    for (int pass = 0; pass < (tree ? 2 : 1); ++pass) {
+        FILE *input = tmpfile();
+        if (!input) return -errno;
+        if (fwrite(paths.data(), 1, paths.size() - 1, input) != paths.size() - 1 || fflush(input)) {
+            int err = errno ? -errno : -EIO; fclose(input); return err;
+        }
+        rewind(input);
+        const char *attr_args[] = {"check-attr", "--stdin", "-z", "filter", nullptr};
+        const char *tree_attr_args[] = {"check-attr", source.c_str(), "--stdin", "-z", "filter", nullptr};
+        Vec<char> attrs;
+        rc = git(root, pass ? tree_attr_args : attr_args, &attrs, nullptr, false, true, fileno(input));
+        fclose(input);
+        if (rc) return rc;
+        if ((rc = reject_filter_attrs(attrs, defined))) return rc;
     }
     return 0;
 }
@@ -1618,9 +1632,14 @@ int require_clean_tree(const char *root) {
 // artifacts and the reserved administration; `read-tree --reset -u` then puts back modified and
 // deleted tracked files and drops files that were only staged. They run with the user's ambient
 // configuration, like the clean check, so "ignored" and "clean" mean what the user's Git says.
-// No filter can run: reject_used_filters refused any that tracked files use, and hooks are off.
+// No filter can run, and hooks are off. The source-side check saw only the source's worktree and
+// index attributes, which a dirty `.gitattributes` can differ from HEAD's, so filter use is
+// checked here first, before the refresh (which cleans stat-dirty files) or the reset (which
+// checks HEAD out), against the copy's index and worktree and against HEAD.
 // SQUASH_MSG describes staged content that no longer exists, so it goes too.
 int reset_to_head(const char *clone) {
+    if (int rc = reject_used_filters(clone)) return rc;
+    if (int rc = reject_used_filters(clone, "HEAD")) return rc;
     // skip-worktree and assume-unchanged entries are invisible to status and left alone by
     // read-tree, so their worktree bytes would survive the reset. Clear both marks in the
     // copy's index first (`ls-files -v`: 'S'/'s' is skip-worktree, a lower-case tag is
