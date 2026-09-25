@@ -1177,7 +1177,7 @@ class GitWorldTest(unittest.TestCase):
         self.git(self.source, 'config', 'alias.st', 'status --short')
         # A valueless boolean is true to Git and must stay true.
         with open(self.source / '.git' / 'config', 'a') as config:
-            config.write('[remote "origin"]\n\tprune\n')
+            config.write('[remote "origin"]\n\tprune\n[branch "main"]\n\tdescription\n')
         # Settings Git would execute on its own are not carried.
         self.git(self.source, 'config', 'remote.origin.uploadpack', 'touch uploadpack-ran; git-upload-pack')
         self.git(self.source, 'config', 'core.hooksPath', '.husky')
@@ -1196,6 +1196,8 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(get('--get', 'url.https://mirror.invalid/.insteadof'), ['https://slow.invalid/'])
         self.assertEqual(get('--type=bool', '--get', 'push.autosetupremote'), ['true'])
         self.assertEqual(get('--type=bool', '--get', 'remote.origin.prune'), ['true'])
+        # A valueless string setting stays empty rather than becoming "true".
+        self.assertEqual(get('--get', 'branch.main.description'), [''])
         self.assertEqual(self.git(one, 'st').stdout, b'')
         for key in ('remote.origin.uploadpack', 'core.hooksPath', 'branch.main.mergeoptions'):
             self.git(one, 'config', '--get', key, code=1)
@@ -1383,6 +1385,19 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'alias is a symbolic ref in the target repository', result.stderr)
         self.assertEqual(self.git(self.source, 'rev-parse', 'main').stdout.strip(), self.base)
         self.assertEqual(self.git(self.source, 'symbolic-ref', 'refs/heads/alias').stdout.strip(), b'refs/heads/main')
+
+    def test_publish_refuses_url_rewrites_of_the_world_path(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'world change')
+        decoy = self.root / 'decoy'
+        self.git(self.root, 'clone', '-q', str(self.source), str(decoy))
+        self.git(decoy, 'checkout', '-q', '-b', 'world/W1')
+        self.git(decoy, '-c', 'user.name=D', '-c', 'user.email=d@example.com', 'commit', '-q', '--allow-empty', '-m', 'decoy')
+        self.git(self.source, 'config', 'url.' + str(decoy) + '.insteadOf', str(one))
+        result = self.world('publish', wid, code=3)
+        self.assertIn(b"url.*.insteadOf rewrites the World's path", result.stderr)
+        self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
 
     def test_publish_follows_checkpoints_back_to_the_source(self):
         self.world('init', str(self.source))

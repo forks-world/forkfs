@@ -340,6 +340,14 @@ String absolute_lexical(const char *base, const char *rel) {
     if (out.empty()) out.assign("/");
     return out;
 }
+bool is_carried_boolean(const char *key) {
+    size_t n = strlen(key);
+    auto ends = [&](const char *suffix) { size_t m = strlen(suffix); return n > m && !strcmp(key + n - m, suffix); };
+    if (!strncmp(key, "remote.", 7))
+        return ends(".prune") || ends(".prunetags") || ends(".mirror") || ends(".skipdefaultupdate") || ends(".skipfetchall");
+    if (!strncmp(key, "branch.", 7)) return ends(".rebase");
+    return !strcmp(key, "push.autosetupremote") || !strcmp(key, "fetch.prune") || !strcmp(key, "fetch.prunetags");
+}
 bool is_relative_local_url(const char *url) {
     if (!*url || url[0] == '/' || url[0] == '~' || strstr(url, "://")) return false;
     const char *colon = strchr(url, ':'), *slash = strchr(url, '/');
@@ -359,9 +367,11 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
         size_t len = strlen(entry);
         i += len + 1;
         const char *nl = strchr(entry, '\n');
-        // A valueless entry (`[remote "o"] prune`) is a boolean true to Git; written back as an
-        // empty value it would read as false, so it is carried as "true".
-        String key(entry, nl ? (size_t)(nl - entry) : len), val(nl ? nl + 1 : "true");
+        // A valueless entry of a boolean key (`[remote "o"] prune`) is true to Git; written back
+        // as an empty value it would read as false, so it is carried as "true". A valueless
+        // string key (a URL, a description, an alias) stays an empty value.
+        String key(entry, nl ? (size_t)(nl - entry) : len), val(nl ? nl + 1 : "");
+        if (!nl && is_carried_boolean(key.c_str())) val.assign("true");
         size_t klen = key.size();
         bool url = !strncmp(key.c_str(), "remote.", 7) &&
                    ((klen > 4 && !strcmp(key.c_str() + klen - 4, ".url")) ||
@@ -1647,6 +1657,16 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
         const char *probe[] = {"rev-parse", "--verify", "--quiet", staging, nullptr};
         if (int prc = value(repo, probe, existing, true)) return prc;
         if (!existing.empty()) return -EEXIST;
+    }
+    // The target's url.<base>.insteadOf rules apply to the fetch's repository operand: one that
+    // matches the World's path would fetch the same-named branch from somewhere else. Ask Git
+    // what it would actually contact, and refuse unless that is the World itself.
+    {
+        String effective;
+        const char *get_url[] = {"ls-remote", "--get-url", world_root, nullptr};
+        if (int urc = value(repo, get_url, effective)) return urc;
+        if (effective != world_root)
+            return refuse(WFS_E_GIT_TARGET, "the target repository's url.*.insteadOf rewrites the World's path to %s", effective.c_str());
     }
     String source_ref;
     if (info.branch[0]) { source_ref.assign("refs/heads/"); source_ref.append(info.branch); }
