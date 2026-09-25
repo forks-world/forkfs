@@ -1965,6 +1965,17 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
     wfs_git_info info;
     if (int rc = wfs_git_inspect(world_root, &info)) return rc;
     if (!info.present) return refuse(WFS_E_GIT_UNSUPPORTED, "the World has no WorldFS-managed Git repository");
+    // Same protection as fork/checkpoint: a symlinked or foreign administration must not be
+    // published as this World. wfs_git_inspect only follows the fixed .git marker; it does not
+    // validate that .world-git and everything beneath it are still the World's own.
+    {
+        String common, admin;
+        const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
+        const char *admin_args[] = {"rev-parse", "--absolute-git-dir", nullptr};
+        int rc;
+        if ((rc = value(world_root, common_args, common)) || (rc = value(world_root, admin_args, admin))) return rc;
+        if ((rc = managed_check(world_root, common.c_str(), admin.c_str()))) return rc;
+    }
     if (!branch || !*branch) {
         if (!info.branch[0])
             return refuse(WFS_E_GIT_TARGET, "the World's HEAD is detached; name the branch to create with --branch");

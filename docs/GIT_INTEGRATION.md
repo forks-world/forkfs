@@ -98,6 +98,11 @@ world fs publish W1 --repo ~/src/other-clone # another clone of the same project
 git -C ~/src/project merge world/W1          # merging stays a Git decision
 ```
 
+Publish first validates the World's own Git administration the same way fork and checkpoint
+do: a symlinked or otherwise foreign `.world-git` (or anything beneath it) is refused before
+the World's repository is used for anything else, so a replaced administration cannot have
+another repository's commits published in the World's name.
+
 It is an ordinary `git fetch` into that repository followed by one compare-and-swap ref
 update: the checkout, index, working tree and other branches are not touched, nothing is
 merged, and nothing is pushed anywhere. The World's path is canonicalized before it is used

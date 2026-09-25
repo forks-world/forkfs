@@ -1714,6 +1714,26 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b"does not carry W1's .world marker", result.stderr)
         self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
 
+    def test_publish_refuses_a_symlinked_world_administration(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'world change')
+        # A symlinked administration could otherwise point publish at another repository's
+        # history (a decoy sharing this project's history, with its own world/W1 branch)
+        # rather than refusing outright. Even when the symlink target is a faithful copy of
+        # the World's own .world-git, fork/checkpoint's managed_check refuses any symlink in
+        # the owned administration, including at its root.
+        decoy = self.root / 'decoy'
+        self.git(self.root, 'clone', '-q', str(self.source), str(decoy))
+        self.git(decoy, 'checkout', '-q', '-b', 'world/W1')
+        self.git(decoy, '-c', 'user.name=D', '-c', 'user.email=d@example.com', 'commit', '-q', '--allow-empty', '-m', 'decoy')
+        moved = self.root / 'moved-admin'
+        shutil.move(str(one / '.world-git'), str(moved))
+        (one / '.world-git').symlink_to(moved)
+        result = self.world('publish', wid, code=3)
+        self.assertIn(b"the World's Git administration contains a symlink", result.stderr)
+        self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
+
     def test_publish_removes_the_staging_ref_when_fetch_fails_late(self):
         import shlex
         self.world('init', str(self.source))
