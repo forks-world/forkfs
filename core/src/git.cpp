@@ -587,6 +587,16 @@ int scan_include_target(const char *root, const char *path, const char *directiv
 int scan_conditional_includes(const char *root, bool *sets_identity);
 int reject_ambient_policy(const char *root) {
     if (getenv("GIT_ATTR_SOURCE")) return refuse(WFS_E_GIT_POLICY, "GIT_ATTR_SOURCE is set in the environment");
+    // GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM are forwarded to every ambient-config probe below
+    // (ambient_config_probe=true), but a relative path is resolved from each command's -C
+    // directory: the source and a copy sitting elsewhere could load different files entirely.
+    for (const char *name : {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"}) {
+        const char *value = getenv(name);
+        if (value && *value && (value[0] != '/'))
+            return refuse(WFS_E_GIT_POLICY,
+                "%s is a relative path (%s), which Git resolves per repository; use an absolute path",
+                name, value);
+    }
     Vec<char> listing; int status = -1;
     {
         String pattern("^(");
@@ -1346,8 +1356,14 @@ int git_import(const GitSource &s, const char *clone) {
         if (int rc = reject_copied_locks(clone)) return rc;
         if (int rc = pin_identity(s.root.c_str(), clone)) return rc;
         // HEAD and the index do not change when a tracked file is edited after the source's
-        // clean check, so check the copy that will actually be published.
-        return s.require_clean ? require_clean_tree(clone) : 0;
+        // clean check, so check the copy that will actually be published. Re-probe the copy's
+        // own ambient policy and filters first: GIT_CONFIG_GLOBAL/SYSTEM and other per-directory
+        // configuration can resolve differently beside the copy than beside the source, and the
+        // clean check below would otherwise run a filter the source-side probe never saw.
+        if (!s.require_clean) return 0;
+        if (int rc = reject_ambient_policy(clone)) return rc;
+        if (int rc = reject_used_filters(clone)) return rc;
+        return require_clean_tree(clone);
     }
     String owned = joinp(clone, ".world-git");
     if (int rc = fs_mkdir(owned.c_str(), 0700)) return rc;
@@ -1462,7 +1478,13 @@ int git_import(const GitSource &s, const char *clone) {
     if (int rc = pin_identity(s.root.c_str(), clone)) return rc;
     // The owned repository now carries the source's index and status settings, so this sees the
     // bytes that will be published, including edits made after the source's own clean check.
-    return s.require_clean ? require_clean_tree(clone) : 0;
+    // Re-probe ambient policy and filters beside the copy first, for the same reason as above:
+    // a relative GIT_CONFIG_GLOBAL/SYSTEM (or other per-directory configuration) can resolve to
+    // a different file next to the copy than it did next to the source.
+    if (!s.require_clean) return 0;
+    if (int rc = reject_ambient_policy(clone)) return rc;
+    if (int rc = reject_used_filters(clone)) return rc;
+    return require_clean_tree(clone);
 }
 
 int git_discard_check(const char *root) {

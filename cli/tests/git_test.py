@@ -661,6 +661,19 @@ class GitWorldTest(unittest.TestCase):
         self.git(self.source, 'config', 'filter.x.clean', 'cat')
         self.world('init', str(self.source))
 
+    def test_relative_git_config_environment_is_refused(self):
+        for name in ('GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM'):
+            with self.subTest(name=name):
+                self.env[name] = '../policy'
+                if name == 'GIT_CONFIG_SYSTEM':
+                    self.env['GIT_CONFIG_NOSYSTEM'] = '0'
+                result = self.world('init', str(self.source), code=3)
+                self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+                self.env.pop('GIT_CONFIG_SYSTEM', None)
+                self.env['GIT_CONFIG_NOSYSTEM'] = '1'
+                self.assertIn(b'is a relative path (../policy)', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_used_ambient_filter_is_refused_without_execution(self):
         global_config = self.root / 'filter-global'
         global_config.write_text('[filter "example"]\n clean = touch ambient-filter-ran; cat\n')
