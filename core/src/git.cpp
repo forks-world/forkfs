@@ -312,7 +312,9 @@ int capture_settings(const char *root, Vec<GitSetting> &out) {
 // source. Settings Git executes on its own -- hooks, remote.*.uploadpack/receivepack/vcs,
 // branch.*.mergeoptions, core.sshCommand, credential helpers -- are not carried. A relative
 // local remote path is made absolute against the source, so it keeps pointing at the same
-// repository after the source is gone.
+// repository after the source is gone -- unless a url.<base>.insteadOf/pushInsteadOf rule
+// rewrites it, in which case the value is kept as written so the (carried or ambient) rule
+// still matches it in the World the way it did in the source.
 const char *const kCarriedConfig =
     "^(remote\\..+\\.(url|pushurl|fetch|push|tagopt|prune|prunetags|mirror|skipdefaultupdate|skipfetchall|followremotehead)"
     "|remotes\\..+|remote\\.pushdefault"
@@ -356,6 +358,28 @@ bool is_relative_local_url(const char *url) {
 }
 int capture_carried_config(const char *root, Vec<GitSetting> &out) {
     out.clear();
+    // Every url.<base>.insteadOf/pushInsteadOf prefix the user's own Git would apply, from every
+    // scope it reads (ambient_config_probe=true covers global/system too, not just what this
+    // repository carries): a relative local remote URL one of these matches is resolved through
+    // the rule, not through the filesystem, so absolutizing it below would point the World at the
+    // wrong place and break the rewrite.
+    Vec<String> rewrite_prefixes;
+    {
+        const char *rw_args[] = {"config", "--includes", "--null", "--get-regexp",
+            "^url\\..*\\.(insteadof|pushinsteadof)$", nullptr};
+        Vec<char> rewrites; int rw_status = -1;
+        int rw_rc = git(root, rw_args, &rewrites, &rw_status, false, true);
+        if (rw_rc && !(rw_rc == WFS_E_GIT_FAILED && rw_status == 1)) return rw_rc;
+        if (!rw_rc) {
+            for (size_t i = 0; i < rewrites.size() && rewrites[i];) {
+                const char *entry = rewrites.data() + i;
+                size_t len = strlen(entry);
+                i += len + 1;
+                const char *nl = strchr(entry, '\n');
+                if (nl && *(nl + 1)) rewrite_prefixes.emplace_back(nl + 1);
+            }
+        }
+    }
     const char *args[] = {"config", "--local", "--includes", "--null", "--get-regexp", kCarriedConfig, nullptr};
     Vec<char> listing; int status = -1;
     int rc = git(root, args, &listing, &status);
@@ -376,7 +400,12 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
         bool url = !strncmp(key.c_str(), "remote.", 7) &&
                    ((klen > 4 && !strcmp(key.c_str() + klen - 4, ".url")) ||
                     (klen > 8 && !strcmp(key.c_str() + klen - 8, ".pushurl")));
-        if (url && is_relative_local_url(val.c_str())) val = absolute_lexical(root, val.c_str());
+        if (url && is_relative_local_url(val.c_str())) {
+            bool rewritten = false;
+            for (const auto &prefix : rewrite_prefixes)
+                if (!strncmp(val.c_str(), prefix.c_str(), prefix.size())) { rewritten = true; break; }
+            if (!rewritten) val = absolute_lexical(root, val.c_str());
+        }
         out.emplace_back(GitSetting{key, val});
     }
     return 0;

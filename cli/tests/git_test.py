@@ -1228,6 +1228,25 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(one, 'rev-parse', 'refs/remotes/up/main').stdout.strip(), self.base)
         self.assertFalse((one / 'uploadpack-ran').exists())
 
+    def test_rewritten_relative_remote_url_is_kept(self):
+        self.git(self.source, 'remote', 'add', 'origin', '../up.git')
+        self.git(self.source, 'config', 'url.ssh://example.invalid/.insteadOf', '../')
+        self.git(self.source, 'remote', 'add', 'pushy', '../push.git')
+        self.git(self.source, 'config', 'url.ssh://push.invalid/.pushInsteadOf', '../pu')
+        # An unmatched relative remote is still absolutized.
+        self.git(self.source, 'remote', 'add', 'plain', './plain.git')
+        self.assertEqual(self.git(self.source, 'ls-remote', '--get-url', 'origin').stdout.decode().strip(),
+                         'ssh://example.invalid/up.git')
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'config', '--get', 'remote.origin.url').stdout.decode().strip(), '../up.git')
+        self.assertEqual(self.git(one, 'ls-remote', '--get-url', 'origin').stdout.decode().strip(),
+                         'ssh://example.invalid/up.git')
+        self.assertEqual(self.git(one, 'config', '--get', 'remote.pushy.url').stdout.decode().strip(), '../push.git')
+        self.assertEqual(self.git(one, 'config', '--get', 'remote.plain.url').stdout.decode().strip(),
+                         str(self.source / 'plain.git'))
+
     def test_remote_change_during_mirror_aborts_publication(self):
         import shlex
         self.git(self.source, 'remote', 'add', 'origin', 'https://example.invalid/before.git')

@@ -55,7 +55,9 @@ fetch and push refspecs, tag and prune options, remote groups, branch upstreams
 `git fetch origin` and `git push origin <branch>` therefore work in a World as in the
 source; nothing is fetched or pushed automatically, and the World's own `world/W<n>` branch
 starts without an upstream. A relative local remote path is made absolute against the
-source, so it keeps reaching the same repository after the source is deleted. Settings Git
+source, so it keeps reaching the same repository after the source is deleted -- unless a
+`url.<base>.insteadOf`/`pushInsteadOf` rule rewrites it, in which case it is kept as written
+so the rule still applies. Settings Git
 runs on its own are not carried: hooks and `core.hooksPath`, `remote.<name>.uploadpack`,
 `receivepack` and `vcs`, `branch.<name>.mergeOptions`, `core.sshCommand` and credential
 helpers (a global credential helper still applies). These settings are rechecked before
