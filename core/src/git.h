@@ -38,6 +38,9 @@ struct GitSource {
     Vec<char> effective_config;
     bool worktree_config = false;
     Vec<GitSetting> worktree_settings;
+    // External sources: the repository-local remotes, upstream tracking, URL rewrites, push
+    // defaults and aliases that travel into the owned repository (capture_carried_config).
+    Vec<GitSetting> carried;
     // user.name / user.email as the source defines them (present ones only, possibly empty).
     Vec<GitSetting> identity;
     Vec<char> refs;

@@ -1413,7 +1413,11 @@ extern "C" const char *wfs_strerror(int rc) {
     case WFS_E_GIT_POOL:
         return "Git snapshots use the ordinary fork path; run world fs fork without filling a pool";
     case WFS_E_GIT_UNSUPPORTED:
-        return "unsupported Git layout (requires committed, full repository; no nested repositories, submodules, sparse/split indexes or alternates)";
+        return "unsupported Git layout";
+    case WFS_E_GIT_TARGET:
+        return "the target repository cannot take this branch";
+    case WFS_E_GIT_POLICY:
+        return "Git configuration outside this repository would make the World's Git see files differently";
     case WFS_E_GIT_DIRTY:
         return "Git workspace has uncommitted changes; commit first or use --include-changes to carry staged, unstaged and untracked files";
     case WFS_E_GIT_FAILED:

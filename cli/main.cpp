@@ -57,6 +57,11 @@ static void usage(int code = EX_USAGE) {
           "                                   A snapshot is refused while an active world or a pool\n"
           "                                   entry still needs it; --force drains the pool\n"
           "  restore W<n>                     bring a trashed world back to its path\n"
+          "  publish W<n> [--repo <path>] [--branch <name>] [--force]\n"
+          "                                   copy a Git world's commits into the repository it\n"
+          "                                   was imported from (or --repo) as a branch, with\n"
+          "                                   git fetch; its checkout and other branches are not\n"
+          "                                   touched. --force allows a non-fast-forward update\n"
           "  gc [--retention <days>] [--now] [--status] [--reconcile]\n"
           "                                   collect half-built trees, stale profiles and dead pool\n"
           "                                   entries; the trash itself is emptied by a background\n"
@@ -133,6 +138,10 @@ static int is_refusal(int rc) { return rc <= -1001 && rc >= -1099; }
 
 static int fail(const char *what, int rc) {
     fprintf(stderr, "world: %s: %s\n", what, wfs_strerror(rc));
+    if (rc == WFS_E_GIT_UNSUPPORTED || rc == WFS_E_GIT_POLICY || rc == WFS_E_GIT_TARGET) {
+        const char *why = wfs_git_reason();
+        if (why && *why) fprintf(stderr, "  reason: %s\n", why);
+    }
     return is_refusal(rc) ? EX_REFUSED : EX_ERR;
 }
 
@@ -1165,6 +1174,97 @@ static int cmd_discard(wfs_store *s, int argc, char **argv) {
     return EX_OK;
 }
 
+// The directory a World's Git history was first imported from: follow world-to-world forks and
+// checkpoint snapshots back to the snapshot `init` took, whose source is that directory.
+static int publish_default_repo(wfs_store *s, wfs_id w, char *out, size_t cap) {
+    // No depth limit: the chain ends at the snapshot `init` took. Only a real cycle (a world
+    // seen twice) stops the walk early.
+    wfs_id *seen = nullptr;
+    size_t count = 0, room = 0;
+    int result = 0;
+    for (;;) {
+        bool again = false;
+        for (size_t i = 0; i < count; ++i) if (seen[i] == w) again = true;
+        if (again) { result = -ELOOP; break; }
+        if (count == room) {
+            room = room ? room * 2 : 16;
+            wfs_id *grown = (wfs_id *)realloc(seen, room * sizeof *seen);
+            if (!grown) { result = -ENOMEM; break; }
+            seen = grown;
+        }
+        seen[count++] = w;
+        wfs_world_rec r;
+        if (int rc = wfs_world_info(s, w, &r)) { result = rc; break; }
+        if (r.origin == WFS_O_WORLD && r.parent_world) { w = r.parent_world; continue; }
+        if (r.origin != WFS_O_SNAPSHOT || !r.snapshot_id) { result = -ENOENT; break; }
+        wfs_snapshot_rec snap;
+        if (int rc = wfs_snapshot_info(s, r.snapshot_id, &snap)) { result = rc; break; }
+        if (snap.from_world) { w = snap.from_world; continue; }
+        snprintf(out, cap, "%s", snap.src_path);
+        break;
+    }
+    free(seen);
+    return result;
+}
+
+static int cmd_publish(wfs_store *s, int argc, char **argv) {
+    const char *target = nullptr, *repo = nullptr, *branch = nullptr;
+    int force = 0;
+    for (int i = 0; i < argc; ++i) {
+        if (!strcmp(argv[i], "--repo") && i + 1 < argc) repo = argv[++i];
+        else if (!strcmp(argv[i], "--branch") && i + 1 < argc) branch = argv[++i];
+        else if (!strcmp(argv[i], "--force")) force = 1;
+        else if (argv[i][0] == '-' || target) { usage(); return EX_USAGE; }
+        else target = argv[i];
+    }
+    if (!target) { usage(); return EX_USAGE; }
+    wfs_id w = parse_world(target);
+    wfs_world_rec r;
+    if (int rc = wfs_world_info(s, w, &r)) return fail("publish", rc);
+    if (r.state != WFS_ST_ACTIVE || !r.present) {
+        char why[96];
+        snprintf(why, sizeof why, "W%llu is not a live world at its recorded path", (unsigned long long)w);
+        return refuse(why, "world fs list");
+    }
+    // `present` only compares the directory inode; the tree in it could have been replaced by
+    // another World's contents (rsync --delete from a sibling). Publish only what the .world
+    // marker at that path says is this World.
+    {
+        wfs_identity id;
+        int vrc = wfs_world_verify(s, w, &id);
+        if (vrc || !id.registered || id.world_id != w) {
+            char why[160];
+            snprintf(why, sizeof why, "the tree at W%llu's path does not carry W%llu's .world marker",
+                     (unsigned long long)w, (unsigned long long)w);
+            return refuse(why, "world fs verify W<n>");
+        }
+    }
+    char default_repo[WFS_PATH_MAX];
+    if (!repo) {
+        int rc = publish_default_repo(s, w, default_repo, sizeof default_repo);
+        if (rc) {
+            char why[128];
+            snprintf(why, sizeof why, "cannot tell which repository W%llu was imported from", (unsigned long long)w);
+            return refuse(why, "world fs publish W<n> --repo <path>");
+        }
+        repo = default_repo;
+    }
+    wfs_git_publish_result out;
+    int rc = wfs_git_publish(r.path, repo, branch, force, &out);
+    if (rc) return fail("publish", rc);
+    const char *name = out.ref + strlen("refs/heads/");
+    if (!out.old_oid[0])
+        printf("W%llu -> %s: new branch %s at %.12s\n", (unsigned long long)w, repo, name, out.new_oid);
+    else if (!strcmp(out.old_oid, out.new_oid))
+        printf("W%llu -> %s: %s already at %.12s\n", (unsigned long long)w, repo, name, out.new_oid);
+    else
+        printf("W%llu -> %s: %s %.12s..%.12s\n", (unsigned long long)w, repo, name, out.old_oid, out.new_oid);
+    if (out.dirty)
+        fprintf(stderr, "world: note: W%llu has uncommitted changes; only its commits were published\n",
+                (unsigned long long)w);
+    return EX_OK;
+}
+
 static int cmd_restore(wfs_store *s, const char *arg) {
     wfs_id w = parse_world(arg);
     wfs_world_rec r;
@@ -2085,7 +2185,8 @@ int main(int argc, char **argv) {
         if (!strcmp(args[i], "--help") || !strcmp(args[i], "-h")) command_help = true;
         else if (!is_exec && (!strcmp(args[i], "--name") || !strcmp(args[i], "--to") ||
                               !strcmp(args[i], "--from") || !strcmp(args[i], "--retention") ||
-                              !strcmp(args[i], "--count")) && i + 1 < nargs) ++i;
+                              !strcmp(args[i], "--count") || !strcmp(args[i], "--repo") ||
+                              !strcmp(args[i], "--branch")) && i + 1 < nargs) ++i;
     }
     if (command_help) usage(EX_OK);
     if (!is_exec && (!strcmp(sub, "list") || !strcmp(sub, "inspect") ||
@@ -2288,6 +2389,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(sub, "inspect")) ret = (nargs == 1) ? cmd_inspect(s, args[0]) : (usage(), EX_USAGE);
     else if (!strcmp(sub, "discard")) ret = cmd_discard(s, nargs, args);
     else if (!strcmp(sub, "restore")) ret = (nargs == 1) ? cmd_restore(s, args[0]) : (usage(), EX_USAGE);
+    else if (!strcmp(sub, "publish")) ret = cmd_publish(s, nargs, args);
     else if (!strcmp(sub, "gc")) ret = cmd_gc(s, nargs, args);
     else if (!strcmp(sub, "pool")) ret = cmd_pool(s, nargs, args);
     else if (!strcmp(sub, "status")) ret = cmd_status(s);

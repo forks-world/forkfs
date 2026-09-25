@@ -43,9 +43,140 @@ by the World, including staged blobs which have not yet appeared in any commit.
 `info/exclude`; source-local `info/exclude` rules are preserved before those reserved entries
 are appended. Source-local `info/attributes` rules are also preserved. These are reserved
 administration names. Source hooks and local executable
-Git settings are not imported. Local `user.name` and `user.email` are preserved; normal Git
-commands in a World also use the user's usual Git configuration. Import does not create a
-remote back to the source. Fetching/pushing requires explicitly configuring a remote.
+Git settings are not imported. Local `user.name` and `user.email` are preserved, and so is an
+identity a conditional include supplies at the source's location; normal Git commands in a
+World also use the user's usual Git configuration. Import does not create a
+remote back to the source.
+
+The source's repository-local remotes travel into the World: remote URLs, push URLs,
+fetch and push refspecs, tag and prune options, remote groups, branch upstreams
+(`branch.<name>.remote`/`merge`/`pushRemote`/`rebase`), `url.<base>.insteadOf` rewrites,
+`remote.pushDefault`, `push.default`, `push.autoSetupRemote`, `fetch.prune` and aliases.
+`git fetch origin` and `git push origin <branch>` therefore work in a World as in the
+source; nothing is fetched or pushed automatically, and the World's own `world/W<n>` branch
+starts without an upstream. Any carried configuration for that exact branch name -- for
+example a stale `branch.world/W1.remote`/`merge` left behind by an earlier branch of that
+name, or configuration copied wholesale from a World this one was itself forked from -- is
+removed when the branch is created, so it cannot resurrect an upstream the World never had.
+A candidate name that ordinary Git would still read `branch.<name>.*` settings for from
+global or system configuration -- configuration this import cannot remove -- is skipped in
+favor of the next free suffix, the same way a colliding ref is.
+A relative local remote path is made absolute against the source, so it keeps reaching the
+same repository after the source is deleted. When the path exists, it is resolved through the
+filesystem the same way Git itself would reach it -- including through a symlink a `..`
+component in the path walks back out of -- rather than collapsed lexically, which a symlink
+could make point somewhere else. When the path does not exist in full (the remote was never
+fetched into the source, or names a path only `git push` would create), its longest existing
+prefix is resolved through the filesystem the same way, and whatever is still missing is
+joined onto that real path -- so a symlink earlier in the path (e.g. `link/new.git` with `link`
+a symlink elsewhere) still lands where Git would put it once the missing part exists. The
+missing part is refused instead of guessed, and the remote URL must be made absolute first,
+when it contains a `..` component (there is no filesystem left to resolve it through) or when
+its first missing component is itself a dangling symlink (one whose own target does not exist,
+so where Git would actually follow it cannot be told from here).
+A remote `url` or `pushurl` containing a line break (`\n` or `\r`) is refused outright, even
+though such a value is legal Git configuration for a local path: `git remote get-url` emits a
+remote's URLs newline-separated, so a URL that itself contains one could no longer be told apart
+from two separate URLs once carried; rename the path before importing.
+A relative remote URL that any `url.<base>.insteadOf` or `pushInsteadOf` rule matches is refused instead (make the
+URL absolute or remove the rule), because a rewrite of a relative path cannot be carried
+faithfully to a World in another location. When such a rule instead rewrites an absolute
+remote URL -- for example a per-account rule reached through a conditional include such as
+`includeIf "gitdir:~/work/"` -- the World does not carry the rewrite rule's effect raw:
+it records the fetch and push URLs Git actually uses for that remote at the source, so the
+World reaches the same endpoints wherever it is placed. Whichever URL a remote ends up carrying
+-- a pinned one, or (when no rewrite applies to that remote) its own raw, absolute URL, carried
+as-is -- is refused if any collected `insteadOf`/`pushInsteadOf` rule could still rewrite it,
+including one that lives in a conditional include inactive at the source: such a rule could
+become active once the World moves elsewhere and redirect a URL the source itself never
+rewrote, or redirect a pinned URL to somewhere other than what the source actually resolved.
+Simplify the rewrite rules before importing. A conditional rule that only applies at the
+World's own location applies there, exactly as it would for any repository placed there. A
+remote that had an explicit `remote.<name>.pushurl` at the source keeps an explicit pinned
+pushurl in the World even when it resolves to the same URL as the pinned fetch URL, since Git
+never falls back to a remote's (possibly rewritten) fetch URL once it has an explicit pushurl,
+and leaving it implicit would expose it to a `pushInsteadOf` rule active at the World's own
+location. A remote that has only a `pushurl` and no `url` at all -- which Git supports -- is
+pinned the same way, from its effective push URL alone. A remote is one unit: if any of its
+repository-local settings are carried -- not only `url`/`pushurl`, but also `fetch`, `push`,
+`tagopt`, `prune`, and the other subsectioned `remote.<name>.*` settings this section
+carries -- and that same remote's `url` or `pushurl` is also set in global, system, or command
+(`GIT_CONFIG_*`/`-c`) configuration, the import is refused, even if the remote has no
+repository-local `url`/`pushurl` of its own and its only URL is the shared one: the World
+reads that same ambient configuration, so pinning the ambient value on top would duplicate the
+URL, could contact a push URL twice, or (via the rewrite pass above) send the World to a
+different endpoint than the source actually reaches. Keep all of a carried remote's settings,
+including its URLs, in the repository-local configuration only.
+Settings Git
+runs on its own are not carried: hooks and `core.hooksPath`, `remote.<name>.uploadpack`,
+`receivepack` and `vcs`, `branch.<name>.mergeOptions`, `core.sshCommand` and credential
+helpers (a global credential helper still applies). These settings are rechecked before
+publication like the rest of the captured state.
+
+## Getting work back to the source
+
+`world fs publish W<n>` copies a Git World's commits into the repository the World was
+imported from, as a branch named like the World's (`world/W<n>`):
+
+```sh
+world fs publish W1                          # refs/heads/world/W1 in the source repository
+world fs publish W1 --branch feature/login   # choose the name
+world fs publish W1 --repo ~/src/other-clone # another clone of the same project
+git -C ~/src/project merge world/W1          # merging stays a Git decision
+```
+
+Publish first validates the World's own Git administration the same way fork and checkpoint
+do: a symlinked or otherwise foreign `.world-git` (or anything beneath it) is refused before
+the World's repository is used for anything else, so a replaced administration cannot have
+another repository's commits published in the World's name.
+
+Import refuses `.world` or `.world-git` tracked anywhere in the history it preserves, but a
+user can force-add and commit one of those reserved paths afterwards. Publish repeats that
+check against the commit being published: if it, or any commit reachable from it, tracks
+`.world` or `.world-git`, publish refuses and nothing is fetched into the target, even if a
+later clean commit on top no longer has the path in its tree. This is checked through both
+views of that history: the real commits and trees, ignoring any `refs/replace/*`, and again
+with replacement refs honored -- since an active replacement that the target repository
+carries identically (required by the replacement-ref compatibility check below) would
+otherwise let a reserved path reach the target through the replaced view alone, even though
+the raw scan sees only a safe tree.
+
+It is an ordinary `git fetch` into that repository followed by one compare-and-swap ref
+update: the checkout, index, working tree and other branches are not touched, nothing is
+merged, and nothing is pushed anywhere. The World's path is canonicalized before it is used
+as the fetch operand (and to detect a `url.*.insteadOf` rewrite of it), so a relative World
+path resolves the same way for this check as it does for the fetch itself, regardless of the
+target repository's own directory. The default repository is found by following the
+World back through world forks and checkpoints to the directory `init` imported. The target
+must be a distinct repository: the World's own working tree, and any other repository that
+shares the World's own private common Git directory -- including `.world-git/repo.git` itself
+or a linked worktree of it -- are refused as a publish target. Without
+`--force`, publishing refuses a branch that is checked out in the target, an update that is
+not a fast-forward, and a repository that shares no history with the World. A detached World
+needs `--branch`. Uncommitted World changes are not published; the command says so.
+Publishing re-checks the configuration policy first, so reading the World's status never
+runs a filter attached after the import. The branch update and the removal of the private
+staging ref are one ref transaction; if that final update fails instead -- for example
+another process moved the branch first -- the staging ref is still removed before publish
+reports the failure, so a failed publish never leaves one behind.
+
+Publish copies exactly the commit that was inspected: if the World's branch (or detached
+HEAD) advances between that inspection and the fetch the command runs, publish refuses
+rather than pick up the newer, uninspected commit, and nothing was changed. Whichever side --
+the World or the target repository -- has active, non-empty replacement refs
+(`refs/replace/*`, under the effective `core.useReplaceRefs` policy) requires the other side to
+carry identical ones, since a replacement changes what a commit's history and tree mean and the
+fetch transfers only the branch tip; otherwise publish refuses before touching the target. This
+comparison reads `core.useReplaceRefs` the way the user's own Git would -- including a global
+or system setting, not just each repository's local configuration -- so a shared, ambient
+`core.useReplaceRefs = false` disables the check in both repositories rather than making a
+dormant replacement in one of them look active. The target repository's own replacement refs,
+if any, are ignored when publish judges whether it shares history with the World and whether
+the update is a fast-forward -- those checks look at the target's real history. Before any of
+this, publish refuses if either the World or the target has legacy `info/grafts`: unlike
+`refs/replace/*`, grafts are not disabled by `--no-replace-objects` and rewrite a commit's
+parents outright, so one could make a diverged branch look like a fast-forward or shared
+history to the checks that follow.
 
 ## Uncommitted content
 
@@ -130,28 +261,61 @@ captured; boolean values are normalized without losing valueless true settings.
 Absent settings stay absent in the owned repository. The policy is checked again
 before publication along with the source index and local rules.
 
-Effective repository `filter.*` definitions are rejected before status inspection.
-Arbitrary configuration, executable conversions, hooks, and external policy paths
-are not imported. A configuration-only probe reads global and system configuration
-key names, including active includes. Status-policy keys listed above, external
-attributes/ignore overrides, and filter definitions in those scopes are rejected
-before deciding cleanliness, even with `--include-changes`. This avoids silently
-changing the user's normal Git status semantics. The probe does not execute
-filters or copy configuration values; other import Git commands continue to
-disable global and system configuration. Identity-only global configuration is
-allowed and remains available to ordinary Git commands in the World.
-Conditional `includeIf` directives are unsupported in any scope, even when
-inactive at capture: moving a World or switching branches can activate policies
-that were not visible before publication. Unconditional includes remain supported; when a
-World is forked or checkpointed, the copy's whole effective configuration must match the
-source World's, so a relative include that resolves to different content at the new
-location (hooks, identity or any other setting) makes the operation fail.
-`GIT_ATTR_SOURCE` in the environment and `attr.tree` in any configuration scope are
-refused as well: they make the user's Git read attributes from a tree-ish that import
-commands and the World would not use.
-The same policy rejection covers command configuration injected through
-`GIT_CONFIG_COUNT` and `GIT_CONFIG_PARAMETERS`. Only the read-only probe receives
-those variables; normal import commands continue to discard them. Mirror imports
+Global and system configuration is shared: a World's Git reads the same `~/.gitconfig`
+and system file as the source's. Settings that come from them unconditionally (a global
+ignore file via `core.excludesFile`, `core.attributesFile`, `core.autocrlf` and the other
+status settings above) therefore mean the same thing on both sides, and cleanliness is
+decided with them, exactly as the user's own `git status` decides it. The shared files are
+whichever ones the import's environment names: `~/.gitconfig`/XDG and the system file by
+default, or an absolute `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` (or `GIT_CONFIG_NOSYSTEM`)
+when the environment sets one. A World is meant to be used under that same configuration;
+an override set for one import command only is not recorded in the World, so identity or
+status settings that came only from it are not carried, and a later command run without it
+behaves as the user's own Git would without it, while an effective remote URL it rewrote
+stays pinned as imported, the same as any other `insteadOf` rewrite (above). To carry
+settings independent of the environment, put them in the source repository's own
+configuration, which the import does capture. Other import Git commands still disable
+global and system configuration.
+
+What cannot be shared is refused with a Git configuration error that names the reason:
+
+- A filter that tracked files actually use (for example Git LFS), from any scope. A filter
+  that is only defined, such as the one a machine-wide `git lfs install` adds, is fine in a
+  repository whose files do not use it; so is a `filter=` attribute whose driver is not
+  defined anywhere. Filters are never executed by the import.
+- A conditional `includeIf` whose target sets status or filter settings, in any scope and
+  whether or not it is active at the source: the condition (a `gitdir:` pattern, a branch)
+  can evaluate differently at the World's location. The same is refused for a target that
+  sets per-remote or per-branch settings (`remote.<name>.*`, `branch.<name>.*`), since a
+  condition inactive at the source but active at the World's location could otherwise add a
+  URL to a carried remote or an upstream to the World's generated branch once the World is
+  in place; section-wide settings without a name, such as `remote.pushDefault` or
+  `branch.autoSetupMerge`, are unaffected. Conditional includes that set other things,
+  typically a work identity, are allowed. When any conditional include sets `user.name` or
+  `user.email`, the identity the source resolves is written into the World's own
+  configuration (an identity the source lacks is written as an explicit empty value), so the
+  World's commits carry the source's author wherever the World is placed.
+- A relative `core.excludesFile` or `core.attributesFile` in global or system
+  configuration: Git resolves it from each repository's location, so the source and a
+  World could read different files. Use an absolute or `~/` path.
+- A relative `GIT_CONFIG_GLOBAL` or `GIT_CONFIG_SYSTEM` in the environment: Git resolves
+  it per repository too, so it can name a different file beside the source than beside a
+  World. Use an absolute path.
+- Status settings, URL rewrites (`url.<base>.insteadOf`/`pushInsteadOf`) or per-remote or
+  per-branch settings (`remote.<name>.*`, `branch.<name>.*`) given as command configuration
+  (`GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, `-c`): they belong to one invocation only, and
+  would otherwise be recorded permanently in the World (for example a rewritten remote URL
+  pinned as if it were the source's actual configuration).
+- `GIT_ATTR_SOURCE` in the environment and `attr.tree` in any scope: they make the user's
+  Git read attributes from a tree-ish instead of the worktree.
+
+Unconditional includes remain supported; when a World is forked or checkpointed, the copy's
+whole effective repository configuration must match the source World's, so a relative
+include that resolves to different content at the new location (hooks, identity or any
+other setting) makes the operation fail.
+Other refusals report `unsupported Git layout` followed by a `reason:` line naming the
+specific cause (for example `reftable ref storage` or `nested Git repository or submodule`).
+Mirror imports
 use an empty template directory so installed Git templates cannot add hooks or rules.
 
 ### External reference restrictions
