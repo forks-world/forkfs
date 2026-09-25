@@ -1873,6 +1873,15 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
             int trc = git(root, type_args, &type, &tstatus, true);
             if (trc || strcmp(type.data(), "tree\n"))
                 return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s is not committed, so --committed-only would leave the hooks out; commit it or drop --committed-only", hp.c_str());
+            // The directory being in HEAD is not enough: a hook inside it that is staged,
+            // untracked or modified would be reset away just the same.
+            String scope(":(top,literal)"); scope.append(hp.c_str());
+            const char *st_args[] = {"status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=no",
+                                     "--", scope.c_str(), nullptr};
+            Vec<char> pending;
+            if (int src = git(root, st_args, &pending, nullptr, false, true)) return src;
+            if (pending.size() > 1)
+                return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s has uncommitted changes, which --committed-only would drop; commit them or drop --committed-only", hp.c_str());
         }
     }
     if (out.managed) {

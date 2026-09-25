@@ -482,6 +482,11 @@ class GitWorldTest(unittest.TestCase):
                 result = self.world('init', str(self.source), '--committed-only', '--with-hooks', code=3)
                 self.assertIn(b'core.hooksPath .husky is not committed', result.stderr)
         self.git(self.source, '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'husky')
+        # A committed directory with an uncommitted hook inside is refused too.
+        self.write_hook(self.source / '.husky' / 'commit-msg', marker, 'late')
+        result = self.world('init', str(self.source), '--committed-only', '--with-hooks', code=3)
+        self.assertIn(b'core.hooksPath .husky has uncommitted changes', result.stderr)
+        (self.source / '.husky' / 'commit-msg').unlink()
         snapshot = self.world('init', str(self.source), '--committed-only', '--with-hooks').stdout.split()[0].decode()
         one, _ = self.fork('one', snapshot)
         self.commit_in(one, 'husky runs')
