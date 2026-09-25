@@ -419,9 +419,12 @@ const UrlRewriteRule *longest_rewrite(const Vec<UrlRewriteRule> &rules, bool pus
 int scan_conditional_includes(const char *root, bool *sets_identity, Vec<UrlRewriteRule> *rewrites = nullptr);
 int capture_carried_config(const char *root, Vec<GitSetting> &out) {
     out.clear();
-    // Every url.<base>.insteadOf/pushInsteadOf rule the user's own Git would apply, from every
-    // scope it reads (ambient_config_probe=true covers global/system too, not just what this
-    // repository carries, and follows a conditional include whose condition currently holds).
+    // Every url.<base>.insteadOf/pushInsteadOf rule that could apply to a relative remote URL:
+    // first every rule the user's own Git would actually apply here, from every scope it reads
+    // (ambient_config_probe=true covers global/system too, not just what this repository
+    // carries, and follows a conditional include whose condition currently holds at the source),
+    // then -- below -- every rule reached only through a conditional include, active here or
+    // not, since one that is inactive at the source may become active once the World moves.
     Vec<UrlRewriteRule> rules;
     {
         const char *rw_args[] = {"config", "--includes", "--null", "--get-regexp",
@@ -432,15 +435,22 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
         if (!rc) parse_rewrite_listing(listing, false, rules);
     }
     // Every rule defined inside any conditional include's target, active or not (unlike the
-    // probe above, which only sees an active one): a rule found there marks the matching entry
-    // above as `conditional`, since the include's condition need not hold at the World's
-    // eventual location the way it does at the source's.
+    // probe above, which only sees one whose condition currently holds at the source): a rule
+    // found there marks a matching entry above as `conditional`, since the include's condition
+    // need not hold at the World's eventual location the way it does at the source's. One that
+    // matches no entry above (its include is inactive at the source) is appended instead, still
+    // marked `conditional`: it is inactive here, but may become active once the World moves, and
+    // longest_rewrite must weigh it against the active rules to decide whether it is the one
+    // that would apply to a given URL.
     {
         Vec<UrlRewriteRule> conditional_rules;
         if (int rc = scan_conditional_includes(root, nullptr, &conditional_rules)) return rc;
-        for (auto &r : rules)
-            for (const auto &c : conditional_rules)
-                if (c.push == r.push && c.base == r.base && c.prefix == r.prefix) { r.conditional = true; break; }
+        for (const auto &c : conditional_rules) {
+            bool matched = false;
+            for (auto &r : rules)
+                if (c.push == r.push && c.base == r.base && c.prefix == r.prefix) { r.conditional = true; matched = true; break; }
+            if (!matched) rules.emplace_back(c);
+        }
     }
     const char *args[] = {"config", "--local", "--includes", "--null", "--get-regexp", kCarriedConfig, nullptr};
     Vec<char> listing; int status = -1;

@@ -1281,6 +1281,21 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'from a conditional include', result.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
+    def test_inactive_conditional_rewrite_of_relative_remote_is_refused(self):
+        # The includeIf condition does not hold at the source (self.source is not under
+        # self.root/'elsewhere'), so the rule is inactive here -- but it may become active once
+        # the World moves, so a relative URL it would match is still refused.
+        included = self.root / 'inactive-conditional-rewrite'
+        included.write_text('[url "ssh://cond.invalid/"]\n insteadOf = ../\n')
+        global_config = self.root / 'inactive-conditional-rewrite-global'
+        global_config.write_text('[includeIf "gitdir:' + str(self.root / 'elsewhere') + '/"]\n path = ' + str(included) + '\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        self.git(self.source, 'remote', 'add', 'origin', '../up.git')
+        result = self.world('init', str(self.source), code=3)
+        self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+        self.assertIn(b'from a conditional include', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_remote_change_during_mirror_aborts_publication(self):
         import shlex
         self.git(self.source, 'remote', 'add', 'origin', 'https://example.invalid/before.git')
