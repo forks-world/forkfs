@@ -70,7 +70,11 @@ remote that had an explicit `remote.<name>.pushurl` at the source keeps an expli
 pushurl in the World even when it resolves to the same URL as the pinned fetch URL, since Git
 never falls back to a remote's (possibly rewritten) fetch URL once it has an explicit pushurl,
 and leaving it implicit would expose it to a `pushInsteadOf` rule active at the World's own
-location.
+location. A remote whose `url` or `pushurl` is also set in global, system, or command
+(`GIT_CONFIG_*`/`-c`) configuration is refused instead of carried: the World reads that same
+ambient configuration, so pinning the ambient value on top would duplicate the URL and could
+contact a push URL twice; keep a carried remote's URLs in the repository-local configuration
+only.
 Settings Git
 runs on its own are not carried: hooks and `core.hooksPath`, `remote.<name>.uploadpack`,
 `receivepack` and `vcs`, `branch.<name>.mergeOptions`, `core.sshCommand` and credential
@@ -110,14 +114,14 @@ reports the failure, so a failed publish never leaves one behind.
 
 Publish copies exactly the commit that was inspected: if the World's branch (or detached
 HEAD) advances between that inspection and the fetch the command runs, publish refuses
-rather than pick up the newer, uninspected commit, and nothing was changed. A World that
-uses replacement refs (`refs/replace/*`) can only publish to a repository that carries
-identical replacement refs under the same `core.useReplaceRefs` policy, since a replacement
-changes what a commit's history and tree mean and the fetch transfers only the branch tip;
-otherwise publish refuses before touching the target. The target repository's own
-replacement refs, if any, are ignored when publish judges whether it shares history with
-the World and whether the update is a fast-forward -- those checks look at the target's real
-history.
+rather than pick up the newer, uninspected commit, and nothing was changed. Whichever side --
+the World or the target repository -- has active, non-empty replacement refs
+(`refs/replace/*`, under the effective `core.useReplaceRefs` policy) requires the other side to
+carry identical ones, since a replacement changes what a commit's history and tree mean and the
+fetch transfers only the branch tip; otherwise publish refuses before touching the target. The
+target repository's own replacement refs, if any, are ignored when publish judges whether it
+shares history with the World and whether the update is a fast-forward -- those checks look at
+the target's real history.
 
 ## Uncommitted content
 

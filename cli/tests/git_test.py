@@ -664,6 +664,24 @@ class GitWorldTest(unittest.TestCase):
         self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
         self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs').stdout, b'')
 
+    def test_publish_refuses_target_only_replacement_refs(self):
+        # The check must be symmetric: a replacement active only in the target (the World has
+        # none) would show the published branch through the target's own replacement too.
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'world change')
+        self.git(self.source, 'checkout', '-q', '-b', 'replacement')
+        (self.source / 'file').write_text('replacement tree\n')
+        self.git(self.source, 'commit', '-qam', 'replacement')
+        replacement = self.git(self.source, 'rev-parse', 'HEAD').stdout.strip().decode()
+        self.git(self.source, 'checkout', '-q', 'main')
+        self.git(self.source, 'branch', '-q', '-D', 'replacement')
+        self.git(self.source, 'replace', self.base.decode(), replacement)
+        result = self.world('publish', wid, code=3)
+        self.assertIn(b'identical replacement refs', result.stderr)
+        self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
+        self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs').stdout, b'')
+
     def test_conditional_include_paths_expand_tilde_forms(self):
         import pwd
         user = pwd.getpwuid(os.getuid()).pw_name
@@ -1373,6 +1391,20 @@ class GitWorldTest(unittest.TestCase):
         one, _ = self.fork()
         self.assertEqual(self.git(one, 'config', '--get-all', 'remote.origin.pushurl').stdout.strip(),
                           b'ssh://same.invalid/proj.git')
+
+    def test_remote_urls_in_ambient_configuration_are_refused(self):
+        # A carried remote's URL must live only in the repository-local configuration the loop
+        # captures: the World reads the same global/system configuration the source does, so a
+        # remote.<name>.url also set there would be visible to the World too, and pinning the
+        # ambient value on top would duplicate it.
+        self.git(self.source, 'remote', 'add', 'origin', 'https://example.invalid/x.git')
+        global_config = self.root / 'remote-ambient-global'
+        global_config.write_text('[remote "origin"]\n url = https://global.invalid/x.git\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        result = self.world('init', str(self.source), code=3)
+        self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+        self.assertIn(b'also has url in global configuration', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
     def test_remote_change_during_mirror_aborts_publication(self):
         import shlex

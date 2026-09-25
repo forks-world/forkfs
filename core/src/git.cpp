@@ -519,6 +519,41 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
         }
         out.emplace_back(GitSetting{key, val});
     }
+    // A carried remote's URLs must live only in the repository-local configuration the loop
+    // above just read: the World reads the same global/system/command configuration the source
+    // does, so a remote.<name>.url or .pushurl also set there would be visible to the World too.
+    // Pinning the ambient value on top would then duplicate the URL (fetch would try both, and a
+    // push URL could be contacted twice); refuse instead of guessing which one should win.
+    {
+        Vec<char> scoped; int scope_status = -1;
+        const char *scope_args[] = {"config", "--includes", "--null", "--show-scope", "--get-regexp",
+            "^remote\\..*\\.(url|pushurl)$", nullptr};
+        int scope_rc = git(root, scope_args, &scoped, &scope_status, false, true);
+        if (scope_rc && !(scope_rc == WFS_E_GIT_FAILED && scope_status == 1)) return scope_rc;
+        // Entries are "<scope>\0<key>\n<value>\0".
+        for (size_t i = 0; !scope_rc && i < scoped.size() && scoped[i];) {
+            const char *scope = scoped.data() + i;
+            i += strlen(scope) + 1;
+            if (i >= scoped.size()) return WFS_E_GIT_FAILED;
+            const char *entry = scoped.data() + i;
+            i += strlen(entry) + 1;
+            if (!strcmp(scope, "local") || !strcmp(scope, "worktree")) continue;
+            const char *nl = strchr(entry, '\n');
+            String key(entry, nl ? (size_t)(nl - entry) : strlen(entry));
+            size_t klen = key.size();
+            bool is_url = klen > 4 && !strcmp(key.c_str() + klen - 4, ".url");
+            bool is_pushurl = klen > 8 && !strcmp(key.c_str() + klen - 8, ".pushurl");
+            if (!is_url && !is_pushurl) continue;
+            String name(key.c_str() + 7, klen - 7 - (is_url ? 4 : 8));
+            bool carried = false;
+            for (const auto &r : remotes) if (r.name == name) { carried = true; break; }
+            if (!carried) continue;
+            return refuse(WFS_E_GIT_POLICY,
+                "remote %s also has %s in %s configuration, which the World shares; keep a "
+                "remote's URLs in one place before importing",
+                name.c_str(), is_url ? "url" : "pushurl", scope);
+        }
+    }
     // Pin each remote whose effective URL a rewrite rule changes. An absolute remote URL is
     // carried as-is above, but a rule that lives in a conditional include active at the source
     // (the common per-account `includeIf "gitdir:..."` setup) still rewrites it there, and may or
@@ -1978,11 +2013,15 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
         bool world_active = false, target_active = false;
         Vec<char> world_listing, target_listing;
         if (int rc = active_replacements(world_real.c_str(), world_active, world_listing)) return rc;
-        if (world_active && world_listing.size() > 1) { // more than just the trailing NUL
-            if (int rc = active_replacements(repo, target_active, target_listing)) return rc;
-            if (!target_active || !same_bytes(world_listing, target_listing))
-                return refuse(WFS_E_GIT_TARGET, "the World uses replacement refs (refs/replace/) that %s does not have identically; the published history would mean something different there", repo);
-        }
+        if (int rc = active_replacements(repo, target_active, target_listing)) return rc;
+        // Symmetric: either side having active, non-empty replacements is enough to require the
+        // other side to match exactly (same active state and byte-identical listing) -- a
+        // replacement active only in the target would show the published branch through it too.
+        bool world_has = world_active && world_listing.size() > 1; // more than just the trailing NUL
+        bool target_has = target_active && target_listing.size() > 1;
+        if ((world_has || target_has) &&
+            (world_active != target_active || !same_bytes(world_listing, target_listing)))
+            return refuse(WFS_E_GIT_TARGET, "%s and the World do not have identical replacement refs (refs/replace/); the published history would mean something different there", repo);
     }
     String source_ref;
     if (info.branch[0]) { source_ref.assign("refs/heads/"); source_ref.append(info.branch); }
