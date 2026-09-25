@@ -517,30 +517,27 @@ int git_lines(const char *root, const char *const *args, Vec<String> &out) {
 }
 int capture_carried_config(const char *root, Vec<GitSetting> &out) {
     out.clear();
-    // Every url.<base>.insteadOf/pushInsteadOf rule the user's own Git currently applies here,
-    // from every scope it reads (ambient_config_probe=true covers global/system too, not just
-    // what this repository carries). Kept separate from `rules` below (which also gathers rules
-    // reachable only through a conditional include) because the pinning pass' chain guard only
-    // cares about rules the source's own Git actually applies right now.
-    Vec<UrlRewriteRule> ambient_rules;
+    // Every url.<base>.insteadOf/pushInsteadOf rule that could rewrite a URL this import
+    // carries or pins: every rule the user's own Git currently applies here, from every scope
+    // it reads (ambient_config_probe=true covers global/system too, not just what this
+    // repository carries), plus -- below -- every rule reached only through a conditional
+    // include, active here or not, since one that is inactive at the source may become active
+    // once the World moves. A relative remote URL that any of these rules matches is refused
+    // rather than carried (below), and so is any URL -- pinned or carried as-is -- that any of
+    // them could still rewrite once the World is placed somewhere else (the chain guard,
+    // further down): reproducing Git's insteadOf/pushInsteadOf resolution across a change of
+    // location (which rule wins, whether a pushurl needs to be synthesized) has repeatedly
+    // diverged from Git's actual behavior, and the combination is rare enough to refuse outright
+    // instead.
+    Vec<UrlRewriteRule> rules;
     {
         const char *rw_args[] = {"config", "--includes", "--null", "--get-regexp",
             "^url\\..*\\.(insteadof|pushinsteadof)$", nullptr};
         Vec<char> listing; int status = -1;
         int rc = git(root, rw_args, &listing, &status, false, true);
         if (rc && !(rc == WFS_E_GIT_FAILED && status == 1)) return rc;
-        if (!rc) parse_rewrite_listing(listing, ambient_rules);
+        if (!rc) parse_rewrite_listing(listing, rules);
     }
-    // Every url.<base>.insteadOf/pushInsteadOf rule that might match a relative remote URL: the
-    // ambient rules above, plus -- below -- every rule reached only through a conditional
-    // include, active here or not, since one that is inactive at the source may become active
-    // once the World moves. Below, a relative remote URL that any of these rules matches is
-    // refused rather than carried: reproducing Git's insteadOf/pushInsteadOf resolution across a
-    // change of location (which rule wins, whether a pushurl needs to be synthesized) has
-    // repeatedly diverged from Git's actual behavior, and the combination is rare enough to
-    // refuse outright instead.
-    Vec<UrlRewriteRule> rules;
-    for (const auto &r : ambient_rules) rules.emplace_back(r);
     {
         Vec<UrlRewriteRule> conditional_rules;
         if (int rc = scan_conditional_includes(root, nullptr, &conditional_rules)) return rc;
@@ -659,17 +656,6 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
             for (auto &u : effective_push)
                 if (is_relative_local_url(u.c_str()))
                     if (int arc = absolutize_remote_path(root, u.c_str(), u)) return arc;
-            // Chain guard: same as the pinned-pushurl guard below -- only an insteadOf rule active
-            // in the source's ambient configuration can rewrite an explicit pushurl again.
-            for (const auto &u : effective_push) {
-                for (const auto &r : ambient_rules) {
-                    if (r.push || r.prefix.empty() || strncmp(u.c_str(), r.prefix.c_str(), r.prefix.size())) continue;
-                    return refuse(WFS_E_GIT_POLICY,
-                        "remote %s resolves to %s, which url.%s.%s would rewrite again; simplify "
-                        "the URL rewrite rules before importing",
-                        info.name.c_str(), u.c_str(), r.base.c_str(), "insteadOf");
-                }
-            }
             info.pin_pushurls = std::move(effective_push);
             continue;
         }
@@ -703,35 +689,55 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
             for (auto &u : effective_push)
                 if (is_relative_local_url(u.c_str()))
                     if (int arc = absolutize_remote_path(root, u.c_str(), u)) return arc;
-        // Chain guard: a pinned URL must not be rewritten again by a rule active in the source's
-        // ambient configuration (not one reachable only through a conditional include -- see
-        // `ambient_rules` above), or the World would resolve it differently than the source does.
-        // A pushInsteadOf rule is checked against a pinned fetch URL only when no pushurl will be
-        // pinned for this remote, the same as Git only ever applies pushInsteadOf to
-        // remote.<name>.url when there is no explicit pushurl.
-        for (const auto &u : effective_fetch) {
-            for (const auto &r : ambient_rules) {
+        info.pin_urls = std::move(effective_fetch);
+        if (pin_push) info.pin_pushurls = std::move(effective_push);
+    }
+    // Chain guard: whichever URL each remote will actually end up carrying for `url` and
+    // `pushurl` -- the source's effective resolution, pinned above, or (when no rewrite applies
+    // to this remote) its own raw, absolutized URL, carried as-is -- must not be matched by any
+    // rule in `rules`: every insteadOf/pushInsteadOf rule the source's own Git could apply right
+    // now, plus one reachable only through a conditional include that is inactive at the source
+    // but could become active once the World moves. Otherwise the World would resolve a pinned
+    // URL differently than the source does, or a rule inactive at the source today could start
+    // rewriting an untouched, carried URL once the World sits somewhere else. A `url` is checked
+    // against pushInsteadOf too, but only when the remote has no separate `pushurl` entry of its
+    // own -- exactly when Git falls back to `url` for push. A `pushurl` (pinned or carried as-is)
+    // is checked only against insteadOf, since Git never applies pushInsteadOf to an explicit
+    // pushurl.
+    for (const auto &info : remotes) {
+        if (info.raw_urls.empty() && info.raw_pushurls.empty()) continue; // nothing carried
+        bool url_pinned = !info.pin_urls.empty(), push_pinned = !info.pin_pushurls.empty();
+        Vec<String> final_urls, final_pushurls;
+        if (url_pinned) for (const auto &u : info.pin_urls) final_urls.emplace_back(u);
+        else for (size_t idx : info.url_indices) final_urls.emplace_back(out[idx].value);
+        if (push_pinned) for (const auto &u : info.pin_pushurls) final_pushurls.emplace_back(u);
+        else for (size_t idx : info.pushurl_indices) final_pushurls.emplace_back(out[idx].value);
+        bool has_pushurl = !final_pushurls.empty();
+        for (const auto &u : final_urls) {
+            for (const auto &r : rules) {
                 if (r.prefix.empty() || strncmp(u.c_str(), r.prefix.c_str(), r.prefix.size())) continue;
-                if (r.push && pin_push) continue;
+                if (r.push && has_pushurl) continue;
                 return refuse(WFS_E_GIT_POLICY,
-                    "remote %s resolves to %s, which url.%s.%s would rewrite again; simplify the "
-                    "URL rewrite rules before importing",
+                    url_pinned
+                        ? "remote %s resolves to %s, which url.%s.%s would rewrite again; simplify the "
+                          "URL rewrite rules before importing"
+                        : "remote %s URL %s matches url.%s.%s, which a conditional include can activate "
+                          "at the World's location; simplify the URL rewrite rules before importing",
                     info.name.c_str(), u.c_str(), r.base.c_str(), r.push ? "pushInsteadOf" : "insteadOf");
             }
         }
-        if (pin_push) {
-            for (const auto &u : effective_push) {
-                for (const auto &r : ambient_rules) {
-                    if (r.push || r.prefix.empty() || strncmp(u.c_str(), r.prefix.c_str(), r.prefix.size())) continue;
-                    return refuse(WFS_E_GIT_POLICY,
-                        "remote %s resolves to %s, which url.%s.%s would rewrite again; simplify "
-                        "the URL rewrite rules before importing",
-                        info.name.c_str(), u.c_str(), r.base.c_str(), "insteadOf");
-                }
+        for (const auto &u : final_pushurls) {
+            for (const auto &r : rules) {
+                if (r.push || r.prefix.empty() || strncmp(u.c_str(), r.prefix.c_str(), r.prefix.size())) continue;
+                return refuse(WFS_E_GIT_POLICY,
+                    push_pinned
+                        ? "remote %s resolves to %s, which url.%s.%s would rewrite again; simplify "
+                          "the URL rewrite rules before importing"
+                        : "remote %s URL %s matches url.%s.%s, which a conditional include can activate "
+                          "at the World's location; simplify the URL rewrite rules before importing",
+                    info.name.c_str(), u.c_str(), r.base.c_str(), "insteadOf");
             }
         }
-        info.pin_urls = std::move(effective_fetch);
-        if (pin_push) info.pin_pushurls = std::move(effective_push);
     }
     bool any_pinned = false;
     for (const auto &info : remotes)

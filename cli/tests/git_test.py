@@ -1630,6 +1630,50 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'would rewrite again', result.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
+    def test_conditional_rewrite_chain_across_includes_is_refused(self):
+        # A source-side conditional rule pins raw.example -> first.example (the source's own
+        # Git chains no further than that). A second includeIf rule -- inactive at the source,
+        # so it plays no part in that resolution -- maps first.example -> second.example. If the
+        # chain guard only considered rules active in the source's ambient configuration, the
+        # World would carry the pinned first.example URL unguarded, and once placed somewhere
+        # the second rule activates, it would contact second.example instead.
+        included_active = self.root / 'chain-active'
+        included_active.write_text('[url "https://first.example/"]\n insteadOf = https://raw.example/\n')
+        included_inactive = self.root / 'chain-inactive'
+        included_inactive.write_text('[url "https://second.example/"]\n insteadOf = https://first.example/\n')
+        global_config = self.root / 'chain-global'
+        global_config.write_text(
+            '[includeIf "gitdir:' + str(self.source) + '/"]\n path = ' + str(included_active) + '\n'
+            '[includeIf "gitdir:' + str(self.root / 'elsewhere') + '/"]\n path = ' + str(included_inactive) + '\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        self.git(self.source, 'remote', 'add', 'origin', 'https://raw.example/r.git')
+        # Sanity: the source's own Git chains only into the first, active rule.
+        self.assertEqual(self.git(self.source, 'remote', 'get-url', 'origin').stdout.strip(),
+                          b'https://first.example/r.git')
+        result = self.world('init', str(self.source), code=3)
+        self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+        self.assertIn(b'would rewrite again', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_inactive_conditional_rewrite_of_carried_remote_is_refused(self):
+        # No rule is active at the source, so this remote is carried as-is, not pinned -- but an
+        # inactive includeIf rule that matches its raw URL could still activate once the World
+        # moves, so it must be refused just as a pinned URL matched again would be.
+        included = self.root / 'unpinned-inactive'
+        included.write_text('[url "https://elsewhere.example/"]\n insteadOf = https://plain.example/\n')
+        global_config = self.root / 'unpinned-inactive-global'
+        global_config.write_text('[includeIf "gitdir:' + str(self.root / 'elsewhere') + '/"]\n path = '
+                                  + str(included) + '\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        self.git(self.source, 'remote', 'add', 'origin', 'https://plain.example/r.git')
+        # Sanity: the rule is inactive here, so the source's own Git does not rewrite it.
+        self.assertEqual(self.git(self.source, 'remote', 'get-url', 'origin').stdout.strip(),
+                          b'https://plain.example/r.git')
+        result = self.world('init', str(self.source), code=3)
+        self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+        self.assertIn(b'matches url.', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_pinned_remote_keeps_explicit_pushurl(self):
         # An explicit pushurl must stay explicit once pinned: Git never falls back to a remote's
         # (possibly rewritten) url entries once it has an explicit pushurl, so leaving it

@@ -84,9 +84,13 @@ faithfully to a World in another location. When such a rule instead rewrites an 
 remote URL -- for example a per-account rule reached through a conditional include such as
 `includeIf "gitdir:~/work/"` -- the World does not carry the rewrite rule's effect raw:
 it records the fetch and push URLs Git actually uses for that remote at the source, so the
-World reaches the same endpoints wherever it is placed. A pinned URL that another rule would
-rewrite again is refused, since the World would then resolve it differently than the source
-does; simplify the rewrite rules before importing. A conditional rule that only applies at the
+World reaches the same endpoints wherever it is placed. Whichever URL a remote ends up carrying
+-- a pinned one, or (when no rewrite applies to that remote) its own raw, absolute URL, carried
+as-is -- is refused if any collected `insteadOf`/`pushInsteadOf` rule could still rewrite it,
+including one that lives in a conditional include inactive at the source: such a rule could
+become active once the World moves elsewhere and redirect a URL the source itself never
+rewrote, or redirect a pinned URL to somewhere other than what the source actually resolved.
+Simplify the rewrite rules before importing. A conditional rule that only applies at the
 World's own location applies there, exactly as it would for any repository placed there. A
 remote that had an explicit `remote.<name>.pushurl` at the source keeps an explicit pinned
 pushurl in the World even when it resolves to the same URL as the pinned fetch URL, since Git
