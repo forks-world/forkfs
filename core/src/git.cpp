@@ -1859,6 +1859,36 @@ int git_branch(const char *clone, wfs_id world) {
     if (!available) return -EEXIST;
     const char *create[] = {"update-ref", branch, s.head.c_str(), "", nullptr};
     if (int rc = git(clone, create)) return rc;
+    // A generated World branch must start without an upstream, even when stale
+    // branch.<name>.* configuration for this exact short name was carried in --
+    // e.g. a leftover branch.world/W1.remote/.merge left behind by a branch this
+    // World once had, or, for a World forked from a World, configuration copied
+    // wholesale from the parent. Remove any section for the new branch's short
+    // name before HEAD is pointed at it.
+    const char *short_name = branch + 11; // strip the "refs/heads/" prefix
+    {
+        String section("branch."); section.append(short_name);
+        const char *remove[] = {"config", "--local", "--remove-section", section.c_str(), nullptr};
+        int status = -1;
+        // A missing section exits 128 ("no such section"); that is the common case
+        // (nothing was carried) and is not an error here.
+        int rc = git(clone, remove, nullptr, &status, true);
+        if (rc && !(rc == WFS_E_GIT_FAILED && status == 128)) return rc;
+        // Verify by name rather than trusting --remove-section's exit status alone:
+        // build a regex that matches this exact short name (escaping regex metacharacters
+        // it may contain) and confirm no branch.<name>.* key remains.
+        String pattern("^branch\\.");
+        for (const char *p = short_name; *p; ++p) {
+            if (strchr(R"(.+*?[](){}^$|\)", *p)) pattern.push_back('\\');
+            pattern.push_back(*p);
+        }
+        pattern.append("\\.");
+        const char *check[] = {"config", "--local", "--name-only", "--get-regexp", pattern.c_str(), nullptr};
+        int check_status = -1;
+        rc = git(clone, check, nullptr, &check_status, true);
+        if (rc == 0) return WFS_E_GIT_FAILED; // a matching key still exists
+        if (!(rc == WFS_E_GIT_FAILED && check_status == 1)) return rc; // unexpected failure
+    }
     const char *checkout[] = {"symbolic-ref", "HEAD", branch, nullptr};
     if (int rc = git(clone, checkout)) return rc;
     if (int rc = config(clone, "worldfs.baseline", s.head.c_str())) return rc;

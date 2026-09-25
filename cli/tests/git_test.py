@@ -1328,6 +1328,27 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(one, 'rev-parse', 'refs/remotes/up/main').stdout.strip(), self.base)
         self.assertFalse((one / 'uploadpack-ran').exists())
 
+    def test_stale_config_for_the_world_branch_is_not_inherited(self):
+        # Carried configuration can include branch.<name>.* for a branch name that has no ref
+        # yet, e.g. leftover config from a branch of that name the source once had. The new
+        # World branch is always named world/W<n>, so such a stale section for that exact name
+        # must not resurrect an upstream the World never had.
+        self.git(self.source, 'remote', 'add', 'origin', 'https://example.invalid/r.git')
+        self.git(self.source, 'config', 'branch.world/W1.remote', 'origin')
+        self.git(self.source, 'config', 'branch.world/W1.merge', 'refs/heads/main')
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        one, wid = self.fork()
+        self.git(one, 'config', '--get', 'branch.world/W1.remote', code=1)
+        self.git(one, 'config', '--get', 'branch.world/W1.merge', code=1)
+        self.git(one, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}', code=128)
+        # The same guarantee holds for a World forked from a World, whose configuration is
+        # copied wholesale from the parent, including any stale section for the child's name.
+        self.git(one, 'config', 'branch.world/W2.remote', 'origin')
+        two, _ = self.fork('two', wid)
+        self.git(two, 'config', '--get', 'branch.world/W2.remote', code=1)
+        self.git(two, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}', code=128)
+
     def test_rewritten_relative_remote_url_is_refused(self):
         # Whichever direction the rule rewrites, a relative remote URL it matches is refused
         # rather than carried -- reproducing Git's own insteadOf/pushInsteadOf resolution across

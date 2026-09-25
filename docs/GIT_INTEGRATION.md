@@ -54,7 +54,11 @@ fetch and push refspecs, tag and prune options, remote groups, branch upstreams
 `remote.pushDefault`, `push.default`, `push.autoSetupRemote`, `fetch.prune` and aliases.
 `git fetch origin` and `git push origin <branch>` therefore work in a World as in the
 source; nothing is fetched or pushed automatically, and the World's own `world/W<n>` branch
-starts without an upstream. A relative local remote path is made absolute against the source,
+starts without an upstream. Any carried configuration for that exact branch name -- for
+example a stale `branch.world/W1.remote`/`merge` left behind by an earlier branch of that
+name, or configuration copied wholesale from a World this one was itself forked from -- is
+removed when the branch is created, so it cannot resurrect an upstream the World never had.
+A relative local remote path is made absolute against the source,
 so it keeps reaching the same repository after the source is deleted. A relative remote URL
 that any `url.<base>.insteadOf` or `pushInsteadOf` rule matches is refused instead (make the
 URL absolute or remove the rule), because a rewrite of a relative path cannot be carried
