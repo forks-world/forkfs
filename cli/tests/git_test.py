@@ -516,6 +516,39 @@ class GitWorldTest(unittest.TestCase):
         self.commit_in(one, 'husky runs')
         self.assertEqual(self.hook_runs(marker), ['husky ' + str(one)])
 
+    def test_committed_only_needs_a_committed_hooks_path_in_a_managed_world(self):
+        # A managed World carries its hooks without --with-hooks, so a hooks path configured
+        # in it after creation (husky installed later) must be committed before the reset.
+        marker = self.root / 'hooks-ran'
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.write_hook(one / '.husky' / 'pre-commit', marker, 'husky')
+        self.git(one, 'config', 'core.hooksPath', '.husky')
+        result = self.world('fork', '--from', wid, '--to', str(self.root / 'two'), '--committed-only', code=3)
+        self.assertIn(b'core.hooksPath .husky is not committed', result.stderr)
+        self.assertFalse((self.root / 'two').exists())
+        result = self.world('checkpoint', wid, '--committed-only', code=3)
+        self.assertIn(b'core.hooksPath .husky is not committed', result.stderr)
+        self.git(one, 'add', '.husky')
+        self.git(one, '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'husky')
+        two, _ = self.fork('two', wid, '--committed-only')
+        self.commit_in(two, 'husky runs')
+        self.assertEqual(self.hook_runs(marker), ['husky ' + str(two)])
+
+    def test_with_hooks_refuses_dot_dot_after_a_directory_in_the_hooks_path(self):
+        # Git takes `link/..` through the symlink, which a lexical collapse would not.
+        marker = self.root / 'hooks-ran'
+        outside = self.root / 'outside' / 'dir'
+        outside.mkdir(parents=True)
+        self.write_hook(self.root / 'outside' / 'hooks' / 'pre-commit', marker, 'outside')
+        self.write_hook(self.source / 'hooks' / 'pre-commit', marker, 'in-tree')
+        (self.source / 'link').symlink_to(outside)
+        self.git(self.source, 'config', 'core.hooksPath', 'link/../hooks')
+        result = self.world('init', str(self.source), '--with-hooks', '--include-changes', code=3)
+        self.assertIn(b"core.hooksPath link/../hooks has a '..' after a directory name", result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        self.assertEqual(self.hook_runs(marker), [])
+
     def test_with_hooks_refuses_a_hooks_path_inside_git_administration(self):
         marker = self.root / 'hooks-ran'
         self.write_hook(self.source / '.git' / 'custom-hooks' / 'pre-commit', marker, 'custom')

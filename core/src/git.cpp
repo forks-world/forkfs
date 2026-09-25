@@ -1510,14 +1510,29 @@ int reject_hook_links(int dfd, const String &rel, bool root_only) {
     }
     return 0;
 }
-int capture_hooks(const char *root, Vec<GitHook> &out, bool &path_present, String &path) {
-    out.clear();
-    if (int rc = local_hooks_path(root, path_present, path)) return rc;
-    // A relative core.hooksPath is resolved from the worktree root. Resolved lexically against
-    // the source: one that stays inside the tree (husky's `.husky`) is carried as a normalized
-    // relative path, so the World uses its own copy; one that leaves it (`../shared-hooks`) is
-    // carried as the absolute directory the source used, not re-resolved beside the World.
-    if (path_present && !path.empty() && path[0] != '/' && path[0] != '~') {
+// A relative core.hooksPath is resolved from the worktree root. Resolved lexically against the
+// real source root: one that stays inside the tree (husky's `.husky`) becomes a normalized
+// relative path, so the World uses its own copy; one that leaves it (`../shared-hooks`) becomes
+// the absolute directory the source used, not re-resolved beside the World. Only leading `..`
+// components collapse correctly without the filesystem (the root is already real); a `..`
+// after a directory name (`link/../hooks`) would be taken through `link` by Git, which may be a
+// symlink to anywhere, so it is refused rather than collapsed to a different directory.
+int normalize_hooks_path(const char *root, bool present, String &path) {
+    if (present && !path.empty() && path[0] != '/' && path[0] != '~') {
+        bool named = false;
+        for (const char *p = path.c_str(); *p;) {
+            while (*p == '/') ++p;
+            const char *start = p;
+            while (*p && *p != '/') ++p;
+            size_t n = (size_t)(p - start);
+            if (n == 0 || (n == 1 && *start == '.')) continue;
+            if (n == 2 && start[0] == '.' && start[1] == '.') {
+                if (named)
+                    return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s has a '..' after a directory name, which Git resolves through that directory (possibly a symlink); simplify it", path.c_str());
+                continue;
+            }
+            named = true;
+        }
         String real_root;
         if (int rc = fs_realpath(root, real_root)) return rc;
         String resolved = absolute_lexical(real_root.c_str(), path.c_str());
@@ -1527,6 +1542,12 @@ int capture_hooks(const char *root, Vec<GitHook> &out, bool &path_present, Strin
             path.assign(resolved.c_str() + n + 1);
         else path = resolved;
     }
+    return 0;
+}
+int capture_hooks(const char *root, Vec<GitHook> &out, bool &path_present, String &path) {
+    out.clear();
+    if (int rc = local_hooks_path(root, path_present, path)) return rc;
+    if (int rc = normalize_hooks_path(root, path_present, path)) return rc;
     if (path_present) {
         // With core.hooksPath set, Git runs hooks from there and never from the default
         // directory, so that is the only one that matters. An in-tree directory travels with the
@@ -1874,6 +1895,44 @@ int reject_reserved_paths(const char *root, const GitSource &s) {
     if (int rc = git(root, args.data(), &hit)) return rc;
     return hit.size() > 1 ? refuse(WFS_E_GIT_UNSUPPORTED, "a preserved commit tracks the reserved path .world or .world-git") : 0;
 }
+// --committed-only resets the copy to HEAD, which removes an in-tree hooks directory that is
+// only staged or untracked; the World would then point core.hooksPath at nothing and silently
+// skip its hooks. Require a relative (normalized) hooks path to be in HEAD with nothing pending.
+int require_committed_hooks_path(const char *root, bool present, const String &hp) {
+    if (!present || hp.empty() || hp[0] == '/' || hp[0] == '~') return 0;
+    bool at_root = hp == ".";
+    if (!at_root) {
+        // `HEAD:<path>` takes everything after the colon as the path, so the type is read
+        // with cat-file rather than peeled with ^{tree}.
+        String spec("HEAD:"); spec.append(hp.c_str());
+        const char *type_args[] = {"cat-file", "-t", spec.c_str(), nullptr};
+        Vec<char> type; int tstatus = -1;
+        int trc = git(root, type_args, &type, &tstatus, true);
+        if (trc || strcmp(type.data(), "tree\n"))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s is not committed, so --committed-only would leave the hooks out; commit it or drop --committed-only", hp.c_str());
+    }
+    // The directory being in HEAD is not enough: a hook inside it that is staged,
+    // untracked or modified would be reset away just the same. At the worktree root only
+    // the hook-named files are hooks, so only those are checked there.
+    Vec<String> scopes;
+    if (at_root) {
+        for (size_t k = 0; kHookNames[k]; ++k) {
+            String one(":(top,literal)"); one.append(kHookNames[k]); scopes.emplace_back(one);
+        }
+    } else {
+        String one(":(top,literal)"); one.append(hp.c_str()); scopes.emplace_back(one);
+    }
+    Vec<const char *> st_args;
+    for (const char *a : {"status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=no", "--"})
+        st_args.emplace_back(a);
+    for (const auto &scope : scopes) st_args.emplace_back(scope.c_str());
+    st_args.emplace_back(nullptr);
+    Vec<char> pending;
+    if (int src = git(root, st_args.data(), &pending, nullptr, false, true)) return src;
+    if (pending.size() > 1)
+        return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s has uncommitted changes, which --committed-only would drop; commit them or drop --committed-only", hp.c_str());
+    return 0;
+}
 int git_source(const char *root, bool include_changes, GitSource &out, bool committed_only, bool with_hooks) {
     g_reason[0] = '\0';
     if (include_changes && committed_only) return -EINVAL;
@@ -1916,43 +1975,17 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
     out.with_hooks = with_hooks;
     if (with_hooks && !out.managed) {
         if (int hook_rc = capture_hooks(root, out.hooks, out.hooks_path_present, out.hooks_path)) return hook_rc;
-        // --committed-only resets the copy to HEAD, which removes an in-tree hooks directory that
-        // is only staged or untracked; the World would then point core.hooksPath at nothing and
-        // silently skip the hooks explicitly asked for. Require the directory in HEAD.
-        const String &hp = out.hooks_path;
-        if (committed_only && out.hooks_path_present && !hp.empty() && hp[0] != '/' && hp[0] != '~') {
-            bool at_root = hp == ".";
-            if (!at_root) {
-                // `HEAD:<path>` takes everything after the colon as the path, so the type is read
-                // with cat-file rather than peeled with ^{tree}.
-                String spec("HEAD:"); spec.append(hp.c_str());
-                const char *type_args[] = {"cat-file", "-t", spec.c_str(), nullptr};
-                Vec<char> type; int tstatus = -1;
-                int trc = git(root, type_args, &type, &tstatus, true);
-                if (trc || strcmp(type.data(), "tree\n"))
-                    return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s is not committed, so --committed-only would leave the hooks out; commit it or drop --committed-only", hp.c_str());
-            }
-            // The directory being in HEAD is not enough: a hook inside it that is staged,
-            // untracked or modified would be reset away just the same. At the worktree root only
-            // the hook-named files are hooks, so only those are checked there.
-            Vec<String> scopes;
-            if (at_root) {
-                for (size_t k = 0; kHookNames[k]; ++k) {
-                    String one(":(top,literal)"); one.append(kHookNames[k]); scopes.emplace_back(one);
-                }
-            } else {
-                String one(":(top,literal)"); one.append(hp.c_str()); scopes.emplace_back(one);
-            }
-            Vec<const char *> st_args;
-            for (const char *a : {"status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=no", "--"})
-                st_args.emplace_back(a);
-            for (const auto &scope : scopes) st_args.emplace_back(scope.c_str());
-            st_args.emplace_back(nullptr);
-            Vec<char> pending;
-            if (int src = git(root, st_args.data(), &pending, nullptr, false, true)) return src;
-            if (pending.size() > 1)
-                return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s has uncommitted changes, which --committed-only would drop; commit them or drop --committed-only", hp.c_str());
+        if (committed_only) {
+            if (int hrc = require_committed_hooks_path(root, out.hooks_path_present, out.hooks_path)) return hrc;
         }
+    }
+    // A managed World carries its hooks and core.hooksPath with its .world-git, so the same
+    // committed-path check applies to it whether or not --with-hooks was given.
+    if (committed_only && out.managed) {
+        bool present = false; String hp;
+        if (int hrc = local_hooks_path(root, present, hp)) return hrc;
+        if (int hrc = normalize_hooks_path(root, present, hp)) return hrc;
+        if (int hrc = require_committed_hooks_path(root, present, hp)) return hrc;
     }
     if (out.managed) {
         // A managed copy has byte-identical configuration files and import commands ignore

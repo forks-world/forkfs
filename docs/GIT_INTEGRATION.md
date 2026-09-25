@@ -129,7 +129,9 @@ line on stderr that names `--with-hooks`.
   that stays inside the tree refers to the World's own copy (hooks run at the worktree root),
   so `.husky` works as-is; one that leaves the tree (`../shared-hooks`) is carried as the
   absolute directory the source used, never re-resolved beside the World. An absolute value is
-  kept as the user opted into it. While `core.hooksPath` is set, Git ignores the default hooks
+  kept as the user opted into it. A relative value with a `..` after a directory name
+  (`link/../hooks`) is refused: Git resolves it through that directory, possibly a symlink,
+  so it cannot be collapsed faithfully. While `core.hooksPath` is set, Git ignores the default hooks
   directory, so it is neither scanned nor copied; an in-tree hooks directory travels with the
   tree and is refused if it, a component of its path or any entry in it -- at any depth, since
   hooks commonly source nested helpers -- is a symlink (for a hooks path of `.`, only the
@@ -147,7 +149,9 @@ and `core.hooksPath` are rechecked before publication like the rest of the captu
 so a hook changed during the import aborts it. Hooks never run during WorldFS's own Git
 commands (import, fork, checkpoint, publish): every one of them sets `core.hooksPath=/dev/null`.
 Worlds forked or checkpointed from a World keep its hooks, since its whole `.world-git`
-(hooks directory and configuration included) is cloned with it.
+(hooks directory and configuration included) is cloned with it. So `--committed-only` from a
+World requires the same of a relative `core.hooksPath` set in it -- committed, nothing pending
+inside -- even without `--with-hooks`.
 
 ## Getting work back to the source
 
