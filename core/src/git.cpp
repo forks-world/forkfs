@@ -798,10 +798,13 @@ int reject_configured_policy(const char *root, const char *key) {
 // What cannot be shared is refused here with WFS_E_GIT_POLICY:
 //   * GIT_ATTR_SOURCE / attr.tree: attributes read from a tree-ish instead of the worktree.
 //   * status settings given as command configuration: they belong to this invocation only.
-//   * a conditional include whose target sets status or filter settings: the condition
-//     (gitdir, onbranch, ...) can evaluate differently at the World's location, active or not
-//     at the source. Includes that only set other things (identity, signing, aliases) are fine;
-//     identity is pinned in the World separately (pin_identity).
+//   * a conditional include whose target sets status or filter settings, or a per-remote or
+//     per-branch setting (remote.<name>.*, branch.<name>.*): the condition (gitdir, onbranch,
+//     ...) can evaluate differently at the World's location, active or not at the source, and
+//     could otherwise add a URL to a carried remote or an upstream to the World's generated
+//     branch once the World is in place. Includes that only set other things (identity,
+//     signing, aliases, section-wide settings like remote.pushDefault) are fine; identity is
+//     pinned in the World separately (pin_identity).
 // Filters are refused only when tracked files actually use a defined one (reject_used_filters).
 const char *const kStatusKeys = "core\\.(excludesfile|attributesfile|autocrlf|eol|safecrlf|filemode|symlinks|"
     "ignorecase|precomposeunicode|trustctime|checkstat|ignorestat|checkroundtripencoding|usereplacerefs)";
@@ -812,6 +815,17 @@ bool is_status_or_filter_key(const char *key) {
         "core.usereplacerefs", "attr.tree", nullptr};
     for (size_t i = 0; keys[i]; ++i) if (!strcasecmp(key, keys[i])) return true;
     return !strncasecmp(key, "filter.", 7);
+}
+// Whether `key` names a per-remote or per-branch setting -- "remote.<subsection>.<var>" or
+// "branch.<subsection>.<var>" -- as opposed to a section-wide setting with no subsection
+// (`remote.pushDefault`, `branch.autoSetupMerge`). A subsection is present exactly when the
+// remainder after the leading "remote."/"branch." contains another '.'.
+bool is_remote_or_branch_subsection_key(const char *key) {
+    for (const char *prefix : {"remote.", "branch."}) {
+        size_t plen = strlen(prefix);
+        if (!strncasecmp(key, prefix, plen) && strchr(key + plen, '.')) return true;
+    }
+    return false;
 }
 String dirname_of(const char *path) {
     const char *slash = strrchr(path, '/');
@@ -869,6 +883,10 @@ int scan_include_target(const char *root, const char *path, const char *directiv
         const char *key = listing.data() + i;
         if (is_status_or_filter_key(key))
             return refuse(WFS_E_GIT_POLICY, "%s includes %s, which sets %s", directive, path, key);
+        if (is_remote_or_branch_subsection_key(key))
+            return refuse(WFS_E_GIT_POLICY,
+                "%s includes %s, which sets %s; per-remote and per-branch settings in a "
+                "conditional include depend on where the World is placed", directive, path, key);
         if (sets_identity && (!strcasecmp(key, "user.name") || !strcasecmp(key, "user.email")))
             *sets_identity = true;
         if (!strcasecmp(key, "include.path") || (!strncasecmp(key, "includeif.", 10) &&
@@ -1820,6 +1838,44 @@ int git_discard_check(const char *root) {
     closedir(d); return rc;
 }
 
+// A regex matching every "branch.<short_name>.*" key, with short_name's regex
+// metacharacters escaped, in the style `git config --get-regexp` expects.
+String branch_section_pattern(const char *short_name) {
+    String pattern("^branch\\.");
+    for (const char *p = short_name; *p; ++p) {
+        if (strchr(R"(.+*?[](){}^$|\)", *p)) pattern.push_back('\\');
+        pattern.push_back(*p);
+    }
+    pattern.append("\\.");
+    return pattern;
+}
+// Whether the user's ambient configuration (global, system, or GIT_CONFIG_* command
+// configuration -- any scope other than local/worktree) has any branch.<short_name>.* key.
+// Ordinary Git in the World reads this configuration the same way it reads the source's, but
+// this import can only remove repository-local configuration for a branch (see the
+// --local --remove-section below), so a name still carrying ambient branch settings -- for
+// example branch.world/W1.remote from a global config entry -- must not be chosen at all.
+int branch_has_ambient_config(const char *clone, const char *short_name, bool &out) {
+    out = false;
+    String pattern = branch_section_pattern(short_name);
+    Vec<char> listing; int status = -1;
+    const char *args[] = {"config", "--includes", "--null", "--show-scope", "--name-only",
+        "--get-regexp", pattern.c_str(), nullptr};
+    int rc = git(clone, args, &listing, &status, false, true);
+    if (rc == WFS_E_GIT_FAILED && status == 1) return 0; // no matching key in any scope
+    if (rc) return rc;
+    // Entries are "<scope>\0<key>\0".
+    for (size_t i = 0; i < listing.size() && listing[i];) {
+        const char *scope = listing.data() + i;
+        i += strlen(scope) + 1;
+        if (i >= listing.size()) return WFS_E_GIT_FAILED;
+        const char *key = listing.data() + i;
+        i += strlen(key) + 1;
+        (void)key;
+        if (strcmp(scope, "local") && strcmp(scope, "worktree")) { out = true; return 0; }
+    }
+    return 0;
+}
 int git_branch(const char *clone, wfs_id world) {
     String dot = joinp(clone, ".git"); struct stat st;
     if (lstat(dot.c_str(), &st)) return errno == ENOENT ? 0 : -errno;
@@ -1839,8 +1895,14 @@ int git_branch(const char *clone, wfs_id world) {
     char branch[96];
     bool available = false;
     // Each existing branch blocks at most one candidate (by equality or as a directory prefix),
-    // so names.size() + 1 candidates always include a free one.
-    for (size_t suffix = 0; suffix <= names.size(); ++suffix) {
+    // so names.size() + 1 candidates always include one free of ref collisions. A candidate can
+    // also be blocked by ambient (non-local) branch.<name>.* configuration this import cannot
+    // remove; each such block extends the bound by one more candidate, so the loop always still
+    // reaches a name free of both. `ambient_blocked` is capped so a pathological ambient
+    // configuration (thousands of matching sections) cannot loop unboundedly.
+    size_t ambient_blocked = 0;
+    constexpr size_t kMaxAmbientBlocked = 4096;
+    for (size_t suffix = 0; suffix <= names.size() + ambient_blocked; ++suffix) {
         const char *sep = root_taken ? "-" : "/";
         if (!suffix) snprintf(branch, sizeof branch, "refs/heads/world%sW%llu", sep, (unsigned long long)world);
         else snprintf(branch, sizeof branch, "refs/heads/world%sW%llu-%llu", sep, (unsigned long long)world,
@@ -1852,6 +1914,17 @@ int git_branch(const char *clone, wfs_id world) {
             if (!memcmp(branch, name.c_str(), shorter) &&
                 (n == len || (n < len ? branch[n] == '/' : name[len] == '/'))) {
                 available = false; break;
+            }
+        }
+        if (available) {
+            bool ambient_configured = false;
+            if (int rc = branch_has_ambient_config(clone, branch + 11, ambient_configured)) return rc;
+            if (ambient_configured) {
+                available = false;
+                if (++ambient_blocked > kMaxAmbientBlocked)
+                    return refuse(WFS_E_GIT_POLICY,
+                        "no free World branch name could be found: too many candidates have "
+                        "branch.<name> settings in global or system configuration");
             }
         }
         if (available) break;
@@ -1877,12 +1950,7 @@ int git_branch(const char *clone, wfs_id world) {
         // Verify by name rather than trusting --remove-section's exit status alone:
         // build a regex that matches this exact short name (escaping regex metacharacters
         // it may contain) and confirm no branch.<name>.* key remains.
-        String pattern("^branch\\.");
-        for (const char *p = short_name; *p; ++p) {
-            if (strchr(R"(.+*?[](){}^$|\)", *p)) pattern.push_back('\\');
-            pattern.push_back(*p);
-        }
-        pattern.append("\\.");
+        String pattern = branch_section_pattern(short_name);
         const char *check[] = {"config", "--local", "--name-only", "--get-regexp", pattern.c_str(), nullptr};
         int check_status = -1;
         rc = git(clone, check, nullptr, &check_status, true);

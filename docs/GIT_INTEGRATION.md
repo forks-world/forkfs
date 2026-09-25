@@ -58,6 +58,9 @@ starts without an upstream. Any carried configuration for that exact branch name
 example a stale `branch.world/W1.remote`/`merge` left behind by an earlier branch of that
 name, or configuration copied wholesale from a World this one was itself forked from -- is
 removed when the branch is created, so it cannot resurrect an upstream the World never had.
+A candidate name that ordinary Git would still read `branch.<name>.*` settings for from
+global or system configuration -- configuration this import cannot remove -- is skipped in
+favor of the next free suffix, the same way a colliding ref is.
 A relative local remote path is made absolute against the source,
 so it keeps reaching the same repository after the source is deleted. A relative remote URL
 that any `url.<base>.insteadOf` or `pushInsteadOf` rule matches is refused instead (make the
@@ -238,11 +241,16 @@ What cannot be shared is refused with a Git configuration error that names the r
   defined anywhere. Filters are never executed by the import.
 - A conditional `includeIf` whose target sets status or filter settings, in any scope and
   whether or not it is active at the source: the condition (a `gitdir:` pattern, a branch)
-  can evaluate differently at the World's location. Conditional includes that set other
-  things, typically a work identity, are allowed. When any conditional include sets
-  `user.name` or `user.email`, the identity the source resolves is written into the World's
-  own configuration (an identity the source lacks is written as an explicit empty value), so
-  the World's commits carry the source's author wherever the World is placed.
+  can evaluate differently at the World's location. The same is refused for a target that
+  sets per-remote or per-branch settings (`remote.<name>.*`, `branch.<name>.*`), since a
+  condition inactive at the source but active at the World's location could otherwise add a
+  URL to a carried remote or an upstream to the World's generated branch once the World is
+  in place; section-wide settings without a name, such as `remote.pushDefault` or
+  `branch.autoSetupMerge`, are unaffected. Conditional includes that set other things,
+  typically a work identity, are allowed. When any conditional include sets `user.name` or
+  `user.email`, the identity the source resolves is written into the World's own
+  configuration (an identity the source lacks is written as an explicit empty value), so the
+  World's commits carry the source's author wherever the World is placed.
 - A relative `core.excludesFile` or `core.attributesFile` in global or system
   configuration: Git resolves it from each repository's location, so the source and a
   World could read different files. Use an absolute or `~/` path.

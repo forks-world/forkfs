@@ -1349,6 +1349,21 @@ class GitWorldTest(unittest.TestCase):
         self.git(two, 'config', '--get', 'branch.world/W2.remote', code=1)
         self.git(two, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}', code=128)
 
+    def test_world_branch_skips_names_with_global_branch_config(self):
+        # Unlike stale repository-local config (removed above), global/system
+        # branch.world/W1.* configuration cannot be removed by this import; ordinary Git in
+        # the World would still read it once that name exists. The generated branch must
+        # therefore skip straight to the next free suffix, exactly like a colliding ref.
+        global_config = self.root / 'ambient-branch-global'
+        global_config.write_text('[branch "world/W1"]\n remote = origin\n merge = refs/heads/main\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        self.git(self.source, 'remote', 'add', 'origin', 'https://example.invalid/x.git')
+        self.world('init', str(self.source))
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'branch', '--show-current').stdout.strip(), b'world/W1-1')
+        self.git(one, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}', code=128)
+        self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+
     def test_rewritten_relative_remote_url_is_refused(self):
         # Whichever direction the rule rewrites, a relative remote URL it matches is refused
         # rather than carried -- reproducing Git's own insteadOf/pushInsteadOf resolution across
@@ -1389,6 +1404,30 @@ class GitWorldTest(unittest.TestCase):
         self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
         self.assertIn(b'is relative and url.', result.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_conditional_include_with_per_remote_or_branch_settings_is_refused(self):
+        # A conditional include's target may set remote.<name>.url/pushurl or
+        # branch.<name>.remote/merge. The condition does not hold at the source (self.source
+        # is not under self.root/'elsewhere'), but it could become active once the World
+        # moves there, at which point it would add a URL to a carried remote or an upstream
+        # to the World's generated branch -- refused just like a status or filter setting,
+        # active or not.
+        targets = {
+            'remote': '[remote "origin"]\n url = https://cond.invalid/x.git\n',
+            'branch': '[branch "world/W1"]\n remote = origin\n',
+        }
+        global_config = self.root / 'per-remote-or-branch-global'
+        for name, contents in targets.items():
+            with self.subTest(target=name):
+                included = self.root / ('per-remote-or-branch-' + name)
+                included.write_text(contents)
+                global_config.write_text('[includeIf "gitdir:' + str(self.root / 'elsewhere') + '/"]\n path = '
+                                          + str(included) + '\n')
+                self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+                result = self.world('init', str(self.source), code=3)
+                self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+                self.assertIn(b'per-remote and per-branch settings', result.stderr)
+                self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
     def test_conditional_rewrite_of_absolute_remote_is_pinned(self):
         # A rule that lives in a conditional include active at the source -- the common
