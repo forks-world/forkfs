@@ -1679,10 +1679,15 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
     const char *fetch[] = {"fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
                            "--", world_root, spec.c_str(), nullptr};
     int rc = git(repo, fetch);
+    // Read the staging ref whatever the fetch returned: Git can write it and still exit
+    // non-zero afterwards (a commit-graph or maintenance step failing), and a ref this call
+    // wrote must be taken back out below either way.
     String now;
-    if (!rc) {
-        const char *now_args[] = {"rev-parse", "--verify", staging, nullptr};
-        rc = value(repo, now_args, now);
+    {
+        const char *now_args[] = {"rev-parse", "--verify", "--quiet", staging, nullptr};
+        int nrc = value(repo, now_args, now, true);
+        if (!rc) rc = nrc;
+        if (!rc && now.empty()) rc = WFS_E_GIT_FAILED;
     }
     if (!rc && !force) {
         // Shared history: at least one of the World's commits is already in the repository.

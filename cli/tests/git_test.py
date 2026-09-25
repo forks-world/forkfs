@@ -1426,6 +1426,25 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b"does not carry W1's .world marker", result.stderr)
         self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
 
+    def test_publish_removes_the_staging_ref_when_fetch_fails_late(self):
+        import shlex
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'world change')
+        real_git = shutil.which('git')
+        wrapper = self.root / 'late-fetch-failure-bin'
+        wrapper.mkdir()
+        script = wrapper / 'git'
+        # The fetch itself succeeds (the staging ref is written), then the command fails.
+        script.write_text('#!/bin/sh\nfetch=0\nfor arg in "$@"; do [ "$arg" = fetch ] && fetch=1; done\n'
+                          + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
+                          + 'if [ "$fetch" = 1 ]; then exit 128; fi\nexit "$result"\n')
+        script.chmod(0o700)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        self.world('publish', wid, code=3)
+        self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs').stdout, b'')
+        self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
+
     def test_publish_follows_checkpoints_back_to_the_source(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
