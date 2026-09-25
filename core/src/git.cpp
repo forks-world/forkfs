@@ -2171,13 +2171,26 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
     // commit reachable from info.head, not only ones added since import, because the target must
     // not receive these paths through any commit being published -- a later clean commit on top
     // does not clear an earlier one out of history. Same pathspecs/flags as reject_reserved_paths.
-    // Run before the staging ref is created, so a refusal here needs no cleanup.
+    // This is scanned twice: once with --no-replace-objects, which sees the real commits and
+    // trees the import preserved (a replacement could otherwise present a safe tree for a
+    // commit whose real tree is reserved -- same reasoning as reject_reserved_paths), and once
+    // with replacement refs explicitly honored (-c core.useReplaceRefs=true, without
+    // --no-replace-objects -- default git() calls neither disable nor redirect replacements, so
+    // this only needs to override a local core.useReplaceRefs=false that might otherwise turn
+    // them off), since an active refs/replace/* the target carries identically (required by the
+    // symmetric replacement-ref check below) would otherwise let a reserved path reach the
+    // target through the replaced view alone. Either scan finding it is enough to refuse; run
+    // both before the staging ref is created, so a refusal here needs no cleanup.
     {
         const char *reserved_args[] = {"--no-replace-objects", "rev-list", "-n", "1", "--full-history",
             info.head, "--", ":(top,literal).world", ":(top,literal).world-git", nullptr};
         Vec<char> hit;
         if (int rc = git(world_root, reserved_args, &hit)) return rc;
-        if (hit.size() > 1)
+        const char *reserved_args_replaced[] = {"-c", "core.useReplaceRefs=true", "rev-list", "-n", "1",
+            "--full-history", info.head, "--", ":(top,literal).world", ":(top,literal).world-git", nullptr};
+        Vec<char> hit_replaced;
+        if (int rc = git(world_root, reserved_args_replaced, &hit_replaced)) return rc;
+        if (hit.size() > 1 || hit_replaced.size() > 1)
             return refuse(WFS_E_GIT_TARGET,
                 "the World's commit %s or its history tracks the reserved path .world or .world-git; remove it from history before publishing",
                 info.head);

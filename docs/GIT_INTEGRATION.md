@@ -129,7 +129,12 @@ Import refuses `.world` or `.world-git` tracked anywhere in the history it prese
 user can force-add and commit one of those reserved paths afterwards. Publish repeats that
 check against the commit being published: if it, or any commit reachable from it, tracks
 `.world` or `.world-git`, publish refuses and nothing is fetched into the target, even if a
-later clean commit on top no longer has the path in its tree.
+later clean commit on top no longer has the path in its tree. This is checked through both
+views of that history: the real commits and trees, ignoring any `refs/replace/*`, and again
+with replacement refs honored -- since an active replacement that the target repository
+carries identically (required by the replacement-ref compatibility check below) would
+otherwise let a reserved path reach the target through the replaced view alone, even though
+the raw scan sees only a safe tree.
 
 It is an ordinary `git fetch` into that repository followed by one compare-and-swap ref
 update: the checkout, index, working tree and other branches are not touched, nothing is

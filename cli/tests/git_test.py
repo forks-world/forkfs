@@ -729,6 +729,47 @@ class GitWorldTest(unittest.TestCase):
         finally:
             self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
 
+    def test_publish_checks_reserved_paths_through_active_replacement_refs(self):
+        # An active replacement for HEAD can present a tree that tracks a reserved path even
+        # though the real commit's tree does not. Publish's replacement-ref compatibility check
+        # (above) requires the target to carry the identical replacement before it would let the
+        # publish through at all -- so the reserved-path check must also scan history with
+        # replacements honored, or a reserved path could reach the target through the replaced
+        # view alone while the raw scan sees nothing.
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'world change')
+        head = self.git(one, 'rev-parse', 'HEAD').stdout.strip().decode()
+        # Build a replacement tree that also tracks the World's own .world marker, entirely
+        # through plumbing (ls-tree/hash-object/mktree) rather than a checkout: switching
+        # branches to add .world to history and back would have git delete-and-restore the file
+        # in the working tree, which risks disturbing the very marker wfs_world_verify checks
+        # before publish is even reached. hash-object only reads the file; it never touches it.
+        entries = self.git(one, 'ls-tree', 'HEAD').stdout.decode()
+        world_blob = self.git(one, 'hash-object', '-w', str(one / '.world')).stdout.strip().decode()
+        mktree_input = (entries + '100644 blob ' + world_blob + '\t.world\n').encode()
+        p = subprocess.run(['git', '-C', str(one), 'mktree'], input=mktree_input, env=self.env,
+                            capture_output=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        payload_tree = p.stdout.strip().decode()
+        replacement = self.git(one, 'commit-tree', payload_tree, '-p', self.base.decode(),
+                                '-m', 'reserved replacement').stdout.strip().decode()
+        self.git(one, 'replace', head, replacement)
+        # Sanity: the raw commit's tree does not track the reserved path; only the active
+        # replacement's does.
+        self.assertEqual(self.git(one, '--no-replace-objects', 'rev-list', '-n', '1', '--full-history',
+                                   head, '--', '.world').stdout, b'')
+        self.assertEqual(self.git(one, '-c', 'core.useReplaceRefs=true', 'rev-list', '-n', '1',
+                                   '--full-history', head, '--', '.world').stdout.strip().decode(), head)
+        # The target must carry the identical replacement ref -- exactly what a real publish
+        # would require before it could even reach the replacement-ref compatibility check.
+        replace_ref = 'refs/replace/' + head
+        self.git(self.source, 'fetch', '-q', str(one), replace_ref + ':' + replace_ref)
+        result = self.world('publish', wid, code=3)
+        self.assertIn(b'reserved path', result.stderr)
+        self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
+        self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs').stdout, b'')
+
     def test_publish_refuses_grafts(self):
         # Legacy info/grafts rewrite a commit's parents and are not disabled by
         # --no-replace-objects, so a graft in the target could make a diverged branch look
