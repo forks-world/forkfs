@@ -492,6 +492,31 @@ class GitWorldTest(unittest.TestCase):
         self.commit_in(one, 'husky runs')
         self.assertEqual(self.hook_runs(marker), ['husky ' + str(one)])
 
+    def test_with_hooks_refuses_a_hooks_path_inside_git_administration(self):
+        marker = self.root / 'hooks-ran'
+        self.write_hook(self.source / '.git' / 'custom-hooks' / 'pre-commit', marker, 'custom')
+        self.git(self.source, 'config', 'core.hooksPath', '.git/custom-hooks')
+        result = self.world('init', str(self.source), '--with-hooks', code=3)
+        self.assertIn(b'core.hooksPath .git/custom-hooks is inside .git, which the import replaces', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_committed_only_checks_root_level_hooks(self):
+        marker = self.root / 'hooks-ran'
+        self.git(self.source, 'config', 'core.hooksPath', '.')
+        (self.source / 'notes.txt').write_text('an ordinary untracked file is not a hook\n')
+        self.write_hook(self.source / 'pre-commit', marker, 'root')
+        result = self.world('init', str(self.source), '--committed-only', '--with-hooks', code=3)
+        self.assertIn(b'core.hooksPath . has uncommitted changes', result.stderr)
+        self.git(self.source, 'add', 'pre-commit')
+        self.git(self.source, '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'root hook')
+        snapshot = self.world('init', str(self.source), '--committed-only', '--with-hooks').stdout.split()[0].decode()
+        one, _ = self.fork('one', snapshot)
+        self.assertFalse((one / 'notes.txt').exists())
+        # (Git itself cannot execute hooks from core.hooksPath=. -- it looks the bare hook name
+        # up on PATH -- so the committed hook is checked as content, not by running it.)
+        self.assertEqual((one / 'pre-commit').read_bytes(), (self.source / 'pre-commit').read_bytes())
+        self.assertTrue(os.access(one / 'pre-commit', os.X_OK))
+
     def test_with_hooks_refuses_symlinked_hooks(self):
         marker = self.root / 'hooks-ran'
         target = self.root / 'elsewhere' / 'pre-commit'

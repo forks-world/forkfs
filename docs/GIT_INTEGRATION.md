@@ -133,8 +133,10 @@ line on stderr that names `--with-hooks`.
   directory, so it is neither scanned nor copied; an in-tree hooks directory travels with the
   tree and is refused if it, a component of its path or any entry in it is a symlink. With
   `--committed-only` the in-tree hooks directory must be committed with no pending changes
-  inside it: the reset to HEAD would otherwise remove the directory or its uncommitted hooks
-  and leave the World silently skipping them. A global `core.hooksPath` needs no carrying: global
+  inside it (for a hooks path of `.`, the hook-named files at the root): the reset to HEAD
+  would otherwise remove the directory or its uncommitted hooks and leave the World silently
+  skipping them. A hooks path inside `.git`, `.world-git` or `.world` is refused, since the
+  import replaces that administration. A global `core.hooksPath` needs no carrying: global
   configuration is shared.
 
 A symlinked hook, or a symlinked hooks directory, is refused with a reason rather than
