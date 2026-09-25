@@ -61,9 +61,14 @@ removed when the branch is created, so it cannot resurrect an upstream the World
 A candidate name that ordinary Git would still read `branch.<name>.*` settings for from
 global or system configuration -- configuration this import cannot remove -- is skipped in
 favor of the next free suffix, the same way a colliding ref is.
-A relative local remote path is made absolute against the source,
-so it keeps reaching the same repository after the source is deleted. A relative remote URL
-that any `url.<base>.insteadOf` or `pushInsteadOf` rule matches is refused instead (make the
+A relative local remote path is made absolute against the source, so it keeps reaching the
+same repository after the source is deleted. When the path exists, it is resolved through the
+filesystem the same way Git itself would reach it -- including through a symlink a `..`
+component in the path walks back out of -- rather than collapsed lexically, which a symlink
+could make point somewhere else. A relative path that does not exist and contains a `..`
+component is refused instead, since there is no filesystem to resolve that `..` through and a
+lexical guess could be wrong once a symlink appears later; make the remote URL absolute first.
+A relative remote URL that any `url.<base>.insteadOf` or `pushInsteadOf` rule matches is refused instead (make the
 URL absolute or remove the rule), because a rewrite of a relative path cannot be carried
 faithfully to a World in another location. When such a rule instead rewrites an absolute
 remote URL -- for example a per-account rule reached through a conditional include such as

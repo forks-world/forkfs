@@ -1350,6 +1350,40 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(one, 'rev-parse', 'refs/remotes/up/main').stdout.strip(), self.base)
         self.assertFalse((one / 'uploadpack-ran').exists())
 
+    def test_relative_remote_through_a_symlink_resolves_like_git(self):
+        # A relative remote path is resolved through the filesystem, the same way Git itself
+        # reaches it -- including through a symlink a ".." component in the path walks back out
+        # of -- rather than collapsed lexically, which a symlink could make point somewhere else.
+        other = self.root / 'other'
+        other.mkdir()
+        sub = other / 'sub'
+        sub.mkdir()
+        up = other / 'up.git'
+        self.run_cmd('git', 'init', '-q', '--bare', str(up))
+        link = self.source / 'link'
+        link.symlink_to(sub)
+        # The symlink is not part of the source's tracked tree; excluding it locally keeps
+        # `git status` clean without committing it.
+        with open(self.source / '.git' / 'info' / 'exclude', 'a') as exclude:
+            exclude.write('/link\n')
+        self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+        self.git(self.source, 'remote', 'add', 'origin', 'link/../up.git')
+        # Sanity: Git itself resolves this through the symlink to <root>/other/up.git.
+        self.git(self.source, 'ls-remote', 'origin')
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'config', '--get', 'remote.origin.url').stdout.strip().decode(),
+                         str((self.root / 'other' / 'up.git').resolve()))
+
+    def test_missing_relative_remote_with_dotdot_is_refused(self):
+        # Nothing on disk exists at this path, so there is no filesystem to resolve the ".."
+        # component through -- a lexical guess could be wrong once a symlink appears later.
+        self.git(self.source, 'remote', 'add', 'origin', '../missing/../nowhere.git')
+        result = self.world('init', str(self.source), code=3)
+        self.assertIn(b'does not exist', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_stale_config_for_the_world_branch_is_not_inherited(self):
         # Carried configuration can include branch.<name>.* for a branch name that has no ref
         # yet, e.g. leftover config from a branch of that name the source once had. The new

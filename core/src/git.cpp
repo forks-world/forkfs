@@ -312,10 +312,11 @@ int capture_settings(const char *root, Vec<GitSetting> &out) {
 // defaults and aliases. Aliases run only when the user types them, as they would in the
 // source. Settings Git executes on its own -- hooks, remote.*.uploadpack/receivepack/vcs,
 // branch.*.mergeoptions, core.sshCommand, credential helpers -- are not carried. A relative
-// local remote URL is made absolute against the source, so it still reaches the same
-// repository once the source is gone; one that any url.<base>.insteadOf or pushInsteadOf rule
-// matches is refused instead (make the URL absolute or remove the rule), since reproducing
-// Git's rewrite of a relative path after the World moves elsewhere cannot be done faithfully.
+// local remote URL is made absolute against the source (see `absolutize_remote_path`), so it
+// still reaches the same repository once the source is gone; one that any url.<base>.insteadOf
+// or pushInsteadOf rule matches is refused instead (make the URL absolute or remove the rule),
+// since reproducing Git's rewrite of a relative path after the World moves elsewhere cannot be
+// done faithfully.
 const char *const kCarriedConfig =
     "^(remote\\..+\\.(url|pushurl|fetch|push|tagopt|prune|prunetags|mirror|skipdefaultupdate|skipfetchall|followremotehead)"
     "|remotes\\..+|remote\\.pushdefault"
@@ -342,6 +343,36 @@ String absolute_lexical(const char *base, const char *rel) {
     for (const auto &part : parts) { out.push_back('/'); out.append(part.c_str()); }
     if (out.empty()) out.assign("/");
     return out;
+}
+// Make a relative local remote URL/pushurl absolute the way Git itself would reach it: through
+// the filesystem, so a symlink component before a ".." segment lands where Git actually resolves
+// it (which `absolute_lexical`'s lexical collapse of ".." cannot see) -- e.g. `link/../up.git`
+// with `link` a symlink to elsewhere resolves through that symlink, not lexically against `root`.
+// If the joined path exists, `fs_realpath` resolves it exactly as Git would. If it does not exist
+// (the remote was never fetched into the source, or names a path only `git push` would create),
+// there is no filesystem to resolve a ".." component through; refuse rather than guess, unless
+// the relative path has no ".." component at all, in which case symlinks cannot change its
+// meaning and the plain lexical join is exact. Used only for a relative local remote URL
+// (`is_relative_local_url`); other relative settings this file carries (e.g. hooksPath) still use
+// `absolute_lexical` directly.
+int absolutize_remote_path(const char *root, const char *rel, String &out) {
+    String joined = joinp(root, rel);
+    String real;
+    if (fs_realpath(joined.c_str(), real) == 0) { out = real; return 0; }
+    bool has_dotdot = false;
+    for (const char *p = rel; *p && !has_dotdot;) {
+        while (*p == '/') ++p;
+        const char *start = p;
+        while (*p && *p != '/') ++p;
+        has_dotdot = (size_t)(p - start) == 2 && start[0] == '.' && start[1] == '.';
+    }
+    if (has_dotdot)
+        return refuse(WFS_E_GIT_POLICY,
+            "relative remote path %s does not exist, so how its '..' resolves cannot be "
+            "preserved; make the remote URL absolute before importing",
+            rel);
+    out = absolute_lexical(root, rel);
+    return 0;
 }
 bool is_carried_boolean(const char *key) {
     size_t n = strlen(key);
@@ -518,7 +549,7 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
                     "remote URL %s is relative and url.%s.%s rewrites it; make the remote URL "
                     "absolute or remove the rewrite before importing",
                     val.c_str(), r->base.c_str(), r->push ? "pushInsteadOf" : "insteadOf");
-            val = absolute_lexical(root, val.c_str());
+            if (int arc = absolutize_remote_path(root, val.c_str(), val)) return arc;
         }
         out.emplace_back(GitSetting{key, val});
     }
@@ -577,7 +608,9 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
             const char *push_args[] = {"remote", "get-url", "--push", "--all", info.name.c_str(), nullptr};
             if (int grc = git_lines(root, push_args, effective_push)) return grc;
             if (effective_push == info.raw_pushurls) continue; // no rewrite applies
-            for (auto &u : effective_push) if (is_relative_local_url(u.c_str())) u = absolute_lexical(root, u.c_str());
+            for (auto &u : effective_push)
+                if (is_relative_local_url(u.c_str()))
+                    if (int arc = absolutize_remote_path(root, u.c_str(), u)) return arc;
             // Chain guard: same as the pinned-pushurl guard below -- only an insteadOf rule active
             // in the source's ambient configuration can rewrite an explicit pushurl again.
             for (const auto &u : effective_push) {
@@ -608,7 +641,9 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
             continue; // no rewrite applies; leave this remote as captured above
         // A rewrite applies: pin the source's result. An effective URL that is itself a relative
         // local path is only possible when no rule rewrote it; absolutize it exactly as above.
-        for (auto &u : effective_fetch) if (is_relative_local_url(u.c_str())) u = absolute_lexical(root, u.c_str());
+        for (auto &u : effective_fetch)
+            if (is_relative_local_url(u.c_str()))
+                if (int arc = absolutize_remote_path(root, u.c_str(), u)) return arc;
         bool same = effective_fetch == effective_push;
         // A pushurl is pinned whenever the effective push differs from the effective fetch, and
         // also whenever the remote had an explicit remote.<name>.pushurl in the source: Git never
@@ -616,7 +651,10 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
         // pushurl, so leaving the pushurl unpinned here would make it implicit again at the World
         // and expose it to a pushInsteadOf rule active at the World's own location.
         bool pin_push = has_explicit_pushurl || !same;
-        if (pin_push) for (auto &u : effective_push) if (is_relative_local_url(u.c_str())) u = absolute_lexical(root, u.c_str());
+        if (pin_push)
+            for (auto &u : effective_push)
+                if (is_relative_local_url(u.c_str()))
+                    if (int arc = absolutize_remote_path(root, u.c_str(), u)) return arc;
         // Chain guard: a pinned URL must not be rewritten again by a rule active in the source's
         // ambient configuration (not one reachable only through a conditional include -- see
         // `ambient_rules` above), or the World would resolve it differently than the source does.
