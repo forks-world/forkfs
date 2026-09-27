@@ -3719,6 +3719,39 @@ class GitWorldTest(unittest.TestCase):
         refused = self.world('fork', '--from', wid, '--to', str(self.root / 'three'), code=3)
         self.assertIn(b'reason: branch.world/W3 settings come from a file the World', refused.stderr)
 
+    def test_relative_gitmodules_url_uses_the_shared_branch_remote(self):
+        # libs/lib is on main with a local origin but no local branch remote; the global
+        # configuration, which the World shares, makes `amb` main's remote.
+        amb = self.root / 'origins' / 'amb'
+        amb.mkdir(parents=True)
+        x = self.origin('x')
+        self.git(self.root, 'clone', '-q', '--bare', str(x), str(amb / 'x.git'))
+        x_head = self.git(x, 'rev-parse', 'HEAD').stdout.strip().decode()
+        lib = self.origin('lib')
+        self.git(lib, 'update-index', '--add', '--cacheinfo', '160000,' + x_head + ',child')
+        (lib / '.gitmodules').write_text('[submodule "child"]\n\tpath = child\n\turl = ../x.git\n')
+        self.git(lib, 'add', '.gitmodules')
+        self.git(lib, 'commit', '-qm', 'child')
+        self.sub(self.source, 'add', '-q', str(lib), 'libs/lib')
+        self.git(self.source, 'commit', '-qm', 'lib')
+        sub = self.source / 'libs/lib'
+        self.git(sub, 'config', '--unset', 'branch.main.remote')
+        global_config = self.root / 'shared-remote-global'
+        def shared(url):
+            global_config.write_text('[branch "main"]\n\tremote = amb\n[remote "amb"]\n\turl = ' + url + '\n')
+        shared('../amb/lib.git')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        refused = self.world('init', str(self.source), code=3)
+        self.assertIn(b'reason: submodule libs/lib/child: its .gitmodules url ../x.git resolves against remote.amb.url in global or system configuration',
+                      refused.stderr)
+        shared(str(amb / 'lib.git'))
+        self.world('init', str(self.source))
+        one, _ = self.fork()
+        self.sub(one / 'libs/lib', 'update', '-q', '--init', 'child')
+        self.assertEqual(self.git(one / 'libs/lib', 'config', 'submodule.child.url').stdout.strip(),
+                         str(amb / 'x.git').encode())
+        self.assertEqual(self.git(one / 'libs/lib/child', 'rev-parse', 'HEAD').stdout.strip().decode(), x_head)
+
     def test_publish_refuses_a_gitlink_commit_the_target_lacks(self):
         self.submodule_fixture()
         self.world('init', str(self.source))

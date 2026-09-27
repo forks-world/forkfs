@@ -222,7 +222,10 @@ against the URL of the repository's default remote, and against the repository's
 directory when that remote has no URL. The default remote is `branch.<current>.remote` when
 HEAD is on a branch that sets it (even to an empty value, which selects no remote at all);
 otherwise the only remote when exactly one is configured, and `origin` otherwise. The base is
-that remote's last `url` (a remote with only a `pushurl` has none). It is decided for HEAD as it
+that remote's last `url` (a remote with only a `pushurl` has none). The branch remote, the
+remotes and their URLs are taken from the configuration Git in the World reads: the
+repository's own (as carried, with its includes) on top of the shared global and system
+configuration, last value winning; a shared remote URL is accepted only when absolute. It is decided for HEAD as it
 will be in the World -- the root's generated branch has no upstream, a submodule keeps its
 source branch unless `--committed-only` detaches it -- and the URL is refused unless that
 remote's URL travels with the World. The URL is then resolved the way Git 2.54 does (each

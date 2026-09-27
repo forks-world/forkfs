@@ -2448,7 +2448,30 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
     // The configuration this repository will have in the World, copied: `state` may move once
     // submodules are appended below. An external source's is what the import carries; a managed
     // World's travels whole with its cloned administration, so it is its own local configuration.
+    // The World's Git also reads the shared global and system configuration (command
+    // configuration belongs to one invocation, and remote/branch settings given that way are
+    // refused by reject_ambient_policy). Git reads system, then global, then the repository's
+    // own, and the last value wins, so the shared entries come first; `shared` counts them.
     Vec<GitSetting> carried;
+    size_t shared = 0;
+    {
+        const char *list[] = {"config", "--includes", "--null", "--show-scope", "--list", nullptr};
+        Vec<char> all; int status = -1;
+        int rc = git(repo_root, list, &all, &status, false, true);
+        if (rc && !(rc == WFS_E_GIT_FAILED && status == 1)) return rc;
+        // Entries are "<scope>\0<key>\n<value>\0".
+        for (size_t i = 0; !rc && i < all.size() && all[i];) {
+            const char *scope = all.data() + i;
+            i += strlen(scope) + 1;
+            if (i >= all.size()) return WFS_E_GIT_FAILED;
+            const char *entry = all.data() + i;
+            i += strlen(entry) + 1;
+            if (strcmp(scope, "system") && strcmp(scope, "global")) continue;
+            const char *nl = strchr(entry, '\n');
+            carried.emplace_back(GitSetting{String(entry, nl ? (size_t)(nl - entry) : strlen(entry)), String(nl ? nl + 1 : "")});
+            ++shared;
+        }
+    }
     if (!state.managed) {
         for (const auto &c : state.carried) carried.emplace_back(c);
     } else {
@@ -2536,7 +2559,23 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
         // pushurl has none.
         String remote_url("remote."); remote_url.append(remote.c_str()); remote_url.append(".url");
         const String *base = nullptr;
-        for (const auto &c : carried) if (c.key == remote_url) base = &c.value;
+        bool shared_base = false;
+        for (size_t i = 0; i < carried.size(); ++i)
+            if (carried[i].key == remote_url) { base = &carried[i].value; shared_base = i < shared; }
+        // A shared URL is the same file for the source and the World, but a relative one is
+        // resolved from wherever the repository is.
+        if (base && shared_base && is_relative_local_url(base->c_str())) {
+            for (const auto &link : gitlinks) {
+                const String *name = module_name(published_names, link.path);
+                const char *url = name ? gitmodules_value(published, *name, "url") : nullptr;
+                if (!url || (strncmp(url, "./", 2) && strncmp(url, "../", 3))) continue;
+                String path(prefix); path.append(link.path.c_str());
+                return refuse(WFS_E_GIT_POLICY,
+                    "submodule %s: its .gitmodules url %s resolves against %s in global or system "
+                    "configuration, which is the relative path %s and resolves differently in the World; "
+                    "make it absolute", path.c_str(), url, remote_url.c_str(), base->c_str());
+            }
+        }
         // Rewrite rules from conditional includes, active here or not: loaded only when a URL
         // that only .gitmodules gives is checked against them.
         Vec<UrlRewriteRule> conditional_rules;
