@@ -2264,6 +2264,41 @@ int in_module(int rc, const String &path) {
     if (!strncmp(inner, "submodule ", 10)) return rc;   // a nested one already named itself
     return refuse(rc, "submodule %s: %s", path.c_str(), inner);
 }
+// A managed World is copied with byte-identical configuration (the effective-configuration
+// comparison relies on it), so nothing in it is absolutized the way an external import makes a
+// relative remote or submodule URL absolute or pins a relative core.hooksPath that leaves the
+// tree. A value set by hand inside the World that Git resolves from the repository's location
+// would name a different place in the copy: refused. `git submodule init`, `git remote add`
+// with an absolute path and the import itself write absolute values; an in-tree relative
+// core.hooksPath travels with the tree and is fine.
+int reject_relative_managed_paths(const char *root) {
+    const char *args[] = {"config", "--local", "--includes", "--null", "--get-regexp",
+        "^(remote\\..*\\.(url|pushurl)|submodule\\..*\\.url)$", nullptr};
+    Vec<char> listing; int status = -1;
+    int rc = git(root, args, &listing, &status);
+    if (rc && !(rc == WFS_E_GIT_FAILED && status == 1)) return rc;
+    for (size_t i = 0; !rc && i < listing.size() && listing[i];) {
+        const char *entry = listing.data() + i;
+        i += strlen(entry) + 1;
+        const char *nl = strchr(entry, '\n');
+        if (!nl || !is_relative_local_url(nl + 1)) continue;
+        return refuse(WFS_E_GIT_POLICY,
+            "the World's %.*s is the relative path %s, which a copy of the World would resolve from its "
+            "own location; make it absolute (git submodule init and the import write absolute URLs)",
+            (int)(nl - entry), entry, nl + 1);
+    }
+    bool present = false; String hooks;
+    if ((rc = local_hooks_path(root, present, hooks))) return rc;
+    if (present && !hooks.empty() && hooks[0] != '/' && hooks[0] != '~') {
+        String normalized(hooks);
+        if ((rc = normalize_hooks_path(root, present, normalized))) return rc;
+        if (normalized[0] == '/')
+            return refuse(WFS_E_GIT_POLICY,
+                "the World's core.hooksPath %s leaves its tree, so a copy of the World would resolve it "
+                "from its own location; make it absolute", hooks.c_str());
+    }
+    return 0;
+}
 // Everything the import reproduces of one repository -- the root, or a submodule's -- and every
 // eligibility check on it. `gitlinks` receives the index's gitlinks.
 int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool module, Vec<Gitlink> &gitlinks) {
@@ -2285,6 +2320,9 @@ int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool modu
     out.with_hooks = with_hooks;
     if (with_hooks && !out.managed) {
         if (int hook_rc = capture_hooks(root, out.hooks, out.hooks_path_present, out.hooks_path)) return hook_rc;
+    }
+    if (out.managed) {
+        if (int rc = reject_relative_managed_paths(root)) return rc;
     }
     if (out.managed) {
         // A managed copy has byte-identical configuration files and import commands ignore
@@ -2401,7 +2439,9 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
     if (!state.managed) {
         for (const auto &c : state.carried) carried.emplace_back(c);
     } else {
-        const char *list[] = {"config", "--local", "--null", "--list", nullptr};
+        // With --includes: an included file's remotes, branch remotes and submodule URLs are
+        // part of the configuration the copy keeps.
+        const char *list[] = {"config", "--local", "--includes", "--null", "--list", nullptr};
         Vec<char> local;
         if (int rc = git(repo_root, list, &local)) return rc;
         for (size_t i = 0; i < local.size() && local[i];) {
@@ -3218,10 +3258,14 @@ int git_branch(const char *clone, wfs_id world) {
         // build a regex that matches this exact short name (escaping regex metacharacters
         // it may contain) and confirm no branch.<name>.* key remains.
         String pattern = branch_section_pattern(short_name);
-        const char *check[] = {"config", "--local", "--name-only", "--get-regexp", pattern.c_str(), nullptr};
+        // With --includes: a key an included file sets survives --remove-section.
+        const char *check[] = {"config", "--local", "--includes", "--name-only", "--get-regexp", pattern.c_str(), nullptr};
         int check_status = -1;
         rc = git(clone, check, nullptr, &check_status, true);
-        if (rc == 0) return WFS_E_GIT_FAILED; // a matching key still exists
+        if (rc == 0)
+            return refuse(WFS_E_GIT_POLICY, "branch.%s settings come from a file the World's configuration "
+                          "includes, which WorldFS cannot remove; the new World's branch would not start "
+                          "without an upstream", short_name);
         if (!(rc == WFS_E_GIT_FAILED && check_status == 1)) return rc; // unexpected failure
     }
     const char *checkout[] = {"symbolic-ref", "HEAD", branch, nullptr};

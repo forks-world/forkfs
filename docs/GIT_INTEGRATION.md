@@ -251,6 +251,15 @@ the submodule's repository, when the index adds or removes a submodule HEAD does
 the uncommitted `.gitmodules` names an initialized submodule differently. An uninitialized
 submodule stays uninitialized.
 
+A World is copied with byte-identical configuration, so nothing in it is made absolute the way
+an import makes relative URLs absolute. Forking or checkpointing a World therefore refuses a
+relative path set by hand in the World or any of its submodules -- `remote.<name>.url`/`pushurl`,
+`submodule.<name>.url`, or a `core.hooksPath` that leaves the tree -- since the copy would
+resolve it from its own location; make it absolute. The World's configuration is read with the
+files it includes (a relative include that resolves differently in the copy is already caught
+by the effective-configuration comparison), and a `branch.<name>.*` setting for the new World's
+branch that comes from an included file, which WorldFS cannot remove, is refused.
+
 Forking or checkpointing a World checks the submodule layout like the root's: the exact
 relative links, no `.git` directory in a submodule, no linked worktree registered in a
 submodule repository (discard refuses one too) and no lock or symlink anywhere in the

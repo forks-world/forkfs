@@ -3662,6 +3662,54 @@ class GitWorldTest(unittest.TestCase):
         refused = init(3)
         self.assertIn(b'its .gitmodules url unused.git is a path Git takes relative to the worktree', refused.stderr)
 
+    def test_relative_paths_set_inside_a_world_are_refused_by_fork(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        cases = (
+            (one, 'submodule.vendor/unused.url', '../origins/unused', b"the World's submodule.vendor/unused.url is the relative path ../origins/unused"),
+            (one, 'remote.up.url', '../origins/up.git', b"the World's remote.up.url is the relative path ../origins/up.git"),
+            (one / 'libs/lib', 'remote.origin.url', '../lib.git', b"reason: submodule libs/lib: the World's remote.origin.url is the relative path ../lib.git"),
+            (one, 'core.hooksPath', '../shared-hooks', b"the World's core.hooksPath ../shared-hooks leaves its tree"),
+        )
+        for repo, key, value, reason in cases:
+            with self.subTest(key=key):
+                previous = subprocess.run(['git', '-C', str(repo), 'config', key], env=self.env, capture_output=True).stdout
+                self.git(repo, 'config', key, value)
+                refused = self.world('fork', '--from', wid, '--to', str(self.root / 'refused'), code=3)
+                self.assertIn(reason, refused.stderr)
+                self.world('checkpoint', wid, code=3)
+                if previous:
+                    self.git(repo, 'config', key, previous.decode().strip())
+                else:
+                    self.git(repo, 'config', '--unset', key)
+        self.fork('two', wid)
+
+    def test_managed_configuration_is_read_with_its_includes(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        x = self.origin('x')
+        x_head = self.git(x, 'rev-parse', 'HEAD').stdout.strip().decode()
+        self.git(one, 'remote', 'add', 'up1', str(self.root / 'origins' / 'up1' / 'project.git'))
+        self.git(one, 'remote', 'add', 'up2', str(self.root / 'origins' / 'up2' / 'project.git'))
+        self.git(one, 'update-index', '--add', '--cacheinfo', '160000,' + x_head + ',child')
+        (one / '.gitmodules').write_text('[submodule "child"]\n\tpath = child\n\turl = ../x.git\n')
+        self.git(one, 'add', '.gitmodules')
+        self.git(one, 'commit', '-qm', 'child')
+        (one / 'child').mkdir()
+        self.world('fork', '--from', wid, '--to', str(self.root / 'refused'), code=3)
+        # origin comes only from an included file; the copy keeps that include.
+        included = self.root / 'origin-include'
+        included.write_text('[remote "origin"]\n\turl = ' + str(self.root / 'origins' / 'project.git') + '\n')
+        self.git(one, 'config', 'include.path', str(included))
+        two, _ = self.fork('two', wid)
+        self.assertEqual(self.git(two, 'remote', 'get-url', 'origin').stdout.strip(),
+                         str(self.root / 'origins' / 'project.git').encode())
+        # A branch upstream from an included file cannot be removed for the new World's branch.
+        included.write_text(included.read_text() + '[branch "world/W3"]\n\tremote = origin\n')
+        refused = self.world('fork', '--from', wid, '--to', str(self.root / 'three'), code=3)
+        self.assertIn(b'reason: branch.world/W3 settings come from a file the World', refused.stderr)
+
     def test_publish_refuses_a_gitlink_commit_the_target_lacks(self):
         self.submodule_fixture()
         self.world('init', str(self.source))
