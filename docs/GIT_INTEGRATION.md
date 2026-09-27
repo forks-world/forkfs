@@ -180,7 +180,11 @@ Every check the root's import makes is made on each submodule's repository too -
 configuration policy and filters, extensions, partial/shallow/alternates, stash and hidden
 refs, grafts, in-progress operations, dangling symbolic refs, reserved paths in its history,
 symlinked or unexpected administration -- and each is rechecked unchanged before publication.
-The copy must then hold a `.git` exactly at the imported submodules (one initialized in the
+The `.gitmodules` settings of every repository with gitlinks are read again from the copy
+-- after any `--committed-only` reset, so the bytes that will be published -- and must equal,
+as a whole, the ones the import was built from (a renamed section would leave the owned
+repository under a name the copy no longer uses). The copy must then hold a `.git` exactly at
+the imported submodules (one initialized in the
 source after it was checked would still lead back into the source), and a copy of a World is
 captured again, submodules included, and compared with its source. A refusal
 inside a submodule names it (`reason: submodule libs/lib: ...`). A submodule with no
@@ -199,6 +203,12 @@ A relative `url` is made absolute like a relative remote URL (with the same refu
 `./` or `../` one is refused when the superproject has a remote, since Git would then resolve
 it against that remote's URL. A URL that a URL rewrite rule from a conditional include matches
 is refused, and so is a conditional include that sets `submodule.<name>.*`.
+A `./` or `../` URL that only `.gitmodules` gives (no `submodule.<name>.url` in the
+repository's configuration, typically for an uninitialized submodule) is refused unless the
+repository has a remote `origin`: Git resolves it against the default remote -- in a World,
+`origin`, since the generated branch has no upstream -- and without one against the World's
+own location. No URL is pinned into the World's configuration for it, since a configured URL
+would make Git treat the submodule as active.
 `submodule.<name>.update` is carried only as `checkout`, `rebase`, `merge` or `none`: a
 `!command` (which `git submodule update` would run) or anything else is refused. The import
 itself never contacts a remote and never runs `git submodule update`.

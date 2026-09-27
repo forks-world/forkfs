@@ -3390,9 +3390,10 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'reason: submodule path libs/lib is not a directory', refused.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
-    def after_first_status(self, repo, name, action):
+    def after_first_status(self, repo, name, action, command='status'):
         """A `git` on PATH that runs the shell `action` once, right after the first successful
-        `status` whose -C is `repo` (an admission check), before the tree is copied."""
+        `command` (by default `status`, an admission check) whose -C is `repo`, before the tree
+        is copied."""
         import shlex
         real_git = shutil.which('git')
         wrapper = self.root / ('race-bin-' + name)
@@ -3400,7 +3401,7 @@ class GitWorldTest(unittest.TestCase):
         done = self.root / ('race-done-' + name)
         script = wrapper / 'git'
         script.write_text('#!/bin/sh\ncwd=\nprev=\nstatus=0\nfor arg in "$@"; do\n'
-                          + '  [ "$prev" = -C ] && cwd=$arg\n  [ "$arg" = status ] && status=1\n  prev=$arg\ndone\n'
+                          + '  [ "$prev" = -C ] && cwd=$arg\n  [ "$arg" = ' + command + ' ] && status=1\n  prev=$arg\ndone\n'
                           + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
                           + 'if [ "$result" = 0 ] && [ "$status" = 1 ] && [ "$cwd" = ' + shlex.quote(str(repo))
                           + ' ] && [ ! -e ' + shlex.quote(str(done)) + ' ]; then\n'
@@ -3434,6 +3435,44 @@ class GitWorldTest(unittest.TestCase):
         self.assertTrue(done.exists())
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
         (unused / '.git').unlink()
+        self.world('init', str(self.source))
+
+    def test_gitmodules_renamed_after_capture_is_not_published(self):
+        import shlex
+        self.submodule_fixture()
+        # The deepest submodule is captured last; right after its history scan, the root's
+        # .gitmodules renames the initialized submodule before the tree is copied.
+        rename = (shlex.quote(shutil.which('git')) + ' config -f ' + shlex.quote(str(self.source / '.gitmodules'))
+                  + ' --rename-section submodule.lib-module submodule.renamed')
+        wrapper, done = self.after_first_status(self.source / 'libs/lib/deps/inner', 'rename', rename, 'rev-list')
+        path = self.env['PATH']
+        self.env['PATH'] = str(wrapper) + os.pathsep + path
+        self.world('init', str(self.source), '--include-changes', code=1)
+        self.env['PATH'] = path
+        self.assertTrue(done.exists())
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        # Seen at capture time, the new name no longer matches the source's module repository.
+        refused = self.world('init', str(self.source), '--include-changes', code=3)
+        self.assertIn(b"points outside its superproject's modules/renamed", refused.stderr)
+        self.git(self.source, 'config', '-f', '.gitmodules', '--rename-section', 'submodule.renamed', 'submodule.lib-module')
+        snapshot = self.world('init', str(self.source), '--include-changes').stdout.split()[0].decode()
+        one, _ = self.fork('one', snapshot)
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+
+    def test_relative_gitmodules_url_needs_a_remote_or_a_configured_url(self):
+        self.submodule_fixture()
+        self.git(self.source, 'config', '-f', '.gitmodules', 'submodule.vendor/unused.url', '../origins/unused')
+        self.git(self.source, 'commit', '-qam', 'relative url')
+        refused = self.world('init', str(self.source), code=3)
+        self.assertIn(b'reason: submodule vendor/unused: its .gitmodules url ../origins/unused is relative', refused.stderr)
+        refused = self.world('init', str(self.source), '--committed-only', code=3)
+        self.assertIn(b'its .gitmodules url ../origins/unused is relative', refused.stderr)
+        # A configured URL decides instead of .gitmodules.
+        self.git(self.source, 'config', 'submodule.vendor/unused.url', str(self.root / 'origins' / 'unused'))
+        self.world('init', str(self.source))
+        self.git(self.source, 'config', '--unset', 'submodule.vendor/unused.url')
+        # With a remote origin, Git resolves it against the carried remote URL, the same everywhere.
+        self.git(self.source, 'remote', 'add', 'origin', str(self.root / 'origins' / 'project.git'))
         self.world('init', str(self.source))
 
     def test_publish_refuses_a_gitlink_commit_the_target_lacks(self):

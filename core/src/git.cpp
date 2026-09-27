@@ -2079,11 +2079,11 @@ int tree_gitlinks(const char *root, const char *tree, Vec<Gitlink> &out) {
     parse_gitlinks(listing, out);
     return 0;
 }
-// The submodule names .gitmodules gives each path, as Git reads the file: the worktree's copy
-// when there is one, else the index's, else HEAD's -- or, with `tree`, that commit's. Pairs are
-// {path, name}.
-int module_names(const char *root, const char *tree, Vec<GitSetting> &out) {
-    out.clear();
+// Every setting of .gitmodules, as Git reads the file: the worktree's copy when there is one,
+// else the index's, else HEAD's -- or, with `tree`, that commit's. The listing is
+// `config --null --list` output ("<key>\n<value>\0" entries), empty when there is no file.
+int gitmodules_listing(const char *root, const char *tree, Vec<char> &listing) {
+    listing.clear();
     String file = joinp(root, ".gitmodules"), blob;
     const char *source_flag = "--blob";
     if (tree) {
@@ -2107,22 +2107,32 @@ int module_names(const char *root, const char *tree, Vec<GitSetting> &out) {
             if (!found) return 0;
         }
     }
-    const char *args[] = {"config", source_flag, blob.c_str(), "--null", "--get-regexp", "^submodule\\..*\\.path$", nullptr};
-    Vec<char> listing; int status = -1;
-    int rc = git(root, args, &listing, &status);
-    if (rc == WFS_E_GIT_FAILED && status == 1) return 0;
-    if (rc) return rc;
-    // Entries are "submodule.<name>.path\n<path>\0".
+    const char *args[] = {"config", source_flag, blob.c_str(), "--null", "--list", nullptr};
+    return git(root, args, &listing);
+}
+// The value of `submodule.<name>.<var>` in a .gitmodules listing; the last one wins, like Git.
+const char *gitmodules_value(const Vec<char> &listing, const String &name, const char *var) {
+    String key("submodule."); key.append(name.c_str()); key.push_back('.'); key.append(var); key.push_back('\n');
+    const char *found = nullptr;
+    for (size_t i = 0; i < listing.size() && listing[i];) {
+        const char *entry = listing.data() + i;
+        i += strlen(entry) + 1;
+        if (!strncmp(entry, key.c_str(), key.size())) found = entry + key.size();
+    }
+    return found;
+}
+// The submodule name .gitmodules gives each path, from a listing: pairs are {path, name}.
+void module_names(const Vec<char> &listing, Vec<GitSetting> &out) {
+    out.clear();
     for (size_t i = 0; i < listing.size() && listing[i];) {
         const char *entry = listing.data() + i;
         size_t len = strlen(entry);
         i += len + 1;
         const char *nl = strchr(entry, '\n');
-        if (!nl || nl - entry < 16) continue;
+        if (!nl || nl - entry < 16 || strncmp(entry, "submodule.", 10) || strncmp(nl - 5, ".path", 5)) continue;
         String name(entry + 10, (size_t)(nl - entry) - 15);
         out.emplace_back(GitSetting{String(nl + 1), name});
     }
-    return 0;
 }
 const String *module_name(const Vec<GitSetting> &names, const String &path) {
     const String *found = nullptr;
@@ -2318,10 +2328,17 @@ constexpr int kMaxModuleDepth = 8;
 // `tree`, for --committed-only, is the commit this repository's copy is reset to: each
 // submodule is then reset to the commit that tree records for it.
 int discover_modules(GitSource &top, const char *repo_root, const String &prefix, const String &gitdir_prefix,
-                     const Vec<Gitlink> &gitlinks, const char *tree, int depth) {
+                     const Vec<Gitlink> &gitlinks, const char *tree, int depth, size_t self) {
     if (gitlinks.empty()) return 0;
+    GitRepoState &state = self == (size_t)-1 ? top : top.modules[self].repo;
+    // The carried configuration of this repository (external sources only), copied: `state`
+    // may move once submodules are appended below.
+    Vec<GitSetting> carried;
+    if (!state.managed) for (const auto &c : state.carried) carried.emplace_back(c);
+    Vec<char> listing, tree_listing;
+    if (int rc = gitmodules_listing(repo_root, nullptr, listing)) return rc;
     Vec<GitSetting> names, tree_names;
-    if (int rc = module_names(repo_root, nullptr, names)) return rc;
+    module_names(listing, names);
     Vec<Gitlink> tree_links;
     if (tree) {
         // Resetting the copy to `tree` would turn a submodule the index adds into a nested
@@ -2332,7 +2349,37 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
         for (size_t i = 0; same && i < gitlinks.size(); ++i) same = find_link(tree_links, gitlinks[i].path.c_str()) != nullptr;
         if (!same)
             return refuse(WFS_E_GIT_UNSUPPORTED, "a submodule is added or removed without being committed, which --committed-only cannot reset; commit it or drop --committed-only");
-        if (int rc = module_names(repo_root, tree, tree_names)) return rc;
+        if (int rc = gitmodules_listing(repo_root, tree, tree_listing)) return rc;
+        module_names(tree_listing, tree_names);
+    }
+    // The .gitmodules the copy will publish -- the worktree's, or with --committed-only the
+    // committed one -- is rechecked as a whole against the copy before publication
+    // (same_gitmodules): the owned repositories are named after this mapping.
+    state.gitmodules = tree ? tree_listing : listing;
+    state.gitmodules_checked = true;
+    // Git resolves a "./" or "../" URL that only .gitmodules gives (no submodule.<name>.url in
+    // the configuration: an uninitialized submodule, typically) against the World's default
+    // remote, `origin` -- its generated branch has no upstream -- and, without one, against the
+    // World's own location, which is not where the source's resolved.
+    if (!state.managed) {
+        bool origin = false;
+        for (const auto &c : carried) if (c.key == "remote.origin.url") origin = true;
+        const Vec<char> &published = tree ? tree_listing : listing;
+        const Vec<GitSetting> &published_names = tree ? tree_names : names;
+        for (const auto &link : gitlinks) {
+            const String *name = module_name(published_names, link.path);
+            const char *url = name ? gitmodules_value(published, *name, "url") : nullptr;
+            if (!url || (strncmp(url, "./", 2) && strncmp(url, "../", 3)) || origin) continue;
+            String key("submodule."); key.append(name->c_str()); key.append(".url");
+            bool configured = false;
+            for (const auto &c : carried) if (c.key == key) configured = true;
+            if (configured) continue;
+            String path(prefix); path.append(link.path.c_str());
+            return refuse(WFS_E_GIT_POLICY,
+                "submodule %s: its .gitmodules url %s is relative and the repository has no remote "
+                "origin, so it would resolve against the World's location; set submodule.%s.url or "
+                "add a remote before importing", path.c_str(), url, name->c_str());
+        }
     }
     String modules_dir;
     const char *modules_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "modules", nullptr};
@@ -2438,7 +2485,7 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
         String child_prefix(path); child_prefix.push_back('/');
         String child_gitdir(m.gitdir); child_gitdir.push_back('/');
         if (int rc = discover_modules(top, full.c_str(), child_prefix, child_gitdir, sub_links,
-                                      tree ? m.target.c_str() : nullptr, depth + 1)) return rc;
+                                      tree ? m.target.c_str() : nullptr, depth + 1, top.modules.size() - 1)) return rc;
     }
     return 0;
 }
@@ -2480,7 +2527,7 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
     // uncommitted state is simply not carried, so it is not a reason to refuse.
     out.require_clean = !include_changes;
     out.committed_only = committed_only;
-    if (int rc = discover_modules(out, root, String(), String(), gitlinks, committed_only ? out.head.c_str() : nullptr, 0))
+    if (int rc = discover_modules(out, root, String(), String(), gitlinks, committed_only ? out.head.c_str() : nullptr, 0, (size_t)-1))
         return rc;
     if (!include_changes && !committed_only) {
         // Every repository's policy checks have run by now, so no status below runs a filter.
@@ -2603,6 +2650,20 @@ int copy_layout_check(const GitSource &s, const char *clone) {
             if (initialized != imported) return -EBUSY;
         }
         if (int rc = nested_check(dir.c_str(), &links)) return rc;
+    }
+    return 0;
+}
+// The copy's .gitmodules -- the bytes that will be published, after any --committed-only
+// reset -- must give every repository with gitlinks exactly the settings the import was built
+// from: an owned repository sits under the name its .gitmodules had at capture time.
+int same_gitmodules(const GitSource &s, const char *clone) {
+    for (size_t i = 0; i <= s.modules.size(); ++i) {
+        const GitRepoState &state = i ? s.modules[i - 1].repo : s;
+        if (!state.gitmodules_checked) continue;
+        String dir = i ? joinp(clone, s.modules[i - 1].path.c_str()) : String(clone);
+        Vec<char> listing;
+        if (int rc = gitmodules_listing(dir.c_str(), nullptr, listing)) return rc;
+        if (!same_bytes(listing, state.gitmodules)) return -EBUSY;
     }
     return 0;
 }
@@ -2835,6 +2896,7 @@ int git_import(const GitSource &s, const char *clone) {
     if (s.committed_only) {
         if (int rc = reset_copy(s, clone)) return rc;
     }
+    if (int rc = same_gitmodules(s, clone)) return rc;
     if (!s.require_clean) return 0;
     return require_clean_copy(s, clone);
 }

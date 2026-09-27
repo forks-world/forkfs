@@ -69,6 +69,10 @@ struct GitRepoState {
     Vec<GitHook> hooks;
     bool hooks_path_present = false;
     String hooks_path;
+    // When the index records gitlinks: the .gitmodules settings the published copy will have
+    // (`config --null --list`), rechecked against the copy before publication.
+    bool gitmodules_checked = false;
+    Vec<char> gitmodules;
 };
 // One initialized submodule, at any depth. Git looks for a submodule's repository in
 // `$GIT_DIR/modules/<name>` of its superproject -- for the root, the World's own per-worktree
