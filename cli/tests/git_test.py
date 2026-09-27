@@ -3511,6 +3511,12 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(one / 'libs/lib/child', 'rev-parse', 'HEAD').stdout.strip().decode(), x_head)
         self.assertEqual(self.git(one / 'libs/lib', 'config', 'submodule.child.url').stdout.strip(),
                          str(up / 'x.git').encode())
+        # An explicitly empty branch remote is still the selected one: Git finds no URL for it.
+        self.git(sub, 'config', 'branch.main.remote', '')
+        refused = self.world('init', str(self.source), code=3)
+        self.assertIn(b"reason: submodule libs/lib/child: its .gitmodules url ../x.git is relative and the repository's default remote (an empty branch.<name>.remote)",
+                      refused.stderr)
+        self.git(sub, 'config', 'branch.main.remote', 'upstream')
         # --committed-only detaches a submodule that is ahead of its gitlink; detached, with two
         # remotes and no origin, Git would resolve against the World's own directory.
         self.identify(sub)
@@ -3625,6 +3631,36 @@ class GitWorldTest(unittest.TestCase):
         (self.source / '.gitmodules').unlink()
         refused = self.world('init', str(self.source), '--include-changes', code=3)
         self.assertIn(b'reason: submodule libs/lib has no entry in the .gitmodules that would be published', refused.stderr)
+
+    def test_gitmodules_url_is_checked_like_a_carried_url(self):
+        self.submodule_fixture()
+        unused = str(self.root / 'origins' / 'unused')
+        rules = self.root / 'rewrite-rules'
+        rules.write_text('[url "/nowhere/"]\n insteadOf = ' + unused + '\n')
+        global_config = self.root / 'rewrite-global'
+        global_config.write_text('[includeIf "gitdir:' + str(self.root / 'elsewhere') + '/"]\n path = ' + str(rules) + '\n')
+        def gitmodules_url(url):
+            self.git(self.source, 'config', '-f', '.gitmodules', 'submodule.vendor/unused.url', url)
+            self.git(self.source, 'commit', '-qam', 'url ' + url)
+        def init(code):
+            self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+            result = self.world('init', str(self.source), code=code)
+            self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+            return result
+        # The absolute URL only .gitmodules gives, and the same URL resolved from a relative one.
+        refused = init(3)
+        self.assertIn(b'reason: submodule vendor/unused: its .gitmodules url resolves to ' + unused.encode()
+                      + b', which url./nowhere/.insteadOf from a conditional include', refused.stderr)
+        self.git(self.source, 'remote', 'add', 'origin', str(self.root / 'origins' / 'project.git'))
+        gitmodules_url('../unused')
+        refused = init(3)
+        self.assertIn(b'its .gitmodules url resolves to ' + unused.encode(), refused.stderr)
+        rules.write_text('')
+        init(0)
+        # A plain relative path is cloned from the worktree top, a different place in the World.
+        gitmodules_url('unused.git')
+        refused = init(3)
+        self.assertIn(b'its .gitmodules url unused.git is a path Git takes relative to the worktree', refused.stderr)
 
     def test_publish_refuses_a_gitlink_commit_the_target_lacks(self):
         self.submodule_fixture()

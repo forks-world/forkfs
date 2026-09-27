@@ -217,13 +217,23 @@ A `./` or `../` URL that only `.gitmodules` gives (no `submodule.<name>.url` in 
 repository's configuration, typically for an uninitialized submodule) is resolved by Git
 against the URL of the repository's default remote, and against the repository's own
 directory when that remote has no URL. The default remote is `branch.<current>.remote` when
-HEAD is on a branch that has one; otherwise the only remote when exactly one is configured, and
-`origin` otherwise. It is decided for HEAD as it will be in the World -- the root's generated
-branch has no upstream, a submodule keeps its source branch unless `--committed-only` detaches
-it -- and the URL is refused unless that remote's URL travels with the World. This is checked
-again whenever a World is forked or checkpointed: every fork of a World or of its checkpoints
-replaces the World's own branch (and whatever upstream it had) with a new `world/W<n>`. No URL is pinned into the World's configuration for it, since a configured URL
-would make Git treat the submodule as active.
+HEAD is on a branch that sets it (even to an empty value, which selects no remote at all);
+otherwise the only remote when exactly one is configured, and `origin` otherwise. The base is
+that remote's last `url` (a remote with only a `pushurl` has none). It is decided for HEAD as it
+will be in the World -- the root's generated branch has no upstream, a submodule keeps its
+source branch unless `--committed-only` detaches it -- and the URL is refused unless that
+remote's URL travels with the World. The URL is then resolved the way Git 2.54 does (each
+leading `../` drops the base's last `/`-component, `./` is skipped, one trailing `/` is
+dropped) and refused where Git's result could not be reproduced faithfully: a `../` that would
+cut into the host or root (Git then produces relative or malformed URLs), a split at an
+scp-like `host:`, an empty remainder, or a relative base. Any other relative `.gitmodules` URL
+(`sub.git`, `~/x.git`) is refused too: Git clones it as it is from the worktree top. The
+resolved URL -- or an absolute one `.gitmodules` gives -- is refused when a URL rewrite rule
+from a conditional include matches it, exactly like a carried URL. This is checked again
+whenever a World is forked or checkpointed: every fork of a World or of its checkpoints
+replaces the World's own branch (and whatever upstream it had) with a new `world/W<n>`. No URL
+is pinned into the World's configuration for it, since a configured URL would make Git treat
+the submodule as active.
 `submodule.<name>.update` is carried only as `checkout`, `rebase`, `merge` or `none`: a
 `!command` (which `git submodule update` would run) or anything else is refused. The import
 itself never contacts a remote and never runs `git submodule update`.

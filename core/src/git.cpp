@@ -2129,6 +2129,48 @@ const String *module_name(const Vec<GitSetting> &names, const String &path) {
     for (const auto &n : names) if (n.key == path) found = &n.value;   // the last one wins, like Git
     return found;
 }
+// `git submodule init`'s resolution of a "./" or "../" .gitmodules URL against a remote's URL,
+// observed with Git 2.54 across local, file://, ssh://, https:// and scp-like bases: trailing
+// slashes of the base are dropped; each leading "../" removes the base's last "/"-component and
+// each leading "./" is skipped; the rest is joined with "/", and one trailing "/" of the result
+// is dropped. Git also chops at a ':' of an scp-like base, falls back to "." and yields
+// relative or malformed URLs (ssh:/x.git) once the components run out: those cases, an empty
+// rest, and a relative base are not reproduced -- false, and the caller refuses.
+bool resolve_submodule_url(const String &base_url, const char *url, String &out) {
+    String base(base_url);
+    while (!base.empty() && base.back() == '/') base.pop_back();
+    const char *b = base.c_str();
+    const char *scheme = strstr(b, "://");
+    size_t floor;   // no "../" may cut below this: the root, the host, or the scp host
+    if (b[0] == '/') {
+        floor = 0;
+    } else if (scheme) {
+        const char *slash = strchr(scheme + 3, '/');
+        if (!slash) return false;
+        floor = (size_t)(slash - b);
+    } else {
+        const char *colon = strchr(b, ':'), *slash = strchr(b, '/');
+        if (!colon || (slash && slash < colon)) return false;
+        floor = (size_t)(colon - b) + 1;
+    }
+    const char *p = url;
+    for (;;) {
+        if (!strncmp(p, "../", 3)) {
+            p += 3;
+            const char *last = strrchr(base.c_str(), '/');
+            if (!last || (size_t)(last - base.c_str()) < floor) return false;
+            base.resize((size_t)(last - base.c_str()));
+        } else if (!strncmp(p, "./", 2)) {
+            p += 2;
+        } else {
+            break;
+        }
+    }
+    if (!*p) return false;
+    out = base; out.push_back('/'); out.append(p);
+    if (out.back() == '/') out.pop_back();
+    return true;
+}
 // A name is a directory below modules/: no empty, "." or ".." component, nothing absolute.
 bool valid_module_name(const String &name) {
     if (name.empty() || name[0] == '/' || strpbrk(name.c_str(), "\\\n\r")) return false;
@@ -2415,12 +2457,16 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
             bool detached = me.repo.head_ref.empty() || (tree && me.target != me.repo.head);
             if (!detached && !strncmp(me.repo.head_ref.c_str(), "refs/heads/", 11)) branch.assign(me.repo.head_ref.c_str() + 11);
         }
+        // branch.<b>.remote is the selected remote as soon as it is set, even to an empty value
+        // (Git then finds no remote..url and uses the repository's directory); the last value
+        // wins. pushRemote and remote.pushDefault play no part (observed).
         String remote;
+        bool branch_remote = false;
         if (!branch.empty()) {
             String key("branch."); key.append(branch.c_str()); key.append(".remote");
-            for (const auto &c : carried) if (c.key == key) remote = c.value;
+            for (const auto &c : carried) if (c.key == key) { remote = c.value; branch_remote = true; }
         }
-        if (remote.empty()) {
+        if (!branch_remote) {
             Vec<String> remotes;
             for (const auto &c : carried) {
                 if (strncmp(c.key.c_str(), "remote.", 7)) continue;
@@ -2433,23 +2479,59 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
             }
             remote.assign(remotes.size() == 1 ? remotes[0].c_str() : "origin");
         }
+        // The base is the remote's last `url` (observed with several); a remote with only a
+        // pushurl has none.
         String remote_url("remote."); remote_url.append(remote.c_str()); remote_url.append(".url");
-        bool origin = false;
-        for (const auto &c : carried) if (c.key == remote_url) origin = true;
+        const String *base = nullptr;
+        for (const auto &c : carried) if (c.key == remote_url) base = &c.value;
+        // Rewrite rules from conditional includes, active here or not: loaded only when a URL
+        // that only .gitmodules gives is checked against them.
+        Vec<UrlRewriteRule> conditional_rules;
+        bool rules_loaded = false;
         for (const auto &link : gitlinks) {
             const String *name = module_name(published_names, link.path);
             const char *url = name ? gitmodules_value(published, *name, "url") : nullptr;
-            if (!url || (strncmp(url, "./", 2) && strncmp(url, "../", 3)) || origin) continue;
+            if (!url) continue;
             String key("submodule."); key.append(name->c_str()); key.append(".url");
             bool configured = false;
             for (const auto &c : carried) if (c.key == key) configured = true;
-            if (configured) continue;
+            if (configured) continue;   // a configured URL is checked with the carried configuration
             String path(prefix); path.append(link.path.c_str());
-            return refuse(WFS_E_GIT_POLICY,
-                "submodule %s: its .gitmodules url %s is relative and the repository's default remote "
-                "(%s) has no URL the World carries, so it would resolve against the World's location; "
-                "set submodule.%s.url or add the remote before importing", path.c_str(), url, remote.c_str(),
-                name->c_str());
+            String effective;
+            if (!strncmp(url, "./", 2) || !strncmp(url, "../", 3)) {
+                if (!base)
+                    return refuse(WFS_E_GIT_POLICY,
+                        "submodule %s: its .gitmodules url %s is relative and the repository's default remote "
+                        "(%s%s) has no URL the World carries, so it would resolve against the World's location; "
+                        "set submodule.%s.url or add the remote before importing", path.c_str(), url,
+                        remote.empty() ? "an empty branch." : remote.c_str(), remote.empty() ? "<name>.remote" : "",
+                        name->c_str());
+                if (!resolve_submodule_url(*base, url, effective))
+                    return refuse(WFS_E_GIT_POLICY,
+                        "submodule %s: its .gitmodules url %s cannot be resolved against %s the way Git would "
+                        "be reproduced faithfully; set submodule.%s.url before importing", path.c_str(), url,
+                        base->c_str(), name->c_str());
+            } else if (url[0] == '/' || (url[0] != '~' && !is_relative_local_url(url))) {
+                effective.assign(url);
+            } else {
+                // Any other path (`sub.git`, `..`, `~/x.git`) is cloned as it is, from the worktree
+                // top (observed): a different place in the World.
+                return refuse(WFS_E_GIT_POLICY,
+                    "submodule %s: its .gitmodules url %s is a path Git takes relative to the worktree, "
+                    "which differs in the World; set submodule.%s.url before importing", path.c_str(), url, name->c_str());
+            }
+            // The same guard as for carried remote and submodule URLs (capture_carried_config):
+            // a rule a conditional include holds could rewrite the URL differently at the World.
+            if (!rules_loaded) {
+                if (int rc = scan_conditional_includes(repo_root, nullptr, &conditional_rules)) return rc;
+                rules_loaded = true;
+            }
+            const UrlRewriteRule *r = matching_rewrite(conditional_rules, effective.c_str());
+            if (r)
+                return refuse(WFS_E_GIT_POLICY,
+                    "submodule %s: its .gitmodules url resolves to %s, which url.%s.%s from a conditional "
+                    "include can change at the World's location; simplify the URL rewrite rules before importing",
+                    path.c_str(), effective.c_str(), r->base.c_str(), r->push ? "pushInsteadOf" : "insteadOf");
         }
     }
     String modules_dir;
