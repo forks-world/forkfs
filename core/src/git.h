@@ -14,12 +14,15 @@ struct GitHook {
     Vec<char> bytes;
     uint32_t mode = 0;
 };
-// Git administration is owned by the tree, so the existing rename/trash/GC protocol also
-// owns all of its Git resources. No worktree is registered in the user's source repository.
-struct GitSource {
-    bool present = false;
+// The captured state of one repository -- the root, or one initialized submodule -- that the
+// import reproduces in owned administration and rechecks before publication.
+struct GitRepoState {
     bool managed = false;
-    String root, head, index_path;
+    // The repository's worktree (for a submodule, its directory in the source) and its absolute
+    // Git directory as Git resolves it.
+    String root, admin, head, index_path;
+    // HEAD's symbolic target (refs/heads/...), or empty when HEAD is detached. Submodules keep it.
+    String head_ref;
     Vec<char> index;
     String exclude_path;
     Vec<char> exclude;
@@ -45,7 +48,8 @@ struct GitSource {
     bool worktree_config = false;
     Vec<GitSetting> worktree_settings;
     // External sources: the repository-local remotes, upstream tracking, URL rewrites, push
-    // defaults and aliases that travel into the owned repository (capture_carried_config).
+    // defaults, submodule settings and aliases that travel into the owned repository
+    // (capture_carried_config).
     Vec<GitSetting> carried;
     // user.name / user.email as the source defines them (present ones only, possibly empty).
     Vec<GitSetting> identity;
@@ -58,11 +62,6 @@ struct GitSource {
     bool rerere_present = false;
     uint64_t rerere_bytes = 0;
     uint64_t import_bytes = 0;
-    // Set when the caller did not pass --include-changes: the published copy must be clean too.
-    bool require_clean = false;
-    // --committed-only: the source may be dirty, but the copy is reset to HEAD before
-    // publication (reset_to_head); ignored files stay. The source itself is never touched.
-    bool committed_only = false;
     // --with-hooks, external sources only (a managed World's hooks travel inside its cloned
     // .world-git): the executable, regular, non-.sample files of the common hooks directory and
     // a repository-local core.hooksPath, installed in the owned repository (capture_hooks).
@@ -70,6 +69,35 @@ struct GitSource {
     Vec<GitHook> hooks;
     bool hooks_path_present = false;
     String hooks_path;
+};
+// One initialized submodule, at any depth. Git looks for a submodule's repository in
+// `$GIT_DIR/modules/<name>` of its superproject -- for the root, the World's own per-worktree
+// directory .world-git/repo.git/worktrees/active -- so a nested one lives in
+// `modules/<name>/modules/<name>`. The worktree's `.git` file and the module's core.worktree
+// are relative, like the root's own links.
+struct GitModule {
+    String path;       // relative to the tree's root
+    String name;       // from .gitmodules
+    String gitdir;     // relative to .world-git/repo.git/worktrees/active
+    // --committed-only: the commit the superproject's committed tree records for it.
+    String target;
+    GitRepoState repo;
+};
+// Git administration is owned by the tree, so the existing rename/trash/GC protocol also
+// owns all of its Git resources. No worktree is registered in the user's source repository.
+struct GitSource : GitRepoState {
+    bool present = false;
+    // Set when the caller did not pass --include-changes: the published copy must be clean too.
+    bool require_clean = false;
+    // --committed-only: the source may be dirty, but the copy is reset to HEAD before
+    // publication (reset_to_head); ignored files stay. The source itself is never touched.
+    bool committed_only = false;
+    // Initialized submodules, parents before their own submodules, and the sum of their
+    // import_bytes: an external import copies each one's objects too.
+    Vec<GitModule> modules;
+    uint64_t modules_bytes = 0;
+    // The root's index records gitlinks, initialized or not.
+    bool has_gitlinks = false;
 };
 int git_source(const char *root, bool include_changes, GitSource &out, bool committed_only = false,
                bool with_hooks = false);
