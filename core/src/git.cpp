@@ -2193,6 +2193,37 @@ String squeeze_slashes(const char *text, size_t n) {
     }
     return out;
 }
+// A managed World's submodule at `path` (relative to the World's root `world`) is trusted only
+// in the World's own layout, exactly: every component of its path a real directory, its `.git`
+// a regular file with the relative link to the owned repository `gitdir` (see GitModule), and
+// that repository's core.worktree the relative link back. Anything else -- a symlinked
+// directory, a gitfile repointed at some other repository -- would have Git read or write a
+// repository that is not the World's.
+int check_owned_module(const char *world, const String &path, const String &gitdir) {
+    String walk(world);
+    for (const char *p = path.c_str(); *p;) {
+        const char *start = p;
+        while (*p && *p != '/') ++p;
+        walk = joinp(walk.c_str(), String(start, (size_t)(p - start)).c_str());
+        if (*p) ++p;
+        struct stat st;
+        if (lstat(walk.c_str(), &st) || !S_ISDIR(st.st_mode))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "submodule path %s is not a directory of the World", path.c_str());
+    }
+    String dot = joinp(walk.c_str(), ".git");
+    struct stat st;
+    Vec<char> bytes;
+    if (lstat(dot.c_str(), &st) || !S_ISREG(st.st_mode) || read_bytes(dot.c_str(), bytes) ||
+        squeeze_slashes(bytes.data(), bytes.size()) != module_gitfile(path, gitdir))
+        return refuse(WFS_E_GIT_UNSUPPORTED, "the .git link of submodule %s was changed", path.c_str());
+    String admin(kActive); admin.push_back('/'); admin.append(gitdir.c_str()); admin.append("/config");
+    String config = joinp(world, admin.c_str()), worktree;
+    const char *wt_args[] = {"config", "--file", config.c_str(), "--get", "core.worktree", nullptr};
+    if (int rc = get_config(world, wt_args, worktree)) return rc;
+    if (squeeze_slashes(worktree.c_str(), worktree.size()) != module_worktree(path, gitdir))
+        return refuse(WFS_E_GIT_UNSUPPORTED, "the core.worktree link of submodule %s was changed", path.c_str());
+    return 0;
+}
 // Prefix the reason of a refusal that came from inside a submodule with its path.
 int in_module(int rc, const String &path) {
     if (rc != WFS_E_GIT_UNSUPPORTED && rc != WFS_E_GIT_POLICY) return rc;
@@ -2357,13 +2388,45 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
     // (same_gitmodules): the owned repositories are named after this mapping.
     state.gitmodules = tree ? tree_listing : listing;
     state.gitmodules_checked = true;
-    // Git resolves a "./" or "../" URL that only .gitmodules gives (no submodule.<name>.url in
-    // the configuration: an uninitialized submodule, typically) against the World's default
-    // remote, `origin` -- its generated branch has no upstream -- and, without one, against the
-    // World's own location, which is not where the source's resolved.
+    // A "./" or "../" URL that only .gitmodules gives (no submodule.<name>.url in the
+    // configuration: an uninitialized submodule, typically) is resolved by `git submodule init`
+    // against the URL of the repository's default remote, and against the repository's own
+    // directory when that remote has no URL. Observed with Git 2.54: the default remote is
+    // branch.<current>.remote when HEAD is on a branch that has one (even when origin also
+    // exists, and even when that remote is not configured -- then the directory is the base);
+    // otherwise, detached or on a branch without one, it is the only remote when exactly one is
+    // configured, and `origin` otherwise. It is decided here for HEAD as it will be in the
+    // World: the root's generated world/W<n> branch has no upstream; a submodule keeps its
+    // source branch unless --committed-only detaches it. Accepted only when that remote's URL
+    // travels with the World; the World's own directory is never the source's.
     if (!state.managed) {
+        String branch;
+        if (self != (size_t)-1) {
+            const GitModule &me = top.modules[self];
+            bool detached = me.repo.head_ref.empty() || (tree && me.target != me.repo.head);
+            if (!detached && !strncmp(me.repo.head_ref.c_str(), "refs/heads/", 11)) branch.assign(me.repo.head_ref.c_str() + 11);
+        }
+        String remote;
+        if (!branch.empty()) {
+            String key("branch."); key.append(branch.c_str()); key.append(".remote");
+            for (const auto &c : carried) if (c.key == key) remote = c.value;
+        }
+        if (remote.empty()) {
+            Vec<String> remotes;
+            for (const auto &c : carried) {
+                if (strncmp(c.key.c_str(), "remote.", 7)) continue;
+                const char *dot = strrchr(c.key.c_str() + 7, '.');
+                if (!dot) continue;   // remote.pushDefault
+                String name(c.key.c_str() + 7, (size_t)(dot - c.key.c_str() - 7));
+                bool seen = false;
+                for (const auto &r : remotes) if (r == name) seen = true;
+                if (!seen) remotes.emplace_back(name);
+            }
+            remote.assign(remotes.size() == 1 ? remotes[0].c_str() : "origin");
+        }
+        String remote_url("remote."); remote_url.append(remote.c_str()); remote_url.append(".url");
         bool origin = false;
-        for (const auto &c : carried) if (c.key == "remote.origin.url") origin = true;
+        for (const auto &c : carried) if (c.key == remote_url) origin = true;
         const Vec<char> &published = tree ? tree_listing : listing;
         const Vec<GitSetting> &published_names = tree ? tree_names : names;
         for (const auto &link : gitlinks) {
@@ -2376,9 +2439,10 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
             if (configured) continue;
             String path(prefix); path.append(link.path.c_str());
             return refuse(WFS_E_GIT_POLICY,
-                "submodule %s: its .gitmodules url %s is relative and the repository has no remote "
-                "origin, so it would resolve against the World's location; set submodule.%s.url or "
-                "add a remote before importing", path.c_str(), url, name->c_str());
+                "submodule %s: its .gitmodules url %s is relative and the repository's default remote "
+                "(%s) has no URL the World carries, so it would resolve against the World's location; "
+                "set submodule.%s.url or add the remote before importing", path.c_str(), url, remote.c_str(),
+                name->c_str());
         }
     }
     String modules_dir;
@@ -2453,17 +2517,7 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
         m.name = *name;
         m.gitdir = gitdir_prefix; m.gitdir.append("modules/"); m.gitdir.append(name->c_str());
         if (top.managed) {
-            // The World's own layout, exactly: relative links in both directions.
-            Vec<char> bytes;
-            if (int rc = read_bytes(dot.c_str(), bytes)) return rc;
-            String want = module_gitfile(m.path, m.gitdir);
-            if (squeeze_slashes(bytes.data(), bytes.size()) != want)
-                return refuse(WFS_E_GIT_UNSUPPORTED, "the .git link of submodule %s was changed", path.c_str());
-            String config = joinp(admin.c_str(), "config"), worktree;
-            const char *wt_args[] = {"config", "--file", config.c_str(), "--get", "core.worktree", nullptr};
-            if (int rc = get_config(full.c_str(), wt_args, worktree)) return rc;
-            if (squeeze_slashes(worktree.c_str(), worktree.size()) != module_worktree(m.path, m.gitdir))
-                return refuse(WFS_E_GIT_UNSUPPORTED, "the core.worktree link of submodule %s was changed", path.c_str());
+            if (int rc = check_owned_module(top.root.c_str(), m.path, m.gitdir)) return rc;
         }
         m.repo.managed = top.managed;
         Vec<Gitlink> sub_links;
@@ -3101,21 +3155,38 @@ int branch_checked_out(const char *repo, const String &ref, bool &out) {
 namespace wfs {
 // The initialized submodules of the repository at `root`, recursively, as paths below it: the
 // directories its index records as gitlinks that hold a `.git`.
-int checked_out_modules(const char *root, const String &prefix, Vec<String> &out, int depth) {
-    if (depth > kMaxModuleDepth) return 0;
+// Each one is checked to be in the World's own layout (check_owned_module) before anything is
+// read from it or below it.
+int checked_out_modules(const char *world, const char *root, const String &prefix, const String &gitdir_prefix,
+                        Vec<String> &out, int depth) {
     const char *ls_args[] = {"ls-files", "--stage", "-z", nullptr};
-    Vec<char> listing;
+    Vec<char> listing, gitmodules;
     if (int rc = git(root, ls_args, &listing)) return rc;
     Vec<Gitlink> links;
     parse_gitlinks(listing, links);
+    if (links.empty()) return 0;
+    if (int rc = gitmodules_listing(root, nullptr, gitmodules)) return rc;
+    Vec<GitSetting> names;
+    module_names(gitmodules, names);
     for (const auto &l : links) {
         String full = joinp(root, l.path.c_str()), dot = joinp(full.c_str(), ".git");
-        struct stat st;
-        if (lstat(dot.c_str(), &st)) continue;
         String path(prefix); path.append(l.path.c_str());
+        struct stat st;
+        if (lstat(dot.c_str(), &st)) {
+            if (errno == ENOENT || errno == ENOTDIR) continue;   // uninitialized or deleted
+            return -errno;
+        }
+        if (depth >= kMaxModuleDepth)
+            return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s is nested more than %d levels deep", path.c_str(), kMaxModuleDepth);
+        const String *name = module_name(names, l.path);
+        if (!name || !valid_module_name(*name))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s has no usable .gitmodules entry", path.c_str());
+        String gitdir(gitdir_prefix); gitdir.append("modules/"); gitdir.append(name->c_str());
+        if (int rc = check_owned_module(world, path, gitdir)) return rc;
         out.emplace_back(path);
         String child(path); child.push_back('/');
-        if (int rc = checked_out_modules(full.c_str(), child, out, depth + 1)) return rc;
+        String child_gitdir(gitdir); child_gitdir.push_back('/');
+        if (int rc = checked_out_modules(world, full.c_str(), child, child_gitdir, out, depth + 1)) return rc;
     }
     return 0;
 }
@@ -3365,7 +3436,7 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
     if (int rc = reject_ambient_policy(world_root)) return rc;
     if (int rc = reject_used_filters(world_root)) return rc;
     Vec<String> modules;
-    if (int rc = checked_out_modules(world_root, String(), modules, 0)) return rc;
+    if (int rc = checked_out_modules(world_root, world_root, String(), String(), modules, 0)) return rc;
     for (const auto &m : modules) {
         String path = joinp(world_root, m.c_str());
         if (int rc = reject_used_filters(path.c_str())) return in_module(rc, m);

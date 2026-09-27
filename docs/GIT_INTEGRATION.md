@@ -204,10 +204,13 @@ A relative `url` is made absolute like a relative remote URL (with the same refu
 it against that remote's URL. A URL that a URL rewrite rule from a conditional include matches
 is refused, and so is a conditional include that sets `submodule.<name>.*`.
 A `./` or `../` URL that only `.gitmodules` gives (no `submodule.<name>.url` in the
-repository's configuration, typically for an uninitialized submodule) is refused unless the
-repository has a remote `origin`: Git resolves it against the default remote -- in a World,
-`origin`, since the generated branch has no upstream -- and without one against the World's
-own location. No URL is pinned into the World's configuration for it, since a configured URL
+repository's configuration, typically for an uninitialized submodule) is resolved by Git
+against the URL of the repository's default remote, and against the repository's own
+directory when that remote has no URL. The default remote is `branch.<current>.remote` when
+HEAD is on a branch that has one; otherwise the only remote when exactly one is configured, and
+`origin` otherwise. It is decided for HEAD as it will be in the World -- the root's generated
+branch has no upstream, a submodule keeps its source branch unless `--committed-only` detaches
+it -- and the URL is refused unless that remote's URL travels with the World. No URL is pinned into the World's configuration for it, since a configured URL
 would make Git treat the submodule as active.
 `submodule.<name>.update` is carried only as `checkout`, `rebase`, `merge` or `none`: a
 `!command` (which `git submodule update` would run) or anything else is refused. The import
@@ -231,6 +234,9 @@ relative links, no `.git` directory in a submodule, no linked worktree registere
 submodule repository (discard refuses one too) and no lock or symlink anywhere in the
 administration.
 
+`publish` checks each of the World's initialized submodules the same way before reading
+anything from it: a submodule whose `.git` or `core.worktree` link was changed, or whose path
+goes through a symlink, is refused.
 `publish` still copies only the root's commits and fetches or pushes nothing for any
 submodule. It refuses when a commit being published records a submodule commit (a gitlink
 added or changed against any parent) that the target could not check out: the target has

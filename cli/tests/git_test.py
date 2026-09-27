@@ -3475,6 +3475,55 @@ class GitWorldTest(unittest.TestCase):
         self.git(self.source, 'remote', 'add', 'origin', str(self.root / 'origins' / 'project.git'))
         self.world('init', str(self.source))
 
+    def test_relative_gitmodules_url_resolves_against_the_branch_remote(self):
+        # libs/lib is on main, whose remote is `upstream` (no origin), and records an
+        # uninitialized child at ../x.git: Git resolves that against upstream's URL, which the
+        # World carries, so it resolves the same there.
+        up = self.root / 'origins' / 'up'
+        up.mkdir(parents=True)
+        x = self.origin('x')
+        self.git(self.root, 'clone', '-q', '--bare', str(x), str(up / 'x.git'))
+        x_head = self.git(x, 'rev-parse', 'HEAD').stdout.strip().decode()
+        lib = self.origin('lib')
+        self.git(lib, 'update-index', '--add', '--cacheinfo', '160000,' + x_head + ',child')
+        (lib / '.gitmodules').write_text('[submodule "child"]\n\tpath = child\n\turl = ../x.git\n')
+        self.git(lib, 'add', '.gitmodules')
+        self.git(lib, 'commit', '-qm', 'child')
+        self.sub(self.source, 'add', '-q', str(lib), 'libs/lib')
+        self.git(self.source, 'commit', '-qm', 'lib')
+        sub = self.source / 'libs/lib'
+        self.git(sub, 'remote', 'rename', 'origin', 'upstream')
+        self.git(sub, 'remote', 'set-url', 'upstream', str(up / 'lib.git'))
+        self.git(sub, 'remote', 'add', 'other', str(self.root / 'origins' / 'other.git'))
+        self.assertEqual(self.git(sub, 'config', 'branch.main.remote').stdout.strip(), b'upstream')
+        self.world('init', str(self.source))
+        one, _ = self.fork()
+        self.sub(one / 'libs/lib', 'update', '-q', '--init', 'child')
+        self.assertEqual(self.git(one / 'libs/lib/child', 'rev-parse', 'HEAD').stdout.strip().decode(), x_head)
+        self.assertEqual(self.git(one / 'libs/lib', 'config', 'submodule.child.url').stdout.strip(),
+                         str(up / 'x.git').encode())
+        # --committed-only detaches a submodule that is ahead of its gitlink; detached, with two
+        # remotes and no origin, Git would resolve against the World's own directory.
+        self.identify(sub)
+        self.git(sub, 'commit', '-q', '--allow-empty', '-m', 'ahead')
+        refused = self.world('init', str(self.source), '--committed-only', code=3)
+        self.assertIn(b"reason: submodule libs/lib/child: its .gitmodules url ../x.git is relative and the repository's default remote (origin)",
+                      refused.stderr)
+
+    def test_publish_refuses_a_repointed_submodule_gitfile(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.commit_in(one, 'root change')
+        stranger = self.root / 'stranger'
+        self.git(self.root, 'clone', '-q', str(one / 'libs/lib'), str(stranger))
+        (one / 'libs/lib/.git').write_text('gitdir: ' + str(stranger / '.git') + '\n')
+        self.assertEqual(self.git(stranger, 'status', '--porcelain').stdout, b'')
+        refused = self.world('publish', wid, code=3)
+        self.assertIn(b'reason: the .git link of submodule libs/lib was changed', refused.stderr)
+        self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
+        self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs/').stdout, b'')
+
     def test_publish_refuses_a_gitlink_commit_the_target_lacks(self):
         self.submodule_fixture()
         self.world('init', str(self.source))
