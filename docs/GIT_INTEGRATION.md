@@ -191,7 +191,8 @@ inside a submodule names it (`reason: submodule libs/lib: ...`). A submodule wit
 `.gitmodules` entry, an unsafe name, two names sharing a repository directory, a submodule
 path that is (or goes through) a symlink, or a `.git` that resolves to any other repository is
 refused. A plain nested repository -- a `.git` anywhere below the root that is not an
-initialized submodule's, including deeper inside an uninitialized submodule's directory -- is
+initialized submodule's, including deeper inside an uninitialized submodule's directory or
+inside a submodule's own `.world-git` directory (only the World's root owns that name) -- is
 still refused.
 
 An uninitialized submodule (a gitlink without a `.git` in its directory) stays exactly as the
@@ -208,9 +209,9 @@ while uninitialized gitlinks are imported as they are. The superproject's
 `submodule.active` and `submodule.<name>.url`, `.active`, `.branch`, `.shallow`,
 `.fetchRecurseSubmodules`, `.ignore` and `.update` settings travel with the other carried
 configuration, so `git submodule update --init` in the World clones it from the source's URL.
-A relative `url` is made absolute like a relative remote URL (with the same refusals); a
-`./` or `../` one is refused when the superproject has a remote, since Git would then resolve
-it against that remote's URL. A URL that a URL rewrite rule from a conditional include matches
+A relative configured `url` is made absolute like a relative remote URL (with the same
+refusals): Git clones a configured URL from the superproject's worktree top, remote or not. A
+URL that a URL rewrite rule from a conditional include matches
 is refused, and so is a conditional include that sets `submodule.<name>.*`.
 A `./` or `../` URL that only `.gitmodules` gives (no `submodule.<name>.url` in the
 repository's configuration, typically for an uninitialized submodule) is resolved by Git

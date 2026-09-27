@@ -3322,17 +3322,26 @@ class GitWorldTest(unittest.TestCase):
         self.assertTrue((one / '.world-git/repo.git/worktrees/active/modules/vendor/unused').is_dir())
         self.assertFalse(marker.exists())
 
-    def test_relative_submodule_url_is_made_absolute_or_refused(self):
+    def test_relative_configured_submodule_url_is_made_absolute(self):
         self.submodule_fixture()
         self.git(self.source, 'config', 'submodule.vendor/unused.url', '../origins/unused')
+        # Git clones a configured URL from the worktree top even when there is a remote.
+        self.git(self.source, 'remote', 'add', 'origin', 'https://example.com/project.git')
         self.world('init', str(self.source))
+        shutil.rmtree(self.source)
         one, _ = self.fork()
         self.assertEqual(self.git(one, 'config', 'submodule.vendor/unused.url').stdout.strip(),
                          str(self.root / 'origins' / 'unused').encode())
-        # With a remote, Git resolves it against the remote's URL instead.
-        self.git(self.source, 'remote', 'add', 'origin', 'https://example.com/project.git')
-        refused = self.world('init', str(self.source), code=3)
-        self.assertIn(b'reason: a submodule URL is relative (./ or ../)', refused.stderr)
+        self.sub(one, 'update', '-q', '--init', 'vendor/unused')
+        self.assertEqual((one / 'vendor/unused/lib.txt').read_text(), 'unused\n')
+
+    def test_world_git_inside_a_submodule_is_ordinary_content(self):
+        self.submodule_fixture()
+        child = self.source / 'libs/lib/.world-git/child'
+        child.mkdir(parents=True)
+        self.git(child, 'init', '-q')
+        refused = self.world('init', str(self.source), '--include-changes', code=3)
+        self.assertIn(b'reason: submodule libs/lib: nested Git repository or submodule at ' + str(child).encode(), refused.stderr)
 
     def test_submodule_filters_and_hooks_never_run(self):
         self.submodule_fixture()

@@ -187,8 +187,10 @@ const Gitlink *find_link(const Vec<Gitlink> &links, const char *path) {
 // `.git` admitted is a submodule's: a directory that this repository's index records as a
 // gitlink (`links`), which discover_modules then validates, captures and walks on its own.
 // Everything else with a `.git` below the root -- a plain nested repository, a `.git` inside an
-// uninitialized submodule's directory -- is refused.
-int nested_walk(const String &dir_path, const String &rel, const Vec<Gitlink> *links) {
+// uninitialized submodule's directory -- is refused. The walk's own top may hold its `.git`; only
+// the top of the tree itself (`world_root`) may also hold the World's `.world-git`, never a
+// submodule's top.
+int nested_walk(const String &dir_path, const String &rel, const Vec<Gitlink> *links, bool world_root) {
     bool top = rel.empty();
     DIR *dir = opendir(dir_path.c_str());
     if (!dir) return -errno;
@@ -202,7 +204,7 @@ int nested_walk(const String &dir_path, const String &rel, const Vec<Gitlink> *l
             if (!top) { rc = refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository or submodule at %s", dir_path.c_str()); break; }
             continue;
         }
-        if (top && !strcmp(e->d_name, ".world-git")) continue;
+        if (top && world_root && !strcmp(e->d_name, ".world-git")) continue;
         String path = joinp(dir_path.c_str(), e->d_name);
         struct stat st;
         if (lstat(path.c_str(), &st)) { rc = -errno; break; }
@@ -213,12 +215,12 @@ int nested_walk(const String &dir_path, const String &rel, const Vec<Gitlink> *l
             if (!lstat(dot.c_str(), &st)) continue;   // an initialized submodule
             if (errno != ENOENT) { rc = -errno; break; }
         }
-        if ((rc = nested_walk(path, child, links))) break;
+        if ((rc = nested_walk(path, child, links, world_root))) break;
     }
     closedir(dir); return rc;
 }
-int nested_check(const char *root, const Vec<Gitlink> *links) {
-    return nested_walk(String(root), String(), links);
+int nested_check(const char *root, const Vec<Gitlink> *links, bool world_root) {
+    return nested_walk(String(root), String(), links, world_root);
 }
 // A managed tree may be copied without consulting an external repository only when all
 // administration stays inside it. Reject changed common-dir pointers and additional worktrees.
@@ -582,11 +584,8 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
     // Every remote's raw url/pushurl entries and where they land in `out`, for the pinning pass
     // below.
     Vec<RemoteRewriteInfo> remotes;
-    // Where each submodule.<name>.url landed in `out`, and whether its raw value was relative to
-    // the superproject in Git's "./" or "../" form (see below).
+    // Where each submodule.<name>.url landed in `out`.
     Vec<size_t> submodule_urls;
-    bool dot_relative_submodule_url = false;
-    bool has_remote_url = false;
     // Entries are "<key>\n<value>\0"; a valueless key has no newline.
     for (size_t i = 0; i < listing.size() && listing[i];) {
         const char *entry = listing.data() + i;
@@ -604,7 +603,6 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
         bool is_pushurl = is_remote && klen > 8 && !strcmp(key.c_str() + klen - 8, ".pushurl");
         bool is_submodule = !strncmp(key.c_str(), "submodule.", 10);
         bool is_submodule_url = is_submodule && klen > 14 && !strcmp(key.c_str() + klen - 4, ".url");
-        if (is_url || is_pushurl) has_remote_url = true;
         // submodule.<name>.update = !<command> makes `git submodule update` run that command;
         // only the update modes Git performs itself are carried.
         if (is_submodule && klen > 17 && !strcmp(key.c_str() + klen - 7, ".update") &&
@@ -618,7 +616,6 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
                 "%s contains a line break, which cannot be carried unambiguously; rename the path "
                 "before importing", key.c_str());
         if (is_submodule_url && is_relative_local_url(val.c_str())) {
-            if (!strncmp(val.c_str(), "./", 2) || !strncmp(val.c_str(), "../", 3)) dot_relative_submodule_url = true;
             const UrlRewriteRule *r = matching_rewrite(rules, val.c_str());
             if (r)
                 return refuse(WFS_E_GIT_POLICY,
@@ -660,13 +657,12 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
         }
         out.emplace_back(GitSetting{key, val});
     }
-    // Git resolves a "./" or "../" submodule URL against the superproject's default remote URL
-    // when it has one, and against the superproject's directory only when it has none; the
-    // lexical-through-the-filesystem resolution above is that second case alone.
-    if (dot_relative_submodule_url && has_remote_url)
-        return refuse(WFS_E_GIT_POLICY,
-            "a submodule URL is relative (./ or ../), which Git resolves against the "
-            "superproject's remote; make the submodule URL absolute before importing");
+    // A relative submodule.<name>.url in the configuration is not resolved against a remote:
+    // observed with Git 2.54, `git submodule update --init` hands a configured URL to clone as
+    // it is, from the superproject's worktree top (from a subdirectory too, and with a remote
+    // origin present), so `../lib.git` names <top>/../lib.git -- exactly what the absolutization
+    // above reproduces. Only a URL that .gitmodules alone gives is resolved against the default
+    // remote (discover_modules).
     // A submodule URL is carried as the source has it and the World's Git rewrites it with the
     // same shared configuration, except a rule from a conditional include: one that is inactive
     // at the source could become active at the World's location, or the other way round.
@@ -2542,7 +2538,7 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
         m.repo.managed = top.managed;
         Vec<Gitlink> sub_links;
         if (int rc = capture_repo(full.c_str(), m.repo, top.with_hooks, true, sub_links)) return in_module(rc, path);
-        if (int rc = nested_check(full.c_str(), &sub_links)) return in_module(rc, path);
+        if (int rc = nested_check(full.c_str(), &sub_links, false)) return in_module(rc, path);
         if (tree) {
             const Gitlink *recorded = find_link(tree_links, link.path.c_str());
             m.target = recorded->oid;
@@ -2572,7 +2568,7 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
     if (!has_managed && errno != ENOENT) return -errno;
     if (lstat(dot.c_str(), &st)) {
         if (errno == ENOENT && !has_managed) {
-            if (int rc = nested_check(root, nullptr)) return rc;
+            if (int rc = nested_check(root, nullptr, true)) return rc;
             if (committed_only) return refuse(WFS_E_GIT_UNSUPPORTED, "--committed-only needs a Git repository at the source root");
             if (with_hooks) return refuse(WFS_E_GIT_UNSUPPORTED, "--with-hooks needs a Git repository at the source root");
             return 0;
@@ -2595,7 +2591,7 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
     if (committed_only) {
         if (int rc = committed_hooks_check(root, out, nullptr)) return rc;
     }
-    if (int rc = nested_check(root, &gitlinks)) return rc;
+    if (int rc = nested_check(root, &gitlinks, true)) return rc;
     out.has_gitlinks = !gitlinks.empty();
     // With --committed-only the copy is reset to HEAD and must then be clean; the source's own
     // uncommitted state is simply not carried, so it is not a reason to refuse.
@@ -2723,7 +2719,7 @@ int copy_layout_check(const GitSource &s, const char *clone) {
             for (const auto &m : s.modules) if (m.path == path) { imported = true; break; }
             if (initialized != imported) return -EBUSY;
         }
-        if (int rc = nested_check(dir.c_str(), &links)) return rc;
+        if (int rc = nested_check(dir.c_str(), &links, i == 0)) return rc;
     }
     return 0;
 }
