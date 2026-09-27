@@ -3524,6 +3524,61 @@ class GitWorldTest(unittest.TestCase):
         self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/W1', code=1)
         self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs/').stdout, b'')
 
+    def test_relative_gitmodules_url_is_rechecked_when_forking_a_world(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        x = self.origin('x')
+        x_head = self.git(x, 'rev-parse', 'HEAD').stdout.strip().decode()
+        # In the World, the branch tracks up2 of two non-origin remotes; a fork's own branch has
+        # no upstream, so there Git would resolve ../x.git against origin, which has no URL.
+        self.git(one, 'remote', 'add', 'up1', str(self.root / 'origins' / 'up1' / 'project.git'))
+        self.git(one, 'remote', 'add', 'up2', str(self.root / 'origins' / 'up2' / 'project.git'))
+        self.git(one, 'config', 'branch.' + 'world/' + wid + '.remote', 'up2')
+        self.git(one, 'update-index', '--add', '--cacheinfo', '160000,' + x_head + ',child')
+        (one / '.gitmodules').write_text('[submodule "child"]\n\tpath = child\n\turl = ../x.git\n')
+        self.git(one, 'add', '.gitmodules')
+        self.git(one, 'commit', '-qm', 'child')
+        (one / 'child').mkdir()
+        refused = self.world('fork', '--from', wid, '--to', str(self.root / 'refused'), code=3)
+        self.assertIn(b"reason: submodule child: its .gitmodules url ../x.git is relative and the repository's default remote (origin)",
+                      refused.stderr)
+        self.assertFalse((self.root / 'refused').exists())
+        self.world('checkpoint', wid, code=3)
+        self.git(one, 'remote', 'add', 'origin', str(self.root / 'origins' / 'project.git'))
+        two, _ = self.fork('two', wid)
+        self.assertEqual(self.git(two, 'status', '--porcelain').stdout, b'')
+
+    def test_every_gitlink_name_is_validated(self):
+        self.submodule_fixture()
+        unused = self.git(self.source, 'rev-parse', 'HEAD:vendor/unused').stdout.strip().decode()
+        def gitlink(path, name):
+            self.git(self.source, 'update-index', '--add', '--cacheinfo', '160000,' + unused + ',' + path)
+            if name:
+                self.git(self.source, 'config', '-f', '.gitmodules', 'submodule.' + name + '.path', path)
+                self.git(self.source, 'config', '-f', '.gitmodules', 'submodule.' + name + '.url', str(self.root / 'origins' / 'unused'))
+                self.git(self.source, 'add', '.gitmodules')
+            self.git(self.source, 'commit', '-qm', 'gitlink ' + path)
+        def undo():
+            self.git(self.source, 'reset', '-q', '--hard', 'HEAD~1')
+        gitlink('escape', '../escape')
+        refused = self.world('init', str(self.source), code=3)
+        self.assertIn(b'reason: submodule escape has an unsafe name (../escape)', refused.stderr)
+        undo()
+        gitlink('inside', 'lib-module/inside')
+        refused = self.world('init', str(self.source), code=3)
+        self.assertIn(b'reason: submodule names lib-module/inside and lib-module share a repository directory', refused.stderr)
+        undo()
+        # An embedded gitlink without any .gitmodules entry is left exactly as it is.
+        gitlink('embedded', None)
+        (self.source / 'embedded').mkdir()
+        status = self.git(self.source, 'status', '--porcelain').stdout
+        snapshot = self.world('init', str(self.source)).stdout.split()[0].decode()
+        one, _ = self.fork('one', snapshot)
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, status)
+        self.assertEqual(self.git(one, 'ls-files', '--stage', 'embedded').stdout,
+                         self.git(self.source, 'ls-files', '--stage', 'embedded').stdout)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'][0]['name'], 'source')
+
     def test_publish_refuses_a_gitlink_commit_the_target_lacks(self):
         self.submodule_fixture()
         self.world('init', str(self.source))

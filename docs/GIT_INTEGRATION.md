@@ -195,7 +195,11 @@ initialized submodule's, including deeper inside an uninitialized submodule's di
 still refused.
 
 An uninitialized submodule (a gitlink without a `.git` in its directory) stays exactly as the
-source has it: the gitlink and its (usually empty) directory. The superproject's
+source has it: the gitlink and its (usually empty) directory. Its `.gitmodules` name is checked
+like an initialized one's -- no unsafe name, and no name whose repository directory would lie
+in or over another submodule's -- since initializing it later puts its repository there. A
+gitlink with no `.gitmodules` entry at all (an "embedded" repository added by accident, which
+Git tolerates) is imported as it is when uninitialized; an initialized one is refused. The superproject's
 `submodule.active` and `submodule.<name>.url`, `.active`, `.branch`, `.shallow`,
 `.fetchRecurseSubmodules`, `.ignore` and `.update` settings travel with the other carried
 configuration, so `git submodule update --init` in the World clones it from the source's URL.
@@ -210,7 +214,9 @@ directory when that remote has no URL. The default remote is `branch.<current>.r
 HEAD is on a branch that has one; otherwise the only remote when exactly one is configured, and
 `origin` otherwise. It is decided for HEAD as it will be in the World -- the root's generated
 branch has no upstream, a submodule keeps its source branch unless `--committed-only` detaches
-it -- and the URL is refused unless that remote's URL travels with the World. No URL is pinned into the World's configuration for it, since a configured URL
+it -- and the URL is refused unless that remote's URL travels with the World. This is checked
+again whenever a World is forked or checkpointed: every fork of a World or of its checkpoints
+replaces the World's own branch (and whatever upstream it had) with a new `world/W<n>`. No URL is pinned into the World's configuration for it, since a configured URL
 would make Git treat the submodule as active.
 `submodule.<name>.update` is carried only as `checkout`, `rebase`, `merge` or `none`: a
 `!command` (which `git submodule update` would run) or anything else is refused. The import

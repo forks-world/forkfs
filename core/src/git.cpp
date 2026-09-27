@@ -2362,10 +2362,23 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
                      const Vec<Gitlink> &gitlinks, const char *tree, int depth, size_t self) {
     if (gitlinks.empty()) return 0;
     GitRepoState &state = self == (size_t)-1 ? top : top.modules[self].repo;
-    // The carried configuration of this repository (external sources only), copied: `state`
-    // may move once submodules are appended below.
+    // The configuration this repository will have in the World, copied: `state` may move once
+    // submodules are appended below. An external source's is what the import carries; a managed
+    // World's travels whole with its cloned administration, so it is its own local configuration.
     Vec<GitSetting> carried;
-    if (!state.managed) for (const auto &c : state.carried) carried.emplace_back(c);
+    if (!state.managed) {
+        for (const auto &c : state.carried) carried.emplace_back(c);
+    } else {
+        const char *list[] = {"config", "--local", "--null", "--list", nullptr};
+        Vec<char> local;
+        if (int rc = git(repo_root, list, &local)) return rc;
+        for (size_t i = 0; i < local.size() && local[i];) {
+            const char *entry = local.data() + i;
+            i += strlen(entry) + 1;
+            const char *nl = strchr(entry, '\n');
+            carried.emplace_back(GitSetting{String(entry, nl ? (size_t)(nl - entry) : strlen(entry)), String(nl ? nl + 1 : "")});
+        }
+    }
     Vec<char> listing, tree_listing;
     if (int rc = gitmodules_listing(repo_root, nullptr, listing)) return rc;
     Vec<GitSetting> names, tree_names;
@@ -2396,10 +2409,12 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
     // exists, and even when that remote is not configured -- then the directory is the base);
     // otherwise, detached or on a branch without one, it is the only remote when exactly one is
     // configured, and `origin` otherwise. It is decided here for HEAD as it will be in the
-    // World: the root's generated world/W<n> branch has no upstream; a submodule keeps its
-    // source branch unless --committed-only detaches it. Accepted only when that remote's URL
-    // travels with the World; the World's own directory is never the source's.
-    if (!state.managed) {
+    // World: the root's generated world/W<n> branch has no upstream -- also when the source is
+    // itself a World, whose own branch every fork (and every fork of its checkpoints, pooled or
+    // not) replaces in git_branch -- and a submodule keeps its source branch unless
+    // --committed-only detaches it. Accepted only when that remote's URL travels with the World;
+    // the World's own directory is never the source's.
+    {
         String branch;
         if (self != (size_t)-1) {
             const GitModule &me = top.modules[self];
@@ -2448,7 +2463,24 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
     String modules_dir;
     const char *modules_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "modules", nullptr};
     if (int rc = value(repo_root, modules_args, modules_dir)) return rc;
+    // Every gitlink's name, initialized or not, is a directory below this repository's modules/:
+    // initializing one later puts its repository there, so a name that escapes it or lands in
+    // (or over) another's is refused now. A gitlink with no .gitmodules entry at all is Git's
+    // ordinary "embedded" gitlink; left uninitialized, there is nothing to import for it.
     Vec<String> sibling_names;
+    for (const auto &link : gitlinks) {
+        const String *name = module_name(names, link.path);
+        if (!name) continue;
+        String path(prefix); path.append(link.path.c_str());
+        if (!valid_module_name(*name)) return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s has an unsafe name (%s)", path.c_str(), name->c_str());
+        for (const auto &other : sibling_names) {
+            size_t n = other.size() < name->size() ? other.size() : name->size();
+            if (!strncmp(other.c_str(), name->c_str(), n) &&
+                (other.size() == name->size() || (other.size() > n ? other[n] : (*name)[n]) == '/'))
+                return refuse(WFS_E_GIT_UNSUPPORTED, "submodule names %s and %s share a repository directory", other.c_str(), name->c_str());
+        }
+        sibling_names.emplace_back(*name);
+    }
     for (const auto &link : gitlinks) {
         String path(prefix); path.append(link.path.c_str());
         String full = joinp(repo_root, link.path.c_str());
@@ -2481,14 +2513,6 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
             return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s is nested more than %d levels deep", path.c_str(), kMaxModuleDepth);
         const String *name = module_name(names, link.path);
         if (!name) return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s has no .gitmodules entry", path.c_str());
-        if (!valid_module_name(*name)) return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s has an unsafe name (%s)", path.c_str(), name->c_str());
-        for (const auto &other : sibling_names) {
-            size_t n = other.size() < name->size() ? other.size() : name->size();
-            if (!strncmp(other.c_str(), name->c_str(), n) &&
-                (other.size() == name->size() || (other.size() > n ? other[n] : (*name)[n]) == '/'))
-                return refuse(WFS_E_GIT_UNSUPPORTED, "submodule names %s and %s share a repository directory", other.c_str(), name->c_str());
-        }
-        sibling_names.emplace_back(*name);
         if (tree) {
             const String *committed = module_name(tree_names, link.path);
             if (!committed || *committed != *name)
