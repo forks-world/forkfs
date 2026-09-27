@@ -8,6 +8,12 @@ struct GitSymref {
 struct GitSetting {
     String key, value;
 };
+// One executable hook file of the source's hooks directory, carried by --with-hooks.
+struct GitHook {
+    String name;
+    Vec<char> bytes;
+    uint32_t mode = 0;
+};
 // Git administration is owned by the tree, so the existing rename/trash/GC protocol also
 // owns all of its Git resources. No worktree is registered in the user's source repository.
 struct GitSource {
@@ -54,8 +60,19 @@ struct GitSource {
     uint64_t import_bytes = 0;
     // Set when the caller did not pass --include-changes: the published copy must be clean too.
     bool require_clean = false;
+    // --committed-only: the source may be dirty, but the copy is reset to HEAD before
+    // publication (reset_to_head); ignored files stay. The source itself is never touched.
+    bool committed_only = false;
+    // --with-hooks, external sources only (a managed World's hooks travel inside its cloned
+    // .world-git): the executable, regular, non-.sample files of the common hooks directory and
+    // a repository-local core.hooksPath, installed in the owned repository (capture_hooks).
+    bool with_hooks = false;
+    Vec<GitHook> hooks;
+    bool hooks_path_present = false;
+    String hooks_path;
 };
-int git_source(const char *root, bool include_changes, GitSource &out);
+int git_source(const char *root, bool include_changes, GitSource &out, bool committed_only = false,
+               bool with_hooks = false);
 int git_import(const GitSource &source, const char *clone);
 int git_discard_check(const char *root);
 int git_branch(const char *clone, wfs_id world);

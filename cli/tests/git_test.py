@@ -209,6 +209,420 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(two, 'status', '--porcelain').stdout, status)
         self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, status)
 
+    def tree_bytes(self, root):
+        """Every file and symlink under root, with its bytes: the whole tree, .git included."""
+        out = {}
+        for base, dirs, files in os.walk(root):
+            for name in files + [d for d in dirs if (Path(base) / d).is_symlink()]:
+                path = Path(base) / name
+                rel = str(path.relative_to(root))
+                out[rel] = os.readlink(path) if path.is_symlink() else path.read_bytes()
+            for name in dirs:
+                out[str((Path(base) / name).relative_to(root)) + '/'] = b''
+        return out
+
+    def make_dirty(self, root):
+        """A staged change, a staged addition, an unstaged change, a deleted tracked file, new
+        untracked files (one in a new directory) and ignored artifacts."""
+        (root / 'file').write_text('staged\n')
+        (root / 'new-staged').write_text('only in index\n')
+        self.git(root, 'add', 'file', 'new-staged')
+        (root / 'sub' / 'tracked').write_text('unstaged\n')
+        (root / 'gone').unlink()
+        (root / 'untracked').write_text('untracked\n')
+        (root / 'scratch').mkdir()
+        (root / 'scratch' / 'note').write_text('untracked in a new directory\n')
+        (root / 'scratch' / 'trace.log').write_text('ignored in an untracked directory\n')
+        (root / 'build').mkdir(exist_ok=True)
+        (root / 'build' / 'model.bin').write_bytes(b'ignored artifact')
+
+    def assert_committed(self, world, head):
+        self.assertEqual(self.git(world, 'status', '--porcelain', '--untracked-files=all').stdout, b'')
+        self.assertEqual(self.git(world, 'rev-parse', 'HEAD').stdout.strip(), head)
+        self.assertEqual(self.git(world, 'diff', '--cached', '--name-only', 'HEAD').stdout, b'')
+        self.assertEqual((world / 'file').read_text(), 'original\n')
+        self.assertEqual((world / 'sub' / 'tracked').read_text(), 'tracked\n')
+        self.assertEqual((world / 'gone').read_text(), 'deleted in the source\n')
+        for absent in ('new-staged', 'untracked', 'scratch/note'):
+            self.assertFalse((world / absent).exists(), absent)
+        self.assertEqual((world / 'build' / 'model.bin').read_bytes(), b'ignored artifact')
+        self.assertEqual((world / 'scratch' / 'trace.log').read_text(), 'ignored in an untracked directory\n')
+
+    def committed_only_fixture(self):
+        (self.source / '.gitignore').write_text('build/\n*.log\n')
+        (self.source / 'sub').mkdir()
+        (self.source / 'sub' / 'tracked').write_text('tracked\n')
+        (self.source / 'gone').write_text('deleted in the source\n')
+        self.git(self.source, 'add', '.')
+        self.git(self.source, 'commit', '-qm', 'more files')
+        return self.git(self.source, 'rev-parse', 'HEAD').stdout.strip()
+
+    def test_committed_only_creates_from_head_and_leaves_the_source_alone(self):
+        head = self.committed_only_fixture()
+        self.make_dirty(self.source)
+        # A passive squash message belongs to the staged content, which is not carried.
+        (self.source / '.git' / 'SQUASH_MSG').write_text('squashed work\n')
+        before = self.tree_bytes(self.source)
+        self.world('init', str(self.source), code=3)
+        both = self.world('init', str(self.source), '--committed-only', '--include-changes', code=2)
+        self.assertIn(b'mutually exclusive', both.stderr)
+        self.world('init', str(self.source), '--committed-only')
+        self.assertEqual(self.tree_bytes(self.source), before)
+        one, _ = self.fork()
+        self.assert_committed(one, head)
+        message = self.git(one, 'rev-parse', '--path-format=absolute', '--git-path', 'SQUASH_MSG').stdout.decode().strip()
+        self.assertFalse(Path(message).exists())
+        self.world('verify', 'S1')
+        # The source keeps every staged, unstaged, deleted and untracked change it had.
+        self.assertEqual(self.tree_bytes(self.source), before)
+        self.assertEqual(self.git(self.source, 'show', ':file').stdout, b'staged\n')
+        self.assertEqual((self.source / 'sub' / 'tracked').read_text(), 'unstaged\n')
+        self.assertFalse((self.source / 'gone').exists())
+        # A World commit on top of HEAD contains none of the source's uncommitted work.
+        (one / 'file').write_text('world change\n')
+        self.git(one, 'commit', '-qam', 'world')
+        self.assertEqual(self.git(one, 'show', '--name-only', '--format=', 'HEAD').stdout, b'file\n')
+        # Without a repository there is no committed version to start from.
+        plain = self.root / 'plain'
+        plain.mkdir()
+        (plain / 'data').write_text('data\n')
+        refused = self.world('init', str(plain), '--committed-only', code=3)
+        self.assertIn(b'reason: --committed-only needs a Git repository', refused.stderr)
+
+    def test_committed_only_resets_index_only_marked_files(self):
+        (self.source / 'config.local').write_text('committed\n')
+        self.git(self.source, 'add', 'config.local')
+        self.git(self.source, 'commit', '-qm', 'local config')
+        self.git(self.source, 'update-index', '--skip-worktree', 'config.local')
+        self.git(self.source, 'update-index', '--assume-unchanged', 'file')
+        (self.source / 'config.local').write_text('private edit\n')
+        (self.source / 'file').write_text('hidden edit\n')
+        self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+        index = (self.source / '.git' / 'index').read_bytes()
+        snapshot = self.world('init', str(self.source), '--committed-only').stdout.split()[0].decode()
+        one, _ = self.fork('one', snapshot)
+        self.assertEqual((one / 'config.local').read_text(), 'committed\n')
+        self.assertEqual((one / 'file').read_text(), 'original\n')
+        self.assertEqual(self.git(one, 'ls-files', '-v').stdout, b'H .gitignore\nH config.local\nH file\n')
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.assertEqual((self.source / 'config.local').read_text(), 'private edit\n')
+        self.assertEqual((self.source / '.git' / 'index').read_bytes(), index)
+
+    def test_committed_only_checks_head_filters_before_resetting_the_copy(self):
+        # HEAD assigns a filter; the dirty source removes the assignment, so only the reset to
+        # HEAD would check the file out through it.
+        marker = self.root / 'head-filter-ran'
+        (self.source / '.gitattributes').write_text('*.bin filter=example\n')
+        (self.source / 'model.bin').write_text('weights\n')
+        self.git(self.source, 'add', '.')
+        self.git(self.source, 'commit', '-qm', 'model')
+        global_config = self.root / 'filter-global'
+        global_config.write_text('[filter "example"]\n smudge = touch ' + str(marker) + '; cat\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        (self.source / '.gitattributes').write_text('')
+        (self.source / 'model.bin').write_text('edited weights\n')
+        result = self.world('init', str(self.source), '--committed-only', code=3)
+        self.assertIn(b"reason: tracked file model.bin uses the 'example' filter", result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_committed_only_snapshot_records_only_hardlinks_it_still_has(self):
+        for name in ('a', 'b', 'c', 'd'):
+            (self.source / name).write_text('shared\n')
+        self.git(self.source, 'add', '.')
+        self.git(self.source, 'commit', '-qm', 'twins')
+        # Same content, so Git sees no change: a and b become one inode, as do c and d.
+        for first, second in (('a', 'b'), ('c', 'd')):
+            (self.source / second).unlink()
+            os.link(self.source / first, self.source / second)
+        # Writing through a changes b as well; the reset puts both back as separate files.
+        with open(self.source / 'a', 'w') as f:
+            f.write('changed through a hardlink\n')
+        self.world('init', str(self.source), '--committed-only')
+        self.world('verify', 'S1')
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        for name in ('a', 'b', 'c', 'd'):
+            self.assertEqual((one / name).read_text(), 'shared\n')
+        # The untouched pair is still one inode in every fork.
+        self.assertEqual((one / 'c').stat().st_ino, (one / 'd').stat().st_ino)
+        self.assertEqual((self.source / 'b').read_text(), 'changed through a hardlink\n')
+
+    def test_committed_only_fork_and_checkpoint_of_a_dirty_world(self):
+        head = self.committed_only_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.make_dirty(one)
+        status = self.git(one, 'status', '--porcelain').stdout
+        self.assertNotEqual(status, b'')
+        staged = self.git(one, 'ls-files', '--stage').stdout
+        self.world('fork', '--from', wid, '--to', str(self.root / 'refused'), code=3)
+        self.world('fork', '--from', wid, '--to', str(self.root / 'both'), '--committed-only',
+                   '--include-changes', code=2)
+        two, _ = self.fork('two', wid, '--committed-only')
+        self.assert_committed(two, head)
+        self.assertEqual(self.git(two, 'branch', '--show-current').stdout.strip(), b'world/W2')
+        self.world('checkpoint', wid, code=3)
+        self.world('checkpoint', wid, '--committed-only')
+        three, _ = self.fork('three', 'S2')
+        self.assert_committed(three, head)
+        self.world('verify', 'S2')
+        # The World the copies came from keeps its uncommitted work, index included.
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, status)
+        self.assertEqual(self.git(one, 'ls-files', '--stage').stdout, staged)
+        self.assertEqual((one / 'untracked').read_text(), 'untracked\n')
+        # A snapshot's content is already fixed.
+        snap = self.world('fork', '--from', 'S1', '--to', str(self.root / 'snap'), '--committed-only', code=2)
+        self.assertIn(b'--committed-only needs --from W<n>', snap.stderr)
+        self.assertFalse((self.root / 'snap').exists())
+
+    def write_hook(self, path, marker, name=None, mode=0o755):
+        import shlex
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('#!/bin/sh\necho "%s $(pwd -P)" >> %s\n' % (name or path.name, shlex.quote(str(marker))))
+        path.chmod(mode)
+
+    def hook_runs(self, marker):
+        return marker.read_text().splitlines() if marker.exists() else []
+
+    def commit_in(self, world, message):
+        (world / 'file').write_text(message + '\n')
+        self.git(world, 'commit', '-qam', message)
+
+    def test_hooks_are_left_behind_with_a_note(self):
+        marker = self.root / 'hooks-ran'
+        # The template's .sample files are not hooks: no note.
+        plain = self.world('init', str(self.source))
+        self.assertNotIn(b'--with-hooks', plain.stderr)
+        self.write_hook(self.source / '.git' / 'hooks' / 'pre-commit', marker)
+        noted = self.world('init', str(self.source))
+        notes = [line for line in noted.stderr.splitlines() if b'--with-hooks' in line]
+        self.assertEqual(len(notes), 1, noted.stderr)
+        self.assertIn(b'note:', notes[0])
+        one, _ = self.fork('one', 'S2')
+        self.assertFalse((one / '.world-git' / 'repo.git' / 'hooks' / 'pre-commit').exists())
+        self.commit_in(one, 'no hook')
+        self.assertEqual(self.hook_runs(marker), [])
+        # A repository-local core.hooksPath (husky) is noted too.
+        (self.source / '.git' / 'hooks' / 'pre-commit').unlink()
+        self.git(self.source, 'config', 'core.hooksPath', '.husky')
+        self.assertIn(b'--with-hooks', self.world('init', str(self.source)).stderr)
+        two, _ = self.fork('two', 'S3')
+        self.git(two, 'config', '--get', 'core.hooksPath', code=1)
+
+    def test_with_hooks_carries_project_hooks_without_running_them(self):
+        marker = self.root / 'hooks-ran'
+        hooks = self.source / '.git' / 'hooks'
+        for name in ('pre-commit', 'post-checkout', 'reference-transaction', 'post-index-change'):
+            self.write_hook(hooks / name, marker)
+        self.write_hook(hooks / 'prepare-commit-msg', marker, mode=0o644)   # Git would not run it
+        init = self.world('init', str(self.source), '--with-hooks')
+        self.assertNotIn(b'--with-hooks', init.stderr)
+        one, wid = self.fork()
+        carried = one / '.world-git' / 'repo.git' / 'hooks'
+        self.assertEqual(sorted(p.name for p in carried.iterdir()),
+                         ['post-checkout', 'post-index-change', 'pre-commit', 'reference-transaction'])
+        self.assertEqual((carried / 'pre-commit').read_bytes(), (hooks / 'pre-commit').read_bytes())
+        self.assertTrue(os.access(carried / 'pre-commit', os.X_OK))
+        # Neither the import nor the fork ran a hook, though both write refs and indexes.
+        self.assertEqual(self.hook_runs(marker), [])
+        self.commit_in(one, 'first')
+        self.assertIn('pre-commit ' + str(one), self.hook_runs(marker))
+        # Worlds forked or checkpointed from a World keep its hooks, and still run none.
+        before = self.hook_runs(marker)
+        two, _ = self.fork('two', wid)
+        self.world('checkpoint', wid)
+        three, _ = self.fork('three', 'S2')
+        self.assertEqual(self.hook_runs(marker), before)
+        for world in (two, three):
+            self.commit_in(world, world.name)
+            self.assertIn('pre-commit ' + str(world), self.hook_runs(marker))
+        # --with-hooks needs a repository.
+        plain = self.root / 'plain'
+        plain.mkdir()
+        refused = self.world('init', str(plain), '--with-hooks', code=3)
+        self.assertIn(b'reason: --with-hooks needs a Git repository', refused.stderr)
+
+    def test_with_hooks_carries_a_relative_hooks_path(self):
+        marker = self.root / 'hooks-ran'
+        self.write_hook(self.source / '.husky' / 'pre-commit', marker, 'husky')
+        self.git(self.source, 'add', '.husky')
+        self.git(self.source, 'commit', '-qm', 'husky')
+        self.git(self.source, 'config', 'core.hooksPath', '.husky')
+        self.world('init', str(self.source), '--with-hooks')
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'config', '--get', 'core.hooksPath').stdout.strip(), b'.husky')
+        self.assertEqual(self.hook_runs(marker), [])
+        self.commit_in(one, 'husky runs')
+        self.assertEqual(self.hook_runs(marker), ['husky ' + str(one)])
+
+    def test_with_hooks_resolves_escaping_relative_hooks_path_from_the_source(self):
+        marker = self.root / 'hooks-ran'
+        shared = self.root / 'shared-hooks'
+        self.write_hook(shared / 'pre-commit', marker, 'shared')
+        # A decoy beside where the World will live must never run.
+        self.write_hook(self.root / 'worlds' / 'shared-hooks' / 'pre-commit', marker, 'decoy')
+        self.git(self.source, 'config', 'core.hooksPath', '../shared-hooks')
+        self.world('init', str(self.source), '--with-hooks')
+        (self.root / 'worlds').mkdir(exist_ok=True)
+        one, _ = self.fork(str(Path('worlds') / 'one'))
+        self.assertEqual(self.git(one, 'config', '--get', 'core.hooksPath').stdout.strip(), str(shared).encode())
+        self.commit_in(one, 'shared hook runs')
+        self.assertEqual(self.hook_runs(marker), ['shared ' + str(one)])
+
+    def test_with_hooks_refuses_symlinks_under_an_in_tree_hooks_path(self):
+        outside = self.root / 'outside-hooks'
+        outside.mkdir()
+        (outside / 'pre-commit').write_text('#!/bin/sh\nexit 0\n')
+        (outside / 'pre-commit').chmod(0o755)
+        self.git(self.source, 'config', 'core.hooksPath', '.husky')
+        with self.subTest(case='symlinked hooks directory'):
+            (self.source / '.husky').symlink_to(outside)
+            result = self.world('init', str(self.source), '--with-hooks', '--include-changes', code=3)
+            self.assertIn(b'core.hooksPath .husky goes through a symlink', result.stderr)
+            (self.source / '.husky').unlink()
+        with self.subTest(case='symlinked hook'):
+            (self.source / '.husky').mkdir()
+            (self.source / '.husky' / 'pre-commit').symlink_to(outside / 'pre-commit')
+            result = self.world('init', str(self.source), '--with-hooks', '--include-changes', code=3)
+            self.assertIn(b'hook .husky/pre-commit is a symlink', result.stderr)
+            (self.source / '.husky' / 'pre-commit').unlink()
+        with self.subTest(case='symlink nested below the hooks directory'):
+            (self.source / '.husky' / 'lib').mkdir()
+            (self.source / '.husky' / 'lib' / 'helper').symlink_to(outside / 'pre-commit')
+            result = self.world('init', str(self.source), '--with-hooks', '--include-changes', code=3)
+            self.assertIn(b'hook .husky/lib/helper is a symlink', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_committed_only_with_hooks_needs_a_committed_hooks_path(self):
+        marker = self.root / 'hooks-ran'
+        self.write_hook(self.source / '.husky' / 'pre-commit', marker, 'husky')
+        self.git(self.source, 'config', 'core.hooksPath', '.husky')
+        for staged in (False, True):
+            with self.subTest(staged=staged):
+                if staged:
+                    self.git(self.source, 'add', '.husky')
+                result = self.world('init', str(self.source), '--committed-only', '--with-hooks', code=3)
+                self.assertIn(b'core.hooksPath .husky is not committed', result.stderr)
+        self.git(self.source, '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'husky')
+        # A committed directory with an uncommitted hook inside is refused too.
+        self.write_hook(self.source / '.husky' / 'commit-msg', marker, 'late')
+        result = self.world('init', str(self.source), '--committed-only', '--with-hooks', code=3)
+        self.assertIn(b'core.hooksPath .husky has uncommitted changes', result.stderr)
+        (self.source / '.husky' / 'commit-msg').unlink()
+        # So is an edit that an index-only mark hides from status.
+        committed = (self.source / '.husky' / 'pre-commit').read_bytes()
+        for mark in ('--skip-worktree', '--assume-unchanged'):
+            with self.subTest(mark=mark):
+                self.git(self.source, 'update-index', mark, '.husky/pre-commit')
+                (self.source / '.husky' / 'pre-commit').write_bytes(committed + b'# local edit\n')
+                self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+                result = self.world('init', str(self.source), '--committed-only', '--with-hooks', code=3)
+                self.assertIn(b'hook .husky/pre-commit is marked skip-worktree or assume-unchanged', result.stderr)
+                self.git(self.source, 'update-index', '--no' + mark[1:], '.husky/pre-commit')
+                (self.source / '.husky' / 'pre-commit').write_bytes(committed)
+        snapshot = self.world('init', str(self.source), '--committed-only', '--with-hooks').stdout.split()[0].decode()
+        one, _ = self.fork('one', snapshot)
+        self.commit_in(one, 'husky runs')
+        self.assertEqual(self.hook_runs(marker), ['husky ' + str(one)])
+
+    def test_committed_only_needs_a_committed_hooks_path_in_a_managed_world(self):
+        # A managed World carries its hooks without --with-hooks, so a hooks path configured
+        # in it after creation (husky installed later) must be committed before the reset.
+        marker = self.root / 'hooks-ran'
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.write_hook(one / '.husky' / 'pre-commit', marker, 'husky')
+        self.git(one, 'config', 'core.hooksPath', '.husky')
+        result = self.world('fork', '--from', wid, '--to', str(self.root / 'two'), '--committed-only', code=3)
+        self.assertIn(b'core.hooksPath .husky is not committed', result.stderr)
+        self.assertFalse((self.root / 'two').exists())
+        result = self.world('checkpoint', wid, '--committed-only', code=3)
+        self.assertIn(b'core.hooksPath .husky is not committed', result.stderr)
+        self.git(one, 'add', '.husky')
+        self.git(one, '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'husky')
+        two, _ = self.fork('two', wid, '--committed-only')
+        self.commit_in(two, 'husky runs')
+        self.assertEqual(self.hook_runs(marker), ['husky ' + str(two)])
+
+    def test_with_hooks_refuses_dot_dot_after_a_directory_in_the_hooks_path(self):
+        # Git takes `link/..` through the symlink, which a lexical collapse would not.
+        marker = self.root / 'hooks-ran'
+        outside = self.root / 'outside' / 'dir'
+        outside.mkdir(parents=True)
+        self.write_hook(self.root / 'outside' / 'hooks' / 'pre-commit', marker, 'outside')
+        self.write_hook(self.source / 'hooks' / 'pre-commit', marker, 'in-tree')
+        (self.source / 'link').symlink_to(outside)
+        self.git(self.source, 'config', 'core.hooksPath', 'link/../hooks')
+        result = self.world('init', str(self.source), '--with-hooks', '--include-changes', code=3)
+        self.assertIn(b"core.hooksPath link/../hooks has a '..' after a directory name", result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        self.assertEqual(self.hook_runs(marker), [])
+
+    def test_with_hooks_refuses_a_hooks_path_inside_git_administration(self):
+        marker = self.root / 'hooks-ran'
+        self.write_hook(self.source / '.git' / 'custom-hooks' / 'pre-commit', marker, 'custom')
+        self.git(self.source, 'config', 'core.hooksPath', '.git/custom-hooks')
+        result = self.world('init', str(self.source), '--with-hooks', code=3)
+        self.assertIn(b'core.hooksPath .git/custom-hooks is inside .git, which the import replaces', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_committed_only_checks_root_level_hooks(self):
+        marker = self.root / 'hooks-ran'
+        self.git(self.source, 'config', 'core.hooksPath', '.')
+        (self.source / 'notes.txt').write_text('an ordinary untracked file is not a hook\n')
+        self.write_hook(self.source / 'pre-commit', marker, 'root')
+        result = self.world('init', str(self.source), '--committed-only', '--with-hooks', code=3)
+        self.assertIn(b'core.hooksPath . has uncommitted changes', result.stderr)
+        self.git(self.source, 'add', 'pre-commit')
+        self.git(self.source, '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'root hook')
+        snapshot = self.world('init', str(self.source), '--committed-only', '--with-hooks').stdout.split()[0].decode()
+        one, _ = self.fork('one', snapshot)
+        self.assertFalse((one / 'notes.txt').exists())
+        # (Git itself cannot execute hooks from core.hooksPath=. -- it looks the bare hook name
+        # up on PATH -- so the committed hook is checked as content, not by running it.)
+        self.assertEqual((one / 'pre-commit').read_bytes(), (self.source / 'pre-commit').read_bytes())
+        self.assertTrue(os.access(one / 'pre-commit', os.X_OK))
+
+    def test_with_hooks_refuses_symlinked_hooks(self):
+        marker = self.root / 'hooks-ran'
+        target = self.root / 'elsewhere' / 'pre-commit'
+        self.write_hook(target, marker)
+        hooks = self.source / '.git' / 'hooks'
+        (hooks / 'pre-commit').symlink_to(target)
+        refused = self.world('init', str(self.source), '--with-hooks', code=3)
+        self.assertIn(b'reason: hook pre-commit is a symlink', refused.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        # Left behind by default, with the note.
+        self.assertIn(b'--with-hooks', self.world('init', str(self.source)).stderr)
+        shutil.rmtree(hooks)
+        hooks.symlink_to(target.parent)
+        refused = self.world('init', str(self.source), '--with-hooks', code=3)
+        self.assertIn(b'is a symlink or not a directory', refused.stderr)
+        self.assertEqual(len(json.loads(self.world('list', '--json').stdout)['snapshots']), 1)
+        self.assertEqual(self.hook_runs(marker), [])
+
+    def test_hook_change_during_mirror_aborts_publication(self):
+        import shlex
+        marker = self.root / 'hooks-ran'
+        hook = self.source / '.git' / 'hooks' / 'pre-commit'
+        self.write_hook(hook, marker)
+        real_git = shutil.which('git')
+        wrapper = self.root / 'hook-race-bin'
+        wrapper.mkdir()
+        script = wrapper / 'git'
+        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = --mirror ] && mirror=1; done\n'
+                          + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
+                          + 'if [ "$result" = 0 ] && [ "$mirror" = 1 ]; then\n'
+                          + 'printf "exit 1\\n" >> ' + shlex.quote(str(hook)) + ' || exit $?\n'
+                          + 'fi\nexit "$result"\n')
+        script.chmod(0o700)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        self.world('init', str(self.source), '--with-hooks', code=1)
+        self.assertTrue(hook.read_text().endswith('exit 1\n'))
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_linked_source_can_be_deleted_after_import(self):
         linked = self.root / 'linked'
         self.git(self.source, 'worktree', 'add', '-b', 'linked', str(linked))
@@ -2455,14 +2869,107 @@ class GitWorldTest(unittest.TestCase):
         self.world('init', str(unborn), '--include-changes', code=3)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
-    def test_hard_snapshot_and_pool_refusal(self):
+    def pool_ready(self, snapshot='S1'):
+        rows = json.loads(self.world('pool', 'status', '--json').stdout)['pool']
+        return sum(r['ready'] for r in rows if r['snapshot'] == snapshot)
+
+    def pool_fork(self, name, pooled):
+        path = self.root / name
+        out = self.world('fork', '--from', 'S1', '--to', str(path)).stdout
+        self.assertEqual(b'(pool)' in out, pooled, out)
+        return path, out.decode().split()[0]
+
+    def test_hard_snapshot_pool(self):
         init_args = ('--hard',) if sys.platform == 'darwin' else ()
         self.world('init', str(self.source), *init_args)
-        self.world('pool', 'fill', 'S1', '--count', '1', code=3)
-        self.assertEqual(json.loads(self.world('pool', 'status', '--json').stdout)['pool'], [])
-        one, _ = self.fork()
+        self.world('pool', 'fill', 'S1', '--count', '1')
+        one, _ = self.pool_fork('one', True)
         self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.git(one, 'branch', '--show-current').stdout.strip(), b'world/W1')
         self.git(one, 'fsck', '--full')
+        two, _ = self.pool_fork('two', False)
+        self.assertEqual(self.git(two, 'status', '--porcelain').stdout, b'')
+        self.world('verify', 'S1')
+
+    def test_git_snapshot_pool_hands_out_ordinary_git_worlds(self):
+        self.world('init', str(self.source))
+        self.world('pool', 'fill', 'S1', '--count', '2')
+        self.assertEqual(self.pool_ready(), 2)
+        self.world('verify', 'S1')
+        one, w1 = self.pool_fork('one', True)
+        two, w2 = self.pool_fork('two', True)
+        self.assertEqual(self.pool_ready(), 0)
+        three, w3 = self.pool_fork('three', False)   # the ordinary path, for comparison
+        for world, wid in ((one, w1), (two, w2), (three, w3)):
+            self.assertEqual(self.git(world, 'status', '--porcelain').stdout, b'')
+            self.assertEqual(self.git(world, 'branch', '--show-current').stdout.decode().strip(), 'world/' + wid)
+            info = json.loads(self.world('inspect', wid, '--json').stdout)['git']
+            self.assertEqual(info['baseline'].encode(), self.base)
+            self.assertEqual(info['branch'], 'world/' + wid)
+            self.assertEqual(info['git_dir'], str(world / '.world-git/repo.git'))
+            self.assertIn(str(world).encode(), self.git(world, 'worktree', 'list', '--porcelain').stdout)
+            self.git(world, 'fsck', '--full')
+        # A handed-out World is configured exactly like an ordinary fork.
+        config = lambda w: self.git(w, 'config', '--local', '--list').stdout
+        self.assertEqual(config(one), config(three))
+        self.assertEqual(config(two), config(three))
+        # Independent refs, indexes and commits.
+        (one / 'file').write_text('one\n')
+        self.git(one, 'commit', '-qam', 'one')
+        (two / 'new').write_text('two\n')
+        self.git(two, 'add', 'new')
+        self.assertEqual(self.git(two, 'rev-parse', 'HEAD').stdout.strip(), self.base)
+        self.assertEqual(self.git(three, 'status', '--porcelain').stdout, b'')
+        self.git(two, 'rev-parse', '--verify', 'refs/heads/world/W1', code=128)
+        self.git(one, 'rev-parse', '--verify', 'refs/heads/world/W2', code=128)
+        self.assertEqual(self.git(self.source, 'rev-parse', 'HEAD').stdout.strip(), self.base)
+        self.world('verify', 'S1')
+
+    def test_git_pool_setup_failure_discards_the_entry(self):
+        import shlex
+        self.world('init', str(self.source))
+        entries = self.store / 'pool' / 'S1'
+        listing = lambda: sorted(p.name for p in entries.iterdir()) if entries.exists() else []
+        self.world('pool', 'fill', 'S1', '--count', '1')
+        self.assertEqual(len(listing()), 1)
+        real_git = shutil.which('git')
+        wrapper = self.root / 'bin'
+        wrapper.mkdir()
+        script = wrapper / 'git'
+        script.write_text('#!/bin/sh\nfor arg in "$@"; do [ "$arg" = update-ref ] && exit 42; done\nexec '
+                          + shlex.quote(real_git) + ' "$@"\n')
+        script.chmod(0o700)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        target = self.root / 'failed'
+        self.world('fork', '--from', 'S1', '--to', str(target), code=3)
+        self.assertFalse(target.exists())
+        self.assertEqual(list(self.root.glob('.wfs-fork-*')), [])
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['worlds'], [])
+        # The entry the failed setup touched is gone, not back in the pool.
+        self.assertEqual(self.pool_ready(), 0)
+        self.assertEqual(listing(), [])
+        self.env['PATH'] = self.env['PATH'].split(os.pathsep, 1)[1]
+        one, _ = self.pool_fork('one', False)
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        # An entry whose setup refuses it is dropped, and the fork is served by a fresh clone.
+        self.world('pool', 'fill', 'S1', '--count', '1')
+        [entry] = listing()
+        (entries / entry / '.git').write_text('gitdir: elsewhere\n')
+        two, wid = self.pool_fork('two', False)
+        self.assertEqual((two / '.git').read_text(), 'gitdir: .world-git/repo.git/worktrees/active\n')
+        self.assertEqual(self.git(two, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.git(two, 'branch', '--show-current').stdout.decode().strip(), 'world/' + wid)
+        self.assertEqual(self.pool_ready(), 0)
+        self.assertEqual(listing(), [])
+        # So is an entry whose marker disappeared: it would otherwise publish without a worktree.
+        self.world('pool', 'fill', 'S1', '--count', '1')
+        [entry] = listing()
+        (entries / entry / '.git').unlink()
+        three, wid = self.pool_fork('three', False)
+        self.assertEqual((three / '.git').read_text(), 'gitdir: .world-git/repo.git/worktrees/active\n')
+        self.assertEqual(self.git(three, 'branch', '--show-current').stdout.decode().strip(), 'world/' + wid)
+        self.assertEqual(self.pool_ready(), 0)
+        self.assertEqual(listing(), [])
         self.world('verify', 'S1')
 
     def test_main_repository_does_not_import_other_worktree_registrations(self):

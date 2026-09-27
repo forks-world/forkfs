@@ -34,14 +34,20 @@ enum { EX_OK = 0, EX_ERR = 1, EX_USAGE = 2, EX_REFUSED = 3 };
 
 static void usage(int code = EX_USAGE) {
     fputs("usage: world fs <command>\n"
-          "  init <dir> [--name N] [--hard] [--include-changes]   snapshot <dir> as S<n> (the root is gated 0000;\n"
-          "                                   --hard is macOS-only: UF_IMMUTABLE per entry)\n"
-          "  fork [--from W<n>|S<n>] [--to <path>] [--name N] [--copy] [--force] [--no-pool] [--include-changes]\n"
+          "  init <dir> [--name N] [--hard] [--include-changes|--committed-only] [--with-hooks]\n"
+          "                                   snapshot <dir> as S<n> (the root is gated 0000;\n"
+          "                                   --hard is macOS-only: UF_IMMUTABLE per entry;\n"
+          "                                   --with-hooks carries the repository's Git hooks)\n"
+          "  fork [--from W<n>|S<n>] [--to <path>] [--name N] [--copy] [--force] [--no-pool]\n"
+          "       [--include-changes|--committed-only]\n"
           "                                   clone into a writable world (default ~/worlds/W<n>/<name>);\n"
           "                                   a snapshot with a warm pool is served in O(1), --no-pool\n"
           "                                   always clones here and now\n"
-          "  checkpoint W<n> [--name N] [--hard] [--force] [--include-changes]\n"
-          "                                   snapshot a live world; the world stays writable\n"
+          "  checkpoint W<n> [--name N] [--hard] [--force] [--include-changes|--committed-only]\n"
+          "                                   snapshot a live world; the world stays writable.\n"
+          "                                   A dirty Git source needs a choice: --include-changes\n"
+          "                                   carries its uncommitted work, --committed-only starts\n"
+          "                                   from HEAD (ignored files are carried either way)\n"
           "  diff W<n> [--full|--events] [--stat] [--json] [--no-xattr] [--all-xattrs] [--no-content]\n"
           "                                   what changed since the fork (A/M/D/T, sorted).\n"
           "                                   Walks both trees by default -- exact, and faster than\n"
@@ -333,6 +339,15 @@ static int explain_path(wfs_store *s, const char *path, int rc, const char *verb
 
 // ---- commands ----------------------------------------------------------------------------------
 
+// --include-changes carries a dirty Git source's uncommitted work, --committed-only leaves it
+// behind: two answers to one question, so asking both is a usage error.
+static void changes_choice(int include_changes, int committed_only) {
+    if (include_changes && committed_only) {
+        fprintf(stderr, "world: --include-changes and --committed-only are mutually exclusive\n");
+        exit(EX_USAGE);
+    }
+}
+
 static int cmd_init(wfs_store *s, int argc, char **argv) {
     const char *dir = NULL;
     wfs_snapshot_opts opts;
@@ -341,10 +356,13 @@ static int cmd_init(wfs_store *s, int argc, char **argv) {
         if (!strcmp(argv[i], "--name") && i + 1 < argc) opts.name = argv[++i];
         else if (!strcmp(argv[i], "--hard")) opts.hard = 1;
         else if (!strcmp(argv[i], "--include-changes")) opts.include_changes = 1;
+        else if (!strcmp(argv[i], "--committed-only")) opts.committed_only = 1;
+        else if (!strcmp(argv[i], "--with-hooks")) opts.with_hooks = 1;
         else if (argv[i][0] != '-' && !dir) dir = argv[i];
         else usage();
     }
     if (!dir) usage();
+    changes_choice(opts.include_changes, opts.committed_only);
     int rc = wfs_path_check(s, dir, 0);
     if (rc) return explain_path(s, dir, rc, "init");
     if ((rc = wfs_store_clone_probe(s, dir))) return explain_path(s, dir, rc, "init");
@@ -372,6 +390,13 @@ static int cmd_init(wfs_store *s, int argc, char **argv) {
     } else {
         printf("S%llu\n", (unsigned long long)id);
     }
+    // Hooks are left behind unless asked for, which silently skips husky/pre-commit checks on
+    // World commits; say so once, with the way to carry them.
+    if (!opts.with_hooks && wfs_git_uncarried_hooks(dir) == 1)
+        fprintf(stderr,
+                "world: note: %s has Git hooks (hooks directory or core.hooksPath) that S%llu does "
+                "not carry, so commits in its Worlds skip them; pass --with-hooks to carry them\n",
+                dir, (unsigned long long)id);
     return EX_OK;
 }
 
@@ -623,9 +648,15 @@ static int cmd_fork(wfs_store *s, int argc, char **argv) {
         else if (!strcmp(argv[i], "--copy")) opts.allow_fallback = 1;
         else if (!strcmp(argv[i], "--no-pool")) opts.no_pool = 1;
         else if (!strcmp(argv[i], "--include-changes")) opts.include_changes = 1;
+        else if (!strcmp(argv[i], "--committed-only")) opts.committed_only = 1;
         else if (!strcmp(argv[i], "--skip-space-check")) opts.skip_space_check = 1;
         else if (!strcmp(argv[i], "--force")) opts.force = 1;
         else usage();
+    }
+    changes_choice(opts.include_changes, opts.committed_only);
+    if (opts.committed_only && from.kind != WFS_K_WORLD) {
+        fprintf(stderr, "world: --committed-only needs --from W<n>: a snapshot's content is already fixed\n");
+        return EX_USAGE;
     }
     if (from.kind == WFS_K_NONE) {
         wfs_id sid = 0;
@@ -714,11 +745,13 @@ static int cmd_checkpoint(wfs_store *s, int argc, char **argv) {
         if (!strcmp(argv[i], "--name") && i + 1 < argc) opts.name = argv[++i];
         else if (!strcmp(argv[i], "--hard")) opts.hard = 1;
         else if (!strcmp(argv[i], "--include-changes")) opts.include_changes = 1;
+        else if (!strcmp(argv[i], "--committed-only")) opts.committed_only = 1;
         else if (!strcmp(argv[i], "--force")) opts.force = 1;
         else if (argv[i][0] != '-' && !w) w = parse_world(argv[i]);
         else usage();
     }
     if (!w) usage();
+    changes_choice(opts.include_changes, opts.committed_only);
     wfs_world_rec r;
     int rc = wfs_world_info(s, w, &r);
     if (rc) return fail("checkpoint", rc);

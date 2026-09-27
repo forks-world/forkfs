@@ -1078,6 +1078,28 @@ void hl_drop_broken(wfs::HardlinkSet &hl, const Vec<uint64_t> &broken) {
     hl = std::move(kept);
 }
 
+// --committed-only resets the clone to HEAD after the replay, and Git rewrites a file by
+// replacing it: a hardlinked tracked file that differed from HEAD, or an untracked one that was
+// removed, leaves its group no longer whole in this tree. Such groups come out of the set for
+// the same reason as hl_drop_broken's -- the manifest must describe the tree it is written for.
+void hl_drop_changed(const char *root, wfs::HardlinkSet &hl) {
+    Vec<uint64_t> broken;
+    for (size_t i = 0; i < hl.groups.size(); ++i) {
+        const auto &g = hl.groups[i];
+        struct stat first;
+        bool whole = !g.paths.empty();
+        for (size_t j = 0; whole && j < g.paths.size(); ++j) {
+            String p = joinp(root, g.paths[j].c_str());
+            struct stat st;
+            if (::lstat(p.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) whole = false;
+            else if (j == 0) first = st;
+            else if (st.st_dev != first.st_dev || st.st_ino != first.st_ino) whole = false;
+        }
+        if (!whole) broken.emplace_back((uint64_t)i);
+    }
+    if (broken.size()) hl_drop_broken(hl, broken);
+}
+
 } // namespace
 
 // The one interleaving a test cannot produce from outside: the middle of a pool-backed fork,
@@ -1178,7 +1200,8 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         if (int rc = exec_lock_guard(s, from_world, o.force)) return rc;
     }
     wfs::GitSource git_source;
-    if (int rc = wfs::git_source(src.c_str(), o.include_changes != 0, git_source)) return rc;
+    if (int rc = wfs::git_source(src.c_str(), o.include_changes != 0, git_source, o.committed_only != 0,
+                                   o.with_hooks != 0)) return rc;
 
     // P6: st_dev equality does not predict clonefile success, so really clone something.
     if (int rc = wfs_store_clone_probe(s, src.c_str())) return rc;
@@ -1273,6 +1296,7 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         if (hlr.broken.size()) hl_drop_broken(hl, hlr.broken);
         // The source scan already left the replaced `.git` out, so `hl` describes this tree.
         if ((rc = wfs::git_import(git_source, root.c_str()))) break;
+        if (git_source.committed_only && hl.groups.size()) hl_drop_changed(root.c_str(), hl);
         {
             struct stat rst;
             if (::stat(root.c_str(), &rst) == 0) root_mode = (uint32_t)(rst.st_mode & 07777);
@@ -1544,17 +1568,17 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
     wfs::GitSource git_source;
     bool git_snapshot = false;
     if (from.kind == WFS_K_WORLD) {
-        if (int rc = wfs::git_source(src.c_str(), o.include_changes != 0, git_source)) return rc;
+        if (int rc = wfs::git_source(src.c_str(), o.include_changes != 0, git_source, o.committed_only != 0)) return rc;
     } else {
+        // A snapshot's content was fixed when it was taken; there is no working state to leave
+        // behind. Refused rather than ignored, since the caller asked for something specific.
+        if (o.committed_only) return -EINVAL;
         SnapGate gate;
         if (src_gated) { if (int rc = gate.open(src.c_str(), false)) return rc; }
         String dot = joinp(src.c_str(), ".git"); struct stat gst;
         if (::lstat(dot.c_str(), &gst) == 0) git_snapshot = true;
         else if (errno != ENOENT) return -errno;
     }
-    // Git branch setup mutates the clone. A failed setup must never return a modified pool
-    // entry to READY; use the normal CREATING temporary-tree rollback path for Git worlds.
-    if (git_snapshot || git_source.present) o.no_pool = 1;
     if (int rc = check_path(s, target_path, PATH_TARGET, target, nullptr)) return rc;
     String parent_dir;
     dirname_of(target.c_str(), parent_dir);
@@ -1582,7 +1606,22 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         if (wfs::pool_claim(s, snapshot_id, snap_created_at, claim, pool_fork_insert, &row) == 0) {
             wfs_id id = row.world;
             if (wfs_test_after_pool_claim) wfs_test_after_pool_claim(wfs_test_after_pool_claim_ctx, id);
-            int rc = marker_write(claim.path.c_str(), s->store_id.c_str(), s->dir.c_str(), id, nm,
+            // A Git entry is the snapshot's clone with no branch of its own. The per-World setup
+            // an ordinary fork runs on its temporary tree -- git_branch: the managed-layout
+            // checks, this World's `world/W<n>` branch and its baseline -- runs on the entry
+            // here, before it has a marker or a public name, so what gets published is exactly
+            // an ordinary Git fork. From this call on the entry is this World's and never goes
+            // back into the pool (see the unwind below).
+            bool git_setup = git_snapshot;
+            int rc = 0;
+            if (git_setup) {
+                // git_branch takes a tree without `.git` for a plain one and succeeds; an entry
+                // of a Git snapshot that lost its marker would publish without a worktree.
+                String dot = joinp(claim.path.c_str(), ".git"); struct stat gst;
+                rc = ::lstat(dot.c_str(), &gst) ? -errno : wfs::git_branch(claim.path.c_str(), id);
+            }
+            if (!rc)
+                rc = marker_write(claim.path.c_str(), s->store_id.c_str(), s->dir.c_str(), id, nm,
                                   snapshot_id, 0, created);
             // P7 again: the entry is store-internal, the target is not. RENAME_EXCL, so a
             // directory that appeared at `--to` since check_path looked is EEXIST and the entry
@@ -1663,28 +1702,50 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
                     return rc;
                 }
             }
-            if (wfs_test_in_pool_unwind) wfs_test_in_pool_unwind(wfs_test_in_pool_unwind_ctx);
-            // PR #1 review (16th round, P2): the CREATING row goes out in the very transaction
-            // the entry comes back in. It used to be deleted first, and in the gap between the
-            // two commits nothing at all referenced the snapshot: `discard S<n>` counted no
-            // world and no pool row, committed WFS_ST_TRASHING, and the return then inserted a
-            // READY entry for a snapshot on its way to the trash -- a whole stale clone, handed
-            // to the next fork as a live baseline until pool_collect() got to it. A reference
-            // exists at every instant between the claim and the return now: the world row until
-            // the commit, the pool row after it.
-            PoolUnwind uw{s, id};
-            if (wfs::pool_return(s, claim, pool_fork_unwind, &uw) && id) {
-                // The entry did not go back -- pool_return has removed its tree -- so nothing
-                // references the snapshot through it any more and the row goes on its own.
+            if (git_setup) {
+                // The entry may carry this World's branch, HEAD and baseline now, or a half of
+                // them: it is not a clone of the snapshot any more and must never be handed to
+                // another fork. It is removed instead of returned, and the CREATING row goes
+                // after it. A tree that would not go is left under <store>/pool with no row
+                // naming it, which is the orphan pool_collect() sweeps; nothing else refers to
+                // it. The fork then falls through to an ordinary clone, as any failed hand-out
+                // does, and fails there the same way if the setup itself is what fails.
+                String m = joinp(claim.path.c_str(), WFS_MARKER_NAME);
+                ::unlink(m.c_str());
+                wfs::fs_remove_tree(claim.path.c_str());
                 Guard g(s->mu);
                 Txn t(s->db);
-                // 34th round, P1: falling through to a fresh clone with that row still CREATING
-                // would put a second tree at --to under a row that names neither. The fork ends
-                // here instead; the row is the abandoned-fork shape gc already collects.
+                // 34th round, P1: without the transaction the row stays CREATING, naming the
+                // entry through tmp_path -- the abandoned-fork shape gc collects -- and the fork
+                // ends here rather than put a second tree at --to under a row naming neither.
                 if (!t.ok()) return rc;
                 Stmt del(s->db, "DELETE FROM worlds WHERE id=?");
                 if (del.ok()) { del.i64(1, (int64_t)id); del.step(); }
                 (void)t.commit();   // best effort: gc's CREATING sweep is the backstop
+            } else {
+                if (wfs_test_in_pool_unwind) wfs_test_in_pool_unwind(wfs_test_in_pool_unwind_ctx);
+                // PR #1 review (16th round, P2): the CREATING row goes out in the very transaction
+                // the entry comes back in. It used to be deleted first, and in the gap between the
+                // two commits nothing at all referenced the snapshot: `discard S<n>` counted no
+                // world and no pool row, committed WFS_ST_TRASHING, and the return then inserted a
+                // READY entry for a snapshot on its way to the trash -- a whole stale clone, handed
+                // to the next fork as a live baseline until pool_collect() got to it. A reference
+                // exists at every instant between the claim and the return now: the world row until
+                // the commit, the pool row after it.
+                PoolUnwind uw{s, id};
+                if (wfs::pool_return(s, claim, pool_fork_unwind, &uw) && id) {
+                    // The entry did not go back -- pool_return has removed its tree -- so nothing
+                    // references the snapshot through it any more and the row goes on its own.
+                    Guard g(s->mu);
+                    Txn t(s->db);
+                    // 34th round, P1: falling through to a fresh clone with that row still CREATING
+                    // would put a second tree at --to under a row that names neither. The fork ends
+                    // here instead; the row is the abandoned-fork shape gc already collects.
+                    if (!t.ok()) return rc;
+                    Stmt del(s->db, "DELETE FROM worlds WHERE id=?");
+                    if (del.ok()) { del.i64(1, (int64_t)id); del.step(); }
+                    (void)t.commit();   // best effort: gc's CREATING sweep is the backstop
+                }
             }
             // ... and fall through to cloning it here and now
         }
