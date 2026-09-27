@@ -154,6 +154,80 @@ Worlds forked or checkpointed from a World keep its hooks, since its whole `.wor
 World requires the same of a relative `core.hooksPath` set in it -- committed, nothing pending
 inside -- even without `--with-hooks`.
 
+## Submodules
+
+An initialized submodule -- a directory the index records as a gitlink that holds a `.git`,
+at any depth up to 8 levels of nesting -- is imported with the root. Its repository is copied
+the way the root's is (a `--mirror --no-hardlinks` clone, then its index, symbolic refs, local
+rules, rerere cache, status settings, identity, carried remotes and submodule settings,
+`SQUASH_MSG`, `FETCH_HEAD`, `ORIG_HEAD` and, with `--with-hooks`, its hooks) into the place
+Git itself uses for a submodule of a linked worktree: `modules/<name>` of the superproject's
+Git directory, which for the root is the World's per-worktree
+`.world-git/repo.git/worktrees/active`, and `modules/<name>/modules/<name>` for a nested one.
+Both links are relative, as Git writes them: the submodule's `.git` file
+(`gitdir: ../../.world-git/repo.git/worktrees/active/modules/<name>`) and the module's
+`core.worktree`. So `git status`, `git submodule status/update/foreach` and `git -C <path> ...`
+work in a World with no network, after the source and the submodules' own origins are
+deleted, and after a move, trash/restore, fork or checkpoint. A submodule keeps the HEAD it
+had in the source, on its branch or detached; only the root gets a `world/W<n>` branch and a
+baseline. The source may keep a submodule absorbed (its `.git` a file into the
+superproject's `modules/`) or old-style (a `.git` directory in the submodule's worktree);
+which repository it is is asked of Git, and it must be exactly one of those two with this
+directory as its worktree. In the World every submodule is absorbed; the source is never
+modified.
+
+Every check the root's import makes is made on each submodule's repository too -- the
+configuration policy and filters, extensions, partial/shallow/alternates, stash and hidden
+refs, grafts, in-progress operations, dangling symbolic refs, reserved paths in its history,
+symlinked or unexpected administration -- and each is rechecked unchanged before publication.
+The copy must then hold a `.git` exactly at the imported submodules (one initialized in the
+source after it was checked would still lead back into the source), and a copy of a World is
+captured again, submodules included, and compared with its source. A refusal
+inside a submodule names it (`reason: submodule libs/lib: ...`). A submodule with no
+`.gitmodules` entry, an unsafe name, two names sharing a repository directory, a submodule
+path that is (or goes through) a symlink, or a `.git` that resolves to any other repository is
+refused. A plain nested repository -- a `.git` anywhere below the root that is not an
+initialized submodule's, including deeper inside an uninitialized submodule's directory -- is
+still refused.
+
+An uninitialized submodule (a gitlink without a `.git` in its directory) stays exactly as the
+source has it: the gitlink and its (usually empty) directory. The superproject's
+`submodule.active` and `submodule.<name>.url`, `.active`, `.branch`, `.shallow`,
+`.fetchRecurseSubmodules`, `.ignore` and `.update` settings travel with the other carried
+configuration, so `git submodule update --init` in the World clones it from the source's URL.
+A relative `url` is made absolute like a relative remote URL (with the same refusals); a
+`./` or `../` one is refused when the superproject has a remote, since Git would then resolve
+it against that remote's URL. A URL that a URL rewrite rule from a conditional include matches
+is refused, and so is a conditional include that sets `submodule.<name>.*`.
+`submodule.<name>.update` is carried only as `checkout`, `rebase`, `merge` or `none`: a
+`!command` (which `git submodule update` would run) or anything else is refused. The import
+itself never contacts a remote and never runs `git submodule update`.
+
+Cleanliness covers every initialized submodule: its own index and worktree must be clean and
+its HEAD must be the commit the superproject's index records. Each is checked directly after
+its own policy checks; the superproject's status runs with `--ignore-submodules=dirty`, so it
+never starts a status inside a submodule, and neither `submodule.<name>.ignore` nor
+`diff.ignoreSubmodules` can hide a dirty or moved submodule. `--include-changes` carries each
+submodule's uncommitted state (index preserved, worktree bytes cloned) and its HEAD even when
+it is ahead of the gitlink. `--committed-only` resets each submodule's copy, parents first, to
+the commit the superproject's HEAD records for it -- detached, when its HEAD is anywhere else --
+with the root's rules for index marks and filters; it is refused when that commit is not in
+the submodule's repository, when the index adds or removes a submodule HEAD does not, or when
+the uncommitted `.gitmodules` names an initialized submodule differently. An uninitialized
+submodule stays uninitialized.
+
+Forking or checkpointing a World checks the submodule layout like the root's: the exact
+relative links, no `.git` directory in a submodule, no linked worktree registered in a
+submodule repository (discard refuses one too) and no lock or symlink anywhere in the
+administration.
+
+`publish` still copies only the root's commits and fetches or pushes nothing for any
+submodule. It refuses when a commit being published records a submodule commit (a gitlink
+added or changed against any parent) that the target could not check out: the target has
+that submodule uninitialized (or is bare), or its submodule repository does not have that
+commit. The reason names the path and the commit; get the commit into the target's submodule
+first. This check applies with `--force` too. Its uncommitted-changes note covers submodules.
+
 ## Getting work back to the source
 
 `world fs publish W<n>` copies a Git World's commits into the repository the World was
@@ -266,8 +340,9 @@ content, including Git administrative changes such as branch/index updates.
 - Only a root repository with an existing commit is supported. Detached HEAD is supported;
   unborn repositories are refused. External linked worktrees are safely imported by
   resolving their source Git administration and constructing fresh local administration.
-- Nested repositories/submodules, sparse or split indexes, shallow/partial clones, and
-  object alternates are refused. So is a repository whose index, or any commit reachable
+- Plain nested repositories (not submodules; see [Submodules](#submodules)), sparse or split
+  indexes, shallow/partial clones, and object alternates are refused, in the root and in every
+  submodule. So is a repository whose index, or any commit reachable
   from its refs, HEAD, `ORIG_HEAD` or `FETCH_HEAD`, contains the root `.world` file or
   anything under `.world-git`: WorldFS owns those paths, `info/exclude` cannot hide a
   tracked file, and an ordinary checkout of such a commit overwrites the World marker. Partial clones are recognized by `extensions.partialClone`,
@@ -281,8 +356,8 @@ content, including Git administrative changes such as branch/index updates.
   crash) is refused, so the lock is never copied into the child. Merge/rebase/cherry-pick/revert in progress
   is also refused, as is an unconcluded `git notes merge`, whose state is invisible to
   `git status`. Re-import older snapshots that still contain an unconverted `.git`.
-- Git LFS hydration, recursive submodule import, a shared refs/object service, and
-  cross-machine history transfer are not provided. This increment does not close every requirement in Issue #7.
+- Git LFS hydration, reftable repositories, a shared refs/object service, cross-machine
+  history transfer, and publishing submodule commits are not provided. This increment does not close every requirement in Issue #7.
 - Repository-local `core.excludesFile` and `core.attributesFile` overrides are unsupported.
   They can point outside the repository, and merging their rules into `info/exclude` or
   `info/attributes` would change Git's precedence; these overrides are not imported. Use the
@@ -300,7 +375,7 @@ content, including Git administrative changes such as branch/index updates.
   ordinary fork runs on its temporary tree -- the managed-layout checks, the `world/W<n>`
   branch and the baseline -- on the entry before it gets its marker and its public name, so
   a handed-out Git World is indistinguishable from an ordinary fork. That setup is a few
-  Git commands and a walk for nested repositories, so a Git pool hit saves the clone but is
+  Git commands and a walk for nested repositories and submodules, so a Git pool hit saves the clone but is
   not the bare marker-and-rename hand-out of a plain snapshot. An entry the setup has touched
   never goes back into the pool: if the setup (or anything after it) fails, the entry is
   removed, nothing is published, and the fork falls through to an ordinary clone, which
@@ -312,7 +387,8 @@ content, including Git administrative changes such as branch/index updates.
 
 Validation: `cli_git_test` uses disposable real repositories and covers clean/dirty imports,
 committed-only imports, opt-in hooks, staging preservation, imported linked worktrees after
-source deletion, independent commits, branch collisions, detached HEAD,
+source deletion, absorbed, old-style, nested and uninitialized submodules and their
+refusals, independent commits, branch collisions, detached HEAD,
 move/discard/restore/checkpoint, hard snapshots, pooled Git forks and their setup failures,
 Git setup rollback, environment isolation and Git commits inside the exec sandbox.
 

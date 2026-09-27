@@ -14,8 +14,14 @@
 - [x] `--include-changes` 显式保留暂存/未暂存/未跟踪内容,ignored 产物照常克隆;
   `inspect` 文本/JSON 展示 Git 身份。已有外部 worktree 安全脱钩导入。
 - [x] Git 在发布前完成初始化,失败走现有临时树回滚;不复用 Git pool 条目。
-- [ ] Issue #7 剩余: 从 HEAD 丢弃修改的显式模式、嵌套仓库/submodule/LFS、共享仓库服务
-  与跨机器传输。范围及测试见 [`GIT_INTEGRATION.md`](GIT_INTEGRATION.md)。
+- [x] `--committed-only`: 从 HEAD 创建、丢弃未提交修改(只作用于副本),PR #16。
+- [x] `feat/git-submodules`: 已初始化的 submodule(含嵌套、absorbed 与旧式 `.git` 目录)
+  复制进 World 自己的 `.world-git/repo.git/worktrees/active/modules/<name>`,指针全为相对路径;
+  未初始化的保持未初始化并携带 `submodule.<name>.*` 配置;干净检查、`--include-changes`、
+  `--committed-only`、fork/checkpoint/pool/discard 覆盖每个 submodule;publish 拒绝目标
+  submodule 缺失的 gitlink 提交。
+- [ ] Issue #7 剩余: Git LFS、reftable 仓库、共享 refs/对象服务、跨机器历史传输。
+  范围及测试见 [`GIT_INTEGRATION.md`](GIT_INTEGRATION.md)。
 
 ## 当前增量开发(2026-09-22)
 
