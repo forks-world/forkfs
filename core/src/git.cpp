@@ -2171,6 +2171,19 @@ bool resolve_submodule_url(const String &base_url, const char *url, String &out)
     if (out.back() == '/') out.pop_back();
     return true;
 }
+// Whether the first `n` bytes of `a` and `b` are equal under ASCII case folding (other bytes,
+// UTF-8 included, compared exactly): submodule names are directories below modules/, and a
+// World may live on, or be forked onto, a case-insensitive volume where `Lib` and `lib` are one
+// directory. Independent of the locale.
+bool ascii_caseeq(const char *a, const char *b, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char x = (unsigned char)a[i], y = (unsigned char)b[i];
+        if (x >= 'A' && x <= 'Z') x = (unsigned char)(x - 'A' + 'a');
+        if (y >= 'A' && y <= 'Z') y = (unsigned char)(y - 'A' + 'a');
+        if (x != y) return false;
+    }
+    return true;
+}
 // A name is a directory below modules/: no empty, "." or ".." component, nothing absolute.
 bool valid_module_name(const String &name) {
     if (name.empty() || name[0] == '/' || strpbrk(name.c_str(), "\\\n\r")) return false;
@@ -2589,7 +2602,7 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
         if (!valid_module_name(*name)) return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s has an unsafe name (%s)", path.c_str(), name->c_str());
         for (const auto &other : sibling_names) {
             size_t n = other.size() < name->size() ? other.size() : name->size();
-            if (!strncmp(other.c_str(), name->c_str(), n) &&
+            if (ascii_caseeq(other.c_str(), name->c_str(), n) &&
                 (other.size() == name->size() || (other.size() > n ? other[n] : (*name)[n]) == '/'))
                 return refuse(WFS_E_GIT_UNSUPPORTED, "submodule names %s and %s share a repository directory", other.c_str(), name->c_str());
         }

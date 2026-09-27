@@ -198,7 +198,10 @@ still refused.
 An uninitialized submodule (a gitlink without a `.git` in its directory) stays exactly as the
 source has it: the gitlink and its (usually empty) directory. Its `.gitmodules` name is checked
 like an initialized one's -- no unsafe name, and no name whose repository directory would lie
-in or over another submodule's -- since initializing it later puts its repository there. A
+in or over another submodule's, comparing names under ASCII case folding whatever the volume
+(`Lib` and `lib` are one directory on a case-insensitive volume, and a World can be forked onto
+one) -- since initializing it later puts its repository there. Non-ASCII bytes are compared
+exactly: names that differ only by Unicode case or normalization are not detected. A
 gitlink with no `.gitmodules` entry at all (an "embedded" repository added by accident, which
 Git tolerates) is imported as it is when uninitialized; an initialized one is refused. Every
 check that reads `.gitmodules` -- names, collisions, relative URLs -- reads the one that will be

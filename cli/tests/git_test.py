@@ -3583,6 +3583,15 @@ class GitWorldTest(unittest.TestCase):
         refused = self.world('init', str(self.source), code=3)
         self.assertIn(b'reason: submodule names lib-module/inside and lib-module share a repository directory', refused.stderr)
         undo()
+        # Names that differ only in ASCII case share a directory on a case-insensitive volume.
+        for first, second in (('Lib', 'lib'), ('Lib', 'lib/x')):
+            with self.subTest(names=(first, second)):
+                gitlink('case-a', first)
+                gitlink('case-b', second)
+                refused = self.world('init', str(self.source), code=3)
+                self.assertIn(b'reason: submodule names ' + first.encode() + b' and ' + second.encode()
+                              + b' share a repository directory', refused.stderr)
+                self.git(self.source, 'reset', '-q', '--hard', 'HEAD~2')
         # An embedded gitlink without any .gitmodules entry is left exactly as it is.
         gitlink('embedded', None)
         (self.source / 'embedded').mkdir()
