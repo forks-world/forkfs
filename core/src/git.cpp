@@ -2397,9 +2397,13 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
         module_names(tree_listing, tree_names);
     }
     // The .gitmodules the copy will publish -- the worktree's, or with --committed-only the
-    // committed one -- is rechecked as a whole against the copy before publication
-    // (same_gitmodules): the owned repositories are named after this mapping.
-    state.gitmodules = tree ? tree_listing : listing;
+    // committed one -- is the one source of truth for every check below (names, collisions,
+    // relative URLs) and for the owned repositories' names, and is rechecked as a whole against
+    // the copy before publication (same_gitmodules). The worktree's is consulted only to
+    // require that an initialized submodule's source repository sits under that same name.
+    const Vec<char> &published = tree ? tree_listing : listing;
+    const Vec<GitSetting> &published_names = tree ? tree_names : names;
+    state.gitmodules = published;
     state.gitmodules_checked = true;
     // A "./" or "../" URL that only .gitmodules gives (no submodule.<name>.url in the
     // configuration: an uninitialized submodule, typically) is resolved by `git submodule init`
@@ -2442,8 +2446,6 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
         String remote_url("remote."); remote_url.append(remote.c_str()); remote_url.append(".url");
         bool origin = false;
         for (const auto &c : carried) if (c.key == remote_url) origin = true;
-        const Vec<char> &published = tree ? tree_listing : listing;
-        const Vec<GitSetting> &published_names = tree ? tree_names : names;
         for (const auto &link : gitlinks) {
             const String *name = module_name(published_names, link.path);
             const char *url = name ? gitmodules_value(published, *name, "url") : nullptr;
@@ -2469,7 +2471,7 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
     // ordinary "embedded" gitlink; left uninitialized, there is nothing to import for it.
     Vec<String> sibling_names;
     for (const auto &link : gitlinks) {
-        const String *name = module_name(names, link.path);
+        const String *name = module_name(published_names, link.path);
         if (!name) continue;
         String path(prefix); path.append(link.path.c_str());
         if (!valid_module_name(*name)) return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s has an unsafe name (%s)", path.c_str(), name->c_str());
@@ -2511,11 +2513,11 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
         }
         if (depth >= kMaxModuleDepth)
             return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s is nested more than %d levels deep", path.c_str(), kMaxModuleDepth);
-        const String *name = module_name(names, link.path);
+        const String *name = module_name(published_names, link.path);
         if (!name) return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s has no .gitmodules entry", path.c_str());
         if (tree) {
-            const String *committed = module_name(tree_names, link.path);
-            if (!committed || *committed != *name)
+            const String *current = module_name(names, link.path);
+            if (!current || *current != *name)
                 return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s is named differently in the uncommitted .gitmodules, which --committed-only would reset; commit it or drop --committed-only", path.c_str());
         }
         bool gitfile = S_ISREG(st.st_mode);

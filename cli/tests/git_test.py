@@ -3579,6 +3579,23 @@ class GitWorldTest(unittest.TestCase):
                          self.git(self.source, 'ls-files', '--stage', 'embedded').stdout)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'][0]['name'], 'source')
 
+    def test_committed_only_validates_the_committed_gitmodules(self):
+        self.submodule_fixture()
+        unused = self.git(self.source, 'rev-parse', 'HEAD:vendor/unused').stdout.strip().decode()
+        for name, reason in (('../escape', b'reason: submodule escape has an unsafe name (../escape)'),
+                             ('lib-module/inside', b'reason: submodule names lib-module/inside and lib-module share a repository directory')):
+            with self.subTest(name=name):
+                self.git(self.source, 'update-index', '--add', '--cacheinfo', '160000,' + unused + ',escape')
+                self.git(self.source, 'config', '-f', '.gitmodules', 'submodule.' + name + '.path', 'escape')
+                self.git(self.source, 'add', '.gitmodules')
+                self.git(self.source, 'commit', '-qm', 'committed ' + name)
+                # A safe name in the worktree only; the reset publishes the committed one.
+                self.git(self.source, 'config', '-f', '.gitmodules', '--rename-section', 'submodule.' + name, 'submodule.safe')
+                self.world('init', str(self.source), '--include-changes')
+                refused = self.world('init', str(self.source), '--committed-only', code=3)
+                self.assertIn(reason, refused.stderr)
+                self.git(self.source, 'reset', '-q', '--hard', 'HEAD~1')
+
     def test_publish_refuses_a_gitlink_commit_the_target_lacks(self):
         self.submodule_fixture()
         self.world('init', str(self.source))

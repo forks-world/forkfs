@@ -199,7 +199,9 @@ source has it: the gitlink and its (usually empty) directory. Its `.gitmodules` 
 like an initialized one's -- no unsafe name, and no name whose repository directory would lie
 in or over another submodule's -- since initializing it later puts its repository there. A
 gitlink with no `.gitmodules` entry at all (an "embedded" repository added by accident, which
-Git tolerates) is imported as it is when uninitialized; an initialized one is refused. The superproject's
+Git tolerates) is imported as it is when uninitialized; an initialized one is refused. Every
+check that reads `.gitmodules` -- names, collisions, relative URLs -- reads the one that will be
+published: the worktree's, or with `--committed-only` the committed one. The superproject's
 `submodule.active` and `submodule.<name>.url`, `.active`, `.branch`, `.shallow`,
 `.fetchRecurseSubmodules`, `.ignore` and `.update` settings travel with the other carried
 configuration, so `git submodule update --init` in the World clones it from the source's URL.
