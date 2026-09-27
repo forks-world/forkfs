@@ -584,8 +584,6 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
     // Every remote's raw url/pushurl entries and where they land in `out`, for the pinning pass
     // below.
     Vec<RemoteRewriteInfo> remotes;
-    // Where each submodule.<name>.url landed in `out`.
-    Vec<size_t> submodule_urls;
     // Entries are "<key>\n<value>\0"; a valueless key has no newline.
     for (size_t i = 0; i < listing.size() && listing[i];) {
         const char *entry = listing.data() + i;
@@ -624,7 +622,6 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
                     key.c_str(), val.c_str(), r->base.c_str(), r->push ? "pushInsteadOf" : "insteadOf");
             if (int arc = absolutize_remote_path(root, val.c_str(), val)) return arc;
         }
-        if (is_submodule_url) submodule_urls.emplace_back(out.size());
         // A local-path remote URL may legally contain an embedded newline (or carriage return).
         // `git remote get-url --all`/`--push --all` below would emit it verbatim, and git_lines
         // splits on every '\n', so the effective URL list would no longer match this raw value
@@ -662,18 +659,8 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
     // it is, from the superproject's worktree top (from a subdirectory too, and with a remote
     // origin present), so `../lib.git` names <top>/../lib.git -- exactly what the absolutization
     // above reproduces. Only a URL that .gitmodules alone gives is resolved against the default
-    // remote (discover_modules).
-    // A submodule URL is carried as the source has it and the World's Git rewrites it with the
-    // same shared configuration, except a rule from a conditional include: one that is inactive
-    // at the source could become active at the World's location, or the other way round.
-    for (size_t idx : submodule_urls) {
-        const UrlRewriteRule *r = matching_rewrite(conditional_rules, out[idx].value.c_str());
-        if (r)
-            return refuse(WFS_E_GIT_POLICY,
-                "%s %s matches url.%s.%s, which a conditional include can change at the World's "
-                "location; simplify the URL rewrite rules before importing",
-                out[idx].key.c_str(), out[idx].value.c_str(), r->base.c_str(), r->push ? "pushInsteadOf" : "insteadOf");
-    }
+    // remote. Every submodule URL is classified and checked against rewrite rules in one place,
+    // with the shared configuration it competes with (discover_modules).
     // A remote is one unit: if any of its repository-local settings are carried (a subsectioned
     // remote.<name>.<var> key from kCarriedConfig above, e.g. .fetch or .prune -- not a
     // section-wide key like remote.pushDefault, which has no <name>), its url/pushurl must also
@@ -2286,7 +2273,7 @@ int in_module(int rc, const String &path) {
 // core.hooksPath travels with the tree and is fine.
 int reject_relative_managed_paths(const char *root) {
     const char *args[] = {"config", "--local", "--includes", "--null", "--get-regexp",
-        "^(remote\\..*\\.(url|pushurl)|submodule\\..*\\.url)$", nullptr};
+        "^remote\\..*\\.(url|pushurl)$", nullptr};
     Vec<char> listing; int status = -1;
     int rc = git(root, args, &listing, &status);
     if (rc && !(rc == WFS_E_GIT_FAILED && status == 1)) return rc;
@@ -2562,35 +2549,42 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
         bool shared_base = false;
         for (size_t i = 0; i < carried.size(); ++i)
             if (carried[i].key == remote_url) { base = &carried[i].value; shared_base = i < shared; }
-        // A shared URL is the same file for the source and the World, but a relative one is
-        // resolved from wherever the repository is.
-        if (base && shared_base && is_relative_local_url(base->c_str())) {
-            for (const auto &link : gitlinks) {
-                const String *name = module_name(published_names, link.path);
-                const char *url = name ? gitmodules_value(published, *name, "url") : nullptr;
-                if (!url || (strncmp(url, "./", 2) && strncmp(url, "../", 3))) continue;
-                String path(prefix); path.append(link.path.c_str());
-                return refuse(WFS_E_GIT_POLICY,
-                    "submodule %s: its .gitmodules url %s resolves against %s in global or system "
-                    "configuration, which is the relative path %s and resolves differently in the World; "
-                    "make it absolute", path.c_str(), url, remote_url.c_str(), base->c_str());
-            }
-        }
         // Rewrite rules from conditional includes, active here or not: loaded only when a URL
         // that only .gitmodules gives is checked against them.
         Vec<UrlRewriteRule> conditional_rules;
         bool rules_loaded = false;
+        // Each submodule's effective URL, classified once, as Git in the World will see it: the
+        // winning submodule.<name>.url of the shared and the carried configuration (last wins, the
+        // repository's own after the shared), else the .gitmodules URL by the default-remote rule.
         for (const auto &link : gitlinks) {
             const String *name = module_name(published_names, link.path);
-            const char *url = name ? gitmodules_value(published, *name, "url") : nullptr;
-            if (!url) continue;
-            String key("submodule."); key.append(name->c_str()); key.append(".url");
-            bool configured = false;
-            for (const auto &c : carried) if (c.key == key) configured = true;
-            if (configured) continue;   // a configured URL is checked with the carried configuration
+            if (!name) continue;
             String path(prefix); path.append(link.path.c_str());
+            String key("submodule."); key.append(name->c_str()); key.append(".url");
+            const GitSetting *configured = nullptr;
+            bool configured_shared = false;
+            for (size_t i = 0; i < carried.size(); ++i)
+                if (carried[i].key == key) { configured = &carried[i]; configured_shared = i < shared; }
+            const char *url = configured ? nullptr : gitmodules_value(published, *name, "url");
             String effective;
-            if (!strncmp(url, "./", 2) || !strncmp(url, "../", 3)) {
+            if (configured) {
+                // A carried value was made absolute by the import (capture_carried_config); a
+                // managed World's is copied byte for byte, and a shared one is used as it is.
+                if (is_relative_local_url(configured->value.c_str())) {
+                    if (configured_shared)
+                        return refuse(WFS_E_GIT_POLICY,
+                            "submodule %s: %s is the relative path %s in global or system configuration, "
+                            "which Git resolves from the worktree and so differently in the World; make it absolute",
+                            path.c_str(), key.c_str(), configured->value.c_str());
+                    return refuse(WFS_E_GIT_POLICY,
+                        "the World's %s is the relative path %s, which a copy of the World would resolve "
+                        "from its own location; make it absolute (git submodule init and the import write "
+                        "absolute URLs)", key.c_str(), configured->value.c_str());
+                }
+                effective = configured->value;
+            } else if (!url) {
+                continue;
+            } else if (!strncmp(url, "./", 2) || !strncmp(url, "../", 3)) {
                 if (!base)
                     return refuse(WFS_E_GIT_POLICY,
                         "submodule %s: its .gitmodules url %s is relative and the repository's default remote "
@@ -2598,6 +2592,13 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
                         "set submodule.%s.url or add the remote before importing", path.c_str(), url,
                         remote.empty() ? "an empty branch." : remote.c_str(), remote.empty() ? "<name>.remote" : "",
                         name->c_str());
+                // A shared URL is the same everywhere, but a relative one is resolved from
+                // wherever the repository is.
+                if (shared_base && is_relative_local_url(base->c_str()))
+                    return refuse(WFS_E_GIT_POLICY,
+                        "submodule %s: its .gitmodules url %s resolves against %s in global or system "
+                        "configuration, which is the relative path %s and resolves differently in the World; "
+                        "make it absolute", path.c_str(), url, remote_url.c_str(), base->c_str());
                 if (!resolve_submodule_url(*base, url, effective))
                     return refuse(WFS_E_GIT_POLICY,
                         "submodule %s: its .gitmodules url %s cannot be resolved against %s the way Git would "
@@ -2612,8 +2613,8 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
                     "submodule %s: its .gitmodules url %s is a path Git takes relative to the worktree, "
                     "which differs in the World; set submodule.%s.url before importing", path.c_str(), url, name->c_str());
             }
-            // The same guard as for carried remote and submodule URLs (capture_carried_config):
-            // a rule a conditional include holds could rewrite the URL differently at the World.
+            // The same guard as for carried remote URLs (capture_carried_config): a rule a
+            // conditional include holds could rewrite the URL differently at the World.
             if (!rules_loaded) {
                 if (int rc = scan_conditional_includes(repo_root, nullptr, &conditional_rules)) return rc;
                 rules_loaded = true;
@@ -2621,7 +2622,7 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
             const UrlRewriteRule *r = matching_rewrite(conditional_rules, effective.c_str());
             if (r)
                 return refuse(WFS_E_GIT_POLICY,
-                    "submodule %s: its .gitmodules url resolves to %s, which url.%s.%s from a conditional "
+                    "submodule %s: its url resolves to %s, which url.%s.%s from a conditional "
                     "include can change at the World's location; simplify the URL rewrite rules before importing",
                     path.c_str(), effective.c_str(), r->base.c_str(), r->push ? "pushInsteadOf" : "insteadOf");
         }

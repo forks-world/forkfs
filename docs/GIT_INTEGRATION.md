@@ -225,7 +225,11 @@ otherwise the only remote when exactly one is configured, and `origin` otherwise
 that remote's last `url` (a remote with only a `pushurl` has none). The branch remote, the
 remotes and their URLs are taken from the configuration Git in the World reads: the
 repository's own (as carried, with its includes) on top of the shared global and system
-configuration, last value winning; a shared remote URL is accepted only when absolute. It is decided for HEAD as it
+configuration, last value winning; a shared remote URL is accepted only when absolute. Every
+submodule's URL is classified the same way: the winning `submodule.<name>.url` -- the
+repository's own (made absolute by the import; a relative one set by hand in a World is
+refused) or a shared one (accepted only when absolute) -- or else the `.gitmodules` URL by the
+rule above, and whichever it is goes through the rewrite-rule check. It is decided for HEAD as it
 will be in the World -- the root's generated branch has no upstream, a submodule keeps its
 source branch unless `--committed-only` detaches it -- and the URL is refused unless that
 remote's URL travels with the World. The URL is then resolved the way Git 2.54 does (each

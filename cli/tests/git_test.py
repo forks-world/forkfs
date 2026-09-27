@@ -3658,12 +3658,12 @@ class GitWorldTest(unittest.TestCase):
             return result
         # The absolute URL only .gitmodules gives, and the same URL resolved from a relative one.
         refused = init(3)
-        self.assertIn(b'reason: submodule vendor/unused: its .gitmodules url resolves to ' + unused.encode()
+        self.assertIn(b'reason: submodule vendor/unused: its url resolves to ' + unused.encode()
                       + b', which url./nowhere/.insteadOf from a conditional include', refused.stderr)
         self.git(self.source, 'remote', 'add', 'origin', str(self.root / 'origins' / 'project.git'))
         gitmodules_url('../unused')
         refused = init(3)
-        self.assertIn(b'its .gitmodules url resolves to ' + unused.encode(), refused.stderr)
+        self.assertIn(b'its url resolves to ' + unused.encode(), refused.stderr)
         rules.write_text('')
         init(0)
         # A plain relative path is cloned from the worktree top, a different place in the World.
@@ -3751,6 +3751,22 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(one / 'libs/lib', 'config', 'submodule.child.url').stdout.strip(),
                          str(amb / 'x.git').encode())
         self.assertEqual(self.git(one / 'libs/lib/child', 'rev-parse', 'HEAD').stdout.strip().decode(), x_head)
+
+    def test_shared_submodule_url_is_classified_like_a_carried_one(self):
+        self.submodule_fixture()
+        # vendor/unused is uninitialized with no configured URL; a global one then wins.
+        global_config = self.root / 'shared-submodule-global'
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        global_config.write_text('[submodule "vendor/unused"]\n\turl = ../origins/unused\n')
+        refused = self.world('init', str(self.source), code=3)
+        self.assertIn(b'reason: submodule vendor/unused: submodule.vendor/unused.url is the relative path ../origins/unused in global or system configuration',
+                      refused.stderr)
+        global_config.write_text('[submodule "vendor/unused"]\n\turl = ' + str(self.root / 'origins' / 'unused') + '\n')
+        self.world('init', str(self.source))
+        # A repository-local value wins over the shared one, and is made absolute.
+        global_config.write_text('[submodule "vendor/unused"]\n\turl = ../elsewhere\n')
+        self.git(self.source, 'config', 'submodule.vendor/unused.url', '../origins/unused')
+        self.world('init', str(self.source))
 
     def test_publish_refuses_a_gitlink_commit_the_target_lacks(self):
         self.submodule_fixture()
