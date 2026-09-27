@@ -3759,14 +3759,27 @@ class GitWorldTest(unittest.TestCase):
         self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
         global_config.write_text('[submodule "vendor/unused"]\n\turl = ../origins/unused\n')
         refused = self.world('init', str(self.source), code=3)
-        self.assertIn(b'reason: submodule vendor/unused: submodule.vendor/unused.url is the relative path ../origins/unused in global or system configuration',
+        self.assertIn(b'reason: submodule.vendor/unused.url is the relative path ../origins/unused in global or system configuration',
                       refused.stderr)
         global_config.write_text('[submodule "vendor/unused"]\n\turl = ' + str(self.root / 'origins' / 'unused') + '\n')
         self.world('init', str(self.source))
-        # A repository-local value wins over the shared one, and is made absolute.
-        global_config.write_text('[submodule "vendor/unused"]\n\turl = ../elsewhere\n')
+        # A repository-local value wins over the shared one, and is made absolute. (A relative
+        # shared value would still be refused: every repository, libs/lib too, reads it.)
+        global_config.write_text('[submodule "vendor/unused"]\n\turl = /elsewhere\n')
         self.git(self.source, 'config', 'submodule.vendor/unused.url', '../origins/unused')
         self.world('init', str(self.source))
+
+    def test_dormant_submodule_urls_are_classified_too(self):
+        # A submodule.<name>.url for no current gitlink (another branch's submodule).
+        self.git(self.source, 'config', 'submodule.other.url', '../origins/other')
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.assertEqual(self.git(one, 'config', 'submodule.other.url').stdout.strip(),
+                         str(self.root / 'origins' / 'other').encode())
+        self.git(one, 'config', 'submodule.other.url', '../elsewhere')
+        refused = self.world('fork', '--from', wid, '--to', str(self.root / 'refused'), code=3)
+        self.assertIn(b"reason: the World's submodule.other.url is the relative path ../elsewhere", refused.stderr)
+        self.world('checkpoint', wid, code=3)
 
     def test_publish_refuses_a_gitlink_commit_the_target_lacks(self):
         self.submodule_fixture()

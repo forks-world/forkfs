@@ -229,7 +229,16 @@ configuration, last value winning; a shared remote URL is accepted only when abs
 submodule's URL is classified the same way: the winning `submodule.<name>.url` -- the
 repository's own (made absolute by the import; a relative one set by hand in a World is
 refused) or a shared one (accepted only when absolute) -- or else the `.gitmodules` URL by the
-rule above, and whichever it is goes through the rewrite-rule check. It is decided for HEAD as it
+rule above, and whichever it is goes through the rewrite-rule check. Every
+`submodule.<name>.url` in the configuration is classified this way, also one for a submodule
+the checked-out commit does not have (a dormant one another branch uses): in an import it is
+made absolute like the rest, in a World a relative one is refused.
+
+These URL checks cover the configuration and the `.gitmodules` that is checked out (published)
+at import. `.gitmodules` on other branches or in history is not inspected: after switching a
+World to another branch, a relative `.gitmodules` URL of a submodule that was never initialized
+resolves the way Git resolves it at the World's location, with the World's remotes -- the same
+as in any other clone at another location. It is decided for HEAD as it
 will be in the World -- the root's generated branch has no upstream, a submodule keeps its
 source branch unless `--committed-only` detaches it -- and the URL is refused unless that
 remote's URL travels with the World. The URL is then resolved the way Git 2.54 does (each

@@ -2419,28 +2419,16 @@ int committed_hooks_check(const char *root, const GitRepoState &s, const char *t
         return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s is inside the submodule, whose HEAD is not the commit --committed-only resets it to; drop --committed-only", hp.c_str());
     return require_committed_hooks_path(root, present, hp);
 }
-// Submodules are at most this many levels deep below the root.
-constexpr int kMaxModuleDepth = 8;
-// Every initialized submodule of the repository at `repo_root` (the root, or a submodule found
-// before it), recursively, appended to `top.modules` parents first. `prefix` is repo_root's path
-// in the tree and `gitdir_prefix` its repository below the root's administration ("" for the
-// root). An uninitialized submodule -- a gitlink whose directory has no `.git` -- stays as the
-// source has it: its gitlink and directory, and the superproject's submodule.<name>.* settings.
-// `tree`, for --committed-only, is the commit this repository's copy is reset to: each
-// submodule is then reset to the commit that tree records for it.
-int discover_modules(GitSource &top, const char *repo_root, const String &prefix, const String &gitdir_prefix,
-                     const Vec<Gitlink> &gitlinks, const char *tree, int depth, size_t self) {
-    if (gitlinks.empty()) return 0;
-    GitRepoState &state = self == (size_t)-1 ? top : top.modules[self].repo;
-    // The configuration this repository will have in the World, copied: `state` may move once
-    // submodules are appended below. An external source's is what the import carries; a managed
-    // World's travels whole with its cloned administration, so it is its own local configuration.
-    // The World's Git also reads the shared global and system configuration (command
-    // configuration belongs to one invocation, and remote/branch settings given that way are
-    // refused by reject_ambient_policy). Git reads system, then global, then the repository's
-    // own, and the last value wins, so the shared entries come first; `shared` counts them.
-    Vec<GitSetting> carried;
-    size_t shared = 0;
+// The configuration a repository will have in the World, as Git there reads it. An external
+// source's own is what the import carries; a managed World's travels whole with its cloned
+// administration, so it is its local configuration with its includes. The World's Git also
+// reads the shared global and system configuration (command configuration belongs to one
+// invocation, and remote/branch settings given that way are refused by reject_ambient_policy).
+// Git reads system, then global, then the repository's own, and the last value wins, so the
+// shared entries come first; `shared` counts them.
+int world_config(const char *repo_root, const GitRepoState &state, Vec<GitSetting> &carried, size_t &shared) {
+    carried.clear();
+    shared = 0;
     {
         const char *list[] = {"config", "--includes", "--null", "--show-scope", "--list", nullptr};
         Vec<char> all; int status = -1;
@@ -2461,19 +2449,76 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
     }
     if (!state.managed) {
         for (const auto &c : state.carried) carried.emplace_back(c);
-    } else {
-        // With --includes: an included file's remotes, branch remotes and submodule URLs are
-        // part of the configuration the copy keeps.
-        const char *list[] = {"config", "--local", "--includes", "--null", "--list", nullptr};
-        Vec<char> local;
-        if (int rc = git(repo_root, list, &local)) return rc;
-        for (size_t i = 0; i < local.size() && local[i];) {
-            const char *entry = local.data() + i;
-            i += strlen(entry) + 1;
-            const char *nl = strchr(entry, '\n');
-            carried.emplace_back(GitSetting{String(entry, nl ? (size_t)(nl - entry) : strlen(entry)), String(nl ? nl + 1 : "")});
-        }
+        return 0;
     }
+    const char *list[] = {"config", "--local", "--includes", "--null", "--list", nullptr};
+    Vec<char> local;
+    if (int rc = git(repo_root, list, &local)) return rc;
+    for (size_t i = 0; i < local.size() && local[i];) {
+        const char *entry = local.data() + i;
+        i += strlen(entry) + 1;
+        const char *nl = strchr(entry, '\n');
+        carried.emplace_back(GitSetting{String(entry, nl ? (size_t)(nl - entry) : strlen(entry)), String(nl ? nl + 1 : "")});
+    }
+    return 0;
+}
+// Every submodule.<name>.url the World's configuration holds -- for a current gitlink or a
+// dormant one another branch uses -- classified as Git in the World sees it: the winning value
+// (the repository's own after the shared ones). A carried value was made absolute by the import
+// (capture_carried_config); a managed World's is copied byte for byte and a shared one is used
+// as it is, so a relative one of either is refused. Every URL then goes through the same
+// conditional-include rewrite guard as carried remote URLs.
+int check_configured_submodule_urls(const char *repo_root, const Vec<GitSetting> &carried, size_t shared) {
+    Vec<UrlRewriteRule> conditional_rules;
+    bool rules_loaded = false;
+    for (size_t i = 0; i < carried.size(); ++i) {
+        const String &key = carried[i].key;
+        size_t n = key.size();
+        if (n < 15 || strncmp(key.c_str(), "submodule.", 10) || strcmp(key.c_str() + n - 4, ".url")) continue;
+        bool later = false;
+        for (size_t j = i + 1; j < carried.size(); ++j) if (carried[j].key == key) later = true;
+        if (later) continue;   // not the winning value
+        const String &url = carried[i].value;
+        if (is_relative_local_url(url.c_str())) {
+            if (i < shared)
+                return refuse(WFS_E_GIT_POLICY,
+                    "%s is the relative path %s in global or system configuration, which Git resolves "
+                    "from the worktree and so differently in the World; make it absolute", key.c_str(), url.c_str());
+            return refuse(WFS_E_GIT_POLICY,
+                "the World's %s is the relative path %s, which a copy of the World would resolve from its "
+                "own location; make it absolute (git submodule init and the import write absolute URLs)",
+                key.c_str(), url.c_str());
+        }
+        if (!rules_loaded) {
+            if (int rc = scan_conditional_includes(repo_root, nullptr, &conditional_rules)) return rc;
+            rules_loaded = true;
+        }
+        const UrlRewriteRule *r = matching_rewrite(conditional_rules, url.c_str());
+        if (r)
+            return refuse(WFS_E_GIT_POLICY,
+                "%s %s matches url.%s.%s, which a conditional include can change at the World's location; "
+                "simplify the URL rewrite rules before importing",
+                key.c_str(), url.c_str(), r->base.c_str(), r->push ? "pushInsteadOf" : "insteadOf");
+    }
+    return 0;
+}
+// Submodules are at most this many levels deep below the root.
+constexpr int kMaxModuleDepth = 8;
+// Every initialized submodule of the repository at `repo_root` (the root, or a submodule found
+// before it), recursively, appended to `top.modules` parents first. `prefix` is repo_root's path
+// in the tree and `gitdir_prefix` its repository below the root's administration ("" for the
+// root). An uninitialized submodule -- a gitlink whose directory has no `.git` -- stays as the
+// source has it: its gitlink and directory, and the superproject's submodule.<name>.* settings.
+// `tree`, for --committed-only, is the commit this repository's copy is reset to: each
+// submodule is then reset to the commit that tree records for it.
+int discover_modules(GitSource &top, const char *repo_root, const String &prefix, const String &gitdir_prefix,
+                     const Vec<Gitlink> &gitlinks, const char *tree, int depth, size_t self) {
+    if (gitlinks.empty()) return 0;
+    GitRepoState &state = self == (size_t)-1 ? top : top.modules[self].repo;
+    // Copied: `state` may move once submodules are appended below.
+    Vec<GitSetting> carried;
+    size_t shared = 0;
+    if (int rc = world_config(repo_root, state, carried, shared)) return rc;
     Vec<char> listing, tree_listing;
     if (int rc = gitmodules_listing(repo_root, nullptr, listing)) return rc;
     Vec<GitSetting> names, tree_names;
@@ -2562,26 +2607,12 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
             String path(prefix); path.append(link.path.c_str());
             String key("submodule."); key.append(name->c_str()); key.append(".url");
             const GitSetting *configured = nullptr;
-            bool configured_shared = false;
             for (size_t i = 0; i < carried.size(); ++i)
-                if (carried[i].key == key) { configured = &carried[i]; configured_shared = i < shared; }
+                if (carried[i].key == key) configured = &carried[i];
             const char *url = configured ? nullptr : gitmodules_value(published, *name, "url");
             String effective;
             if (configured) {
-                // A carried value was made absolute by the import (capture_carried_config); a
-                // managed World's is copied byte for byte, and a shared one is used as it is.
-                if (is_relative_local_url(configured->value.c_str())) {
-                    if (configured_shared)
-                        return refuse(WFS_E_GIT_POLICY,
-                            "submodule %s: %s is the relative path %s in global or system configuration, "
-                            "which Git resolves from the worktree and so differently in the World; make it absolute",
-                            path.c_str(), key.c_str(), configured->value.c_str());
-                    return refuse(WFS_E_GIT_POLICY,
-                        "the World's %s is the relative path %s, which a copy of the World would resolve "
-                        "from its own location; make it absolute (git submodule init and the import write "
-                        "absolute URLs)", key.c_str(), configured->value.c_str());
-                }
-                effective = configured->value;
+                continue;   // classified with the configuration (check_configured_submodule_urls)
             } else if (!url) {
                 continue;
             } else if (!strncmp(url, "./", 2) || !strncmp(url, "../", 3)) {
@@ -2713,6 +2744,11 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
         m.repo.managed = top.managed;
         Vec<Gitlink> sub_links;
         if (int rc = capture_repo(full.c_str(), m.repo, top.with_hooks, true, sub_links)) return in_module(rc, path);
+        {
+            Vec<GitSetting> config; size_t shared = 0;
+            if (int rc = world_config(full.c_str(), m.repo, config, shared)) return rc;
+            if (int rc = check_configured_submodule_urls(full.c_str(), config, shared)) return in_module(rc, path);
+        }
         if (int rc = nested_check(full.c_str(), &sub_links, false)) return in_module(rc, path);
         if (tree) {
             const Gitlink *recorded = find_link(tree_links, link.path.c_str());
@@ -2761,6 +2797,11 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
     }
     Vec<Gitlink> gitlinks;
     if (int rc = capture_repo(root, out, with_hooks, false, gitlinks)) return rc;
+    {
+        Vec<GitSetting> config; size_t shared = 0;
+        if (int rc = world_config(root, out, config, shared)) return rc;
+        if (int rc = check_configured_submodule_urls(root, config, shared)) return rc;
+    }
     // A managed World carries its hooks and core.hooksPath with its .world-git, so the same
     // committed-path check applies to it whether or not --with-hooks was given.
     if (committed_only) {
