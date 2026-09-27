@@ -32,7 +32,8 @@ if(Python3_Interpreter_FOUND AND GIT_FOUND)
     file(MAKE_DIRECTORY "${CLI_GIT_TEST_SCRATCH}")
     add_test(NAME cli_git_test
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/git_test.py $<TARGET_FILE:world>)
+    # Submodule coverage imports several repositories per test; the suite runs ~10 minutes here.
     set_tests_properties(cli_git_test PROPERTIES
-        TIMEOUT 600
+        TIMEOUT 1200
         ENVIRONMENT "TMPDIR=${CLI_GIT_TEST_SCRATCH}/")
 endif()

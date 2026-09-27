@@ -2001,6 +2001,7 @@ class GitWorldTest(unittest.TestCase):
         targets = {
             'remote': '[remote "origin"]\n url = https://cond.invalid/x.git\n',
             'branch': '[branch "world/W1"]\n remote = origin\n',
+            'submodule': '[submodule "lib"]\n update = !touch /nonexistent\n',
         }
         global_config = self.root / 'per-remote-or-branch-global'
         for name, contents in targets.items():
@@ -3041,6 +3042,425 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(sentinel.read_bytes(), b'untouched')
         del self.env['GIT_DIR']; del self.env['GIT_INDEX_FILE']
         self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+
+    # ---- submodules ------------------------------------------------------------------------
+
+    def sub(self, repo, *args, code=0):
+        """A submodule command, as a user runs it: local file transport allowed explicitly."""
+        return self.git(repo, '-c', 'protocol.file.allow=always', 'submodule', *args, code=code)
+
+    def origin(self, name, content=None):
+        """A local repository with one commit, to be added as a submodule."""
+        origin = self.root / 'origins' / name
+        origin.mkdir(parents=True)
+        self.git(origin, 'init', '-q', '-b', 'main')
+        self.git(origin, 'config', 'user.name', 'World Test')
+        self.git(origin, 'config', 'user.email', 'world@example.com')
+        (origin / 'lib.txt').write_text((content or name) + '\n')
+        self.git(origin, 'add', '.')
+        self.git(origin, 'commit', '-qm', name)
+        return origin
+
+    def identify(self, repo):
+        self.git(repo, 'config', 'user.name', 'World Test')
+        self.git(repo, 'config', 'user.email', 'world@example.com')
+
+    def submodule_fixture(self):
+        """libs/lib (absorbed, named `lib-module`), which itself has deps/inner (nested), and
+        vendor/unused (uninitialized) in the source."""
+        inner = self.origin('inner')
+        lib = self.origin('lib')
+        self.sub(lib, 'add', '-q', str(inner), 'deps/inner')
+        self.git(lib, 'commit', '-qm', 'nested')
+        unused = self.origin('unused')
+        self.sub(self.source, 'add', '-q', '--name', 'lib-module', str(lib), 'libs/lib')
+        self.sub(self.source, 'add', '-q', str(unused), 'vendor/unused')
+        self.git(self.source, 'commit', '-qm', 'submodules')
+        self.sub(self.source, 'update', '-q', '--init', '--recursive')
+        self.sub(self.source, 'deinit', '-q', 'vendor/unused')
+        for repo in ('libs/lib', 'libs/lib/deps/inner'):
+            self.identify(self.source / repo)
+        self.base = self.git(self.source, 'rev-parse', 'HEAD').stdout.strip()
+        return self.submodule_status(self.source)
+
+    def submodule_status(self, repo):
+        """`submodule status --recursive` without its `git describe` column, which may name any
+        of several refs at the same commit."""
+        lines = self.sub(repo, 'status', '--recursive').stdout.splitlines()
+        return [line.split(b' (')[0] for line in lines]
+
+    def assert_owned_submodules(self, world):
+        """The World's submodules live in its own administration, linked relatively."""
+        admin = world / '.world-git/repo.git/worktrees/active/modules'
+        self.assertEqual((world / 'libs/lib/.git').read_text(),
+                         'gitdir: ../../.world-git/repo.git/worktrees/active/modules/lib-module\n')
+        self.assertEqual((world / 'libs/lib/deps/inner/.git').read_text(),
+                         'gitdir: ../../../../.world-git/repo.git/worktrees/active/modules/lib-module/modules/deps/inner\n')
+        self.assertEqual(self.git(world / 'libs/lib', 'config', 'core.worktree').stdout.strip(), b'../../../../../../libs/lib')
+        self.assertEqual(Path(self.git(world / 'libs/lib/deps/inner', 'rev-parse', '--absolute-git-dir').stdout.decode().strip()),
+                         (admin / 'lib-module/modules/deps/inner').resolve())
+        self.assertFalse((world / 'vendor/unused/.git').exists())
+        self.assertEqual(list((world / 'vendor/unused').iterdir()), [])
+
+    def test_submodules_survive_deletion_of_the_source_and_their_origins(self):
+        status = self.submodule_fixture()
+        self.assertEqual(status[-1][:1], b'-')   # vendor/unused is uninitialized
+        branches = [self.git(self.source / repo, 'branch', '--show-current').stdout
+                    for repo in ('libs/lib', 'libs/lib/deps/inner')]
+        before = self.tree_bytes(self.source)
+        self.world('init', str(self.source))
+        self.assertEqual(self.tree_bytes(self.source), before)
+        shutil.rmtree(self.source)
+        shutil.rmtree(self.root / 'origins')
+        one, wid = self.fork()
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.submodule_status(one), status)
+        self.assert_owned_submodules(one)
+        for repo, branch in zip(('libs/lib', 'libs/lib/deps/inner'), branches):
+            self.git(one / repo, 'fsck', '--full')
+            self.assertEqual(self.git(one / repo, 'status', '--porcelain').stdout, b'')
+            self.assertEqual(self.git(one / repo, 'branch', '--show-current').stdout, branch)
+        # The uninitialized submodule keeps its settings; the initialized ones keep theirs.
+        self.assertEqual(self.git(one, 'config', 'submodule.lib-module.active').stdout.strip(), b'true')
+        self.assertEqual(self.git(one, 'config', 'submodule.lib-module.url').stdout.strip(),
+                         str(self.root / 'origins' / 'lib').encode())
+        self.assertEqual(self.git(one / 'libs/lib', 'config', 'submodule.deps/inner.url').stdout.strip(),
+                         str(self.root / 'origins' / 'inner').encode())
+        self.assertEqual(self.git(one / 'libs/lib', 'remote', 'get-url', 'origin').stdout.strip(),
+                         str(self.root / 'origins' / 'lib').encode())
+        # Commits in a submodule and in the root, with no network and no source.
+        (one / 'libs/lib/lib.txt').write_text('changed in the World\n')
+        self.git(one / 'libs/lib', 'commit', '-qam', 'world lib change')
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b' M libs/lib\n')
+        self.git(one, 'commit', '-qam', 'bump lib')
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.git(one, 'rev-parse', 'HEAD:libs/lib').stdout,
+                         self.git(one / 'libs/lib', 'rev-parse', 'HEAD').stdout)
+        self.git(one, 'submodule', 'foreach', '--recursive', '-q', 'git rev-parse HEAD')
+        # A fresh fork of the snapshot is untouched by that World.
+        two, _ = self.fork('two')
+        self.assertEqual(self.submodule_status(two), status)
+        self.world('verify', 'S1')
+
+    def test_old_style_submodule_is_absorbed_into_the_world(self):
+        lib = self.origin('lib')
+        self.git(self.source, 'clone', '-q', str(lib), 'libs/lib')
+        self.sub(self.source, 'add', '-q', '--name', 'lib-module', str(lib), 'libs/lib')
+        self.git(self.source, 'commit', '-qm', 'old-style submodule')
+        self.assertTrue((self.source / 'libs/lib/.git').is_dir())
+        head = self.git(self.source / 'libs/lib', 'rev-parse', 'HEAD').stdout.strip()
+        self.world('init', str(self.source))
+        self.assertTrue((self.source / 'libs/lib/.git').is_dir())
+        shutil.rmtree(self.source)
+        shutil.rmtree(self.root / 'origins')
+        one, _ = self.fork()
+        self.assertEqual((one / 'libs/lib/.git').read_text(),
+                         'gitdir: ../../.world-git/repo.git/worktrees/active/modules/lib-module\n')
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.git(one / 'libs/lib', 'rev-parse', 'HEAD').stdout.strip(), head)
+        self.git(one / 'libs/lib', 'fsck', '--full')
+        self.world('verify', 'S1')
+
+    def test_world_with_submodules_moves_checkpoints_forks_and_pools(self):
+        status = self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        (one / 'libs/lib/deps/inner/lib.txt').write_text('inner change\n')
+        self.git(one / 'libs/lib/deps/inner', 'commit', '-qam', 'inner change')
+        self.git(one / 'libs/lib', 'commit', '-qam', 'bump inner')
+        self.git(one, 'commit', '-qam', 'bump lib')
+        changed = self.submodule_status(one)
+        moved = self.root / 'moved'
+        one.rename(moved)
+        self.assertEqual(self.git(moved, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.submodule_status(moved), changed)
+        self.world('verify', str(moved))
+        self.world('checkpoint', wid)
+        two, wid2 = self.fork('two', 'S2')
+        self.assertEqual(self.submodule_status(two), changed)
+        self.assert_owned_submodules(two)
+        three, _ = self.fork('three', wid)
+        self.assertEqual(self.submodule_status(three), changed)
+        self.world('discard', wid)
+        self.world('restore', wid)
+        self.assertEqual(self.submodule_status(moved), changed)
+        # A registered linked worktree of a submodule blocks discard, fork and checkpoint.
+        linked = self.root / 'linked'
+        self.git(moved / 'libs/lib', 'worktree', 'add', '-q', '--detach', str(linked))
+        self.world('discard', wid, '--now', '--force', code=3)
+        refused = self.world('checkpoint', wid, code=3)
+        self.assertIn(b'linked worktree', refused.stderr)
+        self.git(moved / 'libs/lib', 'worktree', 'remove', str(linked))
+        self.world('discard', wid, '--now')
+        self.assertFalse(moved.exists())
+        self.assertEqual(self.submodule_status(two), changed)
+        # Pooled forks get the same per-World setup.
+        self.world('pool', 'fill', 'S1', '--count', '1')
+        pooled, _ = self.pool_fork('pooled', True)
+        self.assertEqual(self.git(pooled, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.submodule_status(pooled), status)
+        self.assert_owned_submodules(pooled)
+        self.world('verify', 'S1')
+        self.world('verify', 'S2')
+
+    def test_changed_submodule_links_are_refused_by_fork(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        dot = one / 'libs/lib/.git'
+        text = dot.read_text()
+        dot.write_text('gitdir: ' + str((one / '.world-git/repo.git/worktrees/active/modules/lib-module').resolve()) + '\n')
+        refused = self.world('checkpoint', wid, code=3)
+        self.assertIn(b'reason: the .git link of submodule libs/lib was changed', refused.stderr)
+        dot.write_text(text)
+        self.world('checkpoint', wid)
+
+    def test_dirty_submodule_needs_an_explicit_choice(self):
+        status = self.submodule_fixture()
+        lib = self.source / 'libs/lib'
+        (lib / 'lib.txt').write_text('staged in the submodule\n')
+        self.git(lib, 'add', 'lib.txt')
+        (lib / 'lib.txt').write_text('unstaged in the submodule\n')
+        (lib / 'untracked').write_text('untracked\n')
+        sub_status = self.git(lib, 'status', '--porcelain').stdout
+        self.world('init', str(self.source), code=3)
+        self.world('init', str(self.source), '--include-changes')
+        one, _ = self.fork()
+        self.assertEqual(self.git(one / 'libs/lib', 'status', '--porcelain').stdout, sub_status)
+        self.assertEqual(self.git(one / 'libs/lib', 'show', ':lib.txt').stdout, b'staged in the submodule\n')
+        self.world('init', str(self.source), '--committed-only')
+        two, _ = self.fork('two', 'S2')
+        self.assertEqual(self.git(two, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.git(two / 'libs/lib', 'status', '--porcelain', '--untracked-files=all').stdout, b'')
+        self.assertEqual((two / 'libs/lib/lib.txt').read_text(), 'lib\n')
+        self.assertEqual(self.submodule_status(two), status)
+        # The source keeps its uncommitted submodule work.
+        self.assertEqual(self.git(lib, 'status', '--porcelain').stdout, sub_status)
+
+    def test_submodule_ahead_of_its_gitlink(self):
+        status = self.submodule_fixture()
+        lib = self.source / 'libs/lib'
+        recorded = self.git(lib, 'rev-parse', 'HEAD').stdout.strip()
+        (lib / 'lib.txt').write_text('ahead\n')
+        self.git(lib, 'commit', '-qam', 'ahead of the gitlink')
+        ahead = self.git(lib, 'rev-parse', 'HEAD').stdout.strip()
+        self.world('init', str(self.source), code=3)
+        self.world('init', str(self.source), '--include-changes')
+        one, _ = self.fork()
+        self.assertEqual(self.git(one / 'libs/lib', 'rev-parse', 'HEAD').stdout.strip(), ahead)
+        self.assertEqual(self.git(one / 'libs/lib', 'branch', '--show-current').stdout.strip(), b'main')
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b' M libs/lib\n')
+        self.world('init', str(self.source), '--committed-only')
+        two, wid = self.fork('two', 'S2')
+        self.assertEqual(self.git(two / 'libs/lib', 'rev-parse', 'HEAD').stdout.strip(), recorded)
+        self.assertEqual(self.git(two / 'libs/lib', 'branch', '--show-current').stdout.strip(), b'')
+        self.assertEqual(self.git(two, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.submodule_status(two), status)
+        # The commit it was ahead with is still in its repository.
+        self.git(two / 'libs/lib', 'cat-file', '-e', ahead.decode())
+        # A World checkpoint with --committed-only resets its submodules the same way.
+        self.world('checkpoint', 'W1', code=3)
+        self.world('checkpoint', 'W1', '--committed-only')
+        three, _ = self.fork('three', 'S3')
+        self.assertEqual(self.git(three / 'libs/lib', 'rev-parse', 'HEAD').stdout.strip(), recorded)
+        self.assertEqual(self.git(three, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.git(self.source / 'libs/lib', 'rev-parse', 'HEAD').stdout.strip(), ahead)
+
+    def test_committed_only_refuses_a_recorded_commit_the_submodule_lacks(self):
+        self.submodule_fixture()
+        lib = self.source / 'libs/lib'
+        (lib / 'lib.txt').write_text('recorded, then dropped\n')
+        self.git(lib, 'commit', '-qam', 'to be dropped')
+        self.git(self.source, 'commit', '-qam', 'record it')
+        self.git(lib, 'reset', '-q', '--hard', 'HEAD~1')
+        self.git(lib, 'update-ref', '-d', 'ORIG_HEAD')
+        self.git(lib, 'reflog', 'expire', '--expire=now', '--all')
+        self.git(lib, 'gc', '-q', '--prune=now')
+        refused = self.world('init', str(self.source), '--committed-only', code=3)
+        self.assertIn(b'reason: submodule libs/lib: commit ', refused.stderr)
+        self.assertIn(b'is not in its repository', refused.stderr)
+
+    def test_submodule_ignore_setting_does_not_hide_a_dirty_submodule(self):
+        self.submodule_fixture()
+        self.git(self.source, 'config', 'submodule.lib-module.ignore', 'all')
+        self.git(self.source, 'config', 'diff.ignoreSubmodules', 'all')
+        (self.source / 'libs/lib/lib.txt').write_text('hidden by ignore=all\n')
+        self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+        self.world('init', str(self.source), code=3)
+        (self.source / 'libs/lib/lib.txt').write_text('lib\n')
+        (self.source / 'libs/lib/lib.txt').write_text('lib\n')
+        self.git(self.source / 'libs/lib', 'commit', '-q', '--allow-empty', '-m', 'moved on')
+        self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+        self.world('init', str(self.source), code=3)
+        self.git(self.source / 'libs/lib', 'reset', '-q', '--hard', 'HEAD~1')
+        self.world('init', str(self.source))
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'config', 'submodule.lib-module.ignore').stdout.strip(), b'all')
+
+    def test_submodule_update_command_is_refused_and_never_run(self):
+        self.submodule_fixture()
+        marker = self.root / 'update-ran'
+        self.git(self.source, 'config', 'submodule.vendor/unused.url', str(self.root / 'origins' / 'unused'))
+        self.git(self.source, 'config', 'submodule.vendor/unused.update', '!touch ' + str(marker))
+        refused = self.world('init', str(self.source), code=3)
+        self.assertIn(b'reason: submodule.vendor/unused.update = !touch', refused.stderr)
+        self.git(self.source / 'libs/lib', 'config', 'submodule.deps/inner.update', '!touch ' + str(marker))
+        self.git(self.source, 'config', 'submodule.vendor/unused.update', 'rebase')
+        refused = self.world('init', str(self.source), code=3)
+        self.assertIn(b'reason: submodule libs/lib: submodule.deps/inner.update = !touch', refused.stderr)
+        self.git(self.source / 'libs/lib', 'config', '--unset', 'submodule.deps/inner.update')
+        self.world('init', str(self.source))
+        self.assertFalse(marker.exists())
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'config', 'submodule.vendor/unused.update').stdout.strip(), b'rebase')
+        self.assertEqual(self.git(one, 'config', 'submodule.vendor/unused.url').stdout.strip(),
+                         str(self.root / 'origins' / 'unused').encode())
+        # The uninitialized submodule can be initialized in the World from its carried URL.
+        self.git(one, 'config', 'submodule.vendor/unused.update', 'checkout')
+        self.sub(one, 'update', '-q', '--init', 'vendor/unused')
+        self.assertEqual((one / 'vendor/unused/lib.txt').read_text(), 'unused\n')
+        self.assertTrue((one / '.world-git/repo.git/worktrees/active/modules/vendor/unused').is_dir())
+        self.assertFalse(marker.exists())
+
+    def test_relative_submodule_url_is_made_absolute_or_refused(self):
+        self.submodule_fixture()
+        self.git(self.source, 'config', 'submodule.vendor/unused.url', '../origins/unused')
+        self.world('init', str(self.source))
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'config', 'submodule.vendor/unused.url').stdout.strip(),
+                         str(self.root / 'origins' / 'unused').encode())
+        # With a remote, Git resolves it against the remote's URL instead.
+        self.git(self.source, 'remote', 'add', 'origin', 'https://example.com/project.git')
+        refused = self.world('init', str(self.source), code=3)
+        self.assertIn(b'reason: a submodule URL is relative (./ or ../)', refused.stderr)
+
+    def test_submodule_filters_and_hooks_never_run(self):
+        self.submodule_fixture()
+        lib = self.source / 'libs/lib'
+        filter_marker = self.root / 'filter-ran'
+        hook_marker = self.root / 'hook-ran'
+        self.write_hook(Path(self.git(lib, 'rev-parse', '--path-format=absolute', '--git-path', 'hooks').stdout.decode().strip()) / 'post-checkout', hook_marker)
+        (lib / '.gitattributes').write_text('*.txt filter=example\n')
+        self.git(lib, 'add', '.gitattributes')
+        self.git(lib, 'commit', '-qm', 'attributes')
+        self.git(self.source, 'commit', '-qam', 'bump lib')
+        self.git(lib, 'config', 'filter.example.clean', 'touch ' + str(filter_marker) + '; cat')
+        self.git(lib, 'config', 'filter.example.smudge', 'touch ' + str(filter_marker) + '; cat')
+        for flag in ((), ('--include-changes',), ('--committed-only',)):
+            refused = self.world('init', str(self.source), *flag, code=3)
+            self.assertIn(b"reason: submodule libs/lib: tracked file lib.txt uses the 'example' filter", refused.stderr)
+        self.assertFalse(filter_marker.exists())
+        self.git(lib, 'config', '--remove-section', 'filter.example')
+        self.world('init', str(self.source), '--with-hooks')
+        one, _ = self.fork()
+        self.world('checkpoint', 'W1', '--committed-only')
+        self.assertFalse(filter_marker.exists())
+        self.assertEqual(self.hook_runs(hook_marker), [])
+        # --with-hooks carries the submodule's hooks into its owned repository, never run.
+        hooks = Path(self.git(one / 'libs/lib', 'rev-parse', '--path-format=absolute', '--git-path', 'hooks').stdout.decode().strip())
+        self.assertTrue((hooks / 'post-checkout').exists())
+
+    def test_nested_repositories_that_are_not_submodules_are_refused(self):
+        self.submodule_fixture()
+        # A plain repository below the uninitialized submodule's directory.
+        (self.source / 'vendor/unused/deeper').mkdir()
+        self.git(self.source / 'vendor/unused/deeper', 'init', '-q')
+        refused = self.world('init', str(self.source), code=3)
+        self.assertIn(b'reason: nested Git repository or submodule at ' + str(self.source / 'vendor/unused/deeper').encode(), refused.stderr)
+        shutil.rmtree(self.source / 'vendor/unused/deeper')
+        # A plain repository inside an initialized submodule.
+        (self.source / 'libs/lib/extra').mkdir()
+        self.git(self.source / 'libs/lib/extra', 'init', '-q')
+        refused = self.world('init', str(self.source), code=3)
+        self.assertIn(b'reason: submodule libs/lib: nested Git repository or submodule at', refused.stderr)
+        shutil.rmtree(self.source / 'libs/lib/extra')
+        # A submodule whose .git points at some other repository.
+        stranger = self.origin('stranger')
+        dot = self.source / 'libs/lib/.git'
+        text = dot.read_text()
+        dot.write_text('gitdir: ' + str(stranger / '.git') + '\n')
+        refused = self.world('init', str(self.source), '--include-changes', code=3)
+        self.assertIn(b"reason: the .git of submodule libs/lib points outside its superproject's modules/lib-module", refused.stderr)
+        dot.write_text(text)
+        # A symlink in place of a submodule directory.
+        self.sub(self.source, 'deinit', '-q', '--force', 'libs/lib')
+        (self.source / 'libs/lib').rmdir()
+        (self.source / 'libs/lib').symlink_to(stranger)
+        refused = self.world('init', str(self.source), '--include-changes', code=3)
+        self.assertIn(b'reason: submodule path libs/lib is not a directory', refused.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def after_first_status(self, repo, name, action):
+        """A `git` on PATH that runs the shell `action` once, right after the first successful
+        `status` whose -C is `repo` (an admission check), before the tree is copied."""
+        import shlex
+        real_git = shutil.which('git')
+        wrapper = self.root / ('race-bin-' + name)
+        wrapper.mkdir()
+        done = self.root / ('race-done-' + name)
+        script = wrapper / 'git'
+        script.write_text('#!/bin/sh\ncwd=\nprev=\nstatus=0\nfor arg in "$@"; do\n'
+                          + '  [ "$prev" = -C ] && cwd=$arg\n  [ "$arg" = status ] && status=1\n  prev=$arg\ndone\n'
+                          + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
+                          + 'if [ "$result" = 0 ] && [ "$status" = 1 ] && [ "$cwd" = ' + shlex.quote(str(repo))
+                          + ' ] && [ ! -e ' + shlex.quote(str(done)) + ' ]; then\n'
+                          + '  : > ' + shlex.quote(str(done)) + ' || exit $?\n  ' + action + ' || exit $?\n'
+                          + 'fi\nexit "$result"\n')
+        script.chmod(0o700)
+        return wrapper, done
+
+    def test_submodule_changes_after_the_clean_check_are_not_published(self):
+        import shlex
+        self.submodule_fixture()
+        lib = self.source / 'libs/lib'
+        path = self.env['PATH']
+        # A tracked file of a submodule edited after its own clean check.
+        wrapper, done = self.after_first_status(lib, 'edit', 'printf "edited\\n" > ' + shlex.quote(str(lib / 'lib.txt')))
+        self.env['PATH'] = str(wrapper) + os.pathsep + path
+        result = self.world('init', str(self.source), code=3)
+        self.env['PATH'] = path
+        self.assertTrue(done.exists())
+        self.assertIn(b'uncommitted', result.stderr.lower())
+        self.git(lib, 'checkout', '-q', '--', 'lib.txt')
+        # The uninitialized submodule gains a `.git` into the source's kept module repository
+        # after the check: the copy would hold a link back into the source.
+        unused = self.source / 'vendor/unused'
+        self.assertTrue((self.source / '.git/modules/vendor/unused').is_dir())
+        wrapper, done = self.after_first_status(self.source, 'init', 'printf "gitdir: ../../.git/modules/vendor/unused\\n" > '
+                                                + shlex.quote(str(unused / '.git')))
+        self.env['PATH'] = str(wrapper) + os.pathsep + path
+        self.world('init', str(self.source), code=1)
+        self.env['PATH'] = path
+        self.assertTrue(done.exists())
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        (unused / '.git').unlink()
+        self.world('init', str(self.source))
+
+    def test_publish_refuses_a_gitlink_commit_the_target_lacks(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        (one / 'file').write_text('root only\n')
+        self.git(one, 'commit', '-qam', 'root only')
+        self.world('publish', wid)
+        other = self.root / 'other'
+        self.git(self.root, 'clone', '-q', str(self.source), str(other))
+        (one / 'libs/lib/lib.txt').write_text('only in the World\n')
+        self.git(one / 'libs/lib', 'commit', '-qam', 'world lib change')
+        missing = self.git(one / 'libs/lib', 'rev-parse', 'HEAD').stdout.strip()
+        self.git(one, 'commit', '-qam', 'bump lib')
+        before = self.git(self.source, 'rev-parse', 'world/W1').stdout.strip()
+        refused = self.world('publish', wid, code=3)
+        self.assertIn(b'record submodule libs/lib at ' + missing, refused.stderr)
+        self.assertEqual(self.git(self.source, 'rev-parse', 'world/W1').stdout.strip(), before)
+        self.assertEqual(self.git(self.source, 'for-each-ref', 'refs/worldfs/').stdout, b'')
+        # Once the target's submodule has that commit, the same publish goes through.
+        self.git(self.source / 'libs/lib', 'fetch', '-q', str(one / 'libs/lib'), missing.decode())
+        self.world('publish', wid)
+        self.assertEqual(self.git(self.source, 'rev-parse', 'world/W1:libs/lib').stdout.strip(), missing)
+        # A target with the submodule uninitialized cannot check it out either.
+        refused = self.world('publish', wid, '--repo', str(other), code=3)
+        self.assertIn(b'does not have that submodule initialized', refused.stderr)
 
 if __name__ == '__main__':
     unittest.main()
