@@ -201,7 +201,10 @@ in or over another submodule's -- since initializing it later puts its repositor
 gitlink with no `.gitmodules` entry at all (an "embedded" repository added by accident, which
 Git tolerates) is imported as it is when uninitialized; an initialized one is refused. Every
 check that reads `.gitmodules` -- names, collisions, relative URLs -- reads the one that will be
-published: the worktree's, or with `--committed-only` the committed one. The superproject's
+published: the worktree's, or with `--committed-only` the committed one. A `.gitmodules` missing
+there is an empty mapping, never the index's or HEAD's copy, so with `--include-changes` a
+deleted `.gitmodules` leaves an initialized submodule without the entry it needs (refused),
+while uninitialized gitlinks are imported as they are. The superproject's
 `submodule.active` and `submodule.<name>.url`, `.active`, `.branch`, `.shallow`,
 `.fetchRecurseSubmodules`, `.ignore` and `.update` settings travel with the other carried
 configuration, so `git submodule update --init` in the World clones it from the source's URL.

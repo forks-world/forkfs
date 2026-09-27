@@ -2079,9 +2079,10 @@ int tree_gitlinks(const char *root, const char *tree, Vec<Gitlink> &out) {
     parse_gitlinks(listing, out);
     return 0;
 }
-// Every setting of .gitmodules, as Git reads the file: the worktree's copy when there is one,
-// else the index's, else HEAD's -- or, with `tree`, that commit's. The listing is
-// `config --null --list` output ("<key>\n<value>\0" entries), empty when there is no file.
+// Every setting of the .gitmodules that is published: the worktree's file, or with `tree`
+// (--committed-only) that commit's. The listing is `config --null --list` output
+// ("<key>\n<value>\0" entries). A missing file is an empty mapping -- never the index's or
+// HEAD's copy, which Git itself may fall back to but which the published tree does not hold.
 int gitmodules_listing(const char *root, const char *tree, Vec<char> &listing) {
     listing.clear();
     String file = joinp(root, ".gitmodules"), blob;
@@ -2096,15 +2097,8 @@ int gitmodules_listing(const char *root, const char *tree, Vec<char> &listing) {
             if (!S_ISREG(st.st_mode)) return refuse(WFS_E_GIT_UNSUPPORTED, ".gitmodules is not a regular file");
             source_flag = "--file";
             blob = file;
-        } else if (errno != ENOENT) {
-            return -errno;
         } else {
-            bool found = false;
-            for (const char *candidate : {":.gitmodules", "HEAD:.gitmodules"}) {
-                const char *exists[] = {"cat-file", "-e", candidate, nullptr};
-                if (!git(root, exists, nullptr, nullptr, true)) { blob.assign(candidate); found = true; break; }
-            }
-            if (!found) return 0;
+            return errno == ENOENT ? 0 : -errno;
         }
     }
     const char *args[] = {"config", source_flag, blob.c_str(), "--null", "--list", nullptr};
@@ -2514,7 +2508,7 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
         if (depth >= kMaxModuleDepth)
             return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s is nested more than %d levels deep", path.c_str(), kMaxModuleDepth);
         const String *name = module_name(published_names, link.path);
-        if (!name) return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s has no .gitmodules entry", path.c_str());
+        if (!name) return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s has no entry in the .gitmodules that would be published (the file is missing or does not name it)", path.c_str());
         if (tree) {
             const String *current = module_name(names, link.path);
             if (!current || *current != *name)

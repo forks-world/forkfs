@@ -3596,6 +3596,27 @@ class GitWorldTest(unittest.TestCase):
                 self.assertIn(reason, refused.stderr)
                 self.git(self.source, 'reset', '-q', '--hard', 'HEAD~1')
 
+    def test_deleted_gitmodules_is_an_empty_mapping(self):
+        # Only an uninitialized submodule: nothing to import, and the World has no .gitmodules.
+        unused = self.origin('unused')
+        self.sub(self.source, 'add', '-q', str(unused), 'vendor/unused')
+        self.git(self.source, 'commit', '-qm', 'submodule')
+        self.sub(self.source, 'deinit', '-q', 'vendor/unused')
+        (self.source / '.gitmodules').unlink()
+        status = self.git(self.source, 'status', '--porcelain').stdout
+        snapshot = self.world('init', str(self.source), '--include-changes').stdout.split()[0].decode()
+        one, _ = self.fork('one', snapshot)
+        self.assertFalse((one / '.gitmodules').exists())
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, status)
+        # An initialized submodule needs the entry the published tree no longer has.
+        self.git(self.source, 'checkout', '--', '.gitmodules')
+        lib = self.origin('lib')
+        self.sub(self.source, 'add', '-q', '--name', 'lib-module', str(lib), 'libs/lib')
+        self.git(self.source, 'commit', '-qm', 'lib')
+        (self.source / '.gitmodules').unlink()
+        refused = self.world('init', str(self.source), '--include-changes', code=3)
+        self.assertIn(b'reason: submodule libs/lib has no entry in the .gitmodules that would be published', refused.stderr)
+
     def test_publish_refuses_a_gitlink_commit_the_target_lacks(self):
         self.submodule_fixture()
         self.world('init', str(self.source))
