@@ -175,10 +175,24 @@ int write_text(const char *root, const char *rel, const char *text) {
     return write_bytes(path.c_str(), text, strlen(text));
 }
 
-// A nested worktree/submodule cannot be made safe by fixing only the root's .git file.
-// Until recursive Git imports exist, reject nested repositories, including plain nested ones.
-int nested_check(const char *root, bool top = true) {
-    DIR *dir = opendir(root);
+// A gitlink (mode 160000) entry of an index or a tree: a submodule's path and recorded commit.
+struct Gitlink {
+    String path, oid;
+};
+const Gitlink *find_link(const Vec<Gitlink> &links, const char *path) {
+    for (const auto &l : links) if (l.path == path) return &l;
+    return nullptr;
+}
+// A nested repository cannot be made safe by fixing only the root's .git file. The only nested
+// `.git` admitted is a submodule's: a directory that this repository's index records as a
+// gitlink (`links`), which discover_modules then validates, captures and walks on its own.
+// Everything else with a `.git` below the root -- a plain nested repository, a `.git` inside an
+// uninitialized submodule's directory -- is refused. The walk's own top may hold its `.git`; only
+// the top of the tree itself (`world_root`) may also hold the World's `.world-git`, never a
+// submodule's top.
+int nested_walk(const String &dir_path, const String &rel, const Vec<Gitlink> *links, bool world_root) {
+    bool top = rel.empty();
+    DIR *dir = opendir(dir_path.c_str());
     if (!dir) return -errno;
     int rc = 0;
     for (;;) {
@@ -187,16 +201,26 @@ int nested_check(const char *root, bool top = true) {
         if (!e) { if (errno) rc = -errno; break; }
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         if (!strcmp(e->d_name, ".git")) {
-            if (!top) { rc = refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository or submodule at %s", root); break; }
+            if (!top) { rc = refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository or submodule at %s", dir_path.c_str()); break; }
             continue;
         }
-        if (top && !strcmp(e->d_name, ".world-git")) continue;
-        String path = joinp(root, e->d_name);
+        if (top && world_root && !strcmp(e->d_name, ".world-git")) continue;
+        String path = joinp(dir_path.c_str(), e->d_name);
         struct stat st;
         if (lstat(path.c_str(), &st)) { rc = -errno; break; }
-        if (S_ISDIR(st.st_mode) && (rc = nested_check(path.c_str(), false))) break;
+        if (!S_ISDIR(st.st_mode)) continue;
+        String child = top ? String(e->d_name) : joinp(rel.c_str(), e->d_name);
+        if (links && find_link(*links, child.c_str())) {
+            String dot = joinp(path.c_str(), ".git");
+            if (!lstat(dot.c_str(), &st)) continue;   // an initialized submodule
+            if (errno != ENOENT) { rc = -errno; break; }
+        }
+        if ((rc = nested_walk(path, child, links, world_root))) break;
     }
     closedir(dir); return rc;
+}
+int nested_check(const char *root, const Vec<Gitlink> *links, bool world_root) {
+    return nested_walk(String(root), String(), links, world_root);
 }
 // A managed tree may be copied without consulting an external repository only when all
 // administration stays inside it. Reject changed common-dir pointers and additional worktrees.
@@ -222,7 +246,10 @@ int managed_check(const char *root, const char *common, const char *admin) {
         if (normalized != expected_text)
             return refuse(WFS_E_GIT_UNSUPPORTED, "the World's worktree %s link was changed", file);
     }
-    // Reject symlinks anywhere in the owned administration, including its root.
+    // Reject symlinks anywhere in the owned administration, including its root. Submodule
+    // repositories live below active/modules (see GitModule); a `worktrees` directory in one of
+    // them is a linked worktree of that submodule registered from somewhere else.
+    String modules = joinp(active.c_str(), "modules/");
     Vec<String> dirs; dirs.emplace_back(joinp(root, ".world-git"));
     for (size_t i = 0; i < dirs.size(); ++i) {
         String path = dirs[i]; struct stat st;
@@ -243,6 +270,13 @@ int managed_check(const char *root, const char *common, const char *admin) {
             }
             if (path == joinp(repo.c_str(), "worktrees") && strcmp(e->d_name, "active")) {
                 rc = refuse(WFS_E_GIT_UNSUPPORTED, "the World has an additional linked worktree (%s)", e->d_name); break;
+            }
+            if (S_ISDIR(st.st_mode) && !strcmp(e->d_name, "worktrees") && !strncmp(path.c_str(), modules.c_str(), modules.size())) {
+                String head = joinp(path.c_str(), "HEAD");
+                if (!lstat(head.c_str(), &st)) {
+                    rc = refuse(WFS_E_GIT_UNSUPPORTED, "a submodule repository of the World has a linked worktree (%s)", child.c_str()); break;
+                }
+                if (errno != ENOENT) { rc = -errno; break; }
             }
         }
         closedir(d); if (rc) return rc;
@@ -309,8 +343,8 @@ int capture_settings(const char *root, Vec<GitSetting> &out) {
 // Repository-local configuration that makes a World usable as a place to work, carried from
 // an external source into the owned repository (a mirror clone copies refs, not config):
 // remotes (URLs, refspecs, tag and prune options), branch upstreams, URL rewrites, push/fetch
-// defaults and aliases. Aliases run only when the user types them, as they would in the
-// source. Settings Git executes on its own -- hooks, remote.*.uploadpack/receivepack/vcs,
+// defaults, submodule settings and aliases. Aliases run only when the user types them, as they
+// would in the source. Settings Git executes on its own -- hooks, remote.*.uploadpack/receivepack/vcs,
 // branch.*.mergeoptions, core.sshCommand, credential helpers -- are not carried. A relative
 // local remote URL is made absolute against the source (see `absolutize_remote_path`), so it
 // still reaches the same repository once the source is gone; one that any url.<base>.insteadOf
@@ -323,6 +357,7 @@ const char *const kCarriedConfig =
     "|branch\\..+\\.(remote|merge|pushremote|rebase|description)"
     "|url\\..+\\.(insteadof|pushinsteadof)"
     "|push\\.(default|autosetupremote)|fetch\\.(prune|prunetags)"
+    "|submodule\\..+\\.(url|active|branch|shallow|fetchrecursesubmodules|ignore|update)|submodule\\.active"
     "|alias\\..+)$";
 // Resolve "." and ".." lexically: the path must stay valid after the directory it was relative
 // to (the source) is deleted, so it cannot be resolved through that directory.
@@ -413,6 +448,7 @@ bool is_carried_boolean(const char *key) {
     if (!strncmp(key, "remote.", 7))
         return ends(".prune") || ends(".prunetags") || ends(".mirror") || ends(".skipdefaultupdate") || ends(".skipfetchall");
     if (!strncmp(key, "branch.", 7)) return ends(".rebase");
+    if (!strncmp(key, "submodule.", 10)) return ends(".active") || ends(".shallow") || ends(".fetchrecursesubmodules");
     return !strcmp(key, "push.autosetupremote") || !strcmp(key, "fetch.prune") || !strcmp(key, "fetch.prunetags");
 }
 bool is_relative_local_url(const char *url) {
@@ -529,7 +565,7 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
     // location (which rule wins, whether a pushurl needs to be synthesized) has repeatedly
     // diverged from Git's actual behavior, and the combination is rare enough to refuse outright
     // instead.
-    Vec<UrlRewriteRule> rules;
+    Vec<UrlRewriteRule> rules, conditional_rules;
     {
         const char *rw_args[] = {"config", "--includes", "--null", "--get-regexp",
             "^url\\..*\\.(insteadof|pushinsteadof)$", nullptr};
@@ -538,11 +574,8 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
         if (rc && !(rc == WFS_E_GIT_FAILED && status == 1)) return rc;
         if (!rc) parse_rewrite_listing(listing, rules);
     }
-    {
-        Vec<UrlRewriteRule> conditional_rules;
-        if (int rc = scan_conditional_includes(root, nullptr, &conditional_rules)) return rc;
-        for (const auto &c : conditional_rules) rules.emplace_back(c);
-    }
+    if (int rc = scan_conditional_includes(root, nullptr, &conditional_rules)) return rc;
+    for (const auto &c : conditional_rules) rules.emplace_back(c);
     const char *args[] = {"config", "--local", "--includes", "--null", "--get-regexp", kCarriedConfig, nullptr};
     Vec<char> listing; int status = -1;
     int rc = git(root, args, &listing, &status);
@@ -566,6 +599,29 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
         bool is_remote = !strncmp(key.c_str(), "remote.", 7);
         bool is_url = is_remote && klen > 4 && !strcmp(key.c_str() + klen - 4, ".url");
         bool is_pushurl = is_remote && klen > 8 && !strcmp(key.c_str() + klen - 8, ".pushurl");
+        bool is_submodule = !strncmp(key.c_str(), "submodule.", 10);
+        bool is_submodule_url = is_submodule && klen > 14 && !strcmp(key.c_str() + klen - 4, ".url");
+        // submodule.<name>.update = !<command> makes `git submodule update` run that command;
+        // only the update modes Git performs itself are carried.
+        if (is_submodule && klen > 17 && !strcmp(key.c_str() + klen - 7, ".update") &&
+            val != "checkout" && val != "rebase" && val != "merge" && val != "none")
+            return refuse(WFS_E_GIT_POLICY,
+                "%s = %s is not an update mode WorldFS carries (a '!' command would be run by "
+                "`git submodule update`); only checkout, rebase, merge and none are carried",
+                key.c_str(), val.c_str());
+        if (is_submodule_url && strpbrk(val.c_str(), "\n\r"))
+            return refuse(WFS_E_GIT_POLICY,
+                "%s contains a line break, which cannot be carried unambiguously; rename the path "
+                "before importing", key.c_str());
+        if (is_submodule_url && is_relative_local_url(val.c_str())) {
+            const UrlRewriteRule *r = matching_rewrite(rules, val.c_str());
+            if (r)
+                return refuse(WFS_E_GIT_POLICY,
+                    "%s %s is relative and url.%s.%s rewrites it; make the URL absolute or remove "
+                    "the rewrite before importing",
+                    key.c_str(), val.c_str(), r->base.c_str(), r->push ? "pushInsteadOf" : "insteadOf");
+            if (int arc = absolutize_remote_path(root, val.c_str(), val)) return arc;
+        }
         // A local-path remote URL may legally contain an embedded newline (or carriage return).
         // `git remote get-url --all`/`--push --all` below would emit it verbatim, and git_lines
         // splits on every '\n', so the effective URL list would no longer match this raw value
@@ -598,6 +654,13 @@ int capture_carried_config(const char *root, Vec<GitSetting> &out) {
         }
         out.emplace_back(GitSetting{key, val});
     }
+    // A relative submodule.<name>.url in the configuration is not resolved against a remote:
+    // observed with Git 2.54, `git submodule update --init` hands a configured URL to clone as
+    // it is, from the superproject's worktree top (from a subdirectory too, and with a remote
+    // origin present), so `../lib.git` names <top>/../lib.git -- exactly what the absolutization
+    // above reproduces. Only a URL that .gitmodules alone gives is resolved against the default
+    // remote. Every submodule URL is classified and checked against rewrite rules in one place,
+    // with the shared configuration it competes with (discover_modules).
     // A remote is one unit: if any of its repository-local settings are carried (a subsectioned
     // remote.<name>.<var> key from kCarriedConfig above, e.g. .fetch or .prune -- not a
     // section-wide key like remote.pushDefault, which has no <name>), its url/pushurl must also
@@ -929,12 +992,13 @@ bool is_status_or_filter_key(const char *key) {
     for (size_t i = 0; keys[i]; ++i) if (!strcasecmp(key, keys[i])) return true;
     return !strncasecmp(key, "filter.", 7);
 }
-// Whether `key` names a per-remote or per-branch setting -- "remote.<subsection>.<var>" or
-// "branch.<subsection>.<var>" -- as opposed to a section-wide setting with no subsection
-// (`remote.pushDefault`, `branch.autoSetupMerge`). A subsection is present exactly when the
+// Whether `key` names a per-remote, per-branch or per-submodule setting --
+// "remote.<subsection>.<var>", "branch.<subsection>.<var>" or "submodule.<subsection>.<var>" --
+// as opposed to a section-wide setting with no subsection (`remote.pushDefault`,
+// `branch.autoSetupMerge`, `submodule.recurse`). A subsection is present exactly when the
 // remainder after the leading "remote."/"branch." contains another '.'.
 bool is_remote_or_branch_subsection_key(const char *key) {
-    for (const char *prefix : {"remote.", "branch."}) {
+    for (const char *prefix : {"remote.", "branch.", "submodule."}) {
         size_t plen = strlen(prefix);
         if (!strncasecmp(key, prefix, plen) && strchr(key + plen, '.')) return true;
     }
@@ -998,7 +1062,7 @@ int scan_include_target(const char *root, const char *path, const char *directiv
             return refuse(WFS_E_GIT_POLICY, "%s includes %s, which sets %s", directive, path, key);
         if (is_remote_or_branch_subsection_key(key))
             return refuse(WFS_E_GIT_POLICY,
-                "%s includes %s, which sets %s; per-remote and per-branch settings in a "
+                "%s includes %s, which sets %s; per-remote and per-branch settings (and per-submodule ones) in a "
                 "conditional include depend on where the World is placed", directive, path, key);
         if (sets_identity && (!strcasecmp(key, "user.name") || !strcasecmp(key, "user.email")))
             *sets_identity = true;
@@ -1623,7 +1687,7 @@ bool same_hooks(const Vec<GitHook> &a, const Vec<GitHook> &b) {
         if (a[i].name != b[i].name || a[i].mode != b[i].mode || !same_bytes(a[i].bytes, b[i].bytes)) return false;
     return true;
 }
-int install_hooks(const GitSource &s, const char *clone, const char *repo) {
+int install_hooks(const GitRepoState &s, const char *clone, const char *repo) {
     if (!s.hooks.empty()) {
         String dir = joinp(repo, "hooks");
         if (int rc = fs_mkdir(dir.c_str(), 0755)) { if (rc != -EEXIST) return rc; }
@@ -1636,8 +1700,14 @@ int install_hooks(const GitSource &s, const char *clone, const char *repo) {
     return s.hooks_path_present ? config(clone, "core.hooksPath", s.hooks_path.c_str()) : 0;
 }
 // GIT_OPTIONAL_LOCKS=0 (set by git()) keeps status from refreshing the index it inspects.
+// --ignore-submodules=dirty: a submodule counts as changed when its HEAD differs from the gitlink
+// the index records (read in-process from its refs), but status does not run a child `git
+// status` inside it -- that child would read the submodule's own configuration, filters
+// included, before anything checked them. Each submodule's own worktree is checked by a direct
+// call on it instead (require_clean_copy, git_source). The command-line value also overrides
+// submodule.<name>.ignore and diff.ignoreSubmodules, so neither can hide a moved submodule.
 int require_clean_tree(const char *root) {
-    const char *args[] = {"status", "--porcelain=v1", "-z", "--untracked-files=normal",
+    const char *args[] = {"status", "--porcelain=v1", "-z", "--untracked-files=normal", "--ignore-submodules=dirty",
         "--", ".", ":(exclude).world", ":(exclude).world-git", nullptr};
     Vec<char> dirty;
     // With the user's own global/system configuration (global ignores, autocrlf, ...), so
@@ -1658,9 +1728,12 @@ int require_clean_tree(const char *root) {
 // checked here first, before the refresh (which cleans stat-dirty files) or the reset (which
 // checks HEAD out), against the copy's index and worktree and against HEAD.
 // SQUASH_MSG describes staged content that no longer exists, so it goes too.
-int reset_to_head(const char *clone) {
+// A submodule is reset to `target`, the commit its committed superproject records: HEAD is
+// detached there first when it is anywhere else, and the filters are checked against it.
+int reset_to_head(const char *clone, const char *target = nullptr) {
+    const char *tree = target ? target : "HEAD";
     if (int rc = reject_used_filters(clone)) return rc;
-    if (int rc = reject_used_filters(clone, "HEAD")) return rc;
+    if (int rc = reject_used_filters(clone, tree)) return rc;
     // skip-worktree and assume-unchanged entries are invisible to status and left alone by
     // read-tree, so their worktree bytes would survive the reset. Clear both marks in the
     // copy's index first (`ls-files -v`: 'S'/'s' is skip-worktree, a lower-case tag is
@@ -1704,6 +1777,15 @@ int reset_to_head(const char *clone) {
     const char *clean[] = {"clean", "-f", "-d", "-q", "--", ".", ":(exclude,top,literal).world",
                            ":(exclude,top,literal).world-git", nullptr};
     if ((rc = git(clone, clean, nullptr, nullptr, false, true))) return rc;
+    if (target) {
+        String head;
+        const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
+        if ((rc = value(clone, head_args, head))) return rc;
+        if (head != target) {
+            const char *detach[] = {"update-ref", "--no-deref", "-m", "world: --committed-only", "HEAD", target, nullptr};
+            if ((rc = git(clone, detach))) return rc;
+        }
+    }
     const char *reset[] = {"read-tree", "--reset", "-u", "HEAD", nullptr};
     if ((rc = git(clone, reset, nullptr, nullptr, false, true))) return rc;
     // A directory the reset emptied of staged additions, or anything else left untracked.
@@ -1780,7 +1862,7 @@ int reject_unlisted_symrefs(const char *root, const Vec<GitSymref> &known) {
     }
     return 0;
 }
-int source_unchanged(const GitSource &s) {
+int source_unchanged(const GitRepoState &s) {
     if (int rc = reject_inprogress(s.root.c_str())) return rc;
     if (int rc = reject_import_policy(s.root.c_str())) return rc;
     if (int rc = reject_external_visibility_state(s.root.c_str(), s.managed)) return rc;
@@ -1792,6 +1874,12 @@ int source_unchanged(const GitSource &s) {
     if (rc) return rc;
     if (head != s.head || index.size() != s.index.size() ||
         (!index.empty() && memcmp(index.data(), s.index.data(), index.size()))) return -EBUSY;
+    String head_ref, admin;
+    const char *ref_args[] = {"symbolic-ref", "--quiet", "HEAD", nullptr};
+    const char *admin_args[] = {"rev-parse", "--absolute-git-dir", nullptr};
+    if (int ref_rc = value(s.root.c_str(), ref_args, head_ref, true)) return ref_rc;
+    if (int admin_rc = value(s.root.c_str(), admin_args, admin)) return admin_rc;
+    if (head_ref != s.head_ref || admin != s.admin) return -EBUSY;
     Vec<char> exclude;
     rc = read_bytes(s.exclude_path.c_str(), exclude);
     if (rc == -ENOENT && s.exclude.empty()) rc = 0;
@@ -1865,7 +1953,7 @@ int source_unchanged(const GitSource &s) {
 // a refs/replace/* entry could otherwise present a safe tree for a commit whose real tree has
 // the path, and deleting that replacement in the World would bring it back. The replacement
 // commits are still scanned, as ordinary tips under --all.
-int reject_reserved_paths(const char *root, const GitSource &s) {
+int reject_reserved_paths(const char *root, const GitRepoState &s) {
     const char *tracked_args[] = {"ls-files", "-z", "--", ":(top,literal).world", ":(top,literal).world-git", nullptr};
     Vec<char> tracked;
     if (int rc = git(root, tracked_args, &tracked)) return rc;
@@ -1923,7 +2011,7 @@ int require_committed_hooks_path(const char *root, bool present, const String &h
         String one(":(top,literal)"); one.append(hp.c_str()); scopes.emplace_back(one);
     }
     Vec<const char *> st_args;
-    for (const char *a : {"status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=no", "--"})
+    for (const char *a : {"status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=no", "--ignore-submodules=dirty", "--"})
         st_args.emplace_back(a);
     for (const auto &scope : scopes) st_args.emplace_back(scope.c_str());
     st_args.emplace_back(nullptr);
@@ -1950,31 +2038,271 @@ int require_committed_hooks_path(const char *root, bool present, const String &h
     }
     return 0;
 }
-int git_source(const char *root, bool include_changes, GitSource &out, bool committed_only, bool with_hooks) {
-    g_reason[0] = '\0';
-    if (include_changes && committed_only) return -EINVAL;
-    if (int rc = nested_check(root)) return rc;
-    String dot = joinp(root, ".git"), managed = joinp(root, ".world-git");
-    struct stat st;
-    bool has_managed = lstat(managed.c_str(), &st) == 0;
-    if (!has_managed && errno != ENOENT) return -errno;
-    if (lstat(dot.c_str(), &st)) {
-        if (errno == ENOENT && !has_managed) {
-            if (committed_only) return refuse(WFS_E_GIT_UNSUPPORTED, "--committed-only needs a Git repository at the source root");
-            if (with_hooks) return refuse(WFS_E_GIT_UNSUPPORTED, "--with-hooks needs a Git repository at the source root");
-            return 0;
+// Parses the gitlinks out of `ls-files --stage -z` ("<mode> <oid> <stage>\t<path>") or
+// `ls-tree -r -z` ("<mode> <type> <oid>\t<path>") output.
+void parse_gitlinks(const Vec<char> &listing, Vec<Gitlink> &out) {
+    out.clear();
+    for (size_t i = 0; i + 1 < listing.size();) {
+        const char *entry = listing.data() + i;
+        i += strlen(entry) + 1;
+        if (strncmp(entry, "160000 ", 7)) continue;
+        const char *tab = strchr(entry, '\t');
+        if (!tab) continue;
+        const char *oid = entry + 7;
+        if (!strncmp(oid, "commit ", 7)) oid += 7;
+        const char *end = strchr(oid, ' ');
+        if (!end || end > tab) end = tab;
+        out.emplace_back(Gitlink{String(tab + 1), String(oid, (size_t)(end - oid))});
+    }
+}
+int tree_gitlinks(const char *root, const char *tree, Vec<Gitlink> &out) {
+    const char *args[] = {"ls-tree", "-r", "-z", "--full-tree", tree, nullptr};
+    Vec<char> listing;
+    if (int rc = git(root, args, &listing)) return rc;
+    parse_gitlinks(listing, out);
+    return 0;
+}
+// Every setting of the .gitmodules that is published: the worktree's file, or with `tree`
+// (--committed-only) that commit's. The listing is `config --null --list` output
+// ("<key>\n<value>\0" entries). A missing file is an empty mapping -- never the index's or
+// HEAD's copy, which Git itself may fall back to but which the published tree does not hold.
+int gitmodules_listing(const char *root, const char *tree, Vec<char> &listing) {
+    listing.clear();
+    String file = joinp(root, ".gitmodules"), blob;
+    const char *source_flag = "--blob";
+    if (tree) {
+        blob.assign(tree); blob.append(":.gitmodules");
+        const char *exists[] = {"cat-file", "-e", blob.c_str(), nullptr};
+        if (git(root, exists, nullptr, nullptr, true)) return 0;
+    } else {
+        struct stat st;
+        if (!lstat(file.c_str(), &st)) {
+            if (!S_ISREG(st.st_mode)) return refuse(WFS_E_GIT_UNSUPPORTED, ".gitmodules is not a regular file");
+            source_flag = "--file";
+            blob = file;
+        } else {
+            return errno == ENOENT ? 0 : -errno;
         }
-        return refuse(WFS_E_GIT_UNSUPPORTED, ".world-git exists without its .git marker");
     }
-    if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) return refuse(WFS_E_GIT_UNSUPPORTED, ".git is neither a directory nor a file");
-    out.present = true; out.root = root;
-    if (has_managed) {
-        Vec<char> contents;
-        if (int rc = read_bytes(dot.c_str(), contents)) return rc;
-        if (contents.size() != strlen(marker) || memcmp(contents.data(), marker, contents.size()))
-            return refuse(WFS_E_GIT_UNSUPPORTED, "the .git file is not the WorldFS marker");
-        out.managed = true;
+    const char *args[] = {"config", source_flag, blob.c_str(), "--null", "--list", nullptr};
+    return git(root, args, &listing);
+}
+// The value of `submodule.<name>.<var>` in a .gitmodules listing; the last one wins, like Git.
+const char *gitmodules_value(const Vec<char> &listing, const String &name, const char *var) {
+    String key("submodule."); key.append(name.c_str()); key.push_back('.'); key.append(var); key.push_back('\n');
+    const char *found = nullptr;
+    for (size_t i = 0; i < listing.size() && listing[i];) {
+        const char *entry = listing.data() + i;
+        i += strlen(entry) + 1;
+        if (!strncmp(entry, key.c_str(), key.size())) found = entry + key.size();
     }
+    return found;
+}
+// The submodule name .gitmodules gives each path, from a listing: pairs are {path, name}.
+void module_names(const Vec<char> &listing, Vec<GitSetting> &out) {
+    out.clear();
+    for (size_t i = 0; i < listing.size() && listing[i];) {
+        const char *entry = listing.data() + i;
+        size_t len = strlen(entry);
+        i += len + 1;
+        const char *nl = strchr(entry, '\n');
+        if (!nl || nl - entry < 16 || strncmp(entry, "submodule.", 10) || strncmp(nl - 5, ".path", 5)) continue;
+        String name(entry + 10, (size_t)(nl - entry) - 15);
+        out.emplace_back(GitSetting{String(nl + 1), name});
+    }
+}
+const String *module_name(const Vec<GitSetting> &names, const String &path) {
+    const String *found = nullptr;
+    for (const auto &n : names) if (n.key == path) found = &n.value;   // the last one wins, like Git
+    return found;
+}
+// `git submodule init`'s resolution of a "./" or "../" .gitmodules URL against a remote's URL,
+// observed with Git 2.54 across local, file://, ssh://, https:// and scp-like bases: trailing
+// slashes of the base are dropped; each leading "../" removes the base's last "/"-component and
+// each leading "./" is skipped; the rest is joined with "/", and one trailing "/" of the result
+// is dropped. Git also chops at a ':' of an scp-like base, falls back to "." and yields
+// relative or malformed URLs (ssh:/x.git) once the components run out: those cases, an empty
+// rest, and a relative base are not reproduced -- false, and the caller refuses.
+bool resolve_submodule_url(const String &base_url, const char *url, String &out) {
+    String base(base_url);
+    while (!base.empty() && base.back() == '/') base.pop_back();
+    const char *b = base.c_str();
+    const char *scheme = strstr(b, "://");
+    size_t floor;   // no "../" may cut below this: the root, the host, or the scp host
+    if (b[0] == '/') {
+        floor = 0;
+    } else if (scheme) {
+        const char *slash = strchr(scheme + 3, '/');
+        if (!slash) return false;
+        floor = (size_t)(slash - b);
+    } else {
+        const char *colon = strchr(b, ':'), *slash = strchr(b, '/');
+        if (!colon || (slash && slash < colon)) return false;
+        floor = (size_t)(colon - b) + 1;
+    }
+    const char *p = url;
+    for (;;) {
+        if (!strncmp(p, "../", 3)) {
+            p += 3;
+            const char *last = strrchr(base.c_str(), '/');
+            if (!last || (size_t)(last - base.c_str()) < floor) return false;
+            base.resize((size_t)(last - base.c_str()));
+        } else if (!strncmp(p, "./", 2)) {
+            p += 2;
+        } else {
+            break;
+        }
+    }
+    if (!*p) return false;
+    out = base; out.push_back('/'); out.append(p);
+    if (out.back() == '/') out.pop_back();
+    return true;
+}
+// Whether the first `n` bytes of `a` and `b` are equal under ASCII case folding (other bytes,
+// UTF-8 included, compared exactly): submodule names are directories below modules/, and a
+// World may live on, or be forked onto, a case-insensitive volume where `Lib` and `lib` are one
+// directory. Independent of the locale.
+bool ascii_caseeq(const char *a, const char *b, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char x = (unsigned char)a[i], y = (unsigned char)b[i];
+        if (x >= 'A' && x <= 'Z') x = (unsigned char)(x - 'A' + 'a');
+        if (y >= 'A' && y <= 'Z') y = (unsigned char)(y - 'A' + 'a');
+        if (x != y) return false;
+    }
+    return true;
+}
+// A name is a directory below modules/: no empty, "." or ".." component, nothing absolute.
+bool valid_module_name(const String &name) {
+    if (name.empty() || name[0] == '/' || strpbrk(name.c_str(), "\\\n\r")) return false;
+    for (const char *p = name.c_str();;) {
+        const char *start = p;
+        while (*p && *p != '/') ++p;
+        size_t n = (size_t)(p - start);
+        if (n == 0 || (n == 1 && *start == '.') || (n == 2 && start[0] == '.' && start[1] == '.')) return false;
+        if (!*p) return true;
+        ++p;
+    }
+}
+// `to` relative to the directory `from`, both relative to the same root and normalized, the
+// way Git spells its relative submodule links: the common leading components are dropped.
+String rel_link(const String &from, const String &to) {
+    Vec<String> a, b;
+    for (const String *src : {&from, &to}) {
+        Vec<String> &parts = src == &from ? a : b;
+        for (const char *p = src->c_str(); *p;) {
+            while (*p == '/') ++p;
+            const char *start = p;
+            while (*p && *p != '/') ++p;
+            if (p != start) parts.emplace_back(start, (size_t)(p - start));
+        }
+    }
+    size_t common = 0;
+    while (common < a.size() && common < b.size() && a[common] == b[common]) ++common;
+    String out;
+    for (size_t i = common; i < a.size(); ++i) out.append("../");
+    for (size_t i = common; i < b.size(); ++i) { out.append(b[i].c_str()); if (i + 1 < b.size()) out.push_back('/'); }
+    if (out.empty()) out.assign(".");
+    else if (out.back() == '/') out.pop_back();
+    return out;
+}
+constexpr const char *kActive = ".world-git/repo.git/worktrees/active";
+// The `.git` file of a submodule at `path` whose repository is `gitdir` (see GitModule).
+String module_gitfile(const String &path, const String &gitdir) {
+    String admin(kActive); admin.push_back('/'); admin.append(gitdir.c_str());
+    String text("gitdir: "); text.append(rel_link(path, admin).c_str()); text.push_back('\n');
+    return text;
+}
+String module_worktree(const String &path, const String &gitdir) {
+    String admin(kActive); admin.push_back('/'); admin.append(gitdir.c_str());
+    return rel_link(admin, path);
+}
+// Git 2.54 can spell a relative link with a doubled slash; compare the normalized spelling.
+String squeeze_slashes(const char *text, size_t n) {
+    String out;
+    for (size_t i = 0; i < n; ++i) {
+        if (text[i] == '/' && !out.empty() && out.back() == '/') continue;
+        out.push_back(text[i]);
+    }
+    return out;
+}
+// A managed World's submodule at `path` (relative to the World's root `world`) is trusted only
+// in the World's own layout, exactly: every component of its path a real directory, its `.git`
+// a regular file with the relative link to the owned repository `gitdir` (see GitModule), and
+// that repository's core.worktree the relative link back. Anything else -- a symlinked
+// directory, a gitfile repointed at some other repository -- would have Git read or write a
+// repository that is not the World's.
+int check_owned_module(const char *world, const String &path, const String &gitdir) {
+    String walk(world);
+    for (const char *p = path.c_str(); *p;) {
+        const char *start = p;
+        while (*p && *p != '/') ++p;
+        walk = joinp(walk.c_str(), String(start, (size_t)(p - start)).c_str());
+        if (*p) ++p;
+        struct stat st;
+        if (lstat(walk.c_str(), &st) || !S_ISDIR(st.st_mode))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "submodule path %s is not a directory of the World", path.c_str());
+    }
+    String dot = joinp(walk.c_str(), ".git");
+    struct stat st;
+    Vec<char> bytes;
+    if (lstat(dot.c_str(), &st) || !S_ISREG(st.st_mode) || read_bytes(dot.c_str(), bytes) ||
+        squeeze_slashes(bytes.data(), bytes.size()) != module_gitfile(path, gitdir))
+        return refuse(WFS_E_GIT_UNSUPPORTED, "the .git link of submodule %s was changed", path.c_str());
+    String admin(kActive); admin.push_back('/'); admin.append(gitdir.c_str()); admin.append("/config");
+    String config = joinp(world, admin.c_str()), worktree;
+    const char *wt_args[] = {"config", "--file", config.c_str(), "--get", "core.worktree", nullptr};
+    if (int rc = get_config(world, wt_args, worktree)) return rc;
+    if (squeeze_slashes(worktree.c_str(), worktree.size()) != module_worktree(path, gitdir))
+        return refuse(WFS_E_GIT_UNSUPPORTED, "the core.worktree link of submodule %s was changed", path.c_str());
+    return 0;
+}
+// Prefix the reason of a refusal that came from inside a submodule with its path.
+int in_module(int rc, const String &path) {
+    if (rc != WFS_E_GIT_UNSUPPORTED && rc != WFS_E_GIT_POLICY) return rc;
+    char inner[sizeof g_reason];
+    snprintf(inner, sizeof inner, "%s", g_reason);
+    if (!strncmp(inner, "submodule ", 10)) return rc;   // a nested one already named itself
+    return refuse(rc, "submodule %s: %s", path.c_str(), inner);
+}
+// A managed World is copied with byte-identical configuration (the effective-configuration
+// comparison relies on it), so nothing in it is absolutized the way an external import makes a
+// relative remote or submodule URL absolute or pins a relative core.hooksPath that leaves the
+// tree. A value set by hand inside the World that Git resolves from the repository's location
+// would name a different place in the copy: refused. `git submodule init`, `git remote add`
+// with an absolute path and the import itself write absolute values; an in-tree relative
+// core.hooksPath travels with the tree and is fine.
+int reject_relative_managed_paths(const char *root) {
+    const char *args[] = {"config", "--local", "--includes", "--null", "--get-regexp",
+        "^remote\\..*\\.(url|pushurl)$", nullptr};
+    Vec<char> listing; int status = -1;
+    int rc = git(root, args, &listing, &status);
+    if (rc && !(rc == WFS_E_GIT_FAILED && status == 1)) return rc;
+    for (size_t i = 0; !rc && i < listing.size() && listing[i];) {
+        const char *entry = listing.data() + i;
+        i += strlen(entry) + 1;
+        const char *nl = strchr(entry, '\n');
+        if (!nl || !is_relative_local_url(nl + 1)) continue;
+        return refuse(WFS_E_GIT_POLICY,
+            "the World's %.*s is the relative path %s, which a copy of the World would resolve from its "
+            "own location; make it absolute (git submodule init and the import write absolute URLs)",
+            (int)(nl - entry), entry, nl + 1);
+    }
+    bool present = false; String hooks;
+    if ((rc = local_hooks_path(root, present, hooks))) return rc;
+    if (present && !hooks.empty() && hooks[0] != '/' && hooks[0] != '~') {
+        String normalized(hooks);
+        if ((rc = normalize_hooks_path(root, present, normalized))) return rc;
+        if (normalized[0] == '/')
+            return refuse(WFS_E_GIT_POLICY,
+                "the World's core.hooksPath %s leaves its tree, so a copy of the World would resolve it "
+                "from its own location; make it absolute", hooks.c_str());
+    }
+    return 0;
+}
+// Everything the import reproduces of one repository -- the root, or a submodule's -- and every
+// eligibility check on it. `gitlinks` receives the index's gitlinks.
+int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool module, Vec<Gitlink> &gitlinks) {
+    out.root = root;
     String top;
     const char *top_args[] = {"rev-parse", "--show-toplevel", nullptr};
     if (int rc = value(root, top_args, top)) return rc;
@@ -1992,17 +2320,9 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
     out.with_hooks = with_hooks;
     if (with_hooks && !out.managed) {
         if (int hook_rc = capture_hooks(root, out.hooks, out.hooks_path_present, out.hooks_path)) return hook_rc;
-        if (committed_only) {
-            if (int hrc = require_committed_hooks_path(root, out.hooks_path_present, out.hooks_path)) return hrc;
-        }
     }
-    // A managed World carries its hooks and core.hooksPath with its .world-git, so the same
-    // committed-path check applies to it whether or not --with-hooks was given.
-    if (committed_only && out.managed) {
-        bool present = false; String hp;
-        if (int hrc = local_hooks_path(root, present, hp)) return hrc;
-        if (int hrc = normalize_hooks_path(root, present, hp)) return hrc;
-        if (int hrc = require_committed_hooks_path(root, present, hp)) return hrc;
+    if (out.managed) {
+        if (int rc = reject_relative_managed_paths(root)) return rc;
     }
     if (out.managed) {
         // A managed copy has byte-identical configuration files and import commands ignore
@@ -2013,6 +2333,8 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
     }
     const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (value(root, head_args, out.head)) return refuse(WFS_E_GIT_UNSUPPORTED, "the repository has no commit yet");
+    const char *head_ref_args[] = {"symbolic-ref", "--quiet", "HEAD", nullptr};
+    if (int rc = value(root, head_ref_args, out.head_ref, true)) return rc;
     const char *index_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "index", nullptr};
     if (int rc = value(root, index_args, out.index_path)) return rc;
     int rc = read_bytes(out.index_path.c_str(), out.index);
@@ -2041,12 +2363,20 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
     rc = read_bytes(out.fetch_path.c_str(), out.fetch);
     out.fetch_present = rc == 0;
     if (rc && rc != -ENOENT) return rc;
-    String common, admin;
+    String common;
     const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
     const char *admin_args[] = {"rev-parse", "--absolute-git-dir", nullptr};
-    if ((rc = value(root, common_args, common)) || (rc = value(root, admin_args, admin))) return rc;
+    if ((rc = value(root, common_args, common)) || (rc = value(root, admin_args, out.admin))) return rc;
     if (!out.managed) { if ((rc = object_import_bytes(common.c_str(), out.import_bytes))) return rc; }
-    if (out.managed && (rc = managed_check(root, common.c_str(), admin.c_str()))) return rc;
+    if (module) {
+        // A submodule's repository is copied as one directory; a linked worktree of some other
+        // repository standing in for it is not what Git itself would create there.
+        String real_common, real_admin;
+        if (fs_realpath(common.c_str(), real_common) || fs_realpath(out.admin.c_str(), real_admin) || real_common != real_admin)
+            return refuse(WFS_E_GIT_UNSUPPORTED, "its repository is a linked worktree of another repository");
+    } else if (out.managed && (rc = managed_check(root, common.c_str(), out.admin.c_str()))) {
+        return rc;
+    }
     if ((rc = reject_external_visibility_state(root, out.managed))) return rc;
     if ((rc = capture_refs(root, out.refs))) return rc;
     if ((rc = capture_orig(root, out.orig_present, out.orig_head))) return rc;
@@ -2057,14 +2387,11 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
         if ((rc = capture_rerere(root, out.rerere, out.rerere_present, out.rerere_bytes))) return rc;
         out.import_bytes += out.rerere_bytes;
     }
-    // Sparse/split indexes and gitlinks require a separate import contract.
+    // Unmerged entries are not a baseline; gitlinks are the submodules discover_modules takes.
     const char *ls_args[] = {"ls-files", "--stage", "-z", nullptr};
     Vec<char> listing;
     if ((rc = git(root, ls_args, &listing))) return rc;
     for (size_t i = 0; i + 1 < listing.size();) {
-        const char *entry = listing.data() + i;
-        if (!strncmp(entry, "160000 ", 7))
-            return refuse(WFS_E_GIT_UNSUPPORTED, "submodule (gitlink) %s", strchr(entry, '\t') ? strchr(entry, '\t') + 1 : entry);
         size_t end = i;
         while (end < listing.size() && listing[end]) ++end;
         size_t tab = i;
@@ -2073,13 +2400,426 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
             return -EBUSY;
         i += strlen(listing.data() + i) + 1;
     }
-    if ((rc = reject_reserved_paths(root, out))) return rc;
+    parse_gitlinks(listing, gitlinks);
+    return reject_reserved_paths(root, out);
+}
+// The committed-only hooks check for one repository whose copy is reset to `target`: a relative
+// core.hooksPath (the carried one of an external source, or the managed World's own) must be
+// committed there with nothing pending. require_committed_hooks_path reads HEAD and the
+// worktree, so a submodule reset to a different commit than its HEAD cannot keep one at all.
+int committed_hooks_check(const char *root, const GitRepoState &s, const char *target) {
+    bool present = s.hooks_path_present; String hp = s.hooks_path;
+    if (s.managed) {
+        if (int rc = local_hooks_path(root, present, hp)) return rc;
+        if (int rc = normalize_hooks_path(root, present, hp)) return rc;
+    } else if (!s.with_hooks) {
+        return 0;
+    }
+    if (target && s.head != target && present && !hp.empty() && hp[0] != '/' && hp[0] != '~')
+        return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s is inside the submodule, whose HEAD is not the commit --committed-only resets it to; drop --committed-only", hp.c_str());
+    return require_committed_hooks_path(root, present, hp);
+}
+// The configuration a repository will have in the World, as Git there reads it. An external
+// source's own is what the import carries; a managed World's travels whole with its cloned
+// administration, so it is its local configuration with its includes. The World's Git also
+// reads the shared global and system configuration (command configuration belongs to one
+// invocation, and remote/branch settings given that way are refused by reject_ambient_policy).
+// Git reads system, then global, then the repository's own, and the last value wins, so the
+// shared entries come first; `shared` counts them.
+int world_config(const char *repo_root, const GitRepoState &state, Vec<GitSetting> &carried, size_t &shared) {
+    carried.clear();
+    shared = 0;
+    {
+        const char *list[] = {"config", "--includes", "--null", "--show-scope", "--list", nullptr};
+        Vec<char> all; int status = -1;
+        int rc = git(repo_root, list, &all, &status, false, true);
+        if (rc && !(rc == WFS_E_GIT_FAILED && status == 1)) return rc;
+        // Entries are "<scope>\0<key>\n<value>\0".
+        for (size_t i = 0; !rc && i < all.size() && all[i];) {
+            const char *scope = all.data() + i;
+            i += strlen(scope) + 1;
+            if (i >= all.size()) return WFS_E_GIT_FAILED;
+            const char *entry = all.data() + i;
+            i += strlen(entry) + 1;
+            if (strcmp(scope, "system") && strcmp(scope, "global")) continue;
+            const char *nl = strchr(entry, '\n');
+            carried.emplace_back(GitSetting{String(entry, nl ? (size_t)(nl - entry) : strlen(entry)), String(nl ? nl + 1 : "")});
+            ++shared;
+        }
+    }
+    if (!state.managed) {
+        for (const auto &c : state.carried) carried.emplace_back(c);
+        return 0;
+    }
+    const char *list[] = {"config", "--local", "--includes", "--null", "--list", nullptr};
+    Vec<char> local;
+    if (int rc = git(repo_root, list, &local)) return rc;
+    for (size_t i = 0; i < local.size() && local[i];) {
+        const char *entry = local.data() + i;
+        i += strlen(entry) + 1;
+        const char *nl = strchr(entry, '\n');
+        carried.emplace_back(GitSetting{String(entry, nl ? (size_t)(nl - entry) : strlen(entry)), String(nl ? nl + 1 : "")});
+    }
+    return 0;
+}
+// Every submodule.<name>.url the World's configuration holds -- for a current gitlink or a
+// dormant one another branch uses -- classified as Git in the World sees it: the winning value
+// (the repository's own after the shared ones). A carried value was made absolute by the import
+// (capture_carried_config); a managed World's is copied byte for byte and a shared one is used
+// as it is, so a relative one of either is refused. Every URL then goes through the same
+// conditional-include rewrite guard as carried remote URLs.
+int check_configured_submodule_urls(const char *repo_root, const Vec<GitSetting> &carried, size_t shared) {
+    Vec<UrlRewriteRule> conditional_rules;
+    bool rules_loaded = false;
+    for (size_t i = 0; i < carried.size(); ++i) {
+        const String &key = carried[i].key;
+        size_t n = key.size();
+        if (n < 15 || strncmp(key.c_str(), "submodule.", 10) || strcmp(key.c_str() + n - 4, ".url")) continue;
+        bool later = false;
+        for (size_t j = i + 1; j < carried.size(); ++j) if (carried[j].key == key) later = true;
+        if (later) continue;   // not the winning value
+        const String &url = carried[i].value;
+        if (is_relative_local_url(url.c_str())) {
+            if (i < shared)
+                return refuse(WFS_E_GIT_POLICY,
+                    "%s is the relative path %s in global or system configuration, which Git resolves "
+                    "from the worktree and so differently in the World; make it absolute", key.c_str(), url.c_str());
+            return refuse(WFS_E_GIT_POLICY,
+                "the World's %s is the relative path %s, which a copy of the World would resolve from its "
+                "own location; make it absolute (git submodule init and the import write absolute URLs)",
+                key.c_str(), url.c_str());
+        }
+        if (!rules_loaded) {
+            if (int rc = scan_conditional_includes(repo_root, nullptr, &conditional_rules)) return rc;
+            rules_loaded = true;
+        }
+        const UrlRewriteRule *r = matching_rewrite(conditional_rules, url.c_str());
+        if (r)
+            return refuse(WFS_E_GIT_POLICY,
+                "%s %s matches url.%s.%s, which a conditional include can change at the World's location; "
+                "simplify the URL rewrite rules before importing",
+                key.c_str(), url.c_str(), r->base.c_str(), r->push ? "pushInsteadOf" : "insteadOf");
+    }
+    return 0;
+}
+// Submodules are at most this many levels deep below the root.
+constexpr int kMaxModuleDepth = 8;
+// Every initialized submodule of the repository at `repo_root` (the root, or a submodule found
+// before it), recursively, appended to `top.modules` parents first. `prefix` is repo_root's path
+// in the tree and `gitdir_prefix` its repository below the root's administration ("" for the
+// root). An uninitialized submodule -- a gitlink whose directory has no `.git` -- stays as the
+// source has it: its gitlink and directory, and the superproject's submodule.<name>.* settings.
+// `tree`, for --committed-only, is the commit this repository's copy is reset to: each
+// submodule is then reset to the commit that tree records for it.
+int discover_modules(GitSource &top, const char *repo_root, const String &prefix, const String &gitdir_prefix,
+                     const Vec<Gitlink> &gitlinks, const char *tree, int depth, size_t self) {
+    if (gitlinks.empty()) return 0;
+    GitRepoState &state = self == (size_t)-1 ? top : top.modules[self].repo;
+    // Copied: `state` may move once submodules are appended below.
+    Vec<GitSetting> carried;
+    size_t shared = 0;
+    if (int rc = world_config(repo_root, state, carried, shared)) return rc;
+    Vec<char> listing, tree_listing;
+    if (int rc = gitmodules_listing(repo_root, nullptr, listing)) return rc;
+    Vec<GitSetting> names, tree_names;
+    module_names(listing, names);
+    Vec<Gitlink> tree_links;
+    if (tree) {
+        // Resetting the copy to `tree` would turn a submodule the index adds into a nested
+        // repository, and leave a removed one's gitlink behind: the submodule set must be
+        // committed as it is.
+        if (int rc = tree_gitlinks(repo_root, tree, tree_links)) return rc;
+        bool same = tree_links.size() == gitlinks.size();
+        for (size_t i = 0; same && i < gitlinks.size(); ++i) same = find_link(tree_links, gitlinks[i].path.c_str()) != nullptr;
+        if (!same)
+            return refuse(WFS_E_GIT_UNSUPPORTED, "a submodule is added or removed without being committed, which --committed-only cannot reset; commit it or drop --committed-only");
+        if (int rc = gitmodules_listing(repo_root, tree, tree_listing)) return rc;
+        module_names(tree_listing, tree_names);
+    }
+    // The .gitmodules the copy will publish -- the worktree's, or with --committed-only the
+    // committed one -- is the one source of truth for every check below (names, collisions,
+    // relative URLs) and for the owned repositories' names, and is rechecked as a whole against
+    // the copy before publication (same_gitmodules). The worktree's is consulted only to
+    // require that an initialized submodule's source repository sits under that same name.
+    const Vec<char> &published = tree ? tree_listing : listing;
+    const Vec<GitSetting> &published_names = tree ? tree_names : names;
+    state.gitmodules = published;
+    state.gitmodules_checked = true;
+    // A "./" or "../" URL that only .gitmodules gives (no submodule.<name>.url in the
+    // configuration: an uninitialized submodule, typically) is resolved by `git submodule init`
+    // against the URL of the repository's default remote, and against the repository's own
+    // directory when that remote has no URL. Observed with Git 2.54: the default remote is
+    // branch.<current>.remote when HEAD is on a branch that has one (even when origin also
+    // exists, and even when that remote is not configured -- then the directory is the base);
+    // otherwise, detached or on a branch without one, it is the only remote when exactly one is
+    // configured, and `origin` otherwise. It is decided here for HEAD as it will be in the
+    // World: the root's generated world/W<n> branch has no upstream -- also when the source is
+    // itself a World, whose own branch every fork (and every fork of its checkpoints, pooled or
+    // not) replaces in git_branch -- and a submodule keeps its source branch unless
+    // --committed-only detaches it. Accepted only when that remote's URL travels with the World;
+    // the World's own directory is never the source's.
+    {
+        String branch;
+        if (self != (size_t)-1) {
+            const GitModule &me = top.modules[self];
+            bool detached = me.repo.head_ref.empty() || (tree && me.target != me.repo.head);
+            if (!detached && !strncmp(me.repo.head_ref.c_str(), "refs/heads/", 11)) branch.assign(me.repo.head_ref.c_str() + 11);
+        }
+        // branch.<b>.remote is the selected remote as soon as it is set, even to an empty value
+        // (Git then finds no remote..url and uses the repository's directory); the last value
+        // wins. pushRemote and remote.pushDefault play no part (observed).
+        String remote;
+        bool branch_remote = false;
+        if (!branch.empty()) {
+            String key("branch."); key.append(branch.c_str()); key.append(".remote");
+            for (const auto &c : carried) if (c.key == key) { remote = c.value; branch_remote = true; }
+        }
+        if (!branch_remote) {
+            Vec<String> remotes;
+            for (const auto &c : carried) {
+                if (strncmp(c.key.c_str(), "remote.", 7)) continue;
+                const char *dot = strrchr(c.key.c_str() + 7, '.');
+                if (!dot) continue;   // remote.pushDefault
+                String name(c.key.c_str() + 7, (size_t)(dot - c.key.c_str() - 7));
+                bool seen = false;
+                for (const auto &r : remotes) if (r == name) seen = true;
+                if (!seen) remotes.emplace_back(name);
+            }
+            remote.assign(remotes.size() == 1 ? remotes[0].c_str() : "origin");
+        }
+        // The base is the remote's last `url` (observed with several); a remote with only a
+        // pushurl has none.
+        String remote_url("remote."); remote_url.append(remote.c_str()); remote_url.append(".url");
+        const String *base = nullptr;
+        bool shared_base = false;
+        for (size_t i = 0; i < carried.size(); ++i)
+            if (carried[i].key == remote_url) { base = &carried[i].value; shared_base = i < shared; }
+        // Rewrite rules from conditional includes, active here or not: loaded only when a URL
+        // that only .gitmodules gives is checked against them.
+        Vec<UrlRewriteRule> conditional_rules;
+        bool rules_loaded = false;
+        // Each submodule's effective URL, classified once, as Git in the World will see it: the
+        // winning submodule.<name>.url of the shared and the carried configuration (last wins, the
+        // repository's own after the shared), else the .gitmodules URL by the default-remote rule.
+        for (const auto &link : gitlinks) {
+            const String *name = module_name(published_names, link.path);
+            if (!name) continue;
+            String path(prefix); path.append(link.path.c_str());
+            String key("submodule."); key.append(name->c_str()); key.append(".url");
+            const GitSetting *configured = nullptr;
+            for (size_t i = 0; i < carried.size(); ++i)
+                if (carried[i].key == key) configured = &carried[i];
+            const char *url = configured ? nullptr : gitmodules_value(published, *name, "url");
+            String effective;
+            if (configured) {
+                continue;   // classified with the configuration (check_configured_submodule_urls)
+            } else if (!url) {
+                continue;
+            } else if (!strncmp(url, "./", 2) || !strncmp(url, "../", 3)) {
+                if (!base)
+                    return refuse(WFS_E_GIT_POLICY,
+                        "submodule %s: its .gitmodules url %s is relative and the repository's default remote "
+                        "(%s%s) has no URL the World carries, so it would resolve against the World's location; "
+                        "set submodule.%s.url or add the remote before importing", path.c_str(), url,
+                        remote.empty() ? "an empty branch." : remote.c_str(), remote.empty() ? "<name>.remote" : "",
+                        name->c_str());
+                // A shared URL is the same everywhere, but a relative one is resolved from
+                // wherever the repository is.
+                if (shared_base && is_relative_local_url(base->c_str()))
+                    return refuse(WFS_E_GIT_POLICY,
+                        "submodule %s: its .gitmodules url %s resolves against %s in global or system "
+                        "configuration, which is the relative path %s and resolves differently in the World; "
+                        "make it absolute", path.c_str(), url, remote_url.c_str(), base->c_str());
+                if (!resolve_submodule_url(*base, url, effective))
+                    return refuse(WFS_E_GIT_POLICY,
+                        "submodule %s: its .gitmodules url %s cannot be resolved against %s the way Git would "
+                        "be reproduced faithfully; set submodule.%s.url before importing", path.c_str(), url,
+                        base->c_str(), name->c_str());
+            } else if (url[0] == '/' || (url[0] != '~' && !is_relative_local_url(url))) {
+                effective.assign(url);
+            } else {
+                // Any other path (`sub.git`, `..`, `~/x.git`) is cloned as it is, from the worktree
+                // top (observed): a different place in the World.
+                return refuse(WFS_E_GIT_POLICY,
+                    "submodule %s: its .gitmodules url %s is a path Git takes relative to the worktree, "
+                    "which differs in the World; set submodule.%s.url before importing", path.c_str(), url, name->c_str());
+            }
+            // The same guard as for carried remote URLs (capture_carried_config): a rule a
+            // conditional include holds could rewrite the URL differently at the World.
+            if (!rules_loaded) {
+                if (int rc = scan_conditional_includes(repo_root, nullptr, &conditional_rules)) return rc;
+                rules_loaded = true;
+            }
+            const UrlRewriteRule *r = matching_rewrite(conditional_rules, effective.c_str());
+            if (r)
+                return refuse(WFS_E_GIT_POLICY,
+                    "submodule %s: its url resolves to %s, which url.%s.%s from a conditional "
+                    "include can change at the World's location; simplify the URL rewrite rules before importing",
+                    path.c_str(), effective.c_str(), r->base.c_str(), r->push ? "pushInsteadOf" : "insteadOf");
+        }
+    }
+    String modules_dir;
+    const char *modules_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "modules", nullptr};
+    if (int rc = value(repo_root, modules_args, modules_dir)) return rc;
+    // Every gitlink's name, initialized or not, is a directory below this repository's modules/:
+    // initializing one later puts its repository there, so a name that escapes it or lands in
+    // (or over) another's is refused now. A gitlink with no .gitmodules entry at all is Git's
+    // ordinary "embedded" gitlink; left uninitialized, there is nothing to import for it.
+    Vec<String> sibling_names;
+    for (const auto &link : gitlinks) {
+        const String *name = module_name(published_names, link.path);
+        if (!name) continue;
+        String path(prefix); path.append(link.path.c_str());
+        if (!valid_module_name(*name)) return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s has an unsafe name (%s)", path.c_str(), name->c_str());
+        for (const auto &other : sibling_names) {
+            size_t n = other.size() < name->size() ? other.size() : name->size();
+            if (ascii_caseeq(other.c_str(), name->c_str(), n) &&
+                (other.size() == name->size() || (other.size() > n ? other[n] : (*name)[n]) == '/'))
+                return refuse(WFS_E_GIT_UNSUPPORTED, "submodule names %s and %s share a repository directory", other.c_str(), name->c_str());
+        }
+        sibling_names.emplace_back(*name);
+    }
+    for (const auto &link : gitlinks) {
+        String path(prefix); path.append(link.path.c_str());
+        String full = joinp(repo_root, link.path.c_str());
+        // Git never checks a submodule out through a symlink; neither is anything else here.
+        bool present = true;
+        {
+            String walk(repo_root);
+            for (const char *p = link.path.c_str(); *p && present;) {
+                const char *start = p;
+                while (*p && *p != '/') ++p;
+                walk = joinp(walk.c_str(), String(start, (size_t)(p - start)).c_str());
+                if (*p) ++p;
+                struct stat st;
+                if (lstat(walk.c_str(), &st)) {
+                    if (errno != ENOENT) return -errno;
+                    present = false;
+                } else if (!S_ISDIR(st.st_mode)) {
+                    return refuse(WFS_E_GIT_UNSUPPORTED, "submodule path %s is not a directory (%s)", path.c_str(), walk.c_str());
+                }
+            }
+        }
+        if (!present) continue;   // a deleted submodule directory: status reports it like any deletion
+        String dot = joinp(full.c_str(), ".git");
+        struct stat st;
+        if (lstat(dot.c_str(), &st)) {
+            if (errno != ENOENT) return -errno;
+            continue;   // uninitialized
+        }
+        if (depth >= kMaxModuleDepth)
+            return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s is nested more than %d levels deep", path.c_str(), kMaxModuleDepth);
+        const String *name = module_name(published_names, link.path);
+        if (!name) return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s has no entry in the .gitmodules that would be published (the file is missing or does not name it)", path.c_str());
+        if (tree) {
+            const String *current = module_name(names, link.path);
+            if (!current || *current != *name)
+                return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s is named differently in the uncommitted .gitmodules, which --committed-only would reset; commit it or drop --committed-only", path.c_str());
+        }
+        bool gitfile = S_ISREG(st.st_mode);
+        if (!gitfile && !S_ISDIR(st.st_mode))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s has a .git that is neither a directory nor a file", path.c_str());
+        if (!gitfile && top.managed)
+            return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s keeps its repository in its own .git directory instead of the World's administration", path.c_str());
+        // Resolve the repository with Git, never by reading the pointer: it must be exactly the
+        // submodule's own -- its .git directory, or the superproject's modules/<name> -- and
+        // its worktree must be this directory.
+        String sub_top, admin, real_full, real_top, real_admin, expected, real_expected;
+        const char *top_args[] = {"rev-parse", "--show-toplevel", nullptr};
+        const char *admin_args[] = {"rev-parse", "--absolute-git-dir", nullptr};
+        if (value(full.c_str(), top_args, sub_top) || fs_realpath(full.c_str(), real_full) ||
+            fs_realpath(sub_top.c_str(), real_top) || real_full != real_top)
+            return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s does not hold its own repository's worktree", path.c_str());
+        if (int rc = value(full.c_str(), admin_args, admin)) return rc;
+        expected = gitfile ? joinp(modules_dir.c_str(), name->c_str()) : dot;
+        if (fs_realpath(admin.c_str(), real_admin) || fs_realpath(expected.c_str(), real_expected) || real_admin != real_expected)
+            return refuse(WFS_E_GIT_UNSUPPORTED, "the .git of submodule %s points outside its superproject's modules/%s", path.c_str(), name->c_str());
+        GitModule m;
+        m.path = path;
+        m.name = *name;
+        m.gitdir = gitdir_prefix; m.gitdir.append("modules/"); m.gitdir.append(name->c_str());
+        if (top.managed) {
+            if (int rc = check_owned_module(top.root.c_str(), m.path, m.gitdir)) return rc;
+        }
+        m.repo.managed = top.managed;
+        Vec<Gitlink> sub_links;
+        if (int rc = capture_repo(full.c_str(), m.repo, top.with_hooks, true, sub_links)) return in_module(rc, path);
+        {
+            Vec<GitSetting> config; size_t shared = 0;
+            if (int rc = world_config(full.c_str(), m.repo, config, shared)) return rc;
+            if (int rc = check_configured_submodule_urls(full.c_str(), config, shared)) return in_module(rc, path);
+        }
+        if (int rc = nested_check(full.c_str(), &sub_links, false)) return in_module(rc, path);
+        if (tree) {
+            const Gitlink *recorded = find_link(tree_links, link.path.c_str());
+            m.target = recorded->oid;
+            String spec(m.target); spec.append("^{commit}");
+            const char *exists[] = {"cat-file", "-e", spec.c_str(), nullptr};
+            if (git(full.c_str(), exists, nullptr, nullptr, true))
+                return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s: commit %s, which the committed superproject records, is not in its repository", path.c_str(), m.target.c_str());
+            if (int rc = committed_hooks_check(full.c_str(), m.repo, m.target.c_str())) return in_module(rc, path);
+        } else if (top.require_clean && m.repo.head != link.oid) {
+            return WFS_E_GIT_DIRTY;   // HEAD moved away from the recorded commit
+        }
+        top.modules_bytes += m.repo.import_bytes;
+        top.modules.emplace_back(m);
+        String child_prefix(path); child_prefix.push_back('/');
+        String child_gitdir(m.gitdir); child_gitdir.push_back('/');
+        if (int rc = discover_modules(top, full.c_str(), child_prefix, child_gitdir, sub_links,
+                                      tree ? m.target.c_str() : nullptr, depth + 1, top.modules.size() - 1)) return rc;
+    }
+    return 0;
+}
+int git_source(const char *root, bool include_changes, GitSource &out, bool committed_only, bool with_hooks) {
+    g_reason[0] = '\0';
+    if (include_changes && committed_only) return -EINVAL;
+    String dot = joinp(root, ".git"), managed = joinp(root, ".world-git");
+    struct stat st;
+    bool has_managed = lstat(managed.c_str(), &st) == 0;
+    if (!has_managed && errno != ENOENT) return -errno;
+    if (lstat(dot.c_str(), &st)) {
+        if (errno == ENOENT && !has_managed) {
+            if (int rc = nested_check(root, nullptr, true)) return rc;
+            if (committed_only) return refuse(WFS_E_GIT_UNSUPPORTED, "--committed-only needs a Git repository at the source root");
+            if (with_hooks) return refuse(WFS_E_GIT_UNSUPPORTED, "--with-hooks needs a Git repository at the source root");
+            return 0;
+        }
+        return refuse(WFS_E_GIT_UNSUPPORTED, ".world-git exists without its .git marker");
+    }
+    if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) return refuse(WFS_E_GIT_UNSUPPORTED, ".git is neither a directory nor a file");
+    out.present = true;
+    if (has_managed) {
+        Vec<char> contents;
+        if (int rc = read_bytes(dot.c_str(), contents)) return rc;
+        if (contents.size() != strlen(marker) || memcmp(contents.data(), marker, contents.size()))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "the .git file is not the WorldFS marker");
+        out.managed = true;
+    }
+    Vec<Gitlink> gitlinks;
+    if (int rc = capture_repo(root, out, with_hooks, false, gitlinks)) return rc;
+    {
+        Vec<GitSetting> config; size_t shared = 0;
+        if (int rc = world_config(root, out, config, shared)) return rc;
+        if (int rc = check_configured_submodule_urls(root, config, shared)) return rc;
+    }
+    // A managed World carries its hooks and core.hooksPath with its .world-git, so the same
+    // committed-path check applies to it whether or not --with-hooks was given.
+    if (committed_only) {
+        if (int rc = committed_hooks_check(root, out, nullptr)) return rc;
+    }
+    if (int rc = nested_check(root, &gitlinks, true)) return rc;
+    out.has_gitlinks = !gitlinks.empty();
     // With --committed-only the copy is reset to HEAD and must then be clean; the source's own
     // uncommitted state is simply not carried, so it is not a reason to refuse.
     out.require_clean = !include_changes;
     out.committed_only = committed_only;
+    if (int rc = discover_modules(out, root, String(), String(), gitlinks, committed_only ? out.head.c_str() : nullptr, 0, (size_t)-1))
+        return rc;
     if (!include_changes && !committed_only) {
-        if ((rc = require_clean_tree(root))) return rc;
+        // Every repository's policy checks have run by now, so no status below runs a filter.
+        if (int rc = require_clean_tree(root)) return rc;
+        for (const auto &m : out.modules)
+            if (int rc = require_clean_tree(m.repo.root.c_str())) return rc;
     }
     return 0;
 }
@@ -2149,56 +2889,194 @@ int pin_identity(const char *source, const char *clone) {
     }
     return 0;
 }
-int git_import(const GitSource &s, const char *clone) {
-    if (!s.present) return 0;
-    if (int rc = source_unchanged(s)) return rc;
-    if (s.managed) {
-        // Detect a copied HEAD/index from a different moment, even when the source looks
-        // unchanged again by the time cloning finishes.
-        GitSource copy;
-        if (int rc = git_source(clone, true, copy)) return rc;
-        if (copy.head != s.head || copy.index.size() != s.index.size() ||
-            (!copy.index.empty() && memcmp(copy.index.data(), s.index.data(), s.index.size())) ||
-            !same_bytes(copy.exclude, s.exclude) ||
-            !same_bytes(copy.attributes, s.attributes) ||
-            copy.fetch_present != s.fetch_present || !same_bytes(copy.fetch, s.fetch) ||
-            copy.squash_present != s.squash_present || !same_bytes(copy.squash, s.squash) ||
-            copy.sparse_present != s.sparse_present || !same_bytes(copy.sparse, s.sparse) ||
-            !same_symrefs(copy.symrefs, s.symrefs) || !same_settings(copy.settings, s.settings) ||
-            // A relative include can resolve differently from the copy's location.
-            !same_settings(copy.identity, s.identity) || !same_bytes(copy.effective_config, s.effective_config) ||
-            copy.worktree_config != s.worktree_config || !same_settings(copy.worktree_settings, s.worktree_settings)) return -EBUSY;
-        if (!same_bytes(copy.refs, s.refs) ||
-            copy.orig_present != s.orig_present || copy.orig_head != s.orig_head) return -EBUSY;
-        if (int rc = reject_copied_locks(clone)) return rc;
-        if (int rc = pin_identity(s.root.c_str(), clone)) return rc;
-        if (s.committed_only) {
-            if (int rc = reset_to_head(clone)) return rc;
-        }
-        // HEAD and the index do not change when a tracked file is edited after the source's
-        // clean check, so check the copy that will actually be published. Re-probe the copy's
-        // own ambient policy and filters first: GIT_CONFIG_GLOBAL/SYSTEM and other per-directory
-        // configuration can resolve differently beside the copy than beside the source, and the
-        // clean check below would otherwise run a filter the source-side probe never saw.
-        if (!s.require_clean) return 0;
-        if (int rc = reject_ambient_policy(clone)) return rc;
-        if (int rc = reject_used_filters(clone)) return rc;
-        return require_clean_tree(clone);
+// What a managed copy must reproduce of its source exactly (git_import).
+bool same_capture(const GitRepoState &copy, const GitRepoState &s) {
+    return copy.head == s.head && copy.head_ref == s.head_ref && same_bytes(copy.index, s.index) &&
+        same_bytes(copy.exclude, s.exclude) && same_bytes(copy.attributes, s.attributes) &&
+        copy.fetch_present == s.fetch_present && same_bytes(copy.fetch, s.fetch) &&
+        copy.squash_present == s.squash_present && same_bytes(copy.squash, s.squash) &&
+        copy.sparse_present == s.sparse_present && same_bytes(copy.sparse, s.sparse) &&
+        same_symrefs(copy.symrefs, s.symrefs) && same_settings(copy.settings, s.settings) &&
+        // A relative include can resolve differently from the copy's location.
+        same_settings(copy.identity, s.identity) && same_bytes(copy.effective_config, s.effective_config) &&
+        copy.worktree_config == s.worktree_config && same_settings(copy.worktree_settings, s.worktree_settings) &&
+        same_bytes(copy.refs, s.refs) && copy.orig_present == s.orig_present && copy.orig_head == s.orig_head;
+}
+// A managed copy's submodules must be exactly its source's, in the same place, with the same state.
+bool same_modules(const GitSource &copy, const GitSource &s) {
+    if (copy.modules.size() != s.modules.size()) return false;
+    for (size_t i = 0; i < s.modules.size(); ++i) {
+        const GitModule &a = copy.modules[i], &b = s.modules[i];
+        if (a.path != b.path || a.name != b.name || a.gitdir != b.gitdir || !same_capture(a.repo, b.repo)) return false;
     }
+    return true;
+}
+// After an external import: the copy's repositories -- the root and each imported submodule --
+// hold a `.git` below their top exactly at the submodules that were imported, and nowhere else.
+// A submodule initialized in the source after it was captured was cloned with a `.git` that
+// still leads back into the source's administration; it is caught here instead of published.
+int copy_layout_check(const GitSource &s, const char *clone) {
+    for (size_t i = 0; i <= s.modules.size(); ++i) {
+        String prefix = i ? s.modules[i - 1].path : String();
+        String dir = i ? joinp(clone, prefix.c_str()) : String(clone);
+        if (i) prefix.push_back('/');
+        const char *ls_args[] = {"ls-files", "--stage", "-z", nullptr};
+        Vec<char> listing;
+        if (int rc = git(dir.c_str(), ls_args, &listing)) return rc;
+        Vec<Gitlink> links;
+        parse_gitlinks(listing, links);
+        for (const auto &link : links) {
+            String path(prefix); path.append(link.path.c_str());
+            String dot = joinp(clone, path.c_str()); dot = joinp(dot.c_str(), ".git");
+            struct stat st;
+            bool initialized = !lstat(dot.c_str(), &st);
+            if (!initialized && errno != ENOENT) return -errno;
+            bool imported = false;
+            for (const auto &m : s.modules) if (m.path == path) { imported = true; break; }
+            if (initialized != imported) return -EBUSY;
+        }
+        if (int rc = nested_check(dir.c_str(), &links, i == 0)) return rc;
+    }
+    return 0;
+}
+// The copy's .gitmodules -- the bytes that will be published, after any --committed-only
+// reset -- must give every repository with gitlinks exactly the settings the import was built
+// from: an owned repository sits under the name its .gitmodules had at capture time.
+int same_gitmodules(const GitSource &s, const char *clone) {
+    for (size_t i = 0; i <= s.modules.size(); ++i) {
+        const GitRepoState &state = i ? s.modules[i - 1].repo : s;
+        if (!state.gitmodules_checked) continue;
+        String dir = i ? joinp(clone, s.modules[i - 1].path.c_str()) : String(clone);
+        Vec<char> listing;
+        if (int rc = gitmodules_listing(dir.c_str(), nullptr, listing)) return rc;
+        if (!same_bytes(listing, state.gitmodules)) return -EBUSY;
+    }
+    return 0;
+}
+int sources_unchanged(const GitSource &s) {
+    if (int rc = source_unchanged(s)) return rc;
+    for (const auto &m : s.modules)
+        if (int rc = source_unchanged(m.repo)) return in_module(rc, m.path);
+    return 0;
+}
+// The state every owned repository -- the root's or a submodule's -- carries over from its
+// source once its mirror exists: index, local rules, rerere cache, status settings and identity,
+// worktree-scoped settings, pending SQUASH_MSG, FETCH_HEAD, ORIG_HEAD, carried configuration and
+// hooks. `worktree` is the repository's worktree in the copy, whose Git commands reach `repo`.
+int restore_state(const GitRepoState &s, const char *worktree, const char *repo, const char *index, bool root) {
+    if (!s.index.empty()) {
+        if (int rc = write_bytes(index, s.index.data(), s.index.size())) return rc;
+    } else {
+        // No index means all tracked files were removed from it; do not recreate HEAD's index.
+        const char *empty[] = {"read-tree", "--empty", nullptr};
+        if (int rc = git(worktree, empty)) return rc;
+    }
+    Vec<char> excludes;
+    for (char c : s.exclude) excludes.emplace_back(c);
+    if (root) {
+        if (!excludes.empty() && excludes.back() != '\n') excludes.emplace_back('\n');
+        for (const char *reserved : {"/.world\n", "/.world-git/\n"})
+            for (const char *p = reserved; *p; ++p) excludes.emplace_back(*p);
+    }
+    // Empty templates omit info/. Create only the directory needed for owned rules.
+    String info = joinp(repo, "info");
+    if (int rc = fs_mkdir(info.c_str(), 0700)) { if (rc != -EEXIST) return rc; }
+    if (!excludes.empty()) {
+        String exclude_path = joinp(repo, "info/exclude");
+        if (int rc = write_bytes(exclude_path.c_str(), excludes.data(), excludes.size())) return rc;
+    }
+    if (!s.attributes.empty()) {
+        String attributes_path = joinp(repo, "info/attributes");
+        if (int rc = write_bytes(attributes_path.c_str(), s.attributes.data(), s.attributes.size())) return rc;
+    }
+    if (s.rerere_present) {
+        if (int rc = restore_rerere(repo, s.rerere)) return rc;
+    }
+    if (root) {
+        if (int rc = config(worktree, "worldfs.baseline", s.head.c_str())) return rc;
+        if (int rc = config(worktree, "worldfs.formatVersion", "1")) return rc;
+    }
+    for (const auto &id : s.identity)
+        if (int rc = config(worktree, id.key.c_str(), id.value.c_str())) return rc;
+    for (const char *key : {"core.autocrlf", "core.safecrlf", "core.eol", "core.checkstat", "core.checkRoundtripEncoding",
+                            "core.filemode", "core.symlinks", "core.ignorecase", "core.precomposeunicode", "core.trustctime", "core.ignorestat",
+                            "core.useReplaceRefs"})
+        if (int rc = unset_config(worktree, key)) return rc;
+    for (const auto &setting : s.settings)
+        if (int rc = config(worktree, setting.key.c_str(), setting.value.c_str())) return rc;
+    if (s.worktree_config) {
+        if (int rc = config(worktree, "extensions.worktreeConfig", "true")) return rc;
+        if (root) {
+            // With worktreeConfig on, core.bare must live in the main worktree's config.worktree
+            // (git-worktree(1)); left in the common config it would make the owned linked
+            // worktree bare too. The owned repository's main worktree is the bare mirror itself.
+            const char *bare[] = {"--git-dir", repo, "config", "--worktree", "core.bare", "true", nullptr};
+            if (int rc = git(worktree, bare)) return rc;
+            if (int rc = unset_config(worktree, "core.bare")) return rc;
+        }
+        for (const auto &setting : s.worktree_settings) {
+            const char *args[] = {"config", "--worktree", setting.key.c_str(), setting.value.c_str(), nullptr};
+            if (int rc = git(worktree, args)) return rc;
+        }
+    }
+    if (s.sparse_present) {
+        const char *args[] = {"rev-parse", "--path-format=absolute", "--git-path", "info/sparse-checkout", nullptr};
+        String dest_sparse;
+        if (int rc = value(worktree, args, dest_sparse)) return rc;
+        String dest_info(dest_sparse.c_str(), dest_sparse.size() - strlen("/sparse-checkout"));
+        if (int rc = fs_mkdir(dest_info.c_str(), 0700)) { if (rc != -EEXIST) return rc; }
+        if (int rc = write_bytes(dest_sparse.c_str(), s.sparse.data(), s.sparse.size())) return rc;
+    }
+    if (s.squash_present) {
+        const char *args[] = {"rev-parse", "--path-format=absolute", "--git-path", "SQUASH_MSG", nullptr};
+        String dest_squash;
+        if (int rc = value(worktree, args, dest_squash)) return rc;
+        if (int rc = write_bytes(dest_squash.c_str(), s.squash.data(), s.squash.size())) return rc;
+    }
+    if (s.fetch_present) {
+        const char *args[] = {"rev-parse", "--path-format=absolute", "--git-path", "FETCH_HEAD", nullptr};
+        String dest_fetch;
+        if (int rc = value(worktree, args, dest_fetch)) return rc;
+        if (int rc = write_bytes(dest_fetch.c_str(), s.fetch.data(), s.fetch.size())) return rc;
+    }
+    if (s.orig_present) {
+        const char *orig_args[] = {"update-ref", "ORIG_HEAD", s.orig_head.c_str(), nullptr};
+        if (int rc = git(worktree, orig_args)) return rc;
+    }
+    // The mirror's own remote points at the source: it is not an implicit write-back channel and
+    // is removed. The source's own remotes, upstreams and aliases are carried instead.
+    const char *remote[] = {"config", "--local", "--remove-section", "remote.origin", nullptr};
+    if (int rc = git(worktree, remote)) return rc;
+    for (const auto &setting : s.carried) {
+        const char *args[] = {"config", "--local", "--add", setting.key.c_str(), setting.value.c_str(), nullptr};
+        if (int rc = git(worktree, args)) return rc;
+    }
+    // Installed, never run: every command here passes core.hooksPath=/dev/null.
+    if (s.with_hooks) {
+        if (int rc = install_hooks(s, worktree, repo)) return rc;
+    }
+    Vec<char> imported_refs;
+    if (int rc = capture_refs(worktree, imported_refs)) return rc;
+    return same_bytes(imported_refs, s.refs) ? 0 : -EBUSY;
+}
+// Mirror all resolvable refs, including stash, notes, remote-tracking and custom refs; a bare
+// clone omits other ref namespaces and would lose them when the source is removed. clone
+// --local copies loose objects too, including blobs referenced only by the index;
+// --no-hardlinks prevents subsequent Git operations changing the source's object files.
+int mirror(const GitRepoState &s, const char *cwd, const char *from, const char *repo) {
+    const char *copy[] = {"clone", "--mirror", "--no-hardlinks", "--template=", "--quiet", "--", from, repo, nullptr};
+    if (int rc = git(cwd, copy)) return rc;
+    for (const auto &ref : s.symrefs) {
+        const char *sym_args[] = {"--git-dir", repo, "symbolic-ref", ref.name.c_str(), ref.target.c_str(), nullptr};
+        if (int rc = git(cwd, sym_args)) return rc;
+    }
+    return 0;
+}
+int import_root(const GitSource &s, const char *clone) {
     String owned = joinp(clone, ".world-git");
     if (int rc = fs_mkdir(owned.c_str(), 0700)) return rc;
     String repo = joinp(owned.c_str(), "repo.git");
-    // Mirror all resolvable refs, including stash, notes, remote-tracking and custom refs; a
-    // bare clone omits other ref namespaces and would lose them when the source is removed.
-    const char *copy[] = {"clone", "--mirror", "--no-hardlinks", "--template=", "--quiet", "--", s.root.c_str(), repo.c_str(), nullptr};
-    if (int rc = git(clone, copy)) return rc;
-    for (const auto &ref : s.symrefs) {
-        const char *sym_args[] = {"--git-dir", repo.c_str(), "symbolic-ref", ref.name.c_str(),
-                                  ref.target.c_str(), nullptr};
-        if (int rc = git(clone, sym_args)) return rc;
-    }
-    // clone --local copies loose objects too, including blobs referenced only by the index;
-    // --no-hardlinks prevents subsequent Git operations changing the source's object files.
+    if (int rc = mirror(s, clone, s.root.c_str(), repo.c_str())) return rc;
     String active = joinp(owned.c_str(), "active");
     const char *add[] = {"--git-dir", repo.c_str(), "worktree", "add", "--relative-paths", "--no-checkout",
         "--detach", "--quiet", "--", active.c_str(), s.head.c_str(), nullptr};
@@ -2212,108 +3090,132 @@ int git_import(const GitSource &s, const char *clone) {
     String old_dot = joinp(active.c_str(), ".git");
     if (unlink(old_dot.c_str()) || rmdir(active.c_str())) return -errno;
     String index = joinp(repo.c_str(), "worktrees/active/index");
-    if (!s.index.empty()) {
-        if (int rc = write_bytes(index.c_str(), s.index.data(), s.index.size())) return rc;
-    } else {
-        // No index means all tracked files were removed from it; do not recreate HEAD's index.
-        const char *empty[] = {"read-tree", "--empty", nullptr};
-        if (int rc = git(clone, empty)) return rc;
+    return restore_state(s, clone, repo.c_str(), index.c_str(), true);
+}
+// A submodule's repository goes where Git itself looks for it -- modules/<name> of its
+// superproject's Git directory, below the root's per-worktree one -- as a non-bare repository
+// whose core.worktree and the worktree's `.git` file point at each other relatively. The copied
+// `.git` (an old-style repository, or a gitfile into the source's administration) is removed
+// first, so no command below can reach the source through it.
+int import_module(const GitModule &m, const char *clone) {
+    const GitRepoState &s = m.repo;
+    String worktree = joinp(clone, m.path.c_str());
+    String admin(kActive); admin.push_back('/'); admin.append(m.gitdir.c_str());
+    String repo = joinp(clone, admin.c_str());
+    String dot = joinp(worktree.c_str(), ".git");
+    if (int rc = fs_remove_tree(dot.c_str())) return rc;
+    if (int rc = mirror(s, clone, s.admin.c_str(), repo.c_str())) return rc;
+    String link = module_worktree(m.path, m.gitdir);
+    const char *bare[] = {"--git-dir", repo.c_str(), "config", "core.bare", "false", nullptr};
+    const char *wt[] = {"--git-dir", repo.c_str(), "config", "core.worktree", link.c_str(), nullptr};
+    if (int rc = git(clone, bare)) return rc;
+    if (int rc = git(clone, wt)) return rc;
+    // HEAD as the source had it: on its branch, or detached.
+    const char *on_branch[] = {"--git-dir", repo.c_str(), "symbolic-ref", "HEAD", s.head_ref.c_str(), nullptr};
+    const char *detached[] = {"--git-dir", repo.c_str(), "update-ref", "--no-deref", "HEAD", s.head.c_str(), nullptr};
+    if (int rc = git(clone, s.head_ref.empty() ? detached : on_branch)) return rc;
+    String gitfile = module_gitfile(m.path, m.gitdir);
+    if (int rc = write_bytes(dot.c_str(), gitfile.c_str(), gitfile.size())) return rc;
+    String top, real_top, real_worktree;
+    const char *top_args[] = {"rev-parse", "--show-toplevel", nullptr};
+    if (int rc = value(worktree.c_str(), top_args, top)) return rc;
+    if (fs_realpath(top.c_str(), real_top) || fs_realpath(worktree.c_str(), real_worktree) || real_top != real_worktree)
+        return refuse(WFS_E_GIT_UNSUPPORTED, "its owned repository does not resolve to its worktree");
+    String index = joinp(repo.c_str(), "index");
+    return restore_state(s, worktree.c_str(), repo.c_str(), index.c_str(), false);
+}
+// --committed-only: the root to HEAD, then each submodule, parents first, to the commit its
+// superproject's committed tree records.
+int reset_copy(const GitSource &s, const char *clone) {
+    if (int rc = reset_to_head(clone)) return rc;
+    for (const auto &m : s.modules) {
+        String path = joinp(clone, m.path.c_str());
+        if (int rc = reset_to_head(path.c_str(), m.target.c_str())) return in_module(rc, m.path);
     }
-    Vec<char> excludes;
-    for (char c : s.exclude) excludes.emplace_back(c);
-    if (!excludes.empty() && excludes.back() != '\n') excludes.emplace_back('\n');
-    for (const char *reserved : {"/.world\n", "/.world-git/\n"})
-        for (const char *p = reserved; *p; ++p) excludes.emplace_back(*p);
-    // Empty templates omit info/. Create only the directory needed for owned rules.
-    String info = joinp(repo.c_str(), "info");
-    if (int rc = fs_mkdir(info.c_str(), 0700)) { if (rc != -EEXIST) return rc; }
-    String exclude_path = joinp(repo.c_str(), "info/exclude");
-    if (int rc = write_bytes(exclude_path.c_str(), excludes.data(), excludes.size())) return rc;
-    if (!s.attributes.empty()) {
-        String attributes_path = joinp(repo.c_str(), "info/attributes");
-        if (int rc = write_bytes(attributes_path.c_str(), s.attributes.data(), s.attributes.size())) return rc;
-    }
-    if (s.rerere_present) {
-        if (int rc = restore_rerere(repo.c_str(), s.rerere)) return rc;
-    }
-    if (int rc = config(clone, "worldfs.baseline", s.head.c_str())) return rc;
-    if (int rc = config(clone, "worldfs.formatVersion", "1")) return rc;
-    for (const auto &id : s.identity)
-        if (int rc = config(clone, id.key.c_str(), id.value.c_str())) return rc;
-    for (const char *key : {"core.autocrlf", "core.safecrlf", "core.eol", "core.checkstat", "core.checkRoundtripEncoding",
-                            "core.filemode", "core.symlinks", "core.ignorecase", "core.precomposeunicode", "core.trustctime", "core.ignorestat",
-                            "core.useReplaceRefs"})
-        if (int rc = unset_config(clone, key)) return rc;
-    for (const auto &setting : s.settings)
-        if (int rc = config(clone, setting.key.c_str(), setting.value.c_str())) return rc;
-    if (s.worktree_config) {
-        // With worktreeConfig on, core.bare must live in the main worktree's config.worktree
-        // (git-worktree(1)); left in the common config it would make the owned linked worktree
-        // bare too. The owned repository's main worktree is the bare mirror itself.
-        if (int rc = config(clone, "extensions.worktreeConfig", "true")) return rc;
-        const char *bare[] = {"--git-dir", repo.c_str(), "config", "--worktree", "core.bare", "true", nullptr};
-        if (int rc = git(clone, bare)) return rc;
-        if (int rc = unset_config(clone, "core.bare")) return rc;
-        for (const auto &setting : s.worktree_settings) {
-            const char *args[] = {"config", "--worktree", setting.key.c_str(), setting.value.c_str(), nullptr};
-            if (int rc = git(clone, args)) return rc;
-        }
-    }
-    if (s.sparse_present) {
-        const char *args[] = {"rev-parse", "--path-format=absolute", "--git-path", "info/sparse-checkout", nullptr};
-        String dest_sparse;
-        if (int rc = value(clone, args, dest_sparse)) return rc;
-        String dest_info(dest_sparse.c_str(), dest_sparse.size() - strlen("/sparse-checkout"));
-        if (int rc = fs_mkdir(dest_info.c_str(), 0700)) { if (rc != -EEXIST) return rc; }
-        if (int rc = write_bytes(dest_sparse.c_str(), s.sparse.data(), s.sparse.size())) return rc;
-    }
-    if (s.squash_present) {
-        const char *args[] = {"rev-parse", "--path-format=absolute", "--git-path", "SQUASH_MSG", nullptr};
-        String dest_squash;
-        if (int rc = value(clone, args, dest_squash)) return rc;
-        if (int rc = write_bytes(dest_squash.c_str(), s.squash.data(), s.squash.size())) return rc;
-    }
-    if (s.fetch_present) {
-        const char *args[] = {"rev-parse", "--path-format=absolute", "--git-path", "FETCH_HEAD", nullptr};
-        String dest_fetch;
-        if (int rc = value(clone, args, dest_fetch)) return rc;
-        if (int rc = write_bytes(dest_fetch.c_str(), s.fetch.data(), s.fetch.size())) return rc;
-    }
-    if (s.orig_present) {
-        const char *orig_args[] = {"update-ref", "ORIG_HEAD", s.orig_head.c_str(), nullptr};
-        if (int rc = git(clone, orig_args)) return rc;
-    }
-    // The mirror's own remote points at the source: it is not an implicit write-back channel and
-    // is removed. The source's own remotes, upstreams and aliases are carried instead.
-    const char *remote[] = {"config", "--local", "--remove-section", "remote.origin", nullptr};
-    if (int rc = git(clone, remote)) return rc;
-    for (const auto &setting : s.carried) {
-        const char *args[] = {"config", "--local", "--add", setting.key.c_str(), setting.value.c_str(), nullptr};
-        if (int rc = git(clone, args)) return rc;
-    }
-    // Installed, never run: every command here passes core.hooksPath=/dev/null.
-    if (s.with_hooks) {
-        if (int rc = install_hooks(s, clone, repo.c_str())) return rc;
-    }
-    Vec<char> imported_refs;
-    if (int rc = capture_refs(clone, imported_refs)) return rc;
-    if (!same_bytes(imported_refs, s.refs)) return -EBUSY;
-    if (int rc = source_unchanged(s)) return rc;
-    if (int rc = pin_identity(s.root.c_str(), clone)) return rc;
-    if (s.committed_only) {
-        if (int rc = reset_to_head(clone)) return rc;
-    }
-    // The owned repository now carries the source's index and status settings, so this sees the
-    // bytes that will be published, including edits made after the source's own clean check.
-    // Re-probe ambient policy and filters beside the copy first, for the same reason as above:
-    // a relative GIT_CONFIG_GLOBAL/SYSTEM (or other per-directory configuration) can resolve to
-    // a different file next to the copy than it did next to the source.
-    if (!s.require_clean) return 0;
+    return 0;
+}
+// HEAD and the index do not change when a tracked file is edited after the source's clean check,
+// so check the copy that will actually be published, every submodule included. Re-probe each
+// repository's ambient policy and filters first -- GIT_CONFIG_GLOBAL/SYSTEM and other
+// per-directory configuration can resolve differently beside the copy than beside the source --
+// so no status below runs a filter the source-side probe never saw.
+int require_clean_copy(const GitSource &s, const char *clone) {
     if (int rc = reject_ambient_policy(clone)) return rc;
     if (int rc = reject_used_filters(clone)) return rc;
-    return require_clean_tree(clone);
+    for (const auto &m : s.modules) {
+        String path = joinp(clone, m.path.c_str());
+        if (int rc = reject_ambient_policy(path.c_str())) return in_module(rc, m.path);
+        if (int rc = reject_used_filters(path.c_str())) return in_module(rc, m.path);
+    }
+    if (int rc = require_clean_tree(clone)) return rc;
+    for (const auto &m : s.modules) {
+        String path = joinp(clone, m.path.c_str());
+        if (int rc = require_clean_tree(path.c_str())) return rc;
+    }
+    return 0;
+}
+int git_import(const GitSource &s, const char *clone) {
+    if (!s.present) return 0;
+    if (int rc = sources_unchanged(s)) return rc;
+    if (!s.managed) {
+        if (int rc = import_root(s, clone)) return rc;
+        for (const auto &m : s.modules)
+            if (int rc = import_module(m, clone)) return in_module(rc, m.path);
+        if (int rc = sources_unchanged(s)) return rc;
+    }
+    if (s.managed) {
+        // Capture the copy as the managed World it is, submodules included: a copied HEAD/index
+        // from a different moment, or a link that resolves differently at the copy's location,
+        // is caught here even when the source looks unchanged again by the time cloning ends.
+        GitSource copy;
+        if (int rc = git_source(clone, true, copy)) return rc;
+        if (!same_capture(copy, s) || !same_modules(copy, s)) return -EBUSY;
+        if (int rc = reject_copied_locks(clone)) return rc;
+    } else if (s.has_gitlinks) {
+        if (int rc = copy_layout_check(s, clone)) return rc;
+    }
+    if (int rc = pin_identity(s.root.c_str(), clone)) return rc;
+    for (const auto &m : s.modules) {
+        String path = joinp(clone, m.path.c_str());
+        if (int rc = pin_identity(m.repo.root.c_str(), path.c_str())) return in_module(rc, m.path);
+    }
+    if (s.committed_only) {
+        if (int rc = reset_copy(s, clone)) return rc;
+    }
+    if (int rc = same_gitmodules(s, clone)) return rc;
+    if (!s.require_clean) return 0;
+    return require_clean_copy(s, clone);
 }
 
+// Whether any submodule repository below `dir` (the World's active/modules) has a linked
+// worktree registered: a directory holding HEAD whose `worktrees` directory is not empty.
+int modules_in_use(const String &dir, int depth) {
+    if (depth > 64) return refuse(WFS_E_GIT_UNSUPPORTED, "the World's submodule administration is nested too deeply");
+    int fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return errno == ENOENT || errno == ENOTDIR ? 0 : -errno;
+    Vec<String> names;
+    int rc = list_names(fd, names);
+    struct stat st;
+    bool repository = !rc && !fstatat(fd, "HEAD", &st, AT_SYMLINK_NOFOLLOW);
+    close(fd);
+    if (rc) return rc;
+    for (const auto &name : names) {
+        String child = joinp(dir.c_str(), name.c_str());
+        if (lstat(child.c_str(), &st) || !S_ISDIR(st.st_mode)) continue;
+        if (repository && name == "worktrees") {
+            int wfd = open(child.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (wfd < 0) return -errno;
+            Vec<String> entries;
+            rc = list_names(wfd, entries);
+            close(wfd);
+            if (rc) return rc;
+            if (!entries.empty()) return WFS_E_GIT_IN_USE;
+            continue;
+        }
+        if ((rc = modules_in_use(child, depth + 1))) return rc;
+    }
+    return 0;
+}
 int git_discard_check(const char *root) {
     String owned = joinp(root, ".world-git"); struct stat st;
     bool managed = lstat(owned.c_str(), &st) == 0;
@@ -2331,7 +3233,10 @@ int git_discard_check(const char *root) {
         if (managed && !strcmp(e->d_name, "active")) continue;
         rc = WFS_E_GIT_IN_USE; break;
     }
-    closedir(d); return rc;
+    closedir(d);
+    if (rc || !managed) return rc;
+    // A linked worktree of one of the World's submodules would be left pointing at nothing too.
+    return modules_in_use(joinp(root, ".world-git/repo.git/worktrees/active/modules"), 0);
 }
 
 // A regex matching every "branch.<short_name>.*" key, with short_name's regex
@@ -2447,10 +3352,14 @@ int git_branch(const char *clone, wfs_id world) {
         // build a regex that matches this exact short name (escaping regex metacharacters
         // it may contain) and confirm no branch.<name>.* key remains.
         String pattern = branch_section_pattern(short_name);
-        const char *check[] = {"config", "--local", "--name-only", "--get-regexp", pattern.c_str(), nullptr};
+        // With --includes: a key an included file sets survives --remove-section.
+        const char *check[] = {"config", "--local", "--includes", "--name-only", "--get-regexp", pattern.c_str(), nullptr};
         int check_status = -1;
         rc = git(clone, check, nullptr, &check_status, true);
-        if (rc == 0) return WFS_E_GIT_FAILED; // a matching key still exists
+        if (rc == 0)
+            return refuse(WFS_E_GIT_POLICY, "branch.%s settings come from a file the World's configuration "
+                          "includes, which WorldFS cannot remove; the new World's branch would not start "
+                          "without an upstream", short_name);
         if (!(rc == WFS_E_GIT_FAILED && check_status == 1)) return rc; // unexpected failure
     }
     const char *checkout[] = {"symbolic-ref", "HEAD", branch, nullptr};
@@ -2474,6 +3383,107 @@ int branch_checked_out(const char *repo, const String &ref, bool &out) {
         const char *line = worktrees.data() + i;
         if (!strcmp(line, checked.c_str())) { out = true; return 0; }
         i += strlen(line) + 1;
+    }
+    return 0;
+}
+}
+
+namespace wfs {
+// The initialized submodules of the repository at `root`, recursively, as paths below it: the
+// directories its index records as gitlinks that hold a `.git`.
+// Each one is checked to be in the World's own layout (check_owned_module) before anything is
+// read from it or below it.
+int checked_out_modules(const char *world, const char *root, const String &prefix, const String &gitdir_prefix,
+                        Vec<String> &out, int depth) {
+    const char *ls_args[] = {"ls-files", "--stage", "-z", nullptr};
+    Vec<char> listing, gitmodules;
+    if (int rc = git(root, ls_args, &listing)) return rc;
+    Vec<Gitlink> links;
+    parse_gitlinks(listing, links);
+    if (links.empty()) return 0;
+    if (int rc = gitmodules_listing(root, nullptr, gitmodules)) return rc;
+    Vec<GitSetting> names;
+    module_names(gitmodules, names);
+    for (const auto &l : links) {
+        String full = joinp(root, l.path.c_str()), dot = joinp(full.c_str(), ".git");
+        String path(prefix); path.append(l.path.c_str());
+        struct stat st;
+        if (lstat(dot.c_str(), &st)) {
+            if (errno == ENOENT || errno == ENOTDIR) continue;   // uninitialized or deleted
+            return -errno;
+        }
+        if (depth >= kMaxModuleDepth)
+            return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s is nested more than %d levels deep", path.c_str(), kMaxModuleDepth);
+        const String *name = module_name(names, l.path);
+        if (!name || !valid_module_name(*name))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s has no usable .gitmodules entry", path.c_str());
+        String gitdir(gitdir_prefix); gitdir.append("modules/"); gitdir.append(name->c_str());
+        if (int rc = check_owned_module(world, path, gitdir)) return rc;
+        out.emplace_back(path);
+        String child(path); child.push_back('/');
+        String child_gitdir(gitdir); child_gitdir.push_back('/');
+        if (int rc = checked_out_modules(world, full.c_str(), child, child_gitdir, out, depth + 1)) return rc;
+    }
+    return 0;
+}
+// Publish copies only the root's commits. A gitlink commit the published range introduces -- one
+// that a commit reachable from `now` but from no other ref of the target records, in any diff
+// against a parent (merges against each) -- must already be in the target's own checked-out
+// submodule at that path, or the target could not check the published commits out. Nothing is
+// fetched into or pushed from any submodule. `worktree` is the target's top level, or null for a
+// bare target, which has no submodule checked out.
+int check_published_gitlinks(const char *repo, const char *worktree, const char *staging, const String &now) {
+    String exclude("--exclude="); exclude.append(staging);
+    const char *range[] = {"--no-replace-objects", "rev-list", now.c_str(), exclude.c_str(), "--not", "--all", nullptr};
+    Vec<char> commits;
+    if (int rc = git(repo, range, &commits)) return rc;
+    if (commits.size() <= 1) return 0;
+    FILE *input = tmpfile();
+    if (!input) return -errno;
+    if (fwrite(commits.data(), 1, commits.size() - 1, input) != commits.size() - 1 || fflush(input)) {
+        int err = errno ? -errno : -EIO; fclose(input); return err;
+    }
+    rewind(input);
+    const char *diff[] = {"--no-replace-objects", "diff-tree", "--stdin", "-r", "-m", "--root", "-z", "--no-renames",
+                          "--no-commit-id", nullptr};
+    Vec<char> raw;
+    int rc = git(repo, diff, &raw, nullptr, false, false, fileno(input));
+    fclose(input);
+    if (rc) return rc;
+    // Records are ":<old mode> <new mode> <old oid> <new oid> <status>\0<path>\0".
+    Vec<GitSetting> links;   // {path, commit}
+    for (size_t i = 0; i < raw.size() && raw[i];) {
+        const char *header = raw.data() + i;
+        i += strlen(header) + 1;
+        if (header[0] != ':' || i >= raw.size()) continue;
+        const char *path = raw.data() + i;
+        i += strlen(path) + 1;
+        char old_mode[8], new_mode[8], old_oid[72], new_oid[72], status[8];
+        if (sscanf(header, ":%7s %7s %71s %71s %7s", old_mode, new_mode, old_oid, new_oid, status) != 5) continue;
+        if (strcmp(new_mode, "160000") || status[0] == 'D') continue;
+        bool seen = false;
+        for (const auto &l : links) if (l.key == path && l.value == new_oid) { seen = true; break; }
+        if (!seen) links.emplace_back(GitSetting{String(path), String(new_oid)});
+    }
+    for (const auto &l : links) {
+        bool checked_out = false;
+        String full;
+        if (worktree) {
+            full = joinp(worktree, l.key.c_str());
+            String dot = joinp(full.c_str(), ".git"), top, real_full, real_top;
+            const char *top_args[] = {"rev-parse", "--show-toplevel", nullptr};
+            struct stat st;
+            checked_out = !lstat(dot.c_str(), &st) && !value(full.c_str(), top_args, top) &&
+                          !fs_realpath(full.c_str(), real_full) && !fs_realpath(top.c_str(), real_top) && real_full == real_top;
+        }
+        if (!checked_out)
+            return refuse(WFS_E_GIT_TARGET, "the published commits record submodule %s at %s, but %s does not have that submodule initialized, so it could not check them out; initialize it there first",
+                          l.key.c_str(), l.value.c_str(), repo);
+        String spec(l.value); spec.append("^{commit}");
+        const char *exists[] = {"cat-file", "-e", spec.c_str(), nullptr};
+        if (git(full.c_str(), exists, nullptr, nullptr, true))
+            return refuse(WFS_E_GIT_TARGET, "the published commits record submodule %s at %s, which the submodule in %s does not have; get that commit there first (publish copies only the root's commits)",
+                          l.key.c_str(), l.value.c_str(), repo);
     }
     return 0;
 }
@@ -2661,7 +3671,17 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
     // Status must not execute a filter that was installed or attached after the import.
     if (int rc = reject_ambient_policy(world_root)) return rc;
     if (int rc = reject_used_filters(world_root)) return rc;
+    Vec<String> modules;
+    if (int rc = checked_out_modules(world_root, world_root, String(), String(), modules, 0)) return rc;
+    for (const auto &m : modules) {
+        String path = joinp(world_root, m.c_str());
+        if (int rc = reject_used_filters(path.c_str())) return in_module(rc, m);
+    }
     int dirty = require_clean_tree(world_root);
+    for (size_t i = 0; !dirty && i < modules.size(); ++i) {
+        String path = joinp(world_root, modules[i].c_str());
+        dirty = require_clean_tree(path.c_str());
+    }
     if (dirty && dirty != WFS_E_GIT_DIRTY) return dirty;
     String old;
     const char *old_args[] = {"rev-parse", "--verify", "--quiet", ref.c_str(), nullptr};
@@ -2788,6 +3808,7 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
             rc = refuse(WFS_E_GIT_TARGET, "%s in the target repository has commits the World's branch does not; this is not a fast-forward (--force overwrites it)", branch);
         else rc = ff_rc;
     }
+    if (!rc) rc = check_published_gitlinks(repo, bare == "true" ? nullptr : repo_real.c_str(), staging, now);
     // One ref transaction: the branch moves (compare-and-swap against the value checked above)
     // and the staging ref disappears together, or neither happens. On an earlier refusal only
     // the staging ref is dropped, and a failure to drop it does not replace that answer.
