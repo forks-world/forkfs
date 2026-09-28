@@ -32,8 +32,9 @@ int refuse(int code, const char *fmt, ...) {
 // Never use a shell, source hooks, inherited GIT_DIR/INDEX_FILE, or lazy network fetches.
 // `ambient_config_probe` keeps the user's global/system configuration (and GIT_CONFIG_* command
 // configuration) so a check sees files the way the user's own Git does; `stdin_fd`, when >= 0,
-// becomes the child's standard input.
-int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, int *exit_code = nullptr, bool quiet_stderr = false, bool ambient_config_probe = false, int stdin_fd = -1) {
+// becomes the child's standard input, and `stdout_fd`, when >= 0, its standard output (then
+// nothing is captured).
+int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, int *exit_code = nullptr, bool quiet_stderr = false, bool ambient_config_probe = false, int stdin_fd = -1, int stdout_fd = -1) {
     if (exit_code) *exit_code = -1;
     Vec<char *> av;
     const char *prefix[] = {"git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
@@ -63,7 +64,7 @@ int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, i
     posix_spawn_file_actions_t actions;
     int rc = posix_spawn_file_actions_init(&actions);
     if (rc) { close(pipefd[0]); close(pipefd[1]); return -rc; }
-    rc = posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+    rc = posix_spawn_file_actions_adddup2(&actions, stdout_fd >= 0 ? stdout_fd : pipefd[1], STDOUT_FILENO);
     if (!rc && stdin_fd >= 0) rc = posix_spawn_file_actions_adddup2(&actions, stdin_fd, STDIN_FILENO);
     if (!rc && quiet_stderr)
         rc = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
@@ -923,6 +924,87 @@ int capture_orig(const char *root, bool &present, String &oid) {
     if ((rc = value(root, verify, oid))) return rc;
     present = true; return 0;
 }
+// The stash stack is refs/stash plus its reflog: stash@{n} for n > 0 exists only as a reflog
+// entry. Each line of a reflog is "<old> <new> <ident>\t<message>\n"; the entries' commits are
+// the non-null <new> object IDs. Anything else is refused rather than guessed at.
+int stash_tips(const Vec<char> &log, Vec<String> &out) {
+    out.clear();
+    auto hex_run = [&](size_t i, size_t end) {
+        size_t j = i;
+        while (j < end && ((log[j] >= '0' && log[j] <= '9') || (log[j] >= 'a' && log[j] <= 'f'))) ++j;
+        return j - i;
+    };
+    size_t start = 0, n = log.size();
+    while (start < n) {
+        size_t end = start;
+        while (end < n && log[end] != '\n') ++end;
+        size_t len = hex_run(start, end), at = start + len + 1;
+        if ((len != 40 && len != 64) || at >= end || log[at - 1] != ' ' || hex_run(at, end) != len ||
+            at + len >= end || log[at + len] != ' ')
+            return refuse(WFS_E_GIT_UNSUPPORTED, "the stash reflog could not be parsed");
+        bool null = true;
+        for (size_t i = at; i < at + len; ++i) if (log[i] != '0') { null = false; break; }
+        if (!null) out.emplace_back(log.data() + at, len);
+        start = end + 1;
+    }
+    return 0;
+}
+// Revisions for the objects of the stash entries that the mirror does not already hold: every
+// entry, minus everything reachable from the other captured refs (`refs`, "<name>\t<oid>\n",
+// which the mirror copies with their history). One per line, for --stdin / --revs.
+int stash_revs(const GitRepoState &s, FILE *&out) {
+    out = nullptr;
+    Vec<String> tips;
+    if (int rc = stash_tips(s.stash, tips)) return rc;
+    if (tips.empty()) return 0;
+    String text;
+    for (const auto &tip : tips) { text.append(tip.c_str()); text.push_back('\n'); }
+    size_t start = 0, n = s.refs.size();
+    for (size_t i = 0; i <= n; ++i) {
+        if (i < n && s.refs[i] != '\n' && s.refs[i] != '\0') continue;
+        size_t tab = start;
+        while (tab < i && s.refs[tab] != '\t') ++tab;
+        if (tab + 1 < i && !(tab - start == 10 && !memcmp(s.refs.data() + start, "refs/stash", 10))) {
+            text.push_back('^'); text.append(s.refs.data() + tab + 1, i - tab - 1); text.push_back('\n');
+        }
+        start = i + 1;
+    }
+    out = tmpfile();
+    if (!out) return -errno;
+    if (fwrite(text.c_str(), 1, text.size(), out) != text.size() || fflush(out)) {
+        int rc = errno ? -errno : -EIO; fclose(out); out = nullptr; return rc;
+    }
+    rewind(out);
+    return 0;
+}
+// The stash stack of the repository at `root` as the import keeps it: the reflog's bytes, Git's
+// own listing of every entry (its selector, commit, tree, parents -- the index and untracked-
+// files commits -- and message), and proof that every object of every entry is present.
+// Recorded in `out`, whose `refs` must already be captured. A repository without a stash
+// reflog (refs/stash alone, as `update-ref` leaves it, is an ordinary ref) records none.
+int capture_stash(const char *root, GitRepoState &out) {
+    const char *path_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "logs/refs/stash", nullptr};
+    if (int rc = value(root, path_args, out.stash_path)) return rc;
+    int rc = read_bytes(out.stash_path.c_str(), out.stash);
+    out.stash_present = rc == 0;
+    out.stash_list.clear();
+    if (rc == -ENOENT) { out.stash.clear(); return 0; }
+    if (rc) return rc;
+    const char *list[] = {"--no-replace-objects", "log", "--walk-reflogs", "--no-show-signature", "--no-decorate",
+        "--no-color", "--format=%gD%x09%H%x09%T%x09%P%x09%gs", "refs/stash", "--", nullptr};
+    if ((rc = git(root, list, &out.stash_list))) return rc;
+    FILE *revs = nullptr;
+    if ((rc = stash_revs(out, revs))) return rc;
+    if (!revs) return 0;
+    // Fails on any missing commit, tree or blob of an entry.
+    const char *walk[] = {"--no-replace-objects", "rev-list", "--objects", "--quiet", "--stdin", nullptr};
+    rc = git(root, walk, nullptr, nullptr, false, false, fileno(revs));
+    fclose(revs);
+    return rc;
+}
+bool same_stash(const GitRepoState &a, const GitRepoState &b) {
+    return a.stash_present == b.stash_present && same_bytes(a.stash, b.stash) && same_bytes(a.stash_list, b.stash_list);
+}
 int walk_objects_fd(int fd, unsigned depth, uint64_t &total) {
     if (depth > 256) return refuse(WFS_E_GIT_UNSUPPORTED, "the object directory is nested too deeply");
     int dupfd = dup(fd); if (dupfd < 0) return -errno;
@@ -1271,10 +1353,6 @@ int reject_external_visibility_state(const char *root, bool managed) {
     if (managed) return 0;
     for (const char *key : {"transfer.hideRefs", "uploadpack.hideRefs"})
         if (int rc = reject_configured_policy(root, key)) return rc;
-    const char *args[] = {"reflog", "exists", "refs/stash", nullptr};
-    int status = -1, rc = git(root, args, nullptr, &status);
-    if (!rc) return refuse(WFS_E_GIT_UNSUPPORTED, "the stash has entries; a mirror cannot preserve the stash stack");
-    if (rc != WFS_E_GIT_FAILED || status != 1) return rc;
     String grafts; const char *graft_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "info/grafts", nullptr};
     if (int graft_rc = value(root, graft_args, grafts)) return graft_rc;
     struct stat st;
@@ -1922,6 +2000,10 @@ int source_unchanged(const GitRepoState &s) {
     }
     Vec<char> direct_refs; if (int ref_rc = capture_refs(s.root.c_str(), direct_refs)) return ref_rc;
     if (!same_bytes(direct_refs, s.refs)) return -EBUSY;
+    // The stash stack as a whole: refs/stash is in the refs above, the entries below it only here.
+    Vec<char> stash; int stash_rc = read_bytes(s.stash_path.c_str(), stash);
+    if (stash_rc != 0 && stash_rc != -ENOENT) return stash_rc;
+    if ((stash_rc == 0) != s.stash_present || !same_bytes(stash, s.stash)) return -EBUSY;
     bool orig_present; String orig; if (int orig_rc = capture_orig(s.root.c_str(), orig_present, orig)) return orig_rc;
     if (orig_present != s.orig_present || orig != s.orig_head) return -EBUSY;
     if (!s.managed) {
@@ -1947,7 +2029,7 @@ int source_unchanged(const GitRepoState &s) {
 // tracked in the index would fork dirty or commit metadata; one anywhere in preserved history
 // would overwrite the World marker on an ordinary checkout (ignored files are overwritten by
 // default). So the index and every commit reachable from what the import keeps -- all refs,
-// HEAD, ORIG_HEAD and FETCH_HEAD tips -- must never contain either path. --full-history keeps
+// HEAD, ORIG_HEAD and FETCH_HEAD tips and every stash entry -- must never contain either path. --full-history keeps
 // a side branch that added the path and was merged away from being simplified out.
 // --no-replace-objects makes the walk read the commits and trees the import actually preserves:
 // a refs/replace/* entry could otherwise present a safe tree for a commit whose real tree has
@@ -1974,6 +2056,11 @@ int reject_reserved_paths(const char *root, const GitRepoState &s) {
             start = i + 1;
         }
     }
+    // Every stash entry, not only refs/stash: `git stash apply stash@{n}` writes its worktree,
+    // index and untracked-files trees (the entry commit and its second and third parents).
+    Vec<String> stash;
+    if (int rc = stash_tips(s.stash, stash)) return rc;
+    for (const auto &tip : stash) tips.emplace_back(tip.c_str());
     Vec<const char *> args;
     for (const char *a : {"--no-replace-objects", "rev-list", "-n", "1", "--full-history", "--all"}) args.emplace_back(a);
     for (const auto &tip : tips) args.emplace_back(tip.c_str());
@@ -2379,6 +2466,7 @@ int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool modu
     }
     if ((rc = reject_external_visibility_state(root, out.managed))) return rc;
     if ((rc = capture_refs(root, out.refs))) return rc;
+    if ((rc = capture_stash(root, out))) return rc;
     if ((rc = capture_orig(root, out.orig_present, out.orig_head))) return rc;
     if ((rc = collect_symrefs(root, out.symrefs))) return rc;
     if ((rc = reject_unlisted_symrefs(root, out.symrefs))) return rc;
@@ -2900,7 +2988,8 @@ bool same_capture(const GitRepoState &copy, const GitRepoState &s) {
         // A relative include can resolve differently from the copy's location.
         same_settings(copy.identity, s.identity) && same_bytes(copy.effective_config, s.effective_config) &&
         copy.worktree_config == s.worktree_config && same_settings(copy.worktree_settings, s.worktree_settings) &&
-        same_bytes(copy.refs, s.refs) && copy.orig_present == s.orig_present && copy.orig_head == s.orig_head;
+        same_bytes(copy.refs, s.refs) && same_stash(copy, s) && copy.orig_present == s.orig_present &&
+        copy.orig_head == s.orig_head;
 }
 // A managed copy's submodules must be exactly its source's, in the same place, with the same state.
 bool same_modules(const GitSource &copy, const GitSource &s) {
@@ -2959,10 +3048,46 @@ int sources_unchanged(const GitSource &s) {
         if (int rc = source_unchanged(m.repo)) return in_module(rc, m.path);
     return 0;
 }
+// The stash stack of an external source (see GitRepoState::stash). A mirror copies refs/stash,
+// never its reflog, and may not copy the objects only older entries reach, so the reflog is
+// written byte for byte where the owned repository's Git reads it (its common directory, for the
+// root shared by the World's worktree) and the entries' objects are packed from the source --
+// read-only: `pack-objects --stdout` into a scratch file inside the owned repository, then
+// `index-pack --stdin` there. Objects the other refs reach are already in the mirror.
+int restore_stash(const GitRepoState &s, const char *worktree) {
+    if (!s.stash_present) return 0;
+    FILE *revs = nullptr;
+    if (int rc = stash_revs(s, revs)) return rc;
+    if (revs) {
+        String scratch;
+        const char *scratch_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "objects/pack/worldfs-stash.pack", nullptr};
+        int rc = value(worktree, scratch_args, scratch);
+        int fd = rc ? -1 : open(scratch.c_str(), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (!rc && fd < 0) rc = -errno;
+        if (fd >= 0 && unlink(scratch.c_str())) rc = -errno;
+        const char *pack[] = {"pack-objects", "--revs", "--stdout", "--quiet", nullptr};
+        if (!rc) rc = git(s.root.c_str(), pack, nullptr, nullptr, false, false, fileno(revs), fd);
+        fclose(revs);
+        if (!rc && lseek(fd, 0, SEEK_SET) < 0) rc = -errno;
+        const char *index[] = {"index-pack", "--stdin", nullptr};
+        Vec<char> ignored;
+        if (!rc) rc = git(worktree, index, &ignored, nullptr, false, false, fd);
+        if (fd >= 0) close(fd);
+        if (rc) return rc;
+    }
+    String log;
+    const char *log_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "logs/refs/stash", nullptr};
+    if (int rc = value(worktree, log_args, log)) return rc;
+    String refs_dir(log.c_str(), log.size() - strlen("/stash"));
+    String logs_dir(refs_dir.c_str(), refs_dir.size() - strlen("/refs"));
+    for (const String *dir : {&logs_dir, &refs_dir})
+        if (int rc = fs_mkdir(dir->c_str(), 0700)) { if (rc != -EEXIST) return rc; }
+    return write_bytes(log.c_str(), s.stash.data(), s.stash.size());
+}
 // The state every owned repository -- the root's or a submodule's -- carries over from its
 // source once its mirror exists: index, local rules, rerere cache, status settings and identity,
-// worktree-scoped settings, pending SQUASH_MSG, FETCH_HEAD, ORIG_HEAD, carried configuration and
-// hooks. `worktree` is the repository's worktree in the copy, whose Git commands reach `repo`.
+// worktree-scoped settings, pending SQUASH_MSG, FETCH_HEAD, ORIG_HEAD, carried configuration,
+// hooks and the stash stack. `worktree` is the repository's worktree in the copy, whose Git commands reach `repo`.
 int restore_state(const GitRepoState &s, const char *worktree, const char *repo, const char *index, bool root) {
     if (!s.index.empty()) {
         if (int rc = write_bytes(index, s.index.data(), s.index.size())) return rc;
@@ -3055,9 +3180,14 @@ int restore_state(const GitRepoState &s, const char *worktree, const char *repo,
     if (s.with_hooks) {
         if (int rc = install_hooks(s, worktree, repo)) return rc;
     }
-    Vec<char> imported_refs;
-    if (int rc = capture_refs(worktree, imported_refs)) return rc;
-    return same_bytes(imported_refs, s.refs) ? 0 : -EBUSY;
+    if (int rc = restore_stash(s, worktree)) return rc;
+    // The copy as it will be published: its refs, and its stash stack read back by Git itself --
+    // the same reflog bytes, the same entries, and every object of every entry present.
+    GitRepoState imported;
+    if (int rc = capture_refs(worktree, imported.refs)) return rc;
+    if (!same_bytes(imported.refs, s.refs)) return -EBUSY;
+    if (int rc = capture_stash(worktree, imported)) return rc;
+    return same_stash(imported, s) ? 0 : -EBUSY;
 }
 // Mirror all resolvable refs, including stash, notes, remote-tracking and custom refs; a bare
 // clone omits other ref namespaces and would lose them when the source is removed. clone
