@@ -1290,6 +1290,35 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((self.source / 'ambient-filter-ran').exists())
         self.assertFalse((one / 'ambient-filter-ran').exists())
 
+    def test_local_canonical_lfs_setup_is_preserved_for_another_branch(self):
+        import hashlib
+        if not shutil.which('git-lfs'):
+            self.skipTest('needs git-lfs')
+        payload = b'LFS content reachable only from another branch\n'
+        oid = hashlib.sha256(payload).hexdigest()
+        self.git(self.source, 'checkout', '-q', '-b', 'lfs-history')
+        (self.source / '.gitattributes').write_text('*.bin filter=lfs\n')
+        (self.source / 'history.bin').write_bytes(self.lfs_pointer(oid, len(payload)))
+        self.git(self.source, 'add', '.gitattributes', 'history.bin')
+        self.git(self.source, 'commit', '-qm', 'LFS pointer on preserved branch')
+        self.git(self.source, 'checkout', '-q', 'main')
+        for key, value in (
+            ('filter.lfs.clean', 'git-lfs clean -- %f'),
+            ('filter.lfs.smudge', 'git-lfs smudge -- %f'),
+            ('filter.lfs.process', 'git-lfs filter-process'),
+            ('filter.lfs.required', '1'),
+        ):
+            self.git(self.source, 'config', key, value)
+        self.assertFalse((self.source / '.git' / 'lfs' / 'objects').exists())
+
+        self.world('init', str(self.source))
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'config', '--get', 'filter.lfs.process').stdout.strip(),
+                         b'git-lfs filter-process')
+        self.assertEqual(self.git(one, 'config', '--get', 'lfs.storage').stdout.strip(), b'lfs')
+        self.assertTrue((one / '.world-git' / 'repo.git' / 'hooks' / 'pre-push').is_file())
+        self.assertIn(b'lfs-history', self.git(one, 'branch', '--list').stdout)
+
     def test_include_changes_recognizes_filter_used_only_by_staged_attributes(self):
         self.install_lfs(self.source)
         (self.source / 'file').write_bytes(b'ordinary committed content\n')
