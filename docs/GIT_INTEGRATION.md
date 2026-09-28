@@ -181,10 +181,13 @@ uncached pointer stays a pointer. Ordinary import and `--include-changes` retain
 worktree and staged bytes.
 
 Only the stock `git-lfs` clean, smudge and process commands are admitted when a tracked path uses
-`filter=lfs`; custom commands, extensions, custom transfer agents and external `lfs.storage`
-locations are refused. A complete stock LFS setup is retained from repository, global, or system
-configuration even when only another preserved branch uses LFS. LFS endpoint URLs are carried when absolute; relative endpoints are
-refused. Accepted canonical `smudge --skip` and `filter-process --skip` variants are retained in
+`filter=lfs`; unused custom or incomplete filters remain inert. Carried repository LFS extensions,
+custom transfer agents, non-local storage, and relative endpoints are refused even if the current
+checkout has no LFS paths or cache, because later checkouts could use them. Dormant settings from
+global or system configuration are not carried or treated as repository policy. Absolute LFS
+endpoint URLs are carried. A complete stock LFS filter setup from repository, global, or system
+configuration is retained when only another preserved branch uses LFS. Accepted canonical
+`smudge --skip` and `filter-process --skip` variants are retained in
 the World's owned local filter configuration. An ordinary import installs and pins its generated pre-push hook in the World's own Git
 administration, independent of ambient `core.hooksPath`; under `--with-hooks`, a carried in-tree
 `core.hooksPath` must already contain an executable canonical Git LFS pre-push hook, so import

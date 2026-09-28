@@ -1388,7 +1388,7 @@ int scan_conditional_includes(const char *root, bool *sets_identity, Vec<UrlRewr
 }
 // Refuses a `check-attr filter` result that assigns any path a defined driver.
 int validate_lfs_filter(const char *root, bool &defined);
-int validate_lfs_storage(const char *root);
+int validate_lfs_storage(const char *root, bool ambient_config_probe = true, Vec<char> *snapshot = nullptr);
 int reject_filter_attrs(const char *root, const Vec<char> &attrs, const Vec<char> &defined, bool *uses_lfs) {
     // Triples "<path>\0filter\0<value>\0".
     for (size_t i = 0; i < attrs.size() && attrs[i];) {
@@ -1501,14 +1501,18 @@ int canonical_lfs_setup(const char *root, bool &canonical, bool &skip_smudge, bo
     }
     return 0;
 }
-int validate_lfs_storage(const char *root) {
+int validate_lfs_storage(const char *root, bool ambient_config_probe, Vec<char> *snapshot) {
     String storage; bool present = false;
-    const char *args[] = {"config", "--get", "lfs.storage", nullptr};
+    const char *args[] = {"config", "--includes", "--null", "--get", "lfs.storage", nullptr};
     Vec<char> bytes; int status = -1;
-    int rc = git(root, args, &bytes, &status, false, true);
+    int rc = git(root, args, &bytes, &status, false, ambient_config_probe);
     if (rc == WFS_E_GIT_FAILED && status == 1) present = false;
     else if (rc) return rc;
-    else { present = true; storage.assign(bytes.data()); if (!storage.empty() && storage.back() == '\n') storage.pop_back(); }
+    else { present = true; storage.assign(bytes.data()); }
+    if (snapshot) {
+        snapshot->emplace_back('\2'); snapshot->emplace_back(present ? '\1' : '\0');
+        for (char c : bytes) snapshot->emplace_back(c);
+    }
     if (!present) return 0;
     if (storage == "lfs") return 0;
     return refuse(WFS_E_GIT_UNSUPPORTED,
@@ -1535,10 +1539,9 @@ int validate_lfs_endpoint_listing(const Vec<char> &listing, Vec<char> *snapshot 
         const char *entry = listing.data() + i;
         size_t n = strlen(entry); i += n + 1;
         const char *nl = strchr(entry, '\n');
-        if (!nl) continue;
-        String key(entry, (size_t)(nl - entry));
+        String key(entry, nl ? (size_t)(nl - entry) : n);
         if (!lfs_endpoint_key(key.c_str())) continue;
-        const char *value = nl + 1;
+        const char *value = nl ? nl + 1 : "";
         if (!*value || strpbrk(value, "\n\r") || !absolute_lfs_endpoint(value))
             return refuse(WFS_E_GIT_UNSUPPORTED,
                 "%s must be an absolute URL or absolute filesystem path for Git LFS", key.c_str());
@@ -1569,26 +1572,42 @@ int validate_lfs_tree_config(const char *root, const char *treeish, Vec<char> *s
     }
     return 0;
 }
-int capture_lfs_endpoint_state(const char *root, Vec<char> &state) {
+int capture_lfs_endpoint_state(const char *root, Vec<char> &state, bool ambient_config_probe) {
     state.clear();
+    if (int rc = validate_lfs_storage(root, ambient_config_probe, &state)) return rc;
     const char *extension_args[] = {"config", "--includes", "--null", "--get-regexp", "^lfs\\.extension\\.", nullptr};
     Vec<char> extensions; int extension_status = -1;
-    int rc = git(root, extension_args, &extensions, &extension_status, false, true);
+    int rc = git(root, extension_args, &extensions, &extension_status, false, ambient_config_probe);
     if (rc == WFS_E_GIT_FAILED && extension_status == 1) extensions.clear();
     else if (rc) return rc;
     if (!extensions.empty()) return refuse(WFS_E_GIT_UNSUPPORTED,
         "Git LFS extensions are not supported; remove lfs.extension.* configuration");
     const char *transfer_args[] = {"config", "--includes", "--null", "--get-regexp", "^lfs\\.customtransfer\\.", nullptr};
     Vec<char> transfers; int transfer_status = -1;
-    rc = git(root, transfer_args, &transfers, &transfer_status, false, true);
+    rc = git(root, transfer_args, &transfers, &transfer_status, false, ambient_config_probe);
     if (rc == WFS_E_GIT_FAILED && transfer_status == 1) transfers.clear();
     else if (rc) return rc;
     if (!transfers.empty()) return refuse(WFS_E_GIT_UNSUPPORTED,
         "custom Git LFS transfer agents are not supported; remove lfs.customtransfer.* configuration");
+    const char *standalone_args[] = {"config", "--includes", "--null", "--get-all",
+        "lfs.standalonetransferagent", nullptr};
+    Vec<char> standalone; int standalone_status = -1;
+    rc = git(root, standalone_args, &standalone, &standalone_status, false, ambient_config_probe);
+    if (rc == WFS_E_GIT_FAILED && standalone_status == 1) standalone.clear();
+    else if (rc) return rc;
+    state.emplace_back('\3');
+    for (size_t i = 0; i + 1 < standalone.size();) {
+        const char *agent = standalone.data() + i;
+        size_t n = strlen(agent); i += n + 1;
+        if (*agent && strcmp(agent, "lfs-standalone-file"))
+            return refuse(WFS_E_GIT_UNSUPPORTED,
+                "custom Git LFS stand-alone transfer agents are not supported; remove lfs.standalonetransferagent");
+        for (size_t j = 0; j <= n; ++j) state.emplace_back(agent[j]);
+    }
     const char *effective_args[] = {"config", "--includes", "--null", "--get-regexp",
         "^(lfs\\.(url|pushurl)|remote\\..+\\.(lfsurl|lfspushurl))$", nullptr};
     Vec<char> effective; int status = -1;
-    rc = git(root, effective_args, &effective, &status, false, true);
+    rc = git(root, effective_args, &effective, &status, false, ambient_config_probe);
     if (rc == WFS_E_GIT_FAILED && status == 1) effective.clear();
     else if (rc) return rc;
     if ((rc = validate_lfs_endpoint_listing(effective, &state))) return rc;
@@ -2522,15 +2541,13 @@ int source_unchanged(const GitRepoState &s) {
                                           lfs_present, lfs_manifest)) return rc;
         if (lfs_present != s.lfs_present || lfs_bytes != s.lfs_bytes || lfs_entries != s.lfs_entries ||
             !same_bytes(lfs_manifest, s.lfs_manifest) || bytes + s.rerere_bytes + lfs_bytes != s.import_bytes) return -EBUSY;
-        if (s.lfs_active) {
-            Vec<char> endpoint_state;
-            if (int rc = capture_lfs_endpoint_state(s.root.c_str(), endpoint_state)) return rc;
-            if (!same_bytes(endpoint_state, s.lfs_endpoint_state)) return -EBUSY;
-        }
         Vec<char> rerere; bool rerere_present = false; uint64_t rerere_bytes = 0;
         if (int rc = capture_rerere(s.root.c_str(), rerere, rerere_present, rerere_bytes)) return rc;
         if (rerere_present != s.rerere_present || !same_bytes(rerere, s.rerere)) return -EBUSY;
     }
+    Vec<char> endpoint_state;
+    if (int rc = capture_lfs_endpoint_state(s.root.c_str(), endpoint_state, s.lfs_active)) return rc;
+    if (!same_bytes(endpoint_state, s.lfs_endpoint_state)) return -EBUSY;
     bool lfs_setup = false, skip_smudge = false, skip_process = false;
     if (int rc = canonical_lfs_setup(s.root.c_str(), lfs_setup, skip_smudge, skip_process)) return rc;
     if (lfs_setup != s.lfs_filter_setup || skip_smudge != s.lfs_skip_smudge ||
@@ -3036,19 +3053,11 @@ int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool modu
     // Preserve an existing local cache even when current HEAD no longer tracks LFS paths: an
     // older branch, stash, or later checkout may still need its payloads.
     if (out.lfs_present) {
-        if ((rc = validate_lfs_storage(root))) return rc;
         out.lfs_active = true;
     }
     out.lfs_target_only = lfs_target && !(lfs_worktree || lfs_head || out.lfs_present);
-    if (out.lfs_active) {
-        if ((rc = validate_lfs_storage(root))) return rc;
-        for (const auto &setting : out.carried)
-            if (!strncmp(setting.key.c_str(), "lfs.customtransfer.", 19))
-                return refuse(WFS_E_GIT_UNSUPPORTED,
-                    "custom Git LFS transfer agents are not supported; remove %s", setting.key.c_str());
-        if ((rc = capture_lfs_endpoint_state(root, out.lfs_endpoint_state))) return rc;
-    }
-    if (out.lfs_active && target && strcmp(target, out.head.c_str()))
+    if ((rc = capture_lfs_endpoint_state(root, out.lfs_endpoint_state, out.lfs_active))) return rc;
+    if (target && strcmp(target, out.head.c_str()))
         if ((rc = validate_lfs_tree_config(root, target))) return rc;
     if (out.managed) {
         if (int relative_rc = reject_relative_managed_paths(root, out.lfs_target_only)) return relative_rc;

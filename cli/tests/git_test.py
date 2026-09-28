@@ -1290,6 +1290,113 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((self.source / 'ambient-filter-ran').exists())
         self.assertFalse((one / 'ambient-filter-ran').exists())
 
+    def test_dormant_carried_lfs_settings_are_location_safe_without_activation(self):
+        def make_repo(name):
+            repo = self.root / name
+            repo.mkdir()
+            self.git(repo, 'init', '-q', '-b', 'main')
+            self.identify(repo)
+            (repo / 'file').write_text('ordinary repository content\n')
+            self.git(repo, 'add', 'file')
+            self.git(repo, 'commit', '-qm', 'ordinary repository')
+            return repo
+
+        safe = make_repo('dormant-lfs-safe')
+        self.git(safe, 'config', 'lfs.url', 'https://lfs.example.test/objects')
+        safe_snapshot = self.world('init', str(safe)).stdout.split()[0].decode()
+        one, wid = self.fork('dormant-lfs-safe-world', safe_snapshot)
+        self.assertEqual(self.git(one, 'config', '--local', '--get', 'lfs.url').stdout.strip(),
+                         b'https://lfs.example.test/objects')
+        self.git(one, 'config', '--local', '--get', 'filter.lfs.process', code=1)
+        self.assertFalse((one / '.world-git' / 'repo.git' / 'hooks' / 'pre-push').exists())
+        checkpoint = self.world('checkpoint', wid)
+        managed, managed_wid = self.fork('dormant-lfs-safe-managed', checkpoint.stdout.split()[0].decode())
+        self.assertEqual(self.git(managed, 'config', '--local', '--get', 'lfs.url').stdout.strip(),
+                         b'https://lfs.example.test/objects')
+        snapshots_before = json.loads(self.world('list', '--json').stdout)['snapshots']
+        self.git(managed, 'config', '--local', 'lfs.url', '../relative-lfs')
+        refused = self.world('checkpoint', managed_wid, code=3)
+        self.assertIn(b'must be an absolute URL', refused.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], snapshots_before)
+
+        cases = (
+            ('relative-endpoint', 'lfs.url', '../relative-lfs', b'must be an absolute URL'),
+            ('relative-remote-endpoint', 'remote.origin.lfsurl', '../relative-lfs', b'must be an absolute URL'),
+            ('valueless-endpoint', 'lfs.url', None, b'must be an absolute URL'),
+            ('custom-storage', 'lfs.storage', '../shared-lfs', b'custom lfs.storage is not supported'),
+            ('extension', 'lfs.extension.test.clean', 'git-lfs clean -- %f', b'Git LFS extensions are not supported'),
+            ('custom-transfer', 'lfs.customtransfer.test.path', '/tmp/lfs-transfer', b'custom Git LFS transfer agents are not supported'),
+            ('standalone-transfer', 'lfs.standalonetransferagent', 'custom-agent', b'stand-alone transfer agents are not supported'),
+        )
+        for name, key, value, reason in cases:
+            with self.subTest(setting=key):
+                repo = make_repo('dormant-lfs-' + name)
+                if value is None:
+                    with (repo / '.git' / 'config').open('a') as config:
+                        config.write('\n[lfs]\n\turl\n')
+                else:
+                    self.git(repo, 'config', key, value)
+                config_before = (repo / '.git' / 'config').read_bytes()
+                index_before = (repo / '.git' / 'index').read_bytes()
+                refused = self.world('init', str(repo), code=3)
+                self.assertIn(reason, refused.stderr)
+                self.assertEqual((repo / '.git' / 'config').read_bytes(), config_before)
+                self.assertEqual((repo / '.git' / 'index').read_bytes(), index_before)
+
+        for view in ('worktree', 'index', 'HEAD'):
+            with self.subTest(lfsconfig_view=view):
+                repo = make_repo('dormant-lfsconfig-' + view)
+                (repo / '.lfsconfig').write_text('[lfs]\n url = ../relative-lfs\n')
+                if view in ('index', 'HEAD'):
+                    self.git(repo, 'add', '.lfsconfig')
+                if view == 'HEAD':
+                    self.git(repo, 'commit', '-qm', 'relative endpoint in HEAD')
+                    (repo / '.lfsconfig').write_text('[lfs]\n url = https://lfs.example.test/objects\n')
+                    self.git(repo, 'add', '.lfsconfig')
+                elif view == 'index':
+                    (repo / '.lfsconfig').write_text('[lfs]\n url = https://lfs.example.test/objects\n')
+                before = (repo / '.git' / 'index').read_bytes()
+                refused = self.world('init', str(repo), code=3)
+                self.assertIn(b'must be an absolute URL', refused.stderr)
+                self.assertEqual((repo / '.git' / 'index').read_bytes(), before)
+
+        # Worktree-scoped settings remain outside the admitted carry set, even when endpoint
+        # syntax is unsafe; do not broaden that separate policy as part of dormant validation.
+        worktree = make_repo('dormant-lfs-worktree')
+        self.git(worktree, 'config', 'extensions.worktreeConfig', 'true')
+        self.git(worktree, 'config', '--worktree', 'lfs.url', '../relative-lfs')
+        refused = self.world('init', str(worktree), code=3)
+        self.assertIn(b'worktree-scoped setting lfs.url', refused.stderr)
+
+    def test_dormant_ambient_lfs_config_is_not_carried_or_activated(self):
+        global_config = self.root / 'dormant-global-lfs'
+        global_config.write_text('[lfs]\n url = ../relative-lfs\n'
+                                 '[lfs "extension.unused"]\n clean = touch unused-lfs-extension-ran\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        snapshot = self.world('init', str(self.source)).stdout.split()[0].decode()
+        one, _ = self.fork('dormant-ambient-lfs-world', snapshot)
+        self.git(one, 'config', '--local', '--get', 'lfs.url', code=1)
+        self.git(one, 'config', '--local', '--get', 'filter.lfs.process', code=1)
+        self.assertFalse((one / '.world-git' / 'repo.git' / 'hooks' / 'pre-push').exists())
+        self.assertFalse((self.source / 'unused-lfs-extension-ran').exists())
+        self.assertFalse((one / 'unused-lfs-extension-ran').exists())
+
+    def test_committed_only_checks_dormant_submodule_target_lfsconfig(self):
+        self.submodule_fixture()
+        lib = self.source / 'libs/lib'
+        old = self.git(lib, 'rev-parse', 'HEAD').stdout.strip()
+        (lib / '.lfsconfig').write_text('[lfs]\n url = ../relative-lfs\n')
+        self.git(lib, 'add', '.lfsconfig')
+        self.git(lib, 'commit', '-qm', 'dormant relative LFS endpoint')
+        self.git(self.source, 'add', 'libs/lib')
+        self.git(self.source, 'commit', '-qm', 'record dormant LFS target')
+        self.git(lib, 'checkout', '-q', old.decode())
+
+        refused = self.world('init', str(self.source), '--committed-only', code=3)
+        self.assertIn(b'must be an absolute URL', refused.stderr)
+        self.assertEqual(self.git(lib, 'rev-parse', 'HEAD').stdout.strip(), old)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_local_canonical_lfs_setup_is_preserved_for_another_branch(self):
         import hashlib
         if not shutil.which('git-lfs'):
