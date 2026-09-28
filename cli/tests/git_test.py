@@ -722,10 +722,15 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(self.source, '-c', 'core.hooksPath=/dev/null', 'status', '--porcelain',
                                   '--', '.husky').stdout, b'')
         self.world('init', str(self.source), '--committed-only', '--with-hooks')
+        self.assertEqual((self.source / '.husky' / 'pre-push').read_bytes(), legacy)
         one, _ = self.fork()
         self.assertEqual(self.git(one, 'config', '--get', 'core.hooksPath').stdout.strip(), b'.husky')
-        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
         self.assertTrue(os.access(one / '.husky' / 'pre-push', os.X_OK))
+        self.assertEqual((one / '.husky' / 'pre-push').read_bytes(), legacy)
+        # A normal Git LFS filter-process can upgrade this legacy hook as a
+        # side effect. Keep the cleanliness check from mutating either copy.
+        self.assertEqual(self.git(one, '-c', 'core.hooksPath=/dev/null', 'status', '--porcelain').stdout, b'')
+        self.assertEqual((self.source / '.husky' / 'pre-push').read_bytes(), legacy)
         self.assertEqual((one / '.husky' / 'pre-push').read_bytes(), legacy)
 
     def test_with_hooks_preserves_legacy_lfs_prepush_in_git_admin(self):
@@ -2032,6 +2037,50 @@ class GitWorldTest(unittest.TestCase):
         self.assertTrue(done.exists(), result.stderr.decode(errors='replace'))
         self.assertEqual(target_cache.read_bytes(), b'X' + payload[1:])
         self.assertIn(b'target Git LFS cache', result.stderr)
+        self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/' + wid, code=1)
+
+    def test_publish_rechecks_name_after_linkat_eexist_lfs_cache_race(self):
+        import hashlib
+        import shlex
+        self.install_lfs(self.source)
+        payload = b'payload racing into the target LFS cache\n'
+        (self.source / 'file.bin').write_bytes(payload)
+        self.git(self.source, 'add', '.gitattributes', 'file.bin')
+        self.git(self.source, 'commit', '-qm', 'target LFS payload')
+        oid = hashlib.sha256(payload).hexdigest()
+        target_cache = self.lfs_object_path(self.source, oid)
+        snapshot = self.world('init', str(self.source)).stdout.split()[0].decode()
+        one, wid = self.fork('lfs-eexist-race', snapshot)
+        target_cache.unlink()
+
+        real_git = shutil.which('git')
+        wrapper = self.root / 'lfs-eexist-race-bin'
+        wrapper.mkdir()
+        created = self.root / 'lfs-eexist-created'
+        replaced = self.root / 'lfs-eexist-replaced'
+        script = wrapper / 'git'
+        script.write_text(
+            '#!/bin/sh\nfilearg=\nfor arg in "$@"; do case "$arg" in --file=*) filearg=${arg#--file=};; esac; done\n' +
+            shlex.quote(real_git) + ' "$@"\nresult=$?\n' +
+            'if [ "$result" = 0 ] && [ ! -e ' + shlex.quote(str(created)) + ' ]; then\n' +
+            '  case "$filearg" in */.wfs-*)\n' +
+            '    mkdir -p ' + shlex.quote(str(target_cache.parent)) + '\n' +
+            '    printf %s ' + shlex.quote(payload.decode()) + ' > ' + shlex.quote(str(target_cache)) + '\n' +
+            '    : > ' + shlex.quote(str(created)) + '\n' +
+            '  esac\n' +
+            'elif [ "$result" = 0 ] && [ "$filearg" = /dev/stdin ] && [ -e ' + shlex.quote(str(created)) +
+            ' ] && [ ! -e ' + shlex.quote(str(replaced)) + ' ]; then\n' +
+            '  cp ' + shlex.quote(str(target_cache)) + ' ' + shlex.quote(str(target_cache) + '.replacement') + '\n' +
+            '  mv ' + shlex.quote(str(target_cache) + '.replacement') + ' ' + shlex.quote(str(target_cache)) + '\n' +
+            '  : > ' + shlex.quote(str(replaced)) + '\nfi\nexit "$result"\n')
+        script.chmod(0o700)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+
+        result = self.world('publish', wid, code=3)
+        self.assertTrue(created.exists(), result.stderr.decode(errors='replace'))
+        self.assertTrue(replaced.exists(), result.stderr.decode(errors='replace'))
+        self.assertEqual(target_cache.read_bytes(), payload)
+        self.assertIn(b'target Git LFS cache object', result.stderr)
         self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/' + wid, code=1)
 
     def test_publish_refuses_relative_lfs_endpoint_in_new_history(self):

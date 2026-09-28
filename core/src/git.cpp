@@ -4510,6 +4510,71 @@ int open_lfs_dir(int parent, const char *name, bool create) {
     return openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 }
 
+int verify_named_lfs_payload(const char *world, int dirfd, const LfsPointerRecord &record) {
+    struct stat named_before;
+    if (fstatat(dirfd, record.oid.c_str(), &named_before, AT_SYMLINK_NOFOLLOW) ||
+        !S_ISREG(named_before.st_mode) || named_before.st_size < 0 ||
+        (uint64_t)named_before.st_size != record.size)
+        return refuse(WFS_E_GIT_TARGET, "the target Git LFS cache has a corrupt object %s", record.oid.c_str());
+
+    int fd = openat(dirfd, record.oid.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat before;
+    if (fd < 0 || fstat(fd, &before) || !S_ISREG(before.st_mode) || before.st_size < 0 ||
+        (uint64_t)before.st_size != record.size || before.st_dev != named_before.st_dev ||
+        before.st_ino != named_before.st_ino) {
+        if (fd >= 0) close(fd);
+        return refuse(WFS_E_GIT_TARGET, "the target Git LFS cache object %s changed or is corrupt", record.oid.c_str());
+    }
+
+    const char *file_arg = "--file=/dev/stdin";
+    Vec<char> first_hash, second_hash;
+    int rc = lseek(fd, 0, SEEK_SET) < 0 ? -errno : lfs_pointer_oracle(world, file_arg, &first_hash, fd);
+    if (!rc && lseek(fd, 0, SEEK_SET) < 0) rc = -errno;
+    if (!rc) rc = lfs_pointer_oracle(world, file_arg, &second_hash, fd);
+    bool valid_hash = false;
+    if (!rc) {
+        LfsPointerRecord got; bool looks = false;
+        valid_hash = parse_lfs_pointer(first_hash.data(), first_hash.size() - 1, got, looks) &&
+            got.oid == record.oid && got.size == record.size && same_bytes(first_hash, second_hash);
+        if (!valid_hash) rc = refuse(WFS_E_GIT_TARGET,
+            "the target Git LFS cache object %s changed or is corrupt", record.oid.c_str());
+    }
+
+    struct stat after, named_after;
+    bool after_ok = !fstat(fd, &after);
+    bool named_ok = !fstatat(dirfd, record.oid.c_str(), &named_after, AT_SYMLINK_NOFOLLOW);
+    bool same_times = false;
+    bool same_named_times = false;
+#if defined(__APPLE__)
+    same_times = after_ok && before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec &&
+        before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec &&
+        before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec &&
+        before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec;
+    same_named_times = after_ok && named_ok && after.st_mtimespec.tv_sec == named_after.st_mtimespec.tv_sec &&
+        after.st_mtimespec.tv_nsec == named_after.st_mtimespec.tv_nsec &&
+        after.st_ctimespec.tv_sec == named_after.st_ctimespec.tv_sec &&
+        after.st_ctimespec.tv_nsec == named_after.st_ctimespec.tv_nsec;
+#else
+    same_times = after_ok && before.st_mtim.tv_sec == after.st_mtim.tv_sec &&
+        before.st_mtim.tv_nsec == after.st_mtim.tv_nsec &&
+        before.st_ctim.tv_sec == after.st_ctim.tv_sec &&
+        before.st_ctim.tv_nsec == after.st_ctim.tv_nsec;
+    same_named_times = after_ok && named_ok && after.st_mtim.tv_sec == named_after.st_mtim.tv_sec &&
+        after.st_mtim.tv_nsec == named_after.st_mtim.tv_nsec &&
+        after.st_ctim.tv_sec == named_after.st_ctim.tv_sec &&
+        after.st_ctim.tv_nsec == named_after.st_ctim.tv_nsec;
+#endif
+    bool stable = after_ok && named_ok &&
+        S_ISREG(named_after.st_mode) && before.st_dev == after.st_dev && before.st_ino == after.st_ino &&
+        before.st_size == after.st_size && same_times && after.st_dev == named_after.st_dev &&
+        after.st_ino == named_after.st_ino && after.st_size == named_after.st_size && same_named_times;
+    close(fd);
+    if (rc) return rc;
+    if (!stable) return refuse(WFS_E_GIT_TARGET,
+        "the target Git LFS cache object %s changed or is corrupt", record.oid.c_str());
+    return 0;
+}
+
 int install_lfs_payload(const char *world, const char *source_common, const char *target_common,
                         const LfsPointerRecord &record) {
     char first[3] = {record.oid[0], record.oid[1], 0};
@@ -4526,57 +4591,9 @@ int install_lfs_payload(const char *world, const char *source_common, const char
     if (b < 0) return -errno;
     struct stat st;
     if (!fstatat(b, record.oid.c_str(), &st, AT_SYMLINK_NOFOLLOW)) {
-        if (!S_ISREG(st.st_mode) || (uint64_t)st.st_size != record.size) {
-            close(b);
-            return refuse(WFS_E_GIT_TARGET, "the target Git LFS cache has a corrupt object %s", record.oid.c_str());
-        }
-        int existing = openat(b, record.oid.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-        struct stat before;
-        if (existing < 0 || fstat(existing, &before) || !S_ISREG(before.st_mode) ||
-            (uint64_t)before.st_size != record.size || before.st_dev != st.st_dev || before.st_ino != st.st_ino) {
-            if (existing >= 0) close(existing);
-            close(b);
-            return refuse(WFS_E_GIT_TARGET, "the target Git LFS cache object %s changed or is corrupt", record.oid.c_str());
-        }
-        const char *file_arg = "--file=/dev/stdin";
-        Vec<char> first_hash, second_hash;
-        int verify_rc = lseek(existing, 0, SEEK_SET) < 0 ? -errno :
-            lfs_pointer_oracle(world, file_arg, &first_hash, existing);
-        if (!verify_rc && lseek(existing, 0, SEEK_SET) < 0) verify_rc = -errno;
-        if (!verify_rc) verify_rc = lfs_pointer_oracle(world, file_arg, &second_hash, existing);
-        bool valid_hash = false;
-        if (!verify_rc) {
-            LfsPointerRecord got; bool looks = false;
-            valid_hash = parse_lfs_pointer(first_hash.data(), first_hash.size() - 1, got, looks) &&
-                got.oid == record.oid && got.size == record.size && same_bytes(first_hash, second_hash);
-            if (!valid_hash) verify_rc = refuse(WFS_E_GIT_TARGET,
-                "the target Git LFS cache object %s changed or is corrupt", record.oid.c_str());
-        }
-        struct stat after, named;
-        bool after_ok = !fstat(existing, &after);
-        bool same_times = false;
-#if defined(__APPLE__)
-        same_times = after_ok && before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec &&
-            before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec &&
-            before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec &&
-            before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec;
-#else
-        same_times = after_ok && before.st_mtim.tv_sec == after.st_mtim.tv_sec &&
-            before.st_mtim.tv_nsec == after.st_mtim.tv_nsec &&
-            before.st_ctim.tv_sec == after.st_ctim.tv_sec &&
-            before.st_ctim.tv_nsec == after.st_ctim.tv_nsec;
-#endif
-        bool stable = after_ok &&
-            !fstatat(b, record.oid.c_str(), &named, AT_SYMLINK_NOFOLLOW) && S_ISREG(named.st_mode) &&
-            before.st_dev == after.st_dev && before.st_ino == after.st_ino &&
-            before.st_size == after.st_size && same_times && after.st_dev == named.st_dev && after.st_ino == named.st_ino &&
-            after.st_size == named.st_size;
-        close(existing);
+        int verify_rc = verify_named_lfs_payload(world, b, record);
         close(b);
-        if (verify_rc) return verify_rc;
-        if (!stable) return refuse(WFS_E_GIT_TARGET,
-            "the target Git LFS cache object %s changed or is corrupt", record.oid.c_str());
-        return 0;
+        return verify_rc;
     }
     if (errno != ENOENT) { int err = -errno; close(b); return err; }
 
@@ -4636,31 +4653,7 @@ int install_lfs_payload(const char *world, const char *source_common, const char
     }
     if (!rc && linkat(b, temp, b, record.oid.c_str(), 0)) {
         if (errno == EEXIST) {
-            int existing = openat(b, record.oid.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-            struct stat existing_st;
-            bool same = existing >= 0 && !fstat(existing, &existing_st) && S_ISREG(existing_st.st_mode) &&
-                (uint64_t)existing_st.st_size == record.size;
-            int staged = openat(b, temp, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-            if (staged < 0) same = false;
-            char left[8192], right[8192];
-            while (same) {
-                ssize_t n = read(existing, left, sizeof left);
-                if (n < 0 && errno == EINTR) continue;
-                if (n < 0) { same = false; break; }
-                if (!n) break;
-                ssize_t m;
-                do { m = read(staged, right, (size_t)n); } while (m < 0 && errno == EINTR);
-                if (m != n || memcmp(left, right, (size_t)n)) { same = false; break; }
-            }
-            if (same) {
-                char extra;
-                ssize_t n; do { n = read(staged, &extra, 1); } while (n < 0 && errno == EINTR);
-                if (n != 0) same = false;
-            }
-            if (existing >= 0) close(existing);
-            if (staged >= 0) close(staged);
-            if (!same)
-                rc = refuse(WFS_E_GIT_TARGET, "the target Git LFS cache has a corrupt object %s", record.oid.c_str());
+            rc = verify_named_lfs_payload(world, b, record);
         } else rc = -errno;
     }
     if (!rc && fsync(b)) rc = -errno;
