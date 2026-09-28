@@ -89,7 +89,7 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'/docs/', patterns)
         self.world('init', str(self.source))
         shutil.rmtree(self.source)
-        one, _ = self.fork()
+        one, wid = self.fork()
         path = self.git(one, 'rev-parse', '--path-format=absolute', '--git-path', 'info/sparse-checkout').stdout.decode().strip()
         self.assertEqual(Path(path).read_bytes(), patterns)
         # The worktree-scoped switches `disable` left behind travel with the patterns.
