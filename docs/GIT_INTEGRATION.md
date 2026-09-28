@@ -164,23 +164,29 @@ submodules. The tracked checkout may contain hydrated files or pointer files. Ex
 preserves the worktree bytes and index as captured, and copies the repository's local
 `.git/lfs/objects` cache into the World's owned Git administration. Each payload's SHA-256,
 fan-out path and recorded size are checked before publication, and the source cache is rechecked
-afterward; import does not run the LFS clean, smudge or process commands. A global LFS filter that no tracked file
-uses remains harmless.
+afterward. To determine tracked-file status, import uses only Git LFS's canonical clean/process
+filters with an isolated temporary `lfs.storage`; smudge/process are set to skip, so this check
+does not download content or write to the source cache. The temporary storage is discarded.
+A global LFS filter that no tracked file uses remains harmless. Git LFS 3.8.0 is the tested version.
 
 The owned cache is independent of the source. After import, deleting or moving the source and
 its cache does not affect offline work. Forks and checkpoints carry each root and submodule cache
-with their owned Git administration. `--committed-only` resets to HEAD with filters disabled,
-then runs `git lfs checkout` against the local cache: available payloads are hydrated, while an
+with their owned Git administration. `--committed-only` resets to HEAD with LFS smudging skipped
+while the stock process filter still recognizes pointers, then runs `git lfs checkout` against
+the local cache: available payloads are hydrated, while an
 uncached pointer stays a pointer. Ordinary import and `--include-changes` retain the original
 worktree and staged bytes.
 
 Only the stock `git-lfs` clean, smudge and process commands are admitted when a tracked path uses
-`filter=lfs`; custom commands, LFS extensions and external `lfs.storage` locations are refused
-before any filter runs. With `--with-hooks`, the generated Git LFS `pre-push` hook is carried so
-an ordinary `git push` transfers payloads to its remote. `publish` validates and transfers every
-required payload in the commits being published, including objects that appear only in an
-intermediate commit, before moving the source branch. A missing or corrupt payload aborts before
-the branch moves.
+`filter=lfs`; custom commands, extensions, custom transfer agents and external `lfs.storage`
+locations are refused. LFS endpoint URLs are carried when absolute; relative endpoints are
+refused. An ordinary import installs and pins its generated pre-push hook in the World's own Git
+administration, independent of ambient `core.hooksPath`; under `--with-hooks`, an existing
+pre-push hook is carried only when it is Git LFS's canonical script (other supported hooks retain
+their normal handling). An ordinary `git push` then
+transfers payloads to its remote. `publish` validates and transfers every required payload in the
+commits being published, including objects that appear only in an intermediate commit, before
+moving the source branch. A missing or corrupt payload aborts before the branch moves.
 
 ## Submodules
 
@@ -523,7 +529,8 @@ What cannot be shared is refused with a Git configuration error that names the r
   machine-wide `git lfs install` adds, is fine in a repository whose files do not use it; so is
   a `filter=` attribute whose driver is not defined anywhere. With `--committed-only`, the files
   and attributes of HEAD count too, so a filter HEAD assigns is refused even when uncommitted
-  edits remove the assignment. Filters are never executed by the import.
+  edits remove the assignment. Unsupported filters are never executed; the stock Git LFS status
+  path is isolated in temporary storage as described above.
 - A conditional `includeIf` whose target sets status or filter settings, in any scope and
   whether or not it is active at the source: the condition (a `gitdir:` pattern, a branch)
   can evaluate differently at the World's location. The same is refused for a target that
@@ -578,14 +585,12 @@ External eligibility is checked again around import.
 The whole stash stack is imported, in the root and in every initialized submodule (each
 repository has its own). A stash is `refs/stash` plus its reflog, `logs/refs/stash` in the
 repository's common directory (shared by all of its worktrees): `stash@{0}` is the ref and
-`stash@{1..n}` exist only as reflog entries. The mirror copies the ref but never a reflog, and
-a transport-based copy would also leave out the objects only older entries reach. So the
-import writes the stash reflog byte for byte where the owned repository's Git reads it (for
-the root, `.world-git/repo.git/logs/refs/stash`, which the World's worktree shares) and copies
-every object of every entry -- its commit and the index and untracked-files commits and trees
-it records -- read-only from the source (`pack-objects --stdout` there, `index-pack` in the
-owned repository; objects the other refs reach are already in the mirror). Nothing in the
-source changes and no hook or filter runs.
+`stash@{1..n}` exist only as reflog entries. The object-store clone includes objects that only
+older reflog entries reach. Import writes the stash reflog byte for byte where the owned
+repository's Git reads it (for the root, `.world-git/repo.git/logs/refs/stash`, which the World's
+worktree shares), then restores the reflog and verifies every entry's commit, index and
+untracked-files commit/tree in that object store. Nothing in the source changes and no hook or
+filter runs.
 
 The reflog's bytes are part of the captured state: a stash pushed, dropped or popped in the
 source before publication aborts the import like any other ref change. The copy that will be

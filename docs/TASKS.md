@@ -22,10 +22,15 @@
   submodule 缺失的 gitlink 提交。
 - [x] `feat/git-stash`: 有 stash 的仓库可以导入(此前拒绝)。根和每个已初始化 submodule 的整个
   stash 栈随导入:`logs/refs/stash` 逐字节写入自有仓库(根的在 `.world-git/repo.git`,World
-  worktree 共享),每个条目的对象(含 index / untracked 提交)从源只读 `pack-objects` 复制;
+  worktree 共享),每个条目的对象(含 index / untracked 提交)在完整克隆的对象库中验证;
   reflog 字节纳入发布前的源不变复查,副本按整体(reflog 字节、条目列表、全部对象存在)对比;
   stash 条目纳入保留路径检查;fork/checkpoint(含 `--committed-only`)保留,publish 不发布。
   其他 reflog 仍不导入。
+- [x] Git object CoW: 克隆受验证的 common object store,维持 refs/config/reflog 语义;
+  仅安全文件可复用,复制后检查连通性;原生 CoW 不可用/跨卷时回退,共享 GC 冲突时可重试。
+- [x] Git LFS: 支持 stock filter、owned root/submodule cache、fork/checkpoint、受限 pre-push 与
+  publish 历史对象传输;自定义 filter/extension/transfer、非本地 storage 与相对 endpoint 拒绝。
+  范围及测试见 [`GIT_INTEGRATION.md`](GIT_INTEGRATION.md)。
 - [ ] Issue #7 剩余: reftable 仓库、共享 refs/对象服务、跨机器历史传输。
   范围及测试见 [`GIT_INTEGRATION.md`](GIT_INTEGRATION.md)。
 
