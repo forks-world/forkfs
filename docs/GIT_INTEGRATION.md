@@ -167,7 +167,10 @@ fan-out path and recorded size are checked before publication, and the source ca
 afterward. To determine tracked-file status, import uses only Git LFS's canonical clean/process
 filters with an isolated temporary `lfs.storage`; smudge/process are set to skip, so this check
 does not download content or write to the source cache. The temporary storage is discarded.
-A global LFS filter that no tracked file uses remains harmless. Git LFS 3.8.0 is the tested version.
+A global LFS filter that no tracked file uses remains harmless. Pointer hashing detects whether the
+installed Git LFS help advertises `--no-extensions`; older releases without that option use their
+legacy raw SHA-256 pointer command. Unrecognized or failed help is refused rather than retried with
+an unsafe command. Git LFS 3.8.0 is the tested version.
 
 The owned cache is independent of the source. After import, deleting or moving the source and
 its cache does not affect offline work. Forks and checkpoints carry each root and submodule cache

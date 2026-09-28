@@ -106,6 +106,24 @@ int value(const char *root, const char *const *args, String &out, bool missing_o
     if (!out.empty() && out.back() == '\n') out.pop_back();
     return 0;
 }
+// Older Git LFS releases hash pointer payloads directly but do not accept
+// --no-extensions. Newer releases need that flag to avoid running configured
+// extensions. Probe once, fail closed on an unrecognized CLI, and select the
+// raw-hash-compatible command form for every pointer verification.
+int lfs_pointer_oracle(const char *root, const char *file_arg, Vec<char> *output = nullptr, int stdin_fd = -1) {
+    static int no_extensions = -1;
+    if (no_extensions < 0) {
+        const char *help_args[] = {"lfs", "pointer", "-h", nullptr};
+        Vec<char> help;
+        if (int rc = git(root, help_args, &help)) return rc;
+        if (!help.data() || !strstr(help.data(), "--file") || !strstr(help.data(), "--check"))
+            return WFS_E_GIT_FAILED;
+        no_extensions = strstr(help.data(), "--no-extensions") ? 1 : 0;
+    }
+    const char *modern[] = {"lfs", "pointer", "--no-extensions", file_arg, nullptr};
+    const char *legacy[] = {"lfs", "pointer", file_arg, nullptr};
+    return git(root, no_extensions ? modern : legacy, output, nullptr, false, false, stdin_fd);
+}
 int collect_symrefs(const char *root, Vec<GitSymref> &out) {
     const char *args[] = {"for-each-ref", "--format=%(refname)%09%(symref)", nullptr};
     Vec<char> listing;
@@ -1080,9 +1098,8 @@ int validate_lfs_files(const char *root, const String &dir, const String &rel, V
             rc = refuse(WFS_E_GIT_UNSUPPORTED, "the Git LFS cache contains a symlink or special file (%s)", child_rel.c_str()); break;
         }
         String file_arg("--file="); file_arg.append(child.c_str());
-        const char *args[] = {"lfs", "pointer", "--no-extensions", file_arg.c_str(), nullptr};
         Vec<char> pointer;
-        if ((rc = git(root, args, &pointer))) {
+        if ((rc = lfs_pointer_oracle(root, file_arg.c_str(), &pointer))) {
             rc = refuse(WFS_E_GIT_UNSUPPORTED, "Git LFS cache object %s is corrupt", child_rel.c_str()); break;
         }
         char oid[65] = {0}; unsigned long long size = 0;
@@ -4506,12 +4523,12 @@ int install_lfs_payload(const char *world, const char *source_common, const char
             close(b);
             return refuse(WFS_E_GIT_TARGET, "the target Git LFS cache object %s changed or is corrupt", record.oid.c_str());
         }
-        const char *verify[] = {"lfs", "pointer", "--no-extensions", "--file=/dev/stdin", nullptr};
+        const char *file_arg = "--file=/dev/stdin";
         Vec<char> first_hash, second_hash;
         int verify_rc = lseek(existing, 0, SEEK_SET) < 0 ? -errno :
-            git(world, verify, &first_hash, nullptr, false, false, existing);
+            lfs_pointer_oracle(world, file_arg, &first_hash, existing);
         if (!verify_rc && lseek(existing, 0, SEEK_SET) < 0) verify_rc = -errno;
-        if (!verify_rc) verify_rc = git(world, verify, &second_hash, nullptr, false, false, existing);
+        if (!verify_rc) verify_rc = lfs_pointer_oracle(world, file_arg, &second_hash, existing);
         bool valid_hash = false;
         if (!verify_rc) {
             LfsPointerRecord got; bool looks = false;
@@ -4594,9 +4611,8 @@ int install_lfs_payload(const char *world, const char *source_common, const char
         String temp_path = joinp(target_common, "lfs/objects");
         temp_path = joinp(temp_path.c_str(), first); temp_path = joinp(temp_path.c_str(), second); temp_path = joinp(temp_path.c_str(), temp);
         String file_arg("--file="); file_arg.append(temp_path.c_str());
-        const char *verify[] = {"lfs", "pointer", "--no-extensions", file_arg.c_str(), nullptr};
         Vec<char> parsed;
-        rc = git(world, verify, &parsed);
+        rc = lfs_pointer_oracle(world, file_arg.c_str(), &parsed);
         if (!rc) {
             LfsPointerRecord got; bool looks = false;
             if (!parse_lfs_pointer(parsed.data(), parsed.size() - 1, got, looks) || got.oid != record.oid || got.size != record.size)

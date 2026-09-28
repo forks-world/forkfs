@@ -1723,6 +1723,93 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(self.source, 'rev-parse', 'refs/heads/world/' + wid).stdout.strip(),
                          self.git(one, 'rev-parse', 'HEAD').stdout.strip())
 
+    def test_lfs_pointer_hashing_supports_legacy_help_without_no_extensions(self):
+        import hashlib
+        import shlex
+        self.install_lfs(self.source)
+        existing = b'cached before import\n'
+        (self.source / 'existing.bin').write_bytes(existing)
+        self.git(self.source, 'add', '.gitattributes', 'existing.bin')
+        self.git(self.source, 'commit', '-qm', 'existing cached LFS object')
+        existing_oid = hashlib.sha256(existing).hexdigest()
+        self.assertEqual(self.lfs_object_path(self.source, existing_oid).read_bytes(), existing)
+
+        real_lfs = shutil.which('git-lfs')
+        real_help = subprocess.run([real_lfs, 'pointer', '-h'], capture_output=True, timeout=30)
+        self.assertEqual(real_help.returncode, 0, real_help.stderr)
+        self.assertIn(b'--file', real_help.stdout)
+        self.assertIn(b'--check', real_help.stdout)
+        real_supports_no_extensions = b'--no-extensions' in real_help.stdout
+        wrapper = self.root / 'legacy-git-lfs-bin'
+        wrapper.mkdir()
+        help_seen = self.root / 'legacy-help-seen'
+        legacy_seen = self.root / 'legacy-pointer-seen'
+        flag_rejected = self.root / 'legacy-flag-rejected'
+        script = wrapper / 'git-lfs'
+        script.write_text(
+            '#!/bin/sh\n'
+            'real=' + shlex.quote(real_lfs) + '\n'
+            'if [ "$1" = pointer ]; then\n'
+            '  shift\n'
+            '  if [ "$1" = -h ] || [ "$1" = --help ]; then\n'
+            '    : > ' + shlex.quote(str(help_seen)) + '\n'
+            '    if [ "${FORKFS_TEST_BAD_LFS_HELP:-0}" = 1 ]; then\n'
+            '      echo "usage: git-lfs pointer --file=<file>"\n'
+            '      exit 0\n'
+            '    fi\n'
+            '    "$real" pointer "$@" | sed "s/--no-extensions//g"\n'
+            '    exit $?\n'
+            '  fi\n'
+            '  for arg do\n'
+            '    if [ "$arg" = --no-extensions ]; then\n'
+            '      : > ' + shlex.quote(str(flag_rejected)) + '\n'
+            '      exit 97\n'
+            '    fi\n'
+            '  done\n'
+            '  : > ' + shlex.quote(str(legacy_seen)) + '\n' +
+            ('  exec "$real" pointer --no-extensions "$@"\n' if real_supports_no_extensions else
+             '  exec "$real" pointer "$@"\n') +
+            'fi\n'
+            'exec "$real" "$@"\n')
+        script.chmod(0o700)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        added = b'published with legacy pointer interface\n'
+        added_oid = hashlib.sha256(added).hexdigest()
+        (one / 'added.bin').write_bytes(added)
+        self.git(one, 'add', 'added.bin')
+        self.git(one, 'commit', '-qm', 'new LFS object')
+        self.assertFalse(self.lfs_object_path(self.source, added_oid).exists())
+        self.world('publish', wid)
+
+        self.assertTrue(help_seen.is_file())
+        self.assertTrue(legacy_seen.is_file())
+        self.assertFalse(flag_rejected.exists())
+        self.assertEqual(self.lfs_object_path(self.source, added_oid).read_bytes(), added)
+        # The baseline object's target-cache reuse exercises the fd-backed oracle path.
+        self.assertEqual(self.lfs_object_path(self.source, existing_oid).read_bytes(), existing)
+
+        # A successful but incomplete help response is not treated as an old CLI: fail before
+        # invoking the legacy pointer command when the required interface cannot be verified.
+        bad_source = self.root / 'bad-pointer-help-source'
+        bad_source.mkdir()
+        self.git(bad_source, 'init', '-q', '-b', 'main')
+        self.identify(bad_source)
+        self.install_lfs(bad_source)
+        (bad_source / 'bad.bin').write_bytes(b'help probe must fail closed\n')
+        self.git(bad_source, 'add', '.gitattributes', 'bad.bin')
+        self.git(bad_source, 'commit', '-qm', 'bad help probe fixture')
+        legacy_seen.unlink()
+        self.env['FORKFS_TEST_BAD_LFS_HELP'] = '1'
+        try:
+            refused = self.world('init', str(bad_source), code=3)
+        finally:
+            self.env.pop('FORKFS_TEST_BAD_LFS_HELP', None)
+        self.assertIn(b'Git LFS cache object', refused.stderr)
+        self.assertFalse(legacy_seen.exists())
+
     def test_publish_ignores_plain_pointer_text_without_lfs_filter(self):
         import hashlib
         payload = b'ordinary text, not an LFS object\n'
