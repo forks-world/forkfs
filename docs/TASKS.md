@@ -20,6 +20,12 @@
   未初始化的保持未初始化并携带 `submodule.<name>.*` 配置;干净检查、`--include-changes`、
   `--committed-only`、fork/checkpoint/pool/discard 覆盖每个 submodule;publish 拒绝目标
   submodule 缺失的 gitlink 提交。
+- [x] `feat/git-stash`: 有 stash 的仓库可以导入(此前拒绝)。根和每个已初始化 submodule 的整个
+  stash 栈随导入:`logs/refs/stash` 逐字节写入自有仓库(根的在 `.world-git/repo.git`,World
+  worktree 共享),每个条目的对象(含 index / untracked 提交)从源只读 `pack-objects` 复制;
+  reflog 字节纳入发布前的源不变复查,副本按整体(reflog 字节、条目列表、全部对象存在)对比;
+  stash 条目纳入保留路径检查;fork/checkpoint(含 `--committed-only`)保留,publish 不发布。
+  其他 reflog 仍不导入。
 - [ ] Issue #7 剩余: Git LFS、reftable 仓库、共享 refs/对象服务、跨机器历史传输。
   范围及测试见 [`GIT_INTEGRATION.md`](GIT_INTEGRATION.md)。
 

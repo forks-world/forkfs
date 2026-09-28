@@ -160,7 +160,7 @@ An initialized submodule -- a directory the index records as a gitlink that hold
 at any depth up to 8 levels of nesting -- is imported with the root. Its repository is copied
 the way the root's is (a `--mirror --no-hardlinks` clone, then its index, symbolic refs, local
 rules, rerere cache, status settings, identity, carried remotes and submodule settings,
-`SQUASH_MSG`, `FETCH_HEAD`, `ORIG_HEAD` and, with `--with-hooks`, its hooks) into the place
+`SQUASH_MSG`, `FETCH_HEAD`, `ORIG_HEAD`, its stash stack and, with `--with-hooks`, its hooks) into the place
 Git itself uses for a submodule of a linked worktree: `modules/<name>` of the superproject's
 Git directory, which for the root is the World's per-worktree
 `.world-git/repo.git/worktrees/active`, and `modules/<name>/modules/<name>` for a nested one.
@@ -177,8 +177,8 @@ directory as its worktree. In the World every submodule is absorbed; the source 
 modified.
 
 Every check the root's import makes is made on each submodule's repository too -- the
-configuration policy and filters, extensions, partial/shallow/alternates, stash and hidden
-refs, grafts, in-progress operations, dangling symbolic refs, reserved paths in its history,
+configuration policy and filters, extensions, partial/shallow/alternates, hidden refs, the
+stash stack (see [Stash](#stash)), grafts, in-progress operations, dangling symbolic refs, reserved paths in its history,
 symlinked or unexpected administration -- and each is rechecked unchanged before publication.
 The `.gitmodules` settings of every repository with gitlinks are read again from the copy
 -- after any `--committed-only` reset, so the bytes that will be published -- and must equal,
@@ -409,7 +409,8 @@ content, including Git administrative changes such as branch/index updates.
 - Plain nested repositories (not submodules; see [Submodules](#submodules)), sparse or split
   indexes, shallow/partial clones, and object alternates are refused, in the root and in every
   submodule. So is a repository whose index, or any commit reachable
-  from its refs, HEAD, `ORIG_HEAD` or `FETCH_HEAD`, contains the root `.world` file or
+  from its refs, HEAD, `ORIG_HEAD`, `FETCH_HEAD` or any stash entry (its worktree, index and
+  untracked-files commits), contains the root `.world` file or
   anything under `.world-git`: WorldFS owns those paths, `info/exclude` cannot hide a
   tracked file, and an ordinary checkout of such a commit overwrites the World marker. Partial clones are recognized by `extensions.partialClone`,
   by any `remote.<name>.promisor` or `remote.<name>.partialclonefilter` setting, and by
@@ -537,14 +538,39 @@ backend are refused because it offers no read-only way to find such refs; the ow
 repositories themselves always use the files backend.
 
 Initial imports from external repositories reject any configured `transfer.hideRefs`
-or `uploadpack.hideRefs`, because the mirror transport may omit those refs. They
-also reject an existing `refs/stash` reflog: mirroring a ref does not preserve the
-stash stack. Ref tips without a stash reflog remain supported. Import does not
-promise preservation of other external reflog history.
+or `uploadpack.hideRefs`, because the mirror transport may omit those refs.
+This restriction does not apply to managed Worlds: their Git administration is
+cloned as part of the filesystem, retaining hidden refs through forks and checkpoints.
+External eligibility is checked again around import.
 
-These restrictions do not apply to managed Worlds: their Git administration is
-cloned as part of the filesystem, retaining hidden refs and native stash stacks
-through forks and checkpoints. External eligibility is checked again around import.
+### Stash
+
+The whole stash stack is imported, in the root and in every initialized submodule (each
+repository has its own). A stash is `refs/stash` plus its reflog, `logs/refs/stash` in the
+repository's common directory (shared by all of its worktrees): `stash@{0}` is the ref and
+`stash@{1..n}` exist only as reflog entries. The mirror copies the ref but never a reflog, and
+a transport-based copy would also leave out the objects only older entries reach. So the
+import writes the stash reflog byte for byte where the owned repository's Git reads it (for
+the root, `.world-git/repo.git/logs/refs/stash`, which the World's worktree shares) and copies
+every object of every entry -- its commit and the index and untracked-files commits and trees
+it records -- read-only from the source (`pack-objects --stdout` there, `index-pack` in the
+owned repository; objects the other refs reach are already in the mirror). Nothing in the
+source changes and no hook or filter runs.
+
+The reflog's bytes are part of the captured state: a stash pushed, dropped or popped in the
+source before publication aborts the import like any other ref change. The copy that will be
+published is then read back by Git itself -- the same reflog bytes, the same entries (selector,
+commit, tree, parents and message) and every commit, tree and blob of every entry present --
+and must match the source as a whole. Stash entries are history the World can check out
+(`git stash apply` writes their trees), so the reserved-path check covers them too: an entry
+whose worktree, index or untracked-files tree holds `.world` or `.world-git` is refused. In the
+World, after the source is deleted, `git stash list/show/apply/pop` work as they did in the
+source; forks and checkpoints (with `--committed-only` too, which never touches the stash) keep
+the stack, since the whole `.world-git` is cloned. `publish` moves one branch only and never
+publishes a stash.
+
+Only the stash reflog is carried, because the stash *is* a reflog. Other reflogs (`HEAD`,
+branches) are not imported, and import does not promise preservation of that history.
 
 External repositories with `info/grafts` are rejected because their local ancestry
 overrides are not transported by a mirror. Active bisect and sequencer sessions,
