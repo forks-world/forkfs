@@ -181,14 +181,19 @@ Only the stock `git-lfs` clean, smudge and process commands are admitted when a 
 `filter=lfs`; custom commands, extensions, custom transfer agents and external `lfs.storage`
 locations are refused. A complete stock LFS setup is retained from repository, global, or system
 configuration even when only another preserved branch uses LFS. LFS endpoint URLs are carried when absolute; relative endpoints are
-refused. An ordinary import installs and pins its generated pre-push hook in the World's own Git
+refused. Accepted canonical `smudge --skip` and `filter-process --skip` variants are retained in
+the World's owned local filter configuration. An ordinary import installs and pins its generated pre-push hook in the World's own Git
 administration, independent of ambient `core.hooksPath`; under `--with-hooks`, a carried in-tree
 `core.hooksPath` must already contain an executable canonical Git LFS pre-push hook, so import
 does not add untracked hook files. An existing pre-push hook is carried only when it is Git LFS's
 canonical script (other supported hooks retain their normal handling). An ordinary `git push` then
-transfers payloads to its remote. `publish` validates and transfers every required payload in the
-commits being published, including objects that appear only in an intermediate commit, before
-moving the source branch. A missing or corrupt payload aborts before the branch moves.
+transfers payloads to its remote. `publish` validates Git LFS pointers and `.lfsconfig` in every
+commit reachable from the branch being published, including history already present in the
+destination. Each required payload must be valid in the destination cache or available in the
+World's local cache for copying. Publishing fails if a required historical payload is missing or
+corrupt, or a historical `.lfsconfig` uses an unsupported endpoint. This can reject an otherwise
+unrelated publish until missing legacy payloads are restored; publishing does not download
+missing payloads.
 
 ## Submodules
 

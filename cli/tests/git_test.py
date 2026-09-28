@@ -1349,6 +1349,41 @@ class GitWorldTest(unittest.TestCase):
         self.assertTrue((one / '.world-git' / 'repo.git' / 'hooks' / 'pre-push').is_file())
         self.assertIn(b'lfs-history', self.git(one, 'branch', '--list').stdout)
 
+    def test_canonical_lfs_skip_variants_are_preserved_in_managed_config(self):
+        if not shutil.which('git-lfs'):
+            self.skipTest('needs git-lfs')
+        variants = ((True, False), (False, True), (True, True))
+        for index, (skip_smudge, skip_process) in enumerate(variants):
+            with self.subTest(skip_smudge=skip_smudge, skip_process=skip_process):
+                source = self.root / f'lfs-skip-{index}'
+                source.mkdir()
+                self.git(source, 'init', '-q', '-b', 'main')
+                self.identify(source)
+                self.install_lfs(source)
+                smudge = 'git-lfs smudge --skip -- %f' if skip_smudge else 'git-lfs smudge -- %f'
+                process = 'git-lfs filter-process --skip' if skip_process else 'git-lfs filter-process'
+                self.git(source, 'config', 'filter.lfs.smudge', smudge)
+                self.git(source, 'config', 'filter.lfs.process', process)
+                (source / 'payload.bin').write_bytes(b'captured skip variant\n')
+                self.git(source, 'add', '.gitattributes', 'payload.bin')
+                self.git(source, 'commit', '-qm', 'LFS skip variant')
+
+                snapshot = self.world('init', str(source)).stdout.split()[0].decode()
+                one, wid = self.fork(f'lfs-skip-one-{index}', snapshot)
+                expected_smudge = smudge.encode()
+                expected_process = process.encode()
+                self.assertEqual(self.git(one, 'config', '--local', '--get', 'filter.lfs.smudge').stdout.strip(),
+                                 expected_smudge)
+                self.assertEqual(self.git(one, 'config', '--local', '--get', 'filter.lfs.process').stdout.strip(),
+                                 expected_process)
+
+                managed = self.world('checkpoint', wid).stdout.split()[0].decode()
+                two, _ = self.fork(f'lfs-skip-two-{index}', managed)
+                self.assertEqual(self.git(two, 'config', '--local', '--get', 'filter.lfs.smudge').stdout.strip(),
+                                 expected_smudge)
+                self.assertEqual(self.git(two, 'config', '--local', '--get', 'filter.lfs.process').stdout.strip(),
+                                 expected_process)
+
     def test_include_changes_recognizes_filter_used_only_by_staged_attributes(self):
         self.install_lfs(self.source)
         (self.source / 'file').write_bytes(b'ordinary committed content\n')
@@ -1653,17 +1688,28 @@ class GitWorldTest(unittest.TestCase):
         self.world('init', str(self.source))
         one, wid = self.fork()
         intermediate = b'present only in an intermediate commit\n'
+        deleted_intermediate = b'deleted before the published tip\n'
         final = b'current LFS content at HEAD\n'
         (one / 'sequence.bin').write_bytes(intermediate)
-        self.git(one, 'add', 'sequence.bin')
+        (one / 'deleted.bin').write_bytes(deleted_intermediate)
+        self.git(one, 'add', 'sequence.bin', 'deleted.bin')
         self.git(one, 'commit', '-qm', 'intermediate LFS content')
         (one / 'sequence.bin').write_bytes(final)
+        self.git(one, 'rm', '-q', 'deleted.bin')
         self.git(one, 'add', 'sequence.bin')
         self.git(one, 'commit', '-qm', 'final LFS content')
         intermediate_oid = hashlib.sha256(intermediate).hexdigest()
+        deleted_oid = hashlib.sha256(deleted_intermediate).hexdigest()
         final_oid = hashlib.sha256(final).hexdigest()
         self.assertFalse(self.lfs_object_path(self.source, intermediate_oid).exists())
+        self.assertFalse(self.lfs_object_path(self.source, deleted_oid).exists())
         self.assertFalse(self.lfs_object_path(self.source, final_oid).exists())
+        # A different target ref can already reach World's tip without its LFS payloads.
+        # Publication must still inspect the complete history, not subtract all target refs.
+        self.git(self.source, 'fetch', '--quiet', str(one / '.world-git' / 'repo.git'),
+                 f'refs/heads/world/{wid}:refs/heads/other-tip')
+        self.assertEqual(self.git(self.source, 'rev-parse', 'refs/heads/other-tip').stdout.strip(),
+                         self.git(one, 'rev-parse', 'HEAD').stdout.strip())
         # Repository-local info attributes override --source=<commit> unless publication
         # evaluates attributes in an isolated repository.
         target_info_attributes = self.source / '.git' / 'info' / 'attributes'
@@ -1672,6 +1718,7 @@ class GitWorldTest(unittest.TestCase):
                          b'sequence.bin: filter: unset\n')
         self.world('publish', wid)
         self.assertEqual(self.lfs_object_path(self.source, intermediate_oid).read_bytes(), intermediate)
+        self.assertEqual(self.lfs_object_path(self.source, deleted_oid).read_bytes(), deleted_intermediate)
         self.assertEqual(self.lfs_object_path(self.source, final_oid).read_bytes(), final)
         self.assertEqual(self.git(self.source, 'rev-parse', 'refs/heads/world/' + wid).stdout.strip(),
                          self.git(one, 'rev-parse', 'HEAD').stdout.strip())
@@ -1785,6 +1832,10 @@ class GitWorldTest(unittest.TestCase):
         (one / '.lfsconfig').write_text('[lfs]\n    url = https://lfs.example.test/objects\n')
         self.git(one, 'add', '.lfsconfig')
         self.git(one, 'commit', '-qm', 'correct LFS endpoint')
+
+        # The tip is reachable from another target ref, but its ancestry still needs checks.
+        self.git(self.source, 'fetch', '--quiet', str(one / '.world-git' / 'repo.git'),
+                 f'refs/heads/world/{wid}:refs/heads/other-tip')
 
         cache_before = {p.relative_to(self.source / '.git/lfs/objects'): p.read_bytes()
                         for p in (self.source / '.git/lfs/objects').rglob('*') if p.is_file()}
@@ -4456,6 +4507,8 @@ class GitWorldTest(unittest.TestCase):
         lib = self.source / 'libs/lib'
         old = self.git(lib, 'rev-parse', 'HEAD').stdout.strip().decode()
         self.install_lfs(lib)
+        self.git(lib, 'config', 'filter.lfs.smudge', 'git-lfs smudge --skip -- %f')
+        self.git(lib, 'config', 'filter.lfs.process', 'git-lfs filter-process --skip')
         payload = b'committed target-only submodule LFS payload\n'
         oid = hashlib.sha256(payload).hexdigest()
         (lib / '.lfsconfig').write_text('[lfs]\n    url = ../relative-lfs\n')
@@ -4493,7 +4546,9 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(owned_lib, 'show', ':target.bin').stdout,
                          self.lfs_pointer(oid, len(payload)))
         self.assertEqual(self.git(owned_lib, 'config', '--get', 'filter.lfs.process').stdout.strip(),
-                         b'git-lfs filter-process')
+                         b'git-lfs filter-process --skip')
+        self.assertEqual(self.git(owned_lib, 'config', '--get', 'filter.lfs.smudge').stdout.strip(),
+                         b'git-lfs smudge --skip -- %f')
         self.assertEqual(self.git(owned_lib, 'config', '--get', 'lfs.storage').stdout.strip(), b'lfs')
         hooks_path = self.git(owned_lib, 'config', '--get', 'core.hooksPath').stdout.decode().strip()
         hook = Path(hooks_path)
@@ -4516,7 +4571,9 @@ class GitWorldTest(unittest.TestCase):
         managed_lib = managed_copy / 'libs/lib'
         self.assertEqual(self.git(managed_lib, 'rev-parse', 'HEAD').stdout.strip(), target)
         self.assertEqual(self.git(managed_lib, 'config', '--get', 'filter.lfs.process').stdout.strip(),
-                         b'git-lfs filter-process')
+                         b'git-lfs filter-process --skip')
+        self.assertEqual(self.git(managed_lib, 'config', '--get', 'filter.lfs.smudge').stdout.strip(),
+                         b'git-lfs smudge --skip -- %f')
         self.assertEqual(self.git(managed_lib, 'config', '--get', 'lfs.storage').stdout.strip(), b'lfs')
         managed_hooks = self.git(managed_lib, 'config', '--get', 'core.hooksPath').stdout.decode().strip()
         managed_hook = Path(managed_hooks)

@@ -1446,8 +1446,9 @@ int validate_lfs_filter(const char *root, bool &defined) {
 // A machine-wide or repository-local stock LFS filter is enough to declare that LFS is
 // supported by this repository, even when the current checkout has no LFS attributes or cache.
 // Unused custom/incomplete tuples remain inert under reject_used_filters.
-int canonical_lfs_setup(const char *root, bool &canonical) {
+int canonical_lfs_setup(const char *root, bool &canonical, bool &skip_smudge, bool &skip_process) {
     canonical = false;
+    skip_smudge = skip_process = false;
     String clean, smudge, process, required;
     bool have_clean = false, have_smudge = false, have_process = false, have_required = false;
     auto get = [&](const char *key, String &value, bool &present) -> int {
@@ -1477,6 +1478,10 @@ int canonical_lfs_setup(const char *root, bool &canonical) {
     bool process_ok = process == "git-lfs filter-process" || process == "git-lfs filter-process --skip";
     canonical = have_clean && have_smudge && have_process && clean_ok && smudge_ok && process_ok &&
         (!have_required || required == "true");
+    if (canonical) {
+        skip_smudge = smudge == "git-lfs smudge --skip -- %f";
+        skip_process = process == "git-lfs filter-process --skip";
+    }
     return 0;
 }
 int validate_lfs_storage(const char *root) {
@@ -2187,11 +2192,13 @@ int install_hooks(const GitRepoState &s, const char *clone, const char *repo) {
     if (!rc) rc = install_lfs_prepush(s, clone, repo);
     return rc;
 }
-int configure_lfs_filter(const char *cwd, const char *repo) {
+int configure_lfs_filter(const GitRepoState &s, const char *cwd, const char *repo) {
     const char *storage[] = {"--git-dir", repo, "config", "lfs.storage", "lfs", nullptr};
     const char *clean[] = {"--git-dir", repo, "config", "filter.lfs.clean", "git-lfs clean -- %f", nullptr};
-    const char *smudge[] = {"--git-dir", repo, "config", "filter.lfs.smudge", "git-lfs smudge -- %f", nullptr};
-    const char *process[] = {"--git-dir", repo, "config", "filter.lfs.process", "git-lfs filter-process", nullptr};
+    const char *smudge[] = {"--git-dir", repo, "config", "filter.lfs.smudge",
+        s.lfs_skip_smudge ? "git-lfs smudge --skip -- %f" : "git-lfs smudge -- %f", nullptr};
+    const char *process[] = {"--git-dir", repo, "config", "filter.lfs.process",
+        s.lfs_skip_process ? "git-lfs filter-process --skip" : "git-lfs filter-process", nullptr};
     const char *required[] = {"--git-dir", repo, "config", "filter.lfs.required", "true", nullptr};
     if (int rc = git(cwd, storage)) return rc;
     if (int rc = git(cwd, clean)) return rc;
@@ -2221,7 +2228,7 @@ int activate_managed_target_lfs(const GitRepoState &s, const char *worktree, con
             if (hook < 0) return hook;
         }
     }
-    if (int rc = configure_lfs_filter(worktree, repo)) return rc;
+    if (int rc = configure_lfs_filter(s, worktree, repo)) return rc;
     if (use_admin) {
         GitRepoState generated = s;
         generated.lfs_active = true;
@@ -2507,6 +2514,10 @@ int source_unchanged(const GitRepoState &s) {
         if (int rc = capture_rerere(s.root.c_str(), rerere, rerere_present, rerere_bytes)) return rc;
         if (rerere_present != s.rerere_present || !same_bytes(rerere, s.rerere)) return -EBUSY;
     }
+    bool lfs_setup = false, skip_smudge = false, skip_process = false;
+    if (int rc = canonical_lfs_setup(s.root.c_str(), lfs_setup, skip_smudge, skip_process)) return rc;
+    if (lfs_setup != s.lfs_filter_setup || skip_smudge != s.lfs_skip_smudge ||
+        skip_process != s.lfs_skip_process) return -EBUSY;
     Vec<GitSymref> refs;
     if (int symrc = collect_symrefs(s.root.c_str(), refs)) return symrc;
     if (!same_symrefs(refs, s.symrefs)) return -EBUSY;
@@ -2953,12 +2964,16 @@ int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool modu
     const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (value(root, head_args, out.head)) return refuse(WFS_E_GIT_UNSUPPORTED, "the repository has no commit yet");
     bool lfs_worktree = false, lfs_head = false, lfs_target = false, lfs_setup = false;
+    bool lfs_skip_smudge = false, lfs_skip_process = false;
     int lfs_rc = reject_used_filters(root, nullptr, &lfs_worktree);
     if (!lfs_rc) lfs_rc = reject_used_filters(root, out.head.c_str(), &lfs_head);
     if (!lfs_rc && target && strcmp(target, out.head.c_str()))
         lfs_rc = reject_used_filters(root, target, &lfs_target);
-    if (!lfs_rc) lfs_rc = canonical_lfs_setup(root, lfs_setup);
+    if (!lfs_rc) lfs_rc = canonical_lfs_setup(root, lfs_setup, lfs_skip_smudge, lfs_skip_process);
     if (lfs_rc) return lfs_rc;
+    out.lfs_filter_setup = lfs_setup;
+    out.lfs_skip_smudge = lfs_skip_smudge;
+    out.lfs_skip_process = lfs_skip_process;
     out.lfs_active = lfs_worktree || lfs_head || lfs_target || lfs_setup;
     const char *head_ref_args[] = {"symbolic-ref", "--quiet", "HEAD", nullptr};
     if (int rc = value(root, head_ref_args, out.head_ref, true)) return rc;
@@ -3581,6 +3596,8 @@ bool same_capture(const GitRepoState &copy, const GitRepoState &s) {
         copy.worktree_config == s.worktree_config && same_settings(copy.worktree_settings, s.worktree_settings) &&
         same_bytes(copy.refs, s.refs) && same_stash(copy, s) && copy.orig_present == s.orig_present &&
         copy.lfs_active == s.lfs_active && copy.lfs_present == s.lfs_present &&
+        copy.lfs_filter_setup == s.lfs_filter_setup && copy.lfs_skip_smudge == s.lfs_skip_smudge &&
+        copy.lfs_skip_process == s.lfs_skip_process &&
         copy.lfs_target_only == s.lfs_target_only &&
         copy.lfs_bytes == s.lfs_bytes && copy.lfs_entries == s.lfs_entries &&
         same_bytes(copy.lfs_manifest, s.lfs_manifest) &&
@@ -3873,7 +3890,7 @@ int own_repository(const GitRepoState &s, const char *cwd, const char *from, con
             if ((rc = lfs_import_bytes(s.root.c_str(), media.c_str(), bytes, entries, present, manifest))) return rc;
             if (!present || bytes != s.lfs_bytes || entries != s.lfs_entries || !same_bytes(manifest, s.lfs_manifest)) return -EBUSY;
         }
-        if ((rc = configure_lfs_filter(cwd, repo))) return rc;
+        if ((rc = configure_lfs_filter(s, cwd, repo))) return rc;
     }
     if ((rc = prune_object_clone(objects, String(), 0))) return rc;
     String script;
@@ -4621,7 +4638,7 @@ int install_lfs_payload(const char *world, const char *source_common, const char
     return rc;
 }
 
-int publish_lfs(const char *world, const char *target, const char *staging, const String &now) {
+int publish_lfs(const char *world, const char *target, const String &now) {
     String source_common, target_common;
     const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
     if (int rc = value(world, common_args, source_common)) return rc;
@@ -4630,8 +4647,7 @@ int publish_lfs(const char *world, const char *target, const char *staging, cons
     String target_cache = joinp(target_common.c_str(), "lfs/objects");
     uint64_t total = 0, entries = 0; bool present = false; Vec<char> source_manifest, target_manifest;
 
-    String exclude("--exclude="); exclude.append(staging);
-    const char *commits_args[] = {"--no-replace-objects", "rev-list", now.c_str(), exclude.c_str(), "--not", "--all", nullptr};
+    const char *commits_args[] = {"--no-replace-objects", "rev-list", now.c_str(), nullptr};
     Vec<char> commits;
     if (int rc = git(target, commits_args, &commits)) return rc;
     if (commits.empty() || !commits[0]) return 0;
@@ -5107,7 +5123,7 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
         if (!rc && checked_now)
             rc = refuse(WFS_E_GIT_TARGET, "%s was checked out in the target repository while publishing; nothing was changed", branch);
     }
-    if (!rc) rc = publish_lfs(world_root, repo, staging, now);
+    if (!rc) rc = publish_lfs(world_root, repo, now);
     if (!rc && old != now) {
         script.append("update "); script.append(ref.c_str()); script.push_back(' ');
         script.append(now.c_str()); script.push_back(' ');

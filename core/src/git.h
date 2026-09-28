@@ -78,6 +78,9 @@ struct GitRepoState {
     uint64_t lfs_entries = 0;
     bool lfs_present = false;
     bool lfs_active = false;
+    bool lfs_filter_setup = false;
+    bool lfs_skip_smudge = false;
+    bool lfs_skip_process = false;
     // LFS is used only by the committed submodule target selected by --committed-only.
     bool lfs_target_only = false;
     Vec<char> lfs_manifest;
