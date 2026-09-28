@@ -1226,7 +1226,7 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
     // including worktree files linked from outside it (a rescan of the clone would lose those).
     const char *git_admin = git_source.present && !git_source.managed ? ".git" : nullptr;
     if (int rc = wfs::hardlinks_scan(src.c_str(), WFS_MARKER_NAME, &src_stats, hl, git_admin)) return rc;
-    if (int rc = space_check(s->dir.c_str(), src_stats.entries, git_source.import_bytes + git_source.modules_bytes)) return rc;
+    if (int rc = space_check(s->dir.c_str(), src_stats.entries, wfs::git_import_budget(git_source, s->dir.c_str()))) return rc;
 
     char nm[WFS_NAME_MAX];
     copy_str(nm, sizeof nm, (name && *name) ? name : basename_of(src.c_str()));
@@ -1767,7 +1767,7 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         if (rc) return rc;
     }
     if (!o.skip_space_check) {
-        if (int rc = space_check(parent_dir.c_str(), entries, git_source.import_bytes + git_source.modules_bytes)) return rc;
+        if (int rc = space_check(parent_dir.c_str(), entries, wfs::git_import_budget(git_source, parent_dir.c_str()))) return rc;
     }
 
     int64_t created = now_sec();

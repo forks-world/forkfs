@@ -71,6 +71,11 @@ struct GitRepoState {
     bool rerere_present = false;
     uint64_t rerere_bytes = 0;
     uint64_t import_bytes = 0;
+    // External sources: the common object directory the owned repository's objects are cloned
+    // from, and how many entries it held when captured (the metadata a copy-on-write clone
+    // costs; see git_import_budget).
+    String objects;
+    uint64_t object_entries = 0;
     // --with-hooks, external sources only (a managed World's hooks travel inside its cloned
     // .world-git): the executable, regular, non-.sample files of the common hooks directory and
     // a repository-local core.hooksPath, installed in the owned repository (capture_hooks).
@@ -105,16 +110,19 @@ struct GitSource : GitRepoState {
     // --committed-only: the source may be dirty, but the copy is reset to HEAD before
     // publication (reset_to_head); ignored files stay. The source itself is never touched.
     bool committed_only = false;
-    // Initialized submodules, parents before their own submodules, and the sum of their
-    // import_bytes: an external import copies each one's objects too.
+    // Initialized submodules, parents before their own submodules. An external import clones
+    // each one's objects too (git_import_budget).
     Vec<GitModule> modules;
-    uint64_t modules_bytes = 0;
     // The root's index records gitlinks, initialized or not.
     bool has_gitlinks = false;
 };
 int git_source(const char *root, bool include_changes, GitSource &out, bool committed_only = false,
                bool with_hooks = false);
 int git_import(const GitSource &source, const char *clone);
+// The free space an external import needs on the volume holding `near`, beyond the tree clone
+// itself: each repository's rerere cache, plus its object directory's clone metadata where
+// that directory can be cloned there sharing data, or its full logical size where it is copied.
+uint64_t git_import_budget(const GitSource &source, const char *near);
 int git_discard_check(const char *root);
 int git_branch(const char *clone, wfs_id world);
 }

@@ -21,9 +21,12 @@ world fs checkpoint W1           # a filesystem snapshot, never an implicit Git 
 Each tree owns `.world-git/repo.git`, a private bare repository with one linked worktree.
 Its root `.git` file and the reverse worktree pointer are relative. The branch, HEAD,
 index, refs and object database belong to that tree, not the original source or another
-World. Initial import mirrors resolvable `refs/*` with Git's `--mirror` mode and
-`--no-hardlinks`, then restores each captured symbolic-ref edge before creating the private
-worktree; subsequent filesystem forks use APFS cloning, including the Git objects. Git's
+World. Initial import builds the owned repository the way `git clone --mirror` would --
+the same bare layout, packed `refs/*`, HEAD and symbolic-ref edges -- but does not
+transfer objects through Git: the source's common object directory is cloned with the
+filesystem's copy-on-write primitive (see [Import cost](#import-cost)) and the captured refs
+are written over it in one `update-ref` transaction. Subsequent filesystem forks use APFS
+cloning, including the Git objects. Git's
 [worktree documentation](https://git-scm.com/docs/git-worktree) describes these per-worktree
 administrative links.
 
@@ -158,7 +161,7 @@ inside -- even without `--with-hooks`.
 
 An initialized submodule -- a directory the index records as a gitlink that holds a `.git`,
 at any depth up to 8 levels of nesting -- is imported with the root. Its repository is copied
-the way the root's is (a `--mirror --no-hardlinks` clone, then its index, symbolic refs, local
+the way the root's is (its object directory cloned and its refs written, then its index, symbolic refs, local
 rules, rerere cache, status settings, identity, carried remotes and submodule settings,
 `SQUASH_MSG`, `FETCH_HEAD`, `ORIG_HEAD`, its stash stack and, with `--with-hooks`, its hooks) into the place
 Git itself uses for a submodule of a linked worktree: `modules/<name>` of the superproject's
@@ -414,7 +417,7 @@ content, including Git administrative changes such as branch/index updates.
   anything under `.world-git`: WorldFS owns those paths, `info/exclude` cannot hide a
   tracked file, and an ordinary checkout of such a commit overwrites the World marker. Partial clones are recognized by `extensions.partialClone`,
   by any `remote.<name>.promisor` or `remote.<name>.partialclonefilter` setting, and by
-  `pack-*.promisor` markers, because a local mirror copies an object database without its
+  `pack-*.promisor` markers, because cloning an object database does not bring back its
   missing objects. Managed Worlds with symlinked administration or additional
   linked worktrees are refused by fork/checkpoint. Discard also refuses registered extra
   worktrees, including with `--force`, until they have been removed with Git. Do not create
@@ -436,7 +439,7 @@ content, including Git administrative changes such as branch/index updates.
 - Repository extensions are admitted only when the owned repository reproduces them:
   `extensions.objectFormat` (SHA-1 and SHA-256 repositories), the files ref backend, and the
   sparse-checkout `worktreeConfig` case above. Others, such as `extensions.preciousObjects`,
-  are refused because a mirror clone does not carry them.
+  are refused because the owned repository does not carry them.
 - Git snapshots can be pooled (`pool fill S<n>`). An entry is a plain clone of the snapshot
   with no branch of its own; the fork that takes it runs the same per-World Git setup an
   ordinary fork runs on its temporary tree -- the managed-layout checks, the `world/W<n>`
@@ -526,8 +529,8 @@ include that resolves to different content at the new location (hooks, identity 
 other setting) makes the operation fail.
 Other refusals report `unsupported Git layout` followed by a `reason:` line naming the
 specific cause (for example `reftable ref storage` or `nested Git repository or submodule`).
-Mirror imports
-use an empty template directory so installed Git templates cannot add hooks or rules.
+Owned repositories
+are created with an empty template directory so installed Git templates cannot add hooks or rules.
 
 ### External reference restrictions
 
@@ -592,7 +595,41 @@ repository and rechecked before publication, so recurring conflicts still resolv
 the source is deleted. Git's layout of one directory per conflict holding regular files
 is required: a symlinked cache, nested directories or special files are refused.
 
-External imports budget the full logical size of the common Git object directory
-and the rerere cache in addition to filesystem clone metadata and the free-space reserve. This includes
-objects outside a linked worktree. Managed Worlds use filesystem cloning for their
-owned object databases and do not incur this additional full-copy budget.
+### Import cost
+
+An external import does not byte-copy the Git object store. Each owned repository -- the
+root's and every submodule's -- is built by one helper (`own_repository` in
+`core/src/git.cpp`):
+
+1. `git init --bare --template=` with the source's object format.
+2. The source's common `objects/` directory is cloned with `fs_clone_tree`: clonefile on
+   APFS, reflinks on XFS/Btrfs, a (sparse-aware) copy on ext4 or when the object directory
+   is on another volume. Symlinks are never followed. The clone is then reduced to what an
+   object store holds -- loose objects, packs with their `.idx`/`.rev`/`.bitmap`/`.keep`/
+   `.mtimes`, multi-pack indexes, `info/packs` and commit-graphs. Files Git leaves
+   mid-write (`tmp_obj_*`, `tmp_pack_*`, `.tmp-*`) and `incoming-*` quarantine directories
+   of a push not yet accepted are dropped: they are not part of the repository, and anything
+   reachable that is missing is caught below. A symlink or special file, alternates or a
+   promisor pack found in the clone are refused as they are in the source.
+3. The captured refs are written with one `update-ref --stdin` transaction (which checks
+   each tip object exists) and packed with `pack-refs --all`; HEAD, the transient
+   `remote.origin` mirror settings (removed again with the rest of the import) and the
+   symbolic-ref edges follow. Nothing is fetched or re-packed.
+
+The result matches what `git clone --mirror --no-hardlinks` produced, except that ref
+directories emptied by `pack-refs` (for example `refs/notes`) remain, and a SHA-256
+repository has its `[extensions]` section first in `config`.
+
+A source that repacks or collects garbage during the import can make the clone miss an
+object (a pack deleted before the clone reached it). Before publication every owned
+repository is walked -- `rev-list --objects` over all refs and HEADs, reflogs, the index,
+`ORIG_HEAD` and `FETCH_HEAD` tips, with `--no-replace-objects` -- and a missing object fails
+the import as busy (retryable) rather than publishing it. Changes to the source's object
+directory are also detected by the existing size recheck. The walk is Git's own
+post-fetch connectivity check; it costs a history traversal without reading blob contents.
+
+The free-space preflight follows the tree clone's budget: where the object directory can be
+cloned into the store's volume sharing data, it costs its metadata (1 KiB per entry);
+where it is copied (ext4, another volume) the full logical size of the object directory is
+budgeted. The rerere cache is always budgeted in full. Managed Worlds clone their owned
+object databases with the rest of the tree and incur no additional budget.

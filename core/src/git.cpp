@@ -1005,7 +1005,7 @@ int capture_stash(const char *root, GitRepoState &out) {
 bool same_stash(const GitRepoState &a, const GitRepoState &b) {
     return a.stash_present == b.stash_present && same_bytes(a.stash, b.stash) && same_bytes(a.stash_list, b.stash_list);
 }
-int walk_objects_fd(int fd, unsigned depth, uint64_t &total) {
+int walk_objects_fd(int fd, unsigned depth, uint64_t &total, uint64_t &entries) {
     if (depth > 256) return refuse(WFS_E_GIT_UNSUPPORTED, "the object directory is nested too deeply");
     int dupfd = dup(fd); if (dupfd < 0) return -errno;
     DIR *dir = fdopendir(dupfd);
@@ -1023,20 +1023,26 @@ int walk_objects_fd(int fd, unsigned depth, uint64_t &total) {
         if (UINT64_MAX - total < 1024 || (S_ISREG(st.st_mode) && (uint64_t)st.st_size > UINT64_MAX - total - 1024)) { rc = -EOVERFLOW; break; }
         if (S_ISREG(st.st_mode) && st.st_size < 0) { rc = -EOVERFLOW; break; }
         total += 1024 + (S_ISREG(st.st_mode) ? (uint64_t)st.st_size : 0);
+        ++entries;
         if (S_ISDIR(st.st_mode)) {
             int child = openat(fd, e->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
             if (child < 0) { rc = -errno; break; }
-            rc = walk_objects_fd(child, depth + 1, total); close(child);
+            rc = walk_objects_fd(child, depth + 1, total, entries); close(child);
             if (rc) break;
         }
     }
     closedir(dir); return rc;
 }
-int object_import_bytes(const char *common, uint64_t &total) {
+// The logical size of the common object directory (1 KiB of metadata per entry plus every
+// file's bytes) and its entry count, refusing symlinks and special files anywhere in it.
+int object_import_bytes(const char *common, uint64_t &total, uint64_t *entries = nullptr) {
     String objects = joinp(common, "objects");
     int fd = open(objects.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) return -errno;
-    total = 0; int rc = walk_objects_fd(fd, 0, total); close(fd); return rc;
+    uint64_t count = 0;
+    total = 0; int rc = walk_objects_fd(fd, 0, total, count); close(fd);
+    if (entries) *entries = count;
+    return rc;
 }
 int reject_configured_policy(const char *root, const char *key) {
     const char *args[] = {"config", "--get", key, nullptr};
@@ -2454,7 +2460,10 @@ int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool modu
     const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
     const char *admin_args[] = {"rev-parse", "--absolute-git-dir", nullptr};
     if ((rc = value(root, common_args, common)) || (rc = value(root, admin_args, out.admin))) return rc;
-    if (!out.managed) { if ((rc = object_import_bytes(common.c_str(), out.import_bytes))) return rc; }
+    if (!out.managed) {
+        if ((rc = object_import_bytes(common.c_str(), out.import_bytes, &out.object_entries))) return rc;
+        out.objects = joinp(common.c_str(), "objects");
+    }
     if (module) {
         // A submodule's repository is copied as one directory; a linked worktree of some other
         // repository standing in for it is not what Git itself would create there.
@@ -2849,7 +2858,6 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
         } else if (top.require_clean && m.repo.head != link.oid) {
             return WFS_E_GIT_DIRTY;   // HEAD moved away from the recorded commit
         }
-        top.modules_bytes += m.repo.import_bytes;
         top.modules.emplace_back(m);
         String child_prefix(path); child_prefix.push_back('/');
         String child_gitdir(m.gitdir); child_gitdir.push_back('/');
@@ -3189,13 +3197,139 @@ int restore_state(const GitRepoState &s, const char *worktree, const char *repo,
     if (int rc = capture_stash(worktree, imported)) return rc;
     return same_stash(imported, s) ? 0 : -EBUSY;
 }
-// Mirror all resolvable refs, including stash, notes, remote-tracking and custom refs; a bare
-// clone omits other ref namespaces and would lose them when the source is removed. clone
-// --local copies loose objects too, including blobs referenced only by the index;
-// --no-hardlinks prevents subsequent Git operations changing the source's object files.
-int mirror(const GitRepoState &s, const char *cwd, const char *from, const char *repo) {
-    const char *copy[] = {"clone", "--mirror", "--no-hardlinks", "--template=", "--quiet", "--", from, repo, nullptr};
-    if (int rc = git(cwd, copy)) return rc;
+bool lower_hex(const char *p, size_t n) {
+    for (size_t i = 0; i < n; ++i)
+        if (!((p[i] >= '0' && p[i] <= '9') || (p[i] >= 'a' && p[i] <= 'f'))) return false;
+    return n > 0;
+}
+// `<prefix><object ID><suffix>` for one of `suffixes` (null-terminated), SHA-1 or SHA-256.
+bool hashed_name(const char *name, const char *prefix, const char *const *suffixes) {
+    size_t pl = strlen(prefix);
+    if (strncmp(name, prefix, pl)) return false;
+    const char *hash = name + pl, *dot = strchr(hash, '.');
+    size_t n = dot ? (size_t)(dot - hash) : strlen(hash);
+    if ((n != 40 && n != 64) || !lower_hex(hash, n) || !dot) return false;
+    for (size_t i = 0; suffixes[i]; ++i) if (!strcmp(dot, suffixes[i])) return true;
+    return false;
+}
+// What an object store holds, by directory relative to objects/: loose objects in the
+// two-hex-digit fan-out directories; packs with their .idx, .rev, .bitmap, .keep and .mtimes
+// files; multi-pack indexes, single or chained; info/packs and commit-graphs, single or chained.
+bool object_store_entry(const char *rel, const char *name, bool dir) {
+    static const char *const pack_ext[] = {".pack", ".idx", ".rev", ".bitmap", ".keep", ".mtimes", nullptr};
+    static const char *const midx_ext[] = {".bitmap", ".rev", nullptr};
+    static const char *const chained_midx_ext[] = {".midx", ".bitmap", ".rev", nullptr};
+    static const char *const graph_ext[] = {".graph", nullptr};
+    if (!*rel) return dir && ((strlen(name) == 2 && lower_hex(name, 2)) || !strcmp(name, "pack") || !strcmp(name, "info"));
+    if (strlen(rel) == 2) return !dir && (strlen(name) == 38 || strlen(name) == 62) && lower_hex(name, strlen(name));
+    if (!strcmp(rel, "pack")) {
+        if (dir) return !strcmp(name, "multi-pack-index.d");
+        return hashed_name(name, "pack-", pack_ext) || !strcmp(name, "multi-pack-index") ||
+               hashed_name(name, "multi-pack-index-", midx_ext);
+    }
+    if (!strcmp(rel, "pack/multi-pack-index.d"))
+        return !dir && (!strcmp(name, "multi-pack-index-chain") || hashed_name(name, "multi-pack-index-", chained_midx_ext));
+    if (!strcmp(rel, "info")) {
+        if (dir) return !strcmp(name, "commit-graphs");
+        return !strcmp(name, "packs") || !strcmp(name, "commit-graph");
+    }
+    if (!strcmp(rel, "info/commit-graphs"))
+        return !dir && (!strcmp(name, "commit-graph-chain") || hashed_name(name, "graph-", graph_ext));
+    return false;
+}
+// Reduce a cloned object directory to object_store_entry's allowlist. Anything else Git may
+// have had there mid-write -- tmp_obj_*/tmp_pack_*/.tmp-* files, incoming-* quarantine
+// directories of a push not yet accepted -- is not part of the repository and is dropped;
+// objects nothing reaches are harmless and anything reachable that went missing is caught by
+// require_owned_objects. What eligibility refuses in the source (a symlink or special file,
+// alternates, promisor packs) is refused again here, since the clone reflects the source a
+// moment after it was checked.
+int prune_object_clone(const String &dir, const String &rel, unsigned depth) {
+    if (depth > 3) return refuse(WFS_E_GIT_UNSUPPORTED, "the object directory is nested too deeply");
+    int fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return errno == ELOOP || errno == ENOTDIR
+        ? refuse(WFS_E_GIT_UNSUPPORTED, "the object directory contains a symlink or special file (%s)", rel.empty() ? "objects" : rel.c_str()) : -errno;
+    Vec<String> names;
+    int rc = list_names(fd, names);
+    for (size_t i = 0; !rc && i < names.size(); ++i) {
+        const char *name = names[i].c_str();
+        struct stat st;
+        if (fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW)) { rc = -errno; break; }
+        if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) {
+            rc = refuse(WFS_E_GIT_UNSUPPORTED, "the object directory contains a symlink or special file (%s)", name); break;
+        }
+        String child_rel = rel.empty() ? String(name) : joinp(rel.c_str(), name);
+        static const char *const promisor_ext[] = {".promisor", nullptr};
+        if (child_rel == "info/alternates" || child_rel == "info/http-alternates") {
+            rc = refuse(WFS_E_GIT_UNSUPPORTED, "objects/%s is present (alternates or shallow clone)", child_rel.c_str()); break;
+        }
+        if (rel == "pack" && hashed_name(name, "pack-", promisor_ext)) { rc = refuse(WFS_E_GIT_UNSUPPORTED, "partial clone (a promisor pack)"); break; }
+        String path = joinp(dir.c_str(), name);
+        if (!object_store_entry(rel.c_str(), name, S_ISDIR(st.st_mode))) rc = fs_remove_tree(path.c_str());
+        else if (S_ISDIR(st.st_mode)) rc = prune_object_clone(path, child_rel, depth + 1);
+    }
+    close(fd);
+    return rc;
+}
+// The owned repository is created the way `git clone --mirror` made it -- the same bare layout,
+// packed refs, HEAD, remote.origin mirror configuration (removed again by restore_state) and
+// symbolic refs -- but its objects are not transferred through Git: the source's common object
+// directory is cloned with fs_clone_tree (clonefile on APFS, reflinks on XFS/Btrfs, a copy on
+// ext4 or across volumes, never following symlinks), so an import costs metadata rather than a
+// second copy of every pack. That also takes loose objects, including blobs only the index
+// refers to. Refs are then written from the captured snapshot with one update-ref transaction,
+// which only checks that each object exists; nothing is fetched. The clone shares no inode
+// with the source, so later Git operations in either never change the other's object files.
+int own_repository(const GitRepoState &s, const char *cwd, const char *from, const char *repo) {
+    String format;
+    const char *format_args[] = {"rev-parse", "--show-object-format", nullptr};
+    if (int rc = value(s.root.c_str(), format_args, format)) return rc;
+    String format_arg("--object-format="); format_arg.append(format.c_str());
+    const char *init[] = {"init", "--bare", "--template=", "--quiet", format_arg.c_str(), "--", repo, nullptr};
+    if (int rc = git(cwd, init)) return rc;
+    String objects = joinp(repo, "objects");
+    if (int rc = fs_remove_tree(objects.c_str())) return rc;
+    int rc = fs_clone_tree(s.objects.c_str(), objects.c_str(), true);
+    // A pack or loose object that vanished mid-clone: gc/repack in the source. Retryable.
+    if (rc == -ENOENT || rc == -ESTALE) return -EBUSY;
+    if (rc) return rc;
+    if ((rc = prune_object_clone(objects, String(), 0))) return rc;
+    String script;
+    for (size_t i = 0; i < s.refs.size() && s.refs[i];) {
+        size_t end = i, tab = i;
+        while (end < s.refs.size() && s.refs[end] && s.refs[end] != '\n') ++end;
+        while (tab < end && s.refs[tab] != '\t') ++tab;
+        if (tab == end) return -EINVAL;
+        script.append("create ");
+        script.append(s.refs.data() + i, tab - i);
+        script.push_back(' ');
+        script.append(s.refs.data() + tab + 1, end - tab - 1);
+        script.push_back('\n');
+        i = end < s.refs.size() && s.refs[end] == '\n' ? end + 1 : end;
+    }
+    FILE *input = tmpfile();
+    if (!input) return -errno;
+    if (fwrite(script.c_str(), 1, script.size(), input) != script.size() || fflush(input)) {
+        int err = errno ? -errno : -EIO; fclose(input); return err;
+    }
+    rewind(input);
+    const char *txn[] = {"--git-dir", repo, "update-ref", "--no-deref", "--stdin", nullptr};
+    rc = git(cwd, txn, nullptr, nullptr, false, false, fileno(input));
+    fclose(input);
+    // An object the captured refs name is missing from the clone: repacked away mid-clone.
+    if (rc == WFS_E_GIT_FAILED) return -EBUSY;
+    if (rc) return rc;
+    const char *pack[] = {"--git-dir", repo, "pack-refs", "--all", nullptr};
+    if ((rc = git(cwd, pack))) return rc;
+    const char *on_branch[] = {"--git-dir", repo, "symbolic-ref", "HEAD", s.head_ref.c_str(), nullptr};
+    const char *detached[] = {"--git-dir", repo, "update-ref", "--no-deref", "HEAD", s.head.c_str(), nullptr};
+    if ((rc = git(cwd, s.head_ref.empty() ? detached : on_branch))) return rc;
+    const char *const origin[][2] = {{"remote.origin.url", from}, {"remote.origin.tagOpt", "--no-tags"},
+        {"remote.origin.fetch", "+refs/*:refs/*"}, {"remote.origin.mirror", "true"}};
+    for (const auto &kv : origin) {
+        const char *args[] = {"--git-dir", repo, "config", kv[0], kv[1], nullptr};
+        if ((rc = git(cwd, args))) return rc;
+    }
     for (const auto &ref : s.symrefs) {
         const char *sym_args[] = {"--git-dir", repo, "symbolic-ref", ref.name.c_str(), ref.target.c_str(), nullptr};
         if (int rc = git(cwd, sym_args)) return rc;
@@ -3206,7 +3340,7 @@ int import_root(const GitSource &s, const char *clone) {
     String owned = joinp(clone, ".world-git");
     if (int rc = fs_mkdir(owned.c_str(), 0700)) return rc;
     String repo = joinp(owned.c_str(), "repo.git");
-    if (int rc = mirror(s, clone, s.root.c_str(), repo.c_str())) return rc;
+    if (int rc = own_repository(s, clone, s.root.c_str(), repo.c_str())) return rc;
     String active = joinp(owned.c_str(), "active");
     const char *add[] = {"--git-dir", repo.c_str(), "worktree", "add", "--relative-paths", "--no-checkout",
         "--detach", "--quiet", "--", active.c_str(), s.head.c_str(), nullptr};
@@ -3234,7 +3368,7 @@ int import_module(const GitModule &m, const char *clone) {
     String repo = joinp(clone, admin.c_str());
     String dot = joinp(worktree.c_str(), ".git");
     if (int rc = fs_remove_tree(dot.c_str())) return rc;
-    if (int rc = mirror(s, clone, s.admin.c_str(), repo.c_str())) return rc;
+    if (int rc = own_repository(s, clone, s.admin.c_str(), repo.c_str())) return rc;
     String link = module_worktree(m.path, m.gitdir);
     const char *bare[] = {"--git-dir", repo.c_str(), "config", "core.bare", "false", nullptr};
     const char *wt[] = {"--git-dir", repo.c_str(), "config", "core.worktree", link.c_str(), nullptr};
@@ -3284,6 +3418,48 @@ int require_clean_copy(const GitSource &s, const char *clone) {
     }
     return 0;
 }
+// A source that repacks or collects garbage while its object directory is cloned can leave the
+// clone without some objects (a pack deleted before the clone reached it, its replacement
+// created after). Before publication, walk everything the owned repository preserves -- all refs
+// and HEADs, reflogs, the index, ORIG_HEAD and FETCH_HEAD tips -- down to every tree and blob, as
+// Git's own connectivity check after a fetch does. --no-replace-objects walks the real graph, not
+// what refs/replace/* substitutes. A hole means the source changed mid-import: -EBUSY, retryable.
+int require_owned_objects(const GitRepoState &s, const char *worktree) {
+    Vec<String> tips;
+    if (s.orig_present) tips.emplace_back(s.orig_head.c_str());
+    if (s.fetch_present) {
+        // FETCH_HEAD lines start with an object ID followed by a tab (reject_reserved_paths
+        // has already refused anything else).
+        for (size_t start = 0, i = 0, n = s.fetch.size(); i <= n; ++i) {
+            if (i < n && s.fetch[i] != '\n') continue;
+            size_t hex = start;
+            while (hex < i && lower_hex(s.fetch.data() + hex, 1)) ++hex;
+            if (hex < i && s.fetch[hex] == '\t' && (hex - start == 40 || hex - start == 64))
+                tips.emplace_back(s.fetch.data() + start, hex - start);
+            start = i + 1;
+        }
+    }
+    Vec<const char *> args;
+    for (const char *a : {"--no-replace-objects", "rev-list", "--objects", "--quiet", "--all", "--reflog", "--indexed-objects"})
+        args.emplace_back(a);
+    for (const auto &tip : tips) args.emplace_back(tip.c_str());
+    args.emplace_back("--");
+    args.emplace_back(nullptr);
+    int rc = git(worktree, args.data(), nullptr, nullptr, true);
+    return rc == WFS_E_GIT_FAILED ? -EBUSY : rc;
+}
+uint64_t git_import_budget(const GitSource &s, const char *near) {
+    uint64_t total = 0;
+    for (size_t i = 0; i <= s.modules.size(); ++i) {
+        const GitRepoState &state = i ? s.modules[i - 1].repo : s;
+        if (state.managed || state.objects.empty()) continue;
+        uint64_t objects = state.import_bytes - state.rerere_bytes;
+        uint64_t metadata = state.object_entries > objects / 1024 ? objects : state.object_entries * 1024;
+        uint64_t need = state.rerere_bytes + (fs_clone_shares(near, state.objects.c_str()) ? metadata : objects);
+        total = need > UINT64_MAX - total ? UINT64_MAX : total + need;
+    }
+    return total;
+}
 int git_import(const GitSource &s, const char *clone) {
     if (!s.present) return 0;
     if (int rc = sources_unchanged(s)) return rc;
@@ -3291,6 +3467,11 @@ int git_import(const GitSource &s, const char *clone) {
         if (int rc = import_root(s, clone)) return rc;
         for (const auto &m : s.modules)
             if (int rc = import_module(m, clone)) return in_module(rc, m.path);
+        if (int rc = require_owned_objects(s, clone)) return rc;
+        for (const auto &m : s.modules) {
+            String path = joinp(clone, m.path.c_str());
+            if (int rc = require_owned_objects(m.repo, path.c_str())) return in_module(rc, m.path);
+        }
         if (int rc = sources_unchanged(s)) return rc;
     }
     if (s.managed) {

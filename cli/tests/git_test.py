@@ -97,7 +97,7 @@ class GitWorldTest(unittest.TestCase):
         wrapper = self.root / 'sparse-race-bin'
         wrapper.mkdir()
         script = wrapper / 'git'
-        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = --mirror ] && mirror=1; done\n'
+        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = pack-refs ] && mirror=1; done\n'
                           + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
                           + 'if [ "$result" = 0 ] && [ "$mirror" = 1 ]; then\n'
                           + 'printf "/raced\\n" >> ' + shlex.quote(str(patterns)) + ' || exit $?\n'
@@ -132,7 +132,7 @@ class GitWorldTest(unittest.TestCase):
             self.assertEqual((self.source / '.git' / name).read_bytes(), data)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
-    def test_external_object_copy_space_is_budgeted(self):
+    def test_external_object_clone_budgets_metadata_not_bytes(self):
         import shlex
         linked = self.root / 'linked-budget'
         self.git(self.source, 'worktree', 'add', '-b', 'budget-linked', str(linked))
@@ -143,7 +143,7 @@ class GitWorldTest(unittest.TestCase):
         size = volume.f_bavail * volume.f_frsize + 256 * 1024 * 1024
         with oversized.open('wb') as f:
             f.truncate(size)
-        # Never permit a regressed preflight to materialize this sparse fixture.
+        # Git never copies the object store: a `git clone` here fails the import.
         real_git = shutil.which('git')
         wrapper = self.root / 'budget-bin'
         wrapper.mkdir()
@@ -155,15 +155,172 @@ class GitWorldTest(unittest.TestCase):
                           'exec ' + shlex.quote(real_git) + ' "$@"\n')
         script.chmod(0o700)
         self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        # On the store's own volume the object directory is cloned, not copied: the budget is
+        # its metadata, so the sparse fixture neither blocks the import nor is materialized, and
+        # Git never byte-copies it either (no `git clone`). Being no object, it is not carried.
         for source in (self.source, linked):
             with self.subTest(source=source.name):
-                head = self.git(source, 'rev-parse', 'HEAD').stdout
-                result = self.world('init', str(source), code=3)
-                self.assertIn(b'not enough free space', result.stderr)
+                self.world('init', str(source))
                 self.assertFalse(called.exists())
-                self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
-                self.assertEqual(self.git(source, 'rev-parse', 'HEAD').stdout, head)
                 self.assertEqual(oversized.stat().st_size, size)
+        self.assertEqual(len(json.loads(self.world('list', '--json').stdout)['snapshots']), 2)
+        one, _ = self.fork()
+        self.assertFalse((one / '.world-git' / 'repo.git' / 'objects' / 'budget-fixture').exists())
+        self.git(one, 'fsck', '--full')
+
+    def mount_private_volume(self):
+        """A private APFS disk image attached under self.root, detached again at cleanup: a
+        second volume, which clonefile(2) cannot clone into the store's."""
+        import time
+        if sys.platform != 'darwin' or not shutil.which('hdiutil'):
+            self.skipTest('needs hdiutil')
+        image, mount = self.root / 'volume.dmg', self.root / 'volume'
+        mount.mkdir()
+        created = subprocess.run(['hdiutil', 'create', '-quiet', '-size', '64m', '-fs', 'APFS',
+                                  '-volname', 'forkfs-objects', str(image)], capture_output=True, timeout=120)
+        if created.returncode:
+            self.skipTest('hdiutil create failed: %r' % created.stderr)
+        attached = subprocess.run(['hdiutil', 'attach', '-quiet', '-nobrowse', '-owners', 'on',
+                                   '-mountpoint', str(mount), str(image)], capture_output=True, timeout=120)
+        if attached.returncode:
+            self.skipTest('hdiutil attach failed: %r' % attached.stderr)
+
+        def detach():
+            for attempt in range(8):
+                args = ['hdiutil', 'detach', '-quiet', str(mount)] + (['-force'] if attempt >= 4 else [])
+                if subprocess.run(args, capture_output=True, timeout=120).returncode == 0:
+                    return
+                time.sleep(1)
+            self.fail('could not detach %s' % mount)
+        self.addCleanup(detach)
+        self.assertNotEqual(mount.stat().st_dev, self.root.stat().st_dev)
+        return mount
+
+    def test_object_store_on_another_volume_is_copied_and_budgeted(self):
+        volume = self.mount_private_volume()
+        source = self.root / 'xvol-source'
+        admin = volume / 'source.git'
+        self.git(self.root, 'init', '-q', '-b', 'main', '--separate-git-dir', str(admin), str(source))
+        self.identify(source)
+        (source / 'file').write_text('packed\n')
+        self.git(source, 'add', '.')
+        self.git(source, 'commit', '-qm', 'packed')
+        self.git(source, 'repack', '-adq')
+        (source / 'file').write_text('loose\n')
+        self.git(source, 'commit', '-qam', 'loose')
+        self.world('list', '--json')
+        # Where the objects cannot be cloned into the store's volume they are copied, and the
+        # preflight budgets their full logical size.
+        oversized = admin / 'objects' / 'budget-fixture'
+        volume_stat = os.statvfs(self.store)
+        size = volume_stat.f_bavail * volume_stat.f_frsize + 256 * 1024 * 1024
+        with oversized.open('wb') as f:
+            f.truncate(size)
+        result = self.world('init', str(source), code=3)
+        self.assertIn(b'not enough free space', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        oversized.unlink()
+        self.world('init', str(source))
+        shutil.rmtree(admin)
+        one, _ = self.fork()
+        self.git(one, 'fsck', '--full')
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.git(one, 'log', '--format=%s').stdout, b'loose\npacked\n')
+
+    def test_owned_objects_are_cloned_and_survive_source_deletion(self):
+        self.git(self.source, 'tag', '-a', 'v1', '-m', 'v1')
+        self.git(self.source, 'repack', '-adq')
+        (self.source / 'file').write_text('loose commit\n')
+        self.git(self.source, 'commit', '-qam', 'loose')
+        (self.source / 'staged').write_text('only in the index\n')
+        self.git(self.source, 'add', 'staged')
+        loose = self.git(self.source, 'rev-parse', 'HEAD:file').stdout.decode().strip()
+        objects = self.source / '.git' / 'objects'
+        self.assertTrue((objects / loose[:2] / loose[2:]).is_file())
+        packs = sorted(p.name for p in (objects / 'pack').iterdir())
+        self.assertTrue(any(name.endswith('.pack') for name in packs))
+        refs = self.git(self.source, 'for-each-ref', '--format=%(refname) %(objectname)').stdout
+        # What Git leaves mid-write -- temporary objects and packs, a push's quarantine -- is not
+        # part of the repository and is not carried into the owned one.
+        junk = [objects / 'pack' / 'tmp_pack_raced', objects / loose[:2] / 'tmp_obj_raced',
+                objects / 'incoming-raced' / 'pack' / 'pack-partial.pack', objects / 'info' / 'unknown']
+        for path in junk:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'partial')
+        self.world('init', str(self.source), '--include-changes')
+        shutil.rmtree(self.source)
+        one, _ = self.fork()
+        owned = one / '.world-git' / 'repo.git' / 'objects'
+        self.assertEqual(sorted(p.name for p in (owned / 'pack').iterdir()), packs)
+        self.assertTrue((owned / loose[:2] / loose[2:]).is_file())
+        for path in junk:
+            self.assertFalse((owned / path.relative_to(objects)).exists(), path)
+        self.assertFalse((owned / 'incoming-raced').exists())
+        self.git(one, 'fsck', '--full')
+        self.assertEqual(self.git(one, 'show', ':staged').stdout, b'only in the index\n')
+        after = self.git(one, 'for-each-ref', '--format=%(refname) %(objectname)', '--exclude=refs/heads/world/*').stdout
+        self.assertEqual(after, refs)
+
+    def object_loss_wrapper(self, oid):
+        """PATH directory whose git deletes loose object `oid` from an owned repository right
+        after the import wrote its refs: a clone that raced a repack and missed an object."""
+        import shlex
+        real_git = shutil.which('git')
+        wrapper = self.root / 'object-loss-bin'
+        wrapper.mkdir()
+        script = wrapper / 'git'
+        loose = 'objects/' + oid[:2] + '/' + oid[2:]
+        script.write_text('#!/bin/sh\nprev=\nrepo=\npack=0\nfor arg in "$@"; do\n'
+                          '[ "$prev" = --git-dir ] && repo=$arg\n[ "$arg" = pack-refs ] && pack=1\nprev=$arg\ndone\n'
+                          + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
+                          'if [ "$result" = 0 ] && [ "$pack" = 1 ] && [ -f "$repo/' + loose + '" ]; then\n'
+                          'rm -f "$repo/' + loose + '" || exit $?\nfi\nexit "$result"\n')
+        script.chmod(0o700)
+        return wrapper
+
+    def test_owned_repository_missing_an_object_is_never_published(self):
+        (self.source / 'file').write_text('loose only\n')
+        self.git(self.source, 'commit', '-qam', 'loose')
+        blob = self.git(self.source, 'rev-parse', 'HEAD:file').stdout.decode().strip()
+        env = dict(self.env)
+        self.env['PATH'] = str(self.object_loss_wrapper(blob)) + os.pathsep + self.env['PATH']
+        self.world('init', str(self.source), code=1)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        self.env = env
+        self.git(self.source, 'cat-file', '-e', blob)
+        self.world('init', str(self.source))
+
+    def test_concurrent_repack_is_retryable_or_complete(self):
+        import shlex
+        for n in range(3):
+            (self.source / 'file').write_text('loose %d\n' % n)
+            self.git(self.source, 'commit', '-qam', 'loose %d' % n)
+        real_git = shutil.which('git')
+        wrapper = self.root / 'repack-race-bin'
+        wrapper.mkdir()
+        script = wrapper / 'git'
+        # Right after the owned repository is created and before its objects are cloned.
+        script.write_text('#!/bin/sh\nbare=0\nfor arg in "$@"; do [ "$arg" = --bare ] && bare=1; done\n'
+                          + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
+                          + 'if [ "$result" = 0 ] && [ "$bare" = 1 ]; then\n'
+                          + shlex.quote(real_git) + ' -C ' + shlex.quote(str(self.source))
+                          + ' repack -adq || exit $?\nfi\nexit "$result"\n')
+        script.chmod(0o700)
+        env = dict(self.env)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        raced = subprocess.run([WORLD, 'fs', 'init', str(self.source)], env=self.env, capture_output=True, timeout=60)
+        self.env = env
+        self.assertIn(raced.returncode, (0, 1), raced.stderr)
+        snapshots = json.loads(self.world('list', '--json').stdout)['snapshots']
+        if raced.returncode:
+            self.assertEqual(snapshots, [])
+            snapshot = self.world('init', str(self.source)).stdout.split()[0].decode()
+        else:
+            snapshot = raced.stdout.split()[0].decode()
+        shutil.rmtree(self.source)
+        one, _ = self.fork('one', snapshot)
+        self.git(one, 'fsck', '--full')
+        self.assertEqual(self.git(one, 'log', '-1', '--format=%s').stdout, b'loose 2\n')
 
     def test_clean_import_fork_commit_isolation(self):
         before = self.git(self.source, 'worktree', 'list', '--porcelain').stdout
@@ -612,7 +769,7 @@ class GitWorldTest(unittest.TestCase):
         wrapper = self.root / 'hook-race-bin'
         wrapper.mkdir()
         script = wrapper / 'git'
-        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = --mirror ] && mirror=1; done\n'
+        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = pack-refs ] && mirror=1; done\n'
                           + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
                           + 'if [ "$result" = 0 ] && [ "$mirror" = 1 ]; then\n'
                           + 'printf "exit 1\\n" >> ' + shlex.quote(str(hook)) + ' || exit $?\n'
@@ -1742,7 +1899,7 @@ class GitWorldTest(unittest.TestCase):
                            ('core.sparseCheckout', 'true'), ('core.splitIndex', 'true'),
                            ('extensions.partialClone', 'origin')):
             with self.subTest(key=key):
-                script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = --mirror ] && mirror=1; done\n'
+                script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = pack-refs ] && mirror=1; done\n'
                                   + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
                                   + 'if [ "$result" = 0 ] && [ "$mirror" = 1 ]; then\n'
                                   + shlex.quote(real_git) + ' -C ' + shlex.quote(str(self.source))
@@ -1809,7 +1966,7 @@ class GitWorldTest(unittest.TestCase):
         wrapper = self.root / 'identity-race-bin'
         wrapper.mkdir()
         script = wrapper / 'git'
-        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = --mirror ] && mirror=1; done\n'
+        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = pack-refs ] && mirror=1; done\n'
                           + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
                           + 'if [ "$result" = 0 ] && [ "$mirror" = 1 ]; then\n'
                           + shlex.quote(real_git) + ' -C ' + shlex.quote(str(self.source))
@@ -1892,7 +2049,7 @@ class GitWorldTest(unittest.TestCase):
         wrapper = self.root / 'race-bin'
         wrapper.mkdir()
         script = wrapper / 'git'
-        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = --mirror ] && mirror=1; done\n'
+        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = pack-refs ] && mirror=1; done\n'
                           + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
                           + 'if [ "$result" = 0 ] && [ "$mirror" = 1 ]; then\n'
                           + shlex.quote(real_git) + ' -C ' + shlex.quote(str(self.source))
@@ -2354,7 +2511,7 @@ class GitWorldTest(unittest.TestCase):
         wrapper = self.root / 'remote-race-bin'
         wrapper.mkdir()
         script = wrapper / 'git'
-        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = --mirror ] && mirror=1; done\n'
+        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = pack-refs ] && mirror=1; done\n'
                           + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
                           + 'if [ "$result" = 0 ] && [ "$mirror" = 1 ]; then\n'
                           + shlex.quote(real_git) + ' -C ' + shlex.quote(str(self.source))
@@ -2832,7 +2989,7 @@ class GitWorldTest(unittest.TestCase):
         wrapper = self.root / 'rerere-race-bin'
         wrapper.mkdir()
         script = wrapper / 'git'
-        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = --mirror ] && mirror=1; done\n'
+        script.write_text('#!/bin/sh\nmirror=0\nfor arg in "$@"; do [ "$arg" = pack-refs ] && mirror=1; done\n'
                           + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
                           + 'if [ "$result" = 0 ] && [ "$mirror" = 1 ]; then\n'
                           + 'printf "raced\\n" >> ' + shlex.quote(str(postimage)) + ' || exit $?\n'
@@ -3308,6 +3465,37 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(one, 'stash', 'list').stdout, b'')
         self.git(one / 'libs/lib', 'stash', 'pop', '-q')
         self.assertEqual((one / 'libs/lib/stashed-untracked').read_text(), 'untracked\n')
+
+    def test_submodule_objects_are_cloned_and_checked_before_publication(self):
+        self.submodule_fixture()
+        lib = self.source / 'libs/lib'
+        self.git(lib, 'repack', '-adq')
+        (lib / 'loose.txt').write_text('loose in the submodule\n')
+        self.git(lib, 'add', 'loose.txt')
+        self.git(lib, 'commit', '-qm', 'loose')
+        self.git(self.source, 'commit', '-qam', 'bump lib')
+        blob = self.git(lib, 'rev-parse', 'HEAD:loose.txt').stdout.decode().strip()
+        objects = self.source / '.git/modules/lib-module/objects'
+        self.assertTrue((objects / blob[:2] / blob[2:]).is_file())
+        packs = sorted(p.name for p in (objects / 'pack').iterdir())
+        (objects / 'pack' / 'tmp_pack_raced').write_bytes(b'partial')
+        # A module repository that lost an object mid-import is not published either.
+        env = dict(self.env)
+        self.env['PATH'] = str(self.object_loss_wrapper(blob)) + os.pathsep + self.env['PATH']
+        result = self.world('init', str(self.source), code=1)
+        self.assertIn(b'Resource busy', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        self.env = env
+        snapshot = self.world('init', str(self.source)).stdout.split()[0].decode()
+        shutil.rmtree(self.source)
+        shutil.rmtree(self.root / 'origins')
+        one, _ = self.fork('one', snapshot)
+        owned = one / '.world-git/repo.git/worktrees/active/modules/lib-module/objects'
+        self.assertEqual(sorted(p.name for p in (owned / 'pack').iterdir()), packs)
+        self.assertTrue((owned / blob[:2] / blob[2:]).is_file())
+        for repo in ('libs/lib', 'libs/lib/deps/inner'):
+            self.git(one / repo, 'fsck', '--full')
+        self.assertEqual((one / 'libs/lib/loose.txt').read_text(), 'loose in the submodule\n')
 
     def test_old_style_submodule_is_absorbed_into_the_world(self):
         lib = self.origin('lib')

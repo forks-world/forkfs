@@ -416,6 +416,25 @@ int fs_clone_probe(const char *dst_dir, const char *src_dir) {
     return rc;
 }
 
+// clonefile(2) never copies: where the probe clones, the tree clone shares blocks too. This
+// budget query must not create a probe file in the source object store, so an empty source is
+// conservatively treated as a copy (zero objects make this immaterial).
+bool fs_clone_shares(const char *dst_dir, const char *src_dir) {
+    String srcfile;
+    if (find_regular(src_dir, srcfile, 3) != 0) return false;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        char probe[PATH_MAX];
+        ::snprintf(probe, sizeof probe, "%s/.wfs-budget-probe-%d-%08x", dst_dir,
+                   (int)::getpid(), arc4random());
+        if (::clonefile(srcfile.c_str(), probe, CLONE_NOFOLLOW) == 0) {
+            force_unlink(probe); // only remove the path this call successfully created
+            return true;
+        }
+        if (errno != EEXIST) return false;
+    }
+    return false;
+}
+
 // ---- cloning ---------------------------------------------------------------------------------
 
 namespace {
