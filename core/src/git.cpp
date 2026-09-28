@@ -2119,9 +2119,15 @@ bool same_hooks(const Vec<GitHook> &a, const Vec<GitHook> &b) {
 const char *lfs_prepush_script() {
     return "#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || { printf >&2 \"\\n%s\\n\\n\" \"This repository is configured for Git LFS but 'git-lfs' was not found on your path. If you no longer wish to use Git LFS, remove this hook by deleting the 'pre-push' file in the hooks directory (set by 'core.hookspath'; usually '.git/hooks').\"; exit 2; }\ngit lfs pre-push \"$@\"\n";
 }
+// Exact Git LFS v3.4.1 hookBaseContent with Command=pre-push and Hook.write's final LF.
+const char *legacy_lfs_prepush_script() {
+    return "#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || { echo >&2 \"\\nThis repository is configured for Git LFS but 'git-lfs' was not found on your path. If you no longer wish to use Git LFS, remove this hook by deleting the 'pre-push' file in the hooks directory (set by 'core.hookspath'; usually '.git/hooks').\\n\"; exit 2; }\ngit lfs pre-push \"$@\"\n";
+}
 bool canonical_lfs_prepush(const Vec<char> &bytes) {
     const char *script = lfs_prepush_script();
-    return bytes.size() == strlen(script) && !memcmp(bytes.data(), script, bytes.size());
+    if (bytes.size() == strlen(script) && !memcmp(bytes.data(), script, bytes.size())) return true;
+    const char *legacy = legacy_lfs_prepush_script();
+    return bytes.size() == strlen(legacy) && !memcmp(bytes.data(), legacy, bytes.size());
 }
 int read_lfs_prepush(const String &dir, bool allow_create, String &path) {
     path = joinp(dir.c_str(), "pre-push");

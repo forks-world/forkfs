@@ -78,6 +78,12 @@ class GitWorldTest(unittest.TestCase):
         return ('version https://git-lfs.github.com/spec/v1\n'
                 'oid sha256:%s\nsize %d\n' % (oid, size)).encode()
 
+    @staticmethod
+    def legacy_lfs_prepush_hook():
+        return (b'#!/bin/sh\n'
+                b'command -v git-lfs >/dev/null 2>&1 || { echo >&2 "\\nThis repository is configured for Git LFS but \'git-lfs\' was not found on your path. If you no longer wish to use Git LFS, remove this hook by deleting the \'pre-push\' file in the hooks directory (set by \'core.hookspath\'; usually \'.git/hooks\').\\n"; exit 2; }\n'
+                b'git lfs pre-push "$@"\n')
+
     def test_disabled_sparse_checkout_patterns_survive_source_deletion(self):
         (self.source / 'docs').mkdir()
         (self.source / 'docs' / 'guide').write_text('guide\n')
@@ -707,6 +713,9 @@ class GitWorldTest(unittest.TestCase):
             dest = husky / name
             dest.write_bytes(canonical.read_bytes())
             dest.chmod(0o755)
+        legacy = self.legacy_lfs_prepush_hook()
+        (husky / 'pre-push').write_bytes(legacy)
+        (husky / 'pre-push').chmod(0o755)
         self.git(self.source, '-c', 'core.hooksPath=/dev/null', 'add', '.husky')
         self.git(self.source, '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'canonical LFS pre-push')
         self.git(self.source, 'config', 'core.hooksPath', '.husky')
@@ -717,6 +726,25 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(one, 'config', '--get', 'core.hooksPath').stdout.strip(), b'.husky')
         self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
         self.assertTrue(os.access(one / '.husky' / 'pre-push', os.X_OK))
+        self.assertEqual((one / '.husky' / 'pre-push').read_bytes(), legacy)
+
+    def test_with_hooks_preserves_legacy_lfs_prepush_in_git_admin(self):
+        self.install_lfs(self.source)
+        (self.source / 'file.bin').write_bytes(b'legacy admin hook fixture\n')
+        self.git(self.source, 'add', '.gitattributes', 'file.bin')
+        self.git(self.source, 'commit', '-qm', 'legacy admin hook LFS fixture')
+        legacy = self.legacy_lfs_prepush_hook()
+        source_hook = self.source / '.git' / 'hooks' / 'pre-push'
+        source_hook.write_bytes(legacy)
+        source_hook.chmod(0o755)
+
+        snapshot = self.world('init', str(self.source), '--with-hooks').stdout.split()[0].decode()
+        one, _ = self.fork('legacy-admin-hook-world', snapshot)
+        owned_hook = one / '.world-git' / 'repo.git' / 'hooks' / 'pre-push'
+        self.assertTrue(os.access(owned_hook, os.X_OK))
+        self.assertEqual(owned_hook.read_bytes(), legacy)
+        self.assertEqual(source_hook.read_bytes(), legacy)
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
 
     def test_with_hooks_resolves_escaping_relative_hooks_path_from_the_source(self):
         marker = self.root / 'hooks-ran'
@@ -1772,12 +1800,11 @@ class GitWorldTest(unittest.TestCase):
         cache = {p.relative_to(self.source / '.git/lfs/objects'): p.read_bytes()
                  for p in (self.source / '.git/lfs/objects').rglob('*') if p.is_file()}
         custom = self.source / '.git/hooks/pre-push'
-        custom.write_text('#!/bin/sh\necho ran > "$HOME/custom-push-ran"\n')
+        custom.write_bytes(self.legacy_lfs_prepush_hook() + b'# near-match custom addition\n')
         custom.chmod(0o700)
         expected_hooks = self.git_hook_snapshot(self.source)
         result = self.world('init', str(self.source), '--with-hooks', code=3)
         self.assertIn(b'pre-push', result.stderr)
-        self.assertFalse((Path(os.environ.get('HOME', '/nonexistent')) / 'custom-push-ran').exists())
         self.assertEqual((self.source / '.git/config').read_bytes(), config)
         self.assertEqual((self.source / '.git/index').read_bytes(), index)
         self.assertEqual(self.git_hook_snapshot(self.source), expected_hooks)
