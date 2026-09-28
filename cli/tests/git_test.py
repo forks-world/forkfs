@@ -4351,7 +4351,7 @@ class GitWorldTest(unittest.TestCase):
 
         snapshot = self.world('init', str(self.source), '--committed-only').stdout.split()[0].decode()
         self.assertEqual(self.git(lib, 'rev-parse', 'HEAD').stdout.strip(), old.encode())
-        one, _ = self.fork('target-lfs', snapshot)
+        one, wid = self.fork('target-lfs', snapshot)
         owned_lib = one / 'libs/lib'
         self.assertEqual(self.git(owned_lib, 'rev-parse', 'HEAD').stdout.strip(), target)
         self.assertEqual(self.git(owned_lib, 'show', ':target.bin').stdout,
@@ -4373,7 +4373,7 @@ class GitWorldTest(unittest.TestCase):
         (hook / 'pre-push').unlink()
         self.assertEqual(self.git(owned_lib, 'rev-parse', 'HEAD').stdout.strip(), old.encode())
         self.assertFalse((hook / 'pre-push').exists())
-        managed_snapshot = self.world('init', str(one), '--committed-only').stdout.split()[0].decode()
+        managed_snapshot = self.world('checkpoint', wid, '--committed-only').stdout.split()[0].decode()
         self.assertEqual(self.git(owned_lib, 'rev-parse', 'HEAD').stdout.strip(), old.encode())
         self.assertFalse((hook / 'pre-push').exists())
         managed_copy, _ = self.fork('managed-target-lfs', managed_snapshot)
