@@ -34,7 +34,7 @@ int refuse(int code, const char *fmt, ...) {
 // `ambient_config_probe` keeps the user's global/system configuration (and GIT_CONFIG_* command
 // configuration) so a check sees files the way the user's own Git does; `stdin_fd`, when >= 0,
 // becomes the child's standard input.
-int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, int *exit_code = nullptr, bool quiet_stderr = false, bool ambient_config_probe = false, int stdin_fd = -1, bool skip_lfs_smudge = false) {
+int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, int *exit_code = nullptr, bool quiet_stderr = false, bool ambient_config_probe = false, int stdin_fd = -1, bool skip_lfs_smudge = false, bool no_system_attributes = false) {
     if (exit_code) *exit_code = -1;
     Vec<char *> av;
     const char *prefix[] = {"git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
@@ -49,11 +49,13 @@ int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, i
             (!strncmp(*p, "GIT_CONFIG_GLOBAL=", 18) || !strncmp(*p, "GIT_CONFIG_SYSTEM=", 18) ||
              !strncmp(*p, "GIT_CONFIG_NOSYSTEM=", 20) || !strncmp(*p, "GIT_CONFIG_COUNT=", 17) ||
              !strncmp(*p, "GIT_CONFIG_KEY_", 15) || !strncmp(*p, "GIT_CONFIG_VALUE_", 17) ||
-             !strncmp(*p, "GIT_CONFIG_PARAMETERS=", 22)))) env.emplace_back(*p);
+             !strncmp(*p, "GIT_CONFIG_PARAMETERS=", 22))) &&
+            !(no_system_attributes && !strncmp(*p, "GIT_ATTR_NOSYSTEM=", 18))) env.emplace_back(*p);
     }
     const char *settings[] = {"GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1"};
     for (const char *p : settings) env.emplace_back(const_cast<char *>(p));
     if (skip_lfs_smudge) env.emplace_back(const_cast<char *>("GIT_LFS_SKIP_SMUDGE=1"));
+    if (no_system_attributes) env.emplace_back(const_cast<char *>("GIT_ATTR_NOSYSTEM=1"));
     if (!ambient_config_probe) {
         env.emplace_back(const_cast<char *>("GIT_CONFIG_NOSYSTEM=1"));
         env.emplace_back(const_cast<char *>("GIT_CONFIG_GLOBAL=/dev/null"));
@@ -1487,7 +1489,7 @@ int validate_lfs_endpoint_listing(const Vec<char> &listing, Vec<char> *snapshot 
 }
 int validate_lfs_tree_config(const char *root, const char *treeish, Vec<char> *snapshot = nullptr) {
     String tree_arg(treeish);
-    const char *tree_args[] = {"ls-tree", "-z", tree_arg.c_str(), "--", ".lfsconfig", nullptr};
+    const char *tree_args[] = {"--no-replace-objects", "ls-tree", "-z", tree_arg.c_str(), "--", ".lfsconfig", nullptr};
     Vec<char> tree;
     if (int rc = git(root, tree_args, &tree)) return rc;
     if (tree.empty() || !tree[0]) return 0;
@@ -1498,7 +1500,7 @@ int validate_lfs_tree_config(const char *root, const char *treeish, Vec<char> *s
     if (strcmp(mode, "100644") && strcmp(mode, "100755"))
         return refuse(WFS_E_GIT_UNSUPPORTED, "%s:.lfsconfig is not a regular file", treeish);
     String blobarg("--blob="); blobarg.append(oid);
-    const char *blob_args[] = {"config", blobarg.c_str(), "--null", "--list", nullptr};
+    const char *blob_args[] = {"--no-replace-objects", "config", blobarg.c_str(), "--null", "--list", nullptr};
     Vec<char> listing;
     if (int rc = git(root, blob_args, &listing)) return rc;
     if (int rc = validate_lfs_endpoint_listing(listing)) return rc;
@@ -4437,10 +4439,57 @@ int install_lfs_payload(const char *world, const char *source_common, const char
     if (b < 0) return -errno;
     struct stat st;
     if (!fstatat(b, record.oid.c_str(), &st, AT_SYMLINK_NOFOLLOW)) {
-        close(b);
-        if (!S_ISREG(st.st_mode) || (uint64_t)st.st_size != record.size)
+        if (!S_ISREG(st.st_mode) || (uint64_t)st.st_size != record.size) {
+            close(b);
             return refuse(WFS_E_GIT_TARGET, "the target Git LFS cache has a corrupt object %s", record.oid.c_str());
-        return 0; // The target cache was fully hash-validated before this helper.
+        }
+        int existing = openat(b, record.oid.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        struct stat before;
+        if (existing < 0 || fstat(existing, &before) || !S_ISREG(before.st_mode) ||
+            (uint64_t)before.st_size != record.size || before.st_dev != st.st_dev || before.st_ino != st.st_ino) {
+            if (existing >= 0) close(existing);
+            close(b);
+            return refuse(WFS_E_GIT_TARGET, "the target Git LFS cache object %s changed or is corrupt", record.oid.c_str());
+        }
+        const char *verify[] = {"lfs", "pointer", "--no-extensions", "--file=/dev/stdin", nullptr};
+        Vec<char> first_hash, second_hash;
+        int verify_rc = lseek(existing, 0, SEEK_SET) < 0 ? -errno :
+            git(world, verify, &first_hash, nullptr, false, false, existing);
+        if (!verify_rc && lseek(existing, 0, SEEK_SET) < 0) verify_rc = -errno;
+        if (!verify_rc) verify_rc = git(world, verify, &second_hash, nullptr, false, false, existing);
+        bool valid_hash = false;
+        if (!verify_rc) {
+            LfsPointerRecord got; bool looks = false;
+            valid_hash = parse_lfs_pointer(first_hash.data(), first_hash.size() - 1, got, looks) &&
+                got.oid == record.oid && got.size == record.size && same_bytes(first_hash, second_hash);
+            if (!valid_hash) verify_rc = refuse(WFS_E_GIT_TARGET,
+                "the target Git LFS cache object %s changed or is corrupt", record.oid.c_str());
+        }
+        struct stat after, named;
+        bool after_ok = !fstat(existing, &after);
+        bool same_times = false;
+#if defined(__APPLE__)
+        same_times = after_ok && before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec &&
+            before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec &&
+            before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec &&
+            before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec;
+#else
+        same_times = after_ok && before.st_mtim.tv_sec == after.st_mtim.tv_sec &&
+            before.st_mtim.tv_nsec == after.st_mtim.tv_nsec &&
+            before.st_ctim.tv_sec == after.st_ctim.tv_sec &&
+            before.st_ctim.tv_nsec == after.st_ctim.tv_nsec;
+#endif
+        bool stable = after_ok &&
+            !fstatat(b, record.oid.c_str(), &named, AT_SYMLINK_NOFOLLOW) && S_ISREG(named.st_mode) &&
+            before.st_dev == after.st_dev && before.st_ino == after.st_ino &&
+            before.st_size == after.st_size && same_times && after.st_dev == named.st_dev && after.st_ino == named.st_ino &&
+            after.st_size == named.st_size;
+        close(existing);
+        close(b);
+        if (verify_rc) return verify_rc;
+        if (!stable) return refuse(WFS_E_GIT_TARGET,
+            "the target Git LFS cache object %s changed or is corrupt", record.oid.c_str());
+        return 0;
     }
     if (errno != ENOENT) { int err = -errno; close(b); return err; }
 
@@ -4547,15 +4596,37 @@ int publish_lfs(const char *world, const char *target, const char *staging, cons
     const char *commits_args[] = {"--no-replace-objects", "rev-list", now.c_str(), exclude.c_str(), "--not", "--all", nullptr};
     Vec<char> commits;
     if (int rc = git(target, commits_args, &commits)) return rc;
+    if (commits.empty() || !commits[0]) return 0;
+    struct AttrRepoCleanup {
+        String root, objects;
+        ~AttrRepoCleanup() {
+            if (!objects.empty()) (void)unlink(objects.c_str());
+            if (!root.empty()) (void)fs_remove_tree(root.c_str());
+        }
+    } attr_repo;
+    char scratch[] = "/tmp/worldfs-lfs-attrs-XXXXXX";
+    if (!mkdtemp(scratch)) return -errno;
+    attr_repo.root = scratch;
+    String scratch_repo = joinp(scratch, "repo.git");
+    String object_format;
+    const char *format_args[] = {"rev-parse", "--show-object-format", nullptr};
+    if (int rc = value(target, format_args, object_format)) return rc;
+    String format_arg("--object-format="); format_arg.append(object_format.c_str());
+    const char *init_args[] = {"init", "--bare", "--template=", "--quiet", format_arg.c_str(), "--", scratch_repo.c_str(), nullptr};
+    if (int rc = git(target, init_args)) return rc;
+    attr_repo.objects = joinp(scratch_repo.c_str(), "objects");
+    if (int rc = fs_remove_tree(attr_repo.objects.c_str())) return rc;
+    String target_objects = joinp(target_common.c_str(), "objects");
+    if (symlink(target_objects.c_str(), attr_repo.objects.c_str())) return -errno;
     Vec<LfsPointerRecord> pointers;
     auto add_pointer_blob = [&](const String &blob_oid) -> int {
-        const char *size_args[] = {"cat-file", "-s", blob_oid.c_str(), nullptr};
+        const char *size_args[] = {"--no-replace-objects", "cat-file", "-s", blob_oid.c_str(), nullptr};
         Vec<char> size_text;
         if (int rc = git(target, size_args, &size_text)) return rc;
         char *end = nullptr;
         unsigned long long blob_size = strtoull(size_text.data(), &end, 10);
         if (!end || end == size_text.data() || blob_size > 1024) return 0;
-        const char *blob_args[] = {"cat-file", "blob", blob_oid.c_str(), nullptr};
+        const char *blob_args[] = {"--no-replace-objects", "cat-file", "blob", blob_oid.c_str(), nullptr};
         Vec<char> blob;
         if (int rc = git(target, blob_args, &blob)) return rc;
         LfsPointerRecord record; bool looks = false;
@@ -4575,6 +4646,7 @@ int publish_lfs(const char *world, const char *target, const char *staging, cons
         size_t end = ci; while (end + 1 < commits.size() && commits[end] != '\n') ++end;
         if (end == ci) { ci = end + 1; continue; }
         String commit(commits.data() + ci, end - ci); ci = end + 1;
+        if (int rc = validate_lfs_tree_config(target, commit.c_str())) return rc;
         const char *diff_args[] = {"--no-replace-objects", "diff-tree", "--no-commit-id", "--root", "-r", "-m", "-z", "--raw", "--no-renames", commit.c_str(), nullptr};
         Vec<char> diff;
         if (int rc = git(target, diff_args, &diff)) return rc;
@@ -4595,7 +4667,7 @@ int publish_lfs(const char *world, const char *target, const char *staging, cons
             if (regular_mode(new_mode) && status[0] != 'D') files.emplace_back(GitSetting{String(path), String(new_oid)});
         }
         if (attributes_changed) {
-            const char *tree_args[] = {"ls-tree", "-r", "-z", "--full-tree", commit.c_str(), nullptr};
+            const char *tree_args[] = {"--no-replace-objects", "ls-tree", "-r", "-z", "--full-tree", commit.c_str(), nullptr};
             Vec<char> tree;
             if (int rc = git(target, tree_args, &tree)) return rc;
             for (size_t i = 0; i + 1 < tree.size();) {
@@ -4621,9 +4693,10 @@ int publish_lfs(const char *world, const char *target, const char *staging, cons
         if (fflush(paths)) { int err = -errno; fclose(paths); return err; }
         rewind(paths);
         String source("--source="); source.append(commit.c_str());
-        const char *attr_args[] = {"check-attr", "--stdin", "-z", source.c_str(), "filter", nullptr};
+        const char *attr_args[] = {"--no-replace-objects", "-c", "core.attributesFile=/dev/null",
+            "check-attr", "--stdin", "-z", source.c_str(), "filter", nullptr};
         Vec<char> attrs;
-        int attr_rc = git(target, attr_args, &attrs, nullptr, false, false, fileno(paths));
+        int attr_rc = git(scratch_repo.c_str(), attr_args, &attrs, nullptr, false, false, fileno(paths), false, true);
         fclose(paths);
         if (attr_rc) return attr_rc;
         size_t ai = 0;
@@ -4652,7 +4725,6 @@ int publish_lfs(const char *world, const char *target, const char *staging, cons
             return refuse(WFS_E_GIT_TARGET, "the World is missing Git LFS object %s", p.oid.c_str());
     }
     for (const auto &p : pointers) {
-        if (lfs_manifest_has(target_manifest, p.oid, p.size)) continue;
         if (int rc = install_lfs_payload(world, source_common.c_str(), target_common.c_str(), p)) return rc;
     }
     return 0;

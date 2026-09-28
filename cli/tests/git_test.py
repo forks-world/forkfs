@@ -1605,6 +1605,12 @@ class GitWorldTest(unittest.TestCase):
         final_oid = hashlib.sha256(final).hexdigest()
         self.assertFalse(self.lfs_object_path(self.source, intermediate_oid).exists())
         self.assertFalse(self.lfs_object_path(self.source, final_oid).exists())
+        # Repository-local info attributes override --source=<commit> unless publication
+        # evaluates attributes in an isolated repository.
+        target_info_attributes = self.source / '.git' / 'info' / 'attributes'
+        target_info_attributes.write_text('*.bin -filter\n')
+        self.assertEqual(self.git(self.source, 'check-attr', 'filter', '--', 'sequence.bin').stdout,
+                         b'sequence.bin: filter: unset\n')
         self.world('publish', wid)
         self.assertEqual(self.lfs_object_path(self.source, intermediate_oid).read_bytes(), intermediate)
         self.assertEqual(self.lfs_object_path(self.source, final_oid).read_bytes(), final)
@@ -1659,6 +1665,77 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.lfs_object_path(self.source, oid).read_bytes(), payload)
         self.assertEqual(self.git(self.source, 'rev-parse', 'refs/heads/world/' + wid).stdout.strip(),
                          self.git(one, 'rev-parse', 'HEAD').stdout.strip())
+
+    def test_publish_revalidates_existing_target_lfs_cache_after_manifest_scan(self):
+        import hashlib
+        import shlex
+        self.install_lfs(self.source)
+        baseline = b'baseline before target-cache race\n'
+        payload = b'target cached payload\n'
+        (self.source / 'baseline.bin').write_bytes(baseline)
+        self.git(self.source, 'add', '.gitattributes', 'baseline.bin')
+        self.git(self.source, 'commit', '-qm', 'baseline LFS content')
+        oid = hashlib.sha256(payload).hexdigest()
+        target_cache = self.lfs_object_path(self.source, oid)
+        target_cache.parent.mkdir(parents=True, exist_ok=True)
+        target_cache.write_bytes(payload)
+
+        snapshot = self.world('init', str(self.source)).stdout.split()[0].decode()
+        one, wid = self.fork('target-cache-race', snapshot)
+        (one / 'new.bin').write_bytes(payload)
+        self.git(one, 'add', 'new.bin')
+        self.git(one, 'commit', '-qm', 'publish pointer with an existing target cache object')
+
+        real_git = shutil.which('git')
+        wrapper = self.root / 'target-lfs-cache-race-bin'
+        wrapper.mkdir()
+        done = self.root / 'target-lfs-cache-race-done'
+        script = wrapper / 'git'
+        script.write_text(
+            '#!/bin/sh\nmatched=0\nfor arg in "$@"; do [ "$arg" = ' +
+            shlex.quote('--file=' + str(target_cache)) + ' ] && matched=1; done\n' +
+            shlex.quote(real_git) + ' "$@"\nresult=$?\n' +
+            'if [ "$result" = 0 ] && [ "$matched" = 1 ] && [ ! -e ' + shlex.quote(str(done)) + ' ]; then\n' +
+            '  printf %s ' + shlex.quote('X' + payload.decode()[1:]) + ' > ' + shlex.quote(str(target_cache)) + '\n' +
+            '  : > ' + shlex.quote(str(done)) + ' || exit $?\nfi\nexit "$result"\n')
+        script.chmod(0o700)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+
+        result = self.world('publish', wid, code=3)
+        self.assertTrue(done.exists(), result.stderr.decode(errors='replace'))
+        self.assertEqual(target_cache.read_bytes(), b'X' + payload[1:])
+        self.assertIn(b'target Git LFS cache', result.stderr)
+        self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/' + wid, code=1)
+
+    def test_publish_refuses_relative_lfs_endpoint_in_new_history(self):
+        import hashlib
+        self.install_lfs(self.source)
+        (self.source / 'baseline.bin').write_bytes(b'baseline LFS payload\n')
+        self.git(self.source, 'add', '.gitattributes', 'baseline.bin')
+        self.git(self.source, 'commit', '-qm', 'baseline LFS setup')
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        payload = b'payload committed with relative LFS endpoint\n'
+        (one / 'relative.bin').write_bytes(payload)
+        self.git(one, 'add', 'relative.bin')
+        (one / '.lfsconfig').write_text('[lfs]\n    url = ../relative-lfs\n')
+        self.git(one, 'add', '.lfsconfig', '.gitattributes')
+        self.git(one, 'commit', '-qm', 'commit relative LFS endpoint')
+        oid = hashlib.sha256(payload).hexdigest()
+        self.assertTrue(self.lfs_object_path(one, oid).is_file())
+        (one / '.lfsconfig').write_text('[lfs]\n    url = https://lfs.example.test/objects\n')
+        self.git(one, 'add', '.lfsconfig')
+        self.git(one, 'commit', '-qm', 'correct LFS endpoint')
+
+        cache_before = {p.relative_to(self.source / '.git/lfs/objects'): p.read_bytes()
+                        for p in (self.source / '.git/lfs/objects').rglob('*') if p.is_file()}
+        head_before = self.git(self.source, 'rev-parse', 'HEAD').stdout
+        refused = self.world('publish', wid, code=3)
+        self.assertIn(b'must be an absolute URL or absolute filesystem path', refused.stderr)
+        self.assertEqual(self.git(self.source, 'rev-parse', 'HEAD').stdout, head_before)
+        self.git(self.source, 'rev-parse', '--verify', '-q', 'refs/heads/world/' + wid, code=1)
+        self.assertEqual({p.relative_to(self.source / '.git/lfs/objects'): p.read_bytes()
+                          for p in (self.source / '.git/lfs/objects').rglob('*') if p.is_file()}, cache_before)
 
     def test_publish_missing_or_corrupt_lfs_history_payload_does_not_move_branch(self):
         import hashlib
