@@ -1319,6 +1319,36 @@ class GitWorldTest(unittest.TestCase):
         self.assertTrue((one / '.world-git' / 'repo.git' / 'hooks' / 'pre-push').is_file())
         self.assertIn(b'lfs-history', self.git(one, 'branch', '--list').stdout)
 
+    def test_global_canonical_lfs_setup_is_preserved_for_another_branch(self):
+        import hashlib
+        if not shutil.which('git-lfs'):
+            self.skipTest('needs git-lfs')
+        payload = b'globally configured LFS content on another branch\n'
+        oid = hashlib.sha256(payload).hexdigest()
+        self.git(self.source, 'checkout', '-q', '-b', 'lfs-history')
+        (self.source / '.gitattributes').write_text('*.bin filter=lfs\n')
+        (self.source / 'history.bin').write_bytes(self.lfs_pointer(oid, len(payload)))
+        self.git(self.source, 'add', '.gitattributes', 'history.bin')
+        self.git(self.source, 'commit', '-qm', 'LFS pointer on preserved branch')
+        self.git(self.source, 'checkout', '-q', 'main')
+        global_config = self.root / 'global-lfs-config'
+        global_config.write_text('[filter "lfs"]\n'
+                                 ' clean = git-lfs clean -- %f\n'
+                                 ' smudge = git-lfs smudge -- %f\n'
+                                 ' process = git-lfs filter-process\n'
+                                 ' required = yes\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        self.git(self.source, 'config', '--local', '--get', 'filter.lfs.process', code=1)
+        self.assertFalse((self.source / '.git' / 'lfs' / 'objects').exists())
+
+        self.world('init', str(self.source))
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'config', '--local', '--get', 'filter.lfs.process').stdout.strip(),
+                         b'git-lfs filter-process')
+        self.assertEqual(self.git(one, 'config', '--get', 'lfs.storage').stdout.strip(), b'lfs')
+        self.assertTrue((one / '.world-git' / 'repo.git' / 'hooks' / 'pre-push').is_file())
+        self.assertIn(b'lfs-history', self.git(one, 'branch', '--list').stdout)
+
     def test_include_changes_recognizes_filter_used_only_by_staged_attributes(self):
         self.install_lfs(self.source)
         (self.source / 'file').write_bytes(b'ordinary committed content\n')

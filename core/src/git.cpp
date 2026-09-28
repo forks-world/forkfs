@@ -1443,10 +1443,10 @@ int validate_lfs_filter(const char *root, bool &defined) {
         return refuse(WFS_E_GIT_POLICY, "custom or incomplete filter.lfs configuration is not supported");
     return 0;
 }
-// A repository may keep canonical LFS support for a different preserved branch while the
-// current checkout has no LFS attributes or cache. Preserve only an effective repository-local
-// stock setup; unused global definitions and dormant custom/incomplete filters remain inert.
-int canonical_local_lfs_setup(const char *root, bool &canonical) {
+// A machine-wide or repository-local stock LFS filter is enough to declare that LFS is
+// supported by this repository, even when the current checkout has no LFS attributes or cache.
+// Unused custom/incomplete tuples remain inert under reject_used_filters.
+int canonical_lfs_setup(const char *root, bool &canonical) {
     canonical = false;
     String clean, smudge, process, required;
     bool have_clean = false, have_smudge = false, have_process = false, have_required = false;
@@ -1454,7 +1454,7 @@ int canonical_local_lfs_setup(const char *root, bool &canonical) {
         String arg(key);
         const char *args[] = {"config", "--get", arg.c_str(), nullptr};
         Vec<char> bytes; int status = -1;
-        int rc = git(root, args, &bytes, &status);
+        int rc = git(root, args, &bytes, &status, false, true);
         if (rc == WFS_E_GIT_FAILED && status == 1) { value.clear(); present = false; return 0; }
         if (rc) return rc;
         value.assign(bytes.data());
@@ -1467,7 +1467,7 @@ int canonical_local_lfs_setup(const char *root, bool &canonical) {
     if (int rc = get("filter.lfs.process", process, have_process)) return rc;
     const char *required_args[] = {"config", "--get", "--type=bool", "filter.lfs.required", nullptr};
     Vec<char> required_bytes; int required_status = -1;
-    int required_rc = git(root, required_args, &required_bytes, &required_status);
+    int required_rc = git(root, required_args, &required_bytes, &required_status, false, true);
     if (required_rc == WFS_E_GIT_FAILED && required_status == 1) have_required = false;
     else if (required_rc == WFS_E_GIT_FAILED) return 0; // An invalid dormant bool is not a stock setup.
     else if (required_rc) return required_rc;
@@ -2952,14 +2952,14 @@ int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool modu
     }
     const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (value(root, head_args, out.head)) return refuse(WFS_E_GIT_UNSUPPORTED, "the repository has no commit yet");
-    bool lfs_worktree = false, lfs_head = false, lfs_target = false, lfs_local_setup = false;
+    bool lfs_worktree = false, lfs_head = false, lfs_target = false, lfs_setup = false;
     int lfs_rc = reject_used_filters(root, nullptr, &lfs_worktree);
     if (!lfs_rc) lfs_rc = reject_used_filters(root, out.head.c_str(), &lfs_head);
     if (!lfs_rc && target && strcmp(target, out.head.c_str()))
         lfs_rc = reject_used_filters(root, target, &lfs_target);
-    if (!lfs_rc) lfs_rc = canonical_local_lfs_setup(root, lfs_local_setup);
+    if (!lfs_rc) lfs_rc = canonical_lfs_setup(root, lfs_setup);
     if (lfs_rc) return lfs_rc;
-    out.lfs_active = lfs_worktree || lfs_head || lfs_target || lfs_local_setup;
+    out.lfs_active = lfs_worktree || lfs_head || lfs_target || lfs_setup;
     const char *head_ref_args[] = {"symbolic-ref", "--quiet", "HEAD", nullptr};
     if (int rc = value(root, head_ref_args, out.head_ref, true)) return rc;
     const char *index_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "index", nullptr};
