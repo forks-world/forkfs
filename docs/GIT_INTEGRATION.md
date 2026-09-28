@@ -157,6 +157,31 @@ Worlds forked or checkpointed from a World keep its hooks, since its whole `.wor
 World requires the same of a relative `core.hooksPath` set in it -- committed, nothing pending
 inside -- even without `--with-hooks`.
 
+## Git LFS
+
+Repositories that use the stock Git LFS filter are supported at the root and in initialized
+submodules. The tracked checkout may contain hydrated files or pointer files. External import
+preserves the worktree bytes and index as captured, and copies the repository's local
+`.git/lfs/objects` cache into the World's owned Git administration. Each payload's SHA-256,
+fan-out path and recorded size are checked before publication, and the source cache is rechecked
+afterward; import does not run the LFS clean, smudge or process commands. A global LFS filter that no tracked file
+uses remains harmless.
+
+The owned cache is independent of the source. After import, deleting or moving the source and
+its cache does not affect offline work. Forks and checkpoints carry each root and submodule cache
+with their owned Git administration. `--committed-only` resets to HEAD with filters disabled,
+then runs `git lfs checkout` against the local cache: available payloads are hydrated, while an
+uncached pointer stays a pointer. Ordinary import and `--include-changes` retain the original
+worktree and staged bytes.
+
+Only the stock `git-lfs` clean, smudge and process commands are admitted when a tracked path uses
+`filter=lfs`; custom commands, LFS extensions and external `lfs.storage` locations are refused
+before any filter runs. With `--with-hooks`, the generated Git LFS `pre-push` hook is carried so
+an ordinary `git push` transfers payloads to its remote. `publish` validates and transfers every
+required payload in the commits being published, including objects that appear only in an
+intermediate commit, before moving the source branch. A missing or corrupt payload aborts before
+the branch moves.
+
 ## Submodules
 
 An initialized submodule -- a directory the index records as a gitlink that holds a `.git`,
@@ -426,8 +451,9 @@ content, including Git administrative changes such as branch/index updates.
   crash) is refused, so the lock is never copied into the child. Merge/rebase/cherry-pick/revert in progress
   is also refused, as is an unconcluded `git notes merge`, whose state is invisible to
   `git status`. Re-import older snapshots that still contain an unconverted `.git`.
-- Git LFS hydration, reftable repositories, a shared refs/object service, cross-machine
-  history transfer, and publishing submodule commits are not provided. This increment does not close every requirement in Issue #7.
+- Reftable repositories, a shared refs/object service, cross-machine history transfer, and
+  publishing submodule commits are not provided. This increment does not close every requirement
+  in Issue #7.
 - Repository-local `core.excludesFile` and `core.attributesFile` overrides are unsupported.
   They can point outside the repository, and merging their rules into `info/exclude` or
   `info/attributes` would change Git's precedence; these overrides are not imported. Use the
@@ -491,12 +517,13 @@ global and system configuration.
 
 What cannot be shared is refused with a Git configuration error that names the reason:
 
-- A filter that tracked files actually use (for example Git LFS), from any scope. A filter
-  that is only defined, such as the one a machine-wide `git lfs install` adds, is fine in a
-  repository whose files do not use it; so is a `filter=` attribute whose driver is not
-  defined anywhere. With `--committed-only`, the files and attributes of HEAD count too, so
-  a filter HEAD assigns is refused even when uncommitted edits remove the assignment. Filters
-  are never executed by the import.
+- A filter tracked files actually use, from any scope, unless it is the supported stock Git LFS
+  filter described above. Custom or incomplete `filter.lfs` commands, LFS extensions and an
+  external `lfs.storage` are refused. A filter that is only defined, such as the one a
+  machine-wide `git lfs install` adds, is fine in a repository whose files do not use it; so is
+  a `filter=` attribute whose driver is not defined anywhere. With `--committed-only`, the files
+  and attributes of HEAD count too, so a filter HEAD assigns is refused even when uncommitted
+  edits remove the assignment. Filters are never executed by the import.
 - A conditional `includeIf` whose target sets status or filter settings, in any scope and
   whether or not it is active at the source: the condition (a `gitdir:` pattern, a branch)
   can evaluate differently at the World's location. The same is refused for a target that

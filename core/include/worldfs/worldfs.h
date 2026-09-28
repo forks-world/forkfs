@@ -165,8 +165,9 @@ enum {
     WFS_E_GIT_POOL = -1026,        /* Reserved, no longer returned: Git snapshots are poolable. */
     WFS_E_GIT_IN_USE = -1027,      /* Additional linked worktrees depend on this tree. */
     /* Git configuration outside the repository would make the World's Git see files
-     * differently from the source's: a filter that tracked files use (e.g. Git LFS), a
-     * conditional include that sets status or filter settings, GIT_ATTR_SOURCE/attr.tree, or
+     * differently from the source's: a filter that tracked files use (except the supported
+     * stock Git LFS filter), a conditional include that sets status or filter settings,
+     * GIT_ATTR_SOURCE/attr.tree, or
      * status settings injected on the command line. wfs_git_reason() names which. */
     WFS_E_GIT_POLICY = -1028,
     /* wfs_git_publish: the target repository cannot take the branch (not a repository, the

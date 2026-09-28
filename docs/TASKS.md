@@ -26,7 +26,7 @@
   reflog 字节纳入发布前的源不变复查,副本按整体(reflog 字节、条目列表、全部对象存在)对比;
   stash 条目纳入保留路径检查;fork/checkpoint(含 `--committed-only`)保留,publish 不发布。
   其他 reflog 仍不导入。
-- [ ] Issue #7 剩余: Git LFS、reftable 仓库、共享 refs/对象服务、跨机器历史传输。
+- [ ] Issue #7 剩余: reftable 仓库、共享 refs/对象服务、跨机器历史传输。
   范围及测试见 [`GIT_INTEGRATION.md`](GIT_INTEGRATION.md)。
 
 ## 当前增量开发(2026-09-22)

@@ -71,6 +71,17 @@ struct GitRepoState {
     bool rerere_present = false;
     uint64_t rerere_bytes = 0;
     uint64_t import_bytes = 0;
+    // Git LFS local media cache under the repository's common directory. The payload store is
+    // copied into the World's owned common directory when LFS is active.
+    String lfs_objects;
+    uint64_t lfs_bytes = 0;
+    uint64_t lfs_entries = 0;
+    bool lfs_present = false;
+    bool lfs_active = false;
+    Vec<char> lfs_manifest;
+    // Effective LFS endpoint settings and the worktree/HEAD .lfsconfig bytes validated on
+    // import, rechecked with the other source configuration before the owned copy is published.
+    Vec<char> lfs_endpoint_state;
     // External sources: the common object directory the owned repository's objects are cloned
     // from, and how many entries it held when captured (the metadata a copy-on-write clone
     // costs; see git_import_budget).
