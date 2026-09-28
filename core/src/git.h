@@ -55,10 +55,10 @@ struct GitRepoState {
     Vec<GitSetting> identity;
     Vec<char> refs;
     // The stash stack: refs/stash (in `refs`) and its reflog, whose entries are stash@{1..n}.
-    // The reflog lives in the common directory, shared by every worktree of the repository; a
-    // mirror copies only the ref, so the reflog travels as bytes and every entry's objects are
-    // packed over from the source (restore_stash). `stash_list` is Git's own reading of the
-    // stack (capture_stash), compared as a whole in the copy.
+    // The reflog lives in the common directory, shared by every worktree of the repository.
+    // Ordinary Git clones copy only the ref, so the reflog travels as bytes; this implementation
+    // clones the complete object store and verifies every reflog-only entry after restoration.
+    // `stash_list` is Git's own reading of the stack (capture_stash), compared as a whole in copy.
     String stash_path;
     Vec<char> stash;
     bool stash_present = false;

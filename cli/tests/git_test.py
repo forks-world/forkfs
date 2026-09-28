@@ -1368,6 +1368,46 @@ class GitWorldTest(unittest.TestCase):
         published = self.git(self.root, '--git-dir', str(bare), 'rev-parse', 'refs/heads/world/' + wid).stdout.strip()
         self.assertEqual(published, self.git(one, 'rev-parse', 'HEAD').stdout.strip())
 
+    def test_default_lfs_hook_is_pinned_over_global_hooks_path(self):
+        import hashlib
+        import shlex
+        self.install_lfs(self.source)
+        baseline = b'baseline before global hooksPath\n'
+        (self.source / 'baseline.bin').write_bytes(baseline)
+        self.git(self.source, 'add', '.gitattributes', 'baseline.bin')
+        self.git(self.source, 'commit', '-qm', 'baseline LFS object')
+        bare = self.root / 'global-hook-remote.git'
+        self.git(self.root, 'init', '--bare', '-q', str(bare))
+        self.git(self.source, 'remote', 'add', 'origin', str(bare))
+        self.git(self.source, '-c', 'core.hooksPath=/dev/null', 'push', '-q', '-u', 'origin', 'main')
+
+        external = self.root / 'external-global-hooks'
+        external.mkdir()
+        marker = self.root / 'external-hook-ran'
+        (external / 'pre-push').write_text('#!/bin/sh\nprintf ran > ' + shlex.quote(str(marker)) + '\nexit 0\n')
+        (external / 'pre-push').chmod(0o700)
+        global_config = self.root / 'global-hook-config'
+        global_config.write_text('[core]\n hooksPath = ' + str(external) + '\n')
+        self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+
+        # Default import ignores the ambient hook directory and installs/pins its own canonical
+        # LFS pre-push hook in the copied repository's administration.
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        hooks_path = self.git(one, 'config', '--local', '--get', 'core.hooksPath').stdout.decode().strip()
+        self.assertTrue(hooks_path)
+        hook = Path(hooks_path)
+        if not hook.is_absolute(): hook = one / hook
+        self.assertTrue(hook.resolve().is_relative_to((one / '.world-git/repo.git').resolve()))
+        payload = b'uploaded by isolated default hook\n'
+        (one / 'world.bin').write_bytes(payload)
+        self.git(one, 'add', 'world.bin')
+        self.git(one, 'commit', '-qm', 'world LFS object')
+        self.git(one, 'push', 'origin', 'world/' + wid)
+        self.assertFalse(marker.exists())
+        oid = hashlib.sha256(payload).hexdigest()
+        self.assertEqual(self.lfs_object_path(bare, oid).read_bytes(), payload)
+
     def test_with_hooks_refuses_custom_lfs_pre_push_without_source_mutation(self):
         self.install_lfs(self.source)
         (self.source / 'file.bin').write_bytes(b'canonical LFS fixture\n')
