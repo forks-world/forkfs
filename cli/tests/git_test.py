@@ -1384,18 +1384,163 @@ class GitWorldTest(unittest.TestCase):
                 self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
                 self.git(self.source, 'config', '--local', '--unset-all', key)
 
-    def test_external_stash_stack_is_refused_unchanged(self):
-        for value in ('first', 'second'):
-            (self.source / 'file').write_text(value + '\n')
-            self.git(self.source, 'stash', 'push', '-m', value)
-        before = self.git(self.source, 'stash', 'list', '--format=%H:%gs').stdout
-        self.assertEqual(len(before.splitlines()), 2)
-        self.assertEqual(self.git(self.source, 'status', '--porcelain').stdout, b'')
+    # ---- stash ----------------------------------------------------------------------------
+
+    def make_stash_stack(self, repo, tracked='file'):
+        """Three stash entries, oldest first: a worktree change, a staged change (changed again
+        after staging), and a change beside an untracked file (--include-untracked)."""
+        repo = Path(repo)
+        (repo / tracked).write_text('worktree change\n')
+        self.git(repo, 'stash', 'push', '-q', '-m', 'worktree')
+        (repo / tracked).write_text('staged change\n')
+        self.git(repo, 'add', tracked)
+        (repo / tracked).write_text('staged, then changed again\n')
+        self.git(repo, 'stash', 'push', '-q', '-m', 'staged')
+        (repo / tracked).write_text('beside untracked\n')
+        (repo / 'stashed-untracked').write_text('untracked\n')
+        self.git(repo, 'stash', 'push', '-q', '--include-untracked', '-m', 'untracked')
+        self.assertEqual(self.git(repo, 'status', '--porcelain').stdout, b'')
+
+    def stash_view(self, repo):
+        """`stash list`, every entry's commit, tree and parents (index and untracked-files
+        commits included), and `stash show -p` of each entry, untracked files included."""
+        listing = self.git(repo, 'stash', 'list').stdout
+        entries = self.git(repo, 'log', '--walk-reflogs', '--format=%gd %H %T %P %gs', 'refs/stash', '--').stdout
+        shows = [self.git(repo, 'stash', 'show', '-p', '--include-untracked', 'stash@{%d}' % n).stdout
+                 for n in range(len(listing.splitlines()))]
+        return listing, entries, shows
+
+    def mirror_wrapper(self, name, action):
+        """A `git` on PATH that runs the shell `action` once, right after the first successful
+        `clone --mirror`, with $mirror naming the new mirror."""
+        import shlex
+        wrapper = self.root / ('mirror-bin-' + name)
+        wrapper.mkdir()
+        done = self.root / ('mirror-done-' + name)
+        script = wrapper / 'git'
+        script.write_text('#!/bin/sh\nis_mirror=0\nmirror=\nfor arg in "$@"; do [ "$arg" = --mirror ] && is_mirror=1; mirror=$arg; done\n'
+                          + shlex.quote(shutil.which('git')) + ' "$@"\nresult=$?\n'
+                          + 'if [ "$result" = 0 ] && [ "$is_mirror" = 1 ] && [ ! -e ' + shlex.quote(str(done)) + ' ]; then\n'
+                          + '  : > ' + shlex.quote(str(done)) + ' || exit $?\n  ' + action + ' || exit $?\n'
+                          + 'fi\nexit "$result"\n')
+        script.chmod(0o700)
+        return wrapper, done
+
+    def test_external_stash_stack_survives_source_deletion(self):
+        self.make_stash_stack(self.source)
+        view = self.stash_view(self.source)
+        self.assertEqual(len(view[0].splitlines()), 3)
+        log = (self.source / '.git/logs/refs/stash').read_bytes()
+        self.world('init', str(self.source))
+        self.assertEqual(self.stash_view(self.source), view)
+        self.assertEqual((self.source / '.git/logs/refs/stash').read_bytes(), log)
+        # publish moves one branch only: never the World's stash, not even a new entry.
+        pub, pub_wid = self.fork('pub')
+        (pub / 'file').write_text('stashed in the World\n')
+        self.git(pub, 'stash', 'push', '-q', '-m', 'world entry')
+        self.git(pub, 'commit', '-q', '--allow-empty', '-m', 'world change')
+        self.world('publish', pub_wid)
+        self.assertEqual(self.stash_view(self.source), view)
+        self.assertEqual((self.source / '.git/logs/refs/stash').read_bytes(), log)
+        shutil.rmtree(self.source)
+        one, wid = self.fork()
+        self.assertEqual(self.stash_view(one), view)
+        # The reflog lives in the common directory the World's worktree reads it from.
+        self.assertEqual((one / '.world-git/repo.git/logs/refs/stash').read_bytes(), log)
+        self.git(one, 'fsck', '--full')
+        self.git(one, 'gc', '--quiet', '--prune=now')
+        self.assertEqual(self.stash_view(one), view)
+        self.world('checkpoint', wid)
+        self.world('checkpoint', wid, '--committed-only')
+        for name, source in (('two', 'S2'), ('three', 'S3'), ('four', wid)):
+            copy, _ = self.fork(name, source, *(('--committed-only',) if name == 'four' else ()))
+            self.assertEqual(self.stash_view(copy), view, name)
+        self.git(one, 'stash', 'pop', '-q', '--index')
+        self.assertEqual((one / 'stashed-untracked').read_text(), 'untracked\n')
+        self.assertEqual((one / 'file').read_text(), 'beside untracked\n')
+        self.assertEqual(self.git(one, 'stash', 'list', '--format=%H').stdout,
+                         b''.join(line.split()[1] + b'\n' for line in view[1].splitlines()[1:]))
+        self.git(one, 'reset', '-q', '--hard')
+        (one / 'stashed-untracked').unlink()
+        self.git(one, 'stash', 'pop', '-q', '--index')
+        self.assertEqual(self.git(one, 'show', ':file').stdout, b'staged change\n')
+        self.assertEqual((one / 'file').read_text(), 'staged, then changed again\n')
+
+    def test_stash_objects_are_copied_when_the_mirror_lacks_them(self):
+        import shlex
+        self.make_stash_stack(self.source)
+        view = self.stash_view(self.source)
+        oldest = self.git(self.source, 'rev-parse', 'stash@{2}').stdout.strip().decode()
+        missing = self.root / 'mirror-lacked-oldest'
+        # As a transport-based (non-local) mirror would: only what refs reach, no reflog.
+        prune = (shlex.quote(shutil.which('git')) + ' --git-dir "$mirror" gc --quiet --prune=now && { '
+                 + shlex.quote(shutil.which('git')) + ' --git-dir "$mirror" cat-file -e ' + oldest
+                 + ' 2>/dev/null || : > ' + shlex.quote(str(missing)) + '; }')
+        path = self.env['PATH']
+        # Without the stash objects, the copy's own check refuses to publish it.
+        wrapper, done = self.mirror_wrapper('skip', prune)
+        skip = wrapper / 'git'
+        skip.write_text(skip.read_text().replace('#!/bin/sh\n', '#!/bin/sh\nfor arg in "$@"; do [ "$arg" = index-pack ] && exit 0; done\n', 1))
+        self.env['PATH'] = str(wrapper) + os.pathsep + path
         result = self.world('init', str(self.source), code=3)
-        self.assertIn(b'unsupported Git layout', result.stderr)
-        self.assertEqual(self.git(self.source, 'stash', 'list', '--format=%H:%gs').stdout, before)
-        self.assertEqual(self.git(self.source, 'rev-parse', 'HEAD').stdout.strip(), self.base)
+        self.env['PATH'] = path
+        self.assertIn(b'bad object', result.stderr)
+        self.assertTrue(done.exists())
+        self.assertTrue(missing.exists())
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        missing.unlink()
+        wrapper, done = self.mirror_wrapper('prune', prune)
+        self.env['PATH'] = str(wrapper) + os.pathsep + path
+        snapshot = self.world('init', str(self.source)).stdout.split()[0].decode()
+        self.env['PATH'] = path
+        self.assertTrue(missing.exists())
+        shutil.rmtree(self.source)
+        one, _ = self.fork('one', snapshot)
+        self.assertEqual(self.stash_view(one), view)
+        self.git(one, 'fsck', '--full')
+
+    def test_stash_entry_with_a_reserved_path_is_refused(self):
+        def reserved_untracked():
+            (self.source / '.world').write_text('not a marker\n')
+            self.git(self.source, 'stash', 'push', '-q', '--include-untracked', '-m', 'reserved')
+        def reserved_staged():
+            (self.source / '.world-git').mkdir()
+            (self.source / '.world-git' / 'x').write_text('staged\n')
+            self.git(self.source, 'add', '-f', '.world-git/x')
+            self.git(self.source, 'stash', 'push', '-q', '-m', 'reserved')
+        for make in (reserved_untracked, reserved_staged):
+            with self.subTest(make.__name__):
+                make()
+                # Buried below another entry: refs/stash itself is clean.
+                (self.source / 'file').write_text('on top\n')
+                self.git(self.source, 'stash', 'push', '-q', '-m', 'top')
+                before = self.git(self.source, 'stash', 'list', '--format=%H %gs').stdout
+                result = self.world('init', str(self.source), code=3)
+                self.assertIn(b'reserved path', result.stderr)
+                self.assertEqual(self.git(self.source, 'stash', 'list', '--format=%H %gs').stdout, before)
+                self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+                self.git(self.source, 'stash', 'clear')
+        self.world('init', str(self.source))
+
+    def test_stash_changed_after_capture_is_not_published(self):
+        import shlex
+        self.make_stash_stack(self.source)
+        # Only the reflog changes: dropping stash@{1} leaves refs/stash where it was.
+        top = self.git(self.source, 'rev-parse', 'refs/stash').stdout
+        drop = shlex.quote(shutil.which('git')) + ' -C ' + shlex.quote(str(self.source)) + " stash drop -q 'stash@{1}'"
+        wrapper, done = self.mirror_wrapper('drop', drop)
+        path = self.env['PATH']
+        self.env['PATH'] = str(wrapper) + os.pathsep + path
+        self.world('init', str(self.source), code=1)
+        self.env['PATH'] = path
+        self.assertTrue(done.exists())
+        self.assertEqual(self.git(self.source, 'rev-parse', 'refs/stash').stdout, top)
+        self.assertEqual(len(self.git(self.source, 'stash', 'list').stdout.splitlines()), 2)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        view = self.stash_view(self.source)
+        snapshot = self.world('init', str(self.source)).stdout.split()[0].decode()
+        one, _ = self.fork('one', snapshot)
+        self.assertEqual(self.stash_view(one), view)
 
     def test_managed_stash_and_hidden_refs_survive_checkpoint(self):
         self.world('init', str(self.source))
@@ -3141,6 +3286,28 @@ class GitWorldTest(unittest.TestCase):
         two, _ = self.fork('two')
         self.assertEqual(self.submodule_status(two), status)
         self.world('verify', 'S1')
+
+    def test_submodule_stash_stacks_are_carried(self):
+        self.submodule_fixture()
+        lib, inner = self.source / 'libs/lib', self.source / 'libs/lib/deps/inner'
+        self.make_stash_stack(lib, 'lib.txt')
+        self.make_stash_stack(inner, 'lib.txt')
+        views = [self.stash_view(repo) for repo in (lib, inner)]
+        self.assertNotEqual(views[0], views[1])
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        shutil.rmtree(self.root / 'origins')
+        one, wid = self.fork()
+        self.world('checkpoint', wid)
+        two, _ = self.fork('two', 'S2')
+        for world in (one, two):
+            for repo, view in zip(('libs/lib', 'libs/lib/deps/inner'), views):
+                self.assertEqual(self.stash_view(world / repo), view)
+                self.git(world / repo, 'fsck', '--full')
+        # The root has no stash of its own.
+        self.assertEqual(self.git(one, 'stash', 'list').stdout, b'')
+        self.git(one / 'libs/lib', 'stash', 'pop', '-q')
+        self.assertEqual((one / 'libs/lib/stashed-untracked').read_text(), 'untracked\n')
 
     def test_old_style_submodule_is_absorbed_into_the_world(self):
         lib = self.origin('lib')
