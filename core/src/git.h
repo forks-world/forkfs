@@ -78,6 +78,8 @@ struct GitRepoState {
     uint64_t lfs_entries = 0;
     bool lfs_present = false;
     bool lfs_active = false;
+    // LFS is used only by the committed submodule target selected by --committed-only.
+    bool lfs_target_only = false;
     Vec<char> lfs_manifest;
     // Effective LFS endpoint settings and the worktree/HEAD .lfsconfig bytes validated on
     // import, rechecked with the other source configuration before the owned copy is published.

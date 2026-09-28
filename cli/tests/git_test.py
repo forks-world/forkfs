@@ -695,12 +695,23 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'core.hooksPath has no canonical executable Git LFS pre-push hook', refused.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
-        canonical = self.source / '.git' / 'hooks' / 'pre-push'
-        self.assertTrue(canonical.is_file())
-        (husky / 'pre-push').write_bytes(canonical.read_bytes())
-        (husky / 'pre-push').chmod(0o755)
-        self.git(self.source, 'add', '.husky/pre-push')
-        self.git(self.source, 'commit', '-qm', 'canonical LFS pre-push')
+        # Keep the fixture-building Git/LFS commands from installing or adjusting hooks while
+        # the explicit in-tree hooksPath points into the source worktree.
+        self.git(self.source, 'config', 'core.hooksPath', '/dev/null')
+        # Git LFS may install its standard checkout/commit/merge hooks when its filter process
+        # runs. Carry the complete generated set so an ordinary Git status in the World stays
+        # clean after LFS performs that documented hook installation.
+        for name in ('pre-push', 'post-checkout', 'post-commit', 'post-merge'):
+            canonical = self.source / '.git' / 'hooks' / name
+            self.assertTrue(canonical.is_file(), name)
+            dest = husky / name
+            dest.write_bytes(canonical.read_bytes())
+            dest.chmod(0o755)
+        self.git(self.source, '-c', 'core.hooksPath=/dev/null', 'add', '.husky')
+        self.git(self.source, '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'canonical LFS pre-push')
+        self.git(self.source, 'config', 'core.hooksPath', '.husky')
+        self.assertEqual(self.git(self.source, '-c', 'core.hooksPath=/dev/null', 'status', '--porcelain',
+                                  '--', '.husky').stdout, b'')
         self.world('init', str(self.source), '--committed-only', '--with-hooks')
         one, _ = self.fork()
         self.assertEqual(self.git(one, 'config', '--get', 'core.hooksPath').stdout.strip(), b'.husky')
@@ -1305,11 +1316,14 @@ class GitWorldTest(unittest.TestCase):
         self.git(self.source, 'commit', '-qm', 'ordinary file')
         marker = self.root / 'staged-filter-ran'
         command = 'touch ' + shlex.quote(str(marker)) + '; cat'
-        for field in ('clean', 'smudge', 'process'):
-            self.git(self.source, 'config', 'filter.example.' + field, command)
         (self.source / '.gitattributes').write_text('file filter=example\n')
         self.git(self.source, 'add', '.gitattributes')
         (self.source / '.gitattributes').write_text('')
+        # Configure only after staging the attribute: otherwise Git's `add` may refresh the
+        # already-tracked file through the newly staged filter and execute this fixture.
+        for field in ('clean', 'smudge', 'process'):
+            self.git(self.source, 'config', 'filter.example.' + field, command)
+        self.assertFalse(marker.exists())
         index_before = (self.source / '.git/index').read_bytes()
         config_before = (self.source / '.git/config').read_bytes()
         refused = self.world('init', str(self.source), '--include-changes', code=3)
@@ -4299,6 +4313,80 @@ class GitWorldTest(unittest.TestCase):
         refused = self.world('init', str(self.source), '--committed-only', code=3)
         self.assertIn(b'reason: submodule libs/lib: commit ', refused.stderr)
         self.assertIn(b'is not in its repository', refused.stderr)
+
+    def test_committed_only_activates_lfs_in_a_submodule_target_only(self):
+        import hashlib
+        self.submodule_fixture()
+        lib = self.source / 'libs/lib'
+        old = self.git(lib, 'rev-parse', 'HEAD').stdout.strip().decode()
+        self.install_lfs(lib)
+        payload = b'committed target-only submodule LFS payload\n'
+        oid = hashlib.sha256(payload).hexdigest()
+        (lib / '.lfsconfig').write_text('[lfs]\n    url = ../relative-lfs\n')
+        (lib / 'target.bin').write_bytes(payload)
+        self.git(lib, 'add', '.gitattributes', '.lfsconfig', 'target.bin')
+        self.git(lib, 'commit', '-qm', 'target-only LFS with relative endpoint')
+        relative_target = self.git(lib, 'rev-parse', 'HEAD').stdout.strip().decode()
+        self.git(self.source, 'add', 'libs/lib')
+        self.git(self.source, 'commit', '-qm', 'record target-only LFS commit')
+        self.git(lib, 'checkout', '-q', old)
+        cache_root = self.lfs_object_path(lib, oid).parents[2]
+
+        refused = self.world('init', str(self.source), '--committed-only', code=3)
+        self.assertIn(b'must be an absolute URL or absolute filesystem path', refused.stderr)
+        self.assertEqual(self.git(lib, 'rev-parse', 'HEAD').stdout.strip(), old.encode())
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+        # The same target is accepted after its committed endpoint is made location-independent.
+        self.git(lib, 'checkout', '-q', relative_target)
+        safe_config = '[lfs]\n    url = https://lfs.example.test/objects\n'
+        (lib / '.lfsconfig').write_text(safe_config)
+        self.git(lib, 'add', '.lfsconfig')
+        self.git(lib, 'commit', '-qm', 'target-only LFS with absolute endpoint')
+        target = self.git(lib, 'rev-parse', 'HEAD').stdout.strip()
+        self.git(self.source, 'add', 'libs/lib')
+        self.git(self.source, 'commit', '-qm', 'record safe target-only LFS commit')
+        self.git(lib, 'checkout', '-q', old)
+        shutil.rmtree(cache_root, ignore_errors=True)
+
+        snapshot = self.world('init', str(self.source), '--committed-only').stdout.split()[0].decode()
+        self.assertEqual(self.git(lib, 'rev-parse', 'HEAD').stdout.strip(), old.encode())
+        one, _ = self.fork('target-lfs', snapshot)
+        owned_lib = one / 'libs/lib'
+        self.assertEqual(self.git(owned_lib, 'rev-parse', 'HEAD').stdout.strip(), target)
+        self.assertEqual(self.git(owned_lib, 'show', ':target.bin').stdout,
+                         self.lfs_pointer(oid, len(payload)))
+        self.assertEqual(self.git(owned_lib, 'config', '--get', 'filter.lfs.process').stdout.strip(),
+                         b'git-lfs filter-process')
+        self.assertEqual(self.git(owned_lib, 'config', '--get', 'lfs.storage').stdout.strip(), b'lfs')
+        hooks_path = self.git(owned_lib, 'config', '--get', 'core.hooksPath').stdout.decode().strip()
+        hook = Path(hooks_path)
+        if not hook.is_absolute():
+            hook = owned_lib / hook
+        self.assertTrue((hook / 'pre-push').is_file())
+        self.assertEqual(self.git(owned_lib, 'status', '--porcelain').stdout, b'')
+
+        # A managed submodule can become LFS-active only in the committed target. Verify the
+        # managed-copy path provisions the owned filter and hook after checking the source.
+        self.git(owned_lib, 'checkout', '-q', old)
+        shutil.rmtree(self.lfs_object_path(owned_lib, oid).parents[2], ignore_errors=True)
+        (hook / 'pre-push').unlink()
+        self.assertEqual(self.git(owned_lib, 'rev-parse', 'HEAD').stdout.strip(), old.encode())
+        self.assertFalse((hook / 'pre-push').exists())
+        managed_snapshot = self.world('init', str(one), '--committed-only').stdout.split()[0].decode()
+        self.assertEqual(self.git(owned_lib, 'rev-parse', 'HEAD').stdout.strip(), old.encode())
+        self.assertFalse((hook / 'pre-push').exists())
+        managed_copy, _ = self.fork('managed-target-lfs', managed_snapshot)
+        managed_lib = managed_copy / 'libs/lib'
+        self.assertEqual(self.git(managed_lib, 'rev-parse', 'HEAD').stdout.strip(), target)
+        self.assertEqual(self.git(managed_lib, 'config', '--get', 'filter.lfs.process').stdout.strip(),
+                         b'git-lfs filter-process')
+        self.assertEqual(self.git(managed_lib, 'config', '--get', 'lfs.storage').stdout.strip(), b'lfs')
+        managed_hooks = self.git(managed_lib, 'config', '--get', 'core.hooksPath').stdout.decode().strip()
+        managed_hook = Path(managed_hooks)
+        if not managed_hook.is_absolute():
+            managed_hook = managed_lib / managed_hook
+        self.assertTrue((managed_hook / 'pre-push').is_file())
 
     def test_submodule_ignore_setting_does_not_hide_a_dirty_submodule(self):
         self.submodule_fixture()

@@ -1485,6 +1485,30 @@ int validate_lfs_endpoint_listing(const Vec<char> &listing, Vec<char> *snapshot 
     }
     return 0;
 }
+int validate_lfs_tree_config(const char *root, const char *treeish, Vec<char> *snapshot = nullptr) {
+    String tree_arg(treeish);
+    const char *tree_args[] = {"ls-tree", "-z", tree_arg.c_str(), "--", ".lfsconfig", nullptr};
+    Vec<char> tree;
+    if (int rc = git(root, tree_args, &tree)) return rc;
+    if (tree.empty() || !tree[0]) return 0;
+    const char *tab = (const char *)memchr(tree.data(), '\t', tree.size());
+    if (!tab) return -EIO;
+    char mode[8], oid[72];
+    if (sscanf(tree.data(), "%7s blob %71s", mode, oid) != 2) return -EIO;
+    if (strcmp(mode, "100644") && strcmp(mode, "100755"))
+        return refuse(WFS_E_GIT_UNSUPPORTED, "%s:.lfsconfig is not a regular file", treeish);
+    String blobarg("--blob="); blobarg.append(oid);
+    const char *blob_args[] = {"config", blobarg.c_str(), "--null", "--list", nullptr};
+    Vec<char> listing;
+    if (int rc = git(root, blob_args, &listing)) return rc;
+    if (int rc = validate_lfs_endpoint_listing(listing)) return rc;
+    if (snapshot) {
+        snapshot->emplace_back('\1');
+        for (char c : tree) snapshot->emplace_back(c);
+        for (char c : listing) snapshot->emplace_back(c);
+    }
+    return 0;
+}
 int capture_lfs_endpoint_state(const char *root, Vec<char> &state) {
     state.clear();
     const char *extension_args[] = {"config", "--includes", "--null", "--get-regexp", "^lfs\\.extension\\.", nullptr};
@@ -1551,24 +1575,7 @@ int capture_lfs_endpoint_state(const char *root, Vec<char> &state) {
         for (char c : listing) state.emplace_back(c);
     }
 
-    const char *tree_args[] = {"ls-tree", "-z", "HEAD", "--", ".lfsconfig", nullptr};
-    Vec<char> tree;
-    if ((rc = git(root, tree_args, &tree))) return rc;
-    if (!tree.empty() && tree[0]) {
-        const char *tab = (const char *)memchr(tree.data(), '\t', tree.size());
-        if (!tab) return -EIO;
-        char oid[72];
-        if (sscanf(tree.data(), "100%*s blob %71s", oid) != 1) return -EIO;
-        String blobarg("--blob="); blobarg.append(oid);
-        const char *blob_args[] = {"config", blobarg.c_str(), "--null", "--list", nullptr};
-        Vec<char> listing;
-        if ((rc = git(root, blob_args, &listing))) return rc;
-        if ((rc = validate_lfs_endpoint_listing(listing))) return rc;
-        state.emplace_back('\1');
-        for (char c : tree) state.emplace_back(c);
-        for (char c : listing) state.emplace_back(c);
-    }
-    return 0;
+    return validate_lfs_tree_config(root, "HEAD", &state);
 }
 // Tracked files whose `filter` attribute names a defined driver (Git LFS, git-crypt, ...) would
 // have that driver executed by status in the source and in the World; WorldFS neither runs nor
@@ -2142,6 +2149,51 @@ int install_hooks(const GitRepoState &s, const char *clone, const char *repo) {
     if (!rc) rc = install_lfs_prepush(s, clone, repo);
     return rc;
 }
+int configure_lfs_filter(const char *cwd, const char *repo) {
+    const char *storage[] = {"--git-dir", repo, "config", "lfs.storage", "lfs", nullptr};
+    const char *clean[] = {"--git-dir", repo, "config", "filter.lfs.clean", "git-lfs clean -- %f", nullptr};
+    const char *smudge[] = {"--git-dir", repo, "config", "filter.lfs.smudge", "git-lfs smudge -- %f", nullptr};
+    const char *process[] = {"--git-dir", repo, "config", "filter.lfs.process", "git-lfs filter-process", nullptr};
+    const char *required[] = {"--git-dir", repo, "config", "filter.lfs.required", "true", nullptr};
+    if (int rc = git(cwd, storage)) return rc;
+    if (int rc = git(cwd, clean)) return rc;
+    if (int rc = git(cwd, smudge)) return rc;
+    if (int rc = git(cwd, process)) return rc;
+    return git(cwd, required);
+}
+int activate_managed_target_lfs(const GitRepoState &s, const char *worktree, const char *repo) {
+    bool present = false; String hooks;
+    if (int rc = local_hooks_path(worktree, present, hooks)) return rc;
+    bool use_admin = !present;
+    if (present) {
+        if (hooks.empty() || hooks[0] == '~')
+            return refuse(WFS_E_GIT_UNSUPPORTED, "managed Git LFS cannot safely install a pre-push hook for core.hooksPath %s", hooks.c_str());
+        String expected;
+        if (int rc = hooks_dir(worktree, expected)) return rc;
+        String expected_relative = relative_hooks_path(worktree, expected.c_str());
+        if (hooks == expected || (!expected_relative.empty() && hooks == expected_relative)) {
+            use_admin = true;
+        } else {
+            String normalized(hooks);
+            if (int rc = normalize_hooks_path(worktree, present, normalized)) return rc;
+            String dir = normalized[0] == '/' ? normalized :
+                (normalized == "." ? String(worktree) : joinp(worktree, normalized.c_str()));
+            String path;
+            int hook = read_lfs_prepush(dir, false, path);
+            if (hook < 0) return hook;
+        }
+    }
+    if (int rc = configure_lfs_filter(worktree, repo)) return rc;
+    if (use_admin) {
+        GitRepoState generated = s;
+        generated.lfs_active = true;
+        generated.with_hooks = false;
+        generated.hooks_path_present = false;
+        generated.hooks_path.clear();
+        return install_lfs_prepush(generated, worktree, repo);
+    }
+    return 0;
+}
 // GIT_OPTIONAL_LOCKS=0 (set by git()) keeps status from refreshing the index it inspects.
 // --ignore-submodules=dirty: a submodule counts as changed when its HEAD differs from the gitlink
 // the index records (read in-process from its refs), but status does not run a child `git
@@ -2503,7 +2555,29 @@ int require_committed_hooks_path(const char *root, bool present, const String &h
     for (const auto &scope : scopes) st_args.emplace_back(scope.c_str());
     st_args.emplace_back(nullptr);
     Vec<char> pending;
-    if (int src = git(root, st_args.data(), &pending, nullptr, false, true)) return src;
+    bool uses_lfs = false;
+    if (int src = reject_used_filters(root, nullptr, &uses_lfs)) return src;
+    int status_rc = 0;
+    if (uses_lfs) {
+        // This source-side status probe must not let Git LFS populate the source cache (or
+        // install/update hooks) while checking only whether the copied hooks path is clean.
+        char scratch[] = "/tmp/worldfs-lfs-hooks-XXXXXX";
+        if (!mkdtemp(scratch)) return -errno;
+        String storage(scratch); storage.append("/storage");
+        String storage_config("lfs.storage="); storage_config.append(storage.c_str());
+        Vec<const char *> safe_args;
+        for (const char *a : {"-c", "filter.lfs.process=git-lfs filter-process --skip", "-c",
+                              "filter.lfs.smudge=git-lfs smudge --skip -- %f", "-c", storage_config.c_str()})
+            safe_args.emplace_back(a);
+        for (size_t i = 0; st_args[i]; ++i) safe_args.emplace_back(st_args[i]);
+        safe_args.emplace_back(nullptr);
+        status_rc = git(root, safe_args.data(), &pending, nullptr, false, true);
+        int cleanup = fs_remove_tree(scratch);
+        if (!status_rc && cleanup) status_rc = cleanup;
+    } else {
+        status_rc = git(root, st_args.data(), &pending, nullptr, false, true);
+    }
+    if (status_rc) return status_rc;
     if (pending.size() > 1)
         return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s has uncommitted changes, which --committed-only would drop; commit them or drop --committed-only", hp.c_str());
     // Status cannot see edits to a hook marked skip-worktree or assume-unchanged, and the reset
@@ -2758,7 +2832,7 @@ int in_module(int rc, const String &path) {
 // would name a different place in the copy: refused. `git submodule init`, `git remote add`
 // with an absolute path and the import itself write absolute values; an in-tree relative
 // core.hooksPath travels with the tree and is fine.
-int reject_relative_managed_paths(const char *root) {
+int reject_relative_managed_paths(const char *root, bool allow_missing_lfs_hook = false) {
     const char *args[] = {"config", "--local", "--includes", "--null", "--get-regexp",
         "^remote\\..*\\.(url|pushurl)$", nullptr};
     Vec<char> listing; int status = -1;
@@ -2792,7 +2866,12 @@ int reject_relative_managed_paths(const char *root) {
                 if (!expected_relative.empty() && hooks == expected_relative &&
                     !fs_realpath(normalized.c_str(), resolved) && expected_real == resolved) {
                     String prepush;
-                    owned_lfs_hook = read_lfs_prepush(expected, false, prepush) == 1;
+                    int hook_rc = read_lfs_prepush(expected, false, prepush);
+                    if (hook_rc == 1) owned_lfs_hook = true;
+                    else if (allow_missing_lfs_hook) {
+                        struct stat st;
+                        owned_lfs_hook = lstat(prepush.c_str(), &st) && errno == ENOENT;
+                    }
                 }
             }
             if (!owned_lfs_hook)
@@ -2805,7 +2884,8 @@ int reject_relative_managed_paths(const char *root) {
 }
 // Everything the import reproduces of one repository -- the root, or a submodule's -- and every
 // eligibility check on it. `gitlinks` receives the index's gitlinks.
-int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool module, Vec<Gitlink> &gitlinks) {
+int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool module, Vec<Gitlink> &gitlinks,
+                 const char *target = nullptr) {
     out.root = root;
     String top;
     const char *top_args[] = {"rev-parse", "--show-toplevel", nullptr};
@@ -2826,9 +2906,6 @@ int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool modu
         if (int hook_rc = capture_hooks(root, out.hooks, out.hooks_path_present, out.hooks_path)) return hook_rc;
     }
     if (out.managed) {
-        if (int rc = reject_relative_managed_paths(root)) return rc;
-    }
-    if (out.managed) {
         // A managed copy has byte-identical configuration files and import commands ignore
         // global/system scope, so the effective list can only differ through an include that
         // resolves differently from the copy's location (hooksPath, identity, anything).
@@ -2837,11 +2914,13 @@ int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool modu
     }
     const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (value(root, head_args, out.head)) return refuse(WFS_E_GIT_UNSUPPORTED, "the repository has no commit yet");
-    bool lfs_worktree = false, lfs_head = false;
+    bool lfs_worktree = false, lfs_head = false, lfs_target = false;
     int lfs_rc = reject_used_filters(root, nullptr, &lfs_worktree);
     if (!lfs_rc) lfs_rc = reject_used_filters(root, out.head.c_str(), &lfs_head);
+    if (!lfs_rc && target && strcmp(target, out.head.c_str()))
+        lfs_rc = reject_used_filters(root, target, &lfs_target);
     if (lfs_rc) return lfs_rc;
-    out.lfs_active = lfs_worktree || lfs_head;
+    out.lfs_active = lfs_worktree || lfs_head || lfs_target;
     const char *head_ref_args[] = {"symbolic-ref", "--quiet", "HEAD", nullptr};
     if (int rc = value(root, head_ref_args, out.head_ref, true)) return rc;
     const char *index_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "index", nullptr};
@@ -2889,12 +2968,18 @@ int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool modu
         if ((rc = validate_lfs_storage(root))) return rc;
         out.lfs_active = true;
     }
+    out.lfs_target_only = lfs_target && !(lfs_worktree || lfs_head || out.lfs_present);
     if (out.lfs_active) {
         for (const auto &setting : out.carried)
             if (!strncmp(setting.key.c_str(), "lfs.customtransfer.", 19))
                 return refuse(WFS_E_GIT_UNSUPPORTED,
                     "custom Git LFS transfer agents are not supported; remove %s", setting.key.c_str());
         if ((rc = capture_lfs_endpoint_state(root, out.lfs_endpoint_state))) return rc;
+    }
+    if (out.lfs_active && target && strcmp(target, out.head.c_str()))
+        if ((rc = validate_lfs_tree_config(root, target))) return rc;
+    if (out.managed) {
+        if (int relative_rc = reject_relative_managed_paths(root, out.lfs_target_only)) return relative_rc;
     }
     if ((rc = validate_lfs_prepush_source(root, out))) return rc;
     if (!out.managed) {
@@ -2945,6 +3030,24 @@ int committed_hooks_check(const char *root, const GitRepoState &s, const char *t
     bool present = s.hooks_path_present; String hp = s.hooks_path;
     if (s.managed) {
         if (int rc = local_hooks_path(root, present, hp)) return rc;
+        // A target-only LFS module gets its generated pre-push hook in its owned Git
+        // administration after the copy is verified. Its exact generated relative path is
+        // outside the module worktree, so it need not be committed in the target tree.
+        if (s.lfs_target_only && target && s.head != target && present) {
+            String expected;
+            if (int rc = hooks_dir(root, expected)) return rc;
+            String expected_relative = relative_hooks_path(root, expected.c_str());
+            if (hp == expected || (!expected_relative.empty() && hp == expected_relative)) {
+                String prepush;
+                int hook = read_lfs_prepush(expected, false, prepush);
+                if (hook == 1) return 0;
+                if (hook < 0) {
+                    struct stat st;
+                    if (lstat(prepush.c_str(), &st) && errno == ENOENT) return 0;
+                    return hook;
+                }
+            }
+        }
         if (int rc = normalize_hooks_path(root, present, hp)) return rc;
     } else if (!s.with_hooks) {
         return 0;
@@ -3275,15 +3378,6 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
         if (top.managed) {
             if (int rc = check_owned_module(top.root.c_str(), m.path, m.gitdir)) return rc;
         }
-        m.repo.managed = top.managed;
-        Vec<Gitlink> sub_links;
-        if (int rc = capture_repo(full.c_str(), m.repo, top.with_hooks, true, sub_links)) return in_module(rc, path);
-        {
-            Vec<GitSetting> config; size_t shared = 0;
-            if (int rc = world_config(full.c_str(), m.repo, config, shared)) return rc;
-            if (int rc = check_configured_submodule_urls(full.c_str(), config, shared)) return in_module(rc, path);
-        }
-        if (int rc = nested_check(full.c_str(), &sub_links, false)) return in_module(rc, path);
         if (tree) {
             const Gitlink *recorded = find_link(tree_links, link.path.c_str());
             m.target = recorded->oid;
@@ -3291,6 +3385,18 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
             const char *exists[] = {"cat-file", "-e", spec.c_str(), nullptr};
             if (git(full.c_str(), exists, nullptr, nullptr, true))
                 return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s: commit %s, which the committed superproject records, is not in its repository", path.c_str(), m.target.c_str());
+        }
+        m.repo.managed = top.managed;
+        Vec<Gitlink> sub_links;
+        if (int rc = capture_repo(full.c_str(), m.repo, top.with_hooks, true, sub_links,
+                                  tree ? m.target.c_str() : nullptr)) return in_module(rc, path);
+        {
+            Vec<GitSetting> config; size_t shared = 0;
+            if (int rc = world_config(full.c_str(), m.repo, config, shared)) return rc;
+            if (int rc = check_configured_submodule_urls(full.c_str(), config, shared)) return in_module(rc, path);
+        }
+        if (int rc = nested_check(full.c_str(), &sub_links, false)) return in_module(rc, path);
+        if (tree) {
             if (int rc = committed_hooks_check(full.c_str(), m.repo, m.target.c_str())) return in_module(rc, path);
         } else if (top.require_clean && m.repo.head != link.oid) {
             return WFS_E_GIT_DIRTY;   // HEAD moved away from the recorded commit
@@ -3435,6 +3541,7 @@ bool same_capture(const GitRepoState &copy, const GitRepoState &s) {
         copy.worktree_config == s.worktree_config && same_settings(copy.worktree_settings, s.worktree_settings) &&
         same_bytes(copy.refs, s.refs) && same_stash(copy, s) && copy.orig_present == s.orig_present &&
         copy.lfs_active == s.lfs_active && copy.lfs_present == s.lfs_present &&
+        copy.lfs_target_only == s.lfs_target_only &&
         copy.lfs_bytes == s.lfs_bytes && copy.lfs_entries == s.lfs_entries &&
         same_bytes(copy.lfs_manifest, s.lfs_manifest) &&
         same_bytes(copy.lfs_endpoint_state, s.lfs_endpoint_state) &&
@@ -3445,7 +3552,8 @@ bool same_modules(const GitSource &copy, const GitSource &s) {
     if (copy.modules.size() != s.modules.size()) return false;
     for (size_t i = 0; i < s.modules.size(); ++i) {
         const GitModule &a = copy.modules[i], &b = s.modules[i];
-        if (a.path != b.path || a.name != b.name || a.gitdir != b.gitdir || !same_capture(a.repo, b.repo)) return false;
+        if (a.path != b.path || a.name != b.name || a.gitdir != b.gitdir || a.target != b.target ||
+            !same_capture(a.repo, b.repo)) return false;
     }
     return true;
 }
@@ -3725,13 +3833,7 @@ int own_repository(const GitRepoState &s, const char *cwd, const char *from, con
             if ((rc = lfs_import_bytes(s.root.c_str(), media.c_str(), bytes, entries, present, manifest))) return rc;
             if (!present || bytes != s.lfs_bytes || entries != s.lfs_entries || !same_bytes(manifest, s.lfs_manifest)) return -EBUSY;
         }
-        const char *storage[] = {"--git-dir", repo, "config", "lfs.storage", "lfs", nullptr};
-        const char *clean[] = {"--git-dir", repo, "config", "filter.lfs.clean", "git-lfs clean -- %f", nullptr};
-        const char *smudge[] = {"--git-dir", repo, "config", "filter.lfs.smudge", "git-lfs smudge -- %f", nullptr};
-        const char *process[] = {"--git-dir", repo, "config", "filter.lfs.process", "git-lfs filter-process", nullptr};
-        const char *required[] = {"--git-dir", repo, "config", "filter.lfs.required", "true", nullptr};
-        if ((rc = git(cwd, storage)) || (rc = git(cwd, clean)) || (rc = git(cwd, smudge)) ||
-            (rc = git(cwd, process)) || (rc = git(cwd, required))) return rc;
+        if ((rc = configure_lfs_filter(cwd, repo))) return rc;
     }
     if ((rc = prune_object_clone(objects, String(), 0))) return rc;
     String script;
@@ -3939,9 +4041,19 @@ int git_import(const GitSource &s, const char *clone) {
         // from a different moment, or a link that resolves differently at the copy's location,
         // is caught here even when the source looks unchanged again by the time cloning ends.
         GitSource copy;
-        if (int rc = git_source(clone, true, copy)) return rc;
+        if (int rc = git_source(clone, !s.committed_only, copy, s.committed_only)) return rc;
         if (!same_capture(copy, s) || !same_modules(copy, s)) return -EBUSY;
         if (int rc = reject_copied_locks(clone)) return rc;
+        if (s.lfs_target_only) {
+            String repo = joinp(clone, ".world-git/repo.git");
+            if (int rc = activate_managed_target_lfs(s, clone, repo.c_str())) return rc;
+        }
+        for (const auto &m : s.modules) if (m.repo.lfs_target_only) {
+            String path = joinp(clone, m.path.c_str());
+            String admin(".world-git/repo.git/worktrees/active/"); admin.append(m.gitdir.c_str());
+            String repo = joinp(clone, admin.c_str());
+            if (int rc = activate_managed_target_lfs(m.repo, path.c_str(), repo.c_str())) return in_module(rc, m.path);
+        }
     } else if (s.has_gitlinks) {
         if (int rc = copy_layout_check(s, clone)) return rc;
     }
