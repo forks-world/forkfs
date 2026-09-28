@@ -1,5 +1,6 @@
 """Git-aware worlds: real repositories, worktrees and complete workspace lifecycles."""
 import json
+import errno
 import os
 from pathlib import Path
 import shutil
@@ -152,6 +153,8 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
     def test_external_object_clone_budgets_metadata_not_bytes(self):
+        import ctypes
+        import fcntl
         import shlex
         linked = self.root / 'linked-budget'
         self.git(self.source, 'worktree', 'add', '-b', 'budget-linked', str(linked))
@@ -174,15 +177,59 @@ class GitWorldTest(unittest.TestCase):
                           'exec ' + shlex.quote(real_git) + ' "$@"\n')
         script.chmod(0o700)
         self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
-        # On the store's own volume the object directory is cloned, not copied: the budget is
-        # its metadata, so the sparse fixture neither blocks the import nor is materialized, and
-        # Git never byte-copies it either (no `git clone`). Being no object, it is not carried.
-        for source in (self.source, linked):
-            with self.subTest(source=source.name):
-                self.world('init', str(source))
-                self.assertFalse(called.exists())
-                self.assertEqual(oversized.stat().st_size, size)
-        self.assertEqual(len(json.loads(self.world('list', '--json').stdout)['snapshots']), 2)
+        # Same-volume does not imply reflink support (for example, ext4 generally lacks it).
+        # Probe the exact primitive on the store volume so the budget assertion covers both the
+        # metadata-only CoW path and the full-byte copy fallback without assuming a filesystem.
+        probe_src = self.store / 'clone-probe-src'
+        probe_dst = self.store / 'clone-probe-dst'
+        self.store.mkdir(parents=True, exist_ok=True)
+        probe_src.write_bytes(b'probe')
+        supports_share = False
+        try:
+            if sys.platform == 'darwin':
+                clonefile = ctypes.CDLL(None, use_errno=True).clonefile
+                clonefile.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+                clonefile.restype = ctypes.c_int
+                supports_share = clonefile(os.fsencode(probe_src), os.fsencode(probe_dst), 0) == 0
+            elif sys.platform.startswith('linux'):
+                with probe_src.open('rb') as src, probe_dst.open('wb') as dst:
+                    try:
+                        fcntl.ioctl(dst.fileno(), 0x40049409, src.fileno())  # FICLONE
+                        supports_share = True
+                    except OSError:
+                        pass
+        finally:
+            probe_src.unlink(missing_ok=True)
+            probe_dst.unlink(missing_ok=True)
+
+        def import_both(oversized_present=True):
+            for source in (self.source, linked):
+                with self.subTest(source=source.name):
+                    self.world('init', str(source))
+                    self.assertFalse(called.exists())
+                    if oversized_present:
+                        self.assertEqual(oversized.stat().st_size, size)
+                    else:
+                        self.assertFalse(oversized.exists())
+
+        if supports_share:
+            # A reflink-capable volume charges object-store metadata, not logical bytes.
+            import_both()
+            self.assertEqual(len(json.loads(self.world('list', '--json').stdout)['snapshots']), 2)
+        else:
+            # Without the filesystem's sharing primitive, budget the full copy. The sparse
+            # fixture therefore refuses both imports before publication; removing it proves
+            # the copy fallback itself remains usable and never invokes `git clone`.
+            for source in (self.source, linked):
+                with self.subTest(source=source.name, reflink=False):
+                    refused = self.world('init', str(source), code=3)
+                    self.assertIn(b'not enough free space', refused.stderr)
+                    self.assertFalse(called.exists())
+            self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+            oversized.unlink()
+            import_both(oversized_present=False)
+            self.assertFalse(called.exists())
+            self.assertEqual(len(json.loads(self.world('list', '--json').stdout)['snapshots']), 2)
         one, wid = self.fork()
         self.assertFalse((one / '.world-git' / 'repo.git' / 'objects' / 'budget-fixture').exists())
         self.git(one, 'fsck', '--full')
@@ -632,6 +679,33 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.hook_runs(marker), [])
         self.commit_in(one, 'husky runs')
         self.assertEqual(self.hook_runs(marker), ['husky ' + str(one)])
+
+    def test_lfs_with_in_tree_hooks_path_requires_existing_canonical_prepush(self):
+        self.install_lfs(self.source)
+        (self.source / 'file.bin').write_bytes(b'in-tree hook LFS fixture\n')
+        self.git(self.source, 'add', '.gitattributes', 'file.bin')
+        husky = self.source / '.husky'
+        husky.mkdir()
+        (husky / 'pre-commit').write_text('#!/bin/sh\nexit 0\n')
+        (husky / 'pre-commit').chmod(0o755)
+        self.git(self.source, 'add', '.husky')
+        self.git(self.source, 'commit', '-qm', 'LFS and husky')
+        self.git(self.source, 'config', 'core.hooksPath', '.husky')
+        refused = self.world('init', str(self.source), '--committed-only', '--with-hooks', code=3)
+        self.assertIn(b'core.hooksPath has no canonical executable Git LFS pre-push hook', refused.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+        canonical = self.source / '.git' / 'hooks' / 'pre-push'
+        self.assertTrue(canonical.is_file())
+        (husky / 'pre-push').write_bytes(canonical.read_bytes())
+        (husky / 'pre-push').chmod(0o755)
+        self.git(self.source, 'add', '.husky/pre-push')
+        self.git(self.source, 'commit', '-qm', 'canonical LFS pre-push')
+        self.world('init', str(self.source), '--committed-only', '--with-hooks')
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'config', '--get', 'core.hooksPath').stdout.strip(), b'.husky')
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.assertTrue(os.access(one / '.husky' / 'pre-push', os.X_OK))
 
     def test_with_hooks_resolves_escaping_relative_hooks_path_from_the_source(self):
         marker = self.root / 'hooks-ran'
@@ -1205,6 +1279,70 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((self.source / 'ambient-filter-ran').exists())
         self.assertFalse((one / 'ambient-filter-ran').exists())
 
+    def test_include_changes_recognizes_filter_used_only_by_staged_attributes(self):
+        self.install_lfs(self.source)
+        (self.source / 'file').write_bytes(b'ordinary committed content\n')
+        self.git(self.source, 'add', 'file')
+        self.git(self.source, 'commit', '-qm', 'ordinary file')
+        (self.source / '.gitattributes').write_text('file filter=lfs\n')
+        self.git(self.source, 'add', '.gitattributes')
+        # Deliberately make the worktree view differ from the staged/index view and HEAD.
+        (self.source / '.gitattributes').write_text('')
+        index_before = (self.source / '.git/index').read_bytes()
+        self.world('init', str(self.source), '--include-changes')
+        self.assertEqual((self.source / '.git/index').read_bytes(), index_before)
+        one, _ = self.fork()
+        self.assertEqual(self.git(one, 'check-attr', '--cached', 'filter', '--', 'file').stdout,
+                         b'file: filter: lfs\n')
+        self.assertEqual(self.git(one, 'config', '--get', 'filter.lfs.process').stdout.strip(),
+                         b'git-lfs filter-process')
+        self.assertTrue((one / '.world-git' / 'repo.git' / 'hooks' / 'pre-push').is_file())
+
+    def test_include_changes_refuses_custom_filter_used_only_by_staged_attributes(self):
+        import shlex
+        (self.source / 'file').write_bytes(b'ordinary committed content\n')
+        self.git(self.source, 'add', 'file')
+        self.git(self.source, 'commit', '-qm', 'ordinary file')
+        marker = self.root / 'staged-filter-ran'
+        command = 'touch ' + shlex.quote(str(marker)) + '; cat'
+        for field in ('clean', 'smudge', 'process'):
+            self.git(self.source, 'config', 'filter.example.' + field, command)
+        (self.source / '.gitattributes').write_text('file filter=example\n')
+        self.git(self.source, 'add', '.gitattributes')
+        (self.source / '.gitattributes').write_text('')
+        index_before = (self.source / '.git/index').read_bytes()
+        config_before = (self.source / '.git/config').read_bytes()
+        refused = self.world('init', str(self.source), '--include-changes', code=3)
+        self.assertIn(b"uses the 'example' filter", refused.stderr)
+        self.assertFalse(marker.exists())
+        self.assertEqual((self.source / '.git/index').read_bytes(), index_before)
+        self.assertEqual((self.source / '.git/config').read_bytes(), config_before)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_inactive_conditional_lfs_configuration_is_refused(self):
+        self.install_lfs(self.source)
+        (self.source / 'file.bin').write_bytes(b'conditional LFS fixture\n')
+        self.git(self.source, 'add', '.gitattributes', 'file.bin')
+        self.git(self.source, 'commit', '-qm', 'LFS fixture')
+        included = self.root / 'inactive-lfs-config'
+        global_config = self.root / 'inactive-lfs-global'
+        global_config.write_text('[includeIf "gitdir:' + str(self.root / 'elsewhere') + '/"]\n path = '
+                                  + str(included) + '\n')
+        targets = {
+            'lfs url': ('[lfs]\n url = ../relative-objects\n', b'lfs.url'),
+            'LFS extension': ('[lfs "extension.foo"]\n clean = touch marker\n', b'lfs.extension.foo.clean'),
+            'section-wide LFS remote': ('[remote]\n lfsdefault = origin\n', b'remote.lfsdefault'),
+        }
+        for name, (contents, key) in targets.items():
+            with self.subTest(target=name):
+                included.write_text(contents)
+                self.env['GIT_CONFIG_GLOBAL'] = str(global_config)
+                refused = self.world('init', str(self.source), code=3)
+                self.env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+                self.assertIn(b'includes', refused.stderr)
+                self.assertIn(key, refused.stderr)
+                self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
     def test_lfs_import_keeps_checkout_index_and_cache_independent_of_source(self):
         import hashlib
         self.install_lfs(self.source)
@@ -1685,6 +1823,26 @@ class GitWorldTest(unittest.TestCase):
         self.git(other, 'commit', '-qm', 'relative endpoint')
         refused = self.world('init', str(other), code=3)
         self.assertIn(b'must be an absolute URL or absolute filesystem path', refused.stderr)
+        snapshots = json.loads(self.world('list', '--json').stdout)['snapshots']
+        self.assertEqual([entry['id'] for entry in snapshots], ['S1'])
+
+        staged = self.root / 'staged-relative-lfsconfig'
+        staged.mkdir()
+        self.git(staged, 'init', '-q', '-b', 'main')
+        self.identify(staged)
+        self.install_lfs(staged)
+        safe = '[lfs]\n    url = https://lfs.example.test/objects\n'
+        (staged / '.lfsconfig').write_text(safe)
+        (staged / 'file.bin').write_bytes(b'staged endpoint fixture\n')
+        self.git(staged, 'add', '.lfsconfig', '.gitattributes', 'file.bin')
+        self.git(staged, 'commit', '-qm', 'safe endpoint')
+        (staged / '.lfsconfig').write_text('[lfs]\n    url = ../relative-objects\n')
+        self.git(staged, 'add', '.lfsconfig')
+        (staged / '.lfsconfig').write_text(safe)  # WT and HEAD are safe; the index is not.
+        staged_index = (staged / '.git/index').read_bytes()
+        refused = self.world('init', str(staged), '--include-changes', code=3)
+        self.assertIn(b'must be an absolute URL or absolute filesystem path', refused.stderr)
+        self.assertEqual((staged / '.git/index').read_bytes(), staged_index)
         snapshots = json.loads(self.world('list', '--json').stdout)['snapshots']
         self.assertEqual([entry['id'] for entry in snapshots], ['S1'])
 
@@ -3990,7 +4148,7 @@ class GitWorldTest(unittest.TestCase):
         env = dict(self.env)
         self.env['PATH'] = str(self.object_loss_wrapper(blob)) + os.pathsep + self.env['PATH']
         result = self.world('init', str(self.source), code=1)
-        self.assertIn(b'Resource busy', result.stderr)
+        self.assertIn(os.strerror(errno.EBUSY).encode(), result.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
         self.env = env
         snapshot = self.world('init', str(self.source)).stdout.split()[0].decode()

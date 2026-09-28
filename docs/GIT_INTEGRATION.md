@@ -181,9 +181,10 @@ Only the stock `git-lfs` clean, smudge and process commands are admitted when a 
 `filter=lfs`; custom commands, extensions, custom transfer agents and external `lfs.storage`
 locations are refused. LFS endpoint URLs are carried when absolute; relative endpoints are
 refused. An ordinary import installs and pins its generated pre-push hook in the World's own Git
-administration, independent of ambient `core.hooksPath`; under `--with-hooks`, an existing
-pre-push hook is carried only when it is Git LFS's canonical script (other supported hooks retain
-their normal handling). An ordinary `git push` then
+administration, independent of ambient `core.hooksPath`; under `--with-hooks`, a carried in-tree
+`core.hooksPath` must already contain an executable canonical Git LFS pre-push hook, so import
+does not add untracked hook files. An existing pre-push hook is carried only when it is Git LFS's
+canonical script (other supported hooks retain their normal handling). An ordinary `git push` then
 transfers payloads to its remote. `publish` validates and transfers every required payload in the
 commits being published, including objects that appear only in an intermediate commit, before
 moving the source branch. A missing or corrupt payload aborts before the branch moves.
@@ -531,7 +532,8 @@ What cannot be shared is refused with a Git configuration error that names the r
   and attributes of HEAD count too, so a filter HEAD assigns is refused even when uncommitted
   edits remove the assignment. Unsupported filters are never executed; the stock Git LFS status
   path is isolated in temporary storage as described above.
-- A conditional `includeIf` whose target sets status or filter settings, in any scope and
+- A conditional `includeIf` whose target sets status, filter, or LFS settings (`lfs.*`,
+  `remote.lfsdefault`, `remote.lfspushdefault`), in any scope and
   whether or not it is active at the source: the condition (a `gitdir:` pattern, a branch)
   can evaluate differently at the World's location. The same is refused for a target that
   sets per-remote or per-branch settings (`remote.<name>.*`, `branch.<name>.*`), since a

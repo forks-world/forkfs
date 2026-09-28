@@ -1151,7 +1151,8 @@ bool is_status_or_filter_key(const char *key) {
         "core.trustctime", "core.checkstat", "core.ignorestat", "core.checkroundtripencoding",
         "core.usereplacerefs", "attr.tree", nullptr};
     for (size_t i = 0; keys[i]; ++i) if (!strcasecmp(key, keys[i])) return true;
-    return !strncasecmp(key, "filter.", 7);
+    return !strncasecmp(key, "filter.", 7) || !strncasecmp(key, "lfs.", 4) ||
+        !strcasecmp(key, "remote.lfsdefault") || !strcasecmp(key, "remote.lfspushdefault");
 }
 // Whether `key` names a per-remote, per-branch or per-submodule setting --
 // "remote.<subsection>.<var>", "branch.<subsection>.<var>" or "submodule.<subsection>.<var>" --
@@ -1524,6 +1525,32 @@ int capture_lfs_endpoint_state(const char *root, Vec<char> &state) {
         for (char c : listing) state.emplace_back(c);
     } else if (errno != ENOENT) return -errno;
 
+    // The index is a third independent view: include-changes can retain a staged .lfsconfig
+    // that differs from both the worktree file and HEAD. Record the full stage listing (also
+    // rechecked through source_unchanged's captured index) and validate its stage-0 blob.
+    const char *index_args[] = {"ls-files", "--stage", "-z", "--", ".lfsconfig", nullptr};
+    Vec<char> index_listing;
+    if ((rc = git(root, index_args, &index_listing))) return rc;
+    for (char c : index_listing) state.emplace_back(c);
+    for (size_t i = 0; i + 1 < index_listing.size();) {
+        const char *record = index_listing.data() + i;
+        size_t n = strlen(record); i += n + 1;
+        const char *tab = strchr(record, '\t');
+        if (!tab) return -EIO;
+        char mode[8], oid[72]; int stage = -1;
+        if (sscanf(record, "%7s %71s %d", mode, oid, &stage) != 3) return -EIO;
+        if (stage != 0)
+            return refuse(WFS_E_GIT_UNSUPPORTED, "the staged .lfsconfig has unresolved index stages");
+        if (strcmp(mode, "100644") && strcmp(mode, "100755"))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "the staged .lfsconfig is not a regular file");
+        String blobarg("--blob="); blobarg.append(oid);
+        const char *blob_args[] = {"config", blobarg.c_str(), "--null", "--list", nullptr};
+        Vec<char> listing;
+        if ((rc = git(root, blob_args, &listing))) return rc;
+        if ((rc = validate_lfs_endpoint_listing(listing))) return rc;
+        for (char c : listing) state.emplace_back(c);
+    }
+
     const char *tree_args[] = {"ls-tree", "-z", "HEAD", "--", ".lfsconfig", nullptr};
     Vec<char> tree;
     if ((rc = git(root, tree_args, &tree))) return rc;
@@ -1564,7 +1591,11 @@ int reject_used_filters(const char *root, const char *tree = nullptr, bool *uses
     if (paths.size() <= 1) return 0;
     String source("--source=");
     if (tree) source.append(tree);
-    for (int pass = 0; pass < (tree ? 2 : 1); ++pass) {
+    // Check the worktree attributes, the staged/index attributes (`--cached`), and, when
+    // resetting to a tree, that tree's attributes. `--include-changes` preserves staged
+    // attributes independently of both the worktree and HEAD, so omitting the index view can
+    // miss a filter that the imported index will activate.
+    for (int pass = 0; pass < (tree ? 3 : 2); ++pass) {
         FILE *input = tmpfile();
         if (!input) return -errno;
         if (fwrite(paths.data(), 1, paths.size() - 1, input) != paths.size() - 1 || fflush(input)) {
@@ -1572,9 +1603,11 @@ int reject_used_filters(const char *root, const char *tree = nullptr, bool *uses
         }
         rewind(input);
         const char *attr_args[] = {"check-attr", "--stdin", "-z", "filter", nullptr};
+        const char *cached_attr_args[] = {"check-attr", "--cached", "--stdin", "-z", "filter", nullptr};
         const char *tree_attr_args[] = {"check-attr", source.c_str(), "--stdin", "-z", "filter", nullptr};
         Vec<char> attrs;
-        rc = git(root, pass ? tree_attr_args : attr_args, &attrs, nullptr, false, true, fileno(input));
+        const char *const *args = pass == 0 ? attr_args : (pass == 1 ? cached_attr_args : tree_attr_args);
+        rc = git(root, args, &attrs, nullptr, false, true, fileno(input));
         fclose(input);
         if (rc) return rc;
         if ((rc = reject_filter_attrs(root, attrs, defined, uses_lfs))) return rc;
@@ -2010,7 +2043,7 @@ int read_lfs_prepush(const String &dir, bool allow_create, String &path) {
     if (lstat(path.c_str(), &st)) {
         if (errno != ENOENT) return -errno;
         return allow_create ? 0 : refuse(WFS_E_GIT_UNSUPPORTED,
-            "an external core.hooksPath has no canonical Git LFS pre-push hook, so WorldFS cannot install one safely");
+            "core.hooksPath has no canonical executable Git LFS pre-push hook; add it before importing with --with-hooks");
     }
     if (!S_ISREG(st.st_mode)) return refuse(WFS_E_GIT_UNSUPPORTED, "the pre-push hook is not a regular file");
     if (!(st.st_mode & 0111)) return refuse(WFS_E_GIT_UNSUPPORTED,
@@ -2061,17 +2094,19 @@ int validate_lfs_prepush_source(const char *root, const GitRepoState &s) {
         dir = joinp(root, s.hooks_path.c_str());
     }
     String path;
-    bool allow_create = !(s.hooks_path_present && s.hooks_path == ".");
-    int rc = read_lfs_prepush(dir, allow_create, path);
+    // Explicit in-tree hooks paths are part of the user's worktree. Never create the
+    // generated hook there: require the canonical executable hook to already exist.
+    int rc = read_lfs_prepush(dir, !s.hooks_path_present, path);
     if (rc < 0) return rc;
     return 0;
 }
 int install_lfs_prepush(const GitRepoState &s, const char *worktree, const char *repo) {
     if (!s.lfs_active) return 0;
     if (s.with_hooks && s.hooks_path_present && (s.hooks_path.empty() || s.hooks_path[0] == '/' || s.hooks_path[0] == '~')) return 0;
-    if (s.with_hooks && s.hooks_path_present && s.hooks_path == ".") {
+    if (s.with_hooks && s.hooks_path_present && s.hooks_path[0] != '/' && s.hooks_path[0] != '~') {
         String path;
-        int exists = read_lfs_prepush(worktree, false, path);
+        String dir = s.hooks_path == "." ? String(worktree) : joinp(worktree, s.hooks_path.c_str());
+        int exists = read_lfs_prepush(dir, false, path);
         return exists < 0 ? exists : 0;
     }
     String dir;
