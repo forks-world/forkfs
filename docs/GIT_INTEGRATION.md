@@ -225,6 +225,89 @@ Worlds forked or checkpointed from a World keep its hooks, since its whole `.wor
 World requires the same of a relative `core.hooksPath` set in it -- committed, nothing pending
 inside -- even without `--with-hooks`.
 
+### Running agents with `world exec`
+
+A World's Git administration, `.world-git/repo.git`, lives inside the World, and `world exec`
+lets the command write the World. Without more, an agent could plant a hook, `core.hooksPath`,
+`core.fsmonitor`, a filter, `core.sshCommand` or a credential helper there that runs later,
+**outside any sandbox**, the first time you run Git in the World yourself. (Codex's own sandbox
+has the same gap for this layout: [openai/codex#49303](https://github.com/openai/codex/issues/49303).)
+So `world exec` does two things.
+
+**Denied inside a sandboxed exec** (writes only; Git still reads and runs the hooks there):
+
+- `.world-git/repo.git/hooks` and everything below it, the directory entry included, so it
+  cannot be replaced, removed or renamed away;
+- the `hooks` directory of every submodule repository under
+  `.world-git/repo.git/worktrees/active/modules/` (nested ones too). On macOS this is a
+  seatbelt regex, so a submodule that `git submodule update --init` clones *during* the exec
+  is covered as well: its clone may create `hooks` (as a directory, not a symlink) and Git's
+  `*.sample` templates in it, which Git never runs, and nothing else (seatbelt cannot tell
+  that `mkdir` from renaming a prepared directory into place, so a *new* repository's hooks
+  directory can still arrive that way; the report below lists what it contains);
+- the directory the World's effective `core.hooksPath` names, when that is outside the tree
+  (a global `~/.githooks`, a shared directory) or inside `.world-git`; its hooks are also
+  included in the report below;
+- what tells Git where those repositories are: the World's `.git` file,
+  `.world-git/repo.git/worktrees/active/commondir`, and the directory entries on the way to
+  each repository (`.world-git`, `repo.git`, `worktrees`, `active`, `modules`, each existing
+  submodule repository and the directories of a slashed submodule name), which cannot be
+  renamed or removed. Operations that move them (`git worktree repair`, `git submodule
+  absorbgitdirs`) fail inside the exec; run them outside.
+
+A tool that installs hooks (`git lfs install`, `pre-commit install`, `husky` writing to the
+default hooks directory) fails inside a sandboxed exec for the same reason; run it outside.
+A repository-local `core.hooksPath` pointing into the tree (husky's `.husky`) is **not**
+denied: it is project content, tracked by Git, and a change to it shows in `git status` and in
+the diff you review before you merge. Git's configuration (`config`, `config.worktree`) is
+not denied either: `git remote add`, `git push -u`, `git branch --set-upstream-to` and
+`git config` legitimately write it. Hence the second part.
+
+**Reported after every exec** (sandboxed or `--no-sandbox`, whatever the command's exit
+status, which `world exec` keeps). Before the command starts, exec records, for the World and
+each submodule repository present, `git config --list --includes --show-scope` (effective
+configuration: system, global, local, worktree and included files -- the sandbox does not
+stop writes to `~/.gitconfig`, and `--no-sandbox` stops nothing) filtered to the settings
+below, plus the hooks Git could run (name, mode and content of every non-`.sample` entry of
+each hooks directory) and the `.git` files that locate the repositories. It records them
+again after the command and prints one line per difference to stderr:
+
+```
+world: WARNING: exec changed a Git setting that runs commands: local core.fsmonitor: (unset) -> touch /tmp/x
+world: WARNING: exec changed a Git setting that runs commands: submodule lib-module local credential.helper: (unset) -> store
+world: WARNING: exec added a Git hook: .world-git/repo.git/worktrees/active/modules/vendor/lib/hooks/post-checkout
+world: WARNING: exec changed where Git finds a repository: libs/lib/.git
+```
+
+The settings watched (Git's lowercase key names; `*` is any subsection): `core.hookspath`,
+`core.fsmonitor`, `core.sshcommand`, `core.editor`, `core.pager`, `core.askpass`,
+`core.gitproxy`, `core.alternaterefscommand`, `sequence.editor`, `credential.helper` and
+`credential.*.helper`, `filter.*.clean|smudge|process`, `diff.external`,
+`diff.*.command|textconv`, `merge.*.driver`, `mergetool.*.cmd|path`, `difftool.*.cmd|path`,
+`gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`,
+`remote.*.uploadpack|receivepack|vcs`, `uploadpack.packobjectshook`,
+`sendemail[.*].tocmd|cccmd|headercmd|sendmailcmd|smtpserver`, `include.path`,
+`includeif.*.path`, `alias.*` whose value starts with `!`, `submodule.*.update` whose value
+starts with `!`, `pager.*`, `interactive.difffilter`, `web.browser`, `browser.*.cmd|path`,
+`man.*.cmd|path`, `init.templatedir`, `hook.*.command`, `trailer.*.command|cmd`,
+`protocol.allow` and `protocol.*.allow` (which can enable `ext::` URLs), and
+`lfs.*.path|clean|smudge` (custom transfer agents and extensions). The list is
+`kGuardKeys` in `cli/exec_guard.h`. This costs one `git config --list` per repository before
+and after; no tree is walked. If the configuration cannot be read (no `git` on `PATH`, a
+malformed file), exec says so in one `note:` line and reports nothing; a World without
+`.world-git` gets neither the rules nor the report.
+
+The exec sandbox is not a general confinement: it keeps the command away from the store and
+from other Worlds, and from the hooks above. `~/.gitconfig`, `~/.ssh`, shell startup files and
+everything else outside the World stay writable on macOS (`(allow default)`), which is why the
+report covers effective configuration. On Linux the host filesystem is read-only in the
+sandbox, but hooks are protected with read-only bind mounts of the directories that exist
+when the exec starts, and the directories on the way to them are bound onto themselves so they
+cannot be renamed; a submodule first initialized during the exec gets writable hooks there,
+which the report then lists. What neither platform stops, and the report does not cover: a
+change to project content that runs code (a `Makefile`, `package.json` scripts, `.husky`,
+`.envrc`) -- review the World's diff before running it.
+
 ## Git LFS
 
 Repositories that use the stock Git LFS filter are supported at the root and in initialized

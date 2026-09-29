@@ -91,6 +91,12 @@ The policy in `cli/linux_sandbox.cpp`:
   The same pass rejects nested `.world` markers and non-directory hardlinks whose inode also has
   a name outside the World; hardlinks fully contained in the World remain usable.
 - Uses a new session and `--die-with-parent`; the existing exec lock covers the runner's lifetime.
+- In a Git World, binds the hooks directories that exist at start (the World's and each
+  submodule repository's, and a `core.hooksPath` inside `.world-git`), the World's `.git` file
+  and `commondir` read-only, and binds each
+  directory on the way to a repository onto itself so it cannot be renamed (EBUSY). A submodule
+  first cloned during the exec is not covered; `world exec` reports its hooks afterwards. See
+  [Running agents with `world exec`](GIT_INTEGRATION.md#running-agents-with-world-exec).
 
 Setup failures return an error without starting the command. `--require-sandbox` is
 consistent with this default. Only explicit `--no-sandbox` runs unconfined.
