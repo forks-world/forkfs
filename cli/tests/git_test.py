@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import shlex
 import unittest
 
 WORLD = str(Path(sys.argv.pop(1)).resolve())
@@ -4473,6 +4474,114 @@ class GitWorldTest(unittest.TestCase):
         self.run_cmd(WORLD, 'exec', wid, '--require-sandbox', '--', 'git', 'commit', '-m', 'sandbox')
         self.assertEqual(self.git(self.source, 'rev-parse', 'HEAD').stdout.strip(), self.base)
 
+    # ---- world exec: the World's Git hooks and command-running settings ----
+
+    def exec_sh(self, wid, script, *opts, code=0):
+        return self.run_cmd(WORLD, 'exec', wid, *opts, '--', '/bin/sh', '-c', script, code=code)
+
+    def assert_denied(self, wid, script):
+        """`script` fails inside the sandbox (EPERM under seatbelt, EROFS/EBUSY under bwrap)."""
+        p = subprocess.run((WORLD, 'exec', wid, '--require-sandbox', '--', '/bin/sh', '-c', script),
+                           env=self.env, capture_output=True, timeout=60)
+        self.assertNotEqual(p.returncode, 0, (script, p.stdout, p.stderr))
+        return p
+
+    def test_exec_sandbox_denies_hooks_but_not_configuration(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        repo = one / '.world-git/repo.git'
+        hooks = repo / 'hooks'
+        hooks.mkdir(exist_ok=True)
+        (hooks / 'post-commit').write_text('#!/bin/sh\necho kept-hook-ran\n')
+        (hooks / 'post-commit').chmod(0o755)
+        dot_git = (one / '.git').read_bytes()
+        self.assert_denied(wid, 'echo evil > .world-git/repo.git/hooks/pre-commit')
+        self.assert_denied(wid, 'echo evil >> .world-git/repo.git/hooks/post-commit')
+        self.assert_denied(wid, 'mkdir hooks2 && mv .world-git/repo.git/hooks hooks-old')
+        self.assert_denied(wid, 'rm -rf .world-git/repo.git/hooks')
+        # Nor can the command swap the repository, or where the World's `.git` points.
+        self.assert_denied(wid, 'mv .world-git/repo.git .world-git/other')
+        self.assert_denied(wid, 'mv .world-git/repo.git/worktrees/active .world-git/repo.git/worktrees/x')
+        self.assert_denied(wid, 'echo "gitdir: /tmp" > .git')
+        self.assert_denied(wid, 'echo /tmp > .world-git/repo.git/worktrees/active/commondir')
+        self.assertFalse((hooks / 'pre-commit').exists())
+        self.assertEqual((hooks / 'post-commit').read_text(), '#!/bin/sh\necho kept-hook-ran\n')
+        self.assertEqual((one / '.git').read_bytes(), dot_git)
+        # Everyday work, including Git writing its own configuration, is unaffected, and the
+        # World's hooks still run inside the exec.
+        p = self.exec_sh(wid, 'echo work > file && git add file && git commit -qm work && '
+                              'git config user.email agent@example.com && '
+                              'git config branch.main.description x', '--require-sandbox')
+        self.assertIn(b'kept-hook-ran', p.stdout + p.stderr)
+        self.assertNotIn(b'WARNING', p.stderr)
+        self.assertEqual(self.git(one, 'config', 'user.email').stdout.strip(), b'agent@example.com')
+        self.assertEqual(self.git(one, 'log', '-1', '--format=%s').stdout.strip(), b'work')
+        # A setting that makes Git run a command is written, then reported, with the exit code kept.
+        p = self.exec_sh(wid, "git config core.fsmonitor 'touch /tmp/x' && exit 7", '--require-sandbox', code=7)
+        self.assertIn(b"world: WARNING: exec changed a Git setting that runs commands: "
+                      b"local core.fsmonitor: (unset) -> touch /tmp/x\n", p.stderr)
+        p = self.exec_sh(wid, "git config --unset core.fsmonitor && git config alias.x '!sh -c evil' && "
+                              "git config alias.co checkout", '--require-sandbox')
+        self.assertIn(b'local core.fsmonitor: touch /tmp/x -> (unset)\n', p.stderr)
+        self.assertIn(b'local alias.x: (unset) -> !sh -c evil\n', p.stderr)
+        self.assertNotIn(b'alias.co', p.stderr)
+        # A core.hooksPath outside the tree is guarded like the hooks directory; one inside the
+        # tree (husky's .husky) is project content that `git status` shows, and stays writable.
+        shared = self.root / 'shared-hooks'
+        shared.mkdir()
+        self.git(one, 'config', 'core.hooksPath', str(shared))
+        self.assert_denied(wid, 'echo evil > ' + shlex.quote(str(shared / 'pre-commit')))
+        self.git(one, 'config', 'core.hooksPath', '.husky')
+        p = self.exec_sh(wid, 'mkdir -p .husky && echo lint > .husky/pre-commit', '--require-sandbox')
+        self.assertNotIn(b'WARNING', p.stderr)
+        self.git(one, 'config', '--unset', 'core.hooksPath')
+        # A World path with regex metacharacters still matches only itself.
+        odd, oid = self.fork('w.i+r(d)[x]{2}$^|?*')
+        (odd / '.world-git/repo.git/hooks').mkdir(exist_ok=True)
+        self.assert_denied(oid, 'echo evil > .world-git/repo.git/hooks/pre-commit')
+        if sys.platform != 'darwin':
+            return  # bwrap binds paths, and everything outside the World is read-only anyway
+        lookalike = self.root / 'wXiirdxx/.world-git/repo.git/worktrees/active/modules/m/hooks'
+        lookalike.mkdir(parents=True)
+        self.exec_sh(oid, 'echo fine > ' + shlex.quote(str(lookalike / 'pre-commit')), '--require-sandbox')
+
+    def test_exec_reports_hooks_and_settings_without_sandbox(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        p = self.exec_sh(wid, 'mkdir -p .world-git/repo.git/hooks && '
+                              'printf "#!/bin/sh\\n" > .world-git/repo.git/hooks/pre-commit && '
+                              'git config credential.helper "!f() { cat ~/.token; }; f" && '
+                              'git config --add credential.helper store && exit 3', '--no-sandbox', code=3)
+        self.assertIn(b'world: WARNING: exec added a Git hook: .world-git/repo.git/hooks/pre-commit\n', p.stderr)
+        self.assertIn(b'world: WARNING: exec changed a Git setting that runs commands: local credential.helper: '
+                      b'(unset) -> !f() { cat ~/.token; }; f, store\n', p.stderr)
+        p = self.exec_sh(wid, 'echo "echo changed" >> .world-git/repo.git/hooks/pre-commit', '--no-sandbox')
+        self.assertIn(b'world: WARNING: exec changed a Git hook: .world-git/repo.git/hooks/pre-commit\n', p.stderr)
+        p = self.exec_sh(wid, 'rm .world-git/repo.git/hooks/pre-commit && touch .world-git/repo.git/hooks/x.sample',
+                         '--no-sandbox')
+        self.assertEqual(p.stderr.count(b'WARNING'), 1, p.stderr)
+        self.assertIn(b'world: WARNING: exec removed a Git hook: .world-git/repo.git/hooks/pre-commit\n', p.stderr)
+        # Effective configuration: a change to the global file the World includes is reported too.
+        glob = self.root / 'global-config'
+        glob.write_text('')
+        self.env['GIT_CONFIG_GLOBAL'] = str(glob)
+        p = self.exec_sh(wid, 'git config --global core.pager "less; evil"', '--no-sandbox')
+        self.assertIn(b'global core.pager: (unset) -> less; evil\n', p.stderr)
+        # A rewritten `.git` is reported: Git would find another repository and its hooks.
+        p = self.exec_sh(wid, 'cp .git .git.orig && echo "gitdir: /tmp/elsewhere" > .git', '--no-sandbox')
+        self.assertIn(b'world: WARNING: exec changed where Git finds a repository: .git\n', p.stderr)
+        (one / '.git.orig').rename(one / '.git')
+
+    def test_exec_in_a_plain_world_says_nothing_about_git(self):
+        plain = self.root / 'plain'
+        plain.mkdir()
+        (plain / 'file').write_text('plain\n')
+        self.world('init', str(plain))
+        _, wid = self.fork('plain-world', 'S1')
+        for opts in (('--no-sandbox',), ('--require-sandbox',)):
+            p = self.exec_sh(wid, 'mkdir -p x/hooks && echo x > x/hooks/pre-commit', *opts)
+            self.assertEqual(p.stderr, b'', opts)
+
     def test_discard_refuses_additional_worktrees(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
@@ -5128,6 +5237,65 @@ class GitWorldTest(unittest.TestCase):
                          (admin / 'lib-module/modules/deps/inner').resolve())
         self.assertFalse((world / 'vendor/unused/.git').exists())
         self.assertEqual(list((world / 'vendor/unused').iterdir()), [])
+
+    def test_exec_guards_submodule_hooks(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        admin = '.world-git/repo.git/worktrees/active/modules/'
+        for repo in ('lib-module', 'lib-module/modules/deps/inner'):
+            (one / admin / repo / 'hooks').mkdir(exist_ok=True)
+            self.assert_denied(wid, 'echo evil > %s%s/hooks/post-checkout' % (admin, repo))
+            self.assertFalse((one / admin / repo / 'hooks/post-checkout').exists())
+        self.assert_denied(wid, 'mv %slib-module %slib-old' % (admin, admin))
+        self.assert_denied(wid, 'mv %slib-module/modules/deps %slib-module/modules/x' % (admin, admin))
+        # The submodule repositories themselves stay writable.
+        self.exec_sh(wid, 'git -C libs/lib config user.name Agent && echo w > libs/lib/new && '
+                          'git -C libs/lib add new && git -C libs/lib commit -qm new', '--require-sandbox')
+        # A submodule initialized during the exec: its clone works (Git's *.sample templates
+        # included). Seatbelt's regex covers its new hooks directory; bwrap's mounts are fixed at
+        # start, so on Linux the hook is written and reported afterwards.
+        self.assertFalse((one / admin / 'vendor').exists())
+        p = subprocess.run((WORLD, 'exec', wid, '--require-sandbox', '--', '/bin/sh', '-c',
+                            'git -c protocol.file.allow=always submodule update -q --init vendor/unused && '
+                            'echo evil > %svendor/unused/hooks/post-checkout' % admin),
+                           env=self.env, capture_output=True, timeout=60)
+        self.assertTrue((one / 'vendor/unused/lib.txt').exists(), p.stderr)
+        self.assertTrue(any((one / admin / 'vendor/unused/hooks').glob('*.sample')))
+        if sys.platform == 'darwin':
+            self.assertNotEqual(p.returncode, 0, p.stderr)
+            self.assertFalse((one / admin / 'vendor/unused/hooks/post-checkout').exists())
+            # A new repository's hooks directory may be created, but not as a symlink elsewhere.
+            (one / admin / 'fake').mkdir()
+            self.assert_denied(wid, 'ln -s /tmp %sfake/hooks' % admin)
+        else:
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn(('world: WARNING: exec added a Git hook: %svendor/unused/hooks/post-checkout\n'
+                           % admin).encode(), p.stderr)
+        # Settings in a submodule's own configuration are reported under its name, and a
+        # rewritten checkout `.git` (pointing Git at another repository) is reported too.
+        p = self.exec_sh(wid, "git -C libs/lib/deps/inner config core.sshCommand 'ssh -o ProxyCommand=evil' && "
+                              "echo 'gitdir: /tmp/elsewhere' > libs/lib/.git", '--require-sandbox')
+        self.assertIn(b'world: WARNING: exec changed a Git setting that runs commands: submodule '
+                      b'lib-module/modules/deps/inner local core.sshcommand: (unset) -> ssh -o ProxyCommand=evil\n',
+                      p.stderr)
+        self.assertIn(b'world: WARNING: exec changed where Git finds a repository: libs/lib/.git\n', p.stderr)
+
+    def test_exec_keeps_a_submodule_named_hooks_writable(self):
+        """Seatbelt's regex cannot tell modules/tools/hooks (a repository) from a hooks directory;
+        the existing repository is given back, and only its own hooks are denied."""
+        tool = self.origin('tool')
+        self.sub(self.source, 'add', '-q', '--name', 'tools/hooks', str(tool), 'tools/hooks')
+        self.git(self.source, 'commit', '-qm', 'tool')
+        self.identify(self.source / 'tools/hooks')
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        gitdir = one / '.world-git/repo.git/worktrees/active/modules/tools/hooks'
+        self.assertTrue((gitdir / 'HEAD').is_file())
+        self.exec_sh(wid, 'echo w > tools/hooks/new && git -C tools/hooks add new && '
+                          'git -C tools/hooks commit -qm new', '--require-sandbox')
+        (gitdir / 'hooks').mkdir(exist_ok=True)
+        self.assert_denied(wid, 'echo evil > .world-git/repo.git/worktrees/active/modules/tools/hooks/hooks/pre-commit')
 
     def test_submodules_survive_deletion_of_the_source_and_their_origins(self):
         status = self.submodule_fixture()
