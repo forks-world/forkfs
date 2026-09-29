@@ -440,7 +440,13 @@ inside its own `.git` directory:
   `extensions.worktreeConfig` (per-worktree settings), and no `include.path` or
   `includeIf.<condition>.path` with a relative path, which Git resolves from the location of
   the configuration file, so the copy would read a different file. Absolute and `~/` includes
-  name the same file from anywhere and are allowed.
+  name the same file from anywhere and are allowed, unconditionally or under an `onbranch:` or
+  `hasconfig:` condition. Any other `includeIf` condition is refused whatever it includes:
+  `gitdir:` and `gitdir/i:` match the repository's own path, so a setting that applies at the
+  source (say `core.filemode=false` for one checkout) would stop applying in the copy, and a
+  condition Git adds later is not known to be location-independent. Conditional includes in the
+  user's global or system configuration that target a nested repository's location are not
+  examined; they act on it as they would on any repository moved there.
 
 A bare repository that happens to be named `.git` (`core.bare`) is admitted too: it names no
 worktree at all. Each repository nested in an admitted one is checked the same way, at any

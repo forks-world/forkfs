@@ -4931,6 +4931,12 @@ class GitWorldTest(unittest.TestCase):
         self.nested_repo(nested)
         self.git(nested, 'config', 'includeIf.onbranch:main.path', 'local.cfg')
         refused(nested, b'it includes local.cfg by a relative path')
+        # A condition on the repository's own location evaluates differently in the copy,
+        # whatever the included path: a source-only core.filemode=false would stop applying.
+        for cond in ('gitdir:' + str(nested) + '/', 'gitdir/i:' + str(nested) + '/'):
+            self.nested_repo(nested)
+            self.git(nested, 'config', 'includeIf.' + cond + '.path', str(self.root / 'shared.cfg'))
+            refused(nested, b'it includes ' + str(self.root / 'shared.cfg').encode() + b' under the condition ' + cond.encode())
         self.nested_repo(nested)
         (nested / '.git/modules/lib').mkdir(parents=True)
         refused(nested, b'it holds submodule repositories (.git/modules)')
@@ -4956,6 +4962,8 @@ class GitWorldTest(unittest.TestCase):
         # repository elsewhere, which stays a symlink and is never entered.
         self.nested_repo(nested)
         self.git(nested, 'config', 'include.path', str(self.root / 'shared.cfg'))
+        self.git(nested, 'config', 'includeIf.onbranch:main.path', str(self.root / 'shared.cfg'))
+        self.git(nested, 'config', 'includeIf.hasconfig:remote.*.url:https://example.com/**.path', str(self.root / 'shared.cfg'))
         self.git(self.root, 'init', '-q', '--bare', str(self.source / 'bare/.git'))
         (self.source / 'link').symlink_to(other)
         self.world('init', str(self.source), '--include-changes')
