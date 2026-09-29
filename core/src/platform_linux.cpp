@@ -278,12 +278,13 @@ bool fs_clone_shares(const char *dst, const char *src) {
     return fs_clone_probe(dst, src) == 0 && !::statfs(dst, &fs) && fs.f_type != EXT4_SUPER_MAGIC;
 }
 
-int fs_clone_tree(const char *src, const char *dst, bool allow_fallback) {
+int fs_clone_tree(const char *src, const char *dst, bool allow_fallback, const Vec<String> *omit) {
     if (!src || !dst) return -EINVAL;
     CloneCtx c{dst, allow_fallback};
-    if (int rc = fs_walk_tree(src, 4, FS_DIRS_PRE, &c, clone_entry)) return rc;
+    // The omitted names are never entered: nothing below one is read, reflinked or copied.
+    if (int rc = fs_walk_tree(src, 4, FS_DIRS_PRE, &c, clone_entry, omit)) return rc;
     // Restore directory ACLs/modes/times only after all children have been created.
-    return fs_walk_tree(src, 1, FS_DIRS_POST, &c, dir_metadata);
+    return fs_walk_tree(src, 1, FS_DIRS_POST, &c, dir_metadata, omit);
 }
 // Linux immutable flags require capabilities and cannot implement unprivileged --hard.
 // Gate protection remains the default; never claim a hard snapshot was protected.

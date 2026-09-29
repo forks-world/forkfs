@@ -152,6 +152,12 @@ struct GitSource : GitRepoState {
 int git_source(const char *root, bool include_changes, GitSource &out, bool committed_only = false,
                bool with_hooks = false);
 int git_import(const GitSource &source, const char *clone);
+// Exactly the tree-relative names git_import removes from the copy for `source`'s left-out
+// linked worktrees (GitSource::worktrees): each in-tree checkout, and for a managed World each
+// registration under .world-git/repo.git/worktrees. The pre-clone scan and a walked copy leave
+// them out (hardlinks_scan, fs_clone_tree); git_import removes whatever of them a whole-root
+// clone still copied.
+void git_omitted_names(const GitSource &source, Vec<String> &out);
 // The free space an external import needs on the volume holding `near`, beyond the tree clone
 // itself: each repository's rerere cache, plus its object directory's clone metadata where
 // that directory can be cloned there sharing data, or its full logical size where it is copied.

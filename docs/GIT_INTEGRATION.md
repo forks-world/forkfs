@@ -71,10 +71,16 @@ named in a `note:` line on stderr.
   of the common directory being imported, that registration's `gitdir` resolves back to this
   `.git` file, and its `commondir` back to the same common directory. Such a checkout is not
   walked (a worktree nested in it goes with it), is excluded from the cleanliness check by exact
-  path -- `git status` lists one that is not ignored as an untracked directory -- and is removed
-  from the snapshot's copy before publication, whatever `--include-changes` or `--committed-only`
-  say. Hardlink groups with a member in a removed checkout are dropped from the snapshot's
-  records, as for a replaced submodule `.git`. A `.git` file leading into another repository,
+  path -- `git status` lists one that is not ignored as an untracked directory -- and is left
+  out of the snapshot's copy, whatever `--include-changes` or `--committed-only` say. The
+  pre-clone scan (entry count, space budget, hardlink groups) never enters it, and neither does
+  a copy that walks the tree (Linux, or `fork --copy` across volumes); APFS clones the whole root
+  in one `clonefile(2)` and the checkout is removed from that copy before publication. (That one
+  clone fails with EACCES on an unreadable directory anywhere in the tree, an agent's checkout
+  included, as it does for an unreadable file of the tree itself.) A name in the checkout is a
+  name leaving the tree, as a replaced `.git`'s is: it is no hardlink group's member, and the
+  tree's own names that shared its inode keep their own group, or become plain files, rather
+  than counting as linked from outside. A `.git` file leading into another repository,
   one whose registration does not lead back to it, a dangling one and a `.git` directory are
   still refused as a nested repository. The source's registrations are rechecked after the copy,
   so a worktree added inside the source while it was being cloned is caught, not published.

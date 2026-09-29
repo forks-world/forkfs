@@ -4282,6 +4282,12 @@ int remove_below(const char *clone, const String &rel) {
     }
     return fs_remove_tree(path.c_str());
 }
+// A managed World's registration of the linked worktree `w`, relative to the World's root.
+String worktree_registration(const GitWorktree &w) {
+    String admin(".world-git/repo.git/worktrees/");
+    admin.append(w.id.c_str());
+    return admin;
+}
 // The source's or parent World's other linked worktrees (GitWorktree) are separate checkouts
 // of the repository, not part of the tree: the copy gets the repository's refs and objects --
 // so their branches and commits -- but not their checkouts or their uncommitted state. Their
@@ -4289,19 +4295,26 @@ int remove_below(const char *clone, const String &rel) {
 // registrations, which would otherwise make the child's Git believe it had checkouts that
 // belong to the parent (a branch checked out there could not be checked out in the child). The
 // source, the parent and anything outside the tree are never touched.
+// The copy may not have them at all: a walked copy (fs_clone_tree's `omit`) never made them,
+// and remove_below takes that as done. A whole-root clonefile(2) copied them and they go here.
 int omit_worktrees(const GitSource &s, const char *clone) {
     for (const auto &w : s.worktrees) {
-        if (s.managed) {
-            String admin(".world-git/repo.git/worktrees/");
-            admin.append(w.id.c_str());
-            if (int rc = remove_below(clone, admin)) return rc;
-        }
+        if (s.managed)
+            if (int rc = remove_below(clone, worktree_registration(w))) return rc;
         if (!w.rel.empty())
             if (int rc = remove_below(clone, w.rel)) return rc;
         g_omitted.append(w.rel.empty() ? w.path.c_str() : w.rel.c_str());
         g_omitted.push_back('\n');
     }
     return 0;
+}
+void git_omitted_names(const GitSource &s, Vec<String> &out) {
+    out.clear();
+    if (!s.present) return;
+    for (const auto &w : s.worktrees) {
+        if (s.managed) out.emplace_back(worktree_registration(w));
+        if (!w.rel.empty()) out.emplace_back(w.rel);
+    }
 }
 int git_import(const GitSource &s, const char *clone) {
     g_omitted.clear();

@@ -4552,11 +4552,54 @@ class GitWorldTest(unittest.TestCase):
         wt, _, _ = self.claude_worktree(self.source, 'agent-x')
         (self.source / 'build').mkdir()
         os.link(wt / 'agent.txt', self.source / 'build' / 'linked.txt')
-        self.world('init', str(self.source))
+        # Two names in the tree and a third in the agent's checkout: the checkout's name leaves
+        # the tree, so the two that stay are one group of their own, not one reaching outside.
+        os.link(wt / 'file', self.source / 'build' / 'pair-a.txt')
+        os.link(wt / 'file', self.source / 'build' / 'pair-b.txt')
+        init = self.world('init', str(self.source))
+        self.assertNotIn(b'outside this tree', init.stderr)
+        snap = json.loads(self.world('inspect', 'S1', '--json').stdout)
+        self.assertEqual((snap['hardlinks'], snap['hl_groups'], snap['hl_external']), (2, 1, 0))
         self.world('verify', 'S1')
         one, _ = self.fork()
         self.assertEqual((one / 'build/linked.txt').read_text(), 'agent work\n')
+        self.assertEqual((one / 'build/linked.txt').stat().st_nlink, 1)
+        a, b = (one / 'build/pair-a.txt').stat(), (one / 'build/pair-b.txt').stat()
+        self.assertEqual(((a.st_dev, a.st_ino), a.st_nlink), ((b.st_dev, b.st_ino), 2))
+        self.assertEqual((one / 'build/pair-a.txt').read_text(), 'uncommitted agent edit\n')
         self.assertFalse((one / '.claude/worktrees/agent-x').exists())
+
+    def test_unreadable_agent_worktree_is_never_entered_by_walked_copies(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        wt, _, _ = self.claude_worktree(one, 'agent-z')
+        locked = wt / 'node_modules' / 'locked'
+        locked.mkdir(parents=True)
+        (locked / 'secret').write_text('x\n')
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o700)
+        # A copy that walks the tree -- --copy across volumes on macOS, every clone on Linux --
+        # never enters the left-out checkout, so what is unreadable in there cannot fail it.
+        if sys.platform == 'darwin':
+            # (The 64 MB image is below the space check's reserve; the copy itself fits.)
+            two = self.mount_private_volume() / 'two'
+            p = self.world('fork', '--from', wid, '--to', str(two), '--copy', '--skip-space-check')
+        else:
+            two = self.root / 'two'
+            p = self.world('fork', '--from', wid, '--to', str(two))
+        self.assertIn(b'not part of W2', p.stderr)
+        self.assertFalse((two / '.claude/worktrees/agent-z').exists())
+        self.assertEqual(sorted(os.listdir(two / '.world-git/repo.git/worktrees')), ['active'])
+        self.assertEqual(self.checkouts(two), [str(two)])
+        self.assertEqual(self.git(two, 'status', '--porcelain').stdout, b'')
+        self.git(two, 'rev-parse', '--verify', 'worktree-agent-z')
+        if sys.platform != 'darwin':
+            # The pre-clone scan does not enter it either. (APFS clones the whole root in one
+            # clonefile(2), which fails with EACCES on an unreadable directory anywhere below
+            # it, an agent's included -- the same as for an unreadable file of the tree.)
+            self.world('checkpoint', wid)
+            self.world('verify', 'S2')
+            self.assertFalse((self.fork('three', 'S2')[0] / '.claude/worktrees/agent-z').exists())
 
     def test_foreign_or_unlinked_git_files_in_source_are_refused(self):
         # A `.git` file leading into another repository's worktree administration.

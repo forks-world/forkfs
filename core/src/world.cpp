@@ -1226,7 +1226,15 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
     // here keeps the groups and the external counts about exactly the tree that is published,
     // including worktree files linked from outside it (a rescan of the clone would lose those).
     const char *git_admin = git_source.present && !git_source.managed ? ".git" : nullptr;
-    if (int rc = wfs::hardlinks_scan(src.c_str(), WFS_MARKER_NAME, &src_stats, hl, git_admin)) return rc;
+    // And the repository's other linked worktrees the import leaves out -- an AI agent's
+    // checkout inside the tree -- are not entered at all: not counted, not budgeted, and never
+    // read, so an unreadable or huge agent checkout cannot fail a snapshot it is not part of.
+    // Their names leave the tree the way `.git`'s do (hardlinks_scan). The clone below skips
+    // them too where it walks; APFS's whole-root clonefile copies them and git_import removes
+    // them.
+    Vec<String> omitted;
+    wfs::git_omitted_names(git_source, omitted);
+    if (int rc = wfs::hardlinks_scan(src.c_str(), WFS_MARKER_NAME, &src_stats, hl, git_admin, &omitted)) return rc;
     if (int rc = space_check(s->dir.c_str(), src_stats.entries, wfs::git_import_budget(git_source, s->dir.c_str()))) return rc;
 
     char nm[WFS_NAME_MAX];
@@ -1272,7 +1280,7 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         // no gate to open on this side.
         if (wfs_test_before_snapshot_clone)
             wfs_test_before_snapshot_clone(wfs_test_before_snapshot_clone_ctx, src.c_str());
-        if ((rc = wfs::fs_clone_tree(src.c_str(), root.c_str(), false))) break;
+        if ((rc = wfs::fs_clone_tree(src.c_str(), root.c_str(), false, &omitted))) break;
         // A checkpoint carries the source world's marker; it is not this snapshot's identity.
         String m = joinp(root.c_str(), WFS_MARKER_NAME);
         ::unlink(m.c_str());
@@ -1298,9 +1306,10 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         // The source scan already left the replaced `.git` out, so `hl` describes this tree.
         if ((rc = wfs::git_import(git_source, root.c_str()))) break;
         // A submodule's copied `.git` is replaced by owned administration too, and the scan above
-        // saw it: a group with a member in there is not whole any more either. Nor is one with a
-        // member in a linked worktree's checkout the import left out of the copy.
-        if ((git_source.committed_only || !git_source.modules.empty() || !git_source.worktrees.empty()) &&
+        // saw it: a group with a member in there is not whole any more either. (The left-out
+        // linked worktrees need no such check: the scan never entered them, so no group has a
+        // member there, and a worktree registered after the capture fails git_import.)
+        if ((git_source.committed_only || !git_source.modules.empty()) &&
             hl.groups.size()) hl_drop_changed(root.c_str(), hl);
         {
             struct stat rst;
@@ -1585,6 +1594,11 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
         if (::lstat(dot.c_str(), &gst) == 0) git_snapshot = true;
         else if (errno != ENOENT) return -errno;
     }
+    // A World's other linked worktrees (an agent's) are left out of the child: a copy that walks
+    // the tree (--copy across volumes) never enters them, and git_import removes them from a
+    // whole-root clone. A snapshot source has none.
+    Vec<String> omitted;
+    wfs::git_omitted_names(git_source, omitted);
     if (int rc = check_path(s, target_path, PATH_TARGET, target, nullptr)) return rc;
     String parent_dir;
     dirname_of(target.c_str(), parent_dir);
@@ -1839,7 +1853,7 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
                 // The gate is open for exactly its duration and for nothing else.
                 SnapGate gate;
                 if (src_gated && (rc = gate.open(src.c_str(), false))) break;
-                rc = wfs::fs_clone_tree(src.c_str(), tmp.c_str(), o.allow_fallback != 0);
+                rc = wfs::fs_clone_tree(src.c_str(), tmp.c_str(), o.allow_fallback != 0, &omitted);
             }
             if (rc == -EEXIST) continue;   // somebody else's name, drawn against all odds
             tmp_is_ours = true;

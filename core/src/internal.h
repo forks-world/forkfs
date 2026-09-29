@@ -267,9 +267,16 @@ enum fs_dir_order {
 // Parallel tree walk (pthread, `threads` workers, dynamic per-directory queue). The root
 // itself is visited too. 4 workers is the APFS metadata-transaction sweet spot measured in
 // docs/CLONE_MODEL_MACOS27.md §9.
-int fs_walk_tree(const char *root, int threads, fs_dir_order order, void *ctx, fs_entry_fn fn);
+//
+// `prune`, when given, lists tree-relative names (exactly as `rel` would spell them) that are
+// not part of the walk: such an entry is neither visited nor, when it is a directory, opened --
+// nothing below it is read, so an unreadable or enormous subtree there costs nothing and cannot
+// fail the walk. A Git import's left-out linked worktree checkouts are the one use.
+int fs_walk_tree(const char *root, int threads, fs_dir_order order, void *ctx, fs_entry_fn fn,
+                 const Vec<String> *prune = nullptr);
 // The same walk, with FsEntry::xattr filled in. fs_walk_tree is this with the verdict dropped.
-int fs_walk_tree_ex(const char *root, int threads, fs_dir_order order, void *ctx, fs_entry_ex_fn fn);
+int fs_walk_tree_ex(const char *root, int threads, fs_dir_order order, void *ctx, fs_entry_ex_fn fn,
+                    const Vec<String> *prune = nullptr);
 
 int fs_count_entries(const char *root, TreeStats &out);
 // The gate-protection equivalent of fs_protect_tree: one walk that writes the manifest and
@@ -347,7 +354,14 @@ bool fs_clone_shares(const char *dst_dir, const char *src_dir);
 // Native tree duplication without following symlinks: clonefile on Darwin,
 // reflinks on Linux XFS/Btrfs, sparse-aware copies on ext4. allow_fallback also
 // permits copies across volumes or when cloning is unsupported.
-int fs_clone_tree(const char *src, const char *dst, bool allow_fallback);
+//
+// `omit`, when given, lists tree-relative names (see fs_walk_tree's `prune`) the caller removes
+// from the copy afterwards anyway. A copy that walks the tree -- Linux always, Darwin on its
+// allow_fallback path -- skips them and never reads what is below them; Darwin's single
+// clonefile(2) of the whole root still clones them (metadata only) and the caller's removal
+// takes them out, so the caller must remove them either way.
+int fs_clone_tree(const char *src, const char *dst, bool allow_fallback,
+                  const Vec<String> *omit = nullptr);
 // `--hard` protection: chflags(UF_IMMUTABLE) on every entry, directories last, write bits
 // stripped from directories. Fills stats and (optionally) the manifest in the same walk.
 int fs_protect_tree(const char *root, TreeStats *stats, Manifest *manifest);
