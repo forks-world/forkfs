@@ -22,7 +22,8 @@ String joinp(const char *a, const char *b) { String s(a); s.append("/"); s.appen
 constexpr const char *marker = "gitdir: .world-git/repo.git/worktrees/active\n";
 
 // The reason for the last Git refusal on this thread, for wfs_git_reason(). Every
-// WFS_E_GIT_UNSUPPORTED / WFS_E_GIT_POLICY this file returns goes through refuse().
+// WFS_E_GIT_UNSUPPORTED / WFS_E_GIT_POLICY / WFS_E_GIT_IN_USE this file returns goes through
+// refuse(); a discard refusal names paths, hence the room.
 thread_local char g_reason[2048];
 int refuse(int code, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -4310,13 +4311,16 @@ int git_import(const GitSource &s, const char *clone) {
     if (!s.managed) {
         // A linked worktree added inside the source after the capture may have been cloned
         // with a `.git` leading back into the source's administration; Git registers a worktree
-        // before it checks one out, so its registration shows it. (A managed copy is recaptured
-        // below instead.)
+        // before it checks one out, so its registration shows it. One removed meanwhile (an
+        // agent's cleanup) is fine: its checkout was left out of the copy either way. (A managed
+        // copy is recaptured below instead.)
         Vec<GitWorktree> now;
         if (int rc = collect_worktrees(s.root.c_str(), s.common.c_str(), s.admin.c_str(), false, now)) return rc;
-        if (now.size() != s.worktrees.size()) return -EBUSY;
-        for (size_t i = 0; i < now.size(); ++i)
-            if (now[i].id != s.worktrees[i].id || now[i].rel != s.worktrees[i].rel) return -EBUSY;
+        for (const auto &w : now) {
+            bool known = false;
+            for (const auto &c : s.worktrees) if (c.id == w.id && c.rel == w.rel) known = true;
+            if (!known) return -EBUSY;
+        }
     }
     if (!s.managed) {
         if (int rc = import_root(s, clone)) return rc;
