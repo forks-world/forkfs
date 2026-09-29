@@ -1234,6 +1234,21 @@ int capture_orig(const char *root, bool &present, String &oid) {
     if ((rc = value(root, verify, oid))) return rc;
     present = true; return 0;
 }
+// The `shallow` file at `path` (see GitRepoState::shallow), absent in a complete repository.
+// Git replaces it through `shallow.lock` while a fetch moves the boundary; a lock present means
+// the boundary is changing right now, which is a retryable busy like any concurrent ref update.
+int read_shallow(const String &path, Vec<char> &bytes, bool &present) {
+    bytes.clear(); present = false;
+    String lock(path); lock.append(".lock");
+    struct stat st;
+    if (!lstat(lock.c_str(), &st)) return -EBUSY;
+    if (errno != ENOENT) return -errno;
+    if (lstat(path.c_str(), &st)) return errno == ENOENT ? 0 : -errno;
+    if (!S_ISREG(st.st_mode)) return refuse(WFS_E_GIT_UNSUPPORTED, "the shallow file is not a regular file");
+    if (int rc = read_bytes(path.c_str(), bytes)) return rc;
+    present = true;
+    return 0;
+}
 // The stash stack is refs/stash plus its reflog: stash@{n} for n > 0 exists only as a reflog
 // entry. Each line of a reflog is "<old> <new> <ident>\t<message>\n"; the entries' commits are
 // the non-null <new> object IDs. Anything else is refused rather than guessed at.
@@ -2124,9 +2139,12 @@ int reject_import_policy(const char *root) {
     String common; const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
     if (int rc = value(root, common_args, common)) return rc;
     struct stat st;
-    for (const char *rel : {"objects/info/alternates", "objects/info/http-alternates", "shallow"}) {
+    // A shallow clone is supported (GitRepoState::shallow): its object store holds everything its
+    // history walks reach. Alternates borrow objects from another repository, which a clone of
+    // this object directory would not have.
+    for (const char *rel : {"objects/info/alternates", "objects/info/http-alternates"}) {
         String path = joinp(common.c_str(), rel);
-        if (!lstat(path.c_str(), &st)) return refuse(WFS_E_GIT_UNSUPPORTED, "%s is present (alternates or shallow clone)", rel);
+        if (!lstat(path.c_str(), &st)) return refuse(WFS_E_GIT_UNSUPPORTED, "%s is present (object alternates)", rel);
         if (errno != ENOENT) return -errno;
     }
     if (int rc = reject_promisor_packs(common)) return rc;
@@ -2897,6 +2915,9 @@ int source_unchanged(const GitRepoState &s) {
     if ((stash_rc == 0) != s.stash_present || !same_bytes(stash, s.stash)) return -EBUSY;
     bool orig_present; String orig; if (int orig_rc = capture_orig(s.root.c_str(), orig_present, orig)) return orig_rc;
     if (orig_present != s.orig_present || orig != s.orig_head) return -EBUSY;
+    Vec<char> shallow; bool shallow_present = false;
+    if (int shallow_rc = read_shallow(s.shallow_path, shallow, shallow_present)) return shallow_rc;
+    if (shallow_present != s.shallow_present || !same_bytes(shallow, s.shallow)) return -EBUSY;
     if (!s.managed) {
         String common;
         const char *a[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
@@ -3411,6 +3432,8 @@ int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool modu
     const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
     const char *admin_args[] = {"rev-parse", "--absolute-git-dir", nullptr};
     if ((rc = value(root, common_args, common)) || (rc = value(root, admin_args, out.admin))) return rc;
+    out.shallow_path = joinp(common.c_str(), "shallow");
+    if ((rc = read_shallow(out.shallow_path, out.shallow, out.shallow_present))) return rc;
     if (!out.managed) {
         if ((rc = object_import_bytes(common.c_str(), out.import_bytes, &out.object_entries))) return rc;
         out.objects = joinp(common.c_str(), "objects");
@@ -4001,6 +4024,7 @@ bool same_capture(const GitRepoState &copy, const GitRepoState &s) {
         same_settings(copy.identity, s.identity) && same_bytes(copy.effective_config, s.effective_config) &&
         copy.worktree_config == s.worktree_config && same_settings(copy.worktree_settings, s.worktree_settings) &&
         same_bytes(copy.refs, s.refs) && same_stash(copy, s) && copy.orig_present == s.orig_present &&
+        copy.shallow_present == s.shallow_present && same_bytes(copy.shallow, s.shallow) &&
         copy.lfs_active == s.lfs_active && copy.lfs_present == s.lfs_present &&
         copy.lfs_filter_setup == s.lfs_filter_setup && copy.lfs_skip_smudge == s.lfs_skip_smudge &&
         copy.lfs_skip_process == s.lfs_skip_process &&
@@ -4180,11 +4204,14 @@ int restore_state(const GitRepoState &s, const char *worktree, const char *repo,
         if (int rc = install_hooks(s, worktree, repo)) return rc;
     }
     if (int rc = restore_stash(s, worktree)) return rc;
-    // The copy as it will be published: its refs, and its stash stack read back by Git itself --
-    // the same reflog bytes, the same entries, and every object of every entry present.
+    // The copy as it will be published: its refs, its shallow boundary, and its stash stack read
+    // back by Git itself -- the same reflog bytes, the same entries, and every object of every
+    // entry present.
     GitRepoState imported;
     if (int rc = capture_refs(worktree, imported.refs)) return rc;
     if (!same_bytes(imported.refs, s.refs)) return -EBUSY;
+    if (int rc = read_shallow(joinp(repo, "shallow"), imported.shallow, imported.shallow_present)) return rc;
+    if (imported.shallow_present != s.shallow_present || !same_bytes(imported.shallow, s.shallow)) return -EBUSY;
     if (int rc = capture_stash(worktree, imported)) return rc;
     return same_stash(imported, s) ? 0 : -EBUSY;
 }
@@ -4252,7 +4279,7 @@ int prune_object_clone(const String &dir, const String &rel, unsigned depth) {
         String child_rel = rel.empty() ? String(name) : joinp(rel.c_str(), name);
         static const char *const promisor_ext[] = {".promisor", nullptr};
         if (child_rel == "info/alternates" || child_rel == "info/http-alternates") {
-            rc = refuse(WFS_E_GIT_UNSUPPORTED, "objects/%s is present (alternates or shallow clone)", child_rel.c_str()); break;
+            rc = refuse(WFS_E_GIT_UNSUPPORTED, "objects/%s is present (object alternates)", child_rel.c_str()); break;
         }
         if (rel == "pack" && hashed_name(name, "pack-", promisor_ext)) { rc = refuse(WFS_E_GIT_UNSUPPORTED, "partial clone (a promisor pack)"); break; }
         String path = joinp(dir.c_str(), name);
@@ -4299,6 +4326,13 @@ int own_repository(const GitRepoState &s, const char *cwd, const char *from, con
         if ((rc = configure_lfs_filter(s, cwd, repo))) return rc;
     }
     if ((rc = prune_object_clone(objects, String(), 0))) return rc;
+    // A shallow clone's boundary goes in before anything walks the history (the stash check in
+    // restore_state, require_owned_objects): without it Git would look for parents the object
+    // store never had.
+    if (s.shallow_present) {
+        String shallow = joinp(repo, "shallow");
+        if ((rc = write_bytes(shallow.c_str(), s.shallow.data(), s.shallow.size()))) return rc;
+    }
     String script;
     for (size_t i = 0; i < s.refs.size() && s.refs[i];) {
         size_t end = i, tab = i;
@@ -4996,6 +5030,41 @@ int check_published_gitlinks(const char *repo, const char *worktree, const char 
     return 0;
 }
 
+// A fetch from a shallow repository drops -- with a warning, exit status 0 -- a ref whose new
+// history reaches one of that repository's shallow commits, unless --update-shallow lets it add
+// them to the target's own `shallow` file, which would make the target a shallow repository.
+// Publish never passes that option, so from a shallow World the staging ref is then simply not
+// written: the target does not have the history below the World's boundary (an empty or
+// unrelated repository), while the shallow source itself or a full clone of the project has it
+// and takes the publish. Name that boundary, as Git reads the World (`common` is its common
+// directory); any other reason for a missing staging ref stays a plain Git failure.
+int shallow_publish_refusal(const char *world, const char *common, const char *head, const char *repo) {
+    Vec<char> shallow; bool present = false;
+    if (read_shallow(joinp(common, "shallow"), shallow, present) || !present) return WFS_E_GIT_FAILED;
+    const char *walk[] = {"--no-replace-objects", "rev-list", head, nullptr};
+    Vec<char> commits;
+    if (git(world, walk, &commits)) return WFS_E_GIT_FAILED;
+    for (size_t i = 0; i + 1 < commits.size();) {
+        size_t end = i;
+        while (end + 1 < commits.size() && commits[end] != '\n') ++end;
+        for (size_t j = 0; j < shallow.size();) {
+            size_t stop = j;
+            while (stop < shallow.size() && shallow[stop] != '\n') ++stop;
+            if (stop - j == end - i && stop > j && !memcmp(shallow.data() + j, commits.data() + i, end - i)) {
+                String boundary(commits.data() + i, end - i);
+                return refuse(WFS_E_GIT_TARGET,
+                    "the World is a shallow clone and %s does not have the history below its shallow boundary "
+                    "(commit %.12s), so Git would have to make that repository shallow to take the World's commits; "
+                    "publish into a repository that has that history, such as the one the World came from, or "
+                    "deepen the World first (git fetch --deepen=<n> or --unshallow in it)", repo, boundary.c_str());
+            }
+            j = stop + 1;
+        }
+        i = end + 1;
+    }
+    return WFS_E_GIT_FAILED;
+}
+
 struct LfsPointerRecord { String oid; uint64_t size; };
 
 bool parse_lfs_pointer(const char *data, size_t length, LfsPointerRecord &out, bool &looks_like_pointer) {
@@ -5641,7 +5710,7 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
         const char *now_args[] = {"rev-parse", "--verify", "--quiet", staging, nullptr};
         int nrc = value(repo, now_args, now, true);
         if (!rc) rc = nrc;
-        if (!rc && now.empty()) rc = WFS_E_GIT_FAILED;
+        if (!rc && now.empty()) rc = shallow_publish_refusal(world_real.c_str(), info.git_dir, info.head, repo);
     }
     // info.head is the commit wfs_git_inspect actually inspected and whose dirty state is
     // reported; the fetch above followed the live branch, so if the World's branch moved

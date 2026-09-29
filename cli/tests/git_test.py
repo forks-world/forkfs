@@ -5994,5 +5994,173 @@ class GitWorldTest(unittest.TestCase):
         refused = self.world('publish', wid, '--repo', str(other), code=3)
         self.assertIn(b'does not have that submodule initialized', refused.stderr)
 
+    # ---- shallow clones --------------------------------------------------------------------
+
+    def shallow_clone(self, name='shallow', depth=2):
+        """A `--depth` clone of the source after three more commits: base, c1, c2, c3 there,
+        only the last `depth` of them here. Its origin is the source, by file:// URL."""
+        for n in (1, 2, 3):
+            (self.source / 'file').write_text('c%d\n' % n)
+            self.git(self.source, 'commit', '-qam', 'c%d' % n)
+        clone = self.root / name
+        self.git(self.root, 'clone', '-q', '--depth', str(depth), 'file://' + str(self.source), str(clone))
+        self.identify(clone)
+        self.assertEqual(self.git(clone, 'rev-parse', '--is-shallow-repository').stdout.strip(), b'true')
+        return clone
+
+    def history(self, repo, rev='HEAD'):
+        return self.git(repo, 'log', '--format=%s', rev).stdout.decode().splitlines()
+
+    def test_shallow_clone_is_imported_with_its_boundary(self):
+        shallow = self.shallow_clone()
+        boundary = (shallow / '.git/shallow').read_bytes()
+        # Everything the import walks, on both sides of the boundary: a stash entry, ORIG_HEAD
+        # and FETCH_HEAD next to the refs.
+        (shallow / 'file').write_text('stashed\n')
+        self.git(shallow, 'stash', 'push', '-q', '-m', 'on a shallow clone')
+        self.git(shallow, 'reset', '-q', 'HEAD')
+        self.git(shallow, 'fetch', '-q', 'origin')
+        stash = self.stash_view(shallow)
+        snapshot = self.world('init', str(shallow)).stdout.split()[0].decode()
+        self.assertEqual((shallow / '.git/shallow').read_bytes(), boundary)
+        # --committed-only from a dirty shallow clone: the copy is reset to HEAD.
+        (shallow / 'file').write_text('uncommitted\n')
+        (shallow / 'untracked').write_text('left behind\n')
+        committed = self.world('init', str(shallow), '--committed-only').stdout.split()[0].decode()
+        shutil.rmtree(shallow)
+        one, wid = self.fork('one', snapshot)
+        owned = one / '.world-git/repo.git'
+        self.assertEqual((owned / 'shallow').read_bytes(), boundary)
+        self.assertEqual(self.git(one, 'rev-parse', '--is-shallow-repository').stdout.strip(), b'true')
+        self.assertEqual(self.history(one), ['c3', 'c2'])
+        self.assertEqual(self.stash_view(one), stash)
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.git(one, 'fsck', '--full')
+        three, _ = self.fork('three', committed)
+        self.assertEqual((three / '.world-git/repo.git/shallow').read_bytes(), boundary)
+        self.assertEqual((three / 'file').read_text(), 'c3\n')
+        self.assertFalse((three / 'untracked').exists())
+        self.assertEqual(self.git(three, 'status', '--porcelain').stdout, b'')
+        # Git's own shallow semantics in the World: the carried origin deepens it.
+        self.git(one, 'commit', '-q', '--allow-empty', '-m', 'in the World')
+        self.git(one, 'fetch', '-q', '--deepen=1', 'origin')
+        self.assertEqual(self.history(one), ['in the World', 'c3', 'c2', 'c1'])
+        deepened = (owned / 'shallow').read_bytes()
+        self.assertNotEqual(deepened, boundary)
+        self.git(one, 'fsck', '--full')
+        # A fork, a checkpoint and a pooled fork of the shallow World carry its boundary.
+        two, _ = self.fork('two', wid)
+        self.assertEqual((two / '.world-git/repo.git/shallow').read_bytes(), deepened)
+        self.assertEqual(self.history(two), ['in the World', 'c3', 'c2', 'c1'])
+        self.git(two, 'fsck', '--full')
+        checkpoint = self.world('checkpoint', wid).stdout.split()[0].decode()
+        self.world('pool', 'fill', checkpoint, '--count', '1')
+        four = self.root / 'four'
+        out = self.world('fork', '--from', checkpoint, '--to', str(four)).stdout
+        self.assertIn(b'(pool)', out)
+        self.assertEqual((four / '.world-git/repo.git/shallow').read_bytes(), deepened)
+        self.assertEqual(self.history(four), ['in the World', 'c3', 'c2', 'c1'])
+        self.assertEqual(self.git(four, 'status', '--porcelain').stdout, b'')
+        self.git(four, 'fsck', '--full')
+
+    def test_shallow_boundary_changed_during_import_is_not_published(self):
+        import shlex
+        shallow = self.shallow_clone()
+        real_git = shlex.quote(shutil.which('git'))
+        head = self.git(shallow, 'rev-parse', 'HEAD').stdout.decode().strip()
+        # A `git fetch --deepen` in the source, and the boundary alone moving (the tip becomes
+        # a shallow commit: no object or ref changes, only the shallow file).
+        actions = {
+            'deepen': real_git + ' -C ' + shlex.quote(str(shallow)) + ' fetch -q --deepen=1 origin',
+            'boundary': 'echo ' + head + ' >> ' + shlex.quote(str(shallow / '.git/shallow')),
+        }
+        for name, action in actions.items():
+            with self.subTest(name):
+                before = (shallow / '.git/shallow').read_bytes()
+                wrapper, done = self.pack_refs_wrapper(name, action)
+                path = self.env['PATH']
+                self.env['PATH'] = str(wrapper) + os.pathsep + path
+                self.world('init', str(shallow), code=1)
+                self.env['PATH'] = path
+                self.assertTrue(done.exists())
+                self.assertNotEqual((shallow / '.git/shallow').read_bytes(), before)
+                self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        snapshot = self.world('init', str(shallow)).stdout.split()[0].decode()
+        one, _ = self.fork('one', snapshot)
+        self.assertEqual((one / '.world-git/repo.git/shallow').read_bytes(), (shallow / '.git/shallow').read_bytes())
+        self.git(one, 'fsck', '--full')
+
+    def test_publish_from_a_shallow_world(self):
+        shallow = self.shallow_clone()
+        boundary = (shallow / '.git/shallow').read_bytes()
+        self.world('init', str(shallow))
+        one, wid = self.fork()
+        (one / 'file').write_text('world change\n')
+        self.git(one, 'commit', '-qam', 'world change')
+        head = self.git(one, 'rev-parse', 'HEAD').stdout.strip()
+        # (a) The shallow clone it came from has the history down to the same boundary.
+        self.world('publish', wid)
+        self.assertEqual(self.git(shallow, 'rev-parse', 'world/W1').stdout.strip(), head)
+        self.assertEqual((shallow / '.git/shallow').read_bytes(), boundary)
+        self.git(shallow, 'fsck', '--full')
+        # (b) A full clone of the project has all of it and stays complete.
+        full = self.root / 'full'
+        self.git(self.root, 'clone', '-q', str(self.source), str(full))
+        self.world('publish', wid, '--repo', str(full))
+        self.assertEqual(self.git(full, 'rev-parse', 'world/W1').stdout.strip(), head)
+        self.assertEqual(self.git(full, 'rev-parse', '--is-shallow-repository').stdout.strip(), b'false')
+        self.assertFalse((full / '.git/shallow').exists())
+        self.git(full, 'fsck', '--full')
+        # A clone shallower than the World that has the commit the World built on takes only
+        # the new commit, its own boundary unchanged.
+        depth1 = self.root / 'depth1'
+        self.git(self.root, 'clone', '-q', '--depth', '1', 'file://' + str(self.source), str(depth1))
+        own = (depth1 / '.git/shallow').read_bytes()
+        self.world('publish', wid, '--repo', str(depth1))
+        self.assertEqual(self.git(depth1, 'rev-parse', 'world/W1').stdout.strip(), head)
+        self.assertEqual((depth1 / '.git/shallow').read_bytes(), own)
+        self.git(depth1, 'fsck', '--full')
+        # (c) A repository without the history below the boundary would have to become shallow
+        # to take the commits; it is refused, --force or not, and never made shallow.
+        empty = self.root / 'empty'
+        self.git(self.root, 'init', '-q', '-b', 'main', str(empty))
+        unrelated = self.root / 'unrelated'
+        self.git(self.root, 'init', '-q', '-b', 'main', str(unrelated))
+        self.git(unrelated, '-c', 'user.name=Other', '-c', 'user.email=other@example.com',
+                 'commit', '-q', '--allow-empty', '-m', 'unrelated')
+        for target in (empty, unrelated):
+            for extra in ((), ('--force',)):
+                with self.subTest(target=target.name, extra=extra):
+                    result = self.world('publish', wid, '--repo', str(target), *extra, code=3)
+                    self.assertIn(b'reason: the World is a shallow clone', result.stderr)
+                    self.assertIn(b'does not have the history below its shallow boundary', result.stderr)
+                    self.assertEqual(self.git(target, 'rev-parse', '--is-shallow-repository').stdout.strip(), b'false')
+                    self.assertFalse((target / '.git/shallow').exists())
+                    self.assertEqual(self.git(target, 'for-each-ref', 'refs/worldfs/', 'refs/heads/world/').stdout, b'')
+
+    def test_shallow_submodule_is_imported_with_its_boundary(self):
+        lib = self.origin('lib')
+        for n in (1, 2):
+            (lib / 'lib.txt').write_text('lib %d\n' % n)
+            self.git(lib, 'commit', '-qam', 'lib %d' % n)
+        self.sub(self.source, 'add', '-q', 'file://' + str(lib), 'libs/lib')
+        self.git(self.source, 'commit', '-qm', 'submodule')
+        # Re-clone it the way `submodule.<name>.shallow` or `update --depth` does.
+        self.sub(self.source, 'deinit', '-q', '-f', 'libs/lib')
+        shutil.rmtree(self.source / '.git/modules/libs/lib')
+        self.sub(self.source, 'update', '-q', '--init', '--depth', '1', 'libs/lib')
+        module = self.source / '.git/modules/libs/lib'
+        boundary = (module / 'shallow').read_bytes()
+        self.assertEqual(self.history(self.source / 'libs/lib'), ['lib 2'])
+        self.world('init', str(self.source))
+        shutil.rmtree(self.source)
+        shutil.rmtree(self.root / 'origins')
+        one, _ = self.fork()
+        owned = one / '.world-git/repo.git/worktrees/active/modules/libs/lib'
+        self.assertEqual((owned / 'shallow').read_bytes(), boundary)
+        self.assertEqual(self.history(one / 'libs/lib'), ['lib 2'])
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.git(one / 'libs/lib', 'fsck', '--full')
+
 if __name__ == '__main__':
     unittest.main()
