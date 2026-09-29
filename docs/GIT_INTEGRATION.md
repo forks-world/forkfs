@@ -81,8 +81,9 @@ named in a `note:` line on stderr.
   name leaving the tree, as a replaced `.git`'s is: it is no hardlink group's member, and the
   tree's own names that shared its inode keep their own group, or become plain files, rather
   than counting as linked from outside. A `.git` file leading into another repository,
-  one whose registration does not lead back to it, a dangling one and a `.git` directory are
-  still refused as a nested repository. The source's registrations are rechecked after the copy
+  one whose registration does not lead back to it and a dangling one are still refused as a
+  nested repository; a `.git` directory is a nested repository, admitted only when it is
+  self-contained (see [Nested repositories](#nested-repositories)). The source's registrations are rechecked after the copy
   and must be exactly the captured ones: a worktree added inside the source while it was being
   cloned, or one removed meanwhile (whose directory may already hold ordinary files again), fails
   the import as busy, to be retried, rather than publishing a copy that lacks those files.
@@ -304,10 +305,9 @@ captured again, submodules included, and compared with its source. A refusal
 inside a submodule names it (`reason: submodule libs/lib: ...`). A submodule with no
 `.gitmodules` entry, an unsafe name, two names sharing a repository directory, a submodule
 path that is (or goes through) a symlink, or a `.git` that resolves to any other repository is
-refused. A plain nested repository -- a `.git` anywhere below the root that is not an
-initialized submodule's, including deeper inside an uninitialized submodule's directory or
-inside a submodule's own `.world-git` directory (only the World's root owns that name) -- is
-still refused.
+refused. Any other `.git` below the root or inside a submodule is a nested repository: carried
+as files when it is self-contained, refused otherwise, and always refused inside an
+uninitialized submodule's directory (see [Nested repositories](#nested-repositories)).
 
 An uninitialized submodule (a gitlink without a `.git` in its directory) stays exactly as the
 source has it: the gitlink and its (usually empty) directory. Its `.gitmodules` name is checked
@@ -408,6 +408,79 @@ that submodule uninitialized (or is bare), or its submodule repository does not 
 commit. The reason names the path and the commit; get the commit into the target's submodule
 first. This check applies with `--force` too. Its uncommitted-changes note covers submodules.
 
+## Nested repositories
+
+Real trees hold Git repositories that are neither the root nor a submodule: a package installed
+editable from Git (`.venv/src/<package>/.git`), a vendored checkout (`third_party/foo/.git`), a
+tool's cache, a scratch clone inside the project, generated examples. A **self-contained**
+nested repository is carried as ordinary files, exactly like any other directory of the tree:
+the tree clone copies its `.git` directory byte for byte, the World's own Git does not manage
+it, and nothing of it is rewritten. `git -C <World>/<path> status/log/commit` works in the
+World, after the source is deleted and after a fork, checkpoint, pool hand-out, move, trash or
+restore; the World's copy and the source's are independent (a commit in one does not change
+the other).
+
+Copying Git administration is unsafe when it points outside itself: a copied linked worktree's
+`.git` file keeps leading to the source's administration (Issue #7), and so do the other links
+below. A nested repository is therefore admitted only when its administration is entirely
+inside its own `.git` directory:
+
+- its `.git` is a real directory, not a symlink and not a `.git` file, and holds only
+  directories and regular files -- no `objects/`, `refs/`, `config` or anything else linked
+  elsewhere, whose target the copy would read and write (the socket of Git's built-in
+  fsmonitor daemon, `.git/fsmonitor--daemon.ipc`, is the one special file allowed);
+- it has no `commondir` (the administration of a linked worktree, whose common directory is
+  elsewhere), no `objects/info/alternates` and no `objects/info/http-alternates` (objects
+  borrowed from another repository, as `git clone --shared` or `--reference` sets up);
+- its `worktrees/` directory is absent or empty: a registration of one of its own linked
+  worktrees names that checkout's absolute path in the source, which the copy would claim as its
+  own; its `modules/` directory is absent or empty too (its submodules' repositories, whose
+  checkouts and links are not examined);
+- its configuration sets no `core.worktree` (a worktree elsewhere), no
+  `extensions.worktreeConfig` (per-worktree settings), and no `include.path` or
+  `includeIf.<condition>.path` with a relative path, which Git resolves from the location of
+  the configuration file, so the copy would read a different file. Absolute and `~/` includes
+  name the same file from anywhere and are allowed.
+
+A bare repository that happens to be named `.git` (`core.bare`) is admitted too: it names no
+worktree at all. Each repository nested in an admitted one is checked the same way, at any
+depth. A `.git` file is still refused unless it is one of the root's own linked worktrees
+([Linked worktrees of AI coding agents](#linked-worktrees-of-ai-coding-agents)) or an
+initialized submodule's, and so is any `.git` inside the directory of an uninitialized
+submodule, where `git submodule update` would put the submodule's own checkout. Inside an
+initialized submodule's tree, and inside a submodule's `.world-git` directory (only the World's
+root owns that name), the rule is the same as in the root. Symlinks are never followed, so a
+symlink to a repository elsewhere stays a symlink and is never entered. A refusal names the
+repository and the cause, for example `reason: nested Git repository at <path>: it borrows
+objects from another repository (objects/info/alternates)`.
+
+The configuration is read from its file alone, with `git config --file <path>/.git/config
+--no-includes`, run from `/`. No WorldFS Git command ever runs inside a nested repository, so
+its hooks, filters and fsmonitor never run during `init`, `fork`, `checkpoint` or `publish`;
+the root's own status, clean and reset commands only look at the directory to tell that it is a
+repository.
+
+The check runs wherever a tree is captured: `init` (also of a directory with no Git repository
+at its root), `fork` and `checkpoint` of a World (whose copy is captured again before
+publication), a fork from a snapshot or a pool entry. The nested
+repositories admitted at capture are checked again in the copy before it is published: one
+that started borrowing objects, registered a worktree or was turned into a `.git` file while
+the tree was being cloned fails the operation as busy, to be retried, instead of being
+published. A nested repository that appeared in the source during the clone may be published
+like any other file the source gained meanwhile, but every `.git` in the copy is checked the
+same way first, so one that is not self-contained fails the operation as busy too.
+
+The nested repository is not part of the root's history. The root's `git status` lists one that
+is not ignored as an untracked directory (`?? scratch/`), so a source holding one is dirty:
+`--include-changes` carries it like any untracked content, and an ignored one
+(`.venv/` in `.gitignore`) is always copied, like every ignored file. `--committed-only` leaves
+a non-ignored nested repository behind whole -- `git clean -ffd` removes one in an untracked
+directory, which plain `-fd` skips, and one that status cannot see (its directory also holds
+tracked files, or its `.git` is not one Git takes for a repository) loses its `.git`, after
+which the reset treats the rest of its directory like any other content -- and keeps the
+ignored ones; the copy's status is then clean. `publish` copies the root branch's commits only
+and never a nested repository; a non-ignored one counts as an uncommitted change in its note.
+
 ## Getting work back to the source
 
 `world fs publish W<n>` copies a Git World's commits into the repository the World was
@@ -484,9 +557,10 @@ of two explicit choices (passing both is a usage error):
 - `--committed-only` creates from the committed version: the new snapshot or World's
   Git-visible content is exactly HEAD, with a clean `git status`. Staged and unstaged
   changes, deleted tracked files, files that were only staged, and untracked files that are
-  not ignored stay behind; a pending `SQUASH_MSG`, which describes staged content, is not
-  carried either. Only the copy is reset (`update-index --refresh`, `clean -fd` without
-  `-x`, `read-tree --reset -u HEAD`), never the source: its HEAD, index and files are left
+  not ignored stay behind, and so do nested repositories that are not ignored
+  ([Nested repositories](#nested-repositories)); a pending `SQUASH_MSG`, which describes
+  staged content, is not carried either. Only the copy is reset (`update-index --refresh`,
+  `clean -ffd` without `-x`, `read-tree --reset -u HEAD`), never the source: its HEAD, index and files are left
   byte-for-byte as they were. Files that already match HEAD are not rewritten, so they stay
   clones of the source's blocks, and a hardlink group the reset replaces is dropped from the
   snapshot's record. No filter or hook runs. A source without a Git repository is refused.
@@ -520,9 +594,9 @@ content, including Git administrative changes such as branch/index updates.
 - Only a root repository with an existing commit is supported. Detached HEAD is supported;
   unborn repositories are refused. External linked worktrees are safely imported by
   resolving their source Git administration and constructing fresh local administration.
-- Plain nested repositories (not submodules; see [Submodules](#submodules)), sparse or split
-  indexes, shallow/partial clones, and object alternates are refused, in the root and in every
-  submodule. So is a repository whose index, or any commit reachable
+- Nested repositories that are not self-contained (see
+  [Nested repositories](#nested-repositories)), sparse or split indexes, shallow/partial
+  clones, and object alternates are refused, in the root and in every submodule. So is a repository whose index, or any commit reachable
   from its refs, HEAD, `ORIG_HEAD`, `FETCH_HEAD` or any stash entry (its worktree, index and
   untracked-files commits), contains the root `.world` file or
   anything under `.world-git`: WorldFS owns those paths, `info/exclude` cannot hide a
@@ -576,7 +650,8 @@ Validation: `cli_git_test` uses disposable real repositories and covers clean/di
 committed-only imports, opt-in hooks, staging preservation, imported linked worktrees after
 source deletion, Claude Code and Codex style agent worktrees in the source and in Worlds
 (ignored or not, nested, locked, absolute or relative, hardlinked, malformed or foreign), absorbed, old-style, nested and uninitialized submodules and their
-refusals, independent commits, branch collisions, detached HEAD,
+refusals, self-contained nested repositories (ignored, untracked, nested in each other or in a
+submodule, under `--committed-only`, changed during the clone) and each of their refusals, independent commits, branch collisions, detached HEAD,
 move/discard/restore/checkpoint, hard snapshots, pooled Git forks and their setup failures,
 Git setup rollback, environment isolation and Git commits inside the exec sandbox.
 
@@ -649,7 +724,8 @@ whole effective repository configuration must match the source World's, so a rel
 include that resolves to different content at the new location (hooks, identity or any
 other setting) makes the operation fail.
 Other refusals report `unsupported Git layout` followed by a `reason:` line naming the
-specific cause (for example `reftable ref storage` or `nested Git repository or submodule`).
+specific cause (for example `reftable ref storage`, or `nested Git repository at <path>: it
+sets core.worktree`).
 Owned repositories
 are created with an empty template directory so installed Git templates cannot add hooks or rules.
 

@@ -130,8 +130,9 @@ source; ignored build/data files are always retained. Project hooks are left beh
 unless `init --with-hooks` asks for them (`init` notes when a source has some). Existing linked worktrees are imported without reusing their source
 index or registration. Initialized submodules (nested too) are copied into the World's own
 administration, so they keep working after the source is deleted; uninitialized ones stay
-uninitialized. Plain nested repositories and several advanced Git layouts are refused, each
-with a `reason:` line. Remotes, upstreams and aliases come
+uninitialized. A self-contained nested repository (a vendored checkout, an editable install
+from Git) travels as ordinary files; one whose administration points outside itself, and
+several advanced Git layouts, are refused, each with a `reason:` line. Remotes, upstreams and aliases come
 along, so `git push origin <branch>` works from a World; `publish` fetches the World's
 commits back into the source as a branch without touching its checkout. Git snapshots can
 be pooled like any other: a handed-out entry gets its own `world/W<n>` branch before it is
