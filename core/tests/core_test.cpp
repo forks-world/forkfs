@@ -1479,6 +1479,28 @@ static void git_worktree_refilled_during_import(const char *root) {
     join(p, sizeof p, sr.path, ".claude/worktrees/agent-x/notes.txt");
     struct stat st;
     CHECK(lstat(p, &st) == 0);
+
+    // The same race when the source is a World: a checkpoint of it (PR #19 review, 3rd round).
+    // The recapture of the copy cannot see it, because the copied registration is already gone.
+    char wpath[4096];
+    join(wpath, sizeof wpath, root, "wt-race-world");
+    wfs_ref from = {WFS_K_SNAPSHOT, id};
+    wfs_fork_opts fo;
+    memset(&fo, 0, sizeof fo);
+    wfs_id w = 0;
+    CHECK_OK(wfs_world_create(s, from, wpath, &fo, &w));
+    join(p, sizeof p, wpath, ".claude/worktrees/agent-x");
+    rm_rf(p);   // the snapshot carried the refilled directory; make room for a real worktree
+    sh("%s -C '%s' worktree add -q .claude/worktrees/agent-x -b worktree-agent-y%s", wpath);
+    wfs_test_before_snapshot_clone = refill_removed_worktree;
+    rc = wfs_snapshot_create(s, wpath, &o, &id);
+    wfs_test_before_snapshot_clone = NULL;
+    CHECK_RC(rc, -EBUSY);   // 0 before the fix, with notes.txt missing from the checkpoint
+    CHECK_OK(wfs_snapshot_create(s, wpath, &o, &id));
+    CHECK_OK(wfs_snapshot_info(s, id, &sr));
+    chmod(sr.path, 0700);
+    join(p, sizeof p, sr.path, ".claude/worktrees/agent-x/notes.txt");
+    CHECK(lstat(p, &st) == 0);
     wfs_store_close(s);
 }
 

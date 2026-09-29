@@ -4321,16 +4321,18 @@ int git_import(const GitSource &s, const char *clone) {
     if (!s.present) return 0;
     if (int rc = sources_unchanged(s)) return rc;
     if (int rc = omit_worktrees(s, clone)) return rc;
-    if (!s.managed) {
-        // A linked worktree added inside the source after the capture may have been cloned
-        // with a `.git` leading back into the source's administration; Git registers a worktree
-        // before it checks one out, so its registration shows it. One removed meanwhile (an
+    {
+        // The source's linked worktrees -- an external source's or a World's -- must still be
+        // exactly the captured ones after the clone. One added meanwhile may have been cloned
+        // with a `.git` leading back into the source's administration (Git registers a worktree
+        // before it checks one out, so its registration shows it). One removed meanwhile (an
         // agent's cleanup) is a change too: its directory may have been refilled with ordinary
         // project files before the clone, which leaving the captured path out would silently
-        // drop. So the set must be exactly the captured one; any difference is a retryable busy.
-        // (A managed copy is recaptured below instead.)
+        // drop -- and a managed copy's recapture below cannot see that, since omit_worktrees has
+        // already removed the copied registration. Any difference is a retryable busy. A World
+        // is read as strictly as it was captured.
         Vec<GitWorktree> now;
-        if (int rc = collect_worktrees(s.root.c_str(), s.common.c_str(), s.admin.c_str(), false, now)) return rc;
+        if (int rc = collect_worktrees(s.root.c_str(), s.common.c_str(), s.admin.c_str(), s.managed, now)) return rc;
         if (now.size() != s.worktrees.size()) return -EBUSY;
         for (const auto &w : now) {
             bool known = false;
