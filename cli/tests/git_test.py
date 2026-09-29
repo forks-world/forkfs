@@ -1301,8 +1301,10 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'unsupported Git layout\n  reason: reftable ref storage', result.stderr)
         (self.source / 'sub').mkdir()
         self.git(self.source / 'sub', 'init', '-q')
+        (self.source / 'sub/.git/objects/info/alternates').write_text('/elsewhere/objects\n')
         result = self.world('init', str(self.source), '--include-changes', code=3)
-        self.assertIn(b'reason: nested Git repository or submodule at ', result.stderr)
+        self.assertIn(b'reason: nested Git repository at ' + str(self.source / 'sub').encode()
+                      + b': it borrows objects from another repository', result.stderr)
 
     def test_unused_ambient_filters_are_allowed_without_execution(self):
         # A machine-wide `git lfs install` defines this full filter for every repository. A
@@ -4300,6 +4302,8 @@ class GitWorldTest(unittest.TestCase):
         nested = self.source / 'nested'
         nested.mkdir()
         self.git(nested, 'init')
+        # A self-contained one is carried as files; one reaching outside its .git is refused.
+        (nested / '.git/commondir').write_text('../../elsewhere\n')
         self.world('init', str(self.source), '--include-changes', code=3)
         shutil.rmtree(nested)
         unborn = self.root / 'unborn'
@@ -4769,6 +4773,250 @@ class GitWorldTest(unittest.TestCase):
         del self.env['GIT_DIR']; del self.env['GIT_INDEX_FILE']
         self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
 
+    # ---- self-contained nested repositories -------------------------------------------------
+
+    def nested_repo(self, path, content='nested'):
+        """A self-contained repository at `path` with one commit; its HEAD."""
+        path.mkdir(parents=True, exist_ok=True)
+        self.git(path, 'init', '-q', '-b', 'main')
+        self.identify(path)
+        (path / 'pkg.txt').write_text(content + '\n')
+        self.git(path, 'add', 'pkg.txt')
+        self.git(path, 'commit', '-qm', content)
+        return self.git(path, 'rev-parse', 'HEAD').stdout.strip()
+
+    def snapshots(self):
+        return json.loads(self.world('list', '--json').stdout)['snapshots']
+
+    def test_ignored_nested_repository_travels_as_files(self):
+        (self.source / '.gitignore').write_text('build/\n.venv/\n')
+        self.git(self.source, 'commit', '-qam', 'ignore the venv')
+        pkg = self.source / '.venv/src/pkg'
+        head = self.nested_repo(pkg)
+        # A nested repository nobody runs Git in here: WorldFS's own commands must never start
+        # its fsmonitor, hooks or filters either.
+        spy = self.source / '.venv/src/spy'
+        self.nested_repo(spy)
+        marker = self.root / 'nested-ran'
+        script = self.root / 'spy.sh'
+        self.write_hook(script, marker)
+        self.git(spy, 'config', 'core.fsmonitor', str(script))
+        self.git(spy, 'config', 'filter.spy.clean', str(script))
+        self.git(spy, 'config', 'filter.spy.smudge', str(script))
+        (spy / '.gitattributes').write_text('* filter=spy\n')
+        for hook in ('post-checkout', 'pre-commit', 'reference-transaction', 'post-index-change'):
+            self.write_hook(spy / '.git/hooks' / hook, marker)
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        nested = one / '.venv/src/pkg'
+        self.assertTrue((nested / '.git').is_dir())
+        # Copied, not shared: a commit in the World's copy leaves the source's alone.
+        (nested / 'pkg.txt').write_text('changed in the World\n')
+        self.git(nested, 'commit', '-qam', 'in the World')
+        changed = self.git(nested, 'rev-parse', 'HEAD').stdout.strip()
+        self.assertEqual(self.git(pkg, 'rev-parse', 'HEAD').stdout.strip(), head)
+        self.assertEqual((pkg / 'pkg.txt').read_text(), 'nested\n')
+        self.assertEqual(self.git(pkg, 'status', '--porcelain').stdout, b'')
+        self.world('checkpoint', wid)
+        self.world('checkpoint', wid, '--committed-only')
+        shutil.rmtree(self.source)
+        for name, snapshot, expected in (('two', 'S1', head), ('three', 'S2', changed), ('four', 'S3', changed)):
+            world, _ = self.fork(name, snapshot)
+            self.assertEqual(self.git(world, 'status', '--porcelain').stdout, b'')
+            copy = world / '.venv/src/pkg'
+            self.assertEqual(self.git(copy, 'rev-parse', 'HEAD').stdout.strip(), expected)
+            self.assertEqual(self.git(copy, 'status', '--porcelain').stdout, b'')
+            self.git(copy, 'fsck', '--full', '--no-progress')
+            self.assertEqual(self.git(copy, 'log', '--format=%s').stdout.split(b'\n')[-2], b'nested')
+        self.world('fork', '--from', wid, '--to', str(self.root / 'five'))
+        self.assertEqual(self.git(self.root / 'five/.venv/src/pkg', 'rev-parse', 'HEAD').stdout.strip(), changed)
+        self.assertFalse(marker.exists())
+
+    def test_untracked_nested_repository_is_uncommitted_content(self):
+        head = self.nested_repo(self.source / 'scratch/clone')
+        refused = self.world('init', str(self.source), code=3)
+        self.assertNotIn(b'nested', refused.stderr)
+        self.assertEqual(self.snapshots(), [])
+        self.world('init', str(self.source), '--include-changes')
+        one, wid = self.fork()
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'?? scratch/\n')
+        self.assertEqual(self.git(one / 'scratch/clone', 'rev-parse', 'HEAD').stdout.strip(), head)
+        self.world('checkpoint', wid, code=3)
+        self.world('checkpoint', wid, '--include-changes')
+        two, _ = self.fork('two', 'S2')
+        self.assertEqual(self.git(two / 'scratch/clone', 'rev-parse', 'HEAD').stdout.strip(), head)
+        # publish sends the World's branch, never the nested repository, and notes the
+        # uncommitted content it leaves behind.
+        self.commit_in(one, 'published')
+        published = self.world('publish', wid)
+        self.assertIn(b'uncommitted', published.stderr + published.stdout)
+        self.assertEqual(self.git(self.source, 'ls-tree', '-r', '--name-only', 'world/W1').stdout, b'.gitignore\nfile\n')
+
+    def test_committed_only_leaves_unignored_nested_repositories_behind(self):
+        (self.source / '.gitignore').write_text('build/\n.venv/\n')
+        (self.source / 'vendor/foo').mkdir(parents=True)
+        (self.source / 'vendor/foo/a').write_text('tracked\n')
+        self.git(self.source, 'add', '.')
+        self.git(self.source, 'commit', '-qm', 'vendor')
+        # One Git's status cannot see (its directory holds tracked files), one in an untracked
+        # directory, and ignored ones, nested in each other.
+        self.nested_repo(self.source / 'vendor/foo', 'foo')
+        self.nested_repo(self.source / 'scratch/clone', 'scratch')
+        (self.source / 'scratch/notes').write_text('notes\n')
+        head = self.nested_repo(self.source / '.venv/src/pkg')
+        inner = self.nested_repo(self.source / '.venv/src/pkg/vendored/inner', 'inner')
+        before = self.tree_bytes(self.source)
+
+        def assert_committed(world):
+            self.assertEqual(self.git(world, 'status', '--porcelain', '--ignored').stdout, b'!! .venv/\n!! .world\n!! .world-git/\n')
+            self.assertFalse((world / 'scratch').exists())
+            self.assertEqual(sorted(os.listdir(world / 'vendor/foo')), ['a'])
+            self.assertEqual(self.git(world / '.venv/src/pkg', 'rev-parse', 'HEAD').stdout.strip(), head)
+            self.assertEqual(self.git(world / '.venv/src/pkg/vendored/inner', 'rev-parse', 'HEAD').stdout.strip(), inner)
+
+        self.world('init', str(self.source), '--committed-only')
+        self.assertEqual(self.tree_bytes(self.source), before)
+        one, _ = self.fork()
+        assert_committed(one)
+        # The same from a World that carries them: checkpoint and fork with --committed-only.
+        self.world('init', str(self.source), '--include-changes')
+        two, wid = self.fork('two', 'S2')
+        self.assertEqual(self.git(two, 'status', '--porcelain').stdout,
+                         self.git(self.source, 'status', '--porcelain').stdout)
+        self.assertTrue((two / 'vendor/foo/.git').is_dir())
+        self.world('checkpoint', wid, '--committed-only')
+        assert_committed(self.fork('three', 'S3')[0])
+        self.world('fork', '--from', wid, '--to', str(self.root / 'four'), '--committed-only')
+        assert_committed(self.root / 'four')
+        self.assertTrue((two / 'scratch/clone/.git').is_dir())
+
+    def test_nested_repositories_that_reach_outside_are_refused(self):
+        other = self.origin('other')
+        objects = str(other / '.git/objects')
+
+        def refused(path, why, prefix=b'nested Git repository at '):
+            p = self.world('init', str(self.source), '--include-changes', code=3)
+            self.assertIn(b'reason: ' + prefix + str(path).encode() + b': ' + why, p.stderr)
+            if path.is_symlink():
+                path.unlink()
+            else:
+                shutil.rmtree(path)
+
+        nested = self.source / 'nested'
+        self.git(self.root, 'clone', '-q', '--shared', str(other), str(nested))
+        refused(nested, b'it borrows objects from another repository (objects/info/alternates)')
+        self.nested_repo(nested)
+        (nested / '.git/objects/info/alternates').write_text(os.path.relpath(objects, nested / '.git/objects') + '\n')
+        refused(nested, b'it borrows objects from another repository (objects/info/alternates)')
+        self.nested_repo(nested)
+        (nested / '.git/objects/info/http-alternates').write_text('https://example.com/objects\n')
+        refused(nested, b'it borrows objects from another repository (objects/info/http-alternates)')
+        self.nested_repo(nested)
+        self.git(nested, 'worktree', 'add', '-q', '--detach', str(self.root / 'nested-wt'))
+        refused(nested, b'it has linked worktrees registered (.git/worktrees)')
+        shutil.rmtree(self.root / 'nested-wt')
+        self.nested_repo(nested)
+        (nested / '.git/commondir').write_text(os.path.relpath(other / '.git', nested / '.git') + '\n')
+        refused(nested, b'it is the administration of a linked worktree (commondir)')
+        self.nested_repo(nested)
+        self.git(nested, 'config', 'core.worktree', str(self.root / 'elsewhere'))
+        refused(nested, b'it sets core.worktree')
+        self.nested_repo(nested)
+        self.git(nested, 'config', 'extensions.worktreeConfig', 'true')
+        refused(nested, b'it sets extensions.worktreeConfig')
+        self.nested_repo(nested)
+        self.git(nested, 'config', 'include.path', '../../shared.cfg')
+        refused(nested, b'it includes ../../shared.cfg by a relative path')
+        self.nested_repo(nested)
+        self.git(nested, 'config', 'includeIf.onbranch:main.path', 'local.cfg')
+        refused(nested, b'it includes local.cfg by a relative path')
+        self.nested_repo(nested)
+        (nested / '.git/modules/lib').mkdir(parents=True)
+        refused(nested, b'it holds submodule repositories (.git/modules)')
+        self.nested_repo(nested)
+        shutil.rmtree(nested / '.git/refs/tags')
+        (nested / '.git/refs/tags').symlink_to(other / '.git/refs/tags')
+        refused(nested, b'its .git holds a symlink or special file (refs/tags)')
+        nested.mkdir()
+        (nested / '.git').symlink_to(other / '.git')
+        refused(nested, b'its .git is a symlink')
+        nested.mkdir()
+        (nested / '.git').write_text('gitdir: ' + str(other / '.git') + '\n')
+        refused(nested, b'its .git is a file leading to administration elsewhere',
+                prefix=b'nested Git repository or worktree at ')
+        # Each repository nested in an admitted one must pass the same check.
+        self.nested_repo(nested)
+        inner = nested / 'deps/inner'
+        self.git(self.root, 'clone', '-q', '--shared', str(other), str(inner))
+        refused(inner, b'it borrows objects from another repository (objects/info/alternates)')
+        shutil.rmtree(nested)
+        self.assertEqual(self.snapshots(), [])
+        # Admitted: an absolute include, a bare repository named .git, and a symlink to a
+        # repository elsewhere, which stays a symlink and is never entered.
+        self.nested_repo(nested)
+        self.git(nested, 'config', 'include.path', str(self.root / 'shared.cfg'))
+        self.git(self.root, 'init', '-q', '--bare', str(self.source / 'bare/.git'))
+        (self.source / 'link').symlink_to(other)
+        self.world('init', str(self.source), '--include-changes')
+        one, wid = self.fork()
+        self.assertEqual(self.git(one / 'nested', 'log', '--format=%s').stdout, b'nested\n')
+        self.assertEqual(self.git(one / 'bare/.git', 'rev-parse', '--is-bare-repository').stdout.strip(), b'true')
+        self.assertTrue((one / 'link').is_symlink())
+        # A World is checked the same way before it is copied.
+        self.git(self.root, 'clone', '-q', '--shared', str(other), str(one / 'borrowed'))
+        p = self.world('checkpoint', wid, '--include-changes', code=3)
+        self.assertIn(b'reason: nested Git repository at ' + str(one / 'borrowed').encode() + b': it borrows objects', p.stderr)
+        self.world('fork', '--from', wid, '--to', str(self.root / 'refused'), '--include-changes', code=3)
+        self.assertFalse((self.root / 'refused').exists())
+        self.assertEqual(len(self.snapshots()), 1)
+
+    def test_nested_repository_changed_during_the_clone_is_not_published(self):
+        import shlex
+        nested = self.source / 'nested'
+        self.nested_repo(nested)
+        other = self.origin('other')
+        config = nested / '.git/config'
+        alternates = nested / '.git/objects/info/alternates'
+        fired = self.root / 'fired'
+        real_git = shutil.which('git')
+        wrapper = self.root / 'nested-race-bin'
+        wrapper.mkdir()
+        script = wrapper / 'git'
+        # Right after the capture has read the nested repository's configuration -- its last
+        # check -- it starts borrowing objects, before the tree is cloned.
+        script.write_text('#!/bin/sh\nhit=0\nfor arg in "$@"; do [ "$arg" = ' + shlex.quote(str(config))
+                          + ' ] && hit=1; done\n' + shlex.quote(real_git) + ' "$@"\nresult=$?\n'
+                          + 'if [ "$hit" = 1 ] && [ ! -e ' + shlex.quote(str(fired)) + ' ]; then\n'
+                          + ': > ' + shlex.quote(str(fired)) + '\n'
+                          + 'echo ' + shlex.quote(str(other / '.git/objects')) + ' > ' + shlex.quote(str(alternates)) + '\n'
+                          + 'fi\nexit "$result"\n')
+        script.chmod(0o700)
+        env = dict(self.env)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        self.world('init', str(self.source), '--include-changes', code=1)
+        self.env = env
+        self.assertTrue(fired.exists())
+        self.assertEqual(self.snapshots(), [])
+        p = self.world('init', str(self.source), '--include-changes', code=3)
+        self.assertIn(b'it borrows objects from another repository', p.stderr)
+        alternates.unlink()
+        # A repository that appears meanwhile, already borrowing objects, is checked too.
+        late = self.source / 'late'
+        fired.unlink()
+        script.write_text(script.read_text().replace(
+            'echo ' + shlex.quote(str(other / '.git/objects')) + ' > ' + shlex.quote(str(alternates)),
+            'mkdir ' + shlex.quote(str(late)) + ' && cp -R ' + shlex.quote(str(nested / '.git')) + ' '
+            + shlex.quote(str(late / '.git')) + ' && echo ' + shlex.quote(str(other / '.git/objects'))
+            + ' > ' + shlex.quote(str(late / '.git/objects/info/alternates'))))
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        self.world('init', str(self.source), '--include-changes', code=1)
+        self.env = env
+        self.assertTrue((late / '.git/objects/info/alternates').exists())
+        self.assertEqual(self.snapshots(), [])
+        shutil.rmtree(late)
+        self.world('init', str(self.source), '--include-changes')
+
     # ---- submodules ------------------------------------------------------------------------
 
     def sub(self, repo, *args, code=0):
@@ -5197,10 +5445,18 @@ class GitWorldTest(unittest.TestCase):
     def test_world_git_inside_a_submodule_is_ordinary_content(self):
         self.submodule_fixture()
         child = self.source / 'libs/lib/.world-git/child'
-        child.mkdir(parents=True)
-        self.git(child, 'init', '-q')
+        head = self.nested_repo(child)
+        # Only the World's root owns `.world-git`; in a submodule it is a directory like any
+        # other, and the repository in it is checked like any nested repository.
+        (child / '.git/objects/info/alternates').write_text('/elsewhere/objects\n')
         refused = self.world('init', str(self.source), '--include-changes', code=3)
-        self.assertIn(b'reason: submodule libs/lib: nested Git repository or submodule at ' + str(child).encode(), refused.stderr)
+        self.assertIn(b'reason: submodule libs/lib: nested Git repository at ' + str(child).encode()
+                      + b': it borrows objects from another repository', refused.stderr)
+        (child / '.git/objects/info/alternates').unlink()
+        self.world('init', str(self.source), '--include-changes')
+        one, _ = self.fork()
+        self.assertEqual(self.git(one / 'libs/lib/.world-git/child', 'rev-parse', 'HEAD').stdout.strip(), head)
+        self.assertEqual(self.git(one / 'libs/lib', 'status', '--porcelain').stdout, b'?? .world-git/\n')
 
     def test_submodule_filters_and_hooks_never_run(self):
         self.submodule_fixture()
@@ -5233,15 +5489,19 @@ class GitWorldTest(unittest.TestCase):
         # A plain repository below the uninitialized submodule's directory.
         (self.source / 'vendor/unused/deeper').mkdir()
         self.git(self.source / 'vendor/unused/deeper', 'init', '-q')
-        refused = self.world('init', str(self.source), code=3)
-        self.assertIn(b'reason: nested Git repository or submodule at ' + str(self.source / 'vendor/unused/deeper').encode(), refused.stderr)
+        refused = self.world('init', str(self.source), '--include-changes', code=3)
+        self.assertIn(b'reason: nested Git repository at ' + str(self.source / 'vendor/unused/deeper').encode()
+                      + b': it is inside the directory of uninitialized submodule vendor/unused', refused.stderr)
         shutil.rmtree(self.source / 'vendor/unused/deeper')
-        # A plain repository inside an initialized submodule.
-        (self.source / 'libs/lib/extra').mkdir()
-        self.git(self.source / 'libs/lib/extra', 'init', '-q')
-        refused = self.world('init', str(self.source), code=3)
-        self.assertIn(b'reason: submodule libs/lib: nested Git repository or submodule at', refused.stderr)
-        shutil.rmtree(self.source / 'libs/lib/extra')
+        # One inside an initialized submodule that reaches outside is refused there too (see
+        # test_nested_repository_in_a_submodule_is_its_untracked_content).
+        extra = self.source / 'libs/lib/extra'
+        self.nested_repo(extra)
+        (extra / '.git/commondir').write_text('../../elsewhere\n')
+        refused = self.world('init', str(self.source), '--include-changes', code=3)
+        self.assertIn(b'reason: submodule libs/lib: nested Git repository at ' + str(extra).encode()
+                      + b': it is the administration of a linked worktree (commondir)', refused.stderr)
+        shutil.rmtree(extra)
         # A submodule whose .git points at some other repository.
         stranger = self.origin('stranger')
         dot = self.source / 'libs/lib/.git'
@@ -5257,6 +5517,29 @@ class GitWorldTest(unittest.TestCase):
         refused = self.world('init', str(self.source), '--include-changes', code=3)
         self.assertIn(b'reason: submodule path libs/lib is not a directory', refused.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+
+    def test_nested_repository_in_a_submodule_is_its_untracked_content(self):
+        self.submodule_fixture()
+        # A self-contained repository inside an initialized submodule is that submodule's
+        # untracked content, carried as files like one in the root.
+        extra = self.source / 'libs/lib/extra'
+        head = self.nested_repo(extra)
+        refused = self.world('init', str(self.source), code=3)
+        self.assertNotIn(b'nested', refused.stderr)
+        self.world('init', str(self.source), '--include-changes')
+        shutil.rmtree(self.source)
+        one, wid = self.fork()
+        self.assertEqual(self.git(one / 'libs/lib', 'status', '--porcelain').stdout, b'?? extra/\n')
+        self.assertEqual(self.git(one / 'libs/lib/extra', 'rev-parse', 'HEAD').stdout.strip(), head)
+        self.git(one / 'libs/lib/extra', 'commit', '-q', '--allow-empty', '-m', 'in the World')
+        self.world('checkpoint', wid, '--include-changes')
+        two, _ = self.fork('two', 'S2')
+        self.assertEqual(self.git(two / 'libs/lib/extra', 'log', '--format=%s').stdout, b'in the World\nnested\n')
+        # --committed-only leaves it behind with the rest of the submodule's untracked content.
+        self.world('checkpoint', wid, '--committed-only')
+        three, _ = self.fork('three', 'S3')
+        self.assertFalse((three / 'libs/lib/extra').exists())
+        self.assertEqual(self.git(three / 'libs/lib', 'status', '--porcelain').stdout, b'')
 
     def after_first_status(self, repo, name, action, command='status'):
         """A `git` on PATH that runs the shell `action` once, right after the first successful
