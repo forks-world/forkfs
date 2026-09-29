@@ -568,8 +568,11 @@ must be a distinct repository: the World's own working tree, and any other repos
 shares the World's own private common Git directory -- including `.world-git/repo.git` itself
 or a linked worktree of it -- are refused as a publish target. Without
 `--force`, publishing refuses a branch that is checked out in the target, an update that is
-not a fast-forward, and a repository that shares no history with the World. A detached World
-needs `--branch`. Uncommitted World changes are not published; the command says so.
+not a fast-forward, and a repository that shares no history with the World -- unless it has
+no commit at all (see [Repositories with no commit yet](#repositories-with-no-commit-yet)). A
+World with no commit has nothing to publish, and a shallow World cannot publish into a
+repository that lacks the history below its boundary (see [Shallow clones](#shallow-clones)).
+A detached World needs `--branch`. Uncommitted World changes are not published; the command says so.
 Publishing re-checks the configuration policy first, so reading the World's status never
 runs a filter attached after the import. The branch update and the removal of the private
 staging ref are one ref transaction; if that final update fails instead -- for example
@@ -637,10 +640,42 @@ HEAD outside `refs/heads/`; inspection then reports an empty branch. Use `git di
 `git diff --cached` to review source changes. `world fs diff` still compares filesystem
 content, including Git administrative changes such as branch/index updates.
 
+### Repositories with no commit yet
+
+A repository on an unborn branch -- `git init` before the first commit, or `git checkout
+--orphan` in one with history -- is imported with no commit of its own: the owned repository
+has the source's refs (none at all after `git init`) and its HEAD names the source's unborn
+branch as captured. Files staged for the first commit are uncommitted changes like any other:
+the import refuses them without `--include-changes` and preserves the index with it. An empty
+repository with nothing staged or untracked imports without either flag. Every place that reads
+HEAD -- capture, the recheck before publication, the reserved-path scan, LFS configuration,
+submodules (a submodule on an orphan branch is a moved submodule; `--committed-only` detaches it
+at the recorded commit) -- treats an unborn HEAD as "no commit", and a HEAD that is neither a
+commit nor an unborn branch is still refused.
+
+`--committed-only` is refused on an unborn branch (`init`, `checkpoint` and `fork --from W<n>`
+alike): nothing is committed, so the committed version would be an empty tree that silently
+leaves every staged and untracked file of the project behind. Commit first, or use
+`--include-changes`.
+
+A fork's HEAD becomes the unborn branch `world/W<n>` (chosen like any World branch) with an
+empty baseline, and `inspect` reports that branch with an empty `head` and `baseline` (the text
+form says `(no commit yet)` and `(none)`). The first `git commit` in the World creates the
+branch as a root commit; a World forked before that keeps its empty baseline. Checkpoints,
+forks and pooled forks of a World that is still unborn work as for any World, and a checkpoint
+taken after the first commit forks with that commit as the baseline.
+
+`publish` refuses a World with no commit: there is nothing to publish. A World with commits may
+publish into a repository with no commit at all -- the source it came from, still unborn, or
+any freshly initialized one -- without `--force`: there is no history to share or to lose, and
+the World's branch becomes that repository's first. The target's own unborn HEAD is left as it
+is. Into a repository that has commits, the shared-history rule applies unchanged.
+
 ## Limits of this increment
 
-- Only a root repository with an existing commit is supported. Detached HEAD is supported;
-  unborn repositories are refused. External linked worktrees are safely imported by
+- Only a Git repository at the root of the source is imported. Detached HEAD and unborn
+  branches are supported (see [Repositories with no commit yet](#repositories-with-no-commit-yet)).
+  External linked worktrees are safely imported by
   resolving their source Git administration and constructing fresh local administration.
 - Nested repositories that are not self-contained (see
   [Nested repositories](#nested-repositories)), sparse or split indexes, partial clones, and
@@ -700,7 +735,7 @@ committed-only imports, opt-in hooks, staging preservation, imported linked work
 source deletion, Claude Code and Codex style agent worktrees in the source and in Worlds
 (ignored or not, nested, locked, absolute or relative, hardlinked, malformed or foreign), absorbed, old-style, nested and uninitialized submodules and their
 refusals, self-contained nested repositories (ignored, untracked, nested in each other or in a
-submodule, under `--committed-only`, changed during the clone) and each of their refusals, independent commits, branch collisions, detached HEAD,
+submodule, under `--committed-only`, changed during the clone) and each of their refusals, shallow clones and unborn branches, independent commits, branch collisions, detached HEAD,
 move/discard/restore/checkpoint, hard snapshots, pooled Git forks and their setup failures,
 Git setup rollback, environment isolation and Git commits inside the exec sandbox.
 

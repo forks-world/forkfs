@@ -4308,7 +4308,7 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'unsupported Git layout', result.stderr)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
-    def test_unsupported_nested_and_unborn_are_refused(self):
+    def test_unsupported_nested_repository_is_refused(self):
         nested = self.source / 'nested'
         nested.mkdir()
         self.git(nested, 'init')
@@ -4316,10 +4316,6 @@ class GitWorldTest(unittest.TestCase):
         (nested / '.git/commondir').write_text('../../elsewhere\n')
         self.world('init', str(self.source), '--include-changes', code=3)
         shutil.rmtree(nested)
-        unborn = self.root / 'unborn'
-        unborn.mkdir()
-        self.git(unborn, 'init')
-        self.world('init', str(unborn), '--include-changes', code=3)
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
 
     def pool_ready(self, snapshot='S1'):
@@ -6161,6 +6157,150 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.history(one / 'libs/lib'), ['lib 2'])
         self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
         self.git(one / 'libs/lib', 'fsck', '--full')
+
+    # ---- unborn repositories ---------------------------------------------------------------
+
+    def unborn_source(self, name='unborn'):
+        repo = self.root / name
+        self.git(self.root, 'init', '-q', '-b', 'trunk', str(repo))
+        self.identify(repo)
+        return repo
+
+    def git_info(self, wid):
+        return json.loads(self.world('inspect', wid, '--json').stdout)['git']
+
+    def test_unborn_repository_is_imported_forked_and_committed(self):
+        unborn = self.unborn_source()
+        (unborn / '.gitignore').write_text('build/\n')
+        (unborn / 'staged').write_text('staged before the first commit\n')
+        self.git(unborn, 'add', '.')
+        (unborn / 'untracked').write_text('untracked\n')
+        (unborn / 'build').mkdir()
+        (unborn / 'build/artifact').write_text('ignored\n')
+        status = self.git(unborn, 'status', '--porcelain').stdout
+        index = (unborn / '.git/index').read_bytes()
+        # Staged files are uncommitted changes: an explicit choice, and nothing is committed yet
+        # to start from with --committed-only.
+        self.world('init', str(unborn), code=3)
+        result = self.world('init', str(unborn), '--committed-only', code=3)
+        self.assertIn(b'reason: HEAD is on refs/heads/trunk, which has no commit yet', result.stderr)
+        self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+        self.world('init', str(unborn), '--include-changes')
+        self.assertEqual((unborn / '.git/index').read_bytes(), index)
+        self.git(unborn, 'rev-parse', '--verify', '-q', 'HEAD', code=1)
+        shutil.rmtree(unborn)
+        owned = Path('.world-git/repo.git')
+        one, wid = self.fork()
+        self.assertEqual((one / owned / 'HEAD').read_text(), 'ref: refs/heads/trunk\n')
+        self.assertEqual(self.git(one, 'for-each-ref').stdout, b'')
+        self.assertEqual(self.git(one, 'symbolic-ref', 'HEAD').stdout.strip(), b'refs/heads/world/W1')
+        self.git(one, 'rev-parse', '--verify', '-q', 'HEAD', code=1)
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, status)
+        self.assertEqual((one / 'build/artifact').read_text(), 'ignored\n')
+        self.assertEqual(self.git_info(wid), {'branch': 'world/W1', 'head': '', 'baseline': '',
+                                              'git_dir': str(one / owned)})
+        self.assertIn(b'(no commit yet)', self.world('inspect', wid).stdout)
+        # A World with no commit publishes nothing, and --committed-only has nothing to start from.
+        result = self.world('publish', wid, '--repo', str(self.source), code=3)
+        self.assertIn(b'reason: the World\'s branch world/W1 has no commit yet; there is nothing to publish', result.stderr)
+        result = self.world('fork', '--from', wid, '--to', str(self.root / 'refused'), '--committed-only', code=3)
+        self.assertIn(b'has no commit yet', result.stderr)
+        # Checkpoints, forks and pooled forks of the unborn World.
+        checkpoint = self.world('checkpoint', wid, '--include-changes').stdout.split()[0].decode()
+        two, wid2 = self.fork('two', wid, '--include-changes')
+        self.world('pool', 'fill', checkpoint, '--count', '1')
+        three = self.root / 'three'
+        out = self.world('fork', '--from', checkpoint, '--to', str(three)).stdout
+        self.assertIn(b'(pool)', out)
+        wid3 = out.decode().split()[0]
+        for world, w in ((two, wid2), (three, wid3)):
+            branch = 'world/' + w
+            self.assertEqual(self.git(world, 'symbolic-ref', 'HEAD').stdout.strip(), b'refs/heads/' + branch.encode())
+            self.git(world, 'rev-parse', '--verify', '-q', 'HEAD', code=1)
+            self.assertEqual(self.git(world, 'status', '--porcelain').stdout, status)
+            self.assertEqual(self.git_info(w)['branch'], branch)
+            self.assertEqual(self.git_info(w)['head'], '')
+        # The first commit creates the World's branch as a root commit.
+        (one / 'untracked').unlink()
+        self.git(one, 'commit', '-qm', 'first')
+        first = self.git(one, 'rev-parse', 'HEAD').stdout.decode().strip()
+        self.assertEqual(self.git(one, 'rev-list', '--parents', 'HEAD').stdout.decode().split(), [first])
+        self.assertEqual(self.git(one, 'rev-parse', 'refs/heads/world/W1').stdout.decode().strip(), first)
+        self.assertEqual(self.git_info(wid)['head'], first)
+        self.assertEqual(self.git_info(wid)['baseline'], '')
+        self.assertEqual(self.git(two, 'for-each-ref').stdout, b'')
+        # A checkpoint after it forks with that commit as the baseline.
+        later = self.world('checkpoint', wid).stdout.split()[0].decode()
+        four, wid4 = self.fork('four', later)
+        self.assertEqual(self.git(four, 'rev-parse', 'HEAD').stdout.decode().strip(), first)
+        self.assertEqual(self.git(four, 'branch', '--show-current').stdout.decode().strip(), 'world/' + wid4)
+        self.assertEqual(self.git_info(wid4)['baseline'], first)
+        self.assertEqual(self.git(four, 'status', '--porcelain').stdout, b'')
+        self.git(four, 'fsck', '--full')
+
+    def test_orphan_branch_is_imported_unborn(self):
+        self.git(self.source, 'checkout', '-q', '--orphan', 'fresh')
+        self.world('init', str(self.source), code=3)
+        self.world('init', str(self.source), '--include-changes')
+        one, wid = self.fork()
+        self.assertEqual(self.git(one, 'rev-parse', 'main').stdout.strip(), self.base)
+        self.git(one, 'rev-parse', '--verify', '-q', 'HEAD', code=1)
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout,
+                         self.git(self.source, 'status', '--porcelain').stdout)
+        self.assertEqual(self.git_info(wid)['branch'], 'world/W1')
+        self.git(one, 'commit', '-qm', 'orphan root')
+        self.assertEqual(self.git(one, 'rev-list', '--count', 'HEAD').stdout.strip(), b'1')
+        # Unrelated to the source's history: publishing it needs --force.
+        result = self.world('publish', wid, code=3)
+        self.assertIn(b'shares no history with the World', result.stderr)
+        self.world('publish', wid, '--force')
+
+    def test_submodule_on_an_unborn_branch(self):
+        self.submodule_fixture()
+        lib = self.source / 'libs/lib'
+        recorded = self.git(lib, 'rev-parse', 'HEAD').stdout.strip()
+        self.git(lib, 'checkout', '-q', '--orphan', 'fresh')
+        # Its HEAD is no longer the recorded commit: an uncommitted change of the superproject.
+        self.world('init', str(self.source), code=3)
+        self.world('init', str(self.source), '--include-changes')
+        committed = self.world('init', str(self.source), '--committed-only').stdout.split()[0].decode()
+        one, _ = self.fork('one', 'S1')
+        self.assertEqual(self.git(one / 'libs/lib', 'symbolic-ref', 'HEAD').stdout.strip(), b'refs/heads/fresh')
+        self.git(one / 'libs/lib', 'rev-parse', '--verify', '-q', 'HEAD', code=1)
+        self.assertEqual(self.git(one / 'libs/lib', 'status', '--porcelain').stdout,
+                         self.git(lib, 'status', '--porcelain').stdout)
+        # --committed-only detaches it at the commit the superproject records.
+        two, _ = self.fork('two', committed)
+        self.assertEqual(self.git(two / 'libs/lib', 'rev-parse', 'HEAD').stdout.strip(), recorded)
+        self.git(two / 'libs/lib', 'symbolic-ref', '-q', 'HEAD', code=1)
+        self.assertEqual(self.git(two, 'status', '--porcelain').stdout, b'')
+
+    def test_publish_into_a_repository_with_no_commit(self):
+        unborn = self.unborn_source()
+        self.world('init', str(unborn))
+        one, wid = self.fork()
+        (one / 'file').write_text('first in the World\n')
+        self.git(one, 'add', 'file')
+        self.git(one, 'commit', '-qm', 'first')
+        head = self.git(one, 'rev-parse', 'HEAD').stdout.strip()
+        # The source it came from has no history to share or lose: no --force needed.
+        self.world('publish', wid)
+        self.assertEqual(self.git(unborn, 'rev-parse', 'refs/heads/world/W1').stdout.strip(), head)
+        self.assertEqual(self.git(unborn, 'symbolic-ref', 'HEAD').stdout.strip(), b'refs/heads/trunk')
+        self.git(unborn, 'rev-parse', '--verify', '-q', 'HEAD', code=1)
+        self.assertEqual(self.git(unborn, 'for-each-ref', 'refs/worldfs/').stdout, b'')
+        # A World of a repository with history publishes into an empty one too; a repository
+        # with unrelated commits still needs --force.
+        self.world('init', str(self.source))
+        two, wid2 = self.fork('two', 'S2')
+        self.git(two, 'commit', '-q', '--allow-empty', '-m', 'world change')
+        empty = self.unborn_source('empty')
+        self.world('publish', wid2, '--repo', str(empty))
+        self.assertEqual(self.git(empty, 'rev-parse', 'world/W2').stdout.strip(),
+                         self.git(two, 'rev-parse', 'HEAD').stdout.strip())
+        self.assertEqual(self.git(empty, 'rev-list', '--count', 'world/W2').stdout.strip(), b'2')
+        result = self.world('publish', wid, '--repo', str(self.source), code=3)
+        self.assertIn(b'shares no history with the World', result.stderr)
 
 if __name__ == '__main__':
     unittest.main()

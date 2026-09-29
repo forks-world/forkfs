@@ -1234,6 +1234,27 @@ int capture_orig(const char *root, bool &present, String &oid) {
     if ((rc = value(root, verify, oid))) return rc;
     present = true; return 0;
 }
+// HEAD of the repository at `root`: the commit it names (`head`) and its symbolic target
+// (`head_ref`, refs/heads/..., empty when detached). An unborn branch -- `git init` before the
+// first commit, or `git checkout --orphan` -- leaves `head` empty: HEAD names a branch that does
+// not exist yet, which is a state Git itself works in. Every reader of HEAD goes through here, so
+// "no commit yet" means the same thing everywhere. A HEAD that names something else that is not a
+// commit (a missing object, a ref to a tree) is refused.
+int read_head(const char *root, String &head, String &head_ref) {
+    const char *ref_args[] = {"symbolic-ref", "--quiet", "HEAD", nullptr};
+    if (int rc = value(root, ref_args, head_ref, true)) return rc;
+    const char *head_args[] = {"rev-parse", "--verify", "--quiet", "HEAD^{commit}", nullptr};
+    int rc = value(root, head_args, head, true);
+    if (rc || !head.empty()) return rc;
+    if (!head_ref.empty()) {
+        const char *exists[] = {"show-ref", "--exists", head_ref.c_str(), nullptr};
+        int status = -1;
+        rc = git(root, exists, nullptr, &status, true);
+        if (rc == WFS_E_GIT_FAILED && status == 2) return 0;   // unborn
+        if (rc && rc != WFS_E_GIT_FAILED) return rc;
+    }
+    return refuse(WFS_E_GIT_UNSUPPORTED, "HEAD does not name a commit");
+}
 // The `shallow` file at `path` (see GitRepoState::shallow), absent in a complete repository.
 // Git replaces it through `shallow.lock` while a fetch moves the boundary; a lock present means
 // the boundary is changing right now, which is a retryable busy like any concurrent ref update.
@@ -1956,7 +1977,10 @@ int capture_lfs_endpoint_state(const char *root, Vec<char> &state, bool ambient_
         for (char c : listing) state.emplace_back(c);
     }
 
-    return validate_lfs_tree_config(root, "HEAD", &state);
+    // An unborn HEAD has no committed .lfsconfig; the worktree and index views above are all.
+    String head, head_ref;
+    if ((rc = read_head(root, head, head_ref))) return rc;
+    return head.empty() ? 0 : validate_lfs_tree_config(root, "HEAD", &state);
 }
 // Tracked files whose `filter` attribute names a defined driver (Git LFS, git-crypt, ...) would
 // have that driver executed by status in the source and in the World; WorldFS neither runs nor
@@ -2750,9 +2774,10 @@ int reset_to_head(const char *clone, const char *target = nullptr) {
     const char *clean[] = {"clean", "-f", "-f", "-d", "-q", "--", ".", ":(exclude,top,literal).world",
                            ":(exclude,top,literal).world-git", nullptr};
     if (target) {
-        String head;
-        const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
-        if ((rc = value(clone, head_args, head))) return rc;
+        // A submodule on an unborn (orphan) branch whose repository still has the recorded commit
+        // is detached there like any other HEAD.
+        String head, head_ref;
+        if ((rc = read_head(clone, head, head_ref))) return rc;
         if (head != target) {
             const char *detach[] = {"update-ref", "--no-deref", "-m", "world: --committed-only", "HEAD", target, nullptr};
             if ((rc = git(clone, detach))) return rc;
@@ -2853,18 +2878,16 @@ int source_unchanged(const GitRepoState &s) {
     if (int rc = reject_inprogress(s.root.c_str())) return rc;
     if (int rc = reject_import_policy(s.root.c_str())) return rc;
     if (int rc = reject_external_grafts(s.root.c_str(), s.managed)) return rc;
-    String head; const char *args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
-    if (int rc = value(s.root.c_str(), args, head)) return rc;
+    String head, head_ref;
+    if (int rc = read_head(s.root.c_str(), head, head_ref)) return rc;
     Vec<char> index;
     int rc = read_bytes(s.index_path.c_str(), index);
     if (rc == -ENOENT && s.index.empty()) rc = 0;
     if (rc) return rc;
     if (head != s.head || index.size() != s.index.size() ||
         (!index.empty() && memcmp(index.data(), s.index.data(), index.size()))) return -EBUSY;
-    String head_ref, admin;
-    const char *ref_args[] = {"symbolic-ref", "--quiet", "HEAD", nullptr};
+    String admin;
     const char *admin_args[] = {"rev-parse", "--absolute-git-dir", nullptr};
-    if (int ref_rc = value(s.root.c_str(), ref_args, head_ref, true)) return ref_rc;
     if (int admin_rc = value(s.root.c_str(), admin_args, admin)) return admin_rc;
     if (head_ref != s.head_ref || admin != s.admin) return -EBUSY;
     Vec<char> exclude;
@@ -2965,7 +2988,7 @@ int reject_reserved_paths(const char *root, const GitRepoState &s) {
     if (int rc = git(root, tracked_args, &tracked)) return rc;
     if (tracked.size() > 1) return refuse(WFS_E_GIT_UNSUPPORTED, "the index tracks the reserved path .world or .world-git");
     Vec<String> tips;
-    tips.emplace_back(s.head.c_str());
+    if (!s.head.empty()) tips.emplace_back(s.head.c_str());   // unborn: no commit of its own
     if (s.orig_present) tips.emplace_back(s.orig_head.c_str());
     if (s.fetch_present) {
         // FETCH_HEAD lines start with an object ID followed by a tab.
@@ -3384,12 +3407,13 @@ int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool modu
         const char *list[] = {"config", "--list", "--includes", "--null", nullptr};
         if (int list_rc = git(root, list, &out.effective_config)) return list_rc;
     }
-    const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
-    if (value(root, head_args, out.head)) return refuse(WFS_E_GIT_UNSUPPORTED, "the repository has no commit yet");
+    // An unborn HEAD (no commit yet) is captured as its branch alone; what HEAD's tree would be
+    // checked for, it has not got.
+    if (int rc = read_head(root, out.head, out.head_ref)) return rc;
     bool lfs_worktree = false, lfs_head = false, lfs_target = false, lfs_setup = false;
     bool lfs_skip_smudge = false, lfs_skip_process = false;
     int lfs_rc = reject_used_filters(root, nullptr, &lfs_worktree);
-    if (!lfs_rc) lfs_rc = reject_used_filters(root, out.head.c_str(), &lfs_head);
+    if (!lfs_rc && !out.head.empty()) lfs_rc = reject_used_filters(root, out.head.c_str(), &lfs_head);
     if (!lfs_rc && target && strcmp(target, out.head.c_str()))
         lfs_rc = reject_used_filters(root, target, &lfs_target);
     if (!lfs_rc) lfs_rc = canonical_lfs_setup(root, lfs_setup, lfs_skip_smudge, lfs_skip_process);
@@ -3398,8 +3422,6 @@ int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool modu
     out.lfs_skip_smudge = lfs_skip_smudge;
     out.lfs_skip_process = lfs_skip_process;
     out.lfs_active = lfs_worktree || lfs_head || lfs_target || lfs_setup;
-    const char *head_ref_args[] = {"symbolic-ref", "--quiet", "HEAD", nullptr};
-    if (int rc = value(root, head_ref_args, out.head_ref, true)) return rc;
     const char *index_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "index", nullptr};
     if (int rc = value(root, index_args, out.index_path)) return rc;
     int rc = read_bytes(out.index_path.c_str(), out.index);
@@ -3912,6 +3934,11 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
     }
     Vec<Gitlink> gitlinks;
     if (int rc = capture_repo(root, out, with_hooks, false, gitlinks)) return rc;
+    // On an unborn branch nothing is committed: the "committed version" would be an empty tree,
+    // silently leaving every staged and untracked file of the project behind. Refused instead.
+    if (committed_only && out.head.empty())
+        return refuse(WFS_E_GIT_UNSUPPORTED, "HEAD is on %s, which has no commit yet, so there is no committed "
+                      "version to start from; commit first, or use --include-changes", out.head_ref.c_str());
     {
         Vec<GitSetting> config; size_t shared = 0;
         if (int rc = world_config(root, out, config, shared)) return rc;
@@ -4383,7 +4410,17 @@ int import_root(const GitSource &s, const char *clone) {
     String active = joinp(owned.c_str(), "active");
     const char *add[] = {"--git-dir", repo.c_str(), "worktree", "add", "--relative-paths", "--no-checkout",
         "--detach", "--quiet", "--", active.c_str(), s.head.c_str(), nullptr};
-    if (int rc = git(clone, add)) return rc;
+    // An unborn source has no commit to detach at: the registration is made on an orphan branch
+    // whose name is never used (it does not exist as a ref, and HEAD is pointed at the source's
+    // unborn branch below). A random name cannot collide with a captured ref.
+    unsigned char nonce[8] = {};
+    if (s.head.empty() && getentropy(nonce, sizeof nonce)) return -errno;
+    char orphan[40];
+    snprintf(orphan, sizeof orphan, "worldfs-import-%02x%02x%02x%02x%02x%02x%02x%02x",
+             nonce[0], nonce[1], nonce[2], nonce[3], nonce[4], nonce[5], nonce[6], nonce[7]);
+    const char *add_orphan[] = {"--git-dir", repo.c_str(), "worktree", "add", "--relative-paths", "--orphan",
+        "-b", orphan, "--quiet", "--", active.c_str(), nullptr};
+    if (int rc = git(clone, s.head.empty() ? add_orphan : add)) return rc;
     String dot = joinp(clone, ".git");
     if (int rc = fs_remove_tree(dot.c_str())) return rc;
     if (int rc = write_text(clone, ".git", marker)) return rc;
@@ -4394,7 +4431,11 @@ int import_root(const GitSource &s, const char *clone) {
     // moved, trashed and restored. Any copy leaves such worktrees out (omit_worktrees).
     const char *relative[] = {"--git-dir", repo.c_str(), "config", "worktree.useRelativePaths", "true", nullptr};
     if (int rc = git(clone, relative)) return rc;
-    // The only entry in the disposable no-checkout directory is its gitfile.
+    if (s.head.empty()) {
+        const char *unborn[] = {"symbolic-ref", "HEAD", s.head_ref.c_str(), nullptr};
+        if (int rc = git(clone, unborn)) return rc;
+    }
+    // The only entry in the disposable no-checkout (or orphan) directory is its gitfile.
     String old_dot = joinp(active.c_str(), ".git");
     if (unlink(old_dot.c_str()) || rmdir(active.c_str())) return -errno;
     String index = joinp(repo.c_str(), "worktrees/active/index");
@@ -4873,8 +4914,11 @@ int git_branch(const char *clone, wfs_id world) {
         if (available) break;
     }
     if (!available) return -EEXIST;
+    // A World with no commit yet gets its branch unborn: HEAD names it, and the first commit
+    // made in the World creates it as a root commit. Its baseline is empty.
     const char *create[] = {"update-ref", branch, s.head.c_str(), "", nullptr};
-    if (int rc = git(clone, create)) return rc;
+    if (!s.head.empty())
+        if (int rc = git(clone, create)) return rc;
     // A generated World branch must start without an upstream, even when stale
     // branch.<name>.* configuration for this exact short name was carried in --
     // e.g. a leftover branch.world/W1.remote/.merge left behind by a branch this
@@ -5459,16 +5503,14 @@ extern "C" int wfs_git_inspect(const char *root, wfs_git_info *out) {
     if (contents.size() != strlen(wfs::marker) || memcmp(contents.data(), wfs::marker, contents.size()))
         return wfs::refuse(WFS_E_GIT_UNSUPPORTED, "the .git file is not the WorldFS marker");
     wfs::String branch, base, common, head;
-    const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
-    if (int rc = wfs::value(root, head_args, head)) return rc;
-    const char *branch_args[] = {"symbolic-ref", "--quiet", "HEAD", nullptr};
     const char *base_args[] = {"config", "--local", "--get", "worldfs.baseline", nullptr};
     const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
     // Detached HEAD after an explicit user checkout is valid; an empty branch reports it
     // (symbolic-ref exits 1 without output). The full symbolic target is read rather than
     // rev-parse --abbrev-ref, which reports "heads/<name>" when a tag shares the branch name.
     // Like `git branch --show-current`, a symbolic HEAD outside refs/heads/ is not a branch.
-    if (int rc = wfs::value(root, branch_args, branch, true)) return rc;
+    // A World with no commit yet reports its (unborn) branch with an empty HEAD and baseline.
+    if (int rc = wfs::read_head(root, head, branch)) return rc;
     if (!strncmp(branch.c_str(), "refs/heads/", 11) && branch.size() > 11) {
         wfs::String name(branch.c_str() + 11, branch.size() - 11);
         branch = name;
@@ -5508,6 +5550,9 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
         if ((rc = value(world_root, common_args, common)) || (rc = value(world_root, admin_args, admin))) return rc;
         if ((rc = managed_check(world_root, common.c_str(), admin.c_str(), worktrees))) return rc;
     }
+    if (!info.head[0])
+        return refuse(WFS_E_GIT_TARGET, "the World's branch %s has no commit yet; there is nothing to publish",
+                      info.branch[0] ? info.branch : "(HEAD)");
     // Import guarantees the preserved history is clean (reject_reserved_paths), so a commit that
     // tracks .world or .world-git can only have been made afterwards, by force-adding a reserved
     // path and committing it. info.head is the commit wfs_git_inspect just inspected; the later
@@ -5727,8 +5772,12 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
         String exclude("--exclude="); exclude.append(staging);
         const char *all_args[] = {"--no-replace-objects", "rev-list", "--count", now.c_str(), nullptr};
         const char *new_args[] = {"--no-replace-objects", "rev-list", "--count", now.c_str(), exclude.c_str(), "--not", "--all", nullptr};
-        String all, fresh;
-        if (!(rc = value(repo, all_args, all)) && !(rc = value(repo, new_args, fresh)) && all == fresh)
+        // A repository with no commit at all (still unborn, as `git init` left it) has no history
+        // to share or to lose: the World's branch is its first.
+        const char *any_args[] = {"--no-replace-objects", "rev-list", "-n", "1", exclude.c_str(), "--all", nullptr};
+        String all, fresh, any;
+        if (!(rc = value(repo, all_args, all)) && !(rc = value(repo, new_args, fresh)) && all == fresh &&
+            !(rc = value(repo, any_args, any)) && !any.empty())
             rc = refuse(WFS_E_GIT_TARGET, "%s shares no history with the World; is it the repository the World came from? (--force skips this check)", repo);
     }
     if (!rc && !force && !old.empty() && old != now) {
