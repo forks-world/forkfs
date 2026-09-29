@@ -4463,6 +4463,294 @@ class GitWorldTest(unittest.TestCase):
         self.world('discard', wid, '--now')
         self.assertFalse(one.exists())
 
+    # ---- linked worktrees of AI coding agents (Claude Code, Codex) ----
+
+    @staticmethod
+    def tree_state(root):
+        """Every entry below `root`, with its type, mode and bytes (or link target)."""
+        state = {}
+        for dirpath, dirs, files in os.walk(root):
+            for name in dirs + files:
+                path = Path(dirpath) / name
+                st = path.lstat()
+                if path.is_symlink():
+                    state[str(path.relative_to(root))] = ('l', os.readlink(path))
+                elif path.is_dir():
+                    state[str(path.relative_to(root))] = ('d', st.st_mode)
+                else:
+                    state[str(path.relative_to(root))] = ('f', st.st_mode, path.read_bytes())
+        return state
+
+    def git_path(self, repo, name):
+        return Path(self.git(repo, 'rev-parse', '--path-format=absolute', '--git-path', name).stdout.decode().strip())
+
+    def checkouts(self, repo):
+        """The non-bare checkouts `git worktree list` reports for `repo`."""
+        out, current, bare = [], None, False
+        for line in self.git(repo, 'worktree', 'list', '--porcelain').stdout.decode().splitlines() + ['']:
+            if line.startswith('worktree '):
+                current, bare = line[len('worktree '):], False
+            elif line == 'bare':
+                bare = True
+            elif not line and current is not None:
+                if not bare:
+                    out.append(current)
+                current = None
+        return out
+
+    def claude_worktree(self, repo, name):
+        """What Claude Code does: `.claude/worktrees/<name>` on branch `worktree-<name>`, a commit
+        and an uncommitted edit in it, CLAUDE_BASE in its administration and a `git worktree
+        lock` held until its cleanup sweep."""
+        wt = repo / '.claude' / 'worktrees' / name
+        self.git(repo, 'worktree', 'add', '-q', str(wt), '-b', 'worktree-' + name)
+        (wt / 'agent.txt').write_text('agent work\n')
+        self.git(wt, 'add', 'agent.txt')
+        self.git(wt, 'commit', '-qm', 'agent commit')
+        (wt / 'file').write_text('uncommitted agent edit\n')
+        admin = Path(self.git(wt, 'rev-parse', '--absolute-git-dir').stdout.decode().strip())
+        (admin / 'CLAUDE_BASE').write_text('main\n')
+        self.git(repo, 'worktree', 'lock', '--reason', 'claude agent', str(wt))
+        return wt, self.git(wt, 'rev-parse', 'HEAD').stdout.strip(), admin
+
+    def assert_claude_source_import(self, ignored):
+        if ignored:
+            with open(self.source / '.git/info/exclude', 'a') as f:
+                f.write('**/.claude/worktrees/\n')
+        wt, commit, admin = self.claude_worktree(self.source, 'agent-x')
+        # Claude Code worktrees nest: an agent inside a worktree adds another worktree of the same
+        # repository below its own `.claude/worktrees`.
+        nested = wt / '.claude' / 'worktrees' / 'inner'
+        self.git(wt, 'worktree', 'add', '-q', str(nested), '-b', 'worktree-inner')
+        before = self.tree_state(self.source)
+        init = self.world('init', str(self.source))
+        self.assertIn(b'note: linked worktree .claude/worktrees/agent-x is a separate checkout', init.stderr)
+        self.assertIn(b'note: linked worktree .claude/worktrees/agent-x/.claude/worktrees/inner', init.stderr)
+        self.assertNotIn(b'repair:', init.stderr)
+        one, wid = self.fork()
+        self.assertEqual(self.tree_state(self.source), before)
+        self.assertFalse((one / '.claude/worktrees/agent-x').exists())
+        self.assertEqual(self.checkouts(one), [str(one)])
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.git(one, 'rev-parse', 'worktree-agent-x').stdout.strip(), commit)
+        self.git(one, 'checkout', '-q', 'worktree-agent-x')
+        self.assertEqual((one / 'agent.txt').read_text(), 'agent work\n')
+        self.assertEqual((one / 'file').read_text(), 'original\n')
+        # The source's worktrees are untouched and still work, lock and uncommitted edit included.
+        self.assertEqual(self.git(wt, 'status', '--porcelain', '--untracked-files=no').stdout, b' M file\n')
+        self.assertIn(b'locked', self.git(self.source, 'worktree', 'list', '--porcelain').stdout)
+        self.git(nested, 'status', '--porcelain')
+        self.world('verify', 'S1')
+
+    def test_claude_worktree_in_source_is_left_out_when_ignored(self):
+        self.assert_claude_source_import(True)
+
+    def test_claude_worktree_in_source_is_left_out_when_not_ignored(self):
+        self.assert_claude_source_import(False)
+
+    def test_claude_worktree_hardlinked_into_source_keeps_snapshot_records_consistent(self):
+        wt, _, _ = self.claude_worktree(self.source, 'agent-x')
+        (self.source / 'build').mkdir()
+        os.link(wt / 'agent.txt', self.source / 'build' / 'linked.txt')
+        # Two names in the tree and a third in the agent's checkout: the checkout's name leaves
+        # the tree, so the two that stay are one group of their own, not one reaching outside.
+        os.link(wt / 'file', self.source / 'build' / 'pair-a.txt')
+        os.link(wt / 'file', self.source / 'build' / 'pair-b.txt')
+        init = self.world('init', str(self.source))
+        self.assertNotIn(b'outside this tree', init.stderr)
+        snap = json.loads(self.world('inspect', 'S1', '--json').stdout)
+        self.assertEqual((snap['hardlinks'], snap['hl_groups'], snap['hl_external']), (2, 1, 0))
+        self.world('verify', 'S1')
+        one, _ = self.fork()
+        self.assertEqual((one / 'build/linked.txt').read_text(), 'agent work\n')
+        self.assertEqual((one / 'build/linked.txt').stat().st_nlink, 1)
+        a, b = (one / 'build/pair-a.txt').stat(), (one / 'build/pair-b.txt').stat()
+        self.assertEqual(((a.st_dev, a.st_ino), a.st_nlink), ((b.st_dev, b.st_ino), 2))
+        self.assertEqual((one / 'build/pair-a.txt').read_text(), 'uncommitted agent edit\n')
+        self.assertFalse((one / '.claude/worktrees/agent-x').exists())
+
+    def test_unreadable_agent_worktree_is_never_entered_by_walked_copies(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        wt, _, _ = self.claude_worktree(one, 'agent-z')
+        locked = wt / 'node_modules' / 'locked'
+        locked.mkdir(parents=True)
+        (locked / 'secret').write_text('x\n')
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o700)
+        # A copy that walks the tree -- --copy across volumes on macOS, every clone on Linux --
+        # never enters the left-out checkout, so what is unreadable in there cannot fail it.
+        if sys.platform == 'darwin':
+            # (The 64 MB image is below the space check's reserve; the copy itself fits.)
+            two = self.mount_private_volume() / 'two'
+            p = self.world('fork', '--from', wid, '--to', str(two), '--copy', '--skip-space-check')
+        else:
+            two = self.root / 'two'
+            p = self.world('fork', '--from', wid, '--to', str(two))
+        self.assertIn(b'not part of W2', p.stderr)
+        self.assertFalse((two / '.claude/worktrees/agent-z').exists())
+        self.assertEqual(sorted(os.listdir(two / '.world-git/repo.git/worktrees')), ['active'])
+        self.assertEqual(self.checkouts(two), [str(two)])
+        self.assertEqual(self.git(two, 'status', '--porcelain').stdout, b'')
+        self.git(two, 'rev-parse', '--verify', 'worktree-agent-z')
+        if sys.platform != 'darwin':
+            # The pre-clone scan does not enter it either. (APFS clones the whole root in one
+            # clonefile(2), which fails with EACCES on an unreadable directory anywhere below
+            # it, an agent's included -- the same as for an unreadable file of the tree.)
+            self.world('checkpoint', wid)
+            self.world('verify', 'S2')
+            self.assertFalse((self.fork('three', 'S2')[0] / '.claude/worktrees/agent-z').exists())
+
+    def test_foreign_or_unlinked_git_files_in_source_are_refused(self):
+        # A `.git` file leading into another repository's worktree administration.
+        other = self.root / 'other'
+        self.git(self.root, 'init', '-q', '-b', 'main', str(other))
+        (other / 'x').write_text('x\n')
+        self.git(other, 'add', 'x')
+        self.git(other, '-c', 'user.name=o', '-c', 'user.email=o@o', 'commit', '-qm', 'x')
+        foreign = self.source / '.claude' / 'worktrees' / 'foreign'
+        self.git(other, 'worktree', 'add', '-q', '--detach', str(foreign))
+        refused = self.world('init', str(self.source), '--include-changes', code=3)
+        self.assertIn(b'nested Git repository', refused.stderr)
+        self.git(other, 'worktree', 'remove', str(foreign))
+        # The source's own worktrees, one whose `.git` names the other's registration: that
+        # registration's backlink is not this checkout.
+        a = self.source / '.claude' / 'worktrees' / 'a'
+        b = self.source / '.claude' / 'worktrees' / 'b'
+        self.git(self.source, 'worktree', 'add', '-q', '--detach', str(a))
+        self.git(self.source, 'worktree', 'add', '-q', '--detach', str(b))
+        self.world('init', str(self.source))
+        self.assertEqual(len(json.loads(self.world('list', '--json').stdout)['snapshots']), 1)
+        (a / '.git').write_bytes((b / '.git').read_bytes())
+        refused = self.world('init', str(self.source), '--include-changes', code=3)
+        self.assertIn(b'nested Git repository', refused.stderr)
+        self.assertEqual(len(json.loads(self.world('list', '--json').stdout)['snapshots']), 1)
+
+    def test_claude_worktree_inside_world_is_left_out_of_forks_and_checkpoints(self):
+        init = self.world('init', str(self.source))
+        self.assertNotIn(b'repair:', init.stderr)
+        one, wid = self.fork()
+        self.assertEqual(self.git(one, 'config', '--type=bool', 'worktree.useRelativePaths').stdout.strip(), b'true')
+        wt, commit, admin = self.claude_worktree(one, 'agent-y')
+        # worktree.useRelativePaths: both links are relative, so they survive moving the World.
+        self.assertTrue((wt / '.git').read_text().startswith('gitdir: ../'))
+        self.assertFalse((admin / 'gitdir').read_text().startswith('/'))
+        parent_admin = self.tree_state(one / '.world-git')
+        checkpoint = self.world('checkpoint', wid)
+        self.assertIn(b'note: linked worktree .claude/worktrees/agent-y is a separate checkout, not part of S2', checkpoint.stderr)
+        p = self.world('fork', '--from', wid, '--to', str(self.root / 'two'))
+        self.assertIn(b'not part of W2', p.stderr)
+        two = self.root / 'two'
+        three, _ = self.fork('three', 'S2')
+        self.world('pool', 'fill', 'S2', '--count', '1')
+        pooled = self.root / 'pooled'
+        self.assertIn(b'(pool)', self.world('fork', '--from', 'S2', '--to', str(pooled)).stdout)
+        for child in (two, three, pooled):
+            self.assertFalse((child / '.claude/worktrees/agent-y').exists())
+            self.assertEqual(sorted(os.listdir(child / '.world-git/repo.git/worktrees')), ['active'])
+            self.assertEqual(self.checkouts(child), [str(child)])
+            self.assertEqual(self.git(child, 'status', '--porcelain').stdout, b'')
+            # The branch the agent had checked out is an ordinary free branch in the child.
+            self.git(child, 'checkout', '-q', 'worktree-agent-y')
+            self.assertEqual(self.git(child, 'rev-parse', 'HEAD').stdout.strip(), commit)
+        # The parent World and its worktree are untouched.
+        self.assertEqual(self.tree_state(one / '.world-git'), parent_admin)
+        self.assertEqual(self.git(wt, 'status', '--porcelain').stdout, b' M file\n')
+        # Moving the World, and trashing and restoring it, keep its in-tree worktree working;
+        # an in-tree worktree does not block discard.
+        moved = self.root / 'moved'
+        one.rename(moved)
+        self.world('verify', str(moved))
+        moved_wt = moved / '.claude/worktrees/agent-y'
+        self.assertEqual(self.git(moved_wt, 'status', '--porcelain').stdout, b' M file\n')
+        self.world('discard', wid)
+        self.world('restore', wid)
+        self.assertEqual(self.git(moved_wt, 'status', '--porcelain').stdout, b' M file\n')
+        self.assertIn(str(moved_wt).encode(), self.git(moved, 'worktree', 'list', '--porcelain').stdout)
+        self.world('checkpoint', wid)
+        self.world('discard', wid, '--now')
+        self.assertFalse(moved.exists())
+        self.world('verify', 'S2')
+        self.world('verify', 'S3')
+
+    def test_in_tree_worktree_does_not_block_discard(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'worktree', 'add', '-q', str(one / '.claude/worktrees/agent-z'), '-b', 'worktree-agent-z')
+        self.world('discard', wid, '--now')
+        self.assertFalse(one.exists())
+
+    def test_codex_worktree_outside_world_is_left_out_and_blocks_discard(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        # What `codex --worktree` does: a detached worktree outside the repository, created
+        # without a checkout, core.worktree in its config.worktree, then a hard reset. Codex
+        # writes absolute links (the default outside a World); its thread file sits in the
+        # registration.
+        codex = self.root / 'codex-home' / 'worktrees' / 'ab12' / 'one'
+        head = self.git(one, 'rev-parse', 'HEAD').stdout.decode().strip()
+        self.git(one, 'worktree', 'add', '-q', '--no-relative-paths', '--detach', '--no-checkout', str(codex), head)
+        self.git(codex, 'config', '--file', str(self.git_path(codex, 'config.worktree')), 'core.worktree', str(codex))
+        self.git(codex, 'reset', '-q', '--hard')
+        admin = Path(self.git(codex, 'rev-parse', '--absolute-git-dir').stdout.decode().strip())
+        self.assertTrue((admin / 'gitdir').read_text().startswith('/'))
+        (admin / 'codex-thread.json').write_text('{"thread": "t"}\n')
+        (codex / 'file').write_text('codex edit\n')
+        p = self.world('fork', '--from', wid, '--to', str(self.root / 'two'))
+        self.assertIn(b'note: linked worktree ' + str(codex).encode() + b' is a separate checkout', p.stderr)
+        self.world('checkpoint', wid)
+        three, _ = self.fork('three', 'S2')
+        for child in (self.root / 'two', three):
+            self.assertEqual(sorted(os.listdir(child / '.world-git/repo.git/worktrees')), ['active'])
+            self.assertEqual(self.checkouts(child), [str(child)])
+            self.assertEqual(self.git(child, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.git(codex, 'status', '--porcelain').stdout, b' M file\n')
+        self.assertIn(str(codex).encode(), self.git(one, 'worktree', 'list', '--porcelain').stdout)
+        refused = self.world('discard', wid, '--now', '--force', code=3)
+        self.assertIn(b'reason: linked worktrees outside the World depend on it: ' + str(codex).encode(), refused.stderr)
+        self.assertIn(b'git -C ' + str(one).encode() + b' worktree remove <path>', refused.stderr)
+        self.assertTrue(one.exists())
+        self.git(one, 'worktree', 'remove', '--force', str(codex))
+        self.world('discard', wid, '--now')
+        self.assertFalse(one.exists())
+
+    def test_world_without_relative_worktree_setting_still_forks(self):
+        # Worlds imported before worktree.useRelativePaths was set: an agent's in-tree worktree
+        # gets absolute links, which name the parent's own path; the fork is unchanged otherwise.
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', '--unset', 'worktree.useRelativePaths')
+        wt, commit, admin = self.claude_worktree(one, 'agent-y')
+        self.assertTrue((admin / 'gitdir').read_text().startswith('/'))
+        two, _ = self.fork('two', wid)
+        self.assertFalse((two / '.claude/worktrees/agent-y').exists())
+        self.assertEqual(self.checkouts(two), [str(two)])
+        self.assertEqual(self.git(two, 'rev-parse', 'worktree-agent-y').stdout.strip(), commit)
+        self.git(two, 'config', '--get', 'worktree.useRelativePaths', code=1)
+        self.assertEqual(self.git(wt, 'status', '--porcelain').stdout, b' M file\n')
+
+    def test_malformed_world_worktree_registration_is_refused(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        wt = one / '.claude' / 'worktrees' / 'agent-y'
+        self.git(one, 'worktree', 'add', '-q', str(wt), '-b', 'worktree-agent-y')
+        admin = one / '.world-git/repo.git/worktrees/agent-y'
+        gitdir = (admin / 'gitdir').read_bytes()
+        (admin / 'gitdir').write_bytes(b'garbled\n')
+        refused = self.world('checkpoint', wid, code=3)
+        self.assertIn(b'agent-y has no readable gitdir link', refused.stderr)
+        (admin / 'gitdir').unlink()
+        (admin / 'gitdir').symlink_to(self.root / 'elsewhere')
+        refused = self.world('fork', '--from', wid, '--to', str(self.root / 'two'), code=3)
+        self.assertIn(b'symlink', refused.stderr)
+        (admin / 'gitdir').unlink()
+        (admin / 'gitdir').write_bytes(gitdir)
+        # A checkout in the tree whose `.git` does not lead back to its registration.
+        (wt / '.git').write_text('gitdir: ' + str(self.root / 'nowhere') + '\n')
+        refused = self.world('checkpoint', wid, code=3)
+        self.assertIn(b'does not link back to its registration', refused.stderr)
+        self.assertEqual(len(json.loads(self.world('list', '--json').stdout)['snapshots']), 1)
+
     def test_plain_directories_still_work(self):
         shutil.rmtree(self.source / '.git')
         self.world('init', str(self.source))

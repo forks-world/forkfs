@@ -97,8 +97,17 @@ struct HardlinkRestore {
 // with everything under it (a Git import replaces the source's `.git` with owned administration).
 // Its names are excluded exactly like `exclude_rel`: they are not group members, and their links
 // are subtracted from the names that stay, so they never make a group external.
+//
+// `omit`, when given, lists tree-relative names the caller removes with everything under them --
+// a Git import's left-out linked worktree checkouts (and a managed World's registrations of
+// them) -- and which the copy may not even contain (fs_clone_tree's `omit`). Unlike
+// `exclude_tree` they are pruned from the walk: nothing below them is counted (entries, files,
+// the space budget) or read, so an unreadable or enormous checkout cannot fail the scan. Their
+// names are no group's members and, like `exclude_tree`'s, leave the tree rather than lie
+// outside it: an inode that would otherwise come out external is looked for below them, best
+// effort (hardlinks.cpp), and the links found there are subtracted as above.
 int hardlinks_scan(const char *root, const char *exclude_rel, TreeStats *stats, HardlinkSet &out,
-                   const char *exclude_tree = nullptr);
+                   const char *exclude_tree = nullptr, const Vec<String> *omit = nullptr);
 
 // Appends the set to an open manifest, as
 //

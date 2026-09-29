@@ -490,7 +490,17 @@ struct Walk {
     void *ctx = nullptr;
     fs_entry_ex_fn fn = nullptr;
     fs_dir_order order = FS_DIRS_PRE;
+    const Vec<String> *prune = nullptr;   // names that are not part of this walk (fs_walk_tree)
 };
+
+bool pruned(const Walk &w, const String &rel) {
+    if (!w.prune) return false;
+    for (size_t i = 0; i < w.prune->size(); ++i) {
+        const String &p = (*w.prune)[i];
+        if (p.size() == rel.size() && !::memcmp(p.c_str(), rel.c_str(), rel.size())) return true;
+    }
+    return false;
+}
 
 void walk_child(const Job &parent, const char *name, Job &out) {
     out.path = parent.path;
@@ -512,6 +522,8 @@ struct DirScan {
 int walk_one(DirScan &s, const char *name, const struct stat &st, uint8_t xattr) {
     Job child;
     walk_child(*s.job, name, child);
+    // Neither visited nor queued: nothing below a pruned name is ever opened.
+    if (pruned(*s.w, child.rel)) return 0;
     bool is_dir = S_ISDIR(st.st_mode);
     if (is_dir) s.subdirs->emplace_back(child);
     if (is_dir && s.w->order != FS_DIRS_PRE) return 0;
@@ -601,7 +613,8 @@ void *walk_worker(void *arg) {
 
 } // namespace
 
-int fs_walk_tree_ex(const char *root, int threads, fs_dir_order order, void *ctx, fs_entry_ex_fn fn) {
+int fs_walk_tree_ex(const char *root, int threads, fs_dir_order order, void *ctx, fs_entry_ex_fn fn,
+                    const Vec<String> *prune) {
     if (!root || !fn) return -EINVAL;
     struct stat rst;
     uint8_t rxa = FS_XATTR_UNKNOWN;
@@ -617,6 +630,7 @@ int fs_walk_tree_ex(const char *root, int threads, fs_dir_order order, void *ctx
     w.ctx = ctx;
     w.fn = fn;
     w.order = order;
+    if (prune && prune->size()) w.prune = prune;
     if (threads < 1) threads = 1;
     if (threads > 16) threads = 16;
     w.threads = threads;
@@ -678,10 +692,11 @@ int plain_entry(void *ctx, const FsEntry &e) {
 }
 } // namespace
 
-int fs_walk_tree(const char *root, int threads, fs_dir_order order, void *ctx, fs_entry_fn fn) {
+int fs_walk_tree(const char *root, int threads, fs_dir_order order, void *ctx, fs_entry_fn fn,
+                 const Vec<String> *prune) {
     if (!fn) return -EINVAL;
     PlainWalk p{ctx, fn};
-    return fs_walk_tree_ex(root, threads, order, &p, plain_entry);
+    return fs_walk_tree_ex(root, threads, order, &p, plain_entry, prune);
 }
 
 namespace {
@@ -1171,7 +1186,7 @@ int fs_lstat_xattr(const char *path, struct stat &st, uint8_t &xattr) {
 // than silently doing a real copy.
 int fs_clone_probe(const char *, const char *) { return -ENOTSUP; }
 bool fs_clone_shares(const char *, const char *) { return false; }
-int fs_clone_tree(const char *, const char *, bool) { return -ENOTSUP; }
+int fs_clone_tree(const char *, const char *, bool, const Vec<String> *) { return -ENOTSUP; }
 int fs_protect_tree(const char *root, TreeStats *stats, Manifest *) {
     if (stats) return fs_count_entries(root, *stats);
     return 0;

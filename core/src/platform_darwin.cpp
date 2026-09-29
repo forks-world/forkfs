@@ -491,15 +491,22 @@ int dirmeta_entry(void *ctx, const char *path, const char *rel, const struct sta
 
 } // namespace
 
-int fs_clone_tree(const char *src, const char *dst, bool allow_fallback) {
+int fs_clone_tree(const char *src, const char *dst, bool allow_fallback, const Vec<String> *omit) {
     if (!src || !dst) return -EINVAL;
+    // One clonefile(2) of the whole root, `omit` or not: splitting it into per-entry clones to
+    // step around a few names would give up the one property this whole design rests on. The
+    // omitted names are cloned (metadata only; the data is shared) and the caller removes them.
+    // What that costs is accepted: clonefile of a tree with an unreadable directory anywhere in
+    // it -- an omitted one included -- fails with EACCES (verified on macOS 27), exactly as an
+    // unreadable file of the tree itself does.
     if (::clonefile(src, dst, CLONE_NOFOLLOW) == 0) return 0;
     int e = errno;
     if (!allow_fallback || (e != EXDEV && e != ENOTSUP)) return -e;
-    // 4 workers: 8 and 16 measured slower, the bottleneck is APFS metadata transactions.
+    // 4 workers: 8 and 16 measured slower, the bottleneck is APFS metadata transactions. The
+    // walked copy never enters an omitted name, so nothing below one is read or copied.
     CloneCtx c{dst};
-    if (int rc = fs_walk_tree(src, 4, FS_DIRS_PRE, &c, clone_entry)) return rc;
-    return fs_walk_tree(src, 1, FS_DIRS_POST, &c, dirmeta_entry);
+    if (int rc = fs_walk_tree(src, 4, FS_DIRS_PRE, &c, clone_entry, omit)) return rc;
+    return fs_walk_tree(src, 1, FS_DIRS_POST, &c, dirmeta_entry, omit);
 }
 
 // ---- protection (P3) ---------------------------------------------------------------------------

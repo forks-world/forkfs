@@ -28,7 +28,13 @@ filesystem's copy-on-write primitive (see [Import cost](#import-cost)) and the c
 are written over it in one `update-ref` transaction. Subsequent filesystem forks use APFS
 cloning, including the Git objects. Git's
 [worktree documentation](https://git-scm.com/docs/git-worktree) describes these per-worktree
-administrative links.
+administrative links. The owned repository also sets `worktree.useRelativePaths=true`, so a
+linked worktree created in a World later -- by an AI coding agent, typically -- gets relative
+links as well and keeps working when the World is moved, trashed and restored (see
+[Linked worktrees of AI coding agents](#linked-worktrees-of-ai-coding-agents)). Worlds
+imported before this setting existed do not have it and are forked as they are: a fork is a
+copy of its parent's configuration, and the setting only decides how Git spells the links of
+worktrees created afterwards (`git config worktree.useRelativePaths true` adds it by hand).
 
 Git refs whose symbolic targets are outside `refs/`, malformed, dangling or cyclic are
 unsupported by this import contract and may be omitted by Git's mirror operation. The
@@ -38,9 +44,70 @@ This deliberately does not put a shared writable repository in the store: the ex
 exec sandbox can continue denying writes to the entire store and every other World.
 Moving, trashing, restoring, checkpointing or collecting a World moves or removes its Git
 administration with the same tree. No separate registry needs a best-effort cleanup and no
-external worktree becomes a GC target. Source worktree registrations are not imported.
+external worktree becomes a GC target. Source worktree registrations are not imported, and
+neither are the checkouts of the source's other linked worktrees that lie inside its tree
+(see [Linked worktrees of AI coding agents](#linked-worktrees-of-ai-coding-agents)).
 Deleting the original source after a successful import does not remove Git objects needed
 by the World, including staged blobs which have not yet appeared in any commit.
+
+### Linked worktrees of AI coding agents
+
+AI coding agents work in extra linked worktrees of the repository. Claude Code creates
+`<repository root>/.claude/worktrees/<name>` on a `worktree-<name>` branch -- inside the tree,
+possibly nested in another such worktree, locked with `git worktree lock` until its cleanup, and
+ignored only when the `**/.claude/worktrees/` rule it writes to `info/exclude` (or the user's own
+`.gitignore`) is present. Codex creates a detached worktree outside the repository and writes
+`core.worktree` into its `config.worktree`. A linked worktree other than the World's own checkout
+is a separate checkout of the repository, not part of the World, which is the same rule as for
+source worktree registrations above: work committed on a branch travels (every ref of the
+repository is imported, so the branch and its commits are in the World), its checkout,
+uncommitted state and HEAD do not, and the source or parent is never modified. A detached
+worktree's HEAD -- every Codex worktree is detached -- is per-worktree state, so commits reachable
+only from it are not referenced in the World (put them on a branch first to carry them). Each one left out is
+named in a `note:` line on stderr.
+
+- `init` admits a `.git` file inside the source tree only when it is exactly a registered
+  worktree of the source's own repository: its `gitdir` resolves to `<common dir>/worktrees/<id>`
+  of the common directory being imported, that registration's `gitdir` resolves back to this
+  `.git` file, and its `commondir` back to the same common directory. Such a checkout is not
+  walked (a worktree nested in it goes with it), is excluded from the cleanliness check by exact
+  path -- `git status` lists one that is not ignored as an untracked directory -- and is left
+  out of the snapshot's copy, whatever `--include-changes` or `--committed-only` say. The
+  pre-clone scan (entry count, space budget, hardlink groups) never enters it, and neither does
+  a copy that walks the tree (Linux, or `fork --copy` across volumes); APFS clones the whole root
+  in one `clonefile(2)` and the checkout is removed from that copy before publication. (That one
+  clone fails with EACCES on an unreadable directory anywhere in the tree, an agent's checkout
+  included, as it does for an unreadable file of the tree itself.) A name in the checkout is a
+  name leaving the tree, as a replaced `.git`'s is: it is no hardlink group's member, and the
+  tree's own names that shared its inode keep their own group, or become plain files, rather
+  than counting as linked from outside. A `.git` file leading into another repository,
+  one whose registration does not lead back to it, a dangling one and a `.git` directory are
+  still refused as a nested repository. The source's registrations are rechecked after the copy
+  and must be exactly the captured ones: a worktree added inside the source while it was being
+  cloned, or one removed meanwhile (whose directory may already hold ordinary files again), fails
+  the import as busy, to be retried, rather than publishing a copy that lacks those files.
+- `fork` and `checkpoint` of a World drop every `worktrees/<id>` registration other than
+  `active` from the child copy -- with whatever Git or the agent keeps there (`locked`,
+  `CLAUDE_BASE`, `codex-thread.json`, `config.worktree`, the index, logs) -- together with the
+  checkout when it lies inside the World. Whether it does is read from the registration's
+  `gitdir`: a relative one is resolved from the World's own administration, an absolute one
+  names the parent's path and is resolved there. The child's `git worktree list` shows only its
+  own checkout, and a branch that was checked out in a dropped worktree is an ordinary branch
+  in the child. The parent World and any directory outside it are never touched. A registration
+  that cannot be read (a symlink, a special file, a missing or garbled `gitdir`), or whose
+  checkout is inside the World but whose `.git` does not lead back to it, is refused rather than
+  guessed at; so is a checkout in a submodule's path.
+- `discard` moves an in-tree worktree to the trash with the World, registration and all, and
+  `restore` brings both back. A worktree outside the World would be left with a `.git` pointing
+  into a discarded tree, so it still blocks discard, `--force` included; the refusal names each
+  such checkout and the command that removes it, `git -C <World> worktree remove <path>` (or
+  `git worktree prune` for one whose directory no longer exists).
+- `publish` sends the World's own branch as before; the other worktrees do not block it, and an
+  in-tree one does not count as an uncommitted change of the World.
+
+Only the root repository's linked worktrees are handled this way. A linked worktree of a
+submodule repository is still refused by fork, checkpoint and discard, and an in-tree `.git`
+file belonging to a submodule's repository is still refused by `init`.
 
 `.world` and `.world-git/` are excluded from Git status using the private repository's
 `info/exclude`; source-local `info/exclude` rules are preserved before those reserved entries
@@ -462,12 +529,17 @@ content, including Git administrative changes such as branch/index updates.
   tracked file, and an ordinary checkout of such a commit overwrites the World marker. Partial clones are recognized by `extensions.partialClone`,
   by any `remote.<name>.promisor` or `remote.<name>.partialclonefilter` setting, and by
   `pack-*.promisor` markers, because cloning an object database does not bring back its
-  missing objects. Managed Worlds with symlinked administration or additional
-  linked worktrees are refused by fork/checkpoint. Discard also refuses registered extra
-  worktrees, including with `--force`, until they have been removed with Git. Do not create
-  new Git registrations in trashed trees. Forking or checkpointing a World whose Git
+  missing objects. Managed Worlds with symlinked administration, or with an additional
+  linked worktree registration that cannot be read or does not match its in-tree checkout,
+  are refused by fork/checkpoint; readable ones are left out of the child
+  ([Linked worktrees of AI coding agents](#linked-worktrees-of-ai-coding-agents)). Discard
+  refuses worktrees registered outside the World, including with `--force`, until they have
+  been removed with Git; linked worktrees of submodule repositories are refused by all three.
+  Do not create new Git registrations in trashed trees. The `locked` marker of `git worktree
+  lock` is not a lock file. Forking or checkpointing a World whose Git
   administration holds any `*.lock` file (a running Git command or a stale lock after a
-  crash) is refused, so the lock is never copied into the child. Merge/rebase/cherry-pick/revert in progress
+  crash) is refused, so the lock is never copied into the child; one inside a left-out
+  registration (an agent committing in its worktree) is dropped with it. Merge/rebase/cherry-pick/revert in progress
   is also refused, as is an unconcluded `git notes merge`, whose state is invisible to
   `git status`. Re-import older snapshots that still contain an unconverted `.git`.
 - Reftable repositories, a shared refs/object service, cross-machine history transfer, and
@@ -502,7 +574,8 @@ content, including Git administrative changes such as branch/index updates.
 
 Validation: `cli_git_test` uses disposable real repositories and covers clean/dirty imports,
 committed-only imports, opt-in hooks, staging preservation, imported linked worktrees after
-source deletion, absorbed, old-style, nested and uninitialized submodules and their
+source deletion, Claude Code and Codex style agent worktrees in the source and in Worlds
+(ignored or not, nested, locked, absolute or relative, hardlinked, malformed or foreign), absorbed, old-style, nested and uninitialized submodules and their
 refusals, independent commits, branch collisions, detached HEAD,
 move/discard/restore/checkpoint, hard snapshots, pooled Git forks and their setup failures,
 Git setup rollback, environment isolation and Git commits inside the exec sandbox.

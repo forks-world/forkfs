@@ -1409,7 +1409,7 @@ extern "C" const char *wfs_strerror(int rc) {
     // trees (store_layout). What every one of them has in common is this.
     case WFS_E_STORE_DAMAGED: return "the store's metadata3.db is gone, or is not a database";
     case WFS_E_GIT_IN_USE:
-        return "additional Git worktrees depend on this World; remove them with git worktree before discarding it";
+        return "Git worktrees outside this World depend on it; remove them with git worktree before discarding it";
     case WFS_E_GIT_POOL:
         // Not returned any more (Git snapshots are poolable); kept for codes older cores gave.
         return "Git snapshots cannot use the pre-clone pool in this version";

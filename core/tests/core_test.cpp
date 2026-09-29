@@ -1423,6 +1423,87 @@ static void copy_dir(const char *src, const char *dst) {
     closedir(d);
 }
 
+// PR #19 review (2nd round, P2): an AI agent's linked worktree inside the source is left out of
+// a Git import. If the agent removes it after the capture and the same directory fills up again
+// with ordinary project files before the clone, leaving the captured path out would silently drop
+// those files. The post-clone recheck wants the captured set of worktrees exactly, so the import
+// fails as busy (retryable) instead. `wfs_test_before_snapshot_clone` runs between the capture and
+// the clone, which is where the agent's cleanup lands.
+extern "C" void (*wfs_test_before_snapshot_clone)(void *ctx, const char *src_dir);
+extern "C" void *wfs_test_before_snapshot_clone_ctx;
+static const char *const kGitEnv =
+    "env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null "
+    "GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.com GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.com git";
+static void sh(const char *fmt, const char *a, const char *b = "") {
+    char cmd[16384];
+    snprintf(cmd, sizeof cmd, fmt, kGitEnv, a, b);
+    CHECK(system(cmd) == 0);
+}
+static void refill_removed_worktree(void *, const char *src_dir) {
+    sh("%s -C '%s' worktree remove --force .claude/worktrees/agent-x%s", src_dir);
+    char p[4096];
+    join(p, sizeof p, src_dir, ".claude/worktrees/agent-x");
+    CHECK(mkdir(p, 0755) == 0);
+    join(p, sizeof p, src_dir, ".claude/worktrees/agent-x/notes.txt");
+    write_file(p, "ordinary project file\n");
+}
+static void git_worktree_refilled_during_import(const char *root) {
+    if (system("git --version >/dev/null 2>&1") != 0) return;   // Git Worlds need git on PATH
+    char src[4096], store[4096], p[4096];
+    join(src, sizeof src, root, "wt-race-src");
+    join(store, sizeof store, root, "wt-race-store");
+    CHECK(mkdir(src, 0755) == 0);
+    sh("%s -c init.defaultBranch=main init -q '%s'%s", src);
+    join(p, sizeof p, src, "a.txt");
+    write_file(p, "a\n");
+    join(p, sizeof p, src, ".git/info/exclude");
+    write_file(p, "**/.claude/worktrees/\n");
+    sh("%s -C '%s' add a.txt%s", src);
+    sh("%s -C '%s' commit -qm init%s", src);
+    sh("%s -C '%s' worktree add -q .claude/worktrees/agent-x -b worktree-agent-x%s", src);
+
+    wfs_store *s = NULL;
+    CHECK_OK(wfs_store_open(store, &s));
+    wfs_snapshot_opts o;
+    memset(&o, 0, sizeof o);
+    wfs_test_before_snapshot_clone = refill_removed_worktree;
+    wfs_id id = 0;
+    int rc = wfs_snapshot_create(s, src, &o, &id);
+    wfs_test_before_snapshot_clone = NULL;
+    CHECK_RC(rc, -EBUSY);   // 0 before the fix, with notes.txt missing from the snapshot
+    // Retried with the directory now ordinary files, the import carries them.
+    CHECK_OK(wfs_snapshot_create(s, src, &o, &id));
+    wfs_snapshot_rec sr;
+    CHECK_OK(wfs_snapshot_info(s, id, &sr));
+    chmod(sr.path, 0700);   // the gate: to look, and so this test's own rm_rf can clear the tree
+    join(p, sizeof p, sr.path, ".claude/worktrees/agent-x/notes.txt");
+    struct stat st;
+    CHECK(lstat(p, &st) == 0);
+
+    // The same race when the source is a World: a checkpoint of it (PR #19 review, 3rd round).
+    // The recapture of the copy cannot see it, because the copied registration is already gone.
+    char wpath[4096];
+    join(wpath, sizeof wpath, root, "wt-race-world");
+    wfs_ref from = {WFS_K_SNAPSHOT, id};
+    wfs_fork_opts fo;
+    memset(&fo, 0, sizeof fo);
+    wfs_id w = 0;
+    CHECK_OK(wfs_world_create(s, from, wpath, &fo, &w));
+    join(p, sizeof p, wpath, ".claude/worktrees/agent-x");
+    rm_rf(p);   // the snapshot carried the refilled directory; make room for a real worktree
+    sh("%s -C '%s' worktree add -q .claude/worktrees/agent-x -b worktree-agent-y%s", wpath);
+    wfs_test_before_snapshot_clone = refill_removed_worktree;
+    rc = wfs_snapshot_create(s, wpath, &o, &id);
+    wfs_test_before_snapshot_clone = NULL;
+    CHECK_RC(rc, -EBUSY);   // 0 before the fix, with notes.txt missing from the checkpoint
+    CHECK_OK(wfs_snapshot_create(s, wpath, &o, &id));
+    CHECK_OK(wfs_snapshot_info(s, id, &sr));
+    chmod(sr.path, 0700);
+    join(p, sizeof p, sr.path, ".claude/worktrees/agent-x/notes.txt");
+    CHECK(lstat(p, &st) == 0);
+    wfs_store_close(s);
+}
+
 int main(int argc, char **argv) {
     // PR #1 review (37th round, P1): the second-process mode. It must come before anything
     // else -- the helper is this same binary, re-executed.
@@ -7892,6 +7973,8 @@ int main(int argc, char **argv) {
         snprintf(p, sizeof p, "%s/snapshots/S%llu/root", xstore, (unsigned long long)x1);
         chmod(p, 0700);   // the gate, so this test's own rm_rf can clear the tree
     }
+
+    git_worktree_refilled_during_import(root);
 
     wfs_store_close(s);
     rm_rf(root);

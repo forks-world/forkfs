@@ -14,6 +14,17 @@ struct GitHook {
     Vec<char> bytes;
     uint32_t mode = 0;
 };
+// A linked worktree registered in a repository's common directory (`worktrees/<id>`) besides the
+// checkout being imported or copied -- an AI agent's (Claude Code's `.claude/worktrees/<name>`, a
+// Codex worktree elsewhere) or the user's own. It is a separate checkout of the same repository,
+// not part of the tree: its refs and objects are the repository's and travel with it, its
+// checkout and its registration do not (collect_worktrees).
+struct GitWorktree {
+    String id;        // the registration's name under <common>/worktrees
+    String path;      // its checkout directory as registered (for messages)
+    String rel;       // that checkout relative to the tree's root, when it exists inside the tree
+    bool inside = false;   // the checkout is (or, gone, was registered) inside the tree
+};
 // The captured state of one repository -- the root, or one initialized submodule -- that the
 // import reproduces in owned administration and rechecks before publication.
 struct GitRepoState {
@@ -103,6 +114,12 @@ struct GitRepoState {
     // (`config --null --list`), rechecked against the copy before publication.
     bool gitmodules_checked = false;
     Vec<char> gitmodules;
+    // The root only: the repository's other linked worktrees. An external source lists those
+    // whose checkout is inside the tree (admitted by nested_walk, left out of the copy); a
+    // managed World lists every extra registration, whose checkouts may be anywhere.
+    Vec<GitWorktree> worktrees;
+    // The root only: the absolute common directory those registrations were read from.
+    String common;
 };
 // One initialized submodule, at any depth. Git looks for a submodule's repository in
 // `$GIT_DIR/modules/<name>` of its superproject -- for the root, the World's own per-worktree
@@ -135,10 +152,19 @@ struct GitSource : GitRepoState {
 int git_source(const char *root, bool include_changes, GitSource &out, bool committed_only = false,
                bool with_hooks = false);
 int git_import(const GitSource &source, const char *clone);
+// Exactly the tree-relative names git_import removes from the copy for `source`'s left-out
+// linked worktrees (GitSource::worktrees): each in-tree checkout, and for a managed World each
+// registration under .world-git/repo.git/worktrees. The pre-clone scan and a walked copy leave
+// them out (hardlinks_scan, fs_clone_tree); git_import removes whatever of them a whole-root
+// clone still copied.
+void git_omitted_names(const GitSource &source, Vec<String> &out);
 // The free space an external import needs on the volume holding `near`, beyond the tree clone
 // itself: each repository's rerere cache, plus its object directory's clone metadata where
 // that directory can be cloned there sharing data, or its full logical size where it is copied.
 uint64_t git_import_budget(const GitSource &source, const char *near);
 int git_discard_check(const char *root);
+// The linked worktrees the last git_import on this thread left out of its copy, one per line
+// (see wfs_git_omitted_worktrees). Cleared by the operations that import.
+void git_clear_omitted();
 int git_branch(const char *clone, wfs_id world);
 }

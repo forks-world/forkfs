@@ -31,6 +31,13 @@
 - [x] Git LFS: 支持 stock filter、owned root/submodule cache、fork/checkpoint、受限 pre-push 与
   publish 历史对象传输;自定义 filter/extension/transfer、非本地 storage 与相对 endpoint 拒绝。
   范围及测试见 [`GIT_INTEGRATION.md`](GIT_INTEGRATION.md)。
+- [x] `feat/agent-worktrees`: 与 AI 编码 agent 的 linked worktree 共存(Claude Code 的
+  `<root>/.claude/worktrees/<name>`、Codex 在仓库外的 detached worktree)。它们是同一仓库的
+  另一个 checkout,不属于 World:init 只接纳 gitdir/反向指针/commondir 三者互相吻合的源仓库
+  自己的树内 worktree,不进入、不计入干净检查、从副本删除;World 的 fork/checkpoint 在子副本里
+  删掉其他注册(及树内的 checkout),父 World 与外部目录不动;树内的不再阻止 discard,树外的
+  拒绝原因列出路径和 `git worktree remove` 命令;自有仓库设 `worktree.useRelativePaths`;
+  每个略去的 worktree 一条 note。submodule 的 linked worktree 仍拒绝。
 - [ ] Issue #7 剩余: reftable 仓库、共享 refs/对象服务、跨机器历史传输。
   范围及测试见 [`GIT_INTEGRATION.md`](GIT_INTEGRATION.md)。
 

@@ -207,22 +207,112 @@ int scan_entry(void *ctx, const char *, const char *rel, const struct stat &st, 
     return 0;
 }
 
+// The links an inode has that the caller is taking out of the published tree (`excl`).
+uint64_t excluded_links(const ScanCtx &c, uint64_t dev, uint64_t ino) {
+    for (size_t e = 0; e < c.excl.size(); ++e)
+        if (c.excl[e].dev == dev && c.excl[e].ino == ino) return c.excl[e].n;
+    return 0;
+}
+
+int ino_cmp(const void *a, const void *b) {
+    const ExclIno *x = (const ExclIno *)a, *y = (const ExclIno *)b;
+    if (x->dev != y->dev) return x->dev < y->dev ? -1 : 1;
+    if (x->ino != y->ino) return x->ino < y->ino ? -1 : (x->ino > y->ino ? 1 : 0);
+    return 0;
+}
+
+// The look into an omitted subtree (hardlinks_scan's `omit`): only for the inodes in `want`,
+// the ones whose names in the published tree fall short of their nlink.
+struct OmitCtx {
+    ScanCtx *scan;
+    const Vec<ExclIno> *want;   // sorted by (dev, ino)
+};
+
+int omit_entry(void *ctx, const char *, const char *, const struct stat &st, bool is_dir) {
+    OmitCtx *o = (OmitCtx *)ctx;
+    if (is_dir || !S_ISREG(st.st_mode) || st.st_nlink <= 1) return 0;
+    ExclIno key;
+    key.dev = (uint64_t)st.st_dev;
+    key.ino = (uint64_t)st.st_ino;
+    key.n = 0;
+    if (!::bsearch(&key, o->want->data(), o->want->size(), sizeof(ExclIno), ino_cmp)) return 0;
+    Guard g(o->scan->mu);
+    for (size_t i = 0; i < o->scan->excl.size(); ++i)
+        if (o->scan->excl[i].dev == key.dev && o->scan->excl[i].ino == key.ino) {
+            o->scan->excl[i].n++;
+            return 0;
+        }
+    key.n = 1;
+    o->scan->excl.emplace_back(key);
+    return 0;
+}
+
+bool under_name(const String &rel, const String &top) {
+    return rel.size() > top.size() && !::memcmp(rel.c_str(), top.c_str(), top.size()) &&
+           rel.c_str()[top.size()] == '/';
+}
+
 } // namespace
 
 int hardlinks_scan(const char *root, const char *exclude_rel, TreeStats *stats,
-                   HardlinkSet &out, const char *exclude_tree) {
+                   HardlinkSet &out, const char *exclude_tree, const Vec<String> *omit) {
     if (stats) *stats = TreeStats();
     out = HardlinkSet();
     ScanCtx c;
     c.stats = stats;
     c.exclude = (exclude_rel && *exclude_rel) ? exclude_rel : nullptr;
     if (exclude_tree && *exclude_tree) { c.exclude_tree = exclude_tree; c.exclude_tree_len = ::strlen(exclude_tree); }
-    if (int rc = fs_walk_tree(root, 4, FS_DIRS_PRE, &c, scan_entry)) return rc;
+    if (omit && omit->empty()) omit = nullptr;
+    // The omitted subtrees are pruned from the walk (fs_walk_tree): not entries of this tree,
+    // not in its space budget, and never read -- an unreadable or enormous one cannot fail it.
+    if (int rc = fs_walk_tree(root, 4, FS_DIRS_PRE, &c, scan_entry, omit)) return rc;
     if (c.recs.empty()) return 0;
 
     // Group by backing inode. The walk order is four threads deep, so the names of a group are
     // sorted afterwards: the canonical name must not depend on which thread got there first.
     ::qsort(c.recs.data(), c.recs.size(), sizeof(Rec), rec_cmp);
+
+    // A name inside an omitted subtree leaves the tree exactly as one inside `exclude_tree`
+    // does, and must not make its group external either. The pruned walk did not see those
+    // names, so the inodes that would otherwise come out external -- fewer names here than
+    // links, after the exclusions already counted -- are looked for below the omitted names,
+    // and only then: in the ordinary case (no such inode) nothing below them is ever read.
+    // That look is best effort. What it cannot read (an unreadable directory, a checkout
+    // removed meanwhile) is left unread and the walk's error dropped: a name that could not be
+    // found there is reported external, which is still true of the published tree -- its file is
+    // a plain file either way and the name is outside it. Only the counts can differ.
+    if (omit) {
+        Vec<ExclIno> want;
+        for (size_t i = 0; i < c.recs.size();) {
+            size_t j = i + 1;
+            while (j < c.recs.size() && c.recs[j].dev == c.recs[i].dev && c.recs[j].ino == c.recs[i].ino) ++j;
+            uint64_t x = excluded_links(c, c.recs[i].dev, c.recs[i].ino);
+            if ((uint64_t)(j - i) + x < c.recs[i].nlink) {
+                ExclIno e;
+                e.dev = c.recs[i].dev;
+                e.ino = c.recs[i].ino;
+                e.n = 0;
+                want.emplace_back(e);
+            }
+            i = j;
+        }
+        if (want.size()) {
+            ::qsort(want.data(), want.size(), sizeof(ExclIno), ino_cmp);
+            OmitCtx o{&c, &want};
+            for (size_t t = 0; t < omit->size(); ++t) {
+                // A name nested in another omitted name is walked with it, not twice.
+                bool nested = false;
+                for (size_t u = 0; u < omit->size() && !nested; ++u)
+                    nested = u != t && under_name((*omit)[t], (*omit)[u]);
+                if (nested || (*omit)[t].empty()) continue;
+                String sub(root);
+                sub.append("/");
+                sub.append((*omit)[t].c_str());
+                (void)fs_walk_tree(sub.c_str(), 4, FS_DIRS_PRE, &o, omit_entry);
+            }
+        }
+    }
+
     size_t i = 0;
     while (i < c.recs.size()) {
         size_t j = i + 1;
@@ -239,11 +329,8 @@ int hardlinks_scan(const char *root, const char *exclude_rel, TreeStats *stats,
         // and the snapshot went out with two independent files. Only a name that is really
         // outside this tree may make a group external.
         uint64_t nl = c.recs[i].nlink;
-        for (size_t e = 0; e < c.excl.size(); ++e)
-            if (c.excl[e].dev == c.recs[i].dev && c.excl[e].ino == c.recs[i].ino) {
-                nl = c.excl[e].n < nl ? nl - c.excl[e].n : 0;
-                break;
-            }
+        uint64_t x = excluded_links(c, c.recs[i].dev, c.recs[i].ino);
+        nl = x < nl ? nl - x : 0;
         // One name left after the exclusion, and no link of that inode anywhere else: not a
         // group (a group is two names or it is nothing) and not external either. It is a plain
         // file in the published tree, so it is also not one of the tree's hardlinked files --

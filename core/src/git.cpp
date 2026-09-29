@@ -22,8 +22,9 @@ String joinp(const char *a, const char *b) { String s(a); s.append("/"); s.appen
 constexpr const char *marker = "gitdir: .world-git/repo.git/worktrees/active\n";
 
 // The reason for the last Git refusal on this thread, for wfs_git_reason(). Every
-// WFS_E_GIT_UNSUPPORTED / WFS_E_GIT_POLICY this file returns goes through refuse().
-thread_local char g_reason[512];
+// WFS_E_GIT_UNSUPPORTED / WFS_E_GIT_POLICY / WFS_E_GIT_IN_USE this file returns goes through
+// refuse(); a discard refusal names paths, hence the room.
+thread_local char g_reason[2048];
 int refuse(int code, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     vsnprintf(g_reason, sizeof g_reason, fmt, ap);
@@ -33,8 +34,8 @@ int refuse(int code, const char *fmt, ...) {
 // Never use a shell, source hooks, inherited GIT_DIR/INDEX_FILE, or lazy network fetches.
 // `ambient_config_probe` keeps the user's global/system configuration (and GIT_CONFIG_* command
 // configuration) so a check sees files the way the user's own Git does; `stdin_fd`, when >= 0,
-// becomes the child's standard input.
-int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, int *exit_code = nullptr, bool quiet_stderr = false, bool ambient_config_probe = false, int stdin_fd = -1, bool skip_lfs_smudge = false, bool no_system_attributes = false) {
+// becomes the child's standard input, and `stderr_fd`, when >= 0, its standard error.
+int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, int *exit_code = nullptr, bool quiet_stderr = false, bool ambient_config_probe = false, int stdin_fd = -1, bool skip_lfs_smudge = false, bool no_system_attributes = false, int stderr_fd = -1) {
     if (exit_code) *exit_code = -1;
     Vec<char *> av;
     const char *prefix[] = {"git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
@@ -69,7 +70,8 @@ int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, i
     if (rc) { close(pipefd[0]); close(pipefd[1]); return -rc; }
     rc = posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
     if (!rc && stdin_fd >= 0) rc = posix_spawn_file_actions_adddup2(&actions, stdin_fd, STDIN_FILENO);
-    if (!rc && quiet_stderr)
+    if (!rc && stderr_fd >= 0) rc = posix_spawn_file_actions_adddup2(&actions, stderr_fd, STDERR_FILENO);
+    else if (!rc && quiet_stderr)
         rc = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
     pid_t pid = 0;
     if (!rc) rc = posix_spawnp(&pid, "git", &actions, nullptr, av.data(), env.data());
@@ -105,6 +107,21 @@ int value(const char *root, const char *const *args, String &out, bool missing_o
     out.assign(bytes.data());
     if (!out.empty() && out.back() == '\n') out.pop_back();
     return 0;
+}
+// A command whose progress chatter is noise on success (`worktree repair` reports each link it
+// rewrites): its standard error is held back and shown only when it fails, so the diagnostic
+// that explains a failure is never lost.
+int git_diagnose_on_failure(const char *cwd, const char *const *args) {
+    FILE *errors = tmpfile();
+    if (!errors) return -errno;
+    int rc = git(cwd, args, nullptr, nullptr, false, false, -1, false, false, fileno(errors));
+    if (rc == WFS_E_GIT_FAILED) {
+        rewind(errors);
+        char buf[4096]; size_t n;
+        while ((n = fread(buf, 1, sizeof buf, errors)) > 0) fwrite(buf, 1, n, stderr);
+    }
+    fclose(errors);
+    return rc;
 }
 // Older Git LFS releases hash pointer payloads directly but do not accept
 // --no-extensions. Newer releases need that flag to avoid running configured
@@ -205,14 +222,117 @@ const Gitlink *find_link(const Vec<Gitlink> &links, const char *path) {
     for (const auto &l : links) if (l.path == path) return &l;
     return nullptr;
 }
+int list_names(int fd, Vec<String> &out);
+String absolute_lexical(const char *base, const char *rel);
+// One of Git's one-line link files -- a registration's `gitdir` or `commondir`, a linked
+// worktree's `.git` (`prefix` "gitdir: ") -- with a relative target resolved against `base`, the
+// way Git reads it. False for anything but a regular file holding exactly one such line.
+bool read_link_file(const String &path, const char *prefix, const String &base, String &out) {
+    struct stat st;
+    if (lstat(path.c_str(), &st) || !S_ISREG(st.st_mode) || st.st_size > 16 * 1024) return false;
+    Vec<char> bytes;
+    if (read_bytes(path.c_str(), bytes)) return false;
+    size_t n = bytes.size(), p = strlen(prefix);
+    if (n && bytes[n - 1] == '\n') --n;
+    if (n <= p || memcmp(bytes.data(), prefix, p)) return false;
+    for (size_t i = p; i < n; ++i) if (bytes[i] == '\n' || bytes[i] == '\r' || !bytes[i]) return false;
+    String target(bytes.data() + p, n - p);
+    out = target[0] == '/' ? target : joinp(base.c_str(), target.c_str());
+    return true;
+}
+// Whether `path` lies strictly below `root` (both spelled the same way); `rel` gets the rest.
+bool under_root(const String &path, const String &root, String *rel) {
+    size_t n = root.size();
+    if (path.size() <= n + 1 || strncmp(path.c_str(), root.c_str(), n) || path[n] != '/') return false;
+    if (rel) rel->assign(path.c_str() + n + 1);
+    return true;
+}
+// The linked worktrees registered in `common` other than the checkout at `root` (whose own
+// administration is `self`), with where each checkout lies (GitWorktree). A checkout inside the
+// tree is listed only when it is exactly what its registration describes: its `.git` is a
+// regular file whose gitdir resolves to that registration, the registration's gitdir resolves
+// to this checkout and its commondir to `common`. Anything else there is left to nested_walk,
+// which refuses it. A checkout under the reserved `.git`, `.world` or `.world-git` names is never
+// admitted.
+//
+// An external source (`strict` false) needs only the admitted in-tree checkouts: its other
+// registrations stay in the source and are not imported. A managed World (`strict`) lists every
+// registration, because each one would be copied with its .world-git: one that cannot be read,
+// or whose checkout is in the tree but does not link back, is refused rather than guessed at. A
+// registered checkout that no longer exists is `inside` when its registered path is in the tree.
+int collect_worktrees(const char *root, const char *common, const char *self, bool strict, Vec<GitWorktree> &out) {
+    out.clear();
+    String dir = joinp(common, "worktrees");
+    int fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) return 0;
+        return strict ? refuse(WFS_E_GIT_UNSUPPORTED, "the World's Git worktrees directory is not a directory") : -errno;
+    }
+    Vec<String> names;
+    int rc = list_names(fd, names);
+    close(fd);
+    if (rc) return rc;
+    String real_root, real_common, real_self;
+    if ((rc = fs_realpath(root, real_root)) || (rc = fs_realpath(common, real_common)) ||
+        (rc = fs_realpath(self, real_self))) return rc;
+    String lexical_root = absolute_lexical("/", root);
+    for (const auto &name : names) {
+        String admin = joinp(dir.c_str(), name.c_str()), real_admin, link;
+        struct stat st;
+        if (lstat(admin.c_str(), &st) || !S_ISDIR(st.st_mode) || fs_realpath(admin.c_str(), real_admin)) {
+            if (strict) return refuse(WFS_E_GIT_UNSUPPORTED, "the World's linked worktree registration %s is not a directory", name.c_str());
+            continue;
+        }
+        if (real_admin == real_self) continue;
+        String gitdir = joinp(admin.c_str(), "gitdir");
+        if (!read_link_file(gitdir, "", admin, link) || link.size() < 6 || strcmp(link.c_str() + link.size() - 5, "/.git")) {
+            if (strict) return refuse(WFS_E_GIT_UNSUPPORTED, "the World's linked worktree registration %s has no readable gitdir link", name.c_str());
+            continue;
+        }
+        GitWorktree w;
+        w.id = name;
+        w.path = absolute_lexical("/", String(link.c_str(), link.size() - 5).c_str());
+        String real_checkout;
+        if (fs_realpath(w.path.c_str(), real_checkout)) {
+            // Gone (a prunable registration): nothing of it is left in the tree to leave out.
+            w.inside = under_root(w.path, lexical_root, nullptr) || under_root(w.path, real_root, nullptr);
+        } else if (under_root(real_checkout, real_root, &w.rel)) {
+            w.inside = true;
+            const char *slash = strchr(w.rel.c_str(), '/');
+            String first(w.rel.c_str(), slash ? (size_t)(slash - w.rel.c_str()) : w.rel.size());
+            bool reserved = first == ".git" || first == ".world" || first == ".world-git";
+            String back, real_back, common_link, real_common_link;
+            bool linked = !reserved &&
+                read_link_file(joinp(real_checkout.c_str(), ".git"), "gitdir: ", real_checkout, back) &&
+                !fs_realpath(back.c_str(), real_back) && real_back == real_admin &&
+                read_link_file(joinp(admin.c_str(), "commondir"), "", admin, common_link) &&
+                !fs_realpath(common_link.c_str(), real_common_link) && real_common_link == real_common;
+            if (!linked) {
+                if (strict) return refuse(WFS_E_GIT_UNSUPPORTED,
+                    "the World's linked worktree %s at %s does not link back to its registration", name.c_str(), w.rel.c_str());
+                continue;
+            }
+        }
+        if (!strict && w.rel.empty()) continue;
+        out.emplace_back(w);
+    }
+    return 0;
+}
+bool is_omitted_worktree(const Vec<GitWorktree> *worktrees, const String &rel) {
+    if (worktrees) for (const auto &w : *worktrees) if (!w.rel.empty() && w.rel == rel) return true;
+    return false;
+}
 // A nested repository cannot be made safe by fixing only the root's .git file. The only nested
 // `.git` admitted is a submodule's: a directory that this repository's index records as a
 // gitlink (`links`), which discover_modules then validates, captures and walks on its own.
 // Everything else with a `.git` below the root -- a plain nested repository, a `.git` inside an
 // uninitialized submodule's directory -- is refused. The walk's own top may hold its `.git`; only
 // the top of the tree itself (`world_root`) may also hold the World's `.world-git`, never a
-// submodule's top.
-int nested_walk(const String &dir_path, const String &rel, const Vec<Gitlink> *links, bool world_root) {
+// submodule's top. The checkouts of the root repository's other linked worktrees (`worktrees`,
+// validated by collect_worktrees) are not part of the tree and are not entered: whatever is
+// below one -- an agent's own nested worktrees included -- goes with it.
+int nested_walk(const String &dir_path, const String &rel, const Vec<Gitlink> *links, bool world_root,
+                const Vec<GitWorktree> *worktrees) {
     bool top = rel.empty();
     DIR *dir = opendir(dir_path.c_str());
     if (!dir) return -errno;
@@ -237,16 +357,20 @@ int nested_walk(const String &dir_path, const String &rel, const Vec<Gitlink> *l
             if (!lstat(dot.c_str(), &st)) continue;   // an initialized submodule
             if (errno != ENOENT) { rc = -errno; break; }
         }
-        if ((rc = nested_walk(path, child, links, world_root))) break;
+        if (is_omitted_worktree(worktrees, child)) continue;
+        if ((rc = nested_walk(path, child, links, world_root, worktrees))) break;
     }
     closedir(dir); return rc;
 }
-int nested_check(const char *root, const Vec<Gitlink> *links, bool world_root) {
-    return nested_walk(String(root), String(), links, world_root);
+int nested_check(const char *root, const Vec<Gitlink> *links, bool world_root,
+                 const Vec<GitWorktree> *worktrees = nullptr) {
+    return nested_walk(String(root), String(), links, world_root, worktrees);
 }
 // A managed tree may be copied without consulting an external repository only when all
-// administration stays inside it. Reject changed common-dir pointers and additional worktrees.
-int managed_check(const char *root, const char *common, const char *admin) {
+// administration stays inside it. Reject changed common-dir pointers. Additional linked
+// worktrees -- an agent's, created inside the World or elsewhere -- are listed in `worktrees`
+// (collect_worktrees): a copy leaves them out (omit_worktrees), so they are validated here.
+int managed_check(const char *root, const char *common, const char *admin, Vec<GitWorktree> &worktrees) {
     String repo = joinp(root, ".world-git/repo.git"), active = joinp(repo.c_str(), "worktrees/active");
     String expected, actual;
     if (fs_realpath(repo.c_str(), expected) || fs_realpath(common, actual) || expected != actual)
@@ -290,9 +414,6 @@ int managed_check(const char *root, const char *common, const char *admin) {
                 rc = refuse(WFS_E_GIT_UNSUPPORTED, "the World's Git administration contains a symlink or special file at %s", child.c_str());
                 break;
             }
-            if (path == joinp(repo.c_str(), "worktrees") && strcmp(e->d_name, "active")) {
-                rc = refuse(WFS_E_GIT_UNSUPPORTED, "the World has an additional linked worktree (%s)", e->d_name); break;
-            }
             if (S_ISDIR(st.st_mode) && !strcmp(e->d_name, "worktrees") && !strncmp(path.c_str(), modules.c_str(), modules.size())) {
                 String head = joinp(path.c_str(), "HEAD");
                 if (!lstat(head.c_str(), &st)) {
@@ -303,7 +424,7 @@ int managed_check(const char *root, const char *common, const char *admin) {
         }
         closedir(d); if (rc) return rc;
     }
-    return 0;
+    return collect_worktrees(root, repo.c_str(), active.c_str(), true, worktrees);
 }
 int config(const char *root, const char *key, const char *val) {
     const char *args[] = {"config", "--local", key, val, nullptr};
@@ -2288,9 +2409,23 @@ int activate_managed_target_lfs(const GitRepoState &s, const char *worktree, con
 // included, before anything checked them. Each submodule's own worktree is checked by a direct
 // call on it instead (require_clean_copy, git_source). The command-line value also overrides
 // submodule.<name>.ignore and diff.ignoreSubmodules, so neither can hide a moved submodule.
-int require_clean_tree(const char *root) {
-    const char *status_args[] = {"status", "--porcelain=v1", "-z", "--untracked-files=normal", "--ignore-submodules=dirty",
-        "--", ".", ":(exclude).world", ":(exclude).world-git", nullptr};
+// The checkouts of the repository's other linked worktrees inside the tree (`worktrees`) are not
+// part of it -- status in the main checkout lists one that is not ignored as an untracked
+// directory -- so exactly those paths are excluded.
+int require_clean_tree(const char *root, const Vec<GitWorktree> *worktrees = nullptr) {
+    Vec<String> excludes;
+    if (worktrees) for (const auto &w : *worktrees) {
+        if (w.rel.empty()) continue;
+        String exclude(":(exclude,top,literal)");
+        exclude.append(w.rel.c_str());
+        excludes.emplace_back(exclude);
+    }
+    Vec<const char *> status_args;
+    for (const char *a : {"status", "--porcelain=v1", "-z", "--untracked-files=normal", "--ignore-submodules=dirty",
+                          "--", ".", ":(exclude).world", ":(exclude).world-git"})
+        status_args.emplace_back(a);
+    for (const auto &e : excludes) status_args.emplace_back(e.c_str());
+    status_args.emplace_back(nullptr);
     Vec<char> dirty;
     // With the user's own global/system configuration (global ignores, autocrlf, ...), so
     // "clean" means what `git status` in the source and in the World both say.
@@ -2302,15 +2437,18 @@ int require_clean_tree(const char *root) {
         if (!mkdtemp(scratch)) return -errno;
         String storage(scratch); storage.append("/storage");
         String storage_config("lfs.storage="); storage_config.append(storage.c_str());
-        const char *args[] = {"-c", "filter.lfs.process=git-lfs filter-process --skip", "-c",
-            "filter.lfs.smudge=git-lfs smudge --skip -- %f", "-c",
-            storage_config.c_str(), "status", "--porcelain=v1", "-z", "--untracked-files=normal",
-            "--ignore-submodules=dirty", "--", ".", ":(exclude).world", ":(exclude).world-git", nullptr};
-        rc = git(root, args, &dirty, nullptr, false, true);
+        Vec<const char *> args;
+        for (const char *a : {"-c", "filter.lfs.process=git-lfs filter-process --skip", "-c",
+                              "filter.lfs.smudge=git-lfs smudge --skip -- %f", "-c"})
+            args.emplace_back(a);
+        args.emplace_back(storage_config.c_str());
+        for (const char *const *a = status_args.data(); *a; ++a) args.emplace_back(*a);
+        args.emplace_back(nullptr);
+        rc = git(root, args.data(), &dirty, nullptr, false, true);
         int cleanup = fs_remove_tree(scratch);
         if (!rc && cleanup) rc = cleanup;
     } else {
-        rc = git(root, status_args, &dirty, nullptr, false, true);
+        rc = git(root, status_args.data(), &dirty, nullptr, false, true);
     }
     if (rc) return rc;
     return dirty.size() > 1 ? WFS_E_GIT_DIRTY : 0;
@@ -3079,8 +3217,11 @@ int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool modu
         String real_common, real_admin;
         if (fs_realpath(common.c_str(), real_common) || fs_realpath(out.admin.c_str(), real_admin) || real_common != real_admin)
             return refuse(WFS_E_GIT_UNSUPPORTED, "its repository is a linked worktree of another repository");
-    } else if (out.managed && (rc = managed_check(root, common.c_str(), out.admin.c_str()))) {
-        return rc;
+    } else {
+        out.common = common;
+        if (out.managed) rc = managed_check(root, common.c_str(), out.admin.c_str(), out.worktrees);
+        else rc = collect_worktrees(root, common.c_str(), out.admin.c_str(), false, out.worktrees);
+        if (rc) return rc;
     }
     if ((rc = reject_external_visibility_state(root, out.managed))) return rc;
     if ((rc = capture_refs(root, out.refs))) return rc;
@@ -3533,7 +3674,14 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
     if (committed_only) {
         if (int rc = committed_hooks_check(root, out, nullptr)) return rc;
     }
-    if (int rc = nested_check(root, &gitlinks, true)) return rc;
+    // Only the root repository's own linked worktrees are left out; one checked out at or inside
+    // a submodule's path is part of that submodule's tree, which is not something to remove.
+    for (const auto &w : out.worktrees) for (const auto &l : gitlinks) {
+        String under;
+        if (!w.rel.empty() && (w.rel == l.path || under_root(w.rel, l.path, &under)))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "a linked worktree of the repository is checked out in submodule path %s", l.path.c_str());
+    }
+    if (int rc = nested_check(root, &gitlinks, true, &out.worktrees)) return rc;
     out.has_gitlinks = !gitlinks.empty();
     // With --committed-only the copy is reset to HEAD and must then be clean; the source's own
     // uncommitted state is simply not carried, so it is not a reason to refuse.
@@ -3543,7 +3691,7 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
         return rc;
     if (!include_changes && !committed_only) {
         // Every repository's policy checks have run by now, so no status below runs a filter.
-        if (int rc = require_clean_tree(root)) return rc;
+        if (int rc = require_clean_tree(root, &out.worktrees)) return rc;
         for (const auto &m : out.modules)
             if (int rc = require_clean_tree(m.repo.root.c_str())) return rc;
     }
@@ -3980,7 +4128,12 @@ int import_root(const GitSource &s, const char *clone) {
     if (int rc = fs_remove_tree(dot.c_str())) return rc;
     if (int rc = write_text(clone, ".git", marker)) return rc;
     const char *repair[] = {"worktree", "repair", "--relative-paths", nullptr};
-    if (int rc = git(clone, repair)) return rc;
+    if (int rc = git_diagnose_on_failure(clone, repair)) return rc;
+    // Linked worktrees created in the World later -- an AI agent's `.claude/worktrees/<name>`,
+    // say -- get relative links too, so one inside the tree keeps working when the World is
+    // moved, trashed and restored. Any copy leaves such worktrees out (omit_worktrees).
+    const char *relative[] = {"--git-dir", repo.c_str(), "config", "worktree.useRelativePaths", "true", nullptr};
+    if (int rc = git(clone, relative)) return rc;
     // The only entry in the disposable no-checkout directory is its gitfile.
     String old_dot = joinp(active.c_str(), ".git");
     if (unlink(old_dot.c_str()) || rmdir(active.c_str())) return -errno;
@@ -4109,9 +4262,84 @@ uint64_t git_import_budget(const GitSource &s, const char *near) {
     }
     return total;
 }
+// wfs_git_omitted_worktrees(): what the last import on this thread left out, one per line.
+thread_local String g_omitted;
+// Removes `rel` below `clone` -- a copy this import owns and nothing else writes -- without
+// following a symlink on the way: a component that changed in the source after it was captured
+// cannot turn the removal into one outside the copy. Already gone is fine (a worktree nested in
+// one removed before it).
+int remove_below(const char *clone, const String &rel) {
+    String path(clone);
+    size_t start = 0;
+    for (size_t i = 0; i <= rel.size(); ++i) {
+        if (i < rel.size() && rel[i] != '/') continue;
+        path.push_back('/');
+        path.append(rel.c_str() + start, i - start);
+        start = i + 1;
+        struct stat st;
+        if (lstat(path.c_str(), &st)) return errno == ENOENT ? 0 : -errno;
+        if (!S_ISDIR(st.st_mode)) return -EBUSY;
+    }
+    return fs_remove_tree(path.c_str());
+}
+// A managed World's registration of the linked worktree `w`, relative to the World's root.
+String worktree_registration(const GitWorktree &w) {
+    String admin(".world-git/repo.git/worktrees/");
+    admin.append(w.id.c_str());
+    return admin;
+}
+// The source's or parent World's other linked worktrees (GitWorktree) are separate checkouts
+// of the repository, not part of the tree: the copy gets the repository's refs and objects --
+// so their branches and commits -- but not their checkouts or their uncommitted state. Their
+// checkouts inside the tree are removed from the copy; a managed World's copy also drops their
+// registrations, which would otherwise make the child's Git believe it had checkouts that
+// belong to the parent (a branch checked out there could not be checked out in the child). The
+// source, the parent and anything outside the tree are never touched.
+// The copy may not have them at all: a walked copy (fs_clone_tree's `omit`) never made them,
+// and remove_below takes that as done. A whole-root clonefile(2) copied them and they go here.
+int omit_worktrees(const GitSource &s, const char *clone) {
+    for (const auto &w : s.worktrees) {
+        if (s.managed)
+            if (int rc = remove_below(clone, worktree_registration(w))) return rc;
+        if (!w.rel.empty())
+            if (int rc = remove_below(clone, w.rel)) return rc;
+        g_omitted.append(w.rel.empty() ? w.path.c_str() : w.rel.c_str());
+        g_omitted.push_back('\n');
+    }
+    return 0;
+}
+void git_omitted_names(const GitSource &s, Vec<String> &out) {
+    out.clear();
+    if (!s.present) return;
+    for (const auto &w : s.worktrees) {
+        if (s.managed) out.emplace_back(worktree_registration(w));
+        if (!w.rel.empty()) out.emplace_back(w.rel);
+    }
+}
 int git_import(const GitSource &s, const char *clone) {
+    g_omitted.clear();
     if (!s.present) return 0;
     if (int rc = sources_unchanged(s)) return rc;
+    if (int rc = omit_worktrees(s, clone)) return rc;
+    {
+        // The source's linked worktrees -- an external source's or a World's -- must still be
+        // exactly the captured ones after the clone. One added meanwhile may have been cloned
+        // with a `.git` leading back into the source's administration (Git registers a worktree
+        // before it checks one out, so its registration shows it). One removed meanwhile (an
+        // agent's cleanup) is a change too: its directory may have been refilled with ordinary
+        // project files before the clone, which leaving the captured path out would silently
+        // drop -- and a managed copy's recapture below cannot see that, since omit_worktrees has
+        // already removed the copied registration. Any difference is a retryable busy. A World
+        // is read as strictly as it was captured.
+        Vec<GitWorktree> now;
+        if (int rc = collect_worktrees(s.root.c_str(), s.common.c_str(), s.admin.c_str(), s.managed, now)) return rc;
+        if (now.size() != s.worktrees.size()) return -EBUSY;
+        for (const auto &w : now) {
+            bool known = false;
+            for (const auto &c : s.worktrees) if (c.id == w.id && c.rel == w.rel) known = true;
+            if (!known) return -EBUSY;
+        }
+    }
     if (!s.managed) {
         if (int rc = import_root(s, clone)) return rc;
         for (const auto &m : s.modules)
@@ -4131,7 +4359,8 @@ int git_import(const GitSource &s, const char *clone) {
         // is caught here even when the source looks unchanged again by the time cloning ends.
         GitSource copy;
         if (int rc = git_source(clone, !s.committed_only, copy, s.committed_only)) return rc;
-        if (!same_capture(copy, s) || !same_modules(copy, s)) return -EBUSY;
+        // A worktree registered after the capture was copied but not omitted.
+        if (!same_capture(copy, s) || !same_modules(copy, s) || !copy.worktrees.empty()) return -EBUSY;
         if (int rc = reject_copied_locks(clone)) return rc;
         if (s.lfs_target_only) {
             String repo = joinp(clone, ".world-git/repo.git");
@@ -4181,32 +4410,53 @@ int modules_in_use(const String &dir, int depth) {
             rc = list_names(wfd, entries);
             close(wfd);
             if (rc) return rc;
-            if (!entries.empty()) return WFS_E_GIT_IN_USE;
+            if (!entries.empty())
+                return refuse(WFS_E_GIT_IN_USE, "a submodule repository of the World has a linked worktree (%s)", child.c_str());
             continue;
         }
         if ((rc = modules_in_use(child, depth + 1))) return rc;
     }
     return 0;
 }
+// A linked worktree whose checkout is inside the World goes to the trash with it, registration
+// and all, and comes back with it on restore. One outside it would be left with a `.git` pointing
+// into a discarded tree, so it blocks the discard until it is removed with Git; the refusal names
+// each such checkout and the command.
 int git_discard_check(const char *root) {
+    g_reason[0] = '\0';
     String owned = joinp(root, ".world-git"); struct stat st;
     bool managed = lstat(owned.c_str(), &st) == 0;
     if (!managed && errno != ENOENT) return -errno;
-    String dir = joinp(root, managed ? ".world-git/repo.git/worktrees" : ".git/worktrees");
+    String repo = joinp(root, managed ? ".world-git/repo.git" : ".git"), dir = joinp(repo.c_str(), "worktrees");
     int fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) return errno == ENOENT || errno == ENOTDIR ? 0 : -errno;
-    DIR *d = fdopendir(fd);
-    if (!d) { int rc = -errno; close(fd); return rc; }
-    int rc = 0;
-    for (;;) {
-        errno = 0; dirent *e = readdir(d);
-        if (!e) { if (errno) rc = -errno; break; }
-        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-        if (managed && !strcmp(e->d_name, "active")) continue;
-        rc = WFS_E_GIT_IN_USE; break;
+    Vec<String> names;
+    int rc = list_names(fd, names);
+    close(fd);
+    if (rc) return rc;
+    bool others = false;
+    for (const auto &name : names) if (!managed || name != "active") others = true;
+    if (others && !managed)
+        return refuse(WFS_E_GIT_IN_USE, "the tree's repository has linked worktrees; remove them with "
+                      "`git -C %s worktree remove <path>`", root);
+    if (others) {
+        String active = joinp(dir.c_str(), "active");
+        Vec<GitWorktree> worktrees;
+        // A registration whose checkout cannot be placed is not known to be inside the World.
+        if (collect_worktrees(root, repo.c_str(), active.c_str(), true, worktrees))
+            return refuse(WFS_E_GIT_IN_USE, "the World's linked worktree registrations cannot be read; remove its "
+                          "other worktrees with `git -C %s worktree remove <path>` or `git -C %s worktree prune`", root, root);
+        String outside;
+        for (const auto &w : worktrees) {
+            if (w.inside) continue;
+            if (!outside.empty()) outside.append(", ");
+            outside.append(w.path.c_str());
+        }
+        if (!outside.empty())
+            return refuse(WFS_E_GIT_IN_USE, "linked worktrees outside the World depend on it: %s; remove each with "
+                          "`git -C %s worktree remove <path>` (`git -C %s worktree prune` for one that no longer exists)",
+                          outside.c_str(), root, root);
     }
-    closedir(d);
-    if (rc || !managed) return rc;
     // A linked worktree of one of the World's submodules would be left pointing at nothing too.
     return modules_in_use(joinp(root, ".world-git/repo.git/worktrees/active/modules"), 0);
 }
@@ -4255,6 +4505,10 @@ int git_branch(const char *clone, wfs_id world) {
     GitSource s;
     if (int rc = git_source(clone, true, s)) return rc;
     if (!s.managed) return refuse(WFS_E_GIT_UNSUPPORTED, "not a WorldFS-managed Git World");
+    // Every copy leaves the other linked worktrees out (omit_worktrees), and snapshots are copies,
+    // so a new World that still has one was not made by this code.
+    if (!s.worktrees.empty())
+        return refuse(WFS_E_GIT_UNSUPPORTED, "the World has an additional linked worktree (%s)", s.worktrees[0].id.c_str());
     Vec<char> refs;
     const char *list_refs[] = {"for-each-ref", "--format=%(refname)", "refs/heads/", nullptr};
     if (int rc = git(clone, list_refs, &refs)) return rc;
@@ -4810,6 +5064,10 @@ int publish_lfs(const char *world, const char *target, const String &now) {
 }
 
 extern "C" const char *wfs_git_reason(void) { return wfs::g_reason; }
+namespace wfs {
+void git_clear_omitted() { g_omitted.clear(); }
+}
+extern "C" const char *wfs_git_omitted_worktrees(void) { return wfs::g_omitted.c_str(); }
 
 extern "C" int wfs_git_uncarried_hooks(const char *root) {
     if (!root) return -EINVAL;
@@ -4888,14 +5146,16 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
     if (!info.present) return refuse(WFS_E_GIT_UNSUPPORTED, "the World has no WorldFS-managed Git repository");
     // Same protection as fork/checkpoint: a symlinked or foreign administration must not be
     // published as this World. wfs_git_inspect only follows the fixed .git marker; it does not
-    // validate that .world-git and everything beneath it are still the World's own.
+    // validate that .world-git and everything beneath it are still the World's own. The World's
+    // other linked worktrees are separate checkouts; publishing sends only its branch.
+    Vec<GitWorktree> worktrees;
     {
         String common, admin;
         const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
         const char *admin_args[] = {"rev-parse", "--absolute-git-dir", nullptr};
         int rc;
         if ((rc = value(world_root, common_args, common)) || (rc = value(world_root, admin_args, admin))) return rc;
-        if ((rc = managed_check(world_root, common.c_str(), admin.c_str()))) return rc;
+        if ((rc = managed_check(world_root, common.c_str(), admin.c_str(), worktrees))) return rc;
     }
     // Import guarantees the preserved history is clean (reject_reserved_paths), so a commit that
     // tracks .world or .world-git can only have been made afterwards, by force-adding a reserved
@@ -4997,7 +5257,7 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
         String path = joinp(world_root, m.c_str());
         if (int rc = reject_used_filters(path.c_str())) return in_module(rc, m);
     }
-    int dirty = require_clean_tree(world_root);
+    int dirty = require_clean_tree(world_root, &worktrees);
     for (size_t i = 0; !dirty && i < modules.size(); ++i) {
         String path = joinp(world_root, modules[i].c_str());
         dirty = require_clean_tree(path.c_str());
