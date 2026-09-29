@@ -8,10 +8,14 @@
 // 0 = ok, 1 = error, 2 = usage, 3 = refused by a safety rule (docs/M1_DESIGN.md §3).
 #include "worldfs/worldfs.h"
 #include "json.h"
+#include "exec_guard.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <spawn.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -92,7 +96,8 @@ static void usage(int code = EX_USAGE) {
           "  world exec W<n> [--no-sandbox|--require-sandbox] -- <cmd...>\n"
           "                                   run <cmd> in the world: cwd = its root, WORLD_* in the\n"
           "                                   environment, an exec lock, and a seatbelt profile that\n"
-          "                                   denies writes outside this world\n"
+          "                                   denies writes outside this world and to its Git hooks;\n"
+          "                                   changed Git settings that run commands are reported\n"
           "  world version | --help\n"
           "options: --store <dir> (or $WORLD_STORE) selects the metadata store\n",
           code == EX_OK ? stdout : stderr);
@@ -1951,6 +1956,439 @@ static int cmd_adopt(wfs_store *s, int argc, char **argv) {
 // Seatbelt rule order matters: the LAST matching rule wins, so every allow is written first
 // and the denies come last, which makes them absolute.
 
+// ---- the World's Git administration -----------------------------------------------------------
+//
+// A command in the World can write the World's Git administration (.world-git/repo.git). A hook,
+// core.fsmonitor, a filter or a credential helper planted there runs later OUTSIDE any sandbox, the
+// next time the user runs Git in the World. So the sandbox denies writes to every hooks directory
+// (and to the entries that locate those directories), and exec reports afterwards when a Git
+// setting that runs a command, or a hook, changed. Configuration itself stays writable: `git
+// remote add`, `git push -u`, `git branch --set-upstream-to` and `git config` legitimately write it.
+
+struct StrList { char **v; size_t n, cap; };
+
+static void sl_push(StrList *l, const char *s) {
+    if (l->n == l->cap) {
+        size_t cap = l->cap ? l->cap * 2 : 16;
+        char **v = (char **)realloc(l->v, cap * sizeof *v);
+        if (!v) return;
+        l->v = v; l->cap = cap;
+    }
+    char *d = strdup(s);
+    if (d) l->v[l->n++] = d;
+}
+
+static void sl_free(StrList *l) {
+    for (size_t i = 0; i < l->n; ++i) free(l->v[i]);
+    free(l->v);
+    memset(l, 0, sizeof *l);
+}
+
+struct GitAdmin {
+    char root[WFS_PATH_MAX];     // the World root, resolved
+    char common[WFS_PATH_MAX];   // <root>/.world-git/repo.git
+    char active[WFS_PATH_MAX];   // <common>/worktrees/active: the World's own worktree
+    char modules[WFS_PATH_MAX];  // <active>/modules: submodule repositories (Git keeps them per worktree)
+    StrList gitdirs;             // submodule repositories found below `modules`, parents first
+    StrList pins;                // directories on the way to them, whose renaming would swap a repository
+    // The World's effective core.hooksPath when it is not project content: outside the World
+    // (~/.githooks, a shared directory) or inside .world-git. Empty otherwise; set by guard_capture.
+    char hooks_path[WFS_PATH_MAX];
+};
+
+static bool real_dir(const char *p) { struct stat st; return lstat(p, &st) == 0 && S_ISDIR(st.st_mode); }
+static bool real_file(const char *p) { struct stat st; return lstat(p, &st) == 0 && S_ISREG(st.st_mode); }
+
+static bool looks_like_gitdir(const char *d) {
+    char p[WFS_PATH_MAX], q[WFS_PATH_MAX];
+    snprintf(p, sizeof p, "%s/HEAD", d);
+    snprintf(q, sizeof q, "%s/objects", d);
+    return real_file(p) && real_dir(q);
+}
+
+// A submodule named `a/b` lives in modules/a/b and a nested one in modules/a/b/modules/c: walk the
+// directories until a repository, then only into its own `modules`. Never into objects or refs.
+static void find_submodules(GitAdmin *a, const char *dir, int depth) {
+    if (depth > 32 || a->gitdirs.n >= 4096) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    while (struct dirent *e = readdir(d)) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char p[WFS_PATH_MAX];
+        if ((size_t)snprintf(p, sizeof p, "%s/%s", dir, e->d_name) >= sizeof p || !real_dir(p)) continue;
+        sl_push(&a->pins, p);
+        if (!looks_like_gitdir(p)) { find_submodules(a, p, depth + 1); continue; }
+        sl_push(&a->gitdirs, p);
+        char m[WFS_PATH_MAX];
+        if ((size_t)snprintf(m, sizeof m, "%s/modules", p) < sizeof m && real_dir(m)) {
+            sl_push(&a->pins, m);
+            find_submodules(a, m, depth + 1);
+        }
+    }
+    closedir(d);
+}
+
+// False for a plain directory World: it has no Git administration to guard.
+static bool git_admin_find(const char *world, GitAdmin *a) {
+    memset(a, 0, sizeof *a);
+    if (!realpath(world, a->root)) snprintf(a->root, sizeof a->root, "%s", world);
+    char wg[WFS_PATH_MAX];
+    snprintf(wg, sizeof wg, "%s/.world-git", a->root);
+    snprintf(a->common, sizeof a->common, "%s/repo.git", wg);
+    snprintf(a->active, sizeof a->active, "%s/worktrees/active", a->common);
+    snprintf(a->modules, sizeof a->modules, "%s/modules", a->active);
+    if (!real_dir(wg) || !real_dir(a->common)) return false;
+    if (real_dir(a->modules)) {
+        sl_push(&a->pins, a->modules);
+        find_submodules(a, a->modules, 0);
+    }
+    return true;
+}
+
+static void git_admin_free(GitAdmin *a) { sl_free(&a->gitdirs); sl_free(&a->pins); }
+
+// --- what exec compares before and after the command ---
+//
+// Records are "<kind>\x1f<...>" -> value, sorted by id: kind `c` is a configuration entry
+// (repository, scope, key), `h` a hook file, `p` a file that tells Git where a repository is.
+
+struct GuardRec { char *id; char *val; size_t seq; };
+struct GuardSet { GuardRec *v; size_t n, cap; };
+
+static void gs_add(GuardSet *s, const char *id, const char *val) {
+    if (s->n == s->cap) {
+        size_t cap = s->cap ? s->cap * 2 : 64;
+        GuardRec *v = (GuardRec *)realloc(s->v, cap * sizeof *v);
+        if (!v) return;
+        s->v = v; s->cap = cap;
+    }
+    GuardRec r = {strdup(id), strdup(val), s->n};
+    if (!r.id || !r.val) { free(r.id); free(r.val); return; }
+    s->v[s->n++] = r;
+}
+
+static void gs_free(GuardSet *s) {
+    for (size_t i = 0; i < s->n; ++i) { free(s->v[i].id); free(s->v[i].val); }
+    free(s->v);
+    memset(s, 0, sizeof *s);
+}
+
+static int gs_cmp(const void *x, const void *y) {
+    const GuardRec *a = (const GuardRec *)x, *b = (const GuardRec *)y;
+    int c = strcmp(a->id, b->id);
+    return c ? c : (a->seq < b->seq ? -1 : a->seq > b->seq);
+}
+
+// Sort, and fold a multi-valued key (credential.helper, include.path) into one record whose
+// values keep Git's order, separated by \x1e.
+static void gs_finish(GuardSet *s) {
+    qsort(s->v, s->n, sizeof *s->v, gs_cmp);
+    size_t out = 0;
+    for (size_t i = 0; i < s->n; ++i) {
+        if (out && !strcmp(s->v[out - 1].id, s->v[i].id)) {
+            GuardRec &r = s->v[out - 1];
+            size_t a = strlen(r.val), b = strlen(s->v[i].val);
+            char *joined = (char *)realloc(r.val, a + b + 2);
+            if (joined) {
+                joined[a] = '\x1e';
+                memcpy(joined + a + 1, s->v[i].val, b + 1);
+                r.val = joined;
+            }
+            free(s->v[i].id); free(s->v[i].val);
+            continue;
+        }
+        s->v[out++] = s->v[i];
+    }
+    s->n = out;
+}
+
+// The file's type, mode and content (a symlink: its target), as a short fingerprint. Hooks are
+// small; hashing the bytes catches a same-size, same-mtime rewrite through a hardlink.
+static bool fingerprint(const char *path, char *out, size_t cap) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return false;
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](const char *b, size_t n) {
+        for (size_t i = 0; i < n; ++i) { h ^= (unsigned char)b[i]; h *= 1099511628211ull; }
+    };
+    char buf[8192];
+    if (S_ISLNK(st.st_mode)) {
+        ssize_t n = readlink(path, buf, sizeof buf);
+        if (n > 0) mix(buf, (size_t)n);
+    } else if (S_ISREG(st.st_mode)) {
+        int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) return false;
+        ssize_t n;
+        while ((n = read(fd, buf, sizeof buf)) > 0) mix(buf, (size_t)n);
+        close(fd);
+    }
+    snprintf(out, cap, "%06o:%016llx", (unsigned)st.st_mode, (unsigned long long)h);
+    return true;
+}
+
+static const char *rel_to(const GitAdmin *a, const char *path) {
+    size_t n = strlen(a->root);
+    return !strncmp(path, a->root, n) && path[n] == '/' ? path + n + 1 : path;
+}
+
+// Every hook Git could run from `dir`: all entries but Git's own *.sample templates, which Git
+// never runs (and which a fresh submodule clone creates).
+static void capture_hooks(const GitAdmin *a, const char *dir, GuardSet *s) {
+    DIR *d = opendir(dir);
+    if (!d) return;
+    while (struct dirent *e = readdir(d)) {
+        size_t n = strlen(e->d_name);
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") ||
+            (n > 7 && !strcmp(e->d_name + n - 7, ".sample"))) continue;
+        char p[WFS_PATH_MAX], id[WFS_PATH_MAX + 8], fp[64];
+        if ((size_t)snprintf(p, sizeof p, "%s/%s", dir, e->d_name) >= sizeof p || !fingerprint(p, fp, sizeof fp))
+            continue;
+        snprintf(id, sizeof id, "h\x1f%s", rel_to(a, p));
+        gs_add(s, id, fp);
+    }
+    closedir(d);
+}
+
+static void capture_pointer(const GitAdmin *a, const char *path, GuardSet *s) {
+    char fp[64], id[WFS_PATH_MAX + 8];
+    if (!real_file(path) || !fingerprint(path, fp, sizeof fp)) return;
+    snprintf(id, sizeof id, "p\x1f%s", rel_to(a, path));
+    gs_add(s, id, fp);
+}
+
+// `base`/`rel` with `.` and `..` resolved lexically (a submodule's core.worktree is relative to
+// its repository: ../../../../../../libs/lib).
+static void join_lexical(const char *base, const char *rel, char *out, size_t cap) {
+    char tmp[2 * WFS_PATH_MAX];
+    snprintf(tmp, sizeof tmp, rel[0] == '/' ? "%s%s" : "%s/%s", rel[0] == '/' ? "" : base, rel);
+    size_t at = 0;
+    out[0] = 0;
+    for (char *save = NULL, *c = strtok_r(tmp, "/", &save); c; c = strtok_r(NULL, "/", &save)) {
+        if (!strcmp(c, ".")) continue;
+        if (!strcmp(c, "..")) {
+            while (at > 0 && out[at - 1] != '/') --at;
+            if (at > 0) --at;
+            out[at] = 0;
+            continue;
+        }
+        at += (size_t)snprintf(out + at, cap > at ? cap - at : 0, "/%s", c);
+        if (at >= cap) { out[0] = 0; return; }
+    }
+    if (!at) snprintf(out, cap, "/");
+}
+
+extern char **environ;
+
+// `git config --list` for one repository, as the user's own Git in the World sees it (global,
+// system and GIT_CONFIG_* included), without hooks or fsmonitor and without inheriting a GIT_DIR
+// or index. Returns the NUL-terminated output, or NULL when Git could not produce it.
+static char *git_config_list(const char *root, const char *gitdir, size_t *len) {
+    char gd[WFS_PATH_MAX + 16];
+    const char *argv[] = {"git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                          "-C", root, "config", "--list", "--includes", "--null", "--show-scope", NULL, NULL};
+    if (gitdir) {
+        // `git --git-dir=<repo> config ...`: the option has to precede the subcommand.
+        snprintf(gd, sizeof gd, "--git-dir=%s", gitdir);
+        memmove(argv + 8, argv + 7, 5 * sizeof *argv);
+        argv[7] = gd;
+    }
+    size_t n = 0;
+    while (environ[n]) ++n;
+    char **env = (char **)calloc(n + 3, sizeof *env);
+    if (!env) return NULL;
+    size_t k = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const char *e = environ[i];
+        if (!strncmp(e, "GIT_", 4) && strncmp(e, "GIT_CONFIG_", 11)) continue;
+        env[k++] = environ[i];
+    }
+    env[k++] = (char *)"GIT_OPTIONAL_LOCKS=0";
+    env[k++] = (char *)"GIT_TERMINAL_PROMPT=0";
+    int fds[2];
+    if (pipe(fds)) { free(env); return NULL; }
+    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    pid_t pid = 0;
+    int rc = posix_spawnp(&pid, "git", &fa, NULL, (char *const *)argv, env);
+    posix_spawn_file_actions_destroy(&fa);
+    free(env);
+    close(fds[1]);
+    if (rc) { close(fds[0]); return NULL; }
+    size_t cap = 1 << 16, at = 0;
+    char *buf = (char *)malloc(cap);
+    bool ok = buf != NULL;
+    for (;;) {
+        if (ok && at + 1 == cap) {
+            char *b = cap < (64u << 20) ? (char *)realloc(buf, cap * 2) : NULL;
+            if (b) { buf = b; cap *= 2; } else ok = false;
+        }
+        char sink[4096];
+        ssize_t r = ok ? read(fds[0], buf + at, cap - at - 1) : read(fds[0], sink, sizeof sink);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        if (ok) at += (size_t)r;
+    }
+    close(fds[0]);
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    if (!ok || !WIFEXITED(st) || WEXITSTATUS(st) != 0) { free(buf); return NULL; }
+    buf[at] = 0;
+    *len = at;
+    return buf;
+}
+
+// One repository's command-running settings. `label` is empty for the World itself and names the
+// submodule otherwise; a submodule contributes only its own local/worktree files (global and
+// system entries are the World's, reported once). A submodule's core.worktree locates the
+// checkout whose `.git` file points back at the repository. The World itself is read through its
+// worktree administration (`active`), as Git in the World reads it, but without trusting the
+// World's `.git` file: a command that rewrote it is reported, not followed.
+// A relative core.hooksPath is resolved from the worktree root, like Git does. One inside the tree
+// is project content (husky's .husky): tracked, visible in `git status` and the World's diff.
+static void note_hooks_path(GitAdmin *a, const char *v) {
+    a->hooks_path[0] = 0;
+    char p[2 * WFS_PATH_MAX], real[WFS_PATH_MAX];
+    const char *home = getenv("HOME");
+    if (!strncmp(v, "~/", 2) && home && *home) snprintf(p, sizeof p, "%s/%s", home, v + 2);
+    else if (v[0] == '/') snprintf(p, sizeof p, "%s", v);
+    else snprintf(p, sizeof p, "%s/%s", a->root, v);
+    if (!*v || !realpath(p, real)) join_lexical("/", p, real, sizeof real);
+    if (!strcmp(real, "/dev/null")) return;
+    char admin[WFS_PATH_MAX];
+    snprintf(admin, sizeof admin, "%s/.world-git", a->root);
+    size_t n = strlen(a->root), m = strlen(admin);
+    bool in_tree = !strncmp(real, a->root, n) && (real[n] == '/' || !real[n]);
+    bool in_admin = !strncmp(real, admin, m) && (real[m] == '/' || !real[m]);
+    if (!in_tree || in_admin) snprintf(a->hooks_path, sizeof a->hooks_path, "%s", real);
+}
+
+static bool capture_config(GitAdmin *a, const char *gitdir, const char *label, GuardSet *s) {
+    const bool sub = *label != 0;
+    size_t len = 0;
+    char *out = git_config_list(a->root, gitdir, &len);
+    if (!out) return false;
+    for (size_t i = 0; i < len;) {
+        const char *scope = out + i;
+        i += strlen(scope) + 1;
+        if (i >= len) break;
+        char *key = out + i;
+        i += strlen(key) + 1;
+        char *nl = strchr(key, '\n');
+        const char *val = "";
+        if (nl) { *nl = 0; val = nl + 1; }
+        if (!strcmp(scope, "command")) continue;
+        if (sub && strcmp(scope, "local") && strcmp(scope, "worktree")) continue;
+        if (sub && !strcmp(scope, "local") && !strcmp(key, "core.worktree")) {
+            char checkout[WFS_PATH_MAX], dotgit[WFS_PATH_MAX + 8];
+            join_lexical(gitdir, val, checkout, sizeof checkout);
+            snprintf(dotgit, sizeof dotgit, "%s/.git", checkout);
+            capture_pointer(a, dotgit, s);
+        }
+        if (!sub && !strcmp(key, "core.hookspath")) note_hooks_path(a, val);  // the last one wins
+        if (!guard_key_runs_command(key, val)) continue;
+        size_t idn = strlen(label) + strlen(scope) + strlen(key) + 8;
+        char *id = (char *)malloc(idn);
+        if (!id) continue;
+        snprintf(id, idn, "c\x1f%s\x1f%s\x1f%s", label, scope, key);
+        gs_add(s, id, val);
+        free(id);
+    }
+    free(out);
+    return true;
+}
+
+static bool guard_capture(GitAdmin *a, GuardSet *s) {
+    if (!capture_config(a, real_dir(a->active) ? a->active : NULL, "", s)) return false;
+    char p[WFS_PATH_MAX];
+    snprintf(p, sizeof p, "%s/hooks", a->common);
+    capture_hooks(a, p, s);
+    if (a->hooks_path[0]) capture_hooks(a, a->hooks_path, s);
+    snprintf(p, sizeof p, "%s/.git", a->root);
+    capture_pointer(a, p, s);
+    snprintf(p, sizeof p, "%s/commondir", a->active);
+    capture_pointer(a, p, s);
+    for (size_t i = 0; i < a->gitdirs.n; ++i) {
+        const char *g = a->gitdirs.v[i];
+        char label[WFS_PATH_MAX + 16];
+        snprintf(label, sizeof label, "submodule %s", g + strlen(a->modules) + 1);
+        if (!capture_config(a, g, label, s)) return false;
+        snprintf(p, sizeof p, "%s/hooks", g);
+        capture_hooks(a, p, s);
+    }
+    gs_finish(s);
+    return true;
+}
+
+// A value from the World's configuration goes to the user's terminal: control bytes are shown
+// escaped, never interpreted.
+static void put_value(FILE *f, const char *v) {
+    if (!v) { fputs("(unset)", f); return; }
+    if (!*v) { fputs("\"\"", f); return; }
+    for (const unsigned char *p = (const unsigned char *)v; *p; ++p) {
+        if (*p == 0x1e) fputs(", ", f);
+        else if (*p < 0x20 || *p == 0x7f) fprintf(f, "\\x%02x", *p);
+        else fputc(*p, f);
+    }
+}
+
+static void put_field(FILE *f, const char *s, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20 || c == 0x7f) fprintf(f, "\\x%02x", c);
+        else fputc(c, f);
+    }
+}
+
+static void guard_warn(const GuardRec *before, const GuardRec *after) {
+    const GuardRec *r = after ? after : before;
+    const char *id = r->id, *rest = id + 2;
+    if (id[0] == 'c') {
+        const char *label = rest, *scope = strchr(label, '\x1f') + 1, *key = strchr(scope, '\x1f') + 1;
+        fputs("world: WARNING: exec changed a Git setting that runs commands: ", stderr);
+        if (scope - label > 1) { put_field(stderr, label, (size_t)(scope - label - 1)); fputc(' ', stderr); }
+        put_field(stderr, scope, (size_t)(key - scope - 1));
+        fputc(' ', stderr);
+        put_field(stderr, key, strlen(key));
+        fputs(": ", stderr);
+        put_value(stderr, before ? before->val : NULL);
+        fputs(" -> ", stderr);
+        put_value(stderr, after ? after->val : NULL);
+        fputc('\n', stderr);
+    } else if (id[0] == 'h') {
+        fprintf(stderr, "world: WARNING: exec %s a Git hook: ", !before ? "added" : !after ? "removed" : "changed");
+        put_field(stderr, rest, strlen(rest));
+        fputc('\n', stderr);
+    } else {
+        fputs("world: WARNING: exec changed where Git finds a repository: ", stderr);
+        put_field(stderr, rest, strlen(rest));
+        fputc('\n', stderr);
+    }
+}
+
+static void guard_report(const GuardSet *b, const GuardSet *a) {
+    size_t i = 0, j = 0, warned = 0;
+    while (i < b->n || j < a->n) {
+        int c = i == b->n ? 1 : j == a->n ? -1 : strcmp(b->v[i].id, a->v[j].id);
+        const GuardRec *before = c <= 0 ? &b->v[i] : NULL, *after = c >= 0 ? &a->v[j] : NULL;
+        if (c <= 0) ++i;
+        if (c >= 0) ++j;
+        if (before && after && !strcmp(before->val, after->val)) continue;
+        // A checkout's `.git` that went away (deinit) or appeared (update --init) points nowhere
+        // new; only a rewritten one can send Git to another repository.
+        if ((before ? before : after)->id[0] == 'p' && (!before || !after)) continue;
+        guard_warn(before, after);
+        ++warned;
+    }
+    if (warned)
+        fputs("world: these run outside any sandbox the next time Git runs in this World; review "
+              "them (docs/GIT_INTEGRATION.md, \"Running agents with world exec\")\n", stderr);
+}
+
 static pid_t g_child = 0;
 
 static void forward_signal(int sig) {
@@ -1994,7 +2432,80 @@ static const char *kAgentHomeDirs[] = {
     "Library/Application Support/Cursor",
 };
 
-static int write_profile(wfs_store *s, wfs_id w, const char *world_root, const char *path) {
+static void sb_literal(FILE *f, const char *rule, const char *path) {
+    fprintf(f, "(%s (literal ", rule);
+    sb_quote(f, path);
+    fputs("))\n", f);
+}
+
+// `^<dir><tail>`, with `dir` matched literally. Written as an SBPL string rather than a #"..."
+// regex literal, which has no way to contain a quote.
+// `also`, when given, is a further filter the operation must match as well.
+static bool sb_regex(FILE *f, const char *rule, const char *dir, const char *tail, const char *also = NULL) {
+    char rx[4 * WFS_PATH_MAX];
+    rx[0] = '^';
+    if (!sb_regex_escape(dir, rx + 1, sizeof rx - 1) || strlen(rx) + strlen(tail) >= sizeof rx) return false;
+    strcat(rx, tail);
+    fprintf(f, also ? "(%s (require-all (regex " : "(%s (regex ", rule);
+    sb_quote(f, rx);
+    if (also) fprintf(f, ") %s", also);
+    fputs("))\n", f);
+    return true;
+}
+
+// Every hooks directory of a submodule repository below `modules`, including those `git submodule
+// update --init` creates during the exec (hence a regex, not the list found beforehand). The
+// directory path itself is covered too, so nothing can be renamed over or out of it. The clone
+// still has to create `hooks` and copy Git's template *.sample files into it (which Git never
+// runs); without those two exceptions it fails outright. Only a directory may be created there,
+// not a symlink to hooks elsewhere.
+static bool sb_module_hooks(FILE *f, const char *modules) {
+    return sb_regex(f, "deny file-write*", modules, "/(.+/)?hooks(/.*)?$") &&
+           sb_regex(f, "allow file-write-create", modules, "/(.+/)?hooks$", "(vnode-type DIRECTORY)") &&
+           sb_regex(f, "allow file-write*", modules, "/(.+/)?hooks/[^/]+\\.sample$");
+}
+
+// Seatbelt rules for the World's Git administration; see "the World's Git administration" above.
+static bool sb_git_admin(FILE *f, const GitAdmin *a) {
+    fputs("\n; --- denied: the World's Git hooks, which run later outside any sandbox, and every\n"
+          "; entry that tells Git where a repository (and so its hooks) is ---\n", f);
+    char p[WFS_PATH_MAX];
+    snprintf(p, sizeof p, "%s/.git", a->root);
+    sb_literal(f, "deny file-write*", p);
+    snprintf(p, sizeof p, "%s/.world-git", a->root);
+    sb_literal(f, "deny file-write*", p);
+    sb_literal(f, "deny file-write*", a->common);
+    snprintf(p, sizeof p, "%s/worktrees", a->common);
+    sb_literal(f, "deny file-write*", p);
+    sb_literal(f, "deny file-write*", a->active);
+    snprintf(p, sizeof p, "%s/commondir", a->active);
+    sb_literal(f, "deny file-write*", p);
+    snprintf(p, sizeof p, "%s/hooks", a->common);
+    sb_subpath(f, "deny file-write*", p);
+    // (On Linux everything outside the World is read-only already.)
+    if (a->hooks_path[0]) sb_subpath(f, "deny file-write*", a->hooks_path);
+    if (!sb_module_hooks(f, a->modules)) return false;
+    // The regex cannot tell a hooks directory from a submodule whose name has a `hooks`
+    // component (modules/tools/hooks). Give such an existing repository back, parents first,
+    // then deny its own hooks below like every other one.
+    for (size_t i = 0; i < a->gitdirs.n; ++i) {
+        const char *g = a->gitdirs.v[i], *rel = g + strlen(a->modules);
+        char pat[WFS_PATH_MAX + 8];
+        snprintf(pat, sizeof pat, "%s/", rel);
+        if (!strstr(pat, "/hooks/")) continue;
+        sb_subpath(f, "allow file-write*", g);
+        snprintf(p, sizeof p, "%s/modules", g);
+        if (!sb_module_hooks(f, p)) return false;
+    }
+    for (size_t i = 0; i < a->pins.n; ++i) sb_literal(f, "deny file-write*", a->pins.v[i]);
+    for (size_t i = 0; i < a->gitdirs.n; ++i) {
+        snprintf(p, sizeof p, "%s/hooks", a->gitdirs.v[i]);
+        sb_subpath(f, "deny file-write*", p);
+    }
+    return true;
+}
+
+static int write_profile(wfs_store *s, wfs_id w, const char *world_root, const char *path, const GitAdmin *git) {
     FILE *f = fopen(path, "w");
     if (!f) return -errno;
     fputs("; generated by `world exec` (P14). Last matching rule wins: allows first, denies last.\n"
@@ -2007,6 +2518,10 @@ static int write_profile(wfs_store *s, wfs_id w, const char *world_root, const c
     sb_subpath(f, "allow file-write*", "/private/var/tmp");
     for (size_t i = 0; i < sizeof kAgentHomeDirs / sizeof kAgentHomeDirs[0]; ++i)
         sb_home(f, "allow file-write*", kAgentHomeDirs[i]);
+
+    // Inside the World, so after its allow; before the store and other Worlds, which stay last
+    // (and absolute) whatever the Git rules give back.
+    if (git && !sb_git_admin(f, git)) { fclose(f); return -ENAMETOOLONG; }
 
     fputs("\n; --- denied: the store (metadata + every snapshot) and every other world ---\n", f);
     const char *store = wfs_store_dir(s);
@@ -2050,6 +2565,59 @@ static int sandbox_usable(const char *profile) {
     return WIFEXITED(st) && WEXITSTATUS(st) == 0;
 }
 
+#endif
+
+#ifdef __linux__
+struct Mount { const char *path; bool ro; };
+
+static int mount_cmp(const void *x, const void *y) {
+    return strcmp(((const Mount *)x)->path, ((const Mount *)y)->path);
+}
+
+// Bubblewrap arguments for the World's Git administration; see "the World's Git administration"
+// above. Existing hooks directories, the World's `.git` file and `commondir` are bound read-only.
+// Every directory on the way to a repository is bound onto itself: a mount point cannot be
+// renamed or removed (EBUSY), so no repository can be swapped for one with other hooks. Mounts
+// are fixed when the sandbox starts, so a submodule initialized during the exec keeps writable
+// hooks; the report after the exec covers it. Paths sort parents first, the order bwrap needs.
+static char **linux_git_mounts(const GitAdmin *a, StrList *keep) {
+    char p[WFS_PATH_MAX];
+    // Kept as "r<path>" (read-only) or "w<path>" (bound onto itself, writable).
+    auto add = [&](const char *path, bool ro, bool dir) {
+        char e[WFS_PATH_MAX + 1];
+        if ((dir ? real_dir(path) : real_file(path)) && (size_t)snprintf(e, sizeof e, "%c%s", ro ? 'r' : 'w', path) < sizeof e)
+            sl_push(keep, e);
+    };
+    snprintf(p, sizeof p, "%s/.git", a->root); add(p, true, false);
+    snprintf(p, sizeof p, "%s/.world-git", a->root); add(p, false, true);
+    add(a->common, false, true);
+    snprintf(p, sizeof p, "%s/worktrees", a->common); add(p, false, true);
+    add(a->active, false, true);
+    snprintf(p, sizeof p, "%s/commondir", a->active); add(p, true, false);
+    snprintf(p, sizeof p, "%s/hooks", a->common); add(p, true, true);
+    // A core.hooksPath inside .world-git; one outside the World is read-only here already.
+    size_t rn = strlen(a->root);
+    if (a->hooks_path[0] && !strncmp(a->hooks_path, a->root, rn) && a->hooks_path[rn] == '/')
+        add(a->hooks_path, true, true);
+    for (size_t i = 0; i < a->pins.n; ++i) add(a->pins.v[i], false, true);
+    for (size_t i = 0; i < a->gitdirs.n; ++i) {
+        snprintf(p, sizeof p, "%s/hooks", a->gitdirs.v[i]);
+        add(p, true, true);
+    }
+    size_t n = keep->n;
+    Mount *m = (Mount *)calloc(n ? n : 1, sizeof *m);
+    char **args = (char **)calloc(3 * n + 1, sizeof *args);
+    if (!m || !args) { free(m); free(args); return NULL; }
+    for (size_t i = 0; i < n; ++i) m[i] = {keep->v[i] + 1, keep->v[i][0] == 'r'};
+    qsort(m, n, sizeof *m, mount_cmp);
+    for (size_t i = 0; i < n; ++i) {
+        args[3 * i] = (char *)(m[i].ro ? "--ro-bind" : "--bind");
+        args[3 * i + 1] = (char *)m[i].path;
+        args[3 * i + 2] = (char *)m[i].path;
+    }
+    free(m);
+    return args;
+}
 #endif
 
 static int cmd_exec(wfs_store *s, int argc, char **argv) {
@@ -2111,12 +2679,25 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
     }
 #endif
 
+    // Git settings and hooks as they are before the command; compared after it, sandboxed or not
+    // (the sandbox leaves ~/.gitconfig and the repository configuration writable).
+    GitAdmin admin;
+    const bool git_world = git_admin_find(id.path, &admin);
+    GuardSet before = {};
+    bool watch = false;
+    if (git_world) {
+        watch = guard_capture(&admin, &before);
+        if (!watch)
+            fprintf(stderr, "world: note: could not read W%llu's Git configuration; exec will not report "
+                    "changed Git settings that run commands\n", (unsigned long long)w);
+    }
+
     char prof[WFS_PATH_MAX] = {0};
 #ifndef __linux__
     if (sandbox) {
         snprintf(prof, sizeof prof, "%s/tmp/exec-W%llu-%d.sb", wfs_store_dir(s), (unsigned long long)w,
                  (int)getpid());
-        rc = write_profile(s, w, id.path, prof);
+        rc = write_profile(s, w, id.path, prof, git_world ? &admin : NULL);
         if (rc) {
             wfs_world_unlock_exec(s, w, lockfd);
             return fail("exec: sandbox profile", rc);
@@ -2159,6 +2740,15 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
     for (int i = 0; i < nargs; ++i) cav[k++] = argv[cmd_at + i];
     cav[k] = NULL;
 
+#ifdef __linux__
+    StrList mount_paths = {};
+    char **git_mounts = NULL;
+    if (sandbox && git_world) {
+        git_mounts = linux_git_mounts(&admin, &mount_paths);
+        if (!git_mounts) { wfs_world_unlock_exec(s, w, lockfd); return fail("exec", -ENOMEM); }
+    }
+#endif
+
     pid_t pid = fork();
     if (pid < 0) {
         int e = -errno;
@@ -2170,7 +2760,7 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
     if (pid == 0) {
 #ifdef __linux__
         if (sandbox) {
-            int err = linux_sandbox_exec(id.path, wfs_store_dir(s), cav);
+            int err = linux_sandbox_exec(id.path, wfs_store_dir(s), git_mounts, cav);
             fprintf(stderr, "world: namespace sandbox: %s; command was not started. "
                     "Install /usr/bin/bwrap and enable unprivileged user namespaces, "
                     "or explicitly use --no-sandbox.\n", strerror(-err));
@@ -2200,6 +2790,24 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
         if (errno != EINTR) { st = 0; break; }
     }
     g_child = 0;
+#ifdef __linux__
+    free(git_mounts);
+    sl_free(&mount_paths);
+#endif
+    // Whatever the command's status: a crashed agent may still have planted something.
+    if (watch) {
+        GitAdmin now;
+        GuardSet after = {};
+        if (git_admin_find(id.path, &now)) {
+            if (guard_capture(&now, &after)) guard_report(&before, &after);
+            else fprintf(stderr, "world: note: could not read W%llu's Git configuration after the command; "
+                         "changed Git settings that run commands are not reported\n", (unsigned long long)w);
+        }
+        gs_free(&after);
+        git_admin_free(&now);
+    }
+    gs_free(&before);
+    if (git_world) git_admin_free(&admin);
     if (prof[0]) unlink(prof);
     wfs_world_unlock_exec(s, w, lockfd);
     free(cav);

@@ -1,0 +1,83 @@
+#pragma once
+// Pure helpers behind `world exec`'s Git guard, kept apart from main.cpp so they can be unit
+// tested (cli/tests/exec_guard_test.cpp). libc only (arch.md §39).
+#include <stddef.h>
+#include <string.h>
+#include <strings.h>
+
+// Escape `in` so a seatbelt regex matches it literally. Every POSIX ERE metacharacter gets a
+// backslash; the result is still to be written as an SBPL string (sb_quote), which escapes the
+// backslashes and quotes once more. A World path is user-chosen: `W.1` must not also match
+// `WX1`, and `a[b]` must match itself, not `ab`. Returns false when `out` is too small.
+static inline bool sb_regex_escape(const char *in, char *out, size_t cap) {
+    size_t at = 0;
+    for (const char *p = in; *p; ++p) {
+        if (strchr(".[]()*+?{}|^$\\", *p)) {
+            if (at + 1 >= cap) return false;
+            out[at++] = '\\';
+        }
+        if (at + 1 >= cap) return false;
+        out[at++] = *p;
+    }
+    if (at >= cap) return false;
+    out[at] = 0;
+    return true;
+}
+
+// Whether a Git configuration entry, as `git config --list` prints it (section and name
+// lowercased, a subsection verbatim), makes Git run a command or load configuration that could.
+// `world exec` reports changes to these after the command exits; the list is documented in
+// docs/GIT_INTEGRATION.md ("Running agents with world exec").
+struct GuardKey {
+    const char *section;
+    const char *name;  // NULL: any name in the section
+    int sub;           // 0: no subsection, 1: subsection required, 2: either
+    bool bang;         // only values starting with `!` run a command
+};
+
+static const GuardKey kGuardKeys[] = {
+    {"core", "hookspath", 0, false},      {"core", "fsmonitor", 0, false},
+    {"core", "sshcommand", 0, false},     {"core", "editor", 0, false},
+    {"core", "pager", 0, false},          {"core", "askpass", 0, false},
+    {"core", "gitproxy", 0, false},       {"core", "alternaterefscommand", 0, false},
+    {"sequence", "editor", 0, false},     {"credential", "helper", 2, false},
+    {"filter", "clean", 1, false},        {"filter", "smudge", 1, false},
+    {"filter", "process", 1, false},      {"diff", "external", 0, false},
+    {"diff", "command", 1, false},        {"diff", "textconv", 1, false},
+    {"merge", "driver", 1, false},        {"mergetool", "cmd", 1, false},
+    {"mergetool", "path", 1, false},      {"difftool", "cmd", 1, false},
+    {"difftool", "path", 1, false},       {"gpg", "program", 2, false},
+    {"gpg", "defaultkeycommand", 2, false},
+    {"remote", "uploadpack", 1, false},   {"remote", "receivepack", 1, false},
+    {"remote", "vcs", 1, false},          {"uploadpack", "packobjectshook", 0, false},
+    {"sendemail", "tocmd", 2, false},     {"sendemail", "cccmd", 2, false},
+    {"sendemail", "headercmd", 2, false}, {"sendemail", "sendmailcmd", 2, false},
+    {"sendemail", "smtpserver", 2, false},
+    {"include", "path", 0, false},        {"includeif", "path", 1, false},
+    {"alias", NULL, 2, true},             {"submodule", "update", 1, true},
+    {"pager", NULL, 0, false},            {"interactive", "difffilter", 0, false},
+    {"web", "browser", 0, false},         {"browser", "cmd", 1, false},
+    {"browser", "path", 1, false},        {"man", "cmd", 1, false},
+    {"man", "path", 1, false},            {"init", "templatedir", 0, false},
+    {"hook", "command", 1, false},        {"trailer", "command", 1, false},
+    {"trailer", "cmd", 1, false},         {"protocol", "allow", 2, false},
+    {"lfs", "path", 1, false},            {"lfs", "clean", 1, false},
+    {"lfs", "smudge", 1, false},
+};
+
+static inline bool guard_key_runs_command(const char *key, const char *value) {
+    const char *first = strchr(key, '.'), *last = strrchr(key, '.');
+    if (!first || !last[1]) return false;
+    size_t section = (size_t)(first - key);
+    bool has_sub = last != first;
+    const char *name = last + 1;
+    for (size_t i = 0; i < sizeof kGuardKeys / sizeof kGuardKeys[0]; ++i) {
+        const GuardKey &k = kGuardKeys[i];
+        if (strlen(k.section) != section || strncasecmp(key, k.section, section)) continue;
+        if ((k.sub == 0 && has_sub) || (k.sub == 1 && !has_sub)) continue;
+        if (k.name && strcasecmp(name, k.name)) continue;
+        if (k.bang && (!value || value[0] != '!')) continue;
+        return true;
+    }
+    return false;
+}

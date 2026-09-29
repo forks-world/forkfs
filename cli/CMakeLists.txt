@@ -13,6 +13,11 @@ if(APPLE AND WFS_FSKIT)
     target_link_libraries(world PRIVATE "-framework FSKit" "-framework Foundation")
 endif()
 
+# Pure helpers of `world exec`'s Git guard (seatbelt regex escaping, command-running keys).
+add_executable(exec_guard_test tests/exec_guard_test.cpp)
+target_compile_options(exec_guard_test PRIVATE -Wall)
+add_test(NAME cli_exec_guard_test COMMAND exec_guard_test)
+
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
     add_test(NAME cli_json_test
