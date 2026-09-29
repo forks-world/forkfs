@@ -357,7 +357,7 @@ static void omitted_worktree_notes(const char *kind, unsigned long long id) {
         int n = end ? (int)(end - list) : (int)strlen(list);
         fprintf(stderr,
                 "world: note: linked worktree %.*s is a separate checkout, not part of %s%llu: its "
-                "branches and commits are carried, its uncommitted changes are not\n",
+                "branch is carried; its checkout, uncommitted changes and a detached HEAD are not\n",
                 n, list, kind, id);
         list += n + (end ? 1 : 0);
     }

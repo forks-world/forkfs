@@ -200,8 +200,8 @@ const char *wfs_git_reason(void);
 /* The Git linked worktrees that the last wfs_snapshot_create or wfs_world_create_ex on this
  * thread left out of the tree it made, one per line: a path relative to the source's root for a
  * checkout inside it, the registered absolute path otherwise. They are separate checkouts of the
- * repository (an AI agent's, typically); their branches and commits are carried, their
- * checkouts and uncommitted state are not. "" when there were none. */
+ * repository (an AI agent's, typically); their branches are carried, their checkouts,
+ * uncommitted state and detached HEADs are not. "" when there were none. */
 const char *wfs_git_omitted_worktrees(void);
 const char *wfs_version(void);
 

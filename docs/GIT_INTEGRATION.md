@@ -59,9 +59,11 @@ ignored only when the `**/.claude/worktrees/` rule it writes to `info/exclude` (
 `.gitignore`) is present. Codex creates a detached worktree outside the repository and writes
 `core.worktree` into its `config.worktree`. A linked worktree other than the World's own checkout
 is a separate checkout of the repository, not part of the World, which is the same rule as for
-source worktree registrations above: its committed work travels (every ref and object of the
-repository is imported, so its branch and commits are in the World), its checkout and
-uncommitted state do not, and the source or parent is never modified. Each one left out is
+source worktree registrations above: work committed on a branch travels (every ref of the
+repository is imported, so the branch and its commits are in the World), its checkout,
+uncommitted state and HEAD do not, and the source or parent is never modified. A detached
+worktree's HEAD -- every Codex worktree is detached -- is per-worktree state, so commits reachable
+only from it are not referenced in the World (put them on a branch first to carry them). Each one left out is
 named in a `note:` line on stderr.
 
 - `init` admits a `.git` file inside the source tree only when it is exactly a registered
