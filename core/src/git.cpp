@@ -1987,10 +1987,14 @@ int reject_used_filters(const char *root, const char *tree = nullptr, bool *uses
     }
     return 0;
 }
-int reject_external_visibility_state(const char *root, bool managed) {
+// Legacy info/grafts rewrite commits' parents for every history walk, and the owned repository
+// does not carry them. `transfer.hideRefs`/`uploadpack.hideRefs` need no refusal: they only hide
+// refs from a client fetching or pushing over a transport, and the import reads the refs with
+// `for-each-ref` (capture_refs) and clones the objects, so hidden refs are captured, written and
+// rechecked like any other. The settings themselves are the source's serving policy and are not
+// carried (kCarriedConfig).
+int reject_external_grafts(const char *root, bool managed) {
     if (managed) return 0;
-    for (const char *key : {"transfer.hideRefs", "uploadpack.hideRefs"})
-        if (int rc = reject_configured_policy(root, key)) return rc;
     String grafts; const char *graft_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "info/grafts", nullptr};
     if (int graft_rc = value(root, graft_args, grafts)) return graft_rc;
     struct stat st;
@@ -2830,7 +2834,7 @@ int reject_unlisted_symrefs(const char *root, const Vec<GitSymref> &known) {
 int source_unchanged(const GitRepoState &s) {
     if (int rc = reject_inprogress(s.root.c_str())) return rc;
     if (int rc = reject_import_policy(s.root.c_str())) return rc;
-    if (int rc = reject_external_visibility_state(s.root.c_str(), s.managed)) return rc;
+    if (int rc = reject_external_grafts(s.root.c_str(), s.managed)) return rc;
     String head; const char *args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (int rc = value(s.root.c_str(), args, head)) return rc;
     Vec<char> index;
@@ -3443,7 +3447,7 @@ int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool modu
         else rc = collect_worktrees(root, common.c_str(), out.admin.c_str(), false, out.worktrees);
         if (rc) return rc;
     }
-    if ((rc = reject_external_visibility_state(root, out.managed))) return rc;
+    if ((rc = reject_external_grafts(root, out.managed))) return rc;
     if ((rc = capture_refs(root, out.refs))) return rc;
     if ((rc = capture_stash(root, out))) return rc;
     if ((rc = capture_orig(root, out.orig_present, out.orig_head))) return rc;

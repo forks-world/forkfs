@@ -292,7 +292,7 @@ directory as its worktree. In the World every submodule is absorbed; the source 
 modified.
 
 Every check the root's import makes is made on each submodule's repository too -- the
-configuration policy and filters, extensions, partial/shallow/alternates, hidden refs, the
+configuration policy and filters, extensions, partial clones and alternates, the
 stash stack (see [Stash](#stash)), grafts, in-progress operations, dangling symbolic refs, reserved paths in its history,
 symlinked or unexpected administration -- and each is rechecked unchanged before publication.
 The `.gitmodules` settings of every repository with gitlinks are read again from the copy
@@ -745,11 +745,16 @@ omit them, so the import could not preserve them. Repositories using the reftabl
 backend are refused because it offers no read-only way to find such refs; the owned
 repositories themselves always use the files backend.
 
-Initial imports from external repositories reject any configured `transfer.hideRefs`
-or `uploadpack.hideRefs`, because the mirror transport may omit those refs.
-This restriction does not apply to managed Worlds: their Git administration is
-cloned as part of the filesystem, retaining hidden refs through forks and checkpoints.
-External eligibility is checked again around import.
+Refs hidden with `transfer.hideRefs` or `uploadpack.hideRefs` are imported like any other
+ref. Those settings only hide refs from a client that fetches from or pushes to the
+repository over a transport, and the import uses none: it lists the refs with
+`for-each-ref`, clones the object directory and writes the refs itself (see
+[Import cost](#import-cost)), and the recheck before publication compares the same complete
+listing. The settings themselves are the source's serving policy, repository-local and outside
+the carried configuration, so the World has the refs without the settings: nothing in it is
+hidden. (A World is not a server; `publish` fetches the World's branch by its exact name.) A
+World's own hiding settings travel with its cloned `.world-git` through forks and
+checkpoints, together with the refs.
 
 ### Stash
 
@@ -779,7 +784,7 @@ Only the stash reflog is carried, because the stash *is* a reflog. Other reflogs
 branches) are not imported, and import does not promise preservation of that history.
 
 External repositories with `info/grafts` are rejected because their local ancestry
-overrides are not transported by a mirror. Active bisect and sequencer sessions,
+overrides are not carried into the owned repository. Active bisect and sequencer sessions,
 like unfinished merges, cherry-picks and rebases, must be completed or aborted
 before import or checkpoint; their administrative state is not a clean baseline.
 

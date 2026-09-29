@@ -2667,17 +2667,27 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
         self.world('init', str(self.source))
 
-    def test_external_hidden_refs_are_refused(self):
-        self.git(self.source, 'update-ref', 'refs/custom/hidden', self.base.decode())
-        for key in ('transfer.hideRefs', 'uploadpack.hideRefs'):
+    def test_external_hidden_refs_are_imported(self):
+        # Hidden refs are hidden from transports only; the import lists refs with for-each-ref
+        # and clones the objects, so they arrive like any other ref. The hiding setting itself
+        # is the source's serving policy and is not carried.
+        (self.source / 'file').write_text('only under a hidden ref\n')
+        self.git(self.source, 'commit', '-qam', 'hidden')
+        hidden = self.git(self.source, 'rev-parse', 'HEAD').stdout.strip()
+        self.git(self.source, 'update-ref', 'refs/hidden/work', hidden.decode())
+        self.git(self.source, 'reset', '-q', '--hard', self.base.decode())
+        self.git(self.source, 'reflog', 'expire', '--expire=now', '--all')
+        for n, key in enumerate(('transfer.hideRefs', 'uploadpack.hideRefs')):
             with self.subTest(key=key):
-                self.git(self.source, 'config', '--local', key, 'refs/custom')
+                self.git(self.source, 'config', '--local', key, 'refs/hidden')
                 before = (self.source / '.git' / 'config').read_bytes()
-                result = self.world('init', str(self.source), code=3)
-                self.assertIn(b'unsupported Git layout', result.stderr)
-                self.assertEqual(self.git(self.source, 'rev-parse', 'refs/custom/hidden').stdout.strip(), self.base)
+                snapshot = self.world('init', str(self.source)).stdout.split()[0].decode()
                 self.assertEqual((self.source / '.git' / 'config').read_bytes(), before)
-                self.assertEqual(json.loads(self.world('list', '--json').stdout)['snapshots'], [])
+                one, _ = self.fork('one-%d' % n, snapshot)
+                self.assertEqual(self.git(one, 'rev-parse', 'refs/hidden/work').stdout.strip(), hidden)
+                self.assertEqual(self.git(one, 'show', 'refs/hidden/work:file').stdout, b'only under a hidden ref\n')
+                self.git(one, 'config', '--get', key, code=1)
+                self.git(one, 'fsck', '--full')
                 self.git(self.source, 'config', '--local', '--unset-all', key)
 
     # ---- stash ----------------------------------------------------------------------------
