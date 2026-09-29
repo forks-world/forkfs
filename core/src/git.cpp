@@ -4325,10 +4325,13 @@ int git_import(const GitSource &s, const char *clone) {
         // A linked worktree added inside the source after the capture may have been cloned
         // with a `.git` leading back into the source's administration; Git registers a worktree
         // before it checks one out, so its registration shows it. One removed meanwhile (an
-        // agent's cleanup) is fine: its checkout was left out of the copy either way. (A managed
-        // copy is recaptured below instead.)
+        // agent's cleanup) is a change too: its directory may have been refilled with ordinary
+        // project files before the clone, which leaving the captured path out would silently
+        // drop. So the set must be exactly the captured one; any difference is a retryable busy.
+        // (A managed copy is recaptured below instead.)
         Vec<GitWorktree> now;
         if (int rc = collect_worktrees(s.root.c_str(), s.common.c_str(), s.admin.c_str(), false, now)) return rc;
+        if (now.size() != s.worktrees.size()) return -EBUSY;
         for (const auto &w : now) {
             bool known = false;
             for (const auto &c : s.worktrees) if (c.id == w.id && c.rel == w.rel) known = true;

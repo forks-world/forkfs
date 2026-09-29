@@ -82,8 +82,10 @@ named in a `note:` line on stderr.
   tree's own names that shared its inode keep their own group, or become plain files, rather
   than counting as linked from outside. A `.git` file leading into another repository,
   one whose registration does not lead back to it, a dangling one and a `.git` directory are
-  still refused as a nested repository. The source's registrations are rechecked after the copy,
-  so a worktree added inside the source while it was being cloned is caught, not published.
+  still refused as a nested repository. The source's registrations are rechecked after the copy
+  and must be exactly the captured ones: a worktree added inside the source while it was being
+  cloned, or one removed meanwhile (whose directory may already hold ordinary files again), fails
+  the import as busy, to be retried, rather than publishing a copy that lacks those files.
 - `fork` and `checkpoint` of a World drop every `worktrees/<id>` registration other than
   `active` from the child copy -- with whatever Git or the agent keeps there (`locked`,
   `CLAUDE_BASE`, `codex-thread.json`, `config.worktree`, the index, logs) -- together with the
