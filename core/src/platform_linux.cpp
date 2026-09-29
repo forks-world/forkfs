@@ -272,6 +272,12 @@ int fs_clone_probe(const char *dst, const char *src) {
     return rc;
 }
 
+// The probe succeeds on ext4 because fs_clone_tree copies there; only reflinks share blocks.
+bool fs_clone_shares(const char *dst, const char *src) {
+    struct statfs fs;
+    return fs_clone_probe(dst, src) == 0 && !::statfs(dst, &fs) && fs.f_type != EXT4_SUPER_MAGIC;
+}
+
 int fs_clone_tree(const char *src, const char *dst, bool allow_fallback) {
     if (!src || !dst) return -EINVAL;
     CloneCtx c{dst, allow_fallback};

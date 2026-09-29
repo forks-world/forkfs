@@ -340,6 +340,10 @@ int fs_lstat_xattr(const char *path, struct stat &st, uint8_t &xattr);
 // Probe the native storage strategy and volume compatibility. Linux ext4 copies;
 // XFS/Btrfs require reflinks. Returns 0, -EXDEV, or -errno.
 int fs_clone_probe(const char *store_dir, const char *src_dir);
+// Whether fs_clone_tree from `src_dir` into `dst_dir` shares data blocks instead of copying
+// them: clonefile/reflinks on the same volume. False for ext4, which copies, and whenever the
+// probe fails, so a caller budgeting space assumes a full copy.
+bool fs_clone_shares(const char *dst_dir, const char *src_dir);
 // Native tree duplication without following symlinks: clonefile on Darwin,
 // reflinks on Linux XFS/Btrfs, sparse-aware copies on ext4. allow_fallback also
 // permits copies across volumes or when cloning is unsupported.

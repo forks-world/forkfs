@@ -1170,6 +1170,7 @@ int fs_lstat_xattr(const char *path, struct stat &st, uint8_t &xattr) {
 // equivalent (docs/M1_DESIGN.md §4); until then these report "unsupported" honestly rather
 // than silently doing a real copy.
 int fs_clone_probe(const char *, const char *) { return -ENOTSUP; }
+bool fs_clone_shares(const char *, const char *) { return false; }
 int fs_clone_tree(const char *, const char *, bool) { return -ENOTSUP; }
 int fs_protect_tree(const char *root, TreeStats *stats, Manifest *) {
     if (stats) return fs_count_entries(root, *stats);

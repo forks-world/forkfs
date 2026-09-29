@@ -21,9 +21,12 @@ world fs checkpoint W1           # a filesystem snapshot, never an implicit Git 
 Each tree owns `.world-git/repo.git`, a private bare repository with one linked worktree.
 Its root `.git` file and the reverse worktree pointer are relative. The branch, HEAD,
 index, refs and object database belong to that tree, not the original source or another
-World. Initial import mirrors resolvable `refs/*` with Git's `--mirror` mode and
-`--no-hardlinks`, then restores each captured symbolic-ref edge before creating the private
-worktree; subsequent filesystem forks use APFS cloning, including the Git objects. Git's
+World. Initial import builds the owned repository the way `git clone --mirror` would --
+the same bare layout, packed `refs/*`, HEAD and symbolic-ref edges -- but does not
+transfer objects through Git: the source's common object directory is cloned with the
+filesystem's copy-on-write primitive (see [Import cost](#import-cost)) and the captured refs
+are written over it in one `update-ref` transaction. Subsequent filesystem forks use APFS
+cloning, including the Git objects. Git's
 [worktree documentation](https://git-scm.com/docs/git-worktree) describes these per-worktree
 administrative links.
 
@@ -154,13 +157,57 @@ Worlds forked or checkpointed from a World keep its hooks, since its whole `.wor
 World requires the same of a relative `core.hooksPath` set in it -- committed, nothing pending
 inside -- even without `--with-hooks`.
 
+## Git LFS
+
+Repositories that use the stock Git LFS filter are supported at the root and in initialized
+submodules. The tracked checkout may contain hydrated files or pointer files. External import
+preserves the worktree bytes and index as captured, and copies the repository's local
+`.git/lfs/objects` cache into the World's owned Git administration. Each payload's SHA-256,
+fan-out path and recorded size are checked before publication, and the source cache is rechecked
+afterward. To determine tracked-file status, import uses only Git LFS's canonical clean/process
+filters with an isolated temporary `lfs.storage`; smudge/process are set to skip, so this check
+does not download content or write to the source cache. The temporary storage is discarded.
+A global LFS filter that no tracked file uses remains harmless. Pointer hashing detects whether the
+installed Git LFS help advertises `--no-extensions`; older releases without that option use their
+legacy raw SHA-256 pointer command. Unrecognized or failed help is refused rather than retried with
+an unsafe command. Git LFS 3.8.0 is the tested version.
+
+The owned cache is independent of the source. After import, deleting or moving the source and
+its cache does not affect offline work. Forks and checkpoints carry each root and submodule cache
+with their owned Git administration. `--committed-only` resets to HEAD with LFS smudging skipped
+while the stock process filter still recognizes pointers, then runs `git lfs checkout` against
+the local cache: available payloads are hydrated, while an
+uncached pointer stays a pointer. Ordinary import and `--include-changes` retain the original
+worktree and staged bytes.
+
+Only the stock `git-lfs` clean, smudge and process commands are admitted when a tracked path uses
+`filter=lfs`; unused custom or incomplete filters remain inert. Carried repository LFS extensions,
+custom transfer agents, non-local storage, and relative endpoints are refused even if the current
+checkout has no LFS paths or cache, because later checkouts could use them. Dormant settings from
+global or system configuration are not carried or treated as repository policy. Absolute LFS
+endpoint URLs are carried. A complete stock LFS filter setup from repository, global, or system
+configuration is retained when only another preserved branch uses LFS. Accepted canonical
+`smudge --skip` and `filter-process --skip` variants are retained in
+the World's owned local filter configuration. An ordinary import installs and pins its generated pre-push hook in the World's own Git
+administration, independent of ambient `core.hooksPath`; under `--with-hooks`, a carried in-tree
+`core.hooksPath` must already contain an executable canonical Git LFS pre-push hook, so import
+does not add untracked hook files. An existing pre-push hook is carried only when it is Git LFS's
+canonical script (other supported hooks retain their normal handling). An ordinary `git push` then
+transfers payloads to its remote. `publish` validates Git LFS pointers and `.lfsconfig` in every
+commit reachable from the branch being published, including history already present in the
+destination. Each required payload must be valid in the destination cache or available in the
+World's local cache for copying. Publishing fails if a required historical payload is missing or
+corrupt, or a historical `.lfsconfig` uses an unsupported endpoint. This can reject an otherwise
+unrelated publish until missing legacy payloads are restored; publishing does not download
+missing payloads.
+
 ## Submodules
 
 An initialized submodule -- a directory the index records as a gitlink that holds a `.git`,
 at any depth up to 8 levels of nesting -- is imported with the root. Its repository is copied
-the way the root's is (a `--mirror --no-hardlinks` clone, then its index, symbolic refs, local
+the way the root's is (its object directory cloned and its refs written, then its index, symbolic refs, local
 rules, rerere cache, status settings, identity, carried remotes and submodule settings,
-`SQUASH_MSG`, `FETCH_HEAD`, `ORIG_HEAD` and, with `--with-hooks`, its hooks) into the place
+`SQUASH_MSG`, `FETCH_HEAD`, `ORIG_HEAD`, its stash stack and, with `--with-hooks`, its hooks) into the place
 Git itself uses for a submodule of a linked worktree: `modules/<name>` of the superproject's
 Git directory, which for the root is the World's per-worktree
 `.world-git/repo.git/worktrees/active`, and `modules/<name>/modules/<name>` for a nested one.
@@ -177,8 +224,8 @@ directory as its worktree. In the World every submodule is absorbed; the source 
 modified.
 
 Every check the root's import makes is made on each submodule's repository too -- the
-configuration policy and filters, extensions, partial/shallow/alternates, stash and hidden
-refs, grafts, in-progress operations, dangling symbolic refs, reserved paths in its history,
+configuration policy and filters, extensions, partial/shallow/alternates, hidden refs, the
+stash stack (see [Stash](#stash)), grafts, in-progress operations, dangling symbolic refs, reserved paths in its history,
 symlinked or unexpected administration -- and each is rechecked unchanged before publication.
 The `.gitmodules` settings of every repository with gitlinks are read again from the copy
 -- after any `--committed-only` reset, so the bytes that will be published -- and must equal,
@@ -409,11 +456,12 @@ content, including Git administrative changes such as branch/index updates.
 - Plain nested repositories (not submodules; see [Submodules](#submodules)), sparse or split
   indexes, shallow/partial clones, and object alternates are refused, in the root and in every
   submodule. So is a repository whose index, or any commit reachable
-  from its refs, HEAD, `ORIG_HEAD` or `FETCH_HEAD`, contains the root `.world` file or
+  from its refs, HEAD, `ORIG_HEAD`, `FETCH_HEAD` or any stash entry (its worktree, index and
+  untracked-files commits), contains the root `.world` file or
   anything under `.world-git`: WorldFS owns those paths, `info/exclude` cannot hide a
   tracked file, and an ordinary checkout of such a commit overwrites the World marker. Partial clones are recognized by `extensions.partialClone`,
   by any `remote.<name>.promisor` or `remote.<name>.partialclonefilter` setting, and by
-  `pack-*.promisor` markers, because a local mirror copies an object database without its
+  `pack-*.promisor` markers, because cloning an object database does not bring back its
   missing objects. Managed Worlds with symlinked administration or additional
   linked worktrees are refused by fork/checkpoint. Discard also refuses registered extra
   worktrees, including with `--force`, until they have been removed with Git. Do not create
@@ -422,8 +470,9 @@ content, including Git administrative changes such as branch/index updates.
   crash) is refused, so the lock is never copied into the child. Merge/rebase/cherry-pick/revert in progress
   is also refused, as is an unconcluded `git notes merge`, whose state is invisible to
   `git status`. Re-import older snapshots that still contain an unconverted `.git`.
-- Git LFS hydration, reftable repositories, a shared refs/object service, cross-machine
-  history transfer, and publishing submodule commits are not provided. This increment does not close every requirement in Issue #7.
+- Reftable repositories, a shared refs/object service, cross-machine history transfer, and
+  publishing submodule commits are not provided. This increment does not close every requirement
+  in Issue #7.
 - Repository-local `core.excludesFile` and `core.attributesFile` overrides are unsupported.
   They can point outside the repository, and merging their rules into `info/exclude` or
   `info/attributes` would change Git's precedence; these overrides are not imported. Use the
@@ -435,7 +484,7 @@ content, including Git administrative changes such as branch/index updates.
 - Repository extensions are admitted only when the owned repository reproduces them:
   `extensions.objectFormat` (SHA-1 and SHA-256 repositories), the files ref backend, and the
   sparse-checkout `worktreeConfig` case above. Others, such as `extensions.preciousObjects`,
-  are refused because a mirror clone does not carry them.
+  are refused because the owned repository does not carry them.
 - Git snapshots can be pooled (`pool fill S<n>`). An entry is a plain clone of the snapshot
   with no branch of its own; the fork that takes it runs the same per-World Git setup an
   ordinary fork runs on its temporary tree -- the managed-layout checks, the `world/W<n>`
@@ -487,13 +536,16 @@ global and system configuration.
 
 What cannot be shared is refused with a Git configuration error that names the reason:
 
-- A filter that tracked files actually use (for example Git LFS), from any scope. A filter
-  that is only defined, such as the one a machine-wide `git lfs install` adds, is fine in a
-  repository whose files do not use it; so is a `filter=` attribute whose driver is not
-  defined anywhere. With `--committed-only`, the files and attributes of HEAD count too, so
-  a filter HEAD assigns is refused even when uncommitted edits remove the assignment. Filters
-  are never executed by the import.
-- A conditional `includeIf` whose target sets status or filter settings, in any scope and
+- A filter tracked files actually use, from any scope, unless it is the supported stock Git LFS
+  filter described above. Custom or incomplete `filter.lfs` commands, LFS extensions and an
+  external `lfs.storage` are refused. A filter that is only defined, such as the one a
+  machine-wide `git lfs install` adds, is fine in a repository whose files do not use it; so is
+  a `filter=` attribute whose driver is not defined anywhere. With `--committed-only`, the files
+  and attributes of HEAD count too, so a filter HEAD assigns is refused even when uncommitted
+  edits remove the assignment. Unsupported filters are never executed; the stock Git LFS status
+  path is isolated in temporary storage as described above.
+- A conditional `includeIf` whose target sets status, filter, or LFS settings (`lfs.*`,
+  `remote.lfsdefault`, `remote.lfspushdefault`), in any scope and
   whether or not it is active at the source: the condition (a `gitdir:` pattern, a branch)
   can evaluate differently at the World's location. The same is refused for a target that
   sets per-remote or per-branch settings (`remote.<name>.*`, `branch.<name>.*`), since a
@@ -525,8 +577,8 @@ include that resolves to different content at the new location (hooks, identity 
 other setting) makes the operation fail.
 Other refusals report `unsupported Git layout` followed by a `reason:` line naming the
 specific cause (for example `reftable ref storage` or `nested Git repository or submodule`).
-Mirror imports
-use an empty template directory so installed Git templates cannot add hooks or rules.
+Owned repositories
+are created with an empty template directory so installed Git templates cannot add hooks or rules.
 
 ### External reference restrictions
 
@@ -537,14 +589,37 @@ backend are refused because it offers no read-only way to find such refs; the ow
 repositories themselves always use the files backend.
 
 Initial imports from external repositories reject any configured `transfer.hideRefs`
-or `uploadpack.hideRefs`, because the mirror transport may omit those refs. They
-also reject an existing `refs/stash` reflog: mirroring a ref does not preserve the
-stash stack. Ref tips without a stash reflog remain supported. Import does not
-promise preservation of other external reflog history.
+or `uploadpack.hideRefs`, because the mirror transport may omit those refs.
+This restriction does not apply to managed Worlds: their Git administration is
+cloned as part of the filesystem, retaining hidden refs through forks and checkpoints.
+External eligibility is checked again around import.
 
-These restrictions do not apply to managed Worlds: their Git administration is
-cloned as part of the filesystem, retaining hidden refs and native stash stacks
-through forks and checkpoints. External eligibility is checked again around import.
+### Stash
+
+The whole stash stack is imported, in the root and in every initialized submodule (each
+repository has its own). A stash is `refs/stash` plus its reflog, `logs/refs/stash` in the
+repository's common directory (shared by all of its worktrees): `stash@{0}` is the ref and
+`stash@{1..n}` exist only as reflog entries. The object-store clone includes objects that only
+older reflog entries reach. Import writes the stash reflog byte for byte where the owned
+repository's Git reads it (for the root, `.world-git/repo.git/logs/refs/stash`, which the World's
+worktree shares), then restores the reflog and verifies every entry's commit, index and
+untracked-files commit/tree in that object store. Nothing in the source changes and no hook or
+filter runs.
+
+The reflog's bytes are part of the captured state: a stash pushed, dropped or popped in the
+source before publication aborts the import like any other ref change. The copy that will be
+published is then read back by Git itself -- the same reflog bytes, the same entries (selector,
+commit, tree, parents and message) and every commit, tree and blob of every entry present --
+and must match the source as a whole. Stash entries are history the World can check out
+(`git stash apply` writes their trees), so the reserved-path check covers them too: an entry
+whose worktree, index or untracked-files tree holds `.world` or `.world-git` is refused. In the
+World, after the source is deleted, `git stash list/show/apply/pop` work as they did in the
+source; forks and checkpoints (with `--committed-only` too, which never touches the stash) keep
+the stack, since the whole `.world-git` is cloned. `publish` moves one branch only and never
+publishes a stash.
+
+Only the stash reflog is carried, because the stash *is* a reflog. Other reflogs (`HEAD`,
+branches) are not imported, and import does not promise preservation of that history.
 
 External repositories with `info/grafts` are rejected because their local ancestry
 overrides are not transported by a mirror. Active bisect and sequencer sessions,
@@ -566,7 +641,41 @@ repository and rechecked before publication, so recurring conflicts still resolv
 the source is deleted. Git's layout of one directory per conflict holding regular files
 is required: a symlinked cache, nested directories or special files are refused.
 
-External imports budget the full logical size of the common Git object directory
-and the rerere cache in addition to filesystem clone metadata and the free-space reserve. This includes
-objects outside a linked worktree. Managed Worlds use filesystem cloning for their
-owned object databases and do not incur this additional full-copy budget.
+### Import cost
+
+An external import does not byte-copy the Git object store. Each owned repository -- the
+root's and every submodule's -- is built by one helper (`own_repository` in
+`core/src/git.cpp`):
+
+1. `git init --bare --template=` with the source's object format.
+2. The source's common `objects/` directory is cloned with `fs_clone_tree`: clonefile on
+   APFS, reflinks on XFS/Btrfs, a (sparse-aware) copy on ext4 or when the object directory
+   is on another volume. Symlinks are never followed. The clone is then reduced to what an
+   object store holds -- loose objects, packs with their `.idx`/`.rev`/`.bitmap`/`.keep`/
+   `.mtimes`, multi-pack indexes, `info/packs` and commit-graphs. Files Git leaves
+   mid-write (`tmp_obj_*`, `tmp_pack_*`, `.tmp-*`) and `incoming-*` quarantine directories
+   of a push not yet accepted are dropped: they are not part of the repository, and anything
+   reachable that is missing is caught below. A symlink or special file, alternates or a
+   promisor pack found in the clone are refused as they are in the source.
+3. The captured refs are written with one `update-ref --stdin` transaction (which checks
+   each tip object exists) and packed with `pack-refs --all`; HEAD, the transient
+   `remote.origin` mirror settings (removed again with the rest of the import) and the
+   symbolic-ref edges follow. Nothing is fetched or re-packed.
+
+The result matches what `git clone --mirror --no-hardlinks` produced, except that ref
+directories emptied by `pack-refs` (for example `refs/notes`) remain, and a SHA-256
+repository has its `[extensions]` section first in `config`.
+
+A source that repacks or collects garbage during the import can make the clone miss an
+object (a pack deleted before the clone reached it). Before publication every owned
+repository is walked -- `rev-list --objects` over all refs and HEADs, reflogs, the index,
+`ORIG_HEAD` and `FETCH_HEAD` tips, with `--no-replace-objects` -- and a missing object fails
+the import as busy (retryable) rather than publishing it. Changes to the source's object
+directory are also detected by the existing size recheck. The walk is Git's own
+post-fetch connectivity check; it costs a history traversal without reading blob contents.
+
+The free-space preflight follows the tree clone's budget: where the object directory can be
+cloned into the store's volume sharing data, it costs its metadata (1 KiB per entry);
+where it is copied (ext4, another volume) the full logical size of the object directory is
+budgeted. The rerere cache is always budgeted in full. Managed Worlds clone their owned
+object databases with the rest of the tree and incur no additional budget.

@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <algorithm>
 #include <utility>   // std::move only
 
 extern char **environ;
@@ -33,7 +34,7 @@ int refuse(int code, const char *fmt, ...) {
 // `ambient_config_probe` keeps the user's global/system configuration (and GIT_CONFIG_* command
 // configuration) so a check sees files the way the user's own Git does; `stdin_fd`, when >= 0,
 // becomes the child's standard input.
-int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, int *exit_code = nullptr, bool quiet_stderr = false, bool ambient_config_probe = false, int stdin_fd = -1) {
+int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, int *exit_code = nullptr, bool quiet_stderr = false, bool ambient_config_probe = false, int stdin_fd = -1, bool skip_lfs_smudge = false, bool no_system_attributes = false) {
     if (exit_code) *exit_code = -1;
     Vec<char *> av;
     const char *prefix[] = {"git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
@@ -48,10 +49,13 @@ int git(const char *cwd, const char *const *args, Vec<char> *output = nullptr, i
             (!strncmp(*p, "GIT_CONFIG_GLOBAL=", 18) || !strncmp(*p, "GIT_CONFIG_SYSTEM=", 18) ||
              !strncmp(*p, "GIT_CONFIG_NOSYSTEM=", 20) || !strncmp(*p, "GIT_CONFIG_COUNT=", 17) ||
              !strncmp(*p, "GIT_CONFIG_KEY_", 15) || !strncmp(*p, "GIT_CONFIG_VALUE_", 17) ||
-             !strncmp(*p, "GIT_CONFIG_PARAMETERS=", 22)))) env.emplace_back(*p);
+             !strncmp(*p, "GIT_CONFIG_PARAMETERS=", 22))) &&
+            !(no_system_attributes && !strncmp(*p, "GIT_ATTR_NOSYSTEM=", 18))) env.emplace_back(*p);
     }
     const char *settings[] = {"GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1"};
     for (const char *p : settings) env.emplace_back(const_cast<char *>(p));
+    if (skip_lfs_smudge) env.emplace_back(const_cast<char *>("GIT_LFS_SKIP_SMUDGE=1"));
+    if (no_system_attributes) env.emplace_back(const_cast<char *>("GIT_ATTR_NOSYSTEM=1"));
     if (!ambient_config_probe) {
         env.emplace_back(const_cast<char *>("GIT_CONFIG_NOSYSTEM=1"));
         env.emplace_back(const_cast<char *>("GIT_CONFIG_GLOBAL=/dev/null"));
@@ -101,6 +105,24 @@ int value(const char *root, const char *const *args, String &out, bool missing_o
     out.assign(bytes.data());
     if (!out.empty() && out.back() == '\n') out.pop_back();
     return 0;
+}
+// Older Git LFS releases hash pointer payloads directly but do not accept
+// --no-extensions. Newer releases need that flag to avoid running configured
+// extensions. Probe once, fail closed on an unrecognized CLI, and select the
+// raw-hash-compatible command form for every pointer verification.
+int lfs_pointer_oracle(const char *root, const char *file_arg, Vec<char> *output = nullptr, int stdin_fd = -1) {
+    static int no_extensions = -1;
+    if (no_extensions < 0) {
+        const char *help_args[] = {"lfs", "pointer", "-h", nullptr};
+        Vec<char> help;
+        if (int rc = git(root, help_args, &help)) return rc;
+        if (!help.data() || !strstr(help.data(), "--file") || !strstr(help.data(), "--check"))
+            return WFS_E_GIT_FAILED;
+        no_extensions = strstr(help.data(), "--no-extensions") ? 1 : 0;
+    }
+    const char *modern[] = {"lfs", "pointer", "--no-extensions", file_arg, nullptr};
+    const char *legacy[] = {"lfs", "pointer", file_arg, nullptr};
+    return git(root, no_extensions ? modern : legacy, output, nullptr, false, false, stdin_fd);
 }
 int collect_symrefs(const char *root, Vec<GitSymref> &out) {
     const char *args[] = {"for-each-ref", "--format=%(refname)%09%(symref)", nullptr};
@@ -352,7 +374,9 @@ int capture_settings(const char *root, Vec<GitSetting> &out) {
 // since reproducing Git's rewrite of a relative path after the World moves elsewhere cannot be
 // done faithfully.
 const char *const kCarriedConfig =
-    "^(remote\\..+\\.(url|pushurl|fetch|push|tagopt|prune|prunetags|mirror|skipdefaultupdate|skipfetchall|followremotehead)"
+    "^(remote\\..+\\.(url|pushurl|lfsurl|lfspushurl|lfsdefault|lfspushdefault|fetch|push|tagopt|prune|prunetags|mirror|skipdefaultupdate|skipfetchall|followremotehead)"
+    "|remote\\.(lfsdefault|lfspushdefault)"
+    "|lfs\\..+"
     "|remotes\\..+|remote\\.pushdefault"
     "|branch\\..+\\.(remote|merge|pushremote|rebase|description)"
     "|url\\..+\\.(insteadof|pushinsteadof)"
@@ -923,7 +947,88 @@ int capture_orig(const char *root, bool &present, String &oid) {
     if ((rc = value(root, verify, oid))) return rc;
     present = true; return 0;
 }
-int walk_objects_fd(int fd, unsigned depth, uint64_t &total) {
+// The stash stack is refs/stash plus its reflog: stash@{n} for n > 0 exists only as a reflog
+// entry. Each line of a reflog is "<old> <new> <ident>\t<message>\n"; the entries' commits are
+// the non-null <new> object IDs. Anything else is refused rather than guessed at.
+int stash_tips(const Vec<char> &log, Vec<String> &out) {
+    out.clear();
+    auto hex_run = [&](size_t i, size_t end) {
+        size_t j = i;
+        while (j < end && ((log[j] >= '0' && log[j] <= '9') || (log[j] >= 'a' && log[j] <= 'f'))) ++j;
+        return j - i;
+    };
+    size_t start = 0, n = log.size();
+    while (start < n) {
+        size_t end = start;
+        while (end < n && log[end] != '\n') ++end;
+        size_t len = hex_run(start, end), at = start + len + 1;
+        if ((len != 40 && len != 64) || at >= end || log[at - 1] != ' ' || hex_run(at, end) != len ||
+            at + len >= end || log[at + len] != ' ')
+            return refuse(WFS_E_GIT_UNSUPPORTED, "the stash reflog could not be parsed");
+        bool null = true;
+        for (size_t i = at; i < at + len; ++i) if (log[i] != '0') { null = false; break; }
+        if (!null) out.emplace_back(log.data() + at, len);
+        start = end + 1;
+    }
+    return 0;
+}
+// Revisions for the objects of the stash entries that the mirror does not already hold: every
+// entry, minus everything reachable from the other captured refs (`refs`, "<name>\t<oid>\n",
+// which the mirror copies with their history). One per line, for --stdin / --revs.
+int stash_revs(const GitRepoState &s, FILE *&out) {
+    out = nullptr;
+    Vec<String> tips;
+    if (int rc = stash_tips(s.stash, tips)) return rc;
+    if (tips.empty()) return 0;
+    String text;
+    for (const auto &tip : tips) { text.append(tip.c_str()); text.push_back('\n'); }
+    size_t start = 0, n = s.refs.size();
+    for (size_t i = 0; i <= n; ++i) {
+        if (i < n && s.refs[i] != '\n' && s.refs[i] != '\0') continue;
+        size_t tab = start;
+        while (tab < i && s.refs[tab] != '\t') ++tab;
+        if (tab + 1 < i && !(tab - start == 10 && !memcmp(s.refs.data() + start, "refs/stash", 10))) {
+            text.push_back('^'); text.append(s.refs.data() + tab + 1, i - tab - 1); text.push_back('\n');
+        }
+        start = i + 1;
+    }
+    out = tmpfile();
+    if (!out) return -errno;
+    if (fwrite(text.c_str(), 1, text.size(), out) != text.size() || fflush(out)) {
+        int rc = errno ? -errno : -EIO; fclose(out); out = nullptr; return rc;
+    }
+    rewind(out);
+    return 0;
+}
+// The stash stack of the repository at `root` as the import keeps it: the reflog's bytes, Git's
+// own listing of every entry (its selector, commit, tree, parents -- the index and untracked-
+// files commits -- and message), and proof that every object of every entry is present.
+// Recorded in `out`, whose `refs` must already be captured. A repository without a stash
+// reflog (refs/stash alone, as `update-ref` leaves it, is an ordinary ref) records none.
+int capture_stash(const char *root, GitRepoState &out) {
+    const char *path_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "logs/refs/stash", nullptr};
+    if (int rc = value(root, path_args, out.stash_path)) return rc;
+    int rc = read_bytes(out.stash_path.c_str(), out.stash);
+    out.stash_present = rc == 0;
+    out.stash_list.clear();
+    if (rc == -ENOENT) { out.stash.clear(); return 0; }
+    if (rc) return rc;
+    const char *list[] = {"--no-replace-objects", "log", "--walk-reflogs", "--no-show-signature", "--no-decorate",
+        "--no-color", "--format=%gD%x09%H%x09%T%x09%P%x09%gs", "refs/stash", "--", nullptr};
+    if ((rc = git(root, list, &out.stash_list))) return rc;
+    FILE *revs = nullptr;
+    if ((rc = stash_revs(out, revs))) return rc;
+    if (!revs) return 0;
+    // Fails on any missing commit, tree or blob of an entry.
+    const char *walk[] = {"--no-replace-objects", "rev-list", "--objects", "--quiet", "--stdin", nullptr};
+    rc = git(root, walk, nullptr, nullptr, false, false, fileno(revs));
+    fclose(revs);
+    return rc;
+}
+bool same_stash(const GitRepoState &a, const GitRepoState &b) {
+    return a.stash_present == b.stash_present && same_bytes(a.stash, b.stash) && same_bytes(a.stash_list, b.stash_list);
+}
+int walk_objects_fd(int fd, unsigned depth, uint64_t &total, uint64_t &entries) {
     if (depth > 256) return refuse(WFS_E_GIT_UNSUPPORTED, "the object directory is nested too deeply");
     int dupfd = dup(fd); if (dupfd < 0) return -errno;
     DIR *dir = fdopendir(dupfd);
@@ -941,20 +1046,95 @@ int walk_objects_fd(int fd, unsigned depth, uint64_t &total) {
         if (UINT64_MAX - total < 1024 || (S_ISREG(st.st_mode) && (uint64_t)st.st_size > UINT64_MAX - total - 1024)) { rc = -EOVERFLOW; break; }
         if (S_ISREG(st.st_mode) && st.st_size < 0) { rc = -EOVERFLOW; break; }
         total += 1024 + (S_ISREG(st.st_mode) ? (uint64_t)st.st_size : 0);
+        ++entries;
         if (S_ISDIR(st.st_mode)) {
             int child = openat(fd, e->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
             if (child < 0) { rc = -errno; break; }
-            rc = walk_objects_fd(child, depth + 1, total); close(child);
+            rc = walk_objects_fd(child, depth + 1, total, entries); close(child);
             if (rc) break;
         }
     }
     closedir(dir); return rc;
 }
-int object_import_bytes(const char *common, uint64_t &total) {
+// The logical size of the common object directory (1 KiB of metadata per entry plus every
+// file's bytes) and its entry count, refusing symlinks and special files anywhere in it.
+int object_import_bytes(const char *common, uint64_t &total, uint64_t *entries = nullptr) {
     String objects = joinp(common, "objects");
     int fd = open(objects.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) return -errno;
-    total = 0; int rc = walk_objects_fd(fd, 0, total); close(fd); return rc;
+    uint64_t count = 0;
+    total = 0; int rc = walk_objects_fd(fd, 0, total, count); close(fd);
+    if (entries) *entries = count;
+    return rc;
+}
+int validate_lfs_files(const char *root, const String &dir, const String &rel, Vec<char> &manifest, unsigned depth) {
+    if (depth > 32) return refuse(WFS_E_GIT_UNSUPPORTED, "the Git LFS object cache is nested too deeply");
+    int fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return errno == ELOOP || errno == ENOTDIR
+        ? refuse(WFS_E_GIT_UNSUPPORTED, "the Git LFS cache contains a symlink or special file") : -errno;
+    DIR *d = fdopendir(fd);
+    if (!d) { int rc = -errno; close(fd); return rc; }
+    int rc = 0;
+    Vec<String> names;
+    for (;;) {
+        errno = 0; dirent *e = readdir(d);
+        if (!e) { if (errno) rc = -errno; break; }
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        names.emplace_back(e->d_name);
+    }
+    closedir(d);
+    if (rc) return rc;
+    std::sort(names.begin(), names.end(), [](const String &a, const String &b) { return a < b; });
+    for (const auto &name : names) {
+        struct stat st;
+        int dfd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (dfd < 0) return -errno;
+        if (fstatat(dfd, name.c_str(), &st, AT_SYMLINK_NOFOLLOW)) { rc = -errno; close(dfd); break; }
+        close(dfd);
+        String child = joinp(dir.c_str(), name.c_str());
+        String child_rel = rel.empty() ? String(name.c_str()) : joinp(rel.c_str(), name.c_str());
+        if (S_ISDIR(st.st_mode)) { rc = validate_lfs_files(root, child, child_rel, manifest, depth + 1); if (rc) break; continue; }
+        if (!S_ISREG(st.st_mode) || st.st_size < 0) {
+            rc = refuse(WFS_E_GIT_UNSUPPORTED, "the Git LFS cache contains a symlink or special file (%s)", child_rel.c_str()); break;
+        }
+        String file_arg("--file="); file_arg.append(child.c_str());
+        Vec<char> pointer;
+        if ((rc = lfs_pointer_oracle(root, file_arg.c_str(), &pointer))) {
+            rc = refuse(WFS_E_GIT_UNSUPPORTED, "Git LFS cache object %s is corrupt", child_rel.c_str()); break;
+        }
+        char oid[65] = {0}; unsigned long long size = 0;
+        if (sscanf(pointer.data(), "version https://git-lfs.github.com/spec/v1\noid sha256:%64[0-9a-f]\nsize %llu", oid, &size) != 2 ||
+            strlen(oid) != 64 || size != (unsigned long long)st.st_size) {
+            rc = refuse(WFS_E_GIT_UNSUPPORTED, "Git LFS cache object %s is corrupt", child_rel.c_str()); break;
+        }
+        String expected(oid, 2); expected.push_back('/'); expected.append(oid + 2, 2); expected.push_back('/'); expected.append(oid);
+        if (expected != child_rel) {
+            rc = refuse(WFS_E_GIT_UNSUPPORTED, "Git LFS cache object %s does not match its SHA-256 name", child_rel.c_str()); break;
+        }
+        for (char c : child_rel) manifest.emplace_back(c); manifest.emplace_back('\0');
+        for (size_t i = 0; i < 64; ++i) manifest.emplace_back(oid[i]); manifest.emplace_back('\0');
+        char size_text[32]; int n = snprintf(size_text, sizeof size_text, "%llu", size);
+        for (int i = 0; i < n; ++i) manifest.emplace_back(size_text[i]); manifest.emplace_back('\0');
+    }
+    return rc;
+}
+int lfs_import_bytes(const char *root, const char *objects, uint64_t &total, uint64_t &entries,
+                     bool &present, Vec<char> &manifest) {
+    struct stat st;
+    if (lstat(objects, &st)) {
+        if (errno == ENOENT) { total = entries = 0; present = false; manifest.clear(); return 0; }
+        return -errno;
+    }
+    if (!S_ISDIR(st.st_mode))
+        return refuse(WFS_E_GIT_UNSUPPORTED, "the Git LFS object cache is not a real directory");
+    int fd = open(objects, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    present = true;
+    total = entries = 0;
+    int rc = walk_objects_fd(fd, 0, total, entries);
+    close(fd);
+    if (!rc) { manifest.clear(); rc = validate_lfs_files(root, String(objects), String(), manifest, 0); }
+    return rc;
 }
 int reject_configured_policy(const char *root, const char *key) {
     const char *args[] = {"config", "--get", key, nullptr};
@@ -990,7 +1170,8 @@ bool is_status_or_filter_key(const char *key) {
         "core.trustctime", "core.checkstat", "core.ignorestat", "core.checkroundtripencoding",
         "core.usereplacerefs", "attr.tree", nullptr};
     for (size_t i = 0; keys[i]; ++i) if (!strcasecmp(key, keys[i])) return true;
-    return !strncasecmp(key, "filter.", 7);
+    return !strncasecmp(key, "filter.", 7) || !strncasecmp(key, "lfs.", 4) ||
+        !strcasecmp(key, "remote.lfsdefault") || !strcasecmp(key, "remote.lfspushdefault");
 }
 // Whether `key` names a per-remote, per-branch or per-submodule setting --
 // "remote.<subsection>.<var>", "branch.<subsection>.<var>" or "submodule.<subsection>.<var>" --
@@ -1206,7 +1387,9 @@ int scan_conditional_includes(const char *root, bool *sets_identity, Vec<UrlRewr
     return 0;
 }
 // Refuses a `check-attr filter` result that assigns any path a defined driver.
-int reject_filter_attrs(const Vec<char> &attrs, const Vec<char> &defined) {
+int validate_lfs_filter(const char *root, bool &defined);
+int validate_lfs_storage(const char *root, bool ambient_config_probe = true, Vec<char> *snapshot = nullptr);
+int reject_filter_attrs(const char *root, const Vec<char> &attrs, const Vec<char> &defined, bool *uses_lfs) {
     // Triples "<path>\0filter\0<value>\0".
     for (size_t i = 0; i < attrs.size() && attrs[i];) {
         const char *path = attrs.data() + i; i += strlen(path) + 1;
@@ -1224,11 +1407,254 @@ int reject_filter_attrs(const Vec<char> &attrs, const Vec<char> &defined) {
             const char *dot = strrchr(key, '.');
             if (!dot || dot < key + 7 || (size_t)(dot - (key + 7)) != dlen || memcmp(key + 7, driver, dlen)) continue;
             const char *field = dot + 1;
-            if (!strcmp(field, "clean") || !strcmp(field, "smudge") || !strcmp(field, "process"))
+            if (!strcmp(field, "clean") || !strcmp(field, "smudge") || !strcmp(field, "process")) {
+                if (dlen == 3 && !memcmp(driver, "lfs", 3)) {
+                    bool lfs_defined = false;
+                    if (int rc = validate_lfs_filter(root, lfs_defined)) return rc;
+                    if (!lfs_defined) return -EINVAL;
+                    if (int rc = validate_lfs_storage(root)) return rc;
+                    if (uses_lfs) *uses_lfs = true;
+                    continue;
+                }
                 return refuse(WFS_E_GIT_POLICY, "tracked file %s uses the '%s' filter (e.g. Git LFS), which WorldFS does not run", path, driver);
+            }
         }
     }
     return 0;
+}
+// Admit only Git LFS's stock filters. Running an arbitrary command under the lfs name would
+// turn status, checkout, or publish into arbitrary code execution; extensions can also transform
+// payloads in ways the local cache copier cannot reproduce.
+int validate_lfs_filter(const char *root, bool &defined) {
+    defined = false;
+    const char *ext[] = {"config", "--get-regexp", "^lfs\\.extension\\.", nullptr};
+    Vec<char> ext_bytes; int ext_status = -1;
+    if (int rc = git(root, ext, &ext_bytes, &ext_status, false, true)) {
+        if (rc != WFS_E_GIT_FAILED || ext_status != 1) return rc;
+    } else return refuse(WFS_E_GIT_POLICY, "Git LFS extensions are not supported");
+    String clean, smudge, process, required;
+    const char *clean_args[] = {"config", "--get", "filter.lfs.clean", nullptr};
+    const char *smudge_args[] = {"config", "--get", "filter.lfs.smudge", nullptr};
+    const char *process_args[] = {"config", "--get", "filter.lfs.process", nullptr};
+    const char *required_args[] = {"config", "--get", "--type=bool", "filter.lfs.required", nullptr};
+    bool have_clean = false, have_smudge = false, have_process = false, have_required = false;
+    Vec<char> b; int status = -1;
+#define GET_AMBIENT(args, out, flag) do { \
+    status = -1; b.clear(); int grc = git(root, args, &b, &status, false, true); \
+    if (grc == WFS_E_GIT_FAILED && status == 1) { out.clear(); flag = false; } \
+    else if (grc) return grc; \
+    else { out.assign(b.data()); if (!out.empty() && out.back() == '\n') out.pop_back(); flag = true; } \
+} while (0)
+    GET_AMBIENT(clean_args, clean, have_clean);
+    GET_AMBIENT(smudge_args, smudge, have_smudge);
+    GET_AMBIENT(process_args, process, have_process);
+    GET_AMBIENT(required_args, required, have_required);
+#undef GET_AMBIENT
+    defined = have_clean || have_smudge || have_process;
+    if (!defined) return 0;
+    bool clean_ok = clean == "git-lfs clean -- %f";
+    bool smudge_ok = smudge == "git-lfs smudge -- %f" || smudge == "git-lfs smudge --skip -- %f";
+    bool process_ok = process == "git-lfs filter-process" || process == "git-lfs filter-process --skip";
+    if (!have_clean || !have_smudge || !have_process || !clean_ok || !smudge_ok || !process_ok ||
+        (have_required && required != "true"))
+        return refuse(WFS_E_GIT_POLICY, "custom or incomplete filter.lfs configuration is not supported");
+    return 0;
+}
+// A machine-wide or repository-local stock LFS filter is enough to declare that LFS is
+// supported by this repository, even when the current checkout has no LFS attributes or cache.
+// Unused custom/incomplete tuples remain inert under reject_used_filters.
+int canonical_lfs_setup(const char *root, bool &canonical, bool &skip_smudge, bool &skip_process) {
+    canonical = false;
+    skip_smudge = skip_process = false;
+    String clean, smudge, process, required;
+    bool have_clean = false, have_smudge = false, have_process = false, have_required = false;
+    auto get = [&](const char *key, String &value, bool &present) -> int {
+        String arg(key);
+        const char *args[] = {"config", "--get", arg.c_str(), nullptr};
+        Vec<char> bytes; int status = -1;
+        int rc = git(root, args, &bytes, &status, false, true);
+        if (rc == WFS_E_GIT_FAILED && status == 1) { value.clear(); present = false; return 0; }
+        if (rc) return rc;
+        value.assign(bytes.data());
+        if (!value.empty() && value.back() == '\n') value.pop_back();
+        present = true;
+        return 0;
+    };
+    if (int rc = get("filter.lfs.clean", clean, have_clean)) return rc;
+    if (int rc = get("filter.lfs.smudge", smudge, have_smudge)) return rc;
+    if (int rc = get("filter.lfs.process", process, have_process)) return rc;
+    const char *required_args[] = {"config", "--get", "--type=bool", "filter.lfs.required", nullptr};
+    Vec<char> required_bytes; int required_status = -1;
+    int required_rc = git(root, required_args, &required_bytes, &required_status, false, true);
+    if (required_rc == WFS_E_GIT_FAILED && required_status == 1) have_required = false;
+    else if (required_rc == WFS_E_GIT_FAILED) return 0; // An invalid dormant bool is not a stock setup.
+    else if (required_rc) return required_rc;
+    else { required.assign(required_bytes.data()); if (!required.empty() && required.back() == '\n') required.pop_back(); have_required = true; }
+    bool clean_ok = clean == "git-lfs clean -- %f";
+    bool smudge_ok = smudge == "git-lfs smudge -- %f" || smudge == "git-lfs smudge --skip -- %f";
+    bool process_ok = process == "git-lfs filter-process" || process == "git-lfs filter-process --skip";
+    canonical = have_clean && have_smudge && have_process && clean_ok && smudge_ok && process_ok &&
+        (!have_required || required == "true");
+    if (canonical) {
+        skip_smudge = smudge == "git-lfs smudge --skip -- %f";
+        skip_process = process == "git-lfs filter-process --skip";
+    }
+    return 0;
+}
+int validate_lfs_storage(const char *root, bool ambient_config_probe, Vec<char> *snapshot) {
+    String storage; bool present = false;
+    const char *args[] = {"config", "--includes", "--null", "--get", "lfs.storage", nullptr};
+    Vec<char> bytes; int status = -1;
+    int rc = git(root, args, &bytes, &status, false, ambient_config_probe);
+    if (rc == WFS_E_GIT_FAILED && status == 1) present = false;
+    else if (rc) return rc;
+    else { present = true; storage.assign(bytes.data()); }
+    if (snapshot) {
+        snapshot->emplace_back('\2'); snapshot->emplace_back(present ? '\1' : '\0');
+        for (char c : bytes) snapshot->emplace_back(c);
+    }
+    if (!present) return 0;
+    if (storage == "lfs") return 0;
+    return refuse(WFS_E_GIT_UNSUPPORTED,
+        "custom lfs.storage is not supported; move its objects into the repository's local lfs cache first");
+}
+bool lfs_endpoint_key(const char *key) {
+    if (!strcmp(key, "lfs.url") || !strcmp(key, "lfs.pushurl")) return true;
+    if (strncmp(key, "remote.", 7)) return false;
+    size_t n = strlen(key);
+    return (n > 7 && !strcmp(key + n - 7, ".lfsurl")) ||
+           (n > 11 && !strcmp(key + n - 11, ".lfspushurl"));
+}
+bool absolute_lfs_endpoint(const char *value) {
+    if (value[0] == '/') return true;
+    const char *sep = strstr(value, "://");
+    if (!sep || sep == value || !isalpha((unsigned char)value[0])) return false;
+    for (const char *p = value + 1; p < sep; ++p)
+        if (!isalnum((unsigned char)*p) && *p != '+' && *p != '-' && *p != '.') return false;
+    return true;
+}
+int validate_lfs_endpoint_listing(const Vec<char> &listing, Vec<char> *snapshot = nullptr) {
+    if (snapshot) for (char c : listing) snapshot->emplace_back(c);
+    for (size_t i = 0; i < listing.size() && listing[i];) {
+        const char *entry = listing.data() + i;
+        size_t n = strlen(entry); i += n + 1;
+        const char *nl = strchr(entry, '\n');
+        String key(entry, nl ? (size_t)(nl - entry) : n);
+        if (!lfs_endpoint_key(key.c_str())) continue;
+        const char *value = nl ? nl + 1 : "";
+        if (!*value || strpbrk(value, "\n\r") || !absolute_lfs_endpoint(value))
+            return refuse(WFS_E_GIT_UNSUPPORTED,
+                "%s must be an absolute URL or absolute filesystem path for Git LFS", key.c_str());
+    }
+    return 0;
+}
+int validate_lfs_tree_config(const char *root, const char *treeish, Vec<char> *snapshot = nullptr) {
+    String tree_arg(treeish);
+    const char *tree_args[] = {"--no-replace-objects", "ls-tree", "-z", tree_arg.c_str(), "--", ".lfsconfig", nullptr};
+    Vec<char> tree;
+    if (int rc = git(root, tree_args, &tree)) return rc;
+    if (tree.empty() || !tree[0]) return 0;
+    const char *tab = (const char *)memchr(tree.data(), '\t', tree.size());
+    if (!tab) return -EIO;
+    char mode[8], oid[72];
+    if (sscanf(tree.data(), "%7s blob %71s", mode, oid) != 2) return -EIO;
+    if (strcmp(mode, "100644") && strcmp(mode, "100755"))
+        return refuse(WFS_E_GIT_UNSUPPORTED, "%s:.lfsconfig is not a regular file", treeish);
+    String blobarg("--blob="); blobarg.append(oid);
+    const char *blob_args[] = {"--no-replace-objects", "config", blobarg.c_str(), "--null", "--list", nullptr};
+    Vec<char> listing;
+    if (int rc = git(root, blob_args, &listing)) return rc;
+    if (int rc = validate_lfs_endpoint_listing(listing)) return rc;
+    if (snapshot) {
+        snapshot->emplace_back('\1');
+        for (char c : tree) snapshot->emplace_back(c);
+        for (char c : listing) snapshot->emplace_back(c);
+    }
+    return 0;
+}
+int capture_lfs_endpoint_state(const char *root, Vec<char> &state, bool ambient_config_probe) {
+    state.clear();
+    if (int rc = validate_lfs_storage(root, ambient_config_probe, &state)) return rc;
+    const char *extension_args[] = {"config", "--includes", "--null", "--get-regexp", "^lfs\\.extension\\.", nullptr};
+    Vec<char> extensions; int extension_status = -1;
+    int rc = git(root, extension_args, &extensions, &extension_status, false, ambient_config_probe);
+    if (rc == WFS_E_GIT_FAILED && extension_status == 1) extensions.clear();
+    else if (rc) return rc;
+    if (!extensions.empty()) return refuse(WFS_E_GIT_UNSUPPORTED,
+        "Git LFS extensions are not supported; remove lfs.extension.* configuration");
+    const char *transfer_args[] = {"config", "--includes", "--null", "--get-regexp", "^lfs\\.customtransfer\\.", nullptr};
+    Vec<char> transfers; int transfer_status = -1;
+    rc = git(root, transfer_args, &transfers, &transfer_status, false, ambient_config_probe);
+    if (rc == WFS_E_GIT_FAILED && transfer_status == 1) transfers.clear();
+    else if (rc) return rc;
+    if (!transfers.empty()) return refuse(WFS_E_GIT_UNSUPPORTED,
+        "custom Git LFS transfer agents are not supported; remove lfs.customtransfer.* configuration");
+    const char *standalone_args[] = {"config", "--includes", "--null", "--get-all",
+        "lfs.standalonetransferagent", nullptr};
+    Vec<char> standalone; int standalone_status = -1;
+    rc = git(root, standalone_args, &standalone, &standalone_status, false, ambient_config_probe);
+    if (rc == WFS_E_GIT_FAILED && standalone_status == 1) standalone.clear();
+    else if (rc) return rc;
+    state.emplace_back('\3');
+    for (size_t i = 0; i + 1 < standalone.size();) {
+        const char *agent = standalone.data() + i;
+        size_t n = strlen(agent); i += n + 1;
+        if (*agent && strcmp(agent, "lfs-standalone-file"))
+            return refuse(WFS_E_GIT_UNSUPPORTED,
+                "custom Git LFS stand-alone transfer agents are not supported; remove lfs.standalonetransferagent");
+        for (size_t j = 0; j <= n; ++j) state.emplace_back(agent[j]);
+    }
+    const char *effective_args[] = {"config", "--includes", "--null", "--get-regexp",
+        "^(lfs\\.(url|pushurl)|remote\\..+\\.(lfsurl|lfspushurl))$", nullptr};
+    Vec<char> effective; int status = -1;
+    rc = git(root, effective_args, &effective, &status, false, ambient_config_probe);
+    if (rc == WFS_E_GIT_FAILED && status == 1) effective.clear();
+    else if (rc) return rc;
+    if ((rc = validate_lfs_endpoint_listing(effective, &state))) return rc;
+
+    // .lfsconfig is separate from Git's normal config. Git LFS reads both the working-tree
+    // file and the committed file on checkout, so validate each view that import/reset can use.
+    String path = joinp(root, ".lfsconfig");
+    struct stat st;
+    if (!lstat(path.c_str(), &st)) {
+        if (!S_ISREG(st.st_mode)) return refuse(WFS_E_GIT_UNSUPPORTED, ".lfsconfig is not a regular file");
+        Vec<char> bytes, listing;
+        if ((rc = read_bytes(path.c_str(), bytes))) return rc;
+        const char *file_args[] = {"config", "--file", path.c_str(), "--null", "--list", nullptr};
+        if ((rc = git(root, file_args, &listing))) return rc;
+        if ((rc = validate_lfs_endpoint_listing(listing))) return rc;
+        for (char c : bytes) state.emplace_back(c);
+        state.emplace_back('\0');
+        for (char c : listing) state.emplace_back(c);
+    } else if (errno != ENOENT) return -errno;
+
+    // The index is a third independent view: include-changes can retain a staged .lfsconfig
+    // that differs from both the worktree file and HEAD. Record the full stage listing (also
+    // rechecked through source_unchanged's captured index) and validate its stage-0 blob.
+    const char *index_args[] = {"ls-files", "--stage", "-z", "--", ".lfsconfig", nullptr};
+    Vec<char> index_listing;
+    if ((rc = git(root, index_args, &index_listing))) return rc;
+    for (char c : index_listing) state.emplace_back(c);
+    for (size_t i = 0; i + 1 < index_listing.size();) {
+        const char *record = index_listing.data() + i;
+        size_t n = strlen(record); i += n + 1;
+        const char *tab = strchr(record, '\t');
+        if (!tab) return -EIO;
+        char mode[8], oid[72]; int stage = -1;
+        if (sscanf(record, "%7s %71s %d", mode, oid, &stage) != 3) return -EIO;
+        if (stage != 0)
+            return refuse(WFS_E_GIT_UNSUPPORTED, "the staged .lfsconfig has unresolved index stages");
+        if (strcmp(mode, "100644") && strcmp(mode, "100755"))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "the staged .lfsconfig is not a regular file");
+        String blobarg("--blob="); blobarg.append(oid);
+        const char *blob_args[] = {"config", blobarg.c_str(), "--null", "--list", nullptr};
+        Vec<char> listing;
+        if ((rc = git(root, blob_args, &listing))) return rc;
+        if ((rc = validate_lfs_endpoint_listing(listing))) return rc;
+        for (char c : listing) state.emplace_back(c);
+    }
+
+    return validate_lfs_tree_config(root, "HEAD", &state);
 }
 // Tracked files whose `filter` attribute names a defined driver (Git LFS, git-crypt, ...) would
 // have that driver executed by status in the source and in the World; WorldFS neither runs nor
@@ -1237,7 +1663,8 @@ int reject_filter_attrs(const Vec<char> &attrs, const Vec<char> &defined) {
 // With `tree` (HEAD before --committed-only resets the copy), the paths are the tree's and each
 // is checked both against the tree's own attributes -- what checking the tree out reads, once
 // it is the index -- and against the worktree's, which checkout still falls back to.
-int reject_used_filters(const char *root, const char *tree = nullptr) {
+int reject_used_filters(const char *root, const char *tree = nullptr, bool *uses_lfs = nullptr) {
+    if (uses_lfs) *uses_lfs = false;
     const char *defined_args[] = {"config", "--null", "--name-only", "--get-regexp", "^filter\\.", nullptr};
     Vec<char> defined; int status = -1;
     int rc = git(root, defined_args, &defined, &status, false, true);
@@ -1250,7 +1677,11 @@ int reject_used_filters(const char *root, const char *tree = nullptr) {
     if (paths.size() <= 1) return 0;
     String source("--source=");
     if (tree) source.append(tree);
-    for (int pass = 0; pass < (tree ? 2 : 1); ++pass) {
+    // Check the worktree attributes, the staged/index attributes (`--cached`), and, when
+    // resetting to a tree, that tree's attributes. `--include-changes` preserves staged
+    // attributes independently of both the worktree and HEAD, so omitting the index view can
+    // miss a filter that the imported index will activate.
+    for (int pass = 0; pass < (tree ? 3 : 2); ++pass) {
         FILE *input = tmpfile();
         if (!input) return -errno;
         if (fwrite(paths.data(), 1, paths.size() - 1, input) != paths.size() - 1 || fflush(input)) {
@@ -1258,12 +1689,14 @@ int reject_used_filters(const char *root, const char *tree = nullptr) {
         }
         rewind(input);
         const char *attr_args[] = {"check-attr", "--stdin", "-z", "filter", nullptr};
+        const char *cached_attr_args[] = {"check-attr", "--cached", "--stdin", "-z", "filter", nullptr};
         const char *tree_attr_args[] = {"check-attr", source.c_str(), "--stdin", "-z", "filter", nullptr};
         Vec<char> attrs;
-        rc = git(root, pass ? tree_attr_args : attr_args, &attrs, nullptr, false, true, fileno(input));
+        const char *const *args = pass == 0 ? attr_args : (pass == 1 ? cached_attr_args : tree_attr_args);
+        rc = git(root, args, &attrs, nullptr, false, true, fileno(input));
         fclose(input);
         if (rc) return rc;
-        if ((rc = reject_filter_attrs(attrs, defined))) return rc;
+        if ((rc = reject_filter_attrs(root, attrs, defined, uses_lfs))) return rc;
     }
     return 0;
 }
@@ -1271,10 +1704,6 @@ int reject_external_visibility_state(const char *root, bool managed) {
     if (managed) return 0;
     for (const char *key : {"transfer.hideRefs", "uploadpack.hideRefs"})
         if (int rc = reject_configured_policy(root, key)) return rc;
-    const char *args[] = {"reflog", "exists", "refs/stash", nullptr};
-    int status = -1, rc = git(root, args, nullptr, &status);
-    if (!rc) return refuse(WFS_E_GIT_UNSUPPORTED, "the stash has entries; a mirror cannot preserve the stash stack");
-    if (rc != WFS_E_GIT_FAILED || status != 1) return rc;
     String grafts; const char *graft_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "info/grafts", nullptr};
     if (int graft_rc = value(root, graft_args, grafts)) return graft_rc;
     struct stat st;
@@ -1687,6 +2116,110 @@ bool same_hooks(const Vec<GitHook> &a, const Vec<GitHook> &b) {
         if (a[i].name != b[i].name || a[i].mode != b[i].mode || !same_bytes(a[i].bytes, b[i].bytes)) return false;
     return true;
 }
+const char *lfs_prepush_script() {
+    return "#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || { printf >&2 \"\\n%s\\n\\n\" \"This repository is configured for Git LFS but 'git-lfs' was not found on your path. If you no longer wish to use Git LFS, remove this hook by deleting the 'pre-push' file in the hooks directory (set by 'core.hookspath'; usually '.git/hooks').\"; exit 2; }\ngit lfs pre-push \"$@\"\n";
+}
+// Exact Git LFS v3.4.1 hookBaseContent with Command=pre-push and Hook.write's final LF.
+const char *legacy_lfs_prepush_script() {
+    return "#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || { echo >&2 \"\\nThis repository is configured for Git LFS but 'git-lfs' was not found on your path. If you no longer wish to use Git LFS, remove this hook by deleting the 'pre-push' file in the hooks directory (set by 'core.hookspath'; usually '.git/hooks').\\n\"; exit 2; }\ngit lfs pre-push \"$@\"\n";
+}
+bool canonical_lfs_prepush(const Vec<char> &bytes) {
+    const char *script = lfs_prepush_script();
+    if (bytes.size() == strlen(script) && !memcmp(bytes.data(), script, bytes.size())) return true;
+    const char *legacy = legacy_lfs_prepush_script();
+    return bytes.size() == strlen(legacy) && !memcmp(bytes.data(), legacy, bytes.size());
+}
+int read_lfs_prepush(const String &dir, bool allow_create, String &path) {
+    path = joinp(dir.c_str(), "pre-push");
+    struct stat st;
+    if (lstat(path.c_str(), &st)) {
+        if (errno != ENOENT) return -errno;
+        return allow_create ? 0 : refuse(WFS_E_GIT_UNSUPPORTED,
+            "core.hooksPath has no canonical executable Git LFS pre-push hook; add it before importing with --with-hooks");
+    }
+    if (!S_ISREG(st.st_mode)) return refuse(WFS_E_GIT_UNSUPPORTED, "the pre-push hook is not a regular file");
+    if (!(st.st_mode & 0111)) return refuse(WFS_E_GIT_UNSUPPORTED,
+        "the canonical Git LFS pre-push hook is not executable");
+    Vec<char> bytes;
+    if (int rc = read_bytes(path.c_str(), bytes)) return rc;
+    if (!canonical_lfs_prepush(bytes))
+        return refuse(WFS_E_GIT_UNSUPPORTED,
+            "a custom pre-push hook conflicts with the generated Git LFS hook; keep only the canonical Git LFS hook or remove pre-push");
+    return 1;
+}
+String relative_hooks_path(const char *root, const char *dir) {
+    String from, to;
+    if (fs_realpath(root, from) || fs_realpath(dir, to)) return String();
+    Vec<String> a, b;
+    auto split = [](const String &path, Vec<String> &parts) {
+        size_t i = 0;
+        while (i < path.size()) {
+            while (i < path.size() && path[i] == '/') ++i;
+            size_t start = i;
+            while (i < path.size() && path[i] != '/') ++i;
+            if (i > start) parts.emplace_back(path.c_str() + start, i - start);
+        }
+    };
+    split(from, a); split(to, b);
+    size_t i = 0;
+    while (i < a.size() && i < b.size() && a[i] == b[i]) ++i;
+    String result;
+    for (size_t j = i; j < a.size(); ++j) { if (!result.empty()) result.push_back('/'); result.append(".."); }
+    for (size_t j = i; j < b.size(); ++j) { if (!result.empty()) result.push_back('/'); result.append(b[j].c_str()); }
+    return result.empty() ? String(".") : result;
+}
+// --with-hooks may carry the LFS hook only when no pre-push hook exists or the existing file is
+// exactly Git LFS's generated hook. External hook paths cannot be modified, so they must already
+// contain the canonical script.
+int validate_lfs_prepush_source(const char *root, const GitRepoState &s) {
+    if (!s.lfs_active || !s.with_hooks) return 0;
+    String dir;
+    if (!s.hooks_path_present) {
+        if (int rc = hooks_dir(root, dir)) return rc;
+    } else if (s.hooks_path.empty() || s.hooks_path == ".") {
+        if (s.hooks_path == ".") dir = root;
+        else return refuse(WFS_E_GIT_UNSUPPORTED, "an empty core.hooksPath cannot host the Git LFS pre-push hook");
+    } else if (s.hooks_path[0] == '/' || s.hooks_path[0] == '~') {
+        return refuse(WFS_E_GIT_UNSUPPORTED,
+            "external core.hooksPath %s cannot be carried with Git LFS; use a path inside the repository", s.hooks_path.c_str());
+    } else {
+        dir = joinp(root, s.hooks_path.c_str());
+    }
+    String path;
+    // Explicit in-tree hooks paths are part of the user's worktree. Never create the
+    // generated hook there: require the canonical executable hook to already exist.
+    int rc = read_lfs_prepush(dir, !s.hooks_path_present, path);
+    if (rc < 0) return rc;
+    return 0;
+}
+int install_lfs_prepush(const GitRepoState &s, const char *worktree, const char *repo) {
+    if (!s.lfs_active) return 0;
+    if (s.with_hooks && s.hooks_path_present && (s.hooks_path.empty() || s.hooks_path[0] == '/' || s.hooks_path[0] == '~')) return 0;
+    if (s.with_hooks && s.hooks_path_present && s.hooks_path[0] != '/' && s.hooks_path[0] != '~') {
+        String path;
+        String dir = s.hooks_path == "." ? String(worktree) : joinp(worktree, s.hooks_path.c_str());
+        int exists = read_lfs_prepush(dir, false, path);
+        return exists < 0 ? exists : 0;
+    }
+    String dir;
+    if (s.with_hooks && s.hooks_path_present) dir = joinp(worktree, s.hooks_path.c_str());
+    else dir = joinp(repo, "hooks");
+    if (int rc = fs_mkdir(dir.c_str(), 0755)) { if (rc != -EEXIST) return rc; }
+    String path;
+    int exists = read_lfs_prepush(dir, true, path);
+    if (exists < 0) return exists;
+    if (!exists) {
+        const char *script = lfs_prepush_script();
+        if (int rc = write_bytes(path.c_str(), script, strlen(script))) return rc;
+        if (chmod(path.c_str(), 0755)) return -errno;
+    }
+    if (!s.with_hooks || !s.hooks_path_present) {
+        String relative = relative_hooks_path(worktree, dir.c_str());
+        if (relative.empty()) return -EINVAL;
+        if (int rc = config(worktree, "core.hooksPath", relative.c_str())) return rc;
+    }
+    return 0;
+}
 int install_hooks(const GitRepoState &s, const char *clone, const char *repo) {
     if (!s.hooks.empty()) {
         String dir = joinp(repo, "hooks");
@@ -1697,7 +2230,56 @@ int install_hooks(const GitRepoState &s, const char *clone, const char *repo) {
             if (chmod(p.c_str(), (mode_t)hook.mode)) return -errno;
         }
     }
-    return s.hooks_path_present ? config(clone, "core.hooksPath", s.hooks_path.c_str()) : 0;
+    int rc = s.hooks_path_present ? config(clone, "core.hooksPath", s.hooks_path.c_str()) : 0;
+    if (!rc) rc = install_lfs_prepush(s, clone, repo);
+    return rc;
+}
+int configure_lfs_filter(const GitRepoState &s, const char *cwd, const char *repo) {
+    const char *storage[] = {"--git-dir", repo, "config", "lfs.storage", "lfs", nullptr};
+    const char *clean[] = {"--git-dir", repo, "config", "filter.lfs.clean", "git-lfs clean -- %f", nullptr};
+    const char *smudge[] = {"--git-dir", repo, "config", "filter.lfs.smudge",
+        s.lfs_skip_smudge ? "git-lfs smudge --skip -- %f" : "git-lfs smudge -- %f", nullptr};
+    const char *process[] = {"--git-dir", repo, "config", "filter.lfs.process",
+        s.lfs_skip_process ? "git-lfs filter-process --skip" : "git-lfs filter-process", nullptr};
+    const char *required[] = {"--git-dir", repo, "config", "filter.lfs.required", "true", nullptr};
+    if (int rc = git(cwd, storage)) return rc;
+    if (int rc = git(cwd, clean)) return rc;
+    if (int rc = git(cwd, smudge)) return rc;
+    if (int rc = git(cwd, process)) return rc;
+    return git(cwd, required);
+}
+int activate_managed_target_lfs(const GitRepoState &s, const char *worktree, const char *repo) {
+    bool present = false; String hooks;
+    if (int rc = local_hooks_path(worktree, present, hooks)) return rc;
+    bool use_admin = !present;
+    if (present) {
+        if (hooks.empty() || hooks[0] == '~')
+            return refuse(WFS_E_GIT_UNSUPPORTED, "managed Git LFS cannot safely install a pre-push hook for core.hooksPath %s", hooks.c_str());
+        String expected;
+        if (int rc = hooks_dir(worktree, expected)) return rc;
+        String expected_relative = relative_hooks_path(worktree, expected.c_str());
+        if (hooks == expected || (!expected_relative.empty() && hooks == expected_relative)) {
+            use_admin = true;
+        } else {
+            String normalized(hooks);
+            if (int rc = normalize_hooks_path(worktree, present, normalized)) return rc;
+            String dir = normalized[0] == '/' ? normalized :
+                (normalized == "." ? String(worktree) : joinp(worktree, normalized.c_str()));
+            String path;
+            int hook = read_lfs_prepush(dir, false, path);
+            if (hook < 0) return hook;
+        }
+    }
+    if (int rc = configure_lfs_filter(s, worktree, repo)) return rc;
+    if (use_admin) {
+        GitRepoState generated = s;
+        generated.lfs_active = true;
+        generated.with_hooks = false;
+        generated.hooks_path_present = false;
+        generated.hooks_path.clear();
+        return install_lfs_prepush(generated, worktree, repo);
+    }
+    return 0;
 }
 // GIT_OPTIONAL_LOCKS=0 (set by git()) keeps status from refreshing the index it inspects.
 // --ignore-submodules=dirty: a submodule counts as changed when its HEAD differs from the gitlink
@@ -1707,12 +2289,30 @@ int install_hooks(const GitRepoState &s, const char *clone, const char *repo) {
 // call on it instead (require_clean_copy, git_source). The command-line value also overrides
 // submodule.<name>.ignore and diff.ignoreSubmodules, so neither can hide a moved submodule.
 int require_clean_tree(const char *root) {
-    const char *args[] = {"status", "--porcelain=v1", "-z", "--untracked-files=normal", "--ignore-submodules=dirty",
+    const char *status_args[] = {"status", "--porcelain=v1", "-z", "--untracked-files=normal", "--ignore-submodules=dirty",
         "--", ".", ":(exclude).world", ":(exclude).world-git", nullptr};
     Vec<char> dirty;
     // With the user's own global/system configuration (global ignores, autocrlf, ...), so
     // "clean" means what `git status` in the source and in the World both say.
-    if (int rc = git(root, args, &dirty, nullptr, false, true)) return rc;
+    bool uses_lfs = false;
+    if (int rc = reject_used_filters(root, nullptr, &uses_lfs)) return rc;
+    int rc = 0;
+    if (uses_lfs) {
+        char scratch[] = "/tmp/worldfs-lfs-status-XXXXXX";
+        if (!mkdtemp(scratch)) return -errno;
+        String storage(scratch); storage.append("/storage");
+        String storage_config("lfs.storage="); storage_config.append(storage.c_str());
+        const char *args[] = {"-c", "filter.lfs.process=git-lfs filter-process --skip", "-c",
+            "filter.lfs.smudge=git-lfs smudge --skip -- %f", "-c",
+            storage_config.c_str(), "status", "--porcelain=v1", "-z", "--untracked-files=normal",
+            "--ignore-submodules=dirty", "--", ".", ":(exclude).world", ":(exclude).world-git", nullptr};
+        rc = git(root, args, &dirty, nullptr, false, true);
+        int cleanup = fs_remove_tree(scratch);
+        if (!rc && cleanup) rc = cleanup;
+    } else {
+        rc = git(root, status_args, &dirty, nullptr, false, true);
+    }
+    if (rc) return rc;
     return dirty.size() > 1 ? WFS_E_GIT_DIRTY : 0;
 }
 // --committed-only: make the copy's Git-visible content exactly HEAD. Only the copy is touched;
@@ -1732,8 +2332,9 @@ int require_clean_tree(const char *root) {
 // detached there first when it is anywhere else, and the filters are checked against it.
 int reset_to_head(const char *clone, const char *target = nullptr) {
     const char *tree = target ? target : "HEAD";
-    if (int rc = reject_used_filters(clone)) return rc;
-    if (int rc = reject_used_filters(clone, tree)) return rc;
+    bool lfs_index = false, lfs_tree = false;
+    if (int rc = reject_used_filters(clone, nullptr, &lfs_index)) return rc;
+    if (int rc = reject_used_filters(clone, tree, &lfs_tree)) return rc;
     // skip-worktree and assume-unchanged entries are invisible to status and left alone by
     // read-tree, so their worktree bytes would survive the reset. Clear both marks in the
     // copy's index first (`ls-files -v`: 'S'/'s' is skip-worktree, a lower-case tag is
@@ -1786,8 +2387,14 @@ int reset_to_head(const char *clone, const char *target = nullptr) {
             if ((rc = git(clone, detach))) return rc;
         }
     }
+    // Git LFS's process filter can download during checkout. Ask its canonical filter to leave
+    // pointers in place, then hydrate only from the copied local cache with `lfs checkout`.
     const char *reset[] = {"read-tree", "--reset", "-u", "HEAD", nullptr};
-    if ((rc = git(clone, reset, nullptr, nullptr, false, true))) return rc;
+    if ((rc = git(clone, reset, nullptr, nullptr, false, true, -1, true))) return rc;
+    if (lfs_index || lfs_tree) {
+        const char *checkout[] = {"lfs", "checkout", nullptr};
+        if ((rc = git(clone, checkout, nullptr, nullptr, false, true))) return rc;
+    }
     // A directory the reset emptied of staged additions, or anything else left untracked.
     if ((rc = git(clone, clean, nullptr, nullptr, false, true))) return rc;
     String squash;
@@ -1922,6 +2529,10 @@ int source_unchanged(const GitRepoState &s) {
     }
     Vec<char> direct_refs; if (int ref_rc = capture_refs(s.root.c_str(), direct_refs)) return ref_rc;
     if (!same_bytes(direct_refs, s.refs)) return -EBUSY;
+    // The stash stack as a whole: refs/stash is in the refs above, the entries below it only here.
+    Vec<char> stash; int stash_rc = read_bytes(s.stash_path.c_str(), stash);
+    if (stash_rc != 0 && stash_rc != -ENOENT) return stash_rc;
+    if ((stash_rc == 0) != s.stash_present || !same_bytes(stash, s.stash)) return -EBUSY;
     bool orig_present; String orig; if (int orig_rc = capture_orig(s.root.c_str(), orig_present, orig)) return orig_rc;
     if (orig_present != s.orig_present || orig != s.orig_head) return -EBUSY;
     if (!s.managed) {
@@ -1930,11 +2541,23 @@ int source_unchanged(const GitRepoState &s) {
         if (int rc = value(s.root.c_str(), a, common)) return rc;
         uint64_t bytes = 0;
         if (int rc = object_import_bytes(common.c_str(), bytes)) return rc;
-        if (bytes + s.rerere_bytes != s.import_bytes) return -EBUSY;
+        uint64_t lfs_bytes = 0, lfs_entries = 0; bool lfs_present = false; Vec<char> lfs_manifest;
+        if (!s.lfs_objects.empty())
+            if (int rc = lfs_import_bytes(s.root.c_str(), s.lfs_objects.c_str(), lfs_bytes, lfs_entries,
+                                          lfs_present, lfs_manifest)) return rc;
+        if (lfs_present != s.lfs_present || lfs_bytes != s.lfs_bytes || lfs_entries != s.lfs_entries ||
+            !same_bytes(lfs_manifest, s.lfs_manifest) || bytes + s.rerere_bytes + lfs_bytes != s.import_bytes) return -EBUSY;
         Vec<char> rerere; bool rerere_present = false; uint64_t rerere_bytes = 0;
         if (int rc = capture_rerere(s.root.c_str(), rerere, rerere_present, rerere_bytes)) return rc;
         if (rerere_present != s.rerere_present || !same_bytes(rerere, s.rerere)) return -EBUSY;
     }
+    Vec<char> endpoint_state;
+    if (int rc = capture_lfs_endpoint_state(s.root.c_str(), endpoint_state, s.lfs_active)) return rc;
+    if (!same_bytes(endpoint_state, s.lfs_endpoint_state)) return -EBUSY;
+    bool lfs_setup = false, skip_smudge = false, skip_process = false;
+    if (int rc = canonical_lfs_setup(s.root.c_str(), lfs_setup, skip_smudge, skip_process)) return rc;
+    if (lfs_setup != s.lfs_filter_setup || skip_smudge != s.lfs_skip_smudge ||
+        skip_process != s.lfs_skip_process) return -EBUSY;
     Vec<GitSymref> refs;
     if (int symrc = collect_symrefs(s.root.c_str(), refs)) return symrc;
     if (!same_symrefs(refs, s.symrefs)) return -EBUSY;
@@ -1947,7 +2570,7 @@ int source_unchanged(const GitRepoState &s) {
 // tracked in the index would fork dirty or commit metadata; one anywhere in preserved history
 // would overwrite the World marker on an ordinary checkout (ignored files are overwritten by
 // default). So the index and every commit reachable from what the import keeps -- all refs,
-// HEAD, ORIG_HEAD and FETCH_HEAD tips -- must never contain either path. --full-history keeps
+// HEAD, ORIG_HEAD and FETCH_HEAD tips and every stash entry -- must never contain either path. --full-history keeps
 // a side branch that added the path and was merged away from being simplified out.
 // --no-replace-objects makes the walk read the commits and trees the import actually preserves:
 // a refs/replace/* entry could otherwise present a safe tree for a commit whose real tree has
@@ -1974,6 +2597,11 @@ int reject_reserved_paths(const char *root, const GitRepoState &s) {
             start = i + 1;
         }
     }
+    // Every stash entry, not only refs/stash: `git stash apply stash@{n}` writes its worktree,
+    // index and untracked-files trees (the entry commit and its second and third parents).
+    Vec<String> stash;
+    if (int rc = stash_tips(s.stash, stash)) return rc;
+    for (const auto &tip : stash) tips.emplace_back(tip.c_str());
     Vec<const char *> args;
     for (const char *a : {"--no-replace-objects", "rev-list", "-n", "1", "--full-history", "--all"}) args.emplace_back(a);
     for (const auto &tip : tips) args.emplace_back(tip.c_str());
@@ -2016,7 +2644,29 @@ int require_committed_hooks_path(const char *root, bool present, const String &h
     for (const auto &scope : scopes) st_args.emplace_back(scope.c_str());
     st_args.emplace_back(nullptr);
     Vec<char> pending;
-    if (int src = git(root, st_args.data(), &pending, nullptr, false, true)) return src;
+    bool uses_lfs = false;
+    if (int src = reject_used_filters(root, nullptr, &uses_lfs)) return src;
+    int status_rc = 0;
+    if (uses_lfs) {
+        // This source-side status probe must not let Git LFS populate the source cache (or
+        // install/update hooks) while checking only whether the copied hooks path is clean.
+        char scratch[] = "/tmp/worldfs-lfs-hooks-XXXXXX";
+        if (!mkdtemp(scratch)) return -errno;
+        String storage(scratch); storage.append("/storage");
+        String storage_config("lfs.storage="); storage_config.append(storage.c_str());
+        Vec<const char *> safe_args;
+        for (const char *a : {"-c", "filter.lfs.process=git-lfs filter-process --skip", "-c",
+                              "filter.lfs.smudge=git-lfs smudge --skip -- %f", "-c", storage_config.c_str()})
+            safe_args.emplace_back(a);
+        for (size_t i = 0; st_args[i]; ++i) safe_args.emplace_back(st_args[i]);
+        safe_args.emplace_back(nullptr);
+        status_rc = git(root, safe_args.data(), &pending, nullptr, false, true);
+        int cleanup = fs_remove_tree(scratch);
+        if (!status_rc && cleanup) status_rc = cleanup;
+    } else {
+        status_rc = git(root, st_args.data(), &pending, nullptr, false, true);
+    }
+    if (status_rc) return status_rc;
     if (pending.size() > 1)
         return refuse(WFS_E_GIT_UNSUPPORTED, "core.hooksPath %s has uncommitted changes, which --committed-only would drop; commit them or drop --committed-only", hp.c_str());
     // Status cannot see edits to a hook marked skip-worktree or assume-unchanged, and the reset
@@ -2271,7 +2921,7 @@ int in_module(int rc, const String &path) {
 // would name a different place in the copy: refused. `git submodule init`, `git remote add`
 // with an absolute path and the import itself write absolute values; an in-tree relative
 // core.hooksPath travels with the tree and is fine.
-int reject_relative_managed_paths(const char *root) {
+int reject_relative_managed_paths(const char *root, bool allow_missing_lfs_hook = false) {
     const char *args[] = {"config", "--local", "--includes", "--null", "--get-regexp",
         "^remote\\..*\\.(url|pushurl)$", nullptr};
     Vec<char> listing; int status = -1;
@@ -2292,16 +2942,39 @@ int reject_relative_managed_paths(const char *root) {
     if (present && !hooks.empty() && hooks[0] != '/' && hooks[0] != '~') {
         String normalized(hooks);
         if ((rc = normalize_hooks_path(root, present, normalized))) return rc;
-        if (normalized[0] == '/')
-            return refuse(WFS_E_GIT_POLICY,
-                "the World's core.hooksPath %s leaves its tree, so a copy of the World would resolve it "
-                "from its own location; make it absolute", hooks.c_str());
+        if (normalized[0] == '/') {
+            // The generated LFS hook for an owned submodule lives in that submodule's common
+            // Git directory, which is deliberately under the World's root .world-git rather
+            // than under the submodule worktree. Admit only this exact managed admin/hooks
+            // destination with the canonical executable pre-push hook; arbitrary paths that
+            // escape the submodule still resolve differently after a World copy and are refused.
+            String expected, expected_real, resolved;
+            bool owned_lfs_hook = false;
+            if (!hooks_dir(root, expected) && !fs_realpath(expected.c_str(), expected_real)) {
+                String expected_relative = relative_hooks_path(root, expected.c_str());
+                if (!expected_relative.empty() && hooks == expected_relative &&
+                    !fs_realpath(normalized.c_str(), resolved) && expected_real == resolved) {
+                    String prepush;
+                    int hook_rc = read_lfs_prepush(expected, false, prepush);
+                    if (hook_rc == 1) owned_lfs_hook = true;
+                    else if (allow_missing_lfs_hook) {
+                        struct stat st;
+                        owned_lfs_hook = lstat(prepush.c_str(), &st) && errno == ENOENT;
+                    }
+                }
+            }
+            if (!owned_lfs_hook)
+                return refuse(WFS_E_GIT_POLICY,
+                    "the World's core.hooksPath %s leaves its tree, so a copy of the World would resolve it "
+                    "from its own location; make it absolute", hooks.c_str());
+        }
     }
     return 0;
 }
 // Everything the import reproduces of one repository -- the root, or a submodule's -- and every
 // eligibility check on it. `gitlinks` receives the index's gitlinks.
-int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool module, Vec<Gitlink> &gitlinks) {
+int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool module, Vec<Gitlink> &gitlinks,
+                 const char *target = nullptr) {
     out.root = root;
     String top;
     const char *top_args[] = {"rev-parse", "--show-toplevel", nullptr};
@@ -2322,9 +2995,6 @@ int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool modu
         if (int hook_rc = capture_hooks(root, out.hooks, out.hooks_path_present, out.hooks_path)) return hook_rc;
     }
     if (out.managed) {
-        if (int rc = reject_relative_managed_paths(root)) return rc;
-    }
-    if (out.managed) {
         // A managed copy has byte-identical configuration files and import commands ignore
         // global/system scope, so the effective list can only differ through an include that
         // resolves differently from the copy's location (hooksPath, identity, anything).
@@ -2333,6 +3003,18 @@ int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool modu
     }
     const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
     if (value(root, head_args, out.head)) return refuse(WFS_E_GIT_UNSUPPORTED, "the repository has no commit yet");
+    bool lfs_worktree = false, lfs_head = false, lfs_target = false, lfs_setup = false;
+    bool lfs_skip_smudge = false, lfs_skip_process = false;
+    int lfs_rc = reject_used_filters(root, nullptr, &lfs_worktree);
+    if (!lfs_rc) lfs_rc = reject_used_filters(root, out.head.c_str(), &lfs_head);
+    if (!lfs_rc && target && strcmp(target, out.head.c_str()))
+        lfs_rc = reject_used_filters(root, target, &lfs_target);
+    if (!lfs_rc) lfs_rc = canonical_lfs_setup(root, lfs_setup, lfs_skip_smudge, lfs_skip_process);
+    if (lfs_rc) return lfs_rc;
+    out.lfs_filter_setup = lfs_setup;
+    out.lfs_skip_smudge = lfs_skip_smudge;
+    out.lfs_skip_process = lfs_skip_process;
+    out.lfs_active = lfs_worktree || lfs_head || lfs_target || lfs_setup;
     const char *head_ref_args[] = {"symbolic-ref", "--quiet", "HEAD", nullptr};
     if (int rc = value(root, head_ref_args, out.head_ref, true)) return rc;
     const char *index_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "index", nullptr};
@@ -2367,7 +3049,30 @@ int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool modu
     const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
     const char *admin_args[] = {"rev-parse", "--absolute-git-dir", nullptr};
     if ((rc = value(root, common_args, common)) || (rc = value(root, admin_args, out.admin))) return rc;
-    if (!out.managed) { if ((rc = object_import_bytes(common.c_str(), out.import_bytes))) return rc; }
+    if (!out.managed) {
+        if ((rc = object_import_bytes(common.c_str(), out.import_bytes, &out.object_entries))) return rc;
+        out.objects = joinp(common.c_str(), "objects");
+    }
+    out.lfs_objects = joinp(common.c_str(), "lfs/objects");
+    if ((rc = lfs_import_bytes(root, out.lfs_objects.c_str(), out.lfs_bytes, out.lfs_entries,
+                               out.lfs_present, out.lfs_manifest))) return rc;
+    // Preserve an existing local cache even when current HEAD no longer tracks LFS paths: an
+    // older branch, stash, or later checkout may still need its payloads.
+    if (out.lfs_present) {
+        out.lfs_active = true;
+    }
+    out.lfs_target_only = lfs_target && !(lfs_worktree || lfs_head || out.lfs_present);
+    if ((rc = capture_lfs_endpoint_state(root, out.lfs_endpoint_state, out.lfs_active))) return rc;
+    if (target && strcmp(target, out.head.c_str()))
+        if ((rc = validate_lfs_tree_config(root, target))) return rc;
+    if (out.managed) {
+        if (int relative_rc = reject_relative_managed_paths(root, out.lfs_target_only)) return relative_rc;
+    }
+    if ((rc = validate_lfs_prepush_source(root, out))) return rc;
+    if (!out.managed) {
+        if (UINT64_MAX - out.import_bytes < out.lfs_bytes) return -EOVERFLOW;
+        out.import_bytes += out.lfs_bytes;
+    }
     if (module) {
         // A submodule's repository is copied as one directory; a linked worktree of some other
         // repository standing in for it is not what Git itself would create there.
@@ -2379,6 +3084,7 @@ int capture_repo(const char *root, GitRepoState &out, bool with_hooks, bool modu
     }
     if ((rc = reject_external_visibility_state(root, out.managed))) return rc;
     if ((rc = capture_refs(root, out.refs))) return rc;
+    if ((rc = capture_stash(root, out))) return rc;
     if ((rc = capture_orig(root, out.orig_present, out.orig_head))) return rc;
     if ((rc = collect_symrefs(root, out.symrefs))) return rc;
     if ((rc = reject_unlisted_symrefs(root, out.symrefs))) return rc;
@@ -2411,6 +3117,24 @@ int committed_hooks_check(const char *root, const GitRepoState &s, const char *t
     bool present = s.hooks_path_present; String hp = s.hooks_path;
     if (s.managed) {
         if (int rc = local_hooks_path(root, present, hp)) return rc;
+        // A target-only LFS module gets its generated pre-push hook in its owned Git
+        // administration after the copy is verified. Its exact generated relative path is
+        // outside the module worktree, so it need not be committed in the target tree.
+        if (s.lfs_target_only && target && s.head != target && present) {
+            String expected;
+            if (int rc = hooks_dir(root, expected)) return rc;
+            String expected_relative = relative_hooks_path(root, expected.c_str());
+            if (hp == expected || (!expected_relative.empty() && hp == expected_relative)) {
+                String prepush;
+                int hook = read_lfs_prepush(expected, false, prepush);
+                if (hook == 1) return 0;
+                if (hook < 0) {
+                    struct stat st;
+                    if (lstat(prepush.c_str(), &st) && errno == ENOENT) return 0;
+                    return hook;
+                }
+            }
+        }
         if (int rc = normalize_hooks_path(root, present, hp)) return rc;
     } else if (!s.with_hooks) {
         return 0;
@@ -2741,15 +3465,6 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
         if (top.managed) {
             if (int rc = check_owned_module(top.root.c_str(), m.path, m.gitdir)) return rc;
         }
-        m.repo.managed = top.managed;
-        Vec<Gitlink> sub_links;
-        if (int rc = capture_repo(full.c_str(), m.repo, top.with_hooks, true, sub_links)) return in_module(rc, path);
-        {
-            Vec<GitSetting> config; size_t shared = 0;
-            if (int rc = world_config(full.c_str(), m.repo, config, shared)) return rc;
-            if (int rc = check_configured_submodule_urls(full.c_str(), config, shared)) return in_module(rc, path);
-        }
-        if (int rc = nested_check(full.c_str(), &sub_links, false)) return in_module(rc, path);
         if (tree) {
             const Gitlink *recorded = find_link(tree_links, link.path.c_str());
             m.target = recorded->oid;
@@ -2757,11 +3472,22 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
             const char *exists[] = {"cat-file", "-e", spec.c_str(), nullptr};
             if (git(full.c_str(), exists, nullptr, nullptr, true))
                 return refuse(WFS_E_GIT_UNSUPPORTED, "submodule %s: commit %s, which the committed superproject records, is not in its repository", path.c_str(), m.target.c_str());
+        }
+        m.repo.managed = top.managed;
+        Vec<Gitlink> sub_links;
+        if (int rc = capture_repo(full.c_str(), m.repo, top.with_hooks, true, sub_links,
+                                  tree ? m.target.c_str() : nullptr)) return in_module(rc, path);
+        {
+            Vec<GitSetting> config; size_t shared = 0;
+            if (int rc = world_config(full.c_str(), m.repo, config, shared)) return rc;
+            if (int rc = check_configured_submodule_urls(full.c_str(), config, shared)) return in_module(rc, path);
+        }
+        if (int rc = nested_check(full.c_str(), &sub_links, false)) return in_module(rc, path);
+        if (tree) {
             if (int rc = committed_hooks_check(full.c_str(), m.repo, m.target.c_str())) return in_module(rc, path);
         } else if (top.require_clean && m.repo.head != link.oid) {
             return WFS_E_GIT_DIRTY;   // HEAD moved away from the recorded commit
         }
-        top.modules_bytes += m.repo.import_bytes;
         top.modules.emplace_back(m);
         String child_prefix(path); child_prefix.push_back('/');
         String child_gitdir(m.gitdir); child_gitdir.push_back('/');
@@ -2900,14 +3626,23 @@ bool same_capture(const GitRepoState &copy, const GitRepoState &s) {
         // A relative include can resolve differently from the copy's location.
         same_settings(copy.identity, s.identity) && same_bytes(copy.effective_config, s.effective_config) &&
         copy.worktree_config == s.worktree_config && same_settings(copy.worktree_settings, s.worktree_settings) &&
-        same_bytes(copy.refs, s.refs) && copy.orig_present == s.orig_present && copy.orig_head == s.orig_head;
+        same_bytes(copy.refs, s.refs) && same_stash(copy, s) && copy.orig_present == s.orig_present &&
+        copy.lfs_active == s.lfs_active && copy.lfs_present == s.lfs_present &&
+        copy.lfs_filter_setup == s.lfs_filter_setup && copy.lfs_skip_smudge == s.lfs_skip_smudge &&
+        copy.lfs_skip_process == s.lfs_skip_process &&
+        copy.lfs_target_only == s.lfs_target_only &&
+        copy.lfs_bytes == s.lfs_bytes && copy.lfs_entries == s.lfs_entries &&
+        same_bytes(copy.lfs_manifest, s.lfs_manifest) &&
+        same_bytes(copy.lfs_endpoint_state, s.lfs_endpoint_state) &&
+        copy.orig_head == s.orig_head;
 }
 // A managed copy's submodules must be exactly its source's, in the same place, with the same state.
 bool same_modules(const GitSource &copy, const GitSource &s) {
     if (copy.modules.size() != s.modules.size()) return false;
     for (size_t i = 0; i < s.modules.size(); ++i) {
         const GitModule &a = copy.modules[i], &b = s.modules[i];
-        if (a.path != b.path || a.name != b.name || a.gitdir != b.gitdir || !same_capture(a.repo, b.repo)) return false;
+        if (a.path != b.path || a.name != b.name || a.gitdir != b.gitdir || a.target != b.target ||
+            !same_capture(a.repo, b.repo)) return false;
     }
     return true;
 }
@@ -2959,10 +3694,25 @@ int sources_unchanged(const GitSource &s) {
         if (int rc = source_unchanged(m.repo)) return in_module(rc, m.path);
     return 0;
 }
+// The stash stack of an external source (see GitRepoState::stash). Object stores are cloned in
+// full, including unreachable stash history; restore only the reflog, byte for byte, where the
+// owned repository's Git reads it (its common directory, shared by the World's worktree).
+// require_owned_objects checks that every reflog entry is reachable in the cloned object store.
+int restore_stash(const GitRepoState &s, const char *worktree) {
+    if (!s.stash_present) return 0;
+    String log;
+    const char *log_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "logs/refs/stash", nullptr};
+    if (int rc = value(worktree, log_args, log)) return rc;
+    String refs_dir(log.c_str(), log.size() - strlen("/stash"));
+    String logs_dir(refs_dir.c_str(), refs_dir.size() - strlen("/refs"));
+    for (const String *dir : {&logs_dir, &refs_dir})
+        if (int rc = fs_mkdir(dir->c_str(), 0700)) { if (rc != -EEXIST) return rc; }
+    return write_bytes(log.c_str(), s.stash.data(), s.stash.size());
+}
 // The state every owned repository -- the root's or a submodule's -- carries over from its
 // source once its mirror exists: index, local rules, rerere cache, status settings and identity,
-// worktree-scoped settings, pending SQUASH_MSG, FETCH_HEAD, ORIG_HEAD, carried configuration and
-// hooks. `worktree` is the repository's worktree in the copy, whose Git commands reach `repo`.
+// worktree-scoped settings, pending SQUASH_MSG, FETCH_HEAD, ORIG_HEAD, carried configuration,
+// hooks and the stash stack. `worktree` is the repository's worktree in the copy, whose Git commands reach `repo`.
 int restore_state(const GitRepoState &s, const char *worktree, const char *repo, const char *index, bool root) {
     if (!s.index.empty()) {
         if (int rc = write_bytes(index, s.index.data(), s.index.size())) return rc;
@@ -3052,20 +3802,165 @@ int restore_state(const GitRepoState &s, const char *worktree, const char *repo,
         if (int rc = git(worktree, args)) return rc;
     }
     // Installed, never run: every command here passes core.hooksPath=/dev/null.
-    if (s.with_hooks) {
+    if (s.with_hooks || s.lfs_active) {
         if (int rc = install_hooks(s, worktree, repo)) return rc;
     }
-    Vec<char> imported_refs;
-    if (int rc = capture_refs(worktree, imported_refs)) return rc;
-    return same_bytes(imported_refs, s.refs) ? 0 : -EBUSY;
+    if (int rc = restore_stash(s, worktree)) return rc;
+    // The copy as it will be published: its refs, and its stash stack read back by Git itself --
+    // the same reflog bytes, the same entries, and every object of every entry present.
+    GitRepoState imported;
+    if (int rc = capture_refs(worktree, imported.refs)) return rc;
+    if (!same_bytes(imported.refs, s.refs)) return -EBUSY;
+    if (int rc = capture_stash(worktree, imported)) return rc;
+    return same_stash(imported, s) ? 0 : -EBUSY;
 }
-// Mirror all resolvable refs, including stash, notes, remote-tracking and custom refs; a bare
-// clone omits other ref namespaces and would lose them when the source is removed. clone
-// --local copies loose objects too, including blobs referenced only by the index;
-// --no-hardlinks prevents subsequent Git operations changing the source's object files.
-int mirror(const GitRepoState &s, const char *cwd, const char *from, const char *repo) {
-    const char *copy[] = {"clone", "--mirror", "--no-hardlinks", "--template=", "--quiet", "--", from, repo, nullptr};
-    if (int rc = git(cwd, copy)) return rc;
+bool lower_hex(const char *p, size_t n) {
+    for (size_t i = 0; i < n; ++i)
+        if (!((p[i] >= '0' && p[i] <= '9') || (p[i] >= 'a' && p[i] <= 'f'))) return false;
+    return n > 0;
+}
+// `<prefix><object ID><suffix>` for one of `suffixes` (null-terminated), SHA-1 or SHA-256.
+bool hashed_name(const char *name, const char *prefix, const char *const *suffixes) {
+    size_t pl = strlen(prefix);
+    if (strncmp(name, prefix, pl)) return false;
+    const char *hash = name + pl, *dot = strchr(hash, '.');
+    size_t n = dot ? (size_t)(dot - hash) : strlen(hash);
+    if ((n != 40 && n != 64) || !lower_hex(hash, n) || !dot) return false;
+    for (size_t i = 0; suffixes[i]; ++i) if (!strcmp(dot, suffixes[i])) return true;
+    return false;
+}
+// What an object store holds, by directory relative to objects/: loose objects in the
+// two-hex-digit fan-out directories; packs with their .idx, .rev, .bitmap, .keep and .mtimes
+// files; multi-pack indexes, single or chained; info/packs and commit-graphs, single or chained.
+bool object_store_entry(const char *rel, const char *name, bool dir) {
+    static const char *const pack_ext[] = {".pack", ".idx", ".rev", ".bitmap", ".keep", ".mtimes", nullptr};
+    static const char *const midx_ext[] = {".bitmap", ".rev", nullptr};
+    static const char *const chained_midx_ext[] = {".midx", ".bitmap", ".rev", nullptr};
+    static const char *const graph_ext[] = {".graph", nullptr};
+    if (!*rel) return dir && ((strlen(name) == 2 && lower_hex(name, 2)) || !strcmp(name, "pack") || !strcmp(name, "info"));
+    if (strlen(rel) == 2) return !dir && (strlen(name) == 38 || strlen(name) == 62) && lower_hex(name, strlen(name));
+    if (!strcmp(rel, "pack")) {
+        if (dir) return !strcmp(name, "multi-pack-index.d");
+        return hashed_name(name, "pack-", pack_ext) || !strcmp(name, "multi-pack-index") ||
+               hashed_name(name, "multi-pack-index-", midx_ext);
+    }
+    if (!strcmp(rel, "pack/multi-pack-index.d"))
+        return !dir && (!strcmp(name, "multi-pack-index-chain") || hashed_name(name, "multi-pack-index-", chained_midx_ext));
+    if (!strcmp(rel, "info")) {
+        if (dir) return !strcmp(name, "commit-graphs");
+        return !strcmp(name, "packs") || !strcmp(name, "commit-graph");
+    }
+    if (!strcmp(rel, "info/commit-graphs"))
+        return !dir && (!strcmp(name, "commit-graph-chain") || hashed_name(name, "graph-", graph_ext));
+    return false;
+}
+// Reduce a cloned object directory to object_store_entry's allowlist. Anything else Git may
+// have had there mid-write -- tmp_obj_*/tmp_pack_*/.tmp-* files, incoming-* quarantine
+// directories of a push not yet accepted -- is not part of the repository and is dropped;
+// objects nothing reaches are harmless and anything reachable that went missing is caught by
+// require_owned_objects. What eligibility refuses in the source (a symlink or special file,
+// alternates, promisor packs) is refused again here, since the clone reflects the source a
+// moment after it was checked.
+int prune_object_clone(const String &dir, const String &rel, unsigned depth) {
+    if (depth > 3) return refuse(WFS_E_GIT_UNSUPPORTED, "the object directory is nested too deeply");
+    int fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return errno == ELOOP || errno == ENOTDIR
+        ? refuse(WFS_E_GIT_UNSUPPORTED, "the object directory contains a symlink or special file (%s)", rel.empty() ? "objects" : rel.c_str()) : -errno;
+    Vec<String> names;
+    int rc = list_names(fd, names);
+    for (size_t i = 0; !rc && i < names.size(); ++i) {
+        const char *name = names[i].c_str();
+        struct stat st;
+        if (fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW)) { rc = -errno; break; }
+        if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) {
+            rc = refuse(WFS_E_GIT_UNSUPPORTED, "the object directory contains a symlink or special file (%s)", name); break;
+        }
+        String child_rel = rel.empty() ? String(name) : joinp(rel.c_str(), name);
+        static const char *const promisor_ext[] = {".promisor", nullptr};
+        if (child_rel == "info/alternates" || child_rel == "info/http-alternates") {
+            rc = refuse(WFS_E_GIT_UNSUPPORTED, "objects/%s is present (alternates or shallow clone)", child_rel.c_str()); break;
+        }
+        if (rel == "pack" && hashed_name(name, "pack-", promisor_ext)) { rc = refuse(WFS_E_GIT_UNSUPPORTED, "partial clone (a promisor pack)"); break; }
+        String path = joinp(dir.c_str(), name);
+        if (!object_store_entry(rel.c_str(), name, S_ISDIR(st.st_mode))) rc = fs_remove_tree(path.c_str());
+        else if (S_ISDIR(st.st_mode)) rc = prune_object_clone(path, child_rel, depth + 1);
+    }
+    close(fd);
+    return rc;
+}
+// The owned repository is created the way `git clone --mirror` made it -- the same bare layout,
+// packed refs, HEAD, remote.origin mirror configuration (removed again by restore_state) and
+// symbolic refs -- but its objects are not transferred through Git: the source's common object
+// directory is cloned with fs_clone_tree (clonefile on APFS, reflinks on XFS/Btrfs, a copy on
+// ext4 or across volumes, never following symlinks), so an import costs metadata rather than a
+// second copy of every pack. That also takes loose objects, including blobs only the index
+// refers to. Refs are then written from the captured snapshot with one update-ref transaction,
+// which only checks that each object exists; nothing is fetched. The clone shares no inode
+// with the source, so later Git operations in either never change the other's object files.
+int own_repository(const GitRepoState &s, const char *cwd, const char *from, const char *repo) {
+    String format;
+    const char *format_args[] = {"rev-parse", "--show-object-format", nullptr};
+    if (int rc = value(s.root.c_str(), format_args, format)) return rc;
+    String format_arg("--object-format="); format_arg.append(format.c_str());
+    const char *init[] = {"init", "--bare", "--template=", "--quiet", format_arg.c_str(), "--", repo, nullptr};
+    if (int rc = git(cwd, init)) return rc;
+    String objects = joinp(repo, "objects");
+    if (int rc = fs_remove_tree(objects.c_str())) return rc;
+    int rc = fs_clone_tree(s.objects.c_str(), objects.c_str(), true);
+    // A pack or loose object that vanished mid-clone: gc/repack in the source. Retryable.
+    if (rc == -ENOENT || rc == -ESTALE) return -EBUSY;
+    if (rc) return rc;
+    if (s.lfs_active) {
+        String lfs = joinp(repo, "lfs");
+        String media = joinp(lfs.c_str(), "objects");
+        if (s.lfs_present) {
+            if (int mrc = fs_mkdir(lfs.c_str(), 0700)) { if (mrc != -EEXIST) return mrc; }
+            rc = fs_clone_tree(s.lfs_objects.c_str(), media.c_str(), true);
+            if (rc == -ENOENT || rc == -ESTALE) return -EBUSY;
+            if (rc) return rc;
+            uint64_t bytes = 0, entries = 0; bool present = false; Vec<char> manifest;
+            if ((rc = lfs_import_bytes(s.root.c_str(), media.c_str(), bytes, entries, present, manifest))) return rc;
+            if (!present || bytes != s.lfs_bytes || entries != s.lfs_entries || !same_bytes(manifest, s.lfs_manifest)) return -EBUSY;
+        }
+        if ((rc = configure_lfs_filter(s, cwd, repo))) return rc;
+    }
+    if ((rc = prune_object_clone(objects, String(), 0))) return rc;
+    String script;
+    for (size_t i = 0; i < s.refs.size() && s.refs[i];) {
+        size_t end = i, tab = i;
+        while (end < s.refs.size() && s.refs[end] && s.refs[end] != '\n') ++end;
+        while (tab < end && s.refs[tab] != '\t') ++tab;
+        if (tab == end) return -EINVAL;
+        script.append("create ");
+        script.append(s.refs.data() + i, tab - i);
+        script.push_back(' ');
+        script.append(s.refs.data() + tab + 1, end - tab - 1);
+        script.push_back('\n');
+        i = end < s.refs.size() && s.refs[end] == '\n' ? end + 1 : end;
+    }
+    FILE *input = tmpfile();
+    if (!input) return -errno;
+    if (fwrite(script.c_str(), 1, script.size(), input) != script.size() || fflush(input)) {
+        int err = errno ? -errno : -EIO; fclose(input); return err;
+    }
+    rewind(input);
+    const char *txn[] = {"--git-dir", repo, "update-ref", "--no-deref", "--stdin", nullptr};
+    rc = git(cwd, txn, nullptr, nullptr, false, false, fileno(input));
+    fclose(input);
+    // An object the captured refs name is missing from the clone: repacked away mid-clone.
+    if (rc == WFS_E_GIT_FAILED) return -EBUSY;
+    if (rc) return rc;
+    const char *pack[] = {"--git-dir", repo, "pack-refs", "--all", nullptr};
+    if ((rc = git(cwd, pack))) return rc;
+    const char *on_branch[] = {"--git-dir", repo, "symbolic-ref", "HEAD", s.head_ref.c_str(), nullptr};
+    const char *detached[] = {"--git-dir", repo, "update-ref", "--no-deref", "HEAD", s.head.c_str(), nullptr};
+    if ((rc = git(cwd, s.head_ref.empty() ? detached : on_branch))) return rc;
+    const char *const origin[][2] = {{"remote.origin.url", from}, {"remote.origin.tagOpt", "--no-tags"},
+        {"remote.origin.fetch", "+refs/*:refs/*"}, {"remote.origin.mirror", "true"}};
+    for (const auto &kv : origin) {
+        const char *args[] = {"--git-dir", repo, "config", kv[0], kv[1], nullptr};
+        if ((rc = git(cwd, args))) return rc;
+    }
     for (const auto &ref : s.symrefs) {
         const char *sym_args[] = {"--git-dir", repo, "symbolic-ref", ref.name.c_str(), ref.target.c_str(), nullptr};
         if (int rc = git(cwd, sym_args)) return rc;
@@ -3076,7 +3971,7 @@ int import_root(const GitSource &s, const char *clone) {
     String owned = joinp(clone, ".world-git");
     if (int rc = fs_mkdir(owned.c_str(), 0700)) return rc;
     String repo = joinp(owned.c_str(), "repo.git");
-    if (int rc = mirror(s, clone, s.root.c_str(), repo.c_str())) return rc;
+    if (int rc = own_repository(s, clone, s.root.c_str(), repo.c_str())) return rc;
     String active = joinp(owned.c_str(), "active");
     const char *add[] = {"--git-dir", repo.c_str(), "worktree", "add", "--relative-paths", "--no-checkout",
         "--detach", "--quiet", "--", active.c_str(), s.head.c_str(), nullptr};
@@ -3104,7 +3999,7 @@ int import_module(const GitModule &m, const char *clone) {
     String repo = joinp(clone, admin.c_str());
     String dot = joinp(worktree.c_str(), ".git");
     if (int rc = fs_remove_tree(dot.c_str())) return rc;
-    if (int rc = mirror(s, clone, s.admin.c_str(), repo.c_str())) return rc;
+    if (int rc = own_repository(s, clone, s.admin.c_str(), repo.c_str())) return rc;
     String link = module_worktree(m.path, m.gitdir);
     const char *bare[] = {"--git-dir", repo.c_str(), "config", "core.bare", "false", nullptr};
     const char *wt[] = {"--git-dir", repo.c_str(), "config", "core.worktree", link.c_str(), nullptr};
@@ -3154,6 +4049,66 @@ int require_clean_copy(const GitSource &s, const char *clone) {
     }
     return 0;
 }
+// A source that repacks or collects garbage while its object directory is cloned can leave the
+// clone without some objects (a pack deleted before the clone reached it, its replacement
+// created after). Before publication, walk everything the owned repository preserves -- all refs
+// and HEADs, reflogs, the index, ORIG_HEAD and FETCH_HEAD tips -- down to every tree and blob, as
+// Git's own connectivity check after a fetch does. --no-replace-objects walks the real graph, not
+// what refs/replace/* substitutes. A hole means the source changed mid-import: -EBUSY, retryable.
+int require_owned_objects(const GitRepoState &s, const char *worktree) {
+    Vec<String> tips;
+    if (s.orig_present) tips.emplace_back(s.orig_head.c_str());
+    if (s.fetch_present) {
+        // FETCH_HEAD lines start with an object ID followed by a tab (reject_reserved_paths
+        // has already refused anything else).
+        for (size_t start = 0, i = 0, n = s.fetch.size(); i <= n; ++i) {
+            if (i < n && s.fetch[i] != '\n') continue;
+            size_t hex = start;
+            while (hex < i && lower_hex(s.fetch.data() + hex, 1)) ++hex;
+            if (hex < i && s.fetch[hex] == '\t' && (hex - start == 40 || hex - start == 64))
+                tips.emplace_back(s.fetch.data() + start, hex - start);
+            start = i + 1;
+        }
+    }
+    Vec<const char *> args;
+    for (const char *a : {"--no-replace-objects", "rev-list", "--objects", "--quiet", "--all", "--reflog", "--indexed-objects"})
+        args.emplace_back(a);
+    for (const auto &tip : tips) args.emplace_back(tip.c_str());
+    args.emplace_back("--");
+    args.emplace_back(nullptr);
+    int rc = git(worktree, args.data(), nullptr, nullptr, true);
+    return rc == WFS_E_GIT_FAILED ? -EBUSY : rc;
+}
+int require_owned_lfs(const GitRepoState &s, const char *worktree) {
+    if (!s.lfs_active) return 0;
+    String common;
+    const char *args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
+    if (int rc = value(worktree, args, common)) return rc;
+    String objects = joinp(common.c_str(), "lfs/objects");
+    uint64_t bytes = 0, entries = 0; bool present = false; Vec<char> manifest;
+    if (int rc = lfs_import_bytes(worktree, objects.c_str(), bytes, entries, present, manifest)) return rc;
+    if (present != s.lfs_present || bytes != s.lfs_bytes || entries != s.lfs_entries ||
+        !same_bytes(manifest, s.lfs_manifest))
+        return refuse(WFS_E_GIT_UNSUPPORTED, "the World's Git LFS cache changed or contains corrupt objects");
+    return 0;
+}
+uint64_t git_import_budget(const GitSource &s, const char *near) {
+    uint64_t total = 0;
+    for (size_t i = 0; i <= s.modules.size(); ++i) {
+        const GitRepoState &state = i ? s.modules[i - 1].repo : s;
+        if (state.managed || state.objects.empty()) continue;
+        uint64_t objects = state.import_bytes - state.rerere_bytes - state.lfs_bytes;
+        uint64_t metadata = state.object_entries > objects / 1024 ? objects : state.object_entries * 1024;
+        uint64_t need = state.rerere_bytes + (fs_clone_shares(near, state.objects.c_str()) ? metadata : objects);
+        if (state.lfs_present) {
+            uint64_t lfs_metadata = state.lfs_entries > state.lfs_bytes / 1024 ? state.lfs_bytes : state.lfs_entries * 1024;
+            uint64_t lfs_need = fs_clone_shares(near, state.lfs_objects.c_str()) ? lfs_metadata : state.lfs_bytes;
+            need = lfs_need > UINT64_MAX - need ? UINT64_MAX : need + lfs_need;
+        }
+        total = need > UINT64_MAX - total ? UINT64_MAX : total + need;
+    }
+    return total;
+}
 int git_import(const GitSource &s, const char *clone) {
     if (!s.present) return 0;
     if (int rc = sources_unchanged(s)) return rc;
@@ -3161,6 +4116,13 @@ int git_import(const GitSource &s, const char *clone) {
         if (int rc = import_root(s, clone)) return rc;
         for (const auto &m : s.modules)
             if (int rc = import_module(m, clone)) return in_module(rc, m.path);
+        if (int rc = require_owned_objects(s, clone)) return rc;
+        if (int rc = require_owned_lfs(s, clone)) return rc;
+        for (const auto &m : s.modules) {
+            String path = joinp(clone, m.path.c_str());
+            if (int rc = require_owned_objects(m.repo, path.c_str())) return in_module(rc, m.path);
+            if (int rc = require_owned_lfs(m.repo, path.c_str())) return in_module(rc, m.path);
+        }
         if (int rc = sources_unchanged(s)) return rc;
     }
     if (s.managed) {
@@ -3168,9 +4130,19 @@ int git_import(const GitSource &s, const char *clone) {
         // from a different moment, or a link that resolves differently at the copy's location,
         // is caught here even when the source looks unchanged again by the time cloning ends.
         GitSource copy;
-        if (int rc = git_source(clone, true, copy)) return rc;
+        if (int rc = git_source(clone, !s.committed_only, copy, s.committed_only)) return rc;
         if (!same_capture(copy, s) || !same_modules(copy, s)) return -EBUSY;
         if (int rc = reject_copied_locks(clone)) return rc;
+        if (s.lfs_target_only) {
+            String repo = joinp(clone, ".world-git/repo.git");
+            if (int rc = activate_managed_target_lfs(s, clone, repo.c_str())) return rc;
+        }
+        for (const auto &m : s.modules) if (m.repo.lfs_target_only) {
+            String path = joinp(clone, m.path.c_str());
+            String admin(".world-git/repo.git/worktrees/active/"); admin.append(m.gitdir.c_str());
+            String repo = joinp(clone, admin.c_str());
+            if (int rc = activate_managed_target_lfs(m.repo, path.c_str(), repo.c_str())) return in_module(rc, m.path);
+        }
     } else if (s.has_gitlinks) {
         if (int rc = copy_layout_check(s, clone)) return rc;
     }
@@ -3484,6 +4456,354 @@ int check_published_gitlinks(const char *repo, const char *worktree, const char 
         if (git(full.c_str(), exists, nullptr, nullptr, true))
             return refuse(WFS_E_GIT_TARGET, "the published commits record submodule %s at %s, which the submodule in %s does not have; get that commit there first (publish copies only the root's commits)",
                           l.key.c_str(), l.value.c_str(), repo);
+    }
+    return 0;
+}
+
+struct LfsPointerRecord { String oid; uint64_t size; };
+
+bool parse_lfs_pointer(const char *data, size_t length, LfsPointerRecord &out, bool &looks_like_pointer) {
+    static const char version[] = "version https://git-lfs.github.com/spec/v1\n";
+    looks_like_pointer = length >= sizeof(version) - 1 && !memcmp(data, version, sizeof(version) - 1);
+    if (!looks_like_pointer) return false;
+    // Only the canonical, extension-free v1 form is supported. Do not silently publish
+    // history whose LFS pointer Git LFS would interpret differently.
+    if (length < sizeof(version) - 1 + 6 + 64 + 6) return false;
+    size_t pos = sizeof(version) - 1;
+    if (memcmp(data + pos, "oid sha256:", 11)) return false;
+    pos += 11;
+    String oid(data + pos, 64); pos += 64;
+    if (oid.size() != 64) return false;
+    for (char c : oid) if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    if (pos >= length || data[pos++] != '\n' || length - pos < 5 || memcmp(data + pos, "size ", 5)) return false;
+    pos += 5;
+    if (pos >= length || data[pos] < '0' || data[pos] > '9') return false;
+    size_t size_start = pos;
+    uint64_t size = 0;
+    for (; pos < length && data[pos] >= '0' && data[pos] <= '9'; ++pos) {
+        unsigned digit = (unsigned)(data[pos] - '0');
+        if (size > (UINT64_MAX - digit) / 10) return false;
+        size = size * 10 + digit;
+    }
+    if (pos - size_start > 1 && data[size_start] == '0') return false;
+    if (pos >= length || data[pos++] != '\n' || pos != length) return false;
+    out = LfsPointerRecord{oid, size};
+    return true;
+}
+
+bool lfs_manifest_has(const Vec<char> &manifest, const String &oid, uint64_t size) {
+    for (size_t i = 0; i < manifest.size();) {
+        String rel(manifest.data() + i); i += rel.size() + 1;
+        String listed_oid(manifest.data() + i); i += listed_oid.size() + 1;
+        String listed_size(manifest.data() + i); i += listed_size.size() + 1;
+        if (listed_oid == oid.c_str() && strtoull(listed_size.c_str(), nullptr, 10) == size) return true;
+    }
+    return false;
+}
+
+// Open/create one path component relative to an already-validated directory descriptor.
+int open_lfs_dir(int parent, const char *name, bool create) {
+    int fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd >= 0 || !create || errno != ENOENT) return fd;
+    if (mkdirat(parent, name, 0700) && errno != EEXIST) return -1;
+    if (errno != EEXIST && fsync(parent)) return -1;
+    return openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+}
+
+int verify_named_lfs_payload(const char *world, int dirfd, const LfsPointerRecord &record) {
+    struct stat named_before;
+    if (fstatat(dirfd, record.oid.c_str(), &named_before, AT_SYMLINK_NOFOLLOW) ||
+        !S_ISREG(named_before.st_mode) || named_before.st_size < 0 ||
+        (uint64_t)named_before.st_size != record.size)
+        return refuse(WFS_E_GIT_TARGET, "the target Git LFS cache has a corrupt object %s", record.oid.c_str());
+
+    int fd = openat(dirfd, record.oid.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat before;
+    if (fd < 0 || fstat(fd, &before) || !S_ISREG(before.st_mode) || before.st_size < 0 ||
+        (uint64_t)before.st_size != record.size || before.st_dev != named_before.st_dev ||
+        before.st_ino != named_before.st_ino) {
+        if (fd >= 0) close(fd);
+        return refuse(WFS_E_GIT_TARGET, "the target Git LFS cache object %s changed or is corrupt", record.oid.c_str());
+    }
+
+    const char *file_arg = "--file=/dev/stdin";
+    Vec<char> first_hash, second_hash;
+    int rc = lseek(fd, 0, SEEK_SET) < 0 ? -errno : lfs_pointer_oracle(world, file_arg, &first_hash, fd);
+    if (!rc && lseek(fd, 0, SEEK_SET) < 0) rc = -errno;
+    if (!rc) rc = lfs_pointer_oracle(world, file_arg, &second_hash, fd);
+    bool valid_hash = false;
+    if (!rc) {
+        LfsPointerRecord got; bool looks = false;
+        valid_hash = parse_lfs_pointer(first_hash.data(), first_hash.size() - 1, got, looks) &&
+            got.oid == record.oid && got.size == record.size && same_bytes(first_hash, second_hash);
+        if (!valid_hash) rc = refuse(WFS_E_GIT_TARGET,
+            "the target Git LFS cache object %s changed or is corrupt", record.oid.c_str());
+    }
+
+    struct stat after, named_after;
+    bool after_ok = !fstat(fd, &after);
+    bool named_ok = !fstatat(dirfd, record.oid.c_str(), &named_after, AT_SYMLINK_NOFOLLOW);
+    bool same_times = false;
+    bool same_named_times = false;
+#if defined(__APPLE__)
+    same_times = after_ok && before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec &&
+        before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec &&
+        before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec &&
+        before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec;
+    same_named_times = after_ok && named_ok && after.st_mtimespec.tv_sec == named_after.st_mtimespec.tv_sec &&
+        after.st_mtimespec.tv_nsec == named_after.st_mtimespec.tv_nsec &&
+        after.st_ctimespec.tv_sec == named_after.st_ctimespec.tv_sec &&
+        after.st_ctimespec.tv_nsec == named_after.st_ctimespec.tv_nsec;
+#else
+    same_times = after_ok && before.st_mtim.tv_sec == after.st_mtim.tv_sec &&
+        before.st_mtim.tv_nsec == after.st_mtim.tv_nsec &&
+        before.st_ctim.tv_sec == after.st_ctim.tv_sec &&
+        before.st_ctim.tv_nsec == after.st_ctim.tv_nsec;
+    same_named_times = after_ok && named_ok && after.st_mtim.tv_sec == named_after.st_mtim.tv_sec &&
+        after.st_mtim.tv_nsec == named_after.st_mtim.tv_nsec &&
+        after.st_ctim.tv_sec == named_after.st_ctim.tv_sec &&
+        after.st_ctim.tv_nsec == named_after.st_ctim.tv_nsec;
+#endif
+    bool stable = after_ok && named_ok &&
+        S_ISREG(named_after.st_mode) && before.st_dev == after.st_dev && before.st_ino == after.st_ino &&
+        before.st_size == after.st_size && same_times && after.st_dev == named_after.st_dev &&
+        after.st_ino == named_after.st_ino && after.st_size == named_after.st_size && same_named_times;
+    close(fd);
+    if (rc) return rc;
+    if (!stable) return refuse(WFS_E_GIT_TARGET,
+        "the target Git LFS cache object %s changed or is corrupt", record.oid.c_str());
+    return 0;
+}
+
+int install_lfs_payload(const char *world, const char *source_common, const char *target_common,
+                        const LfsPointerRecord &record) {
+    char first[3] = {record.oid[0], record.oid[1], 0};
+    char second[3] = {record.oid[2], record.oid[3], 0};
+    int root = open(target_common, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (root < 0) return -errno;
+    int lfs = open_lfs_dir(root, "lfs", true); close(root);
+    if (lfs < 0) return -errno;
+    int objects = open_lfs_dir(lfs, "objects", true); close(lfs);
+    if (objects < 0) return -errno;
+    int a = open_lfs_dir(objects, first, true); close(objects);
+    if (a < 0) return -errno;
+    int b = open_lfs_dir(a, second, true); close(a);
+    if (b < 0) return -errno;
+    struct stat st;
+    if (!fstatat(b, record.oid.c_str(), &st, AT_SYMLINK_NOFOLLOW)) {
+        int verify_rc = verify_named_lfs_payload(world, b, record);
+        close(b);
+        return verify_rc;
+    }
+    if (errno != ENOENT) { int err = -errno; close(b); return err; }
+
+    int source_root = open(source_common, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (source_root < 0) { close(b); return -errno; }
+    int source_lfs = open_lfs_dir(source_root, "lfs", false); close(source_root);
+    if (source_lfs < 0) { close(b); return refuse(WFS_E_GIT_TARGET, "the World is missing Git LFS object %s", record.oid.c_str()); }
+    int source_objects = open_lfs_dir(source_lfs, "objects", false); close(source_lfs);
+    if (source_objects < 0) { close(b); return refuse(WFS_E_GIT_TARGET, "the World is missing Git LFS object %s", record.oid.c_str()); }
+    int source_a = open_lfs_dir(source_objects, first, false); close(source_objects);
+    if (source_a < 0) { close(b); return refuse(WFS_E_GIT_TARGET, "the World is missing Git LFS object %s", record.oid.c_str()); }
+    int source_b = open_lfs_dir(source_a, second, false); close(source_a);
+    if (source_b < 0) { close(b); return refuse(WFS_E_GIT_TARGET, "the World is missing Git LFS object %s", record.oid.c_str()); }
+    int source = openat(source_b, record.oid.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC); close(source_b);
+    if (source < 0) { close(b); return refuse(WFS_E_GIT_TARGET, "the World is missing Git LFS object %s", record.oid.c_str()); }
+    struct stat source_st;
+    if (fstat(source, &source_st) || !S_ISREG(source_st.st_mode) || source_st.st_size < 0 ||
+        (uint64_t)source_st.st_size != record.size) {
+        close(source); close(b); return refuse(WFS_E_GIT_TARGET, "the World Git LFS object %s changed or is corrupt", record.oid.c_str());
+    }
+    unsigned char nonce[8];
+    if (getentropy(nonce, sizeof nonce)) { int err = -errno; close(source); close(b); return err; }
+    char temp[64]; snprintf(temp, sizeof temp, ".wfs-%02x%02x%02x%02x%02x%02x%02x%02x",
+        nonce[0], nonce[1], nonce[2], nonce[3], nonce[4], nonce[5], nonce[6], nonce[7]);
+    int output = openat(b, temp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (output < 0) { int err = -errno; close(source); close(b); return err; }
+    int rc = 0; char buf[65536]; uint64_t copied = 0;
+    for (;;) {
+        ssize_t n = read(source, buf, sizeof buf);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { rc = -errno; break; }
+        if (!n) break;
+        size_t left = (size_t)n; const char *p = buf;
+        while (left) {
+            ssize_t w = write(output, p, left);
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) { rc = w < 0 ? -errno : -EIO; break; }
+            p += w; left -= (size_t)w; copied += (uint64_t)w;
+        }
+        if (rc) break;
+    }
+    if (!rc && copied != record.size) rc = -EIO;
+    if (!rc && fsync(output)) rc = -errno;
+    close(source);
+    if (close(output) && !rc) rc = -errno;
+    if (!rc) {
+        String temp_path = joinp(target_common, "lfs/objects");
+        temp_path = joinp(temp_path.c_str(), first); temp_path = joinp(temp_path.c_str(), second); temp_path = joinp(temp_path.c_str(), temp);
+        String file_arg("--file="); file_arg.append(temp_path.c_str());
+        Vec<char> parsed;
+        rc = lfs_pointer_oracle(world, file_arg.c_str(), &parsed);
+        if (!rc) {
+            LfsPointerRecord got; bool looks = false;
+            if (!parse_lfs_pointer(parsed.data(), parsed.size() - 1, got, looks) || got.oid != record.oid || got.size != record.size)
+                rc = refuse(WFS_E_GIT_TARGET, "the World Git LFS object %s changed or is corrupt", record.oid.c_str());
+        }
+    }
+    if (!rc && linkat(b, temp, b, record.oid.c_str(), 0)) {
+        if (errno == EEXIST) {
+            rc = verify_named_lfs_payload(world, b, record);
+        } else rc = -errno;
+    }
+    if (!rc && fsync(b)) rc = -errno;
+    (void)unlinkat(b, temp, 0);
+    close(b);
+    return rc;
+}
+
+int publish_lfs(const char *world, const char *target, const String &now) {
+    String source_common, target_common;
+    const char *common_args[] = {"rev-parse", "--path-format=absolute", "--git-common-dir", nullptr};
+    if (int rc = value(world, common_args, source_common)) return rc;
+    if (int rc = value(target, common_args, target_common)) return rc;
+    String source_cache = joinp(source_common.c_str(), "lfs/objects");
+    String target_cache = joinp(target_common.c_str(), "lfs/objects");
+    uint64_t total = 0, entries = 0; bool present = false; Vec<char> source_manifest, target_manifest;
+
+    const char *commits_args[] = {"--no-replace-objects", "rev-list", now.c_str(), nullptr};
+    Vec<char> commits;
+    if (int rc = git(target, commits_args, &commits)) return rc;
+    if (commits.empty() || !commits[0]) return 0;
+    struct AttrRepoCleanup {
+        String root, objects;
+        ~AttrRepoCleanup() {
+            if (!objects.empty()) (void)unlink(objects.c_str());
+            if (!root.empty()) (void)fs_remove_tree(root.c_str());
+        }
+    } attr_repo;
+    char scratch[] = "/tmp/worldfs-lfs-attrs-XXXXXX";
+    if (!mkdtemp(scratch)) return -errno;
+    attr_repo.root = scratch;
+    String scratch_repo = joinp(scratch, "repo.git");
+    String object_format;
+    const char *format_args[] = {"rev-parse", "--show-object-format", nullptr};
+    if (int rc = value(target, format_args, object_format)) return rc;
+    String format_arg("--object-format="); format_arg.append(object_format.c_str());
+    const char *init_args[] = {"init", "--bare", "--template=", "--quiet", format_arg.c_str(), "--", scratch_repo.c_str(), nullptr};
+    if (int rc = git(target, init_args)) return rc;
+    attr_repo.objects = joinp(scratch_repo.c_str(), "objects");
+    if (int rc = fs_remove_tree(attr_repo.objects.c_str())) return rc;
+    String target_objects = joinp(target_common.c_str(), "objects");
+    if (symlink(target_objects.c_str(), attr_repo.objects.c_str())) return -errno;
+    Vec<LfsPointerRecord> pointers;
+    auto add_pointer_blob = [&](const String &blob_oid) -> int {
+        const char *size_args[] = {"--no-replace-objects", "cat-file", "-s", blob_oid.c_str(), nullptr};
+        Vec<char> size_text;
+        if (int rc = git(target, size_args, &size_text)) return rc;
+        char *end = nullptr;
+        unsigned long long blob_size = strtoull(size_text.data(), &end, 10);
+        if (!end || end == size_text.data() || blob_size > 1024) return 0;
+        const char *blob_args[] = {"--no-replace-objects", "cat-file", "blob", blob_oid.c_str(), nullptr};
+        Vec<char> blob;
+        if (int rc = git(target, blob_args, &blob)) return rc;
+        LfsPointerRecord record; bool looks = false;
+        bool valid = parse_lfs_pointer(blob.data(), blob.size() - 1, record, looks);
+        if (looks && !valid)
+            return refuse(WFS_E_GIT_TARGET, "published history contains a noncanonical or unsupported Git LFS pointer");
+        if (!valid) return 0;
+        for (const auto &p : pointers) if (p.oid == record.oid) {
+            if (p.size != record.size) return refuse(WFS_E_GIT_TARGET, "published history has conflicting Git LFS sizes for %s", record.oid.c_str());
+            return 0;
+        }
+        pointers.emplace_back(record);
+        return 0;
+    };
+    auto regular_mode = [](const char *mode) { return !strcmp(mode, "100644") || !strcmp(mode, "100755"); };
+    for (size_t ci = 0; ci + 1 < commits.size();) {
+        size_t end = ci; while (end + 1 < commits.size() && commits[end] != '\n') ++end;
+        if (end == ci) { ci = end + 1; continue; }
+        String commit(commits.data() + ci, end - ci); ci = end + 1;
+        if (int rc = validate_lfs_tree_config(target, commit.c_str())) return rc;
+        const char *diff_args[] = {"--no-replace-objects", "diff-tree", "--no-commit-id", "--root", "-r", "-m", "-z", "--raw", "--no-renames", commit.c_str(), nullptr};
+        Vec<char> diff;
+        if (int rc = git(target, diff_args, &diff)) return rc;
+        Vec<GitSetting> files;
+        bool attributes_changed = false;
+        for (size_t i = 0; i + 1 < diff.size();) {
+            const char *header = diff.data() + i; i += strlen(header) + 1;
+            if (header[0] != ':' || i >= diff.size()) continue;
+            const char *path = diff.data() + i; i += strlen(path) + 1;
+            char old_mode[8], new_mode[8], old_oid[72], new_oid[72], status[8];
+            if (sscanf(header, ":%7s %7s %71s %71s %7s", old_mode, new_mode, old_oid, new_oid, status) != 5) continue;
+            size_t plen = strlen(path);
+            static const char root_attr[] = ".gitattributes";
+            static const char nested_attr[] = "/.gitattributes";
+            if ((plen == sizeof(root_attr) - 1 && !strcmp(path, root_attr)) ||
+                (plen >= sizeof(nested_attr) - 1 && !strcmp(path + plen - (sizeof(nested_attr) - 1), nested_attr)))
+                attributes_changed = true;
+            if (regular_mode(new_mode) && status[0] != 'D') files.emplace_back(GitSetting{String(path), String(new_oid)});
+        }
+        if (attributes_changed) {
+            const char *tree_args[] = {"--no-replace-objects", "ls-tree", "-r", "-z", "--full-tree", commit.c_str(), nullptr};
+            Vec<char> tree;
+            if (int rc = git(target, tree_args, &tree)) return rc;
+            for (size_t i = 0; i + 1 < tree.size();) {
+                const char *record = tree.data() + i; i += strlen(record) + 1;
+                const char *tab = strchr(record, '\t');
+                if (!tab) continue;
+                char mode[8], type[8], oid[72];
+                if (sscanf(record, "%7s %7s %71s", mode, type, oid) != 3 || strcmp(type, "blob") || !regular_mode(mode)) continue;
+                const char *path = tab + 1;
+                size_t plen = strlen(path);
+                bool found = false; for (const auto &f : files) if (f.key == path) { found = true; break; }
+                if (!found) files.emplace_back(GitSetting{String(path, plen), String(oid)});
+            }
+        }
+        if (files.empty()) continue;
+        FILE *paths = tmpfile();
+        if (!paths) return -errno;
+        for (const auto &file : files) {
+            if (fwrite(file.key.c_str(), 1, file.key.size() + 1, paths) != file.key.size() + 1) {
+                int err = errno ? -errno : -EIO; fclose(paths); return err;
+            }
+        }
+        if (fflush(paths)) { int err = -errno; fclose(paths); return err; }
+        rewind(paths);
+        String source("--source="); source.append(commit.c_str());
+        const char *attr_args[] = {"--no-replace-objects", "-c", "core.attributesFile=/dev/null",
+            "check-attr", "--stdin", "-z", source.c_str(), "filter", nullptr};
+        Vec<char> attrs;
+        int attr_rc = git(scratch_repo.c_str(), attr_args, &attrs, nullptr, false, false, fileno(paths), false, true);
+        fclose(paths);
+        if (attr_rc) return attr_rc;
+        size_t ai = 0;
+        for (const auto &file : files) {
+            if (ai + 1 >= attrs.size()) return refuse(WFS_E_GIT_TARGET, "Git returned an incomplete attribute listing for published history");
+            const char *path = attrs.data() + ai; ai += strlen(path) + 1;
+            const char *attribute = attrs.data() + ai; ai += strlen(attribute) + 1;
+            const char *value_text = attrs.data() + ai; ai += strlen(value_text) + 1;
+            if (file.key != path || strcmp(attribute, "filter"))
+                return refuse(WFS_E_GIT_TARGET, "Git returned an unexpected attribute listing for published history");
+            if (!strcmp(value_text, "lfs"))
+                if (int rc = add_pointer_blob(file.value)) return rc;
+        }
+    }
+    if (pointers.empty()) return 0;
+    if (int rc = validate_lfs_storage(target)) return rc;
+    if (int rc = lfs_import_bytes(target, target_cache.c_str(), total, entries, present, target_manifest)) return rc;
+    bool needs_source = false;
+    for (const auto &p : pointers) if (!lfs_manifest_has(target_manifest, p.oid, p.size)) needs_source = true;
+    if (needs_source) {
+        if (int rc = lfs_import_bytes(world, source_cache.c_str(), total, entries, present, source_manifest)) return rc;
+    }
+    for (const auto &p : pointers) {
+        if (lfs_manifest_has(target_manifest, p.oid, p.size)) continue;
+        if (!lfs_manifest_has(source_manifest, p.oid, p.size))
+            return refuse(WFS_E_GIT_TARGET, "the World is missing Git LFS object %s", p.oid.c_str());
+    }
+    for (const auto &p : pointers) {
+        if (int rc = install_lfs_payload(world, source_common.c_str(), target_common.c_str(), p)) return rc;
     }
     return 0;
 }
@@ -3818,6 +5138,17 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
     if (now.empty()) return rc ? rc : WFS_E_GIT_FAILED;
     String script;
     if (!rc && old != now) {
+        // Git offers no way to make "not checked out in any worktree" part of a ref
+        // transaction; its own refusal to fetch into a checked-out branch is the same kind of
+        // check. Repeat it immediately before the transaction, so the window is only the
+        // transaction itself rather than the whole fetch and history checks.
+        bool checked_now = false;
+        rc = branch_checked_out(repo, ref, checked_now);
+        if (!rc && checked_now)
+            rc = refuse(WFS_E_GIT_TARGET, "%s was checked out in the target repository while publishing; nothing was changed", branch);
+    }
+    if (!rc) rc = publish_lfs(world_root, repo, now);
+    if (!rc && old != now) {
         script.append("update "); script.append(ref.c_str()); script.push_back(' ');
         script.append(now.c_str()); script.push_back(' ');
         script.append(old.empty() ? zero : old.c_str()); script.push_back('\n');
@@ -3828,21 +5159,6 @@ extern "C" int wfs_git_publish(const char *world_root, const char *repo, const c
     }
     script.append("delete "); script.append(staging); script.push_back(' ');
     script.append(now.c_str()); script.push_back('\n');
-    if (!rc && old != now) {
-        // Git offers no way to make "not checked out in any worktree" part of a ref
-        // transaction; its own refusal to fetch into a checked-out branch is the same kind of
-        // check. Repeat it immediately before the transaction, so the window is only the
-        // transaction itself rather than the whole fetch and history checks.
-        bool checked_now = false;
-        rc = branch_checked_out(repo, ref, checked_now);
-        if (!rc && checked_now)
-            rc = refuse(WFS_E_GIT_TARGET, "%s was checked out in the target repository while publishing; nothing was changed", branch);
-        if (rc) {
-            script.clear();
-            script.append("delete "); script.append(staging); script.push_back(' ');
-            script.append(now.c_str()); script.push_back('\n');
-        }
-    }
     // If the transaction cannot even be fed, still take the staging ref back out (only with
     // the value this call fetched), so a failure never leaves the target modified.
     auto drop_staging = [&]() {
