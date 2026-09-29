@@ -144,7 +144,7 @@ static int is_refusal(int rc) { return rc <= -1001 && rc >= -1099; }
 
 static int fail(const char *what, int rc) {
     fprintf(stderr, "world: %s: %s\n", what, wfs_strerror(rc));
-    if (rc == WFS_E_GIT_UNSUPPORTED || rc == WFS_E_GIT_POLICY || rc == WFS_E_GIT_TARGET) {
+    if (rc == WFS_E_GIT_UNSUPPORTED || rc == WFS_E_GIT_POLICY || rc == WFS_E_GIT_TARGET || rc == WFS_E_GIT_IN_USE) {
         const char *why = wfs_git_reason();
         if (why && *why) fprintf(stderr, "  reason: %s\n", why);
     }
@@ -348,6 +348,21 @@ static void changes_choice(int include_changes, int committed_only) {
     }
 }
 
+// The Git linked worktrees an import left out -- an AI agent's checkouts, typically -- one note
+// each, so a `.claude/worktrees/<name>` missing from the new tree is not a surprise.
+static void omitted_worktree_notes(const char *kind, unsigned long long id) {
+    const char *list = wfs_git_omitted_worktrees();
+    while (list && *list) {
+        const char *end = strchr(list, '\n');
+        int n = end ? (int)(end - list) : (int)strlen(list);
+        fprintf(stderr,
+                "world: note: linked worktree %.*s is a separate checkout, not part of %s%llu: its "
+                "branches and commits are carried, its uncommitted changes are not\n",
+                n, list, kind, id);
+        list += n + (end ? 1 : 0);
+    }
+}
+
 static int cmd_init(wfs_store *s, int argc, char **argv) {
     const char *dir = NULL;
     wfs_snapshot_opts opts;
@@ -390,6 +405,7 @@ static int cmd_init(wfs_store *s, int argc, char **argv) {
     } else {
         printf("S%llu\n", (unsigned long long)id);
     }
+    omitted_worktree_notes("S", (unsigned long long)id);
     // Hooks are left behind unless asked for, which silently skips husky/pre-commit checks on
     // World commits; say so once, with the way to carry them.
     if (!opts.with_hooks && wfs_git_uncarried_hooks(dir) == 1)
@@ -722,6 +738,7 @@ static int cmd_fork(wfs_store *s, int argc, char **argv) {
         // nothing because the filler did it when the entry was made.
         if (res.hardlinks) printf("  (%llu hardlinks rebuilt)", (unsigned long long)res.hardlinks);
         printf("\n");
+        omitted_worktree_notes("W", (unsigned long long)res.world);
         // Put back what this fork took, in the background, so the next one is fast too --
         // unless a filler is already at work, in which case spawning a second one would only
         // cost this fork a process start to have the child exit on the lock.
@@ -776,6 +793,7 @@ static int cmd_checkpoint(wfs_store *s, int argc, char **argv) {
                (unsigned long long)sr.entries, (unsigned long long)w);
     else
         printf("S%llu\n", (unsigned long long)id);
+    omitted_worktree_notes("S", (unsigned long long)id);
     return EX_OK;
 }
 

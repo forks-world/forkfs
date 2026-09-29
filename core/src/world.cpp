@@ -1178,6 +1178,7 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
                                    wfs_id *out) {
     if (!s || !src_dir || !out) return -EINVAL;
     *out = 0;
+    wfs::git_clear_omitted();
     wfs_snapshot_opts o;
     memset(&o, 0, sizeof o);
     if (opts) o = *opts;
@@ -1297,8 +1298,10 @@ extern "C" int wfs_snapshot_create(wfs_store *s, const char *src_dir, const wfs_
         // The source scan already left the replaced `.git` out, so `hl` describes this tree.
         if ((rc = wfs::git_import(git_source, root.c_str()))) break;
         // A submodule's copied `.git` is replaced by owned administration too, and the scan above
-        // saw it: a group with a member in there is not whole any more either.
-        if ((git_source.committed_only || !git_source.modules.empty()) && hl.groups.size()) hl_drop_changed(root.c_str(), hl);
+        // saw it: a group with a member in there is not whole any more either. Nor is one with a
+        // member in a linked worktree's checkout the import left out of the copy.
+        if ((git_source.committed_only || !git_source.modules.empty() || !git_source.worktrees.empty()) &&
+            hl.groups.size()) hl_drop_changed(root.c_str(), hl);
         {
             struct stat rst;
             if (::stat(root.c_str(), &rst) == 0) root_mode = (uint32_t)(rst.st_mode & 07777);
@@ -1483,6 +1486,7 @@ extern "C" int wfs_world_create_ex(wfs_store *s, wfs_ref from, const char *targe
     if (!res) res = &local;
     memset(res, 0, sizeof *res);
     int64_t t_begin = now_us();
+    wfs::git_clear_omitted();
     if (!s || !target_path || from.id == 0) return -EINVAL;
     wfs_fork_opts o;
     memset(&o, 0, sizeof o);

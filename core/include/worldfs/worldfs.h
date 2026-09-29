@@ -163,7 +163,7 @@ enum {
     WFS_E_GIT_DIRTY = -1024,       /* Pass include_changes to preserve uncommitted state. */
     WFS_E_GIT_FAILED = -1025,      /* Git command failed; see its diagnostic. */
     WFS_E_GIT_POOL = -1026,        /* Reserved, no longer returned: Git snapshots are poolable. */
-    WFS_E_GIT_IN_USE = -1027,      /* Additional linked worktrees depend on this tree. */
+    WFS_E_GIT_IN_USE = -1027,      /* Linked worktrees outside this tree depend on it. */
     /* Git configuration outside the repository would make the World's Git see files
      * differently from the source's: a filter that tracked files use (except the supported
      * stock Git LFS filter), a conditional include that sets status or filter settings,
@@ -193,9 +193,16 @@ int wfs_store_holders(const char *store_dir, wfs_store_holder *buf, size_t cap, 
 
 /* Human-readable text for a negative errno or a WFS_E_* code. Never NULL. */
 const char *wfs_strerror(int rc);
-/* The specific reason for the last WFS_E_GIT_UNSUPPORTED or WFS_E_GIT_POLICY returned on this
- * thread (e.g. "reftable ref storage"), or "" when none was recorded. */
+/* The specific reason for the last WFS_E_GIT_UNSUPPORTED, WFS_E_GIT_POLICY, WFS_E_GIT_TARGET or
+ * WFS_E_GIT_IN_USE returned on this thread (e.g. "reftable ref storage", or which worktrees
+ * outside a World block its discard and how to remove them), or "" when none was recorded. */
 const char *wfs_git_reason(void);
+/* The Git linked worktrees that the last wfs_snapshot_create or wfs_world_create_ex on this
+ * thread left out of the tree it made, one per line: a path relative to the source's root for a
+ * checkout inside it, the registered absolute path otherwise. They are separate checkouts of the
+ * repository (an AI agent's, typically); their branches and commits are carried, their
+ * checkouts and uncommitted state are not. "" when there were none. */
+const char *wfs_git_omitted_worktrees(void);
 const char *wfs_version(void);
 
 /* ---- generic file types, shared with the platform layer ---- */
