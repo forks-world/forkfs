@@ -1984,6 +1984,17 @@ static void sl_free(StrList *l) {
     memset(l, 0, sizeof *l);
 }
 
+// realpath(3) into a buffer smaller than PATH_MAX: glibc's _FORTIFY_SOURCE aborts the process
+// ("buffer overflow detected") when the output buffer is under PATH_MAX, and WFS_PATH_MAX is
+// 1024. Let realpath allocate, then copy; false when it fails or the result does not fit.
+static bool resolve_into(const char *path, char *out, size_t cap) {
+    char *r = realpath(path, nullptr);
+    if (!r) return false;
+    bool fits = (size_t)snprintf(out, cap, "%s", r) < cap;
+    free(r);
+    return fits;
+}
+
 struct GitAdmin {
     char root[WFS_PATH_MAX];     // the World root, resolved
     char common[WFS_PATH_MAX];   // <root>/.world-git/repo.git
@@ -2031,7 +2042,7 @@ static void find_submodules(GitAdmin *a, const char *dir, int depth) {
 // False for a plain directory World: it has no Git administration to guard.
 static bool git_admin_find(const char *world, GitAdmin *a) {
     memset(a, 0, sizeof *a);
-    if (!realpath(world, a->root)) snprintf(a->root, sizeof a->root, "%s", world);
+    if (!resolve_into(world, a->root, sizeof a->root)) snprintf(a->root, sizeof a->root, "%s", world);
     char wg[WFS_PATH_MAX];
     snprintf(wg, sizeof wg, "%s/.world-git", a->root);
     snprintf(a->common, sizeof a->common, "%s/repo.git", wg);
@@ -2257,7 +2268,7 @@ static void note_hooks_path(GitAdmin *a, const char *v) {
     if (!strncmp(v, "~/", 2) && home && *home) snprintf(p, sizeof p, "%s/%s", home, v + 2);
     else if (v[0] == '/') snprintf(p, sizeof p, "%s", v);
     else snprintf(p, sizeof p, "%s/%s", a->root, v);
-    if (!*v || !realpath(p, real)) join_lexical("/", p, real, sizeof real);
+    if (!*v || !resolve_into(p, real, sizeof real)) join_lexical("/", p, real, sizeof real);
     if (!strcmp(real, "/dev/null")) return;
     char admin[WFS_PATH_MAX];
     snprintf(admin, sizeof admin, "%s/.world-git", a->root);
