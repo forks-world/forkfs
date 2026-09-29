@@ -2651,11 +2651,11 @@ int drop_unignored_nested(const char *clone, bool world_root) {
 // the source was captured read-only and is rechecked unchanged before this runs. The index is
 // refreshed first (the copy's inodes and ctimes differ from the ones it records), so the reset
 // rewrites only files whose content differs from HEAD and the rest stay clones of the source's
-// blocks. `clean` without -x removes untracked, non-ignored files and keeps ignored build/data
-// artifacts and the reserved administration; with -ff it also removes an untracked nested
-// repository, which plain -f skips, and drop_unignored_nested takes the `.git` of any
-// non-ignored one that is left. `read-tree --reset -u` then puts back modified and
-// deleted tracked files and drops files that were only staged. They run with the user's ambient
+// blocks. `read-tree --reset -u` puts back modified and deleted tracked files and drops files
+// that were only staged; then, by HEAD's ignore rules, `clean` without -x removes untracked,
+// non-ignored files and keeps ignored build/data artifacts and the reserved administration;
+// with -ff it also removes an untracked nested repository, which plain -f skips, and
+// drop_unignored_nested takes the `.git` of any non-ignored one that is left. They run with the user's ambient
 // configuration, like the clean check, so "ignored" and "clean" mean what the user's Git says.
 // No filter can run, and hooks are off. The source-side check saw only the source's worktree and
 // index attributes, which a dirty `.gitattributes` can differ from HEAD's, so filter use is
@@ -2711,8 +2711,6 @@ int reset_to_head(const char *clone, const char *target = nullptr) {
     if (rc && !(rc == WFS_E_GIT_FAILED && status == 1)) return rc;
     const char *clean[] = {"clean", "-f", "-f", "-d", "-q", "--", ".", ":(exclude,top,literal).world",
                            ":(exclude,top,literal).world-git", nullptr};
-    if ((rc = git(clone, clean, nullptr, nullptr, false, true))) return rc;
-    if ((rc = drop_unignored_nested(clone, !target))) return rc;
     if (target) {
         String head;
         const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
@@ -2730,7 +2728,16 @@ int reset_to_head(const char *clone, const char *target = nullptr) {
         const char *checkout[] = {"lfs", "checkout", nullptr};
         if ((rc = git(clone, checkout, nullptr, nullptr, false, true))) return rc;
     }
-    // A directory the reset emptied of staged additions, or anything else left untracked.
+    // Everything untracked is decided only now, after the reset, by HEAD's ignore rules: an
+    // uncommitted `.gitignore` that drops a rule HEAD has would otherwise have the ignored
+    // build output -- or an ignored nested repository -- it covers removed, although HEAD's
+    // rules keep it (`read-tree --reset -u` overwrites untracked files in its way, so nothing
+    // needs cleaning before it). The clean removes untracked files and directories, a
+    // directory the reset emptied of staged additions and whole untracked nested repositories;
+    // drop_unignored_nested then takes the `.git` of a non-ignored one the clean cannot see
+    // (in a directory with tracked files), and a second clean the rest of its content.
+    if ((rc = git(clone, clean, nullptr, nullptr, false, true))) return rc;
+    if ((rc = drop_unignored_nested(clone, !target))) return rc;
     if ((rc = git(clone, clean, nullptr, nullptr, false, true))) return rc;
     String squash;
     const char *squash_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "SQUASH_MSG", nullptr};

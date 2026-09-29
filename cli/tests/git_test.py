@@ -4891,6 +4891,28 @@ class GitWorldTest(unittest.TestCase):
         assert_committed(self.root / 'four')
         self.assertTrue((two / 'scratch/clone/.git').is_dir())
 
+    def test_committed_only_decides_ignored_content_by_heads_rules(self):
+        # HEAD ignores build/ and vendor/; the uncommitted .gitignore drops both rules. What
+        # --committed-only keeps is decided by HEAD's rules, the ones the copy ends with: the
+        # ignored build output and the ignored nested repository in a tracked directory stay.
+        (self.source / '.gitignore').write_text('build/\nvendor/lib/\n')
+        (self.source / 'vendor').mkdir()
+        (self.source / 'vendor/README').write_text('tracked\n')
+        self.git(self.source, 'add', '.')
+        self.git(self.source, 'commit', '-qm', 'ignores')
+        (self.source / 'build').mkdir()
+        (self.source / 'build/out.bin').write_text('artifact\n')
+        head = self.nested_repo(self.source / 'vendor/lib', 'lib')
+        (self.source / '.gitignore').write_text('')
+        (self.source / 'stray.txt').write_text('untracked\n')
+        self.world('init', str(self.source), '--committed-only')
+        one, _ = self.fork()
+        self.assertEqual((one / 'build/out.bin').read_text(), 'artifact\n')
+        self.assertEqual(self.git(one / 'vendor/lib', 'rev-parse', 'HEAD').stdout.strip(), head)
+        self.assertFalse((one / 'stray.txt').exists())
+        self.assertEqual((one / '.gitignore').read_text(), 'build/\nvendor/lib/\n')
+        self.assertEqual(self.git(one, 'status', '--porcelain').stdout, b'')
+
     def test_nested_repositories_that_reach_outside_are_refused(self):
         other = self.origin('other')
         objects = str(other / '.git/objects')
