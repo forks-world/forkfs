@@ -375,10 +375,9 @@ int nested_admin_walk(int dirfd, const String &rel, const String &repo, int dept
 // - its configuration -- read from that file alone with `git config --file --no-includes`, so
 //   none of the nested repository's includes, hooks, filters or fsmonitor ever run -- sets no
 //   core.worktree (a worktree elsewhere), no extensions.worktreeConfig (per-worktree settings
-//   in config.worktree that Git reads only with it), no include.path or includeIf.*.path
-//   with a relative path (resolved from the copy's location instead of the source's), and no
-//   includeIf condition other than `onbranch:` or `hasconfig:` (`gitdir:` matches the
-//   repository's own path, so the copy's effective settings would differ from the source's).
+//   in config.worktree that Git reads only with it), and no include.path or includeIf.*.path
+//   at all (an included file's settings, further includes and conditions -- a `gitdir:` one
+//   matching the source's location -- are not examined, so the copy could read them differently).
 // A bare repository named `.git` (core.bare) passes too: it names no worktree at all. Every
 // refusal names the repository and the cause. No Git command runs inside the repository.
 int check_nested_repository(const String &dir_path) {
@@ -447,21 +446,16 @@ int check_nested_repository(const String &dir_path) {
             return refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository at %s: it sets core.worktree, a worktree elsewhere", who);
         if (!strcmp(k, "extensions.worktreeconfig"))
             return refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository at %s: it sets extensions.worktreeConfig", who);
-        bool conditional = !strncmp(k, "includeif.", 10) && key.size() > 15 && !strcmp(k + key.size() - 5, ".path");
-        bool include = !strcmp(k, "include.path") || conditional;
-        if (conditional) {
-            // Only conditions that do not depend on where the repository is: `onbranch:` (its
-            // HEAD) and `hasconfig:` (its remote URLs). `gitdir:`/`gitdir/i:` match the
-            // repository's own path, which the copy changes, and any condition Git adds later is
-            // not known to be location-independent.
-            String cond(k + 10, key.size() - 15);
-            if (strncmp(cond.c_str(), "onbranch:", 9) && strncmp(cond.c_str(), "hasconfig:", 10))
-                return refuse(WFS_E_GIT_UNSUPPORTED,
-                    "nested Git repository at %s: it includes %s under the condition %s, which a copy at "
-                    "another location would evaluate differently", who, val, cond.c_str());
-        }
-        if (include && val[0] != '/' && val[0] != '~')
-            return refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository at %s: it includes %s by a relative path, which a copy would resolve from its own location", who, val);
+        // Any include, conditional or not, whatever path it names: an included file's own
+        // settings -- its further includes and their conditions, a `gitdir:` one matching the
+        // source's location included -- are not examined here, and resolving Git's include
+        // graph (path forms, conditions, depth) to examine them is not something to
+        // reimplement. A nested repository that includes configuration is refused instead.
+        if (!strcmp(k, "include.path") ||
+            (!strncmp(k, "includeif.", 10) && key.size() > 15 && !strcmp(k + key.size() - 5, ".path")))
+            return refuse(WFS_E_GIT_UNSUPPORTED,
+                "nested Git repository at %s: its configuration includes %s (%s), whose settings a copy "
+                "would not be known to read the same way", who, val, k);
     }
     return 0;
 }

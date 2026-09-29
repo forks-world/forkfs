@@ -4925,18 +4925,20 @@ class GitWorldTest(unittest.TestCase):
         self.nested_repo(nested)
         self.git(nested, 'config', 'extensions.worktreeConfig', 'true')
         refused(nested, b'it sets extensions.worktreeConfig')
-        self.nested_repo(nested)
-        self.git(nested, 'config', 'include.path', '../../shared.cfg')
-        refused(nested, b'it includes ../../shared.cfg by a relative path')
-        self.nested_repo(nested)
-        self.git(nested, 'config', 'includeIf.onbranch:main.path', 'local.cfg')
-        refused(nested, b'it includes local.cfg by a relative path')
-        # A condition on the repository's own location evaluates differently in the copy,
-        # whatever the included path: a source-only core.filemode=false would stop applying.
-        for cond in ('gitdir:' + str(nested) + '/', 'gitdir/i:' + str(nested) + '/'):
+        # Any include is refused, whatever it names and whatever its condition: an included
+        # file's own settings and further includes (a `gitdir:` one matching the source's
+        # location, say) are not examined.
+        shared = str(self.root / 'shared.cfg')
+        for key, value in (('include.path', '../../shared.cfg'), ('include.path', shared),
+                           ('includeIf.onbranch:main.path', shared),
+                           ('includeIf.hasconfig:remote.*.url:https://example.com/**.path', shared),
+                           ('includeIf.gitdir:' + str(nested) + '/.path', shared),
+                           ('includeIf.gitdir/i:' + str(nested) + '/.path', shared)):
             self.nested_repo(nested)
-            self.git(nested, 'config', 'includeIf.' + cond + '.path', str(self.root / 'shared.cfg'))
-            refused(nested, b'it includes ' + str(self.root / 'shared.cfg').encode() + b' under the condition ' + cond.encode())
+            self.git(nested, 'config', key, value)
+            # Git lowercases the section and the variable, never the subsection (the condition).
+            listed = 'include.path' if key == 'include.path' else 'includeif.' + key[len('includeIf.'):]
+            refused(nested, b'its configuration includes ' + value.encode() + b' (' + listed.encode() + b')')
         self.nested_repo(nested)
         (nested / '.git/modules/lib').mkdir(parents=True)
         refused(nested, b'it holds submodule repositories (.git/modules)')
@@ -4958,12 +4960,9 @@ class GitWorldTest(unittest.TestCase):
         refused(inner, b'it borrows objects from another repository (objects/info/alternates)')
         shutil.rmtree(nested)
         self.assertEqual(self.snapshots(), [])
-        # Admitted: an absolute include, a bare repository named .git, and a symlink to a
+        # Admitted: a bare repository named .git, and a symlink to a
         # repository elsewhere, which stays a symlink and is never entered.
         self.nested_repo(nested)
-        self.git(nested, 'config', 'include.path', str(self.root / 'shared.cfg'))
-        self.git(nested, 'config', 'includeIf.onbranch:main.path', str(self.root / 'shared.cfg'))
-        self.git(nested, 'config', 'includeIf.hasconfig:remote.*.url:https://example.com/**.path', str(self.root / 'shared.cfg'))
         self.git(self.root, 'init', '-q', '--bare', str(self.source / 'bare/.git'))
         (self.source / 'link').symlink_to(other)
         self.world('init', str(self.source), '--include-changes')
