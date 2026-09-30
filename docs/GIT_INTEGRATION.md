@@ -245,9 +245,10 @@ So `world exec` does two things.
   `*.sample` templates in it, which Git never runs, and nothing else (seatbelt cannot tell
   that `mkdir` from renaming a prepared directory into place, so a *new* repository's hooks
   directory can still arrive that way; the report below lists what it contains);
-- the directory the World's effective `core.hooksPath` names, when that is outside the tree
-  (a global `~/.githooks`, a shared directory) or inside `.world-git`; its hooks are also
-  included in the report below;
+- the directory each repository's effective `core.hooksPath` names (the World's and every
+  submodule's, a relative value resolved from that repository's checkout as Git does), when
+  that is outside the tree (a global `~/.githooks`, a shared directory) or inside
+  `.world-git`; its hooks are also included in the report below;
 - what tells Git where those repositories are: the World's `.git` file,
   `.world-git/repo.git/worktrees/active/commondir`, and the directory entries on the way to
   each repository (`.world-git`, `repo.git`, `worktrees`, `active`, `modules`, each existing
@@ -264,19 +265,33 @@ not denied either: `git remote add`, `git push -u`, `git branch --set-upstream-t
 `git config` legitimately write it. Hence the second part.
 
 **Reported after every exec** (sandboxed or `--no-sandbox`, whatever the command's exit
-status, which `world exec` keeps). Before the command starts, exec records, for the World and
-each submodule repository present, `git config --list --includes --show-scope` (effective
-configuration: system, global, local, worktree and included files -- the sandbox does not
-stop writes to `~/.gitconfig`, and `--no-sandbox` stops nothing) filtered to the settings
-below, plus the hooks Git could run (name, mode and content of every non-`.sample` entry of
-each hooks directory) and the `.git` files that locate the repositories. It records them
-again after the command and prints one line per difference to stderr:
+status, which `world exec` keeps). Before the command starts, exec captures each repository
+-- the World and every submodule repository present -- whole, and the same capture decides
+the sandbox rules above:
+
+- its effective configuration, `git config --list --includes --show-scope` read through its
+  own administration: system, global, local, worktree and included files -- the sandbox does
+  not stop writes to `~/.gitconfig`, and `--no-sandbox` stops nothing. Every scope is kept
+  per repository, since an `includeIf "gitdir:..."` or `"onbranch:..."` can give one
+  submodule settings the World does not have; a change to a global or system entry that is
+  identical in the World's own listing is reported once, under the World;
+- the hooks Git could run: name, mode and content of every non-`.sample` entry of its hooks
+  directory and of its effective `core.hooksPath` when that is guarded;
+- the entries that tell Git where it is -- the World's `.git` and `commondir`, each
+  submodule checkout's `.git` -- by entry type (file, directory, symlink, missing) and
+  content, and whether a file still names its own repository.
+
+It captures them again after the command and prints one line per difference to stderr. A
+`.git` replaced by another type (`git init` over it, a symlink) or rewritten is reported as a
+change, a removed one (`submodule deinit`, `git rm`) as a removal; only a submodule checkout's
+`.git` that appears naming its own repository (`submodule update --init`) is not reported:
 
 ```
 world: WARNING: exec changed a Git setting that runs commands: local core.fsmonitor: (unset) -> touch /tmp/x
 world: WARNING: exec changed a Git setting that runs commands: submodule lib-module local credential.helper: (unset) -> store
 world: WARNING: exec added a Git hook: .world-git/repo.git/worktrees/active/modules/vendor/lib/hooks/post-checkout
-world: WARNING: exec changed where Git finds a repository: libs/lib/.git
+world: WARNING: exec changed where Git finds a repository: .git (a file naming its repository -> a directory)
+world: WARNING: exec removed libs/lib/.git, which told Git where a repository is
 ```
 
 The settings watched (Git's lowercase key names; `*` is any subsection): `core.hookspath`,

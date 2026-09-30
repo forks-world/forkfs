@@ -408,7 +408,7 @@ last, which makes the denies absolute:
 | | |
 |---|---|
 | **denied, write** | the whole store (metadata, trash and every snapshot), and every other World's root |
-| | this World's Git hooks: `.world-git/repo.git/hooks`, every submodule repository's `hooks` (also one cloned during the exec), a `core.hooksPath` outside the tree, and the entries that locate them (`.git`, `commondir`, the directories on the way) |
+| | this World's Git hooks: `.world-git/repo.git/hooks`, every submodule repository's `hooks` (also one cloned during the exec), any repository's `core.hooksPath` outside the tree, and the entries that locate them (`.git`, `commondir`, the directories on the way) |
 | **denied, read** | `<store>/snapshots` |
 | allowed, write | this World's root |
 | | `$TMPDIR`, `/private/tmp`, `/private/var/tmp` |

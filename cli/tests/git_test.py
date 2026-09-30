@@ -4569,8 +4569,25 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'global core.pager: (unset) -> less; evil\n', p.stderr)
         # A rewritten `.git` is reported: Git would find another repository and its hooks.
         p = self.exec_sh(wid, 'cp .git .git.orig && echo "gitdir: /tmp/elsewhere" > .git', '--no-sandbox')
-        self.assertIn(b'world: WARNING: exec changed where Git finds a repository: .git\n', p.stderr)
+        self.assertIn(b'world: WARNING: exec changed where Git finds a repository: .git '
+                      b'(a file naming its repository -> a file naming another repository)\n', p.stderr)
         (one / '.git.orig').rename(one / '.git')
+        # So is replacing it with another entry type: a new repository (whose settings the
+        # World's own administration does not show), a symlink, or nothing at all.
+        p = self.exec_sh(wid, "mv .git .git.saved && git init -q . && git config core.fsmonitor 'echo bad'",
+                         '--no-sandbox')
+        self.assertIn(b'world: WARNING: exec changed where Git finds a repository: .git '
+                      b'(a file naming its repository -> a directory)\n', p.stderr)
+        shutil.rmtree(one / '.git')
+        p = self.exec_sh(wid, 'ln -s .git.saved .git', '--no-sandbox')
+        self.assertIn(b'world: WARNING: exec changed where Git finds a repository: .git (missing -> a symlink)\n',
+                      p.stderr)
+        p = self.exec_sh(wid, 'rm .git && mv .git.saved .git', '--no-sandbox')
+        self.assertIn(b'world: WARNING: exec changed where Git finds a repository: .git '
+                      b'(a symlink -> a file naming its repository)\n', p.stderr)
+        p = self.exec_sh(wid, 'mv .git .git.saved', '--no-sandbox')
+        self.assertIn(b'world: WARNING: exec removed .git, which told Git where a repository is\n', p.stderr)
+        (one / '.git.saved').rename(one / '.git')
 
     def test_exec_in_a_plain_world_says_nothing_about_git(self):
         plain = self.root / 'plain'
@@ -5279,7 +5296,45 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'world: WARNING: exec changed a Git setting that runs commands: submodule '
                       b'lib-module/modules/deps/inner local core.sshcommand: (unset) -> ssh -o ProxyCommand=evil\n',
                       p.stderr)
-        self.assertIn(b'world: WARNING: exec changed where Git finds a repository: libs/lib/.git\n', p.stderr)
+        self.assertIn(b'world: WARNING: exec changed where Git finds a repository: libs/lib/.git '
+                      b'(a file naming its repository -> a file naming another repository)\n', p.stderr)
+
+    def test_exec_guards_a_submodules_own_hooks_path(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        shared = self.root / 'lib-hooks'
+        shared.mkdir()
+        self.git(one / 'libs/lib', 'config', 'core.hooksPath', str(shared))
+        self.assert_denied(wid, 'echo evil > ' + shlex.quote(str(shared / 'pre-commit')))
+        self.assertFalse((shared / 'pre-commit').exists())
+        p = self.exec_sh(wid, 'echo evil > ' + shlex.quote(str(shared / 'post-checkout')), '--no-sandbox')
+        self.assertIn(('world: WARNING: exec added a Git hook: %s\n' % (shared / 'post-checkout')).encode(), p.stderr)
+        # A relative value is resolved from the submodule's checkout: inside the tree it is the
+        # submodule's project content, not guarded.
+        self.git(one / 'libs/lib', 'config', 'core.hooksPath', 'githooks')
+        p = self.exec_sh(wid, 'mkdir -p libs/lib/githooks && echo lint > libs/lib/githooks/pre-commit',
+                         '--require-sandbox')
+        self.assertNotIn(b'WARNING', p.stderr)
+
+    def test_exec_reports_settings_only_a_submodule_includes(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        only = self.root / 'lib-only.gitconfig'
+        only.write_text('')
+        glob = self.root / 'global.gitconfig'
+        glob.write_text('[includeIf "gitdir:**/modules/lib-module"]\n\tpath = %s\n' % only)
+        self.env['GIT_CONFIG_GLOBAL'] = str(glob)
+        p = self.exec_sh(wid, "printf '[core]\\n\\tfsmonitor = echo evil\\n' > " + shlex.quote(str(only)),
+                         '--no-sandbox')
+        self.assertIn(b'world: WARNING: exec changed a Git setting that runs commands: submodule lib-module '
+                      b'global core.fsmonitor: (unset) -> echo evil\n', p.stderr)
+        self.assertNotIn(b'commands: global core.fsmonitor', p.stderr)  # the World does not include it
+        # A change every repository reads is one change, reported once under the World.
+        p = self.exec_sh(wid, 'git config --global core.pager "less; evil"', '--no-sandbox')
+        self.assertEqual(p.stderr.count(b'core.pager'), 1, p.stderr)
+        self.assertIn(b'commands: global core.pager: (unset) -> less; evil\n', p.stderr)
 
     def test_exec_keeps_a_submodule_named_hooks_writable(self):
         """Seatbelt's regex cannot tell modules/tools/hooks (a repository) from a hooks directory;
