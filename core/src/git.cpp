@@ -322,17 +322,174 @@ bool is_omitted_worktree(const Vec<GitWorktree> *worktrees, const String &rel) {
     if (worktrees) for (const auto &w : *worktrees) if (!w.rel.empty() && w.rel == rel) return true;
     return false;
 }
-// A nested repository cannot be made safe by fixing only the root's .git file. The only nested
-// `.git` admitted is a submodule's: a directory that this repository's index records as a
-// gitlink (`links`), which discover_modules then validates, captures and walks on its own.
-// Everything else with a `.git` below the root -- a plain nested repository, a `.git` inside an
-// uninitialized submodule's directory -- is refused. The walk's own top may hold its `.git`; only
-// the top of the tree itself (`world_root`) may also hold the World's `.world-git`, never a
-// submodule's top. The checkouts of the root repository's other linked worktrees (`worktrees`,
-// validated by collect_worktrees) are not part of the tree and are not entered: whatever is
-// below one -- an agent's own nested worktrees included -- goes with it.
+// A nested repository's `.git` directory (`repo` holds it) consists of directories and regular
+// files only: a symlink -- objects/, refs/ or config linked elsewhere -- would make the copy read
+// and write whatever the link reaches, and a special file is not administration (the one
+// exception is the fsmonitor daemon's socket). Walked by descriptor, never following a link.
+int nested_admin_walk(int dirfd, const String &rel, const String &repo, int depth) {
+    if (depth > 64) return refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository at %s: its .git is nested too deeply", repo.c_str());
+    int dup_fd = dup(dirfd);
+    if (dup_fd < 0) return -errno;
+    DIR *d = fdopendir(dup_fd);
+    if (!d) { int rc = -errno; close(dup_fd); return rc; }
+    int rc = 0;
+    for (;;) {
+        errno = 0; dirent *e = readdir(d);
+        if (!e) { if (errno) rc = -errno; break; }
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        String child = rel.empty() ? String(e->d_name) : joinp(rel.c_str(), e->d_name);
+        struct stat st;
+        if (fstatat(dirfd, e->d_name, &st, AT_SYMLINK_NOFOLLOW)) { rc = -errno; break; }
+        if (S_ISREG(st.st_mode)) continue;
+        // The endpoint of Git's built-in fsmonitor daemon (core.fsmonitor=true): it leads
+        // nowhere, and in the copy nothing listens on it, which Git handles by starting one.
+        if (S_ISSOCK(st.st_mode) && rel.empty() && !strcmp(e->d_name, "fsmonitor--daemon.ipc")) continue;
+        if (!S_ISDIR(st.st_mode)) {
+            rc = refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository at %s: its .git holds a symlink or special file (%s)", repo.c_str(), child.c_str());
+            break;
+        }
+        int fd = openat(dirfd, e->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) { rc = -errno; break; }
+        rc = nested_admin_walk(fd, child, repo, depth + 1);
+        close(fd);
+        if (rc) break;
+    }
+    closedir(d); return rc;
+}
+// A nested repository -- a `.git` below the walk's top that is neither the top's own nor an
+// initialized submodule's -- is carried as ordinary files, like any other directory of the tree:
+// the tree clone copies its `.git` byte for byte, the World's own Git never manages it, and
+// nothing of it is rewritten. That is safe only when the copy cannot keep using anything of the
+// source (Issue #7: a copied worktree `.git` pointer still leads to the original administration),
+// so a nested repository is admitted only when its administration is entirely inside its own
+// `.git` directory (`dir_path` holds it):
+// - `.git` is a real directory, not a symlink and not a `.git` file (which leads to
+//   administration elsewhere: a linked worktree or an absorbed submodule of another repository),
+//   and holds nothing but directories and regular files (nested_admin_walk);
+// - no `commondir` (the administration of a linked worktree, whose common directory is
+//   elsewhere), no objects/info/alternates or http-alternates (objects borrowed from another
+//   repository);
+// - no registrations in `worktrees/` (its own linked worktrees: each names an absolute checkout
+//   path in the source, which the copy would claim) and no repositories in `modules/` (its
+//   submodules', whose layout and links are not examined here);
+// - its configuration -- read from that file alone with `git config --file --no-includes`, so
+//   none of the nested repository's includes, hooks, filters or fsmonitor ever run -- sets no
+//   core.worktree (a worktree elsewhere), no extensions.worktreeConfig (per-worktree settings
+//   in config.worktree that Git reads only with it), no lfs.storage leading out of `.git` (a
+//   Git LFS object cache elsewhere), and no include.path or includeIf.*.path
+//   at all (an included file's settings, further includes and conditions -- a `gitdir:` one
+//   matching the source's location -- are not examined, so the copy could read them differently).
+// A bare repository named `.git` (core.bare) passes too: it names no worktree at all. Every
+// refusal names the repository and the cause. No Git command runs inside the repository.
+int check_nested_repository(const String &dir_path) {
+    const char *who = dir_path.c_str();
+    String dot = joinp(who, ".git");
+    struct stat st;
+    if (lstat(dot.c_str(), &st)) return -errno;
+    if (S_ISLNK(st.st_mode))
+        return refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository at %s: its .git is a symlink", who);
+    if (S_ISREG(st.st_mode))
+        return refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository or worktree at %s: its .git is a file leading to administration elsewhere, which a copy would keep using", who);
+    if (!S_ISDIR(st.st_mode))
+        return refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository at %s: its .git is neither a directory nor a file", who);
+    int fd = open(dot.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    int rc = nested_admin_walk(fd, String(), dir_path, 0);
+    struct Pointer { const char *name, *why; } pointers[] = {
+        {"commondir", "it is the administration of a linked worktree (commondir)"},
+        {"objects/info/alternates", "it borrows objects from another repository (objects/info/alternates)"},
+        {"objects/info/http-alternates", "it borrows objects from another repository (objects/info/http-alternates)"},
+    };
+    for (const auto &p : pointers) {
+        if (rc) break;
+        if (!fstatat(fd, p.name, &st, AT_SYMLINK_NOFOLLOW))
+            rc = refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository at %s: %s", who, p.why);
+        else if (errno != ENOENT && errno != ENOTDIR) rc = -errno;
+    }
+    struct Registry { const char *name, *why; } registries[] = {
+        {"worktrees", "it has linked worktrees registered (.git/worktrees), whose registrations name the source's paths"},
+        {"modules", "it holds submodule repositories (.git/modules)"},
+    };
+    for (const auto &r : registries) {
+        if (rc) break;
+        int sub = openat(fd, r.name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (sub < 0) {
+            if (errno != ENOENT && errno != ENOTDIR) rc = -errno;
+            continue;
+        }
+        Vec<String> names;
+        rc = list_names(sub, names);
+        close(sub);
+        if (!rc && !names.empty()) rc = refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository at %s: %s", who, r.why);
+    }
+    bool has_config = false;
+    if (!rc) {
+        if (!fstatat(fd, "config", &st, AT_SYMLINK_NOFOLLOW)) has_config = true;
+        else if (errno != ENOENT) rc = -errno;
+    }
+    close(fd);
+    if (rc || !has_config) return rc;
+    String file = joinp(dot.c_str(), "config");
+    const char *args[] = {"config", "--file", file.c_str(), "--no-includes", "--null", "--list", nullptr};
+    Vec<char> listing;
+    // Run from `/`, outside every repository: with --file nothing else is read.
+    if (git(file[0] == '/' ? "/" : ".", args, &listing, nullptr, true))
+        return refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository at %s: its .git/config cannot be read", who);
+    for (size_t i = 0; i < listing.size() && listing[i];) {
+        const char *entry = listing.data() + i;
+        size_t len = strlen(entry);
+        i += len + 1;
+        const char *nl = strchr(entry, '\n');
+        String key(entry, nl ? (size_t)(nl - entry) : len);
+        const char *val = nl ? nl + 1 : "";
+        const char *k = key.c_str();
+        if (!strcmp(k, "core.worktree"))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository at %s: it sets core.worktree, a worktree elsewhere", who);
+        if (!strcmp(k, "extensions.worktreeconfig"))
+            return refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository at %s: it sets extensions.worktreeConfig", who);
+        // Git LFS keeps its objects in lfs.storage: an absolute path as given, any other below
+        // `.git` (no `~` expansion; an empty value is the default, `lfs`). Only a relative
+        // path without a `..` component is known to stay inside `.git`, where nested_admin_walk
+        // has found no symlink; any other leaves the copy reading and writing the source's cache.
+        if (!strcmp(k, "lfs.storage")) {
+            bool outside = val[0] == '/';
+            for (const char *p = val; !outside && *p;) {
+                size_t n = strcspn(p, "/");
+                outside = n == 2 && p[0] == '.' && p[1] == '.';
+                p += n; if (*p) ++p;
+            }
+            if (outside) return refuse(WFS_E_GIT_UNSUPPORTED,
+                "nested Git repository at %s: it keeps its Git LFS objects outside its .git (lfs.storage=%s), "
+                "which a copy would keep using", who, val);
+        }
+        // Any include, conditional or not, whatever path it names: an included file's own
+        // settings -- its further includes and their conditions, a `gitdir:` one matching the
+        // source's location included -- are not examined here, and resolving Git's include
+        // graph (path forms, conditions, depth) to examine them is not something to
+        // reimplement. A nested repository that includes configuration is refused instead.
+        if (!strcmp(k, "include.path") ||
+            (!strncmp(k, "includeif.", 10) && key.size() > 15 && !strcmp(k + key.size() - 5, ".path")))
+            return refuse(WFS_E_GIT_UNSUPPORTED,
+                "nested Git repository at %s: its configuration includes %s (%s), whose settings a copy "
+                "would not be known to read the same way", who, val, k);
+    }
+    return 0;
+}
+// A nested repository cannot be made safe by fixing only the root's .git file. A nested `.git`
+// is admitted in two cases. A submodule's: a directory that this repository's index records as
+// a gitlink (`links`), which discover_modules then validates, captures and walks on its own. And
+// a self-contained nested repository (check_nested_repository), carried as ordinary files and
+// listed in `found` (relative to the walk's top); its directory is walked on with the same rule,
+// so each repository nested in it must pass too. Any `.git` inside an uninitialized submodule's
+// directory (`gitlink` names it) is refused: `git submodule update` would put the submodule's
+// own checkout there. The walk's own top may hold its `.git`; only the top of the tree itself
+// (`world_root`) may also hold the World's `.world-git`, never a submodule's top. The checkouts
+// of the root repository's other linked worktrees (`worktrees`, validated by collect_worktrees)
+// are not part of the tree and are not entered: whatever is below one -- an agent's own nested
+// worktrees included -- goes with it. Symlinks are never followed, so nothing is admitted
+// through one.
 int nested_walk(const String &dir_path, const String &rel, const Vec<Gitlink> *links, bool world_root,
-                const Vec<GitWorktree> *worktrees) {
+                const Vec<GitWorktree> *worktrees, const String *gitlink, Vec<String> *found) {
     bool top = rel.empty();
     DIR *dir = opendir(dir_path.c_str());
     if (!dir) return -errno;
@@ -343,7 +500,13 @@ int nested_walk(const String &dir_path, const String &rel, const Vec<Gitlink> *l
         if (!e) { if (errno) rc = -errno; break; }
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         if (!strcmp(e->d_name, ".git")) {
-            if (!top) { rc = refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository or submodule at %s", dir_path.c_str()); break; }
+            if (top) continue;
+            if (gitlink) {
+                rc = refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository at %s: it is inside the directory of uninitialized submodule %s", dir_path.c_str(), gitlink->c_str());
+                break;
+            }
+            if ((rc = check_nested_repository(dir_path))) break;
+            if (found) found->emplace_back(rel);
             continue;
         }
         if (top && world_root && !strcmp(e->d_name, ".world-git")) continue;
@@ -352,19 +515,22 @@ int nested_walk(const String &dir_path, const String &rel, const Vec<Gitlink> *l
         if (lstat(path.c_str(), &st)) { rc = -errno; break; }
         if (!S_ISDIR(st.st_mode)) continue;
         String child = top ? String(e->d_name) : joinp(rel.c_str(), e->d_name);
+        const String *inside = gitlink;
         if (links && find_link(*links, child.c_str())) {
             String dot = joinp(path.c_str(), ".git");
             if (!lstat(dot.c_str(), &st)) continue;   // an initialized submodule
             if (errno != ENOENT) { rc = -errno; break; }
+            if (!inside) inside = &child;
         }
         if (is_omitted_worktree(worktrees, child)) continue;
-        if ((rc = nested_walk(path, child, links, world_root, worktrees))) break;
+        if ((rc = nested_walk(path, child, links, world_root, worktrees, inside, found))) break;
     }
     closedir(dir); return rc;
 }
 int nested_check(const char *root, const Vec<Gitlink> *links, bool world_root,
-                 const Vec<GitWorktree> *worktrees = nullptr) {
-    return nested_walk(String(root), String(), links, world_root, worktrees);
+                 const Vec<GitWorktree> *worktrees = nullptr, Vec<String> *found = nullptr) {
+    if (found) found->clear();
+    return nested_walk(String(root), String(), links, world_root, worktrees, nullptr, found);
 }
 // A managed tree may be copied without consulting an external repository only when all
 // administration stays inside it. Reject changed common-dir pointers. Additional linked
@@ -2453,13 +2619,59 @@ int require_clean_tree(const char *root, const Vec<GitWorktree> *worktrees = nul
     if (rc) return rc;
     return dirty.size() > 1 ? WFS_E_GIT_DIRTY : 0;
 }
+}  // namespace
+// Defined further down, outside the anonymous namespace.
+int remove_below(const char *clone, const String &rel);
+void parse_gitlinks(const Vec<char> &listing, Vec<Gitlink> &out);
+namespace {
+// Whether the nested repository at `rel` below `top` is ignored by `top`'s repository, as the
+// user's own Git says (ambient configuration, global excludes included). `./` keeps a name that
+// starts with `:` from being read as pathspec magic, which check-ignore does not let us disable.
+int nested_ignored(const char *top, const String &rel, bool &ignored) {
+    String path("./"); path.append(rel.c_str());
+    const char *args[] = {"check-ignore", "-q", "--no-index", "--", path.c_str(), nullptr};
+    int status = -1;
+    int rc = git(top, args, nullptr, &status, true, true);
+    ignored = rc == 0;
+    return rc == WFS_E_GIT_FAILED && status == 1 ? 0 : rc;
+}
+// --committed-only leaves every untracked file that is not ignored behind, and a nested
+// repository is untracked content of the repository whose worktree holds it. `clean -ffd`
+// removes one in an untracked directory whole (ignored files in it included: the repository is
+// one unit), but one that status cannot see survives it -- in a directory that also holds
+// tracked files, or behind a `.git` Git does not take for a repository. So every nested
+// repository still in the copy that is not ignored loses its `.git` here, and the reset and the
+// clean that follow treat the rest of its directory like any other content. Ignored ones stay,
+// like every ignored file.
+int drop_unignored_nested(const char *clone, bool world_root) {
+    const char *ls_args[] = {"ls-files", "--stage", "-z", nullptr};
+    Vec<char> listing;
+    if (int rc = git(clone, ls_args, &listing)) return rc;
+    Vec<Gitlink> links;
+    parse_gitlinks(listing, links);
+    Vec<String> found;
+    // Everything here was admitted when the source was captured; a refusal now means the
+    // source changed while it was being cloned.
+    if (int rc = nested_check(clone, &links, world_root, nullptr, &found))
+        return rc == WFS_E_GIT_UNSUPPORTED ? -EBUSY : rc;
+    for (const auto &rel : found) {
+        bool ignored = false;
+        if (int rc = nested_ignored(clone, rel, ignored)) return rc;
+        if (ignored) continue;
+        String dot(rel); dot.append("/.git");
+        if (int rc = remove_below(clone, dot)) return rc;
+    }
+    return 0;
+}
 // --committed-only: make the copy's Git-visible content exactly HEAD. Only the copy is touched;
 // the source was captured read-only and is rechecked unchanged before this runs. The index is
 // refreshed first (the copy's inodes and ctimes differ from the ones it records), so the reset
 // rewrites only files whose content differs from HEAD and the rest stay clones of the source's
-// blocks. `clean` without -x removes untracked, non-ignored files and keeps ignored build/data
-// artifacts and the reserved administration; `read-tree --reset -u` then puts back modified and
-// deleted tracked files and drops files that were only staged. They run with the user's ambient
+// blocks. `read-tree --reset -u` puts back modified and deleted tracked files and drops files
+// that were only staged; then, by HEAD's ignore rules, `clean` without -x removes untracked,
+// non-ignored files and keeps ignored build/data artifacts and the reserved administration;
+// with -ff it also removes an untracked nested repository, which plain -f skips, and
+// drop_unignored_nested takes the `.git` of any non-ignored one that is left. They run with the user's ambient
 // configuration, like the clean check, so "ignored" and "clean" mean what the user's Git says.
 // No filter can run, and hooks are off. The source-side check saw only the source's worktree and
 // index attributes, which a dirty `.gitattributes` can differ from HEAD's, so filter use is
@@ -2513,9 +2725,8 @@ int reset_to_head(const char *clone, const char *target = nullptr) {
     int status = -1;
     rc = git(clone, refresh, nullptr, &status, true, true);
     if (rc && !(rc == WFS_E_GIT_FAILED && status == 1)) return rc;
-    const char *clean[] = {"clean", "-f", "-d", "-q", "--", ".", ":(exclude,top,literal).world",
+    const char *clean[] = {"clean", "-f", "-f", "-d", "-q", "--", ".", ":(exclude,top,literal).world",
                            ":(exclude,top,literal).world-git", nullptr};
-    if ((rc = git(clone, clean, nullptr, nullptr, false, true))) return rc;
     if (target) {
         String head;
         const char *head_args[] = {"rev-parse", "--verify", "HEAD^{commit}", nullptr};
@@ -2533,7 +2744,16 @@ int reset_to_head(const char *clone, const char *target = nullptr) {
         const char *checkout[] = {"lfs", "checkout", nullptr};
         if ((rc = git(clone, checkout, nullptr, nullptr, false, true))) return rc;
     }
-    // A directory the reset emptied of staged additions, or anything else left untracked.
+    // Everything untracked is decided only now, after the reset, by HEAD's ignore rules: an
+    // uncommitted `.gitignore` that drops a rule HEAD has would otherwise have the ignored
+    // build output -- or an ignored nested repository -- it covers removed, although HEAD's
+    // rules keep it (`read-tree --reset -u` overwrites untracked files in its way, so nothing
+    // needs cleaning before it). The clean removes untracked files and directories, a
+    // directory the reset emptied of staged additions and whole untracked nested repositories;
+    // drop_unignored_nested then takes the `.git` of a non-ignored one the clean cannot see
+    // (in a directory with tracked files), and a second clean the rest of its content.
+    if ((rc = git(clone, clean, nullptr, nullptr, false, true))) return rc;
+    if ((rc = drop_unignored_nested(clone, !target))) return rc;
     if ((rc = git(clone, clean, nullptr, nullptr, false, true))) return rc;
     String squash;
     const char *squash_args[] = {"rev-parse", "--path-format=absolute", "--git-path", "SQUASH_MSG", nullptr};
@@ -3623,7 +3843,7 @@ int discover_modules(GitSource &top, const char *repo_root, const String &prefix
             if (int rc = world_config(full.c_str(), m.repo, config, shared)) return rc;
             if (int rc = check_configured_submodule_urls(full.c_str(), config, shared)) return in_module(rc, path);
         }
-        if (int rc = nested_check(full.c_str(), &sub_links, false)) return in_module(rc, path);
+        if (int rc = nested_check(full.c_str(), &sub_links, false, nullptr, &m.repo.nested)) return in_module(rc, path);
         if (tree) {
             if (int rc = committed_hooks_check(full.c_str(), m.repo, m.target.c_str())) return in_module(rc, path);
         } else if (top.require_clean && m.repo.head != link.oid) {
@@ -3646,7 +3866,8 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
     if (!has_managed && errno != ENOENT) return -errno;
     if (lstat(dot.c_str(), &st)) {
         if (errno == ENOENT && !has_managed) {
-            if (int rc = nested_check(root, nullptr, true)) return rc;
+            if (int rc = nested_check(root, nullptr, true, nullptr, &out.nested)) return rc;
+            out.nested_captured = true;
             if (committed_only) return refuse(WFS_E_GIT_UNSUPPORTED, "--committed-only needs a Git repository at the source root");
             if (with_hooks) return refuse(WFS_E_GIT_UNSUPPORTED, "--with-hooks needs a Git repository at the source root");
             return 0;
@@ -3681,7 +3902,8 @@ int git_source(const char *root, bool include_changes, GitSource &out, bool comm
         if (!w.rel.empty() && (w.rel == l.path || under_root(w.rel, l.path, &under)))
             return refuse(WFS_E_GIT_UNSUPPORTED, "a linked worktree of the repository is checked out in submodule path %s", l.path.c_str());
     }
-    if (int rc = nested_check(root, &gitlinks, true, &out.worktrees)) return rc;
+    if (int rc = nested_check(root, &gitlinks, true, &out.worktrees, &out.nested)) return rc;
+    out.nested_captured = true;
     out.has_gitlinks = !gitlinks.empty();
     // With --committed-only the copy is reset to HEAD and must then be clean; the source's own
     // uncommitted state is simply not carried, so it is not a reason to refuse.
@@ -4316,9 +4538,64 @@ void git_omitted_names(const GitSource &s, Vec<String> &out) {
         if (!w.rel.empty()) out.emplace_back(w.rel);
     }
 }
+// The nested repositories the capture admitted (GitRepoState::nested) are checked again in the
+// copy that will be published, with the same check_nested_repository: one that gained
+// alternates, a worktree registration, a core.worktree or a `.git` file while the tree was being
+// cloned was copied that way and must not be published -- a retryable busy, like any other
+// change of the source during the import. One without a `.git` in the copy any more (removed
+// from the source meanwhile, or left behind by --committed-only), or whose path in the copy is
+// no longer directories all the way down, is not a repository there. After --committed-only
+// every one that remains must be ignored (drop_unignored_nested). A nested repository that
+// appeared after the capture may be published like any other file the source gained while it
+// was cloned, but only when it passes the same check: the walks that see the whole copy -- a
+// managed World's recapture, an import's copy_layout_check where the index has gitlinks, and
+// otherwise the walk here -- check every `.git` in it.
+int recheck_nested(const GitSource &s, const char *clone) {
+    if (!s.nested_captured) return 0;
+    if (!s.managed && !s.has_gitlinks) {
+        Vec<String> found;
+        if (int rc = nested_check(clone, nullptr, true, nullptr, &found))
+            return rc == WFS_E_GIT_UNSUPPORTED ? -EBUSY : rc;
+    }
+    for (size_t i = 0; i <= s.modules.size(); ++i) {
+        const GitRepoState &state = i ? s.modules[i - 1].repo : s;
+        String top = i ? joinp(clone, s.modules[i - 1].path.c_str()) : String(clone);
+        for (const auto &rel : state.nested) {
+            String path(top);
+            bool present = true;
+            for (size_t start = 0, j = 0; present && j <= rel.size(); ++j) {
+                if (j < rel.size() && rel[j] != '/') continue;
+                path.push_back('/');
+                path.append(rel.c_str() + start, j - start);
+                start = j + 1;
+                struct stat st;
+                if (lstat(path.c_str(), &st)) {
+                    if (errno != ENOENT) return -errno;
+                    present = false;
+                } else if (!S_ISDIR(st.st_mode)) {
+                    present = false;
+                }
+            }
+            String dot = joinp(path.c_str(), ".git");
+            struct stat st;
+            if (present && lstat(dot.c_str(), &st)) {
+                if (errno != ENOENT) return -errno;
+                present = false;
+            }
+            if (!present) continue;
+            if (int rc = check_nested_repository(path)) return rc == WFS_E_GIT_UNSUPPORTED ? -EBUSY : rc;
+            if (s.committed_only) {
+                bool ignored = false;
+                if (int rc = nested_ignored(top.c_str(), rel, ignored)) return rc;
+                if (!ignored) return refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository %s is not ignored but was not removed by --committed-only", rel.c_str());
+            }
+        }
+    }
+    return 0;
+}
 int git_import(const GitSource &s, const char *clone) {
     g_omitted.clear();
-    if (!s.present) return 0;
+    if (!s.present) return recheck_nested(s, clone);
     if (int rc = sources_unchanged(s)) return rc;
     if (int rc = omit_worktrees(s, clone)) return rc;
     {
@@ -4384,6 +4661,7 @@ int git_import(const GitSource &s, const char *clone) {
         if (int rc = reset_copy(s, clone)) return rc;
     }
     if (int rc = same_gitmodules(s, clone)) return rc;
+    if (int rc = recheck_nested(s, clone)) return rc;
     if (!s.require_clean) return 0;
     return require_clean_copy(s, clone);
 }

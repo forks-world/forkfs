@@ -58,6 +58,10 @@ struct GitRepoState {
     Vec<char> effective_config;
     bool worktree_config = false;
     Vec<GitSetting> worktree_settings;
+    // The self-contained nested repositories below this repository's worktree (or below a tree
+    // without Git), relative to its top: carried as ordinary files, never managed by the World's
+    // Git, and checked again in the copy before publication (check_nested_repository).
+    Vec<String> nested;
     // External sources: the repository-local remotes, upstream tracking, URL rewrites, push
     // defaults, submodule settings and aliases that travel into the owned repository
     // (capture_carried_config).
@@ -148,6 +152,10 @@ struct GitSource : GitRepoState {
     Vec<GitModule> modules;
     // The root's index records gitlinks, initialized or not.
     bool has_gitlinks = false;
+    // git_source walked the tree for nested repositories (`nested`): set for every tree it
+    // captured, with or without Git. A snapshot's fork does not capture its source, whose tree
+    // was checked when the snapshot was taken, and has nothing to recheck.
+    bool nested_captured = false;
 };
 int git_source(const char *root, bool include_changes, GitSource &out, bool committed_only = false,
                bool with_hooks = false);
