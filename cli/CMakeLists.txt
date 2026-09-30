@@ -37,9 +37,9 @@ if(Python3_Interpreter_FOUND AND GIT_FOUND)
     file(MAKE_DIRECTORY "${CLI_GIT_TEST_SCRATCH}")
     add_test(NAME cli_git_test
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/git_test.py $<TARGET_FILE:world>)
-    # Submodule and agent-worktree coverage import several repositories per test; the suite runs
-    # ~15 minutes on CI macOS and up to ~23 locally.
+    # Submodule, agent-worktree, nested-repository, shallow and exec-guard coverage import several
+    # repositories per test; the suite runs ~20 minutes on CI macOS and up to ~28 locally.
     set_tests_properties(cli_git_test PROPERTIES
-        TIMEOUT 1800
+        TIMEOUT 2700
         ENVIRONMENT "TMPDIR=${CLI_GIT_TEST_SCRATCH}/")
 endif()
