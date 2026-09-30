@@ -995,7 +995,8 @@ static int cmd_inspect(wfs_store *s, const char *arg) {
            (unsigned long long)v.dir_ino, (unsigned long long)v.dir_dev, (unsigned long long)v.entries,
            (unsigned long long)v.fsevents_id);
     if (gi.present) printf("git:       %s\nbaseline:  %s\nHEAD:      %s\ngit dir:   %s\n",
-                           gi.branch[0] ? gi.branch : "(detached)", gi.baseline, gi.head, gi.git_dir);
+                           gi.branch[0] ? gi.branch : "(detached)", gi.baseline[0] ? gi.baseline : "(none)",
+                           gi.head[0] ? gi.head : "(no commit yet)", gi.git_dir);
     if (v.parent_world) printf("parent:    W%llu\n", (unsigned long long)v.parent_world);
     if (v.snapshot_id) printf("snapshot:  S%llu\n", (unsigned long long)v.snapshot_id);
     if (v.trashed_at) { fmt_time(t, sizeof t, v.trashed_at); printf("trashed:   %s\n", t); }

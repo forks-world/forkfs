@@ -393,7 +393,9 @@ typedef struct wfs_fork_opts {
 typedef struct wfs_git_info {
     int present;
     char branch[WFS_PATH_MAX]; /* empty for detached HEAD; overflow is reported */
-    char head[65], baseline[65]; /* SHA-1 or SHA-256 hex commit ids */
+    char head[65], baseline[65]; /* SHA-1 or SHA-256 hex commit ids; "" while the branch is
+                                  * unborn (no commit yet), and a baseline stays "" when the
+                                  * World was forked before its first commit */
     char git_dir[WFS_PATH_MAX]; /* common directory inside this World */
 } wfs_git_info;
 int wfs_git_inspect(const char *root, wfs_git_info *out);
@@ -409,7 +411,8 @@ int wfs_git_uncarried_hooks(const char *root);
  * changes: not its checkout, index, working tree or other branches, and nothing is merged.
  * `branch` defaults to the World's current branch (required when HEAD is detached). Without
  * `force`, only a new branch or a fast-forward is written, and the repository must already
- * contain the World's baseline commit (so a branch does not land in an unrelated repository). */
+ * contain one of the World's commits (so a branch does not land in an unrelated repository)
+ * unless it has no commit at all. A World with no commit has nothing to publish. */
 typedef struct wfs_git_publish_result {
     char ref[WFS_PATH_MAX];  /* refs/heads/<branch> written in the target repository */
     char old_oid[65];        /* its previous commit, "" when the branch is new */

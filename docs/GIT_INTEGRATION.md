@@ -292,7 +292,7 @@ directory as its worktree. In the World every submodule is absorbed; the source 
 modified.
 
 Every check the root's import makes is made on each submodule's repository too -- the
-configuration policy and filters, extensions, partial/shallow/alternates, hidden refs, the
+configuration policy and filters, extensions, partial clones and alternates, the
 stash stack (see [Stash](#stash)), grafts, in-progress operations, dangling symbolic refs, reserved paths in its history,
 symlinked or unexpected administration -- and each is rechecked unchanged before publication.
 The `.gitmodules` settings of every repository with gitlinks are read again from the copy
@@ -489,6 +489,46 @@ which the reset treats the rest of its directory like any other content -- and k
 ignored ones; the copy's status is then clean. `publish` copies the root branch's commits only
 and never a nested repository; a non-ignored one counts as an uncommitted change in its note.
 
+## Shallow clones
+
+A shallow clone (`git clone --depth <n>`, `--shallow-since`, or a submodule cloned with
+`submodule.<name>.shallow` or `git submodule update --depth`) is imported as it is, at the root
+and in every submodule. Its common directory's `shallow` file lists the commits whose parents the
+object store does not hold; it is copied into the owned repository byte for byte before
+anything walks the history, so every walk of the import -- the connectivity check below, the
+reserved-path scan of the refs, stash entries, `ORIG_HEAD` and `FETCH_HEAD`, the stash
+verification -- stops at the boundary exactly as it does in the source (Git applies the file
+also under `--no-replace-objects`). The file is part of the captured state: it is rechecked
+unchanged before publication, and so is the object directory, so a `git fetch --deepen` or
+`--unshallow` in the source during the import (or a `shallow.lock` of one still running)
+fails the import as busy, to be retried. Partial clones remain refused (see
+[Limits](#limits-of-this-increment)): their missing objects would have to be fetched lazily from
+the network.
+
+In the World, Git's own shallow semantics apply: `git log` stops at the boundary, and the
+carried remote deepens it (`git fetch --deepen=<n> origin`, `--unshallow`) while that remote is
+reachable. Forks, checkpoints and pooled forks clone the `shallow` file with the rest of
+`.world-git`; `--committed-only`, `--include-changes`, stash and Git LFS behave as for a full
+clone.
+
+`publish` from a shallow World is an ordinary fetch, and Git refuses a ref from a shallow
+repository whose new history reaches one of its shallow commits the target does not already
+have, unless `--update-shallow` lets it write that commit into the target's own `shallow` file
+-- which would make the target a shallow repository. Publish never passes that option, so it
+never makes a target shallow:
+
+- the shallow clone the World came from has the history down to the same boundary (or a deeper
+  one), and a full clone of the project has all of it: both take the publish, and their
+  `shallow` files (or their absence) are left as they were;
+- a repository that shares the World's commits above the boundary but is itself shallow at a
+  commit the World's new commits build on takes it as well: only those new commits are sent;
+- a repository without the history below the World's boundary -- an empty repository, an
+  unrelated one, `--force` or not -- is refused with a reason that names the boundary commit.
+  Git has already received the objects when it drops the ref; they stay unreferenced in the
+  target, as after any other refusal that follows the fetch, and its `shallow` file is not
+  touched. Deepen the World first (`git fetch --deepen=<n>` or `--unshallow` in it) or publish
+  into a repository that has that history.
+
 ## Getting work back to the source
 
 `world fs publish W<n>` copies a Git World's commits into the repository the World was
@@ -528,8 +568,11 @@ must be a distinct repository: the World's own working tree, and any other repos
 shares the World's own private common Git directory -- including `.world-git/repo.git` itself
 or a linked worktree of it -- are refused as a publish target. Without
 `--force`, publishing refuses a branch that is checked out in the target, an update that is
-not a fast-forward, and a repository that shares no history with the World. A detached World
-needs `--branch`. Uncommitted World changes are not published; the command says so.
+not a fast-forward, and a repository that shares no history with the World -- unless it has
+no commit at all (see [Repositories with no commit yet](#repositories-with-no-commit-yet)). A
+World with no commit has nothing to publish, and a shallow World cannot publish into a
+repository that lacks the history below its boundary (see [Shallow clones](#shallow-clones)).
+A detached World needs `--branch`. Uncommitted World changes are not published; the command says so.
 Publishing re-checks the configuration policy first, so reading the World's status never
 runs a filter attached after the import. The branch update and the removal of the private
 staging ref are one ref transaction; if that final update fails instead -- for example
@@ -597,14 +640,47 @@ HEAD outside `refs/heads/`; inspection then reports an empty branch. Use `git di
 `git diff --cached` to review source changes. `world fs diff` still compares filesystem
 content, including Git administrative changes such as branch/index updates.
 
+### Repositories with no commit yet
+
+A repository on an unborn branch -- `git init` before the first commit, or `git checkout
+--orphan` in one with history -- is imported with no commit of its own: the owned repository
+has the source's refs (none at all after `git init`) and its HEAD names the source's unborn
+branch as captured. Files staged for the first commit are uncommitted changes like any other:
+the import refuses them without `--include-changes` and preserves the index with it. An empty
+repository with nothing staged or untracked imports without either flag. Every place that reads
+HEAD -- capture, the recheck before publication, the reserved-path scan, LFS configuration,
+submodules (a submodule on an orphan branch is a moved submodule; `--committed-only` detaches it
+at the recorded commit) -- treats an unborn HEAD as "no commit", and a HEAD that is neither a
+commit nor an unborn branch is still refused.
+
+`--committed-only` is refused on an unborn branch (`init`, `checkpoint` and `fork --from W<n>`
+alike): nothing is committed, so the committed version would be an empty tree that silently
+leaves every staged and untracked file of the project behind. Commit first, or use
+`--include-changes`.
+
+A fork's HEAD becomes the unborn branch `world/W<n>` (chosen like any World branch) with an
+empty baseline, and `inspect` reports that branch with an empty `head` and `baseline` (the text
+form says `(no commit yet)` and `(none)`). The first `git commit` in the World creates the
+branch as a root commit; a World forked before that keeps its empty baseline. Checkpoints,
+forks and pooled forks of a World that is still unborn work as for any World, and a checkpoint
+taken after the first commit forks with that commit as the baseline.
+
+`publish` refuses a World with no commit: there is nothing to publish. A World with commits may
+publish into a repository with no commit at all -- the source it came from, still unborn, or
+any freshly initialized one -- without `--force`: there is no history to share or to lose, and
+the World's branch becomes that repository's first. The target's own unborn HEAD is left as it
+is. Into a repository that has commits, the shared-history rule applies unchanged.
+
 ## Limits of this increment
 
-- Only a root repository with an existing commit is supported. Detached HEAD is supported;
-  unborn repositories are refused. External linked worktrees are safely imported by
+- Only a Git repository at the root of the source is imported. Detached HEAD and unborn
+  branches are supported (see [Repositories with no commit yet](#repositories-with-no-commit-yet)).
+  External linked worktrees are safely imported by
   resolving their source Git administration and constructing fresh local administration.
 - Nested repositories that are not self-contained (see
-  [Nested repositories](#nested-repositories)), sparse or split indexes, shallow/partial
-  clones, and object alternates are refused, in the root and in every submodule. So is a repository whose index, or any commit reachable
+  [Nested repositories](#nested-repositories)), sparse or split indexes, partial clones, and
+  object alternates are refused, in the root and in every submodule. Shallow clones are
+  supported (see [Shallow clones](#shallow-clones)). So is a repository whose index, or any commit reachable
   from its refs, HEAD, `ORIG_HEAD`, `FETCH_HEAD` or any stash entry (its worktree, index and
   untracked-files commits), contains the root `.world` file or
   anything under `.world-git`: WorldFS owns those paths, `info/exclude` cannot hide a
@@ -659,7 +735,7 @@ committed-only imports, opt-in hooks, staging preservation, imported linked work
 source deletion, Claude Code and Codex style agent worktrees in the source and in Worlds
 (ignored or not, nested, locked, absolute or relative, hardlinked, malformed or foreign), absorbed, old-style, nested and uninitialized submodules and their
 refusals, self-contained nested repositories (ignored, untracked, nested in each other or in a
-submodule, under `--committed-only`, changed during the clone) and each of their refusals, independent commits, branch collisions, detached HEAD,
+submodule, under `--committed-only`, changed during the clone) and each of their refusals, shallow clones and unborn branches, independent commits, branch collisions, detached HEAD,
 move/discard/restore/checkpoint, hard snapshots, pooled Git forks and their setup failures,
 Git setup rollback, environment isolation and Git commits inside the exec sandbox.
 
@@ -745,11 +821,16 @@ omit them, so the import could not preserve them. Repositories using the reftabl
 backend are refused because it offers no read-only way to find such refs; the owned
 repositories themselves always use the files backend.
 
-Initial imports from external repositories reject any configured `transfer.hideRefs`
-or `uploadpack.hideRefs`, because the mirror transport may omit those refs.
-This restriction does not apply to managed Worlds: their Git administration is
-cloned as part of the filesystem, retaining hidden refs through forks and checkpoints.
-External eligibility is checked again around import.
+Refs hidden with `transfer.hideRefs` or `uploadpack.hideRefs` are imported like any other
+ref. Those settings only hide refs from a client that fetches from or pushes to the
+repository over a transport, and the import uses none: it lists the refs with
+`for-each-ref`, clones the object directory and writes the refs itself (see
+[Import cost](#import-cost)), and the recheck before publication compares the same complete
+listing. The settings themselves are the source's serving policy, repository-local and outside
+the carried configuration, so the World has the refs without the settings: nothing in it is
+hidden. (A World is not a server; `publish` fetches the World's branch by its exact name.) A
+World's own hiding settings travel with its cloned `.world-git` through forks and
+checkpoints, together with the refs.
 
 ### Stash
 
@@ -779,7 +860,7 @@ Only the stash reflog is carried, because the stash *is* a reflog. Other reflogs
 branches) are not imported, and import does not promise preservation of that history.
 
 External repositories with `info/grafts` are rejected because their local ancestry
-overrides are not transported by a mirror. Active bisect and sequencer sessions,
+overrides are not carried into the owned repository. Active bisect and sequencer sessions,
 like unfinished merges, cherry-picks and rebases, must be completed or aborted
 before import or checkpoint; their administrative state is not a clean baseline.
 
@@ -813,7 +894,8 @@ root's and every submodule's -- is built by one helper (`own_repository` in
    mid-write (`tmp_obj_*`, `tmp_pack_*`, `.tmp-*`) and `incoming-*` quarantine directories
    of a push not yet accepted are dropped: they are not part of the repository, and anything
    reachable that is missing is caught below. A symlink or special file, alternates or a
-   promisor pack found in the clone are refused as they are in the source.
+   promisor pack found in the clone are refused as they are in the source. A shallow clone's
+   captured `shallow` file is written next to it.
 3. The captured refs are written with one `update-ref --stdin` transaction (which checks
    each tip object exists) and packed with `pack-refs --all`; HEAD, the transient
    `remote.origin` mirror settings (removed again with the rest of the import) and the
@@ -826,8 +908,8 @@ repository has its `[extensions]` section first in `config`.
 A source that repacks or collects garbage during the import can make the clone miss an
 object (a pack deleted before the clone reached it). Before publication every owned
 repository is walked -- `rev-list --objects` over all refs and HEADs, reflogs, the index,
-`ORIG_HEAD` and `FETCH_HEAD` tips, with `--no-replace-objects` -- and a missing object fails
-the import as busy (retryable) rather than publishing it. Changes to the source's object
+`ORIG_HEAD` and `FETCH_HEAD` tips, with `--no-replace-objects`, down to a shallow clone's
+boundary -- and a missing object fails the import as busy (retryable) rather than publishing it. Changes to the source's object
 directory are also detected by the existing size recheck. The walk is Git's own
 post-fetch connectivity check; it costs a history traversal without reading blob contents.
 

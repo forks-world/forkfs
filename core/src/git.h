@@ -80,6 +80,13 @@ struct GitRepoState {
     Vec<char> stash_list;
     bool orig_present = false;
     String orig_head;
+    // A shallow clone (`git clone --depth`, a submodule cloned with submodule.<name>.shallow):
+    // the common directory's `shallow` file, which lists the commits whose parents the object
+    // store does not hold. Every history walk stops there, so the owned repository gets it byte
+    // for byte, and it is rechecked like the refs (a `git fetch --deepen` meanwhile is a change).
+    String shallow_path;
+    Vec<char> shallow;
+    bool shallow_present = false;
     // rr-cache of an external source, as sorted records (see capture_rerere); managed Worlds
     // carry theirs inside the cloned tree. import_bytes includes rerere_bytes.
     Vec<char> rerere;
