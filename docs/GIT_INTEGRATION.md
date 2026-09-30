@@ -437,7 +437,9 @@ inside its own `.git` directory:
   own; its `modules/` directory is absent or empty too (its submodules' repositories, whose
   checkouts and links are not examined);
 - its configuration sets no `core.worktree` (a worktree elsewhere), no
-  `extensions.worktreeConfig` (per-worktree settings), and no `include.path` or
+  `extensions.worktreeConfig` (per-worktree settings), no `lfs.storage` that leads out of its
+  `.git` -- an absolute path, or a relative one with a `..` component: the copy would read its
+  Git LFS objects from the source's cache and write new ones into it -- and no `include.path` or
   `includeIf.<condition>.path` at all, whatever file it names and whatever its condition. An
   included file's own settings are not examined, and neither are its further includes and
   their conditions: a `gitdir:` condition matching the source's location, for example, could

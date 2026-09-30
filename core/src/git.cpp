@@ -375,7 +375,8 @@ int nested_admin_walk(int dirfd, const String &rel, const String &repo, int dept
 // - its configuration -- read from that file alone with `git config --file --no-includes`, so
 //   none of the nested repository's includes, hooks, filters or fsmonitor ever run -- sets no
 //   core.worktree (a worktree elsewhere), no extensions.worktreeConfig (per-worktree settings
-//   in config.worktree that Git reads only with it), and no include.path or includeIf.*.path
+//   in config.worktree that Git reads only with it), no lfs.storage leading out of `.git` (a
+//   Git LFS object cache elsewhere), and no include.path or includeIf.*.path
 //   at all (an included file's settings, further includes and conditions -- a `gitdir:` one
 //   matching the source's location -- are not examined, so the copy could read them differently).
 // A bare repository named `.git` (core.bare) passes too: it names no worktree at all. Every
@@ -446,6 +447,21 @@ int check_nested_repository(const String &dir_path) {
             return refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository at %s: it sets core.worktree, a worktree elsewhere", who);
         if (!strcmp(k, "extensions.worktreeconfig"))
             return refuse(WFS_E_GIT_UNSUPPORTED, "nested Git repository at %s: it sets extensions.worktreeConfig", who);
+        // Git LFS keeps its objects in lfs.storage: an absolute path as given, any other below
+        // `.git` (no `~` expansion; an empty value is the default, `lfs`). Only a relative
+        // path without a `..` component is known to stay inside `.git`, where nested_admin_walk
+        // has found no symlink; any other leaves the copy reading and writing the source's cache.
+        if (!strcmp(k, "lfs.storage")) {
+            bool outside = val[0] == '/';
+            for (const char *p = val; !outside && *p;) {
+                size_t n = strcspn(p, "/");
+                outside = n == 2 && p[0] == '.' && p[1] == '.';
+                p += n; if (*p) ++p;
+            }
+            if (outside) return refuse(WFS_E_GIT_UNSUPPORTED,
+                "nested Git repository at %s: it keeps its Git LFS objects outside its .git (lfs.storage=%s), "
+                "which a copy would keep using", who, val);
+        }
         // Any include, conditional or not, whatever path it names: an included file's own
         // settings -- its further includes and their conditions, a `gitdir:` one matching the
         // source's location included -- are not examined here, and resolving Git's include

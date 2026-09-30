@@ -4947,6 +4947,11 @@ class GitWorldTest(unittest.TestCase):
         self.nested_repo(nested)
         self.git(nested, 'config', 'extensions.worktreeConfig', 'true')
         refused(nested, b'it sets extensions.worktreeConfig')
+        # A Git LFS object cache outside the nested .git: absolute, or relative with a `..`.
+        for storage in (str(self.root / 'lfs-cache'), '../../lfs-cache', 'lfs/../../../lfs-cache', '..'):
+            self.nested_repo(nested)
+            self.git(nested, 'config', 'lfs.storage', storage)
+            refused(nested, b'it keeps its Git LFS objects outside its .git (lfs.storage=' + storage.encode() + b')')
         # Any include is refused, whatever it names and whatever its condition: an included
         # file's own settings and further includes (a `gitdir:` one matching the source's
         # location, say) are not examined.
@@ -4982,9 +4987,10 @@ class GitWorldTest(unittest.TestCase):
         refused(inner, b'it borrows objects from another repository (objects/info/alternates)')
         shutil.rmtree(nested)
         self.assertEqual(self.snapshots(), [])
-        # Admitted: a bare repository named .git, and a symlink to a
-        # repository elsewhere, which stays a symlink and is never entered.
+        # Admitted: a Git LFS cache elsewhere inside the nested .git, a bare repository named
+        # .git, and a symlink to a repository elsewhere, which stays a symlink and is never entered.
         self.nested_repo(nested)
+        self.git(nested, 'config', 'lfs.storage', 'cache/..lfs')
         self.git(self.root, 'init', '-q', '--bare', str(self.source / 'bare/.git'))
         (self.source / 'link').symlink_to(other)
         self.world('init', str(self.source), '--include-changes')
