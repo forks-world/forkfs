@@ -4589,6 +4589,46 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'world: WARNING: exec removed .git, which told Git where a repository is\n', p.stderr)
         (one / '.git.saved').rename(one / '.git')
 
+    def test_exec_refuses_preexisting_redirected_git_pointers(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        alternate = self.root / 'alternate.git'
+        self.git(self.root, 'init', '--bare', str(alternate))
+        dotgit = one / '.git'
+        commondir = one / '.world-git/repo.git/worktrees/active/commondir'
+        for pointer, prefix in ((dotgit, b'gitdir: '), (commondir, b'')):
+            original = pointer.read_bytes()
+            saved = pointer.with_name(pointer.name + '.saved')
+            saved.write_bytes(original)
+            cases = ('redirected-file', 'directory', 'symlink', 'embedded-newline', 'nul', 'oversized')
+            for case in cases:
+                with self.subTest(pointer=pointer.name, case=case):
+                    pointer.unlink()
+                    if case == 'directory':
+                        pointer.mkdir()
+                    elif case == 'symlink':
+                        pointer.symlink_to(saved)
+                    elif case == 'redirected-file':
+                        pointer.write_bytes(prefix + str(alternate).encode() + b'\n')
+                    elif case == 'embedded-newline':
+                        pointer.write_bytes(original.rstrip(b'\r\n') + b'\n/alternate\n')
+                    elif case == 'nul':
+                        pointer.write_bytes(original.rstrip(b'\r\n') + b'\0ignored\n')
+                    else:
+                        pointer.write_bytes(original.rstrip(b'\r\n') + b'x' * 8192)
+                    p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+                    self.assertIn(b'Git repository pointer is missing, redirected or unsupported', p.stderr)
+                    self.assertFalse((one / 'should-not-run').exists())
+                    if pointer.is_dir() and not pointer.is_symlink():
+                        pointer.rmdir()
+                    else:
+                        pointer.unlink()
+                    pointer.write_bytes(original)
+            saved.unlink()
+        # Trailing CR/LF and a canonical absolute target are valid Git pointer syntax.
+        dotgit.write_text('gitdir: ' + str(one / '.world-git/repo.git/worktrees/active') + '\r\n')
+        self.exec_sh(wid, ':', '--require-sandbox')
+
     def test_exec_reports_redirected_worktree_hooks_and_archive_command(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
@@ -4841,16 +4881,23 @@ class GitWorldTest(unittest.TestCase):
             proc.send_signal(signal.SIGTERM)
             stdout, stderr = proc.communicate(timeout=3)
             self.assertEqual(proc.returncode, 128 + signal.SIGTERM, (stdout, stderr))
+            # Bubblewrap's namespace teardown can finish after its outer monitor is
+            # reaped. Keep the original writer open so an orphan cannot exit on EOF
+            # and falsely satisfy the check; allow bounded asynchronous descriptor cleanup.
+            deadline = time.monotonic() + 2
+            while True:
+                try:
+                    fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+                except OSError as e:
+                    self.assertEqual(e.errno, errno.ENXIO)
+                    break
+                else:
+                    os.close(fd)
+                if time.monotonic() >= deadline:
+                    self.fail('configuration helper still holds the FIFO open')
+                time.sleep(0.02)
             os.close(writer)
             writer = None
-            # The helper reader was killed and reaped, not orphaned after world exited.
-            try:
-                fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
-            except OSError as e:
-                self.assertEqual(e.errno, errno.ENXIO)
-            else:
-                os.close(fd)
-                self.fail('configuration helper still holds the FIFO open')
         finally:
             if writer is not None:
                 os.close(writer)
@@ -5623,6 +5670,23 @@ class GitWorldTest(unittest.TestCase):
         p = self.exec_sh(wid, 'mkdir -p libs/lib/githooks && echo lint > libs/lib/githooks/pre-commit',
                          '--require-sandbox')
         self.assertNotIn(b'WARNING', p.stderr)
+
+    def test_exec_refuses_preexisting_submodule_pointer_redirection(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        dotgit = one / 'libs/lib/.git'
+        original = dotgit.read_bytes()
+        dotgit.write_text('gitdir: ' + str(one / '.world-git/repo.git/worktrees/active') + '\n')
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'Git repository pointer is missing, redirected or unsupported', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+        dotgit.write_bytes(original)
+        commondir = one / '.world-git/repo.git/worktrees/active/modules/lib-module/commondir'
+        commondir.write_text(str(one / '.world-git/repo.git') + '\n')
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'Git repository pointer is missing, redirected or unsupported', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
 
     def test_exec_submodule_worktree_scope_redirects_relative_hooks(self):
         self.submodule_fixture()

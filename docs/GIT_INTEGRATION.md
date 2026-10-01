@@ -269,6 +269,15 @@ status, which `world exec` keeps). Before the command starts, exec captures each
 -- the World and every submodule repository present -- whole, and the same capture decides
 the sandbox rules above:
 
+Before sandboxed exec, the World's `.git` and active worktree `commondir` must be regular,
+complete pointers to its own administration. Existing `.git` entries in other effective
+checkouts, and existing submodule `commondir` pointers, must likewise name the administration
+being guarded. Missing optional checkout pointers are allowed (for example a redirected
+`core.worktree` without `.git`). Pointer parsing reads the complete bounded file, rejects NUL
+or oversized content, trims only trailing CR/LF and compares canonical targets. Preexisting
+redirected, symlinked or directory pointers refuse sandboxed exec; `--no-sandbox` retains
+observational reporting so a command can repair them.
+
 - its effective configuration, `git config --list --includes --show-scope` read through its
   own administration: system, global, local, worktree, inherited command scope and included files -- the sandbox does
   not stop writes to `~/.gitconfig`, and `--no-sandbox` stops nothing. Every scope is kept

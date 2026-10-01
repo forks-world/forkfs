@@ -2420,6 +2420,58 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
     return buf;
 }
 
+// Git treats only trailing CR/LF as terminators: an embedded newline belongs to the
+// path. Read the complete bounded file before trusting it as an administration pointer.
+static bool pointer_home(const char *path, const char *base, const char *expect,
+                         const char *prefix, bool *present) {
+    *present = true;
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) *present = false;
+        return false;
+    }
+    if (!S_ISREG(st.st_mode)) return false;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return false;
+    char buf[WFS_PATH_MAX + 16];
+    size_t at = 0;
+    bool complete = false;
+    struct stat opened;
+    if (fstat(fd, &opened) == 0 && S_ISREG(opened.st_mode)) {
+        while (at < sizeof buf) {
+            if (g_post_signal) break;
+            ssize_t n = read(fd, buf + at, sizeof buf - at);
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0) break;
+            if (!n) { complete = true; break; }
+            at += (size_t)n;
+        }
+    }
+    close(fd);
+    if (!complete || !at || memchr(buf, 0, at)) return false;
+    while (at && (buf[at - 1] == '\r' || buf[at - 1] == '\n')) --at;
+    size_t pl = strlen(prefix);
+    if (at <= pl || memcmp(buf, prefix, pl)) return false;
+    buf[at] = 0;  // complete implies at < sizeof buf
+    char target[2 * WFS_PATH_MAX];
+    const char *value = buf + pl;
+    int n = value[0] == '/' ? snprintf(target, sizeof target, "%s", value) :
+                             snprintf(target, sizeof target, "%s/%s", base, value);
+    if (n < 0 || (size_t)n >= sizeof target) return false;
+    char *actual = realpath(target, NULL), *expected = realpath(expect, NULL);
+    bool home = actual && expected && !strcmp(actual, expected);
+    free(actual); free(expected);
+    return home;
+}
+
+static bool require_pointer_home(const char *path, const char *base, const char *expect,
+                                 const char *prefix, bool optional, GuardSet *s) {
+    bool present;
+    if (pointer_home(path, base, expect, prefix, &present) || (optional && !present)) return true;
+    s->error = "Git repository pointer is missing, redirected or unsupported";
+    return false;
+}
+
 // What `path` -- a `.git` file, or `commondir` -- is now, as "<type>:<hash>[:home]". Any entry
 // type is recorded, absence included: replacing the World's `.git` file with a directory (`git
 // init`) or a symlink sends Git to another repository just as surely as rewriting it. `home`
@@ -2440,24 +2492,9 @@ static void capture_pointer(const GitAdmin *a, const char *path, const char *bas
         return;
     }
     const char *hash = strchr(fp, ':') ? strchr(fp, ':') + 1 : "";
-    bool home = false;
-    if (S_ISREG(st.st_mode)) {
-        char buf[WFS_PATH_MAX + 16];
-        int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
-        ssize_t n = fd >= 0 ? read(fd, buf, sizeof buf - 1) : -1;
-        if (fd >= 0) close(fd);
-        if (n > 0) {
-            buf[n] = 0;
-            size_t pl = strlen(prefix);
-            char *nl = strchr(buf, '\n');
-            if (nl) *nl = 0;
-            if (!strncmp(buf, prefix, pl)) {
-                char target[WFS_PATH_MAX];
-                join_lexical(base, buf + pl, target, sizeof target);
-                home = !strcmp(target, expect);
-            }
-        }
-    }
+    bool present;
+    bool home = S_ISREG(st.st_mode) && pointer_home(path, base, expect, prefix, &present);
+    if (g_post_signal) { s->error = "Git capture interrupted"; return; }
     snprintf(val, sizeof val, "%s:%s%s",
              S_ISREG(st.st_mode) ? "file" : S_ISDIR(st.st_mode) ? "dir" : S_ISLNK(st.st_mode) ? "link" : "other",
              hash, home ? ":home" : "");
@@ -2502,7 +2539,7 @@ static bool note_hooks_path(const GitAdmin *a, const char *checkout, const char 
 // (`active`), as Git in the World reads it, without trusting the World's `.git` file: a command
 // that replaced it is reported, not followed. The same capture feeds the sandbox rules
 // (hooks_paths) and the before/after report.
-static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, const char *label, GuardSet *s) {
+static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, const char *label, GuardSet *s, bool require_home) {
     size_t len = 0;
     int status = -1;
     char *out = git_guard_read(a->root, gitdir, NULL, false, &len, &status);
@@ -2538,6 +2575,13 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
     worktree[len - 1] = 0;
     snprintf(checkout, sizeof checkout, "%s", worktree);
     free(worktree);
+    if (require_home) {
+        char pointer[WFS_PATH_MAX + 16];
+        snprintf(pointer, sizeof pointer, "%s/.git", checkout);
+        // A redirected core.worktree may legitimately have no .git entry. An existing
+        // entry must not send ordinary Git to administration outside the guard policy.
+        if (!require_pointer_home(pointer, checkout, gitdir, "gitdir: ", true, s)) return false;
+    }
     // Let Git expand ~user and %(prefix), and select the effective value in every scope.
     // Exit 1 means no value; a parse, expansion or capture failure must invalidate capture.
     char *hooks_value = git_guard_read(a->root, gitdir, "core.hooksPath", false, &len, &status);
@@ -2570,12 +2614,20 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
     return !s->error;
 }
 
-static bool guard_capture(GitAdmin *a, GuardSet *s) {
+static bool guard_capture(GitAdmin *a, GuardSet *s, bool require_home = false) {
     if (g_post_signal) { s->error = "Git capture interrupted"; return false; }
     if (a->incomplete) { s->error = "incomplete Git administration scan (limit or read error)"; return false; }
     s->bytes_left = 64u << 20;
     const char *self = real_dir(a->active) ? a->active : NULL;
-    if (!capture_repo(a, self, a->common, "", s)) return false;
+    if (require_home) {
+        if (!self) { s->error = "Git active administration is missing or unsupported"; return false; }
+        char pointer[WFS_PATH_MAX + 16];
+        snprintf(pointer, sizeof pointer, "%s/.git", a->root);
+        if (!require_pointer_home(pointer, a->root, a->active, "gitdir: ", false, s)) return false;
+        snprintf(pointer, sizeof pointer, "%s/commondir", a->active);
+        if (!require_pointer_home(pointer, a->active, a->common, "", false, s)) return false;
+    }
+    if (!capture_repo(a, self, a->common, "", s, require_home)) return false;
     if (self) {
         char p[WFS_PATH_MAX + 16];
         snprintf(p, sizeof p, "%s/commondir", a->active);
@@ -2585,7 +2637,12 @@ static bool guard_capture(GitAdmin *a, GuardSet *s) {
         const char *g = a->gitdirs.v[i];
         char label[WFS_PATH_MAX + 16];
         snprintf(label, sizeof label, "submodule %s", g + strlen(a->modules) + 1);
-        if (!capture_repo(a, g, g, label, s)) return false;
+        if (require_home) {
+            char pointer[WFS_PATH_MAX + 16];
+            snprintf(pointer, sizeof pointer, "%s/commondir", g);
+            if (!require_pointer_home(pointer, g, g, "", true, s)) return false;
+        }
+        if (!capture_repo(a, g, g, label, s, require_home)) return false;
     }
     if (s->error) return false;
     gs_finish(s);
@@ -3022,7 +3079,7 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
             return refuse("refusing sandboxed exec: incomplete Git administration scan (limit or read error)",
                           "world exec W<n> --no-sandbox -- <cmd>");
         }
-        watch = guard_capture(&admin, &before);
+        watch = guard_capture(&admin, &before, sandbox);
         if (!watch && sandbox) {
             fprintf(stderr, "world: note: Git guard unavailable: %s\n",
                     before.error ? before.error : "configuration query failed");
