@@ -298,7 +298,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `core.worktree` (checkout and relative-hook redirection), `core.fsmonitor`, `core.sshcommand`, `core.editor`, `core.pager`, `core.askpass`,
 `core.attributesfile` (can activate configured filters), `core.gitproxy`, `core.alternaterefscommand`, `sequence.editor`, `credential.helper` and
 `credential.*.helper`, `filter.*.clean|smudge|process`, `diff.external`,
-`diff.*.command|textconv`, `merge.*.driver`, `mergetool.*.cmd|path`, `difftool.*.cmd|path`,
+`diff.*.command|textconv`, `diff.tool|guitool`, `merge.tool|guitool` (select configured commands), `merge.*.driver`, `mergetool.*.cmd|path`, `difftool.*.cmd|path`,
 `gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
 `remote.*.uploadpack|receivepack|vcs`, `uploadpack.packobjectshook`,
 `sendemail[.*].tocmd|cccmd|headercmd|sendmailcmd|smtpserver`, `include.path`,
@@ -324,8 +324,9 @@ be read (missing configured Git or sandbox, a malformed file, or a query exceedi
 limits), sandboxed exec refuses before running the command; `--no-sandbox` says so in a
 `note:` line and runs without the report;
 a World without `.world-git` at startup gets neither the rules nor the report. If the command
-removes or replaces previously detected Git administration, exec warns that the final hooks
-and settings could not be inspected. An incomplete administration scan (read/allocation error,
+removes or replaces previously detected Git administration, or makes its scan incomplete,
+exec warns that the final hooks and settings could not be inspected. An interrupted scan
+is identified as cancellation rather than a replacement. An incomplete administration scan (read/allocation error,
 path truncation, depth over 32, more than 4096 repositories or 65536 directory entries) refuses
 sandboxed exec; `--no-sandbox` reports the unavailable guard and preserves the command status.
 Hook and pointer hashing has a 64 MiB aggregate content budget per capture; oversized files,

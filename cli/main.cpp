@@ -3159,7 +3159,13 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
     if (watch) {
         GitAdmin now;
         GuardSet after = {};
-        if (git_admin_find(id.path, &now)) {
+        bool found = git_admin_find(id.path, &now);
+        if (g_post_signal) {
+            fputs("world: note: Git administration inspection interrupted after the command\n", stderr);
+        } else if (found && now.incomplete) {
+            fprintf(stderr, "world: WARNING: exec left W%llu's Git administration replaced or incomplete; "
+                    "changed Git hooks and settings could not be inspected\n", (unsigned long long)w);
+        } else if (found) {
             if (guard_capture(&now, &after)) guard_report(&before, &after);
             else fprintf(stderr, "world: note: could not read W%llu's Git configuration after the command; "
                          "changed Git settings that run commands are not reported (%s)\n", (unsigned long long)w,

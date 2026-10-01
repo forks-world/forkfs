@@ -39,6 +39,7 @@ int main() {
         "core.hookspath", "core.fsmonitor", "core.sshcommand", "core.editor", "core.pager",
         "core.askpass", "core.gitproxy", "core.alternaterefscommand", "sequence.editor",
         "credential.helper", "credential.https://example.com.helper", "filter.lfs.clean",
+        "diff.tool", "diff.guitool", "merge.tool", "merge.guitool",
         "filter.x.smudge", "filter.x.process", "diff.external", "diff.pdf.textconv",
         "diff.pdf.command", "merge.ours.driver", "mergetool.vim.cmd", "difftool.x.path",
         "gpg.program", "gpg.ssh.program", "gpg.ssh.defaultkeycommand", "remote.origin.uploadpack",
@@ -98,7 +99,7 @@ int main() {
         "user.email", "user.name", "remote.origin.url", "remote.origin.fetch",
         "branch.main.remote", "branch.main.merge", "core.bare", "tar.command", "tar.custom.remote",
         "gc.custom.recentobjectshook", "gc.pruneexpire", "core.editorx", "core.custom.attributesfile", "filter.clean", "diff.command", "merge.driver", "core.x.hookspath",
-        "include.x.path", "includeif.path", "hook.command", "remote.uploadpack", "merge.tool",
+        "include.x.path", "includeif.path", "hook.command", "remote.uploadpack", "merge.payload.tool", "diff.payload.guitool",
         "imap.host", "imap.custom.tunnel", "instaweb.port", "instaweb.custom.httpd", "guitool.cmd", "guitool.test.title",
         "credential.username", "gpg.format", "init.defaultbranch", "", ".", "core.", "nodot",
     };

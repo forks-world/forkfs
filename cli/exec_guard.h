@@ -45,6 +45,8 @@ static const GuardKey kGuardKeys[] = {
     {"sequence", "editor", 0, false},     {"credential", "helper", 2, false},
     {"filter", "clean", 1, false},        {"filter", "smudge", 1, false},
     {"filter", "process", 1, false},      {"diff", "external", 0, false},
+    {"diff", "tool", 0, false},           {"diff", "guitool", 0, false},
+    {"merge", "tool", 0, false},          {"merge", "guitool", 0, false},
     {"diff", "command", 1, false},        {"diff", "textconv", 1, false},
     {"merge", "driver", 1, false},        {"mergetool", "cmd", 1, false},
     {"mergetool", "path", 1, false},      {"difftool", "cmd", 1, false},

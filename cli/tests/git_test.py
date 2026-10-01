@@ -4730,16 +4730,39 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'local core.attributesfile: (unset) -> ' + str(attributes).encode(), p.stderr)
         self.assertFalse((one / 'filter-ran').exists())
 
+    def test_exec_reports_selecting_preconfigured_diff_and_merge_tools(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'difftool.payload.cmd', 'touch selected-tool-ran')
+        self.git(one, 'config', 'mergetool.payload.cmd', 'touch selected-tool-ran')
+        keys = ('diff.tool', 'diff.guitool', 'merge.tool', 'merge.guitool')
+        p = self.exec_sh(wid, ' && '.join('git config ' + key + ' payload' for key in keys), '--no-sandbox')
+        for key in keys:
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> payload', p.stderr)
+        self.assertNotIn(b'local difftool.payload.cmd:', p.stderr)
+        self.assertNotIn(b'local mergetool.payload.cmd:', p.stderr)
+        self.assertFalse((one / 'selected-tool-ran').exists())
+
     def test_exec_reports_disappearing_git_administration(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
-        for operation in ('mv .world-git .saved-admin', 'rm -rf .world-git'):
+        for operation in ('mv .world-git .saved-admin',
+                          'mv .world-git .saved-admin; ln -s .saved-admin .world-git',
+                          'mv .world-git .saved-admin; echo replacement > .world-git',
+                          'mv .world-git .saved-admin; mkdir .world-git',
+                          'rm -rf .world-git'):
             with self.subTest(operation=operation):
                 p = self.exec_sh(wid, operation + '; echo "gitdir: /tmp/elsewhere" > .git; exit 7',
                                  '--no-sandbox', code=7)
-                self.assertIn(b'WARNING: exec removed or replaced', p.stderr)
+                self.assertIn(b'WARNING: exec ', p.stderr)
                 self.assertIn(b'Git administration', p.stderr)
+                self.assertIn(b'could not be inspected', p.stderr)
                 if (one / '.saved-admin').exists():
+                    admin = one / '.world-git'
+                    if admin.is_symlink() or admin.is_file():
+                        admin.unlink()
+                    elif admin.exists():
+                        shutil.rmtree(admin)
                     (one / '.saved-admin').rename(one / '.world-git')
                     (one / '.git').write_text('gitdir: .world-git/repo.git/worktrees/active\n')
 
