@@ -5152,6 +5152,26 @@ class GitWorldTest(unittest.TestCase):
         self.assertNotIn(b'local man.payload.cmd:', p.stderr)
         self.assertFalse((one / 'selected-help-ran').exists())
 
+    def test_exec_reports_selecting_preconfigured_merge_driver(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'merge.payload.driver', 'touch merge-driver-ran')
+        self.git(one, 'config', 'filter.payload.clean', 'touch merge-filter-ran; cat')
+        info = one / '.world-git/repo.git/info'
+        info.mkdir(exist_ok=True)
+        (info / 'attributes').write_text('* filter=payload\n')
+        p = self.exec_sh(wid, 'git config merge.outer.recursive payload && '
+                         'git config merge.default payload && git config merge.renormalize true; exit 7',
+                         '--no-sandbox', code=7)
+        self.assertIn(b'local merge.outer.recursive: (unset) -> payload', p.stderr)
+        self.assertIn(b'local merge.default: (unset) -> payload', p.stderr)
+        self.assertIn(b'local merge.renormalize: (unset) -> true', p.stderr)
+        self.assertNotIn(b'local merge.payload.driver:', p.stderr)
+        self.assertNotIn(b'local filter.payload.clean:', p.stderr)
+        self.assertNotIn(b'Git repository attributes:', p.stderr)
+        self.assertFalse((one / 'merge-driver-ran').exists())
+        self.assertFalse((one / 'merge-filter-ran').exists())
+
     def test_exec_reports_selecting_preconfigured_diff_and_merge_tools(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

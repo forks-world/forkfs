@@ -322,7 +322,8 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `core.worktree` (checkout and relative-hook redirection), `core.fsmonitor`, `core.sshcommand`, `core.editor`, `core.pager`, `core.askpass`,
 `core.attributesfile` (can activate configured filters), `core.gitproxy`, `core.alternaterefscommand`, `sequence.editor`, `credential.helper` and
 `credential.*.helper`, `filter.*.clean|smudge|process`, `diff.external`,
-`diff.*.command|textconv`, `diff.tool|guitool`, `merge.tool|guitool`, `difftool.guidefault`, `mergetool.guidefault` (select configured commands), `merge.*.driver`, `mergetool.*.cmd|path`, `difftool.*.cmd|path`,
+`diff.*.command|textconv`, `diff.tool|guitool`, `merge.tool|guitool`, `difftool.guidefault`, `mergetool.guidefault` (select configured commands), `merge.*.driver|recursive`, `merge.default` (including selection of unchanged merge drivers),
+`merge.renormalize` (can activate configured conversion filters), `mergetool.*.cmd|path`, `difftool.*.cmd|path`,
 `commit.gpgsign`, `tag.gpgsign`, `tag.forcesignannotated`, `push.gpgsign` (enable signing),
 `log.showsignature`, `merge.verifysignatures`, `rebase.instructionformat`, `format.pretty`,
 `pretty.*`, `format.commitlistformat`, `format.coverletter` (can activate signature verification),

@@ -87,6 +87,8 @@ static const GuardKey kGuardKeys[] = {
     {"difftool", "guidefault", 0, false}, {"mergetool", "guidefault", 0, false},
     {"merge", "tool", 0, false},          {"merge", "guitool", 0, false},
     {"diff", "command", 1, false},        {"diff", "textconv", 1, false},
+    {"merge", "recursive", 1, false},
+    {"merge", "default", 0, false},      {"merge", "renormalize", 0, false},
     {"merge", "driver", 1, false},        {"mergetool", "cmd", 1, false},
     {"mergetool", "path", 1, false},      {"difftool", "cmd", 1, false},
     {"difftool", "path", 1, false},       {"gpg", "program", 2, false},
