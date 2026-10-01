@@ -315,7 +315,9 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `diff.*.command|textconv`, `diff.tool|guitool`, `merge.tool|guitool` (select configured commands), `merge.*.driver`, `mergetool.*.cmd|path`, `difftool.*.cmd|path`,
 `commit.gpgsign`, `tag.gpgsign`, `tag.forcesignannotated`, `push.gpgsign` (enable signing),
 `gpg.format` (selects the signing program), `gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
-`remote.*.uploadpack|receivepack|vcs`, `uploadpack.packobjectshook`,
+`remote.*.uploadpack|receivepack|vcs`, `branch.*.mergeoptions` (can select external merge strategies),
+`branch.*.remote|pushremote`, `remote.pushdefault` (can select preconfigured helper remotes),
+`uploadpack.packobjectshook`,
 `sendemail[.*].tocmd|cccmd|headercmd|sendmailcmd|smtpserver`, `include.path`,
 `includeif.*.path`, `alias.*` (including ordinary aliases that dispatch commands or inject `-c` settings), `submodule.*.update` whose value
 starts with `!`, `pager.*`, `interactive.difffilter`, `web.browser`, `help.browser`, `help.format`, `instaweb.browser`, `man.viewer` (select configured viewers), `browser.*.cmd|path`, `instaweb.httpd`, `guitool.*.cmd`, `imap.tunnel`,
@@ -327,7 +329,10 @@ For `url.<target>.insteadOf`/`pushInsteadOf`, the target in the key is checked, 
 prefix in the value. Ordinary URLs using exact lowercase `file`, `git`, `ssh`, `git+ssh`,
 `ssh+git`, `http`, `https`, `ftp` and `ftps` schemes, scp-style addresses and local paths stay quiet. Explicit
 `<transport>::` always selects a helper; scheme names are case-sensitive. The key list and
-value-sensitive rules are in `cli/exec_guard.h`. Each repository is read before and after with three
+value-sensitive rules are in `cli/exec_guard.h`. Branch remote selectors and `remote.pushdefault`
+are reported even when choosing an ordinary remote: a remote name can activate unchanged
+helper configuration. Setting tracking remains allowed; `branch.*.merge` stays quiet.
+Each repository is read before and after with three
 queries: a configuration listing, `--path --get core.hooksPath`, and `rev-parse --show-toplevel`,
 so Git expands `~user` and applies its checkout rules when resolving relative hooks. These use the absolute Git 2.48+ path
 selected by CMake at build time, unaffected by runtime `PATH`, and do not execute hooks or

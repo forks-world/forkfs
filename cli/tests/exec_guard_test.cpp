@@ -44,7 +44,8 @@ int main() {
         "diff.pdf.command", "merge.ours.driver", "mergetool.vim.cmd", "difftool.x.path",
         "commit.gpgsign", "tag.gpgsign", "tag.forcesignannotated", "push.gpgsign", "gpg.format",
         "gpg.program", "gpg.ssh.program", "gpg.ssh.defaultkeycommand", "remote.origin.uploadpack",
-        "remote.origin.receivepack", "remote.origin.vcs", "uploadpack.packobjectshook",
+        "branch.main.mergeoptions", "branch.main.remote", "branch.main.pushremote", "remote.pushdefault",
+        "branch.topic.with.dots.mergeoptions", "remote.origin.receivepack", "remote.origin.vcs", "uploadpack.packobjectshook",
         "sendemail.tocmd", "sendemail.work.sendmailcmd", "sendemail.smtpserver", "include.path",
         "help.browser", "help.format", "instaweb.browser", "man.viewer",
         "includeif.gitdir:/x/.path", "pager.log", "interactive.difffilter", "web.browser",
@@ -99,7 +100,8 @@ int main() {
     // Keys that legitimately change during agent work, or only name things.
     const char *quiet[] = {
         "user.email", "user.name", "remote.origin.url", "remote.origin.fetch",
-        "branch.main.remote", "branch.main.merge", "core.bare", "tar.command", "tar.custom.remote",
+        "branch.remote", "branch.pushremote", "branch.mergeoptions", "remote.origin.pushdefault",
+        "branch.main.merge", "core.bare", "tar.command", "tar.custom.remote",
         "gc.custom.recentobjectshook", "gc.pruneexpire", "core.editorx", "core.custom.attributesfile", "filter.clean", "diff.command", "merge.driver", "core.x.hookspath",
         "include.x.path", "includeif.path", "hook.command", "remote.uploadpack", "merge.payload.tool", "diff.payload.guitool",
         "help.custom.browser", "help.custom.format", "instaweb.custom.browser", "man.custom.viewer",

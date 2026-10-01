@@ -56,6 +56,8 @@ static const GuardKey kGuardKeys[] = {
     {"gpg", "format", 0, false},
     {"gpg", "defaultkeycommand", 2, false}, {"gc", "recentobjectshook", 0, false},
     {"remote", "uploadpack", 1, false},   {"remote", "receivepack", 1, false},
+    {"branch", "mergeoptions", 1, false}, {"branch", "remote", 1, false},
+    {"branch", "pushremote", 1, false},   {"remote", "pushdefault", 0, false},
     {"remote", "vcs", 1, false},          {"uploadpack", "packobjectshook", 0, false},
     {"sendemail", "tocmd", 2, false},     {"sendemail", "cccmd", 2, false},
     {"sendemail", "headercmd", 2, false}, {"sendemail", "sendmailcmd", 2, false},

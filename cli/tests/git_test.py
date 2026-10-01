@@ -4847,6 +4847,29 @@ class GitWorldTest(unittest.TestCase):
                 self.assertIn(b'nonregular Git repository attributes cannot be inspected', p.stderr)
                 attributes.unlink()
 
+    def test_exec_reports_remote_and_merge_strategy_selectors(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'remote.dormant.url', 'ext::touch selected-remote-ran')
+        strategy_dir = one / 'strategy-bin'
+        strategy_dir.mkdir()
+        strategy = strategy_dir / 'git-merge-payload'
+        strategy.write_text('#!/bin/sh\ntouch selected-strategy-ran\n')
+        strategy.chmod(0o755)
+        self.env['PATH'] = str(strategy_dir) + os.pathsep + self.env['PATH']
+        branch = self.git(one, 'branch', '--show-current').stdout.decode().strip()
+        values = {'branch.' + branch + '.mergeoptions': '-s payload',
+                  'branch.' + branch + '.remote': 'dormant',
+                  'branch.' + branch + '.pushremote': 'dormant', 'remote.pushdefault': 'dormant'}
+        p = self.exec_sh(wid, ' && '.join('git config ' + shlex.quote(key) + ' ' + shlex.quote(val)
+                                        for key, val in values.items()) + '; exit 7', '--no-sandbox', code=7)
+        for key, val in values.items():
+            self.assertIn(b'local ' + key.encode() + b': ', p.stderr)
+            self.assertIn(b' -> ' + val.encode() + b'\n', p.stderr)
+        self.assertNotIn(b'local remote.dormant.url:', p.stderr)
+        self.assertFalse((one / 'selected-remote-ran').exists())
+        self.assertFalse((one / 'selected-strategy-ran').exists())
+
     def test_exec_reports_selecting_preconfigured_help_commands(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
