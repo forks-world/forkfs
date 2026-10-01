@@ -284,6 +284,10 @@ observational reporting so a command can repair them.
   per repository, since an `includeIf "gitdir:..."` or `"onbranch:..."` can give one
   submodule settings the World does not have; a change to a global or system entry that is
   identical in the World's own listing is reported once, under the World;
+- each repository's private `info/attributes` file: changes can activate an unchanged filter
+  definition without altering tracked project files. Regular files are hashed in full within
+  the shared capture budget, including edits through hardlink aliases. Symlinked or other
+  nonregular attribute files invalidate capture rather than silently omitting their content;
 - the hooks Git could run: name, mode and content of every non-`.sample` entry of its hooks
   directory and of its effective `core.hooksPath` when that is guarded;
 - the entries that tell Git where it is -- the World's `.git` and `commondir`, each
@@ -299,6 +303,7 @@ change, a removed one (`submodule deinit`, `git rm`) as a removal; only a submod
 world: WARNING: exec changed a Git setting that runs commands: local core.fsmonitor: (unset) -> touch /tmp/x
 world: WARNING: exec changed a Git setting that runs commands: submodule lib-module local credential.helper: (unset) -> store
 world: WARNING: exec added a Git hook: .world-git/repo.git/worktrees/active/modules/vendor/lib/hooks/post-checkout
+world: WARNING: exec changed Git repository attributes: .world-git/repo.git/info/attributes (can activate configured filters)
 world: WARNING: exec changed where Git finds a repository: .git (a file naming its repository -> a directory)
 world: WARNING: exec removed libs/lib/.git, which told Git where a repository is
 ```
@@ -340,7 +345,7 @@ renamed or replaced active worktree administration. An interrupted scan
 is identified as cancellation rather than a replacement. An incomplete administration scan (read/allocation error,
 path truncation, depth over 32, more than 4096 repositories or 65536 directory entries) refuses
 sandboxed exec; `--no-sandbox` reports the unavailable guard and preserves the command status.
-Hook and pointer hashing has a 64 MiB aggregate content budget per capture; oversized files,
+Hook, pointer and repository-attributes hashing has a 64 MiB aggregate content budget per capture; oversized files,
 read errors and record/entry limits invalidate the capture explicitly. Incomplete initial
 hook captures also refuse sandboxed exec; final capture failures keep the command status. Small hooks are hashed
 in full, so same-size, same-mtime rewrites remain detectable. Symlinked default hooks directories and symlinked entries in guarded

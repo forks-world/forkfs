@@ -4794,6 +4794,59 @@ class GitWorldTest(unittest.TestCase):
         self.exec_sh(wid, 'echo fine > .world-git/repo.git/worktrees/active/modules/guarded-foo/payload',
                      '--require-sandbox')
 
+    def test_exec_reports_repository_attributes_activating_unchanged_filters(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        repositories = ((one, one / '.world-git/repo.git'),
+                        (one / 'libs/lib', one / '.world-git/repo.git/worktrees/active/modules/lib-module'))
+        for checkout, common in repositories:
+            with self.subTest(repository=checkout):
+                for name in ('hidden', 'second'):
+                    self.git(checkout, 'config', 'filter.' + name + '.clean', 'touch filter-ran; cat')
+                attributes = common / 'info/attributes'
+                attributes.parent.mkdir(exist_ok=True)
+                self.assertFalse(attributes.exists())
+                rel = str(attributes.relative_to(one)).encode()
+                p = self.exec_sh(wid, 'printf %s ' + shlex.quote('* filter=hidden\n') + ' > ' +
+                                 shlex.quote(str(attributes)) + '; exit 7', '--no-sandbox', code=7)
+                self.assertIn(b'exec added Git repository attributes: ' + rel, p.stderr)
+                self.assertNotIn(b'local filter.hidden.clean:', p.stderr)
+                alias = one / 'attributes-alias'
+                os.link(attributes, alias)
+                # Same-size, same-mtime replacement through a hardlink must still be seen.
+                code = ('import os\np = ' + repr(str(alias)) + '\nst = os.stat(p)\n'
+                        "with open(p, 'wb') as f: f.write(b'* filter=second\\n')\n"
+                        'os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))\n')
+                p = self.exec_sh(wid, shlex.quote(sys.executable) + ' -c ' + shlex.quote(code) + '; exit 7',
+                                 '--no-sandbox', code=7)
+                self.assertIn(b'exec changed Git repository attributes: ' + rel, p.stderr)
+                alias.unlink()
+                p = self.exec_sh(wid, 'rm ' + shlex.quote(str(attributes)) + '; exit 7', '--no-sandbox', code=7)
+                self.assertIn(b'exec removed Git repository attributes: ' + rel, p.stderr)
+                self.assertFalse((one / 'filter-ran').exists())
+                self.assertFalse((checkout / 'filter-ran').exists())
+
+    def test_exec_refuses_nonregular_repository_attributes(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        attributes = one / '.world-git/repo.git/info/attributes'
+        attributes.parent.mkdir(exist_ok=True)
+        target = self.root / 'external-attributes'
+        target.write_text('* filter=hidden\n')
+        for kind in ('symlink', 'fifo'):
+            with self.subTest(kind=kind):
+                if kind == 'symlink':
+                    attributes.symlink_to(target)
+                else:
+                    os.mkfifo(attributes)
+                p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+                self.assertIn(b'nonregular Git repository attributes cannot be inspected', p.stderr)
+                self.assertFalse((one / 'should-not-run').exists())
+                p = self.exec_sh(wid, 'exit 7', '--no-sandbox', code=7)
+                self.assertIn(b'nonregular Git repository attributes cannot be inspected', p.stderr)
+                attributes.unlink()
+
     def test_exec_reports_selecting_preconfigured_help_commands(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

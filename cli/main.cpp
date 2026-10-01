@@ -2103,7 +2103,8 @@ static void git_admin_free(GitAdmin *a) { sl_free(&a->gitdirs); sl_free(&a->pins
 // --- what exec compares before and after the command ---
 //
 // Records are "<kind>\x1f<...>" -> value, sorted by id: kind `c` is a configuration entry
-// (repository, scope, key), `h` a hook file, `p` a file that tells Git where a repository is.
+// (repository, scope, key), `h` a hook file, `a` repository attributes, and `p` a file
+// that tells Git where a repository is.
 
 struct GuardRec { char *id; char *val; size_t seq; };
 struct GuardSet { GuardRec *v; size_t n, cap, bytes_left, entries; const char *error; };
@@ -2159,9 +2160,9 @@ static void gs_finish(GuardSet *s) {
 
 // The file's type, mode and content (a symlink: its target), as a short fingerprint. Hooks are
 // small; hashing the bytes catches a same-size, same-mtime rewrite through a hardlink.
-static bool fingerprint(const char *path, char *out, size_t cap, GuardSet *s, bool hook = false) {
+static bool fingerprint(const char *path, char *out, size_t cap, GuardSet *s, bool hook = false, bool regular_only = false) {
     struct stat st;
-    if (lstat(path, &st) != 0) return false;
+    if (lstat(path, &st) != 0 || (regular_only && !S_ISREG(st.st_mode))) return false;
     uint64_t h = 1469598103934665603ull;
     auto mix = [&h](const char *b, size_t n) {
         for (size_t i = 0; i < n; ++i) { h ^= (unsigned char)b[i]; h *= 1099511628211ull; }
@@ -2251,6 +2252,29 @@ static void capture_hooks(const GitAdmin *a, const char *dir, GuardSet *s) {
         gs_add(s, id, fp);
     }
     closedir(d);
+}
+
+// Repository-private attributes can activate a previously configured filter without
+// changing configuration or tracked project files. Observe their full regular-file bytes.
+static void capture_attributes(const GitAdmin *a, const char *common, GuardSet *s) {
+    if (s->error) return;
+    char path[WFS_PATH_MAX + 32], id[WFS_PATH_MAX + 40], fp[64];
+    if ((size_t)snprintf(path, sizeof path, "%s/info/attributes", common) >= sizeof path) {
+        s->error = "Git attributes path exceeds capture limit"; return;
+    }
+    snprintf(id, sizeof id, "a\x1f%s", rel_to(a, path));
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) gs_add(s, id, "absent");
+        else s->error = "could not inspect Git repository attributes";
+        return;
+    }
+    if (!S_ISREG(st.st_mode)) { s->error = "nonregular Git repository attributes cannot be inspected"; return; }
+    if (!fingerprint(path, fp, sizeof fp, s, false, true)) {
+        if (!s->error) s->error = "could not fingerprint Git repository attributes";
+        return;
+    }
+    gs_add(s, id, fp);
 }
 
 // `base`/`rel` with `.` and `..` resolved lexically (a submodule's core.worktree is relative to
@@ -2595,6 +2619,8 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
         free(hooks_value);
         if (!resolved) { s->error = "could not resolve Git hooks path"; return false; }
     }
+    capture_attributes(a, common, s);
+    if (s->error) return false;
     char p[WFS_PATH_MAX + 16];
     snprintf(p, sizeof p, "%s/hooks", common);
     capture_hooks(a, p, s);
@@ -2694,6 +2720,12 @@ static void guard_warn(const GuardRec *before, const GuardRec *after) {
         fputs(" -> ", stderr);
         put_value(stderr, after ? after->val : NULL);
         fputc('\n', stderr);
+    } else if (id[0] == 'a') {
+        bool was = before && strcmp(before->val, "absent");
+        bool is = after && strcmp(after->val, "absent");
+        fprintf(stderr, "world: WARNING: exec %s Git repository attributes: ", !was ? "added" : !is ? "removed" : "changed");
+        put_field(stderr, rest, strlen(rest));
+        fputs(" (can activate configured filters)\n", stderr);
     } else if (id[0] == 'h') {
         fprintf(stderr, "world: WARNING: exec %s a Git hook: ", !before ? "added" : !after ? "removed" : "changed");
         put_field(stderr, rest, strlen(rest));
@@ -2751,6 +2783,8 @@ static void guard_report(const GuardSet *b, const GuardSet *a) {
         if (before && after && !strcmp(before->val, after->val)) continue;
         const char kind = (before ? before : after)->id[0];
         if (kind == 'c' && shared_with_world(b, a, before, after)) continue;
+        if (kind == 'a' && (!before || !strcmp(before->val, "absent")) &&
+            (!after || !strcmp(after->val, "absent"))) continue;
         if (kind == 'p') {
             bool was = before && strcmp(before->val, "absent");
             bool is = after && strcmp(after->val, "absent");
