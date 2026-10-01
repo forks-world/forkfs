@@ -434,7 +434,7 @@ writes to the World's hooks directories (row above; on Linux, read-only bind mou
 that exist when the exec starts). Git's configuration stays writable, because `git remote add`,
 `git push -u` and `git config` need it; instead, after every exec -- sandboxed or `--no-sandbox`,
 whatever its exit status, which is kept -- `world exec` compares the effective configuration
-(system, global, local, worktree, includes) of the World and each submodule against a list of
+(system, global, local, worktree, inherited command scope, includes) of the World and each submodule against a list of
 settings that make Git run a command (`core.hooksPath`, `core.fsmonitor`, `core.sshCommand`,
 filters, credential helpers, `!` aliases, ...) and the hooks present, and prints a line per change:
 

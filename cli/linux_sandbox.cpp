@@ -115,3 +115,31 @@ int linux_sandbox_exec(const char *root, const char *store, char *const mounts[]
     ::close(filter);
     return -e;
 }
+
+int linux_sandbox_config_exec(char *const command[]) {
+    if (::syscall(SYS_close_range, 3u, ~0u, CLOSE_RANGE_CLOEXEC)) return -errno;
+    int filter = socket_filter();
+    if (filter < 0) return filter;
+    char fd[32];
+    ::snprintf(fd, sizeof fd, "%d", filter);
+    const char *policy[] = {
+        "/usr/bin/bwrap", "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+        "--unshare-net", "--unshare-cgroup-try", "--die-with-parent", "--new-session",
+        "--disable-userns", "--assert-userns-disabled", "--cap-drop", "ALL",
+        "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+        "--unsetenv", "DBUS_SESSION_BUS_ADDRESS", "--unsetenv", "SSH_AUTH_SOCK",
+        "--seccomp", fd, "--",
+    };
+    size_t n = 0;
+    while (command[n]) ++n;
+    const size_t prefix = sizeof policy / sizeof policy[0];
+    char **args = (char **)::calloc(prefix + n + 1, sizeof(char *));
+    if (!args) { ::close(filter); return -ENOMEM; }
+    for (size_t i = 0; i < prefix; ++i) args[i] = (char *)policy[i];
+    for (size_t i = 0; i < n; ++i) args[prefix + i] = command[i];
+    ::execv(args[0], args);
+    int e = errno;
+    ::free(args);
+    ::close(filter);
+    return -e;
+}

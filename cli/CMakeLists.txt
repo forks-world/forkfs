@@ -32,6 +32,15 @@ endif()
 
 # Git integration is optional for plain directory worlds; its tests require relative worktrees.
 find_package(Git 2.48 QUIET)
+# Pin configuration introspection at build time. Runtime PATH can belong to the command.
+set(WFS_CONFIG_GIT "")
+if(GIT_FOUND AND IS_ABSOLUTE "${GIT_EXECUTABLE}")
+    set(WFS_CONFIG_GIT "${GIT_EXECUTABLE}")
+endif()
+string(REPLACE "\\" "\\\\" WFS_CONFIG_GIT "${WFS_CONFIG_GIT}")
+string(REPLACE "\"" "\\\"" WFS_CONFIG_GIT "${WFS_CONFIG_GIT}")
+configure_file(config_git.h.in config_git.h @ONLY)
+target_include_directories(world PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 if(Python3_Interpreter_FOUND AND GIT_FOUND)
     set(CLI_GIT_TEST_SCRATCH "${CMAKE_CURRENT_BINARY_DIR}/scratch")
     file(MAKE_DIRECTORY "${CLI_GIT_TEST_SCRATCH}")

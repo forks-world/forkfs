@@ -9,11 +9,13 @@
 #include "worldfs/worldfs.h"
 #include "json.h"
 #include "exec_guard.h"
+#include "config_git.h"
 
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <poll.h>
 #include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -2184,19 +2186,30 @@ static void join_lexical(const char *base, const char *rel, char *out, size_t ca
 
 extern char **environ;
 
-// `git config --list` for one repository, as the user's own Git in the World sees it (global,
-// system and GIT_CONFIG_* included), without hooks or fsmonitor and without inheriting a GIT_DIR
-// or index. Returns the NUL-terminated output, or NULL when Git could not produce it.
-static char *git_config_list(const char *root, const char *gitdir, size_t *len) {
+// Read configuration with build-time Git under read-only confinement, never runtime PATH. These
+// config-only queries do not run hooks or fsmonitor: -c overrides would hide inherited
+// command-scope settings. Bound both output and child lifetime (an include can be a FIFO).
+static char *git_config_read(const char *root, const char *gitdir, bool hooks, size_t *len,
+                             int *status) {
+    *status = -1;
+    if (!WFS_CONFIG_GIT[0]) return NULL;
     char gd[WFS_PATH_MAX + 16];
-    const char *argv[] = {"git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-                          "-C", root, "config", "--list", "--includes", "--null", "--show-scope", NULL, NULL};
+    const char *argv[16];
+    size_t arg = 0;
+    argv[arg++] = WFS_CONFIG_GIT;
+    argv[arg++] = "-C";
+    argv[arg++] = root;
     if (gitdir) {
-        // `git --git-dir=<repo> config ...`: the option has to precede the subcommand.
         snprintf(gd, sizeof gd, "--git-dir=%s", gitdir);
-        memmove(argv + 8, argv + 7, 5 * sizeof *argv);
-        argv[7] = gd;
+        argv[arg++] = gd;
     }
+    argv[arg++] = "config";
+    argv[arg++] = "--includes";
+    argv[arg++] = "--null";
+    argv[arg++] = hooks ? "--path" : "--list";
+    argv[arg++] = hooks ? "--get" : "--show-scope";
+    if (hooks) argv[arg++] = "core.hooksPath";
+    argv[arg] = NULL;
     size_t n = 0;
     while (environ[n]) ++n;
     char **env = (char **)calloc(n + 3, sizeof *env);
@@ -2205,43 +2218,106 @@ static char *git_config_list(const char *root, const char *gitdir, size_t *len) 
     for (size_t i = 0; i < n; ++i) {
         const char *e = environ[i];
         if (!strncmp(e, "GIT_", 4) && strncmp(e, "GIT_CONFIG_", 11)) continue;
+        if (!strncmp(e, "LD_", 3) || !strncmp(e, "DYLD_", 5) ||
+            !strncmp(e, "GCONV_PATH=", 11) || !strncmp(e, "GLIBC_TUNABLES=", 15)) continue;
         env[k++] = environ[i];
     }
     env[k++] = (char *)"GIT_OPTIONAL_LOCKS=0";
     env[k++] = (char *)"GIT_TERMINAL_PROMPT=0";
     int fds[2];
     if (pipe(fds)) { free(env); return NULL; }
-    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
-    fcntl(fds[1], F_SETFD, FD_CLOEXEC);
-    posix_spawn_file_actions_t fa;
-    posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
-    posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    bool ready = fcntl(fds[0], F_SETFD, FD_CLOEXEC) == 0 &&
+                 fcntl(fds[1], F_SETFD, FD_CLOEXEC) == 0 &&
+                 fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0;
+    struct timespec start;
+    ready = ready && clock_gettime(CLOCK_MONOTONIC, &start) == 0;
     pid_t pid = 0;
-    int rc = posix_spawnp(&pid, "git", &fa, NULL, (char *const *)argv, env);
-    posix_spawn_file_actions_destroy(&fa);
+    int rc = -1;
+#ifdef __APPLE__
+    // A configured Git may live in a user-writable package prefix. Confine it even though
+    // PATH lookup is gone: no writes, network, or host IPC except account-name resolution.
+    const char *profile = "(version 1)(deny default)"
+        "(allow file-read*)(allow process-exec)(allow process-fork)(allow sysctl-read)"
+        "(allow signal (target same-sandbox))"
+        "(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\"))";
+    const char *sandbox_argv[20] = {"/usr/bin/sandbox-exec", "-p", profile};
+    for (size_t i = 0; i <= arg; ++i) sandbox_argv[i + 3] = argv[i];
+    posix_spawn_file_actions_t fa;
+    posix_spawnattr_t attr;
+    if (ready && posix_spawn_file_actions_init(&fa) == 0) {
+        rc = posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
+        if (!rc) rc = posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+        if (!rc) rc = posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+        if (!rc && posix_spawnattr_init(&attr) == 0) {
+            rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT);
+            if (!rc) rc = posix_spawnattr_setpgroup(&attr, 0);
+            if (!rc) rc = posix_spawn(&pid, "/usr/bin/sandbox-exec", &fa, &attr,
+                                       (char *const *)sandbox_argv, env);
+            posix_spawnattr_destroy(&attr);
+        } else rc = -1;
+        posix_spawn_file_actions_destroy(&fa);
+    }
+#elif defined(__linux__)
+    if (ready) {
+        pid = fork();
+        if (pid == 0) {
+            if (setpgid(0, 0) != 0 || dup2(fds[1], STDOUT_FILENO) < 0) _exit(127);
+            int nullfd = open("/dev/null", O_RDWR);
+            if (nullfd < 0 || dup2(nullfd, STDIN_FILENO) < 0 || dup2(nullfd, STDERR_FILENO) < 0)
+                _exit(127);
+            environ = env;
+            linux_sandbox_config_exec((char *const *)argv);
+            _exit(127);
+        }
+        if (pid > 0) { setpgid(pid, pid); rc = 0; }
+    }
+#endif
     free(env);
     close(fds[1]);
     if (rc) { close(fds[0]); return NULL; }
+    const size_t limit = 64u << 20;
     size_t cap = 1 << 16, at = 0;
     char *buf = (char *)malloc(cap);
-    bool ok = buf != NULL;
-    for (;;) {
-        if (ok && at + 1 == cap) {
-            char *b = cap < (64u << 20) ? (char *)realloc(buf, cap * 2) : NULL;
-            if (b) { buf = b; cap *= 2; } else ok = false;
+    bool ok = buf != NULL, eof = false, reaped = false;
+    int st = 0;
+    while (ok && (!eof || !reaped)) {
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) { ok = false; break; }
+        int64_t elapsed = (now.tv_sec - start.tv_sec) * 1000LL +
+                          (now.tv_nsec - start.tv_nsec) / 1000000;
+        if (elapsed >= 5000) { ok = false; break; }
+        if (!reaped) {
+            pid_t w = waitpid(pid, &st, WNOHANG);
+            if (w == pid) reaped = true;
+            else if (w < 0 && errno != EINTR) { ok = false; break; }
         }
-        char sink[4096];
-        ssize_t r = ok ? read(fds[0], buf + at, cap - at - 1) : read(fds[0], sink, sizeof sink);
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) break;
-        if (ok) at += (size_t)r;
+        if (eof && reaped) break;
+        struct pollfd pfd = {fds[0], POLLIN, 0};
+        int timeout = (int)(5000 - elapsed);
+        if (timeout > 50) timeout = 50;
+        int p = poll(eof ? NULL : &pfd, eof ? 0 : 1, timeout);
+        if (p < 0 && errno != EINTR) { ok = false; break; }
+        if (p <= 0 || eof) continue;
+        if (at + 1 == cap) {
+            if (cap >= limit) { ok = false; break; }
+            char *b = (char *)realloc(buf, cap * 2);
+            if (!b) { ok = false; break; }
+            buf = b; cap *= 2;
+        }
+        ssize_t r = read(fds[0], buf + at, cap - at - 1);
+        if (r > 0) at += (size_t)r;
+        else if (r == 0) eof = true;
+        else if (errno != EINTR && errno != EAGAIN) ok = false;
     }
     close(fds[0]);
-    int st = 0;
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-    if (!ok || !WIFEXITED(st) || WEXITSTATUS(st) != 0) { free(buf); return NULL; }
+    if (!ok) kill(-pid, SIGKILL);
+    if (!reaped) {
+        kill(pid, SIGKILL);
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    }
+    if (!ok || !WIFEXITED(st)) { free(buf); return NULL; }
+    *status = WEXITSTATUS(st);
+    if (*status != 0) { free(buf); return NULL; }
     buf[at] = 0;
     *len = at;
     return buf;
@@ -2284,16 +2360,14 @@ static void capture_pointer(const GitAdmin *a, const char *path, const char *bas
     gs_add(s, id, val);
 }
 
-// Where a core.hooksPath value sends Git: `~/` is the home directory, and a relative value is
+// Where Git's expanded core.hooksPath sends it: a relative value is
 // resolved from the repository's checkout, as Git does. A directory inside the World's tree is
 // project content (husky's .husky): tracked, visible in `git status` and the World's diff, so
 // it is neither denied nor reported. One outside the tree, or inside .world-git, is guarded.
 static void note_hooks_path(const GitAdmin *a, const char *checkout, const char *v, char *out, size_t cap) {
     out[0] = 0;
     char p[2 * WFS_PATH_MAX], real[WFS_PATH_MAX];
-    const char *home = getenv("HOME");
-    if (!strncmp(v, "~/", 2) && home && *home) snprintf(p, sizeof p, "%s/%s", home, v + 2);
-    else if (v[0] == '/') snprintf(p, sizeof p, "%s", v);
+    if (v[0] == '/') snprintf(p, sizeof p, "%s", v);
     else snprintf(p, sizeof p, "%s/%s", checkout, v);
     if (!*v || !resolve_into(p, real, sizeof real)) join_lexical("/", p, real, sizeof real);
     if (!strcmp(real, "/dev/null")) return;
@@ -2315,10 +2389,10 @@ static void note_hooks_path(const GitAdmin *a, const char *checkout, const char 
 // (hooks_paths) and the before/after report.
 static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, const char *label, GuardSet *s) {
     size_t len = 0;
-    char *out = git_config_list(a->root, gitdir, &len);
+    int status = -1;
+    char *out = git_config_read(a->root, gitdir, false, &len, &status);
     if (!out) return false;
     char checkout[WFS_PATH_MAX], hooks_path[WFS_PATH_MAX] = "";
-    const char *hooks_value = NULL;
     snprintf(checkout, sizeof checkout, "%s", *label ? "" : a->root);
     for (size_t i = 0; i < len;) {
         const char *scope = out + i;
@@ -2329,10 +2403,8 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
         char *nl = strchr(key, '\n');
         const char *val = "";
         if (nl) { *nl = 0; val = nl + 1; }
-        if (!strcmp(scope, "command")) continue;  // WorldFS's own -c: nothing a command can persist
         if (*label && !strcmp(scope, "local") && !strcmp(key, "core.worktree"))
             join_lexical(gitdir, val, checkout, sizeof checkout);
-        if (!strcmp(key, "core.hookspath")) hooks_value = val;  // the last one wins
         if (!guard_key_runs_command(key, val)) continue;
         size_t idn = strlen(label) + strlen(scope) + strlen(key) + 8;
         char *id = (char *)malloc(idn);
@@ -2341,9 +2413,18 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
         gs_add(s, id, val);
         free(id);
     }
-    // Without a recorded checkout, a relative value is resolved from the repository itself.
-    if (hooks_value) note_hooks_path(a, checkout[0] ? checkout : gitdir, hooks_value, hooks_path, sizeof hooks_path);
     free(out);
+    // Let Git expand ~user and %(prefix), and select the effective value in every scope.
+    // Exit 1 means no value; a parse, expansion or capture failure must invalidate capture.
+    char *hooks_value = git_config_read(a->root, gitdir, true, &len, &status);
+    if (!hooks_value && status != 1) return false;
+    if (hooks_value) {
+        if (!len || hooks_value[len - 1] != 0 || strlen(hooks_value) + 1 != len) {
+            free(hooks_value); return false;
+        }
+        note_hooks_path(a, checkout[0] ? checkout : gitdir, hooks_value, hooks_path, sizeof hooks_path);
+        free(hooks_value);
+    }
     char p[WFS_PATH_MAX + 16];
     snprintf(p, sizeof p, "%s/hooks", common);
     capture_hooks(a, p, s);

@@ -270,7 +270,7 @@ status, which `world exec` keeps). Before the command starts, exec captures each
 the sandbox rules above:
 
 - its effective configuration, `git config --list --includes --show-scope` read through its
-  own administration: system, global, local, worktree and included files -- the sandbox does
+  own administration: system, global, local, worktree, inherited command scope and included files -- the sandbox does
   not stop writes to `~/.gitconfig`, and `--no-sandbox` stops nothing. Every scope is kept
   per repository, since an `includeIf "gitdir:..."` or `"onbranch:..."` can give one
   submodule settings the World does not have; a change to a global or system entry that is
@@ -307,10 +307,17 @@ starts with `!`, `pager.*`, `interactive.difffilter`, `web.browser`, `browser.*.
 `man.*.cmd|path`, `init.templatedir`, `hook.*.command`, `trailer.*.command|cmd`,
 `protocol.allow` and `protocol.*.allow` (which can enable `ext::` URLs), and
 `lfs.*.path|clean|smudge` (custom transfer agents and extensions). The list is
-`kGuardKeys` in `cli/exec_guard.h`. This costs one `git config --list` per repository before
-and after; no tree is walked. If the configuration cannot be read (no `git` on `PATH`, a
-malformed file), exec says so in one `note:` line and reports nothing; a World without
-`.world-git` gets neither the rules nor the report.
+`kGuardKeys` in `cli/exec_guard.h`. Each repository is read before and after with two
+configuration queries: a listing and `--path --get core.hooksPath`, so Git expands `~user`
+and selects the effective hooks path. Both use the absolute Git 2.48+ path
+selected by CMake at build time, unaffected by runtime `PATH`, and do not execute hooks or
+fsmonitor. Configuration introspection runs under a separate read-only sandbox: Seatbelt on
+macOS, or Bubblewrap with network and process isolation on Linux. It cannot write files or
+access the network; account lookup on macOS is allowed for `~user` expansion. Each query has
+a five-second deadline and a 64 MiB output limit; no tree is walked. If configuration cannot
+be read (missing configured Git or sandbox, a malformed file, or a query exceeding these
+limits), exec says so in one `note:` line and reports nothing;
+a World without `.world-git` gets neither the rules nor the report.
 
 The exec sandbox is not a general confinement: it keeps the command away from the store and
 from other Worlds, and from the hooks above. `~/.gitconfig`, `~/.ssh`, shell startup files and

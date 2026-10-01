@@ -4589,6 +4589,74 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'world: WARNING: exec removed .git, which told Git where a repository is\n', p.stderr)
         (one / '.git.saved').rename(one / '.git')
 
+    def test_exec_config_capture_ignores_writable_path_git(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        wrapper = one / 'bin'
+        wrapper.mkdir()
+        marker = one / 'untrusted-git-ran'
+        fake = wrapper / 'git'
+        payload = '#!/bin/sh\necho ran >> ' + shlex.quote(str(marker)) + '\nexit 99\n'
+        fake.write_text(payload)
+        fake.chmod(0o755)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        self.exec_sh(wid, ':', '--no-sandbox')
+        self.assertFalse(marker.exists())
+        # The command can install the executable after the initial capture too.
+        fake.unlink()
+        script = 'printf %s ' + shlex.quote(payload) + ' > bin/git && chmod +x bin/git'
+        self.exec_sh(wid, script, '--no-sandbox')
+        self.assertFalse(marker.exists())
+
+    def test_exec_config_fifo_include_has_bounded_capture(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        fifo = one / 'blocked-config'
+        os.mkfifo(fifo)
+        script = '/usr/bin/git config include.path ' + shlex.quote(str(fifo)) + '; exit 7'
+        p = subprocess.run((WORLD, 'exec', wid, '--no-sandbox', '--', '/bin/sh', '-c', script),
+                           env=self.env, capture_output=True, timeout=15)
+        self.assertEqual(p.returncode, 7, p.stderr)
+        self.assertIn(b'Git configuration after the command', p.stderr)
+        # A blocked initial capture also returns, without suppressing the requested command.
+        p = subprocess.run((WORLD, 'exec', wid, '--no-sandbox', '--', '/bin/sh', '-c', 'exit 9'),
+                           env=self.env, capture_output=True, timeout=15)
+        self.assertEqual(p.returncode, 9, p.stderr)
+        self.assertIn(b'could not read', p.stderr)
+
+    def test_exec_config_inherited_command_scope_and_expanded_hooks(self):
+        import pwd
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        shared = self.root / 'command-hooks'
+        shared.mkdir()
+        user = pwd.getpwuid(os.getuid())
+        hook_value = '~' + user.pw_name + '/' + os.path.relpath(shared, user.pw_dir)
+        self.env.update(GIT_CONFIG_COUNT='4', GIT_CONFIG_KEY_2='core.hooksPath',
+                        GIT_CONFIG_VALUE_2=hook_value, GIT_CONFIG_KEY_3='include.path',
+                        GIT_CONFIG_VALUE_3=str(one / 'command-config'))
+        included = one / 'command-config'
+        included.write_text('[alias]\n x = !before\n')
+        hook = shared / 'pre-commit'
+        hook.write_text('original\n')
+        self.assert_denied(wid, 'echo changed > ' + shlex.quote(str(hook)))
+        self.assertEqual(hook.read_text(), 'original\n')
+        p = self.exec_sh(wid, "printf '[alias]\\n x = !after\\n' > command-config", '--no-sandbox')
+        self.assertIn(b'command alias.x: !before -> !after', p.stderr)
+        p = self.exec_sh(wid, 'echo changed > ' + shlex.quote(str(hook)), '--no-sandbox')
+        self.assertIn(b'exec changed a Git hook:', p.stderr)
+        # Global/local config and inherited command settings remain observable without
+        # executing any hook or fsmonitor during either read-only capture.
+        marker = one / 'config-command-ran'
+        executable = shared / 'fsmonitor'
+        executable.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(marker)) + '\n')
+        executable.chmod(0o755)
+        hook.write_text(executable.read_text())
+        hook.chmod(0o755)
+        self.git(one, 'config', 'core.fsmonitor', str(executable))
+        self.exec_sh(wid, ':', '--no-sandbox')
+        self.assertFalse(marker.exists())
+
     def test_exec_in_a_plain_world_says_nothing_about_git(self):
         plain = self.root / 'plain'
         plain.mkdir()
