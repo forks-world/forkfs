@@ -58,7 +58,7 @@ int main() {
 
     // Keys that make Git run a command.
     const char *runs[] = {
-        "receive.autogc", "maintenance.auto", "maintenance.strategy", "gc.auto", "gc.autopacklimit",
+        "receive.autogc", "maintenance.auto", "maintenance.strategy", "maintenance.repo", "gc.auto", "gc.autopacklimit",
         "maintenance.gc.enabled", "maintenance.prefetch.enabled", "maintenance.prefetch.schedule",
         "MAINTENANCE.gc.ENABLED", "Maintenance.prefetch.Schedule",
         "remote.origin.partialclonefilter", "extensions.partialclone",
@@ -154,7 +154,7 @@ int main() {
 
     // Keys that legitimately change during agent work, or only name things.
     const char *quiet[] = {
-        "receive.custom.autogc", "maintenance.custom.auto", "maintenance.custom.strategy",
+        "receive.custom.autogc", "maintenance.custom.auto", "maintenance.custom.strategy", "maintenance.custom.repo",
         "gc.custom.auto", "gc.custom.autopacklimit", "maintenance.GC.enabled", "maintenance.Prefetch.enabled",
         "maintenance.gc.schedule", "maintenance.commit-graph.enabled", "maintenance.repack.enabled",
         "maintenance.team.prefetch.enabled", "maintenance.enabled",

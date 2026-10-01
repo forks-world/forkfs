@@ -337,6 +337,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `uploadpack.packobjectshook`, `receive.procreceiverefs` (activates the configured proc-receive hook),
 `receive.denycurrentbranch` (can enable the existing push-to-checkout hook),
 `receive.autogc`, `maintenance.auto`, `gc.auto`, `gc.autopacklimit`, `maintenance.strategy`,
+`maintenance.repo` (registers repositories for an existing maintenance scheduler),
 `maintenance.gc.enabled`, `maintenance.prefetch.enabled|schedule`
 (can activate existing maintenance hooks or remote helpers; task names are exact),
 `sendemail.identity` (selects configured mail commands),

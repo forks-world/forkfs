@@ -4784,6 +4784,26 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'Git hooks and settings uninspected after the command', p.stderr)
         self.assertIn(b'64 MiB capture budget', p.stderr)
 
+    def test_exec_reports_global_maintenance_registration(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'remote.dormant.url', 'ext::touch scheduled-helper-ran')
+        self.git(one, 'config', 'maintenance.prefetch.enabled', 'true')
+        self.git(one, 'config', 'maintenance.prefetch.schedule', 'hourly')
+        home = self.root / 'maintenance-home'
+        home.mkdir()
+        self.env['HOME'] = str(home)
+        self.env['GIT_CONFIG_GLOBAL'] = str(home / '.gitconfig')
+        p = self.exec_sh(wid, 'git config --global --add maintenance.repo ' + shlex.quote(str(one)) +
+                         '; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'global maintenance.repo: (unset) -> ' + str(one).encode(), p.stderr)
+        self.assertNotIn(b'local maintenance.prefetch.enabled:', p.stderr)
+        self.assertNotIn(b'local maintenance.prefetch.schedule:', p.stderr)
+        self.assertNotIn(b'local remote.dormant.url:', p.stderr)
+        self.assertEqual(self.git(one, 'config', '--global', '--get-all', 'maintenance.repo').stdout.strip(),
+                         str(one).encode())
+        self.assertFalse((one / 'scheduled-helper-ran').exists())
+
     def test_exec_reports_activating_maintenance_commands(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
