@@ -259,8 +259,8 @@ So `world exec` does two things.
 A tool that installs hooks (`git lfs install`, `pre-commit install`, `husky` writing to the
 default hooks directory) fails inside a sandboxed exec for the same reason; run it outside.
 A repository-local `core.hooksPath` pointing into the tree (husky's `.husky`) is **not**
-denied: it is project content, tracked by Git, and a change to it shows in `git status` and in
-the diff you review before you merge. Git's configuration (`config`, `config.worktree`) is
+denied: project hooks remain editable. Their changes are reported even when ignored or
+untracked, since Git status and the review diff may hide them. Git's configuration (`config`, `config.worktree`) is
 not denied either: `git remote add`, `git push -u`, `git branch --set-upstream-to` and
 `git config` legitimately write it. Hence the second part.
 
@@ -295,7 +295,8 @@ observational reporting so a command can repair them.
   repository; `GIT_ATTR_NOSYSTEM` is honored and an effective `/dev/null` source is disabled.
   Shared paths are captured and reported once;
 - the hooks Git could run: name, mode and content of every non-`.sample` entry of its hooks
-  directory and of its effective `core.hooksPath` when that is guarded;
+  directory and of every effective `core.hooksPath`, including paths inside the project tree.
+  Shared hook directories are captured once;
 - the entries that tell Git where it is -- the World's `.git` and `commondir`, each
   submodule checkout's `.git` -- by entry type (file, directory, symlink, missing) and
   content, and whether a file still names its own repository.
@@ -327,6 +328,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `pretty.*`, `format.commitlistformat`, `format.coverletter` (can activate signature verification),
 `branch.sort` and `tag.sort` when selecting a `signature` atom (ordinary name/version sorts stay quiet),
 `gpg.format` (selects the signing program), `gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
+`remote.*.skipdefaultupdate|skipfetchall`, `fetch.all`, `remotes.*` (can activate unchanged remote helpers),
 `remote.*.uploadpack|receivepack|vcs`, `branch.*.mergeoptions`, `pull.twohead`, `pull.octopus` (can select external merge strategies),
 `branch.*.remote|pushremote`, `remote.pushdefault` (can select preconfigured helper remotes),
 `uploadpack.packobjectshook`, `receive.procreceiverefs` (activates the configured proc-receive hook),
@@ -390,9 +392,10 @@ when the exec starts, and the directories on the way to them are bound onto them
 cannot be renamed. Duplicate paths keep the read-only policy, and descendant locator binds
 never reopen a read-only hooks path; a submodule first initialized during the exec gets writable hooks there,
 which the report then lists. What neither platform stops, and the report does not cover: a
-change to project content that runs code (a `Makefile`, `package.json` scripts, `.husky`,
-`.envrc`) -- review the World's diff before running it. Effective Git attributes files are
-an exception: their contents are reported even when the configured path is inside the World.
+change to other project content that runs code (a `Makefile`, `package.json` scripts,
+`.envrc`) -- review the World's diff before running it. Effective Git attributes files and
+hook directories are exceptions: their contents are reported even when the configured path
+is inside the World, including ignored files.
 This does not scan the project tree for `.gitattributes` files.
 
 ## Git LFS

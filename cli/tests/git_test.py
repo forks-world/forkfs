@@ -4526,14 +4526,14 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'local alias.x: (unset) -> !sh -c evil\n', p.stderr)
         self.assertIn(b'local alias.co: (unset) -> checkout', p.stderr)
         # A core.hooksPath outside the tree is guarded like the hooks directory; one inside the
-        # tree (husky's .husky) is project content that `git status` shows, and stays writable.
+        # tree (husky's .husky) stays writable, but its changes are still reported.
         shared = self.root / 'shared-hooks'
         shared.mkdir()
         self.git(one, 'config', 'core.hooksPath', str(shared))
         self.assert_denied(wid, 'echo evil > ' + shlex.quote(str(shared / 'pre-commit')))
         self.git(one, 'config', 'core.hooksPath', '.husky')
         p = self.exec_sh(wid, 'mkdir -p .husky && echo lint > .husky/pre-commit', '--require-sandbox')
-        self.assertNotIn(b'WARNING', p.stderr)
+        self.assertIn(b'exec added a Git hook: .husky/pre-commit', p.stderr)
         self.git(one, 'config', '--unset', 'core.hooksPath')
         # A World path with regex metacharacters still matches only itself.
         odd, oid = self.fork('w.i+r(d)[x]{2}$^|?*')
@@ -5009,6 +5009,48 @@ class GitWorldTest(unittest.TestCase):
         self.assertNotIn(b'\x1f', p.stderr)
         self.assertFalse((one / 'libs/one/helper-ran').exists())
         self.assertFalse((one / 'libs/two/helper-ran').exists())
+
+    def test_exec_reports_enabling_skipped_remotes(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'remote.dormant.url', 'ext::touch skipped-helper-ran')
+        for key in ('remote.dormant.skipDefaultUpdate', 'remote.dormant.skipFetchAll'):
+            self.git(one, 'config', key, 'true')
+        p = self.exec_sh(wid, 'git config remote.dormant.skipDefaultUpdate false && '
+                         'git config remote.dormant.skipFetchAll false && '
+                         'git config fetch.all true && git config remotes.default dormant; exit 7',
+                         '--no-sandbox', code=7)
+        for key in (b'remote.dormant.skipdefaultupdate', b'remote.dormant.skipfetchall'):
+            self.assertIn(b'local ' + key + b': true -> false', p.stderr)
+        self.assertIn(b'local fetch.all: (unset) -> true', p.stderr)
+        self.assertIn(b'local remotes.default: (unset) -> dormant', p.stderr)
+        self.assertNotIn(b'local remote.dormant.url:', p.stderr)
+        self.assertFalse((one / 'skipped-helper-ran').exists())
+
+    def test_exec_reports_ignored_in_tree_hooks(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'core.hooksPath', '.hidden-hooks')
+        (one / '.gitignore').write_text('.hidden-hooks/\n')
+        self.assertFalse((one / '.hidden-hooks').exists())
+        p = self.exec_sh(wid, "mkdir .hidden-hooks && printf '#!/bin/sh\\ntouch hook-ran\\n' "
+                         "> .hidden-hooks/pre-commit && chmod +x .hidden-hooks/pre-commit; exit 7",
+                         '--require-sandbox', code=7)
+        self.assertIn(b'exec added a Git hook: .hidden-hooks/pre-commit', p.stderr)
+        self.assertNotIn(b'.hidden-hooks', self.git(one, 'status', '--porcelain').stdout)
+        p = self.exec_sh(wid, 'echo changed >> .hidden-hooks/pre-commit', '--require-sandbox')
+        self.assertIn(b'exec changed a Git hook: .hidden-hooks/pre-commit', p.stderr)
+        p = self.exec_sh(wid, 'rm .hidden-hooks/pre-commit', '--require-sandbox')
+        self.assertIn(b'exec removed a Git hook: .hidden-hooks/pre-commit', p.stderr)
+        self.assertFalse((one / 'hook-ran').exists())
+        tracked = one / '.tracked-hooks'
+        tracked.mkdir()
+        (tracked / 'pre-commit').write_text('#!/bin/sh\ntouch hook-ran\n')
+        self.git(one, 'add', '.tracked-hooks/pre-commit')
+        self.git(one, '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'tracked hook')
+        self.git(one, 'config', 'core.hooksPath', '.tracked-hooks')
+        p = self.exec_sh(wid, 'echo changed >> .tracked-hooks/pre-commit', '--require-sandbox')
+        self.assertIn(b'exec changed a Git hook: .tracked-hooks/pre-commit', p.stderr)
 
     def test_exec_reports_remote_and_merge_strategy_selectors(self):
         self.world('init', str(self.source))
@@ -6051,11 +6093,11 @@ class GitWorldTest(unittest.TestCase):
         p = self.exec_sh(wid, 'echo evil > ' + shlex.quote(str(shared / 'post-checkout')), '--no-sandbox')
         self.assertIn(('world: WARNING: exec added a Git hook: %s\n' % (shared / 'post-checkout')).encode(), p.stderr)
         # A relative value is resolved from the submodule's checkout: inside the tree it is the
-        # submodule's project content, not guarded.
+        # submodule's project content: writable, but observed.
         self.git(one / 'libs/lib', 'config', 'core.hooksPath', 'githooks')
         p = self.exec_sh(wid, 'mkdir -p libs/lib/githooks && echo lint > libs/lib/githooks/pre-commit',
                          '--require-sandbox')
-        self.assertNotIn(b'WARNING', p.stderr)
+        self.assertIn(b'exec added a Git hook: libs/lib/githooks/pre-commit', p.stderr)
 
     def test_exec_refuses_preexisting_submodule_pointer_redirection(self):
         self.submodule_fixture()

@@ -98,6 +98,8 @@ static const GuardKey kGuardKeys[] = {
     {"format", "commitlistformat", 0, false}, {"format", "coverletter", 0, false},
     {"format", "pretty", 0, false},       {"pretty", NULL, 2, false},
     {"gpg", "defaultkeycommand", 2, false}, {"gc", "recentobjectshook", 0, false},
+    {"fetch", "all", 0, false},          {"remotes", NULL, 2, false},
+    {"remote", "skipdefaultupdate", 1, false}, {"remote", "skipfetchall", 1, false},
     {"remote", "url", 1, false},          {"remote", "pushurl", 1, false},
     {"url", "insteadof", 1, false},       {"url", "pushinsteadof", 1, false},
     {"remote", "uploadpack", 1, false},   {"remote", "receivepack", 1, false},

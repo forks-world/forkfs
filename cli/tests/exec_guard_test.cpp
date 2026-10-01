@@ -70,6 +70,8 @@ int main() {
         "log.showsignature", "merge.verifysignatures", "format.pretty", "pretty.signature", "pretty.team.signature",
         "commit.gpgsign", "tag.gpgsign", "tag.forcesignannotated", "push.gpgsign", "gpg.format",
         "gpg.program", "gpg.ssh.program", "gpg.ssh.defaultkeycommand", "remote.origin.uploadpack",
+        "fetch.all", "remotes.default", "remotes.team.group",
+        "remote.origin.skipdefaultupdate", "remote.origin.skipfetchall", "remote.team.origin.skipfetchall",
         "pull.twohead", "pull.octopus", "receive.procreceiverefs", "branch.main.mergeoptions", "branch.main.remote", "branch.main.pushremote", "remote.pushdefault",
         "branch.topic.with.dots.mergeoptions", "remote.origin.receivepack", "remote.origin.vcs", "uploadpack.packobjectshook",
         "sendemail.tocmd", "sendemail.work.sendmailcmd", "sendemail.smtpserver", "include.path",
@@ -141,6 +143,8 @@ int main() {
 
     // Keys that legitimately change during agent work, or only name things.
     const char *quiet[] = {
+        "fetch.custom.all", "remotes",
+        "remote.skipdefaultupdate", "remote.skipfetchall", "remote.origin.skipfetch",
         "user.email", "user.name", "remote.origin.fetch", "remote.origin.name", "url.insteadof", "url.pushinsteadof",
         "pull.custom.twohead", "pull.custom.octopus", "receive.custom.procreceiverefs", "receive.advertisepushoptions", "branch.remote", "branch.pushremote", "branch.mergeoptions", "remote.origin.pushdefault",
         "branch.main.merge", "core.bare", "tar.command", "tar.custom.remote",

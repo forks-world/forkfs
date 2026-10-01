@@ -2110,7 +2110,7 @@ static void git_admin_free(GitAdmin *a) { sl_free(&a->gitdirs); sl_free(&a->pins
 // that tells Git where a repository is.
 
 struct GuardRec { char *id; char *val; size_t seq; };
-struct GuardSet { GuardRec *v; size_t n, cap, bytes_left, entries; StrList attributes; const char *error; };
+struct GuardSet { GuardRec *v; size_t n, cap, bytes_left, entries; StrList attributes, hooks; const char *error; };
 
 static void gs_add(GuardSet *s, const char *id, const char *val) {
     if (s->error) return;
@@ -2130,6 +2130,7 @@ static void gs_free(GuardSet *s) {
     for (size_t i = 0; i < s->n; ++i) { free(s->v[i].id); free(s->v[i].val); }
     free(s->v);
     sl_free(&s->attributes);
+    sl_free(&s->hooks);
     memset(s, 0, sizeof *s);
 }
 
@@ -2219,6 +2220,9 @@ static const char *rel_to(const GitAdmin *a, const char *path) {
 // never runs (and which a fresh submodule clone creates).
 static void capture_hooks(const GitAdmin *a, const char *dir, GuardSet *s) {
     if (s->error) return;
+    for (size_t i = 0; i < s->hooks.n; ++i)
+        if (!strcmp(s->hooks.v[i], dir)) return;
+    if (!sl_push(&s->hooks, dir)) { s->error = "out of memory"; return; }
     struct stat directory;
     if (lstat(dir, &directory) != 0) {
         if (errno != ENOENT && errno != ENOTDIR) s->error = "could not inspect Git hooks directory";
@@ -2561,11 +2565,12 @@ static void capture_pointer(const GitAdmin *a, const char *path, const char *bas
 }
 
 // Where Git's expanded core.hooksPath sends it: a relative value is
-// resolved from the repository's checkout, as Git does. A directory inside the World's tree is
-// project content (husky's .husky): tracked, visible in `git status` and the World's diff, so
-// it is neither denied nor reported. One outside the tree, or inside .world-git, is guarded.
-static bool note_hooks_path(const GitAdmin *a, const char *checkout, const char *v, char *out, size_t cap) {
+// resolved from the repository's checkout, as Git does. Every effective directory is
+// reported, including ignored project content. Only paths outside the tree or inside
+// .world-git receive readonly protection; project hooks stay editable.
+static bool note_hooks_path(const GitAdmin *a, const char *checkout, const char *v, char *out, size_t cap, bool *protect) {
     out[0] = 0;
+    *protect = false;
     char p[2 * WFS_PATH_MAX], real[WFS_PATH_MAX];
     int npath = v[0] == '/' ? snprintf(p, sizeof p, "%s", v) :
                              snprintf(p, sizeof p, "%s/%s", checkout, v);
@@ -2586,7 +2591,8 @@ static bool note_hooks_path(const GitAdmin *a, const char *checkout, const char 
     size_t n = strlen(a->root), m = strlen(admin);
     bool in_tree = !strncmp(real, a->root, n) && (real[n] == '/' || !real[n]);
     bool in_admin = !strncmp(real, admin, m) && (real[m] == '/' || !real[m]);
-    if ((!in_tree || in_admin) && (size_t)snprintf(out, cap, "%s", real) >= cap) return false;
+    *protect = !in_tree || in_admin;
+    if ((size_t)snprintf(out, cap, "%s", real) >= cap) return false;
     return true;
 }
 
@@ -2604,6 +2610,7 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
     char *out = git_guard_read(a->root, gitdir, NULL, GG_LIST, &len, &status);
     if (!out) return false;
     char checkout[WFS_PATH_MAX], hooks_path[WFS_PATH_MAX] = "";
+    bool protect_hooks = false;
     snprintf(checkout, sizeof checkout, "%s", *label ? "" : a->root);
     for (size_t i = 0; i < len;) {
         const char *scope = out + i;
@@ -2658,7 +2665,7 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
         if (!len || hooks_value[len - 1] != 0 || strlen(hooks_value) + 1 != len) {
             free(hooks_value); return false;
         }
-        bool resolved = note_hooks_path(a, checkout[0] ? checkout : gitdir, hooks_value, hooks_path, sizeof hooks_path);
+        bool resolved = note_hooks_path(a, checkout[0] ? checkout : gitdir, hooks_value, hooks_path, sizeof hooks_path, &protect_hooks);
         free(hooks_value);
         if (!resolved) { s->error = "could not resolve Git hooks path"; return false; }
     }
@@ -2692,7 +2699,7 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
     if (s->error) return false;
     if (hooks_path[0]) {
         capture_hooks(a, hooks_path, s);
-        if (!sl_push(&a->hooks_paths, hooks_path)) s->error = "out of memory";
+        if (protect_hooks && !sl_push(&a->hooks_paths, hooks_path)) s->error = "out of memory";
     }
     // Always retain the World's entry point even when core.worktree redirects its checkout.
     if (!*label && strcmp(checkout, a->root)) {
