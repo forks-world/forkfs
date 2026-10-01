@@ -296,7 +296,7 @@ world: WARNING: exec removed libs/lib/.git, which told Git where a repository is
 
 The settings watched (Git's lowercase key names; `*` is any subsection): `core.hookspath`,
 `core.worktree` (checkout and relative-hook redirection), `core.fsmonitor`, `core.sshcommand`, `core.editor`, `core.pager`, `core.askpass`,
-`core.gitproxy`, `core.alternaterefscommand`, `sequence.editor`, `credential.helper` and
+`core.attributesfile` (can activate configured filters), `core.gitproxy`, `core.alternaterefscommand`, `sequence.editor`, `credential.helper` and
 `credential.*.helper`, `filter.*.clean|smudge|process`, `diff.external`,
 `diff.*.command|textconv`, `merge.*.driver`, `mergetool.*.cmd|path`, `difftool.*.cmd|path`,
 `gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
@@ -306,7 +306,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 starts with `!`, `pager.*`, `interactive.difffilter`, `web.browser`, `browser.*.cmd|path`, `instaweb.httpd`, `guitool.*.cmd`, `imap.tunnel`,
 `man.*.cmd|path`, `init.templatedir`, `hook.*.command`, `trailer.*.command|cmd`, `tar.*.command`,
 `protocol.allow` and `protocol.*.allow` (which can enable `ext::` URLs), and
-`lfs.*.path|clean|smudge` (custom transfer agents and extensions). Remote `url`/`pushurl`
+`lfs.*.path|clean|smudge` (custom transfer agents and extensions). Remote `url`/`pushurl` and submodule `url`
 changes are also reported when the value selects a transport helper (`ext::...`, `custom://...`).
 For `url.<target>.insteadOf`/`pushInsteadOf`, the target in the key is checked, not the rewrite
 prefix in the value. Ordinary URLs using exact lowercase `file`, `git`, `ssh`, `git+ssh`,

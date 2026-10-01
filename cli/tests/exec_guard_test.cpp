@@ -35,7 +35,7 @@ int main() {
 
     // Keys that make Git run a command.
     const char *runs[] = {
-        "core.worktree", "tar.tar.gz.command", "tar.custom.command", "gc.recentobjectshook",
+        "core.attributesfile", "core.worktree", "tar.tar.gz.command", "tar.custom.command", "gc.recentobjectshook",
         "core.hookspath", "core.fsmonitor", "core.sshcommand", "core.editor", "core.pager",
         "core.askpass", "core.gitproxy", "core.alternaterefscommand", "sequence.editor",
         "credential.helper", "credential.https://example.com.helper", "filter.lfs.clean",
@@ -69,6 +69,7 @@ int main() {
     for (const char *url : helpers) {
         CHECK(guard_key_runs_command("remote.origin.url", url));
         CHECK(guard_key_runs_command("remote.origin.pushurl", url));
+        CHECK(guard_key_runs_command("submodule.library.url", url));
         char key[256];
         snprintf(key, sizeof key, "url.%s.insteadOf", url);
         CHECK(guard_key_runs_command(key, "https://example.com/"));
@@ -82,10 +83,13 @@ int main() {
     for (const char *url : ordinary) {
         CHECK(!guard_key_runs_command("remote.origin.url", url));
         CHECK(!guard_key_runs_command("remote.origin.pushurl", url));
+        CHECK(!guard_key_runs_command("submodule.library.url", url));
         char key[256];
         snprintf(key, sizeof key, "url.%s.insteadof", url);
         CHECK(!guard_key_runs_command(key, "ext::value-is-not-the-target"));
     }
+    CHECK(!guard_key_runs_command("submodule.url", "ext::evil"));
+    CHECK(!guard_key_runs_command("submodule.library.url", NULL));
     CHECK(!guard_key_runs_command("remote.url", "ext::evil"));
     CHECK(!guard_key_runs_command("remote.origin.url", NULL));
 
@@ -93,7 +97,7 @@ int main() {
     const char *quiet[] = {
         "user.email", "user.name", "remote.origin.url", "remote.origin.fetch",
         "branch.main.remote", "branch.main.merge", "core.bare", "tar.command", "tar.custom.remote",
-        "gc.custom.recentobjectshook", "gc.pruneexpire", "core.editorx", "filter.clean", "diff.command", "merge.driver", "core.x.hookspath",
+        "gc.custom.recentobjectshook", "gc.pruneexpire", "core.editorx", "core.custom.attributesfile", "filter.clean", "diff.command", "merge.driver", "core.x.hookspath",
         "include.x.path", "includeif.path", "hook.command", "remote.uploadpack", "merge.tool",
         "imap.host", "imap.custom.tunnel", "instaweb.port", "instaweb.custom.httpd", "guitool.cmd", "guitool.test.title",
         "credential.username", "gpg.format", "init.defaultbranch", "", ".", "core.", "nodot",

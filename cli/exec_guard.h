@@ -36,6 +36,7 @@ struct GuardKey {
 };
 
 static const GuardKey kGuardKeys[] = {
+    {"core", "attributesfile", 0, false},
     {"core", "worktree", 0, false},       {"tar", "command", 1, false},
     {"core", "hookspath", 0, false},      {"core", "fsmonitor", 0, false},
     {"core", "sshcommand", 0, false},     {"core", "editor", 0, false},
@@ -97,6 +98,8 @@ static inline bool guard_key_runs_command(const char *key, const char *value) {
     const char *name = last + 1;
     if (has_sub && section == 6 && !strncasecmp(key, "remote", section) &&
         (!strcasecmp(name, "url") || !strcasecmp(name, "pushurl")))
+        return value && guard_helper_url(value, strlen(value));
+    if (has_sub && section == 9 && !strncasecmp(key, "submodule", section) && !strcasecmp(name, "url"))
         return value && guard_helper_url(value, strlen(value));
     if (has_sub && section == 3 && !strncasecmp(key, "url", section) &&
         (!strcasecmp(name, "insteadof") || !strcasecmp(name, "pushinsteadof")))

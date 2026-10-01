@@ -4690,14 +4690,26 @@ class GitWorldTest(unittest.TestCase):
         p = self.exec_sh(wid, "git config alias.probe '-c core.sshCommand=./payload ls-remote origin' && "
                          "git config remote.agent.url 'ext::sh -c evil' && "
                          "git config remote.agent.pushurl 'custom://repository' && "
+                         "git config submodule.agent.url 'ext::sh -c evil' && "
                          "git config 'url.ext::sh -c evil.insteadOf' 'https://example.com/' && "
                          "git config 'url.custom://repository.pushInsteadOf' 'work:'", '--no-sandbox')
-        for key in (b'alias.probe', b'remote.agent.url', b'remote.agent.pushurl',
+        for key in (b'alias.probe', b'remote.agent.url', b'remote.agent.pushurl', b'submodule.agent.url',
                     b'url.ext::sh -c evil.insteadof', b'url.custom://repository.pushinsteadof'):
             self.assertIn(b'local ' + key + b': (unset) -> ', p.stderr)
         p = self.exec_sh(wid, "git config remote.ordinary.url 'https://example.org/repo' && "
-                         "git config remote.ordinary.pushurl 'git@example.org:repo'", '--no-sandbox')
+                         "git config remote.ordinary.pushurl 'git@example.org:repo' && "
+                         "git config submodule.ordinary.url 'https://example.org/library'", '--no-sandbox')
         self.assertNotIn(b'WARNING', p.stderr)
+
+    def test_exec_reports_attributes_file_activating_existing_filter(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'filter.hidden.clean', 'touch filter-ran; cat')
+        attributes = one / '.world-git/hidden-attributes'
+        attributes.write_text('* filter=hidden\n')
+        p = self.exec_sh(wid, 'git config core.attributesFile ' + shlex.quote(str(attributes)), '--no-sandbox')
+        self.assertIn(b'local core.attributesfile: (unset) -> ' + str(attributes).encode(), p.stderr)
+        self.assertFalse((one / 'filter-ran').exists())
 
     def test_exec_reports_disappearing_git_administration(self):
         self.world('init', str(self.source))
