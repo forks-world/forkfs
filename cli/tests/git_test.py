@@ -4770,6 +4770,45 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'local core.attributesfile: (unset) -> ' + str(attributes).encode(), p.stderr)
         self.assertFalse((one / 'filter-ran').exists())
 
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux bind mount policy')
+    def test_exec_readonly_hooks_path_overrides_locator_pin(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        modules = one / '.world-git/repo.git/worktrees/active/modules'
+        (modules / 'guarded/child').mkdir(parents=True)
+        (modules / 'guarded-foo').mkdir()
+        self.git(one, 'config', 'core.hooksPath', str(modules))
+        self.assert_denied(wid, 'echo evil > .world-git/repo.git/worktrees/active/modules/pre-commit')
+        self.assertFalse((modules / 'pre-commit').exists())
+
+        # Read-only ancestors must also dominate descendant locator pins.
+        self.assert_denied(wid, 'echo evil > .world-git/repo.git/worktrees/active/modules/guarded/child/payload')
+        self.assertFalse((modules / 'guarded/child/payload').exists())
+        self.exec_sh(wid, 'echo fine > ordinary-work', '--require-sandbox')
+        self.assertEqual((one / 'ordinary-work').read_text(), 'fine\n')
+        # A lexically intervening sibling must not hide the read-only ancestor, and
+        # should retain its independent writable locator bind.
+        self.git(one, 'config', 'core.hooksPath', str(modules / 'guarded'))
+        self.assert_denied(wid, 'echo evil > .world-git/repo.git/worktrees/active/modules/guarded/child/payload')
+        self.assertFalse((modules / 'guarded/child/payload').exists())
+        self.exec_sh(wid, 'echo fine > .world-git/repo.git/worktrees/active/modules/guarded-foo/payload',
+                     '--require-sandbox')
+
+    def test_exec_reports_selecting_preconfigured_help_commands(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'browser.payload.cmd', 'touch selected-help-ran')
+        self.git(one, 'config', 'man.payload.cmd', 'touch selected-help-ran')
+        values = {'help.browser': 'payload', 'help.format': 'web',
+                  'instaweb.browser': 'payload', 'man.viewer': 'payload'}
+        p = self.exec_sh(wid, ' && '.join('git config ' + key + ' ' + val for key, val in values.items()),
+                         '--no-sandbox')
+        for key, val in values.items():
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> ' + val.encode(), p.stderr)
+        self.assertNotIn(b'local browser.payload.cmd:', p.stderr)
+        self.assertNotIn(b'local man.payload.cmd:', p.stderr)
+        self.assertFalse((one / 'selected-help-ran').exists())
+
     def test_exec_reports_selecting_preconfigured_diff_and_merge_tools(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

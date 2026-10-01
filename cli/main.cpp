@@ -2998,11 +2998,41 @@ static char **linux_git_mounts(const GitAdmin *a, StrList *keep) {
     if (!m || !args) { free(m); free(args); return NULL; }
     for (size_t i = 0; i < n; ++i) m[i] = {keep->v[i] + 1, keep->v[i][0] == 'r'};
     qsort(m, n, sizeof *m, mount_cmp);
+    // A hooks path can also be a locator pin. Merge duplicates so no later writable
+    // bind can undo the read-only policy, regardless of qsort's order for equal paths.
+    size_t unique = 0;
     for (size_t i = 0; i < n; ++i) {
-        args[3 * i] = (char *)(m[i].ro ? "--ro-bind" : "--bind");
-        args[3 * i + 1] = (char *)m[i].path;
-        args[3 * i + 2] = (char *)m[i].path;
+        if (unique && !strcmp(m[unique - 1].path, m[i].path))
+            m[unique - 1].ro = m[unique - 1].ro || m[i].ro;
+        else m[unique++] = m[i];
     }
+    size_t emitted = 0;
+    for (size_t i = 0; i < unique; ++i) {
+        // A writable descendant bind would reopen a read-only ancestor. That ancestor
+        // already protects locator pins below it. Search every proper path prefix: a
+        // sibling such as b-foo can sort between b and b/child, defeating a simple sweep.
+        bool covered = false;
+        char ancestor[WFS_PATH_MAX];
+        for (const char *slash = strchr(m[i].path + 1, '/'); slash; slash = strchr(slash + 1, '/')) {
+            size_t len = (size_t)(slash - m[i].path);
+            memcpy(ancestor, m[i].path, len);
+            ancestor[len] = 0;
+            size_t lo = 0, hi = unique;
+            while (lo < hi) {
+                size_t mid = lo + (hi - lo) / 2;
+                int cmp = strcmp(m[mid].path, ancestor);
+                if (cmp < 0) lo = mid + 1;
+                else hi = mid;
+            }
+            if (lo < unique && !strcmp(m[lo].path, ancestor) && m[lo].ro) { covered = true; break; }
+        }
+        if (covered) continue;
+        args[3 * emitted] = (char *)(m[i].ro ? "--ro-bind" : "--bind");
+        args[3 * emitted + 1] = (char *)m[i].path;
+        args[3 * emitted + 2] = (char *)m[i].path;
+        ++emitted;
+    }
+    args[3 * emitted] = NULL;
     free(m);
     return args;
 }

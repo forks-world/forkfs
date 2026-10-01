@@ -313,7 +313,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `remote.*.uploadpack|receivepack|vcs`, `uploadpack.packobjectshook`,
 `sendemail[.*].tocmd|cccmd|headercmd|sendmailcmd|smtpserver`, `include.path`,
 `includeif.*.path`, `alias.*` (including ordinary aliases that dispatch commands or inject `-c` settings), `submodule.*.update` whose value
-starts with `!`, `pager.*`, `interactive.difffilter`, `web.browser`, `browser.*.cmd|path`, `instaweb.httpd`, `guitool.*.cmd`, `imap.tunnel`,
+starts with `!`, `pager.*`, `interactive.difffilter`, `web.browser`, `help.browser`, `help.format`, `instaweb.browser`, `man.viewer` (select configured viewers), `browser.*.cmd|path`, `instaweb.httpd`, `guitool.*.cmd`, `imap.tunnel`,
 `man.*.cmd|path`, `init.templatedir`, `hook.*.command`, `trailer.*.command|cmd`, `tar.*.command`,
 `protocol.allow` and `protocol.*.allow` (which can enable `ext::` URLs), and
 `lfs.*.path|clean|smudge` (custom transfer agents and extensions). Remote `url`/`pushurl` and submodule `url`
@@ -359,7 +359,8 @@ everything else outside the World stay writable on macOS (`(allow default)`), wh
 report covers effective configuration. On Linux the host filesystem is read-only in the
 sandbox, but hooks are protected with read-only bind mounts of the directories that exist
 when the exec starts, and the directories on the way to them are bound onto themselves so they
-cannot be renamed; a submodule first initialized during the exec gets writable hooks there,
+cannot be renamed. Duplicate paths keep the read-only policy, and descendant locator binds
+never reopen a read-only hooks path; a submodule first initialized during the exec gets writable hooks there,
 which the report then lists. What neither platform stops, and the report does not cover: a
 change to project content that runs code (a `Makefile`, `package.json` scripts, `.husky`,
 `.envrc`) -- review the World's diff before running it.
