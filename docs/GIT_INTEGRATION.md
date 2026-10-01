@@ -244,7 +244,20 @@ So `world exec` does two things.
   is covered as well: its clone may create `hooks` (as a directory, not a symlink) and Git's
   `*.sample` templates in it, which Git never runs, and nothing else (seatbelt cannot tell
   that `mkdir` from renaming a prepared directory into place, so a *new* repository's hooks
-  directory can still arrive that way; the report below lists what it contains);
+  directory can still arrive that way; the report below lists what it contains). Existing
+  `.gitmodules` declarations are read with a bounded, confined `git config --no-includes`
+  query before sandboxed exec on macOS, so slashed names containing `hooks` can initialize.
+  Every parsed declaration record counts toward the shared 65536-entry capture limit.
+  Names must be relative with no empty, `.` or `..` components; overlapping hook namespaces
+  are refused. Namespace prefixes immediately before a `hooks` component must have neither
+  `HEAD` nor `refs`, and those markers remain denied so that prefix cannot become a repository
+  or a linked-worktree common directory. Ordinary names such as `refs` and `HEAD` stay valid
+  when they do not conflict with a required reservation. Exec creates missing locator
+  directories for hook-name exceptions under its lock before sandboxing,
+  then pins them without a create exception; empty namespaces can remain after a failed exec.
+  Planned repository roots permit directory creation but reject symlinks, subject to the
+  same directory-create/rename limitation above. Newly introduced names
+  containing `hooks` remain denied until the next exec;
 - the directory each repository's effective `core.hooksPath` names (the World's and every
   submodule's, a relative value resolved from that repository's checkout as Git does), when
   that is outside the tree (a global `~/.githooks`, a shared directory) or inside
@@ -365,7 +378,7 @@ The key list and value-sensitive rules are in `cli/exec_guard.h`. Branch remote 
 activate unchanged helper configuration. Setting endpoints and tracking remains allowed;
 fetch refspecs, descriptive names and `branch.*.merge` stay quiet.
 Each repository is read before and after with five
-queries: a configuration listing, `--path --get core.hooksPath`, `rev-parse --show-toplevel`,
+queries (plus the macOS pre-exec declaration query described above): a configuration listing, `--path --get core.hooksPath`, `rev-parse --show-toplevel`,
 and `git var GIT_ATTR_GLOBAL`/`GIT_ATTR_SYSTEM`,
 so Git expands `~user` and applies its checkout rules when resolving relative hooks. Missing hook directories resolve through existing ancestors;
 unresolvable ancestors and `..` in a missing suffix invalidate capture. Mutable symlink components

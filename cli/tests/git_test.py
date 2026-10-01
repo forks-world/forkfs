@@ -6348,6 +6348,74 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(p.stderr.count(b'core.pager'), 1, p.stderr)
         self.assertIn(b'commands: global core.pager: (unset) -> less; evil\n', p.stderr)
 
+    def test_exec_initializes_declared_submodule_named_hooks(self):
+        tool = self.origin('new-tool')
+        self.sub(self.source, 'add', '-q', '--name', 'tools/hooks', str(tool), 'tools/hooks')
+        self.git(self.source, 'commit', '-qm', 'uninitialized hooks-named module')
+        self.sub(self.source, 'deinit', '-q', 'tools/hooks')
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        admin = one / '.world-git/repo.git/worktrees/active/modules'
+        gitdir = admin / 'tools/hooks'
+        self.assertFalse(gitdir.exists())
+        if sys.platform == 'darwin':
+            replacement = ('mkdir -p prepared/refs && echo ref: refs/heads/main > prepared/HEAD && ' +
+                           shlex.quote(sys.executable) + ' -c ' + shlex.quote(
+                               "import os; os.rename('prepared', " + repr(str(admin / 'tools')) + ")"))
+            self.assert_denied(wid, replacement)
+            self.assertFalse((admin / 'tools/HEAD').exists())
+            self.assertFalse((admin / 'tools/refs').exists())
+            self.assertFalse(gitdir.exists())
+        command = ('git -c protocol.file.allow=always submodule update -q --init tools/hooks && '
+                   'touch initialized && echo evil > ' + shlex.quote(str(gitdir / 'hooks/pre-commit')))
+        p = subprocess.run((WORLD, 'exec', wid, '--require-sandbox', '--', '/bin/sh', '-c', command),
+                           env=self.env, capture_output=True, timeout=60)
+        self.assertTrue((one / 'initialized').exists(), p.stderr)
+        self.assertTrue((one / 'tools/hooks/lib.txt').exists(), p.stderr)
+        self.assertTrue(any((gitdir / 'hooks').glob('*.sample')), p.stderr)
+        if sys.platform == 'darwin':
+            self.assertNotEqual(p.returncode, 0, p.stderr)
+            self.assertFalse((gitdir / 'hooks/pre-commit').exists())
+            # Namespace parents cannot become standalone or synthetic common repositories.
+            self.assert_denied(wid, 'echo ref: refs/heads/main > ' + shlex.quote(str(admin / 'tools/HEAD')))
+            self.assert_denied(wid, 'mkdir ' + shlex.quote(str(admin / 'tools/refs')))
+        else:
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn(b'exec added a Git hook:', p.stderr)
+
+    def test_exec_initializes_ordinary_marker_named_submodules(self):
+        tool = self.origin('marker-tool')
+        for name in ('refs', 'HEAD'):
+            self.sub(self.source, 'add', '-q', '--name', name, str(tool), 'deps/' + name)
+        self.git(self.source, 'commit', '-qm', 'ordinary marker names')
+        for name in ('refs', 'HEAD'):
+            self.sub(self.source, 'deinit', '-q', 'deps/' + name)
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.exec_sh(wid, 'git -c protocol.file.allow=always submodule update -q --init deps/refs deps/HEAD',
+                     '--require-sandbox')
+        for name in ('refs', 'HEAD'):
+            self.assertTrue((one / 'deps' / name / 'lib.txt').exists())
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Seatbelt declaration budget')
+    def test_exec_refuses_excess_submodule_declaration_records(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        (one / '.gitmodules').write_text('[metadata]\n' + ' item = value\n' * 65537)
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'Git declaration entry limit exceeded', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Seatbelt planned submodule namespaces')
+    def test_exec_refuses_submodule_plan_overlapping_hooks(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        (one / '.gitmodules').write_text('[submodule "tool"]\n path = tool\n'
+                                        '[submodule "tool/hooks/pre-commit"]\n path = other\n')
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'declared submodule administration overlaps Git hooks', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+
     def test_exec_keeps_a_submodule_named_hooks_writable(self):
         """Seatbelt's regex cannot tell modules/tools/hooks (a repository) from a hooks directory;
         the existing repository is given back, and only its own hooks are denied."""

@@ -2017,6 +2017,7 @@ struct GitAdmin {
     // World (~/.githooks, a shared directory) or inside .world-git. Filled by guard_capture, so
     // the sandbox rules and the report guard the same directories.
     StrList hooks_paths;
+    StrList planned_dirs, planned_namespaces, planned_locators; // macOS declarations for initialization during exec
 };
 
 static bool real_dir(const char *p) { struct stat st; return lstat(p, &st) == 0 && S_ISDIR(st.st_mode); }
@@ -2101,7 +2102,7 @@ static bool git_admin_find(const char *world, GitAdmin *a) {
     return true;
 }
 
-static void git_admin_free(GitAdmin *a) { sl_free(&a->gitdirs); sl_free(&a->pins); sl_free(&a->hooks_paths); }
+static void git_admin_free(GitAdmin *a) { sl_free(&a->gitdirs); sl_free(&a->pins); sl_free(&a->hooks_paths); sl_free(&a->planned_dirs); sl_free(&a->planned_namespaces); sl_free(&a->planned_locators); }
 
 // --- what exec compares before and after the command ---
 //
@@ -2336,7 +2337,7 @@ extern char **environ;
 // Read Git metadata with build-time Git under read-only confinement, never runtime PATH.
 // Config, rev-parse and var queries do not run hooks or fsmonitor: -c overrides would hide inherited
 // command-scope settings. Bound both output and child lifetime (an include can be a FIFO).
-enum GitGuardQuery { GG_LIST, GG_PATH, GG_TOPLEVEL, GG_VAR };
+enum GitGuardQuery { GG_LIST, GG_PATH, GG_TOPLEVEL, GG_VAR, GG_MODULES };
 
 static char *git_guard_read(const char *root, const char *gitdir, const char *path_key, GitGuardQuery query,
                             size_t *len, int *status) {
@@ -2353,7 +2354,14 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
         snprintf(gd, sizeof gd, "--git-dir=%s", gitdir);
         argv[arg++] = gd;
     }
-    if (query == GG_VAR) {
+    if (query == GG_MODULES) {
+        argv[arg++] = "config";
+        argv[arg++] = "--no-includes";
+        argv[arg++] = "--null";
+        argv[arg++] = "--file";
+        argv[arg++] = path_key;
+        argv[arg++] = "--list";
+    } else if (query == GG_VAR) {
         argv[arg++] = "var";
         argv[arg++] = path_key;
     } else if (query == GG_TOPLEVEL) {
@@ -2649,6 +2657,135 @@ static bool note_hooks_path(const GitAdmin *a, const char *checkout, const char 
     return true;
 }
 
+#ifdef __APPLE__
+static bool planned_add(StrList *list, const char *path, GuardSet *s) {
+    for (size_t i = 0; i < list->n; ++i) if (!strcmp(list->v[i], path)) return true;
+    if (list->n >= 4096) { s->error = "Git planned submodule limit exceeded"; return false; }
+    if (!sl_push(list, path)) { s->error = "out of memory"; return false; }
+    return true;
+}
+
+// Only declarations present before exec receive exceptions. Reserve their namespace
+// parents as nonrepositories, so an exception cannot become another repository's hooks.
+static bool plan_submodules(GitAdmin *a, const char *gitdir, const char *checkout, GuardSet *s) {
+    char file[WFS_PATH_MAX], base[WFS_PATH_MAX];
+    if ((size_t)snprintf(file, sizeof file, "%s/.gitmodules", checkout) >= sizeof file ||
+        (size_t)snprintf(base, sizeof base, "%s/modules", gitdir) >= sizeof base) return false;
+    struct stat st;
+    if (lstat(file, &st) != 0) return errno == ENOENT;
+    if (!S_ISREG(st.st_mode)) return false;
+    size_t len = 0;
+    int status;
+    char *out = git_guard_read(a->root, gitdir, file, GG_MODULES, &len, &status);
+    if (!out) return false;
+    bool ok = true;
+    for (size_t i = 0; i < len && ok;) {
+        if (g_post_signal) { ok = false; break; }
+        if (++s->entries > 65536) { s->error = "Git declaration entry limit exceeded"; ok = false; break; }
+        char *key = out + i;
+        i += strlen(key) + 1;
+        char *value = strchr(key, '\n');
+        if (!value) continue;
+        *value++ = 0;
+        char *last = strrchr(key, '.');
+        if (strncmp(key, "submodule.", 10) || !last || last <= key + 10 || strcmp(last, ".path")) continue;
+        *last = 0;
+        const char *name = key + 10;
+        if (!*name || *name == '/' || !*value) { ok = false; break; }
+        char path[WFS_PATH_MAX], pattern[WFS_PATH_MAX + 2];
+        if ((size_t)snprintf(pattern, sizeof pattern, "/%s/", name) >= sizeof pattern ||
+            (size_t)snprintf(path, sizeof path, "%s", base) >= sizeof path) { ok = false; break; }
+        bool exception = strstr(pattern, "/hooks/") != NULL;
+        const char *component = name;
+        for (;;) {
+            if (lstat(path, &st) == 0) {
+                if (!S_ISDIR(st.st_mode)) { ok = false; break; }
+            } else if (errno != ENOENT) { ok = false; break; }
+            const char *slash = strchr(component, '/');
+            size_t n = slash ? (size_t)(slash - component) : strlen(component);
+            if (exception && !planned_add(&a->planned_locators, path, s)) { ok = false; break; }
+            // Only a prefix immediately before `hooks` could acquire an executable
+            // hooks directory through the exception. Ordinary refs/HEAD names remain valid.
+            if (n == 5 && !memcmp(component, "hooks", 5)) {
+                const char *markers[] = {"HEAD", "refs"};
+                for (const char *marker : markers) {
+                    char reserved[WFS_PATH_MAX];
+                    if ((size_t)snprintf(reserved, sizeof reserved, "%s/%s", path, marker) >= sizeof reserved ||
+                        lstat(reserved, &st) == 0 || errno != ENOENT) { ok = false; break; }
+                }
+                if (!ok || !planned_add(&a->planned_namespaces, path, s)) { ok = false; break; }
+            }
+            if (!n || (n == 1 && component[0] == '.') ||
+                (n == 2 && component[0] == '.' && component[1] == '.')) { ok = false; break; }
+            size_t at = strlen(path);
+            if (at + n + 2 > sizeof path) { ok = false; break; }
+            path[at++] = '/'; memcpy(path + at, component, n); path[at + n] = 0;
+            if (!slash) break;
+            component = slash + 1;
+        }
+        if (!ok) break;
+        if (lstat(path, &st) == 0) { if (!S_ISDIR(st.st_mode)) ok = false; }
+        else if (errno != ENOENT) ok = false;
+        if (ok) ok = planned_add(&a->planned_dirs, path, s);
+    }
+    free(out);
+    return ok;
+}
+
+// Create only namespace directories under the exec lock. Their strict profile pins
+// cannot safely be combined with a create exception: rename-in could carry reserved refs.
+static bool prepare_planned_namespaces(const GitAdmin *a) {
+    for (size_t i = 0; i < a->planned_locators.n; ++i) {
+        const char *path = a->planned_locators.v[i];
+        struct stat st;
+        if (lstat(path, &st) != 0) {
+            if (errno != ENOENT || mkdir(path, 0777) != 0 || lstat(path, &st) != 0) return false;
+        }
+        if (!S_ISDIR(st.st_mode)) return false;
+    }
+    for (size_t i = 0; i < a->planned_namespaces.n; ++i) {
+        const char *markers[] = {"HEAD", "refs"};
+        for (const char *marker : markers) {
+            char reserved[WFS_PATH_MAX];
+            struct stat st;
+            if ((size_t)snprintf(reserved, sizeof reserved, "%s/%s", a->planned_namespaces.v[i], marker) >= sizeof reserved ||
+                lstat(reserved, &st) == 0 || errno != ENOENT) return false;
+        }
+    }
+    return true;
+}
+
+static bool path_within(const char *path, const char *parent) {
+    size_t n = strlen(parent);
+    return !strncmp(path, parent, n) && (!path[n] || path[n] == '/');
+}
+
+static bool plans_safe(const GitAdmin *a) {
+    for (size_t i = 0; i < a->planned_dirs.n; ++i) {
+        const char *path = a->planned_dirs.v[i];
+        for (size_t j = 0; j < a->planned_locators.n; ++j)
+            if (!strcmp(path, a->planned_locators.v[j])) return false;
+        for (size_t j = 0; j < a->planned_namespaces.n; ++j) {
+            const char *markers[] = {"HEAD", "refs"};
+            for (const char *marker : markers) {
+                char reserved[WFS_PATH_MAX];
+                if ((size_t)snprintf(reserved, sizeof reserved, "%s/%s", a->planned_namespaces.v[j], marker) >= sizeof reserved ||
+                    path_within(path, reserved)) return false;
+            }
+        }
+        for (size_t j = 0; j < a->hooks_paths.n; ++j)
+            if (path_within(path, a->hooks_paths.v[j])) return false;
+        const StrList *lists[] = {&a->gitdirs, &a->planned_dirs};
+        for (const StrList *list : lists) for (size_t j = 0; j < list->n; ++j) {
+            char hooks[WFS_PATH_MAX];
+            if ((size_t)snprintf(hooks, sizeof hooks, "%s/hooks", list->v[j]) >= sizeof hooks ||
+                path_within(path, hooks)) return false;
+        }
+    }
+    return true;
+}
+#endif
+
 // One repository, captured whole: its effective configuration (every scope -- global and
 // system files, and a conditional include, can differ per repository), the checkout its
 // core.worktree names and that checkout's `.git`, the hooks directory its effective
@@ -2703,6 +2840,12 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
     worktree[len - 1] = 0;
     snprintf(checkout, sizeof checkout, "%s", worktree);
     free(worktree);
+#ifdef __APPLE__
+    if (require_home && !plan_submodules(a, gitdir, checkout, s)) {
+        if (!s->error) s->error = "could not safely plan declared submodule administration";
+        return false;
+    }
+#endif
     if (require_home) {
         char pointer[WFS_PATH_MAX + 16];
         snprintf(pointer, sizeof pointer, "%s/.git", checkout);
@@ -2796,6 +2939,9 @@ static bool guard_capture(GitAdmin *a, GuardSet *s, bool require_home = false) {
         }
         if (!capture_repo(a, g, g, label, s, require_home)) return false;
     }
+#ifdef __APPLE__
+    if (require_home && !plans_safe(a)) s->error = "declared submodule administration overlaps Git hooks";
+#endif
     if (s->error) return false;
     gs_finish(s);
     return !s->error;
@@ -3066,6 +3212,40 @@ static bool sb_git_admin(FILE *f, const GitAdmin *a) {
         snprintf(p, sizeof p, "%s/modules", g);
         if (!sb_module_hooks(f, p)) return false;
     }
+    // Declared but not yet initialized repositories need the same exception. Restore
+    // generic hook protection below each exception, including unknown descendants.
+    for (size_t i = 0; i < a->planned_dirs.n; ++i) {
+        const char *g = a->planned_dirs.v[i], *rel = g + strlen(a->modules);
+        char pat[WFS_PATH_MAX + 8];
+        snprintf(pat, sizeof pat, "%s/", rel);
+        if (!strstr(pat, "/hooks/")) continue;
+        sb_subpath(f, "allow file-write*", g);
+        if (!sb_module_hooks(f, g)) return false;
+    }
+    // Planned hooks still need mkdir and inert templates during clone. Existing actual
+    // and effective hooks receive their stronger denies below, after these exceptions.
+    for (size_t i = 0; i < a->planned_dirs.n; ++i) {
+        const char *g = a->planned_dirs.v[i];
+        snprintf(p, sizeof p, "%s/hooks", g);
+        sb_subpath(f, "deny file-write*", p);
+        if (!sb_regex(f, "allow file-write-create", g, "/hooks$", "(vnode-type DIRECTORY)") ||
+            !sb_regex(f, "allow file-write*", g, "/hooks/[^/]+\\.sample$")) return false;
+    }
+    for (size_t i = 0; i < a->planned_dirs.n; ++i) {
+        sb_literal(f, "deny file-write*", a->planned_dirs.v[i]);
+        if (!sb_regex(f, "allow file-write-create", a->planned_dirs.v[i], "$", "(vnode-type DIRECTORY)")) return false;
+    }
+    for (size_t i = 0; i < a->planned_locators.n; ++i)
+        sb_literal(f, "deny file-write*", a->planned_locators.v[i]);
+    // HEAD excludes ordinary repositories; refs also excludes synthetic common dirs
+    // reached through another worktree's commondir (even with external objects).
+    for (size_t i = 0; i < a->planned_namespaces.n; ++i) {
+        const char *markers[] = {"HEAD", "refs"};
+        for (const char *marker : markers) {
+            if ((size_t)snprintf(p, sizeof p, "%s/%s", a->planned_namespaces.v[i], marker) >= sizeof p) return false;
+            sb_subpath(f, "deny file-write*", p);
+        }
+    }
     for (size_t i = 0; i < a->pins.n; ++i) sb_literal(f, "deny file-write*", a->pins.v[i]);
     for (size_t i = 0; i < a->gitdirs.n; ++i) {
         snprintf(p, sizeof p, "%s/hooks", a->gitdirs.v[i]);
@@ -3299,6 +3479,12 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
                           "world exec W<n> --no-sandbox -- <cmd>");
         }
         watch = guard_capture(&admin, &before, sandbox);
+#ifdef __APPLE__
+        if (watch && sandbox && !prepare_planned_namespaces(&admin)) {
+            before.error = "could not reserve declared submodule namespaces";
+            watch = false;
+        }
+#endif
         if (!watch && sandbox) {
             fprintf(stderr, "world: note: Git guard unavailable: %s\n",
                     before.error ? before.error : "configuration query failed");
