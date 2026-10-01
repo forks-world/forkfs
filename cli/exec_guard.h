@@ -57,6 +57,7 @@ static const GuardKey kGuardKeys[] = {
     {"include", "path", 0, false},        {"includeif", "path", 1, false},
     {"alias", NULL, 2, true},             {"submodule", "update", 1, true},
     {"pager", NULL, 0, false},            {"interactive", "difffilter", 0, false},
+    {"imap", "tunnel", 0, false},
     {"instaweb", "httpd", 0, false},      {"guitool", "cmd", 1, false},
     {"web", "browser", 0, false},         {"browser", "cmd", 1, false},
     {"browser", "path", 1, false},        {"man", "cmd", 1, false},

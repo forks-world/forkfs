@@ -303,7 +303,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `remote.*.uploadpack|receivepack|vcs`, `uploadpack.packobjectshook`,
 `sendemail[.*].tocmd|cccmd|headercmd|sendmailcmd|smtpserver`, `include.path`,
 `includeif.*.path`, `alias.*` whose value starts with `!`, `submodule.*.update` whose value
-starts with `!`, `pager.*`, `interactive.difffilter`, `web.browser`, `browser.*.cmd|path`, `instaweb.httpd`, `guitool.*.cmd`,
+starts with `!`, `pager.*`, `interactive.difffilter`, `web.browser`, `browser.*.cmd|path`, `instaweb.httpd`, `guitool.*.cmd`, `imap.tunnel`,
 `man.*.cmd|path`, `init.templatedir`, `hook.*.command`, `trailer.*.command|cmd`, `tar.*.command`,
 `protocol.allow` and `protocol.*.allow` (which can enable `ext::` URLs), and
 `lfs.*.path|clean|smudge` (custom transfer agents and extensions). The list is
@@ -319,7 +319,16 @@ be read (missing configured Git or sandbox, a malformed file, or a query exceedi
 limits), exec says so in one `note:` line and reports nothing;
 a World without `.world-git` at startup gets neither the rules nor the report. If the command
 removes or replaces previously detected Git administration, exec warns that the final hooks
-and settings could not be inspected.
+and settings could not be inspected. An incomplete administration scan (read/allocation error,
+path truncation, depth over 32, more than 4096 repositories or 65536 directory entries) refuses
+sandboxed exec; `--no-sandbox` reports the unavailable guard and preserves the command status.
+Hook and pointer hashing has a 64 MiB aggregate content budget per capture; oversized files,
+read errors and record/entry limits invalidate the capture explicitly. Incomplete initial
+hook captures also refuse sandboxed exec; final capture failures keep the command status. Small hooks are hashed
+in full, so same-size, same-mtime rewrites remain detectable. Symlinked default hooks directories and symlinked entries in guarded
+hooks directories are unsupported: their executable target could change outside the directory
+policy. They invalidate capture, refusing sandboxed exec and producing an explicit note with
+`--no-sandbox`; symlinked Git administration pointers remain recorded by link target.
 
 The exec sandbox is not a general confinement: it keeps the command away from the store and
 from other Worlds, and from the hooks above. `~/.gitconfig`, `~/.ssh`, shell startup files and

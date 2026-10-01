@@ -45,7 +45,7 @@ int main() {
         "remote.origin.receivepack", "remote.origin.vcs", "uploadpack.packobjectshook",
         "sendemail.tocmd", "sendemail.work.sendmailcmd", "sendemail.smtpserver", "include.path",
         "includeif.gitdir:/x/.path", "pager.log", "interactive.difffilter", "web.browser",
-        "instaweb.httpd", "guitool.test.cmd", "browser.ff.cmd", "man.x.cmd", "init.templatedir", "hook.lint.command",
+        "imap.tunnel", "instaweb.httpd", "guitool.test.cmd", "browser.ff.cmd", "man.x.cmd", "init.templatedir", "hook.lint.command",
         "trailer.sign.command", "protocol.allow", "protocol.ext.allow",
         "lfs.customtransfer.x.path", "lfs.extension.x.clean",
         "CORE.HOOKSPATH", "Core.FsMonitor",
@@ -66,7 +66,7 @@ int main() {
         "branch.main.remote", "branch.main.merge", "core.bare", "tar.command", "tar.custom.remote",
         "gc.custom.recentobjectshook", "gc.pruneexpire", "core.editorx", "filter.clean", "diff.command", "merge.driver", "core.x.hookspath",
         "include.x.path", "includeif.path", "hook.command", "remote.uploadpack", "merge.tool",
-        "instaweb.port", "instaweb.custom.httpd", "guitool.cmd", "guitool.test.title",
+        "imap.host", "imap.custom.tunnel", "instaweb.port", "instaweb.custom.httpd", "guitool.cmd", "guitool.test.title",
         "credential.username", "gpg.format", "init.defaultbranch", "", ".", "core.", "nodot",
     };
     for (const char *k : quiet) {

@@ -4618,6 +4618,72 @@ class GitWorldTest(unittest.TestCase):
         p = self.exec_sh(wid, "git config gc.recentObjectsHook 'sh -c evil'", '--no-sandbox')
         self.assertIn(b'local gc.recentobjectshook: (unset) -> sh -c evil', p.stderr)
 
+    def test_exec_refuses_incomplete_git_administration_scan(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        modules = one / '.world-git/repo.git/worktrees/active/modules'
+        # Legal short components exceed the discovery depth without exceeding PATH_MAX.
+        deep = modules.joinpath(*(['a'] * 34))
+        deep.mkdir(parents=True)
+        (deep / 'HEAD').write_text('ref: refs/heads/main\n')
+        (deep / 'objects').mkdir()
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'incomplete Git administration scan', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+        p = self.exec_sh(wid, 'exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'incomplete Git administration scan', p.stderr)
+        shutil.rmtree(modules)
+        # macOS PATH_MAX equals the guard's buffer; Linux allows this longer path.
+        if sys.platform == 'darwin':
+            return
+        # A short-depth path can independently exceed the guard's fixed path buffers.
+        long_path = modules.joinpath(*(['b' * 180] * 6))
+        long_path.mkdir(parents=True)
+        p = self.exec_sh(wid, 'exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'incomplete Git administration scan', p.stderr)
+
+    def test_exec_refuses_symlinked_guarded_hook(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        target = self.root / 'external-hook'
+        target.write_text('#!/bin/sh\nexit 0\n')
+        target.chmod(0o755)
+        hook = one / '.world-git/repo.git/hooks/pre-commit'
+        hook.parent.mkdir(exist_ok=True)
+        hook.symlink_to(target)
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'symlinked Git hooks cannot be guarded', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+        p = self.exec_sh(wid, 'exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'symlinked Git hooks cannot be guarded', p.stderr)
+
+        # The default hooks directory itself must not redirect outside its policy either.
+        shutil.rmtree(hook.parent)
+        external = self.root / 'external-hooks'
+        external.mkdir()
+        (external / 'pre-commit').write_text(target.read_text())
+        hook.parent.symlink_to(external, target_is_directory=True)
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'symlinked Git hooks cannot be guarded', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+
+    def test_exec_large_sparse_hook_invalidates_capture_promptly(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        hook = one / '.world-git/repo.git/hooks/pre-commit'
+        hook.parent.mkdir(exist_ok=True)
+        script = (shlex.quote(sys.executable) + ' -c ' + shlex.quote(
+            "with open('.world-git/repo.git/hooks/pre-commit', 'wb') as f: f.truncate(1 << 40)") +
+            '; exit 7')
+        p = subprocess.run((WORLD, 'exec', wid, '--no-sandbox', '--', '/bin/sh', '-c', script),
+                           env=self.env, capture_output=True, timeout=15)
+        self.assertEqual(p.returncode, 7, p.stderr)
+        self.assertEqual(hook.stat().st_size, 1 << 40)
+        self.assertIn(b'64 MiB capture budget', p.stderr)
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'incomplete Git hooks or administration capture', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+
     def test_exec_reports_disappearing_git_administration(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

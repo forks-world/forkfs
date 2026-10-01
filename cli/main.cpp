@@ -1969,15 +1969,17 @@ static int cmd_adopt(wfs_store *s, int argc, char **argv) {
 
 struct StrList { char **v; size_t n, cap; };
 
-static void sl_push(StrList *l, const char *s) {
+static bool sl_push(StrList *l, const char *s) {
     if (l->n == l->cap) {
         size_t cap = l->cap ? l->cap * 2 : 16;
         char **v = (char **)realloc(l->v, cap * sizeof *v);
-        if (!v) return;
+        if (!v) return false;
         l->v = v; l->cap = cap;
     }
     char *d = strdup(s);
-    if (d) l->v[l->n++] = d;
+    if (!d) return false;
+    l->v[l->n++] = d;
+    return true;
 }
 
 static void sl_free(StrList *l) {
@@ -1998,6 +2000,8 @@ static bool resolve_into(const char *path, char *out, size_t cap) {
 }
 
 struct GitAdmin {
+    bool incomplete;             // discovery failed or exceeded its resource/path limits
+    size_t entries;              // all visited administration entries, not just repositories
     char root[WFS_PATH_MAX];     // the World root, resolved
     char common[WFS_PATH_MAX];   // <root>/.world-git/repo.git
     char active[WFS_PATH_MAX];   // <common>/worktrees/active: the World's own worktree
@@ -2011,50 +2015,79 @@ struct GitAdmin {
 };
 
 static bool real_dir(const char *p) { struct stat st; return lstat(p, &st) == 0 && S_ISDIR(st.st_mode); }
+#ifdef __linux__
 static bool real_file(const char *p) { struct stat st; return lstat(p, &st) == 0 && S_ISREG(st.st_mode); }
+#endif
 
-static bool looks_like_gitdir(const char *d) {
-    char p[WFS_PATH_MAX], q[WFS_PATH_MAX];
-    snprintf(p, sizeof p, "%s/HEAD", d);
-    snprintf(q, sizeof q, "%s/objects", d);
-    return real_file(p) && real_dir(q);
+// Missing optional paths are normal; all other errors make discovery incomplete.
+static bool admin_stat(GitAdmin *a, const char *p, struct stat *st) {
+    if (lstat(p, st) == 0) return true;
+    if (errno != ENOENT) a->incomplete = true;
+    return false;
 }
 
-// A submodule named `a/b` lives in modules/a/b and a nested one in modules/a/b/modules/c: walk the
-// directories until a repository, then only into its own `modules`. Never into objects or refs.
+static bool looks_like_gitdir(GitAdmin *a, const char *d) {
+    char p[WFS_PATH_MAX], q[WFS_PATH_MAX];
+    if ((size_t)snprintf(p, sizeof p, "%s/HEAD", d) >= sizeof p ||
+        (size_t)snprintf(q, sizeof q, "%s/objects", d) >= sizeof q) {
+        a->incomplete = true; return false;
+    }
+    struct stat head, objects;
+    bool h = admin_stat(a, p, &head), o = admin_stat(a, q, &objects);
+    return h && o && S_ISREG(head.st_mode) && S_ISDIR(objects.st_mode);
+}
+
+// A submodule named `a/b` lives in modules/a/b and a nested one in modules/a/b/modules/c.
+// Limits must invalidate the scan, never silently omit a repository from the policy.
 static void find_submodules(GitAdmin *a, const char *dir, int depth) {
-    if (depth > 32 || a->gitdirs.n >= 4096) return;
+    if (depth > 32) { a->incomplete = true; return; }
     DIR *d = opendir(dir);
-    if (!d) return;
-    while (struct dirent *e = readdir(d)) {
+    if (!d) { a->incomplete = true; return; }
+    while (!a->incomplete) {
+        errno = 0;
+        struct dirent *e = readdir(d);
+        if (!e) { if (errno) a->incomplete = true; break; }
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if (++a->entries > 65536) { a->incomplete = true; break; }
         char p[WFS_PATH_MAX];
-        if ((size_t)snprintf(p, sizeof p, "%s/%s", dir, e->d_name) >= sizeof p || !real_dir(p)) continue;
-        sl_push(&a->pins, p);
-        if (!looks_like_gitdir(p)) { find_submodules(a, p, depth + 1); continue; }
-        sl_push(&a->gitdirs, p);
+        if ((size_t)snprintf(p, sizeof p, "%s/%s", dir, e->d_name) >= sizeof p) {
+            a->incomplete = true; break;
+        }
+        struct stat st;
+        if (!admin_stat(a, p, &st)) { a->incomplete = true; break; }
+        if (S_ISLNK(st.st_mode)) { a->incomplete = true; break; }
+        if (!S_ISDIR(st.st_mode)) continue;
+        if (!sl_push(&a->pins, p)) { a->incomplete = true; break; }
+        if (!looks_like_gitdir(a, p)) { if (!a->incomplete) find_submodules(a, p, depth + 1); continue; }
+        if (a->gitdirs.n >= 4096 || !sl_push(&a->gitdirs, p)) { a->incomplete = true; break; }
         char m[WFS_PATH_MAX];
-        if ((size_t)snprintf(m, sizeof m, "%s/modules", p) < sizeof m && real_dir(m)) {
-            sl_push(&a->pins, m);
+        if ((size_t)snprintf(m, sizeof m, "%s/modules", p) >= sizeof m) { a->incomplete = true; break; }
+        if (admin_stat(a, m, &st)) {
+            if (!S_ISDIR(st.st_mode) || !sl_push(&a->pins, m)) { a->incomplete = true; break; }
             find_submodules(a, m, depth + 1);
         }
     }
     closedir(d);
 }
 
-// False for a plain directory World: it has no Git administration to guard.
+// False only for a plain directory World; present but unreadable administration is incomplete.
 static bool git_admin_find(const char *world, GitAdmin *a) {
     memset(a, 0, sizeof *a);
-    if (!resolve_into(world, a->root, sizeof a->root)) snprintf(a->root, sizeof a->root, "%s", world);
+    if (!resolve_into(world, a->root, sizeof a->root)) { a->incomplete = true; return true; }
     char wg[WFS_PATH_MAX];
-    snprintf(wg, sizeof wg, "%s/.world-git", a->root);
-    snprintf(a->common, sizeof a->common, "%s/repo.git", wg);
-    snprintf(a->active, sizeof a->active, "%s/worktrees/active", a->common);
-    snprintf(a->modules, sizeof a->modules, "%s/modules", a->active);
-    if (!real_dir(wg) || !real_dir(a->common)) return false;
-    if (real_dir(a->modules)) {
-        sl_push(&a->pins, a->modules);
-        find_submodules(a, a->modules, 0);
+    if ((size_t)snprintf(wg, sizeof wg, "%s/.world-git", a->root) >= sizeof wg ||
+        (size_t)snprintf(a->common, sizeof a->common, "%s/repo.git", wg) >= sizeof a->common ||
+        (size_t)snprintf(a->active, sizeof a->active, "%s/worktrees/active", a->common) >= sizeof a->active ||
+        (size_t)snprintf(a->modules, sizeof a->modules, "%s/modules", a->active) >= sizeof a->modules) {
+        a->incomplete = true; return true;
+    }
+    struct stat st;
+    if (!admin_stat(a, wg, &st)) return a->incomplete;
+    if (!S_ISDIR(st.st_mode)) { a->incomplete = true; return true; }
+    if (!admin_stat(a, a->common, &st) || !S_ISDIR(st.st_mode)) { a->incomplete = true; return true; }
+    if (admin_stat(a, a->modules, &st)) {
+        if (!S_ISDIR(st.st_mode) || !sl_push(&a->pins, a->modules)) a->incomplete = true;
+        else find_submodules(a, a->modules, 0);
     }
     return true;
 }
@@ -2067,17 +2100,19 @@ static void git_admin_free(GitAdmin *a) { sl_free(&a->gitdirs); sl_free(&a->pins
 // (repository, scope, key), `h` a hook file, `p` a file that tells Git where a repository is.
 
 struct GuardRec { char *id; char *val; size_t seq; };
-struct GuardSet { GuardRec *v; size_t n, cap; };
+struct GuardSet { GuardRec *v; size_t n, cap, bytes_left, entries; const char *error; };
 
 static void gs_add(GuardSet *s, const char *id, const char *val) {
+    if (s->error) return;
+    if (s->n >= 65536) { s->error = "Git capture record limit exceeded"; return; }
     if (s->n == s->cap) {
         size_t cap = s->cap ? s->cap * 2 : 64;
         GuardRec *v = (GuardRec *)realloc(s->v, cap * sizeof *v);
-        if (!v) return;
+        if (!v) { s->error = "out of memory"; return; }
         s->v = v; s->cap = cap;
     }
     GuardRec r = {strdup(id), strdup(val), s->n};
-    if (!r.id || !r.val) { free(r.id); free(r.val); return; }
+    if (!r.id || !r.val) { free(r.id); free(r.val); s->error = "out of memory"; return; }
     s->v[s->n++] = r;
 }
 
@@ -2107,7 +2142,7 @@ static void gs_finish(GuardSet *s) {
                 joined[a] = '\x1e';
                 memcpy(joined + a + 1, s->v[i].val, b + 1);
                 r.val = joined;
-            }
+            } else s->error = "out of memory";
             free(s->v[i].id); free(s->v[i].val);
             continue;
         }
@@ -2118,7 +2153,7 @@ static void gs_finish(GuardSet *s) {
 
 // The file's type, mode and content (a symlink: its target), as a short fingerprint. Hooks are
 // small; hashing the bytes catches a same-size, same-mtime rewrite through a hardlink.
-static bool fingerprint(const char *path, char *out, size_t cap) {
+static bool fingerprint(const char *path, char *out, size_t cap, GuardSet *s) {
     struct stat st;
     if (lstat(path, &st) != 0) return false;
     uint64_t h = 1469598103934665603ull;
@@ -2128,13 +2163,32 @@ static bool fingerprint(const char *path, char *out, size_t cap) {
     char buf[8192];
     if (S_ISLNK(st.st_mode)) {
         ssize_t n = readlink(path, buf, sizeof buf);
-        if (n > 0) mix(buf, (size_t)n);
+        if (n < 0 || (size_t)n == sizeof buf) return false;
+        mix(buf, (size_t)n);
     } else if (S_ISREG(st.st_mode)) {
         int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
         if (fd < 0) return false;
-        ssize_t n;
-        while ((n = read(fd, buf, sizeof buf)) > 0) mix(buf, (size_t)n);
+        struct stat opened;
+        if (fstat(fd, &opened) != 0 || !S_ISREG(opened.st_mode)) { close(fd); return false; }
+        if (opened.st_size < 0 || (uint64_t)opened.st_size > s->bytes_left) {
+            s->error = "Git hook/pointer content exceeds the 64 MiB capture budget";
+            close(fd); return false;
+        }
+        bool ok = true;
+        for (;;) {
+            ssize_t n = read(fd, buf, sizeof buf);
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0) { ok = false; break; }
+            if (!n) break;
+            if ((size_t)n > s->bytes_left) {
+                s->error = "Git hook/pointer content exceeds the 64 MiB capture budget";
+                ok = false; break;
+            }
+            s->bytes_left -= (size_t)n;
+            mix(buf, (size_t)n);
+        }
         close(fd);
+        if (!ok) return false;
     }
     snprintf(out, cap, "%06o:%016llx", (unsigned)st.st_mode, (unsigned long long)h);
     return true;
@@ -2148,15 +2202,36 @@ static const char *rel_to(const GitAdmin *a, const char *path) {
 // Every hook Git could run from `dir`: all entries but Git's own *.sample templates, which Git
 // never runs (and which a fresh submodule clone creates).
 static void capture_hooks(const GitAdmin *a, const char *dir, GuardSet *s) {
+    if (s->error) return;
+    struct stat directory;
+    if (lstat(dir, &directory) != 0) {
+        if (errno != ENOENT && errno != ENOTDIR) s->error = "could not inspect Git hooks directory";
+        return;
+    }
+    if (S_ISLNK(directory.st_mode)) { s->error = "symlinked Git hooks cannot be guarded"; return; }
     DIR *d = opendir(dir);
-    if (!d) return;
-    while (struct dirent *e = readdir(d)) {
+    if (!d) { if (errno != ENOENT) s->error = "could not read Git hooks directory"; return; }
+    while (!s->error) {
+        errno = 0;
+        struct dirent *e = readdir(d);
+        if (!e) { if (errno) s->error = "could not enumerate Git hooks"; break; }
+        if (++s->entries > 65536) { s->error = "Git hook entry limit exceeded"; break; }
         size_t n = strlen(e->d_name);
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") ||
             (n > 7 && !strcmp(e->d_name + n - 7, ".sample"))) continue;
         char p[WFS_PATH_MAX], id[WFS_PATH_MAX + 8], fp[64];
-        if ((size_t)snprintf(p, sizeof p, "%s/%s", dir, e->d_name) >= sizeof p || !fingerprint(p, fp, sizeof fp))
-            continue;
+        if ((size_t)snprintf(p, sizeof p, "%s/%s", dir, e->d_name) >= sizeof p) {
+            s->error = "Git hook path exceeds capture limit"; break;
+        }
+        struct stat st;
+        if (lstat(p, &st) != 0) { s->error = "could not inspect Git hook"; break; }
+        // Hashing only a link would miss edits to its external executable target. The
+        // directory policy cannot protect that target, so refuse an incomplete guard.
+        if (S_ISLNK(st.st_mode)) { s->error = "symlinked Git hooks cannot be guarded"; break; }
+        if (!fingerprint(p, fp, sizeof fp, s)) {
+            if (!s->error) s->error = "could not fingerprint Git hook";
+            break;
+        }
         snprintf(id, sizeof id, "h\x1f%s", rel_to(a, p));
         gs_add(s, id, fp);
     }
@@ -2167,7 +2242,8 @@ static void capture_hooks(const GitAdmin *a, const char *dir, GuardSet *s) {
 // its repository: ../../../../../../libs/lib).
 static void join_lexical(const char *base, const char *rel, char *out, size_t cap) {
     char tmp[2 * WFS_PATH_MAX];
-    snprintf(tmp, sizeof tmp, rel[0] == '/' ? "%s%s" : "%s/%s", rel[0] == '/' ? "" : base, rel);
+    if ((size_t)snprintf(tmp, sizeof tmp, rel[0] == '/' ? "%s%s" : "%s/%s",
+                         rel[0] == '/' ? "" : base, rel) >= sizeof tmp) { out[0] = 0; return; }
     size_t at = 0;
     out[0] = 0;
     for (char *save = NULL, *c = strtok_r(tmp, "/", &save); c; c = strtok_r(NULL, "/", &save)) {
@@ -2337,9 +2413,16 @@ static void capture_pointer(const GitAdmin *a, const char *path, const char *bas
     char val[128], id[WFS_PATH_MAX + 8];
     snprintf(id, sizeof id, "p\x1f%s", rel_to(a, path));
     struct stat st;
-    if (lstat(path, &st) != 0) { gs_add(s, id, "absent"); return; }
+    if (lstat(path, &st) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) gs_add(s, id, "absent");
+        else s->error = "could not inspect Git pointer";
+        return;
+    }
     char fp[64] = "";
-    fingerprint(path, fp, sizeof fp);
+    if (!fingerprint(path, fp, sizeof fp, s)) {
+        if (!s->error) s->error = "could not fingerprint Git pointer";
+        return;
+    }
     const char *hash = strchr(fp, ':') ? strchr(fp, ':') + 1 : "";
     bool home = false;
     if (S_ISREG(st.st_mode)) {
@@ -2369,19 +2452,30 @@ static void capture_pointer(const GitAdmin *a, const char *path, const char *bas
 // resolved from the repository's checkout, as Git does. A directory inside the World's tree is
 // project content (husky's .husky): tracked, visible in `git status` and the World's diff, so
 // it is neither denied nor reported. One outside the tree, or inside .world-git, is guarded.
-static void note_hooks_path(const GitAdmin *a, const char *checkout, const char *v, char *out, size_t cap) {
+static bool note_hooks_path(const GitAdmin *a, const char *checkout, const char *v, char *out, size_t cap) {
     out[0] = 0;
     char p[2 * WFS_PATH_MAX], real[WFS_PATH_MAX];
-    if (v[0] == '/') snprintf(p, sizeof p, "%s", v);
-    else snprintf(p, sizeof p, "%s/%s", checkout, v);
-    if (!*v || !resolve_into(p, real, sizeof real)) join_lexical("/", p, real, sizeof real);
-    if (!strcmp(real, "/dev/null")) return;
+    int npath = v[0] == '/' ? snprintf(p, sizeof p, "%s", v) :
+                             snprintf(p, sizeof p, "%s/%s", checkout, v);
+    if (npath < 0 || (size_t)npath >= sizeof p) return false;
+    char *resolved = realpath(p, NULL);
+    if (resolved) {
+        bool fits = (size_t)snprintf(real, sizeof real, "%s", resolved) < sizeof real;
+        free(resolved);
+        if (!fits) return false;
+    } else {
+        if (errno != ENOENT && errno != ENOTDIR) return false;
+        join_lexical("/", p, real, sizeof real);
+        if (!real[0]) return false;
+    }
+    if (!strcmp(real, "/dev/null")) return true;
     char admin[WFS_PATH_MAX];
     snprintf(admin, sizeof admin, "%s/.world-git", a->root);
     size_t n = strlen(a->root), m = strlen(admin);
     bool in_tree = !strncmp(real, a->root, n) && (real[n] == '/' || !real[n]);
     bool in_admin = !strncmp(real, admin, m) && (real[m] == '/' || !real[m]);
-    if (!in_tree || in_admin) snprintf(out, cap, "%s", real);
+    if ((!in_tree || in_admin) && (size_t)snprintf(out, cap, "%s", real) >= cap) return false;
+    return true;
 }
 
 // One repository, captured whole: its effective configuration (every scope -- global and
@@ -2411,12 +2505,13 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
         if (!guard_key_runs_command(key, val)) continue;
         size_t idn = strlen(label) + strlen(scope) + strlen(key) + 8;
         char *id = (char *)malloc(idn);
-        if (!id) continue;
+        if (!id) { s->error = "out of memory"; continue; }
         snprintf(id, idn, "c\x1f%s\x1f%s\x1f%s", label, scope, key);
         gs_add(s, id, val);
         free(id);
     }
     free(out);
+    if (s->error) return false;
     // Git's setup rules decide the effective checkout, including linked-worktree
     // configuration semantics; the last config-list value alone is insufficient.
     char *worktree = git_guard_read(a->root, gitdir, NULL, true, &len, &status);
@@ -2435,15 +2530,17 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
         if (!len || hooks_value[len - 1] != 0 || strlen(hooks_value) + 1 != len) {
             free(hooks_value); return false;
         }
-        note_hooks_path(a, checkout[0] ? checkout : gitdir, hooks_value, hooks_path, sizeof hooks_path);
+        bool resolved = note_hooks_path(a, checkout[0] ? checkout : gitdir, hooks_value, hooks_path, sizeof hooks_path);
         free(hooks_value);
+        if (!resolved) { s->error = "could not resolve Git hooks path"; return false; }
     }
     char p[WFS_PATH_MAX + 16];
     snprintf(p, sizeof p, "%s/hooks", common);
     capture_hooks(a, p, s);
+    if (s->error) return false;
     if (hooks_path[0]) {
         capture_hooks(a, hooks_path, s);
-        sl_push(&a->hooks_paths, hooks_path);
+        if (!sl_push(&a->hooks_paths, hooks_path)) s->error = "out of memory";
     }
     // Always retain the World's entry point even when core.worktree redirects its checkout.
     if (!*label && strcmp(checkout, a->root)) {
@@ -2454,10 +2551,12 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
         snprintf(p, sizeof p, "%s/.git", checkout);
         capture_pointer(a, p, checkout, gitdir ? gitdir : a->active, "gitdir: ", s);
     }
-    return true;
+    return !s->error;
 }
 
 static bool guard_capture(GitAdmin *a, GuardSet *s) {
+    if (a->incomplete) { s->error = "incomplete Git administration scan (limit or read error)"; return false; }
+    s->bytes_left = 64u << 20;
     const char *self = real_dir(a->active) ? a->active : NULL;
     if (!capture_repo(a, self, a->common, "", s)) return false;
     if (self) {
@@ -2471,8 +2570,9 @@ static bool guard_capture(GitAdmin *a, GuardSet *s) {
         snprintf(label, sizeof label, "submodule %s", g + strlen(a->modules) + 1);
         if (!capture_repo(a, g, g, label, s)) return false;
     }
+    if (s->error) return false;
     gs_finish(s);
-    return true;
+    return !s->error;
 }
 
 // A value from the World's configuration goes to the user's terminal: control bytes are shown
@@ -2787,10 +2887,11 @@ static int mount_cmp(const void *x, const void *y) {
 static char **linux_git_mounts(const GitAdmin *a, StrList *keep) {
     char p[WFS_PATH_MAX];
     // Kept as "r<path>" (read-only) or "w<path>" (bound onto itself, writable).
+    bool complete = true;
     auto add = [&](const char *path, bool ro, bool dir) {
         char e[WFS_PATH_MAX + 1];
         if ((dir ? real_dir(path) : real_file(path)) && (size_t)snprintf(e, sizeof e, "%c%s", ro ? 'r' : 'w', path) < sizeof e)
-            sl_push(keep, e);
+            if (!sl_push(keep, e)) complete = false;
     };
     snprintf(p, sizeof p, "%s/.git", a->root); add(p, true, false);
     snprintf(p, sizeof p, "%s/.world-git", a->root); add(p, false, true);
@@ -2810,6 +2911,7 @@ static char **linux_git_mounts(const GitAdmin *a, StrList *keep) {
         snprintf(p, sizeof p, "%s/hooks", a->gitdirs.v[i]);
         add(p, true, true);
     }
+    if (!complete) return NULL;
     size_t n = keep->n;
     Mount *m = (Mount *)calloc(n ? n : 1, sizeof *m);
     char **args = (char **)calloc(3 * n + 1, sizeof *args);
@@ -2892,10 +2994,25 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
     GuardSet before = {};
     bool watch = false;
     if (git_world) {
+        if (admin.incomplete && sandbox) {
+            git_admin_free(&admin);
+            wfs_world_unlock_exec(s, w, lockfd);
+            return refuse("refusing sandboxed exec: incomplete Git administration scan (limit or read error)",
+                          "world exec W<n> --no-sandbox -- <cmd>");
+        }
         watch = guard_capture(&admin, &before);
+        if (!watch && before.error && sandbox) {
+            fprintf(stderr, "world: note: Git guard unavailable: %s\n", before.error);
+            gs_free(&before);
+            git_admin_free(&admin);
+            wfs_world_unlock_exec(s, w, lockfd);
+            return refuse("refusing sandboxed exec: incomplete Git hooks or administration capture",
+                          "world exec W<n> --no-sandbox -- <cmd>");
+        }
         if (!watch)
             fprintf(stderr, "world: note: could not read W%llu's Git configuration; exec will not report "
-                    "changed Git settings that run commands\n", (unsigned long long)w);
+                    "changed Git settings that run commands (%s)\n", (unsigned long long)w,
+                    before.error ? before.error : "configuration query failed");
     }
 
     char prof[WFS_PATH_MAX] = {0};
@@ -3007,7 +3124,8 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
         if (git_admin_find(id.path, &now)) {
             if (guard_capture(&now, &after)) guard_report(&before, &after);
             else fprintf(stderr, "world: note: could not read W%llu's Git configuration after the command; "
-                         "changed Git settings that run commands are not reported\n", (unsigned long long)w);
+                         "changed Git settings that run commands are not reported (%s)\n", (unsigned long long)w,
+                         after.error ? after.error : "configuration query failed");
         } else {
             fprintf(stderr, "world: WARNING: exec removed or replaced W%llu's Git administration; "
                     "changed Git hooks and settings could not be inspected\n", (unsigned long long)w);
