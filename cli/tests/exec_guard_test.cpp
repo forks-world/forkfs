@@ -53,12 +53,41 @@ int main() {
     for (const char *k : runs) {
         if (!guard_key_runs_command(k, "cmd")) { fprintf(stderr, "%s should be watched\n", k); exit(1); }
     }
-    // `!` aliases and `!` submodule update commands only.
+    // All aliases can dispatch external commands or inject -c command-running settings.
+    // Submodule update runs commands only with a leading `!`.
     CHECK(guard_key_runs_command("alias.x", "!rm -rf /"));
-    CHECK(!guard_key_runs_command("alias.co", "checkout"));
+    CHECK(guard_key_runs_command("alias.co", "checkout"));
+    CHECK(guard_key_runs_command("alias.x", "-c core.sshCommand=./payload ls-remote origin"));
+    CHECK(guard_key_runs_command("alias.external", "custom-command"));
     CHECK(guard_key_runs_command("submodule.lib.update", "!sh evil"));
     CHECK(!guard_key_runs_command("submodule.lib.update", "rebase"));
-    CHECK(!guard_key_runs_command("alias.x", NULL));
+    CHECK(guard_key_runs_command("alias.x", NULL));
+
+    // Helper transports can execute programs through direct URLs or rewrite targets.
+    const char *helpers[] = {"::repo", "ext::sh -c evil", "custom::repo", "https::repo", "ssh::repo",
+                            "custom://repo", "9helper://repo", "HTTPS://example.com/repo", "a+b.c-d://repo"};
+    for (const char *url : helpers) {
+        CHECK(guard_key_runs_command("remote.origin.url", url));
+        CHECK(guard_key_runs_command("remote.origin.pushurl", url));
+        char key[256];
+        snprintf(key, sizeof key, "url.%s.insteadOf", url);
+        CHECK(guard_key_runs_command(key, "https://example.com/"));
+        snprintf(key, sizeof key, "url.%s.pushInsteadOf", url);
+        CHECK(guard_key_runs_command(key, "work:"));
+    }
+    const char *ordinary[] = {"ssh://host/repo", "http://host/repo", "https://host/repo",
+                             "ftp://host/repo", "ftps://host/repo", "git://host/repo", "file:///repo", "git+ssh://host/repo", "ssh+git://host/repo",
+                             "user@host:repo", "user@[::1]:repo", "[::1]:repo", "ssh://[::1]/repo", "./path::repo",
+                             "/tmp/path::repo", "relative/path::repo", "host:repo", "_x::repo", "x_y::repo", "bad_helper://repo", ""};
+    for (const char *url : ordinary) {
+        CHECK(!guard_key_runs_command("remote.origin.url", url));
+        CHECK(!guard_key_runs_command("remote.origin.pushurl", url));
+        char key[256];
+        snprintf(key, sizeof key, "url.%s.insteadof", url);
+        CHECK(!guard_key_runs_command(key, "ext::value-is-not-the-target"));
+    }
+    CHECK(!guard_key_runs_command("remote.url", "ext::evil"));
+    CHECK(!guard_key_runs_command("remote.origin.url", NULL));
 
     // Keys that legitimately change during agent work, or only name things.
     const char *quiet[] = {

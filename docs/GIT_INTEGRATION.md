@@ -302,12 +302,17 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
 `remote.*.uploadpack|receivepack|vcs`, `uploadpack.packobjectshook`,
 `sendemail[.*].tocmd|cccmd|headercmd|sendmailcmd|smtpserver`, `include.path`,
-`includeif.*.path`, `alias.*` whose value starts with `!`, `submodule.*.update` whose value
+`includeif.*.path`, `alias.*` (including ordinary aliases that dispatch commands or inject `-c` settings), `submodule.*.update` whose value
 starts with `!`, `pager.*`, `interactive.difffilter`, `web.browser`, `browser.*.cmd|path`, `instaweb.httpd`, `guitool.*.cmd`, `imap.tunnel`,
 `man.*.cmd|path`, `init.templatedir`, `hook.*.command`, `trailer.*.command|cmd`, `tar.*.command`,
 `protocol.allow` and `protocol.*.allow` (which can enable `ext::` URLs), and
-`lfs.*.path|clean|smudge` (custom transfer agents and extensions). The list is
-`kGuardKeys` in `cli/exec_guard.h`. Each repository is read before and after with three
+`lfs.*.path|clean|smudge` (custom transfer agents and extensions). Remote `url`/`pushurl`
+changes are also reported when the value selects a transport helper (`ext::...`, `custom://...`).
+For `url.<target>.insteadOf`/`pushInsteadOf`, the target in the key is checked, not the rewrite
+prefix in the value. Ordinary URLs using exact lowercase `file`, `git`, `ssh`, `git+ssh`,
+`ssh+git`, `http`, `https`, `ftp` and `ftps` schemes, scp-style addresses and local paths stay quiet. Explicit
+`<transport>::` always selects a helper; scheme names are case-sensitive. The key list and
+value-sensitive rules are in `cli/exec_guard.h`. Each repository is read before and after with three
 queries: a configuration listing, `--path --get core.hooksPath`, and `rev-parse --show-toplevel`,
 so Git expands `~user` and applies its checkout rules when resolving relative hooks. These use the absolute Git 2.48+ path
 selected by CMake at build time, unaffected by runtime `PATH`, and do not execute hooks or
@@ -316,7 +321,8 @@ macOS, or Bubblewrap with network and process isolation on Linux. It cannot writ
 access the network; account lookup on macOS is allowed for `~user` expansion. Each query has
 a five-second deadline and a 64 MiB output limit; no tree is walked. If configuration cannot
 be read (missing configured Git or sandbox, a malformed file, or a query exceeding these
-limits), exec says so in one `note:` line and reports nothing;
+limits), sandboxed exec refuses before running the command; `--no-sandbox` says so in a
+`note:` line and runs without the report;
 a World without `.world-git` at startup gets neither the rules nor the report. If the command
 removes or replaces previously detected Git administration, exec warns that the final hooks
 and settings could not be inspected. An incomplete administration scan (read/allocation error,

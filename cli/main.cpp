@@ -3001,8 +3001,9 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
                           "world exec W<n> --no-sandbox -- <cmd>");
         }
         watch = guard_capture(&admin, &before);
-        if (!watch && before.error && sandbox) {
-            fprintf(stderr, "world: note: Git guard unavailable: %s\n", before.error);
+        if (!watch && sandbox) {
+            fprintf(stderr, "world: note: Git guard unavailable: %s\n",
+                    before.error ? before.error : "configuration query failed");
             gs_free(&before);
             git_admin_free(&admin);
             wfs_world_unlock_exec(s, w, lockfd);

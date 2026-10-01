@@ -4524,7 +4524,7 @@ class GitWorldTest(unittest.TestCase):
                               "git config alias.co checkout", '--require-sandbox')
         self.assertIn(b'local core.fsmonitor: touch /tmp/x -> (unset)\n', p.stderr)
         self.assertIn(b'local alias.x: (unset) -> !sh -c evil\n', p.stderr)
-        self.assertNotIn(b'alias.co', p.stderr)
+        self.assertIn(b'local alias.co: (unset) -> checkout', p.stderr)
         # A core.hooksPath outside the tree is guarded like the hooks directory; one inside the
         # tree (husky's .husky) is project content that `git status` shows, and stays writable.
         shared = self.root / 'shared-hooks'
@@ -4684,6 +4684,21 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'incomplete Git hooks or administration capture', p.stderr)
         self.assertFalse((one / 'should-not-run').exists())
 
+    def test_exec_reports_alias_and_remote_helper_configuration(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        p = self.exec_sh(wid, "git config alias.probe '-c core.sshCommand=./payload ls-remote origin' && "
+                         "git config remote.agent.url 'ext::sh -c evil' && "
+                         "git config remote.agent.pushurl 'custom://repository' && "
+                         "git config 'url.ext::sh -c evil.insteadOf' 'https://example.com/' && "
+                         "git config 'url.custom://repository.pushInsteadOf' 'work:'", '--no-sandbox')
+        for key in (b'alias.probe', b'remote.agent.url', b'remote.agent.pushurl',
+                    b'url.ext::sh -c evil.insteadof', b'url.custom://repository.pushinsteadof'):
+            self.assertIn(b'local ' + key + b': (unset) -> ', p.stderr)
+        p = self.exec_sh(wid, "git config remote.ordinary.url 'https://example.org/repo' && "
+                         "git config remote.ordinary.pushurl 'git@example.org:repo'", '--no-sandbox')
+        self.assertNotIn(b'WARNING', p.stderr)
+
     def test_exec_reports_disappearing_git_administration(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
@@ -4731,6 +4746,18 @@ class GitWorldTest(unittest.TestCase):
                            env=self.env, capture_output=True, timeout=15)
         self.assertEqual(p.returncode, 9, p.stderr)
         self.assertIn(b'could not read', p.stderr)
+
+        # An unavailable initial query must not silently omit hook protections.
+        p = subprocess.run((WORLD, 'exec', wid, '--require-sandbox', '--', '/bin/sh', '-c',
+                            'touch should-not-run'), env=self.env, capture_output=True, timeout=15)
+        self.assertEqual(p.returncode, 3, p.stderr)
+        self.assertIn(b'Git guard unavailable', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+        fifo.unlink()
+        fifo.write_text('[broken config\n')
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'Git guard unavailable', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
 
     def test_exec_config_inherited_command_scope_and_expanded_hooks(self):
         import pwd

@@ -55,7 +55,7 @@ static const GuardKey kGuardKeys[] = {
     {"sendemail", "headercmd", 2, false}, {"sendemail", "sendmailcmd", 2, false},
     {"sendemail", "smtpserver", 2, false},
     {"include", "path", 0, false},        {"includeif", "path", 1, false},
-    {"alias", NULL, 2, true},             {"submodule", "update", 1, true},
+    {"alias", NULL, 2, false},             {"submodule", "update", 1, true},
     {"pager", NULL, 0, false},            {"interactive", "difffilter", 0, false},
     {"imap", "tunnel", 0, false},
     {"instaweb", "httpd", 0, false},      {"guitool", "cmd", 1, false},
@@ -68,12 +68,39 @@ static const GuardKey kGuardKeys[] = {
     {"lfs", "smudge", 1, false},
 };
 
+// Git's transport prefix grammar (url.c): an alphanumeric first byte, then
+// alphanumerics or +.-. Explicit helper syntax is distinct from scp/IPv6/local paths.
+static inline bool guard_helper_url(const char *url, size_t len) {
+    if (!url || !len) return false;
+    size_t n = 0;
+    for (; n < len; ++n) {
+        unsigned char c = (unsigned char)url[n];
+        bool alnum = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+        if (!alnum && !(n && (c == '+' || c == '.' || c == '-'))) break;
+    }
+    if (n + 1 >= len || url[n] != ':') return false;
+    if (url[n + 1] == ':') return true;  // even ssh:: and https:: explicitly select helpers
+    if (!n || n + 2 >= len || url[n + 1] != '/' || url[n + 2] != '/') return false;
+    // Native transports and conventional curl helpers stay quiet for ordinary URL edits.
+    // Git's helper dispatch is case-sensitive, so HTTPS:// must not match https:// here.
+    const char *ordinary[] = {"file", "git", "ssh", "git+ssh", "ssh+git", "http", "https", "ftp", "ftps"};
+    for (size_t i = 0; i < sizeof ordinary / sizeof ordinary[0]; ++i)
+        if (strlen(ordinary[i]) == n && !memcmp(url, ordinary[i], n)) return false;
+    return true;
+}
+
 static inline bool guard_key_runs_command(const char *key, const char *value) {
     const char *first = strchr(key, '.'), *last = strrchr(key, '.');
     if (!first || !last[1]) return false;
     size_t section = (size_t)(first - key);
     bool has_sub = last != first;
     const char *name = last + 1;
+    if (has_sub && section == 6 && !strncasecmp(key, "remote", section) &&
+        (!strcasecmp(name, "url") || !strcasecmp(name, "pushurl")))
+        return value && guard_helper_url(value, strlen(value));
+    if (has_sub && section == 3 && !strncasecmp(key, "url", section) &&
+        (!strcasecmp(name, "insteadof") || !strcasecmp(name, "pushinsteadof")))
+        return guard_helper_url(first + 1, (size_t)(last - first - 1));
     for (size_t i = 0; i < sizeof kGuardKeys / sizeof kGuardKeys[0]; ++i) {
         const GuardKey &k = kGuardKeys[i];
         if (strlen(k.section) != section || strncasecmp(key, k.section, section)) continue;
