@@ -4784,6 +4784,49 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'Git hooks and settings uninspected after the command', p.stderr)
         self.assertIn(b'64 MiB capture budget', p.stderr)
 
+    def test_exec_reports_activating_maintenance_commands(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'remote.dormant.url', 'ext::touch maintenance-helper-ran')
+        hook = one / '.world-git/repo.git/hooks/pre-auto-gc'
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text('#!/bin/sh\ntouch maintenance-hook-ran\n')
+        hook.chmod(0o755)
+        values = {'receive.autogc': 'true', 'maintenance.auto': 'true',
+                  'gc.auto': '1', 'gc.autoPackLimit': '1', 'maintenance.strategy': 'incremental',
+                  'maintenance.gc.enabled': 'true', 'maintenance.prefetch.enabled': 'true',
+                  'maintenance.prefetch.schedule': 'hourly'}
+        p = self.exec_sh(wid, ' && '.join('git config ' + key + ' ' + value
+                                        for key, value in values.items()) + '; exit 7', '--no-sandbox', code=7)
+        for key, value in values.items():
+            self.assertIn(b'local ' + key.lower().encode() + b': (unset) -> ' + value.encode(), p.stderr)
+        self.assertNotIn(b'local remote.dormant.url:', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertFalse((one / 'maintenance-helper-ran').exists())
+        self.assertFalse((one / 'maintenance-hook-ran').exists())
+
+    def test_exec_reports_enabling_promisor_and_checkout_hook(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'remote.dormant.url', 'ext::touch promisor-helper-ran')
+        self.git(one, 'config', 'core.repositoryformatversion', '1')
+        hook = one / '.world-git/repo.git/hooks/push-to-checkout'
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text('#!/bin/sh\ntouch checkout-hook-ran\n')
+        hook.chmod(0o755)
+        p = self.exec_sh(wid, 'git config remote.dormant.promisor true && '
+                         'git config remote.dormant.partialCloneFilter blob:none && '
+                         'git config extensions.partialClone dormant && '
+                         'git config receive.denyCurrentBranch updateInstead; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local remote.dormant.promisor: (unset) -> true', p.stderr)
+        self.assertIn(b'local remote.dormant.partialclonefilter: (unset) -> blob:none', p.stderr)
+        self.assertIn(b'local extensions.partialclone: (unset) -> dormant', p.stderr)
+        self.assertIn(b'local receive.denycurrentbranch: (unset) -> updateInstead', p.stderr)
+        self.assertNotIn(b'local remote.dormant.url:', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertFalse((one / 'promisor-helper-ran').exists())
+        self.assertFalse((one / 'checkout-hook-ran').exists())
+
     def test_exec_reports_enabling_remote_archive_command(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

@@ -58,6 +58,11 @@ int main() {
 
     // Keys that make Git run a command.
     const char *runs[] = {
+        "receive.autogc", "maintenance.auto", "maintenance.strategy", "gc.auto", "gc.autopacklimit",
+        "maintenance.gc.enabled", "maintenance.prefetch.enabled", "maintenance.prefetch.schedule",
+        "MAINTENANCE.gc.ENABLED", "Maintenance.prefetch.Schedule",
+        "remote.origin.partialclonefilter", "extensions.partialclone",
+        "receive.denycurrentbranch", "remote.origin.promisor", "remote.team.origin.promisor",
         "uploadarchive.allowunreachable", "tar.custom.remote", "tar.tar.gz.remote",
         "core.attributesfile", "core.worktree", "tar.tar.gz.command", "tar.custom.command", "gc.recentobjectshook",
         "core.hookspath", "core.fsmonitor", "core.sshcommand", "core.editor", "core.pager",
@@ -149,6 +154,12 @@ int main() {
 
     // Keys that legitimately change during agent work, or only name things.
     const char *quiet[] = {
+        "receive.custom.autogc", "maintenance.custom.auto", "maintenance.custom.strategy",
+        "gc.custom.auto", "gc.custom.autopacklimit", "maintenance.GC.enabled", "maintenance.Prefetch.enabled",
+        "maintenance.gc.schedule", "maintenance.commit-graph.enabled", "maintenance.repack.enabled",
+        "maintenance.team.prefetch.enabled", "maintenance.enabled",
+        "remote.partialclonefilter", "extensions.custom.partialclone",
+        "receive.custom.denycurrentbranch", "remote.promisor",
         "sendemail.work.identity", "sendemail.work.annotation", "sendemail.suppress", "fetch.custom.all", "remotes",
         "remote.skipdefaultupdate", "remote.skipfetchall", "remote.origin.skipfetch",
         "user.email", "user.name", "remote.origin.fetch", "remote.origin.name", "url.insteadof", "url.pushinsteadof",

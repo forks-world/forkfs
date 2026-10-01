@@ -332,7 +332,13 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `remote.*.skipdefaultupdate|skipfetchall`, `fetch.all`, `remotes.*` (can activate unchanged remote helpers),
 `remote.*.uploadpack|receivepack|vcs`, `branch.*.mergeoptions`, `pull.twohead`, `pull.octopus` (can select external merge strategies),
 `branch.*.remote|pushremote`, `remote.pushdefault` (can select preconfigured helper remotes),
+`remote.*.promisor|partialclonefilter`, `extensions.partialclone`
+(can activate a configured helper when fetching missing objects),
 `uploadpack.packobjectshook`, `receive.procreceiverefs` (activates the configured proc-receive hook),
+`receive.denycurrentbranch` (can enable the existing push-to-checkout hook),
+`receive.autogc`, `maintenance.auto`, `gc.auto`, `gc.autopacklimit`, `maintenance.strategy`,
+`maintenance.gc.enabled`, `maintenance.prefetch.enabled|schedule`
+(can activate existing maintenance hooks or remote helpers; task names are exact),
 `sendemail.identity` (selects configured mail commands),
 `sendemail[.*].annotate|suppresscc|validate|useimaponly|imapsentfolder` (activate configured editors, mail commands or hooks),
 `sendemail[.*].tocmd|cccmd|headercmd|sendmailcmd|smtpserver`, `include.path`,

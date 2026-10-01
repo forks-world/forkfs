@@ -107,6 +107,11 @@ static const GuardKey kGuardKeys[] = {
     {"url", "insteadof", 1, false},       {"url", "pushinsteadof", 1, false},
     {"remote", "uploadpack", 1, false},   {"remote", "receivepack", 1, false},
     {"receive", "procreceiverefs", 0, false},
+    {"receive", "autogc", 0, false},    {"maintenance", "auto", 0, false},
+    {"maintenance", "strategy", 0, false},
+    {"gc", "auto", 0, false},          {"gc", "autopacklimit", 0, false},
+    {"receive", "denycurrentbranch", 0, false}, {"remote", "promisor", 1, false},
+    {"remote", "partialclonefilter", 1, false}, {"extensions", "partialclone", 0, false},
     {"pull", "twohead", 0, false},        {"pull", "octopus", 0, false},
     {"branch", "mergeoptions", 1, false}, {"branch", "remote", 1, false},
     {"branch", "pushremote", 1, false},   {"remote", "pushdefault", 0, false},
@@ -158,6 +163,15 @@ static inline bool guard_key_runs_command(const char *key, const char *value) {
     size_t section = (size_t)(first - key);
     bool has_sub = last != first;
     const char *name = last + 1;
+    // Git's task names are case-sensitive subsections; unrelated maintenance tasks do
+    // not select these hook- or remote-running operations.
+    if (has_sub && section == 11 && !strncasecmp(key, "maintenance", section)) {
+        size_t task = (size_t)(last - first - 1);
+        bool gc = task == 2 && !memcmp(first + 1, "gc", 2);
+        bool prefetch = task == 8 && !memcmp(first + 1, "prefetch", 8);
+        if ((gc || prefetch) && !strcasecmp(name, "enabled")) return true;
+        if (prefetch && !strcasecmp(name, "schedule")) return true;
+    }
     if (!has_sub && !strcasecmp(name, "sort") &&
         ((section == 6 && !strncasecmp(key, "branch", section)) ||
          (section == 3 && !strncasecmp(key, "tag", section))))
