@@ -299,11 +299,11 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `core.gitproxy`, `core.alternaterefscommand`, `sequence.editor`, `credential.helper` and
 `credential.*.helper`, `filter.*.clean|smudge|process`, `diff.external`,
 `diff.*.command|textconv`, `merge.*.driver`, `mergetool.*.cmd|path`, `difftool.*.cmd|path`,
-`gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`,
+`gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
 `remote.*.uploadpack|receivepack|vcs`, `uploadpack.packobjectshook`,
 `sendemail[.*].tocmd|cccmd|headercmd|sendmailcmd|smtpserver`, `include.path`,
 `includeif.*.path`, `alias.*` whose value starts with `!`, `submodule.*.update` whose value
-starts with `!`, `pager.*`, `interactive.difffilter`, `web.browser`, `browser.*.cmd|path`,
+starts with `!`, `pager.*`, `interactive.difffilter`, `web.browser`, `browser.*.cmd|path`, `instaweb.httpd`, `guitool.*.cmd`,
 `man.*.cmd|path`, `init.templatedir`, `hook.*.command`, `trailer.*.command|cmd`, `tar.*.command`,
 `protocol.allow` and `protocol.*.allow` (which can enable `ext::` URLs), and
 `lfs.*.path|clean|smudge` (custom transfer agents and extensions). The list is

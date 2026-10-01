@@ -4615,6 +4615,8 @@ class GitWorldTest(unittest.TestCase):
         self.assert_denied(wid, 'echo changed > .world-git/hidden/.husky/pre-commit')
         p = self.exec_sh(wid, "git config tar.custom.command 'sh -c evil'", '--no-sandbox')
         self.assertIn(b'local tar.custom.command: (unset) -> sh -c evil', p.stderr)
+        p = self.exec_sh(wid, "git config gc.recentObjectsHook 'sh -c evil'", '--no-sandbox')
+        self.assertIn(b'local gc.recentobjectshook: (unset) -> sh -c evil', p.stderr)
 
     def test_exec_reports_disappearing_git_administration(self):
         self.world('init', str(self.source))

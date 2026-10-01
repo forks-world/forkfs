@@ -35,7 +35,7 @@ int main() {
 
     // Keys that make Git run a command.
     const char *runs[] = {
-        "core.worktree", "tar.tar.gz.command", "tar.custom.command",
+        "core.worktree", "tar.tar.gz.command", "tar.custom.command", "gc.recentobjectshook",
         "core.hookspath", "core.fsmonitor", "core.sshcommand", "core.editor", "core.pager",
         "core.askpass", "core.gitproxy", "core.alternaterefscommand", "sequence.editor",
         "credential.helper", "credential.https://example.com.helper", "filter.lfs.clean",
@@ -45,7 +45,7 @@ int main() {
         "remote.origin.receivepack", "remote.origin.vcs", "uploadpack.packobjectshook",
         "sendemail.tocmd", "sendemail.work.sendmailcmd", "sendemail.smtpserver", "include.path",
         "includeif.gitdir:/x/.path", "pager.log", "interactive.difffilter", "web.browser",
-        "browser.ff.cmd", "man.x.cmd", "init.templatedir", "hook.lint.command",
+        "instaweb.httpd", "guitool.test.cmd", "browser.ff.cmd", "man.x.cmd", "init.templatedir", "hook.lint.command",
         "trailer.sign.command", "protocol.allow", "protocol.ext.allow",
         "lfs.customtransfer.x.path", "lfs.extension.x.clean",
         "CORE.HOOKSPATH", "Core.FsMonitor",
@@ -64,8 +64,9 @@ int main() {
     const char *quiet[] = {
         "user.email", "user.name", "remote.origin.url", "remote.origin.fetch",
         "branch.main.remote", "branch.main.merge", "core.bare", "tar.command", "tar.custom.remote",
-        "core.editorx", "filter.clean", "diff.command", "merge.driver", "core.x.hookspath",
+        "gc.custom.recentobjectshook", "gc.pruneexpire", "core.editorx", "filter.clean", "diff.command", "merge.driver", "core.x.hookspath",
         "include.x.path", "includeif.path", "hook.command", "remote.uploadpack", "merge.tool",
+        "instaweb.port", "instaweb.custom.httpd", "guitool.cmd", "guitool.test.title",
         "credential.username", "gpg.format", "init.defaultbranch", "", ".", "core.", "nodot",
     };
     for (const char *k : quiet) {
