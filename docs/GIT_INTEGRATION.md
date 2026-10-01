@@ -339,6 +339,8 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `submodule.active`, `submodule.*.active`, `submodule.*.url` (can activate configured update commands),
 `submodule.recurse`, `fetch.recursesubmodules`, `push.recursesubmodules`,
 `submodule.*.fetchrecursesubmodules` (can activate child fetch/push helpers and hooks),
+`submodule.*.ignore`, `diff.ignoresubmodules`, `diff.submodule`, `status.submodulesummary`
+(can activate child status, diff or log commands and their configured programs),
 `includeif.*.path`, `alias.*` (including ordinary aliases that dispatch commands or inject `-c` settings), `submodule.*.update` whose value
 starts with `!`, `pager.*`, `interactive.difffilter`, `web.browser`, `help.browser`, `help.format`, `instaweb.browser`, `man.viewer` (select configured viewers), `browser.*.cmd|path`, `instaweb.httpd`, `guitool.*.cmd`, `imap.tunnel`,
 `man.*.cmd|path`, `init.templatedir`, `hook.*.command`, `trailer.*.command|cmd`, `tar.*.command`,

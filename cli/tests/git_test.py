@@ -5152,6 +5152,27 @@ class GitWorldTest(unittest.TestCase):
         self.assertNotIn(b'local man.payload.cmd:', p.stderr)
         self.assertFalse((one / 'selected-help-ran').exists())
 
+    def test_exec_reports_enabling_submodule_status(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        child = one / 'libs/lib'
+        for key in ('core.fsmonitor', 'diff.external', 'gpg.program'):
+            self.git(child, 'config', key, 'touch child-program-ran')
+        self.git(child, 'config', 'log.showSignature', 'true')
+        self.git(one, 'config', 'submodule.lib-module.ignore', 'all')
+        p = self.exec_sh(wid, 'git config submodule.lib-module.ignore none && '
+                         'git config diff.ignoreSubmodules none && git config diff.submodule diff && '
+                         'git config status.submoduleSummary true; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local submodule.lib-module.ignore: all -> none', p.stderr)
+        self.assertIn(b'local diff.ignoresubmodules: (unset) -> none', p.stderr)
+        self.assertIn(b'local diff.submodule: (unset) -> diff', p.stderr)
+        self.assertIn(b'local status.submodulesummary: (unset) -> true', p.stderr)
+        for key in (b'core.fsmonitor', b'diff.external', b'gpg.program', b'log.showsignature'):
+            self.assertNotIn(b'local ' + key + b':', p.stderr)
+        self.assertFalse((one / 'child-program-ran').exists())
+        self.assertFalse((child / 'child-program-ran').exists())
+
     def test_exec_reports_selecting_preconfigured_merge_driver(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
