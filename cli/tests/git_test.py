@@ -5010,6 +5010,67 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((one / 'libs/one/helper-ran').exists())
         self.assertFalse((one / 'libs/two/helper-ran').exists())
 
+    def test_exec_reports_selecting_sendemail_identity(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'sendemail.work.sendmailcmd', 'touch sendmail-ran')
+        self.git(one, 'config', 'sendemail.work.cccmd', 'touch sendmail-ran')
+        self.git(one, 'config', 'core.editor', 'touch sendmail-ran')
+        self.git(one, 'config', 'imap.tunnel', 'touch sendmail-ran')
+        p = self.exec_sh(wid, 'git config sendemail.identity work; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local sendemail.identity: (unset) -> work', p.stderr)
+        self.assertNotIn(b'local sendemail.work.sendmailcmd:', p.stderr)
+        values = {'sendemail.work.annotate': 'true', 'sendemail.work.suppresscc': 'none',
+                  'sendemail.work.validate': 'true', 'sendemail.work.useimaponly': 'false',
+                  'sendemail.work.imapsentfolder': 'Sent'}
+        p = self.exec_sh(wid, ' && '.join('git config ' + key + ' ' + value
+                                        for key, value in values.items()), '--no-sandbox')
+        for key, value in values.items():
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> ' + value.encode(), p.stderr)
+        for key in (b'sendemail.work.sendmailcmd', b'sendemail.work.cccmd', b'core.editor', b'imap.tunnel'):
+            self.assertNotIn(b'local ' + key + b':', p.stderr)
+        self.assertFalse((one / 'sendmail-ran').exists())
+
+    def test_exec_refuses_hooks_path_aliases_and_guards_missing_direct_path(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        external = self.root / 'external-config'
+        external.mkdir()
+        (one / 'hook-link').symlink_to(external, target_is_directory=True)
+        for path in ('hook-link/new/hooks', 'hook-link/../other-hooks'):
+            self.git(one, 'config', 'core.hooksPath', path)
+            p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+            self.assertIn(b'could not resolve Git hooks path', p.stderr)
+            self.assertFalse((one / 'should-not-run').exists())
+        (one / 'dangling-hooks').symlink_to(external / 'absent', target_is_directory=True)
+        self.git(one, 'config', 'core.hooksPath', 'dangling-hooks/new')
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'could not resolve Git hooks path', p.stderr)
+        self.git(one, 'config', 'core.hooksPath', 'absent/../ambiguous-hooks')
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'could not resolve Git hooks path', p.stderr)
+        (one / 'ordinary-file').write_text('not a directory')
+        self.git(one, 'config', 'core.hooksPath', 'ordinary-file/hooks')
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'could not resolve Git hooks path', p.stderr)
+        local = one / 'local-hooks'
+        local.mkdir()
+        (one / 'local-alias').symlink_to(local, target_is_directory=True)
+        self.git(one, 'config', 'core.hooksPath', 'local-alias')
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'could not resolve Git hooks path', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+        direct = external / 'new-hooks'
+        self.git(one, 'config', 'core.hooksPath', str(direct))
+        self.assert_denied(wid, 'mkdir ' + shlex.quote(str(direct)))
+        self.assertFalse(direct.exists())
+        # Existing parent/.. semantics remain valid without a mutable alias.
+        parent = external / 'existing'
+        parent.mkdir()
+        self.git(one, 'config', 'core.hooksPath', str(parent / '../new-hooks'))
+        self.assert_denied(wid, 'mkdir ' + shlex.quote(str(direct)))
+        self.assertFalse(direct.exists())
+
     def test_exec_reports_enabling_skipped_remotes(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

@@ -332,6 +332,8 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `remote.*.uploadpack|receivepack|vcs`, `branch.*.mergeoptions`, `pull.twohead`, `pull.octopus` (can select external merge strategies),
 `branch.*.remote|pushremote`, `remote.pushdefault` (can select preconfigured helper remotes),
 `uploadpack.packobjectshook`, `receive.procreceiverefs` (activates the configured proc-receive hook),
+`sendemail.identity` (selects configured mail commands),
+`sendemail[.*].annotate|suppresscc|validate|useimaponly|imapsentfolder` (activate configured editors, mail commands or hooks),
 `sendemail[.*].tocmd|cccmd|headercmd|sendmailcmd|smtpserver`, `include.path`,
 `submodule.active`, `submodule.*.active`, `submodule.*.url` (can activate configured update commands),
 `submodule.recurse`, `fetch.recursesubmodules`, `push.recursesubmodules`,
@@ -353,7 +355,11 @@ fetch refspecs, descriptive names and `branch.*.merge` stay quiet.
 Each repository is read before and after with five
 queries: a configuration listing, `--path --get core.hooksPath`, `rev-parse --show-toplevel`,
 and `git var GIT_ATTR_GLOBAL`/`GIT_ATTR_SYSTEM`,
-so Git expands `~user` and applies its checkout rules when resolving relative hooks. These use the absolute Git 2.48+ path
+so Git expands `~user` and applies its checkout rules when resolving relative hooks. Missing hook directories resolve through existing ancestors;
+unresolvable ancestors and `..` in a missing suffix invalidate capture. Mutable symlink components
+in effective hook paths are unsupported, even inside the project: an alias could be retargeted
+and restored during exec. Only the exact root-owned macOS `/tmp`, `/var` and `/etc` system
+aliases to `/private` counterparts are accepted, with a protected root-owned parent. The queries use the absolute Git 2.48+ path
 selected by CMake at build time, unaffected by runtime `PATH`, and do not execute hooks or
 fsmonitor. Configuration introspection runs under a separate read-only sandbox: Seatbelt on
 macOS, or Bubblewrap with network and process isolation on Linux. It cannot write files or

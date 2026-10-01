@@ -2564,6 +2564,43 @@ static void capture_pointer(const GitAdmin *a, const char *path, const char *bas
     gs_add(s, id, val);
 }
 
+// A writable alias could be retargeted during exec and restored before the final capture.
+// Only macOS's fixed root-owned system aliases are safe to accept in hook paths.
+static bool hooks_path_without_aliases(const char *path) {
+    char prefix[2 * WFS_PATH_MAX];
+    if ((size_t)snprintf(prefix, sizeof prefix, "%s", path) >= sizeof prefix) return false;
+    for (size_t i = 1;; ++i) {
+        if (prefix[i] && prefix[i] != '/') continue;
+        char end = prefix[i];
+        prefix[i] = 0;
+        struct stat st;
+        if (lstat(prefix, &st) != 0) {
+            if (errno != ENOENT) return false;
+        } else if (S_ISLNK(st.st_mode)) {
+            bool system_alias = false;
+#ifdef __APPLE__
+            if (st.st_uid == 0 && (!strcmp(prefix, "/tmp") || !strcmp(prefix, "/var") ||
+                                   !strcmp(prefix, "/etc"))) {
+                struct stat parent;
+                char target[64], expected[64];
+                ssize_t n = readlink(prefix, target, sizeof target - 1);
+                if (n >= 0 && (size_t)n < sizeof target - 1) {
+                    target[n] = 0;
+                    snprintf(expected, sizeof expected, "/private%s", prefix);
+                    system_alias = (!strcmp(target, expected) || !strcmp(target, expected + 1)) &&
+                                   lstat("/", &parent) == 0 && parent.st_uid == 0 &&
+                                   S_ISDIR(parent.st_mode) && !(parent.st_mode & (S_IWGRP | S_IWOTH));
+                }
+            }
+#endif
+            if (!system_alias) return false;
+        }
+        prefix[i] = end;
+        if (!end) break;
+    }
+    return true;
+}
+
 // Where Git's expanded core.hooksPath sends it: a relative value is
 // resolved from the repository's checkout, as Git does. Every effective directory is
 // reported, including ignored project content. Only paths outside the tree or inside
@@ -2574,16 +2611,32 @@ static bool note_hooks_path(const GitAdmin *a, const char *checkout, const char 
     char p[2 * WFS_PATH_MAX], real[WFS_PATH_MAX];
     int npath = v[0] == '/' ? snprintf(p, sizeof p, "%s", v) :
                              snprintf(p, sizeof p, "%s/%s", checkout, v);
-    if (npath < 0 || (size_t)npath >= sizeof p) return false;
-    char *resolved = realpath(p, NULL);
-    if (resolved) {
-        bool fits = (size_t)snprintf(real, sizeof real, "%s", resolved) < sizeof real;
-        free(resolved);
-        if (!fits) return false;
-    } else {
-        if (errno != ENOENT && errno != ENOTDIR) return false;
-        join_lexical("/", p, real, sizeof real);
-        if (!real[0]) return false;
+    if (npath < 0 || (size_t)npath >= sizeof p || !hooks_path_without_aliases(p)) return false;
+    char prefix[sizeof p];
+    memcpy(prefix, p, (size_t)npath + 1);
+    size_t suffix = (size_t)npath;
+    for (;;) {
+        char *resolved = realpath(prefix, NULL);
+        if (resolved) {
+            int n = snprintf(prefix, sizeof prefix, "%s%s", resolved, p + suffix);
+            free(resolved);
+            if (n < 0 || (size_t)n >= sizeof prefix) return false;
+            join_lexical("/", prefix, real, sizeof real);
+            if (!real[0]) return false;
+            break;
+        }
+        // Resolve existing ancestors before normalizing a missing suffix. An existing
+        // dangling symlink or a non-directory component cannot safely be guessed.
+        if (errno != ENOENT) return false;
+        struct stat st;
+        if (lstat(prefix, &st) == 0 || errno != ENOENT) return false;
+        size_t end = strlen(prefix);
+        while (end > 1 && prefix[end - 1] == '/') prefix[--end] = 0;
+        char *slash = strrchr(prefix, '/');
+        if (!slash || !strcmp(slash + 1, "..")) return false;
+        suffix = (size_t)(slash - prefix);
+        if (slash == prefix) prefix[1] = 0;
+        else *slash = 0;
     }
     if (!strcmp(real, "/dev/null")) return true;
     char admin[WFS_PATH_MAX];
