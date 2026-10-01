@@ -248,7 +248,8 @@ So `world exec` does two things.
 - the directory each repository's effective `core.hooksPath` names (the World's and every
   submodule's, a relative value resolved from that repository's checkout as Git does), when
   that is outside the tree (a global `~/.githooks`, a shared directory) or inside
-  `.world-git`; its hooks are also included in the report below;
+  `.world-git`; its hooks are also included in the report below. This protection applies
+  even inside a submodule whose administration path contains a `hooks` name component;
 - what tells Git where those repositories are: the World's `.git` file,
   `.world-git/repo.git/worktrees/active/commondir`, and the directory entries on the way to
   each repository (`.world-git`, `repo.git`, `worktrees`, `active`, `modules`, each existing

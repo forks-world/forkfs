@@ -6363,6 +6363,19 @@ class GitWorldTest(unittest.TestCase):
                           'git -C tools/hooks commit -qm new', '--require-sandbox')
         (gitdir / 'hooks').mkdir(exist_ok=True)
         self.assert_denied(wid, 'echo evil > .world-git/repo.git/worktrees/active/modules/tools/hooks/hooks/pre-commit')
+        custom = gitdir / 'custom-hooks'
+        custom.mkdir()
+        hook = custom / 'pre-commit'
+        hook.write_text('#!/bin/sh\nexit 0\n')
+        hook.chmod(0o755)
+        self.git(one / 'tools/hooks', 'config', 'core.hooksPath', str(custom))
+        original = hook.read_bytes()
+        self.assert_denied(wid, 'echo evil > ' + shlex.quote(str(hook)))
+        self.assertEqual(hook.read_bytes(), original)
+        self.assert_denied(wid, 'echo evil > ' + shlex.quote(str(custom / 'post-checkout')))
+        self.assertFalse((custom / 'post-checkout').exists())
+        self.exec_sh(wid, 'echo w > tools/hooks/another && git -C tools/hooks add another && '
+                          'git -C tools/hooks commit -qm another', '--require-sandbox')
 
     def test_submodules_survive_deletion_of_the_source_and_their_origins(self):
         status = self.submodule_fixture()

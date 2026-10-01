@@ -3053,8 +3053,6 @@ static bool sb_git_admin(FILE *f, const GitAdmin *a) {
     sb_literal(f, "deny file-write*", p);
     snprintf(p, sizeof p, "%s/hooks", a->common);
     sb_subpath(f, "deny file-write*", p);
-    // (On Linux everything outside the World is read-only already.)
-    for (size_t i = 0; i < a->hooks_paths.n; ++i) sb_subpath(f, "deny file-write*", a->hooks_paths.v[i]);
     if (!sb_module_hooks(f, a->modules)) return false;
     // The regex cannot tell a hooks directory from a submodule whose name has a `hooks`
     // component (modules/tools/hooks). Give such an existing repository back, parents first,
@@ -3073,6 +3071,9 @@ static bool sb_git_admin(FILE *f, const GitAdmin *a) {
         snprintf(p, sizeof p, "%s/hooks", a->gitdirs.v[i]);
         sb_subpath(f, "deny file-write*", p);
     }
+    // Repository exceptions above must not reopen an effective hooksPath nested within
+    // a repository whose name contains `hooks`. Keep these denies after every allow.
+    for (size_t i = 0; i < a->hooks_paths.n; ++i) sb_subpath(f, "deny file-write*", a->hooks_paths.v[i]);
     return true;
 }
 
