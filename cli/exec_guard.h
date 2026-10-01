@@ -2,6 +2,7 @@
 // Pure helpers behind `world exec`'s Git guard, kept apart from main.cpp so they can be unit
 // tested (cli/tests/exec_guard_test.cpp). libc only (arch.md §39).
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
@@ -22,6 +23,24 @@ static inline bool sb_regex_escape(const char *in, char *out, size_t cap) {
     if (at >= cap) return false;
     out[at] = 0;
     return true;
+}
+
+// Encode one config value before joining records with raw 0x1e. Tags preserve
+// implicit booleans versus explicit empty strings; escapes preserve value boundaries.
+static inline char *guard_encode_value(const char *value, bool explicit_value) {
+    size_t len = explicit_value && value ? strlen(value) : 0;
+    if (len > ((size_t)-1 - 2) / 2) return NULL;
+    char *out = (char *)malloc(2 * len + 2);
+    if (!out) return NULL;
+    size_t at = 0;
+    out[at++] = explicit_value ? 'v' : 'n';
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = (unsigned char)value[i];
+        if (c == 0x1d || c == 0x1e) out[at++] = '\x1d';
+        out[at++] = (char)c;
+    }
+    out[at] = 0;
+    return out;
 }
 
 // Whether a Git configuration entry, as `git config --list` prints it (section and name

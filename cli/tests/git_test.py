@@ -4847,6 +4847,31 @@ class GitWorldTest(unittest.TestCase):
                 self.assertIn(b'nonregular Git repository attributes cannot be inspected', p.stderr)
                 attributes.unlink()
 
+    def test_exec_reports_config_value_boundaries_and_implicit_boolean(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'alias.boundary', 'status\x1e!payload')
+        p = self.exec_sh(wid, "git config --unset-all alias.boundary && "
+                         "git config --add alias.boundary status && git config --add alias.boundary '!payload'; exit 7",
+                         '--no-sandbox', code=7)
+        self.assertIn(rb'local alias.boundary: status\x1e!payload -> status, !payload', p.stderr)
+        self.assertNotIn(b'\x1e', p.stderr)
+        self.git(one, 'config', '--replace-all', 'alias.boundary', 'left\x1d\x1e\\right')
+        script = ('git config --unset-all alias.boundary && git config --add alias.boundary ' +
+                  shlex.quote('left\x1d') + ' && git config --add alias.boundary ' + shlex.quote('\\right'))
+        p = self.exec_sh(wid, script, '--no-sandbox')
+        self.assertIn(rb'local alias.boundary: left\x1d\x1e\\right -> left\x1d, \\right', p.stderr)
+        self.assertNotIn(b'\x1d', p.stderr)
+        self.assertNotIn(b'\x1e', p.stderr)
+        # Git interprets a bare boolean as true and an explicit empty value as false.
+        config = one / '.world-git/repo.git/config'
+        with config.open('a') as f:
+            f.write('\n[commit]\n gpgSign\n')
+        self.assertEqual(self.git(one, 'config', '--bool', 'commit.gpgsign').stdout.strip(), b'true')
+        p = self.exec_sh(wid, "git config commit.gpgsign ''", '--no-sandbox')
+        self.assertIn(b'local commit.gpgsign: (implicit) -> ""', p.stderr)
+        self.assertEqual(self.git(one, 'config', '--bool', 'commit.gpgsign').stdout.strip(), b'false')
+
     def test_exec_reports_remote_and_merge_strategy_selectors(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

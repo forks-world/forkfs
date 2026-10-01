@@ -33,6 +33,20 @@ int main() {
     CHECK(!sb_regex_escape("abcde", small, sizeof small));
     CHECK(!sb_regex_escape("ab.d", small, sizeof small));  // "ab\.d" needs 6 bytes
 
+    // Encoding is injective across raw separators, escape bytes and value presence.
+    char *single = guard_encode_value("status\x1e!payload", true);
+    char *escaped = guard_encode_value("\x1d\x1e\\x1e", true);
+    char *empty = guard_encode_value("", true);
+    char *implicit = guard_encode_value("", false);
+    CHECK(single && escaped && empty && implicit);
+    CHECK(!strcmp(single, "vstatus\x1d\x1e!payload"));
+    CHECK(strcmp(single, "vstatus\x1ev!payload"));  // two independently tagged values
+    CHECK(!strcmp(escaped, "v\x1d\x1d\x1d\x1e\\x1e"));
+    CHECK(!strcmp(empty, "v"));
+    CHECK(!strcmp(implicit, "n"));
+    CHECK(strcmp(empty, implicit));
+    free(single); free(escaped); free(empty); free(implicit);
+
     // Keys that make Git run a command.
     const char *runs[] = {
         "core.attributesfile", "core.worktree", "tar.tar.gz.command", "tar.custom.command", "gc.recentobjectshook",

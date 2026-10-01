@@ -2136,7 +2136,7 @@ static int gs_cmp(const void *x, const void *y) {
 }
 
 // Sort, and fold a multi-valued key (credential.helper, include.path) into one record whose
-// values keep Git's order, separated by \x1e.
+// typed, escaped values keep Git's order, separated by unescaped \x1e.
 static void gs_finish(GuardSet *s) {
     qsort(s->v, s->n, sizeof *s->v, gs_cmp);
     size_t out = 0;
@@ -2585,7 +2585,10 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
         char *id = (char *)malloc(idn);
         if (!id) { s->error = "out of memory"; continue; }
         snprintf(id, idn, "c\x1f%s\x1f%s\x1f%s", label, scope, key);
-        gs_add(s, id, val);
+        char *encoded = guard_encode_value(val, nl != NULL);
+        if (encoded) gs_add(s, id, encoded);
+        else s->error = "out of memory";
+        free(encoded);
         free(id);
     }
     free(out);
@@ -2680,11 +2683,27 @@ static bool guard_capture(GitAdmin *a, GuardSet *s, bool require_home = false) {
 // escaped, never interpreted.
 static void put_value(FILE *f, const char *v) {
     if (!v) { fputs("(unset)", f); return; }
-    if (!*v) { fputs("\"\"", f); return; }
-    for (const unsigned char *p = (const unsigned char *)v; *p; ++p) {
-        if (*p == 0x1e) fputs(", ", f);
-        else if (*p < 0x20 || *p == 0x7f) fprintf(f, "\\x%02x", *p);
-        else fputc(*p, f);
+    const unsigned char *p = (const unsigned char *)v;
+    bool first = true;
+    while (*p) {
+        if (!first) fputs(", ", f);
+        first = false;
+        unsigned char tag = *p++;
+        if (tag == 'n') fputs("(implicit)", f);
+        else {
+            bool any = false;
+            while (*p && *p != 0x1e) {
+                unsigned char c = *p++;
+                if (c == 0x1d && *p) c = *p++;
+                if (c < 0x20 || c == 0x7f) fprintf(f, "\\x%02x", c);
+                else if (c == '\\') fputs("\\\\", f);
+                else fputc(c, f);
+                any = true;
+            }
+            if (!any) fputs("\"\"", f);
+        }
+        if (*p != 0x1e) break;
+        ++p;
     }
 }
 

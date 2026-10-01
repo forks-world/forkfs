@@ -294,7 +294,10 @@ observational reporting so a command can repair them.
   submodule checkout's `.git` -- by entry type (file, directory, symlink, missing) and
   content, and whether a file still names its own repository.
 
-It captures them again after the command and prints one line per difference to stderr. A
+It captures them again after the command and prints one line per difference to stderr.
+Configuration comparison preserves each value boundary and distinguishes an implicit boolean
+from an explicitly empty value. Reports show these as `(implicit)` and `""`; control bytes and
+literal backslashes are escaped rather than interpreted as value boundaries or terminal controls. A
 `.git` replaced by another type (`git init` over it, a symlink) or rewritten is reported as a
 change, a removed one (`submodule deinit`, `git rm`) as a removal; only a submodule checkout's
 `.git` that appears naming its own repository (`submodule update --init`) is not reported:
