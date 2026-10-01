@@ -4782,7 +4782,9 @@ class GitWorldTest(unittest.TestCase):
                          "git config remote.ordinary.pushurl 'git@example.org:repo' && "
                          "git config submodule.ordinary.url 'https://example.org/library' && "
                          "git config branch.sort refname && git config tag.sort version:refname", '--no-sandbox')
-        self.assertNotIn(b'WARNING', p.stderr)
+        self.assertIn(b'local submodule.ordinary.url: (unset) -> https://example.org/library', p.stderr)
+        self.assertEqual(p.stderr.count(b'WARNING'), 1, p.stderr)
+        self.assertNotIn(b'local remote.ordinary.', p.stderr)
 
     def test_exec_reports_attributes_file_activating_existing_filter(self):
         self.world('init', str(self.source))
@@ -5037,6 +5039,42 @@ class GitWorldTest(unittest.TestCase):
         self.assertNotIn(b'exec changed a Git hook:', p.stderr)
         self.assertFalse((one / 'proc-receive-ran').exists())
 
+    def test_exec_reports_activating_unchanged_submodule_update_commands(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'submodule.lib-module.update', '!touch update-command-ran')
+        self.git(one, 'config', 'submodule.vendor/unused.update', '!touch update-command-ran')
+        self.git(one, 'config', 'submodule.lib-module.active', 'false')
+        self.git(one, 'config', '--replace-all', 'submodule.active', ':(exclude)**')
+        p = self.exec_sh(wid, 'git config submodule.lib-module.active true && '
+                         'git config --replace-all submodule.active vendor/unused; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local submodule.lib-module.active: false -> true', p.stderr)
+        self.assertIn(b'local submodule.active: :(exclude)** -> vendor/unused', p.stderr)
+        self.assertNotIn(b'local submodule.lib-module.update:', p.stderr)
+        self.assertNotIn(b'local submodule.vendor/unused.update:', p.stderr)
+        # Without either active selector, adding even an ordinary URL activates a module.
+        self.git(one, 'config', '--unset-all', 'submodule.active')
+        self.git(one, 'config', '--unset', 'submodule.lib-module.active')
+        url = self.git(one, 'config', 'submodule.lib-module.url').stdout.decode().strip()
+        self.git(one, 'config', '--unset', 'submodule.lib-module.url')
+        p = self.exec_sh(wid, 'git config submodule.lib-module.url ' + shlex.quote(url), '--no-sandbox')
+        self.assertIn(b'local submodule.lib-module.url: (unset) -> ' + url.encode(), p.stderr)
+        self.assertNotIn(b'local submodule.lib-module.update:', p.stderr)
+        # Recursion selectors can activate an unchanged child's fetch/push helper.
+        self.git(one / 'libs/lib', 'config', 'remote.origin.url', 'ext::touch fetch-helper-ran')
+        values = {'submodule.recurse': 'true', 'fetch.recursesubmodules': 'on-demand',
+                  'push.recursesubmodules': 'on-demand',
+                  'submodule.lib-module.fetchrecursesubmodules': 'true'}
+        p = self.exec_sh(wid, ' && '.join('git config ' + key + ' ' + val for key, val in values.items()),
+                         '--no-sandbox')
+        for key, val in values.items():
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> ' + val.encode(), p.stderr)
+        self.assertNotIn(b'local remote.origin.url:', p.stderr)
+        for directory in (one, one / 'libs/lib', one / 'vendor/unused'):
+            self.assertFalse((directory / 'update-command-ran').exists())
+            self.assertFalse((directory / 'fetch-helper-ran').exists())
+
     def test_exec_reports_activating_preconfigured_signing_program(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
@@ -5055,9 +5093,12 @@ class GitWorldTest(unittest.TestCase):
         self.assertNotIn(b'local gpg.ssh.program:', p.stderr)
         p = self.exec_sh(wid, "git config log.showSignature true && git config merge.verifySignatures true && "
                          "git config format.pretty signature && git config pretty.signature '%G?' && "
+                         "git config rebase.instructionFormat '%G?' && "
+                         "git config format.commitListFormat 'log:%G?' && git config format.coverLetter true && "
                          "git config branch.sort signature:grade && git config tag.sort signature:grade", '--no-sandbox')
         for key, value in (('log.showsignature', 'true'), ('merge.verifysignatures', 'true'),
-                           ('format.pretty', 'signature'), ('pretty.signature', '%G?'),
+                           ('format.pretty', 'signature'), ('pretty.signature', '%G?'), ('rebase.instructionformat', '%G?'),
+                           ('format.commitlistformat', 'log:%G?'), ('format.coverletter', 'true'),
                            ('branch.sort', 'signature:grade'), ('tag.sort', 'signature:grade')):
             self.assertIn(b'local ' + key.encode() + b': (unset) -> ' + value.encode(), p.stderr)
         self.assertNotIn(b'local gpg.program:', p.stderr)

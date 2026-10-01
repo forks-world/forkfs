@@ -322,21 +322,27 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `credential.*.helper`, `filter.*.clean|smudge|process`, `diff.external`,
 `diff.*.command|textconv`, `diff.tool|guitool`, `merge.tool|guitool`, `difftool.guidefault`, `mergetool.guidefault` (select configured commands), `merge.*.driver`, `mergetool.*.cmd|path`, `difftool.*.cmd|path`,
 `commit.gpgsign`, `tag.gpgsign`, `tag.forcesignannotated`, `push.gpgsign` (enable signing),
-`log.showsignature`, `merge.verifysignatures`, `format.pretty`, `pretty.*` (can activate signature verification),
+`log.showsignature`, `merge.verifysignatures`, `rebase.instructionformat`, `format.pretty`,
+`pretty.*`, `format.commitlistformat`, `format.coverletter` (can activate signature verification),
 `branch.sort` and `tag.sort` when selecting a `signature` atom (ordinary name/version sorts stay quiet),
 `gpg.format` (selects the signing program), `gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
 `remote.*.uploadpack|receivepack|vcs`, `branch.*.mergeoptions`, `pull.twohead`, `pull.octopus` (can select external merge strategies),
 `branch.*.remote|pushremote`, `remote.pushdefault` (can select preconfigured helper remotes),
 `uploadpack.packobjectshook`, `receive.procreceiverefs` (activates the configured proc-receive hook),
 `sendemail[.*].tocmd|cccmd|headercmd|sendmailcmd|smtpserver`, `include.path`,
+`submodule.active`, `submodule.*.active`, `submodule.*.url` (can activate configured update commands),
+`submodule.recurse`, `fetch.recursesubmodules`, `push.recursesubmodules`,
+`submodule.*.fetchrecursesubmodules` (can activate child fetch/push helpers and hooks),
 `includeif.*.path`, `alias.*` (including ordinary aliases that dispatch commands or inject `-c` settings), `submodule.*.update` whose value
 starts with `!`, `pager.*`, `interactive.difffilter`, `web.browser`, `help.browser`, `help.format`, `instaweb.browser`, `man.viewer` (select configured viewers), `browser.*.cmd|path`, `instaweb.httpd`, `guitool.*.cmd`, `imap.tunnel`,
 `man.*.cmd|path`, `init.templatedir`, `hook.*.command`, `trailer.*.command|cmd`, `tar.*.command`,
 `protocol.allow` and `protocol.*.allow` (which can enable `ext::` URLs), and
-`lfs.*.path|clean|smudge` (custom transfer agents and extensions). Remote `url`/`pushurl` and submodule `url`
+`lfs.*.path|clean|smudge` (custom transfer agents and extensions). Remote `url`/`pushurl`
 changes are also reported when the value selects a transport helper (`ext::...`, `custom://...`).
+Submodule URLs are always reported: adding even an ordinary URL can activate an unchanged
+custom update command when no active selector overrides it.
 For `url.<target>.insteadOf`/`pushInsteadOf`, the target in the key is checked, not the rewrite
-prefix in the value. Ordinary URLs using exact lowercase `file`, `git`, `ssh`, `git+ssh`,
+prefix in the value. Ordinary remote and rewrite-target URLs using exact lowercase `file`, `git`, `ssh`, `git+ssh`,
 `ssh+git`, `http`, `https`, `ftp` and `ftps` schemes, scp-style addresses and local paths stay quiet. Explicit
 `<transport>::` always selects a helper; scheme names are case-sensitive. The key list and
 value-sensitive rules are in `cli/exec_guard.h`. Branch remote selectors and `remote.pushdefault`

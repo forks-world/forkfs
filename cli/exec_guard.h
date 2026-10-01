@@ -94,6 +94,8 @@ static const GuardKey kGuardKeys[] = {
     {"tag", "forcesignannotated", 0, false}, {"push", "gpgsign", 0, false},
     {"gpg", "format", 0, false},
     {"log", "showsignature", 0, false},   {"merge", "verifysignatures", 0, false},
+    {"rebase", "instructionformat", 0, false},
+    {"format", "commitlistformat", 0, false}, {"format", "coverletter", 0, false},
     {"format", "pretty", 0, false},       {"pretty", NULL, 2, false},
     {"gpg", "defaultkeycommand", 2, false}, {"gc", "recentobjectshook", 0, false},
     {"remote", "uploadpack", 1, false},   {"remote", "receivepack", 1, false},
@@ -106,6 +108,10 @@ static const GuardKey kGuardKeys[] = {
     {"sendemail", "headercmd", 2, false}, {"sendemail", "sendmailcmd", 2, false},
     {"sendemail", "smtpserver", 2, false},
     {"include", "path", 0, false},        {"includeif", "path", 1, false},
+    {"submodule", "active", 2, false},   {"submodule", "url", 1, false},
+    {"submodule", "recurse", 0, false},  {"fetch", "recursesubmodules", 0, false},
+    {"submodule", "fetchrecursesubmodules", 1, false},
+    {"push", "recursesubmodules", 0, false},
     {"alias", NULL, 2, false},             {"submodule", "update", 1, true},
     {"pager", NULL, 0, false},            {"interactive", "difffilter", 0, false},
     {"imap", "tunnel", 0, false},
@@ -165,8 +171,6 @@ static inline bool guard_key_runs_command(const char *key, const char *value) {
         return guard_signature_sort(value);
     if (has_sub && section == 6 && !strncasecmp(key, "remote", section) &&
         (!strcasecmp(name, "url") || !strcasecmp(name, "pushurl")))
-        return value && guard_helper_url(value, strlen(value));
-    if (has_sub && section == 9 && !strncasecmp(key, "submodule", section) && !strcasecmp(name, "url"))
         return value && guard_helper_url(value, strlen(value));
     if (has_sub && section == 3 && !strncasecmp(key, "url", section) &&
         (!strcasecmp(name, "insteadof") || !strcasecmp(name, "pushinsteadof")))

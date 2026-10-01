@@ -65,6 +65,8 @@ int main() {
         "difftool.guidefault", "mergetool.guidefault", "diff.tool", "diff.guitool", "merge.tool", "merge.guitool",
         "filter.x.smudge", "filter.x.process", "diff.external", "diff.pdf.textconv",
         "diff.pdf.command", "merge.ours.driver", "mergetool.vim.cmd", "difftool.x.path",
+        "submodule.recurse", "push.recursesubmodules", "fetch.recursesubmodules", "submodule.library.fetchrecursesubmodules",
+        "format.commitlistformat", "format.coverletter", "rebase.instructionformat", "submodule.active", "submodule.library.active", "submodule.team.library.active",
         "log.showsignature", "merge.verifysignatures", "format.pretty", "pretty.signature", "pretty.team.signature",
         "commit.gpgsign", "tag.gpgsign", "tag.forcesignannotated", "push.gpgsign", "gpg.format",
         "gpg.program", "gpg.ssh.program", "gpg.ssh.defaultkeycommand", "remote.origin.uploadpack",
@@ -111,13 +113,13 @@ int main() {
     for (const char *url : ordinary) {
         CHECK(!guard_key_runs_command("remote.origin.url", url));
         CHECK(!guard_key_runs_command("remote.origin.pushurl", url));
-        CHECK(!guard_key_runs_command("submodule.library.url", url));
+        CHECK(guard_key_runs_command("submodule.library.url", url));
         char key[256];
         snprintf(key, sizeof key, "url.%s.insteadof", url);
         CHECK(!guard_key_runs_command(key, "ext::value-is-not-the-target"));
     }
     CHECK(!guard_key_runs_command("submodule.url", "ext::evil"));
-    CHECK(!guard_key_runs_command("submodule.library.url", NULL));
+    CHECK(guard_key_runs_command("submodule.library.url", NULL));
     CHECK(!guard_key_runs_command("remote.url", "ext::evil"));
     CHECK(!guard_key_runs_command("remote.origin.url", NULL));
 
@@ -145,6 +147,8 @@ int main() {
         "gc.custom.recentobjectshook", "gc.pruneexpire", "core.editorx", "core.custom.attributesfile", "filter.clean", "diff.command", "merge.driver", "core.x.hookspath",
         "include.x.path", "includeif.path", "hook.command", "remote.uploadpack", "merge.payload.tool", "diff.payload.guitool",
         "difftool.custom.guidefault", "mergetool.custom.guidefault",
+        "push.custom.recursesubmodules", "submodule.library.recurse", "fetch.custom.recursesubmodules", "submodule.fetchrecursesubmodules",
+        "format.custom.commitlistformat", "format.custom.coverletter", "rebase.custom.instructionformat", "submodule.library.ignore", "submodule.library.activeextra",
         "log.custom.showsignature", "merge.custom.verifysignatures", "format.custom.pretty",
         "help.custom.browser", "help.custom.format", "instaweb.custom.browser", "man.custom.viewer",
         "imap.host", "imap.custom.tunnel", "instaweb.port", "instaweb.custom.httpd", "guitool.cmd", "guitool.test.title",
