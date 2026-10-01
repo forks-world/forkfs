@@ -62,9 +62,10 @@ int main() {
         "core.hookspath", "core.fsmonitor", "core.sshcommand", "core.editor", "core.pager",
         "core.askpass", "core.gitproxy", "core.alternaterefscommand", "sequence.editor",
         "credential.helper", "credential.https://example.com.helper", "filter.lfs.clean",
-        "diff.tool", "diff.guitool", "merge.tool", "merge.guitool",
+        "difftool.guidefault", "mergetool.guidefault", "diff.tool", "diff.guitool", "merge.tool", "merge.guitool",
         "filter.x.smudge", "filter.x.process", "diff.external", "diff.pdf.textconv",
         "diff.pdf.command", "merge.ours.driver", "mergetool.vim.cmd", "difftool.x.path",
+        "log.showsignature", "merge.verifysignatures", "format.pretty", "pretty.signature", "pretty.team.signature",
         "commit.gpgsign", "tag.gpgsign", "tag.forcesignannotated", "push.gpgsign", "gpg.format",
         "gpg.program", "gpg.ssh.program", "gpg.ssh.defaultkeycommand", "remote.origin.uploadpack",
         "pull.twohead", "pull.octopus", "receive.procreceiverefs", "branch.main.mergeoptions", "branch.main.remote", "branch.main.pushremote", "remote.pushdefault",
@@ -120,6 +121,22 @@ int main() {
     CHECK(!guard_key_runs_command("remote.url", "ext::evil"));
     CHECK(!guard_key_runs_command("remote.origin.url", NULL));
 
+    const char *signature_sorts[] = {"signature:grade", "-signature:signer", "*signature:key",
+                                     "version:signature:grade", "-v:*signature:grade"};
+    for (const char *value : signature_sorts) {
+        CHECK(guard_key_runs_command("branch.sort", value));
+        CHECK(guard_key_runs_command("tag.sort", value));
+    }
+    const char *ordinary_sorts[] = {"refname", "-version:refname", "v:refname", "signaturex:grade",
+                                   "Signature:grade", "--signature:grade", "version:-signature:grade", ""};
+    for (const char *value : ordinary_sorts) {
+        CHECK(!guard_key_runs_command("branch.sort", value));
+        CHECK(!guard_key_runs_command("tag.sort", value));
+    }
+    CHECK(!guard_key_runs_command("branch.sort", NULL));
+    CHECK(!guard_key_runs_command("branch.topic.sort", "signature:grade"));
+    CHECK(!guard_key_runs_command("tag.topic.sort", "signature:grade"));
+
     // Keys that legitimately change during agent work, or only name things.
     const char *quiet[] = {
         "user.email", "user.name", "remote.origin.url", "remote.origin.fetch",
@@ -127,6 +144,8 @@ int main() {
         "branch.main.merge", "core.bare", "tar.command", "tar.custom.remote",
         "gc.custom.recentobjectshook", "gc.pruneexpire", "core.editorx", "core.custom.attributesfile", "filter.clean", "diff.command", "merge.driver", "core.x.hookspath",
         "include.x.path", "includeif.path", "hook.command", "remote.uploadpack", "merge.payload.tool", "diff.payload.guitool",
+        "difftool.custom.guidefault", "mergetool.custom.guidefault",
+        "log.custom.showsignature", "merge.custom.verifysignatures", "format.custom.pretty",
         "help.custom.browser", "help.custom.format", "instaweb.custom.browser", "man.custom.viewer",
         "imap.host", "imap.custom.tunnel", "instaweb.port", "instaweb.custom.httpd", "guitool.cmd", "guitool.test.title",
         "commit.custom.gpgsign", "tag.custom.gpgsign", "tag.custom.forcesignannotated",

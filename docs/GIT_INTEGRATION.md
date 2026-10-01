@@ -320,8 +320,10 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `core.worktree` (checkout and relative-hook redirection), `core.fsmonitor`, `core.sshcommand`, `core.editor`, `core.pager`, `core.askpass`,
 `core.attributesfile` (can activate configured filters), `core.gitproxy`, `core.alternaterefscommand`, `sequence.editor`, `credential.helper` and
 `credential.*.helper`, `filter.*.clean|smudge|process`, `diff.external`,
-`diff.*.command|textconv`, `diff.tool|guitool`, `merge.tool|guitool` (select configured commands), `merge.*.driver`, `mergetool.*.cmd|path`, `difftool.*.cmd|path`,
+`diff.*.command|textconv`, `diff.tool|guitool`, `merge.tool|guitool`, `difftool.guidefault`, `mergetool.guidefault` (select configured commands), `merge.*.driver`, `mergetool.*.cmd|path`, `difftool.*.cmd|path`,
 `commit.gpgsign`, `tag.gpgsign`, `tag.forcesignannotated`, `push.gpgsign` (enable signing),
+`log.showsignature`, `merge.verifysignatures`, `format.pretty`, `pretty.*` (can activate signature verification),
+`branch.sort` and `tag.sort` when selecting a `signature` atom (ordinary name/version sorts stay quiet),
 `gpg.format` (selects the signing program), `gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
 `remote.*.uploadpack|receivepack|vcs`, `branch.*.mergeoptions`, `pull.twohead`, `pull.octopus` (can select external merge strategies),
 `branch.*.remote|pushremote`, `remote.pushdefault` (can select preconfigured helper remotes),

@@ -4780,7 +4780,8 @@ class GitWorldTest(unittest.TestCase):
             self.assertIn(b'local ' + key + b': (unset) -> ', p.stderr)
         p = self.exec_sh(wid, "git config remote.ordinary.url 'https://example.org/repo' && "
                          "git config remote.ordinary.pushurl 'git@example.org:repo' && "
-                         "git config submodule.ordinary.url 'https://example.org/library'", '--no-sandbox')
+                         "git config submodule.ordinary.url 'https://example.org/library' && "
+                         "git config branch.sort refname && git config tag.sort version:refname", '--no-sandbox')
         self.assertNotIn(b'WARNING', p.stderr)
 
     def test_exec_reports_attributes_file_activating_existing_filter(self):
@@ -5016,6 +5017,12 @@ class GitWorldTest(unittest.TestCase):
             self.assertIn(b'local ' + key.encode() + b': (unset) -> payload', p.stderr)
         self.assertNotIn(b'local difftool.payload.cmd:', p.stderr)
         self.assertNotIn(b'local mergetool.payload.cmd:', p.stderr)
+        p = self.exec_sh(wid, 'git config difftool.guiDefault auto && git config mergetool.guiDefault true',
+                         '--no-sandbox')
+        self.assertIn(b'local difftool.guidefault: (unset) -> auto', p.stderr)
+        self.assertIn(b'local mergetool.guidefault: (unset) -> true', p.stderr)
+        self.assertNotIn(b'local diff.guitool:', p.stderr)
+        self.assertNotIn(b'local merge.guitool:', p.stderr)
         self.assertFalse((one / 'selected-tool-ran').exists())
 
     def test_exec_reports_activating_unchanged_proc_receive_hook(self):
@@ -5044,6 +5051,15 @@ class GitWorldTest(unittest.TestCase):
                          '--no-sandbox')
         for key, val in values.items():
             self.assertIn(b'local ' + key.encode() + b': (unset) -> ' + val.encode(), p.stderr)
+        self.assertNotIn(b'local gpg.program:', p.stderr)
+        self.assertNotIn(b'local gpg.ssh.program:', p.stderr)
+        p = self.exec_sh(wid, "git config log.showSignature true && git config merge.verifySignatures true && "
+                         "git config format.pretty signature && git config pretty.signature '%G?' && "
+                         "git config branch.sort signature:grade && git config tag.sort signature:grade", '--no-sandbox')
+        for key, value in (('log.showsignature', 'true'), ('merge.verifysignatures', 'true'),
+                           ('format.pretty', 'signature'), ('pretty.signature', '%G?'),
+                           ('branch.sort', 'signature:grade'), ('tag.sort', 'signature:grade')):
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> ' + value.encode(), p.stderr)
         self.assertNotIn(b'local gpg.program:', p.stderr)
         self.assertNotIn(b'local gpg.ssh.program:', p.stderr)
         self.assertFalse((one / 'signing-program-ran').exists())

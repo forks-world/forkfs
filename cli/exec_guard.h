@@ -84,6 +84,7 @@ static const GuardKey kGuardKeys[] = {
     {"filter", "clean", 1, false},        {"filter", "smudge", 1, false},
     {"filter", "process", 1, false},      {"diff", "external", 0, false},
     {"diff", "tool", 0, false},           {"diff", "guitool", 0, false},
+    {"difftool", "guidefault", 0, false}, {"mergetool", "guidefault", 0, false},
     {"merge", "tool", 0, false},          {"merge", "guitool", 0, false},
     {"diff", "command", 1, false},        {"diff", "textconv", 1, false},
     {"merge", "driver", 1, false},        {"mergetool", "cmd", 1, false},
@@ -92,6 +93,8 @@ static const GuardKey kGuardKeys[] = {
     {"commit", "gpgsign", 0, false},      {"tag", "gpgsign", 0, false},
     {"tag", "forcesignannotated", 0, false}, {"push", "gpgsign", 0, false},
     {"gpg", "format", 0, false},
+    {"log", "showsignature", 0, false},   {"merge", "verifysignatures", 0, false},
+    {"format", "pretty", 0, false},       {"pretty", NULL, 2, false},
     {"gpg", "defaultkeycommand", 2, false}, {"gc", "recentobjectshook", 0, false},
     {"remote", "uploadpack", 1, false},   {"remote", "receivepack", 1, false},
     {"receive", "procreceiverefs", 0, false},
@@ -139,12 +142,27 @@ static inline bool guard_helper_url(const char *url, size_t len) {
     return true;
 }
 
+// Git ref sorting accepts reverse/version prefixes and an optional dereference marker.
+// Signature atoms invoke the configured verifier; ordinary name/version sorts stay quiet.
+static inline bool guard_signature_sort(const char *value) {
+    if (!value) return false;
+    if (*value == '-') ++value;
+    if (!strncmp(value, "version:", 8)) value += 8;
+    else if (!strncmp(value, "v:", 2)) value += 2;
+    if (*value == '*') ++value;
+    return !strncmp(value, "signature", 9) && (!value[9] || value[9] == ':');
+}
+
 static inline bool guard_key_runs_command(const char *key, const char *value) {
     const char *first = strchr(key, '.'), *last = strrchr(key, '.');
     if (!first || !last[1]) return false;
     size_t section = (size_t)(first - key);
     bool has_sub = last != first;
     const char *name = last + 1;
+    if (!has_sub && !strcasecmp(name, "sort") &&
+        ((section == 6 && !strncasecmp(key, "branch", section)) ||
+         (section == 3 && !strncasecmp(key, "tag", section))))
+        return guard_signature_sort(value);
     if (has_sub && section == 6 && !strncasecmp(key, "remote", section) &&
         (!strcasecmp(name, "url") || !strcasecmp(name, "pushurl")))
         return value && guard_helper_url(value, strlen(value));
