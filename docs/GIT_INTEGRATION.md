@@ -335,6 +335,11 @@ in full, so same-size, same-mtime rewrites remain detectable. Symlinked default 
 hooks directories are unsupported: their executable target could change outside the directory
 policy. They invalidate capture, refusing sandboxed exec and producing an explicit note with
 `--no-sandbox`; symlinked Git administration pointers remain recorded by link target.
+Regular hook files with multiple hardlinks are likewise unsupported, since a writable alias
+could change their bytes outside the guarded directory. The check applies to hook files, not
+directory link counts or Git administration pointers. Signals received during post-command
+inspection cancel the active query, reap its child, release the exec lock and return
+`128 + signal`; signals while the requested command runs continue to be forwarded to it.
 
 The exec sandbox is not a general confinement: it keeps the command away from the store and
 from other Worlds, and from the hooks above. `~/.gitconfig`, `~/.ssh`, shell startup files and

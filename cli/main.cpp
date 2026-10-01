@@ -36,6 +36,10 @@ extern "C" int world_fs_status_platform(void);
 #endif
 #endif
 
+static volatile sig_atomic_t g_child = 0;
+static volatile sig_atomic_t g_post_capture = 0;
+static volatile sig_atomic_t g_post_signal = 0;
+
 enum { EX_OK = 0, EX_ERR = 1, EX_USAGE = 2, EX_REFUSED = 3 };
 
 static void usage(int code = EX_USAGE) {
@@ -2044,6 +2048,7 @@ static void find_submodules(GitAdmin *a, const char *dir, int depth) {
     DIR *d = opendir(dir);
     if (!d) { a->incomplete = true; return; }
     while (!a->incomplete) {
+        if (g_post_signal) { a->incomplete = true; break; }
         errno = 0;
         struct dirent *e = readdir(d);
         if (!e) { if (errno) a->incomplete = true; break; }
@@ -2153,7 +2158,7 @@ static void gs_finish(GuardSet *s) {
 
 // The file's type, mode and content (a symlink: its target), as a short fingerprint. Hooks are
 // small; hashing the bytes catches a same-size, same-mtime rewrite through a hardlink.
-static bool fingerprint(const char *path, char *out, size_t cap, GuardSet *s) {
+static bool fingerprint(const char *path, char *out, size_t cap, GuardSet *s, bool hook = false) {
     struct stat st;
     if (lstat(path, &st) != 0) return false;
     uint64_t h = 1469598103934665603ull;
@@ -2170,12 +2175,17 @@ static bool fingerprint(const char *path, char *out, size_t cap, GuardSet *s) {
         if (fd < 0) return false;
         struct stat opened;
         if (fstat(fd, &opened) != 0 || !S_ISREG(opened.st_mode)) { close(fd); return false; }
+        if (hook && opened.st_nlink > 1) {
+            s->error = "hardlinked Git hooks cannot be guarded";
+            close(fd); return false;
+        }
         if (opened.st_size < 0 || (uint64_t)opened.st_size > s->bytes_left) {
             s->error = "Git hook/pointer content exceeds the 64 MiB capture budget";
             close(fd); return false;
         }
         bool ok = true;
         for (;;) {
+            if (g_post_signal) { s->error = "Git capture interrupted"; ok = false; break; }
             ssize_t n = read(fd, buf, sizeof buf);
             if (n < 0 && errno == EINTR) continue;
             if (n < 0) { ok = false; break; }
@@ -2212,6 +2222,7 @@ static void capture_hooks(const GitAdmin *a, const char *dir, GuardSet *s) {
     DIR *d = opendir(dir);
     if (!d) { if (errno != ENOENT) s->error = "could not read Git hooks directory"; return; }
     while (!s->error) {
+        if (g_post_signal) { s->error = "Git capture interrupted"; break; }
         errno = 0;
         struct dirent *e = readdir(d);
         if (!e) { if (errno) s->error = "could not enumerate Git hooks"; break; }
@@ -2228,7 +2239,10 @@ static void capture_hooks(const GitAdmin *a, const char *dir, GuardSet *s) {
         // Hashing only a link would miss edits to its external executable target. The
         // directory policy cannot protect that target, so refuse an incomplete guard.
         if (S_ISLNK(st.st_mode)) { s->error = "symlinked Git hooks cannot be guarded"; break; }
-        if (!fingerprint(p, fp, sizeof fp, s)) {
+        if (S_ISREG(st.st_mode) && st.st_nlink > 1) {
+            s->error = "hardlinked Git hooks cannot be guarded"; break;
+        }
+        if (!fingerprint(p, fp, sizeof fp, s, true)) {
             if (!s->error) s->error = "could not fingerprint Git hook";
             break;
         }
@@ -2268,6 +2282,7 @@ extern char **environ;
 static char *git_guard_read(const char *root, const char *gitdir, const char *path_key, bool top_level,
                             size_t *len, int *status) {
     *status = -1;
+    if (g_post_signal) return NULL;
     if (!WFS_CONFIG_GIT[0]) return NULL;
     char gd[WFS_PATH_MAX + 16];
     const char *argv[16];
@@ -2362,6 +2377,7 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
     bool ok = buf != NULL, eof = false, reaped = false;
     int st = 0;
     while (ok && (!eof || !reaped)) {
+        if (g_post_signal) { ok = false; break; }
         struct timespec now;
         if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) { ok = false; break; }
         int64_t elapsed = (now.tv_sec - start.tv_sec) * 1000LL +
@@ -2555,6 +2571,7 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
 }
 
 static bool guard_capture(GitAdmin *a, GuardSet *s) {
+    if (g_post_signal) { s->error = "Git capture interrupted"; return false; }
     if (a->incomplete) { s->error = "incomplete Git administration scan (limit or read error)"; return false; }
     s->bytes_left = 64u << 20;
     const char *self = real_dir(a->active) ? a->active : NULL;
@@ -2693,10 +2710,15 @@ static void guard_report(const GuardSet *b, const GuardSet *a) {
               "them (docs/GIT_INTEGRATION.md, \"Running agents with world exec\")\n", stderr);
 }
 
-static pid_t g_child = 0;
-
 static void forward_signal(int sig) {
-    if (g_child > 0) kill(g_child, sig);
+    int saved_errno = errno;
+    if (g_post_capture) {
+        if (!g_post_signal) g_post_signal = sig;
+    } else if (g_child > 0 && kill((pid_t)g_child, sig) < 0 && errno == ESRCH) {
+        // waitpid may have reaped the command just before the masked phase transition.
+        if (!g_post_signal) g_post_signal = sig;
+    }
+    errno = saved_errno;
 }
 
 #ifndef __linux__
@@ -3099,21 +3121,36 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
         fprintf(stderr, "world: exec: %s: %s\n", cav[0], strerror(errno));
         _exit(127);
     }
+    sigset_t forward_mask, saved_mask;
+    sigemptyset(&forward_mask);
+    sigaddset(&forward_mask, SIGINT);
+    sigaddset(&forward_mask, SIGTERM);
+    sigaddset(&forward_mask, SIGHUP);
+    sigprocmask(SIG_BLOCK, &forward_mask, &saved_mask);
     g_child = pid;
+    g_post_capture = 0;
+    g_post_signal = 0;
     // Ctrl-C reaches the whole process group anyway; forwarding covers the case where this
     // process is signalled on its own, and either way the lock is released below.
-    struct sigaction sa;
+    struct sigaction sa, old_int, old_term, old_hup;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = forward_signal;
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGHUP, &sa, NULL);
+    sa.sa_mask = forward_mask;
+    sigaction(SIGINT, &sa, &old_int);
+    sigaction(SIGTERM, &sa, &old_term);
+    sigaction(SIGHUP, &sa, &old_hup);
+    sigprocmask(SIG_SETMASK, &saved_mask, NULL);
 
     int st = 0;
     while (waitpid(pid, &st, 0) < 0) {
         if (errno != EINTR) { st = 0; break; }
     }
+    // Switch atomically: signals after the requested child exits cancel inspection,
+    // whose helper must be killed/reaped before restoring handlers and releasing the lock.
+    sigprocmask(SIG_BLOCK, &forward_mask, &saved_mask);
+    g_post_capture = 1;
     g_child = 0;
+    sigprocmask(SIG_SETMASK, &saved_mask, NULL);
 #ifdef __linux__
     free(git_mounts);
     sl_free(&mount_paths);
@@ -3139,6 +3176,15 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
     if (prof[0]) unlink(prof);
     wfs_world_unlock_exec(s, w, lockfd);
     free(cav);
+    sigprocmask(SIG_BLOCK, &forward_mask, &saved_mask);
+    int post_signal = g_post_signal;
+    g_post_capture = 0;
+    g_post_signal = 0;
+    sigaction(SIGINT, &old_int, NULL);
+    sigaction(SIGTERM, &old_term, NULL);
+    sigaction(SIGHUP, &old_hup, NULL);
+    sigprocmask(SIG_SETMASK, &saved_mask, NULL);
+    if (post_signal) return 128 + post_signal;
     if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);
     return WIFEXITED(st) ? WEXITSTATUS(st) : EX_ERR;
 }

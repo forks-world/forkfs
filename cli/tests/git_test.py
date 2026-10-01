@@ -4642,6 +4642,25 @@ class GitWorldTest(unittest.TestCase):
         p = self.exec_sh(wid, 'exit 7', '--no-sandbox', code=7)
         self.assertIn(b'incomplete Git administration scan', p.stderr)
 
+    def test_exec_refuses_hardlinked_guarded_hook(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        hook = one / '.world-git/repo.git/hooks/pre-commit'
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text('#!/bin/sh\nexit 0\n')
+        hook.chmod(0o755)
+        alias = one / 'writable-hook-alias'
+        os.link(hook, alias)
+        original = hook.read_bytes()
+        p = self.exec_sh(wid, 'touch should-not-run; echo changed > writable-hook-alias',
+                         '--require-sandbox', code=3)
+        self.assertIn(b'hardlinked Git hooks cannot be guarded', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+        self.assertEqual(hook.read_bytes(), original)
+        p = self.exec_sh(wid, 'echo changed > writable-hook-alias; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'hardlinked Git hooks cannot be guarded', p.stderr)
+        self.assertEqual(hook.read_bytes(), b'changed\n')
+
     def test_exec_refuses_symlinked_guarded_hook(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
@@ -4770,6 +4789,56 @@ class GitWorldTest(unittest.TestCase):
         p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
         self.assertIn(b'Git guard unavailable', p.stderr)
         self.assertFalse((one / 'should-not-run').exists())
+
+    def test_exec_post_capture_signal_cancels_query_and_releases_lock(self):
+        import signal
+        import time
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        fifo = one / 'blocked-post-config'
+        os.mkfifo(fifo)
+        script = 'git config include.path ' + shlex.quote(str(fifo))
+        proc = subprocess.Popen((WORLD, 'exec', wid, '--no-sandbox', '--', '/bin/sh', '-c', script),
+                                env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        writer = None
+        try:
+            # A successful writer open proves the post-command inspector has opened the
+            # include; hold it empty so the query stays blocked until cancellation.
+            deadline = time.monotonic() + 10
+            while writer is None and time.monotonic() < deadline:
+                try:
+                    writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+                except OSError as e:
+                    if e.errno != errno.ENXIO:
+                        raise
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.02)
+            self.assertIsNotNone(writer, 'post-command Git query did not open the FIFO')
+            proc.send_signal(signal.SIGTERM)
+            stdout, stderr = proc.communicate(timeout=3)
+            self.assertEqual(proc.returncode, 128 + signal.SIGTERM, (stdout, stderr))
+            os.close(writer)
+            writer = None
+            # The helper reader was killed and reaped, not orphaned after world exited.
+            try:
+                fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as e:
+                self.assertEqual(e.errno, errno.ENXIO)
+            else:
+                os.close(fd)
+                self.fail('configuration helper still holds the FIFO open')
+        finally:
+            if writer is not None:
+                os.close(writer)
+            # Release a failed test's reader without leaving any query blocked.
+            fifo.unlink()
+            fifo.write_text('')
+            if proc.poll() is None:
+                proc.terminate()
+            proc.communicate(timeout=10)
+        self.git(one, 'config', '--unset', 'include.path')
+        self.exec_sh(wid, ':', '--no-sandbox')  # the previous exec lock was released
 
     def test_exec_config_inherited_command_scope_and_expanded_hooks(self):
         import pwd
