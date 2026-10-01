@@ -269,7 +269,8 @@ status, which `world exec` keeps). Before the command starts, exec captures each
 -- the World and every submodule repository present -- whole, and the same capture decides
 the sandbox rules above:
 
-Before sandboxed exec, the World's `.git` and active worktree `commondir` must be regular,
+Before sandboxed exec, the fixed administration locators, including `repo.git/worktrees`,
+must be real directories rather than symlinks. The World's `.git` and active worktree `commondir` must be regular,
 complete pointers to its own administration, each with exactly one hardlink. Writable aliases
 to a pointer would otherwise evade pathname protection. Existing `.git` entries in other effective
 checkouts, and existing submodule `commondir` pointers, must likewise name the administration
@@ -338,16 +339,15 @@ starts with `!`, `pager.*`, `interactive.difffilter`, `web.browser`, `help.brows
 `man.*.cmd|path`, `init.templatedir`, `hook.*.command`, `trailer.*.command|cmd`, `tar.*.command`,
 `protocol.allow` and `protocol.*.allow` (which can enable `ext::` URLs), and
 `lfs.*.path|clean|smudge` (custom transfer agents and extensions). Remote `url`/`pushurl`
-changes are also reported when the value selects a transport helper (`ext::...`, `custom://...`).
-Submodule URLs are always reported: adding even an ordinary URL can activate an unchanged
-custom update command when no active selector overrides it.
-For `url.<target>.insteadOf`/`pushInsteadOf`, the target in the key is checked, not the rewrite
-prefix in the value. Ordinary remote and rewrite-target URLs using exact lowercase `file`, `git`, `ssh`, `git+ssh`,
-`ssh+git`, `http`, `https`, `ftp` and `ftps` schemes, scp-style addresses and local paths stay quiet. Explicit
-`<transport>::` always selects a helper; scheme names are case-sensitive. The key list and
-value-sensitive rules are in `cli/exec_guard.h`. Branch remote selectors and `remote.pushdefault`
-are reported even when choosing an ordinary remote: a remote name can activate unchanged
-helper configuration. Setting tracking remains allowed; `branch.*.merge` stays quiet.
+and `url.<target>.insteadOf`/`pushInsteadOf` changes are always reported. SSH endpoints can
+activate an unchanged `core.sshCommand`; an existing rewrite can map an ordinary URL or local
+path to a helper transport. Restricting reports by the newly written URL's scheme would miss
+these activations. Submodule URLs are likewise always reported: adding even an ordinary URL
+can activate an unchanged custom update command when no active selector overrides it.
+The key list and value-sensitive rules are in `cli/exec_guard.h`. Branch remote selectors and
+`remote.pushdefault` are reported even when choosing an ordinary remote: a remote name can
+activate unchanged helper configuration. Setting endpoints and tracking remains allowed;
+fetch refspecs, descriptive names and `branch.*.merge` stay quiet.
 Each repository is read before and after with five
 queries: a configuration listing, `--path --get core.hooksPath`, `rev-parse --show-toplevel`,
 and `git var GIT_ATTR_GLOBAL`/`GIT_ATTR_SYSTEM`,

@@ -93,7 +93,7 @@ int main() {
     CHECK(!guard_key_runs_command("submodule.lib.update", "rebase"));
     CHECK(guard_key_runs_command("alias.x", NULL));
 
-    // Helper transports can execute programs through direct URLs or rewrite targets.
+    // Every endpoint or rewrite selector can activate an unchanged helper rewrite or SSH command.
     const char *helpers[] = {"::repo", "ext::sh -c evil", "custom::repo", "https::repo", "ssh::repo",
                             "custom://repo", "9helper://repo", "HTTPS://example.com/repo", "a+b.c-d://repo"};
     for (const char *url : helpers) {
@@ -111,17 +111,17 @@ int main() {
                              "user@host:repo", "user@[::1]:repo", "[::1]:repo", "ssh://[::1]/repo", "./path::repo",
                              "/tmp/path::repo", "relative/path::repo", "host:repo", "_x::repo", "x_y::repo", "bad_helper://repo", ""};
     for (const char *url : ordinary) {
-        CHECK(!guard_key_runs_command("remote.origin.url", url));
-        CHECK(!guard_key_runs_command("remote.origin.pushurl", url));
+        CHECK(guard_key_runs_command("remote.origin.url", url));
+        CHECK(guard_key_runs_command("remote.origin.pushurl", url));
         CHECK(guard_key_runs_command("submodule.library.url", url));
         char key[256];
         snprintf(key, sizeof key, "url.%s.insteadof", url);
-        CHECK(!guard_key_runs_command(key, "ext::value-is-not-the-target"));
+        CHECK(guard_key_runs_command(key, "ext::value-is-not-the-target"));
     }
     CHECK(!guard_key_runs_command("submodule.url", "ext::evil"));
     CHECK(guard_key_runs_command("submodule.library.url", NULL));
     CHECK(!guard_key_runs_command("remote.url", "ext::evil"));
-    CHECK(!guard_key_runs_command("remote.origin.url", NULL));
+    CHECK(guard_key_runs_command("remote.origin.url", NULL));
 
     const char *signature_sorts[] = {"signature:grade", "-signature:signer", "*signature:key",
                                      "version:signature:grade", "-v:*signature:grade"};
@@ -141,7 +141,7 @@ int main() {
 
     // Keys that legitimately change during agent work, or only name things.
     const char *quiet[] = {
-        "user.email", "user.name", "remote.origin.url", "remote.origin.fetch",
+        "user.email", "user.name", "remote.origin.fetch", "remote.origin.name", "url.insteadof", "url.pushinsteadof",
         "pull.custom.twohead", "pull.custom.octopus", "receive.custom.procreceiverefs", "receive.advertisepushoptions", "branch.remote", "branch.pushremote", "branch.mergeoptions", "remote.origin.pushdefault",
         "branch.main.merge", "core.bare", "tar.command", "tar.custom.remote",
         "gc.custom.recentobjectshook", "gc.pruneexpire", "core.editorx", "core.custom.attributesfile", "filter.clean", "diff.command", "merge.driver", "core.x.hookspath",

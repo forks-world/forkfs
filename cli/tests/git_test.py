@@ -4783,8 +4783,49 @@ class GitWorldTest(unittest.TestCase):
                          "git config submodule.ordinary.url 'https://example.org/library' && "
                          "git config branch.sort refname && git config tag.sort version:refname", '--no-sandbox')
         self.assertIn(b'local submodule.ordinary.url: (unset) -> https://example.org/library', p.stderr)
-        self.assertEqual(p.stderr.count(b'WARNING'), 1, p.stderr)
-        self.assertNotIn(b'local remote.ordinary.', p.stderr)
+        self.assertIn(b'local remote.ordinary.url: (unset) -> https://example.org/repo', p.stderr)
+        self.assertIn(b'local remote.ordinary.pushurl: (unset) -> git@example.org:repo', p.stderr)
+        self.assertEqual(p.stderr.count(b'WARNING'), 3, p.stderr)
+        self.assertNotIn(b'local branch.sort:', p.stderr)
+        self.assertNotIn(b'local tag.sort:', p.stderr)
+
+    def test_exec_reports_ssh_and_rewritten_endpoint_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'core.sshCommand', 'touch ssh-command-ran')
+        self.git(one, 'config', 'url.ext::touch rewrite-helper-ran.insteadOf', 'https://rewritten.invalid/')
+        p = self.exec_sh(wid, "git config remote.ssh.url ssh://host/repo && "
+                         "git config remote.scp.pushurl git@host:repo && "
+                         "git config 'url.ssh://host/.insteadOf' https://old.invalid/ && "
+                         "git config remote.rewritten.url https://rewritten.invalid/repo; exit 7",
+                         '--no-sandbox', code=7)
+        for key in ('remote.ssh.url', 'remote.scp.pushurl', 'url.ssh://host/.insteadof', 'remote.rewritten.url'):
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> ', p.stderr)
+        self.assertNotIn(b'local core.sshcommand:', p.stderr)
+        self.assertNotIn(b'local url.ext::touch rewrite-helper-ran.insteadof:', p.stderr)
+        self.assertFalse((one / 'ssh-command-ran').exists())
+        self.assertFalse((one / 'rewrite-helper-ran').exists())
+        p = self.exec_sh(wid, "git config remote.ssh.fetch '+refs/heads/*:refs/remotes/ssh/*' && "
+                         "git config branch.main.description unchanged-policy", '--no-sandbox')
+        self.assertNotIn(b'WARNING', p.stderr)
+
+    def test_exec_refuses_symlinked_worktrees_locator(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        worktrees = one / '.world-git/repo.git/worktrees'
+        saved = worktrees.with_name('saved-worktrees')
+        worktrees.rename(saved)
+        worktrees.symlink_to('saved-worktrees', target_is_directory=True)
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'incomplete Git administration scan', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+        self.assertTrue(worktrees.is_symlink())
+        p = self.exec_sh(wid, 'rm .world-git/repo.git/worktrees && '
+                         'mv .world-git/repo.git/saved-worktrees .world-git/repo.git/worktrees; exit 7',
+                         '--no-sandbox', code=7)
+        self.assertIn(b'incomplete Git administration scan', p.stderr)
+        self.assertTrue(worktrees.is_dir())
+        self.assertFalse(worktrees.is_symlink())
 
     def test_exec_reports_attributes_file_activating_existing_filter(self):
         self.world('init', str(self.source))

@@ -98,6 +98,8 @@ static const GuardKey kGuardKeys[] = {
     {"format", "commitlistformat", 0, false}, {"format", "coverletter", 0, false},
     {"format", "pretty", 0, false},       {"pretty", NULL, 2, false},
     {"gpg", "defaultkeycommand", 2, false}, {"gc", "recentobjectshook", 0, false},
+    {"remote", "url", 1, false},          {"remote", "pushurl", 1, false},
+    {"url", "insteadof", 1, false},       {"url", "pushinsteadof", 1, false},
     {"remote", "uploadpack", 1, false},   {"remote", "receivepack", 1, false},
     {"receive", "procreceiverefs", 0, false},
     {"pull", "twohead", 0, false},        {"pull", "octopus", 0, false},
@@ -127,27 +129,6 @@ static const GuardKey kGuardKeys[] = {
     {"lfs", "smudge", 1, false},
 };
 
-// Git's transport prefix grammar (url.c): an alphanumeric first byte, then
-// alphanumerics or +.-. Explicit helper syntax is distinct from scp/IPv6/local paths.
-static inline bool guard_helper_url(const char *url, size_t len) {
-    if (!url || !len) return false;
-    size_t n = 0;
-    for (; n < len; ++n) {
-        unsigned char c = (unsigned char)url[n];
-        bool alnum = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
-        if (!alnum && !(n && (c == '+' || c == '.' || c == '-'))) break;
-    }
-    if (n + 1 >= len || url[n] != ':') return false;
-    if (url[n + 1] == ':') return true;  // even ssh:: and https:: explicitly select helpers
-    if (!n || n + 2 >= len || url[n + 1] != '/' || url[n + 2] != '/') return false;
-    // Native transports and conventional curl helpers stay quiet for ordinary URL edits.
-    // Git's helper dispatch is case-sensitive, so HTTPS:// must not match https:// here.
-    const char *ordinary[] = {"file", "git", "ssh", "git+ssh", "ssh+git", "http", "https", "ftp", "ftps"};
-    for (size_t i = 0; i < sizeof ordinary / sizeof ordinary[0]; ++i)
-        if (strlen(ordinary[i]) == n && !memcmp(url, ordinary[i], n)) return false;
-    return true;
-}
-
 // Git ref sorting accepts reverse/version prefixes and an optional dereference marker.
 // Signature atoms invoke the configured verifier; ordinary name/version sorts stay quiet.
 static inline bool guard_signature_sort(const char *value) {
@@ -169,12 +150,6 @@ static inline bool guard_key_runs_command(const char *key, const char *value) {
         ((section == 6 && !strncasecmp(key, "branch", section)) ||
          (section == 3 && !strncasecmp(key, "tag", section))))
         return guard_signature_sort(value);
-    if (has_sub && section == 6 && !strncasecmp(key, "remote", section) &&
-        (!strcasecmp(name, "url") || !strcasecmp(name, "pushurl")))
-        return value && guard_helper_url(value, strlen(value));
-    if (has_sub && section == 3 && !strncasecmp(key, "url", section) &&
-        (!strcasecmp(name, "insteadof") || !strcasecmp(name, "pushinsteadof")))
-        return guard_helper_url(first + 1, (size_t)(last - first - 1));
     for (size_t i = 0; i < sizeof kGuardKeys / sizeof kGuardKeys[0]; ++i) {
         const GuardKey &k = kGuardKeys[i];
         if (strlen(k.section) != section || strncasecmp(key, k.section, section)) continue;

@@ -2008,6 +2008,7 @@ struct GitAdmin {
     size_t entries;              // all visited administration entries, not just repositories
     char root[WFS_PATH_MAX];     // the World root, resolved
     char common[WFS_PATH_MAX];   // <root>/.world-git/repo.git
+    char worktrees[WFS_PATH_MAX]; // required real locator directory below common
     char active[WFS_PATH_MAX];   // <common>/worktrees/active: the World's own worktree
     char modules[WFS_PATH_MAX];  // <active>/modules: submodule repositories (Git keeps them per worktree)
     StrList gitdirs;             // submodule repositories found below `modules`, parents first
@@ -2082,7 +2083,8 @@ static bool git_admin_find(const char *world, GitAdmin *a) {
     char wg[WFS_PATH_MAX];
     if ((size_t)snprintf(wg, sizeof wg, "%s/.world-git", a->root) >= sizeof wg ||
         (size_t)snprintf(a->common, sizeof a->common, "%s/repo.git", wg) >= sizeof a->common ||
-        (size_t)snprintf(a->active, sizeof a->active, "%s/worktrees/active", a->common) >= sizeof a->active ||
+        (size_t)snprintf(a->worktrees, sizeof a->worktrees, "%s/worktrees", a->common) >= sizeof a->worktrees ||
+        (size_t)snprintf(a->active, sizeof a->active, "%s/active", a->worktrees) >= sizeof a->active ||
         (size_t)snprintf(a->modules, sizeof a->modules, "%s/modules", a->active) >= sizeof a->modules) {
         a->incomplete = true; return true;
     }
@@ -2090,6 +2092,7 @@ static bool git_admin_find(const char *world, GitAdmin *a) {
     if (!admin_stat(a, wg, &st)) return a->incomplete;
     if (!S_ISDIR(st.st_mode)) { a->incomplete = true; return true; }
     if (!admin_stat(a, a->common, &st) || !S_ISDIR(st.st_mode)) { a->incomplete = true; return true; }
+    if (!admin_stat(a, a->worktrees, &st) || !S_ISDIR(st.st_mode)) { a->incomplete = true; return true; }
     if (!admin_stat(a, a->active, &st) || !S_ISDIR(st.st_mode)) { a->incomplete = true; return true; }
     if (admin_stat(a, a->modules, &st)) {
         if (!S_ISDIR(st.st_mode) || !sl_push(&a->pins, a->modules)) a->incomplete = true;
@@ -3100,7 +3103,7 @@ static char **linux_git_mounts(const GitAdmin *a, StrList *keep) {
     snprintf(p, sizeof p, "%s/.git", a->root); add(p, true, false);
     snprintf(p, sizeof p, "%s/.world-git", a->root); add(p, false, true);
     add(a->common, false, true);
-    snprintf(p, sizeof p, "%s/worktrees", a->common); add(p, false, true);
+    add(a->worktrees, false, true);
     add(a->active, false, true);
     snprintf(p, sizeof p, "%s/commondir", a->active); add(p, true, false);
     snprintf(p, sizeof p, "%s/hooks", a->common); add(p, true, true);
