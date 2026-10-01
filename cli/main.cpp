@@ -2186,11 +2186,11 @@ static void join_lexical(const char *base, const char *rel, char *out, size_t ca
 
 extern char **environ;
 
-// Read configuration with build-time Git under read-only confinement, never runtime PATH. These
-// config-only queries do not run hooks or fsmonitor: -c overrides would hide inherited
+// Read Git metadata with build-time Git under read-only confinement, never runtime PATH.
+// Config and rev-parse queries do not run hooks or fsmonitor: -c overrides would hide inherited
 // command-scope settings. Bound both output and child lifetime (an include can be a FIFO).
-static char *git_config_read(const char *root, const char *gitdir, bool hooks, size_t *len,
-                             int *status) {
+static char *git_guard_read(const char *root, const char *gitdir, const char *path_key, bool top_level,
+                            size_t *len, int *status) {
     *status = -1;
     if (!WFS_CONFIG_GIT[0]) return NULL;
     char gd[WFS_PATH_MAX + 16];
@@ -2203,12 +2203,17 @@ static char *git_config_read(const char *root, const char *gitdir, bool hooks, s
         snprintf(gd, sizeof gd, "--git-dir=%s", gitdir);
         argv[arg++] = gd;
     }
-    argv[arg++] = "config";
-    argv[arg++] = "--includes";
-    argv[arg++] = "--null";
-    argv[arg++] = hooks ? "--path" : "--list";
-    argv[arg++] = hooks ? "--get" : "--show-scope";
-    if (hooks) argv[arg++] = "core.hooksPath";
+    if (top_level) {
+        argv[arg++] = "rev-parse";
+        argv[arg++] = "--show-toplevel";
+    } else {
+        argv[arg++] = "config";
+        argv[arg++] = "--includes";
+        argv[arg++] = "--null";
+        argv[arg++] = path_key ? "--path" : "--list";
+        argv[arg++] = path_key ? "--get" : "--show-scope";
+        if (path_key) argv[arg++] = path_key;
+    }
     argv[arg] = NULL;
     size_t n = 0;
     while (environ[n]) ++n;
@@ -2390,7 +2395,7 @@ static void note_hooks_path(const GitAdmin *a, const char *checkout, const char 
 static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, const char *label, GuardSet *s) {
     size_t len = 0;
     int status = -1;
-    char *out = git_config_read(a->root, gitdir, false, &len, &status);
+    char *out = git_guard_read(a->root, gitdir, NULL, false, &len, &status);
     if (!out) return false;
     char checkout[WFS_PATH_MAX], hooks_path[WFS_PATH_MAX] = "";
     snprintf(checkout, sizeof checkout, "%s", *label ? "" : a->root);
@@ -2403,8 +2408,6 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
         char *nl = strchr(key, '\n');
         const char *val = "";
         if (nl) { *nl = 0; val = nl + 1; }
-        if (*label && !strcmp(scope, "local") && !strcmp(key, "core.worktree"))
-            join_lexical(gitdir, val, checkout, sizeof checkout);
         if (!guard_key_runs_command(key, val)) continue;
         size_t idn = strlen(label) + strlen(scope) + strlen(key) + 8;
         char *id = (char *)malloc(idn);
@@ -2414,9 +2417,19 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
         free(id);
     }
     free(out);
+    // Git's setup rules decide the effective checkout, including linked-worktree
+    // configuration semantics; the last config-list value alone is insufficient.
+    char *worktree = git_guard_read(a->root, gitdir, NULL, true, &len, &status);
+    if (!worktree || !len || worktree[len - 1] != '\n' || strlen(worktree) != len ||
+        len >= sizeof checkout || worktree[0] != '/') {
+        free(worktree); return false;
+    }
+    worktree[len - 1] = 0;
+    snprintf(checkout, sizeof checkout, "%s", worktree);
+    free(worktree);
     // Let Git expand ~user and %(prefix), and select the effective value in every scope.
     // Exit 1 means no value; a parse, expansion or capture failure must invalidate capture.
-    char *hooks_value = git_config_read(a->root, gitdir, true, &len, &status);
+    char *hooks_value = git_guard_read(a->root, gitdir, "core.hooksPath", false, &len, &status);
     if (!hooks_value && status != 1) return false;
     if (hooks_value) {
         if (!len || hooks_value[len - 1] != 0 || strlen(hooks_value) + 1 != len) {
@@ -2431,6 +2444,11 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
     if (hooks_path[0]) {
         capture_hooks(a, hooks_path, s);
         sl_push(&a->hooks_paths, hooks_path);
+    }
+    // Always retain the World's entry point even when core.worktree redirects its checkout.
+    if (!*label && strcmp(checkout, a->root)) {
+        snprintf(p, sizeof p, "%s/.git", a->root);
+        capture_pointer(a, p, a->root, gitdir ? gitdir : a->active, "gitdir: ", s);
     }
     if (checkout[0]) {
         snprintf(p, sizeof p, "%s/.git", checkout);
@@ -2990,6 +3008,9 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
             if (guard_capture(&now, &after)) guard_report(&before, &after);
             else fprintf(stderr, "world: note: could not read W%llu's Git configuration after the command; "
                          "changed Git settings that run commands are not reported\n", (unsigned long long)w);
+        } else {
+            fprintf(stderr, "world: WARNING: exec removed or replaced W%llu's Git administration; "
+                    "changed Git hooks and settings could not be inspected\n", (unsigned long long)w);
         }
         gs_free(&after);
         git_admin_free(&now);

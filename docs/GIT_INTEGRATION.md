@@ -295,7 +295,7 @@ world: WARNING: exec removed libs/lib/.git, which told Git where a repository is
 ```
 
 The settings watched (Git's lowercase key names; `*` is any subsection): `core.hookspath`,
-`core.fsmonitor`, `core.sshcommand`, `core.editor`, `core.pager`, `core.askpass`,
+`core.worktree` (checkout and relative-hook redirection), `core.fsmonitor`, `core.sshcommand`, `core.editor`, `core.pager`, `core.askpass`,
 `core.gitproxy`, `core.alternaterefscommand`, `sequence.editor`, `credential.helper` and
 `credential.*.helper`, `filter.*.clean|smudge|process`, `diff.external`,
 `diff.*.command|textconv`, `merge.*.driver`, `mergetool.*.cmd|path`, `difftool.*.cmd|path`,
@@ -304,12 +304,12 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `sendemail[.*].tocmd|cccmd|headercmd|sendmailcmd|smtpserver`, `include.path`,
 `includeif.*.path`, `alias.*` whose value starts with `!`, `submodule.*.update` whose value
 starts with `!`, `pager.*`, `interactive.difffilter`, `web.browser`, `browser.*.cmd|path`,
-`man.*.cmd|path`, `init.templatedir`, `hook.*.command`, `trailer.*.command|cmd`,
+`man.*.cmd|path`, `init.templatedir`, `hook.*.command`, `trailer.*.command|cmd`, `tar.*.command`,
 `protocol.allow` and `protocol.*.allow` (which can enable `ext::` URLs), and
 `lfs.*.path|clean|smudge` (custom transfer agents and extensions). The list is
-`kGuardKeys` in `cli/exec_guard.h`. Each repository is read before and after with two
-configuration queries: a listing and `--path --get core.hooksPath`, so Git expands `~user`
-and selects the effective hooks path. Both use the absolute Git 2.48+ path
+`kGuardKeys` in `cli/exec_guard.h`. Each repository is read before and after with three
+queries: a configuration listing, `--path --get core.hooksPath`, and `rev-parse --show-toplevel`,
+so Git expands `~user` and applies its checkout rules when resolving relative hooks. These use the absolute Git 2.48+ path
 selected by CMake at build time, unaffected by runtime `PATH`, and do not execute hooks or
 fsmonitor. Configuration introspection runs under a separate read-only sandbox: Seatbelt on
 macOS, or Bubblewrap with network and process isolation on Linux. It cannot write files or
@@ -317,7 +317,9 @@ access the network; account lookup on macOS is allowed for `~user` expansion. Ea
 a five-second deadline and a 64 MiB output limit; no tree is walked. If configuration cannot
 be read (missing configured Git or sandbox, a malformed file, or a query exceeding these
 limits), exec says so in one `note:` line and reports nothing;
-a World without `.world-git` gets neither the rules nor the report.
+a World without `.world-git` at startup gets neither the rules nor the report. If the command
+removes or replaces previously detected Git administration, exec warns that the final hooks
+and settings could not be inspected.
 
 The exec sandbox is not a general confinement: it keeps the command away from the store and
 from other Worlds, and from the hooks above. `~/.gitconfig`, `~/.ssh`, shell startup files and

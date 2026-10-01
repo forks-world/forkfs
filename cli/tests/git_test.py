@@ -4589,6 +4589,46 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'world: WARNING: exec removed .git, which told Git where a repository is\n', p.stderr)
         (one / '.git.saved').rename(one / '.git')
 
+    def test_exec_reports_redirected_worktree_hooks_and_archive_command(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'extensions.worktreeConfig', 'true')
+        self.git(one, 'config', '--worktree', 'core.bare', 'false')
+        self.git(one, 'config', 'core.hooksPath', '.husky')
+        hidden = one / '.world-git/hidden'
+        hidden.mkdir()
+        script = ('git config --worktree core.worktree ' + shlex.quote(str(hidden)) +
+                  ' && mkdir -p .world-git/hidden/.husky && '
+                  'echo evil > .world-git/hidden/.husky/pre-commit && exit 7')
+        p = self.exec_sh(wid, script, '--no-sandbox', code=7)
+        self.assertEqual(self.git(one, 'rev-parse', '--show-toplevel').stdout.strip(), str(hidden).encode())
+        self.assertIn(b'worktree core.worktree:', p.stderr)
+        self.assertIn(b'exec added a Git hook: .world-git/hidden/.husky/pre-commit', p.stderr)
+        self.assert_denied(wid, 'echo changed > .world-git/hidden/.husky/pre-commit')
+        # Git ignores command-scope core.worktree for checkout setup; the guard must
+        # protect the Git-resolved checkout rather than the last config-list value.
+        external = self.root / 'external-checkout'
+        (external / '.husky').mkdir(parents=True)
+        self.env.update(GIT_CONFIG_COUNT='3', GIT_CONFIG_KEY_2='core.worktree',
+                        GIT_CONFIG_VALUE_2=str(external))
+        self.assertEqual(self.git(one, 'rev-parse', '--show-toplevel').stdout.strip(), str(hidden).encode())
+        self.assert_denied(wid, 'echo changed > .world-git/hidden/.husky/pre-commit')
+        p = self.exec_sh(wid, "git config tar.custom.command 'sh -c evil'", '--no-sandbox')
+        self.assertIn(b'local tar.custom.command: (unset) -> sh -c evil', p.stderr)
+
+    def test_exec_reports_disappearing_git_administration(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        for operation in ('mv .world-git .saved-admin', 'rm -rf .world-git'):
+            with self.subTest(operation=operation):
+                p = self.exec_sh(wid, operation + '; echo "gitdir: /tmp/elsewhere" > .git; exit 7',
+                                 '--no-sandbox', code=7)
+                self.assertIn(b'WARNING: exec removed or replaced', p.stderr)
+                self.assertIn(b'Git administration', p.stderr)
+                if (one / '.saved-admin').exists():
+                    (one / '.saved-admin').rename(one / '.world-git')
+                    (one / '.git').write_text('gitdir: .world-git/repo.git/worktrees/active\n')
+
     def test_exec_config_capture_ignores_writable_path_git(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
@@ -5384,6 +5424,23 @@ class GitWorldTest(unittest.TestCase):
         p = self.exec_sh(wid, 'mkdir -p libs/lib/githooks && echo lint > libs/lib/githooks/pre-commit',
                          '--require-sandbox')
         self.assertNotIn(b'WARNING', p.stderr)
+
+    def test_exec_submodule_worktree_scope_redirects_relative_hooks(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one / 'libs/lib', 'config', 'extensions.worktreeConfig', 'true')
+        self.git(one / 'libs/lib', 'config', 'core.hooksPath', '.husky')
+        hidden = one / '.world-git/submodule-checkout'
+        hidden.mkdir()
+        p = self.exec_sh(wid, 'git -C libs/lib config --worktree core.worktree ' +
+                         shlex.quote(str(hidden)) + ' && mkdir -p .world-git/submodule-checkout/.husky && '
+                         'echo evil > .world-git/submodule-checkout/.husky/pre-commit', '--no-sandbox')
+        self.assertEqual(self.git(one / 'libs/lib', 'rev-parse', '--show-toplevel').stdout.strip(),
+                         str(hidden).encode())
+        self.assertIn(b'submodule lib-module worktree core.worktree:', p.stderr)
+        self.assertIn(b'exec added a Git hook: .world-git/submodule-checkout/.husky/pre-commit', p.stderr)
+        self.assert_denied(wid, 'echo changed > .world-git/submodule-checkout/.husky/pre-commit')
 
     def test_exec_reports_settings_only_a_submodule_includes(self):
         self.submodule_fixture()

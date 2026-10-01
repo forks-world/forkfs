@@ -35,6 +35,7 @@ int main() {
 
     // Keys that make Git run a command.
     const char *runs[] = {
+        "core.worktree", "tar.tar.gz.command", "tar.custom.command",
         "core.hookspath", "core.fsmonitor", "core.sshcommand", "core.editor", "core.pager",
         "core.askpass", "core.gitproxy", "core.alternaterefscommand", "sequence.editor",
         "credential.helper", "credential.https://example.com.helper", "filter.lfs.clean",
@@ -62,7 +63,7 @@ int main() {
     // Keys that legitimately change during agent work, or only name things.
     const char *quiet[] = {
         "user.email", "user.name", "remote.origin.url", "remote.origin.fetch",
-        "branch.main.remote", "branch.main.merge", "core.bare", "core.worktree",
+        "branch.main.remote", "branch.main.merge", "core.bare", "tar.command", "tar.custom.remote",
         "core.editorx", "filter.clean", "diff.command", "merge.driver", "core.x.hookspath",
         "include.x.path", "includeif.path", "hook.command", "remote.uploadpack", "merge.tool",
         "credential.username", "gpg.format", "init.defaultbranch", "", ".", "core.", "nodot",

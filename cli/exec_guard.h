@@ -36,6 +36,7 @@ struct GuardKey {
 };
 
 static const GuardKey kGuardKeys[] = {
+    {"core", "worktree", 0, false},       {"tar", "command", 1, false},
     {"core", "hookspath", 0, false},      {"core", "fsmonitor", 0, false},
     {"core", "sshcommand", 0, false},     {"core", "editor", 0, false},
     {"core", "pager", 0, false},          {"core", "askpass", 0, false},
