@@ -3442,8 +3442,10 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
                     "changed Git hooks and settings could not be inspected\n", (unsigned long long)w);
         } else if (found) {
             if (guard_capture(&now, &after)) guard_report(&before, &after);
-            else fprintf(stderr, "world: note: could not read W%llu's Git configuration after the command; "
-                         "changed Git settings that run commands are not reported (%s)\n", (unsigned long long)w,
+            else if (g_post_signal)
+                fputs("world: note: Git administration inspection interrupted after the command\n", stderr);
+            else fprintf(stderr, "world: WARNING: exec left W%llu's changed Git hooks and settings "
+                         "uninspected after the command (%s)\n", (unsigned long long)w,
                          after.error ? after.error : "configuration query failed");
         } else {
             fprintf(stderr, "world: WARNING: exec removed or replaced W%llu's Git administration; "

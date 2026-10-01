@@ -343,7 +343,8 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 (can activate child status, diff or log commands and their configured programs),
 `includeif.*.path`, `alias.*` (including ordinary aliases that dispatch commands or inject `-c` settings), `submodule.*.update` whose value
 starts with `!`, `pager.*`, `interactive.difffilter`, `web.browser`, `help.browser`, `help.format`, `instaweb.browser`, `man.viewer` (select configured viewers), `browser.*.cmd|path`, `instaweb.httpd`, `guitool.*.cmd`, `imap.tunnel`,
-`man.*.cmd|path`, `init.templatedir`, `hook.*.command`, `trailer.*.command|cmd`, `tar.*.command`,
+`man.*.cmd|path`, `init.templatedir`, `hook.*.command`, `trailer.*.command|cmd`, `tar.*.command|remote`, `uploadarchive.allowunreachable`
+(including activation of an unchanged archive command),
 `protocol.allow` and `protocol.*.allow` (which can enable `ext::` URLs), and
 `lfs.*.path|clean|smudge` (custom transfer agents and extensions). Remote `url`/`pushurl`
 and `url.<target>.insteadOf`/`pushInsteadOf` changes are always reported. SSH endpoints can
@@ -380,7 +381,8 @@ path truncation, depth over 32, more than 4096 repositories or 65536 directory e
 sandboxed exec; `--no-sandbox` reports the unavailable guard and preserves the command status.
 Hook, pointer and repository-attributes hashing has a 64 MiB aggregate content budget per capture; oversized files,
 read errors and record/entry limits invalidate the capture explicitly. Incomplete initial
-hook captures also refuse sandboxed exec; final capture failures keep the command status. Small hooks are hashed
+hook captures also refuse sandboxed exec. Any noninterrupted final capture failure emits a
+`WARNING` that changed hooks and settings could not be inspected, while keeping the command status. Small hooks are hashed
 in full, so same-size, same-mtime rewrites remain detectable. Symlinked default hooks directories and symlinked entries in guarded
 hooks directories are unsupported: their executable target could change outside the directory
 policy. They invalidate capture, refusing sandboxed exec and producing an explicit note with

@@ -4762,9 +4762,39 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(p.returncode, 7, p.stderr)
         self.assertEqual(hook.stat().st_size, 1 << 40)
         self.assertIn(b'64 MiB capture budget', p.stderr)
+        self.assertIn(b'WARNING: exec left', p.stderr)
+        self.assertIn(b'Git hooks and settings uninspected after the command', p.stderr)
         p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
         self.assertIn(b'incomplete Git hooks or administration capture', p.stderr)
         self.assertFalse((one / 'should-not-run').exists())
+
+    def test_exec_warns_when_new_project_hook_exceeds_capture_budget(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'core.hooksPath', '.hidden-hooks')
+        (one / '.gitignore').write_text('.hidden-hooks/\n')
+        script = (shlex.quote(sys.executable) + ' -c ' + shlex.quote(
+            "import os; os.mkdir('.hidden-hooks'); "
+            "f = open('.hidden-hooks/pre-commit', 'wb'); f.truncate(1 << 40); f.close()") + '; exit 7')
+        p = subprocess.run((WORLD, 'exec', wid, '--require-sandbox', '--', '/bin/sh', '-c', script),
+                           env=self.env, capture_output=True, timeout=15)
+        self.assertEqual(p.returncode, 7, p.stderr)
+        self.assertEqual((one / '.hidden-hooks/pre-commit').stat().st_size, 1 << 40)
+        self.assertIn(b'WARNING: exec left', p.stderr)
+        self.assertIn(b'Git hooks and settings uninspected after the command', p.stderr)
+        self.assertIn(b'64 MiB capture budget', p.stderr)
+
+    def test_exec_reports_enabling_remote_archive_command(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'tar.custom.command', 'touch archive-command-ran; cat')
+        self.git(one, 'config', 'tar.custom.remote', 'false')
+        p = self.exec_sh(wid, 'git config tar.custom.remote true && '
+                         'git config uploadarchive.allowUnreachable true; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local tar.custom.remote: false -> true', p.stderr)
+        self.assertIn(b'local uploadarchive.allowunreachable: (unset) -> true', p.stderr)
+        self.assertNotIn(b'local tar.custom.command:', p.stderr)
+        self.assertFalse((one / 'archive-command-ran').exists())
 
     def test_exec_reports_alias_and_remote_helper_configuration(self):
         self.world('init', str(self.source))
@@ -5364,7 +5394,8 @@ class GitWorldTest(unittest.TestCase):
         p = subprocess.run((WORLD, 'exec', wid, '--no-sandbox', '--', '/bin/sh', '-c', script),
                            env=self.env, capture_output=True, timeout=15)
         self.assertEqual(p.returncode, 7, p.stderr)
-        self.assertIn(b'Git configuration after the command', p.stderr)
+        self.assertIn(b'WARNING: exec left', p.stderr)
+        self.assertIn(b'Git hooks and settings uninspected after the command', p.stderr)
         # A blocked initial capture also returns, without suppressing the requested command.
         p = subprocess.run((WORLD, 'exec', wid, '--no-sandbox', '--', '/bin/sh', '-c', 'exit 9'),
                            env=self.env, capture_output=True, timeout=15)

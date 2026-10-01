@@ -58,6 +58,7 @@ int main() {
 
     // Keys that make Git run a command.
     const char *runs[] = {
+        "uploadarchive.allowunreachable", "tar.custom.remote", "tar.tar.gz.remote",
         "core.attributesfile", "core.worktree", "tar.tar.gz.command", "tar.custom.command", "gc.recentobjectshook",
         "core.hookspath", "core.fsmonitor", "core.sshcommand", "core.editor", "core.pager",
         "core.askpass", "core.gitproxy", "core.alternaterefscommand", "sequence.editor",
@@ -152,7 +153,7 @@ int main() {
         "remote.skipdefaultupdate", "remote.skipfetchall", "remote.origin.skipfetch",
         "user.email", "user.name", "remote.origin.fetch", "remote.origin.name", "url.insteadof", "url.pushinsteadof",
         "pull.custom.twohead", "pull.custom.octopus", "receive.custom.procreceiverefs", "receive.advertisepushoptions", "branch.remote", "branch.pushremote", "branch.mergeoptions", "remote.origin.pushdefault",
-        "branch.main.merge", "core.bare", "tar.command", "tar.custom.remote",
+        "branch.main.merge", "core.bare", "tar.command", "tar.remote", "uploadarchive.custom.allowunreachable",
         "gc.custom.recentobjectshook", "gc.pruneexpire", "core.editorx", "core.custom.attributesfile", "filter.clean", "diff.command", "merge.driver", "merge.recursive", "merge.custom.default", "merge.custom.renormalize", "core.x.hookspath",
         "include.x.path", "includeif.path", "hook.command", "remote.uploadpack", "merge.payload.tool", "diff.payload.guitool",
         "difftool.custom.guidefault", "mergetool.custom.guidefault",
