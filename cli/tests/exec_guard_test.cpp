@@ -42,6 +42,7 @@ int main() {
         "diff.tool", "diff.guitool", "merge.tool", "merge.guitool",
         "filter.x.smudge", "filter.x.process", "diff.external", "diff.pdf.textconv",
         "diff.pdf.command", "merge.ours.driver", "mergetool.vim.cmd", "difftool.x.path",
+        "commit.gpgsign", "tag.gpgsign", "tag.forcesignannotated", "push.gpgsign", "gpg.format",
         "gpg.program", "gpg.ssh.program", "gpg.ssh.defaultkeycommand", "remote.origin.uploadpack",
         "remote.origin.receivepack", "remote.origin.vcs", "uploadpack.packobjectshook",
         "sendemail.tocmd", "sendemail.work.sendmailcmd", "sendemail.smtpserver", "include.path",
@@ -101,7 +102,8 @@ int main() {
         "gc.custom.recentobjectshook", "gc.pruneexpire", "core.editorx", "core.custom.attributesfile", "filter.clean", "diff.command", "merge.driver", "core.x.hookspath",
         "include.x.path", "includeif.path", "hook.command", "remote.uploadpack", "merge.payload.tool", "diff.payload.guitool",
         "imap.host", "imap.custom.tunnel", "instaweb.port", "instaweb.custom.httpd", "guitool.cmd", "guitool.test.title",
-        "credential.username", "gpg.format", "init.defaultbranch", "", ".", "core.", "nodot",
+        "commit.custom.gpgsign", "tag.custom.gpgsign", "tag.custom.forcesignannotated",
+        "push.custom.gpgsign", "gpg.custom.format", "credential.username", "init.defaultbranch", "", ".", "core.", "nodot",
     };
     for (const char *k : quiet) {
         if (guard_key_runs_command(k, "!cmd")) { fprintf(stderr, "%s should not be watched\n", k); exit(1); }

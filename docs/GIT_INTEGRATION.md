@@ -308,7 +308,8 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `core.attributesfile` (can activate configured filters), `core.gitproxy`, `core.alternaterefscommand`, `sequence.editor`, `credential.helper` and
 `credential.*.helper`, `filter.*.clean|smudge|process`, `diff.external`,
 `diff.*.command|textconv`, `diff.tool|guitool`, `merge.tool|guitool` (select configured commands), `merge.*.driver`, `mergetool.*.cmd|path`, `difftool.*.cmd|path`,
-`gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
+`commit.gpgsign`, `tag.gpgsign`, `tag.forcesignannotated`, `push.gpgsign` (enable signing),
+`gpg.format` (selects the signing program), `gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
 `remote.*.uploadpack|receivepack|vcs`, `uploadpack.packobjectshook`,
 `sendemail[.*].tocmd|cccmd|headercmd|sendmailcmd|smtpserver`, `include.path`,
 `includeif.*.path`, `alias.*` (including ordinary aliases that dispatch commands or inject `-c` settings), `submodule.*.update` whose value
@@ -334,7 +335,8 @@ limits), sandboxed exec refuses before running the command; `--no-sandbox` says 
 `note:` line and runs without the report;
 a World without `.world-git` at startup gets neither the rules nor the report. If the command
 removes or replaces previously detected Git administration, or makes its scan incomplete,
-exec warns that the final hooks and settings could not be inspected. An interrupted scan
+exec warns that the final hooks and settings could not be inspected. This includes missing,
+renamed or replaced active worktree administration. An interrupted scan
 is identified as cancellation rather than a replacement. An incomplete administration scan (read/allocation error,
 path truncation, depth over 32, more than 4096 repositories or 65536 directory entries) refuses
 sandboxed exec; `--no-sandbox` reports the unavailable guard and preserves the command status.

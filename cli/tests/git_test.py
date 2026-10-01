@@ -4783,6 +4783,47 @@ class GitWorldTest(unittest.TestCase):
         self.assertNotIn(b'local mergetool.payload.cmd:', p.stderr)
         self.assertFalse((one / 'selected-tool-ran').exists())
 
+    def test_exec_reports_activating_preconfigured_signing_program(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        program = one / 'signing-program'
+        program.write_text('#!/bin/sh\ntouch signing-program-ran\n')
+        program.chmod(0o755)
+        self.git(one, 'config', 'gpg.program', str(program))
+        self.git(one, 'config', 'gpg.ssh.program', str(program))
+        values = {'commit.gpgsign': 'true', 'tag.gpgsign': 'true',
+                  'tag.forcesignannotated': 'true', 'push.gpgsign': 'if-asked', 'gpg.format': 'ssh'}
+        p = self.exec_sh(wid, ' && '.join('git config ' + key + ' ' + val for key, val in values.items()),
+                         '--no-sandbox')
+        for key, val in values.items():
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> ' + val.encode(), p.stderr)
+        self.assertNotIn(b'local gpg.program:', p.stderr)
+        self.assertNotIn(b'local gpg.ssh.program:', p.stderr)
+        self.assertFalse((one / 'signing-program-ran').exists())
+
+    def test_exec_reports_missing_or_replaced_active_git_administration(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        active = one / '.world-git/repo.git/worktrees/active'
+        saved = active.with_name('saved-active')
+        rel = '.world-git/repo.git/worktrees/active'
+        operations = ('mv ' + rel + ' ' + rel.replace('/active', '/saved-active'),
+                      'mv ' + rel + ' ' + rel.replace('/active', '/saved-active') + '; ln -s saved-active ' + rel,
+                      'mv ' + rel + ' ' + rel.replace('/active', '/saved-active') + '; echo replaced > ' + rel,
+                      'rm -rf ' + rel)
+        for operation in operations:
+            with self.subTest(operation=operation):
+                p = self.exec_sh(wid, operation + '; exit 7', '--no-sandbox', code=7)
+                self.assertIn(b'WARNING: exec left', p.stderr)
+                self.assertIn(b'Git administration replaced or incomplete', p.stderr)
+                p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+                self.assertIn(b'incomplete Git administration scan', p.stderr)
+                self.assertFalse((one / 'should-not-run').exists())
+                if saved.exists():
+                    if active.is_symlink() or active.exists():
+                        active.unlink()
+                    saved.rename(active)
+
     def test_exec_reports_disappearing_git_administration(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

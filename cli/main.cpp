@@ -2090,6 +2090,7 @@ static bool git_admin_find(const char *world, GitAdmin *a) {
     if (!admin_stat(a, wg, &st)) return a->incomplete;
     if (!S_ISDIR(st.st_mode)) { a->incomplete = true; return true; }
     if (!admin_stat(a, a->common, &st) || !S_ISDIR(st.st_mode)) { a->incomplete = true; return true; }
+    if (!admin_stat(a, a->active, &st) || !S_ISDIR(st.st_mode)) { a->incomplete = true; return true; }
     if (admin_stat(a, a->modules, &st)) {
         if (!S_ISDIR(st.st_mode) || !sl_push(&a->pins, a->modules)) a->incomplete = true;
         else find_submodules(a, a->modules, 0);
