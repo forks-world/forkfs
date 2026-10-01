@@ -270,7 +270,8 @@ status, which `world exec` keeps). Before the command starts, exec captures each
 the sandbox rules above:
 
 Before sandboxed exec, the World's `.git` and active worktree `commondir` must be regular,
-complete pointers to its own administration. Existing `.git` entries in other effective
+complete pointers to its own administration, each with exactly one hardlink. Writable aliases
+to a pointer would otherwise evade pathname protection. Existing `.git` entries in other effective
 checkouts, and existing submodule `commondir` pointers, must likewise name the administration
 being guarded. Missing optional checkout pointers are allowed (for example a redirected
 `core.worktree` without `.git`). Pointer parsing reads the complete bounded file, rejects NUL
@@ -284,10 +285,14 @@ observational reporting so a command can repair them.
   per repository, since an `includeIf "gitdir:..."` or `"onbranch:..."` can give one
   submodule settings the World does not have; a change to a global or system entry that is
   identical in the World's own listing is reported once, under the World;
-- each repository's private `info/attributes` file: changes can activate an unchanged filter
+- each repository's private `info/attributes` and effective user/system attributes files:
+  changes can activate an unchanged filter
   definition without altering tracked project files. Regular files are hashed in full within
   the shared capture budget, including edits through hardlink aliases. Symlinked or other
-  nonregular attribute files invalidate capture rather than silently omitting their content;
+  nonregular attribute files invalidate capture rather than silently omitting their content.
+  Git resolves `core.attributesFile`, its XDG default and the system attributes path per
+  repository; `GIT_ATTR_NOSYSTEM` is honored and an effective `/dev/null` source is disabled.
+  Shared paths are captured and reported once;
 - the hooks Git could run: name, mode and content of every non-`.sample` entry of its hooks
   directory and of its effective `core.hooksPath` when that is guarded;
 - the entries that tell Git where it is -- the World's `.git` and `commondir`, each
@@ -295,7 +300,7 @@ observational reporting so a command can repair them.
   content, and whether a file still names its own repository.
 
 It captures them again after the command and prints one line per difference to stderr.
-Configuration comparison preserves each value boundary and distinguishes an implicit boolean
+Configuration comparison preserves repository-label/key identity boundaries and each value boundary and distinguishes an implicit boolean
 from an explicitly empty value. Reports show these as `(implicit)` and `""`; control bytes and
 literal backslashes are escaped rather than interpreted as value boundaries or terminal controls. A
 `.git` replaced by another type (`git init` over it, a symlink) or rewritten is reported as a
@@ -318,9 +323,9 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `diff.*.command|textconv`, `diff.tool|guitool`, `merge.tool|guitool` (select configured commands), `merge.*.driver`, `mergetool.*.cmd|path`, `difftool.*.cmd|path`,
 `commit.gpgsign`, `tag.gpgsign`, `tag.forcesignannotated`, `push.gpgsign` (enable signing),
 `gpg.format` (selects the signing program), `gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
-`remote.*.uploadpack|receivepack|vcs`, `branch.*.mergeoptions` (can select external merge strategies),
+`remote.*.uploadpack|receivepack|vcs`, `branch.*.mergeoptions`, `pull.twohead`, `pull.octopus` (can select external merge strategies),
 `branch.*.remote|pushremote`, `remote.pushdefault` (can select preconfigured helper remotes),
-`uploadpack.packobjectshook`,
+`uploadpack.packobjectshook`, `receive.procreceiverefs` (activates the configured proc-receive hook),
 `sendemail[.*].tocmd|cccmd|headercmd|sendmailcmd|smtpserver`, `include.path`,
 `includeif.*.path`, `alias.*` (including ordinary aliases that dispatch commands or inject `-c` settings), `submodule.*.update` whose value
 starts with `!`, `pager.*`, `interactive.difffilter`, `web.browser`, `help.browser`, `help.format`, `instaweb.browser`, `man.viewer` (select configured viewers), `browser.*.cmd|path`, `instaweb.httpd`, `guitool.*.cmd`, `imap.tunnel`,
@@ -335,8 +340,9 @@ prefix in the value. Ordinary URLs using exact lowercase `file`, `git`, `ssh`, `
 value-sensitive rules are in `cli/exec_guard.h`. Branch remote selectors and `remote.pushdefault`
 are reported even when choosing an ordinary remote: a remote name can activate unchanged
 helper configuration. Setting tracking remains allowed; `branch.*.merge` stays quiet.
-Each repository is read before and after with three
-queries: a configuration listing, `--path --get core.hooksPath`, and `rev-parse --show-toplevel`,
+Each repository is read before and after with five
+queries: a configuration listing, `--path --get core.hooksPath`, `rev-parse --show-toplevel`,
+and `git var GIT_ATTR_GLOBAL`/`GIT_ATTR_SYSTEM`,
 so Git expands `~user` and applies its checkout rules when resolving relative hooks. These use the absolute Git 2.48+ path
 selected by CMake at build time, unaffected by runtime `PATH`, and do not execute hooks or
 fsmonitor. Configuration introspection runs under a separate read-only sandbox: Seatbelt on
@@ -362,7 +368,8 @@ policy. They invalidate capture, refusing sandboxed exec and producing an explic
 `--no-sandbox`; symlinked Git administration pointers remain recorded by link target.
 Regular hook files with multiple hardlinks are likewise unsupported, since a writable alias
 could change their bytes outside the guarded directory. The check applies to hook files, not
-directory link counts or Git administration pointers. Signals received during post-command
+directory link counts. Administration pointers also require a single link for sandboxed exec,
+but their contents remain observable with `--no-sandbox`. Signals received during post-command
 inspection cancel the active query, reap its child, release the exec lock and return
 `128 + signal`; signals while the requested command runs continue to be forwarded to it.
 
@@ -376,7 +383,9 @@ cannot be renamed. Duplicate paths keep the read-only policy, and descendant loc
 never reopen a read-only hooks path; a submodule first initialized during the exec gets writable hooks there,
 which the report then lists. What neither platform stops, and the report does not cover: a
 change to project content that runs code (a `Makefile`, `package.json` scripts, `.husky`,
-`.envrc`) -- review the World's diff before running it.
+`.envrc`) -- review the World's diff before running it. Effective Git attributes files are
+an exception: their contents are reported even when the configured path is inside the World.
+This does not scan the project tree for `.gitattributes` files.
 
 ## Git LFS
 

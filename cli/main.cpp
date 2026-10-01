@@ -2107,7 +2107,7 @@ static void git_admin_free(GitAdmin *a) { sl_free(&a->gitdirs); sl_free(&a->pins
 // that tells Git where a repository is.
 
 struct GuardRec { char *id; char *val; size_t seq; };
-struct GuardSet { GuardRec *v; size_t n, cap, bytes_left, entries; const char *error; };
+struct GuardSet { GuardRec *v; size_t n, cap, bytes_left, entries; StrList attributes; const char *error; };
 
 static void gs_add(GuardSet *s, const char *id, const char *val) {
     if (s->error) return;
@@ -2126,6 +2126,7 @@ static void gs_add(GuardSet *s, const char *id, const char *val) {
 static void gs_free(GuardSet *s) {
     for (size_t i = 0; i < s->n; ++i) { free(s->v[i].id); free(s->v[i].val); }
     free(s->v);
+    sl_free(&s->attributes);
     memset(s, 0, sizeof *s);
 }
 
@@ -2254,29 +2255,6 @@ static void capture_hooks(const GitAdmin *a, const char *dir, GuardSet *s) {
     closedir(d);
 }
 
-// Repository-private attributes can activate a previously configured filter without
-// changing configuration or tracked project files. Observe their full regular-file bytes.
-static void capture_attributes(const GitAdmin *a, const char *common, GuardSet *s) {
-    if (s->error) return;
-    char path[WFS_PATH_MAX + 32], id[WFS_PATH_MAX + 40], fp[64];
-    if ((size_t)snprintf(path, sizeof path, "%s/info/attributes", common) >= sizeof path) {
-        s->error = "Git attributes path exceeds capture limit"; return;
-    }
-    snprintf(id, sizeof id, "a\x1f%s", rel_to(a, path));
-    struct stat st;
-    if (lstat(path, &st) != 0) {
-        if (errno == ENOENT || errno == ENOTDIR) gs_add(s, id, "absent");
-        else s->error = "could not inspect Git repository attributes";
-        return;
-    }
-    if (!S_ISREG(st.st_mode)) { s->error = "nonregular Git repository attributes cannot be inspected"; return; }
-    if (!fingerprint(path, fp, sizeof fp, s, false, true)) {
-        if (!s->error) s->error = "could not fingerprint Git repository attributes";
-        return;
-    }
-    gs_add(s, id, fp);
-}
-
 // `base`/`rel` with `.` and `..` resolved lexically (a submodule's core.worktree is relative to
 // its repository: ../../../../../../libs/lib).
 static void join_lexical(const char *base, const char *rel, char *out, size_t cap) {
@@ -2299,12 +2277,61 @@ static void join_lexical(const char *base, const char *rel, char *out, size_t ca
     if (!at) snprintf(out, cap, "/");
 }
 
+// Resolve parent directories for faithful symlink/.. semantics and shared-path dedup,
+// retaining the final entry itself so a symlink attributes file remains unsupported.
+static bool attributes_path(const char *checkout, const char *value, char *out, size_t cap) {
+    char path[2 * WFS_PATH_MAX];
+    int n = value[0] == '/' ? snprintf(path, sizeof path, "%s", value) :
+                             snprintf(path, sizeof path, "%s/%s", checkout, value);
+    if (n < 0 || (size_t)n >= sizeof path) return false;
+    char *slash = strrchr(path, '/');
+    if (!slash) return false;
+    *slash = 0;
+    char *parent = realpath(path[0] ? path : "/", NULL);
+    if (parent) {
+        n = snprintf(out, cap, "%s/%s", !strcmp(parent, "/") ? "" : parent, slash + 1);
+        free(parent);
+        return n >= 0 && (size_t)n < cap;
+    }
+    if (errno != ENOENT && errno != ENOTDIR) return false;
+    *slash = '/';
+    join_lexical("/", path, out, cap);
+    return out[0] != 0;
+}
+
+// Repository-private attributes can activate a previously configured filter without
+// changing configuration or tracked project files. Observe their full regular-file bytes.
+static void capture_attributes(const GitAdmin *a, const char *path, GuardSet *s) {
+    if (s->error) return;
+    for (size_t i = 0; i < s->attributes.n; ++i)
+        if (!strcmp(s->attributes.v[i], path)) return;
+    if (!sl_push(&s->attributes, path)) { s->error = "out of memory"; return; }
+    char id[WFS_PATH_MAX + 40], fp[64];
+    if ((size_t)snprintf(id, sizeof id, "a\x1f%s", rel_to(a, path)) >= sizeof id) {
+        s->error = "Git attributes path exceeds capture limit"; return;
+    }
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) gs_add(s, id, "absent");
+        else s->error = "could not inspect Git repository attributes";
+        return;
+    }
+    if (!S_ISREG(st.st_mode)) { s->error = "nonregular Git repository attributes cannot be inspected"; return; }
+    if (!fingerprint(path, fp, sizeof fp, s, false, true)) {
+        if (!s->error) s->error = "could not fingerprint Git repository attributes";
+        return;
+    }
+    gs_add(s, id, fp);
+}
+
 extern char **environ;
 
 // Read Git metadata with build-time Git under read-only confinement, never runtime PATH.
-// Config and rev-parse queries do not run hooks or fsmonitor: -c overrides would hide inherited
+// Config, rev-parse and var queries do not run hooks or fsmonitor: -c overrides would hide inherited
 // command-scope settings. Bound both output and child lifetime (an include can be a FIFO).
-static char *git_guard_read(const char *root, const char *gitdir, const char *path_key, bool top_level,
+enum GitGuardQuery { GG_LIST, GG_PATH, GG_TOPLEVEL, GG_VAR };
+
+static char *git_guard_read(const char *root, const char *gitdir, const char *path_key, GitGuardQuery query,
                             size_t *len, int *status) {
     *status = -1;
     if (g_post_signal) return NULL;
@@ -2319,16 +2346,19 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
         snprintf(gd, sizeof gd, "--git-dir=%s", gitdir);
         argv[arg++] = gd;
     }
-    if (top_level) {
+    if (query == GG_VAR) {
+        argv[arg++] = "var";
+        argv[arg++] = path_key;
+    } else if (query == GG_TOPLEVEL) {
         argv[arg++] = "rev-parse";
         argv[arg++] = "--show-toplevel";
     } else {
         argv[arg++] = "config";
         argv[arg++] = "--includes";
         argv[arg++] = "--null";
-        argv[arg++] = path_key ? "--path" : "--list";
-        argv[arg++] = path_key ? "--get" : "--show-scope";
-        if (path_key) argv[arg++] = path_key;
+        argv[arg++] = query == GG_PATH ? "--path" : "--list";
+        argv[arg++] = query == GG_PATH ? "--get" : "--show-scope";
+        if (query == GG_PATH) argv[arg++] = path_key;
     }
     argv[arg] = NULL;
     size_t n = 0;
@@ -2338,7 +2368,8 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
     size_t k = 0;
     for (size_t i = 0; i < n; ++i) {
         const char *e = environ[i];
-        if (!strncmp(e, "GIT_", 4) && strncmp(e, "GIT_CONFIG_", 11)) continue;
+        if (!strncmp(e, "GIT_", 4) && strncmp(e, "GIT_CONFIG_", 11) &&
+            strncmp(e, "GIT_ATTR_NOSYSTEM=", 18)) continue;
         if (!strncmp(e, "LD_", 3) || !strncmp(e, "DYLD_", 5) ||
             !strncmp(e, "GCONV_PATH=", 11) || !strncmp(e, "GLIBC_TUNABLES=", 15)) continue;
         env[k++] = environ[i];
@@ -2448,21 +2479,21 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
 // Git treats only trailing CR/LF as terminators: an embedded newline belongs to the
 // path. Read the complete bounded file before trusting it as an administration pointer.
 static bool pointer_home(const char *path, const char *base, const char *expect,
-                         const char *prefix, bool *present) {
+                         const char *prefix, bool *present, bool single_link = false) {
     *present = true;
     struct stat st;
     if (lstat(path, &st) != 0) {
         if (errno == ENOENT || errno == ENOTDIR) *present = false;
         return false;
     }
-    if (!S_ISREG(st.st_mode)) return false;
+    if (!S_ISREG(st.st_mode) || (single_link && st.st_nlink != 1)) return false;
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) return false;
     char buf[WFS_PATH_MAX + 16];
     size_t at = 0;
     bool complete = false;
     struct stat opened;
-    if (fstat(fd, &opened) == 0 && S_ISREG(opened.st_mode)) {
+    if (fstat(fd, &opened) == 0 && S_ISREG(opened.st_mode) && (!single_link || opened.st_nlink == 1)) {
         while (at < sizeof buf) {
             if (g_post_signal) break;
             ssize_t n = read(fd, buf + at, sizeof buf - at);
@@ -2492,7 +2523,7 @@ static bool pointer_home(const char *path, const char *base, const char *expect,
 static bool require_pointer_home(const char *path, const char *base, const char *expect,
                                  const char *prefix, bool optional, GuardSet *s) {
     bool present;
-    if (pointer_home(path, base, expect, prefix, &present) || (optional && !present)) return true;
+    if (pointer_home(path, base, expect, prefix, &present, true) || (optional && !present)) return true;
     s->error = "Git repository pointer is missing, redirected or unsupported";
     return false;
 }
@@ -2567,7 +2598,7 @@ static bool note_hooks_path(const GitAdmin *a, const char *checkout, const char 
 static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, const char *label, GuardSet *s, bool require_home) {
     size_t len = 0;
     int status = -1;
-    char *out = git_guard_read(a->root, gitdir, NULL, false, &len, &status);
+    char *out = git_guard_read(a->root, gitdir, NULL, GG_LIST, &len, &status);
     if (!out) return false;
     char checkout[WFS_PATH_MAX], hooks_path[WFS_PATH_MAX] = "";
     snprintf(checkout, sizeof checkout, "%s", *label ? "" : a->root);
@@ -2581,10 +2612,16 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
         const char *val = "";
         if (nl) { *nl = 0; val = nl + 1; }
         if (!guard_key_runs_command(key, val)) continue;
-        size_t idn = strlen(label) + strlen(scope) + strlen(key) + 8;
+        char *encoded_label = guard_encode_id_field(label);
+        char *encoded_key = guard_encode_id_field(key);
+        if (!encoded_label || !encoded_key) {
+            free(encoded_label); free(encoded_key); s->error = "out of memory"; continue;
+        }
+        size_t idn = strlen(encoded_label) + strlen(scope) + strlen(encoded_key) + 8;
         char *id = (char *)malloc(idn);
+        if (id) snprintf(id, idn, "c\x1f%s\x1f%s\x1f%s", encoded_label, scope, encoded_key);
+        free(encoded_label); free(encoded_key);
         if (!id) { s->error = "out of memory"; continue; }
-        snprintf(id, idn, "c\x1f%s\x1f%s\x1f%s", label, scope, key);
         char *encoded = guard_encode_value(val, nl != NULL);
         if (encoded) gs_add(s, id, encoded);
         else s->error = "out of memory";
@@ -2595,7 +2632,7 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
     if (s->error) return false;
     // Git's setup rules decide the effective checkout, including linked-worktree
     // configuration semantics; the last config-list value alone is insufficient.
-    char *worktree = git_guard_read(a->root, gitdir, NULL, true, &len, &status);
+    char *worktree = git_guard_read(a->root, gitdir, NULL, GG_TOPLEVEL, &len, &status);
     if (!worktree || !len || worktree[len - 1] != '\n' || strlen(worktree) != len ||
         len >= sizeof checkout || worktree[0] != '/') {
         free(worktree); return false;
@@ -2612,7 +2649,7 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
     }
     // Let Git expand ~user and %(prefix), and select the effective value in every scope.
     // Exit 1 means no value; a parse, expansion or capture failure must invalidate capture.
-    char *hooks_value = git_guard_read(a->root, gitdir, "core.hooksPath", false, &len, &status);
+    char *hooks_value = git_guard_read(a->root, gitdir, "core.hooksPath", GG_PATH, &len, &status);
     if (!hooks_value && status != 1) return false;
     if (hooks_value) {
         if (!len || hooks_value[len - 1] != 0 || strlen(hooks_value) + 1 != len) {
@@ -2622,9 +2659,31 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
         free(hooks_value);
         if (!resolved) { s->error = "could not resolve Git hooks path"; return false; }
     }
-    capture_attributes(a, common, s);
+    char p[WFS_PATH_MAX + 32], attributes[WFS_PATH_MAX + 32];
+    snprintf(p, sizeof p, "%s/info/attributes", common);
+    if (!attributes_path(checkout, p, attributes, sizeof attributes)) {
+        s->error = "could not resolve Git repository attributes"; return false;
+    }
+    capture_attributes(a, attributes, s);
+    const char *attribute_vars[] = {"GIT_ATTR_GLOBAL", "GIT_ATTR_SYSTEM"};
+    for (const char *var : attribute_vars) {
+        if (s->error) return false;
+        char *value = git_guard_read(a->root, gitdir, var, GG_VAR, &len, &status);
+        if (!value) {
+            if (status == 1) continue;  // absent or explicitly disabled
+            return false;
+        }
+        if (!len || value[len - 1] != '\n' || strlen(value) != len) { free(value); return false; }
+        value[len - 1] = 0;  // embedded newlines belong to the path
+        if (value[0]) {
+            if (!attributes_path(checkout, value, attributes, sizeof attributes)) {
+                free(value); s->error = "could not resolve effective Git attributes"; return false;
+            }
+            if (strcmp(attributes, "/dev/null")) capture_attributes(a, attributes, s);
+        }
+        free(value);
+    }
     if (s->error) return false;
-    char p[WFS_PATH_MAX + 16];
     snprintf(p, sizeof p, "%s/hooks", common);
     capture_hooks(a, p, s);
     if (s->error) return false;
@@ -2715,6 +2774,18 @@ static void put_field(FILE *f, const char *s, size_t n) {
     }
 }
 
+// Decode only encoded config identity fields, then apply the same terminal escaping.
+// Pointer/hook/attributes path fields remain ordinary strings and use put_field directly.
+static void put_id_field(FILE *f, const char *s, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == 0x1d && i + 1 < n && (s[i + 1] == 'd' || s[i + 1] == 'f'))
+            c = s[++i] == 'd' ? 0x1d : 0x1f;
+        char byte = (char)c;
+        put_field(f, &byte, 1);
+    }
+}
+
 static const char *pointer_kind(const char *val) {
     if (!val || !strcmp(val, "absent")) return "missing";
     if (!strncmp(val, "file:", 5))
@@ -2730,10 +2801,10 @@ static void guard_warn(const GuardRec *before, const GuardRec *after) {
     if (id[0] == 'c') {
         const char *label = rest, *scope = strchr(label, '\x1f') + 1, *key = strchr(scope, '\x1f') + 1;
         fputs("world: WARNING: exec changed a Git setting that runs commands: ", stderr);
-        if (scope - label > 1) { put_field(stderr, label, (size_t)(scope - label - 1)); fputc(' ', stderr); }
+        if (scope - label > 1) { put_id_field(stderr, label, (size_t)(scope - label - 1)); fputc(' ', stderr); }
         put_field(stderr, scope, (size_t)(key - scope - 1));
         fputc(' ', stderr);
-        put_field(stderr, key, strlen(key));
+        put_id_field(stderr, key, strlen(key));
         fputs(": ", stderr);
         put_value(stderr, before ? before->val : NULL);
         fputs(" -> ", stderr);

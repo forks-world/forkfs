@@ -43,6 +43,25 @@ static inline char *guard_encode_value(const char *value, bool explicit_value) {
     return out;
 }
 
+// Config IDs join label/scope/key with raw 0x1f. Escape field data without
+// emitting that separator, including escape bytes themselves, to preserve identity.
+static inline char *guard_encode_id_field(const char *value) {
+    size_t len = strlen(value);
+    if (len > ((size_t)-1 - 1) / 2) return NULL;
+    char *out = (char *)malloc(2 * len + 1);
+    if (!out) return NULL;
+    size_t at = 0;
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = (unsigned char)value[i];
+        if (c == 0x1d || c == 0x1f) {
+            out[at++] = '\x1d';
+            out[at++] = c == 0x1d ? 'd' : 'f';
+        } else out[at++] = (char)c;
+    }
+    out[at] = 0;
+    return out;
+}
+
 // Whether a Git configuration entry, as `git config --list` prints it (section and name
 // lowercased, a subsection verbatim), makes Git run a command or load configuration that could.
 // `world exec` reports changes to these after the command exits; the list is documented in
@@ -75,6 +94,8 @@ static const GuardKey kGuardKeys[] = {
     {"gpg", "format", 0, false},
     {"gpg", "defaultkeycommand", 2, false}, {"gc", "recentobjectshook", 0, false},
     {"remote", "uploadpack", 1, false},   {"remote", "receivepack", 1, false},
+    {"receive", "procreceiverefs", 0, false},
+    {"pull", "twohead", 0, false},        {"pull", "octopus", 0, false},
     {"branch", "mergeoptions", 1, false}, {"branch", "remote", 1, false},
     {"branch", "pushremote", 1, false},   {"remote", "pushdefault", 0, false},
     {"remote", "vcs", 1, false},          {"uploadpack", "packobjectshook", 0, false},

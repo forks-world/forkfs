@@ -47,6 +47,15 @@ int main() {
     CHECK(strcmp(empty, implicit));
     free(single); free(escaped); free(empty); free(implicit);
 
+    char *field = guard_encode_id_field("a\x1f" "local\x1f" "credential.x");
+    char *field_escape = guard_encode_id_field("a\x1d" "f");
+    CHECK(field && field_escape);
+    CHECK(!strchr(field, '\x1f'));
+    CHECK(!strcmp(field, "a\x1d" "flocal\x1d" "fcredential.x"));
+    CHECK(!strcmp(field_escape, "a\x1d" "df"));
+    CHECK(strcmp(field_escape, "a\x1d" "f"));
+    free(field); free(field_escape);
+
     // Keys that make Git run a command.
     const char *runs[] = {
         "core.attributesfile", "core.worktree", "tar.tar.gz.command", "tar.custom.command", "gc.recentobjectshook",
@@ -58,7 +67,7 @@ int main() {
         "diff.pdf.command", "merge.ours.driver", "mergetool.vim.cmd", "difftool.x.path",
         "commit.gpgsign", "tag.gpgsign", "tag.forcesignannotated", "push.gpgsign", "gpg.format",
         "gpg.program", "gpg.ssh.program", "gpg.ssh.defaultkeycommand", "remote.origin.uploadpack",
-        "branch.main.mergeoptions", "branch.main.remote", "branch.main.pushremote", "remote.pushdefault",
+        "pull.twohead", "pull.octopus", "receive.procreceiverefs", "branch.main.mergeoptions", "branch.main.remote", "branch.main.pushremote", "remote.pushdefault",
         "branch.topic.with.dots.mergeoptions", "remote.origin.receivepack", "remote.origin.vcs", "uploadpack.packobjectshook",
         "sendemail.tocmd", "sendemail.work.sendmailcmd", "sendemail.smtpserver", "include.path",
         "help.browser", "help.format", "instaweb.browser", "man.viewer",
@@ -114,7 +123,7 @@ int main() {
     // Keys that legitimately change during agent work, or only name things.
     const char *quiet[] = {
         "user.email", "user.name", "remote.origin.url", "remote.origin.fetch",
-        "branch.remote", "branch.pushremote", "branch.mergeoptions", "remote.origin.pushdefault",
+        "pull.custom.twohead", "pull.custom.octopus", "receive.custom.procreceiverefs", "receive.advertisepushoptions", "branch.remote", "branch.pushremote", "branch.mergeoptions", "remote.origin.pushdefault",
         "branch.main.merge", "core.bare", "tar.command", "tar.custom.remote",
         "gc.custom.recentobjectshook", "gc.pruneexpire", "core.editorx", "core.custom.attributesfile", "filter.clean", "diff.command", "merge.driver", "core.x.hookspath",
         "include.x.path", "includeif.path", "hook.command", "remote.uploadpack", "merge.payload.tool", "diff.payload.guitool",

@@ -4629,6 +4629,29 @@ class GitWorldTest(unittest.TestCase):
         dotgit.write_text('gitdir: ' + str(one / '.world-git/repo.git/worktrees/active') + '\r\n')
         self.exec_sh(wid, ':', '--require-sandbox')
 
+    def test_exec_refuses_hardlinked_git_pointers_but_allows_observational_repair(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        pointers = (one / '.git', one / '.world-git/repo.git/worktrees/active/commondir')
+        for pointer in pointers:
+            with self.subTest(pointer=pointer.name):
+                original = pointer.read_bytes()
+                alias = one / 'pointer-alias'
+                os.link(pointer, alias)
+                p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+                self.assertIn(b'Git repository pointer is missing, redirected or unsupported', p.stderr)
+                self.assertFalse((one / 'should-not-run').exists())
+                self.assertEqual(pointer.read_bytes(), original)
+                # A valid but changed pointer can still be inspected and repaired via an
+                # alias with --no-sandbox; observational parsing must not reject its links.
+                alias.write_bytes(original + b'\r\n')
+                script = 'printf %s ' + shlex.quote(original.decode()) + ' > pointer-alias; exit 7'
+                p = self.exec_sh(wid, script, '--no-sandbox', code=7)
+                self.assertIn(b'exec changed where Git finds a repository: ' +
+                              str(pointer.relative_to(one)).encode(), p.stderr)
+                self.assertEqual(pointer.read_bytes(), original)
+                alias.unlink()
+
     def test_exec_reports_redirected_worktree_hooks_and_archive_command(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
@@ -4827,6 +4850,55 @@ class GitWorldTest(unittest.TestCase):
                 self.assertFalse((one / 'filter-ran').exists())
                 self.assertFalse((checkout / 'filter-ran').exists())
 
+    def test_exec_reports_effective_user_attributes_once_per_path(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'filter.hidden.clean', 'touch filter-ran; cat')
+        self.git(one / 'libs/lib', 'config', 'filter.hidden.clean', 'touch filter-ran; cat')
+        xdg = self.root / 'xdg'
+        shared = xdg / 'git/attributes'
+        shared.parent.mkdir(parents=True)
+        shared.write_text('')
+        self.env.update(XDG_CONFIG_HOME=str(xdg), GIT_ATTR_NOSYSTEM='1')
+        self.git(one, 'var', 'GIT_ATTR_SYSTEM', code=1)
+        p = self.exec_sh(wid, 'printf %s ' + shlex.quote('* filter=hidden\n') + ' > ' +
+                         shlex.quote(str(shared)) + '; exit 7', '--no-sandbox', code=7)
+        warning = b'exec changed Git repository attributes: ' + str(shared).encode()
+        self.assertEqual(p.stderr.count(warning), 1, p.stderr)  # root and submodules share it
+        relative = one / '.world-git/custom-attributes'
+        relative.write_text('')
+        self.git(one, 'config', 'core.attributesFile', '.world-git/custom-attributes')
+        p = self.exec_sh(wid, 'printf %s ' + shlex.quote('* filter=hidden\n') +
+                         ' > .world-git/custom-attributes', '--no-sandbox')
+        self.assertIn(b'exec changed Git repository attributes: .world-git/custom-attributes', p.stderr)
+        # Each repository resolves its own configured value; Git expands ~ using HOME.
+        home_dir = self.root / 'home'
+        home_dir.mkdir()
+        self.env['HOME'] = str(home_dir)
+        user_attributes = home_dir / 'attributes'
+        lib_attributes = home_dir / 'lib-attributes'
+        user_attributes.write_text('')
+        lib_attributes.write_text('')
+        self.git(one, 'config', 'core.attributesFile', '~/attributes')
+        self.git(one / 'libs/lib', 'config', 'core.attributesFile', '~/lib-attributes')
+        script = ' && '.join('printf %s ' + shlex.quote('* filter=hidden\n') + ' > ' + shlex.quote(str(path))
+                             for path in (user_attributes, lib_attributes))
+        p = self.exec_sh(wid, script, '--no-sandbox')
+        for path in (user_attributes, lib_attributes):
+            self.assertEqual(p.stderr.count(b'exec changed Git repository attributes: ' + str(path).encode()), 1,
+                             p.stderr)
+        self.assertFalse((one / 'filter-ran').exists())
+        self.assertFalse((one / 'libs/lib/filter-ran').exists())
+
+    def test_exec_allows_disabled_user_attributes(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'core.attributesFile', '/dev/null')
+        p = self.exec_sh(wid, 'touch command-ran', '--require-sandbox')
+        self.assertTrue((one / 'command-ran').exists())
+        self.assertNotIn(b'WARNING', p.stderr)
+
     def test_exec_refuses_nonregular_repository_attributes(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
@@ -4872,6 +4944,28 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'local commit.gpgsign: (implicit) -> ""', p.stderr)
         self.assertEqual(self.git(one, 'config', '--bool', 'commit.gpgsign').stdout.strip(), b'false')
 
+    def test_exec_preserves_config_identity_field_boundaries(self):
+        origin = self.origin('identity-lib')
+        other_name = 'a\x1flocal\x1fcredential.x'
+        self.sub(self.source, 'add', '-q', '--name', 'a', str(origin), 'libs/one')
+        self.sub(self.source, 'add', '-q', '--name', other_name, str(origin), 'libs/two')
+        self.git(self.source, 'commit', '-qm', 'identity fixtures')
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        key = 'credential.x\x1flocal\x1fcredential.helper'
+        value = '!touch helper-ran'
+        self.git(one / 'libs/one', 'config', key, value)
+        script = ('git -C libs/one config --unset ' + shlex.quote(key) +
+                  ' && git -C libs/two config credential.helper ' + shlex.quote(value))
+        p = self.exec_sh(wid, script, '--no-sandbox')
+        self.assertIn(rb'submodule a local credential.x\x1flocal\x1fcredential.helper: !touch helper-ran -> (unset)',
+                      p.stderr)
+        self.assertIn(rb'submodule a\x1flocal\x1fcredential.x local credential.helper: (unset) -> !touch helper-ran',
+                      p.stderr)
+        self.assertNotIn(b'\x1f', p.stderr)
+        self.assertFalse((one / 'libs/one/helper-ran').exists())
+        self.assertFalse((one / 'libs/two/helper-ran').exists())
+
     def test_exec_reports_remote_and_merge_strategy_selectors(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
@@ -4883,7 +4977,8 @@ class GitWorldTest(unittest.TestCase):
         strategy.chmod(0o755)
         self.env['PATH'] = str(strategy_dir) + os.pathsep + self.env['PATH']
         branch = self.git(one, 'branch', '--show-current').stdout.decode().strip()
-        values = {'branch.' + branch + '.mergeoptions': '-s payload',
+        values = {'pull.twohead': 'payload', 'pull.octopus': 'payload',
+                  'branch.' + branch + '.mergeoptions': '-s payload',
                   'branch.' + branch + '.remote': 'dormant',
                   'branch.' + branch + '.pushremote': 'dormant', 'remote.pushdefault': 'dormant'}
         p = self.exec_sh(wid, ' && '.join('git config ' + shlex.quote(key) + ' ' + shlex.quote(val)
@@ -4922,6 +5017,18 @@ class GitWorldTest(unittest.TestCase):
         self.assertNotIn(b'local difftool.payload.cmd:', p.stderr)
         self.assertNotIn(b'local mergetool.payload.cmd:', p.stderr)
         self.assertFalse((one / 'selected-tool-ran').exists())
+
+    def test_exec_reports_activating_unchanged_proc_receive_hook(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        hook = one / '.world-git/repo.git/hooks/proc-receive'
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text('#!/bin/sh\ntouch proc-receive-ran\n')
+        hook.chmod(0o755)
+        p = self.exec_sh(wid, 'git config receive.procReceiveRefs refs/for/; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local receive.procreceiverefs: (unset) -> refs/for/', p.stderr)
+        self.assertNotIn(b'exec changed a Git hook:', p.stderr)
+        self.assertFalse((one / 'proc-receive-ran').exists())
 
     def test_exec_reports_activating_preconfigured_signing_program(self):
         self.world('init', str(self.source))
