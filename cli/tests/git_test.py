@@ -3,6 +3,7 @@ import json
 import errno
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -252,18 +253,29 @@ class GitWorldTest(unittest.TestCase):
                                   '-volname', 'forkfs-objects', str(image)], capture_output=True, timeout=120)
         if created.returncode:
             self.skipTest('hdiutil create failed: %r' % created.stderr)
-        attached = subprocess.run(['hdiutil', 'attach', '-quiet', '-nobrowse', '-owners', 'on',
+        attached = subprocess.run(['hdiutil', 'attach', '-plist', '-nobrowse', '-owners', 'on',
                                    '-mountpoint', str(mount), str(image)], capture_output=True, timeout=120)
         if attached.returncode:
             self.skipTest('hdiutil attach failed: %r' % attached.stderr)
+        # The volume's device: detaching by it still works once the mount point is gone.
+        device = next(e['dev-entry'] for e in plistlib.loads(attached.stdout)['system-entities']
+                      if e.get('mount-point') == str(mount))
 
         def detach():
-            for attempt in range(8):
-                args = ['hdiutil', 'detach', '-quiet', str(mount)] + (['-force'] if attempt >= 4 else [])
-                if subprocess.run(args, capture_output=True, timeout=120).returncode == 0:
+            # A freshly attached volume is busy for a while on CI runners (Spotlight and
+            # fseventsd look at it, `-force` or not); the eject is retried for about a minute,
+            # unmounting first once the plain and forced detaches have both failed.
+            errors = []
+            for attempt in range(10):
+                if attempt == 4:
+                    subprocess.run(['diskutil', 'unmount', 'force', str(mount)], capture_output=True, timeout=120)
+                args = ['hdiutil', 'detach', '-quiet', device] + (['-force'] if attempt >= 2 else [])
+                p = subprocess.run(args, capture_output=True, timeout=120)
+                if p.returncode == 0:
                     return
-                time.sleep(1)
-            self.fail('could not detach %s' % mount)
+                errors.append(p.stderr.decode(errors='replace').strip())
+                time.sleep(min(2 ** attempt, 10))
+            self.fail('could not detach %s (%s): %s' % (mount, device, ' / '.join(errors)))
         self.addCleanup(detach)
         self.assertNotEqual(mount.stat().st_dev, self.root.stat().st_dev)
         return mount
