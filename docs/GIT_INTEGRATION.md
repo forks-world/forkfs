@@ -372,7 +372,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `core.attributesfile` (can activate configured filters), `core.gitproxy`, `core.alternaterefscommand`, `sequence.editor`, `credential.helper` and
 `credential.*.helper`, `credential.interactive` (enables configured askpass),
 `http[.*].proactiveauth` (can proactively invoke an unchanged credential helper), `filter.*.clean|smudge|process`, `diff.external`,
-`diff.*.command|textconv`, `diff.tool|guitool`, `merge.tool|guitool`, `difftool.guidefault`, `mergetool.guidefault` (select configured commands), `merge.*.driver|recursive`, `merge.default` (including selection of unchanged merge drivers),
+`diff.*.command|textconv`, `diff.tool|guitool`, `merge.tool|guitool`, `difftool.guidefault`, `mergetool.guidefault` (select configured commands), `difftool.prompt` and `mergetool.prompt` (can launch retained tools without waiting for input), `merge.*.driver|recursive`, `merge.default` (including selection of unchanged merge drivers),
 `merge.renormalize` (can activate configured conversion filters),
 `merge.defaulttoupstream`, `merge.ff`, `pull.ff` (can enable previously refused merges using retained drivers),
 `checkout.guess`, `checkout.defaultremote`, `pull.rebase`, `branch.*.rebase` (can activate retained checkout/rewrite hooks),
@@ -393,7 +393,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 (can activate a configured helper when fetching missing objects),
 `uploadpack.packobjectshook`, `receive.procreceiverefs` (activates the configured proc-receive hook),
 `receive.denycurrentbranch` (can enable the existing push-to-checkout hook),
-`receive.denynonfastforwards` (can let a forced branch update reach the existing update hook),
+`receive.denynonfastforwards` and `receive.denydeletes` (can let forced branch updates or deletions reach the existing update hook),
 `receive.autogc`, `maintenance.auto`, `gc.auto`, `gc.autopacklimit`, `maintenance.strategy`,
 `maintenance.repo` (registers repositories for an existing maintenance scheduler),
 `maintenance.gc.enabled|schedule`, `maintenance.prefetch.enabled|schedule`

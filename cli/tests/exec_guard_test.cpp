@@ -77,6 +77,8 @@ int main() {
         "MAINTENANCE.gc.ENABLED", "Maintenance.prefetch.Schedule",
         "remote.origin.partialclonefilter", "extensions.partialclone",
         "receive.denynonfastforwards", "RECEIVE.DENYNONFASTFORWARDS",
+        "receive.denydeletes", "RECEIVE.DENYDELETES",
+        "difftool.prompt", "mergetool.prompt", "DIFFTOOL.PROMPT", "MERGETOOL.PROMPT",
         "receive.denycurrentbranch", "remote.origin.promisor", "remote.team.origin.promisor",
         "uploadarchive.allowunreachable", "tar.custom.remote", "tar.tar.gz.remote",
         "core.attributesfile", "core.worktree", "tar.tar.gz.command", "tar.custom.command", "gc.recentobjectshook",
@@ -116,6 +118,11 @@ int main() {
     }
     CHECK(guard_key_runs_command("receive.denynonfastforwards", "false"));
     CHECK(guard_key_runs_command("receive.denynonfastforwards", NULL));
+    const char *gates[] = {"receive.denydeletes", "difftool.prompt", "mergetool.prompt"};
+    for (const char *key : gates) {
+        CHECK(guard_key_runs_command(key, "false"));
+        CHECK(guard_key_runs_command(key, NULL));
+    }
     // All aliases can dispatch external commands or inject -c command-running settings.
     // Built-in submodule update modes can activate retained child filters and commands.
     CHECK(guard_key_runs_command("alias.x", "!rm -rf /"));
@@ -206,6 +213,8 @@ int main() {
         "maintenance.team.prefetch.enabled", "maintenance.enabled",
         "remote.partialclonefilter", "extensions.custom.partialclone",
         "receive.custom.denynonfastforwards", "receive.denynonfastforwardsextra",
+        "receive.custom.denydeletes", "receive.denydeletesextra",
+        "difftool.payload.prompt", "mergetool.payload.prompt", "difftool.promptextra", "mergetool.promptextra",
         "receive.custom.denycurrentbranch", "remote.promisor",
         "sendemail.work.identity", "sendemail.work.annotation", "sendemail.suppress", "fetch.custom.all", "remotes",
         "remote.skipdefaultupdate", "remote.skipfetchall", "remote.origin.skipfetch",

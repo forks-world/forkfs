@@ -5054,7 +5054,7 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((one / 'maintenance-helper-ran').exists())
         self.assertFalse((one / 'maintenance-hook-ran').exists())
 
-    def test_exec_reports_enabling_non_fast_forward_update_hook(self):
+    def test_exec_reports_enabling_previously_rejected_update_hook(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
         hook = one / '.world-git/repo.git/hooks/update'
@@ -5063,18 +5063,18 @@ class GitWorldTest(unittest.TestCase):
         hook.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(marker)) + '\n')
         hook.chmod(0o755)
         original = hook.read_bytes()
-        # The receive-side non-fast-forward rejection happens before the retained
-        # update hook. Either false or removal permits that path on a forced push.
-        for change, after in (('receive.denyNonFastForwards false', 'false'),
-                              ('--unset receive.denyNonFastForwards', '(unset)')):
-            with self.subTest(change=change):
-                self.git(one, 'config', 'receive.denyNonFastForwards', 'true')
-                p = self.exec_sh(wid, 'git config ' + change + '; exit 7',
-                                 '--no-sandbox', code=7)
-                self.assertIn(b'local receive.denynonfastforwards: true -> ' + after.encode(), p.stderr)
-                self.assertNotIn(b'a Git hook:', p.stderr)
-                self.assertEqual(hook.read_bytes(), original)
-                self.assertFalse(marker.exists())
+        # Both receive-side rejection gates run before the retained update hook.
+        # Changing or removing them can permit forced updates or branch deletions.
+        for key in ('receive.denyNonFastForwards', 'receive.denyDeletes'):
+            for change, after in ((key + ' false', 'false'), ('--unset ' + key, '(unset)')):
+                with self.subTest(change=change):
+                    self.git(one, 'config', key, 'true')
+                    p = self.exec_sh(wid, 'git config ' + change + '; exit 7',
+                                     '--no-sandbox', code=7)
+                    self.assertIn(b'local ' + key.lower().encode() + b': true -> ' + after.encode(), p.stderr)
+                    self.assertNotIn(b'a Git hook:', p.stderr)
+                    self.assertEqual(hook.read_bytes(), original)
+                    self.assertFalse(marker.exists())
 
     def test_exec_reports_enabling_promisor_and_checkout_hook(self):
         self.world('init', str(self.source))
@@ -5839,6 +5839,26 @@ class GitWorldTest(unittest.TestCase):
         self.assertNotIn(b'local diff.guitool:', p.stderr)
         self.assertNotIn(b'local merge.guitool:', p.stderr)
         self.assertFalse((one / 'selected-tool-ran').exists())
+
+    def test_exec_reports_disabling_prompts_for_retained_tools(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        for kind, selector in (('difftool', 'diff.tool'), ('mergetool', 'merge.tool')):
+            command = 'touch retained-' + kind + '-ran'
+            self.git(one, 'config', kind + '.payload.cmd', command)
+            self.git(one, 'config', selector, 'payload')
+            self.git(one, 'config', kind + '.prompt', 'true')
+        # With EOF on stdin a true prompt prevents launching these selected commands;
+        # false allows them. Inspection itself must execute neither tool.
+        p = self.exec_sh(wid, 'git config difftool.prompt false && '
+                         'git config mergetool.prompt false; exit 7', '--no-sandbox', code=7)
+        for kind, selector in (('difftool', 'diff.tool'), ('mergetool', 'merge.tool')):
+            self.assertIn(b'local ' + kind.encode() + b'.prompt: true -> false', p.stderr)
+            self.assertNotIn(b'local ' + kind.encode() + b'.payload.cmd:', p.stderr)
+            self.assertNotIn(b'local ' + selector.encode() + b':', p.stderr)
+            self.assertEqual(self.git(one, 'config', kind + '.payload.cmd').stdout.strip(),
+                             ('touch retained-' + kind + '-ran').encode())
+            self.assertFalse((one / ('retained-' + kind + '-ran')).exists())
 
     def test_exec_reports_activating_unchanged_proc_receive_hook(self):
         self.world('init', str(self.source))
