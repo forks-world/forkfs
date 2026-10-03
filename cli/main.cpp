@@ -2111,7 +2111,7 @@ static void git_admin_free(GitAdmin *a) { sl_free(&a->gitdirs); sl_free(&a->pins
 // that tells Git where a repository is.
 
 struct GuardRec { char *id; char *val; size_t seq; };
-struct GuardSet { GuardRec *v; size_t n, cap, bytes_left, entries; StrList attributes, hooks; const char *error; };
+struct GuardSet { GuardRec *v; size_t n, cap, bytes_left, entries; StrList attributes, hooks, includes, include_contexts; int include_ms; const char *error; };
 
 static void gs_add(GuardSet *s, const char *id, const char *val) {
     if (s->error) return;
@@ -2132,6 +2132,8 @@ static void gs_free(GuardSet *s) {
     free(s->v);
     sl_free(&s->attributes);
     sl_free(&s->hooks);
+    sl_free(&s->includes);
+    sl_free(&s->include_contexts);
     memset(s, 0, sizeof *s);
 }
 
@@ -2337,15 +2339,17 @@ extern char **environ;
 // Read Git metadata with build-time Git under read-only confinement, never runtime PATH.
 // Config, rev-parse and var queries do not run hooks or fsmonitor: -c overrides would hide inherited
 // command-scope settings. Bound both output and child lifetime (an include can be a FIFO).
-enum GitGuardQuery { GG_LIST, GG_PATH, GG_TOPLEVEL, GG_VAR, GG_MODULES };
+enum GitGuardQuery { GG_LIST, GG_PATH, GG_TOPLEVEL, GG_VAR, GG_MODULES, GG_INCLUDE_ROOT, GG_INCLUDE_FILE };
 
 static char *git_guard_read(const char *root, const char *gitdir, const char *path_key, GitGuardQuery query,
-                            size_t *len, int *status) {
+                            size_t *len, int *status, int *remaining_ms = NULL) {
     *status = -1;
+    int deadline_ms = remaining_ms && *remaining_ms < 5000 ? *remaining_ms : 5000;
+    if (deadline_ms <= 0) return NULL;
     if (g_post_signal) return NULL;
     if (!WFS_CONFIG_GIT[0]) return NULL;
     char gd[WFS_PATH_MAX + 16];
-    const char *argv[16];
+    const char *argv[20];
     size_t arg = 0;
     argv[arg++] = WFS_CONFIG_GIT;
     argv[arg++] = "-C";
@@ -2354,7 +2358,16 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
         snprintf(gd, sizeof gd, "--git-dir=%s", gitdir);
         argv[arg++] = gd;
     }
-    if (query == GG_MODULES) {
+    if (query == GG_INCLUDE_ROOT || query == GG_INCLUDE_FILE) {
+        argv[arg++] = "config";
+        argv[arg++] = query == GG_INCLUDE_ROOT ? "--includes" : "--no-includes";
+        argv[arg++] = "--null";
+        argv[arg++] = "--show-origin";
+        argv[arg++] = "--type=path";
+        if (query == GG_INCLUDE_FILE) { argv[arg++] = "--file"; argv[arg++] = path_key; }
+        argv[arg++] = "--get-regexp";
+        argv[arg++] = "^(include\\.path|includeif\\..*\\.path)$";
+    } else if (query == GG_MODULES) {
         argv[arg++] = "config";
         argv[arg++] = "--no-includes";
         argv[arg++] = "--null";
@@ -2402,12 +2415,12 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
     int rc = -1;
 #ifdef __APPLE__
     // A configured Git may live in a user-writable package prefix. Confine it even though
-    // PATH lookup is gone: no writes, network, or host IPC except account-name resolution.
+    // PATH lookup is gone: writes only to /dev/null, no network or host IPC except account-name resolution.
     const char *profile = "(version 1)(deny default)"
-        "(allow file-read*)(allow process-exec)(allow process-fork)(allow sysctl-read)"
+        "(allow file-read*)(allow file-write* (literal \"/dev/null\"))(allow process-exec)(allow process-fork)(allow sysctl-read)"
         "(allow signal (target same-sandbox))"
         "(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\"))";
-    const char *sandbox_argv[20] = {"/usr/bin/sandbox-exec", "-p", profile};
+    const char *sandbox_argv[24] = {"/usr/bin/sandbox-exec", "-p", profile};
     for (size_t i = 0; i <= arg; ++i) sandbox_argv[i + 3] = argv[i];
     posix_spawn_file_actions_t fa;
     posix_spawnattr_t attr;
@@ -2453,7 +2466,7 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
         if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) { ok = false; break; }
         int64_t elapsed = (now.tv_sec - start.tv_sec) * 1000LL +
                           (now.tv_nsec - start.tv_nsec) / 1000000;
-        if (elapsed >= 5000) { ok = false; break; }
+        if (elapsed >= deadline_ms) { ok = false; break; }
         if (!reaped) {
             pid_t w = waitpid(pid, &st, WNOHANG);
             if (w == pid) reaped = true;
@@ -2461,7 +2474,7 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
         }
         if (eof && reaped) break;
         struct pollfd pfd = {fds[0], POLLIN, 0};
-        int timeout = (int)(5000 - elapsed);
+        int timeout = (int)(deadline_ms - elapsed);
         if (timeout > 50) timeout = 50;
         int p = poll(eof ? NULL : &pfd, eof ? 0 : 1, timeout);
         if (p < 0 && errno != EINTR) { ok = false; break; }
@@ -2483,12 +2496,110 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
         kill(pid, SIGKILL);
         while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
     }
+    if (remaining_ms) {
+        struct timespec done;
+        if (clock_gettime(CLOCK_MONOTONIC, &done) != 0) *remaining_ms = 0;
+        else {
+            int64_t spent = (done.tv_sec - start.tv_sec) * 1000LL +
+                            (done.tv_nsec - start.tv_nsec) / 1000000 + 1;
+            *remaining_ms = spent >= *remaining_ms ? 0 : *remaining_ms - (int)spent;
+        }
+    }
     if (!ok || !WIFEXITED(st)) { free(buf); return NULL; }
     *status = WEXITSTATUS(st);
     if (*status != 0) { free(buf); return NULL; }
     buf[at] = 0;
     *len = at;
     return buf;
+}
+
+// Observe every declared include target, even when its condition is currently false.
+// Query contexts retain spelling: a symlinked parent can change relative-include meaning.
+static bool capture_include_edges(const GitAdmin *a, const char *gitdir, const char *file,
+                                  GuardSet *s, int depth);
+
+static bool capture_include_target(const GitAdmin *a, const char *gitdir, const char *path,
+                                   GuardSet *s, int depth) {
+    if (g_post_signal) { s->error = "Git capture interrupted"; return false; }
+    if (depth > 32) { s->error = "Git include depth limit exceeded"; return false; }
+    struct stat st;
+    bool present = lstat(path, &st) == 0;
+    if (!present && errno != ENOENT) { s->error = "could not inspect Git include target"; return false; }
+    if (present && !S_ISREG(st.st_mode)) { s->error = "nonregular Git include target cannot be inspected"; return false; }
+    char identity[WFS_PATH_MAX + 32];
+    if (!attributes_path(a->root, path, identity, sizeof identity)) {
+        s->error = "could not resolve Git include target"; return false;
+    }
+    bool captured = false;
+    for (size_t i = 0; i < s->includes.n; ++i)
+        if (!strcmp(s->includes.v[i], identity)) { captured = true; break; }
+    if (!captured) {
+        if (s->includes.n >= 256) { s->error = "Git include target limit exceeded"; return false; }
+        if (!sl_push(&s->includes, identity)) { s->error = "out of memory"; return false; }
+        char id[WFS_PATH_MAX + 40], fp[64];
+        if ((size_t)snprintf(id, sizeof id, "i\x1f%s", rel_to(a, identity)) >= sizeof id) {
+            s->error = "Git include target path exceeds capture limit"; return false;
+        }
+        if (present && !fingerprint(path, fp, sizeof fp, s, false, true)) {
+            if (!s->error) s->error = "could not fingerprint Git include target";
+            return false;
+        }
+        gs_add(s, id, present ? fp : "absent");
+    }
+    if (s->error || !present) return !s->error;
+    for (size_t i = 0; i < s->include_contexts.n; ++i)
+        if (!strcmp(s->include_contexts.v[i], path)) return true;
+    if (s->include_contexts.n >= 256) { s->error = "Git include context limit exceeded"; return false; }
+    if (!sl_push(&s->include_contexts, path)) { s->error = "out of memory"; return false; }
+    return capture_include_edges(a, gitdir, path, s, depth);
+}
+
+static bool capture_include_edges(const GitAdmin *a, const char *gitdir, const char *file,
+                                  GuardSet *s, int depth) {
+    size_t len = 0;
+    int status = -1;
+    char *out = git_guard_read(a->root, gitdir, file, file ? GG_INCLUDE_FILE : GG_INCLUDE_ROOT,
+                              &len, &status, &s->include_ms);
+    if (!out) {
+        if (status == 1) return true; // no include directives
+        s->error = g_post_signal ? "Git capture interrupted" : "Git include query failed or exceeded capture time budget";
+        return false;
+    }
+    bool ok = true;
+    for (size_t i = 0; i < len && ok;) {
+        if (g_post_signal) { s->error = "Git capture interrupted"; ok = false; break; }
+        if (++s->entries > 65536) { s->error = "Git include entry limit exceeded"; ok = false; break; }
+        char *origin = out + i;
+        char *end = (char *)memchr(origin, 0, len - i);
+        if (!end) { ok = false; break; }
+        i = (size_t)(end - out) + 1;
+        if (i >= len) { ok = false; break; }
+        char *entry = out + i;
+        end = (char *)memchr(entry, 0, len - i);
+        if (!end) { ok = false; break; }
+        i = (size_t)(end - out) + 1;
+        char *value = strchr(entry, '\n');
+        if (!value || !*++value) { ok = false; break; }
+        char target[WFS_PATH_MAX], source[WFS_PATH_MAX];
+        int n;
+        if (value[0] == '/') n = snprintf(target, sizeof target, "%s", value);
+        else {
+            if (strncmp(origin, "file:", 5)) { ok = false; break; }
+            const char *where = origin + 5;
+            n = where[0] == '/' ? snprintf(source, sizeof source, "%s", where) :
+                                 snprintf(source, sizeof source, "%s/%s", a->root, where);
+            if (n < 0 || (size_t)n >= sizeof source) { ok = false; break; }
+            char *slash = strrchr(source, '/');
+            if (!slash) { ok = false; break; }
+            slash[1] = 0;
+            n = snprintf(target, sizeof target, "%s%s", source, value);
+        }
+        if (n < 0 || (size_t)n >= sizeof target) { ok = false; break; }
+        ok = capture_include_target(a, gitdir, target, s, depth + 1);
+    }
+    free(out);
+    if (!ok && !s->error) s->error = "unsupported Git include origin or path";
+    return ok;
 }
 
 // Git treats only trailing CR/LF as terminators: an embedded newline belongs to the
@@ -2830,6 +2941,7 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
     }
     free(out);
     if (s->error) return false;
+    if (!capture_include_edges(a, gitdir, NULL, s, 0)) return false;
     // Git's setup rules decide the effective checkout, including linked-worktree
     // configuration semantics; the last config-list value alone is insufficient.
     char *worktree = git_guard_read(a->root, gitdir, NULL, GG_TOPLEVEL, &len, &status);
@@ -2913,6 +3025,7 @@ static bool guard_capture(GitAdmin *a, GuardSet *s, bool require_home = false) {
     if (g_post_signal) { s->error = "Git capture interrupted"; return false; }
     if (a->incomplete) { s->error = "incomplete Git administration scan (limit or read error)"; return false; }
     s->bytes_left = 64u << 20;
+    s->include_ms = 5000;
     const char *self = real_dir(a->active) ? a->active : NULL;
     if (require_home) {
         if (!self) { s->error = "Git active administration is missing or unsupported"; return false; }
@@ -3019,6 +3132,12 @@ static void guard_warn(const GuardRec *before, const GuardRec *after) {
         fputs(" -> ", stderr);
         put_value(stderr, after ? after->val : NULL);
         fputc('\n', stderr);
+    } else if (id[0] == 'i') {
+        bool was = before && strcmp(before->val, "absent");
+        bool is = after && strcmp(after->val, "absent");
+        fprintf(stderr, "world: WARNING: exec %s a Git include target: ", !was ? "added" : !is ? "removed" : "changed");
+        put_field(stderr, rest, strlen(rest));
+        fputs(" (including inactive conditional configuration)\n", stderr);
     } else if (id[0] == 'a') {
         bool was = before && strcmp(before->val, "absent");
         bool is = after && strcmp(after->val, "absent");
@@ -3082,7 +3201,7 @@ static void guard_report(const GuardSet *b, const GuardSet *a) {
         if (before && after && !strcmp(before->val, after->val)) continue;
         const char kind = (before ? before : after)->id[0];
         if (kind == 'c' && shared_with_world(b, a, before, after)) continue;
-        if (kind == 'a' && (!before || !strcmp(before->val, "absent")) &&
+        if ((kind == 'a' || kind == 'i') && (!before || !strcmp(before->val, "absent")) &&
             (!after || !strcmp(after->val, "absent"))) continue;
         if (kind == 'p') {
             bool was = before && strcmp(before->val, "absent");

@@ -101,6 +101,7 @@ static const GuardKey kGuardKeys[] = {
     {"format", "commitlistformat", 0, false}, {"format", "coverletter", 0, false},
     {"format", "pretty", 0, false},       {"pretty", NULL, 2, false},
     {"gpg", "defaultkeycommand", 2, false}, {"gc", "recentobjectshook", 0, false},
+    {"fetch", "bundleuri", 0, false},
     {"fetch", "all", 0, false},          {"remotes", NULL, 2, false},
     {"remote", "skipdefaultupdate", 1, false}, {"remote", "skipfetchall", 1, false},
     {"remote", "url", 1, false},          {"remote", "pushurl", 1, false},
@@ -170,7 +171,7 @@ static inline bool guard_key_runs_command(const char *key, const char *value) {
         bool gc = task == 2 && !memcmp(first + 1, "gc", 2);
         bool prefetch = task == 8 && !memcmp(first + 1, "prefetch", 8);
         if ((gc || prefetch) && !strcasecmp(name, "enabled")) return true;
-        if (prefetch && !strcasecmp(name, "schedule")) return true;
+        if ((gc || prefetch) && !strcasecmp(name, "schedule")) return true;
     }
     if (!has_sub && !strcasecmp(name, "sort") &&
         ((section == 6 && !strncasecmp(key, "branch", section)) ||

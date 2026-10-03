@@ -4784,6 +4784,74 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'Git hooks and settings uninspected after the command', p.stderr)
         self.assertIn(b'64 MiB capture budget', p.stderr)
 
+    def test_exec_reports_bundle_uri_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        p = self.exec_sh(wid, 'git config fetch.bundleURI https://example.invalid/bootstrap.bundle; exit 7',
+                         '--no-sandbox', code=7)
+        self.assertIn(b'local fetch.bundleuri: (unset) -> https://example.invalid/bootstrap.bundle', p.stderr)
+
+    def test_exec_reports_dormant_conditional_include_targets(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        policy = one / '.world-git/dormant-policy'
+        child = one / '.world-git/dormant-child'
+        absent = one / '.world-git/dormant-new'
+        policy.write_text('[includeIf "onbranch:never-active"]\n path = dormant-child\n'
+                          '[include]\n path = dormant-new\n')
+        child.write_text('[core]\n sshCommand = touch include-command-ran\n')
+        self.git(one, 'config', 'includeIf.onbranch:never-active.path', str(policy))
+        self.assertNotIn(b'include-command-ran', self.git(one, 'config', '--list', '--includes').stdout)
+        p = self.exec_sh(wid, "printf '[core]\\n sshCommand = touch changed-command-ran\\n' > " +
+                         shlex.quote(str(child)) + '; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'exec changed a Git include target: .world-git/dormant-child', p.stderr)
+        self.assertNotIn(b'local core.sshcommand:', p.stderr)
+        p = self.exec_sh(wid, "printf '[alias]\\n payload = !touch added-command-ran\\n' > " +
+                         shlex.quote(str(absent)), '--require-sandbox')
+        self.assertIn(b'exec added a Git include target: .world-git/dormant-new', p.stderr)
+        # Content comparison deliberately also reports benign edits in dormant files.
+        p = self.exec_sh(wid, "printf '\\n[user]\\n name = Changed\\n' >> " +
+                         shlex.quote(str(policy)), '--require-sandbox')
+        self.assertIn(b'exec changed a Git include target: .world-git/dormant-policy', p.stderr)
+        p = self.exec_sh(wid, 'rm ' + shlex.quote(str(child)), '--require-sandbox')
+        self.assertIn(b'exec removed a Git include target: .world-git/dormant-child', p.stderr)
+        for marker in ('include-command-ran', 'changed-command-ran', 'added-command-ran'):
+            self.assertFalse((one / marker).exists())
+
+    def test_exec_dormant_include_resolves_parent_alias_before_dotdot(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        admin = one / '.world-git'
+        (admin / 'include-dir/deep').mkdir(parents=True)
+        (admin / 'include-alias').symlink_to('include-dir/deep', target_is_directory=True)
+        policy = admin / 'include-dir/policy'
+        child = admin / 'include-dir/child'
+        policy.write_text('[include]\n path = child\n')
+        child.write_text('[alias]\n hidden = !touch nested-helper-ran\n')
+        self.git(one, 'config', 'includeIf.onbranch:never-active.path', str(admin / 'include-alias/../policy'))
+        self.git(one, 'config', 'includeIf.onbranch:also-never.path', str(policy))
+        p = self.exec_sh(wid, "printf '\\n[user]\\n name = changed\\n' >> " + shlex.quote(str(child)),
+                         '--require-sandbox')
+        warning = b'exec changed a Git include target: .world-git/include-dir/child'
+        self.assertEqual(p.stderr.count(warning), 1, p.stderr)
+        self.assertFalse((one / 'nested-helper-ran').exists())
+
+    def test_exec_refuses_nonregular_dormant_include_targets(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        target = one / '.world-git/dormant-target'
+        self.git(one, 'config', 'includeIf.onbranch:never-active.path', str(target))
+        for kind in ('symlink', 'fifo'):
+            with self.subTest(kind=kind):
+                if kind == 'symlink':
+                    target.symlink_to(one / 'file')
+                else:
+                    os.mkfifo(target)
+                p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+                self.assertIn(b'nonregular Git include target', p.stderr)
+                self.assertFalse((one / 'should-not-run').exists())
+                target.unlink()
+
     def test_exec_reports_global_maintenance_registration(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
@@ -4815,7 +4883,7 @@ class GitWorldTest(unittest.TestCase):
         values = {'receive.autogc': 'true', 'maintenance.auto': 'true',
                   'gc.auto': '1', 'gc.autoPackLimit': '1', 'maintenance.strategy': 'incremental',
                   'maintenance.gc.enabled': 'true', 'maintenance.prefetch.enabled': 'true',
-                  'maintenance.prefetch.schedule': 'hourly'}
+                  'maintenance.prefetch.schedule': 'hourly', 'maintenance.gc.schedule': 'daily'}
         p = self.exec_sh(wid, ' && '.join('git config ' + key + ' ' + value
                                         for key, value in values.items()) + '; exit 7', '--no-sandbox', code=7)
         for key, value in values.items():
@@ -5453,7 +5521,7 @@ class GitWorldTest(unittest.TestCase):
         one, wid = self.fork()
         fifo = one / 'blocked-config'
         os.mkfifo(fifo)
-        script = '/usr/bin/git config include.path ' + shlex.quote(str(fifo)) + '; exit 7'
+        script = shlex.quote(shutil.which('git', path=self.env['PATH'])) + ' config include.path ' + shlex.quote(str(fifo)) + '; exit 7'
         p = subprocess.run((WORLD, 'exec', wid, '--no-sandbox', '--', '/bin/sh', '-c', script),
                            env=self.env, capture_output=True, timeout=15)
         self.assertEqual(p.returncode, 7, p.stderr)

@@ -59,7 +59,7 @@ int main() {
     // Keys that make Git run a command.
     const char *runs[] = {
         "receive.autogc", "maintenance.auto", "maintenance.strategy", "maintenance.repo", "gc.auto", "gc.autopacklimit",
-        "maintenance.gc.enabled", "maintenance.prefetch.enabled", "maintenance.prefetch.schedule",
+        "maintenance.gc.enabled", "maintenance.prefetch.enabled", "maintenance.prefetch.schedule", "maintenance.gc.schedule", "fetch.bundleuri",
         "MAINTENANCE.gc.ENABLED", "Maintenance.prefetch.Schedule",
         "remote.origin.partialclonefilter", "extensions.partialclone",
         "receive.denycurrentbranch", "remote.origin.promisor", "remote.team.origin.promisor",
@@ -156,7 +156,7 @@ int main() {
     const char *quiet[] = {
         "receive.custom.autogc", "maintenance.custom.auto", "maintenance.custom.strategy", "maintenance.custom.repo",
         "gc.custom.auto", "gc.custom.autopacklimit", "maintenance.GC.enabled", "maintenance.Prefetch.enabled",
-        "maintenance.gc.schedule", "maintenance.commit-graph.enabled", "maintenance.repack.enabled",
+        "maintenance.GC.schedule", "maintenance.gc.scheduleextra", "fetch.custom.bundleuri", "maintenance.commit-graph.enabled", "maintenance.repack.enabled",
         "maintenance.team.prefetch.enabled", "maintenance.enabled",
         "remote.partialclonefilter", "extensions.custom.partialclone",
         "receive.custom.denycurrentbranch", "remote.promisor",

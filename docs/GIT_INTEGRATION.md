@@ -300,6 +300,14 @@ observational reporting so a command can repair them.
   per repository, since an `includeIf "gitdir:..."` or `"onbranch:..."` can give one
   submodule settings the World does not have; a change to a global or system entry that is
   identical in the World's own listing is reported once, under the World;
+- every include target declared by effective configuration, including inactive conditional
+  includes and their nested targets. Git expands paths; relative targets retain the including
+  file's origin directory. Missing files are recorded, so creating a dormant payload is reported.
+  Existing targets must be regular files; symlinks, special files and unsupported origins make
+  capture unavailable. Content fingerprints also report benign changes in these files; conditions
+  do not have to become active during exec. Traversal is limited to 32 levels, 256 targets and
+  256 origin spellings, shares the 64 MiB content/65536-entry budgets, and has five seconds of
+  aggregate confined query time per capture. These files remain writable;
 - each repository's private `info/attributes` and effective user/system attributes files:
   changes can activate an unchanged filter
   definition without altering tracked project files. Regular files are hashed in full within
@@ -343,7 +351,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `pretty.*`, `format.commitlistformat`, `format.coverletter` (can activate signature verification),
 `branch.sort` and `tag.sort` when selecting a `signature` atom (ordinary name/version sorts stay quiet),
 `gpg.format` (selects the signing program), `gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
-`remote.*.skipdefaultupdate|skipfetchall`, `fetch.all`, `remotes.*` (can activate unchanged remote helpers),
+`remote.*.skipdefaultupdate|skipfetchall`, `fetch.bundleuri`, `fetch.all`, `remotes.*` (can activate unchanged remote helpers),
 `remote.*.uploadpack|receivepack|vcs`, `branch.*.mergeoptions`, `pull.twohead`, `pull.octopus` (can select external merge strategies),
 `branch.*.remote|pushremote`, `remote.pushdefault` (can select preconfigured helper remotes),
 `remote.*.promisor|partialclonefilter`, `extensions.partialclone`
@@ -352,7 +360,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `receive.denycurrentbranch` (can enable the existing push-to-checkout hook),
 `receive.autogc`, `maintenance.auto`, `gc.auto`, `gc.autopacklimit`, `maintenance.strategy`,
 `maintenance.repo` (registers repositories for an existing maintenance scheduler),
-`maintenance.gc.enabled`, `maintenance.prefetch.enabled|schedule`
+`maintenance.gc.enabled|schedule`, `maintenance.prefetch.enabled|schedule`
 (can activate existing maintenance hooks or remote helpers; task names are exact),
 `sendemail.identity` (selects configured mail commands),
 `sendemail[.*].annotate|suppresscc|validate|useimaponly|imapsentfolder` (activate configured editors, mail commands or hooks),
@@ -378,7 +386,7 @@ The key list and value-sensitive rules are in `cli/exec_guard.h`. Branch remote 
 activate unchanged helper configuration. Setting endpoints and tracking remains allowed;
 fetch refspecs, descriptive names and `branch.*.merge` stay quiet.
 Each repository is read before and after with five
-queries (plus the macOS pre-exec declaration query described above): a configuration listing, `--path --get core.hooksPath`, `rev-parse --show-toplevel`,
+queries (plus the include graph and macOS pre-exec declaration queries described above): a configuration listing, `--path --get core.hooksPath`, `rev-parse --show-toplevel`,
 and `git var GIT_ATTR_GLOBAL`/`GIT_ATTR_SYSTEM`,
 so Git expands `~user` and applies its checkout rules when resolving relative hooks. Missing hook directories resolve through existing ancestors;
 unresolvable ancestors and `..` in a missing suffix invalidate capture. Mutable symlink components
@@ -387,7 +395,7 @@ and restored during exec. Only the exact root-owned macOS `/tmp`, `/var` and `/e
 aliases to `/private` counterparts are accepted, with a protected root-owned parent. The queries use the absolute Git 2.48+ path
 selected by CMake at build time, unaffected by runtime `PATH`, and do not execute hooks or
 fsmonitor. Configuration introspection runs under a separate read-only sandbox: Seatbelt on
-macOS, or Bubblewrap with network and process isolation on Linux. It cannot write files or
+macOS, or Bubblewrap with network and process isolation on Linux. It can write only `/dev/null` (needed by Git startup) and cannot
 access the network; account lookup on macOS is allowed for `~user` expansion. Each query has
 a five-second deadline and a 64 MiB output limit; no tree is walked. If configuration cannot
 be read (missing configured Git or sandbox, a malformed file, or a query exceeding these
