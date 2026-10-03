@@ -5692,6 +5692,118 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((one / 'endpoint-helper-ran').exists())
         self.assertFalse((one / 'pull-driver-ran').exists())
 
+    def test_exec_reports_ignored_lfsconfig_in_root_and_submodule(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        repos = (one, one / 'libs/lib')
+        for repo in repos:
+            with (repo / '.gitignore').open('a') as f:
+                f.write('\n.lfsconfig\n')
+            self.git(repo, 'config', 'credential.helper', '!touch ' + shlex.quote(str(one / 'lfs-credential-ran')))
+        paths = ('.lfsconfig', 'libs/lib/.lfsconfig')
+        for operation in ('add', 'change', 'remove'):
+            with self.subTest(operation=operation):
+                if operation == 'remove':
+                    commands = ['rm ' + path for path in paths]
+                else:
+                    url = 'https://example.invalid/' + operation
+                    content = '[lfs]\n url = ' + url + '\n'
+                    commands = ['printf %s ' + shlex.quote(content) + ' > ' + path for path in paths]
+                p = self.exec_sh(wid, ' && '.join(commands) + '; exit 7', '--require-sandbox', code=7)
+                verb = {'add': 'added', 'change': 'changed', 'remove': 'removed'}[operation]
+                for path in paths:
+                    self.assertIn(('exec ' + verb + ' Git LFS configuration: ' + path).encode(), p.stderr)
+                self.assertNotIn(b'credential.helper:', p.stderr)
+                self.assertFalse((one / 'lfs-credential-ran').exists())
+
+    def test_exec_reports_lfsconfig_includes_and_ignores_unsupported_hook_setting(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        policy = one / '.world-git/lfs-policy'
+        policy.write_text('[lfs]\n url = https://example.invalid/before\n')
+        (one / 'ignored-hook-alias').symlink_to(self.root, target_is_directory=True)
+        (one / '.lfsconfig').write_text('[include]\n path = .world-git/lfs-policy\n'
+                                      '[core]\n hooksPath = ignored-hook-alias\n')
+        p = self.exec_sh(wid, "printf '[lfs]\\n url = https://example.invalid/after\\n' > .world-git/lfs-policy",
+                         '--require-sandbox')
+        self.assertIn(b'exec changed a Git include target: .world-git/lfs-policy', p.stderr)
+        self.assertNotIn(b'Git LFS configuration:', p.stderr)
+        self.assertNotIn(b'Git guard unavailable', p.stderr)
+
+    def test_exec_reports_lfsconfig_index_head_and_blob_includes_without_fsmonitor(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        policy = one / '.world-git/lfs-blob-policy'
+        policy.write_text('[lfs]\n fetchinclude = before/**\n')
+        config = one / '.lfsconfig'
+        include = '[include]\n path = ' + str(policy) + '\n'
+        config.write_text(include + '[lfs]\n url = https://example.invalid/before\n')
+        self.git(one, 'add', '.lfsconfig')
+        self.git(one, 'commit', '-qm', 'LFS fallback configuration')
+        config.unlink()
+        new_config = one / '.world-git/new-lfs-blob'
+        new_config.write_text(include + '[lfs]\n url = https://example.invalid/after\n')
+        oid = self.git(one, 'hash-object', '-w', str(new_config)).stdout.strip().decode()
+        marker = one / 'fsmonitor-inspection-ran'
+        fsmonitor = one / '.world-git/retained-fsmonitor'
+        fsmonitor.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(marker)) + '\n')
+        fsmonitor.chmod(0o755)
+        self.git(one, 'config', 'core.fsmonitor', str(fsmonitor))
+        self.git(one, 'config', 'credential.helper', '!touch ' + shlex.quote(str(one / 'lfs-credential-ran')))
+        # The command itself also disables fsmonitor, leaving its retained definition
+        # available for the guard's separate, unmodified configuration snapshot.
+        p = self.exec_sh(wid, 'git -c core.fsmonitor=false update-index --cacheinfo 100644,' + oid +
+                         ',.lfsconfig; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'Git LFS configuration: .world-git/repo.git/worktrees/active (:.lfsconfig)', p.stderr)
+        self.assertNotIn(b'local core.fsmonitor:', p.stderr)
+        self.assertFalse(marker.exists())
+        tree = self.git(one, '-c', 'core.fsmonitor=false', 'write-tree').stdout.strip().decode()
+        new_head = self.git(one, 'commit-tree', tree, '-p', 'HEAD', '-m', 'alternate LFS fallback').stdout.strip().decode()
+        self.git(one, '-c', 'core.fsmonitor=false', 'update-index', '--force-remove', '.lfsconfig')
+        p = self.exec_sh(wid, 'git update-ref HEAD ' + new_head + '; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'Git LFS configuration: .world-git/repo.git/worktrees/active (HEAD:.lfsconfig)', p.stderr)
+        self.assertFalse(marker.exists())
+        p = self.exec_sh(wid, "printf '[lfs]\\n fetchinclude = after/**\\n' > .world-git/lfs-blob-policy",
+                         '--require-sandbox')
+        self.assertIn(b'exec changed a Git include target: .world-git/lfs-blob-policy', p.stderr)
+        self.assertNotIn(b'Git LFS configuration:', p.stderr)
+        self.assertFalse(marker.exists())
+        self.assertFalse((one / 'lfs-credential-ran').exists())
+        self.assertFalse(config.exists())
+
+    def test_exec_refuses_nonregular_lfsconfig(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        config = one / '.lfsconfig'
+        for kind in ('symlink', 'fifo'):
+            with self.subTest(kind=kind):
+                if kind == 'symlink':
+                    config.symlink_to(one / 'file')
+                else:
+                    os.mkfifo(config)
+                p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+                self.assertIn(b'nonregular Git include target cannot be inspected', p.stderr)
+                self.assertFalse((one / 'should-not-run').exists())
+                config.unlink()
+
+    def test_exec_reports_lfs_fetch_filters_activating_retained_agent(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'lfs.customtransfer.retained.path', '/bin/sh')
+        self.git(one, 'config', 'lfs.customtransfer.retained.args', '-c "touch retained-lfs-agent-ran"')
+        self.git(one, 'config', 'lfs.standaloneTransferAgent', 'retained')
+        self.git(one, 'config', 'lfs.fetchInclude', 'never-matching/**')
+        self.git(one, 'config', 'lfs.fetchExclude', '*')
+        p = self.exec_sh(wid, "git config lfs.fetchInclude '*' && git config --unset lfs.fetchExclude; exit 7",
+                         '--no-sandbox', code=7)
+        self.assertIn(b'local lfs.fetchinclude: never-matching/** -> *', p.stderr)
+        self.assertIn(b'local lfs.fetchexclude: * -> (unset)', p.stderr)
+        for key in (b'lfs.customtransfer.retained.path', b'lfs.customtransfer.retained.args',
+                    b'lfs.standalonetransferagent'):
+            self.assertNotIn(b'local ' + key + b':', p.stderr)
+        self.assertFalse((one / 'retained-lfs-agent-ran').exists())
+
     def test_exec_reports_lfs_access_and_default_upstream_merge_activation(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

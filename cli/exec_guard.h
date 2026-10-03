@@ -170,6 +170,7 @@ static const GuardKey kGuardKeys[] = {
     {"lfs", "url", 0, false}, {"lfs", "pushurl", 0, false},
     {"remote", "lfsurl", 1, false}, {"remote", "lfspushurl", 1, false},
     {"lfs", "access", 2, false},
+    {"lfs", "fetchinclude", 0, false}, {"lfs", "fetchexclude", 0, false},
     {"lfs", "basictransfersonly", 0, false},
     {"lfs", "standalonetransferagent", 2, false},
     {"lfs", "path", 1, false},            {"lfs", "clean", 1, false},

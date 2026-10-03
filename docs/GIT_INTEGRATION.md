@@ -323,7 +323,7 @@ warning.
 - each repository's `config.worktree`, even while `extensions.worktreeConfig` is disabled,
   including its dormant include graph. Missing files are recorded; later creation, removal
   and content edits are reported under the same regular-file and resource limits. Absent
-  worktree files do not consume the 256-target include budget; present ones do;
+  worktree/LFS configuration files do not consume the 256-target include budget; present ones do;
 - every include target declared by effective configuration, including inactive conditional
   includes and their nested targets. Git expands paths; relative targets retain the including
   file's origin directory. Missing files are recorded, so creating a dormant payload is reported.
@@ -334,6 +334,15 @@ warning.
   aggregate confined query time per capture. Each context uses a typed include/hooks-path
   query and a raw `core.worktree` query; Git treats tilde and `%(prefix)` literally in
   `core.worktree`. These files remain writable;
+- each checkout's `.lfsconfig`, including ignored/untracked files, and its index and HEAD
+  blob sources (LFS falls back to them when the worktree file is absent). Added, removed and
+  changed bytes are reported, including benign edits and dormant fallback changes. These
+  files remain writable. Missing sources are recorded; nonregular files, unsupported object
+  reads and relative includes from blobs make capture unavailable. Includes are traversed
+  with the same graph limits, but LFS-ignored `core.hooksPath`/`core.worktree` settings do not
+  create hook restrictions. Raw blob bytes share the 64 MiB budget and confined queries share
+  the include graph's five-second budget. No LFS command is executed; object queries disable
+  fsmonitor and lazy object fetching, while configuration snapshots retain the real settings;
 - each repository's private `info/attributes` and effective user/system attributes files:
   changes can activate an unchanged filter
   definition without altering tracked project files. Regular files are hashed in full within
@@ -422,6 +431,7 @@ activate retained child filters and commands), `pager.*`, `interactive.difffilte
 `lfs.*.path|clean|smudge` (custom transfer agents and extensions), plus
 `lfs[.*].standalonetransferagent` (selects an existing custom transfer command, including URL-scoped settings),
 `lfs.customtransfer.<name>.args|direction` (change arguments or enable upload/download adapters),
+`lfs.fetchinclude` and `lfs.fetchexclude` (can activate retained transfer agents),
 `lfs.access` and `lfs.<URL>.access` (can invoke retained credential helpers),
 `lfs.url|pushurl|gitprotocol`, `remote.*.lfsurl|lfspushurl` (select endpoints that can use retained credential helpers),
 and `lfs.basictransfersonly` (can restore custom transfer adapters). Remote `url`/`pushurl`
@@ -436,7 +446,7 @@ activate unchanged helper configuration. Setting endpoints and tracking remains 
 fetch refspecs and descriptive names stay quiet; branch upstream merge selectors are reported
 because they can enable an otherwise refused push.
 Each repository is read before and after with five
-queries (plus the include graph and macOS pre-exec declaration queries described above): a configuration listing, `--path --get core.hooksPath`, `rev-parse --show-toplevel`,
+queries (plus the include/LFS source graph and macOS pre-exec declaration queries described above): a configuration listing, `--path --get core.hooksPath`, `rev-parse --show-toplevel`,
 and `git var GIT_ATTR_GLOBAL`/`GIT_ATTR_SYSTEM`,
 so Git expands `~user` and applies its checkout rules when resolving relative hooks. Missing hook directories resolve through existing ancestors;
 unresolvable ancestors and `..` in a missing suffix invalidate capture. Mutable symlink components

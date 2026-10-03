@@ -2337,9 +2337,10 @@ static void capture_attributes(const GitAdmin *a, const char *path, GuardSet *s)
 extern char **environ;
 
 // Read Git metadata with build-time Git under read-only confinement, never runtime PATH.
-// Config, rev-parse and var queries do not run hooks or fsmonitor: -c overrides would hide inherited
-// command-scope settings. Bound both output and child lifetime (an include can be a FIFO).
-enum GitGuardQuery { GG_LIST, GG_PATH, GG_TOPLEVEL, GG_VAR, GG_MODULES, GG_INCLUDE_ROOT, GG_INCLUDE_FILE, GG_WORKTREE_ROOT, GG_WORKTREE_FILE };
+// Config/var/checkout queries preserve inherited settings. Index/object queries explicitly
+// disable fsmonitor; all queries disable lazy fetching. Bound output and child lifetime
+// (an include can be a FIFO) without executing configured commands.
+enum GitGuardQuery { GG_LIST, GG_PATH, GG_TOPLEVEL, GG_VAR, GG_MODULES, GG_INCLUDE_ROOT, GG_INCLUDE_FILE, GG_WORKTREE_ROOT, GG_WORKTREE_FILE, GG_LFS_OID, GG_LFS_BLOB, GG_LFS_INCLUDES_FILE, GG_LFS_INCLUDES_BLOB };
 
 static char *git_guard_read(const char *root, const char *gitdir, const char *path_key, GitGuardQuery query,
                             size_t *len, int *status, int *remaining_ms = NULL) {
@@ -2352,21 +2353,34 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
     const char *argv[20];
     size_t arg = 0;
     argv[arg++] = WFS_CONFIG_GIT;
+    argv[arg++] = "--no-lazy-fetch";  // metadata inspection must never invoke a promisor helper
+    if (query == GG_LFS_OID || query == GG_LFS_BLOB) {
+        // Resolving an index blob can refresh fsmonitor while reading the index.
+        // Override only object queries; the configuration snapshot keeps the real value.
+        argv[arg++] = "-c";
+        argv[arg++] = "core.fsmonitor=false";
+    }
     argv[arg++] = "-C";
     argv[arg++] = root;
     if (gitdir) {
         snprintf(gd, sizeof gd, "--git-dir=%s", gitdir);
         argv[arg++] = gd;
     }
-    if (query == GG_INCLUDE_ROOT || query == GG_INCLUDE_FILE) {
+    if (query == GG_INCLUDE_ROOT || query == GG_INCLUDE_FILE ||
+        query == GG_LFS_INCLUDES_FILE || query == GG_LFS_INCLUDES_BLOB) {
         argv[arg++] = "config";
         argv[arg++] = query == GG_INCLUDE_ROOT ? "--includes" : "--no-includes";
         argv[arg++] = "--null";
         argv[arg++] = "--show-origin";
         argv[arg++] = "--type=path";
-        if (query == GG_INCLUDE_FILE) { argv[arg++] = "--file"; argv[arg++] = path_key; }
+        if (query != GG_INCLUDE_ROOT) {
+            argv[arg++] = query == GG_LFS_INCLUDES_BLOB ? "--blob" : "--file";
+            argv[arg++] = path_key;
+        }
         argv[arg++] = "--get-regexp";
-        argv[arg++] = "^(include\\.path|includeif\\..*\\.path|core\\.hookspath)$";
+        argv[arg++] = (query == GG_LFS_INCLUDES_FILE || query == GG_LFS_INCLUDES_BLOB) ?
+            "^(include\\.path|includeif\\..*\\.path)$" :
+            "^(include\\.path|includeif\\..*\\.path|core\\.hookspath)$";
     } else if (query == GG_WORKTREE_ROOT || query == GG_WORKTREE_FILE) {
         // core.worktree is a raw path in Git setup, not a --type=path value:
         // tilde and %(prefix) must remain literal here.
@@ -2376,6 +2390,15 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
         if (query == GG_WORKTREE_FILE) { argv[arg++] = "--file"; argv[arg++] = path_key; }
         argv[arg++] = "--get-all";
         argv[arg++] = "core.worktree";
+    } else if (query == GG_LFS_OID) {
+        argv[arg++] = "rev-parse";
+        argv[arg++] = "--verify";
+        argv[arg++] = "--quiet";
+        argv[arg++] = path_key;  // fixed :.lfsconfig or HEAD:.lfsconfig
+    } else if (query == GG_LFS_BLOB) {
+        argv[arg++] = "cat-file";
+        argv[arg++] = "blob";
+        argv[arg++] = path_key;  // validated hexadecimal object ID; no filters/textconv
     } else if (query == GG_MODULES) {
         argv[arg++] = "config";
         argv[arg++] = "--no-includes";
@@ -2566,10 +2589,10 @@ static bool capture_worktree_candidates(const GitAdmin *a, const char *gitdir, c
 // Observe every declared include target, even when its condition is currently false.
 // Query contexts retain spelling: a symlinked parent can change relative-include meaning.
 static bool capture_include_edges(const GitAdmin *a, const char *gitdir, const char *file,
-                                  GuardSet *s, HookCandidates *hooks, int depth);
+                                  GuardSet *s, HookCandidates *hooks, int depth, bool lfs = false, bool blob = false);
 
 static bool capture_include_target(const GitAdmin *a, const char *gitdir, const char *path,
-                                   GuardSet *s, HookCandidates *hooks, int depth, char kind = 'i') {
+                                   GuardSet *s, HookCandidates *hooks, int depth, char kind = 'i', bool lfs = false) {
     if (g_post_signal) { s->error = "Git capture interrupted"; return false; }
     if (depth > 32) { s->error = "Git include depth limit exceeded"; return false; }
     struct stat st;
@@ -2584,9 +2607,9 @@ static bool capture_include_target(const GitAdmin *a, const char *gitdir, const 
     for (size_t i = 0; i < s->includes.n; ++i)
         if (!strcmp(s->includes.v[i], identity)) { captured = true; break; }
     if (!captured) {
-        // Absent worktree seeds are already bounded by repository discovery; they do
+        // Absent worktree/LFS seeds are already bounded by repository discovery; they do
         // not consume the include graph's file budget merely by being checked.
-        if (kind != 'w' || present) {
+        if ((kind != 'w' && kind != 'l') || present) {
             if (s->include_targets >= 256) { s->error = "Git include target limit exceeded"; return false; }
             ++s->include_targets;
         }
@@ -2604,22 +2627,24 @@ static bool capture_include_target(const GitAdmin *a, const char *gitdir, const 
     if (s->error || !present) return !s->error;
     char context[2 * WFS_PATH_MAX + 32];
     // Length-prefix the repository identity: paths may themselves contain delimiters.
-    if ((size_t)snprintf(context, sizeof context, "%zu:%s%s", strlen(gitdir), gitdir, path) >= sizeof context) {
+    if ((size_t)snprintf(context, sizeof context, "%c%zu:%s%s", lfs ? 'l' : 'g', strlen(gitdir), gitdir, path) >= sizeof context) {
         s->error = "Git include context path exceeds capture limit"; return false;
     }
     for (size_t i = 0; i < s->include_contexts.n; ++i)
         if (!strcmp(s->include_contexts.v[i], context)) return true;
     if (s->include_contexts.n >= 256) { s->error = "Git include context limit exceeded"; return false; }
     if (!sl_push(&s->include_contexts, context)) { s->error = "out of memory"; return false; }
-    return capture_include_edges(a, gitdir, path, s, hooks, depth);
+    return capture_include_edges(a, gitdir, path, s, hooks, depth, lfs);
 }
 
 static bool capture_include_edges(const GitAdmin *a, const char *gitdir, const char *file,
-                                  GuardSet *s, HookCandidates *hooks, int depth) {
-    if (!capture_worktree_candidates(a, gitdir, file, hooks, s)) return false;
+                                  GuardSet *s, HookCandidates *hooks, int depth, bool lfs, bool blob) {
+    if (!lfs && !capture_worktree_candidates(a, gitdir, file, hooks, s)) return false;
     size_t len = 0;
     int status = -1;
-    char *out = git_guard_read(a->root, gitdir, file, file ? GG_INCLUDE_FILE : GG_INCLUDE_ROOT,
+    GitGuardQuery query = lfs ? (blob ? GG_LFS_INCLUDES_BLOB : GG_LFS_INCLUDES_FILE) :
+                               (file ? GG_INCLUDE_FILE : GG_INCLUDE_ROOT);
+    char *out = git_guard_read(a->root, gitdir, file, query,
                               &len, &status, &s->include_ms);
     if (!out) {
         if (status == 1) return true; // no include directives or hook paths
@@ -2664,10 +2689,74 @@ static bool capture_include_edges(const GitAdmin *a, const char *gitdir, const c
             n = snprintf(target, sizeof target, "%s%s", source, value);
         }
         if (n < 0 || (size_t)n >= sizeof target) { ok = false; break; }
-        ok = capture_include_target(a, gitdir, target, s, hooks, depth + 1);
+        ok = capture_include_target(a, gitdir, target, s, hooks, depth + 1, 'i', lfs);
     }
     free(out);
     if (!ok && !s->error) s->error = "unsupported Git include origin or path";
+    return ok;
+}
+
+// Git LFS can fall back to index/HEAD when the checkout file is absent. Observe
+// both latent blobs, including replacement-object content, without running LFS itself.
+static bool capture_lfs_blob(const GitAdmin *a, const char *gitdir, const char *spec,
+                             GuardSet *s, HookCandidates *hooks) {
+    if (++s->entries > 65536) { s->error = "Git LFS capture entry limit exceeded"; return false; }
+    char *label = guard_encode_id_field(rel_to(a, gitdir));
+    if (!label) { s->error = "out of memory"; return false; }
+    size_t cap = strlen(label) + strlen(spec) + 8;
+    char *id = (char *)malloc(cap);
+    if (id) snprintf(id, cap, "b\x1f%s\x1f%s", spec, label);
+    free(label);
+    if (!id) { s->error = "out of memory"; return false; }
+    size_t len = 0;
+    int status = -1;
+    char *oid = git_guard_read(a->root, gitdir, spec, GG_LFS_OID, &len, &status, &s->include_ms);
+    if (!oid) {
+        if (status == 1) gs_add(s, id, "absent");  // absent stage 0/path, including unborn HEAD
+        else s->error = g_post_signal ? "Git capture interrupted" : "Git LFS object resolution failed or exceeded capture time budget";
+        free(id);
+        return !s->error;
+    }
+    bool valid = (len == 41 || len == 65) && oid[len - 1] == '\n';
+    for (size_t i = 0; valid && i + 1 < len; ++i)
+        valid = (oid[i] >= '0' && oid[i] <= '9') || (oid[i] >= 'a' && oid[i] <= 'f');
+    if (!valid) {
+        free(oid); free(id); s->error = "unsupported Git LFS object identity"; return false;
+    }
+    oid[len - 1] = 0;
+    char *bytes = git_guard_read(a->root, gitdir, oid, GG_LFS_BLOB, &len, &status, &s->include_ms);
+    if (!bytes) {
+        free(oid); free(id);
+        s->error = g_post_signal ? "Git capture interrupted" : "Git LFS blob capture failed or exceeded capture time budget";
+        return false;
+    }
+    if (len > s->bytes_left) {
+        free(bytes); free(oid); free(id); s->error = "Git files exceed the 64 MiB capture budget"; return false;
+    }
+    s->bytes_left -= len;
+    uint64_t hash = 1469598103934665603ull;
+    for (size_t i = 0; i < len; ++i) { hash ^= (unsigned char)bytes[i]; hash *= 1099511628211ull; }
+    free(bytes);
+    char fp[64];
+    snprintf(fp, sizeof fp, "blob:%016llx", (unsigned long long)hash);
+    gs_add(s, id, fp);
+    free(id);
+    // A blob has no file-relative include origin. The ordinary parser below permits
+    // absolute (including Git-expanded tilde) edges, and rejects relative ones.
+    char context[WFS_PATH_MAX + 96];
+    bool ok = !s->error;
+    if ((size_t)snprintf(context, sizeof context, "b%zu:%s%s", strlen(gitdir), gitdir, oid) >= sizeof context) {
+        s->error = "Git include context path exceeds capture limit"; ok = false;
+    }
+    bool seen = false;
+    for (size_t i = 0; ok && i < s->include_contexts.n; ++i)
+        if (!strcmp(context, s->include_contexts.v[i])) { seen = true; break; }
+    if (ok && !seen) {
+        if (s->include_contexts.n >= 256) { s->error = "Git include context limit exceeded"; ok = false; }
+        else if (!sl_push(&s->include_contexts, context)) { s->error = "out of memory"; ok = false; }
+        else ok = capture_include_edges(a, gitdir, oid, s, hooks, 0, true, true);
+    }
+    free(oid);
     return ok;
 }
 
@@ -2890,6 +2979,15 @@ static bool capture_include_hooks(GitAdmin *a, const char *gitdir, const char *c
     // config.worktree may become active later, while omitted from today's listing.
     if (ok) ok = capture_include_target(a, gitdir, worktree_config, s, &hooks, 0, 'w');
     if (ok) ok = capture_include_edges(a, gitdir, NULL, s, &hooks, 0);
+    char lfs_config[WFS_PATH_MAX];
+    if ((size_t)snprintf(lfs_config, sizeof lfs_config, "%s/.lfsconfig", checkout) >= sizeof lfs_config) {
+        s->error = "Git LFS configuration path exceeds capture limit"; ok = false;
+    }
+    // LFS ignores core.hooksPath/core.worktree in these sources. Traverse only their
+    // includes, rather than turning ignored values into new sandbox restrictions.
+    if (ok) ok = capture_include_target(a, gitdir, lfs_config, s, &hooks, 0, 'l', true);
+    if (ok) ok = capture_lfs_blob(a, gitdir, ":.lfsconfig", s, &hooks);
+    if (ok) ok = capture_lfs_blob(a, gitdir, "HEAD:.lfsconfig", s, &hooks);
     for (size_t i = 0; ok && i < hooks.values.n; ++i) {
         // Absolute hooks do not depend on any candidate worktree.
         size_t bases = hooks.values.v[i][0] == '/' ? 1 : hooks.bases.n;
@@ -3291,6 +3389,18 @@ static void guard_warn(const GuardRec *before, const GuardRec *after) {
         fputs(" -> ", stderr);
         put_value(stderr, after ? after->val : NULL);
         fputc('\n', stderr);
+    } else if (id[0] == 'l' || id[0] == 'b') {
+        bool was = before && strcmp(before->val, "absent");
+        bool is = after && strcmp(after->val, "absent");
+        fprintf(stderr, "world: WARNING: exec %s Git LFS configuration: ", !was ? "added" : !is ? "removed" : "changed");
+        if (id[0] == 'b') {
+            const char *label = strchr(rest, '\x1f') + 1;
+            put_id_field(stderr, label, strlen(label));
+            fputs(" (", stderr);
+            put_field(stderr, rest, (size_t)(label - rest - 1));
+            fputc(')', stderr);
+        } else put_field(stderr, rest, strlen(rest));
+        fputs(" (can activate configured LFS commands)\n", stderr);
     } else if (id[0] == 'w') {
         bool was = before && strcmp(before->val, "absent");
         bool is = after && strcmp(after->val, "absent");
@@ -3366,7 +3476,7 @@ static void guard_report(const GuardSet *b, const GuardSet *a) {
         if (before && after && !strcmp(before->val, after->val)) continue;
         const char kind = (before ? before : after)->id[0];
         if (kind == 'c' && shared_with_world(b, a, before, after)) continue;
-        if ((kind == 'a' || kind == 'i' || kind == 'w') && (!before || !strcmp(before->val, "absent")) &&
+        if ((kind == 'a' || kind == 'i' || kind == 'w' || kind == 'l' || kind == 'b') && (!before || !strcmp(before->val, "absent")) &&
             (!after || !strcmp(after->val, "absent"))) continue;
         if (kind == 'p') {
             bool was = before && strcmp(before->val, "absent");

@@ -61,6 +61,7 @@ int main() {
         "rebase.autostash", "REBASE.AUTOSTASH", "pull.autostash", "merge.autostash",
         "checkout.defaultremote", "checkout.guess", "pull.rebase", "branch.main.rebase", "branch.team.topic.rebase",
         "lfs.gitprotocol", "pull.ff", "lfs.url", "lfs.pushurl", "remote.origin.lfsurl", "remote.team.origin.lfspushurl",
+        "lfs.fetchinclude", "lfs.fetchexclude", "LFS.FETCHINCLUDE", "LFS.FETCHEXCLUDE",
         "lfs.access", "lfs.https://example.invalid/repo.access", "LFS.ACCESS", "merge.defaulttoupstream", "merge.ff",
         "http.proactiveauth", "http.https://example.invalid/repo.proactiveauth", "HTTP.PROACTIVEAUTH",
         "credential.interactive", "CREDENTIAL.INTERACTIVE",
@@ -136,6 +137,8 @@ int main() {
         CHECK(guard_key_runs_command(key, "!refs/heads/main"));
         CHECK(guard_key_runs_command(key, NULL));
     }
+    CHECK(guard_key_runs_command("lfs.fetchinclude", "*"));
+    CHECK(guard_key_runs_command("lfs.fetchexclude", NULL));
     // All aliases can dispatch external commands or inject -c command-running settings.
     // Built-in submodule update modes can activate retained child filters and commands.
     CHECK(guard_key_runs_command("alias.x", "!rm -rf /"));
@@ -204,6 +207,7 @@ int main() {
         "checkout.custom.defaultremote", "checkout.defaultremoteextra", "checkout.custom.guess", "pull.custom.rebase", "branch.rebase", "branch.main.rebaseextra",
         "lfs.custom.gitprotocol", "lfs.gitprotocolextra", "pull.custom.ff", "lfs.https://example.invalid.url", "lfs.custom.pushurl",
         "remote.lfsurl", "remote.lfspushurl", "remote.origin.lfsurlextra",
+        "lfs.url.fetchinclude", "lfs.url.fetchexclude", "lfs.fetchincludeextra", "lfs.fetchexcludeextra",
         "lfs.accessextra", "lfs.https://example.invalid/repo.accessextra", "merge.custom.defaulttoupstream", "merge.custom.ff", "merge.ffextra",
         "http.proactiveauthextra", "http.https://example.invalid/repo.proactiveauthextra",
         "credential.https://example.invalid.interactive", "credential.interactiveextra",
