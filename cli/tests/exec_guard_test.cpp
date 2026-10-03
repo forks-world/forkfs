@@ -108,13 +108,18 @@ int main() {
         if (!guard_key_runs_command(k, "cmd")) { fprintf(stderr, "%s should be watched\n", k); exit(1); }
     }
     // All aliases can dispatch external commands or inject -c command-running settings.
-    // Submodule update runs commands only with a leading `!`.
+    // Built-in submodule update modes can activate retained child filters and commands.
     CHECK(guard_key_runs_command("alias.x", "!rm -rf /"));
     CHECK(guard_key_runs_command("alias.co", "checkout"));
     CHECK(guard_key_runs_command("alias.x", "-c core.sshCommand=./payload ls-remote origin"));
     CHECK(guard_key_runs_command("alias.external", "custom-command"));
     CHECK(guard_key_runs_command("submodule.lib.update", "!sh evil"));
-    CHECK(!guard_key_runs_command("submodule.lib.update", "rebase"));
+    const char *update_modes[] = {"none", "checkout", "rebase", "merge", ""};
+    for (const char *mode : update_modes)
+        CHECK(guard_key_runs_command("submodule.lib.update", mode));
+    CHECK(guard_key_runs_command("submodule.lib.update", NULL));
+    CHECK(!guard_key_runs_command("submodule.update", "checkout"));
+    CHECK(!guard_key_runs_command("submodule.lib.updateextra", "checkout"));
     CHECK(guard_key_runs_command("alias.x", NULL));
 
     // Every endpoint or rewrite selector can activate an unchanged helper rewrite or SSH command.

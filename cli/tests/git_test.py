@@ -5361,6 +5361,28 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((one / 'selected-remote-ran').exists())
         self.assertFalse((one / 'selected-strategy-ran').exists())
 
+    def test_exec_reports_enabling_builtin_submodule_update(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        child = one / 'libs/lib'
+        self.git(child, 'config', 'filter.retained.smudge', 'touch retained-filter-ran; cat')
+        child_admin = one / '.world-git/repo.git/worktrees/active/modules/lib-module'
+        info = child_admin / 'info'
+        info.mkdir(exist_ok=True)
+        (info / 'attributes').write_text('*.txt filter=retained\n')
+        self.git(one, 'config', 'submodule.lib-module.update', 'none')
+        p = self.exec_sh(wid, 'git config submodule.lib-module.update checkout; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local submodule.lib-module.update: none -> checkout', p.stderr)
+        self.assertNotIn(b'local filter.retained.smudge:', p.stderr)
+        self.assertNotIn(b'Git repository attributes:', p.stderr)
+        # Removing the selector also restores Git's built-in default mode.
+        self.git(one, 'config', 'submodule.lib-module.update', 'none')
+        p = self.exec_sh(wid, 'git config --unset submodule.lib-module.update', '--no-sandbox')
+        self.assertIn(b'local submodule.lib-module.update: none -> (unset)', p.stderr)
+        self.assertFalse((child / 'retained-filter-ran').exists())
+        self.assertFalse((one / 'retained-filter-ran').exists())
+
     def test_exec_reports_enabling_preconfigured_push_transport(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
