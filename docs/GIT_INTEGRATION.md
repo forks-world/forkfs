@@ -362,6 +362,8 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `log.showsignature`, `merge.verifysignatures`, `rebase.instructionformat`, `format.pretty`,
 `pretty.*`, `format.commitlistformat`, `format.coverletter` (can activate signature verification),
 `branch.sort` and `tag.sort` when selecting a `signature` atom (ordinary name/version sorts stay quiet),
+`user.signingkey` (removal can activate the configured SSH default-key command),
+`http[.*].sslcert|proxysslcert|sslcertpasswordprotected|proxysslcertpasswordprotected` (can activate certificate password helpers),
 `gpg.format` (selects the signing program), `gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
 `remote.*.skipdefaultupdate|skipfetchall`, `fetch.bundleuri`, `fetch.all`, `remotes.*` (can activate unchanged remote helpers),
 `remote.*.uploadpack|receivepack|vcs`, `branch.*.mergeoptions`, `pull.twohead`, `pull.octopus` (can select external merge strategies),

@@ -5361,6 +5361,43 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((one / 'selected-remote-ran').exists())
         self.assertFalse((one / 'selected-strategy-ran').exists())
 
+    def test_exec_reports_certificate_and_signing_helper_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'core.askpass', 'touch certificate-helper-ran')
+        self.git(one, 'config', 'gpg.format', 'ssh')
+        self.git(one, 'config', 'gpg.ssh.defaultKeyCommand', 'touch default-key-helper-ran')
+        self.git(one, 'config', 'user.signingKey', 'existing-key')
+        cert_keys = ('http.sslCert', 'http.proxySSLCert',
+                     'http.https://example.invalid/repo.sslCert',
+                     'http.https://example.invalid/repo.proxySSLCert')
+        for key in cert_keys:
+            self.git(one, 'config', key, 'existing-certificate.pem')
+        values = {'http.sslCertPasswordProtected': 'true',
+                  'http.proxySSLCertPasswordProtected': 'true',
+                  'http.https://example.invalid/repo.sslCertPasswordProtected': 'true',
+                  'http.https://example.invalid/repo.proxySSLCertPasswordProtected': 'true'}
+        p = self.exec_sh(wid, ' && '.join('git config ' + shlex.quote(key) + ' ' + value
+                                        for key, value in values.items()) +
+                         ' && git config --unset user.signingKey; exit 7', '--no-sandbox', code=7)
+        for key, value in values.items():
+            self.assertIn(b'local ' + key.lower().encode() + b': (unset) -> ' + value.encode(), p.stderr)
+        self.assertIn(b'local user.signingkey: existing-key -> (unset)', p.stderr)
+        for key in (b'core.askpass', b'gpg.format', b'gpg.ssh.defaultkeycommand'):
+            self.assertNotIn(b'local ' + key + b':', p.stderr)
+        for key in cert_keys:
+            self.assertNotIn(b'local ' + key.lower().encode() + b':', p.stderr)
+            self.git(one, 'config', '--unset', key)
+        p = self.exec_sh(wid, ' && '.join('git config ' + shlex.quote(key) + ' existing-certificate.pem'
+                                        for key in cert_keys), '--no-sandbox')
+        for key in cert_keys:
+            self.assertIn(b'local ' + key.lower().encode() + b': (unset) -> existing-certificate.pem', p.stderr)
+        self.assertNotIn(b'local core.askpass:', p.stderr)
+        for key in values:
+            self.assertNotIn(b'local ' + key.lower().encode() + b':', p.stderr)
+        self.assertFalse((one / 'certificate-helper-ran').exists())
+        self.assertFalse((one / 'default-key-helper-ran').exists())
+
     def test_exec_reports_lfs_transfer_and_autocorrect_selectors(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

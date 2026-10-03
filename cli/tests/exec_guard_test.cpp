@@ -58,6 +58,11 @@ int main() {
 
     // Keys that make Git run a command.
     const char *runs[] = {
+        "http.sslcert", "http.proxysslcert", "http.https://example.invalid/repo.sslcert",
+        "HTTP.https://example.invalid/repo.PROXYSSLCERT",
+        "http.sslcertpasswordprotected", "http.proxysslcertpasswordprotected", "user.signingkey",
+        "http.https://example.invalid/repo.sslcertpasswordprotected",
+        "HTTP.https://example.invalid/repo.PROXYSSLCERTPASSWORDPROTECTED",
         "receive.autogc", "maintenance.auto", "maintenance.strategy", "maintenance.repo", "gc.auto", "gc.autopacklimit",
         "maintenance.gc.enabled", "maintenance.prefetch.enabled", "maintenance.prefetch.schedule", "maintenance.gc.schedule", "fetch.bundleuri",
         "MAINTENANCE.gc.ENABLED", "Maintenance.prefetch.Schedule",
@@ -157,6 +162,10 @@ int main() {
 
     // Keys that legitimately change during agent work, or only name things.
     const char *quiet[] = {
+        "http.sslcertextra", "http.https://example.invalid/repo.proxysslcertextra",
+        "http.sslkey", "http.sslcainfo", "http.sslcerttype",
+        "user.custom.signingkey", "user.signingkeyextra", "http.sslcertpasswordprotectedextra",
+        "http.https://example.invalid/repo.proxysslcertpasswordprotectedextra",
         "lfs.args", "lfs.direction", "lfs.customtransfer.args", "lfs.customtransfer..args",
         "lfs.customtransferextra.payload.args", "lfs.customtransfer.team.agent.direction",
         "lfs.customtransfer.Team.Agent.args",
