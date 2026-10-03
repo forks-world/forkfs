@@ -6128,6 +6128,54 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((one / 'child-program-ran').exists())
         self.assertFalse((child / 'child-program-ran').exists())
 
+    def test_exec_reports_three_way_am_activating_retained_merge_driver(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        command = 'touch ' + shlex.quote(str(one / 'am-merge-driver-ran'))
+        self.git(one, 'config', 'merge.retained.driver', command)
+        self.git(one, 'config', 'am.threeWay', 'false')
+        attributes = one / '.world-git/repo.git/info/attributes'
+        attributes.parent.mkdir(exist_ok=True)
+        attributes.write_text('file merge=retained\n')
+        original = attributes.read_bytes()
+        p = self.exec_sh(wid, 'git config am.threeWay true; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local am.threeway: false -> true', p.stderr)
+        self.assertNotIn(b'local merge.retained.driver:', p.stderr)
+        self.assertNotIn(b'Git repository attributes:', p.stderr)
+        self.assertEqual(attributes.read_bytes(), original)
+        self.assertEqual(self.git(one, 'config', 'merge.retained.driver').stdout.strip(), command.encode())
+        self.assertFalse((one / 'am-merge-driver-ran').exists())
+
+    def test_exec_reports_pruning_activating_retained_reference_hook(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'remote.origin.url', str(self.source))
+        self.git(one, 'config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*')
+        self.git(one, 'update-ref', 'refs/remotes/origin/stale', 'HEAD')
+        self.git(one, 'tag', 'stale')
+        hook = one / '.world-git/repo.git/hooks/reference-transaction'
+        hook.parent.mkdir(exist_ok=True)
+        marker = one / 'prune-reference-hook-ran'
+        hook.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(marker)) + '\n')
+        hook.chmod(0o755)
+        original = hook.read_bytes()
+        for key in ('fetch.prune', 'remote.origin.prune', 'fetch.pruneTags', 'remote.origin.pruneTags'):
+            self.git(one, 'config', key, 'false')
+        # Tag pruning is tested only after prune itself is enabled and retained.
+        for keys in (('fetch.prune', 'remote.origin.prune'),
+                     ('fetch.pruneTags', 'remote.origin.pruneTags')):
+            p = self.exec_sh(wid, ' && '.join('git config ' + key + ' true' for key in keys) + '; exit 7',
+                             '--no-sandbox', code=7)
+            for key in keys:
+                self.assertIn(b'local ' + key.lower().encode() + b': false -> true', p.stderr)
+            self.assertNotIn(b'a Git hook:', p.stderr)
+            self.assertNotIn(b'local remote.origin.url:', p.stderr)
+            self.assertEqual(hook.read_bytes(), original)
+            self.assertFalse(marker.exists())
+        # Configuration inspection neither fetches nor prunes the prepared stale refs.
+        self.assertEqual(self.git(one, 'rev-parse', 'refs/remotes/origin/stale').stdout.strip(), self.base)
+        self.assertEqual(self.git(one, 'rev-parse', 'refs/tags/stale').stdout.strip(), self.base)
+
     def test_exec_reports_selecting_preconfigured_merge_driver(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

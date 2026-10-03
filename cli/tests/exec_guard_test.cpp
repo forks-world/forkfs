@@ -101,6 +101,8 @@ int main() {
         "log.showsignature", "merge.verifysignatures", "format.pretty", "pretty.signature", "pretty.team.signature",
         "commit.gpgsign", "tag.gpgsign", "tag.forcesignannotated", "push.gpgsign", "gpg.format",
         "gpg.program", "gpg.ssh.program", "gpg.ssh.defaultkeycommand", "remote.origin.uploadpack",
+        "am.threeway", "AM.THREEWAY", "fetch.prune", "fetch.prunetags", "FETCH.PRUNETAGS",
+        "remote.origin.prune", "remote.team.origin.prunetags", "REMOTE.Origin.PRUNE",
         "fetch.all", "remotes.default", "remotes.team.group",
         "remote.origin.skipdefaultupdate", "remote.origin.skipfetchall", "remote.team.origin.skipfetchall",
         "pull.twohead", "pull.octopus", "receive.procreceiverefs", "branch.main.mergeoptions", "branch.main.remote", "branch.main.pushremote", "remote.pushdefault",
@@ -143,6 +145,13 @@ int main() {
     CHECK(guard_key_runs_command("http.followredirects", "initial"));
     CHECK(guard_key_runs_command("http.https://example.invalid/repo.followredirects", "true"));
     CHECK(guard_key_runs_command("http.followredirects", NULL));
+    const char *transaction_gates[] = {"am.threeway", "fetch.prune", "fetch.prunetags",
+                                       "remote.origin.prune", "remote.origin.prunetags"};
+    for (const char *key : transaction_gates) {
+        CHECK(guard_key_runs_command(key, "true"));
+        CHECK(guard_key_runs_command(key, "false"));
+        CHECK(guard_key_runs_command(key, NULL));
+    }
     // All aliases can dispatch external commands or inject -c command-running settings.
     // Built-in submodule update modes can activate retained child filters and commands.
     CHECK(guard_key_runs_command("alias.x", "!rm -rf /"));
@@ -244,6 +253,8 @@ int main() {
         "receive.custom.denycurrentbranch", "remote.promisor",
         "sendemail.confirmextra", "sendemail.work.confirmextra",
         "sendemail.work.identity", "sendemail.work.annotation", "sendemail.suppress", "fetch.custom.all", "remotes",
+        "am.custom.threeway", "am.threewayextra", "fetch.custom.prune", "fetch.custom.prunetags",
+        "remote.prune", "remote.prunetags", "remote.origin.prunetagsExtra",
         "remote.skipdefaultupdate", "remote.skipfetchall", "remote.origin.skipfetch",
         "user.email", "user.name", "remote.origin.fetch", "remote.origin.name", "url.insteadof", "url.pushinsteadof",
         "pull.custom.twohead", "pull.custom.octopus", "receive.custom.procreceiverefs", "receive.advertisepushoptions", "branch.remote", "branch.pushremote", "branch.mergeoptions", "remote.origin.pushdefault",
