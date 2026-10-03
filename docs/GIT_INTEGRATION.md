@@ -409,7 +409,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `http[.*].sslcert|proxysslcert|sslcertpasswordprotected|proxysslcertpasswordprotected` (can activate certificate password helpers),
 `http[.*].proxy`, `remote.*.proxy` (can activate an existing proxy password helper),
 `gpg.format` (selects the signing program), `gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
-`fetch.prune|prunetags` and `remote.*.prune|prunetags` (can invoke the retained reference-transaction hook),
+`remote.*.fetch`, `fetch.prune|prunetags` and `remote.*.prune|prunetags` (can invoke the retained reference-transaction hook),
 `remote.*.skipdefaultupdate|skipfetchall`, `fetch.bundleuri`, `fetch.all`, `remotes.*` (can activate unchanged remote helpers),
 `remote.*.uploadpack|receivepack|vcs`, `branch.*.mergeoptions`, `pull.twohead`, `pull.octopus` (can select external merge strategies),
 `branch.*.remote|pushremote`, `remote.pushdefault` (can select preconfigured helper remotes),
@@ -455,8 +455,8 @@ can activate an unchanged custom update command when no active selector override
 The key list and value-sensitive rules are in `cli/exec_guard.h`. Branch remote selectors and
 `remote.pushdefault` are reported even when choosing an ordinary remote: a remote name can
 activate unchanged helper configuration. Setting endpoints and tracking remains allowed;
-fetch refspecs and descriptive names stay quiet; branch upstream merge selectors are reported
-because they can enable an otherwise refused push.
+fetch refspecs are reported because they can enable tracking-ref updates and retained reference-transaction hooks.
+Descriptive names stay quiet; branch upstream merge selectors are reported because they can enable an otherwise refused push.
 Each repository is read before and after with five
 queries (plus the include/LFS source graph and macOS pre-exec declaration queries described above): a configuration listing, `--path --get core.hooksPath`, `rev-parse --show-toplevel`,
 and `git var GIT_ATTR_GLOBAL`/`GIT_ATTR_SYSTEM`,

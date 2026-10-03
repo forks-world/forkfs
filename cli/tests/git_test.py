@@ -5305,7 +5305,8 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((one / 'rewrite-helper-ran').exists())
         p = self.exec_sh(wid, "git config remote.ssh.fetch '+refs/heads/*:refs/remotes/ssh/*' && "
                          "git config branch.main.description unchanged-policy", '--no-sandbox')
-        self.assertNotIn(b'WARNING', p.stderr)
+        self.assertIn(b'local remote.ssh.fetch: (unset) -> +refs/heads/*:refs/remotes/ssh/*', p.stderr)
+        self.assertNotIn(b'branch.main.description:', p.stderr)
 
     def test_exec_refuses_symlinked_worktrees_locator(self):
         self.world('init', str(self.source))
@@ -5858,7 +5859,10 @@ class GitWorldTest(unittest.TestCase):
         one, wid = self.fork()
         policy = one / '.world-git/lfs-policy'
         policy.write_text('[lfs]\n url = https://example.invalid/before\n')
-        (one / 'ignored-hook-alias').symlink_to(self.root, target_is_directory=True)
+        # Keep the external alias readable without traversing gated store snapshots.
+        ignored_hooks = self.root / 'ignored-lfs-hooks'
+        ignored_hooks.mkdir()
+        (one / 'ignored-hook-alias').symlink_to(ignored_hooks, target_is_directory=True)
         (one / '.lfsconfig').write_text('[include]\n path = .world-git/lfs-policy\n'
                                       '[core]\n hooksPath = ignored-hook-alias\n')
         p = self.exec_sh(wid, "printf '[lfs]\\n url = https://example.invalid/after\\n' > .world-git/lfs-policy",
@@ -6214,6 +6218,27 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(attributes.read_bytes(), original)
         self.assertEqual(self.git(one, 'config', 'merge.retained.driver').stdout.strip(), command.encode())
         self.assertFalse((one / 'am-merge-driver-ran').exists())
+
+    def test_exec_reports_fetch_refspec_activating_retained_reference_hook(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'remote.retained.url', str(self.source))
+        self.assertEqual(self.git(one, 'config', '--get-all', 'remote.retained.fetch', code=1).stdout, b'')
+        hook = one / '.world-git/repo.git/hooks/reference-transaction'
+        hook.parent.mkdir(exist_ok=True)
+        marker = one / 'fetch-reference-hook-ran'
+        hook.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(marker)) + '\n')
+        hook.chmod(0o755)
+        original = hook.read_bytes()
+        refspec = '+refs/heads/*:refs/remotes/retained/*'
+        p = self.exec_sh(wid, 'git config remote.retained.fetch ' + shlex.quote(refspec) + '; exit 7',
+                         '--no-sandbox', code=7)
+        self.assertIn(b'local remote.retained.fetch: (unset) -> ' + refspec.encode(), p.stderr)
+        self.assertNotIn(b'local remote.retained.url:', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertEqual(hook.read_bytes(), original)
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.git(one, 'for-each-ref', '--format=%(refname)', 'refs/remotes/retained/').stdout, b'')
 
     def test_exec_reports_pruning_activating_retained_reference_hook(self):
         self.world('init', str(self.source))

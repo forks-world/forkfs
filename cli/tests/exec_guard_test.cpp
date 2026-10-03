@@ -103,6 +103,7 @@ int main() {
         "commit.gpgsign", "tag.gpgsign", "tag.forcesignannotated", "push.gpgsign", "gpg.format",
         "gpg.program", "gpg.ssh.program", "gpg.ssh.defaultkeycommand", "remote.origin.uploadpack",
         "am.threeway", "AM.THREEWAY", "fetch.prune", "fetch.prunetags", "FETCH.PRUNETAGS",
+        "remote.origin.fetch", "remote.team.origin.fetch", "REMOTE.Origin.FETCH",
         "remote.origin.prune", "remote.team.origin.prunetags", "REMOTE.Origin.PRUNE",
         "fetch.all", "remotes.default", "remotes.team.group",
         "remote.origin.skipdefaultupdate", "remote.origin.skipfetchall", "remote.team.origin.skipfetchall",
@@ -153,6 +154,10 @@ int main() {
         CHECK(guard_key_runs_command(key, "false"));
         CHECK(guard_key_runs_command(key, NULL));
     }
+    CHECK(guard_key_runs_command("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"));
+    CHECK(guard_key_runs_command("remote.origin.fetch", "^refs/heads/private/*"));
+    CHECK(guard_key_runs_command("remote.origin.fetch", ""));
+    CHECK(guard_key_runs_command("remote.origin.fetch", NULL));
     CHECK(guard_key_runs_command("receive.shallowupdate", "true"));
     CHECK(guard_key_runs_command("receive.shallowupdate", "false"));
     CHECK(guard_key_runs_command("receive.shallowupdate", NULL));
@@ -261,7 +266,7 @@ int main() {
         "am.custom.threeway", "am.threewayextra", "fetch.custom.prune", "fetch.custom.prunetags",
         "remote.prune", "remote.prunetags", "remote.origin.prunetagsExtra",
         "remote.skipdefaultupdate", "remote.skipfetchall", "remote.origin.skipfetch",
-        "user.email", "user.name", "remote.origin.fetch", "remote.origin.name", "url.insteadof", "url.pushinsteadof",
+        "remote.fetch", "remote.origin.fetchextra", "user.email", "user.name", "remote.origin.name", "url.insteadof", "url.pushinsteadof",
         "pull.custom.twohead", "pull.custom.octopus", "receive.custom.procreceiverefs", "receive.advertisepushoptions", "branch.remote", "branch.pushremote", "branch.mergeoptions", "remote.origin.pushdefault",
         "core.bare", "tar.command", "tar.remote", "uploadarchive.custom.allowunreachable",
         "gc.custom.recentobjectshook", "gc.pruneexpire", "core.editorx", "core.custom.attributesfile", "filter.clean", "diff.command", "merge.driver", "merge.recursive", "merge.custom.default", "merge.custom.renormalize", "core.x.hookspath",

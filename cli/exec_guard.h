@@ -116,6 +116,7 @@ static const GuardKey kGuardKeys[] = {
     {"fetch", "bundleuri", 0, false},
     {"am", "threeway", 0, false},
     {"fetch", "prune", 0, false}, {"fetch", "prunetags", 0, false},
+    {"remote", "fetch", 1, false},
     {"remote", "prune", 1, false}, {"remote", "prunetags", 1, false},
     {"fetch", "all", 0, false},          {"remotes", NULL, 2, false},
     {"remote", "skipdefaultupdate", 1, false}, {"remote", "skipfetchall", 1, false},
