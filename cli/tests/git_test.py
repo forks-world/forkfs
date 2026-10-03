@@ -5119,6 +5119,18 @@ class GitWorldTest(unittest.TestCase):
                     self.assertEqual(hook.read_bytes(), original)
                     self.assertFalse(marker.exists())
 
+        # Unlike denyDeletes, removing denyDeleteCurrent defaults to refusal.
+        # Explicit false permits the current-branch deletion with this retained policy.
+        self.git(one, 'config', 'receive.denyCurrentBranch', 'ignore')
+        self.git(one, 'config', 'receive.denyDeleteCurrent', 'true')
+        p = self.exec_sh(wid, 'git config receive.denyDeleteCurrent false; exit 7',
+                         '--no-sandbox', code=7)
+        self.assertIn(b'local receive.denydeletecurrent: true -> false', p.stderr)
+        self.assertNotIn(b'local receive.denycurrentbranch:', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertEqual(hook.read_bytes(), original)
+        self.assertFalse(marker.exists())
+
     def test_exec_reports_enabling_promisor_and_checkout_hook(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
@@ -5213,6 +5225,33 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'incomplete Git administration scan', p.stderr)
         self.assertTrue(worktrees.is_dir())
         self.assertFalse(worktrees.is_symlink())
+
+    def test_exec_reports_replacement_refs_activating_retained_filter(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        head = self.git(one, 'rev-parse', 'HEAD').stdout.strip().decode()
+        self.git(one, 'checkout', '-q', '-b', 'filter-replacement')
+        (one / '.gitattributes').write_text('file filter=retained\n')
+        (one / 'file').write_text('replacement contents\n')
+        self.git(one, 'add', '.gitattributes', 'file')
+        self.git(one, 'commit', '-qm', 'replacement with dormant filter attributes')
+        replacement = self.git(one, 'rev-parse', 'HEAD').stdout.strip().decode()
+        self.git(one, 'checkout', '-q', 'main')
+        self.git(one, 'config', 'core.useReplaceRefs', 'false')
+        self.git(one, 'replace', head, replacement)
+        self.git(one, 'config', 'filter.retained.smudge', 'touch replacement-filter-ran; cat')
+        original = (one / 'file').read_bytes()
+        # Activation changes only configuration: neither reset nor the retained
+        # smudge command is run by this inspection/reporting regression.
+        p = self.exec_sh(wid, 'git config core.useReplaceRefs true; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local core.usereplacerefs: false -> true', p.stderr)
+        self.assertNotIn(b'local filter.retained.smudge:', p.stderr)
+        self.assertEqual(self.git(one, 'config', 'filter.retained.smudge').stdout.strip(),
+                         b'touch replacement-filter-ran; cat')
+        self.assertEqual(self.git(one, 'rev-parse', 'refs/replace/' + head).stdout.strip().decode(), replacement)
+        self.assertEqual(self.git(one, 'show', 'HEAD:.gitattributes').stdout, b'file filter=retained\n')
+        self.assertEqual((one / 'file').read_bytes(), original)
+        self.assertFalse((one / 'replacement-filter-ran').exists())
 
     def test_exec_reports_attributes_file_activating_existing_filter(self):
         self.world('init', str(self.source))

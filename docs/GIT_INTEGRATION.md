@@ -374,7 +374,7 @@ world: WARNING: exec removed libs/lib/.git, which told Git where a repository is
 
 The settings watched (Git's lowercase key names; `*` is any subsection): `core.hookspath`,
 `core.worktree` (checkout and relative-hook redirection), `core.fsmonitor`, `core.sshcommand`, `core.editor`, `core.pager`, `core.askpass`,
-`core.attributesfile` (can activate configured filters), `core.gitproxy`, `core.alternaterefscommand`, `sequence.editor`, `credential.helper` and
+`core.attributesfile` and `core.usereplacerefs` (can activate configured filters, including through replacement-tree attributes), `core.gitproxy`, `core.alternaterefscommand`, `sequence.editor`, `credential.helper` and
 `credential.*.helper`, `credential.interactive` (enables configured askpass),
 `http[.*].proactiveauth` (can proactively invoke an unchanged credential helper), `filter.*.clean|smudge|process`, `diff.external`,
 `diff.*.command|textconv`, `diff.tool|guitool`, `merge.tool|guitool`, `difftool.guidefault`, `mergetool.guidefault` (select configured commands), `difftool.prompt` and `mergetool.prompt` (can launch retained tools without waiting for input), `merge.*.driver|recursive`, `merge.default` (including selection of unchanged merge drivers),
@@ -398,7 +398,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 (can activate a configured helper when fetching missing objects),
 `uploadpack.packobjectshook`, `receive.procreceiverefs` (activates the configured proc-receive hook),
 `receive.denycurrentbranch` (can enable the existing push-to-checkout hook),
-`receive.denynonfastforwards` and `receive.denydeletes` (can let forced branch updates or deletions reach the existing update hook),
+`receive.denynonfastforwards`, `receive.denydeletes` and `receive.denydeletecurrent` (can let forced branch updates or permitted deletions reach the existing update hook),
 `receive.autogc`, `maintenance.auto`, `gc.auto`, `gc.autopacklimit`, `maintenance.strategy`,
 `maintenance.repo` (registers repositories for an existing maintenance scheduler),
 `maintenance.gc.enabled|schedule`, `maintenance.prefetch.enabled|schedule`

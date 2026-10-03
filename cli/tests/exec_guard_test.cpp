@@ -78,6 +78,7 @@ int main() {
         "remote.origin.partialclonefilter", "extensions.partialclone",
         "receive.denynonfastforwards", "RECEIVE.DENYNONFASTFORWARDS",
         "receive.denydeletes", "RECEIVE.DENYDELETES",
+        "receive.denydeletecurrent", "RECEIVE.DENYDELETECURRENT", "core.usereplacerefs", "CORE.USEREPLACEREFS",
         "difftool.prompt", "mergetool.prompt", "DIFFTOOL.PROMPT", "MERGETOOL.PROMPT",
         "receive.denycurrentbranch", "remote.origin.promisor", "remote.team.origin.promisor",
         "uploadarchive.allowunreachable", "tar.custom.remote", "tar.tar.gz.remote",
@@ -119,9 +120,10 @@ int main() {
     }
     CHECK(guard_key_runs_command("receive.denynonfastforwards", "false"));
     CHECK(guard_key_runs_command("receive.denynonfastforwards", NULL));
-    const char *gates[] = {"receive.denydeletes", "difftool.prompt", "mergetool.prompt"};
+    const char *gates[] = {"core.usereplacerefs", "receive.denydeletecurrent", "receive.denydeletes", "difftool.prompt", "mergetool.prompt"};
     for (const char *key : gates) {
         CHECK(guard_key_runs_command(key, "false"));
+        CHECK(guard_key_runs_command(key, "true"));
         CHECK(guard_key_runs_command(key, NULL));
     }
     CHECK(guard_key_runs_command("sendemail.confirm", "never"));
@@ -217,6 +219,8 @@ int main() {
         "remote.partialclonefilter", "extensions.custom.partialclone",
         "receive.custom.denynonfastforwards", "receive.denynonfastforwardsextra",
         "receive.custom.denydeletes", "receive.denydeletesextra",
+        "receive.custom.denydeletecurrent", "receive.denydeletecurrentextra",
+        "core.custom.usereplacerefs", "core.usereplacerefsextra",
         "difftool.payload.prompt", "mergetool.payload.prompt", "difftool.promptextra", "mergetool.promptextra",
         "receive.custom.denycurrentbranch", "remote.promisor",
         "sendemail.confirmextra", "sendemail.work.confirmextra",
