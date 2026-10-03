@@ -2769,7 +2769,6 @@ static bool note_hooks_path(GitAdmin *a, const char *checkout, const char *v, ch
     bool in_tree = !strncmp(real, a->root, n) && (real[n] == '/' || !real[n]);
     bool in_admin = !strncmp(real, admin, m) && (real[m] == '/' || !real[m]);
     *protect = !in_tree || in_admin;
-#ifdef __APPLE__
     if (*protect) {
         // Pin raw traversal prefixes too: canonicalization erases `a` from a/../hooks,
         // but replacing a with a symlink would change Git's subsequent path resolution.
@@ -2791,7 +2790,6 @@ static bool note_hooks_path(GitAdmin *a, const char *checkout, const char *v, ch
             if (!end) break;
         }
     }
-#endif
     if ((size_t)snprintf(out, cap, "%s", real) >= cap) return false;
     return true;
 }
@@ -3534,12 +3532,28 @@ static char **linux_git_mounts(const GitAdmin *a, StrList *keep) {
     add(a->active, false, true);
     snprintf(p, sizeof p, "%s/commondir", a->active); add(p, true, false);
     snprintf(p, sizeof p, "%s/hooks", a->common); add(p, true, true);
-    // A core.hooksPath inside .world-git; one outside the World is read-only here already.
+    // Only the World is host-writable. Never bind external ancestors writable: they
+    // are already read-only (or hidden by an ephemeral tmpfs) in the base policy.
     size_t rn = strlen(a->root);
+    auto pin_ancestors = [&](const char *path, bool include_self) {
+        if (strncmp(path, a->root, rn) || path[rn] != '/') return;
+        char parent[WFS_PATH_MAX];
+        if ((size_t)snprintf(parent, sizeof parent, "%s", path) >= sizeof parent) { complete = false; return; }
+        if (include_self) add(parent, false, true);
+        for (char *slash = strrchr(parent, '/'); slash && (size_t)(slash - parent) > rn; slash = strrchr(parent, '/')) {
+            *slash = 0;
+            add(parent, false, true);
+        }
+    };
     for (size_t i = 0; i < a->hooks_paths.n; ++i) {
         const char *h = a->hooks_paths.v[i];
-        if (!strncmp(h, a->root, rn) && h[rn] == '/') add(h, true, true);
+        if (!strncmp(h, a->root, rn) && h[rn] == '/') {
+            add(h, true, true);
+            pin_ancestors(h, false);
+        }
     }
+    for (size_t i = 0; i < a->hook_locator_pins.n; ++i)
+        pin_ancestors(a->hook_locator_pins.v[i], true);
     for (size_t i = 0; i < a->pins.n; ++i) add(a->pins.v[i], false, true);
     for (size_t i = 0; i < a->gitdirs.n; ++i) {
         snprintf(p, sizeof p, "%s/hooks", a->gitdirs.v[i]);

@@ -58,6 +58,7 @@ int main() {
 
     // Keys that make Git run a command.
     const char *runs[] = {
+        "http.proxy", "http.https://example.invalid/repo.proxy", "remote.origin.proxy", "remote.team.origin.proxy",
         "http.sslcert", "http.proxysslcert", "http.https://example.invalid/repo.sslcert",
         "HTTP.https://example.invalid/repo.PROXYSSLCERT",
         "http.sslcertpasswordprotected", "http.proxysslcertpasswordprotected", "user.signingkey",
@@ -162,6 +163,7 @@ int main() {
 
     // Keys that legitimately change during agent work, or only name things.
     const char *quiet[] = {
+        "remote.proxy", "http.proxyextra", "remote.origin.proxyextra",
         "http.sslcertextra", "http.https://example.invalid/repo.proxysslcertextra",
         "http.sslkey", "http.sslcainfo", "http.sslcerttype",
         "user.custom.signingkey", "user.signingkeyextra", "http.sslcertpasswordprotectedextra",

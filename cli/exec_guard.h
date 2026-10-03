@@ -74,6 +74,7 @@ struct GuardKey {
 };
 
 static const GuardKey kGuardKeys[] = {
+    {"http", "proxy", 2, false}, {"remote", "proxy", 1, false},
     {"http", "sslcert", 2, false}, {"http", "proxysslcert", 2, false},
     {"http", "sslcertpasswordprotected", 2, false},
     {"http", "proxysslcertpasswordprotected", 2, false},

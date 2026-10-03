@@ -5361,6 +5361,49 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((one / 'selected-remote-ran').exists())
         self.assertFalse((one / 'selected-strategy-ran').exists())
 
+    def test_exec_reports_proxy_password_helper_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'core.askpass', 'touch proxy-helper-ran')
+        proxy = 'http://username@proxy.invalid:8080'
+        keys = ('http.proxy', 'http.https://example.invalid/repo.proxy', 'remote.origin.proxy')
+        p = self.exec_sh(wid, ' && '.join('git config ' + shlex.quote(key) + ' ' + shlex.quote(proxy)
+                                        for key in keys) + '; exit 7', '--no-sandbox', code=7)
+        for key in keys:
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> ' + proxy.encode(), p.stderr)
+        self.assertNotIn(b'local core.askpass:', p.stderr)
+        self.assertFalse((one / 'proxy-helper-ran').exists())
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux hooks ancestor mount pins')
+    def test_exec_pins_linux_custom_hook_ancestors_without_reopening_external_paths(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        custom = one / '.world-git/custom'
+        hooks = custom / 'hooks'
+        hooks.mkdir(parents=True)
+        (custom / 'cancelled').mkdir()
+        hook = hooks / 'pre-commit'
+        hook.write_text('#!/bin/sh\nexit 0\n')
+        original = hook.read_bytes()
+        self.git(one, 'config', 'core.hooksPath', str(custom / 'cancelled/../hooks'))
+        old = custom.with_name('old-custom')
+        self.assert_denied(wid, 'mv ' + shlex.quote(str(custom)) + ' ' + shlex.quote(str(old)) +
+                           ' && mkdir -p ' + shlex.quote(str(hooks)) + ' && echo evil > ' + shlex.quote(str(hook)))
+        self.assertFalse(old.exists())
+        self.assertEqual(hook.read_bytes(), original)
+        self.assert_denied(wid, 'mv ' + shlex.quote(str(custom / 'cancelled')) + ' ' +
+                           shlex.quote(str(custom / 'old-cancelled')))
+        self.assertFalse((custom / 'old-cancelled').exists())
+        self.exec_sh(wid, 'echo allowed > ' + shlex.quote(str(custom / 'sibling')), '--require-sandbox')
+        self.assertEqual((custom / 'sibling').read_text().strip(), 'allowed')
+        external = self.root / 'external-hooks-parent'
+        (external / 'hooks').mkdir(parents=True)
+        sibling = external / 'sibling'
+        sibling.write_text('unchanged')
+        self.git(one, 'config', 'core.hooksPath', str(external / 'hooks'))
+        self.assert_denied(wid, 'echo evil > ' + shlex.quote(str(sibling)))
+        self.assertEqual(sibling.read_text(), 'unchanged')
+
     def test_exec_reports_certificate_and_signing_helper_activation(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

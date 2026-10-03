@@ -270,6 +270,13 @@ So `world exec` does two things.
   renamed or removed. Operations that move them (`git worktree repair`, `git submodule
   absorbgitdirs`) fail inside the exec; run them outside.
 
+On Linux, existing intermediate directories leading to protected hooks inside the World are
+bound onto themselves so they cannot be renamed away. Existing raw traversal components
+cancelled by `..` are pinned too; writable sibling contents remain available. These writable
+locator binds never extend outside the World, where the base policy is already read-only or
+uses an ephemeral temporary filesystem. Missing directories retain the Linux limitation below:
+only directories present when the sandbox starts can be bound.
+
 On macOS, every protected hook directory also pins its ancestor directory entries, including
 ancestors outside the World. Raw traversal components discarded by `..` are pinned too, so
 renaming an ancestor or replacing a traversed directory with a symlink cannot expose the hooks
@@ -364,6 +371,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `branch.sort` and `tag.sort` when selecting a `signature` atom (ordinary name/version sorts stay quiet),
 `user.signingkey` (removal can activate the configured SSH default-key command),
 `http[.*].sslcert|proxysslcert|sslcertpasswordprotected|proxysslcertpasswordprotected` (can activate certificate password helpers),
+`http[.*].proxy`, `remote.*.proxy` (can activate an existing proxy password helper),
 `gpg.format` (selects the signing program), `gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
 `remote.*.skipdefaultupdate|skipfetchall`, `fetch.bundleuri`, `fetch.all`, `remotes.*` (can activate unchanged remote helpers),
 `remote.*.uploadpack|receivepack|vcs`, `branch.*.mergeoptions`, `pull.twohead`, `pull.octopus` (can select external merge strategies),
