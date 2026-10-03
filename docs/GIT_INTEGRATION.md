@@ -376,6 +376,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `remote.*.skipdefaultupdate|skipfetchall`, `fetch.bundleuri`, `fetch.all`, `remotes.*` (can activate unchanged remote helpers),
 `remote.*.uploadpack|receivepack|vcs`, `branch.*.mergeoptions`, `pull.twohead`, `pull.octopus` (can select external merge strategies),
 `branch.*.remote|pushremote`, `remote.pushdefault` (can select preconfigured helper remotes),
+`push.default`, `push.autosetupremote`, `branch.*.merge`, `remote.*.push|mirror` (can enable an otherwise refused push through an existing helper),
 `remote.*.promisor|partialclonefilter`, `extensions.partialclone`
 (can activate a configured helper when fetching missing objects),
 `uploadpack.packobjectshook`, `receive.procreceiverefs` (activates the configured proc-receive hook),
@@ -409,7 +410,8 @@ can activate an unchanged custom update command when no active selector override
 The key list and value-sensitive rules are in `cli/exec_guard.h`. Branch remote selectors and
 `remote.pushdefault` are reported even when choosing an ordinary remote: a remote name can
 activate unchanged helper configuration. Setting endpoints and tracking remains allowed;
-fetch refspecs, descriptive names and `branch.*.merge` stay quiet.
+fetch refspecs and descriptive names stay quiet; branch upstream merge selectors are reported
+because they can enable an otherwise refused push.
 Each repository is read before and after with five
 queries (plus the include graph and macOS pre-exec declaration queries described above): a configuration listing, `--path --get core.hooksPath`, `rev-parse --show-toplevel`,
 and `git var GIT_ATTR_GLOBAL`/`GIT_ATTR_SYSTEM`,

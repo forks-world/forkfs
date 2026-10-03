@@ -58,6 +58,8 @@ int main() {
 
     // Keys that make Git run a command.
     const char *runs[] = {
+        "push.autosetupremote", "branch.main.merge", "branch.team.topic.merge",
+        "push.default", "remote.origin.push", "remote.origin.mirror", "remote.team.origin.push",
         "http.proxy", "http.https://example.invalid/repo.proxy", "remote.origin.proxy", "remote.team.origin.proxy",
         "http.sslcert", "http.proxysslcert", "http.https://example.invalid/repo.sslcert",
         "HTTP.https://example.invalid/repo.PROXYSSLCERT",
@@ -163,6 +165,8 @@ int main() {
 
     // Keys that legitimately change during agent work, or only name things.
     const char *quiet[] = {
+        "push.custom.autosetupremote", "branch.merge", "branch.main.mergeextra",
+        "push.custom.default", "remote.push", "remote.mirror", "remote.origin.pushextra", "remote.origin.mirrorextra",
         "remote.proxy", "http.proxyextra", "remote.origin.proxyextra",
         "http.sslcertextra", "http.https://example.invalid/repo.proxysslcertextra",
         "http.sslkey", "http.sslcainfo", "http.sslcerttype",
@@ -184,7 +188,7 @@ int main() {
         "remote.skipdefaultupdate", "remote.skipfetchall", "remote.origin.skipfetch",
         "user.email", "user.name", "remote.origin.fetch", "remote.origin.name", "url.insteadof", "url.pushinsteadof",
         "pull.custom.twohead", "pull.custom.octopus", "receive.custom.procreceiverefs", "receive.advertisepushoptions", "branch.remote", "branch.pushremote", "branch.mergeoptions", "remote.origin.pushdefault",
-        "branch.main.merge", "core.bare", "tar.command", "tar.remote", "uploadarchive.custom.allowunreachable",
+        "core.bare", "tar.command", "tar.remote", "uploadarchive.custom.allowunreachable",
         "gc.custom.recentobjectshook", "gc.pruneexpire", "core.editorx", "core.custom.attributesfile", "filter.clean", "diff.command", "merge.driver", "merge.recursive", "merge.custom.default", "merge.custom.renormalize", "core.x.hookspath",
         "include.x.path", "includeif.path", "hook.command", "remote.uploadpack", "merge.payload.tool", "diff.payload.guitool",
         "difftool.custom.guidefault", "mergetool.custom.guidefault",

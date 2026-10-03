@@ -5361,6 +5361,37 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((one / 'selected-remote-ran').exists())
         self.assertFalse((one / 'selected-strategy-ran').exists())
 
+    def test_exec_reports_enabling_preconfigured_push_transport(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'remote.dormant.url', 'ext::touch push-helper-ran')
+        self.git(one, 'config', 'remote.pushDefault', 'dormant')
+        self.git(one, 'config', 'push.default', 'nothing')
+        p = self.exec_sh(wid, 'git config push.default current && '
+                         "git config remote.dormant.push 'HEAD:refs/heads/main' && "
+                         'git config remote.dormant.mirror true; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local push.default: nothing -> current', p.stderr)
+        self.assertIn(b'local remote.dormant.push: (unset) -> HEAD:refs/heads/main', p.stderr)
+        self.assertIn(b'local remote.dormant.mirror: (unset) -> true', p.stderr)
+        self.assertNotIn(b'local remote.dormant.url:', p.stderr)
+        self.assertNotIn(b'local remote.pushdefault:', p.stderr)
+        # Upstream setup gates apply to simple/upstream, unlike push.default=current.
+        branch = self.git(one, 'branch', '--show-current').stdout.decode().strip()
+        self.git(one, 'config', '--unset', 'remote.dormant.push')
+        self.git(one, 'config', '--unset', 'remote.dormant.mirror')
+        self.git(one, 'config', 'push.default', 'upstream')
+        self.git(one, 'config', 'branch.' + branch + '.remote', 'dormant')
+        p = self.exec_sh(wid, 'git config push.autoSetupRemote true', '--no-sandbox')
+        self.assertIn(b'local push.autosetupremote: (unset) -> true', p.stderr)
+        self.assertNotIn(b'local remote.dormant.url:', p.stderr)
+        self.git(one, 'config', '--unset', 'push.autoSetupRemote')
+        p = self.exec_sh(wid, 'git config ' + shlex.quote('branch.' + branch + '.merge') +
+                         ' refs/heads/main', '--no-sandbox')
+        self.assertIn(b'local branch.' + branch.encode() + b'.merge: (unset) -> refs/heads/main', p.stderr)
+        self.assertNotIn(b'local remote.dormant.url:', p.stderr)
+        self.assertNotIn(b'local remote.pushdefault:', p.stderr)
+        self.assertFalse((one / 'push-helper-ran').exists())
+
     def test_exec_reports_proxy_password_helper_activation(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
