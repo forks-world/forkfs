@@ -5361,6 +5361,33 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((one / 'selected-remote-ran').exists())
         self.assertFalse((one / 'selected-strategy-ran').exists())
 
+    def test_exec_reports_lfs_transfer_and_autocorrect_selectors(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        commands = one / 'command-bin'
+        commands.mkdir()
+        transfer = commands / 'transfer-agent'
+        corrected = commands / 'git-customcommand'
+        for program in (transfer, corrected):
+            program.write_text('#!/bin/sh\ntouch selected-command-ran\n')
+            program.chmod(0o755)
+        self.env['PATH'] = str(commands) + os.pathsep + self.env['PATH']
+        self.git(one, 'config', 'lfs.customtransfer.payload.path', str(transfer))
+        self.git(one, 'config', 'lfs.basictransfersonly', 'true')
+        values = {'lfs.standalonetransferagent': 'payload',
+                  'lfs.https://example.invalid/repo.standalonetransferagent': 'payload',
+                  'help.autocorrect': 'immediate',
+                  'lfs.customtransfer.payload.args': '--mode=custom',
+                  'lfs.customtransfer.payload.direction': 'both'}
+        p = self.exec_sh(wid, ' && '.join('git config ' + shlex.quote(key) + ' ' + shlex.quote(value)
+                                        for key, value in values.items()) +
+                         ' && git config lfs.basictransfersonly false; exit 7', '--no-sandbox', code=7)
+        for key, value in values.items():
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> ' + value.encode(), p.stderr)
+        self.assertIn(b'local lfs.basictransfersonly: true -> false', p.stderr)
+        self.assertNotIn(b'local lfs.customtransfer.payload.path:', p.stderr)
+        self.assertFalse((one / 'selected-command-ran').exists())
+
     def test_exec_reports_selecting_preconfigured_help_commands(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

@@ -136,6 +136,7 @@ static const GuardKey kGuardKeys[] = {
     {"pager", NULL, 0, false},            {"interactive", "difffilter", 0, false},
     {"imap", "tunnel", 0, false},
     {"instaweb", "httpd", 0, false},      {"guitool", "cmd", 1, false},
+    {"help", "autocorrect", 0, false},
     {"help", "browser", 0, false},        {"help", "format", 0, false},
     {"instaweb", "browser", 0, false},     {"man", "viewer", 0, false},
     {"web", "browser", 0, false},         {"browser", "cmd", 1, false},
@@ -143,6 +144,8 @@ static const GuardKey kGuardKeys[] = {
     {"man", "path", 1, false},            {"init", "templatedir", 0, false},
     {"hook", "command", 1, false},        {"trailer", "command", 1, false},
     {"trailer", "cmd", 1, false},         {"protocol", "allow", 2, false},
+    {"lfs", "basictransfersonly", 0, false},
+    {"lfs", "standalonetransferagent", 2, false},
     {"lfs", "path", 1, false},            {"lfs", "clean", 1, false},
     {"lfs", "smudge", 1, false},
 };
@@ -164,6 +167,12 @@ static inline bool guard_key_runs_command(const char *key, const char *value) {
     size_t section = (size_t)(first - key);
     bool has_sub = last != first;
     const char *name = last + 1;
+    // Custom transfer arguments and direction select behavior of an existing adapter.
+    // Restrict these to lfs.customtransfer.<name>; URL-scoped LFS keys are different.
+    if (has_sub && section == 3 && !strncasecmp(key, "lfs", section) &&
+        last - first > 16 && !strncasecmp(first + 1, "customtransfer.", 15) &&
+        !memchr(first + 16, '.', (size_t)(last - first - 16)) &&
+        (!strcasecmp(name, "args") || !strcasecmp(name, "direction"))) return true;
     // Git's task names are case-sensitive subsections; unrelated maintenance tasks do
     // not select these hook- or remote-running operations.
     if (has_sub && section == 11 && !strncasecmp(key, "maintenance", section)) {

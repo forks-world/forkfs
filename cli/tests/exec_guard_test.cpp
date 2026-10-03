@@ -86,6 +86,9 @@ int main() {
         "sendemail.annotate", "sendemail.work.annotate", "sendemail.suppresscc", "sendemail.work.suppresscc",
         "sendemail.validate", "sendemail.work.validate", "sendemail.useimaponly", "sendemail.work.useimaponly",
         "sendemail.imapsentfolder", "sendemail.work.imapsentfolder", "sendemail.identity", "sendemail.tocmd", "sendemail.work.sendmailcmd", "sendemail.smtpserver", "include.path",
+        "lfs.customtransfer.payload.args", "lfs.customtransfer.payload.direction",
+        "LFS.CUSTOMTRANSFER.Agent.ARGS", "lfs.Customtransfer.payload.direction",
+        "lfs.basictransfersonly", "help.autocorrect", "lfs.standalonetransferagent", "lfs.https://example.invalid/repo.standalonetransferagent",
         "help.browser", "help.format", "instaweb.browser", "man.viewer",
         "includeif.gitdir:/x/.path", "pager.log", "interactive.difffilter", "web.browser",
         "imap.tunnel", "instaweb.httpd", "guitool.test.cmd", "browser.ff.cmd", "man.x.cmd", "init.templatedir", "hook.lint.command",
@@ -154,6 +157,12 @@ int main() {
 
     // Keys that legitimately change during agent work, or only name things.
     const char *quiet[] = {
+        "lfs.args", "lfs.direction", "lfs.customtransfer.args", "lfs.customtransfer..args",
+        "lfs.customtransferextra.payload.args", "lfs.customtransfer.team.agent.direction",
+        "lfs.customtransfer.Team.Agent.args",
+        "lfs.https://example.invalid/repo.args", "lfs.payload.direction",
+        "lfs.custom.basictransfersonly", "help.custom.autocorrect", "help.autocorrectextra", "lfs.standalonetransferagentextra",
+        "lfs.https://example.invalid/repo.standalonetransferagentextra",
         "receive.custom.autogc", "maintenance.custom.auto", "maintenance.custom.strategy", "maintenance.custom.repo",
         "gc.custom.auto", "gc.custom.autopacklimit", "maintenance.GC.enabled", "maintenance.Prefetch.enabled",
         "maintenance.GC.schedule", "maintenance.gc.scheduleextra", "fetch.custom.bundleuri", "maintenance.commit-graph.enabled", "maintenance.repack.enabled",
