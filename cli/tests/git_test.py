@@ -5361,6 +5361,29 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((one / 'selected-remote-ran').exists())
         self.assertFalse((one / 'selected-strategy-ran').exists())
 
+    def test_exec_reports_checkout_guess_and_rebase_hook_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        hooks = one / '.world-git/repo.git/hooks'
+        hooks.mkdir(exist_ok=True)
+        for name in ('post-checkout', 'post-rewrite'):
+            hook = hooks / name
+            hook.write_text('#!/bin/sh\ntouch retained-hook-ran\n')
+            hook.chmod(0o755)
+        self.git(one, 'config', 'checkout.guess', 'false')
+        self.git(one, 'config', 'pull.rebase', 'false')
+        branch = self.git(one, 'branch', '--show-current').stdout.decode().strip()
+        self.git(one, 'config', 'branch.' + branch + '.rebase', 'false')
+        p = self.exec_sh(wid, 'git config checkout.guess true && git config checkout.defaultRemote origin && '
+                         'git config pull.rebase true && '
+                         'git config ' + shlex.quote('branch.' + branch + '.rebase') + ' true; exit 7',
+                         '--no-sandbox', code=7)
+        for key in (b'checkout.guess', b'pull.rebase', b'branch.' + branch.encode() + b'.rebase'):
+            self.assertIn(b'local ' + key + b': false -> true', p.stderr)
+        self.assertIn(b'local checkout.defaultremote: (unset) -> origin', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertFalse((one / 'retained-hook-ran').exists())
+
     def test_exec_reports_pull_fastforward_and_lfs_endpoint_activation(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
