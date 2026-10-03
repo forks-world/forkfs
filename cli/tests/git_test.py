@@ -5361,6 +5361,24 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((one / 'selected-remote-ran').exists())
         self.assertFalse((one / 'selected-strategy-ran').exists())
 
+    def test_exec_reports_interactive_and_proactive_credential_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'core.askPass', 'touch askpass-command-ran')
+        self.git(one, 'config', 'credential.helper', '!touch credential-command-ran')
+        self.git(one, 'config', 'credential.interactive', 'false')
+        p = self.exec_sh(wid, 'git config credential.interactive true && '
+                         'git config http.proactiveAuth basic && '
+                         'git config http.https://example.invalid/repo.proactiveAuth basic; exit 7',
+                         '--no-sandbox', code=7)
+        self.assertIn(b'local credential.interactive: false -> true', p.stderr)
+        self.assertIn(b'local http.proactiveauth: (unset) -> basic', p.stderr)
+        self.assertIn(b'local http.https://example.invalid/repo.proactiveauth: (unset) -> basic', p.stderr)
+        self.assertNotIn(b'local core.askpass:', p.stderr)
+        self.assertNotIn(b'local credential.helper:', p.stderr)
+        self.assertFalse((one / 'askpass-command-ran').exists())
+        self.assertFalse((one / 'credential-command-ran').exists())
+
     def test_exec_reports_enabling_builtin_submodule_update(self):
         self.submodule_fixture()
         self.world('init', str(self.source))

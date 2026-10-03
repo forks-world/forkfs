@@ -58,6 +58,8 @@ int main() {
 
     // Keys that make Git run a command.
     const char *runs[] = {
+        "http.proactiveauth", "http.https://example.invalid/repo.proactiveauth", "HTTP.PROACTIVEAUTH",
+        "credential.interactive", "CREDENTIAL.INTERACTIVE",
         "push.autosetupremote", "branch.main.merge", "branch.team.topic.merge",
         "push.default", "remote.origin.push", "remote.origin.mirror", "remote.team.origin.push",
         "http.proxy", "http.https://example.invalid/repo.proxy", "remote.origin.proxy", "remote.team.origin.proxy",
@@ -170,6 +172,8 @@ int main() {
 
     // Keys that legitimately change during agent work, or only name things.
     const char *quiet[] = {
+        "http.proactiveauthextra", "http.https://example.invalid/repo.proactiveauthextra",
+        "credential.https://example.invalid.interactive", "credential.interactiveextra",
         "push.custom.autosetupremote", "branch.merge", "branch.main.mergeextra",
         "push.custom.default", "remote.push", "remote.mirror", "remote.origin.pushextra", "remote.origin.mirrorextra",
         "remote.proxy", "http.proxyextra", "remote.origin.proxyextra",

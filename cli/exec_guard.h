@@ -79,6 +79,8 @@ static const GuardKey kGuardKeys[] = {
     {"http", "sslcertpasswordprotected", 2, false},
     {"http", "proxysslcertpasswordprotected", 2, false},
     {"user", "signingkey", 0, false},
+    {"credential", "interactive", 0, false},
+    {"http", "proactiveauth", 2, false},
     {"core", "attributesfile", 0, false},
     {"tar", "remote", 1, false},       {"uploadarchive", "allowunreachable", 0, false},
     {"core", "worktree", 0, false},       {"tar", "command", 1, false},
