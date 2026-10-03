@@ -408,6 +408,7 @@ last, which makes the denies absolute:
 | | |
 |---|---|
 | **denied, write** | the whole store (metadata, trash and every snapshot), and every other World's root |
+| | this World's Git hooks: `.world-git/repo.git/hooks`, every submodule repository's `hooks` (also one cloned during the exec), any repository's `core.hooksPath` outside the tree, and the entries that locate them (`.git`, `commondir`, the directories on the way) |
 | **denied, read** | `<store>/snapshots` |
 | allowed, write | this World's root |
 | | `$TMPDIR`, `/private/tmp`, `/private/var/tmp` |
@@ -424,6 +425,30 @@ Two consequences worth knowing: a `world fs` command that *writes* metadata (`fo
 read-only ones like `list` work; and `sandbox-exec` is deprecated on macOS, so the profile is first
 tried on `/usr/bin/true`. If that probe fails, `world exec` falls back to running without a sandbox
 and says so loudly, unless `--require-sandbox` was given.
+
+**Git hooks and settings.** A Git World's administration (`.world-git/repo.git`) is inside the
+World, so a command could plant a hook or a setting there that runs later *outside any sandbox*,
+when you run Git in the World yourself (Codex's sandbox has the same gap:
+[openai/codex#49303](https://github.com/openai/codex/issues/49303)). The sandbox therefore denies
+writes to the World's hooks directories (row above; on Linux, read-only bind mounts of the ones
+that exist when the exec starts). Git's configuration stays writable, because `git remote add`,
+`git push -u` and `git config` need it; instead, after every exec -- sandboxed or `--no-sandbox`,
+whatever its exit status, which is kept -- `world exec` compares the effective configuration
+(system, global, local, worktree, inherited command scope, includes) of the World and each submodule against a list of
+settings that make Git run a command (`core.hooksPath`, `core.fsmonitor`, `core.sshCommand`,
+filters, credential helpers, `!` aliases, ...) and the hooks present, and prints a line per change:
+
+```
+world: WARNING: exec changed a Git setting that runs commands: local core.fsmonitor: (unset) -> touch /tmp/x
+world: WARNING: exec added a Git hook: .world-git/repo.git/hooks/pre-commit
+```
+
+An in-tree `core.hooksPath` such as `.husky` is project content, shown by `git status`, and is
+not denied. Tools that install hooks (`git lfs install`, `pre-commit install`) fail inside a
+sandboxed exec; run them outside. Remember the sandbox is a fence around the store and other
+Worlds, not a jail: `~/.gitconfig` is writable from it on macOS, which is why the report covers
+effective configuration. Details and the full key list:
+[Running agents with `world exec`](docs/GIT_INTEGRATION.md#running-agents-with-world-exec).
 
 ## Measured cost (macOS 27.0, M1 Mac mini, best of 3)
 
@@ -498,6 +523,7 @@ core/src/events.h                     candidate collection interface + the path 
 core/src/platform_darwin_events.cpp   the FSEvents replay: flags, journal-age check, dedicated queue
 core/src/platform_linux.cpp           Linux FICLONE, sparse-copy fallback, metadata preservation
 cli/linux_sandbox.cpp                Linux namespace and seccomp execution policy
+cli/exec_guard.h                      `world exec`'s Git guard: seatbelt regex escaping, watched keys
 core/src/platform_posix.cpp           parallel tree walk, manifest, free space, recursive delete
 core/src/platform_darwin.cpp          clonefile, per-file fallback, chflags protect/unprotect, FSEvents cursor,
                                       getattrlistbulk enumeration + the EF_NO_XATTRS verdict

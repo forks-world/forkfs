@@ -64,7 +64,7 @@ int socket_filter() {
 }
 } // namespace
 
-int linux_sandbox_exec(const char *root, const char *store, char *const command[]) {
+int linux_sandbox_exec(const char *root, const char *store, char *const mounts[], char *const command[]) {
     // The caller may have inherited writable files/directory handles. Bubblewrap preserves
     // arbitrary descriptors: seal all of them before creating the one policy fd it needs.
     // Keep only the caller-authorized stdin/stdout/stderr. Unsupported kernels fail closed.
@@ -92,13 +92,16 @@ int linux_sandbox_exec(const char *root, const char *store, char *const command[
     // single file after replacing /run so DNS still works without exposing its sockets.
     char resolver[PATH_MAX];
     bool have_resolver = ::realpath("/etc/resolv.conf", resolver) != nullptr;
-    size_t n = 0;
+    size_t n = 0, extra = 0;
     while (command[n]) ++n;
+    while (mounts && mounts[extra]) ++extra;
     constexpr size_t prefix = sizeof policy / sizeof policy[0];
-    char **args = (char **)::calloc(prefix + n + 5, sizeof(char *));
+    char **args = (char **)::calloc(prefix + extra + n + 5, sizeof(char *));
     if (!args) { ::close(filter); return -ENOMEM; }
     for (size_t i = 0; i < prefix; ++i) args[i] = (char *)policy[i];
     size_t at = prefix;
+    // After the World's own writable bind, which they refine (mounts apply in order).
+    for (size_t i = 0; i < extra; ++i) args[at++] = mounts[i];
     if (have_resolver) {
         args[at++] = (char *)"--ro-bind";
         args[at++] = resolver;
@@ -106,6 +109,34 @@ int linux_sandbox_exec(const char *root, const char *store, char *const command[
     }
     args[at++] = (char *)"--";
     for (size_t i = 0; i < n; ++i) args[at++] = command[i];
+    ::execv(args[0], args);
+    int e = errno;
+    ::free(args);
+    ::close(filter);
+    return -e;
+}
+
+int linux_sandbox_config_exec(char *const command[]) {
+    if (::syscall(SYS_close_range, 3u, ~0u, CLOSE_RANGE_CLOEXEC)) return -errno;
+    int filter = socket_filter();
+    if (filter < 0) return filter;
+    char fd[32];
+    ::snprintf(fd, sizeof fd, "%d", filter);
+    const char *policy[] = {
+        "/usr/bin/bwrap", "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+        "--unshare-net", "--unshare-cgroup-try", "--die-with-parent", "--new-session",
+        "--disable-userns", "--assert-userns-disabled", "--cap-drop", "ALL",
+        "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+        "--unsetenv", "DBUS_SESSION_BUS_ADDRESS", "--unsetenv", "SSH_AUTH_SOCK",
+        "--seccomp", fd, "--",
+    };
+    size_t n = 0;
+    while (command[n]) ++n;
+    const size_t prefix = sizeof policy / sizeof policy[0];
+    char **args = (char **)::calloc(prefix + n + 1, sizeof(char *));
+    if (!args) { ::close(filter); return -ENOMEM; }
+    for (size_t i = 0; i < prefix; ++i) args[i] = (char *)policy[i];
+    for (size_t i = 0; i < n; ++i) args[prefix + i] = command[i];
     ::execv(args[0], args);
     int e = errno;
     ::free(args);

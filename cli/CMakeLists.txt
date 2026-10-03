@@ -13,6 +13,11 @@ if(APPLE AND WFS_FSKIT)
     target_link_libraries(world PRIVATE "-framework FSKit" "-framework Foundation")
 endif()
 
+# Pure helpers of `world exec`'s Git guard (seatbelt regex escaping, command-running keys).
+add_executable(exec_guard_test tests/exec_guard_test.cpp)
+target_compile_options(exec_guard_test PRIVATE -Wall)
+add_test(NAME cli_exec_guard_test COMMAND exec_guard_test)
+
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
     add_test(NAME cli_json_test
@@ -27,14 +32,23 @@ endif()
 
 # Git integration is optional for plain directory worlds; its tests require relative worktrees.
 find_package(Git 2.48 QUIET)
+# Pin configuration introspection at build time. Runtime PATH can belong to the command.
+set(WFS_CONFIG_GIT "")
+if(GIT_FOUND AND IS_ABSOLUTE "${GIT_EXECUTABLE}")
+    set(WFS_CONFIG_GIT "${GIT_EXECUTABLE}")
+endif()
+string(REPLACE "\\" "\\\\" WFS_CONFIG_GIT "${WFS_CONFIG_GIT}")
+string(REPLACE "\"" "\\\"" WFS_CONFIG_GIT "${WFS_CONFIG_GIT}")
+configure_file(config_git.h.in config_git.h @ONLY)
+target_include_directories(world PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 if(Python3_Interpreter_FOUND AND GIT_FOUND)
     set(CLI_GIT_TEST_SCRATCH "${CMAKE_CURRENT_BINARY_DIR}/scratch")
     file(MAKE_DIRECTORY "${CLI_GIT_TEST_SCRATCH}")
     add_test(NAME cli_git_test
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/git_test.py $<TARGET_FILE:world>)
-    # Submodule and agent-worktree coverage import several repositories per test; the suite runs
-    # ~15 minutes on CI macOS and up to ~23 locally.
+    # Submodule, agent-worktree, nested-repository, shallow and exec-guard coverage import several
+    # repositories per test; the suite runs ~20 minutes on CI macOS and up to ~28 locally.
     set_tests_properties(cli_git_test PROPERTIES
-        TIMEOUT 1800
+        TIMEOUT 2700
         ENVIRONMENT "TMPDIR=${CLI_GIT_TEST_SCRATCH}/")
 endif()

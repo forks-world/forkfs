@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import shlex
 import unittest
 
 WORLD = str(Path(sys.argv.pop(1)).resolve())
@@ -4473,6 +4474,2238 @@ class GitWorldTest(unittest.TestCase):
         self.run_cmd(WORLD, 'exec', wid, '--require-sandbox', '--', 'git', 'commit', '-m', 'sandbox')
         self.assertEqual(self.git(self.source, 'rev-parse', 'HEAD').stdout.strip(), self.base)
 
+    # ---- world exec: the World's Git hooks and command-running settings ----
+
+    def exec_sh(self, wid, script, *opts, code=0):
+        return self.run_cmd(WORLD, 'exec', wid, *opts, '--', '/bin/sh', '-c', script, code=code)
+
+    def assert_denied(self, wid, script):
+        """`script` fails inside the sandbox (EPERM under seatbelt, EROFS/EBUSY under bwrap)."""
+        p = subprocess.run((WORLD, 'exec', wid, '--require-sandbox', '--', '/bin/sh', '-c', script),
+                           env=self.env, capture_output=True, timeout=60)
+        self.assertNotEqual(p.returncode, 0, (script, p.stdout, p.stderr))
+        return p
+
+    def test_exec_sandbox_denies_hooks_but_not_configuration(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        repo = one / '.world-git/repo.git'
+        hooks = repo / 'hooks'
+        hooks.mkdir(exist_ok=True)
+        (hooks / 'post-commit').write_text('#!/bin/sh\necho kept-hook-ran\n')
+        (hooks / 'post-commit').chmod(0o755)
+        dot_git = (one / '.git').read_bytes()
+        self.assert_denied(wid, 'echo evil > .world-git/repo.git/hooks/pre-commit')
+        self.assert_denied(wid, 'echo evil >> .world-git/repo.git/hooks/post-commit')
+        self.assert_denied(wid, 'mkdir hooks2 && mv .world-git/repo.git/hooks hooks-old')
+        self.assert_denied(wid, 'rm -rf .world-git/repo.git/hooks')
+        # Nor can the command swap the repository, or where the World's `.git` points.
+        self.assert_denied(wid, 'mv .world-git/repo.git .world-git/other')
+        self.assert_denied(wid, 'mv .world-git/repo.git/worktrees/active .world-git/repo.git/worktrees/x')
+        self.assert_denied(wid, 'echo "gitdir: /tmp" > .git')
+        self.assert_denied(wid, 'echo /tmp > .world-git/repo.git/worktrees/active/commondir')
+        self.assertFalse((hooks / 'pre-commit').exists())
+        self.assertEqual((hooks / 'post-commit').read_text(), '#!/bin/sh\necho kept-hook-ran\n')
+        self.assertEqual((one / '.git').read_bytes(), dot_git)
+        # Everyday work, including Git writing its own configuration, is unaffected, and the
+        # World's hooks still run inside the exec.
+        p = self.exec_sh(wid, 'echo work > file && git add file && git commit -qm work && '
+                              'git config user.email agent@example.com && '
+                              'git config branch.main.description x', '--require-sandbox')
+        self.assertIn(b'kept-hook-ran', p.stdout + p.stderr)
+        self.assertNotIn(b'WARNING', p.stderr)
+        self.assertEqual(self.git(one, 'config', 'user.email').stdout.strip(), b'agent@example.com')
+        self.assertEqual(self.git(one, 'log', '-1', '--format=%s').stdout.strip(), b'work')
+        # A setting that makes Git run a command is written, then reported, with the exit code kept.
+        p = self.exec_sh(wid, "git config core.fsmonitor 'touch /tmp/x' && exit 7", '--require-sandbox', code=7)
+        self.assertIn(b"world: WARNING: exec changed a Git setting that runs commands: "
+                      b"local core.fsmonitor: (unset) -> touch /tmp/x\n", p.stderr)
+        p = self.exec_sh(wid, "git config --unset core.fsmonitor && git config alias.x '!sh -c evil' && "
+                              "git config alias.co checkout", '--require-sandbox')
+        self.assertIn(b'local core.fsmonitor: touch /tmp/x -> (unset)\n', p.stderr)
+        self.assertIn(b'local alias.x: (unset) -> !sh -c evil\n', p.stderr)
+        self.assertIn(b'local alias.co: (unset) -> checkout', p.stderr)
+        # A core.hooksPath outside the tree is guarded like the hooks directory; one inside the
+        # tree (husky's .husky) stays writable, but its changes are still reported.
+        shared = self.root / 'shared-hooks'
+        shared.mkdir()
+        self.git(one, 'config', 'core.hooksPath', str(shared))
+        self.assert_denied(wid, 'echo evil > ' + shlex.quote(str(shared / 'pre-commit')))
+        self.git(one, 'config', 'core.hooksPath', '.husky')
+        p = self.exec_sh(wid, 'mkdir -p .husky && echo lint > .husky/pre-commit', '--require-sandbox')
+        self.assertIn(b'exec added a Git hook: .husky/pre-commit', p.stderr)
+        self.git(one, 'config', '--unset', 'core.hooksPath')
+        # A World path with regex metacharacters still matches only itself.
+        odd, oid = self.fork('w.i+r(d)[x]{2}$^|?*')
+        (odd / '.world-git/repo.git/hooks').mkdir(exist_ok=True)
+        self.assert_denied(oid, 'echo evil > .world-git/repo.git/hooks/pre-commit')
+        if sys.platform != 'darwin':
+            return  # bwrap binds paths, and everything outside the World is read-only anyway
+        lookalike = self.root / 'wXiirdxx/.world-git/repo.git/worktrees/active/modules/m/hooks'
+        lookalike.mkdir(parents=True)
+        self.exec_sh(oid, 'echo fine > ' + shlex.quote(str(lookalike / 'pre-commit')), '--require-sandbox')
+
+    def test_exec_reports_hooks_and_settings_without_sandbox(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        p = self.exec_sh(wid, 'mkdir -p .world-git/repo.git/hooks && '
+                              'printf "#!/bin/sh\\n" > .world-git/repo.git/hooks/pre-commit && '
+                              'git config credential.helper "!f() { cat ~/.token; }; f" && '
+                              'git config --add credential.helper store && exit 3', '--no-sandbox', code=3)
+        self.assertIn(b'world: WARNING: exec added a Git hook: .world-git/repo.git/hooks/pre-commit\n', p.stderr)
+        self.assertIn(b'world: WARNING: exec changed a Git setting that runs commands: local credential.helper: '
+                      b'(unset) -> !f() { cat ~/.token; }; f, store\n', p.stderr)
+        p = self.exec_sh(wid, 'echo "echo changed" >> .world-git/repo.git/hooks/pre-commit', '--no-sandbox')
+        self.assertIn(b'world: WARNING: exec changed a Git hook: .world-git/repo.git/hooks/pre-commit\n', p.stderr)
+        p = self.exec_sh(wid, 'rm .world-git/repo.git/hooks/pre-commit && touch .world-git/repo.git/hooks/x.sample',
+                         '--no-sandbox')
+        self.assertEqual(p.stderr.count(b'WARNING'), 1, p.stderr)
+        self.assertIn(b'world: WARNING: exec removed a Git hook: .world-git/repo.git/hooks/pre-commit\n', p.stderr)
+        # Effective configuration: a change to the global file the World includes is reported too.
+        glob = self.root / 'global-config'
+        glob.write_text('')
+        self.env['GIT_CONFIG_GLOBAL'] = str(glob)
+        p = self.exec_sh(wid, 'git config --global core.pager "less; evil"', '--no-sandbox')
+        self.assertIn(b'global core.pager: (unset) -> less; evil\n', p.stderr)
+        # A rewritten `.git` is reported: Git would find another repository and its hooks.
+        p = self.exec_sh(wid, 'cp .git .git.orig && echo "gitdir: /tmp/elsewhere" > .git', '--no-sandbox')
+        self.assertIn(b'world: WARNING: exec changed where Git finds a repository: .git '
+                      b'(a file naming its repository -> a file naming another repository)\n', p.stderr)
+        (one / '.git.orig').rename(one / '.git')
+        # So is replacing it with another entry type: a new repository (whose settings the
+        # World's own administration does not show), a symlink, or nothing at all.
+        p = self.exec_sh(wid, "mv .git .git.saved && git init -q . && git config core.fsmonitor 'echo bad'",
+                         '--no-sandbox')
+        self.assertIn(b'world: WARNING: exec changed where Git finds a repository: .git '
+                      b'(a file naming its repository -> a directory)\n', p.stderr)
+        shutil.rmtree(one / '.git')
+        p = self.exec_sh(wid, 'ln -s .git.saved .git', '--no-sandbox')
+        self.assertIn(b'world: WARNING: exec changed where Git finds a repository: .git (missing -> a symlink)\n',
+                      p.stderr)
+        p = self.exec_sh(wid, 'rm .git && mv .git.saved .git', '--no-sandbox')
+        self.assertIn(b'world: WARNING: exec changed where Git finds a repository: .git '
+                      b'(a symlink -> a file naming its repository)\n', p.stderr)
+        p = self.exec_sh(wid, 'mv .git .git.saved', '--no-sandbox')
+        self.assertIn(b'world: WARNING: exec removed .git, which told Git where a repository is\n', p.stderr)
+        (one / '.git.saved').rename(one / '.git')
+
+    def test_exec_warns_about_preexisting_redirected_pointer_coverage(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        alternate = self.root / 'alternate-repository'
+        self.git(self.root, 'init', str(alternate))
+        dotgit = one / '.git'
+        original = dotgit.read_bytes()
+        dotgit.write_text('gitdir: ' + str(alternate / '.git') + '\n')
+        redirected = dotgit.read_bytes()
+        p = self.exec_sh(wid, "git config core.sshCommand 'touch redirected-helper-ran'; exit 7",
+                         '--no-sandbox', code=7)
+        self.assertIn(b'WARNING: Git guard coverage is incomplete before exec:', p.stderr)
+        self.assertIn(b'WARNING: Git guard coverage is incomplete after exec:', p.stderr)
+        self.assertIn(b'target Git hooks and settings were not fully inspected', p.stderr)
+        self.assertEqual(dotgit.read_bytes(), redirected)
+        self.assertEqual(self.git(alternate, 'config', 'core.sshCommand').stdout.strip(),
+                         b'touch redirected-helper-ran')
+        self.assertNotIn(b'local core.sshcommand:', p.stderr)
+        self.assertFalse((one / 'redirected-helper-ran').exists())
+        # Coverage warnings must not discard owned snapshots or the repair report.
+        p = self.exec_sh(wid, 'printf %s ' + shlex.quote(original.decode()) + ' > .git; exit 7',
+                         '--no-sandbox', code=7)
+        self.assertIn(b'WARNING: Git guard coverage is incomplete before exec:', p.stderr)
+        self.assertNotIn(b'Git guard coverage is incomplete after exec:', p.stderr)
+        self.assertIn(b'exec changed where Git finds a repository: .git ', p.stderr)
+        self.assertEqual(dotgit.read_bytes(), original)
+        # Missing/foreign mandatory commondir must warn before metadata queries,
+        # including when those queries cannot produce an initial snapshot.
+        commondir = one / '.world-git/repo.git/worktrees/active/commondir'
+        original_common = commondir.read_bytes()
+        for contents in (str(alternate / '.git').encode() + b'\n', None):
+            with self.subTest(commondir=contents):
+                if contents is None:
+                    commondir.unlink()
+                else:
+                    commondir.write_bytes(contents)
+                p = self.exec_sh(wid, 'touch command-completed; exit 7', '--no-sandbox', code=7)
+                self.assertIn(b'WARNING: Git guard coverage is incomplete before exec:', p.stderr)
+                self.assertTrue((one / 'command-completed').exists())
+                (one / 'command-completed').unlink()
+                commondir.write_bytes(original_common)
+
+    def test_exec_refuses_preexisting_redirected_git_pointers(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        alternate = self.root / 'alternate.git'
+        self.git(self.root, 'init', '--bare', str(alternate))
+        dotgit = one / '.git'
+        commondir = one / '.world-git/repo.git/worktrees/active/commondir'
+        for pointer, prefix in ((dotgit, b'gitdir: '), (commondir, b'')):
+            original = pointer.read_bytes()
+            saved = pointer.with_name(pointer.name + '.saved')
+            saved.write_bytes(original)
+            cases = ('redirected-file', 'directory', 'symlink', 'embedded-newline', 'nul', 'oversized')
+            for case in cases:
+                with self.subTest(pointer=pointer.name, case=case):
+                    pointer.unlink()
+                    if case == 'directory':
+                        pointer.mkdir()
+                    elif case == 'symlink':
+                        pointer.symlink_to(saved)
+                    elif case == 'redirected-file':
+                        pointer.write_bytes(prefix + str(alternate).encode() + b'\n')
+                    elif case == 'embedded-newline':
+                        pointer.write_bytes(original.rstrip(b'\r\n') + b'\n/alternate\n')
+                    elif case == 'nul':
+                        pointer.write_bytes(original.rstrip(b'\r\n') + b'\0ignored\n')
+                    else:
+                        pointer.write_bytes(original.rstrip(b'\r\n') + b'x' * 8192)
+                    p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+                    self.assertIn(b'Git repository pointer is missing, redirected or unsupported', p.stderr)
+                    self.assertFalse((one / 'should-not-run').exists())
+                    if pointer.is_dir() and not pointer.is_symlink():
+                        pointer.rmdir()
+                    else:
+                        pointer.unlink()
+                    pointer.write_bytes(original)
+            saved.unlink()
+        # Trailing CR/LF and a canonical absolute target are valid Git pointer syntax.
+        dotgit.write_text('gitdir: ' + str(one / '.world-git/repo.git/worktrees/active') + '\r\n')
+        self.exec_sh(wid, ':', '--require-sandbox')
+
+    def test_exec_refuses_hardlinked_git_pointers_but_allows_observational_repair(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        pointers = (one / '.git', one / '.world-git/repo.git/worktrees/active/commondir')
+        for pointer in pointers:
+            with self.subTest(pointer=pointer.name):
+                original = pointer.read_bytes()
+                alias = one / 'pointer-alias'
+                os.link(pointer, alias)
+                p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+                self.assertIn(b'Git repository pointer is missing, redirected or unsupported', p.stderr)
+                self.assertFalse((one / 'should-not-run').exists())
+                self.assertEqual(pointer.read_bytes(), original)
+                # A valid but changed pointer can still be inspected and repaired via an
+                # alias with --no-sandbox; observational parsing must not reject its links.
+                alias.write_bytes(original + b'\r\n')
+                script = 'printf %s ' + shlex.quote(original.decode()) + ' > pointer-alias; exit 7'
+                p = self.exec_sh(wid, script, '--no-sandbox', code=7)
+                self.assertIn(b'exec changed where Git finds a repository: ' +
+                              str(pointer.relative_to(one)).encode(), p.stderr)
+                self.assertEqual(pointer.read_bytes(), original)
+                alias.unlink()
+
+    def test_exec_reports_redirected_worktree_hooks_and_archive_command(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'extensions.worktreeConfig', 'true')
+        self.git(one, 'config', '--worktree', 'core.bare', 'false')
+        self.git(one, 'config', 'core.hooksPath', '.husky')
+        hidden = one / '.world-git/hidden'
+        hidden.mkdir()
+        script = ('git config --worktree core.worktree ' + shlex.quote(str(hidden)) +
+                  ' && mkdir -p .world-git/hidden/.husky && '
+                  'echo evil > .world-git/hidden/.husky/pre-commit && exit 7')
+        p = self.exec_sh(wid, script, '--no-sandbox', code=7)
+        self.assertEqual(self.git(one, 'rev-parse', '--show-toplevel').stdout.strip(), str(hidden).encode())
+        self.assertIn(b'worktree core.worktree:', p.stderr)
+        self.assertIn(b'exec added a Git hook: .world-git/hidden/.husky/pre-commit', p.stderr)
+        self.assertNotIn(b'Git guard coverage is incomplete', p.stderr)  # optional checkout .git is absent
+        self.assert_denied(wid, 'echo changed > .world-git/hidden/.husky/pre-commit')
+        # Git ignores command-scope core.worktree for checkout setup; the guard must
+        # protect the Git-resolved checkout rather than the last config-list value.
+        external = self.root / 'external-checkout'
+        (external / '.husky').mkdir(parents=True)
+        self.env.update(GIT_CONFIG_COUNT='3', GIT_CONFIG_KEY_2='core.worktree',
+                        GIT_CONFIG_VALUE_2=str(external))
+        self.assertEqual(self.git(one, 'rev-parse', '--show-toplevel').stdout.strip(), str(hidden).encode())
+        self.assert_denied(wid, 'echo changed > .world-git/hidden/.husky/pre-commit')
+        p = self.exec_sh(wid, "git config tar.custom.command 'sh -c evil'", '--no-sandbox')
+        self.assertIn(b'local tar.custom.command: (unset) -> sh -c evil', p.stderr)
+        p = self.exec_sh(wid, "git config gc.recentObjectsHook 'sh -c evil'", '--no-sandbox')
+        self.assertIn(b'local gc.recentobjectshook: (unset) -> sh -c evil', p.stderr)
+
+    def test_exec_refuses_incomplete_git_administration_scan(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        modules = one / '.world-git/repo.git/worktrees/active/modules'
+        # Legal short components exceed the discovery depth without exceeding PATH_MAX.
+        deep = modules.joinpath(*(['a'] * 34))
+        deep.mkdir(parents=True)
+        (deep / 'HEAD').write_text('ref: refs/heads/main\n')
+        (deep / 'objects').mkdir()
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'incomplete Git administration scan', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+        p = self.exec_sh(wid, 'exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'incomplete Git administration scan', p.stderr)
+        shutil.rmtree(modules)
+        # macOS PATH_MAX equals the guard's buffer; Linux allows this longer path.
+        if sys.platform == 'darwin':
+            return
+        # A short-depth path can independently exceed the guard's fixed path buffers.
+        long_path = modules.joinpath(*(['b' * 180] * 6))
+        long_path.mkdir(parents=True)
+        p = self.exec_sh(wid, 'exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'incomplete Git administration scan', p.stderr)
+
+    def test_exec_refuses_hardlinked_guarded_hook(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        hook = one / '.world-git/repo.git/hooks/pre-commit'
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text('#!/bin/sh\nexit 0\n')
+        hook.chmod(0o755)
+        alias = one / 'writable-hook-alias'
+        os.link(hook, alias)
+        original = hook.read_bytes()
+        p = self.exec_sh(wid, 'touch should-not-run; echo changed > writable-hook-alias',
+                         '--require-sandbox', code=3)
+        self.assertIn(b'hardlinked Git hooks cannot be guarded', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+        self.assertEqual(hook.read_bytes(), original)
+        p = self.exec_sh(wid, 'echo changed > writable-hook-alias; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'hardlinked Git hooks cannot be guarded', p.stderr)
+        self.assertEqual(hook.read_bytes(), b'changed\n')
+
+    def test_exec_refuses_symlinked_guarded_hook(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        target = self.root / 'external-hook'
+        target.write_text('#!/bin/sh\nexit 0\n')
+        target.chmod(0o755)
+        hook = one / '.world-git/repo.git/hooks/pre-commit'
+        hook.parent.mkdir(exist_ok=True)
+        hook.symlink_to(target)
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'symlinked Git hooks cannot be guarded', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+        p = self.exec_sh(wid, 'exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'symlinked Git hooks cannot be guarded', p.stderr)
+
+        # The default hooks directory itself must not redirect outside its policy either.
+        shutil.rmtree(hook.parent)
+        external = self.root / 'external-hooks'
+        external.mkdir()
+        (external / 'pre-commit').write_text(target.read_text())
+        hook.parent.symlink_to(external, target_is_directory=True)
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'symlinked Git hooks cannot be guarded', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+
+    def test_exec_reports_nested_hook_support_files_without_changing_wrapper(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        roots = (one / '.world-git/repo.git/hooks', one / '.project-hooks')
+        self.git(one, 'config', 'core.hooksPath', '.project-hooks')
+        wrappers = []
+        for root in roots:
+            (root / 'lib/deep').mkdir(parents=True, exist_ok=True)
+            (root / 'helpers.sample').mkdir()
+            wrapper = root / 'pre-commit'
+            wrapper.write_text('#!/bin/sh\n. "$(dirname "$0")/lib/deep/helper"\n')
+            wrapper.chmod(0o755)
+            wrappers.append((wrapper, wrapper.read_bytes()))
+            (root / 'lib/deep/helper').write_text('echo before\n')
+            (root / 'lib/deep/remove-me').write_text('old\n')
+            (root / 'lib/deep/nested.sample').write_text('old\n')
+            (root / 'helpers.sample/helper').write_text('old\n')
+            (root / 'ignored.sample').write_text('old template\n')
+        commands = []
+        for root in roots:
+            for relative in ('lib/deep/helper', 'lib/deep/nested.sample', 'helpers.sample/helper'):
+                commands.append('printf %s ' + shlex.quote('echo after!\n') + ' > ' + shlex.quote(str(root / relative)))
+            commands.extend(('echo added > ' + shlex.quote(str(root / 'lib/deep/new-helper')),
+                             'rm ' + shlex.quote(str(root / 'lib/deep/remove-me')),
+                             'echo template > ' + shlex.quote(str(root / 'ignored.sample'))))
+        p = self.exec_sh(wid, ' && '.join(commands) + '; exit 7', '--no-sandbox', code=7)
+        for root in roots:
+            prefix = str(root.relative_to(one)).encode() + b'/'
+            for relative in (b'lib/deep/helper', b'lib/deep/nested.sample', b'helpers.sample/helper'):
+                self.assertIn(b'exec changed a Git hook: ' + prefix + relative, p.stderr)
+            self.assertIn(b'exec added a Git hook: ' + prefix + b'lib/deep/new-helper', p.stderr)
+            self.assertIn(b'exec removed a Git hook: ' + prefix + b'lib/deep/remove-me', p.stderr)
+            self.assertNotIn(prefix + b'ignored.sample', p.stderr)
+        for wrapper, original in wrappers:
+            self.assertEqual(wrapper.read_bytes(), original)
+            self.assertNotIn(b'a Git hook: ' + str(wrapper.relative_to(one)).encode() + b'\n', p.stderr)
+        # Project hook support stays writable with a sandbox; its bytes are still reported.
+        p = self.exec_sh(wid, 'echo edited > .project-hooks/lib/deep/helper', '--require-sandbox')
+        self.assertIn(b'exec changed a Git hook: .project-hooks/lib/deep/helper', p.stderr)
+
+    def test_exec_refuses_nested_hook_aliases_and_excess_depth(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        helpers = one / '.world-git/repo.git/hooks/lib'
+        helpers.mkdir(parents=True, exist_ok=True)
+        outside = one / 'external-helper'
+        outside.write_text('payload\n')
+        for kind in ('symlink-file', 'symlink-directory', 'hardlink'):
+            with self.subTest(kind=kind):
+                entry = helpers / 'unsupported'
+                if kind == 'hardlink':
+                    os.link(outside, entry)
+                else:
+                    entry.symlink_to(one if kind == 'symlink-directory' else outside,
+                                     target_is_directory=kind == 'symlink-directory')
+                p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+                self.assertIn(b'linked Git hooks cannot be guarded', p.stderr)
+                self.assertFalse((one / 'should-not-run').exists())
+                entry.unlink()
+        deep = helpers
+        for _ in range(33):
+            deep = deep / 'd'
+            deep.mkdir()
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'Git hook directory depth limit exceeded', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+
+    def test_exec_large_sparse_hook_invalidates_capture_promptly(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        hook = one / '.world-git/repo.git/hooks/pre-commit'
+        hook.parent.mkdir(exist_ok=True)
+        script = (shlex.quote(sys.executable) + ' -c ' + shlex.quote(
+            "with open('.world-git/repo.git/hooks/pre-commit', 'wb') as f: f.truncate(1 << 40)") +
+            '; exit 7')
+        p = subprocess.run((WORLD, 'exec', wid, '--no-sandbox', '--', '/bin/sh', '-c', script),
+                           env=self.env, capture_output=True, timeout=15)
+        self.assertEqual(p.returncode, 7, p.stderr)
+        self.assertEqual(hook.stat().st_size, 1 << 40)
+        self.assertIn(b'64 MiB capture budget', p.stderr)
+        self.assertIn(b'WARNING: exec left', p.stderr)
+        self.assertIn(b'Git hooks and settings uninspected after the command', p.stderr)
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'incomplete Git hooks or administration capture', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+
+    def test_exec_warns_when_new_project_hook_exceeds_capture_budget(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'core.hooksPath', '.hidden-hooks')
+        (one / '.gitignore').write_text('.hidden-hooks/\n')
+        script = (shlex.quote(sys.executable) + ' -c ' + shlex.quote(
+            "import os; os.mkdir('.hidden-hooks'); "
+            "f = open('.hidden-hooks/pre-commit', 'wb'); f.truncate(1 << 40); f.close()") + '; exit 7')
+        p = subprocess.run((WORLD, 'exec', wid, '--require-sandbox', '--', '/bin/sh', '-c', script),
+                           env=self.env, capture_output=True, timeout=15)
+        self.assertEqual(p.returncode, 7, p.stderr)
+        self.assertEqual((one / '.hidden-hooks/pre-commit').stat().st_size, 1 << 40)
+        self.assertIn(b'WARNING: exec left', p.stderr)
+        self.assertIn(b'Git hooks and settings uninspected after the command', p.stderr)
+        self.assertIn(b'64 MiB capture budget', p.stderr)
+
+    def test_exec_reports_bundle_uri_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        p = self.exec_sh(wid, 'git config fetch.bundleURI https://example.invalid/bootstrap.bundle; exit 7',
+                         '--no-sandbox', code=7)
+        self.assertIn(b'local fetch.bundleuri: (unset) -> https://example.invalid/bootstrap.bundle', p.stderr)
+
+    def test_exec_reports_dormant_worktree_config_and_its_includes(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        root_admin = one / '.world-git/repo.git/worktrees/active'
+        child_admin = root_admin / 'modules/lib-module'
+        for repo in (one, one / 'libs/lib'):
+            self.git(repo, 'config', 'extensions.worktreeConfig', 'false')
+        root_config = root_admin / 'config.worktree'
+        child_config = child_admin / 'config.worktree'
+        p = self.exec_sh(wid, "printf '[core]\\n sshCommand = touch dormant-worktree-ran\\n' > " +
+                         shlex.quote(str(root_config)) + '; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'exec added Git worktree configuration: .world-git/repo.git/worktrees/active/config.worktree',
+                      p.stderr)
+        self.assertNotIn(b'worktree core.sshcommand:', p.stderr)
+        root_config.write_text('[includeIf "onbranch:never-active"]\n path = dormant-parent\n')
+        policy = root_admin / 'dormant-parent'
+        nested = root_admin / 'dormant-leaf'
+        policy.write_text('[include]\n path = dormant-leaf\n')
+        nested.write_text('[core]\n sshCommand = touch dormant-worktree-ran\n')
+        p = self.exec_sh(wid, "printf '\\n[alias]\\n hidden = !touch dormant-worktree-ran\\n' >> " +
+                         shlex.quote(str(nested)) + " && printf '[core]\\n fsmonitor = touch dormant-worktree-ran\\n' > " +
+                         shlex.quote(str(child_config)), '--require-sandbox')
+        self.assertIn(b'exec changed a Git include target: .world-git/repo.git/worktrees/active/dormant-leaf', p.stderr)
+        self.assertIn(b'exec added Git worktree configuration: .world-git/repo.git/worktrees/active/modules/lib-module/config.worktree',
+                      p.stderr)
+        p = self.exec_sh(wid, 'rm ' + shlex.quote(str(child_config)), '--require-sandbox')
+        self.assertIn(b'exec removed Git worktree configuration:', p.stderr)
+        self.assertFalse((one / 'dormant-worktree-ran').exists())
+        self.assertFalse((one / 'libs/lib/dormant-worktree-ran').exists())
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Seatbelt protected hooks ancestor pins')
+    def test_exec_pins_external_and_default_hook_ancestors(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        shared = self.root / 'shared'
+        hooks = shared / 'hooks'
+        hooks.mkdir(parents=True)
+        (shared / 'cancelled').mkdir()
+        hook = hooks / 'pre-commit'
+        hook.write_text('#!/bin/sh\nexit 0\n')
+        original = hook.read_bytes()
+        self.git(one, 'config', 'core.hooksPath', str(shared / 'cancelled/../hooks'))
+        self.assert_denied(wid, 'mv ' + shlex.quote(str(shared)) + ' ' + shlex.quote(str(self.root / 'shared-old')))
+        self.assert_denied(wid, 'mv ' + shlex.quote(str(shared / 'cancelled')) + ' ' +
+                           shlex.quote(str(shared / 'cancelled-old')))
+        self.exec_sh(wid, 'echo allowed > ' + shlex.quote(str(shared / 'sibling')), '--require-sandbox')
+        self.assertEqual(hook.read_bytes(), original)
+        self.assertTrue((shared / 'sibling').exists())
+        self.git(one, 'config', '--unset', 'core.hooksPath')
+        # Default hooks remain protected even if an ancestor outside administration moves.
+        moved = self.root / 'moved-world'
+        p = subprocess.run((WORLD, 'exec', wid, '--require-sandbox', '--', '/bin/sh', '-c',
+                            'mv ' + shlex.quote(str(one)) + ' ' + shlex.quote(str(moved))),
+                           env=self.env, capture_output=True, timeout=60)
+        if moved.exists():
+            moved.rename(one)
+        self.assertNotEqual(p.returncode, 0, p.stderr)
+        missing = shared / 'not-created/hooks'
+        self.git(one, 'config', 'core.hooksPath', str(missing))
+        self.assert_denied(wid, 'mkdir ' + shlex.quote(str(missing.parent)))
+        self.assertFalse(missing.parent.exists())
+
+    def test_exec_reports_dormant_conditional_include_targets(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        policy = one / '.world-git/dormant-policy'
+        child = one / '.world-git/dormant-child'
+        absent = one / '.world-git/dormant-new'
+        policy.write_text('[includeIf "onbranch:never-active"]\n path = dormant-child\n'
+                          '[include]\n path = dormant-new\n')
+        child.write_text('[core]\n sshCommand = touch include-command-ran\n')
+        self.git(one, 'config', 'includeIf.onbranch:never-active.path', str(policy))
+        self.assertNotIn(b'include-command-ran', self.git(one, 'config', '--list', '--includes').stdout)
+        p = self.exec_sh(wid, "printf '[core]\\n sshCommand = touch changed-command-ran\\n' > " +
+                         shlex.quote(str(child)) + '; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'exec changed a Git include target: .world-git/dormant-child', p.stderr)
+        self.assertNotIn(b'local core.sshcommand:', p.stderr)
+        p = self.exec_sh(wid, "printf '[alias]\\n payload = !touch added-command-ran\\n' > " +
+                         shlex.quote(str(absent)), '--require-sandbox')
+        self.assertIn(b'exec added a Git include target: .world-git/dormant-new', p.stderr)
+        # Content comparison deliberately also reports benign edits in dormant files.
+        p = self.exec_sh(wid, "printf '\\n[user]\\n name = Changed\\n' >> " +
+                         shlex.quote(str(policy)), '--require-sandbox')
+        self.assertIn(b'exec changed a Git include target: .world-git/dormant-policy', p.stderr)
+        p = self.exec_sh(wid, 'rm ' + shlex.quote(str(child)), '--require-sandbox')
+        self.assertIn(b'exec removed a Git include target: .world-git/dormant-child', p.stderr)
+        for marker in ('include-command-ran', 'changed-command-ran', 'added-command-ran'):
+            self.assertFalse((one / marker).exists())
+
+    def test_exec_protects_and_reports_dormant_include_hooks(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        policy = one / '.world-git/dormant-hook-policy'
+        nested = one / '.world-git/dormant-hook-child'
+        policy.write_text('[includeIf "onbranch:also-never"]\n path = dormant-hook-child\n')
+        self.git(one, 'config', 'includeIf.onbranch:never-active.path', str(policy))
+        # Both a writable administration subtree and an external directory need the
+        # dormant policy's hooks protection (the latter is normally writable on macOS).
+        paths = (one / '.world-git/custom/dormant-hooks', self.root / 'external-dormant-hooks')
+        for hooks in paths:
+            hooks.mkdir(parents=True)
+            hook = hooks / 'pre-commit'
+            hook.write_text('#!/bin/sh\ntouch dormant-hook-ran\n')
+            hook.chmod(0o755)
+            self.git(one, 'config', '--file', str(nested), '--add', 'core.hooksPath', str(hooks))
+        unchanged = nested.read_bytes()
+        self.assertNotIn(b'dormant-hooks', self.git(one, 'config', '--list', '--includes').stdout)
+        for hooks in paths:
+            hook = hooks / 'pre-commit'
+            original = hook.read_bytes()
+            # The marker proves a denial occurs in the child rather than initial capture.
+            p = self.assert_denied(wid, 'touch sandbox-started; echo changed > ' + shlex.quote(str(hook)))
+            self.assertTrue((one / 'sandbox-started').exists(), p.stderr)
+            (one / 'sandbox-started').unlink()
+            self.assertEqual(hook.read_bytes(), original)
+            p = self.exec_sh(wid, 'echo changed >> ' + shlex.quote(str(hook)) + '; exit 7',
+                             '--no-sandbox', code=7)
+            self.assertIn(b'exec changed a Git hook:', p.stderr)
+            self.assertIn(str(hooks.name).encode() + b'/pre-commit', p.stderr)
+            self.assertNotIn(b'exec changed a Git include target:', p.stderr)
+        self.assertEqual(nested.read_bytes(), unchanged)
+        self.assertFalse((one / 'dormant-hook-ran').exists())
+
+    def test_exec_dormant_hooks_use_each_checkout_and_receive_gitdir(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        policy = one / '.world-git/shared-dormant-hooks'
+        policy.write_text('[core]\n hooksPath = .dormant-hooks\n')
+        repos = (one, one / 'libs/lib')
+        for repo in repos:
+            self.git(repo, 'config', 'includeIf.onbranch:never-active.path', str(policy))
+        # Same include file, distinct repository contexts. Missing project directories
+        # remain editable, but newly planted hooks must be observed in both checkouts.
+        p = self.exec_sh(wid, 'mkdir .dormant-hooks libs/lib/.dormant-hooks; '
+                         'echo root > .dormant-hooks/pre-commit; '
+                         'echo child > libs/lib/.dormant-hooks/pre-commit; exit 7',
+                         '--require-sandbox', code=7)
+        self.assertIn(b'exec added a Git hook: .dormant-hooks/pre-commit', p.stderr)
+        self.assertIn(b'exec added a Git hook: libs/lib/.dormant-hooks/pre-commit', p.stderr)
+        self.assertNotIn(b'exec changed a Git include target:', p.stderr)
+        admin = one / '.world-git/repo.git/worktrees/active'
+        for gitdir in (admin, admin / 'modules/lib-module'):
+            hooks = gitdir / '.dormant-hooks'
+            hooks.mkdir()
+            hook = hooks / 'pre-receive'
+            hook.write_text('#!/bin/sh\nexit 0\n')
+            p = self.assert_denied(wid, 'touch sandbox-started; echo changed > ' + shlex.quote(str(hook)))
+            self.assertTrue((one / 'sandbox-started').exists(), p.stderr)
+            (one / 'sandbox-started').unlink()
+            self.assertEqual(hook.read_text(), '#!/bin/sh\nexit 0\n')
+
+    def test_exec_dormant_hooks_cover_raw_alternate_worktree(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        admin = one / '.world-git/repo.git/worktrees/active'
+        policy = one / '.world-git/dormant-alternate'
+        self.git(one, 'config', 'includeIf.onbranch:never-active.path', str(policy))
+        # Git setup treats both path expansions literally in core.worktree, unlike
+        # hooksPath. Capture must not apply --type=path to these candidate bases.
+        for raw in ('~literal-worktree', '%(prefix)/literal-worktree'):
+            with self.subTest(worktree=raw):
+                hooks = admin / raw / '.alternate-hooks'
+                hooks.mkdir(parents=True)
+                hook = hooks / 'pre-commit'
+                hook.write_text('#!/bin/sh\nexit 0\n')
+                policy.write_text('[core]\n worktree = ' + raw + '\n hooksPath = .alternate-hooks\n')
+                p = self.assert_denied(wid, 'touch sandbox-started; echo changed > ' + shlex.quote(str(hook)))
+                self.assertTrue((one / 'sandbox-started').exists(), p.stderr)
+                (one / 'sandbox-started').unlink()
+                self.assertEqual(hook.read_text(), '#!/bin/sh\nexit 0\n')
+                p = self.exec_sh(wid, 'echo changed >> ' + shlex.quote(str(hook)) + '; exit 7',
+                                 '--no-sandbox', code=7)
+                self.assertIn((raw + '/.alternate-hooks/pre-commit').encode(), p.stderr)
+                self.assertIn(b'exec changed a Git hook:', p.stderr)
+                self.assertNotIn(b'exec changed a Git include target:', p.stderr)
+
+    def test_exec_dormant_empty_hooks_path_observes_execution_directory(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        policy = one / '.world-git/dormant-empty-hooks'
+        policy.write_text('[core]\n hooksPath =\n')
+        self.git(one, 'config', 'includeIf.onbranch:never-active.path', str(policy))
+        p = self.exec_sh(wid, 'echo changed >> file; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'exec changed a Git hook: file', p.stderr)
+        self.assertNotIn(b'exec changed a Git include target:', p.stderr)
+
+    def test_exec_dormant_include_resolves_parent_alias_before_dotdot(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        admin = one / '.world-git'
+        (admin / 'include-dir/deep').mkdir(parents=True)
+        (admin / 'include-alias').symlink_to('include-dir/deep', target_is_directory=True)
+        policy = admin / 'include-dir/policy'
+        child = admin / 'include-dir/child'
+        policy.write_text('[include]\n path = child\n')
+        child.write_text('[alias]\n hidden = !touch nested-helper-ran\n')
+        self.git(one, 'config', 'includeIf.onbranch:never-active.path', str(admin / 'include-alias/../policy'))
+        self.git(one, 'config', 'includeIf.onbranch:also-never.path', str(policy))
+        p = self.exec_sh(wid, "printf '\\n[user]\\n name = changed\\n' >> " + shlex.quote(str(child)),
+                         '--require-sandbox')
+        warning = b'exec changed a Git include target: .world-git/include-dir/child'
+        self.assertEqual(p.stderr.count(warning), 1, p.stderr)
+        self.assertFalse((one / 'nested-helper-ran').exists())
+
+    def test_exec_refuses_nonregular_dormant_include_targets(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        target = one / '.world-git/dormant-target'
+        self.git(one, 'config', 'includeIf.onbranch:never-active.path', str(target))
+        for kind in ('symlink', 'fifo'):
+            with self.subTest(kind=kind):
+                if kind == 'symlink':
+                    target.symlink_to(one / 'file')
+                else:
+                    os.mkfifo(target)
+                p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+                self.assertIn(b'nonregular Git include target', p.stderr)
+                self.assertFalse((one / 'should-not-run').exists())
+                target.unlink()
+
+    def test_exec_reports_global_maintenance_registration(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'remote.dormant.url', 'ext::touch scheduled-helper-ran')
+        self.git(one, 'config', 'maintenance.prefetch.enabled', 'true')
+        self.git(one, 'config', 'maintenance.prefetch.schedule', 'hourly')
+        home = self.root / 'maintenance-home'
+        home.mkdir()
+        self.env['HOME'] = str(home)
+        self.env['GIT_CONFIG_GLOBAL'] = str(home / '.gitconfig')
+        p = self.exec_sh(wid, 'git config --global --add maintenance.repo ' + shlex.quote(str(one)) +
+                         '; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'global maintenance.repo: (unset) -> ' + str(one).encode(), p.stderr)
+        self.assertNotIn(b'local maintenance.prefetch.enabled:', p.stderr)
+        self.assertNotIn(b'local maintenance.prefetch.schedule:', p.stderr)
+        self.assertNotIn(b'local remote.dormant.url:', p.stderr)
+        self.assertEqual(self.git(one, 'config', '--global', '--get-all', 'maintenance.repo').stdout.strip(),
+                         str(one).encode())
+        self.assertFalse((one / 'scheduled-helper-ran').exists())
+
+    def test_exec_reports_activating_maintenance_commands(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'remote.dormant.url', 'ext::touch maintenance-helper-ran')
+        hook = one / '.world-git/repo.git/hooks/pre-auto-gc'
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text('#!/bin/sh\ntouch maintenance-hook-ran\n')
+        hook.chmod(0o755)
+        values = {'receive.autogc': 'true', 'maintenance.auto': 'true',
+                  'gc.auto': '1', 'gc.autoPackLimit': '1', 'maintenance.strategy': 'incremental',
+                  'maintenance.gc.enabled': 'true', 'maintenance.prefetch.enabled': 'true',
+                  'maintenance.prefetch.schedule': 'hourly', 'maintenance.gc.schedule': 'daily'}
+        p = self.exec_sh(wid, ' && '.join('git config ' + key + ' ' + value
+                                        for key, value in values.items()) + '; exit 7', '--no-sandbox', code=7)
+        for key, value in values.items():
+            self.assertIn(b'local ' + key.lower().encode() + b': (unset) -> ' + value.encode(), p.stderr)
+        self.assertNotIn(b'local remote.dormant.url:', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertFalse((one / 'maintenance-helper-ran').exists())
+        self.assertFalse((one / 'maintenance-hook-ran').exists())
+
+    def test_exec_reports_enabling_previously_rejected_update_hook(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        hook = one / '.world-git/repo.git/hooks/update'
+        hook.parent.mkdir(exist_ok=True)
+        marker = one / 'retained-update-hook-ran'
+        hook.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(marker)) + '\n')
+        hook.chmod(0o755)
+        original = hook.read_bytes()
+        # Both receive-side rejection gates run before the retained update hook.
+        # Changing or removing them can permit forced updates or branch deletions.
+        for key in ('receive.denyNonFastForwards', 'receive.denyDeletes'):
+            for change, after in ((key + ' false', 'false'), ('--unset ' + key, '(unset)')):
+                with self.subTest(change=change):
+                    self.git(one, 'config', key, 'true')
+                    p = self.exec_sh(wid, 'git config ' + change + '; exit 7',
+                                     '--no-sandbox', code=7)
+                    self.assertIn(b'local ' + key.lower().encode() + b': true -> ' + after.encode(), p.stderr)
+                    self.assertNotIn(b'a Git hook:', p.stderr)
+                    self.assertEqual(hook.read_bytes(), original)
+                    self.assertFalse(marker.exists())
+
+        # Unlike denyDeletes, removing denyDeleteCurrent defaults to refusal.
+        # Explicit false permits the current-branch deletion with this retained policy.
+        self.git(one, 'config', 'receive.denyCurrentBranch', 'ignore')
+        self.git(one, 'config', 'receive.denyDeleteCurrent', 'true')
+        p = self.exec_sh(wid, 'git config receive.denyDeleteCurrent false; exit 7',
+                         '--no-sandbox', code=7)
+        self.assertIn(b'local receive.denydeletecurrent: true -> false', p.stderr)
+        self.assertNotIn(b'local receive.denycurrentbranch:', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertEqual(hook.read_bytes(), original)
+        self.assertFalse(marker.exists())
+
+    def test_exec_reports_enabling_promisor_and_checkout_hook(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'remote.dormant.url', 'ext::touch promisor-helper-ran')
+        self.git(one, 'config', 'core.repositoryformatversion', '1')
+        hook = one / '.world-git/repo.git/hooks/push-to-checkout'
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text('#!/bin/sh\ntouch checkout-hook-ran\n')
+        hook.chmod(0o755)
+        p = self.exec_sh(wid, 'git config remote.dormant.promisor true && '
+                         'git config remote.dormant.partialCloneFilter blob:none && '
+                         'git config extensions.partialClone dormant && '
+                         'git config receive.denyCurrentBranch updateInstead; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local remote.dormant.promisor: (unset) -> true', p.stderr)
+        self.assertIn(b'local remote.dormant.partialclonefilter: (unset) -> blob:none', p.stderr)
+        self.assertIn(b'local extensions.partialclone: (unset) -> dormant', p.stderr)
+        self.assertIn(b'local receive.denycurrentbranch: (unset) -> updateInstead', p.stderr)
+        self.assertNotIn(b'local remote.dormant.url:', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertFalse((one / 'promisor-helper-ran').exists())
+        self.assertFalse((one / 'checkout-hook-ran').exists())
+
+    def test_exec_reports_unhiding_refs_with_retained_transfer_commands(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        # uploadpack.packObjectsHook is honored only in protected configuration;
+        # use the test's isolated global file, not an ignored local definition.
+        self.env['GIT_CONFIG_GLOBAL'] = str(self.root / 'hidden-refs-global-config')
+        pack_command = 'touch ' + shlex.quote(str(one / 'retained-pack-hook-ran')) + '; git pack-objects'
+        self.git(one, 'config', '--global', 'uploadpack.packObjectsHook', pack_command)
+        hook = one / '.world-git/repo.git/hooks/update'
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(one / 'retained-hidden-ref-hook-ran')) + '\n')
+        hook.chmod(0o755)
+        original = hook.read_bytes()
+        keys = ('uploadpack.hideRefs', 'receive.hideRefs', 'transfer.hideRefs')
+        for after in ('(unset)', '!refs/heads/main'):
+            with self.subTest(after=after):
+                for key in keys:
+                    self.git(one, 'config', key, 'refs/heads/main')
+                commands = ('git config --unset ' + key if after == '(unset)' else
+                            'git config ' + key + ' ' + shlex.quote(after) for key in keys)
+                p = self.exec_sh(wid, ' && '.join(commands) + '; exit 7', '--no-sandbox', code=7)
+                for key in keys:
+                    self.assertIn(b'local ' + key.lower().encode() + b': refs/heads/main -> ' +
+                                  after.encode(), p.stderr)
+                self.assertNotIn(b'global uploadpack.packobjectshook:', p.stderr)
+                self.assertNotIn(b'a Git hook:', p.stderr)
+                self.assertEqual(self.git(one, 'config', '--global', 'uploadpack.packObjectsHook').stdout.strip(),
+                                 pack_command.encode())
+                self.assertEqual(hook.read_bytes(), original)
+                self.assertFalse((one / 'retained-pack-hook-ran').exists())
+                self.assertFalse((one / 'retained-hidden-ref-hook-ran').exists())
+
+    def test_exec_reports_enabling_remote_archive_command(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'tar.custom.command', 'touch archive-command-ran; cat')
+        self.git(one, 'config', 'tar.custom.remote', 'false')
+        p = self.exec_sh(wid, 'git config tar.custom.remote true && '
+                         'git config uploadarchive.allowUnreachable true; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local tar.custom.remote: false -> true', p.stderr)
+        self.assertIn(b'local uploadarchive.allowunreachable: (unset) -> true', p.stderr)
+        self.assertNotIn(b'local tar.custom.command:', p.stderr)
+        self.assertFalse((one / 'archive-command-ran').exists())
+
+    def test_exec_reports_alias_and_remote_helper_configuration(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        p = self.exec_sh(wid, "git config alias.probe '-c core.sshCommand=./payload ls-remote origin' && "
+                         "git config remote.agent.url 'ext::sh -c evil' && "
+                         "git config remote.agent.pushurl 'custom://repository' && "
+                         "git config submodule.agent.url 'ext::sh -c evil' && "
+                         "git config 'url.ext::sh -c evil.insteadOf' 'https://example.com/' && "
+                         "git config 'url.custom://repository.pushInsteadOf' 'work:'", '--no-sandbox')
+        for key in (b'alias.probe', b'remote.agent.url', b'remote.agent.pushurl', b'submodule.agent.url',
+                    b'url.ext::sh -c evil.insteadof', b'url.custom://repository.pushinsteadof'):
+            self.assertIn(b'local ' + key + b': (unset) -> ', p.stderr)
+        p = self.exec_sh(wid, "git config remote.ordinary.url 'https://example.org/repo' && "
+                         "git config remote.ordinary.pushurl 'git@example.org:repo' && "
+                         "git config submodule.ordinary.url 'https://example.org/library' && "
+                         "git config branch.sort refname && git config tag.sort version:refname", '--no-sandbox')
+        self.assertIn(b'local submodule.ordinary.url: (unset) -> https://example.org/library', p.stderr)
+        self.assertIn(b'local remote.ordinary.url: (unset) -> https://example.org/repo', p.stderr)
+        self.assertIn(b'local remote.ordinary.pushurl: (unset) -> git@example.org:repo', p.stderr)
+        self.assertEqual(p.stderr.count(b'WARNING'), 3, p.stderr)
+        self.assertNotIn(b'local branch.sort:', p.stderr)
+        self.assertNotIn(b'local tag.sort:', p.stderr)
+
+    def test_exec_reports_ssh_and_rewritten_endpoint_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'core.sshCommand', 'touch ssh-command-ran')
+        self.git(one, 'config', 'url.ext::touch rewrite-helper-ran.insteadOf', 'https://rewritten.invalid/')
+        p = self.exec_sh(wid, "git config remote.ssh.url ssh://host/repo && "
+                         "git config remote.scp.pushurl git@host:repo && "
+                         "git config 'url.ssh://host/.insteadOf' https://old.invalid/ && "
+                         "git config remote.rewritten.url https://rewritten.invalid/repo; exit 7",
+                         '--no-sandbox', code=7)
+        for key in ('remote.ssh.url', 'remote.scp.pushurl', 'url.ssh://host/.insteadof', 'remote.rewritten.url'):
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> ', p.stderr)
+        self.assertNotIn(b'local core.sshcommand:', p.stderr)
+        self.assertNotIn(b'local url.ext::touch rewrite-helper-ran.insteadof:', p.stderr)
+        self.assertFalse((one / 'ssh-command-ran').exists())
+        self.assertFalse((one / 'rewrite-helper-ran').exists())
+        p = self.exec_sh(wid, "git config remote.ssh.fetch '+refs/heads/*:refs/remotes/ssh/*' && "
+                         "git config branch.main.description unchanged-policy", '--no-sandbox')
+        self.assertIn(b'local remote.ssh.fetch: (unset) -> +refs/heads/*:refs/remotes/ssh/*', p.stderr)
+        self.assertNotIn(b'branch.main.description:', p.stderr)
+
+    def test_exec_refuses_symlinked_worktrees_locator(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        worktrees = one / '.world-git/repo.git/worktrees'
+        saved = worktrees.with_name('saved-worktrees')
+        worktrees.rename(saved)
+        worktrees.symlink_to('saved-worktrees', target_is_directory=True)
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'incomplete Git administration scan', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+        self.assertTrue(worktrees.is_symlink())
+        p = self.exec_sh(wid, 'rm .world-git/repo.git/worktrees && '
+                         'mv .world-git/repo.git/saved-worktrees .world-git/repo.git/worktrees; exit 7',
+                         '--no-sandbox', code=7)
+        self.assertIn(b'incomplete Git administration scan', p.stderr)
+        self.assertTrue(worktrees.is_dir())
+        self.assertFalse(worktrees.is_symlink())
+
+    def test_exec_reports_replacement_refs_activating_retained_filter(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        head = self.git(one, 'rev-parse', 'HEAD').stdout.strip().decode()
+        self.git(one, 'checkout', '-q', '-b', 'filter-replacement')
+        (one / '.gitattributes').write_text('file filter=retained\n')
+        (one / 'file').write_text('replacement contents\n')
+        self.git(one, 'add', '.gitattributes', 'file')
+        self.git(one, 'commit', '-qm', 'replacement with dormant filter attributes')
+        replacement = self.git(one, 'rev-parse', 'HEAD').stdout.strip().decode()
+        self.git(one, 'checkout', '-q', 'main')
+        self.git(one, 'config', 'core.useReplaceRefs', 'false')
+        self.git(one, 'replace', head, replacement)
+        self.git(one, 'config', 'filter.retained.smudge', 'touch replacement-filter-ran; cat')
+        original = (one / 'file').read_bytes()
+        # Activation changes only configuration: neither reset nor the retained
+        # smudge command is run by this inspection/reporting regression.
+        p = self.exec_sh(wid, 'git config core.useReplaceRefs true; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local core.usereplacerefs: false -> true', p.stderr)
+        self.assertNotIn(b'local filter.retained.smudge:', p.stderr)
+        self.assertEqual(self.git(one, 'config', 'filter.retained.smudge').stdout.strip(),
+                         b'touch replacement-filter-ran; cat')
+        self.assertEqual(self.git(one, 'rev-parse', 'refs/replace/' + head).stdout.strip().decode(), replacement)
+        self.assertEqual(self.git(one, 'show', 'HEAD:.gitattributes').stdout, b'file filter=retained\n')
+        self.assertEqual((one / 'file').read_bytes(), original)
+        self.assertFalse((one / 'replacement-filter-ran').exists())
+
+    def test_exec_reports_attributes_file_activating_existing_filter(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'filter.hidden.clean', 'touch filter-ran; cat')
+        attributes = one / '.world-git/hidden-attributes'
+        attributes.write_text('* filter=hidden\n')
+        p = self.exec_sh(wid, 'git config core.attributesFile ' + shlex.quote(str(attributes)), '--no-sandbox')
+        self.assertIn(b'local core.attributesfile: (unset) -> ' + str(attributes).encode(), p.stderr)
+        self.assertFalse((one / 'filter-ran').exists())
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux bind mount policy')
+    def test_exec_readonly_hooks_path_overrides_locator_pin(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        modules = one / '.world-git/repo.git/worktrees/active/modules'
+        (modules / 'guarded/child').mkdir(parents=True)
+        (modules / 'guarded-foo').mkdir()
+        self.git(one, 'config', 'core.hooksPath', str(modules))
+        self.assert_denied(wid, 'echo evil > .world-git/repo.git/worktrees/active/modules/pre-commit')
+        self.assertFalse((modules / 'pre-commit').exists())
+
+        # Read-only ancestors must also dominate descendant locator pins.
+        self.assert_denied(wid, 'echo evil > .world-git/repo.git/worktrees/active/modules/guarded/child/payload')
+        self.assertFalse((modules / 'guarded/child/payload').exists())
+        self.exec_sh(wid, 'echo fine > ordinary-work', '--require-sandbox')
+        self.assertEqual((one / 'ordinary-work').read_text(), 'fine\n')
+        # A lexically intervening sibling must not hide the read-only ancestor, and
+        # should retain its independent writable locator bind.
+        self.git(one, 'config', 'core.hooksPath', str(modules / 'guarded'))
+        self.assert_denied(wid, 'echo evil > .world-git/repo.git/worktrees/active/modules/guarded/child/payload')
+        self.assertFalse((modules / 'guarded/child/payload').exists())
+        self.exec_sh(wid, 'echo fine > .world-git/repo.git/worktrees/active/modules/guarded-foo/payload',
+                     '--require-sandbox')
+
+    def test_exec_reports_ignored_checkout_attributes_and_aliases(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        marker = one / 'filter-ran'
+        command = 'touch ' + shlex.quote(str(marker)) + '; cat'
+        for checkout in (one, one / 'libs/lib'):
+            self.git(checkout, 'config', 'filter.retained.smudge', command)
+            self.git(checkout, 'config', 'filter.second.smudge', command)
+            (checkout / '.gitignore').write_text('.gitattributes\nhidden/\nroute\nloop\ndangling\n')
+        paths = ('.gitattributes', 'hidden/new/.gitattributes',
+                 'hidden/.world-git/.gitattributes', 'libs/lib/.gitattributes')
+        script = '; '.join('mkdir -p ' + shlex.quote(str((one / path).parent)) +
+                           '; printf %s ' + shlex.quote('* filter=retained\n') + ' > ' + shlex.quote(path)
+                           for path in paths)
+        p = self.exec_sh(wid, script + '; exit 7', '--no-sandbox', code=7)
+        for path in paths:
+            self.assertIn(b'exec added Git repository attributes: ' + path.encode(), p.stderr)
+        # Both trees are already captured; changing only the ignored alias must warn.
+        (one / 'A').mkdir()
+        (one / 'B').mkdir()
+        for target, value in (('A', 'retained'), ('B', 'second')):
+            (one / target / '.gitattributes').write_text('* filter=' + value + '\n')
+        (one / 'route').symlink_to('A', target_is_directory=True)
+        (one / 'loop').symlink_to('.', target_is_directory=True)
+        (one / 'dangling').symlink_to('missing', target_is_directory=True)
+        external = self.root / 'attribute-target'
+        external.mkdir()
+        (external / '.gitattributes').write_text('* filter=retained\n')
+        (one / 'outside').symlink_to(external, target_is_directory=True)
+        # Literal administration is excluded, but a project alias into it is observable.
+        admin_target = one / '.world-git/attribute-target'
+        admin_target.mkdir()
+        (admin_target / '.gitattributes').write_text('* filter=retained\n')
+        (one / 'admin-route').symlink_to(admin_target, target_is_directory=True)
+        changed = [str(one / path) for path in paths] + [str(external / '.gitattributes'),
+                                                        str(admin_target / '.gitattributes')]
+        script = 'rm route; ln -s B route; ' + '; '.join(
+            'printf %s ' + shlex.quote('* filter=second\n') + ' > ' + shlex.quote(path)
+            for path in changed)
+        p = self.exec_sh(wid, script + '; exit 7', '--no-sandbox', code=7)
+        for path in paths:
+            self.assertEqual(p.stderr.count(b'exec changed Git repository attributes: ' + path.encode() + b' '), 1)
+        self.assertIn(b'exec changed a Git attributes directory alias: route', p.stderr)
+        self.assertIn(b'exec changed Git repository attributes: ' + str(external / '.gitattributes').encode(), p.stderr)
+        self.assertIn(b'exec changed Git repository attributes: .world-git/attribute-target/.gitattributes', p.stderr)
+        self.assertNotIn(b'local filter.retained.smudge:', p.stderr)
+        p = self.exec_sh(wid, 'rm ' + ' '.join(shlex.quote(path) for path in paths) +
+                         '; rm route dangling; exit 7', '--no-sandbox', code=7)
+        for path in paths:
+            self.assertIn(b'exec removed Git repository attributes: ' + path.encode(), p.stderr)
+        self.assertIn(b'exec removed a Git attributes directory alias: dangling', p.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_exec_reports_shallow_update_gate_with_retained_hook(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        hook = one / '.world-git/repo.git/hooks/update'
+        hook.parent.mkdir(exist_ok=True)
+        original = b'#!/bin/sh\ntouch update-hook-ran\n'
+        hook.write_bytes(original)
+        hook.chmod(0o755)
+        self.git(one, 'config', 'receive.shallowUpdate', 'false')
+        p = self.exec_sh(wid, 'git config receive.shallowUpdate true; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local receive.shallowupdate: false -> true', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertEqual(hook.read_bytes(), original)
+        self.assertFalse((one / 'update-hook-ran').exists())
+
+    def test_exec_reports_repository_attributes_activating_unchanged_filters(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        repositories = ((one, one / '.world-git/repo.git'),
+                        (one / 'libs/lib', one / '.world-git/repo.git/worktrees/active/modules/lib-module'))
+        for checkout, common in repositories:
+            with self.subTest(repository=checkout):
+                for name in ('hidden', 'second'):
+                    self.git(checkout, 'config', 'filter.' + name + '.clean', 'touch filter-ran; cat')
+                attributes = common / 'info/attributes'
+                attributes.parent.mkdir(exist_ok=True)
+                self.assertFalse(attributes.exists())
+                rel = str(attributes.relative_to(one)).encode()
+                p = self.exec_sh(wid, 'printf %s ' + shlex.quote('* filter=hidden\n') + ' > ' +
+                                 shlex.quote(str(attributes)) + '; exit 7', '--no-sandbox', code=7)
+                self.assertIn(b'exec added Git repository attributes: ' + rel, p.stderr)
+                self.assertNotIn(b'local filter.hidden.clean:', p.stderr)
+                alias = one / 'attributes-alias'
+                os.link(attributes, alias)
+                # Same-size, same-mtime replacement through a hardlink must still be seen.
+                code = ('import os\np = ' + repr(str(alias)) + '\nst = os.stat(p)\n'
+                        "with open(p, 'wb') as f: f.write(b'* filter=second\\n')\n"
+                        'os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))\n')
+                p = self.exec_sh(wid, shlex.quote(sys.executable) + ' -c ' + shlex.quote(code) + '; exit 7',
+                                 '--no-sandbox', code=7)
+                self.assertIn(b'exec changed Git repository attributes: ' + rel, p.stderr)
+                alias.unlink()
+                p = self.exec_sh(wid, 'rm ' + shlex.quote(str(attributes)) + '; exit 7', '--no-sandbox', code=7)
+                self.assertIn(b'exec removed Git repository attributes: ' + rel, p.stderr)
+                self.assertFalse((one / 'filter-ran').exists())
+                self.assertFalse((checkout / 'filter-ran').exists())
+
+    def test_exec_reports_dormant_attributes_sources(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        marker = one / 'dormant-filter-ran'
+        self.git(one, 'config', 'filter.retained.smudge', 'touch ' + shlex.quote(str(marker)) + '; cat')
+        policy = one / '.world-git/dormant-attributes-config'
+        external = self.root / 'dormant-attributes'
+        relative = one / '.world-git/dormant-attributes'
+        policy.write_text('[core]\n attributesFile = ' + str(external) +
+                          '\n attributesFile = .world-git/dormant-attributes\n')
+        self.git(one, 'config', 'includeIf.onbranch:never-selected-attribute-branch.path', str(policy))
+        original = policy.read_bytes()
+        targets = (external, relative)
+        for action, value in (('added', '* filter=retained\n'), ('changed', '*.txt filter=retained\n'),
+                              ('removed', None)):
+            script = '; '.join('rm ' + shlex.quote(str(path)) if value is None else
+                               'printf %s ' + shlex.quote(value) + ' > ' + shlex.quote(str(path))
+                               for path in targets)
+            p = self.exec_sh(wid, script + '; exit 7', '--no-sandbox', code=7)
+            for path in targets:
+                label = str(path.relative_to(one)) if path.is_relative_to(one) else str(path)
+                self.assertIn(b'exec ' + action.encode() + b' Git repository attributes: ' + label.encode(), p.stderr)
+            self.assertNotIn(b'local filter.retained.smudge:', p.stderr)
+            self.assertNotIn(b'a Git include target:', p.stderr)
+            self.assertEqual(policy.read_bytes(), original)
+            self.assertFalse(marker.exists())
+        # The same unsupported-source policy applies even while the condition is false.
+        external.symlink_to(policy)
+        p = self.exec_sh(wid, 'touch command-ran', '--require-sandbox', code=3)
+        self.assertIn(b'nonregular Git repository attributes cannot be inspected', p.stderr)
+        self.assertFalse((one / 'command-ran').exists())
+
+    def test_exec_reports_effective_user_attributes_once_per_path(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'filter.hidden.clean', 'touch filter-ran; cat')
+        self.git(one / 'libs/lib', 'config', 'filter.hidden.clean', 'touch filter-ran; cat')
+        xdg = self.root / 'xdg'
+        shared = xdg / 'git/attributes'
+        shared.parent.mkdir(parents=True)
+        shared.write_text('')
+        self.env.update(XDG_CONFIG_HOME=str(xdg), GIT_ATTR_NOSYSTEM='1')
+        self.git(one, 'var', 'GIT_ATTR_SYSTEM', code=1)
+        p = self.exec_sh(wid, 'printf %s ' + shlex.quote('* filter=hidden\n') + ' > ' +
+                         shlex.quote(str(shared)) + '; exit 7', '--no-sandbox', code=7)
+        warning = b'exec changed Git repository attributes: ' + str(shared).encode()
+        self.assertEqual(p.stderr.count(warning), 1, p.stderr)  # root and submodules share it
+        relative = one / '.world-git/custom-attributes'
+        relative.write_text('')
+        self.git(one, 'config', 'core.attributesFile', '.world-git/custom-attributes')
+        p = self.exec_sh(wid, 'printf %s ' + shlex.quote('* filter=hidden\n') +
+                         ' > .world-git/custom-attributes', '--no-sandbox')
+        self.assertIn(b'exec changed Git repository attributes: .world-git/custom-attributes', p.stderr)
+        # Each repository resolves its own configured value; Git expands ~ using HOME.
+        home_dir = self.root / 'home'
+        home_dir.mkdir()
+        self.env['HOME'] = str(home_dir)
+        user_attributes = home_dir / 'attributes'
+        lib_attributes = home_dir / 'lib-attributes'
+        user_attributes.write_text('')
+        lib_attributes.write_text('')
+        self.git(one, 'config', 'core.attributesFile', '~/attributes')
+        self.git(one / 'libs/lib', 'config', 'core.attributesFile', '~/lib-attributes')
+        script = ' && '.join('printf %s ' + shlex.quote('* filter=hidden\n') + ' > ' + shlex.quote(str(path))
+                             for path in (user_attributes, lib_attributes))
+        p = self.exec_sh(wid, script, '--no-sandbox')
+        for path in (user_attributes, lib_attributes):
+            self.assertEqual(p.stderr.count(b'exec changed Git repository attributes: ' + str(path).encode()), 1,
+                             p.stderr)
+        self.assertFalse((one / 'filter-ran').exists())
+        self.assertFalse((one / 'libs/lib/filter-ran').exists())
+
+    def test_exec_allows_disabled_user_attributes(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'core.attributesFile', '/dev/null')
+        p = self.exec_sh(wid, 'touch command-ran', '--require-sandbox')
+        self.assertTrue((one / 'command-ran').exists())
+        self.assertNotIn(b'WARNING', p.stderr)
+
+    def test_exec_refuses_nonregular_repository_attributes(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        attributes = one / '.world-git/repo.git/info/attributes'
+        attributes.parent.mkdir(exist_ok=True)
+        target = self.root / 'external-attributes'
+        target.write_text('* filter=hidden\n')
+        for kind in ('symlink', 'fifo'):
+            with self.subTest(kind=kind):
+                if kind == 'symlink':
+                    attributes.symlink_to(target)
+                else:
+                    os.mkfifo(attributes)
+                p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+                self.assertIn(b'nonregular Git repository attributes cannot be inspected', p.stderr)
+                self.assertFalse((one / 'should-not-run').exists())
+                p = self.exec_sh(wid, 'exit 7', '--no-sandbox', code=7)
+                self.assertIn(b'nonregular Git repository attributes cannot be inspected', p.stderr)
+                attributes.unlink()
+
+    def test_exec_reports_config_value_boundaries_and_implicit_boolean(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'alias.boundary', 'status\x1e!payload')
+        p = self.exec_sh(wid, "git config --unset-all alias.boundary && "
+                         "git config --add alias.boundary status && git config --add alias.boundary '!payload'; exit 7",
+                         '--no-sandbox', code=7)
+        self.assertIn(rb'local alias.boundary: status\x1e!payload -> status, !payload', p.stderr)
+        self.assertNotIn(b'\x1e', p.stderr)
+        self.git(one, 'config', '--replace-all', 'alias.boundary', 'left\x1d\x1e\\right')
+        script = ('git config --unset-all alias.boundary && git config --add alias.boundary ' +
+                  shlex.quote('left\x1d') + ' && git config --add alias.boundary ' + shlex.quote('\\right'))
+        p = self.exec_sh(wid, script, '--no-sandbox')
+        self.assertIn(rb'local alias.boundary: left\x1d\x1e\\right -> left\x1d, \\right', p.stderr)
+        self.assertNotIn(b'\x1d', p.stderr)
+        self.assertNotIn(b'\x1e', p.stderr)
+        # Git interprets a bare boolean as true and an explicit empty value as false.
+        config = one / '.world-git/repo.git/config'
+        with config.open('a') as f:
+            f.write('\n[commit]\n gpgSign\n')
+        self.assertEqual(self.git(one, 'config', '--bool', 'commit.gpgsign').stdout.strip(), b'true')
+        p = self.exec_sh(wid, "git config commit.gpgsign ''", '--no-sandbox')
+        self.assertIn(b'local commit.gpgsign: (implicit) -> ""', p.stderr)
+        self.assertEqual(self.git(one, 'config', '--bool', 'commit.gpgsign').stdout.strip(), b'false')
+
+    def test_exec_preserves_config_identity_field_boundaries(self):
+        origin = self.origin('identity-lib')
+        other_name = 'a\x1flocal\x1fcredential.x'
+        self.sub(self.source, 'add', '-q', '--name', 'a', str(origin), 'libs/one')
+        self.sub(self.source, 'add', '-q', '--name', other_name, str(origin), 'libs/two')
+        self.git(self.source, 'commit', '-qm', 'identity fixtures')
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        key = 'credential.x\x1flocal\x1fcredential.helper'
+        value = '!touch helper-ran'
+        self.git(one / 'libs/one', 'config', key, value)
+        script = ('git -C libs/one config --unset ' + shlex.quote(key) +
+                  ' && git -C libs/two config credential.helper ' + shlex.quote(value))
+        p = self.exec_sh(wid, script, '--no-sandbox')
+        self.assertIn(rb'submodule a local credential.x\x1flocal\x1fcredential.helper: !touch helper-ran -> (unset)',
+                      p.stderr)
+        self.assertIn(rb'submodule a\x1flocal\x1fcredential.x local credential.helper: (unset) -> !touch helper-ran',
+                      p.stderr)
+        self.assertNotIn(b'\x1f', p.stderr)
+        self.assertFalse((one / 'libs/one/helper-ran').exists())
+        self.assertFalse((one / 'libs/two/helper-ran').exists())
+
+    def test_exec_reports_selecting_sendemail_identity(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'sendemail.work.sendmailcmd', 'touch sendmail-ran')
+        self.git(one, 'config', 'sendemail.work.cccmd', 'touch sendmail-ran')
+        self.git(one, 'config', 'core.editor', 'touch sendmail-ran')
+        self.git(one, 'config', 'imap.tunnel', 'touch sendmail-ran')
+        p = self.exec_sh(wid, 'git config sendemail.identity work; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local sendemail.identity: (unset) -> work', p.stderr)
+        self.assertNotIn(b'local sendemail.work.sendmailcmd:', p.stderr)
+        values = {'sendemail.work.annotate': 'true', 'sendemail.work.suppresscc': 'none',
+                  'sendemail.work.validate': 'true', 'sendemail.work.useimaponly': 'false',
+                  'sendemail.work.imapsentfolder': 'Sent'}
+        p = self.exec_sh(wid, ' && '.join('git config ' + key + ' ' + value
+                                        for key, value in values.items()), '--no-sandbox')
+        for key, value in values.items():
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> ' + value.encode(), p.stderr)
+        for key in (b'sendemail.work.sendmailcmd', b'sendemail.work.cccmd', b'core.editor', b'imap.tunnel'):
+            self.assertNotIn(b'local ' + key + b':', p.stderr)
+        self.assertFalse((one / 'sendmail-ran').exists())
+
+    def test_exec_reports_disabling_confirmation_for_retained_mail_commands(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        for prefix in ('sendemail', 'sendemail.work'):
+            self.git(one, 'config', prefix + '.sendmailCmd', 'touch retained-mail-command-ran')
+            self.git(one, 'config', prefix + '.confirm', 'always')
+        self.git(one, 'config', 'sendemail.identity', 'work')
+        p = self.exec_sh(wid, 'git config sendemail.confirm never && '
+                         'git config sendemail.work.confirm never; exit 7', '--no-sandbox', code=7)
+        for prefix in ('sendemail', 'sendemail.work'):
+            self.assertIn(b'local ' + prefix.encode() + b'.confirm: always -> never', p.stderr)
+            self.assertNotIn(b'local ' + prefix.encode() + b'.sendmailcmd:', p.stderr)
+            self.assertEqual(self.git(one, 'config', prefix + '.sendmailCmd').stdout.strip(),
+                             b'touch retained-mail-command-ran')
+        self.assertNotIn(b'local sendemail.identity:', p.stderr)
+        self.assertFalse((one / 'retained-mail-command-ran').exists())
+
+    def test_exec_refuses_hooks_path_aliases_and_guards_missing_direct_path(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        external = self.root / 'external-config'
+        external.mkdir()
+        (one / 'hook-link').symlink_to(external, target_is_directory=True)
+        for path in ('hook-link/new/hooks', 'hook-link/../other-hooks'):
+            self.git(one, 'config', 'core.hooksPath', path)
+            p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+            self.assertIn(b'could not resolve Git hooks path', p.stderr)
+            self.assertFalse((one / 'should-not-run').exists())
+        (one / 'dangling-hooks').symlink_to(external / 'absent', target_is_directory=True)
+        self.git(one, 'config', 'core.hooksPath', 'dangling-hooks/new')
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'could not resolve Git hooks path', p.stderr)
+        self.git(one, 'config', 'core.hooksPath', 'absent/../ambiguous-hooks')
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'could not resolve Git hooks path', p.stderr)
+        (one / 'ordinary-file').write_text('not a directory')
+        self.git(one, 'config', 'core.hooksPath', 'ordinary-file/hooks')
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'could not resolve Git hooks path', p.stderr)
+        local = one / 'local-hooks'
+        local.mkdir()
+        (one / 'local-alias').symlink_to(local, target_is_directory=True)
+        self.git(one, 'config', 'core.hooksPath', 'local-alias')
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'could not resolve Git hooks path', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+        direct = external / 'new-hooks'
+        self.git(one, 'config', 'core.hooksPath', str(direct))
+        self.assert_denied(wid, 'mkdir ' + shlex.quote(str(direct)))
+        self.assertFalse(direct.exists())
+        # Existing parent/.. semantics remain valid without a mutable alias.
+        parent = external / 'existing'
+        parent.mkdir()
+        self.git(one, 'config', 'core.hooksPath', str(parent / '../new-hooks'))
+        self.assert_denied(wid, 'mkdir ' + shlex.quote(str(direct)))
+        self.assertFalse(direct.exists())
+
+    def test_exec_reports_enabling_skipped_remotes(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'remote.dormant.url', 'ext::touch skipped-helper-ran')
+        for key in ('remote.dormant.skipDefaultUpdate', 'remote.dormant.skipFetchAll'):
+            self.git(one, 'config', key, 'true')
+        p = self.exec_sh(wid, 'git config remote.dormant.skipDefaultUpdate false && '
+                         'git config remote.dormant.skipFetchAll false && '
+                         'git config fetch.all true && git config remotes.default dormant; exit 7',
+                         '--no-sandbox', code=7)
+        for key in (b'remote.dormant.skipdefaultupdate', b'remote.dormant.skipfetchall'):
+            self.assertIn(b'local ' + key + b': true -> false', p.stderr)
+        self.assertIn(b'local fetch.all: (unset) -> true', p.stderr)
+        self.assertIn(b'local remotes.default: (unset) -> dormant', p.stderr)
+        self.assertNotIn(b'local remote.dormant.url:', p.stderr)
+        self.assertFalse((one / 'skipped-helper-ran').exists())
+
+    def test_exec_reports_ignored_in_tree_hooks(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'core.hooksPath', '.hidden-hooks')
+        (one / '.gitignore').write_text('.hidden-hooks/\n')
+        self.assertFalse((one / '.hidden-hooks').exists())
+        p = self.exec_sh(wid, "mkdir .hidden-hooks && printf '#!/bin/sh\\ntouch hook-ran\\n' "
+                         "> .hidden-hooks/pre-commit && chmod +x .hidden-hooks/pre-commit; exit 7",
+                         '--require-sandbox', code=7)
+        self.assertIn(b'exec added a Git hook: .hidden-hooks/pre-commit', p.stderr)
+        self.assertNotIn(b'.hidden-hooks', self.git(one, 'status', '--porcelain').stdout)
+        p = self.exec_sh(wid, 'echo changed >> .hidden-hooks/pre-commit', '--require-sandbox')
+        self.assertIn(b'exec changed a Git hook: .hidden-hooks/pre-commit', p.stderr)
+        p = self.exec_sh(wid, 'rm .hidden-hooks/pre-commit', '--require-sandbox')
+        self.assertIn(b'exec removed a Git hook: .hidden-hooks/pre-commit', p.stderr)
+        self.assertFalse((one / 'hook-ran').exists())
+        tracked = one / '.tracked-hooks'
+        tracked.mkdir()
+        (tracked / 'pre-commit').write_text('#!/bin/sh\ntouch hook-ran\n')
+        self.git(one, 'add', '.tracked-hooks/pre-commit')
+        self.git(one, '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'tracked hook')
+        self.git(one, 'config', 'core.hooksPath', '.tracked-hooks')
+        p = self.exec_sh(wid, 'echo changed >> .tracked-hooks/pre-commit', '--require-sandbox')
+        self.assertIn(b'exec changed a Git hook: .tracked-hooks/pre-commit', p.stderr)
+
+    def test_exec_reports_remote_and_merge_strategy_selectors(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'remote.dormant.url', 'ext::touch selected-remote-ran')
+        strategy_dir = one / 'strategy-bin'
+        strategy_dir.mkdir()
+        strategy = strategy_dir / 'git-merge-payload'
+        strategy.write_text('#!/bin/sh\ntouch selected-strategy-ran\n')
+        strategy.chmod(0o755)
+        self.env['PATH'] = str(strategy_dir) + os.pathsep + self.env['PATH']
+        branch = self.git(one, 'branch', '--show-current').stdout.decode().strip()
+        values = {'pull.twohead': 'payload', 'pull.octopus': 'payload',
+                  'branch.' + branch + '.mergeoptions': '-s payload',
+                  'branch.' + branch + '.remote': 'dormant',
+                  'branch.' + branch + '.pushremote': 'dormant', 'remote.pushdefault': 'dormant'}
+        p = self.exec_sh(wid, ' && '.join('git config ' + shlex.quote(key) + ' ' + shlex.quote(val)
+                                        for key, val in values.items()) + '; exit 7', '--no-sandbox', code=7)
+        for key, val in values.items():
+            self.assertIn(b'local ' + key.encode() + b': ', p.stderr)
+            self.assertIn(b' -> ' + val.encode() + b'\n', p.stderr)
+        self.assertNotIn(b'local remote.dormant.url:', p.stderr)
+        self.assertFalse((one / 'selected-remote-ran').exists())
+        self.assertFalse((one / 'selected-strategy-ran').exists())
+
+    def test_exec_reports_autostash_hook_and_driver_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        hook = one / '.world-git/repo.git/hooks/post-rewrite'
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text('#!/bin/sh\ntouch autostash-hook-ran\n')
+        hook.chmod(0o755)
+        self.git(one, 'config', 'merge.retained.driver', 'touch autostash-driver-ran')
+        self.git(one, 'config', 'merge.default', 'retained')
+        keys = ('rebase.autoStash', 'pull.autoStash', 'merge.autoStash')
+        for key in keys:
+            self.git(one, 'config', key, 'false')
+        (one / 'file').write_text('dirty worktree\n')
+        p = self.exec_sh(wid, ' && '.join('git config ' + key + ' true' for key in keys) + '; exit 7',
+                         '--no-sandbox', code=7)
+        for key in keys:
+            self.assertIn(b'local ' + key.lower().encode() + b': false -> true', p.stderr)
+        self.assertNotIn(b'local merge.retained.driver:', p.stderr)
+        self.assertNotIn(b'local merge.default:', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertFalse((one / 'autostash-hook-ran').exists())
+        self.assertFalse((one / 'autostash-driver-ran').exists())
+
+    def test_exec_reports_checkout_guess_and_rebase_hook_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        hooks = one / '.world-git/repo.git/hooks'
+        hooks.mkdir(exist_ok=True)
+        for name in ('post-checkout', 'post-rewrite'):
+            hook = hooks / name
+            hook.write_text('#!/bin/sh\ntouch retained-hook-ran\n')
+            hook.chmod(0o755)
+        self.git(one, 'config', 'checkout.guess', 'false')
+        self.git(one, 'config', 'pull.rebase', 'false')
+        branch = self.git(one, 'branch', '--show-current').stdout.decode().strip()
+        self.git(one, 'config', 'branch.' + branch + '.rebase', 'false')
+        p = self.exec_sh(wid, 'git config checkout.guess true && git config checkout.defaultRemote origin && '
+                         'git config pull.rebase true && '
+                         'git config ' + shlex.quote('branch.' + branch + '.rebase') + ' true; exit 7',
+                         '--no-sandbox', code=7)
+        for key in (b'checkout.guess', b'pull.rebase', b'branch.' + branch.encode() + b'.rebase'):
+            self.assertIn(b'local ' + key + b': false -> true', p.stderr)
+        self.assertIn(b'local checkout.defaultremote: (unset) -> origin', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertFalse((one / 'retained-hook-ran').exists())
+
+    def test_exec_reports_pull_fastforward_and_lfs_endpoint_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'credential.helper', '!touch endpoint-helper-ran')
+        self.git(one, 'config', 'merge.retained.driver', 'touch pull-driver-ran')
+        self.git(one, 'config', 'merge.default', 'retained')
+        self.git(one, 'config', 'merge.ff', 'only')
+        self.git(one, 'config', 'pull.ff', 'only')
+        endpoints = {'lfs.url': 'https://example.invalid/download',
+                     'lfs.pushurl': 'https://example.invalid/upload',
+                     'remote.origin.lfsurl': 'https://example.invalid/remote-download',
+                     'remote.origin.lfspushurl': 'https://example.invalid/remote-upload'}
+        p = self.exec_sh(wid, ' && '.join('git config ' + key + ' ' + shlex.quote(value)
+                                        for key, value in endpoints.items()) +
+                         ' && git config pull.ff true; exit 7', '--no-sandbox', code=7)
+        for key, value in endpoints.items():
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> ' + value.encode(), p.stderr)
+        self.assertIn(b'local pull.ff: only -> true', p.stderr)
+        for key in (b'credential.helper', b'merge.retained.driver', b'merge.default', b'merge.ff'):
+            self.assertNotIn(b'local ' + key + b':', p.stderr)
+        # Without explicit endpoint overrides, gitprotocol can select an unchanged
+        # URL-scoped access policy for the git:// remote's derived LFS endpoint.
+        for key in endpoints:
+            self.git(one, 'config', '--unset', key)
+        self.git(one, 'config', 'remote.origin.url', 'git://example.invalid/repo')
+        self.git(one, 'config', 'lfs.http://example.invalid/repo/info/lfs.access', 'basic')
+        self.git(one, 'config', 'lfs.gitprotocol', 'https')
+        p = self.exec_sh(wid, 'git config lfs.gitprotocol http', '--no-sandbox')
+        self.assertIn(b'local lfs.gitprotocol: https -> http', p.stderr)
+        self.assertNotIn(b'local lfs.http://example.invalid/repo/info/lfs.access:', p.stderr)
+        self.assertNotIn(b'local credential.helper:', p.stderr)
+        self.assertFalse((one / 'endpoint-helper-ran').exists())
+        self.assertFalse((one / 'pull-driver-ran').exists())
+
+    def test_exec_reports_ignored_lfsconfig_in_root_and_submodule(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        repos = (one, one / 'libs/lib')
+        for repo in repos:
+            with (repo / '.gitignore').open('a') as f:
+                f.write('\n.lfsconfig\n')
+            self.git(repo, 'config', 'credential.helper', '!touch ' + shlex.quote(str(one / 'lfs-credential-ran')))
+        paths = ('.lfsconfig', 'libs/lib/.lfsconfig')
+        for operation in ('add', 'change', 'remove'):
+            with self.subTest(operation=operation):
+                if operation == 'remove':
+                    commands = ['rm ' + path for path in paths]
+                else:
+                    url = 'https://example.invalid/' + operation
+                    content = '[lfs]\n url = ' + url + '\n'
+                    commands = ['printf %s ' + shlex.quote(content) + ' > ' + path for path in paths]
+                p = self.exec_sh(wid, ' && '.join(commands) + '; exit 7', '--require-sandbox', code=7)
+                verb = {'add': 'added', 'change': 'changed', 'remove': 'removed'}[operation]
+                for path in paths:
+                    self.assertIn(('exec ' + verb + ' Git LFS configuration: ' + path).encode(), p.stderr)
+                self.assertNotIn(b'credential.helper:', p.stderr)
+                self.assertFalse((one / 'lfs-credential-ran').exists())
+
+    def test_exec_reports_lfsconfig_includes_and_ignores_unsupported_hook_setting(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        policy = one / '.world-git/lfs-policy'
+        policy.write_text('[lfs]\n url = https://example.invalid/before\n')
+        # Keep the external alias readable without traversing gated store snapshots.
+        ignored_hooks = self.root / 'ignored-lfs-hooks'
+        ignored_hooks.mkdir()
+        (one / 'ignored-hook-alias').symlink_to(ignored_hooks, target_is_directory=True)
+        (one / '.lfsconfig').write_text('[include]\n path = .world-git/lfs-policy\n'
+                                      '[core]\n hooksPath = ignored-hook-alias\n')
+        p = self.exec_sh(wid, "printf '[lfs]\\n url = https://example.invalid/after\\n' > .world-git/lfs-policy",
+                         '--require-sandbox')
+        self.assertIn(b'exec changed a Git include target: .world-git/lfs-policy', p.stderr)
+        self.assertNotIn(b'Git LFS configuration:', p.stderr)
+        self.assertNotIn(b'Git guard unavailable', p.stderr)
+
+    def test_exec_reports_gitmodules_sources_without_running_helpers(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        paths = ('.gitmodules', 'libs/lib/.gitmodules')
+        payload = '[submodule "future"]\n path = future\n url = ext::touch module-helper-ran\n'
+        p = self.exec_sh(wid, '; '.join('printf %s ' + shlex.quote(payload) + ' >> ' + shlex.quote(path)
+                                      for path in paths) + '; exit 7', '--no-sandbox', code=7)
+        for path in paths:
+            self.assertIn(b'Git submodule configuration: ' + path.encode(), p.stderr)
+        config = one / '.gitmodules'
+        config.unlink()
+        replacement = one / '.world-git/module-blob'
+        # Includes in .gitmodules are ignored by Git and must not be traversed.
+        replacement.write_text(payload + '[include]\n path = ' + str(one / '.world-git/module-fifo') + '\n')
+        os.mkfifo(one / '.world-git/module-fifo')
+        oid = self.git(one, 'hash-object', '-w', str(replacement)).stdout.strip().decode()
+        marker = one / 'module-fsmonitor-ran'
+        monitor = one / '.world-git/module-monitor'
+        monitor.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(marker)) + '\n')
+        monitor.chmod(0o755)
+        self.git(one, 'config', 'core.fsmonitor', str(monitor))
+        p = self.exec_sh(wid, 'git -c core.fsmonitor=false update-index --cacheinfo 100644,' + oid +
+                         ',.gitmodules; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'Git submodule configuration: .world-git/repo.git/worktrees/active (:.gitmodules)', p.stderr)
+        tree = self.git(one, '-c', 'core.fsmonitor=false', 'write-tree').stdout.strip().decode()
+        head = self.git(one, 'commit-tree', tree, '-p', 'HEAD', '-m', 'module fallback').stdout.strip().decode()
+        self.git(one, '-c', 'core.fsmonitor=false', 'update-index', '--force-remove', '.gitmodules')
+        p = self.exec_sh(wid, 'git update-ref HEAD ' + head + '; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'Git submodule configuration: .world-git/repo.git/worktrees/active (HEAD:.gitmodules)', p.stderr)
+        self.assertNotIn(b'Git guard unavailable', p.stderr)
+        self.assertFalse(marker.exists())
+        for checkout in (one, one / 'libs/lib'):
+            self.assertFalse((checkout / 'module-helper-ran').exists())
+
+    def test_exec_reports_lfsconfig_index_head_and_blob_includes_without_fsmonitor(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        policy = one / '.world-git/lfs-blob-policy'
+        policy.write_text('[lfs]\n fetchinclude = before/**\n')
+        config = one / '.lfsconfig'
+        include = '[include]\n path = ' + str(policy) + '\n'
+        config.write_text(include + '[lfs]\n url = https://example.invalid/before\n')
+        self.git(one, 'add', '.lfsconfig')
+        self.git(one, 'commit', '-qm', 'LFS fallback configuration')
+        config.unlink()
+        new_config = one / '.world-git/new-lfs-blob'
+        new_config.write_text(include + '[lfs]\n url = https://example.invalid/after\n')
+        oid = self.git(one, 'hash-object', '-w', str(new_config)).stdout.strip().decode()
+        marker = one / 'fsmonitor-inspection-ran'
+        fsmonitor = one / '.world-git/retained-fsmonitor'
+        fsmonitor.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(marker)) + '\n')
+        fsmonitor.chmod(0o755)
+        self.git(one, 'config', 'core.fsmonitor', str(fsmonitor))
+        self.git(one, 'config', 'credential.helper', '!touch ' + shlex.quote(str(one / 'lfs-credential-ran')))
+        # The command itself also disables fsmonitor, leaving its retained definition
+        # available for the guard's separate, unmodified configuration snapshot.
+        p = self.exec_sh(wid, 'git -c core.fsmonitor=false update-index --cacheinfo 100644,' + oid +
+                         ',.lfsconfig; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'Git LFS configuration: .world-git/repo.git/worktrees/active (:.lfsconfig)', p.stderr)
+        self.assertNotIn(b'local core.fsmonitor:', p.stderr)
+        self.assertFalse(marker.exists())
+        tree = self.git(one, '-c', 'core.fsmonitor=false', 'write-tree').stdout.strip().decode()
+        new_head = self.git(one, 'commit-tree', tree, '-p', 'HEAD', '-m', 'alternate LFS fallback').stdout.strip().decode()
+        self.git(one, '-c', 'core.fsmonitor=false', 'update-index', '--force-remove', '.lfsconfig')
+        p = self.exec_sh(wid, 'git update-ref HEAD ' + new_head + '; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'Git LFS configuration: .world-git/repo.git/worktrees/active (HEAD:.lfsconfig)', p.stderr)
+        self.assertFalse(marker.exists())
+        p = self.exec_sh(wid, "printf '[lfs]\\n fetchinclude = after/**\\n' > .world-git/lfs-blob-policy",
+                         '--require-sandbox')
+        self.assertIn(b'exec changed a Git include target: .world-git/lfs-blob-policy', p.stderr)
+        self.assertNotIn(b'Git LFS configuration:', p.stderr)
+        self.assertFalse(marker.exists())
+        self.assertFalse((one / 'lfs-credential-ran').exists())
+        self.assertFalse(config.exists())
+
+    def test_exec_refuses_nonregular_lfsconfig(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        config = one / '.lfsconfig'
+        for kind in ('symlink', 'fifo'):
+            with self.subTest(kind=kind):
+                if kind == 'symlink':
+                    config.symlink_to(one / 'file')
+                else:
+                    os.mkfifo(config)
+                p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+                self.assertIn(b'nonregular Git include target cannot be inspected', p.stderr)
+                self.assertFalse((one / 'should-not-run').exists())
+                config.unlink()
+
+    def test_exec_reports_redirect_policy_activating_retained_credentials(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        helper = '!touch ' + shlex.quote(str(one / 'redirect-credential-ran'))
+        self.git(one, 'config', 'credential.helper', helper)
+        keys = ('http.followRedirects', 'http.https://example.invalid/repo.followRedirects')
+        for key in keys:
+            self.git(one, 'config', key, 'false')
+        p = self.exec_sh(wid, 'git config http.followRedirects true && '
+                         'git config http.https://example.invalid/repo.followRedirects initial; exit 7',
+                         '--no-sandbox', code=7)
+        for key, value in zip(keys, ('true', 'initial')):
+            self.assertIn(b'local ' + key.lower().encode() + b': false -> ' + value.encode(), p.stderr)
+        self.assertNotIn(b'local credential.helper:', p.stderr)
+        self.assertEqual(self.git(one, 'config', 'credential.helper').stdout.strip(), helper.encode())
+        self.assertFalse((one / 'redirect-credential-ran').exists())
+
+    def test_exec_reports_lfs_fetch_filters_activating_retained_agent(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'lfs.customtransfer.retained.path', '/bin/sh')
+        self.git(one, 'config', 'lfs.customtransfer.retained.args', '-c "touch retained-lfs-agent-ran"')
+        self.git(one, 'config', 'lfs.standaloneTransferAgent', 'retained')
+        self.git(one, 'config', 'lfs.fetchInclude', 'never-matching/**')
+        self.git(one, 'config', 'lfs.fetchExclude', '*')
+        p = self.exec_sh(wid, "git config lfs.fetchInclude '*' && git config --unset lfs.fetchExclude; exit 7",
+                         '--no-sandbox', code=7)
+        self.assertIn(b'local lfs.fetchinclude: never-matching/** -> *', p.stderr)
+        self.assertIn(b'local lfs.fetchexclude: * -> (unset)', p.stderr)
+        for key in (b'lfs.customtransfer.retained.path', b'lfs.customtransfer.retained.args',
+                    b'lfs.standalonetransferagent'):
+            self.assertNotIn(b'local ' + key + b':', p.stderr)
+        self.assertFalse((one / 'retained-lfs-agent-ran').exists())
+
+    def test_exec_reports_lfs_access_and_default_upstream_merge_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'credential.helper', '!touch lfs-credential-ran')
+        self.git(one, 'config', 'merge.retained.driver', 'touch retained-merge-ran')
+        info = one / '.world-git/repo.git/info'
+        info.mkdir(exist_ok=True)
+        (info / 'attributes').write_text('* merge=retained\n')
+        branch = self.git(one, 'branch', '--show-current').stdout.decode().strip()
+        self.git(one, 'config', 'branch.' + branch + '.remote', '.')
+        self.git(one, 'config', 'branch.' + branch + '.merge', 'refs/heads/upstream')
+        self.git(one, 'config', 'merge.defaultToUpstream', 'false')
+        self.git(one, 'config', 'merge.ff', 'only')
+        p = self.exec_sh(wid, 'git config lfs.access basic && '
+                         'git config lfs.https://example.invalid/repo.access basic && '
+                         'git config merge.defaultToUpstream true && git config merge.ff true; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local lfs.access: (unset) -> basic', p.stderr)
+        self.assertIn(b'local lfs.https://example.invalid/repo.access: (unset) -> basic', p.stderr)
+        self.assertIn(b'local merge.defaulttoupstream: false -> true', p.stderr)
+        self.assertIn(b'local merge.ff: only -> true', p.stderr)
+        for key in (b'credential.helper', b'merge.retained.driver', b'branch.' + branch.encode() + b'.merge'):
+            self.assertNotIn(b'local ' + key + b':', p.stderr)
+        self.assertNotIn(b'Git repository attributes:', p.stderr)
+        self.assertFalse((one / 'lfs-credential-ran').exists())
+        self.assertFalse((one / 'retained-merge-ran').exists())
+
+    def test_exec_reports_interactive_and_proactive_credential_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'core.askPass', 'touch askpass-command-ran')
+        self.git(one, 'config', 'credential.helper', '!touch credential-command-ran')
+        self.git(one, 'config', 'credential.interactive', 'false')
+        p = self.exec_sh(wid, 'git config credential.interactive true && '
+                         'git config http.proactiveAuth basic && '
+                         'git config http.https://example.invalid/repo.proactiveAuth basic; exit 7',
+                         '--no-sandbox', code=7)
+        self.assertIn(b'local credential.interactive: false -> true', p.stderr)
+        self.assertIn(b'local http.proactiveauth: (unset) -> basic', p.stderr)
+        self.assertIn(b'local http.https://example.invalid/repo.proactiveauth: (unset) -> basic', p.stderr)
+        self.assertNotIn(b'local core.askpass:', p.stderr)
+        self.assertNotIn(b'local credential.helper:', p.stderr)
+        self.assertFalse((one / 'askpass-command-ran').exists())
+        self.assertFalse((one / 'credential-command-ran').exists())
+
+    def test_exec_reports_enabling_builtin_submodule_update(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        child = one / 'libs/lib'
+        self.git(child, 'config', 'filter.retained.smudge', 'touch retained-filter-ran; cat')
+        child_admin = one / '.world-git/repo.git/worktrees/active/modules/lib-module'
+        info = child_admin / 'info'
+        info.mkdir(exist_ok=True)
+        (info / 'attributes').write_text('*.txt filter=retained\n')
+        self.git(one, 'config', 'submodule.lib-module.update', 'none')
+        p = self.exec_sh(wid, 'git config submodule.lib-module.update checkout; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local submodule.lib-module.update: none -> checkout', p.stderr)
+        self.assertNotIn(b'local filter.retained.smudge:', p.stderr)
+        self.assertNotIn(b'Git repository attributes:', p.stderr)
+        # Removing the selector also restores Git's built-in default mode.
+        self.git(one, 'config', 'submodule.lib-module.update', 'none')
+        p = self.exec_sh(wid, 'git config --unset submodule.lib-module.update', '--no-sandbox')
+        self.assertIn(b'local submodule.lib-module.update: none -> (unset)', p.stderr)
+        self.assertFalse((child / 'retained-filter-ran').exists())
+        self.assertFalse((one / 'retained-filter-ran').exists())
+
+    def test_exec_reports_enabling_preconfigured_push_transport(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'remote.dormant.url', 'ext::touch push-helper-ran')
+        self.git(one, 'config', 'remote.pushDefault', 'dormant')
+        self.git(one, 'config', 'push.default', 'nothing')
+        p = self.exec_sh(wid, 'git config push.default current && '
+                         "git config remote.dormant.push 'HEAD:refs/heads/main' && "
+                         'git config remote.dormant.mirror true; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local push.default: nothing -> current', p.stderr)
+        self.assertIn(b'local remote.dormant.push: (unset) -> HEAD:refs/heads/main', p.stderr)
+        self.assertIn(b'local remote.dormant.mirror: (unset) -> true', p.stderr)
+        self.assertNotIn(b'local remote.dormant.url:', p.stderr)
+        self.assertNotIn(b'local remote.pushdefault:', p.stderr)
+        # Upstream setup gates apply to simple/upstream, unlike push.default=current.
+        branch = self.git(one, 'branch', '--show-current').stdout.decode().strip()
+        self.git(one, 'config', '--unset', 'remote.dormant.push')
+        self.git(one, 'config', '--unset', 'remote.dormant.mirror')
+        self.git(one, 'config', 'push.default', 'upstream')
+        self.git(one, 'config', 'branch.' + branch + '.remote', 'dormant')
+        p = self.exec_sh(wid, 'git config push.autoSetupRemote true', '--no-sandbox')
+        self.assertIn(b'local push.autosetupremote: (unset) -> true', p.stderr)
+        self.assertNotIn(b'local remote.dormant.url:', p.stderr)
+        self.git(one, 'config', '--unset', 'push.autoSetupRemote')
+        p = self.exec_sh(wid, 'git config ' + shlex.quote('branch.' + branch + '.merge') +
+                         ' refs/heads/main', '--no-sandbox')
+        self.assertIn(b'local branch.' + branch.encode() + b'.merge: (unset) -> refs/heads/main', p.stderr)
+        self.assertNotIn(b'local remote.dormant.url:', p.stderr)
+        self.assertNotIn(b'local remote.pushdefault:', p.stderr)
+        self.assertFalse((one / 'push-helper-ran').exists())
+
+    def test_exec_reports_proxy_password_helper_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'core.askpass', 'touch proxy-helper-ran')
+        proxy = 'http://username@proxy.invalid:8080'
+        keys = ('http.proxy', 'http.https://example.invalid/repo.proxy', 'remote.origin.proxy')
+        p = self.exec_sh(wid, ' && '.join('git config ' + shlex.quote(key) + ' ' + shlex.quote(proxy)
+                                        for key in keys) + '; exit 7', '--no-sandbox', code=7)
+        for key in keys:
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> ' + proxy.encode(), p.stderr)
+        self.assertNotIn(b'local core.askpass:', p.stderr)
+        self.assertFalse((one / 'proxy-helper-ran').exists())
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux hooks ancestor mount pins')
+    def test_exec_pins_linux_custom_hook_ancestors_without_reopening_external_paths(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        custom = one / '.world-git/custom'
+        hooks = custom / 'hooks'
+        hooks.mkdir(parents=True)
+        (custom / 'cancelled').mkdir()
+        hook = hooks / 'pre-commit'
+        hook.write_text('#!/bin/sh\nexit 0\n')
+        original = hook.read_bytes()
+        self.git(one, 'config', 'core.hooksPath', str(custom / 'cancelled/../hooks'))
+        old = custom.with_name('old-custom')
+        self.assert_denied(wid, 'mv ' + shlex.quote(str(custom)) + ' ' + shlex.quote(str(old)) +
+                           ' && mkdir -p ' + shlex.quote(str(hooks)) + ' && echo evil > ' + shlex.quote(str(hook)))
+        self.assertFalse(old.exists())
+        self.assertEqual(hook.read_bytes(), original)
+        self.assert_denied(wid, 'mv ' + shlex.quote(str(custom / 'cancelled')) + ' ' +
+                           shlex.quote(str(custom / 'old-cancelled')))
+        self.assertFalse((custom / 'old-cancelled').exists())
+        self.exec_sh(wid, 'echo allowed > ' + shlex.quote(str(custom / 'sibling')), '--require-sandbox')
+        self.assertEqual((custom / 'sibling').read_text().strip(), 'allowed')
+        external = self.root / 'external-hooks-parent'
+        (external / 'hooks').mkdir(parents=True)
+        sibling = external / 'sibling'
+        sibling.write_text('unchanged')
+        self.git(one, 'config', 'core.hooksPath', str(external / 'hooks'))
+        self.assert_denied(wid, 'echo evil > ' + shlex.quote(str(sibling)))
+        self.assertEqual(sibling.read_text(), 'unchanged')
+
+    def test_exec_reports_certificate_and_signing_helper_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'core.askpass', 'touch certificate-helper-ran')
+        self.git(one, 'config', 'gpg.format', 'ssh')
+        self.git(one, 'config', 'gpg.ssh.defaultKeyCommand', 'touch default-key-helper-ran')
+        self.git(one, 'config', 'user.signingKey', 'existing-key')
+        cert_keys = ('http.sslCert', 'http.proxySSLCert',
+                     'http.https://example.invalid/repo.sslCert',
+                     'http.https://example.invalid/repo.proxySSLCert')
+        for key in cert_keys:
+            self.git(one, 'config', key, 'existing-certificate.pem')
+        values = {'http.sslCertPasswordProtected': 'true',
+                  'http.proxySSLCertPasswordProtected': 'true',
+                  'http.https://example.invalid/repo.sslCertPasswordProtected': 'true',
+                  'http.https://example.invalid/repo.proxySSLCertPasswordProtected': 'true'}
+        p = self.exec_sh(wid, ' && '.join('git config ' + shlex.quote(key) + ' ' + value
+                                        for key, value in values.items()) +
+                         ' && git config --unset user.signingKey; exit 7', '--no-sandbox', code=7)
+        for key, value in values.items():
+            self.assertIn(b'local ' + key.lower().encode() + b': (unset) -> ' + value.encode(), p.stderr)
+        self.assertIn(b'local user.signingkey: existing-key -> (unset)', p.stderr)
+        for key in (b'core.askpass', b'gpg.format', b'gpg.ssh.defaultkeycommand'):
+            self.assertNotIn(b'local ' + key + b':', p.stderr)
+        for key in cert_keys:
+            self.assertNotIn(b'local ' + key.lower().encode() + b':', p.stderr)
+            self.git(one, 'config', '--unset', key)
+        p = self.exec_sh(wid, ' && '.join('git config ' + shlex.quote(key) + ' existing-certificate.pem'
+                                        for key in cert_keys), '--no-sandbox')
+        for key in cert_keys:
+            self.assertIn(b'local ' + key.lower().encode() + b': (unset) -> existing-certificate.pem', p.stderr)
+        self.assertNotIn(b'local core.askpass:', p.stderr)
+        for key in values:
+            self.assertNotIn(b'local ' + key.lower().encode() + b':', p.stderr)
+        self.assertFalse((one / 'certificate-helper-ran').exists())
+        self.assertFalse((one / 'default-key-helper-ran').exists())
+
+    def test_exec_reports_lfs_transfer_and_autocorrect_selectors(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        commands = one / 'command-bin'
+        commands.mkdir()
+        transfer = commands / 'transfer-agent'
+        corrected = commands / 'git-customcommand'
+        for program in (transfer, corrected):
+            program.write_text('#!/bin/sh\ntouch selected-command-ran\n')
+            program.chmod(0o755)
+        self.env['PATH'] = str(commands) + os.pathsep + self.env['PATH']
+        self.git(one, 'config', 'lfs.customtransfer.payload.path', str(transfer))
+        self.git(one, 'config', 'lfs.basictransfersonly', 'true')
+        values = {'lfs.standalonetransferagent': 'payload',
+                  'lfs.https://example.invalid/repo.standalonetransferagent': 'payload',
+                  'help.autocorrect': 'immediate',
+                  'lfs.customtransfer.payload.args': '--mode=custom',
+                  'lfs.customtransfer.payload.direction': 'both'}
+        p = self.exec_sh(wid, ' && '.join('git config ' + shlex.quote(key) + ' ' + shlex.quote(value)
+                                        for key, value in values.items()) +
+                         ' && git config lfs.basictransfersonly false; exit 7', '--no-sandbox', code=7)
+        for key, value in values.items():
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> ' + value.encode(), p.stderr)
+        self.assertIn(b'local lfs.basictransfersonly: true -> false', p.stderr)
+        self.assertNotIn(b'local lfs.customtransfer.payload.path:', p.stderr)
+        self.assertFalse((one / 'selected-command-ran').exists())
+
+    def test_exec_reports_selecting_preconfigured_help_commands(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'browser.payload.cmd', 'touch selected-help-ran')
+        self.git(one, 'config', 'man.payload.cmd', 'touch selected-help-ran')
+        values = {'help.browser': 'payload', 'help.format': 'web',
+                  'instaweb.browser': 'payload', 'man.viewer': 'payload'}
+        p = self.exec_sh(wid, ' && '.join('git config ' + key + ' ' + val for key, val in values.items()),
+                         '--no-sandbox')
+        for key, val in values.items():
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> ' + val.encode(), p.stderr)
+        self.assertNotIn(b'local browser.payload.cmd:', p.stderr)
+        self.assertNotIn(b'local man.payload.cmd:', p.stderr)
+        self.assertFalse((one / 'selected-help-ran').exists())
+
+    def test_exec_reports_enabling_submodule_status(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        child = one / 'libs/lib'
+        for key in ('core.fsmonitor', 'diff.external', 'gpg.program'):
+            self.git(child, 'config', key, 'touch child-program-ran')
+        self.git(child, 'config', 'log.showSignature', 'true')
+        self.git(one, 'config', 'submodule.lib-module.ignore', 'all')
+        p = self.exec_sh(wid, 'git config submodule.lib-module.ignore none && '
+                         'git config diff.ignoreSubmodules none && git config diff.submodule diff && '
+                         'git config status.submoduleSummary true; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local submodule.lib-module.ignore: all -> none', p.stderr)
+        self.assertIn(b'local diff.ignoresubmodules: (unset) -> none', p.stderr)
+        self.assertIn(b'local diff.submodule: (unset) -> diff', p.stderr)
+        self.assertIn(b'local status.submodulesummary: (unset) -> true', p.stderr)
+        for key in (b'core.fsmonitor', b'diff.external', b'gpg.program', b'log.showsignature'):
+            self.assertNotIn(b'local ' + key + b':', p.stderr)
+        self.assertFalse((one / 'child-program-ran').exists())
+        self.assertFalse((child / 'child-program-ran').exists())
+
+    def test_exec_reports_three_way_am_activating_retained_merge_driver(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        command = 'touch ' + shlex.quote(str(one / 'am-merge-driver-ran'))
+        self.git(one, 'config', 'merge.retained.driver', command)
+        self.git(one, 'config', 'am.threeWay', 'false')
+        attributes = one / '.world-git/repo.git/info/attributes'
+        attributes.parent.mkdir(exist_ok=True)
+        attributes.write_text('file merge=retained\n')
+        original = attributes.read_bytes()
+        p = self.exec_sh(wid, 'git config am.threeWay true; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local am.threeway: false -> true', p.stderr)
+        self.assertNotIn(b'local merge.retained.driver:', p.stderr)
+        self.assertNotIn(b'Git repository attributes:', p.stderr)
+        self.assertEqual(attributes.read_bytes(), original)
+        self.assertEqual(self.git(one, 'config', 'merge.retained.driver').stdout.strip(), command.encode())
+        self.assertFalse((one / 'am-merge-driver-ran').exists())
+
+    def test_exec_reports_hook_and_object_validation_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        marker = one / 'retained-hook-ran'
+        command = 'touch ' + shlex.quote(str(marker))
+        self.git(one, 'config', 'hook.retained.command', command)
+        self.git(one, 'config', 'hook.retained.enabled', 'false')
+        self.git(one, 'config', 'hook.pre-commit.enabled', 'false')
+        self.git(one, 'config', 'fetch.fsckObjects', 'true')
+        self.git(one, 'config', 'transfer.fsckObjects', 'true')
+        hooks = one / '.world-git/repo.git/hooks'
+        hooks.mkdir(exist_ok=True)
+        original = ('#!/bin/sh\n' + command + '\n').encode()
+        for name in ('pre-commit', 'reference-transaction'):
+            (hooks / name).write_bytes(original)
+            (hooks / name).chmod(0o755)
+        p = self.exec_sh(wid, 'git config hook.retained.event pre-commit; '
+                         'git config hook.retained.enabled true; git config hook.pre-commit.enabled true; '
+                         'git config fetch.fsckObjects false; git config transfer.fsckObjects false; exit 7',
+                         '--no-sandbox', code=7)
+        self.assertIn(b'local hook.retained.event: (unset) -> pre-commit', p.stderr)
+        for key in ('hook.retained.enabled', 'hook.pre-commit.enabled'):
+            self.assertIn(b'local ' + key.encode() + b': false -> true', p.stderr)
+        for key in ('fetch.fsckobjects', 'transfer.fsckobjects'):
+            self.assertIn(b'local ' + key.encode() + b': true -> false', p.stderr)
+        self.assertNotIn(b'local hook.retained.command:', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        for name in ('pre-commit', 'reference-transaction'):
+            self.assertEqual((hooks / name).read_bytes(), original)
+        self.assertFalse(marker.exists())
+
+    def test_exec_reports_fetch_refspec_activating_retained_reference_hook(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'remote.retained.url', str(self.source))
+        self.assertEqual(self.git(one, 'config', '--get-all', 'remote.retained.fetch', code=1).stdout, b'')
+        hook = one / '.world-git/repo.git/hooks/reference-transaction'
+        hook.parent.mkdir(exist_ok=True)
+        marker = one / 'fetch-reference-hook-ran'
+        hook.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(marker)) + '\n')
+        hook.chmod(0o755)
+        original = hook.read_bytes()
+        refspec = '+refs/heads/*:refs/remotes/retained/*'
+        p = self.exec_sh(wid, 'git config remote.retained.fetch ' + shlex.quote(refspec) + '; exit 7',
+                         '--no-sandbox', code=7)
+        self.assertIn(b'local remote.retained.fetch: (unset) -> ' + refspec.encode(), p.stderr)
+        self.assertNotIn(b'local remote.retained.url:', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertEqual(hook.read_bytes(), original)
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.git(one, 'for-each-ref', '--format=%(refname)', 'refs/remotes/retained/').stdout, b'')
+        self.git(one, 'config', '--', 'remote.retained.tagOpt', '--no-tags')
+        p = self.exec_sh(wid, 'git config -- remote.retained.tagOpt --tags; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local remote.retained.tagopt: --no-tags -> --tags', p.stderr)
+        self.assertNotIn(b'local remote.retained.url:', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertEqual(hook.read_bytes(), original)
+        self.assertFalse(marker.exists())
+
+    def test_exec_reports_pruning_activating_retained_reference_hook(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'remote.origin.url', str(self.source))
+        self.git(one, 'config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*')
+        self.git(one, 'update-ref', 'refs/remotes/origin/stale', 'HEAD')
+        self.git(one, 'tag', 'stale')
+        hook = one / '.world-git/repo.git/hooks/reference-transaction'
+        hook.parent.mkdir(exist_ok=True)
+        marker = one / 'prune-reference-hook-ran'
+        hook.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(marker)) + '\n')
+        hook.chmod(0o755)
+        original = hook.read_bytes()
+        for key in ('fetch.prune', 'remote.origin.prune', 'fetch.pruneTags', 'remote.origin.pruneTags'):
+            self.git(one, 'config', key, 'false')
+        # Tag pruning is tested only after prune itself is enabled and retained.
+        for keys in (('fetch.prune', 'remote.origin.prune'),
+                     ('fetch.pruneTags', 'remote.origin.pruneTags')):
+            p = self.exec_sh(wid, ' && '.join('git config ' + key + ' true' for key in keys) + '; exit 7',
+                             '--no-sandbox', code=7)
+            for key in keys:
+                self.assertIn(b'local ' + key.lower().encode() + b': false -> true', p.stderr)
+            self.assertNotIn(b'a Git hook:', p.stderr)
+            self.assertNotIn(b'local remote.origin.url:', p.stderr)
+            self.assertEqual(hook.read_bytes(), original)
+            self.assertFalse(marker.exists())
+        # Configuration inspection neither fetches nor prunes the prepared stale refs.
+        self.assertEqual(self.git(one, 'rev-parse', 'refs/remotes/origin/stale').stdout.strip(), self.base)
+        self.assertEqual(self.git(one, 'rev-parse', 'refs/tags/stale').stdout.strip(), self.base)
+
+    def test_exec_reports_selecting_preconfigured_merge_driver(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'merge.payload.driver', 'touch merge-driver-ran')
+        self.git(one, 'config', 'filter.payload.clean', 'touch merge-filter-ran; cat')
+        info = one / '.world-git/repo.git/info'
+        info.mkdir(exist_ok=True)
+        (info / 'attributes').write_text('* filter=payload\n')
+        p = self.exec_sh(wid, 'git config merge.outer.recursive payload && '
+                         'git config merge.default payload && git config merge.renormalize true; exit 7',
+                         '--no-sandbox', code=7)
+        self.assertIn(b'local merge.outer.recursive: (unset) -> payload', p.stderr)
+        self.assertIn(b'local merge.default: (unset) -> payload', p.stderr)
+        self.assertIn(b'local merge.renormalize: (unset) -> true', p.stderr)
+        self.assertNotIn(b'local merge.payload.driver:', p.stderr)
+        self.assertNotIn(b'local filter.payload.clean:', p.stderr)
+        self.assertNotIn(b'Git repository attributes:', p.stderr)
+        self.assertFalse((one / 'merge-driver-ran').exists())
+        self.assertFalse((one / 'merge-filter-ran').exists())
+
+    def test_exec_reports_selecting_preconfigured_diff_and_merge_tools(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'difftool.payload.cmd', 'touch selected-tool-ran')
+        self.git(one, 'config', 'mergetool.payload.cmd', 'touch selected-tool-ran')
+        keys = ('diff.tool', 'diff.guitool', 'merge.tool', 'merge.guitool')
+        p = self.exec_sh(wid, ' && '.join('git config ' + key + ' payload' for key in keys), '--no-sandbox')
+        for key in keys:
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> payload', p.stderr)
+        self.assertNotIn(b'local difftool.payload.cmd:', p.stderr)
+        self.assertNotIn(b'local mergetool.payload.cmd:', p.stderr)
+        p = self.exec_sh(wid, 'git config difftool.guiDefault auto && git config mergetool.guiDefault true',
+                         '--no-sandbox')
+        self.assertIn(b'local difftool.guidefault: (unset) -> auto', p.stderr)
+        self.assertIn(b'local mergetool.guidefault: (unset) -> true', p.stderr)
+        self.assertNotIn(b'local diff.guitool:', p.stderr)
+        self.assertNotIn(b'local merge.guitool:', p.stderr)
+        self.assertFalse((one / 'selected-tool-ran').exists())
+
+    def test_exec_reports_disabling_prompts_for_retained_tools(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        for kind, selector in (('difftool', 'diff.tool'), ('mergetool', 'merge.tool')):
+            command = 'touch retained-' + kind + '-ran'
+            self.git(one, 'config', kind + '.payload.cmd', command)
+            self.git(one, 'config', selector, 'payload')
+            self.git(one, 'config', kind + '.prompt', 'true')
+        # With EOF on stdin a true prompt prevents launching these selected commands;
+        # false allows them. Inspection itself must execute neither tool.
+        p = self.exec_sh(wid, 'git config difftool.prompt false && '
+                         'git config mergetool.prompt false; exit 7', '--no-sandbox', code=7)
+        for kind, selector in (('difftool', 'diff.tool'), ('mergetool', 'merge.tool')):
+            self.assertIn(b'local ' + kind.encode() + b'.prompt: true -> false', p.stderr)
+            self.assertNotIn(b'local ' + kind.encode() + b'.payload.cmd:', p.stderr)
+            self.assertNotIn(b'local ' + selector.encode() + b':', p.stderr)
+            self.assertEqual(self.git(one, 'config', kind + '.payload.cmd').stdout.strip(),
+                             ('touch retained-' + kind + '-ran').encode())
+            self.assertFalse((one / ('retained-' + kind + '-ran')).exists())
+
+    def test_exec_reports_activating_unchanged_proc_receive_hook(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        hook = one / '.world-git/repo.git/hooks/proc-receive'
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text('#!/bin/sh\ntouch proc-receive-ran\n')
+        hook.chmod(0o755)
+        p = self.exec_sh(wid, 'git config receive.procReceiveRefs refs/for/; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local receive.procreceiverefs: (unset) -> refs/for/', p.stderr)
+        self.assertNotIn(b'exec changed a Git hook:', p.stderr)
+        self.assertFalse((one / 'proc-receive-ran').exists())
+
+    def test_exec_reports_activating_unchanged_submodule_update_commands(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'submodule.lib-module.update', '!touch update-command-ran')
+        self.git(one, 'config', 'submodule.vendor/unused.update', '!touch update-command-ran')
+        self.git(one, 'config', 'submodule.lib-module.active', 'false')
+        self.git(one, 'config', '--replace-all', 'submodule.active', ':(exclude)**')
+        p = self.exec_sh(wid, 'git config submodule.lib-module.active true && '
+                         'git config --replace-all submodule.active vendor/unused; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local submodule.lib-module.active: false -> true', p.stderr)
+        self.assertIn(b'local submodule.active: :(exclude)** -> vendor/unused', p.stderr)
+        self.assertNotIn(b'local submodule.lib-module.update:', p.stderr)
+        self.assertNotIn(b'local submodule.vendor/unused.update:', p.stderr)
+        # Without either active selector, adding even an ordinary URL activates a module.
+        self.git(one, 'config', '--unset-all', 'submodule.active')
+        self.git(one, 'config', '--unset', 'submodule.lib-module.active')
+        url = self.git(one, 'config', 'submodule.lib-module.url').stdout.decode().strip()
+        self.git(one, 'config', '--unset', 'submodule.lib-module.url')
+        p = self.exec_sh(wid, 'git config submodule.lib-module.url ' + shlex.quote(url), '--no-sandbox')
+        self.assertIn(b'local submodule.lib-module.url: (unset) -> ' + url.encode(), p.stderr)
+        self.assertNotIn(b'local submodule.lib-module.update:', p.stderr)
+        # Recursion selectors can activate an unchanged child's fetch/push helper.
+        self.git(one / 'libs/lib', 'config', 'remote.origin.url', 'ext::touch fetch-helper-ran')
+        values = {'submodule.recurse': 'true', 'fetch.recursesubmodules': 'on-demand',
+                  'push.recursesubmodules': 'on-demand',
+                  'submodule.lib-module.fetchrecursesubmodules': 'true'}
+        p = self.exec_sh(wid, ' && '.join('git config ' + key + ' ' + val for key, val in values.items()),
+                         '--no-sandbox')
+        for key, val in values.items():
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> ' + val.encode(), p.stderr)
+        self.assertNotIn(b'local remote.origin.url:', p.stderr)
+        for directory in (one, one / 'libs/lib', one / 'vendor/unused'):
+            self.assertFalse((directory / 'update-command-ran').exists())
+            self.assertFalse((directory / 'fetch-helper-ran').exists())
+
+    def test_exec_reports_activating_preconfigured_signing_program(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        program = one / 'signing-program'
+        program.write_text('#!/bin/sh\ntouch signing-program-ran\n')
+        program.chmod(0o755)
+        self.git(one, 'config', 'gpg.program', str(program))
+        self.git(one, 'config', 'gpg.ssh.program', str(program))
+        values = {'commit.gpgsign': 'true', 'tag.gpgsign': 'true',
+                  'tag.forcesignannotated': 'true', 'push.gpgsign': 'if-asked', 'gpg.format': 'ssh'}
+        p = self.exec_sh(wid, ' && '.join('git config ' + key + ' ' + val for key, val in values.items()),
+                         '--no-sandbox')
+        for key, val in values.items():
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> ' + val.encode(), p.stderr)
+        self.assertNotIn(b'local gpg.program:', p.stderr)
+        self.assertNotIn(b'local gpg.ssh.program:', p.stderr)
+        p = self.exec_sh(wid, "git config log.showSignature true && git config merge.verifySignatures true && "
+                         "git config format.pretty signature && git config pretty.signature '%G?' && "
+                         "git config rebase.instructionFormat '%G?' && "
+                         "git config format.commitListFormat 'log:%G?' && git config format.coverLetter true && "
+                         "git config branch.sort signature:grade && git config tag.sort signature:grade", '--no-sandbox')
+        for key, value in (('log.showsignature', 'true'), ('merge.verifysignatures', 'true'),
+                           ('format.pretty', 'signature'), ('pretty.signature', '%G?'), ('rebase.instructionformat', '%G?'),
+                           ('format.commitlistformat', 'log:%G?'), ('format.coverletter', 'true'),
+                           ('branch.sort', 'signature:grade'), ('tag.sort', 'signature:grade')):
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> ' + value.encode(), p.stderr)
+        self.assertNotIn(b'local gpg.program:', p.stderr)
+        self.assertNotIn(b'local gpg.ssh.program:', p.stderr)
+        self.assertFalse((one / 'signing-program-ran').exists())
+
+    def test_exec_reports_missing_or_replaced_active_git_administration(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        active = one / '.world-git/repo.git/worktrees/active'
+        saved = active.with_name('saved-active')
+        rel = '.world-git/repo.git/worktrees/active'
+        operations = ('mv ' + rel + ' ' + rel.replace('/active', '/saved-active'),
+                      'mv ' + rel + ' ' + rel.replace('/active', '/saved-active') + '; ln -s saved-active ' + rel,
+                      'mv ' + rel + ' ' + rel.replace('/active', '/saved-active') + '; echo replaced > ' + rel,
+                      'rm -rf ' + rel)
+        for operation in operations:
+            with self.subTest(operation=operation):
+                p = self.exec_sh(wid, operation + '; exit 7', '--no-sandbox', code=7)
+                self.assertIn(b'WARNING: exec left', p.stderr)
+                self.assertIn(b'Git administration replaced or incomplete', p.stderr)
+                p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+                self.assertIn(b'incomplete Git administration scan', p.stderr)
+                self.assertFalse((one / 'should-not-run').exists())
+                if saved.exists():
+                    if active.is_symlink() or active.exists():
+                        active.unlink()
+                    saved.rename(active)
+
+    def test_exec_reports_disappearing_git_administration(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        for operation in ('mv .world-git .saved-admin',
+                          'mv .world-git .saved-admin; ln -s .saved-admin .world-git',
+                          'mv .world-git .saved-admin; echo replacement > .world-git',
+                          'mv .world-git .saved-admin; mkdir .world-git',
+                          'rm -rf .world-git'):
+            with self.subTest(operation=operation):
+                p = self.exec_sh(wid, operation + '; echo "gitdir: /tmp/elsewhere" > .git; exit 7',
+                                 '--no-sandbox', code=7)
+                self.assertIn(b'WARNING: exec ', p.stderr)
+                self.assertIn(b'Git administration', p.stderr)
+                self.assertIn(b'could not be inspected', p.stderr)
+                if (one / '.saved-admin').exists():
+                    admin = one / '.world-git'
+                    if admin.is_symlink() or admin.is_file():
+                        admin.unlink()
+                    elif admin.exists():
+                        shutil.rmtree(admin)
+                    (one / '.saved-admin').rename(one / '.world-git')
+                    (one / '.git').write_text('gitdir: .world-git/repo.git/worktrees/active\n')
+
+    def test_exec_config_capture_ignores_writable_path_git(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        wrapper = one / 'bin'
+        wrapper.mkdir()
+        marker = one / 'untrusted-git-ran'
+        fake = wrapper / 'git'
+        payload = '#!/bin/sh\necho ran >> ' + shlex.quote(str(marker)) + '\nexit 99\n'
+        fake.write_text(payload)
+        fake.chmod(0o755)
+        self.env['PATH'] = str(wrapper) + os.pathsep + self.env['PATH']
+        self.exec_sh(wid, ':', '--no-sandbox')
+        self.assertFalse(marker.exists())
+        # The command can install the executable after the initial capture too.
+        fake.unlink()
+        script = 'printf %s ' + shlex.quote(payload) + ' > bin/git && chmod +x bin/git'
+        self.exec_sh(wid, script, '--no-sandbox')
+        self.assertFalse(marker.exists())
+
+    def test_exec_config_fifo_include_has_bounded_capture(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        fifo = one / 'blocked-config'
+        os.mkfifo(fifo)
+        script = shlex.quote(shutil.which('git', path=self.env['PATH'])) + ' config include.path ' + shlex.quote(str(fifo)) + '; exit 7'
+        p = subprocess.run((WORLD, 'exec', wid, '--no-sandbox', '--', '/bin/sh', '-c', script),
+                           env=self.env, capture_output=True, timeout=15)
+        self.assertEqual(p.returncode, 7, p.stderr)
+        self.assertIn(b'WARNING: exec left', p.stderr)
+        self.assertIn(b'Git hooks and settings uninspected after the command', p.stderr)
+        # A blocked initial capture also returns, without suppressing the requested command.
+        p = subprocess.run((WORLD, 'exec', wid, '--no-sandbox', '--', '/bin/sh', '-c', 'exit 9'),
+                           env=self.env, capture_output=True, timeout=15)
+        self.assertEqual(p.returncode, 9, p.stderr)
+        self.assertIn(b'could not read', p.stderr)
+
+        # An unavailable initial query must not silently omit hook protections.
+        p = subprocess.run((WORLD, 'exec', wid, '--require-sandbox', '--', '/bin/sh', '-c',
+                            'touch should-not-run'), env=self.env, capture_output=True, timeout=15)
+        self.assertEqual(p.returncode, 3, p.stderr)
+        self.assertIn(b'Git guard unavailable', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+        fifo.unlink()
+        fifo.write_text('[broken config\n')
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'Git guard unavailable', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+
+    def test_exec_post_capture_signal_cancels_query_and_releases_lock(self):
+        import signal
+        import time
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        fifo = one / 'blocked-post-config'
+        os.mkfifo(fifo)
+        script = 'git config include.path ' + shlex.quote(str(fifo))
+        proc = subprocess.Popen((WORLD, 'exec', wid, '--no-sandbox', '--', '/bin/sh', '-c', script),
+                                env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        writer = None
+        try:
+            # A successful writer open proves the post-command inspector has opened the
+            # include; hold it empty so the query stays blocked until cancellation.
+            deadline = time.monotonic() + 10
+            while writer is None and time.monotonic() < deadline:
+                try:
+                    writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+                except OSError as e:
+                    if e.errno != errno.ENXIO:
+                        raise
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.02)
+            self.assertIsNotNone(writer, 'post-command Git query did not open the FIFO')
+            proc.send_signal(signal.SIGTERM)
+            stdout, stderr = proc.communicate(timeout=3)
+            self.assertEqual(proc.returncode, 128 + signal.SIGTERM, (stdout, stderr))
+            # Bubblewrap's namespace teardown can finish after its outer monitor is
+            # reaped. Keep the original writer open so an orphan cannot exit on EOF
+            # and falsely satisfy the check; allow bounded asynchronous descriptor cleanup.
+            deadline = time.monotonic() + 2
+            while True:
+                try:
+                    fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+                except OSError as e:
+                    self.assertEqual(e.errno, errno.ENXIO)
+                    break
+                else:
+                    os.close(fd)
+                if time.monotonic() >= deadline:
+                    self.fail('configuration helper still holds the FIFO open')
+                time.sleep(0.02)
+            os.close(writer)
+            writer = None
+        finally:
+            if writer is not None:
+                os.close(writer)
+            # Release a failed test's reader without leaving any query blocked.
+            fifo.unlink()
+            fifo.write_text('')
+            if proc.poll() is None:
+                proc.terminate()
+            proc.communicate(timeout=10)
+        self.git(one, 'config', '--unset', 'include.path')
+        self.exec_sh(wid, ':', '--no-sandbox')  # the previous exec lock was released
+
+    def test_exec_config_inherited_command_scope_and_expanded_hooks(self):
+        import pwd
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        shared = self.root / 'command-hooks'
+        shared.mkdir()
+        user = pwd.getpwuid(os.getuid())
+        hook_value = '~' + user.pw_name + '/' + os.path.relpath(shared, user.pw_dir)
+        self.env.update(GIT_CONFIG_COUNT='4', GIT_CONFIG_KEY_2='core.hooksPath',
+                        GIT_CONFIG_VALUE_2=hook_value, GIT_CONFIG_KEY_3='include.path',
+                        GIT_CONFIG_VALUE_3=str(one / 'command-config'))
+        included = one / 'command-config'
+        included.write_text('[alias]\n x = !before\n')
+        hook = shared / 'pre-commit'
+        hook.write_text('original\n')
+        self.assert_denied(wid, 'echo changed > ' + shlex.quote(str(hook)))
+        self.assertEqual(hook.read_text(), 'original\n')
+        p = self.exec_sh(wid, "printf '[alias]\\n x = !after\\n' > command-config", '--no-sandbox')
+        self.assertIn(b'command alias.x: !before -> !after', p.stderr)
+        p = self.exec_sh(wid, 'echo changed > ' + shlex.quote(str(hook)), '--no-sandbox')
+        self.assertIn(b'exec changed a Git hook:', p.stderr)
+        # Global/local config and inherited command settings remain observable without
+        # executing any hook or fsmonitor during either read-only capture.
+        marker = one / 'config-command-ran'
+        executable = shared / 'fsmonitor'
+        executable.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(marker)) + '\n')
+        executable.chmod(0o755)
+        hook.write_text(executable.read_text())
+        hook.chmod(0o755)
+        self.git(one, 'config', 'core.fsmonitor', str(executable))
+        self.exec_sh(wid, ':', '--no-sandbox')
+        self.assertFalse(marker.exists())
+
+    def test_exec_in_a_plain_world_says_nothing_about_git(self):
+        plain = self.root / 'plain'
+        plain.mkdir()
+        (plain / 'file').write_text('plain\n')
+        self.world('init', str(plain))
+        _, wid = self.fork('plain-world', 'S1')
+        for opts in (('--no-sandbox',), ('--require-sandbox',)):
+            p = self.exec_sh(wid, 'mkdir -p x/hooks && echo x > x/hooks/pre-commit', *opts)
+            self.assertEqual(p.stderr, b'', opts)
+
     def test_discard_refuses_additional_worktrees(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
@@ -5128,6 +7361,218 @@ class GitWorldTest(unittest.TestCase):
                          (admin / 'lib-module/modules/deps/inner').resolve())
         self.assertFalse((world / 'vendor/unused/.git').exists())
         self.assertEqual(list((world / 'vendor/unused').iterdir()), [])
+
+    def test_exec_guards_submodule_hooks(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        admin = '.world-git/repo.git/worktrees/active/modules/'
+        for repo in ('lib-module', 'lib-module/modules/deps/inner'):
+            (one / admin / repo / 'hooks').mkdir(exist_ok=True)
+            self.assert_denied(wid, 'echo evil > %s%s/hooks/post-checkout' % (admin, repo))
+            self.assertFalse((one / admin / repo / 'hooks/post-checkout').exists())
+        self.assert_denied(wid, 'mv %slib-module %slib-old' % (admin, admin))
+        self.assert_denied(wid, 'mv %slib-module/modules/deps %slib-module/modules/x' % (admin, admin))
+        # The submodule repositories themselves stay writable.
+        self.exec_sh(wid, 'git -C libs/lib config user.name Agent && echo w > libs/lib/new && '
+                          'git -C libs/lib add new && git -C libs/lib commit -qm new', '--require-sandbox')
+        # A submodule initialized during the exec: its clone works (Git's *.sample templates
+        # included). Seatbelt's regex covers its new hooks directory; bwrap's mounts are fixed at
+        # start, so on Linux the hook is written and reported afterwards.
+        self.assertFalse((one / admin / 'vendor').exists())
+        p = subprocess.run((WORLD, 'exec', wid, '--require-sandbox', '--', '/bin/sh', '-c',
+                            'git -c protocol.file.allow=always submodule update -q --init vendor/unused && '
+                            'echo evil > %svendor/unused/hooks/post-checkout' % admin),
+                           env=self.env, capture_output=True, timeout=60)
+        self.assertTrue((one / 'vendor/unused/lib.txt').exists(), p.stderr)
+        self.assertTrue(any((one / admin / 'vendor/unused/hooks').glob('*.sample')))
+        if sys.platform == 'darwin':
+            self.assertNotEqual(p.returncode, 0, p.stderr)
+            self.assertFalse((one / admin / 'vendor/unused/hooks/post-checkout').exists())
+            # A new repository's hooks directory may be created, but not as a symlink elsewhere.
+            (one / admin / 'fake').mkdir()
+            self.assert_denied(wid, 'ln -s /tmp %sfake/hooks' % admin)
+        else:
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn(('world: WARNING: exec added a Git hook: %svendor/unused/hooks/post-checkout\n'
+                           % admin).encode(), p.stderr)
+        # Settings in a submodule's own configuration are reported under its name, and a
+        # rewritten checkout `.git` (pointing Git at another repository) is reported too.
+        p = self.exec_sh(wid, "git -C libs/lib/deps/inner config core.sshCommand 'ssh -o ProxyCommand=evil' && "
+                              "echo 'gitdir: /tmp/elsewhere' > libs/lib/.git", '--require-sandbox')
+        self.assertIn(b'world: WARNING: exec changed a Git setting that runs commands: submodule '
+                      b'lib-module/modules/deps/inner local core.sshcommand: (unset) -> ssh -o ProxyCommand=evil\n',
+                      p.stderr)
+        self.assertIn(b'world: WARNING: exec changed where Git finds a repository: libs/lib/.git '
+                      b'(a file naming its repository -> a file naming another repository)\n', p.stderr)
+
+    def test_exec_guards_a_submodules_own_hooks_path(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        shared = self.root / 'lib-hooks'
+        shared.mkdir()
+        self.git(one / 'libs/lib', 'config', 'core.hooksPath', str(shared))
+        self.assert_denied(wid, 'echo evil > ' + shlex.quote(str(shared / 'pre-commit')))
+        self.assertFalse((shared / 'pre-commit').exists())
+        p = self.exec_sh(wid, 'echo evil > ' + shlex.quote(str(shared / 'post-checkout')), '--no-sandbox')
+        self.assertIn(('world: WARNING: exec added a Git hook: %s\n' % (shared / 'post-checkout')).encode(), p.stderr)
+        # A relative value is resolved from the submodule's checkout: inside the tree it is the
+        # submodule's project content: writable, but observed.
+        self.git(one / 'libs/lib', 'config', 'core.hooksPath', 'githooks')
+        p = self.exec_sh(wid, 'mkdir -p libs/lib/githooks && echo lint > libs/lib/githooks/pre-commit',
+                         '--require-sandbox')
+        self.assertIn(b'exec added a Git hook: libs/lib/githooks/pre-commit', p.stderr)
+
+    def test_exec_refuses_preexisting_submodule_pointer_redirection(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        dotgit = one / 'libs/lib/.git'
+        original = dotgit.read_bytes()
+        dotgit.write_text('gitdir: ' + str(one / '.world-git/repo.git/worktrees/active') + '\n')
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'Git repository pointer is missing, redirected or unsupported', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+        dotgit.write_bytes(original)
+        commondir = one / '.world-git/repo.git/worktrees/active/modules/lib-module/commondir'
+        commondir.write_text(str(one / '.world-git/repo.git') + '\n')
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'Git repository pointer is missing, redirected or unsupported', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+
+    def test_exec_submodule_worktree_scope_redirects_relative_hooks(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one / 'libs/lib', 'config', 'extensions.worktreeConfig', 'true')
+        self.git(one / 'libs/lib', 'config', 'core.hooksPath', '.husky')
+        hidden = one / '.world-git/submodule-checkout'
+        hidden.mkdir()
+        p = self.exec_sh(wid, 'git -C libs/lib config --worktree core.worktree ' +
+                         shlex.quote(str(hidden)) + ' && mkdir -p .world-git/submodule-checkout/.husky && '
+                         'echo evil > .world-git/submodule-checkout/.husky/pre-commit', '--no-sandbox')
+        self.assertEqual(self.git(one / 'libs/lib', 'rev-parse', '--show-toplevel').stdout.strip(),
+                         str(hidden).encode())
+        self.assertIn(b'submodule lib-module worktree core.worktree:', p.stderr)
+        self.assertIn(b'exec added a Git hook: .world-git/submodule-checkout/.husky/pre-commit', p.stderr)
+        self.assert_denied(wid, 'echo changed > .world-git/submodule-checkout/.husky/pre-commit')
+
+    def test_exec_reports_settings_only_a_submodule_includes(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        only = self.root / 'lib-only.gitconfig'
+        only.write_text('')
+        glob = self.root / 'global.gitconfig'
+        glob.write_text('[includeIf "gitdir:**/modules/lib-module"]\n\tpath = %s\n' % only)
+        self.env['GIT_CONFIG_GLOBAL'] = str(glob)
+        p = self.exec_sh(wid, "printf '[core]\\n\\tfsmonitor = echo evil\\n' > " + shlex.quote(str(only)),
+                         '--no-sandbox')
+        self.assertIn(b'world: WARNING: exec changed a Git setting that runs commands: submodule lib-module '
+                      b'global core.fsmonitor: (unset) -> echo evil\n', p.stderr)
+        self.assertNotIn(b'commands: global core.fsmonitor', p.stderr)  # the World does not include it
+        # A change every repository reads is one change, reported once under the World.
+        p = self.exec_sh(wid, 'git config --global core.pager "less; evil"', '--no-sandbox')
+        self.assertEqual(p.stderr.count(b'core.pager'), 1, p.stderr)
+        self.assertIn(b'commands: global core.pager: (unset) -> less; evil\n', p.stderr)
+
+    def test_exec_initializes_declared_submodule_named_hooks(self):
+        tool = self.origin('new-tool')
+        self.sub(self.source, 'add', '-q', '--name', 'tools/hooks', str(tool), 'tools/hooks')
+        self.git(self.source, 'commit', '-qm', 'uninitialized hooks-named module')
+        self.sub(self.source, 'deinit', '-q', 'tools/hooks')
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        admin = one / '.world-git/repo.git/worktrees/active/modules'
+        gitdir = admin / 'tools/hooks'
+        self.assertFalse(gitdir.exists())
+        if sys.platform == 'darwin':
+            replacement = ('mkdir -p prepared/refs && echo ref: refs/heads/main > prepared/HEAD && ' +
+                           shlex.quote(sys.executable) + ' -c ' + shlex.quote(
+                               "import os; os.rename('prepared', " + repr(str(admin / 'tools')) + ")"))
+            self.assert_denied(wid, replacement)
+            self.assertFalse((admin / 'tools/HEAD').exists())
+            self.assertFalse((admin / 'tools/refs').exists())
+            self.assertFalse(gitdir.exists())
+        command = ('git -c protocol.file.allow=always submodule update -q --init tools/hooks && '
+                   'touch initialized && echo evil > ' + shlex.quote(str(gitdir / 'hooks/pre-commit')))
+        p = subprocess.run((WORLD, 'exec', wid, '--require-sandbox', '--', '/bin/sh', '-c', command),
+                           env=self.env, capture_output=True, timeout=60)
+        self.assertTrue((one / 'initialized').exists(), p.stderr)
+        self.assertTrue((one / 'tools/hooks/lib.txt').exists(), p.stderr)
+        self.assertTrue(any((gitdir / 'hooks').glob('*.sample')), p.stderr)
+        if sys.platform == 'darwin':
+            self.assertNotEqual(p.returncode, 0, p.stderr)
+            self.assertFalse((gitdir / 'hooks/pre-commit').exists())
+            # Namespace parents cannot become standalone or synthetic common repositories.
+            self.assert_denied(wid, 'echo ref: refs/heads/main > ' + shlex.quote(str(admin / 'tools/HEAD')))
+            self.assert_denied(wid, 'mkdir ' + shlex.quote(str(admin / 'tools/refs')))
+        else:
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn(b'exec added a Git hook:', p.stderr)
+
+    def test_exec_initializes_ordinary_marker_named_submodules(self):
+        tool = self.origin('marker-tool')
+        for name in ('refs', 'HEAD'):
+            self.sub(self.source, 'add', '-q', '--name', name, str(tool), 'deps/' + name)
+        self.git(self.source, 'commit', '-qm', 'ordinary marker names')
+        for name in ('refs', 'HEAD'):
+            self.sub(self.source, 'deinit', '-q', 'deps/' + name)
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.exec_sh(wid, 'git -c protocol.file.allow=always submodule update -q --init deps/refs deps/HEAD',
+                     '--require-sandbox')
+        for name in ('refs', 'HEAD'):
+            self.assertTrue((one / 'deps' / name / 'lib.txt').exists())
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Seatbelt declaration budget')
+    def test_exec_refuses_excess_submodule_declaration_records(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        (one / '.gitmodules').write_text('[metadata]\n' + ' item = value\n' * 65537)
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'Git declaration entry limit exceeded', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Seatbelt planned submodule namespaces')
+    def test_exec_refuses_submodule_plan_overlapping_hooks(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        (one / '.gitmodules').write_text('[submodule "tool"]\n path = tool\n'
+                                        '[submodule "tool/hooks/pre-commit"]\n path = other\n')
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'declared submodule administration overlaps Git hooks', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+
+    def test_exec_keeps_a_submodule_named_hooks_writable(self):
+        """Seatbelt's regex cannot tell modules/tools/hooks (a repository) from a hooks directory;
+        the existing repository is given back, and only its own hooks are denied."""
+        tool = self.origin('tool')
+        self.sub(self.source, 'add', '-q', '--name', 'tools/hooks', str(tool), 'tools/hooks')
+        self.git(self.source, 'commit', '-qm', 'tool')
+        self.identify(self.source / 'tools/hooks')
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        gitdir = one / '.world-git/repo.git/worktrees/active/modules/tools/hooks'
+        self.assertTrue((gitdir / 'HEAD').is_file())
+        self.exec_sh(wid, 'echo w > tools/hooks/new && git -C tools/hooks add new && '
+                          'git -C tools/hooks commit -qm new', '--require-sandbox')
+        (gitdir / 'hooks').mkdir(exist_ok=True)
+        self.assert_denied(wid, 'echo evil > .world-git/repo.git/worktrees/active/modules/tools/hooks/hooks/pre-commit')
+        custom = gitdir / 'custom-hooks'
+        custom.mkdir()
+        hook = custom / 'pre-commit'
+        hook.write_text('#!/bin/sh\nexit 0\n')
+        hook.chmod(0o755)
+        self.git(one / 'tools/hooks', 'config', 'core.hooksPath', str(custom))
+        original = hook.read_bytes()
+        self.assert_denied(wid, 'echo evil > ' + shlex.quote(str(hook)))
+        self.assertEqual(hook.read_bytes(), original)
+        self.assert_denied(wid, 'echo evil > ' + shlex.quote(str(custom / 'post-checkout')))
+        self.assertFalse((custom / 'post-checkout').exists())
+        self.exec_sh(wid, 'echo w > tools/hooks/another && git -C tools/hooks add another && '
+                          'git -C tools/hooks commit -qm another', '--require-sandbox')
 
     def test_submodules_survive_deletion_of_the_source_and_their_origins(self):
         status = self.submodule_fixture()
