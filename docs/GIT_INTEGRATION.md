@@ -343,14 +343,20 @@ warning.
   create hook restrictions. Raw blob bytes share the 64 MiB budget and confined queries share
   the include graph's five-second budget. No LFS command is executed; object queries disable
   fsmonitor and lazy object fetching, while configuration snapshots retain the real settings;
-- each repository's private `info/attributes` and effective user/system attributes files:
+- each repository's private `info/attributes`, effective user/system attributes files, and
+  root/nested working-tree `.gitattributes`, including ignored and untracked files:
   changes can activate an unchanged filter
   definition without altering tracked project files. Regular files are hashed in full within
   the shared capture budget, including edits through hardlink aliases. Symlinked or other
   nonregular attribute files invalidate capture rather than silently omitting their content.
   Git resolves `core.attributesFile`, its XDG default and the system attributes path per
   repository; `GIT_ATTR_NOSYSTEM` is honored and an effective `/dev/null` source is disabled.
-  Shared paths are captured and reported once;
+  Shared paths are captured and reported once. Checkout discovery follows directory symlinks
+  (including external targets), deduplicates directory identities to terminate cycles, and
+  reports alias changes as well as attribute bytes. It excludes `.git` entries and the literal
+  owned administration paths, but observes project aliases into those paths. Discovery shares
+  the 65,536-entry budget and has a depth limit of 32; unreadable trees or exceeded limits
+  invalidate capture. These working-tree files remain writable;
 - the hooks Git could run: name, mode and content of entries in its hooks directory and
   every effective or dormant `core.hooksPath`, recursively including support files that an
   unchanged wrapper can source. Only direct regular `*.sample` templates are excluded;
@@ -413,6 +419,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `uploadpack.hiderefs`, `receive.hiderefs` and `transfer.hiderefs` (can let newly visible refs reach retained transfer commands or update hooks),
 `uploadpack.packobjectshook`, `receive.procreceiverefs` (activates the configured proc-receive hook),
 `receive.denycurrentbranch` (can enable the existing push-to-checkout hook),
+`receive.shallowupdate` (can allow updates requiring shallow-boundary changes to reach retained hooks),
 `receive.denynonfastforwards`, `receive.denydeletes` and `receive.denydeletecurrent` (can let forced branch updates or permitted deletions reach the existing update hook),
 `receive.autogc`, `maintenance.auto`, `gc.auto`, `gc.autopacklimit`, `maintenance.strategy`,
 `maintenance.repo` (registers repositories for an existing maintenance scheduler),
@@ -504,7 +511,7 @@ change to other project content that runs code (a `Makefile`, `package.json` scr
 `.envrc`) -- review the World's diff before running it. Effective Git attributes files and
 hook directories are exceptions: their contents are reported even when the configured path
 is inside the World, including ignored files.
-This does not scan the project tree for `.gitattributes` files.
+Root and nested `.gitattributes` files are included in the bounded checkout scan described above.
 
 ## Git LFS
 

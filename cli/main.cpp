@@ -2111,7 +2111,7 @@ static void git_admin_free(GitAdmin *a) { sl_free(&a->gitdirs); sl_free(&a->pins
 // that tells Git where a repository is.
 
 struct GuardRec { char *id; char *val; size_t seq; };
-struct GuardSet { GuardRec *v; size_t n, cap, bytes_left, entries, include_targets; StrList attributes, hooks, includes, include_contexts; int include_ms; const char *error; bool coverage_gap; };
+struct GuardSet { GuardRec *v; size_t n, cap, bytes_left, entries, include_targets; StrList attributes, attribute_dirs, hooks, includes, include_contexts; int include_ms; const char *error; bool coverage_gap; };
 
 static void gs_add(GuardSet *s, const char *id, const char *val) {
     if (s->error) return;
@@ -2131,6 +2131,7 @@ static void gs_free(GuardSet *s) {
     for (size_t i = 0; i < s->n; ++i) { free(s->v[i].id); free(s->v[i].val); }
     free(s->v);
     sl_free(&s->attributes);
+    sl_free(&s->attribute_dirs);
     sl_free(&s->hooks);
     sl_free(&s->includes);
     sl_free(&s->include_contexts);
@@ -2339,9 +2340,10 @@ static bool attributes_path(const char *checkout, const char *value, char *out, 
     return out[0] != 0;
 }
 
-// Repository-private attributes can activate a previously configured filter without
-// changing configuration or tracked project files. Observe their full regular-file bytes.
-static void capture_attributes(const GitAdmin *a, const char *path, GuardSet *s) {
+// Attributes can activate a previously configured filter without changing configuration.
+// Observe regular-file bytes, including ignored working-tree sources.
+static void capture_attributes(const GitAdmin *a, const char *path, GuardSet *s,
+                               int parent_fd = -1, const char *name = NULL) {
     if (s->error) return;
     for (size_t i = 0; i < s->attributes.n; ++i)
         if (!strcmp(s->attributes.v[i], path)) return;
@@ -2351,17 +2353,115 @@ static void capture_attributes(const GitAdmin *a, const char *path, GuardSet *s)
         s->error = "Git attributes path exceeds capture limit"; return;
     }
     struct stat st;
-    if (lstat(path, &st) != 0) {
+    int inspected = parent_fd < 0 ? lstat(path, &st) : fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW);
+    if (inspected != 0) {
         if (errno == ENOENT || errno == ENOTDIR) gs_add(s, id, "absent");
         else s->error = "could not inspect Git repository attributes";
         return;
     }
     if (!S_ISREG(st.st_mode)) { s->error = "nonregular Git repository attributes cannot be inspected"; return; }
-    if (!fingerprint(path, fp, sizeof fp, s, false, true)) {
+    if (!fingerprint(path, fp, sizeof fp, s, false, true, parent_fd, name)) {
         if (!s->error) s->error = "could not fingerprint Git repository attributes";
         return;
     }
+    struct stat after;
+    inspected = parent_fd < 0 ? lstat(path, &after) : fstatat(parent_fd, name, &after, AT_SYMLINK_NOFOLLOW);
+    if (inspected != 0 || after.st_dev != st.st_dev || after.st_ino != st.st_ino || after.st_mode != st.st_mode) {
+        s->error = "Git attributes file changed during capture"; return;
+    }
     gs_add(s, id, fp);
+}
+
+// Ignore rules do not prevent .gitattributes from activating configured filters.
+// Follow directory targets as Git does for leading path components, hash only attribute
+// files, and deduplicate target identities to terminate cycles.
+static void capture_checkout_attributes(const GitAdmin *a, const char *dir, GuardSet *s,
+                                        int parent_fd = -1, const char *name = NULL, int depth = 0) {
+    if (s->error) return;
+    if (g_post_signal) { s->error = "Git capture interrupted"; return; }
+    struct stat directory, opened;
+    int inspected = parent_fd < 0 ? stat(dir, &directory) : fstatat(parent_fd, name, &directory, 0);
+    if (inspected != 0 || !S_ISDIR(directory.st_mode)) {
+        s->error = "could not inspect Git attributes directory"; return;
+    }
+    char identity[64];
+    snprintf(identity, sizeof identity, "%llu:%llu", (unsigned long long)directory.st_dev,
+             (unsigned long long)directory.st_ino);
+    for (size_t i = 0; i < s->attribute_dirs.n; ++i)
+        if (!strcmp(s->attribute_dirs.v[i], identity)) return;
+    if (depth > 32) { s->error = "Git attributes directory depth limit exceeded"; return; }
+    int flags = O_RDONLY | O_DIRECTORY | O_NONBLOCK | O_CLOEXEC;
+    int fd = parent_fd < 0 ? open(dir, flags) : openat(parent_fd, name, flags);
+    if (fd < 0 || fstat(fd, &opened) != 0 || opened.st_dev != directory.st_dev || opened.st_ino != directory.st_ino) {
+        if (fd >= 0) close(fd);
+        s->error = "could not safely open Git attributes directory"; return;
+    }
+    char *resolved = realpath(dir, NULL);
+    struct stat canonical;
+    if (!resolved || strlen(resolved) >= WFS_PATH_MAX || stat(resolved, &canonical) != 0 ||
+        canonical.st_dev != opened.st_dev || canonical.st_ino != opened.st_ino) {
+        free(resolved); close(fd); s->error = "could not resolve Git attributes directory"; return;
+    }
+    if (!sl_push(&s->attribute_dirs, identity)) {
+        free(resolved); close(fd); s->error = "out of memory"; return;
+    }
+    DIR *d = fdopendir(fd);
+    if (!d) { free(resolved); close(fd); s->error = "could not read Git attributes directory"; return; }
+    char admin[WFS_PATH_MAX];
+    if ((size_t)snprintf(admin, sizeof admin, "%s/.world-git", a->root) >= sizeof admin)
+        s->error = "Git attributes path exceeds capture limit";
+    while (!s->error) {
+        if (g_post_signal) { s->error = "Git capture interrupted"; break; }
+        errno = 0;
+        struct dirent *e = readdir(d);
+        if (!e) { if (errno) s->error = "could not enumerate Git attributes directories"; break; }
+        if (++s->entries > 65536) { s->error = "Git attributes entry limit exceeded"; break; }
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") || !strcmp(e->d_name, ".git")) continue;
+        char path[WFS_PATH_MAX];
+        if ((size_t)snprintf(path, sizeof path, "%s/%s", dir, e->d_name) >= sizeof path) {
+            s->error = "Git attributes path exceeds capture limit"; break;
+        }
+        // A nested project directory merely named .world-git remains ordinary content.
+        if (!strcmp(path, admin) || !strcmp(path, a->common) || !strcmp(path, a->active)) continue;
+        struct stat st;
+        if (fstatat(fd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            s->error = "could not inspect Git attributes entry"; break;
+        }
+        if (!strcmp(e->d_name, ".gitattributes")) {
+            char target[WFS_PATH_MAX];
+            if ((size_t)snprintf(target, sizeof target, "%s/.gitattributes", resolved) >= sizeof target)
+                s->error = "Git attributes path exceeds capture limit";
+            else capture_attributes(a, target, s, fd, e->d_name);
+        } else if (S_ISDIR(st.st_mode)) capture_checkout_attributes(a, path, s, fd, e->d_name, depth + 1);
+        else if (S_ISLNK(st.st_mode)) {
+            // Observe routing even when both target trees are already in the snapshot.
+            // Dangling and file links also matter if their target later becomes a directory.
+            char alias[WFS_PATH_MAX], id[WFS_PATH_MAX + 40], fp[64];
+            if ((size_t)snprintf(alias, sizeof alias, "%s/%s", resolved, e->d_name) >= sizeof alias ||
+                (size_t)snprintf(id, sizeof id, "d\x1f%s", rel_to(a, alias)) >= sizeof id)
+                s->error = "Git attributes alias path exceeds capture limit";
+            else if (!fingerprint(path, fp, sizeof fp, s, false, false, fd, e->d_name)) {
+                if (!s->error) s->error = "could not fingerprint Git attributes directory alias";
+            } else gs_add(s, id, fp);
+            struct stat target;
+            if (fstatat(fd, e->d_name, &target, 0) == 0) {
+                if (S_ISDIR(target.st_mode)) capture_checkout_attributes(a, path, s, fd, e->d_name, depth + 1);
+            } else if (errno != ENOENT && errno != ENOTDIR)
+                s->error = "could not inspect Git attributes directory target";
+        }
+        // A final .gitattributes symlink uses the existing unsupported-source policy.
+
+        struct stat after;
+        if (!s->error && (fstatat(fd, e->d_name, &after, AT_SYMLINK_NOFOLLOW) != 0 ||
+            after.st_dev != st.st_dev || after.st_ino != st.st_ino || after.st_mode != st.st_mode))
+            s->error = "Git attributes entry changed during capture";
+    }
+    struct stat after;
+    inspected = parent_fd < 0 ? stat(dir, &after) : fstatat(parent_fd, name, &after, 0);
+    if (!s->error && (inspected != 0 || after.st_dev != directory.st_dev || after.st_ino != directory.st_ino))
+        s->error = "Git attributes directory changed during capture";
+    free(resolved);
+    closedir(d);
 }
 
 extern char **environ;
@@ -3274,6 +3374,8 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
         free(value);
     }
     if (s->error) return false;
+    capture_checkout_attributes(a, checkout, s);
+    if (s->error) return false;
     snprintf(p, sizeof p, "%s/hooks", common);
     capture_hooks(a, p, s);
     if (s->error) return false;
@@ -3449,6 +3551,11 @@ static void guard_warn(const GuardRec *before, const GuardRec *after) {
         fprintf(stderr, "world: WARNING: exec %s Git repository attributes: ", !was ? "added" : !is ? "removed" : "changed");
         put_field(stderr, rest, strlen(rest));
         fputs(" (can activate configured filters)\n", stderr);
+    } else if (id[0] == 'd') {
+        fprintf(stderr, "world: WARNING: exec %s a Git attributes directory alias: ",
+                !before ? "added" : !after ? "removed" : "changed");
+        put_field(stderr, rest, strlen(rest));
+        fputs(" (can change attribute selection)\n", stderr);
     } else if (id[0] == 'h') {
         fprintf(stderr, "world: WARNING: exec %s a Git hook: ", !before ? "added" : !after ? "removed" : "changed");
         put_field(stderr, rest, strlen(rest));

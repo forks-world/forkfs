@@ -5386,6 +5386,75 @@ class GitWorldTest(unittest.TestCase):
         self.exec_sh(wid, 'echo fine > .world-git/repo.git/worktrees/active/modules/guarded-foo/payload',
                      '--require-sandbox')
 
+    def test_exec_reports_ignored_checkout_attributes_and_aliases(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        marker = one / 'filter-ran'
+        command = 'touch ' + shlex.quote(str(marker)) + '; cat'
+        for checkout in (one, one / 'libs/lib'):
+            self.git(checkout, 'config', 'filter.retained.smudge', command)
+            self.git(checkout, 'config', 'filter.second.smudge', command)
+            (checkout / '.gitignore').write_text('.gitattributes\nhidden/\nroute\nloop\ndangling\n')
+        paths = ('.gitattributes', 'hidden/new/.gitattributes',
+                 'hidden/.world-git/.gitattributes', 'libs/lib/.gitattributes')
+        script = '; '.join('mkdir -p ' + shlex.quote(str((one / path).parent)) +
+                           '; printf %s ' + shlex.quote('* filter=retained\n') + ' > ' + shlex.quote(path)
+                           for path in paths)
+        p = self.exec_sh(wid, script + '; exit 7', '--no-sandbox', code=7)
+        for path in paths:
+            self.assertIn(b'exec added Git repository attributes: ' + path.encode(), p.stderr)
+        # Both trees are already captured; changing only the ignored alias must warn.
+        (one / 'A').mkdir()
+        (one / 'B').mkdir()
+        for target, value in (('A', 'retained'), ('B', 'second')):
+            (one / target / '.gitattributes').write_text('* filter=' + value + '\n')
+        (one / 'route').symlink_to('A', target_is_directory=True)
+        (one / 'loop').symlink_to('.', target_is_directory=True)
+        (one / 'dangling').symlink_to('missing', target_is_directory=True)
+        external = self.root / 'attribute-target'
+        external.mkdir()
+        (external / '.gitattributes').write_text('* filter=retained\n')
+        (one / 'outside').symlink_to(external, target_is_directory=True)
+        # Literal administration is excluded, but a project alias into it is observable.
+        admin_target = one / '.world-git/attribute-target'
+        admin_target.mkdir()
+        (admin_target / '.gitattributes').write_text('* filter=retained\n')
+        (one / 'admin-route').symlink_to(admin_target, target_is_directory=True)
+        changed = [str(one / path) for path in paths] + [str(external / '.gitattributes'),
+                                                        str(admin_target / '.gitattributes')]
+        script = 'rm route; ln -s B route; ' + '; '.join(
+            'printf %s ' + shlex.quote('* filter=second\n') + ' > ' + shlex.quote(path)
+            for path in changed)
+        p = self.exec_sh(wid, script + '; exit 7', '--no-sandbox', code=7)
+        for path in paths:
+            self.assertEqual(p.stderr.count(b'exec changed Git repository attributes: ' + path.encode() + b' '), 1)
+        self.assertIn(b'exec changed a Git attributes directory alias: route', p.stderr)
+        self.assertIn(b'exec changed Git repository attributes: ' + str(external / '.gitattributes').encode(), p.stderr)
+        self.assertIn(b'exec changed Git repository attributes: .world-git/attribute-target/.gitattributes', p.stderr)
+        self.assertNotIn(b'local filter.retained.smudge:', p.stderr)
+        p = self.exec_sh(wid, 'rm ' + ' '.join(shlex.quote(path) for path in paths) +
+                         '; rm route dangling; exit 7', '--no-sandbox', code=7)
+        for path in paths:
+            self.assertIn(b'exec removed Git repository attributes: ' + path.encode(), p.stderr)
+        self.assertIn(b'exec removed a Git attributes directory alias: dangling', p.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_exec_reports_shallow_update_gate_with_retained_hook(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        hook = one / '.world-git/repo.git/hooks/update'
+        hook.parent.mkdir(exist_ok=True)
+        original = b'#!/bin/sh\ntouch update-hook-ran\n'
+        hook.write_bytes(original)
+        hook.chmod(0o755)
+        self.git(one, 'config', 'receive.shallowUpdate', 'false')
+        p = self.exec_sh(wid, 'git config receive.shallowUpdate true; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local receive.shallowupdate: false -> true', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertEqual(hook.read_bytes(), original)
+        self.assertFalse((one / 'update-hook-ran').exists())
+
     def test_exec_reports_repository_attributes_activating_unchanged_filters(self):
         self.submodule_fixture()
         self.world('init', str(self.source))
