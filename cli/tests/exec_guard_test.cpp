@@ -105,6 +105,8 @@ int main() {
         "am.threeway", "AM.THREEWAY", "fetch.prune", "fetch.prunetags", "FETCH.PRUNETAGS",
         "remote.origin.fetch", "remote.team.origin.fetch", "REMOTE.Origin.FETCH",
         "remote.origin.prune", "remote.team.origin.prunetags", "REMOTE.Origin.PRUNE",
+        "fetch.fsckobjects", "TRANSFER.FSCKOBJECTS",
+        "hook.lint.event", "HOOK.Lint.ENABLED", "hook.pre-commit.enabled", "hook.team.lint.event",
         "fetch.all", "remotes.default", "remotes.team.group",
         "remote.origin.skipdefaultupdate", "remote.origin.skipfetchall", "remote.team.origin.skipfetchall",
         "pull.twohead", "pull.octopus", "receive.procreceiverefs", "branch.main.mergeoptions", "branch.main.remote", "branch.main.pushremote", "remote.pushdefault",
@@ -158,6 +160,12 @@ int main() {
     CHECK(guard_key_runs_command("remote.origin.fetch", "^refs/heads/private/*"));
     CHECK(guard_key_runs_command("remote.origin.fetch", ""));
     CHECK(guard_key_runs_command("remote.origin.fetch", NULL));
+    const char *activation_keys[] = {"hook.lint.event", "hook.pre-commit.enabled", "fetch.fsckobjects", "transfer.fsckobjects"};
+    for (const char *key : activation_keys) {
+        CHECK(guard_key_runs_command(key, "true"));
+        CHECK(guard_key_runs_command(key, "false"));
+        CHECK(guard_key_runs_command(key, NULL));
+    }
     CHECK(guard_key_runs_command("receive.shallowupdate", "true"));
     CHECK(guard_key_runs_command("receive.shallowupdate", "false"));
     CHECK(guard_key_runs_command("receive.shallowupdate", NULL));
@@ -270,6 +278,8 @@ int main() {
         "pull.custom.twohead", "pull.custom.octopus", "receive.custom.procreceiverefs", "receive.advertisepushoptions", "branch.remote", "branch.pushremote", "branch.mergeoptions", "remote.origin.pushdefault",
         "core.bare", "tar.command", "tar.remote", "uploadarchive.custom.allowunreachable",
         "gc.custom.recentobjectshook", "gc.pruneexpire", "core.editorx", "core.custom.attributesfile", "filter.clean", "diff.command", "merge.driver", "merge.recursive", "merge.custom.default", "merge.custom.renormalize", "core.x.hookspath",
+        "fetch.custom.fsckobjects", "transfer.custom.fsckobjects", "fetch.fsckobjectsextra",
+        "hook.event", "hook.enabled", "hook.lint.enabledextra",
         "include.x.path", "includeif.path", "hook.command", "remote.uploadpack", "merge.payload.tool", "diff.payload.guitool",
         "difftool.custom.guidefault", "mergetool.custom.guidefault",
         "push.custom.recursesubmodules", "submodule.library.recurse", "fetch.custom.recursesubmodules", "submodule.fetchrecursesubmodules",

@@ -2510,7 +2510,7 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
         argv[arg++] = "--get-regexp";
         argv[arg++] = (query == GG_LFS_INCLUDES_FILE || query == GG_LFS_INCLUDES_BLOB) ?
             "^(include\\.path|includeif\\..*\\.path)$" :
-            "^(include\\.path|includeif\\..*\\.path|core\\.hookspath)$";
+            "^(include\\.path|includeif\\..*\\.path|core\\.hookspath|core\\.attributesfile)$";
     } else if (query == GG_WORKTREE_ROOT || query == GG_WORKTREE_FILE) {
         // core.worktree is a raw path in Git setup, not a --type=path value:
         // tilde and %(prefix) must remain literal here.
@@ -2675,9 +2675,9 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
     return buf;
 }
 
-// Candidate hook values and execution directories are repository-specific, even when
+// Candidate hook/attribute values and execution directories are repository-specific, even when
 // several repositories share one dormant include file. Hashes remain globally deduplicated.
-struct HookCandidates { StrList values, bases; };
+struct HookCandidates { StrList values, attributes, bases; };
 
 static bool hook_candidate_add(StrList *list, const char *value, GuardSet *s) {
     for (size_t i = 0; i < list->n; ++i) if (!strcmp(list->v[i], value)) return true;
@@ -2801,6 +2801,12 @@ static bool capture_include_edges(const GitAdmin *a, const char *gitdir, const c
             // Relative hooks run from a checkout, or Gitdir for receive hooks;
             // the including file's directory has no bearing on this path.
             ok = hook_candidate_add(&hooks->values, value, s);
+            continue;
+        }
+        if (!strcasecmp(entry, "core.attributesfile")) {
+            // Like hooks, relative attributes paths use the execution directory,
+            // not the directory of the configuration file that declares them.
+            if (*value) ok = hook_candidate_add(&hooks->attributes, value, s);
             continue;
         }
         if (!*value) { ok = false; break; }
@@ -3096,7 +3102,7 @@ static bool note_hooks_path(GitAdmin *a, const char *checkout, const char *v, ch
 }
 
 // Conditions and value precedence may change later. Conservatively observe the union
-// of candidate checkout roots and hook values, plus the Gitdir used by receive hooks.
+// of candidate checkout roots and hook/attribute values, plus the Gitdir used by receive hooks.
 static bool capture_include_hooks(GitAdmin *a, const char *gitdir, const char *checkout, GuardSet *s) {
     if (!gitdir) { s->error = "could not locate Git worktree configuration"; return false; }
     HookCandidates hooks = {};
@@ -3113,7 +3119,7 @@ static bool capture_include_hooks(GitAdmin *a, const char *gitdir, const char *c
     if ((size_t)snprintf(lfs_config, sizeof lfs_config, "%s/.lfsconfig", checkout) >= sizeof lfs_config) {
         s->error = "Git LFS configuration path exceeds capture limit"; ok = false;
     }
-    // LFS ignores core.hooksPath/core.worktree in these sources. Traverse only their
+    // LFS ignores core.hooksPath/core.attributesFile/core.worktree here. Traverse only their
     // includes, rather than turning ignored values into new sandbox restrictions.
     if (ok) ok = capture_include_target(a, gitdir, lfs_config, s, &hooks, 0, 'l', true);
     if (ok) ok = capture_lfs_blob(a, gitdir, ":.lfsconfig", s, &hooks);
@@ -3135,6 +3141,20 @@ static bool capture_include_hooks(GitAdmin *a, const char *gitdir, const char *c
             ok = !s->error;
         }
     }
+    for (size_t i = 0; ok && i < hooks.attributes.n; ++i) {
+        size_t bases = hooks.attributes.v[i][0] == '/' ? 1 : hooks.bases.n;
+        for (size_t j = 0; ok && j < bases; ++j) {
+            if (g_post_signal) { s->error = "Git capture interrupted"; ok = false; break; }
+            if (++s->entries > 65536) { s->error = "Git attributes candidate limit exceeded"; ok = false; break; }
+            char path[WFS_PATH_MAX];
+            if (!attributes_path(hooks.bases.v[j], hooks.attributes.v[i], path, sizeof path)) {
+                s->error = "could not resolve potential Git attributes path"; ok = false; break;
+            }
+            if (strcmp(path, "/dev/null")) capture_attributes(a, path, s);
+            ok = !s->error;
+        }
+    }
+    sl_free(&hooks.attributes);
     sl_free(&hooks.values);
     sl_free(&hooks.bases);
     return ok;

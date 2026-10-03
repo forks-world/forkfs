@@ -5489,6 +5489,38 @@ class GitWorldTest(unittest.TestCase):
                 self.assertFalse((one / 'filter-ran').exists())
                 self.assertFalse((checkout / 'filter-ran').exists())
 
+    def test_exec_reports_dormant_attributes_sources(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        marker = one / 'dormant-filter-ran'
+        self.git(one, 'config', 'filter.retained.smudge', 'touch ' + shlex.quote(str(marker)) + '; cat')
+        policy = one / '.world-git/dormant-attributes-config'
+        external = self.root / 'dormant-attributes'
+        relative = one / '.world-git/dormant-attributes'
+        policy.write_text('[core]\n attributesFile = ' + str(external) +
+                          '\n attributesFile = .world-git/dormant-attributes\n')
+        self.git(one, 'config', 'includeIf.onbranch:never-selected-attribute-branch.path', str(policy))
+        original = policy.read_bytes()
+        targets = (external, relative)
+        for action, value in (('added', '* filter=retained\n'), ('changed', '*.txt filter=retained\n'),
+                              ('removed', None)):
+            script = '; '.join('rm ' + shlex.quote(str(path)) if value is None else
+                               'printf %s ' + shlex.quote(value) + ' > ' + shlex.quote(str(path))
+                               for path in targets)
+            p = self.exec_sh(wid, script + '; exit 7', '--no-sandbox', code=7)
+            for path in targets:
+                label = str(path.relative_to(one)) if path.is_relative_to(one) else str(path)
+                self.assertIn(b'exec ' + action.encode() + b' Git repository attributes: ' + label.encode(), p.stderr)
+            self.assertNotIn(b'local filter.retained.smudge:', p.stderr)
+            self.assertNotIn(b'a Git include target:', p.stderr)
+            self.assertEqual(policy.read_bytes(), original)
+            self.assertFalse(marker.exists())
+        # The same unsupported-source policy applies even while the condition is false.
+        external.symlink_to(policy)
+        p = self.exec_sh(wid, 'touch command-ran', '--require-sandbox', code=3)
+        self.assertIn(b'nonregular Git repository attributes cannot be inspected', p.stderr)
+        self.assertFalse((one / 'command-ran').exists())
+
     def test_exec_reports_effective_user_attributes_once_per_path(self):
         self.submodule_fixture()
         self.world('init', str(self.source))
@@ -6218,6 +6250,37 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(attributes.read_bytes(), original)
         self.assertEqual(self.git(one, 'config', 'merge.retained.driver').stdout.strip(), command.encode())
         self.assertFalse((one / 'am-merge-driver-ran').exists())
+
+    def test_exec_reports_hook_and_object_validation_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        marker = one / 'retained-hook-ran'
+        command = 'touch ' + shlex.quote(str(marker))
+        self.git(one, 'config', 'hook.retained.command', command)
+        self.git(one, 'config', 'hook.retained.enabled', 'false')
+        self.git(one, 'config', 'hook.pre-commit.enabled', 'false')
+        self.git(one, 'config', 'fetch.fsckObjects', 'true')
+        self.git(one, 'config', 'transfer.fsckObjects', 'true')
+        hooks = one / '.world-git/repo.git/hooks'
+        hooks.mkdir(exist_ok=True)
+        original = ('#!/bin/sh\n' + command + '\n').encode()
+        for name in ('pre-commit', 'reference-transaction'):
+            (hooks / name).write_bytes(original)
+            (hooks / name).chmod(0o755)
+        p = self.exec_sh(wid, 'git config hook.retained.event pre-commit; '
+                         'git config hook.retained.enabled true; git config hook.pre-commit.enabled true; '
+                         'git config fetch.fsckObjects false; git config transfer.fsckObjects false; exit 7',
+                         '--no-sandbox', code=7)
+        self.assertIn(b'local hook.retained.event: (unset) -> pre-commit', p.stderr)
+        for key in ('hook.retained.enabled', 'hook.pre-commit.enabled'):
+            self.assertIn(b'local ' + key.encode() + b': false -> true', p.stderr)
+        for key in ('fetch.fsckobjects', 'transfer.fsckobjects'):
+            self.assertIn(b'local ' + key.encode() + b': true -> false', p.stderr)
+        self.assertNotIn(b'local hook.retained.command:', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        for name in ('pre-commit', 'reference-transaction'):
+            self.assertEqual((hooks / name).read_bytes(), original)
+        self.assertFalse(marker.exists())
 
     def test_exec_reports_fetch_refspec_activating_retained_reference_hook(self):
         self.world('init', str(self.source))

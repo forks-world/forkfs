@@ -351,6 +351,11 @@ warning.
   nonregular attribute files invalidate capture rather than silently omitting their content.
   Git resolves `core.attributesFile`, its XDG default and the system attributes path per
   repository; `GIT_ATTR_NOSYSTEM` is honored and an effective `/dev/null` source is disabled.
+  Dormant `core.attributesFile` values in conditional includes and `config.worktree` are
+  also captured, using the candidate checkout/Gitdir and raw `core.worktree` bases rather
+  than the include file's directory. Empty values and `/dev/null` are disabled. Candidate
+  pairs share the entry limit, files share the byte budget, and these paths remain writable.
+  LFS-only configuration does not contribute ignored core settings.
   Shared paths are captured and reported once. Checkout discovery follows directory symlinks
   (including external targets), deduplicates directory identities to terminate cycles, and
   reports alias changes as well as attribute bytes. It excludes `.git` entries and the literal
@@ -409,7 +414,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `http[.*].sslcert|proxysslcert|sslcertpasswordprotected|proxysslcertpasswordprotected` (can activate certificate password helpers),
 `http[.*].proxy`, `remote.*.proxy` (can activate an existing proxy password helper),
 `gpg.format` (selects the signing program), `gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
-`remote.*.fetch`, `fetch.prune|prunetags` and `remote.*.prune|prunetags` (can invoke the retained reference-transaction hook),
+`remote.*.fetch`, `fetch.fsckobjects`, `transfer.fsckobjects`, `fetch.prune|prunetags` and `remote.*.prune|prunetags` (can invoke the retained reference-transaction hook),
 `remote.*.skipdefaultupdate|skipfetchall`, `fetch.bundleuri`, `fetch.all`, `remotes.*` (can activate unchanged remote helpers),
 `remote.*.uploadpack|receivepack|vcs`, `branch.*.mergeoptions`, `pull.twohead`, `pull.octopus` (can select external merge strategies),
 `branch.*.remote|pushremote`, `remote.pushdefault` (can select preconfigured helper remotes),
@@ -437,7 +442,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `includeif.*.path`, `alias.*` (including ordinary aliases that dispatch commands or inject `-c` settings),
 `submodule.*.update` (all modes and removal: enabling built-in checkout, merge or rebase can
 activate retained child filters and commands), `pager.*`, `interactive.difffilter`, `web.browser`, `help.autocorrect` (can dispatch corrected external Git commands), `help.browser`, `help.format`, `instaweb.browser`, `man.viewer` (select configured viewers), `browser.*.cmd|path`, `instaweb.httpd`, `guitool.*.cmd`, `imap.tunnel`,
-`man.*.cmd|path`, `init.templatedir`, `hook.*.command`, `trailer.*.command|cmd`, `tar.*.command|remote`, `uploadarchive.allowunreachable`
+`man.*.cmd|path`, `init.templatedir`, `hook.*.command|event|enabled` (including activation of traditional hooks), `trailer.*.command|cmd`, `tar.*.command|remote`, `uploadarchive.allowunreachable`
 (including activation of an unchanged archive command),
 `protocol.allow` and `protocol.*.allow` (which can enable `ext::` URLs), and
 `lfs.*.path|clean|smudge` (custom transfer agents and extensions), plus
