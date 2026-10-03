@@ -393,6 +393,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 (can activate a configured helper when fetching missing objects),
 `uploadpack.packobjectshook`, `receive.procreceiverefs` (activates the configured proc-receive hook),
 `receive.denycurrentbranch` (can enable the existing push-to-checkout hook),
+`receive.denynonfastforwards` (can let a forced branch update reach the existing update hook),
 `receive.autogc`, `maintenance.auto`, `gc.auto`, `gc.autopacklimit`, `maintenance.strategy`,
 `maintenance.repo` (registers repositories for an existing maintenance scheduler),
 `maintenance.gc.enabled|schedule`, `maintenance.prefetch.enabled|schedule`

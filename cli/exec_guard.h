@@ -121,6 +121,7 @@ static const GuardKey kGuardKeys[] = {
     {"branch", "merge", 1, false},
     {"remote", "push", 1, false}, {"remote", "mirror", 1, false},
     {"receive", "procreceiverefs", 0, false},
+    {"receive", "denynonfastforwards", 0, false},
     {"receive", "autogc", 0, false},    {"maintenance", "auto", 0, false},
     {"maintenance", "strategy", 0, false}, {"maintenance", "repo", 0, false},
     {"gc", "auto", 0, false},          {"gc", "autopacklimit", 0, false},

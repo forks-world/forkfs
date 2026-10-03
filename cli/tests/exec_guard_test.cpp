@@ -76,6 +76,7 @@ int main() {
         "maintenance.gc.enabled", "maintenance.prefetch.enabled", "maintenance.prefetch.schedule", "maintenance.gc.schedule", "fetch.bundleuri",
         "MAINTENANCE.gc.ENABLED", "Maintenance.prefetch.Schedule",
         "remote.origin.partialclonefilter", "extensions.partialclone",
+        "receive.denynonfastforwards", "RECEIVE.DENYNONFASTFORWARDS",
         "receive.denycurrentbranch", "remote.origin.promisor", "remote.team.origin.promisor",
         "uploadarchive.allowunreachable", "tar.custom.remote", "tar.tar.gz.remote",
         "core.attributesfile", "core.worktree", "tar.tar.gz.command", "tar.custom.command", "gc.recentobjectshook",
@@ -113,6 +114,8 @@ int main() {
     for (const char *k : runs) {
         if (!guard_key_runs_command(k, "cmd")) { fprintf(stderr, "%s should be watched\n", k); exit(1); }
     }
+    CHECK(guard_key_runs_command("receive.denynonfastforwards", "false"));
+    CHECK(guard_key_runs_command("receive.denynonfastforwards", NULL));
     // All aliases can dispatch external commands or inject -c command-running settings.
     // Built-in submodule update modes can activate retained child filters and commands.
     CHECK(guard_key_runs_command("alias.x", "!rm -rf /"));
@@ -202,6 +205,7 @@ int main() {
         "maintenance.GC.schedule", "maintenance.gc.scheduleextra", "fetch.custom.bundleuri", "maintenance.commit-graph.enabled", "maintenance.repack.enabled",
         "maintenance.team.prefetch.enabled", "maintenance.enabled",
         "remote.partialclonefilter", "extensions.custom.partialclone",
+        "receive.custom.denynonfastforwards", "receive.denynonfastforwardsextra",
         "receive.custom.denycurrentbranch", "remote.promisor",
         "sendemail.work.identity", "sendemail.work.annotation", "sendemail.suppress", "fetch.custom.all", "remotes",
         "remote.skipdefaultupdate", "remote.skipfetchall", "remote.origin.skipfetch",

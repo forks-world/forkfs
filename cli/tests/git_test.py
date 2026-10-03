@@ -5054,6 +5054,28 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((one / 'maintenance-helper-ran').exists())
         self.assertFalse((one / 'maintenance-hook-ran').exists())
 
+    def test_exec_reports_enabling_non_fast_forward_update_hook(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        hook = one / '.world-git/repo.git/hooks/update'
+        hook.parent.mkdir(exist_ok=True)
+        marker = one / 'retained-update-hook-ran'
+        hook.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(marker)) + '\n')
+        hook.chmod(0o755)
+        original = hook.read_bytes()
+        # The receive-side non-fast-forward rejection happens before the retained
+        # update hook. Either false or removal permits that path on a forced push.
+        for change, after in (('receive.denyNonFastForwards false', 'false'),
+                              ('--unset receive.denyNonFastForwards', '(unset)')):
+            with self.subTest(change=change):
+                self.git(one, 'config', 'receive.denyNonFastForwards', 'true')
+                p = self.exec_sh(wid, 'git config ' + change + '; exit 7',
+                                 '--no-sandbox', code=7)
+                self.assertIn(b'local receive.denynonfastforwards: true -> ' + after.encode(), p.stderr)
+                self.assertNotIn(b'a Git hook:', p.stderr)
+                self.assertEqual(hook.read_bytes(), original)
+                self.assertFalse(marker.exists())
+
     def test_exec_reports_enabling_promisor_and_checkout_hook(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
