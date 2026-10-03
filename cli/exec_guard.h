@@ -105,6 +105,8 @@ static const GuardKey kGuardKeys[] = {
     {"tag", "forcesignannotated", 0, false}, {"push", "gpgsign", 0, false},
     {"gpg", "format", 0, false},
     {"log", "showsignature", 0, false},   {"merge", "verifysignatures", 0, false},
+    {"rebase", "autostash", 0, false},
+    {"pull", "autostash", 0, false}, {"merge", "autostash", 0, false},
     {"rebase", "instructionformat", 0, false},
     {"format", "commitlistformat", 0, false}, {"format", "coverletter", 0, false},
     {"format", "pretty", 0, false},       {"pretty", NULL, 2, false},

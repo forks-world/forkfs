@@ -5361,6 +5361,29 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((one / 'selected-remote-ran').exists())
         self.assertFalse((one / 'selected-strategy-ran').exists())
 
+    def test_exec_reports_autostash_hook_and_driver_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        hook = one / '.world-git/repo.git/hooks/post-rewrite'
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text('#!/bin/sh\ntouch autostash-hook-ran\n')
+        hook.chmod(0o755)
+        self.git(one, 'config', 'merge.retained.driver', 'touch autostash-driver-ran')
+        self.git(one, 'config', 'merge.default', 'retained')
+        keys = ('rebase.autoStash', 'pull.autoStash', 'merge.autoStash')
+        for key in keys:
+            self.git(one, 'config', key, 'false')
+        (one / 'file').write_text('dirty worktree\n')
+        p = self.exec_sh(wid, ' && '.join('git config ' + key + ' true' for key in keys) + '; exit 7',
+                         '--no-sandbox', code=7)
+        for key in keys:
+            self.assertIn(b'local ' + key.lower().encode() + b': false -> true', p.stderr)
+        self.assertNotIn(b'local merge.retained.driver:', p.stderr)
+        self.assertNotIn(b'local merge.default:', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertFalse((one / 'autostash-hook-ran').exists())
+        self.assertFalse((one / 'autostash-driver-ran').exists())
+
     def test_exec_reports_checkout_guess_and_rebase_hook_activation(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
