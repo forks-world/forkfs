@@ -307,7 +307,12 @@ being guarded. Missing optional checkout pointers are allowed (for example a red
 `core.worktree` without `.git`). Pointer parsing reads the complete bounded file, rejects NUL
 or oversized content, trims only trailing CR/LF and compares canonical targets. Preexisting
 redirected, symlinked or directory pointers refuse sandboxed exec; `--no-sandbox` retains
-observational reporting so a command can repair them.
+observational reporting so a command can repair them. When a pointer is already redirected,
+missing or unsupported, `--no-sandbox` emits an explicit coverage warning before running the
+command and again after inspection if the gap remains. It compares the owned administration
+and pointer records, but does not claim to inspect all hooks or settings of a redirected
+repository. Missing optional checkout or submodule `commondir` pointers do not create this
+warning.
 
 - its effective configuration, `git config --list --includes --show-scope` read through its
   own administration: system, global, local, worktree, inherited command scope and included files -- the sandbox does
@@ -399,6 +404,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `maintenance.gc.enabled|schedule`, `maintenance.prefetch.enabled|schedule`
 (can activate existing maintenance hooks or remote helpers; task names are exact),
 `sendemail.identity` (selects configured mail commands),
+`sendemail[.*].confirm` (can run retained mail commands without recipient confirmation),
 `sendemail[.*].annotate|suppresscc|validate|useimaponly|imapsentfolder` (activate configured editors, mail commands or hooks),
 `sendemail[.*].tocmd|cccmd|headercmd|sendmailcmd|smtpserver`, `include.path`,
 `submodule.active`, `submodule.*.active`, `submodule.*.url` (can activate configured update commands),

@@ -100,6 +100,7 @@ int main() {
         "remote.origin.skipdefaultupdate", "remote.origin.skipfetchall", "remote.team.origin.skipfetchall",
         "pull.twohead", "pull.octopus", "receive.procreceiverefs", "branch.main.mergeoptions", "branch.main.remote", "branch.main.pushremote", "remote.pushdefault",
         "branch.topic.with.dots.mergeoptions", "remote.origin.receivepack", "remote.origin.vcs", "uploadpack.packobjectshook",
+        "sendemail.confirm", "sendemail.work.confirm", "SENDEMAIL.CONFIRM", "SENDEMAIL.Work.CONFIRM",
         "sendemail.annotate", "sendemail.work.annotate", "sendemail.suppresscc", "sendemail.work.suppresscc",
         "sendemail.validate", "sendemail.work.validate", "sendemail.useimaponly", "sendemail.work.useimaponly",
         "sendemail.imapsentfolder", "sendemail.work.imapsentfolder", "sendemail.identity", "sendemail.tocmd", "sendemail.work.sendmailcmd", "sendemail.smtpserver", "include.path",
@@ -123,6 +124,8 @@ int main() {
         CHECK(guard_key_runs_command(key, "false"));
         CHECK(guard_key_runs_command(key, NULL));
     }
+    CHECK(guard_key_runs_command("sendemail.confirm", "never"));
+    CHECK(guard_key_runs_command("sendemail.work.confirm", NULL));
     // All aliases can dispatch external commands or inject -c command-running settings.
     // Built-in submodule update modes can activate retained child filters and commands.
     CHECK(guard_key_runs_command("alias.x", "!rm -rf /"));
@@ -216,6 +219,7 @@ int main() {
         "receive.custom.denydeletes", "receive.denydeletesextra",
         "difftool.payload.prompt", "mergetool.payload.prompt", "difftool.promptextra", "mergetool.promptextra",
         "receive.custom.denycurrentbranch", "remote.promisor",
+        "sendemail.confirmextra", "sendemail.work.confirmextra",
         "sendemail.work.identity", "sendemail.work.annotation", "sendemail.suppress", "fetch.custom.all", "remotes",
         "remote.skipdefaultupdate", "remote.skipfetchall", "remote.origin.skipfetch",
         "user.email", "user.name", "remote.origin.fetch", "remote.origin.name", "url.insteadof", "url.pushinsteadof",

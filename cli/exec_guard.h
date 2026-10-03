@@ -136,6 +136,7 @@ static const GuardKey kGuardKeys[] = {
     {"branch", "pushremote", 1, false},   {"remote", "pushdefault", 0, false},
     {"remote", "vcs", 1, false},          {"uploadpack", "packobjectshook", 0, false},
     {"sendemail", "identity", 0, false},
+    {"sendemail", "confirm", 2, false},
     {"sendemail", "annotate", 2, false}, {"sendemail", "suppresscc", 2, false},
     {"sendemail", "validate", 2, false}, {"sendemail", "useimaponly", 2, false},
     {"sendemail", "imapsentfolder", 2, false},

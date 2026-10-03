@@ -2111,7 +2111,7 @@ static void git_admin_free(GitAdmin *a) { sl_free(&a->gitdirs); sl_free(&a->pins
 // that tells Git where a repository is.
 
 struct GuardRec { char *id; char *val; size_t seq; };
-struct GuardSet { GuardRec *v; size_t n, cap, bytes_left, entries, include_targets; StrList attributes, hooks, includes, include_contexts; int include_ms; const char *error; };
+struct GuardSet { GuardRec *v; size_t n, cap, bytes_left, entries, include_targets; StrList attributes, hooks, includes, include_contexts; int include_ms; const char *error; bool coverage_gap; };
 
 static void gs_add(GuardSet *s, const char *id, const char *val) {
     if (s->error) return;
@@ -2715,6 +2715,22 @@ static bool pointer_home(const char *path, const char *base, const char *expect,
     return home;
 }
 
+// Observational capture keeps owned records available for repair reports, but must
+// not imply that a redirected repository's settings and hooks were fully inspected.
+static void note_pointer_coverage(const char *path, const char *base, const char *expect,
+                                  const char *prefix, bool optional, GuardSet *s) {
+    bool present;
+    bool home = pointer_home(path, base, expect, prefix, &present);
+    if (g_post_signal) { s->error = "Git capture interrupted"; return; }
+    if (!home && (!optional || present)) s->coverage_gap = true;
+}
+
+static void warn_pointer_coverage(const GuardSet *s, const char *when) {
+    if (s->coverage_gap && !g_post_signal)
+        fprintf(stderr, "world: WARNING: Git guard coverage is incomplete %s: repository pointers are "
+                "redirected, missing or unsupported; target Git hooks and settings were not fully inspected\n", when);
+}
+
 static bool require_pointer_home(const char *path, const char *base, const char *expect,
                                  const char *prefix, bool optional, GuardSet *s) {
     bool present;
@@ -2729,6 +2745,8 @@ static bool require_pointer_home(const char *path, const char *base, const char 
 // marks a regular file that names `expect`, the repository it belongs to, resolved from `base`.
 static void capture_pointer(const GitAdmin *a, const char *path, const char *base, const char *expect,
                             const char *prefix, GuardSet *s) {
+    note_pointer_coverage(path, base, expect, prefix, true, s);
+    if (s->error) return;
     char val[128], id[WFS_PATH_MAX + 8];
     snprintf(id, sizeof id, "p\x1f%s", rel_to(a, path));
     struct stat st;
@@ -3153,6 +3171,16 @@ static bool guard_capture(GitAdmin *a, GuardSet *s, bool require_home = false) {
     s->bytes_left = 64u << 20;
     s->include_ms = 5000;
     const char *self = real_dir(a->active) ? a->active : NULL;
+    if (!require_home) {
+        // Check mandatory entry points before queries: redirection can also make a
+        // metadata query fail, which must not suppress the coverage diagnostic.
+        char pointer[WFS_PATH_MAX + 16];
+        snprintf(pointer, sizeof pointer, "%s/.git", a->root);
+        note_pointer_coverage(pointer, a->root, a->active, "gitdir: ", false, s);
+        snprintf(pointer, sizeof pointer, "%s/commondir", a->active);
+        note_pointer_coverage(pointer, a->active, a->common, "", false, s);
+        if (s->error) return false;
+    }
     if (require_home) {
         if (!self) { s->error = "Git active administration is missing or unsupported"; return false; }
         char pointer[WFS_PATH_MAX + 16];
@@ -3175,6 +3203,11 @@ static bool guard_capture(GitAdmin *a, GuardSet *s, bool require_home = false) {
             char pointer[WFS_PATH_MAX + 16];
             snprintf(pointer, sizeof pointer, "%s/commondir", g);
             if (!require_pointer_home(pointer, g, g, "", true, s)) return false;
+        } else {
+            char pointer[WFS_PATH_MAX + 16];
+            snprintf(pointer, sizeof pointer, "%s/commondir", g);
+            note_pointer_coverage(pointer, g, g, "", true, s);
+            if (s->error) return false;
         }
         if (!capture_repo(a, g, g, label, s, require_home)) return false;
     }
@@ -3772,6 +3805,7 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
                           "world exec W<n> --no-sandbox -- <cmd>");
         }
         watch = guard_capture(&admin, &before, sandbox);
+        if (!sandbox) warn_pointer_coverage(&before, "before exec");
 #ifdef __APPLE__
         if (watch && sandbox && !prepare_planned_namespaces(&admin)) {
             before.error = "could not reserve declared submodule namespaces";
@@ -3927,6 +3961,7 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
             else fprintf(stderr, "world: WARNING: exec left W%llu's changed Git hooks and settings "
                          "uninspected after the command (%s)\n", (unsigned long long)w,
                          after.error ? after.error : "configuration query failed");
+            warn_pointer_coverage(&after, "after exec");
         } else {
             fprintf(stderr, "world: WARNING: exec removed or replaced W%llu's Git administration; "
                     "changed Git hooks and settings could not be inspected\n", (unsigned long long)w);

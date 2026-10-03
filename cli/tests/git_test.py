@@ -4589,6 +4589,48 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'world: WARNING: exec removed .git, which told Git where a repository is\n', p.stderr)
         (one / '.git.saved').rename(one / '.git')
 
+    def test_exec_warns_about_preexisting_redirected_pointer_coverage(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        alternate = self.root / 'alternate-repository'
+        self.git(self.root, 'init', str(alternate))
+        dotgit = one / '.git'
+        original = dotgit.read_bytes()
+        dotgit.write_text('gitdir: ' + str(alternate / '.git') + '\n')
+        redirected = dotgit.read_bytes()
+        p = self.exec_sh(wid, "git config core.sshCommand 'touch redirected-helper-ran'; exit 7",
+                         '--no-sandbox', code=7)
+        self.assertIn(b'WARNING: Git guard coverage is incomplete before exec:', p.stderr)
+        self.assertIn(b'WARNING: Git guard coverage is incomplete after exec:', p.stderr)
+        self.assertIn(b'target Git hooks and settings were not fully inspected', p.stderr)
+        self.assertEqual(dotgit.read_bytes(), redirected)
+        self.assertEqual(self.git(alternate, 'config', 'core.sshCommand').stdout.strip(),
+                         b'touch redirected-helper-ran')
+        self.assertNotIn(b'local core.sshcommand:', p.stderr)
+        self.assertFalse((one / 'redirected-helper-ran').exists())
+        # Coverage warnings must not discard owned snapshots or the repair report.
+        p = self.exec_sh(wid, 'printf %s ' + shlex.quote(original.decode()) + ' > .git; exit 7',
+                         '--no-sandbox', code=7)
+        self.assertIn(b'WARNING: Git guard coverage is incomplete before exec:', p.stderr)
+        self.assertNotIn(b'Git guard coverage is incomplete after exec:', p.stderr)
+        self.assertIn(b'exec changed where Git finds a repository: .git ', p.stderr)
+        self.assertEqual(dotgit.read_bytes(), original)
+        # Missing/foreign mandatory commondir must warn before metadata queries,
+        # including when those queries cannot produce an initial snapshot.
+        commondir = one / '.world-git/repo.git/worktrees/active/commondir'
+        original_common = commondir.read_bytes()
+        for contents in (str(alternate / '.git').encode() + b'\n', None):
+            with self.subTest(commondir=contents):
+                if contents is None:
+                    commondir.unlink()
+                else:
+                    commondir.write_bytes(contents)
+                p = self.exec_sh(wid, 'touch command-completed; exit 7', '--no-sandbox', code=7)
+                self.assertIn(b'WARNING: Git guard coverage is incomplete before exec:', p.stderr)
+                self.assertTrue((one / 'command-completed').exists())
+                (one / 'command-completed').unlink()
+                commondir.write_bytes(original_common)
+
     def test_exec_refuses_preexisting_redirected_git_pointers(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
@@ -4667,6 +4709,7 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(one, 'rev-parse', '--show-toplevel').stdout.strip(), str(hidden).encode())
         self.assertIn(b'worktree core.worktree:', p.stderr)
         self.assertIn(b'exec added a Git hook: .world-git/hidden/.husky/pre-commit', p.stderr)
+        self.assertNotIn(b'Git guard coverage is incomplete', p.stderr)  # optional checkout .git is absent
         self.assert_denied(wid, 'echo changed > .world-git/hidden/.husky/pre-commit')
         # Git ignores command-scope core.worktree for checkout setup; the guard must
         # protect the Git-resolved checkout rather than the last config-list value.
@@ -5374,6 +5417,23 @@ class GitWorldTest(unittest.TestCase):
         for key in (b'sendemail.work.sendmailcmd', b'sendemail.work.cccmd', b'core.editor', b'imap.tunnel'):
             self.assertNotIn(b'local ' + key + b':', p.stderr)
         self.assertFalse((one / 'sendmail-ran').exists())
+
+    def test_exec_reports_disabling_confirmation_for_retained_mail_commands(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        for prefix in ('sendemail', 'sendemail.work'):
+            self.git(one, 'config', prefix + '.sendmailCmd', 'touch retained-mail-command-ran')
+            self.git(one, 'config', prefix + '.confirm', 'always')
+        self.git(one, 'config', 'sendemail.identity', 'work')
+        p = self.exec_sh(wid, 'git config sendemail.confirm never && '
+                         'git config sendemail.work.confirm never; exit 7', '--no-sandbox', code=7)
+        for prefix in ('sendemail', 'sendemail.work'):
+            self.assertIn(b'local ' + prefix.encode() + b'.confirm: always -> never', p.stderr)
+            self.assertNotIn(b'local ' + prefix.encode() + b'.sendmailcmd:', p.stderr)
+            self.assertEqual(self.git(one, 'config', prefix + '.sendmailCmd').stdout.strip(),
+                             b'touch retained-mail-command-ran')
+        self.assertNotIn(b'local sendemail.identity:', p.stderr)
+        self.assertFalse((one / 'retained-mail-command-ran').exists())
 
     def test_exec_refuses_hooks_path_aliases_and_guards_missing_direct_path(self):
         self.world('init', str(self.source))
