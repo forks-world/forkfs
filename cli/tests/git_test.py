@@ -4792,6 +4792,73 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'symlinked Git hooks cannot be guarded', p.stderr)
         self.assertFalse((one / 'should-not-run').exists())
 
+    def test_exec_reports_nested_hook_support_files_without_changing_wrapper(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        roots = (one / '.world-git/repo.git/hooks', one / '.project-hooks')
+        self.git(one, 'config', 'core.hooksPath', '.project-hooks')
+        wrappers = []
+        for root in roots:
+            (root / 'lib/deep').mkdir(parents=True, exist_ok=True)
+            (root / 'helpers.sample').mkdir()
+            wrapper = root / 'pre-commit'
+            wrapper.write_text('#!/bin/sh\n. "$(dirname "$0")/lib/deep/helper"\n')
+            wrapper.chmod(0o755)
+            wrappers.append((wrapper, wrapper.read_bytes()))
+            (root / 'lib/deep/helper').write_text('echo before\n')
+            (root / 'lib/deep/remove-me').write_text('old\n')
+            (root / 'lib/deep/nested.sample').write_text('old\n')
+            (root / 'helpers.sample/helper').write_text('old\n')
+            (root / 'ignored.sample').write_text('old template\n')
+        commands = []
+        for root in roots:
+            for relative in ('lib/deep/helper', 'lib/deep/nested.sample', 'helpers.sample/helper'):
+                commands.append('printf %s ' + shlex.quote('echo after!\n') + ' > ' + shlex.quote(str(root / relative)))
+            commands.extend(('echo added > ' + shlex.quote(str(root / 'lib/deep/new-helper')),
+                             'rm ' + shlex.quote(str(root / 'lib/deep/remove-me')),
+                             'echo template > ' + shlex.quote(str(root / 'ignored.sample'))))
+        p = self.exec_sh(wid, ' && '.join(commands) + '; exit 7', '--no-sandbox', code=7)
+        for root in roots:
+            prefix = str(root.relative_to(one)).encode() + b'/'
+            for relative in (b'lib/deep/helper', b'lib/deep/nested.sample', b'helpers.sample/helper'):
+                self.assertIn(b'exec changed a Git hook: ' + prefix + relative, p.stderr)
+            self.assertIn(b'exec added a Git hook: ' + prefix + b'lib/deep/new-helper', p.stderr)
+            self.assertIn(b'exec removed a Git hook: ' + prefix + b'lib/deep/remove-me', p.stderr)
+            self.assertNotIn(prefix + b'ignored.sample', p.stderr)
+        for wrapper, original in wrappers:
+            self.assertEqual(wrapper.read_bytes(), original)
+            self.assertNotIn(b'a Git hook: ' + str(wrapper.relative_to(one)).encode() + b'\n', p.stderr)
+        # Project hook support stays writable with a sandbox; its bytes are still reported.
+        p = self.exec_sh(wid, 'echo edited > .project-hooks/lib/deep/helper', '--require-sandbox')
+        self.assertIn(b'exec changed a Git hook: .project-hooks/lib/deep/helper', p.stderr)
+
+    def test_exec_refuses_nested_hook_aliases_and_excess_depth(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        helpers = one / '.world-git/repo.git/hooks/lib'
+        helpers.mkdir(parents=True, exist_ok=True)
+        outside = one / 'external-helper'
+        outside.write_text('payload\n')
+        for kind in ('symlink-file', 'symlink-directory', 'hardlink'):
+            with self.subTest(kind=kind):
+                entry = helpers / 'unsupported'
+                if kind == 'hardlink':
+                    os.link(outside, entry)
+                else:
+                    entry.symlink_to(one if kind == 'symlink-directory' else outside,
+                                     target_is_directory=kind == 'symlink-directory')
+                p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+                self.assertIn(b'linked Git hooks cannot be guarded', p.stderr)
+                self.assertFalse((one / 'should-not-run').exists())
+                entry.unlink()
+        deep = helpers
+        for _ in range(33):
+            deep = deep / 'd'
+            deep.mkdir()
+        p = self.exec_sh(wid, 'touch should-not-run', '--require-sandbox', code=3)
+        self.assertIn(b'Git hook directory depth limit exceeded', p.stderr)
+        self.assertFalse((one / 'should-not-run').exists())
+
     def test_exec_large_sparse_hook_invalidates_capture_promptly(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
@@ -5786,6 +5853,23 @@ class GitWorldTest(unittest.TestCase):
                 self.assertIn(b'nonregular Git include target cannot be inspected', p.stderr)
                 self.assertFalse((one / 'should-not-run').exists())
                 config.unlink()
+
+    def test_exec_reports_redirect_policy_activating_retained_credentials(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        helper = '!touch ' + shlex.quote(str(one / 'redirect-credential-ran'))
+        self.git(one, 'config', 'credential.helper', helper)
+        keys = ('http.followRedirects', 'http.https://example.invalid/repo.followRedirects')
+        for key in keys:
+            self.git(one, 'config', key, 'false')
+        p = self.exec_sh(wid, 'git config http.followRedirects true && '
+                         'git config http.https://example.invalid/repo.followRedirects initial; exit 7',
+                         '--no-sandbox', code=7)
+        for key, value in zip(keys, ('true', 'initial')):
+            self.assertIn(b'local ' + key.lower().encode() + b': false -> ' + value.encode(), p.stderr)
+        self.assertNotIn(b'local credential.helper:', p.stderr)
+        self.assertEqual(self.git(one, 'config', 'credential.helper').stdout.strip(), helper.encode())
+        self.assertFalse((one / 'redirect-credential-ran').exists())
 
     def test_exec_reports_lfs_fetch_filters_activating_retained_agent(self):
         self.world('init', str(self.source))

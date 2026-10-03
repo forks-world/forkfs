@@ -2168,23 +2168,27 @@ static void gs_finish(GuardSet *s) {
 
 // The file's type, mode and content (a symlink: its target), as a short fingerprint. Hooks are
 // small; hashing the bytes catches a same-size, same-mtime rewrite through a hardlink.
-static bool fingerprint(const char *path, char *out, size_t cap, GuardSet *s, bool hook = false, bool regular_only = false) {
+static bool fingerprint(const char *path, char *out, size_t cap, GuardSet *s, bool hook = false, bool regular_only = false,
+                        int parent_fd = -1, const char *name = NULL) {
     struct stat st;
-    if (lstat(path, &st) != 0 || (regular_only && !S_ISREG(st.st_mode))) return false;
+    int inspected = parent_fd < 0 ? lstat(path, &st) : fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW);
+    if (inspected != 0 || (regular_only && !S_ISREG(st.st_mode))) return false;
     uint64_t h = 1469598103934665603ull;
     auto mix = [&h](const char *b, size_t n) {
         for (size_t i = 0; i < n; ++i) { h ^= (unsigned char)b[i]; h *= 1099511628211ull; }
     };
     char buf[8192];
     if (S_ISLNK(st.st_mode)) {
-        ssize_t n = readlink(path, buf, sizeof buf);
+        ssize_t n = parent_fd < 0 ? readlink(path, buf, sizeof buf) : readlinkat(parent_fd, name, buf, sizeof buf);
         if (n < 0 || (size_t)n == sizeof buf) return false;
         mix(buf, (size_t)n);
     } else if (S_ISREG(st.st_mode)) {
-        int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+        int flags = O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC;
+        int fd = parent_fd < 0 ? open(path, flags) : openat(parent_fd, name, flags);
         if (fd < 0) return false;
         struct stat opened;
-        if (fstat(fd, &opened) != 0 || !S_ISREG(opened.st_mode)) { close(fd); return false; }
+        if (fstat(fd, &opened) != 0 || !S_ISREG(opened.st_mode) ||
+            opened.st_dev != st.st_dev || opened.st_ino != st.st_ino) { close(fd); return false; }
         if (hook && opened.st_nlink > 1) {
             s->error = "hardlinked Git hooks cannot be guarded";
             close(fd); return false;
@@ -2219,50 +2223,76 @@ static const char *rel_to(const GitAdmin *a, const char *path) {
     return !strncmp(path, a->root, n) && path[n] == '/' ? path + n + 1 : path;
 }
 
-// Every hook Git could run from `dir`: all entries but Git's own *.sample templates, which Git
-// never runs (and which a fresh submodule clone creates).
-static void capture_hooks(const GitAdmin *a, const char *dir, GuardSet *s) {
+// Descendants may be sourced by an unchanged hook. Walk through directory descriptors,
+// never following a nested symlink or switching to a replacement directory mid-capture.
+static void capture_hook_tree(const GitAdmin *a, const char *dir, GuardSet *s,
+                              int parent_fd, const char *name, int depth) {
     if (s->error) return;
-    for (size_t i = 0; i < s->hooks.n; ++i)
-        if (!strcmp(s->hooks.v[i], dir)) return;
-    if (!sl_push(&s->hooks, dir)) { s->error = "out of memory"; return; }
+    if (g_post_signal) { s->error = "Git capture interrupted"; return; }
+    if (depth > 32) { s->error = "Git hook directory depth limit exceeded"; return; }
     struct stat directory;
-    if (lstat(dir, &directory) != 0) {
-        if (errno != ENOENT && errno != ENOTDIR) s->error = "could not inspect Git hooks directory";
+    int inspected = parent_fd < 0 ? lstat(dir, &directory) : fstatat(parent_fd, name, &directory, AT_SYMLINK_NOFOLLOW);
+    if (inspected != 0) {
+        if (parent_fd >= 0 || (errno != ENOENT && errno != ENOTDIR)) s->error = "could not inspect Git hooks directory";
         return;
     }
     if (S_ISLNK(directory.st_mode)) { s->error = "symlinked Git hooks cannot be guarded"; return; }
-    DIR *d = opendir(dir);
-    if (!d) { if (errno != ENOENT) s->error = "could not read Git hooks directory"; return; }
+    if (!S_ISDIR(directory.st_mode)) { s->error = "non-directory Git hooks path cannot be guarded"; return; }
+    int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC;
+    int fd = parent_fd < 0 ? open(dir, flags) : openat(parent_fd, name, flags);
+    struct stat opened;
+    if (fd < 0 || fstat(fd, &opened) != 0 || opened.st_dev != directory.st_dev || opened.st_ino != directory.st_ino) {
+        if (fd >= 0) close(fd);
+        s->error = "could not safely open Git hooks directory"; return;
+    }
+    DIR *d = fdopendir(fd);
+    if (!d) { close(fd); s->error = "could not read Git hooks directory"; return; }
     while (!s->error) {
         if (g_post_signal) { s->error = "Git capture interrupted"; break; }
         errno = 0;
         struct dirent *e = readdir(d);
         if (!e) { if (errno) s->error = "could not enumerate Git hooks"; break; }
         if (++s->entries > 65536) { s->error = "Git hook entry limit exceeded"; break; }
-        size_t n = strlen(e->d_name);
-        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") ||
-            (n > 7 && !strcmp(e->d_name + n - 7, ".sample"))) continue;
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         char p[WFS_PATH_MAX], id[WFS_PATH_MAX + 8], fp[64];
         if ((size_t)snprintf(p, sizeof p, "%s/%s", dir, e->d_name) >= sizeof p) {
             s->error = "Git hook path exceeds capture limit"; break;
         }
         struct stat st;
-        if (lstat(p, &st) != 0) { s->error = "could not inspect Git hook"; break; }
-        // Hashing only a link would miss edits to its external executable target. The
-        // directory policy cannot protect that target, so refuse an incomplete guard.
+        if (fstatat(fd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) { s->error = "could not inspect Git hook"; break; }
+        size_t n = strlen(e->d_name);
+        // Only Git's direct regular templates are exempt. A nested .sample file or
+        // a directory with that suffix may contain an executable support payload.
+        if (!depth && S_ISREG(st.st_mode) && n > 7 && !strcmp(e->d_name + n - 7, ".sample")) continue;
         if (S_ISLNK(st.st_mode)) { s->error = "symlinked Git hooks cannot be guarded"; break; }
         if (S_ISREG(st.st_mode) && st.st_nlink > 1) {
             s->error = "hardlinked Git hooks cannot be guarded"; break;
         }
-        if (!fingerprint(p, fp, sizeof fp, s, true)) {
+        if (!fingerprint(p, fp, sizeof fp, s, true, false, fd, e->d_name)) {
             if (!s->error) s->error = "could not fingerprint Git hook";
             break;
         }
         snprintf(id, sizeof id, "h\x1f%s", rel_to(a, p));
         gs_add(s, id, fp);
+        if (S_ISDIR(st.st_mode)) capture_hook_tree(a, p, s, fd, e->d_name, depth + 1);
+        struct stat after;
+        if (!s->error && (fstatat(fd, e->d_name, &after, AT_SYMLINK_NOFOLLOW) != 0 ||
+            after.st_dev != st.st_dev || after.st_ino != st.st_ino || after.st_mode != st.st_mode))
+            s->error = "Git hook entry changed during capture";
     }
+    struct stat after;
+    inspected = parent_fd < 0 ? lstat(dir, &after) : fstatat(parent_fd, name, &after, AT_SYMLINK_NOFOLLOW);
+    if (!s->error && (inspected != 0 || after.st_dev != directory.st_dev || after.st_ino != directory.st_ino))
+        s->error = "Git hooks directory changed during capture";
     closedir(d);
+}
+
+static void capture_hooks(const GitAdmin *a, const char *dir, GuardSet *s) {
+    if (s->error) return;
+    for (size_t i = 0; i < s->hooks.n; ++i)
+        if (!strcmp(s->hooks.v[i], dir)) return;
+    if (!sl_push(&s->hooks, dir)) { s->error = "out of memory"; return; }
+    capture_hook_tree(a, dir, s, -1, NULL, 0);
 }
 
 // `base`/`rel` with `.` and `..` resolved lexically (a submodule's core.worktree is relative to

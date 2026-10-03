@@ -351,8 +351,10 @@ warning.
   Git resolves `core.attributesFile`, its XDG default and the system attributes path per
   repository; `GIT_ATTR_NOSYSTEM` is honored and an effective `/dev/null` source is disabled.
   Shared paths are captured and reported once;
-- the hooks Git could run: name, mode and content of every non-`.sample` entry of its hooks
-  directory and of every effective or dormant `core.hooksPath`, including paths inside the
+- the hooks Git could run: name, mode and content of entries in its hooks directory and
+  every effective or dormant `core.hooksPath`, recursively including support files that an
+  unchanged wrapper can source. Only direct regular `*.sample` templates are excluded;
+  nested `.sample` files and sample-named directories are captured. This includes paths inside the
   project tree. Dormant paths come from the include graph and `config.worktree`, without
   requiring their conditions to become active. Relative paths are checked against each
   repository's effective checkout, every candidate `core.worktree`, and its Git directory
@@ -396,6 +398,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `pretty.*`, `format.commitlistformat`, `format.coverletter` (can activate signature verification),
 `branch.sort` and `tag.sort` when selecting a `signature` atom (ordinary name/version sorts stay quiet),
 `user.signingkey` (removal can activate the configured SSH default-key command),
+`http[.*].followredirects` (can reach a retained credential helper after redirection),
 `http[.*].sslcert|proxysslcert|sslcertpasswordprotected|proxysslcertpasswordprotected` (can activate certificate password helpers),
 `http[.*].proxy`, `remote.*.proxy` (can activate an existing proxy password helper),
 `gpg.format` (selects the signing program), `gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
@@ -457,7 +460,7 @@ selected by CMake at build time, unaffected by runtime `PATH`, and do not execut
 fsmonitor. Configuration introspection runs under a separate read-only sandbox: Seatbelt on
 macOS, or Bubblewrap with network and process isolation on Linux. It can write only `/dev/null` (needed by Git startup) and cannot
 access the network; account lookup on macOS is allowed for `~user` expansion. Each query has
-a five-second deadline and a 64 MiB output limit; no tree is walked. If configuration cannot
+a five-second deadline and a 64 MiB output limit; hook support trees use the capture limits below. If configuration cannot
 be read (missing configured Git or sandbox, a malformed file, or a query exceeding these
 limits), sandboxed exec refuses before running the command; `--no-sandbox` says so in a
 `note:` line and runs without the report;
@@ -468,7 +471,10 @@ renamed or replaced active worktree administration. An interrupted scan
 is identified as cancellation rather than a replacement. An incomplete administration scan (read/allocation error,
 path truncation, depth over 32, more than 4096 repositories or 65536 directory entries) refuses
 sandboxed exec; `--no-sandbox` reports the unavailable guard and preserves the command status.
-Hook, pointer and repository-attributes hashing has a 64 MiB aggregate content budget per capture; oversized files,
+Hook trees are limited to 32 directory levels and share the 65536-entry limit. Directory
+traversal uses descriptors without following symlinks; changed directory/entry identities
+invalidate capture. An empty `core.hooksPath` therefore recursively observes its execution
+directory and can exceed these limits. Hook, pointer and repository-attributes hashing has a 64 MiB aggregate content budget per capture; oversized files,
 read errors and record/entry limits invalidate the capture explicitly. Incomplete initial
 hook captures also refuse sandboxed exec. Any noninterrupted final capture failure emits a
 `WARNING` that changed hooks and settings could not be inspected, while keeping the command status. Small hooks are hashed

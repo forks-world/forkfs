@@ -63,6 +63,7 @@ int main() {
         "lfs.gitprotocol", "pull.ff", "lfs.url", "lfs.pushurl", "remote.origin.lfsurl", "remote.team.origin.lfspushurl",
         "lfs.fetchinclude", "lfs.fetchexclude", "LFS.FETCHINCLUDE", "LFS.FETCHEXCLUDE",
         "lfs.access", "lfs.https://example.invalid/repo.access", "LFS.ACCESS", "merge.defaulttoupstream", "merge.ff",
+        "http.followredirects", "http.https://example.invalid/repo.followredirects", "HTTP.FOLLOWREDIRECTS",
         "http.proactiveauth", "http.https://example.invalid/repo.proactiveauth", "HTTP.PROACTIVEAUTH",
         "credential.interactive", "CREDENTIAL.INTERACTIVE",
         "push.autosetupremote", "branch.main.merge", "branch.team.topic.merge",
@@ -139,6 +140,9 @@ int main() {
     }
     CHECK(guard_key_runs_command("lfs.fetchinclude", "*"));
     CHECK(guard_key_runs_command("lfs.fetchexclude", NULL));
+    CHECK(guard_key_runs_command("http.followredirects", "initial"));
+    CHECK(guard_key_runs_command("http.https://example.invalid/repo.followredirects", "true"));
+    CHECK(guard_key_runs_command("http.followredirects", NULL));
     // All aliases can dispatch external commands or inject -c command-running settings.
     // Built-in submodule update modes can activate retained child filters and commands.
     CHECK(guard_key_runs_command("alias.x", "!rm -rf /"));
@@ -209,6 +213,7 @@ int main() {
         "remote.lfsurl", "remote.lfspushurl", "remote.origin.lfsurlextra",
         "lfs.url.fetchinclude", "lfs.url.fetchexclude", "lfs.fetchincludeextra", "lfs.fetchexcludeextra",
         "lfs.accessextra", "lfs.https://example.invalid/repo.accessextra", "merge.custom.defaulttoupstream", "merge.custom.ff", "merge.ffextra",
+        "http.followredirectsextra", "http.https://example.invalid/repo.followredirectsextra",
         "http.proactiveauthextra", "http.https://example.invalid/repo.proactiveauthextra",
         "credential.https://example.invalid.interactive", "credential.interactiveextra",
         "push.custom.autosetupremote", "branch.merge", "branch.main.mergeextra",
