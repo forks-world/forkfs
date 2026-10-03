@@ -2016,7 +2016,7 @@ struct GitAdmin {
     // Each repository's effective core.hooksPath when it is not project content: outside the
     // World (~/.githooks, a shared directory) or inside .world-git. Filled by guard_capture, so
     // the sandbox rules and the report guard the same directories.
-    StrList hooks_paths;
+    StrList hooks_paths, hook_locator_pins;
     StrList planned_dirs, planned_namespaces, planned_locators; // macOS declarations for initialization during exec
 };
 
@@ -2102,7 +2102,7 @@ static bool git_admin_find(const char *world, GitAdmin *a) {
     return true;
 }
 
-static void git_admin_free(GitAdmin *a) { sl_free(&a->gitdirs); sl_free(&a->pins); sl_free(&a->hooks_paths); sl_free(&a->planned_dirs); sl_free(&a->planned_namespaces); sl_free(&a->planned_locators); }
+static void git_admin_free(GitAdmin *a) { sl_free(&a->gitdirs); sl_free(&a->pins); sl_free(&a->hooks_paths); sl_free(&a->hook_locator_pins); sl_free(&a->planned_dirs); sl_free(&a->planned_namespaces); sl_free(&a->planned_locators); }
 
 // --- what exec compares before and after the command ---
 //
@@ -2111,7 +2111,7 @@ static void git_admin_free(GitAdmin *a) { sl_free(&a->gitdirs); sl_free(&a->pins
 // that tells Git where a repository is.
 
 struct GuardRec { char *id; char *val; size_t seq; };
-struct GuardSet { GuardRec *v; size_t n, cap, bytes_left, entries; StrList attributes, hooks, includes, include_contexts; int include_ms; const char *error; };
+struct GuardSet { GuardRec *v; size_t n, cap, bytes_left, entries, include_targets; StrList attributes, hooks, includes, include_contexts; int include_ms; const char *error; };
 
 static void gs_add(GuardSet *s, const char *id, const char *val) {
     if (s->error) return;
@@ -2519,7 +2519,7 @@ static bool capture_include_edges(const GitAdmin *a, const char *gitdir, const c
                                   GuardSet *s, int depth);
 
 static bool capture_include_target(const GitAdmin *a, const char *gitdir, const char *path,
-                                   GuardSet *s, int depth) {
+                                   GuardSet *s, int depth, char kind = 'i') {
     if (g_post_signal) { s->error = "Git capture interrupted"; return false; }
     if (depth > 32) { s->error = "Git include depth limit exceeded"; return false; }
     struct stat st;
@@ -2534,10 +2534,15 @@ static bool capture_include_target(const GitAdmin *a, const char *gitdir, const 
     for (size_t i = 0; i < s->includes.n; ++i)
         if (!strcmp(s->includes.v[i], identity)) { captured = true; break; }
     if (!captured) {
-        if (s->includes.n >= 256) { s->error = "Git include target limit exceeded"; return false; }
+        // Absent worktree seeds are already bounded by repository discovery; they do
+        // not consume the include graph's file budget merely by being checked.
+        if (kind != 'w' || present) {
+            if (s->include_targets >= 256) { s->error = "Git include target limit exceeded"; return false; }
+            ++s->include_targets;
+        }
         if (!sl_push(&s->includes, identity)) { s->error = "out of memory"; return false; }
         char id[WFS_PATH_MAX + 40], fp[64];
-        if ((size_t)snprintf(id, sizeof id, "i\x1f%s", rel_to(a, identity)) >= sizeof id) {
+        if ((size_t)snprintf(id, sizeof id, "%c\x1f%s", kind, rel_to(a, identity)) >= sizeof id) {
             s->error = "Git include target path exceeds capture limit"; return false;
         }
         if (present && !fingerprint(path, fp, sizeof fp, s, false, true)) {
@@ -2724,7 +2729,7 @@ static bool hooks_path_without_aliases(const char *path) {
 // resolved from the repository's checkout, as Git does. Every effective directory is
 // reported, including ignored project content. Only paths outside the tree or inside
 // .world-git receive readonly protection; project hooks stay editable.
-static bool note_hooks_path(const GitAdmin *a, const char *checkout, const char *v, char *out, size_t cap, bool *protect) {
+static bool note_hooks_path(GitAdmin *a, const char *checkout, const char *v, char *out, size_t cap, bool *protect) {
     out[0] = 0;
     *protect = false;
     char p[2 * WFS_PATH_MAX], real[WFS_PATH_MAX];
@@ -2764,6 +2769,29 @@ static bool note_hooks_path(const GitAdmin *a, const char *checkout, const char 
     bool in_tree = !strncmp(real, a->root, n) && (real[n] == '/' || !real[n]);
     bool in_admin = !strncmp(real, admin, m) && (real[m] == '/' || !real[m]);
     *protect = !in_tree || in_admin;
+#ifdef __APPLE__
+    if (*protect) {
+        // Pin raw traversal prefixes too: canonicalization erases `a` from a/../hooks,
+        // but replacing a with a symlink would change Git's subsequent path resolution.
+        char raw[sizeof p];
+        memcpy(raw, p, strlen(p) + 1);
+        for (size_t i = 1;; ++i) {
+            if (raw[i] && raw[i] != '/') continue;
+            char end = raw[i]; raw[i] = 0;
+            char *prefix = realpath(raw, NULL);
+            if (prefix) {
+                bool seen = false;
+                for (size_t j = 0; j < a->hook_locator_pins.n; ++j)
+                    if (!strcmp(a->hook_locator_pins.v[j], prefix)) { seen = true; break; }
+                bool ok = seen || (a->hook_locator_pins.n < 65536 && sl_push(&a->hook_locator_pins, prefix));
+                free(prefix);
+                if (!ok) return false;
+            } else if (errno != ENOENT) return false;
+            raw[i] = end;
+            if (!end) break;
+        }
+    }
+#endif
     if ((size_t)snprintf(out, cap, "%s", real) >= cap) return false;
     return true;
 }
@@ -2941,6 +2969,13 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
     }
     free(out);
     if (s->error) return false;
+    // config.worktree may become active later, even when Git omits it from today's
+    // effective listing. Capture its bytes and dormant include graph unconditionally.
+    char worktree_config[WFS_PATH_MAX];
+    if (!gitdir || (size_t)snprintf(worktree_config, sizeof worktree_config, "%s/config.worktree", gitdir) >= sizeof worktree_config) {
+        s->error = "could not locate Git worktree configuration"; return false;
+    }
+    if (!capture_include_target(a, gitdir, worktree_config, s, 0, 'w')) return false;
     if (!capture_include_edges(a, gitdir, NULL, s, 0)) return false;
     // Git's setup rules decide the effective checkout, including linked-worktree
     // configuration semantics; the last config-list value alone is insufficient.
@@ -3132,6 +3167,12 @@ static void guard_warn(const GuardRec *before, const GuardRec *after) {
         fputs(" -> ", stderr);
         put_value(stderr, after ? after->val : NULL);
         fputc('\n', stderr);
+    } else if (id[0] == 'w') {
+        bool was = before && strcmp(before->val, "absent");
+        bool is = after && strcmp(after->val, "absent");
+        fprintf(stderr, "world: WARNING: exec %s Git worktree configuration: ", !was ? "added" : !is ? "removed" : "changed");
+        put_field(stderr, rest, strlen(rest));
+        fputs(" (including dormant configuration)\n", stderr);
     } else if (id[0] == 'i') {
         bool was = before && strcmp(before->val, "absent");
         bool is = after && strcmp(after->val, "absent");
@@ -3201,7 +3242,7 @@ static void guard_report(const GuardSet *b, const GuardSet *a) {
         if (before && after && !strcmp(before->val, after->val)) continue;
         const char kind = (before ? before : after)->id[0];
         if (kind == 'c' && shared_with_world(b, a, before, after)) continue;
-        if ((kind == 'a' || kind == 'i') && (!before || !strcmp(before->val, "absent")) &&
+        if ((kind == 'a' || kind == 'i' || kind == 'w') && (!before || !strcmp(before->val, "absent")) &&
             (!after || !strcmp(after->val, "absent"))) continue;
         if (kind == 'p') {
             bool was = before && strcmp(before->val, "absent");
@@ -3301,6 +3342,19 @@ static bool sb_module_hooks(FILE *f, const char *modules) {
            sb_regex(f, "allow file-write*", modules, "/(.+/)?hooks/[^/]+\\.sample$");
 }
 
+// Entry pins, not subtree denies: sibling contents remain writable. No creation
+// exception is safe for a missing ancestor because rename-in could carry protected hooks.
+static bool sb_hook_ancestors(FILE *f, const char *path, bool include_self = false) {
+    char p[WFS_PATH_MAX];
+    if ((size_t)snprintf(p, sizeof p, "%s", path) >= sizeof p) return false;
+    if (include_self && strcmp(p, "/")) sb_literal(f, "deny file-write*", p);
+    for (char *slash = strrchr(p, '/'); slash && slash != p; slash = strrchr(p, '/')) {
+        *slash = 0;
+        sb_literal(f, "deny file-write*", p);
+    }
+    return true;
+}
+
 // Seatbelt rules for the World's Git administration; see "the World's Git administration" above.
 static bool sb_git_admin(FILE *f, const GitAdmin *a) {
     fputs("\n; --- denied: the World's Git hooks, which run later outside any sandbox, and every\n"
@@ -3372,7 +3426,20 @@ static bool sb_git_admin(FILE *f, const GitAdmin *a) {
     }
     // Repository exceptions above must not reopen an effective hooksPath nested within
     // a repository whose name contains `hooks`. Keep these denies after every allow.
-    for (size_t i = 0; i < a->hooks_paths.n; ++i) sb_subpath(f, "deny file-write*", a->hooks_paths.v[i]);
+    for (size_t i = 0; i < a->hooks_paths.n; ++i) {
+        sb_subpath(f, "deny file-write*", a->hooks_paths.v[i]);
+        if (!sb_hook_ancestors(f, a->hooks_paths.v[i])) return false;
+    }
+    for (size_t i = 0; i < a->hook_locator_pins.n; ++i)
+        if (!sb_hook_ancestors(f, a->hook_locator_pins.v[i], true)) return false;
+    // Default hooks need their World and outer ancestors pinned too. Only existing
+    // repository roots are included here; planned clone namespaces retain their policy.
+    if ((size_t)snprintf(p, sizeof p, "%s/hooks", a->common) >= sizeof p ||
+        !sb_hook_ancestors(f, p)) return false;
+    for (size_t i = 0; i < a->gitdirs.n; ++i) {
+        if ((size_t)snprintf(p, sizeof p, "%s/hooks", a->gitdirs.v[i]) >= sizeof p ||
+            !sb_hook_ancestors(f, p)) return false;
+    }
     return true;
 }
 

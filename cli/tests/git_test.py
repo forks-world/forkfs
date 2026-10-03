@@ -4791,6 +4791,69 @@ class GitWorldTest(unittest.TestCase):
                          '--no-sandbox', code=7)
         self.assertIn(b'local fetch.bundleuri: (unset) -> https://example.invalid/bootstrap.bundle', p.stderr)
 
+    def test_exec_reports_dormant_worktree_config_and_its_includes(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        root_admin = one / '.world-git/repo.git/worktrees/active'
+        child_admin = root_admin / 'modules/lib-module'
+        for repo in (one, one / 'libs/lib'):
+            self.git(repo, 'config', 'extensions.worktreeConfig', 'false')
+        root_config = root_admin / 'config.worktree'
+        child_config = child_admin / 'config.worktree'
+        p = self.exec_sh(wid, "printf '[core]\\n sshCommand = touch dormant-worktree-ran\\n' > " +
+                         shlex.quote(str(root_config)) + '; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'exec added Git worktree configuration: .world-git/repo.git/worktrees/active/config.worktree',
+                      p.stderr)
+        self.assertNotIn(b'worktree core.sshcommand:', p.stderr)
+        root_config.write_text('[includeIf "onbranch:never-active"]\n path = dormant-parent\n')
+        policy = root_admin / 'dormant-parent'
+        nested = root_admin / 'dormant-leaf'
+        policy.write_text('[include]\n path = dormant-leaf\n')
+        nested.write_text('[core]\n sshCommand = touch dormant-worktree-ran\n')
+        p = self.exec_sh(wid, "printf '\\n[alias]\\n hidden = !touch dormant-worktree-ran\\n' >> " +
+                         shlex.quote(str(nested)) + " && printf '[core]\\n fsmonitor = touch dormant-worktree-ran\\n' > " +
+                         shlex.quote(str(child_config)), '--require-sandbox')
+        self.assertIn(b'exec changed a Git include target: .world-git/repo.git/worktrees/active/dormant-leaf', p.stderr)
+        self.assertIn(b'exec added Git worktree configuration: .world-git/repo.git/worktrees/active/modules/lib-module/config.worktree',
+                      p.stderr)
+        p = self.exec_sh(wid, 'rm ' + shlex.quote(str(child_config)), '--require-sandbox')
+        self.assertIn(b'exec removed Git worktree configuration:', p.stderr)
+        self.assertFalse((one / 'dormant-worktree-ran').exists())
+        self.assertFalse((one / 'libs/lib/dormant-worktree-ran').exists())
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Seatbelt protected hooks ancestor pins')
+    def test_exec_pins_external_and_default_hook_ancestors(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        shared = self.root / 'shared'
+        hooks = shared / 'hooks'
+        hooks.mkdir(parents=True)
+        (shared / 'cancelled').mkdir()
+        hook = hooks / 'pre-commit'
+        hook.write_text('#!/bin/sh\nexit 0\n')
+        original = hook.read_bytes()
+        self.git(one, 'config', 'core.hooksPath', str(shared / 'cancelled/../hooks'))
+        self.assert_denied(wid, 'mv ' + shlex.quote(str(shared)) + ' ' + shlex.quote(str(self.root / 'shared-old')))
+        self.assert_denied(wid, 'mv ' + shlex.quote(str(shared / 'cancelled')) + ' ' +
+                           shlex.quote(str(shared / 'cancelled-old')))
+        self.exec_sh(wid, 'echo allowed > ' + shlex.quote(str(shared / 'sibling')), '--require-sandbox')
+        self.assertEqual(hook.read_bytes(), original)
+        self.assertTrue((shared / 'sibling').exists())
+        self.git(one, 'config', '--unset', 'core.hooksPath')
+        # Default hooks remain protected even if an ancestor outside administration moves.
+        moved = self.root / 'moved-world'
+        p = subprocess.run((WORLD, 'exec', wid, '--require-sandbox', '--', '/bin/sh', '-c',
+                            'mv ' + shlex.quote(str(one)) + ' ' + shlex.quote(str(moved))),
+                           env=self.env, capture_output=True, timeout=60)
+        if moved.exists():
+            moved.rename(one)
+        self.assertNotEqual(p.returncode, 0, p.stderr)
+        missing = shared / 'not-created/hooks'
+        self.git(one, 'config', 'core.hooksPath', str(missing))
+        self.assert_denied(wid, 'mkdir ' + shlex.quote(str(missing.parent)))
+        self.assertFalse(missing.parent.exists())
+
     def test_exec_reports_dormant_conditional_include_targets(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

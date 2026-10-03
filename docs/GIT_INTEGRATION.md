@@ -270,6 +270,14 @@ So `world exec` does two things.
   renamed or removed. Operations that move them (`git worktree repair`, `git submodule
   absorbgitdirs`) fail inside the exec; run them outside.
 
+On macOS, every protected hook directory also pins its ancestor directory entries, including
+ancestors outside the World. Raw traversal components discarded by `..` are pinned too, so
+renaming an ancestor or replacing a traversed directory with a symlink cannot expose the hooks
+through another path. These are entry restrictions, so sibling files remain writable. Missing
+ancestors have no directory-creation exception; create the intended directory outside exec.
+Default-hook ancestor pins apply only to existing repositories and preserve planned submodule
+initialization described above.
+
 A tool that installs hooks (`git lfs install`, `pre-commit install`, `husky` writing to the
 default hooks directory) fails inside a sandboxed exec for the same reason; run it outside.
 A repository-local `core.hooksPath` pointing into the tree (husky's `.husky`) is **not**
@@ -300,6 +308,10 @@ observational reporting so a command can repair them.
   per repository, since an `includeIf "gitdir:..."` or `"onbranch:..."` can give one
   submodule settings the World does not have; a change to a global or system entry that is
   identical in the World's own listing is reported once, under the World;
+- each repository's `config.worktree`, even while `extensions.worktreeConfig` is disabled,
+  including its dormant include graph. Missing files are recorded; later creation, removal
+  and content edits are reported under the same regular-file and resource limits. Absent
+  worktree files do not consume the 256-target include budget; present ones do;
 - every include target declared by effective configuration, including inactive conditional
   includes and their nested targets. Git expands paths; relative targets retain the including
   file's origin directory. Missing files are recorded, so creating a dormant payload is reported.
