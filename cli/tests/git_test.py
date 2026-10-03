@@ -5361,6 +5361,40 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((one / 'selected-remote-ran').exists())
         self.assertFalse((one / 'selected-strategy-ran').exists())
 
+    def test_exec_reports_pull_fastforward_and_lfs_endpoint_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'credential.helper', '!touch endpoint-helper-ran')
+        self.git(one, 'config', 'merge.retained.driver', 'touch pull-driver-ran')
+        self.git(one, 'config', 'merge.default', 'retained')
+        self.git(one, 'config', 'merge.ff', 'only')
+        self.git(one, 'config', 'pull.ff', 'only')
+        endpoints = {'lfs.url': 'https://example.invalid/download',
+                     'lfs.pushurl': 'https://example.invalid/upload',
+                     'remote.origin.lfsurl': 'https://example.invalid/remote-download',
+                     'remote.origin.lfspushurl': 'https://example.invalid/remote-upload'}
+        p = self.exec_sh(wid, ' && '.join('git config ' + key + ' ' + shlex.quote(value)
+                                        for key, value in endpoints.items()) +
+                         ' && git config pull.ff true; exit 7', '--no-sandbox', code=7)
+        for key, value in endpoints.items():
+            self.assertIn(b'local ' + key.encode() + b': (unset) -> ' + value.encode(), p.stderr)
+        self.assertIn(b'local pull.ff: only -> true', p.stderr)
+        for key in (b'credential.helper', b'merge.retained.driver', b'merge.default', b'merge.ff'):
+            self.assertNotIn(b'local ' + key + b':', p.stderr)
+        # Without explicit endpoint overrides, gitprotocol can select an unchanged
+        # URL-scoped access policy for the git:// remote's derived LFS endpoint.
+        for key in endpoints:
+            self.git(one, 'config', '--unset', key)
+        self.git(one, 'config', 'remote.origin.url', 'git://example.invalid/repo')
+        self.git(one, 'config', 'lfs.http://example.invalid/repo/info/lfs.access', 'basic')
+        self.git(one, 'config', 'lfs.gitprotocol', 'https')
+        p = self.exec_sh(wid, 'git config lfs.gitprotocol http', '--no-sandbox')
+        self.assertIn(b'local lfs.gitprotocol: https -> http', p.stderr)
+        self.assertNotIn(b'local lfs.http://example.invalid/repo/info/lfs.access:', p.stderr)
+        self.assertNotIn(b'local credential.helper:', p.stderr)
+        self.assertFalse((one / 'endpoint-helper-ran').exists())
+        self.assertFalse((one / 'pull-driver-ran').exists())
+
     def test_exec_reports_lfs_access_and_default_upstream_merge_activation(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
