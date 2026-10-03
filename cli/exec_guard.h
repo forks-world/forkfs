@@ -135,6 +135,8 @@ static const GuardKey kGuardKeys[] = {
     {"pull", "twohead", 0, false},        {"pull", "octopus", 0, false},
     {"branch", "mergeoptions", 1, false}, {"branch", "remote", 1, false},
     {"branch", "pushremote", 1, false},   {"remote", "pushdefault", 0, false},
+    {"uploadpack", "hiderefs", 0, false}, {"receive", "hiderefs", 0, false},
+    {"transfer", "hiderefs", 0, false},
     {"remote", "vcs", 1, false},          {"uploadpack", "packobjectshook", 0, false},
     {"sendemail", "identity", 0, false},
     {"sendemail", "confirm", 2, false},

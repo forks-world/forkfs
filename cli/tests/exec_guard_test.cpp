@@ -78,6 +78,8 @@ int main() {
         "remote.origin.partialclonefilter", "extensions.partialclone",
         "receive.denynonfastforwards", "RECEIVE.DENYNONFASTFORWARDS",
         "receive.denydeletes", "RECEIVE.DENYDELETES",
+        "uploadpack.hiderefs", "receive.hiderefs", "transfer.hiderefs",
+        "UPLOADPACK.HIDEREFS", "RECEIVE.HIDEREFS", "TRANSFER.HIDEREFS",
         "receive.denydeletecurrent", "RECEIVE.DENYDELETECURRENT", "core.usereplacerefs", "CORE.USEREPLACEREFS",
         "difftool.prompt", "mergetool.prompt", "DIFFTOOL.PROMPT", "MERGETOOL.PROMPT",
         "receive.denycurrentbranch", "remote.origin.promisor", "remote.team.origin.promisor",
@@ -128,6 +130,12 @@ int main() {
     }
     CHECK(guard_key_runs_command("sendemail.confirm", "never"));
     CHECK(guard_key_runs_command("sendemail.work.confirm", NULL));
+    const char *hidden_refs[] = {"uploadpack.hiderefs", "receive.hiderefs", "transfer.hiderefs"};
+    for (const char *key : hidden_refs) {
+        CHECK(guard_key_runs_command(key, "refs/heads/main"));
+        CHECK(guard_key_runs_command(key, "!refs/heads/main"));
+        CHECK(guard_key_runs_command(key, NULL));
+    }
     // All aliases can dispatch external commands or inject -c command-running settings.
     // Built-in submodule update modes can activate retained child filters and commands.
     CHECK(guard_key_runs_command("alias.x", "!rm -rf /"));
@@ -219,6 +227,8 @@ int main() {
         "remote.partialclonefilter", "extensions.custom.partialclone",
         "receive.custom.denynonfastforwards", "receive.denynonfastforwardsextra",
         "receive.custom.denydeletes", "receive.denydeletesextra",
+        "uploadpack.custom.hiderefs", "receive.custom.hiderefs", "transfer.custom.hiderefs",
+        "uploadpack.hiderefsextra", "receive.hiderefsextra", "transfer.hiderefsextra",
         "receive.custom.denydeletecurrent", "receive.denydeletecurrentextra",
         "core.custom.usereplacerefs", "core.usereplacerefsextra",
         "difftool.payload.prompt", "mergetool.payload.prompt", "difftool.promptextra", "mergetool.promptextra",

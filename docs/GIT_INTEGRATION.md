@@ -396,6 +396,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `push.default`, `push.autosetupremote`, `branch.*.merge`, `remote.*.push|mirror` (can enable an otherwise refused push through an existing helper),
 `remote.*.promisor|partialclonefilter`, `extensions.partialclone`
 (can activate a configured helper when fetching missing objects),
+`uploadpack.hiderefs`, `receive.hiderefs` and `transfer.hiderefs` (can let newly visible refs reach retained transfer commands or update hooks),
 `uploadpack.packobjectshook`, `receive.procreceiverefs` (activates the configured proc-receive hook),
 `receive.denycurrentbranch` (can enable the existing push-to-checkout hook),
 `receive.denynonfastforwards`, `receive.denydeletes` and `receive.denydeletecurrent` (can let forced branch updates or permitted deletions reach the existing update hook),

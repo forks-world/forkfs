@@ -5153,6 +5153,38 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((one / 'promisor-helper-ran').exists())
         self.assertFalse((one / 'checkout-hook-ran').exists())
 
+    def test_exec_reports_unhiding_refs_with_retained_transfer_commands(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        # uploadpack.packObjectsHook is honored only in protected configuration;
+        # use the test's isolated global file, not an ignored local definition.
+        self.env['GIT_CONFIG_GLOBAL'] = str(self.root / 'hidden-refs-global-config')
+        pack_command = 'touch ' + shlex.quote(str(one / 'retained-pack-hook-ran')) + '; git pack-objects'
+        self.git(one, 'config', '--global', 'uploadpack.packObjectsHook', pack_command)
+        hook = one / '.world-git/repo.git/hooks/update'
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(one / 'retained-hidden-ref-hook-ran')) + '\n')
+        hook.chmod(0o755)
+        original = hook.read_bytes()
+        keys = ('uploadpack.hideRefs', 'receive.hideRefs', 'transfer.hideRefs')
+        for after in ('(unset)', '!refs/heads/main'):
+            with self.subTest(after=after):
+                for key in keys:
+                    self.git(one, 'config', key, 'refs/heads/main')
+                commands = ('git config --unset ' + key if after == '(unset)' else
+                            'git config ' + key + ' ' + shlex.quote(after) for key in keys)
+                p = self.exec_sh(wid, ' && '.join(commands) + '; exit 7', '--no-sandbox', code=7)
+                for key in keys:
+                    self.assertIn(b'local ' + key.lower().encode() + b': refs/heads/main -> ' +
+                                  after.encode(), p.stderr)
+                self.assertNotIn(b'global uploadpack.packobjectshook:', p.stderr)
+                self.assertNotIn(b'a Git hook:', p.stderr)
+                self.assertEqual(self.git(one, 'config', '--global', 'uploadpack.packObjectsHook').stdout.strip(),
+                                 pack_command.encode())
+                self.assertEqual(hook.read_bytes(), original)
+                self.assertFalse((one / 'retained-pack-hook-ran').exists())
+                self.assertFalse((one / 'retained-hidden-ref-hook-ran').exists())
+
     def test_exec_reports_enabling_remote_archive_command(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
