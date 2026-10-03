@@ -2524,7 +2524,7 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
         argv[arg++] = "rev-parse";
         argv[arg++] = "--verify";
         argv[arg++] = "--quiet";
-        argv[arg++] = path_key;  // fixed :.lfsconfig or HEAD:.lfsconfig
+        argv[arg++] = path_key;  // fixed index/HEAD .lfsconfig or .gitmodules spec
     } else if (query == GG_LFS_BLOB) {
         argv[arg++] = "cat-file";
         argv[arg++] = "blob";
@@ -2832,16 +2832,16 @@ static bool capture_include_edges(const GitAdmin *a, const char *gitdir, const c
     return ok;
 }
 
-// Git LFS can fall back to index/HEAD when the checkout file is absent. Observe
-// both latent blobs, including replacement-object content, without running LFS itself.
-static bool capture_lfs_blob(const GitAdmin *a, const char *gitdir, const char *spec,
-                             GuardSet *s, HookCandidates *hooks) {
-    if (++s->entries > 65536) { s->error = "Git LFS capture entry limit exceeded"; return false; }
+// LFS and submodule configuration can fall back to index/HEAD when checkout files
+// are absent. Observe latent blobs, including replacement bytes, without executing helpers.
+static bool capture_config_blob(const GitAdmin *a, const char *gitdir, const char *spec,
+                             GuardSet *s, HookCandidates *hooks, char kind = 'b') {
+    if (++s->entries > 65536) { s->error = "Git configuration capture entry limit exceeded"; return false; }
     char *label = guard_encode_id_field(rel_to(a, gitdir));
     if (!label) { s->error = "out of memory"; return false; }
     size_t cap = strlen(label) + strlen(spec) + 8;
     char *id = (char *)malloc(cap);
-    if (id) snprintf(id, cap, "b\x1f%s\x1f%s", spec, label);
+    if (id) snprintf(id, cap, "%c\x1f%s\x1f%s", kind, spec, label);
     free(label);
     if (!id) { s->error = "out of memory"; return false; }
     size_t len = 0;
@@ -2849,7 +2849,7 @@ static bool capture_lfs_blob(const GitAdmin *a, const char *gitdir, const char *
     char *oid = git_guard_read(a->root, gitdir, spec, GG_LFS_OID, &len, &status, &s->include_ms);
     if (!oid) {
         if (status == 1) gs_add(s, id, "absent");  // absent stage 0/path, including unborn HEAD
-        else s->error = g_post_signal ? "Git capture interrupted" : "Git LFS object resolution failed or exceeded capture time budget";
+        else s->error = g_post_signal ? "Git capture interrupted" : "Git configuration object resolution failed or exceeded capture time budget";
         free(id);
         return !s->error;
     }
@@ -2857,13 +2857,13 @@ static bool capture_lfs_blob(const GitAdmin *a, const char *gitdir, const char *
     for (size_t i = 0; valid && i + 1 < len; ++i)
         valid = (oid[i] >= '0' && oid[i] <= '9') || (oid[i] >= 'a' && oid[i] <= 'f');
     if (!valid) {
-        free(oid); free(id); s->error = "unsupported Git LFS object identity"; return false;
+        free(oid); free(id); s->error = "unsupported Git configuration object identity"; return false;
     }
     oid[len - 1] = 0;
     char *bytes = git_guard_read(a->root, gitdir, oid, GG_LFS_BLOB, &len, &status, &s->include_ms);
     if (!bytes) {
         free(oid); free(id);
-        s->error = g_post_signal ? "Git capture interrupted" : "Git LFS blob capture failed or exceeded capture time budget";
+        s->error = g_post_signal ? "Git capture interrupted" : "Git configuration blob capture failed or exceeded capture time budget";
         return false;
     }
     if (len > s->bytes_left) {
@@ -2877,6 +2877,8 @@ static bool capture_lfs_blob(const GitAdmin *a, const char *gitdir, const char *
     snprintf(fp, sizeof fp, "blob:%016llx", (unsigned long long)hash);
     gs_add(s, id, fp);
     free(id);
+    // Git's .gitmodules reader does not expand include directives.
+    if (kind != 'b') { free(oid); return !s->error; }
     // A blob has no file-relative include origin. The ordinary parser below permits
     // absolute (including Git-expanded tilde) edges, and rejects relative ones.
     char context[WFS_PATH_MAX + 96];
@@ -3101,6 +3103,30 @@ static bool note_hooks_path(GitAdmin *a, const char *checkout, const char *v, ch
     return true;
 }
 
+static bool capture_gitmodules(const GitAdmin *a, const char *gitdir, const char *checkout,
+                               GuardSet *s, HookCandidates *hooks) {
+    if (++s->entries > 65536) { s->error = "Git configuration entry limit exceeded"; return false; }
+    char path[WFS_PATH_MAX], id[WFS_PATH_MAX + 40], fp[64];
+    if (!attributes_path(checkout, ".gitmodules", path, sizeof path) ||
+        (size_t)snprintf(id, sizeof id, "m\x1f%s", rel_to(a, path)) >= sizeof id) {
+        s->error = "Git submodule configuration path exceeds capture limit"; return false;
+    }
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) gs_add(s, id, "absent");
+        else s->error = "could not inspect Git submodule configuration";
+    } else if (!S_ISREG(st.st_mode)) s->error = "nonregular Git submodule configuration cannot be inspected";
+    else if (fingerprint(path, fp, sizeof fp, s, false, true)) {
+        struct stat after;
+        if (lstat(path, &after) != 0 || after.st_dev != st.st_dev || after.st_ino != st.st_ino ||
+            after.st_mode != st.st_mode) s->error = "Git submodule configuration changed during capture";
+        else gs_add(s, id, fp);
+    }
+    else if (!s->error) s->error = "could not fingerprint Git submodule configuration";
+    return !s->error && capture_config_blob(a, gitdir, ":.gitmodules", s, hooks, 'n') &&
+           capture_config_blob(a, gitdir, "HEAD:.gitmodules", s, hooks, 'n');
+}
+
 // Conditions and value precedence may change later. Conservatively observe the union
 // of candidate checkout roots and hook/attribute values, plus the Gitdir used by receive hooks.
 static bool capture_include_hooks(GitAdmin *a, const char *gitdir, const char *checkout, GuardSet *s) {
@@ -3122,8 +3148,9 @@ static bool capture_include_hooks(GitAdmin *a, const char *gitdir, const char *c
     // LFS ignores core.hooksPath/core.attributesFile/core.worktree here. Traverse only their
     // includes, rather than turning ignored values into new sandbox restrictions.
     if (ok) ok = capture_include_target(a, gitdir, lfs_config, s, &hooks, 0, 'l', true);
-    if (ok) ok = capture_lfs_blob(a, gitdir, ":.lfsconfig", s, &hooks);
-    if (ok) ok = capture_lfs_blob(a, gitdir, "HEAD:.lfsconfig", s, &hooks);
+    if (ok) ok = capture_config_blob(a, gitdir, ":.lfsconfig", s, &hooks);
+    if (ok) ok = capture_config_blob(a, gitdir, "HEAD:.lfsconfig", s, &hooks);
+    if (ok) ok = capture_gitmodules(a, gitdir, checkout, s, &hooks);
     for (size_t i = 0; ok && i < hooks.values.n; ++i) {
         // Absolute hooks do not depend on any candidate worktree.
         size_t bases = hooks.values.v[i][0] == '/' ? 1 : hooks.bases.n;
@@ -3541,18 +3568,20 @@ static void guard_warn(const GuardRec *before, const GuardRec *after) {
         fputs(" -> ", stderr);
         put_value(stderr, after ? after->val : NULL);
         fputc('\n', stderr);
-    } else if (id[0] == 'l' || id[0] == 'b') {
+    } else if (id[0] == 'l' || id[0] == 'b' || id[0] == 'm' || id[0] == 'n') {
         bool was = before && strcmp(before->val, "absent");
         bool is = after && strcmp(after->val, "absent");
-        fprintf(stderr, "world: WARNING: exec %s Git LFS configuration: ", !was ? "added" : !is ? "removed" : "changed");
-        if (id[0] == 'b') {
+        fprintf(stderr, "world: WARNING: exec %s Git %s configuration: ", !was ? "added" : !is ? "removed" : "changed",
+                (id[0] == 'm' || id[0] == 'n') ? "submodule" : "LFS");
+        if (id[0] == 'b' || id[0] == 'n') {
             const char *label = strchr(rest, '\x1f') + 1;
             put_id_field(stderr, label, strlen(label));
             fputs(" (", stderr);
             put_field(stderr, rest, (size_t)(label - rest - 1));
             fputc(')', stderr);
         } else put_field(stderr, rest, strlen(rest));
-        fputs(" (can activate configured LFS commands)\n", stderr);
+        fputs((id[0] == 'm' || id[0] == 'n') ? " (can activate submodule commands)\n" :
+              " (can activate configured LFS commands)\n", stderr);
     } else if (id[0] == 'w') {
         bool was = before && strcmp(before->val, "absent");
         bool is = after && strcmp(after->val, "absent");
@@ -3633,7 +3662,7 @@ static void guard_report(const GuardSet *b, const GuardSet *a) {
         if (before && after && !strcmp(before->val, after->val)) continue;
         const char kind = (before ? before : after)->id[0];
         if (kind == 'c' && shared_with_world(b, a, before, after)) continue;
-        if ((kind == 'a' || kind == 'i' || kind == 'w' || kind == 'l' || kind == 'b') && (!before || !strcmp(before->val, "absent")) &&
+        if ((kind == 'a' || kind == 'i' || kind == 'w' || kind == 'l' || kind == 'b' || kind == 'm' || kind == 'n') && (!before || !strcmp(before->val, "absent")) &&
             (!after || !strcmp(after->val, "absent"))) continue;
         if (kind == 'p') {
             bool was = before && strcmp(before->val, "absent");

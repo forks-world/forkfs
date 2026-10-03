@@ -5903,6 +5903,41 @@ class GitWorldTest(unittest.TestCase):
         self.assertNotIn(b'Git LFS configuration:', p.stderr)
         self.assertNotIn(b'Git guard unavailable', p.stderr)
 
+    def test_exec_reports_gitmodules_sources_without_running_helpers(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        paths = ('.gitmodules', 'libs/lib/.gitmodules')
+        payload = '[submodule "future"]\n path = future\n url = ext::touch module-helper-ran\n'
+        p = self.exec_sh(wid, '; '.join('printf %s ' + shlex.quote(payload) + ' >> ' + shlex.quote(path)
+                                      for path in paths) + '; exit 7', '--no-sandbox', code=7)
+        for path in paths:
+            self.assertIn(b'Git submodule configuration: ' + path.encode(), p.stderr)
+        config = one / '.gitmodules'
+        config.unlink()
+        replacement = one / '.world-git/module-blob'
+        # Includes in .gitmodules are ignored by Git and must not be traversed.
+        replacement.write_text(payload + '[include]\n path = ' + str(one / '.world-git/module-fifo') + '\n')
+        os.mkfifo(one / '.world-git/module-fifo')
+        oid = self.git(one, 'hash-object', '-w', str(replacement)).stdout.strip().decode()
+        marker = one / 'module-fsmonitor-ran'
+        monitor = one / '.world-git/module-monitor'
+        monitor.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(marker)) + '\n')
+        monitor.chmod(0o755)
+        self.git(one, 'config', 'core.fsmonitor', str(monitor))
+        p = self.exec_sh(wid, 'git -c core.fsmonitor=false update-index --cacheinfo 100644,' + oid +
+                         ',.gitmodules; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'Git submodule configuration: .world-git/repo.git/worktrees/active (:.gitmodules)', p.stderr)
+        tree = self.git(one, '-c', 'core.fsmonitor=false', 'write-tree').stdout.strip().decode()
+        head = self.git(one, 'commit-tree', tree, '-p', 'HEAD', '-m', 'module fallback').stdout.strip().decode()
+        self.git(one, '-c', 'core.fsmonitor=false', 'update-index', '--force-remove', '.gitmodules')
+        p = self.exec_sh(wid, 'git update-ref HEAD ' + head + '; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'Git submodule configuration: .world-git/repo.git/worktrees/active (HEAD:.gitmodules)', p.stderr)
+        self.assertNotIn(b'Git guard unavailable', p.stderr)
+        self.assertFalse(marker.exists())
+        for checkout in (one, one / 'libs/lib'):
+            self.assertFalse((checkout / 'module-helper-ran').exists())
+
     def test_exec_reports_lfsconfig_index_head_and_blob_includes_without_fsmonitor(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
@@ -6302,6 +6337,13 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(hook.read_bytes(), original)
         self.assertFalse(marker.exists())
         self.assertEqual(self.git(one, 'for-each-ref', '--format=%(refname)', 'refs/remotes/retained/').stdout, b'')
+        self.git(one, 'config', '--', 'remote.retained.tagOpt', '--no-tags')
+        p = self.exec_sh(wid, 'git config -- remote.retained.tagOpt --tags; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local remote.retained.tagopt: --no-tags -> --tags', p.stderr)
+        self.assertNotIn(b'local remote.retained.url:', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertEqual(hook.read_bytes(), original)
+        self.assertFalse(marker.exists())
 
     def test_exec_reports_pruning_activating_retained_reference_hook(self):
         self.world('init', str(self.source))

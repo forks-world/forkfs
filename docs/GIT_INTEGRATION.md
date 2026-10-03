@@ -343,6 +343,11 @@ warning.
   create hook restrictions. Raw blob bytes share the 64 MiB budget and confined queries share
   the include graph's five-second budget. No LFS command is executed; object queries disable
   fsmonitor and lazy object fetching, while configuration snapshots retain the real settings;
+- each checkout's `.gitmodules` and its index/HEAD fallback blobs: raw content changes can
+  select submodule helpers or activate retained commands. Missing sources are recorded;
+  symlinked/nonregular files or unreadable blobs invalidate capture. Unlike LFS configuration,
+  `.gitmodules` includes are not traversed. The same content, entry and query-time budgets
+  apply, and object queries disable fsmonitor and lazy fetching. Files remain writable;
 - each repository's private `info/attributes`, effective user/system attributes files, and
   root/nested working-tree `.gitattributes`, including ignored and untracked files:
   changes can activate an unchanged filter
@@ -414,7 +419,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `http[.*].sslcert|proxysslcert|sslcertpasswordprotected|proxysslcertpasswordprotected` (can activate certificate password helpers),
 `http[.*].proxy`, `remote.*.proxy` (can activate an existing proxy password helper),
 `gpg.format` (selects the signing program), `gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
-`remote.*.fetch`, `fetch.fsckobjects`, `transfer.fsckobjects`, `fetch.prune|prunetags` and `remote.*.prune|prunetags` (can invoke the retained reference-transaction hook),
+`remote.*.fetch|tagopt`, `fetch.fsckobjects`, `transfer.fsckobjects`, `fetch.prune|prunetags` and `remote.*.prune|prunetags` (can invoke the retained reference-transaction hook),
 `remote.*.skipdefaultupdate|skipfetchall`, `fetch.bundleuri`, `fetch.all`, `remotes.*` (can activate unchanged remote helpers),
 `remote.*.uploadpack|receivepack|vcs`, `branch.*.mergeoptions`, `pull.twohead`, `pull.octopus` (can select external merge strategies),
 `branch.*.remote|pushremote`, `remote.pushdefault` (can select preconfigured helper remotes),
