@@ -5361,6 +5361,32 @@ class GitWorldTest(unittest.TestCase):
         self.assertFalse((one / 'selected-remote-ran').exists())
         self.assertFalse((one / 'selected-strategy-ran').exists())
 
+    def test_exec_reports_lfs_access_and_default_upstream_merge_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        self.git(one, 'config', 'credential.helper', '!touch lfs-credential-ran')
+        self.git(one, 'config', 'merge.retained.driver', 'touch retained-merge-ran')
+        info = one / '.world-git/repo.git/info'
+        info.mkdir(exist_ok=True)
+        (info / 'attributes').write_text('* merge=retained\n')
+        branch = self.git(one, 'branch', '--show-current').stdout.decode().strip()
+        self.git(one, 'config', 'branch.' + branch + '.remote', '.')
+        self.git(one, 'config', 'branch.' + branch + '.merge', 'refs/heads/upstream')
+        self.git(one, 'config', 'merge.defaultToUpstream', 'false')
+        self.git(one, 'config', 'merge.ff', 'only')
+        p = self.exec_sh(wid, 'git config lfs.access basic && '
+                         'git config lfs.https://example.invalid/repo.access basic && '
+                         'git config merge.defaultToUpstream true && git config merge.ff true; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local lfs.access: (unset) -> basic', p.stderr)
+        self.assertIn(b'local lfs.https://example.invalid/repo.access: (unset) -> basic', p.stderr)
+        self.assertIn(b'local merge.defaulttoupstream: false -> true', p.stderr)
+        self.assertIn(b'local merge.ff: only -> true', p.stderr)
+        for key in (b'credential.helper', b'merge.retained.driver', b'branch.' + branch.encode() + b'.merge'):
+            self.assertNotIn(b'local ' + key + b':', p.stderr)
+        self.assertNotIn(b'Git repository attributes:', p.stderr)
+        self.assertFalse((one / 'lfs-credential-ran').exists())
+        self.assertFalse((one / 'retained-merge-ran').exists())
+
     def test_exec_reports_interactive_and_proactive_credential_activation(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

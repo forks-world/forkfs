@@ -365,7 +365,8 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `credential.*.helper`, `credential.interactive` (enables configured askpass),
 `http[.*].proactiveauth` (can proactively invoke an unchanged credential helper), `filter.*.clean|smudge|process`, `diff.external`,
 `diff.*.command|textconv`, `diff.tool|guitool`, `merge.tool|guitool`, `difftool.guidefault`, `mergetool.guidefault` (select configured commands), `merge.*.driver|recursive`, `merge.default` (including selection of unchanged merge drivers),
-`merge.renormalize` (can activate configured conversion filters), `mergetool.*.cmd|path`, `difftool.*.cmd|path`,
+`merge.renormalize` (can activate configured conversion filters),
+`merge.defaulttoupstream`, `merge.ff` (can enable previously refused merges using retained drivers), `mergetool.*.cmd|path`, `difftool.*.cmd|path`,
 `commit.gpgsign`, `tag.gpgsign`, `tag.forcesignannotated`, `push.gpgsign` (enable signing),
 `log.showsignature`, `merge.verifysignatures`, `rebase.instructionformat`, `format.pretty`,
 `pretty.*`, `format.commitlistformat`, `format.coverletter` (can activate signature verification),
@@ -403,6 +404,7 @@ activate retained child filters and commands), `pager.*`, `interactive.difffilte
 `lfs.*.path|clean|smudge` (custom transfer agents and extensions), plus
 `lfs[.*].standalonetransferagent` (selects an existing custom transfer command, including URL-scoped settings),
 `lfs.customtransfer.<name>.args|direction` (change arguments or enable upload/download adapters),
+`lfs.access` and `lfs.<URL>.access` (can invoke retained credential helpers),
 and `lfs.basictransfersonly` (can restore custom transfer adapters). Remote `url`/`pushurl`
 and `url.<target>.insteadOf`/`pushInsteadOf` changes are always reported. SSH endpoints can
 activate an unchanged `core.sshCommand`; an existing rewrite can map an ordinary URL or local

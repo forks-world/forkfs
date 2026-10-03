@@ -58,6 +58,7 @@ int main() {
 
     // Keys that make Git run a command.
     const char *runs[] = {
+        "lfs.access", "lfs.https://example.invalid/repo.access", "LFS.ACCESS", "merge.defaulttoupstream", "merge.ff",
         "http.proactiveauth", "http.https://example.invalid/repo.proactiveauth", "HTTP.PROACTIVEAUTH",
         "credential.interactive", "CREDENTIAL.INTERACTIVE",
         "push.autosetupremote", "branch.main.merge", "branch.team.topic.merge",
@@ -172,6 +173,7 @@ int main() {
 
     // Keys that legitimately change during agent work, or only name things.
     const char *quiet[] = {
+        "lfs.accessextra", "lfs.https://example.invalid/repo.accessextra", "merge.custom.defaulttoupstream", "merge.custom.ff", "merge.ffextra",
         "http.proactiveauthextra", "http.https://example.invalid/repo.proactiveauthextra",
         "credential.https://example.invalid.interactive", "credential.interactiveextra",
         "push.custom.autosetupremote", "branch.merge", "branch.main.mergeextra",
