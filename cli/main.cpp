@@ -2881,7 +2881,7 @@ static bool capture_include_hooks(GitAdmin *a, const char *gitdir, const char *c
             char path[WFS_PATH_MAX];
             bool protect = false;
             if (!note_hooks_path(a, hooks.bases.v[j], hooks.values.v[i], path, sizeof path, &protect)) {
-                s->error = "could not resolve potential Git hooks path"; ok = false; break;
+                s->error = "could not resolve Git hooks path"; ok = false; break;
             }
             if (!path[0]) continue;  // /dev/null
             capture_hooks(a, path, s);
