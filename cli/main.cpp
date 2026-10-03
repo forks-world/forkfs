@@ -2339,7 +2339,7 @@ extern char **environ;
 // Read Git metadata with build-time Git under read-only confinement, never runtime PATH.
 // Config, rev-parse and var queries do not run hooks or fsmonitor: -c overrides would hide inherited
 // command-scope settings. Bound both output and child lifetime (an include can be a FIFO).
-enum GitGuardQuery { GG_LIST, GG_PATH, GG_TOPLEVEL, GG_VAR, GG_MODULES, GG_INCLUDE_ROOT, GG_INCLUDE_FILE };
+enum GitGuardQuery { GG_LIST, GG_PATH, GG_TOPLEVEL, GG_VAR, GG_MODULES, GG_INCLUDE_ROOT, GG_INCLUDE_FILE, GG_WORKTREE_ROOT, GG_WORKTREE_FILE };
 
 static char *git_guard_read(const char *root, const char *gitdir, const char *path_key, GitGuardQuery query,
                             size_t *len, int *status, int *remaining_ms = NULL) {
@@ -2366,7 +2366,16 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
         argv[arg++] = "--type=path";
         if (query == GG_INCLUDE_FILE) { argv[arg++] = "--file"; argv[arg++] = path_key; }
         argv[arg++] = "--get-regexp";
-        argv[arg++] = "^(include\\.path|includeif\\..*\\.path)$";
+        argv[arg++] = "^(include\\.path|includeif\\..*\\.path|core\\.hookspath)$";
+    } else if (query == GG_WORKTREE_ROOT || query == GG_WORKTREE_FILE) {
+        // core.worktree is a raw path in Git setup, not a --type=path value:
+        // tilde and %(prefix) must remain literal here.
+        argv[arg++] = "config";
+        argv[arg++] = query == GG_WORKTREE_ROOT ? "--includes" : "--no-includes";
+        argv[arg++] = "--null";
+        if (query == GG_WORKTREE_FILE) { argv[arg++] = "--file"; argv[arg++] = path_key; }
+        argv[arg++] = "--get-all";
+        argv[arg++] = "core.worktree";
     } else if (query == GG_MODULES) {
         argv[arg++] = "config";
         argv[arg++] = "--no-includes";
@@ -2513,13 +2522,54 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
     return buf;
 }
 
+// Candidate hook values and execution directories are repository-specific, even when
+// several repositories share one dormant include file. Hashes remain globally deduplicated.
+struct HookCandidates { StrList values, bases; };
+
+static bool hook_candidate_add(StrList *list, const char *value, GuardSet *s) {
+    for (size_t i = 0; i < list->n; ++i) if (!strcmp(list->v[i], value)) return true;
+    if (list->n >= 65536) { s->error = "Git hook candidate limit exceeded"; return false; }
+    if (!sl_push(list, value)) { s->error = "out of memory"; return false; }
+    return true;
+}
+
+static bool capture_worktree_candidates(const GitAdmin *a, const char *gitdir, const char *file,
+                                        HookCandidates *hooks, GuardSet *s) {
+    size_t len = 0;
+    int status = -1;
+    char *out = git_guard_read(a->root, gitdir, file, file ? GG_WORKTREE_FILE : GG_WORKTREE_ROOT,
+                              &len, &status, &s->include_ms);
+    if (!out) {
+        if (status == 1) return true;
+        s->error = g_post_signal ? "Git capture interrupted" : "Git worktree candidate query failed or exceeded capture time budget";
+        return false;
+    }
+    bool ok = true;
+    for (size_t i = 0; i < len && ok;) {
+        if (g_post_signal) { s->error = "Git capture interrupted"; ok = false; break; }
+        if (++s->entries > 65536) { s->error = "Git include entry limit exceeded"; ok = false; break; }
+        const char *value = out + i;
+        const char *end = (const char *)memchr(value, 0, len - i);
+        if (!end) { ok = false; break; }
+        i = (size_t)(end - out) + 1;
+        char base[WFS_PATH_MAX];
+        int n = value[0] == '/' ? snprintf(base, sizeof base, "%s", value) :
+                                 snprintf(base, sizeof base, "%s/%s", gitdir, value);
+        if (n < 0 || (size_t)n >= sizeof base) { ok = false; break; }
+        ok = hook_candidate_add(&hooks->bases, base, s);
+    }
+    free(out);
+    if (!ok && !s->error) s->error = "unsupported Git worktree candidate path";
+    return ok;
+}
+
 // Observe every declared include target, even when its condition is currently false.
 // Query contexts retain spelling: a symlinked parent can change relative-include meaning.
 static bool capture_include_edges(const GitAdmin *a, const char *gitdir, const char *file,
-                                  GuardSet *s, int depth);
+                                  GuardSet *s, HookCandidates *hooks, int depth);
 
 static bool capture_include_target(const GitAdmin *a, const char *gitdir, const char *path,
-                                   GuardSet *s, int depth, char kind = 'i') {
+                                   GuardSet *s, HookCandidates *hooks, int depth, char kind = 'i') {
     if (g_post_signal) { s->error = "Git capture interrupted"; return false; }
     if (depth > 32) { s->error = "Git include depth limit exceeded"; return false; }
     struct stat st;
@@ -2552,21 +2602,27 @@ static bool capture_include_target(const GitAdmin *a, const char *gitdir, const 
         gs_add(s, id, present ? fp : "absent");
     }
     if (s->error || !present) return !s->error;
+    char context[2 * WFS_PATH_MAX + 32];
+    // Length-prefix the repository identity: paths may themselves contain delimiters.
+    if ((size_t)snprintf(context, sizeof context, "%zu:%s%s", strlen(gitdir), gitdir, path) >= sizeof context) {
+        s->error = "Git include context path exceeds capture limit"; return false;
+    }
     for (size_t i = 0; i < s->include_contexts.n; ++i)
-        if (!strcmp(s->include_contexts.v[i], path)) return true;
+        if (!strcmp(s->include_contexts.v[i], context)) return true;
     if (s->include_contexts.n >= 256) { s->error = "Git include context limit exceeded"; return false; }
-    if (!sl_push(&s->include_contexts, path)) { s->error = "out of memory"; return false; }
-    return capture_include_edges(a, gitdir, path, s, depth);
+    if (!sl_push(&s->include_contexts, context)) { s->error = "out of memory"; return false; }
+    return capture_include_edges(a, gitdir, path, s, hooks, depth);
 }
 
 static bool capture_include_edges(const GitAdmin *a, const char *gitdir, const char *file,
-                                  GuardSet *s, int depth) {
+                                  GuardSet *s, HookCandidates *hooks, int depth) {
+    if (!capture_worktree_candidates(a, gitdir, file, hooks, s)) return false;
     size_t len = 0;
     int status = -1;
     char *out = git_guard_read(a->root, gitdir, file, file ? GG_INCLUDE_FILE : GG_INCLUDE_ROOT,
                               &len, &status, &s->include_ms);
     if (!out) {
-        if (status == 1) return true; // no include directives
+        if (status == 1) return true; // no include directives or hook paths
         s->error = g_post_signal ? "Git capture interrupted" : "Git include query failed or exceeded capture time budget";
         return false;
     }
@@ -2584,7 +2640,15 @@ static bool capture_include_edges(const GitAdmin *a, const char *gitdir, const c
         if (!end) { ok = false; break; }
         i = (size_t)(end - out) + 1;
         char *value = strchr(entry, '\n');
-        if (!value || !*++value) { ok = false; break; }
+        if (!value) { ok = false; break; }
+        *value++ = 0;
+        if (!strcasecmp(entry, "core.hookspath")) {
+            // Relative hooks run from a checkout, or Gitdir for receive hooks;
+            // the including file's directory has no bearing on this path.
+            ok = hook_candidate_add(&hooks->values, value, s);
+            continue;
+        }
+        if (!*value) { ok = false; break; }
         char target[WFS_PATH_MAX], source[WFS_PATH_MAX];
         int n;
         if (value[0] == '/') n = snprintf(target, sizeof target, "%s", value);
@@ -2600,7 +2664,7 @@ static bool capture_include_edges(const GitAdmin *a, const char *gitdir, const c
             n = snprintf(target, sizeof target, "%s%s", source, value);
         }
         if (n < 0 || (size_t)n >= sizeof target) { ok = false; break; }
-        ok = capture_include_target(a, gitdir, target, s, depth + 1);
+        ok = capture_include_target(a, gitdir, target, s, hooks, depth + 1);
     }
     free(out);
     if (!ok && !s->error) s->error = "unsupported Git include origin or path";
@@ -2794,6 +2858,42 @@ static bool note_hooks_path(GitAdmin *a, const char *checkout, const char *v, ch
     return true;
 }
 
+// Conditions and value precedence may change later. Conservatively observe the union
+// of candidate checkout roots and hook values, plus the Gitdir used by receive hooks.
+static bool capture_include_hooks(GitAdmin *a, const char *gitdir, const char *checkout, GuardSet *s) {
+    if (!gitdir) { s->error = "could not locate Git worktree configuration"; return false; }
+    HookCandidates hooks = {};
+    bool ok = hook_candidate_add(&hooks.bases, checkout, s) &&
+              hook_candidate_add(&hooks.bases, gitdir, s);
+    char worktree_config[WFS_PATH_MAX];
+    if ((size_t)snprintf(worktree_config, sizeof worktree_config, "%s/config.worktree", gitdir) >= sizeof worktree_config) {
+        s->error = "could not locate Git worktree configuration"; ok = false;
+    }
+    // config.worktree may become active later, while omitted from today's listing.
+    if (ok) ok = capture_include_target(a, gitdir, worktree_config, s, &hooks, 0, 'w');
+    if (ok) ok = capture_include_edges(a, gitdir, NULL, s, &hooks, 0);
+    for (size_t i = 0; ok && i < hooks.values.n; ++i) {
+        // Absolute hooks do not depend on any candidate worktree.
+        size_t bases = hooks.values.v[i][0] == '/' ? 1 : hooks.bases.n;
+        for (size_t j = 0; ok && j < bases; ++j) {
+            if (g_post_signal) { s->error = "Git capture interrupted"; ok = false; break; }
+            if (++s->entries > 65536) { s->error = "Git hook candidate limit exceeded"; ok = false; break; }
+            char path[WFS_PATH_MAX];
+            bool protect = false;
+            if (!note_hooks_path(a, hooks.bases.v[j], hooks.values.v[i], path, sizeof path, &protect)) {
+                s->error = "could not resolve potential Git hooks path"; ok = false; break;
+            }
+            if (!path[0]) continue;  // /dev/null
+            capture_hooks(a, path, s);
+            if (!s->error && protect) hook_candidate_add(&a->hooks_paths, path, s);
+            ok = !s->error;
+        }
+    }
+    sl_free(&hooks.values);
+    sl_free(&hooks.bases);
+    return ok;
+}
+
 #ifdef __APPLE__
 static bool planned_add(StrList *list, const char *path, GuardSet *s) {
     for (size_t i = 0; i < list->n; ++i) if (!strcmp(list->v[i], path)) return true;
@@ -2967,14 +3067,6 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
     }
     free(out);
     if (s->error) return false;
-    // config.worktree may become active later, even when Git omits it from today's
-    // effective listing. Capture its bytes and dormant include graph unconditionally.
-    char worktree_config[WFS_PATH_MAX];
-    if (!gitdir || (size_t)snprintf(worktree_config, sizeof worktree_config, "%s/config.worktree", gitdir) >= sizeof worktree_config) {
-        s->error = "could not locate Git worktree configuration"; return false;
-    }
-    if (!capture_include_target(a, gitdir, worktree_config, s, 0, 'w')) return false;
-    if (!capture_include_edges(a, gitdir, NULL, s, 0)) return false;
     // Git's setup rules decide the effective checkout, including linked-worktree
     // configuration semantics; the last config-list value alone is insufficient.
     char *worktree = git_guard_read(a->root, gitdir, NULL, GG_TOPLEVEL, &len, &status);
@@ -2985,6 +3077,7 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
     worktree[len - 1] = 0;
     snprintf(checkout, sizeof checkout, "%s", worktree);
     free(worktree);
+    if (!capture_include_hooks(a, gitdir, checkout, s)) return false;
 #ifdef __APPLE__
     if (require_home && !plan_submodules(a, gitdir, checkout, s)) {
         if (!s->error) s->error = "could not safely plan declared submodule administration";

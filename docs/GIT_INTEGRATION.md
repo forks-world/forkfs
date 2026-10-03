@@ -325,8 +325,10 @@ observational reporting so a command can repair them.
   Existing targets must be regular files; symlinks, special files and unsupported origins make
   capture unavailable. Content fingerprints also report benign changes in these files; conditions
   do not have to become active during exec. Traversal is limited to 32 levels, 256 targets and
-  256 origin spellings, shares the 64 MiB content/65536-entry budgets, and has five seconds of
-  aggregate confined query time per capture. These files remain writable;
+  256 repository/origin contexts, shares the 64 MiB content/65536-entry budgets, and has five seconds of
+  aggregate confined query time per capture. Each context uses a typed include/hooks-path
+  query and a raw `core.worktree` query; Git treats tilde and `%(prefix)` literally in
+  `core.worktree`. These files remain writable;
 - each repository's private `info/attributes` and effective user/system attributes files:
   changes can activate an unchanged filter
   definition without altering tracked project files. Regular files are hashed in full within
@@ -336,8 +338,14 @@ observational reporting so a command can repair them.
   repository; `GIT_ATTR_NOSYSTEM` is honored and an effective `/dev/null` source is disabled.
   Shared paths are captured and reported once;
 - the hooks Git could run: name, mode and content of every non-`.sample` entry of its hooks
-  directory and of every effective `core.hooksPath`, including paths inside the project tree.
-  Shared hook directories are captured once;
+  directory and of every effective or dormant `core.hooksPath`, including paths inside the
+  project tree. Dormant paths come from the include graph and `config.worktree`, without
+  requiring their conditions to become active. Relative paths are checked against each
+  repository's effective checkout, every candidate `core.worktree`, and its Git directory
+  (receive hooks run there), never against the including file's directory. The conservative
+  combinations share the 65536-entry budget; resolved hook directories are captured once.
+  The same protection rules apply to dormant paths: administration/external directories
+  are protected, project directories remain editable and their hook changes are reported;
 - the entries that tell Git where it is -- the World's `.git` and `commondir`, each
   submodule checkout's `.git` -- by entry type (file, directory, symlink, missing) and
   content, and whether a file still names its own repository.

@@ -4881,6 +4881,104 @@ class GitWorldTest(unittest.TestCase):
         for marker in ('include-command-ran', 'changed-command-ran', 'added-command-ran'):
             self.assertFalse((one / marker).exists())
 
+    def test_exec_protects_and_reports_dormant_include_hooks(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        policy = one / '.world-git/dormant-hook-policy'
+        nested = one / '.world-git/dormant-hook-child'
+        policy.write_text('[includeIf "onbranch:also-never"]\n path = dormant-hook-child\n')
+        self.git(one, 'config', 'includeIf.onbranch:never-active.path', str(policy))
+        # Both a writable administration subtree and an external directory need the
+        # dormant policy's hooks protection (the latter is normally writable on macOS).
+        paths = (one / '.world-git/custom/dormant-hooks', self.root / 'external-dormant-hooks')
+        for hooks in paths:
+            hooks.mkdir(parents=True)
+            hook = hooks / 'pre-commit'
+            hook.write_text('#!/bin/sh\ntouch dormant-hook-ran\n')
+            hook.chmod(0o755)
+            self.git(one, 'config', '--file', str(nested), '--add', 'core.hooksPath', str(hooks))
+        unchanged = nested.read_bytes()
+        self.assertNotIn(b'dormant-hooks', self.git(one, 'config', '--list', '--includes').stdout)
+        for hooks in paths:
+            hook = hooks / 'pre-commit'
+            original = hook.read_bytes()
+            # The marker proves a denial occurs in the child rather than initial capture.
+            p = self.assert_denied(wid, 'touch sandbox-started; echo changed > ' + shlex.quote(str(hook)))
+            self.assertTrue((one / 'sandbox-started').exists(), p.stderr)
+            (one / 'sandbox-started').unlink()
+            self.assertEqual(hook.read_bytes(), original)
+            p = self.exec_sh(wid, 'echo changed >> ' + shlex.quote(str(hook)) + '; exit 7',
+                             '--no-sandbox', code=7)
+            self.assertIn(b'exec changed a Git hook:', p.stderr)
+            self.assertIn(str(hooks.name).encode() + b'/pre-commit', p.stderr)
+            self.assertNotIn(b'exec changed a Git include target:', p.stderr)
+        self.assertEqual(nested.read_bytes(), unchanged)
+        self.assertFalse((one / 'dormant-hook-ran').exists())
+
+    def test_exec_dormant_hooks_use_each_checkout_and_receive_gitdir(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        policy = one / '.world-git/shared-dormant-hooks'
+        policy.write_text('[core]\n hooksPath = .dormant-hooks\n')
+        repos = (one, one / 'libs/lib')
+        for repo in repos:
+            self.git(repo, 'config', 'includeIf.onbranch:never-active.path', str(policy))
+        # Same include file, distinct repository contexts. Missing project directories
+        # remain editable, but newly planted hooks must be observed in both checkouts.
+        p = self.exec_sh(wid, 'mkdir .dormant-hooks libs/lib/.dormant-hooks; '
+                         'echo root > .dormant-hooks/pre-commit; '
+                         'echo child > libs/lib/.dormant-hooks/pre-commit; exit 7',
+                         '--require-sandbox', code=7)
+        self.assertIn(b'exec added a Git hook: .dormant-hooks/pre-commit', p.stderr)
+        self.assertIn(b'exec added a Git hook: libs/lib/.dormant-hooks/pre-commit', p.stderr)
+        self.assertNotIn(b'exec changed a Git include target:', p.stderr)
+        admin = one / '.world-git/repo.git/worktrees/active'
+        for gitdir in (admin, admin / 'modules/lib-module'):
+            hooks = gitdir / '.dormant-hooks'
+            hooks.mkdir()
+            hook = hooks / 'pre-receive'
+            hook.write_text('#!/bin/sh\nexit 0\n')
+            p = self.assert_denied(wid, 'touch sandbox-started; echo changed > ' + shlex.quote(str(hook)))
+            self.assertTrue((one / 'sandbox-started').exists(), p.stderr)
+            (one / 'sandbox-started').unlink()
+            self.assertEqual(hook.read_text(), '#!/bin/sh\nexit 0\n')
+
+    def test_exec_dormant_hooks_cover_raw_alternate_worktree(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        admin = one / '.world-git/repo.git/worktrees/active'
+        policy = one / '.world-git/dormant-alternate'
+        self.git(one, 'config', 'includeIf.onbranch:never-active.path', str(policy))
+        # Git setup treats both path expansions literally in core.worktree, unlike
+        # hooksPath. Capture must not apply --type=path to these candidate bases.
+        for raw in ('~literal-worktree', '%(prefix)/literal-worktree'):
+            with self.subTest(worktree=raw):
+                hooks = admin / raw / '.alternate-hooks'
+                hooks.mkdir(parents=True)
+                hook = hooks / 'pre-commit'
+                hook.write_text('#!/bin/sh\nexit 0\n')
+                policy.write_text('[core]\n worktree = ' + raw + '\n hooksPath = .alternate-hooks\n')
+                p = self.assert_denied(wid, 'touch sandbox-started; echo changed > ' + shlex.quote(str(hook)))
+                self.assertTrue((one / 'sandbox-started').exists(), p.stderr)
+                (one / 'sandbox-started').unlink()
+                self.assertEqual(hook.read_text(), '#!/bin/sh\nexit 0\n')
+                p = self.exec_sh(wid, 'echo changed >> ' + shlex.quote(str(hook)) + '; exit 7',
+                                 '--no-sandbox', code=7)
+                self.assertIn((raw + '/.alternate-hooks/pre-commit').encode(), p.stderr)
+                self.assertIn(b'exec changed a Git hook:', p.stderr)
+                self.assertNotIn(b'exec changed a Git include target:', p.stderr)
+
+    def test_exec_dormant_empty_hooks_path_observes_execution_directory(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        policy = one / '.world-git/dormant-empty-hooks'
+        policy.write_text('[core]\n hooksPath =\n')
+        self.git(one, 'config', 'includeIf.onbranch:never-active.path', str(policy))
+        p = self.exec_sh(wid, 'echo changed >> file; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'exec changed a Git hook: file', p.stderr)
+        self.assertNotIn(b'exec changed a Git include target:', p.stderr)
+
     def test_exec_dormant_include_resolves_parent_alias_before_dotdot(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
