@@ -434,7 +434,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `gpg.format` (selects the signing program), `gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
 `gc.packrefs`, `fetch.followremotehead`, `remote.*.followremotehead` (can update references and invoke retained reference-transaction hooks),
 `remote.*.fetch|tagopt`, `fetch.fsckobjects`, `transfer.fsckobjects`, `fetch.prune|prunetags` and `remote.*.prune|prunetags` (can invoke the retained reference-transaction hook),
-`remote.*.skipdefaultupdate|skipfetchall`, `fetch.bundleuri`, `fetch.all`, `remotes.*` (can activate unchanged remote helpers),
+`remote.*.skipdefaultupdate|skipfetchall`, `fetch.bundleuri`, `transfer.bundleuri` (can enable advertised bundle downloads using retained credential helpers), `fetch.all`, `remotes.*` (can activate unchanged remote helpers),
 `remote.*.uploadpack|receivepack|vcs`, `branch.*.mergeoptions`, `pull.twohead`, `pull.octopus` (can select external merge strategies),
 `branch.*.remote|pushremote`, `remote.pushdefault` (can select preconfigured helper remotes),
 `push.followtags` (can activate retained remote hooks through additional tag updates),

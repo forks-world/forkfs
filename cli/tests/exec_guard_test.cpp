@@ -76,7 +76,7 @@ int main() {
         "HTTP.https://example.invalid/repo.PROXYSSLCERTPASSWORDPROTECTED",
         "receive.autogc", "maintenance.auto", "maintenance.strategy", "maintenance.repo", "gc.auto", "gc.autopacklimit",
         "attr.tree", "ATTR.TREE", "maintenance.pack-refs.enabled", "MAINTENANCE.pack-refs.SCHEDULE",
-        "maintenance.gc.enabled", "maintenance.prefetch.enabled", "maintenance.prefetch.schedule", "maintenance.gc.schedule", "fetch.bundleuri",
+        "maintenance.gc.enabled", "maintenance.prefetch.enabled", "maintenance.prefetch.schedule", "maintenance.gc.schedule", "fetch.bundleuri", "transfer.bundleuri", "TRANSFER.BUNDLEURI",
         "MAINTENANCE.gc.ENABLED", "Maintenance.prefetch.Schedule",
         "remote.origin.partialclonefilter", "extensions.partialclone",
         "receive.denynonfastforwards", "RECEIVE.DENYNONFASTFORWARDS",
@@ -193,6 +193,9 @@ int main() {
     CHECK(guard_key_runs_command("gc.packrefs", NULL));
     CHECK(guard_key_runs_command("attr.tree", "HEAD"));
     CHECK(guard_key_runs_command("attr.tree", NULL));
+    CHECK(guard_key_runs_command("transfer.bundleuri", "true"));
+    CHECK(guard_key_runs_command("transfer.bundleuri", "false"));
+    CHECK(guard_key_runs_command("transfer.bundleuri", NULL));
     CHECK(guard_key_runs_command("maintenance.pack-refs.enabled", "false"));
     CHECK(guard_key_runs_command("maintenance.pack-refs.enabled", "true"));
     CHECK(guard_key_runs_command("maintenance.pack-refs.schedule", "hourly"));
@@ -315,7 +318,7 @@ int main() {
         "gc.custom.auto", "gc.custom.autopacklimit", "maintenance.GC.enabled", "maintenance.Prefetch.enabled",
         "attr.custom.tree", "attr.treeextra", "maintenance.Pack-refs.enabled",
         "maintenance.team.pack-refs.schedule", "maintenance.pack-refs.enabledextra",
-        "maintenance.GC.schedule", "maintenance.gc.scheduleextra", "fetch.custom.bundleuri", "maintenance.commit-graph.enabled", "maintenance.repack.enabled",
+        "maintenance.GC.schedule", "maintenance.gc.scheduleextra", "fetch.custom.bundleuri", "transfer.custom.bundleuri", "transfer.bundleuriextra", "maintenance.commit-graph.enabled", "maintenance.repack.enabled",
         "maintenance.team.prefetch.enabled", "maintenance.enabled",
         "remote.partialclonefilter", "extensions.custom.partialclone",
         "receive.custom.denynonfastforwards", "receive.denynonfastforwardsextra",

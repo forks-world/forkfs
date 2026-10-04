@@ -5123,6 +5123,23 @@ class GitWorldTest(unittest.TestCase):
                 self.assertFalse((one / 'should-not-run').exists())
                 target.unlink()
 
+    def test_exec_reports_global_bundle_transfer_activation(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        home = self.root / 'bundle-transfer-home'
+        home.mkdir()
+        self.env['HOME'] = str(home)
+        self.env['GIT_CONFIG_GLOBAL'] = str(home / '.gitconfig')
+        marker = one / 'bundle-credential-ran'
+        helper = '!touch ' + shlex.quote(str(marker))
+        self.git(one, 'config', '--global', 'credential.helper', helper)
+        self.git(one, 'config', '--global', 'transfer.bundleURI', 'false')
+        p = self.exec_sh(wid, 'git config --global transfer.bundleURI true; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'global transfer.bundleuri: false -> true', p.stderr)
+        self.assertNotIn(b'global credential.helper:', p.stderr)
+        self.assertEqual(self.git(one, 'config', '--global', '--get', 'credential.helper').stdout.strip(), helper.encode())
+        self.assertFalse(marker.exists())
+
     def test_exec_reports_global_maintenance_registration(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

@@ -114,7 +114,7 @@ static const GuardKey kGuardKeys[] = {
     {"format", "commitlistformat", 0, false}, {"format", "coverletter", 0, false},
     {"format", "pretty", 0, false},       {"pretty", NULL, 2, false},
     {"gpg", "defaultkeycommand", 2, false}, {"gc", "recentobjectshook", 0, false},
-    {"fetch", "bundleuri", 0, false},
+    {"fetch", "bundleuri", 0, false}, {"transfer", "bundleuri", 0, false},
     {"am", "threeway", 0, false},
     {"gc", "packrefs", 0, false}, {"fetch", "followremotehead", 0, false},
     {"remote", "followremotehead", 1, false},
