@@ -6572,6 +6572,41 @@ class GitWorldTest(unittest.TestCase):
         for marker in (helper_marker, filter_marker, hook_marker):
             self.assertFalse(marker.exists())
 
+    def test_exec_reports_smtp_credentials_without_disclosing_passwords(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        marker = one / 'smtp-credential-ran'
+        self.git(one, 'config', 'credential.helper', '!touch ' + shlex.quote(str(marker)))
+        prefixes = ('sendemail', 'sendemail.work')
+        secrets = ('smtp-test-secret-old', 'smtp-test-secret-new')
+        for prefix in prefixes:
+            self.git(one, 'config', prefix + '.smtpUser', '')
+            self.git(one, 'config', prefix + '.smtpAuth', 'UNSUPPORTED')
+        for action in ('add', 'change', 'remove'):
+            commands = []
+            for prefix in prefixes:
+                if action == 'remove':
+                    commands.append('git config --unset-all ' + prefix + '.smtpPass')
+                else:
+                    value = secrets[0 if action == 'add' else 1]
+                    commands.append('git config ' + prefix + '.smtpPass ' + value)
+                if action == 'add':
+                    commands += ['git config ' + prefix + '.smtpUser user@example.invalid',
+                                 'git config ' + prefix + '.smtpAuth LOGIN']
+            p = self.exec_sh(wid, '; '.join(commands) + '; exit 7', '--no-sandbox', code=7)
+            transition = {'add': b'(unset) -> (redacted)', 'change': b'(redacted) -> (redacted)',
+                          'remove': b'(redacted) -> (unset)'}[action]
+            for prefix in prefixes:
+                self.assertIn(b'local ' + prefix.encode() + b'.smtppass: ' + transition, p.stderr)
+                if action == 'add':
+                    self.assertIn(b'local ' + prefix.encode() + b'.smtpuser: "" -> user@example.invalid', p.stderr)
+                    self.assertIn(b'local ' + prefix.encode() + b'.smtpauth: UNSUPPORTED -> LOGIN', p.stderr)
+            for secret in secrets:
+                self.assertNotIn(secret.encode(), p.stderr)
+                self.assertNotIn(secret.encode(), p.stdout)
+            self.assertNotIn(b'local credential.helper:', p.stderr)
+            self.assertFalse(marker.exists())
+
     def test_exec_reports_svn_authors_program_without_executing_it(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

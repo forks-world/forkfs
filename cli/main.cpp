@@ -3836,9 +3836,14 @@ static void guard_warn(const GuardRec *before, const GuardRec *after) {
         fputc(' ', stderr);
         put_id_field(stderr, key, strlen(key));
         fputs(": ", stderr);
-        put_value(stderr, before ? before->val : NULL);
+        // Encoding only escapes ID field control bytes, leaving section/key separators
+        // intact; secret-key classification is therefore valid on this encoded key too.
+        bool redact = guard_key_redacts_value(key);
+        if (redact) fputs(before ? "(redacted)" : "(unset)", stderr);
+        else put_value(stderr, before ? before->val : NULL);
         fputs(" -> ", stderr);
-        put_value(stderr, after ? after->val : NULL);
+        if (redact) fputs(after ? "(redacted)" : "(unset)", stderr);
+        else put_value(stderr, after ? after->val : NULL);
         fputc('\n', stderr);
     } else if (id[0] == 'l' || id[0] == 'b' || id[0] == 'm' || id[0] == 'n') {
         bool was = before && strcmp(before->val, "absent");

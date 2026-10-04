@@ -125,6 +125,8 @@ int main() {
         "remote.origin.skipdefaultupdate", "remote.origin.skipfetchall", "remote.team.origin.skipfetchall",
         "pull.twohead", "pull.octopus", "receive.procreceiverefs", "branch.main.mergeoptions", "branch.main.remote", "branch.main.pushremote", "remote.pushdefault",
         "branch.topic.with.dots.mergeoptions", "remote.origin.receivepack", "remote.origin.vcs", "uploadpack.packobjectshook",
+        "sendemail.smtpuser", "SENDEMAIL.SMTPPASS", "sendemail.work.smtpauth",
+        "sendemail.team.work.smtppass", "SENDEMAIL.Work.SMTPUSER", "sendemail.smtpauth",
         "sendemail.confirm", "sendemail.work.confirm", "SENDEMAIL.CONFIRM", "SENDEMAIL.Work.CONFIRM",
         "sendemail.annotate", "sendemail.work.annotate", "sendemail.suppresscc", "sendemail.work.suppresscc",
         "sendemail.validate", "sendemail.work.validate", "sendemail.useimaponly", "sendemail.work.useimaponly",
@@ -202,6 +204,17 @@ int main() {
     CHECK(guard_key_runs_command("svn.authorsprog", "./author-map"));
     CHECK(guard_key_runs_command("svn.authorsprog", ""));
     CHECK(guard_key_runs_command("svn.authorsprog", NULL));
+    const char *smtp_keys[] = {"sendemail.smtpuser", "sendemail.work.smtppass", "sendemail.smtpauth"};
+    for (const char *key : smtp_keys) {
+        CHECK(guard_key_runs_command(key, "value"));
+        CHECK(guard_key_runs_command(key, ""));
+        CHECK(guard_key_runs_command(key, NULL));
+    }
+    CHECK(guard_key_redacts_value("sendemail.smtppass"));
+    CHECK(guard_key_redacts_value("SENDEMAIL.Team.Work.SMTPPASS"));
+    CHECK(!guard_key_redacts_value("sendemail.smtpuser"));
+    CHECK(!guard_key_redacts_value("sendemail.work.smtppassextra"));
+    CHECK(!guard_key_redacts_value("other.smtppass"));
     CHECK(guard_key_runs_command("gc.packrefs", "false"));
     CHECK(guard_key_runs_command("gc.packrefs", "true"));
     CHECK(guard_key_runs_command("gc.packrefs", NULL));
@@ -380,6 +393,7 @@ int main() {
         "format.custom.commitlistformat", "format.custom.coverletter", "rebase.custom.instructionformat", "diff.custom.ignoresubmodules", "diff.custom.submodule", "status.custom.submodulesummary", "submodule.ignore", "submodule.library.ignoreextra", "submodule.library.activeextra",
         "log.custom.showsignature", "merge.custom.verifysignatures", "format.custom.pretty",
         "help.custom.browser", "help.custom.format", "instaweb.custom.browser", "man.custom.viewer",
+        "sendemail.smtpuserextra", "sendemail.work.smtppassextra", "sendemail.work.smtpauthextra",
         "svn.custom.authorsprog", "svn.authorsprogextra", "svn.authorsfile",
         "imap.host", "imap.custom.tunnel", "instaweb.port", "instaweb.custom.httpd", "guitool.cmd", "guitool.test.title",
         "commit.custom.gpgsign", "tag.custom.gpgsign", "tag.custom.forcesignannotated",

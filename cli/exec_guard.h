@@ -155,6 +155,8 @@ static const GuardKey kGuardKeys[] = {
     {"transfer", "hiderefs", 0, false},
     {"remote", "vcs", 1, false},          {"uploadpack", "packobjectshook", 0, false},
     {"sendemail", "identity", 0, false},
+    {"sendemail", "smtpuser", 2, false}, {"sendemail", "smtppass", 2, false},
+    {"sendemail", "smtpauth", 2, false},
     {"sendemail", "confirm", 2, false},
     {"sendemail", "annotate", 2, false}, {"sendemail", "suppresscc", 2, false},
     {"sendemail", "validate", 2, false}, {"sendemail", "useimaponly", 2, false},
@@ -203,6 +205,13 @@ static inline bool guard_signature_sort(const char *value) {
     else if (!strncmp(value, "v:", 2)) value += 2;
     if (*value == '*') ++value;
     return !strncmp(value, "signature", 9) && (!value[9] || value[9] == ':');
+}
+
+// Comparison retains the encoded value; terminal reports must never print SMTP passwords.
+static inline bool guard_key_redacts_value(const char *key) {
+    const char *first = strchr(key, '.'), *last = strrchr(key, '.');
+    return first && last && first - key == 9 && !strncasecmp(key, "sendemail", 9) &&
+           !strcasecmp(last + 1, "smtppass");
 }
 
 static inline bool guard_key_runs_command(const char *key, const char *value) {
