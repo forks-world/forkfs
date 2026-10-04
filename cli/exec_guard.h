@@ -74,6 +74,7 @@ struct GuardKey {
 };
 
 static const GuardKey kGuardKeys[] = {
+    {"attr", "tree", 0, false},
     {"http", "followredirects", 2, false},
     {"http", "proxy", 2, false}, {"remote", "proxy", 1, false},
     {"http", "sslcert", 2, false}, {"http", "proxysslcert", 2, false},
@@ -224,8 +225,9 @@ static inline bool guard_key_runs_command(const char *key, const char *value) {
         size_t task = (size_t)(last - first - 1);
         bool gc = task == 2 && !memcmp(first + 1, "gc", 2);
         bool prefetch = task == 8 && !memcmp(first + 1, "prefetch", 8);
-        if ((gc || prefetch) && !strcasecmp(name, "enabled")) return true;
-        if ((gc || prefetch) && !strcasecmp(name, "schedule")) return true;
+        bool pack_refs = task == 9 && !memcmp(first + 1, "pack-refs", 9);
+        if ((gc || prefetch || pack_refs) && !strcasecmp(name, "enabled")) return true;
+        if ((gc || prefetch || pack_refs) && !strcasecmp(name, "schedule")) return true;
     }
     if (!has_sub && !strcasecmp(name, "sort") &&
         ((section == 6 && !strncasecmp(key, "branch", section)) ||

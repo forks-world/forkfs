@@ -75,6 +75,7 @@ int main() {
         "http.https://example.invalid/repo.sslcertpasswordprotected",
         "HTTP.https://example.invalid/repo.PROXYSSLCERTPASSWORDPROTECTED",
         "receive.autogc", "maintenance.auto", "maintenance.strategy", "maintenance.repo", "gc.auto", "gc.autopacklimit",
+        "attr.tree", "ATTR.TREE", "maintenance.pack-refs.enabled", "MAINTENANCE.pack-refs.SCHEDULE",
         "maintenance.gc.enabled", "maintenance.prefetch.enabled", "maintenance.prefetch.schedule", "maintenance.gc.schedule", "fetch.bundleuri",
         "MAINTENANCE.gc.ENABLED", "Maintenance.prefetch.Schedule",
         "remote.origin.partialclonefilter", "extensions.partialclone",
@@ -190,6 +191,12 @@ int main() {
     CHECK(guard_key_runs_command("gc.packrefs", "false"));
     CHECK(guard_key_runs_command("gc.packrefs", "true"));
     CHECK(guard_key_runs_command("gc.packrefs", NULL));
+    CHECK(guard_key_runs_command("attr.tree", "HEAD"));
+    CHECK(guard_key_runs_command("attr.tree", NULL));
+    CHECK(guard_key_runs_command("maintenance.pack-refs.enabled", "false"));
+    CHECK(guard_key_runs_command("maintenance.pack-refs.enabled", "true"));
+    CHECK(guard_key_runs_command("maintenance.pack-refs.schedule", "hourly"));
+    CHECK(guard_key_runs_command("maintenance.pack-refs.schedule", NULL));
     const char *follow_keys[] = {"fetch.followremotehead", "remote.origin.followremotehead"};
     for (const char *key : follow_keys) {
         CHECK(guard_key_runs_command(key, "never"));
@@ -306,6 +313,8 @@ int main() {
         "lfs.https://example.invalid/repo.standalonetransferagentextra",
         "receive.custom.autogc", "maintenance.custom.auto", "maintenance.custom.strategy", "maintenance.custom.repo",
         "gc.custom.auto", "gc.custom.autopacklimit", "maintenance.GC.enabled", "maintenance.Prefetch.enabled",
+        "attr.custom.tree", "attr.treeextra", "maintenance.Pack-refs.enabled",
+        "maintenance.team.pack-refs.schedule", "maintenance.pack-refs.enabledextra",
         "maintenance.GC.schedule", "maintenance.gc.scheduleextra", "fetch.custom.bundleuri", "maintenance.commit-graph.enabled", "maintenance.repack.enabled",
         "maintenance.team.prefetch.enabled", "maintenance.enabled",
         "remote.partialclonefilter", "extensions.custom.partialclone",

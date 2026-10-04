@@ -5387,6 +5387,60 @@ class GitWorldTest(unittest.TestCase):
         self.exec_sh(wid, 'echo fine > .world-git/repo.git/worktrees/active/modules/guarded-foo/payload',
                      '--require-sandbox')
 
+    def test_exec_reports_index_attributes_without_running_filters_or_fsmonitor(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        marker = one / 'index-inspection-ran'
+        monitor = one / '.world-git/index-monitor'
+        monitor.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(marker)) + '\n')
+        monitor.chmod(0o755)
+        blob = one / '.world-git/index-attributes-blob'
+        blob.write_text('* filter=retained\n')
+        repos = (one, one / 'libs/lib')
+        oids = []
+        for repo in repos:
+            oids.append(self.git(repo, 'hash-object', '-w', str(blob)).stdout.strip().decode())
+            self.git(repo, 'config', 'filter.retained.smudge', 'touch ' + shlex.quote(str(marker)) + '; cat')
+            self.git(repo, 'config', 'core.fsmonitor', str(monitor))
+        paths = ('.gitattributes', 'nested/.gitattributes', 'odd\tname/.gitattributes')
+        scripts = []
+        for repo, oid in zip(repos, oids):
+            for path in paths:
+                scripts.append('git -C ' + shlex.quote(str(repo)) +
+                               ' -c core.fsmonitor=false update-index --add --cacheinfo ' +
+                               shlex.quote('100644,' + oid + ',' + path))
+        p = self.exec_sh(wid, '; '.join(scripts) + '; exit 7', '--no-sandbox', code=7)
+        for admin in ('.world-git/repo.git/worktrees/active',
+                      '.world-git/repo.git/worktrees/active/modules/lib-module'):
+            for path in paths:
+                display = path.replace('\t', '\\x09')
+                self.assertIn(b'Git index attributes: ' + admin.encode() + b' (stage 0: ' + display.encode() + b')', p.stderr)
+        self.assertFalse(marker.exists())
+        # A conflict's stage-two attributes are also an index fallback. No working copy exists.
+        index_info = one / '.world-git/index-attributes-stages'
+        index_info.write_text('0 ' + '0' * len(oids[0]) + '\t.gitattributes\n' +
+                              '100644 ' + oids[0] + ' 2\t.gitattributes\n')
+        blob.write_text('* -filter\n')
+        replacement = self.git(one, '-c', 'core.fsmonitor=false', 'hash-object', '-w', '--no-filters',
+                               str(blob)).stdout.strip().decode()
+        p = self.exec_sh(wid, 'git -c core.fsmonitor=false update-index --index-info < ' +
+                         shlex.quote(str(index_info)) + '; git -c core.fsmonitor=false replace ' +
+                         oids[0] + ' ' + replacement + '; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'exec added Git index attributes: .world-git/repo.git/worktrees/active (stage 2: .gitattributes)', p.stderr)
+        self.assertIn(b'exec removed Git index attributes: .world-git/repo.git/worktrees/active (stage 0: .gitattributes)', p.stderr)
+        # The index OID is unchanged, but replacement refs change the bytes Git consumes.
+        self.assertIn(b'exec changed Git index attributes: .world-git/repo.git/worktrees/active (stage 0: nested/.gitattributes)', p.stderr)
+        self.assertNotIn(b'Git index attributes: .world-git/repo.git/worktrees/active/modules/lib-module', p.stderr)
+        self.assertFalse(marker.exists())
+        p = self.exec_sh(wid, 'git config attr.tree HEAD; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local attr.tree: (unset) -> HEAD', p.stderr)
+        self.assertNotIn(b'local filter.retained.smudge:', p.stderr)
+        self.assertFalse(marker.exists())
+        for repo in repos:
+            for path in paths:
+                self.assertFalse((repo / path).exists())
+
     def test_exec_reports_ignored_checkout_attributes_and_aliases(self):
         self.submodule_fixture()
         self.world('init', str(self.source))
@@ -6531,11 +6585,16 @@ class GitWorldTest(unittest.TestCase):
             self.assertEqual(hook.read_bytes(), original)
             self.assertFalse(marker.exists())
         self.git(one, 'config', 'gc.packRefs', 'false')
+        self.git(one, 'config', 'maintenance.pack-refs.enabled', 'false')
+        self.git(one, 'config', 'maintenance.pack-refs.schedule', 'weekly')
         for key in ('fetch.followRemoteHEAD', 'remote.origin.followRemoteHEAD'):
             self.git(one, 'config', key, 'never')
         p = self.exec_sh(wid, 'git config gc.packRefs true; git config fetch.followRemoteHEAD always; '
-                         'git config remote.origin.followRemoteHEAD always; exit 7', '--no-sandbox', code=7)
+                         'git config remote.origin.followRemoteHEAD always; git config maintenance.pack-refs.enabled true; '
+                         'git config maintenance.pack-refs.schedule hourly; exit 7', '--no-sandbox', code=7)
         self.assertIn(b'local gc.packrefs: false -> true', p.stderr)
+        self.assertIn(b'local maintenance.pack-refs.enabled: false -> true', p.stderr)
+        self.assertIn(b'local maintenance.pack-refs.schedule: weekly -> hourly', p.stderr)
         for key in ('fetch.followremotehead', 'remote.origin.followremotehead'):
             self.assertIn(b'local ' + key.encode() + b': never -> always', p.stderr)
         self.assertNotIn(b'a Git hook:', p.stderr)

@@ -348,6 +348,12 @@ warning.
   symlinked/nonregular files or unreadable blobs invalidate capture. Unlike LFS configuration,
   `.gitmodules` includes are not traversed. The same content, entry and query-time budgets
   apply, and object queries disable fsmonitor and lazy fetching. Files remain writable;
+- index `.gitattributes` blobs at every path, including sparse-index entries and conflict
+  stages: Git can fall back to stage zero or stage two when working-tree attributes are absent.
+  The guard expands the index, records each path/stage/mode and hashes actual blob bytes
+  (including replacement-object content). These confined queries disable fsmonitor and lazy
+  fetching and share the existing entry, content and query-time budgets; unavailable objects
+  invalidate capture instead of silently omitting fallback attributes. No filters are run;
 - `receive.fsck.skipList` and `fetch.fsck.skipList` files, including dormant include values:
   regular contents and absent sources are captured without running object validation. Relative
   paths are considered from checkout, Gitdir, common-repository and dormant worktree bases;
@@ -408,7 +414,7 @@ world: WARNING: exec removed libs/lib/.git, which told Git where a repository is
 
 The settings watched (Git's lowercase key names; `*` is any subsection): `core.hookspath`,
 `core.worktree` (checkout and relative-hook redirection), `core.fsmonitor`, `core.sshcommand`, `core.editor`, `core.pager`, `core.askpass`,
-`core.attributesfile` and `core.usereplacerefs` (can activate configured filters, including through replacement-tree attributes), `core.gitproxy`, `core.alternaterefscommand`, `sequence.editor`, `credential.helper` and
+`attr.tree`, `core.attributesfile` and `core.usereplacerefs` (can activate configured filters, including through replacement-tree attributes), `core.gitproxy`, `core.alternaterefscommand`, `sequence.editor`, `credential.helper` and
 `credential.*.helper`, `credential.interactive` (enables configured askpass),
 `http[.*].proactiveauth` (can proactively invoke an unchanged credential helper), `filter.*.clean|smudge|process`, `diff.external`,
 `diff.*.command|textconv`, `diff.tool|guitool`, `merge.tool|guitool`, `difftool.guidefault`, `mergetool.guidefault` (select configured commands), `difftool.prompt` and `mergetool.prompt` (can launch retained tools without waiting for input), `merge.*.driver|recursive`, `merge.default` (including selection of unchanged merge drivers),
@@ -448,7 +454,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `receive.denynonfastforwards`, `receive.denydeletes` and `receive.denydeletecurrent` (can let forced branch updates or permitted deletions reach the existing update hook),
 `receive.autogc`, `maintenance.auto`, `gc.auto`, `gc.autopacklimit`, `maintenance.strategy`,
 `maintenance.repo` (registers repositories for an existing maintenance scheduler),
-`maintenance.gc.enabled|schedule`, `maintenance.prefetch.enabled|schedule`
+`maintenance.gc.enabled|schedule`, `maintenance.prefetch.enabled|schedule`, `maintenance.pack-refs.enabled|schedule`
 (can activate existing maintenance hooks or remote helpers; task names are exact),
 `sendemail.identity` (selects configured mail commands),
 `sendemail[.*].confirm` (can run retained mail commands without recipient confirmation),

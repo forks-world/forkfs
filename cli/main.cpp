@@ -2501,7 +2501,7 @@ extern char **environ;
 // Config/var/checkout queries preserve inherited settings. Index/object queries explicitly
 // disable fsmonitor; all queries disable lazy fetching. Bound output and child lifetime
 // (an include can be a FIFO) without executing configured commands.
-enum GitGuardQuery { GG_LIST, GG_PATH, GG_TOPLEVEL, GG_BARE, GG_VAR, GG_MODULES, GG_INCLUDE_ROOT, GG_INCLUDE_FILE, GG_WORKTREE_ROOT, GG_WORKTREE_FILE, GG_LFS_OID, GG_LFS_BLOB, GG_LFS_INCLUDES_FILE, GG_LFS_INCLUDES_BLOB };
+enum GitGuardQuery { GG_LIST, GG_PATH, GG_TOPLEVEL, GG_BARE, GG_VAR, GG_MODULES, GG_INCLUDE_ROOT, GG_INCLUDE_FILE, GG_WORKTREE_ROOT, GG_WORKTREE_FILE, GG_LFS_OID, GG_LFS_BLOB, GG_ATTR_INDEX, GG_LFS_INCLUDES_FILE, GG_LFS_INCLUDES_BLOB };
 
 static char *git_guard_read(const char *root, const char *gitdir, const char *path_key, GitGuardQuery query,
                             size_t *len, int *status, int *remaining_ms = NULL) {
@@ -2515,7 +2515,7 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
     size_t arg = 0;
     argv[arg++] = WFS_CONFIG_GIT;
     argv[arg++] = "--no-lazy-fetch";  // metadata inspection must never invoke a promisor helper
-    if (query == GG_LFS_OID || query == GG_LFS_BLOB) {
+    if (query == GG_LFS_OID || query == GG_LFS_BLOB || query == GG_ATTR_INDEX) {
         // Resolving an index blob can refresh fsmonitor while reading the index.
         // Override only object queries; the configuration snapshot keeps the real value.
         argv[arg++] = "-c";
@@ -2551,6 +2551,16 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
         if (query == GG_WORKTREE_FILE) { argv[arg++] = "--file"; argv[arg++] = path_key; }
         argv[arg++] = "--get-all";
         argv[arg++] = "core.worktree";
+    } else if (query == GG_ATTR_INDEX) {
+        // Full index expansion includes sparse-directory attributes; no worktree scan,
+        // filters, submodule recursion or abbreviated object identities.
+        argv[arg++] = "ls-files";
+        argv[arg++] = "--stage";
+        argv[arg++] = "--full-name";
+        argv[arg++] = "-z";
+        argv[arg++] = "--abbrev=64";
+        argv[arg++] = "--";
+        argv[arg++] = ":(top,glob)**/.gitattributes";
     } else if (query == GG_LFS_OID) {
         argv[arg++] = "rev-parse";
         argv[arg++] = "--verify";
@@ -2868,6 +2878,66 @@ static bool capture_include_edges(const GitAdmin *a, const char *gitdir, const c
     free(out);
     if (!ok && !s->error) s->error = "unsupported Git include origin or path";
     return ok;
+}
+
+// Git reads attributes from stage zero, or stage two during a conflict, when a
+// working-tree source is absent. Observe all stages so later stage changes remain visible.
+static bool capture_index_attributes(const GitAdmin *a, const char *gitdir, GuardSet *s) {
+    size_t len = 0;
+    int status = -1;
+    char *out = git_guard_read(a->query_root, gitdir, NULL, GG_ATTR_INDEX, &len, &status, &s->include_ms);
+    if (!out) { s->error = "Git index attributes query failed or exceeded capture time budget"; return false; }
+    for (size_t at = 0; at < len && !s->error;) {
+        if (g_post_signal) { s->error = "Git capture interrupted"; break; }
+        if (++s->entries > 65536) { s->error = "Git index attributes entry limit exceeded"; break; }
+        char *record = out + at, *end = (char *)memchr(record, 0, len - at);
+        if (!end) { s->error = "invalid Git index attributes record"; break; }
+        at = (size_t)(end - out) + 1;
+        char *tab = (char *)memchr(record, '\t', (size_t)(end - record));
+        if (!tab || tab - record < 10 || !tab[1] || record[6] != ' ' || tab[-2] != ' ' ||
+            tab[-1] < '0' || tab[-1] > '3') { s->error = "invalid Git index attributes record"; break; }
+        const char *basename = strrchr(tab + 1, '/');
+        basename = basename ? basename + 1 : tab + 1;
+        if (strcmp(basename, ".gitattributes")) { s->error = "unexpected Git index attributes path"; break; }
+        size_t oid_len = (size_t)(tab - record - 9);
+        bool valid = oid_len == 40 || oid_len == 64;
+        for (size_t i = 0; valid && i < 6; ++i) valid = record[i] >= '0' && record[i] <= '7';
+        for (size_t i = 0; valid && i < oid_len; ++i) {
+            char c = record[7 + i];
+            valid = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        }
+        if (!valid) { s->error = "invalid Git index attributes object identity"; break; }
+        char oid[65];
+        memcpy(oid, record + 7, oid_len); oid[oid_len] = 0;
+        size_t bytes_len = 0;
+        char *bytes = git_guard_read(a->query_root, gitdir, oid, GG_LFS_BLOB, &bytes_len, &status, &s->include_ms);
+        if (!bytes) { s->error = "Git index attributes blob unavailable or exceeded capture time budget"; break; }
+        if (bytes_len > s->bytes_left) {
+            free(bytes); s->error = "Git files exceed the 64 MiB capture budget"; break;
+        }
+        s->bytes_left -= bytes_len;
+        uint64_t hash = 1469598103934665603ull;
+        for (size_t i = 0; i < bytes_len; ++i) {
+            if (g_post_signal) { s->error = "Git capture interrupted"; break; }
+            hash ^= (unsigned char)bytes[i]; hash *= 1099511628211ull;
+        }
+        free(bytes);
+        char *label = guard_encode_id_field(rel_to(a, gitdir));
+        char *path = guard_encode_id_field(tab + 1);
+        if (!label || !path) { free(label); free(path); s->error = "out of memory"; break; }
+        size_t cap = strlen(label) + strlen(path) + 8;
+        char *id = (char *)malloc(cap);
+        char fp[80];
+        snprintf(fp, sizeof fp, "%.6s:%016llx", record, (unsigned long long)hash);
+        if (!id) s->error = "out of memory";
+        else {
+            snprintf(id, cap, "t\x1f%s\x1f%c\x1f%s", label, tab[-1], path);
+            gs_add(s, id, fp);
+        }
+        free(id); free(label); free(path);
+    }
+    free(out);
+    return !s->error;
 }
 
 // LFS and submodule configuration can fall back to index/HEAD when checkout files
@@ -3540,6 +3610,7 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
         s->error = "out of memory"; return false;
     }
     if (!capture_include_hooks(a, gitdir, checkout, common, s, bare)) return false;
+    if (!capture_index_attributes(a, gitdir, s)) return false;
 #ifdef __APPLE__
     if (require_home && !nested_checkout && !plan_submodules(a, gitdir, checkout, s)) {
         if (!s->error) s->error = "could not safely plan declared submodule administration";
@@ -3795,6 +3866,15 @@ static void guard_warn(const GuardRec *before, const GuardRec *after) {
         fprintf(stderr, "world: WARNING: exec %s a Git include target: ", !was ? "added" : !is ? "removed" : "changed");
         put_field(stderr, rest, strlen(rest));
         fputs(" (including inactive conditional configuration)\n", stderr);
+    } else if (id[0] == 't') {
+        const char *stage = strchr(rest, '\x1f') + 1, *path = strchr(stage, '\x1f') + 1;
+        fprintf(stderr, "world: WARNING: exec %s Git index attributes: ", !before ? "added" : !after ? "removed" : "changed");
+        put_id_field(stderr, rest, (size_t)(stage - rest - 1));
+        fputs(" (stage ", stderr);
+        put_field(stderr, stage, (size_t)(path - stage - 1));
+        fputs(": ", stderr);
+        put_id_field(stderr, path, strlen(path));
+        fputs(") (can activate configured filters)\n", stderr);
     } else if (id[0] == 's') {
         bool was = before && strcmp(before->val, "absent");
         bool is = after && strcmp(after->val, "absent");
