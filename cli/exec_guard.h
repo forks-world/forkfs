@@ -75,7 +75,7 @@ struct GuardKey {
 
 static const GuardKey kGuardKeys[] = {
     {"attr", "tree", 0, false},
-    {"http", "followredirects", 2, false},
+    {"http", "followredirects", 2, false}, {"http", "sslverify", 2, false},
     {"http", "proxy", 2, false}, {"remote", "proxy", 1, false},
     {"http", "sslcert", 2, false}, {"http", "proxysslcert", 2, false},
     {"http", "sslcertpasswordprotected", 2, false},
@@ -92,6 +92,7 @@ static const GuardKey kGuardKeys[] = {
     {"core", "gitproxy", 0, false},       {"core", "alternaterefscommand", 0, false},
     {"sequence", "editor", 0, false},     {"credential", "helper", 2, false},
     {"filter", "clean", 1, false},        {"filter", "smudge", 1, false},
+    {"filter", "required", 1, false},
     {"filter", "process", 1, false},      {"diff", "external", 0, false},
     {"diff", "tool", 0, false},           {"diff", "guitool", 0, false},
     {"difftool", "guidefault", 0, false}, {"mergetool", "guidefault", 0, false},

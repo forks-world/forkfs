@@ -414,6 +414,8 @@ world: WARNING: exec removed libs/lib/.git, which told Git where a repository is
 
 The settings watched (Git's lowercase key names; `*` is any subsection): `core.hookspath`,
 `core.worktree` (checkout and relative-hook redirection), `core.fsmonitor`, `core.sshcommand`, `core.editor`, `core.pager`, `core.askpass`,
+`http.sslverify` (base or URL-scoped; disabling verification can let a request reach retained credential helpers),
+`filter.*.required` (disabling a failing mandatory filter can let checkout reach retained hooks),
 `attr.tree`, `core.attributesfile` and `core.usereplacerefs` (can activate configured filters, including through replacement-tree attributes), `core.gitproxy`, `core.alternaterefscommand`, `sequence.editor`, `credential.helper` and
 `credential.*.helper`, `credential.interactive` (enables configured askpass),
 `http[.*].proactiveauth` (can proactively invoke an unchanged credential helper), `filter.*.clean|smudge|process`, `diff.external`,

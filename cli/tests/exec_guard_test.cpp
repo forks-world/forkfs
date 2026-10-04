@@ -63,6 +63,8 @@ int main() {
         "lfs.gitprotocol", "pull.ff", "lfs.url", "lfs.pushurl", "remote.origin.lfsurl", "remote.team.origin.lfspushurl",
         "lfs.fetchinclude", "lfs.fetchexclude", "LFS.FETCHINCLUDE", "LFS.FETCHEXCLUDE",
         "lfs.access", "lfs.https://example.invalid/repo.access", "LFS.ACCESS", "merge.defaulttoupstream", "merge.ff",
+        "http.sslverify", "HTTP.SSLVERIFY", "http.https://example.invalid/repo.sslverify",
+        "filter.x.required", "FILTER.Driver.REQUIRED", "filter.team.driver.required",
         "http.followredirects", "http.https://example.invalid/repo.followredirects", "HTTP.FOLLOWREDIRECTS",
         "http.proactiveauth", "http.https://example.invalid/repo.proactiveauth", "HTTP.PROACTIVEAUTH",
         "credential.interactive", "CREDENTIAL.INTERACTIVE",
@@ -159,6 +161,12 @@ int main() {
     CHECK(guard_key_runs_command("http.followredirects", "initial"));
     CHECK(guard_key_runs_command("http.https://example.invalid/repo.followredirects", "true"));
     CHECK(guard_key_runs_command("http.followredirects", NULL));
+    const char *required_keys[] = {"http.sslverify", "http.https://example.invalid/repo.sslverify", "filter.driver.required"};
+    for (const char *key : required_keys) {
+        CHECK(guard_key_runs_command(key, "true"));
+        CHECK(guard_key_runs_command(key, "false"));
+        CHECK(guard_key_runs_command(key, NULL));
+    }
     const char *transaction_gates[] = {"am.threeway", "fetch.prune", "fetch.prunetags",
                                        "remote.origin.prune", "remote.origin.prunetags"};
     for (const char *key : transaction_gates) {
@@ -298,6 +306,8 @@ int main() {
         "remote.lfsurl", "remote.lfspushurl", "remote.origin.lfsurlextra",
         "lfs.url.fetchinclude", "lfs.url.fetchexclude", "lfs.fetchincludeextra", "lfs.fetchexcludeextra",
         "lfs.accessextra", "lfs.https://example.invalid/repo.accessextra", "merge.custom.defaulttoupstream", "merge.custom.ff", "merge.ffextra",
+        "http.sslverifyextra", "http.https://example.invalid/repo.sslverifyextra",
+        "filter.required", "filter.driver.requiredextra",
         "http.followredirectsextra", "http.https://example.invalid/repo.followredirectsextra",
         "http.proactiveauthextra", "http.https://example.invalid/repo.proactiveauthextra",
         "credential.https://example.invalid.interactive", "credential.interactiveextra",

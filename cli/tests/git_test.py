@@ -6516,6 +6516,38 @@ class GitWorldTest(unittest.TestCase):
         self.assertEqual(self.git(one, 'config', 'merge.retained.driver').stdout.strip(), command.encode())
         self.assertFalse((one / 'am-merge-driver-ran').exists())
 
+    def test_exec_reports_tls_and_filter_failure_gates_with_retained_commands(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        helper_marker = one / 'tls-helper-ran'
+        filter_marker = one / 'required-filter-ran'
+        hook_marker = one / 'post-checkout-ran'
+        self.git(one, 'config', 'credential.helper', '!touch ' + shlex.quote(str(helper_marker)))
+        self.git(one, 'config', 'filter.retained.smudge', 'touch ' + shlex.quote(str(filter_marker)) + '; exit 1')
+        self.git(one, 'config', 'filter.retained.required', 'true')
+        attributes = one / '.world-git/repo.git/info/attributes'
+        attributes.parent.mkdir(exist_ok=True)
+        attributes.write_text('file filter=retained\n')
+        hook = one / '.world-git/repo.git/hooks/post-checkout'
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(hook_marker)) + '\n')
+        hook.chmod(0o755)
+        original = hook.read_bytes()
+        for key in ('http.sslVerify', 'http.https://example.invalid/repo.sslVerify'):
+            self.git(one, 'config', key, 'true')
+        p = self.exec_sh(wid, 'git config http.sslVerify false; '
+                         'git config http.https://example.invalid/repo.sslVerify false; '
+                         'git config filter.retained.required false; exit 7', '--no-sandbox', code=7)
+        for key in ('http.sslverify', 'http.https://example.invalid/repo.sslverify', 'filter.retained.required'):
+            self.assertIn(b'local ' + key.encode() + b': true -> false', p.stderr)
+        for key in ('credential.helper', 'filter.retained.smudge'):
+            self.assertNotIn(b'local ' + key.encode() + b':', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertNotIn(b'Git repository attributes:', p.stderr)
+        self.assertEqual(hook.read_bytes(), original)
+        for marker in (helper_marker, filter_marker, hook_marker):
+            self.assertFalse(marker.exists())
+
     def test_exec_reports_hook_and_object_validation_activation(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
