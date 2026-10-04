@@ -430,6 +430,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `uploadpack.packobjectshook`, `receive.procreceiverefs` (activates the configured proc-receive hook),
 `receive.denycurrentbranch` (can enable the existing push-to-checkout hook),
 `receive.shallowupdate` (can allow updates requiring shallow-boundary changes to reach retained hooks),
+`receive.advertiseatomic` and `receive.advertisepushoptions` (can permit capability-dependent pushes to reach retained hooks),
 `receive.fsckobjects` and `receive.maxinputsize` (can admit previously rejected incoming objects or packs and reach retained update hooks),
 `receive.denynonfastforwards`, `receive.denydeletes` and `receive.denydeletecurrent` (can let forced branch updates or permitted deletions reach the existing update hook),
 `receive.autogc`, `maintenance.auto`, `gc.auto`, `gc.autopacklimit`, `maintenance.strategy`,
@@ -762,10 +763,23 @@ repository and the cause, for example `reason: nested Git repository at <path>: 
 objects from another repository (objects/info/alternates)`.
 
 The configuration is read from its file alone, with `git config --file <path>/.git/config
---no-includes`, run from `/`. No WorldFS Git command ever runs inside a nested repository, so
-its hooks, filters and fsmonitor never run during `init`, `fork`, `checkpoint` or `publish`;
+--no-includes`, run from `/`. Tree-copy operations never run Git inside a nested repository, so its hooks, filters and
+fsmonitor never run during `init`, `fork`, `checkpoint` or `publish`;
 the root's own status, clean and reset commands only look at the directory to tell that it is a
 repository.
+
+The `world exec` guard additionally discovers existing nested repositories, including ignored
+paths and those inside submodules or plain directory Worlds. It reads their configuration,
+attributes, fallback configuration blobs and hooks using the same confined trusted Git queries,
+with the nested checkout as the query working directory. Bare `.git` repositories are supported;
+registered linked worktrees of the World's root are validated against their common directory
+and reciprocal registration. Unknown gitfiles, aliased/external administration and foreign
+common-directory pointers make capture unavailable rather than silently omitting repositories.
+Discovery shares the depth, entry, repository and content limits described above. Nested default
+hooks and administration-local custom hooks are protected; configuration remains writable and
+changes are reported. Linux protects existing locator files, but a newly created absent
+`commondir` can only be detected after the command; macOS also denies its creation. This does
+not promise prevention of transient create-and-restore changes or repositories created mid-exec.
 
 The check runs wherever a tree is captured: `init` (also of a directory with no Git repository
 at its root), `fork` and `checkpoint` of a World (whose copy is captured again before

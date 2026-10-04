@@ -129,6 +129,7 @@ static const GuardKey kGuardKeys[] = {
     {"remote", "push", 1, false}, {"remote", "mirror", 1, false},
     {"receive", "procreceiverefs", 0, false},
     {"receive", "shallowupdate", 0, false},
+    {"receive", "advertiseatomic", 0, false}, {"receive", "advertisepushoptions", 0, false},
     {"receive", "fsckobjects", 0, false}, {"receive", "maxinputsize", 0, false},
     {"receive", "denydeletecurrent", 0, false},
     {"receive", "denynonfastforwards", 0, false}, {"receive", "denydeletes", 0, false},

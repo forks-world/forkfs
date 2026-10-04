@@ -5441,6 +5441,80 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'exec removed a Git attributes directory alias: dangling', p.stderr)
         self.assertFalse(marker.exists())
 
+    def test_exec_guards_independent_nested_repositories(self):
+        self.submodule_fixture()
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        (one / '.gitignore').write_text('ignored/\n')
+        checkouts = (one / 'ignored/vendor', one / 'libs/lib/vendor', one / 'bare-vendor')
+        for checkout in checkouts:
+            checkout.mkdir(parents=True)
+            if checkout.name == 'bare-vendor':
+                self.git(checkout, 'init', '--bare', '.git')
+            else:
+                self.git(checkout, 'init')
+            hooks = checkout / '.git/hooks'
+            hooks.mkdir(exist_ok=True)
+            (hooks / 'pre-commit').write_text('#!/bin/sh\nexit 0\n')
+            (hooks / 'pre-commit').chmod(0o755)
+        custom = checkouts[0] / '.git/custom/pre-commit'
+        custom.parent.mkdir()
+        custom.write_text('#!/bin/sh\nexit 0\n')
+        custom.chmod(0o755)
+        self.git(checkouts[0], 'config', 'core.hooksPath', '.git/custom')
+        linked = one / '.claude/worktrees/agent-x'
+        self.git(one, 'worktree', 'add', '--detach', str(linked), 'HEAD')
+        script = '; '.join('git --git-dir=' + shlex.quote(str(path / '.git')) +
+                           ' config core.sshCommand retained-ssh' for path in checkouts)
+        script += '; git -C ' + shlex.quote(str(linked)) + ' config core.askPass retained-askpass'
+        p = self.exec_sh(wid, script + '; exit 7', '--no-sandbox', code=7)
+        for checkout in checkouts:
+            label = str(checkout.relative_to(one)).encode()
+            self.assertIn(b'nested ' + label + b' local core.sshcommand: (unset) -> retained-ssh', p.stderr)
+        self.assertIn(b'nested .claude/worktrees/agent-x local core.askpass: (unset) -> retained-askpass', p.stderr)
+        hook = checkouts[0] / '.git/hooks/pre-commit'
+        original = hook.read_bytes()
+        p = self.exec_sh(wid, 'echo changed >> ' + shlex.quote(str(hook)), '--require-sandbox', code=1)
+        self.assertEqual(hook.read_bytes(), original)
+        self.exec_sh(wid, 'echo changed >> ' + shlex.quote(str(custom)), '--require-sandbox', code=1)
+        self.assertEqual(custom.read_bytes(), original)
+        p = self.exec_sh(wid, 'echo changed >> ' + shlex.quote(str(hook)) + '; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'exec changed a Git hook: ignored/vendor/.git/hooks/pre-commit', p.stderr)
+        # A newly planted persistent common-directory redirect must be reported on Linux,
+        # while macOS can deny creation of the absent literal locator.
+        redirect = checkouts[0] / '.git/commondir'
+        if sys.platform == 'darwin':
+            self.exec_sh(wid, 'printf %s ' + shlex.quote(str(one / '.world-git/repo.git')) +
+                         ' > ' + shlex.quote(str(redirect)), '--require-sandbox', code=1)
+            self.assertFalse(redirect.exists())
+        else:
+            p = self.exec_sh(wid, 'printf %s ' + shlex.quote(str(one / '.world-git/repo.git')) +
+                             ' > ' + shlex.quote(str(redirect)) + '; exit 7', '--require-sandbox', code=7)
+            self.assertIn(b'WARNING', p.stderr)
+            self.assertIn(b'unsupported nested Git common directory', p.stderr)
+            redirect.unlink()
+        # Unknown externally routed administration must fail before user code starts.
+        bad = one / 'unsupported'
+        bad.mkdir()
+        (bad / '.git').write_text('gitdir: ' + str(self.source / '.git') + '\n')
+        p = self.exec_sh(wid, 'touch command-ran', '--require-sandbox', code=3)
+        self.assertIn(b'unsupported nested Git administration pointer', p.stderr)
+        self.assertFalse((one / 'command-ran').exists())
+
+    def test_exec_guards_nested_repository_in_plain_world(self):
+        plain = self.root / 'plain-nested'
+        plain.mkdir()
+        self.world('init', str(plain))
+        one, wid = self.fork()
+        self.exec_sh(wid, 'echo plain > file', '--require-sandbox')
+        checkout = one / 'vendor'
+        checkout.mkdir()
+        self.git(checkout, 'init')
+        p = self.exec_sh(wid, 'git -C vendor config core.sshCommand retained-ssh; exit 7',
+                         '--no-sandbox', code=7)
+        self.assertIn(b'nested vendor local core.sshcommand: (unset) -> retained-ssh', p.stderr)
+        self.assertNotIn(b'Git guard unavailable', p.stderr)
+
     def test_exec_reports_receive_validation_gates_with_retained_hook(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
@@ -5452,12 +5526,17 @@ class GitWorldTest(unittest.TestCase):
         self.git(one, 'config', 'receive.shallowUpdate', 'false')
         self.git(one, 'config', 'receive.fsckObjects', 'true')
         self.git(one, 'config', 'receive.maxInputSize', '1')
+        self.git(one, 'config', 'receive.advertiseAtomic', 'false')
+        self.git(one, 'config', 'receive.advertisePushOptions', 'false')
         p = self.exec_sh(wid, 'git config receive.shallowUpdate true; '
-                         'git config receive.fsckObjects false; git config receive.maxInputSize 0; exit 7',
+                         'git config receive.fsckObjects false; git config receive.maxInputSize 0; '
+                         'git config receive.advertiseAtomic true; git config receive.advertisePushOptions true; exit 7',
                          '--no-sandbox', code=7)
         self.assertIn(b'local receive.shallowupdate: false -> true', p.stderr)
         self.assertIn(b'local receive.fsckobjects: true -> false', p.stderr)
         self.assertIn(b'local receive.maxinputsize: 1 -> 0', p.stderr)
+        self.assertIn(b'local receive.advertiseatomic: false -> true', p.stderr)
+        self.assertIn(b'local receive.advertisepushoptions: false -> true', p.stderr)
         self.assertNotIn(b'a Git hook:', p.stderr)
         self.assertEqual(hook.read_bytes(), original)
         self.assertFalse((one / 'update-hook-ran').exists())

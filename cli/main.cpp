@@ -2004,6 +2004,9 @@ static bool resolve_into(const char *path, char *out, size_t cap) {
 }
 
 struct GitAdmin {
+    bool has_owned_admin;
+    char query_root[WFS_PATH_MAX]; // cwd for the current repository metadata queries
+    StrList nested, nested_gitdirs, nested_common; // parallel checkout/admin/common records, not module namespaces
     bool incomplete;             // discovery failed or exceeded its resource/path limits
     size_t entries;              // all visited administration entries, not just repositories
     char root[WFS_PATH_MAX];     // the World root, resolved
@@ -2090,11 +2093,12 @@ static bool git_admin_find(const char *world, GitAdmin *a) {
         a->incomplete = true; return true;
     }
     struct stat st;
-    if (!admin_stat(a, wg, &st)) return a->incomplete;
+    if (!admin_stat(a, wg, &st)) return true; // plain Worlds can contain independent repositories
     if (!S_ISDIR(st.st_mode)) { a->incomplete = true; return true; }
     if (!admin_stat(a, a->common, &st) || !S_ISDIR(st.st_mode)) { a->incomplete = true; return true; }
     if (!admin_stat(a, a->worktrees, &st) || !S_ISDIR(st.st_mode)) { a->incomplete = true; return true; }
     if (!admin_stat(a, a->active, &st) || !S_ISDIR(st.st_mode)) { a->incomplete = true; return true; }
+    a->has_owned_admin = true;
     if (admin_stat(a, a->modules, &st)) {
         if (!S_ISDIR(st.st_mode) || !sl_push(&a->pins, a->modules)) a->incomplete = true;
         else find_submodules(a, a->modules, 0);
@@ -2102,7 +2106,7 @@ static bool git_admin_find(const char *world, GitAdmin *a) {
     return true;
 }
 
-static void git_admin_free(GitAdmin *a) { sl_free(&a->gitdirs); sl_free(&a->pins); sl_free(&a->hooks_paths); sl_free(&a->hook_locator_pins); sl_free(&a->planned_dirs); sl_free(&a->planned_namespaces); sl_free(&a->planned_locators); }
+static void git_admin_free(GitAdmin *a) { sl_free(&a->nested); sl_free(&a->nested_gitdirs); sl_free(&a->nested_common); sl_free(&a->gitdirs); sl_free(&a->pins); sl_free(&a->hooks_paths); sl_free(&a->hook_locator_pins); sl_free(&a->planned_dirs); sl_free(&a->planned_namespaces); sl_free(&a->planned_locators); }
 
 // --- what exec compares before and after the command ---
 //
@@ -2375,7 +2379,9 @@ static void capture_attributes(const GitAdmin *a, const char *path, GuardSet *s,
 // Ignore rules do not prevent .gitattributes from activating configured filters.
 // Follow directory targets as Git does for leading path components, hash only attribute
 // files, and deduplicate target identities to terminate cycles.
-static void capture_checkout_attributes(const GitAdmin *a, const char *dir, GuardSet *s,
+static void discover_checkout_git(GitAdmin *a, const char *dir, const char *canonical, GuardSet *s);
+
+static void capture_checkout_attributes(GitAdmin *a, const char *dir, GuardSet *s,
                                         int parent_fd = -1, const char *name = NULL, int depth = 0) {
     if (s->error) return;
     if (g_post_signal) { s->error = "Git capture interrupted"; return; }
@@ -2402,6 +2408,8 @@ static void capture_checkout_attributes(const GitAdmin *a, const char *dir, Guar
         canonical.st_dev != opened.st_dev || canonical.st_ino != opened.st_ino) {
         free(resolved); close(fd); s->error = "could not resolve Git attributes directory"; return;
     }
+    discover_checkout_git(a, dir, resolved, s);
+    if (s->error) { free(resolved); close(fd); return; }
     if (!sl_push(&s->attribute_dirs, identity)) {
         free(resolved); close(fd); s->error = "out of memory"; return;
     }
@@ -2470,7 +2478,7 @@ extern char **environ;
 // Config/var/checkout queries preserve inherited settings. Index/object queries explicitly
 // disable fsmonitor; all queries disable lazy fetching. Bound output and child lifetime
 // (an include can be a FIFO) without executing configured commands.
-enum GitGuardQuery { GG_LIST, GG_PATH, GG_TOPLEVEL, GG_VAR, GG_MODULES, GG_INCLUDE_ROOT, GG_INCLUDE_FILE, GG_WORKTREE_ROOT, GG_WORKTREE_FILE, GG_LFS_OID, GG_LFS_BLOB, GG_LFS_INCLUDES_FILE, GG_LFS_INCLUDES_BLOB };
+enum GitGuardQuery { GG_LIST, GG_PATH, GG_TOPLEVEL, GG_BARE, GG_VAR, GG_MODULES, GG_INCLUDE_ROOT, GG_INCLUDE_FILE, GG_WORKTREE_ROOT, GG_WORKTREE_FILE, GG_LFS_OID, GG_LFS_BLOB, GG_LFS_INCLUDES_FILE, GG_LFS_INCLUDES_BLOB };
 
 static char *git_guard_read(const char *root, const char *gitdir, const char *path_key, GitGuardQuery query,
                             size_t *len, int *status, int *remaining_ms = NULL) {
@@ -2539,9 +2547,9 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
     } else if (query == GG_VAR) {
         argv[arg++] = "var";
         argv[arg++] = path_key;
-    } else if (query == GG_TOPLEVEL) {
+    } else if (query == GG_TOPLEVEL || query == GG_BARE) {
         argv[arg++] = "rev-parse";
-        argv[arg++] = "--show-toplevel";
+        argv[arg++] = query == GG_BARE ? "--is-bare-repository" : "--show-toplevel";
     } else {
         argv[arg++] = "config";
         argv[arg++] = "--includes";
@@ -2690,7 +2698,7 @@ static bool capture_worktree_candidates(const GitAdmin *a, const char *gitdir, c
                                         HookCandidates *hooks, GuardSet *s) {
     size_t len = 0;
     int status = -1;
-    char *out = git_guard_read(a->root, gitdir, file, file ? GG_WORKTREE_FILE : GG_WORKTREE_ROOT,
+    char *out = git_guard_read(a->query_root, gitdir, file, file ? GG_WORKTREE_FILE : GG_WORKTREE_ROOT,
                               &len, &status, &s->include_ms);
     if (!out) {
         if (status == 1) return true;
@@ -2774,7 +2782,7 @@ static bool capture_include_edges(const GitAdmin *a, const char *gitdir, const c
     int status = -1;
     GitGuardQuery query = lfs ? (blob ? GG_LFS_INCLUDES_BLOB : GG_LFS_INCLUDES_FILE) :
                                (file ? GG_INCLUDE_FILE : GG_INCLUDE_ROOT);
-    char *out = git_guard_read(a->root, gitdir, file, query,
+    char *out = git_guard_read(a->query_root, gitdir, file, query,
                               &len, &status, &s->include_ms);
     if (!out) {
         if (status == 1) return true; // no include directives or hook paths
@@ -2817,7 +2825,7 @@ static bool capture_include_edges(const GitAdmin *a, const char *gitdir, const c
             if (strncmp(origin, "file:", 5)) { ok = false; break; }
             const char *where = origin + 5;
             n = where[0] == '/' ? snprintf(source, sizeof source, "%s", where) :
-                                 snprintf(source, sizeof source, "%s/%s", a->root, where);
+                                 snprintf(source, sizeof source, "%s/%s", a->query_root, where);
             if (n < 0 || (size_t)n >= sizeof source) { ok = false; break; }
             char *slash = strrchr(source, '/');
             if (!slash) { ok = false; break; }
@@ -2846,7 +2854,7 @@ static bool capture_config_blob(const GitAdmin *a, const char *gitdir, const cha
     if (!id) { s->error = "out of memory"; return false; }
     size_t len = 0;
     int status = -1;
-    char *oid = git_guard_read(a->root, gitdir, spec, GG_LFS_OID, &len, &status, &s->include_ms);
+    char *oid = git_guard_read(a->query_root, gitdir, spec, GG_LFS_OID, &len, &status, &s->include_ms);
     if (!oid) {
         if (status == 1) gs_add(s, id, "absent");  // absent stage 0/path, including unborn HEAD
         else s->error = g_post_signal ? "Git capture interrupted" : "Git configuration object resolution failed or exceeded capture time budget";
@@ -2860,7 +2868,7 @@ static bool capture_config_blob(const GitAdmin *a, const char *gitdir, const cha
         free(oid); free(id); s->error = "unsupported Git configuration object identity"; return false;
     }
     oid[len - 1] = 0;
-    char *bytes = git_guard_read(a->root, gitdir, oid, GG_LFS_BLOB, &len, &status, &s->include_ms);
+    char *bytes = git_guard_read(a->query_root, gitdir, oid, GG_LFS_BLOB, &len, &status, &s->include_ms);
     if (!bytes) {
         free(oid); free(id);
         s->error = g_post_signal ? "Git capture interrupted" : "Git configuration blob capture failed or exceeded capture time budget";
@@ -2940,6 +2948,80 @@ static bool pointer_home(const char *path, const char *base, const char *expect,
     bool home = actual && expected && !strcmp(actual, expected);
     free(actual); free(expected);
     return home;
+}
+
+static void add_nested(GitAdmin *a, const char *checkout, const char *gitdir, const char *common, GuardSet *s) {
+    for (size_t i = 0; i < a->nested.n; ++i) if (!strcmp(a->nested.v[i], checkout)) return;
+    if (a->nested.n + a->gitdirs.n >= 4096) { s->error = "nested Git repository limit exceeded"; return; }
+    if (!sl_push(&a->nested, checkout) || !sl_push(&a->nested_gitdirs, gitdir) ||
+        !sl_push(&a->nested_common, common)) s->error = "out of memory";
+}
+
+// Nested repositories are discovered before their metadata is queried. Unknown gitfiles,
+// aliased administration and foreign common directories cannot silently escape the policy.
+static void discover_checkout_git(GitAdmin *a, const char *dir, const char *canonical, GuardSet *s) {
+    if (a->has_owned_admin && !strcmp(canonical, a->root)) return;
+    char gd[WFS_PATH_MAX], common[WFS_PATH_MAX];
+    if ((size_t)snprintf(gd, sizeof gd, "%s/.git", dir) >= sizeof gd) {
+        s->error = "nested Git path exceeds capture limit"; return;
+    }
+    struct stat st;
+    if (lstat(gd, &st) != 0) {
+        if (errno != ENOENT && errno != ENOTDIR) s->error = "could not inspect nested Git administration";
+        return;
+    }
+    size_t n = strlen(a->root);
+    if (strcmp(dir, canonical) || strncmp(canonical, a->root, n) || (canonical[n] && canonical[n] != '/')) {
+        s->error = "nested Git administration is aliased or outside the World"; return;
+    }
+    if (S_ISREG(st.st_mode)) {
+        bool present;
+        for (size_t i = 0; i < a->gitdirs.n; ++i)
+            if (pointer_home(gd, dir, a->gitdirs.v[i], "gitdir: ", &present, true)) return;
+        if (a->has_owned_admin) {
+            DIR *d = opendir(a->worktrees);
+            if (!d) { s->error = "could not inspect linked worktree administration"; return; }
+            bool found = false;
+            while (!s->error && !found) {
+                if (g_post_signal) { s->error = "Git capture interrupted"; break; }
+                errno = 0;
+                struct dirent *e = readdir(d);
+                if (!e) { if (errno) s->error = "could not enumerate linked worktrees"; break; }
+                if (++s->entries > 65536) { s->error = "Git linked worktree entry limit exceeded"; break; }
+                if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+                char candidate[WFS_PATH_MAX], pointer[WFS_PATH_MAX];
+                if ((size_t)snprintf(candidate, sizeof candidate, "%s/%s", a->worktrees, e->d_name) >= sizeof candidate) {
+                    s->error = "linked worktree path exceeds capture limit"; break;
+                }
+                if (!real_dir(candidate) || !pointer_home(gd, dir, candidate, "gitdir: ", &present, true)) continue;
+                if ((size_t)snprintf(pointer, sizeof pointer, "%s/commondir", candidate) >= sizeof pointer ||
+                    !pointer_home(pointer, candidate, a->common, "", &present, true) ||
+                    (size_t)snprintf(pointer, sizeof pointer, "%s/gitdir", candidate) >= sizeof pointer ||
+                    !pointer_home(pointer, candidate, gd, "", &present, true)) {
+                    s->error = "unsupported linked worktree registration"; break;
+                }
+                add_nested(a, canonical, candidate, a->common, s);
+                found = !s->error;
+            }
+            closedir(d);
+            if (found || s->error) return;
+        }
+        s->error = "unsupported nested Git administration pointer"; return;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        s->error = "nested Git administration is aliased or outside the World"; return;
+    }
+    if (!looks_like_gitdir(a, gd) || a->incomplete) {
+        s->error = "incomplete nested Git administration"; return;
+    }
+    if ((size_t)snprintf(common, sizeof common, "%s/commondir", gd) >= sizeof common) {
+        s->error = "nested Git path exceeds capture limit"; return;
+    }
+    bool present;
+    if (!pointer_home(common, gd, gd, "", &present, true) && present) {
+        s->error = "unsupported nested Git common directory"; return;
+    }
+    add_nested(a, canonical, gd, gd, s);
 }
 
 // Observational capture keeps owned records available for repair reports, but must
@@ -3077,6 +3159,12 @@ static bool note_hooks_path(GitAdmin *a, const char *checkout, const char *v, ch
     size_t n = strlen(a->root), m = strlen(admin);
     bool in_tree = !strncmp(real, a->root, n) && (real[n] == '/' || !real[n]);
     bool in_admin = !strncmp(real, admin, m) && (real[m] == '/' || !real[m]);
+    for (size_t i = 0; i < a->nested.n && !in_admin; ++i) {
+        char gd[WFS_PATH_MAX];
+        snprintf(gd, sizeof gd, "%s", a->nested_gitdirs.v[i]);
+        size_t gn = strlen(gd);
+        in_admin = !strncmp(real, gd, gn) && (!real[gn] || real[gn] == '/');
+    }
     *protect = !in_tree || in_admin;
     if (*protect) {
         // Pin raw traversal prefixes too: canonicalization erases `a` from a/../hooks,
@@ -3104,7 +3192,8 @@ static bool note_hooks_path(GitAdmin *a, const char *checkout, const char *v, ch
 }
 
 static bool capture_gitmodules(const GitAdmin *a, const char *gitdir, const char *checkout,
-                               GuardSet *s, HookCandidates *hooks) {
+                               GuardSet *s, HookCandidates *hooks, bool bare = false) {
+    if (!bare) {
     if (++s->entries > 65536) { s->error = "Git configuration entry limit exceeded"; return false; }
     char path[WFS_PATH_MAX], id[WFS_PATH_MAX + 40], fp[64];
     if (!attributes_path(checkout, ".gitmodules", path, sizeof path) ||
@@ -3123,13 +3212,14 @@ static bool capture_gitmodules(const GitAdmin *a, const char *gitdir, const char
         else gs_add(s, id, fp);
     }
     else if (!s->error) s->error = "could not fingerprint Git submodule configuration";
+    }
     return !s->error && capture_config_blob(a, gitdir, ":.gitmodules", s, hooks, 'n') &&
            capture_config_blob(a, gitdir, "HEAD:.gitmodules", s, hooks, 'n');
 }
 
 // Conditions and value precedence may change later. Conservatively observe the union
 // of candidate checkout roots and hook/attribute values, plus the Gitdir used by receive hooks.
-static bool capture_include_hooks(GitAdmin *a, const char *gitdir, const char *checkout, GuardSet *s) {
+static bool capture_include_hooks(GitAdmin *a, const char *gitdir, const char *checkout, GuardSet *s, bool bare = false) {
     if (!gitdir) { s->error = "could not locate Git worktree configuration"; return false; }
     HookCandidates hooks = {};
     bool ok = hook_candidate_add(&hooks.bases, checkout, s) &&
@@ -3147,10 +3237,10 @@ static bool capture_include_hooks(GitAdmin *a, const char *gitdir, const char *c
     }
     // LFS ignores core.hooksPath/core.attributesFile/core.worktree here. Traverse only their
     // includes, rather than turning ignored values into new sandbox restrictions.
-    if (ok) ok = capture_include_target(a, gitdir, lfs_config, s, &hooks, 0, 'l', true);
+    if (ok && !bare) ok = capture_include_target(a, gitdir, lfs_config, s, &hooks, 0, 'l', true);
     if (ok) ok = capture_config_blob(a, gitdir, ":.lfsconfig", s, &hooks);
     if (ok) ok = capture_config_blob(a, gitdir, "HEAD:.lfsconfig", s, &hooks);
-    if (ok) ok = capture_gitmodules(a, gitdir, checkout, s, &hooks);
+    if (ok) ok = capture_gitmodules(a, gitdir, checkout, s, &hooks, bare);
     for (size_t i = 0; ok && i < hooks.values.n; ++i) {
         // Absolute hooks do not depend on any candidate worktree.
         size_t bases = hooks.values.v[i][0] == '/' ? 1 : hooks.bases.n;
@@ -3206,7 +3296,7 @@ static bool plan_submodules(GitAdmin *a, const char *gitdir, const char *checkou
     if (!S_ISREG(st.st_mode)) return false;
     size_t len = 0;
     int status;
-    char *out = git_guard_read(a->root, gitdir, file, GG_MODULES, &len, &status);
+    char *out = git_guard_read(a->query_root, gitdir, file, GG_MODULES, &len, &status);
     if (!out) return false;
     bool ok = true;
     for (size_t i = 0; i < len && ok;) {
@@ -3324,10 +3414,11 @@ static bool plans_safe(const GitAdmin *a) {
 // (`active`), as Git in the World reads it, without trusting the World's `.git` file: a command
 // that replaced it is reported, not followed. The same capture feeds the sandbox rules
 // (hooks_paths) and the before/after report.
-static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, const char *label, GuardSet *s, bool require_home) {
+static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, const char *label, GuardSet *s, bool require_home, const char *nested_checkout = NULL) {
+    snprintf(a->query_root, sizeof a->query_root, "%s", nested_checkout ? nested_checkout : a->root);
     size_t len = 0;
     int status = -1;
-    char *out = git_guard_read(a->root, gitdir, NULL, GG_LIST, &len, &status);
+    char *out = git_guard_read(a->query_root, gitdir, NULL, GG_LIST, &len, &status);
     if (!out) return false;
     char checkout[WFS_PATH_MAX], hooks_path[WFS_PATH_MAX] = "";
     bool protect_hooks = false;
@@ -3362,7 +3453,18 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
     if (s->error) return false;
     // Git's setup rules decide the effective checkout, including linked-worktree
     // configuration semantics; the last config-list value alone is insufficient.
-    char *worktree = git_guard_read(a->root, gitdir, NULL, GG_TOPLEVEL, &len, &status);
+    bool bare = false;
+    if (nested_checkout) {
+        char *value = git_guard_read(a->query_root, gitdir, NULL, GG_BARE, &len, &status);
+        if (!value) return false;
+        bare = !strcmp(value, "true\n");
+        bool valid = bare || !strcmp(value, "false\n");
+        free(value);
+        if (!valid) return false;
+    }
+    if (bare) snprintf(checkout, sizeof checkout, "%s", gitdir);
+    else {
+    char *worktree = git_guard_read(a->query_root, gitdir, NULL, GG_TOPLEVEL, &len, &status);
     if (!worktree || !len || worktree[len - 1] != '\n' || strlen(worktree) != len ||
         len >= sizeof checkout || worktree[0] != '/') {
         free(worktree); return false;
@@ -3370,14 +3472,15 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
     worktree[len - 1] = 0;
     snprintf(checkout, sizeof checkout, "%s", worktree);
     free(worktree);
-    if (!capture_include_hooks(a, gitdir, checkout, s)) return false;
+    }
+    if (!capture_include_hooks(a, gitdir, checkout, s, bare)) return false;
 #ifdef __APPLE__
-    if (require_home && !plan_submodules(a, gitdir, checkout, s)) {
+    if (require_home && !nested_checkout && !plan_submodules(a, gitdir, checkout, s)) {
         if (!s->error) s->error = "could not safely plan declared submodule administration";
         return false;
     }
 #endif
-    if (require_home) {
+    if (require_home && !bare && (!nested_checkout || strcmp(checkout, nested_checkout))) {
         char pointer[WFS_PATH_MAX + 16];
         snprintf(pointer, sizeof pointer, "%s/.git", checkout);
         // A redirected core.worktree may legitimately have no .git entry. An existing
@@ -3386,7 +3489,7 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
     }
     // Let Git expand ~user and %(prefix), and select the effective value in every scope.
     // Exit 1 means no value; a parse, expansion or capture failure must invalidate capture.
-    char *hooks_value = git_guard_read(a->root, gitdir, "core.hooksPath", GG_PATH, &len, &status);
+    char *hooks_value = git_guard_read(a->query_root, gitdir, "core.hooksPath", GG_PATH, &len, &status);
     if (!hooks_value && status != 1) return false;
     if (hooks_value) {
         if (!len || hooks_value[len - 1] != 0 || strlen(hooks_value) + 1 != len) {
@@ -3405,7 +3508,7 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
     const char *attribute_vars[] = {"GIT_ATTR_GLOBAL", "GIT_ATTR_SYSTEM"};
     for (const char *var : attribute_vars) {
         if (s->error) return false;
-        char *value = git_guard_read(a->root, gitdir, var, GG_VAR, &len, &status);
+        char *value = git_guard_read(a->query_root, gitdir, var, GG_VAR, &len, &status);
         if (!value) {
             if (status == 1) continue;  // absent or explicitly disabled
             return false;
@@ -3421,10 +3524,13 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
         free(value);
     }
     if (s->error) return false;
-    capture_checkout_attributes(a, checkout, s);
+    if (!bare) capture_checkout_attributes(a, checkout, s);
     if (s->error) return false;
     snprintf(p, sizeof p, "%s/hooks", common);
     capture_hooks(a, p, s);
+    if (nested_checkout) {
+        if (!sl_push(&a->hooks_paths, p) || !sl_push(&a->hook_locator_pins, gitdir)) s->error = "out of memory";
+    }
     if (s->error) return false;
     if (hooks_path[0]) {
         capture_hooks(a, hooks_path, s);
@@ -3435,7 +3541,7 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
         snprintf(p, sizeof p, "%s/.git", a->root);
         capture_pointer(a, p, a->root, gitdir ? gitdir : a->active, "gitdir: ", s);
     }
-    if (checkout[0]) {
+    if (checkout[0] && !nested_checkout) {
         snprintf(p, sizeof p, "%s/.git", checkout);
         capture_pointer(a, p, checkout, gitdir ? gitdir : a->active, "gitdir: ", s);
     }
@@ -3447,6 +3553,10 @@ static bool guard_capture(GitAdmin *a, GuardSet *s, bool require_home = false) {
     if (a->incomplete) { s->error = "incomplete Git administration scan (limit or read error)"; return false; }
     s->bytes_left = 64u << 20;
     s->include_ms = 5000;
+    snprintf(a->query_root, sizeof a->query_root, "%s", a->root);
+    capture_checkout_attributes(a, a->root, s);
+    if (s->error) return false;
+    if (a->has_owned_admin) {
     const char *self = real_dir(a->active) ? a->active : NULL;
     if (!require_home) {
         // Check mandatory entry points before queries: redirection can also make a
@@ -3487,6 +3597,19 @@ static bool guard_capture(GitAdmin *a, GuardSet *s, bool require_home = false) {
             if (s->error) return false;
         }
         if (!capture_repo(a, g, g, label, s, require_home)) return false;
+    }
+    }
+    for (size_t i = 0; i < a->nested.n; ++i) {
+        char gd[WFS_PATH_MAX], label[WFS_PATH_MAX + 16];
+        snprintf(gd, sizeof gd, "%s", a->nested_gitdirs.v[i]);
+        snprintf(label, sizeof label, "nested %s", rel_to(a, a->nested.v[i]));
+        if (!capture_repo(a, gd, a->nested_common.v[i], label, s, require_home, a->nested.v[i])) return false;
+        char pointer[WFS_PATH_MAX];
+        snprintf(pointer, sizeof pointer, "%s/commondir", gd);
+        capture_pointer(a, pointer, gd, a->nested_common.v[i], "", s);
+        snprintf(pointer, sizeof pointer, "%s/.git", a->nested.v[i]);
+        if (!real_dir(pointer)) capture_pointer(a, pointer, a->nested.v[i], gd, "gitdir: ", s);
+        if (s->error) return false;
     }
 #ifdef __APPLE__
     if (require_home && !plans_safe(a)) s->error = "declared submodule administration overlaps Git hooks";
@@ -3780,6 +3903,7 @@ static bool sb_git_admin(FILE *f, const GitAdmin *a) {
     fputs("\n; --- denied: the World's Git hooks, which run later outside any sandbox, and every\n"
           "; entry that tells Git where a repository (and so its hooks) is ---\n", f);
     char p[WFS_PATH_MAX];
+    if (a->has_owned_admin) {
     snprintf(p, sizeof p, "%s/.git", a->root);
     sb_literal(f, "deny file-write*", p);
     snprintf(p, sizeof p, "%s/.world-git", a->root);
@@ -3793,6 +3917,7 @@ static bool sb_git_admin(FILE *f, const GitAdmin *a) {
     snprintf(p, sizeof p, "%s/hooks", a->common);
     sb_subpath(f, "deny file-write*", p);
     if (!sb_module_hooks(f, a->modules)) return false;
+    }
     // The regex cannot tell a hooks directory from a submodule whose name has a `hooks`
     // component (modules/tools/hooks). Give such an existing repository back, parents first,
     // then deny its own hooks below like every other one.
@@ -3844,6 +3969,13 @@ static bool sb_git_admin(FILE *f, const GitAdmin *a) {
         snprintf(p, sizeof p, "%s/hooks", a->gitdirs.v[i]);
         sb_subpath(f, "deny file-write*", p);
     }
+    for (size_t i = 0; i < a->nested.n; ++i) {
+        snprintf(p, sizeof p, "%s/commondir", a->nested_gitdirs.v[i]);
+        sb_literal(f, "deny file-write*", p);
+        snprintf(p, sizeof p, "%s/.git", a->nested.v[i]);
+        sb_literal(f, "deny file-write*", p);
+        if (!sb_hook_ancestors(f, p)) return false;
+    }
     // Repository exceptions above must not reopen an effective hooksPath nested within
     // a repository whose name contains `hooks`. Keep these denies after every allow.
     for (size_t i = 0; i < a->hooks_paths.n; ++i) {
@@ -3854,8 +3986,8 @@ static bool sb_git_admin(FILE *f, const GitAdmin *a) {
         if (!sb_hook_ancestors(f, a->hook_locator_pins.v[i], true)) return false;
     // Default hooks need their World and outer ancestors pinned too. Only existing
     // repository roots are included here; planned clone namespaces retain their policy.
-    if ((size_t)snprintf(p, sizeof p, "%s/hooks", a->common) >= sizeof p ||
-        !sb_hook_ancestors(f, p)) return false;
+    if (a->has_owned_admin && ((size_t)snprintf(p, sizeof p, "%s/hooks", a->common) >= sizeof p ||
+        !sb_hook_ancestors(f, p))) return false;
     for (size_t i = 0; i < a->gitdirs.n; ++i) {
         if ((size_t)snprintf(p, sizeof p, "%s/hooks", a->gitdirs.v[i]) >= sizeof p ||
             !sb_hook_ancestors(f, p)) return false;
@@ -3947,6 +4079,7 @@ static char **linux_git_mounts(const GitAdmin *a, StrList *keep) {
         if ((dir ? real_dir(path) : real_file(path)) && (size_t)snprintf(e, sizeof e, "%c%s", ro ? 'r' : 'w', path) < sizeof e)
             if (!sl_push(keep, e)) complete = false;
     };
+    if (a->has_owned_admin) {
     snprintf(p, sizeof p, "%s/.git", a->root); add(p, true, false);
     snprintf(p, sizeof p, "%s/.world-git", a->root); add(p, false, true);
     add(a->common, false, true);
@@ -3954,6 +4087,7 @@ static char **linux_git_mounts(const GitAdmin *a, StrList *keep) {
     add(a->active, false, true);
     snprintf(p, sizeof p, "%s/commondir", a->active); add(p, true, false);
     snprintf(p, sizeof p, "%s/hooks", a->common); add(p, true, true);
+    }
     // Only the World is host-writable. Never bind external ancestors writable: they
     // are already read-only (or hidden by an ephemeral tmpfs) in the base policy.
     size_t rn = strlen(a->root);
@@ -3980,6 +4114,13 @@ static char **linux_git_mounts(const GitAdmin *a, StrList *keep) {
     for (size_t i = 0; i < a->gitdirs.n; ++i) {
         snprintf(p, sizeof p, "%s/hooks", a->gitdirs.v[i]);
         add(p, true, true);
+    }
+    for (size_t i = 0; i < a->nested.n; ++i) {
+        snprintf(p, sizeof p, "%s/commondir", a->nested_gitdirs.v[i]);
+        add(p, true, false);
+        snprintf(p, sizeof p, "%s/.git", a->nested.v[i]);
+        add(p, true, false);
+        pin_ancestors(p, false);
     }
     if (!complete) return NULL;
     size_t n = keep->n;
@@ -4247,7 +4388,7 @@ static int cmd_exec(wfs_store *s, int argc, char **argv) {
         bool found = git_admin_find(id.path, &now);
         if (g_post_signal) {
             fputs("world: note: Git administration inspection interrupted after the command\n", stderr);
-        } else if (found && now.incomplete) {
+        } else if (found && (now.incomplete || (admin.has_owned_admin && !now.has_owned_admin))) {
             fprintf(stderr, "world: WARNING: exec left W%llu's Git administration replaced or incomplete; "
                     "changed Git hooks and settings could not be inspected\n", (unsigned long long)w);
         } else if (found) {

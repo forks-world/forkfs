@@ -83,6 +83,7 @@ int main() {
         "uploadpack.hiderefs", "receive.hiderefs", "transfer.hiderefs",
         "UPLOADPACK.HIDEREFS", "RECEIVE.HIDEREFS", "TRANSFER.HIDEREFS",
         "receive.shallowupdate", "RECEIVE.SHALLOWUPDATE",
+        "receive.advertiseatomic", "RECEIVE.ADVERTISEATOMIC", "receive.advertisepushoptions", "RECEIVE.ADVERTISEPUSHOPTIONS",
         "receive.fsckobjects", "RECEIVE.FSCKOBJECTS", "receive.maxinputsize", "RECEIVE.MAXINPUTSIZE",
         "receive.denydeletecurrent", "RECEIVE.DENYDELETECURRENT", "core.usereplacerefs", "CORE.USEREPLACEREFS",
         "difftool.prompt", "mergetool.prompt", "DIFFTOOL.PROMPT", "MERGETOOL.PROMPT",
@@ -174,6 +175,12 @@ int main() {
     CHECK(guard_key_runs_command("receive.shallowupdate", "true"));
     CHECK(guard_key_runs_command("receive.shallowupdate", "false"));
     CHECK(guard_key_runs_command("receive.shallowupdate", NULL));
+    const char *advertisement_keys[] = {"receive.advertiseatomic", "receive.advertisepushoptions"};
+    for (const char *key : advertisement_keys) {
+        CHECK(guard_key_runs_command(key, "true"));
+        CHECK(guard_key_runs_command(key, "false"));
+        CHECK(guard_key_runs_command(key, NULL));
+    }
     CHECK(guard_key_runs_command("receive.fsckobjects", "true"));
     CHECK(guard_key_runs_command("receive.fsckobjects", "false"));
     CHECK(guard_key_runs_command("receive.fsckobjects", NULL));
@@ -276,6 +283,7 @@ int main() {
         "uploadpack.custom.hiderefs", "receive.custom.hiderefs", "transfer.custom.hiderefs",
         "uploadpack.hiderefsextra", "receive.hiderefsextra", "transfer.hiderefsextra",
         "receive.custom.fsckobjects", "receive.custom.maxinputsize", "receive.fsckobjectsextra", "receive.maxinputsizeextra",
+        "receive.custom.advertiseatomic", "receive.custom.advertisepushoptions", "receive.advertiseatomicextra", "receive.advertisepushoptionsextra",
         "receive.custom.shallowupdate", "receive.shallowupdateextra",
         "receive.custom.denydeletecurrent", "receive.denydeletecurrentextra",
         "core.custom.usereplacerefs", "core.usereplacerefsextra",
@@ -287,7 +295,7 @@ int main() {
         "remote.prune", "remote.prunetags", "remote.origin.prunetagsExtra",
         "remote.skipdefaultupdate", "remote.skipfetchall", "remote.origin.skipfetch",
         "remote.tagopt", "remote.origin.tagoptextra", "remote.fetch", "remote.origin.fetchextra", "user.email", "user.name", "remote.origin.name", "url.insteadof", "url.pushinsteadof",
-        "pull.custom.twohead", "pull.custom.octopus", "receive.custom.procreceiverefs", "receive.advertisepushoptions", "branch.remote", "branch.pushremote", "branch.mergeoptions", "remote.origin.pushdefault",
+        "pull.custom.twohead", "pull.custom.octopus", "receive.custom.procreceiverefs", "branch.remote", "branch.pushremote", "branch.mergeoptions", "remote.origin.pushdefault",
         "core.bare", "tar.command", "tar.remote", "uploadarchive.custom.allowunreachable",
         "gc.custom.recentobjectshook", "gc.pruneexpire", "core.editorx", "core.custom.attributesfile", "filter.clean", "diff.command", "merge.driver", "merge.recursive", "merge.custom.default", "merge.custom.renormalize", "core.x.hookspath",
         "fetch.custom.fsckobjects", "transfer.custom.fsckobjects", "fetch.fsckobjectsextra",
