@@ -16,7 +16,7 @@ jobs:
   release:
     name: Release (macOS arm64)
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Check out source
         uses: actions/checkout@v7.0.1

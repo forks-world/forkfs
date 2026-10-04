@@ -225,6 +225,345 @@ Worlds forked or checkpointed from a World keep its hooks, since its whole `.wor
 World requires the same of a relative `core.hooksPath` set in it -- committed, nothing pending
 inside -- even without `--with-hooks`.
 
+### Running agents with `world exec`
+
+A World's Git administration, `.world-git/repo.git`, lives inside the World, and `world exec`
+lets the command write the World. Without more, an agent could plant a hook, `core.hooksPath`,
+`core.fsmonitor`, a filter, `core.sshCommand` or a credential helper there that runs later,
+**outside any sandbox**, the first time you run Git in the World yourself. (Codex's own sandbox
+has the same gap for this layout: [openai/codex#49303](https://github.com/openai/codex/issues/49303).)
+So `world exec` does two things.
+
+**Denied inside a sandboxed exec** (writes only; Git still reads and runs the hooks there):
+
+- `.world-git/repo.git/hooks` and everything below it, the directory entry included, so it
+  cannot be replaced, removed or renamed away;
+- the `hooks` directory of every submodule repository under
+  `.world-git/repo.git/worktrees/active/modules/` (nested ones too). On macOS this is a
+  seatbelt regex, so a submodule that `git submodule update --init` clones *during* the exec
+  is covered as well: its clone may create `hooks` (as a directory, not a symlink) and Git's
+  `*.sample` templates in it, which Git never runs, and nothing else (seatbelt cannot tell
+  that `mkdir` from renaming a prepared directory into place, so a *new* repository's hooks
+  directory can still arrive that way; the report below lists what it contains). Existing
+  `.gitmodules` declarations are read with a bounded, confined `git config --no-includes`
+  query before sandboxed exec on macOS, so slashed names containing `hooks` can initialize.
+  Every parsed declaration record counts toward the shared 65536-entry capture limit.
+  Names must be relative with no empty, `.` or `..` components; overlapping hook namespaces
+  are refused. Namespace prefixes immediately before a `hooks` component must have neither
+  `HEAD` nor `refs`, and those markers remain denied so that prefix cannot become a repository
+  or a linked-worktree common directory. Ordinary names such as `refs` and `HEAD` stay valid
+  when they do not conflict with a required reservation. Exec creates missing locator
+  directories for hook-name exceptions under its lock before sandboxing,
+  then pins them without a create exception; empty namespaces can remain after a failed exec.
+  Planned repository roots permit directory creation but reject symlinks, subject to the
+  same directory-create/rename limitation above. Newly introduced names
+  containing `hooks` remain denied until the next exec;
+- the directory each repository's effective `core.hooksPath` names (the World's and every
+  submodule's, a relative value resolved from that repository's checkout as Git does), when
+  that is outside the tree (a global `~/.githooks`, a shared directory) or inside
+  `.world-git`; its hooks are also included in the report below. This protection applies
+  even inside a submodule whose administration path contains a `hooks` name component;
+- what tells Git where those repositories are: the World's `.git` file,
+  `.world-git/repo.git/worktrees/active/commondir`, and the directory entries on the way to
+  each repository (`.world-git`, `repo.git`, `worktrees`, `active`, `modules`, each existing
+  submodule repository and the directories of a slashed submodule name), which cannot be
+  renamed or removed. Operations that move them (`git worktree repair`, `git submodule
+  absorbgitdirs`) fail inside the exec; run them outside.
+
+On Linux, existing intermediate directories leading to protected hooks inside the World are
+bound onto themselves so they cannot be renamed away. Existing raw traversal components
+cancelled by `..` are pinned too; writable sibling contents remain available. These writable
+locator binds never extend outside the World, where the base policy is already read-only or
+uses an ephemeral temporary filesystem. Missing directories retain the Linux limitation below:
+only directories present when the sandbox starts can be bound.
+
+On macOS, every protected hook directory also pins its ancestor directory entries, including
+ancestors outside the World. Raw traversal components discarded by `..` are pinned too, so
+renaming an ancestor or replacing a traversed directory with a symlink cannot expose the hooks
+through another path. These are entry restrictions, so sibling files remain writable. Missing
+ancestors have no directory-creation exception; create the intended directory outside exec.
+Default-hook ancestor pins apply only to existing repositories and preserve planned submodule
+initialization described above.
+
+A tool that installs hooks (`git lfs install`, `pre-commit install`, `husky` writing to the
+default hooks directory) fails inside a sandboxed exec for the same reason; run it outside.
+A repository-local `core.hooksPath` pointing into the tree (husky's `.husky`) is **not**
+denied: project hooks remain editable. Their changes are reported even when ignored or
+untracked, since Git status and the review diff may hide them. Git's configuration (`config`, `config.worktree`) is
+not denied either: `git remote add`, `git push -u`, `git branch --set-upstream-to` and
+`git config` legitimately write it. Hence the second part.
+
+**Reported after every exec** (sandboxed or `--no-sandbox`, whatever the command's exit
+status, which `world exec` keeps). Before the command starts, exec captures each repository
+-- the World and every submodule repository present -- whole, and the same capture decides
+the sandbox rules above:
+
+Before sandboxed exec, the fixed administration locators, including `repo.git/worktrees`,
+must be real directories rather than symlinks. The World's `.git` and active worktree `commondir` must be regular,
+complete pointers to its own administration, each with exactly one hardlink. Writable aliases
+to a pointer would otherwise evade pathname protection. Existing `.git` entries in other effective
+checkouts, and existing submodule `commondir` pointers, must likewise name the administration
+being guarded. Missing optional checkout pointers are allowed (for example a redirected
+`core.worktree` without `.git`). Pointer parsing reads the complete bounded file, rejects NUL
+or oversized content, trims only trailing CR/LF and compares canonical targets. Preexisting
+redirected, symlinked or directory pointers refuse sandboxed exec; `--no-sandbox` retains
+observational reporting so a command can repair them. When a pointer is already redirected,
+missing or unsupported, `--no-sandbox` emits an explicit coverage warning before running the
+command and again after inspection if the gap remains. It compares the owned administration
+and pointer records, but does not claim to inspect all hooks or settings of a redirected
+repository. Missing optional checkout or submodule `commondir` pointers do not create this
+warning.
+
+- its effective configuration, `git config --list --includes --show-scope` read through its
+  own administration: system, global, local, worktree, inherited command scope and included files -- the sandbox does
+  not stop writes to `~/.gitconfig`, and `--no-sandbox` stops nothing. Every scope is kept
+  per repository, since an `includeIf "gitdir:..."` or `"onbranch:..."` can give one
+  submodule settings the World does not have; a change to a global or system entry that is
+  identical in the World's own listing is reported once, under the World;
+- each repository's `config.worktree`, even while `extensions.worktreeConfig` is disabled,
+  including its dormant include graph. Missing files are recorded; later creation, removal
+  and content edits are reported under the same regular-file and resource limits. Absent
+  worktree/LFS configuration files do not consume the 256-target include budget; present ones do;
+- every include target declared by effective configuration, including inactive conditional
+  includes and their nested targets. Git expands paths; relative targets retain the including
+  file's origin directory. Missing files are recorded, so creating a dormant payload is reported.
+  Existing targets must be regular files; symlinks, special files and unsupported origins make
+  capture unavailable. Content fingerprints also report benign changes in these files; conditions
+  do not have to become active during exec. Traversal is limited to 32 levels, 256 targets and
+  256 repository/origin contexts, shares the 64 MiB content/65536-entry budgets, and has five seconds of
+  aggregate confined query time per capture. Each context uses a typed include/hooks-path
+  query and a raw `core.worktree` query; Git treats tilde and `%(prefix)` literally in
+  `core.worktree`. These files remain writable;
+- each checkout's `.lfsconfig`, including ignored/untracked files, and its index and HEAD
+  blob sources (LFS falls back to them when the worktree file is absent). Added, removed and
+  changed bytes are reported, including benign edits and dormant fallback changes. These
+  files remain writable. Missing sources are recorded; nonregular files, unsupported object
+  reads and relative includes from blobs make capture unavailable. Includes are traversed
+  with the same graph limits, but LFS-ignored `core.hooksPath`/`core.worktree` settings do not
+  create hook restrictions. Raw blob bytes share the 64 MiB budget and confined queries share
+  the include graph's five-second budget. No LFS command is executed; object queries disable
+  fsmonitor and lazy object fetching, while configuration snapshots retain the real settings;
+- each checkout's `.gitmodules` and its index/HEAD fallback blobs: raw content changes can
+  select submodule helpers or activate retained commands. Missing sources are recorded;
+  symlinked/nonregular files or unreadable blobs invalidate capture. Unlike LFS configuration,
+  `.gitmodules` includes are not traversed. The same content, entry and query-time budgets
+  apply, and object queries disable fsmonitor and lazy fetching. Files remain writable;
+- index `.gitattributes` blobs at every path, including sparse-index entries and conflict
+  stages: Git can fall back to stage zero or stage two when working-tree attributes are absent.
+  The guard expands the index, records each path/stage/mode and hashes actual blob bytes
+  (including replacement-object content). These confined queries disable fsmonitor and lazy
+  fetching and share the existing entry, content and query-time budgets; unavailable objects
+  invalidate capture instead of silently omitting fallback attributes. No filters are run;
+- configured HTTP TLS CA files/directories (`http.sslCAInfo`, `http.sslCAPath`, and
+  `http.proxySSLCAInfo`, including URL scopes and dormant includes): changes can let requests
+  reach retained credential helpers. CA directories record presence, member additions/removals,
+  and regular bytes recursively with the shared content/entry budgets and depth limit 32.
+  File symlinks record both alias and resolved regular-target bytes, including external targets;
+  final-component directory symlinks, dangling/nonregular targets and colon-separated CAPath
+  lists invalidate capture explicitly. Leading parent directories are resolved before traversal. Git expands CAInfo/CAPath values as paths but keeps proxySSLCAInfo raw;
+  relative values use candidate execution bases. Empty paths and file `/dev/null` are omitted
+  from capture. Stores remain writable; no TLS request or credential helper is invoked;
+- `gpg.ssh.allowedSignersFile` and `gpg.ssh.revocationFile` trust sources, including dormant
+  configuration: regular contents and absent files are recorded because signature acceptance
+  can enable an operation to reach retained hooks. Typed path expansion and candidate execution
+  bases follow the same bounded capture as skip lists, but spaces, commas and `|` are valid
+  SSH filenames. Empty values and `/dev/null` are omitted from file capture; final symlinks/nonregular sources
+  make capture unavailable. These files stay writable and no signature verifier is executed;
+- `receive.fsck.skipList` and `fetch.fsck.skipList` files, including dormant include values:
+  regular contents and absent sources are captured without running object validation. Relative
+  paths are considered from checkout, Gitdir, common-repository and dormant worktree bases;
+  typed Git path expansion is used, not the including file's directory. These writable files
+  share existing content/entry budgets and path deduplication. Nonregular sources and expanded
+  paths containing spaces, commas or `|` invalidate capture because Git's fsck option parser
+  splits those delimiters. `/dev/null` is treated as an empty source;
+- each repository's private `info/attributes`, effective user/system attributes files, and
+  root/nested working-tree `.gitattributes`, including ignored and untracked files:
+  changes can activate an unchanged filter
+  definition without altering tracked project files. Regular files are hashed in full within
+  the shared capture budget, including edits through hardlink aliases. Symlinked or other
+  nonregular attribute files invalidate capture rather than silently omitting their content.
+  Git resolves `core.attributesFile`, its XDG default and the system attributes path per
+  repository; `GIT_ATTR_NOSYSTEM` is honored and an effective `/dev/null` source is disabled.
+  Dormant `core.attributesFile` values in conditional includes and `config.worktree` are
+  also captured, using the candidate checkout/Gitdir and raw `core.worktree` bases rather
+  than the include file's directory. Empty values and `/dev/null` are disabled. Candidate
+  pairs share the entry limit, files share the byte budget, and these paths remain writable.
+  LFS-only configuration does not contribute ignored core settings.
+  Shared paths are captured and reported once. Checkout discovery follows directory symlinks
+  (including external targets), deduplicates directory identities to terminate cycles, and
+  reports alias changes as well as attribute bytes. It excludes `.git` entries and the literal
+  owned administration paths, but observes project aliases into those paths. Discovery shares
+  the 65,536-entry budget and has a depth limit of 32; unreadable trees or exceeded limits
+  invalidate capture. These working-tree files remain writable;
+- the hooks Git could run: name, mode and content of entries in its hooks directory and
+  every effective or dormant `core.hooksPath`, recursively including support files that an
+  unchanged wrapper can source. Only direct regular `*.sample` templates are excluded;
+  nested `.sample` files and sample-named directories are captured. This includes paths inside the
+  project tree. Dormant paths come from the include graph and `config.worktree`, without
+  requiring their conditions to become active. Relative paths are checked against each
+  repository's effective checkout, every candidate `core.worktree`, and its Git directory
+  (receive hooks run there), never against the including file's directory. The conservative
+  combinations share the 65536-entry budget; resolved hook directories are captured once.
+  The same protection rules apply to dormant paths: administration/external directories
+  are protected, project directories remain editable and their hook changes are reported;
+- the entries that tell Git where it is -- the World's `.git` and `commondir`, each
+  submodule checkout's `.git` -- by entry type (file, directory, symlink, missing) and
+  content, and whether a file still names its own repository.
+
+It captures them again after the command and prints one line per difference to stderr.
+Configuration comparison preserves repository-label/key identity boundaries and each value boundary and distinguishes an implicit boolean
+from an explicitly empty value. Reports show these as `(implicit)` and `""`; control bytes and
+literal backslashes are escaped rather than interpreted as value boundaries or terminal controls. A
+`.git` replaced by another type (`git init` over it, a symlink) or rewritten is reported as a
+change, a removed one (`submodule deinit`, `git rm`) as a removal; only a submodule checkout's
+`.git` that appears naming its own repository (`submodule update --init`) is not reported:
+
+```
+world: WARNING: exec changed a Git setting that runs commands: local core.fsmonitor: (unset) -> touch /tmp/x
+world: WARNING: exec changed a Git setting that runs commands: submodule lib-module local credential.helper: (unset) -> store
+world: WARNING: exec added a Git hook: .world-git/repo.git/worktrees/active/modules/vendor/lib/hooks/post-checkout
+world: WARNING: exec changed Git repository attributes: .world-git/repo.git/info/attributes (can activate configured filters)
+world: WARNING: exec changed where Git finds a repository: .git (a file naming its repository -> a directory)
+world: WARNING: exec removed libs/lib/.git, which told Git where a repository is
+```
+
+The settings watched (Git's lowercase key names; `*` is any subsection): `core.hookspath`,
+`core.worktree` (checkout and relative-hook redirection), `core.fsmonitor`, `core.sshcommand`, `core.editor`, `core.pager`, `core.askpass`,
+`http.sslcainfo|sslcapath|proxysslcainfo` (base or URL-scoped trust-source selectors),
+`http.sslverify` (base or URL-scoped; disabling verification can let a request reach retained credential helpers),
+`filter.*.required` (disabling a failing mandatory filter can let checkout reach retained hooks),
+`attr.tree`, `core.attributesfile` and `core.usereplacerefs` (can activate configured filters, including through replacement-tree attributes), `core.gitproxy`, `core.alternaterefscommand`, `sequence.editor`, `credential.helper` and
+`credential.*.helper`, `credential.interactive` (enables configured askpass),
+`http[.*].proactiveauth` (can proactively invoke an unchanged credential helper), `filter.*.clean|smudge|process`, `diff.external`,
+`diff.*.command|textconv`, `diff.tool|guitool`, `merge.tool|guitool`, `difftool.guidefault`, `mergetool.guidefault` (select configured commands), `difftool.prompt` and `mergetool.prompt` (can launch retained tools without waiting for input), `merge.*.driver|recursive`, `merge.default` (including selection of unchanged merge drivers),
+`merge.renormalize` (can activate configured conversion filters),
+`am.threeway` (can reach a retained merge driver when applying a patch),
+`merge.defaulttoupstream`, `merge.ff`, `pull.ff` (can enable previously refused merges using retained drivers),
+`checkout.guess`, `checkout.defaultremote`, `pull.rebase`, `branch.*.rebase` (can activate retained checkout/rewrite hooks),
+`rebase.autostash`, `pull.autostash`, `merge.autostash` (can bypass dirty-worktree refusals and activate retained hooks/drivers), `mergetool.*.cmd|path`, `difftool.*.cmd|path`,
+`commit.gpgsign`, `tag.gpgsign`, `tag.forcesignannotated`, `push.gpgsign` (enable signing),
+`log.showsignature`, `merge.verifysignatures`, `rebase.instructionformat`, `format.pretty`,
+`pretty.*`, `format.commitlistformat`, `format.coverletter` (can activate signature verification),
+`branch.sort` and `tag.sort` when selecting a `signature` atom (ordinary name/version sorts stay quiet),
+`user.signingkey` (removal can activate the configured SSH default-key command),
+`http[.*].followredirects` (can reach a retained credential helper after redirection),
+`http[.*].sslcert|proxysslcert|sslcertpasswordprotected|proxysslcertpasswordprotected` (can activate certificate password helpers),
+`http[.*].proxy`, `remote.*.proxy` (can activate an existing proxy password helper),
+`gpg.format` (selects the signing program), `gpg.program` and `gpg.*.program`, `gpg[.*].defaultkeycommand`, `gc.recentobjectshook`,
+`gc.packrefs`, `fetch.followremotehead`, `remote.*.followremotehead` (can update references and invoke retained reference-transaction hooks),
+`remote.*.fetch|tagopt`, `fetch.fsckobjects`, `transfer.fsckobjects`, `fetch.prune|prunetags` and `remote.*.prune|prunetags` (can invoke the retained reference-transaction hook),
+`remote.*.skipdefaultupdate|skipfetchall`, `fetch.bundleuri`, `transfer.bundleuri` (can enable advertised bundle downloads using retained credential helpers), `fetch.all`, `remotes.*` (can activate unchanged remote helpers),
+`remote.*.uploadpack|receivepack|vcs`, `branch.*.mergeoptions`, `pull.twohead`, `pull.octopus` (can select external merge strategies),
+`branch.*.remote|pushremote`, `remote.pushdefault` (can select preconfigured helper remotes),
+`push.followtags` (can activate retained remote hooks through additional tag updates),
+`push.pushoption` (removal can bypass a receiver capability rejection and reach retained hooks),
+`push.useforceifincludes` (disabling the inclusion check can let a force-with-lease push reach retained hooks),
+`push.default`, `push.autosetupremote`, `branch.*.merge`, `remote.*.push|mirror` (can enable an otherwise refused push through an existing helper),
+`remote.*.promisor|partialclonefilter`, `extensions.partialclone`
+(can activate a configured helper when fetching missing objects),
+`uploadpack.hiderefs`, `receive.hiderefs` and `transfer.hiderefs` (can let newly visible refs reach retained transfer commands or update hooks),
+`uploadpackfilter.allow`, `uploadpackfilter.*.allow`, `uploadpackfilter.tree.maxdepth`
+(can admit filtered fetches that reach a retained pack-objects hook; `tree` is case-sensitive),
+`uploadpack.packobjectshook`, `receive.procreceiverefs` (activates the configured proc-receive hook),
+`receive.denycurrentbranch` (can enable the existing push-to-checkout hook),
+`receive.shallowupdate` (can allow updates requiring shallow-boundary changes to reach retained hooks),
+`receive.certnonceseed` (can enable signed pushes to reach retained hooks),
+`receive.advertiseatomic` and `receive.advertisepushoptions` (can permit capability-dependent pushes to reach retained hooks),
+`receive.fsck.*` and `fetch.fsck.*` (severity and skip-list policies),
+`receive.fsckobjects` and `receive.maxinputsize` (can admit previously rejected incoming objects or packs and reach retained update hooks),
+`receive.denynonfastforwards`, `receive.denydeletes` and `receive.denydeletecurrent` (can let forced branch updates or permitted deletions reach the existing update hook),
+`receive.autogc`, `maintenance.auto`, `gc.auto`, `gc.autopacklimit`, `maintenance.strategy`,
+`maintenance.repo` (registers repositories for an existing maintenance scheduler),
+`maintenance.gc.enabled|schedule`, `maintenance.prefetch.enabled|schedule`, `maintenance.pack-refs.enabled|schedule`
+(can activate existing maintenance hooks or remote helpers; task names are exact),
+`sendemail.identity` (selects configured mail commands),
+`sendemail[.*].confirm` (can run retained mail commands without recipient confirmation),
+`sendemail[.*].annotate|suppresscc|validate|useimaponly|imapsentfolder` (activate configured editors, mail commands or hooks),
+`sendemail[.*].tocmd|cccmd|headercmd|sendmailcmd|smtpserver`, `include.path`,
+`submodule.active`, `submodule.*.active`, `submodule.*.url` (can activate configured update commands),
+`submodule.recurse`, `fetch.recursesubmodules`, `push.recursesubmodules`,
+`submodule.*.fetchrecursesubmodules` (can activate child fetch/push helpers and hooks),
+`submodule.*.ignore`, `diff.ignoresubmodules`, `diff.submodule`, `status.submodulesummary`
+(can activate child status, diff or log commands and their configured programs),
+`includeif.*.path`, `alias.*` (including ordinary aliases that dispatch commands or inject `-c` settings),
+`submodule.*.update` (all modes and removal: enabling built-in checkout, merge or rebase can
+activate retained child filters and commands), `pager.*`, `interactive.difffilter`, `web.browser`, `help.autocorrect` (can dispatch corrected external Git commands), `help.browser`, `help.format`, `instaweb.browser`, `man.viewer` (select configured viewers), `browser.*.cmd|path`, `instaweb.httpd`, `guitool.*.cmd`, `imap.tunnel`, `sendemail.smtpuser|smtppass|smtpauth` (base and identity-scoped credential gates; SMTP password values are always redacted in reports), `svn.authorsprog` (maps unmapped authors by executing a program during Git SVN import),
+`man.*.cmd|path`, `init.templatedir`, `hook.*.command|event|enabled` (including activation of traditional hooks), `trailer.*.command|cmd`, `tar.*.command|remote`, `uploadarchive.allowunreachable`
+(including activation of an unchanged archive command),
+`protocol.allow` and `protocol.*.allow` (which can enable `ext::` URLs), and
+`lfs.*.path|clean|smudge` (custom transfer agents and extensions), plus
+`lfs[.*].standalonetransferagent` (selects an existing custom transfer command, including URL-scoped settings),
+`lfs.customtransfer.<name>.args|direction` (change arguments or enable upload/download adapters),
+`lfs.fetchinclude` and `lfs.fetchexclude` (can activate retained transfer agents),
+`lfs.access` and `lfs.<URL>.access` (can invoke retained credential helpers),
+`lfs.url|pushurl|gitprotocol`, `remote.*.lfsurl|lfspushurl` (select endpoints that can use retained credential helpers),
+and `lfs.basictransfersonly` (can restore custom transfer adapters). Remote `url`/`pushurl`
+and `url.<target>.insteadOf`/`pushInsteadOf` changes are always reported. SSH endpoints can
+activate an unchanged `core.sshCommand`; an existing rewrite can map an ordinary URL or local
+path to a helper transport. Restricting reports by the newly written URL's scheme would miss
+these activations. Submodule URLs are likewise always reported: adding even an ordinary URL
+can activate an unchanged custom update command when no active selector overrides it.
+The key list and value-sensitive rules are in `cli/exec_guard.h`. Branch remote selectors and
+`remote.pushdefault` are reported even when choosing an ordinary remote: a remote name can
+activate unchanged helper configuration. Setting endpoints and tracking remains allowed;
+fetch refspecs are reported because they can enable tracking-ref updates and retained reference-transaction hooks.
+Descriptive names stay quiet; branch upstream merge selectors are reported because they can enable an otherwise refused push.
+Each repository is read before and after with five
+queries (plus the include/LFS source graph and macOS pre-exec declaration queries described above): a configuration listing, `--path --get core.hooksPath`, `rev-parse --show-toplevel`,
+and `git var GIT_ATTR_GLOBAL`/`GIT_ATTR_SYSTEM`,
+so Git expands `~user` and applies its checkout rules when resolving relative hooks. Missing hook directories resolve through existing ancestors;
+unresolvable ancestors and `..` in a missing suffix invalidate capture. Mutable symlink components
+in effective hook paths are unsupported, even inside the project: an alias could be retargeted
+and restored during exec. Only the exact root-owned macOS `/tmp`, `/var` and `/etc` system
+aliases to `/private` counterparts are accepted, with a protected root-owned parent. The queries use the absolute Git 2.48+ path
+selected by CMake at build time, unaffected by runtime `PATH`, and do not execute hooks or
+fsmonitor. Configuration introspection runs under a separate read-only sandbox: Seatbelt on
+macOS, or Bubblewrap with network and process isolation on Linux. It can write only `/dev/null` (needed by Git startup) and cannot
+access the network; account lookup on macOS is allowed for `~user` expansion. Each query has
+a five-second deadline and a 64 MiB output limit; hook support trees use the capture limits below. If configuration cannot
+be read (missing configured Git or sandbox, a malformed file, or a query exceeding these
+limits), sandboxed exec refuses before running the command; `--no-sandbox` says so in a
+`note:` line and runs without the report;
+a World without `.world-git` at startup gets neither the rules nor the report. If the command
+removes or replaces previously detected Git administration, or makes its scan incomplete,
+exec warns that the final hooks and settings could not be inspected. This includes missing,
+renamed or replaced active worktree administration. An interrupted scan
+is identified as cancellation rather than a replacement. An incomplete administration scan (read/allocation error,
+path truncation, depth over 32, more than 4096 repositories or 65536 directory entries) refuses
+sandboxed exec; `--no-sandbox` reports the unavailable guard and preserves the command status.
+Hook trees are limited to 32 directory levels and share the 65536-entry limit. Directory
+traversal uses descriptors without following symlinks; changed directory/entry identities
+invalidate capture. An empty `core.hooksPath` therefore recursively observes its execution
+directory and can exceed these limits. Hook, pointer and repository-attributes hashing has a 64 MiB aggregate content budget per capture; oversized files,
+read errors and record/entry limits invalidate the capture explicitly. Incomplete initial
+hook captures also refuse sandboxed exec. Any noninterrupted final capture failure emits a
+`WARNING` that changed hooks and settings could not be inspected, while keeping the command status. Small hooks are hashed
+in full, so same-size, same-mtime rewrites remain detectable. Symlinked default hooks directories and symlinked entries in guarded
+hooks directories are unsupported: their executable target could change outside the directory
+policy. They invalidate capture, refusing sandboxed exec and producing an explicit note with
+`--no-sandbox`; symlinked Git administration pointers remain recorded by link target.
+Regular hook files with multiple hardlinks are likewise unsupported, since a writable alias
+could change their bytes outside the guarded directory. The check applies to hook files, not
+directory link counts. Administration pointers also require a single link for sandboxed exec,
+but their contents remain observable with `--no-sandbox`. Signals received during post-command
+inspection cancel the active query, reap its child, release the exec lock and return
+`128 + signal`; signals while the requested command runs continue to be forwarded to it.
+
+The exec sandbox is not a general confinement: it keeps the command away from the store and
+from other Worlds, and from the hooks above. `~/.gitconfig`, `~/.ssh`, shell startup files and
+everything else outside the World stay writable on macOS (`(allow default)`), which is why the
+report covers effective configuration. On Linux the host filesystem is read-only in the
+sandbox, but hooks are protected with read-only bind mounts of the directories that exist
+when the exec starts, and the directories on the way to them are bound onto themselves so they
+cannot be renamed. Duplicate paths keep the read-only policy, and descendant locator binds
+never reopen a read-only hooks path; a submodule first initialized during the exec gets writable hooks there,
+which the report then lists. What neither platform stops, and the report does not cover: a
+change to other project content that runs code (a `Makefile`, `package.json` scripts,
+`.envrc`) -- review the World's diff before running it. Effective Git attributes files and
+hook directories are exceptions: their contents are reported even when the configured path
+is inside the World, including ignored files.
+Root and nested `.gitattributes` files are included in the bounded checkout scan described above.
+
 ## Git LFS
 
 Repositories that use the stock Git LFS filter are supported at the root and in initialized
@@ -463,10 +802,23 @@ repository and the cause, for example `reason: nested Git repository at <path>: 
 objects from another repository (objects/info/alternates)`.
 
 The configuration is read from its file alone, with `git config --file <path>/.git/config
---no-includes`, run from `/`. No WorldFS Git command ever runs inside a nested repository, so
-its hooks, filters and fsmonitor never run during `init`, `fork`, `checkpoint` or `publish`;
+--no-includes`, run from `/`. Tree-copy operations never run Git inside a nested repository, so its hooks, filters and
+fsmonitor never run during `init`, `fork`, `checkpoint` or `publish`;
 the root's own status, clean and reset commands only look at the directory to tell that it is a
 repository.
+
+The `world exec` guard additionally discovers existing nested repositories, including ignored
+paths and those inside submodules or plain directory Worlds. It reads their configuration,
+attributes, fallback configuration blobs and hooks using the same confined trusted Git queries,
+with the nested checkout as the query working directory. Bare `.git` repositories are supported;
+registered linked worktrees of the World's root are validated against their common directory
+and reciprocal registration. Unknown gitfiles, aliased/external administration and foreign
+common-directory pointers make capture unavailable rather than silently omitting repositories.
+Discovery shares the depth, entry, repository and content limits described above. Nested default
+hooks and administration-local custom hooks are protected; configuration remains writable and
+changes are reported. Linux protects existing locator files, but a newly created absent
+`commondir` can only be detected after the command; macOS also denies its creation. This does
+not promise prevention of transient create-and-restore changes or repositories created mid-exec.
 
 The check runs wherever a tree is captured: `init` (also of a directory with no Git repository
 at its root), `fork` and `checkpoint` of a World (whose copy is captured again before
