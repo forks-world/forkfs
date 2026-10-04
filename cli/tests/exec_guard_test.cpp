@@ -63,6 +63,8 @@ int main() {
         "lfs.gitprotocol", "pull.ff", "lfs.url", "lfs.pushurl", "remote.origin.lfsurl", "remote.team.origin.lfspushurl",
         "lfs.fetchinclude", "lfs.fetchexclude", "LFS.FETCHINCLUDE", "LFS.FETCHEXCLUDE",
         "lfs.access", "lfs.https://example.invalid/repo.access", "LFS.ACCESS", "merge.defaulttoupstream", "merge.ff",
+        "http.sslcainfo", "HTTP.SSLCAPATH", "http.https://example.invalid/repo.sslcainfo",
+        "http.proxysslcainfo", "HTTP.https://example.invalid.PROXYSSLCAINFO",
         "http.sslverify", "HTTP.SSLVERIFY", "http.https://example.invalid/repo.sslverify",
         "filter.x.required", "FILTER.Driver.REQUIRED", "filter.team.driver.required",
         "http.followredirects", "http.https://example.invalid/repo.followredirects", "HTTP.FOLLOWREDIRECTS",
@@ -204,6 +206,12 @@ int main() {
     CHECK(guard_key_runs_command("svn.authorsprog", "./author-map"));
     CHECK(guard_key_runs_command("svn.authorsprog", ""));
     CHECK(guard_key_runs_command("svn.authorsprog", NULL));
+    const char *ca_keys[] = {"http.sslcainfo", "http.https://example.invalid.sslcapath", "http.proxysslcainfo"};
+    for (const char *key : ca_keys) {
+        CHECK(guard_key_runs_command(key, "path"));
+        CHECK(guard_key_runs_command(key, ""));
+        CHECK(guard_key_runs_command(key, NULL));
+    }
     const char *smtp_keys[] = {"sendemail.smtpuser", "sendemail.work.smtppass", "sendemail.smtpauth"};
     for (const char *key : smtp_keys) {
         CHECK(guard_key_runs_command(key, "value"));
@@ -331,6 +339,8 @@ int main() {
         "remote.lfsurl", "remote.lfspushurl", "remote.origin.lfsurlextra",
         "lfs.url.fetchinclude", "lfs.url.fetchexclude", "lfs.fetchincludeextra", "lfs.fetchexcludeextra",
         "lfs.accessextra", "lfs.https://example.invalid/repo.accessextra", "merge.custom.defaulttoupstream", "merge.custom.ff", "merge.ffextra",
+        "http.proxysslcapath", "http.https://example.invalid.proxysslcapath",
+        "http.sslcainfoextra", "http.host.sslcapathextra", "http.proxysslcainfoextra",
         "http.sslverifyextra", "http.https://example.invalid/repo.sslverifyextra",
         "filter.required", "filter.driver.requiredextra",
         "http.followredirectsextra", "http.https://example.invalid/repo.followredirectsextra",
@@ -340,7 +350,7 @@ int main() {
         "push.custom.default", "remote.push", "remote.mirror", "remote.origin.pushextra", "remote.origin.mirrorextra",
         "remote.proxy", "http.proxyextra", "remote.origin.proxyextra",
         "http.sslcertextra", "http.https://example.invalid/repo.proxysslcertextra",
-        "http.sslkey", "http.sslcainfo", "http.sslcerttype",
+        "http.sslkey", "http.sslcerttype",
         "user.custom.signingkey", "user.signingkeyextra", "http.sslcertpasswordprotectedextra",
         "http.https://example.invalid/repo.proxysslcertpasswordprotectedextra",
         "lfs.args", "lfs.direction", "lfs.customtransfer.args", "lfs.customtransfer..args",

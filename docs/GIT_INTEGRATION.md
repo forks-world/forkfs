@@ -354,6 +354,15 @@ warning.
   (including replacement-object content). These confined queries disable fsmonitor and lazy
   fetching and share the existing entry, content and query-time budgets; unavailable objects
   invalidate capture instead of silently omitting fallback attributes. No filters are run;
+- configured HTTP TLS CA files/directories (`http.sslCAInfo`, `http.sslCAPath`, and
+  `http.proxySSLCAInfo`, including URL scopes and dormant includes): changes can let requests
+  reach retained credential helpers. CA directories record presence, member additions/removals,
+  and regular bytes recursively with the shared content/entry budgets and depth limit 32.
+  File symlinks record both alias and resolved regular-target bytes, including external targets;
+  final-component directory symlinks, dangling/nonregular targets and colon-separated CAPath
+  lists invalidate capture explicitly. Leading parent directories are resolved before traversal. Git expands CAInfo/CAPath values as paths but keeps proxySSLCAInfo raw;
+  relative values use candidate execution bases. Empty paths and file `/dev/null` are omitted
+  from capture. Stores remain writable; no TLS request or credential helper is invoked;
 - `gpg.ssh.allowedSignersFile` and `gpg.ssh.revocationFile` trust sources, including dormant
   configuration: regular contents and absent files are recorded because signature acceptance
   can enable an operation to reach retained hooks. Typed path expansion and candidate execution
@@ -420,6 +429,7 @@ world: WARNING: exec removed libs/lib/.git, which told Git where a repository is
 
 The settings watched (Git's lowercase key names; `*` is any subsection): `core.hookspath`,
 `core.worktree` (checkout and relative-hook redirection), `core.fsmonitor`, `core.sshcommand`, `core.editor`, `core.pager`, `core.askpass`,
+`http.sslcainfo|sslcapath|proxysslcainfo` (base or URL-scoped trust-source selectors),
 `http.sslverify` (base or URL-scoped; disabling verification can let a request reach retained credential helpers),
 `filter.*.required` (disabling a failing mandatory filter can let checkout reach retained hooks),
 `attr.tree`, `core.attributesfile` and `core.usereplacerefs` (can activate configured filters, including through replacement-tree attributes), `core.gitproxy`, `core.alternaterefscommand`, `sequence.editor`, `credential.helper` and

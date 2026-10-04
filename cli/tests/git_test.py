@@ -5619,6 +5619,54 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'nested vendor local core.sshcommand: (unset) -> retained-ssh', p.stderr)
         self.assertNotIn(b'Git guard unavailable', p.stderr)
 
+    def test_exec_reports_tls_ca_files_directories_and_raw_proxy_paths(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        marker = one / 'ca-credential-ran'
+        self.git(one, 'config', 'credential.helper', '!touch ' + shlex.quote(str(marker)))
+        bundle = one / '.world-git/ca-bundle'
+        store = self.root / 'dormant-ca-directory'
+        target = self.root / 'external-ca-pem'
+        target.write_text('initial certificate bytes\n')
+        proxy = one / '~literal/proxy.pem'
+        proxy.parent.mkdir()
+        policy = one / '.world-git/dormant-ca-policy'
+        policy.write_text('[http "https://example.invalid/"]\n sslCAPath = ' + str(store) + '\n')
+        self.git(one, 'config', 'includeIf.onbranch:never-ca-policy.path', str(policy))
+        self.git(one, 'config', 'http.sslCAInfo', '.world-git/ca-bundle')
+        # Git keeps proxySSLCAInfo raw, including a leading literal tilde.
+        self.git(one, 'config', 'http.https://proxy.invalid/.proxySSLCAInfo', '~literal/proxy.pem')
+        script = ('ln -s ' + shlex.quote(str(target)) + ' ' + shlex.quote(str(bundle)) +
+                  '; mkdir ' + shlex.quote(str(store)) + '; ln -s ' + shlex.quote(str(target)) + ' ' +
+                  shlex.quote(str(store / '12345678.0')) + '; printf proxy > ' + shlex.quote(str(proxy)))
+        p = self.exec_sh(wid, script + '; exit 7', '--no-sandbox', code=7)
+        for label in ('.world-git/ca-bundle', str(store), str(store / '12345678.0'), '~literal/proxy.pem'):
+            self.assertIn(b'exec added Git TLS CA source: ' + label.encode(), p.stderr)
+        p = self.exec_sh(wid, 'printf changed > ' + shlex.quote(str(target)) +
+                         '; printf member > ' + shlex.quote(str(store / 'second.pem')) +
+                         '; printf changed > ' + shlex.quote(str(proxy)) + '; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'exec changed Git TLS CA source: .world-git/ca-bundle', p.stderr)
+        self.assertIn(b'exec changed Git TLS CA source: ' + str(store / '12345678.0').encode(), p.stderr)
+        self.assertIn(b'exec added Git TLS CA source: ' + str(store / 'second.pem').encode(), p.stderr)
+        self.assertIn(b'exec changed Git TLS CA source: ~literal/proxy.pem', p.stderr)
+        self.assertNotIn(b'local credential.helper:', p.stderr)
+        self.assertFalse(marker.exists())
+        p = self.exec_sh(wid, 'rm ' + ' '.join(shlex.quote(str(path)) for path in
+                         (bundle, proxy, store / '12345678.0', store / 'second.pem')) +
+                         '; rmdir ' + shlex.quote(str(store)) + '; exit 7', '--no-sandbox', code=7)
+        for label in ('.world-git/ca-bundle', str(store), str(store / '12345678.0'), '~literal/proxy.pem'):
+            self.assertIn(b'exec removed Git TLS CA source: ' + label.encode(), p.stderr)
+        self.assertFalse(marker.exists())
+        p = self.exec_sh(wid, 'git config http.sslCAInfo /dev/null; '
+                         'git config http.https://proxy.invalid/.proxySSLCAInfo /dev/null; exit 7',
+                         '--no-sandbox', code=7)
+        self.assertIn(b'local http.sslcainfo:', p.stderr)
+        self.assertIn(b'local http.https://proxy.invalid/.proxysslcainfo:', p.stderr)
+        store.symlink_to(one, target_is_directory=True)
+        p = self.exec_sh(wid, 'touch command-ran', '--require-sandbox', code=3)
+        self.assertIn(b'unsupported Git TLS CA directory', p.stderr)
+        self.assertFalse((one / 'command-ran').exists())
+
     def test_exec_reports_ssh_verification_files_with_retained_postmerge_hook(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

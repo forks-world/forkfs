@@ -78,6 +78,8 @@ static const GuardKey kGuardKeys[] = {
     {"uploadpackfilter", "allow", 2, false},
     {"http", "followredirects", 2, false}, {"http", "sslverify", 2, false},
     {"http", "proxy", 2, false}, {"remote", "proxy", 1, false},
+    {"http", "sslcainfo", 2, false}, {"http", "sslcapath", 2, false},
+    {"http", "proxysslcainfo", 2, false},
     {"http", "sslcert", 2, false}, {"http", "proxysslcert", 2, false},
     {"http", "sslcertpasswordprotected", 2, false},
     {"http", "proxysslcertpasswordprotected", 2, false},

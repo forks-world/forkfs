@@ -2116,7 +2116,7 @@ static void git_admin_free(GitAdmin *a) { sl_free(&a->pending_checkout_markers);
 // that tells Git where a repository is.
 
 struct GuardRec { char *id; char *val; size_t seq; };
-struct GuardSet { GuardRec *v; size_t n, cap, bytes_left, entries, include_targets; StrList attributes, fsck_paths, trust_paths, attribute_dirs, hooks, includes, include_contexts; int include_ms; const char *error; bool coverage_gap; };
+struct GuardSet { GuardRec *v; size_t n, cap, bytes_left, entries, include_targets; StrList attributes, fsck_paths, trust_paths, ca_paths, attribute_dirs, hooks, includes, include_contexts; int include_ms; const char *error; bool coverage_gap; };
 
 static void gs_add(GuardSet *s, const char *id, const char *val) {
     if (s->error) return;
@@ -2138,6 +2138,7 @@ static void gs_free(GuardSet *s) {
     sl_free(&s->attributes);
     sl_free(&s->fsck_paths);
     sl_free(&s->trust_paths);
+    sl_free(&s->ca_paths);
     sl_free(&s->attribute_dirs);
     sl_free(&s->hooks);
     sl_free(&s->includes);
@@ -2401,6 +2402,78 @@ static void capture_policy_file(const GitAdmin *a, const char *path, GuardSet *s
     } else if (!s->error) s->error = (kind == 'v' ? "could not fingerprint Git SSH verification file" : "could not fingerprint Git fsck skipList");
 }
 
+// CA bundles commonly use hashed file symlinks. Observe the alias and regular target,
+// but never recursively follow a directory symlink or silently omit an unreadable store.
+static void capture_ca_source(const GitAdmin *a, const char *path, GuardSet *s, bool allow_dir,
+                              bool require_dir = false, int parent_fd = -1, const char *name = NULL, int depth = 0) {
+    if (s->error || (!require_dir && !strcmp(path, "/dev/null"))) return;
+    if (g_post_signal) { s->error = "Git capture interrupted"; return; }
+    if (depth > 32 || ++s->entries > 65536) { s->error = "Git TLS CA capture depth or entry limit exceeded"; return; }
+    for (size_t i = 0; i < s->ca_paths.n; ++i) if (!strcmp(path, s->ca_paths.v[i])) return;
+    if (!sl_push(&s->ca_paths, path)) { s->error = "out of memory"; return; }
+    char id[WFS_PATH_MAX + 40], fp[160];
+    if ((size_t)snprintf(id, sizeof id, "k\x1f%s", rel_to(a, path)) >= sizeof id) {
+        s->error = "Git TLS CA path exceeds capture limit"; return;
+    }
+    struct stat st, after;
+    int rc = parent_fd < 0 ? lstat(path, &st) : fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW);
+    if (rc != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) gs_add(s, id, "absent");
+        else s->error = "could not inspect Git TLS CA source";
+        return;
+    }
+    if (require_dir && !S_ISDIR(st.st_mode)) { s->error = "unsupported Git TLS CA directory"; return; }
+    if (S_ISDIR(st.st_mode)) {
+        if (!allow_dir) { s->error = "nonregular Git TLS CA file"; return; }
+        int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC;
+        int fd = parent_fd < 0 ? open(path, flags) : openat(parent_fd, name, flags);
+        struct stat opened;
+        if (fd < 0 || fstat(fd, &opened) != 0 || opened.st_dev != st.st_dev || opened.st_ino != st.st_ino) {
+            if (fd >= 0) close(fd);
+            s->error = "could not safely open Git TLS CA directory"; return;
+        }
+        DIR *d = fdopendir(fd);
+        if (!d) { close(fd); s->error = "could not read Git TLS CA directory"; return; }
+        snprintf(fp, sizeof fp, "dir:%o", (unsigned)st.st_mode);
+        gs_add(s, id, fp);
+        while (!s->error) {
+            if (g_post_signal) { s->error = "Git capture interrupted"; break; }
+            errno = 0;
+            struct dirent *e = readdir(d);
+            if (!e) { if (errno) s->error = "could not enumerate Git TLS CA directory"; break; }
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+            char child[WFS_PATH_MAX];
+            if ((size_t)snprintf(child, sizeof child, "%s/%s", path, e->d_name) >= sizeof child) {
+                s->error = "Git TLS CA path exceeds capture limit"; break;
+            }
+            capture_ca_source(a, child, s, true, false, fd, e->d_name, depth + 1);
+        }
+        closedir(d);
+    } else if (S_ISREG(st.st_mode)) {
+        if (fingerprint(path, fp, sizeof fp, s, false, true, parent_fd, name)) gs_add(s, id, fp);
+        else if (!s->error) s->error = "could not fingerprint Git TLS CA file";
+    } else if (S_ISLNK(st.st_mode)) {
+        char link_fp[64], target_fp[64];
+        char *target = realpath(path, NULL);
+        struct stat target_st, target_after;
+        if (!target || strlen(target) >= WFS_PATH_MAX || lstat(target, &target_st) != 0 || !S_ISREG(target_st.st_mode))
+            s->error = "unsupported Git TLS CA symlink target";
+        else if (!fingerprint(path, link_fp, sizeof link_fp, s, false, false, parent_fd, name) ||
+                 !fingerprint(target, target_fp, sizeof target_fp, s, false, true)) {
+            if (!s->error) s->error = "could not fingerprint Git TLS CA symlink";
+        } else {
+            rc = parent_fd < 0 ? stat(path, &target_after) : fstatat(parent_fd, name, &target_after, 0);
+            if (rc != 0 || target_after.st_dev != target_st.st_dev || target_after.st_ino != target_st.st_ino ||
+                target_after.st_mode != target_st.st_mode) s->error = "Git TLS CA target changed during capture";
+            else { snprintf(fp, sizeof fp, "%s:%s", link_fp, target_fp); gs_add(s, id, fp); }
+        }
+        free(target);
+    } else s->error = "nonregular Git TLS CA source";
+    rc = parent_fd < 0 ? lstat(path, &after) : fstatat(parent_fd, name, &after, AT_SYMLINK_NOFOLLOW);
+    if (!s->error && (rc != 0 || after.st_dev != st.st_dev || after.st_ino != st.st_ino || after.st_mode != st.st_mode))
+        s->error = "Git TLS CA source changed during capture";
+}
+
 // Ignore rules do not prevent .gitattributes from activating configured filters.
 // Follow directory targets as Git does for leading path components, hash only attribute
 // files, and deduplicate target identities to terminate cycles.
@@ -2543,16 +2616,16 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
         argv[arg++] = "--get-regexp";
         argv[arg++] = (query == GG_LFS_INCLUDES_FILE || query == GG_LFS_INCLUDES_BLOB) ?
             "^(include\\.path|includeif\\..*\\.path)$" :
-            "^(include\\.path|includeif\\..*\\.path|core\\.hookspath|core\\.attributesfile|(receive|fetch)\\.fsck\\.skiplist|gpg\\.ssh\\.(allowedsignersfile|revocationfile))$";
+            "^(include\\.path|includeif\\..*\\.path|core\\.hookspath|core\\.attributesfile|(receive|fetch)\\.fsck\\.skiplist|gpg\\.ssh\\.(allowedsignersfile|revocationfile)|http\\.(.*\\.)?(sslcainfo|sslcapath))$";
     } else if (query == GG_WORKTREE_ROOT || query == GG_WORKTREE_FILE) {
-        // core.worktree is a raw path in Git setup, not a --type=path value:
+        // core.worktree and proxySSLCAInfo are raw strings, not --type=path values:
         // tilde and %(prefix) must remain literal here.
         argv[arg++] = "config";
         argv[arg++] = query == GG_WORKTREE_ROOT ? "--includes" : "--no-includes";
         argv[arg++] = "--null";
         if (query == GG_WORKTREE_FILE) { argv[arg++] = "--file"; argv[arg++] = path_key; }
-        argv[arg++] = "--get-all";
-        argv[arg++] = "core.worktree";
+        argv[arg++] = "--get-regexp";
+        argv[arg++] = "^(core\\.worktree|http\\.(.*\\.)?proxysslcainfo)$";
     } else if (query == GG_ATTR_INDEX) {
         // Full index expansion includes sparse-directory attributes; no worktree scan,
         // filters, submodule recursion or abbreviated object identities.
@@ -2720,7 +2793,7 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
 
 // Candidate hook/attribute values and execution directories are repository-specific, even when
 // several repositories share one dormant include file. Hashes remain globally deduplicated.
-struct HookCandidates { StrList values, attributes, skiplists, trust_files, bases; };
+struct HookCandidates { StrList values, attributes, skiplists, trust_files, ca_files, ca_dirs, bases; };
 
 static bool hook_candidate_add(StrList *list, const char *value, GuardSet *s) {
     for (size_t i = 0; i < list->n; ++i) if (!strcmp(list->v[i], value)) return true;
@@ -2744,10 +2817,18 @@ static bool capture_worktree_candidates(const GitAdmin *a, const char *gitdir, c
     for (size_t i = 0; i < len && ok;) {
         if (g_post_signal) { s->error = "Git capture interrupted"; ok = false; break; }
         if (++s->entries > 65536) { s->error = "Git include entry limit exceeded"; ok = false; break; }
-        const char *value = out + i;
-        const char *end = (const char *)memchr(value, 0, len - i);
+        char *key = out + i;
+        char *end = (char *)memchr(key, 0, len - i);
         if (!end) { ok = false; break; }
         i = (size_t)(end - out) + 1;
+        char *value = strchr(key, '\n');
+        if (!value) { ok = false; break; }
+        *value++ = 0;
+        if (!strncmp(key, "http.", 5) && !strcmp(strrchr(key, '.') + 1, "proxysslcainfo")) {
+            if (*value) ok = hook_candidate_add(&hooks->ca_files, value, s);
+            continue;
+        }
+        if (strcmp(key, "core.worktree")) { ok = false; break; }
         char base[WFS_PATH_MAX];
         int n = value[0] == '/' ? snprintf(base, sizeof base, "%s", value) :
                                  snprintf(base, sizeof base, "%s/%s", gitdir, value);
@@ -2857,6 +2938,19 @@ static bool capture_include_edges(const GitAdmin *a, const char *gitdir, const c
             // These are individual verifier argv paths, not fsck option strings.
             if (*value) ok = hook_candidate_add(&hooks->trust_files, value, s);
             continue;
+        }
+        if (!strncmp(entry, "http.", 5)) {
+            const char *key = strrchr(entry, '.') + 1;
+            if (!strcmp(key, "sslcainfo")) {
+                if (*value) ok = hook_candidate_add(&hooks->ca_files, value, s);
+                continue;
+            }
+            if (!strcmp(key, "sslcapath")) {
+                if (strchr(value, ':')) { s->error = "unsupported Git TLS CA directory list"; ok = false; }
+                else if (*value) ok = hook_candidate_add(&hooks->ca_dirs, value, s);
+                continue;
+            }
+            ok = false; break;
         }
         if (!strcasecmp(entry, "core.attributesfile")) {
             // Like hooks, relative attributes paths use the execution directory,
@@ -3423,6 +3517,22 @@ static bool capture_include_hooks(GitAdmin *a, const char *gitdir, const char *c
             ok = !s->error;
         }
     }
+    for (int directory = 0; ok && directory < 2; ++directory) {
+        StrList *values = directory ? &hooks.ca_dirs : &hooks.ca_files;
+        for (size_t i = 0; ok && i < values->n; ++i) {
+            size_t bases = values->v[i][0] == '/' ? 1 : hooks.bases.n;
+            for (size_t j = 0; ok && j < bases; ++j) {
+                char path[WFS_PATH_MAX];
+                if (!attributes_path(hooks.bases.v[j], values->v[i], path, sizeof path)) {
+                    s->error = "could not resolve Git TLS CA source"; ok = false; break;
+                }
+                capture_ca_source(a, path, s, directory != 0, directory != 0);
+                ok = !s->error;
+            }
+        }
+    }
+    sl_free(&hooks.ca_files);
+    sl_free(&hooks.ca_dirs);
     sl_free(&hooks.trust_files);
     sl_free(&hooks.skiplists);
     sl_free(&hooks.attributes);
@@ -3901,6 +4011,12 @@ static void guard_warn(const GuardRec *before, const GuardRec *after) {
         fputs(": ", stderr);
         put_id_field(stderr, path, strlen(path));
         fputs(") (can activate configured filters)\n", stderr);
+    } else if (id[0] == 'k') {
+        bool was = before && strcmp(before->val, "absent");
+        bool is = after && strcmp(after->val, "absent");
+        fprintf(stderr, "world: WARNING: exec %s Git TLS CA source: ", !was ? "added" : !is ? "removed" : "changed");
+        put_field(stderr, rest, strlen(rest));
+        fputs(" (can change TLS acceptance and reach retained credentials)\n", stderr);
     } else if (id[0] == 'v') {
         bool was = before && strcmp(before->val, "absent");
         bool is = after && strcmp(after->val, "absent");
@@ -3981,7 +4097,7 @@ static void guard_report(const GuardSet *b, const GuardSet *a) {
         if (before && after && !strcmp(before->val, after->val)) continue;
         const char kind = (before ? before : after)->id[0];
         if (kind == 'c' && shared_with_world(b, a, before, after)) continue;
-        if ((kind == 'a' || kind == 'i' || kind == 'w' || kind == 'l' || kind == 'b' || kind == 'm' || kind == 'n' || kind == 's' || kind == 'v') && (!before || !strcmp(before->val, "absent")) &&
+        if ((kind == 'a' || kind == 'i' || kind == 'w' || kind == 'l' || kind == 'b' || kind == 'm' || kind == 'n' || kind == 's' || kind == 'v' || kind == 'k') && (!before || !strcmp(before->val, "absent")) &&
             (!after || !strcmp(after->val, "absent"))) continue;
         if (kind == 'p') {
             bool was = before && strcmp(before->val, "absent");
