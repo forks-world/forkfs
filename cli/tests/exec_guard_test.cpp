@@ -82,6 +82,7 @@ int main() {
         "receive.denydeletes", "RECEIVE.DENYDELETES",
         "uploadpack.hiderefs", "receive.hiderefs", "transfer.hiderefs",
         "UPLOADPACK.HIDEREFS", "RECEIVE.HIDEREFS", "TRANSFER.HIDEREFS",
+        "push.followtags", "PUSH.FOLLOWTAGS",
         "receive.shallowupdate", "RECEIVE.SHALLOWUPDATE",
         "receive.advertiseatomic", "RECEIVE.ADVERTISEATOMIC", "receive.advertisepushoptions", "RECEIVE.ADVERTISEPUSHOPTIONS",
         "receive.fsckobjects", "RECEIVE.FSCKOBJECTS", "receive.maxinputsize", "RECEIVE.MAXINPUTSIZE",
@@ -175,6 +176,9 @@ int main() {
     CHECK(guard_key_runs_command("receive.shallowupdate", "true"));
     CHECK(guard_key_runs_command("receive.shallowupdate", "false"));
     CHECK(guard_key_runs_command("receive.shallowupdate", NULL));
+    CHECK(guard_key_runs_command("push.followtags", "true"));
+    CHECK(guard_key_runs_command("push.followtags", "false"));
+    CHECK(guard_key_runs_command("push.followtags", NULL));
     const char *advertisement_keys[] = {"receive.advertiseatomic", "receive.advertisepushoptions"};
     for (const char *key : advertisement_keys) {
         CHECK(guard_key_runs_command(key, "true"));
@@ -284,6 +288,7 @@ int main() {
         "uploadpack.hiderefsextra", "receive.hiderefsextra", "transfer.hiderefsextra",
         "receive.custom.fsckobjects", "receive.custom.maxinputsize", "receive.fsckobjectsextra", "receive.maxinputsizeextra",
         "receive.custom.advertiseatomic", "receive.custom.advertisepushoptions", "receive.advertiseatomicextra", "receive.advertisepushoptionsextra",
+        "push.remote.followtags", "push.followtagsextra",
         "receive.custom.shallowupdate", "receive.shallowupdateextra",
         "receive.custom.denydeletecurrent", "receive.denydeletecurrentextra",
         "core.custom.usereplacerefs", "core.usereplacerefsextra",

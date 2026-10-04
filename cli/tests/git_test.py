@@ -5462,6 +5462,13 @@ class GitWorldTest(unittest.TestCase):
         custom.write_text('#!/bin/sh\nexit 0\n')
         custom.chmod(0o755)
         self.git(checkouts[0], 'config', 'core.hooksPath', '.git/custom')
+        # Only the root selects this second directory; nested capture cannot mask
+        # a missed administrative classification while checkout markers are pending.
+        root_custom = checkouts[0] / '.git/root-custom/pre-commit'
+        root_custom.parent.mkdir()
+        root_custom.write_bytes(custom.read_bytes())
+        root_custom.chmod(0o755)
+        self.git(one, 'config', 'core.hooksPath', 'ignored/vendor/.git/root-custom')
         linked = one / '.claude/worktrees/agent-x'
         self.git(one, 'worktree', 'add', '--detach', str(linked), 'HEAD')
         script = '; '.join('git --git-dir=' + shlex.quote(str(path / '.git')) +
@@ -5474,10 +5481,12 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'nested .claude/worktrees/agent-x local core.askpass: (unset) -> retained-askpass', p.stderr)
         hook = checkouts[0] / '.git/hooks/pre-commit'
         original = hook.read_bytes()
-        p = self.exec_sh(wid, 'echo changed >> ' + shlex.quote(str(hook)), '--require-sandbox', code=1)
+        self.assert_denied(wid, 'echo changed >> ' + shlex.quote(str(hook)))
         self.assertEqual(hook.read_bytes(), original)
-        self.exec_sh(wid, 'echo changed >> ' + shlex.quote(str(custom)), '--require-sandbox', code=1)
+        self.assert_denied(wid, 'echo changed >> ' + shlex.quote(str(custom)))
         self.assertEqual(custom.read_bytes(), original)
+        self.assert_denied(wid, 'echo changed >> ' + shlex.quote(str(root_custom)))
+        self.assertEqual(root_custom.read_bytes(), original)
         p = self.exec_sh(wid, 'echo changed >> ' + shlex.quote(str(hook)) + '; exit 7', '--no-sandbox', code=7)
         self.assertIn(b'exec changed a Git hook: ignored/vendor/.git/hooks/pre-commit', p.stderr)
         # A newly planted persistent common-directory redirect must be reported on Linux,
@@ -5528,15 +5537,18 @@ class GitWorldTest(unittest.TestCase):
         self.git(one, 'config', 'receive.maxInputSize', '1')
         self.git(one, 'config', 'receive.advertiseAtomic', 'false')
         self.git(one, 'config', 'receive.advertisePushOptions', 'false')
+        self.git(one, 'config', 'push.followTags', 'false')
         p = self.exec_sh(wid, 'git config receive.shallowUpdate true; '
                          'git config receive.fsckObjects false; git config receive.maxInputSize 0; '
-                         'git config receive.advertiseAtomic true; git config receive.advertisePushOptions true; exit 7',
+                         'git config receive.advertiseAtomic true; git config receive.advertisePushOptions true; '
+                         'git config push.followTags true; exit 7',
                          '--no-sandbox', code=7)
         self.assertIn(b'local receive.shallowupdate: false -> true', p.stderr)
         self.assertIn(b'local receive.fsckobjects: true -> false', p.stderr)
         self.assertIn(b'local receive.maxinputsize: 1 -> 0', p.stderr)
         self.assertIn(b'local receive.advertiseatomic: false -> true', p.stderr)
         self.assertIn(b'local receive.advertisepushoptions: false -> true', p.stderr)
+        self.assertIn(b'local push.followtags: false -> true', p.stderr)
         self.assertNotIn(b'a Git hook:', p.stderr)
         self.assertEqual(hook.read_bytes(), original)
         self.assertFalse((one / 'update-hook-ran').exists())

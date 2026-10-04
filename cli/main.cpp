@@ -2006,6 +2006,7 @@ static bool resolve_into(const char *path, char *out, size_t cap) {
 struct GitAdmin {
     bool has_owned_admin;
     char query_root[WFS_PATH_MAX]; // cwd for the current repository metadata queries
+    StrList pending_checkout_markers, owned_checkouts;
     StrList nested, nested_gitdirs, nested_common; // parallel checkout/admin/common records, not module namespaces
     bool incomplete;             // discovery failed or exceeded its resource/path limits
     size_t entries;              // all visited administration entries, not just repositories
@@ -2106,7 +2107,7 @@ static bool git_admin_find(const char *world, GitAdmin *a) {
     return true;
 }
 
-static void git_admin_free(GitAdmin *a) { sl_free(&a->nested); sl_free(&a->nested_gitdirs); sl_free(&a->nested_common); sl_free(&a->gitdirs); sl_free(&a->pins); sl_free(&a->hooks_paths); sl_free(&a->hook_locator_pins); sl_free(&a->planned_dirs); sl_free(&a->planned_namespaces); sl_free(&a->planned_locators); }
+static void git_admin_free(GitAdmin *a) { sl_free(&a->pending_checkout_markers); sl_free(&a->owned_checkouts); sl_free(&a->nested); sl_free(&a->nested_gitdirs); sl_free(&a->nested_common); sl_free(&a->gitdirs); sl_free(&a->pins); sl_free(&a->hooks_paths); sl_free(&a->hook_locator_pins); sl_free(&a->planned_dirs); sl_free(&a->planned_namespaces); sl_free(&a->planned_locators); }
 
 // --- what exec compares before and after the command ---
 //
@@ -2379,7 +2380,7 @@ static void capture_attributes(const GitAdmin *a, const char *path, GuardSet *s,
 // Ignore rules do not prevent .gitattributes from activating configured filters.
 // Follow directory targets as Git does for leading path components, hash only attribute
 // files, and deduplicate target identities to terminate cycles.
-static void discover_checkout_git(GitAdmin *a, const char *dir, const char *canonical, GuardSet *s);
+static void discover_checkout_git(GitAdmin *a, const char *dir, const char *canonical, GuardSet *s, bool defer_marker = true);
 
 static void capture_checkout_attributes(GitAdmin *a, const char *dir, GuardSet *s,
                                         int parent_fd = -1, const char *name = NULL, int depth = 0) {
@@ -2959,7 +2960,7 @@ static void add_nested(GitAdmin *a, const char *checkout, const char *gitdir, co
 
 // Nested repositories are discovered before their metadata is queried. Unknown gitfiles,
 // aliased administration and foreign common directories cannot silently escape the policy.
-static void discover_checkout_git(GitAdmin *a, const char *dir, const char *canonical, GuardSet *s) {
+static void discover_checkout_git(GitAdmin *a, const char *dir, const char *canonical, GuardSet *s, bool defer_marker) {
     if (a->has_owned_admin && !strcmp(canonical, a->root)) return;
     char gd[WFS_PATH_MAX], common[WFS_PATH_MAX];
     if ((size_t)snprintf(gd, sizeof gd, "%s/.git", dir) >= sizeof gd) {
@@ -2973,6 +2974,15 @@ static void discover_checkout_git(GitAdmin *a, const char *dir, const char *cano
     size_t n = strlen(a->root);
     if (strcmp(dir, canonical) || strncmp(canonical, a->root, n) || (canonical[n] && canonical[n] != '/')) {
         s->error = "nested Git administration is aliased or outside the World"; return;
+    }
+    // Owned repositories must retain their observational snapshots even when
+    // their checkout pointer was rewritten. Classify unknown markers only after
+    // those repositories have supplied their actual checkout paths.
+    if (defer_marker) {
+        for (size_t i = 0; i < a->pending_checkout_markers.n; ++i)
+            if (!strcmp(a->pending_checkout_markers.v[i], canonical)) return;
+        if (!sl_push(&a->pending_checkout_markers, canonical)) s->error = "out of memory";
+        return;
     }
     if (S_ISREG(st.st_mode)) {
         bool present;
@@ -3162,6 +3172,14 @@ static bool note_hooks_path(GitAdmin *a, const char *checkout, const char *v, ch
     for (size_t i = 0; i < a->nested.n && !in_admin; ++i) {
         char gd[WFS_PATH_MAX];
         snprintf(gd, sizeof gd, "%s", a->nested_gitdirs.v[i]);
+        size_t gn = strlen(gd);
+        in_admin = !strncmp(real, gd, gn) && (!real[gn] || real[gn] == '/');
+    }
+    // Marker validation is deferred until owned checkout identities are known, but
+    // a root-selected hooks path below a pending .git must already be protected.
+    for (size_t i = 0; i < a->pending_checkout_markers.n && !in_admin; ++i) {
+        char gd[WFS_PATH_MAX];
+        snprintf(gd, sizeof gd, "%s/.git", a->pending_checkout_markers.v[i]);
         size_t gn = strlen(gd);
         in_admin = !strncmp(real, gd, gn) && (!real[gn] || real[gn] == '/');
     }
@@ -3473,6 +3491,9 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
     snprintf(checkout, sizeof checkout, "%s", worktree);
     free(worktree);
     }
+    if (!nested_checkout && !sl_push(&a->owned_checkouts, checkout)) {
+        s->error = "out of memory"; return false;
+    }
     if (!capture_include_hooks(a, gitdir, checkout, s, bare)) return false;
 #ifdef __APPLE__
     if (require_home && !nested_checkout && !plan_submodules(a, gitdir, checkout, s)) {
@@ -3599,17 +3620,29 @@ static bool guard_capture(GitAdmin *a, GuardSet *s, bool require_home = false) {
         if (!capture_repo(a, g, g, label, s, require_home)) return false;
     }
     }
-    for (size_t i = 0; i < a->nested.n; ++i) {
-        char gd[WFS_PATH_MAX], label[WFS_PATH_MAX + 16];
-        snprintf(gd, sizeof gd, "%s", a->nested_gitdirs.v[i]);
-        snprintf(label, sizeof label, "nested %s", rel_to(a, a->nested.v[i]));
-        if (!capture_repo(a, gd, a->nested_common.v[i], label, s, require_home, a->nested.v[i])) return false;
-        char pointer[WFS_PATH_MAX];
-        snprintf(pointer, sizeof pointer, "%s/commondir", gd);
-        capture_pointer(a, pointer, gd, a->nested_common.v[i], "", s);
-        snprintf(pointer, sizeof pointer, "%s/.git", a->nested.v[i]);
-        if (!real_dir(pointer)) capture_pointer(a, pointer, a->nested.v[i], gd, "gitdir: ", s);
-        if (s->error) return false;
+    size_t pending_at = 0, nested_at = 0;
+    while (pending_at < a->pending_checkout_markers.n || nested_at < a->nested.n) {
+        while (pending_at < a->pending_checkout_markers.n) {
+            const char *checkout = a->pending_checkout_markers.v[pending_at++];
+            bool owned = false;
+            for (size_t j = 0; j < a->owned_checkouts.n; ++j)
+                if (!strcmp(checkout, a->owned_checkouts.v[j])) { owned = true; break; }
+            if (!owned) discover_checkout_git(a, checkout, checkout, s, false);
+            if (s->error) return false;
+        }
+        if (nested_at < a->nested.n) {
+            size_t i = nested_at++;
+            char gd[WFS_PATH_MAX], label[WFS_PATH_MAX + 16];
+            snprintf(gd, sizeof gd, "%s", a->nested_gitdirs.v[i]);
+            snprintf(label, sizeof label, "nested %s", rel_to(a, a->nested.v[i]));
+            if (!capture_repo(a, gd, a->nested_common.v[i], label, s, require_home, a->nested.v[i])) return false;
+            char pointer[WFS_PATH_MAX];
+            snprintf(pointer, sizeof pointer, "%s/commondir", gd);
+            capture_pointer(a, pointer, gd, a->nested_common.v[i], "", s);
+            snprintf(pointer, sizeof pointer, "%s/.git", a->nested.v[i]);
+            if (!real_dir(pointer)) capture_pointer(a, pointer, a->nested.v[i], gd, "gitdir: ", s);
+            if (s->error) return false;
+        }
     }
 #ifdef __APPLE__
     if (require_home && !plans_safe(a)) s->error = "declared submodule administration overlaps Git hooks";

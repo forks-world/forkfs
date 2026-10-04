@@ -124,6 +124,7 @@ static const GuardKey kGuardKeys[] = {
     {"remote", "url", 1, false},          {"remote", "pushurl", 1, false},
     {"url", "insteadof", 1, false},       {"url", "pushinsteadof", 1, false},
     {"remote", "uploadpack", 1, false},   {"remote", "receivepack", 1, false},
+    {"push", "followtags", 0, false},
     {"push", "default", 0, false}, {"push", "autosetupremote", 0, false},
     {"branch", "merge", 1, false},
     {"remote", "push", 1, false}, {"remote", "mirror", 1, false},
