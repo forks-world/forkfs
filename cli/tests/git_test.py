@@ -6530,7 +6530,19 @@ class GitWorldTest(unittest.TestCase):
             self.assertNotIn(b'local remote.origin.url:', p.stderr)
             self.assertEqual(hook.read_bytes(), original)
             self.assertFalse(marker.exists())
-        # Configuration inspection neither fetches nor prunes the prepared stale refs.
+        self.git(one, 'config', 'gc.packRefs', 'false')
+        for key in ('fetch.followRemoteHEAD', 'remote.origin.followRemoteHEAD'):
+            self.git(one, 'config', key, 'never')
+        p = self.exec_sh(wid, 'git config gc.packRefs true; git config fetch.followRemoteHEAD always; '
+                         'git config remote.origin.followRemoteHEAD always; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local gc.packrefs: false -> true', p.stderr)
+        for key in ('fetch.followremotehead', 'remote.origin.followremotehead'):
+            self.assertIn(b'local ' + key.encode() + b': never -> always', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertNotIn(b'local remote.origin.url:', p.stderr)
+        self.assertEqual(hook.read_bytes(), original)
+        self.assertFalse(marker.exists())
+        # Configuration inspection neither fetches, packs nor prunes the prepared refs.
         self.assertEqual(self.git(one, 'rev-parse', 'refs/remotes/origin/stale').stdout.strip(), self.base)
         self.assertEqual(self.git(one, 'rev-parse', 'refs/tags/stale').stdout.strip(), self.base)
 

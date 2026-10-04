@@ -115,6 +115,8 @@ static const GuardKey kGuardKeys[] = {
     {"gpg", "defaultkeycommand", 2, false}, {"gc", "recentobjectshook", 0, false},
     {"fetch", "bundleuri", 0, false},
     {"am", "threeway", 0, false},
+    {"gc", "packrefs", 0, false}, {"fetch", "followremotehead", 0, false},
+    {"remote", "followremotehead", 1, false},
     {"fetch", "prune", 0, false}, {"fetch", "prunetags", 0, false},
     {"remote", "fetch", 1, false}, {"remote", "tagopt", 1, false},
     {"remote", "prune", 1, false}, {"remote", "prunetags", 1, false},

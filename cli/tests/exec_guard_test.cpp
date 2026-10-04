@@ -114,6 +114,8 @@ int main() {
         "remote.origin.prune", "remote.team.origin.prunetags", "REMOTE.Origin.PRUNE",
         "fetch.fsckobjects", "TRANSFER.FSCKOBJECTS",
         "hook.lint.event", "HOOK.Lint.ENABLED", "hook.pre-commit.enabled", "hook.team.lint.event",
+        "gc.packrefs", "GC.PACKREFS", "fetch.followremotehead", "FETCH.FOLLOWREMOTEHEAD",
+        "remote.origin.followremotehead", "REMOTE.Team.Origin.FOLLOWREMOTEHEAD",
         "fetch.all", "remotes.default", "remotes.team.group",
         "remote.origin.skipdefaultupdate", "remote.origin.skipfetchall", "remote.team.origin.skipfetchall",
         "pull.twohead", "pull.octopus", "receive.procreceiverefs", "branch.main.mergeoptions", "branch.main.remote", "branch.main.pushremote", "remote.pushdefault",
@@ -185,6 +187,15 @@ int main() {
     CHECK(guard_key_runs_command("push.pushoption", "ci.skip"));
     CHECK(guard_key_runs_command("push.pushoption", ""));
     CHECK(guard_key_runs_command("push.pushoption", NULL));
+    CHECK(guard_key_runs_command("gc.packrefs", "false"));
+    CHECK(guard_key_runs_command("gc.packrefs", "true"));
+    CHECK(guard_key_runs_command("gc.packrefs", NULL));
+    const char *follow_keys[] = {"fetch.followremotehead", "remote.origin.followremotehead"};
+    for (const char *key : follow_keys) {
+        CHECK(guard_key_runs_command(key, "never"));
+        CHECK(guard_key_runs_command(key, "always"));
+        CHECK(guard_key_runs_command(key, NULL));
+    }
     CHECK(guard_key_runs_command("push.useforceifincludes", "true"));
     CHECK(guard_key_runs_command("push.useforceifincludes", "false"));
     CHECK(guard_key_runs_command("push.useforceifincludes", NULL));
@@ -308,6 +319,8 @@ int main() {
         "receive.fsck", "fetch.fsck.", "transfer.fsck.skiplist",
         "push.remote.useforceifincludes", "push.useforceifincludesextra",
         "receive.remote.certnonceseed", "receive.certnonceseedextra",
+        "gc.custom.packrefs", "gc.packrefsextra", "fetch.custom.followremotehead",
+        "fetch.followremoteheadextra", "remote.followremotehead", "remote.origin.followremoteheadextra",
         "push.remote.followtags", "push.followtagsextra", "push.remote.pushoption", "push.pushoptionextra",
         "receive.custom.shallowupdate", "receive.shallowupdateextra",
         "receive.custom.denydeletecurrent", "receive.denydeletecurrentextra",
