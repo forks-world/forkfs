@@ -348,6 +348,13 @@ warning.
   symlinked/nonregular files or unreadable blobs invalidate capture. Unlike LFS configuration,
   `.gitmodules` includes are not traversed. The same content, entry and query-time budgets
   apply, and object queries disable fsmonitor and lazy fetching. Files remain writable;
+- `receive.fsck.skipList` and `fetch.fsck.skipList` files, including dormant include values:
+  regular contents and absent sources are captured without running object validation. Relative
+  paths are considered from checkout, Gitdir, common-repository and dormant worktree bases;
+  typed Git path expansion is used, not the including file's directory. These writable files
+  share existing content/entry budgets and path deduplication. Nonregular sources and expanded
+  paths containing spaces, commas or `|` invalidate capture because Git's fsck option parser
+  splits those delimiters. `/dev/null` is treated as an empty source;
 - each repository's private `info/attributes`, effective user/system attributes files, and
   root/nested working-tree `.gitattributes`, including ignored and untracked files:
   changes can activate an unchanged filter
@@ -432,6 +439,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `receive.denycurrentbranch` (can enable the existing push-to-checkout hook),
 `receive.shallowupdate` (can allow updates requiring shallow-boundary changes to reach retained hooks),
 `receive.advertiseatomic` and `receive.advertisepushoptions` (can permit capability-dependent pushes to reach retained hooks),
+`receive.fsck.*` and `fetch.fsck.*` (severity and skip-list policies),
 `receive.fsckobjects` and `receive.maxinputsize` (can admit previously rejected incoming objects or packs and reach retained update hooks),
 `receive.denynonfastforwards`, `receive.denydeletes` and `receive.denydeletecurrent` (can let forced branch updates or permitted deletions reach the existing update hook),
 `receive.autogc`, `maintenance.auto`, `gc.auto`, `gc.autopacklimit`, `maintenance.strategy`,

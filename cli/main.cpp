@@ -2116,7 +2116,7 @@ static void git_admin_free(GitAdmin *a) { sl_free(&a->pending_checkout_markers);
 // that tells Git where a repository is.
 
 struct GuardRec { char *id; char *val; size_t seq; };
-struct GuardSet { GuardRec *v; size_t n, cap, bytes_left, entries, include_targets; StrList attributes, attribute_dirs, hooks, includes, include_contexts; int include_ms; const char *error; bool coverage_gap; };
+struct GuardSet { GuardRec *v; size_t n, cap, bytes_left, entries, include_targets; StrList attributes, fsck_paths, attribute_dirs, hooks, includes, include_contexts; int include_ms; const char *error; bool coverage_gap; };
 
 static void gs_add(GuardSet *s, const char *id, const char *val) {
     if (s->error) return;
@@ -2136,6 +2136,7 @@ static void gs_free(GuardSet *s) {
     for (size_t i = 0; i < s->n; ++i) { free(s->v[i].id); free(s->v[i].val); }
     free(s->v);
     sl_free(&s->attributes);
+    sl_free(&s->fsck_paths);
     sl_free(&s->attribute_dirs);
     sl_free(&s->hooks);
     sl_free(&s->includes);
@@ -2377,6 +2378,27 @@ static void capture_attributes(const GitAdmin *a, const char *path, GuardSet *s,
     gs_add(s, id, fp);
 }
 
+static void capture_fsck_skiplist(const GitAdmin *a, const char *path, GuardSet *s) {
+    if (s->error || !strcmp(path, "/dev/null")) return;
+    for (size_t i = 0; i < s->fsck_paths.n; ++i)
+        if (!strcmp(path, s->fsck_paths.v[i])) return;
+    if (!sl_push(&s->fsck_paths, path)) { s->error = "out of memory"; return; }
+    char id[WFS_PATH_MAX + 40], fp[64];
+    if ((size_t)snprintf(id, sizeof id, "s\x1f%s", rel_to(a, path)) >= sizeof id) {
+        s->error = "Git fsck skipList path exceeds capture limit"; return;
+    }
+    struct stat st, after;
+    if (lstat(path, &st) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) gs_add(s, id, "absent");
+        else s->error = "could not inspect Git fsck skipList";
+    } else if (!S_ISREG(st.st_mode)) s->error = "nonregular Git fsck skipList cannot be inspected";
+    else if (fingerprint(path, fp, sizeof fp, s, false, true)) {
+        if (lstat(path, &after) != 0 || after.st_dev != st.st_dev || after.st_ino != st.st_ino ||
+            after.st_mode != st.st_mode) s->error = "Git fsck skipList changed during capture";
+        else gs_add(s, id, fp);
+    } else if (!s->error) s->error = "could not fingerprint Git fsck skipList";
+}
+
 // Ignore rules do not prevent .gitattributes from activating configured filters.
 // Follow directory targets as Git does for leading path components, hash only attribute
 // files, and deduplicate target identities to terminate cycles.
@@ -2519,7 +2541,7 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
         argv[arg++] = "--get-regexp";
         argv[arg++] = (query == GG_LFS_INCLUDES_FILE || query == GG_LFS_INCLUDES_BLOB) ?
             "^(include\\.path|includeif\\..*\\.path)$" :
-            "^(include\\.path|includeif\\..*\\.path|core\\.hookspath|core\\.attributesfile)$";
+            "^(include\\.path|includeif\\..*\\.path|core\\.hookspath|core\\.attributesfile|(receive|fetch)\\.fsck\\.skiplist)$";
     } else if (query == GG_WORKTREE_ROOT || query == GG_WORKTREE_FILE) {
         // core.worktree is a raw path in Git setup, not a --type=path value:
         // tilde and %(prefix) must remain literal here.
@@ -2686,7 +2708,7 @@ static char *git_guard_read(const char *root, const char *gitdir, const char *pa
 
 // Candidate hook/attribute values and execution directories are repository-specific, even when
 // several repositories share one dormant include file. Hashes remain globally deduplicated.
-struct HookCandidates { StrList values, attributes, bases; };
+struct HookCandidates { StrList values, attributes, skiplists, bases; };
 
 static bool hook_candidate_add(StrList *list, const char *value, GuardSet *s) {
     for (size_t i = 0; i < list->n; ++i) if (!strcmp(list->v[i], value)) return true;
@@ -2810,6 +2832,13 @@ static bool capture_include_edges(const GitAdmin *a, const char *gitdir, const c
             // Relative hooks run from a checkout, or Gitdir for receive hooks;
             // the including file's directory has no bearing on this path.
             ok = hook_candidate_add(&hooks->values, value, s);
+            continue;
+        }
+        if (!strcmp(entry, "receive.fsck.skiplist") || !strcmp(entry, "fetch.fsck.skiplist")) {
+            // fsck's message-option parser splits these delimiters, even within paths.
+            if (!*value || strpbrk(value, " ,|")) {
+                s->error = "unsupported Git fsck skipList path"; ok = false;
+            } else ok = hook_candidate_add(&hooks->skiplists, value, s);
             continue;
         }
         if (!strcasecmp(entry, "core.attributesfile")) {
@@ -3237,7 +3266,7 @@ static bool capture_gitmodules(const GitAdmin *a, const char *gitdir, const char
 
 // Conditions and value precedence may change later. Conservatively observe the union
 // of candidate checkout roots and hook/attribute values, plus the Gitdir used by receive hooks.
-static bool capture_include_hooks(GitAdmin *a, const char *gitdir, const char *checkout, GuardSet *s, bool bare = false) {
+static bool capture_include_hooks(GitAdmin *a, const char *gitdir, const char *checkout, const char *common, GuardSet *s, bool bare = false) {
     if (!gitdir) { s->error = "could not locate Git worktree configuration"; return false; }
     HookCandidates hooks = {};
     bool ok = hook_candidate_add(&hooks.bases, checkout, s) &&
@@ -3289,6 +3318,22 @@ static bool capture_include_hooks(GitAdmin *a, const char *gitdir, const char *c
             ok = !s->error;
         }
     }
+    // receive-pack may run from the common bare repository as well as a worktree Gitdir.
+    if (ok) ok = hook_candidate_add(&hooks.bases, common, s);
+    for (size_t i = 0; ok && i < hooks.skiplists.n; ++i) {
+        size_t bases = hooks.skiplists.v[i][0] == '/' ? 1 : hooks.bases.n;
+        for (size_t j = 0; ok && j < bases; ++j) {
+            if (g_post_signal) { s->error = "Git capture interrupted"; ok = false; break; }
+            if (++s->entries > 65536) { s->error = "Git fsck skipList candidate limit exceeded"; ok = false; break; }
+            char path[WFS_PATH_MAX];
+            if (!attributes_path(hooks.bases.v[j], hooks.skiplists.v[i], path, sizeof path)) {
+                s->error = "could not resolve Git fsck skipList"; ok = false; break;
+            }
+            capture_fsck_skiplist(a, path, s);
+            ok = !s->error;
+        }
+    }
+    sl_free(&hooks.skiplists);
     sl_free(&hooks.attributes);
     sl_free(&hooks.values);
     sl_free(&hooks.bases);
@@ -3494,7 +3539,7 @@ static bool capture_repo(GitAdmin *a, const char *gitdir, const char *common, co
     if (!nested_checkout && !sl_push(&a->owned_checkouts, checkout)) {
         s->error = "out of memory"; return false;
     }
-    if (!capture_include_hooks(a, gitdir, checkout, s, bare)) return false;
+    if (!capture_include_hooks(a, gitdir, checkout, common, s, bare)) return false;
 #ifdef __APPLE__
     if (require_home && !nested_checkout && !plan_submodules(a, gitdir, checkout, s)) {
         if (!s->error) s->error = "could not safely plan declared submodule administration";
@@ -3750,6 +3795,12 @@ static void guard_warn(const GuardRec *before, const GuardRec *after) {
         fprintf(stderr, "world: WARNING: exec %s a Git include target: ", !was ? "added" : !is ? "removed" : "changed");
         put_field(stderr, rest, strlen(rest));
         fputs(" (including inactive conditional configuration)\n", stderr);
+    } else if (id[0] == 's') {
+        bool was = before && strcmp(before->val, "absent");
+        bool is = after && strcmp(after->val, "absent");
+        fprintf(stderr, "world: WARNING: exec %s Git fsck skipList: ", !was ? "added" : !is ? "removed" : "changed");
+        put_field(stderr, rest, strlen(rest));
+        fputs(" (can admit objects and reach retained hooks)\n", stderr);
     } else if (id[0] == 'a') {
         bool was = before && strcmp(before->val, "absent");
         bool is = after && strcmp(after->val, "absent");
@@ -3818,7 +3869,7 @@ static void guard_report(const GuardSet *b, const GuardSet *a) {
         if (before && after && !strcmp(before->val, after->val)) continue;
         const char kind = (before ? before : after)->id[0];
         if (kind == 'c' && shared_with_world(b, a, before, after)) continue;
-        if ((kind == 'a' || kind == 'i' || kind == 'w' || kind == 'l' || kind == 'b' || kind == 'm' || kind == 'n') && (!before || !strcmp(before->val, "absent")) &&
+        if ((kind == 'a' || kind == 'i' || kind == 'w' || kind == 'l' || kind == 'b' || kind == 'm' || kind == 'n' || kind == 's') && (!before || !strcmp(before->val, "absent")) &&
             (!after || !strcmp(after->val, "absent"))) continue;
         if (kind == 'p') {
             bool was = before && strcmp(before->val, "absent");

@@ -82,6 +82,8 @@ int main() {
         "receive.denydeletes", "RECEIVE.DENYDELETES",
         "uploadpack.hiderefs", "receive.hiderefs", "transfer.hiderefs",
         "UPLOADPACK.HIDEREFS", "RECEIVE.HIDEREFS", "TRANSFER.HIDEREFS",
+        "receive.fsck.missingemail", "FETCH.fsck.SKIPLIST", "RECEIVE.fsck.MISSINGEMAIL",
+        "fetch.fsck.zeropaddedfilemode", "receive.fsck.skiplist",
         "push.followtags", "PUSH.FOLLOWTAGS",
         "receive.shallowupdate", "RECEIVE.SHALLOWUPDATE",
         "receive.advertiseatomic", "RECEIVE.ADVERTISEATOMIC", "receive.advertisepushoptions", "RECEIVE.ADVERTISEPUSHOPTIONS",
@@ -179,6 +181,10 @@ int main() {
     CHECK(guard_key_runs_command("push.followtags", "true"));
     CHECK(guard_key_runs_command("push.followtags", "false"));
     CHECK(guard_key_runs_command("push.followtags", NULL));
+    CHECK(guard_key_runs_command("receive.fsck.missingemail", "error"));
+    CHECK(guard_key_runs_command("receive.fsck.missingemail", "ignore"));
+    CHECK(guard_key_runs_command("fetch.fsck.skiplist", "path"));
+    CHECK(guard_key_runs_command("fetch.fsck.skiplist", NULL));
     const char *advertisement_keys[] = {"receive.advertiseatomic", "receive.advertisepushoptions"};
     for (const char *key : advertisement_keys) {
         CHECK(guard_key_runs_command(key, "true"));
@@ -288,6 +294,8 @@ int main() {
         "uploadpack.hiderefsextra", "receive.hiderefsextra", "transfer.hiderefsextra",
         "receive.custom.fsckobjects", "receive.custom.maxinputsize", "receive.fsckobjectsextra", "receive.maxinputsizeextra",
         "receive.custom.advertiseatomic", "receive.custom.advertisepushoptions", "receive.advertiseatomicextra", "receive.advertisepushoptionsextra",
+        "receive.FSCK.missingemail", "fetch.Fsck.skiplist", "receive.fsck.extra.missingemail",
+        "receive.fsck", "fetch.fsck.", "transfer.fsck.skiplist",
         "push.remote.followtags", "push.followtagsextra",
         "receive.custom.shallowupdate", "receive.shallowupdateextra",
         "receive.custom.denydeletecurrent", "receive.denydeletecurrentextra",

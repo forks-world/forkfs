@@ -5524,6 +5524,56 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'nested vendor local core.sshcommand: (unset) -> retained-ssh', p.stderr)
         self.assertNotIn(b'Git guard unavailable', p.stderr)
 
+    def test_exec_reports_fsck_policy_and_skiplist_sources(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        common = one / '.world-git/repo.git'
+        hooks = common / 'hooks'
+        hooks.mkdir(exist_ok=True)
+        marker = one / 'fsck-hook-ran'
+        original = ('#!/bin/sh\ntouch ' + shlex.quote(str(marker)) + '\n').encode()
+        for name in ('update', 'reference-transaction'):
+            (hooks / name).write_bytes(original)
+            (hooks / name).chmod(0o755)
+        self.git(one, 'config', 'receive.fsckObjects', 'true')
+        self.git(one, 'config', 'fetch.fsckObjects', 'true')
+        for section in ('receive', 'fetch'):
+            self.git(one, 'config', section + '.fsck.missingEmail', 'error')
+        self.git(one, 'config', 'receive.fsck.skipList', 'skiplist')
+        external = self.root / 'dormant-skiplist'
+        policy = common / 'dormant-fsck-policy'
+        policy.write_text('[fetch "fsck"]\n skipList = ' + str(external) + '\n')
+        self.git(one, 'config', 'includeIf.onbranch:never-fsck.path', str(policy))
+        p = self.exec_sh(wid, 'git config receive.fsck.missingEmail ignore; '
+                         'git config fetch.fsck.missingEmail warn; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local receive.fsck.missingemail: error -> ignore', p.stderr)
+        self.assertIn(b'local fetch.fsck.missingemail: error -> warn', p.stderr)
+        # Relative receive paths include the common bare repository's execution base.
+        targets = (common / 'skiplist', one / 'skiplist', external)
+        for action, value in (('added', self.base.decode() + '\n'),
+                              ('changed', '# policy changed\n' + self.base.decode() + '\n'), ('removed', None)):
+            script = '; '.join('rm ' + shlex.quote(str(path)) if value is None else
+                               'printf %s ' + shlex.quote(value) + ' > ' + shlex.quote(str(path))
+                               for path in targets)
+            p = self.exec_sh(wid, script + '; exit 7', '--no-sandbox', code=7)
+            for path in targets:
+                label = str(path.relative_to(one)) if path.is_relative_to(one) else str(path)
+                self.assertIn(b'exec ' + action.encode() + b' Git fsck skipList: ' + label.encode(), p.stderr)
+            self.assertNotIn(b'a Git hook:', p.stderr)
+            self.assertNotIn(b'local receive.fsck.skiplist:', p.stderr)
+            self.assertFalse(marker.exists())
+        for name in ('update', 'reference-transaction'):
+            self.assertEqual((hooks / name).read_bytes(), original)
+        external.symlink_to(policy)
+        p = self.exec_sh(wid, 'touch command-ran', '--require-sandbox', code=3)
+        self.assertIn(b'nonregular Git fsck skipList cannot be inspected', p.stderr)
+        self.assertFalse((one / 'command-ran').exists())
+        external.unlink()
+        self.git(one, 'config', 'receive.fsck.skipList', 'path,split')
+        p = self.exec_sh(wid, 'touch command-ran', '--require-sandbox', code=3)
+        self.assertIn(b'unsupported Git fsck skipList path', p.stderr)
+        self.assertFalse((one / 'command-ran').exists())
+
     def test_exec_reports_receive_validation_gates_with_retained_hook(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

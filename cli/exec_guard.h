@@ -205,6 +205,10 @@ static inline bool guard_key_runs_command(const char *key, const char *value) {
     size_t section = (size_t)(first - key);
     bool has_sub = last != first;
     const char *name = last + 1;
+    // Git's fsck namespace is a literal, case-sensitive subsection.
+    if (has_sub && last - first == 5 && !memcmp(first + 1, "fsck", 4) &&
+        ((section == 7 && !strncasecmp(key, "receive", section)) ||
+         (section == 5 && !strncasecmp(key, "fetch", section)))) return true;
     // Custom transfer arguments and direction select behavior of an existing adapter.
     // Restrict these to lfs.customtransfer.<name>; URL-scoped LFS keys are different.
     if (has_sub && section == 3 && !strncasecmp(key, "lfs", section) &&
