@@ -5588,6 +5588,14 @@ class GitWorldTest(unittest.TestCase):
         self.git(one, 'config', 'receive.advertiseAtomic', 'false')
         self.git(one, 'config', 'receive.advertisePushOptions', 'false')
         self.git(one, 'config', 'push.followTags', 'false')
+        self.git(one, 'config', 'push.pushOption', 'ci.skip')
+        # Removing the option can bypass the unchanged receiver's capability rejection.
+        p = self.exec_sh(wid, 'git config --unset-all push.pushOption; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local push.pushoption: ci.skip -> (unset)', p.stderr)
+        self.assertNotIn(b'local receive.advertisepushoptions:', p.stderr)
+        self.assertNotIn(b'a Git hook:', p.stderr)
+        self.assertEqual(hook.read_bytes(), original)
+        self.assertFalse((one / 'update-hook-ran').exists())
         p = self.exec_sh(wid, 'git config receive.shallowUpdate true; '
                          'git config receive.fsckObjects false; git config receive.maxInputSize 0; '
                          'git config receive.advertiseAtomic true; git config receive.advertisePushOptions true; '

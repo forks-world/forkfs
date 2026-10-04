@@ -431,6 +431,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `remote.*.uploadpack|receivepack|vcs`, `branch.*.mergeoptions`, `pull.twohead`, `pull.octopus` (can select external merge strategies),
 `branch.*.remote|pushremote`, `remote.pushdefault` (can select preconfigured helper remotes),
 `push.followtags` (can activate retained remote hooks through additional tag updates),
+`push.pushoption` (removal can bypass a receiver capability rejection and reach retained hooks),
 `push.default`, `push.autosetupremote`, `branch.*.merge`, `remote.*.push|mirror` (can enable an otherwise refused push through an existing helper),
 `remote.*.promisor|partialclonefilter`, `extensions.partialclone`
 (can activate a configured helper when fetching missing objects),

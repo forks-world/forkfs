@@ -84,7 +84,7 @@ int main() {
         "UPLOADPACK.HIDEREFS", "RECEIVE.HIDEREFS", "TRANSFER.HIDEREFS",
         "receive.fsck.missingemail", "FETCH.fsck.SKIPLIST", "RECEIVE.fsck.MISSINGEMAIL",
         "fetch.fsck.zeropaddedfilemode", "receive.fsck.skiplist",
-        "push.followtags", "PUSH.FOLLOWTAGS",
+        "push.followtags", "PUSH.FOLLOWTAGS", "push.pushoption", "PUSH.PUSHOPTION",
         "receive.shallowupdate", "RECEIVE.SHALLOWUPDATE",
         "receive.advertiseatomic", "RECEIVE.ADVERTISEATOMIC", "receive.advertisepushoptions", "RECEIVE.ADVERTISEPUSHOPTIONS",
         "receive.fsckobjects", "RECEIVE.FSCKOBJECTS", "receive.maxinputsize", "RECEIVE.MAXINPUTSIZE",
@@ -181,6 +181,9 @@ int main() {
     CHECK(guard_key_runs_command("push.followtags", "true"));
     CHECK(guard_key_runs_command("push.followtags", "false"));
     CHECK(guard_key_runs_command("push.followtags", NULL));
+    CHECK(guard_key_runs_command("push.pushoption", "ci.skip"));
+    CHECK(guard_key_runs_command("push.pushoption", ""));
+    CHECK(guard_key_runs_command("push.pushoption", NULL));
     CHECK(guard_key_runs_command("receive.fsck.missingemail", "error"));
     CHECK(guard_key_runs_command("receive.fsck.missingemail", "ignore"));
     CHECK(guard_key_runs_command("fetch.fsck.skiplist", "path"));
@@ -296,7 +299,7 @@ int main() {
         "receive.custom.advertiseatomic", "receive.custom.advertisepushoptions", "receive.advertiseatomicextra", "receive.advertisepushoptionsextra",
         "receive.FSCK.missingemail", "fetch.Fsck.skiplist", "receive.fsck.extra.missingemail",
         "receive.fsck", "fetch.fsck.", "transfer.fsck.skiplist",
-        "push.remote.followtags", "push.followtagsextra",
+        "push.remote.followtags", "push.followtagsextra", "push.remote.pushoption", "push.pushoptionextra",
         "receive.custom.shallowupdate", "receive.shallowupdateextra",
         "receive.custom.denydeletecurrent", "receive.denydeletecurrentextra",
         "core.custom.usereplacerefs", "core.usereplacerefsextra",
