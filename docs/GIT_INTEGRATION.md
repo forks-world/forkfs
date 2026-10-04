@@ -430,6 +430,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `uploadpack.packobjectshook`, `receive.procreceiverefs` (activates the configured proc-receive hook),
 `receive.denycurrentbranch` (can enable the existing push-to-checkout hook),
 `receive.shallowupdate` (can allow updates requiring shallow-boundary changes to reach retained hooks),
+`receive.fsckobjects` and `receive.maxinputsize` (can admit previously rejected incoming objects or packs and reach retained update hooks),
 `receive.denynonfastforwards`, `receive.denydeletes` and `receive.denydeletecurrent` (can let forced branch updates or permitted deletions reach the existing update hook),
 `receive.autogc`, `maintenance.auto`, `gc.auto`, `gc.autopacklimit`, `maintenance.strategy`,
 `maintenance.repo` (registers repositories for an existing maintenance scheduler),

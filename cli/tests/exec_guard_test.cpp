@@ -83,6 +83,7 @@ int main() {
         "uploadpack.hiderefs", "receive.hiderefs", "transfer.hiderefs",
         "UPLOADPACK.HIDEREFS", "RECEIVE.HIDEREFS", "TRANSFER.HIDEREFS",
         "receive.shallowupdate", "RECEIVE.SHALLOWUPDATE",
+        "receive.fsckobjects", "RECEIVE.FSCKOBJECTS", "receive.maxinputsize", "RECEIVE.MAXINPUTSIZE",
         "receive.denydeletecurrent", "RECEIVE.DENYDELETECURRENT", "core.usereplacerefs", "CORE.USEREPLACEREFS",
         "difftool.prompt", "mergetool.prompt", "DIFFTOOL.PROMPT", "MERGETOOL.PROMPT",
         "receive.denycurrentbranch", "remote.origin.promisor", "remote.team.origin.promisor",
@@ -173,6 +174,12 @@ int main() {
     CHECK(guard_key_runs_command("receive.shallowupdate", "true"));
     CHECK(guard_key_runs_command("receive.shallowupdate", "false"));
     CHECK(guard_key_runs_command("receive.shallowupdate", NULL));
+    CHECK(guard_key_runs_command("receive.fsckobjects", "true"));
+    CHECK(guard_key_runs_command("receive.fsckobjects", "false"));
+    CHECK(guard_key_runs_command("receive.fsckobjects", NULL));
+    CHECK(guard_key_runs_command("receive.maxinputsize", "1"));
+    CHECK(guard_key_runs_command("receive.maxinputsize", "0"));
+    CHECK(guard_key_runs_command("receive.maxinputsize", NULL));
     // All aliases can dispatch external commands or inject -c command-running settings.
     // Built-in submodule update modes can activate retained child filters and commands.
     CHECK(guard_key_runs_command("alias.x", "!rm -rf /"));
@@ -268,6 +275,7 @@ int main() {
         "receive.custom.denydeletes", "receive.denydeletesextra",
         "uploadpack.custom.hiderefs", "receive.custom.hiderefs", "transfer.custom.hiderefs",
         "uploadpack.hiderefsextra", "receive.hiderefsextra", "transfer.hiderefsextra",
+        "receive.custom.fsckobjects", "receive.custom.maxinputsize", "receive.fsckobjectsextra", "receive.maxinputsizeextra",
         "receive.custom.shallowupdate", "receive.shallowupdateextra",
         "receive.custom.denydeletecurrent", "receive.denydeletecurrentextra",
         "core.custom.usereplacerefs", "core.usereplacerefsextra",

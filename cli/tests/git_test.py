@@ -5441,7 +5441,7 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'exec removed a Git attributes directory alias: dangling', p.stderr)
         self.assertFalse(marker.exists())
 
-    def test_exec_reports_shallow_update_gate_with_retained_hook(self):
+    def test_exec_reports_receive_validation_gates_with_retained_hook(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
         hook = one / '.world-git/repo.git/hooks/update'
@@ -5450,8 +5450,14 @@ class GitWorldTest(unittest.TestCase):
         hook.write_bytes(original)
         hook.chmod(0o755)
         self.git(one, 'config', 'receive.shallowUpdate', 'false')
-        p = self.exec_sh(wid, 'git config receive.shallowUpdate true; exit 7', '--no-sandbox', code=7)
+        self.git(one, 'config', 'receive.fsckObjects', 'true')
+        self.git(one, 'config', 'receive.maxInputSize', '1')
+        p = self.exec_sh(wid, 'git config receive.shallowUpdate true; '
+                         'git config receive.fsckObjects false; git config receive.maxInputSize 0; exit 7',
+                         '--no-sandbox', code=7)
         self.assertIn(b'local receive.shallowupdate: false -> true', p.stderr)
+        self.assertIn(b'local receive.fsckobjects: true -> false', p.stderr)
+        self.assertIn(b'local receive.maxinputsize: 1 -> 0', p.stderr)
         self.assertNotIn(b'a Git hook:', p.stderr)
         self.assertEqual(hook.read_bytes(), original)
         self.assertFalse((one / 'update-hook-ran').exists())
