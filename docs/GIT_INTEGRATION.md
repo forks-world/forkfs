@@ -469,7 +469,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 (can activate child status, diff or log commands and their configured programs),
 `includeif.*.path`, `alias.*` (including ordinary aliases that dispatch commands or inject `-c` settings),
 `submodule.*.update` (all modes and removal: enabling built-in checkout, merge or rebase can
-activate retained child filters and commands), `pager.*`, `interactive.difffilter`, `web.browser`, `help.autocorrect` (can dispatch corrected external Git commands), `help.browser`, `help.format`, `instaweb.browser`, `man.viewer` (select configured viewers), `browser.*.cmd|path`, `instaweb.httpd`, `guitool.*.cmd`, `imap.tunnel`,
+activate retained child filters and commands), `pager.*`, `interactive.difffilter`, `web.browser`, `help.autocorrect` (can dispatch corrected external Git commands), `help.browser`, `help.format`, `instaweb.browser`, `man.viewer` (select configured viewers), `browser.*.cmd|path`, `instaweb.httpd`, `guitool.*.cmd`, `imap.tunnel`, `svn.authorsprog` (maps unmapped authors by executing a program during Git SVN import),
 `man.*.cmd|path`, `init.templatedir`, `hook.*.command|event|enabled` (including activation of traditional hooks), `trailer.*.command|cmd`, `tar.*.command|remote`, `uploadarchive.allowunreachable`
 (including activation of an unchanged archive command),
 `protocol.allow` and `protocol.*.allow` (which can enable `ext::` URLs), and

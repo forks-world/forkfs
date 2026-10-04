@@ -171,7 +171,7 @@ static const GuardKey kGuardKeys[] = {
     {"push", "recursesubmodules", 0, false},
     {"alias", NULL, 2, false},             {"submodule", "update", 1, false},
     {"pager", NULL, 0, false},            {"interactive", "difffilter", 0, false},
-    {"imap", "tunnel", 0, false},
+    {"imap", "tunnel", 0, false}, {"svn", "authorsprog", 0, false},
     {"instaweb", "httpd", 0, false},      {"guitool", "cmd", 1, false},
     {"help", "autocorrect", 0, false},
     {"help", "browser", 0, false},        {"help", "format", 0, false},

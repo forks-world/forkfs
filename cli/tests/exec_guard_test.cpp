@@ -132,6 +132,7 @@ int main() {
         "lfs.basictransfersonly", "help.autocorrect", "lfs.standalonetransferagent", "lfs.https://example.invalid/repo.standalonetransferagent",
         "help.browser", "help.format", "instaweb.browser", "man.viewer",
         "includeif.gitdir:/x/.path", "pager.log", "interactive.difffilter", "web.browser",
+        "svn.authorsprog", "SVN.AUTHORSPROG",
         "imap.tunnel", "instaweb.httpd", "guitool.test.cmd", "browser.ff.cmd", "man.x.cmd", "init.templatedir", "hook.lint.command",
         "trailer.sign.command", "protocol.allow", "protocol.ext.allow",
         "lfs.customtransfer.x.path", "lfs.extension.x.clean",
@@ -196,6 +197,9 @@ int main() {
     CHECK(guard_key_runs_command("push.pushoption", "ci.skip"));
     CHECK(guard_key_runs_command("push.pushoption", ""));
     CHECK(guard_key_runs_command("push.pushoption", NULL));
+    CHECK(guard_key_runs_command("svn.authorsprog", "./author-map"));
+    CHECK(guard_key_runs_command("svn.authorsprog", ""));
+    CHECK(guard_key_runs_command("svn.authorsprog", NULL));
     CHECK(guard_key_runs_command("gc.packrefs", "false"));
     CHECK(guard_key_runs_command("gc.packrefs", "true"));
     CHECK(guard_key_runs_command("gc.packrefs", NULL));
@@ -366,6 +370,7 @@ int main() {
         "format.custom.commitlistformat", "format.custom.coverletter", "rebase.custom.instructionformat", "diff.custom.ignoresubmodules", "diff.custom.submodule", "status.custom.submodulesummary", "submodule.ignore", "submodule.library.ignoreextra", "submodule.library.activeextra",
         "log.custom.showsignature", "merge.custom.verifysignatures", "format.custom.pretty",
         "help.custom.browser", "help.custom.format", "instaweb.custom.browser", "man.custom.viewer",
+        "svn.custom.authorsprog", "svn.authorsprogextra", "svn.authorsfile",
         "imap.host", "imap.custom.tunnel", "instaweb.port", "instaweb.custom.httpd", "guitool.cmd", "guitool.test.title",
         "commit.custom.gpgsign", "tag.custom.gpgsign", "tag.custom.forcesignannotated",
         "push.custom.gpgsign", "gpg.custom.format", "credential.username", "init.defaultbranch", "", ".", "core.", "nodot",

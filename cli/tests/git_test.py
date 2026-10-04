@@ -6548,6 +6548,19 @@ class GitWorldTest(unittest.TestCase):
         for marker in (helper_marker, filter_marker, hook_marker):
             self.assertFalse(marker.exists())
 
+    def test_exec_reports_svn_authors_program_without_executing_it(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        marker = one / 'svn-authors-ran'
+        program = one / 'author-map'
+        program.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(marker)) + '\n')
+        program.chmod(0o755)
+        original = program.read_bytes()
+        p = self.exec_sh(wid, 'git config svn.authorsProg ./author-map; exit 7', '--no-sandbox', code=7)
+        self.assertIn(b'local svn.authorsprog: (unset) -> ./author-map', p.stderr)
+        self.assertEqual(program.read_bytes(), original)
+        self.assertFalse(marker.exists())
+
     def test_exec_reports_hook_and_object_validation_activation(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
