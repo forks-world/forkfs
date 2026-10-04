@@ -5619,6 +5619,50 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'nested vendor local core.sshcommand: (unset) -> retained-ssh', p.stderr)
         self.assertNotIn(b'Git guard unavailable', p.stderr)
 
+    def test_exec_reports_ssh_verification_files_with_retained_postmerge_hook(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        marker = one / 'ssh-verification-command-ran'
+        hook = one / '.world-git/repo.git/hooks/post-merge'
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(marker)) + '\n')
+        hook.chmod(0o755)
+        original = hook.read_bytes()
+        self.git(one, 'config', 'merge.verifySignatures', 'true')
+        self.git(one, 'config', 'gpg.format', 'ssh')
+        verifier = one / '.world-git/retained-ssh-verifier'
+        verifier.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(marker)) + '\n')
+        verifier.chmod(0o755)
+        self.git(one, 'config', 'gpg.ssh.program', str(verifier))
+        # SSH paths are individual argv entries; spaces and fsck delimiters are valid.
+        relative = '.world-git/trusted signers,|keys'
+        self.git(one, 'config', 'gpg.ssh.allowedSignersFile', relative)
+        external = self.root / 'dormant-revocations'
+        policy = one / '.world-git/dormant-ssh-policy'
+        policy.write_text('[gpg "ssh"]\n revocationFile = ' + str(external) + '\n')
+        self.git(one, 'config', 'includeIf.onbranch:never-ssh-policy.path', str(policy))
+        policy_bytes = policy.read_bytes()
+        targets = (one / relative, external)
+        for action, value in (('added', '# initial trust policy\n'), ('changed', '# changed trust policy\n'),
+                              ('removed', None)):
+            script = '; '.join('rm ' + shlex.quote(str(path)) if value is None else
+                               'printf %s ' + shlex.quote(value) + ' > ' + shlex.quote(str(path))
+                               for path in targets)
+            p = self.exec_sh(wid, script + '; exit 7', '--no-sandbox', code=7)
+            for path in targets:
+                label = str(path.relative_to(one)) if path.is_relative_to(one) else str(path)
+                self.assertIn(b'exec ' + action.encode() + b' Git SSH verification file: ' + label.encode(), p.stderr)
+            self.assertNotIn(b'a Git hook:', p.stderr)
+            self.assertNotIn(b'a Git include target:', p.stderr)
+            self.assertNotIn(b'local gpg.ssh.program:', p.stderr)
+            self.assertEqual(hook.read_bytes(), original)
+            self.assertEqual(policy.read_bytes(), policy_bytes)
+            self.assertFalse(marker.exists())
+        external.symlink_to(policy)
+        p = self.exec_sh(wid, 'touch command-ran', '--require-sandbox', code=3)
+        self.assertIn(b'nonregular Git SSH verification file cannot be inspected', p.stderr)
+        self.assertFalse((one / 'command-ran').exists())
+
     def test_exec_reports_fsck_policy_and_skiplist_sources(self):
         self.world('init', str(self.source))
         one, wid = self.fork()

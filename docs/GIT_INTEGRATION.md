@@ -354,6 +354,12 @@ warning.
   (including replacement-object content). These confined queries disable fsmonitor and lazy
   fetching and share the existing entry, content and query-time budgets; unavailable objects
   invalidate capture instead of silently omitting fallback attributes. No filters are run;
+- `gpg.ssh.allowedSignersFile` and `gpg.ssh.revocationFile` trust sources, including dormant
+  configuration: regular contents and absent files are recorded because signature acceptance
+  can enable an operation to reach retained hooks. Typed path expansion and candidate execution
+  bases follow the same bounded capture as skip lists, but spaces, commas and `|` are valid
+  SSH filenames. Empty values and `/dev/null` are omitted from file capture; final symlinks/nonregular sources
+  make capture unavailable. These files stay writable and no signature verifier is executed;
 - `receive.fsck.skipList` and `fetch.fsck.skipList` files, including dormant include values:
   regular contents and absent sources are captured without running object validation. Relative
   paths are considered from checkout, Gitdir, common-repository and dormant worktree bases;
