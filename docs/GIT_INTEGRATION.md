@@ -432,6 +432,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `branch.*.remote|pushremote`, `remote.pushdefault` (can select preconfigured helper remotes),
 `push.followtags` (can activate retained remote hooks through additional tag updates),
 `push.pushoption` (removal can bypass a receiver capability rejection and reach retained hooks),
+`push.useforceifincludes` (disabling the inclusion check can let a force-with-lease push reach retained hooks),
 `push.default`, `push.autosetupremote`, `branch.*.merge`, `remote.*.push|mirror` (can enable an otherwise refused push through an existing helper),
 `remote.*.promisor|partialclonefilter`, `extensions.partialclone`
 (can activate a configured helper when fetching missing objects),
@@ -439,6 +440,7 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `uploadpack.packobjectshook`, `receive.procreceiverefs` (activates the configured proc-receive hook),
 `receive.denycurrentbranch` (can enable the existing push-to-checkout hook),
 `receive.shallowupdate` (can allow updates requiring shallow-boundary changes to reach retained hooks),
+`receive.certnonceseed` (can enable signed pushes to reach retained hooks),
 `receive.advertiseatomic` and `receive.advertisepushoptions` (can permit capability-dependent pushes to reach retained hooks),
 `receive.fsck.*` and `fetch.fsck.*` (severity and skip-list policies),
 `receive.fsckobjects` and `receive.maxinputsize` (can admit previously rejected incoming objects or packs and reach retained update hooks),

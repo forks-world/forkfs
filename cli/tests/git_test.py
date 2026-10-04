@@ -5588,6 +5588,7 @@ class GitWorldTest(unittest.TestCase):
         self.git(one, 'config', 'receive.advertiseAtomic', 'false')
         self.git(one, 'config', 'receive.advertisePushOptions', 'false')
         self.git(one, 'config', 'push.followTags', 'false')
+        self.git(one, 'config', 'push.useForceIfIncludes', 'true')
         self.git(one, 'config', 'push.pushOption', 'ci.skip')
         # Removing the option can bypass the unchanged receiver's capability rejection.
         p = self.exec_sh(wid, 'git config --unset-all push.pushOption; exit 7', '--no-sandbox', code=7)
@@ -5599,7 +5600,8 @@ class GitWorldTest(unittest.TestCase):
         p = self.exec_sh(wid, 'git config receive.shallowUpdate true; '
                          'git config receive.fsckObjects false; git config receive.maxInputSize 0; '
                          'git config receive.advertiseAtomic true; git config receive.advertisePushOptions true; '
-                         'git config push.followTags true; exit 7',
+                         'git config push.followTags true; git config push.useForceIfIncludes false; '
+                         'git config receive.certNonceSeed test-seed; exit 7',
                          '--no-sandbox', code=7)
         self.assertIn(b'local receive.shallowupdate: false -> true', p.stderr)
         self.assertIn(b'local receive.fsckobjects: true -> false', p.stderr)
@@ -5607,6 +5609,8 @@ class GitWorldTest(unittest.TestCase):
         self.assertIn(b'local receive.advertiseatomic: false -> true', p.stderr)
         self.assertIn(b'local receive.advertisepushoptions: false -> true', p.stderr)
         self.assertIn(b'local push.followtags: false -> true', p.stderr)
+        self.assertIn(b'local push.useforceifincludes: true -> false', p.stderr)
+        self.assertIn(b'local receive.certnonceseed: (unset) -> test-seed', p.stderr)
         self.assertNotIn(b'a Git hook:', p.stderr)
         self.assertEqual(hook.read_bytes(), original)
         self.assertFalse((one / 'update-hook-ran').exists())

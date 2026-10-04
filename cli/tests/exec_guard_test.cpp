@@ -84,6 +84,7 @@ int main() {
         "UPLOADPACK.HIDEREFS", "RECEIVE.HIDEREFS", "TRANSFER.HIDEREFS",
         "receive.fsck.missingemail", "FETCH.fsck.SKIPLIST", "RECEIVE.fsck.MISSINGEMAIL",
         "fetch.fsck.zeropaddedfilemode", "receive.fsck.skiplist",
+        "push.useforceifincludes", "PUSH.USEFORCEIFINCLUDES", "receive.certnonceseed", "RECEIVE.CERTNONCESEED",
         "push.followtags", "PUSH.FOLLOWTAGS", "push.pushoption", "PUSH.PUSHOPTION",
         "receive.shallowupdate", "RECEIVE.SHALLOWUPDATE",
         "receive.advertiseatomic", "RECEIVE.ADVERTISEATOMIC", "receive.advertisepushoptions", "RECEIVE.ADVERTISEPUSHOPTIONS",
@@ -184,6 +185,12 @@ int main() {
     CHECK(guard_key_runs_command("push.pushoption", "ci.skip"));
     CHECK(guard_key_runs_command("push.pushoption", ""));
     CHECK(guard_key_runs_command("push.pushoption", NULL));
+    CHECK(guard_key_runs_command("push.useforceifincludes", "true"));
+    CHECK(guard_key_runs_command("push.useforceifincludes", "false"));
+    CHECK(guard_key_runs_command("push.useforceifincludes", NULL));
+    CHECK(guard_key_runs_command("receive.certnonceseed", "test-seed"));
+    CHECK(guard_key_runs_command("receive.certnonceseed", ""));
+    CHECK(guard_key_runs_command("receive.certnonceseed", NULL));
     CHECK(guard_key_runs_command("receive.fsck.missingemail", "error"));
     CHECK(guard_key_runs_command("receive.fsck.missingemail", "ignore"));
     CHECK(guard_key_runs_command("fetch.fsck.skiplist", "path"));
@@ -299,6 +306,8 @@ int main() {
         "receive.custom.advertiseatomic", "receive.custom.advertisepushoptions", "receive.advertiseatomicextra", "receive.advertisepushoptionsextra",
         "receive.FSCK.missingemail", "fetch.Fsck.skiplist", "receive.fsck.extra.missingemail",
         "receive.fsck", "fetch.fsck.", "transfer.fsck.skiplist",
+        "push.remote.useforceifincludes", "push.useforceifincludesextra",
+        "receive.remote.certnonceseed", "receive.certnonceseedextra",
         "push.remote.followtags", "push.followtagsextra", "push.remote.pushoption", "push.pushoptionextra",
         "receive.custom.shallowupdate", "receive.shallowupdateextra",
         "receive.custom.denydeletecurrent", "receive.denydeletecurrentextra",
