@@ -77,6 +77,8 @@ int main() {
         "http.https://example.invalid/repo.sslcertpasswordprotected",
         "HTTP.https://example.invalid/repo.PROXYSSLCERTPASSWORDPROTECTED",
         "receive.autogc", "maintenance.auto", "maintenance.strategy", "maintenance.repo", "gc.auto", "gc.autopacklimit",
+        "uploadpackfilter.allow", "UPLOADPACKFILTER.ALLOW", "uploadpackfilter.blob:none.allow",
+        "uploadpackfilter.tree.allow", "uploadpackfilter.tree.maxdepth", "UPLOADPACKFILTER.tree.MAXDEPTH",
         "attr.tree", "ATTR.TREE", "maintenance.pack-refs.enabled", "MAINTENANCE.pack-refs.SCHEDULE",
         "maintenance.gc.enabled", "maintenance.prefetch.enabled", "maintenance.prefetch.schedule", "maintenance.gc.schedule", "fetch.bundleuri", "transfer.bundleuri", "TRANSFER.BUNDLEURI",
         "MAINTENANCE.gc.ENABLED", "Maintenance.prefetch.Schedule",
@@ -205,6 +207,12 @@ int main() {
     CHECK(guard_key_runs_command("gc.packrefs", NULL));
     CHECK(guard_key_runs_command("attr.tree", "HEAD"));
     CHECK(guard_key_runs_command("attr.tree", NULL));
+    CHECK(guard_key_runs_command("uploadpackfilter.allow", "false"));
+    CHECK(guard_key_runs_command("uploadpackfilter.blob:none.allow", "true"));
+    CHECK(guard_key_runs_command("uploadpackfilter.allow", NULL));
+    CHECK(guard_key_runs_command("uploadpackfilter.tree.maxdepth", "0"));
+    CHECK(guard_key_runs_command("uploadpackfilter.tree.maxdepth", "5"));
+    CHECK(guard_key_runs_command("uploadpackfilter.tree.maxdepth", NULL));
     CHECK(guard_key_runs_command("transfer.bundleuri", "true"));
     CHECK(guard_key_runs_command("transfer.bundleuri", "false"));
     CHECK(guard_key_runs_command("transfer.bundleuri", NULL));
@@ -330,6 +338,8 @@ int main() {
         "lfs.https://example.invalid/repo.standalonetransferagentextra",
         "receive.custom.autogc", "maintenance.custom.auto", "maintenance.custom.strategy", "maintenance.custom.repo",
         "gc.custom.auto", "gc.custom.autopacklimit", "maintenance.GC.enabled", "maintenance.Prefetch.enabled",
+        "uploadpackfilter.maxdepth", "uploadpackfilter.blob.maxdepth", "uploadpackfilter.Tree.maxdepth",
+        "uploadpackfilter.tree.custom.maxdepth", "uploadpackfilter.tree.maxdepthextra", "uploadpackfilter.allowextra",
         "attr.custom.tree", "attr.treeextra", "maintenance.Pack-refs.enabled",
         "maintenance.team.pack-refs.schedule", "maintenance.pack-refs.enabledextra",
         "maintenance.GC.schedule", "maintenance.gc.scheduleextra", "fetch.custom.bundleuri", "transfer.custom.bundleuri", "transfer.bundleuriextra", "maintenance.commit-graph.enabled", "maintenance.repack.enabled",

@@ -446,6 +446,8 @@ The settings watched (Git's lowercase key names; `*` is any subsection): `core.h
 `remote.*.promisor|partialclonefilter`, `extensions.partialclone`
 (can activate a configured helper when fetching missing objects),
 `uploadpack.hiderefs`, `receive.hiderefs` and `transfer.hiderefs` (can let newly visible refs reach retained transfer commands or update hooks),
+`uploadpackfilter.allow`, `uploadpackfilter.*.allow`, `uploadpackfilter.tree.maxdepth`
+(can admit filtered fetches that reach a retained pack-objects hook; `tree` is case-sensitive),
 `uploadpack.packobjectshook`, `receive.procreceiverefs` (activates the configured proc-receive hook),
 `receive.denycurrentbranch` (can enable the existing push-to-checkout hook),
 `receive.shallowupdate` (can allow updates requiring shallow-boundary changes to reach retained hooks),

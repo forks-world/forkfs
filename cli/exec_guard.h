@@ -75,6 +75,7 @@ struct GuardKey {
 
 static const GuardKey kGuardKeys[] = {
     {"attr", "tree", 0, false},
+    {"uploadpackfilter", "allow", 2, false},
     {"http", "followredirects", 2, false}, {"http", "sslverify", 2, false},
     {"http", "proxy", 2, false}, {"remote", "proxy", 1, false},
     {"http", "sslcert", 2, false}, {"http", "proxysslcert", 2, false},
@@ -210,6 +211,8 @@ static inline bool guard_key_runs_command(const char *key, const char *value) {
     size_t section = (size_t)(first - key);
     bool has_sub = last != first;
     const char *name = last + 1;
+    if (has_sub && section == 16 && !strncasecmp(key, "uploadpackfilter", section) &&
+        last - first == 5 && !memcmp(first + 1, "tree", 4) && !strcasecmp(name, "maxdepth")) return true;
     // Git's fsck namespace is a literal, case-sensitive subsection.
     if (has_sub && last - first == 5 && !memcmp(first + 1, "fsck", 4) &&
         ((section == 7 && !strncasecmp(key, "receive", section)) ||

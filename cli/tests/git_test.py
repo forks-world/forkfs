@@ -5123,6 +5123,30 @@ class GitWorldTest(unittest.TestCase):
                 self.assertFalse((one / 'should-not-run').exists())
                 target.unlink()
 
+    def test_exec_reports_upload_filter_gates_with_retained_pack_hook(self):
+        self.world('init', str(self.source))
+        one, wid = self.fork()
+        home = self.root / 'upload-filter-home'
+        home.mkdir()
+        self.env['HOME'] = str(home)
+        self.env['GIT_CONFIG_GLOBAL'] = str(home / '.gitconfig')
+        marker = one / 'filter-pack-hook-ran'
+        command = 'touch ' + shlex.quote(str(marker))
+        self.git(one, 'config', '--global', 'uploadpack.packObjectsHook', command)
+        self.git(one, 'config', 'uploadpack.allowFilter', 'true')
+        for key in ('uploadpackfilter.allow', 'uploadpackfilter.blob:none.allow'):
+            self.git(one, 'config', key, 'false')
+        self.git(one, 'config', 'uploadpackfilter.tree.maxDepth', '0')
+        p = self.exec_sh(wid, "git config uploadpackfilter.allow true; "
+                         "git config uploadpackfilter.blob:none.allow true; "
+                         "git config uploadpackfilter.tree.maxDepth 5; exit 7", '--no-sandbox', code=7)
+        for key in ('uploadpackfilter.allow', 'uploadpackfilter.blob:none.allow'):
+            self.assertIn(b'local ' + key.encode() + b': false -> true', p.stderr)
+        self.assertIn(b'local uploadpackfilter.tree.maxdepth: 0 -> 5', p.stderr)
+        self.assertNotIn(b'global uploadpack.packobjectshook:', p.stderr)
+        self.assertEqual(self.git(one, 'config', '--global', '--get', 'uploadpack.packObjectsHook').stdout.strip(), command.encode())
+        self.assertFalse(marker.exists())
+
     def test_exec_reports_global_bundle_transfer_activation(self):
         self.world('init', str(self.source))
         one, wid = self.fork()
