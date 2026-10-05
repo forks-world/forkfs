@@ -172,7 +172,77 @@ const char *kSchema =
     "  owner_pid INTEGER NOT NULL DEFAULT 0,"
     "  owner_start INTEGER NOT NULL DEFAULT 0,"
     "  state INTEGER NOT NULL DEFAULT 0);"   /* 0 = being cloned, 1 = ready */
-    "CREATE INDEX IF NOT EXISTS pool_snap ON pool(snapshot_id, state);";
+    "CREATE INDEX IF NOT EXISTS pool_snap ON pool(snapshot_id, state);"
+    // Continuous work history (docs/CONTINUOUS_WORK_HISTORY.md). These tables are additive and
+    // live beside the checkpoint machinery: a Work revision is NOT a snapshot and cannot restore
+    // Git administration or excluded build outputs. The immutable bytes live outside the
+    // database, under <store>/content/<aa>/<sha256> (history.cpp), which no collector walks --
+    // unlike snapshots, trash and the pool -- so older cores opening this store leave them alone.
+    //
+    // content: one row per distinct byte sequence, keyed by its SHA-256 hex. `size` lets a reader
+    // size a result without opening the object; `refs` is maintained by history.cpp and is the
+    // hook a future collector pins against.
+    "CREATE TABLE IF NOT EXISTS content("
+    "  hash TEXT PRIMARY KEY,"
+    "  size INTEGER NOT NULL DEFAULT 0,"
+    "  refs INTEGER NOT NULL DEFAULT 0,"
+    "  created_at INTEGER NOT NULL DEFAULT 0);"
+    // revisions: a stable ids sequence (the CLI spells them R<n>), one per recorded batch. The
+    // single-writer publication order is this table's id; a world's `parent_revision` is the
+    // revision it was recorded against, not a claim about filesystem write order. `baseline` is
+    // the snapshot the World was forked from at record time, kept for diagnostics.
+    "CREATE TABLE IF NOT EXISTS revisions("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  world_id INTEGER NOT NULL,"
+    "  parent_revision INTEGER NOT NULL DEFAULT 0,"
+    "  baseline_snapshot INTEGER NOT NULL DEFAULT 0,"
+    "  origin INTEGER NOT NULL DEFAULT 0,"
+    "  coverage INTEGER NOT NULL DEFAULT 0,"
+    "  actor_id TEXT NOT NULL DEFAULT '',"
+    "  turn_id TEXT NOT NULL DEFAULT '',"
+    "  tool_call_id TEXT NOT NULL DEFAULT '',"
+    "  git_head TEXT NOT NULL DEFAULT '',"
+    "  capture_started_at INTEGER NOT NULL DEFAULT 0,"
+    "  capture_finished_at INTEGER NOT NULL DEFAULT 0,"
+    "  created_at INTEGER NOT NULL DEFAULT 0,"
+    /* Per-revision counters, so `history` does not run one aggregate per row. */
+    "  changes INTEGER NOT NULL DEFAULT 0,"
+    "  added INTEGER NOT NULL DEFAULT 0,"
+    "  modified INTEGER NOT NULL DEFAULT 0,"
+    "  deleted INTEGER NOT NULL DEFAULT 0,"
+    "  meta INTEGER NOT NULL DEFAULT 0);"
+    "CREATE INDEX IF NOT EXISTS revisions_world ON revisions(world_id, id);"
+    // changes: one row per path that differs from the previous revision's recorded state. This
+    // is the incremental delta a revision means -- NOT the whole tree and NOT the difference
+    // against the baseline snapshot. `change` and `kind` are the wfs_change / wfs_type codes.
+    "CREATE TABLE IF NOT EXISTS changes("
+    "  revision_id INTEGER NOT NULL,"
+    "  seq INTEGER NOT NULL,"
+    "  file_id INTEGER NOT NULL DEFAULT 0,"
+    "  change INTEGER NOT NULL DEFAULT 0,"
+    "  kind INTEGER NOT NULL DEFAULT 0,"
+    "  old_path TEXT NOT NULL DEFAULT '',"
+    "  new_path TEXT NOT NULL DEFAULT '',"
+    "  before_hash TEXT NOT NULL DEFAULT '',"
+    "  after_hash TEXT NOT NULL DEFAULT '',"
+    "  size INTEGER NOT NULL DEFAULT 0,"
+    "  mode INTEGER NOT NULL DEFAULT 0,"
+    "  PRIMARY KEY(revision_id, seq));"
+    // history_files: the logical identity table. A path keeps its file_id across revisions so a
+    // future managed rename can carry identity; `last_hash`/`last_kind`/`last_mode` is the state
+    // the most recent recorded revision left the path in, and is what makes the next record
+    // incremental instead of a fresh diff against the baseline. last_hash = '' with last_kind = 0
+    // means "recorded absent" (a path a revision deleted); a missing row means "never recorded",
+    // so the baseline snapshot is the state to compare against.
+    "CREATE TABLE IF NOT EXISTS history_files("
+    "  file_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  world_id INTEGER NOT NULL,"
+    "  path TEXT NOT NULL,"
+    "  last_hash TEXT NOT NULL DEFAULT '',"
+    "  last_kind INTEGER NOT NULL DEFAULT 0,"
+    "  last_mode INTEGER NOT NULL DEFAULT 0,"
+    "  last_revision INTEGER NOT NULL DEFAULT 0,"
+    "  UNIQUE(world_id, path));";
 
 // Columns added after the first schema-2 stores were written. They are additive and carry
 // defaults, so an older core reading such a store still works and VERSION does not change on
@@ -235,7 +305,7 @@ const Migration kMigrations[] = {
 // with 2 never saw a later ALTER TABLE. The revision counter keeps counting across the 2 -> 3
 // bump: it numbers additive steps, and never resetting it means no two stamps this core has
 // ever written collide.
-const int kSchemaRev = 4;
+const int kSchemaRev = 5;
 inline int user_version_want(void) { return WFS_STORE_SCHEMA * 100 + kSchemaRev; }
 
 // Does `table` have a column called `column`, right now, in this database? The table names are
@@ -1510,7 +1580,7 @@ extern "C" int wfs_store_open(const char *store_dir, wfs_store **out) {
 
     wfs_store *s = new wfs_store();
     s->dir.assign(real.c_str());
-    for (const char *sub : {"/snapshots", "/trash", "/locks", "/tmp", "/pool", "/logs"}) {
+    for (const char *sub : {"/snapshots", "/trash", "/locks", "/tmp", "/pool", "/logs", "/content"}) {
         String p(s->dir);
         p.append(sub);
         if (int rc = wfs::fs_mkdir_p(p.c_str())) { wfs_store_close(s); return rc; }

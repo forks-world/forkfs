@@ -90,6 +90,56 @@ static void json_world(FILE *out, const wfs_world_rec &v, const wfs_git_info *gi
     }
 }
 
+static const char *json_change_code(int change) {
+    switch (change) {
+    case 'A': return "added";
+    case 'M': return "modified";
+    case 'D': return "deleted";
+    case 'T': return "metadata";
+    default: return "unknown";
+    }
+}
+
+static const char *json_coverage(int c) {
+    switch (c) {
+    case WFS_RV_COVERAGE_MEDIATED: return "mediated";
+    case WFS_RV_COVERAGE_OBSERVED: return "observed";
+    case WFS_RV_COVERAGE_INCOMPLETE: return "incomplete";
+    default: return "unknown";
+    }
+}
+
+static const char *json_origin(int o) {
+    switch (o) {
+    case WFS_RV_ORIGIN_TOOL: return "tool";
+    case WFS_RV_ORIGIN_FILESYSTEM: return "filesystem";
+    case WFS_RV_ORIGIN_RESTORE: return "restore";
+    default: return "unknown";
+    }
+}
+
+static void json_revision(FILE *out, const wfs_revision_rec &v) {
+    Json j(out);
+    j.num("schema_version", 1); j.str("kind", "revision"); j.ref("id", 'R', v.id);
+    j.ref("world_id", 'W', v.world_id); j.ref("parent_revision", 'R', v.parent_revision);
+    j.ref("baseline_snapshot", 'S', v.baseline_snapshot);
+    j.str("origin", json_origin(v.origin)); j.str("coverage", json_coverage(v.coverage));
+    j.str("actor_id", v.actor_id); j.str("turn_id", v.turn_id); j.str("tool_call_id", v.tool_call_id);
+    j.str("git_head", v.git_head);
+    j.signed_num("capture_started_at", v.capture_started_at);
+    j.signed_num("capture_finished_at", v.capture_finished_at);
+    j.signed_num("created_at", v.created_at);
+    j.num("changes", v.changes); j.num("added", v.added); j.num("modified", v.modified);
+    j.num("deleted", v.deleted); j.num("meta", v.meta);
+}
+
+static void json_revision_change(FILE *out, const wfs_revision_change &c) {
+    Json j(out);
+    j.num("file_id", c.file_id); j.str("change", json_change_code(c.change));
+    j.str("path", c.path); j.str("before_hash", c.before_hash); j.str("after_hash", c.after_hash);
+    j.num("size", c.size); j.num("mode", c.mode);
+}
+
 static int json_list(wfs_store *s, wfs_snapshot_rec *v, size_t cap, size_t *n) {
     return wfs_snapshot_list(s, v, cap, n);
 }
