@@ -425,7 +425,9 @@ int capture_state(wfs_store *s, const char *path, State &st) {
 // ---- database helpers ------------------------------------------------------------------------
 
 int history_prev(wfs_store *s, wfs_id world, const char *path, State &st, bool &has_row) {
-    Stmt q(s->db, "SELECT last_hash, last_kind, last_mode FROM history_files WHERE world_id=? AND path=?");
+    Stmt q(s->db,
+           "SELECT last_hash, last_kind, last_mode, last_size FROM history_files"
+           " WHERE world_id=? AND path=?");
     if (!q.ok()) return -EIO;
     q.i64(1, (int64_t)world);
     q.text(2, path);
@@ -434,6 +436,7 @@ int history_prev(wfs_store *s, wfs_id world, const char *path, State &st, bool &
     st.hash.assign(q.col_text(0));
     st.kind = (int)q.col_i64(1);
     st.mode = (uint32_t)q.col_i64(2);
+    st.size = (uint64_t)q.col_i64(3);
     st.present = st.kind != 0;
     return 0;
 }
@@ -504,6 +507,13 @@ void fill_revision(Stmt &q, wfs_revision_rec &r) {
     r.meta = (uint64_t)q.col_i64(17);
 }
 
+// A regular file whose content could not be captured -- over the size budget, or unreadable when
+// it was read -- carries no hash. The absence of a hash is not "the same content": it is a state
+// whose content is unknown, and a revision that contains one can never be called lossless.
+bool hashless_file(const State &s) {
+    return s.present && s.kind == WFS_T_FILE && s.hash.size() == 0;
+}
+
 // The incremental verdict: what changed between the state a path is in now and the state the
 // previous revision left it in. Content and kind are the source identity; a mode change alone is
 // metadata. uid/gid/mtime/xattr-only differences are not source history and are not recorded.
@@ -512,6 +522,12 @@ bool differs(const State &cur, const State &prev, int &change) {
     if (cur.present && !prev.present) { change = WFS_C_ADDED; return true; }
     if (!cur.present && prev.present) { change = WFS_C_DELETED; return true; }
     if (cur.hash != prev.hash || cur.kind != prev.kind) { change = WFS_C_MODIFIED; return true; }
+    // Two regular files with no content on either side (both over the budget): only their sizes
+    // can tell them apart, and equal hashes that are both empty are not equality of content.
+    if (cur.kind == WFS_T_FILE && cur.hash.size() == 0 && cur.size != prev.size) {
+        change = WFS_C_MODIFIED;
+        return true;
+    }
     if (cur.mode != prev.mode) { change = WFS_C_META; return true; }
     return false;
 }
@@ -633,7 +649,10 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
                 String bp = joinp(sr.path, rel);
                 if (int e = capture_state(s, bp.c_str(), prev)) return e;
             }
-            if (cur.incoherent || prev.incoherent) incoherent = true;
+            // A revision that touches a regular file whose content is unknown on either side is
+            // incomplete, whatever the diff happened to say about it.
+            if (cur.incoherent || prev.incoherent || hashless_file(cur) || hashless_file(prev))
+                incoherent = true;
 
             int change = 0;
             if (!differs(cur, prev, change)) continue;
@@ -678,6 +697,9 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
                 base.mode = (uint32_t)q.col_i64(8);
                 base.size = (uint64_t)q.col_i64(9);
                 base.present = base.kind != 0;
+                // The baseline's content being unavailable is a property that survives: a path
+                // reconciled against it stays incomplete rather than being relabeled OBSERVED.
+                if (hashless_file(base) || hashless_file(last)) incoherent = true;
                 int change = 0;
                 if (!differs(base, last, change)) continue;
                 Out o;

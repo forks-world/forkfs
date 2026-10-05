@@ -188,6 +188,65 @@ class HistoryTest(unittest.TestCase):
         self.assertEqual((change['path'], change['change']), ('gone', 'added'))
         self.assertEqual(change['after_hash'], self.sha(b'gone\n'))
 
+    def test_modified_reverted_at_baseline_is_reconciled(self):
+        # A modification undone with the baseline's exact content and mtime is invisible to the
+        # baseline diff; reconciliation must still publish the revert.
+        self.populate()
+        (self.world / 'mod').write_text('after\n')
+        self.assertEqual(self.query('history', 'record', 'W1')['revision'], 'R1')
+        st = os.stat(self.source / 'mod')
+        (self.world / 'mod').write_text('before\n')
+        os.utime(self.world / 'mod', ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertEqual(self.query('history', 'record', 'W1')['revision'], 'R2')
+        show = self.query('history', 'show', 'R2')
+        self.assertEqual(len(show['changes']), 1)
+        change = show['changes'][0]
+        self.assertEqual((change['path'], change['change']), ('mod', 'modified'))
+        self.assertEqual(change['before_hash'], self.sha(b'after\n'))
+        self.assertEqual(change['after_hash'], self.sha(b'before\n'))
+
+    def test_deleted_file_records_its_recorded_size(self):
+        self.populate()
+        (self.world / 'sized').write_text('12345\n')
+        self.run_world('fs', 'history', 'record', 'W1')
+        (self.world / 'sized').unlink()
+        self.run_world('fs', 'history', 'record', 'W1')
+        change = self.query('history', 'show', 'R2')['changes'][0]
+        self.assertEqual((change['path'], change['change']), ('sized', 'deleted'))
+        self.assertEqual(change['size'], 6)   # the deleted version's size, not 0
+
+    def test_size_only_change_over_budget_is_not_no_change(self):
+        # Both captures are over budget, so both hashes are empty; only the size distinguishes
+        # them, and a size change must not be reported as no-change.
+        self.populate()
+        env = dict(self.env, WFS_HISTORY_MAX_CONTENT='16')
+        (self.world / 'big').write_bytes(b'x' * 64)
+        self.run_world('fs', 'history', 'record', 'W1', env=env)
+        (self.world / 'big').write_bytes(b'x' * 128)
+        rec = self.run_world('fs', 'history', 'record', 'W1', env=env)
+        self.assertIn(b'R2', rec.stdout)
+        show = self.query('history', 'show', 'R2')
+        self.assertEqual(show['revision']['coverage'], 'incomplete')
+        change = show['changes'][0]
+        self.assertEqual((change['path'], change['change']), ('big', 'modified'))
+        self.assertEqual(change['size'], 128)
+
+    def test_reconciled_revert_stays_incomplete_when_baseline_content_unknown(self):
+        # The baseline file is over budget, so base_hash is empty. Even when the file is later
+        # restored to its baseline byte-for-byte and metadata, the revision cannot be lossless.
+        self.populate()
+        env = dict(self.env, WFS_HISTORY_MAX_CONTENT='4')
+        (self.world / 'mod').write_text('after\n')
+        self.run_world('fs', 'history', 'record', 'W1', env=env)
+        st = os.stat(self.source / 'mod')
+        (self.world / 'mod').write_text('before\n')
+        os.utime(self.world / 'mod', ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.run_world('fs', 'history', 'record', 'W1', env=env)
+        show = self.query('history', 'show', 'R2')
+        self.assertEqual(show['revision']['coverage'], 'incomplete')
+        self.assertEqual(show['changes'][0]['change'], 'modified')
+        self.assertEqual(show['changes'][0]['after_hash'], '')
+
     def test_record_is_serialized_against_the_world_lock(self):
         self.populate()
         (self.world / 'x').write_text('x')
