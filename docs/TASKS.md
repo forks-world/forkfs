@@ -64,7 +64,10 @@ Foundation + 最小 CLI)。设计明确这不是 snapshot、不是 Git commit;�
 - [x] Core C ABI:`wfs_history_record / wfs_revision_info / wfs_revision_list /
   wfs_revision_changes / wfs_history_content / wfs_history_free`。记录是**增量**的:与上一条
   revision 留在 `history_files` 里的状态比较,而不是每次都相对 baseline 快照;没有相关变化时
-  不发布 revision。内容先落盘并 fsync/rename,再提交 revision 事务,发布的行不会引用缺失对象。
+  不发布 revision。对不再出现在 baseline diff 里的已记录路径(改回 baseline 或新增后又被删)
+  用 `history_files.base_*` 做 reconcile,否则 revision 链会一直声称它仍存在。capture 与发布
+  持有该 World 的 marker flock(与 fork/checkpoint/discard 同一把锁),并发的两次 record 或与
+  fork 的重叠会返回 `WFS_E_WORLD_BUSY` 而不是相互覆盖(PR #37 review P1)。内容先落盘并 fsync/rename,再提交 revision 事务,发布的行不会引用缺失对象。
   读文件前后核对 dev/ino/size/mtime,仍变化者标 `INCOMPLETE`;超 `WFS_HISTORY_MAX_CONTENT`
   (默认 64 MiB)只记元数据并标 `INCOMPLETE`。`.git`、`.world-git`、`.world` 不进入源码历史。
 - [x] CLI:`world fs history [W<n>] [--json]`、`history show R<n> [--json]`、

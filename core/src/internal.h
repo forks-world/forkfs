@@ -62,6 +62,18 @@ using InodeTable = stdb::container::dense_map<uint64_t, NodeRec>;
 // that is not a test of this function.
 int threads_start(pthread_t *th, int want, void *(*fn)(void *), void *arg);
 
+// ---- P12, shared: the per-World marker lock ---------------------------------------------------
+//
+// An exclusive, non-blocking flock on a world's `.world` marker -- the same lock fork,
+// checkpoint and discard take (world.cpp, WorldLock). A world-level operation that reads and then
+// writes the store's records for one World must hold it, or two such operations interleave and
+// the second publishes against state the first has already replaced. `wfs_history_record()` is
+// one of them. Returns 0 with *out_fd set, WFS_E_WORLD_BUSY when another operation holds it,
+// WFS_E_NOT_A_WORLD when there is no marker, or a negative errno. Every successful take must be
+// paired with a release.
+int world_marker_lock_take(const char *world_root, int *out_fd);
+void world_marker_lock_release(int fd);
+
 // ---- PR #1 review (3rd round): telling a crashed producer from a slow one --------------------
 //
 // A CREATING row means "somebody is building this tree". gc used to read it as "somebody WAS

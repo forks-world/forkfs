@@ -4,6 +4,7 @@ Drives `world fs history` against a disposable real store: incremental recording
 content objects addressed by SHA-256, the no-change case, coverage degradation over the content
 budget, and the JSON contract.
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -152,6 +153,53 @@ class HistoryTest(unittest.TestCase):
         self.populate()
         result = self.run_world('fs', 'history', 'show', 'R9', code=1)
         self.assertIn(b'no such', result.stderr.lower())
+
+    def test_recorded_addition_deleted_is_reconciled(self):
+        # A recorded addition that is later deleted is no longer a baseline-diff candidate (the
+        # live tree matches the snapshot), so reconciliation against the recorded baseline state
+        # is what notices it. Without it the revision chain keeps claiming the file is present.
+        self.populate()
+        (self.world / 'added').write_text('temp\n')
+        self.assertEqual(self.query('history', 'record', 'W1')['revision'], 'R1')
+        (self.world / 'added').unlink()
+        self.assertEqual(self.query('history', 'record', 'W1')['revision'], 'R2')
+        show = self.query('history', 'show', 'R2')
+        self.assertEqual(len(show['changes']), 1)
+        change = show['changes'][0]
+        self.assertEqual((change['path'], change['change']), ('added', 'deleted'))
+        self.assertEqual(change['before_hash'], self.sha(b'temp\n'))
+        self.assertEqual(change['after_hash'], '')
+        # Nothing further to reconcile.
+        self.assertEqual(self.query('history', 'record', 'W1')['result'], 'no-change')
+
+    def test_deletion_recreated_at_baseline_is_reconciled(self):
+        # A deletion that is undone with the baseline's exact content and mtime produces no
+        # baseline-diff candidate either; reconciliation must report the addition.
+        self.populate()
+        (self.world / 'gone').unlink()
+        self.assertEqual(self.query('history', 'record', 'W1')['revision'], 'R1')
+        st = os.stat(self.source / 'gone')
+        (self.world / 'gone').write_text('gone\n')
+        os.utime(self.world / 'gone', ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertEqual(self.query('history', 'record', 'W1')['revision'], 'R2')
+        show = self.query('history', 'show', 'R2')
+        self.assertEqual(len(show['changes']), 1)
+        change = show['changes'][0]
+        self.assertEqual((change['path'], change['change']), ('gone', 'added'))
+        self.assertEqual(change['after_hash'], self.sha(b'gone\n'))
+
+    def test_record_is_serialized_against_the_world_lock(self):
+        self.populate()
+        (self.world / 'x').write_text('x')
+        with open(self.world / '.world', 'r') as marker:
+            fcntl.flock(marker, fcntl.LOCK_EX)
+            try:
+                result = self.run_world('fs', 'history', 'record', 'W1', code=3)
+                self.assertIn(b'lock', result.stderr.lower())
+            finally:
+                fcntl.flock(marker, fcntl.LOCK_UN)
+        # Once the lock is free, the same record succeeds.
+        self.assertEqual(self.query('history', 'record', 'W1')['revision'], 'R1')
 
 
 if __name__ == '__main__':

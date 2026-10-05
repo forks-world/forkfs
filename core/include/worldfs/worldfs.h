@@ -826,9 +826,16 @@ typedef struct wfs_revision_change {
 
 /* Record the current source changes of `world` as a new revision. actor_id/turn_id/tool_call_id
  * may be NULL. `out_revision` receives the new id, or 0 when nothing changed since the previous
- * revision (which is not an error and publishes nothing). Returns WFS_E_SOURCE_GONE when the
- * world has no live baseline to compare against, WFS_E_WORLD_MISSING when it is not at its
- * recorded path, -ESTALE when it is not ACTIVE, or a negative errno. */
+ * revision (which is not an error and publishes nothing).
+ *
+ * Capture and publication hold the World's marker lock (the same flock fork/checkpoint/discard
+ * take), so two concurrent records -- and a fork of the same World -- cannot read state and then
+ * publish against each other. A world already busy with another such operation is refused with
+ * WFS_E_WORLD_BUSY rather than raced. The same lock makes the revision's parent, its before
+ * hashes and its reconciliation against the previous revision's recorded state a consistent
+ * whole. Returns WFS_E_SOURCE_GONE when the world has no live baseline to compare against,
+ * WFS_E_WORLD_MISSING when it is not at its recorded path, -ESTALE when it is not ACTIVE, or a
+ * negative errno. */
 int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_id, const char *turn_id,
                        const char *tool_call_id, wfs_id *out_revision);
 int wfs_revision_info(wfs_store *s, wfs_id id, wfs_revision_rec *out);

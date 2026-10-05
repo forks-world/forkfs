@@ -438,17 +438,26 @@ int history_prev(wfs_store *s, wfs_id world, const char *path, State &st, bool &
     return 0;
 }
 
-int file_id_get_or_create(wfs_store *s, wfs_id world, const char *path, wfs_id *out) {
+// The logical identity of a path, created on first record with the baseline state it is
+// reconciled against. An existing row is returned untouched -- its base was captured then.
+int file_id_get_or_create(wfs_store *s, wfs_id world, const char *path, const State &base,
+                          wfs_id *out) {
     Stmt q(s->db, "SELECT file_id FROM history_files WHERE world_id=? AND path=?");
     if (!q.ok()) return -EIO;
     q.i64(1, (int64_t)world);
     q.text(2, path);
     if (q.row()) { *out = (wfs_id)q.col_i64(0); return 0; }
     if (!q.done()) return -EIO;
-    Stmt ins(s->db, "INSERT INTO history_files(world_id, path) VALUES(?,?)");
+    Stmt ins(s->db,
+             "INSERT INTO history_files(world_id, path, base_hash, base_kind, base_mode, base_size)"
+             " VALUES(?,?,?,?,?,?)");
     if (!ins.ok()) return -EIO;
     ins.i64(1, (int64_t)world);
     ins.text(2, path);
+    ins.text(3, base.present ? base.hash.c_str() : "");
+    ins.i64(4, base.present ? base.kind : 0);
+    ins.i64(5, base.present ? (int64_t)base.mode : 0);
+    ins.i64(6, base.present ? (int64_t)base.size : 0);
     if (ins.step() != SQLITE_DONE) return -EIO;
     *out = (wfs_id)::sqlite3_last_insert_rowid(s->db);
     return 0;
@@ -517,6 +526,47 @@ int collect_diff(void *ctx, const wfs_diff_entry *e) {
     return 0;
 }
 
+// The diff reports its paths sorted and deduplicated (diff.cpp sorts before handing them over),
+// so membership is a binary search. Reconciliation uses it to skip the rows the loop above
+// already compared.
+bool in_diff(const Vec<String> &paths, const char *p) {
+    size_t lo = 0, hi = paths.size();
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int cmp = ::strcmp(p, paths[mid].c_str());
+        if (cmp == 0) return true;
+        if (cmp < 0) hi = mid;
+        else lo = mid + 1;
+    }
+    return false;
+}
+
+// One recorded change, built either from a diff path (compared against the state the previous
+// revision left it in) or from reconciliation (a recorded path the baseline diff no longer
+// reports, whose current state is therefore the baseline state).
+struct Out {
+    int change = 0;
+    int kind = 0;
+    uint32_t mode = 0;
+    uint64_t size = 0, before_size = 0, after_size = 0;
+    String path, before, after;
+    // The baseline state, used only when this change creates the path's history_files row.
+    State base;
+    wfs_id file_id = 0;   // non-zero: update this existing row (reconciliation)
+};
+
+// The per-World marker lock, held across capture and publication so two recorders -- and a
+// concurrent fork/checkpoint/discard of the same World -- cannot read and publish against each
+// other. See internal.h / world.cpp; the flock and the busy verdict are the existing world-level
+// lock.
+struct MarkerLock {
+    int fd = -1;
+    ~MarkerLock() { if (fd >= 0) wfs::world_marker_lock_release(fd); }
+    MarkerLock() = default;
+    MarkerLock(const MarkerLock &) = delete;
+    MarkerLock &operator=(const MarkerLock &) = delete;
+};
+
 } // namespace
 
 // ---- recording -------------------------------------------------------------------------------
@@ -544,19 +594,19 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
     if (rc) return rc;
     if (sr.state != WFS_ST_ACTIVE || !sr.path[0]) return WFS_E_SOURCE_GONE;
 
+    // Serialize capture and publication against every other world-level operation on this World
+    // (another `history record`, a fork, a checkpoint, a discard). Without this the second of two
+    // overlapping records reads the old history_files state, commits with the first as its parent,
+    // and can publish before_hashes from a state that no longer exists. (PR #37 review, P1.)
+    MarkerLock wl;
+    if (int lrc = wfs::world_marker_lock_take(wroot, &wl.fd)) return lrc;
+
     // The candidate set: every path that differs from the baseline snapshot. The diff is exact
     // about the current state (P10); what makes the revision incremental is the comparison below
     // against the previous revision's recorded state, not this diff.
     Collect col;
     if (int drc = wfs_world_diff_ex(s, world, 0, collect_diff, &col, nullptr)) return drc;
 
-    struct Out {
-        int change = 0;
-        int kind = 0;
-        uint32_t mode = 0;
-        uint64_t size = 0, before_size = 0, after_size = 0;
-        String path, before, after;
-    };
     Vec<Out> recs;
     bool incoherent = false;
 
@@ -595,7 +645,53 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
             o.size = cur.present ? cur.size : prev.size;
             if (prev.present) { o.before = prev.hash; o.before_size = prev.size; }
             if (cur.present) { o.after = cur.hash; o.after_size = cur.size; }
+            if (!has_row) o.base = prev;   // the baseline state to reconcile against later
             recs.emplace_back(o);
+        }
+
+        // Reconciliation (PR #37 review, P1): a path the diff no longer reports is one whose live
+        // state matches the baseline snapshot again -- so a file recorded as modified and then
+        // reverted, or an addition that was later deleted, produces no candidate above. Every
+        // recorded path that is not a candidate is therefore compared against its baseline state
+        // (recorded in base_* when its row was created), and a difference is recorded against the
+        // baseline. This needs no filesystem read: "not in the diff" already means "equals the
+        // snapshot" for content, kind and mode.
+        {
+            Stmt q(s->db,
+                   "SELECT file_id, path, last_hash, last_kind, last_mode, last_size,"
+                   " base_hash, base_kind, base_mode, base_size"
+                   " FROM history_files WHERE world_id=? ORDER BY path");
+            if (!q.ok()) return -EIO;
+            q.i64(1, (int64_t)world);
+            while (q.row()) {
+                const char *rel = q.col_text(1);
+                if (path_excluded(rel) || in_diff(col.paths, rel)) continue;
+                State last;
+                last.hash.assign(q.col_text(2));
+                last.kind = (int)q.col_i64(3);
+                last.mode = (uint32_t)q.col_i64(4);
+                last.size = (uint64_t)q.col_i64(5);
+                last.present = last.kind != 0;
+                State base;
+                base.hash.assign(q.col_text(6));
+                base.kind = (int)q.col_i64(7);
+                base.mode = (uint32_t)q.col_i64(8);
+                base.size = (uint64_t)q.col_i64(9);
+                base.present = base.kind != 0;
+                int change = 0;
+                if (!differs(base, last, change)) continue;
+                Out o;
+                o.change = change;
+                o.path = String(rel);
+                o.file_id = (wfs_id)q.col_i64(0);
+                o.kind = base.present ? base.kind : last.kind;
+                o.mode = base.present ? base.mode : last.mode;
+                o.size = base.present ? base.size : last.size;
+                if (last.present) { o.before = last.hash; o.before_size = last.size; }
+                if (base.present) { o.after = base.hash; o.after_size = base.size; }
+                recs.emplace_back(o);
+            }
+            if (!q.done()) return -EIO;
         }
     }
 
@@ -662,8 +758,10 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
     int64_t seq = 0;
     for (size_t i = 0; i < recs.size(); ++i) {
         Out &o = recs[i];
-        wfs_id fid = 0;
-        if (int e = file_id_get_or_create(s, world, o.path.c_str(), &fid)) return e;
+        wfs_id fid = o.file_id;
+        if (!fid) {
+            if (int e = file_id_get_or_create(s, world, o.path.c_str(), o.base, &fid)) return e;
+        }
 
         bool del = o.change == WFS_C_DELETED;
         {
@@ -691,14 +789,15 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
         if (!del) last_hash = o.after;
         {
             Stmt u(s->db,
-                   "UPDATE history_files SET last_hash=?, last_kind=?, last_mode=?, last_revision=?"
-                   " WHERE file_id=?");
+                   "UPDATE history_files SET last_hash=?, last_kind=?, last_mode=?, last_size=?,"
+                   " last_revision=? WHERE file_id=?");
             if (!u.ok()) return -EIO;
             u.text(1, last_hash.c_str());
             u.i64(2, last_kind);
             u.i64(3, (int64_t)o.mode);
-            u.i64(4, (int64_t)rev);
-            u.i64(5, (int64_t)fid);
+            u.i64(4, (int64_t)o.size);
+            u.i64(5, (int64_t)rev);
+            u.i64(6, (int64_t)fid);
             if (u.step() != SQLITE_DONE) return -EIO;
         }
         if (o.before.size() && content_ref(s, o.before.c_str(), o.before_size, t1)) return -EIO;
