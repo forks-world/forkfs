@@ -74,6 +74,12 @@ static void usage(int code = EX_USAGE) {
           "                                   capture the world's current changes as a new revision,\n"
           "                                   storing changed bytes as immutable content; publishes\n"
           "                                   nothing when there is no relevant change\n"
+          "  history export R<n> [--out <file>]\n"
+          "                                   write the revision's canonical, store-independent\n"
+          "                                   manifest (its SHA-256 identity goes to stderr)\n"
+          "  history import <file> --into W<n> [--check]\n"
+          "                                   validate and import a manifest into a world with the\n"
+          "                                   same baseline (the chain must arrive in order)\n"
           "  list [--json]                    snapshots and worlds\n"
           "  inspect W<n>|S<n> [--json]\n"
           "  discard W<n>|S<n> [--now] [--force]\n"
@@ -984,6 +990,90 @@ static int read_changes(wfs_store *s, wfs_id rev, wfs_revision_change **out, siz
 }
 
 static int cmd_history(wfs_store *s, int argc, char **argv) {
+    if (argc >= 1 && !strcmp(argv[0], "export")) {
+        wfs_id rev = 0;
+        const char *out = NULL;
+        for (int i = 1; i < argc; ++i) {
+            if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
+            else if (argv[i][0] != '-' && !rev) rev = parse_revision(argv[i]);
+            else usage();
+        }
+        if (!rev) usage();
+        void *buf = NULL;
+        size_t len = 0;
+        char hash[WFS_REVISION_HASH_MAX];
+        int rc = wfs_revision_export(s, rev, &buf, &len, hash);
+        if (rc) {
+            const char *why = wfs_history_reason();
+            if (why && *why) {
+                char msg[256];
+                snprintf(msg, sizeof msg, "history export R%llu: %s", (unsigned long long)rev, why);
+                return fail(msg, rc);
+            }
+            return fail("history export", rc);
+        }
+        FILE *f = out ? fopen(out, "wb") : stdout;
+        if (!f) { wfs_history_free(buf); return fail("history export: open", -errno); }
+        size_t wrote = fwrite(buf, 1, len, f);
+        if (out) { if (fclose(f) != 0) wrote = 0; }
+        else if (fflush(f) != 0) wrote = 0;
+        wfs_history_free(buf);
+        if (wrote != len) return fail("history export: write", -EIO);
+        // The hash is the revision's store-independent identity; the manifest bytes themselves
+        // must stay exactly as exported, so the note goes to stderr.
+        fprintf(stderr, "world: manifest %.64s\n", hash);
+        return EX_OK;
+    }
+
+    if (argc >= 1 && !strcmp(argv[0], "import")) {
+        const char *file = NULL;
+        wfs_id w = 0;
+        int check = 0;
+        for (int i = 1; i < argc; ++i) {
+            if (!strcmp(argv[i], "--into") && i + 1 < argc) w = parse_world(argv[++i]);
+            else if (!strcmp(argv[i], "--check")) check = 1;
+            else if (argv[i][0] != '-' && !file) file = argv[i];
+            else usage();
+        }
+        if (!file || !w) usage();
+        FILE *f = fopen(file, "rb");
+        if (!f) return fail("history import: open", -errno);
+        if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return fail("history import: seek", -EIO); }
+        long sz = ftell(f);
+        if (sz < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return fail("history import: size", -EIO); }
+        char *buf = (char *)malloc((size_t)sz ? (size_t)sz : 1);
+        if (!buf) { fclose(f); return fail("history import", -ENOMEM); }
+        size_t got = sz ? fread(buf, 1, (size_t)sz, f) : 0;
+        fclose(f);
+        if (got != (size_t)sz) { free(buf); return fail("history import: read", -EIO); }
+        wfs_id rev = 0;
+        char hash[WFS_REVISION_HASH_MAX];
+        int rc = wfs_revision_import(s, w, buf, got, check ? WFS_HISTORY_IMPORT_CHECK : 0, &rev, hash);
+        free(buf);
+        if (rc) {
+            const char *why = wfs_history_reason();
+            if (why && *why) {
+                char msg[256];
+                snprintf(msg, sizeof msg, "history import: %s", why);
+                return fail(msg, rc);
+            }
+            return fail("history import", rc);
+        }
+        if (g_json) {
+            Json j(g_json_out);
+            j.num("schema_version", 1);
+            j.str("result", check ? "valid" : "imported");
+            j.ref("revision", 'R', rev);
+            j.str("manifest_hash", hash);
+        } else if (check) {
+            printf("manifest %.12s is valid for W%llu\n", hash, (unsigned long long)w);
+        } else {
+            printf("imported R%llu into W%llu (manifest %.12s)\n", (unsigned long long)rev,
+                   (unsigned long long)w, hash);
+        }
+        return EX_OK;
+    }
+
     if (argc >= 1 && !strcmp(argv[0], "record")) {
         wfs_id w = 0;
         const char *actor = NULL, *turn = NULL, *tool = NULL;
@@ -1090,6 +1180,7 @@ static int cmd_history(wfs_store *s, int argc, char **argv) {
                r.origin == WFS_RV_ORIGIN_RESTORE ? "restore" : "unknown",
                r.coverage == WFS_RV_COVERAGE_MEDIATED ? "mediated" :
                r.coverage == WFS_RV_COVERAGE_OBSERVED ? "observed" : "incomplete", t);
+        if (r.manifest_hash[0]) printf("manifest:  %.16s\n", r.manifest_hash);
         if (r.git_head[0]) printf("git HEAD:  %s\n", r.git_head);
         if (r.actor_id[0]) printf("actor:     %s\n", r.actor_id);
         if (r.turn_id[0]) printf("turn:      %s\n", r.turn_id);
@@ -1213,6 +1304,10 @@ static int cmd_inspect(wfs_store *s, const char *arg) {
             printf("hardlinks: %llu groups rebuilt in every fork, %llu entries also linked from "
                    "outside the tree (P9)\n",
                    (unsigned long long)v.hl_groups, (unsigned long long)v.hl_external);
+        if (v.pins)
+            printf("pins:      %llu (a work revision names this as its baseline; discard is "
+                   "refused while pinned)\n",
+                   (unsigned long long)v.pins);
         if (v.from_world) printf("from:      W%llu\n", (unsigned long long)v.from_world);
         return EX_OK;
     }
@@ -1338,6 +1433,16 @@ static int cmd_discard_snapshot(wfs_store *s, wfs_id sid, int now, int force, in
                      "with nothing to diff or verify against",
                      (unsigned long long)sid, listed, names, listed > 6 ? " ..." : "");
             return refuse(why, "discard those worlds first, or `world fs checkpoint` them to a new baseline");
+        }
+        // No active world needs it, but recorded history may: a Work revision names this
+        // snapshot as its baseline, and that reference outlives the World it was recorded in.
+        wfs_snapshot_rec sinfo;
+        if (wfs_snapshot_info(s, sid, &sinfo) == 0 && sinfo.pins) {
+            snprintf(why, sizeof why,
+                     "S%llu is the baseline of %llu recorded work revision(s); discarding it would "
+                     "orphan that history",
+                     (unsigned long long)sid, (unsigned long long)sinfo.pins);
+            return refuse(why, "world fs history W<n>   (revisions keep their baseline pinned)");
         }
         uint64_t ready = 0;
         wfs_pool_ready(s, sid, &ready);
@@ -4994,7 +5099,8 @@ int main(int argc, char **argv) {
                               !strcmp(args[i], "--from") || !strcmp(args[i], "--retention") ||
                               !strcmp(args[i], "--count") || !strcmp(args[i], "--repo") ||
                               !strcmp(args[i], "--branch") || !strcmp(args[i], "--actor") ||
-                              !strcmp(args[i], "--turn") || !strcmp(args[i], "--tool-call")) &&
+                              !strcmp(args[i], "--turn") || !strcmp(args[i], "--tool-call") ||
+                              !strcmp(args[i], "--out") || !strcmp(args[i], "--into")) &&
                  i + 1 < nargs) ++i;
     }
     if (command_help) usage(EX_OK);

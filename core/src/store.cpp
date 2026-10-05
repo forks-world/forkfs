@@ -210,8 +210,29 @@ const char *kSchema =
     "  added INTEGER NOT NULL DEFAULT 0,"
     "  modified INTEGER NOT NULL DEFAULT 0,"
     "  deleted INTEGER NOT NULL DEFAULT 0,"
-    "  meta INTEGER NOT NULL DEFAULT 0);"
+    "  meta INTEGER NOT NULL DEFAULT 0,"
+    /* Sync-ready identity: `manifest_hash` is the SHA-256 of this revision's canonical
+     * store-independent manifest (history.cpp), and `parent_hash` the same for its parent. They
+     * address a revision without a local id, so an exported manifest can be imported elsewhere
+     * and a chain can be walked by hash. Empty on a revision recorded before this column existed
+     * only in the sense that it is recomputed on first export. */
+    "  manifest_hash TEXT NOT NULL DEFAULT '',"
+    "  parent_hash TEXT NOT NULL DEFAULT '');"
     "CREATE INDEX IF NOT EXISTS revisions_world ON revisions(world_id, id);"
+    "CREATE INDEX IF NOT EXISTS revisions_manifest ON revisions(manifest_hash);"
+    // history_pins: a snapshot a revision depends on. The baseline of every recorded revision is
+    // pinned, so discarding it would orphan the history that names it even after the World itself
+    // is gone. The table is deliberately more general than the baseline case: a later slice adds
+    // user bookmarks and retained conversation/test references, and gc already has one place to
+    // count them. `kind` is 1 for a baseline pin.
+    "CREATE TABLE IF NOT EXISTS history_pins("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  snapshot_id INTEGER NOT NULL,"
+    "  revision_id INTEGER NOT NULL,"
+    "  kind INTEGER NOT NULL DEFAULT 1,"
+    "  created_at INTEGER NOT NULL DEFAULT 0,"
+    "  UNIQUE(revision_id, kind));"
+    "CREATE INDEX IF NOT EXISTS history_pins_snap ON history_pins(snapshot_id);"
     // changes: one row per path that differs from the previous revision's recorded state. This
     // is the incremental delta a revision means -- NOT the whole tree and NOT the difference
     // against the baseline snapshot. `change` and `kind` are the wfs_change / wfs_type codes.
@@ -324,6 +345,12 @@ const Migration kMigrations[] = {
      "ALTER TABLE history_files ADD COLUMN last_mtime INTEGER NOT NULL DEFAULT 0"},
     {"history_files", "base_mtime",
      "ALTER TABLE history_files ADD COLUMN base_mtime INTEGER NOT NULL DEFAULT 0"},
+    // Sync-ready revision identity (history.cpp). A store written by the first history build has
+    // revisions but no hashes; they are computed on first export.
+    {"revisions", "manifest_hash",
+     "ALTER TABLE revisions ADD COLUMN manifest_hash TEXT NOT NULL DEFAULT ''"},
+    {"revisions", "parent_hash",
+     "ALTER TABLE revisions ADD COLUMN parent_hash TEXT NOT NULL DEFAULT ''"},
 };
 
 // Additive revision of the schema. `PRAGMA user_version` carries SCHEMA*100 + REV, so a store
@@ -332,7 +359,7 @@ const Migration kMigrations[] = {
 // with 2 never saw a later ALTER TABLE. The revision counter keeps counting across the 2 -> 3
 // bump: it numbers additive steps, and never resetting it means no two stamps this core has
 // ever written collide.
-const int kSchemaRev = 7;
+const int kSchemaRev = 8;
 inline int user_version_want(void) { return WFS_STORE_SCHEMA * 100 + kSchemaRev; }
 
 // Does `table` have a column called `column`, right now, in this database? The table names are
@@ -1514,6 +1541,14 @@ extern "C" const char *wfs_strerror(int rc) {
         return "unsupported Git layout";
     case WFS_E_GIT_TARGET:
         return "the target repository cannot take this branch";
+    case WFS_E_HISTORY_MANIFEST:
+        return "not a canonical work-revision manifest";
+    case WFS_E_HISTORY_PARENT_MISSING:
+        return "the revision's parent is not in this store (import the chain in order)";
+    case WFS_E_HISTORY_CONTENT_MISSING:
+        return "a content object the revision references is missing; sync it too";
+    case WFS_E_HISTORY_BASELINE_MISMATCH:
+        return "the revision's baseline is not this World's baseline";
     case WFS_E_GIT_POLICY:
         return "Git configuration outside this repository would make the World's Git see files differently";
     case WFS_E_GIT_DIRTY:

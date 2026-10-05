@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -278,6 +279,91 @@ class HistoryTest(unittest.TestCase):
         os.symlink(str(outside), str(self.world / 'sub'))
         self.run_world('fs', 'history', 'record', 'W1')
         self.assertFalse(self.content_exists(self.sha(secret)))
+
+    def export(self, rev, path):
+        result = self.run_world('fs', 'history', 'export', rev, '--out', str(path))
+        # "world: manifest <hash>"
+        for line in result.stderr.decode().splitlines():
+            if line.startswith('world: manifest '):
+                return line.split(' ', 2)[2]
+        self.fail('no manifest hash on stderr')
+
+    def test_manifest_roundtrip_and_checks(self):
+        self.populate()
+        (self.world / 'a').write_text('one\n')
+        self.run_world('fs', 'history', 'record', 'W1', '--actor', 'alice')
+        manifest = self.root / 'r1.manifest'
+        h = self.export('R1', manifest)
+        self.assertEqual(len(h), 64)
+        body = manifest.read_bytes()
+        self.assertTrue(body.startswith(b'worldfs-revision 1\n'))
+        self.assertIn(self.sha(b'one\n').encode(), body)   # hashes are plain hex, not re-encoded
+
+        # A valid manifest checks out against its own world.
+        self.run_world('fs', 'history', 'import', str(manifest), '--into', 'W1', '--check')
+        # ... and importing it again is deduplication, not a second revision.
+        out = self.query('history', 'import', str(manifest), '--into', 'W1')
+        self.assertEqual(out['result'], 'imported')
+        self.assertEqual(out['revision'], 'R1')
+        self.assertEqual(out['manifest_hash'], h)
+
+        # A reformatted manifest is refused: the id would otherwise change.
+        tampered = self.root / 'tampered.manifest'
+        tampered.write_bytes(body.replace(b'world_name ', b'world_name  '))
+        result = self.run_world('fs', 'history', 'import', str(tampered), '--into', 'W1', '--check',
+                                code=3)
+        self.assertIn(b'canonical', result.stderr.lower())
+
+        # A manifest that names a content object this store does not have is refused. It goes to
+        # a fresh world so the parent check does not answer first.
+        self.run_world('fs', 'fork', '--from', 'S1', '--to', str(self.root / 'w2'), '--no-pool')
+        missing = self.root / 'missing.manifest'
+        missing.write_bytes(body.replace(self.sha(b'one\n').encode(), b'a' * 64, 1))
+        result = self.run_world('fs', 'history', 'import', str(missing), '--into', 'W2', '--check',
+                                code=3)
+        self.assertIn(b'content object', result.stderr.lower())
+
+    def test_manifest_parent_chain_is_required(self):
+        self.populate()
+        (self.world / 'a').write_text('one\n')
+        self.run_world('fs', 'history', 'record', 'W1')
+        (self.world / 'a').write_text('two\n')
+        self.run_world('fs', 'history', 'record', 'W1')
+        r1 = self.root / 'r1.manifest'
+        r2 = self.root / 'r2.manifest'
+        h1 = self.export('R1', r1)
+        h2 = self.export('R2', r2)
+        self.run_world('fs', 'fork', '--from', 'S1', '--to', str(self.root / 'w2'), '--no-pool')
+        self.w2 = self.root / 'w2'
+        # Forget the local records so the import is not just a deduplication.
+        db = sqlite3.connect(str(self.store / 'metadata3.db'))
+        for table in ('changes', 'revisions', 'history_files', 'history_pins'):
+            db.execute(f'DELETE FROM {table}')
+        db.commit()
+        db.close()
+        # The child cannot arrive before its parent.
+        result = self.run_world('fs', 'history', 'import', str(r2), '--into', 'W2', '--check', code=3)
+        self.assertIn(b'parent', result.stderr.lower())
+        # In order, the chain lands and W2 now has both.
+        self.run_world('fs', 'history', 'import', str(r1), '--into', 'W2')
+        self.run_world('fs', 'history', 'import', str(r2), '--into', 'W2')
+        revs = self.query('history', 'W2')['revisions']
+        self.assertEqual([r['id'] for r in revs], ['R4', 'R3'])
+        self.assertEqual(revs[0]['parent_revision'], 'R3')
+        self.assertEqual(revs[0]['manifest_hash'], h2)
+        self.assertEqual(revs[1]['manifest_hash'], h1)
+
+    def test_baseline_pin_blocks_snapshot_discard(self):
+        self.populate()
+        (self.world / 'a').write_text('one\n')
+        self.run_world('fs', 'history', 'record', 'W1')
+        self.run_world('fs', 'inspect', 'S1')  # does not disturb the pin
+        self.run_world('fs', 'discard', 'W1', '--now')
+        result = self.run_world('fs', 'discard', 'S1', code=3)
+        self.assertIn(b'baseline', result.stderr.lower())
+        # The pin is visible on the snapshot.
+        snap = self.query('inspect', 'S1')
+        self.assertEqual(snap['pins'], 1)
 
     def test_record_is_serialized_against_the_world_lock(self):
         self.populate()

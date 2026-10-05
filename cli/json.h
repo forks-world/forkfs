@@ -70,7 +70,8 @@ static void json_snapshot(FILE *out, const wfs_snapshot_rec &v) {
     j.signed_num("created_at", v.created_at); j.signed_num("trashed_at", v.trashed_at);
     j.num("entries", v.entries); j.num("hardlinks", v.hardlinks);
     j.num("hl_groups", v.hl_groups); j.num("hl_external", v.hl_external);
-    j.num("root_mode", v.root_mode); j.str("protection", v.hard ? "hard" : "gate");
+    j.num("root_mode", v.root_mode); j.num("pins", v.pins);
+    j.str("protection", v.hard ? "hard" : "gate");
 }
 
 static void json_world(FILE *out, const wfs_world_rec &v, const wfs_git_info *git = nullptr) {
@@ -126,6 +127,7 @@ static void json_revision(FILE *out, const wfs_revision_rec &v) {
     j.str("origin", json_origin(v.origin)); j.str("coverage", json_coverage(v.coverage));
     j.str("actor_id", v.actor_id); j.str("turn_id", v.turn_id); j.str("tool_call_id", v.tool_call_id);
     j.str("git_head", v.git_head);
+    j.str("manifest_hash", v.manifest_hash); j.str("parent_hash", v.parent_hash);
     j.signed_num("capture_started_at", v.capture_started_at);
     j.signed_num("capture_finished_at", v.capture_finished_at);
     j.signed_num("created_at", v.created_at);

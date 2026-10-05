@@ -496,11 +496,13 @@ void fill_snapshot(Stmt &q, wfs_snapshot_rec &r) {
     r.trashed_at = q.col_i64(11);
     r.hl_groups = (uint64_t)q.col_i64(12);
     r.hl_external = (uint64_t)q.col_i64(13);
+    r.pins = (uint64_t)q.col_i64(14);
 }
 
 const char *kSnapCols =
     "id, name, path, src_path, from_world, created_at, entries, hardlinks, state, hard, root_mode,"
-    " trashed_at, hl_groups, hl_external";
+    " trashed_at, hl_groups, hl_external,"
+    " (SELECT COUNT(*) FROM history_pins p WHERE p.snapshot_id=snapshots.id) AS pins";
 
 // <store>/snapshots/S<n> -- the directory that holds `root` and `manifest`. The row records the
 // root; a discard moves the whole thing, because the manifest is what `verify` needs.
@@ -2698,6 +2700,11 @@ struct SnapRefs {
     uint64_t trashing_worlds = 0;
     uint64_t trashed_worlds = 0;
     uint64_t pool_entries = 0;
+    // Continuous work history: a Work revision names this snapshot as its baseline. The
+    // reference outlives the World (the whole point of the pin), so it refuses even when no
+    // ACTIVE World does, and `--force` -- which means "the pool entries are disposable" -- does
+    // not clear it. Releasing a pin is explicit retention policy (a later slice).
+    uint64_t pins = 0;
     wfs_id first_world = 0;
 };
 
@@ -2745,6 +2752,16 @@ int snapshot_refs_locked(wfs_store *s, wfs_id id, SnapRefs &out) {
         q.i64(1, (int64_t)id);
         if (!q.row()) return -EIO;   // COUNT(*) always has a row: no row is a failed read
         out.pool_entries = (uint64_t)q.col_i64(0);
+    }
+    {
+        // Continuous work history: revisions whose baseline this snapshot is. Same rule as the
+        // counts above -- a short read here would let the discard walk away from a history that
+        // still names the snapshot.
+        Stmt q(s->db, "SELECT COUNT(*) FROM history_pins WHERE snapshot_id=?");
+        if (!q.ok()) return -EIO;
+        q.i64(1, (int64_t)id);
+        if (!q.row()) return -EIO;
+        out.pins = (uint64_t)q.col_i64(0);
     }
     return 0;
 }
@@ -2808,8 +2825,12 @@ extern "C" int wfs_snapshot_discard(wfs_store *s, wfs_id id, int immediate, int 
     if (r.state != WFS_ST_ACTIVE) return -ESTALE;
     SnapRefs refs;
     if (int rc = snapshot_refs_locked(s, id, refs)) return rc;
-    // Never orphan a world's source: diff and verify both need the baseline (P4/P10).
-    if (refs.active_worlds || refs.creating_worlds || refs.trashing_worlds || refs.pool_entries)
+    // Never orphan a world's source: diff and verify both need the baseline (P4/P10). And never
+    // orphan recorded history: a Work revision names this snapshot as its baseline, and that
+    // reference outlives the World it was recorded in -- which is exactly why it is a pin and
+    // not just the World's own snapshot_id.
+    if (refs.active_worlds || refs.creating_worlds || refs.trashing_worlds || refs.pool_entries ||
+        refs.pins)
         return WFS_E_SNAPSHOT_IN_USE;
 
     snapdir = snapshot_dir_of(r);

@@ -478,21 +478,32 @@ int capture_state(wfs_store *s, int rootfd, const char *rel, State &st) {
 
 // ---- database helpers ------------------------------------------------------------------------
 
-int history_prev(wfs_store *s, wfs_id world, const char *path, State &st, bool &has_row) {
+// Reads both states a record needs for one path: `last`, what the previous revision left it as,
+// and `base`, what the baseline snapshot has. The base is what reconciliation compares against
+// when the baseline diff reports nothing.
+int history_prev(wfs_store *s, wfs_id world, const char *path, State &last, State &base,
+                 bool &has_row) {
     Stmt q(s->db,
-           "SELECT last_hash, last_kind, last_mode, last_size, last_mtime FROM history_files"
-           " WHERE world_id=? AND path=?");
+           "SELECT last_hash, last_kind, last_mode, last_size, last_mtime,"
+           " base_hash, base_kind, base_mode, base_size, base_mtime"
+           " FROM history_files WHERE world_id=? AND path=?");
     if (!q.ok()) return -EIO;
     q.i64(1, (int64_t)world);
     q.text(2, path);
     if (!q.row()) { has_row = false; return q.done() ? 0 : -EIO; }
     has_row = true;
-    st.hash.assign(q.col_text(0));
-    st.kind = (int)q.col_i64(1);
-    st.mode = (uint32_t)q.col_i64(2);
-    st.size = (uint64_t)q.col_i64(3);
-    st.mtime = q.col_i64(4);
-    st.present = st.kind != 0;
+    last.hash.assign(q.col_text(0));
+    last.kind = (int)q.col_i64(1);
+    last.mode = (uint32_t)q.col_i64(2);
+    last.size = (uint64_t)q.col_i64(3);
+    last.mtime = q.col_i64(4);
+    last.present = last.kind != 0;
+    base.hash.assign(q.col_text(5));
+    base.kind = (int)q.col_i64(6);
+    base.mode = (uint32_t)q.col_i64(7);
+    base.size = (uint64_t)q.col_i64(8);
+    base.mtime = q.col_i64(9);
+    base.present = base.kind != 0;
     return 0;
 }
 
@@ -539,7 +550,7 @@ int content_ref(wfs_store *s, const char *hash, uint64_t size, int64_t now) {
 const char *kRevCols =
     "id, world_id, parent_revision, baseline_snapshot, origin, coverage, actor_id, turn_id,"
     " tool_call_id, git_head, capture_started_at, capture_finished_at, created_at, changes,"
-    " added, modified, deleted, meta";
+    " added, modified, deleted, meta, manifest_hash, parent_hash";
 
 void fill_revision(Stmt &q, wfs_revision_rec &r) {
     ::memset(&r, 0, sizeof r);
@@ -561,6 +572,8 @@ void fill_revision(Stmt &q, wfs_revision_rec &r) {
     r.modified = (uint64_t)q.col_i64(15);
     r.deleted = (uint64_t)q.col_i64(16);
     r.meta = (uint64_t)q.col_i64(17);
+    wfs::copy_str(r.manifest_hash, sizeof r.manifest_hash, q.col_text(18));
+    wfs::copy_str(r.parent_hash, sizeof r.parent_hash, q.col_text(19));
 }
 
 // A regular file whose content could not be captured -- over the size budget, or unreadable when
@@ -588,6 +601,263 @@ bool differs(const State &cur, const State &prev, int &change) {
     }
     if (cur.mode != prev.mode) { change = WFS_C_META; return true; }
     return false;
+}
+
+// ---- the canonical revision manifest ---------------------------------------------------------
+//
+// A manifest is the store-independent description of one Work revision: enough for a peer to
+// import the revision, verify it and continue recording from it, without any local id. It is
+// emitted as a fixed line-oriented text form and addressed by the SHA-256 of those exact bytes,
+// so the same revision has the same id in every store and the chain walks by hash. The manifest
+// itself is stored as a content object (immutable, deduplicated, transferable).
+//
+// Every byte string that may contain spaces or newlines (a path, a world or tool name) is
+// hex-encoded, which is why the format has no escaping rules and no ambiguity. "-" is the empty
+// value. A change carries three explicit states -- after (the revision's result), before (the
+// previous revision's result) and base (the baseline snapshot) -- so an import can rebuild the
+// incremental state without reading any files.
+
+struct ManifestChange {
+    String path;
+    int change = 0;
+    State after, before, base;
+};
+
+struct ManifestInput {
+    String world_name;
+    int origin = 0, coverage = 0;
+    String actor, turn, tool_call, git_head;
+    int64_t capture_started = 0, capture_finished = 0, created = 0;
+    String parent_hash;
+    String base_store;
+    int64_t base_snapshot = 0, base_created = 0;
+    Vec<ManifestChange> changes;
+};
+
+void sha256_hex(const void *data, size_t n, char out[WFS_REVISION_HASH_MAX]) {
+    uint8_t d[32];
+    Sha256 h;
+    sha256_init(&h);
+    sha256_update(&h, data, n);
+    sha256_final(&h, d);
+    hex_encode(d, 32, out);
+}
+
+// A byte string that may contain spaces or newlines (a path, a name, an actor) is hex-encoded.
+void append_bytes_or_dash(String &out, const String &v) {
+    if (v.size() == 0) { out.append("-"); return; }
+    Vec<char> buf(v.size() * 2 + 1);
+    hex_encode((const uint8_t *)v.c_str(), v.size(), buf.data());
+    out.append(buf.data());
+}
+
+// A value that is already a safe token -- a hash, a store id, a Git HEAD -- is written as is.
+// State::hash is always a lowercase-hex content address, never raw bytes, so it goes here.
+void append_str_or_dash(String &out, const String &v) {
+    if (v.size() == 0) out.append("-");
+    else out.append(v.c_str());
+}
+
+void append_num(String &out, int64_t v) {
+    char b[32];
+    ::snprintf(b, sizeof b, "%lld", (long long)v);
+    out.append(b);
+}
+
+void append_state(String &out, const State &s) {
+    append_num(out, s.present ? 1 : 0);
+    out.append(" ");
+    append_num(out, s.present ? s.kind : 0);
+    out.append(" ");
+    append_num(out, s.present ? (int64_t)s.mode : 0);
+    out.append(" ");
+    append_num(out, s.present ? (int64_t)s.size : 0);
+    out.append(" ");
+    append_str_or_dash(out, s.present ? s.hash : String());
+}
+
+int manifest_change_cmp(const void *a, const void *b) {
+    return ::strcmp(((const ManifestChange *)a)->path.c_str(),
+                    ((const ManifestChange *)b)->path.c_str());
+}
+
+void manifest_emit(const ManifestInput &m, String &out) {
+    out.assign("worldfs-revision 1\n");
+    out.append("world_name "); append_bytes_or_dash(out, m.world_name); out.append("\n");
+    out.append("origin "); append_num(out, m.origin); out.append("\n");
+    out.append("coverage "); append_num(out, m.coverage); out.append("\n");
+    out.append("actor "); append_bytes_or_dash(out, m.actor); out.append("\n");
+    out.append("turn "); append_bytes_or_dash(out, m.turn); out.append("\n");
+    out.append("tool_call "); append_bytes_or_dash(out, m.tool_call); out.append("\n");
+    out.append("git_head "); append_str_or_dash(out, m.git_head); out.append("\n");
+    out.append("capture_started "); append_num(out, m.capture_started); out.append("\n");
+    out.append("capture_finished "); append_num(out, m.capture_finished); out.append("\n");
+    out.append("created "); append_num(out, m.created); out.append("\n");
+    out.append("parent "); append_str_or_dash(out, m.parent_hash); out.append("\n");
+    out.append("base_store "); append_str_or_dash(out, m.base_store); out.append("\n");
+    out.append("base_snapshot "); append_num(out, m.base_snapshot); out.append("\n");
+    out.append("base_created "); append_num(out, m.base_created); out.append("\n");
+    // Changes are sorted by path so the manifest -- and therefore the revision's id -- does not
+    // depend on capture order.
+    Vec<ManifestChange> cs;
+    for (size_t i = 0; i < m.changes.size(); ++i) cs.emplace_back(m.changes[i]);
+    if (cs.size() > 1) qsort(cs.data(), cs.size(), sizeof(ManifestChange), manifest_change_cmp);
+    for (size_t i = 0; i < cs.size(); ++i) {
+        const ManifestChange &c = cs[i];
+        char code[2] = { (char)c.change, 0 };
+        out.append("change ");
+        out.append(code);
+        out.append(" ");
+        append_state(out, c.after);
+        out.append(" ");
+        append_state(out, c.before);
+        out.append(" ");
+        append_state(out, c.base);
+        out.append(" ");
+        append_bytes_or_dash(out, c.path);
+        out.append("\n");
+    }
+}
+
+// Two hex digits per byte, or -1.
+long hex_decode(const char *p, size_t n, uint8_t *out, size_t cap) {
+    if (n % 2) return -1;
+    size_t bytes = n / 2;
+    if (bytes > cap) return -1;
+    for (size_t i = 0; i < bytes; ++i) {
+        int hi = -1, lo = -1;
+        for (int k = 0; k < 2; ++k) {
+            char ch = p[i * 2 + k];
+            int v = (ch >= '0' && ch <= '9') ? ch - '0'
+                    : (ch >= 'a' && ch <= 'f') ? ch - 'a' + 10
+                    : (ch >= 'A' && ch <= 'F') ? ch - 'A' + 10 : -1;
+            if (v < 0) return -1;
+            if (k == 0) hi = v; else lo = v;
+        }
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return (long)bytes;
+}
+
+// A parsed line's fields, as NUL-terminated tokens in place. Simpler than it sounds because no
+// value can contain a space.
+bool parse_state(const char **tok, int nt, int at, State &s) {
+    if (at + 5 > nt) return false;
+    long long v[4];
+    for (int k = 0; k < 4; ++k) {
+        char *end = nullptr;
+        v[k] = ::strtoll(tok[at + k], &end, 10);
+        if (!end || *end) return false;
+    }
+    s.present = v[0] != 0;
+    s.kind = (int)v[1];
+    s.mode = (uint32_t)v[2];
+    s.size = (uint64_t)v[3];
+    // State::hash is already a lowercase-hex content address (never raw bytes), so the token is
+    // taken as is. A present entry without one is a directory or a special file (and an
+    // over-budget file); a present regular file or symlink always has one.
+    if (!::strcmp(tok[at + 4], "-")) s.hash.clear();
+    else s.hash.assign(tok[at + 4]);
+    return true;
+}
+
+int manifest_parse(const char *buf, size_t len, ManifestInput &m, String &err) {
+    // Work on a NUL-terminated copy so tokens can be terminated in place.
+    String text(buf, len);
+    size_t pos = 0;
+    int lineno = 0;
+    auto next_line = [&](const char *&s, size_t &n) -> bool {
+        if (pos >= text.size()) return false;
+        size_t e = pos;
+        while (e < text.size() && text.data()[e] != '\n') ++e;
+        s = text.data() + pos;
+        n = e - pos;
+        pos = e + 1;
+        ++lineno;
+        return true;
+    };
+    const char *line;
+    size_t n;
+    if (!next_line(line, n) || n != ::strlen("worldfs-revision 1") ||
+        ::strncmp(line, "worldfs-revision 1", n) != 0) {
+        err.assign("not a worldfs-revision 1 manifest");
+        return -EINVAL;
+    }
+    while (next_line(line, n)) {
+        if (n == 0) continue;
+        char tmp[8192];
+        if (n >= sizeof tmp) { err.assign("manifest line too long"); return -EINVAL; }
+        ::memcpy(tmp, line, n);
+        tmp[n] = 0;
+        // Tokenize.
+        const char *tok[24];
+        int nt = 0;
+        for (char *p = tmp; *p && nt < 24;) {
+            while (*p == ' ') ++p;
+            if (!*p) break;
+            tok[nt++] = p;
+            while (*p && *p != ' ') ++p;
+            if (*p) *p++ = 0;
+        }
+        if (nt == 0) continue;
+        const char *key = tok[0];
+        auto hexval = [&](int at, String &out) -> bool {
+            if (at >= nt) return false;
+            if (!::strcmp(tok[at], "-")) { out.clear(); return true; }
+            uint8_t raw[WFS_PATH_MAX];
+            long k = hex_decode(tok[at], ::strlen(tok[at]), raw, sizeof raw);
+            if (k < 0) return false;
+            out.assign((const char *)raw, (size_t)k);
+            return true;
+        };
+        auto strval = [&](int at, String &out) -> bool {
+            if (at >= nt) return false;
+            if (!::strcmp(tok[at], "-")) out.clear();
+            else out.assign(tok[at]);
+            return true;
+        };
+        auto intval = [&](int at, int64_t &out) -> bool {
+            if (at >= nt) return false;
+            char *end = nullptr;
+            long long v = ::strtoll(tok[at], &end, 10);
+            if (!end || *end) return false;
+            out = (int64_t)v;
+            return true;
+        };
+        if (!::strcmp(key, "world_name")) { if (!hexval(1, m.world_name)) return -EINVAL; }
+        else if (!::strcmp(key, "origin")) { int64_t v; if (!intval(1, v)) return -EINVAL; m.origin = (int)v; }
+        else if (!::strcmp(key, "coverage")) { int64_t v; if (!intval(1, v)) return -EINVAL; m.coverage = (int)v; }
+        else if (!::strcmp(key, "actor")) { if (!hexval(1, m.actor)) return -EINVAL; }
+        else if (!::strcmp(key, "turn")) { if (!hexval(1, m.turn)) return -EINVAL; }
+        else if (!::strcmp(key, "tool_call")) { if (!hexval(1, m.tool_call)) return -EINVAL; }
+        else if (!::strcmp(key, "git_head")) { if (!strval(1, m.git_head)) return -EINVAL; }
+        else if (!::strcmp(key, "capture_started")) { if (!intval(1, m.capture_started)) return -EINVAL; }
+        else if (!::strcmp(key, "capture_finished")) { if (!intval(1, m.capture_finished)) return -EINVAL; }
+        else if (!::strcmp(key, "created")) { if (!intval(1, m.created)) return -EINVAL; }
+        else if (!::strcmp(key, "parent")) { if (!strval(1, m.parent_hash)) return -EINVAL; }
+        else if (!::strcmp(key, "base_store")) { if (!strval(1, m.base_store)) return -EINVAL; }
+        else if (!::strcmp(key, "base_snapshot")) { if (!intval(1, m.base_snapshot)) return -EINVAL; }
+        else if (!::strcmp(key, "base_created")) { if (!intval(1, m.base_created)) return -EINVAL; }
+        else if (!::strcmp(key, "change")) {
+            if (nt != 2 + 15 + 1) { err.assign("malformed change line"); return -EINVAL; }
+            ManifestChange c;
+            c.change = (unsigned char)tok[1][0];
+            if (!parse_state(tok, nt, 2, c.after)) { err.assign("bad change after state"); return -EINVAL; }
+            if (!parse_state(tok, nt, 7, c.before)) { err.assign("bad change before state"); return -EINVAL; }
+            if (!parse_state(tok, nt, 12, c.base)) { err.assign("bad change base state"); return -EINVAL; }
+            if (!hexval(17, c.path)) { err.assign("bad change path"); return -EINVAL; }
+            m.changes.emplace_back(c);
+        } else {
+            err.assign("unknown key");
+            err.append(" ");
+            err.append(key);
+            return -EINVAL;
+        }
+    }
+    // A change path is a relative path and never empty.
+    for (size_t i = 0; i < m.changes.size(); ++i)
+        if (m.changes[i].path.size() == 0) { err.assign("empty change path"); return -EINVAL; }
+    return 0;
 }
 
 struct Collect {
@@ -620,13 +890,8 @@ bool in_diff(const Vec<String> &paths, const char *p) {
 // reports, whose current state is therefore the baseline state).
 struct Out {
     int change = 0;
-    int kind = 0;
-    uint32_t mode = 0;
-    uint64_t size = 0, before_size = 0, after_size = 0;
-    int64_t mtime = 0;   // the after state's mtime, remembered for hashless comparison
-    String path, before, after;
-    // The baseline state, used only when this change creates the path's history_files row.
-    State base;
+    String path;
+    State before, after, base;
     wfs_id file_id = 0;   // non-zero: update this existing row (reconciliation)
 };
 
@@ -709,29 +974,28 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
             State cur;
             if (int e = capture_state(s, wfd.fd, rel, cur)) return e;
 
-            State prev;
+            State last, base;
             bool has_row = false;
-            if (int e = history_prev(s, world, rel, prev, has_row)) return e;
+            if (int e = history_prev(s, world, rel, last, base, has_row)) return e;
             if (!has_row) {
-                if (int e = capture_state(s, sfd.fd, rel, prev)) return e;
+                // No recorded state yet, so the previous state is the baseline snapshot's.
+                if (int e = capture_state(s, sfd.fd, rel, base)) return e;
+                last = base;
             }
             // A revision that touches a regular file whose content is unknown on either side is
             // incomplete, whatever the diff happened to say about it.
-            if (cur.incoherent || prev.incoherent || hashless_file(cur) || hashless_file(prev))
+            if (cur.incoherent || base.incoherent || hashless_file(cur) || hashless_file(last) ||
+                hashless_file(base))
                 incoherent = true;
 
             int change = 0;
-            if (!differs(cur, prev, change)) continue;
+            if (!differs(cur, last, change)) continue;
             Out o;
             o.change = change;
             o.path = String(rel);
-            o.kind = cur.present ? cur.kind : prev.kind;
-            o.mode = cur.present ? cur.mode : prev.mode;
-            o.size = cur.present ? cur.size : prev.size;
-            o.mtime = cur.present ? cur.mtime : 0;
-            if (prev.present) { o.before = prev.hash; o.before_size = prev.size; }
-            if (cur.present) { o.after = cur.hash; o.after_size = cur.size; }
-            if (!has_row) o.base = prev;   // the baseline state to reconcile against later
+            o.before = last;
+            o.after = cur;
+            o.base = base;
             recs.emplace_back(o);
         }
 
@@ -775,12 +1039,9 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
                 o.change = change;
                 o.path = String(rel);
                 o.file_id = (wfs_id)q.col_i64(0);
-                o.kind = base.present ? base.kind : last.kind;
-                o.mode = base.present ? base.mode : last.mode;
-                o.size = base.present ? base.size : last.size;
-                o.mtime = base.present ? base.mtime : 0;   // after == base here
-                if (last.present) { o.before = last.hash; o.before_size = last.size; }
-                if (base.present) { o.after = base.hash; o.after_size = base.size; }
+                o.before = last;
+                o.after = base;   // a path not in the diff currently equals the baseline
+                o.base = base;
                 recs.emplace_back(o);
             }
             if (!q.done()) return -EIO;
@@ -807,24 +1068,71 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
         }
     }
 
+    // The parent revision's identity, read under the marker lock we already hold, so it cannot
+    // change between here and the commit.
+    wfs_id parent = 0;
+    String parent_hash;
+    {
+        Guard g(s->mu);
+        Stmt q(s->db, "SELECT id, manifest_hash FROM revisions WHERE world_id=? ORDER BY id DESC LIMIT 1");
+        if (!q.ok()) return -EIO;
+        q.i64(1, (int64_t)world);
+        if (q.row()) {
+            parent = (wfs_id)q.col_i64(0);
+            parent_hash.assign(q.col_text(1));
+        } else if (!q.done()) {
+            return -EIO;
+        }
+    }
+
+    // The manifest: the store-independent description of this revision, addressed by its own
+    // SHA-256. It is written as a content object before the transaction that names it, so a
+    // published revision never points at a missing manifest.
+    ManifestInput m;
+    m.world_name.assign(wr.name);
+    m.origin = WFS_RV_ORIGIN_FILESYSTEM;
+    m.coverage = incoherent ? WFS_RV_COVERAGE_INCOMPLETE : WFS_RV_COVERAGE_OBSERVED;
+    m.actor.assign(actor_id ? actor_id : "");
+    m.turn.assign(turn_id ? turn_id : "");
+    m.tool_call.assign(tool_call_id ? tool_call_id : "");
+    m.git_head.assign(git_head);
+    m.capture_started = t0;
+    m.capture_finished = t1;
+    m.created = t1;
+    m.parent_hash = parent_hash;
+    m.base_store.assign(s->store_id.c_str());
+    m.base_snapshot = (int64_t)wr.snapshot_id;
+    m.base_created = sr.created_at;
+    for (size_t i = 0; i < recs.size(); ++i) {
+        ManifestChange mc;
+        mc.path = recs[i].path;
+        mc.change = recs[i].change;
+        mc.before = recs[i].before;
+        mc.after = recs[i].after;
+        mc.base = recs[i].base;
+        m.changes.emplace_back(mc);
+    }
+    String manifest;
+    manifest_emit(m, manifest);
+    char manifest_hash[WFS_REVISION_HASH_MAX];
+    sha256_hex(manifest.c_str(), manifest.size(), manifest_hash);
+    {
+        // The object's own hash is the manifest's hash; a mismatch would be a bug in the writer.
+        char obj_hash[WFS_REVISION_HASH_MAX];
+        if (int prc = content_put_mem(s, manifest.c_str(), manifest.size(), obj_hash)) return prc;
+        if (::strcmp(obj_hash, manifest_hash) != 0) return -EIO;
+    }
+
     Guard g(s->mu);
     wfs::Txn t(s->db);
     if (!t.ok()) return t.err();
-
-    wfs_id parent = 0;
-    {
-        Stmt q(s->db, "SELECT COALESCE(MAX(id),0) FROM revisions WHERE world_id=?");
-        if (!q.ok()) return -EIO;
-        q.i64(1, (int64_t)world);
-        if (q.row()) parent = (wfs_id)q.col_i64(0);
-        else if (!q.done()) return -EIO;
-    }
     {
         Stmt ins(s->db,
                  "INSERT INTO revisions(world_id, parent_revision, baseline_snapshot, origin,"
                  " coverage, actor_id, turn_id, tool_call_id, git_head, capture_started_at,"
-                 " capture_finished_at, created_at, changes, added, modified, deleted, meta)"
-                 " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+                 " capture_finished_at, created_at, changes, added, modified, deleted, meta,"
+                 " manifest_hash, parent_hash)"
+                 " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         if (!ins.ok()) return -EIO;
         ins.i64(1, (int64_t)world);
         ins.i64(2, (int64_t)parent);
@@ -843,6 +1151,8 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
         ins.i64(15, (int64_t)modified);
         ins.i64(16, (int64_t)deleted);
         ins.i64(17, (int64_t)meta);
+        ins.text(18, manifest_hash);
+        ins.text(19, parent_hash.c_str());
         if (ins.step() != SQLITE_DONE) return -EIO;
     }
     wfs_id rev = (wfs_id)::sqlite3_last_insert_rowid(s->db);
@@ -856,6 +1166,9 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
         }
 
         bool del = o.change == WFS_C_DELETED;
+        int kind = o.after.present ? o.after.kind : o.before.kind;
+        uint32_t mode = o.after.present ? o.after.mode : o.before.mode;
+        uint64_t size = o.after.present ? o.after.size : o.before.size;
         {
             Stmt c(s->db,
                    "INSERT INTO changes(revision_id, seq, file_id, change, kind, old_path,"
@@ -865,36 +1178,50 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
             c.i64(2, seq++);
             c.i64(3, (int64_t)fid);
             c.i64(4, o.change);
-            c.i64(5, o.kind);
+            c.i64(5, kind);
             c.text(6, del ? o.path.c_str() : "");
             c.text(7, del ? "" : o.path.c_str());
-            c.text(8, o.before.c_str());
-            c.text(9, o.after.c_str());
-            c.i64(10, (int64_t)o.size);
-            c.i64(11, (int64_t)o.mode);
+            c.text(8, o.before.present ? o.before.hash.c_str() : "");
+            c.text(9, o.after.present ? o.after.hash.c_str() : "");
+            c.i64(10, (int64_t)size);
+            c.i64(11, (int64_t)mode);
             if (c.step() != SQLITE_DONE) return -EIO;
         }
-        // The state the next record compares against: a deletion is recorded absent (kind 0,
-        // empty hash); everything else is the current state.
-        int last_kind = del ? 0 : o.kind;
-        String last_hash;
-        if (!del) last_hash = o.after;
+        // The state the next record compares against is the after state; a deletion is recorded
+        // absent (kind 0, empty hash).
         {
             Stmt u(s->db,
                    "UPDATE history_files SET last_hash=?, last_kind=?, last_mode=?, last_size=?,"
                    " last_mtime=?, last_revision=? WHERE file_id=?");
             if (!u.ok()) return -EIO;
-            u.text(1, last_hash.c_str());
-            u.i64(2, last_kind);
-            u.i64(3, (int64_t)o.mode);
-            u.i64(4, (int64_t)o.size);
-            u.i64(5, o.mtime);
+            u.text(1, o.after.present ? o.after.hash.c_str() : "");
+            u.i64(2, o.after.present ? o.after.kind : 0);
+            u.i64(3, o.after.present ? (int64_t)o.after.mode : 0);
+            u.i64(4, o.after.present ? (int64_t)o.after.size : 0);
+            u.i64(5, o.after.present ? o.after.mtime : 0);
             u.i64(6, (int64_t)rev);
             u.i64(7, (int64_t)fid);
             if (u.step() != SQLITE_DONE) return -EIO;
         }
-        if (o.before.size() && content_ref(s, o.before.c_str(), o.before_size, t1)) return -EIO;
-        if (o.after.size() && content_ref(s, o.after.c_str(), o.after_size, t1)) return -EIO;
+        if (o.before.present && o.before.hash.size() &&
+            content_ref(s, o.before.hash.c_str(), o.before.size, t1))
+            return -EIO;
+        if (o.after.present && o.after.hash.size() &&
+            content_ref(s, o.after.hash.c_str(), o.after.size, t1))
+            return -EIO;
+    }
+    // The manifest object itself is referenced, and the baseline is pinned so discarding the
+    // World cannot orphan this history.
+    if (content_ref(s, manifest_hash, manifest.size(), t1)) return -EIO;
+    {
+        Stmt p(s->db,
+               "INSERT OR IGNORE INTO history_pins(snapshot_id, revision_id, kind, created_at)"
+               " VALUES(?,?,1,?)");
+        if (!p.ok()) return -EIO;
+        p.i64(1, (int64_t)wr.snapshot_id);
+        p.i64(2, (int64_t)rev);
+        p.i64(3, t1);
+        if (p.step() != SQLITE_DONE) return -EIO;
     }
 
     if (int crc = t.commit()) return crc;
@@ -1014,3 +1341,270 @@ extern "C" int wfs_history_content(wfs_store *s, const char *hash, void **buf, s
 }
 
 extern "C" void wfs_history_free(void *buf) { ::free(buf); }
+
+// ---- export / import -------------------------------------------------------------------------
+
+namespace {
+thread_local String g_history_reason;
+const char *set_history_reason(const char *why) {
+    g_history_reason.assign(why ? why : "");
+    return why;
+}
+} // namespace
+
+extern "C" const char *wfs_history_reason(void) { return g_history_reason.c_str(); }
+
+extern "C" int wfs_revision_export(wfs_store *s, wfs_id revision, void **buf, size_t *len,
+                                   char out_hash[WFS_REVISION_HASH_MAX]) {
+    if (!s || !revision || !buf || !len || !out_hash) return -EINVAL;
+    *buf = nullptr;
+    *len = 0;
+    out_hash[0] = 0;
+    char hash[WFS_REVISION_HASH_MAX] = {0};
+    {
+        Guard g(s->mu);
+        Stmt q(s->db, "SELECT manifest_hash FROM revisions WHERE id=?");
+        if (!q.ok()) return -EIO;
+        q.i64(1, (int64_t)revision);
+        if (!q.row()) return q.done() ? -ENOENT : -EIO;
+        wfs::copy_str(hash, sizeof hash, q.col_text(0));
+    }
+    if (!hash[0]) {
+        set_history_reason("this revision was recorded before manifests existed");
+        return WFS_E_HISTORY_MANIFEST;
+    }
+    void *mem = nullptr;
+    size_t n = 0;
+    int rc = wfs_history_content(s, hash, &mem, &n);
+    if (rc) return rc;
+    // The object is addressed by its own hash; verify rather than trust the row.
+    char check[WFS_REVISION_HASH_MAX];
+    sha256_hex(mem, n, check);
+    if (::strcmp(check, hash) != 0) {
+        ::free(mem);
+        set_history_reason("the stored manifest does not match its hash");
+        return WFS_E_HISTORY_MANIFEST;
+    }
+    wfs::copy_str(out_hash, WFS_REVISION_HASH_MAX, hash);
+    *buf = mem;
+    *len = n;
+    return 0;
+}
+
+extern "C" int wfs_revision_import(wfs_store *s, wfs_id world, const void *manifest, size_t len,
+                                   int flags, wfs_id *out_revision,
+                                   char out_hash[WFS_REVISION_HASH_MAX]) {
+    if (!s || !world || !manifest || !len || !out_revision || !out_hash) return -EINVAL;
+    *out_revision = 0;
+    out_hash[0] = 0;
+
+    ManifestInput m;
+    String err;
+    if (manifest_parse((const char *)manifest, len, m, err) != 0) {
+        set_history_reason(err.c_str());
+        return WFS_E_HISTORY_MANIFEST;
+    }
+    // A manifest is canonical: re-emitting what we parsed must produce the same bytes, so the
+    // hash is stable and a manifest that was reformatted or reordered is refused rather than
+    // silently given a different id.
+    String again;
+    manifest_emit(m, again);
+    if (again.size() != len || ::memcmp(again.c_str(), manifest, len) != 0) {
+        set_history_reason("manifest is not in canonical form");
+        return WFS_E_HISTORY_MANIFEST;
+    }
+    char hash[WFS_REVISION_HASH_MAX];
+    sha256_hex(manifest, len, hash);
+    wfs::copy_str(out_hash, WFS_REVISION_HASH_MAX, hash);
+
+    wfs_world_rec wr;
+    if (int rc = wfs_world_info(s, world, &wr)) return rc;
+    if (wr.state != WFS_ST_ACTIVE) return -ESTALE;
+
+    // Deduplication by hash: importing a manifest already here is a no-op.
+    {
+        Guard g(s->mu);
+        Stmt q(s->db, "SELECT id FROM revisions WHERE manifest_hash=?");
+        if (!q.ok()) return -EIO;
+        q.text(1, hash);
+        if (q.row()) { *out_revision = (wfs_id)q.col_i64(0); return 0; }
+        if (!q.done()) return -EIO;
+    }
+
+    // The baseline this revision was recorded against must be this World's baseline. Cross-store
+    // import needs snapshot transfer and is not part of this slice.
+    if (m.base_store.size() == 0 || m.base_store != s->store_id.c_str() ||
+        m.base_snapshot != (int64_t)wr.snapshot_id) {
+        set_history_reason("the manifest's baseline is not this World's baseline");
+        return WFS_E_HISTORY_BASELINE_MISMATCH;
+    }
+    wfs_snapshot_rec sr;
+    if (int rc = wfs_snapshot_info(s, wr.snapshot_id, &sr)) return rc;
+    if (m.base_created != sr.created_at) {
+        set_history_reason("the manifest's baseline creation time does not match");
+        return WFS_E_HISTORY_BASELINE_MISMATCH;
+    }
+
+    // The chain is linear per World: the manifest's parent must be this World's latest revision,
+    // and a parentless manifest is only accepted into a World with no revisions yet. This is what
+    // keeps history_files a single per-path state rather than a branch set.
+    wfs_id parent = 0;
+    String latest_hash;
+    {
+        Guard g(s->mu);
+        Stmt q(s->db, "SELECT id, manifest_hash FROM revisions WHERE world_id=? ORDER BY id DESC LIMIT 1");
+        if (!q.ok()) return -EIO;
+        q.i64(1, (int64_t)world);
+        if (q.row()) { parent = (wfs_id)q.col_i64(0); latest_hash.assign(q.col_text(1)); }
+        else if (!q.done()) return -EIO;
+    }
+    if (m.parent_hash.size() == 0) {
+        if (parent) {
+            set_history_reason("the import declares no parent but this World already has revisions");
+            return WFS_E_HISTORY_PARENT_MISSING;
+        }
+    } else if (m.parent_hash != latest_hash.c_str()) {
+        set_history_reason("the manifest's parent is not this World's latest revision");
+        return WFS_E_HISTORY_PARENT_MISSING;
+    }
+
+    // Every content object the manifest references has to be here, or the revision would name
+    // missing bytes the moment it is published.
+    for (size_t i = 0; i < m.changes.size(); ++i) {
+        const ManifestChange &c = m.changes[i];
+        const String *hashes[2] = { nullptr, nullptr };
+        if (c.before.present && c.before.hash.size()) hashes[0] = &c.before.hash;
+        if (c.after.present && c.after.hash.size()) hashes[1] = &c.after.hash;
+        for (const String *h : hashes) {
+            if (!h) continue;
+            Guard g(s->mu);
+            Stmt q(s->db, "SELECT 1 FROM content WHERE hash=?");
+            if (!q.ok()) return -EIO;
+            q.text(1, h->c_str());
+            if (!q.row()) {
+                if (!q.done()) return -EIO;
+                set_history_reason(h->c_str());
+                return WFS_E_HISTORY_CONTENT_MISSING;
+            }
+            String p;
+            content_path(s, h->c_str(), p);
+            if (wfs::fs_probe(p.c_str()) != 0) {
+                set_history_reason(h->c_str());
+                return WFS_E_HISTORY_CONTENT_MISSING;
+            }
+        }
+    }
+
+    if (flags & WFS_HISTORY_IMPORT_CHECK) return 0;
+
+    // Store the manifest object before the transaction that names it.
+    {
+        char obj_hash[WFS_REVISION_HASH_MAX];
+        if (int prc = content_put_mem(s, manifest, len, obj_hash)) return prc;
+        if (::strcmp(obj_hash, hash) != 0) return -EIO;
+    }
+
+    int64_t t1 = wfs::now_sec();
+    Guard g(s->mu);
+    wfs::Txn t(s->db);
+    if (!t.ok()) return t.err();
+    {
+        Stmt ins(s->db,
+                 "INSERT INTO revisions(world_id, parent_revision, baseline_snapshot, origin,"
+                 " coverage, actor_id, turn_id, tool_call_id, git_head, capture_started_at,"
+                 " capture_finished_at, created_at, changes, added, modified, deleted, meta,"
+                 " manifest_hash, parent_hash)"
+                 " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        if (!ins.ok()) return -EIO;
+        ins.i64(1, (int64_t)world);
+        ins.i64(2, (int64_t)parent);
+        ins.i64(3, (int64_t)wr.snapshot_id);
+        ins.i64(4, m.origin);
+        ins.i64(5, m.coverage);
+        ins.text(6, m.actor.c_str());
+        ins.text(7, m.turn.c_str());
+        ins.text(8, m.tool_call.c_str());
+        ins.text(9, m.git_head.c_str());
+        ins.i64(10, m.capture_started);
+        ins.i64(11, m.capture_finished);
+        ins.i64(12, m.created);
+        int64_t added = 0, modified = 0, deleted = 0, meta = 0;
+        for (size_t i = 0; i < m.changes.size(); ++i) {
+            switch (m.changes[i].change) {
+            case WFS_C_ADDED: added++; break;
+            case WFS_C_MODIFIED: modified++; break;
+            case WFS_C_DELETED: deleted++; break;
+            default: meta++; break;
+            }
+        }
+        ins.i64(13, (int64_t)m.changes.size());
+        ins.i64(14, added);
+        ins.i64(15, modified);
+        ins.i64(16, deleted);
+        ins.i64(17, meta);
+        ins.text(18, hash);
+        ins.text(19, m.parent_hash.c_str());
+        if (ins.step() != SQLITE_DONE) return -EIO;
+    }
+    wfs_id rev = (wfs_id)::sqlite3_last_insert_rowid(s->db);
+
+    int64_t seq = 0;
+    for (size_t i = 0; i < m.changes.size(); ++i) {
+        const ManifestChange &c = m.changes[i];
+        wfs_id fid = 0;
+        if (int e = file_id_get_or_create(s, world, c.path.c_str(), c.base, &fid)) return e;
+        bool del = c.change == WFS_C_DELETED;
+        {
+            Stmt q(s->db,
+                   "INSERT INTO changes(revision_id, seq, file_id, change, kind, old_path,"
+                   " new_path, before_hash, after_hash, size, mode) VALUES(?,?,?,?,?,?,?,?,?,?,?)");
+            if (!q.ok()) return -EIO;
+            q.i64(1, (int64_t)rev);
+            q.i64(2, seq++);
+            q.i64(3, (int64_t)fid);
+            q.i64(4, c.change);
+            q.i64(5, c.after.present ? c.after.kind : c.before.kind);
+            q.text(6, del ? c.path.c_str() : "");
+            q.text(7, del ? "" : c.path.c_str());
+            q.text(8, c.before.present ? c.before.hash.c_str() : "");
+            q.text(9, c.after.present ? c.after.hash.c_str() : "");
+            q.i64(10, (int64_t)(c.after.present ? c.after.size : c.before.size));
+            q.i64(11, (int64_t)(c.after.present ? c.after.mode : c.before.mode));
+            if (q.step() != SQLITE_DONE) return -EIO;
+        }
+        {
+            Stmt u(s->db,
+                   "UPDATE history_files SET last_hash=?, last_kind=?, last_mode=?, last_size=?,"
+                   " last_mtime=?, last_revision=? WHERE file_id=?");
+            if (!u.ok()) return -EIO;
+            u.text(1, c.after.present ? c.after.hash.c_str() : "");
+            u.i64(2, c.after.present ? c.after.kind : 0);
+            u.i64(3, c.after.present ? (int64_t)c.after.mode : 0);
+            u.i64(4, c.after.present ? (int64_t)c.after.size : 0);
+            u.i64(5, c.after.present ? c.after.mtime : 0);   // not transferred: 0 after an import
+            u.i64(6, (int64_t)rev);
+            u.i64(7, (int64_t)fid);
+            if (u.step() != SQLITE_DONE) return -EIO;
+        }
+        if (c.before.present && c.before.hash.size() &&
+            content_ref(s, c.before.hash.c_str(), c.before.size, t1))
+            return -EIO;
+        if (c.after.present && c.after.hash.size() &&
+            content_ref(s, c.after.hash.c_str(), c.after.size, t1))
+            return -EIO;
+    }
+    if (content_ref(s, hash, len, t1)) return -EIO;
+    {
+        Stmt p(s->db,
+               "INSERT OR IGNORE INTO history_pins(snapshot_id, revision_id, kind, created_at)"
+               " VALUES(?,?,1,?)");
+        if (!p.ok()) return -EIO;
+        p.i64(1, (int64_t)wr.snapshot_id);
+        p.i64(2, (int64_t)rev);
+        p.i64(3, t1);
+        if (p.step() != SQLITE_DONE) return -EIO;
+    }
+    if (int crc = t.commit()) return crc;
+    *out_revision = rev;
+    return 0;
+}

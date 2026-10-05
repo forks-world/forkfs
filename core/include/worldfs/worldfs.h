@@ -173,7 +173,13 @@ enum {
     /* wfs_git_publish: the target repository cannot take the branch (not a repository, the
      * branch is checked out there, not a fast-forward, unrelated history). wfs_git_reason()
      * says which. */
-    WFS_E_GIT_TARGET = -1029
+    WFS_E_GIT_TARGET = -1029,
+    /* Continuous work history, import/export. All four carry the offending value in
+     * wfs_history_reason(). */
+    WFS_E_HISTORY_MANIFEST = -1030,          /* not a canonical revision manifest */
+    WFS_E_HISTORY_PARENT_MISSING = -1031,    /* its parent revision is not in this store */
+    WFS_E_HISTORY_CONTENT_MISSING = -1032,   /* a content object it references is not here */
+    WFS_E_HISTORY_BASELINE_MISMATCH = -1033 /* its baseline is not this World's baseline */
 };
 
 /* One process, other than this one, that has a store's database open (PR #1 review, 34th
@@ -306,6 +312,10 @@ typedef struct wfs_snapshot_rec {
      * outside the tree: those cannot be rebuilt and stay independent copies. */
     uint64_t hl_groups;
     uint64_t hl_external;
+    /* Continuous work history: how many recorded revisions depend on this snapshot as their
+     * baseline (history_pins). It is a hard reference -- wfs_snapshot_discard refuses while it is
+     * non-zero -- so discarding a World does not orphan the history recorded against it. */
+    uint64_t pins;
 } wfs_snapshot_rec;
 
 typedef struct wfs_snapshot_opts {
@@ -811,6 +821,11 @@ typedef struct wfs_revision_rec {
     int64_t capture_started_at, capture_finished_at, created_at;
     uint64_t changes;                       /* paths in this revision's delta */
     uint64_t added, modified, deleted, meta;
+    /* Sync-ready identity: the SHA-256 of the revision's canonical, store-independent manifest
+     * (an immutable content object under <store>/content), and the same hash of its parent. They
+     * address a revision without a local id, so a chain walks and transfers by hash. */
+    char manifest_hash[WFS_REVISION_HASH_MAX];
+    char parent_hash[WFS_REVISION_HASH_MAX];
 } wfs_revision_rec;
 
 typedef struct wfs_revision_change {
@@ -849,6 +864,34 @@ int wfs_revision_changes(wfs_store *s, wfs_id id, wfs_revision_change *buf, size
  * wfs_history_free). Returns -ENOENT when no such object is recorded. */
 int wfs_history_content(wfs_store *s, const char *hash, void **buf, size_t *len);
 void wfs_history_free(void *buf);
+
+/* Export one revision as its canonical manifest: the store-independent bytes that a peer needs
+ * to import it. `buf` is malloc'd (free with wfs_history_free) and `out_hash` receives its
+ * SHA-256. The manifest is addressed by that hash and stored as a content object, so the id a
+ * revision has here and the id it has after import are the same. Returns WFS_E_HISTORY_MANIFEST
+ * for a revision recorded before manifests existed. */
+int wfs_revision_export(wfs_store *s, wfs_id revision, void **buf, size_t *len,
+                        char out_hash[WFS_REVISION_HASH_MAX]);
+
+enum {
+    /* Validate the manifest and everything it needs, insert nothing. */
+    WFS_HISTORY_IMPORT_CHECK = 1 << 0
+};
+
+/* Import a manifest into `world`, whose baseline must be the one the manifest was recorded
+ * against (same store id, snapshot and creation time): cross-store import lands together with
+ * snapshot transfer, which is not part of this slice. The parent revision must already be here
+ * unless the manifest's parent is null, and every content object it references must be here too,
+ * so an imported revision never names a missing object. Importing a manifest that is already
+ * present is a no-op that returns its existing revision id (deduplication by hash).
+ *
+ * `out_revision` receives the local revision id (0 with WFS_HISTORY_IMPORT_CHECK) and
+ * `out_hash` the manifest hash. Refusals name the offending value in wfs_history_reason(). */
+int wfs_revision_import(wfs_store *s, wfs_id world, const void *manifest, size_t len, int flags,
+                        wfs_id *out_revision, char out_hash[WFS_REVISION_HASH_MAX]);
+
+/* The offending value for the last WFS_E_HISTORY_* on this thread, or "". */
+const char *wfs_history_reason(void);
 
 /* P7: refuse dangerous roots. for_target != 0 means "a fork is about to create this path"
  * (it must not exist yet); otherwise the path must already be a directory. */

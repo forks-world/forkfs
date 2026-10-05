@@ -74,8 +74,16 @@ Foundation + 最小 CLI)。设计明确这不是 snapshot、不是 Git commit;�
   `history record W<n> [--actor A] [--turn T] [--tool-call C] [--json]`。
   `cli/tests/history_test.py` 覆盖增量、去重、无变化、mode-only、超预算 `INCOMPLETE` 与 JSON 契约,
   注册为 `cli_history_test`。
+- [x] 同步就绪的 revision manifest 与 baseline pin:每条 revision 生成**存储无关**的规范化
+  manifest(固定行序,路径/名字 hex,状态显式 after/before/base),以自身 SHA-256 寻址并作为
+  content object 保存;`revisions.manifest_hash/parent_hash` 让链按 hash 走,不依赖本地 id。
+  `history export R<n>` 写出 manifest(身份 hash 到 stderr),`history import <file> --into W<n>
+  [--check]` 校验规范化、父链、baseline 与全部被引用 content 对象后按序导入(重复导入按 hash
+  去重)。baseline snapshot 被 `history_pins` 钉住:即使 World 已丢弃,`discard S<n>` 也拒绝
+  (`WFS_E_SNAPSHOT_IN_USE`);`inspect S<n>` 显示 pins。跨 store 导入需要连同 baseline
+  snapshot 一起传输,留给后续切片。
 - [ ] 后续切片(见设计):候选收集/批处理与轮次边界、托管 agent 工具与写者控制、精确读引用、
-  恢复进新 World、压缩/pins/quota/崩溃恢复、协作。
+  恢复进新 World、压缩/pins/quota/崩溃恢复、协作、跨 store manifest+snapshot 同步。
 
 ## 环境事实(2026-09-18, Mac mini M1, macOS 26.6.2)
 
