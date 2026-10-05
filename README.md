@@ -509,6 +509,10 @@ Per-operation trace (what the kernel actually sends the extension):
 log stream --level debug --style compact --predicate 'subsystem == "world.forks.fs"'
 ```
 
+## Proposed designs
+
+- [Continuous work history for agents](docs/CONTINUOUS_WORK_HISTORY.md): lightweight file revisions between Git commits, capture guarantees, recovery, and phased delivery.
+
 ## Layout
 
 ```
