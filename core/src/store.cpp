@@ -245,11 +245,13 @@ const char *kSchema =
     "  last_kind INTEGER NOT NULL DEFAULT 0,"
     "  last_mode INTEGER NOT NULL DEFAULT 0,"
     "  last_size INTEGER NOT NULL DEFAULT 0,"
+    "  last_mtime INTEGER NOT NULL DEFAULT 0,"   /* nanoseconds; change detector when no content */
     "  last_revision INTEGER NOT NULL DEFAULT 0,"
     "  base_hash TEXT NOT NULL DEFAULT '',"
     "  base_kind INTEGER NOT NULL DEFAULT 0,"
     "  base_mode INTEGER NOT NULL DEFAULT 0,"
     "  base_size INTEGER NOT NULL DEFAULT 0,"
+    "  base_mtime INTEGER NOT NULL DEFAULT 0,"
     "  UNIQUE(world_id, path));";
 
 // Columns added after the first schema-2 stores were written. They are additive and carry
@@ -318,6 +320,10 @@ const Migration kMigrations[] = {
      "ALTER TABLE history_files ADD COLUMN base_mode INTEGER NOT NULL DEFAULT 0"},
     {"history_files", "base_size",
      "ALTER TABLE history_files ADD COLUMN base_size INTEGER NOT NULL DEFAULT 0"},
+    {"history_files", "last_mtime",
+     "ALTER TABLE history_files ADD COLUMN last_mtime INTEGER NOT NULL DEFAULT 0"},
+    {"history_files", "base_mtime",
+     "ALTER TABLE history_files ADD COLUMN base_mtime INTEGER NOT NULL DEFAULT 0"},
 };
 
 // Additive revision of the schema. `PRAGMA user_version` carries SCHEMA*100 + REV, so a store
@@ -326,7 +332,7 @@ const Migration kMigrations[] = {
 // with 2 never saw a later ALTER TABLE. The revision counter keeps counting across the 2 -> 3
 // bump: it numbers additive steps, and never resetting it means no two stamps this core has
 // ever written collide.
-const int kSchemaRev = 6;
+const int kSchemaRev = 7;
 inline int user_version_want(void) { return WFS_STORE_SCHEMA * 100 + kSchemaRev; }
 
 // Does `table` have a column called `column`, right now, in this database? The table names are

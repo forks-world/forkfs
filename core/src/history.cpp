@@ -161,14 +161,6 @@ void hex_encode(const uint8_t *p, size_t n, char *out) {
 
 // ---- paths -----------------------------------------------------------------------------------
 
-String joinp(const char *a, const char *b) {
-    String p(a);
-    size_t n = p.size();
-    if (n && p.c_str()[n - 1] != '/') p.append("/");
-    p.append(b);
-    return p;
-}
-
 void dirname_of(const char *p, String &out) {
     const char *slash = ::strrchr(p, '/');
     if (!slash) { out.assign("."); return; }
@@ -330,23 +322,65 @@ int content_put_mem(wfs_store *s, const void *data, size_t n, char out[WFS_REVIS
 }
 
 // The state one path is in, as the recorder sees it. `hash` is the content address ("" for a
-// directory, a special file, an over-budget file, or an entry that is not there); `incoherent`
-// means the bytes could not be captured as a stable read and the revision must say so.
+// directory, a special file, an over-budget file, or an entry that is not there); `mtime` is a
+// detector kept only so that a content-less regular file whose bytes could not be captured can
+// still be told from an unchanged one; `incoherent` means the bytes could not be captured as a
+// stable read and the revision must say so.
 struct State {
     bool present = false;
     int kind = 0;
     uint32_t mode = 0;
     uint64_t size = 0;
+    int64_t mtime = 0;   // nanoseconds
     String hash;
     bool incoherent = false;
 };
 
-int capture_regular(wfs_store *s, const char *path, const struct stat &lst, State &st) {
+// An owned directory descriptor, so the capture loops close what they open on every path out.
+struct Fd {
+    int fd = -1;
+    ~Fd() { if (fd >= 0) ::close(fd); }
+    Fd() = default;
+    Fd(const Fd &) = delete;
+    Fd &operator=(const Fd &) = delete;
+};
+
+// Opens the parent directory of `rel` under `rootfd` and returns it with `leaf` set, or a
+// negative value. Every component is opened with O_NOFOLLOW, so a symlinked ancestor is refused
+// (returns -EINVAL) instead of being followed out of the World -- the final lstat(2)/open(2)
+// would otherwise resolve such a path outside the tree and capture host-file bytes.
+int open_parent(int rootfd, const char *rel, String &leaf) {
+    if (!rel || !*rel) return -EINVAL;
+    int fd = ::dup(rootfd);
+    if (fd < 0) return -errno;
+    const char *p = rel;
+    for (;;) {
+        const char *slash = ::strchr(p, '/');
+        if (!slash) { leaf.assign(p); return fd; }
+        if (slash == p) { ::close(fd); return -EINVAL; }   // empty component
+        String comp(p, (size_t)(slash - p));
+        if (!::strcmp(comp.c_str(), ".") || !::strcmp(comp.c_str(), "..")) {
+            ::close(fd);
+            return -EINVAL;
+        }
+        int nfd = ::openat(fd, comp.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (nfd < 0) {
+            int e = errno;
+            ::close(fd);
+            return (e == ELOOP || e == ENOTDIR) ? -EINVAL : -e;   // a symlinked ancestor
+        }
+        ::close(fd);
+        fd = nfd;
+        p = slash + 1;
+    }
+}
+
+// Reads the already-open regular file `fd` (owned and closed here). `lst` is its
+// AT_SYMLINK_NOFOLLOW stat from the parent, used to detect replacement under us.
+int capture_regular(wfs_store *s, int fd, const struct stat &lst, State &st) {
     uint64_t limit = content_limit();
     st.size = (uint64_t)lst.st_size;
-    if ((uint64_t)lst.st_size > limit) { st.incoherent = true; return 0; }
-    int fd = ::open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) { st.incoherent = true; return 0; }
+    if ((uint64_t)lst.st_size > limit) { ::close(fd); st.incoherent = true; return 0; }
     struct stat bst;
     if (::fstat(fd, &bst) != 0 || !S_ISREG(bst.st_mode) || bst.st_dev != lst.st_dev ||
         bst.st_ino != lst.st_ino) {
@@ -390,21 +424,37 @@ int capture_regular(wfs_store *s, const char *path, const struct stat &lst, Stat
     return 0;
 }
 
-// Reads one path into `st`, materializing its content into the store when it has any. Follows no
-// symlink: a symlink's "content" is the target string, exactly as a Git blob records it.
-int capture_state(wfs_store *s, const char *path, State &st) {
+// Reads one path relative to an open World/snapshot root (`.world`/`.git` paths are filtered
+// before this). Follows no symlink -- not the final one (a symlink's "content" is its target
+// string, exactly as a Git blob records it) and not an ancestor -- and checks identity and mtime
+// before and after the read.
+int capture_state(wfs_store *s, int rootfd, const char *rel, State &st) {
+    String leaf;
+    int pfd = open_parent(rootfd, rel, leaf);
+    if (pfd < 0) {
+        if (pfd == -EINVAL) { st.incoherent = true; return 0; }   // a symlinked ancestor
+        if (wfs::fs_gone(pfd)) return 0;   // an ancestor is genuinely absent: not there
+        return pfd;
+    }
     struct stat lst;
-    if (::lstat(path, &lst) != 0) {
+    if (::fstatat(pfd, leaf.c_str(), &lst, AT_SYMLINK_NOFOLLOW) != 0) {
         int e = errno;
+        ::close(pfd);
         if (wfs::fs_gone(-e)) return 0;   // genuinely not there; st.present stays false
         return -e;
     }
     st.present = true;
     st.mode = (uint32_t)(lst.st_mode & 07777);
+    {
+        int64_t ms; long mn;
+        mtime_of(lst, &ms, &mn);
+        st.mtime = ms * 1000000000LL + mn;
+    }
     if (S_ISLNK(lst.st_mode)) {
         st.kind = WFS_T_SYMLINK;
         char buf[WFS_PATH_MAX];
-        ssize_t n = ::readlink(path, buf, sizeof buf);
+        ssize_t n = ::readlinkat(pfd, leaf.c_str(), buf, sizeof buf);
+        ::close(pfd);
         if (n < 0) { st.incoherent = true; return 0; }
         st.size = (uint64_t)n;
         if ((size_t)n >= sizeof buf) st.incoherent = true;   // the target was truncated
@@ -413,11 +463,15 @@ int capture_state(wfs_store *s, const char *path, State &st) {
         st.hash.assign(hex);
         return 0;
     }
-    if (S_ISDIR(lst.st_mode)) { st.kind = WFS_T_DIR; return 0; }
+    if (S_ISDIR(lst.st_mode)) { ::close(pfd); st.kind = WFS_T_DIR; return 0; }
     if (S_ISREG(lst.st_mode)) {
+        int fd = ::openat(pfd, leaf.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        ::close(pfd);
+        if (fd < 0) { st.incoherent = true; return 0; }
         st.kind = WFS_T_FILE;
-        return capture_regular(s, path, lst, st);
+        return capture_regular(s, fd, lst, st);
     }
+    ::close(pfd);
     st.kind = type_from_mode(lst.st_mode);
     return 0;
 }
@@ -426,7 +480,7 @@ int capture_state(wfs_store *s, const char *path, State &st) {
 
 int history_prev(wfs_store *s, wfs_id world, const char *path, State &st, bool &has_row) {
     Stmt q(s->db,
-           "SELECT last_hash, last_kind, last_mode, last_size FROM history_files"
+           "SELECT last_hash, last_kind, last_mode, last_size, last_mtime FROM history_files"
            " WHERE world_id=? AND path=?");
     if (!q.ok()) return -EIO;
     q.i64(1, (int64_t)world);
@@ -437,6 +491,7 @@ int history_prev(wfs_store *s, wfs_id world, const char *path, State &st, bool &
     st.kind = (int)q.col_i64(1);
     st.mode = (uint32_t)q.col_i64(2);
     st.size = (uint64_t)q.col_i64(3);
+    st.mtime = q.col_i64(4);
     st.present = st.kind != 0;
     return 0;
 }
@@ -452,8 +507,8 @@ int file_id_get_or_create(wfs_store *s, wfs_id world, const char *path, const St
     if (q.row()) { *out = (wfs_id)q.col_i64(0); return 0; }
     if (!q.done()) return -EIO;
     Stmt ins(s->db,
-             "INSERT INTO history_files(world_id, path, base_hash, base_kind, base_mode, base_size)"
-             " VALUES(?,?,?,?,?,?)");
+             "INSERT INTO history_files(world_id, path, base_hash, base_kind, base_mode, base_size,"
+             " base_mtime) VALUES(?,?,?,?,?,?,?)");
     if (!ins.ok()) return -EIO;
     ins.i64(1, (int64_t)world);
     ins.text(2, path);
@@ -461,6 +516,7 @@ int file_id_get_or_create(wfs_store *s, wfs_id world, const char *path, const St
     ins.i64(4, base.present ? base.kind : 0);
     ins.i64(5, base.present ? (int64_t)base.mode : 0);
     ins.i64(6, base.present ? (int64_t)base.size : 0);
+    ins.i64(7, base.present ? base.mtime : 0);
     if (ins.step() != SQLITE_DONE) return -EIO;
     *out = (wfs_id)::sqlite3_last_insert_rowid(s->db);
     return 0;
@@ -522,9 +578,11 @@ bool differs(const State &cur, const State &prev, int &change) {
     if (cur.present && !prev.present) { change = WFS_C_ADDED; return true; }
     if (!cur.present && prev.present) { change = WFS_C_DELETED; return true; }
     if (cur.hash != prev.hash || cur.kind != prev.kind) { change = WFS_C_MODIFIED; return true; }
-    // Two regular files with no content on either side (both over the budget): only their sizes
-    // can tell them apart, and equal hashes that are both empty are not equality of content.
-    if (cur.kind == WFS_T_FILE && cur.hash.size() == 0 && cur.size != prev.size) {
+    // Two regular files with no content on either side (both over the budget): equal empty hashes
+    // are not equality of content, so size and mtime decide. The mtime is what catches a rewrite
+    // with different bytes of the same length; without it such a change would be silently lost.
+    if (cur.kind == WFS_T_FILE && cur.hash.size() == 0 &&
+        (cur.size != prev.size || cur.mtime != prev.mtime)) {
         change = WFS_C_MODIFIED;
         return true;
     }
@@ -565,6 +623,7 @@ struct Out {
     int kind = 0;
     uint32_t mode = 0;
     uint64_t size = 0, before_size = 0, after_size = 0;
+    int64_t mtime = 0;   // the after state's mtime, remembered for hashless comparison
     String path, before, after;
     // The baseline state, used only when this change creates the path's history_files row.
     State base;
@@ -626,6 +685,12 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
     Vec<Out> recs;
     bool incoherent = false;
 
+    // Capture reads each path relative to an open World root (and the snapshot root), never by
+    // absolute path, so a symlinked ancestor cannot redirect a read outside the tree.
+    Fd wfd;
+    wfd.fd = ::open(wroot, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (wfd.fd < 0) return -errno;
+
     {
         // The baseline is read inside the snapshot's gate, exactly as the diff reads it. The gate
         // window covers the whole capture; a fork from this snapshot waits behind it, which is
@@ -633,21 +698,22 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
         wfs::SnapshotReadGuard gate(sr.path);
         if (wfs::fs_gone(gate.rc)) return WFS_E_SOURCE_GONE;
         if (gate.rc) return gate.rc;
+        Fd sfd;
+        sfd.fd = ::open(sr.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (sfd.fd < 0) return wfs::fs_gone(-errno) ? WFS_E_SOURCE_GONE : -errno;
 
         for (size_t i = 0; i < col.paths.size(); ++i) {
             const char *rel = col.paths[i].c_str();
             if (path_excluded(rel)) continue;
 
             State cur;
-            String wp = joinp(wroot, rel);
-            if (int e = capture_state(s, wp.c_str(), cur)) return e;
+            if (int e = capture_state(s, wfd.fd, rel, cur)) return e;
 
             State prev;
             bool has_row = false;
             if (int e = history_prev(s, world, rel, prev, has_row)) return e;
             if (!has_row) {
-                String bp = joinp(sr.path, rel);
-                if (int e = capture_state(s, bp.c_str(), prev)) return e;
+                if (int e = capture_state(s, sfd.fd, rel, prev)) return e;
             }
             // A revision that touches a regular file whose content is unknown on either side is
             // incomplete, whatever the diff happened to say about it.
@@ -662,6 +728,7 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
             o.kind = cur.present ? cur.kind : prev.kind;
             o.mode = cur.present ? cur.mode : prev.mode;
             o.size = cur.present ? cur.size : prev.size;
+            o.mtime = cur.present ? cur.mtime : 0;
             if (prev.present) { o.before = prev.hash; o.before_size = prev.size; }
             if (cur.present) { o.after = cur.hash; o.after_size = cur.size; }
             if (!has_row) o.base = prev;   // the baseline state to reconcile against later
@@ -677,8 +744,8 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
         // snapshot" for content, kind and mode.
         {
             Stmt q(s->db,
-                   "SELECT file_id, path, last_hash, last_kind, last_mode, last_size,"
-                   " base_hash, base_kind, base_mode, base_size"
+                   "SELECT file_id, path, last_hash, last_kind, last_mode, last_size, last_mtime,"
+                   " base_hash, base_kind, base_mode, base_size, base_mtime"
                    " FROM history_files WHERE world_id=? ORDER BY path");
             if (!q.ok()) return -EIO;
             q.i64(1, (int64_t)world);
@@ -690,12 +757,14 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
                 last.kind = (int)q.col_i64(3);
                 last.mode = (uint32_t)q.col_i64(4);
                 last.size = (uint64_t)q.col_i64(5);
+                last.mtime = q.col_i64(6);
                 last.present = last.kind != 0;
                 State base;
-                base.hash.assign(q.col_text(6));
-                base.kind = (int)q.col_i64(7);
-                base.mode = (uint32_t)q.col_i64(8);
-                base.size = (uint64_t)q.col_i64(9);
+                base.hash.assign(q.col_text(7));
+                base.kind = (int)q.col_i64(8);
+                base.mode = (uint32_t)q.col_i64(9);
+                base.size = (uint64_t)q.col_i64(10);
+                base.mtime = q.col_i64(11);
                 base.present = base.kind != 0;
                 // The baseline's content being unavailable is a property that survives: a path
                 // reconciled against it stays incomplete rather than being relabeled OBSERVED.
@@ -709,6 +778,7 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
                 o.kind = base.present ? base.kind : last.kind;
                 o.mode = base.present ? base.mode : last.mode;
                 o.size = base.present ? base.size : last.size;
+                o.mtime = base.present ? base.mtime : 0;   // after == base here
                 if (last.present) { o.before = last.hash; o.before_size = last.size; }
                 if (base.present) { o.after = base.hash; o.after_size = base.size; }
                 recs.emplace_back(o);
@@ -812,14 +882,15 @@ extern "C" int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_
         {
             Stmt u(s->db,
                    "UPDATE history_files SET last_hash=?, last_kind=?, last_mode=?, last_size=?,"
-                   " last_revision=? WHERE file_id=?");
+                   " last_mtime=?, last_revision=? WHERE file_id=?");
             if (!u.ok()) return -EIO;
             u.text(1, last_hash.c_str());
             u.i64(2, last_kind);
             u.i64(3, (int64_t)o.mode);
             u.i64(4, (int64_t)o.size);
-            u.i64(5, (int64_t)rev);
-            u.i64(6, (int64_t)fid);
+            u.i64(5, o.mtime);
+            u.i64(6, (int64_t)rev);
+            u.i64(7, (int64_t)fid);
             if (u.step() != SQLITE_DONE) return -EIO;
         }
         if (o.before.size() && content_ref(s, o.before.c_str(), o.before_size, t1)) return -EIO;

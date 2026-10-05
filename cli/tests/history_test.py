@@ -247,6 +247,38 @@ class HistoryTest(unittest.TestCase):
         self.assertEqual(show['changes'][0]['change'], 'modified')
         self.assertEqual(show['changes'][0]['after_hash'], '')
 
+    def test_equal_length_change_over_budget_is_recorded(self):
+        # Both captures are over budget, so both hashes are empty AND the sizes are equal; the
+        # mtime is what proves the file was rewritten, and the change must not be silently lost.
+        self.populate()
+        env = dict(self.env, WFS_HISTORY_MAX_CONTENT='16')
+        (self.world / 'big').write_bytes(b'a' * 64)
+        self.run_world('fs', 'history', 'record', 'W1', env=env)
+        st = os.stat(self.world / 'big')
+        (self.world / 'big').write_bytes(b'b' * 64)
+        os.utime(self.world / 'big', ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        rec = self.run_world('fs', 'history', 'record', 'W1', env=env)
+        self.assertIn(b'R2', rec.stdout)
+        show = self.query('history', 'show', 'R2')
+        self.assertEqual(show['revision']['coverage'], 'incomplete')
+        self.assertEqual(show['changes'][0]['change'], 'modified')
+
+    def test_symlinked_ancestor_is_not_followed(self):
+        # A writer that replaces a directory on the way with a symlink must not make capture read
+        # and store bytes from outside the World.
+        self.populate()
+        outside = self.root / 'outside'
+        outside.mkdir()
+        secret = b'SECRET-OUTSIDE-CONTENT\n'
+        (outside / 'f').write_bytes(secret)
+        (self.world / 'sub').mkdir()
+        (self.world / 'sub' / 'keep').write_text('keep\n')
+        self.run_world('fs', 'history', 'record', 'W1')
+        shutil.rmtree(self.world / 'sub')
+        os.symlink(str(outside), str(self.world / 'sub'))
+        self.run_world('fs', 'history', 'record', 'W1')
+        self.assertFalse(self.content_exists(self.sha(secret)))
+
     def test_record_is_serialized_against_the_world_lock(self):
         self.populate()
         (self.world / 'x').write_text('x')
