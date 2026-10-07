@@ -20,6 +20,17 @@ def percentile(values, q):
     return ordered[max(0, min(len(ordered) - 1, (len(ordered) * q + 0.999999).__floor__() - 1))]
 
 
+def summarize(workload, side, values):
+    # Use the short-operation threshold for every workload so small exploratory
+    # runs cannot be mistaken for acceptance evidence.
+    enough_samples = len(values) >= 1000
+    return {"workload": workload, "side": side, "samples": len(values),
+            "p50_ns": percentile(values, .50),
+            "p95_ns": percentile(values, .95) if enough_samples else None,
+            "p95_min_samples": 1000,
+            "p95_status": "reported" if enough_samples else "insufficient_samples"}
+
+
 def run_git(path, *args, env=None):
     clean_env = dict(env if env is not None else os.environ)
     identity = {key: clean_env[key] for key in (
@@ -173,8 +184,7 @@ def main():
         for workload in workloads:
             for side in ("native", "world"):
                 values = [r["elapsed_ns"] for r in raw if r["workload"] == workload and r["side"] == side]
-                summaries.append({"workload": workload, "side": side, "samples": len(values),
-                                  "p50_ns": percentile(values, .50), "p95_ns": percentile(values, .95)})
+                summaries.append(summarize(workload, side, values))
         info = {"schema_version": 1, "created_unix_ns": time.time_ns(), "native_root": str(roots[0]),
                 "world_root": str(roots[1]), "fixture_files": args.files, "samples_per_workload_side": args.samples,
                 "stat_cold_definition": "first stat of distinct paths in process; OS cache is not dropped",

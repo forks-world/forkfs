@@ -197,7 +197,8 @@ broker 和可归因的系统进程内存、fd 数及 CPU。资源不足应限制
 交错运行 native/候选，分别测新挂载与重复访问、pool 命中与耗尽、首次 CoW 写与后续写。
 新挂载只代表名字/卷缓存冷启动，不冒称物理磁盘冷缓存。禁止用 best-of-N 作为发布成绩。
 首个数据面采样工具是 [`scripts/bench/mounted_fs.py`](../scripts/bench/mounted_fs.py)：
-它在两个已存在的不同设备目录内建临时 fixture、交错取样并输出原始 JSONL 与 p50/p95。
+它在两个已存在的不同设备目录内建临时 fixture、交错取样并输出原始 JSONL 与 p50；
+每项每侧满 1000 个样本才输出 p95，否则标记 `insufficient_samples`，p95 值为 `null`。
 它不核验 forkfs 卷身份，也不包含挂载、隔离、broker、历史或构建/安装的完整场景，
 因此只能作为上述验收的一部分。
 

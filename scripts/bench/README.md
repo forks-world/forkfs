@@ -13,7 +13,12 @@ python3 scripts/bench/mounted_fs.py /path/to/native /path/to/mounted-world \
 
 `--output` must already exist. Each invocation creates a new results directory containing
 `samples.jsonl` (one raw nanosecond sample per workload, side, and iteration) and
-`summary.json` (p50/p95 plus fixture and cache definitions). Workloads are first stat of distinct
+`summary.json` (p50 plus fixture and cache definitions; p95 only with sufficient samples).
+Each result reports `p95_min_samples: 1000`. With fewer samples, including the default
+100-sample run, `p95_ns` is `null` and `p95_status` is `insufficient_samples`.
+Use `--samples 1000` to report p95 (`p95_status: reported`); this conservative threshold
+applies to every workload and does not by itself establish acceptance of the design budgets.
+Workloads are first stat of distinct
 paths, atomic 4 KiB save (fsync + rename), Git status on a dirty tracked file, create/delete of a
 directory and child, and repeated stat of one path. Git fixture creation and initial commit are
 outside the measured samples. Native and World operations are interleaved. The roots must have
@@ -25,6 +30,12 @@ does not mean a physical cold cache or a newly mounted volume. The results measu
 data path only. They exclude mount setup, isolation, broker, and history costs, and cannot by
 themselves establish the redesign's performance budgets. Use `--files 50000` for the 50k-file
 Git workload; sample count is capped at 1000 and may not exceed fixture size.
+
+Run the summary regression checks without mounting a filesystem:
+
+```bash
+python3 -m unittest discover -s scripts/bench -p 'test_mounted_fs.py'
+```
 
 `apfs_active_fork_probe.py` is a separate macOS-only experiment for the active-image clone
 question. It creates a 160 MiB APFS sparse image under `/private/tmp`, runs a continuous append
