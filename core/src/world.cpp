@@ -350,24 +350,15 @@ int marker_read_at(int dirfd, MarkerData &out) {
 // flock on the marker file. It is advisory and process-scoped, which is exactly the scope we
 // want: two `world` invocations serialise, and nothing an agent does inside the world is
 // affected.
+// The shared implementation lives in namespace wfs below, so history.cpp can take the same lock
+// without a second copy of the flock semantics.
 struct WorldLock {
     int fd = -1;
-    ~WorldLock() { if (fd >= 0) { ::flock(fd, LOCK_UN); ::close(fd); } }
+    ~WorldLock() { wfs::world_marker_lock_release(fd); }
     WorldLock() = default;
     WorldLock(const WorldLock &) = delete;
     WorldLock &operator=(const WorldLock &) = delete;
-    int take(const char *world_root) {
-        String p = joinp(world_root, WFS_MARKER_NAME);
-        fd = ::open(p.c_str(), O_RDONLY);
-        if (fd < 0) return errno == ENOENT ? WFS_E_NOT_A_WORLD : -errno;
-        if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
-            int e = errno;
-            ::close(fd);
-            fd = -1;
-            return (e == EWOULDBLOCK || e == EAGAIN) ? WFS_E_WORLD_BUSY : -e;
-        }
-        return 0;
-    }
+    int take(const char *world_root) { return wfs::world_marker_lock_take(world_root, &fd); }
 };
 
 // ---- P3, the default: the gate directory --------------------------------------------------
@@ -1056,6 +1047,30 @@ int trash_unlink_claim(TrashClaim &c, uint64_t *entries, int64_t deadline_us = 0
 }
 
 } // namespace
+
+// The per-World marker lock, external so history.cpp can serialize its capture and publication
+// against fork/checkpoint/discard with the same flock (internal.h). `joinp` is the anonymous
+// namespace's, visible here for the rest of the translation unit.
+namespace wfs {
+
+int world_marker_lock_take(const char *world_root, int *out_fd) {
+    String p = joinp(world_root, WFS_MARKER_NAME);
+    int fd = ::open(p.c_str(), O_RDONLY);
+    if (fd < 0) return errno == ENOENT ? WFS_E_NOT_A_WORLD : -errno;
+    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        int e = errno;
+        ::close(fd);
+        return (e == EWOULDBLOCK || e == EAGAIN) ? WFS_E_WORLD_BUSY : -e;
+    }
+    *out_fd = fd;
+    return 0;
+}
+
+void world_marker_lock_release(int fd) {
+    if (fd >= 0) { ::flock(fd, LOCK_UN); ::close(fd); }
+}
+
+} // namespace wfs
 
 namespace {
 

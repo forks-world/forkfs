@@ -66,6 +66,14 @@ static void usage(int code = EX_USAGE) {
           "                                   com.apple.provenance (the kernel's note of which app\n"
           "                                   created a file, which cannot be removed) is left out\n"
           "                                   of the xattr comparison; --all-xattrs puts it back\n"
+          "  history [W<n>] [--json]          work revisions recorded for a world (or all worlds),\n"
+          "                                   newest first. A revision is the incremental source\n"
+          "                                   delta between records, not a snapshot and not a commit\n"
+          "  history show R<n> [--json]       one revision and its changes\n"
+          "  history record W<n> [--actor A] [--turn T] [--tool-call C] [--json]\n"
+          "                                   capture the world's current changes as a new revision,\n"
+          "                                   storing changed bytes as immutable content; publishes\n"
+          "                                   nothing when there is no relevant change\n"
           "  list [--json]                    snapshots and worlds\n"
           "  inspect W<n>|S<n> [--json]\n"
           "  discard W<n>|S<n> [--now] [--force]\n"
@@ -920,6 +928,224 @@ static int cmd_diff(wfs_store *s, int argc, char **argv) {
                (unsigned long long)st.compared, (unsigned long long)st.content_cmp,
                st.elapsed_us / 1e6);
     }
+    return EX_OK;
+}
+
+static wfs_id parse_revision(const char *s) {
+    if (!s || (s[0] != 'R' && s[0] != 'r')) {
+        fprintf(stderr, "world: expected a revision id like R1, got '%s'\n", s ? s : "");
+        exit(EX_USAGE);
+    }
+    char *end = NULL;
+    unsigned long long v = strtoull(s + 1, &end, 10);
+    if (!end || *end || v == 0) {
+        fprintf(stderr, "world: expected a revision id like R1, got '%s'\n", s);
+        exit(EX_USAGE);
+    }
+    return (wfs_id)v;
+}
+
+// Same retry contract as json_read_list (json.h), but with the world filter a revision list can
+// carry, which the generic json_list overloads cannot.
+static int read_revisions(wfs_store *s, wfs_id world, wfs_revision_rec **out, size_t *n) {
+    *out = NULL;
+    int rc = wfs_revision_list(s, world, NULL, 0, n);
+    if (rc) return rc;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        size_t cap = *n;
+        if (!cap) return 0;
+        if (cap > SIZE_MAX / sizeof(wfs_revision_rec)) return -ENOMEM;
+        wfs_revision_rec *v = (wfs_revision_rec *)calloc(cap, sizeof *v);
+        if (!v) return -ENOMEM;
+        rc = wfs_revision_list(s, world, v, cap, n);
+        if (!rc && *n <= cap) { *out = v; return 0; }
+        free(v);
+        if (rc) return rc;
+    }
+    return -EAGAIN;
+}
+
+static int read_changes(wfs_store *s, wfs_id rev, wfs_revision_change **out, size_t *n) {
+    *out = NULL;
+    int rc = wfs_revision_changes(s, rev, NULL, 0, n);
+    if (rc) return rc;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        size_t cap = *n;
+        if (!cap) return 0;
+        if (cap > SIZE_MAX / sizeof(wfs_revision_change)) return -ENOMEM;
+        wfs_revision_change *v = (wfs_revision_change *)calloc(cap, sizeof *v);
+        if (!v) return -ENOMEM;
+        rc = wfs_revision_changes(s, rev, v, cap, n);
+        if (!rc && *n <= cap) { *out = v; return 0; }
+        free(v);
+        if (rc) return rc;
+    }
+    return -EAGAIN;
+}
+
+static int cmd_history(wfs_store *s, int argc, char **argv) {
+    if (argc >= 1 && !strcmp(argv[0], "record")) {
+        wfs_id w = 0;
+        const char *actor = NULL, *turn = NULL, *tool = NULL;
+        for (int i = 1; i < argc; ++i) {
+            if (!strcmp(argv[i], "--actor") && i + 1 < argc) actor = argv[++i];
+            else if (!strcmp(argv[i], "--turn") && i + 1 < argc) turn = argv[++i];
+            else if (!strcmp(argv[i], "--tool-call") && i + 1 < argc) tool = argv[++i];
+            else if (argv[i][0] != '-' && !w) w = parse_world(argv[i]);
+            else usage();
+        }
+        if (!w) usage();
+
+        wfs_id rev = 0;
+        int rc = wfs_history_record(s, w, actor, turn, tool, &rev);
+        if (rc == WFS_E_SOURCE_GONE) {
+            char why[256];
+            wfs_world_rec r;
+            wfs_world_info(s, w, &r);
+            if (r.snapshot_id)
+                snprintf(why, sizeof why,
+                         "W%llu was forked from S%llu, which is no longer in the store: there "
+                         "is no baseline to record against",
+                         (unsigned long long)w, (unsigned long long)r.snapshot_id);
+            else
+                snprintf(why, sizeof why, "W%llu has no source snapshot recorded", (unsigned long long)w);
+            return refuse(why, "world fs list   (and `world fs checkpoint W<n>` to give it a new baseline)");
+        }
+        if (rc == WFS_E_WORLD_MISSING) {
+            wfs_world_rec r;
+            wfs_world_info(s, w, &r);
+            char why[WFS_PATH_MAX + 64];
+            snprintf(why, sizeof why, "W%llu is not at %s any more", (unsigned long long)w, r.path);
+            return refuse(why, "world fs verify <the path it was moved to>");
+        }
+        if (rc == -ESTALE) {
+            wfs_world_rec r;
+            wfs_world_info(s, w, &r);
+            char why[128];
+            snprintf(why, sizeof why, "W%llu is %s, not active", (unsigned long long)w, state_name(r.state));
+            return refuse(why, "world fs list");
+        }
+        if (rc) return fail("history record", rc);
+
+        if (g_json) {
+            Json j(g_json_out);
+            j.num("schema_version", 1);
+            j.ref("world", 'W', w);
+            j.ref("revision", 'R', rev);
+            j.str("result", rev ? "recorded" : "no-change");
+        } else if (!rev) {
+            printf("W%llu: no changes since the last revision\n", (unsigned long long)w);
+        } else {
+            wfs_revision_rec r;
+            if (wfs_revision_info(s, rev, &r) == 0)
+                printf("R%llu recorded for W%llu: %llu added, %llu modified, %llu deleted, "
+                       "%llu metadata-only\n",
+                       (unsigned long long)rev, (unsigned long long)w,
+                       (unsigned long long)r.added, (unsigned long long)r.modified,
+                       (unsigned long long)r.deleted, (unsigned long long)r.meta);
+            else
+                printf("R%llu recorded for W%llu\n", (unsigned long long)rev, (unsigned long long)w);
+        }
+        return EX_OK;
+    }
+
+    if (argc >= 1 && !strcmp(argv[0], "show")) {
+        wfs_id rev = 0;
+        for (int i = 1; i < argc; ++i) {
+            if (argv[i][0] != '-' && !rev) rev = parse_revision(argv[i]);
+            else usage();
+        }
+        if (!rev) usage();
+        wfs_revision_rec r;
+        int rc = wfs_revision_info(s, rev, &r);
+        if (rc) return fail("history show", rc);
+        size_t n = 0;
+        wfs_revision_change *ch = NULL;
+        rc = read_changes(s, rev, &ch, &n);
+        if (rc) { free(ch); return fail("history show", rc); }
+
+        if (g_json) {
+            fputs("{\"schema_version\":1,\"revision\":", g_json_out);
+            json_revision(g_json_out, r);
+            fputs(",\"changes\":[", g_json_out);
+            for (size_t i = 0; i < n; ++i) {
+                if (i) fputc(',', g_json_out);
+                json_revision_change(g_json_out, ch[i]);
+            }
+            fputs("]}", g_json_out);
+            free(ch);
+            return EX_OK;
+        }
+        char t[32], parent[24], baseline[24];
+        fmt_time(t, sizeof t, r.created_at);
+        if (r.parent_revision) snprintf(parent, sizeof parent, "R%llu", (unsigned long long)r.parent_revision);
+        else snprintf(parent, sizeof parent, "-");
+        if (r.baseline_snapshot) snprintf(baseline, sizeof baseline, "S%llu", (unsigned long long)r.baseline_snapshot);
+        else snprintf(baseline, sizeof baseline, "-");
+        printf("revision:  R%llu\nworld:     W%llu\nparent:    %s\nbaseline:  %s\n",
+               (unsigned long long)r.id, (unsigned long long)r.world_id, parent, baseline);
+        printf("origin:    %s\ncoverage:  %s\ncreated:   %s\n",
+               r.origin == WFS_RV_ORIGIN_TOOL ? "tool" :
+               r.origin == WFS_RV_ORIGIN_FILESYSTEM ? "filesystem" :
+               r.origin == WFS_RV_ORIGIN_RESTORE ? "restore" : "unknown",
+               r.coverage == WFS_RV_COVERAGE_MEDIATED ? "mediated" :
+               r.coverage == WFS_RV_COVERAGE_OBSERVED ? "observed" : "incomplete", t);
+        if (r.git_head[0]) printf("git HEAD:  %s\n", r.git_head);
+        if (r.actor_id[0]) printf("actor:     %s\n", r.actor_id);
+        if (r.turn_id[0]) printf("turn:      %s\n", r.turn_id);
+        if (r.tool_call_id[0]) printf("tool call: %s\n", r.tool_call_id);
+        printf("changes:   %llu (%llu added, %llu modified, %llu deleted, %llu metadata-only)\n",
+               (unsigned long long)r.changes, (unsigned long long)r.added,
+               (unsigned long long)r.modified, (unsigned long long)r.deleted,
+               (unsigned long long)r.meta);
+        for (size_t i = 0; i < n; ++i) {
+            wfs_revision_change &c = ch[i];
+            printf("  %c  %s", c.change, c.path);
+            if (c.change != 'D') printf("  %llu bytes", (unsigned long long)c.size);
+            if (c.after_hash[0]) printf("  after %.12s", c.after_hash);
+            if (c.before_hash[0]) printf("  before %.12s", c.before_hash);
+            fputc('\n', stdout);
+        }
+        free(ch);
+        return EX_OK;
+    }
+
+    wfs_id w = 0;
+    for (int i = 0; i < argc; ++i) {
+        if (argv[i][0] != '-' && !w) w = parse_world(argv[i]);
+        else usage();
+    }
+    size_t n = 0;
+    wfs_revision_rec *v = NULL;
+    int rc = read_revisions(s, w, &v, &n);
+    if (rc) { free(v); return fail("history", rc); }
+    if (g_json) fputs("{\"schema_version\":1,\"revisions\":[", g_json_out);
+    if (n && !g_json)
+        printf("%-6s %-6s %-16s %-11s %-16s %s\n", "REV", "WORLD", "A/M/D/T", "COVERAGE", "CREATED", "ACTOR/TOOL");
+    for (size_t i = 0; i < n; ++i) {
+        if (g_json) {
+            if (i) fputc(',', g_json_out);
+            json_revision(g_json_out, v[i]);
+            continue;
+        }
+        char t[32];
+        fmt_time(t, sizeof t, v[i].created_at);
+        char who[264];
+        who[0] = 0;
+        if (v[i].actor_id[0]) snprintf(who, sizeof who, "%s", v[i].actor_id);
+        if (v[i].tool_call_id[0])
+            snprintf(who + strlen(who), sizeof who - strlen(who), "%s%s",
+                     who[0] ? " " : "", v[i].tool_call_id);
+        char ch[24];
+        snprintf(ch, sizeof ch, "%llu/%llu/%llu/%llu", (unsigned long long)v[i].added,
+                 (unsigned long long)v[i].modified, (unsigned long long)v[i].deleted,
+                 (unsigned long long)v[i].meta);
+        printf("R%-5llu W%-5llu %-16s %-11s %-16s %s\n", (unsigned long long)v[i].id,
+               (unsigned long long)v[i].world_id, ch,
+               v[i].coverage == WFS_RV_COVERAGE_INCOMPLETE ? "incomplete" : "observed", t, who);
+    }
+    free(v);
+    if (g_json) fputs("]}", g_json_out);
     return EX_OK;
 }
 
@@ -4767,11 +4993,14 @@ int main(int argc, char **argv) {
         else if (!is_exec && (!strcmp(args[i], "--name") || !strcmp(args[i], "--to") ||
                               !strcmp(args[i], "--from") || !strcmp(args[i], "--retention") ||
                               !strcmp(args[i], "--count") || !strcmp(args[i], "--repo") ||
-                              !strcmp(args[i], "--branch")) && i + 1 < nargs) ++i;
+                              !strcmp(args[i], "--branch") || !strcmp(args[i], "--actor") ||
+                              !strcmp(args[i], "--turn") || !strcmp(args[i], "--tool-call")) &&
+                 i + 1 < nargs) ++i;
     }
     if (command_help) usage(EX_OK);
     if (!is_exec && (!strcmp(sub, "list") || !strcmp(sub, "inspect") ||
-                     !strcmp(sub, "status") || !strcmp(sub, "diff") || !strcmp(sub, "gc") ||
+                     !strcmp(sub, "status") || !strcmp(sub, "diff") || !strcmp(sub, "history") ||
+                     !strcmp(sub, "gc") ||
                      (!strcmp(sub, "pool") && nargs && !strcmp(args[0], "status")))) {
         int kept = 0;
         for (int i = 0; i < nargs; ++i) {
@@ -4966,6 +5195,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(sub, "fork")) ret = cmd_fork(s, nargs, args);
     else if (!strcmp(sub, "checkpoint")) ret = cmd_checkpoint(s, nargs, args);
     else if (!strcmp(sub, "diff")) ret = cmd_diff(s, nargs, args);
+    else if (!strcmp(sub, "history")) ret = cmd_history(s, nargs, args);
     else if (!strcmp(sub, "list")) ret = (nargs == 0) ? cmd_list(s) : (usage(), EX_USAGE);
     else if (!strcmp(sub, "inspect")) ret = (nargs == 1) ? cmd_inspect(s, args[0]) : (usage(), EX_USAGE);
     else if (!strcmp(sub, "discard")) ret = cmd_discard(s, nargs, args);

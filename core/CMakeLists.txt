@@ -14,6 +14,7 @@ set(WFS_CORE_SOURCES
     src/world.cpp
     src/git.cpp
     src/diff.cpp
+    src/history.cpp
     src/snapshot_access.cpp
     src/hardlinks.cpp
     src/pool.cpp

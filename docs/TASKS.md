@@ -52,6 +52,31 @@
   `pool fill --count` / `gc,discard --retention` 严格校验,错误参数退出 2;
   `gc --status` 拒绝同时要求执行清理或对账。
 
+## 连续工作历史增量(2026-10-05)
+
+依据 [`CONTINUOUS_WORK_HISTORY.md`](CONTINUOUS_WORK_HISTORY.md) 的第一个交付切片(本地观察历史,
+Foundation + 最小 CLI)。设计明确这不是 snapshot、不是 Git commit;本切片只做记录与读取,
+恢复、托管编辑、保留/配额、协作均未开始。
+
+- [x] 存储与数据模型:`content / revisions / changes / history_files` 加性 schema(rev 4 → 5,
+  不升 VERSION);不可变内容位于 `<store>/content/<aa>/<sha256>`,不进入 World、沙箱不可写、
+  现有收集器不扫描。`core/src/history.cpp` 内置流式 SHA-256(arch.md §39:不引入加密库)。
+- [x] Core C ABI:`wfs_history_record / wfs_revision_info / wfs_revision_list /
+  wfs_revision_changes / wfs_history_content / wfs_history_free`。记录是**增量**的:与上一条
+  revision 留在 `history_files` 里的状态比较,而不是每次都相对 baseline 快照;没有相关变化时
+  不发布 revision。对不再出现在 baseline diff 里的已记录路径(改回 baseline 或新增后又被删)
+  用 `history_files.base_*` 做 reconcile,否则 revision 链会一直声称它仍存在。capture 与发布
+  持有该 World 的 marker flock(与 fork/checkpoint/discard 同一把锁),并发的两次 record 或与
+  fork 的重叠会返回 `WFS_E_WORLD_BUSY` 而不是相互覆盖(PR #37 review P1)。内容先落盘并 fsync/rename,再提交 revision 事务,发布的行不会引用缺失对象。
+  读文件前后核对 dev/ino/size/mtime,仍变化者标 `INCOMPLETE`;超 `WFS_HISTORY_MAX_CONTENT`
+  (默认 64 MiB)只记元数据并标 `INCOMPLETE`。`.git`、`.world-git`、`.world` 不进入源码历史。
+- [x] CLI:`world fs history [W<n>] [--json]`、`history show R<n> [--json]`、
+  `history record W<n> [--actor A] [--turn T] [--tool-call C] [--json]`。
+  `cli/tests/history_test.py` 覆盖增量、去重、无变化、mode-only、超预算 `INCOMPLETE` 与 JSON 契约,
+  注册为 `cli_history_test`。
+- [ ] 后续切片(见设计):候选收集/批处理与轮次边界、托管 agent 工具与写者控制、精确读引用、
+  恢复进新 World、压缩/pins/quota/崩溃恢复、协作。
+
 ## 环境事实(2026-09-18, Mac mini M1, macOS 26.6.2)
 
 - 只有 Command Line Tools,**没有 Xcode.app**。SwiftPM(Swift 6.3)可以直接链接 FSKit.framework,已验证。

@@ -749,6 +749,107 @@ int wfs_world_diff(wfs_store *s, wfs_id world, int flags, wfs_diff_cb cb, void *
 int wfs_world_diff_ex(wfs_store *s, wfs_id world, int flags, wfs_diff_cb cb, void *ctx,
                       wfs_diff_stats *stats);
 
+/* ---- continuous work history (docs/CONTINUOUS_WORK_HISTORY.md) --------------------------------
+ *
+ * A Work revision records the file changes an agent made between useful Git commits, linked to a
+ * tool call and a conversation turn where the caller knows them. It is deliberately NOT a
+ * snapshot: it holds only the source changes in its scope, cannot restore Git administration,
+ * excluded build outputs or running processes, and is not a complete whole-tree checkpoint. A
+ * revision does not relax anything the checkpoint path validates.
+ *
+ * This is the first delivery slice: local observed history. `wfs_history_record()` reads a live
+ * World, compares it against its baseline snapshot through the ordinary diff, and stores the
+ * bytes that changed as immutable content-addressed objects under <store>/content. It records an
+ * incremental delta -- the difference from the previous revision's recorded state, not a fresh
+ * whole-tree delta against the baseline -- so unchanged files cost nothing and repeated saves
+ * over identical content do not publish a revision. Reads (history/diff) and restoration into a
+ * new World come on top of this contract.
+ *
+ * Recorded changes are sampled, not a syscall log. A file rewritten A->B->C between two records
+ * is observed only as A->C, and a file created and deleted between them is never seen. No actor
+ * is inferred from timing: origin and coverage are what the recorder actually did.
+ *
+ * .git, an owned .world-git and the .world marker are excluded from source history; Git context
+ * is stored separately and nothing is staged, committed or reset. The revision's id is its stable
+ * address (the CLI spells it R<n>); no timestamp is ever an address.
+ *
+ * Immutable content lives outside the agent's writable World and is never writable through the
+ * execution sandbox. The initial implementation keeps every object it writes: there is no
+ * revision retention or garbage collection yet (delivery phase 3), and no collector walks
+ * <store>/content, so an unpublished object can only be leaked by being written and then
+ * orphaned by a crash between the object write and the revision commit. */
+#define WFS_REVISION_HASH_MAX 65 /* SHA-256 hex + NUL */
+
+typedef enum wfs_revision_origin {
+    WFS_RV_ORIGIN_TOOL = 1,       /* a managed agent tool operation */
+    WFS_RV_ORIGIN_FILESYSTEM = 2, /* a filesystem observation batch (this slice) */
+    WFS_RV_ORIGIN_RESTORE = 3     /* materialized by restoring an earlier revision */
+} wfs_revision_origin;
+
+/* What the recorder can promise about a revision's completeness. `MEDIATED` would mean every
+ * write passed through the recorder (managed tools, phase 2); `OBSERVED` means the recorder saw
+ * the current state of changed paths but no intermediate write is claimed; `INCOMPLETE` means
+ * at least one path could not be captured coherently (mutated mid-read, over the size budget, or
+ * unreadable) and the revision must not be read as lossless. */
+typedef enum wfs_revision_coverage {
+    WFS_RV_COVERAGE_MEDIATED = 1,
+    WFS_RV_COVERAGE_OBSERVED = 2,
+    WFS_RV_COVERAGE_INCOMPLETE = 3
+} wfs_revision_coverage;
+
+typedef struct wfs_revision_rec {
+    wfs_id id;
+    wfs_id world_id;
+    wfs_id parent_revision;   /* the previous revision of this world, 0 for the first */
+    wfs_id baseline_snapshot; /* snapshot the world was forked from when recorded, 0 if none */
+    int origin;               /* wfs_revision_origin */
+    int coverage;             /* wfs_revision_coverage */
+    char actor_id[128];       /* explicit caller identity; "" when none was given */
+    char turn_id[128];
+    char tool_call_id[128];
+    char git_head[65];        /* HEAD observed at capture, "" when none; contextual, not proof */
+    int64_t capture_started_at, capture_finished_at, created_at;
+    uint64_t changes;                       /* paths in this revision's delta */
+    uint64_t added, modified, deleted, meta;
+} wfs_revision_rec;
+
+typedef struct wfs_revision_change {
+    wfs_id file_id;
+    int change;      /* wfs_change: A / M / D / T */
+    wfs_type type;   /* the entry's kind after the change; for D, before it */
+    char path[WFS_PATH_MAX];     /* new path, or the old path for a deletion */
+    char before_hash[WFS_REVISION_HASH_MAX]; /* "" when the entry did not exist before */
+    char after_hash[WFS_REVISION_HASH_MAX];  /* "" when deleted, a directory, or over budget */
+    uint64_t size;
+    uint32_t mode;
+} wfs_revision_change;
+
+/* Record the current source changes of `world` as a new revision. actor_id/turn_id/tool_call_id
+ * may be NULL. `out_revision` receives the new id, or 0 when nothing changed since the previous
+ * revision (which is not an error and publishes nothing).
+ *
+ * Capture and publication hold the World's marker lock (the same flock fork/checkpoint/discard
+ * take), so two concurrent records -- and a fork of the same World -- cannot read state and then
+ * publish against each other. A world already busy with another such operation is refused with
+ * WFS_E_WORLD_BUSY rather than raced. The same lock makes the revision's parent, its before
+ * hashes and its reconciliation against the previous revision's recorded state a consistent
+ * whole. Returns WFS_E_SOURCE_GONE when the world has no live baseline to compare against,
+ * WFS_E_WORLD_MISSING when it is not at its recorded path, -ESTALE when it is not ACTIVE, or a
+ * negative errno. */
+int wfs_history_record(wfs_store *s, wfs_id world, const char *actor_id, const char *turn_id,
+                       const char *tool_call_id, wfs_id *out_revision);
+int wfs_revision_info(wfs_store *s, wfs_id id, wfs_revision_rec *out);
+/* Revisions of `world`, newest first. `world` = 0 lists every world's revisions. Same retry
+ * contract as the other list calls: `count` receives the total, `buf` up to `cap` of them. */
+int wfs_revision_list(wfs_store *s, wfs_id world, wfs_revision_rec *buf, size_t cap, size_t *count);
+/* The changes of one revision, in capture order. Same retry contract. */
+int wfs_revision_changes(wfs_store *s, wfs_id id, wfs_revision_change *buf, size_t cap,
+                         size_t *count);
+/* The immutable bytes of a content object, malloc'd into *buf (caller frees with
+ * wfs_history_free). Returns -ENOENT when no such object is recorded. */
+int wfs_history_content(wfs_store *s, const char *hash, void **buf, size_t *len);
+void wfs_history_free(void *buf);
+
 /* P7: refuse dangerous roots. for_target != 0 means "a fork is about to create this path"
  * (it must not exist yet); otherwise the path must already be a directory. */
 int wfs_path_check(wfs_store *s, const char *path, int for_target);
