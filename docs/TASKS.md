@@ -6,6 +6,55 @@
 [`MACOS_VALIDATION.md`](MACOS_VALIDATION.md)。本文件按时间保留历史测试数量与测量结果;
 旧的 93/142 等通过数不代表当前测试总数,应以当前 CI/测试输出为准。
 
+## 用户态版本化文件系统整体设计（2026-10-08）
+
+依据 [USERSPACE_FILESYSTEM_DESIGN.md](USERSPACE_FILESYSTEM_DESIGN.md)。本节为新的统一核心
+验证顺序；下面的 APFS 映像与平台调研保留为实验基线，不等于新存储引擎已实现。
+
+- [x] 编写整体设计：元数据 DAG、inode/目录/extent、revision/fork、事务提交、引用回收、
+  本地与 S3 发布状态、多端边界、平台隔离与分阶段验收。
+- [ ] 极简 FSKit/FUSE 内存元数据后端，分离前端往返和存储开销；原始数据决定是否继续。
+- [ ] 本地 CoW 元数据与 SQLite/segment 提交原型，验证 fsync、故障恢复、hardlink、
+  open-unlink、计数重建、ENOSPC 与多 World 调度。
+- [ ] 活跃 checkpoint 写回屏障、挂载代次撤销、真实 Git/build 和 agent 绕过验收。
+- [ ] S3 不可变对象上传、条件发布、只读远端挂载及独立本地分支；首版关闭远端物理 GC。
+- [ ] 按测量决定 extent/页粒度、批次窗口、pack 与后续远端协调；不投入 macFUSE 或 LKL。
+
+## macOS 文件系统主线重设计（2026-10-07）
+
+依据 [MACOS_FILESYSTEM_REDESIGN.md](MACOS_FILESYSTEM_REDESIGN.md)。后续 macOS 架构以此为准，
+下文 native-root 与 FSKit 冻结记录保留为历史。此节完成前不宣称新的隔离保证已交付。
+
+- [x] 明确挂载式 World、私有 backing、独立控制面、默认拒绝与禁止降级的设计契约。
+- [x] 补充设计 §6 的真实性能预算、优化顺序和前端淘汰条件；指标是待验证目标。
+- [ ] 在完整隔离下建立 native/挂载对照基准，复用 agentstress/realwork 的场景，增加
+  端到端挂载就绪、历史、撤销和多 World 测量；记录原始样本、p50/p95、缓存状态与资源成本。
+- [x] Luna worker 交付 `scripts/bench/mounted_fs.py`：编辑保存、Git status、元数据操作、
+  首次/重复 stat，输出原始 JSONL 与 p50/p95；Sol 审查了不同设备、工作区清理、Git 配置
+  与准备工作边界，并在临时 APFS 挂载上验证 50 条样本/10 个汇总及无遗留 fixture。
+  此项只建立数据面测量工具，未证明 forkfs 的完整隔离或性能预算达标。
+- [ ] 边界原型同时验证保存/Git status/依赖安装/增量构建；FSKit 若因往返成本不能达标，
+  比较其他挂载前端及原生 APFS 卷/映像，不开放 native-root 旁路。
+- [x] 第一轮选型：旧 FSKit passthrough 的完整元数据负载远低于目标，发布方案 No-Go；
+  临时 APFS 映像离线 clone/挂载/隔离内容探针通过，数值和界限见设计 §6.4。
+- [ ] APFS 映像下一道闸：真实项目 native I/O、活跃 World 的一致 fork、挂载/设备访问
+  隔离、1000 idle 与多活跃 World 资源成本。离线 clone 数字不可代替完整 fork 时间。
+- [ ] 评估 Btrfs 式共享块根/每 World 写层在 Apple shadow/ASIF 上的可行性：宿主挂载、
+  一致封层、深层读放大、GC/合并与双重 CoW 写放大；依据设计 §6.5。
+- [x] Luna worker 的单写者活跃 fork 探针通过五轮：停写→源卷恢复中位数 536 ms，
+  双卷挂载中位数 747 ms，内容逐字节一致且两边继续独立；原始结果见设计 §6.4。
+  多写者、真实项目、旧 fd/mmap 与安全边界仍在上一条未完成任务内。
+- [x] 用户接受约 300 ms 挂载；设计 §6.1 拆开挂载与完整 fork 目标。临时映像 20 次
+  attach/detach 探针得到 attach p50 258.7 ms / p95 268.8 ms，未覆盖 broker 与隔离。
+- [ ] 边界原型：验证 FSKit 与私有服务通信、调用者授权、受限启动与 backing 拒绝访问；
+  证明卸载不开放下层目录，记录签名/安装与系统版本要求。
+- [ ] 单 World：接入 core 生命周期和 broker CLI，验证 POSIX、缓存、mmap、fsync、
+  checkpoint 写入屏障与崩溃恢复，跑真实 Git/build/编辑器工作负载。
+- [ ] 多 World：完成会话撤销、控制能力隔离、历史/GC 与设计 §8 绕过验收矩阵。
+- [ ] 测量受保护模式性能与支持矩阵；安全、语义和设计 §6 性能预算全部通过后切换 macOS 默认主线。
+- [ ] 显式迁移旧 World/store，验证 Git/submodule/LFS、hardlink 和历史引用；保留恢复数据，
+  旧目录模式明确标为 legacy/unprotected，不能作为失败回退。
+
 ## Git 集成增量(2026-09-22)
 
 - [x] `feat/git-worktrees`: 根 Git 仓库导入内置 `.world-git/repo.git`,fork 自动建立

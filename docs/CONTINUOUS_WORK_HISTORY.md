@@ -1,5 +1,14 @@
 # Continuous work history for agents
 
+The proposed filesystem revision/root model is now specified in the
+[userspace filesystem design](USERSPACE_FILESYSTEM_DESIGN.md). This document retains the earlier
+observation-based work-history proposal; its partial work revisions must not be confused with the
+new immutable filesystem-root revisions. Neither model promises to capture every application write.
+
+macOS follow-up work must use the [mounted-filesystem redesign](MACOS_FILESYSTEM_REDESIGN.md).
+Its mandatory mount and private backing replace this proposal's native-path assumption on macOS;
+filesystem integration still does not promise a revision for every userspace write.
+
 Status: proposed design, 2026-10-05. This document does not introduce a new command,
 storage schema, daemon, or execution backend. Implementation and numerical defaults
 require validation before becoming part of the product contract.

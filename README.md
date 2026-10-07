@@ -1,9 +1,21 @@
 # forkfs — World FS provider (BranchFS)
 
 Fork a workspace into independently writable worlds on macOS/APFS or Linux/XFS/Btrfs/ext4.
-Design: [`arch.md`](arch.md), [`docs/M1_DESIGN.md`](docs/M1_DESIGN.md). Task board: [`docs/TASKS.md`](docs/TASKS.md).
+Proposed architecture: [`docs/USERSPACE_FILESYSTEM_DESIGN.md`](docs/USERSPACE_FILESYSTEM_DESIGN.md).
+Historical designs: [`arch.md`](arch.md), [`docs/M1_DESIGN.md`](docs/M1_DESIGN.md). Task board: [`docs/TASKS.md`](docs/TASKS.md).
 
 ## Status
+
+The proposed next architecture is a userspace versioned filesystem with a shared metadata core,
+immutable revision roots, CoW forks, and staged local/S3 persistence. See the
+[overall design](docs/USERSPACE_FILESYSTEM_DESIGN.md), especially its metadata, transaction, and GC protocols.
+It is not implemented or performance-qualified. New-mode Worlds on Linux/XFS must also be real
+filesystem mounts; ordinary directories and directory-only bind mounts are not accepted substitutes.
+
+The macOS design direction has changed to mandatory mounted Worlds, private backing storage,
+and fail-closed agent isolation. See [macOS filesystem redesign](docs/MACOS_FILESYSTEM_REDESIGN.md)
+for the new contract, migration plan, and bypass acceptance tests. This is not implemented yet:
+the native-directory implementation and optional FSKit frontend described below remain the current behavior.
 
 Linux has XFS/Btrfs reflink and ext4 sparse-copy backends and namespace-isolated `world exec` through the system
 Bubblewrap CLI. Build requirements, tested behavior, timings and limitations:

@@ -1,5 +1,13 @@
 # BranchFS Mac-first 设计文档 v0.3
 
+> 2026-10-08 整体设计入口：[用户态版本化文件系统与元数据服务](docs/USERSPACE_FILESYSTEM_DESIGN.md)。
+> 新提案统一 revision/fork、CoW 元数据和本地/S3 持久化模型；尚未实现或通过性能验收。
+> 本文的目录透传、首版排除 S3 等约束属于历史阶段；冲突处以整体设计的目标契约为准。
+
+> 2026-10-07 macOS 方向调整：以 [挂载式 World 与访问边界设计](docs/MACOS_FILESYSTEM_REDESIGN.md)
+> 为后续实现依据。World 必须通过真实文件系统挂载访问，backing 与控制面隔离，agent
+> 执行失败时禁止降级。本文保留原始架构与性能目标；冲突处以新设计为准。新边界尚未实现。
+
 ## 1. 产品目标
 
 BranchFS 第一阶段只解决一个问题：
