@@ -1,5 +1,12 @@
 # M1 设计:clonefile World(方案 C)
 
+> 2026-10-08 后续整体提案：[用户态版本化文件系统与元数据服务](USERSPACE_FILESYSTEM_DESIGN.md)。
+> 本文继续仅描述 M1 历史实现，新提案尚未落地。
+
+> 历史实现说明：2026-10-07 起，macOS 后续主线改为
+> [挂载式 World 与访问边界设计](MACOS_FILESYSTEM_REDESIGN.md)。本文的 native-root 主线、
+> FSKit 冻结与性能优先决策不再用于新架构；以下内容仍描述当前已实现行为。
+
 依据:`docs/REDIRECT_EXPERIMENT.md`、`docs/CLONE_MODEL_MACOS27.md`、`docs/MACOS27_MEASUREMENTS.md`。
 决定(2026-09-19,用户确认):M1 主线切到 clonefile World;FSKit 前端冻结为实验性备选。
 **设计一等目标:性能等于 native,且用户/agent 很难把自己搞坏。**

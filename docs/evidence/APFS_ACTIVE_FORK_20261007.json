@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "probe": "apfs_active_image_fork",
+  "image_mib": 160,
+  "repeat_requested": 5,
+  "source_image": "/private/tmp/forkfs-apfs-probe-muhhw9pi/source.sparseimage",
+  "temporary_directory": null,
+  "samples": [
+    {
+      "iteration": 1,
+      "baseline_records": 53,
+      "source_records_after_resume": 108,
+      "records_added_after_resume": 55,
+      "copy_seconds": 0.003774917,
+      "source_write_pause_seconds": 0.46485525,
+      "full_stop_to_both_mounts_seconds": 0.664268375,
+      "checks": {
+        "baseline_log_hashes_and_sequence": true,
+        "fork_matches_quiesced_source": true,
+        "child_write_absent_from_source": true,
+        "source_resume_absent_from_child": true
+      }
+    },
+    {
+      "iteration": 2,
+      "baseline_records": 109,
+      "source_records_after_resume": 168,
+      "records_added_after_resume": 59,
+      "copy_seconds": 0.00333975,
+      "source_write_pause_seconds": 0.402224166,
+      "full_stop_to_both_mounts_seconds": 0.618965458,
+      "checks": {
+        "baseline_log_hashes_and_sequence": true,
+        "fork_matches_quiesced_source": true,
+        "child_write_absent_from_source": true,
+        "source_resume_absent_from_child": true
+      }
+    },
+    {
+      "iteration": 3,
+      "baseline_records": 169,
+      "source_records_after_resume": 225,
+      "records_added_after_resume": 56,
+      "copy_seconds": 0.005380667,
+      "source_write_pause_seconds": 0.540654167,
+      "full_stop_to_both_mounts_seconds": 0.748850583,
+      "checks": {
+        "baseline_log_hashes_and_sequence": true,
+        "fork_matches_quiesced_source": true,
+        "child_write_absent_from_source": true,
+        "source_resume_absent_from_child": true
+      }
+    },
+    {
+      "iteration": 4,
+      "baseline_records": 226,
+      "source_records_after_resume": 284,
+      "records_added_after_resume": 58,
+      "copy_seconds": 0.005318708,
+      "source_write_pause_seconds": 0.535896,
+      "full_stop_to_both_mounts_seconds": 0.7473635,
+      "checks": {
+        "baseline_log_hashes_and_sequence": true,
+        "fork_matches_quiesced_source": true,
+        "child_write_absent_from_source": true,
+        "source_resume_absent_from_child": true
+      }
+    },
+    {
+      "iteration": 5,
+      "baseline_records": 285,
+      "source_records_after_resume": 340,
+      "records_added_after_resume": 55,
+      "copy_seconds": 0.005626667,
+      "source_write_pause_seconds": 0.557937583,
+      "full_stop_to_both_mounts_seconds": 0.76210375,
+      "checks": {
+        "baseline_log_hashes_and_sequence": true,
+        "fork_matches_quiesced_source": true,
+        "child_write_absent_from_source": true,
+        "source_resume_absent_from_child": true
+      }
+    }
+  ],
+  "errors": [],
+  "claims": {
+    "image_is_sparse": true,
+    "clone_requires_detached_source": true,
+    "cold_cache": false,
+    "p95_reported": false
+  },
+  "complete": true,
+  "summary": {
+    "completed_samples": 5,
+    "source_write_pause_median_seconds": 0.535896,
+    "full_cycle_median_seconds": 0.7473635,
+    "p95_reported": false
+  },
+  "cleanup": {
+    "temporary_directory_preserved": false,
+    "mounted": false,
+    "mount_state_verified": true
+  }
+}

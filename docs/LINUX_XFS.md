@@ -1,5 +1,12 @@
 # Linux: XFS native-directory backend
 
+This document describes the existing directory backend. The new World design requires
+a real filesystem mount on XFS too; ordinary directories and directory-only bind mounts
+are not accepted as new-mode World backends or fallbacks. The current
+[overall proposal](USERSPACE_FILESYSTEM_DESIGN.md) evaluates a shared metadata engine with
+a Linux FUSE frontend. OverlayFS on private XFS storage remains a research alternative in the
+[platform comparison](MACOS_FILESYSTEM_REDESIGN.md#610-宿主为-xfs-时的具体选择); neither is implemented.
+
 Linux support starts with reflink-enabled XFS. Snapshot, fork, checkpoint, pool, diff,
 verify, discard/restore and GC use the existing lifecycle and C ABI. The backing tree is
 an ordinary directory; applications read and write it through XFS directly.

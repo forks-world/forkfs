@@ -1,0 +1,1046 @@
+{
+  "schema_version": 1,
+  "probe": "apfs_container_compare",
+  "created_unix_ns": 1791381804097263000,
+  "macos_version": "27.0.1",
+  "image_size_mib": 160,
+  "maximum_simultaneous_logical_image_capacity_mib": 480,
+  "repeat_requested_per_variant": 5,
+  "variants": [
+    "udif_udrw",
+    "sparse",
+    "sparse_shadow"
+  ],
+  "fixture": {
+    "files": 66,
+    "edit_bytes": 4096,
+    "warm_bytes": 622592,
+    "small_operations_per_sample": 64,
+    "sequential_write_bytes": 4194304
+  },
+  "cache_policy": "No cache purge. Every mounted fixture is read/stat warmed identically before data timing; attach timing reflects OS state and is not claimed cold.",
+  "samples": [
+    {
+      "iteration": 1,
+      "interleave_order_index": 0,
+      "variant": "udif_udrw",
+      "container_label": "UDIF/UDRW",
+      "imageinfo_format_code": "UDRW",
+      "virtual_capacity_bytes": 167772160,
+      "base_image": "base-udif.dmg",
+      "attach_ns": 214444625,
+      "detach_ns": 92646875,
+      "verify_remount_attach_ns": 209380958,
+      "verify_remount_detach_ns": 177056333,
+      "edit_save_4k_fsync_rename_ns": 747083,
+      "small_create_unlink_64_total_ns": 8448000,
+      "small_create_unlink_ns_per_op": 132000,
+      "sequential_write_4m_fsync_ns": 3144375,
+      "sequential_bytes": 4194304,
+      "warm_fixture_files": 66,
+      "base_sha256_before": "b13701502bbd6e3917ec589863398ea4181154f638a3ffd47ee9bed813385d54",
+      "base_sha256_after_primary_detach": "b13701502bbd6e3917ec589863398ea4181154f638a3ffd47ee9bed813385d54",
+      "base_sha256_after_verify_detach": "b13701502bbd6e3917ec589863398ea4181154f638a3ffd47ee9bed813385d54",
+      "base_unchanged": true,
+      "base_allocation_before": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "base_allocation_after_primary_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "base_allocation_after_verify_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "base_physical_growth_bytes": 0,
+      "copy_image_before": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "copy_image_after_primary_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "copy_image_after_verify_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "shadow_after_attach_before_data": null,
+      "shadow_after_primary_detach": null,
+      "shadow_after_verify_detach": null,
+      "working_object_physical_growth_bytes": 0,
+      "host_apfs_available_before_bytes": 106114453504,
+      "host_apfs_available_after_primary_detach_bytes": 106109792256,
+      "host_apfs_available_decrease_bytes": 4661248,
+      "persisted_data_verification": {
+        "edit_contents_match": true,
+        "edit_bytes": 4096,
+        "sequential_length_matches": true,
+        "sequential_bytes": 4194304,
+        "sequential_sha256": "2b07811057df887086f06a67edc6ebf911de8b6741156e7a2eb1416a4b8b1b2e",
+        "sequential_hash_matches": true,
+        "small_files_all_unlinked": true
+      }
+    },
+    {
+      "iteration": 1,
+      "interleave_order_index": 1,
+      "variant": "sparse",
+      "container_label": "SPARSE",
+      "imageinfo_format_code": "SPRS",
+      "virtual_capacity_bytes": 167772160,
+      "base_image": "base-sparse.sparseimage",
+      "attach_ns": 232679584,
+      "detach_ns": 181990292,
+      "verify_remount_attach_ns": 235267792,
+      "verify_remount_detach_ns": 147645917,
+      "edit_save_4k_fsync_rename_ns": 759500,
+      "small_create_unlink_64_total_ns": 8795667,
+      "small_create_unlink_ns_per_op": 137432,
+      "sequential_write_4m_fsync_ns": 2778125,
+      "sequential_bytes": 4194304,
+      "warm_fixture_files": 66,
+      "base_sha256_before": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_primary_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_verify_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_unchanged": true,
+      "base_allocation_before": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_primary_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_verify_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_physical_growth_bytes": 0,
+      "copy_image_before": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "copy_image_after_primary_detach": {
+        "image_file_size_bytes": 12587008,
+        "allocated_bytes": 12587008
+      },
+      "copy_image_after_verify_detach": {
+        "image_file_size_bytes": 12587008,
+        "allocated_bytes": 12587008
+      },
+      "shadow_after_attach_before_data": null,
+      "shadow_after_primary_detach": null,
+      "shadow_after_verify_detach": null,
+      "working_object_physical_growth_bytes": 4194304,
+      "host_apfs_available_before_bytes": 106114478080,
+      "host_apfs_available_after_primary_detach_bytes": 106109456384,
+      "host_apfs_available_decrease_bytes": 5021696,
+      "persisted_data_verification": {
+        "edit_contents_match": true,
+        "edit_bytes": 4096,
+        "sequential_length_matches": true,
+        "sequential_bytes": 4194304,
+        "sequential_sha256": "2b07811057df887086f06a67edc6ebf911de8b6741156e7a2eb1416a4b8b1b2e",
+        "sequential_hash_matches": true,
+        "small_files_all_unlinked": true
+      }
+    },
+    {
+      "iteration": 1,
+      "interleave_order_index": 2,
+      "variant": "sparse_shadow",
+      "container_label": "SPARSE+shadow",
+      "imageinfo_format_code": "SPRS",
+      "virtual_capacity_bytes": 167772160,
+      "base_image": "base-sparse.sparseimage",
+      "attach_ns": 238899500,
+      "detach_ns": 178460666,
+      "verify_remount_attach_ns": 238033458,
+      "verify_remount_detach_ns": 165523792,
+      "edit_save_4k_fsync_rename_ns": 896167,
+      "small_create_unlink_64_total_ns": 11963583,
+      "small_create_unlink_ns_per_op": 186930,
+      "sequential_write_4m_fsync_ns": 3318500,
+      "sequential_bytes": 4194304,
+      "warm_fixture_files": 66,
+      "base_sha256_before": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_primary_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_verify_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_unchanged": true,
+      "base_allocation_before": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_primary_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_verify_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_physical_growth_bytes": 0,
+      "copy_image_before": null,
+      "copy_image_after_primary_detach": null,
+      "copy_image_after_verify_detach": null,
+      "shadow_after_attach_before_data": {
+        "image_file_size_bytes": 45056,
+        "allocated_bytes": 45056
+      },
+      "shadow_after_primary_detach": {
+        "image_file_size_bytes": 5287936,
+        "allocated_bytes": 5287936
+      },
+      "shadow_after_verify_detach": {
+        "image_file_size_bytes": 5287936,
+        "allocated_bytes": 5287936
+      },
+      "working_object_physical_growth_bytes": 5242880,
+      "host_apfs_available_before_bytes": 106114478080,
+      "host_apfs_available_after_primary_detach_bytes": 106109059072,
+      "host_apfs_available_decrease_bytes": 5419008,
+      "persisted_data_verification": {
+        "edit_contents_match": true,
+        "edit_bytes": 4096,
+        "sequential_length_matches": true,
+        "sequential_bytes": 4194304,
+        "sequential_sha256": "2b07811057df887086f06a67edc6ebf911de8b6741156e7a2eb1416a4b8b1b2e",
+        "sequential_hash_matches": true,
+        "small_files_all_unlinked": true
+      }
+    },
+    {
+      "iteration": 2,
+      "interleave_order_index": 0,
+      "variant": "sparse",
+      "container_label": "SPARSE",
+      "imageinfo_format_code": "SPRS",
+      "virtual_capacity_bytes": 167772160,
+      "base_image": "base-sparse.sparseimage",
+      "attach_ns": 224046500,
+      "detach_ns": 94255458,
+      "verify_remount_attach_ns": 214122375,
+      "verify_remount_detach_ns": 179518125,
+      "edit_save_4k_fsync_rename_ns": 786459,
+      "small_create_unlink_64_total_ns": 9475583,
+      "small_create_unlink_ns_per_op": 148055,
+      "sequential_write_4m_fsync_ns": 3147667,
+      "sequential_bytes": 4194304,
+      "warm_fixture_files": 66,
+      "base_sha256_before": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_primary_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_verify_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_unchanged": true,
+      "base_allocation_before": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_primary_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_verify_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_physical_growth_bytes": 0,
+      "copy_image_before": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "copy_image_after_primary_detach": {
+        "image_file_size_bytes": 12587008,
+        "allocated_bytes": 12587008
+      },
+      "copy_image_after_verify_detach": {
+        "image_file_size_bytes": 12587008,
+        "allocated_bytes": 12587008
+      },
+      "shadow_after_attach_before_data": null,
+      "shadow_after_primary_detach": null,
+      "shadow_after_verify_detach": null,
+      "working_object_physical_growth_bytes": 4194304,
+      "host_apfs_available_before_bytes": 106114347008,
+      "host_apfs_available_after_primary_detach_bytes": 106109325312,
+      "host_apfs_available_decrease_bytes": 5021696,
+      "persisted_data_verification": {
+        "edit_contents_match": true,
+        "edit_bytes": 4096,
+        "sequential_length_matches": true,
+        "sequential_bytes": 4194304,
+        "sequential_sha256": "2b07811057df887086f06a67edc6ebf911de8b6741156e7a2eb1416a4b8b1b2e",
+        "sequential_hash_matches": true,
+        "small_files_all_unlinked": true
+      }
+    },
+    {
+      "iteration": 2,
+      "interleave_order_index": 1,
+      "variant": "sparse_shadow",
+      "container_label": "SPARSE+shadow",
+      "imageinfo_format_code": "SPRS",
+      "virtual_capacity_bytes": 167772160,
+      "base_image": "base-sparse.sparseimage",
+      "attach_ns": 243302208,
+      "detach_ns": 176710417,
+      "verify_remount_attach_ns": 217035792,
+      "verify_remount_detach_ns": 168539333,
+      "edit_save_4k_fsync_rename_ns": 790375,
+      "small_create_unlink_64_total_ns": 10820334,
+      "small_create_unlink_ns_per_op": 169067,
+      "sequential_write_4m_fsync_ns": 3040583,
+      "sequential_bytes": 4194304,
+      "warm_fixture_files": 66,
+      "base_sha256_before": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_primary_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_verify_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_unchanged": true,
+      "base_allocation_before": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_primary_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_verify_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_physical_growth_bytes": 0,
+      "copy_image_before": null,
+      "copy_image_after_primary_detach": null,
+      "copy_image_after_verify_detach": null,
+      "shadow_after_attach_before_data": {
+        "image_file_size_bytes": 45056,
+        "allocated_bytes": 45056
+      },
+      "shadow_after_primary_detach": {
+        "image_file_size_bytes": 5287936,
+        "allocated_bytes": 5287936
+      },
+      "shadow_after_verify_detach": {
+        "image_file_size_bytes": 5287936,
+        "allocated_bytes": 5287936
+      },
+      "working_object_physical_growth_bytes": 5242880,
+      "host_apfs_available_before_bytes": 106114342912,
+      "host_apfs_available_after_primary_detach_bytes": 106109050880,
+      "host_apfs_available_decrease_bytes": 5292032,
+      "persisted_data_verification": {
+        "edit_contents_match": true,
+        "edit_bytes": 4096,
+        "sequential_length_matches": true,
+        "sequential_bytes": 4194304,
+        "sequential_sha256": "2b07811057df887086f06a67edc6ebf911de8b6741156e7a2eb1416a4b8b1b2e",
+        "sequential_hash_matches": true,
+        "small_files_all_unlinked": true
+      }
+    },
+    {
+      "iteration": 2,
+      "interleave_order_index": 2,
+      "variant": "udif_udrw",
+      "container_label": "UDIF/UDRW",
+      "imageinfo_format_code": "UDRW",
+      "virtual_capacity_bytes": 167772160,
+      "base_image": "base-udif.dmg",
+      "attach_ns": 214900500,
+      "detach_ns": 152446583,
+      "verify_remount_attach_ns": 235901125,
+      "verify_remount_detach_ns": 147875417,
+      "edit_save_4k_fsync_rename_ns": 671375,
+      "small_create_unlink_64_total_ns": 8196416,
+      "small_create_unlink_ns_per_op": 128069,
+      "sequential_write_4m_fsync_ns": 2155125,
+      "sequential_bytes": 4194304,
+      "warm_fixture_files": 66,
+      "base_sha256_before": "b13701502bbd6e3917ec589863398ea4181154f638a3ffd47ee9bed813385d54",
+      "base_sha256_after_primary_detach": "b13701502bbd6e3917ec589863398ea4181154f638a3ffd47ee9bed813385d54",
+      "base_sha256_after_verify_detach": "b13701502bbd6e3917ec589863398ea4181154f638a3ffd47ee9bed813385d54",
+      "base_unchanged": true,
+      "base_allocation_before": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "base_allocation_after_primary_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "base_allocation_after_verify_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "base_physical_growth_bytes": 0,
+      "copy_image_before": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "copy_image_after_primary_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "copy_image_after_verify_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "shadow_after_attach_before_data": null,
+      "shadow_after_primary_detach": null,
+      "shadow_after_verify_detach": null,
+      "working_object_physical_growth_bytes": 0,
+      "host_apfs_available_before_bytes": 106114314240,
+      "host_apfs_available_after_primary_detach_bytes": 106109534208,
+      "host_apfs_available_decrease_bytes": 4780032,
+      "persisted_data_verification": {
+        "edit_contents_match": true,
+        "edit_bytes": 4096,
+        "sequential_length_matches": true,
+        "sequential_bytes": 4194304,
+        "sequential_sha256": "2b07811057df887086f06a67edc6ebf911de8b6741156e7a2eb1416a4b8b1b2e",
+        "sequential_hash_matches": true,
+        "small_files_all_unlinked": true
+      }
+    },
+    {
+      "iteration": 3,
+      "interleave_order_index": 0,
+      "variant": "sparse_shadow",
+      "container_label": "SPARSE+shadow",
+      "imageinfo_format_code": "SPRS",
+      "virtual_capacity_bytes": 167772160,
+      "base_image": "base-sparse.sparseimage",
+      "attach_ns": 277862625,
+      "detach_ns": 132237083,
+      "verify_remount_attach_ns": 218915250,
+      "verify_remount_detach_ns": 182222542,
+      "edit_save_4k_fsync_rename_ns": 873250,
+      "small_create_unlink_64_total_ns": 11707542,
+      "small_create_unlink_ns_per_op": 182930,
+      "sequential_write_4m_fsync_ns": 3522208,
+      "sequential_bytes": 4194304,
+      "warm_fixture_files": 66,
+      "base_sha256_before": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_primary_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_verify_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_unchanged": true,
+      "base_allocation_before": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_primary_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_verify_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_physical_growth_bytes": 0,
+      "copy_image_before": null,
+      "copy_image_after_primary_detach": null,
+      "copy_image_after_verify_detach": null,
+      "shadow_after_attach_before_data": {
+        "image_file_size_bytes": 45056,
+        "allocated_bytes": 45056
+      },
+      "shadow_after_primary_detach": {
+        "image_file_size_bytes": 5287936,
+        "allocated_bytes": 5287936
+      },
+      "shadow_after_verify_detach": {
+        "image_file_size_bytes": 5287936,
+        "allocated_bytes": 5287936
+      },
+      "working_object_physical_growth_bytes": 5242880,
+      "host_apfs_available_before_bytes": 106114207744,
+      "host_apfs_available_after_primary_detach_bytes": 106108919808,
+      "host_apfs_available_decrease_bytes": 5287936,
+      "persisted_data_verification": {
+        "edit_contents_match": true,
+        "edit_bytes": 4096,
+        "sequential_length_matches": true,
+        "sequential_bytes": 4194304,
+        "sequential_sha256": "2b07811057df887086f06a67edc6ebf911de8b6741156e7a2eb1416a4b8b1b2e",
+        "sequential_hash_matches": true,
+        "small_files_all_unlinked": true
+      }
+    },
+    {
+      "iteration": 3,
+      "interleave_order_index": 1,
+      "variant": "udif_udrw",
+      "container_label": "UDIF/UDRW",
+      "imageinfo_format_code": "UDRW",
+      "virtual_capacity_bytes": 167772160,
+      "base_image": "base-udif.dmg",
+      "attach_ns": 246207625,
+      "detach_ns": 167729333,
+      "verify_remount_attach_ns": 224966833,
+      "verify_remount_detach_ns": 147854333,
+      "edit_save_4k_fsync_rename_ns": 938542,
+      "small_create_unlink_64_total_ns": 11426041,
+      "small_create_unlink_ns_per_op": 178531,
+      "sequential_write_4m_fsync_ns": 2409000,
+      "sequential_bytes": 4194304,
+      "warm_fixture_files": 66,
+      "base_sha256_before": "b13701502bbd6e3917ec589863398ea4181154f638a3ffd47ee9bed813385d54",
+      "base_sha256_after_primary_detach": "b13701502bbd6e3917ec589863398ea4181154f638a3ffd47ee9bed813385d54",
+      "base_sha256_after_verify_detach": "b13701502bbd6e3917ec589863398ea4181154f638a3ffd47ee9bed813385d54",
+      "base_unchanged": true,
+      "base_allocation_before": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "base_allocation_after_primary_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "base_allocation_after_verify_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "base_physical_growth_bytes": 0,
+      "copy_image_before": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "copy_image_after_primary_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "copy_image_after_verify_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "shadow_after_attach_before_data": null,
+      "shadow_after_primary_detach": null,
+      "shadow_after_verify_detach": null,
+      "working_object_physical_growth_bytes": 0,
+      "host_apfs_available_before_bytes": 106114105344,
+      "host_apfs_available_after_primary_detach_bytes": 106109521920,
+      "host_apfs_available_decrease_bytes": 4583424,
+      "persisted_data_verification": {
+        "edit_contents_match": true,
+        "edit_bytes": 4096,
+        "sequential_length_matches": true,
+        "sequential_bytes": 4194304,
+        "sequential_sha256": "2b07811057df887086f06a67edc6ebf911de8b6741156e7a2eb1416a4b8b1b2e",
+        "sequential_hash_matches": true,
+        "small_files_all_unlinked": true
+      }
+    },
+    {
+      "iteration": 3,
+      "interleave_order_index": 2,
+      "variant": "sparse",
+      "container_label": "SPARSE",
+      "imageinfo_format_code": "SPRS",
+      "virtual_capacity_bytes": 167772160,
+      "base_image": "base-sparse.sparseimage",
+      "attach_ns": 219564625,
+      "detach_ns": 189289667,
+      "verify_remount_attach_ns": 229876958,
+      "verify_remount_detach_ns": 173075250,
+      "edit_save_4k_fsync_rename_ns": 761750,
+      "small_create_unlink_64_total_ns": 8631750,
+      "small_create_unlink_ns_per_op": 134871,
+      "sequential_write_4m_fsync_ns": 2850250,
+      "sequential_bytes": 4194304,
+      "warm_fixture_files": 66,
+      "base_sha256_before": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_primary_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_verify_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_unchanged": true,
+      "base_allocation_before": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_primary_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_verify_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_physical_growth_bytes": 0,
+      "copy_image_before": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "copy_image_after_primary_detach": {
+        "image_file_size_bytes": 12587008,
+        "allocated_bytes": 12587008
+      },
+      "copy_image_after_verify_detach": {
+        "image_file_size_bytes": 12587008,
+        "allocated_bytes": 12587008
+      },
+      "shadow_after_attach_before_data": null,
+      "shadow_after_primary_detach": null,
+      "shadow_after_verify_detach": null,
+      "working_object_physical_growth_bytes": 4194304,
+      "host_apfs_available_before_bytes": 106113150976,
+      "host_apfs_available_after_primary_detach_bytes": 106108137472,
+      "host_apfs_available_decrease_bytes": 5013504,
+      "persisted_data_verification": {
+        "edit_contents_match": true,
+        "edit_bytes": 4096,
+        "sequential_length_matches": true,
+        "sequential_bytes": 4194304,
+        "sequential_sha256": "2b07811057df887086f06a67edc6ebf911de8b6741156e7a2eb1416a4b8b1b2e",
+        "sequential_hash_matches": true,
+        "small_files_all_unlinked": true
+      }
+    },
+    {
+      "iteration": 4,
+      "interleave_order_index": 0,
+      "variant": "udif_udrw",
+      "container_label": "UDIF/UDRW",
+      "imageinfo_format_code": "UDRW",
+      "virtual_capacity_bytes": 167772160,
+      "base_image": "base-udif.dmg",
+      "attach_ns": 206016292,
+      "detach_ns": 156315959,
+      "verify_remount_attach_ns": 219548000,
+      "verify_remount_detach_ns": 164020000,
+      "edit_save_4k_fsync_rename_ns": 697208,
+      "small_create_unlink_64_total_ns": 8278417,
+      "small_create_unlink_ns_per_op": 129350,
+      "sequential_write_4m_fsync_ns": 2308291,
+      "sequential_bytes": 4194304,
+      "warm_fixture_files": 66,
+      "base_sha256_before": "b13701502bbd6e3917ec589863398ea4181154f638a3ffd47ee9bed813385d54",
+      "base_sha256_after_primary_detach": "b13701502bbd6e3917ec589863398ea4181154f638a3ffd47ee9bed813385d54",
+      "base_sha256_after_verify_detach": "b13701502bbd6e3917ec589863398ea4181154f638a3ffd47ee9bed813385d54",
+      "base_unchanged": true,
+      "base_allocation_before": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "base_allocation_after_primary_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "base_allocation_after_verify_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "base_physical_growth_bytes": 0,
+      "copy_image_before": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "copy_image_after_primary_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "copy_image_after_verify_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "shadow_after_attach_before_data": null,
+      "shadow_after_primary_detach": null,
+      "shadow_after_verify_detach": null,
+      "working_object_physical_growth_bytes": 0,
+      "host_apfs_available_before_bytes": 106113130496,
+      "host_apfs_available_after_primary_detach_bytes": 106108350464,
+      "host_apfs_available_decrease_bytes": 4780032,
+      "persisted_data_verification": {
+        "edit_contents_match": true,
+        "edit_bytes": 4096,
+        "sequential_length_matches": true,
+        "sequential_bytes": 4194304,
+        "sequential_sha256": "2b07811057df887086f06a67edc6ebf911de8b6741156e7a2eb1416a4b8b1b2e",
+        "sequential_hash_matches": true,
+        "small_files_all_unlinked": true
+      }
+    },
+    {
+      "iteration": 4,
+      "interleave_order_index": 1,
+      "variant": "sparse",
+      "container_label": "SPARSE",
+      "imageinfo_format_code": "SPRS",
+      "virtual_capacity_bytes": 167772160,
+      "base_image": "base-sparse.sparseimage",
+      "attach_ns": 237103084,
+      "detach_ns": 121463625,
+      "verify_remount_attach_ns": 224481500,
+      "verify_remount_detach_ns": 153296875,
+      "edit_save_4k_fsync_rename_ns": 822625,
+      "small_create_unlink_64_total_ns": 10278000,
+      "small_create_unlink_ns_per_op": 160593,
+      "sequential_write_4m_fsync_ns": 3097083,
+      "sequential_bytes": 4194304,
+      "warm_fixture_files": 66,
+      "base_sha256_before": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_primary_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_verify_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_unchanged": true,
+      "base_allocation_before": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_primary_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_verify_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_physical_growth_bytes": 0,
+      "copy_image_before": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "copy_image_after_primary_detach": {
+        "image_file_size_bytes": 12587008,
+        "allocated_bytes": 12587008
+      },
+      "copy_image_after_verify_detach": {
+        "image_file_size_bytes": 12587008,
+        "allocated_bytes": 12587008
+      },
+      "shadow_after_attach_before_data": null,
+      "shadow_after_primary_detach": null,
+      "shadow_after_verify_detach": null,
+      "working_object_physical_growth_bytes": 4194304,
+      "host_apfs_available_before_bytes": 106113024000,
+      "host_apfs_available_after_primary_detach_bytes": 106107990016,
+      "host_apfs_available_decrease_bytes": 5033984,
+      "persisted_data_verification": {
+        "edit_contents_match": true,
+        "edit_bytes": 4096,
+        "sequential_length_matches": true,
+        "sequential_bytes": 4194304,
+        "sequential_sha256": "2b07811057df887086f06a67edc6ebf911de8b6741156e7a2eb1416a4b8b1b2e",
+        "sequential_hash_matches": true,
+        "small_files_all_unlinked": true
+      }
+    },
+    {
+      "iteration": 4,
+      "interleave_order_index": 2,
+      "variant": "sparse_shadow",
+      "container_label": "SPARSE+shadow",
+      "imageinfo_format_code": "SPRS",
+      "virtual_capacity_bytes": 167772160,
+      "base_image": "base-sparse.sparseimage",
+      "attach_ns": 223208500,
+      "detach_ns": 203321750,
+      "verify_remount_attach_ns": 229679084,
+      "verify_remount_detach_ns": 106697625,
+      "edit_save_4k_fsync_rename_ns": 909125,
+      "small_create_unlink_64_total_ns": 9849792,
+      "small_create_unlink_ns_per_op": 153903,
+      "sequential_write_4m_fsync_ns": 2780750,
+      "sequential_bytes": 4194304,
+      "warm_fixture_files": 66,
+      "base_sha256_before": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_primary_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_verify_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_unchanged": true,
+      "base_allocation_before": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_primary_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_verify_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_physical_growth_bytes": 0,
+      "copy_image_before": null,
+      "copy_image_after_primary_detach": null,
+      "copy_image_after_verify_detach": null,
+      "shadow_after_attach_before_data": {
+        "image_file_size_bytes": 45056,
+        "allocated_bytes": 45056
+      },
+      "shadow_after_primary_detach": {
+        "image_file_size_bytes": 5287936,
+        "allocated_bytes": 5287936
+      },
+      "shadow_after_verify_detach": {
+        "image_file_size_bytes": 5287936,
+        "allocated_bytes": 5287936
+      },
+      "working_object_physical_growth_bytes": 5242880,
+      "host_apfs_available_before_bytes": 106113024000,
+      "host_apfs_available_after_primary_detach_bytes": 106107736064,
+      "host_apfs_available_decrease_bytes": 5287936,
+      "persisted_data_verification": {
+        "edit_contents_match": true,
+        "edit_bytes": 4096,
+        "sequential_length_matches": true,
+        "sequential_bytes": 4194304,
+        "sequential_sha256": "2b07811057df887086f06a67edc6ebf911de8b6741156e7a2eb1416a4b8b1b2e",
+        "sequential_hash_matches": true,
+        "small_files_all_unlinked": true
+      }
+    },
+    {
+      "iteration": 5,
+      "interleave_order_index": 0,
+      "variant": "sparse",
+      "container_label": "SPARSE",
+      "imageinfo_format_code": "SPRS",
+      "virtual_capacity_bytes": 167772160,
+      "base_image": "base-sparse.sparseimage",
+      "attach_ns": 225898750,
+      "detach_ns": 119688000,
+      "verify_remount_attach_ns": 218891000,
+      "verify_remount_detach_ns": 150506834,
+      "edit_save_4k_fsync_rename_ns": 759333,
+      "small_create_unlink_64_total_ns": 8988250,
+      "small_create_unlink_ns_per_op": 140441,
+      "sequential_write_4m_fsync_ns": 2683875,
+      "sequential_bytes": 4194304,
+      "warm_fixture_files": 66,
+      "base_sha256_before": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_primary_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_verify_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_unchanged": true,
+      "base_allocation_before": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_primary_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_verify_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_physical_growth_bytes": 0,
+      "copy_image_before": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "copy_image_after_primary_detach": {
+        "image_file_size_bytes": 12587008,
+        "allocated_bytes": 12587008
+      },
+      "copy_image_after_verify_detach": {
+        "image_file_size_bytes": 12587008,
+        "allocated_bytes": 12587008
+      },
+      "shadow_after_attach_before_data": null,
+      "shadow_after_primary_detach": null,
+      "shadow_after_verify_detach": null,
+      "working_object_physical_growth_bytes": 4194304,
+      "host_apfs_available_before_bytes": 106113019904,
+      "host_apfs_available_after_primary_detach_bytes": 106107957248,
+      "host_apfs_available_decrease_bytes": 5062656,
+      "persisted_data_verification": {
+        "edit_contents_match": true,
+        "edit_bytes": 4096,
+        "sequential_length_matches": true,
+        "sequential_bytes": 4194304,
+        "sequential_sha256": "2b07811057df887086f06a67edc6ebf911de8b6741156e7a2eb1416a4b8b1b2e",
+        "sequential_hash_matches": true,
+        "small_files_all_unlinked": true
+      }
+    },
+    {
+      "iteration": 5,
+      "interleave_order_index": 1,
+      "variant": "sparse_shadow",
+      "container_label": "SPARSE+shadow",
+      "imageinfo_format_code": "SPRS",
+      "virtual_capacity_bytes": 167772160,
+      "base_image": "base-sparse.sparseimage",
+      "attach_ns": 246737000,
+      "detach_ns": 211945042,
+      "verify_remount_attach_ns": 219783750,
+      "verify_remount_detach_ns": 163608208,
+      "edit_save_4k_fsync_rename_ns": 908000,
+      "small_create_unlink_64_total_ns": 10829959,
+      "small_create_unlink_ns_per_op": 169218,
+      "sequential_write_4m_fsync_ns": 3278208,
+      "sequential_bytes": 4194304,
+      "warm_fixture_files": 66,
+      "base_sha256_before": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_primary_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_sha256_after_verify_detach": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "base_unchanged": true,
+      "base_allocation_before": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_primary_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_allocation_after_verify_detach": {
+        "image_file_size_bytes": 8392704,
+        "allocated_bytes": 8392704
+      },
+      "base_physical_growth_bytes": 0,
+      "copy_image_before": null,
+      "copy_image_after_primary_detach": null,
+      "copy_image_after_verify_detach": null,
+      "shadow_after_attach_before_data": {
+        "image_file_size_bytes": 45056,
+        "allocated_bytes": 45056
+      },
+      "shadow_after_primary_detach": {
+        "image_file_size_bytes": 5287936,
+        "allocated_bytes": 5287936
+      },
+      "shadow_after_verify_detach": {
+        "image_file_size_bytes": 5287936,
+        "allocated_bytes": 5287936
+      },
+      "working_object_physical_growth_bytes": 5242880,
+      "host_apfs_available_before_bytes": 106112892928,
+      "host_apfs_available_after_primary_detach_bytes": 106107604992,
+      "host_apfs_available_decrease_bytes": 5287936,
+      "persisted_data_verification": {
+        "edit_contents_match": true,
+        "edit_bytes": 4096,
+        "sequential_length_matches": true,
+        "sequential_bytes": 4194304,
+        "sequential_sha256": "2b07811057df887086f06a67edc6ebf911de8b6741156e7a2eb1416a4b8b1b2e",
+        "sequential_hash_matches": true,
+        "small_files_all_unlinked": true
+      }
+    },
+    {
+      "iteration": 5,
+      "interleave_order_index": 2,
+      "variant": "udif_udrw",
+      "container_label": "UDIF/UDRW",
+      "imageinfo_format_code": "UDRW",
+      "virtual_capacity_bytes": 167772160,
+      "base_image": "base-udif.dmg",
+      "attach_ns": 221214916,
+      "detach_ns": 210490625,
+      "verify_remount_attach_ns": 199094542,
+      "verify_remount_detach_ns": 145308209,
+      "edit_save_4k_fsync_rename_ns": 822083,
+      "small_create_unlink_64_total_ns": 9007458,
+      "small_create_unlink_ns_per_op": 140741,
+      "sequential_write_4m_fsync_ns": 2335584,
+      "sequential_bytes": 4194304,
+      "warm_fixture_files": 66,
+      "base_sha256_before": "b13701502bbd6e3917ec589863398ea4181154f638a3ffd47ee9bed813385d54",
+      "base_sha256_after_primary_detach": "b13701502bbd6e3917ec589863398ea4181154f638a3ffd47ee9bed813385d54",
+      "base_sha256_after_verify_detach": "b13701502bbd6e3917ec589863398ea4181154f638a3ffd47ee9bed813385d54",
+      "base_unchanged": true,
+      "base_allocation_before": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "base_allocation_after_primary_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "base_allocation_after_verify_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "base_physical_growth_bytes": 0,
+      "copy_image_before": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "copy_image_after_primary_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "copy_image_after_verify_detach": {
+        "image_file_size_bytes": 167772160,
+        "allocated_bytes": 167772160
+      },
+      "shadow_after_attach_before_data": null,
+      "shadow_after_primary_detach": null,
+      "shadow_after_verify_detach": null,
+      "working_object_physical_growth_bytes": 0,
+      "host_apfs_available_before_bytes": 106112851968,
+      "host_apfs_available_after_primary_detach_bytes": 106108149760,
+      "host_apfs_available_decrease_bytes": 4702208,
+      "persisted_data_verification": {
+        "edit_contents_match": true,
+        "edit_bytes": 4096,
+        "sequential_length_matches": true,
+        "sequential_bytes": 4194304,
+        "sequential_sha256": "2b07811057df887086f06a67edc6ebf911de8b6741156e7a2eb1416a4b8b1b2e",
+        "sequential_hash_matches": true,
+        "small_files_all_unlinked": true
+      }
+    }
+  ],
+  "errors": [],
+  "cleanup": {
+    "temporary_directory_preserved": false,
+    "mounted_image": false
+  },
+  "p95_reported": false,
+  "temporary_directory": null,
+  "base_images": {
+    "udif_udrw": {
+      "path": "base-udif.dmg",
+      "requested_container": "UDIF",
+      "actual_hdiutil_imageinfo_format_code": "UDRW",
+      "virtual_capacity_bytes": 167772160,
+      "image_file_size_bytes": 167772160,
+      "initial_allocated_bytes": 167772160,
+      "sha256": "b13701502bbd6e3917ec589863398ea4181154f638a3ffd47ee9bed813385d54",
+      "fixture_manifest_sha256": "f2c78ce9628e7a2a2b75b1f47059d602dcb73489c89e498c7a0e59361b4a0ee3"
+    },
+    "sparse": {
+      "path": "base-sparse.sparseimage",
+      "requested_container": "SPARSE",
+      "actual_hdiutil_imageinfo_format_code": "SPRS",
+      "virtual_capacity_bytes": 167772160,
+      "image_file_size_bytes": 8392704,
+      "initial_allocated_bytes": 8392704,
+      "sha256": "5147f4b4c91d6458a0fbff332bcf7575bc6fca0055c90507e0c0e8b919a78e7f",
+      "fixture_manifest_sha256": "f2c78ce9628e7a2a2b75b1f47059d602dcb73489c89e498c7a0e59361b4a0ee3"
+    }
+  },
+  "summary": {
+    "udif_udrw": {
+      "samples": 5,
+      "median_attach_ns": 214900500,
+      "median_detach_ns": 156315959,
+      "median_edit_save_ns": 747083,
+      "median_small_create_unlink_ns_per_op": 132000,
+      "median_sequential_write_fsync_ns": 2335584,
+      "median_working_object_physical_growth_bytes": 0,
+      "median_host_apfs_available_decrease_bytes": 4702208
+    },
+    "sparse": {
+      "samples": 5,
+      "median_attach_ns": 225898750,
+      "median_detach_ns": 121463625,
+      "median_edit_save_ns": 761750,
+      "median_small_create_unlink_ns_per_op": 140441,
+      "median_sequential_write_fsync_ns": 2850250,
+      "median_working_object_physical_growth_bytes": 4194304,
+      "median_host_apfs_available_decrease_bytes": 5021696
+    },
+    "sparse_shadow": {
+      "samples": 5,
+      "median_attach_ns": 243302208,
+      "median_detach_ns": 178460666,
+      "median_edit_save_ns": 896167,
+      "median_small_create_unlink_ns_per_op": 169218,
+      "median_sequential_write_fsync_ns": 3278208,
+      "median_working_object_physical_growth_bytes": 5242880,
+      "median_host_apfs_available_decrease_bytes": 5287936
+    }
+  },
+  "complete": true
+}
