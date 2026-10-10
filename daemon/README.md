@@ -56,3 +56,22 @@ remain readable and can be migrated back to a CoW tree on LevelDB.
 
 This is the version-view library layer. The mounted filesystem, inode operations,
 Container coordination and RPC frontend are not part of this integration.
+
+## Container and file-operation library
+
+`forkfs_namespace` adds the repository owner and namespace/file-operation API
+above `forkfs_metadata`. `Container::create()` creates a LevelDB repository;
+`Namespace::initialize()` creates its root inode. Namespace operations publish
+content, inode and CoW head updates in the same synchronous transaction.
+Snapshots retain immutable roots, and forks publish independent World heads.
+
+The API supports directories, hardlinks, symlinks, attributes, offset I/O,
+append/truncate, and open handles that retain unlinked files until final close.
+Container coordination serializes logical operations and protects handle state;
+the narrower storage locks do not yet establish parallel namespace requests.
+File content is currently bounded to 256 KiB per object/file. This library does
+not expose a mounted filesystem or install an operating-system frontend.
+
+Standalone Release validation includes file I/O, handle lifetime and transaction
+concurrency suites alongside the storage/tree/view suites. The CLI/RPC and their
+process-crash tests are the next integration layer.
