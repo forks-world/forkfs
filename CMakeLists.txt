@@ -55,10 +55,14 @@ if(APPLE AND WFS_COW_FSKIT)
     target_link_libraries(ForkRevisionExtension PRIVATE forkfs_revision_fskit "-framework ExtensionFoundation")
     target_link_options(ForkRevisionExtension PRIVATE "-Wl,-e,_NSExtensionMain")
     set(revision_appex "${CMAKE_BINARY_DIR}/ForkRevisionExtension.appex/Contents")
-    add_custom_command(TARGET ForkRevisionExtension POST_BUILD
+    add_custom_command(OUTPUT "${revision_appex}/MacOS/ForkRevisionExtension" "${revision_appex}/Info.plist"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${revision_appex}/MacOS"
         COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:ForkRevisionExtension>" "${revision_appex}/MacOS/ForkRevisionExtension"
-        COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/macos/cow-fskit/Info.plist" "${revision_appex}/Info.plist")
+        COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/macos/cow-fskit/Info.plist" "${revision_appex}/Info.plist"
+        DEPENDS ForkRevisionExtension "${CMAKE_SOURCE_DIR}/macos/cow-fskit/Info.plist"
+        VERBATIM)
+    add_custom_target(forkfs_revision_extension_bundle
+        DEPENDS "${revision_appex}/MacOS/ForkRevisionExtension" "${revision_appex}/Info.plist")
     add_executable(ForkfsRevision MACOSX_BUNDLE macos/cow-fskit/HostApp.mm macos/cow-fskit/RevisionFileSystem.mm)
     set_target_properties(ForkfsRevision PROPERTIES MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/macos/cow-fskit/Host-Info.plist")
     target_compile_options(ForkfsRevision PRIVATE -fobjc-arc -Wno-error=deprecated-declarations)
@@ -66,7 +70,8 @@ if(APPLE AND WFS_COW_FSKIT)
     add_custom_target(forkfs_revision_bundle ALL
         COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_DIR:ForkfsRevision>/Contents/PlugIns"
         COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_BINARY_DIR}/ForkRevisionExtension.appex" "$<TARGET_BUNDLE_DIR:ForkfsRevision>/Contents/PlugIns/ForkRevisionExtension.appex"
-        DEPENDS ForkfsRevision ForkRevisionExtension)
+        DEPENDS ForkfsRevision forkfs_revision_extension_bundle
+        VERBATIM)
     add_test(NAME forkfsd_fskit_bundle COMMAND ${Python3_EXECUTABLE}
         "${CMAKE_SOURCE_DIR}/macos/cow-fskit/check_bundle.py"
         "$<TARGET_BUNDLE_DIR:ForkfsRevision>" "${CMAKE_SOURCE_DIR}/macos/cow-fskit")
