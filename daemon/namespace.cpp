@@ -296,8 +296,10 @@ InodeInfo Namespace::lookup_child(const std::string& parent_id,const std::string
     need(valid_id(parent_id),"invalid inode identity");
     auto parts=components("/"+name);need(parts.size()==1,"lookup requires one component");
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);
-    need(inode(view,parent_id).directory,"lookup parent is not a directory");
-    return inode(view,decode_id(view.get(entry_key(parent_id,name))));
+    if(!inode(view,parent_id).directory)throw std::system_error(ENOTDIR,std::generic_category(),"lookup parent");
+    auto key=entry_key(parent_id,name);
+    if(!view.contains(key))throw std::system_error(ENOENT,std::generic_category(),"lookup child");
+    return inode(view,decode_id(view.get(key)));
 }
 std::vector<unsigned char> Namespace::read_inode(const std::string& id,uint64_t offset,uint64_t count) const {
     need(valid_id(id) && offset<=INT64_MAX,"invalid inode or file offset");
