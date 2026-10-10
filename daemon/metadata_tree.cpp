@@ -43,14 +43,14 @@ Id MetadataTree::set(Id root,const std::string& key,const std::optional<Id>& val
     need(depth<256,"metadata tree depth limit");
     if(root==Id{})return value?make({key,*value,{},{}}):Id{};
     auto n=node(root);
-    if(key==n.key){if(!value)return merge(n.left,n.right,depth+1);n.value=*value;return make(n);}
+    if(key==n.key){if(!value)return merge(n.left,n.right,depth+1);if(n.value==*value)return root;n.value=*value;return make(n);}
     if(key<n.key) {
-        n.left=set(n.left,key,value,depth+1);
+        auto next=set(n.left,key,value,depth+1);if(next==n.left)return root;n.left=next;
         if(n.left!=Id{} && higher(node(n.left),n)) {
             auto top=node(n.left);n.left=top.right;top.right=make(n);return make(top);
         }
     } else {
-        n.right=set(n.right,key,value,depth+1);
+        auto next=set(n.right,key,value,depth+1);if(next==n.right)return root;n.right=next;
         if(n.right!=Id{} && higher(node(n.right),n)) {
             auto top=node(n.right);n.right=top.left;top.left=make(n);return make(top);
         }

@@ -3,9 +3,10 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <source_location>
 #include <unistd.h>
 using namespace forkfs;
-void check(bool ok) {if(!ok)throw std::runtime_error("metadata tree check failed");}
+void check(bool ok,std::source_location where=std::source_location::current()) {if(!ok)throw std::runtime_error("metadata tree check failed at line "+std::to_string(where.line()));}
 MetadataTree::Id tree_root(const MetadataTree::Plan& plan) {
     MetadataTree::Id root{};check(plan.manifest.size()==40);
     memcpy(root.data(),plan.manifest.data()+8,32);return root;
@@ -29,6 +30,10 @@ int main() {
             for(int i=0;i<100;++i){changes[key("test/"+std::to_string(i))]=id;expected[key("test/"+std::to_string(i))]=id;}
             MetadataTree initial(journal);auto plan=initial.apply(changes);publish(journal,"snapshot",plan);old_root=tree_root(plan);
             MetadataTree tree(journal,old_root);check(tree.entries()==expected);
+            auto unchanged=tree.apply(changes);
+            check(unchanged.objects.empty() && unchanged.manifest==plan.manifest);
+            auto absent=tree.apply({{key("absent"),std::nullopt}});
+            check(absent.objects.empty() && absent.manifest==plan.manifest);
             // Compare bounded, ordered pagination with the full index.
             std::vector<std::string> names;std::string after;
             while(true){auto page=tree.page(key("test/"),after,7);if(page.empty())break;names.insert(names.end(),page.begin(),page.end());after=page.back();}
@@ -45,7 +50,11 @@ int main() {
         }
         {
             Journal journal(path);check(MetadataTree(journal,new_root).entries()==expected);
-            check(MetadataTree(journal,old_root).lookup(key("test/50"))==id);journal.verify();
+            check(MetadataTree(journal,old_root).lookup(key("test/50"))==id);
+            MetadataTree fresh(journal,new_root);
+            auto before=fresh.apply({});
+            auto same=fresh.apply({{key("test/51"),changed_id},{key("test/50"),std::nullopt}});
+            check(same.objects.empty() && same.manifest==before.manifest);journal.verify();
         }
     } catch(const std::exception& e) {std::cerr<<e.what()<<"\n";std::filesystem::remove_all(directory);return 1;}
     std::filesystem::remove_all(directory);return 0;

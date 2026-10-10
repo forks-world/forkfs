@@ -38,3 +38,13 @@ ordered pagination, real insert/update/delete and complete tree checks. Storage
 regressions cover root cache invalidation, concurrent reads, immutable object
 validation and poisoned writes. These are library tests, not mounted filesystem
 or Git/build performance acceptance. No measured latency improvement is claimed.
+
+## Unchanged paths
+
+Setting an existing key to its current object ID or deleting an absent key keeps
+the same node ID. An unchanged child ID propagates the original parent ID back
+up the path, avoiding encoding, hash and pending objects for that path. These
+comparisons use decoded verified nodes and do not skip integrity checks. Actual
+namespace timestamp changes would still be real updates; this does not weaken
+write durability or equate all repeated file writes with no-ops. Tests exercise
+all-value no-op batches and absent deletion on persisted trees, including reopen.
