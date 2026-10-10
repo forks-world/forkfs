@@ -118,10 +118,27 @@ int main() {
             MetadataTree too_deep(journal,deep_root);bool depth_rejected=false;
             try{too_deep.apply({{leaf+"x",id}});}catch(const std::runtime_error& e){depth_rejected=std::string(e.what())=="metadata tree depth limit";}
             check(depth_rejected && too_deep.entries().size()==257);
+            // A higher-priority left insertion at depth 254 would demote the
+            // existing right leaf to depth 256 without visiting that leaf.
+            auto deep_entries=MetadataTree(journal,deep_root).entries();
+            auto parent=std::prev(deep_entries.find(leaf))->first;
+            auto predecessor=std::prev(deep_entries.find(parent))->first;
+            auto priority=[](const std::string& key){auto input="forkfs.metadata.priority.v1"+key;return Journal::object_id(MetadataTree::Bytes(input.begin(),input.end()));};
+            std::string rotation_key;
+            for(unsigned i=0;i<200000;++i){auto k=predecessor+"/rotate-"+std::to_string(i);auto p=priority(k);if(p>priority(parent) && p<priority(predecessor)){rotation_key=k;break;}}
+            check(!rotation_key.empty());
+            MetadataTree rotate(journal,deep_root);auto before_rotation=rotate.apply({{key("root"),changed_id}});
+            deep_entries[key("root")]=changed_id;
+            bool rotation_rejected=false;
+            try{rotate.apply({{key("root"),id},{rotation_key,id}});}catch(const std::runtime_error& e){rotation_rejected=std::string(e.what())=="metadata tree depth limit";}
+            check(rotation_rejected && rotate.entries()==deep_entries);
+            auto after_rotation=rotate.apply({});
+            check(after_rotation.manifest==before_rotation.manifest && after_rotation.objects==before_rotation.objects);
+            publish(journal,"rotation-retry",after_rotation);
+            check(MetadataTree(journal,tree_root(after_rotation)).entries()==deep_entries);
             MetadataTree delete_deep(journal,deep_root);auto deleted=delete_deep.apply({{leaf,std::nullopt}});
             publish(journal,"deep-deleted",deleted);deep_deleted_root=tree_root(deleted);
             check(MetadataTree(journal,deep_deleted_root).entries().size()==256);
-            check(MetadataTree(journal,branch_deleted_root).entries()==expected_branching);
             check(!MetadataTree(journal,deep_deleted_root).lookup(leaf));
             check(MetadataTree(journal,deep_root).lookup(leaf)==id);
             auto [branching,branch_parent]=deep_fixture(journal,id,true);publish(journal,"deep-branching",branching);

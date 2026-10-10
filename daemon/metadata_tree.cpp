@@ -1,5 +1,6 @@
 #include "metadata_tree.h"
 #include <cstring>
+#include <algorithm>
 #include <functional>
 #include <set>
 #include <stdexcept>
@@ -35,6 +36,15 @@ Id MetadataTree::make(const Node& n) {
     memcpy(b.data()+12,n.value.data(),32);memcpy(b.data()+44,n.left.data(),32);memcpy(b.data()+76,n.right.data(),32);
     memcpy(b.data()+108,n.key.data(),n.key.size());auto id=Journal::object_id(b);
     cache_[id]=n;pending_.emplace(id,std::move(b));return id;
+}
+unsigned MetadataTree::height(Id root,unsigned depth) const {
+    if(root==Id{})return 0;
+    need(depth<256,"metadata tree depth limit");
+    auto known=heights_.find(root);
+    if(known!=heights_.end()){need(known->second<=256-depth,"metadata tree depth limit");return known->second;}
+    const auto& n=node(root);
+    auto result=1+std::max(height(n.left,depth+1),height(n.right,depth+1));
+    heights_.emplace(root,result);return result;
 }
 Id MetadataTree::merge(Id left,Id right,unsigned depth) {
     if(left==Id{} && right==Id{})return {};
@@ -119,14 +129,18 @@ MetadataTree::Plan MetadataTree::apply(const Changes& changes) {
         need(key!=namespace_root || value.has_value(),"cannot delete namespace root");
     }
     need(changes.contains(namespace_root) || lookup(namespace_root).has_value(),"metadata tree missing namespace root");
-    for(const auto& [key,value]:changes)root_=set(root_,key,value,0);
-    need(lookup(std::string("\0forkfs/root",12)).has_value(),"metadata tree missing namespace root");
-    Plan result;result.manifest.resize(40);memcpy(result.manifest.data(),"FFTREE01",8);memcpy(result.manifest.data()+8,root_.data(),32);
+    // Validate the complete candidate: rotations can deepen untouched subtrees.
+    // Immutable-node heights are memoized; a cold persisted tree needs one
+    // full walk per editor, while subsequent checks visit only new CoW nodes.
+    auto candidate=root_;
+    for(const auto& [key,value]:changes)candidate=set(candidate,key,value,0);
+    if(candidate!=root_)height(candidate);
+    Plan result;result.manifest.resize(40);memcpy(result.manifest.data(),"FFTREE01",8);memcpy(result.manifest.data()+8,candidate.data(),32);
     std::set<Id> visited;
     std::function<void(Id)> collect=[&](Id id) {
         auto it=pending_.find(id);if(it==pending_.end() || !visited.insert(id).second)return;
         auto n=node(id);collect(n.left);collect(n.right);result.objects.push_back(it->second);
     };
-    collect(root_);return result;
+    collect(candidate);root_=candidate;return result;
 }
 }
