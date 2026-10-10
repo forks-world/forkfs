@@ -15,7 +15,8 @@ class Container {
 public:
     static void create(const std::string& path);
     static void create_legacy(const std::string& path);
-    explicit Container(const std::string& path);
+    enum class OpenMode {ReadWrite,RevisionPreview};
+    explicit Container(const std::string& path,OpenMode mode=OpenMode::ReadWrite);
     ~Container();
     Container(const Container&) = delete;
     Container& operator=(const Container&) = delete;

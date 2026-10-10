@@ -37,7 +37,12 @@ directory. A regular `.forkfs-fskit-revision` file in that directory contains on
 a revision name (1..64 bytes, optional trailing newline); symlinks, nonregular
 files, invalid names and oversized descriptors are rejected. It cannot redirect
 the loader to a different repository. Probe does not open the database. Load
-acquires exclusive repository ownership, so another forkfsd holding its LevelDB
+opens Container in RevisionPreview mode: orphan recovery is skipped and Journal
+put/transact/checkpoint/compaction are rejected. Logical roots and sequence are
+unchanged, including when revision selection fails. Native LevelDB open/recovery
+and background maintenance can still write backing files; the loader therefore
+requires a writable path-resource grant. Physically read-only backing resources
+are unsupported. It acquires exclusive repository ownership, so another forkfsd holding its LevelDB
 lock must be stopped first. Concurrent multi-process ownership is unsupported.
 
 Unload/deactivation/unmount revoke the volume. Revocation drains synchronous

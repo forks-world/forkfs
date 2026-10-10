@@ -47,12 +47,13 @@ NSUUID *ForkRevisionProbeIdentity(NSURL *url,NSString *revision) {
     @synchronized(self){
         if(_volume){reply(nil,fs_errorForPOSIXError(EBUSY));return;}
         if(![resource isKindOfClass:[FSPathURLResource class]]){reply(nil,fs_errorForPOSIXError(EINVAL));return;}
+        if(!((FSPathURLResource *)resource).writable){reply(nil,fs_errorForPOSIXError(EROFS));return;}
         NSURL *url=((FSPathURLResource *)resource).url;
         if(![url startAccessingSecurityScopedResource]){reply(nil,fs_errorForPOSIXError(EPERM));return;}
         _grantedURL=url;
         NSString *revision=ForkRevisionResourceName(url);if(!revision){[self releaseResource];reply(nil,fs_errorForPOSIXError(EINVAL));return;}
         NSError *error=nil;
-        try{auto store=std::make_shared<forkfs::Container>(url.fileSystemRepresentation);_volume=[[ForkRevisionVolume alloc] initWithStore:store revision:revision error:&error];}
+        try{auto store=std::make_shared<forkfs::Container>(url.fileSystemRepresentation,forkfs::Container::OpenMode::RevisionPreview);_volume=[[ForkRevisionVolume alloc] initWithStore:store revision:revision error:&error];}
         catch(const std::exception&){error=fs_errorForPOSIXError(EIO);}
         if(!_volume){[self releaseResource];reply(nil,error?:fs_errorForPOSIXError(EIO));return;}
         self.containerStatus=FSContainerStatus.ready;reply(_volume,nil);

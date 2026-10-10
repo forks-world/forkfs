@@ -151,11 +151,13 @@ void Container::create_legacy(const std::string& path) {
     // that another process might have replaced while initialization was running.
 }
 
-Container::Container(const std::string& path) {
+Container::Container(const std::string& path,OpenMode mode) {
     struct stat backing{};
     if(lstat(path.c_str(),&backing)==0 && S_ISDIR(backing.st_mode)) {
-        journal_=std::make_unique<Journal>(path);id_=journal_->repository();Namespace::recover_orphans(*this);return;
+        journal_=std::make_unique<Journal>(path,mode==OpenMode::RevisionPreview);id_=journal_->repository();
+        if(mode==OpenMode::ReadWrite)Namespace::recover_orphans(*this);return;
     }
+    require(mode==OpenMode::ReadWrite,"revision preview requires LevelDB");
     Fd fd{open(path.c_str(), O_RDWR|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK)};
     if (fd.n < 0) fail("open container");
     struct stat st{};
