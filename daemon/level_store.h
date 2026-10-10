@@ -33,7 +33,8 @@ private:
     LevelStore(const std::string& path,bool initialize,size_t object_cache_bytes);
     bool read(const std::string& key,std::string& value) const;
     void healthy() const;
-    mutable std::mutex mutex_;
+    // Serializes publication, including root validation and durable DB::Write.
+    mutable std::mutex writer_mutex_;
     struct RootFact {bool found;std::string value;};
     mutable std::mutex root_cache_mutex_;
     mutable uint64_t root_cache_sequence_=UINT64_MAX;

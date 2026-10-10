@@ -67,3 +67,35 @@ with a fresh editor and reopen the store, covering preservation of both edits.
 Malformed batches, namespace-root deletion and missing-root initialization are
 rejected before mutation. This is not a general rollback guarantee for corruption,
 depth-limit errors or allocation failures during editing.
+
+## Storage locking
+
+Input validation, reference verification and payload hashing in transact() run
+before the writer mutex. After acquiring it, the writer rechecks health and the
+expected sequence before checking current roots, validating existing immutable
+payloads and publishing one synchronous batch. Stale preparation publishes no
+objects or counters. The caller must keep mutation buffers unchanged throughout
+the synchronous call. Writes and full-sync acknowledgement remain serialized.
+
+verify() pins a LevelDB snapshot and reads its durable counters, index and root
+references with the same ReadOptions. It does not hold the writer mutex during
+its scan and does not compare against potentially newer in-memory counters. All
+snapshot error paths release the pin; health is checked before and after scanning.
+compact() relies on LevelDB's internal synchronization and uses snapshot verify
+afterward instead of holding the writer mutex across manual compaction. LevelDB
+can still stall writers or contend internally during maintenance.
+
+Root cache locking and LevelDB's own cache/DB locks remain. This change does not
+make the legacy single-file Journal or MetadataTree editor thread-safe. Callers
+must join operations before destroying LevelStore; a snapshot is not an exported
+handle that can outlive the store. Future logical GC needs its own retention
+contract. Container/namespace and the serial RPC loop are outside this library PR
+and still require follow-up work for concurrent end-to-end request handling.
+
+The dedicated test executable alone compiles FORKFS_TEST_LOCKS barriers. It pauses
+preparation, snapshot capture and compaction entry and requires another writer to
+finish before release. It also checks stale publication rejection and concurrent
+scan/write consistency, then reopens and verifies. Restoring the broad preparation
+lock makes the barrier test fail with `writer blocked by unrelated
+preparation/maintenance`; the narrowed version passes. This is correctness and
+progress evidence, not a p95 or mounted-filesystem performance measurement.
