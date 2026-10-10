@@ -60,7 +60,8 @@ tests/harness/
 
 统一操作包括 lookup/stat/list、create/mkdir、read/write_at/append/truncate、
 link/symlink/rename/unlink、open/dup/close、fsync、snapshot/fork、restart。
-restore、revision 删除、GC、remote publish 和 mount revoke 是后续能力。
+restore 纳入基础 revision 验收；当前实现缺失时明确报告，不用 fork 到新 World
+冒充原 World 回退。revision 删除、GC 和 remote publish 是后续能力。
 
 操作输入显式携带 World/revision、逻辑路径或 inode、handle、offset、payload、
 预期错误类别和数据检查点。逻辑 handle 名映射到 adapter 的真实 token/fd；
@@ -78,6 +79,79 @@ xattr、mmap、句柄、durability、fault hooks、mount、agent isolation。
 
 当前内部错误多为 runtime_error，缺乏完整 errno。内部场景可要求精确的既有拒绝结果；
 POSIX profile 必须得到真实规范 errno。不能用宽泛“抛了异常就通过”掩盖损坏或缺失功能。
+
+## 3A. 第一阶段：固定基础回归套件
+
+先交付明确、固定、可重复的 regression，再增加随机模型、故障注入和性能测试。
+默认顺序是 `basic-fs → fork → revision`。三个套件可以单独运行，完整运行也必须为
+每个 case 创建独立 fixture；不能依赖前一个 case 残留的状态或顺序。
+
+所有 case 有稳定 ID、固定操作、明确期望、自动清理和结构化结果。
+每次检查同时核对相关目录项、inode/handle 身份、内容与 size，不能只验证返回成功。
+
+### A. basic-fs：基本文件系统功能
+
+| Case | 操作 | 必须验证 |
+| --- | --- | --- |
+| FS001 | 创建 repository、初始化、重复初始化 | 根目录可读；重复初始化拒绝且已有内容不变 |
+| FS002 | mkdir、嵌套目录、list/stat | 类型、父子关系、目录项与初始权限正确 |
+| FS003 | create、read、write_at、append | 内容逐字节正确；覆盖和追加后 size 一致 |
+| FS004 | truncate 缩小/扩大、越 EOF 写入 | 截断正确；新区域补零；EOF 与空读正确 |
+| FS005 | rename 文件/目录、替换目标 | 源名消失、目标正确；移动后 inode 身份保持 |
+| FS006 | hardlink、修改别名、删除一条链接 | 两名称共用 inode/内容；link count 正确 |
+| FS007 | symlink、readlink、路径读取 | 链接自身与目标区分；断链和循环明确拒绝 |
+| FS008 | open、dup、rename/unlink、close | dup 共享 offset；open-unlink 存活；最终 close 释放 orphan |
+| FS009 | unlink/rmdir、非空目录删除 | 类型错误/非空删除拒绝；拒绝后树不变 |
+| FS010 | 目录分页、空目录、重启后复读 | 无重复/遗漏；持久化内容、身份与属性保持 |
+| FS011 | 非法路径、缺失项、只读打开、范围溢出 | 明确错误；没有创建条目或部分写入 |
+
+基础 profile 先采用当前引擎可表达的小文件和名称，但明确公布覆盖上限。
+真实 POSIX profile 再要求大文件、任意合法名称、完整权限/errno、xattr、mmap 和缓存语义。
+不能因基础套件通过而宣称这些扩展语义也通过。
+
+### B. fork：共享基线和独立写入
+
+| Case | 操作 | 必须验证 |
+| --- | --- | --- |
+| FK001 | 准备源树、创建 revision、fork 新 World | 文件/目录/属性/hardlink 拓扑和源 revision 相同 |
+| FK002 | 子 World 覆盖、追加、截断 | 子分支变化；源 World 和源 revision 均不变 |
+| FK003 | 子 World 创建、删除、rename | 目录变化只在子分支可见 |
+| FK004 | 源和子分支修改同名文件 | 两边保留各自结果，重新打开后仍独立 |
+| FK005 | 两个子 World、句柄和锁 | 同一基线各自独立；句柄不能跨 World 使用 |
+| FK006 | 无效 revision、重复 World 名、fork 失败 | 不覆盖已有 World；无半发布 head；序号/计数满足失败契约 |
+| FK007 | fork 后 compaction、关闭/重新打开 | 两边和历史均可读；CoW 引用不损坏 |
+
+功能回归验证独立性；另用存储层判据检查 fork 复用既有 manifest/content 引用。
+不能仅从很快或磁盘增长少推断 CoW 正确，也不能把每个 World 完整复制后功能相同
+当作 CoW 性能验收通过。
+
+### C. revision：历史读取与回退
+
+| Case | 操作 | 必须验证 |
+| --- | --- | --- |
+| RV001 | 建立固定树、创建 r1、继续修改 live World | r1 内容/目录/属性始终保持创建时状态 |
+| RV002 | 创建 r2、从 r1/r2 分别 fork | 每个 World 对应正确历史点；版本之间没有引用混淆 |
+| RV003 | 对 revision 尝试写、删、rename、可写 open | 全部拒绝；revision 和 live World 均不变 |
+| RV004 | 重复 revision 名、缺失或无效名称 | 明确拒绝；已有历史不得覆盖 |
+| RV005 | 将原 World 从当前状态 restore 到 r1 | 当前树整体恢复；后续 revision 仍保留；恢复后可继续独立写入 |
+| RV006 | restore 的旧句柄/目录 cursor/挂载代次 | 按明确契约撤销旧访问；不能经旧引用修改恢复后的 World |
+| RV007 | compaction、服务重启后读历史与恢复 | 所有保留 revision 可读；恢复结果和重新打开结果一致 |
+
+RV005/RV006 需要先定义并实现 restore、写回屏障和访问代次契约，当前属于待实现能力。
+基础 revision 套件必须展示这两项缺失，不能静默跳过或用创建新 World 代替。
+第一批可运行回归先覆盖 RV001–RV004/RV007 的历史读取部分；完整 revision/发布
+验收在 restore 和撤销未实现时必须失败。进程中断后的 restore 原子性由后续 crash
+profile 增强，不降低固定 case 的完整树一致性判据。
+
+### 统一入口与 CI
+
+计划入口：`python3 -m tests.harness run --suite basic-fs|fork|revision --adapter metadata|rpc|mounted`。
+此入口尚未实现。未指定 suite 时按上述顺序运行全部基础套件。
+
+PR 默认运行可用 metadata/RPC 固定 case 和已有 metadata-regression 套件。
+每份报告列出要求、实际执行、通过、失败和未实现 case IDs，避免只显示总通过数。
+完整验收 profile 要求三套所有必需 case；缺失 restore 或真实挂载时不得报告完整通过。
+随机、并发、crash 和性能是独立增强 profile，不应代替固定基础回归。
 
 ## 4. 独立参考模型
 
@@ -217,14 +291,17 @@ harness 的资源隔离不替代 PR 执行隔离；平台挂载所需权限必�
 
 ## 12. 实施顺序
 
-1. **统一 runner 和资源管理**：封装已有 CTest/Python 场景，生成结果/工件，
-   提供清理与超时自测。首个版本不改存储格式，也不替换已有有效断言。
-2. **共享 RPC adapter 与 trace/model**：迁移文件、revision、session 场景，
-   增加 replay 和最短失败前缀。验证同轨迹在 metadata/RPC 下给出一致语义。
-3. **故障与并发控制**：结构化 hooks/确认边界、独立恢复实例、小型历史检查和缩减。
-4. **真实挂载 adapter**：完成安装/授权/身份预检后接 FSKit/FUSE，逐项打开
-   POSIX、缓存、撤销、Git/build 和隔离门槛；无前端时明确 unavailable。
+1. **固定基础 regression + 最小 runner**：按 basic-fs、fork、revision 三套稳定
+   case 实现资源管理、明确断言和结构化结果，复用现有 metadata/RPC 接口。
+   不先开发复杂随机缩减框架；保留现有有效回归。restore/代次缺失单列。
+2. **完整 revision 回退验收**：定义并实现 restore 和撤销契约，落实 RV005/RV006。
+   基础历史读取通过与完整回退通过分别报告。
+3. **共享 trace/model 和故障/并发控制**：增加 replay、固定随机生成、小型历史
+   检查、确认边界与失败缩减，复用基础场景的操作契约。
+4. **真实挂载 adapter**：完成安装/授权/身份预检后，使用同一套 basic-fs/fork/revision
+   逐项落实 syscall、缓存、撤销和隔离判据；无前端时明确 unavailable。
+5. **工作负载与性能验收**：Git/build、编辑保存、冷热缓存和多 World，单独记录基线。
 
-首个交付门槛：同一确定性场景可在现有 metadata 与 RPC 层运行；失败有可重放轨迹；
-超时不会遗留子进程；损坏/错误配置不能变成 skip；现有 11 项 metadata-regression
-测试继续通过。真实挂载和性能验收不属于首个交付的成功声明。
+首个交付门槛：基础固定 case 在 metadata/RPC 下执行并产生明确结果；失败指向具体
+操作与状态差异；超时不遗留子进程；未实现能力不被当成成功；现有 metadata-regression
+继续通过。完整 revision 回退、真实挂载和性能验收分别设闸，不属于首批成功声明。
