@@ -136,6 +136,15 @@ int main() {
             check(after_rotation.manifest==before_rotation.manifest && after_rotation.objects==before_rotation.objects);
             publish(journal,"rotation-retry",after_rotation);
             check(MetadataTree(journal,tree_root(after_rotation)).entries()==deep_entries);
+            // The same rotation followed by deleting the displaced leaf has
+            // a valid final tree, despite the sorted batch's transient depth.
+            MetadataTree atomic_rotate(journal,deep_root);
+            auto valid_rotation=atomic_rotate.apply({{rotation_key,id},{leaf,std::nullopt}});
+            publish(journal,"rotation-atomic",valid_rotation);
+            auto rotation_expected=MetadataTree(journal,deep_root).entries();
+            rotation_expected.erase(leaf);rotation_expected[rotation_key]=id;
+            check(MetadataTree(journal,tree_root(valid_rotation)).entries()==rotation_expected);
+            check(MetadataTree(journal,deep_root).lookup(leaf)==id);
             MetadataTree delete_deep(journal,deep_root);auto deleted=delete_deep.apply({{leaf,std::nullopt}});
             publish(journal,"deep-deleted",deleted);deep_deleted_root=tree_root(deleted);
             check(MetadataTree(journal,deep_deleted_root).entries().size()==256);

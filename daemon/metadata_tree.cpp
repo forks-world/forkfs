@@ -46,31 +46,56 @@ unsigned MetadataTree::height(Id root,unsigned depth) const {
     auto result=1+std::max(height(n.left,depth+1),height(n.right,depth+1));
     heights_.emplace(root,result);return result;
 }
-Id MetadataTree::merge(Id left,Id right,unsigned depth) {
-    if(left==Id{} && right==Id{})return {};
-    need(depth<256,"metadata tree depth limit");if(left==Id{})return right;if(right==Id{})return left;
-    auto a=node(left),b=node(right);
-    if(higher(a,b)){a.right=merge(a.right,right,depth+1);return make(a);}
-    b.left=merge(left,b.left,depth+1);return make(b);
-}
-Id MetadataTree::set(Id root,const std::string& key,const std::optional<Id>& value,unsigned depth) {
-    if(root==Id{} && !value)return {};
-    need(depth<256,"metadata tree depth limit");
-    if(root==Id{})return value?make({key,*value,{},{}}):Id{};
-    auto n=node(root);
-    if(key==n.key){if(!value)return merge(n.left,n.right,depth);if(n.value==*value)return root;n.value=*value;return make(n);}
-    if(key<n.key) {
-        auto next=set(n.left,key,value,depth+1);if(next==n.left)return root;n.left=next;
-        if(n.left!=Id{} && higher(node(n.left),n)) {
-            auto top=node(n.left);n.left=top.right;top.right=make(n);return make(top);
-        }
-    } else {
-        auto next=set(n.right,key,value,depth+1);if(next==n.right)return root;n.right=next;
-        if(n.right!=Id{} && higher(node(n.right),n)) {
-            auto top=node(n.right);n.right=top.left;top.left=make(n);return make(top);
+Id MetadataTree::merge(Id left,Id right) {
+    struct Step {Node node;bool replace_right;};
+    std::vector<Step> path;std::set<Id> visited;
+    while(left!=Id{} && right!=Id{}) {
+        auto a=node(left),b=node(right);
+        if(higher(a,b)) {
+            need(visited.insert(left).second,"metadata tree cycle");
+            path.push_back({a,true});left=a.right;
+        } else {
+            need(visited.insert(right).second,"metadata tree cycle");
+            path.push_back({b,false});right=b.left;
         }
     }
-    return make(n);
+    auto result=left==Id{}?right:left;
+    for(auto i=path.rbegin();i!=path.rend();++i) {
+        if(i->replace_right)i->node.right=result;else i->node.left=result;
+        result=make(i->node);
+    }
+    return result;
+}
+Id MetadataTree::set(Id root,const std::string& key,const std::optional<Id>& value) {
+    struct Step {Node node;bool went_left;};
+    std::vector<Step> path;std::set<Id> visited;auto current=root;Id result{};
+    while(current!=Id{}) {
+        need(visited.insert(current).second,"metadata tree cycle");auto n=node(current);
+        if(key==n.key) {
+            if(value && n.value==*value)return root;
+            if(!value)result=merge(n.left,n.right);
+            else {n.value=*value;result=make(n);}
+            break;
+        }
+        auto left=key<n.key;path.push_back({n,left});current=left?n.left:n.right;
+    }
+    if(current==Id{}) {if(!value)return root;result=make({key,*value,{},{}});}
+    for(auto i=path.rbegin();i!=path.rend();++i) {
+        auto n=i->node;
+        if(i->went_left) {
+            n.left=result;
+            if(n.left!=Id{} && higher(node(n.left),n)) {
+                auto top=node(n.left);n.left=top.right;top.right=make(n);result=make(top);continue;
+            }
+        } else {
+            n.right=result;
+            if(n.right!=Id{} && higher(node(n.right),n)) {
+                auto top=node(n.right);n.right=top.left;top.left=make(n);result=make(top);continue;
+            }
+        }
+        result=make(n);
+    }
+    return result;
 }
 std::optional<Id> MetadataTree::lookup(const std::string& key) const {
     Id current=root_;unsigned depth=0;
@@ -133,7 +158,7 @@ MetadataTree::Plan MetadataTree::apply(const Changes& changes) {
     // Immutable-node heights are memoized; a cold persisted tree needs one
     // full walk per editor, while subsequent checks visit only new CoW nodes.
     auto candidate=root_;
-    for(const auto& [key,value]:changes)candidate=set(candidate,key,value,0);
+    for(const auto& [key,value]:changes)candidate=set(candidate,key,value);
     if(candidate!=root_)height(candidate);
     Plan result;result.manifest.resize(40);memcpy(result.manifest.data(),"FFTREE01",8);memcpy(result.manifest.data()+8,candidate.data(),32);
     std::set<Id> visited;

@@ -33,8 +33,8 @@ private:
     static bool higher(const Node& a,const Node& b);
     Id make(const Node& node);
     unsigned height(Id root,unsigned depth=0) const;
-    Id set(Id root,const std::string& key,const std::optional<Id>& value,unsigned depth);
-    // depth is the merged root placement, not the original child placement.
-    Id merge(Id left,Id right,unsigned depth);
+    // Editing is iterative: intermediate batch trees may exceed the final limit.
+    Id set(Id root,const std::string& key,const std::optional<Id>& value);
+    Id merge(Id left,Id right);
 };
 }
