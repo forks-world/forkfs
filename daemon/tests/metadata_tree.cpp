@@ -49,6 +49,23 @@ int main() {
             }
             rejects_unchanged({{key("root"),changed_id},{"zzzzzzzz",std::nullopt}});
             rejects_unchanged({{key("root"),changed_id},{key("zzzz"),MetadataTree::Id{}}});
+            rejects_unchanged({{key("root"),std::nullopt}});
+            rejects_unchanged({{key("aaa"),changed_id},{key("root"),std::nullopt}});
+            MetadataTree empty(journal);bool missing_root=false;
+            try{empty.apply({{key("aaa"),id}});}catch(const std::runtime_error&){missing_root=true;}
+            check(missing_root && empty.entries().empty());
+            // Returning a plan cannot discard unpublished nodes: retrying or
+            // composing without publishing the first plan must stay complete.
+            MetadataTree unpublished(journal,old_root);
+            auto first=unpublished.apply({{key("retry-a"),changed_id}});
+            auto retry=unpublished.apply({});
+            check(first.manifest==retry.manifest && first.objects==retry.objects);
+            auto composed=unpublished.apply({{key("retry-b"),changed_id}});
+            publish(journal,"composed",composed); // Only this plan is published.
+            MetadataTree committed(journal,tree_root(composed));
+            check(committed.lookup(key("retry-a"))==changed_id && committed.lookup(key("retry-b"))==changed_id);
+            auto committed_noop=committed.apply({{key("retry-a"),changed_id}});
+            check(committed_noop.objects.empty() && committed_noop.manifest==composed.manifest);
             // The exact prefix and maximum-length valid key survive decoding
             // in a fresh editor and after reopening the store.
             MetadataTree boundary(journal,old_root);auto maximum=key(std::string(1016,'x'));
@@ -76,6 +93,9 @@ int main() {
             MetadataTree::Plan boundary_plan;boundary_plan.manifest=journal.get("boundary");
             MetadataTree boundary(journal,tree_root(boundary_plan));
             check(boundary.lookup(key(""))==id && boundary.lookup(key(std::string(1016,'x')))==changed_id);
+            MetadataTree::Plan composed_plan;composed_plan.manifest=journal.get("composed");
+            MetadataTree composed(journal,tree_root(composed_plan));
+            check(composed.lookup(key("retry-a"))==changed_id && composed.lookup(key("retry-b"))==changed_id);
             check(MetadataTree(journal,old_root).lookup(key("test/50"))==id);
             MetadataTree fresh(journal,new_root);
             auto before=fresh.apply({});

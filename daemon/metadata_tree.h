@@ -15,6 +15,10 @@ public:
     std::vector<std::string> page(const std::string& prefix,const std::string& after,size_t limit) const;
     Map entries() const;
     struct Plan {Bytes manifest;std::vector<Bytes> objects;};
+    // One editor per publication session. Plans may be retried or composed
+    // before publication; pending nodes must remain available until then.
+    // After successful publication, use a fresh editor at the committed root
+    // before the next apply. Returning a Plan does not acknowledge a commit.
     Plan apply(const Changes& changes);
 private:
     struct Node {std::string key;Id value{},left{},right{};};

@@ -108,12 +108,15 @@ MetadataTree::Map MetadataTree::entries() const {
     walk(root_,nullptr,nullptr,0);return result;
 }
 MetadataTree::Plan MetadataTree::apply(const Changes& changes) {
+    const std::string namespace_root("\0forkfs/root",12);
     // Reject malformed batches before changing the editor, including absent
     // deletes and no-op updates that never reach make().
     for(const auto& [key,value]:changes) {
         need(valid_key(key),"invalid metadata change key");
         need(!value || *value!=Id{},"zero metadata value reference");
+        need(key!=namespace_root || value.has_value(),"cannot delete namespace root");
     }
+    need(changes.contains(namespace_root) || lookup(namespace_root).has_value(),"metadata tree missing namespace root");
     for(const auto& [key,value]:changes)root_=set(root_,key,value,0);
     need(lookup(std::string("\0forkfs/root",12)).has_value(),"metadata tree missing namespace root");
     Plan result;result.manifest.resize(40);memcpy(result.manifest.data(),"FFTREE01",8);memcpy(result.manifest.data()+8,root_.data(),32);

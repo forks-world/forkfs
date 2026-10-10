@@ -48,3 +48,22 @@ comparisons use decoded verified nodes and do not skip integrity checks. Actual
 namespace timestamp changes would still be real updates; this does not weaken
 write durability or equate all repeated file writes with no-ops. Tests exercise
 all-value no-op batches and absent deletion on persisted trees, including reopen.
+
+## Publication session lifetime
+
+A MetadataTree editor belongs to one publication session. It may produce a plan,
+retry it with apply({}), or compose further changes before publication. Returned
+plans own their bytes but do not acknowledge durable storage: pending nodes must
+remain until publication succeeds. Automatically clearing them when returning a
+plan would make retry/composition omit nodes that exist only in RAM.
+
+After successful Journal::transact, construct a fresh MetadataTree at that
+committed manifest root before the next apply. Its pending set is empty and
+unchanged edits emit no objects. The current API has no publication acknowledgement;
+same-editor reuse across published transactions is outside this lifecycle. Tests
+publish only the latest of two composed, previously unpublished plans, then decode
+with a fresh editor and reopen the store, covering preservation of both edits.
+
+Malformed batches, namespace-root deletion and missing-root initialization are
+rejected before mutation. This is not a general rollback guarantee for corruption,
+depth-limit errors or allocation failures during editing.
