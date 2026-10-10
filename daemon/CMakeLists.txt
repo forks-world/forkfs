@@ -86,3 +86,8 @@ add_executable(forkfsd_revision_preview_test tests/revision_preview.cpp)
 target_link_libraries(forkfsd_revision_preview_test PRIVATE forkfs_namespace)
 add_test(NAME forkfsd_revision_preview COMMAND forkfsd_revision_preview_test)
 set_tests_properties(forkfsd_revision_preview PROPERTIES TIMEOUT 60)
+
+add_executable(forkfsd_metadata_manager_test tests/metadata_manager.cpp)
+target_link_libraries(forkfsd_metadata_manager_test PRIVATE forkfs_metadata)
+add_test(NAME forkfsd_metadata_manager COMMAND forkfsd_metadata_manager_test)
+set_tests_properties(forkfsd_metadata_manager PROPERTIES TIMEOUT 120)

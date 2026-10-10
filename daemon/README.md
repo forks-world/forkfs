@@ -131,3 +131,18 @@ CoW views traverse the bounded key range; legacy views retain a full-enumeration
 fallback. Inode APIs reject unlinked/deleted IDs; already-open files must use the
 handle API to preserve open-unlink lifetime. These methods are platform-neutral
 backend operations, not an installed FSKit or FUSE mount.
+
+## Metadata manager regression model
+
+`forkfsd_metadata_manager` uses a fixed random seed and an independent map model
+to check 200 batches of inserts, replacements and deletes. Every batch compares
+the live view and varied-size pagination with that model, while captured views
+and old manifest roots must remain unchanged. Periodic stale-sequence publication
+attempts must leave roots, object counts and sequence untouched, and retrying the
+same view must produce the same plan bytes.
+
+Named revisions are checked during further writes, after native compaction and
+after reopen. Invalid root-deletion plans and malformed persisted manifests
+(truncated tree, zero tree root, zero runs, duplicate runs) must be rejected
+without affecting the valid main head. This is deterministic logical/recovery
+coverage; it does not simulate power loss or qualify mounted performance.
