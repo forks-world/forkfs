@@ -13,7 +13,7 @@ an ordinary directory; applications read and write it through XFS directly.
 
 ## Build and validate
 
-Requirements: C++23 compiler (GCC tested), CMake, SQLite development headers, static
+Requirements: C++23 compiler (GCC tested), CMake, SQLite and OpenSSL development headers, static
 libstdc++, Python 3 for tests, and the header-only Git submodules. Sandboxed `world exec`
 also requires `/usr/bin/bwrap` (Bubblewrap 0.8 or newer), unprivileged user namespaces,
 seccomp, and `close_range(CLOSE_RANGE_CLOEXEC)` support. The sandbox filter supports
@@ -21,8 +21,8 @@ x86-64 and AArch64; other architectures refuse sandbox startup.
 
 ```bash
 # Fedora
-sudo dnf install gcc-c++ cmake sqlite-devel libstdc++-static bubblewrap python3
-# Ubuntu: sudo apt-get install g++-14 cmake libsqlite3-dev bubblewrap python3
+sudo dnf install gcc-c++ cmake sqlite-devel openssl-devel libstdc++-static bubblewrap python3
+# Ubuntu: sudo apt-get install g++-14 cmake libsqlite3-dev libssl-dev bubblewrap python3
 
 git submodule update --init --recursive
 # The build directory must be on reflink-enabled XFS for these tests.
