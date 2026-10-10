@@ -52,3 +52,27 @@ foreach(suite file_io handles transaction)
     add_test(NAME forkfsd_${suite} COMMAND forkfsd_${suite}_test)
     set_tests_properties(forkfsd_${suite} PROPERTIES TIMEOUT 120)
 endforeach()
+
+add_executable(forkfsd main.cpp rpc.cpp)
+target_link_libraries(forkfsd PRIVATE forkfs_namespace)
+target_compile_options(forkfsd PRIVATE -Wall -Wextra -Wpedantic)
+# Fault injection is absent from the production libraries and executable.
+add_executable(forkfsd_leveldb_fault_test main.cpp rpc.cpp container.cpp namespace.cpp
+    compaction.cpp maintenance.cpp journal.cpp level_store.cpp metadata_tree.cpp metadata_view.cpp)
+target_compile_definitions(forkfsd_leveldb_fault_test PRIVATE FORKFS_TEST_FAULTS=1)
+target_include_directories(forkfsd_leveldb_fault_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(forkfsd_leveldb_fault_test PRIVATE leveldb Threads::Threads)
+if(NOT APPLE)
+    target_link_libraries(forkfsd_leveldb_fault_test PRIVATE OpenSSL::Crypto)
+endif()
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+foreach(suite leveldb file_io_crash handles_crash symlinks attributes save)
+    add_test(NAME forkfsd_${suite} COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/${suite}.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
+    set_tests_properties(forkfsd_${suite} PROPERTIES TIMEOUT 180)
+endforeach()
+foreach(suite rpc sessions directories)
+    add_test(NAME forkfsd_${suite} COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/${suite}.py $<TARGET_FILE:forkfsd>)
+    set_tests_properties(forkfsd_${suite} PROPERTIES TIMEOUT 180)
+endforeach()

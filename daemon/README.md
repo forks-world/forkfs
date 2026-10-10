@@ -75,3 +75,41 @@ not expose a mounted filesystem or install an operating-system frontend.
 Standalone Release validation includes file I/O, handle lifetime and transaction
 concurrency suites alongside the storage/tree/view suites. The CLI/RPC and their
 process-crash tests are the next integration layer.
+
+## forkfsd CLI and resident RPC
+
+Build the service without the legacy world frontend:
+
+```sh
+cmake -S . -B build/forkfsd -DWFS_BUILD_LEGACY=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build/forkfsd --parallel 4
+ctest --test-dir build/forkfsd --output-on-failure --no-tests=error
+build/forkfsd/daemon/forkfsd init project.forkfs
+mkdir -m 700 runtime
+build/forkfsd/daemon/forkfsd serve project.forkfs --socket "$PWD/runtime/control.sock" --rpc
+```
+
+From another terminal:
+
+```sh
+build/forkfsd/daemon/forkfsd request "$PWD/runtime/control.sock" fs-init
+build/forkfsd/daemon/forkfsd request "$PWD/runtime/control.sock" fs-mkdir /src
+build/forkfsd/daemon/forkfsd request "$PWD/runtime/control.sock" fs-write /src/main.txt input.txt
+build/forkfsd/daemon/forkfsd request "$PWD/runtime/control.sock" fs-cat /src/main.txt
+build/forkfsd/daemon/forkfsd request "$PWD/runtime/control.sock" fs-snapshot base
+build/forkfsd/daemon/forkfsd request "$PWD/runtime/control.sock" fs-fork base work
+```
+
+Input file bytes are read by the client and sent in the bounded RPC frame; the
+server does not open a host input filename supplied by a write request. Handle
+operations require a session token, with lease renewal and expiry cleanup. RPC
+requests currently execute serially. The socket's private parent directory must
+be owned by the service user and inaccessible to other users. This authenticates
+an OS identity; an agent broker/sandbox boundary and mounted frontend remain
+separate work. After a crash, confirm the old process has exited before removing
+its stale socket path. Production builds contain no fault-injection hooks.
+
+Process-crash suites terminate the separate fault executable immediately before
+or after synchronous LevelDB publication. Reopen must expose the complete old
+or complete new state, including inode/content, branch roots and orphan handles.
+These tests validate process-crash recovery, not machine power-loss durability.
