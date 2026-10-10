@@ -24,7 +24,6 @@ endif()
 add_library(wfs_third_party INTERFACE)
 target_include_directories(wfs_third_party SYSTEM INTERFACE
     ${CMAKE_SOURCE_DIR}/third_party/fmt/include
-    ${CMAKE_SOURCE_DIR}/third_party/smallstring/include
     ${CMAKE_SOURCE_DIR}/third_party/Containa
     ${CMAKE_SOURCE_DIR}/third_party/Arena/include
 )

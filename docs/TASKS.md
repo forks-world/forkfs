@@ -163,7 +163,7 @@ Foundation + 最小 CLI)。设计明确这不是 snapshot、不是 Git commit;�
 
 ## 工程约束(arch.md §39)
 
-- core C++23,依赖 libc + 标准 C++ 运行时 + SQLite + header-only 的 smallstring / Containa / Arena / fmt(submodule);对外 C ABI。
+- core C++23,依赖 libc + 标准 C++ 运行时 + SQLite + header-only 的 Containa / Arena / fmt(submodule);对外 C ABI。
 - 不用 std::string / unordered_map / std::mutex / iostream;core 自身不 throw。
 - CLT 的 `usr/include/c++/v1` 目录不完整会遮住 SDK 的 libc++ 头,CMake 里用 `-nostdinc++ -isystem <SDK>/usr/include/c++/v1` 绕开。
 - 只有 `macos/fskit/`(Objective-C++)接触 FSKit;`cli/` C 风格 C++。
