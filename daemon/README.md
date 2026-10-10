@@ -157,3 +157,7 @@ CI has a dedicated `Metadata regressions` job on macOS and Linux. It builds with
 covering the model seeds, tree/view, transaction and lock tests, preview recovery,
 and file/handle process-crash suites. The suites also remain in the existing full
 Release checks. Failure logs are uploaded separately for each platform.
+
+The proposed unified scenario/model/replay/resource harness is described in
+[TEST_HARNESS_DESIGN.md](../docs/TEST_HARNESS_DESIGN.md). It separates metadata,
+service and actual mounted-filesystem evidence; the unified runner is not yet implemented.
