@@ -37,12 +37,14 @@ Id MetadataTree::make(const Node& n) {
     cache_[id]=n;pending_.emplace(id,std::move(b));return id;
 }
 Id MetadataTree::merge(Id left,Id right,unsigned depth) {
+    if(left==Id{} && right==Id{})return {};
     need(depth<256,"metadata tree depth limit");if(left==Id{})return right;if(right==Id{})return left;
     auto a=node(left),b=node(right);
     if(higher(a,b)){a.right=merge(a.right,right,depth+1);return make(a);}
     b.left=merge(left,b.left,depth+1);return make(b);
 }
 Id MetadataTree::set(Id root,const std::string& key,const std::optional<Id>& value,unsigned depth) {
+    if(root==Id{} && !value)return {};
     need(depth<256,"metadata tree depth limit");
     if(root==Id{})return value?make({key,*value,{},{}}):Id{};
     auto n=node(root);
