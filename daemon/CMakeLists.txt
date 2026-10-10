@@ -9,7 +9,7 @@ set_target_properties(leveldb PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED O
 find_package(Threads REQUIRED)
 # Upstream disables RTTI, including the Env base used by our profiling wrapper.
 set_source_files_properties(level_store.cpp PROPERTIES COMPILE_OPTIONS "-fno-rtti")
-add_library(forkfs_metadata STATIC journal.cpp level_store.cpp metadata_tree.cpp)
+add_library(forkfs_metadata STATIC journal.cpp level_store.cpp metadata_tree.cpp metadata_view.cpp)
 target_include_directories(forkfs_metadata PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(forkfs_metadata PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(forkfs_metadata PUBLIC leveldb Threads::Threads)
@@ -37,3 +37,8 @@ if(NOT APPLE)
 endif()
 add_test(NAME forkfsd_lock_granularity COMMAND forkfsd_lock_granularity_test)
 set_tests_properties(forkfsd_lock_granularity PROPERTIES TIMEOUT 60)
+
+add_executable(forkfsd_metadata_view_test tests/metadata_view.cpp)
+target_link_libraries(forkfsd_metadata_view_test PRIVATE forkfs_metadata)
+add_test(NAME forkfsd_metadata_view COMMAND forkfsd_metadata_view_test)
+set_tests_properties(forkfsd_metadata_view PROPERTIES TIMEOUT 60)

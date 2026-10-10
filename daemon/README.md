@@ -39,3 +39,20 @@ Storage lock regression tests are also registered. Preparation hashes outside th
 writer mutex; verify scans a consistent LevelDB snapshot; manual compaction does
 not hold the outer publication lock. Writers still serialize durable publication.
 See the storage locking section of docs/COW_METADATA_TREE.md for concurrency limits.
+
+## Namespace version views
+
+`NamespaceView` resolves World heads and revision descriptors to immutable CoW
+metadata roots. LevelDB plans migrate legacy flat/sorted-run views to `FFTREE01`
+without copying file payloads. Reads, prefix enumeration and paginated tree
+enumeration use the captured root, even if another head is subsequently published.
+Each `plan()` creates an independent editor: returning or publishing a plan does
+not change the source view. Construct a fresh view to read the new head.
+
+`freeze()` captures a CoW view's complete reference map for the existing offline
+sorted-run compaction interface. This compatibility path scans the tree and does
+not promise logarithmic compaction or change the source World. Legacy sorted runs
+remain readable and can be migrated back to a CoW tree on LevelDB.
+
+This is the version-view library layer. The mounted filesystem, inode operations,
+Container coordination and RPC frontend are not part of this integration.
