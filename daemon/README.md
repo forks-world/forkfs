@@ -39,3 +39,95 @@ Storage lock regression tests are also registered. Preparation hashes outside th
 writer mutex; verify scans a consistent LevelDB snapshot; manual compaction does
 not hold the outer publication lock. Writers still serialize durable publication.
 See the storage locking section of docs/COW_METADATA_TREE.md for concurrency limits.
+
+## Namespace version views
+
+`NamespaceView` resolves World heads and revision descriptors to immutable CoW
+metadata roots. LevelDB plans migrate legacy flat/sorted-run views to `FFTREE01`
+without copying file payloads. Reads, prefix enumeration and paginated tree
+enumeration use the captured root, even if another head is subsequently published.
+Each `plan()` creates an independent editor: returning or publishing a plan does
+not change the source view. Construct a fresh view to read the new head.
+
+`freeze()` captures a CoW view's complete reference map for the existing offline
+sorted-run compaction interface. This compatibility path scans the tree and does
+not promise logarithmic compaction or change the source World. Legacy sorted runs
+remain readable and can be migrated back to a CoW tree on LevelDB.
+
+This is the version-view library layer. The mounted filesystem, inode operations,
+Container coordination and RPC frontend are not part of this integration.
+
+## Container and file-operation library
+
+`forkfs_namespace` adds the repository owner and namespace/file-operation API
+above `forkfs_metadata`. `Container::create()` creates a LevelDB repository;
+`Namespace::initialize()` creates its root inode. Namespace operations publish
+content, inode and CoW head updates in the same synchronous transaction.
+Snapshots retain immutable roots, and forks publish independent World heads.
+
+The API supports directories, hardlinks, symlinks, attributes, offset I/O,
+append/truncate, and open handles that retain unlinked files until final close.
+Container coordination serializes logical operations and protects handle state;
+the narrower storage locks do not yet establish parallel namespace requests.
+File content is currently bounded to 256 KiB per object/file. This library does
+not expose a mounted filesystem or install an operating-system frontend.
+
+Standalone Release validation includes file I/O, handle lifetime and transaction
+concurrency suites alongside the storage/tree/view suites. The CLI/RPC and their
+process-crash tests are the next integration layer.
+
+## forkfsd CLI and resident RPC
+
+Build the service without the legacy world frontend:
+
+```sh
+cmake -S . -B build/forkfsd -DWFS_BUILD_LEGACY=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build/forkfsd --parallel 4
+ctest --test-dir build/forkfsd --output-on-failure --no-tests=error
+build/forkfsd/daemon/forkfsd init project.forkfs
+mkdir -m 700 runtime
+build/forkfsd/daemon/forkfsd serve project.forkfs --socket "$PWD/runtime/control.sock" --rpc
+```
+
+From another terminal:
+
+```sh
+build/forkfsd/daemon/forkfsd request "$PWD/runtime/control.sock" fs-init
+build/forkfsd/daemon/forkfsd request "$PWD/runtime/control.sock" fs-mkdir /src
+build/forkfsd/daemon/forkfsd request "$PWD/runtime/control.sock" fs-write /src/main.txt input.txt
+build/forkfsd/daemon/forkfsd request "$PWD/runtime/control.sock" fs-cat /src/main.txt
+build/forkfsd/daemon/forkfsd request "$PWD/runtime/control.sock" fs-snapshot base
+build/forkfsd/daemon/forkfsd request "$PWD/runtime/control.sock" fs-fork base work
+```
+
+Input file bytes are read by the client and sent in the bounded RPC frame; the
+server does not open a host input filename supplied by a write request. Handle
+operations require a session token, with lease renewal and expiry cleanup. RPC
+requests currently execute serially. The socket's private parent directory must
+be owned by the service user and inaccessible to other users. This authenticates
+an OS identity; an agent broker/sandbox boundary and mounted frontend remain
+separate work. After a crash, confirm the old process has exited before removing
+its stale socket path. Production builds contain no fault-injection hooks.
+
+Process-crash suites terminate the separate fault executable immediately before
+or after synchronous LevelDB publication. Reopen must expose the complete old
+or complete new state, including inode/content, branch roots and orphan handles.
+These tests validate process-crash recovery, not machine power-loss durability.
+
+## Inode reads for platform frontends
+
+Namespace exposes `root_inode`, `lookup_child`, `stat_inode`, `read_inode`,
+`readlink_inode` and `list_inode`. Lookup returns the child inode itself without
+following a final symlink; the platform can then resolve that symlink. Regular
+file reads reject directories and symlinks. Each call validates the selected view
+under the Container lock, and hardlinks share one logical inode ID. Directory
+renames do not invalidate child lookup by the directory inode.
+
+Directory pages include attributes from the same logical state as the selected
+names. The continuation is the last returned name; pagination of a mutable World
+is a live scan and is not a snapshot across calls. Use an immutable revision or
+the existing pinned DirectoryCursor API for consistent multi-call enumeration.
+CoW views traverse the bounded key range; legacy views retain a full-enumeration
+fallback. Inode APIs reject unlinked/deleted IDs; already-open files must use the
+handle API to preserve open-unlink lifetime. These methods are platform-neutral
+backend operations, not an installed FSKit or FUSE mount.

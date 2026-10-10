@@ -133,14 +133,14 @@ void append(Bytes& a,const Bytes& b) { a.insert(a.end(),b.begin(),b.end()); }
 }
 
 Journal::~Journal()=default;
-Journal::Journal(const std::string& directory):leveldb_(std::make_unique<LevelStore>(directory)),repository_{} {}
+Journal::Journal(const std::string& directory,bool read_only):leveldb_(std::make_unique<LevelStore>(directory)),read_only_(read_only),repository_{} {}
 std::string Journal::repository() const {need(bool(leveldb_),"repository API requires LevelDB");return leveldb_->repository();}
 uint64_t Journal::sequence() const {return leveldb_?leveldb_->sequence():seq_;}
 size_t Journal::objects() const {return leveldb_?leveldb_->objects():objects_.size();}
 size_t Journal::count() const {return leveldb_?leveldb_->roots():roots_.size();}
 void Journal::poison() {if(leveldb_)leveldb_->poison();poisoned_=true;}
 std::string Journal::metrics_json(bool detailed) const {return leveldb_?leveldb_->metrics_json(detailed):"null";}
-void Journal::compact() {need(bool(leveldb_),"direct compaction requires LevelDB");leveldb_->compact();}
+void Journal::compact() {need(!read_only_,"revision preview is read-only");need(bool(leveldb_),"direct compaction requires LevelDB");leveldb_->compact();}
 Journal::Journal(int fd,const std::array<unsigned char,16>& repo,const Checkpoint& checkpoint):fd_(fd),repository_(repo) {
     struct stat st{}; if(fstat(fd_,&st)<0) io("stat journal");
     const uint64_t size=st.st_size;
@@ -250,6 +250,7 @@ Journal::Journal(int fd,const std::array<unsigned char,16>& repo,const Checkpoin
 }
 
 void Journal::put(const std::string& key,const Bytes& value) {
+    need(!read_only_,"revision preview is read-only");
     if(leveldb_){leveldb_->transact(leveldb_->sequence(),{{key,value}});return;}
     need(!poisoned_,"journal requires reopen after write failure");
     need(!key.empty() && key.size()<=1024,"root name must be 1..1024 bytes");
@@ -299,6 +300,7 @@ void Journal::put(const std::string& key,const Bytes& value) {
     } catch(...) { poisoned_=true; throw; }
 }
 void Journal::transact(uint64_t expected,const std::vector<Mutation>& mutations) {
+    need(!read_only_,"revision preview is read-only");
     if(leveldb_){leveldb_->transact(expected,mutations);return;}
     need(!poisoned_,"journal requires reopen after write failure");
     need(expected==seq_,"transaction conflict: sequence changed");
@@ -441,6 +443,7 @@ void Journal::restore_checkpoint(const Checkpoint& c,uint64_t size) {
 }
 
 Checkpoint Journal::checkpoint() {
+    need(!read_only_,"revision preview is read-only");
     if(leveldb_){leveldb_->compact();return {};}
     need(!poisoned_,"journal requires reopen after write failure");
     // Bound the first checkpoint profile to a single record. Multipart follows later.

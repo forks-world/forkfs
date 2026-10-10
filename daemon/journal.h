@@ -24,7 +24,8 @@ class LevelStore;
 class Journal {
 public:
     ~Journal();
-    explicit Journal(const std::string& directory);
+    // Preview forbids logical mutation; native LevelDB open still needs writable backing.
+    explicit Journal(const std::string& directory,bool read_only=false);
     bool is_leveldb() const {return bool(leveldb_);}
     std::string repository() const;
     void compact();
@@ -49,6 +50,7 @@ public:
 private:
     struct Location { uint64_t payload; uint32_t length; };
     std::unique_ptr<LevelStore> leveldb_;
+    bool read_only_=false;
     int fd_=-1;
     std::array<unsigned char,16> repository_;
     uint64_t seq_ = 0, end_ = 65536;
