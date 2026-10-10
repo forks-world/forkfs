@@ -34,6 +34,13 @@ public:
     void fork(const std::string& revision,const std::string& world);
     std::vector<std::string> worlds() const;
     std::vector<std::string> revisions() const;
+    // Frontend reads address logical inodes, never cached host/path names.
+    InodeInfo root_inode() const;
+    InodeInfo lookup_child(const std::string& parent_inode,const std::string& name) const;
+    InodeInfo stat_inode(const std::string& inode_id) const;
+    std::vector<unsigned char> read_inode(const std::string& inode_id,uint64_t offset,uint64_t count) const;
+    std::string readlink_inode(const std::string& inode_id) const;
+    DirectoryPage list_inode(const std::string& inode_id,const std::string& after,size_t limit) const;
     void initialize();
     void compact();
     size_t run_count() const;

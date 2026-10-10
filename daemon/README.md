@@ -113,3 +113,21 @@ Process-crash suites terminate the separate fault executable immediately before
 or after synchronous LevelDB publication. Reopen must expose the complete old
 or complete new state, including inode/content, branch roots and orphan handles.
 These tests validate process-crash recovery, not machine power-loss durability.
+
+## Inode reads for platform frontends
+
+Namespace exposes `root_inode`, `lookup_child`, `stat_inode`, `read_inode`,
+`readlink_inode` and `list_inode`. Lookup returns the child inode itself without
+following a final symlink; the platform can then resolve that symlink. Regular
+file reads reject directories and symlinks. Each call validates the selected view
+under the Container lock, and hardlinks share one logical inode ID. Directory
+renames do not invalidate child lookup by the directory inode.
+
+Directory pages include attributes from the same logical state as the selected
+names. The continuation is the last returned name; pagination of a mutable World
+is a live scan and is not a snapshot across calls. Use an immutable revision or
+the existing pinned DirectoryCursor API for consistent multi-call enumeration.
+CoW views traverse the bounded key range; legacy views retain a full-enumeration
+fallback. Inode APIs reject unlinked/deleted IDs; already-open files must use the
+handle API to preserve open-unlink lifetime. These methods are platform-neutral
+backend operations, not an installed FSKit or FUSE mount.

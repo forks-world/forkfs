@@ -111,7 +111,11 @@ std::vector<std::string> NamespaceView::keys(const std::string& key_prefix) cons
     std::vector<std::string> result;for(const auto& [key,id]:selected)if(id)result.push_back(key);return result;
 }
 std::vector<std::string> NamespaceView::page(const std::string& prefix,const std::string& after,size_t limit) const {
-    need(bool(tree_),"paged directory enumeration requires a CoW tree");return tree_->page(prefix,after,limit);
+    need(limit>0 && limit<=1025 && (after.empty() || after.starts_with(prefix)),"invalid metadata page request");
+    if(tree_)return tree_->page(prefix,after,limit);
+    std::vector<std::string> result;
+    for(const auto& key:keys(prefix))if(after.empty() || key>after){result.push_back(key);if(result.size()==limit)break;}
+    return result;
 }
 NamespaceView::Map NamespaceView::references() const {
     if(tree_)return tree_->entries();

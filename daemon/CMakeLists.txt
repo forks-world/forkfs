@@ -76,3 +76,8 @@ foreach(suite rpc sessions directories)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/${suite}.py $<TARGET_FILE:forkfsd>)
     set_tests_properties(forkfsd_${suite} PROPERTIES TIMEOUT 180)
 endforeach()
+
+add_executable(forkfsd_inode_frontend_test tests/inode_frontend.cpp)
+target_link_libraries(forkfsd_inode_frontend_test PRIVATE forkfs_namespace)
+add_test(NAME forkfsd_inode_frontend COMMAND forkfsd_inode_frontend_test)
+set_tests_properties(forkfsd_inode_frontend PROPERTIES TIMEOUT 60)

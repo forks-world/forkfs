@@ -284,6 +284,45 @@ void Namespace::compact() {
 size_t Namespace::run_count() const {
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);root(view);return view.run_count();
 }
+InodeInfo Namespace::root_inode() const {
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);
+    return inode(view,root(view));
+}
+InodeInfo Namespace::stat_inode(const std::string& id) const {
+    need(valid_id(id),"invalid inode identity");
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);return inode(view,id);
+}
+InodeInfo Namespace::lookup_child(const std::string& parent_id,const std::string& name) const {
+    need(valid_id(parent_id),"invalid inode identity");
+    auto parts=components("/"+name);need(parts.size()==1,"lookup requires one component");
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);
+    need(inode(view,parent_id).directory,"lookup parent is not a directory");
+    return inode(view,decode_id(view.get(entry_key(parent_id,name))));
+}
+std::vector<unsigned char> Namespace::read_inode(const std::string& id,uint64_t offset,uint64_t count) const {
+    need(valid_id(id) && offset<=INT64_MAX,"invalid inode or file offset");
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=inode(view,id);
+    need(!n.directory && !n.symlink,"inode is not a regular file");auto data=view.get(content_key(id));
+    need(data.size()==n.size,"inode size mismatch");if(offset>=data.size() || !count)return {};
+    auto length=static_cast<size_t>(std::min<uint64_t>(count,data.size()-offset));
+    return Bytes(data.begin()+offset,data.begin()+offset+length);
+}
+std::string Namespace::readlink_inode(const std::string& id) const {
+    need(valid_id(id),"invalid inode identity");
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=inode(view,id);
+    need(n.symlink,"inode is not a symbolic link");auto data=view.get(content_key(id));need(data.size()==n.size,"symlink size mismatch");
+    return std::string(data.begin(),data.end());
+}
+Namespace::DirectoryPage Namespace::list_inode(const std::string& id,const std::string& after,size_t limit) const {
+    need(valid_id(id) && limit>0 && limit<=1024,"invalid inode directory page");
+    if(!after.empty()){auto parts=components("/"+after);need(parts.size()==1,"invalid directory cookie");}
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);
+    need(inode(view,id).directory,"inode is not a directory");auto prefix=directory_prefix(id);
+    auto keys=view.page(prefix,after.empty()?"":prefix+after,limit+1);
+    DirectoryPage result;result.eof=keys.size()<=limit;if(!result.eof)keys.resize(limit);
+    for(const auto& key:keys){auto name=key.substr(prefix.size());result.names.push_back(name);result.entries.push_back({name,inode(view,decode_id(view.get(key)))});}
+    return result;
+}
 void Namespace::initialize() {
     need(view_=="main" && !revision_,"fs-init initializes main only");
     update([](const NamespaceView& j,Changes& changes) {

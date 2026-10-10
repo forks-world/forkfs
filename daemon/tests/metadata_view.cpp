@@ -34,6 +34,8 @@ int main(){
             auto frozen=current.freeze();check(frozen.flat==expected && frozen.runs.empty());
             auto compacted=NamespaceView::compact_frozen(frozen);publish(journal,"runs",compacted);
             NamespaceView runs(journal,"runs");check(runs.references()==expected);
+            check(runs.page(ns+"files/","",1)==std::vector<std::string>{ns+"files/a"});
+            check(runs.page(ns+"files/",ns+"files/a",1)==std::vector<std::string>{ns+"files/b"});
             auto converted=runs.plan({});publish(journal,"converted",converted);check(NamespaceView(journal,"converted").references()==expected);
             // Revision and fork descriptors retain the exact immutable manifest.
             std::vector<unsigned char> descriptor(80);std::memcpy(descriptor.data(),"FFREV001",8);
