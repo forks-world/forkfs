@@ -167,3 +167,38 @@ jobs:
         run: |
           if mountpoint -q /mnt/forkfs-test; then sudo umount /mnt/forkfs-test; fi
           if mountpoint -q /mnt/forkfs-other; then sudo umount /mnt/forkfs-other; fi
+
+  metadata:
+    name: Metadata regressions (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: sh
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install Linux compiler and crypto headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14 libssl-dev
+      - name: Configure metadata-only Release build
+        run: python3 scripts/ci/configure_metadata.py
+      - name: Build metadata service and test targets
+        run: cmake --build build/metadata --parallel 4
+      - name: Run metadata regression and crash suites
+        run: ctest --test-dir build/metadata -L metadata-regression --output-on-failure --no-tests=error
+      - name: Upload regression failure logs
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: metadata-failures-${{ matrix.os }}
+          if-no-files-found: ignore
+          path: build/metadata/Testing/Temporary/*.log
