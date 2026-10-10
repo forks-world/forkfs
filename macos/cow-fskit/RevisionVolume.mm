@@ -5,6 +5,7 @@
 @interface ForkRevisionItem : FSItem
 @property(nonatomic,copy) NSString *inode;
 @property(nonatomic) FSItemID number;
+@property(nonatomic,copy) NSString *parentInode;
 @end
 @implementation ForkRevisionItem
 @end
@@ -30,7 +31,7 @@ static FSItemType kind(const forkfs::InodeInfo& n){return n.directory?FSItemType
 - (ForkRevisionItem *)item:(const forkfs::InodeInfo&)info root:(BOOL)root {
     NSString *key=[NSString stringWithUTF8String:info.id.c_str()];auto existing=_items[key];if(existing)return existing;
     if(_items.count>=4096)throw std::runtime_error("revision item quota exceeded");
-    auto item=[ForkRevisionItem new];item.inode=key;item.number=root?FSItemIDRootDirectory:(FSItemID)_next++;_items[key]=item;return item;
+    auto item=[ForkRevisionItem new];item.inode=key;item.number=root?FSItemIDRootDirectory:(FSItemID)_next++;if(root)item.parentInode=key;_items[key]=item;return item;
 }
 - (ForkRevisionItem *)checked:(FSItem *)item {
     if(_revoked)throw std::system_error(ENOTCONN,std::generic_category(),"revision volume revoked");
@@ -51,19 +52,30 @@ static FSItemType kind(const forkfs::InodeInfo& n){return n.directory?FSItemType
 - (void)enumerateDirectory:(FSItem *)directory startingAtCookie:(FSDirectoryCookie)cookie verifier:(FSDirectoryVerifier)verifier
     providingAttributes:(FSItemGetAttributesRequest *)attributes usingPacker:(FSDirectoryEntryPacker *)packer
     replyHandler:(void (^)(FSDirectoryVerifier,NSError *))reply {
-    if(verifier!=FSDirectoryVerifierInitial){reply(FSDirectoryVerifierInitial,err(EINVAL));return;}
+    const FSDirectoryVerifier current=attributes?1:2;
+    if((cookie==FSDirectoryCookieInitial && verifier!=FSDirectoryVerifierInitial && verifier!=current) ||
+       (cookie!=FSDirectoryCookieInitial && verifier!=current)){reply(current,err(FSErrorInvalidDirectoryCookie));return;}
     @synchronized(self){try{
         auto dir=[self checked:directory];uint64_t index=0;std::string after;bool done=false;
-        while(!done){auto page=_view->list_inode(dir.inode.UTF8String,after,128);done=page.eof;
-            for(const auto& entry:page.entries){after=entry.name;++index;if(index<=cookie)continue;
-                auto it=[self item:entry.inode root:NO];auto attr=attributes?[self attributes:entry.inode item:it]:nil;
-                if(![packer packEntryWithName:[FSFileName nameWithBytes:entry.name.data() length:entry.name.size()]
-                    itemType:kind(entry.inode) itemID:it.number nextCookie:index attributes:attr]){reply(FSDirectoryVerifierInitial,nil);return;}
+        if(!attributes){
+            auto parent=_items[dir.parentInode];if(!parent)throw std::runtime_error("directory parent missing");
+            for(unsigned i=0;i<2;++i){++index;if(index<=cookie)continue;
+                if(![packer packEntryWithName:[FSFileName nameWithString:i==0?@".":@".."]
+                    itemType:FSItemTypeDirectory itemID:i==0?dir.number:parent.number nextCookie:index attributes:nil]){reply(current,nil);return;}
             }
         }
-        reply(FSDirectoryVerifierInitial,index<cookie?err(EINVAL):nil);
-    }catch(const std::system_error& e){reply(FSDirectoryVerifierInitial,err(e.code().value()));}catch(const std::exception&){reply(FSDirectoryVerifierInitial,err(EIO));}}
+        while(!done){auto page=_view->list_inode(dir.inode.UTF8String,after,128);done=page.eof;
+            for(const auto& entry:page.entries){after=entry.name;++index;if(index<=cookie)continue;
+                auto it=[self item:entry.inode root:NO];if(entry.inode.directory)it.parentInode=dir.inode;
+                auto attr=attributes?[self attributes:entry.inode item:it]:nil;
+                if(![packer packEntryWithName:[FSFileName nameWithBytes:entry.name.data() length:entry.name.size()]
+                    itemType:kind(entry.inode) itemID:it.number nextCookie:index attributes:attr]){reply(current,nil);return;}
+            }
+        }
+        reply(current,index<cookie?err(FSErrorInvalidDirectoryCookie):nil);
+    }catch(const std::system_error& e){reply(current,err(e.code().value()));}catch(const std::exception&){reply(current,err(EIO));}}
 }
+
 - (FSVolumeSupportedCapabilities *)supportedVolumeCapabilities {
     auto c=[FSVolumeSupportedCapabilities new];c.supportsHardLinks=YES;c.supportsSymbolicLinks=YES;c.supports64BitObjectIDs=YES;
     c.supportsPersistentObjectIDs=NO;c.caseFormat=FSVolumeCaseFormatSensitive;return c;
@@ -82,7 +94,7 @@ static FSItemType kind(const forkfs::InodeInfo& n){return n.directory?FSItemType
     @synchronized(self){try{auto it=[self checked:item];reply([self attributes:_view->stat_inode(it.inode.UTF8String) item:it],nil);}catch(const std::system_error& e){reply(nil,err(e.code().value()));}catch(const std::exception&){reply(nil,err(EIO));}}
 }
 - (void)lookupItemNamed:(FSFileName *)name inDirectory:(FSItem *)directory replyHandler:(void (^)(FSItem *,FSFileName *,NSError *))reply {
-    @synchronized(self){try{auto dir=[self checked:directory];auto n=_view->lookup_child(dir.inode.UTF8String,std::string((const char *)name.data.bytes,name.data.length));reply([self item:n root:NO],name,nil);}catch(const std::system_error& e){reply(nil,nil,err(e.code().value()));}catch(const std::exception&){reply(nil,nil,err(EIO));}}
+    @synchronized(self){try{auto dir=[self checked:directory];auto n=_view->lookup_child(dir.inode.UTF8String,std::string((const char *)name.data.bytes,name.data.length));auto child=[self item:n root:NO];if(n.directory)child.parentInode=dir.inode;reply(child,name,nil);}catch(const std::system_error& e){reply(nil,nil,err(e.code().value()));}catch(const std::exception&){reply(nil,nil,err(EIO));}}
 }
 - (void)reclaimItem:(FSItem *)item replyHandler:(void (^)(NSError *))reply {reply(nil);} // Retain identity for the mount lifetime.
 - (void)readSymbolicLink:(FSItem *)item replyHandler:(void (^)(FSFileName *,NSError *))reply {
