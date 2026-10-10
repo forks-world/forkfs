@@ -51,3 +51,26 @@ This environment reports zero valid code-signing identities. A containing app,
 compatible signing/provisioning and user-enabled extension registration are still
 needed before an actual FSKit mount can be validated. No system installation or
 signing was attempted.
+
+## Containing app
+
+The optional build now produces `ForkfsRevision.app` containing
+`Contents/PlugIns/ForkRevisionExtension.appex`. Its small native window can select
+a repository and validate the revision descriptor; it explicitly reports that
+nothing has been mounted. The app does not create descriptors, install the
+extension, open the repository engine or change repository data.
+
+`forkfsd_fskit_bundle` validates the unsigned host/extension layout, identifiers,
+executables and declared sandbox entitlements. It is not a signature test.
+The host requests only user-selected read access; the extension still relies on
+FSKit's granted resource. Repeated probes derive the same container identifier
+from the resource path and revision, without opening LevelDB. These identifiers
+are path-based and are not persistent repository or inode identities.
+
+With an appropriate real signing identity, `sign_bundle.py --app APP --output NEW_APP
+--identity IDENTITY` copies the build app to a new destination, signs the embedded
+extension before the host and verifies the resulting signature. Existing output
+is refused. Ad-hoc signing is refused; the tool does not install or register
+anything. Signing and provisioning have not been exercised here. Profile/team
+requirements, OS registration and real mounts still need validation on a configured
+machine. The unsigned preview window is not evidence that FSKit can load the bundle.

@@ -4,6 +4,7 @@
 #include <iostream>
 #include <fstream>
 extern NSString *ForkRevisionResourceName(NSURL *url);
+extern NSUUID *ForkRevisionProbeIdentity(NSURL *url,NSString *revision);
 #include <unistd.h>
 void check(bool ok){if(!ok)throw std::runtime_error("FSKit callback regression failed");}
 int main(){@autoreleasepool {
@@ -13,6 +14,8 @@ int main(){@autoreleasepool {
         forkfs::Namespace fs(*store);fs.initialize();fs.write("/a",{1,2});fs.link("/a","/b");fs.symlink("a","/link");fs.snapshot("base");
         auto resource=[NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()] isDirectory:YES];
         auto marker=path+"/.forkfs-fskit-revision";
+        check([ForkRevisionProbeIdentity(resource,@"base") isEqual:ForkRevisionProbeIdentity(resource,@"base")]);
+        check(![ForkRevisionProbeIdentity(resource,@"base") isEqual:ForkRevisionProbeIdentity(resource,@"other")]);
         check(!ForkRevisionResourceName(resource));
         {std::ofstream out(marker);out<<"base\n";}check([ForkRevisionResourceName(resource) isEqualToString:@"base"]);
         {std::ofstream out(marker);out<<"../base";}check(!ForkRevisionResourceName(resource));

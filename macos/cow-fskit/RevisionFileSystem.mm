@@ -1,6 +1,7 @@
 #import "RevisionVolume.h"
 #include "metadata_view.h"
 #include <fcntl.h>
+#include <algorithm>
 #include <sys/stat.h>
 #include <unistd.h>
 // The only descriptor field is a bounded revision name. Repository selection
@@ -12,9 +13,16 @@ NSString *ForkRevisionResourceName(NSURL *url) {
     if(fd<0)return nil;
     struct stat st{};char data[66];ssize_t n=-1;
     if(fstat(fd,&st)==0 && S_ISREG(st.st_mode) && st.st_size>0 && st.st_size<=65)n=read(fd,data,sizeof(data));close(fd);
-    if(n<=0 || n>65)return nil;if(data[n-1]=='\n')--n;if(n<=0 || n>64)return nil;
+    if(n<=0 || n>65 || n!=st.st_size)return nil;if(data[n-1]=='\n')--n;if(n<=0 || n>64)return nil;
     try{forkfs::NamespaceView::valid_name(std::string(data,n));}catch(const std::exception&){return nil;}
     return [[NSString alloc] initWithBytes:data length:n encoding:NSASCIIStringEncoding];
+}
+NSUUID *ForkRevisionProbeIdentity(NSURL *url,NSString *revision) {
+    std::string input="forkfs.fskit.resource.v1";input+=url.fileSystemRepresentation;input.push_back('\0');input+=revision.UTF8String;
+    // The namespace separator prevents ambiguous path/revision concatenation.
+    auto hash=forkfs::Journal::object_id(std::vector<unsigned char>(input.begin(),input.end()));
+    unsigned char uuid[16];std::copy_n(hash.begin(),16,uuid);uuid[6]=(uuid[6]&15)|0x80;uuid[8]=(uuid[8]&63)|0x80;
+    return [[NSUUID alloc] initWithUUIDBytes:uuid];
 }
 @interface ForkRevisionFileSystem : FSUnaryFileSystem <FSUnaryFileSystemOperations>
 @end
@@ -33,7 +41,7 @@ NSString *ForkRevisionResourceName(NSURL *url) {
     if(![url startAccessingSecurityScopedResource]){reply(FSProbeResult.notRecognizedProbeResult,fs_errorForPOSIXError(EPERM));return;}
     NSString *revision=ForkRevisionResourceName(url);[url stopAccessingSecurityScopedResource];
     if(!revision){reply(FSProbeResult.notRecognizedProbeResult,nil);return;}
-    reply([FSProbeResult usableProbeResultWithName:revision containerID:[[FSContainerIdentifier alloc] initWithUUID:[NSUUID UUID]]],nil);
+    reply([FSProbeResult usableProbeResultWithName:revision containerID:[[FSContainerIdentifier alloc] initWithUUID:ForkRevisionProbeIdentity(url,revision)]],nil);
 }
 - (void)loadResource:(FSResource *)resource options:(FSTaskOptions *)options replyHandler:(void (^)(FSVolume *,NSError *))reply {
     @synchronized(self){
