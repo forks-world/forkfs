@@ -26,3 +26,11 @@ macOS and Linux are supported. Linux requires OpenSSL development headers.
 Upstream LevelDB is pinned and compiled as C++17, with RTTI disabled in the Env
 wrapper to match upstream. The object store tests exercise immutable validation,
 cache eviction, root invalidation, concurrent reads and failure poisoning.
+
+MetadataTree is a deterministic persistent treap: immutable node objects contain
+key/value/left/right references. Updates copy only the search path and rotations;
+revision/fork callers can retain or share the old root. The standalone tests cover
+insert/update/delete, tree invariants, bounded pagination, deterministic encoding,
+atomic root publication and reopening with both historical and current roots.
+World/revision naming, namespace operations and OS mount adapters are outside
+this PR. See ../docs/COW_METADATA_TREE.md for the format and remaining limits.

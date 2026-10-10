@@ -1,0 +1,118 @@
+#include "metadata_tree.h"
+#include <cstring>
+#include <functional>
+#include <set>
+#include <stdexcept>
+namespace forkfs {
+namespace {
+using Id=MetadataTree::Id;
+using Bytes=MetadataTree::Bytes;
+void need(bool ok,const char* message) {if(!ok)throw std::runtime_error(message);}
+uint32_t u32(const unsigned char* p) {uint32_t n=0;for(unsigned i=0;i<4;++i)n|=uint32_t(p[i])<<(8*i);return n;}
+Id priority(const std::string& key) {
+    std::string input="forkfs.metadata.priority.v1"+key;return Journal::object_id(Bytes(input.begin(),input.end()));
+}
+}
+const MetadataTree::Node& MetadataTree::node(const Id& id) const {
+    auto cached=cache_.find(id);if(cached!=cache_.end())return cached->second;
+    auto b=store_.get_object(id);need(b.size()>=108 && !memcmp(b.data(),"FFTRNO01",8),"invalid metadata tree node");
+    auto n=u32(b.data()+8);need(n>=8 && n<=1024 && b.size()==108+uint64_t(n),"invalid metadata node length");
+    Node result;result.key.assign(b.begin()+108,b.end());
+    need(result.key.starts_with(std::string("\0forkfs/",8)),"invalid metadata node key");
+    memcpy(result.value.data(),b.data()+12,32);memcpy(result.left.data(),b.data()+44,32);memcpy(result.right.data(),b.data()+76,32);
+    need(result.value!=Id{},"zero metadata value reference");return cache_.emplace(id,std::move(result)).first->second;
+}
+bool MetadataTree::higher(const Node& a,const Node& b) {
+    auto pa=priority(a.key),pb=priority(b.key);return pa==pb?a.key>b.key:pa>pb;
+}
+Id MetadataTree::make(const Node& n) {
+    need(n.key.size()>=8 && n.key.size()<=1024 && n.value!=Id{},"invalid metadata node");
+    Bytes b(108+n.key.size());memcpy(b.data(),"FFTRNO01",8);
+    for(unsigned i=0;i<4;++i)b[8+i]=static_cast<unsigned char>(n.key.size()>>(8*i));
+    memcpy(b.data()+12,n.value.data(),32);memcpy(b.data()+44,n.left.data(),32);memcpy(b.data()+76,n.right.data(),32);
+    memcpy(b.data()+108,n.key.data(),n.key.size());auto id=Journal::object_id(b);
+    cache_[id]=n;pending_.emplace(id,std::move(b));return id;
+}
+Id MetadataTree::merge(Id left,Id right,unsigned depth) {
+    need(depth<256,"metadata tree depth limit");if(left==Id{})return right;if(right==Id{})return left;
+    auto a=node(left),b=node(right);
+    if(higher(a,b)){a.right=merge(a.right,right,depth+1);return make(a);}
+    b.left=merge(left,b.left,depth+1);return make(b);
+}
+Id MetadataTree::set(Id root,const std::string& key,const std::optional<Id>& value,unsigned depth) {
+    need(depth<256,"metadata tree depth limit");
+    if(root==Id{})return value?make({key,*value,{},{}}):Id{};
+    auto n=node(root);
+    if(key==n.key){if(!value)return merge(n.left,n.right,depth+1);n.value=*value;return make(n);}
+    if(key<n.key) {
+        n.left=set(n.left,key,value,depth+1);
+        if(n.left!=Id{} && higher(node(n.left),n)) {
+            auto top=node(n.left);n.left=top.right;top.right=make(n);return make(top);
+        }
+    } else {
+        n.right=set(n.right,key,value,depth+1);
+        if(n.right!=Id{} && higher(node(n.right),n)) {
+            auto top=node(n.right);n.right=top.left;top.left=make(n);return make(top);
+        }
+    }
+    return make(n);
+}
+std::optional<Id> MetadataTree::lookup(const std::string& key) const {
+    Id current=root_;unsigned depth=0;
+    while(current!=Id{}) {
+        need(depth++<256,"metadata tree depth limit");const auto& n=node(current);
+        if(key==n.key)return n.value;current=key<n.key?n.left:n.right;
+    }
+    return std::nullopt;
+}
+std::vector<std::string> MetadataTree::keys(const std::string& prefix) const {
+    std::string upper=prefix;bool bounded=false;
+    for(size_t i=upper.size();i>0;--i) {
+        auto c=static_cast<unsigned char>(upper[i-1]);
+        if(c!=255){upper[i-1]=static_cast<char>(c+1);upper.resize(i);bounded=true;break;}
+    }
+    std::vector<std::string> result;
+    std::function<void(Id,unsigned)> walk=[&](Id id,unsigned depth) {
+        if(id==Id{})return;need(depth<256,"metadata tree depth limit");const auto& n=node(id);
+        if(n.key>=prefix)walk(n.left,depth+1);
+        if(n.key.starts_with(prefix))result.push_back(n.key);
+        if(!bounded || n.key<upper)walk(n.right,depth+1);
+    };
+    walk(root_,0);return result;
+}
+std::vector<std::string> MetadataTree::page(const std::string& prefix,const std::string& after,size_t limit) const {
+    need(limit>0 && limit<=1025 && (after.empty() || after.starts_with(prefix)),"invalid metadata page request");
+    auto lower=after.empty()?prefix:after;std::string upper=prefix;bool bounded=false;
+    for(size_t i=upper.size();i>0;--i){auto c=static_cast<unsigned char>(upper[i-1]);if(c!=255){upper[i-1]=static_cast<char>(c+1);upper.resize(i);bounded=true;break;}}
+    std::vector<std::string> result;
+    std::function<void(Id,unsigned)> walk=[&](Id id,unsigned depth) {
+        if(id==Id{} || result.size()==limit)return;need(depth<256,"metadata tree depth limit");const auto& n=node(id);
+        if(n.key>lower)walk(n.left,depth+1);
+        if(result.size()==limit)return;
+        if(n.key.starts_with(prefix) && (after.empty() || n.key>after))result.push_back(n.key);
+        if(result.size()<limit && (!bounded || n.key<upper))walk(n.right,depth+1);
+    };walk(root_,0);return result;
+}
+MetadataTree::Map MetadataTree::entries() const {
+    Map result;std::set<Id> visited;
+    std::function<void(Id,const std::string*,const std::string*,unsigned)> walk=[&](Id id,const std::string* lo,const std::string* hi,unsigned depth) {
+        if(id==Id{})return;need(depth<256 && visited.insert(id).second,"metadata tree cycle/depth");const auto& n=node(id);
+        need((!lo || *lo<n.key) && (!hi || n.key<*hi),"metadata tree ordering mismatch");
+        if(n.left!=Id{})need(!higher(node(n.left),n),"metadata tree heap mismatch");
+        if(n.right!=Id{})need(!higher(node(n.right),n),"metadata tree heap mismatch");
+        walk(n.left,lo,&n.key,depth+1);result.emplace(n.key,n.value);walk(n.right,&n.key,hi,depth+1);
+    };
+    walk(root_,nullptr,nullptr,0);return result;
+}
+MetadataTree::Plan MetadataTree::apply(const Changes& changes) {
+    for(const auto& [key,value]:changes)root_=set(root_,key,value,0);
+    need(lookup(std::string("\0forkfs/root",12)).has_value(),"metadata tree missing namespace root");
+    Plan result;result.manifest.resize(40);memcpy(result.manifest.data(),"FFTREE01",8);memcpy(result.manifest.data()+8,root_.data(),32);
+    std::set<Id> visited;
+    std::function<void(Id)> collect=[&](Id id) {
+        auto it=pending_.find(id);if(it==pending_.end() || !visited.insert(id).second)return;
+        auto n=node(id);collect(n.left);collect(n.right);result.objects.push_back(it->second);
+    };
+    collect(root_);return result;
+}
+}
