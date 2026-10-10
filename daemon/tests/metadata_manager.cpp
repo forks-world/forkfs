@@ -1,6 +1,7 @@
 #include "metadata_view.h"
 #include "level_store.h"
 #include <cstring>
+#include <charconv>
 #include <filesystem>
 #include <iostream>
 #include <random>
@@ -17,7 +18,11 @@ std::vector<Mutation> publication(const Journal& j,const std::string& world,cons
     batch.push_back({history+"world/"+world,plan.manifest});return batch;
 }
 void publish(Journal& j,const std::string& world,const NamespaceView::Plan& plan) {j.transact(j.sequence(),publication(j,world,plan));}
-int main() {
+int main(int argc,char** argv) {
+    unsigned seed=0xF04C;
+    if(argc>2)return 2;
+    if(argc==2){auto end=argv[1]+std::strlen(argv[1]);auto result=std::from_chars(argv[1],end,seed);if(result.ec!=std::errc{} || result.ptr!=end)return 2;}
+    std::cout<<"metadata model seed="<<seed<<std::endl;
     auto pattern=(std::filesystem::temp_directory_path()/"ff-meta-manager-XXXXXX").string();auto dir=mkdtemp(pattern.data());if(!dir)return 1;
     try {
         auto path=std::string(dir)+"/store";LevelStore::create(path);
@@ -27,7 +32,7 @@ int main() {
             Journal j(path);j.put(ns+"root",{0});std::vector<NamespaceView::ObjectId> values;
             for(unsigned i=0;i<4;++i){auto key="value/"+std::to_string(i);j.put(key,{static_cast<unsigned char>(i+1)});values.push_back(j.root_object(key));}
             expected[ns+"root"]=j.root_object(ns+"root");publish(j,"main",NamespaceView(j,"main").plan({}));
-            std::mt19937 random(0xF04C);
+            std::mt19937 random(seed);
             for(unsigned round=0;round<200;++round) {
                 NamespaceView before(j,"main");auto old_manifest=j.root_object(history+"world/main");auto old_map=expected;
                 NamespaceView::Changes changes;
@@ -57,6 +62,19 @@ int main() {
                     auto manifest=j.root_object(history+"world/main");std::memcpy(descriptor.data()+8,manifest.data(),32);j.put(history+"revision/"+name,descriptor);revisions.push_back({name,expected});
                 }
                 if(round%40==0){j.compact();for(const auto& [name,model]:revisions)check(NamespaceView(j,name,true).references()==model);}
+            }
+            // Batch rejection must roll back valid earlier mutations too.
+            NamespaceView::ObjectId missing{};missing.fill(255);
+            auto head=j.root_object(history+"world/main");auto sequence_before=j.sequence();auto roots_before=j.count();auto objects_before=j.objects();
+            std::vector<std::vector<Mutation>> invalid_batches{
+                {{"temporary",std::vector<unsigned char>{9}},{"missing-reference",std::nullopt,missing}},
+                {{"temporary",std::vector<unsigned char>{9}},{"temporary",std::nullopt}},
+                {{history+"world/main",std::nullopt},{"absent-root",std::nullopt}},
+                {{"temporary",std::vector<unsigned char>{9}},{"too-large",std::vector<unsigned char>(256*1024+1)}}
+            };
+            for(const auto& batch:invalid_batches){bool rejected=false;try{j.transact(j.sequence(),batch);}catch(const std::runtime_error&){rejected=true;}
+                check(rejected && j.sequence()==sequence_before && j.count()==roots_before && j.objects()==objects_before);
+                check(!j.contains("temporary") && j.root_object(history+"world/main")==head);
             }
             // Invalid plans must not poison the view or leak durable publication.
             NamespaceView view(j,"main");auto sequence=j.sequence();bool rejected=false;

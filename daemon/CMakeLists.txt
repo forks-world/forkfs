@@ -91,3 +91,11 @@ add_executable(forkfsd_metadata_manager_test tests/metadata_manager.cpp)
 target_link_libraries(forkfsd_metadata_manager_test PRIVATE forkfs_metadata)
 add_test(NAME forkfsd_metadata_manager COMMAND forkfsd_metadata_manager_test)
 set_tests_properties(forkfsd_metadata_manager PROPERTIES TIMEOUT 120)
+
+foreach(seed 1 173 4294967295)
+    add_test(NAME forkfsd_metadata_manager_seed_${seed} COMMAND forkfsd_metadata_manager_test ${seed})
+    set_tests_properties(forkfsd_metadata_manager_seed_${seed} PROPERTIES TIMEOUT 120 LABELS metadata-regression)
+endforeach()
+set_tests_properties(forkfsd_metadata_manager forkfsd_metadata_view forkfsd_metadata_tree
+    forkfsd_revision_preview forkfsd_transaction forkfsd_lock_granularity
+    forkfsd_file_io_crash forkfsd_handles_crash PROPERTIES LABELS metadata-regression)

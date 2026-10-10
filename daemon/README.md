@@ -146,3 +146,14 @@ after reopen. Invalid root-deletion plans and malformed persisted manifests
 (truncated tree, zero tree root, zero runs, duplicate runs) must be rejected
 without affecting the valid main head. This is deterministic logical/recovery
 coverage; it does not simulate power loss or qualify mounted performance.
+
+The model suite runs four fixed seeds (800 total batches), including the maximum
+32-bit seed. Mixed invalid transactions cover missing immutable references,
+duplicate keys, deletion of an absent root and oversized payloads; valid earlier
+mutations must not leak into durable roots or object/sequence counters.
+
+CI has a dedicated `Metadata regressions` job on macOS and Linux. It builds with
+`WFS_BUILD_LEGACY=OFF` and runs `ctest -L metadata-regression --no-tests=error`,
+covering the model seeds, tree/view, transaction and lock tests, preview recovery,
+and file/handle process-crash suites. The suites also remain in the existing full
+Release checks. Failure logs are uploaded separately for each platform.

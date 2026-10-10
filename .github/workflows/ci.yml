@@ -167,3 +167,42 @@ jobs:
         run: |
           if mountpoint -q /mnt/forkfs-test; then sudo umount /mnt/forkfs-test; fi
           if mountpoint -q /mnt/forkfs-other; then sudo umount /mnt/forkfs-other; fi
+
+  metadata:
+    name: Metadata regressions (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install Linux compiler and crypto headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14 libssl-dev
+      - name: Configure metadata-only Release build
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/metadata-tmp"
+          echo "TMPDIR=$RUNNER_TEMP/metadata-tmp/" >> "$GITHUB_ENV"
+          compiler_args=()
+          if [ "$RUNNER_OS" = Linux ]; then compiler_args=(-DCMAKE_CXX_COMPILER=g++-14); fi
+          cmake -S . -B build/metadata -DWFS_BUILD_LEGACY=OFF -DCMAKE_BUILD_TYPE=Release "${compiler_args[@]}"
+      - name: Build metadata service and test targets
+        run: cmake --build build/metadata --parallel 4
+      - name: Run metadata regression and crash suites
+        run: ctest --test-dir build/metadata -L metadata-regression --output-on-failure --no-tests=error
+      - name: Upload regression failure logs
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: metadata-failures-${{ matrix.os }}
+          if-no-files-found: ignore
+          path: build/metadata/Testing/Temporary/*.log
