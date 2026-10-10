@@ -18,6 +18,12 @@
 #endif
 
 namespace forkfs {
+#ifdef FORKFS_TEST_LOCKS
+// Linked only by the dedicated concurrency test; absent from production builds.
+void test_prepared();
+void test_verify_snapshot();
+void test_compact();
+#endif
 struct StoreIoMetrics {
     std::atomic<uint64_t> root_get_calls=0,root_get_ns=0,root_misses=0,root_cache_hits=0,object_get_calls=0,object_get_ns=0,object_misses=0,meta_get_calls=0,meta_get_ns=0;
     std::atomic<uint64_t> transactions=0,prepare_ns=0,write_ns=0,wal_sync_calls=0,wal_sync_ns=0,other_sync_calls=0,other_sync_ns=0,wal_append_bytes=0,wal_append_ns=0,wal_flush_ns=0;
@@ -178,22 +184,35 @@ std::vector<std::string> LevelStore::keys(const std::string& prefix) const {
     status(it->status(),"scan LevelDB roots");return result;
 }
 void LevelStore::transact(uint64_t expected,const std::vector<Mutation>& changes) {
-    std::lock_guard lock(mutex_);auto begin=Clock::now();healthy();need(expected==sequence_,"transaction conflict: sequence changed");
-    need(sequence_!=UINT64_MAX,"transaction sequence exhausted");need(!changes.empty() && changes.size()<=4096,"LevelDB batch requires 1..4096 mutations");
-    // transact is synchronous: payload references remain valid until DB::Write
-    // has copied the batch. Async queues must own their mutation buffers.
-    std::set<std::string> seen;std::map<Id,const Bytes*> values;std::map<std::string,std::optional<Id>> updates;
-    size_t total=0;uint64_t roots=roots_,objects=objects_;
+    auto begin=Clock::now();healthy();need(expected==sequence_,"transaction conflict: sequence changed");
+    need(!changes.empty() && changes.size()<=4096,"LevelDB batch requires 1..4096 mutations");
+    // Validate and hash caller-owned immutable input before taking the writer
+    // lock. No mutable roots/counters are read and no database mutation occurs here.
+    std::set<std::string> seen;std::map<Id,const Bytes*> values;
+    std::map<std::string,std::optional<Id>> updates;size_t total=0;
     for(const auto& m:changes) {
         need(!m.key.empty() && m.key.size()<=1024 && seen.insert(m.key).second,"invalid or duplicate root key");
         need(!(m.value && m.reference),"mutation has both value and reference");
-        bool exists=contains(m.key);
-        if(m.reference){object(*m.reference);updates[m.key]=*m.reference;if(!exists)++roots;}
+        if(m.reference){object(*m.reference);updates[m.key]=*m.reference;}
         else if(m.value) {
             need(m.value->size()<=256*1024,"object exceeds 256 KiB");auto hash=Journal::object_id(*m.value);
             if(!values.contains(hash)){total+=m.value->size();values.emplace(hash,&*m.value);}
-            need(total<=16*1024*1024,"LevelDB batch exceeds 16 MiB");updates[m.key]=hash;if(!exists)++roots;
-        } else {need(exists,"cannot delete absent root");updates[m.key]=std::nullopt;--roots;}
+            need(total<=16*1024*1024,"LevelDB batch exceeds 16 MiB");updates[m.key]=hash;
+        } else updates[m.key]=std::nullopt;
+    }
+#ifdef FORKFS_TEST_LOCKS
+    test_prepared();
+#endif
+    auto prepared_ns=elapsed(begin);
+    // Another writer may have committed during preparation. Recheck under the
+    // lock before root existence checks, collision validation and publication.
+    std::lock_guard lock(writer_mutex_);healthy();need(expected==sequence_,"transaction conflict: sequence changed");
+    need(sequence_!=UINT64_MAX,"transaction sequence exhausted");auto locked_begin=Clock::now();
+    uint64_t roots=roots_,objects=objects_;
+    for(const auto& [key,hash]:updates) {
+        bool exists=contains(key);
+        if(hash){if(!exists)++roots;}
+        else {need(exists,"cannot delete absent root");--roots;}
     }
     leveldb::WriteBatch batch;
     for(const auto& [hash,value]:values) {
@@ -204,7 +223,7 @@ void LevelStore::transact(uint64_t expected,const std::vector<Mutation>& changes
     for(const auto& [key,hash]:updates){if(hash)batch.Put("R/"+key,bytes(*hash));else batch.Delete("R/"+key);}
     batch.Put("M/sequence",integer(sequence_+1));batch.Put("M/objects",integer(objects));batch.Put("M/roots",integer(roots));
     fault("leveldb_before_write");leveldb::WriteOptions options;options.sync=true;
-    metrics_->prepare_ns+=elapsed(begin);auto write_begin=Clock::now();
+    metrics_->prepare_ns+=prepared_ns+elapsed(locked_begin);auto write_begin=Clock::now();
     auto s=db_->Write(options,&batch);metrics_->write_ns+=elapsed(write_begin);if(!s.ok()){poisoned_=true;status(s,"commit LevelDB batch");}
     ++metrics_->transactions;sequence_=sequence_+1;objects_=objects;roots_=roots;fault("leveldb_after_write");
 }
@@ -224,15 +243,39 @@ std::string LevelStore::metrics_json(bool detailed) const {
     return result+"}";
 }
 void LevelStore::verify() const {
-    std::lock_guard lock(mutex_);healthy();uint64_t roots=0,objects=0;
-    leveldb::ReadOptions options;options.verify_checksums=true;std::unique_ptr<leveldb::Iterator> it(db_->NewIterator(options));
+    healthy();
+    // The snapshot pins the index and durable counters to one commit. Holding
+    // the writer lock for this full scan is unnecessary while objects are
+    // retained. RAII releases the snapshot on every error path.
+    auto release=[this](const leveldb::Snapshot* snapshot){db_->ReleaseSnapshot(snapshot);};
+    std::unique_ptr<const leveldb::Snapshot,decltype(release)> snapshot(db_->GetSnapshot(),release);
+    leveldb::ReadOptions options;options.verify_checksums=true;options.snapshot=snapshot.get();
+#ifdef FORKFS_TEST_LOCKS
+    test_verify_snapshot();
+#endif
+    auto counter=[&](const char* key){std::string value;status(db_->Get(options,key,&value),"read verification counter");return number(value);};
+    const auto expected_roots=counter("M/roots"),expected_objects=counter("M/objects");
+    uint64_t roots=0,objects=0;
+    std::unique_ptr<leveldb::Iterator> it(db_->NewIterator(options));
     for(it->SeekToFirst();it->Valid();it->Next()) {
         auto key=it->key().ToString(),value=it->value().ToString();
         if(key.starts_with("O/")){need(key.size()==34,"invalid object key");need(Journal::object_id(Bytes(value.begin(),value.end()))==id(key.substr(2)),"object checksum mismatch");++objects;}
-        else if(key.starts_with("R/")){object(id(value));++roots;}
-        else need(key=="M/format" || key=="M/repository" || key=="M/sequence" || key=="M/objects" || key=="M/roots","unknown metadata key");
+        else if(key.starts_with("R/")) {
+            auto reference=id(value);std::string object;
+            status(db_->Get(options,"O/"+bytes(reference),&object),"verify root reference");
+            need(Journal::object_id(Bytes(object.begin(),object.end()))==reference,"root object checksum mismatch");++roots;
+        } else need(key=="M/format" || key=="M/repository" || key=="M/sequence" || key=="M/objects" || key=="M/roots","unknown metadata key");
     }
-    status(it->status(),"verify LevelDB");need(roots==roots_ && objects==objects_,"LevelDB count mismatch");
+    status(it->status(),"verify LevelDB");
+    need(roots==expected_roots && objects==expected_objects,"LevelDB count mismatch");healthy();
 }
-void LevelStore::compact() {{std::lock_guard lock(mutex_);healthy();db_->CompactRange(nullptr,nullptr);}verify();}
+void LevelStore::compact() {
+    healthy();
+#ifdef FORKFS_TEST_LOCKS
+    test_compact();
+#endif
+    // LevelDB synchronizes manual compaction internally; it need not own the
+    // metadata writer lock. Post-compaction verification uses its own snapshot.
+    db_->CompactRange(nullptr,nullptr);verify();
+}
 }

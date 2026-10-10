@@ -34,3 +34,8 @@ insert/update/delete, tree invariants, bounded pagination, deterministic encodin
 atomic root publication and reopening with both historical and current roots.
 World/revision naming, namespace operations and OS mount adapters are outside
 this PR. See ../docs/COW_METADATA_TREE.md for the format and remaining limits.
+
+Storage lock regression tests are also registered. Preparation hashes outside the
+writer mutex; verify scans a consistent LevelDB snapshot; manual compaction does
+not hold the outer publication lock. Writers still serialize durable publication.
+See the storage locking section of docs/COW_METADATA_TREE.md for concurrency limits.
