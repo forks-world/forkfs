@@ -15,6 +15,7 @@ static FSItemType kind(const forkfs::InodeInfo& n){return n.directory?FSItemType
     std::unique_ptr<forkfs::Namespace> _view;
     NSMutableDictionary<NSString *,ForkRevisionItem *> *_items;
     uint64_t _next;
+    bool _revoked;
 }
 - (instancetype)initWithStore:(std::shared_ptr<forkfs::Container>)store revision:(NSString *)revision error:(NSError **)error {
     if(!store || !revision){if(error)*error=err(EINVAL);return nil;}
@@ -32,6 +33,7 @@ static FSItemType kind(const forkfs::InodeInfo& n){return n.directory?FSItemType
     auto item=[ForkRevisionItem new];item.inode=key;item.number=root?FSItemIDRootDirectory:(FSItemID)_next++;_items[key]=item;return item;
 }
 - (ForkRevisionItem *)checked:(FSItem *)item {
+    if(_revoked)throw std::system_error(ENOTCONN,std::generic_category(),"revision volume revoked");
     if(![item isKindOfClass:[ForkRevisionItem class]])throw std::runtime_error("foreign item");
     auto selected=(ForkRevisionItem *)item;if(_items[selected.inode]!=selected)throw std::runtime_error("stale item");return selected;
 }
@@ -60,34 +62,35 @@ static FSItemType kind(const forkfs::InodeInfo& n){return n.directory?FSItemType
             }
         }
         reply(FSDirectoryVerifierInitial,index<cookie?err(EINVAL):nil);
-    }catch(const std::exception&){reply(FSDirectoryVerifierInitial,err(EIO));}}
+    }catch(const std::system_error& e){reply(FSDirectoryVerifierInitial,err(e.code().value()));}catch(const std::exception&){reply(FSDirectoryVerifierInitial,err(EIO));}}
 }
 - (FSVolumeSupportedCapabilities *)supportedVolumeCapabilities {
     auto c=[FSVolumeSupportedCapabilities new];c.supportsHardLinks=YES;c.supportsSymbolicLinks=YES;c.supports64BitObjectIDs=YES;
     c.supportsPersistentObjectIDs=NO;c.caseFormat=FSVolumeCaseFormatSensitive;return c;
 }
 - (FSStatFSResult *)volumeStatistics {return [[FSStatFSResult alloc] initWithFileSystemTypeName:@"forkrevision"];}
-- (FSItem *)rootItem {@synchronized(self){return [self item:_view->root_inode() root:YES];}}
+- (void)revoke {@synchronized(self){_revoked=true;[_items removeAllObjects];_view.reset();_store.reset();}}
+- (FSItem *)rootItem {@synchronized(self){if(_revoked)return nil;return [self item:_view->root_inode() root:YES];}}
 - (void)activateWithOptions:(FSTaskOptions *)options replyHandler:(void (^)(FSItem *,NSError *))reply {
-    @synchronized(self){try{reply([self item:_view->root_inode() root:YES],nil);}catch(const std::exception&){reply(nil,err(EIO));}}
+    @synchronized(self){try{if(_revoked){reply(nil,err(ENOTCONN));return;}reply([self item:_view->root_inode() root:YES],nil);}catch(const std::system_error& e){reply(nil,err(e.code().value()));}catch(const std::exception&){reply(nil,err(EIO));}}
 }
-- (void)deactivateWithOptions:(FSDeactivateOptions)options replyHandler:(void (^)(NSError *))reply {reply(nil);}
-- (void)mountWithOptions:(FSTaskOptions *)options replyHandler:(void (^)(NSError *))reply {reply(nil);}
-- (void)unmountWithReplyHandler:(void (^)(void))reply {reply();}
-- (void)synchronizeWithFlags:(FSSyncFlags)flags replyHandler:(void (^)(NSError *))reply {reply(nil);}
+- (void)deactivateWithOptions:(FSDeactivateOptions)options replyHandler:(void (^)(NSError *))reply {[self revoke];reply(nil);}
+- (void)mountWithOptions:(FSTaskOptions *)options replyHandler:(void (^)(NSError *))reply {@synchronized(self){reply(_revoked?err(ENOTCONN):nil);}}
+- (void)unmountWithReplyHandler:(void (^)(void))reply {[self revoke];reply();}
+- (void)synchronizeWithFlags:(FSSyncFlags)flags replyHandler:(void (^)(NSError *))reply {@synchronized(self){reply(_revoked?err(ENOTCONN):nil);}}
 - (void)getAttributes:(FSItemGetAttributesRequest *)desired ofItem:(FSItem *)item replyHandler:(void (^)(FSItemAttributes *,NSError *))reply {
-    @synchronized(self){try{auto it=[self checked:item];reply([self attributes:_view->stat_inode(it.inode.UTF8String) item:it],nil);}catch(const std::exception&){reply(nil,err(EIO));}}
+    @synchronized(self){try{auto it=[self checked:item];reply([self attributes:_view->stat_inode(it.inode.UTF8String) item:it],nil);}catch(const std::system_error& e){reply(nil,err(e.code().value()));}catch(const std::exception&){reply(nil,err(EIO));}}
 }
 - (void)lookupItemNamed:(FSFileName *)name inDirectory:(FSItem *)directory replyHandler:(void (^)(FSItem *,FSFileName *,NSError *))reply {
     @synchronized(self){try{auto dir=[self checked:directory];auto n=_view->lookup_child(dir.inode.UTF8String,std::string((const char *)name.data.bytes,name.data.length));reply([self item:n root:NO],name,nil);}catch(const std::system_error& e){reply(nil,nil,err(e.code().value()));}catch(const std::exception&){reply(nil,nil,err(EIO));}}
 }
 - (void)reclaimItem:(FSItem *)item replyHandler:(void (^)(NSError *))reply {reply(nil);} // Retain identity for the mount lifetime.
 - (void)readSymbolicLink:(FSItem *)item replyHandler:(void (^)(FSFileName *,NSError *))reply {
-    @synchronized(self){try{auto it=[self checked:item];auto data=_view->readlink_inode(it.inode.UTF8String);reply([FSFileName nameWithBytes:data.data() length:data.size()],nil);}catch(const std::exception&){reply(nil,err(EIO));}}
+    @synchronized(self){try{auto it=[self checked:item];auto data=_view->readlink_inode(it.inode.UTF8String);reply([FSFileName nameWithBytes:data.data() length:data.size()],nil);}catch(const std::system_error& e){reply(nil,err(e.code().value()));}catch(const std::exception&){reply(nil,err(EIO));}}
 }
 - (void)readFromFile:(FSItem *)item offset:(off_t)offset length:(size_t)length intoBuffer:(FSMutableFileDataBuffer *)buffer replyHandler:(void (^)(size_t,NSError *))reply {
     if(offset<0){reply(0,err(EINVAL));return;}
-    @synchronized(self){try{auto it=[self checked:item];auto data=_view->read_inode(it.inode.UTF8String,offset,MIN(length,buffer.length));if(!data.empty())memcpy(buffer.mutableBytes,data.data(),data.size());reply(data.size(),nil);}catch(const std::exception&){reply(0,err(EIO));}}
+    @synchronized(self){try{auto it=[self checked:item];auto data=_view->read_inode(it.inode.UTF8String,offset,MIN(length,buffer.length));if(!data.empty())memcpy(buffer.mutableBytes,data.data(),data.size());reply(data.size(),nil);}catch(const std::system_error& e){reply(0,err(e.code().value()));}catch(const std::exception&){reply(0,err(EIO));}}
 }
 - (void)writeContents:(NSData *)contents toFile:(FSItem *)item atOffset:(off_t)offset replyHandler:(void (^)(size_t,NSError *))reply {reply(0,err(EROFS));}
 - (void)setAttributes:(FSItemSetAttributesRequest *)req onItem:(FSItem *)item

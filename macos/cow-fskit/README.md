@@ -20,9 +20,34 @@ without installing an extension; they exercise lookup/attributes, hardlink
 identity, missing names, symlinks and write refusal. Kernel-managed read buffers
 and directory packing have not been tested end to end.
 
-No signed extension bundle, resource loader, installation or mount command is
-provided yet. Lifecycle revocation, stable persistent IDs, accurate statfs,
+An unsigned extension bundle and resource loader are now built; installation
+and a mount command are not provided yet. Stable persistent IDs, accurate statfs,
 complete errno mapping, large-directory performance, actual mount/data-cache
 semantics and broker/backing isolation remain prerequisites for deployment.
 Do not treat this adapter or its callback tests as a usable mounted filesystem
 or an agent isolation boundary. The existing passthrough extension is unchanged.
+
+
+## Resource loader and revocation
+
+The build emits `ForkRevisionExtension.appex` with a separate bundle identifier
+and FS short name `forkrevision`. It remains unsigned and is not registered with
+macOS. The loader requires a security-scoped FSPathURLResource for the repository
+directory. A regular `.forkfs-fskit-revision` file in that directory contains only
+a revision name (1..64 bytes, optional trailing newline); symlinks, nonregular
+files, invalid names and oversized descriptors are rejected. It cannot redirect
+the loader to a different repository. Probe does not open the database. Load
+acquires exclusive repository ownership, so another forkfsd holding its LevelDB
+lock must be stopped first. Concurrent multi-process ownership is unsupported.
+
+Unload/deactivation/unmount revoke the volume. Revocation drains synchronous
+callbacks using the same monitor, clears item identities and releases its engine
+references. Subsequent inode reads/lookup fail with ENOTCONN; a revoked instance
+cannot be reactivated. Unload releases the security-scoped grant after revocation.
+Tests cover descriptor parsing/rejection and old-item access after revocation;
+OS grant delivery and extension installation have not been exercised.
+
+This environment reports zero valid code-signing identities. A containing app,
+compatible signing/provisioning and user-enabled extension registration are still
+needed before an actual FSKit mount can be validated. No system installation or
+signing was attempted.

@@ -5,6 +5,7 @@
 // Experimental read-only adapter. Owns repository lifetime; no host-file I/O.
 @interface ForkRevisionVolume : FSVolume <FSVolumeOperations, FSVolumeReadWriteOperations>
 @property(nonatomic,readonly) FSItem *rootItem;
+- (void)revoke;
 - (instancetype)initWithStore:(std::shared_ptr<forkfs::Container>)store
                      revision:(NSString *)revision error:(NSError **)error;
 @end

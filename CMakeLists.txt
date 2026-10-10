@@ -49,7 +49,16 @@ if(APPLE AND WFS_COW_FSKIT)
     add_library(forkfs_revision_fskit STATIC macos/cow-fskit/RevisionVolume.mm)
     target_compile_options(forkfs_revision_fskit PRIVATE -fobjc-arc -Wall -Wextra -Wno-error=deprecated-declarations)
     target_link_libraries(forkfs_revision_fskit PUBLIC forkfs_namespace "-framework FSKit" "-framework Foundation")
-    add_executable(forkfsd_fskit_callback_test macos/cow-fskit/RevisionVolumeTest.mm)
+    add_executable(ForkRevisionExtension macos/cow-fskit/RevisionFileSystem.mm)
+    target_compile_options(ForkRevisionExtension PRIVATE -fobjc-arc -Wno-error=deprecated-declarations)
+    target_link_libraries(ForkRevisionExtension PRIVATE forkfs_revision_fskit "-framework ExtensionFoundation")
+    target_link_options(ForkRevisionExtension PRIVATE "-Wl,-e,_NSExtensionMain")
+    set(revision_appex "${CMAKE_BINARY_DIR}/ForkRevisionExtension.appex/Contents")
+    add_custom_command(TARGET ForkRevisionExtension POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${revision_appex}/MacOS"
+        COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:ForkRevisionExtension>" "${revision_appex}/MacOS/ForkRevisionExtension"
+        COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/macos/cow-fskit/Info.plist" "${revision_appex}/Info.plist")
+    add_executable(forkfsd_fskit_callback_test macos/cow-fskit/RevisionVolumeTest.mm macos/cow-fskit/RevisionFileSystem.mm)
     target_compile_options(forkfsd_fskit_callback_test PRIVATE -fobjc-arc -Wno-error=deprecated-declarations)
     target_link_libraries(forkfsd_fskit_callback_test PRIVATE forkfs_revision_fskit)
     add_test(NAME forkfsd_fskit_callbacks COMMAND forkfsd_fskit_callback_test)
