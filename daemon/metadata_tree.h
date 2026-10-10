@@ -30,6 +30,7 @@ private:
     static bool higher(const Node& a,const Node& b);
     Id make(const Node& node);
     Id set(Id root,const std::string& key,const std::optional<Id>& value,unsigned depth);
+    // depth is the merged root placement, not the original child placement.
     Id merge(Id left,Id right,unsigned depth);
 };
 }

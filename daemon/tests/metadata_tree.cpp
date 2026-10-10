@@ -21,7 +21,7 @@ void publish(Journal& journal,const std::string& name,const MetadataTree::Plan& 
 // Produce a valid depth-255 fixture with canonical deterministic priorities.
 // Bounded longest-decreasing-subsequence selection avoids a hand-maintained
 // list of hashes. The namespace-root leaf is left of the chain's head.
-std::pair<MetadataTree::Plan,std::string> deep_fixture(const Journal& journal,const MetadataTree::Id& value) {
+std::pair<MetadataTree::Plan,std::string> deep_fixture(const Journal& journal,const MetadataTree::Id& value,bool branching=false) {
     using Id=MetadataTree::Id;
     auto key=[](const char* kind,unsigned index){char number[16];std::snprintf(number,sizeof(number),"%08u",index);return std::string("\0forkfs/",8)+kind+number;};
     auto priority=[](const std::string& key){auto input="forkfs.metadata.priority.v1"+key;return Journal::object_id(MetadataTree::Bytes(input.begin(),input.end()));};
@@ -42,16 +42,24 @@ std::pair<MetadataTree::Plan,std::string> deep_fixture(const Journal& journal,co
     std::reverse(chain.begin(),chain.end());chain.insert(chain.begin(),head);
     MetadataTree::Changes changes{{std::string("\0forkfs/root",12),value}};
     for(const auto& name:chain)changes[name]=value;
-    MetadataTree editor(journal);return {editor.apply(changes),chain.back()};
+    if(branching) {
+        const auto parent_priority=priority(chain[254]);bool found=false;
+        for(unsigned i=0;i<200000;++i) {
+            auto left=chain[253]+"/left-"+std::to_string(i);
+            if(priority(left)<parent_priority){changes[left]=value;found=true;break;}
+        }
+        check(found);
+    }
+    MetadataTree editor(journal);return {editor.apply(changes),branching?chain[254]:chain.back()};
 }
 int main() {
     auto pattern=(std::filesystem::temp_directory_path()/"ff-tree-XXXXXX").string();auto directory=mkdtemp(pattern.data());if(!directory)return 1;
     try {
         auto path=std::string(directory)+"/store";LevelStore::create(path);
         auto key=[](const std::string& suffix){return std::string("\0forkfs/",8)+suffix;};
-        MetadataTree::Id old_root{},new_root{},deep_deleted_root{};
+        MetadataTree::Id old_root{},new_root{},deep_deleted_root{},branch_deleted_root{};
         auto id=Journal::object_id({42}),changed_id=Journal::object_id({43});
-        MetadataTree::Map expected;
+        MetadataTree::Map expected,expected_branching;
         {
             Journal journal(path);journal.put("value",{42});journal.put("changed-value",{43});
             MetadataTree::Changes changes{{key("root"),id}};expected[key("root")]=id;
@@ -113,8 +121,16 @@ int main() {
             MetadataTree delete_deep(journal,deep_root);auto deleted=delete_deep.apply({{leaf,std::nullopt}});
             publish(journal,"deep-deleted",deleted);deep_deleted_root=tree_root(deleted);
             check(MetadataTree(journal,deep_deleted_root).entries().size()==256);
+            check(MetadataTree(journal,branch_deleted_root).entries()==expected_branching);
             check(!MetadataTree(journal,deep_deleted_root).lookup(leaf));
             check(MetadataTree(journal,deep_root).lookup(leaf)==id);
+            auto [branching,branch_parent]=deep_fixture(journal,id,true);publish(journal,"deep-branching",branching);
+            auto branch_root=tree_root(branching);auto branch_before=MetadataTree(journal,branch_root).entries();
+            check(branch_before.size()==258);expected_branching=branch_before;expected_branching.erase(branch_parent);
+            MetadataTree branch_editor(journal,branch_root);auto branch_deleted=branch_editor.apply({{branch_parent,std::nullopt}});
+            publish(journal,"deep-branch-deleted",branch_deleted);branch_deleted_root=tree_root(branch_deleted);
+            check(MetadataTree(journal,branch_deleted_root).entries()==expected_branching);
+            check(MetadataTree(journal,branch_root).entries()==branch_before);
             // Compare bounded, ordered pagination with the full index.
             std::vector<std::string> names;std::string after;
             while(true){auto page=tree.page(key("test/"),after,7);if(page.empty())break;names.insert(names.end(),page.begin(),page.end());after=page.back();}
@@ -132,6 +148,7 @@ int main() {
         {
             Journal journal(path);check(MetadataTree(journal,new_root).entries()==expected);
             check(MetadataTree(journal,deep_deleted_root).entries().size()==256);
+            check(MetadataTree(journal,branch_deleted_root).entries()==expected_branching);
             MetadataTree::Plan boundary_plan;boundary_plan.manifest=journal.get("boundary");
             MetadataTree boundary(journal,tree_root(boundary_plan));
             check(boundary.lookup(key(""))==id && boundary.lookup(key(std::string(1016,'x')))==changed_id);
