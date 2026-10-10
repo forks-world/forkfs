@@ -48,7 +48,7 @@ Dependency policy: arch.md §39. Design: [`docs/M1_DESIGN.md`](docs/M1_DESIGN.md
 ## Build
 
 ```bash
-git submodule update --init        # third_party: fmt, Arena, Containa, smallstring (header-only)
+git submodule update --init        # third_party: fmt, Arena, Containa (header-only)
 cmake -S . -B build/Release -DCMAKE_BUILD_TYPE=Release
 cmake --build build/Release --parallel
 (cd build/Release && ctest --output-on-failure)
@@ -547,7 +547,7 @@ core/src/view.cpp                     M0 inode table + namespace (WFS_FSKIT=ON o
 core/tests/                           core_test.cpp (M1), diff_test.cpp (T1.3), fskit_test.cpp (WFS_FSKIT=ON)
 macos/fskit/                          Objective-C++ FSKit appex (WFS_FSKIT=ON only)
 cli/main.cpp                          `world` CLI (C-style C++); `world fs ...` is the FS provider surface
-third_party/                          header-only submodules: fmt, Arena, Containa, smallstring
+third_party/                          header-only submodules: fmt, Arena, Containa
 scripts/                              bundle.sh, check-deps.sh, mount.sh, smoke.sh, tests/safety.sh, bench/
 
 <store>/snapshots/S<n>/root           the snapshot tree; the root itself is the 0000 gate

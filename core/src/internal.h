@@ -1,5 +1,5 @@
 // Internal types of the WorldFS core. Not part of the C ABI.
-// Dependency policy: arch.md §39. Strings: smallstring. Containers: Containa. No std::string /
+// Dependency policy: arch.md §39. Strings: std::string. Containers: Containa. No
 // unordered_map / std::mutex. Bump allocation (when needed): Arena.
 #pragma once
 #include "worldfs/worldfs.h"
@@ -7,7 +7,7 @@
 
 #include <container/dense_map.hpp>
 #include <container/small_vectra.hpp>
-#include <smallstring.hpp>
+#include <string>
 
 #include <errno.h>
 #include <mutex>   // std::lock_guard only (header-only)
@@ -20,7 +20,7 @@ struct sqlite3;
 
 namespace wfs {
 
-using String = small::small_string;
+using String = std::string;
 template <typename T>
 using Vec = stdb::container::small_vectra<T, 1>;
 

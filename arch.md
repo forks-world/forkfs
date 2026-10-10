@@ -1557,15 +1557,15 @@ world discard W123
 允许:
     libc / POSIX(syscall 封装在 platform 层)
     标准 C++ 运行时(macOS libc++ 是系统库;Linux 静态链接 libstdc++;Windows /MT)
+    std::string    字符串
     SQLite(C 库,单文件 amalgamation,可 vendor)
     header-only 库,以 git submodule vendor 在 third_party/:
-        smallstring   字符串(替代 std::string)
         Containa      容器(btree_map / dense_map / small_vectra …)
         Arena         bump allocator,需要批量分配的地方用
         fmt           仅因上面几个库需要,FMT_HEADER_ONLY
 
 禁止:
-    std::string / std::unordered_map / std::mutex / iostream / std::function
+    std::unordered_map / std::mutex / iostream / std::function
     任何需要单独链接的第三方库(boost、abseil、grpc …)
     静态对象的动态初始化
 ```
@@ -1573,7 +1573,7 @@ world discard W123
 编译约束:
 
 ```text
--std=c++23,异常与 RTTI 开启(smallstring / Containa / Arena 需要)
+-std=c++23,异常与 RTTI 开启(Containa / Arena 需要)
 core 自身代码不 throw,错误用负 errno 返回
 ```
 
