@@ -43,7 +43,7 @@ void test_verify_snapshot(){if(targeted)gate.pause(Stage::verify);}
 void test_compact(){if(targeted)gate.pause(Stage::compact);}
 }
 int main() {
-    char pattern[]="/tmp/ff-locks-XXXXXX";auto directory=mkdtemp(pattern);if(!directory)return 1;
+    auto pattern=(std::filesystem::temp_directory_path()/"ff-locks-XXXXXX").string();auto directory=mkdtemp(pattern.data());if(!directory)return 1;
     try {
         auto path=std::string(directory)+"/store";LevelStore::create(path);
         {
