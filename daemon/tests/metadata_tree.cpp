@@ -17,7 +17,7 @@ void publish(Journal& journal,const std::string& name,const MetadataTree::Plan& 
     batch.push_back({name,plan.manifest});journal.transact(journal.sequence(),batch);
 }
 int main() {
-    char pattern[]="/tmp/ff-tree-XXXXXX";auto directory=mkdtemp(pattern);if(!directory)return 1;
+    auto pattern=(std::filesystem::temp_directory_path()/"ff-tree-XXXXXX").string();auto directory=mkdtemp(pattern.data());if(!directory)return 1;
     try {
         auto path=std::string(directory)+"/store";LevelStore::create(path);
         auto key=[](const std::string& suffix){return std::string("\0forkfs/",8)+suffix;};
@@ -34,6 +34,29 @@ int main() {
             check(unchanged.objects.empty() && unchanged.manifest==plan.manifest);
             auto absent=tree.apply({{key("absent"),std::nullopt}});
             check(absent.objects.empty() && absent.manifest==plan.manifest);
+            // Malformed batches must reject before changing this editor, even
+            // if a valid mutation sorts before the invalid mutation.
+            auto rejects_unchanged=[&](const MetadataTree::Changes& invalid) {
+                MetadataTree editor(journal,old_root);auto before=editor.apply({});
+                bool rejected=false;try{editor.apply(invalid);}catch(const std::runtime_error&){rejected=true;}
+                check(rejected && editor.entries()==tree.entries());
+                auto after=editor.apply({});check(after.manifest==before.manifest && after.objects.empty());
+            };
+            for(const auto& invalid:std::vector<std::string>{"",std::string("\0forkfs",7),"not-a-namespace",std::string("\0forkfsX",8),key(std::string(1017,'x'))}) {
+                rejects_unchanged({{invalid,id}});
+                rejects_unchanged({{invalid,std::nullopt}});
+                rejects_unchanged({{key("root"),changed_id},{invalid,id}});
+            }
+            rejects_unchanged({{key("root"),changed_id},{"zzzzzzzz",std::nullopt}});
+            rejects_unchanged({{key("root"),changed_id},{key("zzzz"),MetadataTree::Id{}}});
+            // The exact prefix and maximum-length valid key survive decoding
+            // in a fresh editor and after reopening the store.
+            MetadataTree boundary(journal,old_root);auto maximum=key(std::string(1016,'x'));
+            auto boundaries=boundary.apply({{key(""),id},{maximum,changed_id}});
+            publish(journal,"boundary",boundaries);
+            MetadataTree fresh_boundary(journal,tree_root(boundaries));
+            check(fresh_boundary.lookup(key(""))==id && fresh_boundary.lookup(maximum)==changed_id);
+            check(fresh_boundary.entries().size()==103);
             // Compare bounded, ordered pagination with the full index.
             std::vector<std::string> names;std::string after;
             while(true){auto page=tree.page(key("test/"),after,7);if(page.empty())break;names.insert(names.end(),page.begin(),page.end());after=page.back();}
@@ -50,6 +73,9 @@ int main() {
         }
         {
             Journal journal(path);check(MetadataTree(journal,new_root).entries()==expected);
+            MetadataTree::Plan boundary_plan;boundary_plan.manifest=journal.get("boundary");
+            MetadataTree boundary(journal,tree_root(boundary_plan));
+            check(boundary.lookup(key(""))==id && boundary.lookup(key(std::string(1016,'x')))==changed_id);
             check(MetadataTree(journal,old_root).lookup(key("test/50"))==id);
             MetadataTree fresh(journal,new_root);
             auto before=fresh.apply({});

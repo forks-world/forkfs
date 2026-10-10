@@ -12,7 +12,7 @@ template<class F> void rejects(F f) {
     bool rejected=false;try{f();}catch(const std::runtime_error&){rejected=true;}check(rejected);
 }
 int main() {
-    char pattern[]="/tmp/ff-cache-XXXXXX";auto directory=mkdtemp(pattern);if(!directory)return 1;
+    auto pattern=(std::filesystem::temp_directory_path()/"ff-cache-XXXXXX").string();auto directory=mkdtemp(pattern.data());if(!directory)return 1;
     auto path=std::string(directory)+"/store";
     try {
         forkfs::LevelStore::create(path);Bytes original(64,42);

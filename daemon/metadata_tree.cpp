@@ -9,6 +9,9 @@ using Id=MetadataTree::Id;
 using Bytes=MetadataTree::Bytes;
 void need(bool ok,const char* message) {if(!ok)throw std::runtime_error(message);}
 uint32_t u32(const unsigned char* p) {uint32_t n=0;for(unsigned i=0;i<4;++i)n|=uint32_t(p[i])<<(8*i);return n;}
+bool valid_key(const std::string& key) {
+    return key.size()>=8 && key.size()<=1024 && key.starts_with(std::string("\0forkfs/",8));
+}
 Id priority(const std::string& key) {
     std::string input="forkfs.metadata.priority.v1"+key;return Journal::object_id(Bytes(input.begin(),input.end()));
 }
@@ -18,7 +21,7 @@ const MetadataTree::Node& MetadataTree::node(const Id& id) const {
     auto b=store_.get_object(id);need(b.size()>=108 && !memcmp(b.data(),"FFTRNO01",8),"invalid metadata tree node");
     auto n=u32(b.data()+8);need(n>=8 && n<=1024 && b.size()==108+uint64_t(n),"invalid metadata node length");
     Node result;result.key.assign(b.begin()+108,b.end());
-    need(result.key.starts_with(std::string("\0forkfs/",8)),"invalid metadata node key");
+    need(valid_key(result.key),"invalid metadata node key");
     memcpy(result.value.data(),b.data()+12,32);memcpy(result.left.data(),b.data()+44,32);memcpy(result.right.data(),b.data()+76,32);
     need(result.value!=Id{},"zero metadata value reference");return cache_.emplace(id,std::move(result)).first->second;
 }
@@ -26,7 +29,7 @@ bool MetadataTree::higher(const Node& a,const Node& b) {
     auto pa=priority(a.key),pb=priority(b.key);return pa==pb?a.key>b.key:pa>pb;
 }
 Id MetadataTree::make(const Node& n) {
-    need(n.key.size()>=8 && n.key.size()<=1024 && n.value!=Id{},"invalid metadata node");
+    need(valid_key(n.key) && n.value!=Id{},"invalid metadata node");
     Bytes b(108+n.key.size());memcpy(b.data(),"FFTRNO01",8);
     for(unsigned i=0;i<4;++i)b[8+i]=static_cast<unsigned char>(n.key.size()>>(8*i));
     memcpy(b.data()+12,n.value.data(),32);memcpy(b.data()+44,n.left.data(),32);memcpy(b.data()+76,n.right.data(),32);
@@ -105,6 +108,12 @@ MetadataTree::Map MetadataTree::entries() const {
     walk(root_,nullptr,nullptr,0);return result;
 }
 MetadataTree::Plan MetadataTree::apply(const Changes& changes) {
+    // Reject malformed batches before changing the editor, including absent
+    // deletes and no-op updates that never reach make().
+    for(const auto& [key,value]:changes) {
+        need(valid_key(key),"invalid metadata change key");
+        need(!value || *value!=Id{},"zero metadata value reference");
+    }
     for(const auto& [key,value]:changes)root_=set(root_,key,value,0);
     need(lookup(std::string("\0forkfs/root",12)).has_value(),"metadata tree missing namespace root");
     Plan result;result.manifest.resize(40);memcpy(result.manifest.data(),"FFTREE01",8);memcpy(result.manifest.data()+8,root_.data(),32);
