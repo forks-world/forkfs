@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import socket
 import subprocess
 import tempfile
 import time
@@ -14,10 +15,14 @@ class Fixture:
         self.binary, self.root = binary, root
         self.repository = root / 'repository'
         self.step = 0
+        self.endpoint = None
+        self.process = None
+        self.service_logs = []
 
     def call(self, operation, *arguments, view=None, error=False):
         self.step += 1
-        argv = [str(self.binary), operation, str(self.repository), *map(str, arguments)]
+        argv = ([str(self.binary), 'request', str(self.endpoint), operation] if self.endpoint
+                else [str(self.binary), operation, str(self.repository)]) + list(map(str, arguments))
         if view:
             argv += ['--revision' if view[0] == 'revision' else '--world', view[1]]
         started = time.monotonic_ns()
@@ -41,6 +46,50 @@ class Fixture:
         finally:
             with (self.root / 'events.jsonl').open('a', encoding='utf-8') as stream:
                 stream.write(json.dumps(event) + '\n')
+
+    def start_service(self):
+        # Keep Unix socket paths short even when the artifact directory is long.
+        self.socket_root = tempfile.TemporaryDirectory(prefix='ff-h-', dir='/tmp')
+        endpoint = Path(self.socket_root.name) / 'rpc.sock'
+        self.service_logs = [(self.root / name).open('wb') for name in ('service.stdout', 'service.stderr')]
+        self.process = subprocess.Popen([str(self.binary), 'serve', str(self.repository),
+                                         '--socket', str(endpoint), '--rpc'],
+                                        stdout=self.service_logs[0], stderr=self.service_logs[1])
+        deadline = time.monotonic() + 5
+        while True:
+            if self.process.poll() is not None:
+                raise AssertionError(f'service exited during startup: {self.process.returncode}')
+            try:
+                with socket.socket(socket.AF_UNIX) as connection:
+                    connection.settimeout(.1)
+                    connection.connect(str(endpoint))
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('service startup timed out')
+                time.sleep(.01)
+        self.endpoint = endpoint
+        self.call('status')
+
+    def close(self):
+        try:
+            if self.process is not None:
+                if self.process.poll() is not None:
+                    raise AssertionError(f'service exited unexpectedly: {self.process.returncode}')
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=5)
+                    raise AssertionError('service shutdown timed out')
+                if self.process.returncode != 0:
+                    raise AssertionError(f'service shutdown exit: {self.process.returncode}')
+        finally:
+            for stream in self.service_logs:
+                stream.close()
+            if hasattr(self, 'socket_root'):
+                self.socket_root.cleanup()
 
     def initialize(self):
         self.call('init')
@@ -179,6 +228,86 @@ def error_boundaries(f):
         raise AssertionError('rejected operation mutated directory')
 
 
+def handles(f):
+    f.initialize()
+    f.start_service()
+    f.write('/a', b'original')
+    session = json.loads(f.call('session-open', 60000))['session']
+    def call(op, *args, **kwargs):
+        return f.call(op, *args, '--session', session, **kwargs)
+    handle = json.loads(call('fs-open', '/a', 'rw'))['handle']
+    duplicate = json.loads(call('fs-dup', handle))['handle']
+    if call('fs-hread-next', handle, 2) != b'or' or call('fs-hread-next', duplicate, 2) != b'ig':
+        raise AssertionError('dup did not share the file offset')
+    identity = stat(f, '/a')['inode_id']
+    f.call('fs-rename', '/a', '/renamed')
+    f.call('fs-unlink', '/renamed')
+    attrs = json.loads(call('fs-hstat', handle))
+    if attrs['inode_id'] != identity or attrs['links'] != 0:
+        raise AssertionError('unlink lost open inode identity')
+    payload = f.root / 'handle.bin'
+    payload.write_bytes(b'changed')
+    call('fs-hwrite', handle, 0, payload)
+    call('fs-close', handle)
+    if call('fs-hread', duplicate, 0, 8) != b'changedl':
+        raise AssertionError('duplicate handle did not retain unlinked inode')
+    f.write('/a', b'new')
+    if stat(f, '/a')['inode_id'] == identity:
+        raise AssertionError('recreated path reused a live orphan inode')
+    f.read('/a', b'new')
+    call('fs-close', duplicate)
+    call('fs-hstat', duplicate, error='handle belongs to another session')
+    live = json.loads(call('fs-open', '/a', 'r'))['handle']
+    f.call('session-close', session)
+    call('fs-hstat', live, error='session')
+
+
+def directory_pages(f):
+    f.initialize()
+    f.start_service()
+    f.call('fs-mkdir', '/dir')
+    names = ['a', 'b', 'c', 'quote"name', 'slash\\name']
+    for name in names:
+        f.write('/dir/' + name, b'x')
+    session = json.loads(f.call('session-open', 60000))['session']
+    def call(op, *args, **kwargs):
+        return f.call(op, *args, '--session', session, **kwargs)
+    empty = json.loads(call('fs-dir-open', '/'))['cursor']
+    call('fs-dir-close', empty)
+    f.call('fs-mkdir', '/empty')
+    empty = json.loads(call('fs-dir-open', '/empty'))['cursor']
+    if json.loads(call('fs-dir-page', empty, 2)) != {'names': [], 'eof': True}:
+        raise AssertionError('empty directory page mismatch')
+    call('fs-dir-close', empty)
+    cursor = json.loads(call('fs-dir-open', '/dir'))['cursor']
+    first = json.loads(call('fs-dir-page', cursor, 2))
+    f.call('fs-unlink', '/dir/c')
+    f.write('/dir/new', b'y')
+    call('fs-dir-page', cursor, 0, error='directory page limit')
+    observed = first['names'][:]
+    for _ in range(10):
+        page = json.loads(call('fs-dir-page', cursor, 2))
+        if len(page['names']) > 2:
+            raise AssertionError('page exceeded requested bound')
+        observed.extend(page['names'])
+        if page['eof']:
+            break
+    else:
+        raise AssertionError('directory pagination did not terminate')
+    if observed != sorted(names) or first['eof']:
+        raise AssertionError('pinned directory lost, duplicated or reordered entries')
+    if json.loads(call('fs-dir-page', cursor, 2)) != {'names': [], 'eof': True}:
+        raise AssertionError('EOF was not stable')
+    call('fs-dir-rewind', cursor)
+    if json.loads(call('fs-dir-page', cursor, 2)) != first:
+        raise AssertionError('rewind changed the captured directory')
+    call('fs-dir-close', cursor)
+    call('fs-dir-page', cursor, 1, error='invalid directory cursor/session')
+    if f.call('fs-ls', '/dir').decode().splitlines() != sorted(set(names) - {'c'} | {'new'}):
+        raise AssertionError('live directory did not reflect mutations')
+    f.call('session-close', session)
+
+
 def fork(f):
     f.initialize()
     f.write('/a', b'base')
@@ -216,7 +345,8 @@ def revision(f):
 CASES = [('basic-fs', 'FS001', initialization), ('basic-fs', 'FS002', directories),
          ('basic-fs', 'FS003', file_io), ('basic-fs', 'FS004', sparse_and_truncate),
          ('basic-fs', 'FS005', rename), ('basic-fs', 'FS006', hardlinks),
-         ('basic-fs', 'FS007', symlinks), ('basic-fs', 'FS009', removals),
+         ('basic-fs', 'FS007', symlinks), ('basic-fs', 'FS008', handles),
+         ('basic-fs', 'FS009', removals), ('basic-fs', 'FS010', directory_pages),
          ('basic-fs', 'FS011', error_boundaries), ('fork', 'FK-isolation-smoke', fork),
          ('revision', 'RV-history-smoke', revision)]
 
@@ -241,7 +371,7 @@ def main():
         output.mkdir()  # Never reuse or overwrite an existing run.
     else:
         output = Path(tempfile.mkdtemp(prefix='forkfs-regression-'))
-    manifest = {'schema': 1, 'adapter': 'offline-cli', 'profile': args.profile,
+    manifest = {'schema': 1, 'adapter': 'offline-cli+resident-rpc', 'profile': args.profile,
                 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
                 'suite': args.suite, 'case': args.case, 'output': str(output)}
     (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
@@ -252,13 +382,19 @@ def main():
         result = {'suite': suite, 'case': case, 'status': 'pass'}
         try:
             fixture = Fixture(binary, root)
-            scenario(fixture)
-            fixture.call('fs-check')
+            try:
+                scenario(fixture)
+                fixture.call('fs-check')
+            finally:
+                fixture.close()
+            if fixture.endpoint is not None:
+                fixture.endpoint = None
+                fixture.call('fs-check')  # Reopen persisted state after resident shutdown.
         except Exception as error:
             result.update(status='fail', error=str(error))
             (root / 'failure.txt').write_text(traceback.format_exc())
         results.append(result)
-    report = {'schema': 1, 'results': results, 'unimplemented': ['FS008-resident-handles', 'FS010-directory-pagination', 'full-fork-revision-matrix', 'resident-rpc',
+    report = {'schema': 1, 'results': results, 'unimplemented': ['full-fork-revision-matrix',
               'mounted', 'revision-restore', 'mount-generation-revocation'], 'artifacts': str(output)}
     if any(r['status'] == 'fail' for r in results):
         report['status'] = 'fail'

@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import regression
 
 
@@ -54,6 +54,34 @@ class RunnerTests(unittest.TestCase):
                     regression.main()
             self.assertEqual(error.exception.code, 2)
             self.assertFalse(output.exists())
+
+    def test_service_shutdown_timeout_kills_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as root:
+            fixture = self.fixture(root)
+            fixture.process = Mock()
+            fixture.process.poll.return_value = None
+            fixture.process.wait.side_effect = [subprocess.TimeoutExpired([], 5), None]
+            fixture.socket_root = Mock()
+            stream = Mock()
+            fixture.service_logs = [stream]
+            with self.assertRaisesRegex(AssertionError, 'shutdown timed out'):
+                fixture.close()
+            fixture.process.terminate.assert_called_once()
+            fixture.process.kill.assert_called_once()
+            stream.close.assert_called_once()
+            fixture.socket_root.cleanup.assert_called_once()
+
+    def test_service_crash_fails_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as root:
+            fixture = self.fixture(root)
+            fixture.process = Mock()
+            fixture.process.poll.return_value = -9
+            fixture.process.returncode = -9
+            fixture.socket_root = Mock()
+            with self.assertRaisesRegex(AssertionError, 'exited unexpectedly'):
+                fixture.close()
+            fixture.socket_root.cleanup.assert_called_once()
+            fixture.process.terminate.assert_not_called()
 
     def test_existing_output_is_not_overwritten(self):
         with tempfile.TemporaryDirectory() as root:
