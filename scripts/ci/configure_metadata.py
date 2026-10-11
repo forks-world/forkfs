@@ -8,7 +8,10 @@ import tempfile
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--build-dir', type=Path, default=Path('build/metadata'))
+parser.add_argument('--fskit', choices=['on', 'off'], default='off')
 args = parser.parse_args()
+if args.fskit == 'on' and sys.platform != 'darwin':
+    parser.error('--fskit on requires macOS')
 source = Path(__file__).resolve().parents[2]
 scratch = Path(os.environ.get('RUNNER_TEMP', tempfile.gettempdir())) / 'forkfs-metadata-ci-tmp'
 scratch.mkdir(parents=True, exist_ok=True)
@@ -18,6 +21,7 @@ if '\n' in tmpdir or '\r' in tmpdir:
 environment = dict(os.environ, TMPDIR=tmpdir)
 command = ['cmake', '-S', str(source), '-B', str(args.build_dir.resolve()),
            '-DWFS_BUILD_LEGACY=OFF', '-DCMAKE_BUILD_TYPE=Release']
+command.append('-DWFS_COW_FSKIT=' + args.fskit.upper())
 if sys.platform.startswith('linux'):
     command.append('-DCMAKE_CXX_COMPILER=g++-14')
 subprocess.run(command, env=environment, check=True)

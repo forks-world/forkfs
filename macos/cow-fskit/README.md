@@ -1,7 +1,11 @@
 # Experimental CoW revision FSKit adapter
 
-Build on macOS with `-DWFS_BUILD_LEGACY=OFF -DWFS_COW_FSKIT=ON` and run
+Build with a macOS 26+ SDK and runtime, with `-DWFS_BUILD_LEGACY=OFF -DWFS_COW_FSKIT=ON` and run
 `ctest --test-dir build/namespace-view -R 'forkfsd_(fskit_callbacks|inode_frontend)' --output-on-failure`.
+
+The optional build defaults its deployment target to 26.0 and rejects explicit
+older targets because the path-resource loader uses FSKit V2. This matches the
+host and extension plist minimum versions.
 The optional target links FSKit directly to `forkfs_namespace`; it performs no
 host-file passthrough and no per-operation RPC. The volume owns a shared
 Container and selects a named immutable revision. A live World is not accepted.
@@ -10,14 +14,30 @@ Lookup, attributes, symlink reads, regular-file reads and directory enumeration
 use logical inodes. All mutation callbacks return EROFS. Hardlinks reuse the same
 FSItem. Numeric item IDs last only for this volume lifetime, and persistent IDs
 are explicitly disabled. At most 4096 items are retained; quota exhaustion
-currently returns EIO. Directory cookies are entry ordinals in the immutable
+returns ENFILE. Directory cookies are entry ordinals in the immutable
 revision; resumed enumeration currently scans earlier entries again.
 
 This uses the Operations compatibility protocols, deprecated by the installed
 macOS 27 SDK. Deprecation warnings remain visible but are not build errors for
 these optional targets. The Handler API remains future work. Callback tests run
-without installing an extension; they exercise lookup/attributes, hardlink
-identity, missing names, symlinks and write refusal. Kernel-managed read buffers
+without installing an extension; they exercise lookup/attributes, dot/parent lookup,
+hardlink identity, missing/long names, symlinks, read offsets/EOF, xattrs and write
+refusal. Directory operations on regular files return ENOTDIR, regular reads of
+directories return EISDIR and foreign items return ESTALE. Directory attributes
+include the parent item ID; hardlinked regular files do not claim a unique parent.
+
+The revision namespace currently stores no extended attributes. Xattr listing
+returns an empty array, queries (including com.apple.provenance) return ENOATTR,
+and all set/delete policies return EROFS. The pathconf maximum xattr size is zero. The adapter conforms to the general
+xattr protocol and intentionally omits the limited-name hook. These callbacks
+never inspect backing-file xattrs. Revocation takes precedence over item/cookie
+validation and read-only errors for requests against revoked volumes (ENOTCONN).
+Item types are cached from the immutable revision, so argument/type validation
+does not add extra metadata-tree lookups.
+Metadata CI retains macOS 15 and Linux core coverage with the adapter disabled,
+and adds macOS 26 with `configure_metadata.py --fskit on`. Callback and unsigned-
+bundle regressions are included in the metadata-regression label on that job.
+Kernel-managed read buffers
 and directory packing have not been tested end to end.
 
 An unsigned extension bundle and resource loader are now built; installation

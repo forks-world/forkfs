@@ -178,7 +178,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, ubuntu-24.04]
+        include:
+          - os: macos-15
+            fskit: 'off'
+          - os: macos-26
+            fskit: 'on'
+          - os: ubuntu-24.04
+            fskit: 'off'
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -190,7 +196,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y g++-14 libssl-dev
       - name: Configure metadata-only Release build
-        run: python3 scripts/ci/configure_metadata.py
+        run: python3 scripts/ci/configure_metadata.py --fskit ${{ matrix.fskit }}
       - name: Build metadata service and test targets
         run: cmake --build build/metadata --parallel 4
       - name: Run metadata regression and crash suites
