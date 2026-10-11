@@ -28,6 +28,8 @@ void Compaction::prepare() {
     std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;
     auto key=history+"world/"+world_;
     if(journal.contains(key))head_=journal.root_object(key);
+    auto generation_key=history+"generation/"+world_;
+    if(journal.contains(generation_key))generation_=journal.root_object(generation_key);
     sequence_=journal.sequence();
     NamespaceView view(journal,world_,false,false);input_=view.freeze();prepared_=true;
 }
@@ -44,7 +46,9 @@ bool Compaction::matches_head_locked() const {
     const auto& journal=*container_.journal_;auto key=history+"world/"+world_;
     std::optional<NamespaceView::ObjectId> current;
     if(journal.contains(key))current=journal.root_object(key);
-    return current==head_ && (head_ || journal.sequence()==sequence_);
+    std::optional<NamespaceView::ObjectId> generation;auto generation_key=history+"generation/"+world_;
+    if(journal.contains(generation_key))generation=journal.root_object(generation_key);
+    return generation==generation_ && current==head_ && (head_ || journal.sequence()==sequence_);
 }
 Compaction::StageResult Compaction::stage_next() {
     need(built_ && !installed_,"compaction task cannot stage");staging_started_=true;

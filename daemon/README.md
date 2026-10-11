@@ -161,3 +161,12 @@ Release checks. Failure logs are uploaded separately for each platform.
 The proposed unified scenario/model/replay/resource harness is described in
 [TEST_HARNESS_DESIGN.md](../docs/TEST_HARNESS_DESIGN.md). It separates metadata,
 service and actual mounted-filesystem evidence; the unified runner is not yet implemented.
+
+### Restore a World (CLI/RPC)
+
+`forkfsd fs-restore CONTAINER REVISION [--world WORLD]` restores an existing World
+and revokes its live handles, locks and directory cursors. Preserve current live
+state with an explicit snapshot before restoring if needed. Revisions and other
+Worlds remain accessible. RPC uses the same `fs-restore` command. See
+[the restore contract](../docs/RESTORE_DESIGN.md) for the local durability boundary,
+orphan batch limit and the still-unimplemented live mount cache barrier.

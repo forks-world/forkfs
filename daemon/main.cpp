@@ -176,6 +176,7 @@ int main(int argc, char** argv) {
                          "forkfsd fs-rmdir CONTAINER PATH\n"
                          "forkfsd fs-check CONTAINER\n"
                          "forkfsd fs-snapshot CONTAINER REVISION_NAME [--world WORLD]\n"
+                         "forkfsd fs-restore CONTAINER REVISION_NAME [--world WORLD]\n"
                          "forkfsd fs-fork CONTAINER REVISION_NAME NEW_WORLD\n"
                          "forkfsd fs-worlds CONTAINER\n"
                          "forkfsd fs-revisions CONTAINER\n"
@@ -257,7 +258,8 @@ int main(int argc, char** argv) {
                 auto runs=fs.run_count();std::cout<<"{\"runs\":"<<runs<<",\"layout\":\""<<(runs?"sorted-runs":"flat")<<"\"}\n";return 0;
             } else if(command=="fs-snapshot" && argc==4) {
                 auto id=fs.snapshot(argv[3]);std::cout<<"{\"revision_id\":\""<<id<<"\"}\n";return 0;
-            } else if(command=="fs-fork" && argc==5) fs.fork(argv[3],argv[4]);
+            } else if(command=="fs-restore" && argc==4) fs.restore(argv[3]);
+            else if(command=="fs-fork" && argc==5) fs.fork(argv[3],argv[4]);
             else if(command=="fs-worlds" && argc==3) {for(const auto& name:fs.worlds())std::cout<<name<<'\n';return 0;}
             else if(command=="fs-revisions" && argc==3) {for(const auto& name:fs.revisions())std::cout<<name<<'\n';return 0;}
             else if(command=="fs-init" && argc==3) fs.initialize();

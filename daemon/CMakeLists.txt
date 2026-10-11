@@ -106,3 +106,11 @@ set_tests_properties(forkfsd_basic_harness PROPERTIES TIMEOUT 120 LABELS metadat
 add_test(NAME forkfsd_harness_runner COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_SOURCE_DIR}/tests/harness/test_runner.py)
 set_tests_properties(forkfsd_harness_runner PROPERTIES TIMEOUT 30 LABELS metadata-regression)
+
+add_executable(forkfsd_restore_test tests/restore.cpp)
+target_link_libraries(forkfsd_restore_test PRIVATE forkfs_namespace)
+add_test(NAME forkfsd_restore COMMAND forkfsd_restore_test)
+set_tests_properties(forkfsd_restore PROPERTIES TIMEOUT 60 LABELS metadata-regression)
+add_test(NAME forkfsd_restore_crash COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/restore_crash.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
+set_tests_properties(forkfsd_restore_crash PROPERTIES TIMEOUT 60 LABELS metadata-regression)
