@@ -41,9 +41,19 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             output = Path(root) / 'run'
             args = ['runner', '--binary', sys.executable, '--output', str(output), '--profile', 'acceptance']
-            with patch.object(sys, 'argv', args), patch.object(regression, 'CASES', [('revision', 'test', lambda f: None)]), contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(sys, 'argv', args), patch.object(regression, 'CASES', [('revision', 'test', lambda f: None)]), patch.object(regression.Fixture, 'call', return_value=b''), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(regression.main(), 1)
             self.assertEqual(json.loads((output / 'result.json').read_text())['status'], 'unavailable')
+
+    def test_conflicting_case_selection_is_rejected_before_setup(self):
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root) / 'run'
+            args = ['runner', '--binary', sys.executable, '--output', str(output), '--suite', 'fork', '--case', 'FS004']
+            with patch.object(sys, 'argv', args), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    regression.main()
+            self.assertEqual(error.exception.code, 2)
+            self.assertFalse(output.exists())
 
     def test_existing_output_is_not_overwritten(self):
         with tempfile.TemporaryDirectory() as root:

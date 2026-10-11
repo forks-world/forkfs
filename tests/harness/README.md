@@ -5,9 +5,11 @@ python3 tests/harness/regression.py --binary build/metadata/daemon/forkfsd
 python3 tests/harness/regression.py --binary build/metadata/daemon/forkfsd --suite fork
 ```
 
-The offline CLI adapter runs three independent smoke scenarios: basic filesystem
-operations, fork isolation and immutable revision history. Each owns a fresh
-repository. Calls use subprocess argument lists without a shell, have a timeout,
+The offline CLI adapter runs nine independently reported fixed filesystem cases
+(FS001–FS007, FS009, FS011), plus fork isolation and revision-history smoke cases. Each owns a fresh
+repository. Use --case FS004 to reproduce one case; incompatible suite/case
+selectors are rejected before creating artifacts. Every successful case finishes
+with a namespace consistency check. Calls use subprocess argument lists without a shell, have a timeout,
 and log return status/output/timing in JSONL. Expected refusals check both the
 ordinary CLI error exit and the specific reason; crashes or unrelated failures
 cannot satisfy them. Every CLI operation opens/closes the engine, so persisted
@@ -29,4 +31,6 @@ future adapters/profiles; existing deeper CTest regressions remain enabled.
 CTest registers forkfsd_basic_harness and forkfsd_harness_runner under the
 metadata-regression label, so the existing dedicated metadata CI discovers them.
 Runner self-tests cover crash-versus-refusal, wrong error reasons, timeout logging,
-missing-capability acceptance and refusing existing output directories.
+missing-capability acceptance, conflicting case selection and refusing existing
+output directories. Resident handles (FS008), directory pagination (FS010) and
+the complete fork/revision case matrix remain explicitly unimplemented.
