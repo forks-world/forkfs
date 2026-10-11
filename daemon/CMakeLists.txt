@@ -114,3 +114,10 @@ set_tests_properties(forkfsd_restore PROPERTIES TIMEOUT 60 LABELS metadata-regre
 add_test(NAME forkfsd_restore_crash COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/restore_crash.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
 set_tests_properties(forkfsd_restore_crash PROPERTIES TIMEOUT 60 LABELS metadata-regression)
+
+add_test(NAME forkfsd_script_control COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/scripts/tests/forkfs_control.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_script_control PROPERTIES TIMEOUT 90 LABELS metadata-regression)
+add_test(NAME forkfsd_script_control_unit COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/scripts/tests/test_forkfs_control.py)
+set_tests_properties(forkfsd_script_control_unit PROPERTIES TIMEOUT 30 LABELS metadata-regression)

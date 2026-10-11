@@ -170,3 +170,10 @@ state with an explicit snapshot before restoring if needed. Revisions and other
 Worlds remain accessible. RPC uses the same `fs-restore` command. See
 [the restore contract](../docs/RESTORE_DESIGN.md) for the local durability boundary,
 orphan batch limit and the still-unimplemented live mount cache barrier.
+
+### Standalone script control
+
+Use [scripts/forkfs.py](../scripts/forkfs.py) for repository, foreground RPC service,
+file, snapshot, branch and restore operations without the legacy world executable.
+See [the script guide](../docs/SCRIPT_CONTROL.md) for complete examples. Native
+mount/unmount deliberately report unavailable until FSKit mount control is ready.
