@@ -123,6 +123,30 @@ std::vector<std::string> target_components(const std::string& target) {
     if(target.back()=='/' && !result.empty())result.push_back(".");return result;
 }
 struct Parent {std::string id,name,key;};
+Parent inode_parent(const NamespaceView& view,const std::string& id,const std::string& name) {
+    if(!valid_id(id) || name.empty() || name=="." || name==".." ||
+       name.find('/')!=std::string::npos || !std::all_of(name.begin(),name.end(),[](unsigned char c){return c>=32 && c<=126;}))
+        throw std::system_error(EINVAL,std::generic_category(),"invalid inode entry name");
+    if(name.size()>255)throw std::system_error(ENAMETOOLONG,std::generic_category(),"entry name too long");
+    if(!view.contains(inode_key(id)))throw std::system_error(ENOENT,std::generic_category(),"parent inode missing");
+    if(!inode(view,id).directory)throw std::system_error(ENOTDIR,std::generic_category(),"parent inode is not a directory");
+    return {id,name,entry_key(id,name)};
+}
+// No directory-parent index exists in the current format. Walk only directory
+// descendants of the moved inode, in bounded pages, to prevent rename cycles.
+bool directory_contains(const NamespaceView& view,const std::string& start,const std::string& target) {
+    std::vector<std::string> pending{start};std::set<std::string> seen;
+    while(!pending.empty()) {
+        auto id=std::move(pending.back());pending.pop_back();if(id==target)return true;
+        need(seen.insert(id).second,"directory cycle in stored namespace");
+        auto pre=directory_prefix(id);std::string after;
+        for(;;){auto entries=view.page(pre,after,128);if(entries.empty())break;
+            for(const auto& key:entries){auto child=decode_id(view.get(key));if(inode(view,child).directory)pending.push_back(child);}
+            after=entries.back();if(entries.size()<128)break;
+        }
+    }
+    return false;
+}
 std::string walk(const NamespaceView& journal,const std::vector<std::string>& names,size_t count,
                  std::vector<std::string>* ancestry=nullptr,bool follow_final=true,Parent* missing=nullptr) {
     std::vector<std::string> stack{root(journal)};std::deque<std::string> pending(names.begin(),names.begin()+count);
@@ -355,6 +379,51 @@ Namespace::DirectoryPage Namespace::list_inode(const std::string& id,const std::
     for(const auto& key:keys){auto name=key.substr(prefix.size());result.names.push_back(name);result.entries.push_back({name,inode(view,decode_id(view.get(key)))});}
     return result;
 }
+InodeInfo Namespace::create_child(const std::string& parent_id,const std::string& name,bool directory,uint32_t mode) {
+    if(revision_)throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");
+    if(mode>0777)throw std::system_error(EINVAL,std::generic_category(),"unsupported mode bits");
+    InodeInfo created;
+    update([&](const NamespaceView& view,Changes& changes){
+        auto p=inode_parent(view,parent_id,name);
+        if(view.contains(p.key))throw std::system_error(EEXIST,std::generic_category(),"entry already exists");
+        auto id=new_id(view);created={id,directory,mode,directory?2u:1u,0,now(),now()};auto pn=inode(view,p.id);
+        if(directory){need(pn.links<UINT64_MAX,"directory link count exhausted");++pn.links;}touch(pn);
+        changes[p.key]=id_bytes(id);changes[inode_key(id)]=encode(created);changes[inode_key(p.id)]=encode(pn);changes[allocated_key(id)]=Bytes{};
+        if(!directory)changes[content_key(id)]=Bytes{};
+    });return created;
+}
+void Namespace::remove_child(const std::string& parent_id,const std::string& name,const std::string& expected,bool directory) {
+    if(revision_)throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");
+    if(!valid_id(expected))throw std::system_error(EINVAL,std::generic_category(),"invalid expected inode");
+    update([&](const NamespaceView& view,Changes& changes){auto p=inode_parent(view,parent_id,name);
+        if(!view.contains(p.key))throw std::system_error(ENOENT,std::generic_category(),"entry missing");
+        if(decode_id(view.get(p.key))!=expected)throw std::system_error(ESTALE,std::generic_category(),"entry identity changed");
+        auto n=inode(view,expected);
+        if(n.directory!=directory)throw std::system_error(n.directory?EISDIR:ENOTDIR,std::generic_category(),"wrong removal type");
+        if(directory && !view.page(directory_prefix(expected),"",1).empty())throw std::system_error(ENOTEMPTY,std::generic_category(),"directory not empty");
+        remove_entry(view,changes,p.id,p.name,directory);
+    });
+}
+void Namespace::rename_child(const std::string& source_parent,const std::string& source_name,
+    const std::string& destination_parent,const std::string& destination_name,const std::string& expected_source,
+    const std::optional<std::string>& expected_target) {
+    if(revision_)throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");
+    if(!valid_id(expected_source) || (expected_target && !valid_id(*expected_target)))throw std::system_error(EINVAL,std::generic_category(),"invalid expected inode");
+    update([&](const NamespaceView& view,Changes& changes){auto src=inode_parent(view,source_parent,source_name),dst=inode_parent(view,destination_parent,destination_name);
+        if(!view.contains(src.key))throw std::system_error(ENOENT,std::generic_category(),"source missing");
+        if(decode_id(view.get(src.key))!=expected_source)throw std::system_error(ESTALE,std::generic_category(),"source identity changed");
+        if(src.key==dst.key)return;
+        if(view.contains(dst.key)) {
+            if(!expected_target || decode_id(view.get(dst.key))!=*expected_target)throw std::system_error(ESTALE,std::generic_category(),"target identity changed");
+            auto source=inode(view,expected_source),target=inode(view,*expected_target);
+            if(source.directory!=target.directory)throw std::system_error(target.directory?EISDIR:ENOTDIR,std::generic_category(),"rename types differ");
+            if(target.directory && !view.page(directory_prefix(target.id),"",1).empty())throw std::system_error(ENOTEMPTY,std::generic_category(),"target directory not empty");
+        }else if(expected_target)throw std::system_error(ESTALE,std::generic_category(),"target disappeared");
+        if(inode(view,expected_source).directory && source_parent!=destination_parent && directory_contains(view,expected_source,destination_parent))
+            throw std::system_error(EINVAL,std::generic_category(),"cannot move directory into itself");
+        rename_entry(view,changes,source_parent,source_name,destination_parent,destination_name);
+    });
+}
 void Namespace::initialize() {
     need(view_=="main" && !revision_,"fs-init initializes main only");
     update([](const NamespaceView& j,Changes& changes) {
@@ -535,21 +604,32 @@ void Namespace::retire(const NamespaceView& j,Changes& c,const InodeInfo& n) {
 }
 void Namespace::remove(const std::string& path,bool directory) {
     update([&](const NamespaceView& j,Changes& c) {
-        auto p=parent(j,path);need(j.contains(p.key),"path not found");auto id=decode_id(j.get(p.key));auto n=inode(j,id),pn=inode(j,p.id);
+        auto p=parent(j,path);remove_entry(j,c,p.id,p.name,directory);
+    });
+}
+void Namespace::remove_entry(const NamespaceView& j,Changes& c,const std::string& parent_id,const std::string& name,bool directory) {
+        Parent p{parent_id,name,entry_key(parent_id,name)};need(j.contains(p.key),"path not found");auto id=decode_id(j.get(p.key));auto n=inode(j,id),pn=inode(j,p.id);
         need(n.directory==directory,"wrong removal operation for inode type");
         if(directory){need(j.keys(directory_prefix(id)).empty(),"directory is not empty");--pn.links;}
         c[p.key]=std::nullopt;
         if(directory || n.links==1)retire(j,c,n);
         else {--n.links;n.changed_ns=now();c[inode_key(id)]=encode(n);}
         touch(pn);c[inode_key(p.id)]=encode(pn);
-    });
+
 }
+
 void Namespace::rename(const std::string& source,const std::string& target) {
     update([&](const NamespaceView& j,Changes& c) {
-        auto src=parent(j,source);need(j.contains(src.key),"source not found");auto id=decode_id(j.get(src.key));auto n=inode(j,id);
-        std::vector<std::string> ancestry;auto dst=parent(j,target,&ancestry);
+        auto src=parent(j,source);need(j.contains(src.key),"source not found");std::vector<std::string> ancestry;auto dst=parent(j,target,&ancestry);
+        rename_entry(j,c,src.id,src.name,dst.id,dst.name,&ancestry);
+    });
+}
+void Namespace::rename_entry(const NamespaceView& j,Changes& c,const std::string& source_parent,const std::string& source_name,
+    const std::string& destination_parent,const std::string& destination_name,const std::vector<std::string>* ancestry) {
+        Parent src{source_parent,source_name,entry_key(source_parent,source_name)};need(j.contains(src.key),"source not found");auto id=decode_id(j.get(src.key));auto n=inode(j,id);
+        Parent dst{destination_parent,destination_name,entry_key(destination_parent,destination_name)};
         if(src.key==dst.key)return;
-        if(n.directory)need(std::find(ancestry.begin(),ancestry.end(),id)==ancestry.end(),"cannot move directory into itself");
+        if(n.directory && ancestry)need(std::find(ancestry->begin(),ancestry->end(),id)==ancestry->end(),"cannot move directory into itself");
         std::map<std::string,InodeInfo> parents;parents.emplace(src.id,inode(j,src.id));parents.emplace(dst.id,inode(j,dst.id));
         if(j.contains(dst.key)) {
             auto replaced=decode_id(j.get(dst.key));if(replaced==id)return;
@@ -561,8 +641,9 @@ void Namespace::rename(const std::string& source,const std::string& target) {
         if(n.directory && src.id!=dst.id){--parents.at(src.id).links;need(parents.at(dst.id).links<UINT64_MAX,"directory link count exhausted");++parents.at(dst.id).links;}
         c[src.key]=std::nullopt;c[dst.key]=id_bytes(id);n.changed_ns=now();c[inode_key(id)]=encode(n);
         for(auto& [parent_id,pn]:parents){touch(pn);c[inode_key(parent_id)]=encode(pn);}
-    });
+
 }
+
 void Namespace::verify() const {
     std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);
     if(journal.is_leveldb())(void)j.references(); // Validate the full CoW tree before namespace traversal.

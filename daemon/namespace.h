@@ -46,6 +46,13 @@ public:
     std::string open_inode(const std::string& inode_id,Access access,const OpenOptions& options);
     std::string readlink_inode(const std::string& inode_id) const;
     DirectoryPage list_inode(const std::string& inode_id,const std::string& after,size_t limit) const;
+    InodeInfo create_child(const std::string& parent_inode,const std::string& name,bool directory,uint32_t mode);
+    void remove_child(const std::string& parent_inode,const std::string& name,
+                      const std::string& expected_inode,bool directory);
+    void rename_child(const std::string& source_parent,const std::string& source_name,
+                      const std::string& destination_parent,const std::string& destination_name,
+                      const std::string& expected_source,
+                      const std::optional<std::string>& expected_target=std::nullopt);
     void initialize();
     void compact();
     size_t run_count() const;
@@ -92,6 +99,11 @@ private:
     std::vector<unsigned char> read_handle_locked(const Container::OpenHandle& info,uint64_t offset,uint64_t count) const;
     using Changes=std::map<std::string,std::optional<std::vector<unsigned char>>>;
     void retire(const NamespaceView& view,Changes& changes,const InodeInfo& inode);
+    void remove_entry(const NamespaceView& view,Changes& changes,const std::string& parent,
+                      const std::string& name,bool directory);
+    void rename_entry(const NamespaceView& view,Changes& changes,const std::string& source_parent,
+                      const std::string& source_name,const std::string& destination_parent,
+                      const std::string& destination_name,const std::vector<std::string>* ancestry=nullptr);
     void commit_changes(const NamespaceView& view,Changes& changes);
     // Caller holds container_.mutex_; pin and publish create/truncate atomically.
     std::string publish_open(const NamespaceView& view,const std::string& inode_id,

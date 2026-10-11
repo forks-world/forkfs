@@ -190,3 +190,20 @@ operation. Inode opening does not follow symbolic links. After the last director
 link disappears, only existing handles can access the orphan; opening its ID again
 returns ENOENT. Revision handles are read-only. This API is backend groundwork;
 the FSKit adapter still exposes only immutable revision reads.
+
+Native frontends can also create entries with `create_child(parent, name, directory,
+mode)`, and remove or rename entries by parent inode and name. Removal requires
+an expected inode ID. Rename requires an expected source ID and either an expected
+overwritten target ID or an absent target (the default). Identity comparisons and
+mutation occur within one namespace update, so a stale FSKit item cannot delete
+or overwrite a different file which has taken its name. Path and inode operations
+share retirement, replacement and directory-link accounting. Existing handles to
+an overwritten or unlinked regular file remain valid until closed.
+
+Directory-cycle prevention for inode rename currently scans the moved directory's
+subtree in pages of 128 entries; the format has no directory-parent index. Regular
+file rename and same-parent directory rename avoid that scan. A parent index is
+needed before claiming efficient cross-directory moves of large trees. Names and
+modes retain the prototype's printable-ASCII and 0777 restrictions. Symlink and
+hardlink creation by inode, richer attributes and writable FSKit callbacks remain
+outstanding.
