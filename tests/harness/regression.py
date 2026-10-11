@@ -489,6 +489,65 @@ def revision_failures(f):
         raise AssertionError('failed revision operation changed history')
 
 
+def revision_restore(f):
+    baseline(f)
+    original = tree_signature(f, ('revision', 'base'))
+    f.write('/dir/a', b'changed')
+    f.call('fs-rename', '/dir', '/moved')
+    f.write('/extra', b'new')
+    f.call('fs-snapshot', 'r2')
+    later = tree_signature(f, ('revision', 'r2'))
+    f.call('fs-restore', 'missing', error='object root not found')
+    if tree_signature(f) != later:
+        raise AssertionError('failed restore changed live tree')
+    f.call('fs-restore', 'base')
+    if tree_signature(f) != original or tree_signature(f, ('revision', 'r2')) != later:
+        raise AssertionError('restore did not preserve complete historical trees')
+    f.write('/dir/a', b'after')
+    f.read('/alias', b'after')
+    f.read('/alias', b'base', ('revision', 'base'))
+    f.call('fs-restore', 'r2', view=('world', 'work'))
+    if tree_signature(f, ('world', 'work')) != later:
+        raise AssertionError('selected World restore chose the wrong tree')
+    f.read('/alias', b'after')
+
+
+def revision_revocation(f):
+    baseline(f)
+    f.start_service()
+    session = json.loads(f.call('session-open', 60000))['session']
+    other_session = json.loads(f.call('session-open', 60000))['session']
+    def call(op, *args, view=None, error=False, owner=session):
+        return f.call(op, *args, '--session', owner, view=view, error=error)
+    live = json.loads(call('fs-open', '/dir/a', 'rw'))['handle']
+    duplicate = json.loads(call('fs-dup', live))['handle']
+    second = json.loads(call('fs-open', '/alias', 'r', owner=other_session))['handle']
+    old_dir = json.loads(call('fs-dir-open', '/dir'))['cursor']
+    historical = json.loads(call('fs-open', '/dir/a', 'r', view=('revision', 'base')))['handle']
+    work = json.loads(call('fs-open', '/dir/a', 'rw', view=('world', 'work')))['handle']
+    if not json.loads(call('fs-hlock', live, 'exclusive'))['granted']:
+        raise AssertionError('initial lock denied')
+    f.call('fs-unlink', '/alias')
+    f.call('fs-unlink', '/dir/a')  # All live handles now retain an orphan.
+    f.call('fs-restore', 'base')
+    for token, owner in [(live, session), (duplicate, session), (second, other_session)]:
+        call('fs-hread', token, 0, 4, owner=owner, error='handle belongs to another session')
+    payload = f.root / 'stale-write.bin'
+    payload.write_bytes(b'bad')
+    call('fs-hwrite', live, 0, payload, error='handle belongs to another session')
+    call('fs-dir-page', old_dir, 1, error='invalid directory cursor/session')
+    call('fs-dir-rewind', old_dir, error='invalid directory cursor/session')
+    for token, view in [(historical, ('revision', 'base')), (work, ('world', 'work'))]:
+        if call('fs-hread', token, 0, 4, view=view) != b'base':
+            raise AssertionError('restore revoked an unrelated view')
+    fresh = json.loads(call('fs-open', '/dir/a', 'rw'))['handle']
+    if not json.loads(call('fs-hlock', fresh, 'exclusive'))['granted']:
+        raise AssertionError('revoked lock survived restore')
+    f.read('/alias', b'base')
+    f.call('session-close', session)
+    f.call('session-close', other_session)
+
+
 def revision_compaction(f):
     baseline(f)
     f.write('/dir/a', b'two')
@@ -496,11 +555,15 @@ def revision_compaction(f):
     expected = {name: tree_signature(f, ('revision', name)) for name in ['base', 'r2']}
     f.start_service()
     f.call('fs-compact')
+    f.call('fs-restore', 'base')
     f.close()
     f.process = None
     f.endpoint = None
     f.service_logs = []
     f.start_service()
+    if tree_signature(f) != expected['base']:
+        raise AssertionError('restored tree did not survive service restart')
+    f.write('/dir/a', b'after-restart')
     for name, signature in expected.items():
         if tree_signature(f, ('revision', name)) != signature:
             raise AssertionError('compaction/service restart changed history')
@@ -518,6 +581,7 @@ CASES = [('basic-fs', 'FS001', initialization), ('basic-fs', 'FS002', directorie
          ('fork', 'FK006', fork_failures), ('fork', 'FK007', fork_compaction),
          ('revision', 'RV001', revision_history), ('revision', 'RV002', revision_forks),
          ('revision', 'RV003', revision_readonly), ('revision', 'RV004', revision_failures),
+         ('revision', 'RV005', revision_restore), ('revision', 'RV006', revision_revocation),
          ('revision', 'RV007', revision_compaction)]
 
 
@@ -564,8 +628,7 @@ def main():
             result.update(status='fail', error=str(error))
             (root / 'failure.txt').write_text(traceback.format_exc())
         results.append(result)
-    report = {'schema': 1, 'results': results, 'unimplemented': ['RV005-restore', 'RV006-generation-revocation', 'RV007-restore-after-restart',
-              'mounted'], 'artifacts': str(output)}
+    report = {'schema': 1, 'results': results, 'unimplemented': ['mounted', 'mount-generation-revocation', 'physical-cow-sharing', 'complete-posix-matrix'], 'artifacts': str(output)}
     if any(r['status'] == 'fail' for r in results):
         report['status'] = 'fail'
     else:

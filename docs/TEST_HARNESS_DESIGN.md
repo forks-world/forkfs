@@ -1,9 +1,9 @@
 # forkfs 测试 harness 设计
 
 状态：整体设计。已实现 [CLI/RPC 固定回归 runner](../tests/harness/README.md)，
-提供 FS001–FS011、FK001–FK007、RV001–RV004 和 RV007 历史读取场景。
-RV005/RV006、RV007 恢复部分、完整验收矩阵、统一参考模型、挂载适配和 trace replay
-尚未实现；固定场景通过不能代表物理 CoW 共享或性能验收通过。
+提供 FS001–FS011、FK001–FK007、RV001–RV007 的 CLI/RPC 场景。
+[restore 与服务访问撤销](RESTORE_DESIGN.md) 已实现；完整验收矩阵、统一参考模型、
+挂载适配和 trace replay 尚未实现；固定场景通过不能代表物理 CoW 共享或性能验收通过。
 适用基线：已合并的元数据、Namespace、CLI/RPC 和实验性只读 FSKit 实现。
 当前 CTest、模型测试和进程崩溃测试继续保留，不能将设计中的能力计为已完成。
 
@@ -140,11 +140,10 @@ POSIX profile 必须得到真实规范 errno。不能用宽泛“抛了异常就
 | RV006 | restore 的旧句柄/目录 cursor/挂载代次 | 按明确契约撤销旧访问；不能经旧引用修改恢复后的 World |
 | RV007 | compaction、服务重启后读历史与恢复 | 所有保留 revision 可读；恢复结果和重新打开结果一致 |
 
-RV005/RV006 需要先定义并实现 restore、写回屏障和访问代次契约，当前属于待实现能力。
-基础 revision 套件必须展示这两项缺失，不能静默跳过或用创建新 World 代替。
-第一批可运行回归先覆盖 RV001–RV004/RV007 的历史读取部分；完整 revision/发布
-验收在 restore 和撤销未实现时必须失败。进程中断后的 restore 原子性由后续 crash
-profile 增强，不降低固定 case 的完整树一致性判据。
+RV005/RV006 和 RV007 的服务恢复部分已实现，契约见 [restore 设计](RESTORE_DESIGN.md)。
+真实挂载代次撤销、内核缓存和写回屏障仍待实现，完整挂载/发布验收必须报告缺失并失败。
+专用 crash 回归验证本地事务提交前后中断时的 restore 原子性，不降低固定 case
+的完整树一致性判据。
 
 ### 统一入口与 CI
 
@@ -296,9 +295,9 @@ harness 的资源隔离不替代 PR 执行隔离；平台挂载所需权限必�
 
 1. **固定基础 regression + 最小 runner**：按 basic-fs、fork、revision 三套稳定
    case 实现资源管理、明确断言和结构化结果，复用现有 metadata/RPC 接口。
-   不先开发复杂随机缩减框架；保留现有有效回归。restore/代次缺失单列。
-2. **完整 revision 回退验收**：定义并实现 restore 和撤销契约，落实 RV005/RV006。
-   基础历史读取通过与完整回退通过分别报告。
+   已提供 25 个 CLI/RPC 场景；保留现有有效回归，挂载与代次屏障缺失单列。
+2. **revision 回退验收**：CLI/RPC restore、访问撤销及提交前后 crash 回归已实现。
+   挂载缓存/写回屏障仍待实现，不能将服务回退通过当成完整挂载回退通过。
 3. **共享 trace/model 和故障/并发控制**：增加 replay、固定随机生成、小型历史
    检查、确认边界与失败缩减，复用基础场景的操作契约。
 4. **真实挂载 adapter**：完成安装/授权/身份预检后，使用同一套 basic-fs/fork/revision
