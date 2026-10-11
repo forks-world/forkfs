@@ -27,6 +27,10 @@ with tempfile.TemporaryDirectory(prefix='ff-control-', dir='/tmp') as temp:
     payload.write_bytes(original)
     call('write', '/dir/a', str(payload))
     assert call('read', '/dir/a') == original
+    for selector in ['--branch', '--revision']:
+        result = subprocess.run(prefix + ['--repo', str(repository), selector, '', 'unlink', '/dir/a'], capture_output=True, timeout=40)
+        assert result.returncode == 2 and b'selectors must not be empty' in result.stderr, result.stderr
+        assert call('read', '/dir/a') == original
     call('snapshot', 'base')
     call('fork', 'base', 'child')
     payload.write_bytes(b'child')
@@ -44,6 +48,12 @@ with tempfile.TemporaryDirectory(prefix='ff-control-', dir='/tmp') as temp:
     assert call('read', '/dir/a', revision='base') == original
     call('init', expected=1)  # No overwrite of an existing repository.
     call('check')
+    shared = root / 'shared-runtime'
+    shared.mkdir(mode=0o755)
+    shared.chmod(0o755)
+    rejected = subprocess.run(prefix + ['--repo', str(repository), 'serve', '--listen', str(shared / 'control.sock')], capture_output=True, timeout=10)
+    assert rejected.returncode == 1 and b'socket parent must be a private directory' in rejected.stderr, rejected.stderr
+    assert not (shared / 'control.sock').exists()
     proc = subprocess.Popen(prefix + ['--repo', str(repository), 'serve', '--listen', str(endpoint)],
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:

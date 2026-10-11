@@ -33,6 +33,16 @@ class ControlTests(unittest.TestCase):
             find.assert_not_called()
             run.assert_not_called()
 
+    def test_empty_selectors_rejected_before_execution(self):
+        for selector in ['--branch', '--revision']:
+            with self.subTest(selector=selector), patch.object(control.shutil, 'which') as find, patch.object(control.subprocess, 'run') as run, patch.object(control.os, 'execv') as execute, contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    control.main(['--repo', '/tmp/store', selector, '', 'unlink', '/a'])
+                self.assertEqual(error.exception.code, 2)
+                find.assert_not_called()
+                run.assert_not_called()
+                execute.assert_not_called()
+
     def test_invalid_selector_rejected_before_execution(self):
         with patch.object(control.shutil, 'which') as find, contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as error:

@@ -45,12 +45,14 @@ def parser():
 def main(argv=None):
     command_parser = parser()
     args = command_parser.parse_args(argv)
+    if args.branch == '' or args.revision == '':
+        command_parser.error('branch and revision selectors must not be empty')
     if args.command in ['mount', 'unmount']:
         print('forkfs: native mount control is not implemented; no mount or directory was changed', file=sys.stderr)
         return 3
-    if args.command in ['init', 'serve'] and (args.socket or args.branch or args.revision):
+    if args.command in ['init', 'serve'] and (args.socket is not None or args.branch is not None or args.revision is not None):
         command_parser.error(f'{args.command} requires --repo without a view selector')
-    if args.command in ['status', 'branches', 'revisions', 'fork'] and (args.branch or args.revision):
+    if args.command in ['status', 'branches', 'revisions', 'fork'] and (args.branch is not None or args.revision is not None):
         command_parser.error(f'{args.command} does not accept a view selector')
     binary = shutil.which(args.binary)
     if not binary:
@@ -82,9 +84,9 @@ def main(argv=None):
             arguments.append(args.name)
         if args.command == 'fork':
             arguments += [args.revision_name, args.branch_name]
-        if args.branch:
+        if args.branch is not None:
             arguments += ['--world', args.branch]
-        elif args.revision:
+        elif args.revision is not None:
             arguments += ['--revision', args.revision]
         prefix = ([binary, 'request', str(args.socket.resolve()), operation] if args.socket
                   else [binary, operation, str(args.repo.resolve())])

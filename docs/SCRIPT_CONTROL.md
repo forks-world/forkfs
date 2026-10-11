@@ -32,16 +32,19 @@ fork、restore、read、write、list、stat、mkdir、rename、unlink、rmdir。
 ## 常驻 RPC
 
 ```sh
-python3 scripts/forkfs.py --binary build/forkfsd/daemon/forkfsd --repo project.forkfs serve --listen /tmp/forkfs-control.sock
+python3 -c "from pathlib import Path; Path('runtime').mkdir(mode=0o700)"
+python3 scripts/forkfs.py --binary build/forkfsd/daemon/forkfsd --repo project.forkfs serve --listen runtime/control.sock
 ```
 
 服务在前台运行，Ctrl-C 停止。脚本 exec 替换为 forkfsd，不创建后台守护子进程、
-PID 文件或第二套信号管理。socket 父目录必须已存在。另一个终端使用：
+PID 文件或第二套信号管理。socket 父目录必须已存在、属于当前用户且禁止 group/others 访问（例如 0700）。
+公共 `/tmp` 不能直接作为父目录。上面的创建命令不覆盖或修改已有目录；已有
+runtime 目录也必须满足权限要求。另一个终端从相同工作目录使用：
 
 ```sh
-python3 scripts/forkfs.py --binary build/forkfsd/daemon/forkfsd --socket /tmp/forkfs-control.sock status
-python3 scripts/forkfs.py --binary build/forkfsd/daemon/forkfsd --socket /tmp/forkfs-control.sock --branch work list /src
-python3 scripts/forkfs.py --binary build/forkfsd/daemon/forkfsd --socket /tmp/forkfs-control.sock snapshot later
+python3 scripts/forkfs.py --binary build/forkfsd/daemon/forkfsd --socket runtime/control.sock status
+python3 scripts/forkfs.py --binary build/forkfsd/daemon/forkfsd --socket runtime/control.sock --branch work list /src
+python3 scripts/forkfs.py --binary build/forkfsd/daemon/forkfsd --socket runtime/control.sock snapshot later
 ```
 
 有限命令超时 30 秒，超时返回 124；确认丢失时应重新查询状态，不能推断事务必然
