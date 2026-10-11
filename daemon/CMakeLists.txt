@@ -99,3 +99,10 @@ endforeach()
 set_tests_properties(forkfsd_metadata_manager forkfsd_metadata_view forkfsd_metadata_tree
     forkfsd_revision_preview forkfsd_transaction forkfsd_lock_granularity
     forkfsd_file_io_crash forkfsd_handles_crash PROPERTIES LABELS metadata-regression)
+
+add_test(NAME forkfsd_basic_harness COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/harness/regression.py --binary $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_basic_harness PROPERTIES TIMEOUT 120 LABELS metadata-regression)
+add_test(NAME forkfsd_harness_runner COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/harness/test_runner.py)
+set_tests_properties(forkfsd_harness_runner PROPERTIES TIMEOUT 30 LABELS metadata-regression)
