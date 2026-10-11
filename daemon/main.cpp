@@ -1,3 +1,7 @@
+#include "fault_injection.h"
+#ifdef FORKFS_TEST_FAULTS
+#include "compaction.h"
+#endif
 #include "container.h"
 #include "namespace.h"
 #include "rpc.h"
@@ -135,6 +139,9 @@ void serve(forkfs::Container& container, const std::string& path,bool rpc=false)
 }
 int main(int argc, char** argv) {
     try {
+#ifdef FORKFS_TEST_FAULTS
+        forkfs::faults::validate();
+#endif
         if (argc == 2 && std::string(argv[1]) == "--help") {
             std::cout << "forkfsd init REPOSITORY_DIRECTORY\nforkfsd check CONTAINER\n"
                          "forkfsd serve CONTAINER --socket PATH [--rpc]\n"
@@ -250,7 +257,17 @@ int main(int argc, char** argv) {
             const auto value = container.get(argv[3]);
             std::cout.write(reinterpret_cast<const char*>(value.data()),value.size());
             if (!std::cout) throw std::runtime_error("cannot write object output");
-        } else if (command.starts_with("fs-")) {
+        }
+#ifdef FORKFS_TEST_FAULTS
+        else if(command=="test-compact-staged" && argc==3) {
+            forkfs::Container container(argv[2]);forkfs::Compaction task(container,"main");task.prepare();task.build();
+            for(;;){auto result=task.stage_next();if(result==forkfs::Compaction::StageResult::Ready)break;
+                if(result==forkfs::Compaction::StageResult::Stale)throw std::runtime_error("test compaction became stale");}
+            if(!task.install())throw std::runtime_error("test compaction publish became stale");
+            std::cout<<container.status();
+        }
+#endif
+        else if (command.starts_with("fs-")) {
             forkfs::Container container(argv[2]);forkfs::Namespace fs(container,view,revision_view);
             if(command=="fs-compact" && argc==3) fs.compact();
             else if(command=="fs-layout" && argc==3) {

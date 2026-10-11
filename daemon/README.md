@@ -177,3 +177,10 @@ Use [scripts/forkfs.py](../scripts/forkfs.py) for repository, foreground RPC ser
 file, snapshot, branch and restore operations without the legacy world executable.
 See [the script guide](../docs/SCRIPT_CONTROL.md) for complete examples. Native
 mount/unmount deliberately report unavailable until FSKit mount control is ready.
+
+### Deterministic storage faults
+
+The dedicated fault executable supports counted crash/EIO/ENOSPC injection at
+transaction WAL and publication boundaries; production forkfsd ignores these
+controls. [Fault injection guide](../docs/FAULT_INJECTION.md) documents the isolated
+Python runner, recovery assertions, evidence and remaining release gates.
