@@ -47,8 +47,10 @@ python3 scripts/forkfs.py --binary build/forkfsd/daemon/forkfsd --socket runtime
 python3 scripts/forkfs.py --binary build/forkfsd/daemon/forkfsd --socket runtime/control.sock snapshot later
 ```
 
-有限命令超时 30 秒，超时返回 124；确认丢失时应重新查询状态，不能推断事务必然
-未提交。daemon 拒绝或崩溃均返回非零，stdout/stderr 直接保留。
+有限命令的进程上限为 30 秒；RPC 客户端另有 10 秒请求期限。两种超时均返回
+124；确认丢失时应重新查询状态，不能推断事务必然未提交。daemon 拒绝或崩溃
+均返回非零。stdout 原样输出；RPC stderr 暂存到命令结束后输出，其他命令直接
+保留 stderr。
 
 ## 挂载边界与验证
 

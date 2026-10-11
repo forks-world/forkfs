@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
 
 def parser():
@@ -90,6 +91,19 @@ def main(argv=None):
             arguments += ['--revision', args.revision]
         prefix = ([binary, 'request', str(args.socket.resolve()), operation] if args.socket
                   else [binary, operation, str(args.repo.resolve())])
+        if args.socket:
+            # Keep stdout binary-clean; replay diagnostics even on the outer timeout.
+            with tempfile.TemporaryFile() as diagnostics:
+                try:
+                    result = subprocess.run(prefix + arguments, stderr=diagnostics, timeout=30)
+                finally:
+                    diagnostics.seek(0)
+                    message = diagnostics.read()
+                    sys.stderr.write(message.decode(errors='replace'))
+                if result.returncode == 1 and message == b'forkfsd: RPC timeout\n':
+                    print('forkfs: command timed out; its commit outcome may need to be checked', file=sys.stderr)
+                    return 124
+                return exit_code(result.returncode)
         return exit_code(subprocess.run(prefix + arguments, timeout=30).returncode)
     except subprocess.TimeoutExpired:
         print('forkfs: command timed out; its commit outcome may need to be checked', file=sys.stderr)

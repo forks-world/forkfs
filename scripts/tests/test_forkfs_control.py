@@ -23,6 +23,30 @@ class ControlTests(unittest.TestCase):
         with patch.object(control.shutil, 'which', return_value=sys.executable), patch.object(control.subprocess, 'run', side_effect=subprocess.TimeoutExpired([], 30)), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(control.main(['--repo', '/tmp/store', 'check']), 124)
 
+    def test_rpc_timeout_is_distinct_from_ordinary_errors(self):
+        for code, message, expected in [(1, b'forkfsd: RPC timeout\n', 124),
+                                        (1, b'forkfsd: RPC connect failed\n', 1),
+                                        (1, b'other: RPC timeout\n', 1),
+                                        (2, b'forkfsd: RPC timeout\n', 2)]:
+            def run(*args, **kwargs):
+                kwargs['stderr'].write(message)
+                return subprocess.CompletedProcess([], code)
+            output = io.StringIO()
+            with self.subTest(code=code, message=message), patch.object(control.shutil, 'which', return_value=sys.executable), patch.object(control.subprocess, 'run', side_effect=run), contextlib.redirect_stderr(output):
+                self.assertEqual(control.main(['--socket', '/tmp/control.sock', 'check']), expected)
+            self.assertTrue(output.getvalue().startswith(message.decode()))
+            self.assertEqual('commit outcome' in output.getvalue(), expected == 124)
+
+    def test_rpc_outer_timeout_preserves_diagnostics(self):
+        def run(*args, **kwargs):
+            kwargs['stderr'].write(b'partial diagnostic\n')
+            raise subprocess.TimeoutExpired([], 30)
+        output = io.StringIO()
+        with patch.object(control.shutil, 'which', return_value=sys.executable), patch.object(control.subprocess, 'run', side_effect=run), contextlib.redirect_stderr(output):
+            self.assertEqual(control.main(['--socket', '/tmp/control.sock', 'check']), 124)
+        self.assertTrue(output.getvalue().startswith('partial diagnostic\n'))
+        self.assertIn('commit outcome', output.getvalue())
+
     def test_crash_is_nonzero(self):
         with patch.object(control.shutil, 'which', return_value=sys.executable), patch.object(control.subprocess, 'run', return_value=subprocess.CompletedProcess([], -9)):
             self.assertEqual(control.main(['--repo', '/tmp/store', 'check']), 137)

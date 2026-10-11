@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 import socket
 import subprocess
+import struct
+import threading
 import sys
 import tempfile
 import time
@@ -86,4 +88,40 @@ with tempfile.TemporaryDirectory(prefix='ff-control-', dir='/tmp') as temp:
             proc.wait(timeout=5)
         proc.communicate(timeout=5)
     assert call('read', '/dir/a') == original
+    # A real RPC client must classify its own 10-second deadline as timeout.
+    stalled_endpoint = root / 'stalled.sock'
+    received, errors = [], []
+    with socket.socket(socket.AF_UNIX) as listener:
+        listener.bind(str(stalled_endpoint))
+        listener.listen(1)
+        listener.settimeout(15)
+        def stall():
+            try:
+                with listener.accept()[0] as connection:
+                    connection.settimeout(15)
+                    def exact(count):
+                        data = b''
+                        while len(data) < count:
+                            chunk = connection.recv(count - len(data))
+                            assert chunk, 'request truncated'
+                            data += chunk
+                        return data
+                    header = exact(12)
+                    assert header[:8] == b'FFRPC001', header
+                    size = struct.unpack('<I', header[8:])[0]
+                    assert size <= 1024, size
+                    received.append(exact(size))
+                    assert connection.recv(1) == b'', 'client did not close after timeout'
+            except Exception as error:
+                errors.append(error)
+        server = threading.Thread(target=stall, daemon=True)
+        server.start()
+        try:
+            result = subprocess.run(prefix + ['--socket', str(stalled_endpoint), 'status'], capture_output=True, timeout=20)
+            assert result.returncode == 124, (result.returncode, result.stderr)
+            assert b'forkfsd: RPC timeout\n' in result.stderr, result.stderr
+            assert b'commit outcome' in result.stderr, result.stderr
+        finally:
+            server.join(timeout=16)
+        assert not server.is_alive() and received and not errors, errors
 print('standalone CLI/RPC control, branch isolation, restore and unavailable mount passed')
