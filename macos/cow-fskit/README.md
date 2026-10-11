@@ -1,7 +1,11 @@
 # Experimental CoW revision FSKit adapter
 
-Build on macOS with `-DWFS_BUILD_LEGACY=OFF -DWFS_COW_FSKIT=ON` and run
+Build with a macOS 26+ SDK and runtime, with `-DWFS_BUILD_LEGACY=OFF -DWFS_COW_FSKIT=ON` and run
 `ctest --test-dir build/namespace-view -R 'forkfsd_(fskit_callbacks|inode_frontend)' --output-on-failure`.
+
+The optional build defaults its deployment target to 26.0 and rejects explicit
+older targets because the path-resource loader uses FSKit V2. This matches the
+host and extension plist minimum versions.
 The optional target links FSKit directly to `forkfs_namespace`; it performs no
 host-file passthrough and no per-operation RPC. The volume owns a shared
 Container and selects a named immutable revision. A live World is not accepted.
@@ -24,14 +28,15 @@ include the parent item ID; hardlinked regular files do not claim a unique paren
 
 The revision namespace currently stores no extended attributes. Xattr listing
 returns an empty array, queries (including com.apple.provenance) return ENOATTR,
-and all set/delete policies return EROFS. The adapter conforms to the general
+and all set/delete policies return EROFS. The pathconf maximum xattr size is zero. The adapter conforms to the general
 xattr protocol and intentionally omits the limited-name hook. These callbacks
 never inspect backing-file xattrs. Revocation takes precedence over item/cookie
 validation and read-only errors for requests against revoked volumes (ENOTCONN).
 Item types are cached from the immutable revision, so argument/type validation
 does not add extra metadata-tree lookups.
-Metadata CI enables the optional adapter on macOS and includes callback and
-unsigned-bundle regressions in the metadata-regression label.
+Metadata CI retains macOS 15 and Linux core coverage with the adapter disabled,
+and adds macOS 26 with `configure_metadata.py --fskit on`. Callback and unsigned-
+bundle regressions are included in the metadata-regression label on that job.
 Kernel-managed read buffers
 and directory packing have not been tested end to end.
 

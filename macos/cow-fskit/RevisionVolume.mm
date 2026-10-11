@@ -49,6 +49,7 @@ static FSItemType kind(const forkfs::InodeInfo& n){return n.directory?FSItemType
 }
 - (NSInteger)maximumLinkCount {return NSIntegerMax;}
 - (NSInteger)maximumNameLength {return 255;}
+- (NSInteger)maximumXattrSize {return 0;} // No xattrs are stored by this revision format.
 - (BOOL)restrictsOwnershipChanges {return YES;}
 - (BOOL)truncatesLongNames {return NO;}
 - (void)enumerateDirectory:(FSItem *)directory startingAtCookie:(FSDirectoryCookie)cookie verifier:(FSDirectoryVerifier)verifier

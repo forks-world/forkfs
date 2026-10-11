@@ -49,6 +49,7 @@ int main(){@autoreleasepool {
         std::filesystem::remove(marker);
         NSError *error=nil;auto volume=[[ForkRevisionVolume alloc] initWithStore:store revision:@"base" error:&error];check(volume && !error);
         FSItem *root=volume.rootItem;check(root);
+        check([volume respondsToSelector:@selector(maximumXattrSize)] && volume.maximumXattrSize==0);
         __block FSItem *a=nil,*b=nil,*link=nil;
         [volume lookupItemNamed:[FSFileName nameWithString:@"a"] inDirectory:root replyHandler:^(FSItem *item,FSFileName *name,NSError *e){check(!e);a=item;}];
         [volume lookupItemNamed:[FSFileName nameWithString:@"b"] inDirectory:root replyHandler:^(FSItem *item,FSFileName *name,NSError *e){check(!e);b=item;}];check(a && a==b);
