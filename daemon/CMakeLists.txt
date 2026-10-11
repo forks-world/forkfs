@@ -46,7 +46,7 @@ set_tests_properties(forkfsd_metadata_view PROPERTIES TIMEOUT 60)
 add_library(forkfs_namespace STATIC container.cpp namespace.cpp compaction.cpp maintenance.cpp)
 target_link_libraries(forkfs_namespace PUBLIC forkfs_metadata)
 target_compile_options(forkfs_namespace PRIVATE -Wall -Wextra -Wpedantic)
-foreach(suite file_io handles inode_handles inode_entries transaction)
+foreach(suite file_io handles inode_handles inode_entries parent_index transaction)
     add_executable(forkfsd_${suite}_test tests/${suite}.cpp)
     target_link_libraries(forkfsd_${suite}_test PRIVATE forkfs_namespace)
     add_test(NAME forkfsd_${suite} COMMAND forkfsd_${suite}_test)
@@ -97,7 +97,7 @@ foreach(seed 1 173 4294967295)
     set_tests_properties(forkfsd_metadata_manager_seed_${seed} PROPERTIES TIMEOUT 120 LABELS metadata-regression)
 endforeach()
 set_tests_properties(forkfsd_metadata_manager forkfsd_metadata_view forkfsd_metadata_tree
-    forkfsd_revision_preview forkfsd_inode_handles forkfsd_inode_entries forkfsd_transaction forkfsd_lock_granularity
+    forkfsd_revision_preview forkfsd_inode_handles forkfsd_inode_entries forkfsd_parent_index forkfsd_transaction forkfsd_lock_granularity
     forkfsd_file_io_crash forkfsd_handles_crash PROPERTIES LABELS metadata-regression)
 
 add_test(NAME forkfsd_basic_harness COMMAND ${Python3_EXECUTABLE}

@@ -52,6 +52,8 @@ uint64_t now() {
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 std::string inode_key(const std::string& id) {return prefix+"inode/"+id;}
+const std::string parent_index_key=prefix+"parent-index";
+std::string parent_key(const std::string& id) {return prefix+"parent/"+id;}
 std::string allocated_key(const std::string& id) {return prefix+"allocated/"+id;}
 std::string content_key(const std::string& id) {return prefix+"content/"+id;}
 std::string directory_prefix(const std::string& id) {return prefix+"entry/"+id+"/";}
@@ -65,19 +67,49 @@ std::string root(const NamespaceView& journal) {
     need(journal.contains(root_key),"filesystem not initialized; use fs-init");return decode_id(journal.get(root_key));
 }
 InodeInfo decode_inode(const Bytes& b,const std::string& id,bool orphan=false) {
-    need(b.size()==48 && !memcmp(b.data(),"FFINOD01",8),"invalid inode record");
+    need(b.size()==48 && (!memcmp(b.data(),"FFINOD01",8) || !memcmp(b.data(),"FFINOD02",8)),"invalid inode record");
     auto type=load(b.data()+8,4),mode=load(b.data()+12,4);
     need((type==1||type==2||type==3) && mode<=0777,"unsupported inode attributes");
     InodeInfo n{id,type==2,static_cast<uint32_t>(mode),load(b.data()+16,8),load(b.data()+24,8),
-                load(b.data()+32,8),load(b.data()+40,8),type==3};
+                load(b.data()+32,8),load(b.data()+40,8),type==3,!memcmp(b.data(),"FFINOD02",8)};
+    need(!n.indexed_directory || n.directory,"indexed format is only valid for directories");
     need((orphan?(!n.directory && !n.symlink && n.links==0):n.links>0) && (!n.directory || (n.links>=2 && n.size==0)),"invalid inode state");return n;
 }
 InodeInfo inode(const NamespaceView& journal,const std::string& id) {return decode_inode(journal.get(inode_key(id)),id);}
 std::string orphan_prefix(const std::string& world,const std::string& id) {return history+"orphan/"+world+"/"+id+"/";}
 Bytes encode(const InodeInfo& n) {
-    Bytes b(48);memcpy(b.data(),"FFINOD01",8);store(b.data()+8,n.symlink?3:n.directory?2:1,4);
+    Bytes b(48);memcpy(b.data(),n.indexed_directory?"FFINOD02":"FFINOD01",8);store(b.data()+8,n.symlink?3:n.directory?2:1,4);
     store(b.data()+12,n.mode,4);store(b.data()+16,n.links,8);store(b.data()+24,n.size,8);
     store(b.data()+32,n.modified_ns,8);store(b.data()+40,n.changed_ns,8);return b;
+}
+bool indexed_parents(const NamespaceView& view) {
+    if(!view.contains(parent_index_key))return false;
+    auto value=view.get(parent_index_key);need(value==Bytes({'F','F','P','I','D','X','0','1'}),"unsupported directory parent index");
+    need(inode(view,root(view)).indexed_directory,"parent index requires versioned root inode");return true;
+}
+Bytes parent_record(const std::string& parent,const std::string& name) {
+    auto result=id_bytes(parent);result.insert(result.begin(),{'F','F','P','A','R','0','0','1'});result.insert(result.end(),name.begin(),name.end());return result;
+}
+std::string indexed_parent(const NamespaceView& view,const std::string& id) {
+    need(inode(view,id).indexed_directory,"directory parent index requires versioned inode");
+    auto value=view.get(parent_key(id));need(value.size()>=40 && value.size()<=295 && !memcmp(value.data(),"FFPAR001",8),"invalid directory parent record");
+    auto parent=decode_id(Bytes(value.begin()+8,value.begin()+40));std::string name(value.begin()+40,value.end());
+    if(id==root(view)){need(parent==id && name.empty(),"invalid root parent");return parent;}
+    need(!name.empty() && name!="." && name!=".." && std::all_of(name.begin(),name.end(),[](unsigned char c){return c>=32 && c<=126 && c!='/';}),"invalid parent entry name");
+    need(view.contains(inode_key(parent)) && inode(view,parent).directory,"directory parent is missing");
+    auto key=entry_key(parent,name);need(view.contains(key) && decode_id(view.get(key))==id,"directory parent backlink mismatch");return parent;
+}
+std::map<std::string,Bytes> directory_parent_records(const NamespaceView& view) {
+    auto root_id=root(view);std::map<std::string,Bytes> result{{root_id,parent_record(root_id,"")}};std::vector<std::string> pending{root_id};
+    while(!pending.empty()) {
+        auto id=std::move(pending.back());pending.pop_back();need(inode(view,id).directory,"root is not a directory");
+        auto pre=directory_prefix(id);std::string after;
+        for(;;){auto entries=view.page(pre,after,128);if(entries.empty())break;
+            for(const auto& key:entries){auto child=decode_id(view.get(key));if(inode(view,child).directory){
+                need(result.emplace(child,parent_record(id,key.substr(pre.size()))).second,"directory cycle or hardlink");pending.push_back(child);
+            }}after=entries.back();if(entries.size()<128)break;
+        }
+    }return result;
 }
 std::string new_id(const NamespaceView& journal) {
     for(int attempt=0;attempt<8;++attempt) {
@@ -132,9 +164,14 @@ Parent inode_parent(const NamespaceView& view,const std::string& id,const std::s
     if(!inode(view,id).directory)throw std::system_error(ENOTDIR,std::generic_category(),"parent inode is not a directory");
     return {id,name,entry_key(id,name)};
 }
-// No directory-parent index exists in the current format. Walk only directory
-// descendants of the moved inode, in bounded pages, to prevent rename cycles.
+// Indexed views walk destination ancestors; old views retain a paged subtree fallback.
 bool directory_contains(const NamespaceView& view,const std::string& start,const std::string& target) {
+    if(indexed_parents(view)) {
+        auto current=target;std::set<std::string> visited;auto root_id=root(view);
+        for(;;){if(current==start)return true;need(visited.insert(current).second,"directory parent cycle");
+            auto next=indexed_parent(view,current);if(current==root_id)return false;current=std::move(next);
+        }
+    }
     std::vector<std::string> pending{start};std::set<std::string> seen;
     while(!pending.empty()) {
         auto id=std::move(pending.back());pending.pop_back();if(id==target)return true;
@@ -342,6 +379,29 @@ InodeInfo Namespace::root_inode() const {
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);
     return inode(view,root(view));
 }
+bool Namespace::has_parent_index() const {
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);return indexed_parents(view);
+}
+void Namespace::build_parent_index() {
+    if(revision_)throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");
+    update([&](const NamespaceView& view,Changes& changes){
+        if(indexed_parents(view))return;
+        need(view.page(prefix+"parent/","",1).empty(),"unversioned parent records prevent index upgrade");
+        auto records=directory_parent_records(view);
+        need(records.size()<=1024,"parent index upgrade is limited to 1024 directories per atomic transaction");
+        for(const auto& [id,value]:records){changes[parent_key(id)]=value;auto n=inode(view,id);n.indexed_directory=true;changes[inode_key(id)]=encode(n);}
+        changes[parent_index_key]=Bytes{'F','F','P','I','D','X','0','1'};
+    });
+}
+InodeInfo Namespace::parent_inode(const std::string& id) const {
+    if(!valid_id(id))throw std::system_error(EINVAL,std::generic_category(),"invalid directory inode");
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);
+    if(!view.contains(inode_key(id)))throw std::system_error(ENOENT,std::generic_category(),"directory inode missing");
+    if(!inode(view,id).directory)throw std::system_error(ENOTDIR,std::generic_category(),"inode is not a directory");
+    if(indexed_parents(view))return inode(view,indexed_parent(view,id));
+    auto records=directory_parent_records(view);auto found=records.find(id);need(found!=records.end(),"directory is not reachable");
+    return inode(view,decode_id(Bytes(found->second.begin()+8,found->second.begin()+40)));
+}
 InodeInfo Namespace::stat_inode(const std::string& id) const {
     need(valid_id(id),"invalid inode identity");
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);return inode(view,id);
@@ -386,10 +446,11 @@ InodeInfo Namespace::create_child(const std::string& parent_id,const std::string
     update([&](const NamespaceView& view,Changes& changes){
         auto p=inode_parent(view,parent_id,name);
         if(view.contains(p.key))throw std::system_error(EEXIST,std::generic_category(),"entry already exists");
-        auto id=new_id(view);created={id,directory,mode,directory?2u:1u,0,now(),now()};auto pn=inode(view,p.id);
+        auto id=new_id(view);created={id,directory,mode,directory?2u:1u,0,now(),now()};created.indexed_directory=directory && indexed_parents(view);auto pn=inode(view,p.id);
         if(directory){need(pn.links<UINT64_MAX,"directory link count exhausted");++pn.links;}touch(pn);
         changes[p.key]=id_bytes(id);changes[inode_key(id)]=encode(created);changes[inode_key(p.id)]=encode(pn);changes[allocated_key(id)]=Bytes{};
         if(!directory)changes[content_key(id)]=Bytes{};
+        else if(indexed_parents(view))changes[parent_key(id)]=parent_record(p.id,p.name);
     });return created;
 }
 void Namespace::remove_child(const std::string& parent_id,const std::string& name,const std::string& expected,bool directory) {
@@ -429,16 +490,18 @@ void Namespace::initialize() {
     update([](const NamespaceView& j,Changes& changes) {
         need(!j.contains(root_key),"filesystem already initialized");
         need(j.keys(prefix).empty(),"orphan filesystem records prevent initialization");
-        auto id=new_id(j);InodeInfo n{id,true,0755,2,0,now(),now()};
+        auto id=new_id(j);InodeInfo n{id,true,0755,2,0,now(),now()};n.indexed_directory=true;
         changes[root_key]=id_bytes(id);changes[inode_key(id)]=encode(n);changes[allocated_key(id)]=Bytes{};
+        changes[parent_index_key]=Bytes{'F','F','P','I','D','X','0','1'};changes[parent_key(id)]=parent_record(id,"");
     });
 }
 void Namespace::mkdir(const std::string& path) {
     update([&](const NamespaceView& j,Changes& c) {
         auto p=parent(j,path);need(!j.contains(p.key),"path already exists");
-        auto id=new_id(j);InodeInfo n{id,true,0755,2,0,now(),now()},pn=inode(j,p.id);
+        auto id=new_id(j);InodeInfo n{id,true,0755,2,0,now(),now()},pn=inode(j,p.id);n.indexed_directory=indexed_parents(j);
         need(pn.links<UINT64_MAX,"directory link count exhausted");++pn.links;touch(pn);
         c[p.key]=id_bytes(id);c[inode_key(id)]=encode(n);c[inode_key(p.id)]=encode(pn);c[allocated_key(id)]=Bytes{};
+        if(indexed_parents(j))c[parent_key(id)]=parent_record(p.id,p.name);
     });
 }
 void Namespace::write(const std::string& path,const Bytes& value) {
@@ -594,7 +657,7 @@ void Namespace::link(const std::string& source,const std::string& target) {
     });
 }
 void Namespace::retire(const NamespaceView& j,Changes& c,const InodeInfo& n) {
-    c[inode_key(n.id)]=std::nullopt;if(n.directory)return;
+    c[inode_key(n.id)]=std::nullopt;if(n.directory){if(indexed_parents(j))c[parent_key(n.id)]=std::nullopt;return;}
     c[content_key(n.id)]=std::nullopt;
     auto count=container_.open_counts_.find({view_,n.id});
     if(count!=container_.open_counts_.end() && count->second) {
@@ -640,6 +703,7 @@ void Namespace::rename_entry(const NamespaceView& j,Changes& c,const std::string
         }
         if(n.directory && src.id!=dst.id){--parents.at(src.id).links;need(parents.at(dst.id).links<UINT64_MAX,"directory link count exhausted");++parents.at(dst.id).links;}
         c[src.key]=std::nullopt;c[dst.key]=id_bytes(id);n.changed_ns=now();c[inode_key(id)]=encode(n);
+        if(n.directory && indexed_parents(j))c[parent_key(id)]=parent_record(dst.id,dst.name);
         for(auto& [parent_id,pn]:parents){touch(pn);c[inode_key(parent_id)]=encode(pn);}
 
 }
@@ -647,10 +711,10 @@ void Namespace::rename_entry(const NamespaceView& j,Changes& c,const std::string
 void Namespace::verify() const {
     std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);
     if(journal.is_leveldb())(void)j.references(); // Validate the full CoW tree before namespace traversal.
-    auto root_id=root(j);need(inode(j,root_id).directory,"root inode is not a directory");std::set<std::string> expected;std::map<std::string,uint64_t> references;
+    bool indexed=indexed_parents(j);auto root_id=root(j);need(inode(j,root_id).directory,"root inode is not a directory");std::set<std::string> expected;std::map<std::string,uint64_t> references;
     std::set<std::string> directories;expected.insert(root_key);
     std::function<void(const std::string&)> visit=[&](const std::string& id) {
-        auto n=inode(j,id);expected.insert(inode_key(id));
+        auto n=inode(j,id);expected.insert(inode_key(id));need(n.indexed_directory==(indexed && n.directory),"directory inode/index version mismatch");
         need(j.contains(allocated_key(id)) && j.get(allocated_key(id)).empty(),"inode missing allocation record");
         if(!n.directory){auto data=j.get(content_key(id));need(data.size()==n.size,"inode content size mismatch");if(n.symlink)target_components(std::string(data.begin(),data.end()));expected.insert(content_key(id));return;}
         need(directories.insert(id).second,"directory cycle or hardlink");uint64_t subdirs=0;
@@ -667,6 +731,10 @@ void Namespace::verify() const {
     for(const auto& key:j.keys(prefix+"allocated/")) {
         auto id=key.substr((prefix+"allocated/").size());
         need(valid_id(id) && j.get(key).empty(),"invalid allocation record");expected.insert(key);
+    }
+    if(indexed_parents(j)) {
+        expected.insert(parent_index_key);auto records=directory_parent_records(j);
+        for(const auto& [id,value]:records){auto key=parent_key(id);need(j.contains(key) && j.get(key)==value,"directory parent index mismatch");expected.insert(key);}
     }
     auto actual=j.keys(prefix);need(actual.size()==expected.size(),"orphan namespace records");
     for(const auto& key:actual)need(expected.contains(key),"unexpected namespace record");

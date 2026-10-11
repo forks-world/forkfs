@@ -10,6 +10,7 @@ struct InodeInfo {
     uint32_t mode;
     uint64_t links, size, modified_ns, changed_ns;
     bool symlink=false;
+    bool indexed_directory=false; // FFINOD02: old writers must reject indexed directories.
 };
 class NamespaceView;
 class Namespace {
@@ -38,6 +39,9 @@ public:
     std::vector<std::string> revisions() const;
     // Frontend reads address logical inodes, never cached host/path names.
     InodeInfo root_inode() const;
+    bool has_parent_index() const;
+    void build_parent_index(); // Explicit atomic upgrade of this writable view only.
+    InodeInfo parent_inode(const std::string& directory_inode) const;
     InodeInfo lookup_child(const std::string& parent_inode,const std::string& name) const;
     InodeInfo stat_inode(const std::string& inode_id) const;
     std::vector<unsigned char> read_inode(const std::string& inode_id,uint64_t offset,uint64_t count) const;

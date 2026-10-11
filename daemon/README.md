@@ -200,10 +200,41 @@ or overwrite a different file which has taken its name. Path and inode operation
 share retirement, replacement and directory-link accounting. Existing handles to
 an overwritten or unlinked regular file remain valid until closed.
 
-Directory-cycle prevention for inode rename currently scans the moved directory's
-subtree in pages of 128 entries; the format has no directory-parent index. Regular
-file rename and same-parent directory rename avoid that scan. A parent index is
-needed before claiming efficient cross-directory moves of large trees. Names and
+Indexed views prevent rename cycles by walking destination ancestors and verifying
+parent backlinks; the work depends on directory depth, not moved subtree size.
+Old unindexed views retain the paged subtree fallback until explicitly upgraded. Names and
 modes retain the prototype's printable-ASCII and 0777 restrictions. Symlink and
 hardlink creation by inode, richer attributes and writable FSKit callbacks remain
 outstanding.
+
+
+## Versioned directory parent index
+
+Newly initialized namespaces include `\0forkfs/parent-index` with `FFPIDX01` and
+one `\0forkfs/parent/<inode>` record per directory. Each record contains `FFPAR001`,
+the parent's 32-byte ASCII inode ID, and the directory entry name (0..255 bytes).
+Only the root has an empty name and points to itself. Regular files and symlinks
+have no parent records because files can have multiple links. Each directory
+create, rename (including same-parent name changes), replacement and removal
+updates its record in the same transaction as directory entries and link counts.
+These keys live inside the same CoW namespace as other metadata, so snapshots,
+forks, restore and compaction carry the correct version automatically.
+
+`parent_inode(id)` verifies the recorded parent/entry backlink before returning a
+parent. Full namespace verification requires exactly one matching record for
+every directory and rejects missing, extra or inconsistent records. A malformed
+index is an error, never a reason to silently fall back or reconstruct it.
+
+Existing namespaces without the marker remain readable/writable without a
+migration. `build_parent_index()` explicitly upgrades only the selected writable
+view in one transaction, is idempotent, and never rewrites earlier revisions or
+other branches. Read-only revision queries use a traversal fallback and never
+write an index. The initial atomic upgrade is limited to 1024 directories
+(including root) to bound transaction size; larger historical trees need a staged
+upgrade design. New indexed namespaces have no such directory-count restriction.
+Indexed directories use `FFINOD02` with the same 48-byte layout; regular files and
+symlinks retain `FFINOD01`. Upgrade changes every directory inode's version in the
+same transaction as the marker and parent records. This makes old directory
+readers/writers reject indexed views instead of silently skipping index updates;
+old revisions retain their original directory versions. Verification rejects
+mixed inode/index versions.
