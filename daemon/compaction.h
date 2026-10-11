@@ -19,6 +19,7 @@ private:
     Container& container_;
     std::string world_;
     std::optional<NamespaceView::ObjectId> head_;
+    std::optional<NamespaceView::ObjectId> generation_;
     uint64_t sequence_=0;
     NamespaceView::Frozen input_;
     NamespaceView::Plan plan_;

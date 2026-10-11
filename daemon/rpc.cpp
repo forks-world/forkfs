@@ -97,6 +97,14 @@ public:
         for(const auto& token:dead)close(token);
     }
     size_t directory_count() const {size_t n=0;for(const auto& [token,s]:values_)n+=s.directories.size();return n;}
+    void revoke_world(const std::string& world){
+        // Namespace::restore already removed engine handles/orphans. Remove
+        // session ownership without attempting to close those revoked tokens.
+        for(auto& [token,session]:values_) {
+            std::erase_if(session.handles,[&](const auto& item){return !item.second.revision && item.second.view==world;});
+            std::erase_if(session.directories,[&](const auto& item){return !item.second.revision && item.second.view==world;});
+        }
+    }
     void shutdown(){while(!values_.empty())close(values_.begin()->first);}
 private:
     Container& store_;std::map<std::string,Session> values_;
@@ -248,6 +256,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     else if(op=="fs-rename")fs.rename(args[1],args[2]);
     else if(op=="fs-link")fs.link(args[1],args[2]);
     else if(op=="fs-fork")fs.fork(args[1],args[2]);
+    else if(op=="fs-restore"){fs.restore(args[1]);sessions.revoke_world(view);}
     else if(op=="fs-compact")fs.compact();
     else if(op=="fs-check"){store.verify();fs.verify();}
     else throw std::runtime_error("unsupported RPC command");

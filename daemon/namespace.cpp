@@ -41,6 +41,12 @@ uint64_t load(const unsigned char* p,size_t n) {
 void store(unsigned char* p,uint64_t v,size_t n) {
     for(size_t i=0;i<n;++i)p[i]=static_cast<unsigned char>(v>>(8*i));
 }
+uint64_t world_generation(const Journal& journal,const std::string& world) {
+    auto key=history+"generation/"+world;
+    if(!journal.contains(key))return 0;
+    auto value=journal.get(key);need(value.size()==8,"invalid World generation");
+    return load(value.data(),8);
+}
 uint64_t now() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -254,6 +260,30 @@ void Namespace::fork(const std::string& revision,const std::string& world) {
     j.transact(j.sequence(),{{history+"world/"+world,std::nullopt,manifest},
                             {history+"base/"+world,Bytes(revision_id.begin(),revision_id.end())}});
 }
+void Namespace::restore(const std::string& revision) {
+    valid_view_name(revision);valid_view_name(view_);need(!revision_,"revision view is read-only");
+    std::lock_guard lock(container_.mutex_);auto& j=*container_.journal_;
+    need(j.is_leveldb(),"restore requires LevelDB");
+    NamespaceView current(j,view_,false);root(current);
+    auto manifest=revision_manifest(j,revision);NamespaceView target(j,revision,true);root(target);
+    auto generation_key=history+"generation/"+view_;
+    auto generation=world_generation(j,view_);
+    need(generation!=UINT64_MAX,"World generation exhausted");
+    Bytes next(8);store(next.data(),generation+1,8);
+    auto revision_id=j.root_object(history+"revision/"+revision);
+    std::vector<Mutation> batch{{history+"world/"+view_,std::nullopt,manifest},
+                              {history+"base/"+view_,Bytes(revision_id.begin(),revision_id.end())},
+                              {generation_key,std::move(next)}};
+    auto orphan_keys=j.keys(history+"orphan/"+view_+"/");
+    need(orphan_keys.size()<=4093,"restore orphan batch limit exceeded");
+    for(const auto& key:orphan_keys)batch.push_back({key,std::nullopt});
+    // The durable publication precedes allocation-free runtime revocation, all
+    // under the lock used by handle IO. A failed transaction preserves access.
+    j.transact(j.sequence(),batch);
+    std::erase_if(container_.handles_,[&](const auto& item){return !item.second.revision && item.second.view==view_;});
+    std::erase_if(container_.open_counts_,[&](const auto& item){return item.first.first==view_;});
+    container_.compaction_cv_.notify_all();
+}
 std::vector<std::string> Namespace::worlds() const {
     std::lock_guard lock(container_.mutex_);const auto& j=*container_.journal_;std::vector<std::string> result;
     if(j.contains(root_key))result.push_back("main");auto p=history+"world/";
@@ -419,6 +449,7 @@ Namespace::DirectoryCursor Namespace::open_directory(const std::string& path) co
     std::lock_guard lock(container_.mutex_);const auto& j=*container_.journal_;need(j.is_leveldb(),"directory cursors require LevelDB");
     NamespaceView view(j,view_,revision_);auto id=resolve(view,path);need(inode(view,id).directory,"path is not a directory");
     DirectoryCursor cursor;cursor.lifetime_=container_.lifetime_;cursor.view_=view_;cursor.revision_=revision_;cursor.prefix_=directory_prefix(id);
+    if(!revision_)cursor.generation_=world_generation(j,view_);
     if(view.legacy()){need(view.keys(cursor.prefix_).empty(),"flat namespace directory is not empty");cursor.done_=true;}
     else cursor.manifest_=revision_?revision_manifest(j,view_):j.root_object(history+"world/"+view_);
     return cursor;
@@ -426,6 +457,7 @@ Namespace::DirectoryCursor Namespace::open_directory(const std::string& path) co
 Namespace::DirectoryPage Namespace::read_directory(DirectoryCursor& cursor,size_t limit,bool attributes) const {
     need(limit>=1 && limit<=1024,"directory page limit must be 1..1024");
     std::lock_guard lock(container_.mutex_);need(cursor.lifetime_.lock()==container_.lifetime_ && cursor.view_==view_ && cursor.revision_==revision_,"directory cursor belongs to another repository/view");
+    if(!revision_)need(cursor.generation_==world_generation(*container_.journal_,view_),"directory cursor revoked by restore");
     if(cursor.done_)return {{},true,{}};NamespaceView snapshot(*container_.journal_,cursor.manifest_);
     auto keys=snapshot.page(cursor.prefix_,cursor.after_,limit+1);bool eof=keys.size()<=limit;if(!eof)keys.resize(limit);
     std::vector<std::string> names;std::vector<DirectoryEntry> entries;
@@ -437,6 +469,7 @@ Namespace::DirectoryPage Namespace::read_directory(DirectoryCursor& cursor,size_
 }
 void Namespace::rewind_directory(DirectoryCursor& cursor) const {
     std::lock_guard lock(container_.mutex_);need(cursor.lifetime_.lock()==container_.lifetime_ && cursor.view_==view_ && cursor.revision_==revision_,"directory cursor belongs to another repository/view");
+    if(!revision_)need(cursor.generation_==world_generation(*container_.journal_,view_),"directory cursor revoked by restore");
     cursor.after_.clear();cursor.done_=cursor.manifest_==ObjectId{};
 }
 InodeInfo Namespace::stat(const std::string& path) const {

@@ -19,6 +19,7 @@ public:
         friend class Namespace;
         std::weak_ptr<const int> lifetime_;
         std::string view_,prefix_,after_;bool revision_=false,done_=false;
+        uint64_t generation_=0;
         std::array<unsigned char,32> manifest_{};
     };
     struct DirectoryEntry {std::string name;InodeInfo inode;};
@@ -32,6 +33,7 @@ public:
         :container_(container),view_(std::move(view)),revision_(revision) {}
     std::string snapshot(const std::string& name);
     void fork(const std::string& revision,const std::string& world);
+    void restore(const std::string& revision);
     std::vector<std::string> worlds() const;
     std::vector<std::string> revisions() const;
     // Frontend reads address logical inodes, never cached host/path names.
