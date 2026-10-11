@@ -1,8 +1,9 @@
 # forkfs 测试 harness 设计
 
-状态：整体设计。已实现 [offline CLI smoke runner](../tests/harness/README.md)，
-覆盖 basic-fs/fork/revision 的首批固定场景；完整 case 矩阵、参考模型、RPC/挂载适配
-和 trace replay 尚未实现。
+状态：整体设计。已实现 [CLI/RPC 固定回归 runner](../tests/harness/README.md)，
+提供 FS001–FS011、FK001–FK007、RV001–RV004 和 RV007 历史读取场景。
+RV005/RV006、RV007 恢复部分、完整验收矩阵、统一参考模型、挂载适配和 trace replay
+尚未实现；固定场景通过不能代表物理 CoW 共享或性能验收通过。
 适用基线：已合并的元数据、Namespace、CLI/RPC 和实验性只读 FSKit 实现。
 当前 CTest、模型测试和进程崩溃测试继续保留，不能将设计中的能力计为已完成。
 

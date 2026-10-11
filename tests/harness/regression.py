@@ -51,7 +51,7 @@ class Fixture:
         # Keep Unix socket paths short even when the artifact directory is long.
         self.socket_root = tempfile.TemporaryDirectory(prefix='ff-h-', dir='/tmp')
         endpoint = Path(self.socket_root.name) / 'rpc.sock'
-        self.service_logs = [(self.root / name).open('wb') for name in ('service.stdout', 'service.stderr')]
+        self.service_logs = [(self.root / name).open('ab') for name in ('service.stdout', 'service.stderr')]
         self.process = subprocess.Popen([str(self.binary), 'serve', str(self.repository),
                                          '--socket', str(endpoint), '--rpc'],
                                         stdout=self.service_logs[0], stderr=self.service_logs[1])
@@ -308,38 +308,203 @@ def directory_pages(f):
     f.call('session-close', session)
 
 
-def fork(f):
+def baseline(f):
     f.initialize()
-    f.write('/a', b'base')
+    f.call('fs-mkdir', '/dir')
+    f.write('/dir/a', b'base')
+    f.call('fs-chmod', '/dir/a', '640')
+    f.call('fs-link', '/dir/a', '/alias')
+    f.call('fs-symlink', 'dir/a', '/link')
     f.call('fs-snapshot', 'base')
     f.call('fs-fork', 'base', 'work')
-    f.write('/a', b'child', ('world', 'work'))
-    f.read('/a', b'base')
-    f.read('/a', b'base', ('revision', 'base'))
-    f.read('/a', b'child', ('world', 'work'))
-    f.write('/a', b'parent')
-    f.read('/a', b'child', ('world', 'work'))
-    f.call('fs-fork', 'base', 'work', error='World already exists')
-    f.read('/a', b'child', ('world', 'work'))
-    f.call('fs-compact', view=('world', 'work'))
-    f.read('/a', b'base', ('revision', 'base'))
-    f.call('fs-check', view=('world', 'work'))
 
 
-def revision(f):
-    f.initialize()
-    f.write('/a', b'one')
-    f.call('fs-snapshot', 'r1')
-    f.write('/a', b'two')
-    f.call('fs-snapshot', 'r2')
-    f.call('fs-snapshot', 'r1', error='revision name already exists')
-    f.call('fs-unlink', '/a', view=('revision', 'r1'), error='revision view is read-only')
-    f.read('/a', b'one', ('revision', 'r1'))
-    f.read('/a', b'two', ('revision', 'r2'))
-    f.read('/a', b'two')
+def tree_signature(f, view=None):
+    result = {}
+    def walk(path):
+        attrs = json.loads(f.call('fs-lstat', path, view=view))
+        result[path] = {'attributes': attrs}
+        if attrs['directory']:
+            for name in f.call('fs-ls', path, view=view).decode().splitlines():
+                walk(path.rstrip('/') + '/' + name)
+        elif attrs['symlink']:
+            result[path]['target'] = f.call('fs-readlink', path, view=view).hex()
+        else:
+            result[path]['content'] = f.call('fs-cat', path, view=view).hex()
+    walk('/')
+    return result
+
+
+def fork_baseline(f):
+    baseline(f)
+    original = tree_signature(f)
+    for view in [('revision', 'base'), ('world', 'work')]:
+        if tree_signature(f, view) != original:
+            raise AssertionError('fork baseline changed tree, attributes or inode topology')
+
+
+def fork_writes(f):
+    baseline(f)
+    original = tree_signature(f)
+    view = ('world', 'work')
+    f.write('/dir/a', b'child', view)
+    payload = f.root / 'append.bin'
+    payload.write_bytes(b'!')
+    f.call('fs-append', '/alias', payload, view=view)
+    f.read('/dir/a', b'child!', view)
+    f.call('fs-truncate', '/dir/a', 3, view=view)
+    f.read('/alias', b'chi', view)
+    if tree_signature(f) != original or tree_signature(f, ('revision', 'base')) != original:
+        raise AssertionError('child writes changed the source or revision')
+
+
+def fork_directories(f):
+    baseline(f)
+    original = tree_signature(f)
+    view = ('world', 'work')
+    f.call('fs-mkdir', '/new', view=view)
+    f.write('/new/file', b'new', view)
+    f.call('fs-rename', '/dir', '/moved', view=view)
+    f.call('fs-unlink', '/alias', view=view)
+    f.read('/moved/a', b'base', view)
+    f.read('/new/file', b'new', view)
+    f.call('fs-stat', '/dir', view=view, error='path not found')
+    f.call('fs-stat', '/alias', view=view, error='path not found')
+    if tree_signature(f) != original or tree_signature(f, ('revision', 'base')) != original:
+        raise AssertionError('child directory edits changed the baseline')
+
+
+def fork_divergence(f):
+    baseline(f)
+    f.write('/dir/a', b'parent')
+    f.write('/dir/a', b'child', ('world', 'work'))
+    # Offline calls reopen the engine for every operation.
+    for view, content in [(None, b'parent'), (('world', 'work'), b'child'), (('revision', 'base'), b'base')]:
+        f.read('/alias', content, view)
+        f.call('fs-check', view=view)
+
+
+def fork_handles(f):
+    baseline(f)
+    f.call('fs-fork', 'base', 'second')
+    f.start_service()
+    session = json.loads(f.call('session-open', 60000))['session']
+    handles = []
+    for name in ['work', 'second']:
+        view = ('world', name)
+        handle = json.loads(f.call('fs-open', '/dir/a', 'rw', '--session', session, view=view))['handle']
+        handles.append(handle)
+        if not json.loads(f.call('fs-hlock', handle, 'exclusive', '--session', session, view=view))['granted']:
+            raise AssertionError('lock in one World blocked another World')
+    f.call('fs-hread', handles[0], 0, 4, '--session', session, view=('world', 'second'),
+           error='file handle belongs to another view')
+    payload = f.root / 'handle.bin'
+    payload.write_bytes(b'only')
+    f.call('fs-hwrite', handles[0], 0, payload, '--session', session, view=('world', 'work'))
+    f.read('/alias', b'only', ('world', 'work'))
+    f.read('/alias', b'base', ('world', 'second'))
+    f.read('/alias', b'base')
+    f.call('session-close', session)
+
+
+def fork_failures(f):
+    baseline(f)
+    f.start_service()
+    before = json.loads(f.call('status'))
+    worlds = f.call('fs-worlds')
+    original = tree_signature(f, ('world', 'work'))
+    for revision, world, reason in [('base', 'work', 'World already exists'),
+                                     ('missing', 'unpublished', 'object root not found'),
+                                     ('base', '../bad', 'invalid World/revision name')]:
+        f.call('fs-fork', revision, world, error=reason)
+    after = json.loads(f.call('status'))
+    for field in ['last_committed_seq', 'indexed_objects', 'object_roots']:
+        if before[field] != after[field]:
+            raise AssertionError(f'failed fork changed {field}')
+    if f.call('fs-worlds') != worlds or tree_signature(f, ('world', 'work')) != original:
+        raise AssertionError('failed fork published or overwrote a World')
+
+
+def fork_compaction(f):
+    baseline(f)
+    f.write('/dir/a', b'parent')
+    f.write('/dir/a', b'child', ('world', 'work'))
+    expected = {view: tree_signature(f, view) for view in [None, ('world', 'work'), ('revision', 'base')]}
     f.call('fs-compact')
-    f.read('/a', b'one', ('revision', 'r1'))
-    f.call('fs-check', view=('revision', 'r1'))
+    f.call('fs-compact', view=('world', 'work'))
+    for view, signature in expected.items():
+        if tree_signature(f, view) != signature:
+            raise AssertionError('compaction/reopen changed a retained tree')
+        f.call('fs-check', view=view)
+
+
+def revision_history(f):
+    baseline(f)
+    original = tree_signature(f, ('revision', 'base'))
+    f.write('/dir/a', b'live')
+    f.call('fs-chmod', '/dir/a', '600')
+    f.call('fs-rename', '/dir', '/moved')
+    f.call('fs-unlink', '/alias')
+    f.write('/new', b'new')
+    if tree_signature(f, ('revision', 'base')) != original:
+        raise AssertionError('live edits changed historical tree or attributes')
+
+
+def revision_forks(f):
+    baseline(f)
+    f.write('/dir/a', b'two')
+    f.call('fs-snapshot', 'r2')
+    for revision, world, content in [('base', 'old', b'base'), ('r2', 'new', b'two')]:
+        f.call('fs-fork', revision, world)
+        f.read('/alias', content, ('world', world))
+        if tree_signature(f, ('world', world)) != tree_signature(f, ('revision', revision)):
+            raise AssertionError('fork selected the wrong revision tree')
+
+
+def revision_readonly(f):
+    baseline(f)
+    f.start_service()
+    view = ('revision', 'base')
+    old, live = tree_signature(f, view), tree_signature(f)
+    payload = f.root / 'rejected.bin'
+    payload.write_bytes(b'rejected')
+    for op, args in [('fs-write', ('/dir/a', payload)), ('fs-unlink', ('/alias',)),
+                     ('fs-rename', ('/dir', '/moved')), ('fs-mkdir', ('/new',))]:
+        f.call(op, *args, view=view, error='revision view is read-only')
+    session = json.loads(f.call('session-open', 60000))['session']
+    f.call('fs-open', '/dir/a', 'rw', '--session', session, view=view, error='revision view is read-only')
+    f.call('session-close', session)
+    if tree_signature(f, view) != old or tree_signature(f) != live:
+        raise AssertionError('rejected revision edits changed history or live World')
+
+
+def revision_failures(f):
+    baseline(f)
+    old = tree_signature(f, ('revision', 'base'))
+    revisions = f.call('fs-revisions')
+    f.call('fs-snapshot', 'base', error='revision name already exists')
+    f.call('fs-snapshot', '../bad', error='invalid World/revision name')
+    f.call('fs-stat', '/', view=('revision', 'missing'), error='object root not found')
+    if f.call('fs-revisions') != revisions or tree_signature(f, ('revision', 'base')) != old:
+        raise AssertionError('failed revision operation changed history')
+
+
+def revision_compaction(f):
+    baseline(f)
+    f.write('/dir/a', b'two')
+    f.call('fs-snapshot', 'r2')
+    expected = {name: tree_signature(f, ('revision', name)) for name in ['base', 'r2']}
+    f.start_service()
+    f.call('fs-compact')
+    f.close()
+    f.process = None
+    f.endpoint = None
+    f.service_logs = []
+    f.start_service()
+    for name, signature in expected.items():
+        if tree_signature(f, ('revision', name)) != signature:
+            raise AssertionError('compaction/service restart changed history')
+        f.call('fs-check', view=('revision', name))
 
 
 CASES = [('basic-fs', 'FS001', initialization), ('basic-fs', 'FS002', directories),
@@ -347,8 +512,13 @@ CASES = [('basic-fs', 'FS001', initialization), ('basic-fs', 'FS002', directorie
          ('basic-fs', 'FS005', rename), ('basic-fs', 'FS006', hardlinks),
          ('basic-fs', 'FS007', symlinks), ('basic-fs', 'FS008', handles),
          ('basic-fs', 'FS009', removals), ('basic-fs', 'FS010', directory_pages),
-         ('basic-fs', 'FS011', error_boundaries), ('fork', 'FK-isolation-smoke', fork),
-         ('revision', 'RV-history-smoke', revision)]
+         ('basic-fs', 'FS011', error_boundaries), ('fork', 'FK001', fork_baseline),
+         ('fork', 'FK002', fork_writes), ('fork', 'FK003', fork_directories),
+         ('fork', 'FK004', fork_divergence), ('fork', 'FK005', fork_handles),
+         ('fork', 'FK006', fork_failures), ('fork', 'FK007', fork_compaction),
+         ('revision', 'RV001', revision_history), ('revision', 'RV002', revision_forks),
+         ('revision', 'RV003', revision_readonly), ('revision', 'RV004', revision_failures),
+         ('revision', 'RV007', revision_compaction)]
 
 
 def main():
@@ -394,8 +564,8 @@ def main():
             result.update(status='fail', error=str(error))
             (root / 'failure.txt').write_text(traceback.format_exc())
         results.append(result)
-    report = {'schema': 1, 'results': results, 'unimplemented': ['full-fork-revision-matrix',
-              'mounted', 'revision-restore', 'mount-generation-revocation'], 'artifacts': str(output)}
+    report = {'schema': 1, 'results': results, 'unimplemented': ['RV005-restore', 'RV006-generation-revocation', 'RV007-restore-after-restart',
+              'mounted'], 'artifacts': str(output)}
     if any(r['status'] == 'fail' for r in results):
         report['status'] = 'fail'
     else:
