@@ -10,14 +10,29 @@ Lookup, attributes, symlink reads, regular-file reads and directory enumeration
 use logical inodes. All mutation callbacks return EROFS. Hardlinks reuse the same
 FSItem. Numeric item IDs last only for this volume lifetime, and persistent IDs
 are explicitly disabled. At most 4096 items are retained; quota exhaustion
-currently returns EIO. Directory cookies are entry ordinals in the immutable
+returns ENFILE. Directory cookies are entry ordinals in the immutable
 revision; resumed enumeration currently scans earlier entries again.
 
 This uses the Operations compatibility protocols, deprecated by the installed
 macOS 27 SDK. Deprecation warnings remain visible but are not build errors for
 these optional targets. The Handler API remains future work. Callback tests run
-without installing an extension; they exercise lookup/attributes, hardlink
-identity, missing names, symlinks and write refusal. Kernel-managed read buffers
+without installing an extension; they exercise lookup/attributes, dot/parent lookup,
+hardlink identity, missing/long names, symlinks, read offsets/EOF, xattrs and write
+refusal. Directory operations on regular files return ENOTDIR, regular reads of
+directories return EISDIR and foreign items return ESTALE. Directory attributes
+include the parent item ID; hardlinked regular files do not claim a unique parent.
+
+The revision namespace currently stores no extended attributes. Xattr listing
+returns an empty array, queries (including com.apple.provenance) return ENOATTR,
+and all set/delete policies return EROFS. The adapter conforms to the general
+xattr protocol and intentionally omits the limited-name hook. These callbacks
+never inspect backing-file xattrs. Revocation takes precedence over item/cookie
+validation and read-only errors for requests against revoked volumes (ENOTCONN).
+Item types are cached from the immutable revision, so argument/type validation
+does not add extra metadata-tree lookups.
+Metadata CI enables the optional adapter on macOS and includes callback and
+unsigned-bundle regressions in the metadata-regression label.
+Kernel-managed read buffers
 and directory packing have not been tested end to end.
 
 An unsigned extension bundle and resource loader are now built; installation
