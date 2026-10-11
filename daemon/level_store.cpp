@@ -1,4 +1,5 @@
 #include "level_store.h"
+#include "fault_injection.h"
 #include <leveldb/cache.h>
 #include <leveldb/db.h>
 #include <leveldb/env.h>
@@ -31,18 +32,36 @@ struct StoreIoMetrics {
 namespace {
 using Clock=std::chrono::steady_clock;
 uint64_t elapsed(Clock::time_point start){return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();}
+#ifdef FORKFS_TEST_FAULTS
+leveldb::Status injected_io(const char* point) {
+    if(!faults::transaction_io)return leveldb::Status::OK();
+    auto action=faults::hit(point);
+    if(action==faults::Action::None)return leveldb::Status::OK();
+    return leveldb::Status::IOError("forkfs injected fault",action==faults::Action::IoError?"EIO":"ENOSPC");
+}
+#endif
 class TimedFile:public leveldb::WritableFile {
     std::unique_ptr<leveldb::WritableFile> file_;StoreIoMetrics& m_;bool wal_;
 public:
     TimedFile(std::unique_ptr<leveldb::WritableFile> file,StoreIoMetrics& m,bool wal):file_(std::move(file)),m_(m),wal_(wal){}
     leveldb::Status Append(const leveldb::Slice& data) override {
+#ifdef FORKFS_TEST_FAULTS
+        if(wal_){auto injected=injected_io("wal_append");if(!injected.ok())return injected;}
+#endif
         auto start=Clock::now();auto s=file_->Append(data);if(wal_){m_.wal_append_ns+=elapsed(start);m_.wal_append_bytes+=data.size();}return s;
     }
     leveldb::Status Close() override{return file_->Close();}
     leveldb::Status Flush() override{auto start=Clock::now();auto s=file_->Flush();if(wal_)m_.wal_flush_ns+=elapsed(start);return s;}
     leveldb::Status Sync() override {
+#ifdef FORKFS_TEST_FAULTS
+        if(wal_){auto injected=injected_io("wal_sync");if(!injected.ok())return injected;}
+#endif
         auto start=Clock::now();auto s=file_->Sync();if(wal_){++m_.wal_sync_calls;m_.wal_sync_ns+=elapsed(start);}
-        else {++m_.other_sync_calls;m_.other_sync_ns+=elapsed(start);}return s;
+        else {++m_.other_sync_calls;m_.other_sync_ns+=elapsed(start);}
+#ifdef FORKFS_TEST_FAULTS
+        if(wal_ && s.ok()){auto injected=injected_io("wal_after_sync");if(!injected.ok())return injected;}
+#endif
+        return s;
     }
 };
 class TimedEnv:public leveldb::EnvWrapper {
@@ -72,6 +91,7 @@ std::string bytes(const Id& id) {return std::string(reinterpret_cast<const char*
 Id id(const std::string& value) {need(value.size()==32,"invalid object reference");Id result{};memcpy(result.data(),value.data(),32);return result;}
 void fault(const char* stage) {
 #ifdef FORKFS_TEST_FAULTS
+    faults::boundary(stage);
     const char* requested=std::getenv("FORKFS_TEST_CRASH");if(requested && !strcmp(requested,stage))_exit(86);
 #else
     (void)stage;
@@ -224,8 +244,12 @@ void LevelStore::transact(uint64_t expected,const std::vector<Mutation>& changes
     batch.Put("M/sequence",integer(sequence_+1));batch.Put("M/objects",integer(objects));batch.Put("M/roots",integer(roots));
     fault("leveldb_before_write");leveldb::WriteOptions options;options.sync=true;
     metrics_->prepare_ns+=prepared_ns+elapsed(locked_begin);auto write_begin=Clock::now();
+#ifdef FORKFS_TEST_FAULTS
+    faults::TransactionIo transaction_io;
+#endif
     auto s=db_->Write(options,&batch);metrics_->write_ns+=elapsed(write_begin);if(!s.ok()){poisoned_=true;status(s,"commit LevelDB batch");}
-    ++metrics_->transactions;sequence_=sequence_+1;objects_=objects;roots_=roots;fault("leveldb_after_write");
+    ++metrics_->transactions;sequence_=sequence_+1;objects_=objects;roots_=roots;
+    try{fault("leveldb_after_write");}catch(...){poisoned_=true;throw;}
 }
 std::string LevelStore::metrics_json(bool detailed) const {
     auto& m=*metrics_;std::string result="{\"transactions\":"+std::to_string(m.transactions.load())+

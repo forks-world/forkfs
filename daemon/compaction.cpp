@@ -1,4 +1,5 @@
 #include "compaction.h"
+#include "fault_injection.h"
 #include <stdexcept>
 #ifdef FORKFS_TEST_FAULTS
 #include <cstdlib>
@@ -16,6 +17,7 @@ std::string hex(const NamespaceView::ObjectId& id) {
 void need(bool ok,const char* message) {if(!ok)throw std::runtime_error(message);}
 void fault(const char* stage) {
 #ifdef FORKFS_TEST_FAULTS
+    faults::boundary(stage);
     const char* value=std::getenv("FORKFS_TEST_CRASH");
     if(value && !strcmp(value,stage))_exit(86);
 #else

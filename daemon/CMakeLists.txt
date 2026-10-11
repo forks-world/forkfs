@@ -121,3 +121,8 @@ set_tests_properties(forkfsd_script_control PROPERTIES TIMEOUT 90 LABELS metadat
 add_test(NAME forkfsd_script_control_unit COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_SOURCE_DIR}/scripts/tests/test_forkfs_control.py)
 set_tests_properties(forkfsd_script_control_unit PROPERTIES TIMEOUT 30 LABELS metadata-regression)
+
+add_test(NAME forkfsd_storage_faults COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/faults/storage.py --binary $<TARGET_FILE:forkfsd>
+    --fault-binary $<TARGET_FILE:forkfsd_leveldb_fault_test>)
+set_tests_properties(forkfsd_storage_faults PROPERTIES TIMEOUT 300 LABELS metadata-regression)
