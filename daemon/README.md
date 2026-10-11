@@ -177,3 +177,16 @@ Use [scripts/forkfs.py](../scripts/forkfs.py) for repository, foreground RPC ser
 file, snapshot, branch and restore operations without the legacy world executable.
 See [the script guide](../docs/SCRIPT_CONTROL.md) for complete examples. Native
 mount/unmount deliberately report unavailable until FSKit mount control is ready.
+
+## Inode-addressed file handles
+
+Native frontends can call `Namespace::open_inode(id, access[, options])` after
+lookup, without reconstructing a path. It opens an existing regular inode in the
+selected branch/revision and shares the path-open handle lifecycle, permissions,
+append behavior, duplication, orphan retention and restore revocation. Opening
+and optional truncation pin the inode under the same namespace lock and commit
+boundary. Create/exclusive options are rejected; create remains a namespace
+operation. Inode opening does not follow symbolic links. After the last directory
+link disappears, only existing handles can access the orphan; opening its ID again
+returns ENOENT. Revision handles are read-only. This API is backend groundwork;
+the FSKit adapter still exposes only immutable revision reads.

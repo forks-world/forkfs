@@ -41,6 +41,9 @@ public:
     InodeInfo lookup_child(const std::string& parent_inode,const std::string& name) const;
     InodeInfo stat_inode(const std::string& inode_id) const;
     std::vector<unsigned char> read_inode(const std::string& inode_id,uint64_t offset,uint64_t count) const;
+    // Open an existing regular inode in this view, without resolving a host/path name.
+    std::string open_inode(const std::string& inode_id,Access access=Access::Read);
+    std::string open_inode(const std::string& inode_id,Access access,const OpenOptions& options);
     std::string readlink_inode(const std::string& inode_id) const;
     DirectoryPage list_inode(const std::string& inode_id,const std::string& after,size_t limit) const;
     void initialize();
@@ -90,6 +93,9 @@ private:
     using Changes=std::map<std::string,std::optional<std::vector<unsigned char>>>;
     void retire(const NamespaceView& view,Changes& changes,const InodeInfo& inode);
     void commit_changes(const NamespaceView& view,Changes& changes);
+    // Caller holds container_.mutex_; pin and publish create/truncate atomically.
+    std::string publish_open(const NamespaceView& view,const std::string& inode_id,
+                             Access access,const OpenOptions& options,Changes& changes);
     Container& container_;
     std::string view_;
     bool revision_;

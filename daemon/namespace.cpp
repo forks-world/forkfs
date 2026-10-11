@@ -637,6 +637,32 @@ std::string Namespace::open(const std::string& path,Access access,const OpenOpti
         auto n=inode(view,id);need(!n.directory && !n.symlink,"only regular file handles are implemented");
         if(options.truncate && n.size!=0){n.size=0;touch(n);changes[inode_key(id)]=encode(n);changes[content_key(id)]=Bytes{};}
     }
+    return publish_open(view,id,access,options,changes);
+}
+std::string Namespace::open_inode(const std::string& id,Access access) {
+    return open_inode(id,access,OpenOptions{});
+}
+std::string Namespace::open_inode(const std::string& id,Access access,const OpenOptions& options) {
+    if(!valid_id(id) || options.create || options.exclusive || options.mode>0777 ||
+       (access!=Access::Read && access!=Access::Write && access!=Access::ReadWrite) ||
+       ((options.truncate || options.append) && access==Access::Read))
+        throw std::system_error(EINVAL,std::generic_category(),"invalid inode open options");
+    if(revision_ && access!=Access::Read)
+        throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");
+    std::lock_guard lock(container_.mutex_);auto& journal=*container_.journal_;
+    need(journal.is_leveldb(),"file handles require the LevelDB backend");
+    need(container_.handles_.size()<4096,"file handle limit reached");
+    NamespaceView view(journal,view_,revision_);
+    // Unlinked inodes can only be accessed through an already pinned handle.
+    if(!view.contains(inode_key(id)))throw std::system_error(ENOENT,std::generic_category(),"inode is not linked in this view");
+    auto n=inode(view,id);
+    if(n.directory || n.symlink)throw std::system_error(n.directory?EISDIR:ELOOP,std::generic_category(),"inode is not a regular file");
+    Changes changes;
+    if(options.truncate && n.size!=0){n.size=0;touch(n);changes[inode_key(id)]=encode(n);changes[content_key(id)]=Bytes{};}
+    return publish_open(view,id,access,options,changes);
+}
+std::string Namespace::publish_open(const NamespaceView& view,const std::string& id,
+                                    Access access,const OpenOptions& options,Changes& changes) {
     auto token=new_id(view);while(token==id || container_.handles_.contains(token))token=new_id(view);
     // Reserve runtime state before publication. Any failure rolls it back while
     // holding the same lock that protects create/truncate and inode pinning.
