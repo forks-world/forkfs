@@ -233,7 +233,10 @@ write an index. The initial atomic upgrade considers at most 1024 directories (i
 and preflights the actual generated mutation batch: at most 64 mutations for the
 legacy object journal or 4096 for LevelDB. Parent payloads, versioned inode
 payloads, metadata pages/runs and the World manifest all count, so a tree below
-1024 directories can still exceed its backend budget. Such an upgrade returns
+1024 directories can still exceed its backend budget. Each value is limited to
+256 KiB; unique value payloads in the batch are limited to 1 MiB for the legacy
+object journal or 16 MiB for LevelDB, matching each backend's deduplication.
+Such an upgrade returns
 E2BIG before upgrade publication; the original view remains usable. A view already
 at the run limit first follows normal compaction/wait/retry handling, then the
 fresh view's generated upgrade batch is checked. Oversized historical trees need a staged upgrade design. New indexed namespaces have no such directory-count restriction.

@@ -401,10 +401,21 @@ void Namespace::build_parent_index() {
         // Count actual objects, metadata plan and manifest once the view can plan
         // a publication. Directory count alone is not a transaction budget.
         const bool leveldb=container_.journal_->is_leveldb();
-        if(prepare_changes(view,changes).size()>(leveldb?4096u:64u))
+        const auto batch=prepare_changes(view,changes);
+        if(batch.size()>(leveldb?4096u:64u))
             throw std::system_error(E2BIG,std::generic_category(),leveldb?
                 "parent index upgrade exceeds LevelDB 4096-mutation limit":
                 "parent index upgrade exceeds object-journal 64-mutation limit");
+        std::set<ObjectId> values;size_t total=0;
+        for(const auto& mutation:batch)if(mutation.value) {
+            if(mutation.value->size()>256*1024)
+                throw std::system_error(E2BIG,std::generic_category(),"parent index upgrade exceeds 256 KiB object limit");
+            if(values.insert(Journal::object_id(*mutation.value)).second)total+=mutation.value->size();
+        }
+        if(total>(leveldb?16u*1024*1024:1024*1024))
+            throw std::system_error(E2BIG,std::generic_category(),leveldb?
+                "parent index upgrade exceeds LevelDB 16 MiB value limit":
+                "parent index upgrade exceeds object-journal 1 MiB value limit");
     });
 }
 InodeInfo Namespace::parent_inode(const std::string& id) const {

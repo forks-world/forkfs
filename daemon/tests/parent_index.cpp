@@ -31,6 +31,19 @@ void fill_legacy_runs(const std::string& path,const std::string& root_id) {
         }
     }catch(...){close(fd);throw;}close(fd);
 }
+void fill_flat_files(const std::string& path,const std::string& root_id) {
+    int fd=open(path.c_str(),O_RDWR|O_CLOEXEC);check(fd>=0);
+    try{std::array<unsigned char,16> repository{};check(pread(fd,repository.data(),repository.size(),16)==static_cast<ssize_t>(repository.size()));
+        Journal journal(fd,repository);const std::string pre("\0forkfs/",8);auto inode=journal.get(pre+"inode/"+root_id);
+        inode[8]=1;inode[12]=0644&255;inode[13]=0644>>8;inode[16]=1;std::vector<Mutation> batch;
+        for(unsigned i=1;i<=3200;++i){auto tail=std::to_string(i);auto id=std::string(32-tail.size(),'0')+tail;check(id!=root_id);
+            batch.push_back({pre+"inode/"+id,inode});batch.push_back({pre+"content/"+id,NamespaceView::Bytes{}});
+            batch.push_back({pre+"allocated/"+id,NamespaceView::Bytes{}});batch.push_back({pre+"entry/"+root_id+"/f"+tail,NamespaceView::Bytes(id.begin(),id.end())});
+            if(batch.size()==64){journal.transact(journal.sequence(),batch);batch.clear();}
+        }
+        if(!batch.empty())journal.transact(journal.sequence(),batch);
+    }catch(...){close(fd);throw;}close(fd);
+}
 int main(){
     auto pattern=(std::filesystem::temp_directory_path()/"ff-parent-index-XXXXXX").string();auto temp=mkdtemp(pattern.data());if(!temp)return 1;
     auto path=std::string(temp)+"/new",old=std::string(temp)+"/old";
@@ -90,6 +103,14 @@ int main(){
         fill_legacy_runs(full,fullroot);
         {Container store(full);Namespace fs(store);check(!fs.has_parent_index() && fs.run_count()==NamespaceView::hard_run_limit);
             fs.verify();fs.build_parent_index();check(fs.has_parent_index() && fs.run_count()<NamespaceView::hard_run_limit);fs.verify();store.verify();}
+        auto large=std::string(temp)+"/legacy-flat-large";Container::create_legacy(large);std::string large_root;
+        {Container store(large);Namespace fs(store);fs.initialize();large_root=fs.root_inode().id;}
+        unindex_fixture(large,true,large_root);fill_flat_files(large,large_root);
+        {Container store(large);Namespace fs(store);check(!fs.has_parent_index() && fs.run_count()==0);fs.verify();auto stable=store.status();
+            bool overflow=false;try{fs.build_parent_index();}catch(const std::system_error& e){overflow=e.code().value()==E2BIG && std::string(e.what()).find("object-journal 1 MiB value limit")!=std::string::npos;}
+            check(overflow && store.status()==stable && !fs.has_parent_index() && !fs.root_inode().indexed_directory);
+            check(fs.stat("/f3200").size==0 && fs.parent_inode(large_root).id==large_root);fs.verify();store.verify();}
+        {Container store(large);Namespace fs(store);check(!fs.has_parent_index() && fs.run_count()==0 && fs.stat("/f3200").size==0);fs.verify();}
         auto bad=std::string(temp)+"/bad";Container::create(bad);std::string badroot;
         {Container store(bad);Namespace fs(store);fs.initialize();badroot=fs.root_inode().id;}
         {Journal journal(bad);journal.put(std::string("\0forkfs/",8)+"parent/"+badroot,{'b','a','d'});}
