@@ -1,4 +1,5 @@
 #include "namespace.h"
+#include "metadata_view.h"
 #include <filesystem>
 #include <fcntl.h>
 #include <iostream>
@@ -14,6 +15,20 @@ void unindex_fixture(const std::string& path,bool legacy,const std::string& id) 
     int fd=open(path.c_str(),O_RDWR|O_CLOEXEC);check(fd>=0);
     try{std::array<unsigned char,16> repository{};check(pread(fd,repository.data(),repository.size(),16)==static_cast<ssize_t>(repository.size()));
         Journal journal(fd,repository);edit(journal);
+    }catch(...){close(fd);throw;}close(fd);
+}
+void fill_legacy_runs(const std::string& path,const std::string& root_id) {
+    int fd=open(path.c_str(),O_RDWR|O_CLOEXEC);check(fd>=0);
+    try{std::array<unsigned char,16> repository{};check(pread(fd,repository.data(),repository.size(),16)==static_cast<ssize_t>(repository.size()));
+        Journal journal(fd,repository);auto history=std::string("\0forkfs-history/",16);auto key=std::string("\0forkfs/",8)+"inode/"+root_id;
+        auto named_object=[&](const std::array<unsigned char,32>& id){const char* hex="0123456789abcdef";std::string result=history+"object/";for(auto c:id){result+=hex[c>>4];result+=hex[c&15];}return result;};
+        for(uint64_t stamp=1;;++stamp){NamespaceView view(journal,"main");if(view.run_count()==NamespaceView::hard_run_limit)break;
+            check(view.run_count()<NamespaceView::hard_run_limit);auto inode=view.get(key);
+            for(unsigned i=0;i<8;++i)inode[32+i]=static_cast<unsigned char>(stamp>>(8*i));
+            auto id=Journal::object_id(inode);auto plan=view.plan({{key,id}});std::vector<Mutation> batch{{named_object(id),inode}};
+            for(const auto& object:plan.objects)batch.push_back({named_object(Journal::object_id(object)),object});
+            batch.push_back({history+"world/main",plan.manifest});journal.transact(journal.sequence(),batch);
+        }
     }catch(...){close(fd);throw;}close(fd);
 }
 int main(){
@@ -68,6 +83,13 @@ int main(){
             }else{fs.build_parent_index();check(fs.has_parent_index() && fs.root_inode().indexed_directory && !before.has_parent_index());}
             fs.verify();before.verify();store.verify();
         }
+        auto full=std::string(temp)+"/legacy-full";Container::create_legacy(full);std::string fullroot;
+        {Container store(full);Namespace fs(store);fs.initialize();fullroot=fs.root_inode().id;}
+        unindex_fixture(full,true,fullroot);
+        {Container store(full);Namespace fs(store);fs.mkdir("/a");fs.mkdir("/b");}
+        fill_legacy_runs(full,fullroot);
+        {Container store(full);Namespace fs(store);check(!fs.has_parent_index() && fs.run_count()==NamespaceView::hard_run_limit);
+            fs.verify();fs.build_parent_index();check(fs.has_parent_index() && fs.run_count()<NamespaceView::hard_run_limit);fs.verify();store.verify();}
         auto bad=std::string(temp)+"/bad";Container::create(bad);std::string badroot;
         {Container store(bad);Namespace fs(store);fs.initialize();badroot=fs.root_inode().id;}
         {Journal journal(bad);journal.put(std::string("\0forkfs/",8)+"parent/"+badroot,{'b','a','d'});}

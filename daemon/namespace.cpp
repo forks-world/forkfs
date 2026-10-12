@@ -395,8 +395,11 @@ void Namespace::build_parent_index() {
         need(records.size()<=1024,"parent index upgrade is limited to 1024 directories per atomic transaction");
         for(const auto& [id,value]:records){changes[parent_key(id)]=value;auto n=inode(view,id);n.indexed_directory=true;changes[inode_key(id)]=encode(n);}
         changes[parent_index_key]=Bytes{'F','F','P','I','D','X','0','1'};
-        // Count the actual objects, metadata plan and manifest before update can
-        // compact or publish. Directory count alone is not a transaction budget.
+        // A full run manifest must first pass update's compaction/wait/retry path.
+        // Leave the changes pending so update knows this is a real mutation.
+        if(view.run_count()>=NamespaceView::hard_run_limit)return;
+        // Count actual objects, metadata plan and manifest once the view can plan
+        // a publication. Directory count alone is not a transaction budget.
         const bool leveldb=container_.journal_->is_leveldb();
         if(prepare_changes(view,changes).size()>(leveldb?4096u:64u))
             throw std::system_error(E2BIG,std::generic_category(),leveldb?

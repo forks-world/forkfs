@@ -234,8 +234,9 @@ and preflights the actual generated mutation batch: at most 64 mutations for the
 legacy object journal or 4096 for LevelDB. Parent payloads, versioned inode
 payloads, metadata pages/runs and the World manifest all count, so a tree below
 1024 directories can still exceed its backend budget. Such an upgrade returns
-E2BIG before publication or automatic compaction; the original view remains
-usable. Oversized historical trees need a staged upgrade design. New indexed namespaces have no such directory-count restriction.
+E2BIG before upgrade publication; the original view remains usable. A view already
+at the run limit first follows normal compaction/wait/retry handling, then the
+fresh view's generated upgrade batch is checked. Oversized historical trees need a staged upgrade design. New indexed namespaces have no such directory-count restriction.
 Indexed directories use `FFINOD02` with the same 48-byte layout; regular files and
 symlinks retain `FFINOD01`. Upgrade changes every directory inode's version in the
 same transaction as the marker and parent records. This makes old directory
