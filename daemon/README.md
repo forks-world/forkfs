@@ -177,3 +177,72 @@ Use [scripts/forkfs.py](../scripts/forkfs.py) for repository, foreground RPC ser
 file, snapshot, branch and restore operations without the legacy world executable.
 See [the script guide](../docs/SCRIPT_CONTROL.md) for complete examples. Native
 mount/unmount deliberately report unavailable until FSKit mount control is ready.
+
+## Inode-addressed file handles
+
+Native frontends can call `Namespace::open_inode(id, access[, options])` after
+lookup, without reconstructing a path. It opens an existing regular inode in the
+selected branch/revision and shares the path-open handle lifecycle, permissions,
+append behavior, duplication, orphan retention and restore revocation. Opening
+and optional truncation pin the inode under the same namespace lock and commit
+boundary. Create/exclusive options are rejected; create remains a namespace
+operation. Inode opening does not follow symbolic links. After the last directory
+link disappears, only existing handles can access the orphan; opening its ID again
+returns ENOENT. Revision handles are read-only. This API is backend groundwork;
+the FSKit adapter still exposes only immutable revision reads.
+
+Native frontends can also create entries with `create_child(parent, name, directory,
+mode)`, and remove or rename entries by parent inode and name. Removal requires
+an expected inode ID. Rename requires an expected source ID and either an expected
+overwritten target ID or an absent target (the default). Identity comparisons and
+mutation occur within one namespace update, so a stale FSKit item cannot delete
+or overwrite a different file which has taken its name. Path and inode operations
+share retirement, replacement and directory-link accounting. Existing handles to
+an overwritten or unlinked regular file remain valid until closed.
+
+Indexed views prevent rename cycles by walking destination ancestors and verifying
+parent backlinks; the work depends on directory depth, not moved subtree size.
+Old unindexed views retain the paged subtree fallback until explicitly upgraded. Names and
+modes retain the prototype's printable-ASCII and 0777 restrictions. Symlink and
+hardlink creation by inode, richer attributes and writable FSKit callbacks remain
+outstanding.
+
+
+## Versioned directory parent index
+
+Newly initialized namespaces include `\0forkfs/parent-index` with `FFPIDX01` and
+one `\0forkfs/parent/<inode>` record per directory. Each record contains `FFPAR001`,
+the parent's 32-byte ASCII inode ID, and the directory entry name (0..255 bytes).
+Only the root has an empty name and points to itself. Regular files and symlinks
+have no parent records because files can have multiple links. Each directory
+create, rename (including same-parent name changes), replacement and removal
+updates its record in the same transaction as directory entries and link counts.
+These keys live inside the same CoW namespace as other metadata, so snapshots,
+forks, restore and compaction carry the correct version automatically.
+
+`parent_inode(id)` verifies the recorded parent/entry backlink before returning a
+parent. Full namespace verification requires exactly one matching record for
+every directory and rejects missing, extra or inconsistent records. A malformed
+index is an error, never a reason to silently fall back or reconstruct it.
+
+Existing namespaces without the marker remain readable/writable without a
+migration. `build_parent_index()` explicitly upgrades only the selected writable
+view in one transaction, is idempotent, and never rewrites earlier revisions or
+other branches. Read-only revision queries use a traversal fallback and never
+write an index. The initial atomic upgrade considers at most 1024 directories (including root),
+and preflights the actual generated mutation batch: at most 64 mutations for the
+legacy object journal or 4096 for LevelDB. Parent payloads, versioned inode
+payloads, metadata pages/runs and the World manifest all count, so a tree below
+1024 directories can still exceed its backend budget. Each value is limited to
+256 KiB; unique value payloads in the batch are limited to 1 MiB for the legacy
+object journal or 16 MiB for LevelDB, matching each backend's deduplication.
+Such an upgrade returns
+E2BIG before upgrade publication; the original view remains usable. A view already
+at the run limit first follows normal compaction/wait/retry handling, then the
+fresh view's generated upgrade batch is checked. Oversized historical trees need a staged upgrade design. New indexed namespaces have no such directory-count restriction.
+Indexed directories use `FFINOD02` with the same 48-byte layout; regular files and
+symlinks retain `FFINOD01`. Upgrade changes every directory inode's version in the
+same transaction as the marker and parent records. This makes old directory
+readers/writers reject indexed views instead of silently skipping index updates;
+old revisions retain their original directory versions. Verification rejects
+mixed inode/index versions.
