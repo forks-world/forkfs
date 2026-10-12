@@ -108,6 +108,7 @@ private:
     void rename_entry(const NamespaceView& view,Changes& changes,const std::string& source_parent,
                       const std::string& source_name,const std::string& destination_parent,
                       const std::string& destination_name,const std::vector<std::string>* ancestry=nullptr);
+    std::vector<Mutation> prepare_changes(const NamespaceView& view,const Changes& changes);
     void commit_changes(const NamespaceView& view,Changes& changes);
     // Caller holds container_.mutex_; pin and publish create/truncate atomically.
     std::string publish_open(const NamespaceView& view,const std::string& inode_id,

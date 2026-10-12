@@ -249,13 +249,12 @@ void Namespace::update(const std::function<void(const NamespaceView&,Changes&)>&
     }
 }
 
-void Namespace::commit_changes(const NamespaceView& view,Changes& changes) {
-    if(changes.empty())return;auto prepare_start=std::chrono::steady_clock::now();
+std::vector<Mutation> Namespace::prepare_changes(const NamespaceView& view,const Changes& changes) {
     auto& journal=*container_.journal_;
     std::vector<Mutation> batch;
     // Initialization alone retains compatibility with the original flat format.
     if(view.legacy() && !view.contains(root_key)) {
-        for(auto& [key,value]:changes)batch.push_back({key,std::move(value)});
+        for(const auto& [key,value]:changes)batch.push_back({key,value});
     } else {
         NamespaceView::Changes delta;std::map<std::string,Bytes> new_objects;
         const auto allocated=prefix+"allocated/";
@@ -278,8 +277,13 @@ void Namespace::commit_changes(const NamespaceView& view,Changes& changes) {
             batch.push_back({history+"world/"+view_,std::move(plan.manifest)});
         }
     }
+    return batch;
+}
+void Namespace::commit_changes(const NamespaceView& view,Changes& changes) {
+    if(changes.empty())return;auto prepare_start=std::chrono::steady_clock::now();
+    auto batch=prepare_changes(view,changes);
     container_.metadata_prepare_ns_+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-prepare_start).count();
-    journal.transact(journal.sequence(),batch);
+    auto& journal=*container_.journal_;journal.transact(journal.sequence(),batch);
 }
 
 std::string Namespace::snapshot(const std::string& name) {
@@ -391,6 +395,13 @@ void Namespace::build_parent_index() {
         need(records.size()<=1024,"parent index upgrade is limited to 1024 directories per atomic transaction");
         for(const auto& [id,value]:records){changes[parent_key(id)]=value;auto n=inode(view,id);n.indexed_directory=true;changes[inode_key(id)]=encode(n);}
         changes[parent_index_key]=Bytes{'F','F','P','I','D','X','0','1'};
+        // Count the actual objects, metadata plan and manifest before update can
+        // compact or publish. Directory count alone is not a transaction budget.
+        const bool leveldb=container_.journal_->is_leveldb();
+        if(prepare_changes(view,changes).size()>(leveldb?4096u:64u))
+            throw std::system_error(E2BIG,std::generic_category(),leveldb?
+                "parent index upgrade exceeds LevelDB 4096-mutation limit":
+                "parent index upgrade exceeds object-journal 64-mutation limit");
     });
 }
 InodeInfo Namespace::parent_inode(const std::string& id) const {

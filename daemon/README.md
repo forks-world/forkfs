@@ -229,9 +229,13 @@ Existing namespaces without the marker remain readable/writable without a
 migration. `build_parent_index()` explicitly upgrades only the selected writable
 view in one transaction, is idempotent, and never rewrites earlier revisions or
 other branches. Read-only revision queries use a traversal fallback and never
-write an index. The initial atomic upgrade is limited to 1024 directories
-(including root) to bound transaction size; larger historical trees need a staged
-upgrade design. New indexed namespaces have no such directory-count restriction.
+write an index. The initial atomic upgrade considers at most 1024 directories (including root),
+and preflights the actual generated mutation batch: at most 64 mutations for the
+legacy object journal or 4096 for LevelDB. Parent payloads, versioned inode
+payloads, metadata pages/runs and the World manifest all count, so a tree below
+1024 directories can still exceed its backend budget. Such an upgrade returns
+E2BIG before publication or automatic compaction; the original view remains
+usable. Oversized historical trees need a staged upgrade design. New indexed namespaces have no such directory-count restriction.
 Indexed directories use `FFINOD02` with the same 48-byte layout; regular files and
 symlinks retain `FFINOD01`. Upgrade changes every directory inode's version in the
 same transaction as the marker and parent records. This makes old directory

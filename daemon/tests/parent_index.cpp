@@ -1,10 +1,21 @@
 #include "namespace.h"
 #include <filesystem>
+#include <fcntl.h>
 #include <iostream>
 #include <unistd.h>
 using namespace forkfs;
 void check(bool value){if(!value)throw std::runtime_error("parent index regression failed");}
 template<class F> void rejects(F operation){try{operation();}catch(const std::exception&){return;}throw std::runtime_error("expected parent index rejection");}
+void unindex_fixture(const std::string& path,bool legacy,const std::string& id) {
+    auto edit=[&](Journal& journal){auto pre=std::string("\0forkfs/",8);auto value=journal.get(pre+"inode/"+id);value[7]='1';
+        journal.transact(journal.sequence(),{{pre+"parent-index",std::nullopt},{pre+"parent/"+id,std::nullopt},{pre+"inode/"+id,value}});
+    };
+    if(!legacy){Journal journal(path);edit(journal);return;}
+    int fd=open(path.c_str(),O_RDWR|O_CLOEXEC);check(fd>=0);
+    try{std::array<unsigned char,16> repository{};check(pread(fd,repository.data(),repository.size(),16)==static_cast<ssize_t>(repository.size()));
+        Journal journal(fd,repository);edit(journal);
+    }catch(...){close(fd);throw;}close(fd);
+}
 int main(){
     auto pattern=(std::filesystem::temp_directory_path()/"ff-parent-index-XXXXXX").string();auto temp=mkdtemp(pattern.data());if(!temp)return 1;
     auto path=std::string(temp)+"/new",old=std::string(temp)+"/old";
@@ -40,6 +51,23 @@ int main(){
             fs.verify();before.verify();work.verify();fs.compact();store.verify();fs.restore("before");check(!fs.has_parent_index());fs.build_parent_index();fs.verify();
         }
         {Container store(old);Namespace fs(store),before(store,"before",true);check(fs.has_parent_index() && !before.has_parent_index());store.verify();}
+        // The same directory count has different admission limits by backend.
+        for(bool legacy : {false,true})for(unsigned count : {2u,64u}) {
+            auto upgrade=std::string(temp)+(legacy?"/legacy-":"/leveldb-")+std::to_string(count);
+            if(legacy)Container::create_legacy(upgrade);else Container::create(upgrade);
+            std::string id;{Container store(upgrade);Namespace fs(store);fs.initialize();id=fs.root_inode().id;}
+            unindex_fixture(upgrade,legacy,id);
+            Container store(upgrade);Namespace fs(store);
+            for(unsigned i=0;i<count;++i)fs.mkdir("/d"+std::to_string(i));
+            fs.snapshot("before");Namespace before(store,"before",true);auto stable=store.status();
+            if(legacy && count==64) {
+                bool overflow=false;try{fs.build_parent_index();}catch(const std::system_error& e){overflow=e.code().value()==E2BIG && std::string(e.what()).find("object-journal 64-mutation limit")!=std::string::npos;}
+                check(overflow && store.status()==stable && !fs.has_parent_index() && !fs.root_inode().indexed_directory);
+                check(!fs.stat("/d63").indexed_directory && !before.has_parent_index());
+                check(fs.parent_inode(fs.stat("/d63").id).id==id); // Original fallback remains usable.
+            }else{fs.build_parent_index();check(fs.has_parent_index() && fs.root_inode().indexed_directory && !before.has_parent_index());}
+            fs.verify();before.verify();store.verify();
+        }
         auto bad=std::string(temp)+"/bad";Container::create(bad);std::string badroot;
         {Container store(bad);Namespace fs(store);fs.initialize();badroot=fs.root_inode().id;}
         {Journal journal(bad);journal.put(std::string("\0forkfs/",8)+"parent/"+badroot,{'b','a','d'});}
