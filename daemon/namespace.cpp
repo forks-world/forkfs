@@ -659,13 +659,24 @@ void Namespace::handle_set_attributes(const std::string& token,const Attributes&
 InodeInfo Namespace::lstat(const std::string& path) const {
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);return inode(view,resolve(view,path,false));
 }
+InodeInfo Namespace::symlink_entry(const NamespaceView& view,Changes& c,const std::string& parent_id,
+                                 const std::string& name,const std::string& target) {
+    if(target.size()>4096)throw std::system_error(ENAMETOOLONG,std::generic_category(),"symlink target too long");
+    try{target_components(target);}catch(const std::runtime_error&){throw std::system_error(EINVAL,std::generic_category(),"invalid symlink target");}
+    auto p=inode_parent(view,parent_id,name);
+    if(view.contains(p.key))throw std::system_error(EEXIST,std::generic_category(),"entry already exists");
+    auto id=new_id(view);InodeInfo n{id,false,0777,1,target.size(),now(),now(),true};auto pn=inode(view,p.id);touch(pn);
+    c[inode_key(id)]=encode(n);c[content_key(id)]=Bytes(target.begin(),target.end());c[allocated_key(id)]=Bytes{};
+    c[p.key]=id_bytes(id);c[inode_key(p.id)]=encode(pn);return n;
+}
+InodeInfo Namespace::symlink_child(const std::string& parent_id,const std::string& name,const std::string& target) {
+    if(revision_)throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");
+    InodeInfo result;update([&](const NamespaceView& view,Changes& c){result=symlink_entry(view,c,parent_id,name,target);});return result;
+}
 void Namespace::symlink(const std::string& target,const std::string& path) {
     target_components(target);
     update([&](const NamespaceView& view,Changes& c) {
-        auto p=parent(view,path);need(!view.contains(p.key),"path already exists");auto id=new_id(view);
-        InodeInfo n{id,false,0777,1,target.size(),now(),now(),true};auto pn=inode(view,p.id);touch(pn);
-        c[inode_key(id)]=encode(n);c[content_key(id)]=Bytes(target.begin(),target.end());c[allocated_key(id)]=Bytes{};
-        c[p.key]=id_bytes(id);c[inode_key(p.id)]=encode(pn);
+        auto p=parent(view,path);symlink_entry(view,c,p.id,p.name,target);
     });
 }
 std::string Namespace::readlink(const std::string& path) const {
@@ -675,11 +686,23 @@ std::string Namespace::readlink(const std::string& path) const {
 }
 void Namespace::link(const std::string& source,const std::string& target) {
     update([&](const NamespaceView& j,Changes& c) {
-        auto id=resolve(j,source,false);auto n=inode(j,id);need(!n.directory,"directory hard links are forbidden");
-        auto p=parent(j,target);need(!j.contains(p.key),"target already exists");need(n.links<UINT64_MAX,"link count exhausted");
-        ++n.links;n.changed_ns=now();auto pn=inode(j,p.id);touch(pn);
-        c[p.key]=id_bytes(id);c[inode_key(id)]=encode(n);c[inode_key(p.id)]=encode(pn);c[allocated_key(id)]=Bytes{};
+        auto id=resolve(j,source,false);auto p=parent(j,target);link_entry(j,c,id,p.id,p.name);
     });
+}
+InodeInfo Namespace::link_entry(const NamespaceView& view,Changes& c,const std::string& id,
+                              const std::string& parent_id,const std::string& name) {
+    if(!valid_id(id))throw std::system_error(EINVAL,std::generic_category(),"invalid source inode");
+    if(!view.contains(inode_key(id)))throw std::system_error(ENOENT,std::generic_category(),"source inode missing");
+    auto n=inode(view,id);if(n.directory)throw std::system_error(EPERM,std::generic_category(),"directory hard links are forbidden");
+    auto p=inode_parent(view,parent_id,name);
+    if(view.contains(p.key))throw std::system_error(EEXIST,std::generic_category(),"entry already exists");
+    if(n.links==UINT64_MAX)throw std::system_error(EMLINK,std::generic_category(),"link count exhausted");
+    ++n.links;n.changed_ns=now();auto pn=inode(view,p.id);touch(pn);
+    c[p.key]=id_bytes(id);c[inode_key(id)]=encode(n);c[inode_key(p.id)]=encode(pn);c[allocated_key(id)]=Bytes{};return n;
+}
+InodeInfo Namespace::link_child(const std::string& source,const std::string& parent_id,const std::string& name) {
+    if(revision_)throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");
+    InodeInfo result;update([&](const NamespaceView& view,Changes& c){result=link_entry(view,c,source,parent_id,name);});return result;
 }
 void Namespace::retire(const NamespaceView& j,Changes& c,const InodeInfo& n) {
     c[inode_key(n.id)]=std::nullopt;if(n.directory){if(indexed_parents(j))c[parent_key(n.id)]=std::nullopt;return;}

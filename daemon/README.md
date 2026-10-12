@@ -203,8 +203,14 @@ an overwritten or unlinked regular file remain valid until closed.
 Indexed views prevent rename cycles by walking destination ancestors and verifying
 parent backlinks; the work depends on directory depth, not moved subtree size.
 Old unindexed views retain the paged subtree fallback until explicitly upgraded. Names and
-modes retain the prototype's printable-ASCII and 0777 restrictions. Symlink and
-hardlink creation by inode, richer attributes and writable FSKit callbacks remain
+modes retain the prototype's printable-ASCII and 0777 restrictions.
+`symlink_child(parent, name, target)` creates a symbolic link without resolving
+the target; `readlink_inode()` reads its stored target. `link_child(source_inode,
+parent, name)` adds a hard link to the exact inode in this view, including symbolic
+links themselves. It rejects directory sources and unlinked or stale source
+inodes, even if a handle still retains their contents. Both operations validate
+the parent and publish atomically, share their mutation logic with path APIs,
+and reject revision writes. Richer attributes and writable FSKit callbacks remain
 outstanding.
 
 
