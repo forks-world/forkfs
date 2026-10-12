@@ -219,6 +219,15 @@ writes return EROFS, and invalid attributes return EINVAL. An empty update valid
 the inode but does not publish a transaction. Handle-based updates remain available
 for retained unlinked files.
 
+`open_directory_inode()` opens a stable directory cursor by inode on LevelDB.
+It shares path-based cursor semantics: enumeration and optional attributes come
+from the captured metadata root, survive later rename/removal, and are revoked by
+restore or Container destruction. `list_inode()` instead pages the current view;
+its name cookie does not freeze concurrent changes. Legacy journal views support
+live paging but return ENOTSUP for stable cursors. Inode reads report EINVAL for
+malformed IDs, ENOENT for missing inodes, ENOTDIR/EISDIR for wrong directory types,
+and ELOOP when a regular-file read addresses a symbolic link.
+
 
 ## Versioned directory parent index
 

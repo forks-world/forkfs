@@ -26,6 +26,7 @@ public:
     struct DirectoryEntry {std::string name;InodeInfo inode;};
     struct DirectoryPage {std::vector<std::string> names;bool eof;std::vector<DirectoryEntry> entries;};
     DirectoryCursor open_directory(const std::string& path) const;
+    DirectoryCursor open_directory_inode(const std::string& inode_id) const;
     DirectoryPage read_directory(DirectoryCursor& cursor,size_t limit,bool attributes=false) const;
     void rewind_directory(DirectoryCursor& cursor) const;
     enum class Access {Read,Write,ReadWrite};
@@ -99,6 +100,7 @@ public:
     uint64_t handle_append(const std::string& handle,const std::vector<unsigned char>& value);
     void handle_truncate(const std::string& handle,uint64_t size);
 private:
+    DirectoryCursor directory_cursor(const NamespaceView& view,const std::string& inode_id) const;
     friend class Container;
     static void recover_orphans(Container& container);
     const Container::OpenHandle& find_handle(const std::string& handle) const;
