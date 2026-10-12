@@ -211,7 +211,13 @@ links themselves. It rejects directory sources and unlinked or stale source
 inodes, even if a handle still retains their contents. Both operations validate
 the parent and publish atomically, share their mutation logic with path APIs,
 and reject revision writes. Richer attributes and writable FSKit callbacks remain
-outstanding.
+outstanding. `set_inode_attributes(inode, attributes)` updates the selected inode's
+mode and modification time atomically, without following symbolic links or relying
+on its current path. Hard-link aliases observe the same attributes; snapshots and
+other branches remain unchanged. Missing or unlinked inodes return ENOENT, revision
+writes return EROFS, and invalid attributes return EINVAL. An empty update validates
+the inode but does not publish a transaction. Handle-based updates remain available
+for retained unlinked files.
 
 
 ## Versioned directory parent index

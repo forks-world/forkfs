@@ -648,6 +648,16 @@ void Namespace::set_attributes(const std::string& path,const Attributes& a) {
         apply_attributes(n,a);changes[inode_key(id)]=encode(n);
     });
 }
+void Namespace::set_inode_attributes(const std::string& id,const Attributes& a) {
+    if(revision_)throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");
+    if(!valid_id(id))throw std::system_error(EINVAL,std::generic_category(),"invalid inode identity");
+    try{valid_attributes(a);}catch(const std::runtime_error&){throw std::system_error(EINVAL,std::generic_category(),"unsupported inode attributes");}
+    update([&](const NamespaceView& view,Changes& changes) {
+        if(!view.contains(inode_key(id)))throw std::system_error(ENOENT,std::generic_category(),"inode missing");
+        auto n=inode(view,id);if(!a.mode && !a.modified_ns)return;
+        apply_attributes(n,a);changes[inode_key(id)]=encode(n);
+    });
+}
 void Namespace::handle_set_attributes(const std::string& token,const Attributes& a) {
     valid_attributes(a);need(!revision_,"revision view is read-only");
     std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);
