@@ -18,6 +18,7 @@ public:
     enum class OpenMode {ReadWrite,RevisionPreview};
     explicit Container(const std::string& path,OpenMode mode=OpenMode::ReadWrite);
     ~Container();
+    OpenMode open_mode() const noexcept {return mode_;}
     Container(const Container&) = delete;
     Container& operator=(const Container&) = delete;
     std::string status() const;
@@ -34,6 +35,7 @@ public:
     std::vector<std::vector<unsigned char>> get_many(const std::vector<std::string>& keys) const;
     std::vector<unsigned char> get(const std::string& key) const;
 private:
+    const OpenMode mode_;
     uint64_t metadata_prepare_ns_=0;
     friend class Namespace;
     std::shared_ptr<const int> lifetime_=std::make_shared<const int>(0);

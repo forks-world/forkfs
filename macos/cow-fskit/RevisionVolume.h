@@ -2,11 +2,13 @@
 #ifdef __cplusplus
 #include "container.h"
 #include <memory>
-// Experimental read-only adapter. Owns repository lifetime; no host-file I/O.
+// Experimental inode adapter. The resource loader still exposes revisions only.
 @interface ForkRevisionVolume : FSVolume <FSVolumeOperations, FSVolumeReadWriteOperations, FSVolumeXattrOperations>
 @property(nonatomic,readonly) FSItem *rootItem;
-- (void)revoke;
+- (NSError *)revoke;
 - (instancetype)initWithStore:(std::shared_ptr<forkfs::Container>)store
                      revision:(NSString *)revision error:(NSError **)error;
+- (instancetype)initWithStore:(std::shared_ptr<forkfs::Container>)store
+                        world:(NSString *)world error:(NSError **)error;
 @end
 #endif

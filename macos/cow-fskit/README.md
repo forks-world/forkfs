@@ -8,10 +8,11 @@ older targets because the path-resource loader uses FSKit V2. This matches the
 host and extension plist minimum versions.
 The optional target links FSKit directly to `forkfs_namespace`; it performs no
 host-file passthrough and no per-operation RPC. The volume owns a shared
-Container and selects a named immutable revision. A live World is not accepted.
+Container. The resource loader selects a named immutable revision; a separate
+World constructor is available to callback tests, but is not exposed by the loader.
 
 Lookup, attributes, symlink reads, regular-file reads and directory enumeration
-use logical inodes. All mutation callbacks return EROFS. Hardlinks reuse the same
+use logical inodes. Revision mutation callbacks return EROFS. Hardlinks reuse the same
 FSItem. Numeric item IDs last only for this volume lifetime, and persistent IDs
 are explicitly disabled. At most 4096 items are retained; quota exhaustion
 returns ENFILE. Directory cookies are entry ordinals in the immutable
@@ -26,9 +27,8 @@ refusal. Directory operations on regular files return ENOTDIR, regular reads of
 directories return EISDIR and foreign items return ESTALE. Directory attributes
 include the parent item ID; hardlinked regular files do not claim a unique parent.
 
-The revision namespace currently stores no extended attributes. Xattr listing
-returns an empty array, queries (including com.apple.provenance) return ENOATTR,
-and all set/delete policies return EROFS. Get/list read versioned inode xattrs;
+Get/list read versioned inode xattrs, missing names return ENOATTR,
+and all revision set/delete policies return EROFS;
 the pathconf maximum xattr size is 64 KiB. The adapter conforms to the general
 xattr protocol and intentionally omits the limited-name hook. These callbacks
 never inspect backing-file xattrs. Revocation takes precedence over item/cookie
@@ -100,3 +100,38 @@ is refused. Ad-hoc signing is refused; the tool does not install or register
 anything. Signing and provisioning have not been exercised here. Profile/team
 requirements, OS registration and real mounts still need validation on a configured
 machine. The unsigned preview window is not evidence that FSKit can load the bundle.
+
+## World file I/O callback stage
+
+`initWithStore:world:error:` accepts a writable LevelDB Container and selects a
+live World. This constructor is for direct integration and callback tests only;
+the resource loader, containing app and revision descriptor still expose only
+immutable revisions. A RevisionPreview Container is rejected with EROFS.
+
+World callbacks now implement writes to existing regular files, atomic
+size/mode/uid/gid/mtime/atime/birthtime updates, and all four xattr policies.
+Attributes report the stored ownership and timestamps, including zero values;
+identity mapping and permission enforcement remain frontend work. Unsupported
+set attributes (including flags and ctime), malformed timestamps and invalid
+modes are rejected before mutation. Only successfully applied fields are marked
+consumed. Prototype file and xattr limits remain 256 KiB and 64 KiB respectively.
+
+Each retained regular FSItem pins a backend read/write handle. This is an internal
+lifetime pin, not an authorization decision or a POSIX open mode. Hardlinks share
+that pin. Reads, attributes and xattrs continue to work after unlink until reclaim
+or revocation closes it. Reclaim invalidates the old FSItem and retains its numeric
+identity for subsequent lookup; the existing 4096 lifetime identity limit remains.
+Revocation closes pins before releasing engine references and returns cleanup
+errors; failed cleanup can be retried, while further callbacks remain revoked.
+Deactivate propagates cleanup failure. Restore must happen after revoking the
+World adapter because backend restore invalidates all World handles.
+
+World namespace mutations and directory enumeration currently return ENOTSUP.
+Mutable directory enumeration cannot reuse revision ordinal cookies; pinned
+cursor enumeration and namespace callbacks form the next stage. This World
+constructor is deliberately not loadable as a mounted filesystem yet.
+`forkfsd_fskit_world` exercises writes, atomic rejection, timestamp conversion,
+xattr policies, hardlink identity, fork/revision isolation, open-unlink retention,
+reclaim, revocation and reopen persistence. It joins metadata-regression on the
+macOS FSKit CI job. Actual kernel buffers, mounting, authorization and fault-time
+cleanup still need integration validation.
