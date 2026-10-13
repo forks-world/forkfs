@@ -26,6 +26,7 @@ public:
     struct DirectoryEntry {std::string name;InodeInfo inode;};
     struct DirectoryPage {std::vector<std::string> names;bool eof;std::vector<DirectoryEntry> entries;};
     DirectoryCursor open_directory(const std::string& path) const;
+    DirectoryCursor open_directory_inode(const std::string& inode_id) const;
     DirectoryPage read_directory(DirectoryCursor& cursor,size_t limit,bool attributes=false) const;
     void rewind_directory(DirectoryCursor& cursor) const;
     enum class Access {Read,Write,ReadWrite};
@@ -51,6 +52,8 @@ public:
     std::string readlink_inode(const std::string& inode_id) const;
     DirectoryPage list_inode(const std::string& inode_id,const std::string& after,size_t limit) const;
     InodeInfo create_child(const std::string& parent_inode,const std::string& name,bool directory,uint32_t mode);
+    InodeInfo symlink_child(const std::string& parent_inode,const std::string& name,const std::string& target);
+    InodeInfo link_child(const std::string& source_inode,const std::string& parent_inode,const std::string& name);
     void remove_child(const std::string& parent_inode,const std::string& name,
                       const std::string& expected_inode,bool directory);
     void rename_child(const std::string& source_parent,const std::string& source_name,
@@ -71,6 +74,7 @@ public:
     std::vector<std::string> list(const std::string& path) const;
     InodeInfo stat(const std::string& path) const;
     void set_attributes(const std::string& path,const Attributes& attributes);
+    void set_inode_attributes(const std::string& inode_id,const Attributes& attributes);
     void handle_set_attributes(const std::string& handle,const Attributes& attributes);
     InodeInfo lstat(const std::string& path) const;
     void symlink(const std::string& target,const std::string& path);
@@ -96,6 +100,7 @@ public:
     uint64_t handle_append(const std::string& handle,const std::vector<unsigned char>& value);
     void handle_truncate(const std::string& handle,uint64_t size);
 private:
+    DirectoryCursor directory_cursor(const NamespaceView& view,const std::string& inode_id) const;
     friend class Container;
     static void recover_orphans(Container& container);
     const Container::OpenHandle& find_handle(const std::string& handle) const;
@@ -103,6 +108,10 @@ private:
     std::vector<unsigned char> read_handle_locked(const Container::OpenHandle& info,uint64_t offset,uint64_t count) const;
     using Changes=std::map<std::string,std::optional<std::vector<unsigned char>>>;
     void retire(const NamespaceView& view,Changes& changes,const InodeInfo& inode);
+    InodeInfo symlink_entry(const NamespaceView& view,Changes& changes,const std::string& parent,
+                           const std::string& name,const std::string& target);
+    InodeInfo link_entry(const NamespaceView& view,Changes& changes,const std::string& source,
+                        const std::string& parent,const std::string& name);
     void remove_entry(const NamespaceView& view,Changes& changes,const std::string& parent,
                       const std::string& name,bool directory);
     void rename_entry(const NamespaceView& view,Changes& changes,const std::string& source_parent,

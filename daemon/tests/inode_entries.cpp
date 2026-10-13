@@ -11,6 +11,49 @@ int main(){
     auto pattern=(std::filesystem::temp_directory_path()/"ff-inode-entries-XXXXXX").string();auto temp=mkdtemp(pattern.data());if(!temp)return 1;
     auto path=std::string(temp)+"/store";
     try{
+        for(bool legacy:{false,true}) {
+            auto links=std::string(temp)+(legacy?"/legacy-links":"/links");
+            if(legacy)Container::create_legacy(links);else Container::create(links);
+            std::string file,symlink;
+            {Container store(links);Namespace fs(store);fs.initialize();auto root=fs.root_inode().id;
+                auto dir=fs.create_child(root,"dir",true,0755);auto n=fs.create_child(dir.id,"file",false,0644);file=n.id;
+                fs.write("/dir/file",Bytes{'L'});std::string handle;
+                if(!legacy)handle=fs.open_inode(file,Namespace::Access::ReadWrite);
+                fs.rename("/dir","/moved");auto alias=fs.link_child(file,dir.id,"alias");check(alias.id==file && alias.links==2);
+                auto link=fs.symlink_child(dir.id,"sym","../moved/file");symlink=link.id;
+                check(link.symlink && fs.readlink_inode(symlink)=="../moved/file" && fs.read("/moved/sym")==Bytes{'L'});
+                auto symalias=fs.link_child(symlink,root,"symalias");check(symalias.id==symlink && symalias.links==2 && fs.readlink("/symalias")=="../moved/file");
+                fs.snapshot("links");fs.fork("links","work");Namespace revision(store,"links",true),work(store,"work");auto stable=store.status();
+                error(EROFS,[&]{revision.link_child(file,root,"readonly");});error(EROFS,[&]{revision.symlink_child(root,"readonly","x");});
+                error(EPERM,[&]{fs.link_child(dir.id,root,"dirlink");});error(EEXIST,[&]{fs.link_child(file,dir.id,"alias");});
+                error(EEXIST,[&]{fs.symlink_child(dir.id,"sym","x");});error(EINVAL,[&]{fs.symlink_child(root,"bad","");});
+                error(ENAMETOOLONG,[&]{fs.symlink_child(root,"bad",std::string(4097,'x'));});
+                error(ENOTDIR,[&]{fs.link_child(file,file,"bad");});error(EINVAL,[&]{fs.symlink_child(root,"a/b","x");});
+                check(store.status()==stable);
+                fs.set_inode_attributes(file,{0600,123456789});
+                check(fs.stat("/moved/alias").mode==0600 && fs.stat_inode(file).modified_ns==123456789);
+                check(revision.stat_inode(file).mode==0644 && work.stat_inode(file).mode==0644);
+                if(!legacy)check(fs.handle_stat(handle).mode==0600);
+                fs.set_inode_attributes(symlink,{0700,0});check(fs.stat_inode(symlink).mode==0700 && fs.stat_inode(symlink).modified_ns==0);
+                check(fs.stat_inode(file).mode==0600 && fs.readlink_inode(symlink)=="../moved/file");
+                fs.set_inode_attributes(dir.id,{0700,7});check(fs.parent_inode(dir.id).id==root && fs.stat_inode(dir.id).mode==0700);
+                stable=store.status();fs.set_inode_attributes(file,{});check(store.status()==stable);
+                error(EROFS,[&]{revision.set_inode_attributes(file,{});});
+                error(EINVAL,[&]{fs.set_inode_attributes(file,{01000,{}});});
+                error(EINVAL,[&]{fs.set_inode_attributes(file,{{},UINT64_MAX});});
+                error(EINVAL,[&]{fs.set_inode_attributes("bad",{});});check(store.status()==stable);
+                fs.remove_child(dir.id,"file",file,false);check(fs.stat_inode(file).links==1 && fs.read("/moved/alias")==Bytes{'L'});
+                fs.remove_child(dir.id,"alias",file,false);stable=store.status();
+                error(ENOENT,[&]{fs.link_child(file,root,"resurrect");});check(store.status()==stable);
+                error(ENOENT,[&]{fs.set_inode_attributes(file,{0644,{}});});check(store.status()==stable);
+                if(!legacy)check(fs.handle_read(handle,0,9)==Bytes{'L'});
+                check(revision.stat_inode(file).links==2 && work.stat_inode(file).links==2);
+                auto retired=fs.create_child(root,"retired",true,0755);fs.remove_child(root,"retired",retired.id,true);stable=store.status();
+                error(ENOENT,[&]{fs.symlink_child(retired.id,"stale","x");});error(ENOENT,[&]{fs.link_child(symlink,retired.id,"stale");});check(store.status()==stable);
+                if(!legacy)fs.close(handle);fs.verify();revision.verify();work.verify();store.verify();
+            }
+            {Container store(links);Namespace fs(store),revision(store,"links",true);check(fs.readlink_inode(symlink)=="../moved/file" && revision.read_inode(file,0,9)==Bytes{'L'});fs.verify();store.verify();}
+        }
         Container::create(path);
         {
             Container store(path);Namespace fs(store);fs.initialize();auto root=fs.root_inode();

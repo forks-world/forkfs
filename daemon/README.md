@@ -203,9 +203,30 @@ an overwritten or unlinked regular file remain valid until closed.
 Indexed views prevent rename cycles by walking destination ancestors and verifying
 parent backlinks; the work depends on directory depth, not moved subtree size.
 Old unindexed views retain the paged subtree fallback until explicitly upgraded. Names and
-modes retain the prototype's printable-ASCII and 0777 restrictions. Symlink and
-hardlink creation by inode, richer attributes and writable FSKit callbacks remain
-outstanding.
+modes retain the prototype's printable-ASCII and 0777 restrictions.
+`symlink_child(parent, name, target)` creates a symbolic link without resolving
+the target; `readlink_inode()` reads its stored target. `link_child(source_inode,
+parent, name)` adds a hard link to the exact inode in this view, including symbolic
+links themselves. It rejects directory sources and unlinked or stale source
+inodes, even if a handle still retains their contents. Both operations validate
+the parent and publish atomically, share their mutation logic with path APIs,
+and reject revision writes. Richer attributes and writable FSKit callbacks remain
+outstanding. `set_inode_attributes(inode, attributes)` updates the selected inode's
+mode and modification time atomically, without following symbolic links or relying
+on its current path. Hard-link aliases observe the same attributes; snapshots and
+other branches remain unchanged. Missing or unlinked inodes return ENOENT, revision
+writes return EROFS, and invalid attributes return EINVAL. An empty update validates
+the inode but does not publish a transaction. Handle-based updates remain available
+for retained unlinked files.
+
+`open_directory_inode()` opens a stable directory cursor by inode on LevelDB.
+It shares path-based cursor semantics: enumeration and optional attributes come
+from the captured metadata root, survive later rename/removal, and are revoked by
+restore or Container destruction. `list_inode()` instead pages the current view;
+its name cookie does not freeze concurrent changes. Legacy journal views support
+live paging but return ENOTSUP for stable cursors. Inode reads report EINVAL for
+malformed IDs, ENOENT for missing inodes, ENOTDIR/EISDIR for wrong directory types,
+and ELOOP when a regular-file read addresses a symbolic link.
 
 
 ## Versioned directory parent index

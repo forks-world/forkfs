@@ -76,6 +76,11 @@ InodeInfo decode_inode(const Bytes& b,const std::string& id,bool orphan=false) {
     need((orphan?(!n.directory && !n.symlink && n.links==0):n.links>0) && (!n.directory || (n.links>=2 && n.size==0)),"invalid inode state");return n;
 }
 InodeInfo inode(const NamespaceView& journal,const std::string& id) {return decode_inode(journal.get(inode_key(id)),id);}
+InodeInfo frontend_inode(const NamespaceView& view,const std::string& id) {
+    if(!valid_id(id))throw std::system_error(EINVAL,std::generic_category(),"invalid inode identity");
+    if(!view.contains(inode_key(id)))throw std::system_error(ENOENT,std::generic_category(),"inode missing");
+    return inode(view,id);
+}
 std::string orphan_prefix(const std::string& world,const std::string& id) {return history+"orphan/"+world+"/"+id+"/";}
 Bytes encode(const InodeInfo& n) {
     Bytes b(48);memcpy(b.data(),n.indexed_directory?"FFINOD02":"FFINOD01",8);store(b.data()+8,n.symlink?3:n.directory?2:1,4);
@@ -428,37 +433,32 @@ InodeInfo Namespace::parent_inode(const std::string& id) const {
     return inode(view,decode_id(Bytes(found->second.begin()+8,found->second.begin()+40)));
 }
 InodeInfo Namespace::stat_inode(const std::string& id) const {
-    need(valid_id(id),"invalid inode identity");
-    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);return inode(view,id);
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);return frontend_inode(view,id);
 }
 InodeInfo Namespace::lookup_child(const std::string& parent_id,const std::string& name) const {
-    need(valid_id(parent_id),"invalid inode identity");
-    auto parts=components("/"+name);need(parts.size()==1,"lookup requires one component");
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);
-    if(!inode(view,parent_id).directory)throw std::system_error(ENOTDIR,std::generic_category(),"lookup parent");
-    auto key=entry_key(parent_id,name);
+    auto key=inode_parent(view,parent_id,name).key;
     if(!view.contains(key))throw std::system_error(ENOENT,std::generic_category(),"lookup child");
     return inode(view,decode_id(view.get(key)));
 }
 std::vector<unsigned char> Namespace::read_inode(const std::string& id,uint64_t offset,uint64_t count) const {
-    need(valid_id(id) && offset<=INT64_MAX,"invalid inode or file offset");
-    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=inode(view,id);
-    need(!n.directory && !n.symlink,"inode is not a regular file");auto data=view.get(content_key(id));
+    if(offset>INT64_MAX)throw std::system_error(EINVAL,std::generic_category(),"file offset out of range");
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=frontend_inode(view,id);
+    if(n.directory || n.symlink)throw std::system_error(n.directory?EISDIR:ELOOP,std::generic_category(),"inode is not a regular file");auto data=view.get(content_key(id));
     need(data.size()==n.size,"inode size mismatch");if(offset>=data.size() || !count)return {};
     auto length=static_cast<size_t>(std::min<uint64_t>(count,data.size()-offset));
     return Bytes(data.begin()+offset,data.begin()+offset+length);
 }
 std::string Namespace::readlink_inode(const std::string& id) const {
-    need(valid_id(id),"invalid inode identity");
-    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=inode(view,id);
-    need(n.symlink,"inode is not a symbolic link");auto data=view.get(content_key(id));need(data.size()==n.size,"symlink size mismatch");
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=frontend_inode(view,id);
+    if(!n.symlink)throw std::system_error(EINVAL,std::generic_category(),"inode is not a symbolic link");auto data=view.get(content_key(id));need(data.size()==n.size,"symlink size mismatch");
     return std::string(data.begin(),data.end());
 }
 Namespace::DirectoryPage Namespace::list_inode(const std::string& id,const std::string& after,size_t limit) const {
-    need(valid_id(id) && limit>0 && limit<=1024,"invalid inode directory page");
-    if(!after.empty()){auto parts=components("/"+after);need(parts.size()==1,"invalid directory cookie");}
+    if(limit==0 || limit>1024)throw std::system_error(EINVAL,std::generic_category(),"invalid directory page limit");
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);
-    need(inode(view,id).directory,"inode is not a directory");auto prefix=directory_prefix(id);
+    if(!frontend_inode(view,id).directory)throw std::system_error(ENOTDIR,std::generic_category(),"inode is not a directory");
+    if(!after.empty())(void)inode_parent(view,id,after);auto prefix=directory_prefix(id);
     auto keys=view.page(prefix,after.empty()?"":prefix+after,limit+1);
     DirectoryPage result;result.eof=keys.size()<=limit;if(!result.eof)keys.resize(limit);
     for(const auto& key:keys){auto name=key.substr(prefix.size());result.names.push_back(name);result.entries.push_back({name,inode(view,decode_id(view.get(key)))});}
@@ -605,6 +605,16 @@ std::vector<std::string> Namespace::list(const std::string& path) const {
 Namespace::DirectoryCursor Namespace::open_directory(const std::string& path) const {
     std::lock_guard lock(container_.mutex_);const auto& j=*container_.journal_;need(j.is_leveldb(),"directory cursors require LevelDB");
     NamespaceView view(j,view_,revision_);auto id=resolve(view,path);need(inode(view,id).directory,"path is not a directory");
+    return directory_cursor(view,id);
+}
+Namespace::DirectoryCursor Namespace::open_directory_inode(const std::string& id) const {
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);
+    if(!frontend_inode(view,id).directory)throw std::system_error(ENOTDIR,std::generic_category(),"inode is not a directory");
+    if(!container_.journal_->is_leveldb())throw std::system_error(ENOTSUP,std::generic_category(),"directory cursors require LevelDB");
+    return directory_cursor(view,id);
+}
+Namespace::DirectoryCursor Namespace::directory_cursor(const NamespaceView& view,const std::string& id) const {
+    const auto& j=*container_.journal_;
     DirectoryCursor cursor;cursor.lifetime_=container_.lifetime_;cursor.view_=view_;cursor.revision_=revision_;cursor.prefix_=directory_prefix(id);
     if(!revision_)cursor.generation_=world_generation(j,view_);
     if(view.legacy()){need(view.keys(cursor.prefix_).empty(),"flat namespace directory is not empty");cursor.done_=true;}
@@ -648,6 +658,16 @@ void Namespace::set_attributes(const std::string& path,const Attributes& a) {
         apply_attributes(n,a);changes[inode_key(id)]=encode(n);
     });
 }
+void Namespace::set_inode_attributes(const std::string& id,const Attributes& a) {
+    if(revision_)throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");
+    if(!valid_id(id))throw std::system_error(EINVAL,std::generic_category(),"invalid inode identity");
+    try{valid_attributes(a);}catch(const std::runtime_error&){throw std::system_error(EINVAL,std::generic_category(),"unsupported inode attributes");}
+    update([&](const NamespaceView& view,Changes& changes) {
+        if(!view.contains(inode_key(id)))throw std::system_error(ENOENT,std::generic_category(),"inode missing");
+        auto n=inode(view,id);if(!a.mode && !a.modified_ns)return;
+        apply_attributes(n,a);changes[inode_key(id)]=encode(n);
+    });
+}
 void Namespace::handle_set_attributes(const std::string& token,const Attributes& a) {
     valid_attributes(a);need(!revision_,"revision view is read-only");
     std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);
@@ -659,13 +679,24 @@ void Namespace::handle_set_attributes(const std::string& token,const Attributes&
 InodeInfo Namespace::lstat(const std::string& path) const {
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);return inode(view,resolve(view,path,false));
 }
+InodeInfo Namespace::symlink_entry(const NamespaceView& view,Changes& c,const std::string& parent_id,
+                                 const std::string& name,const std::string& target) {
+    if(target.size()>4096)throw std::system_error(ENAMETOOLONG,std::generic_category(),"symlink target too long");
+    try{target_components(target);}catch(const std::runtime_error&){throw std::system_error(EINVAL,std::generic_category(),"invalid symlink target");}
+    auto p=inode_parent(view,parent_id,name);
+    if(view.contains(p.key))throw std::system_error(EEXIST,std::generic_category(),"entry already exists");
+    auto id=new_id(view);InodeInfo n{id,false,0777,1,target.size(),now(),now(),true};auto pn=inode(view,p.id);touch(pn);
+    c[inode_key(id)]=encode(n);c[content_key(id)]=Bytes(target.begin(),target.end());c[allocated_key(id)]=Bytes{};
+    c[p.key]=id_bytes(id);c[inode_key(p.id)]=encode(pn);return n;
+}
+InodeInfo Namespace::symlink_child(const std::string& parent_id,const std::string& name,const std::string& target) {
+    if(revision_)throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");
+    InodeInfo result;update([&](const NamespaceView& view,Changes& c){result=symlink_entry(view,c,parent_id,name,target);});return result;
+}
 void Namespace::symlink(const std::string& target,const std::string& path) {
     target_components(target);
     update([&](const NamespaceView& view,Changes& c) {
-        auto p=parent(view,path);need(!view.contains(p.key),"path already exists");auto id=new_id(view);
-        InodeInfo n{id,false,0777,1,target.size(),now(),now(),true};auto pn=inode(view,p.id);touch(pn);
-        c[inode_key(id)]=encode(n);c[content_key(id)]=Bytes(target.begin(),target.end());c[allocated_key(id)]=Bytes{};
-        c[p.key]=id_bytes(id);c[inode_key(p.id)]=encode(pn);
+        auto p=parent(view,path);symlink_entry(view,c,p.id,p.name,target);
     });
 }
 std::string Namespace::readlink(const std::string& path) const {
@@ -675,11 +706,23 @@ std::string Namespace::readlink(const std::string& path) const {
 }
 void Namespace::link(const std::string& source,const std::string& target) {
     update([&](const NamespaceView& j,Changes& c) {
-        auto id=resolve(j,source,false);auto n=inode(j,id);need(!n.directory,"directory hard links are forbidden");
-        auto p=parent(j,target);need(!j.contains(p.key),"target already exists");need(n.links<UINT64_MAX,"link count exhausted");
-        ++n.links;n.changed_ns=now();auto pn=inode(j,p.id);touch(pn);
-        c[p.key]=id_bytes(id);c[inode_key(id)]=encode(n);c[inode_key(p.id)]=encode(pn);c[allocated_key(id)]=Bytes{};
+        auto id=resolve(j,source,false);auto p=parent(j,target);link_entry(j,c,id,p.id,p.name);
     });
+}
+InodeInfo Namespace::link_entry(const NamespaceView& view,Changes& c,const std::string& id,
+                              const std::string& parent_id,const std::string& name) {
+    if(!valid_id(id))throw std::system_error(EINVAL,std::generic_category(),"invalid source inode");
+    if(!view.contains(inode_key(id)))throw std::system_error(ENOENT,std::generic_category(),"source inode missing");
+    auto n=inode(view,id);if(n.directory)throw std::system_error(EPERM,std::generic_category(),"directory hard links are forbidden");
+    auto p=inode_parent(view,parent_id,name);
+    if(view.contains(p.key))throw std::system_error(EEXIST,std::generic_category(),"entry already exists");
+    if(n.links==UINT64_MAX)throw std::system_error(EMLINK,std::generic_category(),"link count exhausted");
+    ++n.links;n.changed_ns=now();auto pn=inode(view,p.id);touch(pn);
+    c[p.key]=id_bytes(id);c[inode_key(id)]=encode(n);c[inode_key(p.id)]=encode(pn);c[allocated_key(id)]=Bytes{};return n;
+}
+InodeInfo Namespace::link_child(const std::string& source,const std::string& parent_id,const std::string& name) {
+    if(revision_)throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");
+    InodeInfo result;update([&](const NamespaceView& view,Changes& c){result=link_entry(view,c,source,parent_id,name);});return result;
 }
 void Namespace::retire(const NamespaceView& j,Changes& c,const InodeInfo& n) {
     c[inode_key(n.id)]=std::nullopt;if(n.directory){if(indexed_parents(j))c[parent_key(n.id)]=std::nullopt;return;}
