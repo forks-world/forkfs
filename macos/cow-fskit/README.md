@@ -126,12 +126,52 @@ errors; failed cleanup can be retried, while further callbacks remain revoked.
 Deactivate propagates cleanup failure. Restore must happen after revoking the
 World adapter because backend restore invalidates all World handles.
 
-World namespace mutations and directory enumeration currently return ENOTSUP.
-Mutable directory enumeration cannot reuse revision ordinal cookies; pinned
-cursor enumeration and namespace callbacks form the next stage. This World
-constructor is deliberately not loadable as a mounted filesystem yet.
+World callbacks also create files/directories/symlinks, link, remove, rename and
+enumerate directories. This World constructor is deliberately not loadable as a
+mounted filesystem yet.
 `forkfsd_fskit_world` exercises writes, atomic rejection, timestamp conversion,
 xattr policies, hardlink identity, fork/revision isolation, open-unlink retention,
 reclaim, revocation and reopen persistence. It joins metadata-regression on the
 macOS FSKit CI job. Actual kernel buffers, mounting, authorization and fault-time
 cleanup still need integration validation.
+
+## World namespace and enumeration
+
+Creation validates requested attributes before publication. Initial mode, size,
+ownership and timestamps are stored with the directory entry and zero-filled
+content in one transaction. Regular-file creation also reserves its backend
+handle before committing; handle quota failure cannot leave a created file.
+Directory and symlink size requests are rejected. FSKit request type attributes
+must match the requested creation type. Other unsupported attributes fail without
+creating anything. The existing inode identity quota is checked before creation.
+
+Link/remove/rename use inode-relative backend operations, including expected
+source and replacement inode IDs. A stale source or target returns ESTALE rather
+than deleting a replacement entry. Overwritten/unlinked regular FSItems keep their
+handle until reclaim. Directory moves update parent lookup through the backend
+parent index. Revisions continue to reject these mutations with EROFS.
+
+World directory enumerations use immutable backend cursors, with attributes from
+the same captured view. The adapter assigns numeric IDs without opening live
+files, so removed entries can still be enumerated from a captured view. Each
+(directory, attributes-mode) has one enumeration: a fresh initial cookie and
+verifier starts a new snapshot and invalidates the previous verifier for that
+pair. Cookies returned by a successful pack may be replayed, including earlier
+cookies. A full packer does not consume its rejected entry. Name-only enumeration
+includes dot entries; attribute enumeration omits them as required by FSKit.
+
+At most 128 enumeration contexts are retained. Starting another evicts the oldest
+context; stale, evicted, wrong-mode and unissued cookies return
+FSErrorInvalidDirectoryCookie so the caller can restart. Reclaim and revoke clear
+contexts. Sequential resumption retains a backend cursor checkpoint and replays at most
+one 128-entry batch; it does not rescan the directory prefix for every small page.
+Replaying earlier cookies can still scan from the captured root. Backend
+restore still requires revoking the adapter first.
+
+`forkfsd_fskit_namespace` tests atomic creation rejection, hardlinks/symlinks,
+stale mutation arguments, rename-over-open-file, directory moves/cycles, snapshot
+pagination across deletion and compaction, rejected pack entries, replay/EOF,
+128-entry boundaries, cursor eviction, and persistence/isolation. The portable
+`forkfsd_inode_create` regression additionally verifies creation attributes on
+both storage engines and all-or-nothing creation at the backend handle limit.
+Both suites are in the appropriate metadata-regression CI groups.

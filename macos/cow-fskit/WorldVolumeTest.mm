@@ -46,9 +46,9 @@ int main(){@autoreleasepool{
             auto revision=[[ForkRevisionVolume alloc] initWithStore:store revision:@"base" error:&error];CHECK(revision && !error);
             FSItem *root=volume.rootItem,*a=lookup(volume,root,@"a"),*b=lookup(volume,root,@"b");CHECK(a==b);
             FSItem *directory=lookup(volume,root,@"dir"),*link=lookup(volume,root,@"link");
-            [volume enumerateDirectory:root startingAtCookie:FSDirectoryCookieInitial verifier:FSDirectoryVerifierInitial providingAttributes:nil
-                usingPacker:(FSDirectoryEntryPacker *)[NSObject new] replyHandler:^(FSDirectoryVerifier,NSError *e){CHECK(e.code==ENOTSUP);}];
-            [volume createItemNamed:[FSFileName nameWithString:@"new"] type:FSItemTypeFile inDirectory:root attributes:[FSItemSetAttributesRequest new]
+            [volume enumerateDirectory:root startingAtCookie:1 verifier:FSDirectoryVerifierInitial providingAttributes:nil
+                usingPacker:(FSDirectoryEntryPacker *)[NSObject new] replyHandler:^(FSDirectoryVerifier,NSError *e){CHECK(e.code==FSErrorInvalidDirectoryCookie);}];
+            [volume createItemNamed:[FSFileName nameWithString:@"new"] type:FSItemTypeSymlink inDirectory:root attributes:[FSItemSetAttributesRequest new]
                 replyHandler:^(FSItem *item,FSFileName *,NSError *e){CHECK(!item && e.code==ENOTSUP);}];
             auto number=attrs(volume,a).fileID;
             auto patch=[FSItemSetAttributesRequest new];patch.size=6;patch.mode=0600;patch.uid=501;patch.gid=20;
