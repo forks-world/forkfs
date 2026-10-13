@@ -48,6 +48,39 @@ int main(){
             CHECK(info.accessed_ns==17 && info.created_ns==19 && info.modified_ns==23);
             CHECK(fs.get_inode_xattr(inode,"user.binary")==std::vector<unsigned char>{42});
             CHECK(before.get_inode_xattr(inode,"user.binary")==std::vector<unsigned char>({0,255,0}));fs.verify();store.verify();}
+        // Corrupt the actual LevelDB backing, not just an archive checksum.
+        // Each copy is closed before mutation and reopened by every assertion.
+        auto raw_get=[](const std::string& path,const std::string& key){
+            leveldb::DB* raw=nullptr;leveldb::Options options;CHECK(leveldb::DB::Open(options,path,&raw).ok());std::unique_ptr<leveldb::DB> db(raw);
+            std::string value;CHECK(db->Get({},key,&value).ok());return value;
+        };
+        // Build binary keys without including the string literal terminator.
+        const auto revision_key=std::string("R/")+std::string("\0forkfs-history/",16)+"revision/before";
+        auto revision_id=raw_get(ns_source,revision_key),revision_bytes=raw_get(ns_source,"O/"+revision_id);
+        auto manifest_id=revision_bytes.substr(8,32),manifest_bytes=raw_get(ns_source,"O/"+manifest_id);
+        CHECK(manifest_bytes.substr(0,8)=="FFTREE01");auto tree_id=manifest_bytes.substr(8,32);
+        auto content_hash=Journal::object_id({0,1,255});std::string content_id(reinterpret_cast<const char*>(content_hash.data()),32);
+        unsigned damage_case=0;
+        for(const auto& damaged_id:{revision_id,manifest_id,tree_id,content_id})for(bool erase:{false,true}){
+            auto copy=pattern+"/damaged-source-"+std::to_string(damage_case++);
+            std::filesystem::copy(ns_source,copy,std::filesystem::copy_options::recursive);
+            auto key="O/"+damaged_id;
+            if(erase){leveldb::DB* raw=nullptr;leveldb::Options options;CHECK(leveldb::DB::Open(options,copy,&raw).ok());std::unique_ptr<leveldb::DB> db(raw);leveldb::WriteOptions write;write.sync=true;CHECK(db->Delete(write,key).ok());}
+            else {auto value=raw_get(copy,key);CHECK(!value.empty());value.back()^=1;corrupt(copy,key,value);}
+            LevelStore damaged(copy);auto sequence=damaged.sequence();
+            rejects([&]{damaged.verify();});rejects([&]{damaged.backup(copy+".pack");});
+            rejects([&]{damaged.export_replay(sequence,copy+".delta");});CHECK(damaged.sequence()==sequence);
+            CHECK(!std::filesystem::exists(copy+".pack") && !std::filesystem::exists(copy+".delta"));
+        }
+        // Even checksum-valid malformed revision records must fail at export.
+        for(unsigned kind=0;kind<4;++kind){
+            auto copy=pattern+"/logical-source-"+std::to_string(kind);
+            std::filesystem::copy(ns_source,copy,std::filesystem::copy_options::recursive);
+            LevelStore damaged(copy);auto bad=std::vector<unsigned char>(revision_bytes.begin(),revision_bytes.end());
+            if(kind==0)bad.resize(79);else if(kind==1)bad[0]='X';else if(kind==2)std::fill(bad.begin()+8,bad.begin()+40,0);else std::fill(bad.begin()+40,bad.begin()+72,255);
+            damaged.transact(damaged.sequence(),{{revision_key.substr(2),bad}});damaged.verify();auto sequence=damaged.sequence();
+            rejects([&]{damaged.backup(copy+".pack");});rejects([&]{damaged.export_replay(sequence,copy+".delta");});CHECK(damaged.sequence()==sequence);
+        }
         // The format guard is persisted, including with a reopened source.
         {
             leveldb::DB* raw=nullptr;leveldb::Options options;CHECK(leveldb::DB::Open(options,source,&raw).ok());std::unique_ptr<leveldb::DB> db(raw);

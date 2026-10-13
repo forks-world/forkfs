@@ -1,5 +1,6 @@
 #include "level_store.h"
 #include "replay_format.h"
+#include "replay_validation.h"
 #ifndef __APPLE__
 #include <sys/syscall.h>
 #include <linux/fs.h>
@@ -325,6 +326,15 @@ void sync_parent(const std::string& path){
     if(fd<0)throw std::system_error(errno,std::generic_category(),"open replay parent");
     int rc=fsync(fd),saved=errno;close(fd);if(rc<0)throw std::system_error(saved,std::generic_category(),"sync replay parent");
 }
+void verify_recovery_graph(leveldb::DB& db,const leveldb::ReadOptions& options,uint64_t sequence){
+    replay::Graph graph([&](const Id& object_id){
+        std::string value;status(db.Get(options,"O/"+bytes(object_id),&value),"read recovery object");
+        Bytes b(value.begin(),value.end());need(Journal::object_id(b)==object_id,"recovery object checksum mismatch");return b;
+    },sequence);
+    std::unique_ptr<leveldb::Iterator> it(db.NewIterator(options));
+    for(it->Seek("R/");it->Valid() && it->key().starts_with("R/");it->Next())graph.root(it->key().ToString(),it->value().ToString());
+    status(it->status(),"scan recovery roots");
+}
 void publish_directory(const std::string& from,const std::string& to){
 #ifdef __APPLE__
     int rc=renamex_np(from.c_str(),to.c_str(),RENAME_EXCL);
@@ -356,6 +366,7 @@ uint64_t LevelStore::backup(const std::string& archive){
     leveldb::ReadOptions options;options.verify_checksums=true;options.snapshot=snapshot.get();
     std::string identity;status(db_->Get(options,"M/repository",&identity),"backup identity");
     replay::Header header{'B',identity,sequence_,sequence_,replay_head_,replay_head_};lock.unlock();
+    verify_recovery_graph(*db_,options,header.to);
     replay::Writer out(archive,header);std::unique_ptr<leveldb::Iterator> it(db_->NewIterator(options));
     for(it->SeekToFirst();it->Valid();it->Next()){
         auto key=it->key().ToString(),value=it->value().ToString();
@@ -371,7 +382,7 @@ uint64_t LevelStore::export_replay(uint64_t after,const std::string& archive) co
     std::unique_ptr<const leveldb::Snapshot,decltype(release)> snapshot(db_->GetSnapshot(),release);
     leveldb::ReadOptions options;options.verify_checksums=true;options.snapshot=snapshot.get();
     std::string identity;status(db_->Get(options,"M/repository",&identity),"export replay identity");
-    replay::Header header{'I',identity,after,sequence_,previous,replay_head_};lock.unlock();replay::Writer out(archive,header);
+    replay::Header header{'I',identity,after,sequence_,previous,replay_head_};lock.unlock();verify_recovery_graph(*db_,options,header.to);replay::Writer out(archive,header);
     uint64_t seq=after;auto head=previous;
     while(seq<header.to){std::string record;status(db_->Get(options,replay::logkey(++seq),&record),"export replay record");
         auto tx=replay::transaction(record);need(tx.sequence==seq && tx.previous==head,"retained replay chain mismatch");out.frame(record);head=replay::hash(record);
@@ -387,7 +398,7 @@ uint64_t LevelStore::replay_archive(const std::string& archive,const std::string
         if(lstat(destination.c_str(),&st)==0){
             need(S_ISDIR(st.st_mode),"backup destination is not a repository directory");LevelStore existing(destination);
             std::string identity;need(existing.read("M/repository",identity) && identity==header.repository && existing.replay_hash(header.to)==header.head,"backup destination is not this recovery lineage");
-            existing.verify();return existing.sequence_;
+            existing.verify();leveldb::ReadOptions options;options.verify_checksums=true;verify_recovery_graph(*existing.db_,options,existing.sequence_);return existing.sequence_;
         }
         need(errno==ENOENT,"backup destination is inaccessible");
         auto staging=destination+".restore-XXXXXX";if(!mkdtemp(staging.data()))throw std::system_error(errno,std::generic_category(),"create restore staging directory");
@@ -406,12 +417,13 @@ uint64_t LevelStore::replay_archive(const std::string& archive,const std::string
             std::string value;need(target.read("M/repository",value) && value==header.repository,"backup repository mismatch");
             need(target.read("M/sequence",value) && number(value)==header.to,"backup sequence mismatch");
             batch.Put("M/replay/start",integer(header.to));batch.Put("M/replay/base",header.head);batch.Put("M/replay/head",header.head);
-            status(target.db_->Write(write,&batch),"restore backup replay anchor");target.verify();fault("replay_base_before_publish");
+            status(target.db_->Write(write,&batch),"restore backup replay anchor");target.verify();leveldb::ReadOptions options;options.verify_checksums=true;verify_recovery_graph(*target.db_,options,header.to);fault("replay_base_before_publish");
         }
         sync_parent(staging+"/CURRENT");publish_directory(staging,destination);fault("replay_base_after_publish");return header.to;
     }
     struct stat st{};need(lstat(destination.c_str(),&st)==0 && S_ISDIR(st.st_mode),"incremental destination must be an existing repository directory");
     LevelStore target(destination);std::lock_guard lock(target.writer_mutex_);target.healthy();target.verify();
+    leveldb::ReadOptions graph_options;graph_options.verify_checksums=true;verify_recovery_graph(*target.db_,graph_options,target.sequence_);
     std::string identity;need(target.read("M/repository",identity) && identity==header.repository,"replay repository identity mismatch");
     need(target.replay_hash(header.from)==header.previous,"replay base differs from destination");
     need(target.sequence_>=header.from,"replay gap at destination");
@@ -435,6 +447,15 @@ uint64_t LevelStore::replay_archive(const std::string& archive,const std::string
             if(op.erase)batch.Delete(op.key);else batch.Put(op.key,op.value);
         }
         for(const auto& op:tx.ops)if(op.key=="M/roots")need(number(op.value)==roots,"replay root count mismatch");
+        // Validate new roots against this transaction's objects before publishing.
+        std::map<std::string,const std::string*> overlay;
+        for(const auto& op:tx.ops)if(op.key.starts_with("O/"))overlay.emplace(op.key,&op.value);
+        replay::Graph graph([&](const Id& object_id){
+            auto key="O/"+bytes(object_id);auto found=overlay.find(key);std::string value;
+            if(found!=overlay.end())value=*found->second;else need(target.read(key,value),"missing replay graph object");
+            Bytes b(value.begin(),value.end());need(Journal::object_id(b)==object_id,"replay graph object checksum mismatch");return b;
+        },tx.sequence);
+        for(const auto& op:tx.ops)if(!op.erase)graph.root(op.key,op.value);
         batch.Put(replay::logkey(tx.sequence),payload);batch.Put("M/replay/head",next);
         leveldb::WriteOptions write;write.sync=true;fault("replay_before_write");status(target.db_->Write(write,&batch),"apply replay transaction");fault("replay_after_write");
         target.sequence_=tx.sequence;target.objects_=objects;target.roots_=roots;target.replay_head_=next;

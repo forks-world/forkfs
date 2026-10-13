@@ -38,7 +38,7 @@ FFLDB001，不承担事务日志留存开销。首次备份失败时也可能已
 
 - 原有新对象、命名根变更和 sequence/object/root counters；
 - `L/<8 字节大端提交序号>`：规范化事务记录；
-- `M/replay/head`：该事务记录的 SHA-256。
+- `M/replay/head`：该事务记录的域隔离哈希 H。
 
 事务记录包含提交序号、上笔记录哈希及完整对象/根/counter 变更。新增对象带
 内容，引用和删除保留原义；没有重新解析路径、读取源文件或重新运行文件系统命令。
@@ -55,14 +55,16 @@ FFRPLY01 包采用 little-endian 整数，包含固定 105 字节头：magic(8)�
 B=基线/I=增量)、仓库 UUID(16)、from/to sequence(各 8)、起点/终点链哈希(各 32)。
 基线 from=to 且两个链哈希相等；增量包含 `(from,to]` 的连续提交。
 
-每帧为 length(u32)、payload、SHA-256(payload)。基线 B 帧是一条有序的
+哈希 H(x) 复用对象格式：SHA-256(`forkfs.object.v0` + u16le(4) +
+u16le(0) + u64le(len(x)) + x)，不是直接对 payload 计算裸 SHA-256。
+每帧为 length(u32)、payload、H(payload)。基线 B 帧是一条有序的
 M/O/R 键值记录；增量 T 帧是 sequence、previous hash 和操作数组。
 操作数组为 count(u32)，每项包含 put/delete(u8)、key/value length(u32)
 及字节数据。M 元数据仅允许 sequence/objects/roots；O 仅允许按内容哈希
 新增对象；R 允许更新或删除命名根。不接受任意内部键写入。
 
-E 帧包含全包滚动摘要，摘要起点为 SHA-256(header)，每个数据帧推进为
-SHA-256(previous_digest + frame_hash)。没有 E 帧、尾随字节、超限长度、
+E 帧包含全包滚动摘要，摘要起点为 H(header)，每个数据帧推进为
+H(previous_digest + frame_hash)。没有 E 帧、尾随字节、超限长度、
 错误对象哈希、重复键、缺提交或乱序均被拒绝。按帧读取，不把整个仓库放入内存。
 哈希用于意外损坏检测，不是签名；包必须来自可信来源。
 
@@ -101,3 +103,27 @@ SHA-256(previous_digest + frame_hash)。没有 E 帧、尾随字节、超限长�
 崩溃、原事务及日志的原子留存。故障钩子不进入生产二进制。
 `forkfsd_replay_core` 另外覆盖并发备份的提交点一致性、引用/删除、inode 身份、
 hardlink、uid/gid/时间/binary xattr，以及底层对象/日志损坏和格式保护。
+
+
+### Corruption 回归矩阵
+
+`forkfsd_replay_corruption` 的包由独立 Python 编码器生成，并用合法包逐字节
+往返作为正对照。负例重算正确的对象、frame、链和 footer 哈希，检查明确的
+错误原因，避免所有用例实际上只碰到最外层 checksum 检查。
+
+- revision：长度、magic、零/缺失 manifest、缺失/错误类型父记录、父序号倒挂、
+  未来序号、非法名称，以及真实 LevelDB 中的描述对象丢失/bit flip。
+- CoW：manifest 格式、长度、零/缺失树根、节点格式/长度、零/缺失值、缺失子节点。
+- replay：重复操作键、未知元数据字段、错误计数、缺失对象引用，以及坏 revision
+  通过校验正确的增量事务到达目标的情况。
+- 拒绝结果：基线不发布目标目录；坏增量事务不改变目标 sequence/根/数据，
+  之后仍能应用原始正确增量。源损坏时 backup/export 拒绝，不生成有效恢复包。
+
+恢复校验遍历所有命名 World、revision 和 World base 的引用，检查 revision
+父链序号严格递减，复用 CoW/旧 run 格式解析器检查传递引用。增量在提交前以
+“现有对象 + 本事务新对象”的只读视图检查变更的根。此检查增加离线备份/replay
+扫描成本，不加入日常写事务路径。
+
+这不替代 `fs-check` 的完整 inode/目录语义检查；例如格式与引用都合法但 link
+count 不匹配的逻辑错误，仍需文件系统层 fsck。既有 inode corruption 回归继续
+覆盖 inode/xattr 编码错误。容灾验收需要两层检查，不能仅凭包的哈希判定文件系统健康。

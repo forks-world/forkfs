@@ -1,5 +1,6 @@
 #pragma once
 #include "journal.h"
+#include <functional>
 namespace forkfs {
 // Persistent ordered index above LevelDB. It stores no WAL/SST/compaction logic.
 // Content-derived priorities make the CoW treap deterministic across devices.
@@ -9,7 +10,9 @@ public:
     using Bytes=std::vector<unsigned char>;
     using Map=std::map<std::string,Id>;
     using Changes=std::map<std::string,std::optional<Id>>;
-    MetadataTree(const Journal& store,Id root={}):store_(store),root_(root) {}
+    using Reader=std::function<Bytes(const Id&)>;
+    MetadataTree(const Journal& store,Id root={}):read_([&store](const Id& id){return store.get_object(id);}),root_(root) {}
+    MetadataTree(Reader read,Id root):read_(std::move(read)),root_(root) {}
     std::optional<Id> lookup(const std::string& key) const;
     std::vector<std::string> keys(const std::string& prefix) const;
     std::vector<std::string> page(const std::string& prefix,const std::string& after,size_t limit) const;
@@ -24,7 +27,7 @@ public:
     Plan apply(const Changes& changes);
 private:
     struct Node {std::string key;Id value{},left{},right{};};
-    const Journal& store_;
+    Reader read_;
     Id root_;
     mutable std::map<Id,Node> cache_;
     mutable std::map<Id,unsigned> heights_;

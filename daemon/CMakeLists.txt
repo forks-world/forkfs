@@ -28,7 +28,7 @@ add_test(NAME forkfsd_metadata_tree COMMAND forkfsd_metadata_tree_test)
 set_tests_properties(forkfsd_metadata_tree PROPERTIES TIMEOUT 60)
 
 # Separate build keeps deterministic barriers completely out of production.
-add_executable(forkfsd_lock_granularity_test tests/lock_granularity.cpp journal.cpp level_store.cpp)
+add_executable(forkfsd_lock_granularity_test tests/lock_granularity.cpp journal.cpp level_store.cpp metadata_tree.cpp metadata_view.cpp)
 target_compile_definitions(forkfsd_lock_granularity_test PRIVATE FORKFS_TEST_LOCKS=1)
 target_include_directories(forkfsd_lock_granularity_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(forkfsd_lock_granularity_test PRIVATE leveldb Threads::Threads)
@@ -139,3 +139,7 @@ add_executable(forkfsd_replay_core_test tests/replay.cpp)
 target_link_libraries(forkfsd_replay_core_test PRIVATE forkfs_namespace)
 add_test(NAME forkfsd_replay_core COMMAND forkfsd_replay_core_test)
 set_tests_properties(forkfsd_replay_core PROPERTIES TIMEOUT 90 LABELS metadata-regression)
+
+add_test(NAME forkfsd_replay_corruption COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay_corruption.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_replay_corruption PROPERTIES TIMEOUT 180 LABELS metadata-regression)

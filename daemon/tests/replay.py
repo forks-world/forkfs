@@ -25,6 +25,9 @@ def run(*args, binary=BIN, crash=None, ok=True):
 def seq(path):
     return json.loads(run('check', path))['last_committed_seq']
 
+def digest(data):
+    return hashlib.sha256(b'forkfs.object.v0'+struct.pack('<HHQ', 4, 0, len(data))+data).digest()
+
 def rewrite(data, mutate):
     """Recompute transport checksums to test structural, not just checksum rejection."""
     header = data[:105]
@@ -37,14 +40,14 @@ def rewrite(data, mutate):
             break
         frames.append(payload)
     header, frames = mutate(header, frames)
-    digest = hashlib.sha256(header).digest()
+    chain = digest(header)
     out = bytearray(header)
     for payload in frames:
-        h = hashlib.sha256(payload).digest()
+        h = digest(payload)
         out += struct.pack('<I', len(payload)) + payload + h
-        digest = hashlib.sha256(digest+h).digest()
-    footer = b'E'+digest
-    return bytes(out + struct.pack('<I', len(footer))+footer+hashlib.sha256(footer).digest())
+        chain = digest(chain+h)
+    footer = b'E'+chain
+    return bytes(out + struct.pack('<I', len(footer))+footer+digest(footer))
 
 with tempfile.TemporaryDirectory(prefix='ff-replay-') as temp:
     root = Path(temp)
@@ -121,6 +124,7 @@ with tempfile.TemporaryDirectory(prefix='ff-replay-') as temp:
     assert b'local\n' in run('fs-ls', divergent, '/')
     # Truncation, bit corruption, suffixes, missing/reordered/duplicated commits.
     data = all_delta.read_bytes()
+    assert rewrite(data, lambda h, f: (h, f)) == data
     malformed = [data[:cut] for cut in [0, 8, 104, 109, len(data)//2, len(data)-1]]
     corrupt = bytearray(data);corrupt[len(data)//2] ^= 1;malformed += [bytes(corrupt), data+b'x']
     malformed += [rewrite(data, lambda h, f: (h, f[1:])),

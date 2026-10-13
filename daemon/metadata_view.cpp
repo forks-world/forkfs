@@ -201,3 +201,28 @@ NamespaceView::Plan NamespaceView::compact_frozen(const Frozen& input) {
 }
 
 }
+
+namespace forkfs {
+void NamespaceView::verify_manifest(const std::function<Bytes(const ObjectId&)>& read,const ObjectId& manifest) {
+    auto b=read(manifest);Map entries;
+    if(b.size()==40 && !memcmp(b.data(),"FFTREE01",8)) {
+        ObjectId root{};std::copy_n(b.data()+8,32,root.begin());need(root!=ObjectId{},"empty metadata tree root");
+        entries=MetadataTree(read,root).entries();
+    } else {
+        std::vector<ObjectId> runs;
+        if(magic(b,"FFMAN001"))runs.push_back(manifest);
+        else {
+            need(magic(b,"FFMAN002"),"unsupported namespace manifest");auto count=u32(b,8);
+            need(count>0 && count<=32 && b.size()==12+uint64_t(count)*32,"invalid manifest run count");std::set<ObjectId> unique;
+            for(uint32_t i=0;i<count;++i){ObjectId id{};std::copy_n(b.data()+12+i*32,32,id.begin());need(id!=ObjectId{} && unique.insert(id).second,"duplicate or zero run reference");runs.push_back(id);}
+        }
+        std::set<std::string> seen;
+        for(const auto& run:runs)for(const auto& [key,value]:decode_run(read(run))){
+            if(value)(void)read(*value); // Even a shadowed PUT must remain a valid reference.
+            if(seen.insert(key).second && value)entries.emplace(key,*value);
+        }
+    }
+    need(entries.contains(prefix+"root"),"manifest missing namespace root");
+    for(const auto& [key,id]:entries){(void)key;(void)read(id);}
+}
+}
