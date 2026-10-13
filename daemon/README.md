@@ -354,3 +354,15 @@ same transaction as the marker and parent records. This makes old directory
 readers/writers reject indexed views instead of silently skipping index updates;
 old revisions retain their original directory versions. Verification rejects
 mixed inode/index versions.
+
+## Disaster recovery replay
+
+`backup REPOSITORY ARCHIVE` creates a consistent full backup and enables retained
+commit logging (FFLDB002; older writers are rejected). `replay-export REPOSITORY
+AFTER_SEQUENCE ARCHIVE` exports subsequent commits. Both print the ending sequence.
+`replay ARCHIVE DESTINATION` restores a new repository from a base or applies an
+incremental archive to the matching recovery lineage. Reapplying matching commits
+is idempotent. These are offline commands requiring exclusive repository ownership.
+See [the disaster replay contract](../docs/DISASTER_REPLAY.md) for durability,
+crash recovery, storage costs and the requirement to keep archives off the source
+machine. Online replication and log pruning are not implemented.

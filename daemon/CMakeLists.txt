@@ -131,3 +131,11 @@ set_tests_properties(forkfsd_script_control PROPERTIES TIMEOUT 90 LABELS metadat
 add_test(NAME forkfsd_script_control_unit COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_SOURCE_DIR}/scripts/tests/test_forkfs_control.py)
 set_tests_properties(forkfsd_script_control_unit PROPERTIES TIMEOUT 30 LABELS metadata-regression)
+
+add_test(NAME forkfsd_replay COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
+set_tests_properties(forkfsd_replay PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+add_executable(forkfsd_replay_core_test tests/replay.cpp)
+target_link_libraries(forkfsd_replay_core_test PRIVATE forkfs_namespace)
+add_test(NAME forkfsd_replay_core COMMAND forkfsd_replay_core_test)
+set_tests_properties(forkfsd_replay_core PROPERTIES TIMEOUT 90 LABELS metadata-regression)

@@ -15,6 +15,11 @@ public:
     explicit LevelStore(const std::string& path,size_t object_cache_bytes=default_object_cache_bytes);
     ~LevelStore();
     void transact(uint64_t expected,const std::vector<Mutation>& changes);
+    // Opt-in retained transaction stream. Backup enables it atomically at a base.
+    uint64_t backup(const std::string& archive);
+    uint64_t export_replay(uint64_t after,const std::string& archive) const;
+    static uint64_t replay_archive(const std::string& archive,const std::string& destination);
+
     std::vector<unsigned char> object(const std::array<unsigned char,32>& id) const;
     std::array<unsigned char,32> root(const std::string& key) const;
     bool contains(const std::string& key) const;
@@ -42,6 +47,10 @@ private:
     std::atomic<uint64_t> sequence_=0,objects_=0,roots_=0;
     std::atomic<bool> poisoned_=false;
     std::string repository_;
+    bool replay_enabled_=false;
+    uint64_t replay_start_=0;
+    std::string replay_base_,replay_head_;
+    std::string replay_hash(uint64_t sequence) const;
     std::unique_ptr<leveldb::Cache> cache_;
     std::unique_ptr<leveldb::Cache> object_cache_;
     size_t object_cache_bytes_;
