@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -29,7 +30,7 @@ std::string frame(const char* magic,const std::string& payload){
 }
 std::string response(uint32_t code,const std::string& value){std::string b;put32(b,code);return frame("FFRSP001",b+value);}
 std::vector<std::string> decode(const std::string& b){
-    size_t at=header;auto count=u32(b,at);at+=4;need(count>0 && count<=8,"RPC requires 1..8 fields");
+    size_t at=header;auto count=u32(b,at);at+=4;need(count>0 && count<=16,"RPC requires 1..16 fields");
     std::vector<std::string> result;
     for(uint32_t i=0;i<count;++i){auto n=u32(b,at);at+=4;need(n<=b.size()-at,"truncated RPC field");result.push_back(b.substr(at,n));at+=n;}
     need(at==b.size(),"trailing RPC bytes");return result;
@@ -37,6 +38,31 @@ std::vector<std::string> decode(const std::string& b){
 uint64_t number(const std::string& text,int base=10){
     uint64_t value=0;auto parsed=std::from_chars(text.data(),text.data()+text.size(),value,base);
     need(parsed.ec==std::errc{} && parsed.ptr==text.data()+text.size(),"invalid file offset/count");return value;
+}
+// Parse the complete patch before publishing any metadata changes.
+Namespace::Attributes attributes(const std::string& patch){
+    Namespace::Attributes a;std::set<std::string> seen;size_t at=0;
+    auto invalid=[](){throw std::system_error(EINVAL,std::generic_category(),"invalid attribute patch");};
+    while(true){
+        auto end=patch.find(',',at);auto field=patch.substr(at,end==std::string::npos?end:end-at);
+        auto equal=field.find('=');if(equal==std::string::npos)invalid();
+        auto key=field.substr(0,equal),text=field.substr(equal+1);
+        if(!seen.insert(key).second)invalid();
+        uint64_t n=0;auto parsed=std::from_chars(text.data(),text.data()+text.size(),n,key=="mode"?8:10);
+        if(parsed.ec!=std::errc{} || parsed.ptr!=text.data()+text.size())invalid();
+        if(key=="mode"){if(n>0777)invalid();a.mode=static_cast<uint32_t>(n);}
+        else if(key=="uid" || key=="gid"){
+            if(n>UINT32_MAX)invalid();
+            if(key=="uid")a.uid=static_cast<uint32_t>(n);else a.gid=static_cast<uint32_t>(n);
+        } else if(key=="size")a.size=n;
+        else if(key=="modified_ns" || key=="accessed_ns" || key=="created_ns"){
+            if(n>INT64_MAX)invalid();
+            if(key=="modified_ns")a.modified_ns=n;
+            else if(key=="accessed_ns")a.accessed_ns=n;else a.created_ns=n;
+        } else invalid();
+        if(end==std::string::npos)break;at=end+1;
+    }
+    return a;
 }
 int64_t signed_number(const std::string& text){
     int64_t value=0;auto parsed=std::from_chars(text.data(),text.data()+text.size(),value);
@@ -120,6 +146,9 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="status" || op=="storage-profile" || op=="fs-init" || op=="fs-check" || op=="fs-worlds" || op=="fs-revisions" || op=="fs-compact")count=1;
     if(op=="fs-write" || op=="fs-save" || op=="fs-rename" || op=="fs-link" || op=="fs-fork" || op=="fs-append" || op=="fs-truncate" || op=="fs-open" || op=="fs-happend" || op=="fs-htruncate" || op=="fs-hread-next" || op=="fs-hwrite-next" || op=="fs-symlink" || op=="fs-chmod" || op=="fs-setmtime" || op=="fs-hchmod" || op=="fs-hsetmtime" || op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-hlock")count=3;
     if(op=="fs-read-at" || op=="fs-write-at" || op=="fs-hread" || op=="fs-hwrite" || op=="fs-hseek" || op=="fs-hrange-lock")count=4;
+    if(op=="fs-setattr" || op=="fs-isetattr" || op=="fs-hsetattr" ||
+       op=="fs-igetxattr" || op=="fs-hgetxattr" || op=="fs-iremovexattr" || op=="fs-hremovexattr")count=3;
+    if(op=="fs-isetxattr" || op=="fs-hsetxattr")count=5;
     std::string session_token;bool selected_view=false;
     while(args.size()>=count+2) {
         const auto& selector=args[args.size()-2];const auto& value=args.back();
@@ -133,7 +162,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         args.resize(args.size()-2);
     }
     need(args.size()==count,"invalid RPC command arguments");
-    for(size_t i=0;i<args.size();++i)if(!(((op=="fs-write" || op=="fs-save" || op=="fs-append" || op=="fs-happend" || op=="fs-hwrite-next") && i==2) || ((op=="fs-write-at" || op=="fs-hwrite") && i==3)))need(args[i].find('\0')==std::string::npos,"NUL in RPC argument");
+    for(size_t i=0;i<args.size();++i)if(!(((op=="fs-write" || op=="fs-save" || op=="fs-append" || op=="fs-happend" || op=="fs-hwrite-next") && i==2) || ((op=="fs-write-at" || op=="fs-hwrite") && i==3) || ((op=="fs-isetxattr" || op=="fs-hsetxattr") && i==4)))need(args[i].find('\0')==std::string::npos,"NUL in RPC argument");
     if(op=="session-open") {
         auto lease=number(args[1]);auto token=sessions.create(lease);
         return "{\"session\":\""+token+"\",\"lease_ms\":"+std::to_string(lease)+"}\n";
@@ -152,6 +181,35 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="status")return store.status();
     if(op=="storage-profile")return store.storage_profile();
     Namespace fs(store,view,revision);
+    if(op=="fs-istat")return inode_json(fs.stat_inode(args[1]))+"\n";
+    if(op=="fs-setattr" || op=="fs-isetattr" || op=="fs-hsetattr"){
+        auto a=attributes(args[2]);
+        if(revision)throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");
+        if(op=="fs-isetattr")fs.set_inode_attributes(args[1],a);
+        else if(op=="fs-hsetattr")fs.handle_set_attributes(args[1],a);
+        else fs.set_attributes(args[1],a);
+        return store.status();
+    }
+    if(op=="fs-ilistxattr" || op=="fs-hlistxattr")
+        return names(handle_op?fs.list_handle_xattrs(args[1]):fs.list_inode_xattrs(args[1]));
+    if(op=="fs-igetxattr" || op=="fs-hgetxattr"){
+        auto b=handle_op?fs.get_handle_xattr(args[1],args[2]):fs.get_inode_xattr(args[1],args[2]);
+        return std::string(b.begin(),b.end());
+    }
+    if(op=="fs-isetxattr" || op=="fs-hsetxattr"){
+        const auto& policy=args[3];
+        if(policy!="upsert" && policy!="create" && policy!="replace")
+            throw std::system_error(EINVAL,std::generic_category(),"invalid xattr policy");
+        auto mode=policy=="create"?Namespace::XattrMode::Create:policy=="replace"?Namespace::XattrMode::Replace:Namespace::XattrMode::Upsert;
+        std::vector<unsigned char> value(args[4].begin(),args[4].end());
+        if(handle_op)fs.set_handle_xattr(args[1],args[2],value,mode);
+        else fs.set_inode_xattr(args[1],args[2],value,mode);
+        return store.status();
+    }
+    if(op=="fs-iremovexattr" || op=="fs-hremovexattr"){
+        if(handle_op)fs.remove_handle_xattr(args[1],args[2]);else fs.remove_inode_xattr(args[1],args[2]);
+        return store.status();
+    }
     if(op=="fs-dir-open") {
         need(activity.session->directories.size()<64 && sessions.directory_count()<1024,"directory cursor limit reached");
         auto cursor=fs.open_directory(args[1]);auto token=random_token();
@@ -308,6 +366,10 @@ void serve_rpc(int listener,Container& container,const volatile sig_atomic_t& st
                             need(p.in.size()<=header+length,"trailing RPC frame");
                             if(p.in.size()==header+length)p.out=response(0,dispatch(container,sessions,decode(p.in)));
                         }
+                    }catch(const std::system_error& e){
+                        // Existing clients treat any nonzero status as failure.
+                        bool posix=(e.code().category()==std::generic_category() || e.code().category()==std::system_category()) && e.code().value()>0;
+                        p.out=response(posix?(0x80000000u|static_cast<uint32_t>(e.code().value())):1,e.what());
                     }catch(const std::exception& e){p.out=response(1,e.what());}
                 }
             }
@@ -327,7 +389,7 @@ void serve_rpc(int listener,Container& container,const volatile sig_atomic_t& st
     sessions.shutdown();
 }
 std::string request_rpc(const std::string& path,const std::vector<std::string>& fields){
-    need(!fields.empty() && fields.size()<=8,"RPC requires 1..8 fields");std::string payload;put32(payload,fields.size());
+    need(!fields.empty() && fields.size()<=16,"RPC requires 1..16 fields");std::string payload;put32(payload,fields.size());
     for(const auto& field:fields){need(field.size()<=limit,"oversized RPC field");put32(payload,field.size());payload+=field;}
     auto request=frame("FFRPC001",payload);sockaddr_un addr{};
     need(path.size()<sizeof(addr.sun_path),"socket path too long");addr.sun_family=AF_UNIX;memcpy(addr.sun_path,path.c_str(),path.size()+1);
@@ -361,6 +423,7 @@ std::string request_rpc(const std::string& path,const std::vector<std::string>& 
             need(length>=4 && length<=limit,"invalid RPC reply length");target=header+length;}
     }
     auto code=u32(reply,header);auto value=reply.substr(header+4);
+    if(code&0x80000000u)throw std::system_error(static_cast<int>(code&0x7fffffffu),std::generic_category(),value);
     if(code)throw std::runtime_error(value);return value;
 }
 }
