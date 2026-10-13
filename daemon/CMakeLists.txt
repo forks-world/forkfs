@@ -79,11 +79,13 @@ foreach(suite leveldb file_io_crash handles_crash symlinks attributes save)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/${suite}.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
     set_tests_properties(forkfsd_${suite} PROPERTIES TIMEOUT 180)
 endforeach()
-foreach(suite rpc sessions directories)
+foreach(suite rpc sessions directories rpc_metadata)
     add_test(NAME forkfsd_${suite} COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/${suite}.py $<TARGET_FILE:forkfsd>)
     set_tests_properties(forkfsd_${suite} PROPERTIES TIMEOUT 180)
 endforeach()
+
+set_tests_properties(forkfsd_rpc_metadata PROPERTIES LABELS metadata-regression)
 
 add_executable(forkfsd_inode_frontend_test tests/inode_frontend.cpp)
 target_link_libraries(forkfsd_inode_frontend_test PRIVATE forkfs_namespace)

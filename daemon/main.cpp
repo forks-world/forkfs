@@ -197,6 +197,10 @@ int main(int argc, char** argv) {
                 if(fields.size()!=index+1 && fields.size()!=index+3 && fields.size()!=index+5)throw std::runtime_error("write command requires input file");
                 auto data=load_file(fields[index].c_str());fields[index].assign(data.begin(),data.end());
             }
+            if(fields[0]=="fs-isetxattr" || fields[0]=="fs-hsetxattr") {
+                if(fields.size()!=5 && fields.size()!=7 && fields.size()!=9)throw std::runtime_error("setxattr requires address, name, policy and input file");
+                auto data=load_file(fields[4].c_str());fields[4].assign(data.begin(),data.end());
+            }
             auto result=forkfs::request_rpc(argv[2],fields);
             std::cout.write(result.data(),result.size());
             if(!std::cout)throw std::runtime_error("cannot write RPC output");return 0;

@@ -109,6 +109,53 @@ an OS identity; an agent broker/sandbox boundary and mounted frontend remain
 separate work. After a crash, confirm the old process has exited before removing
 its stale socket path. Production builds contain no fault-injection hooks.
 
+Metadata requests use the same resident service:
+
+| Command | Arguments after command |
+| --- | --- |
+| `fs-istat` | `INODE_ID` |
+| `fs-setattr` | `PATH PATCH` |
+| `fs-isetattr` / `fs-hsetattr` | `INODE_ID/HANDLE PATCH` |
+| `fs-ilistxattr` / `fs-hlistxattr` | `INODE_ID/HANDLE` |
+| `fs-igetxattr` / `fs-hgetxattr` | `INODE_ID/HANDLE NAME` |
+| `fs-isetxattr` / `fs-hsetxattr` | `INODE_ID/HANDLE NAME POLICY VALUE` |
+| `fs-iremovexattr` / `fs-hremovexattr` | `INODE_ID/HANDLE NAME` |
+
+`PATCH` is a nonempty comma-separated list of `key=value` assignments. Supported
+keys are `mode` (octal permission bits), `size`, `uid`, `gid`, `modified_ns`,
+`accessed_ns`, and `created_ns` (all other values unsigned decimal). Duplicate or
+unknown keys, empty values and out-of-range numbers fail before mutation. All
+requested attributes and resized content publish in one transaction; omitted
+attributes retain backend semantics, including automatic mtime/ctime updates.
+For example, `fs-isetattr INODE_ID mode=600,size=128,uid=501,gid=20` changes all
+four fields atomically. Obtain inode IDs from `fs-stat` or `fs-lstat`; direct inode
+operations do not follow symlinks. Deleted inodes require a retained handle.
+
+Xattr `POLICY` is explicitly `upsert`, `create`, or `replace`. The raw wire `VALUE`
+is binary, including NUL and empty values. In `forkfsd request`, pass an input
+**filename** for `VALUE`; the client reads that file. Get returns the exact bytes,
+and list returns sorted newline-delimited names (names cannot contain newlines).
+The existing 64 KiB value and 128 KiB inode limits still apply. Handle operations
+require `--session TOKEN`; all metadata commands accept `--world NAME` or
+`--revision NAME`. Revisions reject mutations. Session ownership, view matching,
+and open-unlink retention follow the existing handle rules. These are service
+interfaces, not additional offline CLI commands or permission enforcement.
+
+`FFRPC001` accepts 1..16 length-prefixed fields, with the existing 1 MiB frame
+limit; 9 fields are needed for setxattr with both view and session selectors.
+`FFRSP001` status is zero on success, 1 for untyped/protocol failures, or
+`0x80000000 | errno` for POSIX `system_error` failures. Errno values use the
+**server platform** numbering; this protocol is local to a Unix socket. Older
+clients that reject all nonzero statuses remain compatible; the C++ client now
+throws `std::system_error` for tagged errno responses. Existing legacy operations
+may still return untyped failures. Invalid attribute patches and xattr policies
+return EINVAL; underlying inode/xattr errors retain their errno.
+
+The `forkfsd_rpc_metadata` black-box test runs under the `metadata-regression`
+CI label. It checks complete attribute/content state after rejected requests,
+exact errno values, binary/empty and size-limited xattrs, session/view isolation,
+read-only revisions, open-unlink handles, CLI transport, and daemon restart.
+
 Process-crash suites terminate the separate fault executable immediately before
 or after synchronous LevelDB publication. Reopen must expose the complete old
 or complete new state, including inode/content, branch roots and orphan handles.
