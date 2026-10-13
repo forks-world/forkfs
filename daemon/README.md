@@ -239,7 +239,25 @@ fit signed 64-bit nanoseconds. New readers accept all three inode formats; older
 readers reject the new record rather than dropping its extra attributes. Future
 updates retain the extended format even when every new attribute is set to zero.
 These fields store metadata; user identity mapping and ownership authorization
-remain frontend responsibilities. Writable xattrs and ACLs remain outstanding.
+remain frontend responsibilities. ACLs remain outstanding.
+
+Inode and handle xattr APIs support list/get/set/remove, with Upsert/Create/Replace
+policies. Missing names return ENOATTR on macOS and ENODATA on Linux; Create on an
+existing name returns EEXIST. Names are 1..255 printable non-space ASCII bytes,
+values are binary (including empty), with at most 128 names and 64 KiB per value.
+The complete inode record is limited to 128 KiB; budget errors return E2BIG before
+publication. Revision mutations return EROFS. Hard links share attributes, forks
+and revisions keep independent versions, and handles retain xattrs after unlink.
+Reads and mutation use logical inodes; host backing-file xattrs are never queried.
+
+The first xattr mutation uses FFINOD04: the FFINOD03 80-byte field layout followed
+by a little-endian uint32 count and sorted records (uint32 name length, uint32
+value length, name bytes, value bytes). Duplicate/unsorted names, unknown flags,
+bad lengths and trailing bytes are rejected. Removing the last xattr retains the
+new format. Xattrs reside inside the CoW inode payload, so existing orphan retention
+and cleanup apply without extra roots. Copies of InodeInfo share an immutable xattr
+map; mutations copy that map. The read-only revision FSKit adapter reads stored
+xattrs and advertises 64 KiB values; all set/delete callbacks still return EROFS.
 
 `open_directory_inode()` opens a stable directory cursor by inode on LevelDB.
 It shares path-based cursor semantics: enumeration and optional attributes come

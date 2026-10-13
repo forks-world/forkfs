@@ -5,6 +5,7 @@
 
 namespace forkfs {
 struct InodeInfo {
+    using Xattrs=std::map<std::string,std::vector<unsigned char>>;
     std::string id;
     bool directory;
     uint32_t mode;
@@ -14,6 +15,7 @@ struct InodeInfo {
     uint32_t uid=0,gid=0;
     uint64_t accessed_ns=0,created_ns=0;
     bool extended_attributes=false; // FFINOD03 retains ownership and extra timestamps.
+    std::shared_ptr<const Xattrs> xattrs={}; // Non-null retains FFINOD04, including an empty map.
 };
 class NamespaceView;
 class Namespace {
@@ -81,6 +83,15 @@ public:
     InodeInfo stat(const std::string& path) const;
     void set_attributes(const std::string& path,const Attributes& attributes);
     void set_inode_attributes(const std::string& inode_id,const Attributes& attributes);
+    enum class XattrMode {Upsert,Create,Replace};
+    std::vector<std::string> list_inode_xattrs(const std::string& inode_id) const;
+    std::vector<unsigned char> get_inode_xattr(const std::string& inode_id,const std::string& name) const;
+    void set_inode_xattr(const std::string& inode_id,const std::string& name,const std::vector<unsigned char>& value,XattrMode mode=XattrMode::Upsert);
+    void remove_inode_xattr(const std::string& inode_id,const std::string& name);
+    std::vector<std::string> list_handle_xattrs(const std::string& handle) const;
+    std::vector<unsigned char> get_handle_xattr(const std::string& handle,const std::string& name) const;
+    void set_handle_xattr(const std::string& handle,const std::string& name,const std::vector<unsigned char>& value,XattrMode mode=XattrMode::Upsert);
+    void remove_handle_xattr(const std::string& handle,const std::string& name);
     void handle_set_attributes(const std::string& handle,const Attributes& attributes);
     InodeInfo lstat(const std::string& path) const;
     void symlink(const std::string& target,const std::string& path);
@@ -113,6 +124,9 @@ private:
     void edit_handle(const std::string& handle,const std::function<bool(std::vector<unsigned char>&,bool)>& edit,const std::function<void()>& committed={});
     std::vector<unsigned char> read_handle_locked(const Container::OpenHandle& info,uint64_t offset,uint64_t count) const;
     using Changes=std::map<std::string,std::optional<std::vector<unsigned char>>>;
+    std::pair<InodeInfo,std::string> xattr_inode(const NamespaceView& view,const std::string& address,bool handle) const;
+    void edit_xattrs(const std::string& address,bool handle,const std::string& name,
+                    const std::optional<std::vector<unsigned char>>& value,XattrMode mode);
     void attribute_changes(const NamespaceView& view,Changes& changes,InodeInfo inode,const Attributes& attributes,
                            const std::string& inode_key,const std::string& content_key,bool linked);
     void retire(const NamespaceView& view,Changes& changes,const InodeInfo& inode);

@@ -36,7 +36,7 @@ int main(){@autoreleasepool {
     auto pattern=(std::filesystem::temp_directory_path()/"ff-fskit-XXXXXX").string();auto dir=mkdtemp(pattern.data());if(!dir)return 1;
     try {
         auto path=std::string(dir)+"/store";forkfs::Container::create(path);auto store=std::make_shared<forkfs::Container>(path);
-        forkfs::Namespace fs(*store);fs.initialize();fs.write("/a",{1,2});fs.link("/a","/b");fs.symlink("a","/link");fs.mkdir("/dir");fs.snapshot("base");
+        forkfs::Namespace fs(*store);fs.initialize();fs.write("/a",{1,2});fs.link("/a","/b");fs.symlink("a","/link");fs.mkdir("/dir");fs.set_inode_xattr(fs.stat("/a").id,"user.binary",{0,255});fs.snapshot("base");
         auto resource=[NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()] isDirectory:YES];
         auto marker=path+"/.forkfs-fskit-revision";
         check([ForkRevisionProbeIdentity(resource,@"base") isEqual:ForkRevisionProbeIdentity(resource,@"base")]);
@@ -49,7 +49,7 @@ int main(){@autoreleasepool {
         std::filesystem::remove(marker);
         NSError *error=nil;auto volume=[[ForkRevisionVolume alloc] initWithStore:store revision:@"base" error:&error];check(volume && !error);
         FSItem *root=volume.rootItem;check(root);
-        check([volume respondsToSelector:@selector(maximumXattrSize)] && volume.maximumXattrSize==0);
+        check([volume respondsToSelector:@selector(maximumXattrSize)] && volume.maximumXattrSize==64*1024);
         __block FSItem *a=nil,*b=nil,*link=nil;
         [volume lookupItemNamed:[FSFileName nameWithString:@"a"] inDirectory:root replyHandler:^(FSItem *item,FSFileName *name,NSError *e){check(!e);a=item;}];
         [volume lookupItemNamed:[FSFileName nameWithString:@"b"] inDirectory:root replyHandler:^(FSItem *item,FSFileName *name,NSError *e){check(!e);b=item;}];check(a && a==b);
@@ -93,12 +93,14 @@ int main(){@autoreleasepool {
         [volume enumerateDirectory:a startingAtCookie:FSDirectoryCookieInitial verifier:FSDirectoryVerifierInitial providingAttributes:nil usingPacker:(FSDirectoryEntryPacker *)invalidDirectory
             replyHandler:^(FSDirectoryVerifier v,NSError *e){check(e.code==ENOTDIR);}];
         for(FSItem *item in @[root,a,link]) {
-            [volume listXattrsOfItem:item replyHandler:^(NSArray<FSFileName *> *names,NSError *e){check(!e && names && names.count==0);}];
+            [volume listXattrsOfItem:item replyHandler:^(NSArray<FSFileName *> *names,NSError *e){check(!e && names && names.count==(item==a?1:0));}];
             [volume getXattrNamed:[FSFileName nameWithString:@"com.apple.provenance"] ofItem:item replyHandler:^(NSData *data,NSError *e){check(!data && e.code==ENOATTR);}];
             for(FSSetXattrPolicy policy : {FSSetXattrPolicyAlwaysSet,FSSetXattrPolicyMustCreate,FSSetXattrPolicyMustReplace,FSSetXattrPolicyDelete}) {
                 [volume setXattrNamed:[FSFileName nameWithString:@"user.test"] toData:policy==FSSetXattrPolicyDelete?nil:[NSData data] onItem:item policy:policy replyHandler:^(NSError *e){check(e.code==EROFS);}];
             }
         }
+        fs.set_inode_xattr(fs.stat("/a").id,"user.binary",{7});
+        [volume getXattrNamed:[FSFileName nameWithString:@"user.binary"] ofItem:a replyHandler:^(NSData *data,NSError *e){const unsigned char expected[]={0,255};check(!e && data.length==2 && !memcmp(data.bytes,expected,2));}];
         // Same inode in another volume is still a foreign item, not an I/O error.
         auto other=[[ForkRevisionVolume alloc] initWithStore:store revision:@"base" error:&error];check(other && !error);
         [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:other.rootItem replyHandler:^(FSItemAttributes *attrs,NSError *e){check(!attrs && e.code==ESTALE);}];
