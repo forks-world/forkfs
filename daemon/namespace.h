@@ -15,7 +15,7 @@ struct InodeInfo {
 class NamespaceView;
 class Namespace {
 public:
-    struct Attributes {std::optional<uint32_t> mode;std::optional<uint64_t> modified_ns;};
+    struct Attributes {std::optional<uint32_t> mode;std::optional<uint64_t> modified_ns;std::optional<uint64_t> size;};
     class DirectoryCursor {
         friend class Namespace;
         std::weak_ptr<const int> lifetime_;
@@ -107,6 +107,8 @@ private:
     void edit_handle(const std::string& handle,const std::function<bool(std::vector<unsigned char>&,bool)>& edit,const std::function<void()>& committed={});
     std::vector<unsigned char> read_handle_locked(const Container::OpenHandle& info,uint64_t offset,uint64_t count) const;
     using Changes=std::map<std::string,std::optional<std::vector<unsigned char>>>;
+    void attribute_changes(const NamespaceView& view,Changes& changes,InodeInfo inode,const Attributes& attributes,
+                           const std::string& inode_key,const std::string& content_key,bool linked);
     void retire(const NamespaceView& view,Changes& changes,const InodeInfo& inode);
     InodeInfo symlink_entry(const NamespaceView& view,Changes& changes,const std::string& parent,
                            const std::string& name,const std::string& target);

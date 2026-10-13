@@ -651,11 +651,25 @@ void apply_attributes(InodeInfo& n,const Namespace::Attributes& a) {
     if(a.mode)n.mode=*a.mode;if(a.modified_ns)n.modified_ns=*a.modified_ns;n.changed_ns=now();
 }
 }
+void Namespace::attribute_changes(const NamespaceView& view,Changes& changes,InodeInfo n,const Attributes& a,
+                                 const std::string& inode_name,const std::string& content_name,bool linked) {
+    bool resized=false;
+    if(a.size) {
+        if(n.directory || n.symlink)throw std::system_error(n.directory?EISDIR:EINVAL,std::generic_category(),"size requires a regular file");
+        if(*a.size>256*1024)throw std::system_error(EFBIG,std::generic_category(),"prototype files are limited to 256 KiB");
+        if(*a.size!=n.size) {
+            auto data=linked?view.get(content_name):container_.journal_->get(content_name);
+            need(data.size()==n.size,"inode size mismatch");data.resize(static_cast<size_t>(*a.size),0);
+            n.size=*a.size;n.modified_ns=now();changes[content_name]=std::move(data);resized=true;
+        }
+    }
+    if(!resized && !a.mode && !a.modified_ns)return;
+    apply_attributes(n,a);changes[inode_name]=encode(n);
+}
 void Namespace::set_attributes(const std::string& path,const Attributes& a) {
     valid_attributes(a);
     update([&](const NamespaceView& view,Changes& changes) {
-        auto id=resolve(view,path);auto n=inode(view,id);if(!a.mode && !a.modified_ns)return;
-        apply_attributes(n,a);changes[inode_key(id)]=encode(n);
+        auto id=resolve(view,path);attribute_changes(view,changes,inode(view,id),a,inode_key(id),content_key(id),true);
     });
 }
 void Namespace::set_inode_attributes(const std::string& id,const Attributes& a) {
@@ -664,17 +678,18 @@ void Namespace::set_inode_attributes(const std::string& id,const Attributes& a) 
     try{valid_attributes(a);}catch(const std::runtime_error&){throw std::system_error(EINVAL,std::generic_category(),"unsupported inode attributes");}
     update([&](const NamespaceView& view,Changes& changes) {
         if(!view.contains(inode_key(id)))throw std::system_error(ENOENT,std::generic_category(),"inode missing");
-        auto n=inode(view,id);if(!a.mode && !a.modified_ns)return;
-        apply_attributes(n,a);changes[inode_key(id)]=encode(n);
+        attribute_changes(view,changes,inode(view,id),a,inode_key(id),content_key(id),true);
     });
 }
 void Namespace::handle_set_attributes(const std::string& token,const Attributes& a) {
     valid_attributes(a);need(!revision_,"revision view is read-only");
     std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);
+    if(a.size && !info.writable)throw std::system_error(EBADF,std::generic_category(),"size requires a writable handle");
     NamespaceView view(*container_.journal_,view_,revision_);bool linked=view.contains(inode_key(info.inode));
     auto key=linked?inode_key(info.inode):orphan_prefix(view_,info.inode)+"inode";
     auto n=linked?inode(view,info.inode):decode_inode(container_.journal_->get(key),info.inode,true);
-    if(!a.mode && !a.modified_ns)return;apply_attributes(n,a);Changes changes;changes[key]=encode(n);commit_changes(view,changes);
+    Changes changes;auto content=linked?content_key(info.inode):orphan_prefix(view_,info.inode)+"content";
+    attribute_changes(view,changes,n,a,key,content,linked);commit_changes(view,changes);
 }
 InodeInfo Namespace::lstat(const std::string& path) const {
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);return inode(view,resolve(view,path,false));

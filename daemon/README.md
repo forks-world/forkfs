@@ -212,12 +212,21 @@ inodes, even if a handle still retains their contents. Both operations validate
 the parent and publish atomically, share their mutation logic with path APIs,
 and reject revision writes. Richer attributes and writable FSKit callbacks remain
 outstanding. `set_inode_attributes(inode, attributes)` updates the selected inode's
-mode and modification time atomically, without following symbolic links or relying
+mode, modification time and optional regular-file size atomically, without following symbolic links or relying
 on its current path. Hard-link aliases observe the same attributes; snapshots and
 other branches remain unchanged. Missing or unlinked inodes return ENOENT, revision
 writes return EROFS, and invalid attributes return EINVAL. An empty update validates
 the inode but does not publish a transaction. Handle-based updates remain available
 for retained unlinked files.
+
+Size updates share the path/inode/handle attribute transaction: growing a file
+zero-fills its suffix, shrinking drops the suffix, and hard links observe the same
+content and size. A resize updates mtime unless the transaction supplies an explicit
+mtime. An unchanged size alone does not publish a transaction. Directories reject
+size with EISDIR, symbolic links with EINVAL, and sizes beyond the 256 KiB prototype
+limit with EFBIG. Handle size updates require a writable handle (EBADF otherwise),
+including when that handle retains an unlinked inode. Errors leave all requested
+attributes and content unchanged. The inode-size regression runs in metadata CI.
 
 `open_directory_inode()` opens a stable directory cursor by inode on LevelDB.
 It shares path-based cursor semantics: enumeration and optional attributes come
