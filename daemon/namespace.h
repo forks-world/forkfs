@@ -60,6 +60,9 @@ public:
     std::string readlink_inode(const std::string& inode_id) const;
     DirectoryPage list_inode(const std::string& inode_id,const std::string& after,size_t limit) const;
     InodeInfo create_child(const std::string& parent_inode,const std::string& name,bool directory,uint32_t mode);
+    InodeInfo create_child(const std::string& parent_inode,const std::string& name,bool directory,
+                           const Attributes& attributes,std::string* opened_handle=nullptr);
+    InodeInfo symlink_child(const std::string& parent_inode,const std::string& name,const std::string& target,const Attributes& attributes);
     InodeInfo symlink_child(const std::string& parent_inode,const std::string& name,const std::string& target);
     InodeInfo link_child(const std::string& source_inode,const std::string& parent_inode,const std::string& name);
     void remove_child(const std::string& parent_inode,const std::string& name,
@@ -130,6 +133,8 @@ private:
     void attribute_changes(const NamespaceView& view,Changes& changes,InodeInfo inode,const Attributes& attributes,
                            const std::string& inode_key,const std::string& content_key,bool linked);
     void retire(const NamespaceView& view,Changes& changes,const InodeInfo& inode);
+    InodeInfo create_entry(const NamespaceView& view,Changes& changes,const std::string& parent,
+                          const std::string& name,bool directory,const Attributes& attributes);
     InodeInfo symlink_entry(const NamespaceView& view,Changes& changes,const std::string& parent,
                            const std::string& name,const std::string& target);
     InodeInfo link_entry(const NamespaceView& view,Changes& changes,const std::string& source,

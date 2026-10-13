@@ -151,7 +151,7 @@ void Container::create_legacy(const std::string& path) {
     // that another process might have replaced while initialization was running.
 }
 
-Container::Container(const std::string& path,OpenMode mode) {
+Container::Container(const std::string& path,OpenMode mode):mode_(mode) {
     struct stat backing{};
     if(lstat(path.c_str(),&backing)==0 && S_ISDIR(backing.st_mode)) {
         journal_=std::make_unique<Journal>(path,mode==OpenMode::RevisionPreview);id_=journal_->repository();

@@ -32,6 +32,8 @@ ObjectId revision_manifest(const Journal& j,const std::string& name) {
 }
 namespace {
 using Bytes=std::vector<unsigned char>;
+void valid_attributes(const Namespace::Attributes& a);
+void apply_attributes(InodeInfo& n,const Namespace::Attributes& a);
 const std::string prefix("\0forkfs/",8);
 const std::string root_key=prefix+"root";
 void need(bool ok,const char* message) { if(!ok) throw std::runtime_error(message); }
@@ -493,19 +495,36 @@ Namespace::DirectoryPage Namespace::list_inode(const std::string& id,const std::
     for(const auto& key:keys){auto name=key.substr(prefix.size());result.names.push_back(name);result.entries.push_back({name,inode(view,decode_id(view.get(key)))});}
     return result;
 }
+InodeInfo Namespace::create_entry(const NamespaceView& view,Changes& changes,const std::string& parent_id,
+                                const std::string& name,bool directory,const Attributes& a) {
+    auto p=inode_parent(view,parent_id,name);
+    if(view.contains(p.key))throw std::system_error(EEXIST,std::generic_category(),"entry already exists");
+    auto id=new_id(view);InodeInfo created{id,directory,a.mode.value_or(directory?0755:0644),directory?2u:1u,a.size.value_or(0),now(),now()};
+    apply_attributes(created,a);created.indexed_directory=directory && indexed_parents(view);auto pn=inode(view,p.id);
+    if(directory){need(pn.links<UINT64_MAX,"directory link count exhausted");++pn.links;}touch(pn);
+    changes[p.key]=id_bytes(id);changes[inode_key(id)]=encode(created);changes[inode_key(p.id)]=encode(pn);changes[allocated_key(id)]=Bytes{};
+    if(!directory)changes[content_key(id)]=Bytes(created.size,0);
+    else if(indexed_parents(view))changes[parent_key(id)]=parent_record(p.id,p.name);
+    return created;
+}
 InodeInfo Namespace::create_child(const std::string& parent_id,const std::string& name,bool directory,uint32_t mode) {
+    Attributes a;a.mode=mode;return create_child(parent_id,name,directory,a);
+}
+InodeInfo Namespace::create_child(const std::string& parent_id,const std::string& name,bool directory,const Attributes& a,std::string* handle) {
     if(revision_)throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");
-    if(mode>0777)throw std::system_error(EINVAL,std::generic_category(),"unsupported mode bits");
-    InodeInfo created;
-    update([&](const NamespaceView& view,Changes& changes){
-        auto p=inode_parent(view,parent_id,name);
-        if(view.contains(p.key))throw std::system_error(EEXIST,std::generic_category(),"entry already exists");
-        auto id=new_id(view);created={id,directory,mode,directory?2u:1u,0,now(),now()};created.indexed_directory=directory && indexed_parents(view);auto pn=inode(view,p.id);
-        if(directory){need(pn.links<UINT64_MAX,"directory link count exhausted");++pn.links;}touch(pn);
-        changes[p.key]=id_bytes(id);changes[inode_key(id)]=encode(created);changes[inode_key(p.id)]=encode(pn);changes[allocated_key(id)]=Bytes{};
-        if(!directory)changes[content_key(id)]=Bytes{};
-        else if(indexed_parents(view))changes[parent_key(id)]=parent_record(p.id,p.name);
-    });return created;
+    try{valid_attributes(a);}catch(const std::runtime_error&){throw std::system_error(EINVAL,std::generic_category(),"invalid creation attributes");}
+    if(directory && a.size)throw std::system_error(EISDIR,std::generic_category(),"size requires a regular file");
+    if(a.size && *a.size>256*1024)throw std::system_error(EFBIG,std::generic_category(),"prototype files are limited to 256 KiB");
+    if(handle){
+        if(directory || !handle->empty())throw std::system_error(EINVAL,std::generic_category(),"invalid creation handle");
+        std::lock_guard lock(container_.mutex_);
+        if(!container_.journal_->is_leveldb())throw std::system_error(ENOTSUP,std::generic_category(),"file handles require LevelDB");
+        if(container_.handles_.size()>=4096)throw std::system_error(ENFILE,std::generic_category(),"file handle limit reached");
+        NamespaceView view(*container_.journal_,view_,false);Changes changes;
+        auto created=create_entry(view,changes,parent_id,name,directory,a);
+        *handle=publish_open(view,created.id,Access::ReadWrite,OpenOptions{},changes);return created;
+    }
+    InodeInfo created;update([&](const NamespaceView& view,Changes& changes){created=create_entry(view,changes,parent_id,name,directory,a);});return created;
 }
 void Namespace::remove_child(const std::string& parent_id,const std::string& name,const std::string& expected,bool directory) {
     if(revision_)throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");
@@ -790,8 +809,15 @@ InodeInfo Namespace::symlink_entry(const NamespaceView& view,Changes& c,const st
     c[p.key]=id_bytes(id);c[inode_key(p.id)]=encode(pn);return n;
 }
 InodeInfo Namespace::symlink_child(const std::string& parent_id,const std::string& name,const std::string& target) {
+    return symlink_child(parent_id,name,target,Attributes{});
+}
+InodeInfo Namespace::symlink_child(const std::string& parent_id,const std::string& name,const std::string& target,const Attributes& a) {
     if(revision_)throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");
-    InodeInfo result;update([&](const NamespaceView& view,Changes& c){result=symlink_entry(view,c,parent_id,name,target);});return result;
+    try{valid_attributes(a);}catch(const std::runtime_error&){throw std::system_error(EINVAL,std::generic_category(),"invalid creation attributes");}
+    if(a.size)throw std::system_error(EINVAL,std::generic_category(),"symlink size comes from target");
+    InodeInfo result;update([&](const NamespaceView& view,Changes& c){
+        result=symlink_entry(view,c,parent_id,name,target);apply_attributes(result,a);c[inode_key(result.id)]=encode(result);
+    });return result;
 }
 void Namespace::symlink(const std::string& target,const std::string& path) {
     target_components(target);

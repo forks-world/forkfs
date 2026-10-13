@@ -8,10 +8,11 @@ older targets because the path-resource loader uses FSKit V2. This matches the
 host and extension plist minimum versions.
 The optional target links FSKit directly to `forkfs_namespace`; it performs no
 host-file passthrough and no per-operation RPC. The volume owns a shared
-Container and selects a named immutable revision. A live World is not accepted.
+Container. The resource loader selects a named immutable revision; a separate
+World constructor is available to callback tests, but is not exposed by the loader.
 
 Lookup, attributes, symlink reads, regular-file reads and directory enumeration
-use logical inodes. All mutation callbacks return EROFS. Hardlinks reuse the same
+use logical inodes. Revision mutation callbacks return EROFS. Hardlinks reuse the same
 FSItem. Numeric item IDs last only for this volume lifetime, and persistent IDs
 are explicitly disabled. At most 4096 items are retained; quota exhaustion
 returns ENFILE. Directory cookies are entry ordinals in the immutable
@@ -26,9 +27,8 @@ refusal. Directory operations on regular files return ENOTDIR, regular reads of
 directories return EISDIR and foreign items return ESTALE. Directory attributes
 include the parent item ID; hardlinked regular files do not claim a unique parent.
 
-The revision namespace currently stores no extended attributes. Xattr listing
-returns an empty array, queries (including com.apple.provenance) return ENOATTR,
-and all set/delete policies return EROFS. Get/list read versioned inode xattrs;
+Get/list read versioned inode xattrs, missing names return ENOATTR,
+and all revision set/delete policies return EROFS;
 the pathconf maximum xattr size is 64 KiB. The adapter conforms to the general
 xattr protocol and intentionally omits the limited-name hook. These callbacks
 never inspect backing-file xattrs. Revocation takes precedence over item/cookie
@@ -100,3 +100,78 @@ is refused. Ad-hoc signing is refused; the tool does not install or register
 anything. Signing and provisioning have not been exercised here. Profile/team
 requirements, OS registration and real mounts still need validation on a configured
 machine. The unsigned preview window is not evidence that FSKit can load the bundle.
+
+## World file I/O callback stage
+
+`initWithStore:world:error:` accepts a writable LevelDB Container and selects a
+live World. This constructor is for direct integration and callback tests only;
+the resource loader, containing app and revision descriptor still expose only
+immutable revisions. A RevisionPreview Container is rejected with EROFS.
+
+World callbacks now implement writes to existing regular files, atomic
+size/mode/uid/gid/mtime/atime/birthtime updates, and all four xattr policies.
+Attributes report the stored ownership and timestamps, including zero values;
+identity mapping and permission enforcement remain frontend work. Unsupported
+set attributes (including flags and ctime), malformed timestamps and invalid
+modes are rejected before mutation. Only successfully applied fields are marked
+consumed. Prototype file and xattr limits remain 256 KiB and 64 KiB respectively.
+
+Each retained regular FSItem pins a backend read/write handle. This is an internal
+lifetime pin, not an authorization decision or a POSIX open mode. Hardlinks share
+that pin. Reads, attributes and xattrs continue to work after unlink until reclaim
+or revocation closes it. Reclaim invalidates the old FSItem and retains its numeric
+identity for subsequent lookup; the existing 4096 lifetime identity limit remains.
+Revocation closes pins before releasing engine references and returns cleanup
+errors; failed cleanup can be retried, while further callbacks remain revoked.
+Deactivate propagates cleanup failure. Restore must happen after revoking the
+World adapter because backend restore invalidates all World handles.
+
+World callbacks also create files/directories/symlinks, link, remove, rename and
+enumerate directories. This World constructor is deliberately not loadable as a
+mounted filesystem yet.
+`forkfsd_fskit_world` exercises writes, atomic rejection, timestamp conversion,
+xattr policies, hardlink identity, fork/revision isolation, open-unlink retention,
+reclaim, revocation and reopen persistence. It joins metadata-regression on the
+macOS FSKit CI job. Actual kernel buffers, mounting, authorization and fault-time
+cleanup still need integration validation.
+
+## World namespace and enumeration
+
+Creation validates requested attributes before publication. Initial mode, size,
+ownership and timestamps are stored with the directory entry and zero-filled
+content in one transaction. Regular-file creation also reserves its backend
+handle before committing; handle quota failure cannot leave a created file.
+Directory and symlink size requests are rejected. FSKit request type attributes
+must match the requested creation type. Other unsupported attributes fail without
+creating anything. The existing inode identity quota is checked before creation.
+
+Link/remove/rename use inode-relative backend operations, including expected
+source and replacement inode IDs. A stale source or target returns ESTALE rather
+than deleting a replacement entry. Overwritten/unlinked regular FSItems keep their
+handle until reclaim. Directory moves update parent lookup through the backend
+parent index. Revisions continue to reject these mutations with EROFS.
+
+World directory enumerations use immutable backend cursors, with attributes from
+the same captured view. The adapter assigns numeric IDs without opening live
+files, so removed entries can still be enumerated from a captured view. Each
+(directory, attributes-mode) has one enumeration: a fresh initial cookie and
+verifier starts a new snapshot and invalidates the previous verifier for that
+pair. Cookies returned by a successful pack may be replayed, including earlier
+cookies. A full packer does not consume its rejected entry. Name-only enumeration
+includes dot entries; attribute enumeration omits them as required by FSKit.
+
+At most 128 enumeration contexts are retained. Starting another evicts the oldest
+context; stale, evicted, wrong-mode and unissued cookies return
+FSErrorInvalidDirectoryCookie so the caller can restart. Reclaim and revoke clear
+contexts. Sequential resumption retains a backend cursor checkpoint and replays at most
+one 128-entry batch; it does not rescan the directory prefix for every small page.
+Replaying earlier cookies can still scan from the captured root. Backend
+restore still requires revoking the adapter first.
+
+`forkfsd_fskit_namespace` tests atomic creation rejection, hardlinks/symlinks,
+stale mutation arguments, rename-over-open-file, directory moves/cycles, snapshot
+pagination across deletion and compaction, rejected pack entries, replay/EOF,
+128-entry boundaries, cursor eviction, and persistence/isolation. The portable
+`forkfsd_inode_create` regression additionally verifies creation attributes on
+both storage engines and all-or-nothing creation at the backend handle limit.
+Both suites are in the appropriate metadata-regression CI groups.
