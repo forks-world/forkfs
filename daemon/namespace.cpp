@@ -67,11 +67,18 @@ std::string root(const NamespaceView& journal) {
     need(journal.contains(root_key),"filesystem not initialized; use fs-init");return decode_id(journal.get(root_key));
 }
 InodeInfo decode_inode(const Bytes& b,const std::string& id,bool orphan=false) {
-    need(b.size()==48 && (!memcmp(b.data(),"FFINOD01",8) || !memcmp(b.data(),"FFINOD02",8)),"invalid inode record");
+    bool extended=b.size()==80 && !memcmp(b.data(),"FFINOD03",8);
+    need(extended || (b.size()==48 && (!memcmp(b.data(),"FFINOD01",8) || !memcmp(b.data(),"FFINOD02",8))),"invalid inode record");
     auto type=load(b.data()+8,4),mode=load(b.data()+12,4);
     need((type==1||type==2||type==3) && mode<=0777,"unsupported inode attributes");
     InodeInfo n{id,type==2,static_cast<uint32_t>(mode),load(b.data()+16,8),load(b.data()+24,8),
                 load(b.data()+32,8),load(b.data()+40,8),type==3,!memcmp(b.data(),"FFINOD02",8)};
+    if(extended) {
+        auto flags=load(b.data()+48,4);need(flags<=1 && load(b.data()+60,4)==0,"unsupported inode flags");
+        n.indexed_directory=flags&1;n.uid=load(b.data()+52,4);n.gid=load(b.data()+56,4);
+        n.accessed_ns=load(b.data()+64,8);n.created_ns=load(b.data()+72,8);n.extended_attributes=true;
+        need(n.accessed_ns<=INT64_MAX && n.created_ns<=INT64_MAX,"invalid extended inode timestamp");
+    }
     need(!n.indexed_directory || n.directory,"indexed format is only valid for directories");
     need((orphan?(!n.directory && !n.symlink && n.links==0):n.links>0) && (!n.directory || (n.links>=2 && n.size==0)),"invalid inode state");return n;
 }
@@ -83,9 +90,11 @@ InodeInfo frontend_inode(const NamespaceView& view,const std::string& id) {
 }
 std::string orphan_prefix(const std::string& world,const std::string& id) {return history+"orphan/"+world+"/"+id+"/";}
 Bytes encode(const InodeInfo& n) {
-    Bytes b(48);memcpy(b.data(),n.indexed_directory?"FFINOD02":"FFINOD01",8);store(b.data()+8,n.symlink?3:n.directory?2:1,4);
+    Bytes b(n.extended_attributes?80:48);memcpy(b.data(),n.extended_attributes?"FFINOD03":n.indexed_directory?"FFINOD02":"FFINOD01",8);store(b.data()+8,n.symlink?3:n.directory?2:1,4);
     store(b.data()+12,n.mode,4);store(b.data()+16,n.links,8);store(b.data()+24,n.size,8);
-    store(b.data()+32,n.modified_ns,8);store(b.data()+40,n.changed_ns,8);return b;
+    store(b.data()+32,n.modified_ns,8);store(b.data()+40,n.changed_ns,8);
+    if(n.extended_attributes){store(b.data()+48,n.indexed_directory?1:0,4);store(b.data()+52,n.uid,4);store(b.data()+56,n.gid,4);store(b.data()+64,n.accessed_ns,8);store(b.data()+72,n.created_ns,8);}
+    return b;
 }
 bool indexed_parents(const NamespaceView& view) {
     if(!view.contains(parent_index_key))return false;
@@ -646,9 +655,14 @@ namespace {
 void valid_attributes(const Namespace::Attributes& a) {
     need(!a.mode || *a.mode<=0777,"unsupported mode bits");
     need(!a.modified_ns || *a.modified_ns<=INT64_MAX,"mtime exceeds supported nanosecond range");
+    need(!a.accessed_ns || *a.accessed_ns<=INT64_MAX,"atime exceeds supported nanosecond range");
+    need(!a.created_ns || *a.created_ns<=INT64_MAX,"birthtime exceeds supported nanosecond range");
 }
 void apply_attributes(InodeInfo& n,const Namespace::Attributes& a) {
     if(a.mode)n.mode=*a.mode;if(a.modified_ns)n.modified_ns=*a.modified_ns;n.changed_ns=now();
+    if(a.uid)n.uid=*a.uid;if(a.gid)n.gid=*a.gid;
+    if(a.accessed_ns)n.accessed_ns=*a.accessed_ns;if(a.created_ns)n.created_ns=*a.created_ns;
+    if(a.uid || a.gid || a.accessed_ns || a.created_ns)n.extended_attributes=true;
 }
 }
 void Namespace::attribute_changes(const NamespaceView& view,Changes& changes,InodeInfo n,const Attributes& a,
@@ -663,7 +677,7 @@ void Namespace::attribute_changes(const NamespaceView& view,Changes& changes,Ino
             n.size=*a.size;n.modified_ns=now();changes[content_name]=std::move(data);resized=true;
         }
     }
-    if(!resized && !a.mode && !a.modified_ns)return;
+    if(!resized && !a.mode && !a.modified_ns && !a.uid && !a.gid && !a.accessed_ns && !a.created_ns)return;
     apply_attributes(n,a);changes[inode_name]=encode(n);
 }
 void Namespace::set_attributes(const std::string& path,const Attributes& a) {

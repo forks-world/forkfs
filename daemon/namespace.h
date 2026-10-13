@@ -11,11 +11,17 @@ struct InodeInfo {
     uint64_t links, size, modified_ns, changed_ns;
     bool symlink=false;
     bool indexed_directory=false; // FFINOD02: old writers must reject indexed directories.
+    uint32_t uid=0,gid=0;
+    uint64_t accessed_ns=0,created_ns=0;
+    bool extended_attributes=false; // FFINOD03 retains ownership and extra timestamps.
 };
 class NamespaceView;
 class Namespace {
 public:
-    struct Attributes {std::optional<uint32_t> mode;std::optional<uint64_t> modified_ns;std::optional<uint64_t> size;};
+    struct Attributes {
+        std::optional<uint32_t> mode;std::optional<uint64_t> modified_ns;std::optional<uint64_t> size;
+        std::optional<uint32_t> uid,gid;std::optional<uint64_t> accessed_ns,created_ns;
+    };
     class DirectoryCursor {
         friend class Namespace;
         std::weak_ptr<const int> lifetime_;

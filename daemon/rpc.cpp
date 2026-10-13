@@ -49,7 +49,8 @@ std::string quoted(const std::string& value){
 std::string inode_json(const InodeInfo& n){
     std::ostringstream out;out<<"{\"inode_id\":\""<<n.id<<"\",\"directory\":"<<(n.directory?"true":"false")
         <<",\"symlink\":"<<(n.symlink?"true":"false")<<",\"mode\":"<<n.mode<<",\"links\":"<<n.links<<",\"size\":"<<n.size
-        <<",\"modified_ns\":"<<n.modified_ns<<",\"changed_ns\":"<<n.changed_ns<<"}";return out.str();
+        <<",\"modified_ns\":"<<n.modified_ns<<",\"changed_ns\":"<<n.changed_ns
+        <<",\"uid\":"<<n.uid<<",\"gid\":"<<n.gid<<",\"accessed_ns\":"<<n.accessed_ns<<",\"created_ns\":"<<n.created_ns<<"}";return out.str();
 }
 std::string random_token(){
     int fd=open("/dev/urandom",O_RDONLY|O_CLOEXEC);need(fd>=0,"session entropy unavailable");

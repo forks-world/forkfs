@@ -228,6 +228,19 @@ limit with EFBIG. Handle size updates require a writable handle (EBADF otherwise
 including when that handle retains an unlinked inode. Errors leave all requested
 attributes and content unchanged. The inode-size regression runs in metadata CI.
 
+Ownership (`uid`, `gid`), access time (`accessed_ns`) and birth time (`created_ns`)
+are optional attributes in the same transaction. They are exposed in inode stat
+results and CLI/RPC stat JSON; reads do not automatically update atime. Historical
+records report zero for these previously unstored fields. Setting any of them
+upgrades only the affected inode to `FFINOD03` (80 bytes): the original first 48
+bytes, directory-index flag at 48, uid/gid at 52/56, zero reserved word at 60,
+and access/birth nanoseconds at 64/72. Integers are little-endian; timestamps must
+fit signed 64-bit nanoseconds. New readers accept all three inode formats; older
+readers reject the new record rather than dropping its extra attributes. Future
+updates retain the extended format even when every new attribute is set to zero.
+These fields store metadata; user identity mapping and ownership authorization
+remain frontend responsibilities. Writable xattrs and ACLs remain outstanding.
+
 `open_directory_inode()` opens a stable directory cursor by inode on LevelDB.
 It shares path-based cursor semantics: enumeration and optional attributes come
 from the captured metadata root, survive later rename/removal, and are revoked by
