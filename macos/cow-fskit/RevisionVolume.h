@@ -2,7 +2,7 @@
 #ifdef __cplusplus
 #include "container.h"
 #include <memory>
-// Experimental inode adapter. The resource loader still exposes revisions only.
+// Experimental inode adapter. Resource selection supports revisions and live Worlds.
 @interface ForkRevisionVolume : FSVolume <FSVolumeOperations, FSVolumeReadWriteOperations, FSVolumeXattrOperations>
 @property(nonatomic,readonly) FSItem *rootItem;
 - (NSError *)revoke;

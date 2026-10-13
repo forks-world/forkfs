@@ -1,4 +1,4 @@
-# Experimental CoW revision FSKit adapter
+# Experimental CoW FSKit adapter
 
 Build with a macOS 26+ SDK and runtime, with `-DWFS_BUILD_LEGACY=OFF -DWFS_COW_FSKIT=ON` and run
 `ctest --test-dir build/namespace-view -R 'forkfsd_(fskit_callbacks|inode_frontend)' --output-on-failure`.
@@ -8,8 +8,8 @@ older targets because the path-resource loader uses FSKit V2. This matches the
 host and extension plist minimum versions.
 The optional target links FSKit directly to `forkfs_namespace`; it performs no
 host-file passthrough and no per-operation RPC. The volume owns a shared
-Container. The resource loader selects a named immutable revision; a separate
-World constructor is available to callback tests, but is not exposed by the loader.
+Container. The resource loader selects either a named immutable revision or a
+live writable World.
 
 Lookup, attributes, symlink reads, regular-file reads and directory enumeration
 use logical inodes. Revision mutation callbacks return EROFS. Hardlinks reuse the same
@@ -55,21 +55,31 @@ The build emits `ForkRevisionExtension.appex` with a separate bundle identifier
 and FS short name `forkrevision`. It remains unsigned and is not registered with
 macOS. The loader requires a security-scoped FSPathURLResource for the repository
 directory. A regular `.forkfs-fskit-revision` file in that directory contains only
-a revision name (1..64 bytes, optional trailing newline); symlinks, nonregular
+a revision name; alternatively `.forkfs-fskit-world` selects a live World. Exactly
+one marker must exist, with a name of 1..64 bytes and an optional trailing newline.
+Conflicting markers (even a dangling symlink), symlinks, nonregular
 files, invalid names and oversized descriptors are rejected. It cannot redirect
 the loader to a different repository. Probe does not open the database. Load
-opens Container in RevisionPreview mode: orphan recovery is skipped and Journal
+opens revisions in RevisionPreview mode: orphan recovery is skipped and Journal
 put/transact/checkpoint/compaction are rejected. Logical roots and sequence are
 unchanged, including when revision selection fails. Native LevelDB open/recovery
 and background maintenance can still write backing files; the loader therefore
 requires a writable path-resource grant. Physically read-only backing resources
 are unsupported. It acquires exclusive repository ownership, so another forkfsd holding its LevelDB
 lock must be stopped first. Concurrent multi-process ownership is unsupported.
+Missing views currently report EIO through the volume constructor.
+Worlds open in ReadWrite mode, including normal orphan recovery. A failed World
+selection may therefore perform recovery; only revision selection promises to
+leave logical roots unchanged. Changing the marker after load does not retarget
+the active volume; unload and load again to select another view.
 
 Unload/deactivation/unmount revoke the volume. Revocation drains synchronous
 callbacks using the same monitor, clears item identities and releases its engine
 references. Subsequent inode reads/lookup fail with ENOTCONN; a revoked instance
-cannot be reactivated. Unload releases the security-scoped grant after revocation.
+cannot be reactivated. Unload releases the security-scoped grant only after successful revocation.
+If cleanup fails, it returns the error, marks the container not ready, retains the
+volume and grant, and rejects another load with EBUSY until unload succeeds.
+Final object destruction balances the grant even when cleanup cannot be retried.
 Tests cover descriptor parsing/rejection and old-item access after revocation;
 OS grant delivery and extension installation have not been exercised.
 
@@ -82,7 +92,7 @@ signing was attempted.
 
 The optional build now produces `ForkfsRevision.app` containing
 `Contents/PlugIns/ForkRevisionExtension.appex`. Its small native window can select
-a repository and validate the revision descriptor; it explicitly reports that
+a repository and validate the World or revision descriptor; it explicitly reports that
 nothing has been mounted. The app does not create descriptors, install the
 extension, open the repository engine or change repository data.
 
@@ -90,7 +100,8 @@ extension, open the repository engine or change repository data.
 executables and declared sandbox entitlements. It is not a signature test.
 The host requests only user-selected read access; the extension still relies on
 FSKit's granted resource. Repeated probes derive the same container identifier
-from the resource path and revision, without opening LevelDB. These identifiers
+from the resource path and selection, without opening LevelDB. World and revision
+identities use separate hash domains; existing revision identities are preserved. These identifiers
 are path-based and are not persistent repository or inode identities.
 
 With an appropriate real signing identity, `sign_bundle.py --app APP --output NEW_APP
@@ -104,9 +115,8 @@ machine. The unsigned preview window is not evidence that FSKit can load the bun
 ## World file I/O callback stage
 
 `initWithStore:world:error:` accepts a writable LevelDB Container and selects a
-live World. This constructor is for direct integration and callback tests only;
-the resource loader, containing app and revision descriptor still expose only
-immutable revisions. A RevisionPreview Container is rejected with EROFS.
+live World. The resource loader uses this constructor for a World descriptor.
+A RevisionPreview Container is rejected with EROFS.
 
 World callbacks now implement writes to existing regular files, atomic
 size/mode/uid/gid/mtime/atime/birthtime updates, and all four xattr policies.
@@ -127,8 +137,8 @@ Deactivate propagates cleanup failure. Restore must happen after revoking the
 World adapter because backend restore invalidates all World handles.
 
 World callbacks also create files/directories/symlinks, link, remove, rename and
-enumerate directories. This World constructor is deliberately not loadable as a
-mounted filesystem yet.
+enumerate directories. The loader can now construct this volume; actual mounted
+filesystem behavior remains unvalidated.
 `forkfsd_fskit_world` exercises writes, atomic rejection, timestamp conversion,
 xattr policies, hardlink identity, fork/revision isolation, open-unlink retention,
 reclaim, revocation and reopen persistence. It joins metadata-regression on the
@@ -175,3 +185,15 @@ pagination across deletion and compaction, rejected pack entries, replay/EOF,
 `forkfsd_inode_create` regression additionally verifies creation attributes on
 both storage engines and all-or-nothing creation at the backend handle limit.
 Both suites are in the appropriate metadata-regression CI groups.
+
+
+## Resource lifecycle regression
+
+`forkfsd_fskit_resource` is included in metadata-regression on macOS with FSKit.
+It tests both descriptors, ambiguous/invalid selectors, symlinks and FIFO rejection,
+identity separation, denied/read-only grants, probe with a live database owner,
+duplicate load, missing views, World write isolation and persistence, revision
+write rejection, cleanup failure/retry, and balanced grants on final teardown.
+Descriptors, the database and volume callbacks are real; security-scoped URL
+access and the cleanup failure are deterministic test doubles. These tests do not
+establish OS grant delivery, signing, mounted permissions or kernel cache behavior.

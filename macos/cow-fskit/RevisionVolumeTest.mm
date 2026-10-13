@@ -3,8 +3,7 @@
 #include <filesystem>
 #include <iostream>
 #include <fstream>
-extern NSString *ForkRevisionResourceName(NSURL *url);
-extern NSUUID *ForkRevisionProbeIdentity(NSURL *url,NSString *revision);
+#import "RevisionFileSystem.h"
 #include <unistd.h>
 // Recording test double for FSKit's nonconstructible system packer.
 @interface RevisionRecordingPacker : NSObject
@@ -39,13 +38,11 @@ int main(){@autoreleasepool {
         forkfs::Namespace fs(*store);fs.initialize();fs.write("/a",{1,2});fs.link("/a","/b");fs.symlink("a","/link");fs.mkdir("/dir");fs.set_inode_xattr(fs.stat("/a").id,"user.binary",{0,255});fs.snapshot("base");
         auto resource=[NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()] isDirectory:YES];
         auto marker=path+"/.forkfs-fskit-revision";
-        check([ForkRevisionProbeIdentity(resource,@"base") isEqual:ForkRevisionProbeIdentity(resource,@"base")]);
-        check(![ForkRevisionProbeIdentity(resource,@"base") isEqual:ForkRevisionProbeIdentity(resource,@"other")]);
-        check(!ForkRevisionResourceName(resource));
-        {std::ofstream out(marker);out<<"base\n";}check([ForkRevisionResourceName(resource) isEqualToString:@"base"]);
-        {std::ofstream out(marker);out<<"../base";}check(!ForkRevisionResourceName(resource));
-        {std::ofstream out(marker);out<<std::string(66,'a');}check(!ForkRevisionResourceName(resource));
-        std::filesystem::remove(marker);std::filesystem::create_symlink("CURRENT",marker);check(!ForkRevisionResourceName(resource));
+        check(![ForkFSResourceSelection selectionAtURL:resource]);
+        {std::ofstream out(marker);out<<"base\n";}check([[ForkFSResourceSelection selectionAtURL:resource].name isEqualToString:@"base"]);
+        {std::ofstream out(marker);out<<"../base";}check(![ForkFSResourceSelection selectionAtURL:resource]);
+        {std::ofstream out(marker);out<<std::string(66,'a');}check(![ForkFSResourceSelection selectionAtURL:resource]);
+        std::filesystem::remove(marker);std::filesystem::create_symlink("CURRENT",marker);check(![ForkFSResourceSelection selectionAtURL:resource]);
         std::filesystem::remove(marker);
         NSError *error=nil;auto volume=[[ForkRevisionVolume alloc] initWithStore:store revision:@"base" error:&error];check(volume && !error);
         FSItem *root=volume.rootItem;check(root);
