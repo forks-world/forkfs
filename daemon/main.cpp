@@ -298,7 +298,8 @@ int main(int argc, char** argv) {
                 auto n=command=="fs-lstat"?fs.lstat(argv[3]):fs.stat(argv[3]);
                 std::cout<<"{\"inode_id\":\""<<n.id<<"\",\"directory\":"<<(n.directory?"true":"false")
                          <<",\"symlink\":"<<(n.symlink?"true":"false")<<",\"mode\":"<<n.mode<<",\"links\":"<<n.links<<",\"size\":"<<n.size
-                         <<",\"modified_ns\":"<<n.modified_ns<<",\"changed_ns\":"<<n.changed_ns<<"}\n";
+                         <<",\"modified_ns\":"<<n.modified_ns<<",\"changed_ns\":"<<n.changed_ns
+                         <<",\"uid\":"<<n.uid<<",\"gid\":"<<n.gid<<",\"accessed_ns\":"<<n.accessed_ns<<",\"created_ns\":"<<n.created_ns<<"}\n";
                 return 0;
             } else throw std::runtime_error("invalid filesystem command arguments");
             std::cout<<container.status();

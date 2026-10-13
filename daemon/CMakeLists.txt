@@ -46,7 +46,7 @@ set_tests_properties(forkfsd_metadata_view PROPERTIES TIMEOUT 60)
 add_library(forkfs_namespace STATIC container.cpp namespace.cpp compaction.cpp maintenance.cpp)
 target_link_libraries(forkfs_namespace PUBLIC forkfs_metadata)
 target_compile_options(forkfs_namespace PRIVATE -Wall -Wextra -Wpedantic)
-foreach(suite file_io handles inode_handles inode_entries inode_contracts parent_index transaction)
+foreach(suite file_io handles inode_handles inode_entries inode_contracts inode_size inode_xattrs inode_corruption parent_index transaction)
     add_executable(forkfsd_${suite}_test tests/${suite}.cpp)
     target_link_libraries(forkfsd_${suite}_test PRIVATE forkfs_namespace)
     add_test(NAME forkfsd_${suite} COMMAND forkfsd_${suite}_test)
@@ -62,8 +62,16 @@ add_executable(forkfsd_leveldb_fault_test main.cpp rpc.cpp container.cpp namespa
 target_compile_definitions(forkfsd_leveldb_fault_test PRIVATE FORKFS_TEST_FAULTS=1)
 target_include_directories(forkfsd_leveldb_fault_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(forkfsd_leveldb_fault_test PRIVATE leveldb Threads::Threads)
+add_executable(forkfsd_inode_recovery_test tests/inode_recovery.cpp container.cpp namespace.cpp
+    compaction.cpp maintenance.cpp journal.cpp level_store.cpp metadata_tree.cpp metadata_view.cpp)
+target_compile_definitions(forkfsd_inode_recovery_test PRIVATE FORKFS_TEST_FAULTS=1)
+target_include_directories(forkfsd_inode_recovery_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(forkfsd_inode_recovery_test PRIVATE leveldb Threads::Threads)
+add_test(NAME forkfsd_inode_recovery COMMAND forkfsd_inode_recovery_test)
+set_tests_properties(forkfsd_inode_recovery PROPERTIES TIMEOUT 120 LABELS metadata-regression)
 if(NOT APPLE)
     target_link_libraries(forkfsd_leveldb_fault_test PRIVATE OpenSSL::Crypto)
+    target_link_libraries(forkfsd_inode_recovery_test PRIVATE OpenSSL::Crypto)
 endif()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 foreach(suite leveldb file_io_crash handles_crash symlinks attributes save)
@@ -97,7 +105,7 @@ foreach(seed 1 173 4294967295)
     set_tests_properties(forkfsd_metadata_manager_seed_${seed} PROPERTIES TIMEOUT 120 LABELS metadata-regression)
 endforeach()
 set_tests_properties(forkfsd_metadata_manager forkfsd_metadata_view forkfsd_metadata_tree
-    forkfsd_revision_preview forkfsd_inode_handles forkfsd_inode_entries forkfsd_inode_contracts forkfsd_parent_index forkfsd_transaction forkfsd_lock_granularity
+    forkfsd_revision_preview forkfsd_inode_handles forkfsd_inode_entries forkfsd_inode_contracts forkfsd_inode_size forkfsd_inode_xattrs forkfsd_inode_corruption forkfsd_parent_index forkfsd_transaction forkfsd_lock_granularity
     forkfsd_file_io_crash forkfsd_handles_crash PROPERTIES LABELS metadata-regression)
 
 add_test(NAME forkfsd_basic_harness COMMAND ${Python3_EXECUTABLE}

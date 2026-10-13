@@ -28,7 +28,8 @@ include the parent item ID; hardlinked regular files do not claim a unique paren
 
 The revision namespace currently stores no extended attributes. Xattr listing
 returns an empty array, queries (including com.apple.provenance) return ENOATTR,
-and all set/delete policies return EROFS. The pathconf maximum xattr size is zero. The adapter conforms to the general
+and all set/delete policies return EROFS. Get/list read versioned inode xattrs;
+the pathconf maximum xattr size is 64 KiB. The adapter conforms to the general
 xattr protocol and intentionally omits the limited-name hook. These callbacks
 never inspect backing-file xattrs. Revocation takes precedence over item/cookie
 validation and read-only errors for requests against revoked volumes (ENOTCONN).

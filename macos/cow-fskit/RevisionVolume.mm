@@ -49,7 +49,7 @@ static FSItemType kind(const forkfs::InodeInfo& n){return n.directory?FSItemType
 }
 - (NSInteger)maximumLinkCount {return NSIntegerMax;}
 - (NSInteger)maximumNameLength {return 255;}
-- (NSInteger)maximumXattrSize {return 0;} // No xattrs are stored by this revision format.
+- (NSInteger)maximumXattrSize {return 64*1024;}
 - (BOOL)restrictsOwnershipChanges {return YES;}
 - (BOOL)truncatesLongNames {return NO;}
 - (void)enumerateDirectory:(FSItem *)directory startingAtCookie:(FSDirectoryCookie)cookie verifier:(FSDirectoryVerifier)verifier
@@ -126,13 +126,17 @@ static FSItemType kind(const forkfs::InodeInfo& n){return n.directory?FSItemType
     if(offset<0 || !buffer){reply(0,err(EINVAL));return;}
     @synchronized(self){try{auto it=[self checked:item];if(it.type!=FSItemTypeFile){reply(0,err(it.type==FSItemTypeDirectory?EISDIR:EINVAL));return;}auto data=_view->read_inode(it.inode.UTF8String,offset,MIN(length,buffer.length));if(!data.empty()){if(!buffer.mutableBytes){reply(0,err(EFAULT));return;}memcpy(buffer.mutableBytes,data.data(),data.size());}reply(data.size(),nil);}catch(const std::system_error& e){reply(0,err(e.code().value()));}catch(const std::exception&){reply(0,err(EIO));}}
 }
-// Namespace currently stores no xattrs. Do not advertise limited support: FSKit
-// would route unlisted names through AppleDouble instead of these callbacks.
+// Route all names through the versioned inode; do not use AppleDouble sidecars.
 - (void)getXattrNamed:(FSFileName *)name ofItem:(FSItem *)item replyHandler:(void (^)(NSData *,NSError *))reply {
-    @synchronized(self){try{[self checked:item];reply(nil,err(ENOATTR));}catch(const std::system_error& e){reply(nil,err(e.code().value()));}catch(const std::exception&){reply(nil,err(EIO));}}
+    @synchronized(self){try{auto it=[self checked:item];auto data=name.data;if(!data || !data.length){reply(nil,err(EINVAL));return;}
+        auto value=_view->get_inode_xattr(it.inode.UTF8String,std::string(static_cast<const char *>(data.bytes),data.length));
+        reply([NSData dataWithBytes:value.data() length:value.size()],nil);
+    }catch(const std::system_error& e){reply(nil,err(e.code().value()));}catch(const std::exception&){reply(nil,err(EIO));}}
 }
 - (void)listXattrsOfItem:(FSItem *)item replyHandler:(void (^)(NSArray<FSFileName *> *,NSError *))reply {
-    @synchronized(self){try{[self checked:item];reply(@[],nil);}catch(const std::system_error& e){reply(nil,err(e.code().value()));}catch(const std::exception&){reply(nil,err(EIO));}}
+    @synchronized(self){try{auto it=[self checked:item];auto names=[NSMutableArray<FSFileName *> new];
+        for(const auto& name:_view->list_inode_xattrs(it.inode.UTF8String))[names addObject:[FSFileName nameWithBytes:name.data() length:name.size()]];reply(names,nil);
+    }catch(const std::system_error& e){reply(nil,err(e.code().value()));}catch(const std::exception&){reply(nil,err(EIO));}}
 }
 - (NSError *)readOnlyErrorForItems:(NSArray<FSItem *> *)items {
     @synchronized(self){try{for(FSItem *item in items)[self checked:item];return err(EROFS);}catch(const std::system_error& e){return err(e.code().value());}catch(const std::exception&){return err(EIO);}}

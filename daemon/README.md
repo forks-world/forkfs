@@ -212,12 +212,52 @@ inodes, even if a handle still retains their contents. Both operations validate
 the parent and publish atomically, share their mutation logic with path APIs,
 and reject revision writes. Richer attributes and writable FSKit callbacks remain
 outstanding. `set_inode_attributes(inode, attributes)` updates the selected inode's
-mode and modification time atomically, without following symbolic links or relying
+mode, modification time and optional regular-file size atomically, without following symbolic links or relying
 on its current path. Hard-link aliases observe the same attributes; snapshots and
 other branches remain unchanged. Missing or unlinked inodes return ENOENT, revision
 writes return EROFS, and invalid attributes return EINVAL. An empty update validates
 the inode but does not publish a transaction. Handle-based updates remain available
 for retained unlinked files.
+
+Size updates share the path/inode/handle attribute transaction: growing a file
+zero-fills its suffix, shrinking drops the suffix, and hard links observe the same
+content and size. A resize updates mtime unless the transaction supplies an explicit
+mtime. An unchanged size alone does not publish a transaction. Directories reject
+size with EISDIR, symbolic links with EINVAL, and sizes beyond the 256 KiB prototype
+limit with EFBIG. Handle size updates require a writable handle (EBADF otherwise),
+including when that handle retains an unlinked inode. Errors leave all requested
+attributes and content unchanged. The inode-size regression runs in metadata CI.
+
+Ownership (`uid`, `gid`), access time (`accessed_ns`) and birth time (`created_ns`)
+are optional attributes in the same transaction. They are exposed in inode stat
+results and CLI/RPC stat JSON; reads do not automatically update atime. Historical
+records report zero for these previously unstored fields. Setting any of them
+upgrades only the affected inode to `FFINOD03` (80 bytes): the original first 48
+bytes, directory-index flag at 48, uid/gid at 52/56, zero reserved word at 60,
+and access/birth nanoseconds at 64/72. Integers are little-endian; timestamps must
+fit signed 64-bit nanoseconds. New readers accept all three inode formats; older
+readers reject the new record rather than dropping its extra attributes. Future
+updates retain the extended format even when every new attribute is set to zero.
+These fields store metadata; user identity mapping and ownership authorization
+remain frontend responsibilities. ACLs remain outstanding.
+
+Inode and handle xattr APIs support list/get/set/remove, with Upsert/Create/Replace
+policies. Missing names return ENOATTR on macOS and ENODATA on Linux; Create on an
+existing name returns EEXIST. Names are 1..255 printable non-space ASCII bytes,
+values are binary (including empty), with at most 128 names and 64 KiB per value.
+The complete inode record is limited to 128 KiB; budget errors return E2BIG before
+publication. Revision mutations return EROFS. Hard links share attributes, forks
+and revisions keep independent versions, and handles retain xattrs after unlink.
+Reads and mutation use logical inodes; host backing-file xattrs are never queried.
+
+The first xattr mutation uses FFINOD04: the FFINOD03 80-byte field layout followed
+by a little-endian uint32 count and sorted records (uint32 name length, uint32
+value length, name bytes, value bytes). Duplicate/unsorted names, unknown flags,
+bad lengths and trailing bytes are rejected. Removing the last xattr retains the
+new format. Xattrs reside inside the CoW inode payload, so existing orphan retention
+and cleanup apply without extra roots. Copies of InodeInfo share an immutable xattr
+map; mutations copy that map. The read-only revision FSKit adapter reads stored
+xattrs and advertises 64 KiB values; all set/delete callbacks still return EROFS.
 
 `open_directory_inode()` opens a stable directory cursor by inode on LevelDB.
 It shares path-based cursor semantics: enumeration and optional attributes come

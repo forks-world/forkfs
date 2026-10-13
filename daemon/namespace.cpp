@@ -67,11 +67,30 @@ std::string root(const NamespaceView& journal) {
     need(journal.contains(root_key),"filesystem not initialized; use fs-init");return decode_id(journal.get(root_key));
 }
 InodeInfo decode_inode(const Bytes& b,const std::string& id,bool orphan=false) {
-    need(b.size()==48 && (!memcmp(b.data(),"FFINOD01",8) || !memcmp(b.data(),"FFINOD02",8)),"invalid inode record");
+    bool xattrs=b.size()>=84 && b.size()<=128*1024 && !memcmp(b.data(),"FFINOD04",8);
+    bool extended=(b.size()==80 && !memcmp(b.data(),"FFINOD03",8)) || xattrs;
+    need(extended || (b.size()==48 && (!memcmp(b.data(),"FFINOD01",8) || !memcmp(b.data(),"FFINOD02",8))),"invalid inode record");
     auto type=load(b.data()+8,4),mode=load(b.data()+12,4);
     need((type==1||type==2||type==3) && mode<=0777,"unsupported inode attributes");
     InodeInfo n{id,type==2,static_cast<uint32_t>(mode),load(b.data()+16,8),load(b.data()+24,8),
                 load(b.data()+32,8),load(b.data()+40,8),type==3,!memcmp(b.data(),"FFINOD02",8)};
+    if(extended) {
+        auto flags=load(b.data()+48,4);need(flags<=1 && load(b.data()+60,4)==0,"unsupported inode flags");
+        n.indexed_directory=flags&1;n.uid=load(b.data()+52,4);n.gid=load(b.data()+56,4);
+        n.accessed_ns=load(b.data()+64,8);n.created_ns=load(b.data()+72,8);n.extended_attributes=true;
+        need(n.accessed_ns<=INT64_MAX && n.created_ns<=INT64_MAX,"invalid extended inode timestamp");
+    }
+    if(xattrs) {
+        auto values=std::make_shared<InodeInfo::Xattrs>();auto count=load(b.data()+80,4);need(count<=128,"too many xattrs");size_t at=84;std::string previous;
+        for(uint64_t i=0;i<count;++i) {
+            need(b.size()-at>=8,"truncated xattr lengths");auto name_size=load(b.data()+at,4),value_size=load(b.data()+at+4,4);at+=8;
+            need(name_size>0 && name_size<=255 && value_size<=64*1024 && name_size+value_size<=b.size()-at,"invalid xattr size");
+            std::string name(b.begin()+at,b.begin()+at+name_size);at+=name_size;
+            need(std::all_of(name.begin(),name.end(),[](unsigned char c){return c>=33 && c<=126;}) && (i==0 || previous<name),"invalid xattr name/order");
+            previous=name;values->emplace(name,Bytes(b.begin()+at,b.begin()+at+value_size));at+=value_size;
+        }
+        need(at==b.size(),"unexpected xattr suffix");n.xattrs=std::move(values);
+    }
     need(!n.indexed_directory || n.directory,"indexed format is only valid for directories");
     need((orphan?(!n.directory && !n.symlink && n.links==0):n.links>0) && (!n.directory || (n.links>=2 && n.size==0)),"invalid inode state");return n;
 }
@@ -83,9 +102,19 @@ InodeInfo frontend_inode(const NamespaceView& view,const std::string& id) {
 }
 std::string orphan_prefix(const std::string& world,const std::string& id) {return history+"orphan/"+world+"/"+id+"/";}
 Bytes encode(const InodeInfo& n) {
-    Bytes b(48);memcpy(b.data(),n.indexed_directory?"FFINOD02":"FFINOD01",8);store(b.data()+8,n.symlink?3:n.directory?2:1,4);
+    Bytes b(n.xattrs?84:n.extended_attributes?80:48);memcpy(b.data(),n.xattrs?"FFINOD04":n.extended_attributes?"FFINOD03":n.indexed_directory?"FFINOD02":"FFINOD01",8);store(b.data()+8,n.symlink?3:n.directory?2:1,4);
     store(b.data()+12,n.mode,4);store(b.data()+16,n.links,8);store(b.data()+24,n.size,8);
-    store(b.data()+32,n.modified_ns,8);store(b.data()+40,n.changed_ns,8);return b;
+    store(b.data()+32,n.modified_ns,8);store(b.data()+40,n.changed_ns,8);
+    if(n.extended_attributes || n.xattrs){store(b.data()+48,n.indexed_directory?1:0,4);store(b.data()+52,n.uid,4);store(b.data()+56,n.gid,4);store(b.data()+64,n.accessed_ns,8);store(b.data()+72,n.created_ns,8);}
+    if(n.xattrs) {
+        if(n.xattrs->size()>128)throw std::system_error(E2BIG,std::generic_category(),"too many xattrs");store(b.data()+80,n.xattrs->size(),4);
+        for(const auto& [name,value]:*n.xattrs){size_t at=b.size();
+            if(8+name.size()+value.size()>128*1024-at)throw std::system_error(E2BIG,std::generic_category(),"xattr inode exceeds 128 KiB");
+            b.resize(at+8+name.size()+value.size());store(b.data()+at,name.size(),4);store(b.data()+at+4,value.size(),4);
+            memcpy(b.data()+at+8,name.data(),name.size());if(!value.empty())memcpy(b.data()+at+8+name.size(),value.data(),value.size());
+        }
+    }
+    return b;
 }
 bool indexed_parents(const NamespaceView& view) {
     if(!view.contains(parent_index_key))return false;
@@ -646,16 +675,35 @@ namespace {
 void valid_attributes(const Namespace::Attributes& a) {
     need(!a.mode || *a.mode<=0777,"unsupported mode bits");
     need(!a.modified_ns || *a.modified_ns<=INT64_MAX,"mtime exceeds supported nanosecond range");
+    need(!a.accessed_ns || *a.accessed_ns<=INT64_MAX,"atime exceeds supported nanosecond range");
+    need(!a.created_ns || *a.created_ns<=INT64_MAX,"birthtime exceeds supported nanosecond range");
 }
 void apply_attributes(InodeInfo& n,const Namespace::Attributes& a) {
     if(a.mode)n.mode=*a.mode;if(a.modified_ns)n.modified_ns=*a.modified_ns;n.changed_ns=now();
+    if(a.uid)n.uid=*a.uid;if(a.gid)n.gid=*a.gid;
+    if(a.accessed_ns)n.accessed_ns=*a.accessed_ns;if(a.created_ns)n.created_ns=*a.created_ns;
+    if(a.uid || a.gid || a.accessed_ns || a.created_ns)n.extended_attributes=true;
 }
+}
+void Namespace::attribute_changes(const NamespaceView& view,Changes& changes,InodeInfo n,const Attributes& a,
+                                 const std::string& inode_name,const std::string& content_name,bool linked) {
+    bool resized=false;
+    if(a.size) {
+        if(n.directory || n.symlink)throw std::system_error(n.directory?EISDIR:EINVAL,std::generic_category(),"size requires a regular file");
+        if(*a.size>256*1024)throw std::system_error(EFBIG,std::generic_category(),"prototype files are limited to 256 KiB");
+        if(*a.size!=n.size) {
+            auto data=linked?view.get(content_name):container_.journal_->get(content_name);
+            need(data.size()==n.size,"inode size mismatch");data.resize(static_cast<size_t>(*a.size),0);
+            n.size=*a.size;n.modified_ns=now();changes[content_name]=std::move(data);resized=true;
+        }
+    }
+    if(!resized && !a.mode && !a.modified_ns && !a.uid && !a.gid && !a.accessed_ns && !a.created_ns)return;
+    apply_attributes(n,a);changes[inode_name]=encode(n);
 }
 void Namespace::set_attributes(const std::string& path,const Attributes& a) {
     valid_attributes(a);
     update([&](const NamespaceView& view,Changes& changes) {
-        auto id=resolve(view,path);auto n=inode(view,id);if(!a.mode && !a.modified_ns)return;
-        apply_attributes(n,a);changes[inode_key(id)]=encode(n);
+        auto id=resolve(view,path);attribute_changes(view,changes,inode(view,id),a,inode_key(id),content_key(id),true);
     });
 }
 void Namespace::set_inode_attributes(const std::string& id,const Attributes& a) {
@@ -664,18 +712,70 @@ void Namespace::set_inode_attributes(const std::string& id,const Attributes& a) 
     try{valid_attributes(a);}catch(const std::runtime_error&){throw std::system_error(EINVAL,std::generic_category(),"unsupported inode attributes");}
     update([&](const NamespaceView& view,Changes& changes) {
         if(!view.contains(inode_key(id)))throw std::system_error(ENOENT,std::generic_category(),"inode missing");
-        auto n=inode(view,id);if(!a.mode && !a.modified_ns)return;
-        apply_attributes(n,a);changes[inode_key(id)]=encode(n);
+        attribute_changes(view,changes,inode(view,id),a,inode_key(id),content_key(id),true);
     });
 }
 void Namespace::handle_set_attributes(const std::string& token,const Attributes& a) {
     valid_attributes(a);need(!revision_,"revision view is read-only");
     std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);
+    if(a.size && !info.writable)throw std::system_error(EBADF,std::generic_category(),"size requires a writable handle");
     NamespaceView view(*container_.journal_,view_,revision_);bool linked=view.contains(inode_key(info.inode));
     auto key=linked?inode_key(info.inode):orphan_prefix(view_,info.inode)+"inode";
     auto n=linked?inode(view,info.inode):decode_inode(container_.journal_->get(key),info.inode,true);
-    if(!a.mode && !a.modified_ns)return;apply_attributes(n,a);Changes changes;changes[key]=encode(n);commit_changes(view,changes);
+    Changes changes;auto content=linked?content_key(info.inode):orphan_prefix(view_,info.inode)+"content";
+    attribute_changes(view,changes,n,a,key,content,linked);commit_changes(view,changes);
 }
+namespace {
+#ifdef ENOATTR
+constexpr int missing_xattr=ENOATTR;
+#else
+constexpr int missing_xattr=ENODATA;
+#endif
+void valid_xattr_name(const std::string& name) {
+    if(name.empty() || name.size()>255 || !std::all_of(name.begin(),name.end(),[](unsigned char c){return c>=33 && c<=126;}))
+        throw std::system_error(EINVAL,std::generic_category(),"invalid xattr name");
+}
+std::vector<std::string> xattr_names(const InodeInfo& n){std::vector<std::string> result;if(n.xattrs)for(const auto& [name,value]:*n.xattrs)result.push_back(name);return result;}
+Bytes xattr_value(const InodeInfo& n,const std::string& name) {
+    valid_xattr_name(name);if(n.xattrs){auto found=n.xattrs->find(name);if(found!=n.xattrs->end())return found->second;}
+    throw std::system_error(missing_xattr,std::generic_category(),"xattr missing");
+}
+}
+std::pair<InodeInfo,std::string> Namespace::xattr_inode(const NamespaceView& view,const std::string& address,bool handle) const {
+    if(!handle)return {frontend_inode(view,address),inode_key(address)};
+    const auto& info=find_handle(address);if(view.contains(inode_key(info.inode)))return {inode(view,info.inode),inode_key(info.inode)};
+    auto key=orphan_prefix(view_,info.inode)+"inode";return {decode_inode(container_.journal_->get(key),info.inode,true),key};
+}
+void Namespace::edit_xattrs(const std::string& address,bool handle,const std::string& name,const std::optional<Bytes>& value,XattrMode mode) {
+    if(revision_)throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");valid_xattr_name(name);
+    if(mode!=XattrMode::Upsert && mode!=XattrMode::Create && mode!=XattrMode::Replace)throw std::system_error(EINVAL,std::generic_category(),"invalid xattr policy");
+    if(value && value->size()>64*1024)throw std::system_error(E2BIG,std::generic_category(),"xattr exceeds 64 KiB");
+    auto edit=[&](const NamespaceView& view,Changes& changes) {
+        auto [n,key]=xattr_inode(view,address,handle);auto values=n.xattrs?*n.xattrs:InodeInfo::Xattrs{};bool exists=values.contains(name);
+        if(value && mode==XattrMode::Create && exists)throw std::system_error(EEXIST,std::generic_category(),"xattr already exists");
+        if((!value || mode==XattrMode::Replace) && !exists)throw std::system_error(missing_xattr,std::generic_category(),"xattr missing");
+        if(value)values[name]=*value;else values.erase(name);n.xattrs=std::make_shared<const InodeInfo::Xattrs>(std::move(values));
+        n.extended_attributes=true;n.changed_ns=now();changes[key]=encode(n);
+    };
+    if(!handle){update(edit);return;}
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);Changes changes;edit(view,changes);commit_changes(view,changes);
+}
+std::vector<std::string> Namespace::list_inode_xattrs(const std::string& id) const {
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);return xattr_names(xattr_inode(view,id,false).first);
+}
+Bytes Namespace::get_inode_xattr(const std::string& id,const std::string& name) const {
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);return xattr_value(xattr_inode(view,id,false).first,name);
+}
+std::vector<std::string> Namespace::list_handle_xattrs(const std::string& token) const {
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);return xattr_names(xattr_inode(view,token,true).first);
+}
+Bytes Namespace::get_handle_xattr(const std::string& token,const std::string& name) const {
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);return xattr_value(xattr_inode(view,token,true).first,name);
+}
+void Namespace::set_inode_xattr(const std::string& id,const std::string& name,const Bytes& value,XattrMode mode){edit_xattrs(id,false,name,value,mode);}
+void Namespace::remove_inode_xattr(const std::string& id,const std::string& name){edit_xattrs(id,false,name,std::nullopt,XattrMode::Replace);}
+void Namespace::set_handle_xattr(const std::string& token,const std::string& name,const Bytes& value,XattrMode mode){edit_xattrs(token,true,name,value,mode);}
+void Namespace::remove_handle_xattr(const std::string& token,const std::string& name){edit_xattrs(token,true,name,std::nullopt,XattrMode::Replace);}
 InodeInfo Namespace::lstat(const std::string& path) const {
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);return inode(view,resolve(view,path,false));
 }
