@@ -27,7 +27,8 @@ public:
     void checkpoint();
     // Persistent request IDs. One background export; interrupted work is not retried.
     std::string start_backup(const std::string& request_id,const std::string& archive,
-                             std::optional<uint64_t> after=std::nullopt);
+                             std::optional<uint64_t> after=std::nullopt,const std::string& catalog="",bool retry_catalog=false);
+    std::string retry_backup_catalog(const std::string& request_id);
     std::string backup_status(const std::string& request_id);
     void forget_backup(const std::string& request_id);
     void start_compaction();
@@ -45,6 +46,8 @@ private:
         std::string chain_hash;
         std::optional<uint64_t> after;
         uint64_t sequence=0;
+        std::string catalog;
+        bool archive_durable=false;
     };
     std::string backup_status_locked(const std::string& request_id) const;
     void stop_backup();

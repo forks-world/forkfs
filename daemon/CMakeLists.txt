@@ -43,7 +43,7 @@ target_link_libraries(forkfsd_metadata_view_test PRIVATE forkfs_metadata)
 add_test(NAME forkfsd_metadata_view COMMAND forkfsd_metadata_view_test)
 set_tests_properties(forkfsd_metadata_view PROPERTIES TIMEOUT 60)
 
-add_library(forkfs_namespace STATIC container.cpp namespace.cpp compaction.cpp maintenance.cpp)
+add_library(forkfs_namespace STATIC container.cpp backup_catalog.cpp namespace.cpp compaction.cpp maintenance.cpp)
 target_link_libraries(forkfs_namespace PUBLIC forkfs_metadata)
 target_compile_options(forkfs_namespace PRIVATE -Wall -Wextra -Wpedantic)
 foreach(suite file_io handles inode_handles inode_entries inode_contracts inode_create inode_size inode_xattrs inode_corruption parent_index transaction)
@@ -53,16 +53,16 @@ foreach(suite file_io handles inode_handles inode_entries inode_contracts inode_
     set_tests_properties(forkfsd_${suite} PROPERTIES TIMEOUT 120)
 endforeach()
 
-add_executable(forkfsd main.cpp rpc.cpp backup_catalog.cpp)
+add_executable(forkfsd main.cpp rpc.cpp)
 target_link_libraries(forkfsd PRIVATE forkfs_namespace)
 target_compile_options(forkfsd PRIVATE -Wall -Wextra -Wpedantic)
 # Fault injection is absent from the production libraries and executable.
-add_executable(forkfsd_leveldb_fault_test main.cpp rpc.cpp backup_catalog.cpp container.cpp namespace.cpp
+add_executable(forkfsd_leveldb_fault_test main.cpp rpc.cpp container.cpp backup_catalog.cpp namespace.cpp
     compaction.cpp maintenance.cpp journal.cpp level_store.cpp metadata_tree.cpp metadata_view.cpp)
 target_compile_definitions(forkfsd_leveldb_fault_test PRIVATE FORKFS_TEST_FAULTS=1)
 target_include_directories(forkfsd_leveldb_fault_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(forkfsd_leveldb_fault_test PRIVATE leveldb Threads::Threads)
-add_executable(forkfsd_inode_recovery_test tests/inode_recovery.cpp container.cpp namespace.cpp
+add_executable(forkfsd_inode_recovery_test tests/inode_recovery.cpp container.cpp backup_catalog.cpp namespace.cpp
     compaction.cpp maintenance.cpp journal.cpp level_store.cpp metadata_tree.cpp metadata_view.cpp)
 target_compile_definitions(forkfsd_inode_recovery_test PRIVATE FORKFS_TEST_FAULTS=1)
 target_include_directories(forkfsd_inode_recovery_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -182,7 +182,7 @@ add_test(NAME forkfsd_online_backup COMMAND ${Python3_EXECUTABLE}
 set_tests_properties(forkfsd_online_backup PROPERTIES TIMEOUT 180 LABELS metadata-regression)
 
 # Deterministic barrier exists only in this test executable.
-add_executable(forkfsd_online_backup_core_test tests/online_backup.cpp container.cpp namespace.cpp
+add_executable(forkfsd_online_backup_core_test tests/online_backup.cpp container.cpp backup_catalog.cpp namespace.cpp
     compaction.cpp maintenance.cpp journal.cpp level_store.cpp metadata_tree.cpp metadata_view.cpp)
 target_compile_definitions(forkfsd_online_backup_core_test PRIVATE FORKFS_TEST_BACKUP=1)
 target_include_directories(forkfsd_online_backup_core_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -217,3 +217,7 @@ set_tests_properties(forkfsd_recovery_namespace PROPERTIES TIMEOUT 120 LABELS me
 add_test(NAME forkfsd_backup_catalog COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/backup_catalog.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
 set_tests_properties(forkfsd_backup_catalog PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+
+add_test(NAME forkfsd_online_catalog COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/online_catalog.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
+set_tests_properties(forkfsd_online_catalog PROPERTIES TIMEOUT 180 LABELS metadata-regression)

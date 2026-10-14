@@ -2,6 +2,7 @@
 #include "level_store.h"
 #include "replay_format.h"
 #include "namespace.h"
+#include "backup_catalog.h"
 #include <array>
 #include <algorithm>
 #include <cerrno>
@@ -292,23 +293,29 @@ std::string Container::backup_status_locked(const std::string& request_id) const
     const auto& task=i->second;
     std::string chain;constexpr char digits[]="0123456789abcdef";
     for(unsigned char c:task.chain_hash){chain+=digits[c>>4];chain+=digits[c&15];}
+    std::string receipt="{\"repository\":"+json_string(id_)+",\"sequence\":"+std::to_string(task.sequence)+",\"chain_hash\":"+json_string(chain)+"}";
     std::string checkpoint=task.state=="durable"?
         "{\"repository\":"+json_string(id_)+",\"sequence\":"+std::to_string(task.sequence)+",\"chain_hash\":"+json_string(chain)+"}":"null";
     return "{\"request_id\":"+json_string(request_id)+",\"state\":"+json_string(task.state)+
         ",\"archive\":"+json_string(task.archive)+",\"kind\":"+json_string(task.after?"incremental":"base")+
         ",\"sequence\":"+(task.state=="durable"?std::to_string(task.sequence):"null")+
-        ",\"checkpoint\":"+checkpoint+",\"error\":"+json_string(task.error)+"}\n";
+        ",\"checkpoint\":"+checkpoint+",\"error\":"+json_string(task.error)+
+        ",\"catalog\":"+json_string(task.catalog)+",\"archive_durable\":"+(task.archive_durable?"true":"false")+
+        ",\"catalog_published\":"+(!task.catalog.empty() && task.state=="durable"?"true":"false")+
+        ",\"archive_checkpoint\":"+(task.archive_durable?receipt:"null")+"}\n";
 }
 std::string Container::backup_status(const std::string& request_id) {
     std::lock_guard lock(backup_mutex_);load_backup_tasks_locked();return backup_status_locked(request_id);
 }
 std::string Container::start_backup(const std::string& request_id,const std::string& archive,
-                                    std::optional<uint64_t> after) {
+                                    std::optional<uint64_t> after,const std::string& catalog,bool retry_catalog) {
     require(mode_==OpenMode::ReadWrite && journal_->is_leveldb(),"backup requires writable LevelDB owner");
     require(!request_id.empty() && request_id.size()<=128,"invalid backup request ID");
     require(request_id.find('\0')==std::string::npos && archive.find('\0')==std::string::npos,"NUL in backup argument");
     require(archive.size()<=4096,"backup archive path too long");
     require(std::filesystem::path(archive).is_absolute(),"backup archive path must be absolute");
+    require(catalog.size()<=4096 && catalog.find('\0')==std::string::npos && (catalog.empty() || std::filesystem::path(catalog).is_absolute()),"invalid backup catalog path");
+    uint64_t resume_sequence=0;std::string resume_hash;
     std::lock_guard lifecycle(backup_lifecycle_mutex_);
     {
         std::lock_guard lock(backup_mutex_);
@@ -316,29 +323,43 @@ std::string Container::start_backup(const std::string& request_id,const std::str
         require(backup_catalog_error_.empty(),"backup catalog persistence failed; restart and inspect task state");
         auto i=backup_tasks_.find(request_id);
         if(i!=backup_tasks_.end()) {
-            require(i->second.archive==archive && i->second.after==after,"backup request ID reused with different arguments");
-            return backup_status_locked(request_id);
-        }
+            require(i->second.archive==archive && i->second.after==after && i->second.catalog==catalog,"backup request ID reused with different arguments");
+            if(!retry_catalog || i->second.state=="durable" || i->second.state=="running")return backup_status_locked(request_id);
+            require(!catalog.empty() && i->second.archive_durable,"no recorded archive checkpoint to publish");
+            resume_sequence=i->second.sequence;resume_hash=i->second.chain_hash;
+        } else require(!retry_catalog,"unknown backup request");
         require(!backup_active_,"another backup export is running");
-        require(backup_tasks_.size()<128,"backup task history full; forget a terminal task before starting another");
+        require(retry_catalog || backup_tasks_.size()<128,"backup task history full; forget a terminal task before starting another");
     }
     // A finished worker is joined without holding the mutex it uses to publish.
     if(backup_thread_.joinable())backup_thread_.join();
     std::lock_guard lock(backup_mutex_);
-    backup_tasks_.emplace(request_id,BackupTask{archive,"running",{},{},after,0});
+    if(!retry_catalog){BackupTask task;task.archive=archive;task.after=after;task.catalog=catalog;backup_tasks_.emplace(request_id,std::move(task));}
+    auto& started=backup_tasks_.at(request_id);started.state="running";started.error.clear();
     try {save_backup_tasks_locked();}
     catch(const std::exception& e){backup_catalog_error_=e.what();auto& task=backup_tasks_.at(request_id);task.state="interrupted";task.error="task intent persistence failed";throw;}
     backup_fault("backup_task_after_intent");
     backup_active_=true;
     try {
-        backup_thread_=std::thread([this,request_id,archive,after]{
-            uint64_t sequence=0;std::string error,chain_hash;
-            try {sequence=after?journal_->export_replay(*after,archive,&chain_hash):journal_->backup(archive,&chain_hash);backup_fault("backup_task_after_archive");}
+        backup_thread_=std::thread([this,request_id,archive,after,catalog,retry_catalog,resume_sequence,resume_hash]{
+            uint64_t sequence=resume_sequence;std::string error,chain_hash=resume_hash;bool archive_durable=retry_catalog;
+            try {
+                if(!retry_catalog){sequence=after?journal_->export_replay(*after,archive,&chain_hash):journal_->backup(archive,&chain_hash);archive_durable=true;backup_fault("backup_task_after_archive");}
+                if(!catalog.empty()){
+                    {std::lock_guard lock(backup_mutex_);auto& task=backup_tasks_.at(request_id);
+                        task.sequence=sequence;task.chain_hash=chain_hash;task.archive_durable=true;
+                        try{save_backup_tasks_locked();}catch(const std::exception& e){backup_catalog_error_=e.what();throw;}}
+                    backup_fault("backup_task_after_archive_checkpoint");
+                    std::string hex;for(unsigned char c:chain_hash){hex+="0123456789abcdef"[c>>4];hex+="0123456789abcdef"[c&15];}
+                    BackupCatalog::add(catalog,archive,LevelStore::RecoveryPoint{sequence,id_,hex},after);
+                    backup_fault("backup_task_after_catalog");
+                }
+            }
             catch(const std::exception& e){error=e.what();}
-            catch(...){error="unknown backup export failure";}
+            catch(...){error="unknown backup export/publication failure";}
             std::lock_guard done(backup_mutex_);
-            auto& task=backup_tasks_.at(request_id);task.sequence=sequence;
-            task.state=error.empty()?"durable":"failed";task.error=std::move(error);task.chain_hash=std::move(chain_hash);
+            auto& task=backup_tasks_.at(request_id);task.sequence=sequence;task.archive_durable=archive_durable;
+            task.state=!backup_catalog_error_.empty()?"interrupted":error.empty()?"durable":"failed";task.error=std::move(error);task.chain_hash=std::move(chain_hash);
             try {save_backup_tasks_locked();backup_fault("backup_task_after_completion");}
             catch(const std::exception& e){backup_catalog_error_=e.what();task.state="interrupted";task.error="completion persistence failed: "+backup_catalog_error_;}
             backup_active_=false;
@@ -349,6 +370,12 @@ std::string Container::start_backup(const std::string& request_id,const std::str
         throw;
     }
     return backup_status_locked(request_id);
+}
+std::string Container::retry_backup_catalog(const std::string& request_id){
+    BackupTask task;{std::lock_guard lock(backup_mutex_);load_backup_tasks_locked();auto found=backup_tasks_.find(request_id);
+        require(found!=backup_tasks_.end(),"unknown backup request");task=found->second;}
+    require(!task.catalog.empty(),"task has no catalog destination");
+    return start_backup(request_id,task.archive,task.after,task.catalog,true);
 }
 void Container::stop_backup() {
     std::lock_guard lifecycle(backup_lifecycle_mutex_);
@@ -367,7 +394,7 @@ void Container::load_backup_tasks_locked() {
     std::string bytes(static_cast<size_t>(st.st_size),0);read_at(fd.n,bytes.data(),bytes.size(),0);
     auto content=bytes.substr(0,bytes.size()-32);
     require(replay::hash(content)==bytes.substr(bytes.size()-32),"backup task catalog checksum mismatch");
-    replay::Input input{content};require(input.take(8)=="FFBKT001","unsupported backup task catalog");
+    replay::Input input{content};auto version=input.take(8);require(version=="FFBKT001" || version=="FFBKT002","unsupported backup task catalog");
     require(input.take(32)==id_,"backup task catalog repository mismatch");
     auto count=input.integer(4);require(count<=128,"too many backup tasks");
     auto text=[&](size_t limit){auto size=input.integer(4);require(size<=limit,"oversized backup task field");return input.take(size);};
@@ -376,6 +403,11 @@ void Container::load_backup_tasks_locked() {
         auto id=text(128);BackupTask task;
         task.archive=text(4096);task.state=text(16);task.error=text(8192);task.chain_hash=text(32);
         auto incremental=input.integer(1),after=input.integer(8);task.sequence=input.integer(8);
+        if(version=="FFBKT002"){task.catalog=text(4096);auto durable=input.integer(1);require(durable<=1,"invalid archive durability flag");task.archive_durable=durable;}
+        else task.archive_durable=task.state=="durable";
+        require(task.catalog.find('\0')==std::string::npos && (task.catalog.empty() || std::filesystem::path(task.catalog).is_absolute()),"invalid persisted catalog path");
+        require(!task.archive_durable || (task.chain_hash.size()==32 && (!incremental || task.sequence>=after)),"invalid persisted archive checkpoint");
+        require(task.state!="durable" || task.archive_durable,"durable task lacks archive checkpoint");
         require(!id.empty() && id.find('\0')==std::string::npos,"invalid persisted backup ID");
         require(std::filesystem::path(task.archive).is_absolute() && task.archive.find('\0')==std::string::npos,"invalid persisted backup path");
         require(incremental<=1 && (incremental || after==0),"invalid persisted backup range");
@@ -389,11 +421,13 @@ void Container::load_backup_tasks_locked() {
 }
 void Container::save_backup_tasks_locked() {
     require(mode_==OpenMode::ReadWrite,"cannot persist backup tasks in preview mode");
-    std::string content="FFBKT001"+id_+replay::le(backup_tasks_.size(),4);
+    bool extended=false;for(const auto& [id,task]:backup_tasks_)if(!task.catalog.empty())extended=true;
+    std::string content=std::string(extended?"FFBKT002":"FFBKT001")+id_+replay::le(backup_tasks_.size(),4);
     auto text=[&](const std::string& value){content+=replay::le(value.size(),4);content+=value;};
     for(const auto& [id,task]:backup_tasks_){
         text(id);text(task.archive);text(task.state);text(task.error.substr(0,8192));text(task.chain_hash);
         content+=char(task.after.has_value());content+=replay::le(task.after.value_or(0));content+=replay::le(task.sequence);
+        if(extended){text(task.catalog);content+=char(task.archive_durable);}
     }
     content+=replay::hash(content);
     require(content.size()<=2*1024*1024,"backup task catalog too large");

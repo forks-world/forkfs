@@ -77,7 +77,7 @@ void publish(const std::string& temporary,const std::string& path){
 std::vector<BackupCatalog::Entry> BackupCatalog::entries(const std::string& input){
     auto directory=std::filesystem::absolute(input).lexically_normal().string();Lock lock(directory,false);return load(directory);
 }
-void BackupCatalog::add(const std::string& input,const std::string& archive){
+void BackupCatalog::add(const std::string& input,const std::string& archive,std::optional<LevelStore::RecoveryPoint> expected,std::optional<uint64_t> after){
     auto directory=std::filesystem::absolute(input).lexically_normal().string();Lock lock(directory,true);auto existing=load(directory);
     auto staging=directory+"/.catalog-add-XXXXXX";if(!mkdtemp(staging.data()))throw std::system_error(errno,std::generic_category(),"create catalog staging");
     struct Cleanup{std::string path;~Cleanup(){std::error_code ignored;std::filesystem::remove_all(path,ignored);}}cleanup{staging};
@@ -89,6 +89,9 @@ void BackupCatalog::add(const std::string& input,const std::string& archive){
         source.eof();destination.sync();
     }
     auto package=inspect(temporary);auto identity=hex(package.header.repository);
+    if(expected){require(identity==expected->repository && package.header.to==expected->sequence && hex(package.header.head)==expected->chain_hash,
+                         "archive differs from recorded backup checkpoint");
+        require(package.header.kind==(after?'I':'B') && (!after || package.header.from==*after),"archive differs from recorded backup range");}
     if(!existing.empty())require(existing.front().checkpoint.repository==identity,"catalog repository mismatch");
     const auto digest=hex(package.digest);bool duplicate=std::any_of(existing.begin(),existing.end(),[&](const auto& e){return e.digest==digest;});
     require(duplicate || existing.size()<4096,"catalog entry limit exceeded");

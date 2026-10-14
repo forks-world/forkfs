@@ -146,6 +146,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="status" || op=="storage-profile" || op=="fs-init" || op=="fs-check" || op=="fs-worlds" || op=="fs-revisions" || op=="fs-compact")count=1;
     if(op=="fs-write" || op=="fs-save" || op=="fs-rename" || op=="fs-link" || op=="fs-fork" || op=="fs-append" || op=="fs-truncate" || op=="fs-open" || op=="fs-happend" || op=="fs-htruncate" || op=="fs-hread-next" || op=="fs-hwrite-next" || op=="fs-symlink" || op=="fs-chmod" || op=="fs-setmtime" || op=="fs-hchmod" || op=="fs-hsetmtime" || op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-hlock")count=3;
     if(op=="backup-start")count=3;
+    if(op=="backup-catalog-start")count=4;
+    if(op=="replay-catalog-start")count=5;
     if(op=="replay-export-start")count=4;
     if(op=="fs-read-at" || op=="fs-write-at" || op=="fs-hread" || op=="fs-hwrite" || op=="fs-hseek" || op=="fs-hrange-lock")count=4;
     if(op=="fs-setattr" || op=="fs-isetattr" || op=="fs-hsetattr" ||
@@ -182,6 +184,9 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     if(op=="status")return store.status();
     if(op=="storage-profile")return store.storage_profile();
+    if(op=="backup-catalog-start"){need(!args[3].empty(),"catalog destination is required");return store.start_backup(args[1],args[2],std::nullopt,args[3]);}
+    if(op=="replay-catalog-start"){need(!args[4].empty(),"catalog destination is required");return store.start_backup(args[1],args[3],number(args[2]),args[4]);}
+    if(op=="backup-catalog-retry")return store.retry_backup_catalog(args[1]);
     if(op=="backup-start")return store.start_backup(args[1],args[2]);
     if(op=="replay-export-start")return store.start_backup(args[1],args[3],number(args[2]));
     if(op=="backup-status")return store.backup_status(args[1]);

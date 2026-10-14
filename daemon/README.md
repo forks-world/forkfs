@@ -409,3 +409,33 @@ LevelDB. Forced termination may leave an incomplete pack.
 This is the first online-export increment of the revision backup design. It does
 not yet implement automatic task resumption, cancellation, backup catalogs, revision event
 indexing, exact revision checkpoint capture, retention leases or log pruning.
+
+### Online export with catalog publication
+
+Through `forkfsd request SOCKET ...`:
+
+```
+backup-catalog-start REQUEST_ID /absolute/archive.pack /absolute/catalog
+replay-catalog-start REQUEST_ID AFTER_SEQUENCE /absolute/delta.pack /absolute/catalog
+backup-catalog-retry REQUEST_ID
+backup-status REQUEST_ID
+```
+
+These opt-in tasks report `durable` only after export, catalog import and task
+completion are persisted. Existing `backup-start` / `replay-export-start` retain
+archive-only durability. Status additionally exposes `catalog`, `archive_durable`,
+`archive_checkpoint` and `catalog_published`. A failed publication can still have
+a durable archive checkpoint; `checkpoint` remains null until the task succeeds.
+
+The daemon records the archive checkpoint before importing it. Retry only imports
+that existing archive, checking its repository, sequence, chain hash, kind and
+incremental starting sequence; it never overwrites or re-exports the archive.
+The request ID binds the catalog path too. Restart does not automatically retry;
+explicit retry is allowed only with a persisted archive checkpoint. A crash before
+that receipt is persisted requires manual archive inspection/import. Fix catalog
+availability or corruption before retrying. Retrying an already successful task
+returns its persisted result; it does not continually audit external files.
+
+Source task bookkeeping upgrades to FFBKT002 when catalog tasks exist and still
+reads FFBKT001. Older binaries cannot read FFBKT002. Task records remain source-local
+and are not part of backup data. Forgetting a task never removes catalog packages.

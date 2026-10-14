@@ -10,7 +10,8 @@ public:
         uint64_t from,size;
         LevelStore::RecoveryPoint checkpoint;
     };
-    static void add(const std::string& directory,const std::string& archive);
+    static void add(const std::string& directory,const std::string& archive,
+                    std::optional<LevelStore::RecoveryPoint> expected=std::nullopt,std::optional<uint64_t> after=std::nullopt);
     static std::vector<Entry> entries(const std::string& directory);
 };
 }

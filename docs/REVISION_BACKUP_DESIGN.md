@@ -416,7 +416,34 @@ The current implementation scans and validates all packages, so catalog operatio
 are linear in total archive bytes and are not a constant-time metadata index.
 
 This is the first local catalog slice, not the complete generation protocol in
-section 5: no generation chain, revision-name index, automatic online-job ingestion,
+section 5: no generation chain or revision-name index,
 retention/lease management, remote sync, or authenticated manifests yet. The caller
-still supplies an exact checkpoint. Online backup tasks can be imported after they
-report durable using the same `catalog-add` command.
+still supplies an exact checkpoint. Archive-only backup tasks can be imported manually using `catalog-add`; opt-in
+automatic online publication is described below.
+
+
+### Implemented: online task publication to catalog
+
+The RPC commands `backup-catalog-start ID ARCHIVE CATALOG` and
+`replay-catalog-start ID AFTER ARCHIVE CATALOG` integrate catalog import into the
+existing background worker. The source database remains open and filesystem RPCs
+can continue during import. Both paths must be absolute. The catalog path forms
+part of request-ID identity. Export first persists an intermediate archive receipt;
+then the worker validates/imports that archive and records task completion. These
+tasks become `durable` only after catalog publication. Archive-only commands keep
+their prior meaning.
+
+Status separates `archive_durable` / `archive_checkpoint` from `catalog_published`
+and the final `checkpoint`. `backup-catalog-retry ID` retries publication only,
+using the recorded archive and checking its exact checkpoint and export range.
+Failed/interrupted tasks with no persisted archive receipt cannot be retried this
+way. Restart reports unfinished tasks as interrupted without automatic actions.
+A catalog entry published before a crash is reconciled by idempotent re-import.
+Task-persistence errors still block new work until restart/inspection.
+
+FFBKT002 extends each FFBKT001 task record, after its range and sequence fields,
+with a length-prefixed catalog path and a one-byte archive-durable flag. Existing
+FFBKT001 task files remain readable; the writer uses version 2 when catalog tasks
+are present. Neither task format is replayed to recovered machines. See the daemon
+README for commands and retry boundaries. This does not add automatic scheduling,
+retention, remote acknowledgment, or revision-name recovery selection.
