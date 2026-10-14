@@ -283,3 +283,29 @@ errors. A full backup preserves revision trees but not their earlier creation
 logs, so restoring that full backup alone cannot recover those creation receipts.
 Replaying a delta containing the creation transaction preserves the exact receipt.
 Unavailable receipts do not prevent browsing or forking preserved revisions.
+
+### Implemented: replay to an exact recovery point
+
+```
+forkfsd replay ARCHIVE DESTINATION --until SEQUENCE REPOSITORY_ID CHAIN_HASH
+```
+
+Pass the three fields from a revision's available `checkpoint`. The selected
+archive must contain the endpoint (inclusive of its starting anchor). Restore an
+earlier full backup first, apply any preceding increments, then apply the increment
+containing the endpoint with `--until`. A full backup can only satisfy its own exact
+checkpoint. This command does not select archives or plan a multi-archive restore.
+
+The complete archive's framing, checksums and transaction chain are validated
+before opening the destination, including the suffix beyond the chosen endpoint.
+Repository identity and the endpoint hash must match. Only transactions through
+the endpoint are applied; their graph validation and synchronous atomic commits
+use the existing replay path. Skipped transactions are not applied or graph-checked.
+A crash can leave a fully committed prefix; retry with the same endpoint resumes
+idempotently. A destination already ahead of the endpoint is rejected rather than
+rewound. Restore to a separate destination when recovering an older state.
+
+The endpoint is repository-wide: all Worlds reach that transaction, not just the
+World associated with the named revision. Ordinary replay without `--until` retains
+its full-archive behavior. CLI success prints the reached sequence. There is no
+archive format change.

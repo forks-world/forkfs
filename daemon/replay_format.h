@@ -104,11 +104,14 @@ inline Op base_row(const std::string& payload){
     return op;
 }
 // Complete framing/checksum preflight before opening a destination for replay.
-inline Header validate(File& file){
+inline Header validate(File& file,std::optional<std::pair<uint64_t,std::string>> until=std::nullopt){
     Reader r(file);uint64_t seq=r.header.from;std::string head=r.header.previous,last;
+    if(until){require(until->first>=r.header.from && until->first<=r.header.to,"recovery point outside archive range");
+        if(until->first==seq)require(until->second==head,"recovery point chain hash mismatch");}
     while(!r.ended){auto payload=r.next();if(r.ended)break;
         if(r.header.kind=='B'){auto op=base_row(payload);require(last.empty() || last<op.key,"unordered/duplicate backup row");last=op.key;}
-        else {auto tx=transaction(payload);require(seq!=UINT64_MAX && tx.sequence==seq+1 && tx.previous==head,"missing, reordered or divergent replay transaction");seq=tx.sequence;head=hash(payload);}
+        else {auto tx=transaction(payload);require(seq!=UINT64_MAX && tx.sequence==seq+1 && tx.previous==head,"missing, reordered or divergent replay transaction");seq=tx.sequence;head=hash(payload);
+            if(until && seq==until->first)require(head==until->second,"recovery point chain hash mismatch");}
     }
     if(r.header.kind=='I')require(seq==r.header.to && head==r.header.head,"incomplete replay range");
     auto h=r.header;file.rewind();return h;

@@ -18,7 +18,9 @@ public:
     // Opt-in retained transaction stream. Backup enables it atomically at a base.
     uint64_t backup(const std::string& archive,std::string* chain_hash=nullptr);
     uint64_t export_replay(uint64_t after,const std::string& archive,std::string* chain_hash=nullptr) const;
-    static uint64_t replay_archive(const std::string& archive,const std::string& destination);
+    struct RecoveryPoint {uint64_t sequence;std::string repository,chain_hash;}; // Hex IDs, as returned by revision_point.
+    static uint64_t replay_archive(const std::string& archive,const std::string& destination,
+                                   std::optional<RecoveryPoint> until=std::nullopt);
 
     std::vector<unsigned char> object(const std::array<unsigned char,32>& id) const;
     std::array<unsigned char,32> root(const std::string& key) const;

@@ -137,7 +137,7 @@ void serve(forkfs::Container& container, const std::string& path,bool rpc=false)
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--help") {
-            std::cout << "forkfsd backup REPOSITORY ARCHIVE\nforkfsd replay-export REPOSITORY AFTER_SEQUENCE ARCHIVE\nforkfsd replay ARCHIVE DESTINATION\n"
+            std::cout << "forkfsd backup REPOSITORY ARCHIVE\nforkfsd replay-export REPOSITORY AFTER_SEQUENCE ARCHIVE\nforkfsd replay ARCHIVE DESTINATION [--until SEQUENCE REPOSITORY_ID CHAIN_HASH]\n"
                          "forkfsd init REPOSITORY_DIRECTORY\nforkfsd check CONTAINER\n"
                          "forkfsd serve CONTAINER --socket PATH [--rpc]\n"
                          "forkfsd request SOCKET COMMAND [ARGS...]\n"
@@ -210,6 +210,10 @@ int main(int argc, char** argv) {
         }
         if(command=="backup" && argc==4){forkfs::LevelStore store(argv[2]);std::cout<<store.backup(argv[3])<<"\n";return 0;}
         if(command=="replay-export" && argc==5){forkfs::LevelStore store(argv[2]);std::cout<<store.export_replay(file_number(argv[3]),argv[4])<<"\n";return 0;}
+        if(command=="replay" && argc==8 && std::string(argv[4])=="--until"){
+            forkfs::LevelStore::RecoveryPoint point{file_number(argv[5]),argv[6],argv[7]};
+            std::cout<<forkfs::LevelStore::replay_archive(argv[2],argv[3],point)<<"\n";return 0;
+        }
         if(command=="replay" && argc==4){std::cout<<forkfs::LevelStore::replay_archive(argv[2],argv[3])<<"\n";return 0;}
         std::string view="main";bool revision_view=false;
         int base_argc=4;

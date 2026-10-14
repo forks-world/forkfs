@@ -392,8 +392,18 @@ uint64_t LevelStore::export_replay(uint64_t after,const std::string& archive,std
     }
     need(head==header.head,"retained replay end mismatch");out.finish();sync_parent(archive);if(chain_hash)*chain_hash=header.head;return header.to;
 }
-uint64_t LevelStore::replay_archive(const std::string& archive,const std::string& destination){
-    replay::File file(archive);auto header=replay::validate(file);
+uint64_t LevelStore::replay_archive(const std::string& archive,const std::string& destination,std::optional<RecoveryPoint> until){
+    auto unhex=[](const std::string& value,size_t size){
+        need(value.size()==size*2,"invalid recovery point ID length");std::string raw;
+        auto digit=[](char c)->unsigned {if(c>='0' && c<='9')return c-'0';if(c>='a' && c<='f')return c-'a'+10;
+            if(c>='A' && c<='F')return c-'A'+10;throw std::runtime_error("invalid recovery point hex ID");};
+        for(size_t i=0;i<value.size();i+=2)raw.push_back(static_cast<char>((digit(value[i])<<4)|digit(value[i+1])));return raw;
+    };
+    std::optional<std::pair<uint64_t,std::string>> endpoint;std::string repository;
+    if(until){repository=unhex(until->repository,16);endpoint={{until->sequence,unhex(until->chain_hash,32)}};}
+    replay::File file(archive);auto header=replay::validate(file,endpoint);
+    if(until)need(repository==header.repository,"recovery point repository mismatch");
+    const auto stop=until?until->sequence:header.to;
     if(header.kind=='B'){
         // A crashed base restore leaves only a private staging directory.
         // Ordinary failures clean up this attempt after LevelDB has closed.
@@ -401,6 +411,7 @@ uint64_t LevelStore::replay_archive(const std::string& archive,const std::string
         struct stat st{};
         if(lstat(destination.c_str(),&st)==0){
             need(S_ISDIR(st.st_mode),"backup destination is not a repository directory");LevelStore existing(destination);
+            if(until)need(existing.sequence_<=stop,"destination is ahead of recovery point");
             std::string identity;need(existing.read("M/repository",identity) && identity==header.repository && existing.replay_hash(header.to)==header.head,"backup destination is not this recovery lineage");
             existing.verify();leveldb::ReadOptions options;options.verify_checksums=true;verify_recovery_graph(*existing.db_,options,existing.sequence_);return existing.sequence_;
         }
@@ -433,7 +444,9 @@ uint64_t LevelStore::replay_archive(const std::string& archive,const std::string
         sync_parent(staging+"/CURRENT");publish_directory(staging,destination);fault("replay_base_after_publish");return header.to;
     }
     struct stat st{};need(lstat(destination.c_str(),&st)==0 && S_ISDIR(st.st_mode),"incremental destination must be an existing repository directory");
-    LevelStore target(destination);std::lock_guard lock(target.writer_mutex_);target.healthy();target.verify();
+    LevelStore target(destination);std::lock_guard lock(target.writer_mutex_);target.healthy();
+    if(until)need(target.sequence_<=stop,"destination is ahead of recovery point");
+    target.verify();
     leveldb::ReadOptions graph_options;graph_options.verify_checksums=true;verify_recovery_graph(*target.db_,graph_options,target.sequence_);
     std::string identity;need(target.read("M/repository",identity) && identity==header.repository,"replay repository identity mismatch");
     need(target.replay_hash(header.from)==header.previous,"replay base differs from destination");
@@ -442,6 +455,7 @@ uint64_t LevelStore::replay_archive(const std::string& archive,const std::string
     uint64_t seq=header.from;auto head=header.previous;
     while(!in.ended){auto payload=in.next();if(in.ended)break;auto tx=replay::transaction(payload);auto next=replay::hash(payload);
         need(seq!=UINT64_MAX && tx.sequence==seq+1 && tx.sequence<=header.to && tx.previous==head,"invalid replay chain during apply");seq=tx.sequence;head=next;
+        if(tx.sequence>stop)continue;
         if(tx.sequence<=target.sequence_){need(target.replay_hash(tx.sequence)==next,"replay diverges from already applied transaction");continue;}
         need(tx.sequence==target.sequence_+1 && tx.previous==target.replay_head_,"replay gap or divergent destination");
         uint64_t objects=target.objects_,roots=target.roots_;std::set<std::string> new_objects;leveldb::WriteBatch batch;
@@ -471,7 +485,9 @@ uint64_t LevelStore::replay_archive(const std::string& archive,const std::string
         leveldb::WriteOptions write;write.sync=true;fault("replay_before_write");status(target.db_->Write(write,&batch),"apply replay transaction");fault("replay_after_write");
         target.sequence_=tx.sequence;target.objects_=objects;target.roots_=roots;target.replay_head_=next;
     }
-    need(seq==header.to && head==header.head,"incomplete replay range during apply");return target.sequence_;
+    need(seq==header.to && head==header.head,"incomplete replay range during apply");
+    if(until)need(target.sequence_==stop && target.replay_head_==endpoint->second,"recovery point not reached");
+    return target.sequence_;
 }
 }
 
