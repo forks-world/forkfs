@@ -1,5 +1,6 @@
 #include "container.h"
 #include "level_store.h"
+#include "backup_catalog.h"
 #include "namespace.h"
 #include "rpc.h"
 #include <cerrno>
@@ -144,8 +145,10 @@ int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--help") {
             std::cout << "forkfsd backup REPOSITORY ARCHIVE\nforkfsd replay-export REPOSITORY AFTER_SEQUENCE ARCHIVE\nforkfsd replay ARCHIVE DESTINATION [--until SEQUENCE REPOSITORY_ID CHAIN_HASH]\n"
-                         "forkfsd restore-plan SEQUENCE REPOSITORY_ID CHAIN_HASH ARCHIVE...\n"
-                         "forkfsd restore DESTINATION SEQUENCE REPOSITORY_ID CHAIN_HASH ARCHIVE...\n"
+                         "forkfsd catalog-add CATALOG ARCHIVE\n"
+                         "forkfsd catalog-list CATALOG\n"
+                         "forkfsd restore-plan SEQUENCE REPOSITORY_ID CHAIN_HASH ARCHIVE... | --catalog CATALOG\n"
+                         "forkfsd restore DESTINATION SEQUENCE REPOSITORY_ID CHAIN_HASH ARCHIVE... | --catalog CATALOG\n"
                          "forkfsd init REPOSITORY_DIRECTORY\nforkfsd check CONTAINER\n"
                          "forkfsd serve CONTAINER --socket PATH [--rpc]\n"
                          "forkfsd request SOCKET COMMAND [ARGS...]\n"
@@ -216,10 +219,24 @@ int main(int argc, char** argv) {
             std::cout.write(result.data(),result.size());
             if(!std::cout)throw std::runtime_error("cannot write RPC output");return 0;
         }
+        if((command=="catalog-add" && argc==4) || (command=="catalog-list" && argc==3)){
+            if(command=="catalog-add")forkfs::BackupCatalog::add(argv[2],argv[3]);
+            auto entries=forkfs::BackupCatalog::entries(argv[2]);std::cout<<"{\"archives\":[";bool first=true;
+            for(const auto& entry:entries){if(!first)std::cout<<',';first=false;
+                std::cout<<"{\"archive\":"<<json_string(entry.archive)<<",\"digest\":"<<json_string(entry.digest)
+                         <<",\"kind\":\""<<entry.kind<<"\",\"from\":"<<entry.from<<",\"size\":"<<entry.size
+                         <<",\"checkpoint\":{\"sequence\":"<<entry.checkpoint.sequence<<",\"repository\":"<<json_string(entry.checkpoint.repository)
+                         <<",\"chain_hash\":"<<json_string(entry.checkpoint.chain_hash)<<"}}";}
+            std::cout<<"]}\n";return 0;
+        }
         if((command=="restore-plan" && argc>=6) || (command=="restore" && argc>=7)){
             const int offset=command=="restore"?3:2;
             forkfs::LevelStore::RecoveryPoint target{file_number(argv[offset]),argv[offset+1],argv[offset+2]};
             std::vector<std::string> archives;for(int i=offset+3;i<argc;++i)archives.emplace_back(argv[i]);
+            if(archives.size()==2 && archives[0]=="--catalog"){
+                auto entries=forkfs::BackupCatalog::entries(archives[1]);archives.clear();
+                for(const auto& entry:entries)archives.push_back(entry.archive);
+            }
             if(command=="restore")std::cout<<forkfs::LevelStore::restore(archives,argv[2],target,forkfs::Namespace::verify_recovery)<<"\n";
             else {auto plan=forkfs::LevelStore::plan_restore(archives,target);std::cout<<"{\"steps\":[";bool first=true;
                 for(const auto& step:plan){if(!first)std::cout<<',';first=false;

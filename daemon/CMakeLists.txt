@@ -53,11 +53,11 @@ foreach(suite file_io handles inode_handles inode_entries inode_contracts inode_
     set_tests_properties(forkfsd_${suite} PROPERTIES TIMEOUT 120)
 endforeach()
 
-add_executable(forkfsd main.cpp rpc.cpp)
+add_executable(forkfsd main.cpp rpc.cpp backup_catalog.cpp)
 target_link_libraries(forkfsd PRIVATE forkfs_namespace)
 target_compile_options(forkfsd PRIVATE -Wall -Wextra -Wpedantic)
 # Fault injection is absent from the production libraries and executable.
-add_executable(forkfsd_leveldb_fault_test main.cpp rpc.cpp container.cpp namespace.cpp
+add_executable(forkfsd_leveldb_fault_test main.cpp rpc.cpp backup_catalog.cpp container.cpp namespace.cpp
     compaction.cpp maintenance.cpp journal.cpp level_store.cpp metadata_tree.cpp metadata_view.cpp)
 target_compile_definitions(forkfsd_leveldb_fault_test PRIVATE FORKFS_TEST_FAULTS=1)
 target_include_directories(forkfsd_leveldb_fault_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -213,3 +213,7 @@ add_executable(forkfsd_recovery_namespace_test tests/recovery_namespace.cpp)
 target_link_libraries(forkfsd_recovery_namespace_test PRIVATE forkfs_namespace)
 add_test(NAME forkfsd_recovery_namespace COMMAND forkfsd_recovery_namespace_test)
 set_tests_properties(forkfsd_recovery_namespace PROPERTIES TIMEOUT 120 LABELS metadata-regression)
+
+add_test(NAME forkfsd_backup_catalog COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/backup_catalog.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
+set_tests_properties(forkfsd_backup_catalog PROPERTIES TIMEOUT 180 LABELS metadata-regression)

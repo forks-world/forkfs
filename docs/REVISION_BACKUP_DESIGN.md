@@ -2,7 +2,7 @@
 
 状态：设计提案，基于 PR #54 已合并的离线备份与事务 replay。
 已实现在线备份任务、revision 创建恢复点查询、精确 replay 和本地多包恢复计划。
-持久 checkpoint catalog、保留 lease 与日志裁剪仍未实现；各阶段限制见下方进度说明。
+完整 checkpoint/generation catalog、保留 lease 与日志裁剪仍未实现；各阶段限制见下方进度说明。
 现有命令、FFRPLY01 格式及已实现保证见 [DISASTER_REPLAY.md](DISASTER_REPLAY.md)。
 
 ### 当前实现进度
@@ -14,7 +14,7 @@ LevelStore 一致 snapshot。支持单活动任务、持久 request_id 幂等、
 完成记录保存由导出快照产生的 repository/sequence/chain_hash 恢复点凭证；重启保留
 已完成结果，把未完成意图报告为 interrupted，不自动重试。控制文件不随备份复制。
 该凭证尚不是包含根清单的完整 checkpoint catalog。revision 创建事件可从保留日志查询；
-已支持精确恢复终点及本地多包 staging 恢复。取消、保留 lease、独立 catalog 和日志裁剪仍未实现。
+已支持精确恢复终点及本地多包 staging 恢复。已提供本地追加式归档 catalog；取消、保留 lease、generation manifest 和日志裁剪仍未实现。
 因此下面的完整在线备份协议仍是目标设计，不能将当前 `backup-start` 等同于该协议。
 
 ## 1. 决策与边界
@@ -371,3 +371,52 @@ A semantic failure removes the attempt's staging directory and does not publish
 the destination. The storage-layer restore API requires an explicit namespace
 validator; the CLI always supplies this implementation. Low-level `replay` keeps
 its existing structural graph validation and committed-prefix retry contract.
+
+
+### Implemented: portable local archive catalog
+
+```
+forkfsd catalog-add CATALOG ARCHIVE
+forkfsd catalog-list CATALOG
+forkfsd restore-plan SEQUENCE REPOSITORY_ID CHAIN_HASH --catalog CATALOG
+forkfsd restore DESTINATION SEQUENCE REPOSITORY_ID CHAIN_HASH --catalog CATALOG
+```
+
+`catalog-add` imports an owned copy of one validated FFRPLY01 archive. A catalog
+contains immutable `<package_digest>.pack` files and `<record_checksum>.entry`
+records, with no mutable CURRENT pointer. Writers take an exclusive directory
+flock; readers take a shared lock. Concurrent imports do not overwrite one another;
+importing identical content is idempotent. Up to 4096 packages from one repository
+are supported. The source database and original archives are not needed after
+import. Internal references are relative basenames, so the whole catalog can move.
+
+FFCAT001 records are 185 bytes: magic (8), FFRPLY01 header (105), little-endian
+package size (8), package digest (32), record checksum (32). Both checksum functions
+use the existing domain-separated object hash. The package identity is
+`H("forkfs.catalog.package.v1" || uint64le(size) || FFRPLY01_transport_digest)`;
+the transport digest covers the canonical header and ordered frame hashes. It is
+not advertised as a raw SHA-256 of the file. The record checksum covers its first
+153 bytes, and its hex encoding is the `.entry` basename. The embedded header
+preserves repository, range, and both chain endpoints. Records contain no paths.
+
+Publication order is: copy to private staging, fsync and fully validate the copy,
+publish the immutable package without replacing any existing name, fsync catalog,
+write/fsync/publish the entry, fsync catalog. Ordinary errors remove staging;
+process crashes can leave staging or an unregistered package. Readers ignore these
+and use only validated `.entry` records. Retrying an interrupted import safely
+completes publication. A crash after entry publication can leave a completed import
+without a success response. No automatic GC is provided.
+
+Listing and catalog-based recovery validate every entry and its package identity;
+missing or damaged registered packages fail closed. Symlink catalog roots, entries,
+and package files are rejected. Callers must keep catalog contents immutable during
+recovery; this is not a hostile-writer isolation mechanism. Planning still uses the
+existing exact-boundary algorithm and semantic validation precedes publication.
+The current implementation scans and validates all packages, so catalog operations
+are linear in total archive bytes and are not a constant-time metadata index.
+
+This is the first local catalog slice, not the complete generation protocol in
+section 5: no generation chain, revision-name index, automatic online-job ingestion,
+retention/lease management, remote sync, or authenticated manifests yet. The caller
+still supplies an exact checkpoint. Online backup tasks can be imported after they
+report durable using the same `catalog-add` command.
