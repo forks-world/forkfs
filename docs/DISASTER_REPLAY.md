@@ -1,5 +1,8 @@
 # 本地容灾备份与增量 replay
 
+后续在线 checkpoint、基于 revision 的恢复点、备份链及日志回收设计见
+[基于 revision 的备份与 replay 设计](REVISION_BACKUP_DESIGN.md)。
+
 状态：LevelDB 存储核心、离线 CLI、故障注入回归。不是 restore 的别名，
 也不是路径操作重放。目标是原仓库丢失后，靠独立保存的基线与后续提交恢复
 整个仓库，包括 Worlds、revisions、CoW 对象、inode 内容/属性和历史关系。
