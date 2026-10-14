@@ -143,3 +143,36 @@ set_tests_properties(forkfsd_replay_core PROPERTIES TIMEOUT 90 LABELS metadata-r
 add_test(NAME forkfsd_replay_corruption COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay_corruption.py $<TARGET_FILE:forkfsd>)
 set_tests_properties(forkfsd_replay_corruption PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+
+foreach(seed 1 173 4294967295 random)
+    set(seed_args --seed ${seed})
+    if(seed STREQUAL "random")
+        set(seed_args)
+    endif()
+    add_test(NAME forkfsd_replay_fuzz_${seed} COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay_fuzz.py --binary $<TARGET_FILE:forkfsd>
+        ${seed_args} --steps 32 --mutations 24 --artifacts ${CMAKE_BINARY_DIR}/fuzz-artifacts)
+    set_tests_properties(forkfsd_replay_fuzz_${seed} PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+endforeach()
+
+option(WFS_BUILD_FUZZERS "Build replay parser fuzz target with sanitizers" OFF)
+option(WFS_FUZZ_STANDALONE "Run saved corpus without libFuzzer (toolchains lacking its runtime)" OFF)
+if(WFS_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "Replay fuzzing requires Clang")
+    endif()
+    # Instrument LevelDB too: mixing instrumented/uninstrumented libc++ vector
+    # operations can produce false container-overflow reports on macOS.
+    target_compile_options(leveldb PRIVATE -fsanitize=address,undefined -fno-sanitize=vptr -fno-omit-frame-pointer)
+    target_link_options(leveldb INTERFACE -fsanitize=address,undefined)
+    target_compile_options(forkfs_metadata PUBLIC -fsanitize=address,undefined -fno-sanitize=vptr -fno-omit-frame-pointer)
+    target_link_options(forkfs_metadata PUBLIC -fsanitize=address,undefined)
+    add_executable(forkfs_replay_fuzzer tests/replay_fuzzer.cpp)
+    target_link_libraries(forkfs_replay_fuzzer PRIVATE forkfs_metadata)
+    if(WFS_FUZZ_STANDALONE)
+        target_compile_definitions(forkfs_replay_fuzzer PRIVATE FORKFS_FUZZ_STANDALONE=1)
+    else()
+        target_compile_options(forkfs_metadata PUBLIC -fsanitize=fuzzer-no-link)
+        target_link_options(forkfs_replay_fuzzer PRIVATE -fsanitize=fuzzer)
+    endif()
+endif()

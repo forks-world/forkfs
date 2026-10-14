@@ -127,3 +127,67 @@ hardlink、uid/gid/时间/binary xattr，以及底层对象/日志损坏和格�
 这不替代 `fs-check` 的完整 inode/目录语义检查；例如格式与引用都合法但 link
 count 不匹配的逻辑错误，仍需文件系统层 fsck。既有 inode corruption 回归继续
 覆盖 inode/xattr 编码错误。容灾验收需要两层检查，不能仅凭包的哈希判定文件系统健康。
+
+### Fuzzing and independent recovery oracles
+
+`daemon/tests/replay_fuzz.py` generates valid filesystem histories with a seeded
+state machine: binary file writes, append/truncate, chmod, directories, rename,
+unlink, hard links, symlinks, snapshots, fork, restore and compaction. Its Python
+model owns the expected bytes, namespace, modes and hard-link relationships;
+it does not derive those expectations from the database or exported archive.
+It checks both a full restore and randomly partitioned incremental replay after
+deleting the source repository, including historical revisions and forked Worlds.
+Overlapping and repeated increments must leave identical complete backup images.
+
+A second layer mutates archive bytes, or transaction bodies with regenerated
+checksums/hash chains. Transport damage must leave the target unchanged.
+Structured mutations may be valid: rejection is not the only acceptable outcome.
+The target must equal an independently replayed prefix of complete candidate
+transactions, and retrying the candidate must not change the target further.
+This prefix comparison is an atomicity oracle, not an independent implementation
+of transaction semantics; the state model supplies the latter for valid histories.
+The fixed corruption regressions remain useful for known failure modes.
+
+Three fixed seeds and one fresh random seed run under the `metadata-regression`
+CTest label on macOS and Linux. Every run prints its seed. Run new seeds continuously (interrupt to stop) with:
+
+```sh
+python3 daemon/tests/replay_fuzz.py --binary build/metadata/daemon/forkfsd --forever
+```
+
+Failures retain `seed.json`, `events.jsonl`, the base/delta archives, current
+mutant and `failure.txt` under `fuzz-artifacts/`. Replay the operation sequence
+with the recorded `--seed`, `--steps` and `--mutations`. Timestamps/repository IDs
+can differ between runs, so use the retained archives for byte-exact corruption
+reproduction. CI uploads these artifacts on failure.
+
+`forkfs_replay_fuzzer` adds coverage-guided libFuzzer exploration with ASan/UBSan.
+It directly exercises transaction/base-row decoders and revision/manifest/CoW
+reference validation, bypassing transport checksums that otherwise reject almost
+all random mutations early. Graph inputs carry an object table with IDs computed
+from each object's bytes. Unchanged references retain deep valid traversal;
+changed objects exercise missing-reference and parser rejection paths.
+Successful transaction/base-row decoding must reproduce the original encoding;
+CoW enumeration and lookup must agree. Unexpected exceptions, sanitizer findings,
+assertion failures and hangs are fuzz failures.
+
+The Linux CI job builds instrumented storage dependencies, seeds the corpus from
+a generated history and runs libFuzzer for 90 seconds:
+
+```sh
+python3 scripts/ci/replay_fuzz.py
+# Continue longer using the generated corpus:
+build/replay-fuzz/daemon/forkfs_replay_fuzzer build/replay-fuzz/corpus -max_total_time=3600
+# Reproduce / minimize a retained native crash:
+build/replay-fuzz/daemon/forkfs_replay_fuzzer crash-input
+build/replay-fuzz/daemon/forkfs_replay_fuzzer -minimize_crash=1 -exact_artifact_path=minimized crash-input
+```
+
+Configure with `-DWFS_BUILD_FUZZERS=ON`; Clang and its libFuzzer runtime are
+required. Toolchains without that runtime can additionally use
+`-DWFS_FUZZ_STANDALONE=ON` to run saved corpus files under sanitizers, but this
+mode does **not** perform coverage-guided mutation. Parser inputs are bounded to
+256 KiB and graph tables to 2,048 objects; large valid archives are covered by
+normal replay tests, not this in-process target. Bounded fuzzing improves input
+and interleaving coverage; it does not prove recovery correctness or replace
+crash-injection tests.
