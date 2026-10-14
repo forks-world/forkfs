@@ -22,6 +22,10 @@ public:
     static uint64_t replay_archive(const std::string& archive,const std::string& destination,
                                    std::optional<RecoveryPoint> until=std::nullopt);
 
+    struct RestoreStep {std::string archive;RecoveryPoint endpoint;};
+    static std::vector<RestoreStep> plan_restore(const std::vector<std::string>& archives,const RecoveryPoint& target);
+    static uint64_t restore(const std::vector<std::string>& archives,const std::string& destination,const RecoveryPoint& target);
+
     std::vector<unsigned char> object(const std::array<unsigned char,32>& id) const;
     std::array<unsigned char,32> root(const std::string& key) const;
     bool contains(const std::string& key) const;

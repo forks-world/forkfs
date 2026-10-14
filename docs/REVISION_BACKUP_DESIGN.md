@@ -1,8 +1,8 @@
 # 基于 revision 的备份与 replay 设计
 
 状态：设计提案，基于 PR #54 已合并的离线备份与事务 replay。
-本文中的持久 checkpoint、catalog、日志裁剪和精确恢复目标尚未实现；在线 RPC 的
-首个实现及其限制见下方进度说明。
+已实现在线备份任务、revision 创建恢复点查询、精确 replay 和本地多包恢复计划。
+持久 checkpoint catalog、保留 lease 与日志裁剪仍未实现；各阶段限制见下方进度说明。
 现有命令、FFRPLY01 格式及已实现保证见 [DISASTER_REPLAY.md](DISASTER_REPLAY.md)。
 
 ### 当前实现进度
@@ -13,8 +13,8 @@ LevelStore 一致 snapshot。支持单活动任务、持久 request_id 幂等、
 任务记录以源端独立校验文件保存，最多 128 条；通过显式 forget 回收终态记录。
 完成记录保存由导出快照产生的 repository/sequence/chain_hash 恢复点凭证；重启保留
 已完成结果，把未完成意图报告为 interrupted，不自动重试。控制文件不随备份复制。
-该凭证尚不是包含根清单的完整 checkpoint catalog。revision 创建事件索引、取消、
-保留 lease、独立 catalog、多包恢复计划和日志裁剪仍未实现。
+该凭证尚不是包含根清单的完整 checkpoint catalog。revision 创建事件可从保留日志查询；
+已支持精确恢复终点及本地多包 staging 恢复。取消、保留 lease、独立 catalog 和日志裁剪仍未实现。
 因此下面的完整在线备份协议仍是目标设计，不能将当前 `backup-start` 等同于该协议。
 
 ## 1. 决策与边界
@@ -294,7 +294,7 @@ Pass the three fields from a revision's available `checkpoint`. The selected
 archive must contain the endpoint (inclusive of its starting anchor). Restore an
 earlier full backup first, apply any preceding increments, then apply the increment
 containing the endpoint with `--until`. A full backup can only satisfy its own exact
-checkpoint. This command does not select archives or plan a multi-archive restore.
+checkpoint. This low-level command does not select archives; use `restore-plan` and `restore` below for multi-archive recovery.
 
 The complete archive's framing, checksums and transaction chain are validated
 before opening the destination, including the suffix beyond the chosen endpoint.
@@ -309,3 +309,42 @@ The endpoint is repository-wide: all Worlds reach that transaction, not just the
 World associated with the named revision. Ordinary replay without `--until` retains
 its full-archive behavior. CLI success prints the reached sequence. There is no
 archive format change.
+
+
+### Implemented: local multi-archive plans and staged recovery
+
+```
+forkfsd restore-plan SEQUENCE REPOSITORY_ID CHAIN_HASH ARCHIVE...
+forkfsd restore DESTINATION SEQUENCE REPOSITORY_ID CHAIN_HASH ARCHIVE...
+```
+
+The planner accepts an explicit set of up to 4096 local archives, validates every
+supplied archive's framing, checksums and transaction chain, and requires all to
+belong to the requested repository. Corrupt or foreign candidates fail the request,
+even when another usable chain exists. It chooses the newest full backup that can
+reach the exact target through matching `(sequence, chain_hash)` boundaries.
+Valid branches that do not reach the target are ignored. Candidate order does not
+change the result; path ordering breaks ties. Duplicate paths are collapsed. The
+JSON output lists ordered absolute archive paths and each exact endpoint.
+
+This version requires adjacent archive boundaries to match exactly. It does not
+splice overlapping ranges, optimize total bytes, discover a directory, or persist
+a catalog. A final increment may extend beyond the target. Planning validates
+transport and chain integrity; object/reference graph checks run during execution.
+The plan is a preview, not a durable plan ID or an authenticated archive manifest;
+`restore` recomputes it and the replay layer revalidates selected archives.
+
+Execution uses a private sibling `DESTINATION.restore-job-*` directory. It restores
+the base and increments there, verifies the final store and recovery object graph,
+checks the requested repository/sequence/hash, then publishes the repository with
+an exclusive rename and parent-directory sync. Existing destinations are never
+overwritten, including symlinks and publication races. This does not yet provide
+the full per-World namespace semantic validation/reporting proposed in section 5.
+
+Ordinary failures remove this attempt's staging directory. Process crashes can
+leave private staging directories; rerunning starts a new attempt, without exposing
+the unfinished repository at DESTINATION. Automatic resume and staging GC are not
+implemented. A crash after publication can leave a complete destination despite
+no success response; inspect it with `check` before using it. Repeating `restore`
+on an existing destination is rejected. Low-level `replay` remains available for
+explicit in-place incremental retries.

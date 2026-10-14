@@ -38,6 +38,12 @@ struct Socket {
             st.st_dev == dev && st.st_ino == ino) unlink(path.c_str());
     }
 };
+std::string json_string(const std::string& value){
+    std::string out="\"";constexpr char digits[]="0123456789abcdef";
+    for(unsigned char c:value){if(c=='"' || c=='\\'){out+='\\';out+=c;}
+        else if(c<32){out+="\\u00";out+=digits[c>>4];out+=digits[c&15];}else out+=c;}
+    return out+'"';
+}
 uint64_t file_number(const std::string& text,int base=10) {
     uint64_t value=0;auto parsed=std::from_chars(text.data(),text.data()+text.size(),value,base);
     if(parsed.ec!=std::errc{} || parsed.ptr!=text.data()+text.size())throw std::runtime_error("invalid file offset/count");
@@ -138,6 +144,8 @@ int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--help") {
             std::cout << "forkfsd backup REPOSITORY ARCHIVE\nforkfsd replay-export REPOSITORY AFTER_SEQUENCE ARCHIVE\nforkfsd replay ARCHIVE DESTINATION [--until SEQUENCE REPOSITORY_ID CHAIN_HASH]\n"
+                         "forkfsd restore-plan SEQUENCE REPOSITORY_ID CHAIN_HASH ARCHIVE...\n"
+                         "forkfsd restore DESTINATION SEQUENCE REPOSITORY_ID CHAIN_HASH ARCHIVE...\n"
                          "forkfsd init REPOSITORY_DIRECTORY\nforkfsd check CONTAINER\n"
                          "forkfsd serve CONTAINER --socket PATH [--rpc]\n"
                          "forkfsd request SOCKET COMMAND [ARGS...]\n"
@@ -207,6 +215,17 @@ int main(int argc, char** argv) {
             auto result=forkfs::request_rpc(argv[2],fields);
             std::cout.write(result.data(),result.size());
             if(!std::cout)throw std::runtime_error("cannot write RPC output");return 0;
+        }
+        if((command=="restore-plan" && argc>=6) || (command=="restore" && argc>=7)){
+            const int offset=command=="restore"?3:2;
+            forkfs::LevelStore::RecoveryPoint target{file_number(argv[offset]),argv[offset+1],argv[offset+2]};
+            std::vector<std::string> archives;for(int i=offset+3;i<argc;++i)archives.emplace_back(argv[i]);
+            if(command=="restore")std::cout<<forkfs::LevelStore::restore(archives,argv[2],target)<<"\n";
+            else {auto plan=forkfs::LevelStore::plan_restore(archives,target);std::cout<<"{\"steps\":[";bool first=true;
+                for(const auto& step:plan){if(!first)std::cout<<',';first=false;
+                    std::cout<<"{\"archive\":"<<json_string(step.archive)<<",\"sequence\":"<<step.endpoint.sequence
+                             <<",\"repository\":"<<json_string(step.endpoint.repository)<<",\"chain_hash\":"<<json_string(step.endpoint.chain_hash)<<'}';}
+                std::cout<<"]}\n";}return 0;
         }
         if(command=="backup" && argc==4){forkfs::LevelStore store(argv[2]);std::cout<<store.backup(argv[3])<<"\n";return 0;}
         if(command=="replay-export" && argc==5){forkfs::LevelStore store(argv[2]);std::cout<<store.export_replay(file_number(argv[3]),argv[4])<<"\n";return 0;}

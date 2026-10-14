@@ -10,6 +10,7 @@
 #include <leveldb/db.h>
 #include <leveldb/env.h>
 #include <chrono>
+#include <algorithm>
 #include <leveldb/filter_policy.h>
 #include <leveldb/write_batch.h>
 #include <cstring>
@@ -320,6 +321,16 @@ void LevelStore::compact() {
 
 namespace forkfs {
 namespace {
+std::string recovery_unhex(const std::string& value,size_t size){
+        need(value.size()==size*2,"invalid recovery point ID length");std::string raw;
+        auto digit=[](char c)->unsigned {if(c>='0' && c<='9')return c-'0';if(c>='a' && c<='f')return c-'a'+10;
+            if(c>='A' && c<='F')return c-'A'+10;throw std::runtime_error("invalid recovery point hex ID");};
+        for(size_t i=0;i<value.size();i+=2)raw.push_back(static_cast<char>((digit(value[i])<<4)|digit(value[i+1])));return raw;
+}
+std::string recovery_hex(const std::string& raw){
+    constexpr char digits[]="0123456789abcdef";std::string out;
+    for(unsigned char c:raw){out+=digits[c>>4];out+=digits[c&15];}return out;
+}
 void sync_parent(const std::string& path){
     auto parent=std::filesystem::path(path).parent_path();if(parent.empty())parent=".";
     int fd=open(parent.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC);
@@ -392,15 +403,70 @@ uint64_t LevelStore::export_replay(uint64_t after,const std::string& archive,std
     }
     need(head==header.head,"retained replay end mismatch");out.finish();sync_parent(archive);if(chain_hash)*chain_hash=header.head;return header.to;
 }
+std::vector<LevelStore::RestoreStep> LevelStore::plan_restore(const std::vector<std::string>& archives,const RecoveryPoint& target){
+    need(!archives.empty() && archives.size()<=4096,"restore requires 1 to 4096 archives");
+    const auto repository=recovery_unhex(target.repository,16),target_hash=recovery_unhex(target.chain_hash,32);
+    using Point=std::pair<uint64_t,std::string>;
+    struct Candidate {std::string path;replay::Header header;Point end;};
+    std::vector<Candidate> bases,deltas;std::set<std::string> paths;
+    for(const auto& input:archives){
+        auto path=std::filesystem::absolute(input).lexically_normal().string();if(!paths.insert(path).second)continue;
+        replay::File file(path);auto header=replay::validate(file);
+        need(header.repository==repository,"restore archive repository mismatch");
+        if(header.kind=='B'){
+            if(header.to<=target.sequence)bases.push_back({path,header,{header.to,header.head}});
+        } else if(header.from<target.sequence && header.from<header.to){
+            Point end{header.to,header.head};
+            if(header.to>target.sequence){
+                replay::Reader reader(file);
+                while(!reader.ended){auto payload=reader.next();if(reader.ended)break;
+                    auto tx=replay::transaction(payload);
+                    if(tx.sequence==target.sequence){end={tx.sequence,replay::hash(payload)};break;}
+                }
+            }
+            deltas.push_back({path,header,end});
+        }
+    }
+    // Strictly increasing sequence numbers form a DAG. Work backwards from the
+    // requested hash, retaining only edges that can actually reach it.
+    std::sort(deltas.begin(),deltas.end(),[](const auto& a,const auto& b){
+        if(a.header.from!=b.header.from)return a.header.from>b.header.from;
+        if(a.end.first!=b.end.first)return a.end.first>b.end.first;return a.path<b.path;
+    });
+    const Point goal{target.sequence,target_hash};std::map<Point,size_t> next;next.emplace(goal,deltas.size());
+    for(size_t i=0;i<deltas.size();++i){const auto& d=deltas[i];
+        if(next.contains(d.end))next.emplace(Point{d.header.from,d.header.previous},i);
+    }
+    std::sort(bases.begin(),bases.end(),[](const auto& a,const auto& b){
+        if(a.end.first!=b.end.first)return a.end.first>b.end.first;return a.path<b.path;
+    });
+    auto base=std::find_if(bases.begin(),bases.end(),[&](const auto& b){return next.contains(b.end);});
+    need(base!=bases.end(),"no continuous archive chain reaches recovery point");
+    auto receipt=[&](const Point& p){return RecoveryPoint{p.first,recovery_hex(repository),recovery_hex(p.second)};};
+    std::vector<RestoreStep> result{{base->path,receipt(base->end)}};auto current=base->end;
+    while(current!=goal){const auto& delta=deltas.at(next.at(current));result.push_back({delta.path,receipt(delta.end)});current=delta.end;}
+    return result;
+}
+uint64_t LevelStore::restore(const std::vector<std::string>& archives,const std::string& destination,const RecoveryPoint& target){
+    auto plan=plan_restore(archives,target);struct stat st{};
+    need(lstat(destination.c_str(),&st)!=0 && errno==ENOENT,"restore destination must not exist");
+    auto staging=destination+".restore-job-XXXXXX";
+    if(!mkdtemp(staging.data()))throw std::system_error(errno,std::generic_category(),"create restore job staging");
+    struct Cleanup {std::string path;~Cleanup(){std::error_code ignored;std::filesystem::remove_all(path,ignored);}} cleanup{staging};
+    const auto repository=staging+"/repository";
+    for(const auto& step:plan){replay_archive(step.archive,repository,step.endpoint);fault("restore_after_step");}
+    {
+        LevelStore recovered(repository);recovered.verify();leveldb::ReadOptions options;options.verify_checksums=true;
+        verify_recovery_graph(*recovered.db_,options,recovered.sequence_);
+        need(recovered.sequence_==target.sequence && recovered.repository_==recovery_hex(recovery_unhex(target.repository,16)) &&
+             recovered.replay_head_==recovery_unhex(target.chain_hash,32),"restore did not reach requested checkpoint");
+    }
+    sync_parent(repository+"/CURRENT");fault("restore_before_publish");publish_directory(repository,destination);
+    fault("restore_after_publish");return target.sequence;
+}
 uint64_t LevelStore::replay_archive(const std::string& archive,const std::string& destination,std::optional<RecoveryPoint> until){
-    auto unhex=[](const std::string& value,size_t size){
-        need(value.size()==size*2,"invalid recovery point ID length");std::string raw;
-        auto digit=[](char c)->unsigned {if(c>='0' && c<='9')return c-'0';if(c>='a' && c<='f')return c-'a'+10;
-            if(c>='A' && c<='F')return c-'A'+10;throw std::runtime_error("invalid recovery point hex ID");};
-        for(size_t i=0;i<value.size();i+=2)raw.push_back(static_cast<char>((digit(value[i])<<4)|digit(value[i+1])));return raw;
-    };
     std::optional<std::pair<uint64_t,std::string>> endpoint;std::string repository;
-    if(until){repository=unhex(until->repository,16);endpoint={{until->sequence,unhex(until->chain_hash,32)}};}
+    if(until){repository=recovery_unhex(until->repository,16);endpoint={{until->sequence,recovery_unhex(until->chain_hash,32)}};}
     replay::File file(archive);auto header=replay::validate(file,endpoint);
     if(until)need(repository==header.repository,"recovery point repository mismatch");
     const auto stop=until?until->sequence:header.to;
