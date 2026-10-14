@@ -28,7 +28,7 @@ add_test(NAME forkfsd_metadata_tree COMMAND forkfsd_metadata_tree_test)
 set_tests_properties(forkfsd_metadata_tree PROPERTIES TIMEOUT 60)
 
 # Separate build keeps deterministic barriers completely out of production.
-add_executable(forkfsd_lock_granularity_test tests/lock_granularity.cpp journal.cpp level_store.cpp)
+add_executable(forkfsd_lock_granularity_test tests/lock_granularity.cpp journal.cpp level_store.cpp metadata_tree.cpp metadata_view.cpp)
 target_compile_definitions(forkfsd_lock_granularity_test PRIVATE FORKFS_TEST_LOCKS=1)
 target_include_directories(forkfsd_lock_granularity_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(forkfsd_lock_granularity_test PRIVATE leveldb Threads::Threads)
@@ -131,3 +131,48 @@ set_tests_properties(forkfsd_script_control PROPERTIES TIMEOUT 90 LABELS metadat
 add_test(NAME forkfsd_script_control_unit COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_SOURCE_DIR}/scripts/tests/test_forkfs_control.py)
 set_tests_properties(forkfsd_script_control_unit PROPERTIES TIMEOUT 30 LABELS metadata-regression)
+
+add_test(NAME forkfsd_replay COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
+set_tests_properties(forkfsd_replay PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+add_executable(forkfsd_replay_core_test tests/replay.cpp)
+target_link_libraries(forkfsd_replay_core_test PRIVATE forkfs_namespace)
+add_test(NAME forkfsd_replay_core COMMAND forkfsd_replay_core_test)
+set_tests_properties(forkfsd_replay_core PROPERTIES TIMEOUT 90 LABELS metadata-regression)
+
+add_test(NAME forkfsd_replay_corruption COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay_corruption.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_replay_corruption PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+
+foreach(seed 1 173 4294967295 random)
+    set(seed_args --seed ${seed})
+    if(seed STREQUAL "random")
+        set(seed_args)
+    endif()
+    add_test(NAME forkfsd_replay_fuzz_${seed} COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay_fuzz.py --binary $<TARGET_FILE:forkfsd>
+        ${seed_args} --steps 32 --mutations 24 --artifacts ${CMAKE_BINARY_DIR}/fuzz-artifacts)
+    set_tests_properties(forkfsd_replay_fuzz_${seed} PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+endforeach()
+
+option(WFS_BUILD_FUZZERS "Build replay parser fuzz target with sanitizers" OFF)
+option(WFS_FUZZ_STANDALONE "Run saved corpus without libFuzzer (toolchains lacking its runtime)" OFF)
+if(WFS_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "Replay fuzzing requires Clang")
+    endif()
+    # Instrument LevelDB too: mixing instrumented/uninstrumented libc++ vector
+    # operations can produce false container-overflow reports on macOS.
+    target_compile_options(leveldb PRIVATE -fsanitize=address,undefined -fno-sanitize=vptr -fno-omit-frame-pointer)
+    target_link_options(leveldb INTERFACE -fsanitize=address,undefined)
+    target_compile_options(forkfs_metadata PUBLIC -fsanitize=address,undefined -fno-sanitize=vptr -fno-omit-frame-pointer)
+    target_link_options(forkfs_metadata PUBLIC -fsanitize=address,undefined)
+    add_executable(forkfs_replay_fuzzer tests/replay_fuzzer.cpp)
+    target_link_libraries(forkfs_replay_fuzzer PRIVATE forkfs_metadata)
+    if(WFS_FUZZ_STANDALONE)
+        target_compile_definitions(forkfs_replay_fuzzer PRIVATE FORKFS_FUZZ_STANDALONE=1)
+    else()
+        target_compile_options(forkfs_metadata PUBLIC -fsanitize=fuzzer-no-link)
+        target_link_options(forkfs_replay_fuzzer PRIVATE -fsanitize=fuzzer)
+    endif()
+endif()

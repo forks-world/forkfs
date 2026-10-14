@@ -19,7 +19,7 @@ Id priority(const std::string& key) {
 }
 const MetadataTree::Node& MetadataTree::node(const Id& id) const {
     auto cached=cache_.find(id);if(cached!=cache_.end())return cached->second;
-    auto b=store_.get_object(id);need(b.size()>=108 && !memcmp(b.data(),"FFTRNO01",8),"invalid metadata tree node");
+    auto b=read_(id);need(b.size()>=108 && !memcmp(b.data(),"FFTRNO01",8),"invalid metadata tree node");
     auto n=u32(b.data()+8);need(n>=8 && n<=1024 && b.size()==108+uint64_t(n),"invalid metadata node length");
     Node result;result.key.assign(b.begin()+108,b.end());
     need(valid_key(result.key),"invalid metadata node key");

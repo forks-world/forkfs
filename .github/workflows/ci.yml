@@ -207,4 +207,35 @@ jobs:
         with:
           name: metadata-failures-${{ matrix.os }}
           if-no-files-found: ignore
-          path: build/metadata/Testing/Temporary/*.log
+          path: |
+            build/metadata/Testing/Temporary/*.log
+            build/metadata/fuzz-artifacts/
+
+
+  replay-fuzz:
+    name: Replay coverage-guided fuzzing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: sh
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install Clang and crypto headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libssl-dev
+      - name: Run replay fuzzing with ASan and UBSan
+        run: python3 scripts/ci/replay_fuzz.py
+      - name: Upload fuzz failure inputs
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: replay-fuzz-failures
+          if-no-files-found: ignore
+          path: |
+            build/replay-fuzz/artifacts/
+            build/replay-fuzz/corpus/

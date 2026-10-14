@@ -1,4 +1,5 @@
 #include "container.h"
+#include "level_store.h"
 #include "namespace.h"
 #include "rpc.h"
 #include <cerrno>
@@ -136,7 +137,8 @@ void serve(forkfs::Container& container, const std::string& path,bool rpc=false)
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--help") {
-            std::cout << "forkfsd init REPOSITORY_DIRECTORY\nforkfsd check CONTAINER\n"
+            std::cout << "forkfsd backup REPOSITORY ARCHIVE\nforkfsd replay-export REPOSITORY AFTER_SEQUENCE ARCHIVE\nforkfsd replay ARCHIVE DESTINATION\n"
+                         "forkfsd init REPOSITORY_DIRECTORY\nforkfsd check CONTAINER\n"
                          "forkfsd serve CONTAINER --socket PATH [--rpc]\n"
                          "forkfsd request SOCKET COMMAND [ARGS...]\n"
                          "RPC sessions: session-open LEASE_MS, session-keepalive TOKEN, session-close TOKEN\n"
@@ -205,6 +207,9 @@ int main(int argc, char** argv) {
             std::cout.write(result.data(),result.size());
             if(!std::cout)throw std::runtime_error("cannot write RPC output");return 0;
         }
+        if(command=="backup" && argc==4){forkfs::LevelStore store(argv[2]);std::cout<<store.backup(argv[3])<<"\n";return 0;}
+        if(command=="replay-export" && argc==5){forkfs::LevelStore store(argv[2]);std::cout<<store.export_replay(file_number(argv[3]),argv[4])<<"\n";return 0;}
+        if(command=="replay" && argc==4){std::cout<<forkfs::LevelStore::replay_archive(argv[2],argv[3])<<"\n";return 0;}
         std::string view="main";bool revision_view=false;
         int base_argc=4;
         if(command=="fs-init" || command=="fs-check" || command=="fs-worlds" || command=="fs-revisions" || command=="fs-compact" || command=="fs-layout")base_argc=3;

@@ -1,5 +1,6 @@
 #pragma once
 #include "journal.h"
+#include <functional>
 
 namespace forkfs {
 // Namespace version view: persistent CoW tree on LevelDB, immutable sorted runs
@@ -28,6 +29,8 @@ public:
     Frozen freeze() const;
     static Plan compact_frozen(const Frozen& input);
     static void valid_name(const std::string& name);
+    // Validate a frozen manifest through a snapshot/transaction overlay reader.
+    static void verify_manifest(const std::function<Bytes(const ObjectId&)>& read,const ObjectId& manifest);
 private:
     const Journal& journal_;
     std::unique_ptr<MetadataTree> tree_;
