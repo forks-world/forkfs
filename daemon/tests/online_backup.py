@@ -70,6 +70,9 @@ with tempfile.TemporaryDirectory(prefix='ff-online-') as directory:
                 request('fs-write', '/file', payload)
             status = finish(request_id)
             image = base.read_bytes()
+            assert status['checkpoint']['repository'] == image[9:25].hex()
+            assert status['checkpoint']['chain_hash'] == image[73:105].hex()
+            assert status['checkpoint']['sequence'] == status['sequence']
             assert obj('backup-start', request_id, base) == status
             assert base.read_bytes() == image
             request('backup-start', request_id, root/'other.pack', ok=False)
@@ -105,10 +108,15 @@ with tempfile.TemporaryDirectory(prefix='ff-online-') as directory:
     cli('replay', final, root/'shutdown-recovered')
     proc = start()
     try:
-        request('backup-status', 'final', ok=False)
-        # Restart loses only task bookkeeping; never overwrites the published pack.
-        saved = final.read_bytes();obj('backup-start', 'final', final)
-        finish('final', 'failed');assert final.read_bytes() == saved
+        durable = obj('backup-status', 'final');assert durable['state'] == 'durable'
+        assert durable['checkpoint']['sequence'] == durable['sequence']
+        assert len(durable['checkpoint']['chain_hash']) == 64
+        saved = final.read_bytes();assert obj('backup-start', 'final', final) == durable
+        assert final.read_bytes() == saved
+        assert obj('backup-status', 'occupied') == failed
+        obj('backup-forget', 'final');request('backup-status', 'final', ok=False)
+        assert final.read_bytes() == saved  # Forget never deletes the archive.
+        obj('backup-start', 'final', final);finish('final', 'failed')
         assert request('fs-cat', '/file') == versions[-1]
     finally:
         proc.terminate();proc.wait(timeout=20)

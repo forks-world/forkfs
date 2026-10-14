@@ -8,10 +8,13 @@
 ### 当前实现进度
 
 阶段 1 的首个实现提供 daemon RPC 后台全量备份、增量导出与状态查询，复用
-LevelStore 一致 snapshot。支持单活动任务、进程内 request_id 幂等、失败状态和
+LevelStore 一致 snapshot。支持单活动任务、持久 request_id 幂等、失败/中断状态和
 优雅退出等待。命令与限制见 [daemon README](../daemon/README.md#online-export-through-the-owning-daemon)。
-任务记录目前只在内存中保存，最多 128 条；不会在重启后自动重试。尚未实现持久
-checkpoint/任务、revision 创建事件索引、取消、保留 lease、catalog 和日志裁剪。
+任务记录以源端独立校验文件保存，最多 128 条；通过显式 forget 回收终态记录。
+完成记录保存由导出快照产生的 repository/sequence/chain_hash 恢复点凭证；重启保留
+已完成结果，把未完成意图报告为 interrupted，不自动重试。控制文件不随备份复制。
+该凭证尚不是包含根清单的完整 checkpoint catalog。revision 创建事件索引、取消、
+保留 lease、独立 catalog、多包恢复计划和日志裁剪仍未实现。
 因此下面的完整在线备份协议仍是目标设计，不能将当前 `backup-start` 等同于该协议。
 
 ## 1. 决策与边界

@@ -38,6 +38,7 @@ int main(){
                 check(store.backup_status("base")==running);
                 check(store.start_backup("base",base)==running);
                 rejects([&]{store.start_backup("other",directory+"/other");});
+                rejects([&]{store.forget_backup("base");});
                 rejects([&]{store.start_backup("base",directory+"/different");});
                 fs.write("/file",{'n','e','w'});check(fs.read("/file")==std::vector<unsigned char>({'n','e','w'}));
             });
@@ -53,6 +54,37 @@ int main(){
         }
         check(LevelStore::replay_archive(delta,restored)>sequence);
         {Container store(restored);Namespace fs(store);check(fs.read("/file")==std::vector<unsigned char>({'n','e','w'}));fs.verify();}
+        // Completion persistence failure must not report a durable checkpoint or
+        // admit another worker; filesystem data and the exported pack stay usable.
+        {
+            Container store(db);Release guard;
+            {std::lock_guard lock(mutex);captured=false;released=false;}
+            store.start_backup("io-error",directory+"/io-error.pack");
+            bool entered;
+            {std::unique_lock lock(mutex);entered=cv.wait_for(lock,5s,[]{return captured;});}
+            if(!entered){release();check(false);}
+            std::filesystem::rename(db+"/BACKUP-TASKS",db+"/saved-tasks");
+            std::filesystem::create_directory(db+"/BACKUP-TASKS");
+            release();
+            auto deadline=std::chrono::steady_clock::now()+5s;
+            std::string state;
+            do {
+                state=store.backup_status("io-error");
+                if(state.find("\"state\":\"running\"")==std::string::npos)break;
+                std::this_thread::sleep_for(1ms);
+            } while(std::chrono::steady_clock::now()<deadline);
+            check(state.find("\"state\":\"interrupted\"")!=std::string::npos);
+            check(state.find("\"checkpoint\":null")!=std::string::npos);
+            rejects([&]{store.start_backup("blocked",directory+"/blocked");});
+            Namespace fs(store);fs.verify();
+        }
+        std::filesystem::remove(db+"/BACKUP-TASKS");
+        std::filesystem::rename(db+"/saved-tasks",db+"/BACKUP-TASKS");
+        {
+            Container store(db);
+            check(store.backup_status("io-error").find("\"state\":\"interrupted\"")!=std::string::npos);
+            store.forget_backup("io-error");
+        }
         {
             Container preview(db,Container::OpenMode::RevisionPreview);
             rejects([&]{preview.start_backup("forbidden",directory+"/preview");});

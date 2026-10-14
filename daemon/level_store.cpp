@@ -351,7 +351,7 @@ std::string LevelStore::replay_hash(uint64_t seq) const {
     std::string record;need(read(replay::logkey(seq),record),"missing retained replay transaction");
     auto tx=replay::transaction(record);need(tx.sequence==seq,"invalid retained replay sequence");return replay::hash(record);
 }
-uint64_t LevelStore::backup(const std::string& archive){
+uint64_t LevelStore::backup(const std::string& archive,std::string* chain_hash){
     std::unique_lock lock(writer_mutex_);healthy();
     if(!replay_enabled_){
         std::string entropy(32,0);int fd=open("/dev/urandom",O_RDONLY|O_CLOEXEC);if(fd<0)throw std::system_error(errno,std::generic_category(),"replay anchor entropy");
@@ -377,9 +377,9 @@ uint64_t LevelStore::backup(const std::string& archive){
         auto row="B"+replay::le(key.size(),4)+replay::le(value.size(),4)+key+value;
         replay::base_row(row);out.frame(row);
     }
-    status(it->status(),"export backup");out.finish();sync_parent(archive);return header.to;
+    status(it->status(),"export backup");out.finish();sync_parent(archive);if(chain_hash)*chain_hash=header.head;return header.to;
 }
-uint64_t LevelStore::export_replay(uint64_t after,const std::string& archive) const {
+uint64_t LevelStore::export_replay(uint64_t after,const std::string& archive,std::string* chain_hash) const {
     std::unique_lock lock(writer_mutex_);healthy();auto previous=replay_hash(after);
     auto release=[this](const leveldb::Snapshot* s){db_->ReleaseSnapshot(s);};
     std::unique_ptr<const leveldb::Snapshot,decltype(release)> snapshot(db_->GetSnapshot(),release);
@@ -390,7 +390,7 @@ uint64_t LevelStore::export_replay(uint64_t after,const std::string& archive) co
     while(seq<header.to){std::string record;status(db_->Get(options,replay::logkey(++seq),&record),"export replay record");
         auto tx=replay::transaction(record);need(tx.sequence==seq && tx.previous==head,"retained replay chain mismatch");out.frame(record);head=replay::hash(record);
     }
-    need(head==header.head,"retained replay end mismatch");out.finish();sync_parent(archive);return header.to;
+    need(head==header.head,"retained replay end mismatch");out.finish();sync_parent(archive);if(chain_hash)*chain_hash=header.head;return header.to;
 }
 uint64_t LevelStore::replay_archive(const std::string& archive,const std::string& destination){
     replay::File file(archive);auto header=replay::validate(file);

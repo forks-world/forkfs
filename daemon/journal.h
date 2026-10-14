@@ -28,8 +28,8 @@ public:
     explicit Journal(const std::string& directory,bool read_only=false);
     bool is_leveldb() const {return bool(leveldb_);}
     std::string repository() const;
-    uint64_t backup(const std::string& archive);
-    uint64_t export_replay(uint64_t after,const std::string& archive) const;
+    uint64_t backup(const std::string& archive,std::string* chain_hash=nullptr);
+    uint64_t export_replay(uint64_t after,const std::string& archive,std::string* chain_hash=nullptr) const;
     void compact();
     std::string metrics_json(bool detailed=false) const;
     Journal(int fd, const std::array<unsigned char,16>& repository, const Checkpoint& checkpoint = {});

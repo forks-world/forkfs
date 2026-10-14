@@ -185,6 +185,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="backup-start")return store.start_backup(args[1],args[2]);
     if(op=="replay-export-start")return store.start_backup(args[1],args[3],number(args[2]));
     if(op=="backup-status")return store.backup_status(args[1]);
+    if(op=="backup-forget"){store.forget_backup(args[1]);return "{\"forgotten\":true}\n";}
     Namespace fs(store,view,revision);
     if(op=="fs-istat")return inode_json(fs.stat_inode(args[1]))+"\n";
     if(op=="fs-setattr" || op=="fs-isetattr" || op=="fs-hsetattr"){

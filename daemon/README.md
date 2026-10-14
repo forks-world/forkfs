@@ -388,10 +388,24 @@ One export runs per repository. Reusing a request ID with identical arguments
 returns its recorded state; different arguments are rejected. Failed tasks release
 the worker slot and do not retry automatically. Output files are never overwritten;
 a failed export may leave a partial archive, so use a new request ID and path.
-Task history is bounded to 128 entries and lives only for the daemon lifetime;
-restart clears it. Graceful shutdown waits for the current export before closing
+Task history is bounded to 128 entries and stored in the source repository's
+checksummed `BACKUP-TASKS` control file. Intent is synced before a worker starts;
+completion is synced before status reports `durable`. Durable status includes a
+`checkpoint` receipt with repository ID, sequence and chain hash captured by the
+export itself. This is a recovery position, not a user revision or catalog root list.
+Restart preserves request IDs and terminal results, and reports unfinished intents
+as `interrupted`. Even a complete pack left by an interrupted task is not silently
+acknowledged or overwritten. Use a new ID/path after inspecting the old archive.
+`forkfsd request SOCKET backup-forget REQUEST_ID` removes a terminal task record
+without deleting its archive; explicit forgetting ends that ID's deduplication
+protection and frees a history slot. Running tasks cannot be forgotten.
+
+A corrupted catalog rejects backup control operations without preventing normal
+filesystem access. Persistence errors block new exports until restart and inspection.
+This local control file is not part of replay archives: recovery must not import
+old machine paths or task ownership. Graceful shutdown waits for the current export before closing
 LevelDB. Forced termination may leave an incomplete pack.
 
 This is the first online-export increment of the revision backup design. It does
-not yet implement persistent tasks, cancellation, backup catalogs, revision event
+not yet implement automatic task resumption, cancellation, backup catalogs, revision event
 indexing, exact revision checkpoint capture, retention leases or log pruning.
