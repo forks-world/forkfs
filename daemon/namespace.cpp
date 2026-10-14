@@ -322,6 +322,12 @@ void Namespace::commit_changes(const NamespaceView& view,Changes& changes) {
     auto& journal=*container_.journal_;journal.transact(journal.sequence(),batch);
 }
 
+std::string Namespace::revision_point(const std::string& name) const {
+    valid_view_name(name);
+    // LevelStore captures roots, descriptor and log bounds in one snapshot.
+    // Do not hold the namespace mutation lock throughout a cold log scan.
+    return container_.journal_->revision_point(name);
+}
 std::string Namespace::snapshot(const std::string& name) {
     valid_view_name(name);need(!revision_,"revision view is read-only");
     std::lock_guard lock(container_.mutex_);auto& j=*container_.journal_;

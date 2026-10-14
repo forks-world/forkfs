@@ -259,3 +259,27 @@ fork、restore、备份、导出、取消、裁剪和重启；随机选择保留
 4. **远端介质适配**：上传下载、条件发布、认证/加密、remote ACK；单独设计写者接管。
 
 每阶段以本地故障测试通过为前提；阶段 1–3 不依赖网络功能。
+
+### Implemented: revision creation recovery-point lookup
+
+`forkfsd fs-revision-point REPOSITORY NAME` (online RPC:
+`fs-revision-point NAME`) returns the revision ID, descriptor source sequence,
+and an `available` flag. When available, `checkpoint` contains the repository
+UUID, actual creation transaction sequence, and its chain hash. The endpoint
+comes from the retained transaction that binds the named revision, never from
+arithmetic on `FFREV001.source_sequence`. Lookup is read-only.
+
+This first implementation uses a bounded, in-memory derived index, rebuilt from
+a consistent LevelDB snapshot. A cold query scans the retained log and validates
+its contiguous hash chain; repeated queries scan only new transactions. Scanning
+does not hold the store writer mutex, but a cold online query still occupies the
+RPC handler. This is not yet a persistent checkpoint catalog or a constant-time
+cold lookup.
+
+Missing history returns `available: false`, `checkpoint: null`, with reason
+`retention_disabled` or `creation_not_retained`. Multiple matching bindings
+return `ambiguous_binding_events`; corrupt descriptors or scanned logs produce
+errors. A full backup preserves revision trees but not their earlier creation
+logs, so restoring that full backup alone cannot recover those creation receipts.
+Replaying a delta containing the creation transaction preserves the exact receipt.
+Unavailable receipts do not prevent browsing or forking preserved revisions.

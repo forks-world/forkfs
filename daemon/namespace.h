@@ -42,6 +42,7 @@ public:
     explicit Namespace(Container& container,std::string view="main",bool revision=false)
         :container_(container),view_(std::move(view)),revision_(revision) {}
     std::string snapshot(const std::string& name);
+    std::string revision_point(const std::string& name) const;
     void fork(const std::string& revision,const std::string& world);
     void restore(const std::string& revision);
     std::vector<std::string> worlds() const;

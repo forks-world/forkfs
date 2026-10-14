@@ -178,6 +178,7 @@ int main(int argc, char** argv) {
                          "forkfsd fs-rmdir CONTAINER PATH\n"
                          "forkfsd fs-check CONTAINER\n"
                          "forkfsd fs-snapshot CONTAINER REVISION_NAME [--world WORLD]\n"
+                         "forkfsd fs-revision-point CONTAINER REVISION_NAME\n"
                          "forkfsd fs-restore CONTAINER REVISION_NAME [--world WORLD]\n"
                          "forkfsd fs-fork CONTAINER REVISION_NAME NEW_WORLD\n"
                          "forkfsd fs-worlds CONTAINER\n"
@@ -260,7 +261,8 @@ int main(int argc, char** argv) {
             std::cout.write(reinterpret_cast<const char*>(value.data()),value.size());
             if (!std::cout) throw std::runtime_error("cannot write object output");
         } else if (command.starts_with("fs-")) {
-            forkfs::Container container(argv[2]);forkfs::Namespace fs(container,view,revision_view);
+            forkfs::Container container(argv[2],command=="fs-revision-point"?forkfs::Container::OpenMode::RevisionPreview:forkfs::Container::OpenMode::ReadWrite);forkfs::Namespace fs(container,view,revision_view);
+            if(command=="fs-revision-point" && argc==4){std::cout<<fs.revision_point(argv[3]);return 0;}
             if(command=="fs-compact" && argc==3) fs.compact();
             else if(command=="fs-layout" && argc==3) {
                 if(container.storage_engine()=="leveldb") {fs.stat("/");std::cout<<"{\"layout\":\"cow-tree\",\"storage_engine\":\"leveldb\"}\n";return 0;}

@@ -518,3 +518,10 @@ uint64_t Journal::export_replay(uint64_t after,const std::string& archive,std::s
     return leveldb_->export_replay(after,archive,chain_hash);
 }
 }
+
+namespace forkfs {
+std::string Journal::revision_point(const std::string& name) const {
+    if(!leveldb_)throw std::runtime_error("revision recovery points require LevelDB");
+    return leveldb_->revision_point(name);
+}
+}

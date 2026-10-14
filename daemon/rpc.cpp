@@ -294,6 +294,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="fs-stat" || op=="fs-hstat" || op=="fs-lstat"){
         auto n=op=="fs-stat"?fs.stat(args[1]):op=="fs-lstat"?fs.lstat(args[1]):fs.handle_stat(args[1]);return inode_json(n)+"\n";
     }
+    if(op=="fs-revision-point")return fs.revision_point(args[1]);
     if(op=="fs-snapshot")return "{\"revision_id\":\""+fs.snapshot(args[1])+"\"}\n";
     if(op=="fs-append") {
         auto offset=fs.append(args[1],std::vector<unsigned char>(args[2].begin(),args[2].end()));

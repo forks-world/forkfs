@@ -196,3 +196,7 @@ set_tests_properties(forkfsd_online_backup_core PROPERTIES TIMEOUT 60 LABELS met
 add_test(NAME forkfsd_backup_tasks COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/backup_tasks.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
 set_tests_properties(forkfsd_backup_tasks PROPERTIES TIMEOUT 120 LABELS metadata-regression)
+
+add_test(NAME forkfsd_revision_point COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/revision_point.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_revision_point PROPERTIES TIMEOUT 90 LABELS metadata-regression)

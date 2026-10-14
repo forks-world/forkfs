@@ -48,6 +48,33 @@ int main(){
             CHECK(info.accessed_ns==17 && info.created_ns==19 && info.modified_ns==23);
             CHECK(fs.get_inode_xattr(inode,"user.binary")==std::vector<unsigned char>{42});
             CHECK(before.get_inode_xattr(inode,"user.binary")==std::vector<unsigned char>({0,255,0}));fs.verify();store.verify();}
+        // Recovery points are evidence from retained transactions, not source+1.
+        {LevelStore store(ns_source);
+            CHECK(store.revision_point("before").find("creation_not_retained")!=std::string::npos);
+            auto unchanged=store.sequence();auto point=store.revision_point("after");CHECK(point.find("\"available\":true")!=std::string::npos);
+            CHECK(store.revision_point("after")==point);CHECK(store.sequence()==unchanged); // warm cache is read-only
+            auto root_key=std::string("\0forkfs-history/",16)+"revision/after";
+            auto original=store.root(root_key);auto bytes=store.object(original);
+            auto source_sequence=ns_base;for(unsigned i=0;i<8;++i)bytes[72+i]=static_cast<unsigned char>(source_sequence>>(8*i));
+            store.transact(store.sequence(),{{"filler",std::vector<unsigned char>{1}}});
+            store.transact(store.sequence(),{{std::string("\0forkfs-history/",16)+"revision/delayed",bytes}});
+            auto event=store.sequence();auto delayed=store.revision_point("delayed");
+            CHECK(delayed.find("\"sequence\":"+std::to_string(event))!=std::string::npos);
+            CHECK(event>source_sequence+1);CHECK(store.revision_point("after")==point);
+            store.transact(store.sequence(),{{root_key,std::nullopt,original}});
+            CHECK(store.revision_point("after").find("ambiguous_binding_events")!=std::string::npos);
+            rejects([&]{store.revision_point("missing");});rejects([&]{store.revision_point("../bad");});
+        }
+        auto damaged_log=pattern+"/point-damaged";
+        std::filesystem::copy(ns_source,damaged_log,std::filesystem::copy_options::recursive);
+        std::string logkey="L/";auto first=ns_base+1;for(int i=7;i>=0;--i)logkey.push_back(static_cast<char>(first>>(8*i)));
+        corrupt(damaged_log,logkey,"broken");
+        {LevelStore store(damaged_log);rejects([&]{store.revision_point("delayed");});}
+        auto missing_log=pattern+"/point-missing";
+        std::filesystem::copy(ns_source,missing_log,std::filesystem::copy_options::recursive);
+        {leveldb::DB* raw=nullptr;leveldb::Options options;CHECK(leveldb::DB::Open(options,missing_log,&raw).ok());
+            std::unique_ptr<leveldb::DB> db(raw);leveldb::WriteOptions write;write.sync=true;CHECK(db->Delete(write,logkey).ok());}
+        {LevelStore store(missing_log);rejects([&]{store.revision_point("delayed");});}
         // Corrupt the actual LevelDB backing, not just an archive checksum.
         // Each copy is closed before mutation and reopened by every assertion.
         auto raw_get=[](const std::string& path,const std::string& key){

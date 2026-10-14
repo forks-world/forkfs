@@ -32,6 +32,7 @@ public:
     uint64_t sequence() const {return sequence_;}
     size_t objects() const {return objects_;}
     size_t roots() const {return roots_;}
+    std::string revision_point(const std::string& name) const;
     std::string repository() const {return repository_;}
     void poison() {poisoned_=true;}
 private:
@@ -40,6 +41,13 @@ private:
     void healthy() const;
     // Serializes publication, including root validation and durable DB::Write.
     mutable std::mutex writer_mutex_;
+    struct RevisionIndex {
+        uint64_t start=0,through=0,event=0;
+        std::string anchor,head,event_head;
+        unsigned matches=0;
+    };
+    mutable std::mutex revision_index_mutex_;
+    mutable std::map<std::pair<std::string,std::string>,RevisionIndex> revision_index_;
     struct RootFact {bool found;std::string value;};
     mutable std::mutex root_cache_mutex_;
     mutable uint64_t root_cache_sequence_=UINT64_MAX;

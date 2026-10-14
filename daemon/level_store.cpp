@@ -474,3 +474,64 @@ uint64_t LevelStore::replay_archive(const std::string& archive,const std::string
     need(seq==header.to && head==header.head,"incomplete replay range during apply");return target.sequence_;
 }
 }
+
+namespace forkfs {
+std::string LevelStore::revision_point(const std::string& name) const {
+    NamespaceView::valid_name(name);
+    auto hex=[](const std::string& bytes){
+        std::string result;constexpr char digits[]="0123456789abcdef";
+        for(unsigned char c:bytes){result+=digits[c>>4];result+=digits[c&15];}return result;
+    };
+    std::unique_lock writer(writer_mutex_);healthy();
+    const auto end=sequence_.load(),start=replay_start_;
+    const auto anchor=replay_base_,end_head=replay_head_;const bool enabled=replay_enabled_;
+    auto release=[this](const leveldb::Snapshot* s){db_->ReleaseSnapshot(s);};
+    std::unique_ptr<const leveldb::Snapshot,decltype(release)> snapshot(db_->GetSnapshot(),release);
+    leveldb::ReadOptions options;options.verify_checksums=true;options.snapshot=snapshot.get();
+    writer.unlock();
+    const auto key="R/"+std::string("\0forkfs-history/",16)+"revision/"+name;
+    std::string revision,descriptor;
+    status(db_->Get(options,key,&revision),"read revision recovery root");
+    need(revision.size()==32,"invalid revision recovery root");
+    status(db_->Get(options,"O/"+revision,&descriptor),"read revision recovery descriptor");
+    need(replay::hash(descriptor)==revision,"revision recovery descriptor checksum mismatch");
+    need(descriptor.size()==80 && descriptor.starts_with("FFREV001"),"invalid revision recovery descriptor");
+    auto source=replay::num(descriptor.substr(72));need(source<end,"invalid revision source sequence");
+    auto prefix="{\"repository\":\""+repository_+"\",\"revision_id\":\""+hex(revision)+"\",\"source_sequence\":"+std::to_string(source);
+    auto unavailable=[&](const char* reason){return prefix+",\"available\":false,\"reason\":\""+reason+"\",\"checkpoint\":null}\n";};
+    if(!enabled)return unavailable("retention_disabled");
+    // An older descriptor cannot establish when its name was originally bound.
+    // A later re-PUT of the same root is not evidence of its creation transaction.
+    if(source<start)return unavailable("creation_not_retained");
+    std::lock_guard index_lock(revision_index_mutex_);
+    const auto cache_key=std::make_pair(key,revision);RevisionIndex index;
+    auto cached=revision_index_.find(cache_key);
+    if(cached!=revision_index_.end() && cached->second.start==start && cached->second.anchor==anchor && cached->second.through<=end)
+        index=cached->second;
+    else {index.start=start;index.through=start;index.anchor=anchor;index.head=anchor;}
+    if(index.through<end){
+        std::unique_ptr<leveldb::Iterator> it(db_->NewIterator(options));
+        it->Seek(replay::logkey(index.through+1));
+        while(index.through<end){
+            need(it->Valid() && it->key().ToString()==replay::logkey(index.through+1),"missing retained revision event log");
+            auto record=it->value().ToString();auto tx=replay::transaction(record);
+            need(tx.sequence==index.through+1 && tx.previous==index.head,"invalid revision event log chain");
+            auto head=replay::hash(record);
+            for(const auto& op:tx.ops)if(op.key==key && !op.erase && op.value==revision){
+                need(tx.sequence>source,"revision event precedes source sequence");
+                if(index.matches<2)++index.matches;
+                index.event=tx.sequence;index.event_head=head;
+            }
+            index.through=tx.sequence;index.head=std::move(head);it->Next();
+        }
+        status(it->status(),"scan revision event log");
+    }
+    need(index.head==end_head,"revision event log head mismatch");
+    if(!revision_index_.contains(cache_key) && revision_index_.size()>=128)revision_index_.erase(revision_index_.begin());
+    revision_index_[cache_key]=index;
+    if(!index.matches)return unavailable("creation_not_retained");
+    if(index.matches!=1)return unavailable("ambiguous_binding_events");
+    return prefix+",\"available\":true,\"checkpoint\":{\"repository\":\""+repository_+"\",\"sequence\":"+
+        std::to_string(index.event)+",\"chain_hash\":\""+hex(index.event_head)+"\"}}\n";
+}
+}
