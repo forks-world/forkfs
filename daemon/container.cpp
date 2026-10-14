@@ -200,7 +200,7 @@ Container::Container(const std::string& path,OpenMode mode):mode_(mode) {
     anchor_offset_=(&chosen==&a)?0:4096;
     fd_ = fd.n; fd.n = -1;
 }
-Container::~Container() { stop_compaction(); if (fd_ >= 0) close(fd_); }
+Container::~Container() { stop_backup(); stop_compaction(); if (fd_ >= 0) close(fd_); }
 void Container::put(const std::string& key,const std::vector<unsigned char>& value) {
     require(!key.starts_with(std::string("\0forkfs/",8)) && !key.starts_with(std::string("\0forkfs-history/",16)),"reserved filesystem key");
     std::lock_guard lock(mutex_);
@@ -274,5 +274,59 @@ std::string Container::status() const {
         ",\"metadata_prepare_ns\":" + std::to_string(metadata_prepare_ns_) +
         ",\"storage_metrics\":" + journal_->metrics_json() +
         ",\"uncommitted_tail\":" + (journal_->pending_tail() ? "true" : "false") + "}\n";
+}
+}
+
+namespace forkfs {
+std::string Container::backup_status_locked(const std::string& request_id) const {
+    auto i=backup_tasks_.find(request_id);
+    require(i!=backup_tasks_.end(),"unknown backup request (tasks do not survive daemon restart)");
+    const auto& task=i->second;
+    return "{\"request_id\":"+json_string(request_id)+",\"state\":"+json_string(task.state)+
+        ",\"archive\":"+json_string(task.archive)+",\"kind\":"+json_string(task.after?"incremental":"base")+
+        ",\"sequence\":"+(task.state=="durable"?std::to_string(task.sequence):"null")+
+        ",\"error\":"+json_string(task.error)+"}\n";
+}
+std::string Container::backup_status(const std::string& request_id) const {
+    std::lock_guard lock(backup_mutex_);return backup_status_locked(request_id);
+}
+std::string Container::start_backup(const std::string& request_id,const std::string& archive,
+                                    std::optional<uint64_t> after) {
+    require(mode_==OpenMode::ReadWrite && journal_->is_leveldb(),"backup requires writable LevelDB owner");
+    require(!request_id.empty() && request_id.size()<=128,"invalid backup request ID");
+    require(request_id.find('\0')==std::string::npos && archive.find('\0')==std::string::npos,"NUL in backup argument");
+    require(std::filesystem::path(archive).is_absolute(),"backup archive path must be absolute");
+    std::lock_guard lifecycle(backup_lifecycle_mutex_);
+    {
+        std::lock_guard lock(backup_mutex_);
+        auto i=backup_tasks_.find(request_id);
+        if(i!=backup_tasks_.end()) {
+            require(i->second.archive==archive && i->second.after==after,"backup request ID reused with different arguments");
+            return backup_status_locked(request_id);
+        }
+        require(!backup_active_,"another backup export is running");
+        require(backup_tasks_.size()<128,"backup task history full; restart daemon to reset process-local tasks");
+    }
+    // A finished worker is joined without holding the mutex it uses to publish.
+    if(backup_thread_.joinable())backup_thread_.join();
+    std::lock_guard lock(backup_mutex_);
+    backup_tasks_.emplace(request_id,BackupTask{archive,"running",{},after,0});
+    backup_active_=true;
+    try {
+        backup_thread_=std::thread([this,request_id,archive,after]{
+            uint64_t sequence=0;std::string error;
+            try {sequence=after?journal_->export_replay(*after,archive):journal_->backup(archive);}
+            catch(const std::exception& e){error=e.what();}
+            catch(...){error="unknown backup export failure";}
+            std::lock_guard done(backup_mutex_);
+            auto& task=backup_tasks_.at(request_id);task.sequence=sequence;
+            task.state=error.empty()?"durable":"failed";task.error=std::move(error);backup_active_=false;
+        });
+    } catch(...) {backup_active_=false;backup_tasks_.erase(request_id);throw;}
+    return backup_status_locked(request_id);
+}
+void Container::stop_backup() {
+    std::lock_guard lifecycle(backup_lifecycle_mutex_);
+    if(backup_thread_.joinable())backup_thread_.join();
 }
 }

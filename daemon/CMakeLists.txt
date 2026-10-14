@@ -176,3 +176,19 @@ if(WFS_BUILD_FUZZERS)
         target_link_options(forkfs_replay_fuzzer PRIVATE -fsanitize=fuzzer)
     endif()
 endif()
+
+add_test(NAME forkfsd_online_backup COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/online_backup.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_online_backup PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+
+# Deterministic barrier exists only in this test executable.
+add_executable(forkfsd_online_backup_core_test tests/online_backup.cpp container.cpp namespace.cpp
+    compaction.cpp maintenance.cpp journal.cpp level_store.cpp metadata_tree.cpp metadata_view.cpp)
+target_compile_definitions(forkfsd_online_backup_core_test PRIVATE FORKFS_TEST_BACKUP=1)
+target_include_directories(forkfsd_online_backup_core_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(forkfsd_online_backup_core_test PRIVATE leveldb Threads::Threads)
+if(NOT APPLE)
+    target_link_libraries(forkfsd_online_backup_core_test PRIVATE OpenSSL::Crypto)
+endif()
+add_test(NAME forkfsd_online_backup_core COMMAND forkfsd_online_backup_core_test)
+set_tests_properties(forkfsd_online_backup_core PROPERTIES TIMEOUT 60 LABELS metadata-regression)

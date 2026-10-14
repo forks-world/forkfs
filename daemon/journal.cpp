@@ -507,3 +507,14 @@ std::vector<unsigned char> Journal::get(const std::string& key) const {
     return read_object(it->second);
 }
 }
+
+namespace forkfs {
+uint64_t Journal::backup(const std::string& archive) {
+    if(!leveldb_ || read_only_)throw std::runtime_error("backup requires writable LevelDB owner");
+    return leveldb_->backup(archive);
+}
+uint64_t Journal::export_replay(uint64_t after,const std::string& archive) const {
+    if(!leveldb_ || read_only_)throw std::runtime_error("replay export requires writable LevelDB owner");
+    return leveldb_->export_replay(after,archive);
+}
+}

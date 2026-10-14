@@ -366,3 +366,32 @@ is idempotent. These are offline commands requiring exclusive repository ownersh
 See [the disaster replay contract](../docs/DISASTER_REPLAY.md) for durability,
 crash recovery, storage costs and the requirement to keep archives off the source
 machine. Online replication and log pruning are not implemented.
+
+### Online export through the owning daemon
+
+With `forkfsd serve REPOSITORY --socket SOCKET --rpc` running:
+
+```text
+forkfsd request SOCKET backup-start request-1 /absolute/path/base.pack
+forkfsd request SOCKET backup-status request-1
+forkfsd request SOCKET replay-export-start request-2 BASE_SEQUENCE /absolute/path/delta.pack
+forkfsd request SOCKET backup-status request-2
+```
+
+Exports run on a background worker, leaving RPC filesystem operations available.
+Each archive captures one LevelDB snapshot; its sequence becomes available when
+status is `durable`, after file and parent-directory sync. This confirms local
+archive durability, not an independent failure domain or remote acknowledgement.
+An accepted `running` task does not mean the snapshot has already been captured.
+
+One export runs per repository. Reusing a request ID with identical arguments
+returns its recorded state; different arguments are rejected. Failed tasks release
+the worker slot and do not retry automatically. Output files are never overwritten;
+a failed export may leave a partial archive, so use a new request ID and path.
+Task history is bounded to 128 entries and lives only for the daemon lifetime;
+restart clears it. Graceful shutdown waits for the current export before closing
+LevelDB. Forced termination may leave an incomplete pack.
+
+This is the first online-export increment of the revision backup design. It does
+not yet implement persistent tasks, cancellation, backup catalogs, revision event
+indexing, exact revision checkpoint capture, retention leases or log pruning.

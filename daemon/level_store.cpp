@@ -367,6 +367,9 @@ uint64_t LevelStore::backup(const std::string& archive){
     std::string identity;status(db_->Get(options,"M/repository",&identity),"backup identity");
     replay::Header header{'B',identity,sequence_,sequence_,replay_head_,replay_head_};lock.unlock();
     verify_recovery_graph(*db_,options,header.to);
+#ifdef FORKFS_TEST_BACKUP
+    extern void test_backup_snapshot();test_backup_snapshot();
+#endif
     replay::Writer out(archive,header);std::unique_ptr<leveldb::Iterator> it(db_->NewIterator(options));
     for(it->SeekToFirst();it->Valid();it->Next()){
         auto key=it->key().ToString(),value=it->value().ToString();

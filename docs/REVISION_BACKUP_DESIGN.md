@@ -1,8 +1,18 @@
 # 基于 revision 的备份与 replay 设计
 
 状态：设计提案，基于 PR #54 已合并的离线备份与事务 replay。
-本文中的 checkpoint、catalog、在线 RPC、日志裁剪和精确恢复目标尚未实现。
+本文中的持久 checkpoint、catalog、日志裁剪和精确恢复目标尚未实现；在线 RPC 的
+首个实现及其限制见下方进度说明。
 现有命令、FFRPLY01 格式及已实现保证见 [DISASTER_REPLAY.md](DISASTER_REPLAY.md)。
+
+### 当前实现进度
+
+阶段 1 的首个实现提供 daemon RPC 后台全量备份、增量导出与状态查询，复用
+LevelStore 一致 snapshot。支持单活动任务、进程内 request_id 幂等、失败状态和
+优雅退出等待。命令与限制见 [daemon README](../daemon/README.md#online-export-through-the-owning-daemon)。
+任务记录目前只在内存中保存，最多 128 条；不会在重启后自动重试。尚未实现持久
+checkpoint/任务、revision 创建事件索引、取消、保留 lease、catalog 和日志裁剪。
+因此下面的完整在线备份协议仍是目标设计，不能将当前 `backup-start` 等同于该协议。
 
 ## 1. 决策与边界
 

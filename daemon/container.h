@@ -25,6 +25,10 @@ public:
     std::string storage_profile() const;
     std::string storage_engine() const;
     void checkpoint();
+    // Process-local request IDs. One background export; no automatic retries.
+    std::string start_backup(const std::string& request_id,const std::string& archive,
+                             std::optional<uint64_t> after=std::nullopt);
+    std::string backup_status(const std::string& request_id) const;
     void start_compaction();
     void stop_compaction();
     bool wait_compaction(std::chrono::milliseconds timeout=std::chrono::seconds(10));
@@ -35,6 +39,18 @@ public:
     std::vector<std::vector<unsigned char>> get_many(const std::vector<std::string>& keys) const;
     std::vector<unsigned char> get(const std::string& key) const;
 private:
+    struct BackupTask {
+        std::string archive,state="running",error;
+        std::optional<uint64_t> after;
+        uint64_t sequence=0;
+    };
+    std::string backup_status_locked(const std::string& request_id) const;
+    void stop_backup();
+    mutable std::mutex backup_mutex_;
+    std::mutex backup_lifecycle_mutex_;
+    std::map<std::string,BackupTask> backup_tasks_;
+    std::thread backup_thread_;
+    bool backup_active_=false;
     const OpenMode mode_;
     uint64_t metadata_prepare_ns_=0;
     friend class Namespace;
