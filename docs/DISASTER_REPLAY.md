@@ -146,6 +146,11 @@ The target must equal an independently replayed prefix of complete candidate
 transactions, and retrying the candidate must not change the target further.
 This prefix comparison is an atomicity oracle, not an independent implementation
 of transaction semantics; the state model supplies the latter for valid histories.
+Full-backup graph mutations additionally select random revisions and reachable
+CoW nodes, inject missing parent/manifest/tree/value references or invalid ancestry
+sequences, and recompute object IDs along the entire path plus database counters
+and archive checksums. These inputs must be rejected without publishing a target,
+including on retry. This reaches graph validation behind all integrity checks.
 The fixed corruption regressions remain useful for known failure modes.
 
 Three fixed seeds and one fresh random seed run under the `metadata-regression`
@@ -191,3 +196,8 @@ mode does **not** perform coverage-guided mutation. Parser inputs are bounded to
 normal replay tests, not this in-process target. Bounded fuzzing improves input
 and interleaving coverage; it does not prove recovery correctness or replace
 crash-injection tests.
+
+Normal base-restore failures close LevelDB and remove the current attempt's staging
+directory. Cleanup errors do not replace the original restore error. A killed
+process can still leave a private staging directory; retries create a new one and
+never sweep staging directories belonging to other attempts.

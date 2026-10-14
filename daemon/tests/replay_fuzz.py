@@ -18,7 +18,7 @@ import subprocess
 import tempfile
 import traceback
 
-from replay_corruption import unpack, pack, base_rows, rechain
+from replay_corruption import unpack, pack, base_rows, base_frames, counts, h, rechain
 
 @dataclass
 class Node:
@@ -38,7 +38,7 @@ class Trial:
         self.trace = root/'events.jsonl'
         (root/'seed.json').write_text(json.dumps({'seed': seed, 'steps': steps, 'mutations': mutations, 'binary': str(binary)}, indent=2))
 
-    def call(self, *args, allow_error=False):
+    def call(self, *args, allow_error=False, expected_error=None):
         argv = [str(self.binary), *map(str, args)]
         event = {'argv': argv[1:]}
         try:
@@ -47,6 +47,8 @@ class Trial:
             if (p.returncode not in ([0, 1] if allow_error else [0])
                     or b'Sanitizer' in p.stderr or b'runtime error:' in p.stderr):
                 raise AssertionError(event)  # Signals, sanitizer errors and timeouts are failures.
+            if expected_error is not None:
+                assert p.returncode == 1 and expected_error.encode() in p.stderr, event
             return p.returncode, p.stdout
         finally:
             with self.trace.open('a') as out:
@@ -213,6 +215,66 @@ class Trial:
             self.counts[key] = self.counts.get(key, 0)+1
             shutil.rmtree(target)
 
+    def graph_mutations_run(self, full):
+        header, frames = unpack(full.read_bytes())
+        original = base_rows(frames)
+        revisions = [k for k in original if k.startswith(b'R/\0forkfs-history/revision/')]
+        unrelated = self.root/'graph-target.restore-unrelated'
+        unrelated.mkdir();(unrelated/'sentinel').write_bytes(b'other recovery')
+        for i in range(self.mutations):
+            rows = dict(original)
+            key = self.rng.choice(revisions)
+            descriptor = bytearray(rows[b'O/'+rows[key]])
+            missing = bytes(self.rng.randrange(256) for _ in range(32))
+            while b'O/'+missing in rows or missing == bytes(32):
+                missing = bytes(self.rng.randrange(256) for _ in range(32))
+            kind = self.rng.choice(['parent', 'sequence', 'manifest', 'tree', 'value'])
+
+            def put(value):
+                value = bytes(value);oid = h(value)
+                rows[b'O/'+oid] = value
+                return oid
+
+            if kind == 'parent':
+                descriptor[40:72] = missing
+            elif kind == 'sequence':
+                # Every descriptor must precede the archive's committed sequence.
+                sequence = struct.unpack_from('<Q', header, 33)[0]
+                descriptor[72:80] = struct.pack('<Q', self.rng.randint(sequence, 2**64-1))
+            elif kind == 'manifest':
+                descriptor[8:40] = missing
+            else:
+                manifest = bytearray(rows[b'O/'+bytes(descriptor[8:40])])
+                assert manifest[:8] == b'FFTREE01'
+                if kind == 'tree':
+                    manifest[8:40] = missing
+                else:
+                    # Choose a random reachable tree node, then rehash the path
+                    # back to the manifest so hash validation cannot mask damage.
+                    oid = bytes(manifest[8:40]);ancestors = []
+                    while True:
+                        node = bytearray(rows[b'O/'+oid])
+                        children = [offset for offset in (44, 76) if node[offset:offset+32] != bytes(32)]
+                        if not children or self.rng.random()<0.35:
+                            break
+                        offset = self.rng.choice(children)
+                        ancestors.append((node, offset));oid = bytes(node[offset:offset+32])
+                    node[12:44] = missing;oid = put(node)
+                    for parent, offset in reversed(ancestors):
+                        parent[offset:offset+32] = oid;oid = put(parent)
+                    manifest[8:40] = oid
+                descriptor[8:40] = put(manifest)
+            rows[key] = put(descriptor);counts(rows)
+            path = self.root/'graph-mutant.pack';path.write_bytes(pack(header, base_frames(rows)))
+            target = self.root/'graph-target'
+            for _ in range(2):
+                error = 'revision ancestry sequence' if kind == 'sequence' else 'read recovery object'
+                result, _ = self.call('replay', path, target, allow_error=True, expected_error=error)
+                assert result == 1 and not target.exists(), kind
+                assert set(self.root.glob('graph-target.restore-*')) == {unrelated}, kind
+                assert (unrelated/'sentinel').read_bytes() == b'other recovery'
+            self.counts['graph-'+kind] = self.counts.get('graph-'+kind, 0)+1
+
     def save_corpus(self, full, delta):
         if self.corpus is None:
             return
@@ -261,6 +323,7 @@ class Trial:
         self.verify(full_target)
         before = self.image(target);self.run('replay', delta, target);assert self.image(target) == before
         self.mutations_run(base, delta)
+        self.graph_mutations_run(full)
         return self.counts
 
 

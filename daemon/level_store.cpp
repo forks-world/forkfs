@@ -392,7 +392,8 @@ uint64_t LevelStore::export_replay(uint64_t after,const std::string& archive) co
 uint64_t LevelStore::replay_archive(const std::string& archive,const std::string& destination){
     replay::File file(archive);auto header=replay::validate(file);
     if(header.kind=='B'){
-        // A crashed/failed base restore leaves only a private staging directory.
+        // A crashed base restore leaves only a private staging directory.
+        // Ordinary failures clean up this attempt after LevelDB has closed.
         // Publication cannot replace an existing target, even under a rename race.
         struct stat st{};
         if(lstat(destination.c_str(),&st)==0){
@@ -402,6 +403,13 @@ uint64_t LevelStore::replay_archive(const std::string& archive,const std::string
         }
         need(errno==ENOENT,"backup destination is inaccessible");
         auto staging=destination+".restore-XXXXXX";if(!mkdtemp(staging.data()))throw std::system_error(errno,std::generic_category(),"create restore staging directory");
+        struct StagingCleanup {
+            const std::string& path;
+            ~StagingCleanup() noexcept {
+                // Preserve the original restore exception if cleanup itself fails.
+                std::error_code ignored;std::filesystem::remove_all(path,ignored);
+            }
+        } cleanup{staging};
         {
             LevelStore target(staging,true,default_object_cache_bytes);
             replay::Reader in(file);need(in.header.encode()==header.encode(),"archive changed during replay");
