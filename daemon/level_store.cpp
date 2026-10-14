@@ -447,7 +447,8 @@ std::vector<LevelStore::RestoreStep> LevelStore::plan_restore(const std::vector<
     while(current!=goal){const auto& delta=deltas.at(next.at(current));result.push_back({delta.path,receipt(delta.end)});current=delta.end;}
     return result;
 }
-uint64_t LevelStore::restore(const std::vector<std::string>& archives,const std::string& destination,const RecoveryPoint& target){
+uint64_t LevelStore::restore(const std::vector<std::string>& archives,const std::string& destination,const RecoveryPoint& target,const std::function<void(const std::string&)>& verify_namespace){
+    need(bool(verify_namespace),"restore requires namespace validation");
     auto plan=plan_restore(archives,target);struct stat st{};
     need(lstat(destination.c_str(),&st)!=0 && errno==ENOENT,"restore destination must not exist");
     auto staging=destination+".restore-job-XXXXXX";
@@ -461,6 +462,7 @@ uint64_t LevelStore::restore(const std::vector<std::string>& archives,const std:
         need(recovered.sequence_==target.sequence && recovered.repository_==recovery_hex(recovery_unhex(target.repository,16)) &&
              recovered.replay_head_==recovery_unhex(target.chain_hash,32),"restore did not reach requested checkpoint");
     }
+    verify_namespace(repository);
     sync_parent(repository+"/CURRENT");fault("restore_before_publish");publish_directory(repository,destination);
     fault("restore_after_publish");return target.sequence;
 }

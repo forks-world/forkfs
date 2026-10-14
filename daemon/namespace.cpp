@@ -908,25 +908,25 @@ void Namespace::rename_entry(const NamespaceView& j,Changes& c,const std::string
 
 }
 
-void Namespace::verify() const {
-    std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);
-    if(journal.is_leveldb())(void)j.references(); // Validate the full CoW tree before namespace traversal.
+namespace {
+void verify_namespace_view(const NamespaceView& j){
+    (void)j.references();
     bool indexed=indexed_parents(j);auto root_id=root(j);need(inode(j,root_id).directory,"root inode is not a directory");std::set<std::string> expected;std::map<std::string,uint64_t> references;
     std::set<std::string> directories;expected.insert(root_key);
-    std::function<void(const std::string&)> visit=[&](const std::string& id) {
+    std::vector<std::string> pending{root_id};
+    while(!pending.empty()){auto id=std::move(pending.back());pending.pop_back();
         auto n=inode(j,id);expected.insert(inode_key(id));need(n.indexed_directory==(indexed && n.directory),"directory inode/index version mismatch");
         need(j.contains(allocated_key(id)) && j.get(allocated_key(id)).empty(),"inode missing allocation record");
-        if(!n.directory){auto data=j.get(content_key(id));need(data.size()==n.size,"inode content size mismatch");if(n.symlink)target_components(std::string(data.begin(),data.end()));expected.insert(content_key(id));return;}
+        if(!n.directory){auto data=j.get(content_key(id));need(data.size()==n.size,"inode content size mismatch");if(n.symlink)target_components(std::string(data.begin(),data.end()));expected.insert(content_key(id));continue;}
         need(directories.insert(id).second,"directory cycle or hardlink");uint64_t subdirs=0;
         auto pre=directory_prefix(id);
         for(const auto& key:j.keys(pre)) {
-            auto name=key.substr(pre.size());auto parsed=components("/"+name);need(parsed.size()==1,"invalid directory name");
+            auto name=key.substr(pre.size());auto parsed=components("/"+name);need(parsed.size()==1 && parsed.front()==name,"invalid directory name");
             expected.insert(key);auto child=decode_id(j.get(key));++references[child];
-            if(inode(j,child).directory)++subdirs;visit(child);
+            if(inode(j,child).directory)++subdirs;pending.push_back(child);
         }
         need(n.links==2+subdirs,"directory link count mismatch");
-    };
-    visit(root_id);
+    }
     for(const auto& [id,count]:references){auto n=inode(j,id);if(!n.directory)need(n.links==count,"file link count mismatch");}
     for(const auto& key:j.keys(prefix+"allocated/")) {
         auto id=key.substr((prefix+"allocated/").size());
@@ -938,6 +938,11 @@ void Namespace::verify() const {
     }
     auto actual=j.keys(prefix);need(actual.size()==expected.size(),"orphan namespace records");
     for(const auto& key:actual)need(expected.contains(key),"unexpected namespace record");
+}
+}
+void Namespace::verify() const {
+    std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);
+    verify_namespace_view(j);
     if(!revision_) {
         auto pre=history+"orphan/"+view_+"/";auto orphan_keys=journal.keys(pre);std::set<std::string> checked;
         for(const auto& key:orphan_keys) {
@@ -950,6 +955,54 @@ void Namespace::verify() const {
             need(journal.get(orphan_prefix(view_,id)+"content").size()==n.size,"orphan content size mismatch");
         }
     }
+}
+void Namespace::verify_recovery(const std::string& repository){
+    // No Container: opening a live World would reclaim persisted orphan roots
+    // and advance the exact checkpoint we are about to publish.
+    Journal journal(repository,true);journal.verify();const auto sequence=journal.sequence();
+    std::set<ObjectId> manifests,revisions;std::set<std::string> worlds;
+    auto manifest=[&](const ObjectId& id){if(manifests.insert(id).second){NamespaceView view(journal,id);verify_namespace_view(view);}};
+    if(!journal.keys(prefix).empty() && !journal.contains(history+"world/main")){
+        NamespaceView view(journal,"main");verify_namespace_view(view);worlds.insert("main");
+    }
+    for(const auto& key:journal.keys(history+"world/")){
+        auto name=key.substr((history+"world/").size());valid_view_name(name);worlds.insert(name);
+        try{manifest(journal.root_object(key));}catch(const std::exception& e){throw std::runtime_error("World "+name+": "+e.what());}
+    }
+    auto revision=[&](ObjectId id){
+        uint64_t bound=sequence;
+        while(id!=ObjectId{}){
+            auto bytes=journal.get_object(id);need(bytes.size()==80 && !memcmp(bytes.data(),"FFREV001",8),"invalid recovery revision");
+            auto source=load(bytes.data()+72,8);need(source<bound,"invalid recovery revision ancestry");bound=source;
+            if(!revisions.insert(id).second)break;
+            ObjectId tree{},parent{};std::copy_n(bytes.data()+8,32,tree.begin());std::copy_n(bytes.data()+40,32,parent.begin());
+            manifest(tree);id=parent;
+        }
+    };
+    for(const auto& key:journal.keys(history+"revision/")){
+        auto name=key.substr((history+"revision/").size());valid_view_name(name);
+        try{revision(journal.root_object(key));}catch(const std::exception& e){throw std::runtime_error("revision "+name+": "+e.what());}
+    }
+    for(const auto& key:journal.keys(history+"base/")){
+        auto name=key.substr((history+"base/").size());need(worlds.contains(name),"World base has no World");
+        auto bytes=journal.get(key);need(bytes.size()==32,"invalid World base");ObjectId id{};std::copy(bytes.begin(),bytes.end(),id.begin());need(id!=ObjectId{},"zero World base");revision(id);
+    }
+    for(const auto& key:journal.keys(history+"generation/")){
+        auto name=key.substr((history+"generation/").size());need(worlds.contains(name),"generation has no World");(void)world_generation(journal,name);
+    }
+    std::set<std::pair<std::string,std::string>> orphans;
+    for(const auto& key:journal.keys(history+"orphan/")){
+        auto relative=key.substr((history+"orphan/").size());auto slash=relative.find('/');need(slash!=std::string::npos,"invalid orphan World");
+        auto world=relative.substr(0,slash);need(worlds.contains(world),"orphan has no World");relative=relative.substr(slash+1);
+        need(relative.size()>=33 && valid_id(relative.substr(0,32)) && relative[32]=='/',"invalid orphan identity");
+        auto field=relative.substr(33);need(field=="inode" || field=="content","invalid orphan field");
+        auto id=relative.substr(0,32);if(!orphans.emplace(world,id).second)continue;
+        NamespaceView view(journal,world);need(!view.contains(inode_key(id)) && !view.contains(content_key(id)),"orphan also appears in World tree");
+        need(view.contains(allocated_key(id)) && view.get(allocated_key(id)).empty(),"orphan missing allocation record");
+        auto n=decode_inode(journal.get(orphan_prefix(world,id)+"inode"),id,true);
+        need(journal.get(orphan_prefix(world,id)+"content").size()==n.size,"orphan content size mismatch");
+    }
+    need(journal.sequence()==sequence,"recovery validation changed checkpoint");
 }
 const Container::OpenHandle& Namespace::find_handle(const std::string& token) const {
     auto it=container_.handles_.find(token);need(it!=container_.handles_.end(),"invalid or expired file handle");

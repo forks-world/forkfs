@@ -338,8 +338,8 @@ Execution uses a private sibling `DESTINATION.restore-job-*` directory. It resto
 the base and increments there, verifies the final store and recovery object graph,
 checks the requested repository/sequence/hash, then publishes the repository with
 an exclusive rename and parent-directory sync. Existing destinations are never
-overwritten, including symlinks and publication races. This does not yet provide
-the full per-World namespace semantic validation/reporting proposed in section 5.
+overwritten, including symlinks and publication races. Publication now also requires the namespace checks described below; a persistent
+validation report is not yet implemented.
 
 Ordinary failures remove this attempt's staging directory. Process crashes can
 leave private staging directories; rerunning starts a new attempt, without exposing
@@ -348,3 +348,26 @@ implemented. A crash after publication can leave a complete destination despite
 no success response; inspect it with `check` before using it. Repeating `restore`
 on an existing destination is rejected. Low-level `replay` remains available for
 explicit in-place incremental retries.
+
+
+### Implemented: namespace validation before restore publication
+
+`restore` now validates every World, named revision, and reachable ancestor revision
+before the exclusive publication rename. Shared manifests are checked once. The
+validator reuses the `fs-check` rules for inode decoding, file size, hardlink counts,
+directory topology, parent indexes, allocation records and namespace record coverage.
+Directory traversal uses an explicit work list, avoiding call-stack growth with depth.
+World base/generation records must belong to existing Worlds.
+
+Validation opens the journal in preview mode, never normal `Container` mode: it
+must not reclaim orphan roots or advance the requested checkpoint. Persisted
+open-but-unlinked files are permitted without process-local handles, but require
+complete inode/content records, a valid zero-link regular inode, matching content
+size, an allocation record, and no linked inode/content in the World. Unknown
+orphan fields or Worlds fail validation. Ordinary `fs-check` still requires live
+handles for live orphan records. An empty uninitialized repository remains valid.
+
+A semantic failure removes the attempt's staging directory and does not publish
+the destination. The storage-layer restore API requires an explicit namespace
+validator; the CLI always supplies this implementation. Low-level `replay` keeps
+its existing structural graph validation and committed-prefix retry contract.

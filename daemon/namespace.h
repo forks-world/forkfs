@@ -104,6 +104,7 @@ public:
     void link(const std::string& source,const std::string& target);
     void remove(const std::string& path,bool directory);
     void verify() const;
+    static void verify_recovery(const std::string& repository);
     std::string open(const std::string& path,Access access=Access::Read);
     std::string open(const std::string& path,Access access,const OpenOptions& options);
     std::string dup(const std::string& handle);

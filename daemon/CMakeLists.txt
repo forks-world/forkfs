@@ -208,3 +208,8 @@ set_tests_properties(forkfsd_replay_until PROPERTIES TIMEOUT 180 LABELS metadata
 add_test(NAME forkfsd_restore_plan COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/restore_plan.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
 set_tests_properties(forkfsd_restore_plan PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+
+add_executable(forkfsd_recovery_namespace_test tests/recovery_namespace.cpp)
+target_link_libraries(forkfsd_recovery_namespace_test PRIVATE forkfs_namespace)
+add_test(NAME forkfsd_recovery_namespace COMMAND forkfsd_recovery_namespace_test)
+set_tests_properties(forkfsd_recovery_namespace PROPERTIES TIMEOUT 120 LABELS metadata-regression)

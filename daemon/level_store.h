@@ -3,6 +3,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <functional>
 namespace leveldb {class DB;class Cache;class FilterPolicy;class Env;}
 namespace forkfs {
 // One upstream LevelDB per repository. Objects are immutable; heads and the
@@ -24,7 +25,8 @@ public:
 
     struct RestoreStep {std::string archive;RecoveryPoint endpoint;};
     static std::vector<RestoreStep> plan_restore(const std::vector<std::string>& archives,const RecoveryPoint& target);
-    static uint64_t restore(const std::vector<std::string>& archives,const std::string& destination,const RecoveryPoint& target);
+    static uint64_t restore(const std::vector<std::string>& archives,const std::string& destination,const RecoveryPoint& target,
+                            const std::function<void(const std::string&)>& verify_namespace);
 
     std::vector<unsigned char> object(const std::array<unsigned char,32>& id) const;
     std::array<unsigned char,32> root(const std::string& key) const;

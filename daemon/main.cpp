@@ -220,7 +220,7 @@ int main(int argc, char** argv) {
             const int offset=command=="restore"?3:2;
             forkfs::LevelStore::RecoveryPoint target{file_number(argv[offset]),argv[offset+1],argv[offset+2]};
             std::vector<std::string> archives;for(int i=offset+3;i<argc;++i)archives.emplace_back(argv[i]);
-            if(command=="restore")std::cout<<forkfs::LevelStore::restore(archives,argv[2],target)<<"\n";
+            if(command=="restore")std::cout<<forkfs::LevelStore::restore(archives,argv[2],target,forkfs::Namespace::verify_recovery)<<"\n";
             else {auto plan=forkfs::LevelStore::plan_restore(archives,target);std::cout<<"{\"steps\":[";bool first=true;
                 for(const auto& step:plan){if(!first)std::cout<<',';first=false;
                     std::cout<<"{\"archive\":"<<json_string(step.archive)<<",\"sequence\":"<<step.endpoint.sequence
