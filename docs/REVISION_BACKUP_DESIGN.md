@@ -474,3 +474,12 @@ return errors. A lookup receipt alone does not guarantee a usable base/delta cha
 or semantic validity of the entire filesystem; planning and pre-publication semantic
 checks remain separate. Overlapping packages can provide duplicate lookup evidence,
 while restore planning still requires exactly adjoining selected archive boundaries.
+
+### Segmented content backing
+
+New local repositories use the [segmented content layout](CONTENT_SEGMENTS.md).
+Backup and incremental export resolve chunk references to canonical object bytes;
+local segment IDs and offsets are never portable recovery identities. Restore
+synchronizes reconstructed data before publishing its metadata references. The
+FFRPLY01 wire format and revision IDs are unchanged. A missing or corrupt referenced
+chunk makes export/recovery fail; metadata-only success is not accepted.

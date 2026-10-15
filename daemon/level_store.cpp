@@ -1,5 +1,6 @@
 #include "revision.h"
 #include "level_store.h"
+#include "segment_db.h"
 #include "replay_format.h"
 #include "replay_validation.h"
 #ifndef __APPLE__
@@ -106,7 +107,7 @@ LevelStore::LevelStore(const std::string& path,bool initialize,size_t object_cac
     cache_.reset(leveldb::NewLRUCache(16*1024*1024));filter_.reset(leveldb::NewBloomFilterPolicy(10));
     object_cache_.reset(leveldb::NewLRUCache(object_cache_bytes));
     options.block_cache=cache_.get();options.filter_policy=filter_.get();
-    leveldb::DB* raw=nullptr;status(leveldb::DB::Open(options,path,&raw),"open LevelDB");db_.reset(raw);
+    leveldb::DB* raw=nullptr;status(leveldb::DB::Open(options,path,&raw),"open LevelDB");db_=SegmentDB::wrap(std::unique_ptr<leveldb::DB>(raw),path,initialize);
     if(initialize) {
         std::string repository(16,0);int fd=open("/dev/urandom",O_RDONLY|O_CLOEXEC);
         if(fd<0)throw std::system_error(errno,std::generic_category(),"repository entropy");
@@ -384,8 +385,9 @@ uint64_t LevelStore::backup(const std::string& archive,std::string* chain_hash){
 #endif
     replay::Writer out(archive,header);std::unique_ptr<leveldb::Iterator> it(db_->NewIterator(options));
     for(it->SeekToFirst();it->Valid();it->Next()){
-        auto key=it->key().ToString(),value=it->value().ToString();
+        auto key=it->key().ToString();
         if(key.starts_with("L/") || key.starts_with("M/replay/"))continue;
+        auto value=it->value().ToString();
         auto row="B"+replay::le(key.size(),4)+replay::le(value.size(),4)+key+value;
         replay::base_row(row);out.frame(row);
     }

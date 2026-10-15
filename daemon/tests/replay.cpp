@@ -84,8 +84,8 @@ int main(){
         };
         // Build binary keys without including the string literal terminator.
         const auto revision_key=std::string("R/")+std::string("\0forkfs-history/",16)+"revision/before";
-        auto revision_id=raw_get(ns_source,revision_key),revision_bytes=raw_get(ns_source,"O/"+revision_id);
-        auto manifest_id=revision_bytes.substr(8,32),manifest_bytes=raw_get(ns_source,"O/"+manifest_id);
+        auto revision_id=raw_get(ns_source,revision_key),revision_bytes=raw_get(ns_source,"O/"+revision_id).substr(1);
+        auto manifest_id=revision_bytes.substr(8,32),manifest_bytes=raw_get(ns_source,"O/"+manifest_id).substr(1);
         CHECK(manifest_bytes.substr(0,8)=="FFTREE01");auto tree_id=manifest_bytes.substr(8,32);
         auto content_hash=Journal::object_id({0,1,255});std::string content_id(reinterpret_cast<const char*>(content_hash.data()),32);
         unsigned damage_case=0;
@@ -112,7 +112,7 @@ int main(){
         // The format guard is persisted, including with a reopened source.
         {
             leveldb::DB* raw=nullptr;leveldb::Options options;CHECK(leveldb::DB::Open(options,source,&raw).ok());std::unique_ptr<leveldb::DB> db(raw);
-            std::string format;CHECK(db->Get({},"M/format",&format).ok());CHECK(format=="FFLDB002");
+            std::string format;CHECK(db->Get({},"M/format",&format).ok());CHECK(format=="FFLDB004");
         }
         // A backup racing a writer is a single sequence, never a mixture of roots.
         auto concurrent=pattern+"/concurrent";LevelStore::create(concurrent);
@@ -134,7 +134,7 @@ int main(){
         // Corrupt base objects are detected before publishing a recovered name.
         std::string object_key="O/";auto hash=Journal::object_id({42});object_key.append(reinterpret_cast<const char*>(hash.data()),hash.size());
         corrupt(target,object_key,"wrong bytes");
-        {LevelStore damaged(target);rejects([&]{damaged.backup(pattern+"/bad-backup");});}
+        rejects([&]{LevelStore damaged(target);damaged.backup(pattern+"/bad-backup");});
         // A missing format feature flag cannot silently disable retained logging.
         corrupt(concurrent,"M/format","FFLDB001");rejects([&]{LevelStore wrong_format(concurrent);});
         std::filesystem::remove_all(pattern);std::cout<<"replay reference/delete, snapshot race, format and corruption passed\n";return 0;
