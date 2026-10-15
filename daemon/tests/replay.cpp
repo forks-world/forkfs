@@ -84,8 +84,9 @@ int main(){
         };
         // Build binary keys without including the string literal terminator.
         const auto revision_key=std::string("R/")+std::string("\0forkfs-history/",16)+"revision/before";
-        auto revision_id=raw_get(ns_source,revision_key),revision_bytes=raw_get(ns_source,"O/"+revision_id).substr(1);
-        auto manifest_id=revision_bytes.substr(8,32),manifest_bytes=raw_get(ns_source,"O/"+manifest_id).substr(1);
+        auto payload=[](const std::string& path,const std::string& hash){LevelStore store(path);std::array<unsigned char,32> id{};std::copy(hash.begin(),hash.end(),id.begin());auto value=store.object(id);return std::string(value.begin(),value.end());};
+        auto revision_id=raw_get(ns_source,revision_key),revision_bytes=payload(ns_source,revision_id);
+        auto manifest_id=revision_bytes.substr(8,32),manifest_bytes=payload(ns_source,manifest_id);
         CHECK(manifest_bytes.substr(0,8)=="FFTREE01");auto tree_id=manifest_bytes.substr(8,32);
         auto content_hash=Journal::object_id({0,1,255});std::string content_id(reinterpret_cast<const char*>(content_hash.data()),32);
         unsigned damage_case=0;
@@ -112,7 +113,7 @@ int main(){
         // The format guard is persisted, including with a reopened source.
         {
             leveldb::DB* raw=nullptr;leveldb::Options options;CHECK(leveldb::DB::Open(options,source,&raw).ok());std::unique_ptr<leveldb::DB> db(raw);
-            std::string format;CHECK(db->Get({},"M/format",&format).ok());CHECK(format=="FFLDB004");
+            std::string format;CHECK(db->Get({},"M/format",&format).ok());CHECK(format=="FFLDB006");
         }
         // A backup racing a writer is a single sequence, never a mixture of roots.
         auto concurrent=pattern+"/concurrent";LevelStore::create(concurrent);

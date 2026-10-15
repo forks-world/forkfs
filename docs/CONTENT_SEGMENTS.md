@@ -1,14 +1,25 @@
 # Local segmented content storage
 
-New repositories separate large immutable payloads from LevelDB. LevelDB holds
-roots, counters, small immutable objects, content descriptors, chunk locations and
-reference-only replay records. Data blocks live in append-only `DATA-<id>.seg`
+New repositories keep every immutable object payload out of LevelDB, including
+empty values, tiny files, inode records, CoW nodes and revision descriptors.
+LevelDB holds roots, counters, object location descriptors, chunk locations and
+reference-only replay records. Object bytes live in append-only `DATA-<id>.seg`
 files inside the private repository directory. These files are backing storage,
 not a World directory or a user-visible mount.
 
 This implements the local data-placement and commit-order portion of the original
 userspace filesystem design. It does not introduce SQLite or modify upstream
-LevelDB. The adapter in `daemon/segment_db.h` sits below the logical object API.
+LevelDB. `ObjectStore` in `daemon/object_store.h` has no LevelDB API dependency.
+The `LevelStore` facade coordinates two peer components: an unwrapped LevelDB
+metadata database and ObjectStore. Logical transactions are forkfs operation
+vectors; only location descriptors and references enter a LevelDB WriteBatch.
+
+ObjectStore owns append/read/sync, object encoding, chunk reuse, integrity checks,
+and a bounded verified-payload LRU. The metadata coordinator supplies a location
+lookup callback and atomically publishes returned index entries. It cannot publish
+roots until ObjectStore synchronization has completed. Backup and replay explicitly
+materialize object bytes through ObjectStore; there is no DB adapter or custom
+LevelDB iterator that secretly retrieves data.
 
 ## Objects and chunks
 
@@ -16,14 +27,15 @@ An immutable object's canonical ID remains `Journal::object_id(payload)`, includ
 its existing type/schema/length framing. Moving its bytes does not change its ID,
 CoW references, revision IDs, or portable replay hashes.
 
-- Payloads of at most 256 bytes are inline in LevelDB.
+- Every payload is stored in ObjectStore. Small objects are packed as variable-length
+  records in shared segments, without per-object files or page-sized allocation.
 - Larger payloads are split at fixed 64 KiB boundaries. The last block may be short.
 - Each chunk is independently content-addressed and verified. Existing chunks are
   reused across objects, Worlds and revisions in the same repository.
 - The physical object descriptor lists ordered chunk IDs. The chunk index maps
   each ID to a segment ID, record offset and byte length.
-- This generic placement policy also applies to unusually large metadata objects;
-  ordinary inode and CoW node objects remain inline when within the threshold.
+- The same rule applies to file data and immutable metadata objects. Empty objects
+  also have an actual zero-length record; there is no inline-data exception.
 
 A changed byte in a 256 KiB object adds at most one 64 KiB content block if all
 other blocks already exist. The logical namespace API still prepares a complete
@@ -37,13 +49,15 @@ forkfs object hashes, not hashes of machine-local offsets.
 
 | Location | Encoding |
 | --- | --- |
-| `M/format` | `FFLDB003` without retained replay, `FFLDB004` with replay |
-| `O/<object ID>` inline | one byte `I`, followed by 0–256 payload bytes |
-| `O/<object ID>` external | `FFOBJ001`, total length u64, chunk count u32, ordered 32-byte chunk IDs |
+| `M/format` | `FFLDB005` without retained replay, `FFLDB006` with replay |
+| `O/<object ID>` location index | `FFOBJ002`, total length u64, chunk count u32, ordered 32-byte chunk IDs |
 | `C/<chunk ID>` | segment ID u64, record offset u64, payload length u32 |
 | Segment header (48 bytes) | `FFSEG001`, segment ID u64, hash of preceding 16 bytes |
 | Chunk record | `FFCHNK01`, chunk ID, payload length u32, payload |
 | `L/<sequence>` | `FFLOGR01`, sequence u64, previous chain hash, encoded operations with empty payloads for object PUTs |
+
+An empty object has length zero and one zero-length chunk. Other objects use
+`ceil(length / 65536)` chunks. Descriptor length is exactly `20 + 32 * count`.
 
 Segments are at most 64 MiB and records never span segments. Segment IDs start at
 1. No in-place overwrite of referenced records is permitted. Appends after reopen
@@ -75,8 +89,12 @@ indexed chunks and append beyond unused tails. No automatic space reclamation or
 segment compaction is implemented yet.
 
 Physical format guards make older binaries reject segmented repositories rather
-than interpret descriptors as file contents. Existing FFLDB001/FFLDB002 repositories
-continue using their legacy physical layout; they are not silently rewritten.
+than interpret descriptors as file contents. FFLDB001/FFLDB002 raw-value repositories
+and the superseded FFLDB003/FFLDB004 adapter format remain readable/exportable.
+Logical writes to those layouts are rejected with a migration-required error;
+there is no fallback that puts new payloads into LevelDB. Backup may enable retained
+replay metadata on an older repository, without introducing object payloads.
+Migration uses backup/replay into a fresh FFLDB006 repository.
 
 ## Backup, replay and migration
 
@@ -106,7 +124,9 @@ retain existing incremental catalog archives for historical checkpoint resolutio
 
 ## Validation and remaining limits
 
-Tests inspect physical LevelDB rows, assert single-block write growth and reuse
+A standalone test runs ObjectStore against an in-memory location map without
+opening LevelDB. Integration tests inspect physical rows (including empty and tiny
+objects), assert single-block write growth and reuse
 across reopen, compare randomized partial writes with an independent byte model,
 and exercise segment rollover, source-free full/incremental restore, legacy
 migration, malformed locations, missing files, truncated data and hash corruption.

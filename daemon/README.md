@@ -473,8 +473,10 @@ contents; it does not merge files. See [format and validation](../docs/REVISION_
 
 ## Segmented content backing
 
-New repositories keep payloads larger than 256 bytes in append-only data segments,
-using reusable 64 KiB chunks. LevelDB stores their descriptors and chunk locations;
+New repositories keep all immutable object bytes in an independent ObjectStore,
+including tiny files and metadata objects. Larger objects use reusable 64 KiB
+chunks; small records are packed into shared segments. LevelDB stores only
+location descriptors, indexes and references;
 retained replay logs contain object references instead of repeating file data.
 Data is synchronized before metadata publication. Backup packs still contain full
 portable bytes and restore reconstructs the segmented layout. See

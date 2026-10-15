@@ -4,11 +4,13 @@
 #include <memory>
 #include <mutex>
 #include <functional>
-namespace leveldb {class DB;class Cache;class FilterPolicy;class Env;}
+namespace leveldb {class DB;class Cache;class FilterPolicy;class Env;struct ReadOptions;}
 namespace forkfs {
-// One upstream LevelDB per repository. Objects are immutable; heads and the
-// sequence/counts are changed atomically with the same synchronous WriteBatch.
+// Repository coordinator: independent ObjectStore plus an unwrapped LevelDB
+// metadata index. Sync object data before atomically publishing index/head changes.
 struct StoreIoMetrics;
+class ObjectStore;
+namespace replay {struct Batch;}
 class LevelStore {
 public:
     static void create(const std::string& path);
@@ -47,6 +49,12 @@ private:
     LevelStore(const std::string& path,bool initialize,size_t object_cache_bytes);
     bool read(const std::string& key,std::string& value) const;
     void healthy() const;
+    std::string logical_value(const leveldb::ReadOptions&,const std::string& key,const std::string& physical) const;
+    std::string object_payload(const leveldb::ReadOptions&,const std::string& id) const;
+    void publish(const replay::Batch& batch);
+    void verify_recovery_graph(const leveldb::ReadOptions&,uint64_t sequence) const;
+    std::atomic<unsigned> physical_format_=5;
+    std::unique_ptr<ObjectStore> object_store_;
     // Serializes publication, including root validation and durable DB::Write.
     mutable std::mutex writer_mutex_;
     struct RevisionIndex {
@@ -68,9 +76,6 @@ private:
     std::string replay_base_,replay_head_;
     std::string replay_hash(uint64_t sequence) const;
     std::unique_ptr<leveldb::Cache> cache_;
-    std::unique_ptr<leveldb::Cache> object_cache_;
-    size_t object_cache_bytes_;
-    mutable std::atomic<uint64_t> cache_hits_=0,cache_misses_=0;
     std::unique_ptr<const leveldb::FilterPolicy> filter_;
     std::unique_ptr<StoreIoMetrics> metrics_;
     std::unique_ptr<leveldb::Env> env_;

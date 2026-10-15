@@ -1,6 +1,6 @@
 #include "revision.h"
 #include "level_store.h"
-#include "segment_db.h"
+#include "object_store.h"
 #include "replay_format.h"
 #include "replay_validation.h"
 #ifndef __APPLE__
@@ -100,14 +100,16 @@ void LevelStore::create(const std::string& path) {
     }
 }
 LevelStore::LevelStore(const std::string& path,size_t object_cache_bytes):LevelStore(path,false,object_cache_bytes) {}
-LevelStore::LevelStore(const std::string& path,bool initialize,size_t object_cache_bytes):object_cache_bytes_(object_cache_bytes) {
+LevelStore::LevelStore(const std::string& path,bool initialize,size_t object_cache_bytes) {
     leveldb::Options options;options.create_if_missing=initialize;options.error_if_exists=initialize;
     metrics_=std::make_unique<StoreIoMetrics>();env_=std::make_unique<TimedEnv>(*metrics_);options.env=env_.get();
     options.paranoid_checks=true;options.compression=leveldb::kNoCompression;
     cache_.reset(leveldb::NewLRUCache(16*1024*1024));filter_.reset(leveldb::NewBloomFilterPolicy(10));
-    object_cache_.reset(leveldb::NewLRUCache(object_cache_bytes));
+    object_store_=std::make_unique<ObjectStore>(path,object_cache_bytes);
     options.block_cache=cache_.get();options.filter_policy=filter_.get();
-    leveldb::DB* raw=nullptr;status(leveldb::DB::Open(options,path,&raw),"open LevelDB");db_=SegmentDB::wrap(std::unique_ptr<leveldb::DB>(raw),path,initialize);
+    leveldb::DB* raw=nullptr;status(leveldb::DB::Open(options,path,&raw),"open LevelDB");db_.reset(raw);
+    if(!initialize){std::string format;status(db_->Get({},"M/format",&format),"read physical format");
+        need(format.size()==8 && format.starts_with("FFLDB00") && format[7]>='1' && format[7]<='6',"unsupported repository format");physical_format_=format[7]-'0';}
     if(initialize) {
         std::string repository(16,0);int fd=open("/dev/urandom",O_RDONLY|O_CLOEXEC);
         if(fd<0)throw std::system_error(errno,std::generic_category(),"repository entropy");
@@ -117,9 +119,9 @@ LevelStore::LevelStore(const std::string& path,bool initialize,size_t object_cac
             if(n<0 && errno==EINTR)continue;
             if(n<=0){int saved=n<0?errno:EIO;close(fd);throw std::system_error(saved,std::generic_category(),"repository entropy");}done+=n;
         }
-        close(fd);leveldb::WriteBatch batch;batch.Put("M/format","FFLDB001");batch.Put("M/repository",repository);
+        close(fd);replay::Batch batch;batch.Put("M/format","FFLDB001");batch.Put("M/repository",repository);
         batch.Put("M/sequence",integer(0));batch.Put("M/objects",integer(0));batch.Put("M/roots",integer(0));
-        leveldb::WriteOptions write;write.sync=true;status(db_->Write(write,&batch),"initialize LevelDB repository");
+        publish(batch);
     }
     std::string value;need(read("M/format",value) && (value=="FFLDB001" || value=="FFLDB002"),"unsupported LevelDB repository format");
     const bool replay_format=value=="FFLDB002";
@@ -140,6 +142,68 @@ LevelStore::LevelStore(const std::string& path,bool initialize,size_t object_cac
     }
 }
 LevelStore::~LevelStore()=default;
+// The coordinator is the only component that knows both object bytes and DB
+// indexes. LevelDB itself is unwrapped and receives metadata-only WriteBatches.
+std::string LevelStore::object_payload(const leveldb::ReadOptions& options,const std::string& id) const {
+    std::string location;status(db_->Get(options,"O/"+id,&location),"read recovery object");
+    return logical_value(options,"O/"+id,location);
+}
+std::string LevelStore::logical_value(const leveldb::ReadOptions& options,const std::string& key,const std::string& value) const {
+    if(key=="M/format"){
+        need(value.size()==8 && value.starts_with("FFLDB00") && value[7]>='1' && value[7]<='6',"invalid physical format");
+        return ((value[7]-'0')%2)?"FFLDB001":"FFLDB002";
+    }
+    if(key.starts_with("O/")){
+        need(key.size()==34,"invalid object key");std::string result;
+        if(physical_format_<=2)result=value;
+        else if(physical_format_<=4 && value.starts_with("I")){need(value.size()<=257,"oversized legacy inline object");result=value.substr(1);}
+        else {
+            if(physical_format_>=5)need(value.starts_with("FFOBJ002"),"object payload is forbidden in metadata index");
+            result=object_store_->read(key.substr(2),value,[&](const std::string& hash)->std::optional<std::string>{
+                std::string location;auto found=db_->Get(options,"C/"+hash,&location);if(found.IsNotFound())return std::nullopt;status(found,"read chunk location");return location;
+            });
+        }
+        need(replay::hash(result)==key.substr(2),"object checksum mismatch");return result;
+    }
+    if(key.starts_with("L/") && physical_format_>=3){
+        replay::Input in{value};need(in.take(8)=="FFLOGR01","invalid reference log");auto seq=in.integer(8);auto previous=in.take(32);auto count=in.integer(4);need(count>0 && count<=8195,"invalid reference log operation count");
+        std::vector<replay::Op> ops;
+        for(uint64_t i=0;i<count;++i){auto kind=in.integer(1),ks=in.integer(4),vs=in.integer(4);need(kind<=1 && ks>0 && ks<=1026 && vs<=256*1024,"invalid reference log lengths");replay::Op op{in.take(ks),in.take(vs),kind==0};
+            if(op.key.starts_with("O/")){need(!op.erase && op.value.empty(),"reference log contains object payload");op.value=object_payload(options,op.key.substr(2));}ops.push_back(std::move(op));}
+        in.end();auto result="T"+integer(seq)+previous+replay::encode(ops);replay::transaction(result);need(key==replay::logkey(seq),"reference log sequence mismatch");return result;
+    }
+    return value;
+}
+void LevelStore::publish(const replay::Batch& input){
+    // Caller owns the writer lock, or the unpublished recovery destination.
+    try{
+        leveldb::WriteBatch metadata;ObjectStore::Locations pending;auto next_format=physical_format_.load();
+        leveldb::ReadOptions read;read.verify_checksums=true;
+        auto lookup=[&](const std::string& hash)->std::optional<std::string>{std::string location;auto found=db_->Get(read,"C/"+hash,&location);if(found.IsNotFound())return std::nullopt;status(found,"read chunk index");return location;};
+        for(const auto& op:input.ops){
+            need(!op.key.starts_with("C/"),"chunk index is coordinator-owned");
+            if(op.erase){need(!op.key.starts_with("O/") && !op.key.starts_with("L/"),"immutable data deletion unsupported");metadata.Delete(op.key);continue;}
+            if(op.key.starts_with("O/")){
+                need(physical_format_>=5,"legacy object layout is read/export-only; migrate with backup/replay");
+                auto location=object_store_->prepare(op.key.substr(2),op.value,lookup,pending);metadata.Put(op.key,location);
+            }else if(op.key.starts_with("L/")){
+                need(physical_format_>=5,"legacy replay writes are disabled");
+                auto tx=replay::transaction(op.value);need(op.key==replay::logkey(tx.sequence),"invalid log key");for(auto& item:tx.ops)if(item.key.starts_with("O/"))item.value.clear();
+                metadata.Put(op.key,"FFLOGR01"+integer(tx.sequence)+tx.previous+replay::encode(tx.ops));
+            }else if(op.key=="M/format"){
+                need(op.value=="FFLDB001" || op.value=="FFLDB002","invalid logical format");
+                next_format=((physical_format_.load()-1)/2)*2+(op.value=="FFLDB001"?1:2);
+                metadata.Put(op.key,"FFLDB00"+std::to_string(next_format));
+            }else metadata.Put(op.key,op.value);
+        }
+        for(const auto& [hash,location]:pending)metadata.Put("C/"+hash,location);
+        object_store_->sync();fault("segment_before_metadata");
+#ifdef FORKFS_TEST_FAULTS
+        const char* injected=std::getenv("FORKFS_TEST_SEGMENT_ERROR");if(injected && !strcmp(injected,"metadata"))throw std::system_error(EIO,std::generic_category(),"injected metadata publication failure");
+#endif
+        leveldb::WriteOptions options;options.sync=true;status(db_->Write(options,&metadata),"publish metadata indexes");physical_format_=next_format;fault("segment_after_metadata");
+    }catch(...){object_store_->abandon();poisoned_=true;throw;}
+}
 void LevelStore::healthy() const {need(!poisoned_,"LevelDB store requires reopen after write failure");}
 bool LevelStore::read(const std::string& key,std::string& value) const {
     healthy();uint64_t epoch=0;
@@ -150,7 +214,7 @@ bool LevelStore::read(const std::string& key,std::string& value) const {
         if(it!=root_cache_.end()){++metrics_->root_cache_hits;value=it->second.value;return it->second.found;}
     }
     leveldb::ReadOptions options;options.verify_checksums=true;
-    auto begin=Clock::now();auto s=db_->Get(options,key,&value);auto ns=elapsed(begin);
+    auto begin=Clock::now();auto s=db_->Get(options,key,&value);if(s.ok())value=logical_value(options,key,value);auto ns=elapsed(begin);
     if(key.starts_with("R/")){++metrics_->root_get_calls;metrics_->root_get_ns+=ns;if(s.IsNotFound())++metrics_->root_misses;}
     else if(key.starts_with("O/")){++metrics_->object_get_calls;metrics_->object_get_ns+=ns;if(s.IsNotFound())++metrics_->object_misses;}
     else {++metrics_->meta_get_calls;metrics_->meta_get_ns+=ns;}
@@ -170,30 +234,11 @@ Id LevelStore::root(const std::string& key) const {std::string value;need(read("
 bool LevelStore::contains(const std::string& key) const {std::string value;return read("R/"+key,value);}
 Bytes LevelStore::object(const Id& object_id) const {
     healthy();auto key=bytes(object_id);
-    // Only verified immutable payloads enter this repository-local cache.
-    // RAII releases the pin even if copying the payload throws.
-    auto release=[this](leveldb::Cache::Handle* h){object_cache_->Release(h);};
-    using Pin=std::unique_ptr<leveldb::Cache::Handle,decltype(release)>;
-    if(auto* handle=object_cache_->Lookup(key)) {
-        Pin pin(handle,release);++cache_hits_;
-        return *static_cast<const Bytes*>(object_cache_->Value(handle));
-    }
-    ++cache_misses_;
-    std::string value;need(read("O/"+bytes(object_id),value),"object not indexed");
-    Bytes result(value.begin(),value.end());need(Journal::object_id(result)==object_id,"LevelDB object hash mismatch");
-    size_t charge=result.size()+sizeof(Bytes)+32;
-    // LevelDB shards its LRU into 16 parts. Do not admit objects larger than
-    // one shard; a large file must not consume an entire shard by itself.
-    if(charge<=object_cache_bytes_/16) {
-        auto copy=std::make_unique<Bytes>(result);
-        Pin pin(object_cache_->Insert(key,copy.get(),charge,
-            [](const leveldb::Slice&,void* p){delete static_cast<Bytes*>(p);}),release);
-        copy.release();
-    }
-    return result;
+    auto value=object_store_->cached(key,[&]{std::string result;need(read("O/"+key,result),"object not indexed");return result;});
+    healthy();return Bytes(value.begin(),value.end());
 }
 LevelStore::CacheStats LevelStore::cache_stats() const {
-    return {cache_hits_.load(),cache_misses_.load(),object_cache_->TotalCharge()};
+    auto stats=object_store_->cache_stats();return {stats.hits,stats.misses,stats.charge};
 }
 std::vector<std::string> LevelStore::keys(const std::string& prefix) const {
     healthy();std::vector<std::string> result;auto search="R/"+prefix;
@@ -205,7 +250,7 @@ std::vector<std::string> LevelStore::keys(const std::string& prefix) const {
     status(it->status(),"scan LevelDB roots");return result;
 }
 void LevelStore::transact(uint64_t expected,const std::vector<Mutation>& changes) {
-    auto begin=Clock::now();healthy();need(expected==sequence_,"transaction conflict: sequence changed");
+    auto begin=Clock::now();healthy();need(physical_format_>=5,"legacy object layout is read/export-only; migrate with backup/replay");need(expected==sequence_,"transaction conflict: sequence changed");
     need(!changes.empty() && changes.size()<=4096,"LevelDB batch requires 1..4096 mutations");
     // Validate and hash caller-owned immutable input before taking the writer
     // lock. No mutable roots/counters are read and no database mutation occurs here.
@@ -235,24 +280,23 @@ void LevelStore::transact(uint64_t expected,const std::vector<Mutation>& changes
         if(hash){if(!exists)++roots;}
         else {need(exists,"cannot delete absent root");--roots;}
     }
-    leveldb::WriteBatch batch;
+    replay::Batch batch;
     for(const auto& [hash,value]:values) {
         std::string previous;
         if(read("O/"+bytes(hash),previous))need(previous.size()==value->size() && (previous.empty() || !memcmp(previous.data(),value->data(),value->size())),"immutable object collision/corruption");
-        else {batch.Put("O/"+bytes(hash),leveldb::Slice(reinterpret_cast<const char*>(value->data()),value->size()));++objects;}
+        else {batch.Put("O/"+bytes(hash),std::string(value->begin(),value->end()));++objects;}
     }
     for(const auto& [key,hash]:updates){if(hash)batch.Put("R/"+key,bytes(*hash));else batch.Delete("R/"+key);}
     batch.Put("M/sequence",integer(sequence_+1));batch.Put("M/objects",integer(objects));batch.Put("M/roots",integer(roots));
     std::string next_replay_head;
     if(replay_enabled_) {
-        replay::Capture capture;status(batch.Iterate(&capture),"capture replay transaction");
-        auto record="T"+integer(sequence_+1)+replay_head_+replay::encode(capture.ops);
+        auto record="T"+integer(sequence_+1)+replay_head_+replay::encode(batch.ops);
         next_replay_head=replay::hash(record);
         batch.Put(replay::logkey(sequence_+1),record);batch.Put("M/replay/head",next_replay_head);
     }
-    fault("leveldb_before_write");leveldb::WriteOptions options;options.sync=true;
+    fault("leveldb_before_write");
     metrics_->prepare_ns+=prepared_ns+elapsed(locked_begin);auto write_begin=Clock::now();
-    auto s=db_->Write(options,&batch);metrics_->write_ns+=elapsed(write_begin);if(!s.ok()){poisoned_=true;status(s,"commit LevelDB batch");}
+    publish(batch);metrics_->write_ns+=elapsed(write_begin);
     if(replay_enabled_)replay_head_=std::move(next_replay_head);
     ++metrics_->transactions;sequence_=sequence_+1;objects_=objects;roots_=roots;fault("leveldb_after_write");
 }
@@ -291,18 +335,20 @@ void LevelStore::verify() const {
     if(logged){replay_seq=number(start_value);status(db_->Get(options,"M/replay/base",&chain),"verify replay base");status(db_->Get(options,"M/replay/head",&expected_head),"verify replay head");need(chain.size()==32 && expected_head.size()==32,"invalid replay hashes");}
     std::string format,identity;
     status(db_->Get(options,"M/format",&format),"verify format");status(db_->Get(options,"M/repository",&identity),"verify identity");
-    need(format==(logged?"FFLDB002":"FFLDB001") && identity.size()==16,"invalid repository format/identity");
+    format=logical_value(options,"M/format",format);need(format==(logged?"FFLDB002":"FFLDB001") && identity.size()==16,"invalid repository format/identity");
     uint64_t roots=0,objects=0;
     std::unique_ptr<leveldb::Iterator> it(db_->NewIterator(options));
     for(it->SeekToFirst();it->Valid();it->Next()) {
         auto key=it->key().ToString(),value=it->value().ToString();
+        if(key.starts_with("C/")){need(physical_format_>=3 && key.size()==34,"invalid chunk index key");(void)object_store_->read_chunk(key.substr(2),value);continue;}
+        value=logical_value(options,key,value);
         if(key.starts_with("L/")) {
             need(logged && replay_seq!=UINT64_MAX && key==replay::logkey(replay_seq+1),"replay log gap or unexpected record");
             auto tx=replay::transaction(value);need(tx.sequence==++replay_seq && tx.previous==chain,"replay log chain mismatch");chain=replay::hash(value);
         } else if(key.starts_with("O/")){need(key.size()==34,"invalid object key");need(Journal::object_id(Bytes(value.begin(),value.end()))==id(key.substr(2)),"object checksum mismatch");++objects;}
         else if(key.starts_with("R/")) {
             auto reference=id(value);std::string object;
-            status(db_->Get(options,"O/"+bytes(reference),&object),"verify root reference");
+            try{object=object_payload(options,bytes(reference));}catch(const std::exception& e){throw std::runtime_error(std::string("verify root reference: ")+e.what());}
             need(Journal::object_id(Bytes(object.begin(),object.end()))==reference,"root object checksum mismatch");++roots;
         } else need(key=="M/format" || key=="M/repository" || key=="M/sequence" || key=="M/objects" || key=="M/roots" || (logged && (key=="M/replay/start" || key=="M/replay/base" || key=="M/replay/head")),"unknown metadata key");
     }
@@ -339,15 +385,6 @@ void sync_parent(const std::string& path){
     if(fd<0)throw std::system_error(errno,std::generic_category(),"open replay parent");
     int rc=fsync(fd),saved=errno;close(fd);if(rc<0)throw std::system_error(saved,std::generic_category(),"sync replay parent");
 }
-void verify_recovery_graph(leveldb::DB& db,const leveldb::ReadOptions& options,uint64_t sequence){
-    replay::Graph graph([&](const Id& object_id){
-        std::string value;status(db.Get(options,"O/"+bytes(object_id),&value),"read recovery object");
-        Bytes b(value.begin(),value.end());need(Journal::object_id(b)==object_id,"recovery object checksum mismatch");return b;
-    },sequence);
-    std::unique_ptr<leveldb::Iterator> it(db.NewIterator(options));
-    for(it->Seek("R/");it->Valid() && it->key().starts_with("R/");it->Next())graph.root(it->key().ToString(),it->value().ToString());
-    status(it->status(),"scan recovery roots");
-}
 void publish_directory(const std::string& from,const std::string& to){
 #ifdef __APPLE__
     int rc=renamex_np(from.c_str(),to.c_str(),RENAME_EXCL);
@@ -357,6 +394,15 @@ void publish_directory(const std::string& from,const std::string& to){
     if(rc<0)throw std::system_error(errno,std::generic_category(),"publish recovered repository (destination must not exist)");
     sync_parent(to);
 }
+}
+void LevelStore::verify_recovery_graph(const leveldb::ReadOptions& options,uint64_t sequence) const {
+    replay::Graph graph([&](const Id& object_id){
+        auto value=object_payload(options,bytes(object_id));
+        Bytes b(value.begin(),value.end());need(Journal::object_id(b)==object_id,"recovery object checksum mismatch");return b;
+    },sequence);
+    std::unique_ptr<leveldb::Iterator> it(db_->NewIterator(options));
+    for(it->Seek("R/");it->Valid() && it->key().starts_with("R/");it->Next())graph.root(it->key().ToString(),it->value().ToString());
+    status(it->status(),"scan recovery roots");
 }
 std::string LevelStore::replay_hash(uint64_t seq) const {
     need(replay_enabled_ && seq>=replay_start_ && seq<=sequence_,"sequence outside retained replay range");
@@ -370,8 +416,8 @@ uint64_t LevelStore::backup(const std::string& archive,std::string* chain_hash){
         std::string entropy(32,0);int fd=open("/dev/urandom",O_RDONLY|O_CLOEXEC);if(fd<0)throw std::system_error(errno,std::generic_category(),"replay anchor entropy");
         size_t done=0;while(done<entropy.size()){auto n=::read(fd,entropy.data()+done,entropy.size()-done);if(n<0 && errno==EINTR)continue;if(n<=0){close(fd);throw std::runtime_error("replay anchor entropy failed");}done+=n;}close(fd);
         auto anchor=replay::hash("forkfs.replay.anchor.v1"+repository_+integer(sequence_)+entropy);
-        leveldb::WriteBatch batch;batch.Put("M/format","FFLDB002");batch.Put("M/replay/start",integer(sequence_));batch.Put("M/replay/base",anchor);batch.Put("M/replay/head",anchor);
-        leveldb::WriteOptions write;write.sync=true;fault("replay_enable_before_write");auto s=db_->Write(write,&batch);if(!s.ok()){poisoned_=true;status(s,"enable replay");}fault("replay_enable_after_write");
+        replay::Batch batch;batch.Put("M/format","FFLDB002");batch.Put("M/replay/start",integer(sequence_));batch.Put("M/replay/base",anchor);batch.Put("M/replay/head",anchor);
+        fault("replay_enable_before_write");publish(batch);fault("replay_enable_after_write");
         replay_enabled_=true;replay_start_=sequence_;replay_base_=anchor;replay_head_=anchor;
     }
     auto release=[this](const leveldb::Snapshot* s){db_->ReleaseSnapshot(s);};
@@ -379,15 +425,15 @@ uint64_t LevelStore::backup(const std::string& archive,std::string* chain_hash){
     leveldb::ReadOptions options;options.verify_checksums=true;options.snapshot=snapshot.get();
     std::string identity;status(db_->Get(options,"M/repository",&identity),"backup identity");
     replay::Header header{'B',identity,sequence_,sequence_,replay_head_,replay_head_};lock.unlock();
-    verify_recovery_graph(*db_,options,header.to);
+    verify_recovery_graph(options,header.to);
 #ifdef FORKFS_TEST_BACKUP
     extern void test_backup_snapshot();test_backup_snapshot();
 #endif
     replay::Writer out(archive,header);std::unique_ptr<leveldb::Iterator> it(db_->NewIterator(options));
     for(it->SeekToFirst();it->Valid();it->Next()){
         auto key=it->key().ToString();
-        if(key.starts_with("L/") || key.starts_with("M/replay/"))continue;
-        auto value=it->value().ToString();
+        if(key.starts_with("C/") || key.starts_with("L/") || key.starts_with("M/replay/"))continue;
+        auto value=logical_value(options,key,it->value().ToString());
         auto row="B"+replay::le(key.size(),4)+replay::le(value.size(),4)+key+value;
         replay::base_row(row);out.frame(row);
     }
@@ -399,9 +445,9 @@ uint64_t LevelStore::export_replay(uint64_t after,const std::string& archive,std
     std::unique_ptr<const leveldb::Snapshot,decltype(release)> snapshot(db_->GetSnapshot(),release);
     leveldb::ReadOptions options;options.verify_checksums=true;options.snapshot=snapshot.get();
     std::string identity;status(db_->Get(options,"M/repository",&identity),"export replay identity");
-    replay::Header header{'I',identity,after,sequence_,previous,replay_head_};lock.unlock();verify_recovery_graph(*db_,options,header.to);replay::Writer out(archive,header);
+    replay::Header header{'I',identity,after,sequence_,previous,replay_head_};lock.unlock();verify_recovery_graph(options,header.to);replay::Writer out(archive,header);
     uint64_t seq=after;auto head=previous;
-    while(seq<header.to){std::string record;status(db_->Get(options,replay::logkey(++seq),&record),"export replay record");
+    while(seq<header.to){std::string record;status(db_->Get(options,replay::logkey(++seq),&record),"export replay record");record=logical_value(options,replay::logkey(seq),record);
         auto tx=replay::transaction(record);need(tx.sequence==seq && tx.previous==head,"retained replay chain mismatch");out.frame(record);head=replay::hash(record);
     }
     need(head==header.head,"retained replay end mismatch");out.finish();sync_parent(archive);if(chain_hash)*chain_hash=header.head;return header.to;
@@ -461,7 +507,7 @@ uint64_t LevelStore::restore(const std::vector<std::string>& archives,const std:
     for(const auto& step:plan){replay_archive(step.archive,repository,step.endpoint);fault("restore_after_step");}
     {
         LevelStore recovered(repository);recovered.verify();leveldb::ReadOptions options;options.verify_checksums=true;
-        verify_recovery_graph(*recovered.db_,options,recovered.sequence_);
+        recovered.verify_recovery_graph(options,recovered.sequence_);
         need(recovered.sequence_==target.sequence && recovered.repository_==recovery_hex(recovery_unhex(target.repository,16)) &&
              recovered.replay_head_==recovery_unhex(target.chain_hash,32),"restore did not reach requested checkpoint");
     }
@@ -484,7 +530,7 @@ uint64_t LevelStore::replay_archive(const std::string& archive,const std::string
             need(S_ISDIR(st.st_mode),"backup destination is not a repository directory");LevelStore existing(destination);
             if(until)need(existing.sequence_<=stop,"destination is ahead of recovery point");
             std::string identity;need(existing.read("M/repository",identity) && identity==header.repository && existing.replay_hash(header.to)==header.head,"backup destination is not this recovery lineage");
-            existing.verify();leveldb::ReadOptions options;options.verify_checksums=true;verify_recovery_graph(*existing.db_,options,existing.sequence_);return existing.sequence_;
+            existing.verify();leveldb::ReadOptions options;options.verify_checksums=true;existing.verify_recovery_graph(options,existing.sequence_);return existing.sequence_;
         }
         need(errno==ENOENT,"backup destination is inaccessible");
         auto staging=destination+".restore-XXXXXX";if(!mkdtemp(staging.data()))throw std::system_error(errno,std::generic_category(),"create restore staging directory");
@@ -498,8 +544,8 @@ uint64_t LevelStore::replay_archive(const std::string& archive,const std::string
         {
             LevelStore target(staging,true,default_object_cache_bytes);
             replay::Reader in(file);need(in.header.encode()==header.encode(),"archive changed during replay");
-            leveldb::WriteOptions write;write.sync=true;leveldb::WriteBatch batch;size_t pending=0;
-            auto flush=[&]{if(pending){status(target.db_->Write(write,&batch),"restore backup rows");batch.Clear();pending=0;fault("replay_base_rows");}};
+            replay::Batch batch;size_t pending=0;
+            auto flush=[&]{if(pending){target.publish(batch);batch.Clear();pending=0;fault("replay_base_rows");}};
             std::string previous;std::set<std::string> metadata;
             while(!in.ended){auto payload=in.next();if(in.ended)break;auto op=replay::base_row(payload);
                 need(previous.empty() || previous<op.key,"unordered backup rows");previous=op.key;
@@ -510,7 +556,7 @@ uint64_t LevelStore::replay_archive(const std::string& archive,const std::string
             std::string value;need(target.read("M/repository",value) && value==header.repository,"backup repository mismatch");
             need(target.read("M/sequence",value) && number(value)==header.to,"backup sequence mismatch");
             batch.Put("M/replay/start",integer(header.to));batch.Put("M/replay/base",header.head);batch.Put("M/replay/head",header.head);
-            status(target.db_->Write(write,&batch),"restore backup replay anchor");target.verify();leveldb::ReadOptions options;options.verify_checksums=true;verify_recovery_graph(*target.db_,options,header.to);fault("replay_base_before_publish");
+            target.publish(batch);target.verify();leveldb::ReadOptions options;options.verify_checksums=true;target.verify_recovery_graph(options,header.to);fault("replay_base_before_publish");
         }
         sync_parent(staging+"/CURRENT");publish_directory(staging,destination);fault("replay_base_after_publish");return header.to;
     }
@@ -518,7 +564,7 @@ uint64_t LevelStore::replay_archive(const std::string& archive,const std::string
     LevelStore target(destination);std::lock_guard lock(target.writer_mutex_);target.healthy();
     if(until)need(target.sequence_<=stop,"destination is ahead of recovery point");
     target.verify();
-    leveldb::ReadOptions graph_options;graph_options.verify_checksums=true;verify_recovery_graph(*target.db_,graph_options,target.sequence_);
+    leveldb::ReadOptions graph_options;graph_options.verify_checksums=true;target.verify_recovery_graph(graph_options,target.sequence_);
     std::string identity;need(target.read("M/repository",identity) && identity==header.repository,"replay repository identity mismatch");
     need(target.replay_hash(header.from)==header.previous,"replay base differs from destination");
     need(target.sequence_>=header.from,"replay gap at destination");
@@ -529,7 +575,7 @@ uint64_t LevelStore::replay_archive(const std::string& archive,const std::string
         if(tx.sequence>stop)continue;
         if(tx.sequence<=target.sequence_){need(target.replay_hash(tx.sequence)==next,"replay diverges from already applied transaction");continue;}
         need(tx.sequence==target.sequence_+1 && tx.previous==target.replay_head_,"replay gap or divergent destination");
-        uint64_t objects=target.objects_,roots=target.roots_;std::set<std::string> new_objects;leveldb::WriteBatch batch;
+        uint64_t objects=target.objects_,roots=target.roots_;std::set<std::string> new_objects;replay::Batch batch;
         for(const auto& op:tx.ops)if(op.key.starts_with("O/")){
             std::string old;need(!target.read(op.key,old),"replay object already exists");new_objects.insert(op.key);++objects;
         }
@@ -553,7 +599,7 @@ uint64_t LevelStore::replay_archive(const std::string& archive,const std::string
         },tx.sequence);
         for(const auto& op:tx.ops)if(!op.erase)graph.root(op.key,op.value);
         batch.Put(replay::logkey(tx.sequence),payload);batch.Put("M/replay/head",next);
-        leveldb::WriteOptions write;write.sync=true;fault("replay_before_write");status(target.db_->Write(write,&batch),"apply replay transaction");fault("replay_after_write");
+        fault("replay_before_write");target.publish(batch);fault("replay_after_write");
         target.sequence_=tx.sequence;target.objects_=objects;target.roots_=roots;target.replay_head_=next;
     }
     need(seq==header.to && head==header.head,"incomplete replay range during apply");
@@ -580,7 +626,7 @@ std::string LevelStore::revision_point(const std::string& name) const {
     std::string revision,descriptor;
     status(db_->Get(options,key,&revision),"read revision recovery root");
     need(revision.size()==32,"invalid revision recovery root");
-    status(db_->Get(options,"O/"+revision,&descriptor),"read revision recovery descriptor");
+    descriptor=object_payload(options,revision);
     need(replay::hash(descriptor)==revision,"revision recovery descriptor checksum mismatch");
     auto record=RevisionRecord::decode(Bytes(descriptor.begin(),descriptor.end()));
     auto source=record.source_sequence;need(source<end,"invalid revision source sequence");
@@ -601,7 +647,7 @@ std::string LevelStore::revision_point(const std::string& name) const {
         it->Seek(replay::logkey(index.through+1));
         while(index.through<end){
             need(it->Valid() && it->key().ToString()==replay::logkey(index.through+1),"missing retained revision event log");
-            auto record=it->value().ToString();auto tx=replay::transaction(record);
+            auto record=logical_value(options,it->key().ToString(),it->value().ToString());auto tx=replay::transaction(record);
             need(tx.sequence==index.through+1 && tx.previous==index.head,"invalid revision event log chain");
             auto head=replay::hash(record);
             for(const auto& op:tx.ops)if(op.key==key && !op.erase && op.value==revision){

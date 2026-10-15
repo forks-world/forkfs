@@ -25,12 +25,12 @@ int main(){auto temp=(std::filesystem::temp_directory_path()/"ff-segments-XXXXXX
         store.export_replay(base,temp+"/delta.pack");store.verify();
     }
     {
-        auto db=raw(path);CHECK(get(*db,"M/format")=="FFLDB004");
+        auto db=raw(path);CHECK(get(*db,"M/format")=="FFLDB006");
         std::unique_ptr<leveldb::Iterator> it(db->NewIterator({}));unsigned chunks=0,objects=0,logs=0;
         for(it->SeekToFirst();it->Valid();it->Next()){
             auto k=it->key().ToString(),v=it->value().ToString();
             if(k.starts_with("C/")){++chunks;CHECK(v.size()==20);}
-            if(k.starts_with("O/")){++objects;CHECK(v.starts_with("FFOBJ001") && v.size()==148);}
+            if(k.starts_with("O/")){++objects;CHECK(v.starts_with("FFOBJ002") && v.size()==148);}
             if(k.starts_with("L/")){++logs;CHECK(v.starts_with("FFLOGR01") && v.size()<1024);}
             CHECK(v.find(std::string(changed.begin()+70000,changed.begin()+70100))==std::string::npos);
         }
@@ -40,7 +40,27 @@ int main(){auto temp=(std::filesystem::temp_directory_path()/"ff-segments-XXXXXX
     {LevelStore store(target);CHECK(store.object(store.root("head"))==changed);CHECK(store.object(first_id)==first);store.verify();}
     // Reopen appends to the same segment; tiny values remain inline.
     auto previous_size=physical_size(path);{LevelStore store(path);auto next=changed;next.back()^=1;store.transact(store.sequence(),{{"head",next},{"tiny",Bytes{0,255}}});store.verify();}
-    CHECK(physical_size(path)-previous_size==65536+44);
+    CHECK(physical_size(path)-previous_size==65536+44+2+44); // Changed block plus packed tiny object.
+    {
+        auto db=raw(path);auto hash=replay::hash(std::string("\0\xff",2));auto descriptor=get(*db,"O/"+hash);
+        CHECK(descriptor.starts_with("FFOBJ002") && descriptor.size()==52);
+        auto location=get(*db,"C/"+descriptor.substr(20,32));CHECK(location.size()==20);
+    }
+    // Empty and boundary-sized objects all go through ObjectStore; the index
+    // contains descriptors, never an inline payload, regardless of size.
+    auto small=temp+"/small";LevelStore::create(small);
+    for(size_t n:{0u,1u,255u,256u,257u,65535u,65536u,65537u}){
+        Bytes value(n,0x73);{LevelStore store(small);store.transact(store.sequence(),{{"head",value}});CHECK(store.object(store.root("head"))==value);store.verify();}
+        auto db=raw(small);auto descriptor=get(*db,"O/"+replay::hash(std::string(value.begin(),value.end())));
+        CHECK(descriptor.starts_with("FFOBJ002") && descriptor.size()==20+32*std::max<size_t>(1,(n+65535)/65536));
+    }
+    // Read/export compatibility with the discarded adapter format.
+    auto adapter=temp+"/adapter";std::filesystem::copy(target,adapter,std::filesystem::copy_options::recursive);
+    {auto db=raw(adapter);put(*db,"M/format","FFLDB004");std::unique_ptr<leveldb::Iterator> it(db->NewIterator({}));
+        for(it->Seek("O/");it->Valid() && it->key().starts_with("O/");it->Next()){auto value=it->value().ToString();value.replace(0,8,"FFOBJ001");put(*db,it->key().ToString(),value);}}
+    {LevelStore store(adapter);store.verify();CHECK(store.object(store.root("head"))==changed);rejects([&]{store.transact(store.sequence(),{{"head",first}});});store.backup(temp+"/adapter.pack");}
+    LevelStore::replay_archive(temp+"/adapter.pack",temp+"/adapter-migrated");
+    {LevelStore store(temp+"/adapter-migrated");CHECK(store.object(store.root("head"))==changed);store.transact(store.sequence(),{{"head",first}});store.verify();}
     // Independently mutate physical chunk locations/data, bypassing archive checksums.
     for(unsigned kind=0;kind<7;++kind){auto copy=temp+"/bad-"+std::to_string(kind);std::filesystem::copy(target,copy,std::filesystem::copy_options::recursive);
         auto file=copy+"/DATA-1.seg";
@@ -59,9 +79,10 @@ int main(){auto temp=(std::filesystem::temp_directory_path()/"ff-segments-XXXXXX
     // while retaining object IDs and recovery-chain hashes.
     auto legacy=temp+"/legacy";{
         auto db=raw(legacy,true);put(*db,"M/format","FFLDB001");put(*db,"M/repository",std::string(16,'r'));
-        for(const auto& key:{"M/sequence","M/roots","M/objects"})put(*db,key,replay::le(0));
+        for(const auto& key:{"M/sequence","M/roots","M/objects"})put(*db,key,replay::le(1));
+        auto hash=replay::raw(first_id);put(*db,"O/"+hash,std::string(first.begin(),first.end()));put(*db,"R/head",hash);
     }
-    {LevelStore store(legacy);store.transact(0,{{"head",first}});store.backup(temp+"/legacy.pack");}
+    {LevelStore store(legacy);CHECK(store.object(first_id)==first);rejects([&]{store.transact(1,{{"head",changed}});});store.backup(temp+"/legacy.pack");}
     auto migrated=temp+"/migrated";LevelStore::replay_archive(temp+"/legacy.pack",migrated);
     {LevelStore store(migrated);CHECK(store.root("head")==first_id && store.object(first_id)==first);store.verify();}
     CHECK(physical_size(migrated)>0);
