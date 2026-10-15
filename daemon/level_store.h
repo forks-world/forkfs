@@ -3,6 +3,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <functional>
 namespace leveldb {class DB;class Cache;class FilterPolicy;class Env;}
 namespace forkfs {
 // One upstream LevelDB per repository. Objects are immutable; heads and the
@@ -16,9 +17,16 @@ public:
     ~LevelStore();
     void transact(uint64_t expected,const std::vector<Mutation>& changes);
     // Opt-in retained transaction stream. Backup enables it atomically at a base.
-    uint64_t backup(const std::string& archive);
-    uint64_t export_replay(uint64_t after,const std::string& archive) const;
-    static uint64_t replay_archive(const std::string& archive,const std::string& destination);
+    uint64_t backup(const std::string& archive,std::string* chain_hash=nullptr);
+    uint64_t export_replay(uint64_t after,const std::string& archive,std::string* chain_hash=nullptr) const;
+    struct RecoveryPoint {uint64_t sequence;std::string repository,chain_hash;}; // Hex IDs, as returned by revision_point.
+    static uint64_t replay_archive(const std::string& archive,const std::string& destination,
+                                   std::optional<RecoveryPoint> until=std::nullopt);
+
+    struct RestoreStep {std::string archive;RecoveryPoint endpoint;};
+    static std::vector<RestoreStep> plan_restore(const std::vector<std::string>& archives,const RecoveryPoint& target);
+    static uint64_t restore(const std::vector<std::string>& archives,const std::string& destination,const RecoveryPoint& target,
+                            const std::function<void(const std::string&)>& verify_namespace);
 
     std::vector<unsigned char> object(const std::array<unsigned char,32>& id) const;
     std::array<unsigned char,32> root(const std::string& key) const;
@@ -32,6 +40,7 @@ public:
     uint64_t sequence() const {return sequence_;}
     size_t objects() const {return objects_;}
     size_t roots() const {return roots_;}
+    std::string revision_point(const std::string& name) const;
     std::string repository() const {return repository_;}
     void poison() {poisoned_=true;}
 private:
@@ -40,6 +49,13 @@ private:
     void healthy() const;
     // Serializes publication, including root validation and durable DB::Write.
     mutable std::mutex writer_mutex_;
+    struct RevisionIndex {
+        uint64_t start=0,through=0,event=0;
+        std::string anchor,head,event_head;
+        unsigned matches=0;
+    };
+    mutable std::mutex revision_index_mutex_;
+    mutable std::map<std::pair<std::string,std::string>,RevisionIndex> revision_index_;
     struct RootFact {bool found;std::string value;};
     mutable std::mutex root_cache_mutex_;
     mutable uint64_t root_cache_sequence_=UINT64_MAX;

@@ -1,5 +1,7 @@
+#include "revision.h"
 #include "container.h"
 #include "level_store.h"
+#include "backup_catalog.h"
 #include "namespace.h"
 #include "rpc.h"
 #include <cerrno>
@@ -38,6 +40,12 @@ struct Socket {
             st.st_dev == dev && st.st_ino == ino) unlink(path.c_str());
     }
 };
+std::string json_string(const std::string& value){
+    std::string out="\"";constexpr char digits[]="0123456789abcdef";
+    for(unsigned char c:value){if(c=='"' || c=='\\'){out+='\\';out+=c;}
+        else if(c<32){out+="\\u00";out+=digits[c>>4];out+=digits[c&15];}else out+=c;}
+    return out+'"';
+}
 uint64_t file_number(const std::string& text,int base=10) {
     uint64_t value=0;auto parsed=std::from_chars(text.data(),text.data()+text.size(),value,base);
     if(parsed.ec!=std::errc{} || parsed.ptr!=text.data()+text.size())throw std::runtime_error("invalid file offset/count");
@@ -137,7 +145,14 @@ void serve(forkfs::Container& container, const std::string& path,bool rpc=false)
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--help") {
-            std::cout << "forkfsd backup REPOSITORY ARCHIVE\nforkfsd replay-export REPOSITORY AFTER_SEQUENCE ARCHIVE\nforkfsd replay ARCHIVE DESTINATION\n"
+            std::cout << "forkfsd backup REPOSITORY ARCHIVE\nforkfsd replay-export REPOSITORY AFTER_SEQUENCE ARCHIVE\nforkfsd replay ARCHIVE DESTINATION [--until SEQUENCE REPOSITORY_ID CHAIN_HASH]\n"
+                         "forkfsd catalog-add CATALOG ARCHIVE\n"
+                         "forkfsd catalog-list CATALOG\n"
+                         "forkfsd catalog-revision CATALOG REVISION_NAME\n"
+                         "forkfsd restore-plan --revision NAME --catalog CATALOG\n"
+                         "forkfsd restore DESTINATION --revision NAME --catalog CATALOG\n"
+                         "forkfsd restore-plan SEQUENCE REPOSITORY_ID CHAIN_HASH ARCHIVE... | --catalog CATALOG\n"
+                         "forkfsd restore DESTINATION SEQUENCE REPOSITORY_ID CHAIN_HASH ARCHIVE... | --catalog CATALOG\n"
                          "forkfsd init REPOSITORY_DIRECTORY\nforkfsd check CONTAINER\n"
                          "forkfsd serve CONTAINER --socket PATH [--rpc]\n"
                          "forkfsd request SOCKET COMMAND [ARGS...]\n"
@@ -177,7 +192,9 @@ int main(int argc, char** argv) {
                          "forkfsd fs-unlink CONTAINER PATH\n"
                          "forkfsd fs-rmdir CONTAINER PATH\n"
                          "forkfsd fs-check CONTAINER\n"
+                         "forkfsd fs-snapshot-parents CONTAINER NAME PARENT[,PARENT...] [--world WORLD]\n"
                          "forkfsd fs-snapshot CONTAINER REVISION_NAME [--world WORLD]\n"
+                         "forkfsd fs-revision-point CONTAINER REVISION_NAME\n"
                          "forkfsd fs-restore CONTAINER REVISION_NAME [--world WORLD]\n"
                          "forkfsd fs-fork CONTAINER REVISION_NAME NEW_WORLD\n"
                          "forkfsd fs-worlds CONTAINER\n"
@@ -207,13 +224,54 @@ int main(int argc, char** argv) {
             std::cout.write(result.data(),result.size());
             if(!std::cout)throw std::runtime_error("cannot write RPC output");return 0;
         }
+        if((command=="catalog-add" && argc==4) || (command=="catalog-list" && argc==3)){
+            if(command=="catalog-add")forkfs::BackupCatalog::add(argv[2],argv[3]);
+            auto entries=forkfs::BackupCatalog::entries(argv[2]);std::cout<<"{\"archives\":[";bool first=true;
+            for(const auto& entry:entries){if(!first)std::cout<<',';first=false;
+                std::cout<<"{\"archive\":"<<json_string(entry.archive)<<",\"digest\":"<<json_string(entry.digest)
+                         <<",\"kind\":\""<<entry.kind<<"\",\"from\":"<<entry.from<<",\"size\":"<<entry.size
+                         <<",\"checkpoint\":{\"sequence\":"<<entry.checkpoint.sequence<<",\"repository\":"<<json_string(entry.checkpoint.repository)
+                         <<",\"chain_hash\":"<<json_string(entry.checkpoint.chain_hash)<<"}}";}
+            std::cout<<"]}\n";return 0;
+        }
+        if(command=="catalog-revision" && argc==4){
+            auto revision=forkfs::BackupCatalog::revision_point(argv[2],argv[3]);const auto& point=revision.checkpoint;
+            std::cout<<"{\"revision_id\":"<<json_string(revision.revision_id)<<",\"checkpoint\":{\"sequence\":"<<point.sequence
+                     <<",\"repository\":"<<json_string(point.repository)<<",\"chain_hash\":"<<json_string(point.chain_hash)<<"}}\n";return 0;
+        }
+        if((command=="restore-plan" && argc>=6) || (command=="restore" && argc>=7)){
+            const int offset=command=="restore"?3:2;
+            forkfs::LevelStore::RecoveryPoint target;std::vector<std::string> archives;
+            if(std::string(argv[offset])=="--revision"){
+                if(argc!=offset+4 || std::string(argv[offset+2])!="--catalog")throw std::runtime_error("revision recovery requires --revision NAME --catalog CATALOG");
+                target=forkfs::BackupCatalog::revision_point(argv[offset+3],argv[offset+1]).checkpoint;
+                archives={"--catalog",argv[offset+3]};
+            }else{
+                target={file_number(argv[offset]),argv[offset+1],argv[offset+2]};
+                for(int i=offset+3;i<argc;++i)archives.emplace_back(argv[i]);
+            }
+            if(archives.size()==2 && archives[0]=="--catalog"){
+                auto entries=forkfs::BackupCatalog::entries(archives[1]);archives.clear();
+                for(const auto& entry:entries)archives.push_back(entry.archive);
+            }
+            if(command=="restore")std::cout<<forkfs::LevelStore::restore(archives,argv[2],target,forkfs::Namespace::verify_recovery)<<"\n";
+            else {auto plan=forkfs::LevelStore::plan_restore(archives,target);std::cout<<"{\"steps\":[";bool first=true;
+                for(const auto& step:plan){if(!first)std::cout<<',';first=false;
+                    std::cout<<"{\"archive\":"<<json_string(step.archive)<<",\"sequence\":"<<step.endpoint.sequence
+                             <<",\"repository\":"<<json_string(step.endpoint.repository)<<",\"chain_hash\":"<<json_string(step.endpoint.chain_hash)<<'}';}
+                std::cout<<"]}\n";}return 0;
+        }
         if(command=="backup" && argc==4){forkfs::LevelStore store(argv[2]);std::cout<<store.backup(argv[3])<<"\n";return 0;}
         if(command=="replay-export" && argc==5){forkfs::LevelStore store(argv[2]);std::cout<<store.export_replay(file_number(argv[3]),argv[4])<<"\n";return 0;}
+        if(command=="replay" && argc==8 && std::string(argv[4])=="--until"){
+            forkfs::LevelStore::RecoveryPoint point{file_number(argv[5]),argv[6],argv[7]};
+            std::cout<<forkfs::LevelStore::replay_archive(argv[2],argv[3],point)<<"\n";return 0;
+        }
         if(command=="replay" && argc==4){std::cout<<forkfs::LevelStore::replay_archive(argv[2],argv[3])<<"\n";return 0;}
         std::string view="main";bool revision_view=false;
         int base_argc=4;
         if(command=="fs-init" || command=="fs-check" || command=="fs-worlds" || command=="fs-revisions" || command=="fs-compact" || command=="fs-layout")base_argc=3;
-        if(command=="fs-write" || command=="fs-save" || command=="fs-link" || command=="fs-rename" || command=="fs-fork" || command=="fs-append" || command=="fs-truncate" || command=="fs-symlink" || command=="fs-chmod" || command=="fs-setmtime")base_argc=5;
+        if(command=="fs-snapshot-parents" || command=="fs-write" || command=="fs-save" || command=="fs-link" || command=="fs-rename" || command=="fs-fork" || command=="fs-append" || command=="fs-truncate" || command=="fs-symlink" || command=="fs-chmod" || command=="fs-setmtime")base_argc=5;
         if(command=="fs-read-at" || command=="fs-write-at")base_argc=6;
         if(command.starts_with("fs-") && argc==base_argc+2) {
             std::string selector=argv[argc-2];
@@ -260,11 +318,14 @@ int main(int argc, char** argv) {
             std::cout.write(reinterpret_cast<const char*>(value.data()),value.size());
             if (!std::cout) throw std::runtime_error("cannot write object output");
         } else if (command.starts_with("fs-")) {
-            forkfs::Container container(argv[2]);forkfs::Namespace fs(container,view,revision_view);
+            forkfs::Container container(argv[2],command=="fs-revision-point"?forkfs::Container::OpenMode::RevisionPreview:forkfs::Container::OpenMode::ReadWrite);forkfs::Namespace fs(container,view,revision_view);
+            if(command=="fs-revision-point" && argc==4){std::cout<<fs.revision_point(argv[3]);return 0;}
             if(command=="fs-compact" && argc==3) fs.compact();
             else if(command=="fs-layout" && argc==3) {
                 if(container.storage_engine()=="leveldb") {fs.stat("/");std::cout<<"{\"layout\":\"cow-tree\",\"storage_engine\":\"leveldb\"}\n";return 0;}
                 auto runs=fs.run_count();std::cout<<"{\"runs\":"<<runs<<",\"layout\":\""<<(runs?"sorted-runs":"flat")<<"\"}\n";return 0;
+            } else if(command=="fs-snapshot-parents" && argc==5){
+                auto id=fs.snapshot(argv[3],forkfs::revision_parent_names(argv[4]));std::cout<<"{\"revision_id\":\""<<id<<"\"}\n";return 0;
             } else if(command=="fs-snapshot" && argc==4) {
                 auto id=fs.snapshot(argv[3]);std::cout<<"{\"revision_id\":\""<<id<<"\"}\n";return 0;
             } else if(command=="fs-restore" && argc==4) fs.restore(argv[3]);

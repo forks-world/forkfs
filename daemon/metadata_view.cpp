@@ -1,3 +1,4 @@
+#include "revision.h"
 #include "metadata_view.h"
 #include "metadata_tree.h"
 #include <algorithm>
@@ -34,8 +35,7 @@ NamespaceView::NamespaceView(const Journal& journal,const std::string& name,bool
     Id manifest{};
     if(revision) {
         auto descriptor=journal.get(history+"revision/"+name);
-        need(descriptor.size()==80 && !memcmp(descriptor.data(),"FFREV001",8),"invalid revision record");
-        std::copy_n(descriptor.data()+8,32,manifest.begin());
+        manifest=RevisionRecord::decode(descriptor).manifest;
     } else manifest=journal.root_object(history+"world/"+name);
     load(manifest,validate_root);
 }

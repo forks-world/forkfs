@@ -1,8 +1,21 @@
 # 基于 revision 的备份与 replay 设计
 
 状态：设计提案，基于 PR #54 已合并的离线备份与事务 replay。
-本文中的 checkpoint、catalog、在线 RPC、日志裁剪和精确恢复目标尚未实现。
+已实现在线备份任务、revision 创建恢复点查询、精确 replay 和本地多包恢复计划。
+完整 checkpoint/generation catalog、保留 lease 与日志裁剪仍未实现；各阶段限制见下方进度说明。
 现有命令、FFRPLY01 格式及已实现保证见 [DISASTER_REPLAY.md](DISASTER_REPLAY.md)。
+
+### 当前实现进度
+
+阶段 1 的首个实现提供 daemon RPC 后台全量备份、增量导出与状态查询，复用
+LevelStore 一致 snapshot。支持单活动任务、持久 request_id 幂等、失败/中断状态和
+优雅退出等待。命令与限制见 [daemon README](../daemon/README.md#online-export-through-the-owning-daemon)。
+任务记录以源端独立校验文件保存，最多 128 条；通过显式 forget 回收终态记录。
+完成记录保存由导出快照产生的 repository/sequence/chain_hash 恢复点凭证；重启保留
+已完成结果，把未完成意图报告为 interrupted，不自动重试。控制文件不随备份复制。
+该凭证尚不是包含根清单的完整 checkpoint catalog。revision 创建事件可从保留日志查询；
+已支持精确恢复终点及本地多包 staging 恢复。已提供本地追加式归档 catalog；取消、保留 lease、generation manifest 和日志裁剪仍未实现。
+因此下面的完整在线备份协议仍是目标设计，不能将当前 `backup-start` 等同于该协议。
 
 ## 1. 决策与边界
 
@@ -32,7 +45,7 @@
 不同副本可能在相同 sequence 写入不同内容；链哈希用于发现分叉，不负责选举写者。
 正常 World fork 不创建新的仓库 lineage，只是仓库中的一次根引用事务。
 
-现有 FFREV001 中的 `source_sequence` 是创建 revision **之前**的仓库序号，
+FFREV001/FFREV002 中的 `source_sequence` 是创建 revision **之前**的仓库序号，
 不是 revision 描述记录的提交水位，不能直接拿它作为 replay 的终点。
 即使当前 snapshot 路径通常下一笔就提交，也不把 `source_sequence + 1` 作为长期 API。
 
@@ -246,3 +259,218 @@ fork、restore、备份、导出、取消、裁剪和重启；随机选择保留
 4. **远端介质适配**：上传下载、条件发布、认证/加密、remote ACK；单独设计写者接管。
 
 每阶段以本地故障测试通过为前提；阶段 1–3 不依赖网络功能。
+
+### Implemented: revision creation recovery-point lookup
+
+`forkfsd fs-revision-point REPOSITORY NAME` (online RPC:
+`fs-revision-point NAME`) returns the revision ID, descriptor source sequence,
+and an `available` flag. When available, `checkpoint` contains the repository
+UUID, actual creation transaction sequence, and its chain hash. The endpoint
+comes from the retained transaction that binds the named revision, never from
+arithmetic on the descriptor’s `source_sequence`. Lookup is read-only.
+
+This first implementation uses a bounded, in-memory derived index, rebuilt from
+a consistent LevelDB snapshot. A cold query scans the retained log and validates
+its contiguous hash chain; repeated queries scan only new transactions. Scanning
+does not hold the store writer mutex, but a cold online query still occupies the
+RPC handler. This is not yet a persistent checkpoint catalog or a constant-time
+cold lookup.
+
+Missing history returns `available: false`, `checkpoint: null`, with reason
+`retention_disabled` or `creation_not_retained`. Multiple matching bindings
+return `ambiguous_binding_events`; corrupt descriptors or scanned logs produce
+errors. A full backup preserves revision trees but not their earlier creation
+logs, so restoring that full backup alone cannot recover those creation receipts.
+Replaying a delta containing the creation transaction preserves the exact receipt.
+Unavailable receipts do not prevent browsing or forking preserved revisions.
+
+### Implemented: replay to an exact recovery point
+
+```
+forkfsd replay ARCHIVE DESTINATION --until SEQUENCE REPOSITORY_ID CHAIN_HASH
+```
+
+Pass the three fields from a revision's available `checkpoint`. The selected
+archive must contain the endpoint (inclusive of its starting anchor). Restore an
+earlier full backup first, apply any preceding increments, then apply the increment
+containing the endpoint with `--until`. A full backup can only satisfy its own exact
+checkpoint. This low-level command does not select archives; use `restore-plan` and `restore` below for multi-archive recovery.
+
+The complete archive's framing, checksums and transaction chain are validated
+before opening the destination, including the suffix beyond the chosen endpoint.
+Repository identity and the endpoint hash must match. Only transactions through
+the endpoint are applied; their graph validation and synchronous atomic commits
+use the existing replay path. Skipped transactions are not applied or graph-checked.
+A crash can leave a fully committed prefix; retry with the same endpoint resumes
+idempotently. A destination already ahead of the endpoint is rejected rather than
+rewound. Restore to a separate destination when recovering an older state.
+
+The endpoint is repository-wide: all Worlds reach that transaction, not just the
+World associated with the named revision. Ordinary replay without `--until` retains
+its full-archive behavior. CLI success prints the reached sequence. There is no
+archive format change.
+
+
+### Implemented: local multi-archive plans and staged recovery
+
+```
+forkfsd restore-plan SEQUENCE REPOSITORY_ID CHAIN_HASH ARCHIVE...
+forkfsd restore DESTINATION SEQUENCE REPOSITORY_ID CHAIN_HASH ARCHIVE...
+```
+
+The planner accepts an explicit set of up to 4096 local archives, validates every
+supplied archive's framing, checksums and transaction chain, and requires all to
+belong to the requested repository. Corrupt or foreign candidates fail the request,
+even when another usable chain exists. It chooses the newest full backup that can
+reach the exact target through matching `(sequence, chain_hash)` boundaries.
+Valid branches that do not reach the target are ignored. Candidate order does not
+change the result; path ordering breaks ties. Duplicate paths are collapsed. The
+JSON output lists ordered absolute archive paths and each exact endpoint.
+
+This version requires adjacent archive boundaries to match exactly. It does not
+splice overlapping ranges, optimize total bytes, discover a directory, or persist
+a catalog. A final increment may extend beyond the target. Planning validates
+transport and chain integrity; object/reference graph checks run during execution.
+The plan is a preview, not a durable plan ID or an authenticated archive manifest;
+`restore` recomputes it and the replay layer revalidates selected archives.
+
+Execution uses a private sibling `DESTINATION.restore-job-*` directory. It restores
+the base and increments there, verifies the final store and recovery object graph,
+checks the requested repository/sequence/hash, then publishes the repository with
+an exclusive rename and parent-directory sync. Existing destinations are never
+overwritten, including symlinks and publication races. Publication now also requires the namespace checks described below; a persistent
+validation report is not yet implemented.
+
+Ordinary failures remove this attempt's staging directory. Process crashes can
+leave private staging directories; rerunning starts a new attempt, without exposing
+the unfinished repository at DESTINATION. Automatic resume and staging GC are not
+implemented. A crash after publication can leave a complete destination despite
+no success response; inspect it with `check` before using it. Repeating `restore`
+on an existing destination is rejected. Low-level `replay` remains available for
+explicit in-place incremental retries.
+
+
+### Implemented: namespace validation before restore publication
+
+`restore` now validates every World, named revision, and reachable ancestor revision
+before the exclusive publication rename. Shared manifests are checked once. The
+validator reuses the `fs-check` rules for inode decoding, file size, hardlink counts,
+directory topology, parent indexes, allocation records and namespace record coverage.
+Directory traversal uses an explicit work list, avoiding call-stack growth with depth.
+World base/generation records must belong to existing Worlds.
+
+Validation opens the journal in preview mode, never normal `Container` mode: it
+must not reclaim orphan roots or advance the requested checkpoint. Persisted
+open-but-unlinked files are permitted without process-local handles, but require
+complete inode/content records, a valid zero-link regular inode, matching content
+size, an allocation record, and no linked inode/content in the World. Unknown
+orphan fields or Worlds fail validation. Ordinary `fs-check` still requires live
+handles for live orphan records. An empty uninitialized repository remains valid.
+
+A semantic failure removes the attempt's staging directory and does not publish
+the destination. The storage-layer restore API requires an explicit namespace
+validator; the CLI always supplies this implementation. Low-level `replay` keeps
+its existing structural graph validation and committed-prefix retry contract.
+
+
+### Implemented: portable local archive catalog
+
+```
+forkfsd catalog-add CATALOG ARCHIVE
+forkfsd catalog-list CATALOG
+forkfsd restore-plan SEQUENCE REPOSITORY_ID CHAIN_HASH --catalog CATALOG
+forkfsd restore DESTINATION SEQUENCE REPOSITORY_ID CHAIN_HASH --catalog CATALOG
+```
+
+`catalog-add` imports an owned copy of one validated FFRPLY01 archive. A catalog
+contains immutable `<package_digest>.pack` files and `<record_checksum>.entry`
+records, with no mutable CURRENT pointer. Writers take an exclusive directory
+flock; readers take a shared lock. Concurrent imports do not overwrite one another;
+importing identical content is idempotent. Up to 4096 packages from one repository
+are supported. The source database and original archives are not needed after
+import. Internal references are relative basenames, so the whole catalog can move.
+
+FFCAT001 records are 185 bytes: magic (8), FFRPLY01 header (105), little-endian
+package size (8), package digest (32), record checksum (32). Both checksum functions
+use the existing domain-separated object hash. The package identity is
+`H("forkfs.catalog.package.v1" || uint64le(size) || FFRPLY01_transport_digest)`;
+the transport digest covers the canonical header and ordered frame hashes. It is
+not advertised as a raw SHA-256 of the file. The record checksum covers its first
+153 bytes, and its hex encoding is the `.entry` basename. The embedded header
+preserves repository, range, and both chain endpoints. Records contain no paths.
+
+Publication order is: copy to private staging, fsync and fully validate the copy,
+publish the immutable package without replacing any existing name, fsync catalog,
+write/fsync/publish the entry, fsync catalog. Ordinary errors remove staging;
+process crashes can leave staging or an unregistered package. Readers ignore these
+and use only validated `.entry` records. Retrying an interrupted import safely
+completes publication. A crash after entry publication can leave a completed import
+without a success response. No automatic GC is provided.
+
+Listing and catalog-based recovery validate every entry and its package identity;
+missing or damaged registered packages fail closed. Symlink catalog roots, entries,
+and package files are rejected. Callers must keep catalog contents immutable during
+recovery; this is not a hostile-writer isolation mechanism. Planning still uses the
+existing exact-boundary algorithm and semantic validation precedes publication.
+The current implementation scans and validates all packages, so catalog operations
+are linear in total archive bytes and are not a constant-time metadata index.
+
+This is the first local catalog slice, not the complete generation protocol in
+section 5: no generation chain or revision-name index,
+retention/lease management, remote sync, or authenticated manifests yet. The caller
+still supplies an exact checkpoint. Archive-only backup tasks can be imported manually using `catalog-add`; opt-in
+automatic online publication is described below.
+
+
+### Implemented: online task publication to catalog
+
+The RPC commands `backup-catalog-start ID ARCHIVE CATALOG` and
+`replay-catalog-start ID AFTER ARCHIVE CATALOG` integrate catalog import into the
+existing background worker. The source database remains open and filesystem RPCs
+can continue during import. Both paths must be absolute. The catalog path forms
+part of request-ID identity. Export first persists an intermediate archive receipt;
+then the worker validates/imports that archive and records task completion. These
+tasks become `durable` only after catalog publication. Archive-only commands keep
+their prior meaning.
+
+Status separates `archive_durable` / `archive_checkpoint` from `catalog_published`
+and the final `checkpoint`. `backup-catalog-retry ID` retries publication only,
+using the recorded archive and checking its exact checkpoint and export range.
+Failed/interrupted tasks with no persisted archive receipt cannot be retried this
+way. Restart reports unfinished tasks as interrupted without automatic actions.
+A catalog entry published before a crash is reconciled by idempotent re-import.
+Task-persistence errors still block new work until restart/inspection.
+
+FFBKT002 extends each FFBKT001 task record, after its range and sequence fields,
+with a length-prefixed catalog path and a one-byte archive-durable flag. Existing
+FFBKT001 task files remain readable; the writer uses version 2 when catalog tasks
+are present. Neither task format is replayed to recovered machines. See the daemon
+README for commands and retry boundaries. This does not add automatic scheduling,
+retention, remote acknowledgment, or revision-name recovery selection.
+
+### Implemented: revision-name resolution from catalog archives
+
+`catalog-revision CATALOG NAME` returns `{revision_id, checkpoint}` from retained
+creation evidence. `restore-plan --revision NAME --catalog CATALOG` and
+`restore DESTINATION --revision NAME --catalog CATALOG` pass that checkpoint into
+the existing planner and staged restore. Neither requires a surviving source store.
+
+The first implementation builds this result by scanning immutable packages under
+the catalog's shared lock. It introduces no new persistent format or auxiliary
+index. All registered packages are validated, and the scanned transport digest is
+checked against the catalog identity. Lookup remains linear in total archive bytes.
+
+Full-backup revision bindings establish identity, but do not establish creation
+time. Incremental binding events are deduplicated by actual sequence and transaction
+hash. A usable creation event must introduce its matching hash-valid FFREV001 or FFREV002 object
+in the same atomic transaction, and its source sequence must precede that event.
+No `source_sequence + 1` inference is made. Later reference-only bindings cannot
+stand in for missing creation logs. Different IDs or distinct binding events under
+one name are rejected rather than selecting a latest branch implicitly. A deleted
+name may still resolve to its historical creation if that is the only retained binding.
+
+Missing names, unavailable creation evidence, ambiguous names and corrupt records
+return errors. A lookup receipt alone does not guarantee a usable base/delta chain
+or semantic validity of the entire filesystem; planning and pre-publication semantic
+checks remain separate. Overlapping packages can provide duplicate lookup evidence,
+while restore planning still requires exactly adjoining selected archive boundaries.

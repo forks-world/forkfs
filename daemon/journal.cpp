@@ -507,3 +507,21 @@ std::vector<unsigned char> Journal::get(const std::string& key) const {
     return read_object(it->second);
 }
 }
+
+namespace forkfs {
+uint64_t Journal::backup(const std::string& archive,std::string* chain_hash) {
+    if(!leveldb_ || read_only_)throw std::runtime_error("backup requires writable LevelDB owner");
+    return leveldb_->backup(archive,chain_hash);
+}
+uint64_t Journal::export_replay(uint64_t after,const std::string& archive,std::string* chain_hash) const {
+    if(!leveldb_ || read_only_)throw std::runtime_error("replay export requires writable LevelDB owner");
+    return leveldb_->export_replay(after,archive,chain_hash);
+}
+}
+
+namespace forkfs {
+std::string Journal::revision_point(const std::string& name) const {
+    if(!leveldb_)throw std::runtime_error("revision recovery points require LevelDB");
+    return leveldb_->revision_point(name);
+}
+}

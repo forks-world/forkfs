@@ -366,3 +366,107 @@ is idempotent. These are offline commands requiring exclusive repository ownersh
 See [the disaster replay contract](../docs/DISASTER_REPLAY.md) for durability,
 crash recovery, storage costs and the requirement to keep archives off the source
 machine. Online replication and log pruning are not implemented.
+
+### Online export through the owning daemon
+
+With `forkfsd serve REPOSITORY --socket SOCKET --rpc` running:
+
+```text
+forkfsd request SOCKET backup-start request-1 /absolute/path/base.pack
+forkfsd request SOCKET backup-status request-1
+forkfsd request SOCKET replay-export-start request-2 BASE_SEQUENCE /absolute/path/delta.pack
+forkfsd request SOCKET backup-status request-2
+```
+
+Exports run on a background worker, leaving RPC filesystem operations available.
+Each archive captures one LevelDB snapshot; its sequence becomes available when
+status is `durable`, after file and parent-directory sync. This confirms local
+archive durability, not an independent failure domain or remote acknowledgement.
+An accepted `running` task does not mean the snapshot has already been captured.
+
+One export runs per repository. Reusing a request ID with identical arguments
+returns its recorded state; different arguments are rejected. Failed tasks release
+the worker slot and do not retry automatically. Output files are never overwritten;
+a failed export may leave a partial archive, so use a new request ID and path.
+Task history is bounded to 128 entries and stored in the source repository's
+checksummed `BACKUP-TASKS` control file. Intent is synced before a worker starts;
+completion is synced before status reports `durable`. Durable status includes a
+`checkpoint` receipt with repository ID, sequence and chain hash captured by the
+export itself. This is a recovery position, not a user revision or catalog root list.
+Restart preserves request IDs and terminal results, and reports unfinished intents
+as `interrupted`. Even a complete pack left by an interrupted task is not silently
+acknowledged or overwritten. Use a new ID/path after inspecting the old archive.
+`forkfsd request SOCKET backup-forget REQUEST_ID` removes a terminal task record
+without deleting its archive; explicit forgetting ends that ID's deduplication
+protection and frees a history slot. Running tasks cannot be forgotten.
+
+A corrupted catalog rejects backup control operations without preventing normal
+filesystem access. Persistence errors block new exports until restart and inspection.
+This local control file is not part of replay archives: recovery must not import
+old machine paths or task ownership. Graceful shutdown waits for the current export before closing
+LevelDB. Forced termination may leave an incomplete pack.
+
+This is the first online-export increment of the revision backup design. It does
+not yet implement automatic task resumption, cancellation, backup catalogs, revision event
+indexing, exact revision checkpoint capture, retention leases or log pruning.
+
+### Online export with catalog publication
+
+Through `forkfsd request SOCKET ...`:
+
+```
+backup-catalog-start REQUEST_ID /absolute/archive.pack /absolute/catalog
+replay-catalog-start REQUEST_ID AFTER_SEQUENCE /absolute/delta.pack /absolute/catalog
+backup-catalog-retry REQUEST_ID
+backup-status REQUEST_ID
+```
+
+These opt-in tasks report `durable` only after export, catalog import and task
+completion are persisted. Existing `backup-start` / `replay-export-start` retain
+archive-only durability. Status additionally exposes `catalog`, `archive_durable`,
+`archive_checkpoint` and `catalog_published`. A failed publication can still have
+a durable archive checkpoint; `checkpoint` remains null until the task succeeds.
+
+The daemon records the archive checkpoint before importing it. Retry only imports
+that existing archive, checking its repository, sequence, chain hash, kind and
+incremental starting sequence; it never overwrites or re-exports the archive.
+The request ID binds the catalog path too. Restart does not automatically retry;
+explicit retry is allowed only with a persisted archive checkpoint. A crash before
+that receipt is persisted requires manual archive inspection/import. Fix catalog
+availability or corruption before retrying. Retrying an already successful task
+returns its persisted result; it does not continually audit external files.
+
+Source task bookkeeping upgrades to FFBKT002 when catalog tasks exist and still
+reads FFBKT001. Older binaries cannot read FFBKT002. Task records remain source-local
+and are not part of backup data. Forgetting a task never removes catalog packages.
+
+### Recover a revision by name from a catalog
+
+```
+forkfsd catalog-revision CATALOG REVISION_NAME
+forkfsd restore-plan --revision REVISION_NAME --catalog CATALOG
+forkfsd restore DESTINATION --revision REVISION_NAME --catalog CATALOG
+```
+
+The resolver scans validated catalog archives for the actual revision creation
+transaction and returns its revision ID and checkpoint. It does not need the source
+database. Duplicate copies of the same transaction in overlapping archives are
+collapsed. Different descriptors or distinct binding events for the same name are
+ambiguous and rejected; use an explicitly chosen checkpoint to disambiguate.
+
+A full backup preserves revision trees but does not prove their creation endpoints.
+Name resolution therefore requires a retained creation transaction, including the
+new descriptor object in that transaction. A later re-PUT of an existing descriptor
+alone is insufficient. Missing history is an error, not a fabricated `source+1`
+endpoint. Finding a creation receipt does not prove a complete recovery chain exists;
+`restore-plan` checks that separately. `restore` still validates all recovered
+namespaces before publishing. Recovery reaches the repository-wide creation commit,
+not merely the contents of the revision's World.
+
+## Revision DAG
+
+New snapshots write `FFREV002` with ordered parents; existing `FFREV001` revisions
+remain readable. `fs-snapshot` derives its parent from the World base. To record
+explicit ancestry, use `fs-snapshot-parents REPO NAME PARENT[,PARENT...] [--world WORLD]`
+(or `-` for no parents). RPC omits REPO. This records the selected World's current
+contents; it does not merge files. See [format and validation](../docs/REVISION_DAG.md).

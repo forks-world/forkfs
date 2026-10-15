@@ -236,11 +236,10 @@ class Trial:
                 return oid
 
             if kind == 'parent':
-                descriptor[40:72] = missing
+                descriptor[:] = b'FFREV002'+descriptor[8:48]+struct.pack('<I',1)+missing
             elif kind == 'sequence':
-                # Every descriptor must precede the archive's committed sequence.
-                sequence = struct.unpack_from('<Q', header, 33)[0]
-                descriptor[72:80] = struct.pack('<Q', self.rng.randint(sequence, 2**64-1))
+                # An out-of-range parent count is invalid regardless of valid hashes.
+                descriptor[48:52] = struct.pack('<I', self.rng.randint(65, 2**32-1))
             elif kind == 'manifest':
                 descriptor[8:40] = missing
             else:
@@ -268,7 +267,7 @@ class Trial:
             path = self.root/'graph-mutant.pack';path.write_bytes(pack(header, base_frames(rows)))
             target = self.root/'graph-target'
             for _ in range(2):
-                error = 'revision ancestry sequence' if kind == 'sequence' else 'read recovery object'
+                error = 'invalid replay revision descriptor' if kind == 'sequence' else 'read recovery object'
                 result, _ = self.call('replay', path, target, allow_error=True, expected_error=error)
                 assert result == 1 and not target.exists(), kind
                 assert set(self.root.glob('graph-target.restore-*')) == {unrelated}, kind

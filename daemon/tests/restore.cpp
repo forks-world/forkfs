@@ -1,3 +1,4 @@
+#include "revision.h"
 #include "namespace.h"
 #include "compaction.h"
 #include <algorithm>
@@ -45,7 +46,7 @@ int main(){
             auto r1_descriptor=store.get(std::string("\0forkfs-history/",16)+"revision/r1");
             auto r3_descriptor=store.get(std::string("\0forkfs-history/",16)+"revision/r3");
             auto parent=Journal::object_id(r1_descriptor);
-            check(std::equal(parent.begin(),parent.end(),r3_descriptor.begin()+40));
+            check(RevisionRecord::decode(r3_descriptor).parents==std::vector<RevisionRecord::Id>{parent});
             Namespace r2(store,"r2",true);check(r2.read("/new")==Bytes{'b'});fs.verify();store.verify();
         }
         {

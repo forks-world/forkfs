@@ -1,3 +1,4 @@
+#include "revision.h"
 #include "rpc.h"
 #include "namespace.h"
 #include <algorithm>
@@ -145,6 +146,11 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     size_t count=2;
     if(op=="status" || op=="storage-profile" || op=="fs-init" || op=="fs-check" || op=="fs-worlds" || op=="fs-revisions" || op=="fs-compact")count=1;
     if(op=="fs-write" || op=="fs-save" || op=="fs-rename" || op=="fs-link" || op=="fs-fork" || op=="fs-append" || op=="fs-truncate" || op=="fs-open" || op=="fs-happend" || op=="fs-htruncate" || op=="fs-hread-next" || op=="fs-hwrite-next" || op=="fs-symlink" || op=="fs-chmod" || op=="fs-setmtime" || op=="fs-hchmod" || op=="fs-hsetmtime" || op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-hlock")count=3;
+    if(op=="fs-snapshot-parents")count=3;
+    if(op=="backup-start")count=3;
+    if(op=="backup-catalog-start")count=4;
+    if(op=="replay-catalog-start")count=5;
+    if(op=="replay-export-start")count=4;
     if(op=="fs-read-at" || op=="fs-write-at" || op=="fs-hread" || op=="fs-hwrite" || op=="fs-hseek" || op=="fs-hrange-lock")count=4;
     if(op=="fs-setattr" || op=="fs-isetattr" || op=="fs-hsetattr" ||
        op=="fs-igetxattr" || op=="fs-hgetxattr" || op=="fs-iremovexattr" || op=="fs-hremovexattr")count=3;
@@ -180,6 +186,13 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     if(op=="status")return store.status();
     if(op=="storage-profile")return store.storage_profile();
+    if(op=="backup-catalog-start"){need(!args[3].empty(),"catalog destination is required");return store.start_backup(args[1],args[2],std::nullopt,args[3]);}
+    if(op=="replay-catalog-start"){need(!args[4].empty(),"catalog destination is required");return store.start_backup(args[1],args[3],number(args[2]),args[4]);}
+    if(op=="backup-catalog-retry")return store.retry_backup_catalog(args[1]);
+    if(op=="backup-start")return store.start_backup(args[1],args[2]);
+    if(op=="replay-export-start")return store.start_backup(args[1],args[3],number(args[2]));
+    if(op=="backup-status")return store.backup_status(args[1]);
+    if(op=="backup-forget"){store.forget_backup(args[1]);return "{\"forgotten\":true}\n";}
     Namespace fs(store,view,revision);
     if(op=="fs-istat")return inode_json(fs.stat_inode(args[1]))+"\n";
     if(op=="fs-setattr" || op=="fs-isetattr" || op=="fs-hsetattr"){
@@ -288,6 +301,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="fs-stat" || op=="fs-hstat" || op=="fs-lstat"){
         auto n=op=="fs-stat"?fs.stat(args[1]):op=="fs-lstat"?fs.lstat(args[1]):fs.handle_stat(args[1]);return inode_json(n)+"\n";
     }
+    if(op=="fs-revision-point")return fs.revision_point(args[1]);
+    if(op=="fs-snapshot-parents")return "{\"revision_id\":\""+fs.snapshot(args[1],revision_parent_names(args[2]))+"\"}\n";
     if(op=="fs-snapshot")return "{\"revision_id\":\""+fs.snapshot(args[1])+"\"}\n";
     if(op=="fs-append") {
         auto offset=fs.append(args[1],std::vector<unsigned char>(args[2].begin(),args[2].end()));

@@ -1,3 +1,4 @@
+#include "revision.h"
 #include "namespace.h"
 #include "metadata_view.h"
 #include "compaction.h"
@@ -26,8 +27,7 @@ void valid_view_name(const std::string& name) {
 }
 ObjectId revision_manifest(const Journal& j,const std::string& name) {
     valid_view_name(name);auto b=j.get(history+"revision/"+name);
-    if(b.size()!=80 || memcmp(b.data(),"FFREV001",8))throw std::runtime_error("invalid revision record");
-    ObjectId id{};std::copy_n(b.data()+8,32,id.begin());return id;
+    return RevisionRecord::decode(b).manifest;
 }
 }
 namespace {
@@ -322,7 +322,13 @@ void Namespace::commit_changes(const NamespaceView& view,Changes& changes) {
     auto& journal=*container_.journal_;journal.transact(journal.sequence(),batch);
 }
 
-std::string Namespace::snapshot(const std::string& name) {
+std::string Namespace::revision_point(const std::string& name) const {
+    valid_view_name(name);
+    // LevelStore captures roots, descriptor and log bounds in one snapshot.
+    // Do not hold the namespace mutation lock throughout a cold log scan.
+    return container_.journal_->revision_point(name);
+}
+std::string Namespace::snapshot(const std::string& name,std::optional<std::vector<std::string>> parents) {
     valid_view_name(name);need(!revision_,"revision view is read-only");
     std::lock_guard lock(container_.mutex_);auto& j=*container_.journal_;
     need(!j.contains(history+"revision/"+name),"revision name already exists");
@@ -337,16 +343,19 @@ std::string Namespace::snapshot(const std::string& name) {
         manifest_id=Journal::object_id(plan.manifest);auto key=history+"object/"+hex_id(manifest_id);
         if(!j.contains(key))batch.push_back({key,std::move(plan.manifest)});
     } else manifest_id=j.root_object(history+"world/"+view_);
-    ObjectId parent_id{};auto base=history+"base/"+view_;
-    if(j.contains(base)) {
-        auto parent=j.get(base);need(parent.size()==32,"invalid revision ancestry");
-        std::copy_n(parent.data(),32,parent_id.begin());
-        auto descriptor=j.get_object(parent_id);
-        need(descriptor.size()==80 && !memcmp(descriptor.data(),"FFREV001",8),"invalid parent revision");
+    auto base=history+"base/"+view_;RevisionRecord record;record.manifest=manifest_id;record.source_sequence=j.sequence();
+    if(parents){need(parents->size()<=RevisionRecord::max_parents,"too many revision parents");
+        for(const auto& parent:*parents){valid_view_name(parent);record.parents.push_back(j.root_object(history+"revision/"+parent));}
+    }else if(j.contains(base)){auto bytes=j.get(base);need(bytes.size()==32,"invalid revision ancestry");ObjectId id{};std::copy(bytes.begin(),bytes.end(),id.begin());record.parents.push_back(id);}
+    record.validate();
+    if(!container_.revision_dag_){
+        auto read=[journal=&j](const ObjectId& id){return journal->get_object(id);};
+        container_.revision_dag_=std::make_unique<RevisionDag>(
+            [read](const ObjectId& id){return RevisionRecord::read(read,id);},
+            [read](const ObjectId& id){NamespaceView::verify_manifest(read,id);});
     }
-    Bytes descriptor(80);memcpy(descriptor.data(),"FFREV001",8);
-    memcpy(descriptor.data()+8,manifest_id.data(),32);memcpy(descriptor.data()+40,parent_id.data(),32);
-    store(descriptor.data()+72,j.sequence(),8);auto revision_id=Journal::object_id(descriptor);
+    for(const auto& parent:record.parents)container_.revision_dag_->validate(parent);
+    auto descriptor=record.encode();auto revision_id=Journal::object_id(descriptor);
     batch.push_back({history+"revision/"+name,std::move(descriptor)});
     batch.push_back({base,Bytes(revision_id.begin(),revision_id.end())});
     j.transact(j.sequence(),batch);return hex_id(revision_id);
@@ -902,25 +911,25 @@ void Namespace::rename_entry(const NamespaceView& j,Changes& c,const std::string
 
 }
 
-void Namespace::verify() const {
-    std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);
-    if(journal.is_leveldb())(void)j.references(); // Validate the full CoW tree before namespace traversal.
+namespace {
+void verify_namespace_view(const NamespaceView& j){
+    (void)j.references();
     bool indexed=indexed_parents(j);auto root_id=root(j);need(inode(j,root_id).directory,"root inode is not a directory");std::set<std::string> expected;std::map<std::string,uint64_t> references;
     std::set<std::string> directories;expected.insert(root_key);
-    std::function<void(const std::string&)> visit=[&](const std::string& id) {
+    std::vector<std::string> pending{root_id};
+    while(!pending.empty()){auto id=std::move(pending.back());pending.pop_back();
         auto n=inode(j,id);expected.insert(inode_key(id));need(n.indexed_directory==(indexed && n.directory),"directory inode/index version mismatch");
         need(j.contains(allocated_key(id)) && j.get(allocated_key(id)).empty(),"inode missing allocation record");
-        if(!n.directory){auto data=j.get(content_key(id));need(data.size()==n.size,"inode content size mismatch");if(n.symlink)target_components(std::string(data.begin(),data.end()));expected.insert(content_key(id));return;}
+        if(!n.directory){auto data=j.get(content_key(id));need(data.size()==n.size,"inode content size mismatch");if(n.symlink)target_components(std::string(data.begin(),data.end()));expected.insert(content_key(id));continue;}
         need(directories.insert(id).second,"directory cycle or hardlink");uint64_t subdirs=0;
         auto pre=directory_prefix(id);
         for(const auto& key:j.keys(pre)) {
-            auto name=key.substr(pre.size());auto parsed=components("/"+name);need(parsed.size()==1,"invalid directory name");
+            auto name=key.substr(pre.size());auto parsed=components("/"+name);need(parsed.size()==1 && parsed.front()==name,"invalid directory name");
             expected.insert(key);auto child=decode_id(j.get(key));++references[child];
-            if(inode(j,child).directory)++subdirs;visit(child);
+            if(inode(j,child).directory)++subdirs;pending.push_back(child);
         }
         need(n.links==2+subdirs,"directory link count mismatch");
-    };
-    visit(root_id);
+    }
     for(const auto& [id,count]:references){auto n=inode(j,id);if(!n.directory)need(n.links==count,"file link count mismatch");}
     for(const auto& key:j.keys(prefix+"allocated/")) {
         auto id=key.substr((prefix+"allocated/").size());
@@ -932,6 +941,11 @@ void Namespace::verify() const {
     }
     auto actual=j.keys(prefix);need(actual.size()==expected.size(),"orphan namespace records");
     for(const auto& key:actual)need(expected.contains(key),"unexpected namespace record");
+}
+}
+void Namespace::verify() const {
+    std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);
+    verify_namespace_view(j);
     if(!revision_) {
         auto pre=history+"orphan/"+view_+"/";auto orphan_keys=journal.keys(pre);std::set<std::string> checked;
         for(const auto& key:orphan_keys) {
@@ -944,6 +958,47 @@ void Namespace::verify() const {
             need(journal.get(orphan_prefix(view_,id)+"content").size()==n.size,"orphan content size mismatch");
         }
     }
+}
+void Namespace::verify_recovery(const std::string& repository){
+    // No Container: opening a live World would reclaim persisted orphan roots
+    // and advance the exact checkpoint we are about to publish.
+    Journal journal(repository,true);journal.verify();const auto sequence=journal.sequence();
+    std::set<ObjectId> manifests;std::set<std::string> worlds;
+    auto manifest=[&](const ObjectId& id){if(manifests.insert(id).second){NamespaceView view(journal,id);verify_namespace_view(view);}};
+    if(!journal.keys(prefix).empty() && !journal.contains(history+"world/main")){
+        NamespaceView view(journal,"main");verify_namespace_view(view);worlds.insert("main");
+    }
+    for(const auto& key:journal.keys(history+"world/")){
+        auto name=key.substr((history+"world/").size());valid_view_name(name);worlds.insert(name);
+        try{manifest(journal.root_object(key));}catch(const std::exception& e){throw std::runtime_error("World "+name+": "+e.what());}
+    }
+    auto reader=[&](const ObjectId& id){return journal.get_object(id);};
+    RevisionDag dag([&](const ObjectId& id){return RevisionRecord::read(reader,id);},manifest);
+    auto revision=[&](const ObjectId& id){dag.validate(id);};
+    for(const auto& key:journal.keys(history+"revision/")){
+        auto name=key.substr((history+"revision/").size());valid_view_name(name);
+        try{revision(journal.root_object(key));}catch(const std::exception& e){throw std::runtime_error("revision "+name+": "+e.what());}
+    }
+    for(const auto& key:journal.keys(history+"base/")){
+        auto name=key.substr((history+"base/").size());need(worlds.contains(name),"World base has no World");
+        auto bytes=journal.get(key);need(bytes.size()==32,"invalid World base");ObjectId id{};std::copy(bytes.begin(),bytes.end(),id.begin());need(id!=ObjectId{},"zero World base");revision(id);
+    }
+    for(const auto& key:journal.keys(history+"generation/")){
+        auto name=key.substr((history+"generation/").size());need(worlds.contains(name),"generation has no World");(void)world_generation(journal,name);
+    }
+    std::set<std::pair<std::string,std::string>> orphans;
+    for(const auto& key:journal.keys(history+"orphan/")){
+        auto relative=key.substr((history+"orphan/").size());auto slash=relative.find('/');need(slash!=std::string::npos,"invalid orphan World");
+        auto world=relative.substr(0,slash);need(worlds.contains(world),"orphan has no World");relative=relative.substr(slash+1);
+        need(relative.size()>=33 && valid_id(relative.substr(0,32)) && relative[32]=='/',"invalid orphan identity");
+        auto field=relative.substr(33);need(field=="inode" || field=="content","invalid orphan field");
+        auto id=relative.substr(0,32);if(!orphans.emplace(world,id).second)continue;
+        NamespaceView view(journal,world);need(!view.contains(inode_key(id)) && !view.contains(content_key(id)),"orphan also appears in World tree");
+        need(view.contains(allocated_key(id)) && view.get(allocated_key(id)).empty(),"orphan missing allocation record");
+        auto n=decode_inode(journal.get(orphan_prefix(world,id)+"inode"),id,true);
+        need(journal.get(orphan_prefix(world,id)+"content").size()==n.size,"orphan content size mismatch");
+    }
+    need(journal.sequence()==sequence,"recovery validation changed checkpoint");
 }
 const Container::OpenHandle& Namespace::find_handle(const std::string& token) const {
     auto it=container_.handles_.find(token);need(it!=container_.handles_.end(),"invalid or expired file handle");
