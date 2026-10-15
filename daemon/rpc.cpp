@@ -1,3 +1,4 @@
+#include "revision.h"
 #include "rpc.h"
 #include "namespace.h"
 #include <algorithm>
@@ -145,6 +146,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     size_t count=2;
     if(op=="status" || op=="storage-profile" || op=="fs-init" || op=="fs-check" || op=="fs-worlds" || op=="fs-revisions" || op=="fs-compact")count=1;
     if(op=="fs-write" || op=="fs-save" || op=="fs-rename" || op=="fs-link" || op=="fs-fork" || op=="fs-append" || op=="fs-truncate" || op=="fs-open" || op=="fs-happend" || op=="fs-htruncate" || op=="fs-hread-next" || op=="fs-hwrite-next" || op=="fs-symlink" || op=="fs-chmod" || op=="fs-setmtime" || op=="fs-hchmod" || op=="fs-hsetmtime" || op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-hlock")count=3;
+    if(op=="fs-snapshot-parents")count=3;
     if(op=="backup-start")count=3;
     if(op=="backup-catalog-start")count=4;
     if(op=="replay-catalog-start")count=5;
@@ -300,6 +302,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         auto n=op=="fs-stat"?fs.stat(args[1]):op=="fs-lstat"?fs.lstat(args[1]):fs.handle_stat(args[1]);return inode_json(n)+"\n";
     }
     if(op=="fs-revision-point")return fs.revision_point(args[1]);
+    if(op=="fs-snapshot-parents")return "{\"revision_id\":\""+fs.snapshot(args[1],revision_parent_names(args[2]))+"\"}\n";
     if(op=="fs-snapshot")return "{\"revision_id\":\""+fs.snapshot(args[1])+"\"}\n";
     if(op=="fs-append") {
         auto offset=fs.append(args[1],std::vector<unsigned char>(args[2].begin(),args[2].end()));

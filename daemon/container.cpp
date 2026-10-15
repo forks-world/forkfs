@@ -1,4 +1,5 @@
 #include "container.h"
+#include "revision.h"
 #include "level_store.h"
 #include "replay_format.h"
 #include "namespace.h"

@@ -41,7 +41,7 @@ public:
     struct OpenOptions {bool create=false,exclusive=false,truncate=false;uint32_t mode=0644;bool append=false,nofollow=false;};
     explicit Namespace(Container& container,std::string view="main",bool revision=false)
         :container_(container),view_(std::move(view)),revision_(revision) {}
-    std::string snapshot(const std::string& name);
+    std::string snapshot(const std::string& name,std::optional<std::vector<std::string>> parents=std::nullopt);
     std::string revision_point(const std::string& name) const;
     void fork(const std::string& revision,const std::string& world);
     void restore(const std::string& revision);

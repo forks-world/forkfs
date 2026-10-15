@@ -462,3 +462,11 @@ endpoint. Finding a creation receipt does not prove a complete recovery chain ex
 `restore-plan` checks that separately. `restore` still validates all recovered
 namespaces before publishing. Recovery reaches the repository-wide creation commit,
 not merely the contents of the revision's World.
+
+## Revision DAG
+
+New snapshots write `FFREV002` with ordered parents; existing `FFREV001` revisions
+remain readable. `fs-snapshot` derives its parent from the World base. To record
+explicit ancestry, use `fs-snapshot-parents REPO NAME PARENT[,PARENT...] [--world WORLD]`
+(or `-` for no parents). RPC omits REPO. This records the selected World's current
+contents; it does not merge files. See [format and validation](../docs/REVISION_DAG.md).

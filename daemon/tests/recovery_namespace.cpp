@@ -1,3 +1,4 @@
+#include "revision.h"
 #include "namespace.h"
 #include "metadata_view.h"
 #include "level_store.h"
@@ -37,7 +38,7 @@ int main(){auto path=(std::filesystem::temp_directory_path()/"ff-recovery-ns-XXX
                 else {auto descriptor=j.get(history+"revision/saved");auto manifest=Journal::object_id(plan.manifest);std::copy(manifest.begin(),manifest.end(),descriptor.begin()+8);
                     if(view==2)batch.push_back({history+"revision/saved",descriptor});
                     else {object(batch,descriptor);auto parent=Journal::object_id(descriptor);auto child=j.get(history+"revision/saved");
-                        std::copy(parent.begin(),parent.end(),child.begin()+40);put(child,72,j.sequence());batch.push_back({history+"revision/child",child});}
+                        auto record=RevisionRecord::decode(child);record.parents={parent};record.source_sequence=j.sequence();child=record.encode();batch.push_back({history+"revision/child",child});}
                 }
                 j.transact(j.sequence(),batch);j.verify();
             }

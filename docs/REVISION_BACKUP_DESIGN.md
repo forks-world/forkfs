@@ -45,7 +45,7 @@ LevelStore 一致 snapshot。支持单活动任务、持久 request_id 幂等、
 不同副本可能在相同 sequence 写入不同内容；链哈希用于发现分叉，不负责选举写者。
 正常 World fork 不创建新的仓库 lineage，只是仓库中的一次根引用事务。
 
-现有 FFREV001 中的 `source_sequence` 是创建 revision **之前**的仓库序号，
+FFREV001/FFREV002 中的 `source_sequence` 是创建 revision **之前**的仓库序号，
 不是 revision 描述记录的提交水位，不能直接拿它作为 replay 的终点。
 即使当前 snapshot 路径通常下一笔就提交，也不把 `source_sequence + 1` 作为长期 API。
 
@@ -267,7 +267,7 @@ fork、restore、备份、导出、取消、裁剪和重启；随机选择保留
 and an `available` flag. When available, `checkpoint` contains the repository
 UUID, actual creation transaction sequence, and its chain hash. The endpoint
 comes from the retained transaction that binds the named revision, never from
-arithmetic on `FFREV001.source_sequence`. Lookup is read-only.
+arithmetic on the descriptor’s `source_sequence`. Lookup is read-only.
 
 This first implementation uses a bounded, in-memory derived index, rebuilt from
 a consistent LevelDB snapshot. A cold query scans the retained log and validates
@@ -462,7 +462,7 @@ checked against the catalog identity. Lookup remains linear in total archive byt
 
 Full-backup revision bindings establish identity, but do not establish creation
 time. Incremental binding events are deduplicated by actual sequence and transaction
-hash. A usable creation event must introduce its matching hash-valid FFREV001 object
+hash. A usable creation event must introduce its matching hash-valid FFREV001 or FFREV002 object
 in the same atomic transaction, and its source sequence must precede that event.
 No `source_sequence + 1` inference is made. Later reference-only bindings cannot
 stand in for missing creation logs. Different IDs or distinct binding events under

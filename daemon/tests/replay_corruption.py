@@ -83,6 +83,16 @@ def descriptor(rows):
 def replace_revision(rows, value):
     rows[VICTIM] = put_object(rows, value)
 
+def revision_source(b):
+    return struct.unpack_from('<Q', b, 72 if b[:8]==b'FFREV001' else 40)[0]
+
+def revision_with_source(b, sequence):
+    at = 72 if b[:8]==b'FFREV001' else 40
+    return b[:at]+struct.pack('<Q', sequence)+b[at+8:]
+
+def revision_with_parents(b, parents):
+    return b'FFREV002'+b[8:40]+struct.pack('<QI', revision_source(b), len(parents))+b''.join(parents)
+
 def patch_revision(rows, offset, value):
     b = bytearray(descriptor(rows));b[offset:offset+len(value)] = value
     replace_revision(rows, bytes(b))
@@ -181,10 +191,9 @@ def main():
         add('revision-long', lambda r: replace_revision(r, descriptor(r)+b'x'), 'invalid replay revision descriptor')
         add('revision-zero-manifest', lambda r: patch_revision(r, 8, bytes(32)), 'zero revision/World manifest')
         add('revision-missing-manifest', lambda r: patch_revision(r, 8, b'\xff'*32), 'read recovery object')
-        add('revision-missing-parent', lambda r: patch_revision(r, 40, b'\xff'*32), 'read recovery object')
-        add('revision-parent-not-descriptor', lambda r: patch_revision(r, 40, put_object(r, b'not a revision')), 'invalid replay revision descriptor')
-        add('revision-parent-newer', lambda r: patch_revision(r, 40, r[b'R/'+HISTORY+b'revision/child']), 'revision ancestry sequence')
-        add('revision-future-sequence', lambda r: patch_revision(r, 72, struct.pack('<Q', first)), 'revision ancestry sequence')
+        add('revision-missing-parent', lambda r: replace_revision(r, revision_with_parents(descriptor(r), [b'\xff'*32])), 'read recovery object')
+        add('revision-parent-not-descriptor', lambda r: replace_revision(r, revision_with_parents(descriptor(r), [put_object(r, b'not a revision')])), 'invalid replay revision descriptor')
+        add('revision-excess-parents', lambda r: replace_revision(r, revision_with_parents(descriptor(r), [b'x'*32]*65)), 'invalid replay revision descriptor')
         add('revision-invalid-name', lambda r: r.__setitem__(b'R/'+HISTORY+b'revision/../escape', r[VICTIM]), 'invalid World/revision name')
         add('world-base-length', lambda r: r.__setitem__(b'R/'+HISTORY+b'base/main', put_object(r, b'x')), 'invalid replay World base')
         add('manifest-unknown-format', lambda r: patch_manifest(r, lambda m: b'BADMAGIC'+m[8:]), 'unsupported namespace manifest')
@@ -236,7 +245,7 @@ def main():
         rev_id = next(v for op, k, v in ops if k == revision_key)
         original = next(v for op, k, v in ops if k == b'O/'+rev_id)
         replacements = [('short', original[:-1], 'invalid replay revision descriptor'),
-                        ('parent', original[:40]+b'\xff'*32+original[72:], 'missing replay graph object'),
+                        ('parent', revision_with_parents(original, [b'\xff'*32]), 'missing replay graph object'),
                         ('manifest', original[:8]+b'\xff'*32+original[40:], 'missing replay graph object')]
         for name, bad, error in replacements:
             bad_frame = corrupt_revision_tx(df[0], revision_key, lambda original: bad)

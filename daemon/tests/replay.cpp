@@ -1,3 +1,4 @@
+#include "revision.h"
 #include "level_store.h"
 #include "namespace.h"
 #include <leveldb/db.h>
@@ -55,7 +56,7 @@ int main(){
             CHECK(store.revision_point("after")==point);CHECK(store.sequence()==unchanged); // warm cache is read-only
             auto root_key=std::string("\0forkfs-history/",16)+"revision/after";
             auto original=store.root(root_key);auto bytes=store.object(original);
-            auto source_sequence=ns_base;for(unsigned i=0;i<8;++i)bytes[72+i]=static_cast<unsigned char>(source_sequence>>(8*i));
+            auto source_sequence=ns_base;auto descriptor=RevisionRecord::decode(bytes);descriptor.source_sequence=source_sequence;bytes=descriptor.encode();
             store.transact(store.sequence(),{{"filler",std::vector<unsigned char>{1}}});
             store.transact(store.sequence(),{{std::string("\0forkfs-history/",16)+"revision/delayed",bytes}});
             auto event=store.sequence();auto delayed=store.revision_point("delayed");
@@ -104,7 +105,7 @@ int main(){
             auto copy=pattern+"/logical-source-"+std::to_string(kind);
             std::filesystem::copy(ns_source,copy,std::filesystem::copy_options::recursive);
             LevelStore damaged(copy);auto bad=std::vector<unsigned char>(revision_bytes.begin(),revision_bytes.end());
-            if(kind==0)bad.resize(79);else if(kind==1)bad[0]='X';else if(kind==2)std::fill(bad.begin()+8,bad.begin()+40,0);else std::fill(bad.begin()+40,bad.begin()+72,255);
+            if(kind==0)bad.resize(79);else if(kind==1)bad[0]='X';else if(kind==2)std::fill(bad.begin()+8,bad.begin()+40,0);else {auto descriptor=RevisionRecord::decode(bad);RevisionRecord::Id missing;missing.fill(255);descriptor.parents={missing};bad=descriptor.encode();}
             damaged.transact(damaged.sequence(),{{revision_key.substr(2),bad}});damaged.verify();auto sequence=damaged.sequence();
             rejects([&]{damaged.backup(copy+".pack");});rejects([&]{damaged.export_replay(sequence,copy+".delta");});CHECK(damaged.sequence()==sequence);
         }

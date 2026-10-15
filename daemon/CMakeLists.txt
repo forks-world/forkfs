@@ -225,3 +225,10 @@ set_tests_properties(forkfsd_online_catalog PROPERTIES TIMEOUT 180 LABELS metada
 add_test(NAME forkfsd_catalog_revision COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/catalog_revision.py $<TARGET_FILE:forkfsd>)
 set_tests_properties(forkfsd_catalog_revision PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+
+add_executable(forkfsd_revision_dag_test tests/revision_dag.cpp)
+target_link_libraries(forkfsd_revision_dag_test PRIVATE forkfs_metadata)
+add_test(NAME forkfsd_revision_dag_core COMMAND forkfsd_revision_dag_test)
+add_test(NAME forkfsd_revision_dag COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/revision_dag.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_revision_dag_core forkfsd_revision_dag PROPERTIES TIMEOUT 120 LABELS metadata-regression)

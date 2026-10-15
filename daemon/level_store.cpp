@@ -1,3 +1,4 @@
+#include "revision.h"
 #include "level_store.h"
 #include "replay_format.h"
 #include "replay_validation.h"
@@ -579,8 +580,8 @@ std::string LevelStore::revision_point(const std::string& name) const {
     need(revision.size()==32,"invalid revision recovery root");
     status(db_->Get(options,"O/"+revision,&descriptor),"read revision recovery descriptor");
     need(replay::hash(descriptor)==revision,"revision recovery descriptor checksum mismatch");
-    need(descriptor.size()==80 && descriptor.starts_with("FFREV001"),"invalid revision recovery descriptor");
-    auto source=replay::num(descriptor.substr(72));need(source<end,"invalid revision source sequence");
+    auto record=RevisionRecord::decode(Bytes(descriptor.begin(),descriptor.end()));
+    auto source=record.source_sequence;need(source<end,"invalid revision source sequence");
     auto prefix="{\"repository\":\""+repository_+"\",\"revision_id\":\""+hex(revision)+"\",\"source_sequence\":"+std::to_string(source);
     auto unavailable=[&](const char* reason){return prefix+",\"available\":false,\"reason\":\""+reason+"\",\"checkpoint\":null}\n";};
     if(!enabled)return unavailable("retention_disabled");

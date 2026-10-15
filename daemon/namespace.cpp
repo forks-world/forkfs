@@ -1,3 +1,4 @@
+#include "revision.h"
 #include "namespace.h"
 #include "metadata_view.h"
 #include "compaction.h"
@@ -26,8 +27,7 @@ void valid_view_name(const std::string& name) {
 }
 ObjectId revision_manifest(const Journal& j,const std::string& name) {
     valid_view_name(name);auto b=j.get(history+"revision/"+name);
-    if(b.size()!=80 || memcmp(b.data(),"FFREV001",8))throw std::runtime_error("invalid revision record");
-    ObjectId id{};std::copy_n(b.data()+8,32,id.begin());return id;
+    return RevisionRecord::decode(b).manifest;
 }
 }
 namespace {
@@ -328,7 +328,7 @@ std::string Namespace::revision_point(const std::string& name) const {
     // Do not hold the namespace mutation lock throughout a cold log scan.
     return container_.journal_->revision_point(name);
 }
-std::string Namespace::snapshot(const std::string& name) {
+std::string Namespace::snapshot(const std::string& name,std::optional<std::vector<std::string>> parents) {
     valid_view_name(name);need(!revision_,"revision view is read-only");
     std::lock_guard lock(container_.mutex_);auto& j=*container_.journal_;
     need(!j.contains(history+"revision/"+name),"revision name already exists");
@@ -343,16 +343,19 @@ std::string Namespace::snapshot(const std::string& name) {
         manifest_id=Journal::object_id(plan.manifest);auto key=history+"object/"+hex_id(manifest_id);
         if(!j.contains(key))batch.push_back({key,std::move(plan.manifest)});
     } else manifest_id=j.root_object(history+"world/"+view_);
-    ObjectId parent_id{};auto base=history+"base/"+view_;
-    if(j.contains(base)) {
-        auto parent=j.get(base);need(parent.size()==32,"invalid revision ancestry");
-        std::copy_n(parent.data(),32,parent_id.begin());
-        auto descriptor=j.get_object(parent_id);
-        need(descriptor.size()==80 && !memcmp(descriptor.data(),"FFREV001",8),"invalid parent revision");
+    auto base=history+"base/"+view_;RevisionRecord record;record.manifest=manifest_id;record.source_sequence=j.sequence();
+    if(parents){need(parents->size()<=RevisionRecord::max_parents,"too many revision parents");
+        for(const auto& parent:*parents){valid_view_name(parent);record.parents.push_back(j.root_object(history+"revision/"+parent));}
+    }else if(j.contains(base)){auto bytes=j.get(base);need(bytes.size()==32,"invalid revision ancestry");ObjectId id{};std::copy(bytes.begin(),bytes.end(),id.begin());record.parents.push_back(id);}
+    record.validate();
+    if(!container_.revision_dag_){
+        auto read=[journal=&j](const ObjectId& id){return journal->get_object(id);};
+        container_.revision_dag_=std::make_unique<RevisionDag>(
+            [read](const ObjectId& id){return RevisionRecord::read(read,id);},
+            [read](const ObjectId& id){NamespaceView::verify_manifest(read,id);});
     }
-    Bytes descriptor(80);memcpy(descriptor.data(),"FFREV001",8);
-    memcpy(descriptor.data()+8,manifest_id.data(),32);memcpy(descriptor.data()+40,parent_id.data(),32);
-    store(descriptor.data()+72,j.sequence(),8);auto revision_id=Journal::object_id(descriptor);
+    for(const auto& parent:record.parents)container_.revision_dag_->validate(parent);
+    auto descriptor=record.encode();auto revision_id=Journal::object_id(descriptor);
     batch.push_back({history+"revision/"+name,std::move(descriptor)});
     batch.push_back({base,Bytes(revision_id.begin(),revision_id.end())});
     j.transact(j.sequence(),batch);return hex_id(revision_id);
@@ -960,7 +963,7 @@ void Namespace::verify_recovery(const std::string& repository){
     // No Container: opening a live World would reclaim persisted orphan roots
     // and advance the exact checkpoint we are about to publish.
     Journal journal(repository,true);journal.verify();const auto sequence=journal.sequence();
-    std::set<ObjectId> manifests,revisions;std::set<std::string> worlds;
+    std::set<ObjectId> manifests;std::set<std::string> worlds;
     auto manifest=[&](const ObjectId& id){if(manifests.insert(id).second){NamespaceView view(journal,id);verify_namespace_view(view);}};
     if(!journal.keys(prefix).empty() && !journal.contains(history+"world/main")){
         NamespaceView view(journal,"main");verify_namespace_view(view);worlds.insert("main");
@@ -969,16 +972,9 @@ void Namespace::verify_recovery(const std::string& repository){
         auto name=key.substr((history+"world/").size());valid_view_name(name);worlds.insert(name);
         try{manifest(journal.root_object(key));}catch(const std::exception& e){throw std::runtime_error("World "+name+": "+e.what());}
     }
-    auto revision=[&](ObjectId id){
-        uint64_t bound=sequence;
-        while(id!=ObjectId{}){
-            auto bytes=journal.get_object(id);need(bytes.size()==80 && !memcmp(bytes.data(),"FFREV001",8),"invalid recovery revision");
-            auto source=load(bytes.data()+72,8);need(source<bound,"invalid recovery revision ancestry");bound=source;
-            if(!revisions.insert(id).second)break;
-            ObjectId tree{},parent{};std::copy_n(bytes.data()+8,32,tree.begin());std::copy_n(bytes.data()+40,32,parent.begin());
-            manifest(tree);id=parent;
-        }
-    };
+    auto reader=[&](const ObjectId& id){return journal.get_object(id);};
+    RevisionDag dag([&](const ObjectId& id){return RevisionRecord::read(reader,id);},manifest);
+    auto revision=[&](const ObjectId& id){dag.validate(id);};
     for(const auto& key:journal.keys(history+"revision/")){
         auto name=key.substr((history+"revision/").size());valid_view_name(name);
         try{revision(journal.root_object(key));}catch(const std::exception& e){throw std::runtime_error("revision "+name+": "+e.what());}

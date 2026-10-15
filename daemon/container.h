@@ -10,6 +10,7 @@
 #include "journal.h"
 
 namespace forkfs {
+class RevisionDag;
 // Exclusive container owner; named-object journal is an experimental transaction profile.
 class Container {
 public:
@@ -88,5 +89,7 @@ private:
     std::array<unsigned char,4096> anchor_{};
     uint64_t anchor_offset_ = 0;
     std::unique_ptr<Journal> journal_;
+    // Immutable ancestry cache, accessed under mutex_; discarded on reopen.
+    std::unique_ptr<RevisionDag> revision_dag_;
 };
 }

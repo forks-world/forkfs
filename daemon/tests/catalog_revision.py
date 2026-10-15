@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from replay_corruption import unpack, pack, operations, encode_ops, rechain, corrupt_revision_tx, h
+from replay_corruption import unpack, pack, operations, encode_ops, rechain, corrupt_revision_tx, h, revision_with_source
 BIN=str(Path(sys.argv[1]).resolve())
 def run(*args,error=None):
     p=subprocess.run([BIN,*map(str,args)],capture_output=True,timeout=30)
@@ -81,12 +81,12 @@ with tempfile.TemporaryDirectory(prefix='ff-catalog-revision-') as directory:
         tail_cat=catalog(folder/'reference-only-cat',full,tail_pack)
         run('catalog-revision',tail_cat,'wanted',error='creation transaction not retained')
         # No source+1 inference: a descriptor source may precede its actual commit.
-        delayed=list(frames);delayed[event]=corrupt_revision_tx(delayed[event],key,lambda b:b[:72]+struct.pack('<Q',start))
+        delayed=list(frames);delayed[event]=corrupt_revision_tx(delayed[event],key,lambda b:revision_with_source(b,start))
         delayed_pack=folder/'delayed';delayed_pack.write_bytes(pack(*rechain(header,delayed)))
         delayed_cat=catalog(folder/'delayed-cat',base,delayed_pack)
         assert point(delayed_cat)['checkpoint']['sequence']==expected['checkpoint']['sequence']>start+1
         # Hash-valid malformed descriptors must fail before any destination is published.
-        for kind,mutate in enumerate((lambda b:b[:-1],lambda b:b'BADMAGIC'+b[8:],lambda b:b[:72]+struct.pack('<Q',2**64-1))):
+        for kind,mutate in enumerate((lambda b:b[:-1],lambda b:b'BADMAGIC'+b[8:],lambda b:revision_with_source(b,2**64-1))):
             bad=list(frames);bad[event]=corrupt_revision_tx(bad[event],key,mutate)
             archive=folder/('bad'+str(kind));archive.write_bytes(pack(*rechain(header,bad)))
             bad_cat=catalog(folder/('bad-cat'+str(kind)),base,archive)

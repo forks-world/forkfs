@@ -1,3 +1,4 @@
+#include "revision.h"
 #include "container.h"
 #include "level_store.h"
 #include "backup_catalog.h"
@@ -191,6 +192,7 @@ int main(int argc, char** argv) {
                          "forkfsd fs-unlink CONTAINER PATH\n"
                          "forkfsd fs-rmdir CONTAINER PATH\n"
                          "forkfsd fs-check CONTAINER\n"
+                         "forkfsd fs-snapshot-parents CONTAINER NAME PARENT[,PARENT...] [--world WORLD]\n"
                          "forkfsd fs-snapshot CONTAINER REVISION_NAME [--world WORLD]\n"
                          "forkfsd fs-revision-point CONTAINER REVISION_NAME\n"
                          "forkfsd fs-restore CONTAINER REVISION_NAME [--world WORLD]\n"
@@ -269,7 +271,7 @@ int main(int argc, char** argv) {
         std::string view="main";bool revision_view=false;
         int base_argc=4;
         if(command=="fs-init" || command=="fs-check" || command=="fs-worlds" || command=="fs-revisions" || command=="fs-compact" || command=="fs-layout")base_argc=3;
-        if(command=="fs-write" || command=="fs-save" || command=="fs-link" || command=="fs-rename" || command=="fs-fork" || command=="fs-append" || command=="fs-truncate" || command=="fs-symlink" || command=="fs-chmod" || command=="fs-setmtime")base_argc=5;
+        if(command=="fs-snapshot-parents" || command=="fs-write" || command=="fs-save" || command=="fs-link" || command=="fs-rename" || command=="fs-fork" || command=="fs-append" || command=="fs-truncate" || command=="fs-symlink" || command=="fs-chmod" || command=="fs-setmtime")base_argc=5;
         if(command=="fs-read-at" || command=="fs-write-at")base_argc=6;
         if(command.starts_with("fs-") && argc==base_argc+2) {
             std::string selector=argv[argc-2];
@@ -322,6 +324,8 @@ int main(int argc, char** argv) {
             else if(command=="fs-layout" && argc==3) {
                 if(container.storage_engine()=="leveldb") {fs.stat("/");std::cout<<"{\"layout\":\"cow-tree\",\"storage_engine\":\"leveldb\"}\n";return 0;}
                 auto runs=fs.run_count();std::cout<<"{\"runs\":"<<runs<<",\"layout\":\""<<(runs?"sorted-runs":"flat")<<"\"}\n";return 0;
+            } else if(command=="fs-snapshot-parents" && argc==5){
+                auto id=fs.snapshot(argv[3],forkfs::revision_parent_names(argv[4]));std::cout<<"{\"revision_id\":\""<<id<<"\"}\n";return 0;
             } else if(command=="fs-snapshot" && argc==4) {
                 auto id=fs.snapshot(argv[3]);std::cout<<"{\"revision_id\":\""<<id<<"\"}\n";return 0;
             } else if(command=="fs-restore" && argc==4) fs.restore(argv[3]);

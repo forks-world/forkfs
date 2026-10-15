@@ -1,3 +1,4 @@
+#include "revision.h"
 #include "backup_catalog.h"
 #include "replay_format.h"
 #include "metadata_view.h"
@@ -108,8 +109,10 @@ BackupCatalog::RevisionPoint BackupCatalog::revision_point(const std::string& in
     }
     require(!revision.empty(),"revision not found in catalog");
     require(event.has_value() && !descriptor.empty(),"revision creation transaction not retained in catalog");
-    require(descriptor.size()==80 && descriptor.starts_with("FFREV001") && replay::hash(descriptor)==revision,"invalid catalog revision descriptor");
-    require(replay::num(descriptor.substr(72))<event->first,"invalid catalog revision source sequence");
+    require(replay::hash(descriptor)==revision,"invalid catalog revision descriptor");
+    RevisionRecord record;
+    try{record=RevisionRecord::decode({descriptor.begin(),descriptor.end()});}catch(const std::exception& e){throw std::runtime_error(std::string("invalid catalog revision descriptor: ")+e.what());}
+    require(record.source_sequence<event->first,"invalid catalog revision source sequence");
     return {hex(revision),{event->first,packages.front().checkpoint.repository,hex(event->second)}};
 }
 void BackupCatalog::add(const std::string& input,const std::string& archive,std::optional<LevelStore::RecoveryPoint> expected,std::optional<uint64_t> after){
