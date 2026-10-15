@@ -447,3 +447,30 @@ FFBKT001 task files remain readable; the writer uses version 2 when catalog task
 are present. Neither task format is replayed to recovered machines. See the daemon
 README for commands and retry boundaries. This does not add automatic scheduling,
 retention, remote acknowledgment, or revision-name recovery selection.
+
+### Implemented: revision-name resolution from catalog archives
+
+`catalog-revision CATALOG NAME` returns `{revision_id, checkpoint}` from retained
+creation evidence. `restore-plan --revision NAME --catalog CATALOG` and
+`restore DESTINATION --revision NAME --catalog CATALOG` pass that checkpoint into
+the existing planner and staged restore. Neither requires a surviving source store.
+
+The first implementation builds this result by scanning immutable packages under
+the catalog's shared lock. It introduces no new persistent format or auxiliary
+index. All registered packages are validated, and the scanned transport digest is
+checked against the catalog identity. Lookup remains linear in total archive bytes.
+
+Full-backup revision bindings establish identity, but do not establish creation
+time. Incremental binding events are deduplicated by actual sequence and transaction
+hash. A usable creation event must introduce its matching hash-valid FFREV001 object
+in the same atomic transaction, and its source sequence must precede that event.
+No `source_sequence + 1` inference is made. Later reference-only bindings cannot
+stand in for missing creation logs. Different IDs or distinct binding events under
+one name are rejected rather than selecting a latest branch implicitly. A deleted
+name may still resolve to its historical creation if that is the only retained binding.
+
+Missing names, unavailable creation evidence, ambiguous names and corrupt records
+return errors. A lookup receipt alone does not guarantee a usable base/delta chain
+or semantic validity of the entire filesystem; planning and pre-publication semantic
+checks remain separate. Overlapping packages can provide duplicate lookup evidence,
+while restore planning still requires exactly adjoining selected archive boundaries.

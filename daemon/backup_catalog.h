@@ -12,6 +12,8 @@ public:
     };
     static void add(const std::string& directory,const std::string& archive,
                     std::optional<LevelStore::RecoveryPoint> expected=std::nullopt,std::optional<uint64_t> after=std::nullopt);
+    struct RevisionPoint {std::string revision_id;LevelStore::RecoveryPoint checkpoint;};
+    static RevisionPoint revision_point(const std::string& directory,const std::string& name);
     static std::vector<Entry> entries(const std::string& directory);
 };
 }

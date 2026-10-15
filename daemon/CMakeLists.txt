@@ -221,3 +221,7 @@ set_tests_properties(forkfsd_backup_catalog PROPERTIES TIMEOUT 180 LABELS metada
 add_test(NAME forkfsd_online_catalog COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/online_catalog.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
 set_tests_properties(forkfsd_online_catalog PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+
+add_test(NAME forkfsd_catalog_revision COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/catalog_revision.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_catalog_revision PROPERTIES TIMEOUT 180 LABELS metadata-regression)

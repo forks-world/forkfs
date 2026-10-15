@@ -1,5 +1,6 @@
 #include "backup_catalog.h"
 #include "replay_format.h"
+#include "metadata_view.h"
 #include <algorithm>
 #include <filesystem>
 #include <sys/file.h>
@@ -76,6 +77,40 @@ void publish(const std::string& temporary,const std::string& path){
 }
 std::vector<BackupCatalog::Entry> BackupCatalog::entries(const std::string& input){
     auto directory=std::filesystem::absolute(input).lexically_normal().string();Lock lock(directory,false);return load(directory);
+}
+BackupCatalog::RevisionPoint BackupCatalog::revision_point(const std::string& input,const std::string& name){
+    NamespaceView::valid_name(name);
+    auto directory=std::filesystem::absolute(input).lexically_normal().string();Lock lock(directory,false);auto packages=load(directory);
+    const auto key="R/"+std::string("\0forkfs-history/",16)+"revision/"+name;
+    std::string revision,descriptor;std::optional<std::pair<uint64_t,std::string>> event;
+    auto binding=[&](const std::string& id){
+        require(id.size()==32,"invalid catalog revision binding");
+        require(revision.empty() || revision==id,"ambiguous catalog revision identity");revision=id;
+    };
+    for(const auto& package:packages){
+        replay::File file(package.archive);replay::Reader reader(file);
+        while(!reader.ended){auto payload=reader.next();if(reader.ended)break;
+            if(reader.header.kind=='B'){
+                auto row=replay::base_row(payload);if(row.key==key)binding(row.value);
+            }else{
+                auto tx=replay::transaction(payload);
+                for(const auto& op:tx.ops)if(op.key==key && !op.erase){
+                    binding(op.value);const auto candidate=std::make_pair(tx.sequence,replay::hash(payload));
+                    require(!event || *event==candidate,"ambiguous catalog revision creation events");event=candidate;
+                    // A new descriptor in this same atomic transaction is positive
+                    // creation evidence. A later root re-PUT alone is insufficient.
+                    for(const auto& object:tx.ops)if(object.key=="O/"+revision && !object.erase)descriptor=object.value;
+                }
+            }
+        }
+        require(hex(replay::hash("forkfs.catalog.package.v1"+replay::le(package.size)+reader.digest))==package.digest,
+                "catalog archive changed during revision lookup");
+    }
+    require(!revision.empty(),"revision not found in catalog");
+    require(event.has_value() && !descriptor.empty(),"revision creation transaction not retained in catalog");
+    require(descriptor.size()==80 && descriptor.starts_with("FFREV001") && replay::hash(descriptor)==revision,"invalid catalog revision descriptor");
+    require(replay::num(descriptor.substr(72))<event->first,"invalid catalog revision source sequence");
+    return {hex(revision),{event->first,packages.front().checkpoint.repository,hex(event->second)}};
 }
 void BackupCatalog::add(const std::string& input,const std::string& archive,std::optional<LevelStore::RecoveryPoint> expected,std::optional<uint64_t> after){
     auto directory=std::filesystem::absolute(input).lexically_normal().string();Lock lock(directory,true);auto existing=load(directory);

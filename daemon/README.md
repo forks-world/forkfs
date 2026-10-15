@@ -439,3 +439,26 @@ returns its persisted result; it does not continually audit external files.
 Source task bookkeeping upgrades to FFBKT002 when catalog tasks exist and still
 reads FFBKT001. Older binaries cannot read FFBKT002. Task records remain source-local
 and are not part of backup data. Forgetting a task never removes catalog packages.
+
+### Recover a revision by name from a catalog
+
+```
+forkfsd catalog-revision CATALOG REVISION_NAME
+forkfsd restore-plan --revision REVISION_NAME --catalog CATALOG
+forkfsd restore DESTINATION --revision REVISION_NAME --catalog CATALOG
+```
+
+The resolver scans validated catalog archives for the actual revision creation
+transaction and returns its revision ID and checkpoint. It does not need the source
+database. Duplicate copies of the same transaction in overlapping archives are
+collapsed. Different descriptors or distinct binding events for the same name are
+ambiguous and rejected; use an explicitly chosen checkpoint to disambiguate.
+
+A full backup preserves revision trees but does not prove their creation endpoints.
+Name resolution therefore requires a retained creation transaction, including the
+new descriptor object in that transaction. A later re-PUT of an existing descriptor
+alone is insufficient. Missing history is an error, not a fabricated `source+1`
+endpoint. Finding a creation receipt does not prove a complete recovery chain exists;
+`restore-plan` checks that separately. `restore` still validates all recovered
+namespaces before publishing. Recovery reaches the repository-wide creation commit,
+not merely the contents of the revision's World.
