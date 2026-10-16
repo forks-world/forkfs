@@ -18,6 +18,9 @@ class ObjectStore {
     static constexpr uint64_t segment_limit=64*1024*1024,header_size=48;
     static constexpr size_t chunk_size=64*1024;
     size_t budget_;
+#ifdef FORKFS_TEST_FAULTS
+    size_t test_record_=0;
+#endif
     struct Entry {std::string bytes;size_t charge;std::list<std::string>::iterator position;};
     mutable std::mutex cache_mutex_;
     mutable std::list<std::string> lru_;
@@ -79,6 +82,17 @@ class ObjectStore {
         auto record=std::string("FFCHNK01")+hash+replay::le(data.size(),4)+data;
         if(active_>=0 && end_+record.size()>segment_limit){sync(active_);close(active_);active_=-1;}
         open_segment(record.size());auto at=end_;
+#ifdef FORKFS_TEST_FAULTS
+        // Crash mid-record, without exception unwinding or a metadata write.
+        const char* crash=getenv("FORKFS_TEST_CRASH");
+        if(crash && !strcmp(crash,"segment_partial_record")){
+            const char* ordinal=getenv("FORKFS_TEST_SEGMENT_RECORD");
+            if(++test_record_==(ordinal?std::stoull(ordinal):1)){
+                const char* count=getenv("FORKFS_TEST_SEGMENT_CUT");auto cut=count?std::stoull(count):record.size()/2;
+                need(cut>0 && cut<record.size(),"invalid test record cut");write_at(active_,record.substr(0,cut),at);_exit(86);
+            }
+        }
+#endif
         if(injected("partial_write")){write_at(active_,record.substr(0,record.size()/2),at);throw std::system_error(ENOSPC,std::generic_category(),"injected segment write failure");}
         write_at(active_,record,at);end_+=record.size();dirty_=true;fault("segment_after_append");
         return number(segment_)+number(at)+replay::le(data.size(),4);

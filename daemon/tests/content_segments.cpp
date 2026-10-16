@@ -38,7 +38,7 @@ int main(){auto temp=(std::filesystem::temp_directory_path()/"ff-segments-XXXXXX
     }
     auto target=temp+"/target";LevelStore::replay_archive(temp+"/base.pack",target);LevelStore::replay_archive(temp+"/delta.pack",target);
     {LevelStore store(target);CHECK(store.object(store.root("head"))==changed);CHECK(store.object(first_id)==first);store.verify();}
-    // Reopen appends to the same segment; tiny values remain inline.
+    // Reopen appends to the same segment; tiny objects are packed records too.
     auto previous_size=physical_size(path);{LevelStore store(path);auto next=changed;next.back()^=1;store.transact(store.sequence(),{{"head",next},{"tiny",Bytes{0,255}}});store.verify();}
     CHECK(physical_size(path)-previous_size==65536+44+2+44); // Changed block plus packed tiny object.
     {
