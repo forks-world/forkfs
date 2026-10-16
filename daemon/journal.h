@@ -1,4 +1,5 @@
 #pragma once
+#include "tree_height_cache.h"
 #include <array>
 #include <cstdint>
 #include <map>
@@ -51,6 +52,8 @@ public:
     size_t count() const;
     bool pending_tail() const { return tail_; }
 private:
+    friend class MetadataTree;
+    mutable TreeHeightCache tree_heights_;
     struct Location { uint64_t payload; uint32_t length; };
     std::unique_ptr<LevelStore> leveldb_;
     bool read_only_=false;

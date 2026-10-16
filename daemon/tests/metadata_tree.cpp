@@ -52,9 +52,50 @@ std::pair<MetadataTree::Plan,std::string> deep_fixture(const Journal& journal,co
     }
     MetadataTree editor(journal);return {editor.apply(changes),branching?chain[254]:chain.back()};
 }
+// Count actual object loads rather than wall time: a fresh editor must reuse
+// untouched subtree validation across transactions, branches and evictions.
+void height_cache_regression() {
+    using Id=MetadataTree::Id;using Bytes=MetadataTree::Bytes;
+    std::map<Id,Bytes> objects;size_t reads=0;
+    auto read=[&](const Id& id){++reads;return objects.at(id);};
+    auto key=[](const std::string& s){return std::string("\0forkfs/",8)+s;};
+    auto value=Journal::object_id({42}),other=Journal::object_id({43});
+    TreeHeightCache cache;
+    MetadataTree::Changes initial{{key("root"),value}};
+    for(unsigned i=0;i<4096;++i)initial[key("file/"+std::to_string(i))]=value;
+    auto plan=MetadataTree(read,{},&cache).apply(initial);auto root=tree_root(plan);
+    for(const auto& bytes:plan.objects) {
+        auto id=Journal::object_id(bytes);
+        check(!cache.get(id)); // Unpublished nodes must not leak into shared hints.
+        objects[id]=bytes;
+    }
+    reads=0;
+    auto changes=MetadataTree::Changes{{key("file/123"),other}};
+    auto cold=MetadataTree(read,root,&cache).apply(changes);auto cold_reads=reads;
+    check(cold_reads>=4096);
+    reads=0;auto warm=MetadataTree(read,root,&cache).apply(changes);
+    check(reads<256 && warm.manifest==cold.manifest && warm.objects==cold.objects);
+    for(const auto& bytes:warm.objects)check(!cache.get(Journal::object_id(bytes)));
+    // A new branch and different edit reuse the same committed subtrees.
+    reads=0;MetadataTree(read,root,&cache).apply({{key("file/2048"),other}});check(reads<256);
+    // Persist a plan and edit its root in a fresh editor, then compare with an
+    // uncached traversal. Identical results preserve deterministic replay IDs.
+    for(const auto& bytes:warm.objects)objects[Journal::object_id(bytes)]=bytes;
+    auto next=tree_root(warm);reads=0;
+    auto edit=MetadataTree(read,next,&cache).apply({{key("file/99"),other}});check(reads<256);
+    auto reference=MetadataTree(read,next).apply({{key("file/99"),other}});
+    check(edit.manifest==reference.manifest && edit.objects==reference.objects);
+    TreeHeightCache tiny(2),disabled(0);
+    for(auto* hints:{&tiny,&disabled}) {
+        auto evicted=MetadataTree(read,root,hints).apply(changes);
+        auto again=MetadataTree(read,root,hints).apply(changes);
+        check(evicted.manifest==cold.manifest && again.objects==cold.objects);
+    }
+}
 int main() {
     auto pattern=(std::filesystem::temp_directory_path()/"ff-tree-XXXXXX").string();auto directory=mkdtemp(pattern.data());if(!directory)return 1;
     try {
+        height_cache_regression();
         auto path=std::string(directory)+"/store";LevelStore::create(path);
         auto key=[](const std::string& suffix){return std::string("\0forkfs/",8)+suffix;};
         MetadataTree::Id old_root{},new_root{},deep_deleted_root{},branch_deleted_root{};
