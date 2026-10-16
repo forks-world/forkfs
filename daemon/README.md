@@ -470,3 +470,17 @@ remain readable. `fs-snapshot` derives its parent from the World base. To record
 explicit ancestry, use `fs-snapshot-parents REPO NAME PARENT[,PARENT...] [--world WORLD]`
 (or `-` for no parents). RPC omits REPO. This records the selected World's current
 contents; it does not merge files. See [format and validation](../docs/REVISION_DAG.md).
+
+## Segmented content backing
+
+New repositories keep all immutable object bytes in an independent ObjectStore,
+including tiny files and metadata objects. Larger objects use reusable 64 KiB
+chunks; small records are packed into shared segments. LevelDB stores only
+location descriptors, indexes and references;
+retained replay logs contain object references instead of repeating file data.
+Data is synchronized before metadata publication. Backup packs still contain full
+portable bytes and restore reconstructs the segmented layout. See
+[physical format, migration and limits](../docs/CONTENT_SEGMENTS.md).
+
+The existing 256 KiB namespace file limit and whole-value preparation remain;
+segmented backing does not yet provide large-file range-only I/O or data GC.

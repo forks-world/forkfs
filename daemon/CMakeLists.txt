@@ -232,3 +232,15 @@ add_test(NAME forkfsd_revision_dag_core COMMAND forkfsd_revision_dag_test)
 add_test(NAME forkfsd_revision_dag COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/revision_dag.py $<TARGET_FILE:forkfsd>)
 set_tests_properties(forkfsd_revision_dag_core forkfsd_revision_dag PROPERTIES TIMEOUT 120 LABELS metadata-regression)
+
+add_executable(forkfsd_content_segments_test tests/content_segments.cpp)
+target_link_libraries(forkfsd_content_segments_test PRIVATE forkfs_metadata)
+add_test(NAME forkfsd_content_segments COMMAND forkfsd_content_segments_test)
+set_tests_properties(forkfsd_content_segments PROPERTIES TIMEOUT 120 LABELS metadata-regression)
+add_test(NAME forkfsd_content_segments_crash COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/content_segments.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
+set_tests_properties(forkfsd_content_segments_crash PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+add_executable(forkfsd_object_store_test tests/object_store.cpp)
+target_link_libraries(forkfsd_object_store_test PRIVATE forkfs_metadata)
+add_test(NAME forkfsd_object_store COMMAND forkfsd_object_store_test)
+set_tests_properties(forkfsd_object_store PROPERTIES TIMEOUT 120 LABELS metadata-regression)

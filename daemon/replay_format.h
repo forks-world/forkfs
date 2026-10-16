@@ -1,6 +1,5 @@
 #pragma once
 #include "journal.h"
-#include <leveldb/write_batch.h>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -14,7 +13,6 @@ namespace forkfs::replay {
 using Hash=std::array<unsigned char,32>;
 constexpr size_t max_frame=24*1024*1024;
 inline void require(bool ok,const char* message){if(!ok)throw std::runtime_error(message);}
-inline void checked(const leveldb::Status& s){if(!s.ok())throw std::runtime_error(s.ToString());}
 inline std::string raw(const Hash& h){return {reinterpret_cast<const char*>(h.data()),h.size()};}
 inline std::string hash(const std::string& s){return raw(Journal::object_id({s.begin(),s.end()}));}
 inline std::string le(uint64_t n,unsigned width=8){std::string s;for(unsigned i=0;i<width;++i)s+=char(n>>(8*i));return s;}
@@ -45,10 +43,12 @@ inline std::vector<Op> decode(const std::string& data){
     }
     in.end();return ops;
 }
-struct Capture:leveldb::WriteBatch::Handler {
+// In-memory logical operations. Object payloads never enter a LevelDB WriteBatch.
+struct Batch {
     std::vector<Op> ops;
-    void Put(const leveldb::Slice& k,const leveldb::Slice& v) override {ops.push_back({k.ToString(),v.ToString(),false});}
-    void Delete(const leveldb::Slice& k) override {ops.push_back({k.ToString(),{},true});}
+    void Put(const std::string& key,const std::string& value){ops.push_back({key,value,false});}
+    void Delete(const std::string& key){ops.push_back({key,{},true});}
+    void Clear(){ops.clear();}
 };
 struct Transaction {uint64_t sequence;std::string previous;std::vector<Op> ops;};
 inline Transaction transaction(const std::string& payload){
