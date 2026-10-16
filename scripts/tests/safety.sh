@@ -11,6 +11,10 @@
 #   scripts/tests/safety.sh [build-dir] [scratch-dir]
 set -uo pipefail
 
+# Drain pipeline input even after a match: grep -q can close the pipe early,
+# making a successful producer fail with SIGPIPE under pipefail.
+contains() { grep "$@" > /dev/null; }
+
 BUILD=${1:-build/Release}
 cd "$(dirname "$0")/../.."
 BUILD=$(cd "$BUILD" && pwd)
@@ -149,7 +153,7 @@ freed_entries() { sed -n 's/.* \([0-9][0-9]*\) entries unlinked in .*/\1/p' "$1"
 has_hint() {
     local rule=$1 desc=$2 needle=$3; shift 4
     local out; out=$("$@" 2>&1)
-    if echo "$out" | grep -q "try: .*$needle"; then ok "$rule" "$desc"
+    if echo "$out" | contains "try: .*$needle"; then ok "$rule" "$desc"
     else bad "$rule" "$desc (no 'try: ...$needle' in output)"; echo "$out" | sed 's/^/        /'; fi
 }
 
@@ -167,7 +171,7 @@ has_hint P6 "the refusal names --store / --copy" "--store" -- "$WORLD" fs init /
 # ---- init: a protected snapshot -------------------------------------------------------------
 out=$("$WORLD" fs init "$PROJ" --name proj 2>&1) || { echo "$out"; echo "init failed"; exit 1; }
 echo "$out" | sed 's/^/      /'
-if echo "$out" | grep -qi "hardlink"; then ok P9 "init reports the hardlinks it found in the tree"
+if echo "$out" | contains -i "hardlink"; then ok P9 "init reports the hardlinks it found in the tree"
 else bad P9 "init reports the hardlinks it found in the tree"; fi
 
 SNAP=$("$WORLD" fs inspect S1 | awk '/^path:/{print $2}')
@@ -232,8 +236,8 @@ fi
 # ---- P1: identity survives a move -----------------------------------------------------------
 mv "$SCRATCH/w1" "$SCRATCH/w1-moved"
 check P1 "a world moved away is not silently used at the old path" 3 -- "$WORLD" fs verify W1
-if "$WORLD" fs verify "$SCRATCH/w1-moved" | grep -q "path repaired" &&
-   "$WORLD" fs inspect W1 | grep -q "w1-moved"; then
+if "$WORLD" fs verify "$SCRATCH/w1-moved" | contains "path repaired" &&
+   "$WORLD" fs inspect W1 | contains "w1-moved"; then
     ok P1 "verify <new path> re-registers the moved world"
 else
     bad P1 "verify <new path> re-registers the moved world"
@@ -254,13 +258,13 @@ check P2 "adopting twice is refused" 3 -- "$WORLD" fs adopt "$SCRATCH/w1-copy"
 
 # ---- P4: discard is reversible ----------------------------------------------------------------
 "$WORLD" fs discard W2 > /dev/null
-if [ ! -e "$SCRATCH/w1-copy" ] && "$WORLD" fs list | grep -q "W2.*trashed"; then
+if [ ! -e "$SCRATCH/w1-copy" ] && "$WORLD" fs list | contains "W2.*trashed"; then
     ok P4 "discard moves the world to the trash"
 else
     bad P4 "discard moves the world to the trash"
 fi
 "$WORLD" fs gc --retention 7 > /dev/null
-"$WORLD" fs list | grep -q "W2.*trashed" && ok P4 "gc keeps trash inside the retention window" \
+"$WORLD" fs list | contains "W2.*trashed" && ok P4 "gc keeps trash inside the retention window" \
                                          || bad P4 "gc keeps trash inside the retention window"
 if "$WORLD" fs restore W2 > /dev/null && [ "$(cat "$SCRATCH/w1-copy/hello.txt")" = edited ]; then
     ok P4 "restore brings it back with its content"
@@ -270,7 +274,7 @@ fi
 "$WORLD" fs discard W2 > /dev/null
 # --now is the synchronous gc: without it the trash is handed to the background collector (T2.1).
 "$WORLD" fs gc --retention 0 --now > /dev/null
-if "$WORLD" fs list | grep -q "^W2"; then bad P4 "gc past the retention window deletes it"
+if "$WORLD" fs list | contains "^W2"; then bad P4 "gc past the retention window deletes it"
 else ok P4 "gc past the retention window deletes it"; fi
 
 # ---- P8 + PR #1 review (3rd round): `.wfs-tmp` in a user's directory is the user's ------------
@@ -381,9 +385,9 @@ if command -v sqlite3 > /dev/null 2>&1; then
         bad PR5 "a fork tree gc cannot remove keeps its row and its tmp_path (state $STUCKSTATE)"
         echo "$out" | sed 's/^/        /'
     fi
-    echo "$out" | grep -q "could not be removed" && ok PR5 "gc says so instead of reporting it collected" \
+    echo "$out" | contains "could not be removed" && ok PR5 "gc says so instead of reporting it collected" \
                                                  || { bad PR5 "gc says so instead of reporting it collected"; echo "$out" | sed 's/^/        /'; }
-    if "$WORLD" fs gc --status | grep -q "^abandoned: *1 half-built tree"; then
+    if "$WORLD" fs gc --status | contains "^abandoned: *1 half-built tree"; then
         ok PR5 "gc --status counts the abandoned tree"
     else
         bad PR5 "gc --status counts the abandoned tree"; "$WORLD" fs gc --status | sed 's/^/        /'
@@ -397,7 +401,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
     else
         bad PR5 "once it can be removed the next gc removes it and buries the row (state $STUCKSTATE)"
     fi
-    "$WORLD" fs gc --status | grep -q "^abandoned:" && bad PR5 "and stops counting it" \
+    "$WORLD" fs gc --status | contains "^abandoned:" && bad PR5 "and stops counting it" \
                                                     || ok PR5 "and stops counting it"
 fi
 
@@ -413,15 +417,15 @@ mkdir -p "$SWEEPSTUCK/keep"
 echo x > "$SWEEPSTUCK/keep/f.txt"
 chmod +a "$(id -un) deny delete,delete_child,add_file" "$SWEEPSTUCK/keep"
 out=$("$WORLD" fs gc 2>&1)
-if [ -e "$SWEEPSTUCK/keep/f.txt" ] && echo "$out" | grep -q "could not be removed"; then
+if [ -e "$SWEEPSTUCK/keep/f.txt" ] && echo "$out" | contains "could not be removed"; then
     ok PR11 "gc reports the *.wfs-tmp it could not sweep"
 else
     bad PR11 "gc reports the *.wfs-tmp it could not sweep"; echo "$out" | sed 's/^/        /'
 fi
-echo "$out" | grep -q "the collector will try again" \
+echo "$out" | contains "the collector will try again" \
     && ok PR11 "and keeps work_remains set, so the worker chain comes back for it" \
     || { bad PR11 "and keeps work_remains set, so the worker chain comes back for it"; echo "$out" | sed 's/^/        /'; }
-if "$WORLD" fs gc --status | grep -q "^abandoned: *1 half-built tree"; then
+if "$WORLD" fs gc --status | contains "^abandoned: *1 half-built tree"; then
     ok PR11 "gc --status counts it"
 else
     bad PR11 "gc --status counts it"; "$WORLD" fs gc --status | sed 's/^/        /'
@@ -429,7 +433,7 @@ fi
 # Take the ACL away and the next sweep finishes it -- and stops counting it.
 chmod -N "$SWEEPSTUCK/keep"
 "$WORLD" fs gc > /dev/null 2>&1
-if [ ! -e "$SWEEPSTUCK" ] && ! "$WORLD" fs gc --status | grep -q "^abandoned:"; then
+if [ ! -e "$SWEEPSTUCK" ] && ! "$WORLD" fs gc --status | contains "^abandoned:"; then
     ok PR11 "once it can be removed the next gc removes it and stops counting it"
 else
     bad PR11 "once it can be removed the next gc removes it and stops counting it"
@@ -453,7 +457,7 @@ check P13 "a store with a different schema is refused" 3 -- "$WORLD" --store "$S
 
 # ---- checkpoint and the snapshot DAG --------------------------------------------------------------
 # --hard: the old per-entry UF_IMMUTABLE protection, still available by request.
-if "$WORLD" fs checkpoint W1 --name after-edit --hard | grep -q "from W1"; then
+if "$WORLD" fs checkpoint W1 --name after-edit --hard | contains "from W1"; then
     ok "--" "checkpoint records which world it came from"
 else
     bad "--" "checkpoint records which world it came from"
@@ -463,7 +467,7 @@ fi
 
 # ---- P3 again: --hard protection and the old tamper test -------------------------------------------
 S2=$("$WORLD" fs inspect S2 | awk '/^path:/{print $2}')
-"$WORLD" fs inspect S2 | grep -q "protection: hard" && ok P3 "S2 is recorded as a hard snapshot" \
+"$WORLD" fs inspect S2 | contains "protection: hard" && ok P3 "S2 is recorded as a hard snapshot" \
                                                     || bad P3 "S2 is recorded as a hard snapshot"
 [ "$(cat "$S2/hello.txt")" = edited ] && ok P3 "a hard snapshot stays readable (no gate)" \
                                       || bad P3 "a hard snapshot stays readable (no gate)"
@@ -529,7 +533,7 @@ rm -f "$OTHER/allowed" "$SCRATCH/w1-moved/sandbox-ok" /private/tmp/wfs-sandbox-o
 # A fresh world, a change of every kind, and then the two paths have to agree line for line.
 "$WORLD" fs fork --from S1 --to "$SCRATCH/wdiff" --name wdiff > "$SCRATCH/wd.log" 2>&1
 WD=$(awk '{print $1}' "$SCRATCH/wd.log")
-if ! echo "$WD" | grep -qE '^W[0-9]+$' || [ ! -d "$SCRATCH/wdiff" ]; then
+if ! echo "$WD" | contains -E '^W[0-9]+$' || [ ! -d "$SCRATCH/wdiff" ]; then
     bad P10 "fork a world to diff"; cat "$SCRATCH/wd.log" | sed 's/^/        /'
 else
     [ -z "$("$WORLD" fs diff "$WD")" ] && ok P10 "an untouched world diffs to nothing" \
@@ -555,7 +559,7 @@ else
     fi
     [ "$(cat "$SCRATCH/d-full.txt")" = "$want" ] && ok P10 "diff --full agrees line for line" \
                                                  || { bad P10 "diff --full agrees line for line"; sed 's/^/        /' "$SCRATCH/d-full.txt"; }
-    "$WORLD" fs diff "$WD" --stat | grep -q '^2 added, 1 modified, 1 deleted, 1 metadata-only$' \
+    "$WORLD" fs diff "$WD" --stat | contains '^2 added, 1 modified, 1 deleted, 1 metadata-only$' \
         && ok P10 "diff --stat counts them (default path)" || bad P10 "diff --stat counts them (default path)"
     # The source snapshot going away is a refusal with a reason, not a wrong answer.
     SP=$("$WORLD" fs inspect S1 | awk '/^path:/{print $2}')
@@ -569,7 +573,7 @@ fi
 # An entry is a finished clone of S1 waiting under the store with no marker and no world row.
 # A fork that finds one renames it into place; one that does not, clones as before.
 "$WORLD" fs pool drain --all > /dev/null
-"$WORLD" fs pool status | grep -q "^pool: empty" && ok T1.5 "pool status says when the pool is empty" \
+"$WORLD" fs pool status | contains "^pool: empty" && ok T1.5 "pool status says when the pool is empty" \
                                                  || bad T1.5 "pool status says when the pool is empty"
 
 # P7: the entries live inside the store, which is not a legal fork target.
@@ -626,7 +630,7 @@ grep -q "(pool)" "$SCRATCH/nopool.log" && bad T1.5 "--no-pool clones here and no
                                        || ok T1.5 "--no-pool clones here and now"
 
 # verify S1 also checks what is waiting, and gc cleans up after a killed filler.
-"$WORLD" fs verify S1 | grep -q "pool entries (0 touched)" && ok T1.5 "verify S1 reports the pool entries" \
+"$WORLD" fs verify S1 | contains "pool entries (0 touched)" && ok T1.5 "verify S1 reports the pool entries" \
                                                            || bad T1.5 "verify S1 reports the pool entries"
 mkdir -p "$WORLD_STORE/pool/S1/dead.wfs-tmp" "$WORLD_STORE/pool/S1/0000000000000000"
 before=$(ready_S1)
@@ -665,7 +669,7 @@ chmod 700 "$WORLD_STORE/pool"
     || { bad T1.5 "and the orphan goes as soon as the pool can be read again"; sed 's/^/        /' "$SCRATCH/gc-blindpool2.log"; }
 
 "$WORLD" fs pool drain S1 > /dev/null
-"$WORLD" fs pool status | grep -q "^pool: empty" && ok T1.5 "pool drain empties it" \
+"$WORLD" fs pool status | contains "^pool: empty" && ok T1.5 "pool drain empties it" \
                                                  || bad T1.5 "pool drain empties it"
 
 # ---- M2 ----------------------------------------------------------------------------------------
@@ -692,11 +696,11 @@ else bad T2.1 "discard of a 42-entry world is O(1) ($((t1-t0)) ms)"; fi
 TRASHED=$(ls -d "$S2"/trash/W1-* 2>/dev/null | head -1)
 if [ -n "$TRASHED" ] && [ -f "$TRASHED/hello.txt" ]; then ok T2.1 "the tree is intact in <store>/trash"
 else bad T2.1 "the tree is intact in <store>/trash"; fi
-w2 fs gc --status | grep -q "^trash: *1 entries" && ok T2.1 "gc --status counts the trash" \
+w2 fs gc --status | contains "^trash: *1 entries" && ok T2.1 "gc --status counts the trash" \
                                                  || { bad T2.1 "gc --status counts the trash"; w2 fs gc --status | sed 's/^/        /'; }
-w2 fs gc --status | grep -qE "contents: *42 tree entries, ~" && ok T2.1 "gc --status reports entries and an estimated size" \
+w2 fs gc --status | contains -E "contents: *42 tree entries, ~" && ok T2.1 "gc --status reports entries and an estimated size" \
                                                              || { bad T2.1 "gc --status reports entries and an estimated size"; w2 fs gc --status | sed 's/^/        /'; }
-w2 fs gc --status | grep -q "^worker: *none" && ok T2.1 "gc --status says when no worker is running" \
+w2 fs gc --status | contains "^worker: *none" && ok T2.1 "gc --status says when no worker is running" \
                                              || bad T2.1 "gc --status says when no worker is running"
 # Inside the retention window nothing is due and no worker is started.
 w2 fs gc > "$SCRATCH/gc1.log" 2>&1
@@ -719,7 +723,7 @@ for _ in $(seq 60); do
     [ -f "$S2/logs/gc.log" ] && grep -q "entries unlinked" "$S2/logs/gc.log" && break
     sleep 0.25
 done
-w2 fs list | grep -q "^W1 .*trashed" && bad T2.1 "the collected world is marked dead" \
+w2 fs list | contains "^W1 .*trashed" && bad T2.1 "the collected world is marked dead" \
                                      || ok T2.1 "the collected world is marked dead"
 [ -s "$S2/logs/gc.log" ] && ok T2.1 "the worker logs to <store>/logs/gc.log" \
                          || bad T2.1 "the worker logs to <store>/logs/gc.log"
@@ -756,7 +760,7 @@ w2 fs gc --now --retention 0 > /dev/null 2>&1
 # ---- T2.2: discarding a snapshot ---------------------------------------------------------------
 check    T2.2 "discard S<n> is refused while an active world needs it" 3 -- w2 fs discard S1
 out=$(w2 fs discard S1 2>&1)
-echo "$out" | grep -qE "source of [0-9]+ active world\(s\) \(W[0-9]+" && ok T2.2 "that refusal names the worlds holding it" \
+echo "$out" | contains -E "source of [0-9]+ active world\(s\) \(W[0-9]+" && ok T2.2 "that refusal names the worlds holding it" \
                                                                        || { bad T2.2 "that refusal names the worlds holding it"; echo "$out" | sed 's/^/        /'; }
 has_hint  T2.2 "the refusal offers checkpoint as the way out" "checkpoint" -- w2 fs discard S1
 # --force must NOT be a way to orphan a live world's source.
@@ -768,14 +772,14 @@ w2 fs pool fill S1 --count 1 > /dev/null 2>&1
 check    T2.2 "a pool entry alone still refuses" 3 -- w2 fs discard S1
 has_hint T2.2 "that refusal offers --force" "--force" -- w2 fs discard S1
 check    T2.2 "--force drains the pool and discards" 0 -- w2 fs discard S1 --force
-w2 fs status | grep -qE "^snapshots: .*1 trashed" && ok T2.2 "fs status counts the trashed snapshot" \
+w2 fs status | contains -E "^snapshots: .*1 trashed" && ok T2.2 "fs status counts the trashed snapshot" \
                                                   || { bad T2.2 "fs status counts the trashed snapshot"; w2 fs status | sed 's/^/        /'; }
-w2 fs pool status | grep -q "^pool: empty" && ok T2.2 "--force drained its pool entries" \
+w2 fs pool status | contains "^pool: empty" && ok T2.2 "--force drained its pool entries" \
                                            || bad T2.2 "--force drained its pool entries"
 # A world in the trash whose source is gone cannot come back.
 check    T2.2 "restoring a world whose snapshot was discarded is refused" 3 -- w2 fs restore W3
 out=$(w2 fs restore W3 2>&1)
-echo "$out" | grep -q "no baseline" && ok T2.2 "that refusal explains why (no baseline to diff against)" \
+echo "$out" | contains "no baseline" && ok T2.2 "that refusal explains why (no baseline to diff against)" \
                                    || { bad T2.2 "that refusal explains why"; echo "$out" | sed 's/^/        /'; }
 # The gate is 0000; the deleter has to reopen it or nothing below it can be unlinked.
 SNAPTRASH=$(ls -d "$S2"/trash/S1-* 2>/dev/null | head -1)
@@ -795,16 +799,16 @@ rm -rf "$SCRATCH/t-e"                                  # and so does a world
 w2 fs gc --retention 7 > "$SCRATCH/rec1.log" 2>&1
 grep -q "1 snapshot(s) and 1 world(s)" "$SCRATCH/rec1.log" && ok T2.2 "gc reports dangling rows without touching them" \
                                                            || { bad T2.2 "gc reports dangling rows without touching them"; sed 's/^/        /' "$SCRATCH/rec1.log"; }
-w2 fs status | grep -q "^dangling:" && ok T2.2 "fs status reports them too" \
+w2 fs status | contains "^dangling:" && ok T2.2 "fs status reports them too" \
                                     || { bad T2.2 "fs status reports them too"; w2 fs status | sed 's/^/        /'; }
-w2 fs list | grep -q "^S2" && ok T2.2 "a plain gc leaves the dangling rows alone" \
+w2 fs list | contains "^S2" && ok T2.2 "a plain gc leaves the dangling rows alone" \
                            || bad T2.2 "a plain gc leaves the dangling rows alone"
 w2 fs gc --reconcile --retention 7 > "$SCRATCH/rec2.log" 2>&1
 grep -q "reconciled: 1 snapshots and 1 worlds" "$SCRATCH/rec2.log" && ok T2.2 "gc --reconcile marks them dead" \
                                                                    || { bad T2.2 "gc --reconcile marks them dead"; sed 's/^/        /' "$SCRATCH/rec2.log"; }
-w2 fs list | grep -q "^S2" && bad T2.2 "the dead snapshot is gone from the listing" \
+w2 fs list | contains "^S2" && bad T2.2 "the dead snapshot is gone from the listing" \
                            || ok T2.2 "the dead snapshot is gone from the listing"
-w2 fs status | grep -q "^dangling:" && bad T2.2 "nothing dangles afterwards" \
+w2 fs status | contains "^dangling:" && bad T2.2 "nothing dangles afterwards" \
                                     || ok T2.2 "nothing dangles afterwards"
 
 # ---- T2.3: the world marker carries its store's path ---------------------------------------------
@@ -916,7 +920,7 @@ echo shared > "$SCRATCH/extproj/shared.txt"
 ln "$SCRATCH/extproj/shared.txt" "$SCRATCH/outside.txt"
 out=$("$WORLD" fs init "$SCRATCH/extproj" --name extproj 2>&1)
 EXTSNAP=$(echo "$out" | awk '/^S[0-9]+ /{print $1}')
-if echo "$out" | grep -q "outside this tree"; then ok T2.5 "init warns about the links it cannot rebuild"
+if echo "$out" | contains "outside this tree"; then ok T2.5 "init warns about the links it cannot rebuild"
 else bad T2.5 "init warns about the links it cannot rebuild"; echo "$out" | sed 's/^/        /'; fi
 "$WORLD" fs fork --from "$EXTSNAP" --to "$SCRATCH/w-ext" --no-pool > /dev/null 2>&1
 if [ "$(stat -f %l "$SCRATCH/w-ext/shared.txt" 2>/dev/null)" = 1 ] &&
@@ -1038,7 +1042,7 @@ has_hint P17 "the refusal says restore the db or move the store aside" "restore 
 [ ! -e "$P17STORE/metadata3.db" ] && ok P17 "the refused open left no new database behind" \
                                  || bad P17 "the refused open left no new database behind"
 out=$("$WORLD" --store "$P17STORE" fs gc --reconcile 2>&1)
-if echo "$out" | grep -q "gc --reconcile.*cannot help"; then
+if echo "$out" | contains "gc --reconcile.*cannot help"; then
     ok P17 "the refusal explains that gc --reconcile cannot repair this"
 else
     bad P17 "the refusal explains that gc --reconcile cannot repair this"; echo "$out" | sed 's/^/        /'
@@ -1068,18 +1072,18 @@ chmod 0000 "$P17STORE/snapshots"
 p17out=$("$WORLD" --store "$P17STORE" fs status 2>&1); p17rc=$?
 chmod 0755 "$P17STORE/snapshots"
 if [ "$p17rc" = 1 ] \
-   && echo "$p17out" | grep -q "this command removed no snapshot" \
-   && echo "$p17out" | grep -q "never taken for an empty one" \
-   && echo "$p17out" | grep -q "carries on from there" \
-   && ! echo "$p17out" | grep -q "nothing was created" \
-   && ! echo "$p17out" | grep -q "no metadata3.db and no store id"; then
+   && echo "$p17out" | contains "this command removed no snapshot" \
+   && echo "$p17out" | contains "never taken for an empty one" \
+   && echo "$p17out" | contains "carries on from there" \
+   && ! echo "$p17out" | contains "nothing was created" \
+   && ! echo "$p17out" | contains "no metadata3.db and no store id"; then
     ok PR8 "an unreadable store is told what was not lost, not what was not created"
 else
     bad PR8 "an unreadable store is told what was not lost, not what was not created (exit $p17rc)"
     echo "$p17out" | sed 's/^/        /'
 fi
-if echo "$p17out" | grep -q "mv " || echo "$p17out" | grep -q "restore metadata3.db" \
-   || echo "$p17out" | grep -q "move the directory aside"; then
+if echo "$p17out" | contains "mv " || echo "$p17out" | contains "restore metadata3.db" \
+   || echo "$p17out" | contains "move the directory aside"; then
     bad PR8 "and never sent anywhere near moving or rebuilding the store"
     echo "$p17out" | sed 's/^/        /'
 else
@@ -1106,9 +1110,9 @@ else
     bad PR1 "discard S<n> --now deletes the snapshot tree before it returns"
     echo "$out" | sed 's/^/        /'; ls "$RSTORE/trash" 2>/dev/null | sed 's/^/        /'
 fi
-echo "$out" | grep -q "^S1 deleted" && ok PR1 "it says the snapshot is deleted, not collected later" \
+echo "$out" | contains "^S1 deleted" && ok PR1 "it says the snapshot is deleted, not collected later" \
                                     || { bad PR1 "it says the snapshot is deleted, not collected later"; echo "$out" | sed 's/^/        /'; }
-rv fs gc --status | grep -q "^trash: *0 entries" && ok PR1 "and leaves nothing in the trash" \
+rv fs gc --status | contains "^trash: *0 entries" && ok PR1 "and leaves nothing in the trash" \
                                                  || { bad PR1 "and leaves nothing in the trash"; rv fs gc --status | sed 's/^/        /'; }
 # Without --now it still only moves the tree into the trash.
 rv fs init "$SCRATCH/review-src" --name rv2 > /dev/null 2>&1
@@ -1119,15 +1123,15 @@ rv fs discard S2 > /dev/null 2>&1
 # `discard S<n>` then `discard S<n> --now` used to be a refusal, so the only way to get the space
 # back before the retention period was a store-wide gc. A world has always accepted exactly this.
 out=$(rv fs discard S2 --now 2>&1)
-if [ -z "$(ls -d "$RSTORE"/trash/S2-* 2>/dev/null)" ] && echo "$out" | grep -q "^S2 deleted"; then
+if [ -z "$(ls -d "$RSTORE"/trash/S2-* 2>/dev/null)" ] && echo "$out" | contains "^S2 deleted"; then
     ok PR5 "discard S<n> --now finishes a snapshot that was already trashed"
 else
     bad PR5 "discard S<n> --now finishes a snapshot that was already trashed"
     echo "$out" | sed 's/^/        /'; ls "$RSTORE/trash" 2>/dev/null | sed 's/^/        /'
 fi
-rv fs inspect S2 | grep -q "^state: *dead" && ok PR5 "and the row is dead, not still trashed" \
+rv fs inspect S2 | contains "^state: *dead" && ok PR5 "and the row is dead, not still trashed" \
                                            || { bad PR5 "and the row is dead, not still trashed"; rv fs inspect S2 | sed 's/^/        /'; }
-rv fs gc --status | grep -q "^trash: *0 entries" && ok PR5 "and the trash is empty again" \
+rv fs gc --status | contains "^trash: *0 entries" && ok PR5 "and the trash is empty again" \
                                                  || { bad PR5 "and the trash is empty again"; rv fs gc --status | sed 's/^/        /'; }
 # Without --now it is still a refusal, and the refusal now says what --now is for.
 rv fs init "$SCRATCH/review-src" --name rv3 > /dev/null 2>&1
@@ -1149,7 +1153,7 @@ rv fs discard "$RW" --now > /dev/null 2>&1
 rv fs discard S4 --now > /dev/null 2>&1
 check    PR6 "adopting a copy whose snapshot has been discarded is refused" 3 -- rv fs adopt "$SCRATCH/rv4-copy"
 has_hint PR6 "the refusal offers the marker-less way to keep it" "world fs init" -- rv fs adopt "$SCRATCH/rv4-copy"
-rv fs status | grep -q "^worlds: *0 active" && ok PR6 "and no world row was written for it" \
+rv fs status | contains "^worlds: *0 active" && ok PR6 "and no world row was written for it" \
                                              || { bad PR6 "and no world row was written for it"; rv fs status | sed 's/^/        /'; }
 
 # ---- PR #1 review (6th round, P2): a damaged hardlink manifest is not "no hardlinks" ----------
@@ -1172,7 +1176,7 @@ has_hint PR6 "the refusal sends you to verify" "world fs verify S5" -- rv fs for
                           || bad PR6 "and nothing was published at --to"
 check    PR6 "verify reports the damaged manifest" 3 -- rv fs verify S5
 check    PR6 "pool fill refuses it too" 3 -- rv fs pool fill S5 --count 1
-rv fs pool status | grep -q "^pool: empty" && ok PR6 "and leaves no ready entry behind" \
+rv fs pool status | contains "^pool: empty" && ok PR6 "and leaves no ready entry behind" \
                                             || { bad PR6 "and leaves no ready entry behind"; rv fs pool status | sed 's/^/        /'; }
 
 rv fs gc --now --retention 0 > /dev/null 2>&1
@@ -1196,7 +1200,7 @@ out=$(rv fs discard "$RW6" --now 2>&1); rc=$?
                          || { bad PR6 "and the tree is really gone when it returns"; ls "$RSTORE/trash" | sed 's/^/        /'; }
 [ -z "$(ls "$RSTORE"/trash 2>/dev/null)" ] && ok PR6 "and the trash is empty" \
                                            || { bad PR6 "and the trash is empty"; ls "$RSTORE/trash" | sed 's/^/        /'; }
-rv fs inspect "$RW6" | grep -q "^state: *dead" && ok PR6 "and the row is dead" \
+rv fs inspect "$RW6" | contains "^state: *dead" && ok PR6 "and the row is dead" \
                                                || { bad PR6 "and the row is dead"; rv fs inspect "$RW6" | sed 's/^/        /'; }
 
 # ---- PR #1 review (P2): the batch limit bites inside one tree, not only between trees ----------
@@ -1259,16 +1263,16 @@ chmod +a "$(id -un) deny delete,delete_child,add_file" "$STUCK/keep"
 out=$(rv fs gc --now --retention 0 2>&1)
 [ -d "$STUCK.deleting/keep" ] && ok PR1 "an undeletable trash entry stays in the trash" \
                               || { bad PR1 "an undeletable trash entry stays in the trash"; echo "$out" | sed 's/^/        /'; }
-echo "$out" | grep -q "could not be deleted" && ok PR1 "gc says so instead of reporting a clean run" \
+echo "$out" | contains "could not be deleted" && ok PR1 "gc says so instead of reporting a clean run" \
                                               || { bad PR1 "gc says so instead of reporting a clean run"; echo "$out" | sed 's/^/        /'; }
-echo "$out" | grep -q "will try again" && ok PR1 "the first failures are retried" \
+echo "$out" | contains "will try again" && ok PR1 "the first failures are retried" \
                                         || { bad PR1 "the first failures are retried"; echo "$out" | sed 's/^/        /'; }
-rv fs gc --status | grep -q "^trash: *1 entries" && ok PR1 "gc --status still counts it" \
+rv fs gc --status | contains "^trash: *1 entries" && ok PR1 "gc --status still counts it" \
                                                  || { bad PR1 "gc --status still counts it"; rv fs gc --status | sed 's/^/        /'; }
 # The retries are capped: after a few wakes the collector stops waking itself for it, but it
 # still says what is in there -- the trash is never reported as empty while it is not.
 for _ in 1 2 3 4; do out=$(rv fs gc --now --retention 0 2>&1); done
-echo "$out" | grep -q "too often" && ok PR1 "the retries are capped, with a reason" \
+echo "$out" | contains "too often" && ok PR1 "the retries are capped, with a reason" \
                                    || { bad PR1 "the retries are capped, with a reason"; echo "$out" | sed 's/^/        /'; }
 WORLD_GC_PAUSE_MS=0 rv fs gc --worker --retention 0 > "$SCRATCH/gcstuck.log" 2>&1
 grep -q "trash empty" "$SCRATCH/gcstuck.log" && bad PR1 "the worker never calls the trash empty while it is not" \
@@ -1376,9 +1380,9 @@ if [ "$((t1 - t0))" -lt 2500 ]; then ok PR6 "a one-second gc does not unlink a w
 else bad PR6 "a one-second gc does not unlink a whole pool clone ($((t1-t0)) ms)"; echo "$out" | sed 's/^/        /'; fi
 [ -n "$(ls "$PDIR" 2>/dev/null)" ] && ok PR6 "what it did not finish is still where a successor finds it" \
                                     || { bad PR6 "what it did not finish is still where a successor finds it"; echo "$out" | sed 's/^/        /'; }
-echo "$out" | grep -q "being collected in the background" && ok PR6 "and it hands the rest over" \
+echo "$out" | contains "being collected in the background" && ok PR6 "and it hands the rest over" \
                                                            || { bad PR6 "and it hands the rest over"; echo "$out" | sed 's/^/        /'; }
-rv fs gc --status | grep -q "stale pre-clone" && ok PR6 "gc --status counts the stale entry" \
+rv fs gc --status | contains "stale pre-clone" && ok PR6 "gc --status counts the stale entry" \
                                                || { bad PR6 "gc --status counts the stale entry"; rv fs gc --status | sed 's/^/        /'; }
 wait_collected "$RSTORE" "$PDIR"
 [ -z "$(ls "$PDIR" 2>/dev/null)" ] && ok PR6 "the successor chain finishes the pool entry" \
@@ -1411,9 +1415,9 @@ if command -v sqlite3 > /dev/null 2>&1; then
         bad PR7 "a half-built snapshot gc cannot remove keeps its row (rows $H7ROWS)"
         echo "$out" | sed 's/^/        /'
     fi
-    echo "$out" | grep -q "could not be removed" && ok PR7 "gc says so instead of reporting it collected" \
+    echo "$out" | contains "could not be removed" && ok PR7 "gc says so instead of reporting it collected" \
                                                  || { bad PR7 "gc says so instead of reporting it collected"; echo "$out" | sed 's/^/        /'; }
-    if h7 fs gc --status | grep -q "^abandoned: *1 half-built tree"; then
+    if h7 fs gc --status | contains "^abandoned: *1 half-built tree"; then
         ok PR7 "gc --status counts the half-built snapshot"
     else
         bad PR7 "gc --status counts the half-built snapshot"; h7 fs gc --status | sed 's/^/        /'
@@ -1427,7 +1431,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
     else
         bad PR7 "once it can be removed the next gc removes the tree and the row (rows $H7ROWS)"
     fi
-    h7 fs gc --status | grep -q "^abandoned:" && bad PR7 "and stops counting it" \
+    h7 fs gc --status | contains "^abandoned:" && bad PR7 "and stops counting it" \
                                               || ok PR7 "and stops counting it"
 fi
 
@@ -1462,10 +1466,10 @@ if command -v sqlite3 > /dev/null 2>&1; then
             bad PR8 "a stale pool entry gc cannot remove keeps its row (rows $P8ROWS)"
             echo "$out" | sed 's/^/        /'
         fi
-        echo "$out" | grep -q "stale pre-clone entry could not be removed" \
+        echo "$out" | contains "stale pre-clone entry could not be removed" \
             && ok PR8 "gc says so instead of reporting it collected" \
             || { bad PR8 "gc says so instead of reporting it collected"; echo "$out" | sed 's/^/        /'; }
-        p8 fs gc --status | grep -q "stale pre-clone" && ok PR8 "gc --status counts the stale entry" \
+        p8 fs gc --status | contains "stale pre-clone" && ok PR8 "gc --status counts the stale entry" \
             || { bad PR8 "gc --status counts the stale entry"; p8 fs gc --status | sed 's/^/        /'; }
         # Take the ACL away and the next wake finishes what it started: tree gone, row gone.
         chmod -N "$P8ENTRY/keep"
@@ -1512,11 +1516,11 @@ if command -v sqlite3 > /dev/null 2>&1; then
     else
         bad PR7 "what it did not finish keeps its CREATING row and its tmp_path (state $D7STATE, $D7LEFT entries left)"
     fi
-    echo "$out" | grep -q "being collected in the background" && ok PR7 "and it hands the rest over" \
+    echo "$out" | contains "being collected in the background" && ok PR7 "and it hands the rest over" \
                                                                || { bad PR7 "and it hands the rest over"; echo "$out" | sed 's/^/        /'; }
     # Running out of time is not a failure: nothing is reported as undeletable, and a gc with no
     # budget at all finishes the job.
-    echo "$out" | grep -q "could not be removed" && bad PR7 "out of time is not reported as a failure" \
+    echo "$out" | contains "could not be removed" && bad PR7 "out of time is not reported as a failure" \
                                                   || ok PR7 "out of time is not reported as a failure"
     WORLD_GC_CREATING_MIN_AGE=0 d7 fs gc --now > /dev/null 2>&1
     # The detached successor can unlink the tree before committing DEAD. Wait for both
@@ -1555,7 +1559,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
     else
         bad PR7 "what it did not finish keeps its CREATING row (rows $D8ROWS, $D8LEFT entries left)"
     fi
-    echo "$out" | grep -q "being collected in the background" && ok PR7 "and that one hands the rest over too" \
+    echo "$out" | contains "being collected in the background" && ok PR7 "and that one hands the rest over too" \
                                                                || { bad PR7 "and that one hands the rest over too"; echo "$out" | sed 's/^/        /'; }
     WORLD_GC_CREATING_MIN_AGE=0 d8 fs gc --now > /dev/null 2>&1
     # The tree and the row, not the tree alone: a background worker collecting the same tree in
@@ -1605,7 +1609,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
             echo "$out" | sed 's/^/        /'
         fi
         # gc's summary line always names the class; what must be zero is the count.
-        echo "$out" | grep -q "0 orphan trash dirs" && ok PR9 "and gc does not report it as one" \
+        echo "$out" | contains "0 orphan trash dirs" && ok PR9 "and gc does not report it as one" \
             || { bad PR9 "and gc does not report it as one"; echo "$out" | sed 's/^/        /'; }
     else
         bad PR9 "the discarded world has a tree in the trash"
@@ -1721,7 +1725,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
         bad PR12 "a stump reconcile cannot remove keeps its row (state $R12STATE)"
         echo "$out" | sed 's/^/        /'
     fi
-    echo "$out" | grep -q "could not be removed" \
+    echo "$out" | contains "could not be removed" \
         && ok PR12 "and gc says so instead of reporting the snapshot reconciled" \
         || { bad PR12 "and gc says so instead of reporting the snapshot reconciled"; echo "$out" | sed 's/^/        /'; }
     # Take the ACL away and the next reconcile finishes what it started: stump gone, row dead.
@@ -1766,7 +1770,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
             bad PR16 "a forced discard whose pool entry will not go leaves the snapshot and the row alone (exit $rc, state $D16STATE, rows $D16ROWS)"
             echo "$out" | sed 's/^/        /'
         fi
-        echo "$out" | grep -q "could not be removed" \
+        echo "$out" | contains "could not be removed" \
             && ok PR16 "and the refusal names the entry and the errno" \
             || { bad PR16 "and the refusal names the entry and the errno"; echo "$out" | sed 's/^/        /'; }
         # PR #1 review (21st round, P1): the row the drain keeps through the removal is not an
@@ -1779,11 +1783,11 @@ if command -v sqlite3 > /dev/null 2>&1; then
         [ "$D16PSTATE" = 2 ] \
             && ok PR21 "the row the drain could not remove is DRAINING, which no claim matches" \
             || bad PR21 "the row the drain could not remove is DRAINING, which no claim matches (state $D16PSTATE)"
-        d16 fs gc --status | grep -q "stale pre-clone" \
+        d16 fs gc --status | contains "stale pre-clone" \
             && ok PR21 "and gc --status counts it, because it is waiting for the collector" \
             || { bad PR21 "and gc --status counts it, because it is waiting for the collector"; d16 fs gc --status | sed 's/^/        /'; }
         out=$(d16 fs fork --from "$D16S" --to "$SCRATCH/drain16-w" 2>&1); rc=$?
-        if [ "$rc" = 0 ] && ! echo "$out" | grep -q "(pool)" && [ -e "$SCRATCH/drain16-w/keep/f.txt" ]; then
+        if [ "$rc" = 0 ] && ! echo "$out" | contains "(pool)" && [ -e "$SCRATCH/drain16-w/keep/f.txt" ]; then
             ok PR21 "and a fork clones its own tree rather than the one being removed"
         else
             bad PR21 "and a fork clones its own tree rather than the one being removed (exit $rc)"
@@ -1843,7 +1847,7 @@ if [ -n "$B20ENTRY" ]; then
         bad PR20 "--now refuses rather than remove a directory it did not name (exit $rc)"
         echo "$out" | sed 's/^/        /'
     fi
-    echo "$out" | grep -q "$B20ENTRY.deleting" \
+    echo "$out" | contains "$B20ENTRY.deleting" \
         && ok PR20 "and the refusal names the directory that is in the way" \
         || { bad PR20 "and the refusal names the directory that is in the way"; echo "$out" | sed 's/^/        /'; }
     out=$(b20 fs gc --now --retention 0 2>&1)
@@ -1853,10 +1857,10 @@ if [ -n "$B20ENTRY" ]; then
         bad PR20 "the collector leaves both the stray and the entry alone"
         echo "$out" | sed 's/^/        /'
     fi
-    echo "$out" | grep -q "could not be collected" \
+    echo "$out" | contains "could not be collected" \
         && ok PR20 "and gc says so instead of reporting a clean run" \
         || { bad PR20 "and gc says so instead of reporting a clean run"; echo "$out" | sed 's/^/        /'; }
-    b20 fs gc --status --retention 0 | grep -q "^blocked: .*$B20ENTRY.deleting" \
+    b20 fs gc --status --retention 0 | contains "^blocked: .*$B20ENTRY.deleting" \
         && ok PR20 "and gc --status names it for whoever has to clear it" \
         || { bad PR20 "and gc --status names it for whoever has to clear it"; b20 fs gc --status --retention 0 | sed 's/^/        /'; }
     # The entry was never renamed, so it is not `.deleting` to anybody: `restore` still works.
@@ -1915,10 +1919,10 @@ if [ -n "$F25ENTRY" ]; then
         bad PR25 "the collector does not delete a directory that is not the world's tree"
         echo "$out" | sed 's/^/        /'
     fi
-    echo "$out" | grep -q "could not be collected" \
+    echo "$out" | contains "could not be collected" \
         && ok PR25 "and gc says so instead of reporting a clean run" \
         || { bad PR25 "and gc says so instead of reporting a clean run"; echo "$out" | sed 's/^/        /'; }
-    f25 fs gc --status --retention 0 | grep -q "^foreign: .*$F25ENTRY" \
+    f25 fs gc --status --retention 0 | contains "^foreign: .*$F25ENTRY" \
         && ok PR25 "and gc --status names the path it refused to touch" \
         || { bad PR25 "and gc --status names the path it refused to touch"; f25 fs gc --status --retention 0 | sed 's/^/        /'; }
     out=$(f25 fs discard "$F25W" --now 2>&1); rc=$?
@@ -1928,7 +1932,7 @@ if [ -n "$F25ENTRY" ]; then
         bad PR25 "--now refuses rather than delete it (exit $rc)"
         echo "$out" | sed 's/^/        /'
     fi
-    echo "$out" | grep -q "$F25ENTRY" \
+    echo "$out" | contains "$F25ENTRY" \
         && ok PR25 "and the refusal names the path" \
         || { bad PR25 "and the refusal names the path"; echo "$out" | sed 's/^/        /'; }
     out=$(f25 fs restore "$F25W" 2>&1); rc=$?
@@ -1983,13 +1987,13 @@ chmod 000 "$T28STORE/trash"
 # --now, so this run collects in the foreground and hands nothing to a worker: the retry counter
 # this case is about is bumped exactly once, by this run.
 out=$(t28 fs gc --now --retention 0 2>&1)
-echo "$out" | grep -q "could not be read" \
+echo "$out" | contains "could not be read" \
     && ok PR28 "gc reports a trash directory it could not read" \
     || { bad PR28 "gc reports a trash directory it could not read"; echo "$out" | sed 's/^/        /'; }
-echo "$out" | grep -q "$T28STORE/trash" \
+echo "$out" | contains "$T28STORE/trash" \
     && ok PR28 "and names the directory" \
     || { bad PR28 "and names the directory"; echo "$out" | sed 's/^/        /'; }
-echo "$out" | grep -q "collector will try again" \
+echo "$out" | contains "collector will try again" \
     && ok PR28 "and says it will come back for it (work remains)" \
     || { bad PR28 "and says it will come back for it (work remains)"; echo "$out" | sed 's/^/        /'; }
 t28 fs gc --status --retention 0 > "$U28/t-status.log" 2>&1
@@ -2028,10 +2032,10 @@ mkdir -p "$S28STORE/snapshots/S999999.wfs-tmp/sub"
 echo junk > "$S28STORE/snapshots/S999999.wfs-tmp/sub/j.txt"
 chmod 000 "$S28STORE/snapshots"
 out=$(s28 fs gc --now --retention 0 2>&1)
-echo "$out" | grep -q "could not be read" \
+echo "$out" | contains "could not be read" \
     && ok PR28 "gc reports a snapshots directory it could not read" \
     || { bad PR28 "gc reports a snapshots directory it could not read"; echo "$out" | sed 's/^/        /'; }
-echo "$out" | grep -q "$S28STORE/snapshots" \
+echo "$out" | contains "$S28STORE/snapshots" \
     && ok PR28 "and names the directory" \
     || { bad PR28 "and names the directory"; echo "$out" | sed 's/^/        /'; }
 s28 fs gc --status --retention 0 > "$U28/s-status.log" 2>&1
