@@ -137,3 +137,22 @@ The namespace's existing 256 KiB file limit remains. Large-file logical extent
 indexes, range-only I/O, sparse extents, GC, segment reclamation, compression,
 remote synchronization and cloud-ack durability are separate work. This implementation
 does not claim that the complete original filesystem plan is finished.
+
+### Uncommitted-tail recovery regression
+
+`forkfsd_object_store_recovery` runs 27 process-crash cases: fixed and seeded
+mid-record cuts (including the second chunk), complete record append, data sync,
+pre-metadata publication, and rollover into a new segment. The fault build exits
+inside the write path without exception unwinding. One additional persisted-image
+fixture discards only the unindexed suffix; this simulates possible lost tail
+bytes, not a claim that the test reproduces physical power loss.
+
+The oracle compares every LevelDB key/value before and after the interrupted
+transaction, including location indexes, roots, sequence, counters and replay
+state. Three reopen/verify cycles must leave those rows unchanged. A backup from
+that state must recover the old contents. After retry, every new chunk location
+must lie beyond the previous EOF, all crash-tail bytes must remain unchanged, and
+incremental replay must expose exactly one new transaction. A separate
+post-metadata crash must recover the new contents. Truncating or corrupting an
+indexed record must fail reads, verification and backup without modifying metadata
+or silently rolling back to the old root.
