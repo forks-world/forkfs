@@ -11,8 +11,9 @@ public:
     using Map=std::map<std::string,Id>;
     using Changes=std::map<std::string,std::optional<Id>>;
     using Reader=std::function<Bytes(const Id&)>;
-    MetadataTree(const Journal& store,Id root={}):read_([&store](const Id& id){return store.get_object(id);}),root_(root) {}
-    MetadataTree(Reader read,Id root):read_(std::move(read)),root_(root) {}
+    MetadataTree(const Journal& store,Id root={}):read_([&store](const Id& id){return store.get_object(id);}),root_(root),shared_heights_(&store.tree_heights_) {}
+    // A shared cache requires readers from the same immutable object domain.
+    MetadataTree(Reader read,Id root,TreeHeightCache* heights=nullptr):read_(std::move(read)),root_(root),shared_heights_(heights) {}
     std::optional<Id> lookup(const std::string& key) const;
     std::vector<std::string> keys(const std::string& prefix) const;
     std::vector<std::string> page(const std::string& prefix,const std::string& after,size_t limit) const;
@@ -22,13 +23,14 @@ public:
     // before publication; pending nodes must remain available until then.
     // After successful publication, use a fresh editor at the committed root
     // before the next apply. Returning a Plan does not acknowledge a commit.
-    // Height validation walks a cold persisted tree once per editor; immutable
-    // node heights are cached for subsequent changes in that session.
+    // Persisted subtree heights are reused across editors in this repository.
+    // A cold/evicted subtree is validated before its height can be reused.
     Plan apply(const Changes& changes);
 private:
     struct Node {std::string key;Id value{},left{},right{};};
     Reader read_;
     Id root_;
+    TreeHeightCache* shared_heights_=nullptr;
     mutable std::map<Id,Node> cache_;
     mutable std::map<Id,unsigned> heights_;
     std::map<Id,Bytes> pending_;

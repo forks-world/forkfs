@@ -42,9 +42,18 @@ unsigned MetadataTree::height(Id root,unsigned depth) const {
     need(depth<256,"metadata tree depth limit");
     auto known=heights_.find(root);
     if(known!=heights_.end()){need(known->second<=256-depth,"metadata tree depth limit");return known->second;}
+    // Never export uncommitted node hints: a failed plan must not allow a later
+    // editor to skip reading an object that was never published.
+    bool persisted=!pending_.contains(root);
+    if(persisted && shared_heights_)if(auto cached=shared_heights_->get(root)) {
+        need(*cached<=256-depth,"metadata tree depth limit");
+        heights_.emplace(root,*cached);return *cached;
+    }
     const auto& n=node(root);
     auto result=1+std::max(height(n.left,depth+1),height(n.right,depth+1));
-    heights_.emplace(root,result);return result;
+    heights_.emplace(root,result);
+    if(persisted && shared_heights_)shared_heights_->put(root,result);
+    return result;
 }
 Id MetadataTree::merge(Id left,Id right) {
     struct Step {Node node;bool replace_right;};
