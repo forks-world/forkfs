@@ -122,7 +122,7 @@ def receive_pack(stream, plan, expected, entries, persist):
 def verify_closure(plan, entries, load):
     """Independent DAG, ordered-tree and inode checks; return native restore views."""
     validate_plan(plan)
-    used, views, colors = set(), {}, {}
+    used, views, colors, discovered, manifest_cache = set(), {}, {}, set(), {}
     def read(object_id):
         checked(object_id in entries, 'dependency missing from inventory')
         data = load(object_id)
@@ -186,8 +186,10 @@ def verify_closure(plan, entries, load):
                 checked(indexed_inode == (indexed and kind == 2), 'directory inode/index version mismatch')
         root = values[NS + b'root']
         paths, refs, reached = {}, Counter(), set()
-        def directory(ident, path, ancestors):
-            checked(ident in inode_ids and ident not in ancestors, 'directory cycle/missing inode')
+        pending = [(root, '/')]
+        while pending:
+            ident, path = pending.pop()
+            checked(ident in inode_ids, 'directory missing inode')
             kind, mode, links, size = inode_ids[ident]
             checked(kind == 2 and ident not in reached, 'directory hardlink')
             inode_key = NS + b'inode/' + ident
@@ -210,7 +212,8 @@ def verify_closure(plan, entries, load):
                 expected_keys.update((child_inode_key, child_allocation_key))
                 target = path.rstrip('/') + '/' + name.decode()
                 if typ == 2:
-                    subdirs += 1;directory(child, target, ancestors | {ident})
+                    subdirs += 1
+                    pending.append((child, target))
                 else:
                     reached.add(child)
                     content_key = NS + b'content/' + child
@@ -225,7 +228,6 @@ def verify_closure(plan, entries, load):
                     parent_key = NS + b'parent/' + child
                     checked(parent_key in values and values[parent_key] == b'FFPAR001' + ident + name, 'parent backlink')
             checked(links == 2 + subdirs, 'directory link count')
-        directory(root, '/', set())
         checked(set(inode_ids) == reached, 'unreachable live inode')
         for ident, (kind, _, links, _) in inode_ids.items():
             if kind != 2:
@@ -245,54 +247,119 @@ def verify_closure(plan, entries, load):
                     expected_keys.add(NS + b'parent/' + ident)
         checked(set(values) == expected_keys, 'orphan namespace records')
         return paths
-    def revision(object_id, depth=0):
-        checked(depth < 512 and len(colors) < 100000, 'mock DAG budget')
-        if colors.get(object_id) == 2:
-            return
-        checked(object_id not in colors, 'revision cycle')
-        colors[object_id] = 1;data = read(object_id)
-        if data[:8] == b'FFREV001':
-            checked(len(data) == 80, 'V1 revision length')
-            parents = [] if not any(data[40:72]) else [data[40:72].hex()]
-        else:
-            checked(data[:8] == b'FFREV002' and len(data) >= 52, 'revision codec')
-            count, = struct.unpack_from('<I', data, 48)
-            checked(count <= 64 and len(data) == 52 + count * 32, 'revision length')
-            parents = [data[52+i*32:84+i*32].hex() for i in range(count)]
-        checked(len(parents) == len(set(parents)) and '0'*64 not in parents and object_id not in parents, 'revision parent IDs')
-        for parent in parents:
-            revision(parent, depth+1)
-        views[object_id] = view(data[8:40].hex());colors[object_id] = 2
     for root in plan['selected_revision_ids']:
-        revision(root)
+        pending = [(root, False, None)]
+        while pending:
+            object_id, exiting, manifest_id = pending.pop()
+            if exiting:
+                checked(colors.get(object_id) == 1, 'revision traversal state')
+                views[object_id] = manifest_cache[manifest_id]
+                colors[object_id] = 2
+                continue
+            if colors.get(object_id) == 2:
+                continue
+            checked(object_id not in colors, 'revision cycle')
+            if object_id not in discovered:
+                checked(len(discovered) < 100000, 'mock DAG budget')
+                discovered.add(object_id)
+            colors[object_id] = 1
+            data = read(object_id)
+            if data[:8] == b'FFREV001':
+                checked(len(data) == 80, 'V1 revision length')
+                parents = [] if not any(data[40:72]) else [data[40:72].hex()]
+            else:
+                checked(data[:8] == b'FFREV002' and len(data) >= 52, 'revision codec')
+                count, = struct.unpack_from('<I', data, 48)
+                checked(count <= 64 and len(data) == 52 + count * 32, 'revision length')
+                parents = [data[52+i*32:84+i*32].hex() for i in range(count)]
+            checked(len(parents) == len(set(parents)) and '0'*64 not in parents and object_id not in parents,
+                    'revision parent IDs')
+            manifest_id = data[8:40].hex()
+            if manifest_id not in manifest_cache:
+                manifest_cache[manifest_id] = view(manifest_id)
+            pending.append((object_id, True, manifest_id))
+            for parent in reversed(parents):
+                pending.append((parent, False, None))
     checked(used == set(entries), 'inventory not exact revision closure')
     return views
 
 
 def restore_views(views, root):
     """Restore into private native directories, without following stored symlinks."""
-    root = Path(root);root.mkdir()
-    for revision_id, paths in views.items():
-        destination = root / revision_id;destination.mkdir()
-        links = {}
-        for path, info in sorted(paths.items(), key=lambda p: (p[0].count('/'), p[0])):
-            if path == '/':
-                continue
-            target = destination / path.lstrip('/')
-            if info['kind'] == 'dir':
-                target.mkdir()
-            elif info['kind'] == 'symlink':
-                if info['inode'] in links:
-                    os.link(links[info['inode']], target, follow_symlinks=False)
-                else:
-                    os.symlink(os.fsdecode(info['data']), target)
-                    links[info['inode']] = target
-            else:
-                if info['inode'] in links:
-                    os.link(links[info['inode']], target)
-                else:
-                    target.write_bytes(info['data']);os.chmod(target, info['mode']);links[info['inode']] = target
-        for path, info in sorted(paths.items(), reverse=True):
-            if info['kind'] == 'dir':
-                os.chmod(destination / path.lstrip('/'), info['mode'])
+    root = Path(root);root.parent.mkdir(parents=True, exist_ok=True);root.mkdir()
+    dir_flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+
+    def components(path):
+        return [] if path == '/' else path.lstrip('/').split('/')
+
+    def open_parent(base_fd, parts):
+        fd = os.dup(base_fd)
+        try:
+            for component in parts[:-1]:
+                child = os.open(component, dir_flags, dir_fd=fd)
+                os.close(fd);fd = child
+            return fd, parts[-1]
+        except BaseException:
+            os.close(fd)
+            raise
+
+    root_fd = os.open(root, dir_flags)
+    try:
+        for revision_id, paths in views.items():
+            os.mkdir(revision_id, 0o700, dir_fd=root_fd)
+            destination_fd = os.open(revision_id, dir_flags, dir_fd=root_fd)
+            try:
+                links = {}
+                for path, info in sorted(paths.items(), key=lambda p: (p[0].count('/'), p[0])):
+                    if path == '/':
+                        continue
+                    parts = components(path);parent_fd, name = open_parent(destination_fd, parts)
+                    try:
+                        if info['kind'] == 'dir':
+                            os.mkdir(name, 0o700, dir_fd=parent_fd)
+                        elif info['kind'] == 'symlink' and info['inode'] not in links:
+                            os.symlink(os.fsdecode(info['data']), name, dir_fd=parent_fd)
+                            links[info['inode']] = parts
+                        elif info['inode'] in links:
+                            source_parent, source_name = open_parent(destination_fd, links[info['inode']])
+                            try:
+                                os.link(source_name, name, src_dir_fd=source_parent,
+                                        dst_dir_fd=parent_fd, follow_symlinks=False)
+                            finally:
+                                os.close(source_parent)
+                        else:
+                            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0),
+                                         0o600, dir_fd=parent_fd)
+                            try:
+                                data = memoryview(info['data'])
+                                while data:
+                                    written = os.write(fd, data)
+                                    checked(written > 0, 'short native restore write')
+                                    data = data[written:]
+                                os.fchmod(fd, info['mode'])
+                            finally:
+                                os.close(fd)
+                            links[info['inode']] = parts
+                    finally:
+                        os.close(parent_fd)
+                for path, info in sorted(paths.items(), key=lambda p: p[0].count('/'), reverse=True):
+                    if info['kind'] != 'dir':
+                        continue
+                    parts = components(path)
+                    if not parts:
+                        os.fchmod(destination_fd, info['mode'])
+                        continue
+                    parent_fd, name = open_parent(destination_fd, parts)
+                    try:
+                        fd = os.open(name, dir_flags, dir_fd=parent_fd)
+                        try:
+                            os.fchmod(fd, info['mode'])
+                        finally:
+                            os.close(fd)
+                    finally:
+                        os.close(parent_fd)
+            finally:
+                os.close(destination_fd)
+    finally:
+        os.close(root_fd)
     return root

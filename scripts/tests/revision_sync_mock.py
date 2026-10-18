@@ -256,6 +256,12 @@ class Backend:
                 raise ApiError('RECEIPT_MISMATCH', 409)
             if job['state'] == 'acknowledged' and body != job['receipt']:
                 raise ApiError('RECEIPT_MISMATCH', 409)
+            for other in self.state['jobs'].values():
+                previous = other.get('receipt')
+                if (other.get('destination') == body['destination_id'] and previous is not None
+                        and previous['receipt_id'] == body['receipt_id']
+                        and previous != body):
+                    raise ApiError('RECEIPT_ID_CONFLICT', 409)
             job['receipt'] = body;job['state'] = 'acknowledged';self.save()
             if self.fault('drop_ack_response'):
                 return ('drop',)

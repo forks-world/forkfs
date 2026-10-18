@@ -41,6 +41,12 @@ depth、inode 类型/大小/权限/link count、目录父关系等。文件内�
 hardlink inode、symlink 文本和 mode。此时源 HTTP 进程已退出、源 fixture 已删除、
 真实源仓库也已移出可用位置。目标还原过程不访问源端。
 
+原生还原器通过目录文件描述符逐组件操作，避免给合法长路径追加测试目录前缀后
+超过宿主 `PATH_MAX`；硬链接按 revision 内的 inode ID 保留，包括 symlink 硬链接。
+它仍受宿主文件系统的表示能力约束，例如原生 symlink target 长度可能小于 ForkFS
+允许的 4096 字节。协议校验保持 ForkFS 的格式边界，不因宿主限制拒绝合法备份；
+目标无法表示的内容需要真正的 ForkFS import/mount，不能把原生目录还原当作通用导入。
+
 ## 场景
 
 | 类别 | 验证 |
@@ -55,6 +61,9 @@ hardlink inode、symlink 文本和 mode。此时源 HTTP 进程已退出、源 f
 | 发布/确认 | 目标发布前退出后复用已落盘对象；发布后退出只保留一份 catalog；ACK 丢失重试、发布后 lease 过期仍可还原 |
 | 多分支 | frontier 同时保留 left/right，完整同步 next 后才可覆盖它们 |
 | 协商/格式 | 不兼容版本先拒绝、旧新 revision 混合、不把 source_sequence 当作本地排序 |
+| Namespace 边界 | 重新计算 hash 的非法记录集合、名称/target、inode 时间戳及 xattr 长度均拒绝；合法边界仍接受 |
+| 重试与 ACK | 非法 receipt 不污染重启后的状态、跨 export receipt ID 冲突、repository 幂等范围、已确认状态不倒退 |
+| 规模与还原 | 千层目录、长 revision 历史和接近路径长度边界的原生还原 |
 
 pack/结构测试包含固定 seed 的随机截断与位翻转，不只依赖几个固定坏包。
 

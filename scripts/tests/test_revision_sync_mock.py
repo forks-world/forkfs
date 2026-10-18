@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import random
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -130,16 +131,25 @@ class SyncTests(unittest.TestCase):
             return result
         def bad_namespace(name, edit):
             values = namespace_values(manifest[8:].hex());edit(values)
-            def build(items):
-                if not items: return bytes(32)
-                key, value = max(items, key=lambda pair: (object_id(b'forkfs.metadata.priority.v1' + pair[0]), pair[0]))
-                at = next(i for i, pair in enumerate(items) if pair[0] == key)
-                left = build(items[:at]);right = build(items[at+1:])
+            priorities = {key: (object_id(b'forkfs.metadata.priority.v1' + key), key) for key in values}
+            stack = [];tree = None
+            for key, value in sorted(values.items()):
+                node = [key, value, None, None];left = None
+                while stack and priorities[stack[-1][0]] < priorities[key]:
+                    left = stack.pop()
+                node[2] = left
+                if stack: stack[-1][3] = node
+                else: tree = node
+                stack.append(node)
+            def emit(node):
+                if node is None: return bytes(32)
+                key, value = node[0], node[1]
+                left = emit(node[2]);right = emit(node[3])
                 value_id = object_id(value);objects[value_id.hex()] = value.hex()
                 node = b'FFTRNO01' + len(key).to_bytes(4,'little') + value_id + left + right + key
                 node_id = object_id(node);objects[node_id.hex()] = node.hex()
                 return node_id
-            tree_id = build(sorted(values.items()))
+            tree_id = emit(tree)
             new_manifest = b'FFTREE01' + tree_id
             manifest_id = object_id(new_manifest);objects[manifest_id.hex()] = new_manifest.hex()
             revision = descriptor[:8] + manifest_id + descriptor[40:]
@@ -171,6 +181,90 @@ class SyncTests(unittest.TestCase):
             values[prefix + b'a'*length] = value
         bad_namespace('long-entry-name', lambda v: long_entry(v, 256))
         bad_namespace('valid-entry-boundary', lambda v: long_entry(v, 255))
+        def add_deep_directories(values):
+            root_id = values[b'\0forkfs/root']
+            root_inode_key = b'\0forkfs/inode/' + root_id
+            root_inode = bytearray(values[root_inode_key])
+            directory_template = next(value for key, value in values.items()
+                                      if key.startswith(b'\0forkfs/inode/')
+                                      and int.from_bytes(value[8:12], 'little') == 2)
+            used_ids = {key[len(b'\0forkfs/inode/'):] for key in values if key.startswith(b'\0forkfs/inode/')}
+            new_ids = []
+            candidate = 2**128 - 1
+            for _ in range(1000):
+                while format(candidate, '032x').encode() in used_ids:
+                    candidate -= 1
+                ident = format(candidate, '032x').encode();candidate -= 1
+                used_ids.add(ident);new_ids.append(ident)
+            top_name = b'deep'
+            while b'\0forkfs/entry/' + root_id + b'/' + top_name in values:
+                top_name += b'x'
+            values[b'\0forkfs/entry/' + root_id + b'/' + top_name] = new_ids[0]
+            indexed = b'\0forkfs/parent-index' in values
+            for index, ident in enumerate(new_ids):
+                inode = bytearray(directory_template)
+                struct.pack_into('<Q', inode, 16, 3 if index + 1 < len(new_ids) else 2)
+                values[b'\0forkfs/inode/' + ident] = bytes(inode)
+                values[b'\0forkfs/allocated/' + ident] = b''
+                if indexed:
+                    parent = root_id if index == 0 else new_ids[index-1]
+                    name = top_name if index == 0 else b'd'
+                    values[b'\0forkfs/parent/' + ident] = b'FFPAR001' + parent + name
+                if index + 1 < len(new_ids):
+                    values[b'\0forkfs/entry/' + ident + b'/d'] = new_ids[index+1]
+            struct.pack_into('<Q', root_inode, 16, int.from_bytes(root_inode[16:24], 'little') + 1)
+            values[root_inode_key] = bytes(root_inode)
+        bad_namespace('deep-directories', add_deep_directories)
+        parent = refs['merge'];shared_manifest = descriptor[8:40]
+        for index in range(1500):
+            revision = b'FFREV002' + shared_manifest + struct.pack('<QI', index, 1) + bytes.fromhex(parent)
+            revision_id = object_id(revision);objects[revision_id.hex()] = revision.hex()
+            parent = revision_id.hex()
+        refs['deep-history'] = parent
+        def add_long_native_path(values):
+            root_id = values[b'\0forkfs/root']
+            root_inode_key = b'\0forkfs/inode/' + root_id
+            root_inode = bytearray(values[root_inode_key])
+            directory_template = next(value for key, value in values.items()
+                                      if key.startswith(b'\0forkfs/inode/')
+                                      and int.from_bytes(value[8:12], 'little') == 2)
+            used_ids = {key[len(b'\0forkfs/inode/'):] for key in values if key.startswith(b'\0forkfs/inode/')}
+            new_ids = []
+            candidate = 2**128 - 1
+            for _ in range(15):
+                while format(candidate, '032x').encode() in used_ids:
+                    candidate -= 1
+                ident = format(candidate, '032x').encode();candidate -= 1
+                used_ids.add(ident);new_ids.append(ident)
+            name = b'z'*255
+            values[b'\0forkfs/entry/' + root_id + b'/' + name] = new_ids[0]
+            indexed = b'\0forkfs/parent-index' in values
+            for index, ident in enumerate(new_ids):
+                inode = bytearray(directory_template)
+                struct.pack_into('<Q', inode, 16, 3 if index + 1 < len(new_ids) else 2)
+                values[b'\0forkfs/inode/' + ident] = bytes(inode)
+                values[b'\0forkfs/allocated/' + ident] = b''
+                if indexed:
+                    parent = root_id if index == 0 else new_ids[index-1]
+                    values[b'\0forkfs/parent/' + ident] = b'FFPAR001' + parent + name
+                if index + 1 < len(new_ids):
+                    values[b'\0forkfs/entry/' + ident + b'/' + name] = new_ids[index+1]
+            file_key, file_template = next((key, value) for key, value in values.items()
+                                            if key.startswith(b'\0forkfs/inode/')
+                                            and int.from_bytes(value[8:12], 'little') == 1)
+            while format(candidate, '032x').encode() in used_ids:
+                candidate -= 1
+            file_id = format(candidate, '032x').encode()
+            file_inode = bytearray(file_template);struct.pack_into('<Q', file_inode, 16, 1)
+            old_file_id = file_key[len(b'\0forkfs/inode/'):]
+            values[b'\0forkfs/inode/' + file_id] = bytes(file_inode)
+            values[b'\0forkfs/allocated/' + file_id] = b''
+            values[b'\0forkfs/content/' + file_id] = values[b'\0forkfs/content/' + old_file_id]
+            cls.long_path_file_data = values[b'\0forkfs/content/' + old_file_id]
+            values[b'\0forkfs/entry/' + new_ids[-1] + b'/' + b'f'*255] = file_id
+            struct.pack_into('<Q', root_inode, 16, int.from_bytes(root_inode[16:24], 'little') + 1)
+            values[root_inode_key] = bytes(root_inode)
+        bad_namespace('long-native-path', add_long_native_path)
         def set_v4_inode(values, accessed=0, created=0, xattrs=(), legacy=False):
             inode_key, old = next((key, value) for key, value in values.items()
                                   if key.startswith(b'\0forkfs/inode/') and int.from_bytes(value[8:12], 'little') == 1)
@@ -317,6 +411,65 @@ class SyncTests(unittest.TestCase):
         inode = self.sync(request_id='valid-v4-inode-boundary',
                           selectors=[{'name':'valid-v4-inode-boundary'}])
         self.assertEqual(inode['ack'], 'acknowledged')
+        deep = self.sync(request_id='deep-directories', selectors=[{'name':'deep-directories'}])
+        self.assertEqual(deep['state'], 'committed')
+        self.assertEqual(deep['ack'], 'acknowledged')
+        history = self.sync(request_id='deep-history', selectors=[{'name':'deep-history'}])
+        self.assertGreaterEqual(history['revisions'], 1500)
+        self.assertEqual(history['ack'], 'acknowledged')
+
+    def test_06d_restore_long_path_with_directory_fds(self):
+        result = self.sync(request_id='long-native-path', selectors=[{'name':'long-native-path'}])
+        restored = self.backup.request('POST', '/restore', {'backup_id':result['backup_id']})
+        destination = self.backup.root/'restored'/restored['restore_id']
+        revision_root = destination/self.fixture['refs']['long-native-path']
+        components = [b'z'*255] * 15
+        file_name = b'f'*255
+        dir_flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+        revision_fd = current_fd = None
+        try:
+            self.assertEqual(1 + sum(map(len, components)) + len(components)-1 + 1 + len(file_name), 4096)
+            revision_fd = os.open(revision_root, dir_flags)
+            current_fd = os.dup(revision_fd)
+            for component in components:
+                child_fd = os.open(component, dir_flags, dir_fd=current_fd)
+                os.close(current_fd);current_fd = child_fd
+            self.assertTrue(stat.S_ISDIR(os.fstat(current_fd).st_mode))
+            file_fd = os.open(file_name, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0), dir_fd=current_fd)
+            try:
+                restored_data = bytearray()
+                while True:
+                    block = os.read(file_fd, 65536)
+                    if not block: break
+                    restored_data += block
+            finally:
+                os.close(file_fd)
+            self.assertEqual(bytes(restored_data), self.long_path_file_data)
+        finally:
+            if current_fd is not None:
+                try:
+                    os.unlink(file_name, dir_fd=current_fd)
+                except OSError:
+                    pass
+                os.close(current_fd)
+            if revision_fd is None:
+                try:
+                    revision_fd = os.open(revision_root, dir_flags)
+                except OSError:
+                    pass
+            if revision_fd is not None:
+                for depth in reversed(range(len(components))):
+                    parent_fd = os.dup(revision_fd)
+                    try:
+                        for component in components[:depth]:
+                            child_fd = os.open(component, dir_flags, dir_fd=parent_fd)
+                            os.close(parent_fd);parent_fd = child_fd
+                        os.rmdir(components[depth], dir_fd=parent_fd)
+                    except OSError:
+                        pass
+                    finally:
+                        os.close(parent_fd)
+                os.close(revision_fd)
 
     def test_07_inventory_omits_dependency_no_commit(self):
         self.source.faults(omit_inventory_object=1)
@@ -416,7 +569,40 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(saved['state'], 'acknowledged')
         self.assertEqual(saved['receipt'], receipt)
 
-    def test_13c_sync_idempotency_includes_repository(self):
+    def test_13c_receipt_id_conflicts_across_exports(self):
+        first = self.capture(key='receipt-first', selectors=[{'name':'base'}])
+        same_plan = self.capture(key='receipt-same-plan', selectors=[{'name':'base'}])
+        second = self.capture(key='receipt-second', selectors=[{'name':'latest'}])
+
+        def receipt_for(plan, receipt_id, manifest_hash):
+            return dict(receipt_id=receipt_id, consumer_id='mock-backup', destination_id='mock-destination',
+                        source_repository=plan['source_repository'], plan_hash=plan['plan_hash'],
+                        inventory_root=plan['inventory_root'], selected_revision_ids=plan['selected_revision_ids'],
+                        backup_id=plan['plan_hash'], backup_manifest_hash=manifest_hash, catalog_generation='1',
+                        durability='destination-committed', retention_expires_at=None)
+
+        receipt_id = '2'*32
+        first_path = self.base + '/exports/' + first['export_id'] + '/acknowledgements'
+        second_path = self.base + '/exports/' + second['export_id'] + '/acknowledgements'
+        first_receipt = receipt_for(first['plan'], receipt_id, 'a'*64)
+        colliding = receipt_for(second['plan'], receipt_id, 'b'*64)
+        self.assertEqual(self.source.request('POST', first_path, first_receipt)['state'], 'acknowledged')
+        same_plan_path = self.base + '/exports/' + same_plan['export_id'] + '/acknowledgements'
+        self.assertEqual(self.source.request('POST', same_plan_path, first_receipt)['state'], 'acknowledged')
+        before = self.source.state()
+        with self.assertRaises(ApiError) as raised:
+            self.source.request('POST', second_path, colliding)
+        self.assertEqual(raised.exception.code, 'RECEIPT_ID_CONFLICT')
+        self.assertEqual(self.source.state()['jobs'], before['jobs'])
+        self.source.stop();self.source.start()
+        self.assertEqual(self.source.state()['jobs'], before['jobs'])
+        with self.assertRaises(ApiError) as raised:
+            self.source.request('POST', second_path, colliding)
+        self.assertEqual(raised.exception.code, 'RECEIPT_ID_CONFLICT')
+        corrected = receipt_for(second['plan'], '3'*32, 'b'*64)
+        self.assertEqual(self.source.request('POST', second_path, corrected)['state'], 'acknowledged')
+
+    def test_13d_sync_idempotency_includes_repository(self):
         self.sync()
         before = self.backup.state()
         with self.assertRaises(ApiError) as raised:
@@ -424,7 +610,7 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 'IDEMPOTENCY_CONFLICT')
         self.assertEqual(self.backup.state(), before)
 
-    def test_13d_acknowledged_status_is_monotonic_when_source_is_unavailable(self):
+    def test_13e_acknowledged_status_is_monotonic_when_source_is_unavailable(self):
         first = self.sync()
         self.assertEqual(first['ack'], 'acknowledged')
         before = self.backup.state()
