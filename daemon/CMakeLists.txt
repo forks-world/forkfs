@@ -255,3 +255,16 @@ if(NOT APPLE)
 endif()
 add_test(NAME forkfsd_object_store_recovery COMMAND forkfsd_object_store_recovery_test)
 set_tests_properties(forkfsd_object_store_recovery PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+
+# Stateful development workload: independent content model, restart and storage checks.
+foreach(seed 42 173)
+    add_test(NAME forkfsd_developer_workload_${seed} COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/scripts/tests/developer_workload.py $<TARGET_FILE:forkfsd>
+        --seed ${seed} --output ${CMAKE_BINARY_DIR}/developer-workload-artifacts
+        --files 32 --rounds 3 --workers 2 --steps 7 --max-store-mib 64)
+    set_tests_properties(forkfsd_developer_workload_${seed} PROPERTIES
+        TIMEOUT 180 LABELS "metadata-regression;developer-workload")
+endforeach()
+add_test(NAME forkfsd_developer_workload_oracle COMMAND ${Python3_EXECUTABLE} -m unittest discover
+    -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_developer_workload.py)
+set_tests_properties(forkfsd_developer_workload_oracle PROPERTIES TIMEOUT 30 LABELS "metadata-regression;developer-workload")

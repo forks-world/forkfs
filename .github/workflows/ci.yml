@@ -201,15 +201,16 @@ jobs:
         run: cmake --build build/metadata --parallel 4
       - name: Run metadata regression and crash suites
         run: ctest --test-dir build/metadata -L metadata-regression --output-on-failure --no-tests=error
-      - name: Upload regression failure logs
-        if: failure()
+      - name: Upload regression logs and development workload reports
+        if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: metadata-failures-${{ matrix.os }}
+          name: metadata-regressions-${{ matrix.os }}
           if-no-files-found: ignore
           path: |
             build/metadata/Testing/Temporary/*.log
             build/metadata/fuzz-artifacts/
+            build/metadata/developer-workload-artifacts/
 
 
   replay-fuzz:
