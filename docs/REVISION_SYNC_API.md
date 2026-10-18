@@ -1,7 +1,9 @@
 # Revision Sync API v1：面向外部 backup server
 
 状态：设计提案，尚未实现。当前 daemon 的 Unix RPC、在线 backup/replay 与本地
-catalog 不提供本文的网络 API。本文约定的是可独立实现的 backup server 契约。
+catalog 不提供本文的生产网络 API。已有[测试用 HTTP mock](REVISION_SYNC_MOCK.md)
+验证核心流程；正式 SDK、在线 pin 和 revision import 仍待实现。本文约定的是可独立
+实现的 backup server 契约。
 
 ## 1. 目标与恢复边界
 
@@ -179,8 +181,12 @@ accepted -> planning -> ready -> acknowledged
 已 ready 的计划字节与哈希必须不变。控制 catalog 损坏时停止导出及相关 GC，
 不能把无法读取的 pin 当作不存在。不得依赖进程内 LevelDB snapshot/cursor 续传。
 
-过期或取消后释放源端 pin，后续数据请求返回 `EXPORT_EXPIRED`/`EXPORT_CANCELLED`。
+过期或取消后释放源端 pin，后续数据请求及续租返回 `EXPORT_EXPIRED`/`EXPORT_CANCELLED`。
+任务元数据 GET 与同 key 的原申请重试仍返回持久终态，直至 tombstone 保留期结束，
+不因 lease 过期丢失查询能力，也不因重试自动复活任务。DELETE 对终态幂等且不改写终态。
 客户端此前已校验的对象仍可用于新任务。源端任务结束不删除目标端已发布备份。
+目标端状态应分别显示 `committed` 与 `source_ack`，不能因发布后 lease 到期把有效
+备份降为“未提交”，也不能把源端未确认误报为已同步覆盖。
 
 ## 4. 增量发现：Merkle inventory
 
@@ -327,6 +333,8 @@ catalog CAS/持久化 -> receipt。对象存储目标先完成并验证所有依
 源端 `POST .../acknowledgements` 必须核对 authenticated destination、固定 plan、
 根集合和 inventory。receipt 及 acknowledged 状态一起持久化后才返回 200，再释放
 源端 pin。receipt_id 同内容重试返回相同确认，异内容返回冲突。ACK 响应丢失可重试。
+acknowledged 任务仍可查询及重试同一 ACK，但数据接口和续租返回 `EXPORT_CLOSED`；
+需要重新拉取已丢失对象时，新建 export 重新 pin，不能依赖已释放的 lease。
 
 目标先发布成功、源端 ACK 丢失时，目标备份仍有效，源端显示“确认未完成”。lease
 已经到期且之前未确认则返回 410，不能假装更新本地覆盖状态；保留的远端备份不受影响。
@@ -390,7 +398,7 @@ FFRPLY01 base，或声称现在已有导入 CLI。若完整重建祖先命名视
 | 401/403 | UNAUTHENTICATED / FORBIDDEN | 不启动传输，不泄露其他仓库对象存在性 |
 | 404 | REVISION_NOT_FOUND / EXPORT_NOT_FOUND | 重新发现或人工处理，不能改成导出最新值 |
 | 409 | REF_CHANGED / IDEMPOTENCY_CONFLICT / RECEIPT_MISMATCH | 不发布，重新选择或修正请求 |
-| 410 | REF_VIEW_EXPIRED / EXPORT_EXPIRED / EXPORT_CANCELLED | 重新发现/建任务，复用目标已校验对象 |
+| 410 | REF_VIEW_EXPIRED / EXPORT_EXPIRED / EXPORT_CANCELLED / EXPORT_CLOSED | 重新发现/建任务，复用目标已校验对象 |
 | 413/422 | LIMIT_EXCEEDED / UNSUPPORTED_CODEC | 拆批/提高授权预算/升级，结果为 incomplete |
 | 429 | RESOURCE_EXHAUSTED | 按 Retry-After 退避，保留已持久进度 |
 | 500 | SOURCE_CORRUPTION | 导出失败，保留诊断，不能推进覆盖或静默回退 |

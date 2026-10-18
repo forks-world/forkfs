@@ -211,6 +211,7 @@ jobs:
             build/metadata/Testing/Temporary/*.log
             build/metadata/fuzz-artifacts/
             build/metadata/developer-workload-artifacts/
+            build/metadata/revision-sync-mock-artifacts/*.tar.gz
 
 
   replay-fuzz:
