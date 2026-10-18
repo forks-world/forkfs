@@ -5,6 +5,10 @@
 完整 checkpoint/generation catalog、保留 lease 与日志裁剪仍未实现；各阶段限制见下方进度说明。
 现有命令、FFRPLY01 格式及已实现保证见 [DISASTER_REPLAY.md](DISASTER_REPLAY.md)。
 
+独立的 [Revision Sync API v1](REVISION_SYNC_API.md) 设计外部 backup server 拉取
+revision DAG 和完整文件树闭包的接口。它是补充的 revision-only profile，不取代本文
+整个仓库 checkpoint/replay 的恢复契约，也尚未实现网络协议或跨仓库导入。
+
 ### 当前实现进度
 
 阶段 1 的首个实现提供 daemon RPC 后台全量备份、增量导出与状态查询，复用
