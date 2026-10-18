@@ -132,10 +132,13 @@ def receive_pack(stream, plan, expected, entries, persist):
     checked(not stream.read(1), 'pack trailing bytes')
 
 
-def verify_closure(plan, entries, load):
+def verify_closure(plan, entries, load, max_dag_bytes=64*1024*1024):
     """Independent DAG, ordered-tree and inode checks; return native restore views."""
     validate_plan(plan)
+    checked(type(max_dag_bytes) is int and 0 <= max_dag_bytes <= 64*1024*1024,
+            'revision DAG byte limit')
     used, views, colors, discovered, manifest_cache = set(), {}, {}, set(), {}
+    dag_bytes = 0
     def read(object_id):
         checked(object_id in entries, 'dependency missing from inventory')
         data = load(object_id)
@@ -286,6 +289,12 @@ def verify_closure(plan, entries, load):
                 count, = struct.unpack_from('<I', data, 48)
                 checked(count <= 64 and len(data) == 52 + count * 32, 'revision length')
                 parents = [data[52+i*32:84+i*32].hex() for i in range(count)]
+            # RevisionDag::validate charges sizeof(Frame) + 32 bytes per
+            # parent + 64 bytes. On the supported 64-bit ABI Frame is 104
+            # bytes (ID 32, RevisionRecord 64, cursor 8).
+            charge = 168 + 32 * len(parents)
+            checked(charge <= max_dag_bytes - dag_bytes, 'revision DAG byte budget')
+            dag_bytes += charge
             checked(len(parents) == len(set(parents)) and '0'*64 not in parents and object_id not in parents,
                     'revision parent IDs')
             manifest_id = data[8:40].hex()

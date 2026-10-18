@@ -19,7 +19,7 @@ import unittest
 
 from revision_sync_mock import call, remote, ApiError, json_bytes
 from revision_sync_codec import object_id, source_closure, make_plan, encode_pack
-from revision_sync_validator import decode_inventory, receive_pack
+from revision_sync_validator import decode_inventory, receive_pack, verify_closure
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'daemon' / 'tests'))
@@ -518,6 +518,45 @@ class SyncTests(unittest.TestCase):
             self.source.request('GET',path+'/inventory/'+captured['plan']['inventory_root'])
         self.assertEqual(error.exception.code,'EXPORT_EXPIRED')
 
+    def test_10b_sync_renews_during_long_transfer(self):
+        self.backup.faults(advance_sync_clock=4)
+        result = self.sync(request_id='long-transfer-renewal')
+        self.assertEqual(result['ack'], 'acknowledged')
+        source = self.source.state()
+        self.assertGreaterEqual(source['clock_offset'], 1200)
+        self.assertGreaterEqual(source['stats']['renewals'], 3)
+
+    def test_10c_expired_staging_keeps_cas_and_requires_new_explicit_request(self):
+        self.source.faults(truncate_pack=1)
+        with self.assertRaises(ApiError):
+            self.sync(request_id='staging-expired')
+        self.backup.stop();self.backup.start()
+        before = self.backup.state()
+        saved = before['jobs']['staging-expired']
+        cas_before = sorted(p.name for p in (self.backup.root/'objects').iterdir())
+        plan = saved['plan']
+        self.source.request('POST','/__test__/advance',
+                            {'name':'latest','revision_id':self.fixture['refs']['next']})
+        self.source.request('POST','/__test__/clock',{'seconds':901})
+        with self.assertRaises(ApiError) as error:
+            self.sync(request_id='staging-expired')
+        self.assertEqual(error.exception.code, 'EXPORT_EXPIRED')
+        after = self.backup.state()
+        self.assertEqual(after['catalog'], before['catalog'])
+        self.no_ack()
+        self.assertEqual(after['jobs']['staging-expired']['plan'], plan)
+        self.assertEqual(sorted(p.name for p in (self.backup.root/'objects').iterdir()), cas_before)
+        explicit = [{'revision_id':ident} for ident in plan['selected_revision_ids']]
+        resumed = self.sync(request_id='staging-expired-new', selectors=explicit)
+        self.assertEqual(resumed['ack'], 'acknowledged')
+        final = self.backup.state()
+        self.assertEqual(final['jobs']['staging-expired-new']['plan'], plan)
+        expected = source_closure(plan['selected_revision_ids'], self.fixture['objects'])
+        self.assertEqual(final['stats']['received_objects'],
+                         before['stats']['received_objects'] + len(expected) - len(cas_before))
+        self.assertTrue(set(cas_before).issubset(
+            {p.name for p in (self.backup.root/'objects').iterdir()}))
+
     def test_11_crash_before_publish_resume_without_object_retransfer(self):
         self.backup.faults(crash_before_publish=1)
         with self.assertRaises((OSError,http.client.HTTPException)):self.sync()
@@ -526,6 +565,7 @@ class SyncTests(unittest.TestCase):
         before = self.backup.state()['stats']['received_objects'];self.no_ack()
         self.assertEqual(self.sync()['state'],'committed')
         self.assertEqual(self.backup.state()['stats']['received_objects'],before)
+        self.assertGreaterEqual(self.source.state()['stats']['renewals'],1)
 
     def test_12_crash_after_publish_keeps_one_catalog_entry(self):
         self.backup.faults(crash_after_publish=1)
@@ -707,6 +747,28 @@ class SyncTests(unittest.TestCase):
         expected = hashlib.sha256(b'forkfs.object.v0'+b'\x04\x00\x00\x00'+(0).to_bytes(8,'little')).digest()
         self.assertEqual(object_id(b''),expected)
         self.assertNotEqual(object_id(data),hashlib.sha256(data).digest())
+
+    def test_21_revision_dag_byte_budget_matches_canonical_boundary(self):
+        root = self.fixture['refs']['base']
+        entries = source_closure([root], self.fixture['objects'])
+        plan, _ = make_plan(self.fixture['repository'], self.fixture['sequence'], [root], entries)
+        load = lambda ident: bytes.fromhex(self.fixture['objects'][ident])
+        with self.assertRaisesRegex(ValueError, 'byte budget'):
+            verify_closure(plan, entries, load, max_dag_bytes=167)
+        self.assertEqual(set(verify_closure(plan, entries, load, max_dag_bytes=168)), {root})
+
+        objects = self.fixture['objects'].copy()
+        base_descriptor = bytes.fromhex(objects[root])
+        child = (b'FFREV002' + base_descriptor[8:40] + struct.pack('<QI', 3, 1)
+                 + bytes.fromhex(root))
+        child_id = object_id(child).hex();objects[child_id] = child.hex()
+        roots = [root, child_id]
+        entries = source_closure(roots, objects)
+        plan, _ = make_plan(self.fixture['repository'], self.fixture['sequence'], roots, entries)
+        load = lambda ident: bytes.fromhex(objects[ident])
+        with self.assertRaisesRegex(ValueError, 'byte budget'):
+            verify_closure(plan, entries, load, max_dag_bytes=367)
+        self.assertEqual(set(verify_closure(plan, entries, load, max_dag_bytes=368)), set(roots))
 
 
 def main():

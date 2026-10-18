@@ -67,6 +67,17 @@ hardlink inode、symlink 文本和 mode。此时源 HTTP 进程已退出、源 f
 
 pack/结构测试包含固定 seed 的随机截断与位翻转，不只依赖几个固定坏包。
 
+staging 传输会周期续租 export，并在恢复尚未提交的任务时先核对/续租。单次阻塞
+操作或离线暂停若超过 lease，不能靠协作续租保证不失效：原 request 保留固定 plan
+和已验证 CAS，返回 `EXPORT_EXPIRED`，不会重新解析其名称或复活原 export。调用者
+应建立新 request，并显式选择原 plan 中仍有授权的 revision IDs，复用已验证对象。
+已经 committed 的备份不依赖续租；已知 acknowledged 的重试不再联系源端。
+
+mock 同时执行 100,000 个唯一 revision 和 64 MiB 的 DAG 遍历预算，按当前 64 位
+canonical `RevisionDag` 的 frame/parent charge 计算。该预算不是完整 namespace、
+对象缓存或进程的内存上限；超限是 incomplete，不能发布完整 receipt。
+
+
 ## 观测和产物
 
 每个用例保留 source/backup 的状态、日志、对象和还原目录。结束后输出 `result.json`

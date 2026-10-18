@@ -427,7 +427,8 @@ FFRPLY01 base，或声称现在已有导入 CLI。若完整重建祖先命名视
 
 错误体固定为 `code, message, retryable, export_id?, details?`；message 不是机器匹配键。
 限制初值：refs 每页 256（上限 1,024），selectors 数量 1–256，单批 1,024 对象/16 MiB，
-单对象 <=256 KiB，DAG revision 节点 <=100,000，单仓库同时两个活动 export。
+单对象 <=256 KiB，DAG revision 节点 <=100,000，默认 DAG 遍历预算 64 MiB
+（当前 canonical `RevisionDag` 的 frame/parent 计费），单仓库同时两个活动 export。
 对象总数、pin 字节、staging 和校验内存均设管理员可调硬限额；当前遍历器的 DAG
 预算不能冒充完整 namespace/closure 的内存上限。源/目标按请求与响应字节限流。
 

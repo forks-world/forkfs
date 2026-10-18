@@ -190,9 +190,10 @@ class Backend:
             return {'export_id': ident, 'state': job['state'], 'plan': job['plan']}
         if action == 'renew' and method == 'POST':
             seconds = body.get('lease_seconds', 0)
-            if not isinstance(seconds, int) or not 1 <= seconds <= 900:
+            if type(seconds) is not int or not 1 <= seconds <= 900:
                 raise ApiError('INVALID_ARGUMENT', 400)
-            job['expires'] = time.time() + self.state['clock_offset'] + seconds;self.save()
+            job['expires'] = time.time() + self.state['clock_offset'] + seconds
+            self.count('renewals');self.save()
             return {'expires': job['expires']}
         if action.startswith('inventory/') and method == 'GET':
             node = action.split('/')[1]
@@ -278,6 +279,7 @@ class Backend:
     def sync(self, body):
         request_id = body['request_id'];selectors = body['selectors']
         jobs = self.state['jobs']
+        resuming = request_id in jobs
         if request_id in jobs and (jobs[request_id]['selectors'] != selectors
                                    or jobs[request_id].get('repository') != body['repository']):
             raise ApiError('IDEMPOTENCY_CONFLICT', 409)
@@ -294,8 +296,28 @@ class Backend:
                                     base=base, state='staging')
             self.save()
         job = jobs[request_id];plan = job['plan'];path = job['base'] + '/exports/' + job['export_id']
+        last_renewed = [None]
+        def maybe_renew(force=False):
+            if job['state'] != 'staging':
+                return
+            if self.fault('advance_sync_clock'):
+                seconds = 400
+                self.state['sync_clock_offset'] = self.state.get('sync_clock_offset', 0) + seconds
+                self.save()
+                call(self.source, 'POST', '/__test__/clock', {'seconds': seconds})
+            now = time.monotonic() + self.state.get('sync_clock_offset', 0)
+            if force or last_renewed[0] is None or now - last_renewed[0] >= 300:
+                call(self.source, 'POST', path + '/renew', {'lease_seconds': 900})
+                last_renewed[0] = now
+        # A resumed staging request cannot trust a monotonic timestamp saved by
+        # the previous process, so it renews before accessing the export.
+        if resuming and job['state'] == 'staging':
+            maybe_renew(force=True)
+        else:
+            last_renewed[0] = time.monotonic() + self.state.get('sync_clock_offset', 0)
         def inventory_node(node_hash):
             checked(bool(HEX.fullmatch(node_hash)), 'inventory ID')
+            maybe_renew()
             target = self.root / 'inventory' / node_hash
             if not target.exists():
                 with remote(self.source, 'GET', path + '/inventory/' + node_hash) as response:
@@ -306,6 +328,7 @@ class Backend:
         entries = decode_inventory(plan, inventory_node)
         missing = []
         for ident, length in entries.items():
+            maybe_renew()
             target = self.object_path(ident)
             if not target.exists():
                 missing.append(ident)
@@ -314,6 +337,7 @@ class Backend:
                 checked(len(data) == length and object_id(data).hex() == ident, 'existing CAS corruption')
         missing.sort()
         def persist(ident, data):
+            maybe_renew()
             atomic(self.object_path(ident), data)
             self.count('received_objects');self.count('received_payload_bytes', len(data))
         while missing:
@@ -322,11 +346,13 @@ class Backend:
                 if len(batch) == 1024 or total + entries[ident] > 16777216:
                     break
                 batch.append(ident);total += entries[ident]
+            maybe_renew()
             with remote(self.source, 'POST', path + '/packs', {'object_ids': batch}, request_id + ':' + batch[0]) as response:
                 receive_pack(response, plan, batch, entries, persist)
             self.save()
             missing = missing[len(batch):]
-        views = verify_closure(plan, entries, self.load)
+        views = verify_closure(plan, entries, lambda ident: (maybe_renew(), self.load(ident))[1])
+        maybe_renew()
         if self.fault('crash_before_publish'):
             os._exit(86)
         backup_id = plan['plan_hash']
