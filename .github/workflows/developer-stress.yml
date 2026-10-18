@@ -1,0 +1,54 @@
+name: Developer workload stress
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 0'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: developer-stress-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  stress:
+    name: Development stress (${{ matrix.os }}, seed ${{ matrix.seed }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: sh
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        seed: [173, 20261018]
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install Linux compiler and crypto headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14 libssl-dev
+      - name: Configure metadata-only Release build
+        run: python3 scripts/ci/configure_metadata.py --fskit off
+      - name: Build resident daemon
+        run: cmake --build build/metadata --target forkfsd --parallel 4
+      - name: Run concurrent development, recovery and space stress
+        run: >-
+          python3 scripts/tests/developer_workload.py build/metadata/daemon/forkfsd
+          --output build/metadata/developer-stress-artifacts --seed ${{ matrix.seed }}
+          --files 512 --rounds 20 --workers 4 --steps 21 --restart-every 2 --max-store-mib 512
+      - name: Retain metrics, seed, trace and recovery fixtures
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: developer-stress-${{ matrix.os }}-${{ matrix.seed }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: build/metadata/developer-stress-artifacts/
