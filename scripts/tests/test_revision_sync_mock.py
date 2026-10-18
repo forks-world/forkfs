@@ -171,6 +171,20 @@ class SyncTests(unittest.TestCase):
             values[prefix + b'a'*length] = value
         bad_namespace('long-entry-name', lambda v: long_entry(v, 256))
         bad_namespace('valid-entry-boundary', lambda v: long_entry(v, 255))
+        def set_v4_inode(values, accessed=0, created=0, xattrs=(), legacy=False):
+            inode_key, old = next((key, value) for key, value in values.items()
+                                  if key.startswith(b'\0forkfs/inode/') and int.from_bytes(value[8:12], 'little') == 1)
+            flags_ids = old[48:64] if old[:8] in (b'FFINOD03', b'FFINOD04') else bytes(16)
+            inode = bytearray(b'FFINOD04' + old[8:48] + flags_ids + struct.pack('<QQI', accessed, created, len(xattrs)))
+            for name, value in xattrs:
+                inode += struct.pack('<II', len(name), len(value)) + name + value
+            values[inode_key] = b'FFINOD03' + bytes(inode[8:80]) if legacy else bytes(inode)
+        bad_namespace('invalid-extended-timestamp', lambda v: set_v4_inode(v, accessed=2**63))
+        bad_namespace('invalid-created-timestamp', lambda v: set_v4_inode(v, created=2**63))
+        bad_namespace('invalid-v3-accessed-timestamp', lambda v: set_v4_inode(v, accessed=2**63, legacy=True))
+        bad_namespace('invalid-v3-created-timestamp', lambda v: set_v4_inode(v, created=2**63, legacy=True))
+        bad_namespace('oversized-v4-inode', lambda v: set_v4_inode(v, xattrs=((b'a', b'x'*65536), (b'b', b'y'*65536))))
+        bad_namespace('valid-v4-inode-boundary', lambda v: set_v4_inode(v, accessed=2**63-1, created=2**63-1, xattrs=((b'a', b'x'*65536), (b'b', b'y'*65434))))
         # Preserve raw legacy bytes and a nonlocal maximal source watermark.
         base_descriptor = bytes.fromhex(objects[refs['base']])
         legacy = b'FFREV001' + base_descriptor[8:40] + bytes(32) + (2**64-1).to_bytes(8,'little')
@@ -283,7 +297,9 @@ class SyncTests(unittest.TestCase):
         names = ('missing-allocation', 'nonempty-allocation', 'extra-namespace-key',
                  'extra-parent-record', 'extra-content-record', 'empty-symlink-target',
                  'oversized-symlink-target', 'nonprintable-symlink-target',
-                 'long-symlink-component', 'long-entry-name')
+                 'long-symlink-component', 'long-entry-name', 'invalid-extended-timestamp',
+                 'invalid-created-timestamp', 'invalid-v3-accessed-timestamp',
+                 'invalid-v3-created-timestamp', 'oversized-v4-inode')
         for index, name in enumerate(names):
             with self.subTest(namespace=name), self.assertRaises(ApiError) as raised:
                 self.sync(request_id='invalid-namespace-'+str(index), selectors=[{'name':name}])
@@ -298,6 +314,9 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(result['ack'], 'acknowledged')
         entry = self.sync(request_id='valid-entry-boundary', selectors=[{'name':'valid-entry-boundary'}])
         self.assertEqual(entry['ack'], 'acknowledged')
+        inode = self.sync(request_id='valid-v4-inode-boundary',
+                          selectors=[{'name':'valid-v4-inode-boundary'}])
+        self.assertEqual(inode['ack'], 'acknowledged')
 
     def test_07_inventory_omits_dependency_no_commit(self):
         self.source.faults(omit_inventory_object=1)

@@ -164,8 +164,12 @@ def verify_closure(plan, entries, load):
                     checked(len(data) == 48, 'inode length')
                 else:
                     checked(len(data) >= 80 and (data[:8] != b'FFINOD03' or len(data) == 80), 'extended inode length')
+                    if data[:8] == b'FFINOD04':
+                        checked(84 <= len(data) <= 128 * 1024, 'xattr inode length')
                     flags, = struct.unpack_from('<I', data, 48)
                     checked(flags <= 1 and (not flags or kind == 2) and data[60:64] == bytes(4), 'inode flags')
+                    accessed, created = struct.unpack_from('<QQ', data, 64)
+                    checked(accessed <= 2**63 - 1 and created <= 2**63 - 1, 'extended inode timestamp')
                     if data[:8] == b'FFINOD04':
                         inp = Input(data[80:]);n = inp.number(4);previous = b''
                         checked(n <= 128, 'xattr count')
