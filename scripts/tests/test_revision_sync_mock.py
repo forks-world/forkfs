@@ -155,6 +155,10 @@ class SyncTests(unittest.TestCase):
             revision = descriptor[:8] + manifest_id + descriptor[40:]
             revision_id = object_id(revision);objects[revision_id.hex()] = revision.hex()
             refs[name] = revision_id.hex()
+        source_values = namespace_values(manifest[8:].hex())
+        source_root = source_values[b'\0forkfs/root']
+        source_dir = source_values[b'\0forkfs/entry/' + source_root + b'/src']
+        cls.source_dir_mode = struct.unpack_from('<I', source_values[b'\0forkfs/inode/' + source_dir], 12)[0]
         alloc_key = next(k for k in namespace_values(manifest[8:].hex()) if k.startswith(b'\0forkfs/allocated/'))
         bad_namespace('missing-allocation', lambda v: v.pop(alloc_key))
         bad_namespace('nonempty-allocation', lambda v: v.__setitem__(alloc_key, b'x'))
@@ -165,6 +169,12 @@ class SyncTests(unittest.TestCase):
             b'\0forkfs/entry/not-an-inode/name', v[b'\0forkfs/root']))
         bad_namespace('extra-parent-record', lambda v: v.__setitem__(b'\0forkfs/parent/' + b'0'*32, b'FFPAR001' + b'0'*16))
         bad_namespace('extra-content-record', lambda v: v.__setitem__(b'\0forkfs/content/' + b'0'*32, b''))
+        def root_mode_zero(values):
+            ident = values[b'\0forkfs/root']
+            key = b'\0forkfs/inode/' + ident
+            inode = bytearray(values[key]);struct.pack_into('<I', inode, 12, 0)
+            values[key] = bytes(inode)
+        bad_namespace('root-mode-zero', root_mode_zero)
         def set_symlink_payload(values, payload):
             inode_key, inode = next((key, bytearray(value)) for key, value in values.items()
                                     if key.startswith(b'\0forkfs/inode/') and int.from_bytes(value[8:12], 'little') == 3)
@@ -422,6 +432,21 @@ class SyncTests(unittest.TestCase):
         history = self.sync(request_id='deep-history', selectors=[{'name':'deep-history'}])
         self.assertGreaterEqual(history['revisions'], 1500)
         self.assertEqual(history['ack'], 'acknowledged')
+
+    def test_06e_root_mode_zero_restores_after_descendants(self):
+        result = self.sync(request_id='root-mode-zero', selectors=[{'name':'root-mode-zero'}])
+        self.assertEqual(result['ack'], 'acknowledged')
+        restored = self.backup.request('POST', '/restore', {'backup_id':result['backup_id']})
+        view = self.backup.root/'restored'/restored['restore_id']/self.fixture['refs']['root-mode-zero']
+        try:
+            self.assertEqual(stat.S_IMODE(os.lstat(view).st_mode), 0)
+            os.chmod(view, 0o700)
+            source_dir = view/'src'
+            self.assertEqual(stat.S_IMODE(source_dir.stat().st_mode), self.source_dir_mode)
+            self.assertEqual((source_dir/'f0').read_bytes(), b'left\0edit')
+        finally:
+            if view.exists():
+                os.chmod(view, 0o700)
 
     def test_06d_restore_long_path_with_directory_fds(self):
         result = self.sync(request_id='long-native-path', selectors=[{'name':'long-native-path'}])

@@ -365,7 +365,9 @@ def restore_views(views, root):
                             links[info['inode']] = parts
                     finally:
                         os.close(parent_fd)
-                for path, info in sorted(paths.items(), key=lambda p: p[0].count('/'), reverse=True):
+                # Apply descendants first and the revision root last. A root
+                # mode such as 000 must not prevent opening child directories.
+                for path, info in sorted(paths.items(), key=lambda p: len(components(p[0])), reverse=True):
                     if info['kind'] != 'dir':
                         continue
                     parts = components(path)
