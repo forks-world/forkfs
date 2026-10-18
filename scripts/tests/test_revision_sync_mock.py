@@ -151,6 +151,26 @@ class SyncTests(unittest.TestCase):
         bad_namespace('extra-namespace-key', lambda v: v.__setitem__(b'\0forkfs/unknown/record', b''))
         bad_namespace('extra-parent-record', lambda v: v.__setitem__(b'\0forkfs/parent/' + b'0'*32, b'FFPAR001' + b'0'*16))
         bad_namespace('extra-content-record', lambda v: v.__setitem__(b'\0forkfs/content/' + b'0'*32, b''))
+        def set_symlink_payload(values, payload):
+            inode_key, inode = next((key, bytearray(value)) for key, value in values.items()
+                                    if key.startswith(b'\0forkfs/inode/') and int.from_bytes(value[8:12], 'little') == 3)
+            ident = inode_key[len(b'\0forkfs/inode/'):]
+            struct.pack_into('<Q', inode, 24, len(payload))
+            values[inode_key] = bytes(inode)
+            values[b'\0forkfs/content/' + ident] = payload
+        bad_namespace('valid-symlink-boundary', lambda v: set_symlink_payload(v, b'/'.join([b'a'*255]*16) + b'/'))
+        bad_namespace('empty-symlink-target', lambda v: set_symlink_payload(v, b''))
+        bad_namespace('oversized-symlink-target', lambda v: set_symlink_payload(v, b'a'*4097))
+        bad_namespace('nonprintable-symlink-target', lambda v: set_symlink_payload(v, b'a\0b'))
+        bad_namespace('long-symlink-component', lambda v: set_symlink_payload(v, b'a'*256))
+        def long_entry(values, length):
+            old = next(k for k, ident in values.items() if k.startswith(b'\0forkfs/entry/')
+                       and int.from_bytes(values[b'\0forkfs/inode/' + ident][8:12], 'little') == 1)
+            value = values.pop(old)
+            prefix = old.rsplit(b'/', 1)[0] + b'/'
+            values[prefix + b'a'*length] = value
+        bad_namespace('long-entry-name', lambda v: long_entry(v, 256))
+        bad_namespace('valid-entry-boundary', lambda v: long_entry(v, 255))
         # Preserve raw legacy bytes and a nonlocal maximal source watermark.
         base_descriptor = bytes.fromhex(objects[refs['base']])
         legacy = b'FFREV001' + base_descriptor[8:40] + bytes(32) + (2**64-1).to_bytes(8,'little')
@@ -261,11 +281,23 @@ class SyncTests(unittest.TestCase):
 
     def test_06b_rehashed_invalid_namespace_keysets_rejected(self):
         names = ('missing-allocation', 'nonempty-allocation', 'extra-namespace-key',
-                 'extra-parent-record', 'extra-content-record')
+                 'extra-parent-record', 'extra-content-record', 'empty-symlink-target',
+                 'oversized-symlink-target', 'nonprintable-symlink-target',
+                 'long-symlink-component', 'long-entry-name')
         for index, name in enumerate(names):
-            with self.subTest(namespace=name), self.assertRaises(ApiError):
+            with self.subTest(namespace=name), self.assertRaises(ApiError) as raised:
                 self.sync(request_id='invalid-namespace-'+str(index), selectors=[{'name':name}])
+            self.assertEqual(raised.exception.code, 'PROTOTYPE_VALIDATION_FAILED')
             self.no_ack()
+
+    def test_06c_valid_symlink_component_and_target_boundaries(self):
+        # Exactly 4096 bytes, with 255-byte components and a trailing slash.
+        result = self.sync(request_id='valid-symlink-boundary',
+                           selectors=[{'name':'valid-symlink-boundary'}])
+        self.assertEqual(result['state'], 'committed')
+        self.assertEqual(result['ack'], 'acknowledged')
+        entry = self.sync(request_id='valid-entry-boundary', selectors=[{'name':'valid-entry-boundary'}])
+        self.assertEqual(entry['ack'], 'acknowledged')
 
     def test_07_inventory_omits_dependency_no_commit(self):
         self.source.faults(omit_inventory_object=1)
@@ -337,6 +369,52 @@ class SyncTests(unittest.TestCase):
         again = self.sync();self.assertEqual(again['ack'],'acknowledged')
         self.assertEqual(result['backup_id'],again['backup_id'])
         self.assertEqual(self.backup.state()['catalog'],first['catalog'])
+
+    def test_13b_malformed_ack_receipt_is_not_persisted(self):
+        capture = self.capture(key='ack-schema')
+        job_path = self.base + '/exports/' + capture['export_id']
+        plan = capture['plan']
+        receipt = dict(receipt_id='1'*32, consumer_id='mock-backup', destination_id='mock-destination',
+                       source_repository=plan['source_repository'], plan_hash=plan['plan_hash'],
+                       inventory_root=plan['inventory_root'], selected_revision_ids=plan['selected_revision_ids'],
+                       backup_id=plan['plan_hash'], backup_manifest_hash='a'*64, catalog_generation='1',
+                       durability='destination-committed', retention_expires_at=None)
+        before = self.source.state()
+        missing = receipt.copy();missing.pop('receipt_id')
+        malformed_receipts = [(missing, 'INVALID_ARGUMENT')]
+        for field, value in [('receipt_id', ''), ('backup_manifest_hash', 'bad'),
+                             ('catalog_generation', str(2**64)), ('durability', 'uncommitted')]:
+            malformed_receipts.append((receipt | {field: value}, 'RECEIPT_MISMATCH'))
+        for malformed, code in malformed_receipts:
+            with self.subTest(receipt=malformed), self.assertRaises(ApiError) as raised:
+                self.source.request('POST', job_path+'/acknowledgements', malformed)
+            self.assertEqual(raised.exception.code, code)
+            self.assertEqual(self.source.state()['jobs'], before['jobs'])
+        self.source.stop();self.source.start()
+        self.assertEqual(self.source.state()['jobs'], before['jobs'])
+        self.assertEqual(self.source.request('POST', job_path+'/acknowledgements', receipt)['state'], 'acknowledged')
+        saved = self.source.state()['jobs'][capture['export_id']]
+        self.assertEqual(saved['state'], 'acknowledged')
+        self.assertEqual(saved['receipt'], receipt)
+
+    def test_13c_sync_idempotency_includes_repository(self):
+        self.sync()
+        before = self.backup.state()
+        with self.assertRaises(ApiError) as raised:
+            self.sync(repository='00'*16)
+        self.assertEqual(raised.exception.code, 'IDEMPOTENCY_CONFLICT')
+        self.assertEqual(self.backup.state(), before)
+
+    def test_13d_acknowledged_status_is_monotonic_when_source_is_unavailable(self):
+        first = self.sync()
+        self.assertEqual(first['ack'], 'acknowledged')
+        before = self.backup.state()
+        self.source.stop()
+        retry = self.sync()
+        self.assertEqual(retry['ack'], 'acknowledged')
+        after = self.backup.state()
+        self.assertEqual(after['jobs']['request-a']['ack'], 'acknowledged')
+        self.assertEqual(after['catalog'], before['catalog'])
 
     def test_14_capabilities_rejected_before_transfer(self):
         self.source.faults(wrong_protocol=1)

@@ -233,10 +233,26 @@ class Backend:
             return data
         if action == 'acknowledgements' and method == 'POST':
             plan = job['plan']
-            if (body.get('plan_hash') != plan['plan_hash'] or body.get('inventory_root') != plan['inventory_root']
-                    or body.get('selected_revision_ids') != plan['selected_revision_ids']
-                    or body.get('source_repository') != plan['source_repository']
-                    or body.get('destination_id') != job['destination'] or body.get('consumer_id') != job['consumer']):
+            # This validator describes the mock's negotiated receipt schema;
+            # it is not a production receipt contract.
+            receipt_fields = {'receipt_id', 'consumer_id', 'destination_id', 'source_repository', 'plan_hash',
+                              'inventory_root', 'selected_revision_ids', 'backup_id', 'backup_manifest_hash',
+                              'catalog_generation', 'durability', 'retention_expires_at'}
+            if not isinstance(body, dict) or set(body) != receipt_fields:
+                raise ApiError('INVALID_ARGUMENT', 400)
+            if (not isinstance(body['receipt_id'], str) or not re.fullmatch('[0-9a-f]{32}', body['receipt_id'])
+                    or body['consumer_id'] != job['consumer'] or body['destination_id'] != job['destination']
+                    or body['source_repository'] != plan['source_repository'] or body['plan_hash'] != plan['plan_hash']
+                    or body['inventory_root'] != plan['inventory_root']
+                    or body['selected_revision_ids'] != plan['selected_revision_ids']
+                    or body['backup_id'] != plan['plan_hash']
+                    or not isinstance(body['backup_manifest_hash'], str)
+                    or not HEX.fullmatch(body['backup_manifest_hash'])
+                    or not isinstance(body['catalog_generation'], str)
+                    or not re.fullmatch('[1-9][0-9]{0,19}', body['catalog_generation'])
+                    or int(body['catalog_generation']) >= 2**64
+                    or body['durability'] != 'destination-committed'
+                    or body['retention_expires_at'] is not None):
                 raise ApiError('RECEIPT_MISMATCH', 409)
             if job['state'] == 'acknowledged' and body != job['receipt']:
                 raise ApiError('RECEIPT_MISMATCH', 409)
@@ -256,7 +272,8 @@ class Backend:
     def sync(self, body):
         request_id = body['request_id'];selectors = body['selectors']
         jobs = self.state['jobs']
-        if request_id in jobs and jobs[request_id]['selectors'] != selectors:
+        if request_id in jobs and (jobs[request_id]['selectors'] != selectors
+                                   or jobs[request_id].get('repository') != body['repository']):
             raise ApiError('IDEMPOTENCY_CONFLICT', 409)
         if request_id not in jobs:
             base = '/v1/repositories/' + body['repository']
@@ -266,7 +283,8 @@ class Backend:
             request = dict(selectors=selectors, consumer_id='mock-backup', destination_id='mock-destination',
                            scope='revision-closure', history='full', lease_seconds=900)
             capture = call(self.source, 'POST', base + '/exports', request, request_id)
-            jobs[request_id] = dict(selectors=selectors, export_id=capture['export_id'], plan=capture['plan'],
+            jobs[request_id] = dict(repository=body['repository'], selectors=selectors,
+                                    export_id=capture['export_id'], plan=capture['plan'],
                                     base=base, state='staging')
             self.save()
         job = jobs[request_id];plan = job['plan'];path = job['base'] + '/exports/' + job['export_id']
@@ -319,6 +337,9 @@ class Backend:
         job['state'] = 'committed';self.save()
         if self.fault('crash_after_publish'):
             os._exit(87)
+        if job.get('ack') == 'acknowledged':
+            return dict(backup_id=backup_id, state='committed', ack='acknowledged',
+                        revisions=len(views), export_id=job['export_id'])
         receipt = self.state['catalog'][backup_id]['receipt']
         if self.fault('expire_before_ack'):
             call(self.source, 'POST', '/__test__/clock', {'seconds': 901})

@@ -19,6 +19,14 @@ def checked(condition, message):
         raise ValueError(message)
 
 
+def validate_symlink_target(target):
+    """Match daemon/namespace.cpp target_components validation."""
+    checked(bool(target) and len(target) <= 4096, 'symlink target length')
+    checked(all(32 <= byte <= 126 for byte in target), 'symlink target must be printable ASCII')
+    checked(all(not component or len(component) <= 255 for component in target.split(b'/')),
+            'symlink target component length')
+
+
 class Input:
     def __init__(self, data):
         self.data, self.at = data, 0
@@ -187,7 +195,8 @@ def verify_closure(plan, entries, load):
             children = [(key[len(prefix):], child) for key, child in values.items() if key.startswith(prefix)]
             subdirs = 0
             for name, child in children:
-                checked(name not in (b'', b'.', b'..') and b'/' not in name and all(32 <= c <= 126 for c in name), 'unsafe entry name')
+                checked(name not in (b'', b'.', b'..') and len(name) <= 255 and b'/' not in name
+                        and all(32 <= c <= 126 for c in name), 'unsafe entry name')
                 checked(child in inode_ids and child != root, 'entry target')
                 expected_keys.add(prefix + name)
                 refs[child] += 1;typ, md, _, length = inode_ids[child]
@@ -204,6 +213,8 @@ def verify_closure(plan, entries, load):
                     checked(content_key in values, 'inode content missing')
                     payload = values[content_key]
                     checked(len(payload) == length, 'inode content size')
+                    if typ == 3:
+                        validate_symlink_target(payload)
                     expected_keys.add(content_key)
                     paths[target] = dict(kind='symlink' if typ == 3 else 'file', mode=md, inode=child.decode(), data=payload)
                 if typ == 2 and indexed:
