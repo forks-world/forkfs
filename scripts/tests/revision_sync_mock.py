@@ -173,7 +173,7 @@ class Backend:
                 raise ApiError('FORBIDDEN', 403)
             if type(body['lease_seconds']) is not int or not 1 <= body['lease_seconds'] <= 900:
                 raise ApiError('INVALID_ARGUMENT', 400)
-            roots = []
+            roots = [];authorized_ids = None
             for selector in body['selectors']:
                 if 'name' in selector:
                     oid = self.state['refs'].get(selector['name'])
@@ -183,7 +183,9 @@ class Backend:
                         raise ApiError('REF_CHANGED', 409)
                 else:
                     oid = selector.get('revision_id')
-                    if oid not in self.state['refs'].values():
+                    if authorized_ids is None:
+                        authorized_ids = self.authorized_revision_ids()
+                    if oid not in authorized_ids:
                         raise ApiError('REVISION_NOT_FOUND', 404)
                 roots.append(oid)
             entries = source_closure(roots, self.fixture['objects'])
@@ -302,6 +304,42 @@ class Backend:
 
     def load(self, object_id):
         return self.object_path(object_id).read_bytes()
+
+    def authorized_revision_ids(self):
+        """Return current-ref revisions and their bounded, hash-checked ancestors."""
+        refs = self.state.get('refs')
+        checked(type(refs) is dict, 'invalid current revision refs')
+        roots = refs.values()
+        pending = []
+        for root in roots:
+            checked(type(root) is str and bool(HEX.fullmatch(root)), 'invalid current revision ref')
+            pending.append(bytes.fromhex(root))
+        colors = {};charged = 0
+        stack = [(ident, False) for ident in reversed(pending)]
+        while stack:
+            ident, exiting = stack.pop()
+            name = ident.hex()
+            if exiting:
+                checked(colors.get(name) == 1, 'revision DAG traversal state')
+                colors[name] = 2
+                continue
+            if colors.get(name) == 2:
+                continue
+            checked(name not in colors, 'authorized revision DAG cycle')
+            checked(len(colors) < 100000, 'authorized revision DAG node budget')
+            encoded = self.fixture['objects'].get(name)
+            checked(encoded is not None, 'current revision object missing')
+            data = bytes.fromhex(encoded)
+            checked(len(data) <= 262144 and object_id(data) == ident, 'current revision object hash')
+            manifest, parents = revision(data)
+            checked(any(manifest) and ident not in parents, 'invalid revision descriptor')
+            charge = 168 + 32 * len(parents)
+            checked(charge <= 64*1024*1024 - charged, 'authorized revision DAG byte budget')
+            charged += charge
+            colors[name] = 1
+            stack.append((ident, True))
+            stack.extend((parent, False) for parent in reversed(parents))
+        return set(colors)
 
     def sync(self, body):
         request_id = body['request_id'];selectors = body['selectors']
@@ -437,6 +475,12 @@ class Backend:
             self.state['faults'] = body;self.save();return {'ok': True}
         if path == '/__test__/advance' and self.role == 'source':
             self.state['refs'][body['name']] = body['revision_id'];self.save();return {'ok': True}
+        if path == '/__test__/replace-refs' and self.role == 'source':
+            if (type(body) is not dict or set(body) != {'refs'} or type(body['refs']) is not dict
+                    or any(type(name) is not str or type(ident) is not str or not HEX.fullmatch(ident)
+                           for name, ident in body['refs'].items())):
+                raise ApiError('INVALID_ARGUMENT', 400)
+            self.state['refs'] = body['refs'];self.save();return {'ok': True}
         if path == '/__test__/clock' and self.role == 'source':
             self.state['clock_offset'] += body['seconds'];self.save();return {'ok': True}
         if path == '/__test__/drop-object' and self.role == 'backup':

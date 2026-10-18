@@ -300,8 +300,11 @@ class SyncTests(unittest.TestCase):
         merged = bytes.fromhex(objects[refs['merge']])
         mixed = b'FFREV002' + merged[8:40] + struct.pack('<QI',2**64-1,2) + bytes.fromhex(refs['merge']) + legacy_id
         mixed_id = object_id(mixed);objects[mixed_id.hex()] = mixed.hex();refs['mixed'] = mixed_id.hex()
+        unreachable = b'FFREV002' + merged[8:40] + struct.pack('<QI', 7, 0)
+        unreachable_id = object_id(unreachable).hex();objects[unreachable_id] = unreachable.hex()
         cls.fixture = dict(repository=header[9:25].hex(), sequence=int.from_bytes(header[33:41],'little'),
-                           objects=objects, refs=refs, required_object=object_id(cls.expected['/magic']).hex())
+                           objects=objects, refs=refs, required_object=object_id(cls.expected['/magic']).hex(),
+                           unreachable_revision=unreachable_id)
         cls.base = '/v1/repositories/' + cls.fixture['repository']
         cls.unrelated = rows[b'R/unrelated'].hex()
         (cls.root/'fixture-template.json').write_bytes(json_bytes(cls.fixture))
@@ -582,6 +585,27 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(self.source.state()['jobs'], before_jobs)
             self.assertEqual(self.backup.state()['catalog'], before_catalog)
 
+    def test_09c_direct_revision_ids_follow_current_ref_ancestry(self):
+        descendant = self.fixture['refs']['next']
+        ancestor = self.fixture['refs']['merge']
+        self.source.request('POST', '/__test__/replace-refs', {'refs':{'tip':descendant}})
+        self.assertEqual(self.source.request('GET', self.base+'/revision-refs')['refs'], {'tip':descendant})
+        captured = self.capture(key='unnamed-ancestor', selectors=[{'revision_id':ancestor}])
+        self.assertEqual(captured['state'], 'ready')
+        for index, ident in enumerate((self.fixture['unreachable_revision'], self.fixture['required_object'])):
+            before_jobs = self.source.state()['jobs']
+            before_catalog = self.backup.state()['catalog']
+            request = dict(consumer_id='mock-backup', destination_id='mock-destination',
+                           scope='revision-closure', history='full', lease_seconds=900,
+                           selectors=[{'revision_id':ident}])
+            with self.subTest(object_id=ident), self.assertRaises(ApiError) as raised:
+                self.source.request('POST', self.base+'/exports', request,
+                                    'unauthorized-direct-id-'+str(index))
+            self.assertEqual(raised.exception.code, 'REVISION_NOT_FOUND')
+            self.assertEqual(raised.exception.status, 404)
+            self.assertEqual(self.source.state()['jobs'], before_jobs)
+            self.assertEqual(self.backup.state()['catalog'], before_catalog)
+
     def test_10_lease_renew_expiry_and_membership(self):
         captured = self.capture();path = self.base+'/exports/'+captured['export_id']
         before = self.source.state()['jobs']
@@ -626,8 +650,8 @@ class SyncTests(unittest.TestCase):
         saved = before['jobs']['staging-expired']
         cas_before = sorted(p.name for p in (self.backup.root/'objects').iterdir())
         plan = saved['plan']
-        self.source.request('POST','/__test__/advance',
-                            {'name':'latest','revision_id':self.fixture['refs']['next']})
+        self.source.request('POST','/__test__/replace-refs',
+                            {'refs':{'tip':self.fixture['refs']['next']}})
         self.source.request('POST','/__test__/clock',{'seconds':901})
         with self.assertRaises(ApiError) as error:
             self.sync(request_id='staging-expired')

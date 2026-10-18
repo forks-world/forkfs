@@ -32,6 +32,11 @@ base -> left  --+-> merge -> next
 外部 backup server 读取 LevelDB/segment。FFREV001 + FFREV002 混合及最大 u64
 source_sequence 的额外历史由测试生成并保留原始对象 ID。
 
+mock 的显式 revision ID 选择范围是当前授权 refs 及其保留祖先，包含没有直接名称的
+祖先。仅存在于 fixture CAS、或仅被旧 export pin 保留，不自动授予新建 export 的权限。
+已有 export 仍按固定 plan 提供其闭包；refs 变化不会改写它。过期后的新申请必须重新
+满足当前授权历史范围，不能把任意可找到的对象当作可导出的 revision。
+
 源端 encoder/closure walker 与目标 decoder/namespace validator 分开实现。目标
 验证 hash、inventory radix/count、pack framing、精确闭包、DAG、CoW 树顺序/priority/
 depth、inode 类型/大小/权限/link count、目录父关系等。文件内容以魔数开头也保持
