@@ -1,9 +1,28 @@
-# Revision Sync API v1：面向外部 backup server
+# Sync API 总契约：revision、仓库复制与 failover
 
-状态：设计提案，尚未实现。当前 daemon 的 Unix RPC、在线 backup/replay 与本地
-catalog 不提供本文的生产网络 API。已有[测试用 HTTP mock](REVISION_SYNC_MOCK.md)
-验证核心流程；正式 SDK、在线 pin 和 revision import 仍待实现。本文约定的是可独立
-实现的 backup server 契约。
+状态：设计提案，生产网络 API 尚未实现。现有 daemon 提供本地在线 backup/replay；
+[HTTP mock](REVISION_SYNC_MOCK.md) 只验证 revision 传输流程，不能代表完整仓库复制
+或 failover 已实现。本文是统一入口，按 capability/profile 分层协商，不能仅凭 HTTP
+路径中的 `/v1` 推断支持全部能力。
+
+## 0. 需求覆盖与文档入口
+
+| Profile | 保护内容与用途 | 契约 | 当前状态 |
+| --- | --- | --- | --- |
+| `revision-closure/1` | revision DAG、全部祖先文件树与内容；去重备份、独立还原 | 本文第 1–11 节 | 设计与测试 mock；生产 adapter、在线 pin、import 待实现 |
+| `repository-replication/1` | 全部 World、名称、分配状态及未建 revision 的已提交写入；完整 checkpoint + 连续事务日志 | [复制协议第 3–5 节](REPLICATION_FAILOVER_API.md#3-身份和水位) | 本地 backup/replay 是基础；网络连续复制、远端保护水位待实现 |
+| `failover-control/1` | 唯一写者、fencing、精确恢复点、接管、旧主隔离与 failback | [接管协议第 6–11 节](REPLICATION_FAILOVER_API.md#6-authority-和-fencing) | 未实现，现有 mock 不覆盖 |
+
+外部 backup server 只需第一层即可备份指定 revision；若要承担灾备副本，必须支持
+第二层；若要接管原仓库写流，还必须接入第三层及可信 authority/fencer。
+目标可以使用本地磁盘或 S3 等对象存储，但“对象已上传”不等于“完整可恢复”，
+“完整可恢复”也不等于“有权成为新主”。只支持第一层的服务必须拒绝 failover。
+
+完整需求与验收以 [Repository Replication / Failover API](REPLICATION_FAILOVER_API.md)
+为准：明确 local-first 与受管单写模式、local/remote fsync、RPO/RTO、源端丢失恢复、
+分区与崩溃、计划/非计划切换、幂等激活、旧主回归，以及损坏/缺失/保留空间压力。
+受管模式不能在失联时静默降级为离线写者；默认 local-first 仍允许离线写，但不承诺
+无分叉的自动接管。以下各节只定义 `revision-closure/1`，不承担后两层的保证。
 
 ## 1. 目标与恢复边界
 
@@ -28,7 +47,8 @@ revision 各自完整文件树所依赖的对象。包含 inode、目录、文�
 需要更低事务级 RPO 时另外传输 checkpoint/replay；不能以 `source_sequence` 或
 `source_sequence + 1` 推断创建事务，也不能据此实现 `fsync=cloud`。
 
-该协议不做多写者选举、自动合并、远端在线挂载、源端删除或原地回滚。
+`revision-closure/1` 不授予写者资格，不提供接管；接管必须使用上述独立控制契约。
+三个 profile 均不提供多主自动合并、远端在线挂载、源端删除或原地回滚。
 
 ## 2. 身份、对象和格式
 
@@ -381,7 +401,8 @@ FFRPLY01 base，或声称现在已有导入 CLI。若完整重建祖先命名视
 名字；原名称仅作为来源标签。所有恢复测试必须验证目录父关系、inode 分配状态和
 后续可写 fork，而不只验证对象 hash。
 
-需要原仓库精确事务恢复的 backup server，应另外实现 checkpoint/replay 传输通道。
+需要原仓库精确事务恢复的 backup server，必须实现
+[repository-replication/1](REPLICATION_FAILOVER_API.md#4-完整仓库复制通道) 的 checkpoint/replay 通道。
 它的 ACK 包含完整恢复点 `(repository, sequence, chain_hash)`，与本协议的
 `revision-closure` receipt 分开管理。
 
@@ -444,7 +465,8 @@ namespace validator 及恢复 reader adapter。SDK 的验证能从目标字节�
    也可复用独立控制文件模式，但 pin 的崩溃恢复必须与 GC 启动共同协调。
 3. 接入只读 HTTP/broker 与参考 backup server 的本地后端，完成发布/ACK 闭环。
 4. 实现 revision import profile 和源端丢失后的真实还原，再接对象存储后端。
-5. 另行扩展事务 checkpoint/replay 通道与 remote-fsync，保持 ACK 语义独立。
+5. 按 [复制与 failover 契约](REPLICATION_FAILOVER_API.md) 实现连续 checkpoint/replay、
+   remote-fsync 保护水位、authority/fencing 和接管；分别验收，保持 ACK 语义独立。
 
 测试至少覆盖：
 
