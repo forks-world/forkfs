@@ -159,6 +159,10 @@ class SyncTests(unittest.TestCase):
         bad_namespace('missing-allocation', lambda v: v.pop(alloc_key))
         bad_namespace('nonempty-allocation', lambda v: v.__setitem__(alloc_key, b'x'))
         bad_namespace('extra-namespace-key', lambda v: v.__setitem__(b'\0forkfs/unknown/record', b''))
+        # Malformed entry keys must remain visible to the exact keyset check
+        # even though they cannot be assigned to a parent by the fast index.
+        bad_namespace('malformed-entry-parent', lambda v: v.__setitem__(
+            b'\0forkfs/entry/not-an-inode/name', v[b'\0forkfs/root']))
         bad_namespace('extra-parent-record', lambda v: v.__setitem__(b'\0forkfs/parent/' + b'0'*32, b'FFPAR001' + b'0'*16))
         bad_namespace('extra-content-record', lambda v: v.__setitem__(b'\0forkfs/content/' + b'0'*32, b''))
         def set_symlink_payload(values, payload):
@@ -389,6 +393,7 @@ class SyncTests(unittest.TestCase):
 
     def test_06b_rehashed_invalid_namespace_keysets_rejected(self):
         names = ('missing-allocation', 'nonempty-allocation', 'extra-namespace-key',
+                 'malformed-entry-parent',
                  'extra-parent-record', 'extra-content-record', 'empty-symlink-target',
                  'oversized-symlink-target', 'nonprintable-symlink-target',
                  'long-symlink-component', 'long-entry-name', 'invalid-extended-timestamp',

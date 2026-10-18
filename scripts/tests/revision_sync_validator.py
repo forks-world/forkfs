@@ -27,6 +27,19 @@ def validate_symlink_target(target):
             'symlink target component length')
 
 
+def index_directory_entries(values):
+    """Group namespace entry records by their fixed-width parent inode ID."""
+    prefix = NS + b'entry/'
+    indexed = {}
+    for key, child in values.items():
+        if not key.startswith(prefix):
+            continue
+        parent, separator, name = key[len(prefix):].partition(b'/')
+        if separator and len(parent) == 32:
+            indexed.setdefault(parent, []).append((name, child))
+    return indexed
+
+
 class Input:
     def __init__(self, data):
         self.data, self.at = data, 0
@@ -149,6 +162,7 @@ def verify_closure(plan, entries, load):
             return priority
         checked(any(data[8:]), 'zero tree root')
         tree(data[8:].hex())
+        entries_by_parent = index_directory_entries(values)
         inode_ids = {}
         expected_keys = {NS + b'root'}
         indexed = NS + b'parent-index' in values
@@ -198,7 +212,7 @@ def verify_closure(plan, entries, load):
             expected_keys.update((inode_key, allocation_key))
             reached.add(ident);paths[path] = dict(kind='dir', mode=mode, inode=ident.decode())
             prefix = NS + b'entry/' + ident + b'/'
-            children = [(key[len(prefix):], child) for key, child in values.items() if key.startswith(prefix)]
+            children = entries_by_parent.get(ident, ())
             subdirs = 0
             for name, child in children:
                 checked(name not in (b'', b'.', b'..') and len(name) <= 255 and b'/' not in name
