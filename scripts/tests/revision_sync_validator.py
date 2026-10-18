@@ -142,6 +142,8 @@ def verify_closure(plan, entries, load):
         checked(any(data[8:]), 'zero tree root')
         tree(data[8:].hex())
         inode_ids = {}
+        expected_keys = {NS + b'root'}
+        indexed = NS + b'parent-index' in values
         for key, data in values.items():
             if key.startswith(NS + b'inode/'):
                 ident = key[len(NS + b'inode/'):]
@@ -166,12 +168,20 @@ def verify_closure(plan, entries, load):
                             checked(name > previous and all(33 <= c <= 126 for c in name), 'xattr name/order');previous = name
                         inp.end()
                 inode_ids[ident] = (kind, mode, links, size)
+                indexed_inode = data[:8] == b'FFINOD02'
+                if data[:8] in (b'FFINOD03', b'FFINOD04'):
+                    indexed_inode = bool(struct.unpack_from('<I', data, 48)[0] & 1)
+                checked(indexed_inode == (indexed and kind == 2), 'directory inode/index version mismatch')
         root = values[NS + b'root']
         paths, refs, reached = {}, Counter(), set()
         def directory(ident, path, ancestors):
             checked(ident in inode_ids and ident not in ancestors, 'directory cycle/missing inode')
             kind, mode, links, size = inode_ids[ident]
             checked(kind == 2 and ident not in reached, 'directory hardlink')
+            inode_key = NS + b'inode/' + ident
+            allocation_key = NS + b'allocated/' + ident
+            checked(allocation_key in values and values[allocation_key] == b'', 'inode missing allocation record')
+            expected_keys.update((inode_key, allocation_key))
             reached.add(ident);paths[path] = dict(kind='dir', mode=mode, inode=ident.decode())
             prefix = NS + b'entry/' + ident + b'/'
             children = [(key[len(prefix):], child) for key, child in values.items() if key.startswith(prefix)]
@@ -179,16 +189,26 @@ def verify_closure(plan, entries, load):
             for name, child in children:
                 checked(name not in (b'', b'.', b'..') and b'/' not in name and all(32 <= c <= 126 for c in name), 'unsafe entry name')
                 checked(child in inode_ids and child != root, 'entry target')
+                expected_keys.add(prefix + name)
                 refs[child] += 1;typ, md, _, length = inode_ids[child]
+                child_inode_key = NS + b'inode/' + child
+                child_allocation_key = NS + b'allocated/' + child
+                checked(child_allocation_key in values and values[child_allocation_key] == b'', 'inode missing allocation record')
+                expected_keys.update((child_inode_key, child_allocation_key))
                 target = path.rstrip('/') + '/' + name.decode()
                 if typ == 2:
                     subdirs += 1;directory(child, target, ancestors | {ident})
                 else:
-                    reached.add(child);payload = values[NS + b'content/' + child]
+                    reached.add(child)
+                    content_key = NS + b'content/' + child
+                    checked(content_key in values, 'inode content missing')
+                    payload = values[content_key]
                     checked(len(payload) == length, 'inode content size')
+                    expected_keys.add(content_key)
                     paths[target] = dict(kind='symlink' if typ == 3 else 'file', mode=md, inode=child.decode(), data=payload)
-                if typ == 2 and NS + b'parent-index' in values:
-                    checked(values[NS + b'parent/' + child] == b'FFPAR001' + ident + name, 'parent backlink')
+                if typ == 2 and indexed:
+                    parent_key = NS + b'parent/' + child
+                    checked(parent_key in values and values[parent_key] == b'FFPAR001' + ident + name, 'parent backlink')
             checked(links == 2 + subdirs, 'directory link count')
         directory(root, '/', set())
         checked(set(inode_ids) == reached, 'unreachable live inode')
@@ -197,8 +217,18 @@ def verify_closure(plan, entries, load):
                 checked(links == refs[ident], 'file link count')
             elif ident != root:
                 checked(refs[ident] == 1, 'directory parent count')
-        if NS + b'parent-index' in values:
-            checked(values[NS + b'parent-index'] == b'FFPIDX01' and values[NS + b'parent/' + root] == b'FFPAR001' + root, 'root parent index')
+        for key in values:
+            if key.startswith(NS + b'allocated/'):
+                ident = key[len(NS + b'allocated/'):]
+                checked(bool(re.fullmatch(b'[0-9a-f]{32}', ident)) and values[key] == b'', 'invalid allocation record')
+                expected_keys.add(key)
+        if indexed:
+            checked(values[NS + b'parent-index'] == b'FFPIDX01' and values.get(NS + b'parent/' + root) == b'FFPAR001' + root, 'root parent index')
+            expected_keys.add(NS + b'parent-index')
+            for ident, (kind, _, _, _) in inode_ids.items():
+                if kind == 2:
+                    expected_keys.add(NS + b'parent/' + ident)
+        checked(set(values) == expected_keys, 'orphan namespace records')
         return paths
     def revision(object_id, depth=0):
         checked(depth < 512 and len(colors) < 100000, 'mock DAG budget')
@@ -237,7 +267,11 @@ def restore_views(views, root):
             if info['kind'] == 'dir':
                 target.mkdir()
             elif info['kind'] == 'symlink':
-                os.symlink(os.fsdecode(info['data']), target)
+                if info['inode'] in links:
+                    os.link(links[info['inode']], target, follow_symlinks=False)
+                else:
+                    os.symlink(os.fsdecode(info['data']), target)
+                    links[info['inode']] = target
             else:
                 if info['inode'] in links:
                     os.link(links[info['inode']], target)

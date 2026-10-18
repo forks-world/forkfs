@@ -84,6 +84,7 @@ class SyncTests(unittest.TestCase):
             data.write_bytes(cls.expected[path]);run('fs-write', cls.db, path, data)
         run('fs-chmod', cls.db, '/src/f0', '755');run('fs-link', cls.db, '/src/f0', '/alias')
         run('fs-symlink', cls.db, 'src/f0', '/current')
+        run('fs-link', cls.db, '/current', '/current-alias')
         cls.expected['/alias'] = cls.expected['/src/f0']
         run('fs-snapshot', cls.db, 'base');run('fs-fork', cls.db, 'base', 'branch')
         data.write_bytes(b'left\0edit');run('fs-write', cls.db, '/src/f0', data);run('fs-snapshot', cls.db, 'left')
@@ -116,6 +117,40 @@ class SyncTests(unittest.TestCase):
         bad_manifest_id = object_id(bad_manifest);objects[bad_manifest_id.hex()] = bad_manifest.hex()
         bad_revision = descriptor[:8] + bad_manifest_id + descriptor[40:]
         bad_id = object_id(bad_revision);objects[bad_id.hex()] = bad_revision.hex();refs['bad-semantic'] = bad_id.hex()
+        # Build canonical treaps for re-hashed namespace records that violate
+        # the trusted base validator's exact namespace key set.
+        def namespace_values(tree_id):
+            result = {}
+            def visit(node_id):
+                node = bytes.fromhex(objects[node_id])
+                for child in (node[44:76], node[76:108]):
+                    if any(child): visit(child.hex())
+                result[node[108:]] = bytes.fromhex(objects[node[12:44].hex()])
+            visit(tree_id)
+            return result
+        def bad_namespace(name, edit):
+            values = namespace_values(manifest[8:].hex());edit(values)
+            def build(items):
+                if not items: return bytes(32)
+                key, value = max(items, key=lambda pair: (object_id(b'forkfs.metadata.priority.v1' + pair[0]), pair[0]))
+                at = next(i for i, pair in enumerate(items) if pair[0] == key)
+                left = build(items[:at]);right = build(items[at+1:])
+                value_id = object_id(value);objects[value_id.hex()] = value.hex()
+                node = b'FFTRNO01' + len(key).to_bytes(4,'little') + value_id + left + right + key
+                node_id = object_id(node);objects[node_id.hex()] = node.hex()
+                return node_id
+            tree_id = build(sorted(values.items()))
+            new_manifest = b'FFTREE01' + tree_id
+            manifest_id = object_id(new_manifest);objects[manifest_id.hex()] = new_manifest.hex()
+            revision = descriptor[:8] + manifest_id + descriptor[40:]
+            revision_id = object_id(revision);objects[revision_id.hex()] = revision.hex()
+            refs[name] = revision_id.hex()
+        alloc_key = next(k for k in namespace_values(manifest[8:].hex()) if k.startswith(b'\0forkfs/allocated/'))
+        bad_namespace('missing-allocation', lambda v: v.pop(alloc_key))
+        bad_namespace('nonempty-allocation', lambda v: v.__setitem__(alloc_key, b'x'))
+        bad_namespace('extra-namespace-key', lambda v: v.__setitem__(b'\0forkfs/unknown/record', b''))
+        bad_namespace('extra-parent-record', lambda v: v.__setitem__(b'\0forkfs/parent/' + b'0'*32, b'FFPAR001' + b'0'*16))
+        bad_namespace('extra-content-record', lambda v: v.__setitem__(b'\0forkfs/content/' + b'0'*32, b''))
         # Preserve raw legacy bytes and a nonlocal maximal source watermark.
         base_descriptor = bytes.fromhex(objects[refs['base']])
         legacy = b'FFREV001' + base_descriptor[8:40] + bytes(32) + (2**64-1).to_bytes(8,'little')
@@ -170,6 +205,10 @@ class SyncTests(unittest.TestCase):
                 actual = {('/'+str(p.relative_to(view))):p.read_bytes() for p in view.rglob('*') if p.is_file() and not p.is_symlink()}
                 self.assertEqual(actual, expected)
                 self.assertEqual(os.readlink(view/'current'), 'src/f0')
+                self.assertEqual(os.readlink(view/'current-alias'), 'src/f0')
+                self.assertEqual(os.lstat(view/'current').st_ino, os.lstat(view/'current-alias').st_ino)
+                self.assertEqual(os.lstat(view/'current').st_nlink, 2)
+                self.assertNotEqual(os.lstat(view/'current').st_ino, (view/'src/f0').stat().st_ino)
                 self.assertEqual((view/'alias').stat().st_ino, (view/'src/f0').stat().st_ino)
                 self.assertEqual((view/'src/f0').stat().st_mode & 0o777, 0o755)
         finally:
@@ -219,6 +258,14 @@ class SyncTests(unittest.TestCase):
         with self.assertRaises(ApiError):self.sync(selectors=[{'name':'bad-semantic'}])
         self.no_ack()
         self.assertGreater(self.backup.state()['stats']['received_objects'], 0)
+
+    def test_06b_rehashed_invalid_namespace_keysets_rejected(self):
+        names = ('missing-allocation', 'nonempty-allocation', 'extra-namespace-key',
+                 'extra-parent-record', 'extra-content-record')
+        for index, name in enumerate(names):
+            with self.subTest(namespace=name), self.assertRaises(ApiError):
+                self.sync(request_id='invalid-namespace-'+str(index), selectors=[{'name':name}])
+            self.no_ack()
 
     def test_07_inventory_omits_dependency_no_commit(self):
         self.source.faults(omit_inventory_object=1)
