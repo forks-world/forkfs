@@ -268,3 +268,9 @@ endforeach()
 add_test(NAME forkfsd_developer_workload_oracle COMMAND ${Python3_EXECUTABLE} -m unittest discover
     -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_developer_workload.py)
 set_tests_properties(forkfsd_developer_workload_oracle PROPERTIES TIMEOUT 30 LABELS "metadata-regression;developer-workload")
+
+# Test-only HTTP protocol prototype over real forkfs-generated revision objects.
+add_test(NAME forkfsd_revision_sync_mock COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/scripts/tests/test_revision_sync_mock.py $<TARGET_FILE:forkfsd>
+    --output ${CMAKE_BINARY_DIR}/revision-sync-mock-artifacts)
+set_tests_properties(forkfsd_revision_sync_mock PROPERTIES TIMEOUT 240 LABELS "metadata-regression;revision-sync")
