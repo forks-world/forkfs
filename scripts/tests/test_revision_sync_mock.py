@@ -502,8 +502,74 @@ class SyncTests(unittest.TestCase):
             self.capture(selectors=[{'name':'next'}])
         self.assertEqual(error.exception.code,'IDEMPOTENCY_CONFLICT')
 
+    def test_09b_export_selector_schema_is_unambiguous_and_atomic(self):
+        root = self.fixture['refs']['base']
+        base = dict(consumer_id='mock-backup', destination_id='mock-destination',
+                    scope='revision-closure', history='full', lease_seconds=900)
+        invalid = [
+            [{'name':'base','revision_id':root}],
+            [{'name':'base','unexpected':True}],
+            [{'revision_id':None}], [{'revision_id':[]}],
+            [{'name':None}], [{'name':1}],
+            [{'name':'base','expected_revision_id':None}],
+            [{'name':'base','expected_revision_id':'z'*64}],
+            [None], ['base'], None, {'name':'base'},
+        ]
+        before_jobs = self.source.state()['jobs']
+        before_catalog = self.backup.state()['catalog']
+        for index, selectors in enumerate(invalid):
+            request = base | {'selectors':selectors}
+            with self.subTest(selectors=selectors), self.assertRaises(ApiError) as raised:
+                self.source.request('POST', self.base+'/exports', request,
+                                    'invalid-selector-'+str(index))
+            self.assertEqual(raised.exception.code, 'INVALID_ARGUMENT')
+            self.assertEqual(raised.exception.status, 400)
+            self.assertEqual(self.source.state()['jobs'], before_jobs)
+            self.assertEqual(self.backup.state()['catalog'], before_catalog)
+        for index, request in enumerate((None, [], 'invalid', base | {'selectors':[{'name':'base'}], 'extra':True})):
+            with self.subTest(export_body=request), self.assertRaises(ApiError) as raised:
+                self.source.request('POST', self.base+'/exports', request, 'invalid-export-'+str(index))
+            self.assertEqual(raised.exception.code, 'INVALID_ARGUMENT')
+            self.assertEqual(raised.exception.status, 400)
+            self.assertEqual(self.source.state()['jobs'], before_jobs)
+            self.assertEqual(self.backup.state()['catalog'], before_catalog)
+
+        valid = ([{'revision_id':root}], [{'name':'base'}],
+                 [{'name':'base','expected_revision_id':root}])
+        for index, selectors in enumerate(valid):
+            with self.subTest(valid_selector=selectors):
+                result = self.source.request('POST', self.base+'/exports',
+                                             base | {'selectors':selectors},
+                                             'valid-selector-'+str(index))
+                self.assertEqual(result['state'], 'ready')
+
+        for index, selectors in enumerate(([{'name':'missing'}],
+                                            [{'revision_id':'f'*64}],
+                                            [{'name':'base','expected_revision_id':self.fixture['refs']['merge']}])):
+            before_jobs = self.source.state()['jobs']
+            before_catalog = self.backup.state()['catalog']
+            with self.subTest(unknown_selector=selectors), self.assertRaises(ApiError) as raised:
+                self.source.request('POST', self.base+'/exports', base | {'selectors':selectors},
+                                    'unknown-selector-'+str(index))
+            changed = 'expected_revision_id' in selectors[0]
+            self.assertEqual(raised.exception.code, 'REF_CHANGED' if changed else 'REVISION_NOT_FOUND')
+            self.assertEqual(raised.exception.status, 409 if changed else 404)
+            self.assertEqual(self.source.state()['jobs'], before_jobs)
+            self.assertEqual(self.backup.state()['catalog'], before_catalog)
+
     def test_10_lease_renew_expiry_and_membership(self):
         captured = self.capture();path = self.base+'/exports/'+captured['export_id']
+        before = self.source.state()['jobs']
+        for action, malformed in (('renew', {'lease_seconds':900,'extra':1}),
+                                   ('renew', None), ('renew', []),
+                                   ('packs', {'object_ids':[self.unrelated],'extra':1}),
+                                   ('packs', {'object_ids':None}),
+                                   ('packs', {'object_ids':[[self.unrelated]]})):
+            with self.subTest(action=action, body=malformed), self.assertRaises(ApiError) as raised:
+                self.source.request('POST',path+'/'+action,malformed,'schema-check')
+            self.assertEqual(raised.exception.code, 'INVALID_ARGUMENT')
+            self.assertEqual(raised.exception.status, 400)
+            self.assertEqual(self.source.state()['jobs'], before)
         with self.assertRaises(ApiError) as error:
             self.source.request('POST',path+'/packs',{'object_ids':[self.unrelated]},'pack')
         self.assertEqual(error.exception.code,'FORBIDDEN')

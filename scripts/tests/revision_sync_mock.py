@@ -138,15 +138,36 @@ class Backend:
         if path == self.base + '/revision-refs':
             return {'refs': self.state['refs']}
         if path == self.base + '/exports' and method == 'POST':
-            if not key or set(body) != {'selectors', 'consumer_id', 'destination_id', 'scope', 'history', 'lease_seconds'}:
+            if (type(body) is not dict or not key or set(body) !=
+                    {'selectors', 'consumer_id', 'destination_id', 'scope', 'history', 'lease_seconds'}):
                 raise ApiError('INVALID_ARGUMENT', 400)
+            selectors = body['selectors']
+            if type(selectors) is not list or not 1 <= len(selectors) <= 256:
+                raise ApiError('INVALID_ARGUMENT', 400)
+            for selector in selectors:
+                if type(selector) is not dict:
+                    raise ApiError('INVALID_ARGUMENT', 400)
+                keys = set(selector)
+                if keys == {'revision_id'}:
+                    if type(selector['revision_id']) is not str or not HEX.fullmatch(selector['revision_id']):
+                        raise ApiError('INVALID_ARGUMENT', 400)
+                elif keys == {'name'}:
+                    if type(selector['name']) is not str or not selector['name']:
+                        raise ApiError('INVALID_ARGUMENT', 400)
+                elif keys == {'name', 'expected_revision_id'}:
+                    if (type(selector['name']) is not str or not selector['name']
+                            or type(selector['expected_revision_id']) is not str
+                            or not HEX.fullmatch(selector['expected_revision_id'])):
+                        raise ApiError('INVALID_ARGUMENT', 400)
+                else:
+                    raise ApiError('INVALID_ARGUMENT', 400)
             normalized = json_bytes(body).hex()
             for ident, job in self.state['jobs'].items():
                 if job['key'] == key:
                     if job['request'] != normalized:
                         raise ApiError('IDEMPOTENCY_CONFLICT', 409)
                     return {'export_id': ident, 'state': self.job(ident, active=False)['state'], 'plan': job['plan']}
-            if body['scope'] != 'revision-closure' or body['history'] != 'full' or not 1 <= len(body['selectors']) <= 256:
+            if body['scope'] != 'revision-closure' or body['history'] != 'full':
                 raise ApiError('INVALID_ARGUMENT', 400)
             if body['consumer_id'] != 'mock-backup' or body['destination_id'] != 'mock-destination':
                 raise ApiError('FORBIDDEN', 403)
@@ -189,7 +210,9 @@ class Backend:
         if not action and method == 'GET':
             return {'export_id': ident, 'state': job['state'], 'plan': job['plan']}
         if action == 'renew' and method == 'POST':
-            seconds = body.get('lease_seconds', 0)
+            if type(body) is not dict or set(body) != {'lease_seconds'}:
+                raise ApiError('INVALID_ARGUMENT', 400)
+            seconds = body['lease_seconds']
             if type(seconds) is not int or not 1 <= seconds <= 900:
                 raise ApiError('INVALID_ARGUMENT', 400)
             job['expires'] = time.time() + self.state['clock_offset'] + seconds
@@ -205,10 +228,14 @@ class Backend:
                 data = data[:-1] + bytes([data[-1] ^ 1])
             return data
         if action == 'packs' and method == 'POST':
-            ids = body.get('object_ids', [])
-            if not ids or ids != sorted(set(ids)) or len(ids) > 1024:
+            if type(body) is not dict or set(body) != {'object_ids'}:
                 raise ApiError('INVALID_ARGUMENT', 400)
-            if any(not isinstance(i, str) or not HEX.fullmatch(i) or i not in job['entries'] for i in ids):
+            ids = body['object_ids']
+            if (type(ids) is not list or not ids or len(ids) > 1024
+                    or any(type(i) is not str or not HEX.fullmatch(i) for i in ids)
+                    or ids != sorted(set(ids))):
+                raise ApiError('INVALID_ARGUMENT', 400)
+            if any(i not in job['entries'] for i in ids):
                 raise ApiError('FORBIDDEN', 403)
             if sum(job['entries'][i] for i in ids) > 16777216:
                 raise ApiError('LIMIT_EXCEEDED', 413)

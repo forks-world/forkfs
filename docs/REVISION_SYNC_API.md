@@ -132,6 +132,9 @@ refs 返回 `name, revision_id, manifest_id, source_sequence`，并提供有界 
 ### 3.2 创建和查询导出
 
 以下 JSON 为模板，尖括号值需要替换成真实 ID。
+每个 selector 必须恰好采用 `{revision_id}`、`{name}` 或 `{name, expected_revision_id}`
+三种形式之一。名称为非空字符串，ID 为 64 位小写 hex；同时传名称和直接 revision ID、
+未知字段或字段类型错误均返回 `INVALID_ARGUMENT`，不能忽略部分字段后另选 revision。
 
 ```http
 POST R/exports
