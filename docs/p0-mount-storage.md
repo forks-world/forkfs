@@ -99,9 +99,10 @@ before an atomic directory exchange. A shared ownership lease inode spans the
 DB-close/exchange interval, preventing another engine from opening that gap.
 
 The original repository path always names a complete generation. A process crash
-can leave a sibling `STORE.gc-*` directory. The next GC removes completed leftovers
-only when their repository/path marker and ownership inode match. Incomplete
-preparation directories are retained conservatively for manual inspection. This
+can leave a sibling `STORE.gc-*` directory. The next GC removes bound preparation and completed leftovers
+only when their repository/path marker and source ownership inode match, before
+checking free-space admission. Unbound or legacy preparation directories are
+retained conservatively for manual inspection. This
 is offline collection, not background incremental GC. Repacking requires temporary
 space for another live copy. Process-crash tests do not establish power-loss safety
 of every host filesystem, firmware or device.

@@ -67,10 +67,12 @@ with tempfile.TemporaryDirectory(prefix='ff-gc-') as directory:
         run('fs-check',path)
     for stage in ('gc_copy_batch','gc_after_verified','gc_before_swap','gc_after_swap','gc_after_parent_sync'):
         trial=root/stage;shutil.copytree(db,trial)
-        run('gc',trial,binary=FAULT,env=dict(os.environ,FORKFS_TEST_CRASH=stage),code=86)
+        for attempt in range(2 if stage=='gc_copy_batch' else 1):
+            run('gc',trial,binary=FAULT,env=dict(os.environ,FORKFS_TEST_CRASH=stage),code=86)
+            verify(trial)
         verify(trial);run('gc',trial);verify(trial)
-        # Fully prepared crash leftovers must be recovered on the retry.
-        assert not [p for p in root.glob(stage+'.gc-*') if (p/'GC-READY').exists()]
+        # Every safely bound pre-handoff or fully prepared crash leftover is reclaimed.
+        assert not list(root.glob(stage+'.gc-*'))
     # A checkpoint is published only after the exchanged generation is durable.
     for stage in ('gc_copy_batch','gc_after_verified','gc_before_swap','gc_after_swap','gc_after_parent_sync',
                   'gc_before_checkpoint_publish','gc_after_checkpoint_publish','gc_after_checkpoint_complete'):
@@ -91,7 +93,7 @@ with tempfile.TemporaryDirectory(prefix='ff-gc-') as directory:
         if stage not in ('gc_after_verified','gc_before_swap'):
             assert json.loads(run('gc',trial,'--checkpoint',archive))==retried
         assert archive.is_file() and not (trial/'GC-PENDING').exists() and not (trial/'GC-BASELINE.pack').exists()
-        assert not [p for p in root.glob(trial.name+'.gc-*') if (p/'GC-READY').exists()]
+        assert not list(root.glob(trial.name+'.gc-*'))
         verify(trial)
         if stage=='gc_after_checkpoint_complete':
             advanced=root/'after-checkpoint';advanced.write_bytes(b'newer generation transaction')
@@ -142,6 +144,24 @@ with tempfile.TemporaryDirectory(prefix='ff-gc-') as directory:
     run('capacity',too_small,1,0)
     run('gc',too_small,code=1);verify(too_small)
     assert not [p for p in root.glob('capacity-gc-too-small.gc-*') if (p/'GC-READY').exists()]
+    stale=root/'minfree-stale';shutil.copytree(db,stale)
+    run('gc',stale,binary=FAULT,env=dict(os.environ,FORKFS_TEST_CRASH='gc_copy_batch'),code=86)
+    abandoned=next(root.glob('minfree-stale.gc-*'))
+    # Neither a matching marker alone nor a matching lease alone permits deletion.
+    unrelated=root/'minfree-stale.gc-unrelated';unrelated.mkdir()
+    (unrelated/'GC-PREPARED').write_bytes((abandoned/'GC-PREPARED').read_bytes())
+    (unrelated/'GC-SOURCE-OWNERSHIP').write_bytes(b'unrelated inode')
+    wrong=root/'minfree-stale.gc-wrong-marker';wrong.mkdir()
+    os.link(stale/'OWNERSHIP',wrong/'GC-SOURCE-OWNERSHIP')
+    (wrong/'GC-PREPARED').write_bytes(b'wrong repository marker')
+    alias=root/'minfree-stale.gc-symlink';alias.symlink_to(unrelated,target_is_directory=True)
+    run('capacity',stale,0,18446744073709551615)
+    run('gc',stale,code=1);verify(stale)
+    assert not abandoned.exists()
+    assert unrelated.is_dir() and wrong.is_dir() and alias.is_symlink()
+    assert (unrelated/'GC-SOURCE-OWNERSHIP').read_bytes()==b'unrelated inode'
+    alias.unlink();shutil.rmtree(unrelated);shutil.rmtree(wrong)
+    run('capacity',stale,0,0);run('gc',stale);verify(stale)
     # min_free applies to DATA staging and both checkpoint archive copies.
     run('capacity',capacity_trial,0,2**63)
     run('gc',capacity_trial,code=1);verify(capacity_trial)

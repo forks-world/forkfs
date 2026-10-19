@@ -725,10 +725,16 @@ std::string LevelStore::collect(const std::string& input,const std::string& chec
             const auto parent=fs::path(path).parent_path();const auto prefix=fs::path(path).filename().string()+".gc-";
             std::string repository_hex;const char* digits="0123456789abcdef";for(unsigned char c:receipt.identity){repository_hex+=digits[c>>4];repository_hex+=digits[c&15];}
             const auto ready_marker="FFGC0001"+repository_hex+recovery_hex(replay::hash(path));
+            const auto prepared_marker="FFGCP001"+repository_hex+recovery_hex(replay::hash(path));
             for(const auto& item:fs::directory_iterator(parent))if(item.path().filename().string().starts_with(prefix)){
                 struct stat dir{},owner{};if(lstat(item.path().c_str(),&dir)<0 || !S_ISDIR(dir.st_mode))continue;
-                if(lstat((item.path()/"OWNERSHIP").c_str(),&owner)<0 || !S_ISREG(owner.st_mode) || owner.st_dev!=active_owner.st_dev || owner.st_ino!=active_owner.st_ino)continue;
-                if(gc_checkpoint::read_file(item.path()/"GC-READY",256)==ready_marker)fs::remove_all(item.path());
+                const auto bound=(item.path()/"GC-SOURCE-OWNERSHIP").string();
+                const bool same_source=lstat(bound.c_str(),&owner)==0 && S_ISREG(owner.st_mode) && owner.st_dev==active_owner.st_dev && owner.st_ino==active_owner.st_ino;
+                bool safe=false;
+                if(same_source && gc_checkpoint::read_file(item.path()/"GC-PREPARED",256)==prepared_marker)safe=true;
+                if(!safe){const auto owned=(item.path()/"OWNERSHIP").string();const bool same_generation=lstat(owned.c_str(),&owner)==0 && S_ISREG(owner.st_mode) && owner.st_dev==active_owner.st_dev && owner.st_ino==active_owner.st_ino;
+                    if(same_generation && gc_checkpoint::read_file(item.path()/"GC-READY",256)==ready_marker)safe=true;}
+                if(safe)fs::remove_all(item.path());
             }
             gc_checkpoint::sync_directory(parent);
         };
@@ -826,7 +832,6 @@ std::string LevelStore::collect(const std::string& input,const std::string& chec
         need(metadata<=UINT64_MAX-host_reserve,"GC checkpoint reserve overflow");host_reserve+=metadata;
         constexpr uint64_t archive_overhead=1024*1024;need(archive_overhead<=UINT64_MAX-host_reserve,"GC checkpoint reserve overflow");host_reserve+=archive_overhead;
     }
-    RepositoryBudget{0,capacity.min_free}.admit(path,0,host_reserve);
     // The owner lease excludes a live collector; every matching sibling is a
     // leftover staging or exchanged-out generation from an interrupted run.
     const auto marker=std::string("FFGC0001")+source->repository_+recovery_hex(replay::hash(path));
@@ -844,15 +849,24 @@ std::string LevelStore::collect(const std::string& input,const std::string& chec
     };
     struct stat owner_stat{};need(fstat(source->owner_->fd,&owner_stat)==0,"GC owner stat failed");
     const auto parent=fs::path(path).parent_path();const auto prefix=fs::path(path).filename().string()+".gc-";
+    const auto prepared_marker=std::string("FFGCP001")+source->repository_+recovery_hex(replay::hash(path));
     for(const auto& item:fs::directory_iterator(parent))if(item.path().filename().string().starts_with(prefix)){
         struct stat dir{},owner{};if(lstat(item.path().c_str(),&dir)<0 || !S_ISDIR(dir.st_mode))continue;
-        const bool same_lease=lstat((item.path()/"OWNERSHIP").c_str(),&owner)==0 && S_ISREG(owner.st_mode) && owner.st_dev==owner_stat.st_dev && owner.st_ino==owner_stat.st_ino;
-        const bool ready=read_control(item.path()/"GC-READY",256)==marker;
-        if(!same_lease || !ready)continue;
-        fs::remove_all(item.path());
+        const auto bound=(item.path()/"GC-SOURCE-OWNERSHIP").string();
+        const bool same_source=lstat(bound.c_str(),&owner)==0 && S_ISREG(owner.st_mode) && owner.st_dev==owner_stat.st_dev && owner.st_ino==owner_stat.st_ino;
+        bool safe=false;
+        if(same_source && read_control(item.path()/"GC-PREPARED",256)==prepared_marker)safe=true;
+        if(!safe){const auto owned=(item.path()/"OWNERSHIP").string();const bool same_generation=lstat(owned.c_str(),&owner)==0 && S_ISREG(owner.st_mode) && owner.st_dev==owner_stat.st_dev && owner.st_ino==owner_stat.st_ino;
+            if(same_generation && read_control(item.path()/"GC-READY",256)==marker)safe=true;}
+        if(safe)fs::remove_all(item.path());
     }
+    gc_checkpoint::sync_directory(parent);
+    RepositoryBudget{0,capacity.min_free}.admit(path,0,host_reserve);
     auto staging=path+".gc-XXXXXX";need(mkdtemp(staging.data())!=nullptr,"create GC staging directory failed");
     struct Cleanup{const std::string& path;bool swapped=false;~Cleanup(){if(!swapped){std::error_code ignored;fs::remove_all(path,ignored);}}} cleanup{staging};
+    write_control(fs::path(staging)/"GC-PREPARED",prepared_marker);sync_parent(staging);
+    need(link((path+"/OWNERSHIP").c_str(),(staging+"/GC-SOURCE-OWNERSHIP").c_str())==0,"bind GC staging directory to source lease");
+    gc_checkpoint::sync_directory(staging);sync_parent(staging);
     if(capacity.enabled())capacity.save(staging);
     uint64_t archive_estimate=105+69;
     {
@@ -898,6 +912,8 @@ std::string LevelStore::collect(const std::string& input,const std::string& chec
          staged_directory.st_gid==repository_gid && (staged_directory.st_mode&07777)==repository_mode,"GC staging directory identity mismatch");
     write_control(fs::path(path)/"GC-READY",marker);
     sync_parent(staging+"/CURRENT");
+    if(unlink((staging+"/GC-SOURCE-OWNERSHIP").c_str())<0)throw std::system_error(errno,std::generic_category(),"remove GC staging source lease binding");
+    gc_checkpoint::sync_directory(staging);sync_parent(staging);
     auto lease=source->owner_;source.reset();fault("gc_before_swap");
 #ifdef __APPLE__
     int exchanged=renamex_np(path.c_str(),staging.c_str(),RENAME_SWAP);
