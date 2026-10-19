@@ -31,9 +31,13 @@ with tempfile.TemporaryDirectory(prefix='ff-hcrash-',dir='/tmp') as tmp:
                                   env={**os.environ,'FORKFS_TEST_CRASH':stage})
             try:
                 deadline=time.monotonic()+5
-                while not endpoint.exists():
+                while True:
                     assert proc.poll() is None,proc.communicate()
-                    assert time.monotonic()<deadline;time.sleep(.01)
+                    assert time.monotonic()<deadline
+                    if endpoint.exists():
+                        ready=subprocess.run([BIN,'request',str(endpoint),'status'],capture_output=True,timeout=5)
+                        if ready.returncode==0:break
+                    time.sleep(.01)
                 session=json.loads(run('request',endpoint,'session-open','60000'))['session']
                 mode='rw,append' if op=='fs-hwrite' else 'rw'
                 token=json.loads(run('request',endpoint,'fs-open','/f',mode,'--session',session))['handle']

@@ -31,7 +31,8 @@ public:
     static Plan compact_frozen(const Frozen& input);
     static void valid_name(const std::string& name);
     // Validate a frozen manifest through a snapshot/transaction overlay reader.
-    static void verify_manifest(const std::function<Bytes(const ObjectId&)>& read,const ObjectId& manifest);
+    static void verify_manifest(const std::function<Bytes(const ObjectId&)>& read,const ObjectId& manifest,
+                                const std::function<void(const std::string&,const ObjectId&)>& visit={});
 private:
     const Journal& journal_;
     std::unique_ptr<MetadataTree> tree_;

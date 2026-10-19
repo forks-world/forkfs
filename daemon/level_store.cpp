@@ -1,6 +1,8 @@
 #include "revision.h"
 #include "level_store.h"
 #include "object_store.h"
+#include "repository_owner.h"
+#include "file_content.h"
 #include "replay_format.h"
 #include "replay_validation.h"
 #ifndef __APPLE__
@@ -101,6 +103,7 @@ void LevelStore::create(const std::string& path) {
 }
 LevelStore::LevelStore(const std::string& path,size_t object_cache_bytes):LevelStore(path,false,object_cache_bytes) {}
 LevelStore::LevelStore(const std::string& path,bool initialize,size_t object_cache_bytes) {
+    owner_=std::make_shared<RepositoryOwner>(path);
     leveldb::Options options;options.create_if_missing=initialize;options.error_if_exists=initialize;
     metrics_=std::make_unique<StoreIoMetrics>();env_=std::make_unique<TimedEnv>(*metrics_);options.env=env_.get();
     options.paranoid_checks=true;options.compression=leveldb::kNoCompression;
@@ -176,6 +179,17 @@ std::string LevelStore::logical_value(const leveldb::ReadOptions& options,const 
 }
 void LevelStore::publish(const replay::Batch& input){
     // Caller owns the writer lock, or the unpublished recovery destination.
+    // Admission failures leave the current owner healthy: no append has begun.
+    if(object_store_->has_capacity_budget()){
+        uint64_t incoming=0;std::set<std::string> chunks;
+        for(const auto& op:input.ops)if(!op.erase && op.key.starts_with("O/")){
+            auto count=std::max<size_t>(1,(op.value.size()+65535)/65536);
+            for(size_t i=0;i<count;++i){auto payload=op.value.substr(i*65536,65536),hash=replay::hash(payload);std::string existing;
+                if(chunks.insert(hash).second){auto found=db_->Get({},"C/"+hash,&existing);if(found.IsNotFound())incoming+=payload.size()+44+48;else status(found,"read capacity chunk index");}
+            }
+        }
+        object_store_->admit(incoming);
+    }
     try{
         leveldb::WriteBatch metadata;ObjectStore::Locations pending;auto next_format=physical_format_.load();
         leveldb::ReadOptions read;read.verify_checksums=true;
@@ -668,3 +682,117 @@ std::string LevelStore::revision_point(const std::string& name) const {
         std::to_string(index.event)+",\"chain_hash\":\""+hex(index.event_head)+"\"}}\n";
 }
 }
+
+namespace forkfs {
+std::string LevelStore::collect(const std::string& input,const std::string& checkpoint,bool dry_run){
+    namespace fs=std::filesystem;
+    struct stat entry{};need(lstat(input.c_str(),&entry)==0 && S_ISDIR(entry.st_mode),"GC requires a real repository directory");
+    const auto path=fs::canonical(input).string();
+    auto source=std::make_unique<LevelStore>(path);source->healthy();source->verify();
+    need(source->physical_format_>=5,"GC requires the segmented layout");
+    const bool reset=!checkpoint.empty(),pinned=source->replay_enabled_ && !reset;
+    if(reset){auto parent=fs::canonical(fs::absolute(checkpoint).parent_path());
+        auto relative=parent.lexically_relative(path);need(parent!=path && (relative.empty() || *relative.begin()==".."),"GC checkpoint must be outside the repository");
+        need(!fs::exists(checkpoint),"GC checkpoint destination must not exist");}
+    leveldb::ReadOptions options;options.verify_checksums=true;
+    std::map<std::string,std::string> roots;std::set<Id> live;std::set<Id> manifests;
+    std::unique_ptr<leveldb::Iterator> it(source->db_->NewIterator(options));
+    for(it->Seek("R/");it->Valid() && it->key().starts_with("R/");it->Next())roots.emplace(it->key().ToString(),it->value().ToString());
+    status(it->status(),"GC root scan");
+    const std::string history("R/\0forkfs-history/",18),ns("\0forkfs/",8),alias=history+"object/";
+    auto read_object=[&](const Id& reference){auto value=source->object(reference);live.insert(reference);return value;};
+    auto known_inode=[&](const Bytes& value){
+        need(value.size()>=48 && value.size()<=128*1024,"GC invalid inode size");
+        std::string version(value.begin(),value.begin()+8);
+        need(version=="FFINOD01" || version=="FFINOD02" || version=="FFINOD03" || version=="FFINOD04" || version=="FFINOD05","GC unsupported inode codec");
+        if(version=="FFINOD03" || version=="FFINOD04" || version=="FFINOD05"){
+            need(value.size()>=80,"GC truncated inode");auto flags=static_cast<unsigned>(value[48])|(unsigned(value[49])<<8)|(unsigned(value[50])<<16)|(unsigned(value[51])<<24);
+            need(version=="FFINOD05"?flags==2:flags<=1,"GC unknown inode flags");
+        }
+    };
+    auto manifest=[&](const Id& reference){if(!manifests.insert(reference).second)return;
+        NamespaceView::verify_manifest(read_object,reference,[&](const std::string& key,const Id& value){if(key.starts_with(ns+"inode/"))known_inode(read_object(value));});};
+    RevisionDag dag([&](const Id& reference){return RevisionRecord::read(read_object,reference);},manifest);
+    for(const auto& [key,value]:roots){
+        if(key.starts_with(alias)){need(key.substr(alias.size())==recovery_hex(value),"GC noncanonical staging alias");continue;}
+        auto reference=id(value);auto payload=read_object(reference);
+        if(key.starts_with(history+"world/"))manifest(reference);
+        else if(key.starts_with(history+"revision/"))dag.validate(reference);
+        else if(key.starts_with(history+"base/")){need(payload.size()==32,"GC invalid World base");Id base{};std::copy(payload.begin(),payload.end(),base.begin());dag.validate(base);}
+        else if((key.starts_with(history+"orphan/") && key.ends_with("/content")) || key.starts_with("R/"+ns+"content/")){
+            auto inode_key=key.starts_with(history+"orphan/")?key.substr(0,key.size()-7)+"inode":"R/"+ns+"inode/"+key.substr(("R/"+ns+"content/").size());
+            auto found=roots.find(inode_key);need(found!=roots.end(),"GC content has no inode");auto inode=read_object(id(found->second));known_inode(inode);
+            if(std::string(inode.begin(),inode.begin()+8)=="FFINOD05"){
+                uint64_t size=0;for(unsigned i=0;i<8;++i)size|=uint64_t(inode[24+i])<<(8*i);FileContent(read_object,payload,size,true).verify();
+            }
+        }
+    }
+    if(pinned)for(it->Seek("O/");it->Valid() && it->key().starts_with("O/");it->Next())live.insert(id(it->key().ToString().substr(2)));
+    status(it->status(),"GC object scan");
+    uint64_t kept_roots=0;for(const auto& [key,value]:roots)if(!key.starts_with(alias) || live.contains(id(value)))++kept_roots;
+    uint64_t before_bytes=0;for(const auto& item:fs::directory_iterator(path))if(item.is_regular_file() && item.path().filename().string().starts_with("DATA-") && item.path().extension()==".seg")before_bytes+=item.file_size();
+    const auto sequence=source->sequence_.load(),before_objects=source->objects_.load();
+    auto report=[&](uint64_t after_bytes,bool applied){return "{\"applied\":"+std::string(applied?"true":"false")+",\"sequence\":"+std::to_string(sequence)+",\"objects_before\":"+std::to_string(before_objects)+",\"objects_after\":"+std::to_string(live.size())+",\"roots_before\":"+std::to_string(roots.size())+",\"roots_after\":"+std::to_string(kept_roots)+",\"data_bytes_before\":"+std::to_string(before_bytes)+",\"data_bytes_after\":"+(applied?std::to_string(after_bytes):"null")+",\"replay_pins_all_objects\":"+(pinned?"true":"false")+",\"new_replay_generation\":"+(reset?"true":"false")+"}";};
+    if(dry_run)return report(0,false);
+    // Only completed, same-lease GC generations are eligible for stale cleanup.
+    const auto marker=std::string("FFGC0001")+source->repository_+recovery_hex(replay::hash(path));
+    auto read_control=[](const fs::path& file,size_t limit)->std::optional<std::string>{
+        int fd=open(file.c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);if(fd<0){if(errno==ENOENT)return std::nullopt;throw std::system_error(errno,std::generic_category(),"open GC control file");}
+        struct Close{int fd;~Close(){close(fd);}} close_fd{fd};struct stat st{};
+        need(fstat(fd,&st)==0 && S_ISREG(st.st_mode) && st.st_size>=0 && uint64_t(st.st_size)<=limit,"GC invalid control file");
+        std::string value(st.st_size,0);size_t at=0;while(at<value.size()){auto n=::read(fd,value.data()+at,value.size()-at);if(n<0 && errno==EINTR)continue;need(n>0,"GC truncated control file");at+=n;}return value;
+    };
+    auto write_control=[](const fs::path& file,const std::string& value){
+        auto temporary=file.string()+".tmp-XXXXXX";int fd=mkstemp(temporary.data());if(fd<0)throw std::system_error(errno,std::generic_category(),"create GC control file");
+        try{size_t at=0;while(at<value.size()){auto n=::write(fd,value.data()+at,value.size()-at);if(n<0 && errno==EINTR)continue;if(n<=0)throw std::system_error(n<0?errno:EIO,std::generic_category(),"write GC control file");at+=n;}if(fsync(fd)<0)throw std::system_error(errno,std::generic_category(),"sync GC control file");close(fd);fd=-1;
+            if(rename(temporary.c_str(),file.c_str())<0)throw std::system_error(errno,std::generic_category(),"publish GC control file");sync_parent(file.string());}
+        catch(...){if(fd>=0)close(fd);unlink(temporary.c_str());throw;}
+    };
+    struct stat owner_stat{};need(fstat(source->owner_->fd,&owner_stat)==0,"GC owner stat failed");
+    const auto parent=fs::path(path).parent_path();const auto prefix=fs::path(path).filename().string()+".gc-";
+    for(const auto& item:fs::directory_iterator(parent))if(item.path().filename().string().starts_with(prefix)){
+        struct stat dir{},owner{};if(lstat(item.path().c_str(),&dir)<0 || !S_ISDIR(dir.st_mode))continue;
+        if(lstat((item.path()/"OWNERSHIP").c_str(),&owner)<0 || !S_ISREG(owner.st_mode) || owner.st_dev!=owner_stat.st_dev || owner.st_ino!=owner_stat.st_ino)continue;
+        if(read_control(item.path()/"GC-READY",256)==marker)fs::remove_all(item.path());
+    }
+    auto staging=path+".gc-XXXXXX";need(mkdtemp(staging.data())!=nullptr,"create GC staging directory failed");
+    struct Cleanup{const std::string& path;bool swapped=false;~Cleanup(){if(!swapped){std::error_code ignored;fs::remove_all(path,ignored);}}} cleanup{staging};
+    {
+        LevelStore target(staging,true,default_object_cache_bytes);replay::Batch batch;size_t pending=0;
+        auto flush=[&]{if(pending){target.publish(batch);batch.Clear();pending=0;fault("gc_copy_batch");}};
+        for(it->SeekToFirst();it->Valid();it->Next()){
+            auto key=it->key().ToString();if(key.starts_with("C/"))continue;
+            if(key.starts_with("O/") && !live.contains(id(key.substr(2))))continue;
+            if(key.starts_with(alias) && !live.contains(id(it->value().ToString())))continue;
+            if(reset && (key.starts_with("L/") || key.starts_with("M/replay/")))continue;
+            auto value=source->logical_value(options,key,it->value().ToString());
+            if(key=="M/objects")value=integer(live.size());if(key=="M/roots")value=integer(kept_roots);
+            if(reset && key=="M/format")value="FFLDB001";
+            batch.Put(key,value);pending+=key.size()+value.size();if(pending>=1024*1024)flush();
+        }
+        status(it->status(),"copy live GC records");flush();
+    }
+    it.reset();
+    {LevelStore target(staging);target.verify();target.verify_recovery_graph(options,sequence);
+        if(reset)target.backup(checkpoint);}
+    fault("gc_after_verified");
+    for(const auto& name:{"BACKUP-TASKS","CAPACITY",".forkfs-fskit-world",".forkfs-fskit-revision"}){
+        if(auto value=read_control(fs::path(path)/name,std::string(name)=="BACKUP-TASKS"?2*1024*1024:4096))write_control(fs::path(staging)/name,*value);
+    }
+    write_control(fs::path(path)/"GC-READY",marker);write_control(fs::path(staging)/"GC-READY",marker);
+    need(unlink((staging+"/OWNERSHIP").c_str())==0 && link((path+"/OWNERSHIP").c_str(),(staging+"/OWNERSHIP").c_str())==0,"GC ownership handoff failed");
+    sync_parent(staging+"/CURRENT");
+    auto lease=source->owner_;source.reset();fault("gc_before_swap");
+#ifdef __APPLE__
+    int exchanged=renamex_np(path.c_str(),staging.c_str(),RENAME_SWAP);
+#else
+    int exchanged=static_cast<int>(syscall(SYS_renameat2,AT_FDCWD,path.c_str(),AT_FDCWD,staging.c_str(),RENAME_EXCHANGE));
+#endif
+    if(exchanged<0)throw std::system_error(errno,std::generic_category(),"atomic GC generation exchange");
+    cleanup.swapped=true;fault("gc_after_swap");sync_parent(path);fault("gc_after_parent_sync");
+    uint64_t after_bytes=0;for(const auto& item:fs::directory_iterator(path))if(item.is_regular_file() && item.path().filename().string().starts_with("DATA-") && item.path().extension()==".seg")after_bytes+=item.file_size();
+    fs::remove_all(staging);sync_parent(path);return report(after_bytes,true);
+}
+}
+
+namespace forkfs {std::pair<uint64_t,uint64_t> LevelStore::space() const {healthy();return object_store_->space();}}

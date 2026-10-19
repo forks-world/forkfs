@@ -1,6 +1,8 @@
 #pragma once
 #include "replay_format.h"
+#include "repository_budget.h"
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
@@ -18,6 +20,7 @@ class ObjectStore {
     static constexpr uint64_t segment_limit=64*1024*1024,header_size=48;
     static constexpr size_t chunk_size=64*1024;
     size_t budget_;
+    RepositoryBudget capacity_;std::atomic<uint64_t> data_usage_=0;
 #ifdef FORKFS_TEST_FAULTS
     size_t test_record_=0;
 #endif
@@ -74,13 +77,14 @@ class ObjectStore {
         need(largest<UINT64_MAX,"data segment IDs exhausted");segment_=largest+1;
         active_=open(filename(segment_).c_str(),O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
         if(active_<0)throw std::system_error(errno,std::generic_category(),"create data segment");
-        try{write_at(active_,header(segment_),0);sync(active_);Fd dir{open(path_.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC)};if(dir.fd<0)throw std::system_error(errno,std::generic_category(),"open segment directory");sync(dir.fd);end_=header_size;}
+        try{write_at(active_,header(segment_),0);sync(active_);Fd dir{open(path_.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC)};if(dir.fd<0)throw std::system_error(errno,std::generic_category(),"open segment directory");sync(dir.fd);end_=header_size;data_usage_+=header_size;}
         catch(...){close(active_);active_=-1;throw;}
     }
     std::string append(const std::string& hash,const std::string& data){
         need(data.size()<=chunk_size,"invalid chunk size");
         auto record=std::string("FFCHNK01")+hash+replay::le(data.size(),4)+data;
         if(active_>=0 && end_+record.size()>segment_limit){sync(active_);close(active_);active_=-1;}
+        if(capacity_.enabled())capacity_.admit(path_,data_usage_,record.size()+48);
         open_segment(record.size());auto at=end_;
 #ifdef FORKFS_TEST_FAULTS
         // Crash mid-record, without exception unwinding or a metadata write.
@@ -94,14 +98,22 @@ class ObjectStore {
         }
 #endif
         if(injected("partial_write")){write_at(active_,record.substr(0,record.size()/2),at);throw std::system_error(ENOSPC,std::generic_category(),"injected segment write failure");}
-        write_at(active_,record,at);end_+=record.size();dirty_=true;fault("segment_after_append");
+        write_at(active_,record,at);end_+=record.size();data_usage_+=record.size();dirty_=true;fault("segment_after_append");
         return number(segment_)+number(at)+replay::le(data.size(),4);
     }
 public:
     using Lookup=std::function<std::optional<std::string>(const std::string&)>;
     using Locations=std::map<std::string,std::string>;
     struct CacheStats{uint64_t hits,misses;size_t charge;};
-    ObjectStore(std::string path,size_t cache_bytes):path_(std::move(path)),budget_(cache_bytes){}
+    ObjectStore(std::string path,size_t cache_bytes):path_(std::move(path)),budget_(cache_bytes),capacity_(RepositoryBudget::load(path_)){if(capacity_.enabled())data_usage_=RepositoryBudget::data_bytes(path_);}
+    std::pair<uint64_t,uint64_t> space() const{
+        auto host=std::filesystem::space(path_);uint64_t available=host.available,capacity=host.capacity;
+        if(capacity_.min_free){auto reserve=capacity_.min_free;available=available>reserve?available-reserve:0;available=available>4*1024*1024?available-4*1024*1024:0;}
+        if(capacity_.max_data){auto used=data_usage_.load();capacity=std::min(capacity,capacity_.max_data);available=std::min(available,used<capacity_.max_data?capacity_.max_data-used:0);}
+        return {capacity,available};
+    }
+    bool has_capacity_budget() const{return capacity_.enabled();}
+    void admit(uint64_t bytes) const{if(capacity_.enabled())capacity_.admit(path_,data_usage_,bytes);}
     ~ObjectStore(){if(active_>=0)close(active_);}
     ObjectStore(const ObjectStore&)=delete;
     std::string read_chunk(const std::string& hash,const std::string& location) const {

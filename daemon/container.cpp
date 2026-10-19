@@ -454,3 +454,5 @@ void Container::forget_backup(const std::string& request_id) {
     catch(const std::exception& e){backup_tasks_.insert(std::move(saved));backup_catalog_error_=e.what();throw;}
 }
 }
+
+namespace forkfs {std::pair<uint64_t,uint64_t> Container::storage_space() const {std::lock_guard lock(mutex_);return journal_->space();}}
