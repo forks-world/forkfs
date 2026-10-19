@@ -5,6 +5,8 @@
 #include "file_content.h"
 #include "replay_format.h"
 #include "replay_validation.h"
+#include "repository_budget.h"
+#include "gc_checkpoint.h"
 #ifndef __APPLE__
 #include <sys/syscall.h>
 #include <linux/fs.h>
@@ -104,6 +106,7 @@ void LevelStore::create(const std::string& path) {
 LevelStore::LevelStore(const std::string& path,size_t object_cache_bytes):LevelStore(path,false,object_cache_bytes) {}
 LevelStore::LevelStore(const std::string& path,bool initialize,size_t object_cache_bytes) {
     owner_=std::make_shared<RepositoryOwner>(path);
+    need(!gc_checkpoint::exists_nofollow(path+"/GC-PENDING"),"GC checkpoint publication is pending; retry gc with its original --checkpoint target");
     leveldb::Options options;options.create_if_missing=initialize;options.error_if_exists=initialize;
     metrics_=std::make_unique<StoreIoMetrics>();env_=std::make_unique<TimedEnv>(*metrics_);options.env=env_.get();
     options.paranoid_checks=true;options.compression=leveldb::kNoCompression;
@@ -688,12 +691,77 @@ std::string LevelStore::collect(const std::string& input,const std::string& chec
     namespace fs=std::filesystem;
     struct stat entry{};need(lstat(input.c_str(),&entry)==0 && S_ISDIR(entry.st_mode),"GC requires a real repository directory");
     const auto path=fs::canonical(input).string();
+    const auto canonical_checkpoint=[&](){
+        if(checkpoint.empty())return std::string{};auto requested=fs::absolute(checkpoint);
+        need(!requested.filename().empty() && requested.filename()!="." && requested.filename()!="..","invalid GC checkpoint destination");
+        return (fs::canonical(requested.parent_path())/requested.filename()).string();
+    };
+    const auto requested_checkpoint=canonical_checkpoint();
+    // A post-exchange checkpoint is completed under the stable owner lease
+    // before any ordinary LevelStore can open the repository.
+    {
+        RepositoryOwner recovery_owner(path);
+        const auto pending_bytes=gc_checkpoint::read_file(fs::path(path)/"GC-PENDING",32*1024);
+        const auto done_bytes=gc_checkpoint::read_file(fs::path(path)/"GC-DONE",32*1024);
+        auto verify_receipt=[&](const gc_checkpoint::Receipt& receipt,bool allow_advanced){
+            need(receipt.repository==path,"GC receipt belongs to another repository path");
+            leveldb::Options options;options.create_if_missing=false;leveldb::DB* raw=nullptr;
+            status(leveldb::DB::Open(options,path,&raw),"open repository for GC receipt recovery");std::unique_ptr<leveldb::DB> db(raw);
+            leveldb::ReadOptions read;read.verify_checksums=true;
+            std::string identity,sequence,start,anchor;
+            status(db->Get(read,"M/repository",&identity),"read GC receipt repository identity");
+            status(db->Get(read,"M/sequence",&sequence),"read GC receipt sequence");
+            status(db->Get(read,"M/replay/start",&start),"read GC receipt generation");
+            status(db->Get(read,"M/replay/base",&anchor),"read GC receipt anchor");
+            need(identity==receipt.identity && number(sequence)>=receipt.sequence && (allow_advanced || number(sequence)==receipt.sequence) &&
+                 number(start)==receipt.sequence && anchor==receipt.anchor,
+                 "GC receipt does not match the active repository generation");
+        };
+        auto cleanup_retired=[&](const gc_checkpoint::Receipt& receipt){
+            struct stat active_owner{};need(fstat(recovery_owner.fd,&active_owner)==0,"GC recovery owner stat failed");
+            const auto parent=fs::path(path).parent_path();const auto prefix=fs::path(path).filename().string()+".gc-";
+            std::string repository_hex;const char* digits="0123456789abcdef";for(unsigned char c:receipt.identity){repository_hex+=digits[c>>4];repository_hex+=digits[c&15];}
+            const auto ready_marker="FFGC0001"+repository_hex+recovery_hex(replay::hash(path));
+            for(const auto& item:fs::directory_iterator(parent))if(item.path().filename().string().starts_with(prefix)){
+                struct stat dir{},owner{};if(lstat(item.path().c_str(),&dir)<0 || !S_ISDIR(dir.st_mode))continue;
+                if(lstat((item.path()/"OWNERSHIP").c_str(),&owner)<0 || !S_ISREG(owner.st_mode) || owner.st_dev!=active_owner.st_dev || owner.st_ino!=active_owner.st_ino)continue;
+                if(gc_checkpoint::read_file(item.path()/"GC-READY",256)==ready_marker)fs::remove_all(item.path());
+            }
+            gc_checkpoint::sync_directory(parent);
+        };
+        if(!pending_bytes.empty()){
+            need(!dry_run,"GC checkpoint publication is pending; gc-plan will not recover it");
+            auto receipt=gc_checkpoint::decode(pending_bytes);verify_receipt(receipt,false);
+            need(!requested_checkpoint.empty() && requested_checkpoint==receipt.archive,
+                 "GC checkpoint recovery requires the original --checkpoint target");
+            auto capacity=RepositoryBudget::load(path);
+            gc_checkpoint::publish_archive(fs::path(path)/"GC-BASELINE.pack",receipt,capacity.min_free);fault("gc_after_checkpoint_publish");
+            gc_checkpoint::write_atomic(fs::path(path)/"GC-DONE",gc_checkpoint::encode(receipt));fault("gc_after_checkpoint_complete");
+            if(unlink((path+"/GC-PENDING").c_str())<0)throw std::system_error(errno,std::generic_category(),"remove completed GC receipt");
+            gc_checkpoint::sync_directory(path);
+            if(unlink((path+"/GC-BASELINE.pack").c_str())<0 && errno!=ENOENT)throw std::system_error(errno,std::generic_category(),"remove GC checkpoint baseline");
+            gc_checkpoint::sync_directory(path);
+            cleanup_retired(receipt);return receipt.report;
+        }
+        if(!requested_checkpoint.empty() && !done_bytes.empty()){
+            auto receipt=gc_checkpoint::decode(done_bytes);
+            if(receipt.repository==path && receipt.archive==requested_checkpoint){
+                need(!dry_run,"GC checkpoint already completed; gc-plan will not replay checkpoint state");
+                verify_receipt(receipt,true);uint64_t size=0;
+                need(gc_checkpoint::fingerprint(requested_checkpoint,&size)==receipt.fingerprint && size==receipt.size,
+                     "completed GC checkpoint archive no longer matches its receipt");
+                if(unlink((path+"/GC-BASELINE.pack").c_str())<0 && errno!=ENOENT)throw std::system_error(errno,std::generic_category(),"remove GC checkpoint baseline");
+                gc_checkpoint::sync_directory(path);
+                cleanup_retired(receipt);return receipt.report;
+            }
+        }
+    }
     auto source=std::make_unique<LevelStore>(path);source->healthy();source->verify();
     need(source->physical_format_>=5,"GC requires the segmented layout");
     const bool reset=!checkpoint.empty(),pinned=source->replay_enabled_ && !reset;
     if(reset){auto parent=fs::canonical(fs::absolute(checkpoint).parent_path());
         auto relative=parent.lexically_relative(path);need(parent!=path && (relative.empty() || *relative.begin()==".."),"GC checkpoint must be outside the repository");
-        need(!fs::exists(checkpoint),"GC checkpoint destination must not exist");}
+        need(!gc_checkpoint::exists_nofollow(requested_checkpoint),"GC checkpoint destination must not exist");}
     leveldb::ReadOptions options;options.verify_checksums=true;
     std::map<std::string,std::string> roots;std::set<Id> live;std::set<Id> manifests;
     std::unique_ptr<leveldb::Iterator> it(source->db_->NewIterator(options));
@@ -734,7 +802,29 @@ std::string LevelStore::collect(const std::string& input,const std::string& chec
     const auto sequence=source->sequence_.load(),before_objects=source->objects_.load();
     auto report=[&](uint64_t after_bytes,bool applied){return "{\"applied\":"+std::string(applied?"true":"false")+",\"sequence\":"+std::to_string(sequence)+",\"objects_before\":"+std::to_string(before_objects)+",\"objects_after\":"+std::to_string(live.size())+",\"roots_before\":"+std::to_string(roots.size())+",\"roots_after\":"+std::to_string(kept_roots)+",\"data_bytes_before\":"+std::to_string(before_bytes)+",\"data_bytes_after\":"+(applied?std::to_string(after_bytes):"null")+",\"replay_pins_all_objects\":"+(pinned?"true":"false")+",\"new_replay_generation\":"+(reset?"true":"false")+"}";};
     if(dry_run)return report(0,false);
-    // Only completed, same-lease GC generations are eligible for stale cleanup.
+    RepositoryBudget capacity=RepositoryBudget::load(path);
+    // Estimate the exact unique chunks the copied generation will append.
+    // Host-space reservation accounts for the temporary second generation;
+    // max_data is enforced against staged DATA bytes by ObjectStore itself.
+    uint64_t staging_reserve=0;std::set<std::string> staged_chunks;
+    for(const auto& reference:live){auto payload=source->object(reference);auto count=std::max<size_t>(1,(payload.size()+65535)/65536);
+        for(size_t i=0;i<count;++i){auto offset=i*65536,length=std::min<size_t>(65536,payload.size()-offset);
+            std::string chunk=length?std::string(reinterpret_cast<const char*>(payload.data()+offset),length):std::string{};auto hash=replay::hash(chunk);
+            if(staged_chunks.insert(hash).second){const auto incoming=uint64_t(chunk.size())+44+48;need(incoming<=UINT64_MAX-staging_reserve,"GC staging size overflow");staging_reserve+=incoming;}}
+    }
+    uint64_t host_reserve=staging_reserve;
+    if(reset){
+        uint64_t metadata=0;
+        for(const auto& item:fs::directory_iterator(path))if(item.is_regular_file() && !item.path().filename().string().starts_with("DATA-")){
+            auto size=item.file_size();need(size<=UINT64_MAX-metadata,"GC metadata size overflow");metadata+=size;
+        }
+        need(staging_reserve<=UINT64_MAX-host_reserve,"GC checkpoint reserve overflow");host_reserve+=staging_reserve;
+        need(metadata<=UINT64_MAX-host_reserve,"GC checkpoint reserve overflow");host_reserve+=metadata;
+        constexpr uint64_t archive_overhead=1024*1024;need(archive_overhead<=UINT64_MAX-host_reserve,"GC checkpoint reserve overflow");host_reserve+=archive_overhead;
+    }
+    RepositoryBudget{0,capacity.min_free}.admit(path,0,host_reserve);
+    // The owner lease excludes a live collector; every matching sibling is a
+    // leftover staging or exchanged-out generation from an interrupted run.
     const auto marker=std::string("FFGC0001")+source->repository_+recovery_hex(replay::hash(path));
     auto read_control=[](const fs::path& file,size_t limit)->std::optional<std::string>{
         int fd=open(file.c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);if(fd<0){if(errno==ENOENT)return std::nullopt;throw std::system_error(errno,std::generic_category(),"open GC control file");}
@@ -752,11 +842,15 @@ std::string LevelStore::collect(const std::string& input,const std::string& chec
     const auto parent=fs::path(path).parent_path();const auto prefix=fs::path(path).filename().string()+".gc-";
     for(const auto& item:fs::directory_iterator(parent))if(item.path().filename().string().starts_with(prefix)){
         struct stat dir{},owner{};if(lstat(item.path().c_str(),&dir)<0 || !S_ISDIR(dir.st_mode))continue;
-        if(lstat((item.path()/"OWNERSHIP").c_str(),&owner)<0 || !S_ISREG(owner.st_mode) || owner.st_dev!=owner_stat.st_dev || owner.st_ino!=owner_stat.st_ino)continue;
-        if(read_control(item.path()/"GC-READY",256)==marker)fs::remove_all(item.path());
+        const bool same_lease=lstat((item.path()/"OWNERSHIP").c_str(),&owner)==0 && S_ISREG(owner.st_mode) && owner.st_dev==owner_stat.st_dev && owner.st_ino==owner_stat.st_ino;
+        const bool ready=read_control(item.path()/"GC-READY",256)==marker;
+        if(!same_lease || !ready)continue;
+        fs::remove_all(item.path());
     }
     auto staging=path+".gc-XXXXXX";need(mkdtemp(staging.data())!=nullptr,"create GC staging directory failed");
     struct Cleanup{const std::string& path;bool swapped=false;~Cleanup(){if(!swapped){std::error_code ignored;fs::remove_all(path,ignored);}}} cleanup{staging};
+    if(capacity.enabled())capacity.save(staging);
+    uint64_t archive_estimate=105+69;
     {
         LevelStore target(staging,true,default_object_cache_bytes);replay::Batch batch;size_t pending=0;
         auto flush=[&]{if(pending){target.publish(batch);batch.Clear();pending=0;fault("gc_copy_batch");}};
@@ -768,17 +862,28 @@ std::string LevelStore::collect(const std::string& input,const std::string& chec
             auto value=source->logical_value(options,key,it->value().ToString());
             if(key=="M/objects")value=integer(live.size());if(key=="M/roots")value=integer(kept_roots);
             if(reset && key=="M/format")value="FFLDB001";
+            if(reset){const auto row=uint64_t(45)+key.size()+value.size();need(row<=UINT64_MAX-archive_estimate,"GC checkpoint size overflow");archive_estimate+=row;}
             batch.Put(key,value);pending+=key.size()+value.size();if(pending>=1024*1024)flush();
         }
         status(it->status(),"copy live GC records");flush();
     }
     it.reset();
+    std::optional<gc_checkpoint::Receipt> checkpoint_receipt;
     {LevelStore target(staging);target.verify();target.verify_recovery_graph(options,sequence);
-        if(reset)target.backup(checkpoint);}
+        if(reset){
+            RepositoryBudget{0,capacity.min_free}.admit(staging,0,archive_estimate);
+            target.backup(staging+"/GC-BASELINE.pack");
+            uint64_t after_bytes=0;for(const auto& item:fs::directory_iterator(staging))if(item.is_regular_file() && item.path().filename().string().starts_with("DATA-") && item.path().extension()==".seg")after_bytes+=item.file_size();
+            std::string identity;status(target.db_->Get(options,"M/repository",&identity),"read GC checkpoint identity");
+            gc_checkpoint::Receipt receipt;receipt.repository=path;receipt.identity=identity;receipt.archive=requested_checkpoint;
+            receipt.report=report(after_bytes,true);receipt.sequence=target.replay_start_;receipt.anchor=target.replay_base_;
+            receipt.fingerprint=gc_checkpoint::fingerprint(staging+"/GC-BASELINE.pack",&receipt.size);checkpoint_receipt=std::move(receipt);
+        }}
     fault("gc_after_verified");
-    for(const auto& name:{"BACKUP-TASKS","CAPACITY",".forkfs-fskit-world",".forkfs-fskit-revision"}){
+    for(const auto& name:{"BACKUP-TASKS",".forkfs-fskit-world",".forkfs-fskit-revision"}){
         if(auto value=read_control(fs::path(path)/name,std::string(name)=="BACKUP-TASKS"?2*1024*1024:4096))write_control(fs::path(staging)/name,*value);
     }
+    if(checkpoint_receipt)gc_checkpoint::write_atomic(fs::path(staging)/"GC-PENDING",gc_checkpoint::encode(*checkpoint_receipt));
     write_control(fs::path(path)/"GC-READY",marker);write_control(fs::path(staging)/"GC-READY",marker);
     need(unlink((staging+"/OWNERSHIP").c_str())==0 && link((path+"/OWNERSHIP").c_str(),(staging+"/OWNERSHIP").c_str())==0,"GC ownership handoff failed");
     sync_parent(staging+"/CURRENT");
@@ -790,8 +895,16 @@ std::string LevelStore::collect(const std::string& input,const std::string& chec
 #endif
     if(exchanged<0)throw std::system_error(errno,std::generic_category(),"atomic GC generation exchange");
     cleanup.swapped=true;fault("gc_after_swap");sync_parent(path);fault("gc_after_parent_sync");
+    if(checkpoint_receipt){
+        fault("gc_before_checkpoint_publish");gc_checkpoint::publish_archive(fs::path(path)/"GC-BASELINE.pack",*checkpoint_receipt,capacity.min_free);
+        fault("gc_after_checkpoint_publish");gc_checkpoint::write_atomic(fs::path(path)/"GC-DONE",gc_checkpoint::encode(*checkpoint_receipt));
+        fault("gc_after_checkpoint_complete");
+        if(unlink((path+"/GC-PENDING").c_str())<0)throw std::system_error(errno,std::generic_category(),"remove completed GC receipt");gc_checkpoint::sync_directory(path);
+    }
     uint64_t after_bytes=0;for(const auto& item:fs::directory_iterator(path))if(item.is_regular_file() && item.path().filename().string().starts_with("DATA-") && item.path().extension()==".seg")after_bytes+=item.file_size();
-    fs::remove_all(staging);sync_parent(path);return report(after_bytes,true);
+    const auto result=checkpoint_receipt?checkpoint_receipt->report:report(after_bytes,true);
+    if(checkpoint_receipt && unlink((path+"/GC-BASELINE.pack").c_str())<0 && errno!=ENOENT)throw std::system_error(errno,std::generic_category(),"remove GC checkpoint baseline");
+    fs::remove_all(staging);sync_parent(path);if(checkpoint_receipt)gc_checkpoint::sync_directory(path);return result;
 }
 }
 

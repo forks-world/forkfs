@@ -52,6 +52,64 @@ with tempfile.TemporaryDirectory(prefix='ff-gc-') as directory:
         verify(trial);run('gc',trial);verify(trial)
         # Fully prepared crash leftovers must be recovered on the retry.
         assert not [p for p in root.glob(stage+'.gc-*') if (p/'GC-READY').exists()]
+    # A checkpoint is published only after the exchanged generation is durable.
+    for stage in ('gc_copy_batch','gc_after_verified','gc_before_swap','gc_after_swap','gc_after_parent_sync',
+                  'gc_before_checkpoint_publish','gc_after_checkpoint_publish','gc_after_checkpoint_complete'):
+        trial=root/('checkpoint-'+stage);archive=root/('archive-'+stage);shutil.copytree(db,trial)
+        run('gc',trial,'--checkpoint',archive,binary=FAULT,env=dict(os.environ,FORKFS_TEST_CRASH=stage),code=86)
+        if stage in ('gc_copy_batch','gc_after_verified','gc_before_swap'):
+            assert not archive.exists()
+        if stage in ('gc_after_swap','gc_after_parent_sync','gc_before_checkpoint_publish'):
+            run('check',trial,code=1)  # normal opens cannot pass a pending receipt
+            wrong=root/('wrong-'+stage)
+            pending=(trial/'GC-PENDING').read_bytes();baseline=(trial/'GC-BASELINE.pack').read_bytes()
+            run('gc-plan',trial,'--checkpoint',archive,code=1)
+            assert (trial/'GC-PENDING').read_bytes()==pending and (trial/'GC-BASELINE.pack').read_bytes()==baseline and not archive.exists()
+            run('gc',trial,'--checkpoint',wrong,code=1)
+            assert not wrong.exists()
+        retried=json.loads(run('gc',trial,'--checkpoint',archive))
+        assert retried['new_replay_generation'] and retried['applied'],retried
+        if stage not in ('gc_after_verified','gc_before_swap'):
+            assert json.loads(run('gc',trial,'--checkpoint',archive))==retried
+        assert archive.is_file() and not (trial/'GC-PENDING').exists() and not (trial/'GC-BASELINE.pack').exists()
+        assert not [p for p in root.glob(trial.name+'.gc-*') if (p/'GC-READY').exists()]
+        verify(trial)
+        if stage=='gc_after_checkpoint_complete':
+            advanced=root/'after-checkpoint';advanced.write_bytes(b'newer generation transaction')
+            run('fs-write',trial,'/file',advanced)
+            assert json.loads(run('gc',trial,'--checkpoint',archive))==retried
+    conflict_trial=root/'checkpoint-publish-conflict';shutil.copytree(db,conflict_trial);conflicted=root/'checkpoint-publish.pack'
+    run('gc',conflict_trial,'--checkpoint',conflicted,binary=FAULT,env=dict(os.environ,FORKFS_TEST_CRASH='gc_before_checkpoint_publish'),code=86)
+    protected_bytes=b'user archive';conflicted.write_bytes(protected_bytes)
+    pending=(conflict_trial/'GC-PENDING').read_bytes();baseline=(conflict_trial/'GC-BASELINE.pack').read_bytes()
+    run('gc',conflict_trial,'--checkpoint',conflicted,code=1)
+    assert conflicted.read_bytes()==protected_bytes and (conflict_trial/'GC-PENDING').read_bytes()==pending and (conflict_trial/'GC-BASELINE.pack').read_bytes()==baseline
+    moved=root/'checkpoint-publish-moved.pack';conflicted.rename(moved)
+    recovered=json.loads(run('gc',conflict_trial,'--checkpoint',conflicted))
+    assert recovered['applied'] and not (conflict_trial/'GC-PENDING').exists()
+    assert json.loads(run('gc',conflict_trial,'--checkpoint',conflicted))==recovered
+    verify(conflict_trial)
+    corrupt_trial=root/'checkpoint-corrupt-receipt';shutil.copytree(db,corrupt_trial);corrupt_archive=root/'corrupt-receipt.pack'
+    run('gc',corrupt_trial,'--checkpoint',corrupt_archive,binary=FAULT,env=dict(os.environ,FORKFS_TEST_CRASH='gc_before_checkpoint_publish'),code=86)
+    corrupt=(corrupt_trial/'GC-PENDING').read_bytes();(corrupt_trial/'GC-PENDING').write_bytes(corrupt[:-1]+bytes([corrupt[-1]^1]))
+    corrupt=(corrupt_trial/'GC-PENDING').read_bytes()
+    run('check',corrupt_trial,code=1);run('gc',corrupt_trial,'--checkpoint',corrupt_archive,code=1)
+    assert (corrupt_trial/'GC-PENDING').read_bytes()==corrupt and not corrupt_archive.exists()
+    conflict=root/'checkpoint-conflict';shutil.copytree(db,conflict);protected=root/'protected.pack';protected.write_bytes(b'user data')
+    run('gc',conflict,'--checkpoint',protected,code=1);assert protected.read_bytes()==b'user data';verify(conflict)
+    # Existing garbage leaves room for the second generation within the source
+    # max_data policy; a bound below the live output rejects before exchange.
+    capacity_trial=root/'capacity-gc';shutil.copytree(db,capacity_trial)
+    usage=sum(p.stat().st_size for p in capacity_trial.glob('DATA-*.seg'))
+    run('capacity',capacity_trial,usage,0)
+    compacted=json.loads(run('gc',capacity_trial));assert compacted['data_bytes_after']<usage,compacted;verify(capacity_trial)
+    too_small=root/'capacity-gc-too-small';shutil.copytree(db,too_small)
+    run('capacity',too_small,1,0)
+    run('gc',too_small,code=1);verify(too_small)
+    assert not [p for p in root.glob('capacity-gc-too-small.gc-*') if (p/'GC-READY').exists()]
+    # min_free applies to DATA staging and both checkpoint archive copies.
+    run('capacity',capacity_trial,0,2**63)
+    run('gc',capacity_trial,code=1);verify(capacity_trial)
     report=json.loads(run('gc',db));assert report['data_bytes_after']<report['data_bytes_before'],report
     verify(db)
     assert (db/'.forkfs-fskit-world').read_bytes()==b'main\n'
