@@ -57,7 +57,8 @@
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 270000
     if(@available(macOS 27.0,*)){
         if(![[FSClient sharedInstance] openFileSystemExtensionsSettings])self.status.stringValue=@"无法打开文件系统扩展设置。";
-    }else
+        return;
+    }
 #endif
     self.status.stringValue=@"请在系统设置中手动检查文件系统扩展。";
 }

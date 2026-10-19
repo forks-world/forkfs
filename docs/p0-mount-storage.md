@@ -87,7 +87,10 @@ forkfsd gc STORE
 forkfsd gc STORE --checkpoint NEW_BASELINE_ARCHIVE
 ```
 
-GC exclusively owns the repository. It validates existing objects and the recovery
+Run GC as the repository owner; another UID, including root, is refused before
+the repository is opened. The atomic exchange preserves the repository directory's
+POSIX mode and group ID; preservation of ACLs is not claimed. GC exclusively owns
+the repository. It validates existing objects and the recovery
 graph before following typed World, revision DAG, namespace and sparse-content
 references. Unknown inode codecs/flags fail closed. Generic object roots retain
 their payload without guessing a codec from its bytes. Staging aliases are retained
