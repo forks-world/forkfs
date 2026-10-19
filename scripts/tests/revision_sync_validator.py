@@ -173,7 +173,7 @@ def verify_closure(plan, entries, load, max_dag_bytes=64*1024*1024):
             if key.startswith(NS + b'inode/'):
                 ident = key[len(NS + b'inode/'):]
                 checked(bool(re.fullmatch(b'[0-9a-f]{32}', ident)), 'inode ID')
-                checked(len(data) >= 48 and data[:8] in (b'FFINOD01', b'FFINOD02', b'FFINOD03', b'FFINOD04'), 'inode codec')
+                checked(len(data) >= 48 and data[:8] in (b'FFINOD01', b'FFINOD02', b'FFINOD03', b'FFINOD04', b'FFINOD05'), 'inode codec')
                 kind, mode, links, size = struct.unpack_from('<IIQQ', data, 8)
                 checked(kind in (1, 2, 3) and mode <= 0o777 and links > 0, 'inode attributes')
                 checked(kind != 2 or (links >= 2 and size == 0), 'directory inode')
@@ -181,13 +181,13 @@ def verify_closure(plan, entries, load, max_dag_bytes=64*1024*1024):
                     checked(len(data) == 48, 'inode length')
                 else:
                     checked(len(data) >= 80 and (data[:8] != b'FFINOD03' or len(data) == 80), 'extended inode length')
-                    if data[:8] == b'FFINOD04':
+                    if data[:8] in (b'FFINOD04', b'FFINOD05'):
                         checked(84 <= len(data) <= 128 * 1024, 'xattr inode length')
                     flags, = struct.unpack_from('<I', data, 48)
-                    checked(flags <= 1 and (not flags or kind == 2) and data[60:64] == bytes(4), 'inode flags')
+                    checked((flags == 2 and kind == 1 if data[:8] == b'FFINOD05' else flags <= 1 and (not flags or kind == 2)) and data[60:64] == bytes(4), 'inode flags')
                     accessed, created = struct.unpack_from('<QQ', data, 64)
                     checked(accessed <= 2**63 - 1 and created <= 2**63 - 1, 'extended inode timestamp')
-                    if data[:8] == b'FFINOD04':
+                    if data[:8] in (b'FFINOD04', b'FFINOD05'):
                         inp = Input(data[80:]);n = inp.number(4);previous = b''
                         checked(n <= 128, 'xattr count')
                         for _ in range(n):
@@ -198,7 +198,7 @@ def verify_closure(plan, entries, load, max_dag_bytes=64*1024*1024):
                         inp.end()
                 inode_ids[ident] = (kind, mode, links, size)
                 indexed_inode = data[:8] == b'FFINOD02'
-                if data[:8] in (b'FFINOD03', b'FFINOD04'):
+                if data[:8] in (b'FFINOD03', b'FFINOD04', b'FFINOD05'):
                     indexed_inode = bool(struct.unpack_from('<I', data, 48)[0] & 1)
                 checked(indexed_inode == (indexed and kind == 2), 'directory inode/index version mismatch')
         root = values[NS + b'root']
@@ -236,6 +236,30 @@ def verify_closure(plan, entries, load, max_dag_bytes=64*1024*1024):
                     content_key = NS + b'content/' + child
                     checked(content_key in values, 'inode content missing')
                     payload = values[content_key]
+                    if values[child_inode_key][:8] == b'FFINOD05':
+                        checked(len(payload) == 48 and payload[:8] == b'FFFILE01'
+                                and int.from_bytes(payload[8:16], 'little') == length
+                                and length <= 8 * 1024 * 1024, 'mock extent file descriptor/restore budget')
+                        output = bytearray(length)
+                        def extent(object_id, level, first):
+                            node = read(object_id)
+                            checked(len(node) >= 11 and node[:8] == b'FFEXT001' and node[8] == level, 'extent node codec')
+                            count = int.from_bytes(node[9:11], 'little')
+                            checked(1 <= count <= 256 and len(node) == 11 + 33 * count, 'extent node length')
+                            previous = -1
+                            for i in range(count):
+                                at = 11 + 33 * i; slot = node[at]; start = first + (slot << (8 * level))
+                                checked(slot > previous and start * 65536 < length, 'extent order/EOF'); previous = slot
+                                child_id = node[at+1:at+33].hex()
+                                if level:
+                                    extent(child_id, level-1, start)
+                                else:
+                                    block = read(child_id); n = min(65536, length-start*65536)
+                                    checked(len(block) == 65536 and any(block) and not any(block[n:]), 'extent data/tail')
+                                    output[start*65536:start*65536+n] = block[:n]
+                        if any(payload[16:]):
+                            checked(length > 0, 'nonempty zero-size extent tree');extent(payload[16:].hex(), 5, 0)
+                        payload = bytes(output)
                     checked(len(payload) == length, 'inode content size')
                     if typ == 3:
                         validate_symlink_target(payload)

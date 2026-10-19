@@ -14,7 +14,7 @@ def run(*args, binary=BIN, env=None, code=0):
 with tempfile.TemporaryDirectory(prefix='ff-content-segments-') as name:
     root = Path(name); source = root/'source'; payload = root/'input'
     run('init', source); run('fs-init', source)
-    rng = random.Random(8173); original = bytes(rng.randrange(256) for _ in range(180000))
+    rng = random.Random(8173); original = bytes(rng.randrange(256) for _ in range(int(sys.argv[3]) if len(sys.argv)>3 else 180000))
     payload.write_bytes(original); run('fs-write', source, '/file', payload)
     run('fs-snapshot', source, 'original'); run('fs-fork', source, 'original', 'branch')
     assert list(source.glob('DATA-*.seg'))

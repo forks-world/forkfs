@@ -80,8 +80,10 @@ class SyncTests(unittest.TestCase):
             cls.expected['/src/f'+str(i)] = payload
         cls.expected['/magic'] = b'FFREV002this is file data, not a descriptor'
         cls.expected['/empty'] = b''
+        cls.expected['/extent-magic'] = b'FFFILE01' + struct.pack('<Q', 1 << 40) + bytes.fromhex('11'*32)
         cls.expected['/binary'] = random.Random(173).randbytes(150000)
-        for path in ('/magic','/empty','/binary'):
+        cls.expected['/large'] = random.Random(8173).randbytes(700000)
+        for path in ('/magic','/empty','/binary','/large','/extent-magic'):
             data.write_bytes(cls.expected[path]);run('fs-write', cls.db, path, data)
         run('fs-chmod', cls.db, '/src/f0', '755');run('fs-link', cls.db, '/src/f0', '/alias')
         run('fs-symlink', cls.db, 'src/f0', '/current')

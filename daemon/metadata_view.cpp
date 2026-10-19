@@ -1,6 +1,7 @@
 #include "revision.h"
 #include "metadata_view.h"
 #include "metadata_tree.h"
+#include "file_content.h"
 #include <algorithm>
 #include <cstring>
 #include <set>
@@ -223,6 +224,14 @@ void NamespaceView::verify_manifest(const std::function<Bytes(const ObjectId&)>&
         }
     }
     need(entries.contains(prefix+"root"),"manifest missing namespace root");
-    for(const auto& [key,id]:entries){(void)key;(void)read(id);}
+    for(const auto& [key,id]:entries){
+        auto bytes=read(id);
+        if(key.starts_with(prefix+"inode/") && bytes.size()>=8 && !memcmp(bytes.data(),"FFINOD05",8)) {
+            need(bytes.size()>=84 && bytes.size()<=128*1024 && u32(bytes,8)==1 && u32(bytes,48)==2,"invalid extent inode");
+            auto content=entries.find(prefix+"content/"+key.substr((prefix+"inode/").size()));need(content!=entries.end(),"extent file content missing");
+            uint64_t size=0;for(unsigned i=0;i<8;++i)size|=uint64_t(bytes[24+i])<<(8*i);
+            FileContent(read,read(content->second),size,true).verify();
+        }
+    }
 }
 }

@@ -16,8 +16,10 @@ struct InodeInfo {
     uint64_t accessed_ns=0,created_ns=0;
     bool extended_attributes=false; // FFINOD03 retains ownership and extra timestamps.
     std::shared_ptr<const Xattrs> xattrs={}; // Non-null retains FFINOD04, including an empty map.
+    bool indexed_content=false; // FFINOD05: immutable sparse file radix tree.
 };
 class NamespaceView;
+class FileContent;
 class Namespace {
 public:
     struct Attributes {
@@ -126,7 +128,7 @@ private:
     friend class Container;
     static void recover_orphans(Container& container);
     const Container::OpenHandle& find_handle(const std::string& handle) const;
-    void edit_handle(const std::string& handle,const std::function<bool(std::vector<unsigned char>&,bool)>& edit,const std::function<void()>& committed={});
+    void edit_handle(const std::string& handle,const std::function<bool(FileContent&,bool)>& edit,const std::function<void()>& committed={});
     std::vector<unsigned char> read_handle_locked(const Container::OpenHandle& info,uint64_t offset,uint64_t count) const;
     using Changes=std::map<std::string,std::optional<std::vector<unsigned char>>>;
     std::pair<InodeInfo,std::string> xattr_inode(const NamespaceView& view,const std::string& address,bool handle) const;
@@ -155,6 +157,6 @@ private:
     std::string view_;
     bool revision_;
     void update(const std::function<void(const NamespaceView&,Changes&)>& operation);
-    void edit_content(const std::string& path,const std::function<bool(std::vector<unsigned char>&)>& edit);
+    void edit_content(const std::string& path,const std::function<bool(FileContent&)>& edit);
 };
 }

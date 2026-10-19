@@ -16,7 +16,7 @@ try{for(bool legacy:{false,true}){
         CHECK(fs.read("/file")==std::vector<unsigned char>(7,0));
         auto stable=store.status();
         error(EEXIST,[&]{fs.create_child(root,"file",false,a);});
-        auto bad=a;bad.size=262145;error(EFBIG,[&]{fs.create_child(root,"big",false,bad);});
+        auto bad=a;bad.size=UINT64_MAX;error(EFBIG,[&]{fs.create_child(root,"big",false,bad);});
         bad=a;bad.created_ns=UINT64_MAX;error(EINVAL,[&]{fs.create_child(root,"bad",false,bad);});
         error(EISDIR,[&]{fs.create_child(root,"dir",true,a);});
         error(EINVAL,[&]{fs.symlink_child(root,"link","file",a);});

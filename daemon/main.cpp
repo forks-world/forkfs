@@ -3,6 +3,7 @@
 #include "level_store.h"
 #include "backup_catalog.h"
 #include "namespace.h"
+#include "file_content.h"
 #include "rpc.h"
 #include <cerrno>
 #include <charconv>
@@ -54,9 +55,14 @@ uint64_t file_number(const std::string& text,int base=10) {
 std::vector<unsigned char> load_file(const char* path) {
     std::ifstream input(path,std::ios::binary);
     if(!input)throw std::runtime_error("cannot open file input");
-    std::vector<unsigned char> data(256*1024+1);input.read(reinterpret_cast<char*>(data.data()),data.size());
-    if(input.bad() || input.gcount()>256*1024)throw std::runtime_error("invalid or oversized file input");
-    data.resize(input.gcount());return data;
+    std::vector<unsigned char> data;std::array<unsigned char,65536> buffer;
+    for(;;){
+        input.read(reinterpret_cast<char*>(buffer.data()),buffer.size());auto count=static_cast<size_t>(input.gcount());
+        if(input.bad() || count>forkfs::FileContent::max_io-data.size())throw std::runtime_error("invalid or oversized file input");
+        data.insert(data.end(),buffer.begin(),buffer.begin()+count);
+        if(input.eof())return data;
+        if(input.fail())throw std::runtime_error("invalid file input");
+    }
 }
 std::vector<forkfs::Mutation> load_batch(const char* path) {
     std::ifstream input(path,std::ios::binary);

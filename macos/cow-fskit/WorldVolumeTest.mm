@@ -73,13 +73,13 @@ int main(){@autoreleasepool{
                 if(which==2)invalid.birthTime=(struct timespec){INT64_MAX,0};
                 if(which==3)invalid.mode=01000;
                 if(which==4)invalid.flags=1;
-                if(which==5)invalid.size=262145;
+                if(which==5)invalid.size=UINT64_MAX;
                 __block unsigned replies=0;
                 [volume setAttributes:invalid onItem:a replyHandler:^(FSItemAttributes *v,NSError *e){++replies;CHECK(!v && e.code==(which==4?ENOTSUP:which==5?EFBIG:EINVAL));}];
                 CHECK(replies==1 && invalid.consumedAttributes==0);
             }
             [volume writeContents:data toFile:a atOffset:-1 replyHandler:^(size_t count,NSError *e){CHECK(count==0 && e.code==EINVAL);}];
-            [volume writeContents:data toFile:a atOffset:262144 replyHandler:^(size_t count,NSError *e){CHECK(count==0 && e.code==EFBIG);}];
+            [volume writeContents:data toFile:a atOffset:INT64_MAX replyHandler:^(size_t count,NSError *e){CHECK(count==0 && e.code==EFBIG);}];
             [volume writeContents:data toFile:root atOffset:0 replyHandler:^(size_t count,NSError *e){CHECK(count==0 && e.code==EISDIR);}];
             [volume writeContents:data toFile:link atOffset:0 replyHandler:^(size_t count,NSError *e){CHECK(count==0 && e.code==EINVAL);}];
             [volume writeContents:data toFile:revision.rootItem atOffset:0 replyHandler:^(size_t count,NSError *e){CHECK(count==0 && e.code==ESTALE);}];
@@ -99,6 +99,11 @@ int main(){@autoreleasepool{
             CHECK(lookup(volume,directory,@"..")==root && attrs(volume,directory).parentID==FSItemIDRootDirectory);
             work.remove("/a",false);work.remove("/b",false);
             CHECK(attrs(volume,a).linkCount==0);read(volume,a,{1,0,255,0,0,0});
+            [volume writeContents:data toFile:a atOffset:262144 replyHandler:^(size_t count,NSError *e){CHECK(!e && count==2);}];
+            CHECK(attrs(volume,a).size==262146);
+            auto largeBuffer=[WorldBuffer new];largeBuffer.data=[NSMutableData dataWithLength:4];
+            [volume readFromFile:a offset:262143 length:4 intoBuffer:(FSMutableFileDataBuffer *)largeBuffer replyHandler:^(size_t count,NSError *e){CHECK(!e && count==3);}];
+            CHECK(!memcmp(largeBuffer.mutableBytes,"\0\0\xff",3));
             auto orphan=[FSItemSetAttributesRequest new];orphan.size=3;orphan.uid=0;
             [volume setAttributes:orphan onItem:a replyHandler:^(FSItemAttributes *v,NSError *e){CHECK(!e && v.size==3 && v.uid==0);}];
             xattr(volume,a,[NSData data],FSSetXattrPolicyMustReplace);

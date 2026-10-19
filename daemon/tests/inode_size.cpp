@@ -29,7 +29,7 @@ int main(){
             check(n.uid==501 && n.gid==20 && n.accessed_ns==111 && n.created_ns==222);
             check(revision.read_inode(id,0,9)==Bytes({'A','B','C'}) && work.stat_inode(id).size==3);
             auto stable=store.status();fs.set_inode_attributes(id,{{},{},5});check(store.status()==stable);
-            error(EFBIG,[&]{fs.set_inode_attributes(id,{0777,999,256*1024+1});});error(EFBIG,[&]{fs.set_inode_attributes(id,{{},{},UINT64_MAX});});
+            error(EFBIG,[&]{fs.set_inode_attributes(id,{0777,999,UINT64_MAX});});error(EFBIG,[&]{fs.set_inode_attributes(id,{{},{},UINT64_MAX});});
             error(EISDIR,[&]{fs.set_inode_attributes(root,{0777,999,0});});error(EINVAL,[&]{fs.set_inode_attributes(sym.id,{0600,999,0});});
             error(EROFS,[&]{revision.set_inode_attributes(id,{{},{},0});});check(store.status()==stable);
             fs.set_attributes("/alias",{0640,456,1});check(fs.read_inode(id,0,9)==Bytes{'A'} && fs.stat_inode(id).modified_ns==456);
@@ -44,7 +44,7 @@ int main(){
                 Namespace::Attributes owner;owner.uid=0;owner.gid=0;owner.accessed_ns=0;owner.created_ns=0;fs.handle_set_attributes(h,owner);
                 check(fs.handle_stat(r).uid==0 && fs.handle_stat(r).gid==0 && fs.handle_stat(r).accessed_ns==0 && fs.handle_stat(r).created_ns==0);
                 check(fs.handle_read(r,0,9)==Bytes({0,0,0,0}));stable=store.status();
-                error(ENOENT,[&]{fs.set_inode_attributes(id,{{},{},1});});error(EFBIG,[&]{fs.handle_set_attributes(h,{0600,1,256*1024+1});});check(store.status()==stable);
+                error(ENOENT,[&]{fs.set_inode_attributes(id,{{},{},1});});error(EFBIG,[&]{fs.handle_set_attributes(h,{0600,1,UINT64_MAX});});check(store.status()==stable);
                 fs.close(h);fs.close(r);
             }
             fs.verify();revision.verify();work.verify();store.verify();

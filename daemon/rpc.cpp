@@ -241,7 +241,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         return result+"],\"eof\":"+(page.eof?"true":"false")+"}\n";
     }
     if(op=="fs-cat"){auto b=fs.read(args[1]);return std::string(b.begin(),b.end());}
-    if(op=="fs-read-at"){auto b=fs.read_at(args[1],number(args[2]),number(args[3]));return std::string(b.begin(),b.end());}
+    if(op=="fs-read-at"){auto b=fs.read_at(args[1],number(args[2]),std::min<uint64_t>(number(args[3]),limit-4));return std::string(b.begin(),b.end());}
     if(op=="fs-open") {
         auto comma=args[2].find(',');auto mode=args[2].substr(0,comma);
         need(mode=="r" || mode=="w" || mode=="rw","invalid handle access mode");
@@ -284,12 +284,12 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         auto origin=args[3]=="set"?Namespace::Seek::Set:args[3]=="cur"?Namespace::Seek::Current:Namespace::Seek::End;
         return "{\"offset\":"+std::to_string(fs.seek(args[1],signed_number(args[2]),origin))+"}\n";
     }
-    if(op=="fs-hread-next"){auto b=fs.handle_read_next(args[1],number(args[2]));return std::string(b.begin(),b.end());}
+    if(op=="fs-hread-next"){auto b=fs.handle_read_next(args[1],std::min<uint64_t>(number(args[2]),limit-4));return std::string(b.begin(),b.end());}
     if(op=="fs-hwrite-next") {
         auto written=fs.handle_write_next(args[1],std::vector<unsigned char>(args[2].begin(),args[2].end()));
         return "{\"written\":"+std::to_string(written)+"}\n";
     }
-    if(op=="fs-hread"){auto b=fs.handle_read(args[1],number(args[2]),number(args[3]));return std::string(b.begin(),b.end());}
+    if(op=="fs-hread"){auto b=fs.handle_read(args[1],number(args[2]),std::min<uint64_t>(number(args[3]),limit-4));return std::string(b.begin(),b.end());}
     if(op=="fs-happend") {
         auto offset=fs.handle_append(args[1],std::vector<unsigned char>(args[2].begin(),args[2].end()));
         return "{\"offset\":"+std::to_string(offset)+",\"written\":"+std::to_string(args[2].size())+"}\n";

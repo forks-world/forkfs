@@ -51,11 +51,40 @@ def source_closure(roots, objects):
             if data[:8] != b'FFTREE01' or len(data) != 40:
                 raise ValueError('mock supports FFTREE01 only')
             pending.append((data[8:], 'tree'))
+            # Determine typed content edges from inode records, never file magic.
+            values = {}; todo = [data[8:]]; seen = set()
+            while todo:
+                node_id = todo.pop()
+                if node_id in seen:
+                    raise ValueError('source tree cycle')
+                seen.add(node_id); node = bytes.fromhex(objects[node_id.hex()])
+                if len(node) < 108 or node[:8] != b'FFTRNO01':
+                    raise ValueError('source tree codec')
+                values[node[108:]] = node[12:44]
+                todo.extend(c for c in (node[44:76], node[76:108]) if c != ZERO)
+            for key, value in values.items():
+                if key.startswith(b'\0forkfs/inode/'):
+                    inode = bytes.fromhex(objects[value.hex()])
+                    if inode[:8] == b'FFINOD05':
+                        pending.append((values[b'\0forkfs/content/' + key[len(b'\0forkfs/inode/'):]], 'file'))
         elif role == 'tree':
             if len(data) < 108 or data[:8] != b'FFTRNO01':
                 raise ValueError('source tree codec')
             pending.append((data[12:44], 'value'))
             pending.extend((child, 'tree') for child in (data[44:76], data[76:108]) if child != ZERO)
+        elif role == 'file':
+            if len(data) != 48 or data[:8] != b'FFFILE01':
+                raise ValueError('source file descriptor')
+            if data[16:] != ZERO:
+                pending.append((data[16:], 'extent5'))
+        elif role.startswith('extent'):
+            level = int(role[6:])
+            if len(data) < 11 or data[:8] != b'FFEXT001' or data[8] != level:
+                raise ValueError('source extent codec')
+            count = int.from_bytes(data[9:11], 'little')
+            if not 1 <= count <= 256 or len(data) != 11 + 33 * count:
+                raise ValueError('source extent length')
+            pending.extend((data[12+i*33:44+i*33], 'extent' + str(level-1) if level else 'value') for i in range(count))
     return {oid: len(bytes.fromhex(objects[oid])) for oid in sorted(ids)}
 
 

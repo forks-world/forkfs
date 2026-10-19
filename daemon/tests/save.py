@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix='ff-save-',dir='/tmp') as tmp:
     run('fs-mkdir',db,'/dir');run('fs-save',db,'/dir',data,ok=False)
     run('fs-save',db,'/file',data,'--revision','base',ok=False)
     run('fs-save',db,'/missing/child',data,ok=False)
-    data.write_bytes(bytes(256*1024+1));run('fs-save',db,'/file',data,ok=False)
+    data.write_bytes(bytes(8*1024*1024+1));run('fs-save',db,'/file',data,ok=False)
     data.write_bytes(b'crash-value');baseline=root/'baseline';shutil.copytree(db,baseline)
     for stage in ['leveldb_before_write','leveldb_after_write']:
         shutil.rmtree(db);shutil.copytree(baseline,db)

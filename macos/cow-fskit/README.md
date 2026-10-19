@@ -124,7 +124,7 @@ Attributes report the stored ownership and timestamps, including zero values;
 identity mapping and permission enforcement remain frontend work. Unsupported
 set attributes (including flags and ctime), malformed timestamps and invalid
 modes are rejected before mutation. Only successfully applied fields are marked
-consumed. Prototype file and xattr limits remain 256 KiB and 64 KiB respectively.
+consumed. Regular files use the [sparse large-file format](../../docs/LARGE_FILES.md); xattrs remain limited to 64 KiB.
 
 Each retained regular FSItem pins a backend read/write handle. This is an internal
 lifetime pin, not an authorization decision or a POSIX open mode. Hardlinks share

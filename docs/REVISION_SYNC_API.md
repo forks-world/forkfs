@@ -488,3 +488,12 @@ namespace validator 及恢复 reader adapter。SDK 的验证能从目标字节�
 
 关联设计：[revision DAG](REVISION_DAG.md)、[本地对象存储](CONTENT_SEGMENTS.md)、
 [事务备份与 replay](REVISION_BACKUP_DESIGN.md)、[研发 workload](DEVELOPER_WORKLOAD_TESTS.md)。
+
+### 本地大文件格式补充
+
+[稀疏大文件格式](LARGE_FILES.md) 增加 FFINOD05、FFFILE01 和 FFEXT001。
+它们是逻辑对象 codec：typed walker 从 FFINOD05 对应的 content 记录进入文件描述符，
+再遍历全部索引和数据对象。普通文件数据中的相同 magic 不建立引用。生产协商必须
+显式包含这些 codec；不支持的接收端必须拒绝，不能只备份 48 字节描述符。
+现有 mock 已覆盖 700,000 字节文件的完整闭包传输和独立验证；其 native restore
+测试适配器对单文件物化有 8 MiB 上限，不能代表任意大文件的生产导入能力。

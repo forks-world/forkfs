@@ -222,7 +222,7 @@ def error_boundaries(f):
     f.call('fs-stat', '/missing', error='path not found')
     f.call('fs-mkdir', 'relative', error='path must be absolute')
     f.call('fs-mkdir', '/a/../x', error='invalid path component')
-    f.call('fs-truncate', '/a', 262145, error='prototype files are limited to 256 KiB')
+    f.call('fs-truncate', '/a', 18446744073709551615, error='file size exceeds signed 64-bit range')
     f.read('/a', b'unchanged')
     if f.call('fs-ls', '/') != b'a\n':
         raise AssertionError('rejected operation mutated directory')

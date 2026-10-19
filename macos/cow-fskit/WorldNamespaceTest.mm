@@ -56,7 +56,7 @@ int main(){@autoreleasepool{
             auto stable=store->status();
             create(v,root,@"a",FSItemTypeFile,nil,EEXIST);
             create(v,a,@"bad",FSItemTypeFile,nil,ENOTDIR);
-            auto bad=[FSItemSetAttributesRequest new];bad.size=262145;create(v,root,@"big",FSItemTypeFile,bad,EFBIG);CHECK(bad.consumedAttributes==0);
+            auto bad=[FSItemSetAttributesRequest new];bad.size=UINT64_MAX;create(v,root,@"big",FSItemTypeFile,bad,EFBIG);CHECK(bad.consumedAttributes==0);
             bad=[FSItemSetAttributesRequest new];bad.uid=42;bad.flags=1;create(v,root,@"flags",FSItemTypeFile,bad,ENOTSUP);
             bad=[FSItemSetAttributesRequest new];bad.size=0;create(v,root,@"dirsize",FSItemTypeDirectory,bad,EISDIR);
             bad=[FSItemSetAttributesRequest new];bad.type=FSItemTypeDirectory;create(v,root,@"type",FSItemTypeFile,bad,EINVAL);

@@ -38,9 +38,8 @@ CoW references, revision IDs, or portable replay hashes.
   also have an actual zero-length record; there is no inline-data exception.
 
 A changed byte in a 256 KiB object adds at most one 64 KiB content block if all
-other blocks already exist. The logical namespace API still prepares a complete
-file value in memory; this change removes repeated unchanged bytes from physical
-writes, not from all reads, hashing or copying.
+other blocks already exist. Small legacy content objects still use whole-value I/O. Large files now use a
+logical sparse CoW index and bounded range operations; see [Sparse large files](LARGE_FILES.md).
 
 ## Physical encoding
 
@@ -133,9 +132,9 @@ migration, malformed locations, missing files, truncated data and hash corruptio
 Fault builds cover crashes around append/sync/publication plus partial writes,
 sync failures and metadata-publication failures.
 
-The namespace's existing 256 KiB file limit remains. Large-file logical extent
-indexes, range-only I/O, sparse extents, GC, segment reclamation, compression,
-remote synchronization and cloud-ack durability are separate work. This implementation
+The former namespace 256 KiB file limit is removed by [sparse large files](LARGE_FILES.md).
+GC, segment reclamation, compression, production remote synchronization and
+cloud-ack durability remain separate work. This implementation
 does not claim that the complete original filesystem plan is finished.
 
 ### Uncommitted-tail recovery regression

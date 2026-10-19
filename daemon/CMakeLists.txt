@@ -46,7 +46,7 @@ set_tests_properties(forkfsd_metadata_view PROPERTIES TIMEOUT 60)
 add_library(forkfs_namespace STATIC container.cpp backup_catalog.cpp namespace.cpp compaction.cpp maintenance.cpp)
 target_link_libraries(forkfs_namespace PUBLIC forkfs_metadata)
 target_compile_options(forkfs_namespace PRIVATE -Wall -Wextra -Wpedantic)
-foreach(suite file_io handles inode_handles inode_entries inode_contracts inode_create inode_size inode_xattrs inode_corruption parent_index transaction)
+foreach(suite large_files file_io handles inode_handles inode_entries inode_contracts inode_create inode_size inode_xattrs inode_corruption parent_index transaction)
     add_executable(forkfsd_${suite}_test tests/${suite}.cpp)
     target_link_libraries(forkfsd_${suite}_test PRIVATE forkfs_namespace)
     add_test(NAME forkfsd_${suite} COMMAND forkfsd_${suite}_test)
@@ -274,3 +274,14 @@ add_test(NAME forkfsd_revision_sync_mock COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_SOURCE_DIR}/scripts/tests/test_revision_sync_mock.py $<TARGET_FILE:forkfsd>
     --output ${CMAKE_BINARY_DIR}/revision-sync-mock-artifacts)
 set_tests_properties(forkfsd_revision_sync_mock PROPERTIES TIMEOUT 240 LABELS "metadata-regression;revision-sync")
+
+set_tests_properties(forkfsd_large_files PROPERTIES LABELS metadata-regression)
+
+add_test(NAME forkfsd_large_files_crash COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/content_segments.py $<TARGET_FILE:forkfsd>
+    $<TARGET_FILE:forkfsd_leveldb_fault_test> 700000)
+set_tests_properties(forkfsd_large_files_crash PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+
+add_test(NAME forkfsd_large_file_corruption COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/large_file_corruption.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_large_file_corruption PROPERTIES TIMEOUT 90 LABELS metadata-regression)
