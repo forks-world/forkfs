@@ -41,8 +41,9 @@ bundle regressions are included in the metadata-regression label on that job.
 Kernel-managed read buffers
 and directory packing have not been tested end to end.
 
-An unsigned extension bundle and resource loader are now built; installation
-and a mount command are not provided yet. Stable persistent IDs, accurate statfs,
+An unsigned extension bundle and resource loader are built. The containing app
+requests a mount on macOS 27+; installation and provisioning remain external.
+Stable persistent IDs, complete statfs accounting,
 complete errno mapping, large-directory performance, actual mount/data-cache
 semantics and broker/backing isolation remain prerequisites for deployment.
 Do not treat this adapter or its callback tests as a usable mounted filesystem
@@ -92,13 +93,16 @@ signing was attempted.
 
 The optional build now produces `ForkfsRevision.app` containing
 `Contents/PlugIns/ForkRevisionExtension.appex`. Its small native window can select
-a repository and validate the World or revision descriptor; it explicitly reports that
-nothing has been mounted. The app does not create descriptors, install the
-extension, open the repository engine or change repository data.
+a repository and validate the World or revision descriptor. Its Mount button uses
+FSClient mountSingleVolumeForResource on macOS 27+, retaining the selected
+security-scoped grant. It reports the actual completion result and mount path.
+On older systems this mount entry is unavailable. The app does not create
+descriptors, install the extension or open the repository engine.
 
 `forkfsd_fskit_bundle` validates the unsigned host/extension layout, identifiers,
 executables and declared sandbox entitlements. It is not a signature test.
-The host requests only user-selected read access; the extension still relies on
+The host requests user-selected read/write access and the FSKit mount entitlement;
+the extension still relies on
 FSKit's granted resource. Repeated probes derive the same container identifier
 from the resource path and selection, without opening LevelDB. World and revision
 identities use separate hash domains; existing revision identities are preserved. These identifiers
@@ -110,7 +114,7 @@ extension before the host and verifies the resulting signature. Existing output
 is refused. Ad-hoc signing is refused; the tool does not install or register
 anything. Signing and provisioning have not been exercised here. Profile/team
 requirements, OS registration and real mounts still need validation on a configured
-machine. The unsigned preview window is not evidence that FSKit can load the bundle.
+machine. The unsigned host window is not evidence that FSKit can load the bundle.
 
 ## World file I/O callback stage
 
