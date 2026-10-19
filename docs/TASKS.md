@@ -6,6 +6,14 @@
 [`MACOS_VALIDATION.md`](MACOS_VALIDATION.md)。本文件按时间保留历史测试数量与测量结果;
 旧的 93/142 等通过数不代表当前测试总数,应以当前 CI/测试输出为准。
 
+## 稀疏大文件实现（2026-10-19）
+
+- [x] 移除当前 LevelDB/ObjectStore 命名空间的 256 KiB 文件上限，保留单对象上限。
+- [x] 64 KiB 数据块、六层稀疏 CoW 索引、范围读写、稀疏扩容及安全截断。
+- [x] 接入路径、inode、句柄、属性调整、open-unlink、revision/fork 和 FSKit 回调。
+- [x] 本地备份/replay 与同步 mock 遍历新内容引用；格式与请求预算见 [LARGE_FILES.md](LARGE_FILES.md)。
+- [ ] 真实挂载后的 Git/构建/编辑器大文件负载验收及物理 GC。
+
 ## 用户态版本化文件系统整体设计（2026-10-08）
 
 依据 [USERSPACE_FILESYSTEM_DESIGN.md](USERSPACE_FILESYSTEM_DESIGN.md)。本节为新的统一核心

@@ -57,6 +57,7 @@ hardlink inode、symlink 文本和 mode。此时源 HTTP 进程已退出、源 f
 | 类别 | 验证 |
 | --- | --- |
 | 全量/增量 | 全祖先闭包、重复请求零对象重传、后续 revision 仅发送缺失对象 |
+| 大文件 | 700,000 字节文件、FFINOD05/FFFILE01/FFEXT001 typed 闭包与独立还原；native 适配器单文件物化上限 8 MiB |
 | Inventory | 多层 radix、精确缺失集、节点缓存、hash/count 损坏、重新计算外层哈希的结构错误 |
 | 数据传输 | 分批 pack、完整对象 prefix 持久化、中断重试、随机截断/位翻转、footer/EOF |
 | 目标独立验证 | footer 正确但 payload 损坏、hash 全正确但 inode 非法、inventory 漏依赖均不发布/ACK |

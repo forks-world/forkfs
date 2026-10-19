@@ -69,7 +69,7 @@ The API supports directories, hardlinks, symlinks, attributes, offset I/O,
 append/truncate, and open handles that retain unlinked files until final close.
 Container coordination serializes logical operations and protects handle state;
 the narrower storage locks do not yet establish parallel namespace requests.
-File content is currently bounded to 256 KiB per object/file. This library does
+Immutable objects remain bounded to 256 KiB; large files use sparse content indexes. This library does
 not expose a mounted filesystem or install an operating-system frontend.
 
 Standalone Release validation includes file I/O, handle lifetime and transaction
@@ -270,8 +270,8 @@ Size updates share the path/inode/handle attribute transaction: growing a file
 zero-fills its suffix, shrinking drops the suffix, and hard links observe the same
 content and size. A resize updates mtime unless the transaction supplies an explicit
 mtime. An unchanged size alone does not publish a transaction. Directories reject
-size with EISDIR, symbolic links with EINVAL, and sizes beyond the 256 KiB prototype
-limit with EFBIG. Handle size updates require a writable handle (EBADF otherwise),
+size with EISDIR, symbolic links with EINVAL, and sizes beyond INT64_MAX
+with EFBIG. Handle size updates require a writable handle (EBADF otherwise),
 including when that handle retains an unlinked inode. Errors leave all requested
 attributes and content unchanged. The inode-size regression runs in metadata CI.
 
@@ -482,5 +482,11 @@ Data is synchronized before metadata publication. Backup packs still contain ful
 portable bytes and restore reconstructs the segmented layout. See
 [physical format, migration and limits](../docs/CONTENT_SEGMENTS.md).
 
-The existing 256 KiB namespace file limit and whole-value preparation remain;
-segmented backing does not yet provide large-file range-only I/O or data GC.
+Large-file range I/O is implemented above the segmented backing through sparse
+CoW indexes. Physical data GC remains unimplemented.
+
+## Sparse large files
+
+Regular files now support sparse CoW content indexes, bounded range I/O and logical
+sizes up to INT64_MAX. The old 256 KiB limit applies to individual immutable objects,
+not files. See [format, request limits and validation](../docs/LARGE_FILES.md).

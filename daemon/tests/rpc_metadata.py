@@ -87,6 +87,28 @@ with tempfile.TemporaryDirectory(prefix='ffmeta-', dir='/tmp') as tmp:
     proc = start()
     try:
         request('fs-init')
+        request('fs-write', '/large', b'head')
+        far = (1 << 40) + 65535
+        request('fs-write-at', '/large', str(far), b'XYZ')
+        assert request('fs-read-at', '/large', str(far-1), '5') == b'\0XYZ'
+        assert obj('fs-stat', '/large')['size'] == far+3
+        request('fs-truncate', '/large', '65537')
+        request('fs-truncate', '/large', str(far+3))
+        assert request('fs-read-at', '/large', str(far), '3') == bytes(3)
+        request('fs-unlink', '/large')
+        request('fs-write', '/stream', b'A' * 600000)
+        request('fs-append', '/stream', b'B' * 600000)
+        stream_session = obj('session-open', '60000')['session']
+        stream = obj('fs-open', '/stream', 'r', session=stream_session)['handle']
+        first = request('fs-hread-next', stream, str(2**64-1), session=stream_session)
+        assert len(first) == 1024*1024-4
+        assert obj('fs-hseek', stream, '0', 'cur', session=stream_session)['offset'] == len(first)
+        second = request('fs-hread-next', stream, str(2**64-1), session=stream_session)
+        assert first + second == b'A' * 600000 + b'B' * 600000
+        assert request('fs-hread-next', stream, '1', session=stream_session) == b''
+        assert request('fs-read-at', '/stream', '0', str(2**64-1)) == first
+        request('session-close', stream_session)
+        request('fs-unlink', '/stream')
         request('fs-write', '/file', b'abc')
         request('fs-link', '/file', '/alias')
         inode = obj('fs-stat', '/file')['inode_id']
@@ -119,7 +141,7 @@ with tempfile.TemporaryDirectory(prefix='ffmeta-', dir='/tmp') as tmp:
                     'size=18446744073709551616', 'accessed_ns=9223372036854775808',
                     'created_ns=9223372036854775808', 'modified_ns=-1', 'uid=1=2']:
             request('fs-isetattr', inode, bad, error=errno.EINVAL)
-        request('fs-isetattr', inode, 'uid=7,size=262145', error=errno.EFBIG)
+        request('fs-isetattr', inode, 'uid=7,size=18446744073709551615', error=errno.EFBIG)
         request('fs-hsetattr', reader, 'uid=7,size=2', session=session, error=errno.EBADF)
         request('fs-isetattr', inode, 'size=2', revision='base', error=errno.EROFS)
         request('fs-istat', 'bad-id', error=errno.EINVAL)

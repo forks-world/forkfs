@@ -101,8 +101,8 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         cli('fs-append','/src/file',data,'--revision','base',ok=False)
         for fields in [['fs-write-at','/offset','-1',b'x'],
                        ['fs-read-at','/offset','0','18446744073709551616'],
-                       ['fs-truncate','/offset','262145'],['fs-truncate','/offset','1x'],
-                       ['fs-write-at','/offset','262144',b'x']]:raw(fields,ok=False)
+                       ['fs-truncate','/offset','18446744073709551615'],['fs-truncate','/offset','1x'],
+                       ['fs-write-at','/offset','9223372036854775807',b'x']]:raw(fields,ok=False)
         data.write_bytes(b'handle-original');cli('fs-write','/handle',data)
         handle=json.loads(cli('fs-open','/handle','rw'))['handle']
         second=json.loads(cli('fs-open','/handle','r'))['handle']
@@ -124,7 +124,7 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         cli('fs-open','/src/file','rw','--revision','base',ok=False)
         cli('fs-close',revision_handle,'--revision','base')
         before=json.loads(cli('status'))['last_committed_seq']
-        for fields in [['unknown'],['fs-write','/x'],['fs-write','/x',b'x'*(256*1024+1)],
+        for fields in [['unknown'],['fs-write','/x'],['fs-write-at','/x','9223372036854775807',b'x'],
                        ['fs-mkdir','/bad\0name'],['status','--world','work']]:
             raw(fields,ok=False)
         assert json.loads(cli('status'))['last_committed_seq']==before

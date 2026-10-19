@@ -21,6 +21,7 @@ public:
     std::vector<std::string> page(const std::string& prefix,const std::string& after,size_t limit) const;
     bool contains(const std::string& key) const;
     Bytes get(const std::string& key) const;
+    Bytes object(const ObjectId& id) const {return journal_.get_object(id);}
     std::vector<std::string> keys(const std::string& prefix) const;
     Map references() const;
     bool legacy() const {return legacy_;}

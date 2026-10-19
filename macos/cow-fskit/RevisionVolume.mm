@@ -1,5 +1,6 @@
 #import "RevisionVolume.h"
 #include "namespace.h"
+#include "file_content.h"
 #include <algorithm>
 #include <cstring>
 #include <unistd.h>
@@ -254,7 +255,7 @@ struct WorldEnumeration {
 }
 - (void)readFromFile:(FSItem *)item offset:(off_t)offset length:(size_t)length intoBuffer:(FSMutableFileDataBuffer *)buffer replyHandler:(void (^)(size_t,NSError *))reply {
     if(offset<0 || !buffer){reply(0,err(EINVAL));return;}
-    @synchronized(self){try{auto it=[self checked:item];if(it.type!=FSItemTypeFile){reply(0,err(it.type==FSItemTypeDirectory?EISDIR:EINVAL));return;}auto data=it.handle?_view->handle_read(it.handle.UTF8String,offset,MIN(length,buffer.length)):_view->read_inode(it.inode.UTF8String,offset,MIN(length,buffer.length));if(!data.empty()){if(!buffer.mutableBytes){reply(0,err(EFAULT));return;}memcpy(buffer.mutableBytes,data.data(),data.size());}reply(data.size(),nil);}catch(const std::system_error& e){reply(0,err(e.code().value()));}catch(const std::exception&){reply(0,err(EIO));}}
+    @synchronized(self){try{auto it=[self checked:item];if(it.type!=FSItemTypeFile){reply(0,err(it.type==FSItemTypeDirectory?EISDIR:EINVAL));return;}auto data=it.handle?_view->handle_read(it.handle.UTF8String,offset,std::min<uint64_t>(MIN(length,buffer.length),forkfs::FileContent::max_io)):_view->read_inode(it.inode.UTF8String,offset,std::min<uint64_t>(MIN(length,buffer.length),forkfs::FileContent::max_io));if(!data.empty()){if(!buffer.mutableBytes){reply(0,err(EFAULT));return;}memcpy(buffer.mutableBytes,data.data(),data.size());}reply(data.size(),nil);}catch(const std::system_error& e){reply(0,err(e.code().value()));}catch(const std::exception&){reply(0,err(EIO));}}
 }
 // Route all names through the versioned inode; do not use AppleDouble sidecars.
 - (void)getXattrNamed:(FSFileName *)name ofItem:(FSItem *)item replyHandler:(void (^)(NSData *,NSError *))reply {
@@ -299,8 +300,8 @@ struct WorldEnumeration {
         auto it=[self checked:item];if(_readOnly){reply(0,err(EROFS));return;}
         if(it.type!=FSItemTypeFile){reply(0,err(it.type==FSItemTypeDirectory?EISDIR:EINVAL));return;}
         if(!contents || offset<0){reply(0,err(EINVAL));return;}
-        if((uint64_t)offset>256*1024 || contents.length>256*1024-(uint64_t)offset){reply(0,err(EFBIG));return;}
-        std::vector<unsigned char> bytes(contents.length);if(contents.length)memcpy(bytes.data(),contents.bytes,contents.length);
+        if(contents.length>uint64_t(INT64_MAX)-(uint64_t)offset){reply(0,err(EFBIG));return;}
+        std::vector<unsigned char> bytes(std::min<uint64_t>(contents.length,forkfs::FileContent::max_io));if(!bytes.empty())memcpy(bytes.data(),contents.bytes,bytes.size());
         _view->handle_write(it.handle.UTF8String,offset,bytes);reply(bytes.size(),nil);
     }catch(const std::system_error& e){reply(0,err(e.code().value()));}catch(const std::exception&){reply(0,err(EIO));}}
 }
