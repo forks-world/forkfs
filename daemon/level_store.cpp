@@ -768,6 +768,19 @@ std::string LevelStore::collect(const std::string& input,const std::string& chec
     auto source=std::make_unique<LevelStore>(path);source->healthy();source->verify();
     need(source->physical_format_>=5,"GC requires the segmented layout");
     const bool reset=!checkpoint.empty(),pinned=source->replay_enabled_ && !reset;
+    // Read and validate under the source lease that remains held through copying;
+    // an earlier recovery lease may have observed a different replay generation.
+    std::optional<std::string> validated_done_receipt;
+    if(!reset){
+        auto bytes=gc_checkpoint::read_file(fs::path(path)/"GC-DONE",32*1024);
+        if(!bytes.empty()){
+            auto receipt=gc_checkpoint::decode(bytes);
+            need(receipt.repository==path && recovery_hex(receipt.identity)==source->repository_ &&
+                 source->sequence_.load()>=receipt.sequence && source->replay_start_==receipt.sequence && source->replay_base_==receipt.anchor,
+                 "GC receipt does not match the active repository generation");
+            validated_done_receipt=std::move(bytes);
+        }
+    }
     if(reset){auto parent=fs::canonical(fs::absolute(checkpoint).parent_path());
         auto relative=parent.lexically_relative(path);need(parent!=path && (relative.empty() || *relative.begin()==".."),"GC checkpoint must be outside the repository");
         need(!gc_checkpoint::exists_nofollow(requested_checkpoint),"GC checkpoint destination must not exist");}
@@ -901,6 +914,7 @@ std::string LevelStore::collect(const std::string& input,const std::string& chec
     for(const auto& name:{"BACKUP-TASKS",".forkfs-fskit-world",".forkfs-fskit-revision"}){
         if(auto value=read_control(fs::path(path)/name,std::string(name)=="BACKUP-TASKS"?2*1024*1024:4096))write_control(fs::path(staging)/name,*value);
     }
+    if(!reset && validated_done_receipt)write_control(fs::path(staging)/"GC-DONE",*validated_done_receipt);
     if(checkpoint_receipt)gc_checkpoint::write_atomic(fs::path(staging)/"GC-PENDING",gc_checkpoint::encode(*checkpoint_receipt));
     write_control(fs::path(staging)/"GC-READY",marker);
     need(unlink((staging+"/OWNERSHIP").c_str())==0 && link((path+"/OWNERSHIP").c_str(),(staging+"/OWNERSHIP").c_str())==0,"GC ownership handoff failed");

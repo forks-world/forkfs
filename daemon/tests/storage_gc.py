@@ -116,6 +116,16 @@ with tempfile.TemporaryDirectory(prefix='ff-gc-') as directory:
     corrupt=(corrupt_trial/'GC-PENDING').read_bytes()
     run('check',corrupt_trial,code=1);run('gc',corrupt_trial,'--checkpoint',corrupt_archive,code=1)
     assert (corrupt_trial/'GC-PENDING').read_bytes()==corrupt and not corrupt_archive.exists()
+    stale_done=root/'checkpoint-stale-done';shutil.copytree(db,stale_done);stale_archive=root/'stale-done.pack'
+    run('gc',stale_done,'--checkpoint',stale_archive)
+    bad_done=(stale_done/'GC-DONE').read_bytes();(stale_done/'GC-DONE').write_bytes(bad_done[:-1]+bytes([bad_done[-1]^1]))
+    bad_done=(stale_done/'GC-DONE').read_bytes();before=json.loads(run('check',stale_done))
+    run('gc',stale_done,code=1)
+    assert (stale_done/'GC-DONE').read_bytes()==bad_done
+    after=json.loads(run('check',stale_done))
+    for key in ('repository_id','last_committed_seq','indexed_objects','object_roots'):assert after[key]==before[key]
+    verify(stale_done)
+    assert not list(root.glob('checkpoint-stale-done.gc-*'))
     mode_trial=root/'directory-mode';shutil.copytree(db,mode_trial);os.chmod(mode_trial,0o750)
     before=os.stat(mode_trial);run('gc',mode_trial);after=os.stat(mode_trial)
     assert (after.st_uid,after.st_gid,after.st_mode&0o7777)==(before.st_uid,before.st_gid,0o750)
@@ -183,6 +193,35 @@ with tempfile.TemporaryDirectory(prefix='ff-gc-') as directory:
     fresh=root/'fresh';reset=json.loads(run('gc',db,'--checkpoint',fresh))
     assert reset['new_replay_generation'] and not reset['replay_pins_all_objects'],reset
     recovery=root/'recovery';run('replay',fresh,recovery);verify(recovery)
+    receipt_trial=root/'checkpoint-receipt-retention';shutil.copytree(db,receipt_trial)
+    receipt_archive=root/'retained-checkpoint.pack';first_report=json.loads(run('gc',receipt_trial,'--checkpoint',receipt_archive))
+    offline_archive=root/'retained-checkpoint.offline';receipt_archive.rename(offline_archive)
+    followup=root/'receipt-followup';followup.write_bytes(b'write after checkpoint')
+    run('fs-write',receipt_trial,'/file',followup)
+    assert run('fs-cat',receipt_trial,'/file')==followup.read_bytes()
+    run('gc',receipt_trial)
+    assert run('fs-cat',receipt_trial,'/file')==followup.read_bytes()
+    offline_archive.rename(receipt_archive)
+    assert json.loads(run('gc',receipt_trial,'--checkpoint',receipt_archive))==first_report
+    for stage in ('gc_before_swap','gc_after_swap'):
+        run('gc',receipt_trial,binary=FAULT,env=dict(os.environ,FORKFS_TEST_CRASH=stage),code=86)
+        assert json.loads(run('gc',receipt_trial,'--checkpoint',receipt_archive))==first_report
+        assert run('fs-cat',receipt_trial,'/file')==followup.read_bytes()
+        assert not list(root.glob(receipt_trial.name+'.gc-*'))
+    old_receipt=(receipt_trial/'GC-DONE').read_bytes()
+    next_archive=root/'replacement-checkpoint.pack';second_report=json.loads(run('gc',receipt_trial,'--checkpoint',next_archive))
+    assert second_report['new_replay_generation'] and next_archive.is_file()
+    receipt_bytes=(receipt_trial/'GC-DONE').read_bytes()
+    assert str(receipt_archive).encode() not in receipt_bytes and str(next_archive).encode() in receipt_bytes
+    assert run('fs-cat',receipt_trial,'/file')==followup.read_bytes()
+    # A checksummed receipt from the previous generation must not be propagated.
+    (receipt_trial/'GC-DONE').write_bytes(old_receipt)
+    run('gc',receipt_trial,code=1)
+    assert (receipt_trial/'GC-DONE').read_bytes()==old_receipt
+    assert not list(root.glob(receipt_trial.name+'.gc-*'))
+    assert run('fs-cat',receipt_trial,'/file')==followup.read_bytes()
+    (receipt_trial/'GC-DONE').write_bytes(receipt_bytes)
+    assert json.loads(run('gc',receipt_trial,'--checkpoint',next_archive))==second_report
     # Deterministic quota rejection leaves committed state intact.
     usage=sum(p.stat().st_size for p in db.glob('DATA-*.seg'))
     run('capacity',db,usage+4096,0)
