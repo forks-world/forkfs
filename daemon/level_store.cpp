@@ -1,8 +1,12 @@
 #include "revision.h"
 #include "level_store.h"
 #include "object_store.h"
+#include "repository_owner.h"
+#include "file_content.h"
 #include "replay_format.h"
 #include "replay_validation.h"
+#include "repository_budget.h"
+#include "gc_checkpoint.h"
 #ifndef __APPLE__
 #include <sys/syscall.h>
 #include <linux/fs.h>
@@ -101,6 +105,8 @@ void LevelStore::create(const std::string& path) {
 }
 LevelStore::LevelStore(const std::string& path,size_t object_cache_bytes):LevelStore(path,false,object_cache_bytes) {}
 LevelStore::LevelStore(const std::string& path,bool initialize,size_t object_cache_bytes) {
+    owner_=std::make_shared<RepositoryOwner>(path);
+    need(!gc_checkpoint::exists_nofollow(path+"/GC-PENDING"),"GC checkpoint publication is pending; retry gc with its original --checkpoint target");
     leveldb::Options options;options.create_if_missing=initialize;options.error_if_exists=initialize;
     metrics_=std::make_unique<StoreIoMetrics>();env_=std::make_unique<TimedEnv>(*metrics_);options.env=env_.get();
     options.paranoid_checks=true;options.compression=leveldb::kNoCompression;
@@ -176,6 +182,17 @@ std::string LevelStore::logical_value(const leveldb::ReadOptions& options,const 
 }
 void LevelStore::publish(const replay::Batch& input){
     // Caller owns the writer lock, or the unpublished recovery destination.
+    // Admission failures leave the current owner healthy: no append has begun.
+    if(object_store_->has_capacity_budget()){
+        std::vector<size_t> new_chunk_sizes;std::set<std::string> chunks;
+        for(const auto& op:input.ops)if(!op.erase && op.key.starts_with("O/")){
+            auto count=std::max<size_t>(1,(op.value.size()+65535)/65536);
+            for(size_t i=0;i<count;++i){auto payload=op.value.substr(i*65536,65536),hash=replay::hash(payload);std::string existing;
+                if(chunks.insert(hash).second){leveldb::ReadOptions read;read.verify_checksums=true;auto found=db_->Get(read,"C/"+hash,&existing);if(found.IsNotFound())new_chunk_sizes.push_back(payload.size());else status(found,"read capacity chunk index");}
+            }
+        }
+        object_store_->admit(object_store_->append_cost(new_chunk_sizes));
+    }
     try{
         leveldb::WriteBatch metadata;ObjectStore::Locations pending;auto next_format=physical_format_.load();
         leveldb::ReadOptions read;read.verify_checksums=true;
@@ -668,3 +685,268 @@ std::string LevelStore::revision_point(const std::string& name) const {
         std::to_string(index.event)+",\"chain_hash\":\""+hex(index.event_head)+"\"}}\n";
 }
 }
+
+namespace forkfs {
+std::string LevelStore::collect(const std::string& input,const std::string& checkpoint,bool dry_run){
+    namespace fs=std::filesystem;
+    struct stat entry{};need(lstat(input.c_str(),&entry)==0 && S_ISDIR(entry.st_mode),"GC requires a real repository directory");
+    const auto path=fs::canonical(input).string();
+    struct stat source_directory{};need(lstat(path.c_str(),&source_directory)==0 && S_ISDIR(source_directory.st_mode),"GC requires a real repository directory");
+    need(source_directory.st_uid==geteuid(),"GC requires invoking as the repository owner; cross-identity GC is unsupported");
+    const auto repository_mode=source_directory.st_mode&07777;const auto repository_gid=source_directory.st_gid;
+    const auto canonical_checkpoint=[&](){
+        if(checkpoint.empty())return std::string{};auto requested=fs::absolute(checkpoint);
+        need(!requested.filename().empty() && requested.filename()!="." && requested.filename()!="..","invalid GC checkpoint destination");
+        return (fs::canonical(requested.parent_path())/requested.filename()).string();
+    };
+    const auto requested_checkpoint=canonical_checkpoint();
+    // A post-exchange checkpoint is completed under the stable owner lease
+    // before any ordinary LevelStore can open the repository.
+    {
+        RepositoryOwner recovery_owner(path);
+        const auto pending_bytes=gc_checkpoint::read_file(fs::path(path)/"GC-PENDING",32*1024);
+        const auto done_bytes=gc_checkpoint::read_file(fs::path(path)/"GC-DONE",32*1024);
+        auto verify_receipt=[&](const gc_checkpoint::Receipt& receipt,bool allow_advanced){
+            need(receipt.repository==path,"GC receipt belongs to another repository path");
+            leveldb::Options options;options.create_if_missing=false;leveldb::DB* raw=nullptr;
+            status(leveldb::DB::Open(options,path,&raw),"open repository for GC receipt recovery");std::unique_ptr<leveldb::DB> db(raw);
+            leveldb::ReadOptions read;read.verify_checksums=true;
+            std::string identity,sequence,start,anchor;
+            status(db->Get(read,"M/repository",&identity),"read GC receipt repository identity");
+            status(db->Get(read,"M/sequence",&sequence),"read GC receipt sequence");
+            status(db->Get(read,"M/replay/start",&start),"read GC receipt generation");
+            status(db->Get(read,"M/replay/base",&anchor),"read GC receipt anchor");
+            need(identity==receipt.identity && number(sequence)>=receipt.sequence && (allow_advanced || number(sequence)==receipt.sequence) &&
+                 number(start)==receipt.sequence && anchor==receipt.anchor,
+                 "GC receipt does not match the active repository generation");
+        };
+        auto cleanup_retired=[&](const gc_checkpoint::Receipt& receipt){
+            struct stat active_owner{};need(fstat(recovery_owner.fd,&active_owner)==0,"GC recovery owner stat failed");
+            const auto parent=fs::path(path).parent_path();const auto prefix=fs::path(path).filename().string()+".gc-";
+            std::string repository_hex;const char* digits="0123456789abcdef";for(unsigned char c:receipt.identity){repository_hex+=digits[c>>4];repository_hex+=digits[c&15];}
+            const auto ready_marker="FFGC0001"+repository_hex+recovery_hex(replay::hash(path));
+            const auto prepared_marker="FFGCP001"+repository_hex+recovery_hex(replay::hash(path));
+            for(const auto& item:fs::directory_iterator(parent))if(item.path().filename().string().starts_with(prefix)){
+                struct stat dir{},owner{};if(lstat(item.path().c_str(),&dir)<0 || !S_ISDIR(dir.st_mode))continue;
+                const auto bound=(item.path()/"GC-SOURCE-OWNERSHIP").string();
+                const bool same_source=lstat(bound.c_str(),&owner)==0 && S_ISREG(owner.st_mode) && owner.st_dev==active_owner.st_dev && owner.st_ino==active_owner.st_ino;
+                bool safe=false;
+                if(same_source && gc_checkpoint::read_file(item.path()/"GC-PREPARED",256)==prepared_marker)safe=true;
+                if(!safe){const auto owned=(item.path()/"OWNERSHIP").string();const bool same_generation=lstat(owned.c_str(),&owner)==0 && S_ISREG(owner.st_mode) && owner.st_dev==active_owner.st_dev && owner.st_ino==active_owner.st_ino;
+                    if(same_generation && gc_checkpoint::read_file(item.path()/"GC-READY",256)==ready_marker)safe=true;}
+                if(safe)fs::remove_all(item.path());
+            }
+            gc_checkpoint::sync_directory(parent);
+        };
+        if(!pending_bytes.empty()){
+            need(!dry_run,"GC checkpoint publication is pending; gc-plan will not recover it");
+            auto receipt=gc_checkpoint::decode(pending_bytes);verify_receipt(receipt,false);
+            need(!requested_checkpoint.empty() && requested_checkpoint==receipt.archive,
+                 "GC checkpoint recovery requires the original --checkpoint target");
+            auto capacity=RepositoryBudget::load(path);
+            gc_checkpoint::publish_archive(fs::path(path)/"GC-BASELINE.pack",receipt,capacity.min_free);fault("gc_after_checkpoint_publish");
+            gc_checkpoint::write_atomic(fs::path(path)/"GC-DONE",gc_checkpoint::encode(receipt));fault("gc_after_checkpoint_complete");
+            if(unlink((path+"/GC-PENDING").c_str())<0)throw std::system_error(errno,std::generic_category(),"remove completed GC receipt");
+            gc_checkpoint::sync_directory(path);
+            if(unlink((path+"/GC-BASELINE.pack").c_str())<0 && errno!=ENOENT)throw std::system_error(errno,std::generic_category(),"remove GC checkpoint baseline");
+            gc_checkpoint::sync_directory(path);
+            cleanup_retired(receipt);return receipt.report;
+        }
+        if(!requested_checkpoint.empty() && !done_bytes.empty()){
+            auto receipt=gc_checkpoint::decode(done_bytes);
+            if(receipt.repository==path && receipt.archive==requested_checkpoint){
+                need(!dry_run,"GC checkpoint already completed; gc-plan will not replay checkpoint state");
+                verify_receipt(receipt,true);uint64_t size=0;
+                need(gc_checkpoint::fingerprint(requested_checkpoint,&size)==receipt.fingerprint && size==receipt.size,
+                     "completed GC checkpoint archive no longer matches its receipt");
+                if(unlink((path+"/GC-BASELINE.pack").c_str())<0 && errno!=ENOENT)throw std::system_error(errno,std::generic_category(),"remove GC checkpoint baseline");
+                gc_checkpoint::sync_directory(path);
+                cleanup_retired(receipt);return receipt.report;
+            }
+        }
+    }
+    auto source=std::make_unique<LevelStore>(path);source->healthy();source->verify();
+    need(source->physical_format_>=5,"GC requires the segmented layout");
+    const bool reset=!checkpoint.empty(),pinned=source->replay_enabled_ && !reset;
+    // Read and validate under the source lease that remains held through copying;
+    // an earlier recovery lease may have observed a different replay generation.
+    std::optional<std::string> validated_done_receipt;
+    if(!reset){
+        auto bytes=gc_checkpoint::read_file(fs::path(path)/"GC-DONE",32*1024);
+        if(!bytes.empty()){
+            auto receipt=gc_checkpoint::decode(bytes);
+            need(receipt.repository==path && recovery_hex(receipt.identity)==source->repository_ &&
+                 source->sequence_.load()>=receipt.sequence && source->replay_start_==receipt.sequence && source->replay_base_==receipt.anchor,
+                 "GC receipt does not match the active repository generation");
+            validated_done_receipt=std::move(bytes);
+        }
+    }
+    if(reset){auto parent=fs::canonical(fs::absolute(checkpoint).parent_path());
+        auto relative=parent.lexically_relative(path);need(parent!=path && (relative.empty() || *relative.begin()==".."),"GC checkpoint must be outside the repository");
+        need(!gc_checkpoint::exists_nofollow(requested_checkpoint),"GC checkpoint destination must not exist");}
+    leveldb::ReadOptions options;options.verify_checksums=true;
+    std::map<std::string,std::string> roots;std::set<Id> live;std::set<Id> manifests;
+    std::unique_ptr<leveldb::Iterator> it(source->db_->NewIterator(options));
+    for(it->Seek("R/");it->Valid() && it->key().starts_with("R/");it->Next())roots.emplace(it->key().ToString(),it->value().ToString());
+    status(it->status(),"GC root scan");
+    const std::string history("R/\0forkfs-history/",18),ns("\0forkfs/",8),alias=history+"object/";
+    auto read_object=[&](const Id& reference){auto value=source->object(reference);live.insert(reference);return value;};
+    auto known_inode=[&](const Bytes& value){
+        need(value.size()>=48 && value.size()<=128*1024,"GC invalid inode size");
+        std::string version(value.begin(),value.begin()+8);
+        need(version=="FFINOD01" || version=="FFINOD02" || version=="FFINOD03" || version=="FFINOD04" || version=="FFINOD05","GC unsupported inode codec");
+        if(version=="FFINOD03" || version=="FFINOD04" || version=="FFINOD05"){
+            need(value.size()>=80,"GC truncated inode");auto flags=static_cast<unsigned>(value[48])|(unsigned(value[49])<<8)|(unsigned(value[50])<<16)|(unsigned(value[51])<<24);
+            need(version=="FFINOD05"?flags==2:flags<=1,"GC unknown inode flags");
+        }
+    };
+    auto manifest=[&](const Id& reference){if(!manifests.insert(reference).second)return;
+        NamespaceView::verify_manifest(read_object,reference,[&](const std::string& key,const Id& value){if(key.starts_with(ns+"inode/"))known_inode(read_object(value));});};
+    RevisionDag dag([&](const Id& reference){return RevisionRecord::read(read_object,reference);},manifest);
+    for(const auto& [key,value]:roots){
+        if(key.starts_with(alias)){need(key.substr(alias.size())==recovery_hex(value),"GC noncanonical staging alias");continue;}
+        auto reference=id(value);auto payload=read_object(reference);
+        if(key.starts_with(history+"world/"))manifest(reference);
+        else if(key.starts_with(history+"revision/"))dag.validate(reference);
+        else if(key.starts_with(history+"base/")){need(payload.size()==32,"GC invalid World base");Id base{};std::copy(payload.begin(),payload.end(),base.begin());dag.validate(base);}
+        else if((key.starts_with(history+"orphan/") && key.ends_with("/content")) || key.starts_with("R/"+ns+"content/")){
+            auto inode_key=key.starts_with(history+"orphan/")?key.substr(0,key.size()-7)+"inode":"R/"+ns+"inode/"+key.substr(("R/"+ns+"content/").size());
+            auto found=roots.find(inode_key);need(found!=roots.end(),"GC content has no inode");auto inode=read_object(id(found->second));known_inode(inode);
+            if(std::string(inode.begin(),inode.begin()+8)=="FFINOD05"){
+                uint64_t size=0;for(unsigned i=0;i<8;++i)size|=uint64_t(inode[24+i])<<(8*i);FileContent(read_object,payload,size,true).verify();
+            }
+        }
+    }
+    if(pinned)for(it->Seek("O/");it->Valid() && it->key().starts_with("O/");it->Next())live.insert(id(it->key().ToString().substr(2)));
+    status(it->status(),"GC object scan");
+    uint64_t kept_roots=0;for(const auto& [key,value]:roots)if(!key.starts_with(alias) || live.contains(id(value)))++kept_roots;
+    uint64_t before_bytes=0;for(const auto& item:fs::directory_iterator(path))if(item.is_regular_file() && item.path().filename().string().starts_with("DATA-") && item.path().extension()==".seg")before_bytes+=item.file_size();
+    const auto sequence=source->sequence_.load(),before_objects=source->objects_.load();
+    auto report=[&](uint64_t after_bytes,bool applied){return "{\"applied\":"+std::string(applied?"true":"false")+",\"sequence\":"+std::to_string(sequence)+",\"objects_before\":"+std::to_string(before_objects)+",\"objects_after\":"+std::to_string(live.size())+",\"roots_before\":"+std::to_string(roots.size())+",\"roots_after\":"+std::to_string(kept_roots)+",\"data_bytes_before\":"+std::to_string(before_bytes)+",\"data_bytes_after\":"+(applied?std::to_string(after_bytes):"null")+",\"replay_pins_all_objects\":"+(pinned?"true":"false")+",\"new_replay_generation\":"+(reset?"true":"false")+"}";};
+    if(dry_run)return report(0,false);
+    RepositoryBudget capacity=RepositoryBudget::load(path);
+    // Estimate the exact unique chunks the copied generation will append.
+    // Host-space reservation accounts for the temporary second generation;
+    // max_data is enforced against staged DATA bytes by ObjectStore itself.
+    std::vector<size_t> staged_chunk_sizes;std::set<std::string> staged_chunks;
+    for(const auto& reference:live){auto payload=source->object(reference);auto count=std::max<size_t>(1,(payload.size()+65535)/65536);
+        for(size_t i=0;i<count;++i){auto offset=i*65536,length=std::min<size_t>(65536,payload.size()-offset);
+            std::string chunk=length?std::string(reinterpret_cast<const char*>(payload.data()+offset),length):std::string{};auto hash=replay::hash(chunk);
+            if(staged_chunks.insert(hash).second)staged_chunk_sizes.push_back(chunk.size());}
+    }
+    const uint64_t staging_reserve=ObjectStore::new_store_cost(staged_chunk_sizes);
+    uint64_t host_reserve=staging_reserve;
+    if(reset){
+        uint64_t metadata=0;
+        for(const auto& item:fs::directory_iterator(path))if(item.is_regular_file() && !item.path().filename().string().starts_with("DATA-")){
+            auto size=item.file_size();need(size<=UINT64_MAX-metadata,"GC metadata size overflow");metadata+=size;
+        }
+        need(staging_reserve<=UINT64_MAX-host_reserve,"GC checkpoint reserve overflow");host_reserve+=staging_reserve;
+        need(metadata<=UINT64_MAX-host_reserve,"GC checkpoint reserve overflow");host_reserve+=metadata;
+        constexpr uint64_t archive_overhead=1024*1024;need(archive_overhead<=UINT64_MAX-host_reserve,"GC checkpoint reserve overflow");host_reserve+=archive_overhead;
+    }
+    // The owner lease excludes a live collector; every matching sibling is a
+    // leftover staging or exchanged-out generation from an interrupted run.
+    const auto marker=std::string("FFGC0001")+source->repository_+recovery_hex(replay::hash(path));
+    auto read_control=[](const fs::path& file,size_t limit)->std::optional<std::string>{
+        int fd=open(file.c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);if(fd<0){if(errno==ENOENT)return std::nullopt;throw std::system_error(errno,std::generic_category(),"open GC control file");}
+        struct Close{int fd;~Close(){close(fd);}} close_fd{fd};struct stat st{};
+        need(fstat(fd,&st)==0 && S_ISREG(st.st_mode) && st.st_size>=0 && uint64_t(st.st_size)<=limit,"GC invalid control file");
+        std::string value(st.st_size,0);size_t at=0;while(at<value.size()){auto n=::read(fd,value.data()+at,value.size()-at);if(n<0 && errno==EINTR)continue;need(n>0,"GC truncated control file");at+=n;}return value;
+    };
+    auto write_control=[](const fs::path& file,const std::string& value){
+        auto temporary=file.string()+".tmp-XXXXXX";int fd=mkstemp(temporary.data());if(fd<0)throw std::system_error(errno,std::generic_category(),"create GC control file");
+        try{size_t at=0;while(at<value.size()){auto n=::write(fd,value.data()+at,value.size()-at);if(n<0 && errno==EINTR)continue;if(n<=0)throw std::system_error(n<0?errno:EIO,std::generic_category(),"write GC control file");at+=n;}if(fsync(fd)<0)throw std::system_error(errno,std::generic_category(),"sync GC control file");close(fd);fd=-1;
+            if(rename(temporary.c_str(),file.c_str())<0)throw std::system_error(errno,std::generic_category(),"publish GC control file");sync_parent(file.string());}
+        catch(...){if(fd>=0)close(fd);unlink(temporary.c_str());throw;}
+    };
+    struct stat owner_stat{};need(fstat(source->owner_->fd,&owner_stat)==0,"GC owner stat failed");
+    const auto parent=fs::path(path).parent_path();const auto prefix=fs::path(path).filename().string()+".gc-";
+    const auto prepared_marker=std::string("FFGCP001")+source->repository_+recovery_hex(replay::hash(path));
+    for(const auto& item:fs::directory_iterator(parent))if(item.path().filename().string().starts_with(prefix)){
+        struct stat dir{},owner{};if(lstat(item.path().c_str(),&dir)<0 || !S_ISDIR(dir.st_mode))continue;
+        const auto bound=(item.path()/"GC-SOURCE-OWNERSHIP").string();
+        const bool same_source=lstat(bound.c_str(),&owner)==0 && S_ISREG(owner.st_mode) && owner.st_dev==owner_stat.st_dev && owner.st_ino==owner_stat.st_ino;
+        bool safe=false;
+        if(same_source && read_control(item.path()/"GC-PREPARED",256)==prepared_marker)safe=true;
+        if(!safe){const auto owned=(item.path()/"OWNERSHIP").string();const bool same_generation=lstat(owned.c_str(),&owner)==0 && S_ISREG(owner.st_mode) && owner.st_dev==owner_stat.st_dev && owner.st_ino==owner_stat.st_ino;
+            if(same_generation && read_control(item.path()/"GC-READY",256)==marker)safe=true;}
+        if(safe)fs::remove_all(item.path());
+    }
+    gc_checkpoint::sync_directory(parent);
+    RepositoryBudget{0,capacity.min_free}.admit(path,0,host_reserve);
+    auto staging=path+".gc-XXXXXX";need(mkdtemp(staging.data())!=nullptr,"create GC staging directory failed");
+    struct Cleanup{const std::string& path;bool swapped=false;~Cleanup(){if(!swapped){std::error_code ignored;fs::remove_all(path,ignored);}}} cleanup{staging};
+    write_control(fs::path(staging)/"GC-PREPARED",prepared_marker);sync_parent(staging);
+    need(link((path+"/OWNERSHIP").c_str(),(staging+"/GC-SOURCE-OWNERSHIP").c_str())==0,"bind GC staging directory to source lease");
+    gc_checkpoint::sync_directory(staging);sync_parent(staging);
+    if(capacity.enabled())capacity.save(staging);
+    uint64_t archive_estimate=105+69;
+    {
+        LevelStore target(staging,true,default_object_cache_bytes);replay::Batch batch;size_t pending=0;
+        auto flush=[&]{if(pending){target.publish(batch);batch.Clear();pending=0;fault("gc_copy_batch");}};
+        for(it->SeekToFirst();it->Valid();it->Next()){
+            auto key=it->key().ToString();if(key.starts_with("C/"))continue;
+            if(key.starts_with("O/") && !live.contains(id(key.substr(2))))continue;
+            if(key.starts_with(alias) && !live.contains(id(it->value().ToString())))continue;
+            if(reset && (key.starts_with("L/") || key.starts_with("M/replay/")))continue;
+            auto value=source->logical_value(options,key,it->value().ToString());
+            if(key=="M/objects")value=integer(live.size());if(key=="M/roots")value=integer(kept_roots);
+            if(reset && key=="M/format")value="FFLDB001";
+            if(reset){const auto row=uint64_t(45)+key.size()+value.size();need(row<=UINT64_MAX-archive_estimate,"GC checkpoint size overflow");archive_estimate+=row;}
+            batch.Put(key,value);pending+=key.size()+value.size();if(pending>=1024*1024)flush();
+        }
+        status(it->status(),"copy live GC records");flush();
+    }
+    it.reset();
+    std::optional<gc_checkpoint::Receipt> checkpoint_receipt;
+    {LevelStore target(staging);target.verify();target.verify_recovery_graph(options,sequence);
+        if(reset){
+            RepositoryBudget{0,capacity.min_free}.admit(staging,0,archive_estimate);
+            target.backup(staging+"/GC-BASELINE.pack");
+            uint64_t after_bytes=0;for(const auto& item:fs::directory_iterator(staging))if(item.is_regular_file() && item.path().filename().string().starts_with("DATA-") && item.path().extension()==".seg")after_bytes+=item.file_size();
+            std::string identity;status(target.db_->Get(options,"M/repository",&identity),"read GC checkpoint identity");
+            gc_checkpoint::Receipt receipt;receipt.repository=path;receipt.identity=identity;receipt.archive=requested_checkpoint;
+            receipt.report=report(after_bytes,true);receipt.sequence=target.replay_start_;receipt.anchor=target.replay_base_;
+            receipt.fingerprint=gc_checkpoint::fingerprint(staging+"/GC-BASELINE.pack",&receipt.size);checkpoint_receipt=std::move(receipt);
+        }}
+    fault("gc_after_verified");
+    for(const auto& name:{"BACKUP-TASKS",".forkfs-fskit-world",".forkfs-fskit-revision"}){
+        if(auto value=read_control(fs::path(path)/name,std::string(name)=="BACKUP-TASKS"?2*1024*1024:4096))write_control(fs::path(staging)/name,*value);
+    }
+    if(!reset && validated_done_receipt)write_control(fs::path(staging)/"GC-DONE",*validated_done_receipt);
+    if(checkpoint_receipt)gc_checkpoint::write_atomic(fs::path(staging)/"GC-PENDING",gc_checkpoint::encode(*checkpoint_receipt));
+    write_control(fs::path(staging)/"GC-READY",marker);
+    need(unlink((staging+"/OWNERSHIP").c_str())==0 && link((path+"/OWNERSHIP").c_str(),(staging+"/OWNERSHIP").c_str())==0,"GC ownership handoff failed");
+    struct stat staged_directory{};need(lstat(staging.c_str(),&staged_directory)==0 && S_ISDIR(staged_directory.st_mode),"GC staging directory disappeared");
+    if(staged_directory.st_gid!=repository_gid && chown(staging.c_str(),static_cast<uid_t>(-1),repository_gid)<0)
+        throw std::system_error(errno,std::generic_category(),"preserve GC repository group");
+    if(chmod(staging.c_str(),repository_mode)<0)throw std::system_error(errno,std::generic_category(),"preserve GC repository mode");
+    need(lstat(staging.c_str(),&staged_directory)==0 && S_ISDIR(staged_directory.st_mode) && staged_directory.st_uid==source_directory.st_uid &&
+         staged_directory.st_gid==repository_gid && (staged_directory.st_mode&07777)==repository_mode,"GC staging directory identity mismatch");
+    write_control(fs::path(path)/"GC-READY",marker);
+    sync_parent(staging+"/CURRENT");
+    if(unlink((staging+"/GC-SOURCE-OWNERSHIP").c_str())<0)throw std::system_error(errno,std::generic_category(),"remove GC staging source lease binding");
+    gc_checkpoint::sync_directory(staging);sync_parent(staging);
+    auto lease=source->owner_;source.reset();fault("gc_before_swap");
+#ifdef __APPLE__
+    int exchanged=renamex_np(path.c_str(),staging.c_str(),RENAME_SWAP);
+#else
+    int exchanged=static_cast<int>(syscall(SYS_renameat2,AT_FDCWD,path.c_str(),AT_FDCWD,staging.c_str(),RENAME_EXCHANGE));
+#endif
+    if(exchanged<0)throw std::system_error(errno,std::generic_category(),"atomic GC generation exchange");
+    cleanup.swapped=true;fault("gc_after_swap");sync_parent(path);fault("gc_after_parent_sync");
+    if(checkpoint_receipt){
+        fault("gc_before_checkpoint_publish");gc_checkpoint::publish_archive(fs::path(path)/"GC-BASELINE.pack",*checkpoint_receipt,capacity.min_free);
+        fault("gc_after_checkpoint_publish");gc_checkpoint::write_atomic(fs::path(path)/"GC-DONE",gc_checkpoint::encode(*checkpoint_receipt));
+        fault("gc_after_checkpoint_complete");
+        if(unlink((path+"/GC-PENDING").c_str())<0)throw std::system_error(errno,std::generic_category(),"remove completed GC receipt");gc_checkpoint::sync_directory(path);
+    }
+    uint64_t after_bytes=0;for(const auto& item:fs::directory_iterator(path))if(item.is_regular_file() && item.path().filename().string().starts_with("DATA-") && item.path().extension()==".seg")after_bytes+=item.file_size();
+    const auto result=checkpoint_receipt?checkpoint_receipt->report:report(after_bytes,true);
+    if(checkpoint_receipt && unlink((path+"/GC-BASELINE.pack").c_str())<0 && errno!=ENOENT)throw std::system_error(errno,std::generic_category(),"remove GC checkpoint baseline");
+    fs::remove_all(staging);sync_parent(path);if(checkpoint_receipt)gc_checkpoint::sync_directory(path);return result;
+}
+}
+
+namespace forkfs {std::pair<uint64_t,uint64_t> LevelStore::space() const {healthy();return object_store_->space();}}

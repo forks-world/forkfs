@@ -204,7 +204,7 @@ NamespaceView::Plan NamespaceView::compact_frozen(const Frozen& input) {
 }
 
 namespace forkfs {
-void NamespaceView::verify_manifest(const std::function<Bytes(const ObjectId&)>& read,const ObjectId& manifest) {
+void NamespaceView::verify_manifest(const std::function<Bytes(const ObjectId&)>& read,const ObjectId& manifest,const std::function<void(const std::string&,const ObjectId&)>& visit) {
     auto b=read(manifest);Map entries;
     if(b.size()==40 && !memcmp(b.data(),"FFTREE01",8)) {
         ObjectId root{};std::copy_n(b.data()+8,32,root.begin());need(root!=ObjectId{},"empty metadata tree root");
@@ -225,6 +225,7 @@ void NamespaceView::verify_manifest(const std::function<Bytes(const ObjectId&)>&
     }
     need(entries.contains(prefix+"root"),"manifest missing namespace root");
     for(const auto& [key,id]:entries){
+        if(visit)visit(key,id);
         auto bytes=read(id);
         if(key.starts_with(prefix+"inode/") && bytes.size()>=8 && !memcmp(bytes.data(),"FFINOD05",8)) {
             need(bytes.size()>=84 && bytes.size()<=128*1024 && u32(bytes,8)==1 && u32(bytes,48)==2,"invalid extent inode");

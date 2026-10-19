@@ -26,6 +26,7 @@ public:
     std::string storage_profile() const;
     std::string storage_engine() const;
     void checkpoint();
+    std::pair<uint64_t,uint64_t> storage_space() const;
     // Persistent request IDs. One background export; interrupted work is not retried.
     std::string start_backup(const std::string& request_id,const std::string& archive,
                              std::optional<uint64_t> after=std::nullopt,const std::string& catalog="",bool retry_catalog=false);

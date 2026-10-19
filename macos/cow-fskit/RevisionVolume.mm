@@ -203,7 +203,11 @@ struct WorldEnumeration {
     auto c=[FSVolumeSupportedCapabilities new];c.supportsHardLinks=YES;c.supportsSymbolicLinks=YES;c.supports64BitObjectIDs=YES;
     c.supportsPersistentObjectIDs=NO;c.caseFormat=FSVolumeCaseFormatSensitive;return c;
 }
-- (FSStatFSResult *)volumeStatistics {return [[FSStatFSResult alloc] initWithFileSystemTypeName:@"forkrevision"];}
+- (FSStatFSResult *)volumeStatistics {
+    @synchronized(self){auto result=[[FSStatFSResult alloc] initWithFileSystemTypeName:@"forkrevision"];result.blockSize=4096;result.ioSize=65536;
+        if(!_revoked && _store)try{auto space=_store->storage_space();result.totalBlocks=space.first/4096;result.availableBlocks=space.second/4096;result.freeBlocks=result.availableBlocks;result.usedBlocks=result.totalBlocks-result.freeBlocks;}catch(const std::exception&){/* Report no available space on a backing error. */}
+        return result;}
+}
 - (NSError *)revoke {@synchronized(self){
     _revoked=true;
     try{for(ForkRevisionItem *item in _items.allValues)if(item.handle){_view->close(item.handle.UTF8String);item.handle=nil;}}

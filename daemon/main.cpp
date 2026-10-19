@@ -4,6 +4,7 @@
 #include "backup_catalog.h"
 #include "namespace.h"
 #include "file_content.h"
+#include "repository_budget.h"
 #include "rpc.h"
 #include <cerrno>
 #include <charconv>
@@ -151,7 +152,7 @@ void serve(forkfs::Container& container, const std::string& path,bool rpc=false)
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--help") {
-            std::cout << "forkfsd backup REPOSITORY ARCHIVE\nforkfsd replay-export REPOSITORY AFTER_SEQUENCE ARCHIVE\nforkfsd replay ARCHIVE DESTINATION [--until SEQUENCE REPOSITORY_ID CHAIN_HASH]\n"
+            std::cout << "forkfsd gc STORE [--checkpoint ARCHIVE]\nforkfsd gc-plan STORE [--checkpoint ARCHIVE]\nforkfsd capacity STORE [MAX_DATA_BYTES MIN_FREE_BYTES]\nforkfsd backup REPOSITORY ARCHIVE\nforkfsd replay-export REPOSITORY AFTER_SEQUENCE ARCHIVE\nforkfsd replay ARCHIVE DESTINATION [--until SEQUENCE REPOSITORY_ID CHAIN_HASH]\n"
                          "forkfsd catalog-add CATALOG ARCHIVE\n"
                          "forkfsd catalog-list CATALOG\n"
                          "forkfsd catalog-revision CATALOG REVISION_NAME\n"
@@ -285,7 +286,16 @@ int main(int argc, char** argv) {
                 view=argv[argc-1];revision_view=selector=="--revision";argc-=2;
             }
         }
-        if (command == "init" && argc == 3) {
+        if(command=="capacity" && (argc==3 || argc==5)){
+            forkfs::LevelStore owner(argv[2]);
+            if(argc==5)forkfs::RepositoryBudget{file_number(argv[3]),file_number(argv[4])}.save(argv[2]);
+            auto policy=forkfs::RepositoryBudget::load(argv[2]);
+            std::cout<<"{\"max_data_bytes\":"<<policy.max_data<<",\"min_free_bytes\":"<<policy.min_free
+                     <<",\"data_bytes\":"<<forkfs::RepositoryBudget::data_bytes(argv[2])
+                     <<",\"host_free_bytes\":"<<std::filesystem::space(argv[2]).available<<",\"kernel_quota\":false}\n";
+        } else if((command=="gc" || command=="gc-plan") && (argc==3 || (argc==5 && std::string(argv[3])=="--checkpoint"))){
+            std::cout<<forkfs::LevelStore::collect(argv[2],argc==5?argv[4]:"",command=="gc-plan")<<"\n";
+        } else if (command == "init" && argc == 3) {
             forkfs::Container::create(argv[2]);
             forkfs::Container container(argv[2]);
             std::cout << container.status();

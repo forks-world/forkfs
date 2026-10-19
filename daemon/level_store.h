@@ -10,6 +10,7 @@ namespace forkfs {
 // metadata index. Sync object data before atomically publishing index/head changes.
 struct StoreIoMetrics;
 class ObjectStore;
+struct RepositoryOwner;
 namespace replay {struct Batch;}
 class LevelStore {
 public:
@@ -36,6 +37,10 @@ public:
     std::vector<std::string> keys(const std::string& prefix) const;
     void verify() const;
     void compact();
+    std::pair<uint64_t,uint64_t> space() const;
+    // Offline, exclusive repository generation rewrite. A checkpoint explicitly
+    // starts a new replay lineage; default GC retains all replay dependencies.
+    static std::string collect(const std::string& path,const std::string& checkpoint="",bool dry_run=false);
     struct CacheStats {uint64_t hits,misses;size_t charge;};
     CacheStats cache_stats() const;
     std::string metrics_json(bool detailed=false) const;
@@ -54,6 +59,7 @@ private:
     void publish(const replay::Batch& batch);
     void verify_recovery_graph(const leveldb::ReadOptions&,uint64_t sequence) const;
     std::atomic<unsigned> physical_format_=5;
+    std::shared_ptr<RepositoryOwner> owner_;
     std::unique_ptr<ObjectStore> object_store_;
     // Serializes publication, including root validation and durable DB::Write.
     mutable std::mutex writer_mutex_;

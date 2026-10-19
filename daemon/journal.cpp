@@ -525,3 +525,5 @@ std::string Journal::revision_point(const std::string& name) const {
     return leveldb_->revision_point(name);
 }
 }
+
+namespace forkfs {std::pair<uint64_t,uint64_t> Journal::space() const {if(!leveldb_)throw std::runtime_error("space reporting requires LevelDB");return leveldb_->space();}}

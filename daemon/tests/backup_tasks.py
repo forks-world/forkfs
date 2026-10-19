@@ -28,9 +28,14 @@ with tempfile.TemporaryDirectory(prefix='ff-task-') as directory:
         proc = subprocess.Popen([FAULT if stage else BIN,'serve',str(db),'--socket',str(endpoint),'--rpc'],
                                 env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         deadline = time.monotonic()+10
-        while not endpoint.exists():
+        # bind creates the pathname before listen: require a successful RPC,
+        # not merely existence of a socket, especially under parallel CI load.
+        while True:
             assert proc.poll() is None, proc.communicate()
-            assert time.monotonic()<deadline
+            assert time.monotonic()<deadline, 'RPC readiness timeout'
+            if endpoint.exists():
+                ready=subprocess.run([BIN,'request',str(endpoint),'status'],capture_output=True,timeout=5)
+                if ready.returncode==0:break
             time.sleep(.01)
         return proc
 

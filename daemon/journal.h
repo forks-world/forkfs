@@ -33,6 +33,7 @@ public:
     uint64_t backup(const std::string& archive,std::string* chain_hash=nullptr);
     uint64_t export_replay(uint64_t after,const std::string& archive,std::string* chain_hash=nullptr) const;
     void compact();
+    std::pair<uint64_t,uint64_t> space() const;
     std::string metrics_json(bool detailed=false) const;
     Journal(int fd, const std::array<unsigned char,16>& repository, const Checkpoint& checkpoint = {});
     void put(const std::string& key, const std::vector<unsigned char>& bytes);
