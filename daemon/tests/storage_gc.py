@@ -95,6 +95,22 @@ with tempfile.TemporaryDirectory(prefix='ff-gc-') as directory:
     corrupt=(corrupt_trial/'GC-PENDING').read_bytes()
     run('check',corrupt_trial,code=1);run('gc',corrupt_trial,'--checkpoint',corrupt_archive,code=1)
     assert (corrupt_trial/'GC-PENDING').read_bytes()==corrupt and not corrupt_archive.exists()
+    mode_trial=root/'directory-mode';shutil.copytree(db,mode_trial);os.chmod(mode_trial,0o750)
+    before=os.stat(mode_trial);run('gc',mode_trial);after=os.stat(mode_trial)
+    assert (after.st_uid,after.st_gid,after.st_mode&0o7777)==(before.st_uid,before.st_gid,0o750)
+    verify(mode_trial)
+    # A root-owned read-only toolchain directory exercises the real foreign-UID
+    # admission path as an ordinary user, without chown privileges or fixtures
+    # outside the sandbox's readable toolchain resources.
+    if os.geteuid()!=os.stat('/usr').st_uid:
+        refused=subprocess.run([BIN,'gc','/usr'],capture_output=True,timeout=10)
+        assert refused.returncode==1 and b'cross-identity GC is unsupported' in refused.stderr,refused.stderr
+    if os.geteuid()==0:
+        foreign_trial=root/'foreign-owner';shutil.copytree(db,foreign_trial);before=os.stat(foreign_trial)
+        os.chown(foreign_trial,before.st_uid+1,before.st_gid);foreign=os.stat(foreign_trial)
+        run('gc',foreign_trial,code=1);after=os.stat(foreign_trial)
+        assert (after.st_uid,after.st_gid,after.st_mode&0o7777)==(foreign.st_uid,foreign.st_gid,foreign.st_mode&0o7777)
+        assert not (foreign_trial/'GC-READY').exists()
     conflict=root/'checkpoint-conflict';shutil.copytree(db,conflict);protected=root/'protected.pack';protected.write_bytes(b'user data')
     run('gc',conflict,'--checkpoint',protected,code=1);assert protected.read_bytes()==b'user data';verify(conflict)
     # Existing garbage leaves room for the second generation within the source

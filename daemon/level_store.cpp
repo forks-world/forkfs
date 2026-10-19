@@ -691,6 +691,9 @@ std::string LevelStore::collect(const std::string& input,const std::string& chec
     namespace fs=std::filesystem;
     struct stat entry{};need(lstat(input.c_str(),&entry)==0 && S_ISDIR(entry.st_mode),"GC requires a real repository directory");
     const auto path=fs::canonical(input).string();
+    struct stat source_directory{};need(lstat(path.c_str(),&source_directory)==0 && S_ISDIR(source_directory.st_mode),"GC requires a real repository directory");
+    need(source_directory.st_uid==geteuid(),"GC requires invoking as the repository owner; cross-identity GC is unsupported");
+    const auto repository_mode=source_directory.st_mode&07777;const auto repository_gid=source_directory.st_gid;
     const auto canonical_checkpoint=[&](){
         if(checkpoint.empty())return std::string{};auto requested=fs::absolute(checkpoint);
         need(!requested.filename().empty() && requested.filename()!="." && requested.filename()!="..","invalid GC checkpoint destination");
@@ -884,8 +887,15 @@ std::string LevelStore::collect(const std::string& input,const std::string& chec
         if(auto value=read_control(fs::path(path)/name,std::string(name)=="BACKUP-TASKS"?2*1024*1024:4096))write_control(fs::path(staging)/name,*value);
     }
     if(checkpoint_receipt)gc_checkpoint::write_atomic(fs::path(staging)/"GC-PENDING",gc_checkpoint::encode(*checkpoint_receipt));
-    write_control(fs::path(path)/"GC-READY",marker);write_control(fs::path(staging)/"GC-READY",marker);
+    write_control(fs::path(staging)/"GC-READY",marker);
     need(unlink((staging+"/OWNERSHIP").c_str())==0 && link((path+"/OWNERSHIP").c_str(),(staging+"/OWNERSHIP").c_str())==0,"GC ownership handoff failed");
+    struct stat staged_directory{};need(lstat(staging.c_str(),&staged_directory)==0 && S_ISDIR(staged_directory.st_mode),"GC staging directory disappeared");
+    if(staged_directory.st_gid!=repository_gid && chown(staging.c_str(),static_cast<uid_t>(-1),repository_gid)<0)
+        throw std::system_error(errno,std::generic_category(),"preserve GC repository group");
+    if(chmod(staging.c_str(),repository_mode)<0)throw std::system_error(errno,std::generic_category(),"preserve GC repository mode");
+    need(lstat(staging.c_str(),&staged_directory)==0 && S_ISDIR(staged_directory.st_mode) && staged_directory.st_uid==source_directory.st_uid &&
+         staged_directory.st_gid==repository_gid && (staged_directory.st_mode&07777)==repository_mode,"GC staging directory identity mismatch");
+    write_control(fs::path(path)/"GC-READY",marker);
     sync_parent(staging+"/CURRENT");
     auto lease=source->owner_;source.reset();fault("gc_before_swap");
 #ifdef __APPLE__
