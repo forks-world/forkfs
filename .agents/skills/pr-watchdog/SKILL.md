@@ -30,14 +30,16 @@ If the user only asks for PR status or analysis, remain read-only.
 
 ## Model routing
 
-Use Astra (`gpt-6-astra`) for architectural decisions, Luna (`gpt-5.6-luna`)
-for implementation, and a separate Luna agent for independent review of fixes.
-Keep worker and reviewer independent; provide the reviewer the actual diff and
-validation evidence. Delegate bounded tasks when useful, without concurrent
-edits to the same files. A newer explicit user routing preference takes priority.
-If these models or delegation are unavailable, report the limitation and
-continue with the active model without claiming an independent review occurred.
-Rebuild the PR snapshot after any remote update, commit, or push.
+Use Sol for architectural decisions, Luna for implementation, and a separate
+Luna agent for independent review of fixes. Select from the model identifiers
+actually available in the current session, preferring the newest available
+version in each family; do not pin a version number or assume an identifier
+exists. Keep worker and reviewer independent; provide the reviewer the actual
+diff and validation evidence. Delegate bounded tasks when useful, without
+concurrent edits to the same files. A newer explicit user routing preference
+takes priority. If a requested model family or delegation is unavailable, report
+the limitation and continue with the active model without claiming an independent
+review occurred. Rebuild the PR snapshot after any remote update, commit, or push.
 
 ## Establish the watch
 
