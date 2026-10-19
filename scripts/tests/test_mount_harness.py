@@ -1,16 +1,18 @@
 """Harness validation; native runs are deliberately not mounted acceptance."""
 import json
+import fcntl
 import os
 from pathlib import Path
 import platform
 import subprocess
 import sys
 import tempfile
+import socket
 import unittest
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'fskit'))
 import mount_probe
-from restricted_workload import profile
+from restricted_workload import profile,validate_backing,validate_owner_lease,validate_stdio
 import mounted_acceptance
 
 class Harness(unittest.TestCase):
@@ -34,6 +36,45 @@ class Harness(unittest.TestCase):
             with self.assertRaises(ValueError):profile(root,root/'backing',root/'scratch')
             for child in ('mount','backing','scratch'):(root/child).mkdir()
             with self.assertRaises(ValueError):profile(root/'mount',root/'backing',root/'scratch',[root])
+    def test_backing_hardlink_alias_rejects_startup_admission(self):
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name);backing=root/'backing';toolchain=root/'toolchain'
+            backing.mkdir();(backing/'CURRENT').write_text('repository')
+            (backing/'OWNERSHIP').touch();(backing/'object').write_text('private')
+            toolchain.mkdir();os.link(backing/'object',toolchain/'alias')
+            with self.assertRaisesRegex(ValueError,'hardlink alias'):
+                validate_backing(backing,[toolchain])
+    def test_stdio_socket_rejected_and_pipe_allowed(self):
+        with tempfile.TemporaryDirectory() as name:
+            backing=Path(name)
+            sockets=[socket.socketpair() for _ in range(3)]
+            saved=[]
+            try:
+                for descriptor in range(3):
+                    saved.append(os.dup(descriptor))
+                for descriptor in range(3):
+                    os.dup2(sockets[descriptor][0].fileno(),descriptor)
+                    with self.assertRaisesRegex(ValueError,'socket stdio'):
+                        validate_stdio(backing,(descriptor,))
+            finally:
+                for descriptor,backup in enumerate(saved):
+                    os.dup2(backup,descriptor);os.close(backup)
+                for pair in sockets:
+                    for endpoint in pair:endpoint.close()
+            read_fd,write_fd=os.pipe()
+            try:validate_stdio(backing,(read_fd,write_fd))
+            finally:os.close(read_fd);os.close(write_fd)
+    def test_owner_lease_requires_live_exclusive_flock(self):
+        with tempfile.TemporaryDirectory() as name:
+            lease=Path(name)/'OWNERSHIP';lease.touch()
+            descriptor=os.open(lease,os.O_RDONLY)
+            try:
+                fcntl.flock(descriptor,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                validate_owner_lease(name)
+                fcntl.flock(descriptor,fcntl.LOCK_UN)
+                with self.assertRaisesRegex(ValueError,'no live exclusive owner'):
+                    validate_owner_lease(name)
+            finally:os.close(descriptor)
     @unittest.skipUnless(platform.system()=='Darwin','macOS sandbox')
     def test_actual_sandbox_read_write_denial(self):
         with tempfile.TemporaryDirectory() as name:

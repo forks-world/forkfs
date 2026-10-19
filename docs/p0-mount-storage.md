@@ -33,8 +33,22 @@ python3 scripts/fskit/restricted_workload.py --mount MOUNT --backing STORE -- TO
 This launcher uses a deny-by-default macOS sandbox. Mount and private temporary
 storage are writable; system/toolchain directories are readable. Additional
 read-only toolchains require explicit `--read-only PATH` grants. Overlapping
-backing grants are refused. Backing file access is denied, inherited descriptors
-are closed, and regular stdio descriptors into backing storage are rejected.
+backing grants are refused. At launch, the harness walks the backing tree and
+rejects symlinks, special files, and any non-directory inode with a link count
+other than one. This catches hardlink aliases hidden anywhere in an allowed
+read-only toolchain. It also requires the real `OWNERSHIP` file to be a
+single-link regular file whose nonblocking exclusive `flock` reports contention
+from another process; an unlocked lease is rejected. This is a liveness check,
+not proof of the lock holder's identity or its association with the mounted volume.
+
+`close_fds` closes extra descriptors, while inherited standard streams are
+checked separately. Socket and unsupported stdio types are rejected. Pipes,
+terminals, and `/dev/null` are allowed; regular files are allowed only when
+their resolved path is outside backing and their device/inode identity is absent
+from the backing inventory.
+Concurrent same-UID host changes can invalidate these startup checks, and the
+harness does not prevent backing replacement during the mount lifetime. This
+admission check therefore depends on the trusted-host assumption below.
 Network access and arbitrary Mach service access are not granted. Some toolchains
 will need further scoped permissions; failures must remain failures, without an
 unrestricted retry. The sandbox is tested with real denied reads/writes on macOS.
@@ -92,12 +106,18 @@ of every host filesystem, firmware or device.
 If replay logging is enabled, default GC pins all indexed objects and preserves
 logs, root aliases and counters so existing backup baselines/deltas remain usable.
 It may therefore reclaim only unindexed tails. `--checkpoint` explicitly starts a
-new replay generation and writes a fresh baseline outside the repository before
-exchange. Existing external backups remain independently recoverable, but new
-deltas require that new baseline. Provision the new baseline at backup destinations
-before relying on the new incremental chain. A failed/interrupted attempt can
-leave its immutable checkpoint file; inspect it and use a new destination on retry.
-GC does not automatically prune revisions or reuse inode numbers.
+new replay generation. GC first creates a durable baseline inside the staged
+generation, exchanges directories, syncs the parent, and then publishes the
+external baseline without replacing an existing file. A checksummed pending
+receipt blocks ordinary repository opens until publication completes. After an
+interruption, retry the same `gc STORE --checkpoint ARCHIVE` command; a matching
+existing archive is validated and reused, while conflicting user data is never
+overwritten. A completion receipt makes retries idempotent within that retained
+replay generation, including after subsequent writes. `gc-plan` never resumes
+publication. The internal baseline is removed only after durable completion.
+Existing external backups remain independently recoverable, but new deltas require
+the new baseline. Provision it at backup destinations before relying on the new
+incremental chain. GC does not automatically prune revisions or reuse inode numbers.
 
 ## Capacity admission
 
@@ -116,8 +136,9 @@ bounded by the policy and host free space rather than all-zero statistics.
 This is a DATA segment admission budget, **not a kernel-enforced repository quota**.
 LevelDB, logs, control files and temporary GC generations consume additional space.
 Host free space can change concurrently; a reserve is not a reservation. Configure
-policy while the repository is offline. GC preserves policy and backup-task/FSKit
-control files. Existing data above a newly configured cap is retained; additional
+policy while the repository is offline. GC applies the policy before opening its
+staging store, checks free-space admission for internal and external baseline
+copies, and preserves backup-task/FSKit control files. Existing data above a newly configured cap is retained; additional
 allocation is rejected until collection or a policy change makes room.
 
 ## Validation status

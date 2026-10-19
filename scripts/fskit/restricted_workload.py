@@ -2,6 +2,7 @@
 This constrains this process tree, not other processes owned by the host user.
 """
 import argparse
+import errno
 import fcntl
 import stat
 import json
@@ -13,9 +14,103 @@ import subprocess
 import tempfile
 from mount_probe import require_mount
 
+F_GETPATH = 50  # Darwin fcntl command
+OWNER_LEASE = 'OWNERSHIP'
+
 def inside(path,parent):
     try:path.relative_to(parent);return True
     except ValueError:return False
+
+def inventory_backing(backing):
+    """Validate a stable-looking backing tree and return its regular-file IDs.
+
+    This is startup admission under the trusted-host assumption. It cannot
+    prevent another same-UID process from changing the tree after this walk.
+    """
+    backing=Path(backing).absolute()
+    try:root=os.lstat(backing)
+    except OSError as error:raise ValueError('cannot inspect backing root') from error
+    if not stat.S_ISDIR(root.st_mode):raise ValueError('backing root must be a real directory')
+    files=set()
+    def visit(directory):
+        try:entries=list(os.scandir(directory))
+        except OSError as error:raise ValueError('cannot inventory backing') from error
+        for entry in entries:
+            try:info=entry.stat(follow_symlinks=False)
+            except OSError as error:raise ValueError('cannot inventory backing entry') from error
+            if stat.S_ISDIR(info.st_mode):
+                visit(Path(entry.path))
+            elif stat.S_ISREG(info.st_mode):
+                if info.st_nlink!=1:raise ValueError('backing file has an external hardlink alias')
+                files.add((info.st_dev,info.st_ino))
+            else:
+                raise ValueError('backing contains a symlink or unsupported file type')
+    visit(backing)
+    return backing,files
+
+def validate_owner_lease(backing):
+    """Require contention on an exclusive lease; this does not identify its holder."""
+    path=Path(backing)/OWNER_LEASE
+    try:
+        before=os.lstat(path)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1:
+            raise ValueError('owner lease must be a single-link regular file')
+        flags=os.O_RDONLY|getattr(os,'O_CLOEXEC',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_NONBLOCK',0)
+        descriptor=os.open(path,flags)
+    except ValueError:raise
+    except OSError as error:raise ValueError('cannot open owner lease') from error
+    try:
+        after=os.fstat(descriptor)
+        if (not stat.S_ISREG(after.st_mode) or after.st_nlink!=1 or
+            (before.st_dev,before.st_ino)!=(after.st_dev,after.st_ino)):
+            raise ValueError('owner lease changed during admission')
+        try:fcntl.flock(descriptor,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in (errno.EWOULDBLOCK,errno.EAGAIN):
+                return
+            raise ValueError('cannot check owner lease') from error
+        fcntl.flock(descriptor,fcntl.LOCK_UN)
+        raise ValueError('backing has no live exclusive owner lease')
+    finally:os.close(descriptor)
+
+def validate_stdio(backing,descriptors=(0,1,2),backing_files=None):
+    """Allow only safe inherited streams; `descriptors` makes this testable."""
+    backing=Path(backing).resolve(strict=True)
+    if backing_files is None:
+        backing,backing_files=inventory_backing(backing)
+    else:backing=Path(backing).resolve(strict=True)
+    for descriptor in descriptors:
+        try:info=os.fstat(descriptor)
+        except OSError as error:raise RuntimeError('cannot validate inherited stdio') from error
+        mode=info.st_mode
+        if stat.S_ISSOCK(mode):raise ValueError('socket stdio is not allowed')
+        if stat.S_ISFIFO(mode):continue
+        if stat.S_ISCHR(mode):
+            try:raw=fcntl.fcntl(descriptor,F_GETPATH,bytes(1024))
+            except OSError as error:raise RuntimeError('cannot identify character stdio') from error
+            path=Path(os.fsdecode(raw.split(b'\0',1)[0]))
+            if path==Path('/dev/null') or os.isatty(descriptor):continue
+            raise ValueError('unsupported character-device stdio')
+        if stat.S_ISREG(mode):
+            try:raw=fcntl.fcntl(descriptor,F_GETPATH,bytes(1024))
+            except OSError as error:raise RuntimeError('cannot identify regular stdio') from error
+            inherited=Path(os.fsdecode(raw.split(b'\0',1)[0])).resolve(strict=True)
+            if inside(inherited,backing) or (info.st_dev,info.st_ino) in backing_files:
+                raise ValueError('stdio refers to backing storage')
+            continue
+        raise ValueError('unsupported inherited stdio type')
+
+def validate_backing(backing,read_only=()):
+    """Admit a backing tree only while another process holds OWNERSHIP exclusively."""
+    backing,files=inventory_backing(backing)
+    if not (backing/'CURRENT').is_file():raise ValueError('backing is not a repository')
+    validate_owner_lease(backing)
+    # nlink==1 above rejects every pre-existing hardlink alias, including one
+    # hidden under an otherwise allowed read-only toolchain.
+    for grant in read_only:
+        path=Path(grant).resolve(strict=True)
+        if inside(path,backing) or inside(backing,path):raise ValueError('read-only grants overlap backing')
+    return backing,files
 
 def profile(mount,backing,scratch,read_only=()):
     mount,backing,scratch=(Path(p).resolve() for p in (mount,backing,scratch))
@@ -41,20 +136,10 @@ def profile(mount,backing,scratch,read_only=()):
 def run(mount,backing,command,read_only=()):
     if platform.system()!='Darwin':raise RuntimeError('restricted workload launcher requires macOS')
     require_mount(mount)
-    backing=Path(backing).resolve(strict=True)
-    if not (backing/'CURRENT').is_file():raise ValueError('backing is not a repository')
+    backing,backing_files=validate_backing(backing,read_only)
+    validate_stdio(backing,backing_files=backing_files)
     executable=shutil.which(command[0])
     if not executable:raise ValueError('workload executable was not found')
-    # close_fds retains stdio: reject inherited regular backing descriptors too.
-    for descriptor in (0,1,2):
-        try:
-            mode=os.fstat(descriptor).st_mode
-            if stat.S_ISREG(mode) or stat.S_ISDIR(mode):
-                raw=fcntl.fcntl(descriptor,50,bytes(1024))  # Darwin F_GETPATH
-                inherited=Path(os.fsdecode(raw.split(b'\0',1)[0])).resolve(strict=True)
-                if inside(inherited,backing):raise ValueError('stdio refers to backing storage')
-        except OSError as error:
-            raise RuntimeError('cannot validate inherited stdio') from error
     # No ambient directory descriptors, preload settings or control sockets.
     env={k:v for k,v in os.environ.items() if not k.startswith(('DYLD_','LD_','PYTHON','GIT_'))}
     with tempfile.TemporaryDirectory(prefix='forkfs-workload-',dir='/tmp') as directory:
