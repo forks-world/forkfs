@@ -74,19 +74,30 @@ def timed(root,samples):
 
 def exercise(root,samples):return dict(correctness=correctness(root),development=development(root),timing=timed(root,samples))
 
+def validate_paths(mount,native,output):
+    mount=Path(mount).resolve(strict=True);native=Path(native).resolve(strict=True)
+    if not mount.is_dir() or not native.is_dir():raise ValueError('mount and native roots must be directories')
+    output=Path(output).resolve(strict=False)
+    roots=(native,mount)
+    if any(output==root or root in output.parents for root in roots):
+        raise ValueError('output must be outside both workspaces')
+    return mount,native,output
+
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--mount',type=Path,required=True);p.add_argument('--native',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--samples',type=int,default=1000)
     args=p.parse_args()
     if not 1<=args.samples<=1000:p.error('samples must be 1..1000')
-    args.output.mkdir(parents=True,exist_ok=True);result=dict(status='blocked',mounted_acceptance=False)
-    try:result['mount']=require_mount(args.mount)
+    mount,native,args.output=validate_paths(args.mount,args.native,args.output)
+    result=dict(status='blocked',mounted_acceptance=False)
+    try:result['mount']=require_mount(mount)
     except Exception as error:
         result['blocker']=str(error)
+        args.output.mkdir(parents=True,exist_ok=True)
         with (args.output/('blocked-'+uuid.uuid4().hex+'.json')).open('x') as f:json.dump(result,f,indent=2)
         print(json.dumps(result));return 2
-    roots=[args.native.resolve(strict=True),args.mount.resolve(strict=True)];token=uuid.uuid4().hex;owned=[]
+    roots=[native,mount];token=uuid.uuid4().hex;owned=[]
     if roots[0].stat().st_dev==roots[1].stat().st_dev:raise ValueError('native reference must be a different filesystem device')
-    if any(args.output.resolve()==r or r in args.output.resolve().parents for r in roots):raise ValueError('output must be outside both workspaces')
+    args.output.mkdir(parents=True,exist_ok=True)
     try:
         for root in roots:
             path=root/('.forkfs-accept-'+token);path.mkdir(mode=0o700);(path/'.owner').write_text(token);owned.append((path,path.stat().st_dev,path.stat().st_ino));result['native' if root==roots[0] else 'world']=exercise(path,args.samples)

@@ -30,6 +30,45 @@ class Harness(unittest.TestCase):
             self.assertTrue(result['correctness']['cross_process_lock'])
             self.assertTrue(result['development']['git_checkout'])
             self.assertIsNone(result['timing'][1]['stat']['p99_ns'])
+    def test_invalid_output_is_rejected_before_creating_any_hierarchy(self):
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name);mount=root/'mount';native=root/'native'
+            mount.mkdir();native.mkdir()
+            outputs=(native/'new-parent'/'result',mount/'new-parent'/'result')
+            for output in outputs:
+                argv=['mounted_acceptance.py','--mount',str(mount),'--native',str(native),'--output',str(output)]
+                with patch.object(sys,'argv',argv),patch.object(mounted_acceptance,'require_mount') as attest:
+                    with self.assertRaisesRegex(ValueError,'output must be outside'):
+                        mounted_acceptance.main()
+                    attest.assert_not_called()
+                self.assertFalse(output.parent.exists())
+            alias=root/'native-alias';alias.symlink_to(native,target_is_directory=True)
+            output=alias/'via-link'/'result'
+            argv=['mounted_acceptance.py','--mount',str(mount),'--native',str(native),'--output',str(output)]
+            with patch.object(sys,'argv',argv),patch.object(mounted_acceptance,'require_mount') as attest:
+                with self.assertRaisesRegex(ValueError,'output must be outside'):
+                    mounted_acceptance.main()
+                attest.assert_not_called()
+            self.assertFalse((native/'via-link').exists())
+    def test_canonical_external_output_does_not_create_lexical_prefix(self):
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name);mount=root/'mount';native=root/'native';mount.mkdir();native.mkdir()
+            output=native/'unmade'/'..'/'..'/'safe-output'
+            argv=['mounted_acceptance.py','--mount',str(mount),'--native',str(native),'--output',str(output)]
+            with patch.object(sys,'argv',argv),patch.object(mounted_acceptance,'require_mount',side_effect=RuntimeError('ordinary directory')):
+                self.assertEqual(mounted_acceptance.main(),2)
+            self.assertFalse((native/'unmade').exists())
+            self.assertEqual(len(list((root/'safe-output').glob('blocked-*.json'))),1)
+    def test_ordinary_mount_attestation_failure_writes_safe_blocked_receipt(self):
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name);mount=root/'mount';native=root/'native';output=root/'results'
+            mount.mkdir();native.mkdir()
+            argv=['mounted_acceptance.py','--mount',str(mount),'--native',str(native),'--output',str(output)]
+            with patch.object(sys,'argv',argv),patch.object(mounted_acceptance,'require_mount',side_effect=RuntimeError('ordinary directory')):
+                self.assertEqual(mounted_acceptance.main(),2)
+            receipt=json.loads(next(output.glob('blocked-*.json')).read_text())
+            self.assertEqual(receipt['status'],'blocked')
+            self.assertFalse(receipt['mounted_acceptance'])
     def test_overlapping_grants_rejected(self):
         with tempfile.TemporaryDirectory() as name:
             root=Path(name)
@@ -97,8 +136,8 @@ class Harness(unittest.TestCase):
     @unittest.skipUnless(platform.system()=='Darwin','macOS statfs')
     def test_native_path_cannot_pass_acceptance(self):
         with tempfile.TemporaryDirectory() as name:
-            root=Path(name);mount=root/'mount';mount.mkdir();out=root/'result'
-            p=subprocess.run([sys.executable,str(Path(mounted_acceptance.__file__)),'--mount',str(mount),'--native',name,'--output',str(out)],capture_output=True)
+            root=Path(name);mount=root/'mount';native=root/'native';mount.mkdir();native.mkdir();out=root/'result'
+            p=subprocess.run([sys.executable,str(Path(mounted_acceptance.__file__)),'--mount',str(mount),'--native',str(native),'--output',str(out)],capture_output=True)
             self.assertEqual(p.returncode,2)
             self.assertEqual(list(mount.iterdir()),[])
             self.assertFalse(json.loads(next(out.glob('*.json')).read_text())['mounted_acceptance'])
