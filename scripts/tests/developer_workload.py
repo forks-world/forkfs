@@ -103,11 +103,17 @@ class Workload:
         self.proc = subprocess.Popen([self.binary, 'serve', str(db or self.db), '--socket',
                                       str(self.endpoint), '--rpc'], stdout=self.daemon_log, stderr=self.daemon_log)
         deadline = time.monotonic() + 30
-        while not self.endpoint.exists():
+        while True:
             if self.proc.poll() is not None:
                 raise AssertionError('daemon exited during startup; see daemon.log')
             if time.monotonic() > deadline:
                 raise TimeoutError('daemon startup')
+            if self.endpoint.exists():
+                try:
+                    self.rpc('status')
+                    break
+                except (ConnectionRefusedError,FileNotFoundError):
+                    pass
             time.sleep(.01)
 
     def stop(self, crash=False):

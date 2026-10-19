@@ -327,3 +327,7 @@ add_test(NAME forkfsd_storage_gc COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/storage_gc.py $<TARGET_FILE:forkfsd>
     $<TARGET_FILE:forkfsd_leveldb_fault_test>)
 set_tests_properties(forkfsd_storage_gc PROPERTIES TIMEOUT 240 LABELS metadata-regression)
+
+add_test(NAME forkfsd_mount_harness COMMAND ${Python3_EXECUTABLE} -m unittest discover
+    -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_mount_harness.py -v)
+set_tests_properties(forkfsd_mount_harness PROPERTIES TIMEOUT 90 LABELS metadata-regression)
