@@ -18,6 +18,25 @@ def run(*args, binary=BIN, env=None, code=0):
 with tempfile.TemporaryDirectory(prefix='ff-gc-') as directory:
     root=Path(directory);db=root/'store';payload=root/'payload'
     run('init',db);run('fs-init',db)
+    # Test both coordinator preflight and append admission at exact byte limits.
+    edge=root/'quota-edge';edge_input=root/'quota-input';run('init',edge)
+    edge_input.write_bytes(b'x');run('capacity',edge,92,0)
+    run('object-put',edge,'first',edge_input,code=1)
+    assert not list(edge.glob('DATA-*.seg'))
+    run('capacity',edge,93,0);run('object-put',edge,'first',edge_input)
+    assert sum(p.stat().st_size for p in edge.glob('DATA-*.seg'))==93
+    edge_input.write_bytes(b'y');run('capacity',edge,137,0)
+    before=json.loads(run('check',edge));run('object-put',edge,'second',edge_input,code=1)
+    after=json.loads(run('check',edge))
+    for key in ('last_committed_seq','indexed_objects','object_roots'):assert after[key]==before[key]
+    assert run('object-get',edge,'first')==b'x'
+    run('object-get',edge,'second',code=1)
+    assert sum(p.stat().st_size for p in edge.glob('DATA-*.seg'))==93
+    run('capacity',edge,138,0);run('object-put',edge,'second',edge_input)
+    assert sum(p.stat().st_size for p in edge.glob('DATA-*.seg'))==138
+    edge_input.write_bytes(b'x');run('object-put',edge,'deduplicated',edge_input)
+    assert run('object-get',edge,'deduplicated')==b'x'
+    assert sum(p.stat().st_size for p in edge.glob('DATA-*.seg'))==138
     rng=random.Random(7321)
     original=rng.randbytes(180000) if hasattr(rng,'randbytes') else bytes(rng.randrange(256) for _ in range(180000))
     payload.write_bytes(original);run('fs-write',db,'/file',payload)

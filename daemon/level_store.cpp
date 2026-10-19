@@ -184,14 +184,14 @@ void LevelStore::publish(const replay::Batch& input){
     // Caller owns the writer lock, or the unpublished recovery destination.
     // Admission failures leave the current owner healthy: no append has begun.
     if(object_store_->has_capacity_budget()){
-        uint64_t incoming=0;std::set<std::string> chunks;
+        std::vector<size_t> new_chunk_sizes;std::set<std::string> chunks;
         for(const auto& op:input.ops)if(!op.erase && op.key.starts_with("O/")){
             auto count=std::max<size_t>(1,(op.value.size()+65535)/65536);
             for(size_t i=0;i<count;++i){auto payload=op.value.substr(i*65536,65536),hash=replay::hash(payload);std::string existing;
-                if(chunks.insert(hash).second){auto found=db_->Get({},"C/"+hash,&existing);if(found.IsNotFound())incoming+=payload.size()+44+48;else status(found,"read capacity chunk index");}
+                if(chunks.insert(hash).second){leveldb::ReadOptions read;read.verify_checksums=true;auto found=db_->Get(read,"C/"+hash,&existing);if(found.IsNotFound())new_chunk_sizes.push_back(payload.size());else status(found,"read capacity chunk index");}
             }
         }
-        object_store_->admit(incoming);
+        object_store_->admit(object_store_->append_cost(new_chunk_sizes));
     }
     try{
         leveldb::WriteBatch metadata;ObjectStore::Locations pending;auto next_format=physical_format_.load();
@@ -809,12 +809,13 @@ std::string LevelStore::collect(const std::string& input,const std::string& chec
     // Estimate the exact unique chunks the copied generation will append.
     // Host-space reservation accounts for the temporary second generation;
     // max_data is enforced against staged DATA bytes by ObjectStore itself.
-    uint64_t staging_reserve=0;std::set<std::string> staged_chunks;
+    std::vector<size_t> staged_chunk_sizes;std::set<std::string> staged_chunks;
     for(const auto& reference:live){auto payload=source->object(reference);auto count=std::max<size_t>(1,(payload.size()+65535)/65536);
         for(size_t i=0;i<count;++i){auto offset=i*65536,length=std::min<size_t>(65536,payload.size()-offset);
             std::string chunk=length?std::string(reinterpret_cast<const char*>(payload.data()+offset),length):std::string{};auto hash=replay::hash(chunk);
-            if(staged_chunks.insert(hash).second){const auto incoming=uint64_t(chunk.size())+44+48;need(incoming<=UINT64_MAX-staging_reserve,"GC staging size overflow");staging_reserve+=incoming;}}
+            if(staged_chunks.insert(hash).second)staged_chunk_sizes.push_back(chunk.size());}
     }
+    const uint64_t staging_reserve=ObjectStore::new_store_cost(staged_chunk_sizes);
     uint64_t host_reserve=staging_reserve;
     if(reset){
         uint64_t metadata=0;
