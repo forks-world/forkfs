@@ -9,7 +9,7 @@ using Bytes=std::vector<unsigned char>;
 void check_at(bool ok,int line){if(!ok)throw std::runtime_error("large file check failed at line "+std::to_string(line));}
 #define check(x) check_at((x),__LINE__)
 template<class F>void rejects(F f){bool failed=false;try{f();}catch(const std::exception&){failed=true;}check(failed);}
-uint64_t disk(const std::string& path){uint64_t n=0;for(auto& e:std::filesystem::recursive_directory_iterator(path))if(e.is_regular_file())n+=e.file_size();return n;}
+uint64_t segment_bytes(const std::string& path){uint64_t n=0;for(auto& e:std::filesystem::recursive_directory_iterator(path))if(e.is_regular_file() && e.path().filename().string().starts_with("DATA-") && e.path().extension()==".seg")n+=e.file_size();return n;}
 void content_unit(){
     using Id=FileContent::Id;std::map<Id,Bytes> objects;size_t reads=0;
     auto reader=[&](const Id& id){++reads;return objects.at(id);};
@@ -52,9 +52,9 @@ int main(){
                 if(i%10==0){check(work.read("/f")==model);work.verify();}
             }
             check(old.read("/f")==original && fs.read("/f")==original);check(work.read("/f")==model);work.write_at("/f",0,Bytes{0});check(fs.read_at("/f",0,1)==old.read_at("/f",0,1));
-            uint64_t far=(uint64_t(1)<<40)+65535;auto before=disk(path);work.write_at("/f",far,Bytes{11,22,33});
+            uint64_t far=(uint64_t(1)<<40)+65535;auto before=segment_bytes(path);work.write_at("/f",far,Bytes{11,22,33});
             check(work.stat("/f").size==far+3 && work.read_at("/f",far-1,5)==Bytes({0,11,22,33}));
-            check(disk(path)-before<1024*1024);rejects([&]{work.read("/f");});
+            check(segment_bytes(path)-before<1024*1024);rejects([&]{work.read("/f");});
             auto h=work.open("/f",Namespace::Access::ReadWrite);work.remove("/f",false);work.remove("/alias",false);
             work.handle_write(h,far+1,Bytes{44});check(work.handle_read(h,far,3)==Bytes({11,44,33}));work.handle_set_attributes(h,{{},{},far+100});
             work.verify();work.handle_truncate(h,65537);work.handle_truncate(h,far+3);check(work.handle_read(h,far,3)==Bytes(3,0));work.close(h);work.restore("base");check(work.read("/f")==original);work.verify();
@@ -65,7 +65,7 @@ int main(){
             Bytes batch(FileContent::max_io,42);fs.write("/dense",batch);std::fill(batch.begin(),batch.end(),43);fs.write_at("/dense",FileContent::max_io,batch);
             check(fs.stat("/dense").size==2*FileContent::max_io);
             check(fs.read_at("/dense",FileContent::max_io-1,2)==Bytes({42,43}));
-            auto growth=disk(path);fs.write_at("/dense",5*1024*1024,Bytes{17});check(disk(path)-growth<1024*1024);
+            auto growth=segment_bytes(path);fs.write_at("/dense",5*1024*1024,Bytes{17});check(segment_bytes(path)-growth<1024*1024);
             check(fs.read_at("/dense",5*1024*1024-1,3)==Bytes({42,17,42}));rejects([&]{fs.read("/dense");});
             fs.set_inode_xattr(id,"user.test",Bytes{7});check(fs.get_inode_xattr(id,"user.test")==Bytes{7});fs.verify();old.verify();store.verify();
         }

@@ -285,3 +285,40 @@ set_tests_properties(forkfsd_large_files_crash PROPERTIES TIMEOUT 180 LABELS met
 add_test(NAME forkfsd_large_file_corruption COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/large_file_corruption.py $<TARGET_FILE:forkfsd>)
 set_tests_properties(forkfsd_large_file_corruption PROPERTIES TIMEOUT 90 LABELS metadata-regression)
+
+add_executable(forkfsd_sparse_content_model_test tests/sparse_content_model.cpp)
+target_link_libraries(forkfsd_sparse_content_model_test PRIVATE forkfs_metadata)
+foreach(seed 1 173 4294967295)
+    add_test(NAME forkfsd_sparse_content_model_${seed} COMMAND forkfsd_sparse_content_model_test ${seed})
+    set_tests_properties(forkfsd_sparse_content_model_${seed} PROPERTIES TIMEOUT 120 LABELS metadata-regression)
+endforeach()
+add_executable(forkfsd_large_file_concurrency_test tests/large_file_concurrency.cpp)
+target_link_libraries(forkfsd_large_file_concurrency_test PRIVATE forkfs_namespace)
+add_test(NAME forkfsd_large_file_concurrency COMMAND forkfsd_large_file_concurrency_test)
+set_tests_properties(forkfsd_large_file_concurrency PROPERTIES TIMEOUT 120 LABELS metadata-regression)
+
+add_test(NAME forkfsd_large_file_fault_matrix COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/large_file_fault_matrix.py $<TARGET_FILE:forkfsd>
+    $<TARGET_FILE:forkfsd_leveldb_fault_test>)
+set_tests_properties(forkfsd_large_file_fault_matrix PROPERTIES TIMEOUT 240 LABELS metadata-regression)
+
+add_test(NAME forkfsd_large_file_handles_crash COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/handles_crash.py $<TARGET_FILE:forkfsd>
+    $<TARGET_FILE:forkfsd_leveldb_fault_test> 700000)
+set_tests_properties(forkfsd_large_file_handles_crash PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+
+foreach(seed 1 173 4294967295)
+    add_test(NAME forkfsd_native_file_differential_${seed} COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/native_file_differential.py $<TARGET_FILE:forkfsd>
+        --seed ${seed} --steps 300 --output ${CMAKE_BINARY_DIR}/native-differential-artifacts)
+    set_tests_properties(forkfsd_native_file_differential_${seed} PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+endforeach()
+add_test(NAME forkfsd_native_file_differential_random COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/native_file_differential.py $<TARGET_FILE:forkfsd>
+    --steps 300 --output ${CMAKE_BINARY_DIR}/native-differential-artifacts)
+set_tests_properties(forkfsd_native_file_differential_random PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+add_test(NAME forkfsd_readonly_handle_write_regression COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/native_file_differential.py $<TARGET_FILE:forkfsd>
+    --replay ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/readonly-handle-write.json
+    --output ${CMAKE_BINARY_DIR}/native-differential-artifacts)
+set_tests_properties(forkfsd_readonly_handle_write_regression PROPERTIES TIMEOUT 30 LABELS metadata-regression)

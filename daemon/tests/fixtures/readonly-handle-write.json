@@ -1,0 +1,7 @@
+{
+  "actions": [
+    {"op": "write", "path": "/f", "data": ""},
+    {"op": "open", "path": "/f", "access": "r", "handle": "1"},
+    {"op": "hnext", "handle": "1", "data": "01"}
+  ]
+}

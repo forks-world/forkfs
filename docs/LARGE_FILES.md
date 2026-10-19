@@ -75,3 +75,6 @@ I/O errors around data synchronization/metadata publication; and restore full pl
 incremental backups after removing the source repository. FSKit callback tests
 exercise writes beyond the former boundary. Real mounted workload acceptance is
 still required.
+
+Independent oracle design, reproduction, reduction and remaining limits are
+documented in [Large-file testing](LARGE_FILE_TESTING.md).

@@ -1126,7 +1126,7 @@ uint64_t Namespace::seek(const std::string& token,int64_t offset,Seek origin) {
     info.cursor->position=result;return result;
 }
 Bytes Namespace::handle_read_next(const std::string& token,uint64_t count) {
-    std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);need(info.readable,"handle is not readable");
+    std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);if(!info.readable)throw std::system_error(EBADF,std::generic_category(),"handle is not readable");
     auto data=read_handle_locked(info,info.cursor->position,count);info.cursor->position+=data.size();return data;
 }
 size_t Namespace::handle_write_next(const std::string& token,const Bytes& value) {
@@ -1157,7 +1157,7 @@ InodeInfo Namespace::handle_stat(const std::string& token) const {
 }
 Bytes Namespace::handle_read(const std::string& token,uint64_t offset,uint64_t count) const {
     need(offset<=INT64_MAX,"file offset exceeds signed 64-bit range");
-    std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);need(info.readable,"handle is not readable");
+    std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);if(!info.readable)throw std::system_error(EBADF,std::generic_category(),"handle is not readable");
     return read_handle_locked(info,offset,count);
 }
 Bytes Namespace::read_handle_locked(const Container::OpenHandle& info,uint64_t offset,uint64_t count) const {
@@ -1171,7 +1171,7 @@ void Namespace::edit_handle(const std::string& token,const std::function<bool(Fi
     need(!revision_,"revision view is read-only");
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);Changes changes;
     auto operation=[&] {
-        const auto& info=find_handle(token);need(info.writable,"handle is not writable");
+        const auto& info=find_handle(token);if(!info.writable)throw std::system_error(EBADF,std::generic_category(),"handle is not writable");
         bool linked=view.contains(inode_key(info.inode));auto pre=orphan_prefix(view_,info.inode);
         auto& j=*container_.journal_;auto n=linked?inode(view,info.inode):decode_inode(j.get(pre+"inode"),info.inode,true);
         auto file=file_content(view,n,linked?view.get(content_key(info.inode)):j.get(pre+"content"));

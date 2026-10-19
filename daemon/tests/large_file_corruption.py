@@ -81,6 +81,28 @@ with tempfile.TemporaryDirectory(prefix='ff-large-corrupt-') as directory:
             f'truncated-{seed}': (last_data, lambda b, n=cut: b[:n]),
             f'tail-{seed}': (last_data, lambda b, n=tail: b[:-1]+bytes([n])),
         })
+    # Exercise every internal radix level, not only level-0 leaf parsing.
+    for ident, node in [(k[2:], v) for k, v in baseline.items()
+                        if k.startswith(b'O/') and v[:8] == b'FFEXT001' and v[8] > 0]:
+        level = node[8]
+        cases.update({
+            f'internal-level-{level}': (ident, lambda b, n=level: b[:8]+bytes([(n+1)%6])+b[9:]),
+            f'internal-zero-{level}': (ident, lambda b: b[:12]+bytes(32)+b[44:]),
+            f'internal-missing-{level}': (ident, lambda b: b[:12]+b'\xfe'*32+b[44:]),
+            f'internal-count-{level}': (ident, lambda b: b[:9]+struct.pack('<H', 257)+b[11:]),
+            f'internal-short-{level}': (ident, lambda b: b[:-1]),
+        })
+    descriptors = [(k[2:], v) for k, v in baseline.items() if k.startswith(b'O/') and v[:8] == b'FFFILE01']
+    assert len(descriptors) == 1
+    descriptor_id, descriptor = descriptors[0]
+    cases.update({
+        'descriptor-size': (descriptor_id, lambda b: b[:8]+struct.pack('<Q', 700001)+b[16:]),
+        'descriptor-short': (descriptor_id, lambda b: b[:-1]),
+        'descriptor-missing-root': (descriptor_id, lambda b: b[:16]+b'\xfe'*32),
+        'descriptor-wrong-root-role': (descriptor_id, lambda b: b[:16]+last_data),
+        'zero-data-block': (last_data, lambda b: bytes(65536)),
+        'oversized-data-block': (last_data, lambda b: b+b'\0'),
+    })
     # A byte-identical logical rewrite is the positive control for the encoder.
     valid = root/'valid.pack'; valid.write_bytes(rewritten(leaf_id, lambda b: b))
     restored = root/'valid'; run('replay', valid, restored)

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 BIN,FAULT=sys.argv[1:3]
+original = b'original' if len(sys.argv)<4 else (b'original'+bytes(range(256))*((int(sys.argv[3])+255)//256))[:int(sys.argv[3])]
 def run(*args,ok=True):
     p=subprocess.run([BIN,*map(str,args)],capture_output=True,timeout=10)
     assert (p.returncode==0)==ok,(args,p.stderr)
@@ -17,7 +18,7 @@ def run(*args,ok=True):
 with tempfile.TemporaryDirectory(prefix='ff-hcrash-',dir='/tmp') as tmp:
     root=Path(tmp);db=root/'store';data=root/'input';endpoint=root/'control.sock'
     run('init',db);run('fs-init',db)
-    data.write_bytes(b'original');run('fs-write',db,'/f',data)
+    data.write_bytes(original);run('fs-write',db,'/f',data)
     data.write_bytes(b'source');run('fs-write',db,'/source',data)
     run('fs-symlink',db,'/new-target','/dangling');run('fs-snapshot',db,'base');data.write_bytes(b'XY');baseline=root/'baseline';shutil.copytree(db,baseline)
     for stage in ['leveldb_before_write','leveldb_after_write']:
@@ -44,17 +45,17 @@ with tempfile.TemporaryDirectory(prefix='ff-hcrash-',dir='/tmp') as tmp:
                 endpoint.unlink()
                 committed=stage=='leveldb_after_write'
                 if op=='fs-unlink':run('fs-stat',db,'/f',ok=not committed)
-                elif op=='fs-save':assert run('fs-cat',db,'/f')==(b'XY' if committed else b'original')
-                elif op=='fs-hwrite':assert run('fs-cat',db,'/f')==(b'originalXY' if committed else b'original')
+                elif op=='fs-save':assert run('fs-cat',db,'/f')==(b'XY' if committed else original)
+                elif op=='fs-hwrite':assert run('fs-cat',db,'/f')==(original+b'XY' if committed else original)
                 elif op=='fs-open':
                     if args[0] in ['/new','/dangling']:
                         target='/new-target' if args[0]=='/dangling' else '/new';run('fs-stat',db,target,ok=committed)
                         assert run('fs-readlink',db,'/dangling')==b'/new-target'
-                    else:assert run('fs-cat',db,'/f')==(b'' if committed else b'original')
+                    else:assert run('fs-cat',db,'/f')==(b'' if committed else original)
                 else:
-                    assert run('fs-cat',db,'/f')==(b'source' if committed else b'original')
+                    assert run('fs-cat',db,'/f')==(b'source' if committed else original)
                     run('fs-stat',db,'/source',ok=not committed)
-                assert run('fs-cat',db,'/f','--revision','base')==b'original'
+                assert run('fs-cat',db,'/f','--revision','base')==original
                 run('fs-check',db);run('fs-check',db,'--revision','base')
                 # Dead handle retention aliases are released; immutable objects remain.
                 before=json.loads(run('check',db))['last_committed_seq']
