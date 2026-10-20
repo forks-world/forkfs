@@ -14,8 +14,10 @@ live writable World.
 Lookup, attributes, symlink reads, regular-file reads and directory enumeration
 use logical inodes. Revision mutation callbacks return EROFS. Hardlinks reuse the same
 FSItem. Numeric item IDs last only for this volume lifetime, and persistent IDs
-are explicitly disabled. At most 4096 items are retained; quota exhaustion
-returns ENFILE. Directory cookies are entry ordinals in the immutable
+are explicitly disabled. IDs are allocated monotonically without a 4096-item
+quota and never reused during a mount; exhaustion of the 64-bit counter fails
+with EOVERFLOW. The identity table grows with distinct observed inodes until
+revocation; this is not bounded-memory identity management. Directory cookies are entry ordinals in the immutable
 revision; resumed enumeration currently scans earlier entries again.
 
 This uses the Operations compatibility protocols, deprecated by the installed
@@ -134,7 +136,7 @@ Each retained regular FSItem pins a backend read/write handle. This is an intern
 lifetime pin, not an authorization decision or a POSIX open mode. Hardlinks share
 that pin. Reads, attributes and xattrs continue to work after unlink until reclaim
 or revocation closes it. Reclaim invalidates the old FSItem and retains its numeric
-identity for subsequent lookup; the existing 4096 lifetime identity limit remains.
+identity for subsequent lookup, without a 4096 lifetime identity limit.
 Revocation closes pins before releasing engine references and returns cleanup
 errors; failed cleanup can be retried, while further callbacks remain revoked.
 Deactivate propagates cleanup failure. Restore must happen after revoking the

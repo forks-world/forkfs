@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <iostream>
 #include <cstring>
+#include <set>
 #include <unistd.h>
 #define CHECK(value) do {if(!(value))throw std::runtime_error("World callback failure at line "+std::to_string(__LINE__));}while(0)
 @interface WorldBuffer : NSObject
@@ -121,6 +122,33 @@ int main(){@autoreleasepool{
             auto store=std::make_shared<forkfs::Container>(path);forkfs::Namespace work(*store,"work");
             CHECK(work.get_inode_xattr(work.stat("/").id,"user.binary")==std::vector<unsigned char>({0,255}));
             CHECK(work.list("/")==std::vector<std::string>({"dir","link"}));work.verify();store->verify();
+        }
+        {
+            auto scalePath=std::string(dir)+"/scale";forkfs::Container::create(scalePath);
+            auto store=std::make_shared<forkfs::Container>(scalePath);forkfs::Namespace fs(*store);fs.initialize();
+            NSError *error=nil;auto volume=[[ForkRevisionVolume alloc] initWithStore:store world:@"main" error:&error];CHECK(volume && !error);
+            auto root=volume.rootItem;std::set<uint64_t> identities;
+            // More than the old mount-lifetime quota, while keeping few FSItems live.
+            for(unsigned i=0;i<4200;++i){@autoreleasepool{
+                auto name=[NSString stringWithFormat:@"entry-%u",i];__block FSItem *created=nil;
+                if(i%2){
+                    [volume createSymbolicLinkNamed:[FSFileName nameWithString:name] inDirectory:root attributes:[FSItemSetAttributesRequest new]
+                        linkContents:[FSFileName nameWithString:@"target"] replyHandler:^(FSItem *item,FSFileName *,NSError *e){CHECK(!e && item);created=item;}];
+                }else{
+                    [volume createItemNamed:[FSFileName nameWithString:name] type:FSItemTypeFile inDirectory:root attributes:[FSItemSetAttributesRequest new]
+                        replyHandler:^(FSItem *item,FSFileName *,NSError *e){CHECK(!e && item);created=item;}];
+                }
+                CHECK(created);auto number=attrs(volume,created).fileID;CHECK(identities.insert((uint64_t)number).second);
+                [volume reclaimItem:created replyHandler:^(NSError *e){CHECK(!e);}];
+                auto reopened=lookup(volume,root,name);CHECK(reopened!=created && attrs(volume,reopened).fileID==number);
+                [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:created replyHandler:^(FSItemAttributes *a,NSError *e){CHECK(!a && e.code==ESTALE);}];
+                [volume reclaimItem:reopened replyHandler:^(NSError *e){CHECK(!e);}];
+            }}
+            CHECK(identities.size()==4200 && fs.list("/").size()==4200);
+            for(unsigned i=1;i<4200;i+=2)fs.remove("/entry-"+std::to_string(i),false);
+            CHECK(fs.list("/").size()==2100);
+            auto survivor=lookup(volume,root,@"entry-4198");CHECK(identities.contains((uint64_t)attrs(volume,survivor).fileID));
+            CHECK([volume revoke]==nil);fs.verify();store->verify();
         }
         {
             auto preview=std::make_shared<forkfs::Container>(path,forkfs::Container::OpenMode::RevisionPreview);

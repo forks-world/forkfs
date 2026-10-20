@@ -76,8 +76,10 @@ directory fsync and is not a crash-durable editor-save assertion.
 Native runs of the workload functions test the harness only. They are not forkfs
 performance measurements. Real mount cache coherency, dirty buffer writeback,
 permissions, large project item limits and mount latency remain acceptance gates.
-The current adapter retains at most 4096 items and is not yet approved for large
-repositories.
+The adapter assigns monotonic mount-local item identities without a 4096-item
+limit. Numeric identities remain stable across reclaim and are not reused during
+a mount. The identity map grows with distinct observed inodes until unmount;
+this is not a bounded-memory cache or large-repository performance acceptance.
 
 ## Offline GC
 
