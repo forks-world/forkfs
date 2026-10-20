@@ -3,6 +3,7 @@
 #include "file_content.h"
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <unistd.h>
 @interface ForkRevisionItem : FSItem
 @property(nonatomic,copy) NSString *inode;
@@ -84,7 +85,8 @@ struct WorldEnumeration {
 - (FSItemID)numberForInode:(const forkfs::InodeInfo&)info root:(BOOL)root {
     NSString *key=[NSString stringWithUTF8String:info.id.c_str()];
     if(!_numbers[key]){
-        if(_numbers.count>=4096)throw std::system_error(ENFILE,std::generic_category(),"item identity quota exceeded");
+        if(!root && _next==std::numeric_limits<uint64_t>::max())
+            throw std::system_error(EOVERFLOW,std::generic_category(),"item identity space exhausted");
         _numbers[key]=@(root?FSItemIDRootDirectory:(FSItemID)_next++);
     }
     return (FSItemID)_numbers[key].unsignedLongLongValue;
@@ -325,7 +327,7 @@ struct WorldEnumeration {
         auto dir=[self checked:directory];if(_readOnly){reply(nil,nil,err(EROFS));return;}
         if(type!=FSItemTypeFile && type!=FSItemTypeDirectory){reply(nil,nil,err(ENOTSUP));return;}
         auto [a,consumed]=requestAttributes(req,true,type);auto component=fileName(name);
-        if(_numbers.count>=4096){reply(nil,nil,err(ENFILE));return;}
+        if(_next==std::numeric_limits<uint64_t>::max()){reply(nil,nil,err(EOVERFLOW));return;}
         std::string handle;auto n=_view->create_child(dir.inode.UTF8String,component,type==FSItemTypeDirectory,a,type==FSItemTypeFile?&handle:nullptr);
         auto created=[self item:n root:NO handle:handle.empty()?nil:[NSString stringWithUTF8String:handle.c_str()]];
         if(n.directory)created.parentInode=dir.inode;req.consumedAttributes=consumed;reply(created,name,nil);
@@ -336,7 +338,7 @@ struct WorldEnumeration {
     @synchronized(self){try{
         auto dir=[self checked:directory];if(_readOnly){reply(nil,nil,err(EROFS));return;}
         auto [a,consumed]=requestAttributes(req,true,FSItemTypeSymlink);auto component=fileName(name),target=fileName(contents);
-        if(_numbers.count>=4096){reply(nil,nil,err(ENFILE));return;}
+        if(_next==std::numeric_limits<uint64_t>::max()){reply(nil,nil,err(EOVERFLOW));return;}
         auto n=_view->symlink_child(dir.inode.UTF8String,component,target,a);auto created=[self item:n root:NO];
         req.consumedAttributes=consumed;reply(created,name,nil);
     }catch(const std::system_error& e){reply(nil,nil,err(e.code().value()));}catch(const std::exception&){reply(nil,nil,err(EIO));}}
