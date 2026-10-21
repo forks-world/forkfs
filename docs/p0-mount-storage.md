@@ -69,6 +69,43 @@ process-info denial. Restricted compilation/linking is therefore not accepted
 yet; selecting CLT binaries alone does not resolve it. Do not re-enable process
 inspection as a fallback. A separate UID/VM execution boundary is required before
 claiming both host-credential isolation and ordinary developer build support.
+
+The next acceptance gate is `scripts/tests/uid_boundary.py`, an opt-in root-only
+experiment for disposable macOS hosts. CI runs it on macOS 15 and 26 with the
+runner account as host and the existing `_www` account as worker. It installs no
+accounts/services and changes no production launcher permissions. Children drop
+all supplementary groups, primary GID and UID before exec, and receive fresh
+environments and private HOME/TMPDIR. Probes also require attempts to regain
+UID 0, GID 0 or supplementary group 0 to fail. The experiment alone permits process-info
+inside its sandbox; the ordinary launcher retains its unconditional denial.
+It requires a readable host marker from the host UID, a readable worker marker
+from the worker UID inside the experimental sandbox, and EPERM/EACCES/EINVAL for the
+host marker from the worker both with and without the sandbox. This positive
+control distinguishes real cross-UID protection from a broken query. It also
+requires compiling, linking and executing C and C++20 programs inside that same sandbox,
+including a C++ standard-library program that writes a workspace file,
+and rejects backing reads under both POSIX permissions and the sandbox.
+EINVAL is intentional: Apple's published
+[XNU `sysctl_procargsx` implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sysctl.c)
+returns it for a UID mismatch. Probes use `SC_ARG_MAX`-sized buffers and require
+same-query positive controls and live markers, rather than accepting arbitrary
+query failure as isolation evidence.
+
+On a disposable Mac, run with a real non-root host account and a separate
+non-root worker account/group (the example uses existing `_www`):
+
+```sh
+sudo python3 scripts/tests/uid_boundary.py --host-user "$(id -un)" --worker-user _www
+```
+
+A pass is a UID/toolchain prerequisite only: the fixture is an ordinary native
+directory, not a mounted acceptance run. It does not enable a production UID
+launcher, attest an FSKit mount, or validate management/frontend/service RPC
+separation. The proposed deployment still needs a trusted identity broker,
+per-agent identities/lifecycle, workspace ownership and mount access, and real
+mounted build and escape tests. Agents sharing a worker UID can inspect each
+other's process arguments; do not reuse it across mutually untrusted agents.
+
 The sandbox explicitly denies process-info operations and limits sysctl grants
 to basic system/CPU metadata. The process-info denial is necessary to block
 argument/environment queries such as kern.procargs2; sysctl filters alone do
