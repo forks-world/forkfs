@@ -70,7 +70,7 @@ int64_t signed_number(const std::string& text){
     need(parsed.ec==std::errc{} && parsed.ptr==text.data()+text.size(),"invalid signed offset");return value;
 }
 std::string names(const std::vector<std::string>& values){std::string out;for(const auto& s:values)out+=s+'\n';return out;}
-std::string quoted(const std::string& value){
+std::string rpc_json_quote(const std::string& value){
     std::string out="\"";for(char c:value){if(c=='\"' || c=='\\')out+='\\';out+=c;}return out+"\"";
 }
 std::string inode_json(const InodeInfo& n){
@@ -96,20 +96,24 @@ struct Session {
     std::chrono::milliseconds lease;Clock::time_point deadline;bool closing=false;
     std::map<std::string,OwnedHandle> handles;
     std::map<std::string,OwnedDirectory> directories;
+    std::optional<OwnedHandle> mount;
 };
 class Sessions {
 public:
-    explicit Sessions(Container& store):store_(store){}
-    std::string create(uint64_t lease){
+    explicit Sessions(Container& store):store_(store),instance_(random_token()){}
+    const std::string& instance()const{return instance_;}
+    std::string create(uint64_t lease,std::optional<OwnedHandle> mount=std::nullopt){
         need(lease>=100 && lease<=300000,"session lease must be 100..300000 ms");
         need(values_.size()<128,"session limit reached");auto token=random_token();
         while(values_.contains(token))token=random_token();
         auto duration=std::chrono::milliseconds(lease);
-        values_.emplace(token,Session{duration,Clock::now()+duration,false,{},{}});return token;
+        values_.emplace(token,Session{duration,Clock::now()+duration,false,{},{},std::move(mount)});return token;
+    }
+    Session& inspect(const std::string& token){
+        auto it=values_.find(token);need(it!=values_.end() && !it->second.closing && Clock::now()<it->second.deadline,"invalid or expired session");return it->second;
     }
     Session& acquire(const std::string& token){
-        auto it=values_.find(token);need(it!=values_.end() && !it->second.closing && Clock::now()<it->second.deadline,"invalid or expired session");
-        it->second.deadline=Clock::now()+it->second.lease;return it->second;
+        auto& session=inspect(token);session.deadline=Clock::now()+session.lease;return session;
     }
     void close(const std::string& token){
         auto it=values_.find(token);need(it!=values_.end(),"invalid or expired session");auto& session=it->second;session.closing=true;
@@ -128,20 +132,23 @@ public:
     void revoke_world(const std::string& world){
         // Namespace::restore already removed engine handles/orphans. Remove
         // session ownership without attempting to close those revoked tokens.
+        std::vector<std::string> revoked;
         for(auto& [token,session]:values_) {
+            if(session.mount && !session.mount->revision && session.mount->view==world)revoked.push_back(token);
             std::erase_if(session.handles,[&](const auto& item){return !item.second.revision && item.second.view==world;});
             std::erase_if(session.directories,[&](const auto& item){return !item.second.revision && item.second.view==world;});
         }
+        for(const auto& token:revoked)close(token);
     }
     void shutdown(){while(!values_.empty())close(values_.begin()->first);}
 private:
-    Container& store_;std::map<std::string,Session> values_;
+    Container& store_;const std::string instance_;std::map<std::string,Session> values_;
 };
 struct Activity {
     Session* session;
     ~Activity(){if(session && !session->closing)session->deadline=Clock::now()+session->lease;}
 };
-std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string> args){
+std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string> args,bool manager){
     const auto op=args[0];std::string view="main";bool revision=false;
     size_t count=2;
     if(op=="status" || op=="storage-profile" || op=="fs-init" || op=="fs-check" || op=="fs-worlds" || op=="fs-revisions" || op=="fs-compact")count=1;
@@ -151,16 +158,24 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="backup-catalog-start")count=4;
     if(op=="replay-catalog-start")count=5;
     if(op=="replay-export-start")count=4;
-    if(op=="fs-read-at" || op=="fs-write-at" || op=="fs-hread" || op=="fs-hwrite" || op=="fs-hseek" || op=="fs-hrange-lock")count=4;
+    if(op=="fs-iread" || op=="fs-read-at" || op=="fs-write-at" || op=="fs-hread" || op=="fs-hwrite" || op=="fs-hseek" || op=="fs-hrange-lock")count=4;
     if(op=="fs-setattr" || op=="fs-isetattr" || op=="fs-hsetattr" ||
        op=="fs-igetxattr" || op=="fs-hgetxattr" || op=="fs-iremovexattr" || op=="fs-hremovexattr")count=3;
     if(op=="fs-isetxattr" || op=="fs-hsetxattr")count=5;
-    std::string session_token;bool selected_view=false;
+    if(op=="fs-iroot" || op=="service-hello")count=1;
+    if(op=="mount-open")count=4;
+    if(op=="fs-ilookup" || op=="fs-iopen")count=3;
+    if(op=="fs-ilink")count=4;
+    if(op=="fs-icreate" || op=="fs-isymlink" || op=="fs-iremove")count=5;
+    if(op=="fs-irename")count=7;
+    std::string session_token,generation;bool selected_view=false;
     while(args.size()>=count+2) {
         const auto& selector=args[args.size()-2];const auto& value=args.back();
         if(selector=="--world" || selector=="--revision") {
             need(op.starts_with("fs-") && !selected_view,"invalid or duplicate view selector");
             view=value;revision=selector=="--revision";selected_view=true;
+        } else if(selector=="--generation"){
+            need(generation.empty() && !value.empty(),"invalid or duplicate service generation");generation=value;
         } else if(selector=="--session") {
             need(!op.starts_with("session-") && session_token.empty(),"invalid or duplicate session selector");
             need(!value.empty(),"empty session token");session_token=value;
@@ -169,18 +184,51 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     need(args.size()==count,"invalid RPC command arguments");
     for(size_t i=0;i<args.size();++i)if(!(((op=="fs-write" || op=="fs-save" || op=="fs-append" || op=="fs-happend" || op=="fs-hwrite-next") && i==2) || ((op=="fs-write-at" || op=="fs-hwrite") && i==3) || ((op=="fs-isetxattr" || op=="fs-hsetxattr") && i==4)))need(args[i].find('\0')==std::string::npos,"NUL in RPC argument");
+    if(!generation.empty())need(generation==sessions.instance(),"service generation mismatch");
+    if(!manager && op!="service-hello" && op!="mount-keepalive" && op!="mount-revoke"){
+        need(!session_token.empty() && sessions.inspect(session_token).mount.has_value(),"frontend requires a mount session");
+    }
+    if(!session_token.empty())if(auto& current=sessions.inspect(session_token);current.mount){
+        need(!generation.empty(),"mount request requires service generation");
+        static const std::set<std::string> allowed={
+            "fs-iroot","fs-iparent","fs-ilookup","fs-istat","fs-iread","fs-ireadlink",
+            "fs-icreate","fs-isymlink","fs-ilink","fs-iremove","fs-irename","fs-iopen",
+            "fs-isetattr","fs-ilistxattr","fs-igetxattr","fs-isetxattr","fs-iremovexattr",
+            "fs-close","fs-dup","fs-hread","fs-hwrite","fs-hstat","fs-htruncate","fs-happend",
+            "fs-hread-next","fs-hwrite-next","fs-hseek","fs-hlock","fs-hrange-lock",
+            "fs-hsetattr","fs-hlistxattr","fs-hgetxattr","fs-hsetxattr","fs-hremovexattr",
+            "fs-dir-iopen","fs-dir-page","fs-dir-entries","fs-dir-rewind","fs-dir-close"};
+        need(allowed.contains(op),"operation is not permitted for a mount session");
+        need(!selected_view || (view==current.mount->view && revision==current.mount->revision),"mount session belongs to another view");
+        view=current.mount->view;revision=current.mount->revision;
+    }
+    if(op=="service-hello")return "{\"protocol\":1,\"generation\":"+rpc_json_quote(sessions.instance())+"}\n";
+    if(op=="mount-open"){
+        need(!generation.empty(),"mount requires service generation");
+        need(args[1]=="world" || args[1]=="revision","invalid mount view type");
+        need(session_token.empty(),"mount-open does not accept a session");
+        Namespace selected(store,args[2],args[1]=="revision");selected.root_inode();
+        auto token=sessions.create(number(args[3]),OwnedHandle{args[2],args[1]=="revision"});
+        return "{\"session\":"+rpc_json_quote(token)+",\"generation\":"+rpc_json_quote(sessions.instance())+"}\n";
+    }
+    if(op=="mount-keepalive" || op=="mount-revoke"){
+        need(!generation.empty() && session_token.empty(),"mount lifecycle requires generation and positional session");
+        need(sessions.inspect(args[1]).mount.has_value(),"not a mount session");
+        if(op=="mount-revoke")sessions.close(args[1]);else sessions.acquire(args[1]);
+        return "{\"generation\":"+rpc_json_quote(sessions.instance())+"}\n";
+    }
     if(op=="session-open") {
         auto lease=number(args[1]);auto token=sessions.create(lease);
         return "{\"session\":\""+token+"\",\"lease_ms\":"+std::to_string(lease)+"}\n";
     }
-    if(op=="session-keepalive"){sessions.acquire(args[1]);return store.status();}
-    if(op=="session-close"){sessions.acquire(args[1]);sessions.close(args[1]);return store.status();}
-    bool handle_op=op=="fs-open" || op=="fs-close" || op=="fs-dup" || op.starts_with("fs-h");
+    if(op=="session-keepalive"){need(!sessions.inspect(args[1]).mount,"use mount-keepalive for mount sessions");sessions.acquire(args[1]);return store.status();}
+    if(op=="session-close"){need(!sessions.inspect(args[1]).mount,"use mount-revoke for mount sessions");sessions.acquire(args[1]);sessions.close(args[1]);return store.status();}
+    bool handle_op=op=="fs-iopen" || op=="fs-open" || op=="fs-close" || op=="fs-dup" || op.starts_with("fs-h");
     bool dir_op=op.starts_with("fs-dir-");
-    need(!(handle_op || dir_op) || !session_token.empty(),"handle operations require --session TOKEN");
+    need(!(handle_op || dir_op || op=="fs-icreate") || !session_token.empty(),"handle operations require --session TOKEN");
     Activity activity{session_token.empty()?nullptr:&sessions.acquire(session_token)};
-    if(handle_op && op!="fs-open")need(activity.session->handles.contains(args[1]),"handle belongs to another session");
-    if(dir_op && op!="fs-dir-open") {
+    if(handle_op && op!="fs-open" && op!="fs-iopen")need(activity.session->handles.contains(args[1]),"handle belongs to another session");
+    if(dir_op && op!="fs-dir-open" && op!="fs-dir-iopen") {
         auto i=activity.session->directories.find(args[1]);need(i!=activity.session->directories.end(),"invalid directory cursor/session");
         need(i->second.view==view && i->second.revision==revision,"directory cursor belongs to another view");
     }
@@ -194,6 +242,28 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="backup-status")return store.backup_status(args[1]);
     if(op=="backup-forget"){store.forget_backup(args[1]);return "{\"forgotten\":true}\n";}
     Namespace fs(store,view,revision);
+    if(op=="fs-iroot")return inode_json(fs.root_inode())+"\n";
+    if(op=="fs-ireadlink")return fs.readlink_inode(args[1]);
+    if(op=="fs-iread"){auto b=fs.read_inode(args[1],number(args[2]),std::min<uint64_t>(number(args[3]),limit-4));return std::string(b.begin(),b.end());}
+    if(op=="fs-iparent")return inode_json(fs.parent_inode(args[1]))+"\n";
+    if(op=="fs-ilookup")return inode_json(fs.lookup_child(args[1],args[2]))+"\n";
+    if(op=="fs-icreate"){
+        need(args[3]=="file" || args[3]=="directory","invalid inode creation type");
+        if(args[3]=="file")need(activity.session->handles.size()<256,"session handle limit reached");
+        std::string handle;auto n=fs.create_child(args[1],args[2],args[3]=="directory",attributes(args[4]),args[3]=="file"?&handle:nullptr);
+        if(!handle.empty())try{activity.session->handles.emplace(handle,OwnedHandle{view,revision});}catch(...){fs.close(handle);throw;}
+        return "{\"inode\":"+inode_json(n)+",\"handle\":"+(handle.empty()?"null":rpc_json_quote(handle))+"}\n";
+    }
+    if(op=="fs-isymlink")return inode_json(fs.symlink_child(args[1],args[2],args[3],attributes(args[4])))+"\n";
+    if(op=="fs-ilink")return inode_json(fs.link_child(args[1],args[2],args[3]))+"\n";
+    if(op=="fs-iremove"){
+        need(args[4]=="file" || args[4]=="directory","invalid inode removal type");
+        fs.remove_child(args[1],args[2],args[3],args[4]=="directory");return store.status();
+    }
+    if(op=="fs-irename"){
+        fs.rename_child(args[1],args[2],args[3],args[4],args[5],args[6].empty()?std::nullopt:std::optional<std::string>(args[6]));
+        return store.status();
+    }
     if(op=="fs-istat")return inode_json(fs.stat_inode(args[1]))+"\n";
     if(op=="fs-setattr" || op=="fs-isetattr" || op=="fs-hsetattr"){
         auto a=attributes(args[2]);
@@ -223,9 +293,9 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         if(handle_op)fs.remove_handle_xattr(args[1],args[2]);else fs.remove_inode_xattr(args[1],args[2]);
         return store.status();
     }
-    if(op=="fs-dir-open") {
+    if(op=="fs-dir-open" || op=="fs-dir-iopen") {
         need(activity.session->directories.size()<64 && sessions.directory_count()<1024,"directory cursor limit reached");
-        auto cursor=fs.open_directory(args[1]);auto token=random_token();
+        auto cursor=op=="fs-dir-iopen"?fs.open_directory_inode(args[1]):fs.open_directory(args[1]);auto token=random_token();
         while(activity.session->directories.contains(token))token=random_token();
         activity.session->directories.emplace(token,OwnedDirectory{view,revision,std::move(cursor)});
         return "{\"cursor\":\""+token+"\"}\n";
@@ -236,13 +306,13 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         auto limit=number(args[2]);need(limit>=1 && limit<=1024,"directory page limit must be 1..1024");
         bool attrs=op=="fs-dir-entries";auto page=fs.read_directory(activity.session->directories.at(args[1]).cursor,limit,attrs);
         std::string result=attrs?"{\"entries\":[":"{\"names\":[";bool first=true;
-        if(attrs)for(const auto& entry:page.entries){if(!first)result+=',';first=false;result+="{\"name\":"+quoted(entry.name)+",\"inode\":"+inode_json(entry.inode)+"}";}
-        else for(const auto& name:page.names){if(!first)result+=',';first=false;result+=quoted(name);}
+        if(attrs)for(const auto& entry:page.entries){if(!first)result+=',';first=false;result+="{\"name\":"+rpc_json_quote(entry.name)+",\"inode\":"+inode_json(entry.inode)+"}";}
+        else for(const auto& name:page.names){if(!first)result+=',';first=false;result+=rpc_json_quote(name);}
         return result+"],\"eof\":"+(page.eof?"true":"false")+"}\n";
     }
     if(op=="fs-cat"){auto b=fs.read(args[1]);return std::string(b.begin(),b.end());}
     if(op=="fs-read-at"){auto b=fs.read_at(args[1],number(args[2]),std::min<uint64_t>(number(args[3]),limit-4));return std::string(b.begin(),b.end());}
-    if(op=="fs-open") {
+    if(op=="fs-open" || op=="fs-iopen") {
         auto comma=args[2].find(',');auto mode=args[2].substr(0,comma);
         need(mode=="r" || mode=="w" || mode=="rw","invalid handle access mode");
         auto access=mode=="r"?Namespace::Access::Read:mode=="w"?Namespace::Access::Write:Namespace::Access::ReadWrite;
@@ -258,7 +328,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
             else throw std::runtime_error("unsupported open flag");
         }
         need(activity.session->handles.size()<256,"session handle limit reached");
-        auto handle=fs.open(args[1],access,options);
+        auto handle=op=="fs-iopen"?fs.open_inode(args[1],access,options):fs.open(args[1],access,options);
         try{activity.session->handles.emplace(handle,OwnedHandle{view,revision});}catch(...){fs.close(handle);throw;}
         return "{\"handle\":\""+handle+"\"}\n";
     }
@@ -337,17 +407,17 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     return store.status();
 }
 struct Peer {
-    int fd;std::string in,out;size_t sent=0;bool done=false;
+    int fd;std::string in,out;size_t sent=0;bool done=false;bool manager=false;
     Clock::time_point deadline=Clock::now()+std::chrono::seconds(5);
     explicit Peer(int n):fd(n){}
     ~Peer(){if(fd>=0)close(fd);}
 };
-bool owner(int fd){
+bool owner(int fd,uid_t control_uid){
 #ifdef __APPLE__
-    uid_t uid;gid_t gid;return getpeereid(fd,&uid,&gid)==0 && uid==geteuid();
+    uid_t uid;gid_t gid;return getpeereid(fd,&uid,&gid)==0 && uid==control_uid;
 #else
     struct ucred creds{};socklen_t n=sizeof(creds);
-    return getsockopt(fd,SOL_SOCKET,SO_PEERCRED,&creds,&n)==0 && creds.uid==geteuid();
+    return getsockopt(fd,SOL_SOCKET,SO_PEERCRED,&creds,&n)==0 && creds.uid==control_uid;
 #endif
 }
 void wait_fd(int fd,short events,Clock::time_point deadline){
@@ -357,7 +427,7 @@ void wait_fd(int fd,short events,Clock::time_point deadline){
     }
 }
 }
-void serve_rpc(int listener,Container& container,const volatile sig_atomic_t& stopping){
+void serve_rpc(int listener,Container& container,const volatile sig_atomic_t& stopping,uid_t control_uid,std::optional<uid_t> frontend_uid){
     std::vector<std::unique_ptr<Peer>> peers;Sessions sessions(container);
     while(!stopping){
         sessions.expire();
@@ -379,7 +449,7 @@ void serve_rpc(int listener,Container& container,const volatile sig_atomic_t& st
                             need(!memcmp(p.in.data(),"FFRPC001",8),"unsupported RPC protocol");
                             auto length=u32(p.in,8);need(length>=4 && length<=limit,"invalid RPC request length");
                             need(p.in.size()<=header+length,"trailing RPC frame");
-                            if(p.in.size()==header+length)p.out=response(0,dispatch(container,sessions,decode(p.in)));
+                            if(p.in.size()==header+length)p.out=response(0,dispatch(container,sessions,decode(p.in),p.manager));
                         }
                     }catch(const std::system_error& e){
                         // Existing clients treat any nonzero status as failure.
@@ -397,13 +467,17 @@ void serve_rpc(int listener,Container& container,const volatile sig_atomic_t& st
         peers.erase(std::remove_if(peers.begin(),peers.end(),[](const auto& p){return p->done;}),peers.end());
         if(polls[0].revents&POLLIN){int fd=accept(listener,nullptr,nullptr);
             if(fd>=0){auto p=std::make_unique<Peer>(fd);
-                if(peers.size()<16 && owner(fd) && fcntl(fd,F_SETFD,FD_CLOEXEC)==0 && fcntl(fd,F_SETFL,O_NONBLOCK)==0)peers.push_back(std::move(p));
+                p->manager=owner(fd,control_uid);
+                if(peers.size()<16 && (p->manager || (frontend_uid && owner(fd,*frontend_uid))) && fcntl(fd,F_SETFD,FD_CLOEXEC)==0 && fcntl(fd,F_SETFL,O_NONBLOCK)==0)peers.push_back(std::move(p));
             }else need(errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR,"RPC accept failed");
         }
     }
     sessions.shutdown();
 }
 std::string request_rpc(const std::string& path,const std::vector<std::string>& fields){
+    return request_rpc(path,fields,geteuid());
+}
+std::string request_rpc(const std::string& path,const std::vector<std::string>& fields,uid_t expected_server){
     need(!fields.empty() && fields.size()<=16,"RPC requires 1..16 fields");std::string payload;put32(payload,fields.size());
     for(const auto& field:fields){need(field.size()<=limit,"oversized RPC field");put32(payload,field.size());payload+=field;}
     auto request=frame("FFRPC001",payload);sockaddr_un addr{};
@@ -418,6 +492,7 @@ std::string request_rpc(const std::string& path,const std::vector<std::string>& 
         need(errno==EINPROGRESS,"RPC connect failed");wait_fd(peer.fd,POLLOUT,deadline);
         int error=0;socklen_t len=sizeof(error);need(getsockopt(peer.fd,SOL_SOCKET,SO_ERROR,&error,&len)==0 && error==0,"RPC connect failed");
     }
+    need(owner(peer.fd,expected_server),"RPC server identity mismatch");
     size_t sent=0;
     while(sent<request.size()){
         wait_fd(peer.fd,POLLOUT,deadline);

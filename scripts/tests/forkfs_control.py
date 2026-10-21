@@ -11,7 +11,7 @@ import time
 
 binary = Path(sys.argv[1]).resolve()
 script = Path(__file__).resolve().parents[1] / 'forkfs.py'
-with tempfile.TemporaryDirectory(prefix='ff-control-', dir='/tmp') as temp:
+with tempfile.TemporaryDirectory(prefix='ff-control-') as temp:
     root = Path(temp)
     repository = root / 'repo with spaces'
     endpoint = root / 'rpc.sock'
@@ -54,7 +54,7 @@ with tempfile.TemporaryDirectory(prefix='ff-control-', dir='/tmp') as temp:
     shared.mkdir(mode=0o755)
     shared.chmod(0o755)
     rejected = subprocess.run(prefix + ['--repo', str(repository), 'serve', '--listen', str(shared / 'control.sock')], capture_output=True, timeout=10)
-    assert rejected.returncode == 1 and b'socket parent must be a private directory' in rejected.stderr, rejected.stderr
+    assert rejected.returncode == 1 and b'socket parent must be service-owned' in rejected.stderr, rejected.stderr
     assert not (shared / 'control.sock').exists()
     proc = subprocess.Popen(prefix + ['--repo', str(repository), 'serve', '--listen', str(endpoint)],
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

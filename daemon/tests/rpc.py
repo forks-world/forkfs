@@ -1,6 +1,7 @@
 """Resident namespace protocol, framing limits, isolation and restart."""
 from concurrent.futures import ThreadPoolExecutor
 import json
+import errno
 import os
 from pathlib import Path
 import signal
@@ -33,7 +34,7 @@ def response(sock):
     n=struct.unpack('<I',h[8:])[0];assert 4<=n<=1024*1024
     b=exact(sock,n);return struct.unpack('<I',b[:4])[0],b[4:]
 
-with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
+with tempfile.TemporaryDirectory(prefix='ffrpc-') as tmp:
     root=Path(tmp);db=root/'store';endpoint=root/'control.sock';data=root/'input'
     offline('init',db)
     def start():
@@ -47,7 +48,7 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         return p
     session=None
     def raw(fields,ok=True,fragment=False):
-        if fields[0] in ['fs-open','fs-close'] or fields[0].startswith('fs-h'):
+        if fields[0] in ['fs-open','fs-close','fs-iopen','fs-icreate'] or fields[0].startswith(('fs-h','fs-dir-')):
             fields=[*fields,'--session',session]
         with socket.socket(socket.AF_UNIX) as s:
             s.settimeout(10);s.connect(str(endpoint));b=frame(fields)
@@ -60,7 +61,7 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
             assert s.recv(1)==b''
             return value
     def cli(*args,ok=True):
-        if args[0] in ['fs-open','fs-close'] or args[0].startswith('fs-h'):
+        if args[0] in ['fs-open','fs-close','fs-iopen','fs-icreate'] or args[0].startswith(('fs-h','fs-dir-')):
             args=(*args,'--session',session)
         p=subprocess.run([BIN,'request',str(endpoint),*map(str,args)],capture_output=True,timeout=10)
         assert (p.returncode==0)==ok,(args,p.stderr)
@@ -76,6 +77,101 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         cli('fs-link','/src/file','/alias')
         assert json.loads(cli('fs-stat','/alias'))['links']==2
         cli('fs-snapshot','base');cli('fs-fork','base','work')
+        # Inode-addressed RPC must survive parent rename and replacement of its old path.
+        root_id=json.loads(cli('fs-iroot'))['inode_id']
+        d=json.loads(cli('fs-icreate',root_id,'remote-dir','directory','mode=755'))['inode']['inode_id']
+        created=json.loads(cli('fs-icreate',d,'file','file','mode=600'))
+        inode=created['inode']['inode_id'];pin=created['handle'];assert pin
+        raw(['fs-hwrite',pin,'0',b'inode bytes'])
+        assert cli('fs-iread',inode,'0','64')==b'inode bytes'
+        unscoped=subprocess.run([BIN,'request',str(endpoint),'fs-icreate',d,'no-session','file','mode=600'],capture_output=True,timeout=10)
+        assert unscoped.returncode!=0 and b'require --session' in unscoped.stderr
+        cli('fs-ilookup',d,'no-session',ok=False)
+        cursor=json.loads(cli('fs-dir-iopen',d))['cursor']
+        cli('fs-irename',root_id,'remote-dir',root_id,'moved-dir',d,'')
+        replacement=json.loads(cli('fs-icreate',root_id,'remote-dir','directory','mode=755'))['inode']['inode_id']
+        assert replacement!=d and json.loads(cli('fs-ilookup',d,'file'))['inode_id']==inode
+        assert json.loads(cli('fs-iparent',d))['inode_id']==root_id
+        page=json.loads(cli('fs-dir-entries',cursor,'128'));assert any(e['name']=='file' and e['inode']['inode_id']==inode for e in page['entries'])
+        cli('fs-dir-close',cursor)
+        second_pin=json.loads(cli('fs-iopen',inode,'r'))['handle']
+        assert cli('fs-hread',second_pin,'0','64')==b'inode bytes'
+        cli('fs-close',second_pin)
+        assert json.loads(cli('fs-ilink',inode,d,'alias'))['inode_id']==inode
+        # Expected-inode mismatches must report ESTALE, never unlink a replacement.
+        for stale in (['fs-iremove',d,'file',replacement,'file'],
+                      ['fs-irename',d,'file',d,'alias',inode,replacement]):
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(5);client.connect(str(endpoint));client.sendall(frame(stale))
+                code,_=response(client);assert code==0x80000000|errno.ESTALE,code
+        assert json.loads(cli('fs-ilookup',d,'file'))['inode_id']==inode
+        assert json.loads(cli('fs-ilookup',d,'alias'))['inode_id']==inode
+        cli('fs-irename',d,'file',d,'renamed',inode,'')
+        cli('fs-iremove',d,'renamed',inode,'file');cli('fs-iremove',d,'alias',inode,'file')
+        newer=json.loads(cli('fs-icreate',d,'renamed','file','mode=600'))
+        assert newer['inode']['inode_id']!=inode
+        assert cli('fs-hread',pin,'0','64')==b'inode bytes'
+        cli('fs-close',pin);cli('fs-close',newer['handle'])
+        cli('fs-iremove',d,'renamed',newer['inode']['inode_id'],'file')
+        # Directories do not consume session handles, so creating one must
+        # remain available when all 256 file handles are already occupied.
+        full_handles=[json.loads(cli('fs-open','/src/file','r'))['handle'] for _ in range(256)]
+        full_dir=json.loads(cli('fs-icreate',root_id,'at-limit','directory','mode=755'))
+        assert full_dir['handle'] is None
+        full_dir_id=full_dir['inode']['inode_id']
+        cli('fs-icreate',full_dir_id,'rejected-file','file','mode=600',ok=False)
+        cli('fs-ilookup',full_dir_id,'rejected-file',ok=False)
+        cli('fs-close',full_handles.pop())
+        admitted=json.loads(cli('fs-icreate',full_dir_id,'admitted-file','file','mode=600'))
+        assert admitted['handle']
+        cli('fs-close',admitted['handle'])
+        for handle in full_handles:cli('fs-close',handle)
+        cli('fs-iremove',full_dir_id,'admitted-file',admitted['inode']['inode_id'],'file')
+        cli('fs-iremove',root_id,'at-limit',full_dir_id,'directory')
+        link=json.loads(cli('fs-isymlink',d,'link','target','mode=777'))['inode_id']
+        assert cli('fs-ireadlink',link)==b'target';cli('fs-iremove',d,'link',link,'file')
+        cli('fs-iremove',root_id,'moved-dir',d,'directory');cli('fs-iremove',root_id,'remote-dir',replacement,'directory')
+        cli('fs-icreate',root_id,'forbidden','directory','mode=755','--revision','base',ok=False)
+        # Mount sessions are bound to one view and one service process generation.
+        generation=json.loads(cli('service-hello'))['generation']
+        mount=json.loads(cli('mount-open','world','work','60000','--generation',generation))['session']
+        def mounted(fields,token=mount,epoch=generation,ok=True):
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(5);client.connect(str(endpoint))
+                client.sendall(frame([*fields,'--session',token,'--generation',epoch]))
+                code,value=response(client);assert (code==0)==ok,(fields,code,value)
+                return value
+        work_root=json.loads(mounted(['fs-iroot']))['inode_id']
+        mounted(['fs-iroot','--world','main'],ok=False)
+        for fields in (['status'],['backup-start','forbidden','/tmp/not-created'],
+                       ['fs-restore','base'],['session-open','60000'],['service-hello']):mounted(fields,ok=False)
+        mounted(['fs-iroot'],epoch='wrong-generation',ok=False)
+        # A request with no generation must not execute or silently become management.
+        denied=subprocess.run([BIN,'request',str(endpoint),'fs-iroot','--session',mount],capture_output=True,timeout=10)
+        assert denied.returncode!=0 and b'requires service generation' in denied.stderr
+        pinned=json.loads(mounted(['fs-icreate',work_root,'mount-orphan','file','mode=600']))
+        mh=pinned['handle'];mi=pinned['inode']['inode_id']
+        mounted(['fs-hwrite',mh,'0',b'mount retained data'])
+        mc=json.loads(mounted(['fs-dir-iopen',work_root]))['cursor']
+        mounted(['fs-iremove',work_root,'mount-orphan',mi,'file'])
+        assert mounted(['fs-hread',mh,'0','100'])==b'mount retained data'
+        cli('mount-keepalive',mount,'--generation',generation)
+        cli('session-close',mount,ok=False)
+        cli('mount-revoke',mount,'--generation',generation)
+        mounted(['fs-iroot'],ok=False);mounted(['fs-hread',mh,'0','100'],ok=False)
+        mounted(['fs-dir-entries',mc,'128'],ok=False)
+        cli('session-keepalive',mount,ok=False)
+        ro=json.loads(cli('mount-open','revision','base','60000','--generation',generation))['session']
+        ro_root=json.loads(mounted(['fs-iroot'],token=ro))['inode_id']
+        mounted(['fs-icreate',ro_root,'forbidden','directory','mode=755'],token=ro,ok=False)
+        cli('mount-revoke',ro,'--generation',generation)
+        # A World restore revokes mount authority as well as its retained handles.
+        restored=json.loads(cli('mount-open','world','work','60000','--generation',generation))['session']
+        cli('fs-restore','base','--world','work')
+        mounted(['fs-iroot'],token=restored,ok=False)
+        expiring=json.loads(cli('mount-open','world','main','100','--generation',generation))['session']
+        time.sleep(.2);mounted(['fs-iroot'],token=expiring,ok=False)
+        restart_mount=json.loads(cli('mount-open','world','main','60000','--generation',generation))['session']
         raw(['fs-write','/src/file',b'branch\0bytes','--world','work'])
         assert cli('fs-cat','/src/file','--world','work')==b'branch\0bytes'
         assert cli('fs-cat','/src/file','--revision','base')==payload
@@ -154,6 +250,9 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         cli('fs-check')
         # Successful writes survive process death, with revision isolation intact.
         proc.kill();proc.wait(timeout=5);endpoint.unlink();proc=start()
+        next_generation=json.loads(cli('service-hello'))['generation'];assert next_generation!=generation
+        mounted(['fs-iroot'],token=restart_mount,epoch=generation,ok=False)
+        cli('mount-open','world','main','60000','--generation',generation,ok=False)
         session=json.loads(cli('session-open','60000'))['session']
         cli('fs-hstat',expired,ok=False);cli('fs-stat','/dead-handle',ok=False)
         assert cli('fs-cat','/src/file','--revision','base')==payload
@@ -169,3 +268,84 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         print('resident RPC operations, binary data, branches, framing, concurrency and recovery passed')
     finally:
         if proc.poll() is None:proc.kill();proc.wait(timeout=5)
+
+# Select the management identity explicitly; peer credentials are authoritative.
+with tempfile.TemporaryDirectory(prefix='ffrpc-identity-') as tmp:
+    root=Path(tmp);db=root/'store';offline('init',db)
+    for value in ('-1','+1','1x','4294967295','18446744073709551616'):
+        p=subprocess.run([BIN,'serve',str(db),'--socket',str(root/'invalid.sock'),'--rpc','--control-uid',value],capture_output=True,timeout=10)
+        assert p.returncode!=0 and b'invalid control UID' in p.stderr,(value,p.stderr)
+        assert not (root/'invalid.sock').exists()
+    for selected in (os.geteuid(),os.geteuid()+1):
+        separate=selected!=os.geteuid();runtime=root/str(selected);runtime.mkdir(mode=0o711 if separate else 0o700)
+        endpoint=runtime/'control.sock'
+        p=subprocess.Popen([BIN,'serve',str(db),'--socket',str(endpoint),'--rpc','--control-uid',str(selected)],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        try:
+            deadline=time.monotonic()+5
+            while not endpoint.exists():
+                assert p.poll() is None,p.communicate()
+                assert time.monotonic()<deadline
+                time.sleep(.01)
+            assert json.loads(p.stdout.readline())['service']=='forkfsd'
+            assert endpoint.stat().st_mode&0o777==(0o666 if separate else 0o700),oct(endpoint.stat().st_mode)
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(5);client.connect(str(endpoint))
+                if separate:
+                    try:
+                        client.sendall(frame(['fs-init']))
+                        assert client.recv(12)==b'','unauthorized UID received a response'
+                    except OSError as error:
+                        assert error.errno in (errno.ECONNRESET,errno.EPIPE,errno.ENOTCONN),error
+                else:
+                    client.sendall(frame(['status']));code,value=response(client);assert code==0,(code,value)
+                    verified=subprocess.run([BIN,'request',str(endpoint),'--server-uid',str(os.geteuid()),'status'],capture_output=True,timeout=10)
+                    assert verified.returncode==0 and json.loads(verified.stdout)['service']=='forkfsd',verified.stderr
+            assert p.poll() is None
+        finally:
+            p.send_signal(signal.SIGTERM);out,err=p.communicate(timeout=10);assert p.returncode==0,(out,err)
+        assert not endpoint.exists()
+    # Unauthorized fs-init must not have changed the repository.
+    result=subprocess.run([BIN,'fs-stat',str(db),'/'],capture_output=True,timeout=10)
+    assert result.returncode!=0
+
+# A convincing endpoint path is insufficient: no payload reaches a wrong-UID server.
+with tempfile.TemporaryDirectory(prefix='ffrpc-spoof-') as tmp:
+    root=Path(tmp);endpoint=root/'fake.sock';secret=root/'payload';secret.write_bytes(b'private management payload')
+    with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as listener,ThreadPoolExecutor(max_workers=1) as workers:
+        listener.bind(str(endpoint));listener.listen();listener.settimeout(5)
+        def receive():
+            client,_=listener.accept()
+            with client:
+                client.settimeout(5)
+                return client.recv(1024)
+        future=workers.submit(receive)
+        result=subprocess.run([BIN,'request',str(endpoint),'--server-uid',str(os.geteuid()+1),
+                               'fs-write','/file',str(secret)],capture_output=True,timeout=10)
+        assert result.returncode!=0 and b'RPC server identity mismatch' in result.stderr,result.stderr
+        assert future.result(timeout=6)==b'','client leaked request bytes to an untrusted service'
+
+# Real peer UID is admitted only as frontend, not as management. Running both
+# test processes under one UID checks protocol roles, not deployment isolation.
+with tempfile.TemporaryDirectory(prefix='ffrpc-role-') as tmp:
+    root=Path(tmp);db=root/'store';offline('init',db);root.chmod(0o711);endpoint=root/'control.sock'
+    proc=subprocess.Popen([BIN,'serve',str(db),'--socket',str(endpoint),'--rpc','--control-uid',str(os.geteuid()+1),
+                           '--frontend-uid',str(os.geteuid())],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    try:
+        deadline=time.monotonic()+5
+        while not endpoint.exists():
+            assert proc.poll() is None,proc.communicate()
+            assert time.monotonic()<deadline;time.sleep(.01)
+        assert json.loads(proc.stdout.readline())['service']=='forkfsd'
+        hello=subprocess.run([BIN,'request',str(endpoint),'service-hello'],capture_output=True,timeout=10)
+        assert hello.returncode==0,hello.stderr
+        epoch=json.loads(hello.stdout)['generation']
+        for fields in (['status'],['session-open','60000'],['fs-init'],
+                       ['mount-open','world','main','60000','--generation',epoch],
+                       ['fs-iroot'],['fs-iroot','--session','forged','--generation',epoch]):
+            result=subprocess.run([BIN,'request',str(endpoint),*fields],capture_output=True,timeout=10)
+            assert result.returncode!=0,(fields,result.stdout)
+        assert proc.poll() is None
+    finally:
+        proc.send_signal(signal.SIGTERM);out,err=proc.communicate(timeout=10);assert proc.returncode==0,(out,err)
+    assert not endpoint.exists()
+    assert subprocess.run([BIN,'fs-stat',str(db),'/'],capture_output=True,timeout=10).returncode!=0

@@ -53,6 +53,31 @@ Network access and arbitrary Mach service access are not granted. Some toolchain
 will need further scoped permissions; failures must remain failures, without an
 unrestricted retry. The sandbox is tested with real denied reads/writes on macOS.
 
+The launcher builds a fresh environment instead of filtering the host environment.
+Only a fixed system/CLT PATH, private HOME/TMPDIR, locale, and noninteractive Git
+configuration are passed. If installed, the fixed system Command Line Tools
+directory is selected explicitly; full Xcode installations need separately scoped
+toolchain support. API/cloud tokens, proxy credentials, SSH agent sockets,
+control endpoints, shell startup hooks and language-runtime injection variables
+are not inherited. Tools requiring credentials currently fail; no secret forwarding
+or automatic unrestricted retry is supported. Executables from extra toolchains
+must use an absolute path and an explicit read-only toolchain grant.
+Relative executable paths are interpreted under the selected mount. Apple tool
+shims that require process inspection are not supported; use actual CLT binaries.
+On the tested macOS 27 toolchain, the linker also fails under the unconditional
+process-info denial. Restricted compilation/linking is therefore not accepted
+yet; selecting CLT binaries alone does not resolve it. Do not re-enable process
+inspection as a fallback. A separate UID/VM execution boundary is required before
+claiming both host-credential isolation and ordinary developer build support.
+The sandbox explicitly denies process-info operations and limits sysctl grants
+to basic system/CPU metadata. The process-info denial is necessary to block
+argument/environment queries such as kern.procargs2; sysctl filters alone do
+not block that query on the tested macOS version. A runtime test
+checks both permitted CPU discovery and denial of an external marker process.
+The parent and its permitted stdio streams remain trusted: a cooperating external
+process can relay commands or data through pipes, so this is not protection from
+a malicious host supervisor.
+
 This is **not isolation from other processes owned by the host user**. An agent
 launched outside this sandbox still has the host user's access. Global protection
 requires an independently enforced launcher/service identity boundary. The
@@ -159,3 +184,158 @@ On the current development machine, no valid signing identity or registered
 extension is available. The app builds, but no actual FSKit mount, mounted workload
 percentile, mounted permission boundary or 300 ms mount target has been measured.
 These three P0s are therefore not all closed by this change.
+
+## Separate service and management identities
+
+The standalone RPC daemon accepts an explicit management UID:
+
+```
+forkfsd serve STORE --socket RUNTIME/control.sock --rpc --control-uid ADMIN_UID
+```
+
+The daemon must already run as the dedicated service UID; this option does not
+create users, change identity, install a privileged helper or move the FSKit
+engine. The service owns a private (0700) STORE. For a different management UID,
+RUNTIME must be service-owned mode 0711, with non-writable trusted ancestors.
+Only the socket becomes 0666, so another UID can connect; kernel peer credentials
+are checked against ADMIN_UID before request bytes are read or dispatched. No
+UID asserted inside the request is trusted. Without a configured frontend UID, other UIDs, including the service UID
+when it differs from ADMIN_UID, receive no RPC response. The default remains
+same-UID control with a private runtime directory. A matching UID has all RPC
+management privileges; there is no per-operation capability delegation yet.
+
+Agents must run as a third, unprivileged UID or inside the restricted launcher.
+If an unrestricted agent shares ADMIN_UID, it still has management authority.
+Do not share the backing service UID with agents. The actual FSKit extension
+currently opens its engine under the host identity; migrating it to an
+independently authenticated service transport remains necessary before claiming
+whole-product identity isolation. No accounts or system services are installed
+by this change. Dedicated-account installation and a real cross-UID permitted
+client require deployment-level validation; local ordinary-user regressions
+verify a real matching peer and rejection when the configured UID differs.
+
+### Generate the macOS service configuration
+
+```
+python3 scripts/fskit/service_plan.py --service-user _forkfs --admin-uid 501 \
+  --binary /Library/PrivilegedHelperTools/forkfsd \
+  --backing /Library/Forkfs/store --runtime /Library/Forkfs/runtime \
+  --output ./world.forks.forkfsd.plist --preflight
+```
+
+Replace 501 with the actual management UID. This writes only a new, mode-0600
+output file and prints a machine-readable report. It never creates an account,
+changes owners, installs a plist, or calls launchctl. A missing service account
+or unsafe POSIX layout produces a blocked result and exit status 2; the generated
+plist remains available for review. Without --preflight the result is plan_only,
+not evidence that a configuration can be installed.
+
+The launchd plan runs the executable directly as the dedicated non-root user,
+with a fixed PATH, private umask, core dumps disabled and restart throttling.
+Preflight requires a non-login shell, a service UID distinct from management,
+a root-owned single-link executable, service-owned STORE (0700), service-owned
+RUNTIME (0711), and non-writable ancestors owned by root/the relevant owner.
+Symlink paths and ancestors are rejected. It does not audit ACLs or create a
+privileged installation channel. A reviewed production installation must also
+verify ACLs, protect the launchd plist as root-owned/non-writable by agents,
+verify the executable signature, and test actual permitted and rejected UIDs.
+The legacy in-process FSKit adapter cannot use this daemon concurrently: exclusive
+repository ownership intentionally prevents that unsupported combination.
+
+### Authenticate the service before sending a request
+
+```
+forkfsd request RUNTIME/control.sock --server-uid SERVICE_UID status
+```
+
+Clients pin the daemon UID independently of the endpoint path and verify kernel
+peer credentials immediately after connect, before transmitting any request
+bytes, session tokens or file payloads. The default expected server UID is the
+caller's effective UID; cross-UID services require an explicit --server-uid from
+trusted deployment configuration. A value supplied by an agent, a socket file's
+owner or an unauthenticated reply is not an identity authority. Both checks are
+required: server authenticates management UID and client authenticates service
+UID. This verifies an OS identity, not an executable signature or service instance;
+processes sharing the service UID must therefore all be trusted. Root is outside
+this isolation boundary.
+
+The FSKit remote adapter must consume the inode, mount-session and generation
+contracts below. Path commands must not emulate inode operations by rebuilding
+paths: rename and open-unlink would make that unsafe. The current FSKit adapter
+continues using its local engine until the remote adapter is implemented.
+
+### Inode-addressed RPC frontend contract
+
+These are management-authorized operations; inode IDs are addresses, not access
+capabilities. They accept the existing --world/--revision selectors. No host path
+is resolved by these operations.
+
+| Operation | Arguments after operation | Result |
+| --- | --- | --- |
+| fs-iroot | none | inode attributes |
+| fs-iparent | directory inode | parent inode attributes |
+| fs-ilookup | parent inode, component | inode attributes |
+| fs-iread | inode, offset, count | bounded binary payload |
+| fs-ireadlink | inode | link target |
+| fs-icreate | parent, component, file/directory, attribute patch | inode plus handle (null for directory) |
+| fs-isymlink | parent, component, target, attribute patch | inode attributes |
+| fs-ilink | source inode, destination parent, component | inode attributes |
+| fs-iremove | parent, component, expected inode, file/directory | status |
+| fs-irename | source parent, source component, destination parent, destination component, expected source, expected target | status |
+| fs-iopen | inode, existing handle access/flags | session handle |
+| fs-dir-iopen | directory inode | session directory cursor |
+
+fs-icreate, fs-iopen and directory operations require --session. File creation
+publishes an atomic read/write handle together with the namespace change;
+clients release it using fs-close. Existing handle operations retain inode
+identity after rename/unlink. Directory cursors retain their existing view and
+session binding. Mutations of immutable revision views fail read-only.
+An empty expected target in fs-irename requires the destination to be absent;
+otherwise it must identify the exact existing target. Remove and rename identity
+mismatches fail ESTALE. Paths reconstructed from cached names must not substitute
+for these inode operations. Attribute patches use the existing bounded codec.
+
+These endpoints enable transport implementation; they do not switch the FSKit
+adapter to remote service mode, authenticate a filesystem extension executable,
+or provide a mount-scoped authorization/revocation capability.
+
+### Mount session lifecycle and service generation
+
+After verifying the service UID, management calls service-hello to obtain the
+protocol version and a random generation for this daemon process. It then calls
+`mount-open world NAME LEASE_MS --generation GENERATION` (or revision) to obtain
+a session bound to that exact view. Leases retain the existing 100..300000 ms
+range. Every mounted filesystem operation supplies both --session and
+--generation; omitted, stale or mismatched generations fail before dispatch.
+Explicit view selectors, if present, must exactly match the bound view.
+
+Mounted sessions allow only an explicit inode/handle/directory operation list.
+Backup, restore, snapshot, generic session creation and status operations cannot
+be invoked with such a session. A revision binding is read-only. Use
+`mount-keepalive TOKEN --generation GENERATION` to renew and
+`mount-revoke TOKEN --generation GENERATION` to close retained handles and drop
+cursors. Failed cleanup leaves the session closing and unusable until cleanup
+succeeds. Lease expiry also cleans it up. Management restore revokes affected
+World mount sessions after the engine revokes their handles. Generation changes
+on daemon restart; clients must revoke their local volume rather than silently
+reopening old handles against a new instance. An uncertain mutation must not be
+retried automatically after reconnect.
+
+By default this remains view/lifecycle scoping on a management-only endpoint:
+the management UID can omit a session and retains full authority. For enforced
+frontend admission configure `--rpc --control-uid ADMIN_UID --frontend-uid FRONTEND_UID`.
+These two UIDs must differ. The server derives the role from kernel peer
+credentials, never from request fields. Frontend peers may obtain service-hello;
+all filesystem operations require a valid, generation-bound mount session.
+They cannot create generic or mount sessions, call management operations without
+credentials, or use a legacy management session as a mount session. Holders may
+renew/revoke their mounted session. Management creates and securely delivers the
+mount token; delivery to FSKit has not yet been implemented. A shared Unix socket
+does not imply shared privileges.
+
+Deployment must also keep frontend and backing-service UIDs distinct; the
+service planner rejects that overlap. The standalone CLI permits it for protocol
+tests but it provides no backing-file isolation. An untrusted agent must not
+share ADMIN_UID. FSKit transport integration and real three-identity deployment
+validation remain necessary for end-to-end isolation. Generation identifies a
+process, not a durable repository identity or a signature on its executable.

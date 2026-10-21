@@ -121,10 +121,21 @@ def profile(mount,backing,scratch,read_only=()):
     if any(inside(backing,p) or inside(p,backing) for p in readonly):raise ValueError('read-only grants overlap backing')
     quote=lambda p:json.dumps(str(p),ensure_ascii=False)
     terms=lambda paths:' '.join('(subpath '+quote(p)+')' for p in paths)
+    # realpath/toolchain startup needs ancestor metadata, not directory contents.
+    ancestors=sorted({parent for path in readonly+[mount,scratch,Path('/dev/null')]
+                      for parent in path.parents},key=str)
+    metadata=' '.join('(literal '+quote(p)+')' for p in ancestors)
     return '\n'.join([
         '(version 1)','(deny default)',
-        '(allow process-exec process-fork sysctl-read)',
+        '(allow process-exec process-fork)',
+        '(allow sysctl-read (sysctl-name-prefix "hw."))',
+        '(allow sysctl-read (sysctl-name-prefix "machdep."))',
+        '(allow sysctl-read (sysctl-name-prefix "kern.os"))',
+        '(allow sysctl-read (sysctl-name "kern.version") (sysctl-name "kern.hostname") '
+            '(sysctl-name "kern.boottime") (sysctl-name "kern.argmax") (sysctl-name "vm.pagesize"))',
+        '(deny process-info*)',
         '(allow file-read* (literal "/"))',
+        '(allow file-read-metadata '+metadata+')',
         '(allow file-read* '+terms(readonly+[mount,scratch])+')',
         '(allow file-write* '+terms([mount,scratch])+')',
         '(allow file-read* file-write* (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random"))',
@@ -133,19 +144,39 @@ def profile(mount,backing,scratch,read_only=()):
         '(deny file* (subpath '+quote(backing)+'))',
     ])+'\n'
 
+def workload_environment(scratch):
+    """Construct a fresh environment; host credentials and IPC hints never cross."""
+    scratch=Path(scratch).resolve(strict=True)
+    home=scratch/'home';temporary=scratch/'tmp'
+    home.mkdir(mode=0o700);temporary.mkdir(mode=0o700)
+    system_path='/usr/bin:/bin:/usr/sbin:/sbin'
+    environment=dict(PATH=system_path,HOME=str(home),
+                TMPDIR=str(temporary)+'/',LANG='en_US.UTF-8',LC_ALL='en_US.UTF-8',
+                GIT_CONFIG_NOSYSTEM='1',GIT_CONFIG_GLOBAL='/dev/null',
+                GIT_TERMINAL_PROMPT='0')
+    # Avoid the xcrun shim consulting host selection files outside the sandbox.
+    developer=Path('/Library/Developer/CommandLineTools')
+    if developer.is_dir():
+        environment['DEVELOPER_DIR']=str(developer)
+        environment['PATH']=str(developer/'usr/bin')+':'+system_path
+    return environment
+
 def run(mount,backing,command,read_only=()):
     if platform.system()!='Darwin':raise RuntimeError('restricted workload launcher requires macOS')
+    mount=Path(mount).resolve(strict=True)
     require_mount(mount)
     backing,backing_files=validate_backing(backing,read_only)
     validate_stdio(backing,backing_files=backing_files)
-    executable=shutil.which(command[0])
-    if not executable:raise ValueError('workload executable was not found')
-    # No ambient directory descriptors, preload settings or control sockets.
-    env={k:v for k,v in os.environ.items() if not k.startswith(('DYLD_','LD_','PYTHON','GIT_'))}
+    # No ambient directory descriptors, credentials, preload settings or IPC hints.
     with tempfile.TemporaryDirectory(prefix='forkfs-workload-',dir='/tmp') as directory:
-        scratch=Path(directory).resolve();env['TMPDIR']=str(scratch)
+        scratch=Path(directory).resolve();env=workload_environment(scratch)
+        requested=command[0]
+        if not Path(requested).is_absolute() and os.path.sep in requested:
+            requested=str((mount/requested).resolve())
+        executable=shutil.which(requested,path=env['PATH'])
+        if not executable:raise ValueError('workload executable was not found')
         policy=profile(mount,backing,scratch,read_only)
-        return subprocess.run(['/usr/bin/sandbox-exec','-p',policy,str(Path(executable).resolve()),*command[1:]],
+        return subprocess.run(['/usr/bin/sandbox-exec','-p',policy,executable,*command[1:]],
                               cwd=mount,env=env,close_fds=True).returncode
 
 def main():
