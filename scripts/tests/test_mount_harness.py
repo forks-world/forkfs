@@ -13,9 +13,28 @@ from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'fskit'))
 import mount_probe
 from restricted_workload import profile,validate_backing,validate_owner_lease,validate_stdio
+from restricted_workload import workload_environment
 import mounted_acceptance
 
 class Harness(unittest.TestCase):
+    def test_environment_does_not_inherit_credentials_or_control_endpoints(self):
+        secrets=dict(OPENAI_API_KEY='host-token',AWS_SECRET_ACCESS_KEY='cloud-token',
+                     SSH_AUTH_SOCK='/host/ssh',FORKFS_SOCKET='/host/control',
+                     HTTPS_PROXY='http://credential@proxy',BASH_ENV='/host/startup',
+                     ENV='/host/startup',HOME='/host/home',PATH='/host/bin',
+                     GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='core.sshCommand',
+                     GIT_CONFIG_VALUE_0='host-program',NODE_OPTIONS='--require=/host/script')
+        with tempfile.TemporaryDirectory() as name,patch.dict(os.environ,secrets):
+            environment=workload_environment(name)
+            for key in secrets:
+                if key not in ('HOME','PATH'):self.assertNotIn(key,environment)
+            self.assertEqual(environment['PATH'],'/usr/bin:/bin:/usr/sbin:/sbin')
+            home=Path(environment['HOME']);self.assertEqual(home.parent,Path(name).resolve())
+            self.assertEqual(list(home.iterdir()),[])
+            self.assertEqual(home.stat().st_mode&0o777,0o700)
+            self.assertTrue(Path(environment['TMPDIR']).is_dir())
+            self.assertEqual(environment['GIT_CONFIG_GLOBAL'],'/dev/null')
+
     def test_attestation_rejects_fakes(self):
         with tempfile.TemporaryDirectory() as name:
             root=Path(name)
@@ -131,6 +150,21 @@ class Harness(unittest.TestCase):
             (dirs[0]/'escape').symlink_to(dirs[1],target_is_directory=True)
             self.assertEqual(run('/bin/cat',dirs[0]/'escape'/'secret').returncode,1)
             self.assertEqual(run('/usr/bin/touch',dirs[0]/'escape'/'through-link').returncode,1)
+            # The complete descendant tree remains constrained, including a shell.
+            self.assertNotEqual(run('/bin/sh','-c','exec /bin/cat "$1"','probe',secret).returncode,0)
+            # Positive interpreter probe prevents an exec failure from posing as denial.
+            python='/Library/Developer/CommandLineTools/usr/bin/python3'
+            self.assertTrue(Path(python).is_file(),'CLT Python is required for the runtime probes')
+            self.assertEqual(run(python,'-c','print(42)').stdout.strip(),b'42')
+            control=root/'control.sock'
+            with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as server:
+                server.bind(str(control));server.listen()
+                code='import errno,socket,sys\ntry:\n s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1])\nexcept OSError as e: sys.exit(73 if e.errno in (errno.EPERM,errno.EACCES) else 74)'
+                self.assertEqual(run(python,'-c',code,control).returncode,73)
+            with socket.socket() as server:
+                server.bind(('127.0.0.1',0));server.listen()
+                code='import errno,socket,sys\ntry: socket.create_connection(("127.0.0.1",int(sys.argv[1])),timeout=2)\nexcept OSError as e: sys.exit(73 if e.errno in (errno.EPERM,errno.EACCES) else 74)'
+                self.assertEqual(run(python,'-c',code,server.getsockname()[1]).returncode,73)
             outside=root/'outside';outside.write_text('outside')
             self.assertEqual(run('/bin/cat',outside).returncode,1)
     @unittest.skipUnless(platform.system()=='Darwin','macOS statfs')

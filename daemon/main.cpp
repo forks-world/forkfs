@@ -27,6 +27,14 @@
 namespace {
 volatile sig_atomic_t stopping = 0;
 void stop(int) { stopping = 1; }
+uid_t parse_uid(const std::string& value){
+    uint64_t parsed=0;
+    if(value.empty() || value.find_first_not_of("0123456789")!=std::string::npos)throw std::runtime_error("invalid UID");
+    auto result=std::from_chars(value.data(),value.data()+value.size(),parsed);
+    if(result.ec!=std::errc{} || result.ptr!=value.data()+value.size() || parsed>=static_cast<uint64_t>(static_cast<uid_t>(-1)))throw std::runtime_error("invalid UID");
+    return static_cast<uid_t>(parsed);
+}
+
 [[noreturn]] void fail(const char* what) {
     throw std::system_error(errno, std::generic_category(), what);
 }
@@ -94,14 +102,15 @@ std::vector<forkfs::Mutation> load_batch(const char* path) {
     if(pos!=b.size()) throw std::runtime_error("trailing batch input bytes");
     return result;
 }
-void serve(forkfs::Container& container, const std::string& path,bool rpc=false) {
+void serve(forkfs::Container& container, const std::string& path,bool rpc,uid_t control_uid,std::optional<uid_t> frontend_uid) {
     // Use a private, pre-created runtime directory. Never unlink an existing
     // socket: it may be the control endpoint of a live service.
+    const bool separate_control=rpc && (control_uid!=geteuid() || frontend_uid.has_value());
     auto parent = std::filesystem::path(path).parent_path();
     struct stat st{};
     if (parent.empty() || lstat(parent.c_str(), &st) < 0 || !S_ISDIR(st.st_mode) ||
-        st.st_uid != geteuid() || (st.st_mode & 077) != 0)
-        throw std::runtime_error("socket parent must be a private directory owned by this user (0700)");
+        st.st_uid != geteuid() || (separate_control ? (st.st_mode & 0777)!=0711 : (st.st_mode & 077)!=0))
+        throw std::runtime_error("socket parent must be service-owned: 0700 for same UID, 0711 for separate control UID");
     sockaddr_un addr{};
     if (path.size() >= sizeof(addr.sun_path)) throw std::runtime_error("socket path too long");
     addr.sun_family = AF_UNIX;
@@ -114,10 +123,12 @@ void serve(forkfs::Container& container, const std::string& path,bool rpc=false)
     if (bind(listener.fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) fail("bind");
     if (lstat(path.c_str(), &st) < 0) fail("stat socket");
     listener.path = path; listener.dev = st.st_dev; listener.ino = st.st_ino;
+    // Traversable endpoint, authenticated before any request is read. Backing stays private.
+    if(separate_control && chmod(path.c_str(),0666)<0)fail("set control socket permissions");
     if (listen(listener.fd, 16) < 0) fail("listen");
     container.start_compaction();
     std::cout << container.status() << std::flush;
-    if(rpc){forkfs::serve_rpc(listener.fd,container,stopping);return;}
+    if(rpc){forkfs::serve_rpc(listener.fd,container,stopping,control_uid,frontend_uid);return;}
     while (!stopping) {
         pollfd p{listener.fd, POLLIN, 0};
         int r = poll(&p, 1, 100);
@@ -161,8 +172,8 @@ int main(int argc, char** argv) {
                          "forkfsd restore-plan SEQUENCE REPOSITORY_ID CHAIN_HASH ARCHIVE... | --catalog CATALOG\n"
                          "forkfsd restore DESTINATION SEQUENCE REPOSITORY_ID CHAIN_HASH ARCHIVE... | --catalog CATALOG\n"
                          "forkfsd init REPOSITORY_DIRECTORY\nforkfsd check CONTAINER\n"
-                         "forkfsd serve CONTAINER --socket PATH [--rpc]\n"
-                         "forkfsd request SOCKET COMMAND [ARGS...]\n"
+                         "forkfsd serve CONTAINER --socket PATH [--rpc [--control-uid UID [--frontend-uid UID]]]\n"
+                         "forkfsd request SOCKET [--server-uid UID] COMMAND [ARGS...]\n"
                          "RPC sessions: session-open LEASE_MS, session-keepalive TOKEN, session-close TOKEN\n"
                          "RPC handle operations require --session TOKEN.\n"
                          "RPC handles: fs-open PATH MODE[,create][,exclusive][,truncate][,append][,nofollow], fs-close HANDLE, fs-hstat HANDLE\n"
@@ -170,7 +181,11 @@ int main(int argc, char** argv) {
                          "fs-happend HANDLE INPUT_FILE, fs-htruncate HANDLE SIZE\n"
                          "fs-dup HANDLE, fs-hseek HANDLE SIGNED_OFFSET set|cur|end\n"
                          "fs-hread-next HANDLE COUNT, fs-hwrite-next HANDLE INPUT_FILE\n"
-                         "RPC: fs-dir-open PATH, fs-dir-page CURSOR LIMIT, fs-dir-entries CURSOR LIMIT, fs-dir-close CURSOR\n"
+                         "RPC inode: fs-iroot, fs-iparent ID, fs-ilookup PARENT NAME, fs-iopen ID MODE\n"
+                         "RPC inode: fs-icreate PARENT NAME TYPE ATTRS, fs-isymlink PARENT NAME TARGET ATTRS\n"
+                         "RPC inode: fs-ilink SOURCE PARENT NAME, fs-iremove PARENT NAME EXPECTED TYPE\n"
+                         "RPC inode: fs-irename SRC_PARENT SRC_NAME DST_PARENT DST_NAME EXPECTED_SRC EXPECTED_DST\n"
+                         "RPC: fs-dir-iopen INODE, fs-dir-open PATH, fs-dir-page CURSOR LIMIT, fs-dir-entries CURSOR LIMIT, fs-dir-close CURSOR\n"
                          "forkfsd checkpoint CONTAINER\n"
                          "forkfsd object-put CONTAINER KEY INPUT_FILE\n"
                          "forkfsd object-get CONTAINER KEY\n"
@@ -217,7 +232,12 @@ int main(int argc, char** argv) {
         std::string command = argv[1];
         if(command=="request") {
             if(argc<4)throw std::runtime_error("request requires socket and command");
-            std::vector<std::string> fields(argv+3,argv+argc);
+            uid_t expected_server=geteuid();int first=3;
+            if(std::string(argv[3])=="--server-uid"){
+                if(argc<6)throw std::runtime_error("request requires --server-uid UID COMMAND");
+                expected_server=parse_uid(argv[4]);first=5;
+            }
+            std::vector<std::string> fields(argv+first,argv+argc);
             if(fields[0]=="fs-write" || fields[0]=="fs-save" || fields[0]=="fs-write-at" || fields[0]=="fs-append" || fields[0]=="fs-hwrite" || fields[0]=="fs-happend" || fields[0]=="fs-hwrite-next") {
                 size_t index=(fields[0]=="fs-write-at" || fields[0]=="fs-hwrite")?3:2;
                 if(fields.size()!=index+1 && fields.size()!=index+3 && fields.size()!=index+5)throw std::runtime_error("write command requires input file");
@@ -227,7 +247,7 @@ int main(int argc, char** argv) {
                 if(fields.size()!=5 && fields.size()!=7 && fields.size()!=9)throw std::runtime_error("setxattr requires address, name, policy and input file");
                 auto data=load_file(fields[4].c_str());fields[4].assign(data.begin(),data.end());
             }
-            auto result=forkfs::request_rpc(argv[2],fields);
+            auto result=forkfs::request_rpc(argv[2],fields,expected_server);
             std::cout.write(result.data(),result.size());
             if(!std::cout)throw std::runtime_error("cannot write RPC output");return 0;
         }
@@ -389,7 +409,17 @@ int main(int argc, char** argv) {
                 return 0;
             } else throw std::runtime_error("invalid filesystem command arguments");
             std::cout<<container.status();
-        } else if (command == "serve" && (argc == 5 || (argc==6 && std::string(argv[5])=="--rpc")) && std::string(argv[3]) == "--socket") {
+        } else if (command == "serve" && (argc == 5 || ((argc==6 || argc==8 || argc==10) && std::string(argv[5])=="--rpc")) && std::string(argv[3]) == "--socket") {
+            uid_t control_uid=geteuid();std::optional<uid_t> frontend_uid;
+            if(argc>=8){
+                if(std::string(argv[6])!="--control-uid")throw std::runtime_error("expected --control-uid UID");
+                try{control_uid=parse_uid(argv[7]);}catch(const std::exception&){throw std::runtime_error("invalid control UID");}
+            }
+            if(argc==10){
+                if(std::string(argv[8])!="--frontend-uid")throw std::runtime_error("expected --frontend-uid UID");
+                frontend_uid=parse_uid(argv[9]);
+                if(*frontend_uid==control_uid)throw std::runtime_error("frontend and management UIDs must differ");
+            }
             umask(0077);
             struct sigaction action{};
             action.sa_handler = stop;
@@ -398,7 +428,7 @@ int main(int argc, char** argv) {
                 fail("install signal handlers");
             signal(SIGPIPE, SIG_IGN);
             forkfs::Container container(argv[2]);
-            serve(container, argv[4],argc==6);
+            serve(container, argv[4],argc>=6,control_uid,frontend_uid);
         } else throw std::runtime_error("invalid arguments; use forkfsd --help");
         return 0;
     } catch (const std::exception& e) {
