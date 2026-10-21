@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'fskit'))
 import mount_probe
+import restricted_workload
 from restricted_workload import profile,validate_backing,validate_owner_lease,validate_stdio
 from restricted_workload import workload_environment
 import mounted_acceptance
@@ -28,12 +29,42 @@ class Harness(unittest.TestCase):
             environment=workload_environment(name)
             for key in secrets:
                 if key not in ('HOME','PATH'):self.assertNotIn(key,environment)
-            self.assertEqual(environment['PATH'],'/usr/bin:/bin:/usr/sbin:/sbin')
+            system_path='/usr/bin:/bin:/usr/sbin:/sbin'
+            developer=Path('/Library/Developer/CommandLineTools')
+            expected_path=(str(developer/'usr/bin')+':' if developer.is_dir() else '')+system_path
+            self.assertEqual(environment['PATH'],expected_path)
+            if developer.is_dir():self.assertEqual(environment['DEVELOPER_DIR'],str(developer))
             home=Path(environment['HOME']);self.assertEqual(home.parent,Path(name).resolve())
             self.assertEqual(list(home.iterdir()),[])
             self.assertEqual(home.stat().st_mode&0o777,0o700)
             self.assertTrue(Path(environment['TMPDIR']).is_dir())
             self.assertEqual(environment['GIT_CONFIG_GLOBAL'],'/dev/null')
+
+    def test_run_uses_workload_path_and_resolves_relative_commands_from_mount(self):
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name);host_tools=root/'host-tools';host_tools.mkdir()
+            mount=root/'mount';backing=root/'backing';mount.mkdir();backing.mkdir()
+            fake=host_tools/'host-only-tool';fake.write_text('#!/bin/sh\nexit 0\n');fake.chmod(0o700)
+            tool=mount/'tool';tool.write_text('#!/bin/sh\nexit 0\n');tool.chmod(0o700)
+            real_tempdir=restricted_workload.tempfile.TemporaryDirectory
+            def isolated_tempdir(**kwargs):return real_tempdir(dir=root)
+            with patch.dict(os.environ,{'PATH':str(host_tools)}):
+                with patch.object(restricted_workload.platform,'system',return_value='Darwin'), \
+                     patch.object(restricted_workload,'require_mount'), \
+                     patch.object(restricted_workload,'validate_backing',return_value=(backing,set())), \
+                     patch.object(restricted_workload,'validate_stdio'), \
+                     patch.object(restricted_workload.tempfile,'TemporaryDirectory',side_effect=isolated_tempdir), \
+                     patch.object(restricted_workload.subprocess,'run',return_value=subprocess.CompletedProcess([],0)) as launch:
+                    with self.assertRaisesRegex(ValueError,'executable was not found'):
+                        restricted_workload.run(mount,backing,['host-only-tool'])
+                    launch.assert_not_called()
+                    self.assertEqual(restricted_workload.run(mount,backing,['./tool']),0)
+                    argv=launch.call_args.args[0]
+                    self.assertEqual(argv[3],str(tool.resolve()))
+                    self.assertEqual(launch.call_args.kwargs['cwd'],mount.resolve())
+                    self.assertNotIn(str(host_tools),launch.call_args.kwargs['env']['PATH'])
+                    self.assertEqual(restricted_workload.run(mount,backing,[str(tool)]),0)
+                    self.assertEqual(launch.call_args.args[0][3],str(tool))
 
     def test_attestation_rejects_fakes(self):
         with tempfile.TemporaryDirectory() as name:
@@ -94,6 +125,20 @@ class Harness(unittest.TestCase):
             with self.assertRaises(ValueError):profile(root,root/'backing',root/'scratch')
             for child in ('mount','backing','scratch'):(root/child).mkdir()
             with self.assertRaises(ValueError):profile(root/'mount',root/'backing',root/'scratch',[root])
+    def test_profile_sysctl_permissions_are_narrow(self):
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name);mount=root/'mount';backing=root/'backing';scratch=root/'scratch'
+            for path in (mount,backing,scratch):path.mkdir()
+            policy=profile(mount,backing,scratch)
+            self.assertNotIn('(allow process-exec process-fork sysctl-read)',policy)
+            self.assertIn('(deny process-info*)',policy)
+            grants=[line for line in policy.splitlines() if line.startswith('(allow sysctl-read ')]
+            self.assertTrue(grants)
+            self.assertTrue(all('(sysctl-name ' in grant or '(sysctl-name-prefix ' in grant for grant in grants))
+            for name in ('hw.','machdep.','kern.os','kern.version','kern.hostname',
+                         'kern.boottime','kern.argmax','vm.pagesize'):
+                self.assertIn(name,policy)
+            self.assertNotIn('kern.proc',policy)
     def test_backing_hardlink_alias_rejects_startup_admission(self):
         with tempfile.TemporaryDirectory() as name:
             root=Path(name);backing=root/'backing';toolchain=root/'toolchain'
@@ -156,8 +201,17 @@ class Harness(unittest.TestCase):
             # Positive interpreter probe prevents an exec failure from posing as denial.
             python='/Library/Developer/CommandLineTools/usr/bin/python3'
             self.assertTrue(Path(python).is_file(),'CLT Python is required for the runtime probes')
-            positive=run(python,'-c','import errno,socket,sys; print(42)')
+            positive=run(python,'-c','import ctypes,errno,socket,sys; print(42)')
             self.assertEqual((positive.returncode,positive.stdout.strip()),(0,b'42'),positive.stderr)
+            hw_code=('import ctypes,sys\n'
+                'libc=ctypes.CDLL(None,use_errno=True); mib=(ctypes.c_int*2)(6,3)\n'
+                'value=ctypes.c_int(); size=ctypes.c_size_t(ctypes.sizeof(value))\n'
+                'rc=libc.sysctl(mib,2,ctypes.byref(value),ctypes.byref(size),None,0)\n'
+                'if rc: sys.exit(ctypes.get_errno())\n'
+                'print(value.value)')
+            hw=run(python,'-c',hw_code)
+            self.assertEqual(hw.returncode,0,hw.stderr)
+            self.assertRegex(hw.stdout.decode().strip(),r'^[1-9][0-9]*$')
             control=root/'control.sock'
             with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as server:
                 server.bind(str(control));server.listen()
@@ -169,6 +223,26 @@ class Harness(unittest.TestCase):
                 code='import errno,socket,sys\ntry:\n s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)\n s.settimeout(2)\n s.connect(("127.0.0.1",int(sys.argv[1])))\nexcept OSError as e: sys.exit(73 if e.errno in (errno.EPERM,errno.EACCES) else 74)'
                 denied=run(python,'-c',code,server.getsockname()[1])
                 self.assertEqual(denied.returncode,73,denied.stderr)
+            marker='forkfs-sandbox-parent-args-marker'
+            parent=subprocess.Popen([python,'-c','import time; time.sleep(30)',marker],
+                                    stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                                    cwd=dirs[0],env=environment,close_fds=True)
+            try:
+                self.assertIsNone(parent.poll())
+                args_code=('import ctypes,errno,sys\n'
+                    'marker=b"'+marker+'"; libc=ctypes.CDLL(None,use_errno=True)\n'
+                    'mib=(ctypes.c_int*3)(1,49,int(sys.argv[1])); buf=ctypes.create_string_buffer(1048576)\n'
+                    'size=ctypes.c_size_t(len(buf)); rc=libc.sysctl(mib,3,buf,ctypes.byref(size),None,0)\n'
+                    'if rc: sys.exit(73 if ctypes.get_errno() in (errno.EPERM,errno.EACCES) else 74)\n'
+                    'if marker in buf.raw[:size.value]: print(marker.decode())\n'
+                    'sys.exit(75 if marker in buf.raw[:size.value] else 76)')
+                denied=run(python,'-c',args_code,parent.pid)
+                self.assertEqual(denied.returncode,73,denied.stderr)
+                self.assertNotIn(marker.encode(),denied.stdout)
+                self.assertNotIn(marker.encode(),denied.stderr)
+            finally:
+                parent.terminate()
+                parent.wait(timeout=5)
             outside=root/'outside';outside.write_text('outside')
             self.assertEqual(run('/bin/cat',outside).returncode,1)
     @unittest.skipUnless(platform.system()=='Darwin','macOS statfs')

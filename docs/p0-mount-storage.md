@@ -54,14 +54,26 @@ will need further scoped permissions; failures must remain failures, without an
 unrestricted retry. The sandbox is tested with real denied reads/writes on macOS.
 
 The launcher builds a fresh environment instead of filtering the host environment.
-Only a fixed system PATH, private HOME/TMPDIR, locale, and noninteractive Git
+Only a fixed system/CLT PATH, private HOME/TMPDIR, locale, and noninteractive Git
 configuration are passed. If installed, the fixed system Command Line Tools
 directory is selected explicitly; full Xcode installations need separately scoped
 toolchain support. API/cloud tokens, proxy credentials, SSH agent sockets,
 control endpoints, shell startup hooks and language-runtime injection variables
 are not inherited. Tools requiring credentials currently fail; no secret forwarding
 or automatic unrestricted retry is supported. Executables from extra toolchains
-must use an absolute path or be selected by the trusted launcher before exec.
+must use an absolute path and an explicit read-only toolchain grant.
+Relative executable paths are interpreted under the selected mount. Apple tool
+shims that require process inspection are not supported; use actual CLT binaries.
+On the tested macOS 27 toolchain, the linker also fails under the unconditional
+process-info denial. Restricted compilation/linking is therefore not accepted
+yet; selecting CLT binaries alone does not resolve it. Do not re-enable process
+inspection as a fallback. A separate UID/VM execution boundary is required before
+claiming both host-credential isolation and ordinary developer build support.
+The sandbox explicitly denies process-info operations and limits sysctl grants
+to basic system/CPU metadata. The process-info denial is necessary to block
+argument/environment queries such as kern.procargs2; sysctl filters alone do
+not block that query on the tested macOS version. A runtime test
+checks both permitted CPU discovery and denial of an external marker process.
 The parent and its permitted stdio streams remain trusted: a cooperating external
 process can relay commands or data through pipes, so this is not protection from
 a malicious host supervisor.
