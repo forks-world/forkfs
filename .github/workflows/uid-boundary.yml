@@ -1,0 +1,30 @@
+name: Agent UID boundary
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cross-uid:
+    name: Cross-UID build and isolation (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test nonprivileged admission
+        run: python3 -m unittest discover -s scripts/tests -p test_uid_boundary.py -v
+      - name: Exercise real UID separation on disposable runner
+        # _www is an existing non-login identity; no account or service is installed.
+        # Each child receives a fresh environment and drops all supplementary groups.
+        shell: sh
+        run: sudo -n python3 scripts/tests/uid_boundary.py --host-user "$(id -un)" --worker-user _www

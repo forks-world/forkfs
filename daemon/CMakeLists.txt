@@ -335,3 +335,7 @@ set_tests_properties(forkfsd_mount_harness PROPERTIES TIMEOUT 90 LABELS metadata
 add_test(NAME forkfsd_service_plan COMMAND ${Python3_EXECUTABLE} -m unittest discover
     -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_service_plan.py -v)
 set_tests_properties(forkfsd_service_plan PROPERTIES TIMEOUT 30 LABELS metadata-regression)
+
+add_test(NAME forkfsd_uid_boundary_unit COMMAND ${Python3_EXECUTABLE} -m unittest discover
+    -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_uid_boundary.py -v)
+set_tests_properties(forkfsd_uid_boundary_unit PROPERTIES TIMEOUT 30 LABELS metadata-regression)
