@@ -113,6 +113,21 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-') as tmp:
         assert cli('fs-hread',pin,'0','64')==b'inode bytes'
         cli('fs-close',pin);cli('fs-close',newer['handle'])
         cli('fs-iremove',d,'renamed',newer['inode']['inode_id'],'file')
+        # Directories do not consume session handles, so creating one must
+        # remain available when all 256 file handles are already occupied.
+        full_handles=[json.loads(cli('fs-open','/src/file','r'))['handle'] for _ in range(256)]
+        full_dir=json.loads(cli('fs-icreate',root_id,'at-limit','directory','mode=755'))
+        assert full_dir['handle'] is None
+        full_dir_id=full_dir['inode']['inode_id']
+        cli('fs-icreate',full_dir_id,'rejected-file','file','mode=600',ok=False)
+        cli('fs-ilookup',full_dir_id,'rejected-file',ok=False)
+        cli('fs-close',full_handles.pop())
+        admitted=json.loads(cli('fs-icreate',full_dir_id,'admitted-file','file','mode=600'))
+        assert admitted['handle']
+        cli('fs-close',admitted['handle'])
+        for handle in full_handles:cli('fs-close',handle)
+        cli('fs-iremove',full_dir_id,'admitted-file',admitted['inode']['inode_id'],'file')
+        cli('fs-iremove',root_id,'at-limit',full_dir_id,'directory')
         link=json.loads(cli('fs-isymlink',d,'link','target','mode=777'))['inode_id']
         assert cli('fs-ireadlink',link)==b'target';cli('fs-iremove',d,'link',link,'file')
         cli('fs-iremove',root_id,'moved-dir',d,'directory');cli('fs-iremove',root_id,'remote-dir',replacement,'directory')

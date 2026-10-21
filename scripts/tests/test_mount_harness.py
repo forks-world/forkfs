@@ -138,9 +138,10 @@ class Harness(unittest.TestCase):
         with tempfile.TemporaryDirectory() as name:
             root=Path(name).resolve();dirs=[root/p for p in ('mount','backing','scratch')]
             for path in dirs:path.mkdir()
+            environment=workload_environment(dirs[2])
             secret=dirs[1]/'secret';secret.write_text('secret')
             allowed=dirs[0]/'file';allowed.write_text('allowed')
-            def run(*args):return subprocess.run(['/usr/bin/sandbox-exec','-p',profile(*dirs),*map(str,args)],capture_output=True,timeout=10)
+            def run(*args):return subprocess.run(['/usr/bin/sandbox-exec','-p',profile(*dirs),*map(str,args)],capture_output=True,timeout=10,cwd=dirs[0],env=environment,close_fds=True)
             self.assertEqual(run('/bin/cat',allowed).stdout,b'allowed')
             denied=run('/bin/cat',secret)
             self.assertEqual(denied.returncode,1);self.assertNotIn(b'secret',denied.stdout)
@@ -155,16 +156,19 @@ class Harness(unittest.TestCase):
             # Positive interpreter probe prevents an exec failure from posing as denial.
             python='/Library/Developer/CommandLineTools/usr/bin/python3'
             self.assertTrue(Path(python).is_file(),'CLT Python is required for the runtime probes')
-            self.assertEqual(run(python,'-c','print(42)').stdout.strip(),b'42')
+            positive=run(python,'-c','import errno,socket,sys; print(42)')
+            self.assertEqual((positive.returncode,positive.stdout.strip()),(0,b'42'),positive.stderr)
             control=root/'control.sock'
             with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as server:
                 server.bind(str(control));server.listen()
-                code='import errno,socket,sys\ntry:\n s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1])\nexcept OSError as e: sys.exit(73 if e.errno in (errno.EPERM,errno.EACCES) else 74)'
-                self.assertEqual(run(python,'-c',code,control).returncode,73)
+                code='import errno,socket,sys\ntry:\n s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\n s.connect(sys.argv[1])\nexcept OSError as e: sys.exit(73 if e.errno in (errno.EPERM,errno.EACCES) else 74)'
+                denied=run(python,'-c',code,control)
+                self.assertEqual(denied.returncode,73,denied.stderr)
             with socket.socket() as server:
                 server.bind(('127.0.0.1',0));server.listen()
-                code='import errno,socket,sys\ntry: socket.create_connection(("127.0.0.1",int(sys.argv[1])),timeout=2)\nexcept OSError as e: sys.exit(73 if e.errno in (errno.EPERM,errno.EACCES) else 74)'
-                self.assertEqual(run(python,'-c',code,server.getsockname()[1]).returncode,73)
+                code='import errno,socket,sys\ntry:\n s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)\n s.settimeout(2)\n s.connect(("127.0.0.1",int(sys.argv[1])))\nexcept OSError as e: sys.exit(73 if e.errno in (errno.EPERM,errno.EACCES) else 74)'
+                denied=run(python,'-c',code,server.getsockname()[1])
+                self.assertEqual(denied.returncode,73,denied.stderr)
             outside=root/'outside';outside.write_text('outside')
             self.assertEqual(run('/bin/cat',outside).returncode,1)
     @unittest.skipUnless(platform.system()=='Darwin','macOS statfs')

@@ -70,7 +70,7 @@ int64_t signed_number(const std::string& text){
     need(parsed.ec==std::errc{} && parsed.ptr==text.data()+text.size(),"invalid signed offset");return value;
 }
 std::string names(const std::vector<std::string>& values){std::string out;for(const auto& s:values)out+=s+'\n';return out;}
-std::string quoted(const std::string& value){
+std::string rpc_json_quote(const std::string& value){
     std::string out="\"";for(char c:value){if(c=='\"' || c=='\\')out+='\\';out+=c;}return out+"\"";
 }
 std::string inode_json(const InodeInfo& n){
@@ -202,20 +202,20 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         need(!selected_view || (view==current.mount->view && revision==current.mount->revision),"mount session belongs to another view");
         view=current.mount->view;revision=current.mount->revision;
     }
-    if(op=="service-hello")return "{\"protocol\":1,\"generation\":"+quoted(sessions.instance())+"}\n";
+    if(op=="service-hello")return "{\"protocol\":1,\"generation\":"+rpc_json_quote(sessions.instance())+"}\n";
     if(op=="mount-open"){
         need(!generation.empty(),"mount requires service generation");
         need(args[1]=="world" || args[1]=="revision","invalid mount view type");
         need(session_token.empty(),"mount-open does not accept a session");
         Namespace selected(store,args[2],args[1]=="revision");selected.root_inode();
         auto token=sessions.create(number(args[3]),OwnedHandle{args[2],args[1]=="revision"});
-        return "{\"session\":"+quoted(token)+",\"generation\":"+quoted(sessions.instance())+"}\n";
+        return "{\"session\":"+rpc_json_quote(token)+",\"generation\":"+rpc_json_quote(sessions.instance())+"}\n";
     }
     if(op=="mount-keepalive" || op=="mount-revoke"){
         need(!generation.empty() && session_token.empty(),"mount lifecycle requires generation and positional session");
         need(sessions.inspect(args[1]).mount.has_value(),"not a mount session");
         if(op=="mount-revoke")sessions.close(args[1]);else sessions.acquire(args[1]);
-        return "{\"generation\":"+quoted(sessions.instance())+"}\n";
+        return "{\"generation\":"+rpc_json_quote(sessions.instance())+"}\n";
     }
     if(op=="session-open") {
         auto lease=number(args[1]);auto token=sessions.create(lease);
@@ -249,10 +249,10 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="fs-ilookup")return inode_json(fs.lookup_child(args[1],args[2]))+"\n";
     if(op=="fs-icreate"){
         need(args[3]=="file" || args[3]=="directory","invalid inode creation type");
-        need(activity.session->handles.size()<256,"session handle limit reached");
+        if(args[3]=="file")need(activity.session->handles.size()<256,"session handle limit reached");
         std::string handle;auto n=fs.create_child(args[1],args[2],args[3]=="directory",attributes(args[4]),args[3]=="file"?&handle:nullptr);
         if(!handle.empty())try{activity.session->handles.emplace(handle,OwnedHandle{view,revision});}catch(...){fs.close(handle);throw;}
-        return "{\"inode\":"+inode_json(n)+",\"handle\":"+(handle.empty()?"null":quoted(handle))+"}\n";
+        return "{\"inode\":"+inode_json(n)+",\"handle\":"+(handle.empty()?"null":rpc_json_quote(handle))+"}\n";
     }
     if(op=="fs-isymlink")return inode_json(fs.symlink_child(args[1],args[2],args[3],attributes(args[4])))+"\n";
     if(op=="fs-ilink")return inode_json(fs.link_child(args[1],args[2],args[3]))+"\n";
@@ -306,8 +306,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         auto limit=number(args[2]);need(limit>=1 && limit<=1024,"directory page limit must be 1..1024");
         bool attrs=op=="fs-dir-entries";auto page=fs.read_directory(activity.session->directories.at(args[1]).cursor,limit,attrs);
         std::string result=attrs?"{\"entries\":[":"{\"names\":[";bool first=true;
-        if(attrs)for(const auto& entry:page.entries){if(!first)result+=',';first=false;result+="{\"name\":"+quoted(entry.name)+",\"inode\":"+inode_json(entry.inode)+"}";}
-        else for(const auto& name:page.names){if(!first)result+=',';first=false;result+=quoted(name);}
+        if(attrs)for(const auto& entry:page.entries){if(!first)result+=',';first=false;result+="{\"name\":"+rpc_json_quote(entry.name)+",\"inode\":"+inode_json(entry.inode)+"}";}
+        else for(const auto& name:page.names){if(!first)result+=',';first=false;result+=rpc_json_quote(name);}
         return result+"],\"eof\":"+(page.eof?"true":"false")+"}\n";
     }
     if(op=="fs-cat"){auto b=fs.read(args[1]);return std::string(b.begin(),b.end());}
