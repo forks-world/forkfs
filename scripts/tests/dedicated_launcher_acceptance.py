@@ -69,7 +69,13 @@ def acceptance(host_user, worker_user):
         cli=[stage/'dedicated_workload.py','--policy',policy_file,'--','/usr/bin/true']
         native=invoke(cli)
         if native.returncode!=2 or 'not an attested forkfs' not in native.stderr:
-            raise RuntimeError('real CLI failed to reject ordinary directory: '+native.stderr)
+            diagnostic=invoke(['-c', 'import ctypes,json,os,platform,subprocess,tempfile; '
+                'print(json.dumps(dict(keys=sorted(os.environ),'
+                'encoding=os.environ.get("__CF_USER_TEXT_ENCODING"),uid=os.getuid())))'])
+            # This child was execed with the fixed four-variable clean fixture;
+            # print only key names and generated encoding, never ambient values.
+            raise RuntimeError('real CLI failed to reject ordinary directory: '+native.stderr+
+                               '; clean-exec runtime metadata: '+diagnostic.stdout)
         checks.append('real-cli-native-directory-denial')
         # Each identity/config failure must precede the mount gate.
         wrong=invoke(cli,account=host)
