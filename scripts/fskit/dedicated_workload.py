@@ -20,6 +20,16 @@ import tempfile
 ENTRY_ENV = dict(PATH='/usr/bin:/bin:/usr/sbin:/sbin', HOME='/var/empty', LANG='C', LC_ALL='C')
 
 
+def admit_entry_environment():
+    expected = dict(ENTRY_ENV)
+    # CoreFoundation adds this during macOS Python startup even for env -i.
+    # Accept only the current UID's C-locale value, never arbitrary text.
+    if '__CF_USER_TEXT_ENCODING' in os.environ:
+        expected['__CF_USER_TEXT_ENCODING'] = f'0x{os.getuid():X}:0x0:0x0'
+    if dict(os.environ) != expected:
+        raise ValueError('supervisor must exec the launcher with the exact fresh entry environment')
+
+
 def no_acl(path):
     """Reject extended ACLs conservatively, including deny-only/inherited ACLs."""
     libc = ctypes.CDLL(None, use_errno=True)
@@ -152,8 +162,7 @@ def run(policy_path, command):
     # Scrubbing only the workload's environment leaves this same-UID supervisor's
     # original exec-stack environment queryable. Admission requires a clean exec
     # from the trusted identity broker, before any untrusted child can exist.
-    if dict(os.environ) != ENTRY_ENV:
-        raise ValueError('supervisor must exec the launcher with the exact fresh entry environment')
+    admit_entry_environment()
     if not command:raise ValueError('workload command is required')
     policy = read_policy(policy_path)
     admit_identity(policy)
