@@ -18,18 +18,89 @@ import sys
 import tempfile
 
 ENTRY_ENV = dict(PATH='/usr/bin:/bin:/usr/sbin:/sbin', HOME='/var/empty', LANG='C', LC_ALL='C')
+MAX_ENTRY_ENV_COUNT = 4096
+MAX_ENTRY_ENV_ENTRY_BYTES = 65536
+MAX_ENTRY_ENV_TOTAL_BYTES = 1048576
+
+
+def _parse_raw_entry_environment(entries):
+    """Parse an already bounded sequence of native NAME=VALUE byte strings."""
+    result = {}
+    count = 0
+    total = 0
+    for raw in entries:
+        count += 1
+        if count > MAX_ENTRY_ENV_COUNT:
+            raise ValueError('supervisor entry environment is too large')
+        if not isinstance(raw, bytes) or len(raw) > MAX_ENTRY_ENV_ENTRY_BYTES:
+            raise ValueError('malformed supervisor entry environment')
+        total += len(raw)
+        if total > MAX_ENTRY_ENV_TOTAL_BYTES:
+            raise ValueError('supervisor entry environment is too large')
+        name, separator, value = raw.partition(b'=')
+        if not separator or not name:
+            raise ValueError('malformed supervisor entry environment')
+        try:
+            key = name.decode('ascii')
+            decoded_value = value.decode('ascii')
+        except UnicodeDecodeError as error:
+            raise ValueError('malformed supervisor entry environment') from error
+        if key in result:
+            raise ValueError('duplicate supervisor environment variable')
+        result[key] = decoded_value
+    return result
+
+
+def _raw_entry_environment():
+    """Read libc's current native environ array with bounded scans (macOS only)."""
+    if platform.system() != 'Darwin':
+        raise RuntimeError('cannot inspect native supervisor environment')
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        get_environ = libc._NSGetEnviron
+        get_environ.argtypes = []
+        get_environ.restype = ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+        strnlen = libc.strnlen
+        strnlen.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        strnlen.restype = ctypes.c_size_t
+        environment = get_environ()[0]
+        if not environment:
+            raise ValueError('cannot inspect native supervisor environment')
+        entries = []
+        total = 0
+        for index in range(MAX_ENTRY_ENV_COUNT + 1):
+            pointer = environment[index]
+            if pointer is None:
+                return entries
+            address = pointer
+            length = strnlen(address, MAX_ENTRY_ENV_ENTRY_BYTES + 1)
+            if length > MAX_ENTRY_ENV_ENTRY_BYTES:
+                raise ValueError('supervisor entry environment is too large')
+            total += length
+            if total > MAX_ENTRY_ENV_TOTAL_BYTES:
+                raise ValueError('supervisor entry environment is too large')
+            entries.append(ctypes.string_at(address, length))
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        if isinstance(error, ValueError):
+            raise
+        raise RuntimeError('cannot inspect native supervisor environment') from error
+    raise ValueError('supervisor entry environment is too large')
 
 
 def admit_entry_environment():
+    # At trusted -I -S process entry this reads the live libc environ before
+    # launcher code or workload children run. When duplicates remain there,
+    # this preserves them for admission while os.environ would collapse them.
+    actual = _parse_raw_entry_environment(_raw_entry_environment())
     expected = dict(ENTRY_ENV)
     # CoreFoundation adds this during macOS Python startup even for env -i.
     # Accept only the current UID's C-locale value, never arbitrary text.
-    if '__CF_USER_TEXT_ENCODING' in os.environ:
-        encoding = os.environ['__CF_USER_TEXT_ENCODING']
+    if '__CF_USER_TEXT_ENCODING' in actual:
+        encoding = actual['__CF_USER_TEXT_ENCODING']
         if encoding not in (f'0x{os.getuid():X}:0x0:0x0', f'0x{os.getuid():X}:0:0'):
             raise ValueError('supervisor must exec the launcher with the exact fresh entry environment')
         expected['__CF_USER_TEXT_ENCODING'] = encoding
-    if dict(os.environ) != expected:
+    if actual != expected:
         raise ValueError('supervisor must exec the launcher with the exact fresh entry environment')
 
 

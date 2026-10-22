@@ -1,10 +1,12 @@
 """Admission and failure-order regressions for the dedicated launcher."""
 import errno
 import ctypes
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -22,17 +24,85 @@ def policy():
                 backing='/Library/Forkfs/store', read_only=[])
 
 
+def raw_environment(values):
+    return [f'{key}={value}'.encode('ascii') for key, value in values.items()]
+
+
 class DedicatedWorkload(unittest.TestCase):
+    @unittest.skipUnless(sys.platform=='darwin','Darwin native environ')
+    def test_real_execve_duplicates_are_denied_before_policy_access(self):
+        from dedicated_launcher_acceptance import RAW_EXEC
+        with tempfile.TemporaryDirectory() as name:
+            sentinel=Path(name)/'unexpected'
+            absent=Path(name)/'absent-policy'
+            for key in ('PATH','HOME','LANG','LC_ALL','__CF_USER_TEXT_ENCODING'):
+                with self.subTest(key=key):
+                    result=subprocess.run([sys.executable,'-I','-S','-c',RAW_EXEC,
+                        sys.executable,str(Path(launch.__file__).resolve()),str(absent),
+                        key,'disposable-hidden-marker',str(sentinel)],
+                        env=launch.ENTRY_ENV,cwd=name,stdin=subprocess.DEVNULL,
+                        capture_output=True,text=True,close_fds=True,timeout=15)
+                    self.assertEqual(result.returncode,2,result.stderr)
+                    self.assertIn('duplicate',result.stderr)
+                    self.assertFalse(sentinel.exists())
+
     def test_only_uid_derived_corefoundation_environment_is_admitted(self):
         with patch.object(launch.os,'getuid',return_value=70):
             for extra in ({}, {'__CF_USER_TEXT_ENCODING':'0x46:0x0:0x0'},
                           {'__CF_USER_TEXT_ENCODING':'0x46:0:0'}):
-                with patch.dict(os.environ,dict(launch.ENTRY_ENV,**extra),clear=True):
+                with patch.object(launch,'_raw_entry_environment',return_value=raw_environment(dict(launch.ENTRY_ENV,**extra))):
                     launch.admit_entry_environment()
             for value in ('0x1F5:0x0:0x0','token','0x46:0x0:0x0\nhost-secret','0x46:1:0','0x46:0:1'):
-                with patch.dict(os.environ,dict(launch.ENTRY_ENV,__CF_USER_TEXT_ENCODING=value),clear=True):
+                with patch.object(launch,'_raw_entry_environment',return_value=raw_environment(dict(launch.ENTRY_ENV,__CF_USER_TEXT_ENCODING=value))):
                     with self.assertRaisesRegex(ValueError,'fresh entry environment'):
                         launch.admit_entry_environment()
+
+    def test_raw_environment_rejects_hidden_duplicates_and_malformed_entries(self):
+        baseline = raw_environment(launch.ENTRY_ENV)
+        cases = (baseline + [b'PATH=/private/secret'],
+                 baseline + [b'missing-separator'], baseline + [b'=empty-name'],
+                 baseline + [b'BAD=\xff'])
+        for entries in cases:
+            with self.subTest(entries=entries[-1]), \
+                 patch.object(launch, '_raw_entry_environment', return_value=entries), \
+                 self.assertRaises(ValueError):
+                launch.admit_entry_environment()
+
+    def test_native_environment_reader_preserves_entries_and_stops_at_null(self):
+        def read(entries, **limits):
+            buffers = [ctypes.create_string_buffer(entry + b'\0') for entry in entries]
+            array_type = ctypes.c_void_p * (len(buffers) + 1)
+            native_entries = array_type(*(ctypes.addressof(buffer) for buffer in buffers), None)
+            native_pointer = ctypes.cast(native_entries, ctypes.POINTER(ctypes.c_void_p))
+            holder = ctypes.pointer(native_pointer)
+            getter_result = ctypes.cast(holder, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
+            real_libc = ctypes.CDLL(None)
+
+            class Getter:
+                def __call__(self):
+                    return getter_result
+
+            class Libc:
+                _NSGetEnviron = Getter()
+                strnlen = real_libc.strnlen
+
+            limits_patch = patch.multiple(launch, **limits) if limits else nullcontext()
+            with patch.object(launch.platform, 'system', return_value='Darwin'), \
+                 patch.object(launch.ctypes, 'CDLL', return_value=Libc()), \
+                 limits_patch:
+                return launch._raw_entry_environment()
+
+        entries = raw_environment(launch.ENTRY_ENV) + [b'PATH=/private/secret']
+        self.assertEqual(read(entries), entries)
+        # The first null pointer terminates the native vector; later memory is
+        # outside the vector and must not be inspected.
+        self.assertEqual(read([b'PATH=/bin']), [b'PATH=/bin'])
+        for entries, limits in (
+                ([b'A=1', b'B=2', b'C=3'], {'MAX_ENTRY_ENV_COUNT': 2}),
+                ([b'LONG=1'], {'MAX_ENTRY_ENV_ENTRY_BYTES': 4}),
+                ([b'A=123', b'B=456'], {'MAX_ENTRY_ENV_TOTAL_BYTES': 8})):
+            with self.subTest(limits=limits), self.assertRaises(ValueError):
+                read(entries, **limits)
 
     @unittest.skipUnless(sys.platform=='darwin','Darwin ACL API')
     def test_real_extended_acl_is_rejected(self):
@@ -140,6 +210,7 @@ class DedicatedWorkload(unittest.TestCase):
                  patch.object(launch.os,'getuid',return_value=504), \
                  patch.object(launch.os,'geteuid',return_value=504), \
                  patch.dict(os.environ,launch.ENTRY_ENV,clear=True), \
+                 patch.object(launch,'_raw_entry_environment',return_value=raw_environment(launch.ENTRY_ENV)), \
                  patch.object(launch,'read_policy',return_value=policy()), \
                  patch.object(launch,'admit_identity'), \
                  patch.object(launch,'installed_runtime',return_value=runtime), \
@@ -154,6 +225,7 @@ class DedicatedWorkload(unittest.TestCase):
              patch.object(launch.os,'getuid',return_value=504), \
              patch.object(launch.os,'geteuid',return_value=504), \
              patch.dict(os.environ,dict(launch.ENTRY_ENV,OPENAI_API_KEY='test-token'),clear=True), \
+             patch.object(launch,'_raw_entry_environment',return_value=raw_environment(dict(launch.ENTRY_ENV,OPENAI_API_KEY='test-token'))), \
              patch.object(launch,'read_policy') as read, patch.object(launch.subprocess,'run') as spawn:
             with self.assertRaisesRegex(ValueError,'fresh entry environment'):launch.run('/policy',['true'])
             read.assert_not_called();spawn.assert_not_called()

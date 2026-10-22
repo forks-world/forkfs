@@ -36,6 +36,28 @@ raise SystemExit(launcher.run(directory / 'policy.json', sys.argv[3:]))
 '''
 
 
+RAW_EXEC = r'''
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.execve.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p),
+                       ctypes.POINTER(ctypes.c_char_p)]
+libc.execve.restype = ctypes.c_int
+python, launcher, policy, key, value, sentinel = sys.argv[1:]
+arguments = [python, '-I', '-S', launcher, '--policy', policy, '--',
+             '/usr/bin/touch', sentinel]
+# Pass a native array: a Python dict would erase exactly the bug being tested.
+environment = [b'PATH=/usr/bin:/bin:/usr/sbin:/sbin', b'HOME=/var/empty',
+               b'LANG=C', b'LC_ALL=C']
+if key == '__CF_USER_TEXT_ENCODING':
+    environment.append(('__CF_USER_TEXT_ENCODING=0x%X:0:0' % os.getuid()).encode())
+environment.append((key + '=' + value).encode())
+argv = (ctypes.c_char_p * (len(arguments) + 1))(*map(os.fsencode, arguments), None)
+envp = (ctypes.c_char_p * (len(environment) + 1))(*environment, None)
+libc.execve(os.fsencode(python), argv, envp)
+raise OSError(ctypes.get_errno(), 'native execve failed')
+'''
+
+
 def acceptance(host_user, worker_user):
     if platform.system() != 'Darwin' or os.getuid() != 0 or os.geteuid() != 0:
         raise RuntimeError('requires root on a disposable macOS runner')
@@ -105,6 +127,14 @@ def acceptance(host_user, worker_user):
         if linked.returncode!=2 or 'root-owned' not in linked.stderr:
             raise RuntimeError('symlink policy admitted: '+linked.stderr)
         checks.append('symlink-policy-denial')
+        for key in ('PATH','HOME','LANG','LC_ALL','__CF_USER_TEXT_ENCODING'):
+            sentinel=mount/('duplicate-'+key)
+            duplicated=invoke(['-c',RAW_EXEC,python,stage/'dedicated_workload.py',
+                               policy_file,key,'disposable-hidden-marker',sentinel])
+            if (duplicated.returncode!=2 or 'duplicate' not in duplicated.stderr
+                    or sentinel.exists()):
+                raise RuntimeError('native duplicate environment was not rejected for '+key+': '+duplicated.stderr)
+        checks.append('native-execve-duplicate-environment-denial')
         # The success path below uses the actual installed modules/profile/spawn.
         # Mount attestation alone is mocked in a separate, visibly test-only driver.
         prefix=[stage/'driver.py',stage,'stable']
