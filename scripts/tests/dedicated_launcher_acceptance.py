@@ -82,7 +82,16 @@ def acceptance(host_user, worker_user):
         if wrong.returncode!=2 or 'supervisor must drop' not in wrong.stderr:
             raise RuntimeError('wrong caller UID admitted: '+wrong.stderr)
         checks.append('wrong-uid-denial')
-        extra=invoke(cli,extra_groups=(host.pw_gid,))
+        # Darwin setgid replaces the first group slot. Keep the worker primary
+        # group first so the host group survives as an actual extra permission.
+        inherited_groups=(worker.pw_gid,host.pw_gid)
+        group_probe=require_success(invoke(['-c',
+            'import json,sys; sys.path.insert(0,sys.argv[1]); import dedicated_workload; '
+            'print(json.dumps(sorted(dedicated_workload.kernel_groups())))',stage],
+            extra_groups=inherited_groups), 'extra-group fixture')
+        if host.pw_gid not in json.loads(group_probe.stdout):
+            raise RuntimeError('extra-group fixture did not retain the host group')
+        extra=invoke(cli,extra_groups=inherited_groups)
         if extra.returncode!=2 or 'supervisor must drop' not in extra.stderr:
             raise RuntimeError('inherited host group admitted: '+extra.stderr)
         checks.append('supplementary-group-denial')
