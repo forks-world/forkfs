@@ -103,7 +103,8 @@ def reap_identity(policy, launcher, interpreter, environment):
                                 cwd='/', env=environment, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                 timeout=3, **credentials(policy))
-        if result.returncode:raise RuntimeError('unprivileged UID cleanup failed; active marker retained')
+        if result.returncode:raise RuntimeError(f'unprivileged UID cleanup failed ({result.returncode}): '
+                                             f'{result.stderr[:512]!r}; active marker retained')
         time.sleep(0.05)
 
 
