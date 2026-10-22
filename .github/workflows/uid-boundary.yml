@@ -28,3 +28,8 @@ jobs:
         # Each child receives a fresh environment and drops all supplementary groups.
         shell: sh
         run: sudo -n python3 scripts/tests/uid_boundary.py --host-user "$(id -un)" --worker-user _www
+      - name: Test dedicated launcher admission
+        run: python3 -m unittest discover -s scripts/tests -p test_dedicated_workload.py -v
+      - name: Exercise installed launcher with native fixture on disposable runner
+        shell: sh
+        run: sudo -n python3 scripts/tests/dedicated_launcher_acceptance.py --host-user "$(id -un)" --worker-user _www

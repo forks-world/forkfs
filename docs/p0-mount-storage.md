@@ -106,6 +106,80 @@ per-agent identities/lifecycle, workspace ownership and mount access, and real
 mounted build and escape tests. Agents sharing a worker UID can inspect each
 other's process arguments; do not reuse it across mutually untrusted agents.
 
+### Dedicated workload entry point
+
+`scripts/fskit/dedicated_workload.py` is the post-drop entry point. A trusted
+supervisor must first select a provisioned agent identity, remove supplementary
+groups and drop real/effective/saved UID/GID, then invoke a trusted system Python
+with `-I -S`. Before switching identities it must discard host credentials,
+descriptors and secrets in argv, and exec the launcher with exactly
+`PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `HOME=/var/empty`, `LANG=C`, `LC_ALL=C`.
+The launcher rejects any other entry environment, except macOS Python's automatic
+`__CF_USER_TEXT_ENCODING` with exactly the current UID's C-locale value
+(`0x46:0x0:0x0` or Xcode Python's `0x46:0:0` for UID 70). No arbitrary value is permitted.
+Admission scans the live native `_NSGetEnviron` array with entry/count/byte
+bounds and rejects duplicate or malformed entries before comparing the complete
+environment. Python's `os.environ` mapping alone loses duplicate `execve` keys.
+The fresh isolated interpreter remains trusted: this check cannot reconstruct
+an original exec stack after arbitrary earlier native environment mutation.
+CI passes actual duplicate PATH, HOME, LANG, LC_ALL and CoreFoundation entries
+through native `execve`, requiring rejection before any workload starts.
+Cleaning only the eventual
+workload environment would leave the same-UID launcher process's original
+exec-stack environment exposed to process queries; changing `os.environ` does
+not erase that stack. The launcher refuses root, identity/group mismatches and retained
+root recovery. It does not itself provide a privileged identity broker, create
+accounts, install sudo rules, or accept requests from agents as root.
+
+Install this file, `restricted_workload.py`, `mount_probe.py` and the per-mount
+JSON policy under a root-owned installation directory. The launcher checks all
+code/policy ancestors, rejects symlinks, multiple hardlinks, special modes,
+group/world writes and extended ACLs. Temporary world-writable ancestors are
+not admitted. Installation and interpreter authenticity remain responsibilities
+of the trusted supervisor. The policy has this exact versioned schema:
+
+```json
+{
+  "version": 1,
+  "host_uid": 501,
+  "service_uid": 502,
+  "frontend_uid": 503,
+  "worker_uid": 504,
+  "worker_gid": 504,
+  "mount": "/Volumes/AgentWorld",
+  "mount_fsid": [123, 456],
+  "backing": "/Library/Forkfs/store",
+  "read_only": []
+}
+```
+
+These are example IDs; the supervisor must obtain actual identities and the
+`statfs` fsid from its authenticated mount lifecycle. All four UIDs must be
+distinct and non-root. Unknown/duplicate policy keys, invalid IDs and parent
+traversal are rejected. The worker does not inventory the private backing;
+it checks the root-owned parent, service ownership, mode 0700 and absence of
+extended ACLs. Both mount attestations must identify a writable `forkrevision`
+FSKit root with the provisioned fsid, including the final check before exec.
+There is no native-directory bypass option. A trusted supervisor must also
+prevent concurrent unmount/remount and ensure the underlying mountpoint does
+not expose writable native storage if the volume disappears.
+
+After admission the dedicated policy enables process-info, while retaining the
+ordinary filesystem/network restrictions and explicit backing denial. The
+original same-UID launcher remains unchanged. The child receives a fresh
+HOME/TMPDIR/environment, mount cwd, no extra descriptors, stdin `/dev/null`,
+and umask 077. Supervisor output must be pipes or `/dev/null`; regular files,
+sockets and terminals are rejected. The supervisor remains responsible for
+agent process-tree cleanup and exclusive identity lifetime; this entry point
+is not a process/container lifecycle manager.
+
+The `dedicated_launcher_acceptance.py` CI stages root-owned code/policy on a
+disposable runner, tests real UID/group/config denials and the production
+profile/spawn path, including C++ linking, environment scrubbing and host argv
+denial. Its success driver explicitly mocks only mount attestation for the
+native fixture; a separate real CLI test requires rejection of that fixture.
+These tests never count as real mounted FSKit acceptance.
+
 The sandbox explicitly denies process-info operations and limits sysctl grants
 to basic system/CPU metadata. The process-info denial is necessary to block
 argument/environment queries such as kern.procargs2; sysctl filters alone do
