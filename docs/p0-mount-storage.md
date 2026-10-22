@@ -116,7 +116,7 @@ descriptors and secrets in argv, and exec the launcher with exactly
 `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `HOME=/var/empty`, `LANG=C`, `LC_ALL=C`.
 The launcher rejects any other entry environment, except macOS Python's automatic
 `__CF_USER_TEXT_ENCODING` with exactly the current UID's C-locale value
-(`0x46:0x0:0x0` for UID 70). No arbitrary value is permitted. Cleaning only the eventual
+(`0x46:0x0:0x0` or Xcode Python's `0x46:0:0` for UID 70). No arbitrary value is permitted. Cleaning only the eventual
 workload environment would leave the same-UID launcher process's original
 exec-stack environment exposed to process queries; changing `os.environ` does
 not erase that stack. The launcher refuses root, identity/group mismatches and retained

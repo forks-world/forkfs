@@ -25,7 +25,10 @@ def admit_entry_environment():
     # CoreFoundation adds this during macOS Python startup even for env -i.
     # Accept only the current UID's C-locale value, never arbitrary text.
     if '__CF_USER_TEXT_ENCODING' in os.environ:
-        expected['__CF_USER_TEXT_ENCODING'] = f'0x{os.getuid():X}:0x0:0x0'
+        encoding = os.environ['__CF_USER_TEXT_ENCODING']
+        if encoding not in (f'0x{os.getuid():X}:0x0:0x0', f'0x{os.getuid():X}:0:0'):
+            raise ValueError('supervisor must exec the launcher with the exact fresh entry environment')
+        expected['__CF_USER_TEXT_ENCODING'] = encoding
     if dict(os.environ) != expected:
         raise ValueError('supervisor must exec the launcher with the exact fresh entry environment')
 

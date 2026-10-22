@@ -25,10 +25,11 @@ def policy():
 class DedicatedWorkload(unittest.TestCase):
     def test_only_uid_derived_corefoundation_environment_is_admitted(self):
         with patch.object(launch.os,'getuid',return_value=70):
-            for extra in ({}, {'__CF_USER_TEXT_ENCODING':'0x46:0x0:0x0'}):
+            for extra in ({}, {'__CF_USER_TEXT_ENCODING':'0x46:0x0:0x0'},
+                          {'__CF_USER_TEXT_ENCODING':'0x46:0:0'}):
                 with patch.dict(os.environ,dict(launch.ENTRY_ENV,**extra),clear=True):
                     launch.admit_entry_environment()
-            for value in ('0x1F5:0x0:0x0','token','0x46:0x0:0x0\nhost-secret'):
+            for value in ('0x1F5:0x0:0x0','token','0x46:0x0:0x0\nhost-secret','0x46:1:0','0x46:0:1'):
                 with patch.dict(os.environ,dict(launch.ENTRY_ENV,__CF_USER_TEXT_ENCODING=value),clear=True):
                     with self.assertRaisesRegex(ValueError,'fresh entry environment'):
                         launch.admit_entry_environment()
