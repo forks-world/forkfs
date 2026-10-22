@@ -478,8 +478,9 @@ It captures at most 1 MiB combined stdout/stderr and enforces a wall-clock timeo
 
 On normal exit, timeout, output overflow, SIGINT or SIGTERM, cleanup targets the
 whole worker UID, including detached descendants. A child running as the nonroot
-worker uses Darwin's same-UID `kill(-1, SIGKILL)` semantics; root never signals
-previously enumerated PIDs, avoiding a PID-reuse race against unrelated identities.
+worker signals positive enumerated PIDs; kernel UID checks protect unrelated
+identities if a PID is reused. Root never signals enumerated PIDs. Broadcast
+`kill(-1)` is avoided because CI observed it terminate the sender on Darwin.
 Bounded process enumeration has a root-PID positive control. Only after the UID is
 observably empty does descriptor-based scratch cleanup remove the active marker.
 Cleanup failures or supervisor SIGKILL retain the marker and block reuse. Recovery

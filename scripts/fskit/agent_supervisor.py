@@ -76,14 +76,22 @@ def uid_processes(uid):
 
 
 REAPER = r'''
-import errno, os, signal, sys
+import json, os, signal, sys
 uid, gid = map(int, sys.argv[1:])
 if uid <= 0 or gid <= 0 or (os.getuid(),os.geteuid(),os.getgid(),os.getegid()) != (uid,uid,gid,gid):
     raise SystemExit('reaper refused unexpected credentials')
-# Darwin kill(-1) as an unprivileged identity targets only that UID and excludes
-# the caller. The root parent never sends signals to enumerated/reusable PIDs.
-try:os.kill(-1,signal.SIGKILL)
-except ProcessLookupError:pass
+data = sys.stdin.buffer.read(2 * 1024 * 1024 + 1)
+if len(data) > 2 * 1024 * 1024:raise SystemExit('reaper input exceeds bound')
+pids = json.loads(data)
+if not isinstance(pids,list) or len(pids)>131072 or any(type(pid) is not int or pid<=1 for pid in pids):
+    raise SystemExit('reaper requires bounded positive PIDs')
+# A PID reused by another identity remains protected by the kernel's UID check.
+# Never broadcast kill(-1): observed Darwin runners also killed the sender.
+for pid in pids:
+    if pid == os.getpid():continue
+    try:os.kill(pid,signal.SIGKILL)
+    except (ProcessLookupError,PermissionError):pass
+
 '''
 
 
@@ -96,11 +104,12 @@ def reap_identity(policy, launcher, interpreter, environment):
     deadline = time.monotonic() + REAP_SECONDS
     while True:
         if launcher is not None:launcher.poll()  # reap our immediate child
-        if not uid_processes(policy['worker_uid']):return
+        targets = uid_processes(policy['worker_uid'])
+        if not targets:return
         if time.monotonic() >= deadline:raise RuntimeError('worker UID did not quiesce; active marker retained')
         result = subprocess.run([str(interpreter), '-I', '-S', '-c', REAPER,
                                  str(policy['worker_uid']), str(policy['worker_gid'])],
-                                cwd='/', env=environment, stdin=subprocess.DEVNULL,
+                                cwd='/', env=environment, input=json.dumps(sorted(targets)).encode(),
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                 timeout=3, **credentials(policy))
         if result.returncode:raise RuntimeError(f'unprivileged UID cleanup failed ({result.returncode}): '

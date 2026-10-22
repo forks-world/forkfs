@@ -1,5 +1,6 @@
 """Supervisor contracts; privileged Darwin behavior has a separate CI harness."""
 import json
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -28,11 +29,49 @@ class Supervisor(unittest.TestCase):
                 supervisor.supervise('/absent', '/absent', ['true'])
             installed.assert_not_called()
 
+    def test_process_enumeration_requires_positive_control(self):
+        class Query:
+            def __call__(self, kind, identity, buffer, capacity):return 0
+        library=SimpleNamespace(proc_listpids=Query())
+        with patch.object(supervisor.ctypes, 'CDLL', return_value=library):
+            with self.assertRaisesRegex(RuntimeError, 'verify root'):
+                supervisor.uid_processes(70)
+
+    def test_process_enumeration_unions_real_and_effective_uid(self):
+        class Query:
+            def __call__(self, kind, identity, buffer, capacity):
+                buffer[0]=os.getpid() if identity==0 else (123 if kind==4 else 456)
+                return supervisor.ctypes.sizeof(supervisor.ctypes.c_int)
+        library=SimpleNamespace(proc_listpids=Query())
+        with patch.object(supervisor.ctypes, 'CDLL', return_value=library):
+            self.assertEqual(supervisor.uid_processes(70), {123,456})
+
+    def test_process_enumeration_overflow_fails_closed(self):
+        class Query:
+            def __call__(self, kind, identity, buffer, capacity):return capacity
+        library=SimpleNamespace(proc_listpids=Query())
+        with patch.object(supervisor.ctypes, 'CDLL', return_value=library):
+            with self.assertRaisesRegex(RuntimeError, 'capacity'):
+                supervisor.uid_processes(70)
+
     def test_reaper_refuses_root_before_signalling(self):
         result = subprocess.run([sys.executable, '-I', '-S', '-c', supervisor.REAPER, '0', '0'],
                                 capture_output=True, timeout=5)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b'refused', result.stderr)
+
+    def test_reaper_validates_all_targets_before_any_signal(self):
+        for targets in ([123, 0], [123, -1], [123, True], [123, '456']):
+            with self.subTest(targets=targets), \
+                 patch.object(supervisor.os, 'getuid', return_value=70), \
+                 patch.object(supervisor.os, 'geteuid', return_value=70), \
+                 patch.object(supervisor.os, 'getgid', return_value=70), \
+                 patch.object(supervisor.os, 'getegid', return_value=70), \
+                 patch.object(sys, 'argv', ['reaper','70','70']), \
+                 patch.object(sys, 'stdin', SimpleNamespace(buffer=io.BytesIO(json.dumps(targets).encode()))), \
+                 patch.object(supervisor.os, 'kill') as kill:
+                with self.assertRaises(SystemExit):exec(supervisor.REAPER, {})
+                kill.assert_not_called()
 
     def child(self, code):
         return subprocess.Popen([sys.executable, '-I', '-S', '-c', code],

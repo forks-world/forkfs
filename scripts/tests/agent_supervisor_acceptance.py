@@ -93,6 +93,17 @@ def acceptance(host_user, worker_user):
             report=finish(start(['/bin/sh','-c','exit 7']))
             if report['returncode']!=7:raise AssertionError(report)
             checks.append('nonzero-status')
+            occupied=subprocess.Popen(['/bin/sleep','60'],cwd='/',env=CLEAN,
+                stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                **supervisor.credentials(policy))
+            try:
+                denied=start(['/usr/bin/true']);out,err=denied.communicate(timeout=10)
+                if denied.returncode!=2 or 'already in use' not in json.loads(out).get('error',''):
+                    raise AssertionError((out,err))
+                if occupied.poll() is not None or active.exists():raise AssertionError('busy UID modified')
+            finally:
+                occupied.kill();occupied.wait(timeout=5)
+            checks.append('preexisting-worker-refused-without-killing')
             # Detached descendant and inherited pipes must not outlive the lease.
             script='import os,time\nif os.fork()==0:\n os.setsid();time.sleep(60)\nelse:\n time.sleep(.2)'
             report=finish(start([PYTHON,'-I','-S','-c',script]))
