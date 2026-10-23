@@ -17,7 +17,9 @@ import disk_full
 class ImageCleanupTests(unittest.TestCase):
     def exercise(self, *, attach_timeout=False, detach_ok=False, unreadable=False,
                 malformed_discovery=False, unmounted=False, absent=False,
-                detach_timeout=False, persistent=False):
+                detach_timeout=False, persistent=False, busy_attempts=0,
+                detach_error_clears=False, discovery_lost_after_detach=False,
+                replacement_device=False):
         with tempfile.TemporaryDirectory(prefix="forkfs-wrapper-unit-") as root:
             root = Path(root)
             private = root / "image"
@@ -27,6 +29,7 @@ class ImageCleanupTests(unittest.TestCase):
             binary.touch()
             mounted = False
             info_attached = False
+            detach_count = 0
             calls = []
             original_lstat = Path.lstat
 
@@ -41,7 +44,7 @@ class ImageCleanupTests(unittest.TestCase):
                 return result
 
             def run(command, **kwargs):
-                nonlocal mounted, info_attached
+                nonlocal mounted, info_attached, detach_count
                 calls.append(command[1])
                 if command[1] == "attach":
                     # An attach can mount successfully and still fail or time out afterward.
@@ -51,23 +54,24 @@ class ImageCleanupTests(unittest.TestCase):
                         raise subprocess.TimeoutExpired(command, 120)
                     return subprocess.CompletedProcess(command, 7, stdout="attach failed\n")
                 if command[1] == "info":
-                    if malformed_discovery:
+                    if malformed_discovery or (discovery_lost_after_detach and detach_count):
                         return subprocess.CompletedProcess(command, 0, stdout=b"not a plist")
                     images = [] if not info_attached else [{
                         "image-path": str(private / "test.dmg"),
-                        "system-entities": [{"dev-entry": "/dev/disk42s1", "whole-disk": False}],
+                        "system-entities": [{"dev-entry": "/dev/disk43s1" if replacement_device and detach_count else "/dev/disk42s1", "whole-disk": False}],
                     }]
                     return subprocess.CompletedProcess(
                         command, 0, stdout=plistlib.dumps({"images": images})
                     )
                 if command[1] == "detach":
-                    self.assertEqual(command[2], "/dev/disk42s1")
+                    self.assertEqual(command[2], "/dev/disk43s1" if replacement_device and detach_count else "/dev/disk42s1")
+                    detach_count += 1
                     if detach_timeout:
                         raise subprocess.TimeoutExpired(command, 120)
-                    if detach_ok and not persistent:
+                    if (detach_ok and not persistent and detach_count > busy_attempts) or detach_error_clears:
                         mounted = False
                         info_attached = False
-                    return subprocess.CompletedProcess(command, 0 if detach_ok else 8, stdout="")
+                    return subprocess.CompletedProcess(command, 0 if detach_ok and detach_count > busy_attempts else 8, stdout="")
                 return subprocess.CompletedProcess(command, 0, stdout="")
 
             with contextlib.ExitStack() as stack:
@@ -80,6 +84,7 @@ class ImageCleanupTests(unittest.TestCase):
                                                        return_value=mock.Mock(free=3 * 1024**3)))
                 stack.enter_context(mock.patch.object(Path, "lstat", lstat))
                 stack.enter_context(mock.patch.object(disk_full, "run", side_effect=run))
+                stack.enter_context(mock.patch.object(disk_full.time, "sleep"))
                 cleanup = stack.enter_context(mock.patch.object(disk_full.shutil, "rmtree"))
                 child = stack.enter_context(mock.patch.object(disk_full.subprocess, "run"))
                 output = io.StringIO()
@@ -87,8 +92,9 @@ class ImageCleanupTests(unittest.TestCase):
                 stack.enter_context(contextlib.redirect_stderr(output))
                 rc = disk_full.main()
                 child.assert_not_called()
-                if (detach_ok or absent) and not any((unreadable, malformed_discovery,
-                                                       detach_timeout, persistent)):
+                if (detach_ok or absent or detach_error_clears) and not any((unreadable, malformed_discovery,
+                                                       detach_timeout, persistent, discovery_lost_after_detach)):
+                    self.assertLessEqual(detach_count, disk_full.MAX_DETACH_ATTEMPTS)
                     cleanup.assert_called_once_with(private)
                 else:
                     cleanup.assert_not_called()
@@ -98,7 +104,28 @@ class ImageCleanupTests(unittest.TestCase):
     def test_partial_attach_and_failed_detach_preserve_image(self):
         rc, calls = self.exercise()
         self.assertNotEqual(rc, 0)
-        self.assertEqual(calls, ["create", "attach", "info", "detach"])
+        self.assertEqual(calls, ["create", "attach", "info"] +
+                         ["detach", "info"] * disk_full.MAX_DETACH_ATTEMPTS)
+
+    def test_transient_busy_detach_retries_and_preserves_test_status(self):
+        rc, calls = self.exercise(detach_ok=True, busy_attempts=2)
+        self.assertEqual(rc, 7)  # successful cleanup must not hide the original failure
+        self.assertEqual(calls, ['create', 'attach', 'info'] + ['detach', 'info'] * 3)
+
+    def test_failed_detach_that_removed_attachment_does_not_retry_stale_device(self):
+        rc, calls = self.exercise(detach_error_clears=True)
+        self.assertEqual(rc, 7)
+        self.assertEqual(calls, ['create', 'attach', 'info', 'detach', 'info'])
+
+    def test_unknown_discovery_after_busy_detach_preserves_image(self):
+        rc, calls = self.exercise(detach_ok=True, busy_attempts=1, discovery_lost_after_detach=True)
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls, ['create', 'attach', 'info', 'detach', 'info'])
+
+    def test_retry_uses_rediscovered_device_not_old_name(self):
+        rc, calls = self.exercise(detach_ok=True, busy_attempts=1, replacement_device=True)
+        self.assertEqual(rc, 7)
+        self.assertEqual(calls.count('detach'), 2)
 
     def test_attach_timeout_still_detaches_before_cleanup(self):
         rc, calls = self.exercise(attach_timeout=True, detach_ok=True)
@@ -108,7 +135,8 @@ class ImageCleanupTests(unittest.TestCase):
     def test_unknown_mount_state_never_removes_image(self):
         rc, calls = self.exercise(unreadable=True)
         self.assertNotEqual(rc, 0)
-        self.assertEqual(calls, ["create", "attach", "info", "detach"])
+        self.assertEqual(calls, ["create", "attach", "info"] +
+                         ["detach", "info"] * disk_full.MAX_DETACH_ATTEMPTS)
 
     def test_unknown_mount_state_preserves_after_successful_detach(self):
         rc, calls = self.exercise(unreadable=True, detach_ok=True)

@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import re
+import time
 from pathlib import Path
 
 
@@ -273,17 +274,19 @@ def main() -> int:
                     devices = None
                     break
                 print(detached_result.stdout, end="")
-                if detached_result.returncode:
-                    print(f"disk-full wrapper: detach failed; preserving private image at {private}", file=sys.stderr)
-                    result_code = 1
-                    devices = None
-                    break
-                # Re-probe before detaching another device; this bounds cleanup and avoids
-                # acting on stale device names after a partial detach.
+                # A just-filled APFS image can remain temporarily busy after the test
+                # closes its files. Never force-detach it. Re-discover this exact image
+                # after every result, including errors: a failing detach may have partly
+                # succeeded, and retrying the old device name could affect a reused disk.
                 devices = attached_devices()
+                if detached_result.returncode and devices and attempts < MAX_DETACH_ATTEMPTS:
+                    print(f"disk-full wrapper: detach returned {detached_result.returncode}; "
+                          f"retrying confirmed image devices ({attempts}/{MAX_DETACH_ATTEMPTS})",
+                          file=sys.stderr)
+                    time.sleep(1)
             if devices is None or devices:
                 if devices:
-                    print(f"disk-full wrapper: too many attached devices; preserving private image at {private}", file=sys.stderr)
+                    print(f"disk-full wrapper: detach attempts exhausted; preserving private image at {private}", file=sys.stderr)
                 result_code = 1
             else:
                 final_mount = mount_state()
