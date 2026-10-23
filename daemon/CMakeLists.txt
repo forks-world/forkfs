@@ -343,3 +343,7 @@ set_tests_properties(forkfsd_uid_boundary_unit PROPERTIES TIMEOUT 30 LABELS meta
 add_test(NAME forkfsd_dedicated_workload_unit COMMAND ${Python3_EXECUTABLE} -m unittest discover
     -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_dedicated_workload.py -v)
 set_tests_properties(forkfsd_dedicated_workload_unit PROPERTIES TIMEOUT 30 LABELS metadata-regression)
+
+add_test(NAME forkfsd_agent_supervisor_unit COMMAND ${Python3_EXECUTABLE} -m unittest discover
+    -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_agent_supervisor.py -v)
+set_tests_properties(forkfsd_agent_supervisor_unit PROPERTIES TIMEOUT 30 LABELS metadata-regression)

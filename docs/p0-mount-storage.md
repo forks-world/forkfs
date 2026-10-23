@@ -450,3 +450,47 @@ tests but it provides no backing-file isolation. An untrusted agent must not
 share ADMIN_UID. FSKit transport integration and real three-identity deployment
 validation remain necessary for end-to-end isolation. Generation identifies a
 process, not a durable repository identity or a signature on its executable.
+
+### Administrator supervisor for provisioned identities
+
+`scripts/fskit/agent_supervisor.py` adds a bounded administrator CLI above the
+post-drop launcher. Install all four Python modules under root-owned, non-writable
+ancestors without extended ACLs. Invoke using trusted Python with `-I -S` and the
+fresh entry environment described above. The worker interpreter is fixed to the
+root-owned Command Line Tools Python at
+`/Library/Developer/CommandLineTools/usr/bin/python3`; installation is a prerequisite.
+Pass `--policy /trusted/policy.json --state /trusted/state --timeout 600 -- COMMAND`.
+The state directory must be root-owned mode 0711. The input is the version 1 policy
+above; the worker must be a provisioned non-login account with matching primary GID.
+No account creation, sudo installation, agent-facing root socket or UID allocator
+is provided.
+
+A nonblocking exclusive UID lease rejects concurrent supervisors and preexisting
+processes with either real or effective worker UID. A persistent policy fingerprint
+prevents rebinding an idle UID to another world/policy. Before launching, a synced
+active marker reserves the identity across supervisor crashes. A per-session version
+2 policy adds exactly `scratch_parent`, an absolute worker-owned mode-0700 directory
+under a root-owned session directory. Existing version 1 direct launch remains
+supported. The supervisor drops supplementary groups, real/effective/saved IDs,
+closes inherited descriptors and launches with fresh environment and umask 077.
+It captures at most 1 MiB combined stdout/stderr and enforces a wall-clock timeout
+(default 600 seconds, maximum one day).
+
+On normal exit, timeout, output overflow, SIGINT or SIGTERM, cleanup targets the
+whole worker UID, including detached descendants. A child running as the nonroot
+worker signals positive enumerated PIDs; kernel UID checks protect unrelated
+identities if a PID is reused. Root never signals enumerated PIDs. Broadcast
+`kill(-1)` is avoided because CI observed it terminate the sender on Darwin.
+Bounded process enumeration has a root-PID positive control. Only after the UID is
+observably empty does descriptor-based scratch cleanup remove the active marker.
+Cleanup failures or supervisor SIGKILL retain the marker and block reuse. Recovery
+and explicit UID retirement require administrator handling and are not automated.
+The trusted administrator must also prevent mount substitution during the session;
+fsid checks alone do not implement mount lifecycle ownership.
+
+Unit tests cover lease exclusion, crash markers, policy binding, live-UID refusal,
+output preservation/limits, timeout and symlink-safe scratch removal. The disposable
+macOS CI harness additionally exercises real privilege drops, dedicated sandbox
+execution, detached descendants, interruption, output floods and supervisor death.
+Its real CLI rejects an ordinary directory; its success driver mocks only mount
+attestation. These tests do not establish signed, real-mounted FSKit acceptance.

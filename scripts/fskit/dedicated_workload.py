@@ -143,14 +143,17 @@ def parse_policy(data):
     policy = json.loads(data, object_pairs_hook=unique)
     fields = {'version', 'host_uid', 'service_uid', 'frontend_uid', 'worker_uid',
               'worker_gid', 'mount', 'mount_fsid', 'backing', 'read_only'}
-    if not isinstance(policy, dict) or set(policy) != fields or type(policy['version']) is not int or policy['version'] != 1:
+    if not isinstance(policy, dict) or type(policy.get('version')) is not int:
+        raise ValueError('unsupported identity policy schema')
+    if policy['version'] == 2:fields.add('scratch_parent')
+    if set(policy) != fields or policy['version'] not in (1, 2):
         raise ValueError('unsupported identity policy schema')
     ids = [policy[key] for key in ('host_uid', 'service_uid', 'frontend_uid', 'worker_uid')]
     if any(type(uid) is not int or not 0 < uid < 2**32 - 1 for uid in ids) or len(set(ids)) != 4:
         raise ValueError('host, service, frontend and worker require distinct non-root UIDs')
     if type(policy['worker_gid']) is not int or not 0 < policy['worker_gid'] < 2**32 - 1:
         raise ValueError('invalid worker GID')
-    for key in ('mount', 'backing'):
+    for key in (('mount', 'backing', 'scratch_parent') if policy['version'] == 2 else ('mount', 'backing')):
         value = policy[key]
         if not isinstance(value, str) or not Path(value).is_absolute() or '..' in Path(value).parts:
             raise ValueError('invalid ' + key + ' path')
@@ -253,7 +256,15 @@ def run(policy_path, command):
     no_acl(backing)
     # The worker must not inventory/open the service's private store.
     safe_output()
-    with tempfile.TemporaryDirectory(prefix='forkfs-dedicated-', dir='/private/tmp') as name:
+    scratch_parent = Path(policy['scratch_parent']) if policy['version'] == 2 else Path('/private/tmp')
+    if policy['version'] == 2:
+        trusted_path(scratch_parent.parent, directory=True)
+        scratch_info = os.lstat(scratch_parent)
+        if (not stat.S_ISDIR(scratch_info.st_mode) or scratch_info.st_uid != policy['worker_uid']
+                or stat.S_IMODE(scratch_info.st_mode) != 0o700):
+            raise ValueError('managed scratch must be a private directory owned by the worker UID')
+        no_acl(scratch_parent)
+    with tempfile.TemporaryDirectory(prefix='forkfs-dedicated-', dir=scratch_parent) as name:
         scratch = Path(name).resolve()
         environment = runtime.workload_environment(scratch)
         requested = command[0]
