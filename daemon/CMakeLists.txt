@@ -53,15 +53,18 @@ foreach(suite large_files file_io handles inode_handles inode_entries inode_cont
     set_tests_properties(forkfsd_${suite} PROPERTIES TIMEOUT 120)
 endforeach()
 
+add_library(forkfs_rpc_client STATIC rpc_client.cpp)
+target_include_directories(forkfs_rpc_client PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(forkfs_rpc_client PRIVATE -Wall -Wextra -Wpedantic)
 add_executable(forkfsd main.cpp rpc.cpp)
-target_link_libraries(forkfsd PRIVATE forkfs_namespace)
+target_link_libraries(forkfsd PRIVATE forkfs_namespace forkfs_rpc_client)
 target_compile_options(forkfsd PRIVATE -Wall -Wextra -Wpedantic)
 # Fault injection is absent from the production libraries and executable.
 add_executable(forkfsd_leveldb_fault_test main.cpp rpc.cpp container.cpp backup_catalog.cpp namespace.cpp
     compaction.cpp maintenance.cpp journal.cpp level_store.cpp metadata_tree.cpp metadata_view.cpp)
 target_compile_definitions(forkfsd_leveldb_fault_test PRIVATE FORKFS_TEST_FAULTS=1)
 target_include_directories(forkfsd_leveldb_fault_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(forkfsd_leveldb_fault_test PRIVATE leveldb Threads::Threads)
+target_link_libraries(forkfsd_leveldb_fault_test PRIVATE leveldb Threads::Threads forkfs_rpc_client)
 add_executable(forkfsd_inode_recovery_test tests/inode_recovery.cpp container.cpp backup_catalog.cpp namespace.cpp
     compaction.cpp maintenance.cpp journal.cpp level_store.cpp metadata_tree.cpp metadata_view.cpp)
 target_compile_definitions(forkfsd_inode_recovery_test PRIVATE FORKFS_TEST_FAULTS=1)
@@ -347,3 +350,7 @@ set_tests_properties(forkfsd_dedicated_workload_unit PROPERTIES TIMEOUT 30 LABEL
 add_test(NAME forkfsd_agent_supervisor_unit COMMAND ${Python3_EXECUTABLE} -m unittest discover
     -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_agent_supervisor.py -v)
 set_tests_properties(forkfsd_agent_supervisor_unit PROPERTIES TIMEOUT 30 LABELS metadata-regression)
+
+add_test(NAME forkfsd_mount_session_unit COMMAND ${Python3_EXECUTABLE} -m unittest discover
+    -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_mount_session.py -v)
+set_tests_properties(forkfsd_mount_session_unit PROPERTIES TIMEOUT 30 LABELS metadata-regression)

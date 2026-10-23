@@ -203,3 +203,18 @@ write rejection, cleanup failure/retry, and balanced grants on final teardown.
 Descriptors, the database and volume callbacks are real; security-scoped URL
 access and the cleanup failure are deterministic test doubles. These tests do not
 establish OS grant delivery, signing, mounted permissions or kernel cache behavior.
+
+### Isolated daemon transport
+
+The resource loader also supports a frontend-only `.forkfs-fskit-session`
+credential in the daemon's control directory. This route owns no Container:
+existing callbacks use authenticated RPC with a pinned service UID, token and
+generation. See [provisioning and limitations](../../docs/p0-mount-storage.md#fskit-session-transport).
+The older in-process resource and constructor paths above remain compatibility
+fixtures; separate-service security requires the session resource and distinct
+service/frontend/worker identities.
+
+`forkfsd_fskit_transport` runs actual RPC callback/lease/restart tests in
+metadata-regression. Disposable-root CI additionally validates credential
+admission and backing/management denial across UIDs. These tests simulate only
+the security-scope grant and do not establish a real mounted FSKit sandbox grant.
