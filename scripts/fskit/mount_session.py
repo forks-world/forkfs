@@ -14,6 +14,7 @@ import socket
 import stat
 import struct
 import sys
+import time
 
 MARKER = '.forkfs-fskit-session'
 LIMIT = 1024 * 1024
@@ -26,6 +27,7 @@ def request(endpoint, service_uid, fields):
         payload += struct.pack('<I', len(value)) + value
     if len(payload) > LIMIT:raise ValueError('RPC request exceeds frame')
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+        deadline = time.monotonic() + 10
         peer.settimeout(10)
         peer.connect(str(endpoint))
         uid, gid = ctypes.c_uint(), ctypes.c_uint()
@@ -34,10 +36,14 @@ def request(endpoint, service_uid, fields):
         if libc.getpeereid(peer.fileno(), ctypes.byref(uid), ctypes.byref(gid)) or uid.value != service_uid:
             raise ValueError('service peer UID mismatch')
         # Authentication precedes any token or management request transmission.
+        peer.settimeout(max(0.001, deadline-time.monotonic()))
         peer.sendall(b'FFRPC001' + struct.pack('<I', len(payload)) + payload)
         def receive(count):
             out = bytearray()
             while len(out) < count:
+                remaining = deadline-time.monotonic()
+                if remaining <= 0:raise TimeoutError('mount RPC deadline exceeded')
+                peer.settimeout(remaining)
                 chunk = peer.recv(count-len(out))
                 if not chunk:raise ValueError('truncated RPC response')
                 out.extend(chunk)

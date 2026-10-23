@@ -37,6 +37,7 @@ std::optional<MountCredentials> mount_credentials(NSURL *resource){
     auto marker=[resource URLByAppendingPathComponent:@".forkfs-fskit-session"];
     int fd=open(marker.fileSystemRepresentation,O_RDONLY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK);int saved=errno;
     if(fd<0){if(saved==ENOENT)return std::nullopt;bad();}
+    if(geteuid()==0){close(fd);bad();}
     struct stat st{};std::string bytes;bool valid=fstat(fd,&st)==0 && S_ISREG(st.st_mode) && st.st_uid==geteuid() &&
         (st.st_mode&07777)==0400 && st.st_nlink==1 && st.st_size>0 && st.st_size<=4096;
     if(valid){bytes.resize(st.st_size);size_t done=0;while(done<bytes.size()){

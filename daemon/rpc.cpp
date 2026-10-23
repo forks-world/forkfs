@@ -434,12 +434,6 @@ bool owner(int fd,uid_t control_uid){
     return getsockopt(fd,SOL_SOCKET,SO_PEERCRED,&creds,&n)==0 && creds.uid==control_uid;
 #endif
 }
-void wait_fd(int fd,short events,Clock::time_point deadline){
-    while(true){auto left=std::chrono::duration_cast<std::chrono::milliseconds>(deadline-Clock::now()).count();
-        need(left>0,"RPC timeout");pollfd p{fd,events,0};int n=poll(&p,1,std::min<int64_t>(left,100));
-        if(n<0 && errno==EINTR)continue;need(n>=0,"RPC poll failed");if(n && (p.revents&(events|POLLERR|POLLHUP)))return;
-    }
-}
 }
 void serve_rpc(int listener,Container& container,const volatile sig_atomic_t& stopping,uid_t control_uid,std::optional<uid_t> frontend_uid){
     std::vector<std::unique_ptr<Peer>> peers;Sessions sessions(container);
