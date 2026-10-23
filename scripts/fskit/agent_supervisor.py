@@ -230,7 +230,10 @@ def supervise(policy_path, state, command, timeout=600):
     policy_path = Path(policy_path)
     policy = runtime.read_policy(policy_path)
     if policy['version'] != 1:raise ValueError('supervisor requires a provisioned version 1 identity policy')
-    account = pwd.getpwuid(policy['worker_uid'])
+    try:
+        account = pwd.getpwuid(policy['worker_uid'])
+    except KeyError as error:
+        raise ValueError(f'provisioned worker account for UID {policy["worker_uid"]} is missing') from error
     if (account.pw_gid != policy['worker_gid'] or
             account.pw_shell not in ('/usr/bin/false', '/bin/false', '/usr/sbin/nologin', '/sbin/nologin')):
         raise ValueError('worker must be a dedicated account with matching GID and non-login shell')

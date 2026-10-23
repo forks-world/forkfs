@@ -29,6 +29,41 @@ class Supervisor(unittest.TestCase):
                 supervisor.supervise('/absent', '/absent', ['true'])
             installed.assert_not_called()
 
+    def test_missing_provisioned_account_blocks_admission_before_reservation(self):
+        runtime = SimpleNamespace(
+            ENTRY_ENV={},
+            admit_entry_environment=lambda: None,
+            read_policy=lambda path: dict(version=1, worker_uid=701, worker_gid=702),
+            trusted_path=lambda *args, **kwargs: self.fail('interpreter admission must not run'),
+        )
+        output = io.StringIO()
+        flags = {name: getattr(sys.flags, name) for name in dir(sys.flags)
+                 if not name.startswith('_') and isinstance(getattr(sys.flags, name), int)}
+        flags.update(isolated=True, no_site=True)
+        with patch.object(supervisor.platform, 'system', return_value='Darwin'), \
+             patch.object(supervisor.os, 'getuid', return_value=0), \
+             patch.object(supervisor.os, 'geteuid', return_value=0), \
+             patch.object(sys, 'flags', SimpleNamespace(**flags)), \
+             patch.object(supervisor, 'installed_launcher', return_value=runtime), \
+             patch.object(supervisor.pwd, 'getpwuid', side_effect=KeyError(701)), \
+             patch.object(supervisor, 'Reservation') as reservation, \
+             patch.object(supervisor.subprocess, 'Popen') as popen, \
+             patch.object(supervisor.subprocess, 'run') as run, \
+             patch.object(supervisor.os.path, 'lexists') as lexists, \
+             patch.object(sys, 'argv', ['agent_supervisor.py', '--policy', '/policy',
+                                        '--state', '/state', '--', 'true']), \
+             patch('sys.stdout', output):
+            self.assertEqual(supervisor.main(), 2)
+
+        report = json.loads(output.getvalue())
+        self.assertEqual(report['status'], 'blocked')
+        self.assertIn('provisioned worker account', report['error'])
+        self.assertIn('701', report['error'])
+        reservation.assert_not_called()
+        popen.assert_not_called()
+        run.assert_not_called()
+        lexists.assert_not_called()
+
     def test_process_enumeration_requires_positive_control(self):
         class Query:
             def __call__(self, kind, identity, buffer, capacity):return 0
