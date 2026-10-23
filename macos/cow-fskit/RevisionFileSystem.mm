@@ -7,9 +7,24 @@
 #include <unistd.h>
 // Exactly one bounded selector is accepted. Neither selector can redirect the
 // security-scoped repository path. Invalid/conflicting markers fail closed.
-@implementation ForkFSResourceSelection
+@implementation ForkFSResourceSelection {
+    std::optional<forkfs::MountCredentials> _mount;
+}
+- (const forkfs::MountCredentials *)mountCredentials {return _mount?&*_mount:nullptr;}
 + (instancetype)selectionAtURL:(NSURL *)url {
     if(!url.isFileURL)return nil;
+    try{
+        auto mount=forkfs::mount_credentials(url);
+        if(mount){
+            // Session resources are control-only directories, never stores.
+            for(NSString *marker in @[@".forkfs-fskit-revision",@".forkfs-fskit-world"]){
+                struct stat info{};if(lstat([[url URLByAppendingPathComponent:marker] fileSystemRepresentation],&info)==0 || errno!=ENOENT)return nil;
+            }
+            auto result=[ForkFSResourceSelection new];result->_mount=std::move(mount);
+            result->_name=[NSString stringWithUTF8String:result->_mount->name.c_str()];result->_readOnly=result->_mount->read_only;return result;
+        }
+    }catch(...){return nil;}
+
     int directory=open(url.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
     if(directory<0)return nil;
     const char *markers[]={".forkfs-fskit-revision",".forkfs-fskit-world"};
@@ -39,6 +54,7 @@
 - (NSUUID *)probeIdentityAtURL:(NSURL *)url {
     // Preserve existing revision identities, and give Worlds a distinct domain.
     std::string input=self.readOnly?"forkfs.fskit.resource.v1":"forkfs.fskit.world.v1";
+    if(_mount){input="forkfs.fskit.session.v1";input+=_mount->generation;input+=_mount->session;}
     input+=url.fileSystemRepresentation;input.push_back('\0');input+=self.name.UTF8String;
     auto hash=forkfs::Journal::object_id(std::vector<unsigned char>(input.begin(),input.end()));
     unsigned char uuid[16];std::copy_n(hash.begin(),16,uuid);uuid[6]=(uuid[6]&15)|0x80;uuid[8]=(uuid[8]&63)|0x80;
@@ -73,17 +89,21 @@
     @synchronized(self){
         if(_volume){reply(nil,fs_errorForPOSIXError(EBUSY));return;}
         if(![resource isKindOfClass:[FSPathURLResource class]]){reply(nil,fs_errorForPOSIXError(EINVAL));return;}
-        if(!((FSPathURLResource *)resource).writable){reply(nil,fs_errorForPOSIXError(EROFS));return;}
         NSURL *url=((FSPathURLResource *)resource).url;
         if(![url startAccessingSecurityScopedResource]){reply(nil,fs_errorForPOSIXError(EPERM));return;}
         _grantedURL=url;
         ForkFSResourceSelection *selection=[ForkFSResourceSelection selectionAtURL:url];if(!selection){[self releaseResource];reply(nil,fs_errorForPOSIXError(EINVAL));return;}
         NSError *error=nil;
         try{
-            auto mode=selection.readOnly?forkfs::Container::OpenMode::RevisionPreview:forkfs::Container::OpenMode::ReadWrite;
-            auto store=std::make_shared<forkfs::Container>(url.fileSystemRepresentation,mode);
-            _volume=selection.readOnly?[[ForkRevisionVolume alloc] initWithStore:store revision:selection.name error:&error]
-                                      :[[ForkRevisionVolume alloc] initWithStore:store world:selection.name error:&error];
+            if(auto credentials=[selection mountCredentials]){
+                _volume=[[ForkRevisionVolume alloc] initWithMountCredentials:*credentials error:&error];
+            }else{
+                if(!((FSPathURLResource *)resource).writable)throw std::system_error(EROFS,std::generic_category(),"local resource requires write grant");
+                auto mode=selection.readOnly?forkfs::Container::OpenMode::RevisionPreview:forkfs::Container::OpenMode::ReadWrite;
+                auto store=std::make_shared<forkfs::Container>(url.fileSystemRepresentation,mode);
+                _volume=selection.readOnly?[[ForkRevisionVolume alloc] initWithStore:store revision:selection.name error:&error]
+                                          :[[ForkRevisionVolume alloc] initWithStore:store world:selection.name error:&error];
+            }
         }
         catch(const std::system_error& e){error=fs_errorForPOSIXError(e.code().value());}
         catch(const std::exception&){error=fs_errorForPOSIXError(EIO);}
