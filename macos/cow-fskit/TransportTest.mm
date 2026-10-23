@@ -58,7 +58,12 @@ int main(int argc,char **argv){@autoreleasepool{try{
         std::cout<<"OK"<<std::endl;return 0;
     }
     __block unsigned calls=0;__block FSItem *item=nil;
-    char raw[]={'a','\n',char(0xff)};auto name=[FSFileName nameWithBytes:raw length:sizeof(raw)];
+    char invalid[]={'a','\n',char(0xff)};
+    [volume createItemNamed:[FSFileName nameWithBytes:invalid length:sizeof(invalid)] type:FSItemTypeFile inDirectory:root attributes:[FSItemSetAttributesRequest new]
+        replyHandler:^(FSItem *created,FSFileName *,NSError *e){CHECK(!created && e.code==EINVAL);}];
+    // Preserve the metadata layer's printable-ASCII policy, while proving that
+    // quote/backslash names are byte-exact through raw directory responses.
+    char raw[]={'a','"','\\'};auto name=[FSFileName nameWithBytes:raw length:sizeof(raw)];
     [volume createItemNamed:name type:FSItemTypeFile inDirectory:root attributes:[FSItemSetAttributesRequest new]
         replyHandler:^(FSItem *created,FSFileName *,NSError *error){++calls;CHECK(!error && created);item=created;}];CHECK(calls==1);
     char payload[]={0,1,char(0xff),2};NSData *data=[NSData dataWithBytes:payload length:sizeof(payload)];calls=0;

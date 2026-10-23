@@ -75,9 +75,12 @@ int main(){@autoreleasepool {
         std::filesystem::remove(world);std::filesystem::create_directory(world);CHECK(![ForkFSResourceSelection selectionAtURL:url]);std::filesystem::remove(world);
         CHECK(mkfifo(world.c_str(),0600)==0);CHECK(![ForkFSResourceSelection selectionAtURL:url]);std::filesystem::remove(world);
         put(world,"work");
+        auto malformedSession=path+"/.forkfs-fskit-session";put(malformedSession,"not a credential");
+        CHECK(![ForkFSResourceSelection selectionAtURL:url]);load(fs,resource,EINVAL);
+        std::filesystem::remove(malformedSession);
         auto alias=pattern+"/alias";std::filesystem::create_directory_symlink(path,alias);
         CHECK(![ForkFSResourceSelection selectionAtURL:[NSURL fileURLWithPath:@(alias.c_str())]]);
-        auto starts=url.starts;load(fs,roResource,EROFS);CHECK(url.starts==starts);
+        auto starts=url.starts;auto grantStops=url.stops;load(fs,roResource,EROFS);CHECK(url.starts==starts+1 && url.stops==grantStops+1);
         url.denied=YES;auto stops=url.stops;load(fs,resource,EPERM);CHECK(url.stops==stops);url.denied=NO;
         // Probe must not contend with an existing database owner.
         {forkfs::Container owner(path);__block int calls=0;

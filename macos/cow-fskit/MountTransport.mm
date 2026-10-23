@@ -34,8 +34,8 @@ std::string remote_unhex(id value){
 }
 std::optional<MountCredentials> mount_credentials(NSURL *resource){
     if(!resource.isFileURL)bad();
-    auto marker=[resource URLByAppendingPathComponent:@".forkfs-fskit-session"];
-    int fd=open(marker.fileSystemRepresentation,O_RDONLY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK);int saved=errno;
+    auto marker=std::string(resource.fileSystemRepresentation)+"/.forkfs-fskit-session";
+    int fd=open(marker.c_str(),O_RDONLY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK);int saved=errno;
     if(fd<0){if(saved==ENOENT)return std::nullopt;bad();}
     if(geteuid()==0){close(fd);bad();}
     struct stat st{};std::string bytes;bool valid=fstat(fd,&st)==0 && S_ISREG(st.st_mode) && st.st_uid==geteuid() &&
@@ -59,7 +59,7 @@ std::optional<MountCredentials> mount_credentials(NSURL *resource){
             (info.st_uid!=0 && info.st_uid!=c.service_uid) || (info.st_mode&07022))bad();
         no_acl(path.fileSystemRepresentation);if([path isEqual:@"/"])break;
     }
-    no_acl([[resource URLByAppendingPathComponent:@".forkfs-fskit-session"] fileSystemRepresentation]);
+    no_acl(marker.c_str());
     return c;
 }
 MountTransport::MountTransport(MountCredentials c):credentials_(std::move(c)){

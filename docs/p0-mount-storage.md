@@ -440,15 +440,15 @@ credentials, never from request fields. Frontend peers may obtain service-hello;
 all filesystem operations require a valid, generation-bound mount session.
 They cannot create generic or mount sessions, call management operations without
 credentials, or use a legacy management session as a mount session. Holders may
-renew/revoke their mounted session. Management creates and securely delivers the
-mount token; delivery to FSKit has not yet been implemented. A shared Unix socket
+renew/revoke their mounted session. Management creates and delivers the mount token through the frontend-only
+session resource described below. A shared Unix socket
 does not imply shared privileges.
 
 Deployment must also keep frontend and backing-service UIDs distinct; the
 service planner rejects that overlap. The standalone CLI permits it for protocol
 tests but it provides no backing-file isolation. An untrusted agent must not
-share ADMIN_UID. FSKit transport integration and real three-identity deployment
-validation remain necessary for end-to-end isolation. Generation identifies a
+share ADMIN_UID. The session transport below implements the callback RPC path; real signed
+three-identity mount validation remains necessary for end-to-end isolation. Generation identifies a
 process, not a durable repository identity or a signature on its executable.
 
 ### Administrator supervisor for provisioned identities
@@ -510,7 +510,9 @@ identity. Start `forkfsd serve STORE --socket RESOURCE/rpc.sock --rpc
 --control-uid 0 --frontend-uid FRONTEND_UID` as the service. RESOURCE must be a
 service-owned mode-0711 directory under trusted root/service-owned ancestors,
 without ACLs or group/world write permission. STORE must be outside RESOURCE,
-private to the service. The public socket's kernel peer checks enforce the roles.
+private to the service. Configure World root ownership/mode for the worker UID
+through management before launching it; session provisioning does not change
+filesystem ownership. The public socket's kernel peer checks enforce the roles.
 
 Run trusted administrator code using isolated Python and a fresh environment:
 
@@ -547,7 +549,9 @@ manager remains necessary to tear down the actual mount and agent together.
 
 Directory cursors pin server snapshots; copied cookie checkpoints retain one
 cursor and rewind/replay when necessary. Raw directory name responses carry hex
-bytes so newline and non-UTF8 names remain exact. Remote read/write callbacks
+bytes rather than assuming JSON-safe text. The existing namespace policy still
+accepts only printable ASCII components; newline/non-UTF8 names return EINVAL.
+General POSIX/Unicode filename support remains separate work. Remote read/write callbacks
 cap each operation below the 1-MiB RPC frame and report the actual partial count;
 large writes are not silently split or retried. Existing daemon session limits
 (256 handles, 64 directory cursors) still apply. FSKit keeps at most 32 directory
@@ -560,7 +564,7 @@ without opening backing data in the frontend. Revocation closes the daemon
 session and permanently discards local handles/cursors.
 
 The metadata-regression FSKit transport test exercises real RPC callbacks,
-binary names/content, copied cursors, idle renewal and daemon restart. A separate
+escaped names, invalid-name rejection, binary content, copied cursors, idle renewal and daemon restart. A separate
 root-only macOS CI fixture runs distinct service/frontend/worker identities and
 checks frontend management denial, worker RPC/token denial, and backing-file
 denial. Only the security-scope grant is simulated for callbacks; no signed

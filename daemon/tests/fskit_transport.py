@@ -63,4 +63,4 @@ with tempfile.TemporaryDirectory(prefix='ff-transport-', dir='/tmp') as temp:
     finally:
         if child and child.poll() is None:child.kill();child.communicate(timeout=5)
         if process and process.poll() is None:process.terminate();process.wait(timeout=10)
-print('RPC callbacks, binary names, retained cursors, idle lease and restart invalidation passed')
+print('RPC callbacks, escaped names, invalid-name rejection, retained cursors, idle lease and restart invalidation passed')

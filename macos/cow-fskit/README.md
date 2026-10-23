@@ -6,10 +6,11 @@ Build with a macOS 26+ SDK and runtime, with `-DWFS_BUILD_LEGACY=OFF -DWFS_COW_F
 The optional build defaults its deployment target to 26.0 and rejects explicit
 older targets because the path-resource loader uses FSKit V2. This matches the
 host and extension plist minimum versions.
-The optional target links FSKit directly to `forkfs_namespace`; it performs no
-host-file passthrough and no per-operation RPC. The volume owns a shared
-Container. The resource loader selects either a named immutable revision or a
-live writable World.
+The in-process compatibility mode links FSKit directly to `forkfs_namespace`
+and owns a shared Container. The resource loader selects a named immutable
+revision or live writable World. The isolated session-resource mode below
+uses per-operation RPC and opens no backing Container in the frontend.
+Neither mode performs host-file passthrough.
 
 Lookup, attributes, symlink reads, regular-file reads and directory enumeration
 use logical inodes. Revision mutation callbacks return EROFS. Hardlinks reuse the same
