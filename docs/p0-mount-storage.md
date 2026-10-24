@@ -548,7 +548,9 @@ invalidation, not an OS-level unmount/cache purge: the trusted mount lifecycle
 manager remains necessary to tear down the actual mount and agent together.
 
 Directory cursors pin server snapshots; copied cookie checkpoints retain one
-cursor and rewind/replay when necessary. Raw directory name responses carry hex
+cursor and a bounded last-page cache. Both remote Worlds and revisions use this
+path, so partial FSKit packer batches resume without reopening cursors or
+rescanning earlier pages. Explicit older-cookie seeks can still rewind/replay. Raw directory name responses carry hex
 bytes rather than assuming JSON-safe text. The existing namespace policy still
 accepts only printable ASCII components; newline/non-UTF8 names return EINVAL.
 General POSIX/Unicode filename support remains separate work. Remote read/write callbacks
@@ -564,7 +566,10 @@ without opening backing data in the frontend. Revocation closes the daemon
 session and permanently discards local handles/cursors.
 
 The metadata-regression FSKit transport test exercises real RPC callbacks,
-escaped names, invalid-name rejection, binary content, copied cursors, idle renewal and daemon restart. A separate
+escaped names, invalid-name rejection, binary content, copied cursors, idle renewal and daemon restart. A counted
+fake-service regression additionally enumerates 4,097 revision entries through
+31-entry FSKit packer batches, asserting a single cursor, no rewinds and at most
+35 page RPCs. A separate
 root-only macOS CI fixture runs distinct service/frontend/worker identities and
 checks frontend management denial, worker RPC/token denial, and backing-file
 denial. Only the security-scope grant is simulated for callbacks; no signed

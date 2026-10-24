@@ -115,5 +115,8 @@ if(APPLE AND WFS_COW_FSKIT)
     add_test(NAME forkfsd_fskit_transport COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_SOURCE_DIR}/daemon/tests/fskit_transport.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_fskit_transport_test>)
     set_tests_properties(forkfsd_fskit_transport PROPERTIES TIMEOUT 60 LABELS metadata-regression)
+    add_test(NAME forkfsd_fskit_pagination COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/daemon/tests/fskit_pagination.py $<TARGET_FILE:forkfsd_fskit_transport_test>)
+    set_tests_properties(forkfsd_fskit_pagination PROPERTIES TIMEOUT 60 LABELS metadata-regression)
 
 endif()

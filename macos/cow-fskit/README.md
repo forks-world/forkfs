@@ -19,7 +19,9 @@ are explicitly disabled. IDs are allocated monotonically without a 4096-item
 quota and never reused during a mount; exhaustion of the 64-bit counter fails
 with EOVERFLOW. The identity table grows with distinct observed inodes until
 revocation; this is not bounded-memory identity management. Directory cookies are entry ordinals in the immutable
-revision; resumed enumeration currently scans earlier entries again.
+revision. Local compatibility enumeration can rescan earlier entries; remote
+revision enumeration retains a pinned cursor and bounded last-page cache across
+partial FSKit batches.
 
 This uses the Operations compatibility protocols, deprecated by the installed
 macOS 27 SDK. Deprecation warnings remain visible but are not build errors for

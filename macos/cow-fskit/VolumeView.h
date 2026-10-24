@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <optional>
 #import "MountTransport.h"
 namespace forkfs {
 // Keeps the existing callback behavior for in-process tests while the resource
@@ -8,6 +9,7 @@ class VolumeView {
 public:
     struct RemoteCursor {
         std::shared_ptr<MountTransport> transport;std::string token;uint64_t position=0;
+        uint64_t cachedStart=0;size_t cachedCount=0;std::optional<Namespace::DirectoryPage> cachedPage;
         ~RemoteCursor(){try{if(transport->healthy())transport->call({"fs-dir-close",token});}catch(...) {}}
     };
     struct DirectoryCursor {Namespace::DirectoryCursor local;std::shared_ptr<RemoteCursor> remote;uint64_t index=0;};
@@ -74,15 +76,20 @@ public:
     }
     Namespace::DirectoryPage read_directory(DirectoryCursor& c,size_t count,bool attrs){
         if(local_)return local_->read_directory(c.local,count,attrs);
+        if(!remote_->healthy())throw std::system_error(ENOTCONN,std::generic_category(),"mount session is permanently disconnected");
+        if(c.remote->cachedPage && c.index==c.remote->cachedStart && count==c.remote->cachedCount){
+            c.index=c.remote->cachedStart+c.remote->cachedPage->entries.size();return *c.remote->cachedPage;
+        }
         // Copies retain one server-pinned snapshot. Rewind only when an earlier
         // cookie is requested; sequential batches require a single RPC.
         if(c.remote->position>c.index){remote_->call({"fs-dir-rewind",c.remote->token});c.remote->position=0;}
         while(c.remote->position<c.index){auto n=std::min<uint64_t>(128,c.index-c.remote->position);auto page=page_read(c,n);if(page.eof && c.remote->position<c.index)throw std::system_error(ESTALE,std::generic_category(),"cursor position lost");}
-        auto page=page_read(c,count);c.index=c.remote->position;return page;
+        auto start=c.remote->position;auto page=page_read(c,count);c.index=c.remote->position;
+        c.remote->cachedStart=start;c.remote->cachedCount=count;c.remote->cachedPage=page;return page;
     }
     Namespace::DirectoryPage list_inode(const std::string& id,const std::string& after,size_t count){
-        if(local_)return local_->list_inode(id,after,count);auto c=open_directory_inode(id);Namespace::DirectoryPage out;out.eof=false;
-        while(!out.eof){auto p=read_directory(c,128,true);out.eof=p.eof;for(auto& e:p.entries)if(e.name>after){out.names.push_back(e.name);out.entries.push_back(std::move(e));if(out.entries.size()==count){out.eof=false;return out;}}}return out;
+        if(!local_)throw std::system_error(ENOTSUP,std::generic_category(),"remote inode listing requires a pinned directory cursor");
+        return local_->list_inode(id,after,count);
     }
 private:
     static constexpr size_t io_limit=1024*1024-4096;

@@ -16,6 +16,19 @@
 - (NSUInteger)length{return self.data.length;}
 - (void *)mutableBytes{return self.data.mutableBytes;}
 @end
+@interface PaginationPacker : NSObject
+@property(nonatomic) NSUInteger capacity;
+@property(nonatomic,strong) NSMutableArray<NSString *> *names;
+@property(nonatomic,strong) NSMutableArray<NSNumber *> *cookies;
+@property(nonatomic) NSUInteger attributeCount;
+@end
+@implementation PaginationPacker
+- (instancetype)init {if((self=[super init])){_capacity=31;_names=[NSMutableArray new];_cookies=[NSMutableArray new];}return self;}
+- (BOOL)packEntryWithName:(FSFileName *)name itemType:(FSItemType)type itemID:(FSItemID)itemID nextCookie:(FSDirectoryCookie)cookie attributes:(FSItemAttributes *)attributes {
+    if(self.names.count==self.capacity)return NO;
+    [self.names addObject:name.string];[self.cookies addObject:@(cookie)];if(attributes)++_attributeCount;return YES;
+}
+@end
 // Only the OS-supplied security-scope grant is simulated. Session resource,
 // ownership/ACL admission, peer credentials, socket and callbacks remain real.
 @interface TransportURL : NSURL
@@ -37,6 +50,7 @@
 @end
 int main(int argc,char **argv){@autoreleasepool{try{
     CHECK(argc==3 || argc==4);
+    const bool paginationMode=std::string(argv[1])=="--pagination-config";
     ForkRevisionVolume *volume=nil;ForkRevisionFileSystem *loader=nil;FSPathURLResource *resource=nil;
     std::optional<forkfs::MountCredentials> c;
     if(std::string(argv[1])=="--resource"){
@@ -49,13 +63,33 @@ int main(int argc,char **argv){@autoreleasepool{try{
         // A frontend credential must not give management authority.
         bool denied=false;try{forkfs::request_rpc(c->socket,{"status"},c->service_uid);}catch(...){denied=true;}CHECK(denied);
     }else{
-        CHECK(std::string(argv[1])=="--test-config");
+        CHECK(std::string(argv[1])=="--test-config" || paginationMode);
         std::ifstream input(argv[2]);forkfs::MountCredentials config{};unsigned uid;int ro;
         input>>config.socket>>uid>>config.generation>>config.session>>config.name>>ro;CHECK(input.good());
         config.service_uid=uid;config.read_only=ro;config.lease_ms=3000;c=config;
         NSError *error=nil;volume=[[ForkRevisionVolume alloc] initWithMountCredentials:*c error:&error];CHECK(volume && !error);
     }
     auto root=volume.rootItem;CHECK(root);
+    if(paginationMode){
+        CHECK(c->read_only);
+        FSDirectoryCookie cookie=FSDirectoryCookieInitial;__block FSDirectoryVerifier verifier=FSDirectoryVerifierInitial;
+        NSMutableArray<NSString *> *names=[NSMutableArray new];NSMutableArray<NSNumber *> *cookies=[NSMutableArray new];
+        bool eof=false;
+        for(unsigned call=0;call<200 && !eof;++call){
+            auto packer=[PaginationPacker new];__block unsigned replies=0;
+            [volume enumerateDirectory:root startingAtCookie:cookie verifier:verifier providingAttributes:[FSItemGetAttributesRequest new]
+                usingPacker:(FSDirectoryEntryPacker *)packer replyHandler:^(FSDirectoryVerifier next,NSError *e){++replies;CHECK(!e && next!=FSDirectoryVerifierInitial);verifier=next;}];
+            CHECK(replies==1 && packer.attributeCount==packer.names.count);
+            [names addObjectsFromArray:packer.names];[cookies addObjectsFromArray:packer.cookies];
+            if(packer.names.count){cookie=packer.cookies.lastObject.unsignedLongLongValue;}
+            else eof=true;
+        }
+        CHECK(eof && names.count==4097 && cookies.count==4097);
+        NSMutableArray<NSString *> *expected=[NSMutableArray new];for(unsigned i=0;i<4097;++i)[expected addObject:[NSString stringWithFormat:@"file-%05u",i]];
+        CHECK([names isEqualToArray:expected]);
+        for(unsigned i=0;i<4097;++i)CHECK(cookies[i].unsignedLongLongValue==uint64_t(i+1));
+        CHECK(![volume revoke]);std::cout<<"OK"<<std::endl;return 0;
+    }
     if(c->read_only){
         __block unsigned replies=0;
         [volume createItemNamed:[FSFileName nameWithString:@"denied"] type:FSItemTypeFile inDirectory:root attributes:[FSItemSetAttributesRequest new]

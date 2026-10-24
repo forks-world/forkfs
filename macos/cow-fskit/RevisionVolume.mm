@@ -147,7 +147,7 @@ struct WorldEnumeration {
     @synchronized(self){try{
         auto dir=[self checked:directory];
         if(dir.type!=FSItemTypeDirectory){reply(current,err(ENOTDIR));return;}
-        if(!_readOnly){[self enumerateWorld:dir cookie:cookie verifier:verifier attributes:attributes packer:packer reply:reply];return;}
+        if(!_readOnly || _view->remote()){[self enumerateWorld:dir cookie:cookie verifier:verifier attributes:attributes packer:packer reply:reply];return;}
         if((cookie==FSDirectoryCookieInitial && verifier!=FSDirectoryVerifierInitial && verifier!=current) ||
            (cookie!=FSDirectoryCookieInitial && verifier!=current)){reply(current,err(FSErrorInvalidDirectoryCookie));return;}
         uint64_t index=0;std::string after;bool done=false;
