@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <charconv>
+#include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
@@ -261,7 +262,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="fs-ilookup")return inode_json(fs.lookup_child(args[1],args[2]))+"\n";
     if(op=="fs-icreate"){
         need(args[3]=="file" || args[3]=="directory","invalid inode creation type");
-        if(args[3]=="file")need(activity.session->handles.size()<256,"session handle limit reached");
+        if(args[3]=="file" && activity.session->handles.size()>=256)throw std::system_error(EMFILE,std::generic_category(),"session handle limit reached");
         std::string handle;auto n=fs.create_child(args[1],args[2],args[3]=="directory",attributes(args[4]),args[3]=="file"?&handle:nullptr);
         if(!handle.empty())try{activity.session->handles.emplace(handle,OwnedHandle{view,revision});}catch(...){fs.close(handle);throw;}
         return "{\"inode\":"+inode_json(n)+",\"handle\":"+(handle.empty()?"null":rpc_json_quote(handle))+"}\n";
@@ -308,7 +309,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         return store.status();
     }
     if(op=="fs-dir-open" || op=="fs-dir-iopen") {
-        need(activity.session->directories.size()<64 && sessions.directory_count()<1024,"directory cursor limit reached");
+        if(activity.session->directories.size()>=64)throw std::system_error(EMFILE,std::generic_category(),"session directory cursor limit reached");
+        if(sessions.directory_count()>=1024)throw std::system_error(ENFILE,std::generic_category(),"global directory cursor limit reached");
         auto cursor=op=="fs-dir-iopen"?fs.open_directory_inode(args[1]):fs.open_directory(args[1]);auto token=random_token();
         while(activity.session->directories.contains(token))token=random_token();
         activity.session->directories.emplace(token,OwnedDirectory{view,revision,std::move(cursor)});
@@ -341,13 +343,13 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
             else if(flag=="nofollow")options.nofollow=true;
             else throw std::runtime_error("unsupported open flag");
         }
-        need(activity.session->handles.size()<256,"session handle limit reached");
+        if(activity.session->handles.size()>=256)throw std::system_error(EMFILE,std::generic_category(),"session handle limit reached");
         auto handle=op=="fs-iopen"?fs.open_inode(args[1],access,options):fs.open(args[1],access,options);
         try{activity.session->handles.emplace(handle,OwnedHandle{view,revision});}catch(...){fs.close(handle);throw;}
         return "{\"handle\":\""+handle+"\"}\n";
     }
     if(op=="fs-dup") {
-        need(activity.session->handles.size()<256,"session handle limit reached");auto handle=fs.dup(args[1]);
+        if(activity.session->handles.size()>=256)throw std::system_error(EMFILE,std::generic_category(),"session handle limit reached");auto handle=fs.dup(args[1]);
         try{activity.session->handles.emplace(handle,OwnedHandle{view,revision});}catch(...){fs.close(handle);throw;}
         return "{\"handle\":\""+handle+"\"}\n";
     }
