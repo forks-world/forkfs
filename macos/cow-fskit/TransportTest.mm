@@ -16,6 +16,13 @@
 - (NSUInteger)length{return self.data.length;}
 - (void *)mutableBytes{return self.data.mutableBytes;}
 @end
+// Force reserved NUL bytes to reach the adapter; FSFileName may canonicalize
+// constructor input before this boundary. Positive cases use real FSFileName.
+@interface RawFileName : NSObject
+@property(nonatomic,strong) NSData *data;
+@end
+@implementation RawFileName
+@end
 @interface PaginationPacker : NSObject
 @property(nonatomic) NSUInteger capacity;
 @property(nonatomic,strong) NSMutableArray<NSString *> *names;
@@ -133,8 +140,8 @@ int main(int argc,char **argv){@autoreleasepool{try{
         std::cout<<"OK"<<std::endl;return 0;
     }
     __block unsigned calls=0;__block FSItem *item=nil;
-    char invalid[]={'a','\0','b'};
-    [volume createItemNamed:[FSFileName nameWithBytes:invalid length:sizeof(invalid)] type:FSItemTypeFile inDirectory:root attributes:[FSItemSetAttributesRequest new]
+    char invalid[]={'a','\0','b'};auto rawName=[RawFileName new];rawName.data=[NSData dataWithBytes:invalid length:sizeof(invalid)];
+    [volume createItemNamed:(FSFileName *)rawName type:FSItemTypeFile inDirectory:root attributes:[FSItemSetAttributesRequest new]
         replyHandler:^(FSItem *created,FSFileName *,NSError *e){CHECK(!created && e.code==EINVAL);}];
     // NUL is rejected locally; quote/backslash and Unicode names remain exact.
     char raw[]={'a','"','\\'};auto name=[FSFileName nameWithBytes:raw length:sizeof(raw)];
