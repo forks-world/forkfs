@@ -1,5 +1,6 @@
 #import "RevisionVolume.h"
 #include "namespace.h"
+#import "VolumeView.h"
 #include "file_content.h"
 #include <algorithm>
 #include <cstring>
@@ -45,16 +46,16 @@ static std::string fileName(FSFileName *name){
     return std::string(static_cast<const char *>(data.bytes),data.length);
 }
 struct WorldEnumeration {
-    forkfs::Namespace::DirectoryCursor start;
+    forkfs::VolumeView::DirectoryCursor start;
     FSDirectoryVerifier verifier;
     FSItemID parent;
     uint64_t issued=0;
-    std::optional<forkfs::Namespace::DirectoryCursor> checkpoint={};
+    std::optional<forkfs::VolumeView::DirectoryCursor> checkpoint={};
     uint64_t checkpointIndex=0;
 };
 @implementation ForkRevisionVolume {
     std::shared_ptr<forkfs::Container> _store;
-    std::unique_ptr<forkfs::Namespace> _view;
+    std::unique_ptr<forkfs::VolumeView> _view;
     NSMutableDictionary<NSString *,ForkRevisionItem *> *_items;
     uint64_t _next;
     bool _revoked;
@@ -75,12 +76,23 @@ struct WorldEnumeration {
         if(error)*error=err(store->open_mode()!=forkfs::Container::OpenMode::ReadWrite?EROFS:ENOTSUP);return nil;
     }
     try {
-        auto view=std::make_unique<forkfs::Namespace>(*store,name.UTF8String,readOnly);
+        auto view=std::make_unique<forkfs::VolumeView>(*store,name.UTF8String,readOnly);
         auto root=view->root_inode();
         self=[super initWithVolumeID:[[FSVolumeIdentifier alloc] initWithUUID:[NSUUID UUID]] volumeName:[FSFileName nameWithString:name]];
         if(self){_store=std::move(store);_view=std::move(view);_items=[NSMutableDictionary new];_numbers=[NSMutableDictionary new];_readOnly=readOnly;_next=3;_nextVerifier=3;[self item:root root:YES];}
         return self;
     }catch(const std::exception&){if(error)*error=err(EIO);return nil;}
+}
+- (instancetype)initWithMountCredentials:(const forkfs::MountCredentials&)credentials error:(NSError **)error {
+    try {
+        auto transport=std::make_shared<forkfs::MountTransport>(credentials);
+        auto view=std::make_unique<forkfs::VolumeView>(transport);auto root=view->root_inode();
+        NSString *name=[NSString stringWithUTF8String:credentials.name.c_str()];
+        self=[super initWithVolumeID:[[FSVolumeIdentifier alloc] initWithUUID:[NSUUID UUID]] volumeName:[FSFileName nameWithString:name]];
+        if(self){_view=std::move(view);_items=[NSMutableDictionary new];_numbers=[NSMutableDictionary new];_readOnly=credentials.read_only;_next=3;_nextVerifier=3;[self item:root root:YES];}
+        return self;
+    }catch(const std::system_error& e){if(error)*error=err(e.code().value());return nil;}
+    catch(const std::exception&){if(error)*error=err(EIO);return nil;}
 }
 - (FSItemID)numberForInode:(const forkfs::InodeInfo&)info root:(BOOL)root {
     NSString *key=[NSString stringWithUTF8String:info.id.c_str()];
@@ -101,7 +113,7 @@ struct WorldEnumeration {
     if(root)item.parentInode=key;_items[key]=item;return item;
 }
 - (ForkRevisionItem *)checked:(FSItem *)item {
-    if(_revoked)throw std::system_error(ENOTCONN,std::generic_category(),"revision volume revoked");
+    if(_revoked || !_view || !_view->healthy())throw std::system_error(ENOTCONN,std::generic_category(),"revision volume revoked");
     if(![item isKindOfClass:[ForkRevisionItem class]])throw std::system_error(ESTALE,std::generic_category(),"foreign item");
     auto selected=(ForkRevisionItem *)item;if(_items[selected.inode]!=selected)throw std::system_error(ESTALE,std::generic_category(),"stale item");return selected;
 }
@@ -135,7 +147,7 @@ struct WorldEnumeration {
     @synchronized(self){try{
         auto dir=[self checked:directory];
         if(dir.type!=FSItemTypeDirectory){reply(current,err(ENOTDIR));return;}
-        if(!_readOnly){[self enumerateWorld:dir cookie:cookie verifier:verifier attributes:attributes packer:packer reply:reply];return;}
+        if(!_readOnly || _view->remote()){[self enumerateWorld:dir cookie:cookie verifier:verifier attributes:attributes packer:packer reply:reply];return;}
         if((cookie==FSDirectoryCookieInitial && verifier!=FSDirectoryVerifierInitial && verifier!=current) ||
            (cookie!=FSDirectoryCookieInitial && verifier!=current)){reply(current,err(FSErrorInvalidDirectoryCookie));return;}
         uint64_t index=0;std::string after;bool done=false;
@@ -165,7 +177,7 @@ struct WorldEnumeration {
         auto cursor=_view->open_directory_inode(key.first);auto parent=_view->parent_inode(key.first);
         auto parentNumber=[self numberForInode:parent root:parent.id==key.first];
         if(_nextVerifier==UINT64_MAX)throw std::system_error(EOVERFLOW,std::generic_category(),"directory verifier exhausted");
-        if(!_enumerations.contains(key) && _enumerations.size()>=128){
+        if(!_enumerations.contains(key) && _enumerations.size()>=32){
             auto oldest=std::min_element(_enumerations.begin(),_enumerations.end(),[](const auto& a,const auto& b){return a.second.verifier<b.second.verifier;});
             _enumerations.erase(oldest);
         }
@@ -207,24 +219,28 @@ struct WorldEnumeration {
 }
 - (FSStatFSResult *)volumeStatistics {
     @synchronized(self){auto result=[[FSStatFSResult alloc] initWithFileSystemTypeName:@"forkrevision"];result.blockSize=4096;result.ioSize=65536;
-        if(!_revoked && _store)try{auto space=_store->storage_space();result.totalBlocks=space.first/4096;result.availableBlocks=space.second/4096;result.freeBlocks=result.availableBlocks;result.usedBlocks=result.totalBlocks-result.freeBlocks;}catch(const std::exception&){/* Report no available space on a backing error. */}
+        if(!_revoked && _view && _view->healthy())try{auto space=_store?_store->storage_space():_view->space();result.totalBlocks=space.first/4096;result.availableBlocks=space.second/4096;result.freeBlocks=result.availableBlocks;result.usedBlocks=result.totalBlocks-result.freeBlocks;}catch(const std::exception&){/* Report no available space on a backing error. */}
         return result;}
 }
 - (NSError *)revoke {@synchronized(self){
     _revoked=true;
+    if(_view && _view->remote()){
+        NSError *failure=nil;try{_view->revoke();}catch(const std::system_error& e){failure=err(e.code().value());}catch(...){failure=err(EIO);}
+        [_items removeAllObjects];[_numbers removeAllObjects];_enumerations.clear();_view.reset();return failure;
+    }
     try{for(ForkRevisionItem *item in _items.allValues)if(item.handle){_view->close(item.handle.UTF8String);item.handle=nil;}}
     catch(const std::system_error& e){return err(e.code().value());}catch(const std::exception&){return err(EIO);}
     [_items removeAllObjects];[_numbers removeAllObjects];_enumerations.clear();_view.reset();_store.reset();return nil;
 }}
 - (void)dealloc {[self revoke];}
-- (FSItem *)rootItem {@synchronized(self){if(_revoked)return nil;return [self item:_view->root_inode() root:YES];}}
+- (FSItem *)rootItem {@synchronized(self){if(_revoked || !_view || !_view->healthy())return nil;try{return [self item:_view->root_inode() root:YES];}catch(...){return nil;}}}
 - (void)activateWithOptions:(FSTaskOptions *)options replyHandler:(void (^)(FSItem *,NSError *))reply {
-    @synchronized(self){try{if(_revoked){reply(nil,err(ENOTCONN));return;}reply([self item:_view->root_inode() root:YES],nil);}catch(const std::system_error& e){reply(nil,err(e.code().value()));}catch(const std::exception&){reply(nil,err(EIO));}}
+    @synchronized(self){try{if(_revoked || !_view || !_view->healthy()){reply(nil,err(ENOTCONN));return;}reply([self item:_view->root_inode() root:YES],nil);}catch(const std::system_error& e){reply(nil,err(e.code().value()));}catch(const std::exception&){reply(nil,err(EIO));}}
 }
 - (void)deactivateWithOptions:(FSDeactivateOptions)options replyHandler:(void (^)(NSError *))reply {reply([self revoke]);}
-- (void)mountWithOptions:(FSTaskOptions *)options replyHandler:(void (^)(NSError *))reply {@synchronized(self){reply(_revoked?err(ENOTCONN):nil);}}
+- (void)mountWithOptions:(FSTaskOptions *)options replyHandler:(void (^)(NSError *))reply {@synchronized(self){reply((_revoked || !_view || !_view->healthy())?err(ENOTCONN):nil);}}
 - (void)unmountWithReplyHandler:(void (^)(void))reply {[self revoke];reply();}
-- (void)synchronizeWithFlags:(FSSyncFlags)flags replyHandler:(void (^)(NSError *))reply {@synchronized(self){reply(_revoked?err(ENOTCONN):nil);}}
+- (void)synchronizeWithFlags:(FSSyncFlags)flags replyHandler:(void (^)(NSError *))reply {@synchronized(self){try{if(_revoked || !_view || !_view->healthy()){reply(err(ENOTCONN));return;}_view->sync();reply(nil);}catch(const std::system_error& e){reply(err(e.code().value()));}catch(...){reply(err(EIO));}}}
 - (void)getAttributes:(FSItemGetAttributesRequest *)desired ofItem:(FSItem *)item replyHandler:(void (^)(FSItemAttributes *,NSError *))reply {
     @synchronized(self){try{auto it=[self checked:item];reply([self attributes:(it.handle?_view->handle_stat(it.handle.UTF8String):_view->stat_inode(it.inode.UTF8String)) item:it],nil);}catch(const std::system_error& e){reply(nil,err(e.code().value()));}catch(const std::exception&){reply(nil,err(EIO));}}
 }
@@ -261,7 +277,7 @@ struct WorldEnumeration {
 }
 - (void)readFromFile:(FSItem *)item offset:(off_t)offset length:(size_t)length intoBuffer:(FSMutableFileDataBuffer *)buffer replyHandler:(void (^)(size_t,NSError *))reply {
     if(offset<0 || !buffer){reply(0,err(EINVAL));return;}
-    @synchronized(self){try{auto it=[self checked:item];if(it.type!=FSItemTypeFile){reply(0,err(it.type==FSItemTypeDirectory?EISDIR:EINVAL));return;}auto data=it.handle?_view->handle_read(it.handle.UTF8String,offset,std::min<uint64_t>(MIN(length,buffer.length),forkfs::FileContent::max_io)):_view->read_inode(it.inode.UTF8String,offset,std::min<uint64_t>(MIN(length,buffer.length),forkfs::FileContent::max_io));if(!data.empty()){if(!buffer.mutableBytes){reply(0,err(EFAULT));return;}memcpy(buffer.mutableBytes,data.data(),data.size());}reply(data.size(),nil);}catch(const std::system_error& e){reply(0,err(e.code().value()));}catch(const std::exception&){reply(0,err(EIO));}}
+    @synchronized(self){try{auto it=[self checked:item];if(it.type!=FSItemTypeFile){reply(0,err(it.type==FSItemTypeDirectory?EISDIR:EINVAL));return;}auto data=it.handle?_view->handle_read(it.handle.UTF8String,offset,std::min<uint64_t>(MIN(length,buffer.length),_view->max_io())):_view->read_inode(it.inode.UTF8String,offset,std::min<uint64_t>(MIN(length,buffer.length),_view->max_io()));if(!data.empty()){if(!buffer.mutableBytes){reply(0,err(EFAULT));return;}memcpy(buffer.mutableBytes,data.data(),data.size());}reply(data.size(),nil);}catch(const std::system_error& e){reply(0,err(e.code().value()));}catch(const std::exception&){reply(0,err(EIO));}}
 }
 // Route all names through the versioned inode; do not use AppleDouble sidecars.
 - (void)getXattrNamed:(FSFileName *)name ofItem:(FSItem *)item replyHandler:(void (^)(NSData *,NSError *))reply {
@@ -307,7 +323,7 @@ struct WorldEnumeration {
         if(it.type!=FSItemTypeFile){reply(0,err(it.type==FSItemTypeDirectory?EISDIR:EINVAL));return;}
         if(!contents || offset<0){reply(0,err(EINVAL));return;}
         if(contents.length>uint64_t(INT64_MAX)-(uint64_t)offset){reply(0,err(EFBIG));return;}
-        std::vector<unsigned char> bytes(std::min<uint64_t>(contents.length,forkfs::FileContent::max_io));if(!bytes.empty())memcpy(bytes.data(),contents.bytes,bytes.size());
+        std::vector<unsigned char> bytes(std::min<uint64_t>(contents.length,_view->max_io()));if(!bytes.empty())memcpy(bytes.data(),contents.bytes,bytes.size());
         _view->handle_write(it.handle.UTF8String,offset,bytes);reply(bytes.size(),nil);
     }catch(const std::system_error& e){reply(0,err(e.code().value()));}catch(const std::exception&){reply(0,err(EIO));}}
 }

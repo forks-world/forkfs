@@ -6,10 +6,11 @@ Build with a macOS 26+ SDK and runtime, with `-DWFS_BUILD_LEGACY=OFF -DWFS_COW_F
 The optional build defaults its deployment target to 26.0 and rejects explicit
 older targets because the path-resource loader uses FSKit V2. This matches the
 host and extension plist minimum versions.
-The optional target links FSKit directly to `forkfs_namespace`; it performs no
-host-file passthrough and no per-operation RPC. The volume owns a shared
-Container. The resource loader selects either a named immutable revision or a
-live writable World.
+The in-process compatibility mode links FSKit directly to `forkfs_namespace`
+and owns a shared Container. The resource loader selects a named immutable
+revision or live writable World. The isolated session-resource mode below
+uses per-operation RPC and opens no backing Container in the frontend.
+Neither mode performs host-file passthrough.
 
 Lookup, attributes, symlink reads, regular-file reads and directory enumeration
 use logical inodes. Revision mutation callbacks return EROFS. Hardlinks reuse the same
@@ -18,7 +19,9 @@ are explicitly disabled. IDs are allocated monotonically without a 4096-item
 quota and never reused during a mount; exhaustion of the 64-bit counter fails
 with EOVERFLOW. The identity table grows with distinct observed inodes until
 revocation; this is not bounded-memory identity management. Directory cookies are entry ordinals in the immutable
-revision; resumed enumeration currently scans earlier entries again.
+revision. Local compatibility enumeration can rescan earlier entries; remote
+revision enumeration retains a pinned cursor and bounded last-page cache across
+partial FSKit batches.
 
 This uses the Operations compatibility protocols, deprecated by the installed
 macOS 27 SDK. Deprecation warnings remain visible but are not build errors for
@@ -203,3 +206,18 @@ write rejection, cleanup failure/retry, and balanced grants on final teardown.
 Descriptors, the database and volume callbacks are real; security-scoped URL
 access and the cleanup failure are deterministic test doubles. These tests do not
 establish OS grant delivery, signing, mounted permissions or kernel cache behavior.
+
+### Isolated daemon transport
+
+The resource loader also supports a frontend-only `.forkfs-fskit-session`
+credential in the daemon's control directory. This route owns no Container:
+existing callbacks use authenticated RPC with a pinned service UID, token and
+generation. See [provisioning and limitations](../../docs/p0-mount-storage.md#fskit-session-transport).
+The older in-process resource and constructor paths above remain compatibility
+fixtures; separate-service security requires the session resource and distinct
+service/frontend/worker identities.
+
+`forkfsd_fskit_transport` runs actual RPC callback/lease/restart tests in
+metadata-regression. Disposable-root CI additionally validates credential
+admission and backing/management denial across UIDs. These tests simulate only
+the security-scope grant and do not establish a real mounted FSKit sandbox grant.

@@ -1,4 +1,5 @@
 """RPC session ownership, heartbeat, quota and lease-driven handle release."""
+import errno
 import json
 from pathlib import Path
 import socket
@@ -22,11 +23,12 @@ with tempfile.TemporaryDirectory(prefix='ff-session-',dir='/tmp') as tmp:
     root=Path(tmp);db=root/'store';endpoint=root/'control.sock'
     p=subprocess.run([BIN,'init',str(db)],capture_output=True,timeout=10);assert p.returncode==0,p.stderr
     proc=subprocess.Popen([BIN,'serve',str(db),'--socket',str(endpoint),'--rpc'],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-    def rpc(*fields,ok=True):
+    def rpc(*fields,ok=True,error=None):
         with socket.socket(socket.AF_UNIX) as s:
             s.settimeout(5);s.connect(str(endpoint));s.sendall(frame(fields))
             h=exact(s,12);assert h[:8]==b'FFRSP001';b=exact(s,struct.unpack('<I',h[8:])[0])
             code=struct.unpack('<I',b[:4])[0];assert (code==0)==ok,(fields[:2],b)
+            if error is not None:assert code==(0x80000000|error),(fields[:2],code,b)
             return b[4:]
     def session(ms=60000):return json.loads(rpc('session-open',ms))['session']
     def open_file(path,s,*view):return json.loads(rpc('fs-open',path,'rw',*view,'--session',s))['handle']
@@ -164,11 +166,26 @@ with tempfile.TemporaryDirectory(prefix='ff-session-',dir='/tmp') as tmp:
         # Bounded session and per-session descriptor counts; release restores capacity.
         rpc('fs-write','/quota',b'Q');quota=session(300000)
         handles=[open_file('/quota',quota) for _ in range(256)]
-        rpc('fs-open','/quota','r','--session',quota,ok=False)
-        rpc('fs-open','/quota-new','rw,create','--session',quota,ok=False)
-        rpc('fs-open','/quota','w,truncate','--session',quota,ok=False)
+        rpc('fs-open','/quota','r','--session',quota,ok=False,error=errno.EMFILE)
+        rpc('fs-open','/quota-new','rw,create','--session',quota,ok=False,error=errno.EMFILE)
+        rpc('fs-open','/quota','w,truncate','--session',quota,ok=False,error=errno.EMFILE)
+        rpc('fs-dup',handles[0],'--session',quota,ok=False,error=errno.EMFILE)
+        root_inode=json.loads(rpc('fs-iroot'))['inode_id']
+        quota_file_inode=json.loads(rpc('fs-stat','/quota'))['inode_id']
+        rpc('fs-icreate',root_inode,'quota-inode','file','mode=644','--session',quota,ok=False,error=errno.EMFILE)
+        rpc('fs-iopen',quota_file_inode,'r','--session',quota,ok=False,error=errno.EMFILE)
+        rpc('fs-ilookup',root_inode,'quota-inode',ok=False)
         rpc('fs-stat','/quota-new',ok=False);assert rpc('fs-cat','/quota')==b'Q'
-        rpc('fs-close',handles[0],'--session',quota);open_file('/quota',quota)
+        rpc('fs-close',handles[0],'--session',quota)
+        inode_result=json.loads(rpc('fs-icreate',root_inode,'quota-inode','file','mode=644','--session',quota))
+        rpc('fs-close',inode_result['handle'],'--session',quota)
+        inode_handle=json.loads(rpc('fs-iopen',quota_file_inode,'r','--session',quota))['handle']
+        rpc('fs-close',inode_handle,'--session',quota)
+        open_file('/quota',quota)
+        cursors=[json.loads(rpc('fs-dir-open','/','--session',quota))['cursor'] for _ in range(64)]
+        rpc('fs-dir-open','/','--session',quota,ok=False,error=errno.EMFILE)
+        rpc('fs-dir-close',cursors.pop(),'--session',quota)
+        cursors.append(json.loads(rpc('fs-dir-open','/','--session',quota))['cursor'])
         rpc('session-close',quota)
         tokens=[session(300000) for _ in range(128)]
         rpc('session-open',300000,ok=False)

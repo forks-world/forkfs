@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <charconv>
+#include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
@@ -70,6 +71,13 @@ int64_t signed_number(const std::string& text){
     need(parsed.ec==std::errc{} && parsed.ptr==text.data()+text.size(),"invalid signed offset");return value;
 }
 std::string names(const std::vector<std::string>& values){std::string out;for(const auto& s:values)out+=s+'\n';return out;}
+std::string hex_bytes(const std::string& value){
+    static constexpr char digits[]="0123456789abcdef";std::string out;out.reserve(value.size()*2);
+    for(unsigned char c:value){out+=digits[c>>4];out+=digits[c&15];}return out;
+}
+std::string raw_names(const std::vector<std::string>& values){
+    std::string out="[";bool first=true;for(const auto& value:values){if(!first)out+=',';first=false;out+="\""+hex_bytes(value)+"\"";}return out+"]\n";
+}
 std::string rpc_json_quote(const std::string& value){
     std::string out="\"";for(char c:value){if(c=='\"' || c=='\\')out+='\\';out+=c;}return out+"\"";
 }
@@ -151,14 +159,15 @@ struct Activity {
 std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string> args,bool manager){
     const auto op=args[0];std::string view="main";bool revision=false;
     size_t count=2;
-    if(op=="status" || op=="storage-profile" || op=="fs-init" || op=="fs-check" || op=="fs-worlds" || op=="fs-revisions" || op=="fs-compact")count=1;
-    if(op=="fs-write" || op=="fs-save" || op=="fs-rename" || op=="fs-link" || op=="fs-fork" || op=="fs-append" || op=="fs-truncate" || op=="fs-open" || op=="fs-happend" || op=="fs-htruncate" || op=="fs-hread-next" || op=="fs-hwrite-next" || op=="fs-symlink" || op=="fs-chmod" || op=="fs-setmtime" || op=="fs-hchmod" || op=="fs-hsetmtime" || op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-hlock")count=3;
+    if(op=="status" || op=="storage-profile" || op=="fs-init" || op=="fs-check" || op=="fs-worlds" || op=="fs-revisions" || op=="fs-compact" || op=="fs-statfs" || op=="fs-sync")count=1;
+    if(op=="fs-write" || op=="fs-save" || op=="fs-rename" || op=="fs-link" || op=="fs-fork" || op=="fs-append" || op=="fs-truncate" || op=="fs-open" || op=="fs-happend" || op=="fs-htruncate" || op=="fs-hread-next" || op=="fs-hwrite-next" || op=="fs-symlink" || op=="fs-chmod" || op=="fs-setmtime" || op=="fs-hchmod" || op=="fs-hsetmtime" || op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-dir-entries-raw" || op=="fs-hlock")count=3;
     if(op=="fs-snapshot-parents")count=3;
     if(op=="backup-start")count=3;
     if(op=="backup-catalog-start")count=4;
     if(op=="replay-catalog-start")count=5;
     if(op=="replay-export-start")count=4;
     if(op=="fs-iread" || op=="fs-read-at" || op=="fs-write-at" || op=="fs-hread" || op=="fs-hwrite" || op=="fs-hseek" || op=="fs-hrange-lock")count=4;
+    if(op=="fs-ilistxattr-raw" || op=="fs-hlistxattr-raw")count=2;
     if(op=="fs-setattr" || op=="fs-isetattr" || op=="fs-hsetattr" ||
        op=="fs-igetxattr" || op=="fs-hgetxattr" || op=="fs-iremovexattr" || op=="fs-hremovexattr")count=3;
     if(op=="fs-isetxattr" || op=="fs-hsetxattr")count=5;
@@ -193,11 +202,11 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         static const std::set<std::string> allowed={
             "fs-iroot","fs-iparent","fs-ilookup","fs-istat","fs-iread","fs-ireadlink",
             "fs-icreate","fs-isymlink","fs-ilink","fs-iremove","fs-irename","fs-iopen",
-            "fs-isetattr","fs-ilistxattr","fs-igetxattr","fs-isetxattr","fs-iremovexattr",
+            "fs-isetattr","fs-ilistxattr","fs-ilistxattr-raw","fs-igetxattr","fs-isetxattr","fs-iremovexattr",
             "fs-close","fs-dup","fs-hread","fs-hwrite","fs-hstat","fs-htruncate","fs-happend",
             "fs-hread-next","fs-hwrite-next","fs-hseek","fs-hlock","fs-hrange-lock",
-            "fs-hsetattr","fs-hlistxattr","fs-hgetxattr","fs-hsetxattr","fs-hremovexattr",
-            "fs-dir-iopen","fs-dir-page","fs-dir-entries","fs-dir-rewind","fs-dir-close"};
+            "fs-hsetattr","fs-hlistxattr","fs-hlistxattr-raw","fs-hgetxattr","fs-hsetxattr","fs-hremovexattr",
+            "fs-dir-iopen","fs-dir-page","fs-dir-entries","fs-dir-entries-raw","fs-dir-rewind","fs-dir-close","fs-statfs","fs-sync"};
         need(allowed.contains(op),"operation is not permitted for a mount session");
         need(!selected_view || (view==current.mount->view && revision==current.mount->revision),"mount session belongs to another view");
         view=current.mount->view;revision=current.mount->revision;
@@ -234,6 +243,10 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     if(op=="status")return store.status();
     if(op=="storage-profile")return store.storage_profile();
+    if(op=="fs-statfs"){auto [total,available]=store.storage_space();return "{\"total_bytes\":"+std::to_string(total)+",\"available_bytes\":"+std::to_string(available)+"}\n";}
+    // Mutations publish object data and metadata synchronously before returning.
+    // Dispatch is serial: this ordered barrier must not trigger compaction.
+    if(op=="fs-sync")return "{\"synced\":true}\n";
     if(op=="backup-catalog-start"){need(!args[3].empty(),"catalog destination is required");return store.start_backup(args[1],args[2],std::nullopt,args[3]);}
     if(op=="replay-catalog-start"){need(!args[4].empty(),"catalog destination is required");return store.start_backup(args[1],args[3],number(args[2]),args[4]);}
     if(op=="backup-catalog-retry")return store.retry_backup_catalog(args[1]);
@@ -249,7 +262,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="fs-ilookup")return inode_json(fs.lookup_child(args[1],args[2]))+"\n";
     if(op=="fs-icreate"){
         need(args[3]=="file" || args[3]=="directory","invalid inode creation type");
-        if(args[3]=="file")need(activity.session->handles.size()<256,"session handle limit reached");
+        if(args[3]=="file" && activity.session->handles.size()>=256)throw std::system_error(EMFILE,std::generic_category(),"session handle limit reached");
         std::string handle;auto n=fs.create_child(args[1],args[2],args[3]=="directory",attributes(args[4]),args[3]=="file"?&handle:nullptr);
         if(!handle.empty())try{activity.session->handles.emplace(handle,OwnedHandle{view,revision});}catch(...){fs.close(handle);throw;}
         return "{\"inode\":"+inode_json(n)+",\"handle\":"+(handle.empty()?"null":rpc_json_quote(handle))+"}\n";
@@ -275,6 +288,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     if(op=="fs-ilistxattr" || op=="fs-hlistxattr")
         return names(handle_op?fs.list_handle_xattrs(args[1]):fs.list_inode_xattrs(args[1]));
+    if(op=="fs-ilistxattr-raw" || op=="fs-hlistxattr-raw")
+        return raw_names(handle_op?fs.list_handle_xattrs(args[1]):fs.list_inode_xattrs(args[1]));
     if(op=="fs-igetxattr" || op=="fs-hgetxattr"){
         auto b=handle_op?fs.get_handle_xattr(args[1],args[2]):fs.get_inode_xattr(args[1],args[2]);
         return std::string(b.begin(),b.end());
@@ -294,7 +309,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         return store.status();
     }
     if(op=="fs-dir-open" || op=="fs-dir-iopen") {
-        need(activity.session->directories.size()<64 && sessions.directory_count()<1024,"directory cursor limit reached");
+        if(activity.session->directories.size()>=64)throw std::system_error(EMFILE,std::generic_category(),"session directory cursor limit reached");
+        if(sessions.directory_count()>=1024)throw std::system_error(ENFILE,std::generic_category(),"global directory cursor limit reached");
         auto cursor=op=="fs-dir-iopen"?fs.open_directory_inode(args[1]):fs.open_directory(args[1]);auto token=random_token();
         while(activity.session->directories.contains(token))token=random_token();
         activity.session->directories.emplace(token,OwnedDirectory{view,revision,std::move(cursor)});
@@ -302,11 +318,11 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     if(op=="fs-dir-rewind"){fs.rewind_directory(activity.session->directories.at(args[1]).cursor);return store.status();}
     if(op=="fs-dir-close"){activity.session->directories.erase(args[1]);return store.status();}
-    if(op=="fs-dir-page" || op=="fs-dir-entries") {
+    if(op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-dir-entries-raw") {
         auto limit=number(args[2]);need(limit>=1 && limit<=1024,"directory page limit must be 1..1024");
-        bool attrs=op=="fs-dir-entries";auto page=fs.read_directory(activity.session->directories.at(args[1]).cursor,limit,attrs);
+        bool attrs=op!="fs-dir-page";bool raw=op=="fs-dir-entries-raw";auto page=fs.read_directory(activity.session->directories.at(args[1]).cursor,limit,attrs);
         std::string result=attrs?"{\"entries\":[":"{\"names\":[";bool first=true;
-        if(attrs)for(const auto& entry:page.entries){if(!first)result+=',';first=false;result+="{\"name\":"+rpc_json_quote(entry.name)+",\"inode\":"+inode_json(entry.inode)+"}";}
+        if(attrs)for(const auto& entry:page.entries){if(!first)result+=',';first=false;result+=raw?"{\"name_hex\":\""+hex_bytes(entry.name)+"\",\"inode\":"+inode_json(entry.inode)+"}":"{\"name\":"+rpc_json_quote(entry.name)+",\"inode\":"+inode_json(entry.inode)+"}";}
         else for(const auto& name:page.names){if(!first)result+=',';first=false;result+=rpc_json_quote(name);}
         return result+"],\"eof\":"+(page.eof?"true":"false")+"}\n";
     }
@@ -327,13 +343,13 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
             else if(flag=="nofollow")options.nofollow=true;
             else throw std::runtime_error("unsupported open flag");
         }
-        need(activity.session->handles.size()<256,"session handle limit reached");
+        if(activity.session->handles.size()>=256)throw std::system_error(EMFILE,std::generic_category(),"session handle limit reached");
         auto handle=op=="fs-iopen"?fs.open_inode(args[1],access,options):fs.open(args[1],access,options);
         try{activity.session->handles.emplace(handle,OwnedHandle{view,revision});}catch(...){fs.close(handle);throw;}
         return "{\"handle\":\""+handle+"\"}\n";
     }
     if(op=="fs-dup") {
-        need(activity.session->handles.size()<256,"session handle limit reached");auto handle=fs.dup(args[1]);
+        if(activity.session->handles.size()>=256)throw std::system_error(EMFILE,std::generic_category(),"session handle limit reached");auto handle=fs.dup(args[1]);
         try{activity.session->handles.emplace(handle,OwnedHandle{view,revision});}catch(...){fs.close(handle);throw;}
         return "{\"handle\":\""+handle+"\"}\n";
     }
@@ -420,12 +436,6 @@ bool owner(int fd,uid_t control_uid){
     return getsockopt(fd,SOL_SOCKET,SO_PEERCRED,&creds,&n)==0 && creds.uid==control_uid;
 #endif
 }
-void wait_fd(int fd,short events,Clock::time_point deadline){
-    while(true){auto left=std::chrono::duration_cast<std::chrono::milliseconds>(deadline-Clock::now()).count();
-        need(left>0,"RPC timeout");pollfd p{fd,events,0};int n=poll(&p,1,std::min<int64_t>(left,100));
-        if(n<0 && errno==EINTR)continue;need(n>=0,"RPC poll failed");if(n && (p.revents&(events|POLLERR|POLLHUP)))return;
-    }
-}
 }
 void serve_rpc(int listener,Container& container,const volatile sig_atomic_t& stopping,uid_t control_uid,std::optional<uid_t> frontend_uid){
     std::vector<std::unique_ptr<Peer>> peers;Sessions sessions(container);
@@ -473,47 +483,5 @@ void serve_rpc(int listener,Container& container,const volatile sig_atomic_t& st
         }
     }
     sessions.shutdown();
-}
-std::string request_rpc(const std::string& path,const std::vector<std::string>& fields){
-    return request_rpc(path,fields,geteuid());
-}
-std::string request_rpc(const std::string& path,const std::vector<std::string>& fields,uid_t expected_server){
-    need(!fields.empty() && fields.size()<=16,"RPC requires 1..16 fields");std::string payload;put32(payload,fields.size());
-    for(const auto& field:fields){need(field.size()<=limit,"oversized RPC field");put32(payload,field.size());payload+=field;}
-    auto request=frame("FFRPC001",payload);sockaddr_un addr{};
-    need(path.size()<sizeof(addr.sun_path),"socket path too long");addr.sun_family=AF_UNIX;memcpy(addr.sun_path,path.c_str(),path.size()+1);
-    Peer peer(socket(AF_UNIX,SOCK_STREAM,0));need(peer.fd>=0,"RPC socket failed");
-    need(fcntl(peer.fd,F_SETFD,FD_CLOEXEC)==0 && fcntl(peer.fd,F_SETFL,O_NONBLOCK)==0,"RPC socket flags failed");
-#ifdef __APPLE__
-    int yes=1;need(setsockopt(peer.fd,SOL_SOCKET,SO_NOSIGPIPE,&yes,sizeof(yes))==0,"RPC socket SIGPIPE option failed");
-#endif
-    auto deadline=Clock::now()+std::chrono::seconds(10);
-    if(connect(peer.fd,reinterpret_cast<sockaddr*>(&addr),sizeof(addr))<0){
-        need(errno==EINPROGRESS,"RPC connect failed");wait_fd(peer.fd,POLLOUT,deadline);
-        int error=0;socklen_t len=sizeof(error);need(getsockopt(peer.fd,SOL_SOCKET,SO_ERROR,&error,&len)==0 && error==0,"RPC connect failed");
-    }
-    need(owner(peer.fd,expected_server),"RPC server identity mismatch");
-    size_t sent=0;
-    while(sent<request.size()){
-        wait_fd(peer.fd,POLLOUT,deadline);
-#ifdef __APPLE__
-        auto n=send(peer.fd,request.data()+sent,request.size()-sent,0);
-#else
-        auto n=send(peer.fd,request.data()+sent,request.size()-sent,MSG_NOSIGNAL);
-#endif
-        if(n<0 && (errno==EINTR || errno==EAGAIN || errno==EWOULDBLOCK))continue;
-        need(n>0,"RPC send failed");sent+=n;
-    }
-    std::string reply;size_t target=header;
-    while(reply.size()<target){wait_fd(peer.fd,POLLIN,deadline);char buf[16384];
-        auto n=recv(peer.fd,buf,std::min(sizeof(buf),target-reply.size()),0);
-        if(n<0 && (errno==EINTR || errno==EAGAIN || errno==EWOULDBLOCK))continue;
-        need(n>0,"truncated RPC reply");reply.append(buf,n);
-        if(reply.size()==header){need(!memcmp(reply.data(),"FFRSP001",8),"unsupported RPC reply");auto length=u32(reply,8);
-            need(length>=4 && length<=limit,"invalid RPC reply length");target=header+length;}
-    }
-    auto code=u32(reply,header);auto value=reply.substr(header+4);
-    if(code&0x80000000u)throw std::system_error(static_cast<int>(code&0x7fffffffu),std::generic_category(),value);
-    if(code)throw std::runtime_error(value);return value;
 }
 }
