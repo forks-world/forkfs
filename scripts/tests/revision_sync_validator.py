@@ -22,7 +22,7 @@ def checked(condition, message):
 def validate_symlink_target(target):
     """Match daemon/namespace.cpp target_components validation."""
     checked(bool(target) and len(target) <= 4096, 'symlink target length')
-    checked(all(32 <= byte <= 126 for byte in target), 'symlink target must be printable ASCII')
+    checked(b'\0' not in target, 'symlink target contains NUL')
     checked(all(not component or len(component) <= 255 for component in target.split(b'/')),
             'symlink target component length')
 
@@ -219,7 +219,7 @@ def verify_closure(plan, entries, load, max_dag_bytes=64*1024*1024):
             subdirs = 0
             for name, child in children:
                 checked(name not in (b'', b'.', b'..') and len(name) <= 255 and b'/' not in name
-                        and all(32 <= c <= 126 for c in name), 'unsafe entry name')
+                        and b'\0' not in name, 'unsafe entry name')
                 checked(child in inode_ids and child != root, 'entry target')
                 expected_keys.add(prefix + name)
                 refs[child] += 1;typ, md, _, length = inode_ids[child]
@@ -227,7 +227,9 @@ def verify_closure(plan, entries, load, max_dag_bytes=64*1024*1024):
                 child_allocation_key = NS + b'allocated/' + child
                 checked(child_allocation_key in values and values[child_allocation_key] == b'', 'inode missing allocation record')
                 expected_keys.update((child_inode_key, child_allocation_key))
-                target = path.rstrip('/') + '/' + name.decode()
+                # fsdecode uses surrogateescape, so every stored byte survives
+                # path construction and can be passed back through fsencode.
+                target = path.rstrip('/') + '/' + os.fsdecode(name)
                 if typ == 2:
                     subdirs += 1
                     pending.append((child, target))
@@ -337,7 +339,7 @@ def restore_views(views, root):
     dir_flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
 
     def components(path):
-        return [] if path == '/' else path.lstrip('/').split('/')
+        return [] if path == '/' else [os.fsencode(part) for part in path.lstrip('/').split('/')]
 
     def open_parent(base_fd, parts):
         fd = os.dup(base_fd)
@@ -365,7 +367,7 @@ def restore_views(views, root):
                         if info['kind'] == 'dir':
                             os.mkdir(name, 0o700, dir_fd=parent_fd)
                         elif info['kind'] == 'symlink' and info['inode'] not in links:
-                            os.symlink(os.fsdecode(info['data']), name, dir_fd=parent_fd)
+                            os.symlink(info['data'], name, dir_fd=parent_fd)
                             links[info['inode']] = parts
                         elif info['inode'] in links:
                             source_parent, source_name = open_parent(destination_fd, links[info['inode']])
