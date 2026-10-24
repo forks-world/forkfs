@@ -64,6 +64,12 @@ std::string entry_key(const std::string& id,const std::string& name) {return dir
 bool valid_id(const std::string& id) {
     return id.size()==32 && std::all_of(id.begin(),id.end(),[](char c){return (c>='0'&&c<='9')||(c>='a'&&c<='f');});
 }
+// Namespace keys are byte strings. POSIX names need no UTF-8 validation or
+// normalization; only the reserved bytes and components are excluded.
+bool valid_entry_name(const std::string& name) {
+    return !name.empty() && name.size()<=255 && name!="." && name!=".." &&
+        std::all_of(name.begin(),name.end(),[](unsigned char c){return c!=0 && c!='/';});
+}
 Bytes id_bytes(const std::string& id) {need(valid_id(id),"invalid inode identity");return Bytes(id.begin(),id.end());}
 std::string decode_id(const Bytes& b) {std::string id(b.begin(),b.end());need(valid_id(id),"invalid inode reference");return id;}
 std::string root(const NamespaceView& journal) {
@@ -142,7 +148,7 @@ std::string indexed_parent(const NamespaceView& view,const std::string& id) {
     auto value=view.get(parent_key(id));need(value.size()>=40 && value.size()<=295 && !memcmp(value.data(),"FFPAR001",8),"invalid directory parent record");
     auto parent=decode_id(Bytes(value.begin()+8,value.begin()+40));std::string name(value.begin()+40,value.end());
     if(id==root(view)){need(parent==id && name.empty(),"invalid root parent");return parent;}
-    need(!name.empty() && name!="." && name!=".." && std::all_of(name.begin(),name.end(),[](unsigned char c){return c>=32 && c<=126 && c!='/';}),"invalid parent entry name");
+    need(valid_entry_name(name),"invalid parent entry name");
     need(view.contains(inode_key(parent)) && inode(view,parent).directory,"directory parent is missing");
     auto key=entry_key(parent,name);need(view.contains(key) && decode_id(view.get(key))==id,"directory parent backlink mismatch");return parent;
 }
@@ -183,8 +189,7 @@ std::vector<std::string> components(const std::string& path) {
     while(begin<path.size()) {
         auto end=path.find('/',begin);if(end==std::string::npos)end=path.size();
         auto name=path.substr(begin,end-begin);
-        need(!name.empty() && name!="." && name!=".." && name.size()<=255,"invalid path component");
-        for(unsigned char c:name)need(c>=32 && c<=126,"prototype names must be printable ASCII");
+        need(valid_entry_name(name),"invalid path component");
         result.push_back(name);begin=end+1;
         need(end==path.size() || begin<path.size(),"trailing slash is unsupported");
     }
@@ -192,7 +197,7 @@ std::vector<std::string> components(const std::string& path) {
 }
 std::vector<std::string> target_components(const std::string& target) {
     need(!target.empty() && target.size()<=4096,"invalid symlink target length");
-    for(unsigned char c:target)need(c>=32 && c<=126,"prototype symlink targets must be printable ASCII");
+    need(target.find('\0')==std::string::npos,"invalid symlink target byte");
     std::vector<std::string> result;size_t start=0;
     while(start<target.size()) {
         auto end=target.find('/',start);if(end==std::string::npos)end=target.size();auto name=target.substr(start,end-start);
@@ -203,10 +208,10 @@ std::vector<std::string> target_components(const std::string& target) {
 }
 struct Parent {std::string id,name,key;};
 Parent inode_parent(const NamespaceView& view,const std::string& id,const std::string& name) {
-    if(!valid_id(id) || name.empty() || name=="." || name==".." ||
-       name.find('/')!=std::string::npos || !std::all_of(name.begin(),name.end(),[](unsigned char c){return c>=32 && c<=126;}))
+    if(!valid_id(id))
         throw std::system_error(EINVAL,std::generic_category(),"invalid inode entry name");
     if(name.size()>255)throw std::system_error(ENAMETOOLONG,std::generic_category(),"entry name too long");
+    if(!valid_entry_name(name))throw std::system_error(EINVAL,std::generic_category(),"invalid inode entry name");
     if(!view.contains(inode_key(id)))throw std::system_error(ENOENT,std::generic_category(),"parent inode missing");
     if(!inode(view,id).directory)throw std::system_error(ENOTDIR,std::generic_category(),"parent inode is not a directory");
     return {id,name,entry_key(id,name)};

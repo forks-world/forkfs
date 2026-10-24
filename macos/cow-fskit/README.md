@@ -221,3 +221,8 @@ service/frontend/worker identities.
 metadata-regression. Disposable-root CI additionally validates credential
 admission and backing/management denial across UIDs. These tests simulate only
 the security-scope grant and do not establish a real mounted FSKit sandbox grant.
+
+The CoW namespace now supports byte-exact Unicode names without normalization or
+case folding. The raw RPC directory path preserves non-UTF8 names as well.
+See [filename encoding and limits](../../docs/FILENAMES.md); real-mounted Unicode
+behavior remains a signed deployment acceptance gate.

@@ -43,7 +43,8 @@ static std::pair<forkfs::Namespace::Attributes,FSItemAttribute> requestAttribute
 }
 static std::string fileName(FSFileName *name){
     auto data=name.data;if(!data || !data.length)throw std::system_error(EINVAL,std::generic_category(),"empty name");
-    return std::string(static_cast<const char *>(data.bytes),data.length);
+    auto value=std::string(static_cast<const char *>(data.bytes),data.length);
+    if(value.find('\0')!=std::string::npos)throw std::system_error(EINVAL,std::generic_category(),"NUL in filename/target");return value;
 }
 struct WorldEnumeration {
     forkfs::VolumeView::DirectoryCursor start;

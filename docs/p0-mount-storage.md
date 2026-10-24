@@ -551,9 +551,10 @@ Directory cursors pin server snapshots; copied cookie checkpoints retain one
 cursor and a bounded last-page cache. Both remote Worlds and revisions use this
 path, so partial FSKit packer batches resume without reopening cursors or
 rescanning earlier pages. Explicit older-cookie seeks can still rewind/replay. Raw directory name responses carry hex
-bytes rather than assuming JSON-safe text. The existing namespace policy still
-accepts only printable ASCII components; newline/non-UTF8 names return EINVAL.
-General POSIX/Unicode filename support remains separate work. Remote read/write callbacks
+bytes rather than assuming JSON-safe text. The namespace now preserves POSIX
+byte components, including Unicode, control characters and non-UTF8 bytes;
+see [filename encoding and compatibility](FILENAMES.md). Text JSON endpoints
+require strict UTF-8 and fail without advancing the cursor if encoding fails. Remote read/write callbacks
 cap each operation below the 1-MiB RPC frame and report the actual partial count;
 large writes are not silently split or retried. Existing daemon session limits
 (256 handles, 64 directory cursors) still apply. FSKit keeps at most 32 directory

@@ -46,7 +46,7 @@ set_tests_properties(forkfsd_metadata_view PROPERTIES TIMEOUT 60)
 add_library(forkfs_namespace STATIC container.cpp backup_catalog.cpp namespace.cpp compaction.cpp maintenance.cpp)
 target_link_libraries(forkfs_namespace PUBLIC forkfs_metadata)
 target_compile_options(forkfs_namespace PRIVATE -Wall -Wextra -Wpedantic)
-foreach(suite large_files file_io handles inode_handles inode_entries inode_contracts inode_create inode_size inode_xattrs inode_corruption parent_index transaction)
+foreach(suite large_files file_io handles inode_handles inode_entries inode_contracts inode_create inode_size inode_xattrs inode_corruption parent_index transaction filenames)
     add_executable(forkfsd_${suite}_test tests/${suite}.cpp)
     target_link_libraries(forkfsd_${suite}_test PRIVATE forkfs_namespace)
     add_test(NAME forkfsd_${suite} COMMAND forkfsd_${suite}_test)
@@ -354,3 +354,12 @@ set_tests_properties(forkfsd_agent_supervisor_unit PROPERTIES TIMEOUT 30 LABELS 
 add_test(NAME forkfsd_mount_session_unit COMMAND ${Python3_EXECUTABLE} -m unittest discover
     -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_mount_session.py -v)
 set_tests_properties(forkfsd_mount_session_unit PROPERTIES TIMEOUT 30 LABELS metadata-regression)
+
+add_test(NAME forkfsd_filename_rpc COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/filename_rpc.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_filename_rpc PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+
+add_test(NAME forkfsd_filename_replay COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/filename_replay.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_filename_replay PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+set_tests_properties(forkfsd_filenames PROPERTIES LABELS metadata-regression)

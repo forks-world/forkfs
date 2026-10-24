@@ -1,6 +1,7 @@
 #include "revision.h"
 #include "rpc.h"
 #include "namespace.h"
+#include "json_string.h"
 #include <algorithm>
 #include <chrono>
 #include <charconv>
@@ -79,7 +80,7 @@ std::string raw_names(const std::vector<std::string>& values){
     std::string out="[";bool first=true;for(const auto& value:values){if(!first)out+=',';first=false;out+="\""+hex_bytes(value)+"\"";}return out+"]\n";
 }
 std::string rpc_json_quote(const std::string& value){
-    std::string out="\"";for(char c:value){if(c=='\"' || c=='\\')out+='\\';out+=c;}return out+"\"";
+    return json_string::quote(value);
 }
 std::string inode_json(const InodeInfo& n){
     std::ostringstream out;out<<"{\"inode_id\":\""<<n.id<<"\",\"directory\":"<<(n.directory?"true":"false")
@@ -319,12 +320,20 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="fs-dir-rewind"){fs.rewind_directory(activity.session->directories.at(args[1]).cursor);return store.status();}
     if(op=="fs-dir-close"){activity.session->directories.erase(args[1]);return store.status();}
     if(op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-dir-entries-raw") {
-        auto limit=number(args[2]);need(limit>=1 && limit<=1024,"directory page limit must be 1..1024");
-        bool attrs=op!="fs-dir-page";bool raw=op=="fs-dir-entries-raw";auto page=fs.read_directory(activity.session->directories.at(args[1]).cursor,limit,attrs);
+        auto page_limit=number(args[2]);need(page_limit>=1 && page_limit<=1024,"directory page limit must be 1..1024");
+        bool attrs=op!="fs-dir-page";bool raw=op=="fs-dir-entries-raw";
+        auto& cursor=activity.session->directories.at(args[1]).cursor;
+        auto trial=cursor;
+        auto page=fs.read_directory(trial,page_limit,attrs);
         std::string result=attrs?"{\"entries\":[":"{\"names\":[";bool first=true;
         if(attrs)for(const auto& entry:page.entries){if(!first)result+=',';first=false;result+=raw?"{\"name_hex\":\""+hex_bytes(entry.name)+"\",\"inode\":"+inode_json(entry.inode)+"}":"{\"name\":"+rpc_json_quote(entry.name)+",\"inode\":"+inode_json(entry.inode)+"}";}
         else for(const auto& name:page.names){if(!first)result+=',';first=false;result+=rpc_json_quote(name);}
-        return result+"],\"eof\":"+(page.eof?"true":"false")+"}\n";
+        result += "],\"eof\":";
+        result += page.eof?"true":"false";
+        result += "}\n";
+        if(result.size()>limit-4) throw std::system_error(E2BIG,std::generic_category(),"directory JSON page exceeds RPC limit");
+        cursor=std::move(trial);
+        return result;
     }
     if(op=="fs-cat"){auto b=fs.read(args[1]);return std::string(b.begin(),b.end());}
     if(op=="fs-read-at"){auto b=fs.read_at(args[1],number(args[2]),std::min<uint64_t>(number(args[3]),limit-4));return std::string(b.begin(),b.end());}

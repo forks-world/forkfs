@@ -48,6 +48,37 @@
 - (BOOL)startAccessingSecurityScopedResource{return YES;}
 - (void)stopAccessingSecurityScopedResource{}
 @end
+static FSItem *unicodeCreate(ForkRevisionVolume *v,FSItem *parent,NSString *name,FSItemType type){
+    __block FSItem *result=nil;__block unsigned calls=0;auto requested=[FSFileName nameWithString:name];
+    [v createItemNamed:requested type:type inDirectory:parent attributes:[FSItemSetAttributesRequest new]
+        replyHandler:^(FSItem *item,FSFileName *actual,NSError *e){++calls;CHECK(!e && item && [actual.data isEqual:requested.data]);result=item;}];
+    CHECK(calls==1 && result);return result;
+}
+static void unicodeCallbacks(ForkRevisionVolume *v,FSItem *root,NSData *payload){
+    auto dir=unicodeCreate(v,root,@"中文目录😀",FSItemTypeDirectory);
+    NSMutableArray<FSItem *> *files=[NSMutableArray new];
+    for(NSString *name in @[@"源代码🧪.txt",@"café",@"cafe\u0301"]){
+        auto file=unicodeCreate(v,dir,name,FSItemTypeFile);[files addObject:file];
+        [v writeContents:payload toFile:file atOffset:0 replyHandler:^(size_t n,NSError *e){CHECK(!e && n==payload.length);}];
+        auto buffer=[TransportBuffer new];buffer.data=[NSMutableData dataWithLength:payload.length];
+        [v readFromFile:file offset:0 length:payload.length intoBuffer:(FSMutableFileDataBuffer *)buffer
+            replyHandler:^(size_t n,NSError *e){CHECK(!e && n==payload.length && [buffer.data isEqual:payload]);}];
+        [v lookupItemNamed:[FSFileName nameWithString:name] inDirectory:dir replyHandler:^(FSItem *found,FSFileName *,NSError *e){CHECK(!e && found==file);}];
+    }
+    CHECK(files[1]!=files[2]);
+    auto renamed=[FSFileName nameWithString:@"重命名́.txt"];
+    [v renameItem:files[0] inDirectory:dir named:[FSFileName nameWithString:@"源代码🧪.txt"] toNewName:renamed inDirectory:dir overItem:nil
+        replyHandler:^(FSFileName *actual,NSError *e){CHECK(!e && [actual.data isEqual:renamed.data]);}];
+    [v createLinkToItem:files[0] named:[FSFileName nameWithString:@"别名📎"] inDirectory:dir replyHandler:^(FSFileName *,NSError *e){CHECK(!e);}];
+    __block FSItem *link=nil;
+    [v createSymbolicLinkNamed:[FSFileName nameWithString:@"链接🔗"] inDirectory:dir attributes:[FSItemSetAttributesRequest new] linkContents:renamed
+        replyHandler:^(FSItem *item,FSFileName *,NSError *e){CHECK(!e && item);link=item;}];
+    [v readSymbolicLink:link replyHandler:^(FSFileName *target,NSError *e){CHECK(!e && [target.data isEqual:renamed.data]);}];
+    // Reclaim retained regular handles before the independent 256-handle test.
+    for(FSItem *file in files)[v reclaimItem:file replyHandler:^(NSError *e){CHECK(!e);}];
+    [v reclaimItem:link replyHandler:^(NSError *e){CHECK(!e);}];
+    [v reclaimItem:dir replyHandler:^(NSError *e){CHECK(!e);}];
+}
 int main(int argc,char **argv){@autoreleasepool{try{
     CHECK(argc==3 || argc==4);
     const bool paginationMode=std::string(argv[1])=="--pagination-config";
@@ -102,11 +133,10 @@ int main(int argc,char **argv){@autoreleasepool{try{
         std::cout<<"OK"<<std::endl;return 0;
     }
     __block unsigned calls=0;__block FSItem *item=nil;
-    char invalid[]={'a','\n',char(0xff)};
+    char invalid[]={'a','\0','b'};
     [volume createItemNamed:[FSFileName nameWithBytes:invalid length:sizeof(invalid)] type:FSItemTypeFile inDirectory:root attributes:[FSItemSetAttributesRequest new]
         replyHandler:^(FSItem *created,FSFileName *,NSError *e){CHECK(!created && e.code==EINVAL);}];
-    // Preserve the metadata layer's printable-ASCII policy, while proving that
-    // quote/backslash names are byte-exact through raw directory responses.
+    // NUL is rejected locally; quote/backslash and Unicode names remain exact.
     char raw[]={'a','"','\\'};auto name=[FSFileName nameWithBytes:raw length:sizeof(raw)];
     [volume createItemNamed:name type:FSItemTypeFile inDirectory:root attributes:[FSItemSetAttributesRequest new]
         replyHandler:^(FSItem *created,FSFileName *,NSError *error){++calls;CHECK(!error && created);item=created;}];CHECK(calls==1);
@@ -117,6 +147,7 @@ int main(int argc,char **argv){@autoreleasepool{try{
     [volume setXattrNamed:xname toData:data onItem:item policy:FSSetXattrPolicyAlwaysSet replyHandler:^(NSError *e){CHECK(!e);}];
     [volume listXattrsOfItem:item replyHandler:^(NSArray<FSFileName *> *names,NSError *e){CHECK(!e && names.count==1 && [names.firstObject.data isEqual:xname.data]);}];
     [volume getXattrNamed:xname ofItem:item replyHandler:^(NSData *value,NSError *e){CHECK(!e && [value isEqual:data]);}];
+    unicodeCallbacks(volume,root,data);
     // Cursor copies share one pinned server snapshot and can replay old cookies.
     auto transport=std::make_shared<forkfs::MountTransport>(*c);forkfs::VolumeView view(transport);
     __block FSItem *removedDirectory=nil;__block unsigned directoryReplies=0;
