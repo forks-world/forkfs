@@ -265,14 +265,14 @@ class SyncTests(unittest.TestCase):
                     values[b'\0forkfs/parent/' + ident] = b'FFPAR001' + parent + name
                 if index + 1 < len(new_ids):
                     values[b'\0forkfs/entry/' + ident + b'/' + name] = new_ids[index+1]
-            file_key, file_template = next((key, value) for key, value in values.items()
-                                            if key.startswith(b'\0forkfs/inode/')
-                                            and int.from_bytes(value[8:12], 'little') == 1)
+            # Use an inline file explicitly: inode order is randomized, and
+            # an extent-backed content record is a descriptor, not file bytes.
+            old_file_id = values[b'\0forkfs/entry/' + root_id + b'/magic']
+            file_template = values[b'\0forkfs/inode/' + old_file_id]
             while format(candidate, '032x').encode() in used_ids:
                 candidate -= 1
             file_id = format(candidate, '032x').encode()
             file_inode = bytearray(file_template);struct.pack_into('<Q', file_inode, 16, 1)
-            old_file_id = file_key[len(b'\0forkfs/inode/'):]
             values[b'\0forkfs/inode/' + file_id] = bytes(file_inode)
             values[b'\0forkfs/allocated/' + file_id] = b''
             values[b'\0forkfs/content/' + file_id] = values[b'\0forkfs/content/' + old_file_id]
@@ -282,8 +282,11 @@ class SyncTests(unittest.TestCase):
             values[root_inode_key] = bytes(root_inode)
         bad_namespace('long-native-path', add_long_native_path)
         def set_v4_inode(values, accessed=0, created=0, xattrs=(), legacy=False):
-            inode_key, old = next((key, value) for key, value in values.items()
-                                  if key.startswith(b'\0forkfs/inode/') and int.from_bytes(value[8:12], 'little') == 1)
+            # Converting FFINOD05 to v4 would discard extent semantics.
+            # This fixture tests v4 timestamps/xattrs on a known inline file.
+            ident = values[b'\0forkfs/entry/' + values[b'\0forkfs/root'] + b'/magic']
+            inode_key = b'\0forkfs/inode/' + ident
+            old = values[inode_key]
             flags_ids = old[48:64] if old[:8] in (b'FFINOD03', b'FFINOD04') else bytes(16)
             inode = bytearray(b'FFINOD04' + old[8:48] + flags_ids + struct.pack('<QQI', accessed, created, len(xattrs)))
             for name, value in xattrs:
