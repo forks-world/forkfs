@@ -119,6 +119,30 @@ int main(int argc,char **argv){@autoreleasepool{try{
     [volume getXattrNamed:xname ofItem:item replyHandler:^(NSData *value,NSError *e){CHECK(!e && [value isEqual:data]);}];
     // Cursor copies share one pinned server snapshot and can replay old cookies.
     auto transport=std::make_shared<forkfs::MountTransport>(*c);forkfs::VolumeView view(transport);
+    __block FSItem *removedDirectory=nil;__block unsigned directoryReplies=0;
+    [volume createItemNamed:[FSFileName nameWithString:@"removed-enum"] type:FSItemTypeDirectory inDirectory:root attributes:[FSItemSetAttributesRequest new]
+        replyHandler:^(FSItem *created,FSFileName *,NSError *e){++directoryReplies;CHECK(!e && created);removedDirectory=created;}];CHECK(directoryReplies==1 && removedDirectory);
+    const auto rootInode=view.root_inode().id;
+    const auto removedInode=view.lookup_child(rootInode,"removed-enum");
+    directoryReplies=0;
+    [volume removeItem:removedDirectory named:[FSFileName nameWithString:@"removed-enum"] fromDirectory:root
+        replyHandler:^(NSError *e){++directoryReplies;CHECK(!e);}];CHECK(directoryReplies==1);
+    bool missingOpen=false;try{view.open_directory_inode(removedInode.id);}
+    catch(const std::system_error& e){missingOpen=e.code().value()==ENOENT;}CHECK(missingOpen && transport->healthy());
+    CHECK(view.root_inode().directory);
+    __block unsigned enumReplies=0;
+    [volume enumerateDirectory:removedDirectory startingAtCookie:FSDirectoryCookieInitial verifier:FSDirectoryVerifierInitial
+        providingAttributes:[FSItemGetAttributesRequest new] usingPacker:(FSDirectoryEntryPacker *)[PaginationPacker new]
+        replyHandler:^(FSDirectoryVerifier,NSError *e){++enumReplies;CHECK(e.code==ENOENT);}];CHECK(enumReplies==1);
+    calls=0;
+    [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:item replyHandler:^(FSItemAttributes *a,NSError *e){++calls;CHECK(!e && a.size==sizeof(payload));}];CHECK(calls==1);
+    std::vector<forkfs::VolumeView::DirectoryCursor> directoryCursors;directoryCursors.reserve(64);
+    for(unsigned i=0;i<64;++i)directoryCursors.push_back(view.open_directory_inode(rootInode));
+    bool cursorLimit=false;try{view.open_directory_inode(rootInode);}
+    catch(const std::system_error& e){cursorLimit=e.code().value()==EMFILE;}CHECK(cursorLimit && transport->healthy());
+    directoryCursors.erase(directoryCursors.begin());
+    directoryCursors.push_back(view.open_directory_inode(rootInode));
+    directoryCursors.clear();CHECK(transport->healthy());
     const auto quotaRoot=view.root_inode().id;
     // The initial escaped-name file owns one descriptor. Fill the session to
     // its 256-handle limit through real FSKit create callbacks.

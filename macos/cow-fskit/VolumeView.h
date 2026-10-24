@@ -10,7 +10,7 @@ public:
     struct RemoteCursor {
         std::shared_ptr<MountTransport> transport;std::string token;uint64_t position=0;
         uint64_t cachedStart=0;size_t cachedCount=0;std::optional<Namespace::DirectoryPage> cachedPage;
-        ~RemoteCursor(){try{if(transport->healthy())transport->call({"fs-dir-close",token});}catch(...) {}}
+        ~RemoteCursor(){try{if(transport && !token.empty() && transport->healthy())transport->call({"fs-dir-close",token});}catch(...) {}}
     };
     struct DirectoryCursor {Namespace::DirectoryCursor local;std::shared_ptr<RemoteCursor> remote;uint64_t index=0;};
     VolumeView(Container& store,const std::string& name,bool revision):local_(std::make_unique<Namespace>(store,name,revision)){}
