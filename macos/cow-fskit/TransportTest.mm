@@ -86,8 +86,6 @@ int main(int argc,char **argv){@autoreleasepool{try{
     // Cursor copies share one pinned server snapshot and can replay old cookies.
     auto transport=std::make_shared<forkfs::MountTransport>(*c);forkfs::VolumeView view(transport);
     const auto quotaRoot=view.root_inode().id;
-    const auto quotaZero=view.lookup_child(quotaRoot,"quota-0");
-    const auto quotaOne=view.lookup_child(quotaRoot,"quota-1");
     // The initial escaped-name file owns one descriptor. Fill the session to
     // its 256-handle limit through real FSKit create callbacks.
     std::vector<FSItem *> quotaItems;quotaItems.reserve(255);
@@ -98,6 +96,8 @@ int main(int argc,char **argv){@autoreleasepool{try{
             replyHandler:^(FSItem *value,FSFileName *,NSError *e){++replies;CHECK(!e && value);created=value;}];
         CHECK(replies==1 && created);quotaItems.push_back(created);
     }
+    const auto quotaZero=view.lookup_child(quotaRoot,"quota-0");
+    const auto quotaOne=view.lookup_child(quotaRoot,"quota-1");
     __block unsigned quotaReplies=0;
     [volume createItemNamed:[FSFileName nameWithString:@"quota-rejected"] type:FSItemTypeFile inDirectory:root attributes:[FSItemSetAttributesRequest new]
         replyHandler:^(FSItem *created,FSFileName *,NSError *e){++quotaReplies;CHECK(!created && e.code==EMFILE);}];CHECK(quotaReplies==1);
