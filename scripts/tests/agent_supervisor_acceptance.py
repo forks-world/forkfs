@@ -52,7 +52,8 @@ def acceptance(host_user, worker_user):
     checks = []
     with tempfile.TemporaryDirectory(prefix='ForkfsSupervisorTest-', dir='/Library') as name:
         stage = Path(name);stage.chmod(0o755)
-        for filename in ('agent_supervisor.py','dedicated_workload.py','restricted_workload.py','mount_probe.py'):
+        for filename in ('agent_supervisor.py','dedicated_workload.py','restricted_workload.py','mount_probe.py',
+                         'mount_lifecycle.py','mount_session.py'):
             shutil.copyfile(Path(__file__).resolve().parents[1]/'fskit'/filename,stage/filename)
             (stage/filename).chmod(0o644)
         for filename, content in (('driver.py',DRIVER),('worker.py',WORKER)):

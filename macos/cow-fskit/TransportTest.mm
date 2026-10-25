@@ -2,6 +2,7 @@
 #import "RevisionFileSystem.h"
 #import "VolumeView.h"
 #include "rpc.h"
+#include "SessionIdentity.h"
 #include <cerrno>
 #include <fstream>
 #include <iostream>
@@ -87,6 +88,15 @@ static void unicodeCallbacks(ForkRevisionVolume *v,FSItem *root,NSData *payload)
     [v reclaimItem:dir replyHandler:^(NSError *e){CHECK(!e);}];
 }
 int main(int argc,char **argv){@autoreleasepool{try{
+    const std::string identityGeneration="0123456789abcdef0123456789abcdef";
+    const std::string identitySession="fedcba9876543210fedcba9876543210";
+    auto identity=forkfs::session_volume_uuid(identityGeneration,identitySession);
+    const std::array<unsigned char,16> expectedIdentity={0xf5,0x03,0x7f,0x19,0x5e,0xa9,0x83,0x05,0x95,0x58,0x86,0x3f,0x32,0xb2,0xa1,0x9b};
+    CHECK(identity==expectedIdentity);
+    CHECK(identity==forkfs::session_volume_uuid(identityGeneration,identitySession));
+    CHECK(identity!=forkfs::session_volume_uuid("1123456789abcdef0123456789abcdef",identitySession));
+    CHECK(identity!=forkfs::session_volume_uuid(identityGeneration,"eedcba9876543210fedcba9876543210"));
+    CHECK((identity[6]>>4)==8 && (identity[8]&0xc0)==0x80);
     CHECK(argc==3 || argc==4);
     const bool paginationMode=std::string(argv[1])=="--pagination-config";
     ForkRevisionVolume *volume=nil;ForkRevisionFileSystem *loader=nil;FSPathURLResource *resource=nil;
@@ -107,6 +117,8 @@ int main(int argc,char **argv){@autoreleasepool{try{
         config.service_uid=uid;config.read_only=ro;config.lease_ms=3000;c=config;
         NSError *error=nil;volume=[[ForkRevisionVolume alloc] initWithMountCredentials:*c error:&error];CHECK(volume && !error);
     }
+    auto sessionIdentity=forkfs::session_volume_uuid(c->generation,c->session);
+    CHECK([volume.volumeID.uuid isEqual:[[NSUUID alloc] initWithUUIDBytes:sessionIdentity.data()]]);
     auto root=volume.rootItem;CHECK(root);
     if(paginationMode){
         CHECK(c->read_only);

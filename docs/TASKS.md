@@ -6,6 +6,17 @@
 [`MACOS_VALIDATION.md`](MACOS_VALIDATION.md)。本文件按时间保留历史测试数量与测量结果;
 旧的 93/142 等通过数不代表当前测试总数,应以当前 CI/测试输出为准。
 
+## 受控挂载生命周期（2026-10-25）
+
+- [x] 持久挂载登记；World restore 在登记未退休时返回 EBUSY，覆盖撤销、过期和 daemon 重启。
+- [x] 不续租的管理检查、跨代登记查询和精确、幂等的退休协议。
+- [x] root receipt、策略/FSID 绑定、监护进程、UID 清理、fd 卸载、持久隔离和显式恢复实现。
+- [~] 隔离单测、RPC 回归和一次性 root CI；与真实挂载证据分开记录。
+- [ ] 签名 FSKit 上的卸载、脏页、旧 fd/mmap、Git/构建/Unicode 和隔离验收。
+
+设计与命令见 [MOUNT_LIFECYCLE.md](MOUNT_LIFECYCLE.md)。下方早期探索条目保留为历史，
+不能据此把已实现的 LevelDB/CoW 元数据误记为待实现的 SQLite 原型。
+
 ## 稀疏大文件实现（2026-10-19）
 
 - [x] 移除当前 LevelDB/ObjectStore 命名空间的 256 KiB 文件上限，保留单对象上限。

@@ -142,6 +142,8 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-') as tmp:
                 code,value=response(client);assert (code==0)==ok,(fields,code,value)
                 return value
         work_root=json.loads(mounted(['fs-iroot']))['inode_id']
+        mounted(['mount-check',mount],ok=False)
+        mounted(['mount-list'],ok=False)
         mounted(['fs-iroot','--world','main'],ok=False)
         for fields in (['status'],['backup-start','forbidden','/tmp/not-created'],
                        ['fs-restore','base'],['session-open','60000'],['service-hello']):mounted(fields,ok=False)
@@ -158,6 +160,7 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-') as tmp:
         cli('mount-keepalive',mount,'--generation',generation)
         cli('session-close',mount,ok=False)
         cli('mount-revoke',mount,'--generation',generation)
+        cli('mount-retire',generation,mount,'--generation',generation)
         mounted(['fs-iroot'],ok=False);mounted(['fs-hread',mh,'0','100'],ok=False)
         mounted(['fs-dir-entries',mc,'128'],ok=False)
         cli('session-keepalive',mount,ok=False)
@@ -165,13 +168,20 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-') as tmp:
         ro_root=json.loads(mounted(['fs-iroot'],token=ro))['inode_id']
         mounted(['fs-icreate',ro_root,'forbidden','directory','mode=755'],token=ro,ok=False)
         cli('mount-revoke',ro,'--generation',generation)
+        cli('mount-retire',generation,ro,'--generation',generation)
         # A World restore revokes mount authority as well as its retained handles.
         restored=json.loads(cli('mount-open','world','work','60000','--generation',generation))['session']
+        cli('fs-restore','base','--world','work',ok=False)
+        cli('mount-revoke',restored,'--generation',generation)
+        cli('fs-restore','base','--world','work',ok=False)
+        cli('mount-retire',generation,restored,'--generation',generation)
         cli('fs-restore','base','--world','work')
         mounted(['fs-iroot'],token=restored,ok=False)
         expiring=json.loads(cli('mount-open','world','main','100','--generation',generation))['session']
         time.sleep(.2);mounted(['fs-iroot'],token=expiring,ok=False)
         restart_mount=json.loads(cli('mount-open','world','main','60000','--generation',generation))['session']
+        cli('mount-revoke',restart_mount,'--generation',generation)
+        cli('mount-retire',generation,restart_mount,'--generation',generation)
         raw(['fs-write','/src/file',b'branch\0bytes','--world','work'])
         assert cli('fs-cat','/src/file','--world','work')==b'branch\0bytes'
         assert cli('fs-cat','/src/file','--revision','base')==payload

@@ -393,6 +393,10 @@ void Namespace::restore(const std::string& revision) {
     valid_view_name(revision);valid_view_name(view_);need(!revision_,"revision view is read-only");
     std::lock_guard lock(container_.mutex_);auto& j=*container_.journal_;
     need(j.is_leveldb(),"restore requires LevelDB");
+    const std::string registrations("\0forkfs-history/mount/world/",28),revision_registrations("\0forkfs-history/mount/revision/",31);
+    auto mounted=j.keys(registrations),revision_mounts=j.keys(revision_registrations);need(mounted.size()+revision_mounts.size()<=128,"mount registration limit exceeded");
+    auto validate_mounts=[&](const std::vector<std::string>& keys,const std::string& prefix,bool readonly){for(const auto& key:keys){auto suffix=key.substr(prefix.size());auto a=suffix.find('/'),b=a==std::string::npos?a:suffix.find('/',a+1);need(a!=std::string::npos&&b!=std::string::npos&&suffix.find('/',b+1)==std::string::npos,"invalid mount registration key");auto name=suffix.substr(0,a),gen=suffix.substr(a+1,b-a-1),token=suffix.substr(b+1);valid_view_name(name);need(valid_id(gen)&&valid_id(token),"invalid mount registration key");auto value=j.get(key);need(value.size()==10&&!memcmp(value.data(),"FFMOUNT01",9)&&value[9]==static_cast<unsigned char>(readonly),"invalid mount registration; refusing restore");if(!readonly&&name==view_)throw std::system_error(EBUSY,std::generic_category(),"World has durable mount registrations");}};
+    validate_mounts(mounted,registrations,false);validate_mounts(revision_mounts,revision_registrations,true);
     NamespaceView current(j,view_,false);root(current);
     auto manifest=revision_manifest(j,revision);NamespaceView target(j,revision,true);root(target);
     auto generation_key=history+"generation/"+view_;

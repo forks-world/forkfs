@@ -217,6 +217,26 @@ class Reservations(unittest.TestCase):
             self.assertTrue(lease.active.exists())
             lease.release_after_quiescence()
 
+    def test_atomic_active_marker_handles_short_writes(self):
+        original = os.write
+        original_lstat = os.lstat
+        def short_write(fd, data):return original(fd, data[:max(1, min(3, len(data)))])
+        with self.lease() as lease:
+            def root_active(path, *args, **kwargs):
+                value = original_lstat(path, *args, **kwargs)
+                if Path(path) == lease.active:
+                    return SimpleNamespace(**{name: (0 if name == 'st_uid' else getattr(value, name))
+                                              for name in dir(value) if name.startswith('st_')})
+                return value
+            with patch.object(supervisor.os, 'write', side_effect=short_write), \
+                 patch.object(supervisor.os, 'lstat', side_effect=root_active):
+                lease.write_active(dict(status='active', mount_record='/record', session_dir=str(lease.session)))
+                value = json.loads(lease.active.read_text())
+                self.assertEqual(value['status'], 'active')
+                self.assertEqual(value['session_dir'], str(lease.session))
+                self.assertEqual(os.stat(lease.active).st_mode & 0o777, 0o600)
+            lease.release_after_quiescence()
+
     def test_scratch_symlink_cannot_delete_external_target(self):
         target = self.state/'protected';target.write_text('keep')
         with self.lease() as lease:

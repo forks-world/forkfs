@@ -219,6 +219,34 @@ void Container::put(const std::string& key,const std::vector<unsigned char>& val
 std::vector<unsigned char> Container::get(const std::string& key) const {
     std::lock_guard lock(mutex_); return journal_->get(key);
 }
+namespace {
+const std::string mount_root("\0forkfs-history/mount/world/",28);
+const std::string revision_mount_root("\0forkfs-history/mount/revision/",31);
+bool mount_id(const std::string& s){return s.size()==32&&std::all_of(s.begin(),s.end(),[](char c){return (c>='0'&&c<='9')||(c>='a'&&c<='f');});}
+void mount_name(const std::string& s){require(!s.empty()&&s.size()<=64&&std::all_of(s.begin(),s.end(),[](unsigned char c){return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_'||c=='-'||c=='.';})&&s!="."&&s!="..","invalid mount view name");}
+void check_mount_record(const std::vector<unsigned char>& v){require(v.size()==10&&!memcmp(v.data(),"FFMOUNT01",9)&&v[9]<=1,"invalid mount registration; refusing operation");}
+std::vector<MountRegistration> mount_records(const Journal& journal){
+    auto keys=journal.keys(mount_root);auto revisions=journal.keys(revision_mount_root);keys.insert(keys.end(),revisions.begin(),revisions.end());require(keys.size()<=128,"mount registration limit exceeded");std::vector<MountRegistration> out;out.reserve(keys.size());
+    for(const auto& key:keys){bool revision=key.starts_with(revision_mount_root);auto root=revision?revision_mount_root:mount_root;require(key.starts_with(root),"invalid mount registration prefix");auto suffix=key.substr(root.size());auto a=suffix.find('/'),b=a==std::string::npos?a:suffix.find('/',a+1);require(a!=std::string::npos&&b!=std::string::npos&&suffix.find('/',b+1)==std::string::npos,"invalid mount registration key");MountRegistration r{suffix.substr(0,a),suffix.substr(a+1,b-a-1),suffix.substr(b+1),false,revision};mount_name(r.view);require(mount_id(r.generation)&&mount_id(r.token),"invalid mount registration key");auto value=journal.get(key);check_mount_record(value);r.read_only=value[9]!=0;require(r.read_only==revision,"mount registration mode mismatch");out.push_back(std::move(r));}
+    return out;
+}
+}
+void Container::mount_register(const std::string& view,const std::string& generation,const std::string& token,bool read_only,bool revision){
+    mount_name(view);require(mount_id(generation)&&mount_id(token),"invalid mount identity");std::lock_guard lock(mutex_);
+    require(read_only==revision,"mount registration mode mismatch");auto records=mount_records(*journal_);require(records.size()<128,"mount registration limit reached");require(std::none_of(records.begin(),records.end(),[&](const auto& r){return r.token==token;}),"mount token already registered");auto root=revision?revision_mount_root:mount_root;auto prefix=root+view+"/";
+    std::vector<unsigned char> value{'F','F','M','O','U','N','T','0','1',static_cast<unsigned char>(read_only)};
+    journal_->transact(journal_->sequence(),{{prefix+generation+"/"+token,std::move(value)}});
+}
+MountRegistration Container::mount_check(const std::string& token,const std::string& generation) const{
+    require(mount_id(token)&&mount_id(generation),"invalid mount identity");std::lock_guard lock(mutex_);for(auto& r:mount_records(*journal_))if(r.token==token&&r.generation==generation)return r;
+    throw std::runtime_error("mount registration not found");
+}
+std::vector<MountRegistration> Container::mount_list() const{std::lock_guard lock(mutex_);return mount_records(*journal_);}
+void Container::mount_retire(const std::string& token,const std::string& old_generation){
+    require(mount_id(token)&&mount_id(old_generation),"invalid mount identity");std::lock_guard lock(mutex_);auto records=mount_records(*journal_);std::vector<Mutation> changes;
+    for(const auto& r:records)if(r.token==token&&r.generation==old_generation){auto root=r.revision?revision_mount_root:mount_root;auto key=root+r.view+"/"+r.generation+"/"+r.token;changes.push_back({key,std::nullopt});}
+    if(!changes.empty())journal_->transact(journal_->sequence(),changes);
+}
 void Container::transact(uint64_t expected,const std::vector<Mutation>& mutations) {
     for(const auto& m:mutations)
         require(!m.key.starts_with(std::string("\0forkfs/",8)) && !m.key.starts_with(std::string("\0forkfs-history/",16)),"reserved filesystem key");

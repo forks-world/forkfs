@@ -20,15 +20,15 @@ MARKER = '.forkfs-fskit-session'
 LIMIT = 1024 * 1024
 
 
-def request(endpoint, service_uid, fields):
+def request(endpoint, service_uid, fields, timeout=10):
     payload = struct.pack('<I', len(fields))
     for field in fields:
         value = field.encode('utf-8')
         payload += struct.pack('<I', len(value)) + value
     if len(payload) > LIMIT:raise ValueError('RPC request exceeds frame')
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
-        deadline = time.monotonic() + 10
-        peer.settimeout(10)
+        deadline = time.monotonic() + timeout
+        peer.settimeout(timeout)
         peer.connect(str(endpoint))
         uid, gid = ctypes.c_uint(), ctypes.c_uint()
         libc = ctypes.CDLL(None, use_errno=True)
@@ -62,7 +62,28 @@ def token(value):
     return isinstance(value, str) and len(value) == 32 and all(c in '0123456789abcdef' for c in value)
 
 
-def provision(directory, service_uid, frontend_uid, frontend_gid, name, revision=False, lease_ms=300000):
+def trusted_receipt_parent(path):
+    path = Path(path)
+    if not path.is_absolute() or '..' in path.parts or path.resolve() != path:
+        raise ValueError('receipt path must be a canonical absolute path')
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.acl_get_link_np.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    libc.acl_get_link_np.restype = ctypes.c_void_p
+    libc.acl_free.argtypes = [ctypes.c_void_p]
+    for item in [path.parent, *path.parent.parents]:
+        info = os.lstat(item)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o7022:
+            raise ValueError('receipt parent chain must be root-owned and private to root writes')
+        ctypes.set_errno(0)
+        acl = libc.acl_get_link_np(os.fsencode(item), 0x100)
+        if acl:
+            libc.acl_free(acl); raise ValueError('receipt parent has an extended ACL')
+        if ctypes.get_errno() != errno.ENOENT: raise RuntimeError('cannot inspect receipt parent ACL')
+    return path
+
+
+def provision(directory, service_uid, frontend_uid, frontend_gid, name, revision=False, lease_ms=300000,
+              receipt=None):
     if sys.platform != 'darwin' or os.getuid() != 0 or os.geteuid() != 0:
         raise RuntimeError('mount provisioning requires root on macOS')
     if (type(service_uid) is not int or type(frontend_uid) is not int or
@@ -92,6 +113,7 @@ def provision(directory, service_uid, frontend_uid, frontend_gid, name, revision
     endpoint = directory/'rpc.sock'
     descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     created = False
+    receipt_created = False
     session = generation = None
     try:
         # Reserve a name first; concurrent provisioners cannot overwrite a token.
@@ -112,8 +134,20 @@ def provision(directory, service_uid, frontend_uid, frontend_gid, name, revision
             if not token(session) or result.get('generation') != generation:raise ValueError('invalid mount session response')
             value = dict(version=1, socket=str(endpoint), service_uid=service_uid, frontend_uid=frontend_uid,
                          generation=generation, session=session, name=name, read_only=bool(revision), lease_ms=lease_ms)
+            payload = json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
+            if receipt is not None:
+                receipt = trusted_receipt_parent(receipt)
+                receipt_fd = os.open(receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+                receipt_created = True
+                try:
+                    with os.fdopen(receipt_fd, 'wb', closefd=False) as stream:
+                        stream.write(payload); stream.flush(); os.fchmod(receipt_fd, 0o600); os.fsync(receipt_fd)
+                    receipt_dir = os.open(receipt.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                    try: os.fsync(receipt_dir)
+                    finally: os.close(receipt_dir)
+                finally: os.close(receipt_fd)
             with os.fdopen(fd, 'wb', closefd=False) as stream:
-                stream.write(json.dumps(value).encode());stream.flush();os.fsync(fd)
+                stream.write(payload);stream.flush();os.fsync(fd)
             os.fchown(fd, frontend_uid, frontend_gid)
             os.fchmod(fd, 0o400)
             os.fsync(fd);os.fsync(descriptor)
@@ -123,6 +157,9 @@ def provision(directory, service_uid, frontend_uid, frontend_gid, name, revision
             try:request(endpoint, service_uid, ['mount-revoke', session, '--generation', generation])
             except Exception:pass  # server lease expires; do not hide original error
         if created:os.unlink(MARKER, dir_fd=descriptor)
+        if receipt_created:
+            try: os.unlink(receipt)
+            except OSError: pass
         raise
     finally:os.close(descriptor)
     return dict(resource=str(directory), frontend_uid=frontend_uid, lease_ms=lease_ms)
@@ -137,10 +174,11 @@ def main():
     parser.add_argument('--name', required=True)
     parser.add_argument('--revision', action='store_true')
     parser.add_argument('--lease-ms', type=int, default=300000)
+    parser.add_argument('--receipt', type=Path, help='optional root-only durable lifecycle receipt')
     args = parser.parse_args()
     try:
         print(json.dumps(provision(args.resource, args.service_uid, args.frontend_uid,
-            args.frontend_gid, args.name, args.revision, args.lease_ms)))
+            args.frontend_gid, args.name, args.revision, args.lease_ms, args.receipt)))
         return 0
     except (OSError, ValueError, RuntimeError) as error:
         print(json.dumps(dict(status='blocked', error=str(error))))

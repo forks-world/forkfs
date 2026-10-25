@@ -11,6 +11,7 @@
 
 namespace forkfs {
 class RevisionDag;
+struct MountRegistration {std::string view,generation,token;bool read_only=false,revision=false;};
 // Exclusive container owner; named-object journal is an experimental transaction profile.
 class Container {
 public:
@@ -42,6 +43,10 @@ public:
     void transact(uint64_t expected_sequence, const std::vector<Mutation>& mutations);
     std::vector<std::vector<unsigned char>> get_many(const std::vector<std::string>& keys) const;
     std::vector<unsigned char> get(const std::string& key) const;
+    void mount_register(const std::string& view,const std::string& generation,const std::string& token,bool read_only,bool revision=false);
+    MountRegistration mount_check(const std::string& token,const std::string& generation) const;
+    std::vector<MountRegistration> mount_list() const;
+    void mount_retire(const std::string& token,const std::string& old_generation);
 private:
     struct BackupTask {
         std::string archive,state="running",error;
