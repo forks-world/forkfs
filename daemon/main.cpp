@@ -186,6 +186,8 @@ int main(int argc, char** argv) {
                          "RPC inode: fs-ilink SOURCE PARENT NAME, fs-iremove PARENT NAME EXPECTED TYPE\n"
                          "RPC inode: fs-irename SRC_PARENT SRC_NAME DST_PARENT DST_NAME EXPECTED_SRC EXPECTED_DST\n"
                          "RPC: fs-dir-iopen INODE, fs-dir-open PATH, fs-dir-page CURSOR LIMIT, fs-dir-entries CURSOR LIMIT, fs-dir-close CURSOR\n"
+                         "forkfsd gc-step CONTAINER [COPY_BYTES [MAX_OBJECTS]]\n"
+                         "RPC: gc-step [COPY_BYTES [MAX_OBJECTS]], gc-start [COPY_BYTES MAX_OBJECTS MAX_STEPS], gc-status, gc-stop\n"
                          "forkfsd checkpoint CONTAINER\n"
                          "forkfsd object-put CONTAINER KEY INPUT_FILE\n"
                          "forkfsd object-get CONTAINER KEY\n"
@@ -313,6 +315,9 @@ int main(int argc, char** argv) {
             std::cout<<"{\"max_data_bytes\":"<<policy.max_data<<",\"min_free_bytes\":"<<policy.min_free
                      <<",\"data_bytes\":"<<forkfs::RepositoryBudget::data_bytes(argv[2])
                      <<",\"host_free_bytes\":"<<std::filesystem::space(argv[2]).available<<",\"kernel_quota\":false}\n";
+        } else if(command=="gc-step" && argc>=3 && argc<=5){
+            forkfs::LevelStore owner(argv[2]);
+            std::cout<<owner.collect_step(argc>=4?file_number(argv[3]):1024*1024,argc>=5?file_number(argv[4]):128)<<"\n";
         } else if((command=="gc" || command=="gc-plan") && (argc==3 || (argc==5 && std::string(argv[3])=="--checkpoint"))){
             std::cout<<forkfs::LevelStore::collect(argv[2],argc==5?argv[4]:"",command=="gc-plan")<<"\n";
         } else if (command == "init" && argc == 3) {
