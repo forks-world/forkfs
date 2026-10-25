@@ -118,6 +118,9 @@ public:
         auto duration=std::chrono::milliseconds(lease);
         values_.emplace(token,Session{duration,Clock::now()+duration,false,{},{},std::move(mount)});return token;
     }
+    std::string create_mount(uint64_t lease,const std::string& token,OwnedHandle mount){
+        need(lease>=100&&lease<=300000,"session lease must be 100..300000 ms");need(values_.size()<128,"session limit reached");need(!values_.contains(token),"session token collision");auto duration=std::chrono::milliseconds(lease);values_.emplace(token,Session{duration,Clock::now()+duration,false,{},{},std::move(mount)});return token;
+    }
     Session& inspect(const std::string& token){
         auto it=values_.find(token);need(it!=values_.end() && !it->second.closing && Clock::now()<it->second.deadline,"invalid or expired session");return it->second;
     }
@@ -132,6 +135,7 @@ public:
         }
         values_.erase(it);
     }
+    void retire_mount(const std::string& token){auto it=values_.find(token);if(it!=values_.end()&&it->second.mount)close(token);}
     void expire(){
         std::vector<std::string> dead;
         for(const auto& [token,s]:values_)if(s.closing || Clock::now()>=s.deadline)dead.push_back(token);
@@ -174,6 +178,9 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="fs-isetxattr" || op=="fs-hsetxattr")count=5;
     if(op=="fs-iroot" || op=="service-hello")count=1;
     if(op=="mount-open")count=4;
+    if(op=="mount-check")count=2;
+    if(op=="mount-list")count=1;
+    if(op=="mount-retire")count=3;
     if(op=="fs-ilookup" || op=="fs-iopen")count=3;
     if(op=="fs-ilink")count=4;
     if(op=="fs-icreate" || op=="fs-isymlink" || op=="fs-iremove")count=5;
@@ -195,6 +202,9 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     need(args.size()==count,"invalid RPC command arguments");
     for(size_t i=0;i<args.size();++i)if(!(((op=="fs-write" || op=="fs-save" || op=="fs-append" || op=="fs-happend" || op=="fs-hwrite-next") && i==2) || ((op=="fs-write-at" || op=="fs-hwrite") && i==3) || ((op=="fs-isetxattr" || op=="fs-hsetxattr") && i==4)))need(args[i].find('\0')==std::string::npos,"NUL in RPC argument");
     if(!generation.empty())need(generation==sessions.instance(),"service generation mismatch");
+    if(op=="mount-check"){need(manager,"operation requires manager connection");need(!generation.empty()&&session_token.empty(),"mount-check requires service generation");auto& live=sessions.inspect(args[1]);need(live.mount.has_value(),"not a live mount session");auto record=store.mount_check(args[1],generation);need(record.view==live.mount->view&&record.revision==live.mount->revision,"mount registration does not match live session");return "{\"generation\":"+rpc_json_quote(generation)+",\"name\":"+rpc_json_quote(record.view)+",\"read_only\":"+(record.read_only?"true":"false")+"}\n";}
+    if(op=="mount-list"){need(manager,"operation requires manager connection");need(!generation.empty()&&session_token.empty(),"mount-list requires service generation");auto records=store.mount_list();std::string out="{\"generation\":"+rpc_json_quote(generation)+",\"mounts\":[";bool first=true;for(const auto& r:records){if(!first)out+=',';first=false;out+="{\"generation\":"+rpc_json_quote(r.generation)+",\"token\":"+rpc_json_quote(r.token)+",\"view\":"+rpc_json_quote(r.view)+",\"read_only\":"+(r.read_only?"true":"false")+",\"revision\":"+(r.revision?"true":"false")+"}";}return out+"]}\n";}
+    if(op=="mount-retire"){need(manager,"operation requires manager connection");need(!generation.empty()&&session_token.empty(),"mount-retire requires current service generation");if(args[1]==generation)sessions.retire_mount(args[2]);store.mount_retire(args[2],args[1]);return "{\"generation\":"+rpc_json_quote(generation)+"}\n";}
     if(!manager && op!="service-hello" && op!="mount-keepalive" && op!="mount-revoke"){
         need(!session_token.empty() && sessions.inspect(session_token).mount.has_value(),"frontend requires a mount session");
     }
@@ -218,7 +228,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         need(args[1]=="world" || args[1]=="revision","invalid mount view type");
         need(session_token.empty(),"mount-open does not accept a session");
         Namespace selected(store,args[2],args[1]=="revision");selected.root_inode();
-        auto token=sessions.create(number(args[3]),OwnedHandle{args[2],args[1]=="revision"});
+        auto token=random_token();sessions.create_mount(number(args[3]),token,OwnedHandle{args[2],args[1]=="revision"});
+        try{store.mount_register(args[2],sessions.instance(),token,args[1]=="revision",args[1]=="revision");}catch(...){sessions.retire_mount(token);throw;}
         return "{\"session\":"+rpc_json_quote(token)+",\"generation\":"+rpc_json_quote(sessions.instance())+"}\n";
     }
     if(op=="mount-keepalive" || op=="mount-revoke"){
