@@ -207,6 +207,27 @@ def atomic_root_file(path, payload, runtime):
     finally: os.close(temp_fd)
 
 
+def _verify_bootstrap(directory, entry, libc):
+    """Verify the install chain before importing any sibling module."""
+    directory = Path(directory)
+    entry = Path(entry)
+    if entry.parent != directory:
+        raise ValueError('lifecycle bootstrap entry is outside its installation directory')
+    for index, item in enumerate([entry, *entry.parents]):
+        info = os.lstat(item)
+        expected = stat.S_ISREG if index == 0 else stat.S_ISDIR
+        if (not expected(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o7022
+                or (index == 0 and info.st_nlink != 1)):
+            raise ValueError('lifecycle installation is not root-owned and private to root writes')
+        ctypes.set_errno(0)
+        acl = libc.acl_get_link_np(os.fsencode(item), 0x100)
+        if acl:
+            libc.acl_free(acl)
+            raise ValueError('lifecycle installation has an extended ACL')
+        if ctypes.get_errno() != errno.ENOENT:
+            raise RuntimeError('cannot inspect lifecycle installation ACL')
+
+
 class Guard:
     """Held by supervise() from pre-launch verification through retirement."""
     def __init__(self, record_path, policy, runtime, probe=None, rpc=None, sleep=time.sleep):
@@ -398,24 +419,17 @@ def main():
     args = parser.parse_args()
     try:
         if not sys.flags.isolated or not sys.flags.no_site: raise RuntimeError('invoke trusted lifecycle controller with Python -I -S')
+        if platform.system() != 'Darwin' or os.getuid() != 0 or os.geteuid() != 0:
+            raise RuntimeError('mount binding requires root on macOS')
         directory = Path(__file__).absolute().parent
         libc = ctypes.CDLL(None, use_errno=True)
         libc.acl_get_link_np.argtypes = [ctypes.c_char_p, ctypes.c_int]
         libc.acl_get_link_np.restype = ctypes.c_void_p
         libc.acl_free.argtypes = [ctypes.c_void_p]
-        for filename in ('mount_lifecycle.py','agent_supervisor.py','mount_session.py','mount_probe.py',
-                         'dedicated_workload.py','restricted_workload.py'):
-            entry = directory / filename
-            for index, item in enumerate([entry, *entry.parents]):
-                info = os.lstat(item)
-                expected = stat.S_ISDIR if index else stat.S_ISREG
-                if (not expected(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o7022
-                        or (not index and info.st_nlink != 1)):
-                    raise ValueError('lifecycle installation is not root-owned and private to root writes')
-                ctypes.set_errno(0); acl = libc.acl_get_link_np(os.fsencode(item), 0x100)
-                if acl:
-                    libc.acl_free(acl); raise ValueError('lifecycle installation has an extended ACL')
-                if ctypes.get_errno() != errno.ENOENT: raise RuntimeError('cannot inspect lifecycle installation ACL')
+        _verify_bootstrap(directory, Path(__file__).absolute(), libc)
+        supervisor_path = directory / 'agent_supervisor.py'
+        _verify_bootstrap(directory, supervisor_path, libc)
+        sys.path.insert(0, str(directory))
         import agent_supervisor
         runtime = agent_supervisor.installed_launcher()
         agent_supervisor.trusted_interpreter(runtime)

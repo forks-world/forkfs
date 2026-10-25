@@ -1,6 +1,9 @@
 """Lifecycle teardown ordering and failure quarantine contracts."""
 import json
 import contextlib
+import builtins
+import errno
+import io
 import os
 from pathlib import Path
 import stat
@@ -33,6 +36,55 @@ class Probe:
 
 
 class MountLifecycle(unittest.TestCase):
+    def test_bootstrap_rejects_untrusted_install_nodes_before_import(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / 'install'
+            directory.mkdir()
+            entry = directory / 'agent_supervisor.py'
+            entry.write_text('# trusted fixture')
+            real_lstat = os.lstat
+            class LibC:
+                acl_get_link_np = lambda self, path, flags: None
+                acl_free = lambda self, acl: None
+            libc = LibC()
+            def mock_lstat(path):
+                value = real_lstat(path)
+                return SimpleNamespace(st_mode=value.st_mode & ~0o7022, st_uid=0, st_nlink=value.st_nlink)
+            with patch.object(mount_lifecycle.os, 'lstat', side_effect=mock_lstat), \
+                 patch.object(mount_lifecycle.ctypes, 'get_errno', return_value=errno.ENOENT):
+                mount_lifecycle._verify_bootstrap(directory, entry, libc)
+                with patch.object(mount_lifecycle.os, 'lstat', side_effect=lambda path: (
+                        SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=0, st_nlink=1)
+                        if Path(path) == directory else mock_lstat(path))):
+                    with self.assertRaisesRegex(ValueError, 'installation'):
+                        mount_lifecycle._verify_bootstrap(directory, entry, libc)
+                with patch.object(mount_lifecycle.os, 'lstat', side_effect=lambda path: (
+                        SimpleNamespace(st_mode=stat.S_IFREG | 0o666, st_uid=0, st_nlink=1)
+                        if Path(path) == entry else mock_lstat(path))):
+                    with self.assertRaisesRegex(ValueError, 'installation'):
+                        mount_lifecycle._verify_bootstrap(directory, entry, libc)
+                class AclLibC(LibC):
+                    acl_get_link_np = lambda self, path, flags: 1
+                with self.assertRaisesRegex(ValueError, 'extended ACL'):
+                    mount_lifecycle._verify_bootstrap(directory, entry, AclLibC())
+
+    def test_nonroot_cli_blocks_before_sibling_import(self):
+        flags = isolated_test_flags()
+        original_import = builtins.__import__
+        with patch.object(mount_lifecycle.sys, 'flags', flags), \
+             patch.object(mount_lifecycle.sys, 'argv', ['mount_lifecycle.py', 'bind', '--receipt', '/missing',
+                    '--policy', '/missing', '--output', '/missing']), \
+             patch.object(mount_lifecycle.platform, 'system', return_value='Darwin'), \
+             patch.object(mount_lifecycle.os, 'getuid', return_value=501), \
+             patch.object(mount_lifecycle.os, 'geteuid', return_value=501), \
+             patch.object(builtins, '__import__', side_effect=lambda name, *a, **k: (
+                 (_ for _ in ()).throw(AssertionError('sibling import attempted')) if name == 'agent_supervisor'
+                 else original_import(name, *a, **k))):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                status = mount_lifecycle.main()
+        self.assertEqual(status, 2)
+        self.assertIn('requires root on macOS', output.getvalue())
+
     def test_session_volume_uuid_golden_vector(self):
         self.assertEqual(mount_lifecycle.expected_session_uuid(
             '0123456789abcdef0123456789abcdef',

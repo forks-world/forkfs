@@ -83,6 +83,22 @@ def acceptance(host_user, worker_user):
                     mount=str(mount),mount_fsid=[7,9],backing=str(backing),read_only=[])
         policy_file=stage/'policy.json'; policy_file.write_text(json.dumps(policy)); policy_file.chmod(0o644)
         record=stage/'lifecycle.json'; active=state/f'{worker.pw_uid}.active'
+        # Exercise the installed lifecycle CLI under the same isolated Python
+        # flags that exposed the missing sibling import in the review.
+        cli = subprocess.run([PYTHON, '-I', '-S', str(stage/'mount_lifecycle.py'), 'bind',
+                              '--receipt', str(stage/'missing-receipt.json'),
+                              '--policy', str(policy_file), '--output', str(stage/'bound.json')],
+                             cwd='/', env=CLEAN, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
+        if cli.returncode != 2:
+            raise AssertionError(('isolated lifecycle CLI did not block as expected', cli.returncode, cli.stdout, cli.stderr))
+        cli_result = json.loads(cli.stdout)
+        if (cli_result.get('status') != 'blocked' or 'ModuleNotFoundError' in cli.stdout + cli.stderr
+                or 'No such file or directory' not in cli_result.get('error', '')
+                or str(stage/'missing-receipt.json') not in cli_result.get('error', '')):
+            raise AssertionError(('isolated lifecycle CLI did not reach missing-receipt validation',
+                                  cli.stdout, cli.stderr))
+        checks.append('mount-lifecycle-cli-isolated-bootstrap-reaches-receipt-validation')
         def reset():
             if active.exists() or supervisor.uid_processes(worker.pw_uid): raise AssertionError('fixture did not quiesce')
             value=dict(version=1,phase='bound',policy_sha256=hashlib.sha256(
