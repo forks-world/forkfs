@@ -1,6 +1,7 @@
 #import "RevisionVolume.h"
 #include "namespace.h"
 #import "VolumeView.h"
+#include "SessionIdentity.h"
 #include "file_content.h"
 #include <algorithm>
 #include <cstring>
@@ -89,7 +90,9 @@ struct WorldEnumeration {
         auto transport=std::make_shared<forkfs::MountTransport>(credentials);
         auto view=std::make_unique<forkfs::VolumeView>(transport);auto root=view->root_inode();
         NSString *name=[NSString stringWithUTF8String:credentials.name.c_str()];
-        self=[super initWithVolumeID:[[FSVolumeIdentifier alloc] initWithUUID:[NSUUID UUID]] volumeName:[FSFileName nameWithString:name]];
+        auto identity=forkfs::session_volume_uuid(credentials.generation,credentials.session);
+        NSUUID *uuid=[[NSUUID alloc] initWithUUIDBytes:identity.data()];
+        self=[super initWithVolumeID:[[FSVolumeIdentifier alloc] initWithUUID:uuid] volumeName:[FSFileName nameWithString:name]];
         if(self){_view=std::move(view);_items=[NSMutableDictionary new];_numbers=[NSMutableDictionary new];_readOnly=credentials.read_only;_next=3;_nextVerifier=3;[self item:root root:YES];}
         return self;
     }catch(const std::system_error& e){if(error)*error=err(e.code().value());return nil;}

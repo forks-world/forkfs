@@ -29,6 +29,7 @@ policy = json.loads((stage/'policy.json').read_bytes())
 flag, fault = stage/'mounted', stage/'unmount-fails'
 mount_probe.descriptor_mount_info = lambda fd: dict(fstype='forkrevision', fskit=True,
     fsid=policy['mount_fsid'], mountpoint=policy['mount'], read_only=False)
+mount_probe.descriptor_volume_uuid = lambda fd: mount_lifecycle.expected_session_uuid('a'*32,'b'*32)
 mount_probe.mounted_fsids = lambda: {tuple(policy['mount_fsid'])} if flag.exists() else set()
 def unmount(fd):
     if fault.exists(): raise OSError(errno.EBUSY, 'fixture busy mount')
@@ -59,6 +60,7 @@ def acceptance(host_user, worker_user):
         raise RuntimeError('requires root on a disposable macOS runner')
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'fskit'))
     import agent_supervisor as supervisor
+    import mount_lifecycle
     host, worker = pwd.getpwnam(host_user), pwd.getpwnam(worker_user)
     service, frontend = pwd.getpwnam('daemon'), pwd.getpwnam('_spotlight')
     if len({0, host.pw_uid, worker.pw_uid, service.pw_uid, frontend.pw_uid}) != 5:
@@ -85,7 +87,7 @@ def acceptance(host_user, worker_user):
             if active.exists() or supervisor.uid_processes(worker.pw_uid): raise AssertionError('fixture did not quiesce')
             value=dict(version=1,phase='bound',policy_sha256=hashlib.sha256(
                 json.dumps(policy,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
-                mount=str(mount),fsid=[7,9],service_uid=service.pw_uid,socket=str(stage/'rpc.sock'),
+                mount=str(mount),fsid=[7,9],volume_uuid=mount_lifecycle.expected_session_uuid('a'*32,'b'*32),service_uid=service.pw_uid,socket=str(stage/'rpc.sock'),
                 generation='a'*32,session='b'*32,name='main',read_only=False)
             record.write_text(json.dumps(value)); record.chmod(0o600)
             (stage/'mounted').touch()

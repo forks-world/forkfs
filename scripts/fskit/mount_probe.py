@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import platform
 import subprocess
+import struct
+import uuid
 
 class DarwinStatFS(ctypes.Structure):
     _fields_=[('bsize',ctypes.c_uint32),('iosize',ctypes.c_int32),
@@ -34,6 +36,26 @@ def descriptor_mount_info(fd):
     return dict(fstype=result.fstype.decode(),mountpoint=os.fsdecode(result.mountpoint),
                 fsid=list(result.fsid),fskit=bool(result.flags_ext & 2),read_only=bool(result.flags & 1),
                 available_bytes=result.bavail*result.bsize)
+
+def descriptor_volume_uuid(fd):
+    """Read the kernel's FSKit volume UUID from a pinned directory FD."""
+    if platform.system()!='Darwin': raise RuntimeError('volume UUID attestation requires macOS')
+    class AttrList(ctypes.Structure):
+        _fields_=[('bitmapcount',ctypes.c_uint16),('reserved',ctypes.c_uint16),
+                  ('commonattr',ctypes.c_uint32),('volattr',ctypes.c_uint32),
+                  ('dirattr',ctypes.c_uint32),('fileattr',ctypes.c_uint32),('forkattr',ctypes.c_uint32)]
+    attrs=AttrList(5,0,0,0x80040000,0,0,0) # ATTR_VOL_INFO | ATTR_VOL_UUID
+    output=(ctypes.c_ubyte*20)()
+    libc=ctypes.CDLL(None,use_errno=True);call=libc.fgetattrlist
+    call.argtypes=[ctypes.c_int,ctypes.POINTER(AttrList),ctypes.c_void_p,ctypes.c_size_t,ctypes.c_ulong]
+    call.restype=ctypes.c_int
+    if call(fd,ctypes.byref(attrs),ctypes.byref(output),ctypes.sizeof(output),0)!=0:
+        raise OSError(ctypes.get_errno(),'fgetattrlist volume UUID')
+    length,=struct.unpack_from('=I',bytes(output),0)
+    raw=bytes(output[4:20])
+    if length!=20 or raw==b'\0'*16:
+        raise RuntimeError('kernel did not return a supported FSKit volume UUID')
+    return str(uuid.UUID(bytes=raw))
 
 def mounted_fsids():
     """Return a bounded snapshot of mounted filesystems for post-unmount proof."""

@@ -68,9 +68,11 @@ python3 -I -S /trusted/mount_lifecycle.py bind \
 ```
 
 The administrator selects the policy-to-resource association. Binding verifies
-the actual mount type, FSKit flag, filesystem ID and read-only state, and checks
-the service session. It does not infer this association from a frontend-writable
-marker. The root-owned record stores the policy hash, filesystem ID, original
+the actual mount type, FSKit flag, filesystem ID, session-specific volume UUID
+and read-only state, and checks
+the service session. The kernel volume UUID must match the UUID derived from the root receipt’s
+generation and token; unsupported or mismatched UUID attributes block admission.
+The root-owned record stores the policy hash, filesystem ID, volume UUID, original
 daemon generation and session token.
 
 Run the agent through the existing supervisor with
@@ -79,7 +81,8 @@ not renew the FSKit session. The teardown order is:
 
 1. Persist stopping state and terminate/reap all real/effective-worker-UID
    processes, including detached descendants.
-2. Unmount the filesystem through the pinned root directory fd, keeping the
+2. Verify its session-specific volume UUID and unmount through the pinned root
+   directory fd, keeping the
    backend session available for normal kernel writeback.
 3. Verify that the original filesystem ID disappeared from the kernel mount list.
 4. Retire the original registration against the current daemon generation.
@@ -116,7 +119,8 @@ Daemon RPC tests establish persistence, nonrenewing inspection, restore rejectio
 and exact retirement across restart. Controller unit tests inject kernel and RPC
 failures to check ordering and quarantine. They are not real-mounted acceptance.
 
-Signed FSKit installation, actual unmount behavior with dirty pages and old
+Signed FSKit installation, kernel exposure of the FSKit volume identifier through
+`ATTR_VOL_UUID`, actual unmount behavior with dirty pages and old
 fd/mmap users, App Sandbox delivery, and end-to-end agent isolation must also run
 on a real mounted World. A native directory or mocked mount attestation cannot
 substitute for those results. A missing signing identity is a deployment blocker,

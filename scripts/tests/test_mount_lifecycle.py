@@ -33,6 +33,14 @@ class Probe:
 
 
 class MountLifecycle(unittest.TestCase):
+    def test_session_volume_uuid_golden_vector(self):
+        self.assertEqual(mount_lifecycle.expected_session_uuid(
+            '0123456789abcdef0123456789abcdef',
+            'fedcba9876543210fedcba9876543210'),
+            'f5037f19-5ea9-8305-9558-863f32b2a19b')
+        self.assertNotEqual(mount_lifecycle.expected_session_uuid('a'*32, 'b'*32),
+                            mount_lifecycle.expected_session_uuid('a'*31+'c', 'b'*32))
+
     def bind_context(self, directory):
         root = Path(directory)
         receipt = dict(version=1, socket='/run/service/rpc.sock', service_uid=70, frontend_uid=71,
@@ -40,9 +48,14 @@ class MountLifecycle(unittest.TestCase):
         policy = dict(version=1, host_uid=50, service_uid=70, frontend_uid=71, worker_uid=72,
                       worker_gid=73, mount=str(root/'mount'), mount_fsid=[12, 34],
                       backing=str(root/'backing'), read_only=[])
+        (root/'mount').mkdir()
         runtime = SimpleNamespace(admit_entry_environment=lambda: None, read_policy=lambda path: policy,
                                   trusted_path=lambda *a, **k: None, no_acl=lambda *a: None)
-        probe = SimpleNamespace(require_mount=lambda path, expected_read_only: dict(fsid=[12, 34]))
+        probe = SimpleNamespace(require_mount=lambda path, expected_read_only: dict(fsid=[12, 34]),
+                                descriptor_mount_info=lambda fd: dict(fstype='forkrevision', fskit=True,
+                                    fsid=[12, 34], read_only=False, mountpoint=str(root/'mount')),
+                                descriptor_volume_uuid=lambda fd: mount_lifecycle.expected_session_uuid(
+                                    'a'*32, 'b'*32))
         original_lstat = os.lstat
         def service_lstat(path, *args, **kwargs):
             if str(path) == '/run/service':
@@ -58,14 +71,15 @@ class MountLifecycle(unittest.TestCase):
         stack.enter_context(patch.object(mount_lifecycle.os, 'lstat', side_effect=service_lstat))
         stack.enter_context(patch.object(mount_session, 'request', return_value=dict(
             generation='a'*32, name='main', read_only=False)))
-        return stack, runtime, policy
+        return stack, runtime, policy, probe
 
     def guard(self, events, probe, rpc):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         path = Path(directory.name) / 'record.json'
         record = dict(version=1, phase='stopping', policy_sha256='0'*64, mount='/mnt/world',
-                      fsid=[12, 34], service_uid=70, socket='/run/service/rpc.sock',
+                      fsid=[12, 34], volume_uuid=mount_lifecycle.expected_session_uuid('a'*32,'b'*32),
+                      service_uid=70, socket='/run/service/rpc.sock',
                       generation='a'*32, session='b'*32, name='worker', read_only=False)
         guard = mount_lifecycle.Guard(path, {}, type('Runtime', (), {'no_acl': lambda *args: None})(),
                                       probe=probe, rpc=rpc, sleep=lambda _: None)
@@ -155,6 +169,7 @@ class MountLifecycle(unittest.TestCase):
             policy = dict(mount=str(mountpoint), mount_fsid=[12, 34], service_uid=70)
             record = dict(version=1, phase='bound', policy_sha256=mount_lifecycle.hashlib.sha256(
                 mount_lifecycle.canonical(policy)).hexdigest(), mount=str(mountpoint), fsid=[12, 34],
+                volume_uuid=mount_lifecycle.expected_session_uuid('a'*32,'b'*32),
                 service_uid=70, socket='/run/service/rpc.sock', generation='a'*32, session='b'*32,
                 name='worker', read_only=False)
             record_path.write_bytes(mount_lifecycle.canonical(record)); record_path.chmod(0o600)
@@ -165,6 +180,8 @@ class MountLifecycle(unittest.TestCase):
                     events.append('attest')
                     return dict(fstype='forkrevision', fskit=True, fsid=[12, 34], read_only=False,
                                 mountpoint=str(mountpoint))
+                def descriptor_volume_uuid(self, fd):
+                    return record['volume_uuid']
             probe = TestProbe(events, [(12, 34)])
             runtime = SimpleNamespace(trusted_path=lambda *a, **k: None, no_acl=lambda *a: None)
             original_fstat = os.fstat
@@ -227,9 +244,43 @@ class MountLifecycle(unittest.TestCase):
                 guard.recover()
         self.assertEqual(events, [])
 
+    def test_recovery_rejects_same_fsid_replacement_uuid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); mountpoint = root/'mount'; mountpoint.mkdir()
+            path = root/'record.json'
+            policy = dict(mount=str(mountpoint), mount_fsid=[12, 34], service_uid=70)
+            record = dict(version=1, phase='active', policy_sha256=mount_lifecycle.hashlib.sha256(
+                mount_lifecycle.canonical(policy)).hexdigest(), mount=str(mountpoint), fsid=[12, 34],
+                volume_uuid=mount_lifecycle.expected_session_uuid('a'*32,'b'*32), service_uid=70,
+                socket='/run/service/rpc.sock', generation='a'*32, session='b'*32, name='worker', read_only=False)
+            path.write_bytes(mount_lifecycle.canonical(record)); path.chmod(0o600)
+            events = []
+            class ReplacementProbe:
+                def mounted_fsids(self): events.append('fsids'); return {(12, 34)}
+                def descriptor_mount_info(self, fd):
+                    return dict(fstype='forkrevision', fskit=True, fsid=[12, 34], read_only=False,
+                                mountpoint=str(mountpoint))
+                def descriptor_volume_uuid(self, fd): return mount_lifecycle.expected_session_uuid('c'*32,'d'*32)
+                def funmount_fd(self, fd): events.append('unsafe-funmount')
+            runtime = SimpleNamespace(trusted_path=lambda *a, **k: None, no_acl=lambda *a: None)
+            guard = mount_lifecycle.Guard(path, policy, runtime, probe=ReplacementProbe())
+            self.addCleanup(guard.close)
+            original_fstat = os.fstat
+            def root_fstat(fd):
+                value = original_fstat(fd)
+                return SimpleNamespace(**{name: (0 if name == 'st_uid' else getattr(value, name))
+                                          for name in dir(value) if name.startswith('st_')})
+            with patch.object(mount_lifecycle.os, 'fstat', side_effect=root_fstat), \
+                 patch.object(mount_lifecycle, 'load_record', return_value=record):
+                with self.assertRaisesRegex(RuntimeError, 'pinned FSKit mount'):
+                    guard.recover()
+            self.assertEqual(events, ['fsids'])
+            self.assertNotIn('unsafe-funmount', events)
+
     def test_record_schema_rejects_bool_version_and_nonboolean_read_only(self):
         runtime = SimpleNamespace(trusted_path=lambda *a, **k: None, no_acl=lambda *a: None)
         base = dict(version=1, phase='bound', policy_sha256='0'*64, mount='/mnt/world', fsid=[12, 34],
+                    volume_uuid=mount_lifecycle.expected_session_uuid('a'*32,'b'*32),
                     service_uid=70, socket='/run/service/rpc.sock', generation='a'*32, session='b'*32,
                     name='worker', read_only=False)
         with patch.object(mount_lifecycle, 'read_root_file', return_value=b'{}'):
@@ -241,23 +292,21 @@ class MountLifecycle(unittest.TestCase):
     def test_bind_short_writes_publish_complete_record(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)/'record.json'
-            stack, runtime, _ = self.bind_context(directory)
+            stack, runtime, _, probe = self.bind_context(directory)
             original_write = os.write
             def short_write(fd, data): return original_write(fd, data[:max(1, min(7, len(data)))])
             with stack, patch.object(mount_lifecycle.os, 'write', side_effect=short_write):
-                result = mount_lifecycle.bind('/receipt', '/policy', output, runtime,
-                                              probe=SimpleNamespace(require_mount=lambda *a, **k: dict(fsid=[12, 34])))
+                result = mount_lifecycle.bind('/receipt', '/policy', output, runtime, probe=probe)
             self.assertEqual(json.loads(output.read_bytes()), result)
             self.assertEqual(output.stat().st_mode & 0o777, 0o600)
 
     def test_bind_does_not_replace_foreign_existing_output(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)/'record.json'; output.write_bytes(b'keep existing')
-            stack, runtime, _ = self.bind_context(directory)
+            stack, runtime, _, probe = self.bind_context(directory)
             with stack:
                 with self.assertRaises(FileExistsError):
-                    mount_lifecycle.bind('/receipt', '/policy', output, runtime,
-                                         probe=SimpleNamespace(require_mount=lambda *a, **k: dict(fsid=[12, 34])))
+                    mount_lifecycle.bind('/receipt', '/policy', output, runtime, probe=probe)
             self.assertEqual(output.read_bytes(), b'keep existing')
 
     def test_recovery_finishes_partial_scratch_cleanup_after_retirement(self):

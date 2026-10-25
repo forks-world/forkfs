@@ -16,8 +16,10 @@ from pathlib import Path
 import platform
 import stat
 import sys
+import struct
 import tempfile
 import time
+import uuid
 
 
 def canonical(value):
@@ -38,6 +40,17 @@ def unique_object(pairs):
         if key in result: raise ValueError('duplicate lifecycle record key')
         result[key] = value
     return result
+
+
+def expected_session_uuid(generation, session):
+    from mount_session import token
+    if not token(generation) or not token(session): raise ValueError('invalid mount session identity')
+    identity = b'forkfs.fskit.volume.v1' + generation.encode('ascii') + session.encode('ascii')
+    digest = bytearray(hashlib.sha256(b'forkfs.object.v0' +
+        struct.pack('<HHQ', 4, 0, len(identity)) + identity).digest()[:16])
+    digest[6] = (digest[6] & 0x0f) | 0x80
+    digest[8] = (digest[8] & 0x3f) | 0x80
+    return str(uuid.UUID(bytes=bytes(digest)))
 
 
 def read_root_file(path, mode=0o600, maximum=65536):
@@ -65,7 +78,7 @@ def load_record(path, runtime):
     runtime.no_acl(Path(path))
     data = read_root_file(path)
     value = json.loads(data, object_pairs_hook=unique_object)
-    required = {'version', 'phase', 'policy_sha256', 'mount', 'fsid', 'service_uid', 'socket',
+    required = {'version', 'phase', 'policy_sha256', 'mount', 'fsid', 'volume_uuid', 'service_uid', 'socket',
                 'generation', 'session', 'name', 'read_only'}
     if (not isinstance(value, dict) or set(value) != required or type(value.get('version')) is not int
             or value.get('version') != 1):
@@ -85,6 +98,8 @@ def load_record(path, runtime):
             or not isinstance(value['name'], str) or not value['name'] or len(value['name']) > 64
             or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-' for c in value['name'])):
         raise ValueError('invalid mount lifecycle record fields')
+    if value['volume_uuid'] != expected_session_uuid(value['generation'], value['session']):
+        raise ValueError('mount lifecycle UUID does not match its daemon generation and session')
     return value
 
 
@@ -131,13 +146,26 @@ def bind(receipt_path, policy_path, output, runtime, probe=None):
     if probe is None:
         import mount_probe
         probe = mount_probe
-    info = probe.require_mount(policy['mount'], expected_read_only=receipt['read_only'])
+    expected_uuid = expected_session_uuid(receipt['generation'], receipt['session'])
+    root_fd = os.open(policy['mount'], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = probe.descriptor_mount_info(root_fd)
+        actual_uuid = probe.descriptor_volume_uuid(root_fd)
+        mount_path = Path(policy['mount']).resolve(strict=True)
+        if (info['fstype'] != 'forkrevision' or not info['fskit']
+                or info['read_only'] != receipt['read_only']
+                or Path(info['mountpoint']).resolve() != mount_path):
+            raise RuntimeError('not an attested forkfs FSKit mount root')
+        if actual_uuid != expected_uuid:
+            raise ValueError('FSKit volume UUID does not match daemon generation and session')
+    finally: os.close(root_fd)
     if info['fsid'] != policy['mount_fsid']:
         raise ValueError('mounted filesystem ID differs from worker policy')
     # The receipt is intentionally a root-only bearer credential. It records
     # the daemon session, not a frontend-controlled marker or claim.
     record = dict(version=1, phase='bound', policy_sha256=hashlib.sha256(canonical(policy)).hexdigest(),
-                  mount=policy['mount'], fsid=info['fsid'], service_uid=receipt['service_uid'], socket=receipt['socket'],
+                  mount=policy['mount'], fsid=info['fsid'], volume_uuid=actual_uuid,
+                  service_uid=receipt['service_uid'], socket=receipt['socket'],
                   generation=receipt['generation'], session=receipt['session'], name=receipt['name'],
                   read_only=receipt['read_only'])
     output = Path(output)
@@ -247,20 +275,22 @@ class Guard:
         if (current.st_dev, current.st_ino) != (named.st_dev, named.st_ino):
             raise ValueError('mount lifecycle record changed during admission')
         if (not isinstance(self.record, dict) or set(self.record) !=
-                {'version','phase','policy_sha256','mount','fsid','service_uid','socket','generation','session','name','read_only'}
+                {'version','phase','policy_sha256','mount','fsid','volume_uuid','service_uid','socket','generation','session','name','read_only'}
                 or self.record.get('version') != 1): raise ValueError('unsupported mount lifecycle record')
         runtime.no_acl(self.path)
         if self.record.get('phase') != 'bound': raise ValueError('mount lifecycle record is not bound')
         if hashlib.sha256(canonical(self.policy)).hexdigest() != self.record['policy_sha256']:
             raise ValueError('mount lifecycle policy fingerprint changed')
         if (self.record['mount'] != self.policy['mount'] or self.record['fsid'] != self.policy['mount_fsid']
-                or self.record['service_uid'] != self.policy['service_uid']):
+                or self.record['service_uid'] != self.policy['service_uid']
+                or self.record['volume_uuid'] != expected_session_uuid(self.record['generation'], self.record['session'])):
             raise ValueError('mount lifecycle record does not match worker policy')
         self._modules()
         self.fd = os.open(self.record['mount'], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         info = self.probe.descriptor_mount_info(self.fd)
         if (info['fstype'] != 'forkrevision' or not info['fskit'] or info['fsid'] != self.record['fsid']
                 or info['read_only'] != self.record['read_only']
+                or self.probe.descriptor_volume_uuid(self.fd) != self.record['volume_uuid']
                 or Path(info['mountpoint']).resolve() != Path(self.record['mount']).resolve()):
             raise RuntimeError('pinned directory is not the recorded FSKit mount')
         self._rpc_status()
@@ -293,12 +323,13 @@ class Guard:
         if (current.st_dev, current.st_ino) != (named.st_dev, named.st_ino):
             raise ValueError('mount lifecycle record changed during recovery')
         if (not isinstance(self.record, dict) or set(self.record) !=
-                {'version','phase','policy_sha256','mount','fsid','service_uid','socket','generation','session','name','read_only'}
+                {'version','phase','policy_sha256','mount','fsid','volume_uuid','service_uid','socket','generation','session','name','read_only'}
                 or self.record.get('version') != 1 or self.record.get('phase') not in ('bound','active','stopping','retired')):
             raise ValueError('record is not recoverable')
         if (hashlib.sha256(canonical(self.policy)).hexdigest() != self.record['policy_sha256']
                 or self.record['mount'] != self.policy['mount'] or self.record['fsid'] != self.policy['mount_fsid']
-                or self.record['service_uid'] != self.policy['service_uid']):
+                or self.record['service_uid'] != self.policy['service_uid']
+                or self.record['volume_uuid'] != expected_session_uuid(self.record['generation'], self.record['session'])):
             raise ValueError('recovery policy does not match lifecycle record')
         self._modules()
         old_fsid = tuple(self.record['fsid'])
@@ -311,6 +342,7 @@ class Guard:
             mount = self.probe.descriptor_mount_info(self.fd)
             if (mount['fstype'] != 'forkrevision' or not mount['fskit'] or mount['fsid'] != self.record['fsid']
                     or mount['read_only'] != self.record['read_only']
+                    or self.probe.descriptor_volume_uuid(self.fd) != self.record['volume_uuid']
                     or Path(mount['mountpoint']).resolve() != Path(self.record['mount']).resolve()):
                 raise RuntimeError('recorded mount path no longer names the pinned FSKit mount')
         self.record['phase'] = 'stopping'; self._persist()
