@@ -41,6 +41,10 @@ public:
     // Offline, exclusive repository generation rewrite. A checkpoint explicitly
     // starts a new replay lineage; default GC retains all replay dependencies.
     static std::string collect(const std::string& path,const std::string& checkpoint="",bool dry_run=false);
+    std::shared_ptr<void> pin_objects() const;
+    std::shared_ptr<void> pin_manifest(const std::array<unsigned char,32>& id) const;
+    std::string collect_step(size_t max_copy_bytes=1024*1024,size_t max_objects=128);
+    void barrier() const;
     struct CacheStats {uint64_t hits,misses;size_t charge;};
     CacheStats cache_stats() const;
     std::string metrics_json(bool detailed=false) const;
@@ -76,6 +80,16 @@ private:
     mutable std::map<std::string,RootFact> root_cache_;
     std::atomic<uint64_t> sequence_=0,objects_=0,roots_=0;
     std::atomic<bool> poisoned_=false;
+    struct PinState {
+        mutable std::mutex mutex; size_t logical=0,locations=0;
+        std::map<std::array<unsigned char,32>,size_t> manifests;
+        uint64_t manifest_epoch=0;
+    };
+    struct LocationRelease { void operator()(PinState* state) const noexcept; };
+    using LocationPin=std::unique_ptr<PinState,LocationRelease>;
+    std::shared_ptr<PinState> pin_state_=std::make_shared<PinState>();
+    LocationPin pin_locations() const;
+    mutable std::mutex gc_mutex_;
     std::string repository_;
     bool replay_enabled_=false;
     uint64_t replay_start_=0;

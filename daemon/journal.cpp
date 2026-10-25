@@ -141,6 +141,13 @@ size_t Journal::count() const {return leveldb_?leveldb_->roots():roots_.size();}
 void Journal::poison() {if(leveldb_)leveldb_->poison();poisoned_=true;}
 std::string Journal::metrics_json(bool detailed) const {return leveldb_?leveldb_->metrics_json(detailed):"null";}
 void Journal::compact() {need(!read_only_,"revision preview is read-only");need(bool(leveldb_),"direct compaction requires LevelDB");leveldb_->compact();}
+std::shared_ptr<void> Journal::pin_objects() const {return leveldb_?leveldb_->pin_objects():nullptr;}
+std::shared_ptr<void> Journal::pin_manifest(const std::array<unsigned char,32>& manifest) const {return leveldb_?leveldb_->pin_manifest(manifest):nullptr;}
+std::string Journal::collect_step(size_t max_copy_bytes,size_t max_objects) {
+    need(!read_only_,"revision preview is read-only");need(bool(leveldb_),"online GC requires LevelDB");
+    return leveldb_->collect_step(max_copy_bytes,max_objects);
+}
+void Journal::barrier() const {if(leveldb_)leveldb_->barrier();else need(!poisoned_,"journal requires reopen after write failure");}
 Journal::Journal(int fd,const std::array<unsigned char,16>& repo,const Checkpoint& checkpoint):fd_(fd),repository_(repo) {
     struct stat st{}; if(fstat(fd_,&st)<0) io("stat journal");
     const uint64_t size=st.st_size;
@@ -501,6 +508,7 @@ void Journal::verify() const {
     for(const auto& [id,loc]:objects_) { (void)loc; read_object(id); }
 }
 std::vector<unsigned char> Journal::get(const std::string& key) const {
+    auto pin=pin_objects();
     if(leveldb_)return leveldb_->object(leveldb_->root(key));
     need(!poisoned_,"journal requires reopen after write failure");
     auto it=roots_.find(key); need(it!=roots_.end(),"object root not found");

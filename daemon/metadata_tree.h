@@ -11,7 +11,7 @@ public:
     using Map=std::map<std::string,Id>;
     using Changes=std::map<std::string,std::optional<Id>>;
     using Reader=std::function<Bytes(const Id&)>;
-    MetadataTree(const Journal& store,Id root={}):read_([&store](const Id& id){return store.get_object(id);}),root_(root),shared_heights_(&store.tree_heights_) {}
+    MetadataTree(const Journal& store,Id root={}):read_([&store](const Id& id){return store.get_object(id);}),root_(root),shared_heights_(&store.tree_heights_),object_pin_(store.pin_objects()) {}
     // A shared cache requires readers from the same immutable object domain.
     MetadataTree(Reader read,Id root,TreeHeightCache* heights=nullptr):read_(std::move(read)),root_(root),shared_heights_(heights) {}
     std::optional<Id> lookup(const std::string& key) const;
@@ -31,6 +31,7 @@ private:
     Reader read_;
     Id root_;
     TreeHeightCache* shared_heights_=nullptr;
+    std::shared_ptr<void> object_pin_;
     mutable std::map<Id,Node> cache_;
     mutable std::map<Id,unsigned> heights_;
     std::map<Id,Bytes> pending_;

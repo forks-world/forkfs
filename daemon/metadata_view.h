@@ -35,6 +35,7 @@ public:
                                 const std::function<void(const std::string&,const ObjectId&)>& visit={});
 private:
     const Journal& journal_;
+    std::shared_ptr<void> object_pin_;
     std::unique_ptr<MetadataTree> tree_;
     ObjectId tree_root_{};
     bool legacy_=false;

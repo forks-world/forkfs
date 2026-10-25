@@ -17,6 +17,7 @@ public:
     size_t output_runs() const {return plan_.run_count;}
 private:
     Container& container_;
+    std::shared_ptr<void> object_pin_;
     std::string world_;
     std::optional<NamespaceView::ObjectId> head_;
     std::optional<NamespaceView::ObjectId> generation_;

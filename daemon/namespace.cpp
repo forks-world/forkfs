@@ -686,6 +686,7 @@ Namespace::DirectoryCursor Namespace::directory_cursor(const NamespaceView& view
     if(!revision_)cursor.generation_=world_generation(j,view_);
     if(view.legacy()){need(view.keys(cursor.prefix_).empty(),"flat namespace directory is not empty");cursor.done_=true;}
     else cursor.manifest_=revision_?revision_manifest(j,view_):j.root_object(history+"world/"+view_);
+    if(cursor.manifest_!=ObjectId{})cursor.object_pin_=j.pin_manifest(cursor.manifest_);
     return cursor;
 }
 Namespace::DirectoryPage Namespace::read_directory(DirectoryCursor& cursor,size_t limit,bool attributes) const {
