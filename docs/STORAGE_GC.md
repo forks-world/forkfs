@@ -1,6 +1,8 @@
 # ObjectStore physical garbage collection
 
-The segmented ObjectStore supports **offline collection**. Stop the owning daemon
+The segmented ObjectStore supports online incremental collection inside
+`forkfsd`; see [Online GC](ONLINE_GC.md) for commands, pins and retirement.
+This document describes **offline collection**. Stop the owning daemon
 before running it as the repository owner:
 
 ```
@@ -105,8 +107,8 @@ results for this change have not yet been obtained.
 
 ## Remaining work
 
-Online incremental GC needs a common publication fence and durable pin lifecycle
-for all readers, open handles, compaction candidates and backup/export snapshots.
-The offline ownership lease cannot be relaxed in isolation. Whole-machine power
+Online collection now has publication fences and separate logical/location pins;
+see [its remaining performance limits](ONLINE_GC.md#validation-and-limits).
+The offline ownership lease is retained for generation exchange. Whole-machine power
 loss and every filesystem/device's persistence behavior remain separate validation
 from process-crash injection. Remote physical GC is a separate protocol.

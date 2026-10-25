@@ -15,8 +15,10 @@
 - [x] gc-plan 预估精确 packed DATA 大小、可回收字节与临时 DATA 副本大小。
 - [x] 独立 seeded namespace 模型回归，覆盖编辑、fork/revision、重复 GC、未提交尾部与
   source-free checkpoint/delta 恢复；注册到 metadata-regression CI。
-- [ ] 在线分段、增量回收：需要为读者、句柄、后台 compaction 与备份快照建立统一 pin/fence，
-  不能直接让离线 generation exchange 与活跃 daemon 并发。
+- [x] 在线分段回收：通用 pin、目录 manifest lease/epoch、位置读者保护、发布 fence、
+  分批对象清理、chunk 搬迁与延迟删除；后台启动/查询/停止、配额/故障/并发回归通过。
+  本地 metadata-only Release 全部 103 项 CTest 通过；见 [ONLINE_GC.md](ONLINE_GC.md)。
+- [ ] 在线 GC 的增量标记与元数据扫描内存预算；当前完整标记在前台锁外执行。
 
 协议、空间估算和边界见 [STORAGE_GC.md](STORAGE_GC.md)。
 

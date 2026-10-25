@@ -48,7 +48,7 @@ forkfs object hashes, not hashes of machine-local offsets.
 
 | Location | Encoding |
 | --- | --- |
-| `M/format` | `FFLDB005` without retained replay, `FFLDB006` with replay |
+| `M/format` | `FFLDB005` without retained replay, `FFLDB006` with replay; online segment retirement upgrades these to `FFLDB007`/`FFLDB008` |
 | `O/<object ID>` location index | `FFOBJ002`, total length u64, chunk count u32, ordered 32-byte chunk IDs |
 | `C/<chunk ID>` | segment ID u64, record offset u64, payload length u32 |
 | Segment header (48 bytes) | `FFSEG001`, segment ID u64, hash of preceding 16 bytes |
@@ -134,7 +134,8 @@ sync failures and metadata-publication failures.
 
 The former namespace 256 KiB file limit is removed by [sparse large files](LARGE_FILES.md).
 Offline GC and segment reclamation are implemented; see [ObjectStore GC](STORAGE_GC.md).
-Background incremental GC, compression, production remote synchronization and
+Online incremental GC is described in [ONLINE_GC.md](ONLINE_GC.md).
+Compression, production remote synchronization and
 cloud-ack durability remain separate work. This implementation
 does not claim that the complete original filesystem plan is finished.
 

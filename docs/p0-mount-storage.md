@@ -219,6 +219,9 @@ this is not a bounded-memory cache or large-repository performance acceptance.
 
 ## Offline GC
 
+For bounded collection while the daemon remains open, see [Online GC](ONLINE_GC.md).
+The commands below retain the exclusive offline generation-exchange protocol.
+
 ```
 forkfsd gc-plan STORE
 forkfsd gc STORE
