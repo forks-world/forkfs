@@ -55,6 +55,8 @@ with tempfile.TemporaryDirectory(prefix='ff-mounts-') as td:
         cli('mount-check',revoked,'--generation',gen,ok=False)
         assert cli('fs-cat','/f')==b'new'
         proc.terminate();proc.wait(timeout=5)
+        offline=subprocess.run([BIN,'fs-restore',str(db),'base'],capture_output=True,timeout=10)
+        assert offline.returncode!=0 and b'durable mount registrations' in offline.stderr,offline.stderr
         sockpath=root/'rpc-restarted.sock'
         proc=subprocess.Popen([BIN,'serve',str(db),'--socket',str(sockpath),'--rpc'],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
         deadline=time.monotonic()+5
@@ -63,5 +65,8 @@ with tempfile.TemporaryDirectory(prefix='ff-mounts-') as td:
         assert any(m['token']==revoked and m['generation']==gen for m in json.loads(cli('mount-list','--generation',newgen))['mounts'])
         cli('mount-retire',gen,revoked,'--generation',newgen);cli('mount-retire',gen,revoked,'--generation',newgen)
         assert cli('fs-restore','base');assert cli('fs-cat','/f')==b'old'
-    finally:
         proc.terminate();proc.wait(timeout=5)
+        offline=subprocess.run([BIN,'fs-restore',str(db),'base'],capture_output=True,timeout=10)
+        assert offline.returncode==0,offline.stderr
+    finally:
+        if proc.poll() is None:proc.terminate();proc.wait(timeout=5)
