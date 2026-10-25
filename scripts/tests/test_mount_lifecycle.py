@@ -42,14 +42,14 @@ class MountLifecycle(unittest.TestCase):
             directory.mkdir()
             entry = directory / 'agent_supervisor.py'
             entry.write_text('# trusted fixture')
-            real_lstat = os.lstat
             class LibC:
                 acl_get_link_np = lambda self, path, flags: None
                 acl_free = lambda self, acl: None
             libc = LibC()
             def mock_lstat(path):
-                value = real_lstat(path)
-                return SimpleNamespace(st_mode=value.st_mode & ~0o7022, st_uid=0, st_nlink=value.st_nlink)
+                path = Path(path)
+                mode = (stat.S_IFREG | 0o644) if path == entry else (stat.S_IFDIR | 0o755)
+                return SimpleNamespace(st_mode=mode, st_uid=0, st_nlink=1)
             with patch.object(mount_lifecycle.os, 'lstat', side_effect=mock_lstat), \
                  patch.object(mount_lifecycle.ctypes, 'get_errno', return_value=errno.ENOENT):
                 mount_lifecycle._verify_bootstrap(directory, entry, libc)
