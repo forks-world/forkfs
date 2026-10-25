@@ -16,6 +16,8 @@ with tempfile.TemporaryDirectory(prefix='ff-mounts-') as td:
     def rpc(*fields):
         with socket.socket(socket.AF_UNIX) as s:
             s.settimeout(5);s.connect(str(sockpath));s.sendall(frame(fields));h=exact(s,12);assert h[:8]==b'FFRSP001';b=exact(s,struct.unpack('<I',h[8:])[0]);return struct.unpack('<I',b[:4])[0],b[4:]
+    def write(path,value):
+        code,_=rpc('fs-write',path,value);assert code==0,code
     def busy_restore():
         code,_=rpc('fs-restore','base');assert code==(0x80000000|16),code
     assert subprocess.run([BIN,'init',str(db)]).returncode==0
@@ -23,22 +25,22 @@ with tempfile.TemporaryDirectory(prefix='ff-mounts-') as td:
     try:
         deadline=time.monotonic()+5
         while not sockpath.exists():assert proc.poll() is None and time.monotonic()<deadline;time.sleep(.01)
-        cli('fs-init');cli('fs-write','/f','old');cli('fs-snapshot','base');cli('fs-write','/f','new')
+        cli('fs-init');write('/f','old');cli('fs-snapshot','base');write('/f','new')
         gen=json.loads(cli('service-hello'))['generation']
         cli('mount-open','world','main','99','--generation',gen,ok=False);assert cli('fs-restore','base')
-        cli('fs-write','/f','new')
+        write('/f','new')
         revision_mount=json.loads(cli('mount-open','revision','base','60000','--generation',gen))['session']
         assert cli('fs-restore','base')
         cli('mount-revoke',revision_mount,'--generation',gen);cli('mount-retire',gen,revision_mount,'--generation',gen)
-        cli('fs-write','/f','new');cli('fs-fork','base','other')
+        write('/f','new');cli('fs-fork','base','other')
         other_mount=json.loads(cli('mount-open','world','other','60000','--generation',gen))['session']
         assert cli('fs-restore','base')
         cli('mount-revoke',other_mount,'--generation',gen);cli('mount-retire',gen,other_mount,'--generation',gen)
-        cli('fs-write','/f','new')
+        write('/f','new')
         full=[json.loads(cli('session-open','60000'))['session'] for _ in range(128)]
         cli('mount-open','world','main','60000','--generation',gen,ok=False)
         for token in full:cli('session-close',token)
-        assert cli('fs-restore','base');cli('fs-write','/f','new')
+        assert cli('fs-restore','base');write('/f','new')
         token=json.loads(cli('mount-open','world','main','1000','--generation',gen))['session']
         assert any(m['token']==token for m in json.loads(cli('mount-list','--generation',gen))['mounts'])
         check=json.loads(cli('mount-check',token,'--generation',gen));assert check=={'generation':gen,'name':'main','read_only':False}
