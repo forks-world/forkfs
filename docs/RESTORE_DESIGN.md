@@ -79,3 +79,12 @@ RV006 覆盖多 session、dup、orphan、锁释放、旧 cursor 拒绝，以及 
 故障二进制在 LevelDB write 前/本地 sync 后退出，重启验证完整旧/新树、
 提交序号及保留历史。真实内核挂载、断电硬件、云同步和完整 POSIX 验收
 仍不属于这些测试的证明范围。
+
+## Managed mounted Worlds
+
+Restore now returns POSIX `EBUSY` while the target World has a durable mount
+registration, including expired/revoked sessions and registrations surviving a
+daemon restart. Stop the managed agent, verify OS unmount, and retire that exact
+registration before restore. See [managed mount lifecycle](MOUNT_LIFECYCLE.md).
+This prevents an in-place restore from publishing new metadata beneath old
+kernel caches; it does not implement live cache invalidation or hot restore.

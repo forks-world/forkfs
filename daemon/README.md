@@ -490,3 +490,13 @@ CoW indexes. Physical data GC remains unimplemented.
 Regular files now support sparse CoW content indexes, bounded range I/O and logical
 sizes up to INT64_MAX. The old 256 KiB limit applies to individual immutable objects,
 not files. See [format, request limits and validation](../docs/LARGE_FILES.md).
+
+### Managed mount lifecycle
+
+Durable mount registrations now block World restore until the trusted controller
+has verified OS unmount and retired the exact registration. Session expiry,
+revocation and daemon restart do not release that barrier. The root supervisor
+supports root-only receipt binding, a nonrenewing session monitor, independent
+parent-death recovery, UID quiescence and fd-based unmount. See
+[the lifecycle protocol](../docs/MOUNT_LIFECYCLE.md) for commands and the remaining
+signed real-mounted acceptance boundary.

@@ -575,3 +575,18 @@ root-only macOS CI fixture runs distinct service/frontend/worker identities and
 checks frontend management denial, worker RPC/token denial, and backing-file
 denial. Only the security-scope grant is simulated for callbacks; no signed
 installation or real-mounted acceptance is claimed.
+
+## Managed mount retirement and restore barrier
+
+The daemon now retains mount registrations across session expiry, revoke and
+restart. Registered World mounts block both CLI and RPC restore with `EBUSY`.
+The trusted root supervisor can bind a root-only session receipt to a worker
+policy, monitor the session without renewing it, reap the worker UID, unmount
+through a pinned filesystem-root fd, verify filesystem-ID disappearance, and
+retire the registration. An independent EOF deathwatch handles supervisor death;
+failed cleanup retains the UID/lifecycle quarantine for explicit recovery.
+See [protocol, ordering and validation boundaries](MOUNT_LIFECYCLE.md).
+
+This implements the controller protocol. Unit tests and the disposable-root
+fixture do not establish signed, real-mounted FSKit behavior; its kernel and
+RPC boundary substitutions are explicitly reported as mocked.
