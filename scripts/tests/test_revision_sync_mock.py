@@ -1,5 +1,6 @@
 """Run mock HTTP source and backup as separate processes over real forkfs objects."""
 import argparse
+import errno
 import hashlib
 import http.client
 import io
@@ -19,7 +20,7 @@ import unittest
 
 from revision_sync_mock import call, remote, ApiError, json_bytes
 from revision_sync_codec import object_id, source_closure, make_plan, encode_pack
-from revision_sync_validator import decode_inventory, receive_pack, verify_closure
+from revision_sync_validator import decode_inventory, receive_pack, verify_closure, validate_symlink_target, restore_views
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'daemon' / 'tests'))
@@ -85,11 +86,32 @@ class SyncTests(unittest.TestCase):
         cls.expected['/large'] = random.Random(8173).randbytes(700000)
         for path in ('/magic','/empty','/binary','/large','/extent-magic'):
             data.write_bytes(cls.expected[path]);run('fs-write', cls.db, path, data)
+        # Native filename and link target include non-ASCII and control bytes.
+        odd_name = '/中文-\x01'
+        cls.expected[odd_name] = b'byte name survives sync and restore'
+        data.write_bytes(cls.expected[odd_name]);run('fs-write', cls.db, odd_name, data)
+        run('fs-symlink', cls.db, '中文/\x01-target', '/odd-target')
         run('fs-chmod', cls.db, '/src/f0', '755');run('fs-link', cls.db, '/src/f0', '/alias')
         run('fs-symlink', cls.db, 'src/f0', '/current')
         run('fs-link', cls.db, '/current', '/current-alias')
         cls.expected['/alias'] = cls.expected['/src/f0']
-        run('fs-snapshot', cls.db, 'base');run('fs-fork', cls.db, 'base', 'branch')
+        run('fs-snapshot', cls.db, 'base')
+        run('fs-fork', cls.db, 'base', 'raw-bytes')
+        raw_name = b'/raw-\xff'
+        data.write_bytes(b'raw byte name survives sync and restore')
+        raw_run = [os.fsencode(BINARY), b'fs-write', os.fsencode(cls.db), raw_name,
+                   os.fsencode(data), b'--world', b'raw-bytes']
+        result = subprocess.run(raw_run, capture_output=True, timeout=30)
+        if result.returncode:
+            raise AssertionError((raw_run, result.stderr))
+        cls.raw_target = b'raw-\xfe/\x01-target'
+        raw_link = [os.fsencode(BINARY), b'fs-symlink', os.fsencode(cls.db), cls.raw_target,
+                    b'/raw-target', b'--world', b'raw-bytes']
+        result = subprocess.run(raw_link, capture_output=True, timeout=30)
+        if result.returncode:
+            raise AssertionError((raw_link, result.stderr))
+        run('fs-snapshot', cls.db, 'raw-bytes', '--world', 'raw-bytes')
+        run('fs-fork', cls.db, 'base', 'branch')
         data.write_bytes(b'left\0edit');run('fs-write', cls.db, '/src/f0', data);run('fs-snapshot', cls.db, 'left')
         data.write_bytes(b'right edit');run('fs-write', cls.db, '/src/f1', data, '--world', 'branch');run('fs-snapshot', cls.db, 'right', '--world', 'branch')
         run('fs-snapshot-parents', cls.db, 'merge', 'left,right')
@@ -265,14 +287,14 @@ class SyncTests(unittest.TestCase):
                     values[b'\0forkfs/parent/' + ident] = b'FFPAR001' + parent + name
                 if index + 1 < len(new_ids):
                     values[b'\0forkfs/entry/' + ident + b'/' + name] = new_ids[index+1]
-            file_key, file_template = next((key, value) for key, value in values.items()
-                                            if key.startswith(b'\0forkfs/inode/')
-                                            and int.from_bytes(value[8:12], 'little') == 1)
+            # Use an inline file explicitly: inode order is randomized, and
+            # an extent-backed content record is a descriptor, not file bytes.
+            old_file_id = values[b'\0forkfs/entry/' + root_id + b'/magic']
+            file_template = values[b'\0forkfs/inode/' + old_file_id]
             while format(candidate, '032x').encode() in used_ids:
                 candidate -= 1
             file_id = format(candidate, '032x').encode()
             file_inode = bytearray(file_template);struct.pack_into('<Q', file_inode, 16, 1)
-            old_file_id = file_key[len(b'\0forkfs/inode/'):]
             values[b'\0forkfs/inode/' + file_id] = bytes(file_inode)
             values[b'\0forkfs/allocated/' + file_id] = b''
             values[b'\0forkfs/content/' + file_id] = values[b'\0forkfs/content/' + old_file_id]
@@ -282,8 +304,11 @@ class SyncTests(unittest.TestCase):
             values[root_inode_key] = bytes(root_inode)
         bad_namespace('long-native-path', add_long_native_path)
         def set_v4_inode(values, accessed=0, created=0, xattrs=(), legacy=False):
-            inode_key, old = next((key, value) for key, value in values.items()
-                                  if key.startswith(b'\0forkfs/inode/') and int.from_bytes(value[8:12], 'little') == 1)
+            # Converting FFINOD05 to v4 would discard extent semantics.
+            # This fixture tests v4 timestamps/xattrs on a known inline file.
+            ident = values[b'\0forkfs/entry/' + values[b'\0forkfs/root'] + b'/magic']
+            inode_key = b'\0forkfs/inode/' + ident
+            old = values[inode_key]
             flags_ids = old[48:64] if old[:8] in (b'FFINOD03', b'FFINOD04') else bytes(16)
             inode = bytearray(b'FFINOD04' + old[8:48] + flags_ids + struct.pack('<QQI', accessed, created, len(xattrs)))
             for name, value in xattrs:
@@ -320,6 +345,31 @@ class SyncTests(unittest.TestCase):
         self.backup = Server('backup', backup_root, self.source);self.addCleanup(self.backup.stop);self.backup.start()
         self.request = dict(repository=self.fixture['repository'], selectors=[{'name':'latest'}], request_id='request-a')
 
+    def test_00_raw_byte_namespace_sync_and_restore_limits(self):
+        validate_symlink_target(b'\xff/\x01-target')
+        for invalid in (b'', b'bad\0target', b'a'*4097, b'a'*256):
+            with self.subTest(target=invalid[:16], size=len(invalid)), self.assertRaises(ValueError):
+                validate_symlink_target(invalid)
+        result = self.sync(selectors=[{'name':'raw-bytes'}])
+        self.assertEqual((result['state'], result['ack']), ('committed', 'acknowledged'))
+        manifest = json.loads((self.backup.root/'manifests'/result['backup_id']).read_bytes())
+        load = lambda ident: (self.backup.root/'objects'/ident).read_bytes()
+        views = verify_closure(manifest['plan'], manifest['entries'], load)
+        raw_view = views[self.fixture['refs']['raw-bytes']]
+        found = {os.fsencode(path):info for path, info in raw_view.items()}
+        self.assertEqual(found[b'/raw-\xff']['data'], b'raw byte name survives sync and restore')
+        self.assertEqual(found[b'/raw-target']['data'], self.raw_target)
+        if sys.platform == 'darwin':
+            with self.assertRaises(OSError) as error:
+                restore_views(views, self.case/'native-raw-restore')
+            self.assertEqual(error.exception.errno, errno.EILSEQ)
+        else:
+            restored = self.backup.request('POST','/restore',{'backup_id':result['backup_id']})
+            view = self.backup.root/'restored'/restored['restore_id']/self.fixture['refs']['raw-bytes']
+            with open(os.fsencode(view)+b'/raw-\xff', 'rb') as handle:
+                self.assertEqual(handle.read(), b'raw byte name survives sync and restore')
+            self.assertEqual(os.readlink(os.fsencode(view)+b'/raw-target'), self.raw_target)
+
     def sync(self, **changes):
         return self.backup.request('POST', '/sync', self.request | changes)
 
@@ -352,6 +402,7 @@ class SyncTests(unittest.TestCase):
                 actual = {('/'+str(p.relative_to(view))):p.read_bytes() for p in view.rglob('*') if p.is_file() and not p.is_symlink()}
                 self.assertEqual(actual, expected)
                 self.assertEqual(os.readlink(view/'current'), 'src/f0')
+                self.assertEqual(os.readlink(view/'odd-target'), '中文/\x01-target')
                 self.assertEqual(os.readlink(view/'current-alias'), 'src/f0')
                 self.assertEqual(os.lstat(view/'current').st_ino, os.lstat(view/'current-alias').st_ino)
                 self.assertEqual(os.lstat(view/'current').st_nlink, 2)
