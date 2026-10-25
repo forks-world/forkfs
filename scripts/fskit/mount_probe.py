@@ -25,11 +25,37 @@ def mount_info(path):
                 fsid=list(result.fsid),fskit=bool(result.flags_ext & 2),read_only=bool(result.flags & 1),
                 available_bytes=result.bavail*result.bsize)
 
-def require_mount(path):
+def descriptor_mount_info(fd):
+    """Attest the filesystem reached by an already pinned directory FD."""
+    if platform.system()!='Darwin': raise RuntimeError('FSKit attestation requires macOS')
+    result=DarwinStatFS();libc=ctypes.CDLL(None,use_errno=True)
+    call=libc.fstatfs;call.argtypes=[ctypes.c_int,ctypes.POINTER(DarwinStatFS)];call.restype=ctypes.c_int
+    if call(fd,ctypes.byref(result))!=0: raise OSError(ctypes.get_errno(),'fstatfs')
+    return dict(fstype=result.fstype.decode(),mountpoint=os.fsdecode(result.mountpoint),
+                fsid=list(result.fsid),fskit=bool(result.flags_ext & 2),read_only=bool(result.flags & 1),
+                available_bytes=result.bavail*result.bsize)
+
+def mounted_fsids():
+    """Return a bounded snapshot of mounted filesystems for post-unmount proof."""
+    if platform.system()!='Darwin': raise RuntimeError('mount enumeration requires macOS')
+    libc=ctypes.CDLL(None,use_errno=True);call=libc.getfsstat
+    call.argtypes=[ctypes.POINTER(DarwinStatFS),ctypes.c_int,ctypes.c_int];call.restype=ctypes.c_int
+    capacity=4096;items=(DarwinStatFS*capacity)()
+    count=call(items,ctypes.sizeof(items),2) # MNT_NOWAIT
+    if count<=0 or count>=capacity:raise RuntimeError('mounted filesystem enumeration failed or exceeded capacity')
+    return {tuple(item.fsid) for item in items[:count]}
+
+def funmount_fd(fd):
+    """Unmount the mount pinned by fd, never resolving a replacement path."""
+    libc=ctypes.CDLL(None,use_errno=True);call=libc.funmount
+    call.argtypes=[ctypes.c_int,ctypes.c_int];call.restype=ctypes.c_int
+    if call(fd,0)!=0:raise OSError(ctypes.get_errno(),'funmount')
+
+def require_mount(path, expected_read_only=False):
     path=Path(path).resolve(strict=True);info=mount_info(path)
     if info['fstype']!='forkrevision' or not info['fskit'] or Path(info['mountpoint']).resolve()!=path:
         raise RuntimeError('not an attested forkfs FSKit mount root: '+json.dumps(info))
-    if info['read_only']: raise RuntimeError('acceptance requires a writable World mount')
+    if info['read_only'] != bool(expected_read_only): raise RuntimeError('mount read-only state differs from policy')
     return info
 
 def preflight(app):

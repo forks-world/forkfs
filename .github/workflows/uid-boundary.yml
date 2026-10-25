@@ -38,3 +38,8 @@ jobs:
       - name: Exercise privileged supervisor on disposable runner
         shell: sh
         run: sudo -n python3 scripts/tests/agent_supervisor_acceptance.py --host-user "$(id -un)" --worker-user _www
+      - name: Test managed mount lifecycle contracts
+        run: python3 -m unittest discover -s scripts/tests -p test_mount_lifecycle.py -v
+      - name: Exercise managed lifecycle and parent death on disposable runner
+        shell: sh
+        run: sudo -n python3 scripts/tests/mount_lifecycle_acceptance.py --host-user "$(id -un)" --worker-user _www
