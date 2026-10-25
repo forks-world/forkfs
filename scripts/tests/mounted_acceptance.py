@@ -6,18 +6,93 @@ import json
 import mmap
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import time
 import uuid
+import unicodedata
+import select
+import stat
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'fskit'))
-from mount_probe import require_mount
+from mount_probe import require_mount,descriptor_mount_info,descriptor_volume_uuid
+
+def workload_environment(home):
+    # Workload children get only a system PATH and a private HOME. In
+    # particular, credentials, proxy settings and inherited Git config cannot
+    # silently affect either filesystem's result.
+    return {'PATH':os.defpath,'HOME':str(home),'GIT_CONFIG_NOSYSTEM':'1',
+            'GIT_CONFIG_GLOBAL':'/dev/null','GIT_TEMPLATE_DIR':'/dev/null',
+            'LC_ALL':'C'}
 
 def command(directory,*args):
-    env={k:v for k,v in os.environ.items() if not k.startswith(('GIT_','DYLD_','LD_'))}
-    env.update(GIT_CONFIG_NOSYSTEM='1',GIT_CONFIG_GLOBAL='/dev/null',GIT_TEMPLATE_DIR='/dev/null')
-    return subprocess.run(list(args),cwd=directory,env=env,capture_output=True,check=True,timeout=60).stdout
+    return subprocess.run(list(args),cwd=directory,env=workload_environment(directory),capture_output=True,check=True,timeout=60).stdout
+
+def pinned_mount_identity(fd):
+    info=descriptor_mount_info(fd)
+    if info['fstype']!='forkrevision' or not info['fskit']:
+        raise RuntimeError('pinned descriptor is not on the ForkFS FSKit volume')
+    return dict(fsid=list(info['fsid']),volume_uuid=descriptor_volume_uuid(fd))
+
+def attest_mount_identity(path,pinned_fd,expected):
+    info=require_mount(path)
+    if list(info['fsid'])!=expected['fsid']:
+        raise RuntimeError('mounted path FSID changed during acceptance')
+    current=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+    try:current_identity=pinned_mount_identity(current)
+    finally:os.close(current)
+    pinned_identity=pinned_mount_identity(pinned_fd)
+    if current_identity!=expected or pinned_identity!=expected:
+        raise RuntimeError('mounted filesystem identity changed during acceptance')
+    return expected
+
+def _remove_tree_contents(directory_fd,expected_device):
+    for name in os.listdir(directory_fd):
+        info=os.stat(name,dir_fd=directory_fd,follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            if info.st_dev!=expected_device:
+                raise RuntimeError('refusing to traverse a workspace mount boundary')
+            child=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=directory_fd)
+            try:
+                opened=os.fstat(child)
+                if opened.st_dev!=expected_device or (opened.st_dev,opened.st_ino)!=(info.st_dev,info.st_ino):
+                    raise RuntimeError('workspace child identity changed')
+                _remove_tree_contents(child,expected_device)
+            finally:os.close(child)
+            current=os.stat(name,dir_fd=directory_fd,follow_symlinks=False)
+            if not stat.S_ISDIR(current.st_mode) or (current.st_dev,current.st_ino)!=(info.st_dev,info.st_ino):
+                raise RuntimeError('workspace child identity changed')
+            os.rmdir(name,dir_fd=directory_fd)
+        else:
+            # Symlinks and other nondirectories are unlinked as entries; their
+            # targets are never opened or traversed.
+            current=os.stat(name,dir_fd=directory_fd,follow_symlinks=False)
+            if (current.st_dev,current.st_ino)!=(info.st_dev,info.st_ino):
+                raise RuntimeError('workspace child identity changed')
+            os.unlink(name,dir_fd=directory_fd)
+
+def safe_remove_owned(root_fd,name,device,inode,token):
+    info=os.stat(name,dir_fd=root_fd,follow_symlinks=False)
+    if not stat.S_ISDIR(info.st_mode) or (info.st_dev,info.st_ino)!=(device,inode):
+        raise RuntimeError('workspace cleanup identity changed')
+    workspace=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=root_fd)
+    try:
+        current=os.fstat(workspace)
+        if (current.st_dev,current.st_ino)!=(device,inode):raise RuntimeError('workspace cleanup identity changed')
+        marker=os.open('.owner',os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=workspace)
+        try:
+            marker_info=os.fstat(marker)
+            if not stat.S_ISREG(marker_info.st_mode):raise RuntimeError('workspace ownership marker is not a regular file')
+            actual=os.read(marker,128).decode('ascii')
+        finally:os.close(marker)
+        if actual!=token:raise RuntimeError('workspace ownership marker changed')
+        _remove_tree_contents(workspace,device)
+    finally:os.close(workspace)
+    # Both the parent descriptor and the final inode check keep cleanup on the
+    # original filesystem and refuse a replacement directory at this name.
+    current=os.stat(name,dir_fd=root_fd,follow_symlinks=False)
+    if not stat.S_ISDIR(current.st_mode) or (current.st_dev,current.st_ino)!=(device,inode):
+        raise RuntimeError('workspace cleanup identity changed')
+    os.rmdir(name,dir_fd=root_fd)
 
 def correctness(root):
     result={};data=bytes(range(256))*65536;file=root/'large';file.write_bytes(data)
@@ -38,10 +113,95 @@ def correctness(root):
     with lock.open('r+b') as f:
         fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
         code='import errno,fcntl,sys\nf=open(sys.argv[1],"r+b")\ntry: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept OSError as e: sys.exit(73 if e.errno in (errno.EAGAIN,errno.EWOULDBLOCK) else 74)'
-        other=subprocess.run([sys.executable,'-c',code,str(lock)],capture_output=True,timeout=10)
+        other=subprocess.run([sys.executable,'-I','-c',code,str(lock)],capture_output=True,timeout=10,env=workload_environment(root))
         if other.returncode!=73:raise AssertionError(('exclusive lock failed',other.returncode,other.stderr.decode()))
     result['retained_inode']=True;result['truncate_regrow']=True;result['cross_process_lock']=True
     return result
+
+def metadata_contract(root,require_forkfs):
+    directory=root/'metadata';directory.mkdir()
+    original='漢字-🧪-control-\x01.txt';renamed='改名-🚀-control-\x02.txt';payload=b'filename-bytes\x00\xff'
+    source=directory/original
+    unicode_exact=False;unicode_issue=None
+    try:
+        with source.open('xb') as f:f.write(payload)
+        if source.read_bytes()!=payload:raise AssertionError('Unicode/control filename readback changed bytes')
+        target=directory/renamed;os.rename(source,target)
+        if target.read_bytes()!=payload or os.fsencode(target.name)!=os.fsencode(renamed):
+            raise AssertionError('Unicode/control filename rename or byte spelling changed')
+        if os.fsencode(renamed) not in {os.fsencode(name) for name in os.listdir(directory)}:
+            raise AssertionError('renamed Unicode/control filename missing from readdir')
+        unicode_exact=True
+    except (OSError,AssertionError) as error:
+        if require_forkfs:raise
+        unicode_issue=repr(error)
+
+    def pair(first,second):
+        outcomes=[]
+        for index,name in enumerate((first,second)):
+            path=directory/name
+            try:
+                with path.open('xb') as f:f.write(str(index).encode())
+                outcomes.append(True)
+            except FileExistsError:outcomes.append(False)
+            except OSError:
+                if require_forkfs:raise
+                outcomes.append(False)
+        names={os.fsencode(name) for name in os.listdir(directory)}
+        distinct=all(outcomes) and os.fsencode(first) in names and os.fsencode(second) in names
+        if require_forkfs and not distinct:raise AssertionError('ForkFS must preserve distinct filename byte spellings')
+        return distinct
+
+    nfc=unicodedata.normalize('NFC','café.txt');nfd=unicodedata.normalize('NFD','café.txt')
+    normalization_distinct=pair(nfc,nfd)
+    case_sensitive=pair('ForkFS-Case.txt','forkfs-case.txt')
+    result=dict(unicode_control_exact=unicode_exact,nfc_nfd_distinct=normalization_distinct,
+                case_sensitive=case_sensitive)
+    if unicode_issue:result['unicode_control_issue']=unicode_issue
+    return result
+
+def crossprocess_atomic_replace(root):
+    directory=root/'crossprocess';directory.mkdir();target=directory/'payload.bin'
+    old=bytes(range(251))*17+b'old-tail';new=bytes(reversed(range(251)))*19+b'new-tail'
+    target.write_bytes(old)
+    reader_code=(
+        'import hashlib,json,os,sys\n'
+        'path=sys.argv[1];old_expected=bytes.fromhex(sys.argv[2]);new_expected=bytes.fromhex(sys.argv[3])\n'
+        'fd=os.open(path,os.O_RDONLY);os.write(1,b"READY\\n")\n'
+        'if sys.stdin.buffer.readline()!=b"go\\n":raise RuntimeError("missing writer handshake")\n'
+        'parts=[];offset=0\n'
+        'while offset<len(old_expected):\n part=os.pread(fd,len(old_expected)-offset,offset)\n'
+        ' if not part:break\n parts.append(part);offset+=len(part)\n'
+        'old=b"".join(parts);fresh=open(path,"rb").read();os.close(fd)\n'
+        'result={"old_matches":old==old_expected,"fresh_matches":fresh==new_expected,\n'
+        '"old_sha256":hashlib.sha256(old).hexdigest(),"fresh_sha256":hashlib.sha256(fresh).hexdigest()}\n'
+        'print(json.dumps(result),flush=True)\n')
+    writer_code=(
+        'import os,sys,uuid\n'
+        'path=sys.argv[1];data=bytes.fromhex(sys.argv[2]);directory=os.path.dirname(path)\n'
+        'temp=os.path.join(directory,".replace-"+uuid.uuid4().hex)\n'
+        'fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)\n'
+        'try:\n view=memoryview(data)\n while view:\n  count=os.write(fd,view)\n  if count<=0:raise OSError("short write")\n  view=view[count:]\n os.fsync(fd)\nfinally:os.close(fd)\n'
+        'os.replace(temp,path);dfd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY)\n'
+        'try:os.fsync(dfd)\nfinally:os.close(dfd)\n')
+    env=workload_environment(root)
+    reader=subprocess.Popen([sys.executable,'-I','-c',reader_code,str(target),old.hex(),new.hex()],
+                            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                            env=env,close_fds=True)
+    try:
+        ready,_,_=select.select([reader.stdout],[],[],10)
+        if not ready or reader.stdout.readline()!=b'READY\n':raise AssertionError('cross-process reader did not pin old file')
+        subprocess.run([sys.executable,'-I','-c',writer_code,str(target),new.hex()],
+                       env=env,capture_output=True,check=True,timeout=10,close_fds=True)
+        output,_=reader.communicate(input=b'go\n',timeout=10)
+        if reader.returncode!=0:raise AssertionError(('cross-process reader failed',reader.returncode))
+        result=json.loads(output)
+        expected=dict(old_matches=True,fresh_matches=True,old_sha256=hashlib.sha256(old).hexdigest(),
+                      fresh_sha256=hashlib.sha256(new).hexdigest())
+        if result!=expected:raise AssertionError(('cross-process atomic replace mismatch',result,expected))
+        return result
+    finally:
+        if reader.poll() is None:reader.kill();reader.communicate(timeout=5)
 
 def development(root):
     command(root,'git','init','-q','--template=/dev/null')
@@ -74,6 +234,14 @@ def timed(root,samples):
 
 def exercise(root,samples):return dict(correctness=correctness(root),development=development(root),timing=timed(root,samples))
 
+def native_exercise(root,samples):
+    return dict(exercise(root,samples),metadata=metadata_contract(root,False),
+                crossprocess_atomic_replace=crossprocess_atomic_replace(root))
+
+def mounted_exercise(root,samples):
+    return dict(exercise(root,samples),metadata=metadata_contract(root,True),
+                crossprocess_atomic_replace=crossprocess_atomic_replace(root))
+
 def validate_paths(mount,native,output):
     mount=Path(mount).resolve(strict=True);native=Path(native).resolve(strict=True)
     if not mount.is_dir() or not native.is_dir():raise ValueError('mount and native roots must be directories')
@@ -95,20 +263,53 @@ def main():
         args.output.mkdir(parents=True,exist_ok=True)
         with (args.output/('blocked-'+uuid.uuid4().hex+'.json')).open('x') as f:json.dump(result,f,indent=2)
         print(json.dumps(result));return 2
-    roots=[native,mount];token=uuid.uuid4().hex;owned=[]
-    if roots[0].stat().st_dev==roots[1].stat().st_dev:raise ValueError('native reference must be a different filesystem device')
+    roots=[native,mount];token=uuid.uuid4().hex;owned=[];root_fds=[];identity_fd=None;baseline=None;failure=None
     args.output.mkdir(parents=True,exist_ok=True)
     try:
-        for root in roots:
-            path=root/('.forkfs-accept-'+token);path.mkdir(mode=0o700);(path/'.owner').write_text(token);owned.append((path,path.stat().st_dev,path.stat().st_ino));result['native' if root==roots[0] else 'world']=exercise(path,args.samples)
+        native_fd=os.open(native,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC|os.O_NOFOLLOW);root_fds.append(native_fd)
+        identity_fd=os.open(mount,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC|os.O_NOFOLLOW);root_fds.append(identity_fd)
+        baseline=pinned_mount_identity(identity_fd)
+        result['world_identity']={'fsid':list(baseline['fsid']),'volume_uuid':baseline['volume_uuid']}
+        attest_mount_identity(mount,identity_fd,baseline)
+        if os.fstat(native_fd).st_dev==os.fstat(identity_fd).st_dev:raise ValueError('native reference must be a different filesystem device')
+        for index,root in enumerate(roots):
+            root_fd=root_fds[index];name='.forkfs-accept-'+token
+            os.mkdir(name,mode=0o700,dir_fd=root_fd)
+            work_fd=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=root_fd)
+            try:
+                info=os.fstat(work_fd);owned.append((root_fd,name,info.st_dev,info.st_ino))
+                marker=os.open('.owner',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,0o600,dir_fd=work_fd)
+                try:os.write(marker,token.encode('ascii'));os.fsync(marker)
+                finally:os.close(marker)
+            finally:os.close(work_fd)
+            path=root/name
+            if index==0:result['native']=native_exercise(path,args.samples)
+            else:
+                result['world_identity']['before_workload']=attest_mount_identity(mount,identity_fd,baseline)
+                try:result['world']=mounted_exercise(path,args.samples)
+                finally:result['world_identity']['after_workload']=attest_mount_identity(mount,identity_fd,baseline)
         result.update(status='passed',mounted_acceptance=True,os_caches_dropped=False)
     except Exception as error:
-        result.update(status='failed',error=repr(error))
-        raise
+        failure=error;result.update(status='failed',mounted_acceptance=False,error=repr(error))
     finally:
-        for path,device,inode in owned:
-            if path.is_symlink() or path.stat().st_dev!=device or path.stat().st_ino!=inode or (path/'.owner').read_text()!=token:raise RuntimeError('workspace cleanup identity changed')
-            shutil.rmtree(path)
-        with (args.output/('acceptance-'+token+'.json')).open('x') as f:json.dump(result,f,indent=2)
-    print(json.dumps(dict(status=result['status'],mounted_acceptance=result['mounted_acceptance'])));return 0
+        cleanup_errors=[]
+        for root_fd,name,device,inode in reversed(owned):
+            try:safe_remove_owned(root_fd,name,device,inode,token)
+            except Exception as error:cleanup_errors.append(repr(error))
+        if identity_fd is not None and baseline is not None:
+            try:result['world_identity']['after_cleanup']=attest_mount_identity(mount,identity_fd,baseline)
+            except Exception as error:cleanup_errors.append(repr(error))
+        for fd in reversed(root_fds):
+            try:os.close(fd)
+            except OSError as error:cleanup_errors.append(repr(error))
+        if cleanup_errors:
+            result.update(status='failed',mounted_acceptance=False,cleanup_errors=cleanup_errors)
+            if failure is None:failure=RuntimeError('; '.join(cleanup_errors))
+        result.setdefault('status','failed');result.setdefault('mounted_acceptance',False)
+        try:
+            with (args.output/('acceptance-'+token+'.json')).open('x') as f:json.dump(result,f,indent=2)
+        except Exception as error:
+            if failure is None:failure=error
+    print(json.dumps(dict(status=result['status'],mounted_acceptance=result['mounted_acceptance'])))
+    return 1 if failure is not None or result['status']!='passed' else 0
 if __name__=='__main__':raise SystemExit(main())

@@ -1,6 +1,7 @@
 """Harness validation; native runs are deliberately not mounted acceptance."""
 import json
 import fcntl
+import hashlib
 import os
 from pathlib import Path
 import platform
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import socket
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'fskit'))
 import mount_probe
@@ -80,6 +82,114 @@ class Harness(unittest.TestCase):
             self.assertTrue(result['correctness']['cross_process_lock'])
             self.assertTrue(result['development']['git_checkout'])
             self.assertIsNone(result['timing'][1]['stat']['p99_ns'])
+            self.assertNotIn('mounted_acceptance',result)
+    def test_native_metadata_reference_reports_filesystem_filename_behavior(self):
+        with tempfile.TemporaryDirectory() as name:
+            result=mounted_acceptance.metadata_contract(Path(name),False)
+            self.assertIsInstance(result['unicode_control_exact'],bool)
+            self.assertIsInstance(result['nfc_nfd_distinct'],bool)
+            self.assertIsInstance(result['case_sensitive'],bool)
+    def test_crossprocess_atomic_replace_keeps_pinned_reader_and_new_lookup_consistent(self):
+        with tempfile.TemporaryDirectory() as name:
+            result=mounted_acceptance.crossprocess_atomic_replace(Path(name))
+            self.assertTrue(result['old_matches'])
+            self.assertTrue(result['fresh_matches'])
+            self.assertEqual(result['old_sha256'],hashlib.sha256(bytes(range(251))*17+b'old-tail').hexdigest())
+            self.assertNotEqual(result['old_sha256'],result['fresh_sha256'])
+    def test_pinned_mount_attestation_requires_stable_fsid_and_kernel_uuid(self):
+        info=dict(fstype='forkrevision',fskit=True,mountpoint='/fake',read_only=False,fsid=[17,23])
+        identity=dict(fsid=[17,23],volume_uuid='f5037f19-5ea9-8305-9558-863f32b2a19b')
+        with tempfile.TemporaryDirectory() as name:
+            with patch.object(mounted_acceptance,'require_mount',return_value=info), \
+                 patch.object(mounted_acceptance,'descriptor_mount_info',return_value=info), \
+                 patch.object(mounted_acceptance,'descriptor_volume_uuid',return_value=identity['volume_uuid']):
+                self.assertEqual(mounted_acceptance.attest_mount_identity(Path(name),-1,identity),identity)
+            with patch.object(mounted_acceptance,'require_mount',return_value=info), \
+                 patch.object(mounted_acceptance,'descriptor_mount_info',return_value=info), \
+                 patch.object(mounted_acceptance,'descriptor_volume_uuid',side_effect=[identity['volume_uuid'],'00000000-0000-8000-8000-000000000000']):
+                with self.assertRaisesRegex(RuntimeError,'identity changed'):
+                    mounted_acceptance.attest_mount_identity(Path(name),-1,identity)
+    def test_cleanup_never_removes_replacement_workspace(self):
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name);owned=root/'owned';owned.mkdir();(owned/'.owner').write_text('token')
+            info=owned.stat();owned.rename(root/'original');owned.mkdir();(owned/'.owner').write_text('replacement')
+            parent=os.open(root,os.O_RDONLY|os.O_DIRECTORY)
+            try:
+                with self.assertRaisesRegex(RuntimeError,'cleanup identity changed'):
+                    mounted_acceptance.safe_remove_owned(parent,'owned',info.st_dev,info.st_ino,'token')
+            finally:os.close(parent)
+            self.assertEqual((owned/'.owner').read_text(),'replacement')
+            self.assertTrue((root/'original'/'.owner').exists())
+    def test_fd_cleanup_removes_owned_tree_without_following_symlinks(self):
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name);owned=root/'owned';owned.mkdir();(owned/'.owner').write_text('token')
+            nested=owned/'nested';nested.mkdir();(nested/'payload').write_text('inside')
+            outside=root/'outside';outside.write_text('keep');(owned/'escape').symlink_to(outside)
+            info=owned.stat();parent=os.open(root,os.O_RDONLY|os.O_DIRECTORY)
+            try:mounted_acceptance.safe_remove_owned(parent,'owned',info.st_dev,info.st_ino,'token')
+            finally:os.close(parent)
+            self.assertFalse(owned.exists())
+            self.assertEqual(outside.read_text(),'keep')
+    def test_cleanup_rejects_fifo_owner_marker_without_blocking(self):
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name);owned=root/'owned';owned.mkdir();os.mkfifo(owned/'.owner')
+            info=owned.stat();parent=os.open(root,os.O_RDONLY|os.O_DIRECTORY)
+            try:
+                with self.assertRaisesRegex(RuntimeError,'not a regular file'):
+                    mounted_acceptance.safe_remove_owned(parent,'owned',info.st_dev,info.st_ino,'token')
+            finally:os.close(parent)
+    def test_cleanup_refuses_nested_mount_before_opening_it(self):
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name);owned=root/'owned';owned.mkdir();(owned/'.owner').write_text('token')
+            nested=owned/'nested';nested.mkdir();payload=nested/'secret';payload.write_text('keep')
+            info=owned.stat();parent=os.open(root,os.O_RDONLY|os.O_DIRECTORY)
+            real_stat=os.stat;real_open=os.open;opened=[]
+            def mounted_stat(path,*args,**kwargs):
+                result=real_stat(path,*args,**kwargs)
+                if path=='nested':return SimpleNamespace(st_dev=result.st_dev+1,st_ino=result.st_ino,st_mode=result.st_mode)
+                return result
+            def track_open(path,*args,**kwargs):
+                if path=='nested':opened.append(path)
+                return real_open(path,*args,**kwargs)
+            try:
+                with patch.object(mounted_acceptance.os,'stat',side_effect=mounted_stat), \
+                     patch.object(mounted_acceptance.os,'open',side_effect=track_open):
+                    with self.assertRaisesRegex(RuntimeError,'mount boundary'):
+                        mounted_acceptance.safe_remove_owned(parent,'owned',info.st_dev,info.st_ino,'token')
+            finally:os.close(parent)
+            self.assertEqual(opened,[])
+            self.assertEqual(payload.read_text(),'keep')
+    def test_workload_failure_writes_receipt_and_preserves_pinned_identity_record(self):
+        with tempfile.TemporaryDirectory() as name:
+            root=Path(name);mount=root/'mount';native=root/'native';output=root/'results'
+            mount.mkdir();native.mkdir();argv=['mounted_acceptance.py','--mount',str(mount),'--native',str(native),'--output',str(output),'--samples','1']
+            info=dict(fstype='forkrevision',fskit=True,mountpoint=str(mount),read_only=False,fsid=[7,11])
+            identities=dict(fsid=[7,11],volume_uuid='f5037f19-5ea9-8305-9558-863f32b2a19b')
+            real_open=os.open;real_fstat=os.fstat;root_fds={}
+            def tracked_open(path,*args,**kwargs):
+                fd=real_open(path,*args,**kwargs)
+                if os.fspath(path)==str(native):root_fds[fd]='native'
+                return fd
+            def distinguish_native(fd):
+                result=real_fstat(fd)
+                if root_fds.get(fd)=='native':return SimpleNamespace(st_dev=result.st_dev+1,st_ino=result.st_ino)
+                return result
+            with patch.object(sys,'argv',argv), \
+                 patch.object(mounted_acceptance,'require_mount',return_value=info), \
+                 patch.object(mounted_acceptance,'descriptor_mount_info',return_value=info), \
+                 patch.object(mounted_acceptance,'descriptor_volume_uuid',return_value=identities['volume_uuid']), \
+                 patch.object(mounted_acceptance.os,'open',side_effect=tracked_open), \
+                 patch.object(mounted_acceptance.os,'fstat',side_effect=distinguish_native), \
+                 patch.object(mounted_acceptance,'native_exercise',return_value={'native':'ok'}), \
+                 patch.object(mounted_acceptance,'mounted_exercise',side_effect=RuntimeError('workload failed')):
+                self.assertEqual(mounted_acceptance.main(),1)
+            receipt=json.loads(next(output.glob('acceptance-*.json')).read_text())
+            self.assertEqual(receipt['status'],'failed')
+            self.assertIn('workload failed',receipt['error'])
+            self.assertEqual(receipt['world_identity']['before_workload'],identities)
+            self.assertEqual(receipt['world_identity']['after_workload'],identities)
+            self.assertEqual(receipt['world_identity']['after_cleanup'],identities)
+            self.assertFalse(any(path.name.startswith('.forkfs-accept-') for path in mount.iterdir()))
     def test_invalid_output_is_rejected_before_creating_any_hierarchy(self):
         with tempfile.TemporaryDirectory() as name:
             root=Path(name);mount=root/'mount';native=root/'native'
