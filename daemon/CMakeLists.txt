@@ -370,3 +370,7 @@ set_tests_properties(forkfsd_session_mounts PROPERTIES TIMEOUT 60 LABELS metadat
 add_test(NAME forkfsd_mount_lifecycle_unit COMMAND ${Python3_EXECUTABLE} -m unittest discover
     -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_mount_lifecycle.py -v)
 set_tests_properties(forkfsd_mount_lifecycle_unit PROPERTIES TIMEOUT 60 LABELS metadata-regression)
+
+add_test(NAME forkfsd_mount_preflight_unit COMMAND ${Python3_EXECUTABLE} -m unittest discover
+    -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_mount_preflight.py -v)
+set_tests_properties(forkfsd_mount_preflight_unit PROPERTIES TIMEOUT 60 LABELS metadata-regression)
