@@ -248,6 +248,11 @@ target_link_libraries(forkfsd_object_store_test PRIVATE forkfs_metadata)
 add_test(NAME forkfsd_object_store COMMAND forkfsd_object_store_test)
 set_tests_properties(forkfsd_object_store PROPERTIES TIMEOUT 120 LABELS metadata-regression)
 
+add_executable(forkfsd_storage_gc_plan_test tests/storage_gc_plan.cpp)
+target_link_libraries(forkfsd_storage_gc_plan_test PRIVATE forkfs_metadata)
+add_test(NAME forkfsd_storage_gc_plan COMMAND forkfsd_storage_gc_plan_test)
+set_tests_properties(forkfsd_storage_gc_plan PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+
 add_executable(forkfsd_object_store_recovery_test tests/object_store_recovery.cpp
     journal.cpp level_store.cpp metadata_tree.cpp metadata_view.cpp)
 target_compile_definitions(forkfsd_object_store_recovery_test PRIVATE FORKFS_TEST_FAULTS=1)
@@ -330,6 +335,12 @@ add_test(NAME forkfsd_storage_gc COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/storage_gc.py $<TARGET_FILE:forkfsd>
     $<TARGET_FILE:forkfsd_leveldb_fault_test>)
 set_tests_properties(forkfsd_storage_gc PROPERTIES TIMEOUT 240 LABELS metadata-regression)
+
+foreach(seed 1 173 4294967295)
+    add_test(NAME forkfsd_storage_gc_model_${seed} COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/storage_gc_model.py $<TARGET_FILE:forkfsd> ${seed})
+    set_tests_properties(forkfsd_storage_gc_model_${seed} PROPERTIES TIMEOUT 240 LABELS metadata-regression)
+endforeach()
 
 add_test(NAME forkfsd_mount_harness COMMAND ${Python3_EXECUTABLE} -m unittest discover
     -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_mount_harness.py -v)

@@ -822,9 +822,6 @@ std::string LevelStore::collect(const std::string& input,const std::string& chec
     uint64_t kept_roots=0;for(const auto& [key,value]:roots)if(!key.starts_with(alias) || live.contains(id(value)))++kept_roots;
     uint64_t before_bytes=0;for(const auto& item:fs::directory_iterator(path))if(item.is_regular_file() && item.path().filename().string().starts_with("DATA-") && item.path().extension()==".seg")before_bytes+=item.file_size();
     const auto sequence=source->sequence_.load(),before_objects=source->objects_.load();
-    auto report=[&](uint64_t after_bytes,bool applied){return "{\"applied\":"+std::string(applied?"true":"false")+",\"sequence\":"+std::to_string(sequence)+",\"objects_before\":"+std::to_string(before_objects)+",\"objects_after\":"+std::to_string(live.size())+",\"roots_before\":"+std::to_string(roots.size())+",\"roots_after\":"+std::to_string(kept_roots)+",\"data_bytes_before\":"+std::to_string(before_bytes)+",\"data_bytes_after\":"+(applied?std::to_string(after_bytes):"null")+",\"replay_pins_all_objects\":"+(pinned?"true":"false")+",\"new_replay_generation\":"+(reset?"true":"false")+"}";};
-    if(dry_run)return report(0,false);
-    RepositoryBudget capacity=RepositoryBudget::load(path);
     // Estimate the exact unique chunks the copied generation will append.
     // Host-space reservation accounts for the temporary second generation;
     // max_data is enforced against staged DATA bytes by ObjectStore itself.
@@ -835,6 +832,26 @@ std::string LevelStore::collect(const std::string& input,const std::string& chec
             if(staged_chunks.insert(hash).second)staged_chunk_sizes.push_back(chunk.size());}
     }
     const uint64_t staging_reserve=ObjectStore::new_store_cost(staged_chunk_sizes);
+    // Planning uses precisely the same live-object/chunk order as the copy.
+    // Include record and rollover headers, not merely logical payload sizes.
+    // A dry run must not create a staging directory or clean old generations.
+    auto report=[&](uint64_t after_bytes,bool applied){
+        return "{\"applied\":"+std::string(applied?"true":"false")+
+            ",\"sequence\":"+std::to_string(sequence)+
+            ",\"objects_before\":"+std::to_string(before_objects)+
+            ",\"objects_after\":"+std::to_string(live.size())+
+            ",\"roots_before\":"+std::to_string(roots.size())+
+            ",\"roots_after\":"+std::to_string(kept_roots)+
+            ",\"data_bytes_before\":"+std::to_string(before_bytes)+
+            ",\"data_bytes_after\":"+(applied?std::to_string(after_bytes):"null")+
+            ",\"data_bytes_estimated_after\":"+std::to_string(staging_reserve)+
+            ",\"reclaimable_data_bytes\":"+std::to_string(before_bytes>staging_reserve?before_bytes-staging_reserve:0)+
+            ",\"temporary_data_bytes_required\":"+std::to_string(staging_reserve)+
+            ",\"replay_pins_all_objects\":"+(pinned?"true":"false")+
+            ",\"new_replay_generation\":"+(reset?"true":"false")+"}";
+    };
+    if(dry_run)return report(0,false);
+    RepositoryBudget capacity=RepositoryBudget::load(path);
     uint64_t host_reserve=staging_reserve;
     if(reset){
         uint64_t metadata=0;

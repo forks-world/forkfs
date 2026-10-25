@@ -68,7 +68,7 @@ and reconstructed object hashes are checked on read.
 Reference logs reconstruct canonical transaction bytes from immutable objects.
 This preserves the replay chain while keeping file payloads out of the LevelDB
 WAL, SST files and compaction. Retained logs therefore also retain their object
-and chunk dependencies; a future GC must include them as roots.
+and chunk dependencies; offline GC retains them with the replay generation.
 
 ## Commit and failure ordering
 
@@ -133,7 +133,8 @@ Fault builds cover crashes around append/sync/publication plus partial writes,
 sync failures and metadata-publication failures.
 
 The former namespace 256 KiB file limit is removed by [sparse large files](LARGE_FILES.md).
-GC, segment reclamation, compression, production remote synchronization and
+Offline GC and segment reclamation are implemented; see [ObjectStore GC](STORAGE_GC.md).
+Background incremental GC, compression, production remote synchronization and
 cloud-ack durability remain separate work. This implementation
 does not claim that the complete original filesystem plan is finished.
 

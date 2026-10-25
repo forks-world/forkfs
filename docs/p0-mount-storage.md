@@ -225,6 +225,15 @@ forkfsd gc STORE
 forkfsd gc STORE --checkpoint NEW_BASELINE_ARCHIVE
 ```
 
+`gc-plan` reports `data_bytes_estimated_after`, `reclaimable_data_bytes` and
+`temporary_data_bytes_required`. The estimate follows the same live-object and
+unique-chunk order as collection, including chunk records and segment headers.
+It predicts packed DATA file lengths; LevelDB, checkpoint archives, filesystem
+allocation and other temporary space are additional costs. `data_bytes_after`
+remains null until collection actually runs. Planning holds the offline owner
+lease and validates data, but never stages, exchanges or cleans generations.
+See [ObjectStore GC](STORAGE_GC.md) for retention and validation details.
+
 Run GC as the repository owner; another UID, including root, is refused before
 the repository is opened. The atomic exchange preserves the repository directory's
 POSIX mode and group ID; preservation of ACLs is not claimed. GC exclusively owns
