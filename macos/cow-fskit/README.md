@@ -226,3 +226,13 @@ The CoW namespace now supports byte-exact Unicode names without normalization or
 case folding. The raw RPC directory path preserves non-UTF8 names as well.
 See [filename encoding and limits](../../docs/FILENAMES.md); real-mounted Unicode
 behavior remains a signed deployment acceptance gate.
+
+## Signed mounted acceptance gate
+
+The extension now declares the FSKit module entitlement as well as its sandbox
+and RPC client permissions. Preflight verifies actual signed entitlements for
+both host and extension, matching teams and bundle identifiers; static plist
+checks do not substitute for these checks. Mounted acceptance now checks exact
+Unicode/control names, NFC/NFD and case behavior, cross-process fsync/rename,
+and pinned filesystem ID plus kernel volume UUID across the workload and cleanup.
+See [the executable gate and current environment blocker](../../docs/MOUNTED_ACCEPTANCE.md).
