@@ -26,6 +26,7 @@ void fault(const char* stage) {
 void Compaction::prepare() {
     need(!prepared_,"compaction task already prepared");NamespaceView::valid_name(world_);
     std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;
+    object_pin_=journal.pin_objects();
     auto key=history+"world/"+world_;
     if(journal.contains(key))head_=journal.root_object(key);
     auto generation_key=history+"generation/"+world_;

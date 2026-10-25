@@ -29,6 +29,7 @@ public:
     class DirectoryCursor {
         friend class Namespace;
         std::weak_ptr<const int> lifetime_;
+        std::shared_ptr<void> object_pin_;
         std::string view_,prefix_,after_;bool revision_=false,done_=false;
         uint64_t generation_=0;
         std::array<unsigned char,32> manifest_{};

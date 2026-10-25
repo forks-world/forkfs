@@ -1,5 +1,8 @@
 #include "revision.h"
 #include "rpc.h"
+#ifdef FORKFS_TEST_FAULTS
+#include <cstdlib>
+#endif
 #include "namespace.h"
 #include "json_string.h"
 #include <algorithm>
@@ -163,6 +166,17 @@ struct Activity {
 };
 std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string> args,bool manager){
     const auto op=args[0];std::string view="main";bool revision=false;
+    if(op=="gc-step" || op=="gc-start"){
+        need(manager,"operation requires manager connection");
+        need(args.size()<= (op=="gc-start"?4u:3u),"invalid GC arguments");
+        if(op=="gc-step")return store.collect_step(args.size()>1?number(args[1]):1024*1024,args.size()>2?number(args[2]):128)+"\n";
+        need(args.size()==1 || args.size()==4,"gc-start expects zero or three budgets");
+        return store.start_collection(args.size()>1?number(args[1]):1024*1024,args.size()>1?number(args[2]):128,args.size()>1?number(args[3]):64);
+    }
+    if(op=="gc-status" || op=="gc-stop"){
+        need(manager && args.size()==1,"GC control requires manager connection and no selectors");
+        if(op=="gc-stop")store.stop_collection();return store.collection_status();
+    }
     size_t count=2;
     if(op=="status" || op=="storage-profile" || op=="fs-init" || op=="fs-check" || op=="fs-worlds" || op=="fs-revisions" || op=="fs-compact" || op=="fs-statfs" || op=="fs-sync")count=1;
     if(op=="fs-write" || op=="fs-save" || op=="fs-rename" || op=="fs-link" || op=="fs-fork" || op=="fs-append" || op=="fs-truncate" || op=="fs-open" || op=="fs-happend" || op=="fs-htruncate" || op=="fs-hread-next" || op=="fs-hwrite-next" || op=="fs-symlink" || op=="fs-chmod" || op=="fs-setmtime" || op=="fs-hchmod" || op=="fs-hsetmtime" || op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-dir-entries-raw" || op=="fs-hlock")count=3;
@@ -258,7 +272,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="fs-statfs"){auto [total,available]=store.storage_space();return "{\"total_bytes\":"+std::to_string(total)+",\"available_bytes\":"+std::to_string(available)+"}\n";}
     // Mutations publish object data and metadata synchronously before returning.
     // Dispatch is serial: this ordered barrier must not trigger compaction.
-    if(op=="fs-sync")return "{\"synced\":true}\n";
+    if(op=="fs-sync"){store.sync();return "{\"synced\":true}\n";}
     if(op=="backup-catalog-start"){need(!args[3].empty(),"catalog destination is required");return store.start_backup(args[1],args[2],std::nullopt,args[3]);}
     if(op=="replay-catalog-start"){need(!args[4].empty(),"catalog destination is required");return store.start_backup(args[1],args[3],number(args[2]),args[4]);}
     if(op=="backup-catalog-retry")return store.retry_backup_catalog(args[1]);
@@ -479,7 +493,16 @@ void serve_rpc(int listener,Container& container,const volatile sig_atomic_t& st
                             need(!memcmp(p.in.data(),"FFRPC001",8),"unsupported RPC protocol");
                             auto length=u32(p.in,8);need(length>=4 && length<=limit,"invalid RPC request length");
                             need(p.in.size()<=header+length,"trailing RPC frame");
-                            if(p.in.size()==header+length)p.out=response(0,dispatch(container,sessions,decode(p.in),p.manager));
+                            if(p.in.size()==header+length){
+                                auto command=decode(p.in);
+#ifdef FORKFS_TEST_FAULTS
+                                // A completed dispatch can outlive the receive
+                                // deadline; deterministic regression, no sleep.
+                                if(std::getenv("FORKFS_TEST_RPC_EXPIRE_DURING_DISPATCH") && command[0]=="fs-check")
+                                    p.deadline=Clock::now()-std::chrono::milliseconds(1);
+#endif
+                                p.out=response(0,dispatch(container,sessions,std::move(command),p.manager));
+                            }
                         }
                     }catch(const std::system_error& e){
                         // Existing clients treat any nonzero status as failure.
@@ -487,6 +510,9 @@ void serve_rpc(int listener,Container& container,const volatile sig_atomic_t& st
                         p.out=response(posix?(0x80000000u|static_cast<uint32_t>(e.code().value())):1,e.what());
                     }catch(const std::exception& e){p.out=response(1,e.what());}
                 }
+                // Give a newly prepared response its own bounded send window,
+                // once, regardless of time spent executing the command.
+                if(!p.out.empty())p.deadline=Clock::now()+std::chrono::seconds(5);
             }
             if(!p.out.empty() && (events&POLLOUT)){
                 auto sent=send(p.fd,p.out.data()+p.sent,p.out.size()-p.sent,0);

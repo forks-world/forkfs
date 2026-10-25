@@ -248,6 +248,11 @@ target_link_libraries(forkfsd_object_store_test PRIVATE forkfs_metadata)
 add_test(NAME forkfsd_object_store COMMAND forkfsd_object_store_test)
 set_tests_properties(forkfsd_object_store PROPERTIES TIMEOUT 120 LABELS metadata-regression)
 
+add_executable(forkfsd_storage_gc_plan_test tests/storage_gc_plan.cpp)
+target_link_libraries(forkfsd_storage_gc_plan_test PRIVATE forkfs_metadata)
+add_test(NAME forkfsd_storage_gc_plan COMMAND forkfsd_storage_gc_plan_test)
+set_tests_properties(forkfsd_storage_gc_plan PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+
 add_executable(forkfsd_object_store_recovery_test tests/object_store_recovery.cpp
     journal.cpp level_store.cpp metadata_tree.cpp metadata_view.cpp)
 target_compile_definitions(forkfsd_object_store_recovery_test PRIVATE FORKFS_TEST_FAULTS=1)
@@ -331,6 +336,12 @@ add_test(NAME forkfsd_storage_gc COMMAND ${Python3_EXECUTABLE}
     $<TARGET_FILE:forkfsd_leveldb_fault_test>)
 set_tests_properties(forkfsd_storage_gc PROPERTIES TIMEOUT 240 LABELS metadata-regression)
 
+foreach(seed 1 173 4294967295)
+    add_test(NAME forkfsd_storage_gc_model_${seed} COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/storage_gc_model.py $<TARGET_FILE:forkfsd> ${seed})
+    set_tests_properties(forkfsd_storage_gc_model_${seed} PROPERTIES TIMEOUT 240 LABELS metadata-regression)
+endforeach()
+
 add_test(NAME forkfsd_mount_harness COMMAND ${Python3_EXECUTABLE} -m unittest discover
     -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_mount_harness.py -v)
 set_tests_properties(forkfsd_mount_harness PROPERTIES TIMEOUT 90 LABELS metadata-regression)
@@ -370,3 +381,38 @@ set_tests_properties(forkfsd_session_mounts PROPERTIES TIMEOUT 60 LABELS metadat
 add_test(NAME forkfsd_mount_lifecycle_unit COMMAND ${Python3_EXECUTABLE} -m unittest discover
     -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_mount_lifecycle.py -v)
 set_tests_properties(forkfsd_mount_lifecycle_unit PROPERTIES TIMEOUT 60 LABELS metadata-regression)
+
+add_executable(forkfsd_online_gc_test tests/online_gc.cpp)
+target_link_libraries(forkfsd_online_gc_test PRIVATE forkfs_namespace)
+add_test(NAME forkfsd_online_gc COMMAND forkfsd_online_gc_test)
+set_tests_properties(forkfsd_online_gc PROPERTIES TIMEOUT 240 LABELS metadata-regression)
+add_test(NAME forkfsd_online_gc_crash COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/online_gc_crash.py $<TARGET_FILE:forkfsd>
+    $<TARGET_FILE:forkfsd_leveldb_fault_test>)
+set_tests_properties(forkfsd_online_gc_crash PROPERTIES TIMEOUT 240 LABELS metadata-regression)
+
+# Backup snapshot barrier is compiled only into this deterministic concurrency test.
+add_executable(forkfsd_online_gc_concurrency_test tests/online_gc_concurrency.cpp
+    container.cpp backup_catalog.cpp namespace.cpp compaction.cpp maintenance.cpp
+    journal.cpp level_store.cpp metadata_tree.cpp metadata_view.cpp)
+target_compile_definitions(forkfsd_online_gc_concurrency_test PRIVATE FORKFS_TEST_BACKUP=1 FORKFS_TEST_GC=1)
+target_include_directories(forkfsd_online_gc_concurrency_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(forkfsd_online_gc_concurrency_test PRIVATE leveldb Threads::Threads)
+if(NOT APPLE)
+    target_link_libraries(forkfsd_online_gc_concurrency_test PRIVATE OpenSSL::Crypto)
+endif()
+add_test(NAME forkfsd_online_gc_concurrency COMMAND forkfsd_online_gc_concurrency_test)
+set_tests_properties(forkfsd_online_gc_concurrency PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+add_test(NAME forkfsd_online_gc_rpc COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/online_gc_rpc.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_online_gc_rpc PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+add_executable(forkfsd_online_gc_model_test tests/online_gc_model.cpp)
+target_link_libraries(forkfsd_online_gc_model_test PRIVATE forkfs_metadata)
+foreach(seed 1 173 4294967295)
+    add_test(NAME forkfsd_online_gc_model_${seed} COMMAND forkfsd_online_gc_model_test ${seed})
+    set_tests_properties(forkfsd_online_gc_model_${seed} PROPERTIES TIMEOUT 120 LABELS metadata-regression)
+endforeach()
+add_test(NAME forkfsd_rpc_dispatch_deadline COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/rpc_dispatch_deadline.py
+    $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
+set_tests_properties(forkfsd_rpc_dispatch_deadline PROPERTIES TIMEOUT 60 LABELS metadata-regression)

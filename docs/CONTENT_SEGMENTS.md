@@ -48,7 +48,7 @@ forkfs object hashes, not hashes of machine-local offsets.
 
 | Location | Encoding |
 | --- | --- |
-| `M/format` | `FFLDB005` without retained replay, `FFLDB006` with replay |
+| `M/format` | `FFLDB005` without retained replay, `FFLDB006` with replay; online segment retirement upgrades these to `FFLDB007`/`FFLDB008` |
 | `O/<object ID>` location index | `FFOBJ002`, total length u64, chunk count u32, ordered 32-byte chunk IDs |
 | `C/<chunk ID>` | segment ID u64, record offset u64, payload length u32 |
 | Segment header (48 bytes) | `FFSEG001`, segment ID u64, hash of preceding 16 bytes |
@@ -68,7 +68,7 @@ and reconstructed object hashes are checked on read.
 Reference logs reconstruct canonical transaction bytes from immutable objects.
 This preserves the replay chain while keeping file payloads out of the LevelDB
 WAL, SST files and compaction. Retained logs therefore also retain their object
-and chunk dependencies; a future GC must include them as roots.
+and chunk dependencies; offline GC retains them with the replay generation.
 
 ## Commit and failure ordering
 
@@ -133,7 +133,9 @@ Fault builds cover crashes around append/sync/publication plus partial writes,
 sync failures and metadata-publication failures.
 
 The former namespace 256 KiB file limit is removed by [sparse large files](LARGE_FILES.md).
-GC, segment reclamation, compression, production remote synchronization and
+Offline GC and segment reclamation are implemented; see [ObjectStore GC](STORAGE_GC.md).
+Online incremental GC is described in [ONLINE_GC.md](ONLINE_GC.md).
+Compression, production remote synchronization and
 cloud-ack durability remain separate work. This implementation
 does not claim that the complete original filesystem plan is finished.
 

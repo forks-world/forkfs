@@ -29,7 +29,7 @@ void NamespaceView::valid_name(const std::string& name) {
         }),"invalid World/revision name");
 }
 NamespaceView::~NamespaceView()=default;
-NamespaceView::NamespaceView(const Journal& journal,const std::string& name,bool revision,bool validate_root):journal_(journal) {
+NamespaceView::NamespaceView(const Journal& journal,const std::string& name,bool revision,bool validate_root):journal_(journal),object_pin_(journal.pin_objects()) {
     valid_name(name);
     legacy_=name=="main" && !revision && !journal.contains(history+"world/main");
     if(legacy_)return;
@@ -40,7 +40,7 @@ NamespaceView::NamespaceView(const Journal& journal,const std::string& name,bool
     } else manifest=journal.root_object(history+"world/"+name);
     load(manifest,validate_root);
 }
-NamespaceView::NamespaceView(const Journal& journal,const ObjectId& manifest):journal_(journal) {load(manifest,true);}
+NamespaceView::NamespaceView(const Journal& journal,const ObjectId& manifest):journal_(journal),object_pin_(journal.pin_objects()) {load(manifest,true);}
 void NamespaceView::load(const ObjectId& manifest,bool validate_root) {
     const auto& journal=journal_;
     auto b=journal.get_object(manifest);

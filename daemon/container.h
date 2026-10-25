@@ -7,6 +7,7 @@
 #include <set>
 #include <thread>
 #include <chrono>
+#include <atomic>
 #include "journal.h"
 
 namespace forkfs {
@@ -38,6 +39,11 @@ public:
     void stop_compaction();
     bool wait_compaction(std::chrono::milliseconds timeout=std::chrono::seconds(10));
     std::string compaction_error() const;
+    std::string collect_step(size_t max_copy_bytes=1024*1024,size_t max_objects=128);
+    std::string start_collection(size_t max_copy_bytes=1024*1024,size_t max_objects=128,size_t max_steps=64);
+    std::string collection_status() const;
+    void stop_collection();
+    void sync() const;
     void verify() const;
     void put(const std::string& key, const std::vector<unsigned char>& value);
     void transact(uint64_t expected_sequence, const std::vector<Mutation>& mutations);
@@ -56,6 +62,13 @@ private:
         std::string catalog;
         bool archive_durable=false;
     };
+    mutable std::mutex collection_mutex_;
+    std::mutex collection_lifecycle_mutex_;
+    std::thread collection_thread_;
+    std::atomic<bool> collection_stop_=false;
+    bool collection_active_=false;
+    uint64_t collection_steps_=0;
+    std::string collection_state_="idle",collection_last_="null",collection_error_;
     std::string backup_status_locked(const std::string& request_id) const;
     void stop_backup();
     void load_backup_tasks_locked();

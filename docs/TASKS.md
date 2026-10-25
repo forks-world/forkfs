@@ -6,6 +6,22 @@
 [`MACOS_VALIDATION.md`](MACOS_VALIDATION.md)。本文件按时间保留历史测试数量与测量结果;
 旧的 93/142 等通过数不代表当前测试总数,应以当前 CI/测试输出为准。
 
+## ObjectStore 物理 GC（2026-10-26）
+
+- [x] 离线标记/重打包：World、revision DAG、World base、稀疏内容与孤儿 inode 引用；
+  校验后原子交换完整仓库代次，稳定 owner lease 阻止与 daemon/备份/句柄并发。
+- [x] 保留 replay 依赖，显式 checkpoint 发布新 baseline 后才能释放旧代次依赖；
+  中断重试、冲突归档拒绝覆盖与遗留代次清理由现有故障回归覆盖。
+- [x] gc-plan 预估精确 packed DATA 大小、可回收字节与临时 DATA 副本大小。
+- [x] 独立 seeded namespace 模型回归，覆盖编辑、fork/revision、重复 GC、未提交尾部与
+  source-free checkpoint/delta 恢复；注册到 metadata-regression CI。
+- [x] 在线分段回收：通用 pin、目录 manifest lease/epoch、位置读者保护、发布 fence、
+  分批对象清理、chunk 搬迁与延迟删除；后台启动/查询/停止、配额/故障/并发回归通过。
+  本地 metadata-only Release 全部 103 项 CTest 通过；见 [ONLINE_GC.md](ONLINE_GC.md)。
+- [ ] 在线 GC 的增量标记与元数据扫描内存预算；当前完整标记在前台锁外执行。
+
+协议、空间估算和边界见 [STORAGE_GC.md](STORAGE_GC.md)。
+
 ## 受控挂载生命周期（2026-10-25）
 
 - [x] 持久挂载登记；World restore 在登记未退休时返回 EBUSY，覆盖撤销、过期和 daemon 重启。
@@ -23,7 +39,8 @@
 - [x] 64 KiB 数据块、六层稀疏 CoW 索引、范围读写、稀疏扩容及安全截断。
 - [x] 接入路径、inode、句柄、属性调整、open-unlink、revision/fork 和 FSKit 回调。
 - [x] 本地备份/replay 与同步 mock 遍历新内容引用；格式与请求预算见 [LARGE_FILES.md](LARGE_FILES.md)。
-- [ ] 真实挂载后的 Git/构建/编辑器大文件负载验收及物理 GC。
+- [x] 大文件稀疏引用的离线物理 GC；见 [STORAGE_GC.md](STORAGE_GC.md)。
+- [ ] 真实挂载后的 Git/构建/编辑器大文件负载验收。
 
 ## 用户态版本化文件系统整体设计（2026-10-08）
 

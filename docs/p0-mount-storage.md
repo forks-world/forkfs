@@ -219,11 +219,23 @@ this is not a bounded-memory cache or large-repository performance acceptance.
 
 ## Offline GC
 
+For bounded collection while the daemon remains open, see [Online GC](ONLINE_GC.md).
+The commands below retain the exclusive offline generation-exchange protocol.
+
 ```
 forkfsd gc-plan STORE
 forkfsd gc STORE
 forkfsd gc STORE --checkpoint NEW_BASELINE_ARCHIVE
 ```
+
+`gc-plan` reports `data_bytes_estimated_after`, `reclaimable_data_bytes` and
+`temporary_data_bytes_required`. The estimate follows the same live-object and
+unique-chunk order as collection, including chunk records and segment headers.
+It predicts packed DATA file lengths; LevelDB, checkpoint archives, filesystem
+allocation and other temporary space are additional costs. `data_bytes_after`
+remains null until collection actually runs. Planning holds the offline owner
+lease and validates data, but never stages, exchanges or cleans generations.
+See [ObjectStore GC](STORAGE_GC.md) for retention and validation details.
 
 Run GC as the repository owner; another UID, including root, is refused before
 the repository is opened. The atomic exchange preserves the repository directory's
