@@ -20,11 +20,34 @@ with tempfile.TemporaryDirectory(prefix='ff-online-catalog-') as directory:
         if stage:env['FORKFS_TEST_CRASH']=stage
         proc=subprocess.Popen([FAULT if stage else BIN,'serve',str(db),'--socket',str(endpoint),'--rpc'],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         deadline=time.monotonic()+10
-        while not endpoint.exists():
-            assert proc.poll() is None,proc.communicate()
-            assert time.monotonic()<deadline
+        last_probe=None
+        while True:
+            if proc.poll() is not None:
+                stdout,stderr=proc.communicate()
+                endpoint.unlink(missing_ok=True)
+                raise AssertionError(f'daemon exited before RPC readiness: {stdout!r} {stderr!r}')
+            if endpoint.exists():
+                try:
+                    probe=subprocess.run([BIN,'request',str(endpoint),'status'],capture_output=True,timeout=2)
+                    if probe.returncode==0:
+                        status=json.loads(probe.stdout)
+                        assert 'storage_engine' in status,status
+                        if proc.poll() is not None:
+                            stdout,stderr=proc.communicate()
+                            endpoint.unlink(missing_ok=True)
+                            raise AssertionError(f'daemon exited after binding: {stdout!r} {stderr!r}')
+                        return proc
+                    last_probe=(probe.returncode,probe.stdout,probe.stderr)
+                except subprocess.TimeoutExpired as error:
+                    last_probe=error
+            if time.monotonic()>=deadline:
+                if proc.poll() is None:proc.terminate()
+                try:stdout,stderr=proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill();stdout,stderr=proc.communicate()
+                endpoint.unlink(missing_ok=True)
+                raise AssertionError(f'daemon RPC readiness timed out; probe={last_probe!r}; logs={stdout!r} {stderr!r}')
             time.sleep(.01)
-        return proc
     def stop(proc):
         if proc.poll() is None:proc.terminate()
         proc.wait(timeout=30);endpoint.unlink(missing_ok=True)

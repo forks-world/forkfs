@@ -47,9 +47,23 @@ with tempfile.TemporaryDirectory(prefix='ff-filename-', dir='/tmp') as tmp:
 
     try:
         deadline = time.monotonic() + 5
-        while not endpoint.exists():
-            assert proc.poll() is None, proc.communicate()
-            assert time.monotonic() < deadline
+        while True:
+            if proc.poll() is not None:
+                stdout, stderr = proc.communicate()
+                raise AssertionError(f'RPC daemon exited before readiness: {stdout!r} {stderr!r}')
+            if endpoint.exists():
+                try:
+                    hello = json.loads(rpc('service-hello'))
+                except OSError as error:
+                    if error.errno not in (errno.ENOENT, errno.ECONNREFUSED):
+                        raise
+                else:
+                    assert 'protocol' in hello and 'generation' in hello, hello
+                    if proc.poll() is not None:
+                        stdout, stderr = proc.communicate()
+                        raise AssertionError(f'RPC daemon exited after binding: {stdout!r} {stderr!r}')
+                    break
+            assert time.monotonic() < deadline, 'RPC daemon readiness timed out'
             time.sleep(.01)
         rpc('fs-init')
         session = json.loads(rpc('session-open', 300000))['session']
