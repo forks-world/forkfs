@@ -11,8 +11,10 @@
 - [x] 持久挂载登记；World restore 在登记未退休时返回 EBUSY，覆盖撤销、过期和 daemon 重启。
 - [x] 不续租的管理检查、跨代登记查询和精确、幂等的退休协议。
 - [x] root receipt、策略/FSID 绑定、监护进程、UID 清理、fd 卸载、持久隔离和显式恢复实现。
-- [~] 隔离单测、RPC 回归和一次性 root CI；与真实挂载证据分开记录。
-- [ ] 签名 FSKit 上的卸载、脏页、旧 fd/mmap、Git/构建/Unicode 和隔离验收。
+- [x] 隔离单测、三平台 RPC 回归和一次性 root CI；与真实挂载证据分开记录。
+- [~] 签名/entitlement preflight 与真实挂载 Unicode、跨进程一致性、Git/构建工具已补齐；
+  本机无签名身份和实际 mount，真实卸载、脏页、旧 fd/mmap 与隔离验收尚待运行。
+  命令和证据边界见 [MOUNTED_ACCEPTANCE.md](MOUNTED_ACCEPTANCE.md)。
 
 设计与命令见 [MOUNT_LIFECYCLE.md](MOUNT_LIFECYCLE.md)。下方早期探索条目保留为历史，
 不能据此把已实现的 LevelDB/CoW 元数据误记为待实现的 SQLite 原型。

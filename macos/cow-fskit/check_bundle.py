@@ -27,9 +27,13 @@ attributes = info['EXAppExtensionAttributes']
 assert attributes['EXExtensionPrincipalClass'] == 'ForkRevisionFileSystem'
 assert attributes['FSShortName'] == 'forkrevision'
 assert attributes['FSRequiresSecurityScopedPathURLResources'] is True
-assert plist(source / 'Extension.entitlements')['com.apple.security.app-sandbox'] is True
+extension_entitlements = plist(source / 'Extension.entitlements')
+assert extension_entitlements['com.apple.security.app-sandbox'] is True
+assert extension_entitlements['com.apple.security.network.client'] is True
+assert extension_entitlements['com.apple.developer.fskit.fsmodule'] is True
 host = plist(source / 'Host.entitlements')
 assert host['com.apple.security.app-sandbox'] is True
 assert host['com.apple.security.files.user-selected.read-write'] is True
 assert host['com.apple.developer.fskit.mount'] is True
+assert host['com.apple.security.network.client'] is True
 print('unsigned host/extension layout and entitlement declarations verified')
