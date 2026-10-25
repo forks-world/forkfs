@@ -18,6 +18,14 @@ import agent_supervisor
 import mount_session
 
 
+def isolated_test_flags():
+    flags = SimpleNamespace(**{name: getattr(sys.flags, name) for name in dir(sys.flags)
+                               if not name.startswith('_')})
+    flags.isolated = True
+    flags.no_site = True
+    return flags
+
+
 class Probe:
     def __init__(self, events, mounted=()): self.events, self.mounted = events, set(mounted)
     def funmount_fd(self, fd): self.events.append('funmount'); self.mounted.clear()
@@ -181,7 +189,7 @@ class MountLifecycle(unittest.TestCase):
         death_read, death_write = os.pipe()
         ready_read, ready_write = os.pipe()
         result = []
-        flags = SimpleNamespace(isolated=True, no_site=True)
+        flags = isolated_test_flags()
         runtime = SimpleNamespace(ENTRY_ENV={}, admit_entry_environment=lambda: None,
                                   read_policy=lambda path: dict(worker_uid=70))
         lifecycle_module = SimpleNamespace(load_record=lambda path, runtime: dict(phase='active'))
@@ -273,7 +281,7 @@ class MountLifecycle(unittest.TestCase):
             lifecycle_module = SimpleNamespace(load_record=lambda *a: dict(phase='retired'), Guard=Guard)
             runtime = SimpleNamespace(ENTRY_ENV={}, admit_entry_environment=lambda: None,
                 read_policy=lambda path: policy, trusted_path=lambda *a, **k: None, no_acl=lambda *a: None)
-            flags = SimpleNamespace(isolated=True, no_site=True)
+            flags = isolated_test_flags()
             with patch.object(agent_supervisor.platform, 'system', return_value='Darwin'), \
                  patch.object(agent_supervisor.os, 'getuid', return_value=0), \
                  patch.object(agent_supervisor.os, 'geteuid', return_value=0), \
