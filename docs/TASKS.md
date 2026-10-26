@@ -20,7 +20,9 @@
   本地 metadata-only Release 全部 103 项 CTest 通过；见 [ONLINE_GC.md](ONLINE_GC.md)。
 - [x] 在线 GC 流式扫描元数据索引与保守内存记账预算；覆盖图校验器、删除候选和物理搬迁元数据，超预算安全拒绝。
   本地 metadata-only Release 全部 104 项 CTest 通过（93 项 metadata-regression）；含 8,000 对象流式扫描、早期/提交后超预算和重试回归。
-- [ ] 在线 GC 跨轮增量标记、磁盘工作队列和写入屏障；当前仍在每轮完整标记，持续写入时尚不保证逻辑回收进度。
+- [x] 在线 GC 跨轮增量标记、磁盘工作队列与发布/manifest 屏障；分批清扫对象和 chunk，重启丢弃旧队列安全重建，显式停止释放工作状态。
+  本地 metadata-only Release 全部 109 项 CTest 通过（98 项 metadata-regression，415.05 秒）；含持续写入回收、精确 ID 复活、三组 Namespace/fork/revision 随机模型、发布屏障前后进程崩溃与损坏 scratch 恢复。
+  完成判定仍需一轮无并发提交的干净扫描；物理索引扫描与严格延时/RSS 上限见 [ONLINE_GC.md](ONLINE_GC.md)。
 
 协议、空间估算和边界见 [STORAGE_GC.md](STORAGE_GC.md)。
 

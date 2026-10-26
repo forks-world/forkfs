@@ -15,15 +15,20 @@ forkfsd request /private/control/rpc.sock gc-status
 forkfsd request /private/control/rpc.sock gc-stop
 ```
 
-The explicit form is `gc-start COPY_BYTES MAX_OBJECTS MAX_STEPS [METADATA_BYTES]`. Defaults are
+The explicit form is `gc-start COPY_BYTES MAX_OBJECTS MAX_STEPS [METADATA_BYTES [MARK_WORK]]`. Defaults are
 1 MiB of chunk payload copying, 128 object deletions per step, 64 steps, and a
-64 MiB conservative metadata allocation budget per step.
+64 MiB conservative metadata allocation budget per step and 128 logical work
+units per step.
 Valid bounds are 65,580–8,388,608 copy bytes, 1–4,096 objects, 1–1,024 steps,
-and 65,536–268,435,456 metadata bytes.
+65,536–268,435,456 metadata bytes, and 1–65,536 logical work units.
 There is one GC worker per container. A second start while it is active fails.
 The background worker releases the foreground namespace lock during marking;
 normal filesystem requests can continue. A stop waits for the current step to
-finish, then joins the worker. Container destruction also joins it before closing
+finish, joins the worker and discards its partial mark so later foreground writes
+do not keep appending to a stopped queue. Budget-exhausted/blocked jobs retain
+cycle state and insertion barriers when a cycle exists (replay retention does
+not create one) for a later start within the same owner; use
+`gc-stop` to release that state explicitly. Container destruction also joins it before closing
 storage. Jobs are explicit maintenance requests and are not automatically resumed
 after restart.
 
@@ -32,7 +37,7 @@ states are `complete`, `blocked`, `budget_exhausted`, `stopped` or `failed`.
 `blocked` means the current step cannot make more progress, including retention
 by readers or replay. After those conditions change, start another job. Step
 statistics count committed work, not candidates that failed a publication fence.
-The step's `sequence` identifies its captured mark snapshot; concurrent writes
+The step's `sequence` identifies the cycle's initial snapshot; concurrent writes
 may have advanced the repository by the time the report is returned.
 
 For deterministic stepping and diagnostics:
@@ -42,8 +47,12 @@ forkfsd request /private/control/rpc.sock gc-step 1048576 128
 forkfsd gc-step /path/to/stopped/repository 1048576 128 67108864
 ```
 
-Both forms of `gc-step` accept an optional final `METADATA_BYTES` after the copy
-and object budgets.
+Both forms of `gc-step` accept `[METADATA_BYTES [MARK_WORK]]` after the copy
+and object budgets. RPC defaults to 128 work units. The standalone, exclusive
+command defaults to 65,536: its process cannot carry an in-memory cycle across
+invocations. An explicitly tiny standalone work budget may only mark, then lose
+that unfinished work when it exits. Use the daemon for incremental maintenance
+on large stores; standalone partial marks are never trusted by a later owner.
 
 The standalone command acquires the usual exclusive repository-owner lease and
 cannot open a store already owned by a daemon. The RPC `gc-step` is synchronous;
@@ -88,30 +97,68 @@ copies are released or evicted.
 
 ## Mark and publication fence
 
-A GC step captures roots, object descriptors, chunk locations, counters and the
-logical sequence from one LevelDB snapshot, together with registered manifest
-leases and their addition epoch under the pin mutex. It validates and follows the same
-typed World/revision DAG, base, inode and sparse-content references used by offline
-collection, including the closures of leased manifests. Generic named roots retain opaque payloads. Internal staging aliases
-do not independently keep unreachable objects alive.
+A cycle holds a LevelDB metadata snapshot defining the finite baseline root and
+object universe. Root scanning, existing manifest-lease seeding, graph marking,
+object sweeping, retained-object chunk-reference scanning and chunk sweeping
+advance across calls. `MARK_WORK` bounds the logical records/tasks processed in
+each call. Reports include `mark_work_done`, `mark_processed`, `mark_pending`,
+`mark_phase`, and `chunks_deleted`; zero deletions while `mark_pending` is true
+does not mean collection is complete. The background worker counts marking and
+scan work as progress. A round that deletes metadata or observes sequence changes
+requests a fresh follow-up round (`mark_phase: cycle_complete`); completion needs
+a clean round, so the last empty deletion batch cannot hide newer garbage.
+Continuous commits can prevent a complete status even while reclamation advances.
 
-Marking and candidate construction occur outside the writer lock. The step then
-acquires the writer and pin gates. It deletes candidates only when the captured
-sequence is still current, no external generic pins or physical-location readers exist, and retained
-replay is disabled. A newly registered manifest advances the addition epoch and
-also invalidates a stale mark, even when no transaction changed the sequence.
-Dropping a lease may conservatively retain extra objects until the next step.
-A concurrent commit invalidates the sweep; it does not cause
-GC to delete according to a stale graph. The collector mutex excludes another
-unlogged GC mutation throughout the complete step.
+A private `.gc-mark-*` directory contains a separate LevelDB with the typed FIFO
+frontier, task deduplication, object and chunk liveness, and effective legacy-run
+entries. It contains metadata only. Each task atomically publishes its child
+work, live marks and continuation with removal of the completed queue entry.
+Run entries, overlay resolution and radix children have resumable cursors;
+no full namespace map, live-object set or object/chunk index is kept in memory.
+World/revision/base and leased-manifest closures are traversed by type. Inline
+file data is distinguished from indexed content by its paired inode, including
+legacy direct roots and open-unlink orphans. Arbitrary named roots remain opaque;
+canonical staging aliases are weak roots. Every shadowed legacy PUT is retained
+as opaque data, while only effective inodes are interpreted.
 
-At most `MAX_OBJECTS` object rows and their staging aliases are deleted. Chunk
-references are calculated from **every remaining object descriptor**, including
-unreachable objects left for a later batch. Object rows, unused chunk indexes,
-aliases and durable counters change in one synchronous metadata batch. Cached
-bytes for deleted objects are evicted before admitting another reader, so an old
-cached ID cannot be republished as a dangling root. Collection neither advances
-the logical sequence nor creates a revision.
+Publication has an insertion barrier. While still holding the writer mutex,
+`publish` first synchronizes object bytes and commits the main metadata batch,
+then enqueues newly PUT roots and protects chunks of newly published objects in
+the active scratch generation before releasing the mutex. Manifest registration
+uses the same writer fence to enqueue its closure. Sweeping holds the writer and
+pin gates, checks that its generation remains active and the queue is empty, and
+pauses while any external generic pin or physical-location reader exists. It no
+longer requires an unchanged logical sequence: concurrent writes extend the
+frontier rather than restarting the baseline scan. A new root inserted between
+marking and sweeping prevents that sweep until its work is processed.
+
+Only objects in the initial snapshot are sweep candidates. Objects born during
+this cycle are left for a later generation. Once object sweeping finishes, a
+second metadata snapshot scans **every retained object descriptor** into the disk
+chunk-live set. Publication protects later new objects' chunks under the same
+writer fence. Only after this scan and all pending graph work finish can unused
+C rows be deleted. Object/alias/counter pruning and chunk pruning are separate
+synced metadata batches; unreachable chunks can therefore remain indexed after
+an interruption, but live object descriptors do not lose their chunks. Cached
+bytes for deleted objects are evicted before admitting another reader. No GC
+phase advances the logical sequence or creates a revision. Each writer-lock
+sweep interval visits at most 128 rows, independently of the requested work quota.
+
+The directory and queue are disposable, never a recovery authority. Normal cycle
+completion or owner destruction removes them; after acquiring the exclusive
+owner lease, reopening removes abandoned scratch paths, including links without
+following their targets, and starts a fresh scan. A crash in the gap between
+main publication and the scratch barrier is safe because that old generation is
+never reused. Scratch/read/validation failures invalidate the cycle before any
+further sweep. A scratch publication-barrier failure is reported to GC, while
+the already committed user write and owner remain usable. Uncertain main-store
+or DATA writes retain the existing poison-and-reopen behavior.
+
+This permits reclamation while ordinary writes continue when the marker drains
+work faster than those writes introduce it. It is not a guarantee against an
+unbounded adversarial rate of new reachable graphs; pending work can still
+outpace collection. Long-lived generic pins and replay retention also prevent
+logical sweeping.
 
 When replay is enabled, all indexed objects remain retained to preserve old
 baseline/delta contents and counters. Online cleaning can still reclaim unindexed
@@ -161,9 +208,9 @@ IDs, logical pins, retained directory cursors, orphan handles, replay retention
 and malformed retirement markers. `forkfsd_online_gc_concurrency` uses test-only
 barriers to hold a real backup snapshot while GC and foreground writes advance,
 then restores the archive without its source. A separate barrier commits a new
-reference after marking and requires the stale sweep to be rejected.
+reference after marking and requires the insertion barrier to defer that sweep.
 It also registers an old manifest lease after marking without changing the
-sequence, requiring the pin epoch to reject that sweep. Cursor tests require
+sequence, requiring its newly queued closure to defer that sweep. Cursor tests require
 unrelated garbage to be reclaimed while old cursor copies remain readable.
 Additional barriers poison the owner during marking (no further metadata may
 publish), and pause after the G/M-format batch commits but before its in-memory
@@ -207,60 +254,53 @@ separate bounded windows, with a deterministic fault-only regression rather than
 a sleep-based timing assertion. Linux, remote CI and signed mounted results for
 this change have not yet been obtained.
 
-Payload copying, object deletion and unlink counts are bounded per step.
-The R/O/C indexes are now scanned through LevelDB snapshot iterators; graph
-references use snapshot point lookups instead of duplicating those indexes in
-maps. Chunk pruning stores only hashes belonging to the bounded deletion batch,
-and removes a candidate hash from that set if any retained object uses it.
-Physical relocation retains only the copy-budget-sized prefix of source chunk
-references, while counting all source references before deciding retirement.
-Scans disable LevelDB block-cache filling to reduce cache pollution.
+Payload copying, object/chunk deletion and unlink counts are bounded per step.
+The typed frontier, deduplication and live marks live on disk. Scan cursors and
+phase state live in memory; both persist across calls within one owner, and all
+are discarded after reopening.
+The metadata charge includes a fixed 32 KiB marker/task working reserve plus
+bounded sweep and physical-compaction collections. The configured ceiling and
+charge remain available as `metadata_budget_bytes` and `metadata_bytes_charged`.
+A small ceiling may suffice for graph marking but refuse a later relocation
+batch; retry with a larger budget is supported. Charges are conservative, are
+not returned for temporary allocations within a step, and are not process RSS.
+Existing main/scratch LevelDB caches, memtables and iterator internals,
+ObjectStore caches, allocator overhead, and bounded codec/payload buffers remain
+outside this accounting. Scratch uses a 64 KiB requested write buffer, no block
+cache retention, no compression and a small open-file setting; it consumes disk
+space proportional to the graph and queued publication work. Long-lived
+metadata snapshots can also retain old main-LevelDB versions until the cycle
+finishes or is cancelled.
 
-GC-owned metadata has a shared conservative allocation budget. It covers mark and
-manifest sets, tree caches and entries, legacy run decoding, revision DAG frames
-and colors, extent verification sets, candidate batches, segment inventories and
-relocation metadata. `metadata_budget_bytes` and `metadata_bytes_charged` in each
-successful step expose the configured ceiling and the cumulative charge. Charges
-are conservative and are not returned when temporary collections are freed, so
-a step can be refused even when peak live metadata would fit. The budget does not
-represent process RSS: LevelDB's existing caches and snapshot/iterator internals,
-ObjectStore caches, allocator overhead and bounded codec/payload working buffers
-are outside this accounting. It is not a hard OS memory limit.
+`MARK_WORK` is a logical-work bound, not a syscall, byte-I/O or wall-clock bound.
+A bounded tree lookup can still read up to 256 nodes, and manifest validation
+can inspect up to 32 bounded legacy runs. Physical source selection, sealed-C
+reference validation and retirement checks still stream complete chunk indexes
+outside the writer lock; physical scan cursors are not persisted across calls.
+Stopping a worker waits for the current step. Strict latency/RSS bounds and
+adversarial producer backpressure are not established by this implementation.
 
-Exhaustion throws `GC metadata memory budget exceeded`; background jobs report
-`failed` with that error. Incomplete marking never authorizes a logical sweep.
-Budget refusal does not poison the owner: reads, writes and sync remain usable,
-and a later job can retry with a larger budget. A step contains several separately
-durable phases, so retirement cleanup or a completed prune/relocation may already
-have committed before a later phase exhausts its budget; refusal does not roll
-back that progress. The same crash recovery rules apply to it.
+Exhaustion throws `GC metadata memory budget exceeded`; a background job reports
+`failed`. Incomplete marking never authorizes a sweep. Earlier durable pruning
+or relocation phases may already have committed, so refusal does not roll back
+progress. Reads, writes and sync remain usable unless a separate main-store I/O
+failure has poisoned the owner. Reopen abandons scratch and safely rebuilds
+reachability from current committed roots.
 
-The metadata-budget regression uses opaque roots, a real namespace tree, an
-independently encoded legacy manifest, a 500-node revision DAG, and a 700-block
-indexed file. It checks safe early refusal, healthy read/write/sync afterward,
-large-budget retry, and refusal after a committed prune. A separate 8,000-object
-fixture holds a generic pin and checks that streaming the O/C indexes succeeds
-with a 64 KiB charge ceiling. RPC tests check bounds and propagation of an
-explicit budget to the background worker. These are accounting/correctness tests,
-not measured RSS or latency bounds. The local metadata-only Release build passed
-all 104 registered CTest tests (93 labeled metadata-regression) in 360.65 seconds
-after this change; this does not establish signed FSKit-mounted or remote CI
-acceptance.
+The incremental regression covers one-unit stepping, live writes during
+reclamation, exact-ID revival, pins, restart cleanup and corrupt scratch. A
+separate independent-encoder marker suite covers legacy overlays, raw magic-like
+content, direct and orphan inode pairs, directory/symlink roots, sparse extents,
+partial tails and malformed runs/extents. Existing seeded models and concurrent
+publication/lease/poison tests remain in the regression suite. Fault-only process
+crashes cover marking and sweep boundaries in addition to physical relocation.
 
-Full metadata scans and graph marking are still not incremental across steps.
-A graph that exceeds the configured maximum cannot yet be collected online;
-offline GC or a subsequent disk-backed marker is required. Sustained concurrent
-commits or long-lived generic pins can repeatedly defer object pruning; this
-version does not guarantee logical reclamation progress under continuous
-mutation. Segment movement and retirement have independent reader gates.
+The incremental implementation passed all 109 registered tests in the local
+metadata-only Release build (98 labeled metadata-regression, 415.05 seconds).
+This includes the independent codec fixtures, three seeded namespace models,
+background stop/restart, scratch-barrier failure without owner poisoning, and
+process crashes immediately before/after both main-root publication barriers.
 
-The next incremental design needs disposable disk-backed mark/queue state,
-per-codec resumable walkers, bounded scan cursors and a generation fence. Restart
-on logical sequence or manifest-addition-epoch changes preserves the present
-safety model but can starve. Progress during continuous mutation additionally
-requires a publication barrier covering newly exposed object closures; reusing
-old marks without that barrier is unsafe. No persistent partial mark is trusted
-by this implementation.
-
-No latency target, whole-machine power-loss guarantee, remote GC or true
-signed FSKit-mounted acceptance is established by these local tests.
+No signed FSKit-mounted acceptance, whole-machine power-loss guarantee, remote
+GC, process RSS ceiling or end-to-end latency target is established by these
+local tests. Earlier local counts above describe their historical changes.
