@@ -91,12 +91,18 @@ with tempfile.TemporaryDirectory(prefix='ff-online-gc-rpc-') as directory:
                      ('gc-start', '65580', '1'), ('gc-step', '0'),
                      ('gc-start', '65580', '1', '1', '65535'),
                      ('gc-start', '65580', '1', '1', '268435457'),
+                     ('gc-step', '65580', '1', '1048576', '0'),
+                     ('gc-step', '65580', '1', '1048576', '65537'),
                      ('gc-step', '65580', '1', '65535'),
                      ('gc-step', '65580', '1', '268435457')):
             request(*args, ok=False)
         # Session selectors cannot turn manager-only GC controls into session operations.
         request('gc-status', '--session', session, ok=False)
         request('gc-start', '--session', session, ok=False)
+
+        one_unit = obj('gc-step', '65580', '1', '1048576', '1')
+        assert one_unit['mark_work_done'] <= 1, one_unit
+        assert one_unit['mark_pending'] and one_unit['mark_phase'] != 'complete', one_unit
 
         metadata_budget = 1048576
         started = obj('gc-start', '65580', '4', '24', str(metadata_budget))
@@ -134,6 +140,7 @@ with tempfile.TemporaryDirectory(prefix='ff-online-gc-rpc-') as directory:
         again = obj('gc-start', '65580', '1', '1024')
         assert again['state'] in {'running', 'complete', 'blocked', 'budget_exhausted'}, again
         stopped = obj('gc-stop')
+        assert not list(db.glob('.gc-mark-*')), 'gc-stop retained scratch state'
         assert not stopped['active'] and stopped['state'] in {
             'stopped', 'complete', 'blocked', 'budget_exhausted'
         }, stopped

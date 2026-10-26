@@ -16,6 +16,81 @@ def run(executable, *args, env=None, code=0):
     assert result.returncode == code, (args, result.returncode, result.stdout, result.stderr)
     return result.stdout
 
+def crash_mark_barrier(stage, endpoint_name, root, baseline, payload, binary, fault_binary):
+    repository = root / stage
+    shutil.copytree(baseline, repository)
+    endpoint = root / endpoint_name
+    proc = subprocess.Popen([fault_binary, 'serve', str(repository), '--socket', str(endpoint), '--rpc'],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            env=dict(os.environ, FORKFS_TEST_CRASH=stage))
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            if proc.poll() is not None:
+                stdout, stderr = proc.communicate()
+                raise AssertionError(f'{stage} daemon exited before readiness: {stdout!r} {stderr!r}')
+            if endpoint.exists():
+                probe = subprocess.run([binary, 'request', str(endpoint), 'gc-status'],
+                                       capture_output=True, timeout=2)
+                if probe.returncode == 0:
+                    break
+            if time.monotonic() >= deadline:
+                raise AssertionError(f'{stage} daemon RPC readiness timed out')
+            time.sleep(.01)
+
+        report = json.loads(run(binary, 'request', endpoint,
+                                'gc-step', 65580, 4, 256*1024*1024, 1))
+        assert report['mark_work_done'] <= 1 and report['mark_pending'], report
+        expected = ('publish survived ' + stage).encode()
+        payload.write_bytes(expected)
+        # The socket may close before the client receives a response. The
+        # repository write must nevertheless have reached its durable point.
+        subprocess.run([binary, 'request', str(endpoint), 'fs-write', '/file', str(payload)],
+                       capture_output=True, timeout=10)
+        try:
+            code = proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.terminate();proc.wait(timeout=5)
+            raise AssertionError(f'{stage} hook did not terminate the daemon')
+        stdout, stderr = proc.communicate()
+        assert code == 86, (stage, code, stdout, stderr)
+
+        scratch_dirs = [path for path in repository.glob('.gc-mark-*') if path.is_dir()]
+        assert scratch_dirs, (stage, list(repository.glob('.gc-mark-*')))
+        scratch = scratch_dirs[0]
+        files = [path for path in scratch.rglob('*') if path.is_file()]
+        corrupt = files[0] if files else scratch / 'corrupt-leftover'
+        corrupt.write_bytes(b'corrupt mark database after process crash')
+
+        # First open discards the corrupted scratch tree and recovers the
+        # already committed namespace transaction.
+        run(binary, 'fs-check', repository)
+        assert run(binary, 'fs-cat', repository, '/file') == expected, stage
+        assert json.loads(run(binary, 'check', repository))['last_committed_seq'] > json.loads(
+            run(binary, 'check', baseline))['last_committed_seq']
+        assert not list(repository.glob('.gc-mark-*')), stage
+        for _ in range(512):
+            report = json.loads(run(binary, 'gc-step', repository, 65580, 16))
+            assert report['bytes_copied'] <= 65580, (stage, report)
+            if not report['mark_pending'] and report['pending_segments'] == 0 and \
+               report['objects_deleted'] == 0 and report['chunks_moved'] == 0 and \
+               report['segments_deleted'] == 0:
+                break
+        else:
+            raise AssertionError(f'{stage} recovery GC did not converge')
+        later = b'write after mark barrier crash recovery'
+        payload.write_bytes(later)
+        run(binary, 'fs-write', repository, '/file', payload)
+        assert run(binary, 'fs-cat', repository, '/file') == later
+        run(binary, 'fs-check', repository)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill();proc.wait();raise
+
 with tempfile.TemporaryDirectory(prefix='ff-online-gc-crash-') as temp:
     root = Path(temp)
     baseline = root / 'baseline'
@@ -34,7 +109,9 @@ with tempfile.TemporaryDirectory(prefix='ff-online-gc-crash-') as temp:
     # reached from a clean generation and recovery is checked independently.
     stages = ('gc_online_after_copy', 'gc_online_after_sync',
               'gc_online_before_publish', 'gc_online_after_publish',
-              'gc_online_after_unlink', 'gc_online_after_delete_sync')
+              'gc_online_after_unlink', 'gc_online_after_delete_sync',
+              'gc_mark_after_begin', 'gc_mark_after_task',
+              'gc_mark_before_sweep', 'gc_mark_after_sweep')
     for stage in stages:
         repository = root / stage
         shutil.copytree(baseline, repository)
@@ -54,16 +131,26 @@ with tempfile.TemporaryDirectory(prefix='ff-online-gc-crash-') as temp:
             run(binary, 'fs-check', repository)
         else:
             raise AssertionError(f'{stage} fault hook was not reached within bounded GC steps')
+        if stage.startswith('gc_mark_'):
+            scratch_dirs = [path for path in repository.glob('.gc-mark-*') if path.is_dir()]
+            assert scratch_dirs, (stage, list(repository.glob('.gc-mark-*')))
+            # Deliberately corrupt the abandoned mark database before the next
+            # owner opens the repository. Mark scratch is never recovery data.
+            scratch = scratch_dirs[0]
+            files = [path for path in scratch.rglob('*') if path.is_file()]
+            corrupt = files[0] if files else scratch / 'corrupt-leftover'
+            corrupt.write_bytes(b'corrupt abandoned incremental GC mark state')
         assert run(binary, 'fs-cat', repository, '/file') == current
+        assert not list(repository.glob('.gc-mark-*')), stage
         run(binary, 'fs-check', repository)
         assert json.loads(run(binary, 'check', repository))['last_committed_seq'] == sequence
         # Recovery may finish the interrupted step, and a later ordinary write
         # must append safely after it without reusing a committed sequence.
-        for _ in range(64):
+        for _ in range(512):
             report = json.loads(run(binary, 'gc-step', repository, 65580, 16))
             assert report['bytes_copied'] <= 65580, report
             run(binary, 'fs-check', repository)
-            if report['pending_segments'] == 0 and report['objects_deleted'] == 0 and report['chunks_moved'] == 0:
+            if not report['mark_pending'] and report['pending_segments'] == 0 and report['objects_deleted'] == 0 and report['chunks_moved'] == 0:
                 break
         else:
             raise AssertionError(f'GC retry did not converge after {stage}')
@@ -71,6 +158,9 @@ with tempfile.TemporaryDirectory(prefix='ff-online-gc-crash-') as temp:
         run(binary, 'fs-write', repository, '/file', payload)
         assert run(binary, 'fs-cat', repository, '/file') == payload.read_bytes()
         assert json.loads(run(binary, 'check', repository))['last_committed_seq'] > sequence
+
+    for index, stage in enumerate(('gc_mark_before_barrier', 'gc_mark_after_barrier')):
+        crash_mark_barrier(stage, f'p{index}.sock', root, baseline, payload, binary, fault_binary)
 
     # Failed data appends/syncs poison only the current owner. Reopen must keep
     # the committed namespace intact and allow bounded GC retries to finish.
@@ -82,11 +172,11 @@ with tempfile.TemporaryDirectory(prefix='ff-online-gc-crash-') as temp:
         assert run(binary, 'fs-cat', repository, '/file') == current
         run(binary, 'fs-check', repository)
         assert json.loads(run(binary, 'check', repository))['last_committed_seq'] == sequence
-        for _ in range(64):
+        for _ in range(512):
             report = json.loads(run(binary, 'gc-step', repository, 8*1024*1024, 128))
             assert report['bytes_copied'] <= 8*1024*1024, report
             run(binary, 'fs-check', repository)
-            if report['pending_segments'] == 0 and report['objects_deleted'] == 0 and report['chunks_moved'] == 0:
+            if not report['mark_pending'] and report['pending_segments'] == 0 and report['objects_deleted'] == 0 and report['chunks_moved'] == 0:
                 break
         else:
             raise AssertionError(f'GC did not recover from {failure} within bounded retries')
@@ -95,6 +185,77 @@ with tempfile.TemporaryDirectory(prefix='ff-online-gc-crash-') as temp:
         run(binary, 'fs-write', repository, '/file', payload)
         assert run(binary, 'fs-cat', repository, '/file') == future
         assert json.loads(run(binary, 'check', repository))['last_committed_seq'] > sequence
+
+    # An incremental root barrier failure invalidates only the active mark
+    # cycle. The foreground publish remains durable and the owner stays healthy.
+    repository = root / 'rpc-mark-barrier-error'
+    shutil.copytree(baseline, repository)
+    endpoint = root / 'b.sock'
+    proc = subprocess.Popen([fault_binary, 'serve', str(repository), '--socket', str(endpoint), '--rpc'],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            env=dict(os.environ, FORKFS_TEST_GC_ERROR='barrier'))
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            if proc.poll() is not None:
+                stdout, stderr = proc.communicate()
+                raise AssertionError(f'barrier-fault daemon exited before readiness: {stdout!r} {stderr!r}')
+            if endpoint.exists():
+                probe = subprocess.run([binary, 'request', str(endpoint), 'gc-status'],
+                                       capture_output=True, timeout=2)
+                if probe.returncode == 0:
+                    break
+            if time.monotonic() >= deadline:
+                raise AssertionError('barrier-fault daemon RPC readiness timed out')
+            time.sleep(.01)
+
+        def barrier_request(*args):
+            return run(binary, 'request', endpoint, *args)
+
+        mark = json.loads(barrier_request('gc-step', 65580, 4, 256*1024*1024, 1))
+        assert mark['mark_work_done'] <= 1 and mark['mark_pending'], mark
+        future = b'foreground write survives incremental mark barrier failure'
+        payload.write_bytes(future)
+        barrier_request('fs-write', '/file', payload)
+        barrier_request('fs-sync')
+        assert barrier_request('fs-cat', '/file') == future
+
+        started = json.loads(barrier_request('gc-start', 65580, 4, 24, 256*1024*1024, 1))
+        assert started['state'] in {'running', 'failed'}, started
+        deadline = time.monotonic() + 20
+        while True:
+            status = json.loads(barrier_request('gc-status'))
+            if not status['active']:
+                assert status['state'] == 'failed', status
+                assert 'GC publication barrier failed' in status['error'], status
+                break
+            assert time.monotonic() < deadline, status
+            time.sleep(.01)
+
+        later = b'write after mark barrier error is consumed'
+        payload.write_bytes(later)
+        barrier_request('fs-write', '/file', payload)
+        barrier_request('fs-sync')
+        assert barrier_request('fs-cat', '/file') == later
+        retry = json.loads(barrier_request('gc-start', 8*1024*1024, 128, 1024, 256*1024*1024, 65536))
+        assert retry['state'] in {'running', 'complete', 'budget_exhausted'}, retry
+        deadline = time.monotonic() + 30
+        while True:
+            status = json.loads(barrier_request('gc-status'))
+            if not status['active']:
+                assert status['state'] == 'complete', status
+                assert status['error'] == '', status
+                break
+            assert time.monotonic() < deadline, status
+            time.sleep(.01)
+        assert barrier_request('fs-cat', '/file') == later
+        barrier_request('fs-check')
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill(); proc.wait(); raise
 
     # The online worker's sync failure poisons the still-running owner. Querying
     # job status remains available, while storage operations must fail until
@@ -179,18 +340,22 @@ with tempfile.TemporaryDirectory(prefix='ff-online-gc-crash-') as temp:
         tail.write(bytes([0xB9]) * (1024 * 1024))
     before_bytes = sum(path.stat().st_size for path in data_files)
     run(binary, 'capacity', repository, before_bytes, 0)
-    first = json.loads(run(binary, 'gc-step', repository, 8*1024*1024, 4096))
-    assert first['segments_deleted'] > 0, first
-    assert first['bytes_copied'] <= 8*1024*1024, first
+    first = None
+    for _ in range(512):
+        first = json.loads(run(binary, 'gc-step', repository, 8*1024*1024, 4096))
+        assert first['bytes_copied'] <= 8*1024*1024, first
+        if first['segments_deleted'] > 0:
+            break
+    assert first and first['segments_deleted'] > 0, first
     assert sum(path.stat().st_size for path in repository.glob('DATA-*.seg')) < before_bytes
     assert run(binary, 'fs-cat', repository, '/file') == current
     run(binary, 'fs-check', repository)
     assert json.loads(run(binary, 'check', repository))['last_committed_seq'] == sequence
-    for _ in range(64):
+    for _ in range(512):
         report = json.loads(run(binary, 'gc-step', repository, 8*1024*1024, 4096))
         assert report['bytes_copied'] <= 8*1024*1024, report
         run(binary, 'fs-check', repository)
-        if report['pending_segments'] == 0 and report['objects_deleted'] == 0 and report['chunks_moved'] == 0 and report['segments_deleted'] == 0:
+        if not report['mark_pending'] and report['pending_segments'] == 0 and report['objects_deleted'] == 0 and report['chunks_moved'] == 0 and report['segments_deleted'] == 0:
             break
     else:
         raise AssertionError('quota-bounded online GC did not converge')

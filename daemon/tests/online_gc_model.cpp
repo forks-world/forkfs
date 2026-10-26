@@ -98,7 +98,7 @@ void run_seed(uint32_t seed){
                 MODEL_CHECK(report_number(report,"bytes_copied",seed,step)<=1024*1024);
                 MODEL_CHECK(report_number(report,"objects_deleted",seed,step)<=128);
                 verify_roots(store,roots,seed,step);store.verify();
-                if(report_number(report,"objects_deleted",seed,step)==0 &&
+                if(!report_bool(report,"mark_pending","true") && report_number(report,"objects_deleted",seed,step)==0 &&
                    report_number(report,"chunks_moved",seed,step)==0 &&
                    report_number(report,"segments_deleted",seed,step)==0 &&
                    report_number(report,"pending_segments",seed,step)==0){converged=true;break;}

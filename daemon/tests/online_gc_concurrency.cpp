@@ -215,9 +215,9 @@ int main(){
                 CHECK(store.sequence()==sequence);
                 CHECK(store.object(old_file_id)==old_file);store.verify();
                 lease.reset();
-                for(unsigned i=0;i<64;++i) {
+                for(unsigned i=0;i<512;++i) {
                     report=store.collect_step(8*1024*1024,128);store.verify();
-                    if(number(report,"objects_deleted")==0 && number(report,"chunks_moved")==0 &&
+                    if(report.find("\"mark_pending\":true")==std::string::npos && number(report,"objects_deleted")==0 && number(report,"chunks_moved")==0 &&
                        number(report,"segments_deleted")==0 && number(report,"pending_segments")==0)break;
                 }
                 bool reclaimed=false;try{(void)store.object(old_file_id);}catch(const std::exception&){reclaimed=true;}

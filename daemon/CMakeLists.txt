@@ -386,6 +386,10 @@ add_executable(forkfsd_online_gc_test tests/online_gc.cpp)
 target_link_libraries(forkfsd_online_gc_test PRIVATE forkfs_namespace)
 add_test(NAME forkfsd_online_gc COMMAND forkfsd_online_gc_test)
 set_tests_properties(forkfsd_online_gc PROPERTIES TIMEOUT 240 LABELS metadata-regression)
+add_executable(forkfsd_incremental_gc_test tests/incremental_gc.cpp)
+target_link_libraries(forkfsd_incremental_gc_test PRIVATE forkfs_namespace)
+add_test(NAME forkfsd_incremental_gc COMMAND forkfsd_incremental_gc_test)
+set_tests_properties(forkfsd_incremental_gc PROPERTIES TIMEOUT 180 LABELS metadata-regression)
 add_executable(forkfsd_gc_memory_budget_test tests/gc_memory_budget.cpp)
 target_link_libraries(forkfsd_gc_memory_budget_test PRIVATE forkfs_namespace)
 add_test(NAME forkfsd_gc_memory_budget COMMAND forkfsd_gc_memory_budget_test)
@@ -420,3 +424,17 @@ add_test(NAME forkfsd_rpc_dispatch_deadline COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/rpc_dispatch_deadline.py
     $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
 set_tests_properties(forkfsd_rpc_dispatch_deadline PROPERTIES TIMEOUT 60 LABELS metadata-regression)
+
+add_executable(forkfsd_gc_mark_test tests/gc_mark.cpp)
+target_link_libraries(forkfsd_gc_mark_test PRIVATE forkfs_metadata)
+add_test(NAME forkfsd_gc_mark COMMAND forkfsd_gc_mark_test)
+set_tests_properties(forkfsd_gc_mark PROPERTIES TIMEOUT 120 LABELS metadata-regression)
+
+add_executable(forkfsd_incremental_gc_namespace_test tests/incremental_gc_namespace.cpp)
+target_link_libraries(forkfsd_incremental_gc_namespace_test PRIVATE forkfs_namespace)
+foreach(seed 1 173 4294967295)
+    add_test(NAME forkfsd_incremental_gc_namespace_${seed}
+        COMMAND forkfsd_incremental_gc_namespace_test ${seed})
+    set_tests_properties(forkfsd_incremental_gc_namespace_${seed}
+        PROPERTIES TIMEOUT 180 LABELS metadata-regression)
+endforeach()

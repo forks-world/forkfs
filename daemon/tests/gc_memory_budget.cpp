@@ -17,14 +17,21 @@
 using namespace forkfs;
 namespace {
 #define CHECK(x) do { if (!(x)) throw std::runtime_error("line " + std::to_string(__LINE__) + ": " #x); } while (0)
-void budget_error(auto&& operation);
 uint64_t field(const std::string& json,const char* name) {
     std::regex expression(std::string("\\\"")+name+"\\\":([0-9]+)");
     std::smatch match;CHECK(std::regex_search(json,match,expression));return std::stoull(match[1]);
 }
+std::string string_field(const std::string& json,const char* name) {
+    std::regex expression(std::string("\\\"")+name+"\\\":\\\"([^\\\"]*)\\\"");
+    std::smatch match;CHECK(std::regex_search(json,match,expression));return match[1];
+}
 bool boolean_field(const std::string& json,const char* name) {
     std::regex expression(std::string("\\\"")+name+"\\\":(true|false)");
     std::smatch match;CHECK(std::regex_search(json,match,expression));return match[1]=="true";
+}
+bool gc_done(const std::string& report) {
+    return !boolean_field(report,"mark_pending")&&field(report,"objects_deleted")==0&&
+        field(report,"chunks_moved")==0&&field(report,"segments_deleted")==0&&field(report,"pending_segments")==0;
 }
 std::vector<unsigned char> value(size_t size,unsigned seed) {
     std::vector<unsigned char> out(size);
@@ -61,14 +68,15 @@ void check_recoverable_graph(const std::string& repo,const std::string& root_key
                              const std::vector<unsigned char>& sample) {
     LevelStore store(repo);const auto roots=store.roots();const auto objects=store.objects();const auto sequence=store.sequence();
     const auto root_id=Journal::object_id(root_value),sample_id=Journal::object_id(sample);
-    budget_error([&]{(void)store.collect_step(1024*1024,128,64*1024);});
+    auto bounded=store.collect_step(1024*1024,128,64*1024);
+    CHECK(field(bounded,"metadata_bytes_charged")<=field(bounded,"metadata_budget_bytes"));
     CHECK(store.roots()==roots&&store.objects()==objects&&store.sequence()==sequence);
     CHECK(store.root(root_key)==root_id&&store.object(sample_id)==sample);
     store.verify();store.barrier();store.transact(store.sequence(),{{"post-refusal",sample}});
     CHECK(store.object(sample_id)==sample);store.verify();
     for(unsigned i=0;i<512;++i){auto report=store.collect_step(1024*1024,128,256*1024*1024);
         CHECK(field(report,"metadata_bytes_charged")<=field(report,"metadata_budget_bytes"));
-        if(field(report,"objects_deleted")==0&&field(report,"chunks_moved")==0&&field(report,"segments_deleted")==0&&field(report,"pending_segments")==0)return;}
+        if(gc_done(report))return;}
     throw std::runtime_error("GC did not converge for metadata graph fixture");
 }
 
@@ -102,7 +110,7 @@ void extent_graph(const std::string& repo) {
         for(uint64_t i=0;i<count;++i){auto block=base+i;for(unsigned b=0;b<8;++b)chunk[i*FileContent::block_size+b]=static_cast<unsigned char>(block>>(b*8));chunk[i*FileContent::block_size+8]=static_cast<unsigned char>((block*29+17)%251);}
         file.write(base*FileContent::block_size,chunk);}
     std::vector<Bytes> extent_objects;auto descriptor=file.encode(extent_objects);
-    auto inode=Bytes(84,0);memcpy(inode.data(),"FFINOD05",8);inode[8]=1;inode[48]=2;
+    auto inode=Bytes(84,0);memcpy(inode.data(),"FFINOD05",8);inode[8]=1;inode[16]=1;inode[48]=2;
     const auto size=file.size();for(unsigned i=0;i<8;++i)inode[24+i]=static_cast<unsigned char>(size>>(i*8));
     auto root_payload=text(803);const auto inode_id=Journal::object_id(inode),content_id=Journal::object_id(descriptor),root_id=Journal::object_id(root_payload);
     const std::string ns("\0forkfs/",8);NamespaceView::Changes entries;entries[ns+"root"]=root_id;
@@ -122,18 +130,28 @@ void late_refusal(const std::string& repo) {
     std::vector<std::vector<unsigned char>> expected;
     for(unsigned i=0;i<96;++i){expected.push_back(value(4096,i+900));roots.push_back({"live/"+std::to_string(i),expected.back()});}
     auto stale=value(4096,1900);roots.push_back({"stale",stale});store.transact(store.sequence(),roots);
-    store.transact(store.sequence(),{{"stale",std::nullopt}});
+    std::vector<Mutation> dead;
+    for(unsigned i=0;i<800;++i){auto object=value(4096,i+2100);object[0]=i&0xff;object[1]=(i>>8)&0xff;dead.push_back({"dead/"+std::to_string(i),std::move(object)});}
+    store.transact(store.sequence(),dead);
+    std::vector<Mutation> erase{{"stale",std::nullopt}};for(unsigned i=0;i<800;++i)erase.push_back({"dead/"+std::to_string(i),std::nullopt});
+    store.transact(store.sequence(),erase);
     const auto before_objects=store.objects(),before_roots=store.roots();
-    budget_error([&]{(void)store.collect_step(1024*1024,128,64*1024);});
+    bool refused=false;
+    for(unsigned i=0;i<512&&!refused;++i){
+        try{auto report=store.collect_step(1024*1024,128,64*1024);
+            CHECK(field(report,"metadata_bytes_charged")<=field(report,"metadata_budget_bytes"));}
+        catch(const std::exception& error){refused=std::string(error.what()).find("GC metadata memory budget exceeded")!=std::string::npos;}
+    }
+    CHECK(refused);
     // The rooted objects and healthy engine survive even when collection had
     // already durably removed the stale object before the physical scan refused.
-    CHECK(store.objects()==before_objects-1&&store.roots()==before_roots);
+    CHECK(store.objects()<before_objects&&store.roots()==before_roots);
     for(unsigned i=0;i<expected.size();++i)CHECK(store.object(store.root("live/"+std::to_string(i)))==expected[i]);
     store.verify();store.barrier();store.transact(store.sequence(),{{"after-late-refusal",expected.front()}});
     CHECK(store.object(store.root("after-late-refusal"))==expected.front());store.verify();
     for(unsigned i=0;i<512;++i){auto report=store.collect_step(1024*1024,128,256*1024*1024);
         CHECK(field(report,"metadata_bytes_charged")<=field(report,"metadata_budget_bytes"));
-        if(field(report,"objects_deleted")==0&&field(report,"chunks_moved")==0&&field(report,"segments_deleted")==0&&field(report,"pending_segments")==0)break;
+        if(gc_done(report))break;
         if(i==511)throw std::runtime_error("GC did not converge after late budget refusal");}
     CHECK(store.object(store.root("live/95"))==expected.back());store.verify();
 }
@@ -153,12 +171,6 @@ void streaming_indexes(const std::string& repo) {
     CHECK(store.root("sample")==sample_id&&store.object(sample_id)==sample);
     store.verify();
 }
-void budget_error(auto&& operation) {
-    bool expected=false;
-    try { operation(); }
-    catch(const std::exception& error) { expected=std::string(error.what()).find("GC metadata memory budget exceeded")!=std::string::npos; }
-    CHECK(expected);
-}
 }
 
 int main() {
@@ -173,36 +185,38 @@ int main() {
             try{(void)store.collect_step(1024*1024,128,256*1024*1024+1);}catch(const std::exception&){high=true;}
             CHECK(low&&high);
 
-            // Keep a sizeable rooted set and create additional historical objects
-            // so the bounded mark walk has to account for real repository state.
+            // Keep a sizeable rooted set and create historical objects. Disk
+            // backed mark state lets this succeed within the fixed heap budget.
             constexpr unsigned rooted=700;
             for(unsigned i=0;i<rooted;++i)
                 store.transact(store.sequence(),{{"live-"+std::to_string(i),text(i)}});
-            const auto objects_before=store.objects();
             const auto sample_id=store.root("live-350");const auto sample=text(350);
             for(unsigned i=0;i<300;++i)
                 store.transact(store.sequence(),{{"waste",text(10000+i)}});
             const auto roots_before=store.roots();
-            const auto before_failure=store.objects();
+            const auto before_sweep=store.objects();
             const auto before_sequence=store.sequence();
-            budget_error([&]{(void)store.collect_step(1024*1024,128,64*1024);});
-            CHECK(store.objects()==before_failure && store.roots()==roots_before);
+            bool marked=false;
+            for(unsigned i=0;i<10000;++i){auto report=store.collect_step(1024*1024,128,64*1024,16);
+                CHECK(field(report,"metadata_bytes_charged")<=64*1024);
+                CHECK(field(report,"mark_work_done")<=16);
+                if(string_field(report,"mark_phase")=="objects"){marked=true;break;}}
+            CHECK(marked);
+            CHECK(store.roots()==roots_before);
             CHECK(store.sequence()==before_sequence && store.root("live-350")==sample_id);
             CHECK(store.object(sample_id)==sample);
             store.verify();store.barrier();
             store.transact(store.sequence(),{{"healthy-alias",std::nullopt,sample_id}});
             CHECK(store.root("healthy-alias")==sample_id);
-            CHECK(store.objects()>=objects_before);
-            bool failed_again=false;
-            try{(void)store.collect_step(1024*1024,128,256*1024*1024);}catch(const std::exception&){failed_again=true;}
-            CHECK(!failed_again);
-            for(unsigned i=0;i<256;++i) {
+            CHECK(store.object(sample_id)==sample);
+            bool drained=false;
+            for(unsigned i=0;i<2000;++i) {
                 auto report=store.collect_step(1024*1024,128,256*1024*1024);
                 CHECK(field(report,"metadata_bytes_charged")<=field(report,"metadata_budget_bytes"));
-                if(field(report,"objects_deleted")==0&&field(report,"chunks_moved")==0&&
-                   field(report,"segments_deleted")==0&&field(report,"pending_segments")==0)break;
-                if(i==255)throw std::runtime_error("GC did not drain garbage within bounded steps");
+                if(gc_done(report)){drained=true;break;}
             }
+            CHECK(drained);
+            CHECK(store.objects()<before_sweep);
             CHECK(store.root("live-350")==sample_id);CHECK(store.object(sample_id)==sample);
             store.verify();
         }
@@ -213,12 +227,20 @@ int main() {
         {
             Container container(fs_path);Namespace fs(container);fs.initialize();
             for(unsigned i=0;i<500;++i)fs.write("/dir-"+std::to_string(i),value(96,i));
-            budget_error([&]{(void)container.collect_step(1024*1024,128,64*1024);});
+            bool marked=false;
+            for(unsigned i=0;i<10000;++i){auto report=container.collect_step(1024*1024,128,64*1024,16);
+                CHECK(field(report,"metadata_bytes_charged")<=64*1024);
+                CHECK(field(report,"mark_work_done")<=16);
+                if(string_field(report,"mark_phase")=="objects"){marked=true;break;}}
+            CHECK(marked);
             container.verify();
             const auto probe=value(96,271);fs.write("/after-refusal",probe);
             CHECK(fs.read("/after-refusal")==probe);
-            auto report=container.collect_step(1024*1024,128,256*1024*1024);
-            CHECK(field(report,"metadata_bytes_charged")<=field(report,"metadata_budget_bytes"));
+            bool drained=false;
+            for(unsigned i=0;i<2000;++i){auto report=container.collect_step(1024*1024,128,256*1024*1024);
+                CHECK(field(report,"metadata_bytes_charged")<=field(report,"metadata_budget_bytes"));
+                if(gc_done(report)){drained=true;break;}}
+            CHECK(drained);
             container.verify();
         }
         legacy_graph(temp+"/legacy");
