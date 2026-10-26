@@ -43,7 +43,8 @@ public:
     static std::string collect(const std::string& path,const std::string& checkpoint="",bool dry_run=false);
     std::shared_ptr<void> pin_objects() const;
     std::shared_ptr<void> pin_manifest(const std::array<unsigned char,32>& id) const;
-    std::string collect_step(size_t max_copy_bytes=1024*1024,size_t max_objects=128);
+    std::string collect_step(size_t max_copy_bytes=1024*1024,size_t max_objects=128,
+                             size_t max_metadata_bytes=64*1024*1024);
     void barrier() const;
     struct CacheStats {uint64_t hits,misses;size_t charge;};
     CacheStats cache_stats() const;

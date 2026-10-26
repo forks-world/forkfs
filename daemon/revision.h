@@ -51,7 +51,7 @@ public:
     using Id=RevisionRecord::Id;
     struct Limit:std::runtime_error{Limit():std::runtime_error("revision DAG validation incomplete: resource limit") {}};
     RevisionDag(std::function<RevisionRecord(const Id&)> read,std::function<void(const Id&)> manifest,
-                size_t max_nodes=100000,size_t max_bytes=64*1024*1024):read_(std::move(read)),manifest_(std::move(manifest)),max_nodes_(max_nodes),max_bytes_(max_bytes){}
+                size_t max_nodes=100000,size_t max_bytes=64*1024*1024,std::function<void(size_t)> charge={}):read_(std::move(read)),manifest_(std::move(manifest)),charge_(std::move(charge)),max_nodes_(max_nodes),max_bytes_(max_bytes){}
     void validate(const Id& root){
         try{
             RevisionRecord::require(root!=Id{},"zero revision reference");
@@ -60,6 +60,7 @@ public:
                 if(colors_.size()>=max_nodes_)throw Limit();auto record=read_(id);record.validate(id);
                 const auto charge=sizeof(Frame)+32*record.parents.size()+64;
                 if(charge>max_bytes_-std::min(bytes_,max_bytes_))throw Limit();bytes_+=charge;
+                if(charge_)charge_(256+2*sizeof(Frame)+64*record.parents.size());
                 colors_[id]=1;manifest_(record.manifest);stack.push_back({id,std::move(record),0});
             };
             if(colors_.contains(root))return;enter(root);
@@ -71,7 +72,7 @@ public:
         }catch(...){colors_.clear();bytes_=0;throw;}
     }
 private:
-    std::function<RevisionRecord(const Id&)> read_;std::function<void(const Id&)> manifest_;
+    std::function<RevisionRecord(const Id&)> read_;std::function<void(const Id&)> manifest_;std::function<void(size_t)> charge_;
     std::map<Id,unsigned char> colors_;size_t bytes_=0,max_nodes_,max_bytes_;
 };
 }

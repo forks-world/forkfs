@@ -15,9 +15,11 @@ forkfsd request /private/control/rpc.sock gc-status
 forkfsd request /private/control/rpc.sock gc-stop
 ```
 
-The explicit form is `gc-start COPY_BYTES MAX_OBJECTS MAX_STEPS`. Defaults are
-1 MiB of chunk payload copying, 128 object deletions per step, and 64 steps.
-Valid bounds are 65,580–8,388,608 copy bytes, 1–4,096 objects and 1–1,024 steps.
+The explicit form is `gc-start COPY_BYTES MAX_OBJECTS MAX_STEPS [METADATA_BYTES]`. Defaults are
+1 MiB of chunk payload copying, 128 object deletions per step, 64 steps, and a
+64 MiB conservative metadata allocation budget per step.
+Valid bounds are 65,580–8,388,608 copy bytes, 1–4,096 objects, 1–1,024 steps,
+and 65,536–268,435,456 metadata bytes.
 There is one GC worker per container. A second start while it is active fails.
 The background worker releases the foreground namespace lock during marking;
 normal filesystem requests can continue. A stop waits for the current step to
@@ -37,8 +39,11 @@ For deterministic stepping and diagnostics:
 
 ```
 forkfsd request /private/control/rpc.sock gc-step 1048576 128
-forkfsd gc-step /path/to/stopped/repository 1048576 128
+forkfsd gc-step /path/to/stopped/repository 1048576 128 67108864
 ```
+
+Both forms of `gc-step` accept an optional final `METADATA_BYTES` after the copy
+and object budgets.
 
 The standalone command acquires the usual exclusive repository-owner lease and
 cannot open a store already owned by a daemon. The RPC `gc-step` is synchronous;
@@ -202,12 +207,60 @@ separate bounded windows, with a deterministic fault-only regression rather than
 a sleep-based timing assertion. Linux, remote CI and signed mounted results for
 this change have not yet been obtained.
 
-Payload copying, object deletion and unlink counts are bounded per step. Full
-metadata snapshot scans and graph marking are not yet incremental or bounded in
-memory; they run off the foreground namespace/writer lock but consume CPU and
-I/O. Sustained concurrent commits or long-lived generic pins can repeatedly defer
-object pruning; this version does not guarantee logical reclamation progress under
-continuous mutation. Segment movement and retirement have independent reader
-gates. Incremental marking with a mutation barrier is future work.
+Payload copying, object deletion and unlink counts are bounded per step.
+The R/O/C indexes are now scanned through LevelDB snapshot iterators; graph
+references use snapshot point lookups instead of duplicating those indexes in
+maps. Chunk pruning stores only hashes belonging to the bounded deletion batch,
+and removes a candidate hash from that set if any retained object uses it.
+Physical relocation retains only the copy-budget-sized prefix of source chunk
+references, while counting all source references before deciding retirement.
+Scans disable LevelDB block-cache filling to reduce cache pollution.
+
+GC-owned metadata has a shared conservative allocation budget. It covers mark and
+manifest sets, tree caches and entries, legacy run decoding, revision DAG frames
+and colors, extent verification sets, candidate batches, segment inventories and
+relocation metadata. `metadata_budget_bytes` and `metadata_bytes_charged` in each
+successful step expose the configured ceiling and the cumulative charge. Charges
+are conservative and are not returned when temporary collections are freed, so
+a step can be refused even when peak live metadata would fit. The budget does not
+represent process RSS: LevelDB's existing caches and snapshot/iterator internals,
+ObjectStore caches, allocator overhead and bounded codec/payload working buffers
+are outside this accounting. It is not a hard OS memory limit.
+
+Exhaustion throws `GC metadata memory budget exceeded`; background jobs report
+`failed` with that error. Incomplete marking never authorizes a logical sweep.
+Budget refusal does not poison the owner: reads, writes and sync remain usable,
+and a later job can retry with a larger budget. A step contains several separately
+durable phases, so retirement cleanup or a completed prune/relocation may already
+have committed before a later phase exhausts its budget; refusal does not roll
+back that progress. The same crash recovery rules apply to it.
+
+The metadata-budget regression uses opaque roots, a real namespace tree, an
+independently encoded legacy manifest, a 500-node revision DAG, and a 700-block
+indexed file. It checks safe early refusal, healthy read/write/sync afterward,
+large-budget retry, and refusal after a committed prune. A separate 8,000-object
+fixture holds a generic pin and checks that streaming the O/C indexes succeeds
+with a 64 KiB charge ceiling. RPC tests check bounds and propagation of an
+explicit budget to the background worker. These are accounting/correctness tests,
+not measured RSS or latency bounds. The local metadata-only Release build passed
+all 104 registered CTest tests (93 labeled metadata-regression) in 360.65 seconds
+after this change; this does not establish signed FSKit-mounted or remote CI
+acceptance.
+
+Full metadata scans and graph marking are still not incremental across steps.
+A graph that exceeds the configured maximum cannot yet be collected online;
+offline GC or a subsequent disk-backed marker is required. Sustained concurrent
+commits or long-lived generic pins can repeatedly defer object pruning; this
+version does not guarantee logical reclamation progress under continuous
+mutation. Segment movement and retirement have independent reader gates.
+
+The next incremental design needs disposable disk-backed mark/queue state,
+per-codec resumable walkers, bounded scan cursors and a generation fence. Restart
+on logical sequence or manifest-addition-epoch changes preserves the present
+safety model but can starve. Progress during continuous mutation additionally
+requires a publication barrier covering newly exposed object closures; reusing
+old marks without that barrier is unsafe. No persistent partial mark is trusted
+by this implementation.
+
 No latency target, whole-machine power-loss guarantee, remote GC or true
 signed FSKit-mounted acceptance is established by these local tests.

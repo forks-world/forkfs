@@ -12,6 +12,7 @@ public:
     using Bytes=std::vector<unsigned char>;
     using Map=std::map<std::string,ObjectId>;
     using Changes=std::map<std::string,std::optional<ObjectId>>;
+    using Charge=std::function<void(size_t)>;
     struct Frozen {Map flat;std::vector<Bytes> runs;};
     static constexpr size_t soft_run_limit=16, hard_run_limit=32;
     struct Plan {std::vector<Bytes> objects;Bytes manifest;size_t run_count;};
@@ -32,7 +33,7 @@ public:
     static void valid_name(const std::string& name);
     // Validate a frozen manifest through a snapshot/transaction overlay reader.
     static void verify_manifest(const std::function<Bytes(const ObjectId&)>& read,const ObjectId& manifest,
-                                const std::function<void(const std::string&,const ObjectId&)>& visit={});
+                                const std::function<void(const std::string&,const ObjectId&)>& visit={},Charge charge={});
 private:
     const Journal& journal_;
     std::shared_ptr<void> object_pin_;
@@ -44,7 +45,7 @@ private:
     std::optional<ObjectId> lookup(const std::string& key) const;
     const Changes& run(const ObjectId& id) const;
     void load(const ObjectId& manifest,bool validate_root);
-    static Changes decode_run(const Bytes& payload);
+    static Changes decode_run(const Bytes& payload,const Charge& charge={});
     static Bytes encode_run(const Changes& changes);
     static Bytes encode_manifest(const std::vector<ObjectId>& runs);
 };

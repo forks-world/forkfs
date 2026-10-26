@@ -39,8 +39,8 @@ public:
     void stop_compaction();
     bool wait_compaction(std::chrono::milliseconds timeout=std::chrono::seconds(10));
     std::string compaction_error() const;
-    std::string collect_step(size_t max_copy_bytes=1024*1024,size_t max_objects=128);
-    std::string start_collection(size_t max_copy_bytes=1024*1024,size_t max_objects=128,size_t max_steps=64);
+    std::string collect_step(size_t max_copy_bytes=1024*1024,size_t max_objects=128,size_t max_metadata_bytes=64*1024*1024);
+    std::string start_collection(size_t max_copy_bytes=1024*1024,size_t max_objects=128,size_t max_steps=64,size_t max_metadata_bytes=64*1024*1024);
     std::string collection_status() const;
     void stop_collection();
     void sync() const;

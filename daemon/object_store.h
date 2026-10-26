@@ -147,7 +147,7 @@ public:
     void admit_segment_header() const{if(capacity_.enabled())capacity_.admit(path_,data_usage_,header_size);}
     uint64_t active_segment() const{return segment_;}
     void seal_and_rotate(){create_next_segment();}
-    std::vector<std::pair<uint64_t,uint64_t>> segments() const {
+    std::vector<std::pair<uint64_t,uint64_t>> segments(const std::function<void(size_t)>& charge={}) const {
         std::vector<std::pair<uint64_t,uint64_t>> out;
         for(const auto& entry:std::filesystem::directory_iterator(path_)){auto name=entry.path().filename().string();
             if(!name.starts_with("DATA-") || !name.ends_with(".seg"))continue;auto digits=name.substr(5,name.size()-9);
@@ -156,7 +156,7 @@ public:
             struct stat st{};need(lstat(entry.path().c_str(),&st)==0 && S_ISREG(st.st_mode) && st.st_size>=int64_t(header_size),"invalid data segment type/size");
             need(uint64_t(st.st_size)<=segment_limit,"invalid data segment size");Fd fd{open(entry.path().c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK)};
             if(fd.fd<0)throw std::system_error(errno,std::generic_category(),"open data segment");need(read_at(fd.fd,header_size,0)==header(id),"data segment header mismatch");
-            out.emplace_back(id,uint64_t(st.st_size));}
+            if(charge)charge(64);out.emplace_back(id,uint64_t(st.st_size));}
         std::sort(out.begin(),out.end());return out;
     }
     std::string relocate(const std::string& hash,const std::string& data){return append(hash,data);}

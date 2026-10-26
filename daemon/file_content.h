@@ -54,7 +54,7 @@ public:
         std::set<Id> seen;collect(root_,5,objects,seen);
         Bytes result(48,0);memcpy(result.data(),"FFFILE01",8);integer(result.data()+8,size_,8);std::copy(root_.begin(),root_.end(),result.begin()+16);return result;
     }
-    void verify() const {if(indexed_){std::set<std::pair<Id,unsigned>> verified;verify_node(root_,5,0,verified);}}
+    void verify(std::function<void(size_t)> charge={}) const {if(indexed_){std::set<std::pair<Id,unsigned>> verified;verify_node(root_,5,0,verified,charge);}}
 private:
     using Node=std::map<unsigned,Id>;
     Reader read_;uint64_t size_;bool indexed_;Bytes raw_;Id root_{};
@@ -94,13 +94,13 @@ private:
         if(id==Id{} || !pending_.contains(id) || !seen.insert(id).second)return;
         for(const auto& [slot,child]:node(id,level)){(void)slot;if(level)collect(child,level-1,out,seen);else if(pending_.contains(child) && seen.insert(child).second)out.push_back(pending_.at(child));}out.push_back(pending_.at(id));
     }
-    void verify_node(const Id& id,unsigned level,uint64_t first,std::set<std::pair<Id,unsigned>>& verified) const {
+    void verify_node(const Id& id,unsigned level,uint64_t first,std::set<std::pair<Id,unsigned>>& verified,const std::function<void(size_t)>& charge) const {
         auto span=uint64_t(1)<<(8*(level+1));auto blocks=size_/block_size;bool full=first<=blocks && span<=blocks-first;
         if(full && verified.contains({id,level}))return;
         for(const auto& [slot,child]:node(id,level)){auto start=first+(uint64_t(slot)<<(8*level));require(start<=(size_?((size_-1)/block_size):0) && size_,"extent beyond EOF");
-            if(level)verify_node(child,level-1,start,verified);else {auto b=payload(child);require(b.size()==block_size && !std::all_of(b.begin(),b.end(),[](auto c){return c==0;}),"invalid extent data");
+            if(level)verify_node(child,level-1,start,verified,charge);else {auto b=payload(child);require(b.size()==block_size && !std::all_of(b.begin(),b.end(),[](auto c){return c==0;}),"invalid extent data");
                 if(start==size_/block_size && size_%block_size)require(std::all_of(b.begin()+size_%block_size,b.end(),[](auto c){return c==0;}),"nonzero extent tail");}}
-        if(full)verified.emplace(id,level);
+        if(full && !verified.contains({id,level})){if(charge)charge(sizeof(std::pair<Id,unsigned>)+sizeof(void*)*4+64);verified.emplace(id,level);}
     }
 };
 }

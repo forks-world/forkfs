@@ -88,13 +88,18 @@ with tempfile.TemporaryDirectory(prefix='ff-online-gc-rpc-') as directory:
         for args in (('gc-start', '0', '1', '1'), ('gc-start', '-1', '1', '1'),
                      ('gc-start', '65580', '0', '1'), ('gc-start', '8388609', '1', '1'),
                      ('gc-start', '65580', '4097', '1'), ('gc-start', '65580', '1', '1025'),
-                     ('gc-start', '65580', '1'), ('gc-step', '0')):
+                     ('gc-start', '65580', '1'), ('gc-step', '0'),
+                     ('gc-start', '65580', '1', '1', '65535'),
+                     ('gc-start', '65580', '1', '1', '268435457'),
+                     ('gc-step', '65580', '1', '65535'),
+                     ('gc-step', '65580', '1', '268435457')):
             request(*args, ok=False)
         # Session selectors cannot turn manager-only GC controls into session operations.
         request('gc-status', '--session', session, ok=False)
         request('gc-start', '--session', session, ok=False)
 
-        started = obj('gc-start', '65580', '4', '24')
+        metadata_budget = 1048576
+        started = obj('gc-start', '65580', '4', '24', str(metadata_budget))
         assert started['state'] in {'running', 'complete', 'blocked', 'budget_exhausted'}, started
         assert started['error'] == '', started
 
@@ -115,6 +120,8 @@ with tempfile.TemporaryDirectory(prefix='ff-online-gc-rpc-') as directory:
 
         completed = finish_gc()
         assert completed['steps'] > 0, completed
+        assert completed['last_step']['metadata_budget_bytes'] == metadata_budget, completed
+        assert completed['last_step']['metadata_bytes_charged'] <= metadata_budget, completed
         after = obj('status')['last_committed_seq']
         assert after > before, (before, after)
         assert request('fs-cat', '/file') == final_value

@@ -386,6 +386,10 @@ add_executable(forkfsd_online_gc_test tests/online_gc.cpp)
 target_link_libraries(forkfsd_online_gc_test PRIVATE forkfs_namespace)
 add_test(NAME forkfsd_online_gc COMMAND forkfsd_online_gc_test)
 set_tests_properties(forkfsd_online_gc PROPERTIES TIMEOUT 240 LABELS metadata-regression)
+add_executable(forkfsd_gc_memory_budget_test tests/gc_memory_budget.cpp)
+target_link_libraries(forkfsd_gc_memory_budget_test PRIVATE forkfs_namespace)
+add_test(NAME forkfsd_gc_memory_budget COMMAND forkfsd_gc_memory_budget_test)
+set_tests_properties(forkfsd_gc_memory_budget PROPERTIES TIMEOUT 120 LABELS metadata-regression)
 add_test(NAME forkfsd_online_gc_crash COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/online_gc_crash.py $<TARGET_FILE:forkfsd>
     $<TARGET_FILE:forkfsd_leveldb_fault_test>)
