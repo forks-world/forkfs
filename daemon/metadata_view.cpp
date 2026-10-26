@@ -67,7 +67,7 @@ const NamespaceView::Changes& NamespaceView::run(const Id& id) const {
     auto b=journal_.get_object(id);
     return cache_.emplace(id,decode_run(b)).first->second;
 }
-NamespaceView::Changes NamespaceView::decode_run(const Bytes& b) {
+NamespaceView::Changes NamespaceView::decode_run(const Bytes& b,const Charge& charge) {
     bool full=magic(b,"FFMAN001");need(full || magic(b,"FFRUN001"),"unsupported sorted run");
     auto count=u32(b,8);need(count>0 && count<=(b.size()-12)/(full?44:48),"invalid sorted run count");
     Changes result;size_t at=12;std::string previous;
@@ -78,6 +78,7 @@ NamespaceView::Changes NamespaceView::decode_run(const Bytes& b) {
         std::string key(b.begin()+at,b.begin()+at+n);at+=n;
         Id target{};std::copy_n(b.data()+at,32,target.begin());at+=32;
         need(key.starts_with(prefix) && (i==0 || previous<key),"unordered run keys");previous=key;
+        if(charge)charge(sizeof(std::pair<const std::string,std::optional<Id>>)+sizeof(void*)*4+64+key.size());
         if(op==1){need(target!=Id{},"zero PUT reference");result.emplace(key,target);}
         else {need(target==Id{},"nonzero tombstone reference");result.emplace(key,std::nullopt);}
     }
@@ -204,24 +205,26 @@ NamespaceView::Plan NamespaceView::compact_frozen(const Frozen& input) {
 }
 
 namespace forkfs {
-void NamespaceView::verify_manifest(const std::function<Bytes(const ObjectId&)>& read,const ObjectId& manifest,const std::function<void(const std::string&,const ObjectId&)>& visit) {
+void NamespaceView::verify_manifest(const std::function<Bytes(const ObjectId&)>& read,const ObjectId& manifest,const std::function<void(const std::string&,const ObjectId&)>& visit,Charge charge) {
     auto b=read(manifest);Map entries;
     if(b.size()==40 && !memcmp(b.data(),"FFTREE01",8)) {
         ObjectId root{};std::copy_n(b.data()+8,32,root.begin());need(root!=ObjectId{},"empty metadata tree root");
-        entries=MetadataTree(read,root).entries();
+        entries=MetadataTree(read,root,nullptr,charge).entries();
     } else {
+        if(charge)charge(512);
         std::vector<ObjectId> runs;
         if(magic(b,"FFMAN001"))runs.push_back(manifest);
         else {
             need(magic(b,"FFMAN002"),"unsupported namespace manifest");auto count=u32(b,8);
             need(count>0 && count<=32 && b.size()==12+uint64_t(count)*32,"invalid manifest run count");std::set<ObjectId> unique;
-            for(uint32_t i=0;i<count;++i){ObjectId id{};std::copy_n(b.data()+12+i*32,32,id.begin());need(id!=ObjectId{} && unique.insert(id).second,"duplicate or zero run reference");runs.push_back(id);}
+            for(uint32_t i=0;i<count;++i){ObjectId id{};std::copy_n(b.data()+12+i*32,32,id.begin());need(id!=ObjectId{},"duplicate or zero run reference");if(charge)charge(sizeof(ObjectId)+sizeof(void*)*4+64);need(unique.insert(id).second,"duplicate or zero run reference");runs.push_back(id);}
         }
         std::set<std::string> seen;
-        for(const auto& run:runs)for(const auto& [key,value]:decode_run(read(run))){
+        for(const auto& run:runs){auto decoded=decode_run(read(run),charge);
+        for(const auto& [key,value]:decoded){
             if(value)(void)read(*value); // Even a shadowed PUT must remain a valid reference.
-            if(seen.insert(key).second && value)entries.emplace(key,*value);
-        }
+            if(!seen.contains(key)){if(charge)charge(sizeof(std::string)+sizeof(void*)*4+64+key.size());seen.insert(key);if(value){if(charge)charge(sizeof(std::pair<const std::string,ObjectId>)+sizeof(void*)*4+64+key.size());entries.emplace(key,*value);}}
+        }}
     }
     need(entries.contains(prefix+"root"),"manifest missing namespace root");
     for(const auto& [key,id]:entries){
@@ -231,7 +234,7 @@ void NamespaceView::verify_manifest(const std::function<Bytes(const ObjectId&)>&
             need(bytes.size()>=84 && bytes.size()<=128*1024 && u32(bytes,8)==1 && u32(bytes,48)==2,"invalid extent inode");
             auto content=entries.find(prefix+"content/"+key.substr((prefix+"inode/").size()));need(content!=entries.end(),"extent file content missing");
             uint64_t size=0;for(unsigned i=0;i<8;++i)size|=uint64_t(bytes[24+i])<<(8*i);
-            FileContent(read,read(content->second),size,true).verify();
+            FileContent(read,read(content->second),size,true).verify(charge);
         }
     }
 }

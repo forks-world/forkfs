@@ -24,7 +24,7 @@ const MetadataTree::Node& MetadataTree::node(const Id& id) const {
     Node result;result.key.assign(b.begin()+108,b.end());
     need(valid_key(result.key),"invalid metadata node key");
     memcpy(result.value.data(),b.data()+12,32);memcpy(result.left.data(),b.data()+44,32);memcpy(result.right.data(),b.data()+76,32);
-    need(result.value!=Id{},"zero metadata value reference");return cache_.emplace(id,std::move(result)).first->second;
+    need(result.value!=Id{},"zero metadata value reference");if(charge_)charge_(sizeof(std::pair<const Id,Node>)+sizeof(void*)*4+64+result.key.size());return cache_.emplace(id,std::move(result)).first->second;
 }
 bool MetadataTree::higher(const Node& a,const Node& b) {
     auto pa=priority(a.key),pb=priority(b.key);return pa==pb?a.key>b.key:pa>pb;
@@ -145,11 +145,11 @@ std::vector<std::string> MetadataTree::page(const std::string& prefix,const std:
 MetadataTree::Map MetadataTree::entries() const {
     Map result;std::set<Id> visited;
     std::function<void(Id,const std::string*,const std::string*,unsigned)> walk=[&](Id id,const std::string* lo,const std::string* hi,unsigned depth) {
-        if(id==Id{})return;need(depth<256 && visited.insert(id).second,"metadata tree cycle/depth");const auto& n=node(id);
+        if(id==Id{})return;need(depth<256 && !visited.contains(id),"metadata tree cycle/depth");if(charge_)charge_(sizeof(Id)+sizeof(void*)*4+64);visited.insert(id);const auto& n=node(id);
         need((!lo || *lo<n.key) && (!hi || n.key<*hi),"metadata tree ordering mismatch");
         if(n.left!=Id{})need(!higher(node(n.left),n),"metadata tree heap mismatch");
         if(n.right!=Id{})need(!higher(node(n.right),n),"metadata tree heap mismatch");
-        walk(n.left,lo,&n.key,depth+1);result.emplace(n.key,n.value);walk(n.right,&n.key,hi,depth+1);
+        walk(n.left,lo,&n.key,depth+1);if(charge_)charge_(sizeof(std::pair<const std::string,Id>)+sizeof(void*)*4+64+n.key.size());result.emplace(n.key,n.value);walk(n.right,&n.key,hi,depth+1);
     };
     walk(root_,nullptr,nullptr,0);return result;
 }

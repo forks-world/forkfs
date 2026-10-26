@@ -18,7 +18,9 @@
 - [x] 在线分段回收：通用 pin、目录 manifest lease/epoch、位置读者保护、发布 fence、
   分批对象清理、chunk 搬迁与延迟删除；后台启动/查询/停止、配额/故障/并发回归通过。
   本地 metadata-only Release 全部 103 项 CTest 通过；见 [ONLINE_GC.md](ONLINE_GC.md)。
-- [ ] 在线 GC 的增量标记与元数据扫描内存预算；当前完整标记在前台锁外执行。
+- [x] 在线 GC 流式扫描元数据索引与保守内存记账预算；覆盖图校验器、删除候选和物理搬迁元数据，超预算安全拒绝。
+  本地 metadata-only Release 全部 104 项 CTest 通过（93 项 metadata-regression）；含 8,000 对象流式扫描、早期/提交后超预算和重试回归。
+- [ ] 在线 GC 跨轮增量标记、磁盘工作队列和写入屏障；当前仍在每轮完整标记，持续写入时尚不保证逻辑回收进度。
 
 协议、空间估算和边界见 [STORAGE_GC.md](STORAGE_GC.md)。
 
