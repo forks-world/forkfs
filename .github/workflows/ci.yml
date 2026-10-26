@@ -16,7 +16,9 @@ jobs:
   release:
     name: Release (macOS arm64)
     runs-on: macos-15
-    timeout-minutes: 60
+    # The full Git test can take about 45 minutes; leave room for remaining
+    # regressions, the build, and runner-time variance under the job limit.
+    timeout-minutes: 90
     steps:
       - name: Check out source
         uses: actions/checkout@v7.0.1
