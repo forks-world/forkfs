@@ -35,7 +35,8 @@ public:
     void compact();
     std::shared_ptr<void> pin_objects() const;
     std::shared_ptr<void> pin_manifest(const std::array<unsigned char,32>& manifest) const;
-    std::string collect_step(size_t max_copy_bytes=1024*1024,size_t max_objects=128,size_t max_metadata_bytes=64*1024*1024);
+    std::string collect_step(size_t max_copy_bytes=1024*1024,size_t max_objects=128,size_t max_metadata_bytes=64*1024*1024,size_t mark_work=128);
+    void cancel_collection();
     void barrier() const;
     std::pair<uint64_t,uint64_t> space() const;
     std::string metrics_json(bool detailed=false) const;

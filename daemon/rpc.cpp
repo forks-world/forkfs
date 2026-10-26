@@ -168,10 +168,10 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     const auto op=args[0];std::string view="main";bool revision=false;
     if(op=="gc-step" || op=="gc-start"){
         need(manager,"operation requires manager connection");
-        need(args.size()<= (op=="gc-start"?5u:4u),"invalid GC arguments");
-        if(op=="gc-step")return store.collect_step(args.size()>1?number(args[1]):1024*1024,args.size()>2?number(args[2]):128,args.size()>3?number(args[3]):64*1024*1024)+"\n";
-        need(args.size()==1 || args.size()==4 || args.size()==5,"gc-start expects zero, three or four budgets");
-        return store.start_collection(args.size()>1?number(args[1]):1024*1024,args.size()>1?number(args[2]):128,args.size()>1?number(args[3]):64,args.size()>4?number(args[4]):64*1024*1024);
+        need(args.size()<= (op=="gc-start"?6u:5u),"invalid GC arguments");
+        if(op=="gc-step")return store.collect_step(args.size()>1?number(args[1]):1024*1024,args.size()>2?number(args[2]):128,args.size()>3?number(args[3]):64*1024*1024,args.size()>4?number(args[4]):128)+"\n";
+        need(args.size()==1 || args.size()==4 || args.size()==5 || args.size()==6,"gc-start expects zero, three, four or five budgets");
+        return store.start_collection(args.size()>1?number(args[1]):1024*1024,args.size()>1?number(args[2]):128,args.size()>1?number(args[3]):64,args.size()>4?number(args[4]):64*1024*1024,args.size()>5?number(args[5]):128);
     }
     if(op=="gc-status" || op=="gc-stop"){
         need(manager && args.size()==1,"GC control requires manager connection and no selectors");

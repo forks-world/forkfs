@@ -12,6 +12,7 @@ struct StoreIoMetrics;
 class ObjectStore;
 struct RepositoryOwner;
 namespace replay {struct Batch;}
+struct GcCycle;
 class LevelStore {
 public:
     static void create(const std::string& path);
@@ -44,7 +45,8 @@ public:
     std::shared_ptr<void> pin_objects() const;
     std::shared_ptr<void> pin_manifest(const std::array<unsigned char,32>& id) const;
     std::string collect_step(size_t max_copy_bytes=1024*1024,size_t max_objects=128,
-                             size_t max_metadata_bytes=64*1024*1024);
+                             size_t max_metadata_bytes=64*1024*1024,size_t mark_work=128);
+    void cancel_collection();
     void barrier() const;
     struct CacheStats {uint64_t hits,misses;size_t charge;};
     CacheStats cache_stats() const;
@@ -91,6 +93,9 @@ private:
     std::shared_ptr<PinState> pin_state_=std::make_shared<PinState>();
     LocationPin pin_locations() const;
     mutable std::mutex gc_mutex_;
+    mutable std::shared_ptr<GcCycle> gc_cycle_; // publication and lifecycle guarded by writer_mutex_
+    mutable std::string gc_error_;
+    std::string path_;
     std::string repository_;
     bool replay_enabled_=false;
     uint64_t replay_start_=0;
