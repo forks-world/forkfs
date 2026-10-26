@@ -862,7 +862,9 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
                     charge(256);batch.Delete(key);
                     if(objects_phase){++object_removals;forgotten.push_back(key.substr(2));auto alias_key=alias+recovery_hex(key.substr(2));std::string ref;auto found=db_->Get({},alias_key,&ref);if(found.ok()){need(ref==key.substr(2),"invalid incremental staging alias");charge(256);batch.Delete(alias_key);++root_removals;}else if(!found.IsNotFound())status(found,"incremental staging alias");}
                     else ++chunk_removals;
-                    if(object_removals+chunk_removals>=max_objects){scan->Next();if(!scan->Valid()||!scan->key().starts_with(prefix))exhausted=true;break;}
+                    const auto phase_deleted=objects_phase?deleted:chunks_deleted;
+                    const auto batch_deleted=objects_phase?object_removals:chunk_removals;
+                    if(phase_deleted+batch_deleted>=max_objects){scan->Next();if(!scan->Valid()||!scan->key().starts_with(prefix))exhausted=true;break;}
                 }
                 status(scan->status(),"incremental sweep scan");work_done+=visits;
                 if(object_removals || chunk_removals){

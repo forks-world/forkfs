@@ -1,5 +1,7 @@
 #include "level_store.h"
 #include "journal.h"
+#include "replay_format.h"
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -99,6 +101,40 @@ void revival_and_pins(const std::string& path) {
         CHECK(!s.contains(key)&&s.object(s.root("a-live"))==other);s.verify();
     }
 }
+void deletion_limits(const std::string& path,bool order_chunks) {
+    LevelStore::create(path);
+    LevelStore s(path);
+    std::vector<Mutation> create;
+    std::map<std::string,std::vector<unsigned char>> values;
+    constexpr unsigned count=300;
+    for(unsigned i=0;i<count;++i){auto key="candidate/"+std::to_string(i);values[key]=payload(10000+i);create.push_back({key,values[key]});}
+    s.transact(s.sequence(),create);
+
+    std::vector<std::pair<std::string,std::string>> ordered;
+    for(unsigned i=0;i<count;++i){auto key="candidate/"+std::to_string(i);std::string order;if(order_chunks)order=replay::hash(std::string(values[key].begin(),values[key].end()));else {auto id=s.root(key);order.assign(reinterpret_cast<const char*>(id.data()),id.size());}ordered.emplace_back(order,key);}
+    std::sort(ordered.begin(),ordered.end());
+    // Keep the first key in the phase under test live. The following 127
+    // candidates are dead, exposing an overrun if the next batch ignores the
+    // allowance already consumed by this call.
+    const auto keeper=ordered.front().second;
+    std::vector<Mutation> erase;
+    for(unsigned i=1;i<count;++i)erase.push_back({ordered[i].second,std::nullopt});
+    s.transact(s.sequence(),erase);
+
+    bool objects_reaped=false,chunks_reaped=false;
+    std::string last;
+    for(unsigned i=0;i<1000;++i){
+        last=s.collect_step(1024*1024,128,256*1024*1024,65536);
+        const auto objects=number(last,"objects_deleted"),chunks=number(last,"chunks_deleted");
+        CHECK(objects<=128&&chunks<=128);
+        objects_reaped|=objects>0;chunks_reaped|=chunks>0;
+        CHECK(s.object(s.root(keeper))==values[keeper]);
+        if(converged(last))break;
+        CHECK(i!=999);
+    }
+    CHECK(objects_reaped&&chunks_reaped);
+    CHECK(s.contains(keeper));s.verify();
+}
 void interrupted_cycle(const std::string& path) {
     LevelStore::create(path);
     {LevelStore s(path);for(unsigned i=0;i<80;++i)s.transact(s.sequence(),{{"root/"+std::to_string(i),payload(i)}});
@@ -124,7 +160,7 @@ void interrupted_cycle(const std::string& path) {
 }
 int main(){
     auto p=(std::filesystem::temp_directory_path()/"forkfs-incremental-gc-XXXXXX").string();CHECK(mkdtemp(p.data()));
-    try {bounded_mark_and_writes(p+"/writes");revival_and_pins(p+"/revival");interrupted_cycle(p+"/restart");
+    try {bounded_mark_and_writes(p+"/writes");revival_and_pins(p+"/revival");deletion_limits(p+"/limits-objects",false);deletion_limits(p+"/limits-chunks",true);interrupted_cycle(p+"/restart");
         std::filesystem::remove_all(p);std::cout<<"incremental GC bounded marking, writes, revival and restart passed\n";}
     catch(const std::exception& e){std::cerr<<e.what()<<'\n';std::filesystem::remove_all(p);return 1;}
 }
