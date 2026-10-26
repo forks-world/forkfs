@@ -258,11 +258,11 @@ std::vector<std::vector<unsigned char>> Container::get_many(const std::vector<st
     for(const auto& key:keys) result.push_back(journal_->get(key));
     return result;
 }
-std::string Container::collect_step(size_t max_copy_bytes,size_t max_objects,size_t max_metadata_bytes) {
+std::string Container::collect_step(size_t max_copy_bytes,size_t max_objects,size_t max_metadata_bytes,size_t mark_work) {
     // The storage coordinator owns publication locks. Do not hold the namespace
     // lock through graph marking: ordinary operations must keep making progress.
     require(mode_==OpenMode::ReadWrite,"revision preview is read-only");
-    return journal_->collect_step(max_copy_bytes,max_objects,max_metadata_bytes);
+    return journal_->collect_step(max_copy_bytes,max_objects,max_metadata_bytes,mark_work);
 }
 std::string Container::collection_status() const {
     std::lock_guard lock(collection_mutex_);
@@ -271,31 +271,36 @@ std::string Container::collection_status() const {
         ",\"steps\":"+std::to_string(collection_steps_)+
         ",\"last_step\":"+collection_last_+",\"error\":"+json_string(collection_error_)+"}\n";
 }
-std::string Container::start_collection(size_t max_copy_bytes,size_t max_objects,size_t max_steps,size_t max_metadata_bytes) {
+std::string Container::start_collection(size_t max_copy_bytes,size_t max_objects,size_t max_steps,size_t max_metadata_bytes,size_t mark_work) {
     require(mode_==OpenMode::ReadWrite && journal_->is_leveldb(),"online GC requires writable LevelDB");
     require(max_copy_bytes>=65580 && max_copy_bytes<=8*1024*1024,"invalid GC copy budget");
     require(max_objects>0 && max_objects<=4096 && max_steps>0 && max_steps<=1024,"invalid GC step budget");
     require(max_metadata_bytes>=64*1024 && max_metadata_bytes<=256*1024*1024,"invalid GC metadata memory budget");
+    require(mark_work>0 && mark_work<=65536,"invalid GC mark work budget");
     std::lock_guard lifecycle(collection_lifecycle_mutex_);
     {std::lock_guard lock(collection_mutex_);require(!collection_active_,"online GC is already running");}
     if(collection_thread_.joinable())collection_thread_.join();
     {std::lock_guard lock(collection_mutex_);collection_active_=true;collection_stop_=false;
         collection_steps_=0;collection_last_="null";collection_error_.clear();collection_state_="running";}
-    try {collection_thread_=std::thread([this,max_copy_bytes,max_objects,max_steps,max_metadata_bytes]{
+    try {collection_thread_=std::thread([this,max_copy_bytes,max_objects,max_steps,max_metadata_bytes,mark_work]{
         std::string state="budget_exhausted";
         try {
             for(size_t step=0;step<max_steps && !collection_stop_;++step){
-                auto report=collect_step(max_copy_bytes,max_objects,max_metadata_bytes);
+                auto report=collect_step(max_copy_bytes,max_objects,max_metadata_bytes,mark_work);
                 auto count=[&](const std::string& name){
                     auto marker="\""+name+"\":";auto at=report.find(marker);
                     require(at!=std::string::npos,"incomplete GC progress report");at+=marker.size();
                     auto end=report.find_first_not_of("0123456789",at);
                     require(end!=at,"invalid GC progress report");return std::stoull(report.substr(at,end-at));
                 };
-                const bool progress=count("objects_deleted") || count("chunks_moved") || count("segments_deleted");
-                const bool pending=count("pending_segments")!=0;
+                const bool reclaimed=count("objects_deleted") || count("chunks_deleted") || count("chunks_moved") || count("segments_deleted");
+                const bool progress=reclaimed || count("mark_work_done");
+                const bool mark_pending=report.find("\"mark_pending\":true")!=std::string::npos;
+                const bool pending=count("pending_segments")!=0 || mark_pending;
                 {std::lock_guard lock(collection_mutex_);collection_last_=report;++collection_steps_;}
-                if(!progress){state=pending || report.find("\"logical_sweep_skipped\":true")!=std::string::npos?"blocked":"complete";break;}
+                const bool skipped=report.find("\"logical_sweep_skipped\":true")!=std::string::npos;
+                if(!pending && !reclaimed && !skipped){state="complete";break;}
+                if(!progress){state=pending || skipped?"blocked":"complete";break;}
                 std::this_thread::yield();
             }
             if(collection_stop_)state="stopped";
@@ -307,6 +312,9 @@ std::string Container::start_collection(size_t max_copy_bytes,size_t max_objects
 void Container::stop_collection() {
     std::lock_guard lifecycle(collection_lifecycle_mutex_);collection_stop_=true;
     if(collection_thread_.joinable())collection_thread_.join();
+    journal_->cancel_collection();
+    std::lock_guard state(collection_mutex_);
+    if(collection_state_=="blocked" || collection_state_=="budget_exhausted")collection_state_="stopped";
 }
 void Container::sync() const {std::lock_guard lock(mutex_);journal_->barrier();}
 void Container::verify() const { std::lock_guard lock(mutex_); journal_->verify(); }

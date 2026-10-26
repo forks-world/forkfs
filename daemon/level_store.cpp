@@ -7,6 +7,7 @@
 #include "replay_validation.h"
 #include "repository_budget.h"
 #include "gc_checkpoint.h"
+#include "gc_mark.h"
 #include "metadata_view.h"
 #ifndef __APPLE__
 #include <sys/syscall.h>
@@ -39,6 +40,16 @@ void test_prepared();
 void test_verify_snapshot();
 void test_compact();
 #endif
+struct GcCycle {
+    enum Phase {Roots,Leases,Mark,Objects,References,Chunks,Complete};
+    leveldb::DB* db;GcMark mark;const leveldb::Snapshot* baseline;const leveldb::Snapshot* references=nullptr;
+    uint64_t sequence,deleted=0;Phase phase=Roots;
+    std::string root_cursor,object_cursor,reference_cursor,chunk_cursor;
+    std::array<unsigned char,32> lease_cursor{};bool lease_started=false;
+    GcCycle(leveldb::DB* source,const std::string& path,uint64_t seq):db(source),mark(path),baseline(source->GetSnapshot()),sequence(seq){}
+    ~GcCycle(){if(references)db->ReleaseSnapshot(references);db->ReleaseSnapshot(baseline);}
+    const char* phase_name() const {switch(phase){case Roots:return "roots";case Leases:return "leases";case Mark:return "mark";case Objects:return "objects";case References:return "references";case Chunks:return "chunks";default:return "complete";}}
+};
 struct StoreIoMetrics {
     std::atomic<uint64_t> root_get_calls=0,root_get_ns=0,root_misses=0,root_cache_hits=0,object_get_calls=0,object_get_ns=0,object_misses=0,meta_get_calls=0,meta_get_ns=0;
     std::atomic<uint64_t> transactions=0,prepare_ns=0,write_ns=0,wal_sync_calls=0,wal_sync_ns=0,other_sync_calls=0,other_sync_ns=0,wal_append_bytes=0,wal_append_ns=0,wal_flush_ns=0;
@@ -106,7 +117,12 @@ void LevelStore::create(const std::string& path) {
 }
 LevelStore::LevelStore(const std::string& path,size_t object_cache_bytes):LevelStore(path,false,object_cache_bytes) {}
 LevelStore::LevelStore(const std::string& path,bool initialize,size_t object_cache_bytes) {
-    owner_=std::make_shared<RepositoryOwner>(path);
+    owner_=std::make_shared<RepositoryOwner>(path);path_=path;
+    // Scratch is never a recovery authority. A new owner starts a fresh mark;
+    // remove links themselves, never traverse their targets.
+    for(const auto& entry:std::filesystem::directory_iterator(path))if(entry.path().filename().string().starts_with(".gc-mark-")){
+        std::error_code ec;std::filesystem::remove_all(entry.path(),ec);if(ec)throw std::system_error(ec,"discard abandoned GC mark");}
+
     need(!gc_checkpoint::exists_nofollow(path+"/GC-PENDING"),"GC checkpoint publication is pending; retry gc with its original --checkpoint target");
     leveldb::Options options;options.create_if_missing=initialize;options.error_if_exists=initialize;
     metrics_=std::make_unique<StoreIoMetrics>();env_=std::make_unique<TimedEnv>(*metrics_);options.env=env_.get();
@@ -148,7 +164,7 @@ LevelStore::LevelStore(const std::string& path,bool initialize,size_t object_cac
         need(!read("M/replay/base",value) && !read("M/replay/head",value),"incomplete replay metadata");
     }
 }
-LevelStore::~LevelStore()=default;
+LevelStore::~LevelStore(){gc_cycle_.reset();}
 std::shared_ptr<void> LevelStore::pin_objects() const {
     auto state=pin_state_;{std::lock_guard lock(state->mutex);++state->logical;}
     return std::shared_ptr<void>(state.get(),[state](void*){std::lock_guard lock(state->mutex);--state->logical;});
@@ -161,12 +177,14 @@ std::shared_ptr<void> LevelStore::pin_manifest(const Id& object_id) const {
         if(!*active)return;std::lock_guard lock(state->mutex);auto found=state->manifests.find(object_id);
         if(found==state->manifests.end())return;if(--found->second==0)state->manifests.erase(found);
     });
+    std::lock_guard writer(writer_mutex_);healthy();
     {std::lock_guard lock(state->mutex);auto found=state->manifests.find(object_id);
         if(found==state->manifests.end()){
             need(state->manifest_epoch!=UINT64_MAX,"manifest pin epoch exhausted");state->manifests.emplace(object_id,1);++state->manifest_epoch;
         }else {need(found->second!=SIZE_MAX,"manifest pin count exhausted");++found->second;}
         *active=true;
     }
+    if(gc_cycle_)try{gc_cycle_->mark.seed_manifest(object_id);}catch(const std::exception& error){gc_error_=std::string("GC manifest barrier failed: ")+error.what();gc_cycle_.reset();}
     return token;
 }
 void LevelStore::LocationRelease::operator()(PinState* state) const noexcept {
@@ -176,6 +194,7 @@ LevelStore::LocationPin LevelStore::pin_locations() const {
     auto* state=pin_state_.get();{std::lock_guard lock(state->mutex);++state->locations;}
     return LocationPin(state);
 }
+void LevelStore::cancel_collection(){std::lock_guard gc(gc_mutex_);std::lock_guard writer(writer_mutex_);gc_cycle_.reset();}
 void LevelStore::barrier() const {std::lock_guard lock(writer_mutex_);healthy();}
 // The coordinator is the only component that knows both object bytes and DB
 // indexes. LevelDB itself is unwrapped and receives metadata-only WriteBatches.
@@ -248,6 +267,23 @@ void LevelStore::publish(const replay::Batch& input){
         const char* injected=std::getenv("FORKFS_TEST_SEGMENT_ERROR");if(injected && !strcmp(injected,"metadata"))throw std::system_error(EIO,std::generic_category(),"injected metadata publication failure");
 #endif
         leveldb::WriteOptions options;options.sync=true;status(db_->Write(options,&metadata),"publish metadata indexes");physical_format_=next_format;fault("segment_after_metadata");
+        if(gc_cycle_){
+            fault("gc_mark_before_barrier");
+            try {
+#ifdef FORKFS_TEST_FAULTS
+                const char* gc_failure=std::getenv("FORKFS_TEST_GC_ERROR");if(gc_failure && !strcmp(gc_failure,"barrier"))throw std::runtime_error("injected GC scratch barrier failure");
+#endif
+                auto roots=[&](const std::string& key)->std::optional<Id>{std::string ref;auto found=db_->Get(read,key,&ref);if(found.IsNotFound())return std::nullopt;status(found,"GC publication root lookup");return id(ref);};
+                for(const auto& op:input.ops)if(!op.erase){
+                    if(op.key.starts_with("R/"))gc_cycle_->mark.seed_root(op.key,id(op.value),roots);
+                    else if(op.key.starts_with("O/")){
+                        std::string descriptor;status(db_->Get(read,op.key,&descriptor),"GC published object lookup");
+                        replay::Input in{descriptor};need(in.take(8)=="FFOBJ002","invalid GC publication descriptor");(void)in.integer(8);auto count=in.integer(4);need(count>0&&count<=4,"invalid GC publication chunks");for(uint64_t i=0;i<count;++i)gc_cycle_->mark.protect_chunk(in.take(32));in.end();
+                    }
+                }
+            }catch(const std::exception& error){gc_error_=std::string("GC publication barrier failed: ")+error.what();gc_cycle_.reset();}
+            fault("gc_mark_after_barrier");
+        }
     }catch(...){object_store_->abandon();poisoned_=true;throw;}
 }
 void LevelStore::healthy() const {need(!poisoned_,"LevelDB store requires reopen after write failure");}
@@ -721,10 +757,11 @@ std::string LevelStore::revision_point(const std::string& name) const {
 }
 
 namespace forkfs {
-std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,size_t max_metadata_bytes) {
+std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,size_t max_metadata_bytes,size_t mark_work) {
     need(max_copy_bytes>=65580 && max_copy_bytes<=8*1024*1024,"GC copy budget must be 64 KiB..8 MiB");
     need(max_objects>0 && max_objects<=4096,"invalid GC object budget");
     need(max_metadata_bytes>=64*1024 && max_metadata_bytes<=256*1024*1024,"invalid GC metadata memory budget");
+    need(mark_work>0 && mark_work<=65536,"invalid GC mark work budget");
     // Conservative allocation charges, not RSS: shared DB/cache buffers and a
     // bounded payload/iterator working set are separate from GC-owned metadata.
     size_t metadata_bytes=0;
@@ -765,103 +802,108 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
         fault("gc_online_after_delete_sync");++segments_deleted;--pending;
     };
     reap_one(true);
-    std::unique_lock snapshot_writer(writer_mutex_);
-    healthy();
+    charge(32*1024); // bounded marker/task working metadata; disk marks are not resident sets
+    uint64_t seq=0,deleted=0,chunks_deleted=0,work_done=0,mark_processed=0;
+    bool sweep_skipped=false,mark_pending=false,round_complete=false;std::string mark_phase="complete";
+    std::shared_ptr<GcCycle> cycle;
+    try {
+        {std::lock_guard writer(writer_mutex_);healthy();
+            if(!gc_error_.empty()){auto message=std::move(gc_error_);gc_error_.clear();throw std::runtime_error(message);}
+            if(replay_enabled_){gc_cycle_.reset();sweep_skipped=true;seq=sequence_;}
+            else {if(!gc_cycle_)gc_cycle_=std::make_shared<GcCycle>(db_.get(),path_,sequence_);cycle=gc_cycle_;seq=cycle->sequence;}}
+        fault("gc_mark_after_begin");
+        auto read_object=[&](const Id& ref)->Bytes{
+            auto location=pin_locations();healthy();leveldb::ReadOptions ro;ro.verify_checksums=true;ro.fill_cache=false;
+            auto payload=object_payload(ro,bytes(ref));healthy();return Bytes(payload.begin(),payload.end());};
+        bool hook_called=false;
+        while(cycle && work_done<mark_work && (cycle->phase!=GcCycle::Complete || cycle->mark.has_work())){
+            if(cycle->phase==GcCycle::Roots){
+                leveldb::ReadOptions ro;ro.verify_checksums=true;ro.fill_cache=false;ro.snapshot=cycle->baseline;
+                std::unique_ptr<leveldb::Iterator> roots(db_->NewIterator(ro));
+                roots->Seek(cycle->root_cursor.empty()?"R/":cycle->root_cursor);if(!cycle->root_cursor.empty()&&roots->Valid()&&roots->key().ToString()==cycle->root_cursor)roots->Next();
+                if(!roots->Valid()||!roots->key().starts_with("R/")){status(roots->status(),"incremental root scan");cycle->phase=GcCycle::Leases;continue;}
+                auto key=roots->key().ToString(),value=roots->value().ToString();status(roots->status(),"incremental root scan");
+                auto lookup=[&](const std::string& name)->std::optional<Id>{std::string value;auto found=db_->Get(ro,name,&value);if(found.IsNotFound())return std::nullopt;status(found,"incremental root pair");return id(value);};
+                cycle->mark.seed_root(key,id(value),lookup);cycle->root_cursor=key;++work_done;continue;
+            }
+            if(cycle->phase==GcCycle::Leases){
+                std::unique_lock writer(writer_mutex_);healthy();if(gc_cycle_!=cycle)throw std::runtime_error("GC mark invalidated");
+                std::optional<Id> next;
+                {std::lock_guard pins(pin_state_->mutex);auto it=cycle->lease_started?pin_state_->manifests.upper_bound(cycle->lease_cursor):pin_state_->manifests.begin();if(it!=pin_state_->manifests.end())next=it->first;}
+                if(next){cycle->mark.seed_manifest(*next);cycle->lease_cursor=*next;cycle->lease_started=true;++work_done;}
+                else cycle->phase=GcCycle::Mark;
+                continue;
+            }
+            if(cycle->mark.has_work()) {work_done+=cycle->mark.advance(1,read_object);fault("gc_mark_after_task");continue;}
+            if(cycle->phase==GcCycle::Mark){cycle->phase=GcCycle::Objects;continue;}
+#ifdef FORKFS_TEST_GC
+            if(!hook_called){extern void test_gc_marked();test_gc_marked();hook_called=true;}
+#else
+            (void)hook_called;
+#endif
+            std::unique_lock writer(writer_mutex_);healthy();if(gc_cycle_!=cycle)throw std::runtime_error("GC mark invalidated");
+            if(replay_enabled_){gc_cycle_.reset();cycle.reset();sweep_skipped=true;break;}
+            if(cycle->mark.has_work()){sweep_skipped=true;break;}
+            if(cycle->phase==GcCycle::Objects || cycle->phase==GcCycle::Chunks){
+                std::lock_guard pins(pin_state_->mutex);
+                if(pin_state_->logical!=1 || pin_state_->locations!=0){sweep_skipped=true;break;}
+                const bool objects_phase=cycle->phase==GcCycle::Objects;
+                auto& cursor=objects_phase?cycle->object_cursor:cycle->chunk_cursor;const std::string prefix=objects_phase?"O/":"C/";
+                leveldb::ReadOptions ro;ro.verify_checksums=true;ro.fill_cache=false;ro.snapshot=objects_phase?cycle->baseline:nullptr;
+                std::unique_ptr<leveldb::Iterator> scan(db_->NewIterator(ro));scan->Seek(cursor.empty()?prefix:cursor);if(!cursor.empty()&&scan->Valid()&&scan->key().ToString()==cursor)scan->Next();
+                leveldb::WriteBatch batch;std::vector<std::string> forgotten;uint64_t root_removals=0,object_removals=0,chunk_removals=0;
+                const std::string alias("R/\0forkfs-history/object/",25);
+                size_t visits=0;bool exhausted=false;
+                for(;visits<std::min<uint64_t>(128,mark_work-work_done);scan->Next()){
+                    if(!scan->Valid()||!scan->key().starts_with(prefix)){exhausted=true;break;}
+                    auto key=scan->key().ToString();need(key.size()==34,"invalid incremental GC object/chunk key");++visits;cursor=key;
+                    const bool live=objects_phase?cycle->mark.live(id(key.substr(2))):cycle->mark.chunk_live(key.substr(2));if(live)continue;
+                    std::string existing;auto present=db_->Get({},key,&existing);if(present.IsNotFound())continue;status(present,"incremental GC candidate");
+                    charge(256);batch.Delete(key);
+                    if(objects_phase){++object_removals;forgotten.push_back(key.substr(2));auto alias_key=alias+recovery_hex(key.substr(2));std::string ref;auto found=db_->Get({},alias_key,&ref);if(found.ok()){need(ref==key.substr(2),"invalid incremental staging alias");charge(256);batch.Delete(alias_key);++root_removals;}else if(!found.IsNotFound())status(found,"incremental staging alias");}
+                    else ++chunk_removals;
+                    const auto phase_deleted=objects_phase?deleted:chunks_deleted;
+                    const auto batch_deleted=objects_phase?object_removals:chunk_removals;
+                    if(phase_deleted+batch_deleted>=max_objects){scan->Next();if(!scan->Valid()||!scan->key().starts_with(prefix))exhausted=true;break;}
+                }
+                status(scan->status(),"incremental sweep scan");work_done+=visits;
+                if(object_removals || chunk_removals){
+                    need(object_removals<=objects_ && root_removals<=roots_,"incremental GC counter underflow");
+                    if(object_removals)batch.Put("M/objects",integer(objects_-object_removals));if(root_removals)batch.Put("M/roots",integer(roots_-root_removals));
+                    try{fault("gc_mark_before_sweep");leveldb::WriteOptions wo;wo.sync=true;status(db_->Write(wo,&batch),"incremental GC metadata prune");fault("gc_mark_after_sweep");}catch(...){object_store_->abandon();poisoned_=true;throw;}
+                    objects_=objects_-object_removals;roots_=roots_-root_removals;deleted+=object_removals;chunks_deleted+=chunk_removals;cycle->deleted+=object_removals+chunk_removals;
+                    for(const auto& raw:forgotten)object_store_->forget(raw);
+                    if(root_removals){std::lock_guard cache(root_cache_mutex_);root_cache_.clear();root_cache_sequence_=UINT64_MAX;}
+                }
+                if(exhausted){if(objects_phase){cycle->references=db_->GetSnapshot();cycle->phase=GcCycle::References;}else cycle->phase=GcCycle::Complete;}
+                // Deletion limits apply to the whole call, not each batch.
+                if(deleted>=max_objects || chunks_deleted>=max_objects)break;
+                continue;
+            }
+            if(cycle->phase==GcCycle::References){
+                leveldb::ReadOptions ro;ro.verify_checksums=true;ro.fill_cache=false;ro.snapshot=cycle->references;
+                std::unique_ptr<leveldb::Iterator> refs(db_->NewIterator(ro));refs->Seek(cycle->reference_cursor.empty()?"O/":cycle->reference_cursor);if(!cycle->reference_cursor.empty()&&refs->Valid()&&refs->key().ToString()==cycle->reference_cursor)refs->Next();
+                if(!refs->Valid()||!refs->key().starts_with("O/")){status(refs->status(),"incremental chunk references");cycle->phase=GcCycle::Chunks;continue;}
+                auto descriptor=refs->value().ToString();replay::Input in{descriptor};need(in.take(8)=="FFOBJ002","invalid incremental object descriptor");(void)in.integer(8);auto count=in.integer(4);need(count>0&&count<=4,"invalid incremental chunk count");for(uint64_t i=0;i<count;++i)cycle->mark.protect_chunk(in.take(32));in.end();cycle->reference_cursor=refs->key().ToString();status(refs->status(),"incremental chunk references");++work_done;continue;
+            }
+        }
+        if(cycle){mark_processed=cycle->mark.processed();mark_pending=cycle->phase!=GcCycle::Complete;mark_phase=cycle->phase_name();
+            if(!mark_pending){std::lock_guard writer(writer_mutex_);healthy();if(gc_cycle_!=cycle)throw std::runtime_error("GC mark invalidated");if(cycle->mark.has_work()){mark_pending=true;mark_phase="mark";}else {round_complete=true;mark_pending=cycle->deleted!=0 || cycle->sequence!=sequence_;if(mark_pending)mark_phase="cycle_complete";gc_cycle_.reset();}}}
+    }catch(...){std::lock_guard writer(writer_mutex_);if(gc_cycle_==cycle)gc_cycle_.reset();throw;}
+    auto report=[&](uint64_t moved,uint64_t copied){return "{\"metadata_budget_bytes\":"+std::to_string(max_metadata_bytes)+",\"metadata_bytes_charged\":"+std::to_string(metadata_bytes)+",\"mark_work_done\":"+std::to_string(work_done)+",\"mark_processed\":"+std::to_string(mark_processed)+",\"mark_pending\":"+(mark_pending?"true":"false")+",\"mark_phase\":\""+mark_phase+"\",\"objects_deleted\":"+std::to_string(deleted)+",\"chunks_deleted\":"+std::to_string(chunks_deleted)+",\"chunks_moved\":"+std::to_string(moved)+",\"bytes_copied\":"+std::to_string(copied)+",\"segments_deleted\":"+std::to_string(segments_deleted)+",\"pending_segments\":"+std::to_string(pending)+",\"logical_sweep_skipped\":"+(sweep_skipped?"true":"false")+",\"sequence\":"+std::to_string(seq)+"}";};
+    if(mark_pending && !round_complete && !sweep_skipped)return report(0,0);
+    auto physical_pin=pin_locations();
     std::unique_ptr<const leveldb::Snapshot,decltype(release)> snapshot(db_->GetSnapshot(),release);
     leveldb::ReadOptions options;options.verify_checksums=true;options.fill_cache=false;options.snapshot=snapshot.get();
-    const uint64_t seq=sequence_.load();const bool replay_snapshot=replay_enabled_;
-    const uint64_t objects_before=objects_.load(),roots_before=roots_.load();std::set<Id> targeted_manifests;uint64_t manifest_epoch;
-    {std::lock_guard pins(pin_state_->mutex);manifest_epoch=pin_state_->manifest_epoch;for(const auto& [ref,count]:pin_state_->manifests){charge(128);targeted_manifests.insert(ref);}}
-    snapshot_writer.unlock();
-    // Keep indexes in LevelDB: the snapshot gives every graph lookup the same
-    // logical generation without duplicating O/R/C in process-owned maps.
-    auto get=[&](const std::string& key,std::string& value){auto st=db_->Get(options,key,&value);if(st.IsNotFound())return false;status(st,"online GC snapshot lookup");return true;};
-    std::set<uint64_t> retired;
-    std::unique_ptr<leveldb::Iterator> it(db_->NewIterator(options));
-    std::string snapshot_format;status(db_->Get(options,"M/format",&snapshot_format),"read GC snapshot format");
-    (void)logical_value(options,"M/format",snapshot_format);
-    for(it->Seek("G/");it->Valid() && it->key().starts_with("G/");it->Next()){auto key=it->key().ToString();need(snapshot_format[7]>='7' && key.size()==10 && it->value().ToString()=="FFGCRET1","invalid retired segment marker");auto sid=replay::num(key.substr(2));need(sid>0 && integer(sid)==key.substr(2),"invalid retired segment ID");charge(128);retired.insert(sid);}
-    status(it->status(),"online GC retired segment scan");
-    const std::string history("R/\0forkfs-history/",18),ns("\0forkfs/",8),alias=history+"object/";
-    std::set<Id> live,manifests;
-    auto read_object=[&](const Id& ref)->Bytes {
-        if(!live.contains(ref)){charge(128);live.insert(ref);}
-        auto payload=object_payload(options,bytes(ref));return Bytes(payload.begin(),payload.end());
-    };
-    auto known_inode=[&](const Bytes& value){
-        need(value.size()>=48 && value.size()<=128*1024,"GC invalid inode size");
-        std::string version(value.begin(),value.begin()+8);
-        need(version=="FFINOD01" || version=="FFINOD02" || version=="FFINOD03" || version=="FFINOD04" || version=="FFINOD05","GC unsupported inode codec");
-        if(version=="FFINOD03" || version=="FFINOD04" || version=="FFINOD05"){
-            need(value.size()>=80,"GC truncated inode");auto flags=static_cast<unsigned>(value[48])|(unsigned(value[49])<<8)|(unsigned(value[50])<<16)|(unsigned(value[51])<<24);
-            need(version=="FFINOD05"?flags==2:flags<=1,"GC unknown inode flags");}
-    };
-    auto manifest=[&](const Id& ref){if(manifests.contains(ref))return;charge(128);manifests.insert(ref);NamespaceView::verify_manifest(read_object,ref,[&](const std::string& key,const Id& value){if(key.starts_with(ns+"inode/"))known_inode(read_object(value));},charge);};
-    RevisionDag dag([&](const Id& ref){return RevisionRecord::read(read_object,ref);},manifest,100000,64*1024*1024,charge);
-    for(it->Seek("R/");it->Valid() && it->key().starts_with("R/");it->Next()){
-        auto key=it->key().ToString(),value=it->value().ToString();
-        if(key.starts_with(alias)){need(key.substr(alias.size())==recovery_hex(value),"GC noncanonical staging alias");continue;}
-        auto ref=id(value);auto payload=read_object(ref);
-        if(key.starts_with(history+"world/"))manifest(ref);
-        else if(key.starts_with(history+"revision/"))dag.validate(ref);
-        else if(key.starts_with(history+"base/")){need(payload.size()==32,"GC invalid World base");Id base{};std::copy(payload.begin(),payload.end(),base.begin());dag.validate(base);}
-        else if((key.starts_with(history+"orphan/") && key.ends_with("/content")) || key.starts_with("R/"+ns+"content/")){
-            auto inode_key=key.starts_with(history+"orphan/")?key.substr(0,key.size()-7)+"inode":"R/"+ns+"inode/"+key.substr(("R/"+ns+"content/").size());
-            std::string inode_ref;need(get(inode_key,inode_ref),"GC content has no inode");auto inode=read_object(id(inode_ref));known_inode(inode);
-            if(std::string(inode.begin(),inode.begin()+8)=="FFINOD05"){
-                uint64_t size=0;for(unsigned i=0;i<8;++i)size|=uint64_t(inode[24+i])<<(8*i);FileContent(read_object,payload,size,true).verify(charge);}
-        }
-    }
-    status(it->status(),"online GC root scan");
-    for(const auto& ref:targeted_manifests)manifest(ref);
-    std::vector<std::string> doomed;
-    // Retained replay logs can refer to every immutable object. In that mode
-    // there is no logical sweep, so no all-object live set is needed either.
-    if(!replay_snapshot)for(it->Seek("O/");it->Valid() && it->key().starts_with("O/") && doomed.size()<max_objects;it->Next()){
-        auto key=it->key().ToString();if(!live.contains(id(key.substr(2)))){charge(192+key.size());doomed.push_back(key);}}
-    status(it->status(),"online GC object candidate scan");
-    std::set<std::string> remove_aliases,removed_hashes;
-    for(const auto& key:doomed){auto alias_key=alias+recovery_hex(key.substr(2));std::string value;if(get(alias_key,value)){charge(192+alias_key.size());remove_aliases.insert(alias_key);}}
-    for(const auto& key:doomed){std::string descriptor;need(get(key,descriptor),"GC candidate disappeared from snapshot");replay::Input in{descriptor};auto magic=in.take(8);need(magic=="FFOBJ001" || magic=="FFOBJ002","invalid object location descriptor");(void)in.integer(8);auto count=in.integer(4);need(count>0 && count<=4,"invalid object chunk count");for(uint64_t i=0;i<count;++i){auto hash=in.take(32);if(!removed_hashes.contains(hash)){charge(160);removed_hashes.insert(hash);}}in.end();}
-    // Only candidate hashes matter. Erase any still used by retained O rows;
-    // never construct a set containing all chunks in the repository.
-    charge(doomed.size()*256);const std::set<std::string> doomed_keys(doomed.begin(),doomed.end());
-    for(it->Seek("O/");!removed_hashes.empty() && it->Valid() && it->key().starts_with("O/");it->Next())if(!doomed_keys.contains(it->key().ToString())){
-        replay::Input in{it->value().ToString()};auto magic=in.take(8);need(magic=="FFOBJ001" || magic=="FFOBJ002","invalid object location descriptor");(void)in.integer(8);auto count=in.integer(4);need(count>0 && count<=4,"invalid object chunk count");for(uint64_t i=0;i<count;++i)removed_hashes.erase(in.take(32));in.end();}
-    status(it->status(),"online GC retained chunk scan");
-    need(doomed.size()<=objects_before && remove_aliases.size()<=roots_before,"GC metadata counter underflow");
-    leveldb::WriteBatch batch;const uint64_t planned_deleted=doomed.size(),root_count=roots_before-remove_aliases.size();uint64_t deleted=0;
-    charge(doomed.size()*80+remove_aliases.size()*120+removed_hashes.size()*80+256);
-    for(const auto& key:doomed)batch.Delete(key);for(const auto& key:remove_aliases)batch.Delete(key);
-    for(const auto& hash:removed_hashes)batch.Delete("C/"+hash);
-    if(planned_deleted)batch.Put("M/objects",integer(objects_before-planned_deleted));if(!remove_aliases.empty())batch.Put("M/roots",integer(root_count));
-#ifdef FORKFS_TEST_GC
-    extern void test_gc_marked();test_gc_marked();
-#endif
-    std::unique_lock writer(writer_mutex_);
-    healthy();
-    bool sweep_skipped=false;
-    {std::lock_guard pins(pin_state_->mutex);
-        if(sequence_.load()!=seq || pin_state_->logical!=1 || pin_state_->locations!=0 || pin_state_->manifest_epoch!=manifest_epoch || replay_snapshot || replay_enabled_)sweep_skipped=true;
-        else {
-        if(planned_deleted || !remove_aliases.empty() || !removed_hashes.empty()){
-            try{leveldb::WriteOptions wo;wo.sync=true;status(db_->Write(wo,&batch),"online GC metadata prune");}
-            catch(...){object_store_->abandon();poisoned_=true;throw;}
-            deleted=planned_deleted;objects_=objects_before-planned_deleted;roots_=root_count;
-            for(const auto& key:doomed)object_store_->forget(key.substr(2));
-            if(!remove_aliases.empty()){std::lock_guard cache(root_cache_mutex_);root_cache_.clear();root_cache_sequence_=UINT64_MAX;}
-        }
-        }
-    }
-    writer.unlock();
+    std::set<uint64_t> retired;std::unique_ptr<leveldb::Iterator> it(db_->NewIterator(options));
+    for(it->Seek("G/");it->Valid()&&it->key().starts_with("G/");it->Next()){need(it->key().size()==10&&it->value().ToString()=="FFGCRET1","invalid retired segment marker");charge(128);retired.insert(number(it->key().ToString().substr(2)));}status(it->status(),"physical GC retired scan");
     uint64_t moved=0,copied=0;
     // The indexed chunk scan is outside the writer lock. A selected segment is
     // sealed under the lock before taking the authoritative post-seal C view.
     std::map<uint64_t,uint64_t> indexed;
     for(it->Seek("C/");it->Valid() && it->key().starts_with("C/");it->Next()){
-        if(!sweep_skipped && removed_hashes.contains(it->key().ToString().substr(2)))continue;
         replay::Input d{it->value().ToString()};auto sid=d.integer(8);(void)d.integer(8);auto n=d.integer(4);d.end();if(!indexed.contains(sid))charge(128);indexed[sid]+=n+44;}
-    status(it->status(),"online GC segment accounting scan");it.reset();snapshot.reset();
+    status(it->status(),"online GC segment accounting scan");it.reset();snapshot.reset();physical_pin.reset();
     uint64_t source=0,source_size=0;std::vector<std::pair<uint64_t,uint64_t>> segment_files;
     {std::unique_lock inventory(writer_mutex_);healthy();segment_files=object_store_->segments(charge);}
     for(const auto& [sid,length]:segment_files){auto found=indexed.find(sid);auto indexed_bytes=found==indexed.end()?0:found->second;
@@ -907,7 +949,7 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
         }catch(...){if(attempted_append){object_store_->abandon();poisoned_=true;}throw;}
     }
     reap_one(segments_deleted==0);
-    return "{\"metadata_budget_bytes\":"+std::to_string(max_metadata_bytes)+",\"metadata_bytes_charged\":"+std::to_string(metadata_bytes)+",\"objects_deleted\":"+std::to_string(deleted)+",\"chunks_moved\":"+std::to_string(moved)+",\"bytes_copied\":"+std::to_string(copied)+",\"segments_deleted\":"+std::to_string(segments_deleted)+",\"pending_segments\":"+std::to_string(pending)+",\"logical_sweep_skipped\":"+(sweep_skipped?"true":"false")+",\"sequence\":"+std::to_string(seq)+"}";
+    return report(moved,copied);
 }
 
 std::string LevelStore::collect(const std::string& input,const std::string& checkpoint,bool dry_run){

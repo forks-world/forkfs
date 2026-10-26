@@ -39,7 +39,7 @@ void drain(LevelStore& store) {
         CHECK(field(report,"bytes_copied")<=256*1024);
         CHECK(field(report,"objects_deleted")<=128);
         store.verify();
-        if(field(report,"objects_deleted")==0 && field(report,"chunks_moved")==0 &&
+        if(!boolean_field(report,"mark_pending") && field(report,"objects_deleted")==0 && field(report,"chunks_moved")==0 &&
            field(report,"segments_deleted")==0 && field(report,"pending_segments")==0) return;
     }
     throw std::runtime_error("online GC did not converge within bounded steps");
@@ -150,7 +150,8 @@ int main() {
             }
             store.transact(store.sequence(),{{"head",live}});
             auto before_objects=store.objects();
-            auto report=store.collect_step(1024*1024,1);
+            std::string report;
+            for(unsigned i=0;i<256;++i){report=store.collect_step(1024*1024,1);if(field(report,"objects_deleted"))break;}
             CHECK(field(report,"objects_deleted")==1);
             CHECK(before_objects==store.objects()+1);store.verify();
             unsigned readable=0,missing=0;
@@ -215,7 +216,7 @@ int main() {
             fs.write("/gamma",payload(160000,54));
             for(unsigned i=0;i<8;++i)fs.replace_file("/gamma",payload(70000+i*1024,60+i));
             uint64_t cursor_pruned=0,cursor_reclaimed=0;
-            for(unsigned i=0;i<8;++i) {
+            for(unsigned i=0;i<512 && (!cursor_pruned || !cursor_reclaimed);++i) {
                 auto report=container.collect_step(256*1024,32);
                 CHECK(field(report,"objects_deleted")<=32);
                 CHECK(!boolean_field(report,"logical_sweep_skipped"));
@@ -241,13 +242,13 @@ int main() {
             CHECK(copy_still_valid.names==copied.names && copy_still_valid.entries[1].inode.size==beta.size());
             copy={};
             bool pruned=false,reclaimed=false;
-            for(unsigned i=0;i<64;++i) {
+            for(unsigned i=0;i<512;++i) {
                 auto report=container.collect_step(256*1024,32);
                 CHECK(field(report,"bytes_copied")<=256*1024);
                 pruned|=field(report,"objects_deleted")>0;
                 reclaimed|=field(report,"segments_deleted")>0;
                 container.verify();
-                if(pruned && reclaimed && field(report,"pending_segments")==0)break;
+                if(pruned && reclaimed && !boolean_field(report,"mark_pending") && field(report,"pending_segments")==0)break;
             }
             CHECK(pruned && reclaimed);
             CHECK(segment_bytes(fs_path)<before_reclaim);

@@ -143,10 +143,11 @@ std::string Journal::metrics_json(bool detailed) const {return leveldb_?leveldb_
 void Journal::compact() {need(!read_only_,"revision preview is read-only");need(bool(leveldb_),"direct compaction requires LevelDB");leveldb_->compact();}
 std::shared_ptr<void> Journal::pin_objects() const {return leveldb_?leveldb_->pin_objects():nullptr;}
 std::shared_ptr<void> Journal::pin_manifest(const std::array<unsigned char,32>& manifest) const {return leveldb_?leveldb_->pin_manifest(manifest):nullptr;}
-std::string Journal::collect_step(size_t max_copy_bytes,size_t max_objects,size_t max_metadata_bytes) {
+std::string Journal::collect_step(size_t max_copy_bytes,size_t max_objects,size_t max_metadata_bytes,size_t mark_work) {
     need(!read_only_,"revision preview is read-only");need(bool(leveldb_),"online GC requires LevelDB");
-    return leveldb_->collect_step(max_copy_bytes,max_objects,max_metadata_bytes);
+    return leveldb_->collect_step(max_copy_bytes,max_objects,max_metadata_bytes,mark_work);
 }
+void Journal::cancel_collection(){if(leveldb_)leveldb_->cancel_collection();}
 void Journal::barrier() const {if(leveldb_)leveldb_->barrier();else need(!poisoned_,"journal requires reopen after write failure");}
 Journal::Journal(int fd,const std::array<unsigned char,16>& repo,const Checkpoint& checkpoint):fd_(fd),repository_(repo) {
     struct stat st{}; if(fstat(fd_,&st)<0) io("stat journal");
