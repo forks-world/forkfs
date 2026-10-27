@@ -430,6 +430,11 @@ target_link_libraries(forkfsd_gc_mark_test PRIVATE forkfs_metadata)
 add_test(NAME forkfsd_gc_mark COMMAND forkfsd_gc_mark_test)
 set_tests_properties(forkfsd_gc_mark PROPERTIES TIMEOUT 120 LABELS metadata-regression)
 
+add_executable(forkfsd_physical_gc_budget_test tests/physical_gc_budget.cpp)
+target_link_libraries(forkfsd_physical_gc_budget_test PRIVATE forkfs_namespace)
+add_test(NAME forkfsd_physical_gc_budget COMMAND forkfsd_physical_gc_budget_test)
+set_tests_properties(forkfsd_physical_gc_budget PROPERTIES TIMEOUT 240 LABELS metadata-regression)
+
 add_executable(forkfsd_incremental_gc_namespace_test tests/incremental_gc_namespace.cpp)
 target_link_libraries(forkfsd_incremental_gc_namespace_test PRIVATE forkfs_namespace)
 foreach(seed 1 173 4294967295)

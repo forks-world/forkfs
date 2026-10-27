@@ -126,6 +126,21 @@ int main(){
             CHECK(std::filesystem::exists(source));
             CHECK(data_bytes(repo)>=before);
 
+            // A location pin defers only unlink. Inventory must finish, then
+            // repeated pin waits must stop reporting fictitious scan progress.
+            bool waiting=false;
+            for(unsigned i=0;i<512;++i){
+                auto held=store.collect_step(8*1024*1024,128,64*1024*1024,16);
+                CHECK(number(held,"physical_work_done")<=16);
+                CHECK(number(held,"segments_deleted")==0);
+                CHECK(std::filesystem::exists(source));
+                if(held.find("\"physical_phase\":\"wait_pins\"")!=std::string::npos){waiting=true;break;}
+            }
+            CHECK(waiting);
+            auto stalled=store.collect_step(8*1024*1024,128);
+            CHECK(number(stalled,"physical_work_done")==0);
+            CHECK(stalled.find("\"physical_pending\":true")!=std::string::npos);
+
             writer_future=std::async(std::launch::async,[&]{store.transact(store.sequence(),{{"head",new_value}});});
             const bool writer_progressed=writer_future.wait_for(10s)==std::future_status::ready;
             if(!writer_progressed){release_snapshot();writer_future.get();CHECK(false);}

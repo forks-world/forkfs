@@ -17,6 +17,9 @@ namespace forkfs {
 class ObjectStore {
     std::string path_;
     int active_=-1;uint64_t segment_=0,end_=0;bool dirty_=false;
+    // Directory tail is discovered once on open and maintained as appends
+    // create records. GC steps must not rescan the repository directory.
+    uint64_t largest_segment_=0,largest_end_=0;
     static constexpr uint64_t segment_limit=64*1024*1024,header_size=48;
     static constexpr size_t chunk_size=64*1024;
     size_t budget_;
@@ -88,7 +91,7 @@ class ObjectStore {
         if(active_>=0)return;
         // Indexed extents are immutable. An unindexed crash tail can remain as
         // garbage; new records start after EOF, without rescanning file contents.
-        auto tail=discover_tail();const auto largest=tail.id;
+        const auto largest=largest_segment_;const Tail tail{largest,largest_end_};
         if(largest>0 && tail.end<=segment_limit && required<=segment_limit-tail.end){
             Fd prior{open(filename(largest).c_str(),O_RDWR|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK)};
             if(prior.fd<0)throw std::system_error(errno,std::generic_category(),"reopen data segment");
@@ -98,16 +101,16 @@ class ObjectStore {
         active_=open(filename(segment_).c_str(),O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
         if(active_<0)throw std::system_error(errno,std::generic_category(),"create data segment");
         bool header_written=false;
-        try{write_at(active_,header(segment_),0);header_written=true;sync(active_);Fd dir{open(path_.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC)};if(dir.fd<0)throw std::system_error(errno,std::generic_category(),"open segment directory");sync(dir.fd);end_=header_size;data_usage_+=header_size;}
+        try{write_at(active_,header(segment_),0);header_written=true;sync(active_);Fd dir{open(path_.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC)};if(dir.fd<0)throw std::system_error(errno,std::generic_category(),"open segment directory");sync(dir.fd);end_=header_size;largest_segment_=segment_;largest_end_=end_;data_usage_+=header_size;}
         catch(...){close(active_);active_=-1;if(!header_written){if(unlink(filename(segment_).c_str())==0){Fd dir{open(path_.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC)};if(dir.fd>=0){try{sync(dir.fd);}catch(...){}}}}throw;}
     }
     void create_next_segment(){
-        auto tail=discover_tail();need(tail.id<UINT64_MAX,"data segment IDs exhausted");auto next=tail.id+1;
+        need(largest_segment_<UINT64_MAX,"data segment IDs exhausted");auto next=largest_segment_+1;
         if(active_>=0){sync(active_);close(active_);active_=-1;dirty_=false;}segment_=next;
         active_=open(filename(segment_).c_str(),O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
         if(active_<0)throw std::system_error(errno,std::generic_category(),"create data segment");
         bool header_written=false;
-        try{write_at(active_,header(segment_),0);header_written=true;sync(active_);Fd dir{open(path_.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC)};if(dir.fd<0)throw std::system_error(errno,std::generic_category(),"open segment directory");sync(dir.fd);end_=header_size;data_usage_+=header_size;}
+        try{write_at(active_,header(segment_),0);header_written=true;sync(active_);Fd dir{open(path_.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC)};if(dir.fd<0)throw std::system_error(errno,std::generic_category(),"open segment directory");sync(dir.fd);end_=header_size;largest_segment_=segment_;largest_end_=end_;data_usage_+=header_size;}
         catch(...){close(active_);active_=-1;if(!header_written){if(unlink(filename(segment_).c_str())==0){Fd dir{open(path_.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC)};if(dir.fd>=0){try{sync(dir.fd);}catch(...){}}}}throw;}
     }
     std::string append(const std::string& hash,const std::string& data){
@@ -128,14 +131,14 @@ class ObjectStore {
         }
 #endif
         if(injected("partial_write")){write_at(active_,record.substr(0,record.size()/2),at);throw std::system_error(ENOSPC,std::generic_category(),"injected segment write failure");}
-        write_at(active_,record,at);end_+=record.size();data_usage_+=record.size();dirty_=true;fault("segment_after_append");
+        write_at(active_,record,at);end_+=record.size();largest_segment_=segment_;largest_end_=end_;data_usage_+=record.size();dirty_=true;fault("segment_after_append");
         return number(segment_)+number(at)+replay::le(data.size(),4);
     }
 public:
     using Lookup=std::function<std::optional<std::string>(const std::string&)>;
     using Locations=std::map<std::string,std::string>;
     struct CacheStats{uint64_t hits,misses;size_t charge;};
-    ObjectStore(std::string path,size_t cache_bytes):path_(std::move(path)),budget_(cache_bytes),capacity_(RepositoryBudget::load(path_)){if(capacity_.enabled())data_usage_=RepositoryBudget::data_bytes(path_);}
+    ObjectStore(std::string path,size_t cache_bytes):path_(std::move(path)),budget_(cache_bytes),capacity_(RepositoryBudget::load(path_)){auto tail=discover_tail();largest_segment_=tail.id;largest_end_=tail.end;if(capacity_.enabled())data_usage_=RepositoryBudget::data_bytes(path_);}
     std::pair<uint64_t,uint64_t> space() const{
         auto host=std::filesystem::space(path_);uint64_t available=host.available,capacity=host.capacity;
         if(capacity_.min_free){auto reserve=capacity_.min_free;available=available>reserve?available-reserve:0;available=available>4*1024*1024?available-4*1024*1024:0;}
@@ -146,6 +149,16 @@ public:
     void admit(uint64_t bytes) const{if(capacity_.enabled())capacity_.admit(path_,data_usage_,bytes);}
     void admit_segment_header() const{if(capacity_.enabled())capacity_.admit(path_,data_usage_,header_size);}
     uint64_t active_segment() const{return segment_;}
+    std::string segment_path(uint64_t id) const{return filename(id);}
+    std::pair<uint64_t,uint64_t> tail() const{return {largest_segment_,largest_end_};}
+    std::pair<uint64_t,uint64_t> inspect_segment(const std::filesystem::directory_entry& entry) const {
+        auto name=entry.path().filename().string();need(name.starts_with("DATA-")&&name.ends_with(".seg"),"invalid data segment name");
+        auto digits=name.substr(5,name.size()-9);need(!digits.empty()&&digits.find_first_not_of("0123456789")==std::string::npos,"invalid data segment name");
+        auto id=std::stoull(digits);need(id>0&&std::to_string(id)==digits,"noncanonical data segment name");struct stat st{};
+        need(lstat(entry.path().c_str(),&st)==0&&S_ISREG(st.st_mode)&&st.st_size>=int64_t(header_size)&&uint64_t(st.st_size)<=segment_limit,"invalid data segment type/size");
+        Fd fd{open(entry.path().c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK)};if(fd.fd<0)throw std::system_error(errno,std::generic_category(),"open data segment");
+        need(read_at(fd.fd,header_size,0)==header(id),"data segment header mismatch");return {id,uint64_t(st.st_size)};
+    }
     void seal_and_rotate(){create_next_segment();}
     std::vector<std::pair<uint64_t,uint64_t>> segments(const std::function<void(size_t)>& charge={}) const {
         std::vector<std::pair<uint64_t,uint64_t>> out;
@@ -163,20 +176,20 @@ public:
     void retire_segment(uint64_t id){
         need(id!=segment_,"cannot retire active data segment");auto file=filename(id);struct stat st{};
         bool already_absent=false;
-        if(lstat(file.c_str(),&st)<0){if(errno==ENOENT){already_absent=true;if(capacity_.enabled())data_usage_=RepositoryBudget::data_bytes(path_);}else throw std::system_error(errno,std::generic_category(),"stat retired segment");}
+        if(lstat(file.c_str(),&st)<0){if(errno==ENOENT){already_absent=true;}else throw std::system_error(errno,std::generic_category(),"stat retired segment");}
         if(!already_absent){need(S_ISREG(st.st_mode),"retired segment is not regular");
-            if(unlink(file.c_str())<0){if(errno!=ENOENT)throw std::system_error(errno,std::generic_category(),"unlink retired segment");already_absent=true;if(capacity_.enabled())data_usage_=RepositoryBudget::data_bytes(path_);}}
+            if(unlink(file.c_str())<0){if(errno!=ENOENT)throw std::system_error(errno,std::generic_category(),"unlink retired segment");already_absent=true;}}
         Fd dir{open(path_.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC)};if(dir.fd<0)throw std::system_error(errno,std::generic_category(),"open segment directory");sync(dir.fd);
         if(!already_absent)data_usage_.fetch_sub(std::min<uint64_t>(data_usage_.load(),uint64_t(st.st_size)));
     }
     uint64_t append_cost(const std::vector<size_t>& payload_sizes) const {
         if(payload_sizes.empty())return 0;
         if(active_>=0)return plan_append_cost(payload_sizes,end_,true);
-        auto tail=discover_tail();return plan_append_cost(payload_sizes,tail.end,tail.id>0);
+        return plan_append_cost(payload_sizes,largest_end_,largest_segment_>0);
     }
     uint64_t append_cost(size_t payload_size) const {
         uint64_t end=end_;bool has_tail=active_>=0;
-        if(!has_tail){auto tail=discover_tail();end=tail.end;has_tail=tail.id>0;}
+        if(!has_tail){end=largest_end_;has_tail=largest_segment_>0;}
         return append_growth(payload_size,end,has_tail);
     }
     static uint64_t new_store_cost(const std::vector<size_t>& payload_sizes){return plan_append_cost(payload_sizes,0,false);}

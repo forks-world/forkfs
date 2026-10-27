@@ -304,3 +304,79 @@ process crashes immediately before/after both main-root publication barriers.
 No signed FSKit-mounted acceptance, whole-machine power-loss guarantee, remote
 GC, process RSS ceiling or end-to-end latency target is established by these
 local tests. Earlier local counts above describe their historical changes.
+
+### Resumable physical scans
+
+Physical collection now has a separate, restart-discardable state machine. Each
+`collect_step(..., MARK_WORK)` admits at most `MARK_WORK` logical units **and**
+`MARK_WORK` physical units. `physical_work_done`, `physical_phase` and
+`physical_pending` report the latter; `mark_pending` also includes physical
+continuation for existing clients. A physical unit visits one directory entry
+(including non-segment entries), one chunk-index row, or a bounded phase/EOF
+operation. Copy bytes and unlink counts remain independently capped. These are
+work bounds, not deadlines: an individual read, directory operation, LevelDB
+seek/write or fsync can still stall in the host OS.
+
+Directory traversal and exclusive chunk-key cursors survive calls within the
+same owner. Inventory captures a segment-ID high water so concurrent writers do
+not continually reset an old pass. It examines one candidate at a time and
+retains constant cursor/counter state, rather than maps of every segment.
+Candidate accounting and source scans run outside the writer lock. A selected
+active source is sealed under that lock; each relocated chunk is checked against
+its current location again before publication. A deletion or replacement therefore
+cannot be resurrected by a stale scan. Data sync still precedes the synchronous
+index publication. The source is retired only after the post-seal scan reaches
+EOF: publication cannot introduce new locations in a sealed source.
+
+Retired-marker validation also advances incrementally. A reader location pin
+postpones unlink without preventing inventory/relocation of other segments. Once
+that work finishes, the background worker reports blocked rather than treating
+repeated waits on the same pin as progress. No location pin survives a collection
+call. `pending_segments` now reports a discovered pending marker (0 or 1), rather
+than an eager global marker count; `physical_pending` is the continuation signal.
+Cancellation/reopen discards cursors and rebuilds proofs from durable metadata;
+there is no new on-disk format or persisted scan cursor.
+
+ObjectStore discovers the highest segment at owner startup and maintains that
+identity and EOF as it appends/rotates. Per-step rotation/admission and already
+unlinked retirement recovery no longer enumerate the repository. Startup discovery
+and capacity accounting remain proportional to the number of files.
+
+This implementation prioritizes bounded per-call work. Candidate accounting still
+scans the chunk index separately per candidate: aggregate work can be proportional
+to segments times chunk rows. It does not establish an overall GC throughput,
+process-RSS or scratch-space ceiling. Persisted per-segment accounting would need
+its own format/recovery design before claiming those properties. Relocations
+publish at most eight chunks at a time, limiting the writer critical section but
+potentially increasing sync cost compared with a large batch. Production p95/p99 targets require larger mounted workload
+measurements, beyond the regression's local timing samples.
+
+`forkfsd_physical_gc_budget` (registered as `metadata-regression`) exercises
+one-unit physical calls, finite foreground churn, deletion/new references,
+publication during a sealed-source scan, DATA reduction/peak-growth assertions,
+and cancellation/reopen. It prints local step and interleaved read/write timing
+percentiles without a machine-dependent timing assertion. The concurrency suite
+holds a backup location pin through a complete inventory, asserts zero fictitious
+physical progress in `wait_pins`, then releases it and checks durable unlink.
+The crash suite separately injects chunk-index publication and retired-marker
+publication, including recovery with an exact DATA capacity limit.
+
+For repositories requiring more scan work than one invocation allows, use the
+long-lived daemon/RPC owner. Standalone CLI processes cannot share these in-memory
+cursors: reopening rebuilds proofs, even with the CLI's larger default work
+allowance. Repeated short standalone invocations are not a resumable GC protocol.
+
+Local validation (2026-10-27, macOS 27.0.1 arm64, Apple Clang 21, Release,
+`WFS_BUILD_LEGACY=OFF`, `WFS_COW_FSKIT=OFF`): all 110 registered tests passed,
+including 99 `metadata-regression` tests, in 541.96 seconds with three workers.
+The final production changes were built before the GC tests began; the new
+concurrency and physical-budget tests were also rebuilt before their execution.
+
+The deliberately one-unit physical regression took 66,232 continuation calls.
+Its DATA bytes were 2,192,365 initially, 3,213,445 peak, and 817,260 after drain.
+Collection-step p50/p95/p99 were 147/4,842/6,846 microseconds. Eighteen interleaved
+foreground samples reported write p50/p95/p99 9,401/24,581/24,581 microseconds and
+read 1,088/1,328/1,328 microseconds. These include the namespace API and synchronous
+publication, are from a small synthetic fixture with intentionally tiny budgets,
+and are neither a native-filesystem comparison nor a production latency SLO.
+No signed mounted or remote-CI results were obtained in this implementation turn.

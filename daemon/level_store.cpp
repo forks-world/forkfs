@@ -50,6 +50,17 @@ struct GcCycle {
     ~GcCycle(){if(references)db->ReleaseSnapshot(references);db->ReleaseSnapshot(baseline);}
     const char* phase_name() const {switch(phase){case Roots:return "roots";case Leases:return "leases";case Mark:return "mark";case Objects:return "objects";case References:return "references";case Chunks:return "chunks";default:return "complete";}}
 };
+// Restart-discardable cursors, owned by gc_mutex_. No payload/location pins
+// survive a call. A sealed source cannot gain new C references.
+struct GcPhysical {
+    enum Phase {ReapMarker,ReapC,Inventory,CandidateC,SourceC,WaitPins};
+    Phase phase=ReapMarker;
+    std::filesystem::directory_iterator directory,end;
+    bool directory_started=false,changed=false,reap_ready=false,eligible=false;
+    uint64_t high_water=0,sequence=0,candidate=0,length=0,indexed=0,reap_sid=0,reaped_high_water=0;
+    std::string cursor,reap_key;
+    const char* phase_name() const {switch(phase){case ReapMarker:return "reap_marker";case ReapC:return "reap_c";case Inventory:return "inventory";case CandidateC:return "candidate_c";case WaitPins:return "wait_pins";default:return "source_c";}}
+};
 struct StoreIoMetrics {
     std::atomic<uint64_t> root_get_calls=0,root_get_ns=0,root_misses=0,root_cache_hits=0,object_get_calls=0,object_get_ns=0,object_misses=0,meta_get_calls=0,meta_get_ns=0;
     std::atomic<uint64_t> transactions=0,prepare_ns=0,write_ns=0,wal_sync_calls=0,wal_sync_ns=0,other_sync_calls=0,other_sync_ns=0,wal_append_bytes=0,wal_append_ns=0,wal_flush_ns=0;
@@ -164,7 +175,7 @@ LevelStore::LevelStore(const std::string& path,bool initialize,size_t object_cac
         need(!read("M/replay/base",value) && !read("M/replay/head",value),"incomplete replay metadata");
     }
 }
-LevelStore::~LevelStore(){gc_cycle_.reset();}
+LevelStore::~LevelStore(){gc_physical_.reset();gc_cycle_.reset();}
 std::shared_ptr<void> LevelStore::pin_objects() const {
     auto state=pin_state_;{std::lock_guard lock(state->mutex);++state->logical;}
     return std::shared_ptr<void>(state.get(),[state](void*){std::lock_guard lock(state->mutex);--state->logical;});
@@ -194,7 +205,7 @@ LevelStore::LocationPin LevelStore::pin_locations() const {
     auto* state=pin_state_.get();{std::lock_guard lock(state->mutex);++state->locations;}
     return LocationPin(state);
 }
-void LevelStore::cancel_collection(){std::lock_guard gc(gc_mutex_);std::lock_guard writer(writer_mutex_);gc_cycle_.reset();}
+void LevelStore::cancel_collection(){std::lock_guard gc(gc_mutex_);std::lock_guard writer(writer_mutex_);gc_cycle_.reset();gc_physical_.reset();}
 void LevelStore::barrier() const {std::lock_guard lock(writer_mutex_);healthy();}
 // The coordinator is the only component that knows both object bytes and DB
 // indexes. LevelDB itself is unwrapped and receives metadata-only WriteBatches.
@@ -768,43 +779,10 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
     auto charge=[&](size_t n){need(n<=max_metadata_bytes-metadata_bytes,"GC metadata memory budget exceeded");metadata_bytes+=n;};
     std::unique_lock gc(gc_mutex_,std::try_to_lock);need(gc.owns_lock(),"online GC is already running");
     auto pin=pin_objects();healthy();
-    auto release=[this](const leveldb::Snapshot* s){db_->ReleaseSnapshot(s);};
     uint64_t segments_deleted=0,pending=0;
-    auto reap_one=[&](bool allow_unlink){
-        std::map<uint64_t,std::string> markers;std::set<uint64_t> referenced;
-        auto scan_pin=pin_locations();auto snap=std::unique_ptr<const leveldb::Snapshot,decltype(release)>(db_->GetSnapshot(),release);
-        leveldb::ReadOptions ro;ro.verify_checksums=true;ro.fill_cache=false;ro.snapshot=snap.get();
-        std::string raw_format;status(db_->Get(ro,"M/format",&raw_format),"read retired marker format");
-        (void)logical_value(ro,"M/format",raw_format);const unsigned snapshot_physical_format=raw_format[7]-'0';
-        std::unique_ptr<leveldb::Iterator> gi(db_->NewIterator(ro));
-        for(gi->Seek("G/");gi->Valid()&&gi->key().starts_with("G/");gi->Next()){
-            auto key=gi->key().ToString(),value=gi->value().ToString();need(snapshot_physical_format>=7 && key.size()==10 && value=="FFGCRET1","invalid retired segment marker");
-            auto sid=replay::num(key.substr(2));need(sid>0 && integer(sid)==key.substr(2),"invalid retired segment ID");charge(192+key.size());markers.emplace(sid,key);
-        }
-        status(gi->status(),"online GC retired segment scan");gi.reset();
-        pending=markers.size();if(markers.empty()){snap.reset();scan_pin.reset();return;}
-        std::unique_ptr<leveldb::Iterator> ci(db_->NewIterator(ro));
-        for(ci->Seek("C/");ci->Valid()&&ci->key().starts_with("C/");ci->Next()){
-            replay::Input loc{ci->value().ToString()};auto sid=loc.integer(8);(void)loc.integer(8);(void)loc.integer(4);loc.end();
-            if(markers.contains(sid) && !referenced.contains(sid)){charge(128);referenced.insert(sid);}
-        }
-        status(ci->status(),"online GC retired C-reference scan");ci.reset();snap.reset();scan_pin.reset();
-        std::unique_lock writer(writer_mutex_);healthy();std::lock_guard pins(pin_state_->mutex);
-        auto files=object_store_->segments(charge);
-        for(const auto& [sid,key]:markers){
-            need(!referenced.contains(sid),"retired segment still has a current chunk reference");
-            need(!files.empty() && sid<files.back().first,"retired segment lacks a durable higher segment");
-        }
-        if(!allow_unlink || pin_state_->locations!=0)return;
-        const auto& [sid,key]=*markers.begin();object_store_->retire_segment(sid);fault("gc_online_after_unlink");
-        leveldb::WriteBatch del;del.Delete(key);leveldb::WriteOptions wo;wo.sync=true;
-        try{status(db_->Write(wo,&del),"delete retired segment marker");}catch(...){object_store_->abandon();poisoned_=true;throw;}
-        fault("gc_online_after_delete_sync");++segments_deleted;--pending;
-    };
-    reap_one(true);
     charge(32*1024); // bounded marker/task working metadata; disk marks are not resident sets
     uint64_t seq=0,deleted=0,chunks_deleted=0,work_done=0,mark_processed=0;
-    bool sweep_skipped=false,mark_pending=false,round_complete=false;std::string mark_phase="complete";
+    bool sweep_skipped=false,mark_pending=false;std::string mark_phase="complete";
     std::shared_ptr<GcCycle> cycle;
     try {
         {std::lock_guard writer(writer_mutex_);healthy();
@@ -888,68 +866,193 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
             }
         }
         if(cycle){mark_processed=cycle->mark.processed();mark_pending=cycle->phase!=GcCycle::Complete;mark_phase=cycle->phase_name();
-            if(!mark_pending){std::lock_guard writer(writer_mutex_);healthy();if(gc_cycle_!=cycle)throw std::runtime_error("GC mark invalidated");if(cycle->mark.has_work()){mark_pending=true;mark_phase="mark";}else {round_complete=true;mark_pending=cycle->deleted!=0 || cycle->sequence!=sequence_;if(mark_pending)mark_phase="cycle_complete";gc_cycle_.reset();}}}
+            if(!mark_pending){std::lock_guard writer(writer_mutex_);healthy();if(gc_cycle_!=cycle)throw std::runtime_error("GC mark invalidated");if(cycle->mark.has_work()){mark_pending=true;mark_phase="mark";}else {mark_pending=cycle->deleted!=0 || cycle->sequence!=sequence_;if(mark_pending){mark_phase="cycle_complete";gc_cycle_.reset();}}}}
     }catch(...){std::lock_guard writer(writer_mutex_);if(gc_cycle_==cycle)gc_cycle_.reset();throw;}
-    auto report=[&](uint64_t moved,uint64_t copied){return "{\"metadata_budget_bytes\":"+std::to_string(max_metadata_bytes)+",\"metadata_bytes_charged\":"+std::to_string(metadata_bytes)+",\"mark_work_done\":"+std::to_string(work_done)+",\"mark_processed\":"+std::to_string(mark_processed)+",\"mark_pending\":"+(mark_pending?"true":"false")+",\"mark_phase\":\""+mark_phase+"\",\"objects_deleted\":"+std::to_string(deleted)+",\"chunks_deleted\":"+std::to_string(chunks_deleted)+",\"chunks_moved\":"+std::to_string(moved)+",\"bytes_copied\":"+std::to_string(copied)+",\"segments_deleted\":"+std::to_string(segments_deleted)+",\"pending_segments\":"+std::to_string(pending)+",\"logical_sweep_skipped\":"+(sweep_skipped?"true":"false")+",\"sequence\":"+std::to_string(seq)+"}";};
-    if(mark_pending && !round_complete && !sweep_skipped)return report(0,0);
-    auto physical_pin=pin_locations();
-    std::unique_ptr<const leveldb::Snapshot,decltype(release)> snapshot(db_->GetSnapshot(),release);
-    leveldb::ReadOptions options;options.verify_checksums=true;options.fill_cache=false;options.snapshot=snapshot.get();
-    std::set<uint64_t> retired;std::unique_ptr<leveldb::Iterator> it(db_->NewIterator(options));
-    for(it->Seek("G/");it->Valid()&&it->key().starts_with("G/");it->Next()){need(it->key().size()==10&&it->value().ToString()=="FFGCRET1","invalid retired segment marker");charge(128);retired.insert(number(it->key().ToString().substr(2)));}status(it->status(),"physical GC retired scan");
-    uint64_t moved=0,copied=0;
-    // The indexed chunk scan is outside the writer lock. A selected segment is
-    // sealed under the lock before taking the authoritative post-seal C view.
-    std::map<uint64_t,uint64_t> indexed;
-    for(it->Seek("C/");it->Valid() && it->key().starts_with("C/");it->Next()){
-        replay::Input d{it->value().ToString()};auto sid=d.integer(8);(void)d.integer(8);auto n=d.integer(4);d.end();if(!indexed.contains(sid))charge(128);indexed[sid]+=n+44;}
-    status(it->status(),"online GC segment accounting scan");it.reset();snapshot.reset();physical_pin.reset();
-    uint64_t source=0,source_size=0;std::vector<std::pair<uint64_t,uint64_t>> segment_files;
-    {std::unique_lock inventory(writer_mutex_);healthy();segment_files=object_store_->segments(charge);}
-    for(const auto& [sid,length]:segment_files){auto found=indexed.find(sid);auto indexed_bytes=found==indexed.end()?0:found->second;
-        if(!retired.contains(sid) && indexed_bytes+48<length && (!source || length-indexed_bytes>source_size)){source=sid;source_size=length-indexed_bytes;}}
-    if(source){
-        std::unique_lock lock(writer_mutex_);healthy();if(!segment_files.empty() && source==segment_files.back().first){
-            object_store_->admit_segment_header();
-            try{object_store_->seal_and_rotate();}catch(...){object_store_->abandon();poisoned_=true;throw;}
+    uint64_t moved=0,copied=0,physical_work=0;
+    bool physical_pending=true;
+    std::string physical_phase="complete";
+    if(!gc_physical_){
+        gc_physical_=std::make_unique<GcPhysical>();
+        std::lock_guard writer(writer_mutex_);gc_physical_->high_water=object_store_->tail().first;gc_physical_->sequence=sequence_;
+    }
+    auto& ph=*gc_physical_;
+    ph.changed=ph.changed || chunks_deleted!=0;
+    ph.eligible=ph.eligible || !mark_pending || sweep_skipped || mark_phase=="cycle_complete";
+    leveldb::ReadOptions ro;ro.verify_checksums=true;ro.fill_cache=false;
+    auto chunk_location=[&](const std::string& loc){
+        replay::Input d{loc};auto sid=d.integer(8);auto offset=d.integer(8);auto n=d.integer(4);d.end();
+        need(sid>0 && offset>=48 && n<=65536,"invalid physical GC chunk location");
+        return std::pair<uint64_t,uint64_t>{sid,n};
+    };
+    auto resume=[&](const char* prefix){
+        auto it=std::unique_ptr<leveldb::Iterator>(db_->NewIterator(ro));
+        it->Seek(ph.cursor.empty()?std::string(prefix):ph.cursor);
+        if(!ph.cursor.empty() && it->Valid() && it->key().ToString()==ph.cursor)it->Next();
+        status(it->status(),"resume physical GC index");return it;
+    };
+    try {
+        // EOF proof remains valid for this sealed retired segment. A reader
+        // delays unlink only; let inventory/relocation finish in the meantime.
+        if(ph.reap_ready){
+            pending=1;
+            std::unique_lock writer(writer_mutex_);healthy();std::lock_guard pins(pin_state_->mutex);
+            if(pin_state_->locations==0){
+                object_store_->retire_segment(ph.reap_sid);fault("gc_online_after_unlink");
+                leveldb::WriteBatch del;del.Delete(ph.reap_key);leveldb::WriteOptions wo;wo.sync=true;
+                try{status(db_->Write(wo,&del),"delete retired segment marker");}catch(...){object_store_->abandon();poisoned_=true;throw;}
+                fault("gc_online_after_delete_sync");++segments_deleted;++physical_work;pending=0;ph.reaped_high_water=std::max(ph.reaped_high_water,ph.reap_sid);
+                ph.reap_ready=false;ph.changed=true;
+                if(ph.phase==GcPhysical::WaitPins){ph.directory_started=false;ph.phase=GcPhysical::ReapMarker;}
+            }
         }
-        auto physical_pin=pin_locations();
-        std::unique_ptr<const leveldb::Snapshot,decltype(release)> post(db_->GetSnapshot(),release);
-        leveldb::ReadOptions po;po.verify_checksums=true;po.fill_cache=false;po.snapshot=post.get();
-        std::vector<std::pair<std::string,std::string>> refs;uint64_t total_refs=0,ref_bytes=0;
-        lock.unlock();
-        std::unique_ptr<leveldb::Iterator> ci(db_->NewIterator(po));for(ci->Seek("C/");ci->Valid()&&ci->key().starts_with("C/");ci->Next()){
-            auto key=ci->key().ToString(),loc=ci->value().ToString();replay::Input d{loc};if(d.integer(8)==source){++total_refs;(void)d.integer(8);auto length=d.integer(4);if(ref_bytes+length<=max_copy_bytes && refs.size()==total_refs-1){charge(1024);refs.emplace_back(key,loc);ref_bytes+=length;}}}
-        status(ci->status(),"online GC sealed chunk scan");ci.reset();post.reset();
-        lock.lock();healthy();
-        std::vector<std::pair<std::string,std::string>> copy_refs;std::vector<size_t> copy_sizes;uint64_t used=0;
-        for(const auto& [key,oldloc]:refs){replay::Input d{oldloc};(void)d.integer(8);(void)d.integer(8);auto length=d.integer(4);if(used+length>max_copy_bytes)break;
-            copy_refs.emplace_back(key,oldloc);copy_sizes.push_back(length);used+=length;}
-        object_store_->admit(object_store_->append_cost(copy_sizes));
-        ObjectStore::Locations updates;used=0;bool attempted_append=false;
-        try {
-            for(const auto& [key,oldloc]:copy_refs){
-                auto hash=key.substr(2),payload=object_store_->read_chunk(hash,oldloc);attempted_append=true;auto newloc=object_store_->relocate(hash,payload);updates.emplace(key,newloc);used+=payload.size();++moved;copied+=payload.size();fault("gc_online_after_copy");}
-            if(moved){object_store_->sync();fault("gc_online_after_sync");leveldb::WriteBatch wb;for(const auto& [key,loc]:updates)wb.Put(key,loc);
-                if(moved==total_refs){auto gkey="G/"+integer(source);wb.Put(gkey,"FFGCRET1");auto logical=(physical_format_.load()%2)?1:2;auto fmt=(logical==1?7:8);wb.Put("M/format","FFLDB00"+std::to_string(fmt));}
-                fault("gc_online_before_publish");leveldb::WriteOptions wo;wo.sync=true;status(db_->Write(wo,&wb),"publish online GC relocation");
-                if(moved==total_refs){
+        while(physical_work<mark_work){
+            healthy();
+            if(ph.phase==GcPhysical::WaitPins)break;
+            if(ph.phase==GcPhysical::ReapMarker && ph.reap_ready){ph.phase=GcPhysical::Inventory;continue;}
+            if(ph.phase==GcPhysical::ReapMarker){
+                ++physical_work;
+                auto it=std::unique_ptr<leveldb::Iterator>(db_->NewIterator(ro));it->Seek("G/");
+                status(it->status(),"physical GC retired marker");
+                if(!it->Valid() || !it->key().starts_with("G/")){ph.phase=GcPhysical::Inventory;continue;}
+                ph.reap_key=it->key().ToString();
+                need(ph.reap_key.size()==10 && it->value().ToString()=="FFGCRET1","invalid retired segment marker");
+                ph.reap_sid=number(ph.reap_key.substr(2));need(ph.reap_sid>0,"invalid retired segment ID");
+                {std::lock_guard writer(writer_mutex_);healthy();
+                    need(physical_format_>=7 && ph.reap_sid<object_store_->tail().first,"retired segment lacks a durable higher segment");}
+                pending=1;ph.cursor.clear();ph.phase=GcPhysical::ReapC;continue;
+            }
+            if(ph.phase==GcPhysical::ReapC){
+                auto it=resume("C/");++physical_work;pending=1;
+                if(it->Valid() && it->key().starts_with("C/")){
+                    need(chunk_location(it->value().ToString()).first!=ph.reap_sid,"retired segment still has a current chunk reference");
+                    ph.cursor=it->key().ToString();continue;
+                }
+                it.reset();
+                std::unique_lock writer(writer_mutex_);healthy();std::lock_guard pins(pin_state_->mutex);
+                if(pin_state_->locations!=0 || segments_deleted!=0){
+                    ph.reap_ready=true;ph.cursor.clear();ph.phase=GcPhysical::Inventory;
+                    continue;
+                }
+                object_store_->retire_segment(ph.reap_sid);fault("gc_online_after_unlink");
+                leveldb::WriteBatch del;del.Delete(ph.reap_key);leveldb::WriteOptions wo;wo.sync=true;
+                try{status(db_->Write(wo,&del),"delete retired segment marker");}catch(...){object_store_->abandon();poisoned_=true;throw;}
+                fault("gc_online_after_delete_sync");++segments_deleted;pending=0;ph.changed=true;ph.reaped_high_water=std::max(ph.reaped_high_water,ph.reap_sid);
+                ph.cursor.clear();ph.phase=GcPhysical::ReapMarker;continue;
+            }
+            if(ph.phase==GcPhysical::Inventory){
+                if(!ph.eligible)break; // do not copy garbage before logical pruning finishes
+                if(!ph.directory_started){ph.directory=std::filesystem::directory_iterator(path_);ph.directory_started=true;}
+                if(ph.directory==ph.end){
+                    // Inventory was finite. New writes/deletions require another round,
+                    // but never reset a cursor while an existing round is progressing.
+                    bool again=ph.changed || ph.sequence!=sequence_;
+                    if(ph.reap_ready){ph.phase=GcPhysical::WaitPins;pending=1;break;}
+                    physical_pending=again;physical_phase=again?"round_complete":"complete";
+                    gc_physical_.reset();break;
+                }
+                auto entry=*ph.directory;++ph.directory;++physical_work;
+                const auto name=entry.path().filename().string();
+                if(!name.starts_with("DATA-") || !name.ends_with(".seg"))continue;
+                // readdir may retain an entry unlinked by this same GC round.
+                // Only the exclusive owner mutates DATA names; bound tolerance
+                // to IDs at/below a retirement already proved by this round.
+                if(ph.reaped_high_water){
+                    struct stat st{};
+                    if(lstat(entry.path().c_str(),&st)<0 && errno==ENOENT){
+                        auto digits=name.substr(5,name.size()-9);
+                        need(!digits.empty() && digits.find_first_not_of("0123456789")==std::string::npos,"invalid data segment name");
+                        auto sid=std::stoull(digits);need(sid>0 && std::to_string(sid)==digits && sid<=ph.reaped_high_water,"unexpected missing GC segment");
+                        continue;
+                    }
+                }
+                auto file=object_store_->inspect_segment(entry);
+                if(file.first>ph.high_water)continue;
+                std::string marker;auto st=db_->Get(ro,"G/"+integer(file.first),&marker);
+                if(st.ok()){need(marker=="FFGCRET1","invalid retired segment marker");continue;}
+                if(!st.IsNotFound())status(st,"physical GC candidate marker");
+                ph.candidate=file.first;ph.length=file.second;ph.indexed=0;ph.cursor.clear();ph.phase=GcPhysical::CandidateC;continue;
+            }
+            if(ph.phase==GcPhysical::CandidateC){
+                auto it=resume("C/");++physical_work;
+                if(it->Valid() && it->key().starts_with("C/")){
+                    auto [sid,n]=chunk_location(it->value().ToString());if(sid==ph.candidate)ph.indexed+=n+44;
+                    ph.cursor=it->key().ToString();continue;
+                }
+                it.reset();
+                if(ph.indexed+48>=ph.length){ph.phase=GcPhysical::Inventory;ph.cursor.clear();continue;}
+                std::lock_guard writer(writer_mutex_);healthy();
+                if(ph.candidate==object_store_->tail().first){
+                    object_store_->admit_segment_header();
+                    try{object_store_->seal_and_rotate();}catch(...){object_store_->abandon();poisoned_=true;throw;}
+                }
+                need(ph.candidate<object_store_->tail().first,"physical GC source is not sealed");
+                ph.cursor.clear();ph.phase=GcPhysical::SourceC;continue;
+            }
+            // C rows cannot start pointing to a sealed source: publications either
+            // reuse a current row or append to the higher active segment. A fresh
+            // iterator plus exclusive cursor therefore suffices without a long pin.
+            auto location_pin=pin_locations();
+            auto it=resume("C/");
+            if(!it->Valid() || !it->key().starts_with("C/")){
+                ++physical_work;it.reset();location_pin.reset();
+                std::lock_guard writer(writer_mutex_);healthy();
+                leveldb::WriteBatch wb;wb.Put("G/"+integer(ph.candidate),"FFGCRET1");
+                const auto fmt=physical_format_.load()%2?7:8;wb.Put("M/format","FFLDB00"+std::to_string(fmt));
+                try{fault("gc_online_before_publish");leveldb::WriteOptions wo;wo.sync=true;
+                    status(db_->Write(wo,&wb),"retire online GC source");
 #ifdef FORKFS_TEST_GC
                     extern void test_gc_indexes_published();test_gc_indexes_published();
 #endif
-                    physical_format_=physical_format_.load()%2?7:8;
-                }fault("gc_online_after_publish");
-            }else if(total_refs==0){
-                attempted_append=true;leveldb::WriteBatch wb;wb.Put("G/"+integer(source),"FFGCRET1");wb.Put("M/format",physical_format_.load()%2?"FFLDB007":"FFLDB008");fault("gc_online_before_publish");leveldb::WriteOptions wo;wo.sync=true;status(db_->Write(wo,&wb),"retire empty online GC segment");
-#ifdef FORKFS_TEST_GC
-                extern void test_gc_indexes_published();test_gc_indexes_published();
-#endif
-                physical_format_=physical_format_.load()%2?7:8;fault("gc_online_after_publish");
+                    physical_format_=fmt;fault("gc_online_after_publish");
+                }catch(...){object_store_->abandon();poisoned_=true;throw;}
+                ph.changed=true;ph.cursor.clear();ph.phase=GcPhysical::ReapMarker;pending=1;continue;
             }
-        }catch(...){if(attempted_append){object_store_->abandon();poisoned_=true;}throw;}
-    }
-    reap_one(segments_deleted==0);
-    return report(moved,copied);
+            // Collect a small batch outside the writer lock. Every visited row
+            // consumes work; at most eight matching chunks enter a publication.
+            std::vector<std::pair<std::string,std::string>> refs;
+            uint64_t batch_bytes=0,visits=0;std::string next_cursor=ph.cursor;
+            while(it->Valid() && it->key().starts_with("C/") && physical_work+visits<mark_work){
+                auto key=it->key().ToString(),loc=it->value().ToString();
+                need(key.size()==34,"invalid physical GC chunk key");auto [sid,n]=chunk_location(loc);
+                if(sid==ph.candidate){
+                    if(n>max_copy_bytes-copied-batch_bytes || refs.size()==8)break;
+                    charge(1024);refs.emplace_back(key,loc);batch_bytes+=n;
+                }
+                next_cursor=key;++visits;it->Next();
+            }
+            status(it->status(),"physical GC source scan");it.reset();
+            if(visits==0)break; // copy allowance exhausted; retry same key next call
+            std::unique_lock writer(writer_mutex_);healthy();
+            std::vector<std::pair<std::string,std::string>> current_refs;std::vector<size_t> sizes;
+            for(const auto& [key,oldloc]:refs){
+                std::string current;auto st=db_->Get(ro,key,&current);
+                if(!st.ok() && !st.IsNotFound())status(st,"recheck physical GC location");
+                if(st.ok() && current==oldloc){current_refs.emplace_back(key,oldloc);sizes.push_back(size_t(chunk_location(oldloc).second));}
+            }
+            if(!sizes.empty())object_store_->admit(object_store_->append_cost(sizes));
+            bool attempted=false;uint64_t batch_moved=0,batch_copied=0;
+            try{
+                leveldb::WriteBatch wb;
+                for(const auto& [key,oldloc]:current_refs){
+                    auto hash=key.substr(2),payload=object_store_->read_chunk(hash,oldloc);
+                    attempted=true;auto newloc=object_store_->relocate(hash,payload);fault("gc_online_after_copy");
+                    wb.Put(key,newloc);++batch_moved;batch_copied+=payload.size();
+                }
+                if(batch_moved){
+                    object_store_->sync();fault("gc_online_after_sync");leveldb::WriteOptions wo;wo.sync=true;
+                    fault("gc_online_before_publish");status(db_->Write(wo,&wb),"publish online GC relocation");fault("gc_online_after_chunk_publish");
+                }
+            }catch(...){if(attempted){object_store_->abandon();poisoned_=true;}throw;}
+            moved+=batch_moved;copied+=batch_copied;ph.changed=ph.changed || batch_moved!=0;
+            physical_work+=visits;ph.cursor=next_cursor;
+
+        }
+        if(gc_physical_)physical_phase=gc_physical_->phase_name();
+    }catch(...){gc_physical_.reset();throw;}
+    if(!mark_pending && !physical_pending){std::lock_guard writer(writer_mutex_);gc_cycle_.reset();}
+    mark_pending=mark_pending || physical_pending;
+    return "{\"metadata_budget_bytes\":"+std::to_string(max_metadata_bytes)+",\"metadata_bytes_charged\":"+std::to_string(metadata_bytes)+",\"mark_work_done\":"+std::to_string(work_done)+",\"mark_processed\":"+std::to_string(mark_processed)+",\"mark_pending\":"+(mark_pending?"true":"false")+",\"mark_phase\":\""+mark_phase+"\",\"physical_work_done\":"+std::to_string(physical_work)+",\"physical_pending\":"+(physical_pending?"true":"false")+",\"physical_phase\":\""+physical_phase+"\",\"objects_deleted\":"+std::to_string(deleted)+",\"chunks_deleted\":"+std::to_string(chunks_deleted)+",\"chunks_moved\":"+std::to_string(moved)+",\"bytes_copied\":"+std::to_string(copied)+",\"segments_deleted\":"+std::to_string(segments_deleted)+",\"pending_segments\":"+std::to_string(pending)+",\"logical_sweep_skipped\":"+(sweep_skipped?"true":"false")+",\"sequence\":"+std::to_string(seq)+"}";
+
 }
 
 std::string LevelStore::collect(const std::string& input,const std::string& checkpoint,bool dry_run){

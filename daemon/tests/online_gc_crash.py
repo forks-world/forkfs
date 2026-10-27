@@ -108,7 +108,7 @@ with tempfile.TemporaryDirectory(prefix='ff-online-gc-crash-') as temp:
     # Each fault runs against an independent copy so every durable boundary is
     # reached from a clean generation and recovery is checked independently.
     stages = ('gc_online_after_copy', 'gc_online_after_sync',
-              'gc_online_before_publish', 'gc_online_after_publish',
+              'gc_online_before_publish', 'gc_online_after_chunk_publish', 'gc_online_after_publish',
               'gc_online_after_unlink', 'gc_online_after_delete_sync',
               'gc_mark_after_begin', 'gc_mark_after_task',
               'gc_mark_before_sweep', 'gc_mark_after_sweep')

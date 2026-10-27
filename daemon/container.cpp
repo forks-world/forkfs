@@ -294,9 +294,10 @@ std::string Container::start_collection(size_t max_copy_bytes,size_t max_objects
                     require(end!=at,"invalid GC progress report");return std::stoull(report.substr(at,end-at));
                 };
                 const bool reclaimed=count("objects_deleted") || count("chunks_deleted") || count("chunks_moved") || count("segments_deleted");
-                const bool progress=reclaimed || count("mark_work_done");
+                const bool progress=reclaimed || count("mark_work_done") || count("physical_work_done");
                 const bool mark_pending=report.find("\"mark_pending\":true")!=std::string::npos;
-                const bool pending=count("pending_segments")!=0 || mark_pending;
+                const bool physical_pending=report.find("\"physical_pending\":true")!=std::string::npos;
+                const bool pending=count("pending_segments")!=0 || mark_pending || physical_pending;
                 {std::lock_guard lock(collection_mutex_);collection_last_=report;++collection_steps_;}
                 const bool skipped=report.find("\"logical_sweep_skipped\":true")!=std::string::npos;
                 if(!pending && !reclaimed && !skipped){state="complete";break;}
