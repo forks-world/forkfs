@@ -342,11 +342,11 @@ identity and EOF as it appends/rotates. Per-step rotation/admission and already
 unlinked retirement recovery no longer enumerate the repository. Startup discovery
 and capacity accounting remain proportional to the number of files.
 
-This implementation prioritizes bounded per-call work. Candidate accounting still
-scans the chunk index separately per candidate: aggregate work can be proportional
+The first bounded-scan implementation prioritized per-call work. Its candidate accounting
+scanned the chunk index separately per candidate: aggregate work could be proportional
 to segments times chunk rows. It does not establish an overall GC throughput,
-process-RSS or scratch-space ceiling. Persisted per-segment accounting would need
-its own format/recovery design before claiming those properties. Relocations
+process-RSS or scratch-space ceiling. The scratch reverse-index implementation below removes that repeated scan without
+introducing persistent per-segment accounting. Relocations
 publish at most eight chunks at a time, limiting the writer critical section but
 potentially increasing sync cost compared with a large batch. Production p95/p99 targets require larger mounted workload
 measurements, beyond the regression's local timing samples.
@@ -380,3 +380,92 @@ read 1,088/1,328/1,328 microseconds. These include the namespace API and synchro
 publication, are from a small synthetic fixture with intentionally tiny budgets,
 and are neither a native-filesystem comparison nor a production latency SLO.
 No signed mounted or remote-CI results were obtained in this implementation turn.
+
+
+### Per-round segment reverse index
+
+Physical GC now builds a private disk-backed reverse index in
+`.gc-physical-XXXXXX/db`. The owning daemon captures the initial tail ID and a
+main-LevelDB snapshot together under the publication lock. It visits each `C/`
+row once, in budgeted slices, storing scratch metadata only:
+
+- `R/<sid:8 little-endian><chunk hash:32>` → original 20-byte chunk location.
+- `N/<sid:8 little-endian>` → summed payload bytes plus record headers, uint64 LE.
+
+No file payload is stored in the scratch database. Its memtable request is
+64 KiB, block cache retention is disabled, compression is disabled and the
+open-file setting is small. These LevelDB internals are outside the conservative
+GC-owned metadata charge, as with logical marking. Scratch disk usage is O(C)
+metadata; it is not included in the DATA-segment capacity limit and can fail on
+host ENOSPC. Scratch failure abandons that physical pass without authorizing a
+retirement or independently poisoning the main store. Successful earlier main
+publications remain committed. Startup/cancellation discard the scratch index;
+there is no new repository format, persistent index or migration.
+
+Candidate accounting is a scratch counter lookup. Relocation and retirement
+validation visit only that segment's reverse-reference prefix. Every relocation
+still checks the current main `C/` location for exact equality; retired-reference
+validation rejects any current location in the retired segment, including an
+unexpected alternate offset. Stale scratch rows resulting from deletes/moves
+are conservative and never resurrect a reference. A segment sealed before the
+initial snapshot cannot gain new `C/` locations under the writer protocol.
+
+The captured active segment is different: foreground writes may add locations
+there before it is sealed, even when the foreground already rotated it by the
+time GC selects it. Selection therefore seals it if needed, then captures a
+fresh snapshot and performs one additional budgeted `C/` scan for that segment.
+The refresh completes before copying or retirement. A retirement proof must
+belong to the indexed generation: a marker for the captured tail is rejected
+unless that tail's authoritative refresh completed. Merely seeing a newer
+current tail does not establish coverage of the older one.
+
+Per physical round, full main-index visits are bounded by the initial scan plus
+at most one active-tail refresh. Other visits follow segment prefixes: row visits
+scale with C rows and segments rather than their product. Actual CPU/I/O also
+includes LevelDB seeks, scratch writes/compaction, payload copying and syncs;
+this is not a strict wall-clock linear-time or latency guarantee. Concurrent
+changes can require follow-up rounds. Main snapshots are released immediately
+after their index/refresh completes; no location pin survives a call.
+
+Reports add `physical_index_work` (main C rows visited),
+`physical_reference_work` (scratch references visited), and
+`physical_candidate_work` (candidate-counter lookups), each charged within
+`physical_work_done`. `forkfsd_gc_segment_index` compares 4- and 12-segment sparse
+fixtures using independently counted pre-GC C rows, normalized scan-growth bounds,
+known payload oracles, and a write during the actual index build. A separate
+corrupt-marker case rotates the captured tail during construction and requires
+refusal without unlink or main-owner poisoning. Crash tests include index-row
+and index-complete boundaries; restart tests discard corrupt scratch and avoid
+traversing scratch symlinks.
+
+After refreshing a captured tail, GC rechecks its immutable sealed size against
+the refreshed byte counter. A now fully packed tail is skipped rather than
+recopied; the regression requires exactly one copy of each old-source chunk in
+that case. Normal scratch cleanup is a separate budgeted phase: closing the
+scratch DB, each file unlink, and directory removal are charged operations.
+LevelDB close can still wait for background compaction and free version metadata;
+this bounds explicit filesystem deletion count, not close latency. Cancellation
+and error teardown discard scratch synchronously and are not latency guarantees.
+
+Validation for the reverse-index increment (2026-10-27, same macOS arm64 Release
+configuration): the complete 111-test run passed 110 tests in 566.79 seconds. The
+sole failure was a 30-second mock HTTP wait in the deep-directory sync case;
+all other mock cases passed. With builds and competing tests finished, the entire
+34-case sync mock passed unchanged in an isolated CTest rerun (53.00 seconds).
+The final production tree then passed all 13 targeted GC tests in 119.16 seconds,
+including memory budgets, crash injection, concurrent pins, three namespace seeds
+and three online models. No assertion or timeout was relaxed.
+
+The 4-/12-segment fixtures had independently counted pre-GC populations of 19/59
+C rows and published one additional live chunk while indexing. The final targeted
+run visited 59/239 main C rows in total, across all necessary physical rounds;
+the earlier full run visited 59/179. Directory ordering and follow-up rounds can
+change totals, so tests assert normalized growth and an explicit visit ceiling,
+not exact counts. The packed-tail fixture moved exactly 18 old-source chunks
+instead of recopying the fully packed tail.
+
+The final one-unit regression also passed separately in 139.562 seconds with
+71,195 calls: DATA initial/peak/final 2,283,834/3,235,906/817,260 bytes; step
+p50/p95/p99 154/4,810/6,803 microseconds. Its 18 interleaved samples reported write
+13,577/27,238/27,238 and read 843/1,053/1,053 microseconds. As above, these are
+small local diagnostic samples, not mounted acceptance or a throughput/SLO claim.

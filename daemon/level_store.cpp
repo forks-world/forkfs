@@ -8,6 +8,7 @@
 #include "repository_budget.h"
 #include "gc_checkpoint.h"
 #include "gc_mark.h"
+#include "gc_physical_index.h"
 #include "metadata_view.h"
 #ifndef __APPLE__
 #include <sys/syscall.h>
@@ -53,13 +54,16 @@ struct GcCycle {
 // Restart-discardable cursors, owned by gc_mutex_. No payload/location pins
 // survive a call. A sealed source cannot gain new C references.
 struct GcPhysical {
-    enum Phase {ReapMarker,ReapC,Inventory,CandidateC,SourceC,WaitPins};
-    Phase phase=ReapMarker;
+    enum Phase {BuildIndex,RefreshActive,ReapMarker,ReapC,Inventory,CandidateC,SourceC,WaitPins,Cleanup};
+    Phase phase=BuildIndex;
+    leveldb::DB* db;GcPhysicalIndex index;const leveldb::Snapshot* snapshot=nullptr;
+    GcPhysical(leveldb::DB* source,const std::string& path):db(source),index(path){}
+    ~GcPhysical(){if(snapshot)db->ReleaseSnapshot(snapshot);}
     std::filesystem::directory_iterator directory,end;
-    bool directory_started=false,changed=false,reap_ready=false,eligible=false;
+    bool directory_started=false,changed=false,reap_ready=false,eligible=false,tail_refreshed=false;
     uint64_t high_water=0,sequence=0,candidate=0,length=0,indexed=0,reap_sid=0,reaped_high_water=0;
     std::string cursor,reap_key;
-    const char* phase_name() const {switch(phase){case ReapMarker:return "reap_marker";case ReapC:return "reap_c";case Inventory:return "inventory";case CandidateC:return "candidate_c";case WaitPins:return "wait_pins";default:return "source_c";}}
+    const char* phase_name() const {switch(phase){case BuildIndex:return "index";case RefreshActive:return "refresh_active";case ReapMarker:return "reap_marker";case ReapC:return "reap_c";case Inventory:return "inventory";case CandidateC:return "candidate_c";case WaitPins:return "wait_pins";case Cleanup:return "cleanup";default:return "source_c";}}
 };
 struct StoreIoMetrics {
     std::atomic<uint64_t> root_get_calls=0,root_get_ns=0,root_misses=0,root_cache_hits=0,object_get_calls=0,object_get_ns=0,object_misses=0,meta_get_calls=0,meta_get_ns=0;
@@ -131,7 +135,7 @@ LevelStore::LevelStore(const std::string& path,bool initialize,size_t object_cac
     owner_=std::make_shared<RepositoryOwner>(path);path_=path;
     // Scratch is never a recovery authority. A new owner starts a fresh mark;
     // remove links themselves, never traverse their targets.
-    for(const auto& entry:std::filesystem::directory_iterator(path))if(entry.path().filename().string().starts_with(".gc-mark-")){
+    for(const auto& entry:std::filesystem::directory_iterator(path))if(entry.path().filename().string().starts_with(".gc-mark-") || entry.path().filename().string().starts_with(".gc-physical-")){
         std::error_code ec;std::filesystem::remove_all(entry.path(),ec);if(ec)throw std::system_error(ec,"discard abandoned GC mark");}
 
     need(!gc_checkpoint::exists_nofollow(path+"/GC-PENDING"),"GC checkpoint publication is pending; retry gc with its original --checkpoint target");
@@ -868,12 +872,12 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
         if(cycle){mark_processed=cycle->mark.processed();mark_pending=cycle->phase!=GcCycle::Complete;mark_phase=cycle->phase_name();
             if(!mark_pending){std::lock_guard writer(writer_mutex_);healthy();if(gc_cycle_!=cycle)throw std::runtime_error("GC mark invalidated");if(cycle->mark.has_work()){mark_pending=true;mark_phase="mark";}else {mark_pending=cycle->deleted!=0 || cycle->sequence!=sequence_;if(mark_pending){mark_phase="cycle_complete";gc_cycle_.reset();}}}}
     }catch(...){std::lock_guard writer(writer_mutex_);if(gc_cycle_==cycle)gc_cycle_.reset();throw;}
-    uint64_t moved=0,copied=0,physical_work=0;
+    uint64_t moved=0,copied=0,physical_work=0,index_work=0,reference_work=0,candidate_work=0;
     bool physical_pending=true;
     std::string physical_phase="complete";
     if(!gc_physical_){
-        gc_physical_=std::make_unique<GcPhysical>();
-        std::lock_guard writer(writer_mutex_);gc_physical_->high_water=object_store_->tail().first;gc_physical_->sequence=sequence_;
+        gc_physical_=std::make_unique<GcPhysical>(db_.get(),path_);
+        std::lock_guard writer(writer_mutex_);gc_physical_->high_water=object_store_->tail().first;gc_physical_->sequence=sequence_;gc_physical_->snapshot=db_->GetSnapshot();
     }
     auto& ph=*gc_physical_;
     ph.changed=ph.changed || chunks_deleted!=0;
@@ -883,12 +887,6 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
         replay::Input d{loc};auto sid=d.integer(8);auto offset=d.integer(8);auto n=d.integer(4);d.end();
         need(sid>0 && offset>=48 && n<=65536,"invalid physical GC chunk location");
         return std::pair<uint64_t,uint64_t>{sid,n};
-    };
-    auto resume=[&](const char* prefix){
-        auto it=std::unique_ptr<leveldb::Iterator>(db_->NewIterator(ro));
-        it->Seek(ph.cursor.empty()?std::string(prefix):ph.cursor);
-        if(!ph.cursor.empty() && it->Valid() && it->key().ToString()==ph.cursor)it->Next();
-        status(it->status(),"resume physical GC index");return it;
     };
     try {
         // EOF proof remains valid for this sealed retired segment. A reader
@@ -907,6 +905,38 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
         }
         while(physical_work<mark_work){
             healthy();
+            if(ph.phase==GcPhysical::Cleanup){
+                ++physical_work;
+                if(ph.index.cleanup_one()){
+                    const bool again=ph.changed || ph.sequence!=sequence_;
+                    physical_pending=again;physical_phase=again?"round_complete":"complete";gc_physical_.reset();break;
+                }
+                continue;
+            }
+            if(ph.phase==GcPhysical::BuildIndex || ph.phase==GcPhysical::RefreshActive){
+                auto scan_options=ro;scan_options.snapshot=ph.snapshot;
+                auto it=std::unique_ptr<leveldb::Iterator>(db_->NewIterator(scan_options));
+                it->Seek(ph.cursor.empty()?"C/":ph.cursor);
+                if(!ph.cursor.empty() && it->Valid() && it->key().ToString()==ph.cursor)it->Next();
+                status(it->status(),"build physical GC reverse index");++physical_work;
+                if(it->Valid() && it->key().starts_with("C/")){
+                    auto key=it->key().ToString(),loc=it->value().ToString();auto [sid,n]=chunk_location(loc);
+                    if(ph.phase==GcPhysical::BuildIndex || sid==ph.candidate)ph.index.add(sid,key,loc,n);
+                    ph.cursor=key;++index_work;fault("gc_physical_after_index_row");continue;
+                }
+                it.reset();db_->ReleaseSnapshot(ph.snapshot);ph.snapshot=nullptr;
+                const bool refresh=ph.phase==GcPhysical::RefreshActive;
+                if(refresh)ph.tail_refreshed=true;
+                ph.cursor.clear();ph.phase=refresh?GcPhysical::SourceC:GcPhysical::ReapMarker;
+                if(refresh){
+                    // Earlier relocations may have packed the initial tail.
+                    // Refresh proves coverage, not that a fresh copy is useful.
+                    auto file=object_store_->inspect_segment(std::filesystem::directory_entry(object_store_->segment_path(ph.candidate)));
+                    ph.length=file.second;
+                    if(ph.index.bytes(ph.candidate)+48>=ph.length)ph.phase=GcPhysical::Inventory;
+                }
+                fault("gc_physical_after_index_complete");continue;
+            }
             if(ph.phase==GcPhysical::WaitPins)break;
             if(ph.phase==GcPhysical::ReapMarker && ph.reap_ready){ph.phase=GcPhysical::Inventory;continue;}
             if(ph.phase==GcPhysical::ReapMarker){
@@ -917,17 +947,19 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
                 ph.reap_key=it->key().ToString();
                 need(ph.reap_key.size()==10 && it->value().ToString()=="FFGCRET1","invalid retired segment marker");
                 ph.reap_sid=number(ph.reap_key.substr(2));need(ph.reap_sid>0,"invalid retired segment ID");
+                need(ph.reap_sid<ph.high_water || (ph.reap_sid==ph.high_water && ph.tail_refreshed),"retired segment outside indexed generation");
                 {std::lock_guard writer(writer_mutex_);healthy();
                     need(physical_format_>=7 && ph.reap_sid<object_store_->tail().first,"retired segment lacks a durable higher segment");}
                 pending=1;ph.cursor.clear();ph.phase=GcPhysical::ReapC;continue;
             }
             if(ph.phase==GcPhysical::ReapC){
-                auto it=resume("C/");++physical_work;pending=1;
-                if(it->Valid() && it->key().starts_with("C/")){
-                    need(chunk_location(it->value().ToString()).first!=ph.reap_sid,"retired segment still has a current chunk reference");
-                    ph.cursor=it->key().ToString();continue;
+                auto row=ph.index.next(ph.reap_sid,ph.cursor);++physical_work;pending=1;
+                if(row){
+                    ++reference_work;std::string current;auto st=db_->Get(ro,row->first,&current);
+                    if(!st.IsNotFound()){status(st,"validate retired reverse reference");
+                        need(chunk_location(current).first!=ph.reap_sid,"retired segment still has a current chunk reference");}
+                    ph.cursor=row->first;continue;
                 }
-                it.reset();
                 std::unique_lock writer(writer_mutex_);healthy();std::lock_guard pins(pin_state_->mutex);
                 if(pin_state_->locations!=0 || segments_deleted!=0){
                     ph.reap_ready=true;ph.cursor.clear();ph.phase=GcPhysical::Inventory;
@@ -945,10 +977,8 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
                 if(ph.directory==ph.end){
                     // Inventory was finite. New writes/deletions require another round,
                     // but never reset a cursor while an existing round is progressing.
-                    bool again=ph.changed || ph.sequence!=sequence_;
                     if(ph.reap_ready){ph.phase=GcPhysical::WaitPins;pending=1;break;}
-                    physical_pending=again;physical_phase=again?"round_complete":"complete";
-                    gc_physical_.reset();break;
+                    ph.phase=GcPhysical::Cleanup;continue;
                 }
                 auto entry=*ph.directory;++ph.directory;++physical_work;
                 const auto name=entry.path().filename().string();
@@ -973,12 +1003,7 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
                 ph.candidate=file.first;ph.length=file.second;ph.indexed=0;ph.cursor.clear();ph.phase=GcPhysical::CandidateC;continue;
             }
             if(ph.phase==GcPhysical::CandidateC){
-                auto it=resume("C/");++physical_work;
-                if(it->Valid() && it->key().starts_with("C/")){
-                    auto [sid,n]=chunk_location(it->value().ToString());if(sid==ph.candidate)ph.indexed+=n+44;
-                    ph.cursor=it->key().ToString();continue;
-                }
-                it.reset();
+                ++physical_work;++candidate_work;ph.indexed=ph.index.bytes(ph.candidate);
                 if(ph.indexed+48>=ph.length){ph.phase=GcPhysical::Inventory;ph.cursor.clear();continue;}
                 std::lock_guard writer(writer_mutex_);healthy();
                 if(ph.candidate==object_store_->tail().first){
@@ -986,15 +1011,21 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
                     try{object_store_->seal_and_rotate();}catch(...){object_store_->abandon();poisoned_=true;throw;}
                 }
                 need(ph.candidate<object_store_->tail().first,"physical GC source is not sealed");
-                ph.cursor.clear();ph.phase=GcPhysical::SourceC;continue;
+                ph.cursor.clear();
+                if(ph.candidate==ph.high_water){
+                    // The initial tail could gain new locations after the first
+                    // snapshot, even if a foreground write already rotated it.
+                    ph.index.reset_bytes(ph.candidate);ph.snapshot=db_->GetSnapshot();ph.phase=GcPhysical::RefreshActive;
+                }else ph.phase=GcPhysical::SourceC;
+                continue;
             }
             // C rows cannot start pointing to a sealed source: publications either
             // reuse a current row or append to the higher active segment. A fresh
             // iterator plus exclusive cursor therefore suffices without a long pin.
             auto location_pin=pin_locations();
-            auto it=resume("C/");
-            if(!it->Valid() || !it->key().starts_with("C/")){
-                ++physical_work;it.reset();location_pin.reset();
+            auto row=ph.index.next(ph.candidate,ph.cursor);
+            if(!row){
+                ++physical_work;location_pin.reset();
                 std::lock_guard writer(writer_mutex_);healthy();
                 leveldb::WriteBatch wb;wb.Put("G/"+integer(ph.candidate),"FFGCRET1");
                 const auto fmt=physical_format_.load()%2?7:8;wb.Put("M/format","FFLDB00"+std::to_string(fmt));
@@ -1011,16 +1042,15 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
             // consumes work; at most eight matching chunks enter a publication.
             std::vector<std::pair<std::string,std::string>> refs;
             uint64_t batch_bytes=0,visits=0;std::string next_cursor=ph.cursor;
-            while(it->Valid() && it->key().starts_with("C/") && physical_work+visits<mark_work){
-                auto key=it->key().ToString(),loc=it->value().ToString();
+            while(row && physical_work+visits<mark_work){
+                auto key=row->first,loc=row->second;
                 need(key.size()==34,"invalid physical GC chunk key");auto [sid,n]=chunk_location(loc);
                 if(sid==ph.candidate){
                     if(n>max_copy_bytes-copied-batch_bytes || refs.size()==8)break;
                     charge(1024);refs.emplace_back(key,loc);batch_bytes+=n;
                 }
-                next_cursor=key;++visits;it->Next();
+                next_cursor=key;++visits;++reference_work;row=ph.index.next(ph.candidate,next_cursor);
             }
-            status(it->status(),"physical GC source scan");it.reset();
             if(visits==0)break; // copy allowance exhausted; retry same key next call
             std::unique_lock writer(writer_mutex_);healthy();
             std::vector<std::pair<std::string,std::string>> current_refs;std::vector<size_t> sizes;
@@ -1051,7 +1081,7 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
     }catch(...){gc_physical_.reset();throw;}
     if(!mark_pending && !physical_pending){std::lock_guard writer(writer_mutex_);gc_cycle_.reset();}
     mark_pending=mark_pending || physical_pending;
-    return "{\"metadata_budget_bytes\":"+std::to_string(max_metadata_bytes)+",\"metadata_bytes_charged\":"+std::to_string(metadata_bytes)+",\"mark_work_done\":"+std::to_string(work_done)+",\"mark_processed\":"+std::to_string(mark_processed)+",\"mark_pending\":"+(mark_pending?"true":"false")+",\"mark_phase\":\""+mark_phase+"\",\"physical_work_done\":"+std::to_string(physical_work)+",\"physical_pending\":"+(physical_pending?"true":"false")+",\"physical_phase\":\""+physical_phase+"\",\"objects_deleted\":"+std::to_string(deleted)+",\"chunks_deleted\":"+std::to_string(chunks_deleted)+",\"chunks_moved\":"+std::to_string(moved)+",\"bytes_copied\":"+std::to_string(copied)+",\"segments_deleted\":"+std::to_string(segments_deleted)+",\"pending_segments\":"+std::to_string(pending)+",\"logical_sweep_skipped\":"+(sweep_skipped?"true":"false")+",\"sequence\":"+std::to_string(seq)+"}";
+    return "{\"metadata_budget_bytes\":"+std::to_string(max_metadata_bytes)+",\"metadata_bytes_charged\":"+std::to_string(metadata_bytes)+",\"mark_work_done\":"+std::to_string(work_done)+",\"mark_processed\":"+std::to_string(mark_processed)+",\"mark_pending\":"+(mark_pending?"true":"false")+",\"mark_phase\":\""+mark_phase+"\",\"physical_work_done\":"+std::to_string(physical_work)+",\"physical_index_work\":"+std::to_string(index_work)+",\"physical_reference_work\":"+std::to_string(reference_work)+",\"physical_candidate_work\":"+std::to_string(candidate_work)+",\"physical_pending\":"+(physical_pending?"true":"false")+",\"physical_phase\":\""+physical_phase+"\",\"objects_deleted\":"+std::to_string(deleted)+",\"chunks_deleted\":"+std::to_string(chunks_deleted)+",\"chunks_moved\":"+std::to_string(moved)+",\"bytes_copied\":"+std::to_string(copied)+",\"segments_deleted\":"+std::to_string(segments_deleted)+",\"pending_segments\":"+std::to_string(pending)+",\"logical_sweep_skipped\":"+(sweep_skipped?"true":"false")+",\"sequence\":"+std::to_string(seq)+"}";
 
 }
 
