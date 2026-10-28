@@ -1,0 +1,456 @@
+{
+  "scope": "Fixed LevelDB + World coalescing, before async retained-GC termination fix; failed deadline",
+  "settings": {
+    "binary": "/Users/hurricane/private/code/forks.world/forkfs-gc-budget/build/gc-budget/daemon/forkfsd",
+    "output": "build/developer-soak-gc-final",
+    "seed": 20261028,
+    "files": 16,
+    "file_bytes": 1024,
+    "rounds": 10,
+    "workers": 2,
+    "steps": 350,
+    "seconds": 0,
+    "sample_interval": 0.5,
+    "max_store_mib": 256,
+    "max_rpcs": 1000000,
+    "max_artifact_mib": 1024,
+    "deadline": 600.0,
+    "gc_work": 128,
+    "gc_copy_bytes": 1048576,
+    "gc_objects": 128,
+    "gc_mode": "concurrent",
+    "restart_every": 1,
+    "pid": 25304,
+    "binary_sha256": "202d20a8023c1167f0a8cda3a01c6bfe9a4560a607b75b6e59c0d26b9cadd3fe",
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "python": "3.9.6",
+    "transport": "resident Unix RPC; one connection per operation",
+    "cache": "OS caches not flushed; service restarts reset daemon caches",
+    "scope": "synthetic development I/O; no mounted git/compiler execution",
+    "harness_sha256": {
+      "developer_soak.py": "f39b9213ae2b1619f8649658392045ee2c1e1ef63b987fd58a1c97b116e4abf8",
+      "developer_workload.py": "07367d758c2d6f01d9149220a529f83e6f769e04cbb424e1199c68700b249f49"
+    },
+    "worker_revision_pattern": "r{generation}w{worker}",
+    "revision_policy": "retain all; no revision deletion API is used"
+  },
+  "elapsed_seconds": 600.025726959,
+  "state": "failed",
+  "failure": "Traceback (most recent call last):\n  File \"/Users/hurricane/private/code/forks.world/forkfs-gc-budget/scripts/tests/developer_soak.py\", line 644, in main\n    trial.run()\n  File \"/Users/hurricane/private/code/forks.world/forkfs-gc-budget/scripts/tests/developer_soak.py\", line 513, in run\n    status = self.drain_gc('retained-replay', allow_logical_skip=True)\n  File \"/Users/hurricane/private/code/forks.world/forkfs-gc-budget/scripts/tests/developer_soak.py\", line 250, in drain_gc\n    status = self.wait_gc_terminal(stage)\n  File \"/Users/hurricane/private/code/forks.world/forkfs-gc-budget/scripts/tests/developer_soak.py\", line 220, in wait_gc_terminal\n    self.check_background()\n  File \"/Users/hurricane/private/code/forks.world/forkfs-gc-budget/scripts/tests/developer_soak.py\", line 168, in check_background\n    self.remaining()\n  File \"/Users/hurricane/private/code/forks.world/forkfs-gc-budget/scripts/tests/developer_soak.py\", line 98, in remaining\n    raise TimeoutError('overall soak deadline exceeded')\nTimeoutError: overall soak deadline exceeded\n",
+  "latency_save_development": {
+    "count": 1000,
+    "p50_ms": 12.744333,
+    "p95_ms": 27.310541,
+    "p99_ms": 35.284209,
+    "p95_status": "reported",
+    "p99_status": "reported",
+    "tail_min_samples": 1000,
+    "max_ms": 190.181334
+  },
+  "replayed_storage": {
+    "base-replayed": {
+      "apparent_bytes": 2329283,
+      "allocated_bytes": 2347008,
+      "segment_bytes": 857434,
+      "index_bytes": 1471849,
+      "scratch_bytes": 0,
+      "mark_scratch_bytes": 0,
+      "physical_scratch_bytes": 0,
+      "scratch_allocated_bytes": 0,
+      "control_bytes": 0,
+      "files": 7
+    }
+  },
+  "sampled_storage_peaks": {
+    "allocated_bytes": 142798848,
+    "segment_bytes": 54537158,
+    "index_bytes": 81577019,
+    "control_bytes": 277,
+    "mark_scratch_bytes": 16753582,
+    "physical_scratch_bytes": 20576014,
+    "scratch_allocated_bytes": 26619904,
+    "artifact_allocated_bytes": 151556096,
+    "artifact_apparent_bytes": 148159229
+  },
+  "pre_backup_gc_storage": {
+    "before": {
+      "apparent_bytes": 105211118,
+      "allocated_bytes": 107905024,
+      "segment_bytes": 36517984,
+      "index_bytes": 46523774,
+      "scratch_bytes": 22169360,
+      "mark_scratch_bytes": 12436563,
+      "physical_scratch_bytes": 9732797,
+      "scratch_allocated_bytes": 22294528,
+      "control_bytes": 0,
+      "files": 56,
+      "stage": "pre-backup-gc-before",
+      "live_main_bytes": 28717,
+      "unique_reachable_payload_bytes": 41920,
+      "modeled_worlds": 3,
+      "fork_probe_worlds": 0,
+      "retained_revisions": 21,
+      "last_committed_seq": 7378,
+      "indexed_objects": 164252,
+      "submitted_payload_bytes": 3066104,
+      "mutation_requests": 7365,
+      "delta_commits": 0,
+      "delta_segment_bytes": 31922,
+      "segment_bytes_per_commit": null,
+      "delta_allocated_bytes": -45056,
+      "segment_to_reachable_payload_ratio": 871.1351145038168
+    },
+    "after": {
+      "apparent_bytes": 73180987,
+      "allocated_bytes": 73347072,
+      "segment_bytes": 857434,
+      "index_bytes": 72323553,
+      "scratch_bytes": 0,
+      "mark_scratch_bytes": 0,
+      "physical_scratch_bytes": 0,
+      "scratch_allocated_bytes": 0,
+      "control_bytes": 0,
+      "files": 44,
+      "stage": "pre-backup-gc-after",
+      "live_main_bytes": 28717,
+      "unique_reachable_payload_bytes": 41920,
+      "modeled_worlds": 3,
+      "fork_probe_worlds": 0,
+      "retained_revisions": 21,
+      "last_committed_seq": 7378,
+      "indexed_objects": 4708,
+      "submitted_payload_bytes": 3066104,
+      "mutation_requests": 7365,
+      "delta_commits": 0,
+      "delta_segment_bytes": -35660550,
+      "segment_bytes_per_commit": null,
+      "delta_allocated_bytes": -34557952,
+      "segment_to_reachable_payload_ratio": 20.45405534351145
+    },
+    "drain_seconds": 172.92319416599997,
+    "observed_net_segment_reclaimed_bytes_per_second": 206221.9019952128,
+    "observed_allocated_delta_bytes": -34557952,
+    "observed_segment_delta_bytes": -35660550,
+    "observed_allocated_reduction_bytes": 34557952,
+    "observed_segment_reduction_bytes": 35660550,
+    "interpretation": "observed sample delta; storage is not expected to shrink monotonically"
+  },
+  "last_gc_observation": {
+    "time_ns": 1793166464354915000,
+    "perf_ns": 599989171625,
+    "elapsed_seconds": 599.9094582500001,
+    "phase": "backup-overlap/concurrent-verify",
+    "gc_mode": "concurrent",
+    "kind": "gc-status",
+    "stage": "retained-replay",
+    "status": {
+      "state": "running",
+      "active": true,
+      "steps": 305,
+      "last_step": {
+        "metadata_budget_bytes": 67108864,
+        "metadata_bytes_charged": 32768,
+        "mark_work_done": 0,
+        "mark_processed": 0,
+        "mark_pending": true,
+        "mark_phase": "complete",
+        "physical_work_done": 128,
+        "physical_index_work": 128,
+        "physical_reference_work": 0,
+        "physical_candidate_work": 0,
+        "physical_pending": true,
+        "physical_phase": "index",
+        "objects_deleted": 0,
+        "chunks_deleted": 0,
+        "chunks_moved": 0,
+        "bytes_copied": 0,
+        "segments_deleted": 0,
+        "pending_segments": 0,
+        "logical_sweep_skipped": true,
+        "sequence": 8114
+      },
+      "error": ""
+    },
+    "gc_attempt": 54
+  },
+  "retained_gc_transition_sample": [
+    {
+      "elapsed_seconds": 551.549888542,
+      "state": "running",
+      "physical_phase": "index",
+      "steps": 374,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 554.6773715420001,
+      "state": "running",
+      "physical_phase": "complete",
+      "steps": 835,
+      "physical_pending": false,
+      "mark_pending": false,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 554.8884575,
+      "state": "running",
+      "physical_phase": "index",
+      "steps": 868,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 555.942156875,
+      "state": "budget_exhausted",
+      "physical_phase": "index",
+      "steps": 1024,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 555.942566542,
+      "state": "running",
+      "physical_phase": null,
+      "steps": 0,
+      "physical_pending": null,
+      "mark_pending": null,
+      "logical_sweep_skipped": null
+    },
+    {
+      "elapsed_seconds": 556.150275375,
+      "state": "running",
+      "physical_phase": "index",
+      "steps": 35,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 558.022374292,
+      "state": "running",
+      "physical_phase": "complete",
+      "steps": 309,
+      "physical_pending": false,
+      "mark_pending": false,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 558.235334417,
+      "state": "running",
+      "physical_phase": "index",
+      "steps": 343,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 562.4188665,
+      "state": "running",
+      "physical_phase": "complete",
+      "steps": 973,
+      "physical_pending": false,
+      "mark_pending": false,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 562.63229775,
+      "state": "running",
+      "physical_phase": "index",
+      "steps": 1010,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 562.834416334,
+      "state": "budget_exhausted",
+      "physical_phase": "index",
+      "steps": 1024,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 562.835236542,
+      "state": "running",
+      "physical_phase": null,
+      "steps": 0,
+      "physical_pending": null,
+      "mark_pending": null,
+      "logical_sweep_skipped": null
+    },
+    {
+      "elapsed_seconds": 563.044103834,
+      "state": "running",
+      "physical_phase": "index",
+      "steps": 30,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 569.520126375,
+      "state": "budget_exhausted",
+      "physical_phase": "index",
+      "steps": 1024,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 569.52083425,
+      "state": "running",
+      "physical_phase": null,
+      "steps": 0,
+      "physical_pending": null,
+      "mark_pending": null,
+      "logical_sweep_skipped": null
+    },
+    {
+      "elapsed_seconds": 569.734078542,
+      "state": "running",
+      "physical_phase": "index",
+      "steps": 37,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 576.392805875,
+      "state": "budget_exhausted",
+      "physical_phase": "index",
+      "steps": 1024,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 576.393399167,
+      "state": "running",
+      "physical_phase": null,
+      "steps": 0,
+      "physical_pending": null,
+      "mark_pending": null,
+      "logical_sweep_skipped": null
+    },
+    {
+      "elapsed_seconds": 576.60120125,
+      "state": "running",
+      "physical_phase": "index",
+      "steps": 29,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 576.802452625,
+      "state": "running",
+      "physical_phase": "complete",
+      "steps": 59,
+      "physical_pending": false,
+      "mark_pending": false,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 577.01316225,
+      "state": "running",
+      "physical_phase": "index",
+      "steps": 87,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 583.286228667,
+      "state": "budget_exhausted",
+      "physical_phase": "index",
+      "steps": 1024,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 583.286742667,
+      "state": "running",
+      "physical_phase": null,
+      "steps": 0,
+      "physical_pending": null,
+      "mark_pending": null,
+      "logical_sweep_skipped": null
+    },
+    {
+      "elapsed_seconds": 583.493815167,
+      "state": "running",
+      "physical_phase": "index",
+      "steps": 30,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 590.53512625,
+      "state": "budget_exhausted",
+      "physical_phase": "index",
+      "steps": 1024,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 590.535817292,
+      "state": "running",
+      "physical_phase": null,
+      "steps": 0,
+      "physical_pending": null,
+      "mark_pending": null,
+      "logical_sweep_skipped": null
+    },
+    {
+      "elapsed_seconds": 590.7429943340001,
+      "state": "running",
+      "physical_phase": "index",
+      "steps": 30,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 597.823277167,
+      "state": "budget_exhausted",
+      "physical_phase": "index",
+      "steps": 1024,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    },
+    {
+      "elapsed_seconds": 597.824071042,
+      "state": "running",
+      "physical_phase": null,
+      "steps": 0,
+      "physical_pending": null,
+      "mark_pending": null,
+      "logical_sweep_skipped": null
+    },
+    {
+      "elapsed_seconds": 598.032050584,
+      "state": "running",
+      "physical_phase": "index",
+      "steps": 30,
+      "physical_pending": true,
+      "mark_pending": true,
+      "logical_sweep_skipped": true
+    }
+  ],
+  "old_rpc_regression": {
+    "state": "budget_exhausted",
+    "steps": 32,
+    "physical_pending": false,
+    "mark_pending": false,
+    "logical_sweep_skipped": true,
+    "pending_segments": 0
+  }
+}
