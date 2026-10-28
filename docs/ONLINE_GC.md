@@ -258,6 +258,16 @@ Payload copying, object/chunk deletion and unlink counts are bounded per step.
 The typed frontier, deduplication and live marks live on disk. Scan cursors and
 phase state live in memory; both persist across calls within one owner, and all
 are discarded after reopening.
+The LevelDB submodule is pinned to upstream `13e3c4efc66b8d7317c7648766a930b5d7e48aa7`
+(1.23 plus its immediate compaction boundary fix and Apple C-header fix).
+Unpatched 1.23 can drop tombstones when the second input level splits one user
+key across adjacent SSTs, exposing obsolete aliases after GC. The pinned
+[upstream fix](https://github.com/google/leveldb/commit/13e3c4efc66b8d7317c7648766a930b5d7e48aa7)
+includes boundary files in both compaction input levels. A real-SST regression
+checks point reads, iteration and reopening; it fails with the old pin. Updating
+the pin prevents this compaction error; it does not repair an already damaged
+store. Failed stores from this investigation are preserved unchanged.
+
 Marker advancement serializes its callers separately from the publication mutex.
 It selects a queued task under that mutex, retains its Q/P record, and releases the
 mutex while reading immutable objects and interpreting their references. Child

@@ -419,7 +419,7 @@ set_tests_properties(forkfsd_incremental_gc PROPERTIES TIMEOUT 180 LABELS metada
 add_executable(forkfsd_gc_memory_budget_test tests/gc_memory_budget.cpp)
 target_link_libraries(forkfsd_gc_memory_budget_test PRIVATE forkfs_namespace)
 add_test(NAME forkfsd_gc_memory_budget COMMAND forkfsd_gc_memory_budget_test)
-set_tests_properties(forkfsd_gc_memory_budget PROPERTIES TIMEOUT 120 LABELS metadata-regression)
+set_tests_properties(forkfsd_gc_memory_budget PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE LABELS metadata-regression)
 add_test(NAME forkfsd_online_gc_crash COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/online_gc_crash.py $<TARGET_FILE:forkfsd>
     $<TARGET_FILE:forkfsd_leveldb_fault_test>)
@@ -456,10 +456,16 @@ target_link_libraries(forkfsd_gc_mark_test PRIVATE forkfs_metadata)
 add_test(NAME forkfsd_gc_mark COMMAND forkfsd_gc_mark_test)
 set_tests_properties(forkfsd_gc_mark PROPERTIES TIMEOUT 120 LABELS metadata-regression)
 
+add_executable(forkfsd_leveldb_compaction_boundary_test tests/leveldb_compaction_boundary.cpp)
+target_include_directories(forkfsd_leveldb_compaction_boundary_test PRIVATE ${CMAKE_SOURCE_DIR}/third_party/leveldb)
+target_link_libraries(forkfsd_leveldb_compaction_boundary_test PRIVATE leveldb Threads::Threads)
+add_test(NAME forkfsd_leveldb_compaction_boundary COMMAND forkfsd_leveldb_compaction_boundary_test)
+set_tests_properties(forkfsd_leveldb_compaction_boundary PROPERTIES TIMEOUT 120 LABELS metadata-regression)
+
 add_executable(forkfsd_physical_gc_budget_test tests/physical_gc_budget.cpp)
 target_link_libraries(forkfsd_physical_gc_budget_test PRIVATE forkfs_namespace)
 add_test(NAME forkfsd_physical_gc_budget COMMAND forkfsd_physical_gc_budget_test)
-set_tests_properties(forkfsd_physical_gc_budget PROPERTIES TIMEOUT 240 LABELS metadata-regression)
+set_tests_properties(forkfsd_physical_gc_budget PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE LABELS metadata-regression)
 
 add_executable(forkfsd_gc_segment_index_test tests/gc_segment_index.cpp)
 target_link_libraries(forkfsd_gc_segment_index_test PRIVATE forkfs_namespace)
