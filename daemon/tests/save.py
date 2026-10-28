@@ -54,6 +54,10 @@ with tempfile.TemporaryDirectory(prefix='ff-save-',dir='/tmp') as tmp:
         a=metrics_before['storage_metrics'];b=metrics_after['storage_metrics']
         assert b['transactions']==a['transactions']+1 and b['wal_sync_calls']==a['wal_sync_calls']+1
         assert b['wal_append_bytes']>a['wal_append_bytes'] and b['write_ns']>a['write_ns']
+        for phase in ('data_prepare', 'data_sync', 'metadata_publish'):
+            assert b[phase+'_calls']==a[phase+'_calls']+1
+            assert b[phase+'_ns']>a[phase+'_ns']
+        assert b['gc_barrier_calls']==a['gc_barrier_calls']
         assert metrics_after['metadata_prepare_ns']>metrics_before['metadata_prepare_ns']
         profile_after=json.loads(rpc('storage-profile'))
         pa=profile_before['storage_metrics'];pb=profile_after['storage_metrics']

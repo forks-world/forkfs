@@ -521,6 +521,8 @@ class Soak(_workload.Workload):
         self.replay_verify(final_archive, self.root / 'final-replayed')
         self.phase = 'complete'
         self.measure_storage('final-source')
+        (self.root / 'storage-profile-final.json').write_text(
+            json.dumps(json.loads(self.rpc('storage-profile')), indent=2) + '\n')
         self.stop()
         self.final_archive_bytes = final_archive.stat().st_size
         self.base_archive_bytes = base_archive.stat().st_size

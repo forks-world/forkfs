@@ -258,6 +258,32 @@ Payload copying, object/chunk deletion and unlink counts are bounded per step.
 The typed frontier, deduplication and live marks live on disk. Scan cursors and
 phase state live in memory; both persist across calls within one owner, and all
 are discarded after reopening.
+Marker advancement serializes its callers separately from the publication mutex.
+It selects a queued task under that mutex, retains its Q record, and releases the
+mutex while reading immutable objects and interpreting their references. Child
+tasks and semantic scratch writes are staged locally. The commit reacquires the
+mutex, resolves deduplication against concurrent seeds, and atomically publishes
+children, semantic records, cursor continuation and removal of the selected task.
+Foreground seed/chunk protection never accesses advancement's staging state.
+Consequently a blocked object reader does not itself block publication, and
+`has_work()` cannot report an empty frontier while a task is in flight. Scratch
+I/O during insertion/commit can still block; this is not a lock-free design.
+
+Staged children use encoded records, capped at the codecs' maximum fanout of 65.
+Their encodings are released as the commit batch grows, avoiding a second large
+resident vector of decoded tasks. A reader-gate regression verifies foreground
+completion before releasing the reader, followed by liveness and pending-count
+checks; the same test fails against the earlier lock scope.
+
+Storage profiles expose cumulative `data_prepare_*`, `data_sync_*`,
+`metadata_publish_*` and `gc_barrier_*` calls/nanoseconds for completed phase
+instrumentation points. `gc_foreground_wait_ns` / `gc_foreground_hold_ns` include all root,
+manifest, object and chunk seeding, including the collector's own seeds;
+`gc_advance_wait_ns` / `gc_advance_hold_ns` measure the short marker mutex sections,
+excluding the separate serialization mutex and unlocked object processing.
+Counters survive collection completion/cancellation in one store owner. They are
+aggregate durations, not percentiles, and concurrent work may overlap.
+
 The metadata charge includes a fixed 32 KiB marker/task working reserve plus
 bounded sweep and physical-compaction collections. The configured ceiling and
 charge remain available as `metadata_budget_bytes` and `metadata_bytes_charged`.

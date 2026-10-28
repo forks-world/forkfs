@@ -10,9 +10,11 @@
 #include <leveldb/options.h>
 #include <leveldb/write_batch.h>
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <chrono>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -27,13 +29,19 @@
 
 namespace forkfs {
 class GcMark {
+    using Clock=std::chrono::steady_clock;
+    static uint64_t ns(Clock::time_point start){return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();}
+    struct HoldTimer {std::atomic<uint64_t>& target;Clock::time_point start=Clock::now();explicit HoldTimer(std::atomic<uint64_t>& value):target(value){}~HoldTimer(){target+=ns(start);}};
 public:
     using Id=std::array<unsigned char,32>;
     using Bytes=std::vector<unsigned char>;
     using Reader=std::function<Bytes(const Id&)>;
     using RootReader=std::function<std::optional<Id>(const std::string&)>;
+    struct MutexMetrics {uint64_t foreground_wait_ns=0,foreground_hold_ns=0,advance_wait_ns=0,advance_hold_ns=0;};
+    struct MutexCounters {std::atomic<uint64_t> foreground_wait_ns=0,foreground_hold_ns=0,advance_wait_ns=0,advance_hold_ns=0;};
+    MutexMetrics mutex_metrics() const {return {mutex_counters_->foreground_wait_ns.load(),mutex_counters_->foreground_hold_ns.load(),mutex_counters_->advance_wait_ns.load(),mutex_counters_->advance_hold_ns.load()};}
 
-    explicit GcMark(const std::string& repository_path) {
+    explicit GcMark(const std::string& repository_path,std::shared_ptr<MutexCounters> counters={}):mutex_counters_(counters?std::move(counters):std::make_shared<MutexCounters>()) {
         auto pattern=(std::filesystem::path(repository_path)/".gc-mark-XXXXXX").string();
         std::vector<char> name(pattern.begin(),pattern.end());name.push_back(0);
         char* made=::mkdtemp(name.data());if(!made)throw std::runtime_error("create GC mark scratch directory: "+std::string(strerror(errno)));
@@ -52,7 +60,7 @@ public:
     GcMark(const GcMark&)=delete;GcMark& operator=(const GcMark&)=delete;
 
     void seed_root(const std::string& key,const Id& id,RootReader roots) {
-        std::lock_guard<std::mutex> guard(mu_);const std::string full_key=key;std::string root_key=key;
+        auto waiting=Clock::now();std::unique_lock<std::mutex> guard(mu_);mutex_counters_->foreground_wait_ns+=ns(waiting);HoldTimer held(mutex_counters_->foreground_hold_ns);const std::string full_key=key;std::string root_key=key;
         if(root_key.starts_with("R/"))root_key.erase(0,2);
         const std::string alias("\0forkfs-history/object/",23);if(root_key.starts_with(alias)){static const char* hex="0123456789abcdef";if(root_key.size()!=alias.size()+64)throw std::runtime_error("invalid history object alias");std::string spelling;for(auto c:id){spelling+=hex[c>>4];spelling+=hex[c&15];}if(root_key.substr(alias.size())!=spelling)throw std::runtime_error("noncanonical history object alias");return;}
         if(roots){auto observed=roots(full_key);if(!observed||*observed!=id)throw std::runtime_error("GC root changed during seeding");}
@@ -72,12 +80,12 @@ public:
         }
         // A root key is retained as a typed task so revision and World roots
         // are interpreted only after their referenced bytes are verified.
-        if(t.kind==DIRECT_INODE||t.kind==ORPHAN_INODE){Task keep;keep.kind=OPAQUE;keep.id=id;enqueue(keep);}
-        enqueue(t);
+        if(t.kind==DIRECT_INODE||t.kind==ORPHAN_INODE){Task keep;keep.kind=OPAQUE;keep.id=id;enqueue_now(keep);}
+        enqueue_now(t);
     }
-    void seed_manifest(const Id& id){std::lock_guard<std::mutex> guard(mu_);Task t;t.kind=MANIFEST;t.id=id;enqueue(t);}
-    void protect(const Id& id){std::lock_guard<std::mutex> guard(mu_);Task t;t.kind=OPAQUE;t.id=id;enqueue(t);}
-    void protect_chunk(const std::string& hash){std::lock_guard<std::mutex> guard(mu_);if(hash.size()!=32)throw std::runtime_error("invalid GC chunk hash");leveldb::WriteBatch b;b.Put("H/"+hash,"1");check(db_->Write({},&b),"protect GC chunk");}
+    void seed_manifest(const Id& id){auto waiting=Clock::now();std::unique_lock<std::mutex> guard(mu_);mutex_counters_->foreground_wait_ns+=ns(waiting);HoldTimer held(mutex_counters_->foreground_hold_ns);Task t;t.kind=MANIFEST;t.id=id;enqueue_now(t);}
+    void protect(const Id& id){auto waiting=Clock::now();std::unique_lock<std::mutex> guard(mu_);mutex_counters_->foreground_wait_ns+=ns(waiting);HoldTimer held(mutex_counters_->foreground_hold_ns);Task t;t.kind=OPAQUE;t.id=id;enqueue_now(t);}
+    void protect_chunk(const std::string& hash){auto waiting=Clock::now();std::unique_lock<std::mutex> guard(mu_);mutex_counters_->foreground_wait_ns+=ns(waiting);HoldTimer held(mutex_counters_->foreground_hold_ns);if(hash.size()!=32)throw std::runtime_error("invalid GC chunk hash");leveldb::WriteBatch b;b.Put("H/"+hash,"1");check(db_->Write({},&b),"protect GC chunk");}
     bool chunk_live(const std::string& hash) const {std::lock_guard<std::mutex> guard(mu_);std::string value;auto s=db_->Get(read_options(),"H/"+hash,&value);if(!s.IsNotFound())check(s,"read GC chunk marker");return !s.IsNotFound();}
     bool live(const Id& id) const {std::lock_guard<std::mutex> guard(mu_);std::string value;auto s=db_->Get(read_options(),live_key(id),&value);if(!s.IsNotFound())check(s,"read GC live marker");return !s.IsNotFound();}
     bool has_work() const {std::lock_guard<std::mutex> guard(mu_);auto it=iterator();it->Seek("Q/");check(it->status(),"scan GC tasks");return it->Valid()&&it->key().ToString().starts_with("Q/");}
@@ -85,20 +93,57 @@ public:
     size_t pending() const {std::lock_guard<std::mutex> guard(mu_);return pending_count_;}
 
     size_t advance(size_t units,const Reader& read) {
-        std::lock_guard<std::mutex> guard(mu_);size_t done=0;
-        while(done<units){auto it=iterator();it->Seek("Q/");check(it->status(),"scan GC tasks");if(!it->Valid()||!it->key().ToString().starts_with("Q/"))break;
-            auto qkey=it->key().ToString(),encoded=it->value().ToString();Task task=decode(encoded);leveldb::WriteBatch batch;active_batch_=&batch;staged_dedup_.clear();staged_queued_=0;
-            struct ResetBatch {leveldb::WriteBatch*& batch;std::set<std::string>& dedup;~ResetBatch(){batch=nullptr;dedup.clear();}} reset{active_batch_,staged_dedup_};
-            bool more=false;try{more=process(task,read);}catch(...){active_batch_=nullptr;staged_dedup_.clear();throw;}
-            batch.Delete(qkey);if(more){if(next_==UINT64_MAX){active_batch_=nullptr;throw std::runtime_error("GC task sequence overflow");}auto seq=next_++;auto dk=dedup_key(task);batch.Put(dk,"1");batch.Put("Q/"+be(seq),encode(task));batch.Put("C/next",le(next_));}
-            batch.Put("C/processed",le(processed_+1));auto status=db_->Write({},&batch);active_batch_=nullptr;staged_dedup_.clear();check(status,"commit GC mark task");pending_count_+=staged_queued_;if(!more)--pending_count_;++processed_;++done;
-        }return done;
+        // Only advancement accesses process_stage_ and semantic K/V/M records.
+        // Foreground insertion has its own path and never observes staged state.
+        std::lock_guard<std::mutex> advance_guard(advance_mu_);
+        size_t done=0;
+        while(done<units){
+            std::string qkey;Task task;
+            {
+                auto waiting=Clock::now();std::unique_lock<std::mutex> guard(mu_);
+                mutex_counters_->advance_wait_ns+=ns(waiting);HoldTimer held(mutex_counters_->advance_hold_ns);
+                auto it=iterator();it->Seek("Q/");check(it->status(),"scan GC tasks");
+                if(!it->Valid()||!it->key().ToString().starts_with("Q/"))break;
+                qkey=it->key().ToString();task=decode(it->value().ToString());
+            }
+            // Keep Q visible until commit, including while immutable reads block.
+            Stage stage;process_stage_=&stage;bool more=false;
+            try{more=process(task,read);}catch(...){process_stage_=nullptr;throw;}
+            process_stage_=nullptr;
+            {
+                auto waiting=Clock::now();std::unique_lock<std::mutex> guard(mu_);
+                mutex_counters_->advance_wait_ns+=ns(waiting);HoldTimer held(mutex_counters_->advance_hold_ns);
+                auto& batch=stage.batch;batch.Delete(qkey);
+                size_t queued=0;std::set<std::string> staged;
+                // Resolve dedup after concurrent publication; free child encodings
+                // as the commit batch grows to bound temporary marker metadata.
+                for(auto& child:stage.children){
+                    auto dk=dedup_encoded(child);std::string marker;
+                    auto status=db_->Get(read_options(),dk,&marker);
+                    if(!status.IsNotFound())check(status,"check GC mark dedup");
+                    if(!status.IsNotFound()||!staged.insert(dk).second){std::string{}.swap(child);continue;}
+                    if(next_==UINT64_MAX)throw std::runtime_error("GC task sequence overflow");
+                    batch.Put(dk,"1");batch.Put("Q/"+be(next_),child);
+                    std::string{}.swap(child);++next_;++queued;
+                }
+                if(more){
+                    if(next_==UINT64_MAX)throw std::runtime_error("GC task sequence overflow");
+                    batch.Put(dedup_key(task),"1");batch.Put("Q/"+be(next_),encode(task));++next_;
+                }
+                if(more||queued)batch.Put("C/next",le(next_));
+                batch.Put("C/processed",le(processed_+1));
+                check(db_->Write({},&batch),"commit GC mark task");
+                pending_count_+=queued;if(!more)--pending_count_;++processed_;++done;
+            }
+        }
+        return done;
     }
 
 private:
     enum : unsigned char {ROOT=1,MANIFEST=2,OPAQUE=3,REVISION=4,RUN=5,TREE=6,INODE=7,EXTENT=8,CONTENT=9,BLOCK=10,ORPHAN_INODE=11,DIRECT_INODE=12,RESOLVE=13};
     struct Task {unsigned char kind=OPAQUE;Id id{};Id context{};uint64_t first=0,size=0,depth=0;unsigned char level=0;std::string key,previous,lower,upper;};
-    std::string scratch_;std::unique_ptr<leveldb::Cache> cache_;std::unique_ptr<leveldb::DB> db_;mutable std::mutex mu_;uint64_t next_=0,processed_=0;size_t pending_count_=0,staged_queued_=0;leveldb::WriteBatch* active_batch_=nullptr;std::set<std::string> staged_dedup_;
+    struct Stage {leveldb::WriteBatch batch;std::vector<std::string> children;};
+    std::string scratch_;std::unique_ptr<leveldb::Cache> cache_;std::unique_ptr<leveldb::DB> db_;mutable std::mutex mu_,advance_mu_;std::shared_ptr<MutexCounters> mutex_counters_;Stage* process_stage_=nullptr;uint64_t next_=0,processed_=0;size_t pending_count_=0;
     static leveldb::ReadOptions read_options(){leveldb::ReadOptions ro;ro.verify_checksums=true;ro.fill_cache=false;return ro;}
     static void check(const leveldb::Status& s,const char* what){if(!s.ok())throw std::runtime_error(std::string(what)+": "+s.ToString());}
     static std::string le(uint64_t n,unsigned w=8){std::string s(w,0);for(unsigned i=0;i<w;++i)s[i]=char(n>>(8*i));return s;}
@@ -110,9 +155,11 @@ private:
     static std::string take_field(const std::string& s,size_t& p){if(p>s.size()||s.size()-p<4)throw std::runtime_error("truncated GC task field");auto n=number(reinterpret_cast<const unsigned char*>(s.data()+p),4);p+=4;if(n>1024||s.size()<p+n)throw std::runtime_error("invalid GC task field");auto v=s.substr(p,n);p+=n;return v;}
     static std::string encode(const Task& t){std::string s="GCT001";s.push_back(char(t.kind));s+=idstr(t.id);s+=idstr(t.context);s+=le(t.first);s+=le(t.size);s+=le(t.depth);s.push_back(char(t.level));field(s,t.key);field(s,t.previous);field(s,t.lower);field(s,t.upper);return s;}
     static Task decode(const std::string& s){if(s.size()<6+1+64+24+1+16||s.substr(0,6)!="GCT001")throw std::runtime_error("invalid GC mark task");size_t p=6;Task t;t.kind=static_cast<unsigned char>(s[p++]);if(t.kind<ROOT||t.kind>RESOLVE)throw std::runtime_error("unknown GC task kind");memcpy(t.id.data(),s.data()+p,32);p+=32;memcpy(t.context.data(),s.data()+p,32);p+=32;t.first=number(reinterpret_cast<const unsigned char*>(s.data()+p),8);p+=8;t.size=number(reinterpret_cast<const unsigned char*>(s.data()+p),8);p+=8;t.depth=number(reinterpret_cast<const unsigned char*>(s.data()+p),8);p+=8;t.level=s[p++];t.key=take_field(s,p);t.previous=take_field(s,p);t.lower=take_field(s,p);t.upper=take_field(s,p);if(p!=s.size())throw std::runtime_error("invalid GC mark task suffix");return t;}
-    std::string dedup_key(const Task& t)const{auto value=encode(t);Bytes bytes(value.begin(),value.end());return "D/"+idstr(Journal::object_id(bytes));}
-    void enqueue(const Task& t){if(t.id==Id{})throw std::runtime_error("zero GC object reference");auto encoded=encode(t);std::string marker;auto dk=dedup_key(t);auto status=db_->Get(read_options(),dk,&marker);if(!status.IsNotFound())check(status,"check GC mark dedup");
-        if(active_batch_){active_batch_->Put(live_key(t.id),"1");if(!status.IsNotFound()||staged_dedup_.contains(dk))return;if(next_==UINT64_MAX)throw std::runtime_error("GC task sequence overflow");staged_dedup_.insert(dk);auto seq=next_++;active_batch_->Put(dk,"1");active_batch_->Put("Q/"+be(seq),encoded);active_batch_->Put("C/next",le(next_));++staged_queued_;return;}
+    static std::string dedup_encoded(const std::string& value){Bytes bytes(value.begin(),value.end());return "D/"+idstr(Journal::object_id(bytes));}
+    std::string dedup_key(const Task& t)const{return dedup_encoded(encode(t));}
+    void stage_put(const std::string& key,const std::string& value){if(!process_stage_)throw std::runtime_error("GC staged write outside advance");process_stage_->batch.Put(key,value);}
+    void enqueue(const Task& t){if(t.id==Id{})throw std::runtime_error("zero GC object reference");if(!process_stage_)throw std::runtime_error("GC process enqueue outside advance");if(process_stage_->children.size()>=65)throw std::runtime_error("GC task fanout exceeds codec bound");stage_put(live_key(t.id),"1");process_stage_->children.push_back(encode(t));}
+    void enqueue_now(const Task& t){if(t.id==Id{})throw std::runtime_error("zero GC object reference");auto encoded=encode(t);std::string marker;auto dk=dedup_key(t);auto status=db_->Get(read_options(),dk,&marker);if(!status.IsNotFound())check(status,"check GC mark dedup");
         leveldb::WriteBatch b;b.Put(live_key(t.id),"1");if(!status.IsNotFound()){check(db_->Write({},&b),"mark GC object live");return;}
         if(next_==UINT64_MAX)throw std::runtime_error("GC task sequence overflow");
         auto seq=next_++;std::string q="Q/"+be(seq);b.Put(dk,"1");b.Put(q,encoded);b.Put("C/next",le(next_));check(db_->Write({},&b),"enqueue GC mark task");++pending_count_;}
@@ -122,8 +169,8 @@ private:
         if(t.kind==ROOT){if(t.key.starts_with(std::string("\0forkfs-history/revision/",25))){RevisionRecord::decode(b,t.id);mark(t.id,REVISION);}else if(t.key.starts_with(std::string("\0forkfs-history/world/",22))){mark(t.id,MANIFEST);}else if(t.key.starts_with(std::string("\0forkfs-history/base/",21))){if(b.size()!=32)throw std::runtime_error("invalid World base revision reference");Id revision{};memcpy(revision.data(),b.data(),32);if(revision==Id{})throw std::runtime_error("zero World base revision reference");mark(revision,REVISION);}return false;}
         if(t.kind==REVISION){auto r=RevisionRecord::decode(b,t.id);mark(r.manifest,MANIFEST);for(auto& p:r.parents)mark(p,REVISION);return false;}
         if(t.kind==MANIFEST){auto root_value=lookup_manifest(t.id,std::string("\0forkfs/root",12),reader);if(!root_value)throw std::runtime_error("manifest missing namespace root");mark(*root_value,OPAQUE);if(b.size()==40&&!memcmp(b.data(),"FFTREE01",8)){Id root{};memcpy(root.data(),b.data()+8,32);if(root==Id{})throw std::runtime_error("empty metadata tree root");Task tree;tree.kind=TREE;tree.id=root;tree.context=t.id;enqueue(tree);return false;}
-            if(b.size()>=12&&!memcmp(b.data(),"FFMAN001",8)){leveldb::WriteBatch* batch=active_batch_;batch->Put("V/"+idstr(t.id),"r");batch->Put("M/"+idstr(t.id),le(1,4));Task run;run.kind=RUN;run.id=t.id;run.context=t.id;run.size=12;run.key="full";enqueue(run);return false;}
-            if(b.size()<12||memcmp(b.data(),"FFMAN002",8))throw std::runtime_error("unsupported namespace manifest");auto n=number(b.data()+8,4);if(!n||n>32||b.size()!=12+32*n)throw std::runtime_error("invalid namespace run count");std::set<Id> unique;active_batch_->Put("V/"+idstr(t.id),"r");active_batch_->Put("M/"+idstr(t.id),le(n,4));for(size_t i=0;i<n;++i){Id run{};memcpy(run.data(),b.data()+12+32*i,32);if(run==Id{}||!unique.insert(run).second)throw std::runtime_error("duplicate or zero namespace run reference");Task task;task.kind=RUN;task.id=run;task.context=t.id;task.size=12;task.depth=i;task.key="delta";enqueue(task);}return false;}
+            if(b.size()>=12&&!memcmp(b.data(),"FFMAN001",8)){stage_put("V/"+idstr(t.id),"r");stage_put("M/"+idstr(t.id),le(1,4));Task run;run.kind=RUN;run.id=t.id;run.context=t.id;run.size=12;run.key="full";enqueue(run);return false;}
+            if(b.size()<12||memcmp(b.data(),"FFMAN002",8))throw std::runtime_error("unsupported namespace manifest");auto n=number(b.data()+8,4);if(!n||n>32||b.size()!=12+32*n)throw std::runtime_error("invalid namespace run count");std::set<Id> unique;stage_put("V/"+idstr(t.id),"r");stage_put("M/"+idstr(t.id),le(n,4));for(size_t i=0;i<n;++i){Id run{};memcpy(run.data(),b.data()+12+32*i,32);if(run==Id{}||!unique.insert(run).second)throw std::runtime_error("duplicate or zero namespace run reference");Task task;task.kind=RUN;task.id=run;task.context=t.id;task.size=12;task.depth=i;task.key="delta";enqueue(task);}return false;}
         if(t.kind==RUN)return scan_run(b,t,reader);
         if(t.kind==TREE){scan_tree(b,t,reader);return false;}
         if(t.kind==EXTENT)return scan_extent(b,t);
@@ -137,9 +184,9 @@ private:
         return false;
     }
     bool scan_run(const Bytes& b,Task& t,const Reader&){bool full=b.size()>=8&&!memcmp(b.data(),"FFMAN001",8);if(b.size()<12||(!full&&memcmp(b.data(),"FFRUN001",8)))throw std::runtime_error("unsupported namespace run");auto count=number(b.data()+8,4);if(!count||t.first>=count)throw std::runtime_error("empty run or cursor outside entry range");size_t at=t.size;if(at<12||at>b.size()||b.size()-at<(full?4:8))throw std::runtime_error("truncated namespace run entry");auto op=full?1:number(b.data()+at,4);if(!full)at+=4;auto n=number(b.data()+at,4);at+=4;if((op!=1&&op!=2)||n<8||n>1024||b.size()-at<n+32)throw std::runtime_error("invalid namespace run entry");std::string key(b.begin()+at,b.begin()+at+n);at+=n;Id value{};memcpy(value.data(),b.data()+at,32);at+=32;if(!key.starts_with(std::string("\0forkfs/",8))||(!t.previous.empty()&&t.previous>=key)||(op==1&&value==Id{})||(op==2&&value!=Id{}))throw std::runtime_error("invalid namespace run ordering/reference");t.previous=key;
-        std::string winner="K/"+idstr(t.context)+key,old;auto found=db_->Get(read_options(),winner,&old);if(!found.IsNotFound())check(found,"read effective namespace entry");bool replace=found.IsNotFound();if(!replace){if(old.size()!=37)throw std::runtime_error("corrupt effective namespace entry");replace=number(reinterpret_cast<const unsigned char*>(old.data()),4)>t.depth;}if(replace){std::string value_record=le(t.depth,4);value_record.push_back(char(op));value_record+=idstr(value);active_batch_->Put(winner,value_record);}
+        std::string winner="K/"+idstr(t.context)+key,old;auto found=db_->Get(read_options(),winner,&old);if(!found.IsNotFound())check(found,"read effective namespace entry");bool replace=found.IsNotFound();if(!replace){if(old.size()!=37)throw std::runtime_error("corrupt effective namespace entry");replace=number(reinterpret_cast<const unsigned char*>(old.data()),4)>t.depth;}if(replace){std::string value_record=le(t.depth,4);value_record.push_back(char(op));value_record+=idstr(value);stage_put(winner,value_record);}
         if(op==1)mark(value,OPAQUE);
-        ++t.first;t.size=at;if(t.first<count)return true;if(at!=b.size())throw std::runtime_error("namespace run suffix");std::string remaining;auto rs=db_->Get(read_options(),"M/"+idstr(t.context),&remaining);check(rs,"read manifest run barrier");if(remaining.size()!=4)throw std::runtime_error("corrupt manifest run barrier");auto left=number(reinterpret_cast<const unsigned char*>(remaining.data()),4);if(!left)throw std::runtime_error("manifest run barrier underflow");--left;active_batch_->Put("M/"+idstr(t.context),le(left,4));if(!left){Task resolve;resolve.kind=RESOLVE;resolve.id=t.context;resolve.context=t.context;enqueue(resolve);}return false;}
+        ++t.first;t.size=at;if(t.first<count)return true;if(at!=b.size())throw std::runtime_error("namespace run suffix");std::string remaining;auto rs=db_->Get(read_options(),"M/"+idstr(t.context),&remaining);check(rs,"read manifest run barrier");if(remaining.size()!=4)throw std::runtime_error("corrupt manifest run barrier");auto left=number(reinterpret_cast<const unsigned char*>(remaining.data()),4);if(!left)throw std::runtime_error("manifest run barrier underflow");--left;stage_put("M/"+idstr(t.context),le(left,4));if(!left){Task resolve;resolve.kind=RESOLVE;resolve.id=t.context;resolve.context=t.context;enqueue(resolve);}return false;}
     bool scan_resolve(Task& t){std::string prefix="K/"+idstr(t.context),seek=prefix+t.previous;auto it=iterator();it->Seek(seek);check(it->status(),"scan effective namespace entries");if(!t.previous.empty()&&it->Valid()&&it->key().ToString()==seek)it->Next();check(it->status(),"scan effective namespace entries");if(!it->Valid()||!it->key().ToString().starts_with(prefix))return false;auto dbkey=it->key().ToString(),record=it->value().ToString();if(record.size()!=37||dbkey.size()<=prefix.size())throw std::runtime_error("corrupt effective namespace entry");std::string key=dbkey.substr(prefix.size());auto op=static_cast<unsigned char>(record[4]);Id value{};memcpy(value.data(),record.data()+5,32);if((op!=1&&op!=2)||(op==1&&value==Id{})||(op==2&&value!=Id{}))throw std::runtime_error("invalid effective namespace entry");if(op==1){mark(value,OPAQUE);if(key.starts_with(std::string("\0forkfs/inode/",14)))mark(value,INODE,t.context,0,0,0,key);}t.previous=key;return true;}
     static Id priority(const std::string& key){std::string input="forkfs.metadata.priority.v1"+key;return Journal::object_id(Bytes(input.begin(),input.end()));}
     static bool higher(const std::string& a,const std::string& b){auto pa=priority(a),pb=priority(b);return pa==pb?a>b:pa>pb;}

@@ -47,7 +47,7 @@ struct GcCycle {
     uint64_t sequence,deleted=0;Phase phase=Roots;
     std::string root_cursor,object_cursor,reference_cursor,chunk_cursor;
     std::array<unsigned char,32> lease_cursor{};bool lease_started=false;
-    GcCycle(leveldb::DB* source,const std::string& path,uint64_t seq):db(source),mark(path),baseline(source->GetSnapshot()),sequence(seq){}
+    GcCycle(leveldb::DB* source,const std::string& path,uint64_t seq,std::shared_ptr<GcMark::MutexCounters> counters):db(source),mark(path,std::move(counters)),baseline(source->GetSnapshot()),sequence(seq){}
     ~GcCycle(){if(references)db->ReleaseSnapshot(references);db->ReleaseSnapshot(baseline);}
     const char* phase_name() const {switch(phase){case Roots:return "roots";case Leases:return "leases";case Mark:return "mark";case Objects:return "objects";case References:return "references";case Chunks:return "chunks";default:return "complete";}}
 };
@@ -66,8 +66,10 @@ struct GcPhysical {
     const char* phase_name() const {switch(phase){case BuildIndex:return "index";case RefreshActive:return "refresh_active";case ReapMarker:return "reap_marker";case ReapC:return "reap_c";case Inventory:return "inventory";case CandidateC:return "candidate_c";case WaitPins:return "wait_pins";case Cleanup:return "cleanup";default:return "source_c";}}
 };
 struct StoreIoMetrics {
+    std::shared_ptr<GcMark::MutexCounters> gc_mutex=std::make_shared<GcMark::MutexCounters>();
     std::atomic<uint64_t> root_get_calls=0,root_get_ns=0,root_misses=0,root_cache_hits=0,object_get_calls=0,object_get_ns=0,object_misses=0,meta_get_calls=0,meta_get_ns=0;
     std::atomic<uint64_t> transactions=0,prepare_ns=0,write_ns=0,wal_sync_calls=0,wal_sync_ns=0,other_sync_calls=0,other_sync_ns=0,wal_append_bytes=0,wal_append_ns=0,wal_flush_ns=0;
+    std::atomic<uint64_t> data_prepare_calls=0,data_prepare_ns=0,data_sync_calls=0,data_sync_ns=0,metadata_publish_calls=0,metadata_publish_ns=0,gc_barrier_calls=0,gc_barrier_ns=0;
 };
 namespace {
 using Clock=std::chrono::steady_clock;
@@ -246,6 +248,7 @@ std::string LevelStore::logical_value(const leveldb::ReadOptions& options,const 
 void LevelStore::publish(const replay::Batch& input){
     // Caller owns the writer lock, or the unpublished recovery destination.
     // Admission failures leave the current owner healthy: no append has begun.
+    auto data_prepare_begin=Clock::now();
     if(object_store_->has_capacity_budget()){
         std::vector<size_t> new_chunk_sizes;std::set<std::string> chunks;
         for(const auto& op:input.ops)if(!op.erase && op.key.starts_with("O/")){
@@ -277,13 +280,17 @@ void LevelStore::publish(const replay::Batch& input){
             }else metadata.Put(op.key,op.value);
         }
         for(const auto& [hash,location]:pending)metadata.Put("C/"+hash,location);
-        object_store_->sync();fault("segment_before_metadata");
+        ++metrics_->data_prepare_calls;metrics_->data_prepare_ns+=elapsed(data_prepare_begin);
+        auto data_sync_begin=Clock::now();object_store_->sync();fault("segment_before_metadata");
+        ++metrics_->data_sync_calls;metrics_->data_sync_ns+=elapsed(data_sync_begin);
 #ifdef FORKFS_TEST_FAULTS
         const char* injected=std::getenv("FORKFS_TEST_SEGMENT_ERROR");if(injected && !strcmp(injected,"metadata"))throw std::system_error(EIO,std::generic_category(),"injected metadata publication failure");
 #endif
-        leveldb::WriteOptions options;options.sync=true;status(db_->Write(options,&metadata),"publish metadata indexes");physical_format_=next_format;fault("segment_after_metadata");
+        auto metadata_publish_begin=Clock::now();leveldb::WriteOptions options;options.sync=true;status(db_->Write(options,&metadata),"publish metadata indexes");physical_format_=next_format;fault("segment_after_metadata");
+        ++metrics_->metadata_publish_calls;metrics_->metadata_publish_ns+=elapsed(metadata_publish_begin);
         if(gc_cycle_){
             fault("gc_mark_before_barrier");
+            auto gc_barrier_begin=Clock::now();
             try {
 #ifdef FORKFS_TEST_FAULTS
                 const char* gc_failure=std::getenv("FORKFS_TEST_GC_ERROR");if(gc_failure && !strcmp(gc_failure,"barrier"))throw std::runtime_error("injected GC scratch barrier failure");
@@ -297,6 +304,7 @@ void LevelStore::publish(const replay::Batch& input){
                     }
                 }
             }catch(const std::exception& error){gc_error_=std::string("GC publication barrier failed: ")+error.what();gc_cycle_.reset();}
+            ++metrics_->gc_barrier_calls;metrics_->gc_barrier_ns+=elapsed(gc_barrier_begin);
             fault("gc_mark_after_barrier");
         }
     }catch(...){object_store_->abandon();poisoned_=true;throw;}
@@ -403,7 +411,13 @@ std::string LevelStore::metrics_json(bool detailed) const {
         ",\"wal_sync_calls\":"+std::to_string(m.wal_sync_calls.load())+",\"wal_sync_ns\":"+std::to_string(m.wal_sync_ns.load())+
         ",\"other_sync_calls\":"+std::to_string(m.other_sync_calls.load())+",\"other_sync_ns\":"+std::to_string(m.other_sync_ns.load())+
         ",\"wal_append_bytes\":"+std::to_string(m.wal_append_bytes.load())+",\"wal_append_ns\":"+std::to_string(m.wal_append_ns.load())+
-        ",\"wal_flush_ns\":"+std::to_string(m.wal_flush_ns.load());
+        ",\"wal_flush_ns\":"+std::to_string(m.wal_flush_ns.load())+
+        ",\"data_prepare_calls\":"+std::to_string(m.data_prepare_calls.load())+",\"data_prepare_ns\":"+std::to_string(m.data_prepare_ns.load())+
+        ",\"data_sync_calls\":"+std::to_string(m.data_sync_calls.load())+",\"data_sync_ns\":"+std::to_string(m.data_sync_ns.load())+
+        ",\"metadata_publish_calls\":"+std::to_string(m.metadata_publish_calls.load())+",\"metadata_publish_ns\":"+std::to_string(m.metadata_publish_ns.load())+
+        ",\"gc_barrier_calls\":"+std::to_string(m.gc_barrier_calls.load())+",\"gc_barrier_ns\":"+std::to_string(m.gc_barrier_ns.load());
+    result+=",\"gc_foreground_wait_ns\":"+std::to_string(m.gc_mutex->foreground_wait_ns.load())+",\"gc_foreground_hold_ns\":"+std::to_string(m.gc_mutex->foreground_hold_ns.load())+
+        ",\"gc_advance_wait_ns\":"+std::to_string(m.gc_mutex->advance_wait_ns.load())+",\"gc_advance_hold_ns\":"+std::to_string(m.gc_mutex->advance_hold_ns.load());
     if(detailed){auto c=cache_stats();result+=
         ",\"root_get_calls\":"+std::to_string(m.root_get_calls.load())+",\"root_get_ns\":"+std::to_string(m.root_get_ns.load())+
         ",\"root_misses\":"+std::to_string(m.root_misses.load())+",\"root_cache_hits\":"+std::to_string(m.root_cache_hits.load())+",\"object_get_calls\":"+std::to_string(m.object_get_calls.load())+
@@ -792,7 +806,7 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
         {std::lock_guard writer(writer_mutex_);healthy();
             if(!gc_error_.empty()){auto message=std::move(gc_error_);gc_error_.clear();throw std::runtime_error(message);}
             if(replay_enabled_){gc_cycle_.reset();sweep_skipped=true;seq=sequence_;}
-            else {if(!gc_cycle_)gc_cycle_=std::make_shared<GcCycle>(db_.get(),path_,sequence_);cycle=gc_cycle_;seq=cycle->sequence;}}
+            else {if(!gc_cycle_)gc_cycle_=std::make_shared<GcCycle>(db_.get(),path_,sequence_,metrics_->gc_mutex);cycle=gc_cycle_;seq=cycle->sequence;}}
         fault("gc_mark_after_begin");
         auto read_object=[&](const Id& ref)->Bytes{
             auto location=pin_locations();healthy();leveldb::ReadOptions ro;ro.verify_checksums=true;ro.fill_cache=false;
