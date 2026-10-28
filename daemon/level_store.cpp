@@ -77,7 +77,7 @@ struct StoreIoMetrics {
     OperationTiming gc_sweep_dbwrite,gc_relocation_chunk_read,gc_relocation_sync,gc_relocation_dbwrite,gc_retirement_dbwrite;
     std::atomic<uint64_t> root_get_calls=0,root_get_ns=0,root_misses=0,root_cache_hits=0,object_get_calls=0,object_get_ns=0,object_misses=0,meta_get_calls=0,meta_get_ns=0;
     std::atomic<uint64_t> transactions=0,prepare_ns=0,write_ns=0,wal_sync_calls=0,wal_sync_ns=0,other_sync_calls=0,other_sync_ns=0,wal_append_bytes=0,wal_append_ns=0,wal_flush_ns=0;
-    std::atomic<uint64_t> data_prepare_calls=0,data_prepare_ns=0,data_sync_calls=0,data_sync_ns=0,metadata_publish_calls=0,metadata_publish_ns=0,gc_barrier_calls=0,gc_barrier_ns=0;
+    OperationTiming data_prepare,data_sync,metadata_publish,gc_barrier;
 };
 namespace {
 using Clock=std::chrono::steady_clock;
@@ -322,14 +322,14 @@ void LevelStore::publish(const replay::Batch& input){
             }else metadata.Put(op.key,op.value);
         }
         for(const auto& [hash,location]:pending)metadata.Put("C/"+hash,location);
-        ++metrics_->data_prepare_calls;metrics_->data_prepare_ns+=elapsed(data_prepare_begin);
+        record_operation(metrics_->data_prepare,elapsed(data_prepare_begin));
         auto data_sync_begin=Clock::now();object_store_->sync();fault("segment_before_metadata");
-        ++metrics_->data_sync_calls;metrics_->data_sync_ns+=elapsed(data_sync_begin);
+        record_operation(metrics_->data_sync,elapsed(data_sync_begin));
 #ifdef FORKFS_TEST_FAULTS
         const char* injected=std::getenv("FORKFS_TEST_SEGMENT_ERROR");if(injected && !strcmp(injected,"metadata"))throw std::system_error(EIO,std::generic_category(),"injected metadata publication failure");
 #endif
         auto metadata_publish_begin=Clock::now();leveldb::WriteOptions options;options.sync=true;status(db_->Write(options,&metadata),"publish metadata indexes");physical_format_=next_format;fault("segment_after_metadata");
-        ++metrics_->metadata_publish_calls;metrics_->metadata_publish_ns+=elapsed(metadata_publish_begin);
+        record_operation(metrics_->metadata_publish,elapsed(metadata_publish_begin));
         if(gc_cycle_){
             fault("gc_mark_before_barrier");
             auto gc_barrier_begin=Clock::now();
@@ -338,15 +338,20 @@ void LevelStore::publish(const replay::Batch& input){
                 const char* gc_failure=std::getenv("FORKFS_TEST_GC_ERROR");if(gc_failure && !strcmp(gc_failure,"barrier"))throw std::runtime_error("injected GC scratch barrier failure");
 #endif
                 auto roots=[&](const std::string& key)->std::optional<Id>{std::string ref;auto found=db_->Get(read,key,&ref);if(found.IsNotFound())return std::nullopt;status(found,"GC publication root lookup");return id(ref);};
+                // Descriptors contain at most four chunks; bound the per-batch
+                // collection to the maximum foreground mutation count times four.
+                std::vector<std::string> chunk_hashes;
                 for(const auto& op:input.ops)if(!op.erase){
                     if(op.key.starts_with("R/"))gc_cycle_->mark.seed_published_root(op.key,id(op.value),roots);
                     else if(op.key.starts_with("O/")){
                         std::string descriptor;status(db_->Get(read,op.key,&descriptor),"GC published object lookup");
-                        replay::Input in{descriptor};need(in.take(8)=="FFOBJ002","invalid GC publication descriptor");(void)in.integer(8);auto count=in.integer(4);need(count>0&&count<=4,"invalid GC publication chunks");for(uint64_t i=0;i<count;++i)gc_cycle_->mark.protect_chunk(in.take(32));in.end();
+                        replay::Input in{descriptor};need(in.take(8)=="FFOBJ002","invalid GC publication descriptor");(void)in.integer(8);auto count=in.integer(4);need(count>0&&count<=4,"invalid GC publication chunks");
+                        need(count<=GcMark::max_protected_chunks-chunk_hashes.size(),"too many GC publication chunks");for(uint64_t i=0;i<count;++i)chunk_hashes.push_back(in.take(32));in.end();
                     }
                 }
+                gc_cycle_->mark.protect_chunks(chunk_hashes);
             }catch(const std::exception& error){gc_error_=std::string("GC publication barrier failed: ")+error.what();gc_cycle_.reset();}
-            ++metrics_->gc_barrier_calls;metrics_->gc_barrier_ns+=elapsed(gc_barrier_begin);
+            record_operation(metrics_->gc_barrier,elapsed(gc_barrier_begin));
             fault("gc_mark_after_barrier");
         }
     }catch(...){object_store_->abandon();poisoned_=true;throw;}
@@ -454,10 +459,10 @@ std::string LevelStore::metrics_json(bool detailed) const {
         ",\"other_sync_calls\":"+std::to_string(m.other_sync_calls.load())+",\"other_sync_ns\":"+std::to_string(m.other_sync_ns.load())+
         ",\"wal_append_bytes\":"+std::to_string(m.wal_append_bytes.load())+",\"wal_append_ns\":"+std::to_string(m.wal_append_ns.load())+
         ",\"wal_flush_ns\":"+std::to_string(m.wal_flush_ns.load())+
-        ",\"data_prepare_calls\":"+std::to_string(m.data_prepare_calls.load())+",\"data_prepare_ns\":"+std::to_string(m.data_prepare_ns.load())+
-        ",\"data_sync_calls\":"+std::to_string(m.data_sync_calls.load())+",\"data_sync_ns\":"+std::to_string(m.data_sync_ns.load())+
-        ",\"metadata_publish_calls\":"+std::to_string(m.metadata_publish_calls.load())+",\"metadata_publish_ns\":"+std::to_string(m.metadata_publish_ns.load())+
-        ",\"gc_barrier_calls\":"+std::to_string(m.gc_barrier_calls.load())+",\"gc_barrier_ns\":"+std::to_string(m.gc_barrier_ns.load());
+        ",\"data_prepare_calls\":"+std::to_string(m.data_prepare.calls.load())+",\"data_prepare_ns\":"+std::to_string(m.data_prepare.ns.load())+",\"data_prepare_max_ns\":"+std::to_string(m.data_prepare.max_ns.load())+
+        ",\"data_sync_calls\":"+std::to_string(m.data_sync.calls.load())+",\"data_sync_ns\":"+std::to_string(m.data_sync.ns.load())+",\"data_sync_max_ns\":"+std::to_string(m.data_sync.max_ns.load())+
+        ",\"metadata_publish_calls\":"+std::to_string(m.metadata_publish.calls.load())+",\"metadata_publish_ns\":"+std::to_string(m.metadata_publish.ns.load())+",\"metadata_publish_max_ns\":"+std::to_string(m.metadata_publish.max_ns.load())+
+        ",\"gc_barrier_calls\":"+std::to_string(m.gc_barrier.calls.load())+",\"gc_barrier_ns\":"+std::to_string(m.gc_barrier.ns.load())+",\"gc_barrier_max_ns\":"+std::to_string(m.gc_barrier.max_ns.load());
     result+=",\"gc_foreground_wait_ns\":"+std::to_string(m.gc_mutex->foreground_wait_ns.load())+",\"gc_foreground_hold_ns\":"+std::to_string(m.gc_mutex->foreground_hold_ns.load())+
         ",\"gc_advance_wait_ns\":"+std::to_string(m.gc_mutex->advance_wait_ns.load())+",\"gc_advance_hold_ns\":"+std::to_string(m.gc_mutex->advance_hold_ns.load());
     result+=",\"foreground_writer\":"+timing_json(m.foreground_writer)+

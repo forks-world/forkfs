@@ -178,7 +178,7 @@ static void test_foreground_seeds_while_reader_is_blocked(){
     std::thread foreground([&]{try{
         marker.seed_manifest(second_run);
         marker.protect(shared_child); // Duplicates a child that the blocked run scan will enqueue.
-        marker.protect_chunk(std::string(32,'a'));
+        marker.protect_chunks({std::string(32,'a'),std::string(32,'b'),std::string(32,'c')});
     }catch(...){foreground_error=std::current_exception();}
         {std::lock_guard<std::mutex> lock(foreground_mutex);finished=true;}foreground_done.notify_all();});
     bool foreground_finished=false;
@@ -198,7 +198,33 @@ static void test_foreground_seeds_while_reader_is_blocked(){
     drain(marker,objects);
     CHECK(marker.live(first_run)&&marker.live(second_run));
     CHECK(marker.live(root_value)&&marker.live(second_value)&&marker.live(shared_child));
-    CHECK(marker.chunk_live(std::string(32,'a')));CHECK(marker.pending()==0);
+    CHECK(marker.chunk_live(std::string(32,'a'))&&marker.chunk_live(std::string(32,'b'))&&marker.chunk_live(std::string(32,'c')));CHECK(marker.pending()==0);
+}
+
+static void test_protect_chunks_batch_atomicity_and_bounds(){
+    const std::string a(32,'a'),b(32,'b'),c(32,'c'),legacy(32,'d');
+    {
+        TempDir dir;GcMark marker(dir.path);
+        const auto before_processed=marker.processed();const auto before_pending=marker.pending();
+        marker.protect_chunks({});
+        CHECK(!marker.has_work());CHECK(marker.processed()==before_processed);CHECK(marker.pending()==before_pending);
+        CHECK(!marker.chunk_live(a));
+        marker.protect_chunks({a,b,a,c});
+        CHECK(marker.chunk_live(a)&&marker.chunk_live(b)&&marker.chunk_live(c));
+        CHECK(!marker.has_work());CHECK(marker.processed()==0);CHECK(marker.pending()==0);
+        marker.protect_chunk(legacy);CHECK(marker.chunk_live(legacy));
+    }
+    {
+        TempDir dir;GcMark marker(dir.path);const std::string malformed(31,'x');
+        rejects([&]{marker.protect_chunks({a,malformed,b});});
+        CHECK(!marker.chunk_live(a)&&!marker.chunk_live(b));
+        CHECK(!marker.has_work());CHECK(marker.pending()==0);CHECK(marker.processed()==0);
+    }
+    {
+        TempDir dir;GcMark marker(dir.path);std::vector<std::string> too_many(GcMark::max_protected_chunks+1,a);
+        rejects([&]{marker.protect_chunks(too_many);});
+        CHECK(!marker.chunk_live(a));CHECK(!marker.has_work());CHECK(marker.pending()==0);CHECK(marker.processed()==0);
+    }
 }
 
 static void test_reader_failure_and_concurrent_advances(){
@@ -377,7 +403,8 @@ static void test_maximum_revision_fanout(){
 int main(){try{
     test_sparse_extent_and_zero_root();test_extent_out_of_eof_rejected();test_raw_content_magic_is_opaque();
     test_effective_overlay_keeps_shadowed_put_opaque();test_invalid_run_operation_rejected();test_content_only_orphan_and_inode_roots();
-    test_foreground_seeds_while_reader_is_blocked();test_reader_failure_and_concurrent_advances();test_maximum_revision_fanout();
+    test_foreground_seeds_while_reader_is_blocked();test_protect_chunks_batch_atomicity_and_bounds();
+    test_reader_failure_and_concurrent_advances();test_maximum_revision_fanout();
     test_published_world_root_coalescing();test_published_world_roots_coexist_with_retained_roots();
     test_published_world_replacement_during_blocked_reader(false);test_published_world_replacement_during_blocked_reader(true);
     test_published_world_reader_error_and_validation();

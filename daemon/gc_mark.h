@@ -37,6 +37,7 @@ public:
     using Bytes=std::vector<unsigned char>;
     using Reader=std::function<Bytes(const Id&)>;
     using RootReader=std::function<std::optional<Id>(const std::string&)>;
+    static constexpr size_t max_protected_chunks=16384;
     struct MutexMetrics {uint64_t foreground_wait_ns=0,foreground_hold_ns=0,advance_wait_ns=0,advance_hold_ns=0;};
     struct MutexCounters {std::atomic<uint64_t> foreground_wait_ns=0,foreground_hold_ns=0,advance_wait_ns=0,advance_hold_ns=0;};
     MutexMetrics mutex_metrics() const {return {mutex_counters_->foreground_wait_ns.load(),mutex_counters_->foreground_hold_ns.load(),mutex_counters_->advance_wait_ns.load(),mutex_counters_->advance_hold_ns.load()};}
@@ -107,6 +108,13 @@ public:
     void seed_manifest(const Id& id){auto waiting=Clock::now();std::unique_lock<std::mutex> guard(mu_);mutex_counters_->foreground_wait_ns+=ns(waiting);HoldTimer held(mutex_counters_->foreground_hold_ns);Task t;t.kind=MANIFEST;t.id=id;enqueue_now(t);}
     void protect(const Id& id){auto waiting=Clock::now();std::unique_lock<std::mutex> guard(mu_);mutex_counters_->foreground_wait_ns+=ns(waiting);HoldTimer held(mutex_counters_->foreground_hold_ns);Task t;t.kind=OPAQUE;t.id=id;enqueue_now(t);}
     void protect_chunk(const std::string& hash){auto waiting=Clock::now();std::unique_lock<std::mutex> guard(mu_);mutex_counters_->foreground_wait_ns+=ns(waiting);HoldTimer held(mutex_counters_->foreground_hold_ns);if(hash.size()!=32)throw std::runtime_error("invalid GC chunk hash");leveldb::WriteBatch b;b.Put("H/"+hash,"1");check(db_->Write({},&b),"protect GC chunk");}
+    void protect_chunks(const std::vector<std::string>& hashes){
+        if(hashes.empty())return;
+        if(hashes.size()>max_protected_chunks)throw std::runtime_error("too many GC chunks to protect");
+        for(const auto& hash:hashes)if(hash.size()!=32)throw std::runtime_error("invalid GC chunk hash");
+        auto waiting=Clock::now();std::unique_lock<std::mutex> guard(mu_);mutex_counters_->foreground_wait_ns+=ns(waiting);HoldTimer held(mutex_counters_->foreground_hold_ns);
+        leveldb::WriteBatch batch;for(const auto& hash:hashes)batch.Put("H/"+hash,"1");check(db_->Write({},&batch),"protect GC chunks");
+    }
     bool chunk_live(const std::string& hash) const {std::lock_guard<std::mutex> guard(mu_);std::string value;auto s=db_->Get(read_options(),"H/"+hash,&value);if(!s.IsNotFound())check(s,"read GC chunk marker");return !s.IsNotFound();}
     bool live(const Id& id) const {std::lock_guard<std::mutex> guard(mu_);std::string value;auto s=db_->Get(read_options(),live_key(id),&value);if(!s.IsNotFound())check(s,"read GC live marker");return !s.IsNotFound();}
     bool has_work() const {std::lock_guard<std::mutex> guard(mu_);auto it=iterator();it->Seek("Q/");check(it->status(),"scan GC tasks");if(it->Valid()&&it->key().ToString().starts_with("Q/"))return true;it->Seek("P/");check(it->status(),"scan GC publication roots");return it->Valid()&&it->key().ToString().starts_with("P/");}
