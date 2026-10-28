@@ -300,7 +300,7 @@ std::string Container::start_collection(size_t max_copy_bytes,size_t max_objects
                 const bool pending=count("pending_segments")!=0 || mark_pending || physical_pending;
                 {std::lock_guard lock(collection_mutex_);collection_last_=report;++collection_steps_;}
                 const bool skipped=report.find("\"logical_sweep_skipped\":true")!=std::string::npos;
-                if(!pending && !reclaimed && !skipped){state="complete";break;}
+                if(!pending && !reclaimed){state=skipped?"blocked":"complete";break;}
                 if(!progress){state=pending || skipped?"blocked":"complete";break;}
                 std::this_thread::yield();
             }

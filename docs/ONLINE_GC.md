@@ -268,6 +268,13 @@ checks point reads, iteration and reopening; it fails with the old pin. Updating
 the pin prevents this compaction error; it does not repair an already damaged
 store. Failed stores from this investigation are preserved unchanged.
 
+When replay retention skips logical sweeping, the async job stops as `blocked`
+once a clean physical round has no pending work or new reclamation. Cleanup may
+consume `physical_work_done` even in this terminal round; that progress alone
+must not restart indexing. The terminal report keeps `logical_sweep_skipped=true`
+and `physical_pending=false` / `mark_pending=false`, allowing callers to distinguish
+physical completion from a complete logical reclaim.
+
 Marker advancement serializes its callers separately from the publication mutex.
 It selects a queued task under that mutex, retains its Q/P record, and releases the
 mutex while reading immutable objects and interpreting their references. Child

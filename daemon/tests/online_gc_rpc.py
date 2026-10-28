@@ -68,6 +68,16 @@ with tempfile.TemporaryDirectory(prefix='ff-online-gc-rpc-') as directory:
             assert time.monotonic() < deadline, state
             time.sleep(.01)
 
+    def finish_backup(name, timeout=30):
+        deadline = time.monotonic() + timeout
+        while True:
+            state = obj('backup-status', name)
+            if state['state'] != 'running':
+                assert state['state'] == 'durable' and state['error'] == '', state
+                return state
+            assert time.monotonic() < deadline, state
+            time.sleep(.01)
+
     proc = start_server()
     try:
         request('fs-init')
@@ -151,6 +161,22 @@ with tempfile.TemporaryDirectory(prefix='ff-online-gc-rpc-') as directory:
         assert terminal['steps'] > 0 and terminal['error'] == '', terminal
         request('fs-check')
         assert request('fs-cat', '/file') == final_value
+
+        # A durable base backup enables replay retention. Once its physical
+        # sweep has no pending work, replay retention intentionally skips the
+        # logical sweep and the manager must stop as blocked instead of
+        # repeatedly rebuilding the physical index until its step budget ends.
+        base = root/'replay-base.pack'
+        obj('backup-start', 'gc-replay-base', base)
+        assert finish_backup('gc-replay-base')['checkpoint']['sequence'] is not None
+        replay_gc = obj('gc-start', '65580', '4096', '32', '1048576', '128')
+        assert replay_gc['state'] in {'running', 'blocked'}, replay_gc
+        replay_gc = finish_gc(timeout=60)
+        assert replay_gc['state'] == 'blocked' and replay_gc['steps'] < 32, replay_gc
+        last = replay_gc['last_step']
+        assert last['logical_sweep_skipped'] is True, last
+        assert last['physical_pending'] is False and last['mark_pending'] is False, last
+        assert last['pending_segments'] == 0, last
     finally:
         proc.terminate()
         try:
