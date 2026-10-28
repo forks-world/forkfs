@@ -41,6 +41,10 @@ void test_prepared();
 void test_verify_snapshot();
 void test_compact();
 #endif
+#ifdef FORKFS_TEST_GC
+void test_gc_foreground_demand();
+void test_gc_work_boundary(uint64_t);
+#endif
 struct GcCycle {
     enum Phase {Roots,Leases,Mark,Objects,References,Chunks,Complete};
     leveldb::DB* db;GcMark mark;const leveldb::Snapshot* baseline;const leveldb::Snapshot* references=nullptr;
@@ -82,6 +86,13 @@ struct StoreIoMetrics {
 namespace {
 using Clock=std::chrono::steady_clock;
 uint64_t elapsed(Clock::time_point start){return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();}
+class ForegroundDemand {
+    std::atomic<uint64_t>& active_;
+public:
+    explicit ForegroundDemand(std::atomic<uint64_t>& active):active_(active){active_.fetch_add(1,std::memory_order_relaxed);}
+    ~ForegroundDemand(){active_.fetch_sub(1,std::memory_order_relaxed);}
+    ForegroundDemand(const ForegroundDemand&)=delete;ForegroundDemand& operator=(const ForegroundDemand&)=delete;
+};
 void update_max(std::atomic<uint64_t>& target,uint64_t value){auto current=target.load(std::memory_order_relaxed);while(current<value&&!target.compare_exchange_weak(current,value,std::memory_order_relaxed)) {}}
 void record_operation(StoreIoMetrics::OperationTiming& metrics,uint64_t duration){++metrics.calls;metrics.ns+=duration;update_max(metrics.max_ns,duration);}
 class TimedOperation {
@@ -402,7 +413,12 @@ std::vector<std::string> LevelStore::keys(const std::string& prefix) const {
     status(it->status(),"scan LevelDB roots");return result;
 }
 void LevelStore::transact(uint64_t expected,const std::vector<Mutation>& changes) {
-    auto pin=pin_locations();auto begin=Clock::now();healthy();need(physical_format_>=5,"legacy object layout is read/export-only; migrate with backup/replay");need(expected==sequence_,"transaction conflict: sequence changed");
+    // Pin admission may itself wait behind GC: advertise demand before it.
+    ForegroundDemand demand(foreground_demand_);auto pin=pin_locations();
+#ifdef FORKFS_TEST_GC
+    test_gc_foreground_demand();
+#endif
+    auto begin=Clock::now();healthy();need(physical_format_>=5,"legacy object layout is read/export-only; migrate with backup/replay");need(expected==sequence_,"transaction conflict: sequence changed");
     need(!changes.empty() && changes.size()<=4096,"LevelDB batch requires 1..4096 mutations");
     // Validate and hash caller-owned immutable input before taking the writer
     // lock. No mutable roots/counters are read and no database mutation occurs here.
@@ -856,6 +872,14 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
     uint64_t segments_deleted=0,pending=0;
     charge(32*1024); // bounded marker/task working metadata; disk marks are not resident sets
     uint64_t seq=0,deleted=0,chunks_deleted=0,work_done=0,mark_processed=0;
+    bool foreground_pressure=false;
+    size_t work_limit=mark_work;
+    auto refresh_pressure=[&]{
+        if(foreground_demand_.load(std::memory_order_relaxed)!=0){
+            foreground_pressure=true;
+            work_limit=std::min<size_t>(work_limit,8);
+        }
+    };
     bool sweep_skipped=false,mark_pending=false;std::string mark_phase="complete";
     std::shared_ptr<GcCycle> cycle;
     try {
@@ -868,7 +892,12 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
             auto location=pin_locations();healthy();leveldb::ReadOptions ro;ro.verify_checksums=true;ro.fill_cache=false;
             auto payload=object_payload(ro,bytes(ref));healthy();return Bytes(payload.begin(),payload.end());};
         bool hook_called=false;
-        while(cycle && work_done<mark_work && (cycle->phase!=GcCycle::Complete || cycle->mark.has_work())){
+        while(cycle){
+#ifdef FORKFS_TEST_GC
+            test_gc_work_boundary(work_done);
+#endif
+            refresh_pressure();
+            if(work_done>=work_limit || (cycle->phase==GcCycle::Complete && !cycle->mark.has_work()))break;
             if(cycle->phase==GcCycle::Roots){
                 leveldb::ReadOptions ro;ro.verify_checksums=true;ro.fill_cache=false;ro.snapshot=cycle->baseline;
                 std::unique_ptr<leveldb::Iterator> roots(db_->NewIterator(ro));
@@ -906,7 +935,9 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
                 leveldb::WriteBatch batch;std::vector<std::string> forgotten;uint64_t root_removals=0,object_removals=0,chunk_removals=0;
                 const std::string alias("R/\0forkfs-history/object/",25);
                 size_t visits=0;bool exhausted=false;
-                for(;visits<std::min<uint64_t>(128,mark_work-work_done);scan->Next()){
+                for(;visits<128;scan->Next()){
+                    refresh_pressure();
+                    if(work_done+visits>=work_limit)break;
                     if(!scan->Valid()||!scan->key().starts_with(prefix)){exhausted=true;break;}
                     auto key=scan->key().ToString();need(key.size()==34,"invalid incremental GC object/chunk key");++visits;cursor=key;
                     const bool live=objects_phase?cycle->mark.live(id(key.substr(2))):cycle->mark.chunk_live(key.substr(2));if(live)continue;
@@ -961,6 +992,7 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
     try {
         // EOF proof remains valid for this sealed retired segment. A reader
         // delays unlink only; let inventory/relocation finish in the meantime.
+        refresh_pressure();
         if(ph.reap_ready){
             pending=1;
             TimedMutexLock writer(writer_mutex_,metrics_->gc_writer_retire);healthy();std::lock_guard pins(pin_state_->mutex);
@@ -973,7 +1005,9 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
                 if(ph.phase==GcPhysical::WaitPins){ph.directory_started=false;ph.phase=GcPhysical::ReapMarker;}
             }
         }
-        while(physical_work<mark_work){
+        while(true){
+            refresh_pressure();
+            if(physical_work>=work_limit)break;
             healthy();
             if(ph.phase==GcPhysical::Cleanup){
                 ++physical_work;
@@ -1112,7 +1146,9 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
             // consumes work; at most eight matching chunks enter a publication.
             std::vector<std::pair<std::string,std::string>> refs;
             uint64_t batch_bytes=0,visits=0;std::string next_cursor=ph.cursor;
-            while(row && physical_work+visits<mark_work){
+            while(row){
+                refresh_pressure();
+                if(physical_work+visits>=work_limit)break;
                 auto key=row->first,loc=row->second;
                 need(key.size()==34,"invalid physical GC chunk key");auto [sid,n]=chunk_location(loc);
                 if(sid==ph.candidate){
@@ -1151,7 +1187,8 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
     }catch(...){gc_physical_.reset();throw;}
     if(!mark_pending && !physical_pending){std::lock_guard writer(writer_mutex_);gc_cycle_.reset();}
     mark_pending=mark_pending || physical_pending;
-    return "{\"metadata_budget_bytes\":"+std::to_string(max_metadata_bytes)+",\"metadata_bytes_charged\":"+std::to_string(metadata_bytes)+",\"mark_work_done\":"+std::to_string(work_done)+",\"mark_processed\":"+std::to_string(mark_processed)+",\"mark_pending\":"+(mark_pending?"true":"false")+",\"mark_phase\":\""+mark_phase+"\",\"physical_work_done\":"+std::to_string(physical_work)+",\"physical_index_work\":"+std::to_string(index_work)+",\"physical_reference_work\":"+std::to_string(reference_work)+",\"physical_candidate_work\":"+std::to_string(candidate_work)+",\"physical_pending\":"+(physical_pending?"true":"false")+",\"physical_phase\":\""+physical_phase+"\",\"objects_deleted\":"+std::to_string(deleted)+",\"chunks_deleted\":"+std::to_string(chunks_deleted)+",\"chunks_moved\":"+std::to_string(moved)+",\"bytes_copied\":"+std::to_string(copied)+",\"segments_deleted\":"+std::to_string(segments_deleted)+",\"pending_segments\":"+std::to_string(pending)+",\"logical_sweep_skipped\":"+(sweep_skipped?"true":"false")+",\"sequence\":"+std::to_string(seq)+"}";
+    refresh_pressure();
+    return "{\"metadata_budget_bytes\":"+std::to_string(max_metadata_bytes)+",\"metadata_bytes_charged\":"+std::to_string(metadata_bytes)+",\"mark_work_done\":"+std::to_string(work_done)+",\"mark_processed\":"+std::to_string(mark_processed)+",\"mark_pending\":"+(mark_pending?"true":"false")+",\"mark_phase\":\""+mark_phase+"\",\"physical_work_done\":"+std::to_string(physical_work)+",\"physical_index_work\":"+std::to_string(index_work)+",\"physical_reference_work\":"+std::to_string(reference_work)+",\"physical_candidate_work\":"+std::to_string(candidate_work)+",\"physical_pending\":"+(physical_pending?"true":"false")+",\"physical_phase\":\""+physical_phase+"\",\"objects_deleted\":"+std::to_string(deleted)+",\"chunks_deleted\":"+std::to_string(chunks_deleted)+",\"chunks_moved\":"+std::to_string(moved)+",\"bytes_copied\":"+std::to_string(copied)+",\"segments_deleted\":"+std::to_string(segments_deleted)+",\"pending_segments\":"+std::to_string(pending)+",\"logical_sweep_skipped\":"+(sweep_skipped?"true":"false")+",\"foreground_pressure\":"+(foreground_pressure?"true":"false")+",\"sequence\":"+std::to_string(seq)+"}";
 
 }
 

@@ -63,6 +63,7 @@ private:
         bool archive_durable=false;
     };
     mutable std::mutex collection_mutex_;
+    std::condition_variable collection_wait_cv_;
     std::mutex collection_lifecycle_mutex_;
     std::thread collection_thread_;
     std::atomic<bool> collection_stop_=false;

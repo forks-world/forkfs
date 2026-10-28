@@ -298,11 +298,20 @@ std::string Container::start_collection(size_t max_copy_bytes,size_t max_objects
                 const bool mark_pending=report.find("\"mark_pending\":true")!=std::string::npos;
                 const bool physical_pending=report.find("\"physical_pending\":true")!=std::string::npos;
                 const bool pending=count("pending_segments")!=0 || mark_pending || physical_pending;
+                const bool foreground_pressure=report.find("\"foreground_pressure\":true")!=std::string::npos;
                 {std::lock_guard lock(collection_mutex_);collection_last_=report;++collection_steps_;}
                 const bool skipped=report.find("\"logical_sweep_skipped\":true")!=std::string::npos;
                 if(!pending && !reclaimed){state=skipped?"blocked":"complete";break;}
-                if(!progress){state=pending || skipped?"blocked":"complete";break;}
-                std::this_thread::yield();
+                if(!progress){
+                    if(!foreground_pressure){state=pending || skipped?"blocked":"complete";break;}
+                    std::unique_lock wait(collection_mutex_);
+                    collection_wait_cv_.wait_for(wait,std::chrono::milliseconds(1),[this]{return collection_stop_.load();});
+                    continue;
+                }
+                if(foreground_pressure){
+                    std::unique_lock wait(collection_mutex_);
+                    collection_wait_cv_.wait_for(wait,std::chrono::milliseconds(1),[this]{return collection_stop_.load();});
+                }else std::this_thread::yield();
             }
             if(collection_stop_)state="stopped";
         }catch(const std::exception& e){std::lock_guard lock(collection_mutex_);collection_error_=e.what();state="failed";}
@@ -311,7 +320,9 @@ std::string Container::start_collection(size_t max_copy_bytes,size_t max_objects
     return collection_status();
 }
 void Container::stop_collection() {
-    std::lock_guard lifecycle(collection_lifecycle_mutex_);collection_stop_=true;
+    std::lock_guard lifecycle(collection_lifecycle_mutex_);
+    {std::lock_guard lock(collection_mutex_);collection_stop_=true;}
+    collection_wait_cv_.notify_all();
     if(collection_thread_.joinable())collection_thread_.join();
     journal_->cancel_collection();
     std::lock_guard state(collection_mutex_);
