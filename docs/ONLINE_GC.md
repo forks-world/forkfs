@@ -301,6 +301,36 @@ root IDs may remain conservatively live without retaining an obsolete transient
 closure; any independently retained revision or lease still traverses that
 closure. Scratch P state is discarded on restart with the rest of the cycle.
 
+Publication protects its chunk H markers with one scratch WriteBatch after
+validating all hashes, bounded to 16,384 chunks. Root protection remains ordered
+before that batch, with the main writer fence held across both. Scratch failure
+still discards the collection cycle; main DATA/metadata sync ordering is unchanged.
+Incremental reference scanning retains the single-chunk protection primitive.
+
+Foreground transactions advertise demand before location-pin admission and keep
+that RAII demand through writer release and cleanup, including exception paths.
+A collector observing demand tightens its remaining logical/physical quantum to
+at most eight units and retains all cursors. Already completed work is not undone:
+late-arrival pressure may accompany more than eight reported units, always within
+the original caller ceiling. The next call restores the full caller budget when
+idle. This is a cooperative work quantum, not a bound on individual I/O duration.
+
+Synchronous collection never sleeps. Only the asynchronous worker waits for an
+interruptible one millisecond after a pressured step. Stop signals under the wait
+mutex and notifies before joining. Transient pressure-related no-progress remains
+retryable within the existing job ceiling; quiet completion retains priority.
+GC continues eligible bounded work under demand rather than being disabled.
+Reader pins still gate pruning/retirement; persistent pins or continuous changes
+can require later resumptions and do not promise a complete collection under load.
+
+Profiles expose writer wait/hold counters and maxima for foreground transactions
+and GC sweep/relocation/retirement, plus relocation read and sync timings. Hold
+bands are non-cumulative; independent atomic snapshots during activity need not
+have exactly matching counts. The sweep bucket also includes reference marking.
+[The tail-latency investigation](evidence/GC_TAIL_BACKPRESSURE_20261029.md) records
+matched workloads, explicit remaining long stalls and sampled storage tradeoffs.
+No hard latency, CPU-share or process-RSS ceiling follows from this scheduling.
+
 Staged children use encoded records, capped at the codecs' maximum fanout of 65.
 Their encodings are released as the commit batch grows, avoiding a second large
 resident vector of decoded tasks. A reader-gate regression verifies foreground
