@@ -66,7 +66,15 @@ struct GcPhysical {
     const char* phase_name() const {switch(phase){case BuildIndex:return "index";case RefreshActive:return "refresh_active";case ReapMarker:return "reap_marker";case ReapC:return "reap_c";case Inventory:return "inventory";case CandidateC:return "candidate_c";case WaitPins:return "wait_pins";case Cleanup:return "cleanup";default:return "source_c";}}
 };
 struct StoreIoMetrics {
+    struct LockTiming {
+        std::atomic<uint64_t> wait_calls=0,wait_ns=0,wait_max_ns=0;
+        std::atomic<uint64_t> hold_calls=0,hold_ns=0,hold_max_ns=0;
+        std::array<std::atomic<uint64_t>,7> hold_buckets{};
+    };
+    struct OperationTiming {std::atomic<uint64_t> calls=0,ns=0,max_ns=0;};
     std::shared_ptr<GcMark::MutexCounters> gc_mutex=std::make_shared<GcMark::MutexCounters>();
+    LockTiming foreground_writer,gc_writer_sweep,gc_writer_relocate,gc_writer_retire;
+    OperationTiming gc_sweep_dbwrite,gc_relocation_chunk_read,gc_relocation_sync,gc_relocation_dbwrite,gc_retirement_dbwrite;
     std::atomic<uint64_t> root_get_calls=0,root_get_ns=0,root_misses=0,root_cache_hits=0,object_get_calls=0,object_get_ns=0,object_misses=0,meta_get_calls=0,meta_get_ns=0;
     std::atomic<uint64_t> transactions=0,prepare_ns=0,write_ns=0,wal_sync_calls=0,wal_sync_ns=0,other_sync_calls=0,other_sync_ns=0,wal_append_bytes=0,wal_append_ns=0,wal_flush_ns=0;
     std::atomic<uint64_t> data_prepare_calls=0,data_prepare_ns=0,data_sync_calls=0,data_sync_ns=0,metadata_publish_calls=0,metadata_publish_ns=0,gc_barrier_calls=0,gc_barrier_ns=0;
@@ -74,6 +82,40 @@ struct StoreIoMetrics {
 namespace {
 using Clock=std::chrono::steady_clock;
 uint64_t elapsed(Clock::time_point start){return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();}
+void update_max(std::atomic<uint64_t>& target,uint64_t value){auto current=target.load(std::memory_order_relaxed);while(current<value&&!target.compare_exchange_weak(current,value,std::memory_order_relaxed)) {}}
+void record_operation(StoreIoMetrics::OperationTiming& metrics,uint64_t duration){++metrics.calls;metrics.ns+=duration;update_max(metrics.max_ns,duration);}
+class TimedOperation {
+    StoreIoMetrics::OperationTiming& metrics_;Clock::time_point start_=Clock::now();
+public:
+    explicit TimedOperation(StoreIoMetrics::OperationTiming& metrics):metrics_(metrics){}
+    ~TimedOperation(){record_operation(metrics_,elapsed(start_));}
+};
+class TimedMutexLock {
+    std::unique_lock<std::mutex> lock_;StoreIoMetrics::LockTiming& metrics_;Clock::time_point acquired_;
+public:
+    TimedMutexLock(std::mutex& mutex,StoreIoMetrics::LockTiming& metrics):lock_(mutex,std::defer_lock),metrics_(metrics){
+        auto waiting=Clock::now();lock_.lock();acquired_=Clock::now();auto wait_ns=elapsed(waiting);
+        ++metrics_.wait_calls;metrics_.wait_ns+=wait_ns;update_max(metrics_.wait_max_ns,wait_ns);
+    }
+    ~TimedMutexLock(){
+        auto hold_ns=elapsed(acquired_);++metrics_.hold_calls;metrics_.hold_ns+=hold_ns;update_max(metrics_.hold_max_ns,hold_ns);
+        // Non-cumulative duration bands, then an open-ended tail.
+        constexpr std::array<uint64_t,6> limits={1000000,2000000,5000000,10000000,20000000,50000000};
+        size_t bucket=0;while(bucket<limits.size()&&hold_ns>limits[bucket])++bucket;
+        ++metrics_.hold_buckets[bucket];
+        if(lock_.owns_lock())lock_.unlock();
+    }
+    TimedMutexLock(const TimedMutexLock&)=delete;TimedMutexLock& operator=(const TimedMutexLock&)=delete;
+};
+std::string timing_json(const StoreIoMetrics::LockTiming& m){
+    std::string out="{\"wait_calls\":"+std::to_string(m.wait_calls.load())+",\"wait_ns\":"+std::to_string(m.wait_ns.load())+",\"wait_max_ns\":"+std::to_string(m.wait_max_ns.load())+
+        ",\"hold_calls\":"+std::to_string(m.hold_calls.load())+",\"hold_ns\":"+std::to_string(m.hold_ns.load())+",\"hold_max_ns\":"+std::to_string(m.hold_max_ns.load())+
+        ",\"hold_buckets\":{\"le_1ms\":"+std::to_string(m.hold_buckets[0].load())+",\"gt_1_le_2ms\":"+std::to_string(m.hold_buckets[1].load())+
+        ",\"gt_2_le_5ms\":"+std::to_string(m.hold_buckets[2].load())+",\"gt_5_le_10ms\":"+std::to_string(m.hold_buckets[3].load())+
+        ",\"gt_10_le_20ms\":"+std::to_string(m.hold_buckets[4].load())+",\"gt_20_le_50ms\":"+std::to_string(m.hold_buckets[5].load())+
+        ",\"gt_50ms\":"+std::to_string(m.hold_buckets[6].load())+"}}";return out;
+}
+std::string timing_json(const StoreIoMetrics::OperationTiming& m){return "{\"calls\":"+std::to_string(m.calls.load())+",\"ns\":"+std::to_string(m.ns.load())+",\"max_ns\":"+std::to_string(m.max_ns.load())+"}";}
 class TimedFile:public leveldb::WritableFile {
     std::unique_ptr<leveldb::WritableFile> file_;StoreIoMetrics& m_;bool wal_;
 public:
@@ -377,7 +419,7 @@ void LevelStore::transact(uint64_t expected,const std::vector<Mutation>& changes
     auto prepared_ns=elapsed(begin);
     // Another writer may have committed during preparation. Recheck under the
     // lock before root existence checks, collision validation and publication.
-    std::lock_guard lock(writer_mutex_);healthy();need(expected==sequence_,"transaction conflict: sequence changed");
+    TimedMutexLock lock(writer_mutex_,metrics_->foreground_writer);healthy();need(expected==sequence_,"transaction conflict: sequence changed");
     need(sequence_!=UINT64_MAX,"transaction sequence exhausted");auto locked_begin=Clock::now();
     uint64_t roots=roots_,objects=objects_;
     for(const auto& [key,hash]:updates) {
@@ -418,6 +460,15 @@ std::string LevelStore::metrics_json(bool detailed) const {
         ",\"gc_barrier_calls\":"+std::to_string(m.gc_barrier_calls.load())+",\"gc_barrier_ns\":"+std::to_string(m.gc_barrier_ns.load());
     result+=",\"gc_foreground_wait_ns\":"+std::to_string(m.gc_mutex->foreground_wait_ns.load())+",\"gc_foreground_hold_ns\":"+std::to_string(m.gc_mutex->foreground_hold_ns.load())+
         ",\"gc_advance_wait_ns\":"+std::to_string(m.gc_mutex->advance_wait_ns.load())+",\"gc_advance_hold_ns\":"+std::to_string(m.gc_mutex->advance_hold_ns.load());
+    result+=",\"foreground_writer\":"+timing_json(m.foreground_writer)+
+        ",\"gc_writer_sweep\":"+timing_json(m.gc_writer_sweep)+
+        ",\"gc_writer_relocate\":"+timing_json(m.gc_writer_relocate)+
+        ",\"gc_writer_retire\":"+timing_json(m.gc_writer_retire)+
+        ",\"gc_sweep_dbwrite\":"+timing_json(m.gc_sweep_dbwrite)+
+        ",\"gc_relocation_chunk_read\":"+timing_json(m.gc_relocation_chunk_read)+
+        ",\"gc_relocation_sync\":"+timing_json(m.gc_relocation_sync)+
+        ",\"gc_relocation_dbwrite\":"+timing_json(m.gc_relocation_dbwrite)+
+        ",\"gc_retirement_dbwrite\":"+timing_json(m.gc_retirement_dbwrite);
     if(detailed){auto c=cache_stats();result+=
         ",\"root_get_calls\":"+std::to_string(m.root_get_calls.load())+",\"root_get_ns\":"+std::to_string(m.root_get_ns.load())+
         ",\"root_misses\":"+std::to_string(m.root_misses.load())+",\"root_cache_hits\":"+std::to_string(m.root_cache_hits.load())+",\"object_get_calls\":"+std::to_string(m.object_get_calls.load())+
@@ -837,7 +888,7 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
 #else
             (void)hook_called;
 #endif
-            std::unique_lock writer(writer_mutex_);healthy();if(gc_cycle_!=cycle)throw std::runtime_error("GC mark invalidated");
+            TimedMutexLock writer(writer_mutex_,metrics_->gc_writer_sweep);healthy();if(gc_cycle_!=cycle)throw std::runtime_error("GC mark invalidated");
             if(replay_enabled_){gc_cycle_.reset();cycle.reset();sweep_skipped=true;break;}
             if(cycle->mark.has_work()){sweep_skipped=true;break;}
             if(cycle->phase==GcCycle::Objects || cycle->phase==GcCycle::Chunks){
@@ -866,7 +917,7 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
                 if(object_removals || chunk_removals){
                     need(object_removals<=objects_ && root_removals<=roots_,"incremental GC counter underflow");
                     if(object_removals)batch.Put("M/objects",integer(objects_-object_removals));if(root_removals)batch.Put("M/roots",integer(roots_-root_removals));
-                    try{fault("gc_mark_before_sweep");leveldb::WriteOptions wo;wo.sync=true;status(db_->Write(wo,&batch),"incremental GC metadata prune");fault("gc_mark_after_sweep");}catch(...){object_store_->abandon();poisoned_=true;throw;}
+                    try{fault("gc_mark_before_sweep");leveldb::WriteOptions wo;wo.sync=true;{TimedOperation timing(metrics_->gc_sweep_dbwrite);status(db_->Write(wo,&batch),"incremental GC metadata prune");}fault("gc_mark_after_sweep");}catch(...){object_store_->abandon();poisoned_=true;throw;}
                     objects_=objects_-object_removals;roots_=roots_-root_removals;deleted+=object_removals;chunks_deleted+=chunk_removals;cycle->deleted+=object_removals+chunk_removals;
                     for(const auto& raw:forgotten)object_store_->forget(raw);
                     if(root_removals){std::lock_guard cache(root_cache_mutex_);root_cache_.clear();root_cache_sequence_=UINT64_MAX;}
@@ -907,11 +958,11 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
         // delays unlink only; let inventory/relocation finish in the meantime.
         if(ph.reap_ready){
             pending=1;
-            std::unique_lock writer(writer_mutex_);healthy();std::lock_guard pins(pin_state_->mutex);
+            TimedMutexLock writer(writer_mutex_,metrics_->gc_writer_retire);healthy();std::lock_guard pins(pin_state_->mutex);
             if(pin_state_->locations==0){
                 object_store_->retire_segment(ph.reap_sid);fault("gc_online_after_unlink");
                 leveldb::WriteBatch del;del.Delete(ph.reap_key);leveldb::WriteOptions wo;wo.sync=true;
-                try{status(db_->Write(wo,&del),"delete retired segment marker");}catch(...){object_store_->abandon();poisoned_=true;throw;}
+                try{TimedOperation timing(metrics_->gc_retirement_dbwrite);status(db_->Write(wo,&del),"delete retired segment marker");}catch(...){object_store_->abandon();poisoned_=true;throw;}
                 fault("gc_online_after_delete_sync");++segments_deleted;++physical_work;pending=0;ph.reaped_high_water=std::max(ph.reaped_high_water,ph.reap_sid);
                 ph.reap_ready=false;ph.changed=true;
                 if(ph.phase==GcPhysical::WaitPins){ph.directory_started=false;ph.phase=GcPhysical::ReapMarker;}
@@ -974,14 +1025,14 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
                         need(chunk_location(current).first!=ph.reap_sid,"retired segment still has a current chunk reference");}
                     ph.cursor=row->first;continue;
                 }
-                std::unique_lock writer(writer_mutex_);healthy();std::lock_guard pins(pin_state_->mutex);
+                TimedMutexLock writer(writer_mutex_,metrics_->gc_writer_retire);healthy();std::lock_guard pins(pin_state_->mutex);
                 if(pin_state_->locations!=0 || segments_deleted!=0){
                     ph.reap_ready=true;ph.cursor.clear();ph.phase=GcPhysical::Inventory;
                     continue;
                 }
                 object_store_->retire_segment(ph.reap_sid);fault("gc_online_after_unlink");
                 leveldb::WriteBatch del;del.Delete(ph.reap_key);leveldb::WriteOptions wo;wo.sync=true;
-                try{status(db_->Write(wo,&del),"delete retired segment marker");}catch(...){object_store_->abandon();poisoned_=true;throw;}
+                try{TimedOperation timing(metrics_->gc_retirement_dbwrite);status(db_->Write(wo,&del),"delete retired segment marker");}catch(...){object_store_->abandon();poisoned_=true;throw;}
                 fault("gc_online_after_delete_sync");++segments_deleted;pending=0;ph.changed=true;ph.reaped_high_water=std::max(ph.reaped_high_water,ph.reap_sid);
                 ph.cursor.clear();ph.phase=GcPhysical::ReapMarker;continue;
             }
@@ -1019,7 +1070,7 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
             if(ph.phase==GcPhysical::CandidateC){
                 ++physical_work;++candidate_work;ph.indexed=ph.index.bytes(ph.candidate);
                 if(ph.indexed+48>=ph.length){ph.phase=GcPhysical::Inventory;ph.cursor.clear();continue;}
-                std::lock_guard writer(writer_mutex_);healthy();
+                TimedMutexLock writer(writer_mutex_,metrics_->gc_writer_retire);healthy();
                 if(ph.candidate==object_store_->tail().first){
                     object_store_->admit_segment_header();
                     try{object_store_->seal_and_rotate();}catch(...){object_store_->abandon();poisoned_=true;throw;}
@@ -1040,11 +1091,11 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
             auto row=ph.index.next(ph.candidate,ph.cursor);
             if(!row){
                 ++physical_work;location_pin.reset();
-                std::lock_guard writer(writer_mutex_);healthy();
+                TimedMutexLock writer(writer_mutex_,metrics_->gc_writer_retire);healthy();
                 leveldb::WriteBatch wb;wb.Put("G/"+integer(ph.candidate),"FFGCRET1");
                 const auto fmt=physical_format_.load()%2?7:8;wb.Put("M/format","FFLDB00"+std::to_string(fmt));
                 try{fault("gc_online_before_publish");leveldb::WriteOptions wo;wo.sync=true;
-                    status(db_->Write(wo,&wb),"retire online GC source");
+                    {TimedOperation timing(metrics_->gc_retirement_dbwrite);status(db_->Write(wo,&wb),"retire online GC source");}
 #ifdef FORKFS_TEST_GC
                     extern void test_gc_indexes_published();test_gc_indexes_published();
 #endif
@@ -1066,7 +1117,7 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
                 next_cursor=key;++visits;++reference_work;row=ph.index.next(ph.candidate,next_cursor);
             }
             if(visits==0)break; // copy allowance exhausted; retry same key next call
-            std::unique_lock writer(writer_mutex_);healthy();
+            TimedMutexLock writer(writer_mutex_,metrics_->gc_writer_relocate);healthy();
             std::vector<std::pair<std::string,std::string>> current_refs;std::vector<size_t> sizes;
             for(const auto& [key,oldloc]:refs){
                 std::string current;auto st=db_->Get(ro,key,&current);
@@ -1078,13 +1129,13 @@ std::string LevelStore::collect_step(size_t max_copy_bytes,size_t max_objects,si
             try{
                 leveldb::WriteBatch wb;
                 for(const auto& [key,oldloc]:current_refs){
-                    auto hash=key.substr(2),payload=object_store_->read_chunk(hash,oldloc);
+                    auto hash=key.substr(2);std::string payload;{TimedOperation timing(metrics_->gc_relocation_chunk_read);payload=object_store_->read_chunk(hash,oldloc);}
                     attempted=true;auto newloc=object_store_->relocate(hash,payload);fault("gc_online_after_copy");
                     wb.Put(key,newloc);++batch_moved;batch_copied+=payload.size();
                 }
                 if(batch_moved){
-                    object_store_->sync();fault("gc_online_after_sync");leveldb::WriteOptions wo;wo.sync=true;
-                    fault("gc_online_before_publish");status(db_->Write(wo,&wb),"publish online GC relocation");fault("gc_online_after_chunk_publish");
+                    {TimedOperation timing(metrics_->gc_relocation_sync);object_store_->sync();}fault("gc_online_after_sync");leveldb::WriteOptions wo;wo.sync=true;
+                    fault("gc_online_before_publish");{TimedOperation timing(metrics_->gc_relocation_dbwrite);status(db_->Write(wo,&wb),"publish online GC relocation");}fault("gc_online_after_chunk_publish");
                 }
             }catch(...){if(attempted){object_store_->abandon();poisoned_=true;}throw;}
             moved+=batch_moved;copied+=batch_copied;ph.changed=ph.changed || batch_moved!=0;
