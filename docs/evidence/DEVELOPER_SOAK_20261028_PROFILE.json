@@ -1,0 +1,27 @@
+{
+  "metadata_prepare_ns": 718596032,
+  "storage_metrics": {
+    "transactions": 2778,
+    "prepare_ns": 162650450,
+    "write_ns": 209887993617,
+    "wal_sync_calls": 2778,
+    "wal_sync_ns": 13958149133,
+    "other_sync_calls": 42,
+    "other_sync_ns": 289919253,
+    "wal_append_bytes": 16816489,
+    "wal_append_ns": 1263529,
+    "wal_flush_ns": 80941994,
+    "root_get_calls": 70573,
+    "root_get_ns": 141565543,
+    "root_misses": 60787,
+    "root_cache_hits": 66079,
+    "object_get_calls": 124420,
+    "object_get_ns": 1310039174,
+    "object_misses": 61812,
+    "meta_get_calls": 8,
+    "meta_get_ns": 7957,
+    "object_cache_hits": 298154,
+    "object_cache_misses": 61765,
+    "object_cache_charge": 8388504
+  }
+}

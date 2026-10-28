@@ -277,6 +277,32 @@ add_test(NAME forkfsd_developer_workload_oracle COMMAND ${Python3_EXECUTABLE} -m
     -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_developer_workload.py)
 set_tests_properties(forkfsd_developer_workload_oracle PROPERTIES TIMEOUT 30 LABELS "metadata-regression;developer-workload")
 
+# Paired resident-RPC maintenance smoke runs; detailed artifacts use the
+# existing developer-workload upload directory. Run serial to avoid turning
+# unrelated I/O-heavy regressions into load-dependent timeout tests.
+foreach(mode concurrent disabled)
+    add_test(NAME forkfsd_developer_soak_${mode} COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/scripts/tests/developer_soak.py $<TARGET_FILE:forkfsd>
+        --seed 173 --output ${CMAKE_BINARY_DIR}/developer-workload-artifacts/soak
+        --files 4 --rounds 1 --workers 1 --steps 7 --sample-interval 0.2
+        --gc-work 256 --gc-mode ${mode} --max-store-mib 64 --deadline 120)
+    set_tests_properties(forkfsd_developer_soak_${mode} PROPERTIES TIMEOUT 180
+        RUN_SERIAL TRUE LABELS "metadata-regression;developer-workload;developer-soak")
+endforeach()
+add_test(NAME forkfsd_developer_soak_oracle COMMAND ${Python3_EXECUTABLE} -m unittest discover
+    -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_developer_soak*.py)
+set_tests_properties(forkfsd_developer_soak_oracle PROPERTIES TIMEOUT 30
+    LABELS "metadata-regression;developer-workload;developer-soak")
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/developer-workload-artifacts/native-fixtures
+    ${CMAKE_BINARY_DIR}/developer-workload-artifacts/native-results)
+add_test(NAME forkfsd_native_developer_soak COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/scripts/bench/developer_mount_soak.py
+    --native ${CMAKE_BINARY_DIR}/developer-workload-artifacts/native-fixtures
+    --output ${CMAKE_BINARY_DIR}/developer-workload-artifacts/native-results
+    --compiler ${CMAKE_C_COMPILER} --rounds 4 --files 8 --deadline 60)
+set_tests_properties(forkfsd_native_developer_soak PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE
+    LABELS "metadata-regression;developer-workload;developer-soak")
+
 # Test-only HTTP protocol prototype over real forkfs-generated revision objects.
 add_test(NAME forkfsd_revision_sync_mock COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_SOURCE_DIR}/scripts/tests/test_revision_sync_mock.py $<TARGET_FILE:forkfsd>
