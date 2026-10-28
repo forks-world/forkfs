@@ -7,7 +7,6 @@
 #include "journal.h"
 #include <leveldb/cache.h>
 #include <leveldb/db.h>
-#include <leveldb/filter_policy.h>
 #include <leveldb/options.h>
 #include <leveldb/write_batch.h>
 #include <algorithm>
@@ -52,7 +51,6 @@ public:
                 throw std::runtime_error("GC mark scratch directory is not private");
             leveldb::Options options;options.create_if_missing=true;options.write_buffer_size=64*1024;
             options.max_open_files=16;options.paranoid_checks=true;options.compression=leveldb::kNoCompression;
-            filter_.reset(leveldb::NewBloomFilterPolicy(10));options.filter_policy=filter_.get();
             cache_.reset(leveldb::NewLRUCache(0));options.block_cache=cache_.get();
             leveldb::DB* raw=nullptr;auto status=leveldb::DB::Open(options,scratch_+"/db",&raw);
             if(!status.ok())throw std::runtime_error("open GC mark scratch database: "+status.ToString());db_.reset(raw);
@@ -85,12 +83,33 @@ public:
         if(t.kind==DIRECT_INODE||t.kind==ORPHAN_INODE){Task keep;keep.kind=OPAQUE;keep.id=id;enqueue_now(keep);}
         enqueue_now(t);
     }
+    // Only the publication barrier uses this path. Baseline roots and leases
+    // retain independent immutable tasks even when a World advances again.
+    void seed_published_root(const std::string& key,const Id& id,RootReader roots) {
+        std::string normalized=key;if(normalized.starts_with("R/"))normalized.erase(0,2);
+        const std::string world_prefix("\0forkfs-history/world/",22);
+        if(!normalized.starts_with(world_prefix)||!roots){seed_root(key,id,std::move(roots));return;}
+        if(id==Id{})throw std::runtime_error("zero GC object reference");
+        // The production caller holds the store writer mutex for source roots.
+        auto observed=roots(key);
+        if(!observed||*observed!=id)throw std::runtime_error("GC root changed during seeding");
+        Task task;task.kind=ROOT;task.id=id;task.key=normalized;
+        auto encoded=encode(task),publication_key="P/"+normalized;
+        auto waiting=Clock::now();std::unique_lock<std::mutex> guard(mu_);
+        mutex_counters_->foreground_wait_ns+=ns(waiting);HoldTimer held(mutex_counters_->foreground_hold_ns);
+        // One pending row per World key coalesces rapid immutable-root updates.
+        std::string existing;auto found=db_->Get(read_options(),publication_key,&existing);
+        if(!found.IsNotFound())check(found,"read pending GC publication root");
+        leveldb::WriteBatch batch;batch.Put(live_key(id),"1");batch.Put(publication_key,encoded);
+        check(db_->Write({},&batch),"queue GC publication root");
+        if(found.IsNotFound())++pending_count_;
+    }
     void seed_manifest(const Id& id){auto waiting=Clock::now();std::unique_lock<std::mutex> guard(mu_);mutex_counters_->foreground_wait_ns+=ns(waiting);HoldTimer held(mutex_counters_->foreground_hold_ns);Task t;t.kind=MANIFEST;t.id=id;enqueue_now(t);}
     void protect(const Id& id){auto waiting=Clock::now();std::unique_lock<std::mutex> guard(mu_);mutex_counters_->foreground_wait_ns+=ns(waiting);HoldTimer held(mutex_counters_->foreground_hold_ns);Task t;t.kind=OPAQUE;t.id=id;enqueue_now(t);}
     void protect_chunk(const std::string& hash){auto waiting=Clock::now();std::unique_lock<std::mutex> guard(mu_);mutex_counters_->foreground_wait_ns+=ns(waiting);HoldTimer held(mutex_counters_->foreground_hold_ns);if(hash.size()!=32)throw std::runtime_error("invalid GC chunk hash");leveldb::WriteBatch b;b.Put("H/"+hash,"1");check(db_->Write({},&b),"protect GC chunk");}
     bool chunk_live(const std::string& hash) const {std::lock_guard<std::mutex> guard(mu_);std::string value;auto s=db_->Get(read_options(),"H/"+hash,&value);if(!s.IsNotFound())check(s,"read GC chunk marker");return !s.IsNotFound();}
     bool live(const Id& id) const {std::lock_guard<std::mutex> guard(mu_);std::string value;auto s=db_->Get(read_options(),live_key(id),&value);if(!s.IsNotFound())check(s,"read GC live marker");return !s.IsNotFound();}
-    bool has_work() const {std::lock_guard<std::mutex> guard(mu_);auto it=iterator();it->Seek("Q/");check(it->status(),"scan GC tasks");return it->Valid()&&it->key().ToString().starts_with("Q/");}
+    bool has_work() const {std::lock_guard<std::mutex> guard(mu_);auto it=iterator();it->Seek("Q/");check(it->status(),"scan GC tasks");if(it->Valid()&&it->key().ToString().starts_with("Q/"))return true;it->Seek("P/");check(it->status(),"scan GC publication roots");return it->Valid()&&it->key().ToString().starts_with("P/");}
     uint64_t processed() const {std::lock_guard<std::mutex> guard(mu_);return processed_;}
     size_t pending() const {std::lock_guard<std::mutex> guard(mu_);return pending_count_;}
 
@@ -100,22 +119,27 @@ public:
         std::lock_guard<std::mutex> advance_guard(advance_mu_);
         size_t done=0;
         while(done<units){
-            std::string qkey;Task task;
+            std::string selected_key,selected_encoded;Task task;bool publication=false;
             {
                 auto waiting=Clock::now();std::unique_lock<std::mutex> guard(mu_);
                 mutex_counters_->advance_wait_ns+=ns(waiting);HoldTimer held(mutex_counters_->advance_hold_ns);
                 auto it=iterator();it->Seek("Q/");check(it->status(),"scan GC tasks");
-                if(!it->Valid()||!it->key().ToString().starts_with("Q/"))break;
-                qkey=it->key().ToString();task=decode(it->value().ToString());
+                if(it->Valid()&&it->key().ToString().starts_with("Q/")){selected_key=it->key().ToString();selected_encoded=it->value().ToString();}
+                else {it->Seek("P/");check(it->status(),"scan GC publication roots");if(!it->Valid()||!it->key().ToString().starts_with("P/"))break;selected_key=it->key().ToString();selected_encoded=it->value().ToString();publication=true;}
+                task=decode(selected_encoded);
             }
-            // Keep Q visible until commit, including while immutable reads block.
+            // Keep the selected Q/P row visible while immutable reads block.
             Stage stage;process_stage_=&stage;bool more=false;
             try{more=process(task,read);}catch(...){process_stage_=nullptr;throw;}
             process_stage_=nullptr;
+            if(publication&&more)throw std::runtime_error("GC publication root unexpectedly produced a continuation");
             {
                 auto waiting=Clock::now();std::unique_lock<std::mutex> guard(mu_);
                 mutex_counters_->advance_wait_ns+=ns(waiting);HoldTimer held(mutex_counters_->advance_hold_ns);
-                auto& batch=stage.batch;batch.Delete(qkey);
+                auto& batch=stage.batch;bool publication_deleted=false;
+                // Delete only the version processed: a newer foreground write may have replaced it.
+                if(publication){std::string current;auto found=db_->Get(read_options(),selected_key,&current);if(!found.IsNotFound())check(found,"recheck pending GC publication root");if(!found.IsNotFound()&&current==selected_encoded){batch.Delete(selected_key);publication_deleted=true;}}
+                else batch.Delete(selected_key);
                 size_t queued=0;std::set<std::string> staged;
                 // Resolve dedup after concurrent publication; free child encodings
                 // as the commit batch grows to bound temporary marker metadata.
@@ -135,7 +159,7 @@ public:
                 if(more||queued)batch.Put("C/next",le(next_));
                 batch.Put("C/processed",le(processed_+1));
                 check(db_->Write({},&batch),"commit GC mark task");
-                pending_count_+=queued;if(!more)--pending_count_;++processed_;++done;
+                pending_count_+=queued;if((!publication&&!more)||(publication&&publication_deleted))--pending_count_;++processed_;++done;
             }
         }
         return done;
@@ -145,7 +169,7 @@ private:
     enum : unsigned char {ROOT=1,MANIFEST=2,OPAQUE=3,REVISION=4,RUN=5,TREE=6,INODE=7,EXTENT=8,CONTENT=9,BLOCK=10,ORPHAN_INODE=11,DIRECT_INODE=12,RESOLVE=13};
     struct Task {unsigned char kind=OPAQUE;Id id{};Id context{};uint64_t first=0,size=0,depth=0;unsigned char level=0;std::string key,previous,lower,upper;};
     struct Stage {leveldb::WriteBatch batch;std::vector<std::string> children;};
-    std::string scratch_;std::unique_ptr<leveldb::Cache> cache_;std::unique_ptr<const leveldb::FilterPolicy> filter_;std::unique_ptr<leveldb::DB> db_;mutable std::mutex mu_,advance_mu_;std::shared_ptr<MutexCounters> mutex_counters_;Stage* process_stage_=nullptr;uint64_t next_=0,processed_=0;size_t pending_count_=0;
+    std::string scratch_;std::unique_ptr<leveldb::Cache> cache_;std::unique_ptr<leveldb::DB> db_;mutable std::mutex mu_,advance_mu_;std::shared_ptr<MutexCounters> mutex_counters_;Stage* process_stage_=nullptr;uint64_t next_=0,processed_=0;size_t pending_count_=0;
     static leveldb::ReadOptions read_options(){leveldb::ReadOptions ro;ro.verify_checksums=true;ro.fill_cache=false;return ro;}
     static void check(const leveldb::Status& s,const char* what){if(!s.ok())throw std::runtime_error(std::string(what)+": "+s.ToString());}
     static std::string le(uint64_t n,unsigned w=8){std::string s(w,0);for(unsigned i=0;i<w;++i)s[i]=char(n>>(8*i));return s;}

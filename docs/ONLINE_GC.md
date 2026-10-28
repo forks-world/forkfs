@@ -259,15 +259,30 @@ The typed frontier, deduplication and live marks live on disk. Scan cursors and
 phase state live in memory; both persist across calls within one owner, and all
 are discarded after reopening.
 Marker advancement serializes its callers separately from the publication mutex.
-It selects a queued task under that mutex, retains its Q record, and releases the
+It selects a queued task under that mutex, retains its Q/P record, and releases the
 mutex while reading immutable objects and interpreting their references. Child
 tasks and semantic scratch writes are staged locally. The commit reacquires the
 mutex, resolves deduplication against concurrent seeds, and atomically publishes
-children, semantic records, cursor continuation and removal of the selected task.
+children, semantic records and cursor continuation. Q removal is unconditional;
+a P row is removed only if its value still matches the processed version.
 Foreground seed/chunk protection never accesses advancement's staging state.
 Consequently a blocked object reader does not itself block publication, and
 `has_work()` cannot report an empty frontier while a task is in flight. Scratch
 I/O during insertion/commit can still block; this is not a lock-free design.
+
+Publication-origin mutable World roots use a disk-backed P row per World key.
+Repeated publication overwrites that pending value, coalescing intermediate
+Worlds before traversal. Ordinary Q tasks take priority; if Q is empty the marker
+processes one P value, retaining it during unlocked reads. If publication replaces
+that P row meanwhile, commit leaves the newer value pending. Same-value ABA is
+safe because object IDs identify immutable closures. Both Q and P participate in
+`has_work()` and the existing writer-locked sweep/completion rechecks.
+
+Baseline roots, revision/base roots and explicit manifest leases still use their
+independent Q tasks. Expanded MANIFEST/TREE tasks are never cancelled. Old World
+root IDs may remain conservatively live without retaining an obsolete transient
+closure; any independently retained revision or lease still traverses that
+closure. Scratch P state is discarded on restart with the rest of the cycle.
 
 Staged children use encoded records, capped at the codecs' maximum fanout of 65.
 Their encodings are released as the commit batch grows, avoiding a second large
@@ -293,12 +308,8 @@ not returned for temporary allocations within a step, and are not process RSS.
 Existing main/scratch LevelDB caches, memtables and iterator internals,
 ObjectStore caches, allocator overhead, and bounded codec/payload buffers remain
 outside this accounting. Scratch uses a 64 KiB requested write buffer, no block
-cache retention, no compression, a 10-bit Bloom filter policy and a small
-open-file setting; it consumes disk
-space proportional to the graph and queued publication work. Bloom negatives
-avoid unnecessary table block reads for dedup misses; positive results still use
-the exact checksum-verified lookup. Filter/table metadata follows LevelDB table
-cache lifetime and is outside the GC metadata charge described above. Long-lived
+cache retention, no compression and a small open-file setting; it consumes disk
+space proportional to the graph and queued publication work. Long-lived
 metadata snapshots can also retain old main-LevelDB versions until the cycle
 finishes or is cancelled.
 

@@ -297,7 +297,7 @@ void LevelStore::publish(const replay::Batch& input){
 #endif
                 auto roots=[&](const std::string& key)->std::optional<Id>{std::string ref;auto found=db_->Get(read,key,&ref);if(found.IsNotFound())return std::nullopt;status(found,"GC publication root lookup");return id(ref);};
                 for(const auto& op:input.ops)if(!op.erase){
-                    if(op.key.starts_with("R/"))gc_cycle_->mark.seed_root(op.key,id(op.value),roots);
+                    if(op.key.starts_with("R/"))gc_cycle_->mark.seed_published_root(op.key,id(op.value),roots);
                     else if(op.key.starts_with("O/")){
                         std::string descriptor;status(db_->Get(read,op.key,&descriptor),"GC published object lookup");
                         replay::Input in{descriptor};need(in.take(8)=="FFOBJ002","invalid GC publication descriptor");(void)in.integer(8);auto count=in.integer(4);need(count>0&&count<=4,"invalid GC publication chunks");for(uint64_t i=0;i<count;++i)gc_cycle_->mark.protect_chunk(in.take(32));in.end();
