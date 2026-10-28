@@ -7,6 +7,7 @@
 #include "journal.h"
 #include <leveldb/cache.h>
 #include <leveldb/db.h>
+#include <leveldb/filter_policy.h>
 #include <leveldb/options.h>
 #include <leveldb/write_batch.h>
 #include <algorithm>
@@ -51,6 +52,7 @@ public:
                 throw std::runtime_error("GC mark scratch directory is not private");
             leveldb::Options options;options.create_if_missing=true;options.write_buffer_size=64*1024;
             options.max_open_files=16;options.paranoid_checks=true;options.compression=leveldb::kNoCompression;
+            filter_.reset(leveldb::NewBloomFilterPolicy(10));options.filter_policy=filter_.get();
             cache_.reset(leveldb::NewLRUCache(0));options.block_cache=cache_.get();
             leveldb::DB* raw=nullptr;auto status=leveldb::DB::Open(options,scratch_+"/db",&raw);
             if(!status.ok())throw std::runtime_error("open GC mark scratch database: "+status.ToString());db_.reset(raw);
@@ -143,7 +145,7 @@ private:
     enum : unsigned char {ROOT=1,MANIFEST=2,OPAQUE=3,REVISION=4,RUN=5,TREE=6,INODE=7,EXTENT=8,CONTENT=9,BLOCK=10,ORPHAN_INODE=11,DIRECT_INODE=12,RESOLVE=13};
     struct Task {unsigned char kind=OPAQUE;Id id{};Id context{};uint64_t first=0,size=0,depth=0;unsigned char level=0;std::string key,previous,lower,upper;};
     struct Stage {leveldb::WriteBatch batch;std::vector<std::string> children;};
-    std::string scratch_;std::unique_ptr<leveldb::Cache> cache_;std::unique_ptr<leveldb::DB> db_;mutable std::mutex mu_,advance_mu_;std::shared_ptr<MutexCounters> mutex_counters_;Stage* process_stage_=nullptr;uint64_t next_=0,processed_=0;size_t pending_count_=0;
+    std::string scratch_;std::unique_ptr<leveldb::Cache> cache_;std::unique_ptr<const leveldb::FilterPolicy> filter_;std::unique_ptr<leveldb::DB> db_;mutable std::mutex mu_,advance_mu_;std::shared_ptr<MutexCounters> mutex_counters_;Stage* process_stage_=nullptr;uint64_t next_=0,processed_=0;size_t pending_count_=0;
     static leveldb::ReadOptions read_options(){leveldb::ReadOptions ro;ro.verify_checksums=true;ro.fill_cache=false;return ro;}
     static void check(const leveldb::Status& s,const char* what){if(!s.ok())throw std::runtime_error(std::string(what)+": "+s.ToString());}
     static std::string le(uint64_t n,unsigned w=8){std::string s(w,0);for(unsigned i=0;i<w;++i)s[i]=char(n>>(8*i));return s;}

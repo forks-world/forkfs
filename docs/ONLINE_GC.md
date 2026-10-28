@@ -293,8 +293,12 @@ not returned for temporary allocations within a step, and are not process RSS.
 Existing main/scratch LevelDB caches, memtables and iterator internals,
 ObjectStore caches, allocator overhead, and bounded codec/payload buffers remain
 outside this accounting. Scratch uses a 64 KiB requested write buffer, no block
-cache retention, no compression and a small open-file setting; it consumes disk
-space proportional to the graph and queued publication work. Long-lived
+cache retention, no compression, a 10-bit Bloom filter policy and a small
+open-file setting; it consumes disk
+space proportional to the graph and queued publication work. Bloom negatives
+avoid unnecessary table block reads for dedup misses; positive results still use
+the exact checksum-verified lookup. Filter/table metadata follows LevelDB table
+cache lifetime and is outside the GC metadata charge described above. Long-lived
 metadata snapshots can also retain old main-LevelDB versions until the cycle
 finishes or is cancelled.
 
