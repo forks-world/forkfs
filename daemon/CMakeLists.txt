@@ -277,6 +277,47 @@ add_test(NAME forkfsd_developer_workload_oracle COMMAND ${Python3_EXECUTABLE} -m
     -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_developer_workload.py)
 set_tests_properties(forkfsd_developer_workload_oracle PROPERTIES TIMEOUT 30 LABELS "metadata-regression;developer-workload")
 
+# Paired resident-RPC maintenance smoke runs; detailed artifacts use the
+# existing developer-workload upload directory. Run serial to avoid turning
+# unrelated I/O-heavy regressions into load-dependent timeout tests.
+foreach(mode concurrent disabled)
+    add_test(NAME forkfsd_developer_soak_${mode} COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/scripts/tests/developer_soak.py $<TARGET_FILE:forkfsd>
+        --seed 173 --output ${CMAKE_BINARY_DIR}/developer-workload-artifacts/soak
+        --files 4 --rounds 1 --workers 1 --steps 7 --sample-interval 0.2
+        --gc-work 256 --gc-mode ${mode} --max-store-mib 64 --deadline 120)
+    set_tests_properties(forkfsd_developer_soak_${mode} PROPERTIES TIMEOUT 180
+        RUN_SERIAL TRUE LABELS "metadata-regression;developer-workload;developer-soak")
+endforeach()
+add_test(NAME forkfsd_developer_soak_oracle COMMAND ${Python3_EXECUTABLE} -m unittest discover
+    -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_developer_soak*.py)
+set_tests_properties(forkfsd_developer_soak_oracle PROPERTIES TIMEOUT 30
+    LABELS "metadata-regression;developer-workload;developer-soak")
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/developer-workload-artifacts/native-fixtures
+    ${CMAKE_BINARY_DIR}/developer-workload-artifacts/native-results)
+set(_forkfs_native_soak_sysroot_args)
+if(APPLE AND CMAKE_OSX_SYSROOT)
+    set(_forkfs_native_soak_sysroot "${CMAKE_OSX_SYSROOT}")
+    if(NOT IS_DIRECTORY "${_forkfs_native_soak_sysroot}")
+        execute_process(COMMAND xcrun --sdk "${_forkfs_native_soak_sysroot}" --show-sdk-path
+            RESULT_VARIABLE _forkfs_xcrun_status OUTPUT_VARIABLE _forkfs_xcrun_sysroot
+            ERROR_VARIABLE _forkfs_xcrun_error OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(NOT _forkfs_xcrun_status EQUAL 0 OR NOT IS_DIRECTORY "${_forkfs_xcrun_sysroot}")
+            message(FATAL_ERROR "Could not resolve CMAKE_OSX_SYSROOT '${CMAKE_OSX_SYSROOT}' for native developer soak: ${_forkfs_xcrun_error}")
+        endif()
+        set(_forkfs_native_soak_sysroot "${_forkfs_xcrun_sysroot}")
+    endif()
+    list(APPEND _forkfs_native_soak_sysroot_args --sysroot "${_forkfs_native_soak_sysroot}")
+endif()
+add_test(NAME forkfsd_native_developer_soak COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/scripts/bench/developer_mount_soak.py
+    --native ${CMAKE_BINARY_DIR}/developer-workload-artifacts/native-fixtures
+    --output ${CMAKE_BINARY_DIR}/developer-workload-artifacts/native-results
+    --compiler ${CMAKE_C_COMPILER} ${_forkfs_native_soak_sysroot_args}
+    --rounds 4 --files 8 --deadline 60)
+set_tests_properties(forkfsd_native_developer_soak PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE
+    LABELS "metadata-regression;developer-workload;developer-soak")
+
 # Test-only HTTP protocol prototype over real forkfs-generated revision objects.
 add_test(NAME forkfsd_revision_sync_mock COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_SOURCE_DIR}/scripts/tests/test_revision_sync_mock.py $<TARGET_FILE:forkfsd>
@@ -393,7 +434,7 @@ set_tests_properties(forkfsd_incremental_gc PROPERTIES TIMEOUT 180 LABELS metada
 add_executable(forkfsd_gc_memory_budget_test tests/gc_memory_budget.cpp)
 target_link_libraries(forkfsd_gc_memory_budget_test PRIVATE forkfs_namespace)
 add_test(NAME forkfsd_gc_memory_budget COMMAND forkfsd_gc_memory_budget_test)
-set_tests_properties(forkfsd_gc_memory_budget PROPERTIES TIMEOUT 120 LABELS metadata-regression)
+set_tests_properties(forkfsd_gc_memory_budget PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE LABELS metadata-regression)
 add_test(NAME forkfsd_online_gc_crash COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/online_gc_crash.py $<TARGET_FILE:forkfsd>
     $<TARGET_FILE:forkfsd_leveldb_fault_test>)
@@ -429,6 +470,22 @@ add_executable(forkfsd_gc_mark_test tests/gc_mark.cpp)
 target_link_libraries(forkfsd_gc_mark_test PRIVATE forkfs_metadata)
 add_test(NAME forkfsd_gc_mark COMMAND forkfsd_gc_mark_test)
 set_tests_properties(forkfsd_gc_mark PROPERTIES TIMEOUT 120 LABELS metadata-regression)
+
+add_executable(forkfsd_leveldb_compaction_boundary_test tests/leveldb_compaction_boundary.cpp)
+target_include_directories(forkfsd_leveldb_compaction_boundary_test PRIVATE ${CMAKE_SOURCE_DIR}/third_party/leveldb)
+target_link_libraries(forkfsd_leveldb_compaction_boundary_test PRIVATE leveldb Threads::Threads)
+add_test(NAME forkfsd_leveldb_compaction_boundary COMMAND forkfsd_leveldb_compaction_boundary_test)
+set_tests_properties(forkfsd_leveldb_compaction_boundary PROPERTIES TIMEOUT 120 LABELS metadata-regression)
+
+add_executable(forkfsd_physical_gc_budget_test tests/physical_gc_budget.cpp)
+target_link_libraries(forkfsd_physical_gc_budget_test PRIVATE forkfs_namespace)
+add_test(NAME forkfsd_physical_gc_budget COMMAND forkfsd_physical_gc_budget_test)
+set_tests_properties(forkfsd_physical_gc_budget PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE LABELS metadata-regression)
+
+add_executable(forkfsd_gc_segment_index_test tests/gc_segment_index.cpp)
+target_link_libraries(forkfsd_gc_segment_index_test PRIVATE forkfs_namespace)
+add_test(NAME forkfsd_gc_segment_index COMMAND forkfsd_gc_segment_index_test)
+set_tests_properties(forkfsd_gc_segment_index PROPERTIES TIMEOUT 240 LABELS metadata-regression)
 
 add_executable(forkfsd_incremental_gc_namespace_test tests/incremental_gc_namespace.cpp)
 target_link_libraries(forkfsd_incremental_gc_namespace_test PRIVATE forkfs_namespace)

@@ -6,6 +6,17 @@
 [`MACOS_VALIDATION.md`](MACOS_VALIDATION.md)。本文件按时间保留历史测试数量与测量结果;
 旧的 93/142 等通过数不代表当前测试总数,应以当前 CI/测试输出为准。
 
+## GC 尾延迟与前台背压（2026-10-29）
+
+- [x] 拆分前台 writer 等待/持锁与 GC 清扫、搬迁、退休计量，提供固定分桶和阶段最大值。
+- [x] 将一次事务的 chunk 保护合并为有界 scratch WriteBatch；保持 DATA/metadata 同步顺序、发布 fence 和失败丢弃 GC 的语义。
+- [x] 前台事务在 pin 申请前登记需求；GC 在工作边界缩小后续量子，异步 worker 采用可停止的 1 ms 让步，空闲恢复原预算。
+- [x] 覆盖批次原子校验、持续需求下进度、晚到压力、失败后清除、游标恢复、字节 oracle 和 backup/replay。
+- [x] 同参数 600 秒完整负载：计量基线 240.092 秒、批处理 230.740 秒、背压 224.618 秒；开发写入 p99 为 39.788 / 32.641 / 27.483 ms。
+- [x] 本地 metadata-only Release 全部 116 项 CTest 通过，571.58 秒。单次最坏停顿与实际挂载边界仍须分别验收。
+
+测量、存储峰值代价与无 GC 对照见 [尾延迟证据](evidence/GC_TAIL_BACKPRESSURE_20261029.md)。
+
 ## ObjectStore 物理 GC（2026-10-26）
 
 - [x] 离线标记/重打包：World、revision DAG、World base、稀疏内容与孤儿 inode 引用；

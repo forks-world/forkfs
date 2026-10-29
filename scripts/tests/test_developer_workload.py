@@ -1,7 +1,13 @@
 """Check the workload oracle rejects plausible filesystem regressions."""
 import json
+import io
+import struct
+import tempfile
+import threading
+from pathlib import Path
+from unittest.mock import patch
 import unittest
-from developer_workload import Node, Workload, distribution, check_recovered_save
+from developer_workload import Node, Workload, distribution, check_recovered_save, disk_usage
 
 
 class OracleTests(unittest.TestCase):
@@ -53,6 +59,55 @@ class OracleTests(unittest.TestCase):
     def test_percentiles_require_enough_samples(self):
         self.assertIsNone(distribution([1, 2, 3])['p95_ms'])
         self.assertEqual(distribution(list(range(1, 1001)))['p95_ms'], 950 / 1e6)
+        self.assertEqual(distribution(list(range(1, 1001)))['p99_ms'], 990 / 1e6)
+        self.assertIsNone(distribution([1, 2, 3])['p99_ms'])
+        self.assertEqual(distribution([])['count'], 0)
+        self.assertIsNone(distribution([])['p50_ms'])
+
+    def test_storage_components_and_unlink_race(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            files = {'DATA-1.seg': 100, '000001.ldb': 20, 'OWNERSHIP': 3,
+                     '.gc-mark-own/db/LOG': 7, '.gc-physical-own/db/000002.ldb': 11,
+                     '.sync/catalog': 5, 'vanishing': 13}
+            for name, count in files.items():
+                p = root / name;p.parent.mkdir(parents=True, exist_ok=True);p.write_bytes(b'x' * count)
+            (root / 'link').symlink_to(root / 'DATA-1.seg')
+            original = Path.lstat
+            def racing_stat(path, *args, **kwargs):
+                if path.name == 'vanishing':
+                    raise FileNotFoundError(path)
+                return original(path, *args, **kwargs)
+            with patch.object(Path, 'lstat', racing_stat):
+                usage = disk_usage(root)
+            self.assertEqual(usage['segment_bytes'], 100)
+            self.assertEqual(usage['index_bytes'], 20)
+            self.assertEqual(usage['control_bytes'], 8)
+            self.assertEqual(usage['scratch_bytes'], 18)
+            self.assertEqual(usage['mark_scratch_bytes'], 7)
+            self.assertEqual(usage['physical_scratch_bytes'], 11)
+            self.assertEqual(usage['apparent_bytes'], 146)
+            self.assertEqual(usage['files'], 6)
+
+    def test_rpc_phase_is_captured_at_request_start(self):
+        trial = Workload.__new__(Workload)
+        trial.phase = 'before';trial.endpoint = '/private/socket';trial.lock = threading.Lock()
+        trial.samples = {};trial.phase_samples = {};trial.outcomes = {};trial.coverage = {}
+        trial.input_bytes = 0;trial.mutations = 0;trial.log = io.StringIO()
+        class Response:
+            data = b'FFRSP001' + struct.pack('<II', 6, 0) + b'ok'
+            def __enter__(self):trial.phase = 'after';return self
+            def __exit__(self, *args):pass
+            def settimeout(self, value):pass
+            def connect(self, value):pass
+            def sendall(self, value):pass
+            def recv(self, count):
+                out, self.data = self.data[:count], self.data[count:];return out
+        with patch('developer_workload.socket.socket', return_value=Response()):
+            self.assertEqual(trial.rpc('fs-cat', Path('/virtual')), b'ok')
+        self.assertIn('before/fs-cat', trial.phase_samples)
+        self.assertNotIn('after/fs-cat', trial.phase_samples)
+        self.assertEqual(json.loads(trial.log.getvalue())['args'], ['/virtual'])
 
 
 if __name__ == '__main__':

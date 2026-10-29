@@ -258,6 +258,94 @@ Payload copying, object/chunk deletion and unlink counts are bounded per step.
 The typed frontier, deduplication and live marks live on disk. Scan cursors and
 phase state live in memory; both persist across calls within one owner, and all
 are discarded after reopening.
+The LevelDB submodule is pinned to upstream `13e3c4efc66b8d7317c7648766a930b5d7e48aa7`
+(1.23 plus its immediate compaction boundary fix and Apple C-header fix).
+Unpatched 1.23 can drop tombstones when the second input level splits one user
+key across adjacent SSTs, exposing obsolete aliases after GC. The pinned
+[upstream fix](https://github.com/google/leveldb/commit/13e3c4efc66b8d7317c7648766a930b5d7e48aa7)
+includes boundary files in both compaction input levels. A real-SST regression
+checks point reads, iteration and reopening; it fails with the old pin. Updating
+the pin prevents this compaction error; it does not repair an already damaged
+store. Failed stores from this investigation are preserved unchanged.
+
+When replay retention skips logical sweeping, the async job stops as `blocked`
+once a clean physical round has no pending work or new reclamation. Cleanup may
+consume `physical_work_done` even in this terminal round; that progress alone
+must not restart indexing. The terminal report keeps `logical_sweep_skipped=true`
+and `physical_pending=false` / `mark_pending=false`, allowing callers to distinguish
+physical completion from a complete logical reclaim.
+
+Marker advancement serializes its callers separately from the publication mutex.
+It selects a queued task under that mutex, retains its Q/P record, and releases the
+mutex while reading immutable objects and interpreting their references. Child
+tasks and semantic scratch writes are staged locally. The commit reacquires the
+mutex, resolves deduplication against concurrent seeds, and atomically publishes
+children, semantic records and cursor continuation. Q removal is unconditional;
+a P row is removed only if its value still matches the processed version.
+Foreground seed/chunk protection never accesses advancement's staging state.
+Consequently a blocked object reader does not itself block publication, and
+`has_work()` cannot report an empty frontier while a task is in flight. Scratch
+I/O during insertion/commit can still block; this is not a lock-free design.
+
+Publication-origin mutable World roots use a disk-backed P row per World key.
+Repeated publication overwrites that pending value, coalescing intermediate
+Worlds before traversal. Ordinary Q tasks take priority; if Q is empty the marker
+processes one P value, retaining it during unlocked reads. If publication replaces
+that P row meanwhile, commit leaves the newer value pending. Same-value ABA is
+safe because object IDs identify immutable closures. Both Q and P participate in
+`has_work()` and the existing writer-locked sweep/completion rechecks.
+
+Baseline roots, revision/base roots and explicit manifest leases still use their
+independent Q tasks. Expanded MANIFEST/TREE tasks are never cancelled. Old World
+root IDs may remain conservatively live without retaining an obsolete transient
+closure; any independently retained revision or lease still traverses that
+closure. Scratch P state is discarded on restart with the rest of the cycle.
+
+Publication protects its chunk H markers with one scratch WriteBatch after
+validating all hashes, bounded to 16,384 chunks. Root protection remains ordered
+before that batch, with the main writer fence held across both. Scratch failure
+still discards the collection cycle; main DATA/metadata sync ordering is unchanged.
+Incremental reference scanning retains the single-chunk protection primitive.
+
+Foreground transactions advertise demand before location-pin admission and keep
+that RAII demand through writer release and cleanup, including exception paths.
+A collector observing demand tightens its remaining logical/physical quantum to
+at most eight units and retains all cursors. Already completed work is not undone:
+late-arrival pressure may accompany more than eight reported units, always within
+the original caller ceiling. The next call restores the full caller budget when
+idle. This is a cooperative work quantum, not a bound on individual I/O duration.
+
+Synchronous collection never sleeps. Only the asynchronous worker waits for an
+interruptible one millisecond after a pressured step. Stop signals under the wait
+mutex and notifies before joining. Transient pressure-related no-progress remains
+retryable within the existing job ceiling; quiet completion retains priority.
+GC continues eligible bounded work under demand rather than being disabled.
+Reader pins still gate pruning/retirement; persistent pins or continuous changes
+can require later resumptions and do not promise a complete collection under load.
+
+Profiles expose writer wait/hold counters and maxima for foreground transactions
+and GC sweep/relocation/retirement, plus relocation read and sync timings. Hold
+bands are non-cumulative; independent atomic snapshots during activity need not
+have exactly matching counts. The sweep bucket also includes reference marking.
+[The tail-latency investigation](evidence/GC_TAIL_BACKPRESSURE_20261029.md) records
+matched workloads, explicit remaining long stalls and sampled storage tradeoffs.
+No hard latency, CPU-share or process-RSS ceiling follows from this scheduling.
+
+Staged children use encoded records, capped at the codecs' maximum fanout of 65.
+Their encodings are released as the commit batch grows, avoiding a second large
+resident vector of decoded tasks. A reader-gate regression verifies foreground
+completion before releasing the reader, followed by liveness and pending-count
+checks; the same test fails against the earlier lock scope.
+
+Storage profiles expose cumulative `data_prepare_*`, `data_sync_*`,
+`metadata_publish_*` and `gc_barrier_*` calls/nanoseconds for completed phase
+instrumentation points. `gc_foreground_wait_ns` / `gc_foreground_hold_ns` include all root,
+manifest, object and chunk seeding, including the collector's own seeds;
+`gc_advance_wait_ns` / `gc_advance_hold_ns` measure the short marker mutex sections,
+excluding the separate serialization mutex and unlocked object processing.
+Counters survive collection completion/cancellation in one store owner. They are
+aggregate durations, not percentiles, and concurrent work may overlap.
+
 The metadata charge includes a fixed 32 KiB marker/task working reserve plus
 bounded sweep and physical-compaction collections. The configured ceiling and
 charge remain available as `metadata_budget_bytes` and `metadata_bytes_charged`.
@@ -304,3 +392,168 @@ process crashes immediately before/after both main-root publication barriers.
 No signed FSKit-mounted acceptance, whole-machine power-loss guarantee, remote
 GC, process RSS ceiling or end-to-end latency target is established by these
 local tests. Earlier local counts above describe their historical changes.
+
+### Resumable physical scans
+
+Physical collection now has a separate, restart-discardable state machine. Each
+`collect_step(..., MARK_WORK)` admits at most `MARK_WORK` logical units **and**
+`MARK_WORK` physical units. `physical_work_done`, `physical_phase` and
+`physical_pending` report the latter; `mark_pending` also includes physical
+continuation for existing clients. A physical unit visits one directory entry
+(including non-segment entries), one chunk-index row, or a bounded phase/EOF
+operation. Copy bytes and unlink counts remain independently capped. These are
+work bounds, not deadlines: an individual read, directory operation, LevelDB
+seek/write or fsync can still stall in the host OS.
+
+Directory traversal and exclusive chunk-key cursors survive calls within the
+same owner. Inventory captures a segment-ID high water so concurrent writers do
+not continually reset an old pass. It examines one candidate at a time and
+retains constant cursor/counter state, rather than maps of every segment.
+Candidate accounting and source scans run outside the writer lock. A selected
+active source is sealed under that lock; each relocated chunk is checked against
+its current location again before publication. A deletion or replacement therefore
+cannot be resurrected by a stale scan. Data sync still precedes the synchronous
+index publication. The source is retired only after the post-seal scan reaches
+EOF: publication cannot introduce new locations in a sealed source.
+
+Retired-marker validation also advances incrementally. A reader location pin
+postpones unlink without preventing inventory/relocation of other segments. Once
+that work finishes, the background worker reports blocked rather than treating
+repeated waits on the same pin as progress. No location pin survives a collection
+call. `pending_segments` now reports a discovered pending marker (0 or 1), rather
+than an eager global marker count; `physical_pending` is the continuation signal.
+Cancellation/reopen discards cursors and rebuilds proofs from durable metadata;
+there is no new on-disk format or persisted scan cursor.
+
+ObjectStore discovers the highest segment at owner startup and maintains that
+identity and EOF as it appends/rotates. Per-step rotation/admission and already
+unlinked retirement recovery no longer enumerate the repository. Startup discovery
+and capacity accounting remain proportional to the number of files.
+
+The first bounded-scan implementation prioritized per-call work. Its candidate accounting
+scanned the chunk index separately per candidate: aggregate work could be proportional
+to segments times chunk rows. It does not establish an overall GC throughput,
+process-RSS or scratch-space ceiling. The scratch reverse-index implementation below removes that repeated scan without
+introducing persistent per-segment accounting. Relocations
+publish at most eight chunks at a time, limiting the writer critical section but
+potentially increasing sync cost compared with a large batch. Production p95/p99 targets require larger mounted workload
+measurements, beyond the regression's local timing samples.
+
+`forkfsd_physical_gc_budget` (registered as `metadata-regression`) exercises
+one-unit physical calls, finite foreground churn, deletion/new references,
+publication during a sealed-source scan, DATA reduction/peak-growth assertions,
+and cancellation/reopen. It prints local step and interleaved read/write timing
+percentiles without a machine-dependent timing assertion. The concurrency suite
+holds a backup location pin through a complete inventory, asserts zero fictitious
+physical progress in `wait_pins`, then releases it and checks durable unlink.
+The crash suite separately injects chunk-index publication and retired-marker
+publication, including recovery with an exact DATA capacity limit.
+
+For repositories requiring more scan work than one invocation allows, use the
+long-lived daemon/RPC owner. Standalone CLI processes cannot share these in-memory
+cursors: reopening rebuilds proofs, even with the CLI's larger default work
+allowance. Repeated short standalone invocations are not a resumable GC protocol.
+
+Local validation (2026-10-27, macOS 27.0.1 arm64, Apple Clang 21, Release,
+`WFS_BUILD_LEGACY=OFF`, `WFS_COW_FSKIT=OFF`): all 110 registered tests passed,
+including 99 `metadata-regression` tests, in 541.96 seconds with three workers.
+The final production changes were built before the GC tests began; the new
+concurrency and physical-budget tests were also rebuilt before their execution.
+
+The deliberately one-unit physical regression took 66,232 continuation calls.
+Its DATA bytes were 2,192,365 initially, 3,213,445 peak, and 817,260 after drain.
+Collection-step p50/p95/p99 were 147/4,842/6,846 microseconds. Eighteen interleaved
+foreground samples reported write p50/p95/p99 9,401/24,581/24,581 microseconds and
+read 1,088/1,328/1,328 microseconds. These include the namespace API and synchronous
+publication, are from a small synthetic fixture with intentionally tiny budgets,
+and are neither a native-filesystem comparison nor a production latency SLO.
+No signed mounted or remote-CI results were obtained in this implementation turn.
+
+
+### Per-round segment reverse index
+
+Physical GC now builds a private disk-backed reverse index in
+`.gc-physical-XXXXXX/db`. The owning daemon captures the initial tail ID and a
+main-LevelDB snapshot together under the publication lock. It visits each `C/`
+row once, in budgeted slices, storing scratch metadata only:
+
+- `R/<sid:8 little-endian><chunk hash:32>` → original 20-byte chunk location.
+- `N/<sid:8 little-endian>` → summed payload bytes plus record headers, uint64 LE.
+
+No file payload is stored in the scratch database. Its memtable request is
+64 KiB, block cache retention is disabled, compression is disabled and the
+open-file setting is small. These LevelDB internals are outside the conservative
+GC-owned metadata charge, as with logical marking. Scratch disk usage is O(C)
+metadata; it is not included in the DATA-segment capacity limit and can fail on
+host ENOSPC. Scratch failure abandons that physical pass without authorizing a
+retirement or independently poisoning the main store. Successful earlier main
+publications remain committed. Startup/cancellation discard the scratch index;
+there is no new repository format, persistent index or migration.
+
+Candidate accounting is a scratch counter lookup. Relocation and retirement
+validation visit only that segment's reverse-reference prefix. Every relocation
+still checks the current main `C/` location for exact equality; retired-reference
+validation rejects any current location in the retired segment, including an
+unexpected alternate offset. Stale scratch rows resulting from deletes/moves
+are conservative and never resurrect a reference. A segment sealed before the
+initial snapshot cannot gain new `C/` locations under the writer protocol.
+
+The captured active segment is different: foreground writes may add locations
+there before it is sealed, even when the foreground already rotated it by the
+time GC selects it. Selection therefore seals it if needed, then captures a
+fresh snapshot and performs one additional budgeted `C/` scan for that segment.
+The refresh completes before copying or retirement. A retirement proof must
+belong to the indexed generation: a marker for the captured tail is rejected
+unless that tail's authoritative refresh completed. Merely seeing a newer
+current tail does not establish coverage of the older one.
+
+Per physical round, full main-index visits are bounded by the initial scan plus
+at most one active-tail refresh. Other visits follow segment prefixes: row visits
+scale with C rows and segments rather than their product. Actual CPU/I/O also
+includes LevelDB seeks, scratch writes/compaction, payload copying and syncs;
+this is not a strict wall-clock linear-time or latency guarantee. Concurrent
+changes can require follow-up rounds. Main snapshots are released immediately
+after their index/refresh completes; no location pin survives a call.
+
+Reports add `physical_index_work` (main C rows visited),
+`physical_reference_work` (scratch references visited), and
+`physical_candidate_work` (candidate-counter lookups), each charged within
+`physical_work_done`. `forkfsd_gc_segment_index` compares 4- and 12-segment sparse
+fixtures using independently counted pre-GC C rows, normalized scan-growth bounds,
+known payload oracles, and a write during the actual index build. A separate
+corrupt-marker case rotates the captured tail during construction and requires
+refusal without unlink or main-owner poisoning. Crash tests include index-row
+and index-complete boundaries; restart tests discard corrupt scratch and avoid
+traversing scratch symlinks.
+
+After refreshing a captured tail, GC rechecks its immutable sealed size against
+the refreshed byte counter. A now fully packed tail is skipped rather than
+recopied; the regression requires exactly one copy of each old-source chunk in
+that case. Normal scratch cleanup is a separate budgeted phase: closing the
+scratch DB, each file unlink, and directory removal are charged operations.
+LevelDB close can still wait for background compaction and free version metadata;
+this bounds explicit filesystem deletion count, not close latency. Cancellation
+and error teardown discard scratch synchronously and are not latency guarantees.
+
+Validation for the reverse-index increment (2026-10-27, same macOS arm64 Release
+configuration): the complete 111-test run passed 110 tests in 566.79 seconds. The
+sole failure was a 30-second mock HTTP wait in the deep-directory sync case;
+all other mock cases passed. With builds and competing tests finished, the entire
+34-case sync mock passed unchanged in an isolated CTest rerun (53.00 seconds).
+The final production tree then passed all 13 targeted GC tests in 119.16 seconds,
+including memory budgets, crash injection, concurrent pins, three namespace seeds
+and three online models. No assertion or timeout was relaxed.
+
+The 4-/12-segment fixtures had independently counted pre-GC populations of 19/59
+C rows and published one additional live chunk while indexing. The final targeted
+run visited 59/239 main C rows in total, across all necessary physical rounds;
+the earlier full run visited 59/179. Directory ordering and follow-up rounds can
+change totals, so tests assert normalized growth and an explicit visit ceiling,
+not exact counts. The packed-tail fixture moved exactly 18 old-source chunks
+instead of recopying the fully packed tail.
+
+The final one-unit regression also passed separately in 139.562 seconds with
+71,195 calls: DATA initial/peak/final 2,283,834/3,235,906/817,260 bytes; step
+p50/p95/p99 154/4,810/6,803 microseconds. Its 18 interleaved samples reported write
+13,577/27,238/27,238 and read 843/1,053/1,053 microseconds. As above, these are
+small local diagnostic samples, not mounted acceptance or a throughput/SLO claim.

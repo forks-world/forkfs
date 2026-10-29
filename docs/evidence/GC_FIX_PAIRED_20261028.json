@@ -1,0 +1,415 @@
+{
+  "scope": "paired synthetic RPC development phase; warm caches; sequential runs; not mounted acceptance",
+  "settings": {
+    "binary_sha256": "6faf28add26d29b166bde7dd31b656c392d550aef6089189f7aea038604ca66f",
+    "harness_sha256": {
+      "developer_soak.py": "f39b9213ae2b1619f8649658392045ee2c1e1ef63b987fd58a1c97b116e4abf8",
+      "developer_workload.py": "07367d758c2d6f01d9149220a529f83e6f769e04cbb424e1199c68700b249f49"
+    },
+    "python": "3.9.6",
+    "seed": 20261028,
+    "files": 16,
+    "file_bytes": 1024,
+    "rounds": 10,
+    "workers": 2,
+    "steps": 350,
+    "seconds": 0,
+    "sample_interval": 0.5,
+    "gc_work": 128,
+    "gc_copy_bytes": 1048576,
+    "gc_objects": 128,
+    "max_store_mib": 256,
+    "max_artifact_mib": 1024,
+    "max_rpcs": 1000000
+  },
+  "latency": {
+    "fs-save": {
+      "count_per_run": 1000,
+      "disabled": {
+        "count": 1000,
+        "p50_ms": 8.114312,
+        "p95_ms": 14.897083,
+        "p99_ms": 18.264875,
+        "p95_status": "reported",
+        "p99_status": "reported",
+        "tail_min_samples": 1000,
+        "max_ms": 34.494584
+      },
+      "concurrent": {
+        "count": 1000,
+        "p50_ms": 11.286583,
+        "p95_ms": 26.1435,
+        "p99_ms": 47.41875,
+        "p95_status": "reported",
+        "p99_status": "reported",
+        "tail_min_samples": 1000,
+        "max_ms": 197.539709
+      },
+      "p50_ms_ratio": 1.3909476243950196,
+      "p95_ms_ratio": 1.7549408833930775,
+      "p99_ms_ratio": 2.596171613547862
+    },
+    "fs-write-at": {
+      "count_per_run": 1000,
+      "disabled": {
+        "count": 1000,
+        "p50_ms": 9.082208,
+        "p95_ms": 13.723541,
+        "p99_ms": 17.007291,
+        "p95_status": "reported",
+        "p99_status": "reported",
+        "tail_min_samples": 1000,
+        "max_ms": 26.768875
+      },
+      "concurrent": {
+        "count": 1000,
+        "p50_ms": 11.745729,
+        "p95_ms": 26.334041,
+        "p99_ms": 36.512333,
+        "p95_status": "reported",
+        "p99_status": "reported",
+        "tail_min_samples": 1000,
+        "max_ms": 109.761042
+      },
+      "p50_ms_ratio": 1.2932680026707164,
+      "p95_ms_ratio": 1.9188954949746568,
+      "p99_ms_ratio": 2.1468635422302116
+    },
+    "fs-append": {
+      "count_per_run": 1000,
+      "disabled": {
+        "count": 1000,
+        "p50_ms": 7.869812,
+        "p95_ms": 11.795083,
+        "p99_ms": 15.228792,
+        "p95_status": "reported",
+        "p99_status": "reported",
+        "tail_min_samples": 1000,
+        "max_ms": 25.562042
+      },
+      "concurrent": {
+        "count": 1000,
+        "p50_ms": 11.254563,
+        "p95_ms": 25.144083,
+        "p99_ms": 30.083875,
+        "p95_status": "reported",
+        "p99_status": "reported",
+        "tail_min_samples": 1000,
+        "max_ms": 186.127958
+      },
+      "p50_ms_ratio": 1.4300929933269053,
+      "p95_ms_ratio": 2.131742777901605,
+      "p99_ms_ratio": 1.9754603648142282
+    },
+    "fs-truncate": {
+      "count_per_run": 1000,
+      "disabled": {
+        "count": 1000,
+        "p50_ms": 7.7690415,
+        "p95_ms": 12.023292,
+        "p99_ms": 16.599208,
+        "p95_status": "reported",
+        "p99_status": "reported",
+        "tail_min_samples": 1000,
+        "max_ms": 22.241417
+      },
+      "concurrent": {
+        "count": 1000,
+        "p50_ms": 11.8266455,
+        "p95_ms": 25.259208,
+        "p99_ms": 37.606333,
+        "p95_status": "reported",
+        "p99_status": "reported",
+        "tail_min_samples": 1000,
+        "max_ms": 184.786833
+      },
+      "p50_ms_ratio": 1.522278584816415,
+      "p95_ms_ratio": 2.1008562380419606,
+      "p99_ms_ratio": 2.2655498382814407
+    },
+    "fs-rename": {
+      "count_per_run": 1000,
+      "disabled": {
+        "count": 1000,
+        "p50_ms": 9.9312915,
+        "p95_ms": 14.032,
+        "p99_ms": 17.362791,
+        "p95_status": "reported",
+        "p99_status": "reported",
+        "tail_min_samples": 1000,
+        "max_ms": 26.730791
+      },
+      "concurrent": {
+        "count": 1000,
+        "p50_ms": 12.996354,
+        "p95_ms": 26.633334,
+        "p99_ms": 41.991583,
+        "p95_status": "reported",
+        "p99_status": "reported",
+        "tail_min_samples": 1000,
+        "max_ms": 146.864708
+      },
+      "p50_ms_ratio": 1.3086267782996803,
+      "p95_ms_ratio": 1.8980426168757127,
+      "p99_ms_ratio": 2.4184811646929343
+    },
+    "fs-chmod": {
+      "count_per_run": 1000,
+      "disabled": {
+        "count": 1000,
+        "p50_ms": 8.5310835,
+        "p95_ms": 13.376375,
+        "p99_ms": 16.692959,
+        "p95_status": "reported",
+        "p99_status": "reported",
+        "tail_min_samples": 1000,
+        "max_ms": 22.699291
+      },
+      "concurrent": {
+        "count": 1000,
+        "p50_ms": 10.7358125,
+        "p95_ms": 24.12075,
+        "p99_ms": 40.231625,
+        "p95_status": "reported",
+        "p99_status": "reported",
+        "tail_min_samples": 1000,
+        "max_ms": 130.6155
+      },
+      "p50_ms_ratio": 1.2584348166326118,
+      "p95_ms_ratio": 1.8032351814299465,
+      "p99_ms_ratio": 2.4100954779796684
+    },
+    "fs-cat": {
+      "count_per_run": 7420,
+      "disabled": {
+        "count": 7420,
+        "p50_ms": 3.439354,
+        "p95_ms": 9.684125,
+        "p99_ms": 11.65875,
+        "p95_status": "reported",
+        "p99_status": "reported",
+        "tail_min_samples": 1000,
+        "max_ms": 23.691
+      },
+      "concurrent": {
+        "count": 7420,
+        "p50_ms": 3.308042,
+        "p95_ms": 15.42125,
+        "p99_ms": 21.596834,
+        "p95_status": "reported",
+        "p99_status": "reported",
+        "tail_min_samples": 1000,
+        "max_ms": 197.555333
+      },
+      "p50_ms_ratio": 0.9618207372663587,
+      "p95_ms_ratio": 1.592425748325223,
+      "p99_ms_ratio": 1.8524141953468427
+    },
+    "fs-stat": {
+      "count_per_run": 60,
+      "disabled": {
+        "count": 60,
+        "p50_ms": 4.7479585,
+        "p95_ms": null,
+        "p99_ms": null,
+        "p95_status": "insufficient_samples",
+        "p99_status": "insufficient_samples",
+        "tail_min_samples": 1000,
+        "max_ms": 9.948667
+      },
+      "concurrent": {
+        "count": 60,
+        "p50_ms": 7.2525835,
+        "p95_ms": null,
+        "p99_ms": null,
+        "p95_status": "insufficient_samples",
+        "p99_status": "insufficient_samples",
+        "tail_min_samples": 1000,
+        "max_ms": 52.118792
+      },
+      "p50_ms_ratio": 1.527516194591844,
+      "p95_ms_ratio": null,
+      "p99_ms_ratio": null
+    },
+    "fs-lstat": {
+      "count_per_run": 480,
+      "disabled": {
+        "count": 480,
+        "p50_ms": 0.2102085,
+        "p95_ms": null,
+        "p99_ms": null,
+        "p95_status": "insufficient_samples",
+        "p99_status": "insufficient_samples",
+        "tail_min_samples": 1000,
+        "max_ms": 5.636417
+      },
+      "concurrent": {
+        "count": 480,
+        "p50_ms": 0.2476665,
+        "p95_ms": null,
+        "p99_ms": null,
+        "p95_status": "insufficient_samples",
+        "p99_status": "insufficient_samples",
+        "tail_min_samples": 1000,
+        "max_ms": 108.329792
+      },
+      "p50_ms_ratio": 1.1781945068824524,
+      "p95_ms_ratio": null,
+      "p99_ms_ratio": null
+    }
+  },
+  "storage": {
+    "disabled": {
+      "after_development": {
+        "apparent_bytes": 72554852,
+        "allocated_bytes": 73728000,
+        "segment_bytes": 30586339,
+        "index_bytes": 41968513,
+        "scratch_bytes": 0,
+        "mark_scratch_bytes": 0,
+        "physical_scratch_bytes": 0,
+        "scratch_allocated_bytes": 0,
+        "control_bytes": 0,
+        "files": 27,
+        "stage": "development-after",
+        "live_main_bytes": 28717,
+        "unique_reachable_payload_bytes": 41920,
+        "modeled_worlds": 3,
+        "fork_probe_worlds": 0,
+        "retained_revisions": 21,
+        "last_committed_seq": 7378,
+        "indexed_objects": 157464,
+        "submitted_payload_bytes": 3066104,
+        "mutation_requests": 7365,
+        "delta_commits": 736,
+        "delta_segment_bytes": 3067034,
+        "segment_bytes_per_commit": 4167.165760869565,
+        "delta_allocated_bytes": 7577600,
+        "segment_to_reachable_payload_ratio": 729.6359494274809
+      },
+      "sampled_peaks": {
+        "allocated_bytes": 133025792,
+        "segment_bytes": 33773151,
+        "index_bytes": 99384071,
+        "control_bytes": 484,
+        "mark_scratch_bytes": 0,
+        "physical_scratch_bytes": 0,
+        "scratch_allocated_bytes": 0,
+        "artifact_allocated_bytes": 464879616,
+        "artifact_apparent_bytes": 444888416
+      },
+      "pre_backup_gc_storage": null,
+      "base_archive_bytes": 61306360,
+      "final_archive_bytes": 67688364
+    },
+    "concurrent": {
+      "after_development": {
+        "apparent_bytes": 47022459,
+        "allocated_bytes": 47185920,
+        "segment_bytes": 878032,
+        "index_bytes": 46144427,
+        "scratch_bytes": 0,
+        "mark_scratch_bytes": 0,
+        "physical_scratch_bytes": 0,
+        "scratch_allocated_bytes": 0,
+        "control_bytes": 0,
+        "files": 32,
+        "stage": "pre-backup-gc-after",
+        "live_main_bytes": 28717,
+        "unique_reachable_payload_bytes": 41920,
+        "modeled_worlds": 3,
+        "fork_probe_worlds": 0,
+        "retained_revisions": 21,
+        "last_committed_seq": 7378,
+        "indexed_objects": 4810,
+        "submitted_payload_bytes": 3066104,
+        "mutation_requests": 7365,
+        "delta_commits": 0,
+        "delta_segment_bytes": -33281057,
+        "segment_bytes_per_commit": null,
+        "delta_allocated_bytes": -62791680,
+        "segment_to_reachable_payload_ratio": 20.945419847328246
+      },
+      "sampled_peaks": {
+        "allocated_bytes": 137490432,
+        "segment_bytes": 47836341,
+        "index_bytes": 86624724,
+        "control_bytes": 486,
+        "mark_scratch_bytes": 20794366,
+        "physical_scratch_bytes": 21637771,
+        "scratch_allocated_bytes": 33869824,
+        "artifact_allocated_bytes": 145195008,
+        "artifact_apparent_bytes": 140383473
+      },
+      "pre_backup_gc_storage": {
+        "before": {
+          "apparent_bytes": 105432778,
+          "allocated_bytes": 109977600,
+          "segment_bytes": 34159089,
+          "index_bytes": 48019520,
+          "scratch_bytes": 23254169,
+          "mark_scratch_bytes": 14690049,
+          "physical_scratch_bytes": 8564120,
+          "scratch_allocated_bytes": 23388160,
+          "control_bytes": 0,
+          "files": 62,
+          "stage": "pre-backup-gc-before",
+          "live_main_bytes": 28717,
+          "unique_reachable_payload_bytes": 41920,
+          "modeled_worlds": 3,
+          "fork_probe_worlds": 0,
+          "retained_revisions": 21,
+          "last_committed_seq": 7378,
+          "indexed_objects": 174330,
+          "submitted_payload_bytes": 3066104,
+          "mutation_requests": 7365,
+          "delta_commits": 0,
+          "delta_segment_bytes": 0,
+          "segment_bytes_per_commit": null,
+          "delta_allocated_bytes": 0,
+          "segment_to_reachable_payload_ratio": 814.8637643129771
+        },
+        "after": {
+          "apparent_bytes": 47022459,
+          "allocated_bytes": 47185920,
+          "segment_bytes": 878032,
+          "index_bytes": 46144427,
+          "scratch_bytes": 0,
+          "mark_scratch_bytes": 0,
+          "physical_scratch_bytes": 0,
+          "scratch_allocated_bytes": 0,
+          "control_bytes": 0,
+          "files": 32,
+          "stage": "pre-backup-gc-after",
+          "live_main_bytes": 28717,
+          "unique_reachable_payload_bytes": 41920,
+          "modeled_worlds": 3,
+          "fork_probe_worlds": 0,
+          "retained_revisions": 21,
+          "last_committed_seq": 7378,
+          "indexed_objects": 4810,
+          "submitted_payload_bytes": 3066104,
+          "mutation_requests": 7365,
+          "delta_commits": 0,
+          "delta_segment_bytes": -33281057,
+          "segment_bytes_per_commit": null,
+          "delta_allocated_bytes": -62791680,
+          "segment_to_reachable_payload_ratio": 20.945419847328246
+        },
+        "drain_seconds": 95.338694917,
+        "observed_net_segment_reclaimed_bytes_per_second": 349082.3639758635,
+        "observed_allocated_delta_bytes": -62791680,
+        "observed_segment_delta_bytes": -33281057,
+        "observed_allocated_reduction_bytes": 62791680,
+        "observed_segment_reduction_bytes": 33281057,
+        "interpretation": "observed sample delta; storage is not expected to shrink monotonically"
+      },
+      "base_archive_bytes": 2134251,
+      "final_archive_bytes": 8805491
+    }
+  },
+  "artifacts": [
+    "/Users/hurricane/private/code/forks.world/forkfs-gc-budget/build/developer-soak-gc-control/seed-20261028-qlal68bg/summary.json",
+    "/Users/hurricane/private/code/forks.world/forkfs-gc-budget/build/developer-soak-gc-complete/seed-20261028-3drrqez7/summary.json"
+  ]
+}

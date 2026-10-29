@@ -1,0 +1,2269 @@
+{
+  "scope": "Sequential synthetic resident-RPC variant observations; changed binaries are intentional; not mounted acceptance",
+  "variants": {
+    "baseline": {
+      "commit": "99b6e49",
+      "artifact": "build/gc-tail-baseline/seed-20261028-ok0sgzyc",
+      "settings": {
+        "binary": "/Users/hurricane/private/code/forks.world/forkfs-gc-budget/build/gc-budget/daemon/forkfsd",
+        "output": "build/gc-tail-baseline",
+        "seed": 20261028,
+        "files": 16,
+        "file_bytes": 1024,
+        "rounds": 10,
+        "workers": 2,
+        "steps": 350,
+        "seconds": 0,
+        "sample_interval": 0.5,
+        "max_store_mib": 256,
+        "max_rpcs": 1000000,
+        "max_artifact_mib": 1024,
+        "deadline": 600.0,
+        "gc_work": 128,
+        "gc_copy_bytes": 1048576,
+        "gc_objects": 128,
+        "gc_mode": "concurrent",
+        "restart_every": 1,
+        "pid": 41971,
+        "binary_sha256": "571e89135c0197ea510bc927ee5f53a3f5cfe0ff0b09f44eaf335de31037e466",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "python": "3.9.6",
+        "transport": "resident Unix RPC; one connection per operation",
+        "cache": "OS caches not flushed; service restarts reset daemon caches",
+        "scope": "synthetic development I/O; no mounted git/compiler execution",
+        "harness_sha256": {
+          "developer_soak.py": "f39b9213ae2b1619f8649658392045ee2c1e1ef63b987fd58a1c97b116e4abf8",
+          "developer_workload.py": "07367d758c2d6f01d9149220a529f83e6f769e04cbb424e1199c68700b249f49"
+        },
+        "worker_revision_pattern": "r{generation}w{worker}",
+        "revision_policy": "retain all; no revision deletion API is used"
+      },
+      "state": "passed",
+      "elapsed_seconds": 240.09178658300002,
+      "development_latency": {
+        "status": {
+          "count": 10,
+          "p50_ms": 0.0569165,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 0.104958
+        },
+        "gc-status": {
+          "count": 624,
+          "p50_ms": 8.338916,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 184.104459
+        },
+        "fs-fork": {
+          "count": 2,
+          "p50_ms": 23.6278335,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 25.659542
+        },
+        "fs-save": {
+          "count": 1000,
+          "p50_ms": 11.096854,
+          "p95_ms": 25.049833,
+          "p99_ms": 39.787917,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 171.3065
+        },
+        "fs-cat": {
+          "count": 7420,
+          "p50_ms": 3.0651245,
+          "p95_ms": 14.866458,
+          "p99_ms": 20.857833,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 181.6005
+        },
+        "fs-write-at": {
+          "count": 1000,
+          "p50_ms": 11.4498955,
+          "p95_ms": 24.135791,
+          "p99_ms": 31.89025,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 110.156125
+        },
+        "fs-append": {
+          "count": 1000,
+          "p50_ms": 10.285167,
+          "p95_ms": 23.157417,
+          "p99_ms": 30.755666,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 99.938584
+        },
+        "fs-truncate": {
+          "count": 1000,
+          "p50_ms": 10.3051045,
+          "p95_ms": 22.209417,
+          "p99_ms": 27.225333,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 156.532042
+        },
+        "fs-rename": {
+          "count": 1000,
+          "p50_ms": 12.163375,
+          "p95_ms": 26.817042,
+          "p99_ms": 41.982125,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 173.03775
+        },
+        "fs-write": {
+          "count": 1080,
+          "p50_ms": 15.4231045,
+          "p95_ms": 29.528875,
+          "p99_ms": 39.723208,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 191.322417
+        },
+        "fs-chmod": {
+          "count": 1000,
+          "p50_ms": 10.6704375,
+          "p95_ms": 23.454167,
+          "p99_ms": 28.113333,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 48.632125
+        },
+        "fs-unlink": {
+          "count": 120,
+          "p50_ms": 10.1608955,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 41.533
+        },
+        "fs-mkdir": {
+          "count": 20,
+          "p50_ms": 16.318021,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 28.1525
+        },
+        "fs-rmdir": {
+          "count": 20,
+          "p50_ms": 13.7515835,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 28.6595
+        },
+        "fs-link": {
+          "count": 20,
+          "p50_ms": 13.762271,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 28.083917
+        },
+        "fs-stat": {
+          "count": 60,
+          "p50_ms": 6.7734585,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 18.959458
+        },
+        "session-open": {
+          "count": 20,
+          "p50_ms": 1.2252085,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 14.435542
+        },
+        "fs-open": {
+          "count": 40,
+          "p50_ms": 1.9986665,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 24.9765
+        },
+        "fs-hlock": {
+          "count": 60,
+          "p50_ms": 1.446521,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 21.884875
+        },
+        "fs-hstat": {
+          "count": 20,
+          "p50_ms": 0.7915835,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 5.922584
+        },
+        "fs-hwrite": {
+          "count": 20,
+          "p50_ms": 5.563417,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 11.798292
+        },
+        "fs-hread": {
+          "count": 20,
+          "p50_ms": 1.3610625,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 17.715792
+        },
+        "fs-close": {
+          "count": 40,
+          "p50_ms": 4.800646,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 16.646209
+        },
+        "session-close": {
+          "count": 20,
+          "p50_ms": 0.2622915,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 7.348875
+        },
+        "fs-symlink": {
+          "count": 20,
+          "p50_ms": 9.5789585,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 25.254791
+        },
+        "fs-readlink": {
+          "count": 20,
+          "p50_ms": 3.1605,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 14.91325
+        },
+        "fs-snapshot": {
+          "count": 20,
+          "p50_ms": 8.7041875,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 28.509917
+        },
+        "fs-lstat": {
+          "count": 480,
+          "p50_ms": 0.232271,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 17.665542
+        },
+        "fs-ls": {
+          "count": 120,
+          "p50_ms": 0.295604,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 10.412375
+        },
+        "fs-restore": {
+          "count": 18,
+          "p50_ms": 11.091562,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 19.273917
+        }
+      },
+      "sampled_storage_peaks": {
+        "allocated_bytes": 133267456,
+        "segment_bytes": 46042995,
+        "index_bytes": 83886275,
+        "control_bytes": 466,
+        "mark_scratch_bytes": 21675971,
+        "physical_scratch_bytes": 21195371,
+        "scratch_allocated_bytes": 34144256,
+        "artifact_allocated_bytes": 140967936,
+        "artifact_apparent_bytes": 136130576
+      },
+      "pre_backup_gc_storage": {
+        "before": {
+          "apparent_bytes": 101820607,
+          "allocated_bytes": 105910272,
+          "segment_bytes": 33005428,
+          "index_bytes": 46597141,
+          "scratch_bytes": 22218038,
+          "mark_scratch_bytes": 13653728,
+          "physical_scratch_bytes": 8564310,
+          "scratch_allocated_bytes": 22372352,
+          "control_bytes": 0,
+          "files": 59,
+          "stage": "pre-backup-gc-before",
+          "live_main_bytes": 28717,
+          "unique_reachable_payload_bytes": 41920,
+          "modeled_worlds": 3,
+          "fork_probe_worlds": 0,
+          "retained_revisions": 21,
+          "last_committed_seq": 7378,
+          "indexed_objects": 169094,
+          "submitted_payload_bytes": 3066104,
+          "mutation_requests": 7365,
+          "delta_commits": 0,
+          "delta_segment_bytes": 0,
+          "segment_bytes_per_commit": null,
+          "delta_allocated_bytes": 0,
+          "segment_to_reachable_payload_ratio": 787.3432251908397
+        },
+        "after": {
+          "apparent_bytes": 35467216,
+          "allocated_bytes": 35643392,
+          "segment_bytes": 868306,
+          "index_bytes": 34598910,
+          "scratch_bytes": 0,
+          "mark_scratch_bytes": 0,
+          "physical_scratch_bytes": 0,
+          "scratch_allocated_bytes": 0,
+          "control_bytes": 0,
+          "files": 28,
+          "stage": "pre-backup-gc-after",
+          "live_main_bytes": 28717,
+          "unique_reachable_payload_bytes": 41920,
+          "modeled_worlds": 3,
+          "fork_probe_worlds": 0,
+          "retained_revisions": 21,
+          "last_committed_seq": 7378,
+          "indexed_objects": 4762,
+          "submitted_payload_bytes": 3066104,
+          "mutation_requests": 7365,
+          "delta_commits": 0,
+          "delta_segment_bytes": -32137122,
+          "segment_bytes_per_commit": null,
+          "delta_allocated_bytes": -70266880,
+          "segment_to_reachable_payload_ratio": 20.71340648854962
+        },
+        "drain_seconds": 97.886397959,
+        "observed_net_segment_reclaimed_bytes_per_second": 328310.3952140595,
+        "observed_allocated_delta_bytes": -70266880,
+        "observed_segment_delta_bytes": -32137122,
+        "observed_allocated_reduction_bytes": 70266880,
+        "observed_segment_reduction_bytes": 32137122,
+        "interpretation": "observed sample delta; storage is not expected to shrink monotonically"
+      },
+      "gc_retention_status": {
+        "state": "blocked",
+        "active": false,
+        "steps": 82,
+        "last_step": {
+          "metadata_budget_bytes": 67108864,
+          "metadata_bytes_charged": 32768,
+          "mark_work_done": 0,
+          "mark_processed": 0,
+          "mark_pending": false,
+          "mark_phase": "complete",
+          "physical_work_done": 53,
+          "physical_index_work": 8,
+          "physical_reference_work": 0,
+          "physical_candidate_work": 6,
+          "physical_pending": false,
+          "physical_phase": "complete",
+          "objects_deleted": 0,
+          "chunks_deleted": 0,
+          "chunks_moved": 0,
+          "bytes_copied": 0,
+          "segments_deleted": 0,
+          "pending_segments": 0,
+          "logical_sweep_skipped": true,
+          "sequence": 8114
+        },
+        "error": ""
+      },
+      "retained_revision_counts": [
+        {
+          "round": 0,
+          "generation": 0,
+          "retained_revisions": 3
+        },
+        {
+          "round": 1,
+          "generation": 1,
+          "retained_revisions": 5
+        },
+        {
+          "round": 2,
+          "generation": 2,
+          "retained_revisions": 7
+        },
+        {
+          "round": 3,
+          "generation": 3,
+          "retained_revisions": 9
+        },
+        {
+          "round": 4,
+          "generation": 4,
+          "retained_revisions": 11
+        },
+        {
+          "round": 5,
+          "generation": 5,
+          "retained_revisions": 13
+        },
+        {
+          "round": 6,
+          "generation": 6,
+          "retained_revisions": 15
+        },
+        {
+          "round": 7,
+          "generation": 7,
+          "retained_revisions": 17
+        },
+        {
+          "round": 8,
+          "generation": 8,
+          "retained_revisions": 19
+        },
+        {
+          "round": 9,
+          "generation": 9,
+          "retained_revisions": 21
+        },
+        {
+          "round": 10,
+          "generation": 10,
+          "retained_revisions": 23
+        }
+      ],
+      "replayed_storage": {
+        "base-replayed": {
+          "apparent_bytes": 2354735,
+          "allocated_bytes": 2367488,
+          "segment_bytes": 868306,
+          "index_bytes": 1486429,
+          "scratch_bytes": 0,
+          "mark_scratch_bytes": 0,
+          "physical_scratch_bytes": 0,
+          "scratch_allocated_bytes": 0,
+          "control_bytes": 0,
+          "files": 7
+        },
+        "final-replayed": {
+          "apparent_bytes": 10279522,
+          "allocated_bytes": 10297344,
+          "segment_bytes": 4101683,
+          "index_bytes": 6177839,
+          "scratch_bytes": 0,
+          "mark_scratch_bytes": 0,
+          "physical_scratch_bytes": 0,
+          "scratch_allocated_bytes": 0,
+          "control_bytes": 0,
+          "files": 8
+        }
+      },
+      "final_source": [
+        {
+          "apparent_bytes": 20407938,
+          "allocated_bytes": 22016000,
+          "segment_bytes": 4101923,
+          "index_bytes": 16305549,
+          "scratch_bytes": 0,
+          "mark_scratch_bytes": 0,
+          "physical_scratch_bytes": 0,
+          "scratch_allocated_bytes": 0,
+          "control_bytes": 466,
+          "files": 22,
+          "stage": "final-source",
+          "live_main_bytes": 28717,
+          "unique_reachable_payload_bytes": 42878,
+          "modeled_worlds": 3,
+          "fork_probe_worlds": 0,
+          "retained_revisions": 23,
+          "last_committed_seq": 8114,
+          "indexed_objects": 21382,
+          "submitted_payload_bytes": 3370083,
+          "mutation_requests": 8099,
+          "delta_commits": 0,
+          "delta_segment_bytes": 0,
+          "segment_bytes_per_commit": null,
+          "delta_allocated_bytes": -774144,
+          "segment_to_reachable_payload_ratio": 95.66497970987453
+        }
+      ],
+      "storage_profile_final": {
+        "metadata_prepare_ns": 5383830307,
+        "storage_metrics": {
+          "transactions": 8114,
+          "prepare_ns": 1458170914,
+          "write_ns": 58979017822,
+          "wal_sync_calls": 22332,
+          "wal_sync_ns": 91723035432,
+          "other_sync_calls": 426,
+          "other_sync_ns": 2709874666,
+          "wal_append_bytes": 85217652,
+          "wal_append_ns": 15061780,
+          "wal_flush_ns": 2039125299,
+          "data_prepare_calls": 8115,
+          "data_prepare_ns": 8787529752,
+          "data_sync_calls": 8115,
+          "data_sync_ns": 1301652880,
+          "metadata_publish_calls": 8115,
+          "metadata_publish_ns": 36090201819,
+          "gc_barrier_calls": 7353,
+          "gc_barrier_ns": 12775885577,
+          "gc_foreground_wait_ns": 5157468581,
+          "gc_foreground_hold_ns": 9176553989,
+          "gc_advance_wait_ns": 5521493504,
+          "gc_advance_hold_ns": 44298807672,
+          "foreground_writer": {
+            "wait_calls": 8114,
+            "wait_ns": 1064707373,
+            "wait_max_ns": 16614500,
+            "hold_calls": 8114,
+            "hold_ns": 60202132428,
+            "hold_max_ns": 178324167,
+            "hold_buckets": {
+              "le_1ms": 0,
+              "gt_1_le_2ms": 5,
+              "gt_2_le_5ms": 2306,
+              "gt_5_le_10ms": 4361,
+              "gt_10_le_20ms": 1382,
+              "gt_20_le_50ms": 35,
+              "gt_50ms": 25
+            }
+          },
+          "gc_writer_sweep": {
+            "wait_calls": 69047,
+            "wait_ns": 25520648,
+            "wait_max_ns": 4578667,
+            "hold_calls": 69047,
+            "hold_ns": 21043854548,
+            "hold_max_ns": 16285916,
+            "hold_buckets": {
+              "le_1ms": 65673,
+              "gt_1_le_2ms": 8,
+              "gt_2_le_5ms": 1320,
+              "gt_5_le_10ms": 1923,
+              "gt_10_le_20ms": 123,
+              "gt_20_le_50ms": 0,
+              "gt_50ms": 0
+            }
+          },
+          "gc_writer_relocate": {
+            "wait_calls": 11220,
+            "wait_ns": 1789817805,
+            "wait_max_ns": 16923666,
+            "hold_calls": 11220,
+            "hold_ns": 58231686261,
+            "hold_max_ns": 53777208,
+            "hold_buckets": {
+              "le_1ms": 0,
+              "gt_1_le_2ms": 5,
+              "gt_2_le_5ms": 5219,
+              "gt_5_le_10ms": 5950,
+              "gt_10_le_20ms": 44,
+              "gt_20_le_50ms": 1,
+              "gt_50ms": 1
+            }
+          },
+          "gc_writer_retire": {
+            "wait_calls": 33,
+            "wait_ns": 10000332,
+            "wait_max_ns": 4447167,
+            "hold_calls": 33,
+            "hold_ns": 65662997,
+            "hold_max_ns": 6058333,
+            "hold_buckets": {
+              "le_1ms": 18,
+              "gt_1_le_2ms": 1,
+              "gt_2_le_5ms": 9,
+              "gt_5_le_10ms": 5,
+              "gt_10_le_20ms": 0,
+              "gt_20_le_50ms": 0,
+              "gt_50ms": 0
+            }
+          },
+          "gc_sweep_dbwrite": {
+            "calls": 2983,
+            "ns": 13601987756,
+            "max_ns": 14659625
+          },
+          "gc_relocation_chunk_read": {
+            "calls": 89327,
+            "ns": 8118973647,
+            "max_ns": 19341000
+          },
+          "gc_relocation_sync": {
+            "calls": 11220,
+            "ns": 1238384860,
+            "max_ns": 10181833
+          },
+          "gc_relocation_dbwrite": {
+            "calls": 11220,
+            "ns": 45364492123,
+            "max_ns": 52726875
+          },
+          "gc_retirement_dbwrite": {
+            "calls": 14,
+            "ns": 50219250,
+            "max_ns": 4996750
+          },
+          "root_get_calls": 213129,
+          "root_get_ns": 1038433070,
+          "root_misses": 183142,
+          "root_cache_hits": 206122,
+          "object_get_calls": 374806,
+          "object_get_ns": 11269174320,
+          "object_misses": 186114,
+          "meta_get_calls": 8,
+          "meta_get_ns": 6831,
+          "object_cache_hits": 1158517,
+          "object_cache_misses": 186241,
+          "object_cache_charge": 4297194
+        }
+      },
+      "sampled_pressure_reports": 0
+    },
+    "batch": {
+      "commit": "1372e21",
+      "artifact": "build/gc-tail-batch/seed-20261028-1bl2kioe",
+      "settings": {
+        "binary": "/Users/hurricane/private/code/forks.world/forkfs-gc-budget/build/gc-budget/daemon/forkfsd",
+        "output": "build/gc-tail-batch",
+        "seed": 20261028,
+        "files": 16,
+        "file_bytes": 1024,
+        "rounds": 10,
+        "workers": 2,
+        "steps": 350,
+        "seconds": 0,
+        "sample_interval": 0.5,
+        "max_store_mib": 256,
+        "max_rpcs": 1000000,
+        "max_artifact_mib": 1024,
+        "deadline": 600.0,
+        "gc_work": 128,
+        "gc_copy_bytes": 1048576,
+        "gc_objects": 128,
+        "gc_mode": "concurrent",
+        "restart_every": 1,
+        "pid": 46343,
+        "binary_sha256": "ed470e869482a8583f0f56022c044382c909b1b0914dd93e08bbc7137c6db16c",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "python": "3.9.6",
+        "transport": "resident Unix RPC; one connection per operation",
+        "cache": "OS caches not flushed; service restarts reset daemon caches",
+        "scope": "synthetic development I/O; no mounted git/compiler execution",
+        "harness_sha256": {
+          "developer_soak.py": "f39b9213ae2b1619f8649658392045ee2c1e1ef63b987fd58a1c97b116e4abf8",
+          "developer_workload.py": "07367d758c2d6f01d9149220a529f83e6f769e04cbb424e1199c68700b249f49"
+        },
+        "worker_revision_pattern": "r{generation}w{worker}",
+        "revision_policy": "retain all; no revision deletion API is used"
+      },
+      "state": "passed",
+      "elapsed_seconds": 230.740003709,
+      "development_latency": {
+        "status": {
+          "count": 10,
+          "p50_ms": 0.0591665,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 0.104042
+        },
+        "gc-status": {
+          "count": 612,
+          "p50_ms": 7.602292,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 133.889542
+        },
+        "fs-fork": {
+          "count": 2,
+          "p50_ms": 25.2901255,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 27.178167
+        },
+        "fs-save": {
+          "count": 1000,
+          "p50_ms": 10.569125,
+          "p95_ms": 23.675125,
+          "p99_ms": 32.641416,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 114.873875
+        },
+        "fs-cat": {
+          "count": 7420,
+          "p50_ms": 2.754875,
+          "p95_ms": 12.557584,
+          "p99_ms": 19.398417,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 152.962542
+        },
+        "fs-write-at": {
+          "count": 1000,
+          "p50_ms": 10.637625,
+          "p95_ms": 21.858417,
+          "p99_ms": 35.216875,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 175.858583
+        },
+        "fs-append": {
+          "count": 1000,
+          "p50_ms": 9.9941035,
+          "p95_ms": 20.352958,
+          "p99_ms": 31.716959,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 162.4765
+        },
+        "fs-truncate": {
+          "count": 1000,
+          "p50_ms": 10.4121045,
+          "p95_ms": 21.649875,
+          "p99_ms": 28.388625,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 168.45375
+        },
+        "fs-rename": {
+          "count": 1000,
+          "p50_ms": 10.722541,
+          "p95_ms": 21.960125,
+          "p99_ms": 31.588375,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 187.117
+        },
+        "fs-write": {
+          "count": 1080,
+          "p50_ms": 13.966708,
+          "p95_ms": 25.998083,
+          "p99_ms": 39.505042,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 106.219292
+        },
+        "fs-chmod": {
+          "count": 1000,
+          "p50_ms": 10.098833,
+          "p95_ms": 22.015542,
+          "p99_ms": 31.694292,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 179.896708
+        },
+        "fs-unlink": {
+          "count": 120,
+          "p50_ms": 9.1306875,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 118.773167
+        },
+        "fs-mkdir": {
+          "count": 20,
+          "p50_ms": 15.8506875,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 33.352375
+        },
+        "fs-rmdir": {
+          "count": 20,
+          "p50_ms": 12.80925,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 26.655791
+        },
+        "fs-link": {
+          "count": 20,
+          "p50_ms": 9.031667,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 31.327583
+        },
+        "fs-stat": {
+          "count": 60,
+          "p50_ms": 5.3421455,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 22.930584
+        },
+        "session-open": {
+          "count": 20,
+          "p50_ms": 4.2672705,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 13.713333
+        },
+        "fs-open": {
+          "count": 40,
+          "p50_ms": 2.4387915,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 19.116209
+        },
+        "fs-hlock": {
+          "count": 60,
+          "p50_ms": 0.48,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 19.639083
+        },
+        "fs-hstat": {
+          "count": 20,
+          "p50_ms": 1.17,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 11.69675
+        },
+        "fs-hwrite": {
+          "count": 20,
+          "p50_ms": 9.723021,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 20.183709
+        },
+        "fs-hread": {
+          "count": 20,
+          "p50_ms": 0.8610835,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 8.651083
+        },
+        "fs-close": {
+          "count": 40,
+          "p50_ms": 3.812437,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 123.771666
+        },
+        "session-close": {
+          "count": 20,
+          "p50_ms": 0.3912915,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 9.552625
+        },
+        "fs-symlink": {
+          "count": 20,
+          "p50_ms": 11.074667,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 27.334666
+        },
+        "fs-readlink": {
+          "count": 20,
+          "p50_ms": 2.1559375,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 8.205125
+        },
+        "fs-snapshot": {
+          "count": 20,
+          "p50_ms": 6.163375,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 17.236417
+        },
+        "fs-lstat": {
+          "count": 480,
+          "p50_ms": 0.23325,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 11.894916
+        },
+        "fs-ls": {
+          "count": 120,
+          "p50_ms": 0.3342085,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 16.774791
+        },
+        "fs-restore": {
+          "count": 18,
+          "p50_ms": 9.2923125,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 16.421208
+        }
+      },
+      "sampled_storage_peaks": {
+        "allocated_bytes": 128819200,
+        "segment_bytes": 45389464,
+        "index_bytes": 80118235,
+        "control_bytes": 460,
+        "mark_scratch_bytes": 20863234,
+        "physical_scratch_bytes": 21422362,
+        "scratch_allocated_bytes": 33402880,
+        "artifact_allocated_bytes": 136331264,
+        "artifact_apparent_bytes": 131406683
+      },
+      "pre_backup_gc_storage": {
+        "before": {
+          "apparent_bytes": 98662045,
+          "allocated_bytes": 104005632,
+          "segment_bytes": 32460394,
+          "index_bytes": 45884712,
+          "scratch_bytes": 20316939,
+          "mark_scratch_bytes": 11750850,
+          "physical_scratch_bytes": 8566089,
+          "scratch_allocated_bytes": 20471808,
+          "control_bytes": 0,
+          "files": 58,
+          "stage": "pre-backup-gc-before",
+          "live_main_bytes": 28717,
+          "unique_reachable_payload_bytes": 41920,
+          "modeled_worlds": 3,
+          "fork_probe_worlds": 0,
+          "retained_revisions": 21,
+          "last_committed_seq": 7378,
+          "indexed_objects": 166468,
+          "submitted_payload_bytes": 3066104,
+          "mutation_requests": 7365,
+          "delta_commits": 0,
+          "delta_segment_bytes": 0,
+          "segment_bytes_per_commit": null,
+          "delta_allocated_bytes": 0,
+          "segment_to_reachable_payload_ratio": 774.3414599236642
+        },
+        "after": {
+          "apparent_bytes": 35555612,
+          "allocated_bytes": 35614720,
+          "segment_bytes": 869832,
+          "index_bytes": 34685780,
+          "scratch_bytes": 0,
+          "mark_scratch_bytes": 0,
+          "physical_scratch_bytes": 0,
+          "scratch_allocated_bytes": 0,
+          "control_bytes": 0,
+          "files": 27,
+          "stage": "pre-backup-gc-after",
+          "live_main_bytes": 28717,
+          "unique_reachable_payload_bytes": 41920,
+          "modeled_worlds": 3,
+          "fork_probe_worlds": 0,
+          "retained_revisions": 21,
+          "last_committed_seq": 7378,
+          "indexed_objects": 4770,
+          "submitted_payload_bytes": 3066104,
+          "mutation_requests": 7365,
+          "delta_commits": 0,
+          "delta_segment_bytes": -31590562,
+          "segment_bytes_per_commit": null,
+          "delta_allocated_bytes": -68390912,
+          "segment_to_reachable_payload_ratio": 20.749809160305343
+        },
+        "drain_seconds": 93.061279875,
+        "observed_net_segment_reclaimed_bytes_per_second": 339459.7843746881,
+        "observed_allocated_delta_bytes": -68390912,
+        "observed_segment_delta_bytes": -31590562,
+        "observed_allocated_reduction_bytes": 68390912,
+        "observed_segment_reduction_bytes": 31590562,
+        "interpretation": "observed sample delta; storage is not expected to shrink monotonically"
+      },
+      "gc_retention_status": {
+        "state": "blocked",
+        "active": false,
+        "steps": 122,
+        "last_step": {
+          "metadata_budget_bytes": 67108864,
+          "metadata_bytes_charged": 32768,
+          "mark_work_done": 0,
+          "mark_processed": 0,
+          "mark_pending": false,
+          "mark_phase": "complete",
+          "physical_work_done": 4,
+          "physical_index_work": 0,
+          "physical_reference_work": 0,
+          "physical_candidate_work": 0,
+          "physical_pending": false,
+          "physical_phase": "complete",
+          "objects_deleted": 0,
+          "chunks_deleted": 0,
+          "chunks_moved": 0,
+          "bytes_copied": 0,
+          "segments_deleted": 0,
+          "pending_segments": 0,
+          "logical_sweep_skipped": true,
+          "sequence": 8114
+        },
+        "error": ""
+      },
+      "retained_revision_counts": [
+        {
+          "round": 0,
+          "generation": 0,
+          "retained_revisions": 3
+        },
+        {
+          "round": 1,
+          "generation": 1,
+          "retained_revisions": 5
+        },
+        {
+          "round": 2,
+          "generation": 2,
+          "retained_revisions": 7
+        },
+        {
+          "round": 3,
+          "generation": 3,
+          "retained_revisions": 9
+        },
+        {
+          "round": 4,
+          "generation": 4,
+          "retained_revisions": 11
+        },
+        {
+          "round": 5,
+          "generation": 5,
+          "retained_revisions": 13
+        },
+        {
+          "round": 6,
+          "generation": 6,
+          "retained_revisions": 15
+        },
+        {
+          "round": 7,
+          "generation": 7,
+          "retained_revisions": 17
+        },
+        {
+          "round": 8,
+          "generation": 8,
+          "retained_revisions": 19
+        },
+        {
+          "round": 9,
+          "generation": 9,
+          "retained_revisions": 21
+        },
+        {
+          "round": 10,
+          "generation": 10,
+          "retained_revisions": 23
+        }
+      ],
+      "replayed_storage": {
+        "base-replayed": {
+          "apparent_bytes": 2358418,
+          "allocated_bytes": 2375680,
+          "segment_bytes": 869832,
+          "index_bytes": 1488586,
+          "scratch_bytes": 0,
+          "mark_scratch_bytes": 0,
+          "physical_scratch_bytes": 0,
+          "scratch_allocated_bytes": 0,
+          "control_bytes": 0,
+          "files": 7
+        },
+        "final-replayed": {
+          "apparent_bytes": 10713944,
+          "allocated_bytes": 10731520,
+          "segment_bytes": 4272396,
+          "index_bytes": 6441548,
+          "scratch_bytes": 0,
+          "mark_scratch_bytes": 0,
+          "physical_scratch_bytes": 0,
+          "scratch_allocated_bytes": 0,
+          "control_bytes": 0,
+          "files": 8
+        }
+      },
+      "final_source": [
+        {
+          "apparent_bytes": 22356701,
+          "allocated_bytes": 24403968,
+          "segment_bytes": 4272636,
+          "index_bytes": 18083605,
+          "scratch_bytes": 0,
+          "mark_scratch_bytes": 0,
+          "physical_scratch_bytes": 0,
+          "scratch_allocated_bytes": 0,
+          "control_bytes": 460,
+          "files": 23,
+          "stage": "final-source",
+          "live_main_bytes": 28717,
+          "unique_reachable_payload_bytes": 42878,
+          "modeled_worlds": 3,
+          "fork_probe_worlds": 0,
+          "retained_revisions": 23,
+          "last_committed_seq": 8114,
+          "indexed_objects": 22226,
+          "submitted_payload_bytes": 3370083,
+          "mutation_requests": 8099,
+          "delta_commits": 0,
+          "delta_segment_bytes": 0,
+          "segment_bytes_per_commit": null,
+          "delta_allocated_bytes": -487424,
+          "segment_to_reachable_payload_ratio": 99.64634544521667
+        }
+      ],
+      "storage_profile_final": {
+        "metadata_prepare_ns": 5087491306,
+        "storage_metrics": {
+          "transactions": 8114,
+          "prepare_ns": 1349153011,
+          "write_ns": 55328605649,
+          "wal_sync_calls": 22196,
+          "wal_sync_ns": 91903598841,
+          "other_sync_calls": 426,
+          "other_sync_ns": 2612235169,
+          "wal_append_bytes": 84401334,
+          "wal_append_ns": 14720117,
+          "wal_flush_ns": 1846452960,
+          "data_prepare_calls": 8115,
+          "data_prepare_ns": 8733818022,
+          "data_prepare_max_ns": 53300750,
+          "data_sync_calls": 8115,
+          "data_sync_ns": 1382918224,
+          "data_sync_max_ns": 22434625,
+          "metadata_publish_calls": 8115,
+          "metadata_publish_ns": 37509191590,
+          "metadata_publish_max_ns": 42060541,
+          "gc_barrier_calls": 7353,
+          "gc_barrier_ns": 7678812778,
+          "gc_barrier_max_ns": 175665167,
+          "gc_foreground_wait_ns": 4630080283,
+          "gc_foreground_hold_ns": 5369902079,
+          "gc_advance_wait_ns": 2076324481,
+          "gc_advance_hold_ns": 46259571699,
+          "foreground_writer": {
+            "wait_calls": 8114,
+            "wait_ns": 1038216968,
+            "wait_max_ns": 18465500,
+            "hold_calls": 8114,
+            "hold_ns": 56470410991,
+            "hold_max_ns": 178426542,
+            "hold_buckets": {
+              "le_1ms": 0,
+              "gt_1_le_2ms": 9,
+              "gt_2_le_5ms": 2433,
+              "gt_5_le_10ms": 4524,
+              "gt_10_le_20ms": 1088,
+              "gt_20_le_50ms": 37,
+              "gt_50ms": 23
+            }
+          },
+          "gc_writer_sweep": {
+            "wait_calls": 68176,
+            "wait_ns": 31768094,
+            "wait_max_ns": 9182750,
+            "hold_calls": 68176,
+            "hold_ns": 21273104935,
+            "hold_max_ns": 22194500,
+            "hold_buckets": {
+              "le_1ms": 64739,
+              "gt_1_le_2ms": 10,
+              "gt_2_le_5ms": 1494,
+              "gt_5_le_10ms": 1808,
+              "gt_10_le_20ms": 124,
+              "gt_20_le_50ms": 1,
+              "gt_50ms": 0
+            }
+          },
+          "gc_writer_relocate": {
+            "wait_calls": 11109,
+            "wait_ns": 1454236488,
+            "wait_max_ns": 17097959,
+            "hold_calls": 11109,
+            "hold_ns": 55389114557,
+            "hold_max_ns": 38964375,
+            "hold_buckets": {
+              "le_1ms": 0,
+              "gt_1_le_2ms": 9,
+              "gt_2_le_5ms": 7065,
+              "gt_5_le_10ms": 3988,
+              "gt_10_le_20ms": 45,
+              "gt_20_le_50ms": 2,
+              "gt_50ms": 0
+            }
+          },
+          "gc_writer_retire": {
+            "wait_calls": 33,
+            "wait_ns": 7650419,
+            "wait_max_ns": 4021875,
+            "hold_calls": 33,
+            "hold_ns": 76599376,
+            "hold_max_ns": 7458625,
+            "hold_buckets": {
+              "le_1ms": 17,
+              "gt_1_le_2ms": 0,
+              "gt_2_le_5ms": 9,
+              "gt_5_le_10ms": 7,
+              "gt_10_le_20ms": 0,
+              "gt_20_le_50ms": 0,
+              "gt_50ms": 0
+            }
+          },
+          "gc_sweep_dbwrite": {
+            "calls": 2958,
+            "ns": 13542095339,
+            "max_ns": 20358125
+          },
+          "gc_relocation_chunk_read": {
+            "calls": 88444,
+            "ns": 7027121072,
+            "max_ns": 7946917
+          },
+          "gc_relocation_sync": {
+            "calls": 11109,
+            "ns": 1276764597,
+            "max_ns": 11564750
+          },
+          "gc_relocation_dbwrite": {
+            "calls": 11109,
+            "ns": 43985050045,
+            "max_ns": 37958333
+          },
+          "gc_retirement_dbwrite": {
+            "calls": 14,
+            "ns": 53024042,
+            "max_ns": 5229375
+          },
+          "root_get_calls": 211047,
+          "root_get_ns": 952252879,
+          "root_misses": 181365,
+          "root_cache_hits": 204197,
+          "object_get_calls": 371252,
+          "object_get_ns": 10733109924,
+          "object_misses": 184337,
+          "meta_get_calls": 8,
+          "meta_get_ns": 8416,
+          "object_cache_hits": 1141850,
+          "object_cache_misses": 184464,
+          "object_cache_charge": 4488749
+        }
+      },
+      "sampled_pressure_reports": 0
+    },
+    "pressure": {
+      "commit": "4f9ce13",
+      "artifact": "build/gc-tail-pressure/seed-20261028-3tw6idwu",
+      "settings": {
+        "binary": "/Users/hurricane/private/code/forks.world/forkfs-gc-budget/build/gc-budget/daemon/forkfsd",
+        "output": "build/gc-tail-pressure",
+        "seed": 20261028,
+        "files": 16,
+        "file_bytes": 1024,
+        "rounds": 10,
+        "workers": 2,
+        "steps": 350,
+        "seconds": 0,
+        "sample_interval": 0.5,
+        "max_store_mib": 256,
+        "max_rpcs": 1000000,
+        "max_artifact_mib": 1024,
+        "deadline": 600.0,
+        "gc_work": 128,
+        "gc_copy_bytes": 1048576,
+        "gc_objects": 128,
+        "gc_mode": "concurrent",
+        "restart_every": 1,
+        "pid": 49654,
+        "binary_sha256": "6f17db8382ca261350821e3a135c8c0274752bc3f18734b73d0c7b8a2165fd1e",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "python": "3.9.6",
+        "transport": "resident Unix RPC; one connection per operation",
+        "cache": "OS caches not flushed; service restarts reset daemon caches",
+        "scope": "synthetic development I/O; no mounted git/compiler execution",
+        "harness_sha256": {
+          "developer_soak.py": "f39b9213ae2b1619f8649658392045ee2c1e1ef63b987fd58a1c97b116e4abf8",
+          "developer_workload.py": "07367d758c2d6f01d9149220a529f83e6f769e04cbb424e1199c68700b249f49"
+        },
+        "worker_revision_pattern": "r{generation}w{worker}",
+        "revision_policy": "retain all; no revision deletion API is used"
+      },
+      "state": "passed",
+      "elapsed_seconds": 224.618109833,
+      "development_latency": {
+        "status": {
+          "count": 10,
+          "p50_ms": 0.062583,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 0.557541
+        },
+        "gc-status": {
+          "count": 568,
+          "p50_ms": 7.619979,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 157.223167
+        },
+        "fs-fork": {
+          "count": 2,
+          "p50_ms": 25.5642915,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 29.936458
+        },
+        "fs-save": {
+          "count": 1000,
+          "p50_ms": 9.1025415,
+          "p95_ms": 22.047959,
+          "p99_ms": 27.482917,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 149.144792
+        },
+        "fs-cat": {
+          "count": 7420,
+          "p50_ms": 3.1175835,
+          "p95_ms": 11.717959,
+          "p99_ms": 18.170875,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 160.666209
+        },
+        "fs-write-at": {
+          "count": 1000,
+          "p50_ms": 10.151229,
+          "p95_ms": 20.67775,
+          "p99_ms": 26.414667,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 115.906917
+        },
+        "fs-append": {
+          "count": 1000,
+          "p50_ms": 9.3559165,
+          "p95_ms": 19.17125,
+          "p99_ms": 23.851291,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 92.401667
+        },
+        "fs-truncate": {
+          "count": 1000,
+          "p50_ms": 9.9756875,
+          "p95_ms": 19.944667,
+          "p99_ms": 26.333125,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 138.737083
+        },
+        "fs-rename": {
+          "count": 1000,
+          "p50_ms": 11.0113545,
+          "p95_ms": 22.201292,
+          "p99_ms": 31.181584,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 189.995041
+        },
+        "fs-write": {
+          "count": 1080,
+          "p50_ms": 14.0187705,
+          "p95_ms": 26.108584,
+          "p99_ms": 37.166875,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 180.941792
+        },
+        "fs-chmod": {
+          "count": 1000,
+          "p50_ms": 9.923396,
+          "p95_ms": 21.3635,
+          "p99_ms": 31.406792,
+          "p95_status": "reported",
+          "p99_status": "reported",
+          "tail_min_samples": 1000,
+          "max_ms": 112.578042
+        },
+        "fs-unlink": {
+          "count": 120,
+          "p50_ms": 9.150812,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 191.628916
+        },
+        "fs-mkdir": {
+          "count": 20,
+          "p50_ms": 12.971041,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 29.501958
+        },
+        "fs-rmdir": {
+          "count": 20,
+          "p50_ms": 12.272521,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 22.741792
+        },
+        "fs-link": {
+          "count": 20,
+          "p50_ms": 11.9183545,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 25.209833
+        },
+        "fs-stat": {
+          "count": 60,
+          "p50_ms": 5.258833,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 191.997958
+        },
+        "session-open": {
+          "count": 20,
+          "p50_ms": 5.166646,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 13.588333
+        },
+        "fs-open": {
+          "count": 40,
+          "p50_ms": 2.5010415,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 15.869583
+        },
+        "fs-hlock": {
+          "count": 60,
+          "p50_ms": 0.4258545,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 13.316666
+        },
+        "fs-hstat": {
+          "count": 20,
+          "p50_ms": 3.4670835,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 9.718291
+        },
+        "fs-hwrite": {
+          "count": 20,
+          "p50_ms": 6.491646,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 17.524916
+        },
+        "fs-hread": {
+          "count": 20,
+          "p50_ms": 0.7387295,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 13.758666
+        },
+        "fs-close": {
+          "count": 40,
+          "p50_ms": 4.2645835,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 21.322
+        },
+        "session-close": {
+          "count": 20,
+          "p50_ms": 0.8464995,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 9.0725
+        },
+        "fs-symlink": {
+          "count": 20,
+          "p50_ms": 9.835396,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 25.810833
+        },
+        "fs-readlink": {
+          "count": 20,
+          "p50_ms": 2.344646,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 11.241792
+        },
+        "fs-snapshot": {
+          "count": 20,
+          "p50_ms": 5.0844165,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 11.844875
+        },
+        "fs-lstat": {
+          "count": 480,
+          "p50_ms": 0.2614585,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 11.012375
+        },
+        "fs-ls": {
+          "count": 120,
+          "p50_ms": 0.422292,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 9.307709
+        },
+        "fs-restore": {
+          "count": 18,
+          "p50_ms": 8.045479,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 16.092667
+        },
+        "gc-start": {
+          "count": 3,
+          "p50_ms": 6.899542,
+          "p95_ms": null,
+          "p99_ms": null,
+          "p95_status": "insufficient_samples",
+          "p99_status": "insufficient_samples",
+          "tail_min_samples": 1000,
+          "max_ms": 6.978792
+        }
+      },
+      "sampled_storage_peaks": {
+        "allocated_bytes": 144986112,
+        "segment_bytes": 40437679,
+        "index_bytes": 87963948,
+        "control_bytes": 466,
+        "mark_scratch_bytes": 14594166,
+        "physical_scratch_bytes": 20965202,
+        "scratch_allocated_bytes": 28315648,
+        "artifact_allocated_bytes": 152104960,
+        "artifact_apparent_bytes": 151208945
+      },
+      "pre_backup_gc_storage": {
+        "before": {
+          "apparent_bytes": 138511052,
+          "allocated_bytes": 140455936,
+          "segment_bytes": 34076627,
+          "index_bytes": 84916157,
+          "scratch_bytes": 19518268,
+          "mark_scratch_bytes": 10953610,
+          "physical_scratch_bytes": 8564658,
+          "scratch_allocated_bytes": 19701760,
+          "control_bytes": 0,
+          "files": 78,
+          "stage": "pre-backup-gc-before",
+          "live_main_bytes": 28717,
+          "unique_reachable_payload_bytes": 41920,
+          "modeled_worlds": 3,
+          "fork_probe_worlds": 0,
+          "retained_revisions": 21,
+          "last_committed_seq": 7378,
+          "indexed_objects": 159760,
+          "submitted_payload_bytes": 3066104,
+          "mutation_requests": 7365,
+          "delta_commits": 0,
+          "delta_segment_bytes": 22305,
+          "segment_bytes_per_commit": null,
+          "delta_allocated_bytes": 0,
+          "segment_to_reachable_payload_ratio": 812.8966364503817
+        },
+        "after": {
+          "apparent_bytes": 41006553,
+          "allocated_bytes": 41668608,
+          "segment_bytes": 863715,
+          "index_bytes": 40142838,
+          "scratch_bytes": 0,
+          "mark_scratch_bytes": 0,
+          "physical_scratch_bytes": 0,
+          "scratch_allocated_bytes": 0,
+          "control_bytes": 0,
+          "files": 27,
+          "stage": "pre-backup-gc-after",
+          "live_main_bytes": 28717,
+          "unique_reachable_payload_bytes": 41920,
+          "modeled_worlds": 3,
+          "fork_probe_worlds": 0,
+          "retained_revisions": 21,
+          "last_committed_seq": 7378,
+          "indexed_objects": 4740,
+          "submitted_payload_bytes": 3066104,
+          "mutation_requests": 7365,
+          "delta_commits": 0,
+          "delta_segment_bytes": -33212912,
+          "segment_bytes_per_commit": null,
+          "delta_allocated_bytes": -98787328,
+          "segment_to_reachable_payload_ratio": 20.603888358778626
+        },
+        "drain_seconds": 94.28723429200001,
+        "observed_net_segment_reclaimed_bytes_per_second": 352252.4788153428,
+        "observed_allocated_delta_bytes": -98787328,
+        "observed_segment_delta_bytes": -33212912,
+        "observed_allocated_reduction_bytes": 98787328,
+        "observed_segment_reduction_bytes": 33212912,
+        "interpretation": "observed sample delta; storage is not expected to shrink monotonically"
+      },
+      "gc_retention_status": {
+        "state": "blocked",
+        "active": false,
+        "steps": 245,
+        "last_step": {
+          "metadata_budget_bytes": 67108864,
+          "metadata_bytes_charged": 32768,
+          "mark_work_done": 0,
+          "mark_processed": 0,
+          "mark_pending": false,
+          "mark_phase": "complete",
+          "physical_work_done": 72,
+          "physical_index_work": 29,
+          "physical_reference_work": 0,
+          "physical_candidate_work": 4,
+          "physical_pending": false,
+          "physical_phase": "complete",
+          "objects_deleted": 0,
+          "chunks_deleted": 0,
+          "chunks_moved": 0,
+          "bytes_copied": 0,
+          "segments_deleted": 0,
+          "pending_segments": 0,
+          "logical_sweep_skipped": true,
+          "foreground_pressure": false,
+          "sequence": 8114
+        },
+        "error": ""
+      },
+      "retained_revision_counts": [
+        {
+          "round": 0,
+          "generation": 0,
+          "retained_revisions": 3
+        },
+        {
+          "round": 1,
+          "generation": 1,
+          "retained_revisions": 5
+        },
+        {
+          "round": 2,
+          "generation": 2,
+          "retained_revisions": 7
+        },
+        {
+          "round": 3,
+          "generation": 3,
+          "retained_revisions": 9
+        },
+        {
+          "round": 4,
+          "generation": 4,
+          "retained_revisions": 11
+        },
+        {
+          "round": 5,
+          "generation": 5,
+          "retained_revisions": 13
+        },
+        {
+          "round": 6,
+          "generation": 6,
+          "retained_revisions": 15
+        },
+        {
+          "round": 7,
+          "generation": 7,
+          "retained_revisions": 17
+        },
+        {
+          "round": 8,
+          "generation": 8,
+          "retained_revisions": 19
+        },
+        {
+          "round": 9,
+          "generation": 9,
+          "retained_revisions": 21
+        },
+        {
+          "round": 10,
+          "generation": 10,
+          "retained_revisions": 23
+        }
+      ],
+      "replayed_storage": {
+        "base-replayed": {
+          "apparent_bytes": 2344204,
+          "allocated_bytes": 2359296,
+          "segment_bytes": 863715,
+          "index_bytes": 1480489,
+          "scratch_bytes": 0,
+          "mark_scratch_bytes": 0,
+          "physical_scratch_bytes": 0,
+          "scratch_allocated_bytes": 0,
+          "control_bytes": 0,
+          "files": 7
+        },
+        "final-replayed": {
+          "apparent_bytes": 10031109,
+          "allocated_bytes": 10047488,
+          "segment_bytes": 4004142,
+          "index_bytes": 6026967,
+          "scratch_bytes": 0,
+          "mark_scratch_bytes": 0,
+          "physical_scratch_bytes": 0,
+          "scratch_allocated_bytes": 0,
+          "control_bytes": 0,
+          "files": 8
+        }
+      },
+      "final_source": [
+        {
+          "apparent_bytes": 19148670,
+          "allocated_bytes": 22659072,
+          "segment_bytes": 4004286,
+          "index_bytes": 15143918,
+          "scratch_bytes": 0,
+          "mark_scratch_bytes": 0,
+          "physical_scratch_bytes": 0,
+          "scratch_allocated_bytes": 0,
+          "control_bytes": 466,
+          "files": 18,
+          "stage": "final-source",
+          "live_main_bytes": 28717,
+          "unique_reachable_payload_bytes": 42878,
+          "modeled_worlds": 3,
+          "fork_probe_worlds": 0,
+          "retained_revisions": 23,
+          "last_committed_seq": 8114,
+          "indexed_objects": 20891,
+          "submitted_payload_bytes": 3370083,
+          "mutation_requests": 8099,
+          "delta_commits": 0,
+          "delta_segment_bytes": 0,
+          "segment_bytes_per_commit": null,
+          "delta_allocated_bytes": 0,
+          "segment_to_reachable_payload_ratio": 93.38789122626989
+        }
+      ],
+      "storage_profile_final": {
+        "metadata_prepare_ns": 5741147019,
+        "storage_metrics": {
+          "transactions": 8114,
+          "prepare_ns": 1527190467,
+          "write_ns": 51133908442,
+          "wal_sync_calls": 20069,
+          "wal_sync_ns": 82109101062,
+          "other_sync_calls": 406,
+          "other_sync_ns": 2603646330,
+          "wal_append_bytes": 79965730,
+          "wal_append_ns": 15778338,
+          "wal_flush_ns": 1817427671,
+          "data_prepare_calls": 8115,
+          "data_prepare_ns": 8707705137,
+          "data_prepare_max_ns": 15013458,
+          "data_sync_calls": 8115,
+          "data_sync_ns": 1391469363,
+          "data_sync_max_ns": 6156875,
+          "metadata_publish_calls": 8115,
+          "metadata_publish_ns": 35963046268,
+          "metadata_publish_max_ns": 19465500,
+          "gc_barrier_calls": 7353,
+          "gc_barrier_ns": 5043006763,
+          "gc_barrier_max_ns": 185367541,
+          "gc_foreground_wait_ns": 2851387990,
+          "gc_foreground_hold_ns": 3988790588,
+          "gc_advance_wait_ns": 833978457,
+          "gc_advance_hold_ns": 31134757359,
+          "foreground_writer": {
+            "wait_calls": 8114,
+            "wait_ns": 23640112,
+            "wait_max_ns": 15963084,
+            "hold_calls": 8114,
+            "hold_ns": 52456038902,
+            "hold_max_ns": 190072708,
+            "hold_buckets": {
+              "le_1ms": 0,
+              "gt_1_le_2ms": 14,
+              "gt_2_le_5ms": 3299,
+              "gt_5_le_10ms": 3824,
+              "gt_10_le_20ms": 947,
+              "gt_20_le_50ms": 8,
+              "gt_50ms": 22
+            }
+          },
+          "gc_writer_sweep": {
+            "wait_calls": 66152,
+            "wait_ns": 40053034,
+            "wait_max_ns": 7268667,
+            "hold_calls": 66152,
+            "hold_ns": 20757466586,
+            "hold_max_ns": 38909250,
+            "hold_buckets": {
+              "le_1ms": 62895,
+              "gt_1_le_2ms": 56,
+              "gt_2_le_5ms": 1033,
+              "gt_5_le_10ms": 2047,
+              "gt_10_le_20ms": 118,
+              "gt_20_le_50ms": 3,
+              "gt_50ms": 0
+            }
+          },
+          "gc_writer_relocate": {
+            "wait_calls": 9093,
+            "wait_ns": 1044802,
+            "wait_max_ns": 2625,
+            "hold_calls": 9093,
+            "hold_ns": 45870124994,
+            "hold_max_ns": 32217167,
+            "hold_buckets": {
+              "le_1ms": 0,
+              "gt_1_le_2ms": 10,
+              "gt_2_le_5ms": 4496,
+              "gt_5_le_10ms": 4554,
+              "gt_10_le_20ms": 32,
+              "gt_20_le_50ms": 1,
+              "gt_50ms": 0
+            }
+          },
+          "gc_writer_retire": {
+            "wait_calls": 33,
+            "wait_ns": 3081,
+            "wait_max_ns": 167,
+            "hold_calls": 33,
+            "hold_ns": 81874709,
+            "hold_max_ns": 7798542,
+            "hold_buckets": {
+              "le_1ms": 15,
+              "gt_1_le_2ms": 0,
+              "gt_2_le_5ms": 11,
+              "gt_5_le_10ms": 7,
+              "gt_10_le_20ms": 0,
+              "gt_20_le_50ms": 0,
+              "gt_50ms": 0
+            }
+          },
+          "gc_sweep_dbwrite": {
+            "calls": 2845,
+            "ns": 13332695154,
+            "max_ns": 35357667
+          },
+          "gc_relocation_chunk_read": {
+            "calls": 72344,
+            "ns": 6278691660,
+            "max_ns": 26907417
+          },
+          "gc_relocation_sync": {
+            "calls": 9093,
+            "ns": 913229837,
+            "max_ns": 3683959
+          },
+          "gc_relocation_dbwrite": {
+            "calls": 9093,
+            "ns": 36033209129,
+            "max_ns": 18410458
+          },
+          "gc_retirement_dbwrite": {
+            "calls": 16,
+            "ns": 62037917,
+            "max_ns": 5356083
+          },
+          "root_get_calls": 203654,
+          "root_get_ns": 1173034934,
+          "root_misses": 173360,
+          "root_cache_hits": 196357,
+          "object_get_calls": 355239,
+          "object_get_ns": 11393695022,
+          "object_misses": 176332,
+          "meta_get_calls": 8,
+          "meta_get_ns": 9417,
+          "object_cache_hits": 982966,
+          "object_cache_misses": 176456,
+          "object_cache_charge": 4196685
+        }
+      },
+      "sampled_pressure_reports": 618
+    }
+  },
+  "matched_workload": {
+    "harness_sha256": {
+      "developer_soak.py": "f39b9213ae2b1619f8649658392045ee2c1e1ef63b987fd58a1c97b116e4abf8",
+      "developer_workload.py": "07367d758c2d6f01d9149220a529f83e6f769e04cbb424e1199c68700b249f49"
+    },
+    "python": "3.9.6",
+    "seed": 20261028,
+    "files": 16,
+    "file_bytes": 1024,
+    "rounds": 10,
+    "workers": 2,
+    "steps": 350,
+    "seconds": 0,
+    "sample_interval": 0.5,
+    "gc_work": 128,
+    "gc_copy_bytes": 1048576,
+    "gc_objects": 128,
+    "max_store_mib": 256,
+    "max_artifact_mib": 1024,
+    "max_rpcs": 1000000,
+    "deadline": 600.0
+  },
+  "matched_retained_model": {
+    "unique_reachable_payload_bytes": 41920,
+    "modeled_worlds": 3,
+    "retained_revisions": 21,
+    "last_committed_seq": 7378
+  },
+  "matched_foreground_counts": {
+    "fs-fork": 2,
+    "fs-save": 1000,
+    "fs-cat": 7420,
+    "fs-write-at": 1000,
+    "fs-append": 1000,
+    "fs-truncate": 1000,
+    "fs-rename": 1000,
+    "fs-write": 1080,
+    "fs-chmod": 1000,
+    "fs-unlink": 120,
+    "fs-mkdir": 20,
+    "fs-rmdir": 20,
+    "fs-link": 20,
+    "fs-stat": 60,
+    "session-open": 20,
+    "fs-open": 40,
+    "fs-hlock": 60,
+    "fs-hstat": 20,
+    "fs-hwrite": 20,
+    "fs-hread": 20,
+    "fs-close": 40,
+    "session-close": 20,
+    "fs-symlink": 20,
+    "fs-readlink": 20,
+    "fs-snapshot": 20,
+    "fs-lstat": 480,
+    "fs-ls": 120,
+    "fs-restore": 18
+  },
+  "control": {
+    "artifact": "build/gc-tail-control/seed-20261028-5t3nm7go",
+    "settings": {
+      "binary": "/Users/hurricane/private/code/forks.world/forkfs-gc-budget/build/gc-budget/daemon/forkfsd",
+      "output": "build/gc-tail-control",
+      "seed": 20261028,
+      "files": 16,
+      "file_bytes": 1024,
+      "rounds": 10,
+      "workers": 2,
+      "steps": 350,
+      "seconds": 0,
+      "sample_interval": 0.5,
+      "max_store_mib": 256,
+      "max_rpcs": 1000000,
+      "max_artifact_mib": 1024,
+      "deadline": 600.0,
+      "gc_work": 128,
+      "gc_copy_bytes": 1048576,
+      "gc_objects": 128,
+      "gc_mode": "disabled",
+      "restart_every": 1,
+      "pid": 70007,
+      "binary_sha256": "6f17db8382ca261350821e3a135c8c0274752bc3f18734b73d0c7b8a2165fd1e",
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "python": "3.9.6",
+      "transport": "resident Unix RPC; one connection per operation",
+      "cache": "OS caches not flushed; service restarts reset daemon caches",
+      "scope": "synthetic development I/O; no mounted git/compiler execution",
+      "harness_sha256": {
+        "developer_soak.py": "f39b9213ae2b1619f8649658392045ee2c1e1ef63b987fd58a1c97b116e4abf8",
+        "developer_workload.py": "07367d758c2d6f01d9149220a529f83e6f769e04cbb424e1199c68700b249f49"
+      },
+      "worker_revision_pattern": "r{generation}w{worker}",
+      "revision_policy": "retain all; no revision deletion API is used"
+    },
+    "state": "passed",
+    "elapsed_seconds": 178.31493079199998,
+    "development_save_latency": {
+      "count": 1000,
+      "p50_ms": 8.5752085,
+      "p95_ms": 14.968542,
+      "p99_ms": 16.669541,
+      "p95_status": "reported",
+      "p99_status": "reported",
+      "tail_min_samples": 1000,
+      "max_ms": 18.997041
+    },
+    "sampled_storage_peaks": {
+      "allocated_bytes": 177172480,
+      "segment_bytes": 34492674,
+      "index_bytes": 142426801,
+      "control_bytes": 464,
+      "mark_scratch_bytes": 0,
+      "physical_scratch_bytes": 0,
+      "scratch_allocated_bytes": 0,
+      "artifact_allocated_bytes": 527323136,
+      "artifact_apparent_bytes": 510609666
+    },
+    "replayed_storage": {
+      "base-replayed": {
+        "apparent_bytes": 93039066,
+        "allocated_bytes": 93261824,
+        "segment_bytes": 31418714,
+        "index_bytes": 61620352,
+        "scratch_bytes": 0,
+        "mark_scratch_bytes": 0,
+        "physical_scratch_bytes": 0,
+        "scratch_allocated_bytes": 0,
+        "control_bytes": 0,
+        "files": 32
+      },
+      "final-replayed": {
+        "apparent_bytes": 96561648,
+        "allocated_bytes": 96874496,
+        "segment_bytes": 34492674,
+        "index_bytes": 62068974,
+        "scratch_bytes": 0,
+        "mark_scratch_bytes": 0,
+        "physical_scratch_bytes": 0,
+        "scratch_allocated_bytes": 0,
+        "control_bytes": 0,
+        "files": 32
+      }
+    },
+    "final_source": [
+      {
+        "apparent_bytes": 176919939,
+        "allocated_bytes": 177172480,
+        "segment_bytes": 34492674,
+        "index_bytes": 142426801,
+        "scratch_bytes": 0,
+        "mark_scratch_bytes": 0,
+        "physical_scratch_bytes": 0,
+        "scratch_allocated_bytes": 0,
+        "control_bytes": 464,
+        "files": 80,
+        "stage": "final-source",
+        "live_main_bytes": 28717,
+        "unique_reachable_payload_bytes": 42878,
+        "modeled_worlds": 3,
+        "fork_probe_worlds": 0,
+        "retained_revisions": 23,
+        "last_committed_seq": 8114,
+        "indexed_objects": 177552,
+        "submitted_payload_bytes": 3370083,
+        "mutation_requests": 8099,
+        "delta_commits": 0,
+        "delta_segment_bytes": 0,
+        "segment_bytes_per_commit": null,
+        "delta_allocated_bytes": 0,
+        "segment_to_reachable_payload_ratio": 804.437567050702
+      }
+    ]
+  },
+  "validation": {
+    "full_ctest_total": 116,
+    "full_ctest_passed": 116,
+    "elapsed_seconds": 571.58
+  }
+}

@@ -155,6 +155,14 @@ void interrupted_cycle(const std::string& path) {
     std::filesystem::create_directory_symlink(outside,scratch);
     {LevelStore s(path);s.verify();}
     CHECK(!std::filesystem::exists(scratch));CHECK(std::filesystem::exists(outside/"keep"));
+    auto physical=std::filesystem::path(path)/".gc-physical-abandoned";
+    std::filesystem::create_directory(physical);
+    {std::ofstream corrupt(physical/"corrupt",std::ios::binary);corrupt<<"untrusted partial physical index";}
+    {LevelStore s(path);CHECK(!std::filesystem::exists(physical));converge(s);s.verify();}
+    physical=std::filesystem::path(path)/".gc-physical-symlink";
+    std::filesystem::create_directory_symlink(outside,physical);
+    {LevelStore s(path);CHECK(!std::filesystem::exists(physical));CHECK(std::filesystem::exists(outside/"keep"));s.verify();}
+
     std::filesystem::remove_all(outside);
 }
 }

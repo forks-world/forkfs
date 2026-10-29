@@ -31,7 +31,7 @@ def summarize(workload, side, values):
             "p95_status": "reported" if enough_samples else "insufficient_samples"}
 
 
-def run_git(path, *args, env=None):
+def run_git(path, *args, env=None, timeout=120, capture_output=False):
     clean_env = dict(env if env is not None else os.environ)
     identity = {key: clean_env[key] for key in (
         "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"
@@ -40,8 +40,10 @@ def run_git(path, *args, env=None):
     clean_env.update(identity)
     clean_env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
                       "GIT_TEMPLATE_DIR": "/dev/null"})
-    subprocess.run(["git", "-C", str(path), *args], check=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=clean_env)
+    return subprocess.run(["git", "-C", str(path), *args], check=True,
+                          stdout=subprocess.PIPE if capture_output else subprocess.DEVNULL,
+                          stderr=subprocess.PIPE, env=clean_env, text=capture_output,
+                          timeout=timeout() if callable(timeout) else timeout)
 
 
 def inside(path, parent):
@@ -52,7 +54,7 @@ def inside(path, parent):
         return False
 
 
-def create_workspace(root, token, files):
+def create_workspace(root, token, files, *, command_timeout=120):
     name = f".forkfs-perf-{token}"
     path = root / name
     path.mkdir(mode=0o700)  # exclusive: never reuse or overwrite an existing workspace
@@ -62,14 +64,16 @@ def create_workspace(root, token, files):
         (path / "tracked").mkdir()
         payload = (b"forkfs mounted filesystem benchmark fixture\n" * 16)[:512]
         for i in range(files):
+            if callable(command_timeout) and i % 64 == 0:
+                command_timeout()
             (path / "tracked" / f"file-{i:05d}.txt").write_bytes(payload)
         git_env = os.environ.copy()
         git_env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
                         "GIT_AUTHOR_NAME": "forkfs benchmark", "GIT_AUTHOR_EMAIL": "bench@example.invalid",
                         "GIT_COMMITTER_NAME": "forkfs benchmark", "GIT_COMMITTER_EMAIL": "bench@example.invalid"})
-        run_git(path, "init", "-q", "--template=/dev/null", env=git_env)
-        run_git(path, "add", "tracked", env=git_env)
-        run_git(path, "commit", "-q", "-m", "benchmark fixture", env=git_env)
+        run_git(path, "init", "-q", "--template=/dev/null", env=git_env, timeout=command_timeout)
+        run_git(path, "add", "tracked", env=git_env, timeout=command_timeout)
+        run_git(path, "commit", "-q", "-m", "benchmark fixture", env=git_env, timeout=command_timeout)
     except BaseException:
         safe_cleanup(path, root, token)
         raise

@@ -87,6 +87,7 @@ jobs:
             build/ci/Testing/Temporary/*.log
             build/ci/safety.log
             build/ci/disk-full.log
+            build/ci/developer-workload-artifacts/
 
   linux:
     name: Release (Linux ${{ matrix.label }})

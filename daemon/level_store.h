@@ -13,6 +13,7 @@ class ObjectStore;
 struct RepositoryOwner;
 namespace replay {struct Batch;}
 struct GcCycle;
+struct GcPhysical;
 class LevelStore {
 public:
     static void create(const std::string& path);
@@ -83,6 +84,7 @@ private:
     mutable std::map<std::string,RootFact> root_cache_;
     std::atomic<uint64_t> sequence_=0,objects_=0,roots_=0;
     std::atomic<bool> poisoned_=false;
+    std::atomic<uint64_t> foreground_demand_=0;
     struct PinState {
         mutable std::mutex mutex; size_t logical=0,locations=0;
         std::map<std::array<unsigned char,32>,size_t> manifests;
@@ -94,6 +96,7 @@ private:
     LocationPin pin_locations() const;
     mutable std::mutex gc_mutex_;
     mutable std::shared_ptr<GcCycle> gc_cycle_; // publication and lifecycle guarded by writer_mutex_
+    mutable std::shared_ptr<GcPhysical> gc_physical_; // protected by gc_mutex_
     mutable std::string gc_error_;
     std::string path_;
     std::string repository_;

@@ -69,13 +69,13 @@ to each repository, not the sum of all artifacts.
 
 `summary.json` reports count, p50 and max for successful RPCs per operation and per
 workload phase. Rejected and interrupted requests are counted separately.
-P95 is only emitted with at least 1,000 samples. RPC samples include socket setup,
+P95 and p99 are only emitted with at least 1,000 samples per bucket. RPC samples include socket setup,
 queueing, daemon execution and the normal durability boundary. Caches are not
 flushed; reopening resets daemon caches. Latencies are reported, not gated against
 hardware-independent millisecond thresholds. CI correctness failures fail the run.
 
 Each storage checkpoint reports apparent file bytes, allocated `st_blocks * 512`,
-segment/index bytes, object count, sequence, logical live-main bytes, unique payload
+segment/main-index/control bytes, logical/physical GC scratch bytes, object count, sequence, logical live-main bytes, unique payload
 bytes reachable from modeled Worlds/revisions, growth and bytes per commit. APFS
 sharing/compression can make `st_blocks` differ from physical device usage.
 
@@ -86,12 +86,12 @@ segment budget (submitted payload bytes plus 256 KiB per mutation request and
 Read-only segment growth is rejected exactly. Detailed growth data should be used
 to set tighter workload-specific budgets once multi-platform baselines are available.
 
-Repeated build/clean and World restore do **not** currently promise physical
-reclamation. Immutable objects, historical revisions, obsolete metadata and logs
-can remain retained; ObjectStore GC is not implemented. A small live workspace
-with substantial backing storage is possible and must be reported, rather than
-mistaken for a flat-storage guarantee. Backup/replay size is reported separately
-and does not imply GC of the source.
+The original development regression does not start online GC. Immutable objects,
+historical revisions, obsolete metadata and logs can therefore remain retained.
+Online reclamation is implemented separately; see [ONLINE_GC.md](ONLINE_GC.md) and
+the mixed maintenance soak below. Retained revisions and replay logs remain live
+by policy, so a small current workspace does not imply flat backing storage.
+Backup/replay size is reported separately and does not imply GC of the source.
 
 ## CI
 
@@ -104,3 +104,126 @@ checker rejects them.
 and macOS with two seeds, 512 files, 20 rounds and four clients. GitHub schedules
 only activate when the workflow exists on the default branch. It retains evidence
 for seven days; it does not claim to have passed until those jobs run.
+
+
+## Mixed maintenance soak
+
+`developer_soak.py` reuses the independent byte/namespace model and seeded worker
+from the original regression. Each worker owns a separate World, restores the
+common base, performs editor saves/range writes/append/truncate/rename/chmod,
+hashes dependencies, writes/verifies/removes synthetic build products, and creates
+a revision. All named revisions remain retained: there is no revision-pruning API
+in this workload, and history growth is accounted for rather than treated as a
+leak. This mode uses graceful shutdown and recovery; crash injection remains in
+the original regression and storage-fault suites.
+
+Concurrent mode supervises the background collector during producer rounds,
+restarting completed/budget-exhausted/blocked bounded jobs without `gc-stop`.
+After producers stop, it requires complete logical and physical convergence before
+backup. It records storage immediately before and after that drain, its duration,
+and the observed signed net DATA-byte recovery rate (not device bandwidth).
+
+An online base backup then runs against a further producer generation. The
+captured base revision is checked by replay into a separate repository/daemon
+without changing the source daemon endpoint while producers are running. Backup
+enables replay retention: subsequent GC is explicitly reported as logical-sweep
+skipped, and its physical continuation must still drain. Finally a quiescent full
+backup is replayed and **all** modeled Worlds/revisions are checked. Every daemon
+startup and subprocess has a deadline; monitors propagate failures to the next
+foreground operation. Cleanup may take additional time after the work deadline.
+
+Short runs (also registered with CTest for concurrent and disabled modes):
+
+```sh
+python3 scripts/tests/developer_soak.py build/metadata/daemon/forkfsd \
+  --output build/developer-workload-artifacts/soak --seed 173 \
+  --files 4 --rounds 1 --workers 1 --steps 7 --gc-work 256 \
+  --gc-mode concurrent --max-store-mib 64 --deadline 120
+ctest --test-dir build/metadata -L developer-workload --output-on-failure
+```
+
+A successful matched stress run accumulates 1,000 `fs-save` samples in the development phase
+per mode. Run the modes sequentially on the same machine and binary; caches are
+not flushed, and these are diagnostic comparisons rather than causal/SLO proof:
+
+```sh
+python3 scripts/tests/developer_soak.py build/metadata/daemon/forkfsd \
+  --output build/soak-pairs --seed 20261028 --files 16 --rounds 10 \
+  --workers 2 --steps 350 --gc-work 128 --max-store-mib 256 \
+  --max-artifact-mib 1024 --gc-mode disabled --deadline 600
+python3 scripts/tests/developer_soak.py build/metadata/daemon/forkfsd \
+  --output build/soak-pairs --seed 20261028 --files 16 --rounds 10 \
+  --workers 2 --steps 350 --gc-work 128 --max-store-mib 256 \
+  --max-artifact-mib 1024 --gc-mode concurrent --deadline 600
+python3 scripts/bench/compare_developer_soak.py \
+  build/soak-pairs/CONTROL/summary.json build/soak-pairs/CONCURRENT/summary.json
+```
+
+`--seconds` optionally caps the development phase in addition to `--rounds`;
+`--deadline` caps the entire run. A duration cap can produce different generation
+counts, which the comparison helper rejects. The helper also checks the binary
+and harness hashes, Python version, seed/shape, successful operation counts, and
+retained byte-model sizes before comparing development-phase latency. Failures
+and rejected operations remain separate from successful RPC timing samples.
+
+Each run captures SHA-256-identified harness sources in `harness-snapshot/` along
+with the binary hash and settings. In addition to existing operation traces and
+checkpoint storage:
+
+- `jobs.jsonl` retains status and observed job lifetimes. Completed GC steps per
+  first-observed terminal job time are reported; last-step copy counts are not
+  extrapolated into a total byte throughput.
+- `storage-samples.jsonl` classifies DATA, main LevelDB, control files, logical-mark
+  scratch, physical-index scratch, and all artifact files (including backups and
+  replay copies). It tolerates only disappearance races and never follows links.
+  Sampled maxima are labeled as sampled, not exact transient/device peaks.
+- GC/backup running observations are intersected with actual client transport
+  intervals from foreground worker threads. `overlap_observed=false` can mean a
+  short overlap was missed; a positive observation is not a proof of backend CPU
+  contention. Status polling and trace recording themselves add load.
+- The source and each replay copy enforce `--max-store-mib`; the whole artifact
+  tree enforces `--max-artifact-mib` (default eight times the store limit), with
+  synchronous checks after replay and before/after the final report. These are
+  sample-and-stop guards, not filesystem quotas: an in-flight operation can
+  overshoot. Failure artifacts are retained for inspection.
+- `--max-rpcs` defaults to one million and stops further requests if the recording
+  budget is exhausted. Client latency/job collections use O(recorded operations)
+  memory within that request budget; this is not a process-RSS ceiling. Raw traces
+  are retained independently on disk.
+
+## Real Git/compiler fixtures
+
+The companion driver runs actual Git status/diff/add/commit, atomic source saves,
+full compilation/link/execution of a fixed four-object C program, and incremental
+source edit/one-object compilation/link/execution. Program output is checked after
+every build. Git configuration and identity are hermetic; generated build outputs
+are ignored. Compiler/version, raw durations, per-round workspace storage,
+sampled peaks, failures and cleanup outcomes are retained.
+
+Native-only control (used by CI; this establishes no mounted result):
+
+```sh
+mkdir -p build/native-fixtures build/native-results
+python3 scripts/bench/developer_mount_soak.py \
+  --native build/native-fixtures --output build/native-results --rounds 20
+```
+
+For a provisioned writable World, add `--world /Volumes/ForkfsWorld`. The driver
+requires a mount point on a device distinct from the native root and creates only
+its own UUID/marker-protected fixture. Those checks do not certify the filesystem
+driver or agent isolation. The driver does not install/sign/mount anything.
+Workspace allocated bytes are not ObjectStore/device usage; use the RPC storage
+sampler for backing-store costs. At least 1,000 rounds are needed to report native
+p95/p99 per operation. The baseline and incremental inputs are identical on both
+sides and execution order is seeded/alternated.
+
+The short native test, paired RPC smoke tests and negative oracle tests are in
+`metadata-regression`/`developer-workload`. Soak tests run serially within CTest to
+avoid imposing their background load on unrelated timeout-sensitive regressions.
+All artifacts live under the existing developer-workload CI upload directory.
+
+The first local mixed run and its failed high-load GC profile are recorded in
+[evidence/DEVELOPER_SOAK_20261028.md](evidence/DEVELOPER_SOAK_20261028.md). The long
+profile exposed publication-path/marking overhead and did not meet its configured
+work deadline; passing smoke tests do not override that result. Storage category
+maxima are independent sampled maxima and must not be summed as a co-timed peak.

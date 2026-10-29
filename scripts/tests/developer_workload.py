@@ -16,6 +16,7 @@ import platform
 import signal
 import socket
 import statistics
+import stat
 import struct
 import subprocess
 import tempfile
@@ -38,10 +39,14 @@ class Node:
 
 def distribution(samples):
     values = sorted(samples)
-    return {'count': len(values), 'p50_ms': statistics.median(values) / 1e6,
-            'p95_ms': values[(95 * len(values) + 99) // 100 - 1] / 1e6 if len(values) >= 1000 else None,
-            'p95_status': 'reported' if len(values) >= 1000 else 'insufficient_samples',
-            'max_ms': values[-1] / 1e6}
+    enough = len(values) >= 1000
+    return {'count': len(values), 'p50_ms': statistics.median(values) / 1e6 if values else None,
+            'p95_ms': values[(95 * len(values) + 99) // 100 - 1] / 1e6 if enough else None,
+            'p99_ms': values[(99 * len(values) + 99) // 100 - 1] / 1e6 if enough else None,
+            'p95_status': 'reported' if enough else 'insufficient_samples',
+            'p99_status': 'reported' if enough else 'insufficient_samples',
+            'tail_min_samples': 1000,
+            'max_ms': values[-1] / 1e6 if values else None}
 
 
 def check_recovered_save(old, new, actual, acknowledged):
@@ -51,14 +56,45 @@ def check_recovered_save(old, new, actual, acknowledged):
 
 
 def disk_usage(path):
-    result = dict(apparent_bytes=0, allocated_bytes=0, segment_bytes=0, index_bytes=0, files=0)
-    for item in path.rglob('*'):
-        if item.is_file():
-            st = item.stat()
+    """Sample regular files without following links; tolerate GC unlink races.
+
+    This is a non-atomic sample, not a device usage or exact peak measurement.
+    Other I/O errors remain failures instead of silently undercounting usage.
+    """
+    result = dict(apparent_bytes=0, allocated_bytes=0, segment_bytes=0, index_bytes=0,
+                  scratch_bytes=0, mark_scratch_bytes=0, physical_scratch_bytes=0,
+                  scratch_allocated_bytes=0, control_bytes=0, files=0)
+    def on_error(error):
+        if not isinstance(error, FileNotFoundError):
+            raise error
+    for parent, dirs, files in os.walk(path, followlinks=False, onerror=on_error):
+        dirs[:] = [name for name in dirs if not (Path(parent) / name).is_symlink()]
+        for name in files:
+            item = Path(parent) / name
+            try:
+                st = item.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            relative = item.relative_to(path)
+            first = relative.parts[0]
+            allocated = st.st_blocks * 512
             result['apparent_bytes'] += st.st_size
-            result['allocated_bytes'] += st.st_blocks * 512
-            result['segment_bytes' if item.name.startswith('DATA') else 'index_bytes'] += st.st_size
+            result['allocated_bytes'] += allocated
             result['files'] += 1
+            if first.startswith(('.gc-mark-', '.gc-physical-')):
+                result['scratch_bytes'] += st.st_size
+                result['scratch_allocated_bytes'] += allocated
+                key = 'mark_scratch_bytes' if first.startswith('.gc-mark-') else 'physical_scratch_bytes'
+            elif len(relative.parts) == 1 and name.startswith('DATA-') and name.endswith('.seg'):
+                key = 'segment_bytes'
+            elif len(relative.parts) == 1 and (name in {'CURRENT', 'LOCK', 'LOG', 'LOG.old'}
+                    or name.startswith('MANIFEST-') or item.suffix in {'.ldb', '.sst', '.log'}):
+                key = 'index_bytes'
+            else:
+                key = 'control_bytes'
+            result[key] += st.st_size
     return result
 
 
@@ -140,13 +176,13 @@ class Workload:
             fields += ('--revision', revision)
         values = [v if isinstance(v, bytes) else str(v).encode() for v in fields]
         body = struct.pack('<I', len(values)) + b''.join(struct.pack('<I', len(v)) + v for v in values)
-        event = {'op': op, 'phase': self.phase, 'world': world, 'revision': revision,
+        event = {'op': op, 'phase': self.phase, 'thread': threading.current_thread().name, 'world': world, 'revision': revision,
                  'args': [{'bytes': len(v), 'sha256': hashlib.sha256(v).hexdigest()} if isinstance(v, bytes)
-                          else v for v in fields[1:]], 'start_ns': time.perf_counter_ns()}
+                          else str(v) for v in fields[1:]], 'start_ns': time.perf_counter_ns()}
         begin = event['start_ns']
         try:
             with socket.socket(socket.AF_UNIX) as s:
-                s.settimeout(60)
+                s.settimeout(self.rpc_timeout() if hasattr(self, 'rpc_timeout') else 60)
                 s.connect(str(self.endpoint))
                 s.sendall(b'FFRPC001' + struct.pack('<I', len(body)) + body)
                 if sent is not None:
@@ -182,13 +218,16 @@ class Workload:
                 self.outcomes[bucket] = self.outcomes.get(bucket, 0) + 1
                 if outcome == 'success':
                     self.samples.setdefault(op, []).append(event['latency_ns'])
-                    self.phase_samples.setdefault(self.phase + '/' + op, []).append(event['latency_ns'])
+                    self.phase_samples.setdefault(event['phase'] + '/' + op, []).append(event['latency_ns'])
                 self.coverage[op] = self.coverage.get(op, 0) + 1
                 if op in {'fs-write', 'fs-save', 'fs-write-at', 'fs-append', 'fs-hwrite'}:
                     self.input_bytes += sum(len(v) for v in fields if isinstance(v, bytes))
                 if op in MUTATIONS and outcome == 'success':
                     self.mutations += 1
                 self.log.write(json.dumps(event) + '\n')
+            observer = getattr(self, 'rpc_observed', None)
+            if observer is not None:
+                observer(event)
 
     def put(self, model, path, data, world='main', op='fs-write'):
         self.rpc(op, path, data, world=world)
