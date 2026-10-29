@@ -619,5 +619,185 @@
     "elapsed_seconds": 490.69,
     "filter": "gc|replay_core|object_store_recovery|save$|lock_granularity",
     "remote_ci": "not run for this follow-up"
+  },
+  "rss_followup": {
+    "scope": "Sequential two-round same-harness synthetic RPC runs, sampled RSS of currently selected daemon only. Candidate uses baseline-captured harness snapshot. Final harness additionally checks missing samples before writing a success summary; sampling itself is unchanged. No process-tree cap, no RSS guarantee, no attribution of full RSS delta solely to memtables.",
+    "variants": {
+      "64k": {
+        "artifact": "build/rss-64k/seed-20261030-4ffgmlk0",
+        "settings": {
+          "binary": "/Users/hurricane/private/code/forks.world/forkfs-gc-foreground/build/foreground/daemon/forkfsd",
+          "output": "build/rss-64k",
+          "seed": 20261030,
+          "files": 32,
+          "file_bytes": 1024,
+          "rounds": 2,
+          "workers": 2,
+          "steps": 350,
+          "seconds": 0,
+          "sample_interval": 0.5,
+          "max_store_mib": 256,
+          "max_rss_mib": 256,
+          "max_rpcs": 1000000,
+          "max_artifact_mib": 2048,
+          "deadline": 300.0,
+          "gc_work": 128,
+          "gc_copy_bytes": 1048576,
+          "gc_objects": 128,
+          "gc_mode": "concurrent",
+          "restart_every": 1,
+          "pid": 35738,
+          "binary_sha256": "96ee5eb89c1af3edf506f84c176e8a8836bd49f394216f4d0e33da1b493035fc",
+          "platform": "macOS-27.0.1-arm64-arm-64bit",
+          "python": "3.9.6",
+          "transport": "resident Unix RPC; one connection per operation",
+          "cache": "OS caches not flushed; service restarts reset daemon caches",
+          "scope": "synthetic development I/O; no mounted git/compiler execution",
+          "harness_sha256": {
+            "developer_soak.py": "d5d29db9f2df7c9771fe55caf20566401f7c8451e72a737d3087f468ad5d092d",
+            "developer_workload.py": "07367d758c2d6f01d9149220a529f83e6f769e04cbb424e1199c68700b249f49"
+          },
+          "worker_revision_pattern": "r{generation}w{worker}",
+          "revision_policy": "retain all; no revision deletion API is used"
+        },
+        "elapsed_seconds": 49.773432916,
+        "state": "passed",
+        "process_memory": {
+          "sample_count": 97,
+          "sampled_peak_rss_bytes": 49790976,
+          "limit_mib": 256,
+          "peak_exact": false,
+          "method": "/bin/ps RSS KiB converted to bytes",
+          "scope": "currently selected daemon only; excludes harness, CLI children and any paused source daemon during replay",
+          "samples_file": "/Users/hurricane/private/code/forks.world/forkfs-gc-foreground/build/rss-64k/seed-20261030-4ffgmlk0/process-memory.jsonl"
+        },
+        "retained_model": {
+          "unique_reachable_payload_bytes": 68428,
+          "retained_revisions": 5,
+          "modeled_worlds": 3
+        },
+        "retained_revision_counts": [
+          {
+            "round": 0,
+            "generation": 0,
+            "retained_revisions": 3
+          },
+          {
+            "round": 1,
+            "generation": 1,
+            "retained_revisions": 5
+          },
+          {
+            "round": 2,
+            "generation": 2,
+            "retained_revisions": 7
+          }
+        ],
+        "sampled_storage_peaks": {
+          "allocated_bytes": 39911424,
+          "segment_bytes": 7900312,
+          "index_bytes": 28239593,
+          "control_bytes": 456,
+          "mark_scratch_bytes": 4159848,
+          "physical_scratch_bytes": 3377621,
+          "scratch_allocated_bytes": 6025216,
+          "artifact_allocated_bytes": 42803200,
+          "artifact_apparent_bytes": 40083080
+        },
+        "base_archive_bytes": 726536,
+        "final_archive_bytes": 8011917
+      },
+      "1m": {
+        "artifact": "build/rss-1m/seed-20261030-ys0hqdy3",
+        "settings": {
+          "binary": "/Users/hurricane/private/code/forks.world/forkfs-gc-foreground/build/foreground-1m/daemon/forkfsd",
+          "output": "build/rss-1m",
+          "seed": 20261030,
+          "files": 32,
+          "file_bytes": 1024,
+          "rounds": 2,
+          "workers": 2,
+          "steps": 350,
+          "seconds": 0,
+          "sample_interval": 0.5,
+          "max_store_mib": 256,
+          "max_rss_mib": 256,
+          "max_rpcs": 1000000,
+          "max_artifact_mib": 2048,
+          "deadline": 300.0,
+          "gc_work": 128,
+          "gc_copy_bytes": 1048576,
+          "gc_objects": 128,
+          "gc_mode": "concurrent",
+          "restart_every": 1,
+          "pid": 35998,
+          "binary_sha256": "fde5d2a040858f281e8e52e1b12808ed9e6c13cb6c28c71040d034fea6a31945",
+          "platform": "macOS-27.0.1-arm64-arm-64bit",
+          "python": "3.9.6",
+          "transport": "resident Unix RPC; one connection per operation",
+          "cache": "OS caches not flushed; service restarts reset daemon caches",
+          "scope": "synthetic development I/O; no mounted git/compiler execution",
+          "harness_sha256": {
+            "developer_soak.py": "d5d29db9f2df7c9771fe55caf20566401f7c8451e72a737d3087f468ad5d092d",
+            "developer_workload.py": "07367d758c2d6f01d9149220a529f83e6f769e04cbb424e1199c68700b249f49"
+          },
+          "worker_revision_pattern": "r{generation}w{worker}",
+          "revision_policy": "retain all; no revision deletion API is used"
+        },
+        "elapsed_seconds": 50.607813834,
+        "state": "passed",
+        "process_memory": {
+          "sample_count": 99,
+          "sampled_peak_rss_bytes": 56967168,
+          "limit_mib": 256,
+          "peak_exact": false,
+          "method": "/bin/ps RSS KiB converted to bytes",
+          "scope": "currently selected daemon only; excludes harness, CLI children and any paused source daemon during replay",
+          "samples_file": "/Users/hurricane/private/code/forks.world/forkfs-gc-foreground/build/rss-1m/seed-20261030-ys0hqdy3/process-memory.jsonl"
+        },
+        "retained_model": {
+          "unique_reachable_payload_bytes": 68428,
+          "retained_revisions": 5,
+          "modeled_worlds": 3
+        },
+        "retained_revision_counts": [
+          {
+            "round": 0,
+            "generation": 0,
+            "retained_revisions": 3
+          },
+          {
+            "round": 1,
+            "generation": 1,
+            "retained_revisions": 5
+          },
+          {
+            "round": 2,
+            "generation": 2,
+            "retained_revisions": 7
+          }
+        ],
+        "sampled_storage_peaks": {
+          "allocated_bytes": 36765696,
+          "segment_bytes": 7483918,
+          "index_bytes": 27982076,
+          "control_bytes": 454,
+          "mark_scratch_bytes": 3290422,
+          "physical_scratch_bytes": 4132616,
+          "scratch_allocated_bytes": 6815744,
+          "artifact_allocated_bytes": 41660416,
+          "artifact_apparent_bytes": 39174075
+        },
+        "base_archive_bytes": 722132,
+        "final_archive_bytes": 7667031
+      }
+    },
+    "validation": {
+      "python_oracle_cases": 29,
+      "ctest_cases": 4,
+      "ctest_elapsed_seconds": 6.86,
+      "platform": "local macOS",
+      "remote_ci": "not run"
+    }
   }
 }

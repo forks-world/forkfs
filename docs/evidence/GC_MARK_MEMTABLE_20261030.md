@@ -52,7 +52,8 @@ and is retained as diagnostic evidence only, not the controlled comparator.
 
 LevelDB can retain both mutable and immutable memtables, plus allocation and
 iterator overhead. Raising the request increases potential resident scratch
-memory; process RSS was not measured. This memory remains outside the per-step
+memory; process RSS was not measured in that full ten-round comparison. The
+two-round follow-up below supplies a narrower measurement. This memory remains outside the per-step
 GC metadata charge. The physical reverse-index scratch DB retains its own 64 KiB
 request. Disk peaks are sampled rather than exact, and scratch indexes can grow
 with the retained graph. Each run retained the same 3 modeled Worlds, 21
@@ -80,3 +81,35 @@ ctest --test-dir build/foreground-1m -R 'gc|replay_core|object_store_recovery|sa
 The cases are already part of the existing CI; the new counter assertions extend
 the registered `forkfsd_online_gc` test. No new remote CI execution is claimed
 for this follow-up.
+
+## Sampled RSS follow-up
+
+The harness now records `process-memory.jsonl` and a scoped `process_memory`
+summary via macOS/Linux `ps`. Both CI smoke modes use a sampled 256 MiB limit;
+an additional integration regression deliberately fails a 1 MiB limit and checks
+the failure summary, offending samples and daemon termination. Live measurement
+errors fail rather than silently reporting zero; exited-child races are skipped.
+
+A sequential same-harness probe used seed 20261030, 32 files, 2 rounds, 2 workers,
+350 steps, GC work 128 and 256 MiB disk/RSS limits. The candidate used the baseline's
+captured harness snapshot so both fingerprints match. The final harness additionally
+checks missing samples before publishing success; sampling itself is unchanged.
+Both runs passed byte/model, backup and replay checks with matching retained models.
+
+| Variant | Sampled selected-daemon RSS peak | RSS samples | Elapsed |
+| --- | ---: | ---: | ---: |
+| 64 KiB marker | 47.484 MiB | 97 | 49.773 s |
+| 1 MiB marker | 54.328 MiB | 99 | 50.608 s |
+
+The observed RSS difference is 6.844 MiB. It includes changes in caches, allocation
+and concurrent GC timing, so it cannot be attributed solely to the memtable request.
+The samples cover the currently selected daemon, excluding harness/CLI processes
+and any paused source daemon during replay; they neither sum the process tree nor
+establish a hard RSS high-water mark. These short runs do not replace the original
+1000-save latency comparison or establish percentile improvements.
+
+RSS harness validation: all 29 Python oracle cases passed; all 4 selected
+`forkfsd_developer_soak_*` CTest cases passed in 6.86 s (including real-daemon
+limit failure and cleanup). The subsequently added missing-samples success guard
+case passed in the final 29-case Python run. These are local macOS results;
+Linux execution is delegated to the existing metadata CI matrix after publication.

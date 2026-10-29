@@ -13,6 +13,8 @@
 - [x] 对照 64 KiB / 1 MiB marker scratch memtable：复核基线最长持锁 204.375 ms，候选 20.458 ms；save p99 降低 24.3%，完整备份/replay 与保留模型一致。
 - [x] 24 项相关回归通过（490.69 秒），覆盖预算、并发、崩溃恢复和 seeded 模型。调整只扩大 marker scratch 的写缓冲区请求，未承诺 RSS 或最坏延时上限。
 
+- [x] stress harness 增加 macOS/Linux daemon RSS 采样、可选限额、错误传播和失败清理回归；CI smoke 设置 256 MiB 采样限额。两轮同参数对照峰值为 47.484 / 54.328 MiB，非进程树合计或硬性内存上限。
+
 参数、采样空间成本和限制见 [发布屏障证据](evidence/GC_MARK_MEMTABLE_20261030.md)。
 
 ## GC 尾延迟与前台背压（2026-10-29）

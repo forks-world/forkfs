@@ -285,10 +285,14 @@ foreach(mode concurrent disabled)
         ${CMAKE_SOURCE_DIR}/scripts/tests/developer_soak.py $<TARGET_FILE:forkfsd>
         --seed 173 --output ${CMAKE_BINARY_DIR}/developer-workload-artifacts/soak
         --files 4 --rounds 1 --workers 1 --steps 7 --sample-interval 0.2
-        --gc-work 256 --gc-mode ${mode} --max-store-mib 64 --deadline 120)
+        --gc-work 256 --gc-mode ${mode} --max-store-mib 64 --max-rss-mib 256 --deadline 120)
     set_tests_properties(forkfsd_developer_soak_${mode} PROPERTIES TIMEOUT 180
         RUN_SERIAL TRUE LABELS "metadata-regression;developer-workload;developer-soak")
 endforeach()
+add_test(NAME forkfsd_developer_soak_rss_limit COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/scripts/tests/developer_soak_rss_budget.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_developer_soak_rss_limit PROPERTIES TIMEOUT 60
+    RUN_SERIAL TRUE LABELS "metadata-regression;developer-workload;developer-soak")
 add_test(NAME forkfsd_developer_soak_oracle COMMAND ${Python3_EXECUTABLE} -m unittest discover
     -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_developer_soak*.py)
 set_tests_properties(forkfsd_developer_soak_oracle PROPERTIES TIMEOUT 30
