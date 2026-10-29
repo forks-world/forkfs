@@ -295,11 +295,26 @@ set_tests_properties(forkfsd_developer_soak_oracle PROPERTIES TIMEOUT 30
     LABELS "metadata-regression;developer-workload;developer-soak")
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/developer-workload-artifacts/native-fixtures
     ${CMAKE_BINARY_DIR}/developer-workload-artifacts/native-results)
+set(_forkfs_native_soak_sysroot_args)
+if(APPLE AND CMAKE_OSX_SYSROOT)
+    set(_forkfs_native_soak_sysroot "${CMAKE_OSX_SYSROOT}")
+    if(NOT IS_DIRECTORY "${_forkfs_native_soak_sysroot}")
+        execute_process(COMMAND xcrun --sdk "${_forkfs_native_soak_sysroot}" --show-sdk-path
+            RESULT_VARIABLE _forkfs_xcrun_status OUTPUT_VARIABLE _forkfs_xcrun_sysroot
+            ERROR_VARIABLE _forkfs_xcrun_error OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(NOT _forkfs_xcrun_status EQUAL 0 OR NOT IS_DIRECTORY "${_forkfs_xcrun_sysroot}")
+            message(FATAL_ERROR "Could not resolve CMAKE_OSX_SYSROOT '${CMAKE_OSX_SYSROOT}' for native developer soak: ${_forkfs_xcrun_error}")
+        endif()
+        set(_forkfs_native_soak_sysroot "${_forkfs_xcrun_sysroot}")
+    endif()
+    list(APPEND _forkfs_native_soak_sysroot_args --sysroot "${_forkfs_native_soak_sysroot}")
+endif()
 add_test(NAME forkfsd_native_developer_soak COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_SOURCE_DIR}/scripts/bench/developer_mount_soak.py
     --native ${CMAKE_BINARY_DIR}/developer-workload-artifacts/native-fixtures
     --output ${CMAKE_BINARY_DIR}/developer-workload-artifacts/native-results
-    --compiler ${CMAKE_C_COMPILER} --rounds 4 --files 8 --deadline 60)
+    --compiler ${CMAKE_C_COMPILER} ${_forkfs_native_soak_sysroot_args}
+    --rounds 4 --files 8 --deadline 60)
 set_tests_properties(forkfsd_native_developer_soak PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE
     LABELS "metadata-regression;developer-workload;developer-soak")
 

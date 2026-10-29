@@ -71,7 +71,15 @@ GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
            "GIT_COMMITTER_EMAIL": "bench@example.invalid"}
 
 
-def project_setup(root, compiler, remaining):
+def compiler_command(compiler, sysroot, *args):
+    argv = [compiler]
+    if sysroot is not None:
+        argv.extend(["-isysroot", str(sysroot)])
+    argv.extend(str(arg) for arg in args)
+    return argv
+
+
+def project_setup(root, compiler, sysroot, remaining):
     source = root / "src"
     build = root / "build"
     source.mkdir()
@@ -83,11 +91,11 @@ def project_setup(root, compiler, remaining):
         (source / f"unit{i}.c").write_bytes(project_source(i, value))
     objs = [build / f"unit{i}.o" for i in range(3)]
     for i, obj in enumerate(objs):
-        run_command([compiler, "-c", "-I", str(source), str(source / f"unit{i}.c"), "-o", str(obj)], timeout=remaining())
+        run_command(compiler_command(compiler, sysroot, "-c", "-I", source, source / f"unit{i}.c", "-o", obj), timeout=remaining())
     main_obj = build / "main.o"
-    run_command([compiler, "-c", "-I", str(source), str(source / "main.c"), "-o", str(main_obj)], timeout=remaining())
+    run_command(compiler_command(compiler, sysroot, "-c", "-I", source, source / "main.c", "-o", main_obj), timeout=remaining())
     binary = build / "soak-program"
-    run_command([compiler, *(str(p) for p in [main_obj, *objs]), "-o", str(binary)], timeout=remaining())
+    run_command(compiler_command(compiler, sysroot, *[main_obj, *objs, "-o", binary]), timeout=remaining())
     ensure_program(binary, sum(values), remaining())
     return source, build, objs, binary, values
 
@@ -146,6 +154,7 @@ def main():
     parser.add_argument("--rounds", type=int, default=10)
     parser.add_argument("--files", type=int, default=32, help="tracked Git fixture files")
     parser.add_argument("--compiler", default="cc", help="compiler executable or PATH-resolved name")
+    parser.add_argument("--sysroot", type=Path, help="SDK/sysroot directory passed to compiler and linker")
     parser.add_argument("--deadline", type=int, default=600, help="seconds allowed per external build/run command")
     args = parser.parse_args()
     if args.rounds < 1 or not 1 <= args.files <= 50000 or args.deadline < 1:
@@ -158,6 +167,12 @@ def main():
         parser.error(str(exc))
     if not native.is_dir() or not output.is_dir() or (world is not None and not world.is_dir()):
         parser.error("native, world, and output must be existing directories")
+    try:
+        sysroot = args.sysroot.expanduser().resolve(strict=True) if args.sysroot else None
+    except OSError as exc:
+        parser.error(f"invalid --sysroot: {exc}")
+    if sysroot is not None and not sysroot.is_dir():
+        parser.error("--sysroot must be an existing directory")
     roots = [native] + ([world] if world is not None else [])
     if world is not None:
         if not os.path.ismount(world):
@@ -200,7 +215,7 @@ def main():
             paths.append(create_workspace(root, token, args.files, command_timeout=remaining))
         side_values = []
         for root in paths:
-            _, _, _, _, initial_values = project_setup(root, compiler, remaining)
+            _, _, _, _, initial_values = project_setup(root, compiler, sysroot, remaining)
             side_values.append(initial_values)
             git_setup(root, remaining)
         max_space = {"native": {"apparent_bytes": 0, "allocated_bytes": 0}}
@@ -260,9 +275,9 @@ def main():
                 binary = build / "soak-program"
                 def full_build(root=root, unit=unit, next_value=next_value, obj=obj, src=src, build=build, binary=binary, values=values):
                     for i in range(3):
-                        run_command([compiler, "-c", "-I", str(root / "src"), str(root / "src" / f"unit{i}.c"), "-o", str(build / f"unit{i}.o")], timeout=remaining())
-                    run_command([compiler, "-c", "-I", str(root / "src"), str(root / "src" / "main.c"), "-o", str(build / "main.o")], timeout=remaining())
-                    run_command([compiler, str(build / "main.o"), *(str(build / f"unit{i}.o") for i in range(3)), "-o", str(binary)], timeout=remaining())
+                        run_command(compiler_command(compiler, sysroot, "-c", "-I", root / "src", root / "src" / f"unit{i}.c", "-o", build / f"unit{i}.o"), timeout=remaining())
+                    run_command(compiler_command(compiler, sysroot, "-c", "-I", root / "src", root / "src" / "main.c", "-o", build / "main.o"), timeout=remaining())
+                    run_command(compiler_command(compiler, sysroot, build / "main.o", *(build / f"unit{i}.o" for i in range(3)), "-o", binary), timeout=remaining())
                     expected = sum((next_value if i == unit else values[i]) for i in range(3))
                     ensure_program(binary, expected, remaining())
                 record("compile_full_four_objects_link_run", label, round_no, full_build)
@@ -270,8 +285,8 @@ def main():
                 inc_value = next_value + 1
                 def incremental(root=root, unit=unit, next_value=inc_value, obj=obj, src=src, build=build, binary=binary, values=values):
                     atomic_edit(src, project_source(unit, next_value))
-                    run_command([compiler, "-c", "-I", str(root / "src"), str(src), "-o", str(obj)], timeout=remaining())
-                    run_command([compiler, str(build / "main.o"), *(str(build / f"unit{i}.o") for i in range(3)), "-o", str(binary)], timeout=remaining())
+                    run_command(compiler_command(compiler, sysroot, "-c", "-I", root / "src", src, "-o", obj), timeout=remaining())
+                    run_command(compiler_command(compiler, sysroot, build / "main.o", *(build / f"unit{i}.o" for i in range(3)), "-o", binary), timeout=remaining())
                     expected = sum((next_value if i == unit else values[i]) for i in range(3))
                     ensure_program(binary, expected, remaining())
                     values[unit] = next_value
@@ -290,6 +305,8 @@ def main():
                 "native_root": str(native), "world_root": str(world) if world else None,
                 "world_identity_note": "os.path.ismount and distinct st_dev checks only; caller identity cannot prove the mount is the target filesystem",
                 "compiler": {"requested": args.compiler, "resolved_path": compiler, "version": version,
+                             "sysroot": str(sysroot) if sysroot else None,
+                             "argv_flags": ["-isysroot", str(sysroot)] if sysroot else [],
                              "cache_scope": "OS and compiler caches are left in their natural state; no cache dropping"},
                 "rounds": args.rounds, "git_fixture_files": args.files, "command_deadline_seconds": args.deadline,
                 "workspace_peak_usage": max_space, "sampled_peaks_exact": False,
@@ -303,7 +320,9 @@ def main():
         summary = {"schema_version": 1, "created_unix_ns": time.time_ns(),
                    "mode": "mounted_compare" if world else "native_only_no_mounted_acceptance",
                    "native_root": str(native), "world_root": str(world) if world else None,
-                   "compiler": {"requested": args.compiler, "resolved_path": compiler},
+                   "compiler": {"requested": args.compiler, "resolved_path": compiler,
+                                "version": version, "sysroot": str(sysroot) if sysroot else None,
+                                "argv_flags": ["-isysroot", str(sysroot)] if sysroot else []},
                    "rounds": args.rounds, "git_fixture_files": args.files,
                    "command_deadline_seconds": args.deadline, "workspace_peak_usage": max_space if 'max_space' in locals() else {},
                    "results": summarize_raw(raw), "workspaces_cleaned": False, "outcome": "error",
@@ -336,5 +355,5 @@ if __name__ == "__main__":
     try:
         main()
     except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
-        print(f"developer_mount_soak: {exc}", file=sys.stderr)
+        print(f"developer_mount_soak: {exception_text(exc)}", file=sys.stderr)
         sys.exit(1)
