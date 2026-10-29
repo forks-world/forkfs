@@ -331,6 +331,16 @@ have exactly matching counts. The sweep bucket also includes reference marking.
 matched workloads, explicit remaining long stalls and sampled storage tradeoffs.
 No hard latency, CPU-share or process-RSS ceiling follows from this scheduling.
 
+`gc_barrier_roots`, `gc_barrier_descriptors` and `gc_barrier_chunks` expose
+`calls`, `ns` and `max_ns` for root protection (including marker-lock wait),
+committed descriptor lookup/decoding, and the chunk-protection batch. The first
+two count individual non-deleted root/object operations; the last counts one
+attempt per publication barrier, including an empty chunk list. RAII records
+failed attempts too. Their totals are nested within `gc_barrier_ns`; maxima need
+not occur in the same transaction, and snapshots taken during a publication can
+be temporarily inconsistent. Outside a collection all three remain unchanged.
+
+
 Staged children use encoded records, capped at the codecs' maximum fanout of 65.
 Their encodings are released as the commit batch grows, avoiding a second large
 resident vector of decoded tasks. A reader-gate regression verifies foreground
@@ -354,7 +364,8 @@ batch; retry with a larger budget is supported. Charges are conservative, are
 not returned for temporary allocations within a step, and are not process RSS.
 Existing main/scratch LevelDB caches, memtables and iterator internals,
 ObjectStore caches, allocator overhead, and bounded codec/payload buffers remain
-outside this accounting. Scratch uses a 64 KiB requested write buffer, no block
+outside this accounting. Marker scratch uses a 1 MiB requested write buffer (LevelDB may retain both
+mutable and immutable memtables, with allocation overhead), no block
 cache retention, no compression and a small open-file setting; it consumes disk
 space proportional to the graph and queued publication work. Long-lived
 metadata snapshots can also retain old main-LevelDB versions until the cycle
