@@ -82,6 +82,7 @@ struct StoreIoMetrics {
     std::atomic<uint64_t> root_get_calls=0,root_get_ns=0,root_misses=0,root_cache_hits=0,object_get_calls=0,object_get_ns=0,object_misses=0,meta_get_calls=0,meta_get_ns=0;
     std::atomic<uint64_t> transactions=0,prepare_ns=0,write_ns=0,wal_sync_calls=0,wal_sync_ns=0,other_sync_calls=0,other_sync_ns=0,wal_append_bytes=0,wal_append_ns=0,wal_flush_ns=0;
     OperationTiming data_prepare,data_sync,metadata_publish,gc_barrier;
+    OperationTiming gc_barrier_roots,gc_barrier_descriptors,gc_barrier_chunks;
 };
 namespace {
 using Clock=std::chrono::steady_clock;
@@ -353,14 +354,15 @@ void LevelStore::publish(const replay::Batch& input){
                 // collection to the maximum foreground mutation count times four.
                 std::vector<std::string> chunk_hashes;
                 for(const auto& op:input.ops)if(!op.erase){
-                    if(op.key.starts_with("R/"))gc_cycle_->mark.seed_published_root(op.key,id(op.value),roots);
+                    if(op.key.starts_with("R/")){TimedOperation timing(metrics_->gc_barrier_roots);gc_cycle_->mark.seed_published_root(op.key,id(op.value),roots);}
                     else if(op.key.starts_with("O/")){
+                        TimedOperation timing(metrics_->gc_barrier_descriptors);
                         std::string descriptor;status(db_->Get(read,op.key,&descriptor),"GC published object lookup");
                         replay::Input in{descriptor};need(in.take(8)=="FFOBJ002","invalid GC publication descriptor");(void)in.integer(8);auto count=in.integer(4);need(count>0&&count<=4,"invalid GC publication chunks");
                         need(count<=GcMark::max_protected_chunks-chunk_hashes.size(),"too many GC publication chunks");for(uint64_t i=0;i<count;++i)chunk_hashes.push_back(in.take(32));in.end();
                     }
                 }
-                gc_cycle_->mark.protect_chunks(chunk_hashes);
+                {TimedOperation timing(metrics_->gc_barrier_chunks);gc_cycle_->mark.protect_chunks(chunk_hashes);}
             }catch(const std::exception& error){gc_error_=std::string("GC publication barrier failed: ")+error.what();gc_cycle_.reset();}
             record_operation(metrics_->gc_barrier,elapsed(gc_barrier_begin));
             fault("gc_mark_after_barrier");
@@ -481,7 +483,10 @@ std::string LevelStore::metrics_json(bool detailed) const {
         ",\"gc_barrier_calls\":"+std::to_string(m.gc_barrier.calls.load())+",\"gc_barrier_ns\":"+std::to_string(m.gc_barrier.ns.load())+",\"gc_barrier_max_ns\":"+std::to_string(m.gc_barrier.max_ns.load());
     result+=",\"gc_foreground_wait_ns\":"+std::to_string(m.gc_mutex->foreground_wait_ns.load())+",\"gc_foreground_hold_ns\":"+std::to_string(m.gc_mutex->foreground_hold_ns.load())+
         ",\"gc_advance_wait_ns\":"+std::to_string(m.gc_mutex->advance_wait_ns.load())+",\"gc_advance_hold_ns\":"+std::to_string(m.gc_mutex->advance_hold_ns.load());
-    result+=",\"foreground_writer\":"+timing_json(m.foreground_writer)+
+    result+=",\"gc_barrier_roots\":"+timing_json(m.gc_barrier_roots)+
+        ",\"gc_barrier_descriptors\":"+timing_json(m.gc_barrier_descriptors)+
+        ",\"gc_barrier_chunks\":"+timing_json(m.gc_barrier_chunks)+
+        ",\"foreground_writer\":"+timing_json(m.foreground_writer)+
         ",\"gc_writer_sweep\":"+timing_json(m.gc_writer_sweep)+
         ",\"gc_writer_relocate\":"+timing_json(m.gc_writer_relocate)+
         ",\"gc_writer_retire\":"+timing_json(m.gc_writer_retire)+
