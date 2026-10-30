@@ -6,7 +6,7 @@ from pathlib import Path
 
 MATCH = ('binary_sha256', 'harness_sha256', 'python', 'seed', 'files', 'file_bytes',
          'rounds', 'workers', 'steps', 'seconds', 'sample_interval', 'gc_work',
-         'gc_copy_bytes', 'gc_objects', 'max_store_mib', 'max_artifact_mib', 'max_rpcs')
+         'gc_copy_bytes', 'gc_objects', 'max_store_mib', 'max_artifact_mib', 'max_rpcs', 'max_rss_mib')
 OPS = ('fs-save', 'fs-write-at', 'fs-append', 'fs-truncate', 'fs-rename', 'fs-chmod',
        'fs-cat', 'fs-stat', 'fs-lstat')
 
@@ -51,6 +51,7 @@ def compare(disabled_path, concurrent_path):
             raise ValueError(f'unmatched retained model: {key}')
     return {'scope': 'paired synthetic RPC development phase; warm caches; sequential runs; not mounted acceptance',
             'settings': {key: settings[0][key] for key in MATCH}, 'latency': latency, 'storage': storage,
+            'process_memory': {mode: result.get('process_memory') for mode, result in zip(('disabled', 'concurrent'), summaries)},
             'artifacts': [str(path.resolve()) for path in paths]}
 
 

@@ -50,7 +50,11 @@ public:
         try {
             struct stat st{};if(::lstat(scratch_.c_str(),&st)<0 || !S_ISDIR(st.st_mode) || (st.st_mode&0777)!=0700)
                 throw std::runtime_error("GC mark scratch directory is not private");
-            leveldb::Options options;options.create_if_missing=true;options.write_buffer_size=64*1024;
+            // Publication writes this scratch DB while holding the main writer
+            // fence. A tiny memtable forces frequent flush/compaction stalls there.
+            // LevelDB may retain both mutable and immutable buffers; this cache
+            // is separate from the per-step metadata charge, not a strict RSS cap.
+            leveldb::Options options;options.create_if_missing=true;options.write_buffer_size=1024*1024;
             options.max_open_files=16;options.paranoid_checks=true;options.compression=leveldb::kNoCompression;
             cache_.reset(leveldb::NewLRUCache(0));options.block_cache=cache_.get();
             leveldb::DB* raw=nullptr;auto status=leveldb::DB::Open(options,scratch_+"/db",&raw);

@@ -186,6 +186,20 @@ checkpoint storage:
   synchronous checks after replay and before/after the final report. These are
   sample-and-stop guards, not filesystem quotas: an in-flight operation can
   overshoot. Failure artifacts are retained for inspection.
+- `process-memory.jsonl` records the currently selected daemon PID and RSS at
+  startup and every sampling tick. macOS/Linux `/bin/ps` RSS values are converted
+  from KiB to bytes without a shell. `summary.json.process_memory` records sample
+  count, sampled peak and scope. This excludes harness/CLI processes and any
+  paused source daemon while the replay daemon is selected; it is not a sum over
+  the process tree or a historical OS high-water mark. Exit races are skipped;
+  failure to measure a live daemon fails the run rather than recording zero.
+- `--max-rss-mib` optionally stops a run after an over-limit sample. The offending
+  sample and failed summary remain available, and normal cleanup terminates the
+  daemon. This is a sampled guard, not an OS-enforced cap: bursts can be missed or
+  overshoot. CI smoke workloads use 256 MiB and include a deliberately failing
+  1 MiB limit regression. Comparison requires matching RSS limits and carries
+  memory measurements into its output without treating missing old measurements
+  as zero.
 - `--max-rpcs` defaults to one million and stops further requests if the recording
   budget is exhausted. Client latency/job collections use O(recorded operations)
   memory within that request budget; this is not a process-RSS ceiling. Raw traces

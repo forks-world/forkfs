@@ -33,6 +33,46 @@ std::vector<unsigned char> payload(size_t size,unsigned seed) {
     for(size_t i=0;i<size;++i)value[i]=static_cast<unsigned char>((i*37+seed*19+(i>>8))%251);
     return value;
 }
+uint64_t phase_field(const std::string& json,const char* phase,const char* name) {
+    const auto start=json.find(std::string("\"")+phase+"\":{");CHECK(start!=std::string::npos);
+    const auto end=json.find('}',start);CHECK(end!=std::string::npos);
+    return field(json.substr(start,end-start+1),name);
+}
+void publication_metrics(const std::string& path) {
+    LevelStore::create(path);LevelStore store(path);
+    std::vector<Mutation> roots;
+    for(unsigned i=0;i<16;++i)roots.push_back({"root-"+std::to_string(i),payload(128,i)});
+    store.transact(0,roots);
+    CHECK(field(store.metrics_json(),"gc_barrier_calls")==0);
+    CHECK(phase_field(store.metrics_json(),"gc_barrier_roots","calls")==0);
+    CHECK(boolean_field(store.collect_step(65580,1,1024*1024,1),"mark_pending"));
+    store.transact(store.sequence(),{{"root-0",payload(128,77)}});
+    auto first=store.metrics_json();
+    CHECK(field(first,"gc_barrier_calls")==1);
+    CHECK(phase_field(first,"gc_barrier_roots","calls")==1);
+    CHECK(phase_field(first,"gc_barrier_descriptors","calls")==1);
+    CHECK(phase_field(first,"gc_barrier_chunks","calls")==1);
+    uint64_t sum=0;
+    for(auto phase:{"gc_barrier_roots","gc_barrier_descriptors","gc_barrier_chunks"}){
+        auto duration=phase_field(first,phase,"ns");CHECK(duration>0);
+        CHECK(phase_field(first,phase,"max_ns")==duration);sum+=duration;
+    }
+    CHECK(sum<=field(first,"gc_barrier_ns"));
+    // Reusing the same immutable object publishes a root without a new descriptor.
+    store.transact(store.sequence(),{{"root-1",std::nullopt,store.root("root-0")}});
+    auto second=store.metrics_json();
+    CHECK(phase_field(second,"gc_barrier_roots","calls")==2);
+    CHECK(phase_field(second,"gc_barrier_descriptors","calls")==1);
+    CHECK(phase_field(second,"gc_barrier_chunks","calls")==2);
+    store.cancel_collection();
+    store.transact(store.sequence(),{{"root-2",payload(128,78)}});
+    auto cancelled=store.metrics_json();
+    CHECK(field(cancelled,"gc_barrier_calls")==field(second,"gc_barrier_calls"));
+    for(auto phase:{"gc_barrier_roots","gc_barrier_descriptors","gc_barrier_chunks"})
+        CHECK(phase_field(cancelled,phase,"calls")==phase_field(second,phase,"calls"));
+    store.verify();
+    CHECK(store.object(store.root("root-1"))==payload(128,77));
+}
 void drain(LevelStore& store) {
     for(unsigned i=0;i<256;++i) {
         auto report=store.collect_step(256*1024,32);
@@ -60,6 +100,7 @@ int main() {
     auto temp=(std::filesystem::temp_directory_path()/"ff-online-gc-XXXXXX").string();
     CHECK(mkdtemp(temp.data()));
     try {
+        publication_metrics(temp+"/metrics");
         const auto repo=temp+"/repo";
         LevelStore::create(repo);
         auto live=payload(192*1024,1);

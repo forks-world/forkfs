@@ -42,6 +42,21 @@ def gc_job_rates(events):
     return list(jobs.values())
 
 
+def process_rss(proc):
+    """Read one live child's RSS in bytes; never accept an exited/reused PID."""
+    if proc is None or proc.poll() is not None:
+        return None
+    result = subprocess.run(['/bin/ps', '-o', 'rss=', '-p', str(proc.pid)],
+                            capture_output=True, text=True, timeout=2)
+    if proc.poll() is not None:
+        return None
+    value = result.stdout.strip()
+    if result.returncode or not value.isascii() or not value.isdecimal() or int(value) <= 0:
+        raise RuntimeError(f'cannot sample live daemon RSS for pid {proc.pid}: {result.stderr!r}, {value!r}')
+    # Both macOS and Linux ps report RSS in KiB.
+    return {'pid': proc.pid, 'rss_bytes': int(value) * 1024}
+
+
 class Soak(_workload.Workload):
     def __init__(self, args):
         super().__init__(args)
@@ -49,6 +64,10 @@ class Soak(_workload.Workload):
         self.sample_stop = threading.Event()
         self.sample_thread = None
         self.sample_count = 0
+        self.memory_lock = threading.Lock()
+        self.memory_sample_count = 0
+        self.memory_peak_bytes = 0
+        self.memory_log = (self.root / 'process-memory.jsonl').open('w', buffering=1)
         self.storage_peak_lock = threading.Lock()
         self.storage_peaks = {key: 0 for key in ('allocated_bytes', 'segment_bytes', 'index_bytes',
                                                   'control_bytes', 'mark_scratch_bytes',
@@ -89,6 +108,26 @@ class Soak(_workload.Workload):
         self.settings['worker_revision_pattern'] = 'r{generation}w{worker}'
         self.settings['revision_policy'] = 'retain all; no revision deletion API is used'
         (self.root / 'settings.json').write_text(json.dumps(self.settings, default=str, indent=2))
+
+    def sample_memory(self):
+        # Capture the Popen object before measuring: replay and restart may switch
+        # self.proc concurrently. A successful post-read poll rejects PID reuse.
+        sample = process_rss(self.proc)
+        if sample is None:
+            return
+        sample.update(time_ns=time.time_ns(), phase=self.phase)
+        with self.memory_lock:
+            self.memory_log.write(json.dumps(sample) + '\n')
+            self.memory_sample_count += 1
+            self.memory_peak_bytes = max(self.memory_peak_bytes, sample['rss_bytes'])
+        if self.args.max_rss_mib is not None and sample['rss_bytes'] > self.args.max_rss_mib * 1024 * 1024:
+            raise AssertionError(('daemon RSS budget exceeded', sample))
+
+    def start(self, db=None):
+        super().start(db)
+        # Capture even short-lived/replayed daemons when the periodic sampler
+        # would otherwise miss their entire lifetime.
+        self.sample_memory()
 
     def remaining(self):
         if self.shutdown_phase:
@@ -141,6 +180,7 @@ class Soak(_workload.Workload):
         def sample():
             try:
                 while not self.sample_stop.is_set():
+                    self.sample_memory()
                     if self.db.exists():
                         row = _workload.disk_usage(self.db)
                         artifacts = _workload.disk_usage(self.root)
@@ -537,6 +577,15 @@ class Soak(_workload.Workload):
                 raise TimeoutError('storage sampler did not stop before successful report')
             self.check_background()
             self.check_artifact_budget()
+        with self.memory_lock:
+            memory = {'sample_count': self.memory_sample_count,
+                      'sampled_peak_rss_bytes': self.memory_peak_bytes,
+                      'limit_mib': self.args.max_rss_mib,
+                      'peak_exact': False, 'method': '/bin/ps RSS KiB converted to bytes',
+                      'scope': 'currently selected daemon only; excludes harness, CLI children and any paused source daemon during replay',
+                      'samples_file': str(self.root / 'process-memory.jsonl')}
+        if state == 'passed' and not memory['sample_count']:
+            raise AssertionError('no daemon RSS samples recorded')
         super().report(state, failure)
         path = self.root / 'summary.json'
         result = json.loads(path.read_text())
@@ -544,6 +593,7 @@ class Soak(_workload.Workload):
             sampled_peaks = dict(self.storage_peaks)
             sample_count = self.sample_count
         result.update({
+            'process_memory': memory,
             'rpc_latency_raw_summary': {k: rpc_distribution(v) for k, v in self.samples.items()},
             'storage_samples_file': str(self.root / 'storage-samples.jsonl'),
             'storage_sample_count': sample_count,
@@ -594,6 +644,7 @@ class Soak(_workload.Workload):
                     pass
             super().close()
         finally:
+            self.memory_log.close()
             self.storage_samples_log.close()
             self.job_log.close()
 
@@ -611,6 +662,7 @@ def main():
     parser.add_argument('--seconds', type=float, default=0, help='optional development-phase duration cap')
     parser.add_argument('--sample-interval', type=float, default=.5)
     parser.add_argument('--max-store-mib', type=int, default=512)
+    parser.add_argument('--max-rss-mib', type=int, default=None, help='optional sampled RSS limit for each selected daemon; not a hard OS memory cap')
     parser.add_argument('--max-rpcs', type=int, default=1000000, help='bound retained latency samples and job observations')
     parser.add_argument('--max-artifact-mib', type=int, default=None)
     parser.add_argument('--deadline', type=float, default=1800)
@@ -623,6 +675,8 @@ def main():
     args.restart_every = 1
     if args.max_artifact_mib is None:
         args.max_artifact_mib = args.max_store_mib * 8
+    if args.max_rss_mib is not None and args.max_rss_mib < 1:
+        parser.error('max-rss-mib must be positive')
     if args.max_artifact_mib < 1:
         parser.error('max-artifact-mib must be positive')
     if not __debug__:

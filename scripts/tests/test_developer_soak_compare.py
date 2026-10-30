@@ -54,3 +54,19 @@ class ComparisonTests(unittest.TestCase):
             paths = self.make_pair(Path(temp));self.change(paths[1], 'retained_revision_counts', [5, 7])
             with self.assertRaisesRegex(ValueError, 'generation counts'):
                 compare(*paths)
+
+    def test_different_rss_limits_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            paths = self.make_pair(Path(temp))
+            self.change(paths[1].parent/'settings.json', 'max_rss_mib', 256)
+            with self.assertRaisesRegex(ValueError, 'max_rss_mib'):
+                compare(*paths)
+
+    def test_memory_measurements_are_carried_into_comparison(self):
+        with tempfile.TemporaryDirectory() as temp:
+            paths = self.make_pair(Path(temp))
+            memory = {'sampled_peak_rss_bytes': 123456, 'peak_exact': False}
+            self.change(paths[1], 'process_memory', memory)
+            result = compare(*paths)
+            self.assertEqual(result['process_memory']['concurrent'], memory)
+            self.assertIsNone(result['process_memory']['disabled'])
