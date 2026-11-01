@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <set>
 
 namespace forkfs {
 // A temporary named-object transaction API. Names are retention roots, not paths.
@@ -28,6 +29,8 @@ public:
     bool is_leveldb() const {return bool(leveldb_);}
     std::string repository() const;
     void compact();
+    size_t collect(uint64_t expected,const std::set<std::array<unsigned char,32>>& live,
+                   const std::vector<std::string>& obsolete_roots);
     std::string metrics_json(bool detailed=false) const;
     Journal(int fd, const std::array<unsigned char,16>& repository, const Checkpoint& checkpoint = {});
     void put(const std::string& key, const std::vector<unsigned char>& bytes);
