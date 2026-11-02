@@ -3,6 +3,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <set>
 namespace leveldb {class DB;class Cache;class FilterPolicy;class Env;}
 namespace forkfs {
 // One upstream LevelDB per repository. Objects are immutable; heads and the
@@ -21,6 +22,8 @@ public:
     std::vector<std::string> keys(const std::string& prefix) const;
     void verify() const;
     void compact();
+    size_t collect(uint64_t expected,const std::set<std::array<unsigned char,32>>& live,
+                   const std::vector<std::string>& obsolete_roots);
     struct CacheStats {uint64_t hits,misses;size_t charge;};
     CacheStats cache_stats() const;
     std::string metrics_json(bool detailed=false) const;

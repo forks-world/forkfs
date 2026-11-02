@@ -504,3 +504,9 @@ std::vector<unsigned char> Journal::get(const std::string& key) const {
     return read_object(it->second);
 }
 }
+
+namespace forkfs {
+size_t Journal::collect(uint64_t expected,const std::set<std::array<unsigned char,32>>& live,const std::vector<std::string>& roots) {
+    need(bool(leveldb_),"physical GC requires LevelDB");return leveldb_->collect(expected,live,roots);
+}
+}

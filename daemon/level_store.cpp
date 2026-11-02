@@ -236,3 +236,30 @@ void LevelStore::verify() const {
 }
 void LevelStore::compact() {{std::lock_guard lock(mutex_);healthy();db_->CompactRange(nullptr,nullptr);}verify();}
 }
+
+namespace forkfs {
+size_t LevelStore::collect(uint64_t expected,const std::set<Id>& live,const std::vector<std::string>& obsolete_roots) {
+    std::lock_guard lock(mutex_);healthy();
+    need(sequence_==expected && expected!=UINT64_MAX,"GC sequence conflict");
+    // Validate the complete mark before the first deletion. Never use the payload
+    // cache here: deleted objects must not be resurrected by a later reference.
+    for(const auto& hash:live){std::string value;need(read("O/"+bytes(hash),value),"GC live object missing");}
+    leveldb::WriteBatch batch;size_t removed=0;
+    leveldb::ReadOptions read_options;read_options.fill_cache=false;
+    std::unique_ptr<leveldb::Iterator> it(db_->NewIterator(read_options));
+    for(it->Seek("O/");it->Valid() && it->key().starts_with("O/");it->Next()) {
+        auto key=it->key().ToString();need(key.size()==34,"invalid object key");
+        if(!live.contains(id(key.substr(2)))){batch.Delete(key);++removed;}
+    }
+    status(it->status(),"scan GC objects");
+    for(const auto& key:obsolete_roots){need(contains(key),"GC root disappeared");batch.Delete("R/"+key);}
+    need(removed<=objects_ && obsolete_roots.size()<=roots_,"invalid GC counters");
+    batch.Put("M/sequence",integer(expected+1));batch.Put("M/objects",integer(objects_-removed));
+    batch.Put("M/roots",integer(roots_-obsolete_roots.size()));
+    fault("gc_before_write");leveldb::WriteOptions options;options.sync=true;
+    auto result=db_->Write(options,&batch);if(!result.ok()){poisoned_=true;status(result,"commit GC");}
+    sequence_=expected+1;objects_-=removed;roots_-=obsolete_roots.size();
+    object_cache_->Prune();
+    fault("gc_after_write");return removed;
+}
+}
