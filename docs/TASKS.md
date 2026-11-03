@@ -1,3 +1,5 @@
+> Historical native-backend material: the supported runtime is now revision-only `forkfsd`. See [transition policy](REVISION_ONLY.md). Native-directory features below are retired, not pending supported work.
+
 # BranchFS / World FS — 任务分解与进度
 
 依据 `arch.md` v0.3。本文件是唯一的任务看板,状态用 `[ ]` / `[~]` / `[x]` 标记。

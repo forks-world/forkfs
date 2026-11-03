@@ -1,3 +1,5 @@
+> Historical native-backend material: the supported runtime is now revision-only `forkfsd`. See [transition policy](docs/REVISION_ONLY.md). Native-directory features below are retired, not pending supported work.
+
 # BranchFS Mac-first 设计文档 v0.3
 
 > 2026-10-08 整体设计入口：[用户态版本化文件系统与元数据服务](docs/USERSPACE_FILESYSTEM_DESIGN.md)。

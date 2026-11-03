@@ -1,3 +1,5 @@
+> Historical native-directory backend documentation. These commands and guarantees are retired; see [revision-only policy](REVISION_ONLY.md) for the supported runtime.
+
 # Linux: ext4 native-directory backend
 
 Ext4 supports init, fork, checkpoint, pool, diff, verify, discard, restore and GC.

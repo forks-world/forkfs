@@ -20,6 +20,8 @@ public:
     Container(const Container&) = delete;
     Container& operator=(const Container&) = delete;
     std::string status() const;
+    std::string space_json() const;
+    const std::string& repository_id() const {return id_;}
     std::string storage_profile() const;
     std::string storage_engine() const;
     void checkpoint();
@@ -58,6 +60,7 @@ private:
     mutable std::mutex mutex_;
     int fd_ = -1;
     std::string id_;
+    std::string repository_path_;
     bool degraded_ = false;
     std::array<unsigned char,4096> anchor_{};
     uint64_t anchor_offset_ = 0;

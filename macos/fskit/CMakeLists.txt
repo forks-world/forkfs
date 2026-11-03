@@ -1,3 +1,5 @@
+message(FATAL_ERROR "This native-directory backend is retired; use the revision-backed forkfsd target.")
+
 # FSKit appex executable. Entry point is Foundation's NSExtensionMain, like Apple's
 # own FSKit modules; principal class comes from Info.plist (EXExtensionPrincipalClass).
 add_executable(WorldFSExtension

@@ -29,7 +29,7 @@ std::string frame(const char* magic,const std::string& payload){
 }
 std::string response(uint32_t code,const std::string& value){std::string b;put32(b,code);return frame("FFRSP001",b+value);}
 std::vector<std::string> decode(const std::string& b){
-    size_t at=header;auto count=u32(b,at);at+=4;need(count>0 && count<=8,"RPC requires 1..8 fields");
+    size_t at=header;auto count=u32(b,at);at+=4;need(count>0 && count<=16,"RPC requires 1..16 fields");
     std::vector<std::string> result;
     for(uint32_t i=0;i<count;++i){auto n=u32(b,at);at+=4;need(n<=b.size()-at,"truncated RPC field");result.push_back(b.substr(at,n));at+=n;}
     need(at==b.size(),"trailing RPC bytes");return result;
@@ -67,6 +67,7 @@ struct OwnedDirectory {std::string view;bool revision;Namespace::DirectoryCursor
 struct Session {
     std::chrono::milliseconds lease;Clock::time_point deadline;bool closing=false;
     std::map<std::string,OwnedHandle> handles;
+    std::optional<OwnedHandle> mount;
     std::map<std::string,OwnedDirectory> directories;
 };
 class Sessions {
@@ -77,7 +78,7 @@ public:
         need(values_.size()<128,"session limit reached");auto token=random_token();
         while(values_.contains(token))token=random_token();
         auto duration=std::chrono::milliseconds(lease);
-        values_.emplace(token,Session{duration,Clock::now()+duration,false,{},{}});return token;
+        values_.emplace(token,Session{duration,Clock::now()+duration,false,{},{},{}});return token;
     }
     Session& acquire(const std::string& token){
         auto it=values_.find(token);need(it!=values_.end() && !it->second.closing && Clock::now()<it->second.deadline,"invalid or expired session");
@@ -96,6 +97,23 @@ public:
         for(const auto& [token,s]:values_)if(s.closing || Clock::now()>=s.deadline)dead.push_back(token);
         for(const auto& token:dead)close(token);
     }
+    void mount_acquire(const std::string& token,const std::string& view,bool revision) {
+        auto& selected=acquire(token);
+        if(selected.mount)need(selected.mount->view==view && selected.mount->revision==revision,"invalid mount view");
+        if(!revision)for(const auto& [other,s]:values_)if(other!=token) {
+            need(!s.mount || s.mount->revision || s.mount->view!=view,"mount view is busy");
+            for(const auto& [h,owner]:s.handles)need(owner.revision || owner.view!=view,"mount view has outstanding handles");
+        }
+        selected.mount=OwnedHandle{view,revision};
+    }
+    void mount_require(const std::string& token,const std::string& view,bool revision) {
+        auto& s=acquire(token);need(s.mount && s.mount->view==view && s.mount->revision==revision,"invalid mount view/session");
+    }
+    void authorize(const std::string& token,const std::string& view,bool revision,bool writes) const {
+        if(!writes || revision)return;
+        for(const auto& [other,s]:values_)if(other!=token && s.mount && !s.mount->revision && s.mount->view==view)
+            throw RpcError(EBUSY,"World is exclusively leased to a mounted filesystem");
+    }
     size_t directory_count() const {size_t n=0;for(const auto& [token,s]:values_)n+=s.directories.size();return n;}
     void shutdown(){while(!values_.empty())close(values_.begin()->first);}
 private:
@@ -106,16 +124,24 @@ struct Activity {
     ~Activity(){if(session && !session->closing)session->deadline=Clock::now()+session->lease;}
 };
 std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string> args){
-    const auto op=args[0];std::string view="main";bool revision=false;
+    auto op=args[0];std::string view="main";bool revision=false;
     size_t count=2;
     if(op=="status" || op=="storage-profile" || op=="fs-init" || op=="fs-check" || op=="fs-worlds" || op=="fs-revisions" || op=="fs-compact")count=1;
     if(op=="fs-write" || op=="fs-save" || op=="fs-rename" || op=="fs-link" || op=="fs-fork" || op=="fs-append" || op=="fs-truncate" || op=="fs-open" || op=="fs-happend" || op=="fs-htruncate" || op=="fs-hread-next" || op=="fs-hwrite-next" || op=="fs-symlink" || op=="fs-chmod" || op=="fs-setmtime" || op=="fs-hchmod" || op=="fs-hsetmtime" || op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-hlock")count=3;
     if(op=="fs-read-at" || op=="fs-write-at" || op=="fs-hread" || op=="fs-hwrite" || op=="fs-hseek" || op=="fs-hrange-lock")count=4;
+    if(op=="inode-root" || op=="inode-sync" || op=="inode-space")count=1;
+    if(op=="inode-stat" || op=="inode-dir-open" || op=="inode-readlink")count=2;
+    if(op=="inode-lookup" || op=="inode-open")count=3;
+    if(op=="inode-create" || op=="inode-mkdir" || op=="inode-symlink" || op=="inode-link")count=4;
+    if(op=="inode-remove")count=5;
+    if(op=="inode-setattr")count=6;
+    if(op=="inode-rename")count=7;
+    uint32_t creation_mode=0644;
     std::string session_token;bool selected_view=false;
     while(args.size()>=count+2) {
         const auto& selector=args[args.size()-2];const auto& value=args.back();
         if(selector=="--world" || selector=="--revision") {
-            need(op.starts_with("fs-") && !selected_view,"invalid or duplicate view selector");
+            need((op.starts_with("fs-") || op.starts_with("inode-")) && !selected_view,"invalid or duplicate view selector");
             view=value;revision=selector=="--revision";selected_view=true;
         } else if(selector=="--session") {
             need(!op.starts_with("session-") && session_token.empty(),"invalid or duplicate session selector");
@@ -133,7 +159,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="session-close"){sessions.acquire(args[1]);sessions.close(args[1]);return store.status();}
     bool handle_op=op=="fs-open" || op=="fs-close" || op=="fs-dup" || op.starts_with("fs-h");
     bool dir_op=op.starts_with("fs-dir-");
-    need(!(handle_op || dir_op) || !session_token.empty(),"handle operations require --session TOKEN");
+    need(!(handle_op || dir_op || op.starts_with("inode-")) || !session_token.empty(),"handle operations require --session TOKEN");
     Activity activity{session_token.empty()?nullptr:&sessions.acquire(session_token)};
     if(handle_op && op!="fs-open")need(activity.session->handles.contains(args[1]),"handle belongs to another session");
     if(dir_op && op!="fs-dir-open") {
@@ -142,7 +168,60 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     if(op=="status")return store.status();
     if(op=="storage-profile")return store.storage_profile();
+    static const std::set<std::string> reads{"fs-cat","fs-read-at","fs-ls","fs-stat","fs-lstat","fs-readlink","fs-check","fs-worlds","fs-revisions","fs-snapshot","fs-fork",
+        "fs-hstat","fs-hread","fs-hread-next","fs-hseek","fs-close","fs-dup","fs-hlock","fs-hrange-lock","fs-dir-open","fs-dir-page","fs-dir-entries","fs-dir-rewind","fs-dir-close"};
+    sessions.authorize(session_token,view,revision,!reads.contains(op));
+    if(op.starts_with("inode-") && op!="inode-root")sessions.mount_require(session_token,view,revision);
     Namespace fs(store,view,revision);
+    // RPC dispatch is serial. Resolve inode identities and mutate under the same
+    // dispatch turn; another RPC cannot retarget the path between these steps.
+    auto child=[&](const std::string& parent,const std::string& name) {
+        need(!name.empty() && name!="." && name!=".." && name.find('/')==name.npos,"invalid mount name");
+        auto path=fs.path_for_inode(parent);need(fs.lstat(path).directory,"parent is not a directory");
+        return path=="/"?path+name:path+"/"+name;
+    };
+    if(op=="inode-root") {
+        need(store.storage_engine()=="leveldb","mount requires LevelDB");
+        auto root_info=fs.lstat("/");auto cursor=fs.open_directory("/");(void)fs.read_directory(cursor,1);sessions.mount_acquire(session_token,view,revision);
+        return "{\"inode\":"+inode_json(root_info)+",\"repository\":"+quoted(store.repository_id())+
+            ",\"uid\":"+std::to_string(geteuid())+",\"gid\":"+std::to_string(getegid())+"}\n";
+    }
+    if(op=="inode-space")return store.space_json();
+    if(op=="inode-sync")return store.status(); // Every mutation already commits synchronously.
+    if(op=="inode-lookup"){auto path=child(args[1],args[2]);op="fs-lstat";args={op,path};}
+    else if(op=="inode-stat" || op=="inode-dir-open" || op=="inode-readlink" || op=="inode-open") {
+        auto path=fs.path_for_inode(args[1]);auto mode=op=="inode-open"?args[2]:"";
+        op=op=="inode-stat"?"fs-lstat":op=="inode-dir-open"?"fs-dir-open":op=="inode-readlink"?"fs-readlink":"fs-open";
+        args={op,path};if(op=="fs-open"){need(!fs.lstat(path).symlink,"symbolic link open is forbidden");args.push_back(mode+",nofollow");}
+    } else if(op=="inode-create") {
+        auto path=child(args[1],args[2]);auto mode=number(args[3]);need(mode<=0777,"unsupported mode bits");creation_mode=static_cast<uint32_t>(mode);
+        op="fs-open";args={op,path,"rw,create,exclusive,nofollow"};
+    } else if(op=="inode-mkdir") {
+        auto path=child(args[1],args[2]);auto mode=number(args[3]);need(mode<=0777,"unsupported mode bits");
+        fs.mkdir(path,static_cast<uint32_t>(mode));return inode_json(fs.lstat(path));
+    } else if(op=="inode-symlink") {
+        auto path=child(args[1],args[2]);fs.symlink(args[3],path);return inode_json(fs.lstat(path));
+    } else if(op=="inode-link") {
+        auto source=fs.path_for_inode(args[1]),target=child(args[2],args[3]);fs.link(source,target);return inode_json(fs.lstat(target));
+    } else if(op=="inode-remove") {
+        auto path=child(args[1],args[2]);need(fs.lstat(path).id==args[3],"invalid stale directory entry");
+        need(args[4]=="file" || args[4]=="directory","invalid removal type");fs.remove(path,args[4]=="directory");return store.status();
+    } else if(op=="inode-rename") {
+        auto source=child(args[1],args[2]),target=child(args[3],args[4]);need(fs.lstat(source).id==args[5],"invalid stale source entry");
+        if(args[6]!="-")need(fs.lstat(target).id==args[6],"invalid stale target entry");
+        else {bool missing=false;try{(void)fs.lstat(target);}catch(const std::runtime_error& e){if(std::string_view(e.what())=="path not found")missing=true;else throw;}
+            need(missing,"target already exists");}
+        fs.rename(source,target);return inode_json(fs.lstat(target));
+    } else if(op=="inode-setattr") {
+        Namespace::Attributes a;if(args[2]!="-"){auto mode=number(args[2]);need(mode<=0777,"unsupported mode bits");a.mode=static_cast<uint32_t>(mode);}
+        if(args[3]!="-")a.size=number(args[3]);if(args[4]!="-")a.modified_ns=number(args[4]);
+        if(args[5]!="-") {
+            need(activity.session->handles.contains(args[5]),"handle belongs to another session");
+            need(fs.handle_stat(args[5]).id==args[1],"invalid inode/handle pairing");fs.handle_set_attributes(args[5],a);return inode_json(fs.handle_stat(args[5]));
+        }
+        auto path=fs.path_for_inode(args[1]);need(!fs.lstat(path).symlink,"symbolic link attributes are unsupported");
+        fs.set_attributes(path,a);return inode_json(fs.lstat(path));
+    }
     if(op=="fs-dir-open") {
         need(activity.session->directories.size()<64 && sessions.directory_count()<1024,"directory cursor limit reached");
         auto cursor=fs.open_directory(args[1]);auto token=random_token();
@@ -166,7 +245,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         auto comma=args[2].find(',');auto mode=args[2].substr(0,comma);
         need(mode=="r" || mode=="w" || mode=="rw","invalid handle access mode");
         auto access=mode=="r"?Namespace::Access::Read:mode=="w"?Namespace::Access::Write:Namespace::Access::ReadWrite;
-        Namespace::OpenOptions options;std::set<std::string> flags;
+        Namespace::OpenOptions options;options.mode=creation_mode;std::set<std::string> flags;
         while(comma!=std::string::npos) {
             auto start=comma+1;comma=args[2].find(',',start);auto flag=args[2].substr(start,comma==std::string::npos?comma:comma-start);
             need(flags.insert(flag).second,"duplicate open flag");
@@ -267,12 +346,7 @@ bool owner(int fd){
     return getsockopt(fd,SOL_SOCKET,SO_PEERCRED,&creds,&n)==0 && creds.uid==geteuid();
 #endif
 }
-void wait_fd(int fd,short events,Clock::time_point deadline){
-    while(true){auto left=std::chrono::duration_cast<std::chrono::milliseconds>(deadline-Clock::now()).count();
-        need(left>0,"RPC timeout");pollfd p{fd,events,0};int n=poll(&p,1,std::min<int64_t>(left,100));
-        if(n<0 && errno==EINTR)continue;need(n>=0,"RPC poll failed");if(n && (p.revents&(events|POLLERR|POLLHUP)))return;
-    }
-}
+
 }
 void serve_rpc(int listener,Container& container,const volatile sig_atomic_t& stopping){
     std::vector<std::unique_ptr<Peer>> peers;Sessions sessions(container);
@@ -296,9 +370,15 @@ void serve_rpc(int listener,Container& container,const volatile sig_atomic_t& st
                             need(!memcmp(p.in.data(),"FFRPC001",8),"unsupported RPC protocol");
                             auto length=u32(p.in,8);need(length>=4 && length<=limit,"invalid RPC request length");
                             need(p.in.size()<=header+length,"trailing RPC frame");
-                            if(p.in.size()==header+length)p.out=response(0,dispatch(container,sessions,decode(p.in)));
+                            if(p.in.size()==header+length) {
+                                auto fields=decode(p.in);bool inode_request=fields[0].starts_with("inode-");
+                                try {p.out=response(0,dispatch(container,sessions,fields));}
+                                catch(const RpcError&){throw;}
+                                catch(const std::exception& e){if(inode_request)throw RpcError(rpc_posix_error(e.what()),e.what());throw;}
+                            }
                         }
-                    }catch(const std::exception& e){p.out=response(1,e.what());}
+                    }catch(const RpcError& e){p.out=response(static_cast<uint32_t>(e.code)+1,e.what());}
+                    catch(const std::exception& e){p.out=response(1,e.what());}
                 }
             }
             if(!p.out.empty() && (events&POLLOUT)){
@@ -315,42 +395,5 @@ void serve_rpc(int listener,Container& container,const volatile sig_atomic_t& st
         }
     }
     sessions.shutdown();
-}
-std::string request_rpc(const std::string& path,const std::vector<std::string>& fields){
-    need(!fields.empty() && fields.size()<=8,"RPC requires 1..8 fields");std::string payload;put32(payload,fields.size());
-    for(const auto& field:fields){need(field.size()<=limit,"oversized RPC field");put32(payload,field.size());payload+=field;}
-    auto request=frame("FFRPC001",payload);sockaddr_un addr{};
-    need(path.size()<sizeof(addr.sun_path),"socket path too long");addr.sun_family=AF_UNIX;memcpy(addr.sun_path,path.c_str(),path.size()+1);
-    Peer peer(socket(AF_UNIX,SOCK_STREAM,0));need(peer.fd>=0,"RPC socket failed");
-    need(fcntl(peer.fd,F_SETFD,FD_CLOEXEC)==0 && fcntl(peer.fd,F_SETFL,O_NONBLOCK)==0,"RPC socket flags failed");
-#ifdef __APPLE__
-    int yes=1;need(setsockopt(peer.fd,SOL_SOCKET,SO_NOSIGPIPE,&yes,sizeof(yes))==0,"RPC socket SIGPIPE option failed");
-#endif
-    auto deadline=Clock::now()+std::chrono::seconds(10);
-    if(connect(peer.fd,reinterpret_cast<sockaddr*>(&addr),sizeof(addr))<0){
-        need(errno==EINPROGRESS,"RPC connect failed");wait_fd(peer.fd,POLLOUT,deadline);
-        int error=0;socklen_t len=sizeof(error);need(getsockopt(peer.fd,SOL_SOCKET,SO_ERROR,&error,&len)==0 && error==0,"RPC connect failed");
-    }
-    size_t sent=0;
-    while(sent<request.size()){
-        wait_fd(peer.fd,POLLOUT,deadline);
-#ifdef __APPLE__
-        auto n=send(peer.fd,request.data()+sent,request.size()-sent,0);
-#else
-        auto n=send(peer.fd,request.data()+sent,request.size()-sent,MSG_NOSIGNAL);
-#endif
-        if(n<0 && (errno==EINTR || errno==EAGAIN || errno==EWOULDBLOCK))continue;
-        need(n>0,"RPC send failed");sent+=n;
-    }
-    std::string reply;size_t target=header;
-    while(reply.size()<target){wait_fd(peer.fd,POLLIN,deadline);char buf[16384];
-        auto n=recv(peer.fd,buf,std::min(sizeof(buf),target-reply.size()),0);
-        if(n<0 && (errno==EINTR || errno==EAGAIN || errno==EWOULDBLOCK))continue;
-        need(n>0,"truncated RPC reply");reply.append(buf,n);
-        if(reply.size()==header){need(!memcmp(reply.data(),"FFRSP001",8),"unsupported RPC reply");auto length=u32(reply,8);
-            need(length>=4 && length<=limit,"invalid RPC reply length");target=header+length;}
-    }
-    auto code=u32(reply,header);auto value=reply.substr(header+4);
-    if(code)throw std::runtime_error(value);return value;
 }
 }

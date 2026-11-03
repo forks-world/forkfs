@@ -1,3 +1,5 @@
+message(FATAL_ERROR "This native-directory backend is retired; use the revision-backed forkfsd target.")
+
 find_package(SQLite3 REQUIRED)
 find_package(Threads REQUIRED)
 

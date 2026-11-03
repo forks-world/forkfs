@@ -1,3 +1,5 @@
+> Historical native-directory backend documentation. These commands and guarantees are retired; see [revision-only policy](REVISION_ONLY.md) for the supported runtime.
+
 # Continuous work history for agents
 
 The proposed filesystem revision/root model is now specified in the

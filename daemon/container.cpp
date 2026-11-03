@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 namespace forkfs {
@@ -151,7 +152,7 @@ void Container::create_legacy(const std::string& path) {
     // that another process might have replaced while initialization was running.
 }
 
-Container::Container(const std::string& path) {
+Container::Container(const std::string& path):repository_path_(path) {
     struct stat backing{};
     if(lstat(path.c_str(),&backing)==0 && S_ISDIR(backing.st_mode)) {
         journal_=std::make_unique<Journal>(path);id_=journal_->repository();Namespace::recover_orphans(*this);return;
@@ -319,5 +320,14 @@ size_t Container::collect_garbage() {
     std::vector<std::string> obsolete;
     for(const auto& key:registry)if(!live.contains(j.root_object(key)))obsolete.push_back(key);
     auto removed=j.collect(j.sequence(),live,obsolete);j.compact();return removed;
+}
+}
+
+namespace forkfs {
+std::string Container::space_json() const {
+    std::lock_guard lock(mutex_);struct statvfs st{};if(statvfs(repository_path_.c_str(),&st))fail("statvfs");
+    return "{\"block_size\":"+std::to_string(st.f_frsize)+",\"blocks\":"+std::to_string(st.f_blocks)+
+        ",\"free_blocks\":"+std::to_string(st.f_bfree)+",\"available_blocks\":"+std::to_string(st.f_bavail)+
+        ",\"files\":"+std::to_string(st.f_files)+",\"free_files\":"+std::to_string(st.f_ffree)+"}\n";
 }
 }

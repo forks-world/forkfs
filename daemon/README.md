@@ -3,7 +3,7 @@
 The default backend is upstream LevelDB 1.23, pinned as a submodule. A repository
 is a private directory (mode 0700), containing LevelDB's WAL, MANIFEST and SST
 files. No SQLite is used. This backing directory is not a World exposed to users;
-OS filesystem mounting is still unimplemented.
+The optional macOS FSKit frontend connects over RPC; see [setup and limits](../docs/FSKIT.md).
 
 LevelDB owns WAL, memtable, Bloom filters, block cache and physical compaction.
 A repository-wide 8 MiB LRU reuses verified immutable payloads across namespace
@@ -14,13 +14,13 @@ WriteBatch. See [the backend design](../docs/LEVELDB_METADATA_DESIGN.md).
 
 Old single-file containers remain readable. The legacy test binaries create that
 format to preserve regression coverage; new `forkfsd init` creates a directory.
-This executable is independent of the existing `world` / `worldfs_core` backend.
+This is the supported runtime. The native-directory `world` / `worldfs_core` backend is retired.
 
 ## Build and test
 
 ```sh
 git submodule update --init --recursive
-cmake -S . -B build/forkfsd -DWFS_BUILD_LEGACY=OFF -DCMAKE_BUILD_TYPE=Debug
+cmake -S . -B build/forkfsd -DCMAKE_BUILD_TYPE=Debug
 cmake --build build/forkfsd
 ctest --test-dir build/forkfsd -R forkfsd --output-on-failure
 ```
@@ -80,13 +80,13 @@ and closes incomplete/slow connections after five seconds. Network I/O uses a
 poll loop; namespace operations and local synchronous commits execute serially.
 Long storage operations can delay other requests and shutdown; the I/O timeout
 does not cancel an executing transaction. This is an experimental local control
-interface, not an OS mount adapter, filesystem handle API or an agent sandbox.
+interface. The optional FSKit client uses its inode/session operations; this is not an agent sandbox.
 
 Each connection carries one request/reply. Request magic `FFRPC001` and reply
 magic `FFRSP001` are followed by payload length u32 LE. Request payload is field
-count u32 LE (1..8), then length u32 LE + bytes for each field. First field is the
+count u32 LE (1..16), then length u32 LE + bytes for each field. First field is the
 command; write payload is binary. Reply payload starts with result code u32 LE
-(0 success, 1 error) followed by raw result/error bytes. The format is experimental.
+(0 success, 1 generic error, or POSIX errno + 1 for typed errors) followed by raw result/error bytes. The format is experimental.
 Supported commands are `status`, `fs-init`, `fs-mkdir`, `fs-write`, `fs-cat`,
 `fs-ls`, `fs-stat`, `fs-read-at`, `fs-write-at`, `fs-append`, `fs-truncate`, `fs-link`, `fs-rename`, `fs-unlink`, `fs-rmdir`, `fs-check`,
 `fs-compact`, `fs-snapshot`, `fs-fork`, `fs-worlds` and `fs-revisions`, with the
@@ -378,7 +378,7 @@ All RPC handle operations require `--session`; presenting another session's
 handle fails. View and session selectors can appear in either order, and duplicate
 selectors fail. Path operations can remain sessionless; attaching `--session`
 renews its lease. Session commands take their token positionally and accept no
-selectors. The binary framing is unchanged (maximum 8 fields). Examples:
+selectors. The binary framing is unchanged (maximum 16 fields). Examples:
 
 ```text
 request SOCKET session-open 60000
@@ -400,7 +400,7 @@ unfinished ownership state if a close fails; the service stops rather than
 silently forgetting retention. Startup recovery releases remaining orphan roots.
 Leases are a resource-lifetime mechanism, not World authorization or an agent
 sandbox. A mount client must maintain heartbeats during idle application periods;
-that client and OS integration remain unimplemented.
+the optional FSKit client now maintains those heartbeats; OS mount validation remains separate from callback tests.
 
 ## Legacy single-file scope
 
@@ -499,7 +499,7 @@ hardware power-loss or storage-reordering tests. Only local durability exists;
 remote ACK mode is not implemented yet.
 
 This is **not a mounted filesystem**: the namespace prototype below supports
-inodes and directory transactions, while GC, remote sync and mount callbacks remain to be implemented.
+inodes and directory transactions, while remote sync remains to be implemented. Offline LevelDB GC and the optional FSKit callback adapter are described above.
 Opening without a checkpoint scans the full journal. The status reports `object-journal` and
 `mounted: false`; `transactions_supported` covers the named-root batches used by
 the namespace prototype.
@@ -765,3 +765,32 @@ mark set and deletion batch in memory, and performs a full compaction. Schedule
 it during maintenance with enough temporary disk space for LevelDB compaction.
 Filesystem allocation changes depend on the underlying filesystem and LevelDB;
 the returned count measures deleted objects, not guaranteed reclaimed bytes.
+
+
+## FSKit inode RPC
+
+The optional revision frontend uses `inode-root` to acquire a leased mount view.
+For a mutable World, this excludes other sessions with file handles and blocks
+foreign namespace mutations until session close/expiry. Read-only revision mounts
+remain shareable. Snapshot/fork queries remain available; snapshots capture only
+the daemon's committed root, not unsent kernel writeback.
+
+Commands use inode identities, never host World paths: `inode-lookup PARENT NAME`,
+`inode-stat INODE`, `inode-dir-open INODE`, `inode-open INODE r|w|rw`,
+`inode-create PARENT NAME MODE`, `inode-mkdir PARENT NAME MODE`,
+`inode-symlink PARENT NAME TARGET`, `inode-readlink INODE`,
+`inode-link INODE PARENT NAME`, `inode-remove PARENT NAME EXPECTED_INODE file|directory`,
+`inode-rename SOURCE_PARENT SOURCE_NAME DEST_PARENT DEST_NAME EXPECTED_INODE EXPECTED_DEST_OR_DASH`,
+`inode-setattr INODE MODE_OR_DASH SIZE_OR_DASH MTIME_NS_OR_DASH HANDLE_OR_DASH`,
+`inode-space`, and `inode-sync`. All require `--session`; the mount must keep the
+same World/revision selector. Modes are decimal 0000..0777. Setattr publishes
+size/content and mode/mtime in one synchronous transaction; handle size changes
+require writable access. Subsequent I/O uses the existing session-owned `fs-h*`
+operations, preserving open-unlink behavior. Session loss is terminal for a mount.
+
+Inode-to-path resolution currently traverses the selected immutable metadata
+view on each operation inside the serial RPC dispatch. It never scans a native
+World directory or infers content from timestamps. This is a correctness-first
+prototype, not a qualified large-repository filesystem. Typed errors use reply
+code `errno+1`; old generic errors retain code 1. Frames still have a 1 MiB cap,
+now allowing up to 16 fields for inode-relative rename plus selectors.

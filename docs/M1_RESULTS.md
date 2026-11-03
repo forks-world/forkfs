@@ -1,3 +1,5 @@
+> Historical native-directory backend documentation. These commands and guarantees are retired; see [revision-only policy](REVISION_ONLY.md) for the supported runtime.
+
 # M1 基准:对照 arch.md §1 判据(T1.7)
 
 生成:`scripts/bench/m1_criteria.sh`,2026-09-19 15:29。

@@ -132,7 +132,7 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         for packet in [b'BADRPC01'+struct.pack('<I',4)+struct.pack('<I',1),
                        b'FFRPC001'+struct.pack('<I',1024*1024+1),
                        frame(['status'])+b'extra',
-                       b'FFRPC001'+struct.pack('<I',4)+struct.pack('<I',9),
+                       b'FFRPC001'+struct.pack('<I',4)+struct.pack('<I',17),
                        frame(['fs-mkdir','/partial'])[:-1]]:
             with socket.socket(socket.AF_UNIX) as s:
                 s.settimeout(5);s.connect(str(endpoint));s.sendall(packet);s.shutdown(socket.SHUT_WR)

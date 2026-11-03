@@ -1,3 +1,5 @@
+> Historical native-directory backend documentation. These commands and guarantees are retired; see [revision-only policy](REVISION_ONLY.md) for the supported runtime.
+
 # macOS support and validation
 
 The supported main path is the C++ CLI/core using ordinary APFS directories, with

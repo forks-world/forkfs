@@ -1,3 +1,5 @@
+message(FATAL_ERROR "This native-directory backend is retired; use the revision-backed forkfsd target.")
+
 set(WORLD_SOURCES main.cpp)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND WORLD_SOURCES linux_sandbox.cpp)

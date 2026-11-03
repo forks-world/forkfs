@@ -18,7 +18,7 @@ function(forkfs_object target)
     endif()
 endfunction()
 forkfs_object(forkfs_common namespace.cpp metadata_view.cpp maintenance.cpp)
-forkfs_object(forkfs_cli main.cpp rpc.cpp)
+forkfs_object(forkfs_cli main.cpp rpc.cpp rpc_client.cpp)
 forkfs_object(forkfs_metadata_tree_obj metadata_tree.cpp)
 forkfs_object(forkfs_journal_obj journal.cpp)
 forkfs_object(forkfs_level_obj level_store.cpp)
@@ -213,3 +213,11 @@ target_link_libraries(forkfs_metadata PUBLIC leveldb Threads::Threads)
 if(NOT APPLE)
     target_link_libraries(forkfs_metadata PUBLIC OpenSSL::Crypto)
 endif()
+
+add_test(NAME forkfs_revision_only COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/revision_only.py ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR})
+set_tests_properties(forkfs_revision_only PROPERTIES TIMEOUT 120)
+
+add_test(NAME forkfsd_inode_rpc COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/inode_rpc.py $<TARGET_FILE:forkfsd> ${CMAKE_SOURCE_DIR}/scripts/fskit-config.py)
+set_tests_properties(forkfsd_inode_rpc PROPERTIES TIMEOUT 120)

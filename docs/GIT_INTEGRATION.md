@@ -1,3 +1,5 @@
+> Historical native-directory backend documentation. These commands and guarantees are retired; see [revision-only policy](REVISION_ONLY.md) for the supported runtime.
+
 # Git-aware Worlds
 
 `world fs init` detects a Git repository at the source root. It imports an independent

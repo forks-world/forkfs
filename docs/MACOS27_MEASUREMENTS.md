@@ -1,3 +1,5 @@
+> Historical native-directory backend documentation. These commands and guarantees are retired; see [revision-only policy](REVISION_ONLY.md) for the supported runtime.
+
 # macOS 27.0 实测:FSKit passthrough 复测报告
 
 2026-09-19,Mac mini M1(4P+4E),**macOS 27.0(build 26A428,xnu-13432.1.9)**,
