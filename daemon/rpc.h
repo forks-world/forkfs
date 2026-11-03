@@ -11,6 +11,7 @@ inline int rpc_posix_error(std::string_view message) {
     if(message=="RPC timeout")return ETIMEDOUT;
     if(message=="RPC connect failed" || message=="RPC connection failed" || message=="RPC send failed" || message=="truncated RPC reply")return ENOTCONN;
     if(message=="object root not found")return ENOENT;
+    if(message=="path exceeds mount protocol limit")return ENAMETOOLONG;
     if(message=="path not found" || message=="source not found")return ENOENT;
     if((message.find("invalid stale")!=message.npos || message.find("invalid mount view")!=message.npos))return ESTALE;
     if(message=="inode is no longer linked" || message.find("invalid or expired session")!=message.npos || message.find("invalid file handle")!=message.npos)return ESTALE;

@@ -63,6 +63,21 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         assert obj('inode-lookup',did,'moved',*sel)['inode_id']==fid
         obj('inode-link',fid,rid,'alias',*sel)
         assert obj('inode-stat',fid,*sel)['links']==2
+        top=obj('inode-mkdir',rid,'x',str(0o700),*sel);topid=top['inode_id'];deep_parent=topid
+        component='d'*240;depth=16
+        for _ in range(depth):
+            deep_parent=obj('inode-mkdir',deep_parent,component,str(0o700),*sel)['inode_id']
+        old_path_length=2+depth*(1+len(component))
+        new_path_length=1+250+depth*(1+len(component))
+        assert old_path_length<=4096<new_path_length,(old_path_length,new_path_length)
+        deep_file=obj('inode-create',deep_parent,'leaf',str(0o600),*sel);deep_id=obj('fs-hstat',deep_file['handle'],*sel)['inode_id']
+        rpc('fs-close',deep_file['handle'],*sel)
+        obj('inode-link',deep_id,rid,'deep-alias',*sel)
+        rpc('inode-rename',rid,'x',rid,'z'*250,topid,'-',*sel)
+        rpc('inode-stat',deep_parent,*sel,error=errno.ENAMETOOLONG)
+        assert obj('inode-stat',deep_id,*sel)['inode_id']==deep_id
+        assert obj('inode-stat',fid,*sel)['inode_id']==fid
+        short_read=obj('inode-open',fid,'r',*sel)['handle'];rpc('fs-close',short_read,*sel)
         before=obj('status')['last_committed_seq']
         rpc('inode-setattr',fid,str(0o777),'262145','0',handle,*sel,error=errno.EFBIG)
         assert obj('status')['last_committed_seq']==before
@@ -82,7 +97,7 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         link=obj('inode-symlink',rid,'link','dir',*sel)
         assert rpc('inode-readlink',link['inode_id'],*sel)==b'dir'
         cursor=obj('inode-dir-open',rid,*sel)['cursor']
-        page=obj('fs-dir-entries',cursor,'100',*sel);assert page['eof'] and {x['name'] for x in page['entries']}=={'dir','link'}
+        page=obj('fs-dir-entries',cursor,'100',*sel);assert page['eof'] and {x['name'] for x in page['entries']}=={'dir','link','deep-alias','z'*250}
         rpc('fs-dir-close',cursor,*sel)
         ro=obj('session-open','60000')['session'];ro_sel=['--revision','base','--session',ro]
         ro_root=obj('inode-root',*ro_sel)['inode']['inode_id']

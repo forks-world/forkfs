@@ -744,18 +744,25 @@ namespace forkfs {
 std::string Namespace::path_for_inode(const std::string& id) const {
     need(valid_id(id),"invalid inode identity");std::lock_guard lock(container_.mutex_);
     NamespaceView view(*container_.journal_,view_,revision_);auto rid=root(view);
-    std::vector<std::pair<std::string,std::string>> pending{{rid,"/"}};std::set<std::string> visited;
+    struct PendingPath {std::string inode,path;bool too_long;};
+    // Keep overlong branches in the walk without retaining unbounded path strings.
+    std::vector<PendingPath> pending{{rid,"/",false}};std::set<std::string> visited;bool found_too_long=false;
     while(!pending.empty()) {
-        auto [current,path]=std::move(pending.back());pending.pop_back();if(current==id)return path;
+        auto entry=std::move(pending.back());pending.pop_back();auto& current=entry.inode;
+        // A file may have a short hardlink alias elsewhere, so defer the error.
+        if(current==id){if(!entry.too_long)return entry.path;found_too_long=true;}
         if(!inode(view,current).directory)continue;
         need(visited.insert(current).second,"invalid directory cycle or hardlink");
         auto pre=directory_prefix(current);
         for(const auto& key:view.keys(pre)) {
             auto name=key.substr(pre.size());auto child=decode_id(view.get(key));
-            auto next=path=="/"?path+name:path+"/"+name;
-            need(next.size()<=4096,"path exceeds mount protocol limit");pending.emplace_back(child,std::move(next));
+            auto separator=entry.path=="/"?size_t(0):size_t(1);
+            bool too_long=entry.too_long || entry.path.size()+separator>4096 || name.size()>4096-entry.path.size()-separator;
+            if(too_long)pending.push_back({std::move(child),{},true});
+            else {auto next=entry.path=="/"?entry.path+name:entry.path+"/"+name;pending.push_back({std::move(child),std::move(next),false});}
         }
     }
+    if(found_too_long)throw std::runtime_error("path exceeds mount protocol limit");
     throw std::runtime_error("inode is no longer linked");
 }
 }
