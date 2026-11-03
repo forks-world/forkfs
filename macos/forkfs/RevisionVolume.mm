@@ -66,9 +66,13 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
     @finally{[_lock unlock];}
     return error;
 }
+- (uint64_t)numberForInode:(NSString*)inode {
+    require([inode isKindOfClass:NSString.class] && inode.length==32,EPROTO,"invalid inode attributes");
+    NSNumber* number=_numbers[inode];if(!number){number=@(_nextItem++);_numbers[inode]=number;}return number.unsignedLongLongValue;
+}
 - (RevisionItem*)remember:(NSDictionary*)attrs parent:(uint64_t)parent {
     NSString* inode=attrs[@"inode_id"];require([inode isKindOfClass:NSString.class] && inode.length==32,EPROTO,"invalid inode attributes");
-    RevisionItem* item=_items[inode];if(!item){item=[RevisionItem new];item.inode=inode;item.number=_numbers[inode]?_numbers[inode].unsignedLongLongValue:_nextItem++;_numbers[inode]=@(item.number);_items[inode]=item;}
+    RevisionItem* item=_items[inode];if(!item){item=[RevisionItem new];item.inode=inode;item.number=[self numberForInode:inode];_items[inode]=item;}
     item.attrs=attrs;item.parent=parent;return item;
 }
 - (FSItemAttributes*)attributes:(RevisionItem*)item {
@@ -231,7 +235,8 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
         for(NSUInteger index=cookie;index<entries.count;++index){NSDictionary* entry=entries[index];BOOL dot=entry[@"dotID"]!=nil;
             RevisionItem* it=nil;FSItemType type=FSItemTypeDirectory;FSItemID itemID;
             if(dot)itemID=(FSItemID)[entry[@"dotID"] unsignedLongLongValue];
-            else {it=[self remember:entry[@"inode"] parent:dir.number];type=itemType(it.attrs);itemID=(FSItemID)it.number;}
+            else {NSDictionary* snapshot=entry[@"inode"];type=itemType(snapshot);itemID=(FSItemID)[self numberForInode:snapshot[@"inode_id"]];
+                if(attributes){it=[RevisionItem new];it.inode=snapshot[@"inode_id"];it.number=itemID;it.parent=dir.number;it.attrs=snapshot;}}
             if(![packer packEntryWithName:[FSFileName nameWithString:entry[@"name"]] itemType:type itemID:itemID nextCookie:index+1 attributes:(attributes && it)?[self attributes:it]:nil])break;
         }
         // Bounded snapshots remain available for resumed cookies. Evict only when
