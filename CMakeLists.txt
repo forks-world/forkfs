@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
-project(worldfs LANGUAGES C CXX)
+# Retired switches fail explicitly instead of silently restoring native-tree semantics.
+if(WFS_BUILD_LEGACY)
+    message(FATAL_ERROR "The native-directory world/core/FSKit backend is retired. Only the revision-backed runtime is supported.")
+endif()
+if(EXISTS "${CMAKE_BINARY_DIR}/cli/world" OR EXISTS "${CMAKE_BINARY_DIR}/core/libworldfs_core.a")
+    message(FATAL_ERROR "This build directory contains retired world artifacts. Use a fresh build directory; existing files are preserved.")
+endif()
+project(forkfs LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,7 +16,6 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 if(APPLE)
-    enable_language(OBJCXX)
     # Command Line Tools ship an incomplete usr/include/c++/v1 that shadows the SDK's libc++
     # headers. Point the compiler at the SDK copy explicitly.
     execute_process(COMMAND xcrun --show-sdk-path OUTPUT_VARIABLE WFS_SDK OUTPUT_STRIP_TRAILING_WHITESPACE)
@@ -20,26 +26,18 @@ if(APPLE)
     endif()
 endif()
 
-# Header-only third-party libraries (git submodules), see arch.md §39.
-add_library(wfs_third_party INTERFACE)
-target_include_directories(wfs_third_party SYSTEM INTERFACE
-    ${CMAKE_SOURCE_DIR}/third_party/fmt/include
-    ${CMAKE_SOURCE_DIR}/third_party/Containa
-    ${CMAKE_SOURCE_DIR}/third_party/Arena/include
-)
-target_compile_definitions(wfs_third_party INTERFACE FMT_HEADER_ONLY=1)
-
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     add_link_options(-static-libstdc++)
 endif()
 
 enable_testing()
-option(WFS_BUILD_LEGACY "Build the existing world CLI and core" ON)
-if(WFS_BUILD_LEGACY)
-    add_subdirectory(core)
-    add_subdirectory(cli)
-    if(APPLE AND WFS_FSKIT)
-        add_subdirectory(macos/fskit)
-    endif()
-endif()
 add_subdirectory(daemon)
+
+option(WFS_FSKIT "Build the revision-backed macOS FSKit frontend" OFF)
+if(WFS_FSKIT)
+    if(NOT APPLE)
+        message(FATAL_ERROR "The revision FSKit frontend requires macOS")
+    endif()
+    enable_language(OBJCXX)
+    add_subdirectory(macos/forkfs)
+endif()

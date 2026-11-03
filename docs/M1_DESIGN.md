@@ -1,3 +1,5 @@
+> Historical native-directory backend documentation. These commands and guarantees are retired; see [revision-only policy](REVISION_ONLY.md) for the supported runtime.
+
 # M1 设计:clonefile World(方案 C)
 
 > 2026-10-08 后续整体提案：[用户态版本化文件系统与元数据服务](USERSPACE_FILESYSTEM_DESIGN.md)。

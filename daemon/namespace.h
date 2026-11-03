@@ -14,7 +14,7 @@ struct InodeInfo {
 class NamespaceView;
 class Namespace {
 public:
-    struct Attributes {std::optional<uint32_t> mode;std::optional<uint64_t> modified_ns;};
+    struct Attributes {std::optional<uint32_t> mode;std::optional<uint64_t> modified_ns;std::optional<uint64_t> size;};
     class DirectoryCursor {
         friend class Namespace;
         std::weak_ptr<const int> lifetime_;
@@ -38,7 +38,8 @@ public:
     void initialize();
     void compact();
     size_t run_count() const;
-    void mkdir(const std::string& path);
+    void mkdir(const std::string& path,uint32_t mode=0755);
+    std::string path_for_inode(const std::string& id) const;
     void write(const std::string& path,const std::vector<unsigned char>& value);
     void replace_file(const std::string& path,const std::vector<unsigned char>& value);
     void write_at(const std::string& path,uint64_t offset,const std::vector<unsigned char>& value);

@@ -1,3 +1,5 @@
+> Historical native-directory backend documentation. These commands and guarantees are retired; see [revision-only policy](REVISION_ONLY.md) for the supported runtime.
+
 # macOS 27 Handler API 实测:把 FSKit passthrough 移植到 `FSVolumeHandler` 之后
 
 2026-09-19,Mac mini M1(4P+4E),**macOS 27.0(build 26A428)**,

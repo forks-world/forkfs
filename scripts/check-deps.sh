@@ -3,11 +3,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 BUILD=${1:-build/Release}
-BINS=("$BUILD/cli/world")
-[ -f "$BUILD/core/core_test" ] && BINS+=("$BUILD/core/core_test")
-[ -f "$BUILD/core/diff_test" ] && BINS+=("$BUILD/core/diff_test")
-[ -f "$BUILD/core/disk_full_test" ] && BINS+=("$BUILD/core/disk_full_test")
-[ -f "$BUILD/macos/fskit/WorldFSExtension" ] && BINS+=("$BUILD/macos/fskit/WorldFSExtension")
+BINS=("$BUILD/daemon/forkfsd")
+if [ ! -f "${BINS[0]}" ]; then
+    echo "FAIL missing revision-backed daemon: ${BINS[0]}" >&2
+    exit 1
+fi
+[ ! -f "$BUILD/macos/forkfs/ForkFSExtension" ] || BINS+=("$BUILD/macos/forkfs/ForkFSExtension")
+[ ! -f "$BUILD/macos/forkfs/ForkFSHost" ] || BINS+=("$BUILD/macos/forkfs/ForkFSHost")
 rc=0
 for b in "${BINS[@]}"; do
     if [ "$(uname)" = Darwin ]; then

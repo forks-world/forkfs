@@ -293,10 +293,11 @@ void Namespace::initialize() {
         changes[root_key]=id_bytes(id);changes[inode_key(id)]=encode(n);changes[allocated_key(id)]=Bytes{};
     });
 }
-void Namespace::mkdir(const std::string& path) {
+void Namespace::mkdir(const std::string& path,uint32_t mode) {
+    need(mode<=0777,"invalid creation mode");
     update([&](const NamespaceView& j,Changes& c) {
         auto p=parent(j,path);need(!j.contains(p.key),"path already exists");
-        auto id=new_id(j);InodeInfo n{id,true,0755,2,0,now(),now()},pn=inode(j,p.id);
+        auto id=new_id(j);InodeInfo n{id,true,mode,2,0,now(),now()},pn=inode(j,p.id);
         need(pn.links<UINT64_MAX,"directory link count exhausted");++pn.links;touch(pn);
         c[p.key]=id_bytes(id);c[inode_key(id)]=encode(n);c[inode_key(p.id)]=encode(pn);c[allocated_key(id)]=Bytes{};
     });
@@ -407,6 +408,7 @@ InodeInfo Namespace::stat(const std::string& path) const {
 namespace {
 void valid_attributes(const Namespace::Attributes& a) {
     need(!a.mode || *a.mode<=0777,"unsupported mode bits");
+    need(!a.size || *a.size<=256*1024,"prototype files are limited to 256 KiB");
     need(!a.modified_ns || *a.modified_ns<=INT64_MAX,"mtime exceeds supported nanosecond range");
 }
 void apply_attributes(InodeInfo& n,const Namespace::Attributes& a) {
@@ -416,7 +418,11 @@ void apply_attributes(InodeInfo& n,const Namespace::Attributes& a) {
 void Namespace::set_attributes(const std::string& path,const Attributes& a) {
     valid_attributes(a);
     update([&](const NamespaceView& view,Changes& changes) {
-        auto id=resolve(view,path);auto n=inode(view,id);if(!a.mode && !a.modified_ns)return;
+        auto id=resolve(view,path);auto n=inode(view,id);if(!a.mode && !a.modified_ns && !a.size)return;
+        if(a.size && *a.size==n.size && !a.mode && !a.modified_ns)return;
+        if(a.size){need(!n.directory && !n.symlink,"only regular files support size changes");
+            auto data=view.get(content_key(id));need(data.size()==n.size,"inode size mismatch");
+            if(n.size!=*a.size){data.resize(*a.size,0);n.size=*a.size;touch(n);changes[content_key(id)]=std::move(data);}}
         apply_attributes(n,a);changes[inode_key(id)]=encode(n);
     });
 }
@@ -426,7 +432,14 @@ void Namespace::handle_set_attributes(const std::string& token,const Attributes&
     NamespaceView view(*container_.journal_,view_,revision_);bool linked=view.contains(inode_key(info.inode));
     auto key=linked?inode_key(info.inode):orphan_prefix(view_,info.inode)+"inode";
     auto n=linked?inode(view,info.inode):decode_inode(container_.journal_->get(key),info.inode,true);
-    if(!a.mode && !a.modified_ns)return;apply_attributes(n,a);Changes changes;changes[key]=encode(n);commit_changes(view,changes);
+    need(!a.size || info.writable,"handle is not writable");
+    if(!a.mode && !a.modified_ns && !a.size)return;
+    if(a.size && *a.size==n.size && !a.mode && !a.modified_ns)return;
+    Changes changes;
+    if(a.size){auto data=linked?view.get(content_key(info.inode)):container_.journal_->get(orphan_prefix(view_,info.inode)+"content");
+        need(data.size()==n.size,"inode size mismatch");if(n.size!=*a.size){data.resize(*a.size,0);n.size=*a.size;touch(n);
+        changes[linked?content_key(info.inode):orphan_prefix(view_,info.inode)+"content"]=std::move(data);}}
+    apply_attributes(n,a);changes[key]=encode(n);commit_changes(view,changes);
 }
 InodeInfo Namespace::lstat(const std::string& path) const {
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);return inode(view,resolve(view,path,false));
@@ -725,4 +738,31 @@ void Namespace::recover_orphans(Container& container) {
     if(!batch.empty())j.transact(j.sequence(),batch);
 }
 
+}
+
+namespace forkfs {
+std::string Namespace::path_for_inode(const std::string& id) const {
+    need(valid_id(id),"invalid inode identity");std::lock_guard lock(container_.mutex_);
+    NamespaceView view(*container_.journal_,view_,revision_);auto rid=root(view);
+    struct PendingPath {std::string inode,path;bool too_long;};
+    // Keep overlong branches in the walk without retaining unbounded path strings.
+    std::vector<PendingPath> pending{{rid,"/",false}};std::set<std::string> visited;bool found_too_long=false;
+    while(!pending.empty()) {
+        auto entry=std::move(pending.back());pending.pop_back();auto& current=entry.inode;
+        // A file may have a short hardlink alias elsewhere, so defer the error.
+        if(current==id){if(!entry.too_long)return entry.path;found_too_long=true;}
+        if(!inode(view,current).directory)continue;
+        need(visited.insert(current).second,"invalid directory cycle or hardlink");
+        auto pre=directory_prefix(current);
+        for(const auto& key:view.keys(pre)) {
+            auto name=key.substr(pre.size());auto child=decode_id(view.get(key));
+            auto separator=entry.path=="/"?size_t(0):size_t(1);
+            bool too_long=entry.too_long || entry.path.size()+separator>4096 || name.size()>4096-entry.path.size()-separator;
+            if(too_long)pending.push_back({std::move(child),{},true});
+            else {auto next=entry.path=="/"?entry.path+name:entry.path+"/"+name;pending.push_back({std::move(child),std::move(next),false});}
+        }
+    }
+    if(found_too_long)throw std::runtime_error("path exceeds mount protocol limit");
+    throw std::runtime_error("inode is no longer linked");
+}
 }

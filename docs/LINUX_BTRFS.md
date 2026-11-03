@@ -1,3 +1,5 @@
+> Historical native-directory backend documentation. These commands and guarantees are retired; see [revision-only policy](REVISION_ONLY.md) for the supported runtime.
+
 # Linux: Btrfs native-directory backend
 
 Btrfs uses the Linux `FICLONE` backend for init, fork, checkpoint and pool creation.

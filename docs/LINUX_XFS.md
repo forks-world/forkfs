@@ -1,3 +1,5 @@
+> Historical native-directory backend documentation. These commands and guarantees are retired; see [revision-only policy](REVISION_ONLY.md) for the supported runtime.
+
 # Linux: XFS native-directory backend
 
 This document describes the existing directory backend. The new World design requires
