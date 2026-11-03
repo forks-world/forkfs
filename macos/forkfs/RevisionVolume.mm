@@ -5,6 +5,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/sysctl.h>
+#include <stdlib.h>
 
 namespace {
 void require(bool ok,int code,const char* message){if(!ok)throw forkfs::RpcError(code,message);}
@@ -16,6 +18,11 @@ NSDictionary* object(const std::string& value){
 }
 NSError* posix(int code){return fs_errorForPOSIXError(code);}
 FSItemType itemType(NSDictionary* a){return [a[@"directory"] boolValue]?FSItemTypeDirectory:[a[@"symlink"] boolValue]?FSItemTypeSymlink:FSItemTypeFile;}
+BOOL emitsDotEntriesWithoutAttributes(void) {
+    char release[64]={0};size_t length=sizeof release-1;long major=27;
+    if(sysctlbyname("kern.osrelease",release,&length,nullptr,0)==0)major=strtol(release,nullptr,10);
+    return major>=27;
+}
 }
 @interface RevisionItem : FSItem
 @property NSString* inode;
@@ -210,16 +217,22 @@ FSItemType itemType(NSDictionary* a){return [a[@"directory"] boolValue]?FSItemTy
 }
 - (void)enumerateDirectory:(FSItem*)directory startingAtCookie:(FSDirectoryCookie)cookie verifier:(FSDirectoryVerifier)verifier providingAttributes:(FSItemGetAttributesRequest*)attributes usingPacker:(FSDirectoryEntryPacker*)packer replyHandler:(void(^)(FSDirectoryVerifier,NSError*))reply {
     __block FSDirectoryVerifier out=verifier;NSError* e=[self perform:^{auto dir=[self item:directory];NSArray* entries;
+        BOOL withDots=attributes==nil && emitsDotEntriesWithoutAttributes();
         if(cookie==FSDirectoryCookieInitial){require(_streams.count<64,EMFILE,"directory stream limit");
             NSString* cursor=[self json:@[@"inode-dir-open",dir.inode]][@"cursor"];NSMutableArray* all=[NSMutableArray new];
             @try {for(;;){NSDictionary* page=[self json:@[@"fs-dir-entries",cursor,@"512"]];NSArray* values=page[@"entries"];
-                require([values isKindOfClass:NSArray.class] && all.count+values.count<=65536,EOVERFLOW,"directory enumeration limit");[all addObjectsFromArray:values];if([page[@"eof"] boolValue])break;}}
+                require([values isKindOfClass:NSArray.class] && all.count+values.count+(withDots?2:0)<=65536,EOVERFLOW,"directory enumeration limit");[all addObjectsFromArray:values];if([page[@"eof"] boolValue])break;}}
             @finally{[self json:@[@"fs-dir-close",cursor]];}
-            out=_nextStream++;_streams[@(out)]=@{@"directory":dir.inode,@"entries":all};entries=all;
-        } else {NSDictionary* stream=_streams[@(verifier)];require([stream[@"directory"] isEqual:dir.inode],ESTALE,"directory cookie belongs to another inode");entries=stream[@"entries"];}
+            if(withDots){[all insertObject:@{@"dotID":@(dir.parent),@"name":@".."} atIndex:0];[all insertObject:@{@"dotID":@(dir.number),@"name":@"."} atIndex:0];}
+            out=_nextStream++;_streams[@(out)]=@{@"directory":dir.inode,@"entries":all,@"dots":@(withDots),@"attributes":@(attributes!=nil)};entries=all;
+        } else {NSDictionary* stream=_streams[@(verifier)];require([stream[@"directory"] isEqual:dir.inode],ESTALE,"directory cookie belongs to another inode");
+            require([stream[@"dots"] boolValue]==withDots && [stream[@"attributes"] boolValue]==(attributes!=nil),ESTALE,"directory cookie mode changed");entries=stream[@"entries"];}
         require(entries!=nil && cookie<=entries.count,ESTALE,"invalid directory cookie");
-        for(NSUInteger index=cookie;index<entries.count;++index){NSDictionary* entry=entries[index];RevisionItem* it=[self remember:entry[@"inode"] parent:dir.number];
-            if(![packer packEntryWithName:[FSFileName nameWithString:entry[@"name"]] itemType:itemType(it.attrs) itemID:(FSItemID)it.number nextCookie:index+1 attributes:attributes?[self attributes:it]:nil])break;
+        for(NSUInteger index=cookie;index<entries.count;++index){NSDictionary* entry=entries[index];BOOL dot=entry[@"dotID"]!=nil;
+            RevisionItem* it=nil;FSItemType type=FSItemTypeDirectory;FSItemID itemID;
+            if(dot)itemID=(FSItemID)[entry[@"dotID"] unsignedLongLongValue];
+            else {it=[self remember:entry[@"inode"] parent:dir.number];type=itemType(it.attrs);itemID=(FSItemID)it.number;}
+            if(![packer packEntryWithName:[FSFileName nameWithString:entry[@"name"]] itemType:type itemID:itemID nextCookie:index+1 attributes:(attributes && it)?[self attributes:it]:nil])break;
         }
         // Bounded snapshots remain available for resumed cookies. Evict only when
         // starting a later stream; old cookies then fail explicitly with ESTALE.

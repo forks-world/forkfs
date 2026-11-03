@@ -21,6 +21,18 @@ static NSData* command(NSString* binary,NSArray<NSString*>* args){
 - (NSUInteger)length{return self.storage.length;}
 - (void*)mutableBytes{return self.storage.mutableBytes;}
 @end
+@interface RecordingPacker:NSObject
+@property NSUInteger limit;
+@property NSUInteger packedThisCall;
+@property NSMutableArray<NSDictionary*>* entries;
+@end
+@implementation RecordingPacker
+- (instancetype)init {if((self=[super init]))_entries=[NSMutableArray new];return self;}
+- (BOOL)packEntryWithName:(FSFileName*)name itemType:(FSItemType)type itemID:(FSItemID)itemID nextCookie:(FSDirectoryCookie)cookie attributes:(FSItemAttributes*)attributes {
+    if(_packedThisCall>=_limit)return NO;
+    ++_packedThisCall;[_entries addObject:@{@"name":name.string,@"type":@(type),@"id":@(itemID),@"cookie":@(cookie),@"hasAttributes":@(attributes!=nil)}];return YES;
+}
+@end
 int main(int argc,char** argv){@autoreleasepool {
     if(argc!=2)return 2;char tmp[]="/tmp/ff-fskit-XXXXXX";if(!mkdtemp(tmp))return 2;
     NSString* runtime=@(tmp);NSString* db=[runtime stringByAppendingPathComponent:@"db"];
@@ -49,6 +61,62 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume setAttributes:expose onItem:root replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(result.code==EPERM,"must not expose private mount root");
         __block FSItem* file=nil;FSItemSetAttributesRequest* create=[FSItemSetAttributesRequest new];create.mode=0600;
         [volume createItemNamed:[FSFileName nameWithString:@"file"] type:FSItemTypeFile inDirectory:root attributes:create replyHandler:^(FSItem* item,FSFileName* n,NSError* e){file=item;result=e;}];check(file && !result,"create callback failed");
+        __block FSItemAttributes* fileAttrs=nil;
+        [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:file replyHandler:^(FSItemAttributes* a,NSError* e){fileAttrs=a;result=e;}];check(fileAttrs && !result,"file identity lookup failed");
+        BOOL expectDots=[NSProcessInfo processInfo].operatingSystemVersion.majorVersion>=27;
+        NSArray<NSString*>* expectedNames=expectDots?@[@".",@"..",@"file"]:@[@"file"];
+        RecordingPacker* directoryPacker=[RecordingPacker new];directoryPacker.limit=1;
+        __block FSDirectoryVerifier directoryVerifier=FSDirectoryVerifierInitial;
+        FSDirectoryCookie next=FSDirectoryCookieInitial;
+        for(NSUInteger page=0;page<expectedNames.count;++page) {
+            __block NSError* enumerationError=nil;
+            directoryPacker.packedThisCall=0;
+            [volume enumerateDirectory:root startingAtCookie:next verifier:directoryVerifier providingAttributes:nil usingPacker:(FSDirectoryEntryPacker*)directoryPacker replyHandler:^(FSDirectoryVerifier verifier,NSError* e){directoryVerifier=verifier;enumerationError=e;}];
+            check(!enumerationError,"attribute-less directory enumeration failed");
+            check(directoryPacker.packedThisCall==1,"directory packer made no progress");
+            next=[directoryPacker.entries.lastObject[@"cookie"] unsignedLongLongValue];
+        }
+        check(directoryPacker.entries.count==expectedNames.count,"directory enumeration returned an unexpected entry count");
+        for(NSUInteger i=0;i<expectedNames.count;++i){NSDictionary* entry=directoryPacker.entries[i];check([entry[@"name"] isEqual:expectedNames[i]],"directory entries or resume cookies are out of order");check(![entry[@"hasAttributes"] boolValue],"attribute-less enumeration unexpectedly supplied attributes");
+            if(expectDots && i==0)check([entry[@"id"] unsignedLongLongValue]==rootAttrs.fileID,"dot entry did not use the directory item ID");
+            if(expectDots && i==1)check([entry[@"id"] unsignedLongLongValue]==FSItemIDParentOfRoot,"root parent dot entry did not use parent-of-root ID");
+            if([entry[@"name"] isEqual:@"file"])check([entry[@"id"] unsignedLongLongValue]==fileAttrs.fileID,"normal directory item ID changed");
+        }
+        directoryPacker.packedThisCall=0;__block NSError* eofError=nil;
+        [volume enumerateDirectory:root startingAtCookie:next verifier:directoryVerifier providingAttributes:nil usingPacker:(FSDirectoryEntryPacker*)directoryPacker replyHandler:^(FSDirectoryVerifier verifier,NSError* e){eofError=e;}];
+        check(!eofError && directoryPacker.packedThisCall==0 && directoryPacker.entries.count==expectedNames.count,"end-of-directory resume duplicated entries");
+        RecordingPacker* attributePacker=[RecordingPacker new];attributePacker.limit=8;
+        __block FSDirectoryVerifier attributeVerifier=FSDirectoryVerifierInitial;__block NSError* enumerationError=nil;
+        [volume enumerateDirectory:root startingAtCookie:FSDirectoryCookieInitial verifier:attributeVerifier providingAttributes:[FSItemGetAttributesRequest new] usingPacker:(FSDirectoryEntryPacker*)attributePacker replyHandler:^(FSDirectoryVerifier verifier,NSError* e){attributeVerifier=verifier;enumerationError=e;}];
+        check(!enumerationError && attributePacker.entries.count==1 && [attributePacker.entries[0][@"name"] isEqual:@"file"],"attribute directory enumeration must omit dot entries");
+        check([attributePacker.entries[0][@"hasAttributes"] boolValue],"requested directory attributes were not supplied");
+        __block FSItem* childDirectory=nil;
+        [volume createItemNamed:[FSFileName nameWithString:@"child"] type:FSItemTypeDirectory inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){childDirectory=item;result=e;}];check(childDirectory && !result,"test directory creation failed");
+        RecordingPacker* stalePacker=[RecordingPacker new];stalePacker.limit=1;stalePacker.packedThisCall=0;
+        __block FSDirectoryVerifier staleVerifier=FSDirectoryVerifierInitial;__block NSError* staleError=nil;
+        [volume enumerateDirectory:root startingAtCookie:FSDirectoryCookieInitial verifier:staleVerifier providingAttributes:nil usingPacker:(FSDirectoryEntryPacker*)stalePacker replyHandler:^(FSDirectoryVerifier verifier,NSError* e){staleVerifier=verifier;staleError=e;}];check(!staleError,"initial resumable enumeration failed");
+        FSDirectoryCookie staleCookie=[stalePacker.entries.lastObject[@"cookie"] unsignedLongLongValue];
+        [volume enumerateDirectory:childDirectory startingAtCookie:staleCookie verifier:staleVerifier providingAttributes:nil usingPacker:(FSDirectoryEntryPacker*)[RecordingPacker new] replyHandler:^(FSDirectoryVerifier verifier,NSError* e){staleError=e;}];check(staleError.code==ESTALE,"directory cookie was accepted for another directory");
+        staleError=nil;
+        [volume enumerateDirectory:root startingAtCookie:staleCookie verifier:staleVerifier providingAttributes:[FSItemGetAttributesRequest new] usingPacker:(FSDirectoryEntryPacker*)[RecordingPacker new] replyHandler:^(FSDirectoryVerifier verifier,NSError* e){staleError=e;}];check(staleError.code==ESTALE,"directory cookie was accepted in another attribute mode");
+        staleError=nil;
+        [volume enumerateDirectory:root startingAtCookie:UINT64_MAX verifier:staleVerifier providingAttributes:nil usingPacker:(FSDirectoryEntryPacker*)[RecordingPacker new] replyHandler:^(FSDirectoryVerifier verifier,NSError* e){staleError=e;}];check(staleError.code==ESTALE,"invalid directory cookie was accepted");
+        if(expectDots){
+        __block FSItem* parentA=nil;__block FSItem* parentB=nil;__block FSItem* movingDirectory=nil;
+        [volume createItemNamed:[FSFileName nameWithString:@"parent-a"] type:FSItemTypeDirectory inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){parentA=item;result=e;}];check(parentA && !result,"first parent directory creation failed");
+        [volume createItemNamed:[FSFileName nameWithString:@"parent-b"] type:FSItemTypeDirectory inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){parentB=item;result=e;}];check(parentB && !result,"second parent directory creation failed");
+        [volume createItemNamed:[FSFileName nameWithString:@"moving"] type:FSItemTypeDirectory inDirectory:parentA attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){movingDirectory=item;result=e;}];check(movingDirectory && !result,"nested directory creation failed");
+        __block FSItemAttributes* parentAAttrs=nil;
+        [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:parentA replyHandler:^(FSItemAttributes* a,NSError* e){parentAAttrs=a;result=e;}];check(parentAAttrs && !result,"parent identity lookup failed");
+        RecordingPacker* movingPacker=[RecordingPacker new];movingPacker.limit=1;
+        __block FSDirectoryVerifier movingVerifier=FSDirectoryVerifierInitial;__block NSError* movingError=nil;
+        [volume enumerateDirectory:movingDirectory startingAtCookie:FSDirectoryCookieInitial verifier:movingVerifier providingAttributes:nil usingPacker:(FSDirectoryEntryPacker*)movingPacker replyHandler:^(FSDirectoryVerifier verifier,NSError* e){movingVerifier=verifier;movingError=e;}];check(!movingError && movingPacker.entries.count==1 && [movingPacker.entries[0][@"name"] isEqual:@"."],"nested directory first page failed");
+        FSDirectoryCookie movingCookie=[movingPacker.entries.lastObject[@"cookie"] unsignedLongLongValue];
+        [volume renameItem:movingDirectory inDirectory:parentA named:[FSFileName nameWithString:@"moving"] toNewName:[FSFileName nameWithString:@"moved"] inDirectory:parentB overItem:nil replyHandler:^(FSFileName* n,NSError* e){movingError=e;}];check(!movingError,"directory move between pages failed");
+        movingPacker.packedThisCall=0;
+        [volume enumerateDirectory:movingDirectory startingAtCookie:movingCookie verifier:movingVerifier providingAttributes:nil usingPacker:(FSDirectoryEntryPacker*)movingPacker replyHandler:^(FSDirectoryVerifier verifier,NSError* e){movingError=e;}];
+        check(!movingError && movingPacker.entries.count==2 && [movingPacker.entries[1][@"name"] isEqual:@".."] && [movingPacker.entries[1][@"id"] unsignedLongLongValue]==parentAAttrs.fileID,"resumed parent dot ID changed during rename");
+        }
         [volume openItem:file withModes:FSVolumeOpenModesRead|FSVolumeOpenModesWrite replyHandler:^(NSError* e){result=e;}];check(!result,"open callback failed");
         const char payload[]={'a',0,'b','c'};NSData* contents=[NSData dataWithBytes:payload length:4];__block size_t count=0;
         [volume writeContents:contents toFile:file atOffset:0 replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==4,"binary write failed");
