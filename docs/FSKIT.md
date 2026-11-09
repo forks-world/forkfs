@@ -18,13 +18,35 @@ compatibility; a context-aware Handler frontend is not implemented yet.
 
 ```sh
 git submodule update --init third_party/leveldb
-scripts/bundle-forkfs.sh build/forkfs
+FORKFS_SIGN_IDENTITY="Apple Development: YOUR NAME (CERTIFICATE ID)" \
+FORKFS_MODULE_PROFILE="/absolute/path/ForkFS.provisionprofile" \
+  scripts/bundle-forkfs.sh build/forkfs
+cmake --build build/forkfs --parallel 4
 ctest --test-dir build/forkfs --output-on-failure --no-tests=error
 ```
 
-The helper assembles and ad-hoc signs `build/forkfs/ForkFS.app`. It does
-not install the app, register an extension, enable it in System Settings, or
-mount anything. Application/extension IDs are `world.forks.forkfs` and
+The helper embeds a local provisioning profile and signs
+`build/forkfs/ForkFS.app` using the selected identity in the macOS Keychain.
+It validates the FSKit Module entitlement, exact extension App ID, profile
+expiry, and the signing certificate's inclusion in the profile. Missing signing
+inputs and ad-hoc identities are rejected before building.
+
+For local testing, create an Apple Development certificate and a macOS App
+Development profile for `world.forks.forkfs.extension`, with FSKit Module enabled
+and the test Mac's Provisioning UDID registered. Pass an absolute profile path;
+the identity may be a certificate name or its SHA-1 fingerprint. Both the host
+and extension use that identity. The script does not export or read private-key
+material; Keychain authorization may prompt locally when `codesign` uses it.
+Provisioning profiles, certificates, private keys, signed bundles, and signing
+logs belong outside source control. Temporary profile/entitlement files are
+removed when the script exits. The generated bundle embeds the profile, not a
+private key.
+
+Self-signed/ad-hoc signatures cannot authorize the restricted FSKit Module
+entitlement. Successful signing verifies the bundle's signature; OS enablement,
+sandbox-compatible daemon communication, and mount acceptance still need
+separate validation. The helper does not install the app, register an extension,
+enable it in System Settings, or mount anything. Application/extension IDs are `world.forks.forkfs` and
 `world.forks.forkfs.extension`; the filesystem short name is `forkfs`.
 
 The callback test drives real FSKit `FSVolume`/`FSItem` callbacks against a
