@@ -189,6 +189,91 @@ class MountLifecycle(unittest.TestCase):
         self.assertEqual(marker.read_text(), 'keep')
         self.assertIsNone(session.daemon)
 
+    def test_busy_cleanup_waits_for_signal_without_automatic_retry(self):
+        self._check_cleanup_retry(None, None, [False, True], busy_calls=1, expected_waits=2)
+
+    def test_child_failure_during_busy_wait_triggers_cleanup_retry(self):
+        self._check_cleanup_retry(None, 'bridge', [False], busy_calls=1, expected_waits=1)
+
+    def test_preexisting_child_failure_does_not_spin_busy_cleanup(self):
+        self._check_cleanup_retry('daemon', None, [True, True], busy_calls=2, expected_waits=2)
+
+    def test_initial_signal_is_consumed_once_before_cleanup(self):
+        session, event = self._check_cleanup_retry(
+            None, None, [False, True], busy_calls=1, expected_waits=2, initially_set=True)
+        self.assertEqual(event.clear_count, 2)
+        self.assertEqual(session.stop_count, 2)
+
+    def test_signal_during_stop_is_not_discarded(self):
+        session, event = self._check_cleanup_retry(
+            None, None, [], busy_calls=1, expected_waits=1, signal_during_stop=True)
+        self.assertEqual(session.stop_count, 2)
+        self.assertEqual(event.wait_count, 1)
+
+    def test_new_child_failure_retries_once_then_waits_if_detach_stays_busy(self):
+        for child in ('daemon', 'bridge'):
+            with self.subTest(child=child):
+                session, event = self._check_cleanup_retry(
+                    None, None, [False, True], busy_calls=2, expected_waits=2,
+                    child_after_first_stop=child)
+                self.assertEqual(session.stop_count, 3)
+                self.assertEqual(event.wait_count, 2)
+
+    def _check_cleanup_retry(self, initial_child, child_on_wait, waits, busy_calls, expected_waits,
+                             initially_set=False, signal_during_stop=False,
+                             child_after_first_stop=None):
+        class Event:
+            def __init__(self, session):
+                self.outcomes = iter(waits)
+                self.set = initially_set
+                self.wait_count = 0
+                self.clear_count = 0
+                self.session = session
+
+            def clear(self):
+                self.clear_count += 1
+                self.set = False
+
+            def is_set(self):
+                return self.set
+
+            def wait(self, _timeout):
+                self.wait_count += 1
+                if not self.set:
+                    self.set = next(self.outcomes)
+                if child_on_wait:
+                    self.session.child = child_on_wait
+                return self.set
+
+        class Session:
+            def __init__(self):
+                self.child = initial_child
+                self.stop_count = 0
+                self.busy_calls = busy_calls
+                self.event = None
+
+            def failed_child(self):
+                return self.child
+
+            def stop(self):
+                self.stop_count += 1
+                if self.stop_count == 1:
+                    if signal_during_stop:
+                        self.event.set = True
+                    if child_after_first_stop:
+                        self.child = child_after_first_stop
+                if self.stop_count <= self.busy_calls:
+                    raise launcher.UnmountBusy('busy')
+
+        session = Session()
+        event = Event(session)
+        session.event = event
+        result = launcher._stop_until_detached(session, event, 0, poll_interval=0)
+        self.assertEqual(result, 1)
+        self.assertEqual(event.wait_count, expected_waits)
+        self.assertEqual(session.stop_count, busy_calls + 1)
+        return session, event
+
 
 if __name__ == '__main__':
     unittest.main()

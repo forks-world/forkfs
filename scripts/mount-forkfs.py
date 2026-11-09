@@ -251,16 +251,33 @@ def main():
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         print('forkfs: ' + str(error), file=sys.stderr)
         result = 1
+    return _stop_until_detached(session, stopping, result)
+
+
+def _stop_until_detached(session, stopping, result, poll_interval=0.2):
+    """Retry a busy detach on user input or one newly observed child failure."""
+    backend_failure_observed = bool(session.failed_child())
     while True:
+        stopping.clear()
+        if session.failed_child():
+            backend_failure_observed = True
         try:
             session.stop()
-            break
+            return result
         except UnmountBusy as error:
             print('forkfs: ' + str(error), file=sys.stderr, flush=True)
             result = 1
-            stopping.clear()
-            stopping.wait()
-    return result
+            child = session.failed_child()
+            if child and not backend_failure_observed:
+                backend_failure_observed = True
+                continue
+            while not stopping.wait(poll_interval):
+                child = session.failed_child()
+                if child and not backend_failure_observed:
+                    backend_failure_observed = True
+                    break
+            if session.failed_child():
+                backend_failure_observed = True
 
 
 if __name__ == '__main__':
