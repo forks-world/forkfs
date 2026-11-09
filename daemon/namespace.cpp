@@ -90,6 +90,27 @@ std::string new_id(const NamespaceView& journal) {
     }
     throw std::runtime_error("inode identity collision");
 }
+void valid_namespace_text(const std::string& value) {
+    // Keep the original bytes as identity. Decode only to reject malformed
+    // UTF-8 and the C0/DEL/C1 controls excluded by the naming policy.
+    for(size_t at=0;at<value.size();) {
+        const auto lead=static_cast<unsigned char>(value[at++]);
+        uint32_t scalar=lead,minimum=0;size_t remaining=0;
+        if(lead<0x80){}
+        else if(lead>=0xc2 && lead<=0xdf){scalar=lead&0x1f;remaining=1;minimum=0x80;}
+        else if(lead>=0xe0 && lead<=0xef){scalar=lead&0x0f;remaining=2;minimum=0x800;}
+        else if(lead>=0xf0 && lead<=0xf4){scalar=lead&0x07;remaining=3;minimum=0x10000;}
+        else need(false,"invalid UTF-8 namespace text");
+        need(remaining<=value.size()-at,"invalid UTF-8 namespace text");
+        for(size_t i=0;i<remaining;++i) {
+            const auto next=static_cast<unsigned char>(value[at++]);
+            need((next&0xc0)==0x80,"invalid UTF-8 namespace text");
+            scalar=(scalar<<6)|(next&0x3f);
+        }
+        need(scalar>=minimum && scalar<=0x10ffff && !(scalar>=0xd800 && scalar<=0xdfff),"invalid UTF-8 namespace text");
+        need(scalar>=0x20 && !(scalar>=0x7f && scalar<=0x9f),"invalid control character in namespace text");
+    }
+}
 std::vector<std::string> components(const std::string& path) {
     need(!path.empty() && path[0]=='/' && path.size()<=4096,"path must be absolute and at most 4096 bytes");
     std::vector<std::string> result;
@@ -99,7 +120,7 @@ std::vector<std::string> components(const std::string& path) {
         auto end=path.find('/',begin);if(end==std::string::npos)end=path.size();
         auto name=path.substr(begin,end-begin);
         need(!name.empty() && name!="." && name!=".." && name.size()<=255,"invalid path component");
-        for(unsigned char c:name)need(c>=32 && c<=126,"prototype names must be printable ASCII");
+        valid_namespace_text(name);
         result.push_back(name);begin=end+1;
         need(end==path.size() || begin<path.size(),"trailing slash is unsupported");
     }
@@ -107,7 +128,7 @@ std::vector<std::string> components(const std::string& path) {
 }
 std::vector<std::string> target_components(const std::string& target) {
     need(!target.empty() && target.size()<=4096,"invalid symlink target length");
-    for(unsigned char c:target)need(c>=32 && c<=126,"prototype symlink targets must be printable ASCII");
+    valid_namespace_text(target);
     std::vector<std::string> result;size_t start=0;
     while(start<target.size()) {
         auto end=target.find('/',start);if(end==std::string::npos)end=target.size();auto name=target.substr(start,end-start);

@@ -78,11 +78,11 @@ int main(int argc,char** argv){@autoreleasepool {
         FSItemSetAttributesRequest* expose=[FSItemSetAttributesRequest new];expose.mode=0755;
         [volume setAttributes:expose onItem:root replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(result.code==EPERM,"must not expose private mount root");
         __block FSItem* file=nil;FSItemSetAttributesRequest* create=[FSItemSetAttributesRequest new];create.mode=0600;
-        [volume createItemNamed:[FSFileName nameWithString:@"file"] type:FSItemTypeFile inDirectory:root attributes:create replyHandler:^(FSItem* item,FSFileName* n,NSError* e){file=item;result=e;}];check(file && !result,"create callback failed");
+        [volume createItemNamed:[FSFileName nameWithString:@"文件📄"] type:FSItemTypeFile inDirectory:root attributes:create replyHandler:^(FSItem* item,FSFileName* n,NSError* e){file=item;result=e;}];check(file && !result,"create callback failed");
         __block FSItemAttributes* fileAttrs=nil;
         [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:file replyHandler:^(FSItemAttributes* a,NSError* e){fileAttrs=a;result=e;}];check(fileAttrs && !result,"file identity lookup failed");
         BOOL expectDots=[NSProcessInfo processInfo].operatingSystemVersion.majorVersion>=27;
-        NSArray<NSString*>* expectedNames=expectDots?@[@".",@"..",@"file"]:@[@"file"];
+        NSArray<NSString*>* expectedNames=expectDots?@[@".",@"..",@"文件📄"]:@[@"文件📄"];
         RecordingPacker* directoryPacker=[RecordingPacker new];directoryPacker.limit=1;
         __block FSDirectoryVerifier directoryVerifier=FSDirectoryVerifierInitial;
         FSDirectoryCookie next=FSDirectoryCookieInitial;
@@ -98,7 +98,7 @@ int main(int argc,char** argv){@autoreleasepool {
         for(NSUInteger i=0;i<expectedNames.count;++i){NSDictionary* entry=directoryPacker.entries[i];check([entry[@"name"] isEqual:expectedNames[i]],"directory entries or resume cookies are out of order");check(![entry[@"hasAttributes"] boolValue],"attribute-less enumeration unexpectedly supplied attributes");
             if(expectDots && i==0)check([entry[@"id"] unsignedLongLongValue]==rootAttrs.fileID,"dot entry did not use the directory item ID");
             if(expectDots && i==1)check([entry[@"id"] unsignedLongLongValue]==FSItemIDParentOfRoot,"root parent dot entry did not use parent-of-root ID");
-            if([entry[@"name"] isEqual:@"file"])check([entry[@"id"] unsignedLongLongValue]==fileAttrs.fileID,"normal directory item ID changed");
+            if([entry[@"name"] isEqual:@"文件📄"])check([entry[@"id"] unsignedLongLongValue]==fileAttrs.fileID,"normal directory item ID changed");
         }
         directoryPacker.packedThisCall=0;__block NSError* eofError=nil;
         [volume enumerateDirectory:root startingAtCookie:next verifier:directoryVerifier providingAttributes:nil usingPacker:(FSDirectoryEntryPacker*)directoryPacker replyHandler:^(FSDirectoryVerifier verifier,NSError* e){eofError=e;}];
@@ -106,7 +106,7 @@ int main(int argc,char** argv){@autoreleasepool {
         RecordingPacker* attributePacker=[RecordingPacker new];attributePacker.limit=8;
         __block FSDirectoryVerifier attributeVerifier=FSDirectoryVerifierInitial;__block NSError* enumerationError=nil;
         [volume enumerateDirectory:root startingAtCookie:FSDirectoryCookieInitial verifier:attributeVerifier providingAttributes:[FSItemGetAttributesRequest new] usingPacker:(FSDirectoryEntryPacker*)attributePacker replyHandler:^(FSDirectoryVerifier verifier,NSError* e){attributeVerifier=verifier;enumerationError=e;}];
-        check(!enumerationError && attributePacker.entries.count==1 && [attributePacker.entries[0][@"name"] isEqual:@"file"],"attribute directory enumeration must omit dot entries");
+        check(!enumerationError && attributePacker.entries.count==1 && [attributePacker.entries[0][@"name"] isEqual:@"文件📄"],"attribute directory enumeration must omit dot entries");
         check([attributePacker.entries[0][@"hasAttributes"] boolValue],"requested directory attributes were not supplied");
         __block FSItem* childDirectory=nil;
         [volume createItemNamed:[FSFileName nameWithString:@"child"] type:FSItemTypeDirectory inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){childDirectory=item;result=e;}];check(childDirectory && !result,"test directory creation failed");
@@ -159,10 +159,10 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume writeContents:contents toFile:file atOffset:0 replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==4,"binary write failed");
         TestBuffer* buffer=[TestBuffer new];buffer.storage=[NSMutableData dataWithLength:32];
         [volume readFromFile:file offset:0 length:32 intoBuffer:(FSMutableFileDataBuffer*)buffer replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==4 && !memcmp(buffer.storage.bytes,payload,4),"binary read failed");
-        [volume renameItem:file inDirectory:root named:[FSFileName nameWithString:@"file"] toNewName:[FSFileName nameWithString:@"renamed"] inDirectory:root overItem:nil replyHandler:^(FSFileName* n,NSError* e){result=e;}];check(!result,"rename callback failed");
+        [volume renameItem:file inDirectory:root named:[FSFileName nameWithString:@"文件📄"] toNewName:[FSFileName nameWithString:@"重命名🚀"] inDirectory:root overItem:nil replyHandler:^(FSFileName* n,NSError* e){result=e;}];check(!result,"rename callback failed");
         __block FSItem* again=nil;
-        [volume lookupItemNamed:[FSFileName nameWithString:@"renamed"] inDirectory:root replyHandler:^(FSItem* it,FSFileName* n,NSError* e){again=it;result=e;}];check(!result && again==file,"rename lost item identity");
-        [volume removeItem:file named:[FSFileName nameWithString:@"renamed"] fromDirectory:root replyHandler:^(NSError* e){result=e;}];check(!result,"unlink failed");
+        [volume lookupItemNamed:[FSFileName nameWithString:@"重命名🚀"] inDirectory:root replyHandler:^(FSItem* it,FSFileName* n,NSError* e){again=it;result=e;}];check(!result && again==file,"rename lost item identity");
+        [volume removeItem:file named:[FSFileName nameWithString:@"重命名🚀"] fromDirectory:root replyHandler:^(NSError* e){result=e;}];check(!result,"unlink failed");
         __block FSItem* snapshotDirectory=nil;__block FSItem* snapshotVictim=nil;
         [volume createItemNamed:[FSFileName nameWithString:@"snapshot-test"] type:FSItemTypeDirectory inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){snapshotDirectory=item;result=e;}];check(snapshotDirectory && !result,"snapshot test directory creation failed");
         [volume createItemNamed:[FSFileName nameWithString:@"a-first"] type:FSItemTypeFile inDirectory:snapshotDirectory attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){result=e;}];check(!result,"snapshot first entry creation failed");

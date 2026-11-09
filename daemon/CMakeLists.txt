@@ -51,6 +51,9 @@ target_compile_definitions(forkfsd_legacy_test PRIVATE FORKFS_LEGACY_DEFAULT=1)
 add_executable(forkfsd ${FORKFS_NORMAL_OBJECTS})
 target_compile_options(forkfsd PRIVATE -Wall -Wextra -Wpedantic)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME forkfsd_unicode_paths COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/unicode_paths.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_unicode_paths PROPERTIES TIMEOUT 120)
 add_test(NAME forkfs_loopback_auth COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_SOURCE_DIR}/scripts/tests/fskit_bridge.py)
 set_tests_properties(forkfs_loopback_auth PROPERTIES TIMEOUT 30)
