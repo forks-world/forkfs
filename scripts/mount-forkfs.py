@@ -84,6 +84,17 @@ class MountSession:
                 raise RuntimeError(name + ' startup timed out; see ' + str(self.runtime / (name + '.log')))
             self.stopping.wait(0.05)
 
+    def capture_socket_identity(self):
+        """Remember the first socket created at this launcher's private endpoint."""
+        if self.socket_identity is not None:
+            return
+        try:
+            info = (self.runtime / 'control.sock').lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISSOCK(info.st_mode) and info.st_uid == os.geteuid():
+            self.socket_identity = (info.st_dev, info.st_ino, info.st_ctime_ns)
+
     def start(self):
         if self.mounted_on_host():
             raise RuntimeError('mount point already contains a mounted filesystem')
@@ -126,6 +137,7 @@ class MountSession:
         self.daemon = self.spawn([str(self.binary), 'serve', str(self.repository),
                                   '--socket', str(endpoint), '--rpc'], 'daemon')
         def daemon_ready():
+            self.capture_socket_identity()
             if not endpoint.exists():
                 return False
             try:
@@ -135,9 +147,10 @@ class MountSession:
                 return self.daemon.poll() is None
             except (OSError, subprocess.SubprocessError):
                 return False
-        self.wait_ready(self.daemon, daemon_ready, 'daemon')
-        info = endpoint.lstat()
-        self.socket_identity = (info.st_dev, info.st_ino, info.st_ctime_ns)
+        try:
+            self.wait_ready(self.daemon, daemon_ready, 'daemon')
+        finally:
+            self.capture_socket_identity()
         descriptor = self.runtime / 'forkfs.json'
         def bridge_key():
             try:
@@ -197,6 +210,8 @@ class MountSession:
                     except ProcessLookupError:
                         pass
                     process.wait(timeout=5)
+        if self.daemon is not None and self.daemon.poll() is not None:
+            self.capture_socket_identity()
         if self.socket_identity is not None:
             endpoint = self.runtime / 'control.sock'
             try:

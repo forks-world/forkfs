@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import socket
 import stat
 import subprocess
 import sys
@@ -188,6 +189,87 @@ class MountLifecycle(unittest.TestCase):
             session.start()
         self.assertEqual(marker.read_text(), 'keep')
         self.assertIsNone(session.daemon)
+
+    def test_socket_bound_before_dead_child_readiness_check_is_cleaned_for_restart(self):
+        first = self.session()
+        first.repository.mkdir()
+
+        def spawn_dead_daemon(*_args):
+            self._bind_socket(first.runtime / 'control.sock')
+            return type('DeadProcess', (), {'poll': lambda _self: 1})()
+
+        first.spawn = Mock(side_effect=spawn_dead_daemon)
+        with self.assertRaisesRegex(RuntimeError, 'daemon exited'):
+            first.start()
+        first.stop()
+        self.assertFalse((first.runtime / 'control.sock').exists())
+
+        second = self.session()
+        second.spawn = Mock(side_effect=spawn_dead_daemon)
+        with self.assertRaisesRegex(RuntimeError, 'daemon exited'):
+            second.start()
+        second.spawn.assert_called_once()
+        second.stop()
+
+    def test_replacement_after_first_socket_capture_is_preserved(self):
+        session = self.session()
+        session.runtime.mkdir()
+        endpoint = session.runtime / 'control.sock'
+        self._bind_socket(endpoint)
+        session.capture_socket_identity()
+        captured = session.socket_identity
+        endpoint.unlink()
+        self._bind_socket(endpoint)
+        session.capture_socket_identity()
+        self.assertEqual(session.socket_identity, captured)
+        session.stop()
+        self.assertTrue(stat.S_ISSOCK(endpoint.lstat().st_mode))
+
+    def test_non_socket_and_symlink_endpoints_are_not_captured_or_removed(self):
+        session = self.session()
+        session.runtime.mkdir()
+        endpoint = session.runtime / 'control.sock'
+        endpoint.write_text('keep')
+        session.capture_socket_identity()
+        self.assertIsNone(session.socket_identity)
+        session.stop()
+        self.assertEqual(endpoint.read_text(), 'keep')
+
+        endpoint.unlink()
+        target = session.runtime / 'target'
+        target.write_text('target')
+        endpoint.symlink_to(target)
+        session.capture_socket_identity()
+        self.assertIsNone(session.socket_identity)
+        session.stop()
+        self.assertTrue(endpoint.is_symlink())
+
+    def test_late_socket_after_cancel_is_captured_after_daemon_reaping(self):
+        session = self.session()
+        session.runtime.mkdir()
+
+        class LateBinder:
+            reaped = False
+
+            def poll(self):
+                return 0 if self.reaped else None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                MountLifecycle._bind_socket(session.runtime / 'control.sock')
+                self.reaped = True
+
+        session.daemon = LateBinder()
+        session.stop()
+        self.assertFalse((session.runtime / 'control.sock').exists())
+
+    @staticmethod
+    def _bind_socket(path):
+        endpoint = socket.socket(socket.AF_UNIX)
+        endpoint.bind(str(path))
+        endpoint.close()
 
     def test_busy_cleanup_waits_for_signal_without_automatic_retry(self):
         self._check_cleanup_retry(None, None, [False, True], busy_calls=1, expected_waits=2)
