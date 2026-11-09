@@ -72,3 +72,12 @@ __pycache__/
 # SwiftPM
 .build/
 .swiftpm/
+
+# Local Apple signing inputs; private keys remain in Keychain.
+*.p12
+*.pfx
+*.key
+*.pem
+*.cer
+*.provisionprofile
+*.mobileprovision
