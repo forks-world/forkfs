@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <cerrno>
 #include <string_view>
+#include <cstdint>
 namespace forkfs {
 class Container;
 inline int rpc_posix_error(std::string_view message) {
@@ -35,5 +36,8 @@ public:int code;RpcError(int value,const std::string& message):std::runtime_erro
 // Same-UID control protocol; the optional FSKit frontend uses the inode operations.
 // This transport is not an agent sandbox.
 void serve_rpc(int listener,Container& container,const volatile sig_atomic_t& stopping);
-std::string request_rpc(const std::string& socket,const std::vector<std::string>& fields);
+// FSKit uses mutually authenticated loopback TCP to cross App Sandbox.
+// The private mount descriptor carries a fresh per-bridge 256-bit key.
+struct LoopbackEndpoint { uint16_t port=0; std::string key; };
+std::string request_rpc(const std::string& socket,const std::vector<std::string>& fields,const LoopbackEndpoint* loopback=nullptr);
 }

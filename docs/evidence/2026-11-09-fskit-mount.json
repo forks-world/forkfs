@@ -1,0 +1,47 @@
+{
+  "namespace": "/forkfs-accept-lz8gpc7b",
+  "checks": [
+    "binary write/read/fsync reaches daemon content",
+    "hardlink identity and symlink traversal",
+    "fsync then revision checkpoint isolates subsequent writes",
+    "rename/open-unlink/truncate/path reuse preserve file identity",
+    "directory enumeration and dot entries",
+    "atomic-save replacement reaches revision-backed namespace"
+  ],
+  "retained_revision": "mount_accept_bf747c83a69f",
+  "appledouble_sidecars": 37,
+  "platform": {
+    "macOS": "27.2",
+    "architecture": "arm64"
+  },
+  "signing": "Apple Development with FSKit-authorized provisioning profile",
+  "transport": "127.0.0.1 TCP bridge with mutual nonce/HMAC-SHA256 authentication; same-UID Unix backend",
+  "revision_mount": {
+    "mount_flags_include_read_only": true,
+    "snapshot_payload_preserved": true,
+    "create_errno": "EROFS"
+  },
+  "automated_tests": {
+    "passed": 34,
+    "failed": 0
+  },
+  "bundle_script": "Real signing and certificate/profile match validation passed",
+  "not_qualified": [
+    "kernel mmap/writeback and daemon-loss cache revocation",
+    "multi-user access",
+    "other macOS versions",
+    "large files and Unicode names"
+  ],
+  "launcher_acceptance": {
+    "world_syscalls": "passed",
+    "readonly_revision": "passed",
+    "ctrl_c_shutdown": "passed",
+    "sigterm_shutdown": "passed",
+    "busy_unmount_preserves_services_and_retries": "passed",
+    "daemon_exit_detach": "passed",
+    "daemon_sigkill_detach_and_owned_socket_cleanup": "passed",
+    "restart_same_runtime_and_snapshot_readback": "passed",
+    "fs_check_after_restart": "passed",
+    "automated_lifecycle_scenarios": 14
+  }
+}

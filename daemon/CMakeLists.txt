@@ -51,6 +51,12 @@ target_compile_definitions(forkfsd_legacy_test PRIVATE FORKFS_LEGACY_DEFAULT=1)
 add_executable(forkfsd ${FORKFS_NORMAL_OBJECTS})
 target_compile_options(forkfsd PRIVATE -Wall -Wextra -Wpedantic)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME forkfs_loopback_auth COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/scripts/tests/fskit_bridge.py)
+set_tests_properties(forkfs_loopback_auth PROPERTIES TIMEOUT 30)
+add_test(NAME forkfs_mount_lifecycle COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/scripts/tests/mount_lifecycle.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfs_mount_lifecycle PROPERTIES TIMEOUT 90)
 add_test(NAME forkfsd_lifecycle COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/lifecycle.py $<TARGET_FILE:forkfsd_legacy_test>)
 set_tests_properties(forkfsd_lifecycle PROPERTIES TIMEOUT 30)

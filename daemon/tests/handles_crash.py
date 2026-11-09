@@ -3,12 +3,12 @@ import json
 import os
 from pathlib import Path
 import shutil
+import select
 import socket
 import struct
 import subprocess
 import sys
 import tempfile
-import time
 BIN,FAULT=sys.argv[1:3]
 def run(*args,ok=True):
     p=subprocess.run([BIN,*map(str,args)],capture_output=True,timeout=10)
@@ -29,10 +29,11 @@ with tempfile.TemporaryDirectory(prefix='ff-hcrash-',dir='/tmp') as tmp:
                                   stdout=subprocess.PIPE,stderr=subprocess.PIPE,
                                   env={**os.environ,'FORKFS_TEST_CRASH':stage})
             try:
-                deadline=time.monotonic()+5
-                while not endpoint.exists():
-                    assert proc.poll() is None,proc.communicate()
-                    assert time.monotonic()<deadline;time.sleep(.01)
+                # bind() creates the socket before listen() and the ready
+                # status. Waiting for the path alone races the first request.
+                assert select.select([proc.stdout],[],[],5)[0], 'daemon readiness timed out'
+                ready=json.loads(proc.stdout.readline())
+                assert ready['state']=='leveldb' and proc.poll() is None,ready
                 session=json.loads(run('request',endpoint,'session-open','60000'))['session']
                 mode='rw,append' if op=='fs-hwrite' else 'rw'
                 token=json.loads(run('request',endpoint,'fs-open','/f',mode,'--session',session))['handle']
