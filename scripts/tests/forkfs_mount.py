@@ -88,7 +88,13 @@ try:
     (root/'subdir').mkdir(mode=0o700)
     for index in range(32):(root/f'entry{index:02d}').write_bytes(str(index).encode())
     expected={'file','symlink','subdir',*(f'entry{i:02d}' for i in range(32))}
-    assert set(os.listdir(root))==expected
+    actual=set(os.listdir(root))
+    # With no native xattrs, macOS stores metadata in AppleDouble sidecars.
+    sidecars={name for name in actual-expected if name.startswith('._')}
+    for name in sidecars:
+        assert (root/name).read_bytes()[:4]==b'\x00\x05\x16\x07',name
+    assert actual-sidecars==expected,{'missing':sorted(expected-actual),'unexpected':sorted(actual-expected-sidecars)}
+    report['appledouble_sidecars']=len(sidecars)
     dots=subprocess.run(['/bin/ls','-a',str(root)],capture_output=True,text=True,check=True).stdout.splitlines()
     assert dots.count('.')==1 and dots.count('..')==1,dots
     report['checks'].append('directory enumeration and dot entries')

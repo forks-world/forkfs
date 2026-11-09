@@ -16,7 +16,10 @@
 }
 - (void)loadResource:(FSResource*)resource options:(FSTaskOptions*)options replyHandler:(void(^)(FSVolume*,NSError*))reply {
     if(![resource isKindOfClass:FSPathURLResource.class]){reply(nil,fs_errorForPOSIXError(EINVAL));return;}
-    NSError* error=nil;RevisionVolume* volume=[[RevisionVolume alloc] initWithRuntimeURL:((FSPathURLResource*)resource).url readOnly:!((FSPathURLResource*)resource).writable error:&error];
+    // This URL grants access to a private descriptor, not to repository data.
+    // FSKit supplies a read-only descriptor URL even for a writable World.
+    // Revision immutability and mount options determine volume writability.
+    NSError* error=nil;RevisionVolume* volume=[[RevisionVolume alloc] initWithRuntimeURL:((FSPathURLResource*)resource).url error:&error];
     if(volume)self.containerStatus=FSContainerStatus.ready;reply(volume,error);
 }
 - (void)unloadResource:(FSResource*)resource options:(FSTaskOptions*)options replyHandler:(void(^)(NSError*))reply {

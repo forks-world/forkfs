@@ -21,6 +21,13 @@ NSDictionary* RevisionLoadDescriptor(NSURL* url,NSError** error) {
         id view=config[config[@"revision"]!=nil?@"revision":@"world"],repository=config[@"repository"];
         require([view isKindOfClass:NSString.class] && [view length]>0 && (config[@"world"]==nil || config[@"revision"]==nil),EINVAL,"select exactly one view");
         require([repository isKindOfClass:NSString.class] && [repository length]==32,EINVAL,"invalid repository identity");
+        if(config[@"rpc"]){
+            id rpc=config[@"rpc"];
+            require([rpc isKindOfClass:NSDictionary.class] && [rpc[@"transport"] isEqual:@"tcp-loopback"],EINVAL,"invalid RPC transport");
+            id port=rpc[@"port"],key=rpc[@"key"];
+            require([port isKindOfClass:NSNumber.class] && CFGetTypeID((__bridge CFTypeRef)port)!=CFBooleanGetTypeID() && [port doubleValue]>=1 && [port doubleValue]<=65535 && [port doubleValue]==[port unsignedIntegerValue],EINVAL,"invalid loopback port");
+            require([key isKindOfClass:NSString.class] && [key length]==64 && [key rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"] invertedSet]].location==NSNotFound,EINVAL,"invalid loopback key");
+        }
         return config;
     }catch(const forkfs::RpcError& e){if(error)*error=[NSError errorWithDomain:NSPOSIXErrorDomain code:e.code userInfo:@{NSLocalizedDescriptionKey:@(e.what())}];return nil;}
     catch(const std::exception&){if(error)*error=[NSError errorWithDomain:NSPOSIXErrorDomain code:EIO userInfo:nil];return nil;}

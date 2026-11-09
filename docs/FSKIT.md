@@ -53,7 +53,45 @@ The callback test drives real FSKit `FSVolume`/`FSItem` callbacks against a
 separate resident daemon, covering binary I/O, identity after rename,
 open-unlink, atomic mode/size updates, read-only revisions and daemon loss.
 This is not evidence that the OS has accepted, activated or mounted the extension.
-A complete OS mount/syscall acceptance run remains required.
+The local OS mount/syscall acceptance evidence and remaining qualification
+limits are recorded below.
+
+## Start and stop a mount
+
+After installing and enabling the signed module, start the daemon, authenticated
+bridge and mount together from the repository root:
+
+```sh
+python3 scripts/mount-forkfs.py build/forkfs/daemon/forkfsd \
+  "$HOME/project.forkfs" "$HOME/Worlds/demo" \
+  --runtime "$HOME/.forkfs/run/demo" --world main --initialize
+```
+
+`--initialize` explicitly creates a new repository and its `main` World. It
+refuses an existing repository. For subsequent starts, omit `--initialize`.
+Use `--revision NAME` instead of `--world main` for an immutable revision. The
+repository, private runtime directory and empty private mountpoint must be
+separate paths; choose a short runtime path for the daemon's Unix socket.
+This foreground launcher owns one daemon and one mount per repository.
+
+The command stays in the foreground and reports readiness only after the OS
+mount succeeds. Ctrl-C or SIGTERM unmounts first, then stops the bridge and
+daemon. If unmounting fails because applications still use the volume, it keeps
+the services running; close those files and press Ctrl-C again. Startup failure
+cleans up processes it created. An unexpected daemon/bridge exit triggers
+unmounting rather than silently reconnecting a stale mount. If normal unmount
+fails after a backend process exits, the launcher attempts a forced detach of
+that failed mount. It never force-unmounts a busy volume while both services are
+healthy. Unsynced kernel writes are not a recovery guarantee; callers must use
+fsync before relying on a revision checkpoint. Separate runtime
+and mountpoint locks reject duplicate launchers. No pre-existing control socket
+is removed automatically. After its own daemon exits, the launcher removes an
+owned leftover socket only if its device, inode and change timestamp
+still match the endpoint it observed at startup. A replacement is preserved.
+Private `daemon.log` and `bridge.log` files are stored
+in the runtime directory; no key material is printed.
+
+The following manual setup remains useful when debugging the individual services.
 
 ## Set up a runtime resource
 
@@ -72,24 +110,45 @@ $forkfsd fs-init "$repo"
 $forkfsd serve "$repo" --socket "$runtime/control.sock" --rpc
 ```
 
-In a second terminal, prepare the mount resource after the service is ready:
+In a second terminal, start the sandbox-compatible bridge after the service is ready:
 
 ```sh
-python3 scripts/fskit-config.py build/forkfs/daemon/forkfsd "$runtime" --world main
+runtime="$HOME/.forkfs/run/demo"
+python3 scripts/fskit-bridge.py build/forkfs/daemon/forkfsd "$runtime" --world main
 # For an immutable snapshot, use --revision NAME instead.
 ```
 
-The helper validates the selected view and pins its repository identity in the
-JSON descriptor. Keep this directory private. Do not edit a descriptor for an
-active mount. Socket peers must have the same OS UID as the daemon. This local
+The bridge validates the selected view and pins its repository identity in the
+JSON descriptor. Keep it running until after unmounting. A security-scoped URL
+grants descriptor access but does not permit the sandboxed extension to connect
+to an arbitrary Unix socket. The bridge listens only on `127.0.0.1` and forwards
+to the fixed same-UID daemon socket. Fresh client/server nonces and HMAC-SHA256
+with a random 256-bit key authenticate both sides before any RPC is forwarded.
+The key is published only in the private descriptor and is never sent over the
+wire. Each bridge start rotates the endpoint/key, so stale mounts fail closed.
+Connections have a ten-second deadline, a 1 MiB frame limit and a sixteen-client
+concurrency limit. `scripts/fskit-config.py` remains available for unsandboxed
+callback tests that connect directly to the Unix socket. Keep this directory private. Do not edit a descriptor for an
+active mount. The bridge and Unix socket peers must have the same OS UID as the daemon;
+loopback peers must prove possession of the private descriptor key. This local
 control interface is not an agent broker, multi-user authorization system, or
 replacement for a sandbox boundary.
 
 For an OS mount test, install/register the built application and enable its file
 system extension in System Settings first. These are explicit host setup steps;
-the bundle script does not perform them. Once enabled:
+the bundle script does not perform them. Use System Settings → General → Login Items & Extensions → **By Category** →
+File System Extensions → ForkFS. The **By Application** → FSKit Modules toggle
+can ignore clicks due to a macOS settings defect, as investigated in
+[macFUSE issue 1194](https://github.com/macfuse/macfuse/issues/1194).
+After replacing an ad-hoc
+build with a development-signed build, macOS may also request authorization to
+reuse the extension's existing data container.
+
+Once enabled, use a third terminal:
 
 ```sh
+forkfsd="$PWD/build/forkfs/daemon/forkfsd"
+runtime="$HOME/.forkfs/run/demo"
 mountpoint="$HOME/Worlds/demo"
 mkdir -p "$mountpoint"
 chmod 700 "$mountpoint"
@@ -129,7 +188,8 @@ unsupported attributes fail before mutation. The owner/group are synthesized
 from the service identity. The mounted root is always exposed as mode 0700, and
 requests to broaden that mode fail before mutation; this mount policy does not
 rewrite the root metadata of a read-only revision. The frontend is intended for a single-user, private
-mount point; multi-user permissions and real syscall mappings are unqualified.
+mount point; multi-user permissions and syscall cases beyond the local
+acceptance suite remain unqualified.
 
 Directory enumeration uses captured daemon cursors, retains at most 64 bounded
 streams and rejects directories exceeding 65,536 entries. Old/foreign cookies
@@ -144,12 +204,31 @@ an explicit configuration error. CI builds the frontend and runs callback tests
 on macOS 26, alongside the daemon suite on Linux.
 
 
-## OS acceptance still required
+## OS acceptance and remaining qualification
 
-Validate real `open/read/write/fsync`, atomic-save rename, hardlinks, symlinks,
-open-unlink, truncate, directory cookies and dot entries, statfs, read-only
-revision mounts, daemon loss, kernel writeback/mmap, and ownership/access checks.
-The callback suite and signed bundle do not replace those OS-level checks.
+On 2026-11-09, a development-signed arm64 module on macOS 27.2 mounted a
+disposable repository through the authenticated bridge. The syscall acceptance
+script passed binary I/O/fsync with daemon readback, hardlink identity, symlink
+traversal, revision checkpoint isolation, rename/open-unlink/truncate/path reuse,
+directory enumeration/dot entries and atomic-save replacement. A separate actual
+revision mount advertised `read-only`, preserved the original snapshot bytes and
+rejected creation with `EROFS`.
+
+Because native xattrs are unsupported, macOS creates AppleDouble `._` sidecars.
+The acceptance script validates their AppleDouble headers before excluding them
+from its user-entry comparison. These files are real revision-backed namespace
+entries; they are not hidden or discarded by the daemon.
+
+The foreground launcher was additionally exercised with normal Ctrl-C and
+SIGTERM shutdown, busy-unmount preservation/retry, externally terminated daemon,
+abrupt daemon SIGKILL, forced detach, reuse of the same runtime after the crash,
+and snapshot readback plus `fs-check` after restarting. Fourteen automated
+lifecycle scenarios cover startup cleanup, duplicate ownership, busy unmount,
+backend loss, and cleanup/preservation of stale/replaced socket paths.
+
+Broader kernel writeback/mmap, long-running recovery, daemon-loss cache behavior,
+multi-user ownership/access checks and other macOS versions remain unqualified.
+The local mount evidence does not establish those behaviors.
 
 
 If mount reports `Module world.forks.forkfs.extension is disabled!`, plugin

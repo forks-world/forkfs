@@ -34,9 +34,9 @@ static NSData* command(NSString* binary,NSArray<NSString*>* args){
 }
 @end
 int main(int argc,char** argv){@autoreleasepool {
-    if(argc!=2)return 2;char tmp[]="/tmp/ff-fskit-XXXXXX";if(!mkdtemp(tmp))return 2;
+    if(argc!=2 && argc!=4)return 2;char tmp[]="/tmp/ff-fskit-XXXXXX";if(!mkdtemp(tmp))return 2;
     NSString* runtime=@(tmp);NSString* db=[runtime stringByAppendingPathComponent:@"db"];
-    NSString* binary=@(argv[1]);NSTask* server=nil;RevisionVolume* volume=nil;
+    NSString* binary=@(argv[1]);NSTask* server=nil;NSTask* bridge=nil;__block RevisionVolume* volume=nil;
     try {
         command(binary,@[@"init",db]);command(binary,@[@"fs-init",db]);command(binary,@[@"fs-snapshot",db,@"base"]);
         NSDictionary* status=[NSJSONSerialization JSONObjectWithData:command(binary,@[@"check",db]) options:0 error:nil];
@@ -47,11 +47,29 @@ int main(int argc,char** argv){@autoreleasepool {
         check(write(configFD,encoded.bytes,encoded.length)==static_cast<ssize_t>(encoded.length),"cannot write descriptor");close(configFD);
         NSString* socket=[runtime stringByAppendingPathComponent:@"control.sock"];
         server=[NSTask new];server.executableURL=[NSURL fileURLWithPath:binary];server.arguments=@[@"serve",db,@"--socket",socket,@"--rpc"];
-        NSPipe* pipe=[NSPipe pipe];server.standardOutput=pipe;server.standardError=[NSPipe pipe];NSError* error=nil;
+        NSPipe* pipe=[NSPipe pipe];server.standardOutput=pipe;server.standardError=[NSPipe pipe];__block NSError* error=nil;
         check([server launchAndReturnError:&error],"cannot launch resident daemon");
         // Read the ready status line, emitted after listen().
         check([pipe.fileHandleForReading availableData].length>0,"daemon did not become ready");
-        volume=[[RevisionVolume alloc] initWithRuntimeURL:[NSURL fileURLWithPath:runtime isDirectory:YES] error:&error];
+        if(argc==4){
+            bridge=[NSTask new];bridge.executableURL=[NSURL fileURLWithPath:@(argv[2])];bridge.arguments=@[@(argv[3]),binary,runtime,@"--world",@"main"];
+            NSPipe* ready=[NSPipe pipe];bridge.standardOutput=ready;
+            check([bridge launchAndReturnError:&error],"cannot launch loopback bridge");
+            check([ready.fileHandleForReading availableData].length>0,"bridge did not become ready");
+            config=[NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:configPath] options:0 error:nil];
+            check(config[@"rpc"]!=nil,"bridge descriptor missing");
+            NSMutableDictionary* wrong=[config mutableCopy];NSMutableDictionary* rpc=[config[@"rpc"] mutableCopy];
+            NSString* key=rpc[@"key"];rpc[@"key"]=[( [key hasPrefix:@"0"]?@"1":@"0") stringByAppendingString:[key substringFromIndex:1]];wrong[@"rpc"]=rpc;
+            NSData* bad=[NSJSONSerialization dataWithJSONObject:wrong options:0 error:nil];
+            check([bad writeToFile:configPath options:0 error:nil],"cannot write authentication test descriptor");
+            RevisionVolume* rejected=[[RevisionVolume alloc] initWithRuntimeURL:[NSURL fileURLWithPath:runtime isDirectory:YES] error:&error];
+            check(!rejected && error,"wrong server key must fail closed");error=nil;
+            NSData* good=[NSJSONSerialization dataWithJSONObject:config options:0 error:nil];
+            check([good writeToFile:configPath options:0 error:nil],"cannot restore authenticated descriptor");
+        }
+        FSUnaryFileSystem<FSUnaryFileSystemOperations>* filesystem=[NSClassFromString(@"RevisionFileSystem") new];
+        FSPathURLResource* resource=[[FSPathURLResource alloc] initWithURL:[NSURL fileURLWithPath:runtime isDirectory:YES] writable:NO];
+        [filesystem loadResource:resource options:nil replyHandler:^(FSVolume* loaded,NSError* failure){volume=(RevisionVolume*)loaded;error=failure;}];
         if(error)std::cerr<<error.description.UTF8String<<"\n";check(volume!=nil && !error,"volume initialization failed");
         __block FSItem* root=nil;__block NSError* result=nil;
         [volume activateWithOptions:nil replyHandler:^(FSItem* item,NSError* e){root=item;result=e;}];check(root && !result,"activation failed");
@@ -169,7 +187,8 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume synchronizeWithFlags:(FSSyncFlags)0 replyHandler:^(NSError* e){result=e;}];check(!result,"sync failed");
         check(volume.volumeStatistics.blockSize>0,"space callback failed");
         [volume deactivateWithOptions:0 replyHandler:^(NSError* e){result=e;}];check(!result,"deactivation failed");volume=nil;
-        NSDictionary* roConfig=@{@"schema_version":@1,@"revision":@"base",@"repository":status[@"repository_id"]};
+        NSMutableDictionary* roConfig=[@{@"schema_version":@1,@"revision":@"base",@"repository":status[@"repository_id"]} mutableCopy];
+        if(config[@"rpc"])roConfig[@"rpc"]=config[@"rpc"];
         NSData* roData=[NSJSONSerialization dataWithJSONObject:roConfig options:0 error:nil];
         int roFD=open(configPath.fileSystemRepresentation,O_WRONLY|O_TRUNC);check(roFD>=0,"cannot replace descriptor");
         check(write(roFD,roData.bytes,roData.length)==static_cast<ssize_t>(roData.length),"cannot write revision descriptor");close(roFD);
@@ -179,8 +198,9 @@ int main(int argc,char** argv){@autoreleasepool {
         [server terminate];[server waitUntilExit];server=nil;
         [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:root replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(result!=nil,"daemon loss must not use cached fallback");
         volume=nil;
+        if(bridge.running){[bridge terminate];[bridge waitUntilExit];bridge=nil;}
         command(binary,@[@"fs-check",db]);command(binary,@[@"gc",db]);
         [[NSFileManager defaultManager] removeItemAtPath:runtime error:nil];
         std::cout<<"FSKit callbacks -> resident daemon: binary I/O, identity, open-unlink, atomic attributes and sync passed\n";return 0;
-    }catch(const std::exception& e){std::cerr<<e.what()<<"\n";volume=nil;if(server.running){[server terminate];[server waitUntilExit];}[[NSFileManager defaultManager] removeItemAtPath:runtime error:nil];return 1;}
+    }catch(const std::exception& e){std::cerr<<e.what()<<"\n";volume=nil;if(bridge.running){[bridge terminate];[bridge waitUntilExit];}if(server.running){[server terminate];[server waitUntilExit];}[[NSFileManager defaultManager] removeItemAtPath:runtime error:nil];return 1;}
 }}

@@ -42,6 +42,8 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
     NSMutableDictionary<NSNumber*,NSDictionary*>* _streams;
     uint64_t _nextItem,_nextStream;
     std::string _socket;
+    forkfs::LoopbackEndpoint _loopback;
+    BOOL _bridged;
     NSString* _session;
     NSString* _view;
     BOOL _revision,_readOnly,_alive,_scoped,_initialized;
@@ -55,7 +57,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
     for(NSString* arg in args)fields.push_back(bytes(arg));
     fields.push_back(_revision?"--revision":"--world");fields.push_back(bytes(_view));
     fields.push_back("--session");fields.push_back(bytes(_session));
-    return forkfs::request_rpc(_socket,fields);
+    return forkfs::request_rpc(_socket,fields,_bridged?&_loopback:nullptr);
 }
 - (NSDictionary*)json:(NSArray<NSString*>*)args {return object([self call:args]);}
 - (NSError*)perform:(void(^)(void))operation {
@@ -106,7 +108,8 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
         BOOL revision=config[@"revision"]!=nil;id view=config[revision?@"revision":@"world"];
         require([view isKindOfClass:NSString.class] && (config[@"world"]==nil || config[@"revision"]==nil),EINVAL,"select exactly one view");
         _view=view;_revision=revision;_readOnly=readOnly||revision;_socket=bytes([url.path stringByAppendingPathComponent:@"control.sock"]);
-        auto session=object(forkfs::request_rpc(_socket,{"session-open","60000"}));_session=session[@"session"];
+        if(config[@"rpc"]){_bridged=YES;_loopback.port=[config[@"rpc"][@"port"] unsignedShortValue];_loopback.key=bytes(config[@"rpc"][@"key"]);}
+        auto session=object(forkfs::request_rpc(_socket,{"session-open","60000"},_bridged?&_loopback:nullptr));_session=session[@"session"];
         require([_session isKindOfClass:NSString.class],EPROTO,"invalid session response");_alive=YES;
         NSDictionary* root=[self json:@[@"inode-root"]];require([root[@"repository"] isEqual:config[@"repository"]],ESTALE,"repository identity changed");
         _uid=[root[@"uid"] unsignedIntValue];_gid=[root[@"gid"] unsignedIntValue];
@@ -118,13 +121,13 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
     _heartbeat=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
     dispatch_source_set_timer(_heartbeat,dispatch_time(DISPATCH_TIME_NOW,15*NSEC_PER_SEC),15*NSEC_PER_SEC,NSEC_PER_SEC);
     dispatch_source_set_event_handler(_heartbeat,^{RevisionVolume* volume=weak;if(!volume)return;
-        NSError* failure=[volume perform:^{require(volume->_alive,ESTALE,"closed mount");forkfs::request_rpc(volume->_socket,{"session-keepalive",bytes(volume->_session)});}];
+        NSError* failure=[volume perform:^{require(volume->_alive,ESTALE,"closed mount");forkfs::request_rpc(volume->_socket,{"session-keepalive",bytes(volume->_session)},volume->_bridged?&volume->_loopback:nullptr);}];
         if(failure){[volume->_lock lock];volume->_alive=NO;[volume->_lock unlock];}
     });dispatch_resume(_heartbeat);return self;
 }
 - (void)shutdown {
     [_lock lock];if(_heartbeat){dispatch_source_cancel(_heartbeat);_heartbeat=nil;}
-    if(_session){try{forkfs::request_rpc(_socket,{"session-close",bytes(_session)});}catch(...){} _session=nil;}
+    if(_session){try{forkfs::request_rpc(_socket,{"session-close",bytes(_session)},_bridged?&_loopback:nullptr);}catch(...){} _session=nil;}
     _alive=NO;[_streams removeAllObjects];[_items removeAllObjects];[_lock unlock];
 }
 - (void)dealloc {[self shutdown];if(_scoped)[_runtime stopAccessingSecurityScopedResource];}
@@ -134,6 +137,9 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 - (BOOL)truncatesLongNames{return NO;}
 - (NSInteger)maximumXattrSize{return 0;}
 - (uint64_t)maximumFileSize{return 256*1024;}
+#ifdef FSKIT_API_AVAILABILITY_V2_4
+- (FSMountOptions)requestedMountOptions {return _readOnly?FSMountOptionsReadOnly:0;}
+#endif
 - (FSVolumeSupportedCapabilities*)supportedVolumeCapabilities {
     FSVolumeSupportedCapabilities* c=[FSVolumeSupportedCapabilities new];c.supportsHardLinks=YES;c.supportsSymbolicLinks=YES;
     c.supportsPersistentObjectIDs=NO;c.supports64BitObjectIDs=YES;c.supportsSparseFiles=NO;c.supports2TBFiles=NO;
@@ -269,7 +275,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 - (void)writeContents:(NSData*)contents toFile:(FSItem*)item atOffset:(off_t)offset replyHandler:(void(^)(size_t,NSError*))reply {
     __block size_t count=0;NSError* e=[self perform:^{[self writable];require(offset>=0,EINVAL,"negative write offset");require(contents.length<=256*1024,EFBIG,"file limit exceeded");auto it=[self item:item];require(it.writer!=nil,EBADF,"file is not open for writing");
         std::vector<std::string> fields{"fs-hwrite",bytes(it.writer),std::to_string(offset),std::string(contents.length?static_cast<const char*>(contents.bytes):"",contents.length),_revision?"--revision":"--world",bytes(_view),"--session",bytes(_session)};
-        forkfs::request_rpc(_socket,fields);count=contents.length;
+        forkfs::request_rpc(_socket,fields,_bridged?&_loopback:nullptr);count=contents.length;
     }];reply(count,e);
 }
 - (void)getXattrNamed:(FSFileName*)name ofItem:(FSItem*)item replyHandler:(void(^)(NSData*,NSError*))reply {reply(nil,posix(ENOATTR));}
