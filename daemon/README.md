@@ -102,9 +102,9 @@ JSON. Reads stop at EOF. Truncate growth zero fills; shrinking discards the tail
 Empty writes/appends and unchanged truncate do not commit or update timestamps.
 Read-only revision restrictions and hardlink identity apply to all operations.
 
-Files remain limited to 256 KiB. Offset reads still load the complete object;
-partial updates still copy the complete file into a new immutable object. Extent
-storage is not implemented. File handle semantics are described below.
+Files support up to 64 MiB, with 256 KiB per daemon I/O call. Small inline files
+retain their original layout; larger files use sparse 64 KiB CoW chunks, so
+range operations load only the touched chunks. See the storage layout below.
 
 Successful mutation replies follow local synchronous commit. A lost reply can
 mean the mutation committed: request deduplication is not implemented, and the
@@ -355,7 +355,7 @@ input and revision writes fail without a partial publication.
 This is an explicit metadata-service operation for clients that can express atomic
 replacement intent. It is not a transparent rewrite of an editor's separate
 create/write/rename syscalls, and requires no durability weakening. It retains the
-256 KiB file limit. Use the performance probe to compare this one-commit API with
+256 KiB replacement-input limit. Use the performance probe to compare this one-commit API with
 the two-commit temporary-write/rename path; OS-mounted save performance is unmeasured.
 
 ## RPC client sessions
@@ -545,7 +545,7 @@ delete so inode identities are not reused. Failed validation leaves the file int
 sizes, file/directory link counts, orphan records and allocation markers. The
 internal prefix `NUL + forkfs/` is reserved against generic PUT/batch mutation.
 
-The prototype supports regular files up to 256 KiB, directories, modes 0644/0755,
+The prototype supports regular files up to 64 MiB, directories, modes 0644/0755,
 mtime/ctime, and absolute paths with valid UTF-8 components up to 255 bytes
 (path up to 4096 bytes). Names and symlink targets preserve their original UTF-8
 bytes: case and canonically equivalent NFC/NFD spellings remain distinct.
@@ -559,12 +559,29 @@ UTF-8 names requires a daemon that supports them. These deliberate prototype
 restrictions are not a frozen cross-platform naming policy. Current operations
 wait for local durability.
 
-There are no open handles, open-unlink lifetime, permission enforcement, symlinks,
-range writes or sparse files yet. Internal keys use immutable sorted runs after
-the first namespace update, with decoded per-view indexes; this is a
-transaction/namespace correctness baseline, not the final performance layout. Existing storage/crash tests
-are supplemented by stable inode, hardlink, directory rename/link count and atomic
-overwrite-rename process-crash tests with checkpoint recovery.
+Regular files retain the original inline inode type (1) until they first grow
+past 256 KiB. They then use inode type 4 and sparse 64 KiB chunks at
+`\0forkfs/chunk/INODE/NNNN` (four decimal digits). Missing chunks and omitted
+trailing zero bytes read as zero. Shrinking removes later chunks and trims the
+last chunk, so extending again cannot reveal old bytes. Chunk leaves use the
+existing immutable CoW tree: each operation publishes data and inode size in one
+transaction, and retained revisions/Worlds keep their original objects. Older
+daemons reject type 4; do not downgrade a repository after creating chunked files.
+
+Range reads/writes, appends and handle I/O remain bounded to 256 KiB per call;
+reads clamp to EOF before checking that bound. `fs-write`/`fs-save` and their RPC
+forms still accept a complete replacement of at most 256 KiB. Larger files use
+`fs-write-at`, append, or mounted I/O in bounded pieces. Offline `fs-cat` streams
+the full file; RPC `fs-cat` is bounded and clients use `fs-read-at` for larger
+files. These multi-call transfers are not a single atomic operation; native
+save-via-temp-file-and-rename remains available.
+
+Open-unlink retains chunk references under the existing orphan roots. Retention
+reuses object IDs instead of resubmitting all file bytes to the 16 MiB value
+batch. Last close and restart release the roots; physical GC preserves chunks
+referenced by retained revisions. The 64 MiB cap bounds chunk count, unlink and
+truncate transactions while retaining the existing object/batch limits.
+Permission enforcement beyond the private single-user mount remains unqualified.
 
 
 ## Worlds and retained revisions

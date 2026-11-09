@@ -69,7 +69,7 @@ try:
         assert rpc('fs-cat',namespace+'/file')!=payload
         report['retained_revision']=revision
         report['checks'].append('fsync then revision checkpoint isolates subsequent writes')
-    rejects(lambda:os.ftruncate(fd,256*1024+1),errno.EFBIG)
+    rejects(lambda:os.ftruncate(fd,64*1024*1024+1),errno.EFBIG)
     assert os.fstat(fd).st_size==len(payload)
     os.rename(file,root/'renamed')
     assert (root/'renamed').stat().st_ino==old_inode
@@ -132,6 +132,28 @@ try:
         assert rpc('fs-cat',unicode_namespace,revision=revision)==payload
         report['unicode_retained_revision']=revision
     report['checks'].append('UTF-8 names, links, rename, NFC/NFD identity and byte limits')
+    large=root/'large.bin';large_namespace=namespace+'/large.bin'
+    large_payload=bytes(range(256))*(4*1024*1024//256)
+    large.write_bytes(large_payload)
+    assert large.read_bytes()==large_payload
+    with large.open('r+b',buffering=0) as stream:
+        os.fsync(stream.fileno())
+        if args.checkpoint:
+            large_revision='large_mount_'+uuid.uuid4().hex[:12]
+            rpc('fs-snapshot',large_revision)
+            assert rpc('fs-read-at',large_namespace,str(3*1024*1024),str(256*1024),revision=large_revision)==large_payload[3*1024*1024:3*1024*1024+256*1024]
+            report['large_retained_revision']=large_revision
+            report['large_namespace']=large_namespace
+        os.pwrite(stream.fileno(),b'TAIL',64*1024*1024-4);os.fsync(stream.fileno())
+        assert os.fstat(stream.fileno()).st_size==64*1024*1024
+        assert os.pread(stream.fileno(),8,64*1024*1024-8)==bytes(4)+b'TAIL'
+        rejects(lambda:os.ftruncate(stream.fileno(),64*1024*1024+1),errno.EFBIG)
+        os.ftruncate(stream.fileno(),65537);os.ftruncate(stream.fileno(),1024*1024);os.fsync(stream.fileno())
+        assert os.pread(stream.fileno(),8,65536)==bytes([0])+bytes(7)
+        os.unlink(large)
+        assert os.pwrite(stream.fileno(),b'ORPHAN',900000)==6;os.fsync(stream.fileno())
+        assert os.pread(stream.fileno(),6,900000)==b'ORPHAN'
+    report['checks'].append('4 MiB file transfer, 64 MiB sparse limit, truncate zero-fill and chunked open-unlink')
     rpc('fs-check')
 finally:
     if fd is not None:os.close(fd)

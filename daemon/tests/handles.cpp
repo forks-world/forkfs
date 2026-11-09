@@ -93,7 +93,7 @@ int main(){
             fs.handle_write(appenders[0],INT64_MAX,Bytes{'!'});check(fs.handle_read(appenders[0],appended.size(),5)==Bytes{'!'});
             check(append_base.read("/append-test")==Bytes{'B'} && append_fork.read("/append-test")==Bytes{'B'});
             fs.write("/append-test",Bytes{'N'});check(fs.read("/append-test")==Bytes{'N'});
-            fs.handle_truncate(appenders[0],256*1024);stable=store.status();
+            fs.handle_truncate(appenders[0],forkfs::Namespace::maximum_file_size);stable=store.status();
             rejects([&]{fs.handle_write(appenders[0],0,Bytes{1});});rejects([&]{fs.handle_write(appenders[0],UINT64_MAX,{});});
             fs.handle_write(appenders[0],0,{});check(store.status()==stable);
             for(const auto& h:appenders)fs.close(h);fs.remove("/append-test",false);fs.verify();

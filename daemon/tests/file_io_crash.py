@@ -22,6 +22,8 @@ with tempfile.TemporaryDirectory(prefix='ff-io-crash-',dir='/tmp') as tmp:
         ('fs-truncate',('/f','3'),b'abc'),
         ('fs-truncate',('/f','8'),b'abcdef\0\0'),
         ('fs-append',('/f',str(data)),b'abcdefXY'),
+        ('fs-write-at',('/f','262143',str(data)),b'abcdef'+bytes(262143-6)+b'XY'),
+        ('fs-truncate',('/f','400000'),b'abcdef'+bytes(400000-6)),
     ]:
         for stage in ['leveldb_before_write','leveldb_after_write']:
             shutil.rmtree(db);shutil.copytree(baseline,db)

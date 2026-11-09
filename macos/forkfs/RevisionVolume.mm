@@ -136,13 +136,13 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 - (BOOL)restrictsOwnershipChanges{return YES;}
 - (BOOL)truncatesLongNames{return NO;}
 - (NSInteger)maximumXattrSize{return 0;}
-- (uint64_t)maximumFileSize{return 256*1024;}
+- (uint64_t)maximumFileSize{return 64*1024*1024;}
 #ifdef FSKIT_API_AVAILABILITY_V2_4
 - (FSMountOptions)requestedMountOptions {return _readOnly?FSMountOptionsReadOnly:0;}
 #endif
 - (FSVolumeSupportedCapabilities*)supportedVolumeCapabilities {
     FSVolumeSupportedCapabilities* c=[FSVolumeSupportedCapabilities new];c.supportsHardLinks=YES;c.supportsSymbolicLinks=YES;
-    c.supportsPersistentObjectIDs=NO;c.supports64BitObjectIDs=YES;c.supportsSparseFiles=NO;c.supports2TBFiles=NO;
+    c.supportsPersistentObjectIDs=NO;c.supports64BitObjectIDs=YES;c.supportsSparseFiles=YES;c.supports2TBFiles=NO;
     c.caseFormat=FSVolumeCaseFormatSensitive;return c;
 }
 - (FSStatFSResult*)volumeStatistics {
@@ -269,13 +269,20 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 }
 - (void)readFromFile:(FSItem*)item offset:(off_t)offset length:(size_t)length intoBuffer:(FSMutableFileDataBuffer*)buffer replyHandler:(void(^)(size_t,NSError*))reply {
     __block size_t count=0;NSError* e=[self perform:^{require(offset>=0,EINVAL,"negative read offset");auto it=[self item:item];NSString* handle=[self handle:it];require(handle!=nil,EBADF,"file is not open");
-        auto data=[self call:@[@"fs-hread",handle,[@(offset) stringValue],[@(MIN(length,buffer.length)) stringValue]]];count=data.size();require(count<=buffer.length,EPROTO,"oversized daemon read");memcpy(buffer.mutableBytes,data.data(),count);
+        const auto wanted=MIN(length,buffer.length);
+        while(count<wanted){auto data=[self call:@[@"fs-hread",handle,[@(uint64_t(offset)+count) stringValue],[@(MIN(wanted-count,size_t(256*1024))) stringValue]]];
+            require(data.size()<=MIN(wanted-count,size_t(256*1024)),EPROTO,"oversized daemon read");if(data.empty())break;
+            memcpy(static_cast<unsigned char*>(buffer.mutableBytes)+count,data.data(),data.size());count+=data.size();}
     }];reply(count,e);
 }
 - (void)writeContents:(NSData*)contents toFile:(FSItem*)item atOffset:(off_t)offset replyHandler:(void(^)(size_t,NSError*))reply {
-    __block size_t count=0;NSError* e=[self perform:^{[self writable];require(offset>=0,EINVAL,"negative write offset");require(contents.length<=256*1024,EFBIG,"file limit exceeded");auto it=[self item:item];require(it.writer!=nil,EBADF,"file is not open for writing");
-        std::vector<std::string> fields{"fs-hwrite",bytes(it.writer),std::to_string(offset),std::string(contents.length?static_cast<const char*>(contents.bytes):"",contents.length),_revision?"--revision":"--world",bytes(_view),"--session",bytes(_session)};
-        forkfs::request_rpc(_socket,fields,_bridged?&_loopback:nullptr);count=contents.length;
+    __block size_t count=0;NSError* e=[self perform:^{[self writable];require(offset>=0,EINVAL,"negative write offset");auto it=[self item:item];require(it.writer!=nil,EBADF,"file is not open for writing");
+        // FSKit can exceed ioSize in a single callback. Complete it using
+        // bounded RPCs; ioSize is a preference rather than a request limit.
+        require(contents.length==0 || (uint64_t(offset)<=64*1024*1024 && contents.length<=64*1024*1024-uint64_t(offset)),EFBIG,"file exceeds 64 MiB");
+        while(count<contents.length){auto length=MIN(contents.length-count,size_t(256*1024));
+            std::vector<std::string> fields{"fs-hwrite",bytes(it.writer),std::to_string(uint64_t(offset)+count),std::string(static_cast<const char*>(contents.bytes)+count,length),_revision?"--revision":"--world",bytes(_view),"--session",bytes(_session)};
+            forkfs::request_rpc(_socket,fields,_bridged?&_loopback:nullptr);count+=length;}
     }];reply(count,e);
 }
 - (void)getXattrNamed:(FSFileName*)name ofItem:(FSItem*)item replyHandler:(void(^)(NSData*,NSError*))reply {reply(nil,posix(ENOATTR));}

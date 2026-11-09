@@ -31,11 +31,11 @@ int main(){
             check(before==store.status() && attrs.modified_ns==work.stat("/f").modified_ns);
             rejects([&]{old.write_at("/f",0,{});});rejects([&]{old.append("/f",{});});rejects([&]{old.truncate("/f",6);});
             rejects([&]{work.write_at("/f",UINT64_MAX,Bytes{1});});rejects([&]{work.read_at("/f",UINT64_MAX,1);});
-            rejects([&]{work.write_at("/f",256*1024,Bytes{1});});rejects([&]{work.truncate("/f",256*1024+1);});
+            rejects([&]{work.write_at("/f",forkfs::Namespace::maximum_file_size,Bytes{1});});rejects([&]{work.truncate("/f",forkfs::Namespace::maximum_file_size+1);});
             rejects([&]{work.write_at("/missing",0,{});});rejects([&]{work.truncate("/",0);});
             check(before==store.status());
-            work.truncate("/f",256*1024);work.write_at("/f",256*1024-1,Bytes{42});
-            check(work.read_at("/f",256*1024-1,8)==Bytes{42});rejects([&]{work.append("/f",Bytes{1});});
+            work.truncate("/f",forkfs::Namespace::maximum_file_size);work.write_at("/f",forkfs::Namespace::maximum_file_size-1,Bytes{42});
+            check(work.read_at("/f",forkfs::Namespace::maximum_file_size-1,8)==Bytes{42});rejects([&]{work.append("/f",Bytes{1});});
             work.truncate("/f",0);
             std::atomic<bool> failed=false;std::mutex mutex;std::set<uint64_t> offsets;
             std::vector<std::thread> workers;

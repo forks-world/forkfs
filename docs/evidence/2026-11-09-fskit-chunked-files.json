@@ -1,0 +1,35 @@
+{
+  "namespace": "/forkfs-accept-nk21cc_7",
+  "checks": [
+    "binary write/read/fsync reaches daemon content",
+    "hardlink identity and symlink traversal",
+    "fsync then revision checkpoint isolates subsequent writes",
+    "rename/open-unlink/truncate/path reuse preserve file identity",
+    "directory enumeration and dot entries",
+    "atomic-save replacement reaches revision-backed namespace",
+    "UTF-8 names, links, rename, NFC/NFD identity and byte limits",
+    "4 MiB file transfer, 64 MiB sparse limit, truncate zero-fill and chunked open-unlink"
+  ],
+  "retained_revision": "mount_accept_f21c539e5d41",
+  "appledouble_sidecars": 36,
+  "unicode_retained_revision": "unicode_mount_c17a2f1e32f5",
+  "large_retained_revision": "large_mount_ca7a5cc0699d",
+  "large_namespace": "/forkfs-accept-nk21cc_7/large.bin",
+  "platform": {
+    "macOS": "27.2",
+    "architecture": "arm64"
+  },
+  "source_sha256": {
+    "daemon/namespace.cpp": "a0ce9af1fbb7c299d3fc8bd461d92962ba91267e04795b910df75eaedca95956",
+    "macos/forkfs/RevisionVolume.mm": "82a10c4c12bbb16460a6feb251c186e47d4c7215a98bfc1b9643e86d91c19192",
+    "scripts/tests/forkfs_mount.py": "59d1b44de7cb46daf768414e018046b80cbbba0a159fd45efd3d00447c2ac1b9"
+  },
+  "readonly_large_revision": {
+    "revision": "large_mount_ca7a5cc0699d",
+    "bytes": 4194304,
+    "sha256": "2b07811057df887086f06a67edc6ebf911de8b6741156e7a2eb1416a4b8b1b2e",
+    "read_only_errno": 30,
+    "after_restart_and_gc": true
+  },
+  "offline_gc_collected_objects": 29639
+}

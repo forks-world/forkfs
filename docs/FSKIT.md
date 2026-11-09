@@ -189,8 +189,8 @@ Actual macOS 27.2 World and read-only revision mounts verified Chinese/emoji
 names, links, rename, NFC/NFD distinctions and the byte limit; see
 [UTF-8 acceptance evidence](evidence/2026-11-09-fskit-utf8.json).
 
-Current limits are inherited from the namespace prototype: 256 KiB per regular
-file, UTF-8 names (255 bytes per component, 4096 per path), mode bits through
+Current limits are inherited from the namespace prototype: 64 MiB per regular
+file with 256 KiB per daemon I/O request, UTF-8 names (255 bytes per component, 4096 per path), mode bits through
 0777, no xattrs/ACLs, no uid/gid
 changes, and no special files. Setattr supports mode, size and mtime atomically;
 unsupported attributes fail before mutation. The owner/group are synthesized
@@ -205,8 +205,13 @@ streams and rejects directories exceeding 65,536 entries. Old/foreign cookies
 fail with ESTALE. FSItem numbers are stable only for the mount lifetime;
 persistent object IDs are not advertised. Inode requests currently traverse the
 revision metadata to locate a linked inode, so large-tree performance is not
-qualified. File data always goes through daemon handles. Sparse-file, 2 TB-file,
-xattr and native-directory capabilities are not advertised.
+qualified. File data always goes through daemon handles. Sparse files are supported through zero-filled holes and bounded chunk I/O.
+2 TB-file, xattr and native-directory capabilities are not advertised.
+FSKit callbacks can exceed the advertised I/O size; the frontend completes them
+using bounded RPCs. Actual macOS 27.2 mounts verified a 4 MiB transfer, 64 MiB
+sparse growth, shrink/extend zero fill, chunked open-unlink and a full 4 MiB
+read-only revision read after service restart and physical GC; see
+[chunked-file acceptance evidence](evidence/2026-11-09-fskit-chunked-files.json).
 
 Linux continues to build the daemon without FSKit; enabling the option there is
 an explicit configuration error. CI builds the frontend and runs callback tests

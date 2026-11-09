@@ -159,6 +159,14 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume writeContents:contents toFile:file atOffset:0 replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==4,"binary write failed");
         TestBuffer* buffer=[TestBuffer new];buffer.storage=[NSMutableData dataWithLength:32];
         [volume readFromFile:file offset:0 length:32 intoBuffer:(FSMutableFileDataBuffer*)buffer replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==4 && !memcmp(buffer.storage.bytes,payload,4),"binary read failed");
+        check(volume.maximumFileSize==64*1024*1024,"wrong file size capability");
+        [volume writeContents:contents toFile:file atOffset:300001 replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==4,"large sparse write failed");
+        buffer.storage=[NSMutableData dataWithLength:300010];
+        [volume readFromFile:file offset:0 length:300010 intoBuffer:(FSMutableFileDataBuffer*)buffer replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==300005,"large callback read must complete via bounded requests");
+        [volume readFromFile:file offset:299999 length:16 intoBuffer:(FSMutableFileDataBuffer*)buffer replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==6 && !memcmp((const char*)buffer.storage.bytes+2,payload,4),"large sparse read failed");
+        NSMutableData* oversized=[NSMutableData dataWithLength:300000];
+        [volume writeContents:oversized toFile:file atOffset:500000 replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==300000,"large callback write must complete via bounded requests");
+        [volume writeContents:contents toFile:file atOffset:64*1024*1024 replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(result.code==EFBIG && count==0,"oversized file write must fail before mutation");
         [volume renameItem:file inDirectory:root named:[FSFileName nameWithString:@"文件📄"] toNewName:[FSFileName nameWithString:@"重命名🚀"] inDirectory:root overItem:nil replyHandler:^(FSFileName* n,NSError* e){result=e;}];check(!result,"rename callback failed");
         __block FSItem* again=nil;
         [volume lookupItemNamed:[FSFileName nameWithString:@"重命名🚀"] inDirectory:root replyHandler:^(FSItem* it,FSFileName* n,NSError* e){again=it;result=e;}];check(!result && again==file,"rename lost item identity");
