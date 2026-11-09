@@ -104,6 +104,34 @@ try:
     assert file.read_bytes()==b'atomic replacement'
     assert rpc('fs-cat',namespace+'/file')==b'atomic replacement'
     report['checks'].append('atomic-save replacement reaches revision-backed namespace')
+    unicode_dir=root/'中文目录📁';unicode_dir.mkdir(mode=0o700)
+    unicode_file=unicode_dir/'文件📄.txt';unicode_file.write_bytes(payload)
+    with unicode_file.open('rb') as stream:os.fsync(stream.fileno())
+    unicode_inode=unicode_file.stat().st_ino
+    unicode_alias=unicode_dir/'硬链接🔗';os.link(unicode_file,unicode_alias)
+    unicode_renamed=unicode_dir/'重命名🚀.txt';os.rename(unicode_file,unicode_renamed)
+    assert unicode_alias.stat().st_ino==unicode_renamed.stat().st_ino==unicode_inode
+    os.symlink(unicode_renamed.name,unicode_dir/'符号链接')
+    assert os.readlink(unicode_dir/'符号链接')==unicode_renamed.name
+    assert (unicode_dir/'符号链接').read_bytes()==payload
+    for spelling,data in [('é',b'NFC'),('e\u0301',b'NFD')]:
+        path=unicode_dir/spelling;path.write_bytes(data)
+        with path.open('rb') as stream:os.fsync(stream.fileno())
+    assert (unicode_dir/'é').read_bytes()==b'NFC' and (unicode_dir/'e\u0301').read_bytes()==b'NFD'
+    assert (unicode_dir/'é').stat().st_ino!=(unicode_dir/'e\u0301').stat().st_ino
+    boundary=unicode_dir/('界'*85);boundary.write_bytes(b'255 UTF-8 bytes')
+    assert boundary.read_bytes()==b'255 UTF-8 bytes'
+    rejects(lambda:(unicode_dir/('界'*85+'a')).write_bytes(b'too long'),errno.ENAMETOOLONG,errno.EINVAL)
+    assert {'文件📄.txt','重命名🚀.txt'}&set(os.listdir(unicode_dir))=={'重命名🚀.txt'}
+    unicode_namespace=namespace+'/'+unicode_dir.name+'/'+unicode_renamed.name
+    assert rpc('fs-cat',unicode_namespace)==payload
+    if args.checkpoint:
+        revision='unicode_mount_'+uuid.uuid4().hex[:12];rpc('fs-snapshot',revision)
+        unicode_alias.write_bytes(b'changed after Unicode checkpoint')
+        with unicode_alias.open('rb') as stream:os.fsync(stream.fileno())
+        assert rpc('fs-cat',unicode_namespace,revision=revision)==payload
+        report['unicode_retained_revision']=revision
+    report['checks'].append('UTF-8 names, links, rename, NFC/NFD identity and byte limits')
     rpc('fs-check')
 finally:
     if fd is not None:os.close(fd)

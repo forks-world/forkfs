@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import select
 import socket
 import struct
 import subprocess
@@ -39,11 +40,13 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
     def start():
         p=subprocess.Popen([BIN,'serve',str(db),'--socket',str(endpoint),'--rpc'],
                            stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-        deadline=time.monotonic()+5
-        while not endpoint.exists():
-            assert p.poll() is None,p.communicate()
-            assert time.monotonic()<deadline
-            time.sleep(.01)
+        try:
+            # A bound path can exist before listen(); the greeting follows it.
+            assert select.select([p.stdout],[],[],5)[0], 'daemon readiness timed out'
+            assert json.loads(p.stdout.readline())['state']=='leveldb'
+        except BaseException:
+            if p.poll() is None:p.kill();p.wait(timeout=5)
+            raise
         return p
     session=None
     def raw(fields,ok=True,fragment=False):

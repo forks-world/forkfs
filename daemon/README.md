@@ -227,7 +227,7 @@ Absolute targets begin at the selected World root; relative targets start at the
 link's actual containing directory. Dot/dot-dot in targets use physical traversal,
 clamping at the World root. No host path is opened to resolve a symlink. Traversal
 allows at most 40 followed links and 64 KiB cumulative target expansion. Targets
-are 1..4096 bytes, printable ASCII, component length at most 255; repeated slashes
+are 1..4096 bytes of valid UTF-8, component length at most 255 bytes; repeated slashes
 and dot components are supported inside targets. A target's trailing slash requires
 a directory. Ordinary external paths retain the prototype's strict path rules.
 
@@ -546,10 +546,18 @@ sizes, file/directory link counts, orphan records and allocation markers. The
 internal prefix `NUL + forkfs/` is reserved against generic PUT/batch mutation.
 
 The prototype supports regular files up to 256 KiB, directories, modes 0644/0755,
-mtime/ctime, and absolute paths with printable ASCII components up to 255 bytes
-(path up to 4096 bytes). Dot components, repeated/trailing slashes and control/non-ASCII
-characters are rejected. These deliberate prototype restrictions are not a frozen
-cross-platform naming policy. Current operations wait for local durability.
+mtime/ctime, and absolute paths with valid UTF-8 components up to 255 bytes
+(path up to 4096 bytes). Names and symlink targets preserve their original UTF-8
+bytes: case and canonically equivalent NFC/NFD spellings remain distinct.
+There is no Unicode normalization or case folding. C0 controls, DEL and C1 controls,
+malformed/truncated UTF-8, overlong encodings, surrogate code points and values
+above U+10FFFF are rejected before publication. Dot components and repeated or
+trailing slashes remain unsupported in ordinary paths; symlink targets retain
+their existing traversal rules. World/revision labels remain restricted to their
+ASCII identifier grammar. Existing ASCII stores need no conversion; a store with
+UTF-8 names requires a daemon that supports them. These deliberate prototype
+restrictions are not a frozen cross-platform naming policy. Current operations
+wait for local durability.
 
 There are no open handles, open-unlink lifetime, permission enforcement, symlinks,
 range writes or sparse files yet. Internal keys use immutable sorted runs after

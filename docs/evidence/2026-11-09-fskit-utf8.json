@@ -1,0 +1,33 @@
+{
+  "namespace": "/forkfs-accept-ulz6ob_5",
+  "checks": [
+    "binary write/read/fsync reaches daemon content",
+    "hardlink identity and symlink traversal",
+    "fsync then revision checkpoint isolates subsequent writes",
+    "rename/open-unlink/truncate/path reuse preserve file identity",
+    "directory enumeration and dot entries",
+    "atomic-save replacement reaches revision-backed namespace",
+    "UTF-8 names, links, rename, NFC/NFD identity and byte limits"
+  ],
+  "retained_revision": "mount_accept_327ede171d57",
+  "appledouble_sidecars": 36,
+  "unicode_retained_revision": "unicode_mount_fdda622d90be",
+  "platform": {
+    "macOS": "27.2",
+    "architecture": "arm64"
+  },
+  "namespace_source_sha256": "c815cba126a896e752e8529b50fb57fbf81e5baa5e2a639fe8b3ac8d7cb0c994",
+  "readonly_unicode_revision": {
+    "original_contents": true,
+    "nfc_nfd_distinct": true,
+    "unicode_symlink_target_preserved": true,
+    "create_errno": "EROFS"
+  },
+  "naming_policy": {
+    "encoding": "strict UTF-8",
+    "normalization": "none; byte identity",
+    "component_limit_bytes": 255,
+    "path_limit_bytes": 4096,
+    "excluded_controls": "C0, DEL, C1"
+  }
+}

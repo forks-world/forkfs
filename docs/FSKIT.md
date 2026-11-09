@@ -181,8 +181,17 @@ rename and unlink through daemon orphan roots and are released on final close,
 unmount or session expiry. This is normal FSKit callback-level lifetime, not a
 claim that a live mount survives service restart.
 
+Names and symlink targets preserve their UTF-8 bytes without normalization or
+case folding. Chinese, emoji and combining sequences are supported; NFC and NFD
+spellings are distinct names. Malformed UTF-8 and C0/DEL/C1 controls are rejected.
+World and revision labels continue to use the separate ASCII identifier grammar.
+Actual macOS 27.2 World and read-only revision mounts verified Chinese/emoji
+names, links, rename, NFC/NFD distinctions and the byte limit; see
+[UTF-8 acceptance evidence](evidence/2026-11-09-fskit-utf8.json).
+
 Current limits are inherited from the namespace prototype: 256 KiB per regular
-file, printable ASCII names, mode bits through 0777, no xattrs/ACLs, no uid/gid
+file, UTF-8 names (255 bytes per component, 4096 per path), mode bits through
+0777, no xattrs/ACLs, no uid/gid
 changes, and no special files. Setattr supports mode, size and mtime atomically;
 unsupported attributes fail before mutation. The owner/group are synthesized
 from the service identity. The mounted root is always exposed as mode 0700, and
