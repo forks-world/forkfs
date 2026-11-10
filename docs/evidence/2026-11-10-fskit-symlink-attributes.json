@@ -1,0 +1,62 @@
+{
+  "namespace": "/forkfs-accept-8z07c6kx",
+  "checks": [
+    "binary write/read/fsync reaches daemon content",
+    "native binary/empty xattrs, Finder tags, create policy and size limit",
+    "hardlink identity and symlink traversal",
+    "pathname/fd utime nanoseconds and native creation time reach revision inode",
+    "nofollow symlink times/mode/birth, target isolation, dangling touch -h and cp -PpX",
+    "fsync then revision checkpoint isolates subsequent writes",
+    "xattrs follow hardlink identity, revision isolation and open-unlink handles",
+    "rename/open-unlink/truncate/path reuse preserve file identity",
+    "directory enumeration and dot entries",
+    "atomic-save replacement reaches revision-backed namespace",
+    "UTF-8 names, links, rename, NFC/NFD identity and byte limits",
+    "4 MiB file transfer, 64 MiB sparse limit, truncate zero-fill and chunked open-unlink"
+  ],
+  "timestamp_ns": {
+    "accessed_ns": 1234567890123456790,
+    "modified_ns": 1345678901234567891,
+    "birth_ns": 1123456789000000000
+  },
+  "symlink_attributes": {
+    "mode": 449,
+    "accessed_ns": 111111111111111111,
+    "modified_ns": 222222222222222222,
+    "birth_ns": 100000000000000000,
+    "target_unchanged": true,
+    "dangling_touch_h": true,
+    "dangling_cp_PpX": true
+  },
+  "retained_revision": "mount_accept_0bbef6ae4b5c",
+  "appledouble_sidecars": 0,
+  "unicode_retained_revision": "unicode_mount_9cfa324f144d",
+  "large_retained_revision": "large_mount_5b150846c836",
+  "large_namespace": "/forkfs-accept-8z07c6kx/large.bin",
+  "readonly_after_restart_gc": {
+    "metadata_preserved": true,
+    "readlink_preserved": true,
+    "nofollow_utime_errno": "EROFS",
+    "lchmod_errno": "EROFS"
+  },
+  "before": {
+    "nofollow_utime_errno": 45,
+    "cp_Pp_returncode": 1
+  },
+  "remaining_limit": {
+    "O_SYMLINK_errno": 45,
+    "cp_Pp": "unsupported symlink handle required by xattr copying",
+    "cp_PpX": "passed",
+    "path_nofollow_listxattr": "passed"
+  },
+  "platform": {
+    "macOS": "27.2",
+    "architecture": "arm64"
+  },
+  "source_sha256": {
+    "daemon/namespace.cpp": "a7f2fa67e43e648216049bd0869974aa143236ccec9d9685c8cd6cb89f3854d3",
+    "daemon/rpc.cpp": "01cb2dadda62a3315837c9c087825a36e35ffbda057227d21339ff98c3474e65",
+    "macos/forkfs/RevisionVolume.mm": "64391c4ace81b50c48abea450aaf75290e76266b1421f4141c8483c671c9e805",
+    "scripts/tests/forkfs_mount.py": "eabcf0b121323b9e7e6f45b41ec70ae2369739420043b71b7124c517a05f0da6"
+  }
+}

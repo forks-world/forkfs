@@ -756,9 +756,17 @@ void apply_attributes(InodeInfo& n,const Namespace::Attributes& a) {
 }
 }
 void Namespace::set_attributes(const std::string& path,const Attributes& a) {
+    set_path_attributes(path,a,true);
+}
+void Namespace::set_link_attributes(const std::string& path,const Attributes& a) {
+    set_path_attributes(path,a,false);
+}
+void Namespace::set_path_attributes(const std::string& path,const Attributes& a,bool follow_final) {
     valid_attributes(a);
     update([&](const NamespaceView& view,Changes& changes) {
-        auto id=resolve(view,path);auto n=inode(view,id);if(!a.mode && !a.modified_ns && !a.size && !a.accessed_ns && !a.birth_ns)return;
+        auto id=resolve(view,path,follow_final);auto n=inode(view,id);
+        need(!n.symlink || !a.size,"invalid symbolic link size change");
+        if(!a.mode && !a.modified_ns && !a.size && !a.accessed_ns && !a.birth_ns)return;
         if(a.size && *a.size==n.size && !a.mode && !a.modified_ns && !a.accessed_ns && !a.birth_ns)return;
         if(a.size){need(!n.directory && !n.symlink,"only regular files support size changes");
             FileContent data(n,view,&changes);if(data.resize(*a.size))touch(n);}

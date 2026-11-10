@@ -51,6 +51,9 @@ target_compile_definitions(forkfsd_legacy_test PRIVATE FORKFS_LEGACY_DEFAULT=1)
 add_executable(forkfsd ${FORKFS_NORMAL_OBJECTS})
 target_compile_options(forkfsd PRIVATE -Wall -Wextra -Wpedantic)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME forkfsd_symlink_attributes COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/symlink_attributes.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_legacy_test> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
+set_tests_properties(forkfsd_symlink_attributes PROPERTIES TIMEOUT 120)
 add_test(NAME forkfsd_times COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/times.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_legacy_test> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
 set_tests_properties(forkfsd_times PROPERTIES TIMEOUT 120)

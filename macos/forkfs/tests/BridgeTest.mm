@@ -222,6 +222,14 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume reclaimItem:file replyHandler:^(NSError* e){result=e;}];check(!result,"reclaim failed");
         [volume synchronizeWithFlags:(FSSyncFlags)0 replyHandler:^(NSError* e){result=e;}];check(!result,"sync failed");
         check(volume.volumeStatistics.blockSize>0,"space callback failed");
+        __block FSItem* danglingLink=nil;
+        [volume createSymbolicLinkNamed:[FSFileName nameWithString:@"dangling-attributes"] inDirectory:root attributes:[FSItemSetAttributesRequest new] linkContents:[FSFileName nameWithString:@"missing-target"] replyHandler:^(FSItem* it,FSFileName* n,NSError* e){danglingLink=it;result=e;}];check(danglingLink && !result,"dangling symlink creation failed");
+        FSItemSetAttributesRequest* linkAttrs=[FSItemSetAttributesRequest new];linkAttrs.mode=0701;linkAttrs.accessTime=(timespec){111,222};linkAttrs.modifyTime=(timespec){333,444};linkAttrs.birthTime=(timespec){55,66};
+        [volume setAttributes:linkAttrs onItem:danglingLink replyHandler:^(FSItemAttributes* a,NSError* e){attrs=a;result=e;}];
+        check(!result && attrs.type==FSItemTypeSymlink && attrs.mode==0701 && attrs.modifyTime.tv_sec==333 && attrs.accessTime.tv_nsec==222 && attrs.birthTime.tv_nsec==66,"symlink attributes must not resolve the missing target");
+        FSItemSetAttributesRequest* badLinkSize=[FSItemSetAttributesRequest new];badLinkSize.mode=0777;badLinkSize.size=attrs.size;
+        [volume setAttributes:badLinkSize onItem:danglingLink replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(result.code==EINVAL,"symlink size change must fail even for the current length");
+        [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:danglingLink replyHandler:^(FSItemAttributes* a,NSError* e){attrs=a;result=e;}];check(!result && attrs.mode==0701 && attrs.modifyTime.tv_sec==333,"invalid symlink size partially changed metadata");
         [volume deactivateWithOptions:0 replyHandler:^(NSError* e){result=e;}];check(!result,"deactivation failed");volume=nil;
         NSMutableDictionary* roConfig=[@{@"schema_version":@1,@"revision":@"base",@"repository":status[@"repository_id"]} mutableCopy];
         if(config[@"rpc"])roConfig[@"rpc"]=config[@"rpc"];
