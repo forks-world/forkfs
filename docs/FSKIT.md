@@ -254,7 +254,16 @@ and snapshot readback plus `fs-check` after restarting. Fourteen automated
 lifecycle scenarios cover startup cleanup, duplicate ownership, busy unmount,
 backend loss, and cleanup/preservation of stale/replaced socket paths.
 
-Broader kernel writeback/mmap, long-running recovery, daemon-loss cache behavior,
+Native macOS 27.2 acceptance additionally covers shared/private/read-only mmap,
+mapping/pread/pwrite coherence, mapped open-unlink, cross-process lockf/flock,
+SQLite DELETE/WAL transactions and abrupt application exit recovery, and a local
+Git checkout/merge/repack/fsck workflow. Mapped writes flushed with msync/fsync
+were read directly from the daemon and retained in an isolated revision.
+See the [API matrix and reproducible suite](FILESYSTEM_API_COMPATIBILITY.md)
+for the exact scope and APFS reference results. This does not restore the retired
+native-directory Git integration.
+
+Broader kernel writeback/mmap under failures, long-running recovery, daemon-loss cache behavior,
 multi-user ownership/access checks and other macOS versions remain unqualified.
 The local mount evidence does not establish those behaviors.
 
