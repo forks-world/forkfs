@@ -1119,3 +1119,30 @@ World directory or infers content from timestamps. This is a correctness-first
 prototype, not a qualified large-repository filesystem. Typed errors use reply
 code `errno+1`; old generic errors retain code 1. Frames still have a 1 MiB cap,
 now allowing up to 16 fields for inode-relative rename plus selectors.
+
+
+### Namespace failure errno
+
+The inode RPC layer preserves operation-specific errors for directory/type
+conflicts, even when a client reaches the daemon without kernel prevalidation:
+
+| Rejected operation | errno |
+| --- | --- |
+| Rename a file or symlink over a directory | EISDIR |
+| Rename a directory over a file or symlink | ENOTDIR |
+| Remove a file or symlink with the directory operation | ENOTDIR |
+| Unlink a directory as a file | EPERM on macOS; EISDIR on Linux |
+| Hardlink a directory, including the root | EPERM |
+
+Existing stale-identity checks retain ESTALE; missing entries, existing targets,
+nonempty directories and descendant cycles retain ENOENT, EEXIST, ENOTEMPTY and
+EINVAL respectively. These validation failures do not commit, allocate roots,
+change inode metadata or modify directory entries. Rename inspects the final
+destination entry without following its symlink: a file may replace a symlink
+to a directory while the referenced directory remains intact.
+
+Inode RPC errors use the existing errno+1 reply code. Ordinary fs-* errors still
+use generic code 1, and CLI process failure remains nonzero. This refines the
+error contract without a new frame, inode format or permission model. Native
+FSKit already rejects these operation types with the same macOS errors; the
+acceptance script verifies that behavior and repository-state stability.

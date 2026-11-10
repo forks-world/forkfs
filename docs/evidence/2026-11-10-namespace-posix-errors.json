@@ -1,0 +1,79 @@
+{
+  "namespace": "/forkfs-accept-j730cmor",
+  "checks": [
+    "binary write/read/fsync reaches daemon content",
+    "native binary/empty xattrs, Finder tags, create policy and size limit",
+    "hardlink identity and symlink traversal",
+    "pathname/fd utime nanoseconds and native creation time reach revision inode",
+    "nofollow metadata, O_SYMLINK fds, cp -Pp binary xattrs and open-unlink/dup identity",
+    "native rename/removal/directory-hardlink errno and failed-operation atomicity",
+    "fsync then revision checkpoint isolates subsequent writes",
+    "xattrs follow hardlink identity, revision isolation and open-unlink handles",
+    "rename/open-unlink/truncate/path reuse preserve file identity",
+    "directory enumeration and dot entries",
+    "atomic-save replacement reaches revision-backed namespace",
+    "UTF-8 names, links, rename, NFC/NFD identity and byte limits",
+    "4 MiB file transfer, 64 MiB sparse limit, truncate zero-fill and chunked open-unlink"
+  ],
+  "timestamp_ns": {
+    "accessed_ns": 1234567890123456790,
+    "modified_ns": 1345678901234567891,
+    "birth_ns": 1123456789000000000
+  },
+  "symlink_attributes": {
+    "mode": 449,
+    "accessed_ns": 111111111111111111,
+    "modified_ns": 222222222222222222,
+    "birth_ns": 100000000000000000,
+    "target_unchanged": true,
+    "dangling_touch_h": true,
+    "dangling_cp_Pp": true,
+    "copied_binary_xattr": true,
+    "fd_open_unlink_dup": true,
+    "data_read_write_errno": "EPERM",
+    "truncate_errno": "EINVAL"
+  },
+  "retained_revision": "mount_accept_4221ed089c11",
+  "appledouble_sidecars": 0,
+  "unicode_retained_revision": "unicode_mount_d49c038f4147",
+  "large_retained_revision": "large_mount_63eb4ddf1303",
+  "large_namespace": "/forkfs-accept-j730cmor/large.bin",
+  "platform": {
+    "macOS": "27.2",
+    "architecture": "arm64"
+  },
+  "apfs_comparison_before": {
+    "apfs": {
+      "rename_file_over_dir": 21,
+      "rename_dir_over_file": 20,
+      "rmdir_file": 20,
+      "unlink_dir": 1,
+      "hardlink_dir": 1
+    },
+    "forkfs": {
+      "rename_file_over_dir": 21,
+      "rename_dir_over_file": 20,
+      "rmdir_file": 20,
+      "unlink_dir": 1,
+      "hardlink_dir": 1
+    }
+  },
+  "rpc_regression": {
+    "old_code": "EINVAL for file-over-directory rename",
+    "fixed_code": "EISDIR",
+    "cases": 16,
+    "failed_operations_leave_sequence_objects_entries_inodes_unchanged": true,
+    "baseline_failed_then_fixed_passed": true
+  },
+  "after_unmount": {
+    "gc": true,
+    "world_check": true,
+    "revision_check": true
+  },
+  "source_sha256": {
+    "daemon/namespace.cpp": "128fe0ee272ea8ed78d7738aa82ebb830ad12e9743233c146bfcc383e5bd15bb",
+    "daemon/rpc.h": "5935ac52daebc8cedbbc0dffb311baecc48496fa2ab1a6a656784017f8c094e1",
+    "daemon/tests/namespace_errors.py": "f91b56e0076a3618a69da1dd258ffce71268907f3bc94984e327d6234f88a490",
+    "scripts/tests/forkfs_mount.py": "01bc9b32d4edc6fbf5a145107d11f1ebe4973bfe5a4cbd1cfeeb0807bcdf9938"
+  }
+}

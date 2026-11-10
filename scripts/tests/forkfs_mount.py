@@ -174,6 +174,22 @@ try:
     assert not (root/'missing-target').exists();os.unlink(copied);os.unlink(dangling)
     report['symlink_attributes']={'mode':0o701,'accessed_ns':link_atime,'modified_ns':link_mtime,'birth_ns':link_birth,'target_unchanged':True,'dangling_touch_h':True,'dangling_cp_Pp':True,'copied_binary_xattr':True,'fd_open_unlink_dup':True,'data_read_write_errno':'EPERM','truncate_errno':'EINVAL'}
     report['checks'].append('nofollow metadata, O_SYMLINK fds, cp -Pp binary xattrs and open-unlink/dup identity')
+    error_dir=root/'errno-cases';error_dir.mkdir()
+    try:
+        (error_dir/'file-src').write_bytes(b'S');(error_dir/'file-dst').write_bytes(b'D')
+        (error_dir/'dir-src').mkdir();(error_dir/'dir-dst').mkdir()
+        status_before=json.loads(subprocess.check_output([daemon,'request',socket,'status']))
+        rejects(lambda:os.rename(error_dir/'file-src',error_dir/'dir-dst'),errno.EISDIR)
+        rejects(lambda:os.rename(error_dir/'dir-src',error_dir/'file-dst'),errno.ENOTDIR)
+        rejects(lambda:os.rmdir(error_dir/'file-src'),errno.ENOTDIR)
+        rejects(lambda:os.unlink(error_dir/'dir-src'),errno.EPERM)
+        rejects(lambda:os.link(error_dir/'dir-src',error_dir/'hard-dir'),errno.EPERM)
+        status_after=json.loads(subprocess.check_output([daemon,'request',socket,'status']))
+        assert all(status_before[k]==status_after[k] for k in ['last_committed_seq','indexed_objects','object_roots'])
+        assert (error_dir/'file-src').read_bytes()==b'S' and (error_dir/'file-dst').read_bytes()==b'D'
+        assert {p.name for p in error_dir.iterdir()}=={'file-src','file-dst','dir-src','dir-dst'}
+    finally:shutil.rmtree(error_dir)
+    report['checks'].append('native rename/removal/directory-hardlink errno and failed-operation atomicity')
     if args.checkpoint:
         revision='mount_accept_'+uuid.uuid4().hex[:12]
         rpc('fs-snapshot',revision)

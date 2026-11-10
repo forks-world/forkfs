@@ -10,6 +10,15 @@ namespace forkfs {
 class Container;
 inline int rpc_posix_error(std::string_view message) {
     if(message=="RPC timeout")return ETIMEDOUT;
+    if(message=="rename target is a directory")return EISDIR;
+    if(message=="directory hard links are forbidden")return EPERM;
+    if(message=="cannot unlink a directory"){
+#ifdef __APPLE__
+        return EPERM;
+#else
+        return EISDIR;
+#endif
+    }
     if(message=="symbolic link handle forbids data I/O")return EPERM;
     if(message=="mtime exceeds supported nanosecond range" || message=="atime exceeds supported nanosecond range" || message=="birth time exceeds supported nanosecond range")return EINVAL;
     if(message=="RPC connect failed" || message=="RPC connection failed" || message=="RPC send failed" || message=="truncated RPC reply")return ENOTCONN;

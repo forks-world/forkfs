@@ -827,7 +827,8 @@ void Namespace::retire(const NamespaceView& j,Changes& c,const InodeInfo& n) {
 void Namespace::remove(const std::string& path,bool directory) {
     update([&](const NamespaceView& j,Changes& c) {
         auto p=parent(j,path);need(j.contains(p.key),"path not found");auto id=decode_id(j.get(p.key));auto n=inode(j,id),pn=inode(j,p.id);
-        need(n.directory==directory,"wrong removal operation for inode type");
+        need(!directory || n.directory,"path is not a directory");
+        need(directory || !n.directory,"cannot unlink a directory");
         if(directory){need(j.keys(directory_prefix(id)).empty(),"directory is not empty");--pn.links;}
         c[p.key]=std::nullopt;
         if(directory || n.links==1)retire(j,c,n);
@@ -844,7 +845,8 @@ void Namespace::rename(const std::string& source,const std::string& target) {
         std::map<std::string,InodeInfo> parents;parents.emplace(src.id,inode(j,src.id));parents.emplace(dst.id,inode(j,dst.id));
         if(j.contains(dst.key)) {
             auto replaced=decode_id(j.get(dst.key));if(replaced==id)return;
-            auto other=inode(j,replaced);need(other.directory==n.directory,"rename inode types differ");
+            auto other=inode(j,replaced);need(!other.directory || n.directory,"rename target is a directory");
+            need(other.directory || !n.directory,"rename target is not a directory");
             if(other.directory){need(j.keys(directory_prefix(replaced)).empty(),"target directory is not empty");--parents.at(dst.id).links;}
             if(other.directory || other.links==1)retire(j,c,other);
             else {--other.links;other.changed_ns=now();c[inode_key(replaced)]=encode(other);}
