@@ -183,9 +183,9 @@ revocation or flush uncommitted application data. The operation uses committed
 repository state and keeps the existing FSKit coherence limits.
 
 The operation supports LevelDB and the immutable single-file compatibility
-backend. Safety snapshots remain retained until a future explicit retention
-policy; physical GC preserves their data. No automatic retention or revision
-deletion is added by restore.
+backend. Restore does not automatically expire safety revisions. Explicit label
+removal is described below; surviving World bases and descendant revisions still
+pin the data, which physical GC preserves while reachable.
 
 ## Revision history
 
@@ -227,8 +227,8 @@ supports both LevelDB and the legacy immutable single-file container format;
 physical GC remains LevelDB-only.
 
 The query reports explicit snapshot ancestry, not every write, an event log,
-per-file history or the children of a revision. It does not implement retention
-or revision deletion. Stateless pages rewalk the chain from the named tip to
+per-file history or the children of a revision. Explicit offline label removal
+does not rewrite ancestry or truncate this history. Stateless pages rewalk the chain from the named tip to
 validate the cursor; time and memory can grow with ancestry depth. Reads run
 under the namespace lock. Use `check`/`fs-check` for full object/namespace integrity
 verification.
@@ -810,13 +810,15 @@ run and replace the small run-list manifest instead of rewriting all metadata.
 Container indexes still copy on commit, so small append sizes do not establish
 constant-time CPU behavior. Old objects/manifests/revisions and allocation markers
 remain retained in the legacy backend. LevelDB supports explicit offline physical
-GC; revision retention/deletion and allocation-marker recycling remain unimplemented.
+GC and explicit offline World/label removal; automatic retention, ancestry pruning
+and allocation-marker recycling remain unimplemented.
 
 Offline commands require exclusive repository ownership. The resident RPC service
 and optional FSKit frontend use the same revision-backed namespace. Cross-World
-rename, multi-host writes, application-consistent live snapshots, revision
-deletion and automatic retention remain unavailable. Restore uses the explicit
-safety-revision operation above. `fs-check --world/--revision` verifies one namespace view; `check`
+rename, multi-host writes, application-consistent live snapshots and automatic
+retention remain unavailable. Restore uses the explicit safety-revision operation
+above; explicit offline World and revision label removal is described below.
+`fs-check --world/--revision` verifies one namespace view; `check`
 verifies physical indexed objects. Neither is an authoritative remote GC audit.
 
 
@@ -961,6 +963,44 @@ root keys and 32-byte values are admitted. Poisoned stores reject reads before
 cache lookup. This does not replace immutable-object hash/collision checks or
 change synchronous commit. Full verify continues to scan the database itself.
 
+## Offline retention
+
+Stop the daemon and unmount FSKit before these commands. They require exclusive
+repository ownership and accept explicit names with no view selectors or RPC
+entry points:
+
+```sh
+forkfsd fs-drop-world project.forkfs discarded-work
+forkfsd fs-forget-revision project.forkfs discarded-tip
+forkfsd gc project.forkfs
+```
+
+`fs-drop-world CONTAINER WORLD_NAME` removes an existing non-main World's head
+and retained base in one synchronous transaction. It discards that World's
+un-snapshotted committed state; snapshot it first if it should be kept. `main`
+is protected, absent Worlds fail without a commit, and named revisions are
+unaffected. Reusing a dropped World name requires an explicit new fork.
+
+`fs-forget-revision CONTAINER REVISION_NAME` removes only the named revision
+label in one synchronous transaction. The revision cannot then be selected by
+that label. Immutable descriptors, parent IDs, other labels, and World bases
+are unchanged. A retained descendant or World base still pins the unlabelled
+revision and its complete ancestry. Reusing a forgotten label creates a new
+binding; it does not rewrite older history. Existing history pagination remains
+based on immutable revision IDs.
+
+Both JSON replies identify the removed World manifest/base or revision ID and
+report `collected_objects: 0`: these commands release named roots without
+physically deleting objects. Run offline LevelDB GC separately to reclaim only
+objects no longer reachable from any surviving root. Forgetting an ancestor
+label alone cannot prune a retained tip's history. Allocation markers remain
+retained, preventing reuse of historical inode identities. The immutable
+single-file compatibility backend supports root removal but not physical GC.
+
+The C++ APIs also reject open file handles, captured directory cursors and a
+running background compactor anywhere in the repository. There is no automatic
+retention policy, history rewriting, ancestry truncation or bulk deletion.
+
 ## Offline physical garbage collection (LevelDB)
 
 Stop the daemon, then run `forkfsd gc REPOSITORY`. Exclusive repository ownership
@@ -972,9 +1012,9 @@ synchronous WriteBatch, together with sequence and object/root counters. Manual
 LevelDB compaction follows to reclaim obsolete SST data. The JSON reply reports
 `collected_objects`; rerunning collection is safe after interruption.
 
-This is explicit collection, without revision retention/deletion policy. Retained
-revisions and their ancestors remain pinned indefinitely. LevelDB CoW tree
-manifests are supported; older run manifests and legacy single-file containers
+Explicit offline retention commands can remove World roots and revision labels.
+Surviving revision roots and World bases continue to pin their complete ancestry.
+LevelDB CoW tree manifests are supported; older run manifests and legacy single-file containers
 are rejected before deletion. The C++ API rejects active file handles, directory
 cursors and background compaction. There is no RPC GC command.
 
