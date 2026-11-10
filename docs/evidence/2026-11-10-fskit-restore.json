@@ -1,0 +1,40 @@
+{
+  "namespace": "/forkfs-accept-luqfme56",
+  "checks": [
+    "binary write/read/fsync reaches daemon content",
+    "native binary/empty xattrs, Finder tags, create policy and size limit",
+    "hardlink identity and symlink traversal",
+    "fsync then revision checkpoint isolates subsequent writes",
+    "xattrs follow hardlink identity, revision isolation and open-unlink handles",
+    "rename/open-unlink/truncate/path reuse preserve file identity",
+    "directory enumeration and dot entries",
+    "atomic-save replacement reaches revision-backed namespace",
+    "UTF-8 names, links, rename, NFC/NFD identity and byte limits",
+    "4 MiB file transfer, 64 MiB sparse limit, truncate zero-fill and chunked open-unlink"
+  ],
+  "retained_revision": "mount_accept_43cac2833c5b",
+  "appledouble_sidecars": 0,
+  "unicode_retained_revision": "unicode_mount_925e86433005",
+  "large_retained_revision": "large_mount_fd6b9e82e34d",
+  "large_namespace": "/forkfs-accept-luqfme56/large.bin",
+  "restore_checks": [
+    "active mount rejects restore without publishing safety label",
+    "offline restore and remount recover binary content, hardlinks, symlink, native xattrs and Finder tags",
+    "undo recovers pre-restore empty World; GC preserves source and both safety revisions"
+  ],
+  "undo": {
+    "safety_revision_id": "300619f4a5c93f40ed62dfc0128f503371f70fa02c20849323ca3cec15387707",
+    "target_revision_id": "f431d95f2ad4163ab4255717f350b39ce2735fb4eabf0c76a762db92298a3d19",
+    "restored_manifest_id": "735ea2eb82f57cc11bb5cf17290c83dfbc0c88e3688442a2d0ab6f4ddf9c8b68"
+  },
+  "platform": {
+    "macOS": "27.2",
+    "architecture": "arm64"
+  },
+  "source_sha256": {
+    "daemon/namespace.cpp": "b8aba90adc5f1b3f865667c4c7a8218c161c32fb0cb8c010943b8b335145ab2f",
+    "daemon/rpc.cpp": "cd9ae5559baf0eaa237318b149a04648fe48b71ccf4c2cb87d004acd91a52e24",
+    "macos/forkfs/RevisionVolume.mm": "9f0cd506a052fb7c0034637baa8bddac22e0760e3c0878143639344644946fd6",
+    "scripts/tests/forkfs_mount.py": "048303d439193ca87215456cf478b147c02efc0e4e40d129c67dbd9f5061ce82"
+  }
+}

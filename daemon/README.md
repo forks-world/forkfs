@@ -90,7 +90,7 @@ command; write payload is binary. Reply payload starts with result code u32 LE
 Supported commands are `status`, `fs-init`, `fs-mkdir`, `fs-write`, `fs-cat`,
 `fs-xattr-list`, `fs-xattr-get`, `fs-xattr-set`, `fs-xattr-remove`,
 `fs-history`, `fs-diff`, `fs-ls`, `fs-stat`, `fs-read-at`, `fs-write-at`, `fs-append`, `fs-truncate`, `fs-link`, `fs-rename`, `fs-unlink`, `fs-rmdir`, `fs-check`,
-`fs-compact`, `fs-snapshot`, `fs-fork`, `fs-worlds` and `fs-revisions`, with the
+`fs-compact`, `fs-snapshot`, `fs-fork`, `fs-restore`, `fs-worlds` and `fs-revisions`, with the
 same view selectors as offline commands. `fs-diff` and `fs-history` instead take
 explicit named revisions and reject view selectors. Revision writes remain forbidden.
 
@@ -137,6 +137,55 @@ until final close/restart, and fs-check verifies their bounds and presence marke
 Revision diff compares attribute names and object IDs independently of ctime,
 reports `xattrs_changed`, and includes that result in `metadata_changed` without
 claiming file-content changes. History continues to traverse retained revisions.
+
+## Restore a World
+
+```sh
+# Unmount the selected World and close its mutable file handles first.
+forkfsd fs-restore project.forkfs known-good safety-before-restore --world main
+forkfsd fs-snapshot project.forkfs restored --world main
+forkfsd fs-diff project.forkfs known-good restored
+# Undo the restore, retaining another safety revision for the current state.
+forkfsd fs-restore project.forkfs safety-before-restore safety-before-undo --world main
+forkfsd request /private/runtime/control.sock fs-restore known-good safety-via-rpc --world main
+```
+
+Syntax is `fs-restore CONTAINER TARGET_REVISION SAFETY_REVISION [--world NAME]`;
+RPC omits CONTAINER. The World defaults to main and must already exist and be
+initialized. TARGET_REVISION must be a retained named revision; SAFETY_REVISION
+must be a new valid label. Revision views reject restoration.
+
+Under one namespace lock, restore checks that the World has no open file handles,
+verifies the complete target namespace and prepares a safety snapshot of the
+World's current committed root. One synchronous transaction publishes that safety
+revision, advances the World's retained base to it and switches the World head to
+the target manifest. Validation failures publish none of these changes. A process
+crash exposes either the previous state with no new safety label or the restored
+state with the complete safety revision. Restore uses immutable manifest references
+and preserves file IDs, hardlinks, directories, symlink targets, contents, modes,
+timestamps and xattrs. Full target verification reads the referenced namespace;
+this is not a constant-time operation or physical corruption repair.
+
+The JSON reply identifies `safety_revision_id`, `target_revision_id` and
+`restored_manifest_id`. The safety revision captures un-snapshotted committed
+changes and retains the World's previous parent revision. A subsequent snapshot
+of restored data has the safety revision as its parent, preserving the World
+history. The target revision and other World heads retain their own graphs. A
+second restore can select the safety revision to undo the operation; it also
+requires a new safety label.
+
+Open mutable-World file handles, including read-only access handles and unlinked
+inodes, block restoration. Handles in other Worlds and immutable revision handles
+remain usable. Captured directory cursors keep their original immutable pages.
+RPC rejects an active mutable mount lease even when the caller owns it. Unmount
+FSKit before using restore: lease expiry does not establish kernel cache
+revocation or flush uncommitted application data. The operation uses committed
+repository state and keeps the existing FSKit coherence limits.
+
+The operation supports LevelDB and the immutable single-file compatibility
+backend. Safety snapshots remain retained until a future explicit retention
+policy; physical GC preserves their data. No automatic retention or revision
+deletion is added by restore.
 
 ## Revision history
 
@@ -741,11 +790,13 @@ forkfsd fs-revisions project.forkfs
 The default World is `main`. Namespace commands accept a trailing `--world NAME`;
 read/check commands also accept `--revision NAME`. Revisions reject mutations.
 Names are 1..64 ASCII letters, digits, dot, underscore or hyphen; `.`/`..` are
-invalid. Snapshot labels and World names cannot overwrite existing entries.
+invalid. Snapshot labels and newly forked World names cannot overwrite existing entries.
+Restore explicitly replaces an existing World head while retaining a safety revision.
 
 A revision descriptor holds an immutable manifest object ID, previous retained
-revision ID and captured container sequence. The manifest is an immutable newest-first list of sorted-run object IDs; each
-run maps namespace keys to immutable objects or deletion markers. Fork installs a new World head referring
+revision ID and captured container sequence. LevelDB manifests refer to immutable CoW metadata trees; the single-file
+compatibility backend uses sorted-run manifests mapping namespace keys to
+immutable objects or deletion markers. Fork installs a new World head referring
 to that same manifest, plus its base revision, in one transaction. It copies no
 file contents or manifest bytes. Branch reads use the complete manifest directly,
 without traversing parent Worlds. Inode identity and hardlink relationships are
@@ -761,10 +812,11 @@ constant-time CPU behavior. Old objects/manifests/revisions and allocation marke
 remain retained in the legacy backend. LevelDB supports explicit offline physical
 GC; revision retention/deletion and allocation-marker recycling remain unimplemented.
 
-All commands operate offline under the exclusive container lock. Status socket
-is still read-only. There is no mount, cross-World rename, multi-host writer,
-application-consistent live snapshot, restore, revision deletion or automatic
-retention yet. `fs-check --world/--revision` verifies one namespace view; `check`
+Offline commands require exclusive repository ownership. The resident RPC service
+and optional FSKit frontend use the same revision-backed namespace. Cross-World
+rename, multi-host writes, application-consistent live snapshots, revision
+deletion and automatic retention remain unavailable. Restore uses the explicit
+safety-revision operation above. `fs-check --world/--revision` verifies one namespace view; `check`
 verifies physical indexed objects. Neither is an authoritative remote GC audit.
 
 
