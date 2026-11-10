@@ -260,7 +260,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 }
 - (BOOL)isOpenCloseInhibited{return NO;}
 - (void)openItem:(FSItem*)item withModes:(FSVolumeOpenModes)modes replyHandler:(void(^)(NSError*))reply {
-    NSError* e=[self perform:^{auto it=[self item:item];if(itemType(it.attrs)==FSItemTypeDirectory){require(!(modes&FSVolumeOpenModesWrite),EISDIR,"directory is not writable as a file");return;}require(itemType(it.attrs)==FSItemTypeFile,ENOTSUP,"only regular file opens are supported");
+    NSError* e=[self perform:^{auto it=[self item:item];if(itemType(it.attrs)==FSItemTypeDirectory){require(!(modes&FSVolumeOpenModesWrite),EISDIR,"directory is not writable as a file");return;}require(itemType(it.attrs)==FSItemTypeFile || itemType(it.attrs)==FSItemTypeSymlink,ENOTSUP,"unsupported open inode type");
         if((modes&FSVolumeOpenModesWrite) && !it.writer){[self writable];it.writer=[self json:@[@"inode-open",it.inode,@"rw"]][@"handle"];}
         if((modes&FSVolumeOpenModesRead) && !it.reader && !it.writer)it.reader=[self json:@[@"inode-open",it.inode,@"r"]][@"handle"];
     }];reply(e);
@@ -276,7 +276,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
     }];reply(e);
 }
 - (void)readFromFile:(FSItem*)item offset:(off_t)offset length:(size_t)length intoBuffer:(FSMutableFileDataBuffer*)buffer replyHandler:(void(^)(size_t,NSError*))reply {
-    __block size_t count=0;NSError* e=[self perform:^{require(offset>=0,EINVAL,"negative read offset");auto it=[self item:item];NSString* handle=[self handle:it];require(handle!=nil,EBADF,"file is not open");
+    __block size_t count=0;NSError* e=[self perform:^{require(offset>=0,EINVAL,"negative read offset");auto it=[self item:item];require(itemType(it.attrs)!=FSItemTypeSymlink,EPERM,"symbolic link handle forbids data I/O");NSString* handle=[self handle:it];require(handle!=nil,EBADF,"file is not open");
         const auto wanted=MIN(length,buffer.length);
         while(count<wanted){auto data=[self call:@[@"fs-hread",handle,[@(uint64_t(offset)+count) stringValue],[@(MIN(wanted-count,size_t(256*1024))) stringValue]]];
             require(data.size()<=MIN(wanted-count,size_t(256*1024)),EPROTO,"oversized daemon read");if(data.empty())break;
@@ -284,7 +284,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
     }];reply(count,e);
 }
 - (void)writeContents:(NSData*)contents toFile:(FSItem*)item atOffset:(off_t)offset replyHandler:(void(^)(size_t,NSError*))reply {
-    __block size_t count=0;NSError* e=[self perform:^{[self writable];require(offset>=0,EINVAL,"negative write offset");auto it=[self item:item];require(it.writer!=nil,EBADF,"file is not open for writing");
+    __block size_t count=0;NSError* e=[self perform:^{[self writable];require(offset>=0,EINVAL,"negative write offset");auto it=[self item:item];require(itemType(it.attrs)!=FSItemTypeSymlink,EPERM,"symbolic link handle forbids data I/O");require(it.writer!=nil,EBADF,"file is not open for writing");
         // FSKit can exceed ioSize in a single callback. Complete it using
         // bounded RPCs; ioSize is a preference rather than a request limit.
         require(contents.length==0 || (uint64_t(offset)<=64*1024*1024 && contents.length<=64*1024*1024-uint64_t(offset)),EFBIG,"file exceeds 64 MiB");
