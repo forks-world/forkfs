@@ -31,6 +31,11 @@ snapshots continue the existing timeline with restored data. Mutable World file
 handles must close first; RPC restore also rejects active mutable mount leases,
 including the calling session's own lease. Unmount FSKit before restoring a World.
 
+`fs-drop-world` and `fs-forget-revision` provide explicit offline World and revision label
+removal. They preserve immutable ancestry and all surviving roots; physical GC
+can reclaim an abandoned branch after its last retaining root is removed.
+`main` is protected. No automatic retention or ancestry rewriting is provided.
+
 The new optional FSKit frontend operates through the resident daemon RPC and
 revision-backed namespace; see [FSKit integration](FSKIT.md). Git and
 execution integration remain unavailable until revision-backed replacements exist.

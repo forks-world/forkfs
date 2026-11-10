@@ -188,6 +188,8 @@ int main(int argc, char** argv) {
                          "forkfsd fs-restore CONTAINER REVISION_NAME SAFETY_REVISION_NAME [--world NAME]\n"
                          "forkfsd fs-worlds CONTAINER\n"
                          "forkfsd fs-revisions CONTAINER\n"
+                         "forkfsd fs-drop-world CONTAINER WORLD_NAME (offline; main is protected)\n"
+                         "forkfsd fs-forget-revision CONTAINER REVISION_NAME (offline; removes label only)\n"
                          "fs-* read commands accept --world NAME or --revision NAME.\n"
                          "fs-* write commands accept --world NAME.\n"
                          "fs-diff/fs-history take explicit revisions and accept no view selector.\n"
@@ -217,7 +219,7 @@ int main(int argc, char** argv) {
         if(command=="fs-read-at" || command=="fs-write-at")base_argc=6;
         if(command=="fs-xattr-get" || command=="fs-xattr-remove")base_argc=5;
         if(command=="fs-xattr-set")base_argc=7;
-        if(command!="fs-diff" && command!="fs-history" && command.starts_with("fs-") && argc==base_argc+2) {
+        if(command!="fs-diff" && command!="fs-history" && command!="fs-drop-world" && command!="fs-forget-revision" && command.starts_with("fs-") && argc==base_argc+2) {
             std::string selector=argv[argc-2];
             if(selector=="--world" || selector=="--revision") {
                 view=argv[argc-1];revision_view=selector=="--revision";argc-=2;
@@ -282,6 +284,8 @@ int main(int argc, char** argv) {
             else if(command=="fs-xattr-set" && argc==7)fs.set_xattr(argv[3],argv[4],load_file(argv[6]),forkfs::Namespace::xattr_policy(argv[5]));
             else if(command=="fs-xattr-remove" && argc==5)fs.remove_xattr(argv[3],argv[4]);
             else if(command=="fs-restore" && argc==5){std::cout<<fs.restore(argv[3],argv[4]);return 0;}
+            else if(command=="fs-drop-world" && argc==4){std::cout<<fs.drop_world(argv[3]);return 0;}
+            else if(command=="fs-forget-revision" && argc==4){std::cout<<fs.forget_revision(argv[3]);return 0;}
             else if(command=="fs-compact" && argc==3) fs.compact();
             else if(command=="fs-layout" && argc==3) {
                 if(container.storage_engine()=="leveldb") {fs.stat("/");std::cout<<"{\"layout\":\"cow-tree\",\"storage_engine\":\"leveldb\"}\n";return 0;}

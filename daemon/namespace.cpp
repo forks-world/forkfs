@@ -577,6 +577,30 @@ void Namespace::fork(const std::string& revision,const std::string& world) {
     j.transact(j.sequence(),{{history+"world/"+world,std::nullopt,manifest},
                             {history+"base/"+world,Bytes(revision_id.begin(),revision_id.end())}});
 }
+void Namespace::require_offline_locked() const {
+    need(view_=="main" && !revision_,"retention commands take explicit names, not view selectors");
+    need(container_.handles_.empty() && !container_.compaction_running_,"retention requires an idle offline repository");
+    for(const auto& pin:container_.directory_pins_)need(pin.expired(),"retention requires closed directory cursors");
+}
+std::string Namespace::drop_world(const std::string& name) {
+    valid_view_name(name);need(name!="main","cannot drop main World");
+    std::lock_guard lock(container_.mutex_);require_offline_locked();auto& j=*container_.journal_;
+    auto head=history+"world/"+name,base=history+"base/"+name;
+    need(j.contains(head) && j.contains(base),"World does not exist or has incomplete roots");
+    auto manifest=j.root_object(head);auto parent=j.get(base);need(parent.size()==32,"invalid World base");
+    ObjectId parent_id{};std::copy(parent.begin(),parent.end(),parent_id.begin());
+    j.transact(j.sequence(),{{head,std::nullopt},{base,std::nullopt}});
+    return "{\"world\":\""+name+"\",\"manifest_id\":\""+hex_id(manifest)+"\",\"base_revision_id\":\""+hex_id(parent_id)+"\",\"collected_objects\":0}\n";
+}
+std::string Namespace::forget_revision(const std::string& name) {
+    valid_view_name(name);
+    std::lock_guard lock(container_.mutex_);require_offline_locked();auto& j=*container_.journal_;
+    auto key=history+"revision/"+name;need(j.contains(key),"revision does not exist");auto id=j.root_object(key);
+    // Only the label is removed. Immutable parent IDs and World bases remain
+    // intact, and the collector continues tracing all surviving roots.
+    j.transact(j.sequence(),{{key,std::nullopt}});
+    return "{\"revision\":\""+name+"\",\"revision_id\":\""+hex_id(id)+"\",\"collected_objects\":0}\n";
+}
 std::vector<std::string> Namespace::worlds() const {
     std::lock_guard lock(container_.mutex_);const auto& j=*container_.journal_;std::vector<std::string> result;
     if(j.contains(root_key))result.push_back("main");auto p=history+"world/";

@@ -42,6 +42,9 @@ public:
     std::string revision_history(const std::string& tip,const std::string& after_id="",size_t limit=64) const;
     std::string snapshot(const std::string& name);
     std::string restore(const std::string& revision,const std::string& safety_revision);
+    // Offline retention operations; descendants and other roots keep their data.
+    std::string drop_world(const std::string& name);
+    std::string forget_revision(const std::string& name);
     void fork(const std::string& revision,const std::string& world);
     std::vector<std::string> worlds() const;
     std::vector<std::string> revisions() const;
@@ -97,6 +100,7 @@ public:
     void handle_truncate(const std::string& handle,uint64_t size);
 private:
     friend class Container;
+    void require_offline_locked() const;
     static void recover_orphans(Container& container);
     void verify_locked() const;
     std::array<unsigned char,32> prepare_snapshot_locked(const NamespaceView& view,const std::string& name,std::vector<Mutation>& batch);

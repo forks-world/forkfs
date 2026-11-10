@@ -80,3 +80,9 @@ per value. See [daemon commands, guarantees and limits](daemon/README.md).
 Older architecture and platform guides describe retired or proposed systems;
 they do not enable additional supported runtimes. See
 [revision-only transition](docs/REVISION_ONLY.md) for the replacement policy.
+
+Explicit offline retention uses `fs-drop-world CONTAINER WORLD_NAME` (protecting
+`main`) and `fs-forget-revision CONTAINER REVISION_NAME` (removing only the label).
+Stop the daemon first. Surviving World bases and revision histories keep their
+ancestry; run `gc` separately to reclaim unreachable objects. See
+[offline retention](daemon/README.md#offline-retention).
