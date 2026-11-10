@@ -41,6 +41,7 @@ public:
                      const std::string& after_path="",size_t limit=64) const;
     std::string revision_history(const std::string& tip,const std::string& after_id="",size_t limit=64) const;
     std::string snapshot(const std::string& name);
+    std::string restore(const std::string& revision,const std::string& safety_revision);
     void fork(const std::string& revision,const std::string& world);
     std::vector<std::string> worlds() const;
     std::vector<std::string> revisions() const;
@@ -97,6 +98,8 @@ public:
 private:
     friend class Container;
     static void recover_orphans(Container& container);
+    void verify_locked() const;
+    std::array<unsigned char,32> prepare_snapshot_locked(const NamespaceView& view,const std::string& name,std::vector<Mutation>& batch);
     const Container::OpenHandle& find_handle(const std::string& handle) const;
     void edit_handle(const std::string& handle,const std::function<bool(FileContent&,bool)>& edit,const std::function<void()>& committed={});
     std::vector<unsigned char> read_handle_locked(const Container::OpenHandle& info,uint64_t offset,uint64_t count) const;

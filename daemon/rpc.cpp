@@ -114,6 +114,10 @@ public:
         for(const auto& [other,s]:values_)if(other!=token && s.mount && !s.mount->revision && s.mount->view==view)
             throw RpcError(EBUSY,"World is exclusively leased to a mounted filesystem");
     }
+    void require_unmounted(const std::string& view) const {
+        for(const auto& [token,s]:values_)if(s.mount && !s.mount->revision && s.mount->view==view)
+            throw RpcError(EBUSY,"World restore requires an unmounted filesystem");
+    }
     size_t directory_count() const {size_t n=0;for(const auto& [token,s]:values_)n+=s.directories.size();return n;}
     void shutdown(){while(!values_.empty())close(values_.begin()->first);}
 private:
@@ -127,7 +131,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     auto op=args[0];std::string view="main";bool revision=false;
     size_t count=2;
     if(op=="status" || op=="storage-profile" || op=="fs-init" || op=="fs-check" || op=="fs-worlds" || op=="fs-revisions" || op=="fs-compact")count=1;
-    if(op=="fs-write" || op=="fs-save" || op=="fs-rename" || op=="fs-link" || op=="fs-fork" || op=="fs-append" || op=="fs-truncate" || op=="fs-open" || op=="fs-happend" || op=="fs-htruncate" || op=="fs-hread-next" || op=="fs-hwrite-next" || op=="fs-symlink" || op=="fs-chmod" || op=="fs-setmtime" || op=="fs-hchmod" || op=="fs-hsetmtime" || op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-hlock")count=3;
+    if(op=="fs-write" || op=="fs-save" || op=="fs-rename" || op=="fs-link" || op=="fs-fork" || op=="fs-restore" || op=="fs-append" || op=="fs-truncate" || op=="fs-open" || op=="fs-happend" || op=="fs-htruncate" || op=="fs-hread-next" || op=="fs-hwrite-next" || op=="fs-symlink" || op=="fs-chmod" || op=="fs-setmtime" || op=="fs-hchmod" || op=="fs-hsetmtime" || op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-hlock")count=3;
     if(op=="fs-read-at" || op=="fs-write-at" || op=="fs-hread" || op=="fs-hwrite" || op=="fs-hseek" || op=="fs-hrange-lock")count=4;
     if(op=="fs-history")count=4;
     if(op=="inode-root" || op=="inode-sync" || op=="inode-space")count=1;
@@ -256,6 +260,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="fs-xattr-remove" || op=="fs-hxattr-remove"){
         if(op=="fs-xattr-remove")fs.remove_xattr(args[1],args[2]);else fs.handle_remove_xattr(args[1],args[2]);return store.status();
     }
+    if(op=="fs-restore"){sessions.require_unmounted(view);return fs.restore(args[1],args[2]);}
     if(op=="fs-history"){auto limit=number(args[3]);need(limit>=1 && limit<=64,"invalid history page limit; expected 1..64");return fs.revision_history(args[1],args[2],static_cast<size_t>(limit));}
     if(op=="fs-diff"){auto limit=number(args[4]);need(limit>=1 && limit<=64,"invalid diff page limit; expected 1..64");return fs.diff(args[1],args[2],args[3],static_cast<size_t>(limit));}
     if(op=="fs-cat"){auto b=fs.read(args[1]);return std::string(b.begin(),b.end());}

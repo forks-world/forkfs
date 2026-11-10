@@ -518,12 +518,11 @@ std::string Namespace::revision_history(const std::string& tip,const std::string
     return result+"],\"next_after\":\""+(eof?"":last)+"\",\"eof\":"+(eof?"true":"false")+"}\n";
 }
 
-std::string Namespace::snapshot(const std::string& name) {
-    valid_view_name(name);need(!revision_,"revision view is read-only");
-    std::lock_guard lock(container_.mutex_);auto& j=*container_.journal_;
+ObjectId Namespace::prepare_snapshot_locked(const NamespaceView& view,const std::string& name,std::vector<Mutation>& batch) {
+    auto& j=*container_.journal_;
     need(!j.contains(history+"revision/"+name),"revision name already exists");
-    NamespaceView view(j,view_,false);root(view);
-    ObjectId manifest_id{};std::vector<Mutation> batch;
+    root(view);
+    ObjectId manifest_id{};
     if(view.legacy()) {
         auto plan=view.plan({});
         for(auto& payload:plan.objects) {
@@ -545,7 +544,28 @@ std::string Namespace::snapshot(const std::string& name) {
     store(descriptor.data()+72,j.sequence(),8);auto revision_id=Journal::object_id(descriptor);
     batch.push_back({history+"revision/"+name,std::move(descriptor)});
     batch.push_back({base,Bytes(revision_id.begin(),revision_id.end())});
-    j.transact(j.sequence(),batch);return hex_id(revision_id);
+    return revision_id;
+}
+std::string Namespace::snapshot(const std::string& name) {
+    valid_view_name(name);need(!revision_,"revision view is read-only");
+    std::lock_guard lock(container_.mutex_);auto& j=*container_.journal_;NamespaceView view(j,view_,false);std::vector<Mutation> batch;
+    auto id=prepare_snapshot_locked(view,name,batch);j.transact(j.sequence(),batch);return hex_id(id);
+}
+std::string Namespace::restore(const std::string& revision,const std::string& safety_revision) {
+    valid_view_name(revision);valid_view_name(safety_revision);need(!revision_,"revision view is read-only");
+    std::lock_guard lock(container_.mutex_);auto& j=*container_.journal_;
+    for(const auto& [owner,count]:container_.open_counts_)
+        need(owner.first!=view_ || count==0,"World restore has outstanding handles; close them first");
+    // Verify and publish under one lock. Directory cursors retain their captured
+    // immutable trees; mutable file handles must close before a World reset.
+    Namespace target(container_,revision,true);target.verify_locked();auto manifest=revision_manifest(j,revision);
+    auto target_id=j.root_object(history+"revision/"+revision);NamespaceView current(j,view_,false);std::vector<Mutation> batch;
+    auto safety_id=prepare_snapshot_locked(current,safety_revision,batch);
+    batch.push_back({history+"world/"+view_,std::nullopt,manifest});
+    // prepare_snapshot_locked advances base to the safety revision, preserving
+    // the World timeline. A later snapshot records restored data as its child.
+    j.transact(j.sequence(),batch);container_.compaction_cv_.notify_all();
+    return "{\"safety_revision_id\":\""+hex_id(safety_id)+"\",\"target_revision_id\":\""+hex_id(target_id)+"\",\"restored_manifest_id\":\""+hex_id(manifest)+"\"}\n";
 }
 void Namespace::fork(const std::string& revision,const std::string& world) {
     valid_view_name(revision);valid_view_name(world);need(world!="main","main World already exists");
@@ -794,7 +814,10 @@ void Namespace::rename(const std::string& source,const std::string& target) {
     });
 }
 void Namespace::verify() const {
-    std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);
+    std::lock_guard lock(container_.mutex_);verify_locked();
+}
+void Namespace::verify_locked() const {
+    const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);
     if(journal.is_leveldb())(void)j.references(); // Validate the full CoW tree before namespace traversal.
     auto root_id=root(j);need(inode(j,root_id).directory,"root inode is not a directory");std::set<std::string> expected;std::map<std::string,uint64_t> references;
     std::set<std::string> directories;expected.insert(root_key);

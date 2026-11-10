@@ -24,6 +24,13 @@ and captured repository sequences along the ancestry of an explicit named tip.
 Forks retain their selected base as ancestry; unrelated branch commits do not
 appear in that chain. The query does not create versions or claim to capture
 every file write. See [revision history](../daemon/README.md#revision-history).
+`fs-restore` installs a verified revision manifest into an existing World and
+atomically retains its previous committed state under a caller-supplied safety
+revision name. The safety revision becomes the World's retained base, so later
+snapshots continue the existing timeline with restored data. Mutable World file
+handles must close first; RPC restore also rejects active mutable mount leases,
+including the calling session's own lease. Unmount FSKit before restoring a World.
+
 The new optional FSKit frontend operates through the resident daemon RPC and
 revision-backed namespace; see [FSKit integration](FSKIT.md). Git and
 execution integration remain unavailable until revision-backed replacements exist.

@@ -27,8 +27,9 @@ A replacement diff must compare two immutable revision roots and their reference
 metadata/content objects. A replacement history must record committed revisions.
 `forkfsd fs-diff` now compares two explicit immutable revisions and pages path,
 metadata and content changes. `forkfsd fs-history` pages the immutable parent
-chain of a named revision. Neither scanning an external directory nor comparing
-timestamps is an accepted substitute.
+chain of a named revision. `fs-restore` atomically preserves the previous World
+as a safety revision and switches to a selected revision. Neither scanning an
+external directory nor comparing timestamps is an accepted substitute.
 
 `forkfsd check` verifies physical object integrity; `fs-check` verifies the selected
 World/revision namespace. These remain supported. The daemon's legacy single-file
@@ -63,6 +64,7 @@ $forkfsd fs-cat project.forkfs /src/main.txt --revision base
 $forkfsd fs-snapshot project.forkfs edited --world work
 $forkfsd fs-diff project.forkfs base edited
 $forkfsd fs-history project.forkfs edited
+$forkfsd fs-restore project.forkfs base safety-before-restore --world work
 $forkfsd fs-check project.forkfs --world work
 $forkfsd check project.forkfs
 $forkfsd gc project.forkfs  # offline physical GC for LevelDB CoW trees

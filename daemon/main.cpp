@@ -185,6 +185,7 @@ int main(int argc, char** argv) {
                          "forkfsd fs-check CONTAINER\n"
                          "forkfsd fs-snapshot CONTAINER REVISION_NAME [--world WORLD]\n"
                          "forkfsd fs-fork CONTAINER REVISION_NAME NEW_WORLD\n"
+                         "forkfsd fs-restore CONTAINER REVISION_NAME SAFETY_REVISION_NAME [--world NAME]\n"
                          "forkfsd fs-worlds CONTAINER\n"
                          "forkfsd fs-revisions CONTAINER\n"
                          "fs-* read commands accept --world NAME or --revision NAME.\n"
@@ -212,7 +213,7 @@ int main(int argc, char** argv) {
         std::string view="main";bool revision_view=false;
         int base_argc=4;
         if(command=="fs-init" || command=="fs-check" || command=="fs-worlds" || command=="fs-revisions" || command=="fs-compact" || command=="fs-layout")base_argc=3;
-        if(command=="fs-write" || command=="fs-save" || command=="fs-link" || command=="fs-rename" || command=="fs-fork" || command=="fs-append" || command=="fs-truncate" || command=="fs-symlink" || command=="fs-chmod" || command=="fs-setmtime")base_argc=5;
+        if(command=="fs-write" || command=="fs-save" || command=="fs-link" || command=="fs-rename" || command=="fs-fork" || command=="fs-restore" || command=="fs-append" || command=="fs-truncate" || command=="fs-symlink" || command=="fs-chmod" || command=="fs-setmtime")base_argc=5;
         if(command=="fs-read-at" || command=="fs-write-at")base_argc=6;
         if(command=="fs-xattr-get" || command=="fs-xattr-remove")base_argc=5;
         if(command=="fs-xattr-set")base_argc=7;
@@ -280,6 +281,7 @@ int main(int argc, char** argv) {
             else if(command=="fs-xattr-list" && argc==4){for(const auto& name:fs.list_xattrs(argv[3]))std::cout<<name<<'\n';return 0;}
             else if(command=="fs-xattr-set" && argc==7)fs.set_xattr(argv[3],argv[4],load_file(argv[6]),forkfs::Namespace::xattr_policy(argv[5]));
             else if(command=="fs-xattr-remove" && argc==5)fs.remove_xattr(argv[3],argv[4]);
+            else if(command=="fs-restore" && argc==5){std::cout<<fs.restore(argv[3],argv[4]);return 0;}
             else if(command=="fs-compact" && argc==3) fs.compact();
             else if(command=="fs-layout" && argc==3) {
                 if(container.storage_engine()=="leveldb") {fs.stat("/");std::cout<<"{\"layout\":\"cow-tree\",\"storage_engine\":\"leveldb\"}\n";return 0;}
