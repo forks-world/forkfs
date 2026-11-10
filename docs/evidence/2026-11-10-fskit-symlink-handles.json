@@ -1,0 +1,59 @@
+{
+  "namespace": "/forkfs-accept-w4o4zb2b",
+  "checks": [
+    "binary write/read/fsync reaches daemon content",
+    "native binary/empty xattrs, Finder tags, create policy and size limit",
+    "hardlink identity and symlink traversal",
+    "pathname/fd utime nanoseconds and native creation time reach revision inode",
+    "nofollow metadata, O_SYMLINK fds, cp -Pp binary xattrs and open-unlink/dup identity",
+    "fsync then revision checkpoint isolates subsequent writes",
+    "xattrs follow hardlink identity, revision isolation and open-unlink handles",
+    "rename/open-unlink/truncate/path reuse preserve file identity",
+    "directory enumeration and dot entries",
+    "atomic-save replacement reaches revision-backed namespace",
+    "UTF-8 names, links, rename, NFC/NFD identity and byte limits",
+    "4 MiB file transfer, 64 MiB sparse limit, truncate zero-fill and chunked open-unlink"
+  ],
+  "timestamp_ns": {
+    "accessed_ns": 1234567890123456790,
+    "modified_ns": 1345678901234567891,
+    "birth_ns": 1123456789000000000
+  },
+  "symlink_attributes": {
+    "mode": 449,
+    "accessed_ns": 111111111111111111,
+    "modified_ns": 222222222222222222,
+    "birth_ns": 100000000000000000,
+    "target_unchanged": true,
+    "dangling_touch_h": true,
+    "dangling_cp_Pp": true,
+    "copied_binary_xattr": true,
+    "fd_open_unlink_dup": true,
+    "data_read_write_errno": "EPERM",
+    "truncate_errno": "EINVAL"
+  },
+  "retained_revision": "mount_accept_7605313027ae",
+  "appledouble_sidecars": 0,
+  "unicode_retained_revision": "unicode_mount_bfaa184628b1",
+  "large_retained_revision": "large_mount_d53e310032b0",
+  "large_namespace": "/forkfs-accept-w4o4zb2b/large.bin",
+  "readonly_after_restart_gc": {
+    "O_SYMLINK_open": true,
+    "binary_fd_xattr_preserved": true,
+    "fsetxattr_errno": "EROFS",
+    "fchmod_errno": "EROFS",
+    "data_read_errno": "EPERM"
+  },
+  "platform": {
+    "macOS": "27.2",
+    "architecture": "arm64"
+  },
+  "source_sha256": {
+    "daemon/rpc.cpp": "2b6a9c43cfdfdbda58bcfd33605f2f9579dd967974af5eda7ad8041930f04fd9",
+    "macos/forkfs/RevisionVolume.mm": "d369573b34e1019c357907b407bb77a55fb62ce6e8ac734311b19b8bd99da441",
+    "scripts/tests/forkfs_mount.py": "87e0e46ab0a8b1a51d69b490a90994da5f8e3ca38a6402ad27bd4266b3cdf734"
+  },
+  "world_daemon_namespace_sha256": "8dc3b273abda2026272a92fffcabbc8b05d6d119f31b9c5b3aa62c5b5065cb08",
+  "readonly_daemon_namespace_sha256": "94458b86cb34826e1a07bec3ba54fc2397088b54342938fe4e351e7be184bbc8",
+  "validation_note": "World acceptance preceded a directory-open error-code refinement; readonly remount and final 49-test suite use the refined daemon."
+}

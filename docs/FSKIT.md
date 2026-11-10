@@ -285,11 +285,25 @@ changes. The CLI/RPC `fs-lchmod` and `fs-lsettimes` variants provide the same
 nofollow-final behavior; prefix directory links continue to resolve normally.
 
 Native nofollow utime, lchmod, birth-time updates, `touch -h` and `cp -PpX` are
-covered by the symlink-attribute acceptance run. Plain `cp -Pp` still fails on
-symlinks because its extended-attribute copy path needs an O_SYMLINK file handle;
-those handles remain unsupported. Path-based nofollow xattr queries work. The
-`-X` copy skips extended attributes and is the specifically validated copy case.
+covered by the symlink-attribute acceptance run. Symlink metadata handles now
+also support native O_SYMLINK and the xattr-copy path used by plain `cp -Pp`,
+including binary xattrs. The source and destination descriptors refer to the
+symlink objects, independently of whether the target exists.
 
 After daemon restart and physical GC, a read-only revision mount preserved the
 symlink's mode, target text and all stored times, rejecting nofollow utime and
 lchmod with EROFS. See [symlink attribute evidence](evidence/2026-11-10-fskit-symlink-attributes.json).
+
+Symlink descriptors support fstat, xattr and mode/time operations, including
+open-unlinked descriptors and path reuse. File data read/write operations return
+EPERM, and size changes return EINVAL; the adapter rejects empty data requests
+too. The daemon retains orphan link text and metadata until the last descriptor
+closes or its session expires. Writer-to-reader downgrade preserves the orphan
+through a duplicated daemon handle. A read-only revision may open a symlink for
+metadata reads and rejects metadata mutations with EROFS. Restart invalidates
+all descriptors; it does not resume an old mount or preserve kernel caches.
+
+The native macOS 27.2 run verified ordinary `cp -Pp` with a binary xattr on a
+dangling link, O_SYMLINK fstat/fchmod/utime, rejected data I/O, and open-unlink/dup
+identity. After restart and GC, a read-only revision fd retained its binary xattr
+and rejected metadata writes. See [symlink handle evidence](evidence/2026-11-10-fskit-symlink-handles.json).
