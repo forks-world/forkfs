@@ -38,7 +38,9 @@ int main(int argc,char** argv){@autoreleasepool {
     NSString* runtime=@(tmp);NSString* db=[runtime stringByAppendingPathComponent:@"db"];
     NSString* binary=@(argv[1]);NSTask* server=nil;NSTask* bridge=nil;__block RevisionVolume* volume=nil;
     try {
-        command(binary,@[@"init",db]);command(binary,@[@"fs-init",db]);command(binary,@[@"fs-snapshot",db,@"base"]);
+        command(binary,@[@"init",db]);command(binary,@[@"fs-init",db]);
+        NSString* xattrInput=[runtime stringByAppendingPathComponent:@"xattr-input"];[[NSData dataWithBytes:"R\0X" length:3] writeToFile:xattrInput atomically:YES];
+        command(binary,@[@"fs-xattr-set",db,@"/",@"user.retained",@"create",xattrInput]);command(binary,@[@"fs-snapshot",db,@"base"]);
         NSDictionary* status=[NSJSONSerialization JSONObjectWithData:command(binary,@[@"check",db]) options:0 error:nil];
         NSDictionary* config=@{@"schema_version":@1,@"world":@"main",@"repository":status[@"repository_id"]};
         NSString* configPath=[runtime stringByAppendingPathComponent:@"forkfs.json"];
@@ -159,6 +161,24 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume writeContents:contents toFile:file atOffset:0 replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==4,"binary write failed");
         TestBuffer* buffer=[TestBuffer new];buffer.storage=[NSMutableData dataWithLength:32];
         [volume readFromFile:file offset:0 length:32 intoBuffer:(FSMutableFileDataBuffer*)buffer replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==4 && !memcmp(buffer.storage.bytes,payload,4),"binary read failed");
+        check(volume.maximumXattrSize==65536,"wrong xattr size capability");
+        FSFileName* attrName=[FSFileName nameWithString:@"user.测试📄"];__block NSData* xattrValue=nil;__block NSArray<FSFileName*>* attrNames=nil;
+        const char badName[]={char(0xff)};FSFileName* invalidAttr=[FSFileName nameWithBytes:badName length:1];
+        [volume getXattrNamed:invalidAttr ofItem:file replyHandler:^(NSData* v,NSError* e){result=e;}];check(result.code==EINVAL,"invalid UTF-8 xattr get must fail safely");
+        [volume setXattrNamed:invalidAttr toData:nil onItem:file policy:FSSetXattrPolicyDelete replyHandler:^(NSError* e){result=e;}];check(result.code==EINVAL,"invalid UTF-8 xattr delete must fail safely");
+        [volume getXattrNamed:attrName ofItem:file replyHandler:^(NSData* v,NSError* e){xattrValue=v;result=e;}];check(result.code==ENOATTR,"missing xattr must report ENOATTR");
+        [volume setXattrNamed:attrName toData:contents onItem:file policy:FSSetXattrPolicyMustCreate replyHandler:^(NSError* e){result=e;}];check(!result,"xattr create failed");
+        [volume getXattrNamed:attrName ofItem:file replyHandler:^(NSData* v,NSError* e){xattrValue=v;result=e;}];check(!result && [xattrValue isEqualToData:contents],"binary xattr read failed");
+        [volume listXattrsOfItem:file replyHandler:^(NSArray<FSFileName*>* v,NSError* e){attrNames=v;result=e;}];check(!result && attrNames.count==1 && [attrNames[0].string isEqual:attrName.string],"xattr list failed");
+        [volume setXattrNamed:attrName toData:contents onItem:file policy:FSSetXattrPolicyMustCreate replyHandler:^(NSError* e){result=e;}];check(result.code==EEXIST,"xattr create must reject existing name");
+        [volume setXattrNamed:attrName toData:[NSData data] onItem:file policy:FSSetXattrPolicyMustReplace replyHandler:^(NSError* e){result=e;}];check(!result,"empty xattr replace failed");
+        [volume getXattrNamed:attrName ofItem:file replyHandler:^(NSData* v,NSError* e){xattrValue=v;result=e;}];check(!result && xattrValue.length==0,"empty xattr must remain present");
+        [volume setXattrNamed:attrName toData:nil onItem:file policy:FSSetXattrPolicyDelete replyHandler:^(NSError* e){result=e;}];check(!result,"xattr delete failed");
+        [volume setXattrNamed:attrName toData:contents onItem:file policy:FSSetXattrPolicyMustReplace replyHandler:^(NSError* e){result=e;}];check(result.code==ENOATTR,"xattr replace must reject missing name");
+        [volume setXattrNamed:attrName toData:contents onItem:file policy:FSSetXattrPolicyAlwaysSet replyHandler:^(NSError* e){result=e;}];check(!result,"xattr upsert failed");
+        [volume setXattrNamed:[FSFileName nameWithString:@"user.root"] toData:contents onItem:root policy:FSSetXattrPolicyAlwaysSet replyHandler:^(NSError* e){result=e;}];check(!result,"inode root xattr set failed");
+        [volume getXattrNamed:[FSFileName nameWithString:@"user.root"] ofItem:root replyHandler:^(NSData* v,NSError* e){xattrValue=v;result=e;}];check(!result && [xattrValue isEqualToData:contents],"inode root xattr get failed");
+        [volume setXattrNamed:[FSFileName nameWithString:@"user.root"] toData:nil onItem:root policy:FSSetXattrPolicyDelete replyHandler:^(NSError* e){result=e;}];check(!result,"inode root xattr remove failed");
         check(volume.maximumFileSize==64*1024*1024,"wrong file size capability");
         [volume writeContents:contents toFile:file atOffset:300001 replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==4,"large sparse write failed");
         buffer.storage=[NSMutableData dataWithLength:300010];
@@ -188,6 +208,7 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume writeContents:[NSData dataWithBytes:"Z" length:1] toFile:file atOffset:0 replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==1,"orphan write failed");
         __block FSItemAttributes* attrs=nil;
         [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:file replyHandler:^(FSItemAttributes* a,NSError* e){attrs=a;result=e;}];check(!result && attrs.linkCount==0,"orphan attributes failed");
+        [volume getXattrNamed:attrName ofItem:file replyHandler:^(NSData* v,NSError* e){xattrValue=v;result=e;}];check(!result && [xattrValue isEqualToData:contents],"orphan xattr lost after unlink");
         FSItemSetAttributesRequest* truncate=[FSItemSetAttributesRequest new];truncate.size=2;truncate.mode=0700;
         [volume setAttributes:truncate onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){attrs=a;result=e;}];check(!result && attrs.size==2 && attrs.mode==0700,"orphan setattr failed");
         [volume closeItem:file keepingModes:0 replyHandler:^(NSError* e){result=e;}];check(!result,"close callback failed");
@@ -203,6 +224,8 @@ int main(int argc,char** argv){@autoreleasepool {
         volume=[[RevisionVolume alloc] initWithRuntimeURL:[NSURL fileURLWithPath:runtime isDirectory:YES] error:&error];check(volume!=nil,"revision volume initialization failed");
         [volume activateWithOptions:nil replyHandler:^(FSItem* it,NSError* e){root=it;result=e;}];check(root && !result,"revision activation failed");
         [volume createItemNamed:[FSFileName nameWithString:@"forbidden"] type:FSItemTypeFile inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* it,FSFileName* n,NSError* e){result=e;}];check(result.code==EROFS,"revision creation must fail read-only");
+        [volume getXattrNamed:[FSFileName nameWithString:@"user.retained"] ofItem:root replyHandler:^(NSData* v,NSError* e){xattrValue=v;result=e;}];check(!result && xattrValue.length==3 && !memcmp(xattrValue.bytes,"R\0X",3),"revision xattr read failed");
+        [volume setXattrNamed:attrName toData:contents onItem:root policy:FSSetXattrPolicyAlwaysSet replyHandler:^(NSError* e){result=e;}];check(result.code==EROFS,"revision xattr write must fail read-only");
         [server terminate];[server waitUntilExit];server=nil;
         [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:root replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(result!=nil,"daemon loss must not use cached fallback");
         volume=nil;

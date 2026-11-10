@@ -1,0 +1,45 @@
+{
+  "namespace": "/forkfs-accept-lmnt8saa",
+  "checks": [
+    "binary write/read/fsync reaches daemon content",
+    "native binary/empty xattrs, Finder tags, create policy and size limit",
+    "hardlink identity and symlink traversal",
+    "fsync then revision checkpoint isolates subsequent writes",
+    "xattrs follow hardlink identity, revision isolation and open-unlink handles",
+    "rename/open-unlink/truncate/path reuse preserve file identity",
+    "directory enumeration and dot entries",
+    "atomic-save replacement reaches revision-backed namespace",
+    "UTF-8 names, links, rename, NFC/NFD identity and byte limits",
+    "4 MiB file transfer, 64 MiB sparse limit, truncate zero-fill and chunked open-unlink"
+  ],
+  "retained_revision": "mount_accept_6f1a4b3558be",
+  "appledouble_sidecars": 0,
+  "unicode_retained_revision": "unicode_mount_2e5144a9ba3e",
+  "large_retained_revision": "large_mount_eb4073a1d03c",
+  "large_namespace": "/forkfs-accept-lmnt8saa/large.bin",
+  "platform": {
+    "macOS": "27.2",
+    "architecture": "arm64"
+  },
+  "source_sha256": {
+    "daemon/namespace.cpp": "52f018f63d9c8db37077dba27d352f37f90bce2d255c515007fab7a0bc82d09f",
+    "macos/forkfs/RevisionVolume.mm": "9f0cd506a052fb7c0034637baa8bddac22e0760e3c0878143639344644946fd6",
+    "scripts/tests/forkfs_mount.py": "048303d439193ca87215456cf478b147c02efc0e4e40d129c67dbd9f5061ce82"
+  },
+  "native_invalid_utf8_rejected": true,
+  "readonly_xattrs": {
+    "after_restart_and_gc": true,
+    "original_binary_xattr": true,
+    "original_finder_tags": true,
+    "set_errno": "EROFS",
+    "remove_errno": "EROFS",
+    "revision": "mount_accept_6f1a4b3558be"
+  },
+  "compatibility": {
+    "older_daemon_rejects_xattr_inode": true,
+    "last_remove_restores_older_inode_readability": true,
+    "gc": {
+      "collected_objects": 6149
+    }
+  }
+}

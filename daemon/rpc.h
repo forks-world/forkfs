@@ -11,6 +11,16 @@ class Container;
 inline int rpc_posix_error(std::string_view message) {
     if(message=="RPC timeout")return ETIMEDOUT;
     if(message=="RPC connect failed" || message=="RPC connection failed" || message=="RPC send failed" || message=="truncated RPC reply")return ENOTCONN;
+    if(message=="extended attribute not found"){
+#ifdef __APPLE__
+        return ENOATTR;
+#else
+        return ENODATA;
+#endif
+    }
+    if(message=="extended attribute exceeds 64 KiB")return E2BIG;
+    if(message=="extended attribute name exceeds 255 bytes")return ENAMETOOLONG;
+    if(message=="extended attribute count limit reached")return ENOSPC;
     if(message=="object root not found")return ENOENT;
     if(message=="path exceeds mount protocol limit")return ENAMETOOLONG;
     if(message=="path not found" || message=="source not found")return ENOENT;
