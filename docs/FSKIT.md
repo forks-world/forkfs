@@ -192,7 +192,7 @@ names, links, rename, NFC/NFD distinctions and the byte limit; see
 Current limits are inherited from the namespace prototype: 64 MiB per regular
 file with 256 KiB per daemon I/O request, UTF-8 names (255 bytes per component, 4096 per path), mode bits through
 0777, native xattrs (64 KiB per value, 32 per inode), no ACLs or uid/gid
-changes, and no special files. Setattr supports mode, size and mtime atomically;
+changes, and no special files. Setattr supports mode, size, mtime, atime and birth time atomically;
 unsupported attributes fail before mutation. The owner/group are synthesized
 from the service identity. The mounted root is always exposed as mode 0700, and
 requests to broaden that mode fail before mutation; this mount policy does not
@@ -264,3 +264,16 @@ registration alone is insufficient. Enable ForkFS in System Settings →
 General → Login Items & Extensions → File System Extensions. The public FSKit
 client exposes a settings launcher and the module enabled state is read-only;
 the scripts do not alter private preferences or bypass this authorization.
+
+The timestamp adapter accepts pathname and descriptor utime requests and explicit
+birth-time updates, validating all fields before mutation. Times use unsigned
+nanoseconds in 0..INT64_MAX; reads do not update atime. The daemon reads old
+FFINOD01 records and writes FFINOD02 with stored atime/birth time. Old records
+initially expose mtime/ctime as fallback atime/birth values; no historical creation
+time is reconstructed. Older daemons reject upgraded inode records. See
+[mode and timestamps](../daemon/README.md#mode-and-timestamps).
+
+Actual macOS 27.2 acceptance verified pathname/fd nanosecond utime, native birth
+time, open-unlinked fd updates, `touch` and `cp -p`. A read-only revision mount
+after daemon restart and physical GC preserved the recorded times and rejected
+utime with EROFS; see [timestamp evidence](evidence/2026-11-10-fskit-times.json).

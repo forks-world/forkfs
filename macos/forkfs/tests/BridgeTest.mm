@@ -83,6 +83,13 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume createItemNamed:[FSFileName nameWithString:@"文件📄"] type:FSItemTypeFile inDirectory:root attributes:create replyHandler:^(FSItem* item,FSFileName* n,NSError* e){file=item;result=e;}];check(file && !result,"create callback failed");
         __block FSItemAttributes* fileAttrs=nil;
         [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:file replyHandler:^(FSItemAttributes* a,NSError* e){fileAttrs=a;result=e;}];check(fileAttrs && !result,"file identity lookup failed");
+        FSItemSetAttributesRequest* times=[FSItemSetAttributesRequest new];times.accessTime=(timespec){123,456};times.modifyTime=(timespec){234,567};times.birthTime=(timespec){100,789};
+        [volume setAttributes:times onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){fileAttrs=a;result=e;}];
+        check(!result && fileAttrs.accessTime.tv_sec==123 && fileAttrs.accessTime.tv_nsec==456 && fileAttrs.modifyTime.tv_sec==234 && fileAttrs.modifyTime.tv_nsec==567 && fileAttrs.birthTime.tv_sec==100 && fileAttrs.birthTime.tv_nsec==789,"timestamp callback roundtrip failed");
+        check((times.consumedAttributes&(FSItemAttributeAccessTime|FSItemAttributeModifyTime|FSItemAttributeBirthTime))==(FSItemAttributeAccessTime|FSItemAttributeModifyTime|FSItemAttributeBirthTime),"timestamp attributes were not consumed");
+        FSItemSetAttributesRequest* invalidTimes=[FSItemSetAttributesRequest new];invalidTimes.mode=0777;invalidTimes.accessTime=(timespec){9223372036,854775808};
+        [volume setAttributes:invalidTimes onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(result.code==EINVAL,"overflowing time must fail before mutation");
+        [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:file replyHandler:^(FSItemAttributes* a,NSError* e){fileAttrs=a;result=e;}];check(!result && fileAttrs.mode==0600 && fileAttrs.accessTime.tv_sec==123,"invalid timestamp partially changed attributes");
         BOOL expectDots=[NSProcessInfo processInfo].operatingSystemVersion.majorVersion>=27;
         NSArray<NSString*>* expectedNames=expectDots?@[@".",@"..",@"文件📄"]:@[@"文件📄"];
         RecordingPacker* directoryPacker=[RecordingPacker new];directoryPacker.limit=1;

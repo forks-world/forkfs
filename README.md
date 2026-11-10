@@ -36,6 +36,10 @@ World/revision namespace. These remain supported. The daemon's legacy single-fil
 container compatibility also uses immutable revision manifests; it is distinct
 from the retired native-directory `world` backend.
 
+The daemon and FSKit frontend store nanosecond mtime, atime and birth time in
+revision metadata. `fs-settimes` updates selected times atomically; reads follow
+a noatime policy. See [mode and timestamps](daemon/README.md#mode-and-timestamps).
+
 ## Build and test
 
 ```sh

@@ -112,11 +112,29 @@ try:
     os.symlink('file',root/'symlink')
     assert os.readlink(root/'symlink')=='file' and (root/'symlink').read_bytes()==payload
     report['checks'].append('hardlink identity and symlink traversal')
+    atime,mtime,birth=1234567890123456789,1345678901234567890,1123456789000000000
+    os.utime(file,ns=(atime,mtime));assert file.stat().st_atime_ns==atime and file.stat().st_mtime_ns==mtime
+    os.utime(fd,ns=(atime+1,mtime+1));atime+=1;mtime+=1
+    class AttrList(ctypes.Structure):
+        _fields_=[('count',ctypes.c_uint16),('reserved',ctypes.c_uint16),('common',ctypes.c_uint32),('volume',ctypes.c_uint32),('directory',ctypes.c_uint32),('file',ctypes.c_uint32),('fork',ctypes.c_uint32)]
+    class Timespec(ctypes.Structure):
+        _fields_=[('seconds',ctypes.c_long),('nanoseconds',ctypes.c_long)]
+    attributes=AttrList(5,0,0x00000200,0,0,0,0) # ATTR_CMN_CRTIME from Darwin sys/attr.h
+    stamp=Timespec(birth//1000000000,birth%1000000000)
+    libc.setattrlist.argtypes=[ctypes.c_char_p,ctypes.c_void_p,ctypes.c_void_p,ctypes.c_size_t,ctypes.c_uint32];libc.setattrlist.restype=ctypes.c_int
+    assert libc.setattrlist(os.fsencode(file),ctypes.byref(attributes),ctypes.byref(stamp),ctypes.sizeof(stamp),0)==0,ctypes.get_errno()
+    metadata=json.loads(rpc('fs-stat',namespace+'/file'))
+    assert [metadata[k] for k in ['accessed_ns','modified_ns','birth_ns']]==[atime,mtime,birth]
+    assert file.stat().st_atime_ns==atime and file.stat().st_mtime_ns==mtime and int(file.stat().st_birthtime)==birth//1000000000
+    report['timestamp_ns']={'accessed_ns':atime,'modified_ns':mtime,'birth_ns':birth}
+    report['checks'].append('pathname/fd utime nanoseconds and native creation time reach revision inode')
     if args.checkpoint:
         revision='mount_accept_'+uuid.uuid4().hex[:12]
         rpc('fs-snapshot',revision)
         os.pwrite(fd,b'CHANGED!',0);os.fsync(fd)
         assert rpc('fs-cat',namespace+'/file',revision=revision)==payload
+        retained=json.loads(rpc('fs-stat',namespace+'/file',revision=revision))
+        assert all(retained[k]==v for k,v in report['timestamp_ns'].items())
         assert rpc('fs-cat',namespace+'/file')!=payload
         setxattr(file,attr,b'changed',flags=XATTR_REPLACE)
         assert rpc('fs-xattr-get',namespace+'/file',attr,revision=revision)==attr_value

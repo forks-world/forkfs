@@ -60,21 +60,25 @@ std::string root(const NamespaceView& journal) {
     need(journal.contains(root_key),"filesystem not initialized; use fs-init");return decode_id(journal.get(root_key));
 }
 InodeInfo decode_inode(const Bytes& b,const std::string& id,bool orphan=false) {
-    need(b.size()==48 && !memcmp(b.data(),"FFINOD01",8),"invalid inode record");
+    bool extended=b.size()==64 && !memcmp(b.data(),"FFINOD02",8);
+    need(extended || (b.size()==48 && !memcmp(b.data(),"FFINOD01",8)),"invalid inode record");
     auto type=load(b.data()+8,4),encoded_mode=load(b.data()+12,4);
     // Older readers reject this mode bit instead of silently losing xattrs.
     bool xattrs=(encoded_mode&0x80000000U)!=0;auto mode=encoded_mode&~uint64_t(0x80000000U);
     need((type==1||type==2||type==3||type==4) && mode<=0777,"unsupported inode attributes");
     InodeInfo n{id,type==2,static_cast<uint32_t>(mode),load(b.data()+16,8),load(b.data()+24,8),
                 load(b.data()+32,8),load(b.data()+40,8),type==3,type==4,xattrs};
+    n.accessed_ns=extended?load(b.data()+48,8):n.modified_ns;n.birth_ns=extended?load(b.data()+56,8):n.changed_ns;
+    need(n.accessed_ns<=INT64_MAX && n.birth_ns<=INT64_MAX,"inode time exceeds supported nanosecond range");
     need((orphan?(!n.directory && !n.symlink && n.links==0):n.links>0) && (!n.directory || (n.links>=2 && n.size==0)),"invalid inode state");return n;
 }
 InodeInfo inode(const NamespaceView& journal,const std::string& id) {return decode_inode(journal.get(inode_key(id)),id);}
 std::string orphan_prefix(const std::string& world,const std::string& id) {return history+"orphan/"+world+"/"+id+"/";}
 Bytes encode(const InodeInfo& n) {
-    Bytes b(48);memcpy(b.data(),"FFINOD01",8);store(b.data()+8,n.symlink?3:n.directory?2:n.chunked?4:1,4);
+    Bytes b(64);memcpy(b.data(),"FFINOD02",8);store(b.data()+8,n.symlink?3:n.directory?2:n.chunked?4:1,4);
     store(b.data()+12,uint64_t(n.mode)|(n.xattrs?uint64_t(0x80000000U):0),4);store(b.data()+16,n.links,8);store(b.data()+24,n.size,8);
-    store(b.data()+32,n.modified_ns,8);store(b.data()+40,n.changed_ns,8);return b;
+    store(b.data()+32,n.modified_ns,8);store(b.data()+40,n.changed_ns,8);
+    store(b.data()+48,n.accessed_ns,8);store(b.data()+56,n.birth_ns,8);return b;
 }
 void valid_xattr_name(const std::string& name);
 bool valid_orphan_field(const std::string& field) {
@@ -181,6 +185,7 @@ Parent parent(const NamespaceView& journal,const std::string& path,std::vector<s
 std::string resolve(const NamespaceView& journal,const std::string& path,bool follow=true,Parent* missing=nullptr) {
     auto names=components(path);return walk(journal,names,names.size(),nullptr,follow,missing);
 }
+InodeInfo created(InodeInfo n){n.accessed_ns=n.modified_ns;n.birth_ns=n.changed_ns;return n;}
 void touch(InodeInfo& n) {n.modified_ns=n.changed_ns=now();}
 }
 // Type 1 remains the original inline regular file. Type 4 stores sparse 64 KiB
@@ -433,7 +438,7 @@ std::string Namespace::diff(const std::string& before,const std::string& after,c
     auto type=[&](const std::optional<InodeInfo>& n){return n?quote(n->directory?"directory":n->symlink?"symlink":"file"):std::string("null");};
     auto identity=[&](const std::optional<InodeInfo>& n){return n?quote(n->id):std::string("null");};
     auto same_metadata=[](const InodeInfo& a,const InodeInfo& b){return a.id==b.id && a.directory==b.directory && a.symlink==b.symlink &&
-        a.mode==b.mode && a.links==b.links && a.size==b.size && a.modified_ns==b.modified_ns && a.changed_ns==b.changed_ns;};
+        a.mode==b.mode && a.links==b.links && a.size==b.size && a.modified_ns==b.modified_ns && a.changed_ns==b.changed_ns && a.accessed_ns==b.accessed_ns && a.birth_ns==b.birth_ns;};
     auto attribute_ids=[](const NamespaceView& view,const std::optional<InodeInfo>& n){
         std::map<std::string,ObjectId> result;if(n){auto pre=xattr_prefix(n->id);for(const auto& key:view.keys(pre))result.emplace(key.substr(pre.size()),*view.reference(key));}return result;
     };
@@ -636,7 +641,7 @@ void Namespace::initialize() {
     update([](const NamespaceView& j,Changes& changes) {
         need(!j.contains(root_key),"filesystem already initialized");
         need(j.keys(prefix).empty(),"orphan filesystem records prevent initialization");
-        auto id=new_id(j);InodeInfo n{id,true,0755,2,0,now(),now()};
+        auto id=new_id(j);InodeInfo n=created({id,true,0755,2,0,now(),now()});
         changes[root_key]=id_bytes(id);changes[inode_key(id)]=encode(n);changes[allocated_key(id)]=Bytes{};
     });
 }
@@ -644,7 +649,7 @@ void Namespace::mkdir(const std::string& path,uint32_t mode) {
     need(mode<=0777,"invalid creation mode");
     update([&](const NamespaceView& j,Changes& c) {
         auto p=parent(j,path);need(!j.contains(p.key),"path already exists");
-        auto id=new_id(j);InodeInfo n{id,true,mode,2,0,now(),now()},pn=inode(j,p.id);
+        auto id=new_id(j);InodeInfo n=created({id,true,mode,2,0,now(),now()}),pn=inode(j,p.id);
         need(pn.links<UINT64_MAX,"directory link count exhausted");++pn.links;touch(pn);
         c[p.key]=id_bytes(id);c[inode_key(id)]=encode(n);c[inode_key(p.id)]=encode(pn);c[allocated_key(id)]=Bytes{};
     });
@@ -657,7 +662,7 @@ void Namespace::write(const std::string& path,const Bytes& value) {
             Parent destination;id=resolve(j,path,true,&destination);
             if(id.empty()){p=std::move(destination);exists=false;id=new_id(j);}
         }
-        auto n=exists?inode(j,id):InodeInfo{id,false,0644,1,0,now(),now()};
+        auto n=exists?inode(j,id):created({id,false,0644,1,0,now(),now()});
         need(!n.directory && !n.symlink,"cannot write non-regular file");if(n.chunked){for(const auto& key:FileContent(n,j).records())c[key]=std::nullopt;n.chunked=false;}n.size=value.size();touch(n);
         c[inode_key(id)]=encode(n);c[content_key(id)]=value;
         if(!exists){auto pn=inode(j,p.id);touch(pn);c[inode_key(p.id)]=encode(pn);c[p.key]=id_bytes(id);c[allocated_key(id)]=Bytes{};}
@@ -673,7 +678,7 @@ void Namespace::replace_file(const std::string& path,const Bytes& value) {
             if(old.links==1)retire(view,changes,old);
             else {--old.links;old.changed_ns=now();changes[inode_key(old.id)]=encode(old);}
         }
-        auto id=new_id(view);InodeInfo n{id,false,mode,1,value.size(),now(),now()};auto pn=inode(view,p.id);touch(pn);
+        auto id=new_id(view);InodeInfo n=created({id,false,mode,1,value.size(),now(),now()});auto pn=inode(view,p.id);touch(pn);
         changes[inode_key(id)]=encode(n);changes[content_key(id)]=value;changes[allocated_key(id)]=Bytes{};
         changes[p.key]=id_bytes(id);changes[inode_key(p.id)]=encode(pn);
     });
@@ -742,16 +747,19 @@ void valid_attributes(const Namespace::Attributes& a) {
     need(!a.mode || *a.mode<=0777,"unsupported mode bits");
     need(!a.size || *a.size<=Namespace::maximum_file_size,"file exceeds 64 MiB");
     need(!a.modified_ns || *a.modified_ns<=INT64_MAX,"mtime exceeds supported nanosecond range");
+    need(!a.accessed_ns || *a.accessed_ns<=INT64_MAX,"atime exceeds supported nanosecond range");
+    need(!a.birth_ns || *a.birth_ns<=INT64_MAX,"birth time exceeds supported nanosecond range");
 }
 void apply_attributes(InodeInfo& n,const Namespace::Attributes& a) {
     if(a.mode)n.mode=*a.mode;if(a.modified_ns)n.modified_ns=*a.modified_ns;n.changed_ns=now();
+    if(a.accessed_ns)n.accessed_ns=*a.accessed_ns;if(a.birth_ns)n.birth_ns=*a.birth_ns;
 }
 }
 void Namespace::set_attributes(const std::string& path,const Attributes& a) {
     valid_attributes(a);
     update([&](const NamespaceView& view,Changes& changes) {
-        auto id=resolve(view,path);auto n=inode(view,id);if(!a.mode && !a.modified_ns && !a.size)return;
-        if(a.size && *a.size==n.size && !a.mode && !a.modified_ns)return;
+        auto id=resolve(view,path);auto n=inode(view,id);if(!a.mode && !a.modified_ns && !a.size && !a.accessed_ns && !a.birth_ns)return;
+        if(a.size && *a.size==n.size && !a.mode && !a.modified_ns && !a.accessed_ns && !a.birth_ns)return;
         if(a.size){need(!n.directory && !n.symlink,"only regular files support size changes");
             FileContent data(n,view,&changes);if(data.resize(*a.size))touch(n);}
         apply_attributes(n,a);changes[inode_key(id)]=encode(n);
@@ -764,8 +772,8 @@ void Namespace::handle_set_attributes(const std::string& token,const Attributes&
     auto key=linked?inode_key(info.inode):orphan_prefix(view_,info.inode)+"inode";
     auto n=linked?inode(view,info.inode):decode_inode(container_.journal_->get(key),info.inode,true);
     need(!a.size || info.writable,"handle is not writable");
-    if(!a.mode && !a.modified_ns && !a.size)return;
-    if(a.size && *a.size==n.size && !a.mode && !a.modified_ns)return;
+    if(!a.mode && !a.modified_ns && !a.size && !a.accessed_ns && !a.birth_ns)return;
+    if(a.size && *a.size==n.size && !a.mode && !a.modified_ns && !a.accessed_ns && !a.birth_ns)return;
     Changes changes;
     if(a.size){FileContent data=linked?FileContent(n,view,&changes):FileContent(n,*container_.journal_,orphan_prefix(view_,info.inode),&changes);if(data.resize(*a.size))touch(n);}
     apply_attributes(n,a);changes[key]=encode(n);commit_changes(view,changes);
@@ -777,7 +785,7 @@ void Namespace::symlink(const std::string& target,const std::string& path) {
     target_components(target);
     update([&](const NamespaceView& view,Changes& c) {
         auto p=parent(view,path);need(!view.contains(p.key),"path already exists");auto id=new_id(view);
-        InodeInfo n{id,false,0777,1,target.size(),now(),now(),true};auto pn=inode(view,p.id);touch(pn);
+        InodeInfo n=created({id,false,0777,1,target.size(),now(),now(),true});auto pn=inode(view,p.id);touch(pn);
         c[inode_key(id)]=encode(n);c[content_key(id)]=Bytes(target.begin(),target.end());c[allocated_key(id)]=Bytes{};
         c[p.key]=id_bytes(id);c[inode_key(p.id)]=encode(pn);
     });
@@ -911,7 +919,7 @@ std::string Namespace::open(const std::string& path,Access access,const OpenOpti
             if(id.empty()){p=std::move(destination);exists=false;}
         }
         if(!exists) {
-            id=new_id(view);InodeInfo n{id,false,options.mode,1,0,now(),now()};auto pn=inode(view,p.id);touch(pn);
+            id=new_id(view);InodeInfo n=created({id,false,options.mode,1,0,now(),now()});auto pn=inode(view,p.id);touch(pn);
             changes[inode_key(id)]=encode(n);changes[content_key(id)]=Bytes{};changes[allocated_key(id)]=Bytes{};
             changes[p.key]=id_bytes(id);changes[inode_key(p.id)]=encode(pn);
         }

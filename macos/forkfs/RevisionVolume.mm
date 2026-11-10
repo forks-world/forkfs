@@ -18,6 +18,11 @@ NSDictionary* object(const std::string& value){
 }
 NSError* posix(int code){return fs_errorForPOSIXError(code);}
 FSItemType itemType(NSDictionary* a){return [a[@"directory"] boolValue]?FSItemTypeDirectory:[a[@"symlink"] boolValue]?FSItemTypeSymlink:FSItemTypeFile;}
+NSString* timestamp(timespec t) {
+    require(t.tv_sec>=0 && t.tv_nsec>=0 && t.tv_nsec<1000000000 &&
+        uint64_t(t.tv_sec)<=(uint64_t(INT64_MAX)-uint64_t(t.tv_nsec))/1000000000,EINVAL,"invalid inode time");
+    return [@(uint64_t(t.tv_sec)*1000000000+uint64_t(t.tv_nsec)) stringValue];
+}
 BOOL emitsDotEntriesWithoutAttributes(void) {
     char release[64]={0};size_t length=sizeof release-1;long major=27;
     if(sysctlbyname("kern.osrelease",release,&length,nullptr,0)==0)major=strtol(release,nullptr,10);
@@ -84,6 +89,9 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
     uint64_t m=[a[@"modified_ns"] unsignedLongLongValue],c=[a[@"changed_ns"] unsignedLongLongValue];
     r.modifyTime=(timespec){(time_t)(m/1000000000),(long)(m%1000000000)};
     r.changeTime=(timespec){(time_t)(c/1000000000),(long)(c%1000000000)};
+    uint64_t at=[a[@"accessed_ns"] unsignedLongLongValue],birth=[a[@"birth_ns"] unsignedLongLongValue];
+    r.accessTime=(timespec){(time_t)(at/1000000000),(long)(at%1000000000)};
+    r.birthTime=(timespec){(time_t)(birth/1000000000),(long)(birth%1000000000)};
     r.supportsLimitedXAttrs=YES;r.inhibitKernelOffloadedIO=YES;return r;
 }
 - (RevisionItem*)item:(FSItem*)item {
@@ -171,15 +179,15 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
         require(it!=_root || ![request isValid:FSItemAttributeMode] || request.mode==0700,EPERM,"mount root must remain private");
         NSString* mode=[request isValid:FSItemAttributeMode]?[@(request.mode) stringValue]:@"-";
         NSString* size=[request isValid:FSItemAttributeSize]?[@(request.size) stringValue]:@"-";
-        NSString* mtime=@"-";if([request isValid:FSItemAttributeModifyTime]){auto t=request.modifyTime;
-            require(t.tv_sec>=0 && t.tv_nsec>=0 && t.tv_nsec<1000000000 && uint64_t(t.tv_sec)<=uint64_t(INT64_MAX)/1000000000,EINVAL,"invalid modification time");
-            mtime=[@(uint64_t(t.tv_sec)*1000000000+t.tv_nsec) stringValue];}
+        NSString* mtime=[request isValid:FSItemAttributeModifyTime]?timestamp(request.modifyTime):@"-";
+        NSString* atime=[request isValid:FSItemAttributeAccessTime]?timestamp(request.accessTime):@"-";
+        NSString* birth=[request isValid:FSItemAttributeBirthTime]?timestamp(request.birthTime):@"-";
         // Only these attributes are persisted by the current inode schema.
         require((![request isValid:FSItemAttributeUID] || request.uid==_uid) && (![request isValid:FSItemAttributeGID] || request.gid==_gid),EPERM,"ownership changes are unsupported");
         require(![request isValid:FSItemAttributeType] && ![request isValid:FSItemAttributeLinkCount] && ![request isValid:FSItemAttributeAllocSize] && ![request isValid:FSItemAttributeFileID] && ![request isValid:FSItemAttributeParentID] && ![request isValid:FSItemAttributeChangeTime] && ![request isValid:FSItemAttributeBackupTime] && ![request isValid:FSItemAttributeAddedTime],ENOTSUP,"unsupported inode attributes");
-        require(![request isValid:FSItemAttributeFlags] && ![request isValid:FSItemAttributeAccessTime] && ![request isValid:FSItemAttributeBirthTime],ENOTSUP,"unsupported inode attributes");
-        it.attrs=[self json:@[@"inode-setattr",it.inode,mode,size,mtime,([request isValid:FSItemAttributeSize]?(it.writer?:@"-"):([self handle:it]?:@"-"))]];
-        request.consumedAttributes=([request isValid:FSItemAttributeUID]?FSItemAttributeUID:0)|([request isValid:FSItemAttributeGID]?FSItemAttributeGID:0)|([request isValid:FSItemAttributeMode]?FSItemAttributeMode:0)|([request isValid:FSItemAttributeSize]?FSItemAttributeSize:0)|([request isValid:FSItemAttributeModifyTime]?FSItemAttributeModifyTime:0);
+        require(![request isValid:FSItemAttributeFlags],ENOTSUP,"unsupported inode attributes");
+        it.attrs=[self json:@[@"inode-setattr-times",it.inode,mode,size,mtime,atime,birth,([request isValid:FSItemAttributeSize]?(it.writer?:@"-"):([self handle:it]?:@"-"))]];
+        request.consumedAttributes=([request isValid:FSItemAttributeUID]?FSItemAttributeUID:0)|([request isValid:FSItemAttributeGID]?FSItemAttributeGID:0)|([request isValid:FSItemAttributeMode]?FSItemAttributeMode:0)|([request isValid:FSItemAttributeSize]?FSItemAttributeSize:0)|([request isValid:FSItemAttributeModifyTime]?FSItemAttributeModifyTime:0)|([request isValid:FSItemAttributeAccessTime]?FSItemAttributeAccessTime:0)|([request isValid:FSItemAttributeBirthTime]?FSItemAttributeBirthTime:0);
         a=[self attributes:it];}];reply(a,e);
 }
 - (void)lookupItemNamed:(FSFileName*)name inDirectory:(FSItem*)directory replyHandler:(void(^)(FSItem*,FSFileName*,NSError*))reply {

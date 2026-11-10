@@ -89,7 +89,7 @@ command; write payload is binary. Reply payload starts with result code u32 LE
 (0 success, 1 generic error, or POSIX errno + 1 for typed errors) followed by raw result/error bytes. The format is experimental.
 Supported commands are `status`, `fs-init`, `fs-mkdir`, `fs-write`, `fs-cat`,
 `fs-xattr-list`, `fs-xattr-get`, `fs-xattr-set`, `fs-xattr-remove`,
-`fs-history`, `fs-diff`, `fs-ls`, `fs-stat`, `fs-read-at`, `fs-write-at`, `fs-append`, `fs-truncate`, `fs-link`, `fs-rename`, `fs-unlink`, `fs-rmdir`, `fs-check`,
+`fs-settimes`, `fs-history`, `fs-diff`, `fs-ls`, `fs-stat`, `fs-read-at`, `fs-write-at`, `fs-append`, `fs-truncate`, `fs-link`, `fs-rename`, `fs-unlink`, `fs-rmdir`, `fs-check`,
 `fs-compact`, `fs-snapshot`, `fs-fork`, `fs-restore`, `fs-worlds` and `fs-revisions`, with the
 same view selectors as offline commands. `fs-diff` and `fs-history` instead take
 explicit named revisions and reject view selectors. Revision writes remain forbidden.
@@ -261,7 +261,8 @@ that pair while paging. Responses fit the existing 1 MiB RPC frame even at the
 
 Entries report `path`, `change` (`added`, `removed`, `modified`), before/after inode
 IDs and types (null on the absent side), `metadata_changed` and `content_changed`.
-Metadata compares identity, type, mode, link count, size, mtime, ctime and xattrs;
+Metadata compares identity, type, mode, link count, size, mtime, ctime, atime,
+birth time and xattrs;
 `xattrs_changed` identifies changes to attribute names or values. Storage layout
 is excluded. Content compares logical bytes, including zero holes, without
 using size or timestamp equality as proof. Equal content/chunk object IDs skip
@@ -421,7 +422,7 @@ are 1..4096 bytes of valid UTF-8, component length at most 255 bytes; repeated s
 and dot components are supported inside targets. A target's trailing slash requires
 a directory. Ordinary external paths retain the prototype's strict path rules.
 
-Inode schema FFINOD01 adds type=3 without changing the 48-byte record size; its
+The original inode schema FFINOD01 added type=3 in its 48-byte record; its
 content object contains target bytes and size is target byte length. New lstat/stat
 JSON includes `symlink`. Revision/fork retain these objects through the same CoW
 tree. File handles open the resolved regular inode. Create through a dangling final
@@ -432,25 +433,52 @@ rule. Exclusive create rejects the existing link name, even when dangling.
 links. No lchmod, symlink handle or OS O_NOFOLLOW mapping is implemented. This World-local
 resolver does not constitute the OS/agent isolation boundary.
 
-## Mode and modification time
+## Mode and timestamps
 
-Path commands are `fs-chmod PATH OCTAL_MODE` and `fs-setmtime PATH NANOSECONDS`.
-CLI and RPC both accept them; RPC also offers `fs-hchmod HANDLE OCTAL_MODE` and
-`fs-hsetmtime HANDLE NANOSECONDS` with the owning session/view. The C++ attribute
-API can set mode and mtime atomically in one call.
+Path commands include `fs-chmod PATH OCTAL_MODE`, `fs-setmtime PATH NANOSECONDS`
+and `fs-settimes PATH ATIME MTIME BIRTH`. CLI commands take CONTAINER before
+PATH; RPC commands omit it. A dash (`-`) leaves an individual time unchanged:
 
-Modes use octal digits (for example 755 or 0755), limited to 0000..0777. Mtime is
-nanoseconds since Unix epoch in 0..INT64_MAX; zero is supported. Updates change
-ctime, preserve inode identity/content/size, and publish only inode metadata.
-Chmod preserves mtime. Hardlinks and existing handles see the same attributes;
-World/revision sharing remains isolated. Path changes follow symlinks. Directory
-attributes and unlinked regular-file handle attributes are supported. Live
-read-only handles can set attributes through this owner control API; revision
-handles cannot. An empty C++ change set is a no-op after view/handle validation.
+```sh
+forkfsd fs-settimes project.forkfs /file 123456789 234567890 -
+forkfsd request /private/runtime/control.sock fs-settimes /file - - 100000000
+```
 
-This stores executable/permission bits; Unix access permission checks, ownership,
-ACLs, setuid/sticky bits, atime, negative timestamps and symlink lchmod are not
-implemented. OS setattr/fchmod/utimens mappings remain future work.
+RPC also provides session-owned `fs-hchmod`, `fs-hsetmtime` and
+`fs-hsettimes HANDLE ATIME MTIME BIRTH`, including open-unlinked regular files.
+The C++ attribute API sets mode, size, mtime, atime and birth time atomically.
+All requested fields are validated before any mutation. The FSKit adapter uses
+`inode-setattr-times INODE MODE SIZE MTIME ATIME BIRTH HANDLE`, where unchanged
+fields and an absent handle use `-`. The older `inode-setattr` operation remains
+available for existing clients. Inode RPC calls require a mounted session.
+
+Modes are octal 0000..0777. Times are integer nanoseconds since the Unix epoch in
+0..INT64_MAX, including zero. New inodes initialize atime and birth time when
+created. Metadata updates advance ctime; content/size changes advance mtime,
+while atime and birth time remain stable unless explicitly set. Ordinary reads,
+stat and directory enumeration do not update atime or create commits (a noatime
+policy), including immutable revision reads. Birth time is owner-editable
+metadata, not an audit record.
+
+Hardlinks and existing handles see the same attributes; Worlds and immutable
+revisions remain isolated. Path changes follow final symlinks. Directory and
+unlinked regular-file handle attributes are supported. Live read-only access
+handles may set owner metadata; revision handles cannot. An all-dash change is
+a no-op after view/handle validation. Negative timestamps, symlink timestamp
+mutation, uid/gid changes, ACLs, setuid/sticky bits and multi-user permission
+enforcement remain unsupported.
+
+Inode records now use the 64-byte `FFINOD02` format. Bytes 8..47 retain the
+original type, mode, links, size, mtime and ctime layout; bytes 48..55 and 56..63
+hold little-endian atime and birth time. The daemon still reads 48-byte
+`FFINOD01` records, using their mtime as the initial atime and ctime as the
+initial birth time. Those fallback values do not recover historical creation
+times. A normal metadata mutation upgrades only the inode being written; its
+fallback times are then persisted. Old revision roots remain unchanged and
+mixed-format views are supported, including GC and the single-file backend.
+Older daemons reject the new record size/magic; upgraded views require this
+daemon even after the last xattr is removed. No in-place whole-store migration
+or downgrade is provided.
 
 ## Directory pages
 
@@ -1040,9 +1068,10 @@ Commands use inode identities, never host World paths: `inode-lookup PARENT NAME
 `inode-link INODE PARENT NAME`, `inode-remove PARENT NAME EXPECTED_INODE file|directory`,
 `inode-rename SOURCE_PARENT SOURCE_NAME DEST_PARENT DEST_NAME EXPECTED_INODE EXPECTED_DEST_OR_DASH`,
 `inode-setattr INODE MODE_OR_DASH SIZE_OR_DASH MTIME_NS_OR_DASH HANDLE_OR_DASH`,
+`inode-setattr-times INODE MODE SIZE MTIME ATIME BIRTH HANDLE`,
 `inode-space`, and `inode-sync`. All require `--session`; the mount must keep the
 same World/revision selector. Modes are decimal 0000..0777. Setattr publishes
-size/content and mode/mtime in one synchronous transaction; handle size changes
+size/content, mode and mtime/atime/birth time in one synchronous transaction; handle size changes
 require writable access. Subsequent I/O uses the existing session-owned `fs-h*`
 operations, preserving open-unlink behavior. Session loss is terminal for a mount.
 

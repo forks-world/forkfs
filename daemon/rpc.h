@@ -10,6 +10,7 @@ namespace forkfs {
 class Container;
 inline int rpc_posix_error(std::string_view message) {
     if(message=="RPC timeout")return ETIMEDOUT;
+    if(message=="mtime exceeds supported nanosecond range" || message=="atime exceeds supported nanosecond range" || message=="birth time exceeds supported nanosecond range")return EINVAL;
     if(message=="RPC connect failed" || message=="RPC connection failed" || message=="RPC send failed" || message=="truncated RPC reply")return ENOTCONN;
     if(message=="extended attribute not found"){
 #ifdef __APPLE__
