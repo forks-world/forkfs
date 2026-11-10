@@ -305,7 +305,7 @@ listing is described below.
 
 ## Inode handles and open-unlink
 
-The LevelDB backend supports existing regular-file handles through the C++ API
+The LevelDB backend supports regular-file and symlink metadata handles through the C++ API
 and resident RPC. RPC requires a session (see below).
 `fs-open PATH MODE --session SESSION` returns a random opaque token. MODE is
 `r`, `w` or `rw`, optionally followed by comma-separated `create`, `exclusive`
@@ -347,6 +347,32 @@ or explicit close. A lost open reply consumes a handle slot until session releas
 Handle tokens do not survive restart and are scoped to a session and view. Directory handles,
 mmap and OS integration remain
 unimplemented. The legacy single-file backend does not offer the handle API.
+
+Symlink metadata handles use `OpenOptions::symlink` or the RPC open flag
+`fs-open PATH r|w|rw,symlink`. The final symlink is opened without traversing its
+target; prefix directory links still resolve. This also works on dangling and
+cyclic links. On a regular file the flag opens the ordinary file. It cannot be
+combined with create, truncate, append or nofollow; invalid combinations fail
+before publication. The flag does not implement symlink creation via open.
+`inode-open` opens the explicitly identified symlink as a metadata handle, and
+the FSKit adapter supports native O_SYMLINK descriptors.
+
+These handles provide stat, xattr and mode/time operations on the symlink itself.
+Readonly data-access handles can change owner metadata; immutable revision
+handles cannot. Reading or writing file data, including empty requests, fails
+with EPERM; the target text and referenced file are unchanged. Symlink size
+attribute updates fail with EINVAL. Ordinary opens continue to follow final
+symlinks, and the existing nofollow flag continues to reject them. Seek/dup use
+the normal open-description lifetime; seeking does not enable data I/O.
+
+Final unlink or rename replacement moves a live symlink's inode, immutable
+link-text object and xattrs into orphan roots atomically. Existing descriptors
+retain that identity across path reuse, while snapshot/fork omit the orphan.
+Dup, writer-to-reader downgrade, session expiry and last close use the same
+retention machinery as regular files. Verification checks orphan link targets;
+restart releases stale handles and orphan roots before serving. GC, World
+restore and retention keep their existing open-handle guards. No persistent
+inode or wire-format version change is needed; handles remain LevelDB-only.
 
 Atomic open options are available through `Namespace::OpenOptions` and RPC:
 
@@ -431,8 +457,9 @@ intermediate directories to exist. Whole-file write follows the same creation
 rule. Exclusive create rejects the existing link name, even when dangling.
 `nofollow` rejects a final symlink before mutation but permits prefix directory
 links. Attribute setters can instead update the final entry through `fs-lchmod`
-and `fs-lsettimes`, including dangling links. Symlink file handles and the OS
-O_SYMLINK/O_NOFOLLOW open mappings remain unsupported. This World-local resolver
+and `fs-lsettimes`, including dangling links. Native O_SYMLINK descriptors use
+metadata handles; symlink data I/O and the general OS O_NOFOLLOW mapping remain
+unsupported. This World-local resolver
 does not constitute the OS/agent isolation boundary.
 
 ## Mode and timestamps
@@ -473,7 +500,7 @@ regular files and directories. Both inode setattr RPCs always update the inode
 identified by the caller, including a symlink, without following it. Symlink
 size changes fail with EINVAL, even for the existing length, before any requested
 mode or time can change. Directory and
-unlinked regular-file handle attributes are supported. Live read-only access
+unlinked regular-file and symlink-metadata handle attributes are supported. Live read-only access
 handles may set owner metadata; revision handles cannot. An all-dash change is
 a no-op after view/handle validation. Negative timestamps, uid/gid changes,
 ACLs, setuid/sticky bits and multi-user permission

@@ -13,6 +13,7 @@ import os
 import plistlib
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tempfile
 import uuid
@@ -138,14 +139,41 @@ try:
     link_metadata=json.loads(rpc('fs-lstat',namespace+'/symlink'))
     assert link_metadata['mode']==0o701 and [link_metadata[k] for k in ['accessed_ns','modified_ns','birth_ns']]==[link_atime,link_mtime,link_birth]
     assert json.loads(rpc('fs-stat',namespace+'/file'))==target_before
+    retained_link_fd=os.open(link,os.O_RDONLY|0x00200000)
+    try:
+        setxattr(retained_link_fd,'user.link-retained',b'retained\0link\xff')
+        assert getxattr(retained_link_fd,'user.link-retained')==b'retained\0link\xff'
+    finally:os.close(retained_link_fd)
     dangling=root/'dangling-attrs';copied=root/'copied-link';os.symlink('missing-target',dangling)
     subprocess.run(['/usr/bin/touch','-h',str(dangling)],check=True)
     os.utime(dangling,ns=(link_atime,link_mtime),follow_symlinks=False)
-    subprocess.run(['/bin/cp','-PpX',str(dangling),str(copied)],check=True)
-    assert os.readlink(copied)=='missing-target' and copied.lstat().st_mtime_ns==dangling.lstat().st_mtime_ns
+    metadata_fd=os.open(dangling,os.O_RDWR|0x00200000) # O_SYMLINK from Darwin sys/fcntl.h
+    duplicate_fd=-1
+    try:
+        assert stat.S_ISLNK(os.fstat(metadata_fd).st_mode)
+        setxattr(metadata_fd,'user.link-fd',b'link\0metadata\xff')
+        os.fchmod(metadata_fd,0o701);os.utime(metadata_fd,ns=(link_atime,link_mtime))
+        rejects(lambda:os.read(metadata_fd,1),errno.EPERM)
+        rejects(lambda:os.write(metadata_fd,b'x'),errno.EPERM)
+        rejects(lambda:os.ftruncate(metadata_fd,0),errno.EINVAL)
+        subprocess.run(['/bin/cp','-Pp',str(dangling),str(copied)],check=True)
+        assert os.readlink(copied)=='missing-target' and copied.lstat().st_mtime_ns==dangling.lstat().st_mtime_ns
+        copied_fd=os.open(copied,os.O_RDONLY|0x00200000)
+        try:
+            assert getxattr(copied_fd,'user.link-fd')==b'link\0metadata\xff'
+        finally:os.close(copied_fd)
+        os.unlink(dangling);os.symlink('replacement-target',dangling)
+        assert os.fstat(metadata_fd).st_nlink==0 and getxattr(metadata_fd,'user.link-fd')==b'link\0metadata\xff'
+        setxattr(metadata_fd,'user.link-fd',b'orphan-link');os.utime(metadata_fd,ns=(1,2))
+        duplicate_fd=os.dup(metadata_fd);os.close(metadata_fd);metadata_fd=-1
+        assert getxattr(duplicate_fd,'user.link-fd')==b'orphan-link' and os.fstat(duplicate_fd).st_mtime_ns==2
+        assert os.readlink(dangling)=='replacement-target';rpc('fs-check')
+    finally:
+        if metadata_fd>=0:os.close(metadata_fd)
+        if duplicate_fd>=0:os.close(duplicate_fd)
     assert not (root/'missing-target').exists();os.unlink(copied);os.unlink(dangling)
-    report['symlink_attributes']={'mode':0o701,'accessed_ns':link_atime,'modified_ns':link_mtime,'birth_ns':link_birth,'target_unchanged':True,'dangling_touch_h':True,'dangling_cp_PpX':True}
-    report['checks'].append('nofollow symlink times/mode/birth, target isolation, dangling touch -h and cp -PpX')
+    report['symlink_attributes']={'mode':0o701,'accessed_ns':link_atime,'modified_ns':link_mtime,'birth_ns':link_birth,'target_unchanged':True,'dangling_touch_h':True,'dangling_cp_Pp':True,'copied_binary_xattr':True,'fd_open_unlink_dup':True,'data_read_write_errno':'EPERM','truncate_errno':'EINVAL'}
+    report['checks'].append('nofollow metadata, O_SYMLINK fds, cp -Pp binary xattrs and open-unlink/dup identity')
     if args.checkpoint:
         revision='mount_accept_'+uuid.uuid4().hex[:12]
         rpc('fs-snapshot',revision)
