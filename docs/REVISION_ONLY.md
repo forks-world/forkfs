@@ -10,10 +10,14 @@ Historical source and design documents remain for reference. Old binary/store
 migration is not implemented, and no command silently opens an old World store
 as a revision repository.
 
-Future diff compares explicit revision roots. Equal subtree IDs permit skipping
-subtrees; equal content IDs prove byte identity; metadata is compared separately.
-Size, timestamps and event observations never prove content equality. Comparing
-a mutable World must first capture a committed root under the transaction lock.
+`fs-diff` compares two explicit immutable revision roots and returns paged path
+changes. Equal manifest IDs skip identical namespaces, and equal content/chunk
+IDs prove byte identity; metadata is compared separately. Inline/chunked layout
+differences and sparse holes are compared as bounded logical byte ranges when
+object identity alone is insufficient. Size, timestamps and event observations
+never prove content equality. Comparing a mutable World requires an explicit
+`fs-snapshot` first; diff never silently selects a World or scans host files.
+See [command semantics and pagination](../daemon/README.md#revision-diff).
 
 Future history exposes committed revisions and parent relationships, rather than
 claiming that observing an external directory captures every write. The new optional FSKit frontend operates through the resident daemon RPC and

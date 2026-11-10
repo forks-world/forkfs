@@ -22,6 +22,7 @@ public:
     Bytes get(const std::string& key) const;
     std::vector<std::string> keys(const std::string& prefix) const;
     Map references() const;
+    std::optional<ObjectId> reference(const std::string& key) const {return lookup(key);}
     bool legacy() const {return legacy_;}
     size_t run_count() const {return tree_?1:runs_.size();}
     Plan plan(const Changes& changes,bool compact=false) const;

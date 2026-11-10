@@ -88,9 +88,58 @@ count u32 LE (1..16), then length u32 LE + bytes for each field. First field is 
 command; write payload is binary. Reply payload starts with result code u32 LE
 (0 success, 1 generic error, or POSIX errno + 1 for typed errors) followed by raw result/error bytes. The format is experimental.
 Supported commands are `status`, `fs-init`, `fs-mkdir`, `fs-write`, `fs-cat`,
-`fs-ls`, `fs-stat`, `fs-read-at`, `fs-write-at`, `fs-append`, `fs-truncate`, `fs-link`, `fs-rename`, `fs-unlink`, `fs-rmdir`, `fs-check`,
+`fs-diff`, `fs-ls`, `fs-stat`, `fs-read-at`, `fs-write-at`, `fs-append`, `fs-truncate`, `fs-link`, `fs-rename`, `fs-unlink`, `fs-rmdir`, `fs-check`,
 `fs-compact`, `fs-snapshot`, `fs-fork`, `fs-worlds` and `fs-revisions`, with the
-same view selectors as offline commands. Revision writes remain forbidden.
+same view selectors as offline commands. `fs-diff` instead takes two explicit
+revision names and rejects view selectors. Revision writes remain forbidden.
+
+## Revision diff
+
+```sh
+forkfsd fs-snapshot project.forkfs before
+# Edit main (or snapshot a selected World with --world NAME).
+forkfsd fs-snapshot project.forkfs after
+forkfsd fs-diff project.forkfs before after
+forkfsd fs-diff project.forkfs before after /last-returned-path 16
+forkfsd request /private/runtime/control.sock fs-diff before after '' 64
+```
+
+Offline syntax is `fs-diff CONTAINER BEFORE_REVISION AFTER_REVISION [AFTER_PATH
+LIMIT]`; RPC syntax is `fs-diff BEFORE_REVISION AFTER_REVISION AFTER_PATH LIMIT`.
+Both names must exist in the revision registry. World names and `--world` or
+`--revision` selectors are not accepted as substitutes. Snapshot a World
+explicitly before comparing it. Diff does not publish a revision or change the
+repository. The response identifies both revision object IDs.
+
+Each JSON response contains `changes`, `next_after` and `eof`. A page has at most
+LIMIT entries (default and maximum 64, minimum 1), ordered by original UTF-8 path
+bytes, including `/` when root metadata changes. Pass `next_after` as the exclusive
+AFTER_PATH for the next page while `eof` is false. The final page has an empty
+`next_after`. Cursors are path positions within the chosen revision pair; retain
+that pair while paging. Responses fit the existing 1 MiB RPC frame even at the
+4096-byte path limit. Paths exceeding that supported limit fail explicitly.
+
+Entries report `path`, `change` (`added`, `removed`, `modified`), before/after inode
+IDs and types (null on the absent side), `metadata_changed` and `content_changed`.
+Metadata compares identity, type, mode, link count, size, mtime and ctime; storage
+layout is excluded. Content compares logical bytes, including zero holes, without
+using size or timestamp equality as proof. Equal content/chunk object IDs skip
+byte reads. Distinct storage representations compare in chunks of at most 64 KiB.
+Added/removed entries have metadata changes and content changes for non-directories;
+directories have no file content. Type changes also count as content changes when
+one side is a non-directory.
+
+Symlinks compare their stored targets and are never followed, including dangling
+links or cycles. Each hardlink path is reported independently. A rename appears
+as removal/addition, with stable inode IDs available for correlation; diff does
+not infer renames or emit text patches. Directory removal/addition includes its
+descendant paths. This is not an integrity check: use `check` and `fs-check` to
+validate object/namespace integrity.
+
+The first implementation skips an identical manifest and matching file/chunk
+objects, but otherwise walks the namespace. Stateless pages repeat that traversal;
+large-tree performance and subtree-level traversal pruning are not qualified.
+Diff executes under the daemon's namespace lock and can delay other requests.
 
 Offset commands are `fs-read-at PATH OFFSET COUNT`,
 `fs-write-at PATH OFFSET INPUT_FILE`, `fs-append PATH INPUT_FILE` and

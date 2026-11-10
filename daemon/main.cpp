@@ -158,6 +158,7 @@ int main(int argc, char** argv) {
                          "forkfsd fs-write CONTAINER PATH INPUT_FILE\n"
                          "forkfsd fs-save CONTAINER PATH INPUT_FILE\n"
                          "forkfsd fs-cat CONTAINER PATH\n"
+                         "forkfsd fs-diff CONTAINER BEFORE_REVISION AFTER_REVISION [AFTER_PATH LIMIT]\n"
                          "forkfsd fs-read-at CONTAINER PATH OFFSET COUNT\n"
                          "forkfsd fs-write-at CONTAINER PATH OFFSET INPUT_FILE\n"
                          "forkfsd fs-append CONTAINER PATH INPUT_FILE\n"
@@ -183,6 +184,7 @@ int main(int argc, char** argv) {
                          "forkfsd fs-revisions CONTAINER\n"
                          "fs-* read commands accept --world NAME or --revision NAME.\n"
                          "fs-* write commands accept --world NAME.\n"
+                         "fs-diff takes two explicit revisions and accepts no view selector.\n"
                          "forkfsd fs-compact CONTAINER [--world WORLD]\n"
                          "forkfsd fs-layout CONTAINER [--world WORLD | --revision REVISION]\n"
                          "LevelDB directory backend; experimental namespace, no OS mount yet.\n";
@@ -207,7 +209,7 @@ int main(int argc, char** argv) {
         if(command=="fs-init" || command=="fs-check" || command=="fs-worlds" || command=="fs-revisions" || command=="fs-compact" || command=="fs-layout")base_argc=3;
         if(command=="fs-write" || command=="fs-save" || command=="fs-link" || command=="fs-rename" || command=="fs-fork" || command=="fs-append" || command=="fs-truncate" || command=="fs-symlink" || command=="fs-chmod" || command=="fs-setmtime")base_argc=5;
         if(command=="fs-read-at" || command=="fs-write-at")base_argc=6;
-        if(command.starts_with("fs-") && argc==base_argc+2) {
+        if(command!="fs-diff" && command.starts_with("fs-") && argc==base_argc+2) {
             std::string selector=argv[argc-2];
             if(selector=="--world" || selector=="--revision") {
                 view=argv[argc-1];revision_view=selector=="--revision";argc-=2;
@@ -257,7 +259,12 @@ int main(int argc, char** argv) {
             if (!std::cout) throw std::runtime_error("cannot write object output");
         } else if (command.starts_with("fs-")) {
             forkfs::Container container(argv[2]);forkfs::Namespace fs(container,view,revision_view);
-            if(command=="fs-compact" && argc==3) fs.compact();
+            if(command=="fs-diff" && (argc==5 || argc==7)) {
+                auto limit=argc==7?file_number(argv[6]):uint64_t(64);
+                if(limit<1 || limit>64)throw std::runtime_error("invalid diff page limit; expected 1..64");
+                std::cout<<fs.diff(argv[3],argv[4],argc==7?argv[5]:"",static_cast<size_t>(limit));return 0;
+            }
+            else if(command=="fs-compact" && argc==3) fs.compact();
             else if(command=="fs-layout" && argc==3) {
                 if(container.storage_engine()=="leveldb") {fs.stat("/");std::cout<<"{\"layout\":\"cow-tree\",\"storage_engine\":\"leveldb\"}\n";return 0;}
                 auto runs=fs.run_count();std::cout<<"{\"runs\":"<<runs<<",\"layout\":\""<<(runs?"sorted-runs":"flat")<<"\"}\n";return 0;
