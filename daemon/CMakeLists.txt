@@ -51,6 +51,9 @@ target_compile_definitions(forkfsd_legacy_test PRIVATE FORKFS_LEGACY_DEFAULT=1)
 add_executable(forkfsd ${FORKFS_NORMAL_OBJECTS})
 target_compile_options(forkfsd PRIVATE -Wall -Wextra -Wpedantic)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME forkfsd_revision_diff COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/revision_diff.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_revision_diff PROPERTIES TIMEOUT 120)
 add_test(NAME forkfsd_unicode_paths COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/unicode_paths.py $<TARGET_FILE:forkfsd>)
 set_tests_properties(forkfsd_unicode_paths PROPERTIES TIMEOUT 120)

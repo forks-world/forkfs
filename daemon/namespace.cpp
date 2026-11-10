@@ -350,6 +350,71 @@ void Namespace::commit_changes(const NamespaceView& view,Changes& changes) {
     journal.transact(journal.sequence(),batch);
 }
 
+std::string Namespace::diff(const std::string& before,const std::string& after,const std::string& after_path,size_t limit) const {
+    need(limit>=1 && limit<=64,"invalid diff page limit; expected 1..64");
+    if(!after_path.empty())components(after_path);
+    valid_view_name(before);valid_view_name(after);
+    std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;
+    auto before_manifest=revision_manifest(journal,before),after_manifest=revision_manifest(journal,after);
+    NamespaceView left(journal,before_manifest),right(journal,after_manifest);
+    auto quote=[](const std::string& value){std::string result="\"";for(char c:value){if(c=='"' || c=='\\')result+='\\';result+=c;}return result+'"';};
+    auto type=[&](const std::optional<InodeInfo>& n){return n?quote(n->directory?"directory":n->symlink?"symlink":"file"):std::string("null");};
+    auto identity=[&](const std::optional<InodeInfo>& n){return n?quote(n->id):std::string("null");};
+    auto same_metadata=[](const InodeInfo& a,const InodeInfo& b){return a.id==b.id && a.directory==b.directory && a.symlink==b.symlink &&
+        a.mode==b.mode && a.links==b.links && a.size==b.size && a.modified_ns==b.modified_ns && a.changed_ns==b.changed_ns;};
+    auto same_content=[&](InodeInfo& a,InodeInfo& b){
+        if(a.directory || b.directory)return a.directory==b.directory;
+        if(a.symlink!=b.symlink || a.size!=b.size)return false;
+        need(a.size<=maximum_file_size,"invalid file size");
+        // Equal object IDs prove byte equality, independently of inode metadata.
+        if(!a.chunked && !b.chunked){auto a_ref=left.reference(content_key(a.id)),b_ref=right.reference(content_key(b.id));
+            need(a_ref.has_value() && b_ref.has_value(),"inode content missing");if(a_ref==b_ref)return true;}
+        FileContent a_data(a,left),b_data(b,right);
+        for(uint64_t offset=0;offset<a.size;offset+=64*1024) {
+            if(a.chunked && b.chunked){auto suffix=std::to_string(offset/(64*1024));suffix=std::string(4-suffix.size(),'0')+suffix;
+                if(left.reference(prefix+"chunk/"+a.id+"/"+suffix)==right.reference(prefix+"chunk/"+b.id+"/"+suffix))continue;}
+            // Inline and chunked representations (or distinct chunk objects)
+            // are compared as bounded logical byte ranges, including zero holes.
+            if(a_data.read(offset,64*1024)!=b_data.read(offset,64*1024))return false;
+        }
+        return true;
+    };
+    std::vector<std::string> changes;std::string last;bool eof=true;
+    if(before_manifest!=after_manifest) {
+        using Pair=std::pair<std::string,std::string>;
+        std::map<std::string,Pair> pending{{"/",{root(left),root(right)}}};std::set<std::string> left_dirs,right_dirs;
+        while(!pending.empty()) {
+            auto entry=pending.extract(pending.begin());auto path=std::move(entry.key());auto [a_id,b_id]=std::move(entry.mapped());
+            std::optional<InodeInfo> a=a_id.empty()?std::nullopt:std::optional(inode(left,a_id));
+            std::optional<InodeInfo> b=b_id.empty()?std::nullopt:std::optional(inode(right,b_id));
+            if(path>after_path){bool metadata=!a || !b || !same_metadata(*a,*b);
+                bool content=!a? !b->directory:!b? !a->directory:!same_content(*a,*b);
+                if(metadata || content) {
+                    if(changes.size()==limit){eof=false;break;}
+                    changes.push_back("{\"path\":"+quote(path)+",\"change\":"+quote(!a?"added":!b?"removed":"modified")+
+                        ",\"before_inode\":"+identity(a)+",\"after_inode\":"+identity(b)+
+                        ",\"before_type\":"+type(a)+",\"after_type\":"+type(b)+
+                        ",\"metadata_changed\":"+(metadata?"true":"false")+",\"content_changed\":"+(content?"true":"false")+"}");last=path;
+                }
+            }
+            auto children=[&](const NamespaceView& view,const std::optional<InodeInfo>& n,std::set<std::string>& visited,bool old){
+                if(!n || !n->directory)return;
+                need(visited.insert(n->id).second,"directory cycle or hardlink");auto pre=directory_prefix(n->id);
+                for(const auto& key:view.keys(pre)) {
+                    auto name=key.substr(pre.size());auto parsed=components("/"+name);need(parsed.size()==1,"invalid directory name");
+                    auto child_path=path=="/"?path+name:path+"/"+name;need(child_path.size()<=4096,"path exceeds mount protocol limit");
+                    auto& pair=pending[child_path];(old?pair.first:pair.second)=decode_id(view.get(key));
+                }
+            };
+            children(left,a,left_dirs,true);children(right,b,right_dirs,false);
+        }
+    }
+    std::string result="{\"before_revision_id\":"+quote(hex_id(journal.root_object(history+"revision/"+before)))+
+        ",\"after_revision_id\":"+quote(hex_id(journal.root_object(history+"revision/"+after)))+",\"changes\":[";
+    for(size_t i=0;i<changes.size();++i){if(i)result+=',';result+=changes[i];}
+    return result+"],\"next_after\":"+quote(eof?"":last)+",\"eof\":"+(eof?"true":"false")+"}\n";
+}
+
 std::string Namespace::snapshot(const std::string& name) {
     valid_view_name(name);need(!revision_,"revision view is read-only");
     std::lock_guard lock(container_.mutex_);auto& j=*container_.journal_;

@@ -35,6 +35,9 @@ public:
     struct OpenOptions {bool create=false,exclusive=false,truncate=false;uint32_t mode=0644;bool append=false,nofollow=false;};
     explicit Namespace(Container& container,std::string view="main",bool revision=false)
         :container_(container),view_(std::move(view)),revision_(revision) {}
+    // Stateless page over two immutable revisions with an exclusive path cursor.
+    std::string diff(const std::string& before,const std::string& after,
+                     const std::string& after_path="",size_t limit=64) const;
     std::string snapshot(const std::string& name);
     void fork(const std::string& revision,const std::string& world);
     std::vector<std::string> worlds() const;

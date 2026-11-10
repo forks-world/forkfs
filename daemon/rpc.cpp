@@ -133,7 +133,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="inode-stat" || op=="inode-dir-open" || op=="inode-readlink")count=2;
     if(op=="inode-lookup" || op=="inode-open")count=3;
     if(op=="inode-create" || op=="inode-mkdir" || op=="inode-symlink" || op=="inode-link")count=4;
-    if(op=="inode-remove")count=5;
+    if(op=="inode-remove" || op=="fs-diff")count=5;
     if(op=="inode-setattr")count=6;
     if(op=="inode-rename")count=7;
     uint32_t creation_mode=0644;
@@ -150,6 +150,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         args.resize(args.size()-2);
     }
     need(args.size()==count,"invalid RPC command arguments");
+    need(op!="fs-diff" || !selected_view,"invalid view selector for revision diff");
     for(size_t i=0;i<args.size();++i)if(!(((op=="fs-write" || op=="fs-save" || op=="fs-append" || op=="fs-happend" || op=="fs-hwrite-next") && i==2) || ((op=="fs-write-at" || op=="fs-hwrite") && i==3)))need(args[i].find('\0')==std::string::npos,"NUL in RPC argument");
     if(op=="session-open") {
         auto lease=number(args[1]);auto token=sessions.create(lease);
@@ -168,7 +169,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     if(op=="status")return store.status();
     if(op=="storage-profile")return store.storage_profile();
-    static const std::set<std::string> reads{"fs-cat","fs-read-at","fs-ls","fs-stat","fs-lstat","fs-readlink","fs-check","fs-worlds","fs-revisions","fs-snapshot","fs-fork",
+    static const std::set<std::string> reads{"fs-diff","fs-cat","fs-read-at","fs-ls","fs-stat","fs-lstat","fs-readlink","fs-check","fs-worlds","fs-revisions","fs-snapshot","fs-fork",
         "fs-hstat","fs-hread","fs-hread-next","fs-hseek","fs-close","fs-dup","fs-hlock","fs-hrange-lock","fs-dir-open","fs-dir-page","fs-dir-entries","fs-dir-rewind","fs-dir-close"};
     sessions.authorize(session_token,view,revision,!reads.contains(op));
     if(op.starts_with("inode-") && op!="inode-root")sessions.mount_require(session_token,view,revision);
@@ -239,6 +240,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         else for(const auto& name:page.names){if(!first)result+=',';first=false;result+=quoted(name);}
         return result+"],\"eof\":"+(page.eof?"true":"false")+"}\n";
     }
+    if(op=="fs-diff"){auto limit=number(args[4]);need(limit>=1 && limit<=64,"invalid diff page limit; expected 1..64");return fs.diff(args[1],args[2],args[3],static_cast<size_t>(limit));}
     if(op=="fs-cat"){auto b=fs.read(args[1]);return std::string(b.begin(),b.end());}
     if(op=="fs-read-at"){auto b=fs.read_at(args[1],number(args[2]),number(args[3]));return std::string(b.begin(),b.end());}
     if(op=="fs-open") {
