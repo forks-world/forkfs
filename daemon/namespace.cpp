@@ -276,7 +276,7 @@ public:
         for(const auto& key:keys_(chunks_)) {
             auto suffix=key.substr(chunks_.size());need(suffix.size()==4 && std::all_of(suffix.begin(),suffix.end(),[](char c){return c>='0'&&c<='9';}),"invalid file chunk key");
             auto index=std::stoull(suffix);need(index<Namespace::maximum_file_size/chunk_size && key==chunk_key(index) && index*chunk_size<n_.size,"file chunk beyond EOF");
-            auto data=get(key);need(!data.empty() && data.size()<=std::min(chunk_size,n_.size-index*chunk_size) && data.back()!=0,"invalid file chunk");
+            auto data=get(key);need(!data.empty() && data.size()<=std::min<uint64_t>(chunk_size,n_.size-index*chunk_size) && data.back()!=0,"invalid file chunk");
         }
     }
 };
