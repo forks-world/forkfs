@@ -36,6 +36,11 @@ removal. They preserve immutable ancestry and all surviving roots; physical GC
 can reclaim an abandoned branch after its last retaining root is removed.
 `main` is protected. No automatic retention or ancestry rewriting is provided.
 
+Inode atime and birth time are stored in revision metadata, alongside mtime and
+ctime, and participate in revision diff, fork, restore and physical GC. Reads
+follow a noatime policy. Old inode records remain readable; mutations upgrade
+the affected record to FFINOD02, which older daemons reject.
+
 The new optional FSKit frontend operates through the resident daemon RPC and
 revision-backed namespace; see [FSKit integration](FSKIT.md). Git and
 execution integration remain unavailable until revision-backed replacements exist.

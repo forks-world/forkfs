@@ -49,7 +49,8 @@ std::string quoted(const std::string& value){
 std::string inode_json(const InodeInfo& n){
     std::ostringstream out;out<<"{\"inode_id\":\""<<n.id<<"\",\"directory\":"<<(n.directory?"true":"false")
         <<",\"symlink\":"<<(n.symlink?"true":"false")<<",\"mode\":"<<n.mode<<",\"links\":"<<n.links<<",\"size\":"<<n.size
-        <<",\"modified_ns\":"<<n.modified_ns<<",\"changed_ns\":"<<n.changed_ns<<"}";return out.str();
+        <<",\"modified_ns\":"<<n.modified_ns<<",\"changed_ns\":"<<n.changed_ns
+        <<",\"accessed_ns\":"<<n.accessed_ns<<",\"birth_ns\":"<<n.birth_ns<<"}";return out.str();
 }
 std::string random_token(){
     int fd=open("/dev/urandom",O_RDONLY|O_CLOEXEC);need(fd>=0,"session entropy unavailable");
@@ -140,6 +141,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="inode-create" || op=="inode-mkdir" || op=="inode-symlink" || op=="inode-link")count=4;
     if(op=="inode-remove" || op=="fs-diff")count=5;
     if(op=="inode-setattr")count=6;
+    if(op=="inode-setattr-times")count=8;
+    if(op=="fs-settimes" || op=="fs-hsettimes")count=5;
     if(op=="inode-rename")count=7;
     if(op=="fs-xattr-get" || op=="fs-xattr-remove" || op=="fs-hxattr-get" || op=="fs-hxattr-remove" || op=="inode-xattr-get" || op=="inode-xattr-remove")count=3;
     if(op=="fs-xattr-set" || op=="fs-hxattr-set" || op=="inode-xattr-set")count=5;
@@ -221,12 +224,14 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         else {bool missing=false;try{(void)fs.lstat(target);}catch(const std::runtime_error& e){if(std::string_view(e.what())=="path not found")missing=true;else throw;}
             need(missing,"target already exists");}
         fs.rename(source,target);return inode_json(fs.lstat(target));
-    } else if(op=="inode-setattr") {
+    } else if(op=="inode-setattr" || op=="inode-setattr-times") {
         Namespace::Attributes a;if(args[2]!="-"){auto mode=number(args[2]);need(mode<=0777,"unsupported mode bits");a.mode=static_cast<uint32_t>(mode);}
         if(args[3]!="-")a.size=number(args[3]);if(args[4]!="-")a.modified_ns=number(args[4]);
-        if(args[5]!="-") {
-            need(activity.session->handles.contains(args[5]),"handle belongs to another session");
-            need(fs.handle_stat(args[5]).id==args[1],"invalid inode/handle pairing");fs.handle_set_attributes(args[5],a);return inode_json(fs.handle_stat(args[5]));
+        size_t handle_index=5;
+        if(op=="inode-setattr-times"){if(args[5]!="-")a.accessed_ns=number(args[5]);if(args[6]!="-")a.birth_ns=number(args[6]);handle_index=7;}
+        if(args[handle_index]!="-") {
+            const auto& handle=args[handle_index];need(activity.session->handles.contains(handle),"handle belongs to another session");
+            need(fs.handle_stat(handle).id==args[1],"invalid inode/handle pairing");fs.handle_set_attributes(handle,a);return inode_json(fs.handle_stat(handle));
         }
         auto path=fs.path_for_inode(args[1]);need(!fs.lstat(path).symlink,"symbolic link attributes are unsupported");
         fs.set_attributes(path,a);return inode_json(fs.lstat(path));
@@ -328,6 +333,10 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="fs-append") {
         auto offset=fs.append(args[1],std::vector<unsigned char>(args[2].begin(),args[2].end()));
         return "{\"offset\":"+std::to_string(offset)+",\"written\":"+std::to_string(args[2].size())+"}\n";
+    }
+    if(op=="fs-settimes" || op=="fs-hsettimes") {
+        Namespace::Attributes a;if(args[2]!="-")a.accessed_ns=number(args[2]);if(args[3]!="-")a.modified_ns=number(args[3]);if(args[4]!="-")a.birth_ns=number(args[4]);
+        if(op=="fs-hsettimes")fs.handle_set_attributes(args[1],a);else fs.set_attributes(args[1],a);return store.status();
     }
     if(op=="fs-chmod" || op=="fs-hchmod" || op=="fs-setmtime" || op=="fs-hsetmtime") {
         Namespace::Attributes a;

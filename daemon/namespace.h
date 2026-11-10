@@ -12,6 +12,7 @@ struct InodeInfo {
     bool symlink=false;
     bool chunked=false;
     bool xattrs=false;
+    uint64_t accessed_ns=0, birth_ns=0;
 };
 class NamespaceView;
 class FileContent;
@@ -19,7 +20,7 @@ class Namespace {
 public:
     static constexpr uint64_t maximum_file_size=64*1024*1024;
     static constexpr size_t maximum_io_size=256*1024;
-    struct Attributes {std::optional<uint32_t> mode;std::optional<uint64_t> modified_ns;std::optional<uint64_t> size;};
+    struct Attributes {std::optional<uint32_t> mode;std::optional<uint64_t> modified_ns;std::optional<uint64_t> size;std::optional<uint64_t> accessed_ns,birth_ns;};
     class DirectoryCursor {
         friend class Namespace;
         std::weak_ptr<const int> lifetime_;

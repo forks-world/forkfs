@@ -1,0 +1,52 @@
+{
+  "namespace": "/forkfs-accept-pjqoy_z_",
+  "checks": [
+    "binary write/read/fsync reaches daemon content",
+    "native binary/empty xattrs, Finder tags, create policy and size limit",
+    "hardlink identity and symlink traversal",
+    "pathname/fd utime nanoseconds and native creation time reach revision inode",
+    "fsync then revision checkpoint isolates subsequent writes",
+    "xattrs follow hardlink identity, revision isolation and open-unlink handles",
+    "rename/open-unlink/truncate/path reuse preserve file identity",
+    "directory enumeration and dot entries",
+    "atomic-save replacement reaches revision-backed namespace",
+    "UTF-8 names, links, rename, NFC/NFD identity and byte limits",
+    "4 MiB file transfer, 64 MiB sparse limit, truncate zero-fill and chunked open-unlink"
+  ],
+  "timestamp_ns": {
+    "accessed_ns": 1234567890123456790,
+    "modified_ns": 1345678901234567891,
+    "birth_ns": 1123456789000000000
+  },
+  "retained_revision": "mount_accept_264ea9bd8ec1",
+  "appledouble_sidecars": 0,
+  "unicode_retained_revision": "unicode_mount_7d573c0ac065",
+  "large_retained_revision": "large_mount_03c0066a939a",
+  "large_namespace": "/forkfs-accept-pjqoy_z_/large.bin",
+  "readonly_after_restart_gc": {
+    "native_times_preserved": true,
+    "reads_preserve_atime": true,
+    "utime_errno": "EROFS"
+  },
+  "native_tools": {
+    "touch": true,
+    "cp_preserve_mtime": true,
+    "orphan_fd_utime": true
+  },
+  "compatibility": {
+    "old_records_readable": true,
+    "old_revision_unchanged": true,
+    "older_daemon_rejects_upgraded_inode": true,
+    "mixed_format_gc": true
+  },
+  "platform": {
+    "macOS": "27.2",
+    "architecture": "arm64"
+  },
+  "source_sha256": {
+    "daemon/namespace.cpp": "5798ec3f520bfd2af044dd88b198eb4cba075fb52628ee9a9552d37e73428900",
+    "daemon/rpc.cpp": "31aa92ad95e5eb8a981bd38211fcd3eed68186c36cc513b542f504de23f37cd3",
+    "macos/forkfs/RevisionVolume.mm": "64391c4ace81b50c48abea450aaf75290e76266b1421f4141c8483c671c9e805",
+    "scripts/tests/forkfs_mount.py": "d756c6987d58dd7f6feb9ced40b3bea9235dbe18cf0004678af726146f367277"
+  }
+}
