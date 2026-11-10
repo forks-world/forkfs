@@ -129,6 +129,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="status" || op=="storage-profile" || op=="fs-init" || op=="fs-check" || op=="fs-worlds" || op=="fs-revisions" || op=="fs-compact")count=1;
     if(op=="fs-write" || op=="fs-save" || op=="fs-rename" || op=="fs-link" || op=="fs-fork" || op=="fs-append" || op=="fs-truncate" || op=="fs-open" || op=="fs-happend" || op=="fs-htruncate" || op=="fs-hread-next" || op=="fs-hwrite-next" || op=="fs-symlink" || op=="fs-chmod" || op=="fs-setmtime" || op=="fs-hchmod" || op=="fs-hsetmtime" || op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-hlock")count=3;
     if(op=="fs-read-at" || op=="fs-write-at" || op=="fs-hread" || op=="fs-hwrite" || op=="fs-hseek" || op=="fs-hrange-lock")count=4;
+    if(op=="fs-history")count=4;
     if(op=="inode-root" || op=="inode-sync" || op=="inode-space")count=1;
     if(op=="inode-stat" || op=="inode-dir-open" || op=="inode-readlink")count=2;
     if(op=="inode-lookup" || op=="inode-open")count=3;
@@ -150,7 +151,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         args.resize(args.size()-2);
     }
     need(args.size()==count,"invalid RPC command arguments");
-    need(op!="fs-diff" || !selected_view,"invalid view selector for revision diff");
+    need((op!="fs-diff" && op!="fs-history") || !selected_view,"invalid view selector for revision query");
     for(size_t i=0;i<args.size();++i)if(!(((op=="fs-write" || op=="fs-save" || op=="fs-append" || op=="fs-happend" || op=="fs-hwrite-next") && i==2) || ((op=="fs-write-at" || op=="fs-hwrite") && i==3)))need(args[i].find('\0')==std::string::npos,"NUL in RPC argument");
     if(op=="session-open") {
         auto lease=number(args[1]);auto token=sessions.create(lease);
@@ -158,7 +159,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     if(op=="session-keepalive"){sessions.acquire(args[1]);return store.status();}
     if(op=="session-close"){sessions.acquire(args[1]);sessions.close(args[1]);return store.status();}
-    bool handle_op=op=="fs-open" || op=="fs-close" || op=="fs-dup" || op.starts_with("fs-h");
+    bool handle_op=op=="fs-open" || op=="fs-close" || op=="fs-dup" || (op.starts_with("fs-h") && op!="fs-history");
     bool dir_op=op.starts_with("fs-dir-");
     need(!(handle_op || dir_op || op.starts_with("inode-")) || !session_token.empty(),"handle operations require --session TOKEN");
     Activity activity{session_token.empty()?nullptr:&sessions.acquire(session_token)};
@@ -169,7 +170,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     if(op=="status")return store.status();
     if(op=="storage-profile")return store.storage_profile();
-    static const std::set<std::string> reads{"fs-diff","fs-cat","fs-read-at","fs-ls","fs-stat","fs-lstat","fs-readlink","fs-check","fs-worlds","fs-revisions","fs-snapshot","fs-fork",
+    static const std::set<std::string> reads{"fs-history","fs-diff","fs-cat","fs-read-at","fs-ls","fs-stat","fs-lstat","fs-readlink","fs-check","fs-worlds","fs-revisions","fs-snapshot","fs-fork",
         "fs-hstat","fs-hread","fs-hread-next","fs-hseek","fs-close","fs-dup","fs-hlock","fs-hrange-lock","fs-dir-open","fs-dir-page","fs-dir-entries","fs-dir-rewind","fs-dir-close"};
     sessions.authorize(session_token,view,revision,!reads.contains(op));
     if(op.starts_with("inode-") && op!="inode-root")sessions.mount_require(session_token,view,revision);
@@ -240,6 +241,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         else for(const auto& name:page.names){if(!first)result+=',';first=false;result+=quoted(name);}
         return result+"],\"eof\":"+(page.eof?"true":"false")+"}\n";
     }
+    if(op=="fs-history"){auto limit=number(args[3]);need(limit>=1 && limit<=64,"invalid history page limit; expected 1..64");return fs.revision_history(args[1],args[2],static_cast<size_t>(limit));}
     if(op=="fs-diff"){auto limit=number(args[4]);need(limit>=1 && limit<=64,"invalid diff page limit; expected 1..64");return fs.diff(args[1],args[2],args[3],static_cast<size_t>(limit));}
     if(op=="fs-cat"){auto b=fs.read(args[1]);return std::string(b.begin(),b.end());}
     if(op=="fs-read-at"){auto b=fs.read_at(args[1],number(args[2]),number(args[3]));return std::string(b.begin(),b.end());}
