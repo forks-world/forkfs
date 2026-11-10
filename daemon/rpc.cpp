@@ -246,7 +246,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     if(op=="fs-xattr-get" || op=="fs-hxattr-get"){auto value=op=="fs-xattr-get"?fs.get_xattr(args[1],args[2]):fs.handle_get_xattr(args[1],args[2]);return std::string(value.begin(),value.end());}
     if(op=="fs-xattr-list" || op=="fs-hxattr-list"){
-        auto names=op=="fs-xattr-list"?fs.list_xattrs(args[1]):fs.handle_list_xattrs(args[1]);std::string result="{\"names\":[";
+        const auto names=op=="fs-xattr-list"?fs.list_xattrs(args[1]):fs.handle_list_xattrs(args[1]);std::string result="{\"names\":[";
         for(size_t i=0;i<names.size();++i){if(i)result+=',';result+=quoted(names[i]);}return result+"]}\n";
     }
     if(op=="fs-xattr-set" || op=="fs-hxattr-set"){

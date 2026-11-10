@@ -44,6 +44,10 @@ for binary in [BIN,LEGACY]:
                 rid=json.loads(rpc('inode-root',*sel))['inode']['inode_id'];fid=json.loads(rpc('inode-lookup',rid,'f',*sel))['inode_id']
                 rpc('inode-xattr-set',fid,'binary','create',payload,*sel);assert rpc('inode-xattr-get',fid,'binary',*sel)==payload
                 assert json.loads(rpc('inode-xattr-list',fid,*sel))['names']==['binary','user.test']
+                escaped='quote"back\\name'
+                rpc('inode-xattr-set',fid,escaped,'create',payload,*sel)
+                assert escaped in json.loads(rpc('inode-xattr-list',fid,*sel))['names']
+                assert rpc('inode-xattr-get',fid,escaped,*sel)==payload
                 rpc('inode-xattr-set',fid,'binary','create',b'',*sel,code=errno.EEXIST+1)
                 rpc('inode-xattr-set',fid,'missing','replace',b'',*sel,code=MISSING+1)
                 rpc('inode-xattr-get',fid,'missing',*sel,code=MISSING+1)
