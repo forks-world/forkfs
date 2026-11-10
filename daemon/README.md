@@ -89,7 +89,7 @@ command; write payload is binary. Reply payload starts with result code u32 LE
 (0 success, 1 generic error, or POSIX errno + 1 for typed errors) followed by raw result/error bytes. The format is experimental.
 Supported commands are `status`, `fs-init`, `fs-mkdir`, `fs-write`, `fs-cat`,
 `fs-xattr-list`, `fs-xattr-get`, `fs-xattr-set`, `fs-xattr-remove`,
-`fs-settimes`, `fs-history`, `fs-diff`, `fs-ls`, `fs-stat`, `fs-read-at`, `fs-write-at`, `fs-append`, `fs-truncate`, `fs-link`, `fs-rename`, `fs-unlink`, `fs-rmdir`, `fs-check`,
+`fs-settimes`, `fs-lsettimes`, `fs-lchmod`, `fs-history`, `fs-diff`, `fs-ls`, `fs-stat`, `fs-read-at`, `fs-write-at`, `fs-append`, `fs-truncate`, `fs-link`, `fs-rename`, `fs-unlink`, `fs-rmdir`, `fs-check`,
 `fs-compact`, `fs-snapshot`, `fs-fork`, `fs-restore`, `fs-worlds` and `fs-revisions`, with the
 same view selectors as offline commands. `fs-diff` and `fs-history` instead take
 explicit named revisions and reject view selectors. Revision writes remain forbidden.
@@ -430,13 +430,17 @@ symlink creates its missing final target, preserving the link and requiring all
 intermediate directories to exist. Whole-file write follows the same creation
 rule. Exclusive create rejects the existing link name, even when dangling.
 `nofollow` rejects a final symlink before mutation but permits prefix directory
-links. No lchmod, symlink handle or OS O_NOFOLLOW mapping is implemented. This World-local
-resolver does not constitute the OS/agent isolation boundary.
+links. Attribute setters can instead update the final entry through `fs-lchmod`
+and `fs-lsettimes`, including dangling links. Symlink file handles and the OS
+O_SYMLINK/O_NOFOLLOW open mappings remain unsupported. This World-local resolver
+does not constitute the OS/agent isolation boundary.
 
 ## Mode and timestamps
 
 Path commands include `fs-chmod PATH OCTAL_MODE`, `fs-setmtime PATH NANOSECONDS`
-and `fs-settimes PATH ATIME MTIME BIRTH`. CLI commands take CONTAINER before
+and `fs-settimes PATH ATIME MTIME BIRTH`. Their nofollow counterparts are
+`fs-lchmod PATH OCTAL_MODE` and `fs-lsettimes PATH ATIME MTIME BIRTH`.
+CLI commands take CONTAINER before
 PATH; RPC commands omit it. A dash (`-`) leaves an individual time unchanged:
 
 ```sh
@@ -461,11 +465,18 @@ policy), including immutable revision reads. Birth time is owner-editable
 metadata, not an audit record.
 
 Hardlinks and existing handles see the same attributes; Worlds and immutable
-revisions remain isolated. Path changes follow final symlinks. Directory and
+revisions remain isolated. Ordinary path changes follow final symlinks; the
+`fs-l*` variants update the final entry itself while still resolving prefix
+directory symlinks. Dangling and self-referencing final links need no valid
+target. The C++ `set_link_attributes` API has the same behavior and also accepts
+regular files and directories. Both inode setattr RPCs always update the inode
+identified by the caller, including a symlink, without following it. Symlink
+size changes fail with EINVAL, even for the existing length, before any requested
+mode or time can change. Directory and
 unlinked regular-file handle attributes are supported. Live read-only access
 handles may set owner metadata; revision handles cannot. An all-dash change is
-a no-op after view/handle validation. Negative timestamps, symlink timestamp
-mutation, uid/gid changes, ACLs, setuid/sticky bits and multi-user permission
+a no-op after view/handle validation. Negative timestamps, uid/gid changes,
+ACLs, setuid/sticky bits and multi-user permission
 enforcement remain unsupported.
 
 Inode records now use the 64-byte `FFINOD02` format. Bytes 8..47 retain the

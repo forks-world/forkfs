@@ -277,3 +277,19 @@ Actual macOS 27.2 acceptance verified pathname/fd nanosecond utime, native birth
 time, open-unlinked fd updates, `touch` and `cp -p`. A read-only revision mount
 after daemon restart and physical GC preserved the recorded times and rejected
 utime with EROFS; see [timestamp evidence](evidence/2026-11-10-fskit-times.json).
+
+The inode attribute RPCs also support mode and timestamps on the symlink itself,
+including dangling links. They retain the target text and never modify the
+referenced file. Symlink size requests fail with EINVAL before any other field
+changes. The CLI/RPC `fs-lchmod` and `fs-lsettimes` variants provide the same
+nofollow-final behavior; prefix directory links continue to resolve normally.
+
+Native nofollow utime, lchmod, birth-time updates, `touch -h` and `cp -PpX` are
+covered by the symlink-attribute acceptance run. Plain `cp -Pp` still fails on
+symlinks because its extended-attribute copy path needs an O_SYMLINK file handle;
+those handles remain unsupported. Path-based nofollow xattr queries work. The
+`-X` copy skips extended attributes and is the specifically validated copy case.
+
+After daemon restart and physical GC, a read-only revision mount preserved the
+symlink's mode, target text and all stored times, rejecting nofollow utime and
+lchmod with EROFS. See [symlink attribute evidence](evidence/2026-11-10-fskit-symlink-attributes.json).

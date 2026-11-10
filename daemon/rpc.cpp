@@ -132,7 +132,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     auto op=args[0];std::string view="main";bool revision=false;
     size_t count=2;
     if(op=="status" || op=="storage-profile" || op=="fs-init" || op=="fs-check" || op=="fs-worlds" || op=="fs-revisions" || op=="fs-compact")count=1;
-    if(op=="fs-write" || op=="fs-save" || op=="fs-rename" || op=="fs-link" || op=="fs-fork" || op=="fs-restore" || op=="fs-append" || op=="fs-truncate" || op=="fs-open" || op=="fs-happend" || op=="fs-htruncate" || op=="fs-hread-next" || op=="fs-hwrite-next" || op=="fs-symlink" || op=="fs-chmod" || op=="fs-setmtime" || op=="fs-hchmod" || op=="fs-hsetmtime" || op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-hlock")count=3;
+    if(op=="fs-write" || op=="fs-save" || op=="fs-rename" || op=="fs-link" || op=="fs-fork" || op=="fs-restore" || op=="fs-append" || op=="fs-truncate" || op=="fs-open" || op=="fs-happend" || op=="fs-htruncate" || op=="fs-hread-next" || op=="fs-hwrite-next" || op=="fs-symlink" || op=="fs-chmod" || op=="fs-lchmod" || op=="fs-setmtime" || op=="fs-hchmod" || op=="fs-hsetmtime" || op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-hlock")count=3;
     if(op=="fs-read-at" || op=="fs-write-at" || op=="fs-hread" || op=="fs-hwrite" || op=="fs-hseek" || op=="fs-hrange-lock")count=4;
     if(op=="fs-history")count=4;
     if(op=="inode-root" || op=="inode-sync" || op=="inode-space")count=1;
@@ -142,7 +142,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="inode-remove" || op=="fs-diff")count=5;
     if(op=="inode-setattr")count=6;
     if(op=="inode-setattr-times")count=8;
-    if(op=="fs-settimes" || op=="fs-hsettimes")count=5;
+    if(op=="fs-settimes" || op=="fs-lsettimes" || op=="fs-hsettimes")count=5;
     if(op=="inode-rename")count=7;
     if(op=="fs-xattr-get" || op=="fs-xattr-remove" || op=="fs-hxattr-get" || op=="fs-hxattr-remove" || op=="inode-xattr-get" || op=="inode-xattr-remove")count=3;
     if(op=="fs-xattr-set" || op=="fs-hxattr-set" || op=="inode-xattr-set")count=5;
@@ -233,8 +233,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
             const auto& handle=args[handle_index];need(activity.session->handles.contains(handle),"handle belongs to another session");
             need(fs.handle_stat(handle).id==args[1],"invalid inode/handle pairing");fs.handle_set_attributes(handle,a);return inode_json(fs.handle_stat(handle));
         }
-        auto path=fs.path_for_inode(args[1]);need(!fs.lstat(path).symlink,"symbolic link attributes are unsupported");
-        fs.set_attributes(path,a);return inode_json(fs.lstat(path));
+        auto path=fs.path_for_inode(args[1]);fs.set_link_attributes(path,a);return inode_json(fs.lstat(path));
     }
     if(op=="fs-dir-open") {
         need(activity.session->directories.size()<64 && sessions.directory_count()<1024,"directory cursor limit reached");
@@ -334,15 +333,15 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         auto offset=fs.append(args[1],std::vector<unsigned char>(args[2].begin(),args[2].end()));
         return "{\"offset\":"+std::to_string(offset)+",\"written\":"+std::to_string(args[2].size())+"}\n";
     }
-    if(op=="fs-settimes" || op=="fs-hsettimes") {
+    if(op=="fs-settimes" || op=="fs-lsettimes" || op=="fs-hsettimes") {
         Namespace::Attributes a;if(args[2]!="-")a.accessed_ns=number(args[2]);if(args[3]!="-")a.modified_ns=number(args[3]);if(args[4]!="-")a.birth_ns=number(args[4]);
-        if(op=="fs-hsettimes")fs.handle_set_attributes(args[1],a);else fs.set_attributes(args[1],a);return store.status();
+        if(op=="fs-hsettimes")fs.handle_set_attributes(args[1],a);else if(op=="fs-lsettimes")fs.set_link_attributes(args[1],a);else fs.set_attributes(args[1],a);return store.status();
     }
-    if(op=="fs-chmod" || op=="fs-hchmod" || op=="fs-setmtime" || op=="fs-hsetmtime") {
+    if(op=="fs-chmod" || op=="fs-lchmod" || op=="fs-hchmod" || op=="fs-setmtime" || op=="fs-hsetmtime") {
         Namespace::Attributes a;
-        if(op=="fs-chmod" || op=="fs-hchmod"){auto mode=number(args[2],8);need(mode<=0777,"unsupported mode bits");a.mode=static_cast<uint32_t>(mode);}
+        if(op=="fs-chmod" || op=="fs-lchmod" || op=="fs-hchmod"){auto mode=number(args[2],8);need(mode<=0777,"unsupported mode bits");a.mode=static_cast<uint32_t>(mode);}
         else a.modified_ns=number(args[2]);
-        if(op=="fs-hchmod" || op=="fs-hsetmtime")fs.handle_set_attributes(args[1],a);else fs.set_attributes(args[1],a);
+        if(op=="fs-hchmod" || op=="fs-hsetmtime")fs.handle_set_attributes(args[1],a);else if(op=="fs-lchmod")fs.set_link_attributes(args[1],a);else fs.set_attributes(args[1],a);
         return store.status();
     }
     if(op=="fs-symlink")fs.symlink(args[1],args[2]);

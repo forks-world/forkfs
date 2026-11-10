@@ -174,8 +174,10 @@ int main(int argc, char** argv) {
                          "forkfsd fs-symlink CONTAINER TARGET PATH\n"
                          "forkfsd fs-readlink CONTAINER PATH\n"
                          "forkfsd fs-chmod CONTAINER PATH OCTAL_MODE\n"
+                         "forkfsd fs-lchmod CONTAINER PATH OCTAL_MODE (nofollow final entry)\n"
                          "forkfsd fs-setmtime CONTAINER PATH NANOSECONDS\n"
                          "forkfsd fs-settimes CONTAINER PATH ATIME_OR_DASH MTIME_OR_DASH BIRTH_OR_DASH\n"
+                         "forkfsd fs-lsettimes CONTAINER PATH ATIME_OR_DASH MTIME_OR_DASH BIRTH_OR_DASH\n"
                          "RPC: fs-hlock HANDLE shared|exclusive|unlock\n"
                          "RPC: fs-hrange-lock HANDLE shared|exclusive|unlock START:LENGTH\n"
                          "RPC: fs-hchmod HANDLE OCTAL_MODE, fs-hsetmtime HANDLE NANOSECONDS\n"
@@ -216,11 +218,11 @@ int main(int argc, char** argv) {
         std::string view="main";bool revision_view=false;
         int base_argc=4;
         if(command=="fs-init" || command=="fs-check" || command=="fs-worlds" || command=="fs-revisions" || command=="fs-compact" || command=="fs-layout")base_argc=3;
-        if(command=="fs-write" || command=="fs-save" || command=="fs-link" || command=="fs-rename" || command=="fs-fork" || command=="fs-restore" || command=="fs-append" || command=="fs-truncate" || command=="fs-symlink" || command=="fs-chmod" || command=="fs-setmtime")base_argc=5;
+        if(command=="fs-write" || command=="fs-save" || command=="fs-link" || command=="fs-rename" || command=="fs-fork" || command=="fs-restore" || command=="fs-append" || command=="fs-truncate" || command=="fs-symlink" || command=="fs-lchmod" || command=="fs-chmod" || command=="fs-setmtime")base_argc=5;
         if(command=="fs-read-at" || command=="fs-write-at")base_argc=6;
         if(command=="fs-xattr-get" || command=="fs-xattr-remove")base_argc=5;
         if(command=="fs-xattr-set")base_argc=7;
-        if(command=="fs-settimes")base_argc=7;
+        if(command=="fs-settimes" || command=="fs-lsettimes")base_argc=7;
         if(command!="fs-diff" && command!="fs-history" && command!="fs-drop-world" && command!="fs-forget-revision" && command.starts_with("fs-") && argc==base_argc+2) {
             std::string selector=argv[argc-2];
             if(selector=="--world" || selector=="--revision") {
@@ -299,14 +301,14 @@ int main(int argc, char** argv) {
             else if(command=="fs-revisions" && argc==3) {for(const auto& name:fs.revisions())std::cout<<name<<'\n';return 0;}
             else if(command=="fs-init" && argc==3) fs.initialize();
             else if(command=="fs-check" && argc==3) {container.verify();fs.verify();}
-            else if(command=="fs-settimes" && argc==7) {
+            else if((command=="fs-settimes" || command=="fs-lsettimes") && argc==7) {
                 forkfs::Namespace::Attributes a;if(std::string(argv[4])!="-")a.accessed_ns=file_number(argv[4]);
-                if(std::string(argv[5])!="-")a.modified_ns=file_number(argv[5]);if(std::string(argv[6])!="-")a.birth_ns=file_number(argv[6]);fs.set_attributes(argv[3],a);
+                if(std::string(argv[5])!="-")a.modified_ns=file_number(argv[5]);if(std::string(argv[6])!="-")a.birth_ns=file_number(argv[6]);if(command=="fs-lsettimes")fs.set_link_attributes(argv[3],a);else fs.set_attributes(argv[3],a);
             }
-            else if((command=="fs-chmod" || command=="fs-setmtime") && argc==5) {
+            else if((command=="fs-chmod" || command=="fs-lchmod" || command=="fs-setmtime") && argc==5) {
                 forkfs::Namespace::Attributes a;
-                if(command=="fs-chmod"){auto mode=file_number(argv[4],8);if(mode>0777)throw std::runtime_error("unsupported mode bits");a.mode=static_cast<uint32_t>(mode);}
-                else a.modified_ns=file_number(argv[4]);fs.set_attributes(argv[3],a);
+                if(command=="fs-chmod" || command=="fs-lchmod"){auto mode=file_number(argv[4],8);if(mode>0777)throw std::runtime_error("unsupported mode bits");a.mode=static_cast<uint32_t>(mode);}
+                else a.modified_ns=file_number(argv[4]);if(command=="fs-lchmod")fs.set_link_attributes(argv[3],a);else fs.set_attributes(argv[3],a);
             }
             else if(command=="fs-symlink" && argc==5)fs.symlink(argv[3],argv[4]);
             else if(command=="fs-readlink" && argc==4){std::cout<<fs.readlink(argv[3]);return 0;}

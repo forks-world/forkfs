@@ -64,6 +64,7 @@ public:
     std::vector<std::string> list(const std::string& path) const;
     InodeInfo stat(const std::string& path) const;
     void set_attributes(const std::string& path,const Attributes& attributes);
+    void set_link_attributes(const std::string& path,const Attributes& attributes);
     void handle_set_attributes(const std::string& handle,const Attributes& attributes);
     InodeInfo lstat(const std::string& path) const;
     void symlink(const std::string& target,const std::string& path);
@@ -101,6 +102,7 @@ public:
     void handle_truncate(const std::string& handle,uint64_t size);
 private:
     friend class Container;
+    void set_path_attributes(const std::string& path,const Attributes& attributes,bool follow_final);
     void require_offline_locked() const;
     static void recover_orphans(Container& container);
     void verify_locked() const;

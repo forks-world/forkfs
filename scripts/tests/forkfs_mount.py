@@ -128,6 +128,24 @@ try:
     assert file.stat().st_atime_ns==atime and file.stat().st_mtime_ns==mtime and int(file.stat().st_birthtime)==birth//1000000000
     report['timestamp_ns']={'accessed_ns':atime,'modified_ns':mtime,'birth_ns':birth}
     report['checks'].append('pathname/fd utime nanoseconds and native creation time reach revision inode')
+    target_before=json.loads(rpc('fs-stat',namespace+'/file'))
+    link=root/'symlink';link_atime,link_mtime,link_birth=111111111111111111,222222222222222222,100000000000000000
+    os.utime(link,ns=(link_atime,link_mtime),follow_symlinks=False)
+    libc.lchmod.argtypes=[ctypes.c_char_p,ctypes.c_uint32];libc.lchmod.restype=ctypes.c_int
+    assert libc.lchmod(os.fsencode(link),0o701)==0,ctypes.get_errno()
+    link_stamp=Timespec(link_birth//1000000000,link_birth%1000000000)
+    assert libc.setattrlist(os.fsencode(link),ctypes.byref(attributes),ctypes.byref(link_stamp),ctypes.sizeof(link_stamp),1)==0,ctypes.get_errno() # FSOPT_NOFOLLOW
+    link_metadata=json.loads(rpc('fs-lstat',namespace+'/symlink'))
+    assert link_metadata['mode']==0o701 and [link_metadata[k] for k in ['accessed_ns','modified_ns','birth_ns']]==[link_atime,link_mtime,link_birth]
+    assert json.loads(rpc('fs-stat',namespace+'/file'))==target_before
+    dangling=root/'dangling-attrs';copied=root/'copied-link';os.symlink('missing-target',dangling)
+    subprocess.run(['/usr/bin/touch','-h',str(dangling)],check=True)
+    os.utime(dangling,ns=(link_atime,link_mtime),follow_symlinks=False)
+    subprocess.run(['/bin/cp','-PpX',str(dangling),str(copied)],check=True)
+    assert os.readlink(copied)=='missing-target' and copied.lstat().st_mtime_ns==dangling.lstat().st_mtime_ns
+    assert not (root/'missing-target').exists();os.unlink(copied);os.unlink(dangling)
+    report['symlink_attributes']={'mode':0o701,'accessed_ns':link_atime,'modified_ns':link_mtime,'birth_ns':link_birth,'target_unchanged':True,'dangling_touch_h':True,'dangling_cp_PpX':True}
+    report['checks'].append('nofollow symlink times/mode/birth, target isolation, dangling touch -h and cp -PpX')
     if args.checkpoint:
         revision='mount_accept_'+uuid.uuid4().hex[:12]
         rpc('fs-snapshot',revision)

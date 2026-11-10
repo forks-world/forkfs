@@ -39,7 +39,9 @@ can reclaim an abandoned branch after its last retaining root is removed.
 Inode atime and birth time are stored in revision metadata, alongside mtime and
 ctime, and participate in revision diff, fork, restore and physical GC. Reads
 follow a noatime policy. Old inode records remain readable; mutations upgrade
-the affected record to FFINOD02, which older daemons reject.
+the affected record to FFINOD02, which older daemons reject. Explicit nofollow
+mode/time setters also operate on symlink metadata, including dangling links,
+without changing link targets or referenced file objects.
 
 The new optional FSKit frontend operates through the resident daemon RPC and
 revision-backed namespace; see [FSKit integration](FSKIT.md). Git and
