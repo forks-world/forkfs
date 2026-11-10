@@ -6,9 +6,11 @@ An optional checkpoint is retained in the repository, since revision deletion is
 not implemented. Use a disposable repository for acceptance testing.
 """
 import argparse
+import ctypes
 import errno
 import json
 import os
+import plistlib
 from pathlib import Path
 import shutil
 import subprocess
@@ -44,6 +46,43 @@ def rejects(operation,*codes):
         assert error.errno in codes,error
     else:raise AssertionError('operation unexpectedly succeeded')
 
+# Apple's bundled Python may omit os.*xattr. Call the native Darwin APIs so
+# acceptance still covers both pathname and open-file-descriptor syscalls.
+libc=ctypes.CDLL('/usr/lib/libSystem.B.dylib',use_errno=True)
+for operation,argument_types,return_type in [
+    ('setxattr',[ctypes.c_char_p,ctypes.c_void_p,ctypes.c_size_t,ctypes.c_uint32,ctypes.c_int],ctypes.c_int),
+    ('getxattr',[ctypes.c_char_p,ctypes.c_void_p,ctypes.c_size_t,ctypes.c_uint32,ctypes.c_int],ctypes.c_ssize_t),
+    ('listxattr',[ctypes.c_void_p,ctypes.c_size_t,ctypes.c_int],ctypes.c_ssize_t),
+    ('removexattr',[ctypes.c_char_p,ctypes.c_int],ctypes.c_int),
+]:
+    for prefix,first in [('',ctypes.c_char_p),('f',ctypes.c_int)]:
+        function=getattr(libc,prefix+operation);function.argtypes=[first,*argument_types];function.restype=return_type
+
+def xattr_call(operation,target,*args):
+    fd=isinstance(target,int);function=getattr(libc,('f' if fd else '')+operation)
+    result=function(target if fd else os.fsencode(target),*args)
+    if result<0:
+        code=ctypes.get_errno();raise OSError(code,os.strerror(code))
+    return result
+
+def setxattr(target,name,value,flags=0):
+    data=ctypes.create_string_buffer(value);xattr_call('setxattr',target,os.fsencode(name),data,len(value),0,flags)
+
+def getxattr(target,name):
+    name=os.fsencode(name);size=xattr_call('getxattr',target,name,None,0,0,0)
+    if not size:return b''
+    data=ctypes.create_string_buffer(size);length=xattr_call('getxattr',target,name,data,size,0,0);return data.raw[:length]
+
+def listxattr(target):
+    size=xattr_call('listxattr',target,None,0,0)
+    if not size:return []
+    data=ctypes.create_string_buffer(size);length=xattr_call('listxattr',target,data,size,0)
+    return [os.fsdecode(name) for name in data.raw[:length].split(b'\0') if name]
+
+def removexattr(target,name):xattr_call('removexattr',target,os.fsencode(name),0)
+XATTR_CREATE=2
+XATTR_REPLACE=4
+
 root=Path(tempfile.mkdtemp(prefix='forkfs-accept-',dir=mountpoint))
 namespace='/'+root.name
 report={'mountpoint':str(mountpoint),'namespace':namespace,'checks':[]}
@@ -55,9 +94,21 @@ try:
     assert os.pread(fd,100,0)==payload
     assert rpc('fs-cat',namespace+'/file')==payload
     report['checks'].append('binary write/read/fsync reaches daemon content')
+    attr='user.forkfs';attr_value=b'xattr\0binary\xff';tags=plistlib.dumps(['Revision\n6'],fmt=plistlib.FMT_BINARY)
+    setxattr(file,attr,attr_value,flags=XATTR_CREATE)
+    setxattr(file,'com.apple.metadata:_kMDItemUserTags',tags)
+    assert getxattr(file,attr)==attr_value and getxattr(file,'com.apple.metadata:_kMDItemUserTags')==tags
+    assert attr in listxattr(file) and rpc('fs-xattr-get',namespace+'/file',attr)==attr_value
+    rejects(lambda:setxattr(file,attr,b'duplicate',flags=XATTR_CREATE),errno.EEXIST)
+    rejects(lambda:setxattr(file,'user.too-big',bytes(65537)),errno.E2BIG)
+    rejects(lambda:setxattr(file,b'bad\xff',b'x'),errno.EINVAL)
+    rejects(lambda:getxattr(file,b'bad\xff'),errno.EINVAL)
+    setxattr(file,'user.empty',b'');assert getxattr(file,'user.empty')==b'';removexattr(file,'user.empty')
+    report['checks'].append('native binary/empty xattrs, Finder tags, create policy and size limit')
     old_inode=os.fstat(fd).st_ino
     os.link(file,root/'alias')
     assert (root/'alias').stat().st_ino==old_inode and file.stat().st_nlink==2
+    assert getxattr(root/'alias',attr)==attr_value
     os.symlink('file',root/'symlink')
     assert os.readlink(root/'symlink')=='file' and (root/'symlink').read_bytes()==payload
     report['checks'].append('hardlink identity and symlink traversal')
@@ -67,6 +118,9 @@ try:
         os.pwrite(fd,b'CHANGED!',0);os.fsync(fd)
         assert rpc('fs-cat',namespace+'/file',revision=revision)==payload
         assert rpc('fs-cat',namespace+'/file')!=payload
+        setxattr(file,attr,b'changed',flags=XATTR_REPLACE)
+        assert rpc('fs-xattr-get',namespace+'/file',attr,revision=revision)==attr_value
+        assert rpc('fs-xattr-get',namespace+'/file',attr)==b'changed'
         report['retained_revision']=revision
         report['checks'].append('fsync then revision checkpoint isolates subsequent writes')
     rejects(lambda:os.ftruncate(fd,64*1024*1024+1),errno.EFBIG)
@@ -75,6 +129,10 @@ try:
     assert (root/'renamed').stat().st_ino==old_inode
     os.unlink(root/'renamed');os.unlink(root/'alias')
     assert os.fstat(fd).st_nlink==0
+    assert getxattr(fd,attr)==(b'changed' if args.checkpoint else attr_value)
+    setxattr(fd,attr,b'orphan-xattr',flags=XATTR_REPLACE);assert getxattr(fd,attr)==b'orphan-xattr'
+    removexattr(fd,attr);rejects(lambda:getxattr(fd,attr),getattr(errno,'ENOATTR',errno.ENODATA))
+    report['checks'].append('xattrs follow hardlink identity, revision isolation and open-unlink handles')
     assert os.pwrite(fd,b'ORPHAN',0)==6;os.fsync(fd)
     assert os.pread(fd,6,0)==b'ORPHAN'
     os.ftruncate(fd,3);os.fsync(fd);assert os.fstat(fd).st_size==3

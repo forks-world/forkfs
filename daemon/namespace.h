@@ -11,6 +11,7 @@ struct InodeInfo {
     uint64_t links, size, modified_ns, changed_ns;
     bool symlink=false;
     bool chunked=false;
+    bool xattrs=false;
 };
 class NamespaceView;
 class FileContent;
@@ -62,6 +63,17 @@ public:
     InodeInfo lstat(const std::string& path) const;
     void symlink(const std::string& target,const std::string& path);
     std::string readlink(const std::string& path) const;
+    enum class XattrPolicy {Upsert,Create,Replace};
+    static XattrPolicy xattr_policy(const std::string& value);
+    std::vector<unsigned char> get_xattr(const std::string& path,const std::string& name) const {return read_xattr(path,name,false);}
+    std::vector<std::string> list_xattrs(const std::string& path) const {return read_xattr_names(path,false);}
+    void set_xattr(const std::string& path,const std::string& name,const std::vector<unsigned char>& value,XattrPolicy policy=XattrPolicy::Upsert) {edit_xattr(path,name,value,policy,false);}
+    void remove_xattr(const std::string& path,const std::string& name) {edit_xattr(path,name,std::nullopt,XattrPolicy::Upsert,false);}
+    std::vector<unsigned char> handle_get_xattr(const std::string& handle,const std::string& name) const {return read_xattr(handle,name,true);}
+    std::vector<std::string> handle_list_xattrs(const std::string& handle) const {return read_xattr_names(handle,true);}
+    void handle_set_xattr(const std::string& handle,const std::string& name,const std::vector<unsigned char>& value,XattrPolicy policy=XattrPolicy::Upsert) {edit_xattr(handle,name,value,policy,true);}
+    void handle_remove_xattr(const std::string& handle,const std::string& name) {edit_xattr(handle,name,std::nullopt,XattrPolicy::Upsert,true);}
+
     void rename(const std::string& source,const std::string& target);
     void link(const std::string& source,const std::string& target);
     void remove(const std::string& path,bool directory);
@@ -89,6 +101,10 @@ private:
     void edit_handle(const std::string& handle,const std::function<bool(FileContent&,bool)>& edit,const std::function<void()>& committed={});
     std::vector<unsigned char> read_handle_locked(const Container::OpenHandle& info,uint64_t offset,uint64_t count) const;
     using Changes=std::map<std::string,std::optional<std::vector<unsigned char>>>;
+    std::pair<InodeInfo,bool> xattr_inode(const NamespaceView& view,const std::string& target,bool handle) const;
+    std::vector<unsigned char> read_xattr(const std::string& target,const std::string& name,bool handle) const;
+    std::vector<std::string> read_xattr_names(const std::string& target,bool handle) const;
+    void edit_xattr(const std::string& target,const std::string& name,const std::optional<std::vector<unsigned char>>& value,XattrPolicy policy,bool handle);
     void retire(const NamespaceView& view,Changes& changes,const InodeInfo& inode);
     void commit_changes(const NamespaceView& view,Changes& changes);
     Container& container_;

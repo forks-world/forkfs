@@ -158,6 +158,10 @@ int main(int argc, char** argv) {
                          "forkfsd fs-write CONTAINER PATH INPUT_FILE\n"
                          "forkfsd fs-save CONTAINER PATH INPUT_FILE\n"
                          "forkfsd fs-cat CONTAINER PATH\n"
+                         "forkfsd fs-xattr-list CONTAINER PATH\n"
+                         "forkfsd fs-xattr-get CONTAINER PATH NAME\n"
+                         "forkfsd fs-xattr-set CONTAINER PATH NAME upsert|create|replace INPUT_FILE\n"
+                         "forkfsd fs-xattr-remove CONTAINER PATH NAME\n"
                          "forkfsd fs-diff CONTAINER BEFORE_REVISION AFTER_REVISION [AFTER_PATH LIMIT]\n"
                          "forkfsd fs-history CONTAINER TIP_REVISION [AFTER_REVISION_ID LIMIT]\n"
                          "forkfsd fs-read-at CONTAINER PATH OFFSET COUNT\n"
@@ -196,8 +200,8 @@ int main(int argc, char** argv) {
         if(command=="request") {
             if(argc<4)throw std::runtime_error("request requires socket and command");
             std::vector<std::string> fields(argv+3,argv+argc);
-            if(fields[0]=="fs-write" || fields[0]=="fs-save" || fields[0]=="fs-write-at" || fields[0]=="fs-append" || fields[0]=="fs-hwrite" || fields[0]=="fs-happend" || fields[0]=="fs-hwrite-next") {
-                size_t index=(fields[0]=="fs-write-at" || fields[0]=="fs-hwrite")?3:2;
+            if(fields[0]=="fs-write" || fields[0]=="fs-save" || fields[0]=="fs-write-at" || fields[0]=="fs-append" || fields[0]=="fs-hwrite" || fields[0]=="fs-happend" || fields[0]=="fs-hwrite-next" || fields[0]=="fs-xattr-set" || fields[0]=="fs-hxattr-set" || fields[0]=="inode-xattr-set") {
+                size_t index=(fields[0]=="fs-xattr-set" || fields[0]=="fs-hxattr-set" || fields[0]=="inode-xattr-set")?4:(fields[0]=="fs-write-at" || fields[0]=="fs-hwrite")?3:2;
                 if(fields.size()!=index+1 && fields.size()!=index+3 && fields.size()!=index+5)throw std::runtime_error("write command requires input file");
                 auto data=load_file(fields[index].c_str());fields[index].assign(data.begin(),data.end());
             }
@@ -210,6 +214,8 @@ int main(int argc, char** argv) {
         if(command=="fs-init" || command=="fs-check" || command=="fs-worlds" || command=="fs-revisions" || command=="fs-compact" || command=="fs-layout")base_argc=3;
         if(command=="fs-write" || command=="fs-save" || command=="fs-link" || command=="fs-rename" || command=="fs-fork" || command=="fs-append" || command=="fs-truncate" || command=="fs-symlink" || command=="fs-chmod" || command=="fs-setmtime")base_argc=5;
         if(command=="fs-read-at" || command=="fs-write-at")base_argc=6;
+        if(command=="fs-xattr-get" || command=="fs-xattr-remove")base_argc=5;
+        if(command=="fs-xattr-set")base_argc=7;
         if(command!="fs-diff" && command!="fs-history" && command.starts_with("fs-") && argc==base_argc+2) {
             std::string selector=argv[argc-2];
             if(selector=="--world" || selector=="--revision") {
@@ -270,6 +276,10 @@ int main(int argc, char** argv) {
                 if(limit<1 || limit>64)throw std::runtime_error("invalid history page limit; expected 1..64");
                 std::cout<<fs.revision_history(argv[3],argc==6?argv[4]:"",static_cast<size_t>(limit));return 0;
             }
+            else if(command=="fs-xattr-get" && argc==5){auto value=fs.get_xattr(argv[3],argv[4]);std::cout.write(reinterpret_cast<const char*>(value.data()),value.size());if(!std::cout)throw std::runtime_error("cannot write xattr output");return 0;}
+            else if(command=="fs-xattr-list" && argc==4){for(const auto& name:fs.list_xattrs(argv[3]))std::cout<<name<<'\n';return 0;}
+            else if(command=="fs-xattr-set" && argc==7)fs.set_xattr(argv[3],argv[4],load_file(argv[6]),forkfs::Namespace::xattr_policy(argv[5]));
+            else if(command=="fs-xattr-remove" && argc==5)fs.remove_xattr(argv[3],argv[4]);
             else if(command=="fs-compact" && argc==3) fs.compact();
             else if(command=="fs-layout" && argc==3) {
                 if(container.storage_engine()=="leveldb") {fs.stat("/");std::cout<<"{\"layout\":\"cow-tree\",\"storage_engine\":\"leveldb\"}\n";return 0;}

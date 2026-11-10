@@ -191,7 +191,7 @@ names, links, rename, NFC/NFD distinctions and the byte limit; see
 
 Current limits are inherited from the namespace prototype: 64 MiB per regular
 file with 256 KiB per daemon I/O request, UTF-8 names (255 bytes per component, 4096 per path), mode bits through
-0777, no xattrs/ACLs, no uid/gid
+0777, native xattrs (64 KiB per value, 32 per inode), no ACLs or uid/gid
 changes, and no special files. Setattr supports mode, size and mtime atomically;
 unsupported attributes fail before mutation. The owner/group are synthesized
 from the service identity. The mounted root is always exposed as mode 0700, and
@@ -206,7 +206,7 @@ fail with ESTALE. FSItem numbers are stable only for the mount lifetime;
 persistent object IDs are not advertised. Inode requests currently traverse the
 revision metadata to locate a linked inode, so large-tree performance is not
 qualified. File data always goes through daemon handles. Sparse files are supported through zero-filled holes and bounded chunk I/O.
-2 TB-file, xattr and native-directory capabilities are not advertised.
+2 TB-file and native-directory capabilities are not advertised.
 FSKit callbacks can exceed the advertised I/O size; the frontend completes them
 using bounded RPCs. Actual macOS 27.2 mounts verified a 4 MiB transfer, 64 MiB
 sparse growth, shrink/extend zero fill, chunked open-unlink and a full 4 MiB
@@ -228,10 +228,24 @@ directory enumeration/dot entries and atomic-save replacement. A separate actual
 revision mount advertised `read-only`, preserved the original snapshot bytes and
 rejected creation with `EROFS`.
 
-Because native xattrs are unsupported, macOS creates AppleDouble `._` sidecars.
-The acceptance script validates their AppleDouble headers before excluding them
-from its user-entry comparison. These files are real revision-backed namespace
-entries; they are not hidden or discarded by the daemon.
+Native xattrs now use the daemon's immutable revision objects, including Finder
+tags, binary/empty values, create/replace/delete policy and open-unlink lifetime.
+The actual macOS 27.2 acceptance run verified pathname and descriptor xattr
+syscalls, hardlinks, snapshot isolation, and read-only metadata after restart and
+physical GC. It produced zero AppleDouble `._` sidecars; see
+[xattr acceptance evidence](evidence/2026-11-10-fskit-xattrs.json). The acceptance
+script still validates any AppleDouble headers before excluding sidecars from
+its user-entry comparison. Such files, when present, remain ordinary
+revision-backed entries.
+
+Each value is limited to 64 KiB, including resource-fork values; larger values
+fail with E2BIG. Logical xattr names support up to 255 valid UTF-8 bytes without
+normalization, with the namespace's control-character exclusions; macOS can
+apply tighter native name limits. Xattrs do not add ACL or multi-user permission
+enforcement. Final symlinks refer to their own attributes. The daemon marks
+inodes that have xattrs so older readers reject them; after the last attribute
+is removed, that marker clears. Attributes are retained by immutable revisions,
+not inferred from external files.
 
 The foreground launcher was additionally exercised with normal Ctrl-C and
 SIGTERM shutdown, busy-unmount preservation/retry, externally terminated daemon,

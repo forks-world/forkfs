@@ -137,6 +137,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="inode-remove" || op=="fs-diff")count=5;
     if(op=="inode-setattr")count=6;
     if(op=="inode-rename")count=7;
+    if(op=="fs-xattr-get" || op=="fs-xattr-remove" || op=="fs-hxattr-get" || op=="fs-hxattr-remove" || op=="inode-xattr-get" || op=="inode-xattr-remove")count=3;
+    if(op=="fs-xattr-set" || op=="fs-hxattr-set" || op=="inode-xattr-set")count=5;
     uint32_t creation_mode=0644;
     std::string session_token;bool selected_view=false;
     while(args.size()>=count+2) {
@@ -152,7 +154,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     need(args.size()==count,"invalid RPC command arguments");
     need((op!="fs-diff" && op!="fs-history") || !selected_view,"invalid view selector for revision query");
-    for(size_t i=0;i<args.size();++i)if(!(((op=="fs-write" || op=="fs-save" || op=="fs-append" || op=="fs-happend" || op=="fs-hwrite-next") && i==2) || ((op=="fs-write-at" || op=="fs-hwrite") && i==3)))need(args[i].find('\0')==std::string::npos,"NUL in RPC argument");
+    for(size_t i=0;i<args.size();++i)if(!(((op=="fs-xattr-set" || op=="fs-hxattr-set" || op=="inode-xattr-set") && i==4) || ((op=="fs-write" || op=="fs-save" || op=="fs-append" || op=="fs-happend" || op=="fs-hwrite-next") && i==2) || ((op=="fs-write-at" || op=="fs-hwrite") && i==3)))need(args[i].find('\0')==std::string::npos,"NUL in RPC argument");
     if(op=="session-open") {
         auto lease=number(args[1]);auto token=sessions.create(lease);
         return "{\"session\":\""+token+"\",\"lease_ms\":"+std::to_string(lease)+"}\n";
@@ -170,7 +172,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     if(op=="status")return store.status();
     if(op=="storage-profile")return store.storage_profile();
-    static const std::set<std::string> reads{"fs-history","fs-diff","fs-cat","fs-read-at","fs-ls","fs-stat","fs-lstat","fs-readlink","fs-check","fs-worlds","fs-revisions","fs-snapshot","fs-fork",
+    static const std::set<std::string> reads{"fs-xattr-get","fs-xattr-list","fs-hxattr-get","fs-hxattr-list","inode-xattr-get","inode-xattr-list","fs-history","fs-diff","fs-cat","fs-read-at","fs-ls","fs-stat","fs-lstat","fs-readlink","fs-check","fs-worlds","fs-revisions","fs-snapshot","fs-fork",
         "fs-hstat","fs-hread","fs-hread-next","fs-hseek","fs-close","fs-dup","fs-hlock","fs-hrange-lock","fs-dir-open","fs-dir-page","fs-dir-entries","fs-dir-rewind","fs-dir-close"};
     sessions.authorize(session_token,view,revision,!reads.contains(op));
     if(op.starts_with("inode-") && op!="inode-root")sessions.mount_require(session_token,view,revision);
@@ -188,6 +190,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         return "{\"inode\":"+inode_json(root_info)+",\"repository\":"+quoted(store.repository_id())+
             ",\"uid\":"+std::to_string(geteuid())+",\"gid\":"+std::to_string(getegid())+"}\n";
     }
+    if(op.starts_with("inode-xattr-")){args[1]=fs.path_for_inode(args[1]);op="fs-xattr-"+op.substr(12);args[0]=op;}
     if(op=="inode-space")return store.space_json();
     if(op=="inode-sync")return store.status(); // Every mutation already commits synchronously.
     if(op=="inode-lookup"){auto path=child(args[1],args[2]);op="fs-lstat";args={op,path};}
@@ -240,6 +243,18 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         if(attrs)for(const auto& entry:page.entries){if(!first)result+=',';first=false;result+="{\"name\":"+quoted(entry.name)+",\"inode\":"+inode_json(entry.inode)+"}";}
         else for(const auto& name:page.names){if(!first)result+=',';first=false;result+=quoted(name);}
         return result+"],\"eof\":"+(page.eof?"true":"false")+"}\n";
+    }
+    if(op=="fs-xattr-get" || op=="fs-hxattr-get"){auto value=op=="fs-xattr-get"?fs.get_xattr(args[1],args[2]):fs.handle_get_xattr(args[1],args[2]);return std::string(value.begin(),value.end());}
+    if(op=="fs-xattr-list" || op=="fs-hxattr-list"){
+        const auto names=op=="fs-xattr-list"?fs.list_xattrs(args[1]):fs.handle_list_xattrs(args[1]);std::string result="{\"names\":[";
+        for(size_t i=0;i<names.size();++i){if(i)result+=',';result+=quoted(names[i]);}return result+"]}\n";
+    }
+    if(op=="fs-xattr-set" || op=="fs-hxattr-set"){
+        auto policy=Namespace::xattr_policy(args[3]);std::vector<unsigned char> value(args[4].begin(),args[4].end());
+        if(op=="fs-xattr-set")fs.set_xattr(args[1],args[2],value,policy);else fs.handle_set_xattr(args[1],args[2],value,policy);return store.status();
+    }
+    if(op=="fs-xattr-remove" || op=="fs-hxattr-remove"){
+        if(op=="fs-xattr-remove")fs.remove_xattr(args[1],args[2]);else fs.handle_remove_xattr(args[1],args[2]);return store.status();
     }
     if(op=="fs-history"){auto limit=number(args[3]);need(limit>=1 && limit<=64,"invalid history page limit; expected 1..64");return fs.revision_history(args[1],args[2],static_cast<size_t>(limit));}
     if(op=="fs-diff"){auto limit=number(args[4]);need(limit>=1 && limit<=64,"invalid diff page limit; expected 1..64");return fs.diff(args[1],args[2],args[3],static_cast<size_t>(limit));}

@@ -88,10 +88,55 @@ count u32 LE (1..16), then length u32 LE + bytes for each field. First field is 
 command; write payload is binary. Reply payload starts with result code u32 LE
 (0 success, 1 generic error, or POSIX errno + 1 for typed errors) followed by raw result/error bytes. The format is experimental.
 Supported commands are `status`, `fs-init`, `fs-mkdir`, `fs-write`, `fs-cat`,
+`fs-xattr-list`, `fs-xattr-get`, `fs-xattr-set`, `fs-xattr-remove`,
 `fs-history`, `fs-diff`, `fs-ls`, `fs-stat`, `fs-read-at`, `fs-write-at`, `fs-append`, `fs-truncate`, `fs-link`, `fs-rename`, `fs-unlink`, `fs-rmdir`, `fs-check`,
 `fs-compact`, `fs-snapshot`, `fs-fork`, `fs-worlds` and `fs-revisions`, with the
 same view selectors as offline commands. `fs-diff` and `fs-history` instead take
 explicit named revisions and reject view selectors. Revision writes remain forbidden.
+
+## Extended attributes
+
+```sh
+forkfsd fs-xattr-set project.forkfs /file user.note upsert value.bin
+forkfsd fs-xattr-get project.forkfs /file user.note > saved.bin
+forkfsd fs-xattr-list project.forkfs /file
+forkfsd fs-xattr-remove project.forkfs /file user.note
+forkfsd request /private/runtime/control.sock fs-xattr-set /file user.note create value.bin
+```
+
+Paths address the final inode without following its final symlink. Regular files,
+directories and symlinks have independent xattrs; hardlinks share their inode's
+attributes. Names are 1..255 bytes of valid UTF-8, without normalization, excluding
+C0/DEL/C1 controls. A value can be empty or binary, up to 64 KiB, and an inode can
+have at most 32 attributes. Native macOS may impose tighter name restrictions.
+Set policy is mandatory: `upsert`, `create` (EEXIST if present), or `replace`
+(ENOATTR/ENODATA if absent). Removing a missing name also fails. Invalid input
+and quota failures publish no partial changes.
+
+CLI get writes raw bytes, list writes one name per line, and set reads INPUT_FILE.
+RPC commands are `fs-xattr-list PATH`, `fs-xattr-get PATH NAME`,
+`fs-xattr-set PATH NAME POLICY VALUE` and `fs-xattr-remove PATH NAME`; RPC list
+returns a JSON `names` array. VALUE is raw binary data, never a server-side host
+path. The request CLI loads the input file on the client. Existing World/revision
+selectors apply; revision mutation remains forbidden.
+
+Session-scoped `fs-hxattr-list/get/set/remove` use a file handle instead of a path,
+including an unlinked inode. These are owner metadata operations and do not
+require a writable data handle. `inode-xattr-list/get/set/remove` use linked inode
+IDs and require a mounted session, returning typed errors for FSKit. All variants
+commit synchronously, modify ctime and preserve mtime, mode and file contents.
+Snapshot/fork, rename, replacement, final close, lease expiry, recovery and GC
+retain or release metadata alongside the associated inode. A replacement inode
+starts with its own attributes; old open handles retain the replaced inode's set.
+
+Values live at `\0forkfs/xattr/INODE/NAME` as ordinary CoW leaves. The inode's
+encoded mode word reserves bit 31 for attribute presence; the public mode remains
+0000..0777. Older daemons reject that mode marker, and the last removal clears it.
+Existing stores need no conversion. Orphan attributes use separate retention roots
+until final close/restart, and fs-check verifies their bounds and presence marker.
+Revision diff compares attribute names and object IDs independently of ctime,
+reports `xattrs_changed`, and includes that result in `metadata_changed` without
+claiming file-content changes. History continues to traverse retained revisions.
 
 ## Revision history
 
@@ -167,8 +212,9 @@ that pair while paging. Responses fit the existing 1 MiB RPC frame even at the
 
 Entries report `path`, `change` (`added`, `removed`, `modified`), before/after inode
 IDs and types (null on the absent side), `metadata_changed` and `content_changed`.
-Metadata compares identity, type, mode, link count, size, mtime and ctime; storage
-layout is excluded. Content compares logical bytes, including zero holes, without
+Metadata compares identity, type, mode, link count, size, mtime, ctime and xattrs;
+`xattrs_changed` identifies changes to attribute names or values. Storage layout
+is excluded. Content compares logical bytes, including zero holes, without
 using size or timestamp equality as proof. Equal content/chunk object IDs skip
 byte reads. Distinct storage representations compare in chunks of at most 64 KiB.
 Added/removed entries have metadata changes and content changes for non-directories;

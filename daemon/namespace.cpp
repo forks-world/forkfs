@@ -47,6 +47,7 @@ uint64_t now() {
 }
 std::string inode_key(const std::string& id) {return prefix+"inode/"+id;}
 std::string allocated_key(const std::string& id) {return prefix+"allocated/"+id;}
+std::string xattr_prefix(const std::string& id) {return prefix+"xattr/"+id+"/";}
 std::string content_key(const std::string& id) {return prefix+"content/"+id;}
 std::string directory_prefix(const std::string& id) {return prefix+"entry/"+id+"/";}
 std::string entry_key(const std::string& id,const std::string& name) {return directory_prefix(id)+name;}
@@ -60,21 +61,25 @@ std::string root(const NamespaceView& journal) {
 }
 InodeInfo decode_inode(const Bytes& b,const std::string& id,bool orphan=false) {
     need(b.size()==48 && !memcmp(b.data(),"FFINOD01",8),"invalid inode record");
-    auto type=load(b.data()+8,4),mode=load(b.data()+12,4);
+    auto type=load(b.data()+8,4),encoded_mode=load(b.data()+12,4);
+    // Older readers reject this mode bit instead of silently losing xattrs.
+    bool xattrs=(encoded_mode&0x80000000U)!=0;auto mode=encoded_mode&~uint64_t(0x80000000U);
     need((type==1||type==2||type==3||type==4) && mode<=0777,"unsupported inode attributes");
     InodeInfo n{id,type==2,static_cast<uint32_t>(mode),load(b.data()+16,8),load(b.data()+24,8),
-                load(b.data()+32,8),load(b.data()+40,8),type==3,type==4};
+                load(b.data()+32,8),load(b.data()+40,8),type==3,type==4,xattrs};
     need((orphan?(!n.directory && !n.symlink && n.links==0):n.links>0) && (!n.directory || (n.links>=2 && n.size==0)),"invalid inode state");return n;
 }
 InodeInfo inode(const NamespaceView& journal,const std::string& id) {return decode_inode(journal.get(inode_key(id)),id);}
 std::string orphan_prefix(const std::string& world,const std::string& id) {return history+"orphan/"+world+"/"+id+"/";}
 Bytes encode(const InodeInfo& n) {
     Bytes b(48);memcpy(b.data(),"FFINOD01",8);store(b.data()+8,n.symlink?3:n.directory?2:n.chunked?4:1,4);
-    store(b.data()+12,n.mode,4);store(b.data()+16,n.links,8);store(b.data()+24,n.size,8);
+    store(b.data()+12,uint64_t(n.mode)|(n.xattrs?uint64_t(0x80000000U):0),4);store(b.data()+16,n.links,8);store(b.data()+24,n.size,8);
     store(b.data()+32,n.modified_ns,8);store(b.data()+40,n.changed_ns,8);return b;
 }
+void valid_xattr_name(const std::string& name);
 bool valid_orphan_field(const std::string& field) {
     if(field=="inode" || field=="content")return true;
+    if(field.starts_with("xattr/")){valid_xattr_name(field.substr(6));return true;}
     return field.size()==10 && field.starts_with("chunk/") &&
         std::all_of(field.begin()+6,field.end(),[](char c){return c>='0'&&c<='9';}) && field.substr(6)<"1024";
 }
@@ -115,6 +120,9 @@ void valid_namespace_text(const std::string& value) {
         need(scalar>=minimum && scalar<=0x10ffff && !(scalar>=0xd800 && scalar<=0xdfff),"invalid UTF-8 namespace text");
         need(scalar>=0x20 && !(scalar>=0x7f && scalar<=0x9f),"invalid control character in namespace text");
     }
+}
+void valid_xattr_name(const std::string& name) {
+    need(!name.empty(),"invalid empty extended attribute name");need(name.size()<=255,"extended attribute name exceeds 255 bytes");valid_namespace_text(name);
 }
 std::vector<std::string> components(const std::string& path) {
     need(!path.empty() && path[0]=='/' && path.size()<=4096,"path must be absolute and at most 4096 bytes");
@@ -281,6 +289,70 @@ public:
     }
 };
 
+namespace {
+class Xattrs {
+    using Changes=std::map<std::string,std::optional<Bytes>>;
+    std::function<bool(const std::string&)> contains_;
+    std::function<Bytes(const std::string&)> get_;
+    std::function<std::vector<std::string>(const std::string&)> keys_;
+    std::string prefix_;
+    Changes* changes_;
+public:
+    Xattrs(const NamespaceView& view,const std::string& id,Changes* changes=nullptr)
+        :contains_([&view](const auto& key){return view.contains(key);}),get_([&view](const auto& key){return view.get(key);}),
+         keys_([&view](const auto& key){return view.keys(key);}),prefix_(xattr_prefix(id)),changes_(changes) {}
+    Xattrs(const Journal& journal,const std::string& orphan,Changes* changes=nullptr)
+        :contains_([&journal](const auto& key){return journal.contains(key);}),get_([&journal](const auto& key){return journal.get(key);}),
+         keys_([&journal](const auto& key){return journal.keys(key);}),prefix_(orphan+"xattr/"),changes_(changes) {}
+    std::vector<std::string> records() const {return keys_(prefix_);}
+    Bytes get(const std::string& name) const {
+        valid_xattr_name(name);auto key=prefix_+name;need(contains_(key),"extended attribute not found");auto value=get_(key);
+        need(value.size()<=64*1024,"extended attribute exceeds 64 KiB");return value;
+    }
+    std::vector<std::string> names() const {
+        auto keys=records();need(keys.size()<=32,"extended attribute count limit reached");std::vector<std::string> result;
+        for(const auto& key:keys){auto name=key.substr(prefix_.size());valid_xattr_name(name);result.push_back(name);}return result;
+    }
+    bool edit(const std::string& name,const std::optional<Bytes>& value,Namespace::XattrPolicy policy) {
+        valid_xattr_name(name);need(policy==Namespace::XattrPolicy::Upsert || policy==Namespace::XattrPolicy::Create || policy==Namespace::XattrPolicy::Replace,"invalid extended attribute policy");
+        auto key=prefix_+name;bool exists=contains_(key);auto count=records().size();
+        if(value){need(value->size()<=64*1024,"extended attribute exceeds 64 KiB");
+            need(policy!=Namespace::XattrPolicy::Create || !exists,"extended attribute already exists");
+            need(policy!=Namespace::XattrPolicy::Replace || exists,"extended attribute not found");
+            need(exists || count<32,"extended attribute count limit reached");
+        } else need(exists,"extended attribute not found");
+        (*changes_)[key]=value;return value.has_value() || count>1;
+    }
+    void verify(bool flag) const {auto values=names();need(flag==!values.empty(),"invalid extended attribute inode flag");for(const auto& name:values)(void)get(name);}
+};
+}
+Namespace::XattrPolicy Namespace::xattr_policy(const std::string& value) {
+    if(value=="upsert")return XattrPolicy::Upsert;if(value=="create")return XattrPolicy::Create;if(value=="replace")return XattrPolicy::Replace;
+    throw std::runtime_error("invalid extended attribute policy");
+}
+std::pair<InodeInfo,bool> Namespace::xattr_inode(const NamespaceView& view,const std::string& target,bool handle) const {
+    if(!handle)return {inode(view,resolve(view,target,false)),true};
+    const auto& info=find_handle(target);bool linked=view.contains(inode_key(info.inode));
+    return {linked?inode(view,info.inode):decode_inode(container_.journal_->get(orphan_prefix(view_,info.inode)+"inode"),info.inode,true),linked};
+}
+Bytes Namespace::read_xattr(const std::string& target,const std::string& name,bool handle) const {
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto [n,linked]=xattr_inode(view,target,handle);
+    return linked?Xattrs(view,n.id).get(name):Xattrs(*container_.journal_,orphan_prefix(view_,n.id)).get(name);
+}
+std::vector<std::string> Namespace::read_xattr_names(const std::string& target,bool handle) const {
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto [n,linked]=xattr_inode(view,target,handle);
+    return linked?Xattrs(view,n.id).names():Xattrs(*container_.journal_,orphan_prefix(view_,n.id)).names();
+}
+void Namespace::edit_xattr(const std::string& target,const std::string& name,const std::optional<Bytes>& value,XattrPolicy policy,bool handle) {
+    need(!revision_,"revision view is read-only");
+    auto edit=[&](const NamespaceView& view,Changes& changes){auto [n,linked]=xattr_inode(view,target,handle);auto pre=orphan_prefix(view_,n.id);
+        auto attrs=linked?Xattrs(view,n.id,&changes):Xattrs(*container_.journal_,pre,&changes);
+        n.xattrs=attrs.edit(name,value,policy);n.changed_ns=now();changes[linked?inode_key(n.id):pre+"inode"]=encode(n);
+    };
+    if(!handle){update(edit);return;}
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);Changes changes;edit(view,changes);commit_changes(view,changes);
+}
+
 void Namespace::update(const std::function<void(const NamespaceView&,Changes&)>& operation) {
     need(!revision_,"revision view is read-only");
     bool offline_compacted=false;
@@ -362,6 +434,9 @@ std::string Namespace::diff(const std::string& before,const std::string& after,c
     auto identity=[&](const std::optional<InodeInfo>& n){return n?quote(n->id):std::string("null");};
     auto same_metadata=[](const InodeInfo& a,const InodeInfo& b){return a.id==b.id && a.directory==b.directory && a.symlink==b.symlink &&
         a.mode==b.mode && a.links==b.links && a.size==b.size && a.modified_ns==b.modified_ns && a.changed_ns==b.changed_ns;};
+    auto attribute_ids=[](const NamespaceView& view,const std::optional<InodeInfo>& n){
+        std::map<std::string,ObjectId> result;if(n){auto pre=xattr_prefix(n->id);for(const auto& key:view.keys(pre))result.emplace(key.substr(pre.size()),*view.reference(key));}return result;
+    };
     auto same_content=[&](InodeInfo& a,InodeInfo& b){
         if(a.directory || b.directory)return a.directory==b.directory;
         if(a.symlink!=b.symlink || a.size!=b.size)return false;
@@ -387,14 +462,14 @@ std::string Namespace::diff(const std::string& before,const std::string& after,c
             auto entry=pending.extract(pending.begin());auto path=std::move(entry.key());auto [a_id,b_id]=std::move(entry.mapped());
             std::optional<InodeInfo> a=a_id.empty()?std::nullopt:std::optional(inode(left,a_id));
             std::optional<InodeInfo> b=b_id.empty()?std::nullopt:std::optional(inode(right,b_id));
-            if(path>after_path){bool metadata=!a || !b || !same_metadata(*a,*b);
+            if(path>after_path){bool attrs_changed=attribute_ids(left,a)!=attribute_ids(right,b);bool metadata=attrs_changed || !a || !b || !same_metadata(*a,*b);
                 bool content=!a? !b->directory:!b? !a->directory:!same_content(*a,*b);
                 if(metadata || content) {
                     if(changes.size()==limit){eof=false;break;}
                     changes.push_back("{\"path\":"+quote(path)+",\"change\":"+quote(!a?"added":!b?"removed":"modified")+
                         ",\"before_inode\":"+identity(a)+",\"after_inode\":"+identity(b)+
                         ",\"before_type\":"+type(a)+",\"after_type\":"+type(b)+
-                        ",\"metadata_changed\":"+(metadata?"true":"false")+",\"content_changed\":"+(content?"true":"false")+"}");last=path;
+                        ",\"xattrs_changed\":"+(attrs_changed?"true":"false")+",\"metadata_changed\":"+(metadata?"true":"false")+",\"content_changed\":"+(content?"true":"false")+"}");last=path;
                 }
             }
             auto children=[&](const NamespaceView& view,const std::optional<InodeInfo>& n,std::set<std::string>& visited,bool old){
@@ -677,13 +752,14 @@ void Namespace::link(const std::string& source,const std::string& target) {
     });
 }
 void Namespace::retire(const NamespaceView& j,Changes& c,const InodeInfo& n) {
-    c[inode_key(n.id)]=std::nullopt;if(n.directory)return;
+    c[inode_key(n.id)]=std::nullopt;auto attrs=Xattrs(j,n.id).records();for(const auto& key:attrs)c[key]=std::nullopt;if(n.directory)return;
     auto copy=n;auto data=FileContent(copy,j);auto records=data.records();
     for(const auto& key:records)c[key]=std::nullopt;
     auto count=container_.open_counts_.find({view_,n.id});
     if(count!=container_.open_counts_.end() && count->second) {
         auto orphan=n;orphan.links=0;orphan.changed_ns=now();auto pre=orphan_prefix(view_,n.id);
         c[pre+"inode"]=encode(orphan);
+        for(const auto& key:attrs)c[pre+"xattr/"+key.substr(xattr_prefix(n.id).size())]=j.get(key);
         for(const auto& key:records){auto suffix=n.chunked?"chunk/"+key.substr(key.size()-4):"content";c[pre+suffix]=j.get(key);}
     }
 }
@@ -724,6 +800,7 @@ void Namespace::verify() const {
     std::set<std::string> directories;expected.insert(root_key);
     std::function<void(const std::string&)> visit=[&](const std::string& id) {
         auto n=inode(j,id);expected.insert(inode_key(id));
+        Xattrs attributes(j,id);attributes.verify(n.xattrs);for(const auto& key:attributes.records())expected.insert(key);
         need(j.contains(allocated_key(id)) && j.get(allocated_key(id)).empty(),"inode missing allocation record");
         if(!n.directory){FileContent content(n,j);content.verify();
             if(n.symlink){auto data=j.get(content_key(id));target_components(std::string(data.begin(),data.end()));}
@@ -755,7 +832,8 @@ void Namespace::verify() const {
             need(!j.contains(inode_key(id)),"orphan also appears in World tree");
             auto n=decode_inode(journal.get(orphan_prefix(view_,id)+"inode"),id,true);
             FileContent content(n,journal,orphan_prefix(view_,id));content.verify();
-            std::set<std::string> fields;for(const auto& record:content.records())fields.insert(record);fields.insert(orphan_prefix(view_,id)+"inode");
+            Xattrs attributes(journal,orphan_prefix(view_,id));attributes.verify(n.xattrs);
+            std::set<std::string> fields;for(const auto& record:content.records())fields.insert(record);for(const auto& record:attributes.records())fields.insert(record);fields.insert(orphan_prefix(view_,id)+"inode");
             for(const auto& record:journal.keys(orphan_prefix(view_,id)))need(fields.contains(record),"unexpected orphan record");
         }
     }

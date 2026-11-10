@@ -135,7 +135,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 - (NSInteger)maximumNameLength{return 255;}
 - (BOOL)restrictsOwnershipChanges{return YES;}
 - (BOOL)truncatesLongNames{return NO;}
-- (NSInteger)maximumXattrSize{return 0;}
+- (NSInteger)maximumXattrSize{return 64*1024;}
 - (uint64_t)maximumFileSize{return 64*1024*1024;}
 #ifdef FSKIT_API_AVAILABILITY_V2_4
 - (FSMountOptions)requestedMountOptions {return _readOnly?FSMountOptionsReadOnly:0;}
@@ -285,7 +285,26 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
             forkfs::request_rpc(_socket,fields,_bridged?&_loopback:nullptr);count+=length;}
     }];reply(count,e);
 }
-- (void)getXattrNamed:(FSFileName*)name ofItem:(FSItem*)item replyHandler:(void(^)(NSData*,NSError*))reply {reply(nil,posix(ENOATTR));}
-- (void)setXattrNamed:(FSFileName*)name toData:(NSData*)value onItem:(FSItem*)item policy:(FSSetXattrPolicy)policy replyHandler:(void(^)(NSError*))reply {reply(posix(_readOnly?EROFS:ENOTSUP));}
-- (void)listXattrsOfItem:(FSItem*)item replyHandler:(void(^)(NSArray<FSFileName*>*,NSError*))reply {reply(@[],nil);}
+- (void)getXattrNamed:(FSFileName*)name ofItem:(FSItem*)item replyHandler:(void(^)(NSData*,NSError*))reply {
+    __block NSData* value=nil;NSError* e=[self perform:^{require(name.string!=nil,EINVAL,"invalid UTF-8 extended attribute name");auto it=[self item:item];auto handle=[self handle:it];
+        auto data=[self call:@[handle?@"fs-hxattr-get":@"inode-xattr-get",handle?:it.inode,name.string]];
+        value=[NSData dataWithBytes:data.data() length:data.size()];}];reply(value,e);
+}
+- (void)setXattrNamed:(FSFileName*)name toData:(NSData*)value onItem:(FSItem*)item policy:(FSSetXattrPolicy)policy replyHandler:(void(^)(NSError*))reply {
+    NSError* e=[self perform:^{[self writable];require(name.string!=nil,EINVAL,"invalid UTF-8 extended attribute name");auto it=[self item:item];auto handle=[self handle:it];
+        if(policy==FSSetXattrPolicyDelete){[self call:@[handle?@"fs-hxattr-remove":@"inode-xattr-remove",handle?:it.inode,name.string]];}
+        else {
+            require(value!=nil,EINVAL,"missing extended attribute value");require(value.length<=64*1024,E2BIG,"extended attribute exceeds 64 KiB");
+            require(policy==FSSetXattrPolicyAlwaysSet || policy==FSSetXattrPolicyMustCreate || policy==FSSetXattrPolicyMustReplace,EINVAL,"invalid extended attribute policy");
+            const char* mode=policy==FSSetXattrPolicyMustCreate?"create":policy==FSSetXattrPolicyMustReplace?"replace":"upsert";
+            std::vector<std::string> fields{handle?"fs-hxattr-set":"inode-xattr-set",bytes(handle?:it.inode),bytes(name.string),mode,std::string(value.length?static_cast<const char*>(value.bytes):"",value.length),_revision?"--revision":"--world",bytes(_view),"--session",bytes(_session)};
+            forkfs::request_rpc(_socket,fields,_bridged?&_loopback:nullptr);
+        }
+        [self refresh:it];}];reply(e);
+}
+- (void)listXattrsOfItem:(FSItem*)item replyHandler:(void(^)(NSArray<FSFileName*>*,NSError*))reply {
+    __block NSMutableArray<FSFileName*>* names=nil;NSError* e=[self perform:^{auto it=[self item:item];auto handle=[self handle:it];
+        auto result=[self json:@[handle?@"fs-hxattr-list":@"inode-xattr-list",handle?:it.inode]];names=[NSMutableArray new];
+        for(NSString* name in result[@"names"])[names addObject:[FSFileName nameWithString:name]];}];reply(names,e);
+}
 @end
