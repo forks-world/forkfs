@@ -19,8 +19,12 @@ never prove content equality. Comparing a mutable World requires an explicit
 `fs-snapshot` first; diff never silently selects a World or scans host files.
 See [command semantics and pagination](../daemon/README.md#revision-diff).
 
-Future history exposes committed revisions and parent relationships, rather than
-claiming that observing an external directory captures every write. The new optional FSKit frontend operates through the resident daemon RPC and
+`fs-history` exposes committed revision IDs, parent relationships, manifest IDs
+and captured repository sequences along the ancestry of an explicit named tip.
+Forks retain their selected base as ancestry; unrelated branch commits do not
+appear in that chain. The query does not create versions or claim to capture
+every file write. See [revision history](../daemon/README.md#revision-history).
+The new optional FSKit frontend operates through the resident daemon RPC and
 revision-backed namespace; see [FSKit integration](FSKIT.md). Git and
 execution integration remain unavailable until revision-backed replacements exist.
 

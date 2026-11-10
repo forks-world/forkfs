@@ -88,10 +88,56 @@ count u32 LE (1..16), then length u32 LE + bytes for each field. First field is 
 command; write payload is binary. Reply payload starts with result code u32 LE
 (0 success, 1 generic error, or POSIX errno + 1 for typed errors) followed by raw result/error bytes. The format is experimental.
 Supported commands are `status`, `fs-init`, `fs-mkdir`, `fs-write`, `fs-cat`,
-`fs-diff`, `fs-ls`, `fs-stat`, `fs-read-at`, `fs-write-at`, `fs-append`, `fs-truncate`, `fs-link`, `fs-rename`, `fs-unlink`, `fs-rmdir`, `fs-check`,
+`fs-history`, `fs-diff`, `fs-ls`, `fs-stat`, `fs-read-at`, `fs-write-at`, `fs-append`, `fs-truncate`, `fs-link`, `fs-rename`, `fs-unlink`, `fs-rmdir`, `fs-check`,
 `fs-compact`, `fs-snapshot`, `fs-fork`, `fs-worlds` and `fs-revisions`, with the
-same view selectors as offline commands. `fs-diff` instead takes two explicit
-revision names and rejects view selectors. Revision writes remain forbidden.
+same view selectors as offline commands. `fs-diff` and `fs-history` instead take
+explicit named revisions and reject view selectors. Revision writes remain forbidden.
+
+## Revision history
+
+```sh
+forkfsd fs-history project.forkfs after-edit
+forkfsd fs-history project.forkfs after-edit LAST_RETURNED_REVISION_ID 16
+forkfsd request /private/runtime/control.sock fs-history after-edit '' 64
+```
+
+Offline syntax is `fs-history CONTAINER TIP_REVISION [AFTER_REVISION_ID LIMIT]`;
+RPC syntax is `fs-history TIP_REVISION AFTER_REVISION_ID LIMIT`. TIP_REVISION is
+an existing retained revision name, never an implicit mutable World. To include
+current World changes, first create a named revision with `fs-snapshot`.
+`--world` and `--revision` selectors are rejected for this query. The RPC is a
+read-only repository query and needs no file handle or session; an optional
+`--session` uses the existing lease validation.
+
+Results contain `tip_revision_id`, `entries`, `next_after` and `eof`. Entries are
+newest-to-oldest along that tip's immutable parent chain, with `revision_id`,
+`parent_revision_id` (null at the root), `manifest_id` and `captured_sequence`.
+The captured sequence is the repository commit sequence observed before the
+snapshot descriptor was published, not a timestamp or the publication sequence.
+A fork's first revision points to its selected base revision, including when
+other Worlds have since committed newer revisions. A snapshot with unchanged
+namespace content remains a separate revision, with a shared manifest ID.
+
+Pages contain at most LIMIT entries (default/maximum 64, minimum 1). Pass
+`next_after` as the exclusive AFTER_REVISION_ID while `eof` is false; retain the
+same named tip while paging. The final page has an empty `next_after`. Cursors
+must be canonical lowercase 64-digit object IDs in that tip's ancestry; malformed
+or unrelated cursors fail instead of silently jumping to another branch. The
+parent of each entry is followed by immutable object ID, not by registry-name
+sorting or mutable World state. Responses fit the existing 1 MiB frame limit.
+
+History reads commit no new revision or repository mutation. Later World writes
+and snapshots do not change an existing tip's pages. Restart and physical GC
+preserve the chain because retained descriptors pin their ancestors. This query
+supports both LevelDB and the legacy immutable single-file container format;
+physical GC remains LevelDB-only.
+
+The query reports explicit snapshot ancestry, not every write, an event log,
+per-file history or the children of a revision. It does not implement retention
+or revision deletion. Stateless pages rewalk the chain from the named tip to
+validate the cursor; time and memory can grow with ancestry depth. Reads run
+under the namespace lock. Use `check`/`fs-check` for full object/namespace integrity
+verification.
 
 ## Revision diff
 

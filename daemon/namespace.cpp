@@ -415,6 +415,34 @@ std::string Namespace::diff(const std::string& before,const std::string& after,c
     return result+"],\"next_after\":"+quote(eof?"":last)+",\"eof\":"+(eof?"true":"false")+"}\n";
 }
 
+std::string Namespace::revision_history(const std::string& tip,const std::string& after_id,size_t limit) const {
+    valid_view_name(tip);need(limit>=1 && limit<=64,"invalid history page limit; expected 1..64");
+    need(after_id.empty() || (after_id.size()==64 && std::all_of(after_id.begin(),after_id.end(),[](char c){
+        return (c>='0' && c<='9') || (c>='a' && c<='f');})),"invalid history cursor");
+    std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;
+    auto tip_id=journal.root_object(history+"revision/"+tip),current=tip_id;
+    std::set<ObjectId> visited;std::optional<uint64_t> newer_sequence;
+    bool found=after_id.empty(),eof=true;std::vector<std::string> entries;std::string last;
+    while(current!=ObjectId{}) {
+        need(visited.insert(current).second,"invalid revision ancestry cycle");
+        auto descriptor=journal.get_object(current);
+        need(descriptor.size()==80 && !memcmp(descriptor.data(),"FFREV001",8),"invalid revision record");
+        ObjectId manifest{},parent{};std::copy_n(descriptor.data()+8,32,manifest.begin());std::copy_n(descriptor.data()+40,32,parent.begin());
+        auto sequence=load(descriptor.data()+72,8);
+        need(manifest!=ObjectId{} && (!newer_sequence || sequence<*newer_sequence),"invalid revision ancestry sequence");newer_sequence=sequence;
+        auto id=hex_id(current);
+        if(!found){if(id==after_id)found=true;current=parent;continue;}
+        if(entries.size()==limit){eof=false;break;}
+        entries.push_back("{\"revision_id\":\""+id+"\",\"parent_revision_id\":"+(parent==ObjectId{}?"null":"\""+hex_id(parent)+"\"")+
+            ",\"manifest_id\":\""+hex_id(manifest)+"\",\"captured_sequence\":"+std::to_string(sequence)+"}");
+        last=id;current=parent;
+    }
+    need(found,"invalid history cursor; revision is not in tip ancestry");
+    std::string result="{\"tip_revision_id\":\""+hex_id(tip_id)+"\",\"entries\":[";
+    for(size_t i=0;i<entries.size();++i){if(i)result+=',';result+=entries[i];}
+    return result+"],\"next_after\":\""+(eof?"":last)+"\",\"eof\":"+(eof?"true":"false")+"}\n";
+}
+
 std::string Namespace::snapshot(const std::string& name) {
     valid_view_name(name);need(!revision_,"revision view is read-only");
     std::lock_guard lock(container_.mutex_);auto& j=*container_.journal_;
