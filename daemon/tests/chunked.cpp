@@ -48,6 +48,22 @@ int main(){
             fs.handle_write(handle,65533,Bytes{1,2,3,4,5,6});check(fs.handle_read(handle,65533,6)==Bytes({1,2,3,4,5,6}));
             attrs.size=65535;fs.handle_set_attributes(handle,attrs);fs.handle_truncate(handle,128*1024);
             check(fs.handle_read(handle,65533,6)==Bytes({1,2,0,0,0,0}));fs.verify();fs.close(handle);
+            // Open hard links keep a sparse inode alive after its names are removed.
+            fs.write("/sparse-orphan",{});fs.write_at("/sparse-orphan",1024*1024-1,Bytes{0x5a});fs.link("/sparse-orphan","/sparse-alias");
+            auto sparse=fs.open("/sparse-alias",Namespace::Access::ReadWrite);fs.remove("/sparse-orphan",false);fs.remove("/sparse-alias",false);
+            check(fs.handle_stat(sparse).size==1024*1024 && fs.handle_stat(sparse).links==0);
+            fs.handle_write(sparse,0,Bytes{0});check(fs.handle_read(sparse,0,1)==Bytes{0});
+            check(fs.handle_read(sparse,1024*1024-1,2)==Bytes{0x5a});check(fs.handle_stat(sparse).size==1024*1024);fs.verify();fs.close(sparse);
+            // Promoting an unlinked inline zero file must tolerate absent zero chunks.
+            fs.write("/inline-zero-orphan",Bytes(32,0));auto inline_zero=fs.open("/inline-zero-orphan",Namespace::Access::ReadWrite);fs.remove("/inline-zero-orphan",false);
+            fs.handle_write(inline_zero,Namespace::maximum_io_size+17,Bytes(8,0));
+            check(fs.handle_read(inline_zero,0,32)==Bytes(32,0));check(fs.handle_read(inline_zero,Namespace::maximum_io_size+17,8)==Bytes(8,0));
+            check(fs.handle_read(inline_zero,Namespace::maximum_io_size+25,1).empty());fs.close(inline_zero);
+            // Replacing an existing nonzero orphan chunk with zeros removes it.
+            fs.write("/nonzero-orphan",{});fs.write_at("/nonzero-orphan",1024*1024-1,Bytes{0x7f});
+            auto nonzero=fs.open("/nonzero-orphan",Namespace::Access::ReadWrite);fs.remove("/nonzero-orphan",false);
+            fs.handle_write(nonzero,1024*1024-1,Bytes{0});check(fs.handle_stat(nonzero).size==1024*1024);
+            check(fs.handle_read(nonzero,1024*1024-1,1)==Bytes{0});check(fs.handle_read(nonzero,1024*1024,1).empty());fs.verify();fs.close(nonzero);
             // Original inline and chunked revisions survive replacement and GC.
             fs.write("/f",Bytes{'n'});check(fs.read("/alias")==Bytes{'n'});
             check(read_all(old,"/f")==retained);fs.verify();work.verify();old.verify();store.verify();

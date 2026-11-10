@@ -326,6 +326,7 @@ void Namespace::commit_changes(const NamespaceView& view,Changes& changes) {
         const auto allocated=prefix+"allocated/";
         for(const auto& [key,value]:changes) {
             if(key.starts_with(history+"orphan/")){
+                if(!value && !journal.contains(key))continue;
                 if(value){auto id=Journal::object_id(*value);if(journal.contains(history+"object/"+hex_id(id))){batch.push_back({key,std::nullopt,id});continue;}}
                 batch.push_back({key,value});continue;}
             if(value) {
