@@ -230,6 +230,18 @@ int main(int argc,char** argv){@autoreleasepool {
         FSItemSetAttributesRequest* badLinkSize=[FSItemSetAttributesRequest new];badLinkSize.mode=0777;badLinkSize.size=attrs.size;
         [volume setAttributes:badLinkSize onItem:danglingLink replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(result.code==EINVAL,"symlink size change must fail even for the current length");
         [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:danglingLink replyHandler:^(FSItemAttributes* a,NSError* e){attrs=a;result=e;}];check(!result && attrs.mode==0701 && attrs.modifyTime.tv_sec==333,"invalid symlink size partially changed metadata");
+        [volume openItem:danglingLink withModes:FSVolumeOpenModesRead|FSVolumeOpenModesWrite replyHandler:^(NSError* e){result=e;}];check(!result,"symlink metadata open failed");
+        [volume setXattrNamed:attrName toData:contents onItem:danglingLink policy:FSSetXattrPolicyAlwaysSet replyHandler:^(NSError* e){result=e;}];check(!result,"symlink fd xattr set failed");
+        [volume readFromFile:danglingLink offset:0 length:0 intoBuffer:(FSMutableFileDataBuffer*)buffer replyHandler:^(size_t n,NSError* e){result=e;count=n;}];check(result.code==EPERM && count==0,"symlink data read must fail even when empty");
+        [volume writeContents:[NSData data] toFile:danglingLink atOffset:0 replyHandler:^(size_t n,NSError* e){result=e;count=n;}];check(result.code==EPERM && count==0,"symlink data write must fail even when empty");
+        [volume removeItem:danglingLink named:[FSFileName nameWithString:@"dangling-attributes"] fromDirectory:root replyHandler:^(NSError* e){result=e;}];check(!result,"open symlink unlink failed");
+        __block FSItem* reusedLink=nil;
+        [volume createSymbolicLinkNamed:[FSFileName nameWithString:@"dangling-attributes"] inDirectory:root attributes:[FSItemSetAttributesRequest new] linkContents:[FSFileName nameWithString:@"replacement"] replyHandler:^(FSItem* it,FSFileName* n,NSError* e){reusedLink=it;result=e;}];check(reusedLink && reusedLink!=danglingLink && !result,"symlink path reuse lost identity");
+        [volume getXattrNamed:attrName ofItem:danglingLink replyHandler:^(NSData* v,NSError* e){xattrValue=v;result=e;}];check(!result && [xattrValue isEqualToData:contents],"orphan symlink fd lost xattr");
+        [volume closeItem:danglingLink keepingModes:FSVolumeOpenModesRead replyHandler:^(NSError* e){result=e;}];check(!result,"symlink writer downgrade failed");
+        [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:danglingLink replyHandler:^(FSItemAttributes* a,NSError* e){attrs=a;result=e;}];check(!result && attrs.linkCount==0 && attrs.type==FSItemTypeSymlink,"symlink reader must retain orphan after downgrade");
+        [volume closeItem:danglingLink keepingModes:0 replyHandler:^(NSError* e){result=e;}];check(!result,"symlink metadata close failed");
+        [volume reclaimItem:danglingLink replyHandler:^(NSError* e){result=e;}];check(!result,"symlink metadata reclaim failed");
         [volume deactivateWithOptions:0 replyHandler:^(NSError* e){result=e;}];check(!result,"deactivation failed");volume=nil;
         NSMutableDictionary* roConfig=[@{@"schema_version":@1,@"revision":@"base",@"repository":status[@"repository_id"]} mutableCopy];
         if(config[@"rpc"])roConfig[@"rpc"]=config[@"rpc"];

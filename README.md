@@ -39,7 +39,9 @@ from the retired native-directory `world` backend.
 The daemon and FSKit frontend store nanosecond mtime, atime and birth time in
 revision metadata. `fs-settimes` updates selected times atomically; reads follow
 a noatime policy. `fs-lchmod` and `fs-lsettimes` update the final symlink itself,
-including dangling links, without changing its target. See [mode and timestamps](daemon/README.md#mode-and-timestamps).
+including dangling links, without changing its target. Symlink metadata handles
+also support O_SYMLINK and `cp -Pp` with xattrs, while rejecting data I/O.
+See [mode and timestamps](daemon/README.md#mode-and-timestamps).
 
 ## Build and test
 

@@ -70,7 +70,7 @@ InodeInfo decode_inode(const Bytes& b,const std::string& id,bool orphan=false) {
                 load(b.data()+32,8),load(b.data()+40,8),type==3,type==4,xattrs};
     n.accessed_ns=extended?load(b.data()+48,8):n.modified_ns;n.birth_ns=extended?load(b.data()+56,8):n.changed_ns;
     need(n.accessed_ns<=INT64_MAX && n.birth_ns<=INT64_MAX,"inode time exceeds supported nanosecond range");
-    need((orphan?(!n.directory && !n.symlink && n.links==0):n.links>0) && (!n.directory || (n.links>=2 && n.size==0)),"invalid inode state");return n;
+    need((orphan?(!n.directory && n.links==0):n.links>0) && (!n.directory || (n.links>=2 && n.size==0)),"invalid inode state");return n;
 }
 InodeInfo inode(const NamespaceView& journal,const std::string& id) {return decode_inode(journal.get(inode_key(id)),id);}
 std::string orphan_prefix(const std::string& world,const std::string& id) {return history+"orphan/"+world+"/"+id+"/";}
@@ -779,6 +779,7 @@ void Namespace::handle_set_attributes(const std::string& token,const Attributes&
     NamespaceView view(*container_.journal_,view_,revision_);bool linked=view.contains(inode_key(info.inode));
     auto key=linked?inode_key(info.inode):orphan_prefix(view_,info.inode)+"inode";
     auto n=linked?inode(view,info.inode):decode_inode(container_.journal_->get(key),info.inode,true);
+    need(!n.symlink || !a.size,"invalid symbolic link size change");
     need(!a.size || info.writable,"handle is not writable");
     if(!a.mode && !a.modified_ns && !a.size && !a.accessed_ns && !a.birth_ns)return;
     if(a.size && *a.size==n.size && !a.mode && !a.modified_ns && !a.accessed_ns && !a.birth_ns)return;
@@ -895,6 +896,7 @@ void Namespace::verify_locked() const {
             need(!j.contains(inode_key(id)),"orphan also appears in World tree");
             auto n=decode_inode(journal.get(orphan_prefix(view_,id)+"inode"),id,true);
             FileContent content(n,journal,orphan_prefix(view_,id));content.verify();
+            if(n.symlink){auto data=journal.get(orphan_prefix(view_,id)+"content");target_components(std::string(data.begin(),data.end()));}
             Xattrs attributes(journal,orphan_prefix(view_,id));attributes.verify(n.xattrs);
             std::set<std::string> fields;for(const auto& record:content.records())fields.insert(record);for(const auto& record:attributes.records())fields.insert(record);fields.insert(orphan_prefix(view_,id)+"inode");
             for(const auto& record:journal.keys(orphan_prefix(view_,id)))need(fields.contains(record),"unexpected orphan record");
@@ -911,6 +913,7 @@ std::string Namespace::open(const std::string& path,Access access,const OpenOpti
     need(!options.exclusive || options.create,"exclusive open requires create");
     need(!options.truncate || access!=Access::Read,"truncate open requires writable access");
     need(!options.append || access!=Access::Read,"append open requires writable access");
+    need(!options.symlink || (!options.create && !options.truncate && !options.append && !options.nofollow),"invalid symlink open options");
     need(options.mode<=0777,"invalid creation mode");
     need(!revision_ || (access==Access::Read && !options.create && !options.truncate),"revision view is read-only");
     std::lock_guard lock(container_.mutex_);auto& j=*container_.journal_;
@@ -931,9 +934,9 @@ std::string Namespace::open(const std::string& path,Access access,const OpenOpti
             changes[inode_key(id)]=encode(n);changes[content_key(id)]=Bytes{};changes[allocated_key(id)]=Bytes{};
             changes[p.key]=id_bytes(id);changes[inode_key(p.id)]=encode(pn);
         }
-    } else {id=resolve(view,path,!options.nofollow);need(!options.nofollow || !inode(view,id).symlink,"final symbolic link is forbidden");}
+    } else {id=resolve(view,path,!(options.nofollow || options.symlink));need(!options.nofollow || !inode(view,id).symlink,"final symbolic link is forbidden");}
     if(changes.empty()) {
-        auto n=inode(view,id);need(!n.directory && !n.symlink,"only regular file handles are implemented");
+        auto n=inode(view,id);need(!n.directory,"cannot read a directory");need(!n.symlink || options.symlink,"symbolic link open is forbidden");
         if(options.truncate && n.size!=0){FileContent(n,view,&changes).resize(0);touch(n);changes[inode_key(id)]=encode(n);}
     }
     auto token=new_id(view);while(token==id || container_.handles_.contains(token))token=new_id(view);
@@ -1036,9 +1039,9 @@ Bytes Namespace::handle_read(const std::string& token,uint64_t offset,uint64_t c
 }
 Bytes Namespace::read_handle_locked(const Container::OpenHandle& info,uint64_t offset,uint64_t count) const {
     const auto& j=*container_.journal_;NamespaceView view(j,view_,revision_);
-    if(view.contains(inode_key(info.inode))){auto n=inode(view,info.inode);return FileContent(n,view).read(offset,count);}
+    if(view.contains(inode_key(info.inode))){auto n=inode(view,info.inode);need(!n.symlink,"symbolic link handle forbids data I/O");return FileContent(n,view).read(offset,count);}
     need(!revision_,"revision inode missing");auto pre=orphan_prefix(view_,info.inode);
-    auto n=decode_inode(j.get(pre+"inode"),info.inode,true);return FileContent(n,j,pre).read(offset,count);
+    auto n=decode_inode(j.get(pre+"inode"),info.inode,true);need(!n.symlink,"symbolic link handle forbids data I/O");return FileContent(n,j,pre).read(offset,count);
 }
 void Namespace::edit_handle(const std::string& token,const std::function<bool(FileContent&,bool)>& edit,const std::function<void()>& committed) {
     need(!revision_,"revision view is read-only");
@@ -1046,6 +1049,7 @@ void Namespace::edit_handle(const std::string& token,const std::function<bool(Fi
     const auto& info=find_handle(token);need(info.writable,"handle is not writable");
     bool linked=view.contains(inode_key(info.inode));auto pre=orphan_prefix(view_,info.inode);auto& j=*container_.journal_;
     auto n=linked?inode(view,info.inode):decode_inode(j.get(pre+"inode"),info.inode,true);
+    need(!n.symlink,"symbolic link handle forbids data I/O");
     FileContent data=linked?FileContent(n,view,&changes):FileContent(n,j,pre,&changes);
     if(edit(data,info.append)){touch(n);changes[linked?inode_key(info.inode):pre+"inode"]=encode(n);}
     commit_changes(view,changes);if(committed)committed();
