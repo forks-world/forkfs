@@ -293,8 +293,12 @@ int main(int argc, char** argv) {
             } else if(command=="fs-write" && argc==5) {
                 fs.write(argv[3],load_file(argv[4]));
             } else if(command=="fs-cat" && argc==4) {
-                auto value=fs.read(argv[3]);
-                std::cout.write(reinterpret_cast<const char*>(value.data()),value.size());
+                for(uint64_t offset=0;;) {
+                    auto value=fs.read_at(argv[3],offset,forkfs::Namespace::maximum_io_size);
+                    if(value.empty())break;
+                    std::cout.write(reinterpret_cast<const char*>(value.data()),value.size());offset+=value.size();
+                    if(!std::cout)throw std::runtime_error("cannot write file output");
+                }
                 if(!std::cout)throw std::runtime_error("cannot write file output");return 0;
             } else if(command=="fs-ls" && argc==4) {
                 for(const auto& name:fs.list(argv[3]))std::cout<<name<<'\n';return 0;

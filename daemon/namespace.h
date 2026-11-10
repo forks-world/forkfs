@@ -10,10 +10,14 @@ struct InodeInfo {
     uint32_t mode;
     uint64_t links, size, modified_ns, changed_ns;
     bool symlink=false;
+    bool chunked=false;
 };
 class NamespaceView;
+class FileContent;
 class Namespace {
 public:
+    static constexpr uint64_t maximum_file_size=64*1024*1024;
+    static constexpr size_t maximum_io_size=256*1024;
     struct Attributes {std::optional<uint32_t> mode;std::optional<uint64_t> modified_ns;std::optional<uint64_t> size;};
     class DirectoryCursor {
         friend class Namespace;
@@ -78,7 +82,7 @@ private:
     friend class Container;
     static void recover_orphans(Container& container);
     const Container::OpenHandle& find_handle(const std::string& handle) const;
-    void edit_handle(const std::string& handle,const std::function<bool(std::vector<unsigned char>&,bool)>& edit,const std::function<void()>& committed={});
+    void edit_handle(const std::string& handle,const std::function<bool(FileContent&,bool)>& edit,const std::function<void()>& committed={});
     std::vector<unsigned char> read_handle_locked(const Container::OpenHandle& info,uint64_t offset,uint64_t count) const;
     using Changes=std::map<std::string,std::optional<std::vector<unsigned char>>>;
     void retire(const NamespaceView& view,Changes& changes,const InodeInfo& inode);
@@ -87,6 +91,6 @@ private:
     std::string view_;
     bool revision_;
     void update(const std::function<void(const NamespaceView&,Changes&)>& operation);
-    void edit_content(const std::string& path,const std::function<bool(std::vector<unsigned char>&)>& edit);
+    void edit_content(const std::string& path,const std::function<bool(FileContent&)>& edit);
 };
 }

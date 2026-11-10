@@ -22,7 +22,7 @@ inline int rpc_posix_error(std::string_view message) {
     if(message.find("not a directory")!=message.npos)return ENOTDIR;
     if(message.find("cannot read a directory")!=message.npos)return EISDIR;
     if(message.find("read-only")!=message.npos)return EROFS;
-    if(message.find("256 KiB")!=message.npos)return EFBIG;
+    if(message.find("256 KiB")!=message.npos || message=="file exceeds 64 MiB")return EFBIG;
     if(message.find("too many symbolic links")!=message.npos)return ELOOP;
     if(message.find("handle limit")!=message.npos || message.find("cursor limit")!=message.npos)return EMFILE;
     if(message.find("not readable")!=message.npos || message.find("not writable")!=message.npos)return EBADF;

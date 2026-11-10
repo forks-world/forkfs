@@ -104,8 +104,8 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         cli('fs-append','/src/file',data,'--revision','base',ok=False)
         for fields in [['fs-write-at','/offset','-1',b'x'],
                        ['fs-read-at','/offset','0','18446744073709551616'],
-                       ['fs-truncate','/offset','262145'],['fs-truncate','/offset','1x'],
-                       ['fs-write-at','/offset','262144',b'x']]:raw(fields,ok=False)
+                       ['fs-truncate','/offset',str(64*1024*1024+1)],['fs-truncate','/offset','1x'],
+                       ['fs-write-at','/offset',str(64*1024*1024),b'x']]:raw(fields,ok=False)
         data.write_bytes(b'handle-original');cli('fs-write','/handle',data)
         handle=json.loads(cli('fs-open','/handle','rw'))['handle']
         second=json.loads(cli('fs-open','/handle','r'))['handle']
