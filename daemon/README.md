@@ -293,9 +293,11 @@ JSON. Reads stop at EOF. Truncate growth zero fills; shrinking discards the tail
 Empty writes/appends and unchanged truncate do not commit or update timestamps.
 Read-only revision restrictions and hardlink identity apply to all operations.
 
-Files support up to 64 MiB, with 256 KiB per daemon I/O call. Small inline files
+Files support up to 1 TiB, with 256 KiB per daemon I/O call. Small inline files
 retain their original layout; larger files use sparse 64 KiB CoW chunks, so
 range operations load only the touched chunks. See the storage layout below.
+This is a logical size limit, not a disk reservation. Current large-file
+qualification covers 65 MiB of dense data and sparse files through 1 TiB.
 
 Successful mutation replies follow local synchronous commit. A lost reply can
 mean the mutation committed: request deduplication is not implemented, and the
@@ -506,7 +508,7 @@ a no-op after view/handle validation. Negative timestamps, uid/gid changes,
 ACLs, setuid/sticky bits and multi-user permission
 enforcement remain unsupported.
 
-Inode records now use the 64-byte `FFINOD02` format. Bytes 8..47 retain the
+Small inode records use the 64-byte `FFINOD02` format. Bytes 8..47 retain the
 original type, mode, links, size, mtime and ctime layout; bytes 48..55 and 56..63
 hold little-endian atime and birth time. The daemon still reads 48-byte
 `FFINOD01` records, using their mtime as the initial atime and ctime as the
@@ -517,6 +519,13 @@ mixed-format views are supported, including GC and the single-file backend.
 Older daemons reject the new record size/magic; upgraded views require this
 daemon even after the last xattr is removed. No in-place whole-store migration
 or downgrade is provided.
+
+Regular files larger than 64 MiB use `FFINOD03`, with the same 64-byte field
+layout and chunked type. Readers predating large-file support reject its magic
+instead of accidentally editing an unsupported large inode. `FFINOD01`/`02`
+remain readable for small files. Shrinking to at most 64 MiB removes extended
+chunk keys and writes that inode as `FFINOD02` again; retained large revisions
+remain version 3 and still require a compatible daemon.
 
 ## Directory pages
 
@@ -801,7 +810,7 @@ delete so inode identities are not reused. Failed validation leaves the file int
 sizes, file/directory link counts, orphan records and allocation markers. The
 internal prefix `NUL + forkfs/` is reserved against generic PUT/batch mutation.
 
-The prototype supports regular files up to 64 MiB, directories, modes 0644/0755,
+The prototype supports regular files up to 1 TiB, directories, modes 0644/0755,
 mtime/ctime, and absolute paths with valid UTF-8 components up to 255 bytes
 (path up to 4096 bytes). Names and symlink targets preserve their original UTF-8
 bytes: case and canonically equivalent NFC/NFD spellings remain distinct.
@@ -817,7 +826,10 @@ wait for local durability.
 
 Regular files retain the original inline inode type (1) until they first grow
 past 256 KiB. They then use inode type 4 and sparse 64 KiB chunks at
-`\0forkfs/chunk/INODE/NNNN` (four decimal digits). Missing chunks and omitted
+`\0forkfs/chunk/INODE/NNNN` for indices 0..1023 (four decimal digits). Higher
+indices use `\0forkfs/chunk/INODE/xNNNNNNNN` (eight decimal digits), up to
+`x16777215`. Both ranges sort in index order; existing keys need no rewrite.
+Missing chunks and omitted
 trailing zero bytes read as zero. Shrinking removes later chunks and trims the
 last chunk, so extending again cannot reveal old bytes. Chunk leaves use the
 existing immutable CoW tree: each operation publishes data and inode size in one
@@ -835,8 +847,12 @@ save-via-temp-file-and-rename remains available.
 Open-unlink retains chunk references under the existing orphan roots. Retention
 reuses object IDs instead of resubmitting all file bytes to the 16 MiB value
 batch. Last close and restart release the roots; physical GC preserves chunks
-referenced by retained revisions. The 64 MiB cap bounds chunk count, unlink and
-truncate transactions while retaining the existing object/batch limits.
+referenced by retained revisions. Sparse revision diff compares the union of
+allocated chunk positions, skipping absent holes rather than scanning the
+whole logical file. The existing 4,096-mutation/16 MiB transaction limits remain:
+unlinking an open dense file with thousands of chunks, or large truncations,
+can still exceed a transaction's capacity. Those operations are not qualified
+across the full 1 TiB dense range; scalable chunk retirement is separate work.
 Permission enforcement beyond the private single-user mount remains unqualified.
 
 

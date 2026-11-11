@@ -2,6 +2,7 @@
 #import "RevisionConfig.h"
 #import <CommonCrypto/CommonDigest.h>
 #include "rpc.h"
+#include "filesystem_limits.h"
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -144,7 +145,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 - (BOOL)restrictsOwnershipChanges{return YES;}
 - (BOOL)truncatesLongNames{return NO;}
 - (NSInteger)maximumXattrSize{return 64*1024;}
-- (uint64_t)maximumFileSize{return 64*1024*1024;}
+- (uint64_t)maximumFileSize{return forkfs::maximum_file_bytes;}
 #ifdef FSKIT_API_AVAILABILITY_V2_4
 - (FSMountOptions)requestedMountOptions {return _readOnly?FSMountOptionsReadOnly:0;}
 #endif
@@ -287,7 +288,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
     __block size_t count=0;NSError* e=[self perform:^{[self writable];require(offset>=0,EINVAL,"negative write offset");auto it=[self item:item];require(itemType(it.attrs)!=FSItemTypeSymlink,EPERM,"symbolic link handle forbids data I/O");require(it.writer!=nil,EBADF,"file is not open for writing");
         // FSKit can exceed ioSize in a single callback. Complete it using
         // bounded RPCs; ioSize is a preference rather than a request limit.
-        require(contents.length==0 || (uint64_t(offset)<=64*1024*1024 && contents.length<=64*1024*1024-uint64_t(offset)),EFBIG,"file exceeds 64 MiB");
+        require(contents.length==0 || (uint64_t(offset)<=forkfs::maximum_file_bytes && contents.length<=forkfs::maximum_file_bytes-uint64_t(offset)),EFBIG,"file exceeds 1 TiB");
         while(count<contents.length){auto length=MIN(contents.length-count,size_t(256*1024));
             std::vector<std::string> fields{"fs-hwrite",bytes(it.writer),std::to_string(uint64_t(offset)+count),std::string(static_cast<const char*>(contents.bytes)+count,length),_revision?"--revision":"--world",bytes(_view),"--session",bytes(_session)};
             forkfs::request_rpc(_socket,fields,_bridged?&_loopback:nullptr);count+=length;}

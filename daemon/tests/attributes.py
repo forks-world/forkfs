@@ -1,6 +1,7 @@
 """Inode mode/mtime, hardlinks, revisions, orphan handles and recovery."""
 import json
 import os
+import select
 from pathlib import Path
 import shutil
 import subprocess
@@ -50,9 +51,8 @@ with tempfile.TemporaryDirectory(prefix='ff-attr-',dir='/tmp') as tmp:
     endpoint=root/'control.sock'
     proc=subprocess.Popen([BIN,'serve',str(db),'--socket',str(endpoint),'--rpc'],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     try:
-        deadline=time.monotonic()+5
-        while not endpoint.exists():
-            assert proc.poll() is None,proc.communicate();assert time.monotonic()<deadline;time.sleep(.01)
+        assert select.select([proc.stdout],[],[],5)[0], 'daemon startup timed out'
+        assert json.loads(proc.stdout.readline())['state']=='leveldb'
         def rpc(*args,ok=True):return run('request',endpoint,*args,ok=ok)
         session=json.loads(rpc('session-open','60000'))['session']
         readonly=json.loads(rpc('fs-open','/file','r','--session',session))['handle']

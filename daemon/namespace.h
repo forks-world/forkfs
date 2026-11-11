@@ -1,5 +1,6 @@
 #pragma once
 #include "container.h"
+#include "filesystem_limits.h"
 #include <functional>
 #include <map>
 
@@ -18,7 +19,7 @@ class NamespaceView;
 class FileContent;
 class Namespace {
 public:
-    static constexpr uint64_t maximum_file_size=64*1024*1024;
+    static constexpr uint64_t maximum_file_size=maximum_file_bytes;
     static constexpr size_t maximum_io_size=256*1024;
     struct Attributes {std::optional<uint32_t> mode;std::optional<uint64_t> modified_ns;std::optional<uint64_t> size;std::optional<uint64_t> accessed_ns,birth_ns;};
     class DirectoryCursor {

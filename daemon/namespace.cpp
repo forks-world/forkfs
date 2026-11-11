@@ -60,7 +60,8 @@ std::string root(const NamespaceView& journal) {
     need(journal.contains(root_key),"filesystem not initialized; use fs-init");return decode_id(journal.get(root_key));
 }
 InodeInfo decode_inode(const Bytes& b,const std::string& id,bool orphan=false) {
-    bool extended=b.size()==64 && !memcmp(b.data(),"FFINOD02",8);
+    bool large=b.size()==64 && !memcmp(b.data(),"FFINOD03",8);
+    bool extended=large || (b.size()==64 && !memcmp(b.data(),"FFINOD02",8));
     need(extended || (b.size()==48 && !memcmp(b.data(),"FFINOD01",8)),"invalid inode record");
     auto type=load(b.data()+8,4),encoded_mode=load(b.data()+12,4);
     // Older readers reject this mode bit instead of silently losing xattrs.
@@ -68,6 +69,7 @@ InodeInfo decode_inode(const Bytes& b,const std::string& id,bool orphan=false) {
     need((type==1||type==2||type==3||type==4) && mode<=0777,"unsupported inode attributes");
     InodeInfo n{id,type==2,static_cast<uint32_t>(mode),load(b.data()+16,8),load(b.data()+24,8),
                 load(b.data()+32,8),load(b.data()+40,8),type==3,type==4,xattrs};
+    need(n.size<=maximum_file_bytes && (large?(n.chunked && n.size>legacy_file_bytes):n.size<=legacy_file_bytes),"invalid inode size/version");
     n.accessed_ns=extended?load(b.data()+48,8):n.modified_ns;n.birth_ns=extended?load(b.data()+56,8):n.changed_ns;
     need(n.accessed_ns<=INT64_MAX && n.birth_ns<=INT64_MAX,"inode time exceeds supported nanosecond range");
     need((orphan?(!n.directory && n.links==0):n.links>0) && (!n.directory || (n.links>=2 && n.size==0)),"invalid inode state");return n;
@@ -75,17 +77,32 @@ InodeInfo decode_inode(const Bytes& b,const std::string& id,bool orphan=false) {
 InodeInfo inode(const NamespaceView& journal,const std::string& id) {return decode_inode(journal.get(inode_key(id)),id);}
 std::string orphan_prefix(const std::string& world,const std::string& id) {return history+"orphan/"+world+"/"+id+"/";}
 Bytes encode(const InodeInfo& n) {
-    Bytes b(64);memcpy(b.data(),"FFINOD02",8);store(b.data()+8,n.symlink?3:n.directory?2:n.chunked?4:1,4);
+    Bytes b(64);memcpy(b.data(),n.size>legacy_file_bytes?"FFINOD03":"FFINOD02",8);store(b.data()+8,n.symlink?3:n.directory?2:n.chunked?4:1,4);
     store(b.data()+12,uint64_t(n.mode)|(n.xattrs?uint64_t(0x80000000U):0),4);store(b.data()+16,n.links,8);store(b.data()+24,n.size,8);
     store(b.data()+32,n.modified_ns,8);store(b.data()+40,n.changed_ns,8);
     store(b.data()+48,n.accessed_ns,8);store(b.data()+56,n.birth_ns,8);return b;
 }
 void valid_xattr_name(const std::string& name);
+std::string chunk_suffix(uint64_t index) {
+    need(index<maximum_file_bytes/file_chunk_bytes,"invalid file chunk index");
+    auto digits=std::to_string(index);
+    // Preserve every old key. Extended keys sort after the old 0000..1023 range
+    // and remain numerically ordered without rewriting existing content leaves.
+    return index<legacy_file_bytes/file_chunk_bytes?std::string(4-digits.size(),'0')+digits:
+        "x"+std::string(8-digits.size(),'0')+digits;
+}
+bool parse_chunk_suffix(std::string_view suffix,uint64_t& index) {
+    bool extended=suffix.size()==9 && suffix[0]=='x';
+    if(!extended && suffix.size()!=4)return false;
+    if(extended)suffix.remove_prefix(1);
+    index=0;for(char c:suffix){if(c<'0'||c>'9')return false;index=index*10+uint64_t(c-'0');}
+    return index<maximum_file_bytes/file_chunk_bytes &&
+        (extended?index>=legacy_file_bytes/file_chunk_bytes:index<legacy_file_bytes/file_chunk_bytes);
+}
 bool valid_orphan_field(const std::string& field) {
     if(field=="inode" || field=="content")return true;
     if(field.starts_with("xattr/")){valid_xattr_name(field.substr(6));return true;}
-    return field.size()==10 && field.starts_with("chunk/") &&
-        std::all_of(field.begin()+6,field.end(),[](char c){return c>='0'&&c<='9';}) && field.substr(6)<"1024";
+    uint64_t index;return field.starts_with("chunk/") && parse_chunk_suffix(std::string_view(field).substr(6),index);
 }
 std::string new_id(const NamespaceView& journal) {
     for(int attempt=0;attempt<8;++attempt) {
@@ -193,7 +210,7 @@ void touch(InodeInfo& n) {n.modified_ns=n.changed_ns=now();}
 // the same immutable object graph as directory metadata. No payload heuristics.
 class FileContent {
     using Changes=std::map<std::string,std::optional<Bytes>>;
-    static constexpr uint64_t chunk_size=64*1024;
+    static constexpr uint64_t chunk_size=file_chunk_bytes;
     InodeInfo& n_;
     std::function<bool(const std::string&)> contains_;
     std::function<Bytes(const std::string&)> get_;
@@ -209,8 +226,7 @@ class FileContent {
         return get_(key);
     }
     std::string chunk_key(uint64_t index) const {
-        // Fixed width decimal keeps scans ordered and gives verify a canonical key.
-        auto suffix=std::to_string(index);return chunks_+std::string(4-suffix.size(),'0')+suffix;
+        return chunks_+chunk_suffix(index);
     }
     void put_chunk(uint64_t index,Bytes data) {
         while(!data.empty() && data.back()==0)data.pop_back();
@@ -249,7 +265,7 @@ public:
     bool write(uint64_t offset,const Bytes& value) {
         need(value.size()<=Namespace::maximum_io_size,"file I/O exceeds 256 KiB");
         if(value.empty())return false;
-        need(offset<=Namespace::maximum_file_size && value.size()<=Namespace::maximum_file_size-offset,"file exceeds 64 MiB");
+        need(offset<=Namespace::maximum_file_size && value.size()<=Namespace::maximum_file_size-offset,"file exceeds 1 TiB");
         auto end=offset+value.size();
         if(!n_.chunked && end<=Namespace::maximum_io_size) {
             auto data=get(inline_);need(data.size()==n_.size,"inode size mismatch");if(end>data.size())data.resize(end,0);
@@ -266,13 +282,13 @@ public:
         n_.size=std::max(n_.size,end);return true;
     }
     bool resize(uint64_t size) {
-        need(size<=Namespace::maximum_file_size,"file exceeds 64 MiB");if(size==n_.size)return false;
+        need(size<=Namespace::maximum_file_size,"file exceeds 1 TiB");if(size==n_.size)return false;
         if(!n_.chunked && size<=Namespace::maximum_io_size){auto data=get(inline_);need(data.size()==n_.size,"inode size mismatch");data.resize(size,0);(*changes_)[inline_]=std::move(data);}
         else {
             promote();
             if(size<n_.size) {
                 for(const auto& key:keys_(chunks_)) {
-                    auto index=std::stoull(key.substr(chunks_.size()));
+                    uint64_t index;need(parse_chunk_suffix(std::string_view(key).substr(chunks_.size()),index),"invalid file chunk key");
                     if(index*chunk_size>=size)(*changes_)[key]=std::nullopt;
                 }
                 if(size%chunk_size){auto index=size/chunk_size;auto key=chunk_key(index);
@@ -287,8 +303,8 @@ public:
         if(!n_.chunked){need(get(inline_).size()==n_.size && n_.size<=Namespace::maximum_io_size,"inode content size mismatch");return;}
         need(!contains(inline_),"chunked inode also has inline content");
         for(const auto& key:keys_(chunks_)) {
-            auto suffix=key.substr(chunks_.size());need(suffix.size()==4 && std::all_of(suffix.begin(),suffix.end(),[](char c){return c>='0'&&c<='9';}),"invalid file chunk key");
-            auto index=std::stoull(suffix);need(index<Namespace::maximum_file_size/chunk_size && key==chunk_key(index) && index*chunk_size<n_.size,"file chunk beyond EOF");
+            uint64_t index;need(parse_chunk_suffix(std::string_view(key).substr(chunks_.size()),index),"invalid file chunk key");
+            need(index*chunk_size<n_.size,"file chunk beyond EOF");
             auto data=get(key);need(!data.empty() && data.size()<=std::min<uint64_t>(chunk_size,n_.size-index*chunk_size) && data.back()!=0,"invalid file chunk");
         }
     }
@@ -450,12 +466,21 @@ std::string Namespace::diff(const std::string& before,const std::string& after,c
         if(!a.chunked && !b.chunked){auto a_ref=left.reference(content_key(a.id)),b_ref=right.reference(content_key(b.id));
             need(a_ref.has_value() && b_ref.has_value(),"inode content missing");if(a_ref==b_ref)return true;}
         FileContent a_data(a,left),b_data(b,right);
-        for(uint64_t offset=0;offset<a.size;offset+=64*1024) {
-            if(a.chunked && b.chunked){auto suffix=std::to_string(offset/(64*1024));suffix=std::string(4-suffix.size(),'0')+suffix;
-                if(left.reference(prefix+"chunk/"+a.id+"/"+suffix)==right.reference(prefix+"chunk/"+b.id+"/"+suffix))continue;}
+        if(a.chunked && b.chunked) {
+            // Holes have no records. Compare only the union of allocated chunk
+            // positions, so a 1 TiB sparse file does not require 16M lookups.
+            std::map<uint64_t,std::pair<std::optional<ObjectId>,std::optional<ObjectId>>> chunks;
+            auto collect=[&](const NamespaceView& view,const InodeInfo& n,bool old){auto pre=prefix+"chunk/"+n.id+"/";
+                for(const auto& key:view.keys(pre)){uint64_t index;need(parse_chunk_suffix(std::string_view(key).substr(pre.size()),index),"invalid file chunk key");
+                    need(index*file_chunk_bytes<n.size,"file chunk beyond EOF");auto& refs=chunks[index];(old?refs.first:refs.second)=view.reference(key);}};
+            collect(left,a,true);collect(right,b,false);
+            for(const auto& [index,refs]:chunks)if(refs.first!=refs.second && a_data.read(index*file_chunk_bytes,file_chunk_bytes)!=b_data.read(index*file_chunk_bytes,file_chunk_bytes))return false;
+            return true;
+        }
+        for(uint64_t offset=0;offset<a.size;offset+=file_chunk_bytes) {
             // Inline and chunked representations (or distinct chunk objects)
             // are compared as bounded logical byte ranges, including zero holes.
-            if(a_data.read(offset,64*1024)!=b_data.read(offset,64*1024))return false;
+            if(a_data.read(offset,file_chunk_bytes)!=b_data.read(offset,file_chunk_bytes))return false;
         }
         return true;
     };
@@ -699,7 +724,7 @@ uint64_t Namespace::append(const std::string& path,const Bytes& value) {
     uint64_t offset=0;edit_content(path,[&](FileContent& data){offset=data.size();return data.write(offset,value);});return offset;
 }
 void Namespace::truncate(const std::string& path,uint64_t size) {
-    need(size<=maximum_file_size,"file exceeds 64 MiB");
+    need(size<=maximum_file_size,"file exceeds 1 TiB");
     edit_content(path,[&](FileContent& data){return data.resize(size);});
 }
 Bytes Namespace::read_at(const std::string& path,uint64_t offset,uint64_t count) const {
@@ -745,7 +770,7 @@ InodeInfo Namespace::stat(const std::string& path) const {
 namespace {
 void valid_attributes(const Namespace::Attributes& a) {
     need(!a.mode || *a.mode<=0777,"unsupported mode bits");
-    need(!a.size || *a.size<=Namespace::maximum_file_size,"file exceeds 64 MiB");
+    need(!a.size || *a.size<=Namespace::maximum_file_size,"file exceeds 1 TiB");
     need(!a.modified_ns || *a.modified_ns<=INT64_MAX,"mtime exceeds supported nanosecond range");
     need(!a.accessed_ns || *a.accessed_ns<=INT64_MAX,"atime exceeds supported nanosecond range");
     need(!a.birth_ns || *a.birth_ns<=INT64_MAX,"birth time exceeds supported nanosecond range");
@@ -821,7 +846,8 @@ void Namespace::retire(const NamespaceView& j,Changes& c,const InodeInfo& n) {
         auto orphan=n;orphan.links=0;orphan.changed_ns=now();auto pre=orphan_prefix(view_,n.id);
         c[pre+"inode"]=encode(orphan);
         for(const auto& key:attrs)c[pre+"xattr/"+key.substr(xattr_prefix(n.id).size())]=j.get(key);
-        for(const auto& key:records){auto suffix=n.chunked?"chunk/"+key.substr(key.size()-4):"content";c[pre+suffix]=j.get(key);}
+        const auto chunks=prefix+"chunk/"+n.id+"/";
+        for(const auto& key:records){auto suffix=n.chunked?"chunk/"+key.substr(chunks.size()):"content";c[pre+suffix]=j.get(key);}
     }
 }
 void Namespace::remove(const std::string& path,bool directory) {
@@ -1064,7 +1090,7 @@ uint64_t Namespace::handle_append(const std::string& token,const Bytes& value) {
     uint64_t offset=0;edit_handle(token,[&](FileContent& data,bool){offset=data.size();return data.write(offset,value);});return offset;
 }
 void Namespace::handle_truncate(const std::string& token,uint64_t size) {
-    need(size<=maximum_file_size,"file exceeds 64 MiB");
+    need(size<=maximum_file_size,"file exceeds 1 TiB");
     edit_handle(token,[&](FileContent& data,bool){return data.resize(size);});
 }
 void Namespace::recover_orphans(Container& container) {

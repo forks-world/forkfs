@@ -477,7 +477,7 @@ def main():
               'limits': ['single mount', 'no power-loss or kernel-crash guarantee',
                          'small-file workloads only']}
     if not args.reference_apfs:
-        report['forkfs_maximum_file_bytes'] = 64 * 1024 * 1024
+        report['forkfs_maximum_file_bytes'] = 1 << 40
     root = Path(tempfile.mkdtemp(prefix='forkfs-api-', dir=target))
     try:
         for name in operations:

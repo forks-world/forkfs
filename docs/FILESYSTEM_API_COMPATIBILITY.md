@@ -25,7 +25,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | 应用接口/行为 | FSKit 或内核路径 | 当前状态与验收边界 |
 | --- | --- | --- |
 | `mount/umount`、只读挂载、后台服务启动/退出 | activate/mount/unmount/deactivate + launcher/session | 挂载已测；服务损失后卸载，不能透明重连旧 inode |
-| `open/read/write/pread/pwrite/close` | OpenCloseOperations、ReadWriteOperations → inode handles | 挂载已测；单文件最多 64 MiB，RPC 单次最多 256 KiB，回调分块 |
+| `open/read/write/pread/pwrite/close` | OpenCloseOperations、ReadWriteOperations → inode handles | 挂载已测；单文件逻辑上限 1 TiB，RPC 单次最多 256 KiB，回调分块 |
 | `O_CREAT/O_EXCL/O_TRUNC/O_APPEND/O_NOFOLLOW/O_DIRECTORY`、`openat` 系列 | 内核路径解析 + lookup/create/open/setattr | 挂载已测排他/类型/nofollow 拒绝、dangling link 创建、截断身份、umask、并发 append、基本 `*at`；全部组合与极限并发仍未验收 |
 | `dup`、打开后 rename/unlink、同名路径重用 | 内核 fd + daemon orphan roots | 挂载已测；包含普通文件、符号链接元数据 fd 和 mmap |
 | `stat/lstat/fstat`、`chmod/fchmod`、`utime/utimens`、birth time | get/setAttributes | 挂载已测；时间纳秒精度，读取不更新 atime，模式仅 0777 |
@@ -40,7 +40,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `mmap(MAP_SHARED/MAP_PRIVATE)`、`msync`、`munmap` | 内核缓存 + ReadWriteOperations | macOS 27.2 单挂载已测；映射/`pread/pwrite` 一致性、private 隔离、open-unlink、flush 后 revision 隔离 |
 | `fcntl(F_SETLK)`、`flock` | 内核原生 advisory locks；与 RPC 锁分开 | macOS 27.2 跨进程互斥、关闭/退出释放已测；byte-range 不相交范围可同时持有。共享锁/阻塞唤醒/信号打断未验收 |
 | `fsync`、目录同步、`F_FULLFSYNC`、断电恢复 | synchronize → inode-sync + 存储提交 | 基础文件 fsync/提交与 daemon 恢复已测；目录语义、全硬件屏障、断电/内核崩溃没有完整保证 |
-| `ftruncate`、稀疏文件、`lseek` | setattr size + bounded chunk I/O | 挂载已测零填充、shrink/extend、64 MiB 边界；`SEEK_DATA/SEEK_HOLE` 未验收 |
+| `ftruncate`、稀疏文件、`lseek` | setattr size + bounded chunk I/O | 挂载已测零填充、shrink/extend、64 MiB/4 GiB/1 TiB 边界；`SEEK_DATA/SEEK_HOLE` 未验收 |
 | `F_PREALLOCATE`、`posix_fallocate`、hole punch | 可选 Preallocate/SeekRegion 协议 | 未实现相应协议；不能声称空间预留或洞区间查询兼容 |
 | `statfs/statvfs/pathconf` | volumeStatistics、PathConfOperations | 回调/RPC 已测；空间来自宿主卷，不是 forkfs 配额，剩余空间不保证下一次写入成功 |
 | `chflags`、immutable/append-only/hidden 等 | setattr flags + 所有变更点执行约束 | 缺失；flags 更新拒绝，不能仅保存位而不执行约束 |
@@ -111,6 +111,12 @@ rename extensions 探针确认 forkfs 的 SWAP 和 EXCL-to-missing 返回 ENOTSU
 不能用多次普通 rename 冒充原子交换，也不能宣称 Handler 迁移能解决此问题。
 完整结果见 [open/append/权限/相对路径证据](evidence/2026-11-11-open-semantics.json)。
 
+大文件扩展的逻辑上限为 1 TiB；验收覆盖 65 MiB + 17 字节密集文件全量哈希、
+跨旧上限 mmap、64 MiB/4 GiB/1 TiB 稀疏位置、orphan/截断/历史隔离，以及
+GC、服务重启后只读重挂载。见 [大文件证据](evidence/2026-11-11-large-files.json)。
+这不是全范围密集文件资格：现有事务容量仍可能拒绝大量 chunk 的 open-unlink
+或 truncate；物理分配统计也尚未完善。1 TiB 不预留磁盘空间。
+
 ## 补全顺序与完成条件
 
 每批功能必须同时更新此矩阵、自动化用例及真实挂载证据。明确不支持的功能应
@@ -122,8 +128,8 @@ rename extensions 探针确认 forkfs 的 SWAP 和 EXCL-to-missing 返回 ENOTSU
    差异后分别修复 namespace、RPC 或 FSKit 层。明确 errno、失败不变性、readonly、
    revision/GC 后仍保持语义。rename 扩展需单独评估平台路线或明确兼容范围，
    不能当作普通 daemon 修复任务。
-2. **容量与大文件**：解除 64 MiB 文件、32 项 xattr、目录项上限中的应用阻断；
-   chunk 索引/尺寸上限一起迁移。增加 >4 GiB 稀疏文件、边界短写、ENOSPC、
+2. **容量与大文件**：验证更大密集文件的事务容量，并解除 32 项 xattr、目录项上限中的应用阻断；
+   完善大规模 chunk 回收，并扩充密集文件、边界短写、ENOSPC、
    GC/重启和历史隔离验收。预分配必须兑现空间保证，不能只改逻辑长度。
 3. **元数据与安全**：设计持久 uid/gid、特殊模式位、ACL、file flags 的 revision
    格式与授权模型；所有 write/truncate/link/rename/unlink 路径执行约束。先完成
