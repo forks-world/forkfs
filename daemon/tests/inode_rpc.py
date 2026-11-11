@@ -79,7 +79,7 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         assert obj('inode-stat',fid,*sel)['inode_id']==fid
         short_read=obj('inode-open',fid,'r',*sel)['handle'];rpc('fs-close',short_read,*sel)
         before=obj('status')['last_committed_seq']
-        rpc('inode-setattr',fid,str(0o777),str(64*1024*1024+1),'0',handle,*sel,error=errno.EFBIG)
+        rpc('inode-setattr',fid,str(0o777),str((1<<40)+1),'0',handle,*sel,error=errno.EFBIG)
         assert obj('status')['last_committed_seq']==before
         assert obj('fs-hstat',handle,*sel)['mode']==0o600
         st=obj('inode-setattr',fid,str(0o701),'10','0',handle,*sel)

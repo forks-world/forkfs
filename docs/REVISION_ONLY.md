@@ -39,7 +39,10 @@ can reclaim an abandoned branch after its last retaining root is removed.
 Inode atime and birth time are stored in revision metadata, alongside mtime and
 ctime, and participate in revision diff, fork, restore and physical GC. Reads
 follow a noatime policy. Old inode records remain readable; mutations upgrade
-the affected record to FFINOD02, which older daemons reject. Explicit nofollow
+the affected record to FFINOD02, which older daemons reject. Regular files above
+64 MiB use FFINOD03 and extended chunk keys, with a 1 TiB logical size bound;
+small files retain their existing records/keys. Sparse revision diff compares
+allocated chunk positions rather than scanning holes. Explicit nofollow
 mode/time setters also operate on symlink metadata, including dangling links,
 without changing link targets or referenced file objects. Symlink metadata
 handles retain the same identity through open-unlink and path reuse, while

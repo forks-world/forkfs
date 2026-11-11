@@ -203,7 +203,7 @@ try:
         assert rpc('fs-xattr-get',namespace+'/file',attr)==b'changed'
         report['retained_revision']=revision
         report['checks'].append('fsync then revision checkpoint isolates subsequent writes')
-    rejects(lambda:os.ftruncate(fd,64*1024*1024+1),errno.EFBIG)
+    rejects(lambda:os.ftruncate(fd,(1<<40)+1),errno.EFBIG)
     assert os.fstat(fd).st_size==len(payload)
     os.rename(file,root/'renamed')
     assert (root/'renamed').stat().st_ino==old_inode
@@ -285,13 +285,13 @@ try:
         os.pwrite(stream.fileno(),b'TAIL',64*1024*1024-4);os.fsync(stream.fileno())
         assert os.fstat(stream.fileno()).st_size==64*1024*1024
         assert os.pread(stream.fileno(),8,64*1024*1024-8)==bytes(4)+b'TAIL'
-        rejects(lambda:os.ftruncate(stream.fileno(),64*1024*1024+1),errno.EFBIG)
+        rejects(lambda:os.ftruncate(stream.fileno(),(1<<40)+1),errno.EFBIG)
         os.ftruncate(stream.fileno(),65537);os.ftruncate(stream.fileno(),1024*1024);os.fsync(stream.fileno())
         assert os.pread(stream.fileno(),8,65536)==bytes([0])+bytes(7)
         os.unlink(large)
         assert os.pwrite(stream.fileno(),b'ORPHAN',900000)==6;os.fsync(stream.fileno())
         assert os.pread(stream.fileno(),6,900000)==b'ORPHAN'
-    report['checks'].append('4 MiB file transfer, 64 MiB sparse limit, truncate zero-fill and chunked open-unlink')
+    report['checks'].append('4 MiB file transfer, 64 MiB sparse growth, truncate zero-fill and chunked open-unlink')
     rpc('fs-check')
 finally:
     if fd is not None:os.close(fd)

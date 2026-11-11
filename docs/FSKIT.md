@@ -189,7 +189,7 @@ Actual macOS 27.2 World and read-only revision mounts verified Chinese/emoji
 names, links, rename, NFC/NFD distinctions and the byte limit; see
 [UTF-8 acceptance evidence](evidence/2026-11-09-fskit-utf8.json).
 
-Current limits are inherited from the namespace prototype: 64 MiB per regular
+Current limits are inherited from the namespace prototype: 1 TiB per regular
 file with 256 KiB per daemon I/O request, UTF-8 names (255 bytes per component, 4096 per path), mode bits through
 0777, native xattrs (64 KiB per value, 32 per inode), no ACLs or uid/gid
 changes, and no special files. Setattr supports mode, size, mtime, atime and birth time atomically;
@@ -212,6 +212,29 @@ using bounded RPCs. Actual macOS 27.2 mounts verified a 4 MiB transfer, 64 MiB
 sparse growth, shrink/extend zero fill, chunked open-unlink and a full 4 MiB
 read-only revision read after service restart and physical GC; see
 [chunked-file acceptance evidence](evidence/2026-11-09-fskit-chunked-files.json).
+
+The logical file limit is now 1 TiB, shared between daemon validation and the
+FSKit frontend. Large-file acceptance verifies a 65 MiB + 17 byte dense file
+with full SHA-256 readback, sparse markers across 64 MiB and 4 GiB through the
+last byte of 1 TiB, mmap across the old limit, open-unlink/path reuse,
+shrink/extend zero fill, and revision isolation. Use a disposable repository:
+
+```sh
+python3 scripts/tests/large_file_mount.py /path/to/mount \
+  --daemon build/Release/daemon/forkfsd --socket /path/to/runtime/control.sock > /tmp/large.json
+# After unmount, offline GC, and mounting the reported revision read-only:
+python3 scripts/tests/large_file_mount.py /path/to/mount --verify-report /tmp/large.json
+```
+
+The script retains a named revision and removes its live scratch directory.
+It checks immediate EFBIG on oversized truncate and O_SYNC/F_NOCACHE writes;
+buffered writes may reach the kernel cache before a writeback error is reported.
+Applications must check write/fsync/close errors. Allocation size is currently
+synthesized from logical size, not accurate per-file physical usage. This is
+not preallocation or quota enforcement. Transaction limits still constrain very
+large dense unlink/truncate operations; see [daemon limits](../daemon/README.md).
+Large inode records use FFINOD03; old daemons reject them. Full local evidence
+is in [large-file acceptance](evidence/2026-11-11-large-files.json).
 
 Linux continues to build the daemon without FSKit; enabling the option there is
 an explicit configuration error. CI builds the frontend and runs callback tests

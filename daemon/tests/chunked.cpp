@@ -40,11 +40,12 @@ int main(){
             // Retain every dense chunk as an orphan. This exceeds the 16 MiB
             // value batch cap, so unlink must publish existing object references.
             fs.write("/dense",{});Bytes block(Namespace::maximum_io_size);
-            for(uint64_t offset=0;offset<Namespace::maximum_file_size;offset+=block.size()){
+            constexpr uint64_t dense_size=64*1024*1024;
+            for(uint64_t offset=0;offset<dense_size;offset+=block.size()){
                 for(auto& c:block)c=static_cast<unsigned char>(random());fs.write_at("/dense",offset,block);
             }
-            auto handle=fs.open("/dense",Namespace::Access::ReadWrite);auto last=fs.read_at("/dense",Namespace::maximum_file_size-block.size(),block.size());
-            fs.remove("/dense",false);fs.verify();check(fs.handle_read(handle,Namespace::maximum_file_size-block.size(),block.size())==last);
+            auto handle=fs.open("/dense",Namespace::Access::ReadWrite);auto last=fs.read_at("/dense",dense_size-block.size(),block.size());
+            fs.remove("/dense",false);fs.verify();check(fs.handle_read(handle,dense_size-block.size(),block.size())==last);
             fs.handle_write(handle,65533,Bytes{1,2,3,4,5,6});check(fs.handle_read(handle,65533,6)==Bytes({1,2,3,4,5,6}));
             attrs.size=65535;fs.handle_set_attributes(handle,attrs);fs.handle_truncate(handle,128*1024);
             check(fs.handle_read(handle,65533,6)==Bytes({1,2,0,0,0,0}));fs.verify();fs.close(handle);
@@ -76,6 +77,6 @@ int main(){
             fs.verify();old.verify();work.verify();check(read_all(old,"/f")==retained);
             check(work.read_at("/f",Namespace::maximum_file_size-1,8)==Bytes{0xff});store.collect_garbage();store.verify();
         }
-        std::filesystem::remove_all(tmp);std::cout<<"chunked files, 64 MiB dense/sparse bounds, differential I/O, orphan retention, revisions, restart and GC passed\n";return 0;
+        std::filesystem::remove_all(tmp);std::cout<<"chunked files, 64 MiB dense / 1 TiB sparse bounds, differential I/O, orphan retention, revisions, restart and GC passed\n";return 0;
     }catch(const std::exception& e){std::cerr<<e.what()<<'\n';std::filesystem::remove_all(tmp);return 1;}
 }

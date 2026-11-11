@@ -37,4 +37,24 @@ with tempfile.TemporaryDirectory(prefix='ff-io-crash-',dir='/tmp') as tmp:
             assert run('fs-cat',db,'/f')==b'abcdef'
             assert run('fs-cat',db,'/f','--revision','base')==b'abcdef'
             run('fs-check',db,'--world','work');run('fs-check',db,'--revision','base')
+    # The first large write changes both the inode version and chunk key range.
+    # Recovery must publish all of them together, without materializing holes.
+    for command,args,size,offset in [
+        ('fs-write-at',('/f',str(64*1024*1024-1),str(data)),64*1024*1024+1,64*1024*1024-1),
+        ('fs-write-at',('/f',str((4<<30)+123),str(data)),(4<<30)+125,(4<<30)+123),
+        ('fs-truncate',('/f',str(1<<40)),1<<40,(1<<40)-2),
+    ]:
+        for stage in ['leveldb_before_write','leveldb_after_write']:
+            shutil.rmtree(db);shutil.copytree(baseline,db)
+            p=subprocess.run([FAULT,command,str(db),*args,'--world','work'],capture_output=True,timeout=10,
+                             env={**os.environ,'FORKFS_TEST_CRASH':stage})
+            assert p.returncode==86,(command,stage,p.stderr)
+            committed=stage=='leveldb_after_write'
+            for path in ['/f','/alias']:
+                assert json.loads(run('fs-stat',db,path,'--world','work'))['size']==(size if committed else 6)
+                assert run('fs-read-at',db,path,'0','6','--world','work')==b'abcdef'
+                assert run('fs-read-at',db,path,str(offset),'2','--world','work')==(
+                    (b'XY' if command=='fs-write-at' else bytes(2)) if committed else b'')
+            assert run('fs-cat',db,'/f','--revision','base')==b'abcdef'
+            run('fs-check',db,'--world','work');run('fs-check',db,'--revision','base')
     print('offset write, zero fill, truncate and append crash publication passed')

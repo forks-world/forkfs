@@ -81,7 +81,7 @@ World mutations atomically publish immutable objects and a new metadata root.
 Retained revisions remain immutable. The prototype has an optional macOS 26+ FSKit frontend; see
 [FSKit setup and limits](docs/FSKIT.md). It has no native Git
 checkout integration or replacement for `world exec`. Regular files support up to
-64 MiB through bounded 256 KiB I/O, with revision-backed xattrs up to 64 KiB
+1 TiB through bounded 256 KiB I/O, with revision-backed xattrs up to 64 KiB
 per value. See [daemon commands, guarantees and limits](daemon/README.md).
 The [filesystem API compatibility matrix](docs/FILESYSTEM_API_COMPATIBILITY.md)
 tracks native syscall/application evidence, remaining gaps, and qualification order.
