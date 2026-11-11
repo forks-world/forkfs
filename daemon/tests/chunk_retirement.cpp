@@ -13,7 +13,59 @@ template<class F> static void rejects(F f){bool failed=false;try{f();}catch(cons
 static uint64_t number(const std::string& json,const std::string& key){auto at=json.find("\""+key+"\":");check(at!=json.npos);return std::stoull(json.substr(at+key.size()+3));}
 static std::string hex(const std::array<unsigned char,32>& id){std::string result;const char* h="0123456789abcdef";for(auto c:id){result+=h[c>>4];result+=h[c&15];}return result;}
 static void put64(Bytes& b,size_t at,uint64_t value){for(unsigned i=0;i<8;++i)b[at+i]=static_cast<unsigned char>(value>>(8*i));}
+static void put32(Bytes& b,size_t at,uint32_t value){for(unsigned i=0;i<4;++i)b[at+i]=static_cast<unsigned char>(value>>(8*i));}
+static Bytes flat_inode(uint32_t mode,uint64_t size,bool xattrs=false){
+    Bytes b(64);memcpy(b.data(),"FFINOD02",8);put32(b,8,1);put32(b,12,mode|(xattrs?0x80000000U:0));
+    put64(b,16,1);put64(b,24,size);put64(b,32,1);put64(b,40,1);put64(b,48,1);put64(b,56,1);return b;
+}
 static std::string suffix(uint64_t index){auto n=std::to_string(index);return index<1024?std::string(4-n.size(),'0')+n:"x"+std::string(8-n.size(),'0')+n;}
+// Publish a small, independently encoded main namespace in the old flat-key
+// layout. In particular, do not create the history/world/main root.
+static std::string flat_retirement_fixture(const std::string& path){
+    Container::create(path);std::string root;
+    {Container store(path);Namespace fs(store);fs.initialize();root=fs.stat("/").id;}
+    const auto victim=std::string(32,'a'),replacement=std::string(32,'b');
+    Journal journal(path);check(!journal.contains(history+"world/main"));
+    auto root_inode=journal.get(prefix+"inode/"+root);put64(root_inode,16,2);put64(root_inode,40,2);
+    std::vector<forkfs::Mutation> batch{
+        {prefix+"inode/"+root,root_inode},
+        {prefix+"entry/"+root+"/victim",Bytes(victim.begin(),victim.end())},
+        {prefix+"inode/"+victim,flat_inode(0644,8,true)},
+        {prefix+"allocated/"+victim,Bytes{}},
+        {prefix+"content/"+victim,Bytes{'o','l','d','-','d','a','t','a'}},
+        {prefix+"xattr/"+victim+"/user.marker",Bytes{'X'}},
+        {prefix+"entry/"+root+"/replacement",Bytes(replacement.begin(),replacement.end())},
+        {prefix+"inode/"+replacement,flat_inode(0644,3)},
+        {prefix+"allocated/"+replacement,Bytes{}},
+        {prefix+"content/"+replacement,Bytes{'n','e','w'}}
+    };
+    journal.transact(journal.sequence(),batch);return victim;
+}
+static void flat_retirement(const std::string& path,bool replace){
+    auto victim=flat_retirement_fixture(path);auto orphan=history+"orphan/main/"+victim+"/";
+    {
+        Container store(path);Namespace fs(store);auto before=store.status();auto handle=fs.open("/victim",Namespace::Access::ReadWrite);
+        check(fs.handle_stat(handle).id==victim && fs.handle_read(handle,0,8)==Bytes({'o','l','d','-','d','a','t','a'}));
+        check(number(store.status(),"last_committed_seq")==number(before,"last_committed_seq"));
+        rejects([&]{store.get(history+"world/main");});
+        before=store.status();if(replace)fs.rename("/replacement","/victim");else fs.remove("/victim",false);
+        auto after=store.status();check(number(after,"last_committed_seq")==number(before,"last_committed_seq")+1);
+        check(!store.get(history+"world/main").empty());check(store.get(orphan+"content")==Bytes({'o','l','d','-','d','a','t','a'}));
+        check(fs.handle_stat(handle).id==victim && fs.handle_stat(handle).links==0);
+        check(fs.handle_get_xattr(handle,"user.marker")==Bytes{'X'});
+        fs.handle_write(handle,0,Bytes{'W'});fs.handle_truncate(handle,3);fs.handle_set_xattr(handle,"user.marker",Bytes{'Y'});
+        check(fs.handle_stat(handle).id==victim && fs.handle_stat(handle).size==3);
+        check(fs.handle_read(handle,0,8)==Bytes({'W','l','d'}));check(fs.handle_get_xattr(handle,"user.marker")==Bytes{'Y'});
+        if(replace){check(fs.read("/victim")==Bytes({'n','e','w'}));check(fs.stat("/victim").id!=victim);rejects([&]{fs.stat("/replacement");});}
+        else rejects([&]{fs.stat("/victim");});
+        fs.verify();before=store.status();fs.close(handle);after=store.status();
+        check(number(after,"last_committed_seq")==number(before,"last_committed_seq")+1);
+        rejects([&]{store.get(orphan+"inode");});store.collect_garbage();fs.verify();
+    }
+    {Container store(path);Namespace fs(store);rejects([&]{store.get(orphan+"inode");});
+        if(replace)check(fs.read("/victim")==Bytes({'n','e','w'}));else rejects([&]{fs.stat("/victim");});
+        fs.verify();store.collect_garbage();store.verify();}
+}
 // Construct a valid dense file with independently encoded records. Stage
 // immutable objects in bounded batches, then publish one World head. Reusing
 // identical nonzero chunk objects keeps this 320 MiB logical fixture small.
@@ -62,6 +114,7 @@ int main(int argc,char** argv){
     if(argc==4){crash(argv[1],argv[2],argv[3]);return 1;}
     char pattern[]="/tmp/ff-io-retire-XXXXXX";auto tmp=mkdtemp(pattern);if(!tmp)return 1;auto path=std::string(tmp)+"/db";
     try{
+        flat_retirement(path+"-flat-unlink",false);flat_retirement(path+"-flat-replace",true);
         fixture(path);
         {Container store(path);Namespace fs(store),old(store,"base",true);auto fd=fs.open("/dense",Namespace::Access::ReadWrite),dup=fs.dup(fd);auto id=fs.handle_stat(fd).id;
             auto pre=history+"orphan/main/"+id+"/";auto before=store.status();fs.remove("/dense",false);auto after=store.status();

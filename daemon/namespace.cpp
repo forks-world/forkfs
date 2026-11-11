@@ -887,11 +887,13 @@ void Namespace::retire(const NamespaceView& j,Changes& c,const InodeInfo& n) {
     if(count!=container_.open_counts_.end() && count->second) {
         auto orphan=n;orphan.links=0;orphan.changed_ns=now();auto pre=orphan_prefix(view_,n.id);
         c[pre+"inode"]=encode(orphan);
-        auto manifest=container_.journal_->get(history+"world/"+view_);
-        if(manifest.size()==40 && !memcmp(manifest.data(),"FFTREE01",8)) {
-            // Pin the immutable origin tree in one root. All orphan edits use
-            // its private CoW tree, never the live World's inode or path.
-            c[pre+"tree"]=std::move(manifest);return;
+        if(!j.legacy()) {
+            auto manifest=container_.journal_->get(history+"world/"+view_);
+            if(manifest.size()==40 && !memcmp(manifest.data(),"FFTREE01",8)) {
+                // Pin the immutable origin tree in one root. All orphan edits use
+                // its private CoW tree, never the live World's inode or path.
+                c[pre+"tree"]=std::move(manifest);return;
+            }
         }
         auto copy=n;auto records=FileContent(copy,j).records();
         for(const auto& key:attrs)c[pre+"xattr/"+key.substr(xattr_prefix(n.id).size())]=j.get(key);
