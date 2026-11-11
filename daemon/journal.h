@@ -39,6 +39,8 @@ public:
     bool contains(const std::string& key) const;
     std::array<unsigned char,32> root_object(const std::string& key) const;
     std::vector<unsigned char> get_object(const std::array<unsigned char,32>& id) const;
+    uint64_t object_size(const std::array<unsigned char,32>& id) const;
+    bool requires_reopen() const;
     static std::array<unsigned char,32> object_id(const std::vector<unsigned char>& value);
     std::vector<std::string> keys(const std::string& prefix) const;
     Checkpoint checkpoint();

@@ -195,6 +195,7 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume writeContents:oversized toFile:file atOffset:500000 replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==300000,"large callback write must complete via bounded requests");
         [volume writeContents:contents toFile:file atOffset:(uint64_t{1}<<40) replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(result.code==EFBIG && count==0,"oversized file write must fail before mutation");
         [volume writeContents:contents toFile:file atOffset:(uint64_t{5}<<30)+123 replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==4,"large-offset write failed");
+        [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:file replyHandler:^(FSItemAttributes* a,NSError* e){result=e;check(a.size>(uint64_t{5}<<30) && a.allocSize>0 && a.allocSize<1024*1024,"sparse allocation must not equal logical size");}];check(!result,"sparse allocation attributes failed");
         [volume readFromFile:file offset:(uint64_t{5}<<30)+121 length:6 intoBuffer:(FSMutableFileDataBuffer*)buffer replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==6 && !memcmp((const char*)buffer.storage.bytes+2,payload,4),"large-offset read failed");
         FSItemSetAttributesRequest* shrinkLarge=[FSItemSetAttributesRequest new];shrinkLarge.size=800000;
         [volume setAttributes:shrinkLarge onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(!result,"large-offset shrink failed");

@@ -386,6 +386,11 @@ Bytes Journal::get_object(const Hash& id) const {
     if(leveldb_)return leveldb_->object(id);
     need(!poisoned_,"journal requires reopen after write failure");return read_object(id);
 }
+uint64_t Journal::object_size(const Hash& id) const {
+    if(leveldb_)return leveldb_->object_size(id);
+    need(!poisoned_,"journal requires reopen after write failure");return read_object(id).size();
+}
+bool Journal::requires_reopen() const {return leveldb_?leveldb_->requires_reopen():poisoned_;}
 bool Journal::contains(const std::string& key) const {
     if(leveldb_)return leveldb_->contains(key);
     need(!poisoned_,"journal requires reopen after write failure"); return roots_.contains(key);

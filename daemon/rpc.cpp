@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -49,7 +50,7 @@ std::string quoted(const std::string& value){
 std::string inode_json(const InodeInfo& n){
     std::ostringstream out;out<<"{\"inode_id\":\""<<n.id<<"\",\"directory\":"<<(n.directory?"true":"false")
         <<",\"symlink\":"<<(n.symlink?"true":"false")<<",\"mode\":"<<n.mode<<",\"links\":"<<n.links<<",\"size\":"<<n.size
-        <<",\"modified_ns\":"<<n.modified_ns<<",\"changed_ns\":"<<n.changed_ns
+        <<",\"allocated_size\":"<<n.allocated_size<<",\"modified_ns\":"<<n.modified_ns<<",\"changed_ns\":"<<n.changed_ns
         <<",\"accessed_ns\":"<<n.accessed_ns<<",\"birth_ns\":"<<n.birth_ns<<"}";return out.str();
 }
 std::string random_token(){
@@ -166,7 +167,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         auto lease=number(args[1]);auto token=sessions.create(lease);
         return "{\"session\":\""+token+"\",\"lease_ms\":"+std::to_string(lease)+"}\n";
     }
-    if(op=="session-keepalive"){sessions.acquire(args[1]);return store.status();}
+    if(op=="session-keepalive"){sessions.acquire(args[1]);if(store.requires_reopen())throw RpcError(EIO,"storage requires reopen after write failure");return store.status();}
     if(op=="session-close"){sessions.acquire(args[1]);sessions.close(args[1]);return store.status();}
     bool handle_op=op=="fs-open" || op=="fs-close" || op=="fs-dup" || (op.starts_with("fs-h") && op!="fs-history");
     bool dir_op=op.starts_with("fs-dir-");
@@ -199,7 +200,10 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     if(op.starts_with("inode-xattr-")){args[1]=fs.path_for_inode(args[1]);op="fs-xattr-"+op.substr(12);args[0]=op;}
     if(op=="inode-space")return store.space_json();
-    if(op=="inode-sync")return store.status(); // Every mutation already commits synchronously.
+    if(op=="inode-sync") {
+        if(store.requires_reopen())throw RpcError(EIO,"storage requires reopen after write failure");
+        return store.status(); // Healthy mutations already commit synchronously.
+    }
     if(op=="inode-lookup"){auto path=child(args[1],args[2]);op="fs-lstat";args={op,path};}
     else if(op=="inode-stat" || op=="inode-dir-open" || op=="inode-readlink" || op=="inode-open") {
         auto path=fs.path_for_inode(args[1]);auto mode=op=="inode-open"?args[2]:"";
@@ -407,6 +411,7 @@ void serve_rpc(int listener,Container& container,const volatile sig_atomic_t& st
                                 auto fields=decode(p.in);bool inode_request=fields[0].starts_with("inode-");
                                 try {p.out=response(0,dispatch(container,sessions,fields));}
                                 catch(const RpcError&){throw;}
+                                catch(const std::system_error& e){throw RpcError(e.code().value(),e.what());}
                                 catch(const std::exception& e){if(inode_request)throw RpcError(rpc_posix_error(e.what()),e.what());throw;}
                             }
                         }

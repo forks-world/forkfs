@@ -14,6 +14,9 @@ struct InodeInfo {
     bool chunked=false;
     bool xattrs=false;
     uint64_t accessed_ns=0, birth_ns=0;
+    // Derived backed data allocation in 512-byte units, not exclusive ownership
+    // of LevelDB/SST bytes. Not serialized into the inode record.
+    uint64_t allocated_size=0;
 };
 class NamespaceView;
 class FileContent;
@@ -107,6 +110,7 @@ private:
     void require_offline_locked() const;
     static void recover_orphans(Container& container);
     void verify_locked() const;
+    void allocation_info(InodeInfo& inode,const NamespaceView& view) const;
     std::array<unsigned char,32> prepare_snapshot_locked(const NamespaceView& view,const std::string& name,std::vector<Mutation>& batch);
     const Container::OpenHandle& find_handle(const std::string& handle) const;
     void edit_handle(const std::string& handle,const std::function<bool(FileContent&,bool)>& edit,const std::function<void()>& committed={});
