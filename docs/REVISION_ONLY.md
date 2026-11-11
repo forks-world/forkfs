@@ -48,6 +48,13 @@ without changing link targets or referenced file objects. Symlink metadata
 handles retain the same identity through open-unlink and path reuse, while
 rejecting file data I/O and preserving immutable revision isolation.
 
+Dense unlink/truncate retire chunk ranges through the persistent CoW tree.
+Open-unlink retains immutable data through a private tree root plus an inode
+root, updated atomically outside the live World. These roots are session/fd
+retention, not public revisions; snapshots omit unlinked handles. Last close
+or startup recovery releases them, and offline physical GC reclaims objects
+unreachable from surviving Worlds, revisions or retention roots.
+
 The new optional FSKit frontend operates through the resident daemon RPC and
 revision-backed namespace; see [FSKit integration](FSKIT.md). Git and
 execution integration remain unavailable until revision-backed replacements exist.

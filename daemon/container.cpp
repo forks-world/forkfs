@@ -296,6 +296,7 @@ size_t Container::collect_garbage() {
         if(key.starts_with(h+"object/")){registry.push_back(key);continue;}
         auto id=j.root_object(key);auto b=mark(id);
         if(key.starts_with(h+"world/"))trace(id,1);
+        else if(key.starts_with(h+"orphan/") && key.ends_with("/tree"))trace(id,1);
         else if(key.starts_with(h+"revision/"))trace(id,0);
         else if(key.starts_with(h+"base/")){require(b.size()==32,"invalid GC base");trace(extract(b,0),0);}
     }

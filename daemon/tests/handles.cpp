@@ -35,8 +35,8 @@ int main(){
             check(fs.handle_read(a,0,20)==Bytes({'o','X','d',0}));check(fs.read("/f")==Bytes({'n','e','w'}));
             check(work.handle_read(wh,0,20)==Bytes({'o','l','d'}));check(revision.handle_read(ro,0,20)==Bytes({'o','l','d'}));
             fs.close(a);check(fs.handle_read(b,0,20)==Bytes({'o','X','d',0}));
-            check(store.get(orphan+"content")==Bytes({'o','X','d',0}));fs.close(b);
-            rejects([&]{store.get(orphan+"inode");});rejects([&]{store.get(orphan+"content");});
+            check(!store.get(orphan+"tree").empty());check(fs.handle_read(b,0,20)==Bytes({'o','X','d',0}));fs.close(b);
+            rejects([&]{store.get(orphan+"inode");});rejects([&]{store.get(orphan+"tree");});
             rejects([&]{fs.handle_stat(a);});rejects([&]{fs.close(b);});fs.verify();
             // Rename replacement retains the old destination inode for its handles.
             fs.write("/dst",Bytes{'D'});auto dst=fs.open("/dst",forkfs::Namespace::Access::ReadWrite);

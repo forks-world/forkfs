@@ -97,6 +97,18 @@ Id MetadataTree::set(Id root,const std::string& key,const std::optional<Id>& val
     }
     return result;
 }
+std::pair<Id,Id> MetadataTree::split(Id root,const std::string& boundary) {
+    struct Step {Node node;bool below;};std::vector<Step> path;std::set<Id> visited;
+    while(root!=Id{}) {
+        need(visited.insert(root).second,"metadata tree cycle");auto n=node(root);bool below=n.key<boundary;
+        path.push_back({n,below});root=below?n.right:n.left;
+    }
+    Id left{},right{};
+    for(auto i=path.rbegin();i!=path.rend();++i) {
+        auto n=i->node;if(i->below){n.right=left;left=make(n);}else{n.left=right;right=make(n);}
+    }
+    return {left,right};
+}
 std::optional<Id> MetadataTree::lookup(const std::string& key) const {
     Id current=root_;unsigned depth=0;
     while(current!=Id{}) {
@@ -144,7 +156,7 @@ MetadataTree::Map MetadataTree::entries() const {
     };
     walk(root_,nullptr,nullptr,0);return result;
 }
-MetadataTree::Plan MetadataTree::apply(const Changes& changes) {
+MetadataTree::Plan MetadataTree::apply(const Changes& changes,const std::vector<Range>& erased) {
     const std::string namespace_root("\0forkfs/root",12);
     // Reject malformed batches before changing the editor, including absent
     // deletes and no-op updates that never reach make().
@@ -154,10 +166,18 @@ MetadataTree::Plan MetadataTree::apply(const Changes& changes) {
         need(key!=namespace_root || value.has_value(),"cannot delete namespace root");
     }
     need(changes.contains(namespace_root) || lookup(namespace_root).has_value(),"metadata tree missing namespace root");
+    for(const auto& [lower,upper]:erased) {
+        need(valid_key(lower) && valid_key(upper) && lower<upper,"invalid metadata erase range");
+        need(namespace_root<lower || namespace_root>=upper,"cannot delete namespace root");
+    }
     // Validate the complete candidate: rotations can deepen untouched subtrees.
     // Immutable-node heights are memoized; a cold persisted tree needs one
     // full walk per editor, while subsequent checks visit only new CoW nodes.
     auto candidate=root_;
+    for(const auto& [lower,upper]:erased) {
+        auto [left,tail]=split(candidate,lower);auto [removed,right]=split(tail,upper);
+        (void)removed;candidate=merge(left,right);
+    }
     for(const auto& [key,value]:changes)candidate=set(candidate,key,value);
     if(candidate!=root_)height(candidate);
     Plan result;result.manifest.resize(40);memcpy(result.manifest.data(),"FFTREE01",8);memcpy(result.manifest.data()+8,candidate.data(),32);

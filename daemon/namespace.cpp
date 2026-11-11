@@ -49,6 +49,11 @@ std::string inode_key(const std::string& id) {return prefix+"inode/"+id;}
 std::string allocated_key(const std::string& id) {return prefix+"allocated/"+id;}
 std::string xattr_prefix(const std::string& id) {return prefix+"xattr/"+id+"/";}
 std::string content_key(const std::string& id) {return prefix+"content/"+id;}
+std::string prefix_end(std::string value) {
+    for(size_t i=value.size();i>0;--i)if(static_cast<unsigned char>(value[i-1])!=255){
+        value[i-1]=static_cast<char>(static_cast<unsigned char>(value[i-1])+1);value.resize(i);return value;}
+    throw std::runtime_error("invalid unbounded prefix");
+}
 std::string directory_prefix(const std::string& id) {return prefix+"entry/"+id+"/";}
 std::string entry_key(const std::string& id,const std::string& name) {return directory_prefix(id)+name;}
 bool valid_id(const std::string& id) {
@@ -76,6 +81,11 @@ InodeInfo decode_inode(const Bytes& b,const std::string& id,bool orphan=false) {
 }
 InodeInfo inode(const NamespaceView& journal,const std::string& id) {return decode_inode(journal.get(inode_key(id)),id);}
 std::string orphan_prefix(const std::string& world,const std::string& id) {return history+"orphan/"+world+"/"+id+"/";}
+std::unique_ptr<NamespaceView> retained_orphan(const Journal& journal,const std::string& pre) {
+    if(!journal.contains(pre+"tree"))return {};
+    auto b=journal.get(pre+"tree");need(b.size()==40 && !memcmp(b.data(),"FFTREE01",8),"invalid orphan tree");
+    return std::make_unique<NamespaceView>(journal,journal.root_object(pre+"tree"));
+}
 Bytes encode(const InodeInfo& n) {
     Bytes b(64);memcpy(b.data(),n.size>legacy_file_bytes?"FFINOD03":"FFINOD02",8);store(b.data()+8,n.symlink?3:n.directory?2:n.chunked?4:1,4);
     store(b.data()+12,uint64_t(n.mode)|(n.xattrs?uint64_t(0x80000000U):0),4);store(b.data()+16,n.links,8);store(b.data()+24,n.size,8);
@@ -100,7 +110,7 @@ bool parse_chunk_suffix(std::string_view suffix,uint64_t& index) {
         (extended?index>=legacy_file_bytes/file_chunk_bytes:index<legacy_file_bytes/file_chunk_bytes);
 }
 bool valid_orphan_field(const std::string& field) {
-    if(field=="inode" || field=="content")return true;
+    if(field=="inode" || field=="content" || field=="tree")return true;
     if(field.starts_with("xattr/")){valid_xattr_name(field.substr(6));return true;}
     uint64_t index;return field.starts_with("chunk/") && parse_chunk_suffix(std::string_view(field).substr(6),index);
 }
@@ -209,7 +219,7 @@ void touch(InodeInfo& n) {n.modified_ns=n.changed_ns=now();}
 // chunks as ordinary CoW namespace leaves, so revision retention and GC follow
 // the same immutable object graph as directory metadata. No payload heuristics.
 class FileContent {
-    using Changes=std::map<std::string,std::optional<Bytes>>;
+    using Changes=Namespace::Changes;
     static constexpr uint64_t chunk_size=file_chunk_bytes;
     InodeInfo& n_;
     std::function<bool(const std::string&)> contains_;
@@ -219,10 +229,12 @@ class FileContent {
     Changes* changes_;
     bool contains(const std::string& key) const {
         if(changes_){auto it=changes_->find(key);if(it!=changes_->end())return bool(it->second);}
+        if(changes_)for(const auto& [lower,upper]:changes_->erased)if(lower<=key && key<upper)return false;
         return contains_(key);
     }
     Bytes get(const std::string& key) const {
         if(changes_){auto it=changes_->find(key);if(it!=changes_->end()){need(bool(it->second),"missing file content");return *it->second;}}
+        if(changes_)for(const auto& [lower,upper]:changes_->erased)need(key<lower || key>=upper,"missing file content");
         return get_(key);
     }
     std::string chunk_key(uint64_t index) const {
@@ -287,7 +299,10 @@ public:
         else {
             promote();
             if(size<n_.size) {
-                for(const auto& key:keys_(chunks_)) {
+                if(chunks_.starts_with(prefix)) {
+                    auto first=(size+chunk_size-1)/chunk_size;
+                    if(first<maximum_file_bytes/chunk_size)changes_->erase_range(chunk_key(first),prefix_end(chunks_));
+                } else for(const auto& key:keys_(chunks_)) {
                     uint64_t index;need(parse_chunk_suffix(std::string_view(key).substr(chunks_.size()),index),"invalid file chunk key");
                     if(index*chunk_size>=size)(*changes_)[key]=std::nullopt;
                 }
@@ -358,10 +373,12 @@ std::pair<InodeInfo,bool> Namespace::xattr_inode(const NamespaceView& view,const
 }
 Bytes Namespace::read_xattr(const std::string& target,const std::string& name,bool handle) const {
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto [n,linked]=xattr_inode(view,target,handle);
+    if(!linked)if(auto retained=retained_orphan(*container_.journal_,orphan_prefix(view_,n.id)))return Xattrs(*retained,n.id).get(name);
     return linked?Xattrs(view,n.id).get(name):Xattrs(*container_.journal_,orphan_prefix(view_,n.id)).get(name);
 }
 std::vector<std::string> Namespace::read_xattr_names(const std::string& target,bool handle) const {
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto [n,linked]=xattr_inode(view,target,handle);
+    if(!linked)if(auto retained=retained_orphan(*container_.journal_,orphan_prefix(view_,n.id)))return Xattrs(*retained,n.id).names();
     return linked?Xattrs(view,n.id).names():Xattrs(*container_.journal_,orphan_prefix(view_,n.id)).names();
 }
 void Namespace::edit_xattr(const std::string& target,const std::string& name,const std::optional<Bytes>& value,XattrPolicy policy,bool handle) {
@@ -371,7 +388,13 @@ void Namespace::edit_xattr(const std::string& target,const std::string& name,con
         n.xattrs=attrs.edit(name,value,policy);n.changed_ns=now();changes[linked?inode_key(n.id):pre+"inode"]=encode(n);
     };
     if(!handle){update(edit);return;}
-    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);Changes changes;edit(view,changes);commit_changes(view,changes);
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);Changes changes;
+    auto [n,linked]=xattr_inode(view,target,true);auto pre=orphan_prefix(view_,n.id);
+    if(!linked)if(auto retained=retained_orphan(*container_.journal_,pre)) {
+        n.xattrs=Xattrs(*retained,n.id,&changes).edit(name,value,policy);n.changed_ns=now();
+        commit_orphan_changes(*retained,pre,n,changes);return;
+    }
+    edit(view,changes);commit_changes(view,changes);
 }
 
 void Namespace::update(const std::function<void(const NamespaceView&,Changes&)>& operation) {
@@ -429,8 +452,8 @@ void Namespace::commit_changes(const NamespaceView& view,Changes& changes) {
                 if(key.starts_with(allocated))new_objects.emplace(history+"allocated/"+key.substr(allocated.size()),Bytes{});
             } else delta[key]=std::nullopt;
         }
-        if(!delta.empty()) {
-            auto plan=view.plan(delta);
+        if(!delta.empty() || !changes.erased.empty()) {
+            auto plan=view.plan(delta,false,changes.erased);
             for(auto& payload:plan.objects) {
                 auto id=Journal::object_id(payload);auto key=history+"object/"+hex_id(id);
                 if(!journal.contains(key))new_objects.emplace(key,std::move(payload));
@@ -441,6 +464,23 @@ void Namespace::commit_changes(const NamespaceView& view,Changes& changes) {
     }
     container_.metadata_prepare_ns_+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-prepare_start).count();
     journal.transact(journal.sequence(),batch);
+}
+
+void Namespace::commit_orphan_changes(const NamespaceView& retained,const std::string& pre,const InodeInfo& n,Changes& changes) {
+    auto& journal=*container_.journal_;std::vector<Mutation> batch;
+    if(!changes.empty()) {
+        NamespaceView::Changes delta;std::map<std::string,Bytes> objects;
+        for(const auto& [key,value]:changes) {
+            if(value){auto id=Journal::object_id(*value);delta[key]=id;
+                auto name=history+"object/"+hex_id(id);if(!journal.contains(name))objects.emplace(name,*value);}
+            else delta[key]=std::nullopt;
+        }
+        auto plan=retained.plan(delta,false,changes.erased);
+        for(auto& value:plan.objects){auto name=history+"object/"+hex_id(Journal::object_id(value));if(!journal.contains(name))objects.emplace(name,std::move(value));}
+        for(auto& [key,value]:objects)batch.push_back({key,std::move(value)});
+        batch.push_back({pre+"tree",std::move(plan.manifest)});
+    }
+    batch.push_back({pre+"inode",encode(n)});journal.transact(journal.sequence(),batch);
 }
 
 std::string Namespace::diff(const std::string& before,const std::string& after,const std::string& after_path,size_t limit) const {
@@ -809,7 +849,9 @@ void Namespace::handle_set_attributes(const std::string& token,const Attributes&
     if(!a.mode && !a.modified_ns && !a.size && !a.accessed_ns && !a.birth_ns)return;
     if(a.size && *a.size==n.size && !a.mode && !a.modified_ns && !a.accessed_ns && !a.birth_ns)return;
     Changes changes;
-    if(a.size){FileContent data=linked?FileContent(n,view,&changes):FileContent(n,*container_.journal_,orphan_prefix(view_,info.inode),&changes);if(data.resize(*a.size))touch(n);}
+    auto pre=orphan_prefix(view_,info.inode);auto retained=linked?nullptr:retained_orphan(*container_.journal_,pre);
+    if(a.size){FileContent data=retained?FileContent(n,*retained,&changes):linked?FileContent(n,view,&changes):FileContent(n,*container_.journal_,pre,&changes);if(data.resize(*a.size))touch(n);}
+    if(retained){apply_attributes(n,a);commit_orphan_changes(*retained,pre,n,changes);return;}
     apply_attributes(n,a);changes[key]=encode(n);commit_changes(view,changes);
 }
 InodeInfo Namespace::lstat(const std::string& path) const {
@@ -839,14 +881,20 @@ void Namespace::link(const std::string& source,const std::string& target) {
 }
 void Namespace::retire(const NamespaceView& j,Changes& c,const InodeInfo& n) {
     c[inode_key(n.id)]=std::nullopt;auto attrs=Xattrs(j,n.id).records();for(const auto& key:attrs)c[key]=std::nullopt;if(n.directory)return;
-    auto copy=n;auto data=FileContent(copy,j);auto records=data.records();
-    for(const auto& key:records)c[key]=std::nullopt;
+    auto chunks=prefix+"chunk/"+n.id+"/";
+    if(n.chunked)c.erase_range(chunks,prefix_end(chunks));else c[content_key(n.id)]=std::nullopt;
     auto count=container_.open_counts_.find({view_,n.id});
     if(count!=container_.open_counts_.end() && count->second) {
         auto orphan=n;orphan.links=0;orphan.changed_ns=now();auto pre=orphan_prefix(view_,n.id);
         c[pre+"inode"]=encode(orphan);
+        auto manifest=container_.journal_->get(history+"world/"+view_);
+        if(manifest.size()==40 && !memcmp(manifest.data(),"FFTREE01",8)) {
+            // Pin the immutable origin tree in one root. All orphan edits use
+            // its private CoW tree, never the live World's inode or path.
+            c[pre+"tree"]=std::move(manifest);return;
+        }
+        auto copy=n;auto records=FileContent(copy,j).records();
         for(const auto& key:attrs)c[pre+"xattr/"+key.substr(xattr_prefix(n.id).size())]=j.get(key);
-        const auto chunks=prefix+"chunk/"+n.id+"/";
         for(const auto& key:records){auto suffix=n.chunked?"chunk/"+key.substr(chunks.size()):"content";c[pre+suffix]=j.get(key);}
     }
 }
@@ -923,6 +971,11 @@ void Namespace::verify_locked() const {
             auto count=container_.open_counts_.find({view_,id});need(count!=container_.open_counts_.end() && count->second>0,"orphan lacks an open handle");
             need(!j.contains(inode_key(id)),"orphan also appears in World tree");
             auto n=decode_inode(journal.get(orphan_prefix(view_,id)+"inode"),id,true);
+            if(auto retained=retained_orphan(journal,orphan_prefix(view_,id))) {
+                (void)retained->references();FileContent content(n,*retained);content.verify();Xattrs(*retained,id).verify(n.xattrs);
+                if(n.symlink){auto data=retained->get(content_key(id));target_components(std::string(data.begin(),data.end()));}
+                auto fields=journal.keys(orphan_prefix(view_,id));need(fields.size()==2,"unexpected orphan tree record");continue;
+            }
             FileContent content(n,journal,orphan_prefix(view_,id));content.verify();
             if(n.symlink){auto data=journal.get(orphan_prefix(view_,id)+"content");target_components(std::string(data.begin(),data.end()));}
             Xattrs attributes(journal,orphan_prefix(view_,id));attributes.verify(n.xattrs);
@@ -1069,7 +1122,9 @@ Bytes Namespace::read_handle_locked(const Container::OpenHandle& info,uint64_t o
     const auto& j=*container_.journal_;NamespaceView view(j,view_,revision_);
     if(view.contains(inode_key(info.inode))){auto n=inode(view,info.inode);need(!n.symlink,"symbolic link handle forbids data I/O");return FileContent(n,view).read(offset,count);}
     need(!revision_,"revision inode missing");auto pre=orphan_prefix(view_,info.inode);
-    auto n=decode_inode(j.get(pre+"inode"),info.inode,true);need(!n.symlink,"symbolic link handle forbids data I/O");return FileContent(n,j,pre).read(offset,count);
+    auto n=decode_inode(j.get(pre+"inode"),info.inode,true);need(!n.symlink,"symbolic link handle forbids data I/O");
+    if(auto retained=retained_orphan(j,pre))return FileContent(n,*retained).read(offset,count);
+    return FileContent(n,j,pre).read(offset,count);
 }
 void Namespace::edit_handle(const std::string& token,const std::function<bool(FileContent&,bool)>& edit,const std::function<void()>& committed) {
     need(!revision_,"revision view is read-only");
@@ -1078,7 +1133,12 @@ void Namespace::edit_handle(const std::string& token,const std::function<bool(Fi
     bool linked=view.contains(inode_key(info.inode));auto pre=orphan_prefix(view_,info.inode);auto& j=*container_.journal_;
     auto n=linked?inode(view,info.inode):decode_inode(j.get(pre+"inode"),info.inode,true);
     need(!n.symlink,"symbolic link handle forbids data I/O");
-    FileContent data=linked?FileContent(n,view,&changes):FileContent(n,j,pre,&changes);
+    auto retained=linked?nullptr:retained_orphan(j,pre);
+    FileContent data=retained?FileContent(n,*retained,&changes):linked?FileContent(n,view,&changes):FileContent(n,j,pre,&changes);
+    if(retained) {
+        if(edit(data,info.append)){touch(n);commit_orphan_changes(*retained,pre,n,changes);}
+        if(committed)committed();return;
+    }
     if(edit(data,info.append)){touch(n);changes[linked?inode_key(info.inode):pre+"inode"]=encode(n);}
     commit_changes(view,changes);if(committed)committed();
 }

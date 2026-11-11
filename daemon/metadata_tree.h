@@ -9,6 +9,7 @@ public:
     using Bytes=std::vector<unsigned char>;
     using Map=std::map<std::string,Id>;
     using Changes=std::map<std::string,std::optional<Id>>;
+    using Range=std::pair<std::string,std::string>;
     MetadataTree(const Journal& store,Id root={}):store_(store),root_(root) {}
     std::optional<Id> lookup(const std::string& key) const;
     std::vector<std::string> keys(const std::string& prefix) const;
@@ -21,7 +22,9 @@ public:
     // before the next apply. Returning a Plan does not acknowledge a commit.
     // Height validation walks a cold persisted tree once per editor; immutable
     // node heights are cached for subsequent changes in that session.
-    Plan apply(const Changes& changes);
+    // Erase half-open ranges before applying point changes. Whole subtrees can
+    // be detached without generating a mutation for every removed leaf.
+    Plan apply(const Changes& changes,const std::vector<Range>& erased={});
 private:
     struct Node {std::string key;Id value{},left{},right{};};
     const Journal& store_;
@@ -36,5 +39,6 @@ private:
     // Editing is iterative: intermediate batch trees may exceed the final limit.
     Id set(Id root,const std::string& key,const std::optional<Id>& value);
     Id merge(Id left,Id right);
+    std::pair<Id,Id> split(Id root,const std::string& boundary);
 };
 }

@@ -114,8 +114,11 @@ rename extensions 探针确认 forkfs 的 SWAP 和 EXCL-to-missing 返回 ENOTSU
 大文件扩展的逻辑上限为 1 TiB；验收覆盖 65 MiB + 17 字节密集文件全量哈希、
 跨旧上限 mmap、64 MiB/4 GiB/1 TiB 稀疏位置、orphan/截断/历史隔离，以及
 GC、服务重启后只读重挂载。见 [大文件证据](evidence/2026-11-11-large-files.json)。
-这不是全范围密集文件资格：现有事务容量仍可能拒绝大量 chunk 的 open-unlink
-或 truncate；物理分配统计也尚未完善。1 TiB 不预留磁盘空间。
+密集文件回收改为 CoW 范围删除及两个 orphan 保留根后，已额外验收两个 320 MiB、
+各 5,120 个已分配 chunk 的文件。open-unlink/dup/孤儿写入和截断、路径重用、
+最后关闭及闭合文件截断均通过，并在 GC/只读重挂载后校验历史完整哈希。
+见 [密集文件回收证据](evidence/2026-11-11-chunk-retirement.json)。这不是全范围
+1 TiB 密集文件性能资格；物理分配统计也尚未完善。1 TiB 不预留磁盘空间。
 
 ## 补全顺序与完成条件
 
@@ -128,8 +131,8 @@ GC、服务重启后只读重挂载。见 [大文件证据](evidence/2026-11-11-
    差异后分别修复 namespace、RPC 或 FSKit 层。明确 errno、失败不变性、readonly、
    revision/GC 后仍保持语义。rename 扩展需单独评估平台路线或明确兼容范围，
    不能当作普通 daemon 修复任务。
-2. **容量与大文件**：验证更大密集文件的事务容量，并解除 32 项 xattr、目录项上限中的应用阻断；
-   完善大规模 chunk 回收，并扩充密集文件、边界短写、ENOSPC、
+2. **容量与大文件**：完善空间不足恢复，并解除 32 项 xattr、目录项上限中的应用阻断；
+   扩充更大密集文件的性能/内存资格、物理分配统计、边界短写、ENOSPC、
    GC/重启和历史隔离验收。预分配必须兑现空间保证，不能只改逻辑长度。
 3. **元数据与安全**：设计持久 uid/gid、特殊模式位、ACL、file flags 的 revision
    格式与授权模型；所有 write/truncate/link/rename/unlink 路径执行约束。先完成

@@ -11,6 +11,7 @@ public:
     using Bytes=std::vector<unsigned char>;
     using Map=std::map<std::string,ObjectId>;
     using Changes=std::map<std::string,std::optional<ObjectId>>;
+    using Range=std::pair<std::string,std::string>;
     struct Frozen {Map flat;std::vector<Bytes> runs;};
     static constexpr size_t soft_run_limit=16, hard_run_limit=32;
     struct Plan {std::vector<Bytes> objects;Bytes manifest;size_t run_count;};
@@ -25,7 +26,7 @@ public:
     std::optional<ObjectId> reference(const std::string& key) const {return lookup(key);}
     bool legacy() const {return legacy_;}
     size_t run_count() const {return tree_?1:runs_.size();}
-    Plan plan(const Changes& changes,bool compact=false) const;
+    Plan plan(const Changes& changes,bool compact=false,const std::vector<Range>& erased={}) const;
     Frozen freeze() const;
     static Plan compact_frozen(const Frozen& input);
     static void valid_name(const std::string& name);
