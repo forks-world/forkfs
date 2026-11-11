@@ -26,13 +26,13 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | --- | --- | --- |
 | `mount/umount`、只读挂载、后台服务启动/退出 | activate/mount/unmount/deactivate + launcher/session | 挂载已测；服务损失后卸载，不能透明重连旧 inode |
 | `open/read/write/pread/pwrite/close` | OpenCloseOperations、ReadWriteOperations → inode handles | 挂载已测；单文件最多 64 MiB，RPC 单次最多 256 KiB，回调分块 |
-| `O_CREAT/O_EXCL/O_TRUNC/O_APPEND/O_NOFOLLOW/O_DIRECTORY`、`openat` 系列 | 内核路径解析 + lookup/create/open/setattr | 基础创建/截断已测；全部 flag 组合、并发 append、`*at` 边界尚未系统验收 |
+| `O_CREAT/O_EXCL/O_TRUNC/O_APPEND/O_NOFOLLOW/O_DIRECTORY`、`openat` 系列 | 内核路径解析 + lookup/create/open/setattr | 挂载已测排他/类型/nofollow 拒绝、dangling link 创建、截断身份、umask、并发 append、基本 `*at`；全部组合与极限并发仍未验收 |
 | `dup`、打开后 rename/unlink、同名路径重用 | 内核 fd + daemon orphan roots | 挂载已测；包含普通文件、符号链接元数据 fd 和 mmap |
 | `stat/lstat/fstat`、`chmod/fchmod`、`utime/utimens`、birth time | get/setAttributes | 挂载已测；时间纳秒精度，读取不更新 atime，模式仅 0777 |
 | `chown/fchown`、setuid/setgid/sticky、ACL | inode metadata + access checks | 缺失；uid/gid 来自服务用户，拒绝更换属主，无 ACL，不是多用户文件系统 |
-| `access/faccessat`、目录搜索权限、只读 fd 权限 | 内核权限判断；未接 AccessCheckOperations | 未完成系统验收；根目录强制 0700 不能证明完整权限语义 |
+| `access/faccessat`、目录搜索权限、只读 fd 权限 | 内核权限判断；未接 AccessCheckOperations | 挂载已测单用户 mode 000/0400、access、目录搜索/写权限、拒绝 truncate/创建/unlink、chmod 不撤销已开 fd；faccessat/组权限/多用户未验收 |
 | `mkdir/rmdir/unlink`、普通 `rename`、原子保存 | create/remove/rename → 原子 namespace 提交 | 挂载已测；失败 errno 与状态不变需按操作继续扩充。直接 RPC 错误码修复另见 PR #95 |
-| `renameatx_np(RENAME_EXCL/RENAME_SWAP)`、交换/排他 rename | 内核扩展语义 + 原子 namespace 操作 | 未验收；无专用 daemon 交换操作，不承诺可用 |
+| `renamex_np/renameatx_np(RENAME_EXCL/RENAME_SWAP)`、交换/排他 rename | FSKit 平台限制 | 原生实测 SWAP、EXCL 到不存在目标均 ENOTSUP；EXCL 目标已存在时内核先返回 EEXIST。旧 Operations 和新 Handler 都不提供 flags 回调，不能只补 daemon 或迁移 Handler 解决 |
 | `link/symlink/readlink`、dangling symlink、`O_SYMLINK` | createLink/createSymbolicLink/readSymbolicLink | 挂载已测；包含链接身份、nofollow 时间/模式、`cp -Pp` 和二进制 xattr |
 | `readdir/getdirentries`、目录游标与属性 | enumerateDirectory → captured cursor | 基础挂载已测、游标 RPC 已测；单目录最多 65,536 项，64 个流，变更中遍历压力未验收 |
 | UTF-8、大小写、NFC/NFD、长名字 | FSFileName → namespace validation | 挂载已测；区分大小写及 NFC/NFD，255 字节/组件、4096 字节/路径；非法 UTF-8/控制符拒绝 |
@@ -92,15 +92,36 @@ SQLite 的 [锁和同步要求](https://www.sqlite.org/lockingv3.html) 说明为
 本轮 [APFS 与 forkfs 对照结果](evidence/2026-11-10-filesystem-api-compatibility.json)
 限于 macOS 27.2/列出的应用版本、小文件、单挂载。
 
+2026-11-11 增加四组回归，APFS 与 forkfs 全部通过：
+
+| 用例 | 验证内容 |
+| --- | --- |
+| open-flags | 12 组失败 flags 的精确 errno 与文件/目录不变性、dangling symlink 创建、保留 inode 的 truncate、Darwin `O_RDONLY|O_TRUNC`、umask |
+| append | 4 进程各追加 4 个 300 KiB 记录（超过 256 KiB RPC 上限），无丢失/交错/重复；lseek 不改变 append，Darwin pwrite 忽略 O_APPEND |
+| permissions | 单用户文件 mode/access、目录搜索/写入检查；已开 fd 在 chmod 000 后仍可读写，拒绝写截断及目录变更时不改数据 |
+| relative-paths | 目录 fd 在目录改名后仍支持 openat/fstatat/linkat/renameat/unlinkat/mkdirat/readlinkat 路径语义 |
+
+脚本另外输出 `capability_probes`，与通过的功能用例分开。
+rename extensions 探针确认 forkfs 的 SWAP 和 EXCL-to-missing 返回 ENOTSUP，
+失败不改 inode 或数据；APFS 对照可完成这些操作。EXCL-to-existing 的 EEXIST
+只是提前拒绝，不能据此宣称支持排他 rename。
+[Apple 的 Handler rename 文档](https://developer.apple.com/documentation/fskit/fsvolume/handler/renameitem%28_%3Aindirectory%3Anamed%3Ato%3Aindirectory%3Aoveritem%3Acontext%3Areplyhandler%3A%29)
+明确说明 FSKit 在进入回调之前拒绝带 flags 的 rename。SDK 27.2 的 Operations
+接口也有相同限制。因此完整 APFS API 兼容在现有公开 FSKit 表面上有平台阻碍；
+不能用多次普通 rename 冒充原子交换，也不能宣称 Handler 迁移能解决此问题。
+完整结果见 [open/append/权限/相对路径证据](evidence/2026-11-11-open-semantics.json)。
+
 ## 补全顺序与完成条件
 
 每批功能必须同时更新此矩阵、自动化用例及真实挂载证据。明确不支持的功能应
 在修改前返回合适错误；不能返回成功却丢弃请求。不能根据接口存在把“未验收”
 改成“挂载已测”。
 
-1. **基础语义完整性**：补 open flags/`*at`/并发 append、mode/search/access、
-   rename 扩展、目录并发遍历的 APFS 对照；发现差异后分别修复 namespace、RPC
-   或 FSKit 层。明确 errno、失败不变性、readonly、revision/GC 后仍保持语义。
+1. **基础语义完整性**：在本轮已验收的 flags/`*at`/append/单用户权限上继续补
+   flag 组合、组权限、阻塞与共享 fd、目录并发遍历、容量边界的 APFS 对照；发现
+   差异后分别修复 namespace、RPC 或 FSKit 层。明确 errno、失败不变性、readonly、
+   revision/GC 后仍保持语义。rename 扩展需单独评估平台路线或明确兼容范围，
+   不能当作普通 daemon 修复任务。
 2. **容量与大文件**：解除 64 MiB 文件、32 项 xattr、目录项上限中的应用阻断；
    chunk 索引/尺寸上限一起迁移。增加 >4 GiB 稀疏文件、边界短写、ENOSPC、
    GC/重启和历史隔离验收。预分配必须兑现空间保证，不能只改逻辑长度。

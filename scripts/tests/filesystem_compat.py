@@ -6,6 +6,7 @@ process. This is native mount acceptance, not a daemon-only or power-loss test.
 On forkfs, retains one explicitly named revision; use a disposable repository.
 """
 import argparse
+import ctypes
 import errno
 import fcntl
 import json
@@ -67,6 +68,236 @@ def mapped_io(root):
             mapping.flush()
         os.fsync(stream.fileno())
     return {'page_size': page, 'shared_private_readonly': True, 'open_unlink': True}
+
+
+def rejects(operation, expected):
+    try:
+        operation()
+    except OSError as error:
+        check(error.errno == expected, 'expected errno %s, got %s' % (expected, error.errno))
+    else:
+        raise RuntimeError('operation unexpectedly succeeded (expected errno %s)' % expected)
+
+
+def open_flags(root):
+    path = root / 'file'
+    path.write_bytes(b'original')
+    directory = root / 'directory'
+    directory.mkdir()
+    os.symlink('file', root / 'link')
+    os.symlink('missing', root / 'dangling')
+    os.symlink('loop', root / 'loop')
+
+    def opened(target, flags):
+        descriptor = os.open(target, flags, 0o600)
+        os.close(descriptor)
+
+    failures = [('file', os.O_WRONLY | os.O_CREAT | os.O_EXCL, errno.EEXIST),
+                ('link', os.O_WRONLY | os.O_CREAT | os.O_EXCL, errno.EEXIST),
+                ('dangling', os.O_WRONLY | os.O_CREAT | os.O_EXCL, errno.EEXIST),
+                ('link', os.O_RDONLY | os.O_NOFOLLOW, errno.ELOOP),
+                ('dangling', os.O_RDONLY | os.O_NOFOLLOW, errno.ELOOP),
+                ('link', os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, errno.ELOOP),
+                ('loop', os.O_RDONLY, errno.ELOOP),
+                ('absent', os.O_RDONLY, errno.ENOENT),
+                ('file', os.O_RDONLY | os.O_DIRECTORY, errno.ENOTDIR),
+                ('file/child', os.O_RDONLY | os.O_CREAT, errno.ENOTDIR),
+                ('directory', os.O_WRONLY, errno.EISDIR),
+                ('directory', os.O_RDWR, errno.EISDIR)]
+    names = sorted(os.listdir(root))
+    info = path.stat()
+    for name, flags, code in failures:
+        rejects(lambda: opened(root / name, flags), code)
+        check(sorted(os.listdir(root)) == names, 'failed open created an entry')
+        after = path.stat()
+        check((after.st_ino, after.st_size, after.st_mtime_ns) ==
+              (info.st_ino, info.st_size, info.st_mtime_ns), 'failed open changed file metadata')
+        check(path.read_bytes() == b'original', 'failed open changed bytes')
+    opened(directory, os.O_RDONLY | os.O_DIRECTORY)
+    opened(root / 'link', os.O_RDONLY)
+    opened(root / 'dangling', os.O_WRONLY | os.O_CREAT)
+    check((root / 'missing').is_file() and (root / 'dangling').is_symlink(), 'create through dangling link')
+    with path.open('rb') as original:
+        identity = os.fstat(original.fileno()).st_ino
+        opened(path, os.O_WRONLY | os.O_TRUNC)
+        check(os.fstat(original.fileno()).st_size == 0 and path.stat().st_ino == identity,
+              'truncate replaced inode or left stale size')
+    # Darwin accepts this combination and truncates even with a read-only fd.
+    path.write_bytes(b'truncate-readonly')
+    opened(path, os.O_RDONLY | os.O_TRUNC)
+    check(path.stat().st_size == 0, 'Darwin read-only O_TRUNC behavior')
+    old_mask = os.umask(0o027)
+    try:
+        descriptor = os.open(root / 'umask', os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o666)
+        os.close(descriptor)
+    finally:
+        os.umask(old_mask)
+    check((root / 'umask').stat().st_mode & 0o777 == 0o640, 'creation umask')
+    return {'rejected_combinations': len(failures), 'failure_preserves_file': True,
+            'dangling_create': True, 'truncate_preserves_inode': True,
+            'darwin_readonly_truncate': True, 'umask': '0027 -> 0640'}
+
+
+def append_io(root):
+    path = root / 'append'
+    path.write_bytes(b'HEAD')
+    # Records exceed the daemon's 256 KiB I/O bound: the native append must not
+    # interleave records when one callback requires several daemon requests.
+    workers, records, size = 4, 4, 300 * 1024
+    code = '''import os,sys
+fd=os.open(sys.argv[1],os.O_WRONLY|os.O_APPEND)
+print('ready',flush=True);sys.stdin.buffer.read(1)
+for sequence in range(int(sys.argv[3])):
+    header=('%02d:%02d:'%(int(sys.argv[2]),sequence)).encode()
+    record=header+bytes([65+int(sys.argv[2])])*(int(sys.argv[4])-len(header))
+    if os.write(fd,record)!=len(record):raise RuntimeError('short append')
+os.fsync(fd);os.close(fd)
+'''
+    processes = []
+    try:
+        for worker in range(workers):
+            process = subprocess.Popen([sys.executable, '-c', code, str(path), str(worker),
+                                        str(records), str(size)], stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            processes.append(process)
+        for process in processes:
+            check(process.stdout.readline() == b'ready\n', 'append worker did not open')
+        for process in processes:
+            process.stdin.write(b'x')
+            process.stdin.flush()
+        for process in processes:
+            check(process.wait(timeout=30) == 0, 'append worker failed: ' + process.stderr.read().decode())
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=10)
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+    data = path.read_bytes()
+    check(data[:4] == b'HEAD' and len(data) == 4 + workers * records * size, 'append lost bytes')
+    expected = set()
+    for worker in range(workers):
+        for sequence in range(records):
+            header = ('%02d:%02d:' % (worker, sequence)).encode()
+            expected.add(header + bytes([65 + worker]) * (size - len(header)))
+    actual = [data[offset:offset + size] for offset in range(4, len(data), size)]
+    check(len(set(actual)) == workers * records and set(actual) == expected,
+          'append records interleaved, duplicated, or lost')
+    descriptor = os.open(path, os.O_RDWR | os.O_APPEND)
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        check(os.write(descriptor, b'TAIL') == 4, 'append write length')
+        check(os.pwrite(descriptor, b'EDIT', 0) == 4, 'positional write length')
+        os.fsync(descriptor)
+        check(os.pread(descriptor, 4, 0) == b'EDIT', 'Darwin pwrite must ignore O_APPEND')
+    finally:
+        os.close(descriptor)
+    check(path.read_bytes()[-4:] == b'TAIL', 'lseek defeated O_APPEND')
+    return {'processes': workers, 'records_per_process': records, 'record_bytes': size,
+            'no_lost_or_interleaved_records': True, 'darwin_pwrite_ignores_append': True}
+
+
+def permissions(root):
+    check(os.geteuid() != 0, 'permission acceptance must run as an ordinary user')
+    path = root / 'file'
+    path.write_bytes(b'original')
+    directory = root / 'directory'
+    directory.mkdir()
+    (directory / 'child').write_bytes(b'child')
+    descriptor = os.open(path, os.O_RDWR)
+    try:
+        path.chmod(0)
+        rejects(lambda: os.open(path, os.O_RDONLY), errno.EACCES)
+        rejects(lambda: os.open(path, os.O_WRONLY), errno.EACCES)
+        check(not os.access(path, os.R_OK) and not os.access(path, os.W_OK), 'access ignored mode 000')
+        # Access checks occur at open. chmod must not revoke an existing fd.
+        check(os.pread(descriptor, 8, 0) == b'original', 'chmod revoked open read fd')
+        check(os.pwrite(descriptor, b'UPDATED!', 0) == 8, 'chmod revoked open write fd')
+        os.fsync(descriptor)
+        path.chmod(0o400)
+        rejects(lambda: os.open(path, os.O_WRONLY | os.O_TRUNC), errno.EACCES)
+        check(path.read_bytes() == b'UPDATED!', 'denied truncate changed bytes')
+        directory.chmod(0o600)
+        rejects(lambda: (directory / 'child').stat(), errno.EACCES)
+        directory.chmod(0o500)
+        rejects(lambda: os.open(directory / 'new', os.O_CREAT | os.O_WRONLY, 0o600), errno.EACCES)
+        rejects(lambda: (directory / 'child').unlink(), errno.EACCES)
+        directory.chmod(0o700)
+        check((directory / 'child').read_bytes() == b'child' and not (directory / 'new').exists(),
+              'denied directory mutation changed namespace')
+    finally:
+        os.close(descriptor)
+        path.chmod(0o600)
+        directory.chmod(0o700)
+    return {'mode_access_checks': True, 'directory_search_and_write': True,
+            'open_fd_survives_chmod': True, 'denied_mutations_preserve_data': True}
+
+
+def relative_paths(root):
+    directory = root / 'directory'
+    directory.mkdir()
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        file_descriptor = os.open('file', os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600, dir_fd=descriptor)
+        try:
+            check(os.write(file_descriptor, b'relative\x00\xff') == 10, 'openat write')
+            os.fsync(file_descriptor)
+        finally:
+            os.close(file_descriptor)
+        os.rename(directory, root / 'moved')
+        check(os.stat('file', dir_fd=descriptor).st_size == 10, 'dirfd lost identity after rename')
+        os.mkdir('child', mode=0o700, dir_fd=descriptor)
+        os.symlink('file', 'link', dir_fd=descriptor)
+        check(os.readlink('link', dir_fd=descriptor) == 'file', 'readlinkat')
+        os.link('file', 'alias', src_dir_fd=descriptor, dst_dir_fd=descriptor)
+        check(os.stat('alias', dir_fd=descriptor).st_ino == os.stat('file', dir_fd=descriptor).st_ino,
+              'linkat inode identity')
+        os.rename('file', 'renamed', src_dir_fd=descriptor, dst_dir_fd=descriptor)
+        rejects(lambda: os.stat('file', dir_fd=descriptor), errno.ENOENT)
+        os.unlink('alias', dir_fd=descriptor)
+        os.rmdir('child', dir_fd=descriptor)
+        check((root / 'moved/renamed').read_bytes() == b'relative\x00\xff', 'renameat bytes')
+    finally:
+        os.close(descriptor)
+    return {'openat_statat_linkat_renameat_unlinkat_mkdirat_readlinkat': True,
+            'directory_fd_survives_rename': True}
+
+
+def rename_extensions(root):
+    libc = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+    libc.renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    libc.renamex_np.restype = ctypes.c_int
+    kind = filesystem(root)[1]
+    source, destination = root / 'source', root / 'destination'
+    results = {}
+    for name, flags, exists in [('swap', 2, True), ('exclusive-existing', 4, True),
+                                ('exclusive-missing', 4, False)]:
+        source.write_bytes(b'SOURCE')
+        if exists:
+            destination.write_bytes(b'DESTINATION')
+        elif destination.exists():
+            destination.unlink()
+        before = {path.name: (path.stat().st_ino, path.read_bytes())
+                  for path in (source, destination) if path.exists()}
+        ctypes.set_errno(0)
+        result = libc.renamex_np(os.fsencode(source), os.fsencode(destination), flags)
+        code = ctypes.get_errno() if result != 0 else 0
+        expected = errno.EEXIST if name == 'exclusive-existing' else (errno.ENOTSUP if kind == 'forkfs' else 0)
+        check(code == expected, 'unexpected renamex_np %s errno %s' % (name, code))
+        if code:
+            after = {path.name: (path.stat().st_ino, path.read_bytes())
+                     for path in (source, destination) if path.exists()}
+            check(before == after, 'rejected rename extension changed namespace')
+        elif name == 'swap':
+            check(source.read_bytes() == b'DESTINATION' and destination.read_bytes() == b'SOURCE',
+                  'rename swap contents')
+        else:
+            check(not source.exists() and destination.read_bytes() == b'SOURCE', 'exclusive rename contents')
+        results[name] = {'errno': code, 'operation_completed': code == 0,
+                         'unsupported': code == errno.ENOTSUP}
+    return results
 
 
 def locks(root, name):
@@ -200,7 +431,10 @@ def git_workflow(root):
 CASES = {'mmap': mapped_io, 'lockf': lambda root: locks(root, 'lockf'),
          'flock': lambda root: locks(root, 'flock'),
          'sqlite-delete': lambda root: database(root, 'DELETE'),
-         'sqlite-wal': lambda root: database(root, 'WAL'), 'git': git_workflow}
+         'sqlite-wal': lambda root: database(root, 'WAL'), 'git': git_workflow,
+         'open-flags': open_flags, 'append': append_io, 'permissions': permissions,
+         'relative-paths': relative_paths}
+PROBES = {'rename-extensions': rename_extensions}
 
 
 def filesystem(path):
@@ -224,10 +458,11 @@ def main():
     parser.add_argument('--daemon', type=Path)
     parser.add_argument('--socket', type=Path)
     parser.add_argument('--world', default='main')
-    parser.add_argument('--worker-case', choices=CASES, help=argparse.SUPPRESS)
+    operations = dict(CASES, **PROBES)
+    parser.add_argument('--worker-case', choices=operations, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.worker_case:
-        print(json.dumps(CASES[args.worker_case](args.mountpoint)))
+        print(json.dumps(operations[args.worker_case](args.mountpoint)))
         return 0
     check(sys.platform == 'darwin', 'requires native macOS mounts')
     target = args.mountpoint.resolve(strict=True)
@@ -238,14 +473,15 @@ def main():
         check(target.stat().st_mode & 0o777 == 0o700, 'forkfs root must remain private')
         check(args.daemon is not None and args.socket is not None, 'forkfs requires --daemon and --socket')
     report = {'schema': 1, 'platform': platform.platform(), 'filesystem': kind,
-              'python': platform.python_version(), 'cases': {},
+              'python': platform.python_version(), 'cases': {}, 'capability_probes': {},
               'limits': ['single mount', 'no power-loss or kernel-crash guarantee',
                          'small-file workloads only']}
     if not args.reference_apfs:
         report['forkfs_maximum_file_bytes'] = 64 * 1024 * 1024
     root = Path(tempfile.mkdtemp(prefix='forkfs-api-', dir=target))
     try:
-        for name in CASES:
+        for name in operations:
+            group = report['cases'] if name in CASES else report['capability_probes']
             case_root = root / name
             case_root.mkdir(mode=0o700)
             try:
@@ -253,9 +489,10 @@ def main():
                                          str(case_root), '--worker-case', name],
                                         capture_output=True, text=True, timeout=120)
                 check(result.returncode == 0, result.stderr.strip() or 'worker failed')
-                report['cases'][name] = {'status': 'passed', 'details': json.loads(result.stdout)}
+                group[name] = {'status': 'passed' if name in CASES else 'measured',
+                               'details': json.loads(result.stdout)}
             except (RuntimeError, subprocess.TimeoutExpired) as error:
-                report['cases'][name] = {'status': 'failed', 'error': str(error)}
+                group[name] = {'status': 'failed', 'error': str(error)}
         if not args.reference_apfs and report['cases']['mmap']['status'] == 'passed':
             def rpc(*fields, revision=None):
                 view = ['--revision', revision] if revision else ['--world', args.world]
@@ -280,7 +517,8 @@ def main():
     finally:
         shutil.rmtree(root)
     print(json.dumps(report, indent=2))
-    return int(any(case['status'] != 'passed' for case in report['cases'].values()))
+    return int(any(case['status'] == 'failed' for group in ('cases', 'capability_probes')
+                   for case in report[group].values()))
 
 
 if __name__ == '__main__':
