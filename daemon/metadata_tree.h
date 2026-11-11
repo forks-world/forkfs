@@ -1,6 +1,20 @@
 #pragma once
 #include "journal.h"
+namespace leveldb {class Cache;}
 namespace forkfs {
+// Immutable-node summaries are safe across Worlds/revisions and never use
+// size/mtime as content identity. The LRU is bounded to one MiB per repository.
+class AllocationCache {
+public:
+    struct Summary {uint64_t bytes;unsigned height;};
+    AllocationCache();
+    ~AllocationCache();
+    bool get(const std::array<unsigned char,32>& id,Summary& value);
+    void put(const std::array<unsigned char,32>& id,Summary value);
+    void prune();
+private:
+    std::unique_ptr<leveldb::Cache> cache_;
+};
 // Persistent ordered index above LevelDB. It stores no WAL/SST/compaction logic.
 // Content-derived priorities make the CoW treap deterministic across devices.
 class MetadataTree {
@@ -25,6 +39,10 @@ public:
     // Erase half-open ranges before applying point changes. Whole subtrees can
     // be detached without generating a mutation for every removed leaf.
     Plan apply(const Changes& changes,const std::vector<Range>& erased={});
+    // Sum each referenced payload's length rounded to 512-byte units. Missing
+    // sparse positions have no leaf and contribute zero; shared positions count
+    // per reference, not as exclusive ownership of repository disk blocks.
+    uint64_t allocated_bytes(const std::string& prefix,AllocationCache& cache) const;
 private:
     struct Node {std::string key;Id value{},left{},right{};};
     const Journal& store_;

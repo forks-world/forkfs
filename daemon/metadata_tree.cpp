@@ -4,7 +4,20 @@
 #include <functional>
 #include <set>
 #include <stdexcept>
+#include <leveldb/cache.h>
 namespace forkfs {
+AllocationCache::AllocationCache():cache_(leveldb::NewLRUCache(1024*1024)) {}
+AllocationCache::~AllocationCache()=default;
+bool AllocationCache::get(const std::array<unsigned char,32>& id,Summary& value) {
+    auto key=leveldb::Slice(reinterpret_cast<const char*>(id.data()),id.size());auto handle=cache_->Lookup(key);
+    if(!handle)return false;value=*static_cast<Summary*>(cache_->Value(handle));cache_->Release(handle);return true;
+}
+void AllocationCache::put(const std::array<unsigned char,32>& id,Summary value) {
+    auto owned=std::make_unique<Summary>(value);auto key=leveldb::Slice(reinterpret_cast<const char*>(id.data()),id.size());
+    auto handle=cache_->Insert(key,owned.get(),sizeof(Summary)+32,[](const leveldb::Slice&,void* p){delete static_cast<Summary*>(p);});
+    owned.release();cache_->Release(handle);
+}
+void AllocationCache::prune(){cache_->Prune();}
 namespace {
 using Id=MetadataTree::Id;
 using Bytes=MetadataTree::Bytes;
@@ -187,5 +200,27 @@ MetadataTree::Plan MetadataTree::apply(const Changes& changes,const std::vector<
         auto n=node(id);collect(n.left);collect(n.right);result.objects.push_back(it->second);
     };
     collect(candidate);root_=candidate;return result;
+}
+uint64_t MetadataTree::allocated_bytes(const std::string& prefix,AllocationCache& cache) const {
+    std::string upper=prefix;bool bounded=false;
+    for(size_t i=upper.size();i>0;--i)if(static_cast<unsigned char>(upper[i-1])!=255){
+        upper[i-1]=static_cast<char>(static_cast<unsigned char>(upper[i-1])+1);upper.resize(i);bounded=true;break;}
+    auto add=[](uint64_t a,uint64_t b){need(b<=UINT64_MAX-a,"allocation size overflow");return a+b;};
+    auto weight=[&](const Id& value){auto length=store_.object_size(value);need(length<=UINT64_MAX-511,"allocation size overflow");return ((length+511)/512)*512;};
+    std::function<AllocationCache::Summary(Id,unsigned)> total=[&](Id id,unsigned depth)->AllocationCache::Summary {
+        if(id==Id{})return {0,0};need(depth<256,"metadata tree depth limit");AllocationCache::Summary result{};
+        if(cache.get(id,result)){need(result.height<=256-depth,"metadata tree depth limit");return result;}
+        const auto& n=node(id);auto left=total(n.left,depth+1),right=total(n.right,depth+1);
+        result={add(add(left.bytes,right.bytes),weight(n.value)),1+std::max(left.height,right.height)};cache.put(id,result);return result;
+    };
+    std::function<uint64_t(Id,const std::string*,const std::string*,unsigned)> range=[&](Id id,const std::string* lower_bound,const std::string* upper_bound,unsigned depth)->uint64_t {
+        if(id==Id{})return 0;need(depth<256,"metadata tree depth limit");
+        if(lower_bound && *lower_bound>=prefix && (!bounded || (upper_bound && *upper_bound<=upper)))return total(id,depth).bytes;
+        const auto& n=node(id);
+        if(n.key<prefix)return range(n.right,&n.key,upper_bound,depth+1);
+        if(bounded && n.key>=upper)return range(n.left,lower_bound,&n.key,depth+1);
+        return add(add(weight(n.value),range(n.left,lower_bound,&n.key,depth+1)),range(n.right,&n.key,upper_bound,depth+1));
+    };
+    return range(root_,nullptr,nullptr,0);
 }
 }

@@ -5,6 +5,7 @@ namespace forkfs {
 // Namespace version view: persistent CoW tree on LevelDB, immutable sorted runs
 // or flat roots for the legacy single-file backend.
 class MetadataTree;
+class AllocationCache;
 class NamespaceView {
 public:
     using ObjectId=std::array<unsigned char,32>;
@@ -24,6 +25,7 @@ public:
     std::vector<std::string> keys(const std::string& prefix) const;
     Map references() const;
     std::optional<ObjectId> reference(const std::string& key) const {return lookup(key);}
+    uint64_t allocated_bytes(const std::string& prefix,AllocationCache& cache) const;
     bool legacy() const {return legacy_;}
     size_t run_count() const {return tree_?1:runs_.size();}
     Plan plan(const Changes& changes,bool compact=false,const std::vector<Range>& erased={}) const;

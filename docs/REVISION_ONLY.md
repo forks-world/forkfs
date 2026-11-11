@@ -55,6 +55,15 @@ retention, not public revisions; snapshots omit unlinked handles. Last close
 or startup recovery releases them, and offline physical GC reclaims objects
 unreachable from surviving Worlds, revisions or retention roots.
 
+Backed data allocation is derived from immutable payload lengths, not inode
+size or mtime; holes contribute zero and each data position rounds to 512 bytes.
+It remains revision-specific and excludes exclusive physical deduplication costs.
+LevelDB `FFLDB002` adds atomic object-length indexes; `FFLDB001` is readable and
+upgrades on its first successful ordinary transaction. Older daemons reject the
+upgraded repository. Inode/chunk/manifest formats are unaffected by this index.
+Storage commit failures require service reopen; sync and mount keepalive reject
+success while the store is poisoned. See [storage behavior](../daemon/README.md#backed-data-allocation-and-storage-errors).
+
 The new optional FSKit frontend operates through the resident daemon RPC and
 revision-backed namespace; see [FSKit integration](FSKIT.md). Git and
 execution integration remain unavailable until revision-backed replacements exist.

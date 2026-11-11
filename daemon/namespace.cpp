@@ -1,5 +1,6 @@
 #include "namespace.h"
 #include "metadata_view.h"
+#include "metadata_tree.h"
 #include "compaction.h"
 #include <algorithm>
 #include <chrono>
@@ -227,6 +228,7 @@ class FileContent {
     std::function<std::vector<std::string>(const std::string&)> keys_;
     std::string inline_,chunks_;
     Changes* changes_;
+    const NamespaceView* view_=nullptr;
     bool contains(const std::string& key) const {
         if(changes_){auto it=changes_->find(key);if(it!=changes_->end())return bool(it->second);}
         if(changes_)for(const auto& [lower,upper]:changes_->erased)if(lower<=key && key<upper)return false;
@@ -254,11 +256,17 @@ class FileContent {
 public:
     FileContent(InodeInfo& n,const NamespaceView& view,Changes* changes=nullptr)
         :n_(n),contains_([&view](const auto& k){return view.contains(k);}),get_([&view](const auto& k){return view.get(k);}),
-         keys_([&view](const auto& k){return view.keys(k);}),inline_(content_key(n.id)),chunks_(prefix+"chunk/"+n.id+"/"),changes_(changes) {}
+         keys_([&view](const auto& k){return view.keys(k);}),inline_(content_key(n.id)),chunks_(prefix+"chunk/"+n.id+"/"),changes_(changes),view_(&view) {}
     FileContent(InodeInfo& n,const Journal& journal,const std::string& pre,Changes* changes=nullptr)
         :n_(n),contains_([&journal](const auto& k){return journal.contains(k);}),get_([&journal](const auto& k){return journal.get(k);}),
          keys_([&journal](const auto& k){return journal.keys(k);}),inline_(pre+"content"),chunks_(pre+"chunk/"),changes_(changes) {}
     uint64_t size() const {return n_.size;}
+    uint64_t allocated_bytes(AllocationCache& cache) const {
+        if(!n_.chunked)return ((n_.size+511)/512)*512;
+        if(view_)return view_->allocated_bytes(chunks_,cache);
+        uint64_t result=0;for(const auto& key:keys_(chunks_)){auto length=get(key).size();result+=((length+511)/512)*512;}
+        return result;
+    }
     Bytes read(uint64_t offset,uint64_t count) const {
         if(offset>=n_.size || count==0)return {};
         auto length=std::min(count,n_.size-offset);
@@ -796,7 +804,7 @@ Namespace::DirectoryPage Namespace::read_directory(DirectoryCursor& cursor,size_
     std::vector<std::string> names;std::vector<DirectoryEntry> entries;
     for(const auto& key:keys) {
         auto name=key.substr(cursor.prefix_.size());names.push_back(name);
-        if(attributes)entries.push_back({name,inode(snapshot,decode_id(snapshot.get(key)))});
+        if(attributes){auto n=inode(snapshot,decode_id(snapshot.get(key)));allocation_info(n,snapshot);entries.push_back({name,n});}
     }
     if(!keys.empty())cursor.after_=keys.back();cursor.done_=eof;return {std::move(names),eof,std::move(entries)};
 }
@@ -805,7 +813,11 @@ void Namespace::rewind_directory(DirectoryCursor& cursor) const {
     cursor.after_.clear();cursor.done_=cursor.manifest_==ObjectId{};
 }
 InodeInfo Namespace::stat(const std::string& path) const {
-    std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);return inode(j,resolve(j,path));
+    std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);auto n=inode(j,resolve(j,path));allocation_info(n,j);return n;
+}
+void Namespace::allocation_info(InodeInfo& n,const NamespaceView& view) const {
+    n.allocated_size=n.directory?0:FileContent(n,view).allocated_bytes(*container_.allocation_cache_);
+    need(n.allocated_size<=maximum_file_bytes,"invalid allocation size");
 }
 namespace {
 void valid_attributes(const Namespace::Attributes& a) {
@@ -855,7 +867,7 @@ void Namespace::handle_set_attributes(const std::string& token,const Attributes&
     apply_attributes(n,a);changes[key]=encode(n);commit_changes(view,changes);
 }
 InodeInfo Namespace::lstat(const std::string& path) const {
-    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);return inode(view,resolve(view,path,false));
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=inode(view,resolve(view,path,false));allocation_info(n,view);return n;
 }
 void Namespace::symlink(const std::string& target,const std::string& path) {
     target_components(target);
@@ -1110,8 +1122,11 @@ void Namespace::close(const std::string& token) {
 InodeInfo Namespace::handle_stat(const std::string& token) const {
     std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);const auto& j=*container_.journal_;
     NamespaceView view(j,view_,revision_);auto key=inode_key(info.inode);
-    if(view.contains(key))return inode(view,info.inode);
-    need(!revision_,"revision inode missing");return decode_inode(j.get(orphan_prefix(view_,info.inode)+"inode"),info.inode,true);
+    if(view.contains(key)){auto n=inode(view,info.inode);allocation_info(n,view);return n;}
+    need(!revision_,"revision inode missing");auto pre=orphan_prefix(view_,info.inode);auto n=decode_inode(j.get(pre+"inode"),info.inode,true);
+    if(auto retained=retained_orphan(j,pre))allocation_info(n,*retained);
+    else n.allocated_size=FileContent(n,j,pre).allocated_bytes(*container_.allocation_cache_);
+    return n;
 }
 Bytes Namespace::handle_read(const std::string& token,uint64_t offset,uint64_t count) const {
     need(offset<=INT64_MAX,"file offset exceeds signed 64-bit range");

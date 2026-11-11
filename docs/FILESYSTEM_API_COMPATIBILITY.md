@@ -29,6 +29,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `O_CREAT/O_EXCL/O_TRUNC/O_APPEND/O_NOFOLLOW/O_DIRECTORY`、`openat` 系列 | 内核路径解析 + lookup/create/open/setattr | 挂载已测排他/类型/nofollow 拒绝、dangling link 创建、截断身份、umask、并发 append、基本 `*at`；全部组合与极限并发仍未验收 |
 | `dup`、打开后 rename/unlink、同名路径重用 | 内核 fd + daemon orphan roots | 挂载已测；包含普通文件、符号链接元数据 fd 和 mmap |
 | `stat/lstat/fstat`、`chmod/fchmod`、`utime/utimens`、birth time | get/setAttributes | 挂载已测；时间纳秒精度，读取不更新 atime，模式仅 0777 |
+| `st_blocks`、`du` | allocated_size → allocSize | 挂载已测；空洞为零、数据 payload 每位置向上取整到 512 字节，不是去重后独占仓库空间 |
 | `chown/fchown`、setuid/setgid/sticky、ACL | inode metadata + access checks | 缺失；uid/gid 来自服务用户，拒绝更换属主，无 ACL，不是多用户文件系统 |
 | `access/faccessat`、目录搜索权限、只读 fd 权限 | 内核权限判断；未接 AccessCheckOperations | 挂载已测单用户 mode 000/0400、access、目录搜索/写权限、拒绝 truncate/创建/unlink、chmod 不撤销已开 fd；faccessat/组权限/多用户未验收 |
 | `mkdir/rmdir/unlink`、普通 `rename`、原子保存 | create/remove/rename → 原子 namespace 提交 | 挂载已测；失败 errno 与状态不变需按操作继续扩充。直接 RPC 错误码修复另见 PR #95 |
@@ -118,7 +119,15 @@ GC、服务重启后只读重挂载。见 [大文件证据](evidence/2026-11-11-
 各 5,120 个已分配 chunk 的文件。open-unlink/dup/孤儿写入和截断、路径重用、
 最后关闭及闭合文件截断均通过，并在 GC/只读重挂载后校验历史完整哈希。
 见 [密集文件回收证据](evidence/2026-11-11-chunk-retirement.json)。这不是全范围
-1 TiB 密集文件性能资格；物理分配统计也尚未完善。1 TiB 不预留磁盘空间。
+1 TiB 密集文件性能资格。1 TiB 不预留磁盘空间。
+
+分配统计现按每个数据位置的已存 payload 向上取整到 512 字节；空洞为零，
+FSKit `allocSize`、原生 `st_blocks` 和 `du` 已挂载验收。它不包含元数据/WAL，
+也不是去重后独占物理字节。真实 256 MiB APFS 测试镜像已复现 ENOSPC，
+故障后保活和 sync 拒绝成功；释放空间并重启后校验完整旧/新发布和历史隔离。
+WAL append/sync 的 ENOSPC、EDQUOT、EIO 另有注入测试；没有实现配额保证或
+完整断电资格。`FFLDB002` 索引升级后旧 daemon 会拒绝打开。
+见 [分配及空间不足证据](evidence/2026-11-11-allocation-enospc.json)。
 
 ## 补全顺序与完成条件
 
@@ -132,7 +141,7 @@ GC、服务重启后只读重挂载。见 [大文件证据](evidence/2026-11-11-
    revision/GC 后仍保持语义。rename 扩展需单独评估平台路线或明确兼容范围，
    不能当作普通 daemon 修复任务。
 2. **容量与大文件**：完善空间不足恢复，并解除 32 项 xattr、目录项上限中的应用阻断；
-   扩充更大密集文件的性能/内存资格、物理分配统计、边界短写、ENOSPC、
+   扩充更大密集文件的性能/内存资格、旧仓库冷查询性能、边界短写及空间不足故障组合、
    GC/重启和历史隔离验收。预分配必须兑现空间保证，不能只改逻辑长度。
 3. **元数据与安全**：设计持久 uid/gid、特殊模式位、ACL、file flags 的 revision
    格式与授权模型；所有 write/truncate/link/rename/unlink 路径执行约束。先完成
