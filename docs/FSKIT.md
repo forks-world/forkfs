@@ -307,3 +307,13 @@ The native macOS 27.2 run verified ordinary `cp -Pp` with a binary xattr on a
 dangling link, O_SYMLINK fstat/fchmod/utime, rejected data I/O, and open-unlink/dup
 identity. After restart and GC, a read-only revision fd retained its binary xattr
 and rejected metadata writes. See [symlink handle evidence](evidence/2026-11-10-fskit-symlink-handles.json).
+
+Namespace type-conflict errors are also validated directly by inode RPC: rename
+file-over-directory reports EISDIR, directory-over-file reports ENOTDIR, rmdir
+on a file/symlink reports ENOTDIR, and directory hardlinks report EPERM. Unlinking
+a directory reports EPERM on macOS (EISDIR in the Linux daemon). The native
+acceptance matrix matches APFS and verifies that rejected operations publish no
+repository changes. These checks supplement the kernel's prevalidation.
+
+See [namespace error evidence](evidence/2026-11-10-namespace-posix-errors.json)
+for the APFS comparison, native matrix and direct-RPC regression results.
