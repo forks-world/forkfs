@@ -263,6 +263,17 @@ See the [API matrix and reproducible suite](FILESYSTEM_API_COMPATIBILITY.md)
 for the exact scope and APFS reference results. This does not restore the retired
 native-directory Git integration.
 
+The native suite also verifies selected open flags and exact failure errno,
+umask, dangling-link creation, truncate identity, four-process append using
+300 KiB records, Darwin positional writes on append descriptors, single-user
+mode/access/search checks, existing-fd access after chmod, and directory-relative
+syscalls after the directory is renamed. These are tested scenarios, not a claim
+of complete permission/flag conformance. Native rename extensions remain limited
+by FSKit: SWAP and EXCL with an absent target return ENOTSUP; EXCL with an existing
+target fails early with EEXIST. Both Operations and Handler document that flags
+are not forwarded to rename callbacks. See the matrix for primary documentation
+and the separate capability probe results.
+
 Broader kernel writeback/mmap under failures, long-running recovery, daemon-loss cache behavior,
 multi-user ownership/access checks and other macOS versions remain unqualified.
 The local mount evidence does not establish those behaviors.
