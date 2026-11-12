@@ -98,5 +98,15 @@
     "Mount-lifetime inode-to-file-ID mappings still grow with observed inodes; this is a page-buffer bound, not constant total process memory. Backward cookies rewind/replay their original snapshot and can cost a traversal.",
     "Native acceptance covers 66000 empty files, private single-user macOS 27.2.1 arm64, current and read-only directory_base revision after GC. It does not qualify arbitrary-size directory throughput, multi-user behavior, power loss or full POSIX/APFS compatibility.",
     "Fixture seeds existing empty-file records in bounded metadata batches; it does not qualify normal per-file create throughput. The initial per-file fixture was interrupted after profiling revealed full-tree MetadataTree::height checks per editor. That performance issue remains a separate follow-up."
-  ]
+  ],
+  "integration_after_rebase": {
+    "base_commit": "6b4be10d5d4cceb90bd7f9c6b0683d6a9e7de340",
+    "tested_code_commit": "32688973ab156e7f876b5611f82d3c0c2404def3",
+    "ctest_passed": 57,
+    "ctest_failed": 0,
+    "ctest_seconds": 93.82,
+    "source_paths_match_isolated_copy": 135,
+    "system_only_dependencies": true,
+    "notes": "Combination with merged PR104: both sparse seek and paged-directory callback tests pass. Native 66000-entry evidence above remains pinned to the original candidate/runtime hashes."
+  }
 }
