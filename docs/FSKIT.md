@@ -413,7 +413,9 @@ python3 scripts/tests/vnode_events_mount.py /private/tmp --reference-apfs
 ```
 
 The suite creates and removes an owned scratch directory. Each case runs in a
-bounded worker. It tests cross-process append and overwrite (WRITE/EXTEND),
+bounded worker. The append child uses an owned host temporary HOME/TMPDIR so
+interpreter/xcrun startup caches do not add unrelated I/O to the watched mount.
+It tests cross-process append and overwrite (WRITE/EXTEND),
 chmod (ATTRIB), hardlink count changes (LINK), rename (RENAME), unlink (DELETE),
 parent-directory creation/rename/removal, and an unlinked fd whose watch remains
 attached to its original inode after pathname reuse. Assertions allow coalescing

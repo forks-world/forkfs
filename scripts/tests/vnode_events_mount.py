@@ -54,8 +54,11 @@ def file_events(root):
     try:
         def append_child():
             code='import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY|os.O_APPEND); os.write(fd,b"child"); os.fsync(fd); os.close(fd)'
-            subprocess.run([sys.executable, '-c', code, str(path)], check=True, capture_output=True, timeout=15,
-                           env={'PATH':'/usr/bin:/bin','HOME':str(root),'TMPDIR':str(root)})
+            # Keep interpreter/xcrun startup caches off the filesystem under test.
+            # Only the explicitly opened file should exercise mounted append I/O.
+            with tempfile.TemporaryDirectory(prefix='forkfs-vnode-child-', dir='/private/tmp') as child_home:
+                subprocess.run([sys.executable, '-c', code, str(path)], check=True, capture_output=True, timeout=15,
+                               env={'PATH':'/usr/bin:/bin','HOME':child_home,'TMPDIR':child_home})
         report['cross_process_append']=watch.expect(append_child,'WRITE','EXTEND')
         check(os.pread(fd,9,0)==b'basechild','event preceded incorrect file content')
         report['overwrite']=watch.expect(lambda: os.pwrite(fd,b'B',0),'WRITE')
