@@ -23,9 +23,33 @@ static void attribute_identity(const std::string& path){
     {Container store(path);Namespace fs(store);auto after=fs.stat("/f");check(after.id==before.id && after.changed_ns==before.changed_ns && after.modified_ns==before.modified_ns);
         fs.snapshot("b");auto diff=fs.diff("a","b");check(diff.find("\"path\":\"/f\"")!=diff.npos && diff.find("\"xattrs_changed\":true")!=diff.npos && diff.find("\"content_changed\":true")==diff.npos);fs.verify();store.verify();}
 }
+static void large_values(const std::string& path,bool legacy){
+    if(legacy)Container::create_legacy(path);else Container::create(path);
+    Bytes value(forkfs::maximum_xattr_bytes);for(size_t i=0;i<value.size();++i)value[i]=i%251;
+    {
+        Container store(path);Namespace fs(store);fs.initialize();fs.write("/f",Bytes{'D'});fs.link("/f","/alias");
+        fs.set_xattr("/f","com.apple.ResourceFork",value);fs.snapshot("large");fs.fork("large","work");
+        Namespace old(store,"large",true),work(store,"work");auto stable=store.status();
+        rejects([&]{fs.set_xattr("/alias","com.apple.ResourceFork",Bytes(value.size()+1),Namespace::XattrPolicy::Replace);});
+        check(store.status()==stable && fs.get_xattr("/alias","com.apple.ResourceFork")==value);
+        work.set_xattr("/f","com.apple.ResourceFork",Bytes{7});work.snapshot("changed");
+        check(fs.diff("large","changed").find("\"xattrs_changed\":true")!=std::string::npos);
+        auto changed=value;changed.back()^=1;
+        if(!legacy){
+            auto fd=fs.open("/f",Namespace::Access::ReadWrite);fs.remove("/f",false);fs.remove("/alias",false);
+            check(fs.handle_get_xattr(fd,"com.apple.ResourceFork")==value);
+            fs.handle_set_xattr(fd,"com.apple.ResourceFork",changed);check(fs.handle_get_xattr(fd,"com.apple.ResourceFork")==changed);
+            fs.close(fd);
+        }else fs.set_xattr("/f","com.apple.ResourceFork",changed);
+        check(old.get_xattr("/f","com.apple.ResourceFork")==value);fs.verify();old.verify();store.verify();
+        if(!legacy)store.collect_garbage();
+    }
+    {Container store(path);Namespace old(store,"large",true);check(old.get_xattr("/alias","com.apple.ResourceFork")==value);old.verify();store.verify();}
+}
 int main(){
     char pattern[]="/tmp/ff-attr-XXXXXX";auto tmp=mkdtemp(pattern);if(!tmp)return 1;auto path=std::string(tmp)+"/db";
     try {
+        large_values(path+"-large",false);large_values(path+"-legacy",true);
         attribute_identity(path+"-identity");Container::create(path);
         {
             Container store(path);Namespace fs(store);fs.initialize();fs.write("/file",Bytes{'D'});fs.link("/file","/alias");fs.mkdir("/dir");fs.symlink("/file","/link");
@@ -46,9 +70,9 @@ int main(){
             work.snapshot("changed");auto diff=fs.diff("base","changed");
             check(diff.find("\"xattrs_changed\":true")!=diff.npos && diff.find("\"content_changed\":true")==diff.npos);
             fs.write("/quota",{});for(unsigned i=0;i<32;++i)fs.set_xattr("/quota","a"+std::to_string(i),Bytes{static_cast<unsigned char>(i)});
-            stable=store.status();rejects([&]{fs.set_xattr("/quota","overflow",{});});rejects([&]{fs.set_xattr("/quota","a0",Bytes(65537));});
+            stable=store.status();rejects([&]{fs.set_xattr("/quota","overflow",{});});rejects([&]{fs.set_xattr("/quota","a0",Bytes(forkfs::maximum_xattr_bytes+1));});
             for(const auto& name:std::vector<std::string>{"",std::string(256,'n'),std::string("bad\0name",8),std::string("\xc0\x80",2)})rejects([&]{fs.set_xattr("/quota",name,{});});
-            check(store.status()==stable);fs.set_xattr("/quota","a0",Bytes(65536,0xff),Namespace::XattrPolicy::Replace);check(fs.get_xattr("/quota","a0")==Bytes(65536,0xff));
+            check(store.status()==stable);fs.set_xattr("/quota","a0",Bytes(forkfs::maximum_xattr_bytes,0xff),Namespace::XattrPolicy::Replace);check(fs.get_xattr("/quota","a0")==Bytes(forkfs::maximum_xattr_bytes,0xff));
             fs.remove_xattr("/quota","a1");fs.set_xattr("/quota",std::string(255,'n'),{});check(fs.list_xattrs("/quota").size()==32);
             auto quota=fs.open("/quota",Namespace::Access::Read);fs.remove("/quota",false);check(fs.handle_list_xattrs(quota).size()==32);fs.verify();fs.close(quota);
             auto handle=fs.open("/file",Namespace::Access::Read);fs.remove("/file",false);fs.remove("/alias",false);

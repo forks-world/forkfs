@@ -107,7 +107,7 @@ forkfsd request /private/runtime/control.sock fs-xattr-set /file user.note creat
 Paths address the final inode without following its final symlink. Regular files,
 directories and symlinks have independent xattrs; hardlinks share their inode's
 attributes. Names are 1..255 bytes of valid UTF-8, without normalization, excluding
-C0/DEL/C1 controls. A value can be empty or binary, up to 64 KiB, and an inode can
+C0/DEL/C1 controls. A value can be empty or binary, up to 262,143 bytes, and an inode can
 have at most 32 attributes. Native macOS may impose tighter name restrictions.
 Set policy is mandatory: `upsert`, `create` (EEXIST if present), or `replace`
 (ENOATTR/ENODATA if absent). Removing a missing name also fails. Invalid input
@@ -128,6 +128,18 @@ commit synchronously, modify ctime and preserve mtime, mode and file contents.
 Snapshot/fork, rename, replacement, final close, lease expiry, recovery and GC
 retain or release metadata alongside the associated inode. A replacement inode
 starts with its own attributes; old open handles retain the replaced inode's set.
+
+The shared daemon/FSKit limit is 262,143 bytes per value, including whole-value
+`com.apple.ResourceFork` operations. Values remain single immutable objects;
+this does not provide arbitrarily large or streamed resource forks. Native
+ResourceFork `cp -p` and position reads still fail with EINVAL on the tested macOS
+27.2 mount; ordinary large xattrs copy successfully. The 32-name
+limit per inode remains. Existing values up to 64 KiB need no rewrite. Older
+daemons/frontends reject larger values; use the updated pair for repositories
+containing them. No inode/manifest encoding or repository format change is
+introduced by this bound increase. Updates still publish the complete value and
+inode atomically, and revisions retain the original object IDs. Attributes do
+not contribute to the file-data `allocated_size` statistic.
 
 Values live at `\0forkfs/xattr/INODE/NAME` as ordinary CoW leaves. The inode's
 encoded mode word reserves bit 31 for attribute presence; the public mode remains

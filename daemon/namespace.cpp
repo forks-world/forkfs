@@ -351,7 +351,7 @@ public:
     std::vector<std::string> records() const {return keys_(prefix_);}
     Bytes get(const std::string& name) const {
         valid_xattr_name(name);auto key=prefix_+name;need(contains_(key),"extended attribute not found");auto value=get_(key);
-        need(value.size()<=64*1024,"extended attribute exceeds 64 KiB");return value;
+        need(value.size()<=maximum_xattr_bytes,"extended attribute exceeds 262143 bytes");return value;
     }
     std::vector<std::string> names() const {
         auto keys=records();need(keys.size()<=32,"extended attribute count limit reached");std::vector<std::string> result;
@@ -360,7 +360,7 @@ public:
     bool edit(const std::string& name,const std::optional<Bytes>& value,Namespace::XattrPolicy policy) {
         valid_xattr_name(name);need(policy==Namespace::XattrPolicy::Upsert || policy==Namespace::XattrPolicy::Create || policy==Namespace::XattrPolicy::Replace,"invalid extended attribute policy");
         auto key=prefix_+name;bool exists=contains_(key);auto count=records().size();
-        if(value){need(value->size()<=64*1024,"extended attribute exceeds 64 KiB");
+        if(value){need(value->size()<=maximum_xattr_bytes,"extended attribute exceeds 262143 bytes");
             need(policy!=Namespace::XattrPolicy::Create || !exists,"extended attribute already exists");
             need(policy!=Namespace::XattrPolicy::Replace || exists,"extended attribute not found");
             need(exists || count<32,"extended attribute count limit reached");
