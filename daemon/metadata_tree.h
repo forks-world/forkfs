@@ -15,6 +15,22 @@ public:
 private:
     std::unique_ptr<leveldb::Cache> cache_;
 };
+// Repository-owned, bounded memo of verified immutable subtree heights.
+// Container serialization protects use; summaries never retain objects for GC.
+class TreeHeightCache {
+public:
+    explicit TreeHeightCache(size_t bytes=64*1024*1024);
+    ~TreeHeightCache();
+    std::optional<unsigned> get(const std::array<unsigned char,32>& id);
+    void put(const std::array<unsigned char,32>& id,unsigned height);
+    void prune();
+    size_t charge() const;
+    uint64_t hits() const {return hits_;}
+    uint64_t misses() const {return misses_;}
+private:
+    std::unique_ptr<leveldb::Cache> cache_;
+    uint64_t hits_=0,misses_=0;
+};
 // Persistent ordered index above LevelDB. It stores no WAL/SST/compaction logic.
 // Content-derived priorities make the CoW treap deterministic across devices.
 class MetadataTree {
@@ -34,11 +50,11 @@ public:
     // before publication; pending nodes must remain available until then.
     // After successful publication, use a fresh editor at the committed root
     // before the next apply. Returning a Plan does not acknowledge a commit.
-    // Height validation walks a cold persisted tree once per editor; immutable
-    // node heights are cached for subsequent changes in that session.
+    // A repository-owned height cache can reuse verified immutable subtree
+    // heights across fresh editors. Cold/evicted subtrees are still checked.
     // Erase half-open ranges before applying point changes. Whole subtrees can
     // be detached without generating a mutation for every removed leaf.
-    Plan apply(const Changes& changes,const std::vector<Range>& erased={});
+    Plan apply(const Changes& changes,const std::vector<Range>& erased={},TreeHeightCache* heights=nullptr);
     // Sum each referenced payload's length rounded to 512-byte units. Missing
     // sparse positions have no leaf and contribute zero; shared positions count
     // per reference, not as exclusive ownership of repository disk blocks.
@@ -53,7 +69,7 @@ private:
     const Node& node(const Id& id) const;
     static bool higher(const Node& a,const Node& b);
     Id make(const Node& node);
-    unsigned height(Id root,unsigned depth=0) const;
+    unsigned height(Id root,unsigned depth,TreeHeightCache* shared) const;
     // Editing is iterative: intermediate batch trees may exceed the final limit.
     Id set(Id root,const std::string& key,const std::optional<Id>& value);
     Id merge(Id left,Id right);

@@ -500,7 +500,7 @@ void Namespace::commit_changes(const NamespaceView& view,Changes& changes) {
             } else delta[key]=std::nullopt;
         }
         if(!delta.empty() || !changes.erased.empty()) {
-            auto plan=view.plan(delta,false,changes.erased);
+            auto plan=view.plan(delta,false,changes.erased,container_.tree_height_cache_.get());
             for(auto& payload:plan.objects) {
                 auto id=Journal::object_id(payload);auto key=history+"object/"+hex_id(id);
                 if(!journal.contains(key))new_objects.emplace(key,std::move(payload));
@@ -522,7 +522,7 @@ void Namespace::commit_orphan_changes(const NamespaceView& retained,const std::s
                 auto name=history+"object/"+hex_id(id);if(!journal.contains(name))objects.emplace(name,*value);}
             else delta[key]=std::nullopt;
         }
-        auto plan=retained.plan(delta,false,changes.erased);
+        auto plan=retained.plan(delta,false,changes.erased,container_.tree_height_cache_.get());
         for(auto& value:plan.objects){auto name=history+"object/"+hex_id(Journal::object_id(value));if(!journal.contains(name))objects.emplace(name,std::move(value));}
         for(auto& [key,value]:objects)batch.push_back({key,std::move(value)});
         batch.push_back({pre+"tree",std::move(plan.manifest)});

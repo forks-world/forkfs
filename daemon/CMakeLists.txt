@@ -310,3 +310,9 @@ set_tests_properties(forkfs_revision_only PROPERTIES TIMEOUT 120)
 add_test(NAME forkfsd_inode_rpc COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/inode_rpc.py $<TARGET_FILE:forkfsd> ${CMAKE_SOURCE_DIR}/scripts/fskit-config.py)
 set_tests_properties(forkfsd_inode_rpc PROPERTIES TIMEOUT 120)
+
+# Opt-in manual Namespace API creation probe; not part of default builds/CTest.
+add_executable(forkfsd_create_probe EXCLUDE_FROM_ALL tests/create_probe.cpp
+    $<TARGET_OBJECTS:forkfs_common> $<TARGET_OBJECTS:forkfs_container_obj>
+    $<TARGET_OBJECTS:forkfs_compaction_obj>)
+target_link_libraries(forkfsd_create_probe PRIVATE forkfs_metadata)
