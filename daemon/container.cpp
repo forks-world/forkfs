@@ -1,6 +1,7 @@
 #include "container.h"
 #include "level_store.h"
 #include "namespace.h"
+#include "metadata_tree.h"
 #include <array>
 #include <algorithm>
 #include <cerrno>
@@ -152,7 +153,7 @@ void Container::create_legacy(const std::string& path) {
     // that another process might have replaced while initialization was running.
 }
 
-Container::Container(const std::string& path):repository_path_(path) {
+Container::Container(const std::string& path):repository_path_(path),allocation_cache_(std::make_unique<AllocationCache>()) {
     struct stat backing{};
     if(lstat(path.c_str(),&backing)==0 && S_ISDIR(backing.st_mode)) {
         journal_=std::make_unique<Journal>(path);id_=journal_->repository();Namespace::recover_orphans(*this);return;
@@ -258,7 +259,7 @@ std::string Container::status() const {
         (journal_->is_leveldb()?std::string("leveldb"):std::string("object-journal")) + "\",\"storage_engine\":\"" +
         (journal_->is_leveldb()?std::string("leveldb"):std::string("legacy")) + "\",\"repository_id\":\"" + id_ +
         "\",\"degraded_anchor\":" + (degraded_ ? "true" : "false") +
-        ",\"mounted\":false,\"transactions_supported\":true,\"last_committed_seq\":" +
+        ",\"mounted\":false,\"transactions_supported\":true,\"requires_reopen\":"+(journal_->requires_reopen()?"true":"false")+",\"last_committed_seq\":" +
         std::to_string(journal_->sequence()) + ",\"checkpoint_seq\":" +
         std::to_string(decode_le(anchor_.data()+80,8)) + ",\"replayed_transactions\":" +
         std::to_string(journal_->replayed()) + ",\"indexed_objects\":" +
@@ -320,7 +321,7 @@ size_t Container::collect_garbage() {
     // Remove only unreachable entries; live indices remain usable for dedup.
     std::vector<std::string> obsolete;
     for(const auto& key:registry)if(!live.contains(j.root_object(key)))obsolete.push_back(key);
-    auto removed=j.collect(j.sequence(),live,obsolete);j.compact();return removed;
+    auto removed=j.collect(j.sequence(),live,obsolete);allocation_cache_->prune();j.compact();return removed;
 }
 }
 

@@ -870,6 +870,48 @@ outstanding. Sparse revision diff still compares allocated positions only.
 Permission enforcement beyond the private single-user mount remains unqualified.
 
 
+## Backed data allocation and storage errors
+
+`fs-stat`, `fs-lstat` and inode RPC attributes expose `allocated_size` in bytes.
+FSKit uses it for `allocSize` and native `st_blocks`/`du`. Each stored data payload
+is rounded to 512 bytes per file position; sparse holes contribute zero. Identical
+chunks at different positions count separately, while hardlinks share the same
+inode statistic. Directories report zero. Inline payloads count their stored
+length, including embedded zeroes. Namespace/xattr/LevelDB metadata and WAL are
+excluded: this measures backed file data, not exclusive physical CAS ownership
+or a per-file repository disk bill. It provides no preallocation guarantee.
+
+LevelDB repositories now use `FFLDB002`, with `S/<object ID>` payload lengths
+published atomically with immutable objects. Verification checks the index;
+physical GC removes an object's index with the object. A bounded 1 MiB cache per
+repository aggregates immutable metadata subtrees by content ID, so edits cannot
+reuse stale size/mtime summaries. Cold indexed queries traverse metadata rather
+than loading file data. Existing `FFLDB001` repositories remain readable without
+rewriting their format during read-only access. Their first successful ordinary
+transaction upgrades the format atomically; old objects without index entries
+fall back to verified payload reads. This can make cold legacy queries expensive.
+The legacy journal format also uses verified payload reads. Public inode and
+revision formats are unchanged by these derived statistics.
+
+**Older daemons reject `FFLDB002`. After creating or upgrading a repository, keep
+using the updated daemon; removing files or running GC does not undo the upgrade.**
+
+The pinned LevelDB POSIX environment's ENOSPC and EDQUOT I/O statuses propagate
+as the corresponding RPC errno; other storage I/O failures become EIO. A failed
+commit poisons the open store: status reports `requires_reopen: true`, and writes,
+mount keepalive and inode sync fail rather than reporting successful durability.
+Freeing host space alone does not repair that process. Unmount/stop the service,
+free space on the backing filesystem, then reopen and check the repository. Do
+not reinitialize or delete its database. A failed sync can still replay a complete
+transaction after restart; callers must allow the whole old or new publication,
+not assume that an error proves no write occurred. Retained revisions stay intact.
+
+CTest covers both WAL append and sync failures with ENOSPC, EDQUOT and EIO,
+including handle writes and inode truncation. Native acceptance and the bounded
+real APFS-image disk-full reproducer are documented in [FSKit](../docs/FSKIT.md).
+These tests do not qualify physical quota enforcement, all short-write paths,
+hardware power loss or full 1 TiB dense workloads.
+
 ## Worlds and retained revisions
 
 ```sh

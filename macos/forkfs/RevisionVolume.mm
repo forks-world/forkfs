@@ -86,7 +86,8 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 - (FSItemAttributes*)attributes:(RevisionItem*)item {
     NSDictionary* a=item.attrs;FSItemAttributes* r=[FSItemAttributes new];r.type=itemType(a);
     r.fileID=(FSItemID)item.number;r.parentID=(FSItemID)item.parent;r.mode=item==_root?0700:[a[@"mode"] unsignedIntValue];r.linkCount=[a[@"links"] unsignedLongLongValue];
-    r.uid=_uid;r.gid=_gid;r.size=[a[@"size"] unsignedLongLongValue];r.allocSize=r.size;
+    r.uid=_uid;r.gid=_gid;r.size=[a[@"size"] unsignedLongLongValue];
+    r.allocSize=a[@"allocated_size"]?[a[@"allocated_size"] unsignedLongLongValue]:r.size;
     uint64_t m=[a[@"modified_ns"] unsignedLongLongValue],c=[a[@"changed_ns"] unsignedLongLongValue];
     r.modifyTime=(timespec){(time_t)(m/1000000000),(long)(m%1000000000)};
     r.changeTime=(timespec){(time_t)(c/1000000000),(long)(c%1000000000)};

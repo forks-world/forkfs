@@ -25,17 +25,29 @@ struct StoreIoMetrics {
 namespace {
 using Clock=std::chrono::steady_clock;
 uint64_t elapsed(Clock::time_point start){return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();}
+leveldb::Status injected_io_error(const char* operation) {
+#ifdef FORKFS_TEST_FAULTS
+    const char* request=std::getenv("FORKFS_TEST_IO_ERROR");const char* armed=std::getenv("FORKFS_TEST_IO_ERROR_FILE");
+    if(request && (!armed || access(armed,F_OK)==0))for(int code:{ENOSPC,EDQUOT,EIO}) {
+        auto selection=std::string(operation)+":"+std::to_string(code);
+        if(selection==request)return leveldb::Status::IOError("injected storage error",std::strerror(code));
+    }
+#else
+    (void)operation;
+#endif
+    return leveldb::Status::OK();
+}
 class TimedFile:public leveldb::WritableFile {
     std::unique_ptr<leveldb::WritableFile> file_;StoreIoMetrics& m_;bool wal_;
 public:
     TimedFile(std::unique_ptr<leveldb::WritableFile> file,StoreIoMetrics& m,bool wal):file_(std::move(file)),m_(m),wal_(wal){}
     leveldb::Status Append(const leveldb::Slice& data) override {
-        auto start=Clock::now();auto s=file_->Append(data);if(wal_){m_.wal_append_ns+=elapsed(start);m_.wal_append_bytes+=data.size();}return s;
+        auto start=Clock::now();auto s=injected_io_error(wal_?"wal-append":"file-append");if(s.ok())s=file_->Append(data);if(wal_){m_.wal_append_ns+=elapsed(start);m_.wal_append_bytes+=data.size();}return s;
     }
     leveldb::Status Close() override{return file_->Close();}
     leveldb::Status Flush() override{auto start=Clock::now();auto s=file_->Flush();if(wal_)m_.wal_flush_ns+=elapsed(start);return s;}
     leveldb::Status Sync() override {
-        auto start=Clock::now();auto s=file_->Sync();if(wal_){++m_.wal_sync_calls;m_.wal_sync_ns+=elapsed(start);}
+        auto start=Clock::now();auto s=injected_io_error(wal_?"wal-sync":"file-sync");if(s.ok())s=file_->Sync();if(wal_){++m_.wal_sync_calls;m_.wal_sync_ns+=elapsed(start);}
         else {++m_.other_sync_calls;m_.other_sync_ns+=elapsed(start);}return s;
     }
 };
@@ -55,7 +67,16 @@ using Bytes=std::vector<unsigned char>;
 using Id=std::array<unsigned char,32>;
 void need(bool ok,const char* message) {if(!ok)throw std::runtime_error(message);}
 void status(const leveldb::Status& s,const char* operation) {
-    if(!s.ok())throw std::runtime_error(std::string(operation)+": "+s.ToString());
+    if(!s.ok()) {
+        auto message=std::string(operation)+": "+s.ToString();
+        // The pinned POSIX Env appends strerror(errno) to IOError. Match only
+        // the complete suffix, never an error word somewhere in a pathname.
+        if(s.IsIOError()) {
+            for(int code:{ENOSPC,EDQUOT})if(message.ends_with(std::string(": ")+std::strerror(code)))throw std::system_error(code,std::generic_category(),message);
+            throw std::system_error(EIO,std::generic_category(),message);
+        }
+        throw std::runtime_error(message);
+    }
 }
 std::string integer(uint64_t n) {std::string b(8,0);for(unsigned i=0;i<8;++i)b[i]=static_cast<char>(n>>(8*i));return b;}
 uint64_t number(const std::string& b) {
@@ -101,11 +122,12 @@ LevelStore::LevelStore(const std::string& path,bool initialize,size_t object_cac
             if(n<0 && errno==EINTR)continue;
             if(n<=0){int saved=n<0?errno:EIO;close(fd);throw std::system_error(saved,std::generic_category(),"repository entropy");}done+=n;
         }
-        close(fd);leveldb::WriteBatch batch;batch.Put("M/format","FFLDB001");batch.Put("M/repository",repository);
+        close(fd);leveldb::WriteBatch batch;batch.Put("M/format","FFLDB002");batch.Put("M/repository",repository);
         batch.Put("M/sequence",integer(0));batch.Put("M/objects",integer(0));batch.Put("M/roots",integer(0));
         leveldb::WriteOptions write;write.sync=true;status(db_->Write(write,&batch),"initialize LevelDB repository");
     }
-    std::string value;need(read("M/format",value) && value=="FFLDB001","unsupported LevelDB repository format");
+    std::string value;need(read("M/format",value) && (value=="FFLDB001" || value=="FFLDB002"),"unsupported LevelDB repository format");
+    indexed_sizes_=value=="FFLDB002";
     need(read("M/repository",value) && value.size()==16,"invalid repository identity");
     const char* hex="0123456789abcdef";for(unsigned char c:value){repository_+=hex[c>>4];repository_+=hex[c&15];}
     need(read("M/sequence",value),"missing sequence");sequence_=number(value);
@@ -168,6 +190,14 @@ Bytes LevelStore::object(const Id& object_id) const {
 LevelStore::CacheStats LevelStore::cache_stats() const {
     return {cache_hits_.load(),cache_misses_.load(),object_cache_->TotalCharge()};
 }
+uint64_t LevelStore::object_size(const Id& object_id) const {
+    healthy();std::string value;
+    if(indexed_sizes_ && read("S/"+bytes(object_id),value)) {
+        auto length=number(value);need(length<=256*1024,"invalid object size index");return length;
+    }
+    // Version-1 payloads remain readable without an eager whole-store rewrite.
+    return object(object_id).size();
+}
 std::vector<std::string> LevelStore::keys(const std::string& prefix) const {
     healthy();std::vector<std::string> result;auto search="R/"+prefix;
     leveldb::ReadOptions options;options.verify_checksums=true;
@@ -200,13 +230,15 @@ void LevelStore::transact(uint64_t expected,const std::vector<Mutation>& changes
         std::string previous;
         if(read("O/"+bytes(hash),previous))need(previous.size()==value->size() && (previous.empty() || !memcmp(previous.data(),value->data(),value->size())),"immutable object collision/corruption");
         else {batch.Put("O/"+bytes(hash),leveldb::Slice(reinterpret_cast<const char*>(value->data()),value->size()));++objects;}
+        batch.Put("S/"+bytes(hash),integer(value->size()));
     }
     for(const auto& [key,hash]:updates){if(hash)batch.Put("R/"+key,bytes(*hash));else batch.Delete("R/"+key);}
     batch.Put("M/sequence",integer(sequence_+1));batch.Put("M/objects",integer(objects));batch.Put("M/roots",integer(roots));
+    batch.Put("M/format","FFLDB002");
     fault("leveldb_before_write");leveldb::WriteOptions options;options.sync=true;
     metrics_->prepare_ns+=elapsed(begin);auto write_begin=Clock::now();
     auto s=db_->Write(options,&batch);metrics_->write_ns+=elapsed(write_begin);if(!s.ok()){poisoned_=true;status(s,"commit LevelDB batch");}
-    ++metrics_->transactions;sequence_=sequence_+1;objects_=objects;roots_=roots;fault("leveldb_after_write");
+    ++metrics_->transactions;sequence_=sequence_+1;objects_=objects;roots_=roots;indexed_sizes_=true;fault("leveldb_after_write");
 }
 std::string LevelStore::metrics_json(bool detailed) const {
     auto& m=*metrics_;std::string result="{\"transactions\":"+std::to_string(m.transactions.load())+
@@ -230,6 +262,8 @@ void LevelStore::verify() const {
         auto key=it->key().ToString(),value=it->value().ToString();
         if(key.starts_with("O/")){need(key.size()==34,"invalid object key");need(Journal::object_id(Bytes(value.begin(),value.end()))==id(key.substr(2)),"object checksum mismatch");++objects;}
         else if(key.starts_with("R/")){object(id(value));++roots;}
+        else if(key.starts_with("S/")){need(indexed_sizes_ && key.size()==34,"invalid object size key");
+            need(number(value)==object(id(key.substr(2))).size(),"object size index mismatch");}
         else need(key=="M/format" || key=="M/repository" || key=="M/sequence" || key=="M/objects" || key=="M/roots","unknown metadata key");
     }
     status(it->status(),"verify LevelDB");need(roots==roots_ && objects==objects_,"LevelDB count mismatch");
@@ -249,7 +283,7 @@ size_t LevelStore::collect(uint64_t expected,const std::set<Id>& live,const std:
     std::unique_ptr<leveldb::Iterator> it(db_->NewIterator(read_options));
     for(it->Seek("O/");it->Valid() && it->key().starts_with("O/");it->Next()) {
         auto key=it->key().ToString();need(key.size()==34,"invalid object key");
-        if(!live.contains(id(key.substr(2)))){batch.Delete(key);++removed;}
+        if(!live.contains(id(key.substr(2)))){batch.Delete(key);batch.Delete("S/"+key.substr(2));++removed;}
     }
     status(it->status(),"scan GC objects");
     for(const auto& key:obsolete_roots){need(contains(key),"GC root disappeared");batch.Delete("R/"+key);}

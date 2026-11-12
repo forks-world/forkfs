@@ -17,6 +17,7 @@ public:
     ~LevelStore();
     void transact(uint64_t expected,const std::vector<Mutation>& changes);
     std::vector<unsigned char> object(const std::array<unsigned char,32>& id) const;
+    uint64_t object_size(const std::array<unsigned char,32>& id) const;
     std::array<unsigned char,32> root(const std::string& key) const;
     bool contains(const std::string& key) const;
     std::vector<std::string> keys(const std::string& prefix) const;
@@ -32,6 +33,7 @@ public:
     size_t roots() const {return roots_;}
     std::string repository() const {return repository_;}
     void poison() {poisoned_=true;}
+    bool requires_reopen() const {return poisoned_;}
 private:
     LevelStore(const std::string& path,bool initialize,size_t object_cache_bytes);
     bool read(const std::string& key,std::string& value) const;
@@ -43,6 +45,7 @@ private:
     mutable std::map<std::string,RootFact> root_cache_;
     std::atomic<uint64_t> sequence_=0,objects_=0,roots_=0;
     std::atomic<bool> poisoned_=false;
+    std::atomic<bool> indexed_sizes_=false;
     std::string repository_;
     std::unique_ptr<leveldb::Cache> cache_;
     std::unique_ptr<leveldb::Cache> object_cache_;

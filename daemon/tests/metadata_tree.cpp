@@ -170,6 +170,15 @@ int main() {
             // The same base and changes produce byte-identical immutable trees.
             MetadataTree replay(journal,old_root);auto repeated=replay.apply({{key("test/50"),std::nullopt},{key("test/51"),changed_id},{key("test/new"),changed_id}});
             check(repeated.manifest==updated.manifest && repeated.objects==updated.objects);
+            AllocationCache allocation;
+            check(tree.allocated_bytes(key("test/"),allocation)==tree.keys(key("test/")).size()*512);
+            check(tree.allocated_bytes(key("test/2"),allocation)==tree.keys(key("test/2")).size()*512);
+            check(tree.allocated_bytes(key("absent/"),allocation)==0);
+            MetadataTree::Bytes wide_value(513,0x45);auto wide_id=Journal::object_id(wide_value);journal.put("wide-value",wide_value);
+            MetadataTree weighted(journal,new_root);auto weighted_plan=weighted.apply({{key("test/51"),wide_id}});
+            publish(journal,"weighted",weighted_plan);
+            check(weighted.allocated_bytes(key("test/"),allocation)==tree.keys(key("test/")).size()*512+512);
+            check(tree.allocated_bytes(key("test/"),allocation)==tree.keys(key("test/")).size()*512);
             // Half-open range erasure agrees with an independent ordered map;
             // explicit point changes are applied after overlapping removals.
             MetadataTree ranged(journal,new_root);auto ranged_expected=expected;
