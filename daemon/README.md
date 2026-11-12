@@ -325,6 +325,35 @@ client does not automatically retry mutations. Online directory export, paged
 persistent/multiplexed transport connections are not implemented; bounded directory
 listing is described below.
 
+## Validated inode path hints
+
+Inode RPCs can reuse a recently observed namespace path instead of locating an
+inode by traversing all directory entries. Successful stat/lstat/open and a
+fallback search seed hints. Each use resolves the path in the **current**
+World/revision with no final-symlink following, and compares the requested inode
+ID. A mismatch, vanished path, changed ancestor type or retargeted/cyclic symlink
+falls back to the existing traversal. Hardlinks may return any valid alias;
+regular-file inode operations cannot accidentally target the final symlink.
+
+Hints are scoped by view kind/name and inode ID, serialized by the repository
+mutex, and globally bounded to 4096 entries per Container with FIFO eviction.
+Paths are bounded by the existing 4096-byte limit. They store no object roots,
+remain non-authoritative through GC, and disappear on reopen. Allocation failure
+while recording a hint is ignored so an already committed operation cannot fail
+because of the optimization. No inode, store, manifest or RPC format changes.
+
+The CTest target also offers an optional read-only lookup probe for an **owned,
+offline disposable fixture**:
+
+```sh
+build/Release/daemon/forkfsd_inode_paths_test /private/tmp/owned-fixture /scale/n000000
+```
+
+It seeds with stat, performs ten inode lookups with identity checks and confirms
+that the journal sequence is unchanged. This measures the known-path hint case,
+not arbitrary cold inode search. Unseeded/evicted/stale hints still require the
+existing traversal. See [acceptance evidence](../docs/evidence/2026-11-12-inode-path-hints.json).
+
 ## Inode handles and open-unlink
 
 The LevelDB backend supports regular-file and symlink metadata handles through the C++ API

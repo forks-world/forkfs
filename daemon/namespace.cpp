@@ -865,7 +865,7 @@ void Namespace::rewind_directory(DirectoryCursor& cursor) const {
     cursor.after_.clear();cursor.done_=cursor.manifest_==ObjectId{};
 }
 InodeInfo Namespace::stat(const std::string& path) const {
-    std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);auto n=inode(j,resolve(j,path));allocation_info(n,j);return n;
+    std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);auto n=inode(j,resolve(j,path));allocation_info(n,j);remember_path(n.id,path);return n;
 }
 void Namespace::allocation_info(InodeInfo& n,const NamespaceView& view) const {
     n.allocated_size=n.directory?0:FileContent(n,view).allocated_bytes(*container_.allocation_cache_);
@@ -920,7 +920,7 @@ void Namespace::handle_set_attributes(const std::string& token,const Attributes&
     apply_attributes(n,a);changes[key]=encode(n);commit_changes(view,changes);
 }
 InodeInfo Namespace::lstat(const std::string& path) const {
-    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=inode(view,resolve(view,path,false));allocation_info(n,view);return n;
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=inode(view,resolve(view,path,false));allocation_info(n,view);remember_path(n.id,path);return n;
 }
 void Namespace::symlink(const std::string& target,const std::string& path) {
     target_components(target);
@@ -1099,7 +1099,7 @@ std::string Namespace::open(const std::string& path,Access access,const OpenOpti
         if(counted){auto count=container_.open_counts_.find({view_,id});if(--count->second==0)container_.open_counts_.erase(count);}
         container_.handles_.erase(token);throw;
     }
-    container_.compaction_cv_.notify_all();return token;
+    remember_path(id,path);container_.compaction_cv_.notify_all();return token;
 }
 
 std::string Namespace::dup(const std::string& token) {
@@ -1241,16 +1241,37 @@ void Namespace::recover_orphans(Container& container) {
 }
 
 namespace forkfs {
+void Namespace::remember_path(const std::string& id,const std::string& path) const noexcept {
+    // Caller holds the repository mutex. An optional hint must never turn an
+    // already committed operation into a failure if allocation is unavailable.
+    try {
+        Container::InodePathKey key{view_,revision_,id};auto& paths=container_.inode_paths_;
+        auto existing=paths.find(key);if(existing!=paths.end()){existing->second=path;return;}
+        auto inserted=paths.emplace(key,path).first;
+        try{container_.inode_path_order_.push_back(std::move(key));}catch(...){paths.erase(inserted);throw;}
+        if(paths.size()>Container::maximum_inode_path_hints){paths.erase(container_.inode_path_order_.front());container_.inode_path_order_.pop_front();}
+    }catch(...){} // Optimization only; resolution remains authoritative.
+}
 std::string Namespace::path_for_inode(const std::string& id) const {
     need(valid_id(id),"invalid inode identity");std::lock_guard lock(container_.mutex_);
     NamespaceView view(*container_.journal_,view_,revision_);auto rid=root(view);
+    auto hint=container_.inode_paths_.find({view_,revision_,id});
+    if(hint!=container_.inode_paths_.end()){
+        try{if(resolve(view,hint->second,false)==id)return hint->second;}
+        catch(const std::runtime_error& e){auto message=std::string_view(e.what());
+            if(message!="path not found" && message!="path component is not a directory" &&
+               message!="too many symbolic links" && message!="symlink expansion limit")throw;
+        }
+        // Rename, link removal, ancestor symlink retargeting and path reuse can
+        // stale a hint. Fall back without changing the inode identity requested.
+    }
     struct PendingPath {std::string inode,path;bool too_long;};
     // Keep overlong branches in the walk without retaining unbounded path strings.
     std::vector<PendingPath> pending{{rid,"/",false}};std::set<std::string> visited;bool found_too_long=false;
     while(!pending.empty()) {
         auto entry=std::move(pending.back());pending.pop_back();auto& current=entry.inode;
         // A file may have a short hardlink alias elsewhere, so defer the error.
-        if(current==id){if(!entry.too_long)return entry.path;found_too_long=true;}
+        if(current==id){if(!entry.too_long){remember_path(id,entry.path);return entry.path;}found_too_long=true;}
         if(!inode(view,current).directory)continue;
         need(visited.insert(current).second,"invalid directory cycle or hardlink");
         auto pre=directory_prefix(current);

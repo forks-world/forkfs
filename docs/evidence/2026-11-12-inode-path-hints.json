@@ -1,0 +1,174 @@
+{
+  "schema": 1,
+  "date": "2026-11-12",
+  "platform": "macOS-27.2.1-arm64-arm-64bit",
+  "base_commit": "6b4be10d5d4cceb90bd7f9c6b0683d6a9e7de340",
+  "source_tree_before_evidence": "ed90019f424053a72a28ec068ce2f9e4a899916d",
+  "validation": {
+    "isolated_release_ctest_passed": 58,
+    "isolated_release_ctest_failed": 0,
+    "ctest_seconds": 96.2,
+    "final_inode_paths_test_passed": true,
+    "final_inode_paths_test_seconds": 14.0,
+    "non_documentation_source_paths_match_isolated_copy": 134,
+    "system_only_dependencies": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "coverage": "Legacy and LevelDB; known paths, rename/ancestor rename, hardlinks, final symlink rejection, ancestor symlink retarget/cycle/type change, unlink/path reuse, World and revision identity, reused World names, 4100 Worlds exceeding the 4096-hint budget, GC and reopen."
+  },
+  "fixture": {
+    "entries": 66000,
+    "bulk_fixture": true
+  },
+  "fixture_source_commit": "e2ead520bb6f6dedaecf4429e59da9f8f7b99c96",
+  "seeded_lookup_probe": {
+    "baseline_production_source_paths_match_base": 20,
+    "probe_source_identical": true,
+    "baseline": {
+      "seeded_inode_lookups": 10,
+      "seconds": 8.81302,
+      "identity_and_sequence_preserved": true
+    },
+    "candidate": {
+      "seeded_inode_lookups": 10,
+      "seconds": 0.00059325,
+      "identity_and_sequence_preserved": true
+    },
+    "scope": "One sequential Release pair on copies of the same 66000-entry owned fixture. stat seeds the hint before timing ten lookups plus identity checks. Only committed sequence is compared; background I/O counters may change during reads."
+  },
+  "native_runtime": {
+    "module_source_commit": "da278f1b6e502257faf4d9764f0c8638ec8b04cb",
+    "unchanged_frontend_from_base": true,
+    "vnode_suite_commit": "877fb5dc68a7e3c6651790a38356425c395430a7",
+    "vnode_suite_sha256": "2973ba55edd1f061c75f99c0e4960e7c6c3cc6ba0a66239e1ef7d4a0d83d684d",
+    "child_home_and_tmpdir_on_host_temporary_directory": true,
+    "deadlines_unchanged": true
+  },
+  "native_vnode_events_in_66000_entry_repository": {
+    "schema": 1,
+    "platform": "macOS-27.2.1-arm64-arm-64bit",
+    "filesystem": "forkfs",
+    "cases": {
+      "file-events": {
+        "status": "passed",
+        "details": {
+          "cross_process_append": [
+            "WRITE",
+            "EXTEND"
+          ],
+          "overwrite": [
+            "WRITE"
+          ],
+          "chmod": [
+            "ATTRIB"
+          ],
+          "link": [
+            "LINK"
+          ],
+          "unlink_alias": [
+            "LINK",
+            "DELETE"
+          ],
+          "rename": [
+            "RENAME"
+          ],
+          "unlink": [
+            "LINK",
+            "DELETE"
+          ],
+          "orphan_write": [
+            "WRITE",
+            "EXTEND"
+          ],
+          "path_reuse_isolated": true
+        }
+      },
+      "directory-events": {
+        "status": "passed",
+        "details": {
+          "create": [
+            "WRITE"
+          ],
+          "rename": [
+            "WRITE"
+          ],
+          "unlink": [
+            "WRITE"
+          ],
+          "mkdir": [
+            "WRITE",
+            "LINK"
+          ],
+          "rmdir": [
+            "WRITE",
+            "LINK"
+          ]
+        }
+      }
+    },
+    "limits": [
+      "live vnode watches only",
+      "events may coalesce",
+      "no FSEvents, recursive watch, revoke or revision replay qualification"
+    ]
+  },
+  "offline_gc": {
+    "collected_objects": 21144
+  },
+  "storage_check_after_gc": {
+    "service": "forkfsd",
+    "state": "leveldb",
+    "storage_engine": "leveldb",
+    "repository_id": "8512f2a720970109fe1da2a633625b31",
+    "degraded_anchor": false,
+    "mounted": false,
+    "transactions_supported": true,
+    "requires_reopen": false,
+    "last_committed_seq": 344,
+    "checkpoint_seq": 0,
+    "replayed_transactions": 0,
+    "indexed_objects": 330113,
+    "object_roots": 396137,
+    "compaction_running": false,
+    "compaction_queued": 0,
+    "compaction_active": false,
+    "compaction_completed": 0,
+    "compaction_races": 0,
+    "compaction_failures": 0,
+    "compaction_last_error": "",
+    "metadata_prepare_ns": 0,
+    "storage_metrics": {
+      "transactions": 0,
+      "prepare_ns": 0,
+      "write_ns": 0,
+      "wal_sync_calls": 0,
+      "wal_sync_ns": 0,
+      "other_sync_calls": 2,
+      "other_sync_ns": 12076667,
+      "wal_append_bytes": 0,
+      "wal_append_ns": 0,
+      "wal_flush_ns": 0
+    },
+    "uncommitted_tail": false
+  },
+  "readonly_revision_after_gc": {
+    "readonly_samples_after_gc": 5,
+    "empty_data_verified": true,
+    "readonly_chmod_errno": 30,
+    "readonly_mount_confirmed": true
+  },
+  "sha256": {
+    "daemon": "7c7b6efbbc3adde549a8e49f85dc9e2c83e5a6ac4863c971d67926442832f148",
+    "probe": "a12a65562e2143ace0860bd39ecdcf9102726914bc36c7ea0e730432e386f907",
+    "probe_source": "d492e9d0b6c4b9d2be021c40c7dc6cbbe36cc3b735e51e0293d023a0f239a387",
+    "installed_signed_extension": "ed37c1a2a0c2d19ae7eb853a9be3eaf9ca48a0b43b5799d307a927594e640bde"
+  },
+  "limits": [
+    "Hints are non-authoritative, mutex-serialized and scoped by view kind/name and inode ID. Every use resolves the current path without final-symlink following and checks identity. Stale, absent or evicted hints fall back to traversal.",
+    "At most 4096 FIFO hints per Container; pathname bytes retain the existing 4096-byte bound. No object roots or GC pins, no storage/RPC/format changes, and no persistent index or constant-time cold-search guarantee.",
+    "The native append harness originally put child HOME/TMPDIR on the mount and exceeded 15 s. The script was corrected to isolate interpreter/xcrun startup caches on the host without raising deadlines. The final large-repository result uses BOTH that harness fix and this daemon; do not attribute the entire pass to inode hints alone.",
+    "Native acceptance covers the listed vnode operations amid 66000 preexisting empty files, on private single-user macOS 27.2.1 arm64. This is not universal latency, FSEvents, recursive watch, full POSIX/APFS or power-loss qualification."
+  ]
+}
