@@ -111,13 +111,21 @@ private:
     const Container::OpenHandle& find_handle(const std::string& handle) const;
     void edit_handle(const std::string& handle,const std::function<bool(FileContent&,bool)>& edit,const std::function<void()>& committed={});
     std::vector<unsigned char> read_handle_locked(const Container::OpenHandle& info,uint64_t offset,uint64_t count) const;
-    using Changes=std::map<std::string,std::optional<std::vector<unsigned char>>>;
+    friend class FileContent;
+    struct Changes:std::map<std::string,std::optional<std::vector<unsigned char>>> {
+        std::vector<std::pair<std::string,std::string>> erased;
+        bool empty() const {return std::map<std::string,std::optional<std::vector<unsigned char>>>::empty() && erased.empty();}
+        void erase_range(const std::string& lower,const std::string& upper) {
+            erase(lower_bound(lower),lower_bound(upper));erased.emplace_back(lower,upper);
+        }
+    };
     std::pair<InodeInfo,bool> xattr_inode(const NamespaceView& view,const std::string& target,bool handle) const;
     std::vector<unsigned char> read_xattr(const std::string& target,const std::string& name,bool handle) const;
     std::vector<std::string> read_xattr_names(const std::string& target,bool handle) const;
     void edit_xattr(const std::string& target,const std::string& name,const std::optional<std::vector<unsigned char>>& value,XattrPolicy policy,bool handle);
     void retire(const NamespaceView& view,Changes& changes,const InodeInfo& inode);
     void commit_changes(const NamespaceView& view,Changes& changes);
+    void commit_orphan_changes(const NamespaceView& retained,const std::string& prefix,const InodeInfo& inode,Changes& changes);
     Container& container_;
     std::string view_;
     bool revision_;

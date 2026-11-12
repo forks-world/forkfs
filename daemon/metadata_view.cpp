@@ -138,12 +138,22 @@ Bytes NamespaceView::encode_manifest(const std::vector<Id>& runs) {
     Bytes b(12+runs.size()*32);memcpy(b.data(),"FFMAN002",8);put32(b,8,runs.size());
     for(size_t i=0;i<runs.size();++i)memcpy(b.data()+12+i*32,runs[i].data(),32);return b;
 }
-NamespaceView::Plan NamespaceView::plan(const Changes& changes,bool compact) const {
+NamespaceView::Plan NamespaceView::plan(const Changes& changes,bool compact,const std::vector<Range>& erased) const {
     if(journal_.is_leveldb()) {
         Changes all=changes;
-        if(!tree_) {for(const auto& [key,value]:references())if(!all.contains(key))all[key]=value;}
-        MetadataTree empty(journal_);auto plan=tree_?tree_->apply(all):empty.apply(all);
+        if(!tree_) {for(const auto& [key,value]:references()) {
+            bool removed=std::any_of(erased.begin(),erased.end(),[&](const auto& r){return r.first<=key && key<r.second;});
+            if(!removed && !all.contains(key))all[key]=value;}}
+        MetadataTree empty(journal_);auto plan=tree_?tree_->apply(all,erased):empty.apply(all,erased);
         return {std::move(plan.objects),std::move(plan.manifest),1};
+    }
+    if(!erased.empty()) {
+        // The historical single-file backend has no CoW range operation.
+        // Preserve compatibility by materializing its bounded sorted-run delta.
+        Changes effective=changes;auto all=references();
+        for(const auto& [lower,upper]:erased)for(auto it=all.lower_bound(lower);it!=all.end() && it->first<upper;++it)
+            effective.try_emplace(it->first,std::nullopt);
+        return plan(effective,compact);
     }
     Plan result;std::vector<Id> runs=runs_;
     // Migration of a flat main namespace, and bounded full compaction, produce

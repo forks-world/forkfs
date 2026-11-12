@@ -170,6 +170,22 @@ int main() {
             // The same base and changes produce byte-identical immutable trees.
             MetadataTree replay(journal,old_root);auto repeated=replay.apply({{key("test/50"),std::nullopt},{key("test/51"),changed_id},{key("test/new"),changed_id}});
             check(repeated.manifest==updated.manifest && repeated.objects==updated.objects);
+            // Half-open range erasure agrees with an independent ordered map;
+            // explicit point changes are applied after overlapping removals.
+            MetadataTree ranged(journal,new_root);auto ranged_expected=expected;
+            std::vector<MetadataTree::Range> ranges{{key("test/20"),key("test/70")},
+                                                   {key("test/60"),key("test/80")}};
+            for(const auto& [lower,upper]:ranges)ranged_expected.erase(ranged_expected.lower_bound(lower),ranged_expected.lower_bound(upper));
+            ranged_expected[key("test/50")]=changed_id;
+            auto ranged_plan=ranged.apply({{key("test/50"),changed_id}},ranges);
+            check(ranged.entries()==ranged_expected);publish(journal,"ranged",ranged_plan);
+            check(MetadataTree(journal,tree_root(ranged_plan)).entries()==ranged_expected);
+            check(MetadataTree(journal,new_root).entries()==expected);
+            for(const auto& range:std::vector<MetadataTree::Range>{{key("root"),key("rootz")},
+                    {key("test/z"),key("test/a")},{"bad",key("test/a")}}) {
+                bool rejected=false;try{ranged.apply({}, {range});}catch(const std::runtime_error&){rejected=true;}
+                check(rejected && ranged.entries()==ranged_expected);
+            }
         }
         {
             Journal journal(path);check(MetadataTree(journal,new_root).entries()==expected);

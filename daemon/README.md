@@ -330,10 +330,11 @@ handles to that inode see the same updates. Access mode is enforced per handle;
 revision handles permit reads only. This is not a replacement for Unix permission
 checks, an agent broker or an OS mount adapter.
 
-An unlinked open file retains separate durable orphan inode/content roots outside
-the World tree. Snapshot/fork omit these orphans. Unlink and orphan publication
-share one synchronous WriteBatch; orphan writes synchronously commit both inode
-and content without changing the World tree root. Last close releases the orphan
+An unlinked open file retains two durable orphan roots outside the World tree:
+`inode` for its current metadata and `tree` for an immutable CoW retention view.
+Snapshot/fork omit these orphans. Unlink and orphan publication share one
+synchronous WriteBatch; orphan writes synchronously commit metadata and the
+private CoW head without changing the World tree root. Last close releases both
 retention roots. **It does not itself physically delete immutable objects or recycle an
 inode ID. Offline `gc` can collect unreachable immutable objects.** Physical reclamation is available through offline LevelDB `gc`. Random stable inode IDs
 are never reused; slot reuse would require generation checks.
@@ -844,15 +845,28 @@ the full file; RPC `fs-cat` is bounded and clients use `fs-read-at` for larger
 files. These multi-call transfers are not a single atomic operation; native
 save-via-temp-file-and-rename remains available.
 
-Open-unlink retains chunk references under the existing orphan roots. Retention
-reuses object IDs instead of resubmitting all file bytes to the 16 MiB value
-batch. Last close and restart release the roots; physical GC preserves chunks
-referenced by retained revisions. Sparse revision diff compares the union of
-allocated chunk positions, skipping absent holes rather than scanning the
-whole logical file. The existing 4,096-mutation/16 MiB transaction limits remain:
-unlinking an open dense file with thousands of chunks, or large truncations,
-can still exceed a transaction's capacity. Those operations are not qualified
-across the full 1 TiB dense range; scalable chunk retirement is separate work.
+Unlink and shrink detach half-open chunk-key ranges from the persistent treap.
+They split and merge boundary paths instead of publishing one deletion per
+removed chunk. The immutable original subtree remains available to revisions.
+An open-unlink initially pins the origin World manifest in a private retention
+view; later fd writes/truncates/xattrs update only that view's target-file leaves
+and the separate orphan inode. Other origin-World objects can remain pinned
+until last close. This is internal retention, not a named revision or a public
+World; namespace lookups and snapshots never expose it. GC already requires an
+idle repository with no handles. Last close releases two roots in one commit;
+restart recovery also drops them, and physical GC follows retained tree roots.
+
+Older flat `inode`/`content`/`chunk`/`xattr` orphan records remain recoverable.
+Older daemons do not recognize the new `tree` field: after a crash with live
+new-format orphans, use the updated daemon for recovery before downgrading.
+Public inode/chunk/CoW tree formats are unchanged by retirement itself.
+
+The existing 4,096-mutation/16 MiB transaction limits remain; retirement no
+longer expands a dense file into that many root mutations or reads all its
+payload bytes. Tests cover 5,120 allocated chunks (320 MiB), single-commit
+unlink/close/truncate, rename replacement, dup, metadata/xattrs, restart, GC and
+crash publication. Full 1 TiB dense-file performance/memory qualification remains
+outstanding. Sparse revision diff still compares allocated positions only.
 Permission enforcement beyond the private single-user mount remains unqualified.
 
 

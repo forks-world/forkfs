@@ -231,10 +231,30 @@ It checks immediate EFBIG on oversized truncate and O_SYNC/F_NOCACHE writes;
 buffered writes may reach the kernel cache before a writeback error is reported.
 Applications must check write/fsync/close errors. Allocation size is currently
 synthesized from logical size, not accurate per-file physical usage. This is
-not preallocation or quota enforcement. Transaction limits still constrain very
-large dense unlink/truncate operations; see [daemon limits](../daemon/README.md).
+not preallocation or quota enforcement. Dense retirement now uses CoW range
+removal and two orphan retention roots, rather than per-chunk root mutations;
+see [daemon limits](../daemon/README.md).
 Large inode records use FFINOD03; old daemons reject them. Full local evidence
 is in [large-file acceptance](evidence/2026-11-11-large-files.json).
+
+The dense retirement suite additionally exercises two actual 320 MiB files,
+each with 5,120 allocated chunks (beyond the old 4,096-mutation batch limit).
+It covers full SHA-256 readback, open-unlink/dup, orphan writes/truncation,
+partial-chunk zero fill, path reuse, final close, closed-file truncate and
+revision isolation. Its retained revision is read again after offline GC and
+service restart with a read-only mount:
+
+```sh
+python3 scripts/tests/chunk_retirement_mount.py /path/to/mount \
+  --daemon build/Release/daemon/forkfsd --socket /path/to/runtime/control.sock > /tmp/retirement.json
+# After unmount, offline GC, and mounting the reported revision read-only:
+python3 scripts/tests/chunk_retirement_mount.py /path/to/mount --verify-report /tmp/retirement.json
+```
+
+Use a disposable repository: the live scratch directory is removed, but one
+explicitly named revision is retained. The suite reports object-root deltas;
+unsupported/failed operations return nonzero. It does not qualify a full 1 TiB
+dense workload. See [retirement evidence](evidence/2026-11-11-chunk-retirement.json).
 
 Linux continues to build the daemon without FSKit; enabling the option there is
 an explicit configuration error. CI builds the frontend and runs callback tests
