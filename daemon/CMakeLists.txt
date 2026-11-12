@@ -195,6 +195,10 @@ add_executable(forkfsd_allocation_test tests/allocation.cpp $<TARGET_OBJECTS:for
 target_include_directories(forkfsd_allocation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME forkfsd_allocation COMMAND forkfsd_allocation_test)
 set_tests_properties(forkfsd_allocation PROPERTIES TIMEOUT 120)
+add_executable(forkfsd_file_flags_test tests/file_flags.cpp $<TARGET_OBJECTS:forkfs_common> $<TARGET_OBJECTS:forkfs_container_obj> $<TARGET_OBJECTS:forkfs_journal_obj> $<TARGET_OBJECTS:forkfs_level_obj> $<TARGET_OBJECTS:forkfs_compaction_obj> $<TARGET_OBJECTS:forkfs_metadata_tree_obj>)
+target_include_directories(forkfsd_file_flags_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME forkfsd_file_flags COMMAND forkfsd_file_flags_test)
+set_tests_properties(forkfsd_file_flags PROPERTIES TIMEOUT 120)
 add_test(NAME forkfsd_storage_errors COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/storage_errors.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
 set_tests_properties(forkfsd_storage_errors PROPERTIES TIMEOUT 180)
@@ -239,7 +243,7 @@ target_compile_definitions(forkfsd_leveldb_fault_test PRIVATE FORKFS_TEST_FAULTS
 add_test(NAME forkfsd_leveldb COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/leveldb.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
 set_tests_properties(forkfsd_leveldb PROPERTIES TIMEOUT 180)
-foreach(target forkfsd forkfsd_legacy_test forkfsd_fault_test forkfsd_transaction_test forkfsd_lsm_test forkfsd_maintenance_test forkfsd_staged_compaction_test forkfsd_leveldb_fault_test forkfsd_leveldb_transaction_test forkfsd_object_cache_test forkfsd_file_io_test forkfsd_chunked_test forkfsd_large_files_test forkfsd_allocation_test forkfsd_chunk_retirement_test forkfsd_chunk_retirement_fault_test forkfsd_symlink_handles_test forkfsd_times_test forkfsd_xattrs_test forkfsd_restore_test forkfsd_retention_test forkfsd_handles_test)
+foreach(target forkfsd forkfsd_legacy_test forkfsd_fault_test forkfsd_transaction_test forkfsd_lsm_test forkfsd_maintenance_test forkfsd_staged_compaction_test forkfsd_leveldb_fault_test forkfsd_leveldb_transaction_test forkfsd_object_cache_test forkfsd_file_io_test forkfsd_chunked_test forkfsd_large_files_test forkfsd_allocation_test forkfsd_file_flags_test forkfsd_chunk_retirement_test forkfsd_chunk_retirement_fault_test forkfsd_symlink_handles_test forkfsd_times_test forkfsd_xattrs_test forkfsd_restore_test forkfsd_retention_test forkfsd_handles_test)
     target_link_libraries(${target} PRIVATE leveldb Threads::Threads)
     if(NOT APPLE)
         target_link_libraries(${target} PRIVATE OpenSSL::Crypto)

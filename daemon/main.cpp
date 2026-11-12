@@ -175,6 +175,7 @@ int main(int argc, char** argv) {
                          "forkfsd fs-readlink CONTAINER PATH\n"
                          "forkfsd fs-chmod CONTAINER PATH OCTAL_MODE\n"
                          "forkfsd fs-lchmod CONTAINER PATH OCTAL_MODE (nofollow final entry)\n"
+                         "forkfsd fs-setflags|fs-lsetflags CONTAINER PATH FLAGS_DECIMAL\n"
                          "forkfsd fs-setmtime CONTAINER PATH NANOSECONDS\n"
                          "forkfsd fs-settimes CONTAINER PATH ATIME_OR_DASH MTIME_OR_DASH BIRTH_OR_DASH\n"
                          "forkfsd fs-lsettimes CONTAINER PATH ATIME_OR_DASH MTIME_OR_DASH BIRTH_OR_DASH\n"
@@ -219,6 +220,7 @@ int main(int argc, char** argv) {
         int base_argc=4;
         if(command=="fs-init" || command=="fs-check" || command=="fs-worlds" || command=="fs-revisions" || command=="fs-compact" || command=="fs-layout")base_argc=3;
         if(command=="fs-write" || command=="fs-save" || command=="fs-link" || command=="fs-rename" || command=="fs-fork" || command=="fs-restore" || command=="fs-append" || command=="fs-truncate" || command=="fs-symlink" || command=="fs-lchmod" || command=="fs-chmod" || command=="fs-setmtime")base_argc=5;
+        if(command=="fs-setflags" || command=="fs-lsetflags")base_argc=5;
         if(command=="fs-read-at" || command=="fs-write-at")base_argc=6;
         if(command=="fs-xattr-get" || command=="fs-xattr-remove")base_argc=5;
         if(command=="fs-xattr-set")base_argc=7;
@@ -305,6 +307,10 @@ int main(int argc, char** argv) {
                 forkfs::Namespace::Attributes a;if(std::string(argv[4])!="-")a.accessed_ns=file_number(argv[4]);
                 if(std::string(argv[5])!="-")a.modified_ns=file_number(argv[5]);if(std::string(argv[6])!="-")a.birth_ns=file_number(argv[6]);if(command=="fs-lsettimes")fs.set_link_attributes(argv[3],a);else fs.set_attributes(argv[3],a);
             }
+            else if((command=="fs-setflags" || command=="fs-lsetflags") && argc==5) {
+                auto flags=file_number(argv[4]);if(flags>UINT32_MAX || (flags&~uint64_t(forkfs::supported_file_flags)))throw std::runtime_error("unsupported file flags");
+                forkfs::Namespace::Attributes a;a.flags=static_cast<uint32_t>(flags);if(command=="fs-lsetflags")fs.set_link_attributes(argv[3],a);else fs.set_attributes(argv[3],a);
+            }
             else if((command=="fs-chmod" || command=="fs-lchmod" || command=="fs-setmtime") && argc==5) {
                 forkfs::Namespace::Attributes a;
                 if(command=="fs-chmod" || command=="fs-lchmod"){auto mode=file_number(argv[4],8);if(mode>0777)throw std::runtime_error("unsupported mode bits");a.mode=static_cast<uint32_t>(mode);}
@@ -343,7 +349,7 @@ int main(int argc, char** argv) {
                 auto n=command=="fs-lstat"?fs.lstat(argv[3]):fs.stat(argv[3]);
                 std::cout<<"{\"inode_id\":\""<<n.id<<"\",\"directory\":"<<(n.directory?"true":"false")
                          <<",\"symlink\":"<<(n.symlink?"true":"false")<<",\"mode\":"<<n.mode<<",\"links\":"<<n.links<<",\"size\":"<<n.size
-                         <<",\"allocated_size\":"<<n.allocated_size<<",\"modified_ns\":"<<n.modified_ns<<",\"changed_ns\":"<<n.changed_ns
+                         <<",\"allocated_size\":"<<n.allocated_size<<",\"flags\":"<<n.flags<<",\"modified_ns\":"<<n.modified_ns<<",\"changed_ns\":"<<n.changed_ns
                          <<",\"accessed_ns\":"<<n.accessed_ns<<",\"birth_ns\":"<<n.birth_ns<<"}\n";
                 return 0;
             } else throw std::runtime_error("invalid filesystem command arguments");

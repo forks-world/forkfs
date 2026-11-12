@@ -9,6 +9,7 @@
 namespace forkfs {
 class Container;
 inline int rpc_posix_error(std::string_view message) {
+    if(message=="unsupported file flags")return ENOTSUP;
     if(message=="RPC timeout")return ETIMEDOUT;
     if(message=="rename target is a directory")return EISDIR;
     if(message=="directory hard links are forbidden")return EPERM;

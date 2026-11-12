@@ -39,7 +39,7 @@ can reclaim an abandoned branch after its last retaining root is removed.
 Inode atime and birth time are stored in revision metadata, alongside mtime and
 ctime, and participate in revision diff, fork, restore and physical GC. Reads
 follow a noatime policy. Old inode records remain readable; mutations upgrade
-the affected record to FFINOD02, which older daemons reject. Regular files above
+the affected unflagged record to FFINOD02, which older daemons reject. Unflagged regular files above
 64 MiB use FFINOD03 and extended chunk keys, with a 1 TiB logical size bound;
 small files retain their existing records/keys. Sparse revision diff compares
 allocated chunk positions rather than scanning holes. Explicit nofollow
@@ -47,6 +47,13 @@ mode/time setters also operate on symlink metadata, including dangling links,
 without changing link targets or referenced file objects. Symlink metadata
 handles retain the same identity through open-unlink and path reuse, while
 rejecting file data I/O and preserving immutable revision isolation.
+
+BSD `hidden`/`nodump` flags are revision metadata. Nonzero flags use `FFINOD04`
+(72 bytes), with a little-endian flag word after the existing extended inode
+fields and a reserved-zero word. Older inode records remain readable with no
+flags; older daemons reject the new records. Flags participate in revision diff,
+GC, restore and orphan metadata without relying on timestamps. Protection flags
+are rejected until write/namespace constraints are implemented.
 
 Dense unlink/truncate retire chunk ranges through the persistent CoW tree.
 Open-unlink retains immutable data through a private tree root plus an inode

@@ -17,6 +17,7 @@ struct InodeInfo {
     // Derived backed data allocation in 512-byte units, not exclusive ownership
     // of LevelDB/SST bytes. Not serialized into the inode record.
     uint64_t allocated_size=0;
+    uint32_t flags=0;
 };
 class NamespaceView;
 class FileContent;
@@ -26,7 +27,7 @@ public:
     static constexpr size_t maximum_io_size=256*1024;
     static constexpr size_t maximum_xattr_count=128;
     static constexpr uint64_t maximum_xattr_storage_bytes=8*1024*1024;
-    struct Attributes {std::optional<uint32_t> mode;std::optional<uint64_t> modified_ns;std::optional<uint64_t> size;std::optional<uint64_t> accessed_ns,birth_ns;};
+    struct Attributes {std::optional<uint32_t> mode;std::optional<uint64_t> modified_ns;std::optional<uint64_t> size;std::optional<uint64_t> accessed_ns,birth_ns;std::optional<uint32_t> flags;};
     class DirectoryCursor {
         friend class Namespace;
         std::weak_ptr<const int> lifetime_;
