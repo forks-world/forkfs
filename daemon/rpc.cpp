@@ -50,7 +50,7 @@ std::string quoted(const std::string& value){
 std::string inode_json(const InodeInfo& n){
     std::ostringstream out;out<<"{\"inode_id\":\""<<n.id<<"\",\"directory\":"<<(n.directory?"true":"false")
         <<",\"symlink\":"<<(n.symlink?"true":"false")<<",\"mode\":"<<n.mode<<",\"links\":"<<n.links<<",\"size\":"<<n.size
-        <<",\"allocated_size\":"<<n.allocated_size<<",\"modified_ns\":"<<n.modified_ns<<",\"changed_ns\":"<<n.changed_ns
+        <<",\"allocated_size\":"<<n.allocated_size<<",\"flags\":"<<n.flags<<",\"modified_ns\":"<<n.modified_ns<<",\"changed_ns\":"<<n.changed_ns
         <<",\"accessed_ns\":"<<n.accessed_ns<<",\"birth_ns\":"<<n.birth_ns<<"}";return out.str();
 }
 std::string random_token(){
@@ -147,6 +147,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="inode-rename")count=7;
     if(op=="fs-xattr-get" || op=="fs-xattr-remove" || op=="fs-hxattr-get" || op=="fs-hxattr-remove" || op=="inode-xattr-get" || op=="inode-xattr-remove")count=3;
     if(op=="fs-xattr-set" || op=="fs-hxattr-set" || op=="inode-xattr-set")count=5;
+    if(op=="inode-setattr-flags")count=9;
+    if(op=="fs-setflags" || op=="fs-lsetflags" || op=="fs-hsetflags")count=3;
     uint32_t creation_mode=0644;
     std::string session_token;bool selected_view=false;
     while(args.size()>=count+2) {
@@ -228,11 +230,14 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         else {bool missing=false;try{(void)fs.lstat(target);}catch(const std::runtime_error& e){if(std::string_view(e.what())=="path not found")missing=true;else throw;}
             need(missing,"target already exists");}
         fs.rename(source,target);return inode_json(fs.lstat(target));
-    } else if(op=="inode-setattr" || op=="inode-setattr-times") {
+    } else if(op=="inode-setattr" || op=="inode-setattr-times" || op=="inode-setattr-flags") {
         Namespace::Attributes a;if(args[2]!="-"){auto mode=number(args[2]);need(mode<=0777,"unsupported mode bits");a.mode=static_cast<uint32_t>(mode);}
         if(args[3]!="-")a.size=number(args[3]);if(args[4]!="-")a.modified_ns=number(args[4]);
         size_t handle_index=5;
-        if(op=="inode-setattr-times"){if(args[5]!="-")a.accessed_ns=number(args[5]);if(args[6]!="-")a.birth_ns=number(args[6]);handle_index=7;}
+        if(op=="inode-setattr-times" || op=="inode-setattr-flags"){if(args[5]!="-")a.accessed_ns=number(args[5]);if(args[6]!="-")a.birth_ns=number(args[6]);handle_index=7;}
+        if(op=="inode-setattr-flags"){
+            if(args[7]!="-"){auto flags=number(args[7]);need(flags<=UINT32_MAX && !(flags&~uint64_t(supported_file_flags)),"unsupported file flags");a.flags=static_cast<uint32_t>(flags);}handle_index=8;
+        }
         if(args[handle_index]!="-") {
             const auto& handle=args[handle_index];need(activity.session->handles.contains(handle),"handle belongs to another session");
             need(fs.handle_stat(handle).id==args[1],"invalid inode/handle pairing");fs.handle_set_attributes(handle,a);return inode_json(fs.handle_stat(handle));
@@ -337,6 +342,11 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="fs-append") {
         auto offset=fs.append(args[1],std::vector<unsigned char>(args[2].begin(),args[2].end()));
         return "{\"offset\":"+std::to_string(offset)+",\"written\":"+std::to_string(args[2].size())+"}\n";
+    }
+    if(op=="fs-setflags" || op=="fs-lsetflags" || op=="fs-hsetflags") {
+        auto flags=number(args[2]);need(flags<=UINT32_MAX && !(flags&~uint64_t(supported_file_flags)),"unsupported file flags");
+        Namespace::Attributes a;a.flags=static_cast<uint32_t>(flags);
+        if(op=="fs-hsetflags")fs.handle_set_attributes(args[1],a);else if(op=="fs-lsetflags")fs.set_link_attributes(args[1],a);else fs.set_attributes(args[1],a);return store.status();
     }
     if(op=="fs-settimes" || op=="fs-lsettimes" || op=="fs-hsettimes") {
         Namespace::Attributes a;if(args[2]!="-")a.accessed_ns=number(args[2]);if(args[3]!="-")a.modified_ns=number(args[3]);if(args[4]!="-")a.birth_ns=number(args[4]);

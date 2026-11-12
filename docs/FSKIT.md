@@ -192,7 +192,7 @@ names, links, rename, NFC/NFD distinctions and the byte limit; see
 Current limits are inherited from the namespace prototype: 1 TiB per regular
 file with 256 KiB per daemon I/O request, UTF-8 names (255 bytes per component, 4096 per path), mode bits through
 0777, native xattrs (262,143 bytes per value, 128 per inode, 8 MiB total values), no ACLs or uid/gid
-changes, and no special files. Setattr supports mode, size, mtime, atime and birth time atomically;
+changes, and no special files. Setattr supports mode, size, mtime, atime, birth time and hidden/nodump flags atomically. Protection flags and other
 unsupported attributes fail before mutation. The owner/group are synthesized
 from the service identity. The mounted root is always exposed as mode 0700, and
 requests to broaden that mode fail before mutation; this mount policy does not
@@ -454,3 +454,27 @@ successful copy. Changing `supportsLimitedXAttrs` alone produced identical resul
 that experimental change is not included. Current xattr callbacks carry no offset,
 so this needs further frontend/platform work rather than a daemon range-read stub.
 See [capacity and ResourceFork evidence](evidence/2026-11-12-xattr-capacity-resource-fork.json).
+
+### BSD metadata flags
+
+The frontend reports `FSItemAttributes.flags` and atomically consumes supported
+flags with mode/size/times through `inode-setattr-flags`. Older setattr RPCs
+remain supported; requests without flags keep using the existing times command.
+Supported masks are hidden/nodump only. Kernel-visible rejection is ENOTSUP for
+unsupported flags, or EPERM when the kernel rejects a privileged mask first.
+Use the matching new daemon/module pair for flag support. `FFINOD04` records
+require the updated daemon, including when only historical roots retain flags.
+
+```sh
+python3 scripts/tests/file_flags_mount.py /private/tmp --reference-apfs
+python3 scripts/tests/file_flags_mount.py /path/to/mount \
+  --daemon build/Release/daemon/forkfsd --socket /path/to/runtime/control.sock > /tmp/flags.json
+# After unmount, offline GC and mounting the reported revision read-only:
+python3 scripts/tests/file_flags_mount.py /path/to/mount --verify-report /tmp/flags.json
+```
+
+Use a disposable repository. The suite retains a revision and verifies file/fd,
+directory/link/hardlink flags, cp preservation, unsupported-mask rejection,
+open-unlink/dup/path reuse and read-only GC/restart readback. It qualifies metadata
+hints, not Finder UI behavior, backup-tool policy or protection enforcement.
+See [flag acceptance evidence](evidence/2026-11-12-file-flags.json).

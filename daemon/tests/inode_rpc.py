@@ -78,6 +78,13 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         assert obj('inode-stat',deep_id,*sel)['inode_id']==deep_id
         assert obj('inode-stat',fid,*sel)['inode_id']==fid
         short_read=obj('inode-open',fid,'r',*sel)['handle'];rpc('fs-close',short_read,*sel)
+        st=obj('inode-setattr-flags',fid,'-','-','-','-','-','32769',handle,*sel)
+        assert st['flags']==32769
+        flag_seq=obj('status')['last_committed_seq']
+        for invalid in ['2','4294967297']:
+            rpc('inode-setattr-flags',fid,str(0o777),'0','0','-','-',invalid,handle,*sel,error=errno.ENOTSUP)
+        assert obj('status')['last_committed_seq']==flag_seq
+        assert obj('fs-hstat',handle,*sel)['flags']==32769
         before=obj('status')['last_committed_seq']
         rpc('inode-setattr',fid,str(0o777),str((1<<40)+1),'0',handle,*sel,error=errno.EFBIG)
         assert obj('status')['last_committed_seq']==before
@@ -89,6 +96,7 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         rpc('inode-remove',did,'moved',fid,'file',*sel)
         rpc('inode-remove',rid,'alias',fid,'file',*sel)
         assert obj('fs-hstat',handle,*sel)['links']==0
+        st=obj('inode-setattr-flags',fid,'-','-','-','-','-','1',handle,*sel);assert st['flags']==1
         rpc('fs-hwrite',handle,'0',b'X',*sel)
         st=obj('inode-setattr',fid,str(0o700),'4','1',handle,*sel);assert st['size']==4
         assert rpc('fs-hread',handle,'0','99',*sel)==b'Xbc\x00'

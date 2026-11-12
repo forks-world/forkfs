@@ -502,7 +502,8 @@ RPC also provides session-owned `fs-hchmod`, `fs-hsetmtime` and
 `fs-hsettimes HANDLE ATIME MTIME BIRTH`, including open-unlinked regular files.
 The C++ attribute API sets mode, size, mtime, atime and birth time atomically.
 All requested fields are validated before any mutation. The FSKit adapter uses
-`inode-setattr-times INODE MODE SIZE MTIME ATIME BIRTH HANDLE`, where unchanged
+`inode-setattr-times INODE MODE SIZE MTIME ATIME BIRTH HANDLE`,
+`inode-setattr-flags INODE MODE SIZE MTIME ATIME BIRTH FLAGS HANDLE`, where unchanged
 fields and an absent handle use `-`. The older `inode-setattr` operation remains
 available for existing clients. Inode RPC calls require a mounted session.
 
@@ -529,7 +530,7 @@ a no-op after view/handle validation. Negative timestamps, uid/gid changes,
 ACLs, setuid/sticky bits and multi-user permission
 enforcement remain unsupported.
 
-Small inode records use the 64-byte `FFINOD02` format. Bytes 8..47 retain the
+Small unflagged inode records use the 64-byte `FFINOD02` format. Bytes 8..47 retain the
 original type, mode, links, size, mtime and ctime layout; bytes 48..55 and 56..63
 hold little-endian atime and birth time. The daemon still reads 48-byte
 `FFINOD01` records, using their mtime as the initial atime and ctime as the
@@ -541,12 +542,47 @@ Older daemons reject the new record size/magic; upgraded views require this
 daemon even after the last xattr is removed. No in-place whole-store migration
 or downgrade is provided.
 
-Regular files larger than 64 MiB use `FFINOD03`, with the same 64-byte field
+Unflagged regular files larger than 64 MiB use `FFINOD03`, with the same 64-byte field
 layout and chunked type. Readers predating large-file support reject its magic
 instead of accidentally editing an unsupported large inode. `FFINOD01`/`02`
 remain readable for small files. Shrinking to at most 64 MiB removes extended
 chunk keys and writes that inode as `FFINOD02` again; retained large revisions
 remain version 3 and still require a compatible daemon.
+
+## BSD metadata flags
+
+`fs-stat`, `fs-lstat` and handle/inode RPC attributes expose a numeric `flags`
+field. Supported masks are `UF_NODUMP` (1), `UF_HIDDEN` (32768), or their
+combination (32769). These are metadata hints for backup/visibility tools;
+they do not restrict file writes. Other flags, including immutable, append-only,
+nounlink and system protection bits, fail with ENOTSUP before mutation. The
+native kernel may reject privileged flags earlier with EPERM. This is not full
+BSD flag support or a multi-user authorization model.
+
+```sh
+forkfsd fs-setflags project.forkfs /file 32769
+forkfsd fs-lsetflags project.forkfs /link 1  # nofollow
+forkfsd fs-setflags project.forkfs /file 0
+# Session-owned RPC metadata handle, including open-unlink:
+forkfsd request /private/runtime/control.sock fs-hsetflags HANDLE 32768 --session TOKEN
+```
+
+Path setters follow the final symlink; the `l` variant changes the link itself.
+Hardlinks share flags. Metadata handles keep them through rename, open-unlink,
+dup and path reuse. Flags preserve mode, data, mtime, atime and birth time;
+ctime advances. Mixed supported setattr fields commit atomically; any unsupported
+flag rejects the complete request, including a requested truncate. Snapshots,
+forks, restore and GC retain flags as immutable metadata. Revision diff compares
+flags even when inode times are equal, without reporting a content change.
+
+Flagged inodes use 72-byte `FFINOD04`: bytes 8..63 retain the extended inode layout,
+bytes 64..67 store little-endian BSD flags, and bytes 68..71 are reserved zero.
+The format supports small/large regular files, directories and symlinks. Existing
+`FFINOD01`/`02`/`03` records read as flags=0 without a read-time rewrite. Zero-flag
+writes retain the existing version 2/3 encoding. Older daemons reject flagged
+records. Clearing flags in a World does not remove version 4 records retained by
+revisions; use the updated daemon and FSKit module together, and do not downgrade
+while those records remain reachable.
 
 ## Directory pages
 
@@ -1199,9 +1235,10 @@ Commands use inode identities, never host World paths: `inode-lookup PARENT NAME
 `inode-rename SOURCE_PARENT SOURCE_NAME DEST_PARENT DEST_NAME EXPECTED_INODE EXPECTED_DEST_OR_DASH`,
 `inode-setattr INODE MODE_OR_DASH SIZE_OR_DASH MTIME_NS_OR_DASH HANDLE_OR_DASH`,
 `inode-setattr-times INODE MODE SIZE MTIME ATIME BIRTH HANDLE`,
+`inode-setattr-flags INODE MODE SIZE MTIME ATIME BIRTH FLAGS HANDLE`,
 `inode-space`, and `inode-sync`. All require `--session`; the mount must keep the
 same World/revision selector. Modes are decimal 0000..0777. Setattr publishes
-size/content, mode and mtime/atime/birth time in one synchronous transaction; handle size changes
+size/content, mode, metadata flags and mtime/atime/birth time in one synchronous transaction; handle size changes
 require writable access. Subsequent I/O uses the existing session-owned `fs-h*`
 operations, preserving open-unlink behavior. Session loss is terminal for a mount.
 

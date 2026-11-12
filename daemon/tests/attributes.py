@@ -30,6 +30,10 @@ with tempfile.TemporaryDirectory(prefix='ff-attr-',dir='/tmp') as tmp:
     assert stat('/file','--revision','base')['mode']==original['mode']
     assert stat('/file','--world','work')['modified_ns']==original['modified_ns']
     run('fs-chmod',db,'/file','0711','--world','work');assert stat('/file','--world','work')['mode']==0o711
+    run('fs-setflags',db,'/file','32769');assert stat('/alias')['flags']==32769
+    run('fs-lsetflags',db,'/link','1');assert json.loads(run('fs-lstat',db,'/link'))['flags']==1
+    assert stat('/link')['flags']==32769
+    run('fs-setflags',db,'/file','0');run('fs-lsetflags',db,'/link','0')
     before=json.loads(run('check',db))['last_committed_seq']
     for mode in ['888','1000','-1','0x755','777777777777777777777777']:
         run('fs-chmod',db,'/file',mode,ok=False)
@@ -39,7 +43,7 @@ with tempfile.TemporaryDirectory(prefix='ff-attr-',dir='/tmp') as tmp:
     assert json.loads(run('check',db))['last_committed_seq']==before
     baseline=root/'baseline';shutil.copytree(db,baseline)
     for stage in ['leveldb_before_write','leveldb_after_write']:
-        for op,value in [('fs-chmod','755'),('fs-setmtime','777')]:
+        for op,value in [('fs-chmod','755'),('fs-setmtime','777'),('fs-setflags','32769')]:
             shutil.rmtree(db);shutil.copytree(baseline,db)
             p=subprocess.run([FAULT,op,str(db),'/file',value],capture_output=True,timeout=10,
                              env={**os.environ,'FORKFS_TEST_CRASH':stage})
@@ -47,6 +51,7 @@ with tempfile.TemporaryDirectory(prefix='ff-attr-',dir='/tmp') as tmp:
             attrs=stat('/file');committed=stage=='leveldb_after_write'
             assert attrs['mode']==(0o755 if committed and op=='fs-chmod' else 0)
             assert attrs['modified_ns']==(777 if committed and op=='fs-setmtime' else 0)
+            assert attrs['flags']==(32769 if committed and op=='fs-setflags' else 0)
             assert run('fs-cat',db,'/file')==payload;run('fs-check',db)
     endpoint=root/'control.sock'
     proc=subprocess.Popen([BIN,'serve',str(db),'--socket',str(endpoint),'--rpc'],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
@@ -56,6 +61,8 @@ with tempfile.TemporaryDirectory(prefix='ff-attr-',dir='/tmp') as tmp:
         def rpc(*args,ok=True):return run('request',endpoint,*args,ok=ok)
         session=json.loads(rpc('session-open','60000'))['session']
         readonly=json.loads(rpc('fs-open','/file','r','--session',session))['handle']
+        rpc('fs-hsetflags',readonly,'32768','--session',session)
+        assert json.loads(rpc('fs-hstat',readonly,'--session',session))['flags']==32768
         rpc('fs-hchmod',readonly,'0750','--session',session)
         rpc('fs-hsetmtime',readonly,'987','--session',session)
         assert json.loads(rpc('fs-hstat',readonly,'--session',session))['mode']==0o750

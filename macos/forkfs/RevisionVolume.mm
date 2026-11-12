@@ -87,7 +87,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 - (FSItemAttributes*)attributes:(RevisionItem*)item {
     NSDictionary* a=item.attrs;FSItemAttributes* r=[FSItemAttributes new];r.type=itemType(a);
     r.fileID=(FSItemID)item.number;r.parentID=(FSItemID)item.parent;r.mode=item==_root?0700:[a[@"mode"] unsignedIntValue];r.linkCount=[a[@"links"] unsignedLongLongValue];
-    r.uid=_uid;r.gid=_gid;r.size=[a[@"size"] unsignedLongLongValue];
+    r.uid=_uid;r.gid=_gid;r.flags=[a[@"flags"] unsignedIntValue];r.size=[a[@"size"] unsignedLongLongValue];
     r.allocSize=a[@"allocated_size"]?[a[@"allocated_size"] unsignedLongLongValue]:r.size;
     uint64_t m=[a[@"modified_ns"] unsignedLongLongValue],c=[a[@"changed_ns"] unsignedLongLongValue];
     r.modifyTime=(timespec){(time_t)(m/1000000000),(long)(m%1000000000)};
@@ -189,9 +189,11 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
         // Only these attributes are persisted by the current inode schema.
         require((![request isValid:FSItemAttributeUID] || request.uid==_uid) && (![request isValid:FSItemAttributeGID] || request.gid==_gid),EPERM,"ownership changes are unsupported");
         require(![request isValid:FSItemAttributeType] && ![request isValid:FSItemAttributeLinkCount] && ![request isValid:FSItemAttributeAllocSize] && ![request isValid:FSItemAttributeFileID] && ![request isValid:FSItemAttributeParentID] && ![request isValid:FSItemAttributeChangeTime] && ![request isValid:FSItemAttributeBackupTime] && ![request isValid:FSItemAttributeAddedTime],ENOTSUP,"unsupported inode attributes");
-        require(![request isValid:FSItemAttributeFlags],ENOTSUP,"unsupported inode attributes");
-        it.attrs=[self json:@[@"inode-setattr-times",it.inode,mode,size,mtime,atime,birth,([request isValid:FSItemAttributeSize]?(it.writer?:@"-"):([self handle:it]?:@"-"))]];
-        request.consumedAttributes=([request isValid:FSItemAttributeUID]?FSItemAttributeUID:0)|([request isValid:FSItemAttributeGID]?FSItemAttributeGID:0)|([request isValid:FSItemAttributeMode]?FSItemAttributeMode:0)|([request isValid:FSItemAttributeSize]?FSItemAttributeSize:0)|([request isValid:FSItemAttributeModifyTime]?FSItemAttributeModifyTime:0)|([request isValid:FSItemAttributeAccessTime]?FSItemAttributeAccessTime:0)|([request isValid:FSItemAttributeBirthTime]?FSItemAttributeBirthTime:0);
+        require(![request isValid:FSItemAttributeFlags] || !(request.flags&~forkfs::supported_file_flags),ENOTSUP,"unsupported file flags");
+        NSString* handle=[request isValid:FSItemAttributeSize]?(it.writer?:@"-"):([self handle:it]?:@"-");
+        if([request isValid:FSItemAttributeFlags])it.attrs=[self json:@[@"inode-setattr-flags",it.inode,mode,size,mtime,atime,birth,[@(request.flags) stringValue],handle]];
+        else it.attrs=[self json:@[@"inode-setattr-times",it.inode,mode,size,mtime,atime,birth,handle]];
+        request.consumedAttributes=([request isValid:FSItemAttributeFlags]?FSItemAttributeFlags:0)|([request isValid:FSItemAttributeUID]?FSItemAttributeUID:0)|([request isValid:FSItemAttributeGID]?FSItemAttributeGID:0)|([request isValid:FSItemAttributeMode]?FSItemAttributeMode:0)|([request isValid:FSItemAttributeSize]?FSItemAttributeSize:0)|([request isValid:FSItemAttributeModifyTime]?FSItemAttributeModifyTime:0)|([request isValid:FSItemAttributeAccessTime]?FSItemAttributeAccessTime:0)|([request isValid:FSItemAttributeBirthTime]?FSItemAttributeBirthTime:0);
         a=[self attributes:it];}];reply(a,e);
 }
 - (void)lookupItemNamed:(FSFileName*)name inDirectory:(FSItem*)directory replyHandler:(void(^)(FSItem*,FSFileName*,NSError*))reply {

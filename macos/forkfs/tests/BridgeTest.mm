@@ -168,6 +168,14 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume writeContents:contents toFile:file atOffset:0 replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==4,"binary write failed");
         TestBuffer* buffer=[TestBuffer new];buffer.storage=[NSMutableData dataWithLength:32];
         [volume readFromFile:file offset:0 length:32 intoBuffer:(FSMutableFileDataBuffer*)buffer replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==4 && !memcmp(buffer.storage.bytes,payload,4),"binary read failed");
+        FSItemSetAttributesRequest* flagRequest=[FSItemSetAttributesRequest new];flagRequest.flags=UF_HIDDEN|UF_NODUMP;
+        __block FSItemAttributes* flagAttrs=nil;
+        [volume setAttributes:flagRequest onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){flagAttrs=a;result=e;}];check(!result && flagAttrs.flags==(UF_HIDDEN|UF_NODUMP) && (flagRequest.consumedAttributes&FSItemAttributeFlags),"flag callback failed");
+        FSItemSetAttributesRequest* badFlags=[FSItemSetAttributesRequest new];badFlags.flags=UF_IMMUTABLE;badFlags.size=0;
+        [volume setAttributes:badFlags onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(result.code==ENOTSUP,"protection flags must be rejected");
+        [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:file replyHandler:^(FSItemAttributes* a,NSError* e){flagAttrs=a;result=e;}];check(!result && flagAttrs.flags==(UF_HIDDEN|UF_NODUMP) && flagAttrs.size==4,"failed flags changed attributes");
+        flagRequest=[FSItemSetAttributesRequest new];flagRequest.flags=0;
+        [volume setAttributes:flagRequest onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(!result,"clear flags callback failed");
         check(volume.maximumXattrSizeInBits==18,"wrong xattr size capability");
         FSFileName* attrName=[FSFileName nameWithString:@"user.测试📄"];__block NSData* xattrValue=nil;__block NSArray<FSFileName*>* attrNames=nil;
         const char badName[]={char(0xff)};FSFileName* invalidAttr=[FSFileName nameWithBytes:badName length:1];

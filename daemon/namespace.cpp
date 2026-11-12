@@ -67,7 +67,8 @@ std::string root(const NamespaceView& journal) {
 }
 InodeInfo decode_inode(const Bytes& b,const std::string& id,bool orphan=false) {
     bool large=b.size()==64 && !memcmp(b.data(),"FFINOD03",8);
-    bool extended=large || (b.size()==64 && !memcmp(b.data(),"FFINOD02",8));
+    bool flagged=b.size()==72 && !memcmp(b.data(),"FFINOD04",8);
+    bool extended=flagged || large || (b.size()==64 && !memcmp(b.data(),"FFINOD02",8));
     need(extended || (b.size()==48 && !memcmp(b.data(),"FFINOD01",8)),"invalid inode record");
     auto type=load(b.data()+8,4),encoded_mode=load(b.data()+12,4);
     // Older readers reject this mode bit instead of silently losing xattrs.
@@ -75,7 +76,8 @@ InodeInfo decode_inode(const Bytes& b,const std::string& id,bool orphan=false) {
     need((type==1||type==2||type==3||type==4) && mode<=0777,"unsupported inode attributes");
     InodeInfo n{id,type==2,static_cast<uint32_t>(mode),load(b.data()+16,8),load(b.data()+24,8),
                 load(b.data()+32,8),load(b.data()+40,8),type==3,type==4,xattrs};
-    need(n.size<=maximum_file_bytes && (large?(n.chunked && n.size>legacy_file_bytes):n.size<=legacy_file_bytes),"invalid inode size/version");
+    need(n.size<=maximum_file_bytes && (flagged?(n.size<=legacy_file_bytes || n.chunked):large?(n.chunked && n.size>legacy_file_bytes):n.size<=legacy_file_bytes),"invalid inode size/version");
+    if(flagged){n.flags=load(b.data()+64,4);need(load(b.data()+68,4)==0 && !(n.flags&~supported_file_flags),"unsupported file flags");}
     n.accessed_ns=extended?load(b.data()+48,8):n.modified_ns;n.birth_ns=extended?load(b.data()+56,8):n.changed_ns;
     need(n.accessed_ns<=INT64_MAX && n.birth_ns<=INT64_MAX,"inode time exceeds supported nanosecond range");
     need((orphan?(!n.directory && n.links==0):n.links>0) && (!n.directory || (n.links>=2 && n.size==0)),"invalid inode state");return n;
@@ -88,10 +90,10 @@ std::unique_ptr<NamespaceView> retained_orphan(const Journal& journal,const std:
     return std::make_unique<NamespaceView>(journal,journal.root_object(pre+"tree"));
 }
 Bytes encode(const InodeInfo& n) {
-    Bytes b(64);memcpy(b.data(),n.size>legacy_file_bytes?"FFINOD03":"FFINOD02",8);store(b.data()+8,n.symlink?3:n.directory?2:n.chunked?4:1,4);
+    Bytes b(n.flags?72:64);memcpy(b.data(),n.flags?"FFINOD04":n.size>legacy_file_bytes?"FFINOD03":"FFINOD02",8);store(b.data()+8,n.symlink?3:n.directory?2:n.chunked?4:1,4);
     store(b.data()+12,uint64_t(n.mode)|(n.xattrs?uint64_t(0x80000000U):0),4);store(b.data()+16,n.links,8);store(b.data()+24,n.size,8);
     store(b.data()+32,n.modified_ns,8);store(b.data()+40,n.changed_ns,8);
-    store(b.data()+48,n.accessed_ns,8);store(b.data()+56,n.birth_ns,8);return b;
+    store(b.data()+48,n.accessed_ns,8);store(b.data()+56,n.birth_ns,8);if(n.flags)store(b.data()+64,n.flags,4);return b;
 }
 void valid_xattr_name(const std::string& name);
 std::string chunk_suffix(uint64_t index) {
@@ -509,7 +511,7 @@ std::string Namespace::diff(const std::string& before,const std::string& after,c
     auto type=[&](const std::optional<InodeInfo>& n){return n?quote(n->directory?"directory":n->symlink?"symlink":"file"):std::string("null");};
     auto identity=[&](const std::optional<InodeInfo>& n){return n?quote(n->id):std::string("null");};
     auto same_metadata=[](const InodeInfo& a,const InodeInfo& b){return a.id==b.id && a.directory==b.directory && a.symlink==b.symlink &&
-        a.mode==b.mode && a.links==b.links && a.size==b.size && a.modified_ns==b.modified_ns && a.changed_ns==b.changed_ns && a.accessed_ns==b.accessed_ns && a.birth_ns==b.birth_ns;};
+        a.mode==b.mode && a.flags==b.flags && a.links==b.links && a.size==b.size && a.modified_ns==b.modified_ns && a.changed_ns==b.changed_ns && a.accessed_ns==b.accessed_ns && a.birth_ns==b.birth_ns;};
     auto attribute_ids=[](const NamespaceView& view,const std::optional<InodeInfo>& n){
         std::map<std::string,ObjectId> result;if(n){auto pre=xattr_prefix(n->id);for(const auto& key:view.keys(pre))result.emplace(key.substr(pre.size()),*view.reference(key));}return result;
     };
@@ -829,13 +831,14 @@ void Namespace::allocation_info(InodeInfo& n,const NamespaceView& view) const {
 namespace {
 void valid_attributes(const Namespace::Attributes& a) {
     need(!a.mode || *a.mode<=0777,"unsupported mode bits");
+    need(!a.flags || !(*a.flags&~supported_file_flags),"unsupported file flags");
     need(!a.size || *a.size<=Namespace::maximum_file_size,"file exceeds 1 TiB");
     need(!a.modified_ns || *a.modified_ns<=INT64_MAX,"mtime exceeds supported nanosecond range");
     need(!a.accessed_ns || *a.accessed_ns<=INT64_MAX,"atime exceeds supported nanosecond range");
     need(!a.birth_ns || *a.birth_ns<=INT64_MAX,"birth time exceeds supported nanosecond range");
 }
 void apply_attributes(InodeInfo& n,const Namespace::Attributes& a) {
-    if(a.mode)n.mode=*a.mode;if(a.modified_ns)n.modified_ns=*a.modified_ns;n.changed_ns=now();
+    if(a.flags)n.flags=*a.flags;if(a.mode)n.mode=*a.mode;if(a.modified_ns)n.modified_ns=*a.modified_ns;n.changed_ns=now();
     if(a.accessed_ns)n.accessed_ns=*a.accessed_ns;if(a.birth_ns)n.birth_ns=*a.birth_ns;
 }
 }
@@ -850,8 +853,8 @@ void Namespace::set_path_attributes(const std::string& path,const Attributes& a,
     update([&](const NamespaceView& view,Changes& changes) {
         auto id=resolve(view,path,follow_final);auto n=inode(view,id);
         need(!n.symlink || !a.size,"invalid symbolic link size change");
-        if(!a.mode && !a.modified_ns && !a.size && !a.accessed_ns && !a.birth_ns)return;
-        if(a.size && *a.size==n.size && !a.mode && !a.modified_ns && !a.accessed_ns && !a.birth_ns)return;
+        if(!a.mode && !a.modified_ns && !a.size && !a.accessed_ns && !a.birth_ns && !a.flags)return;
+        if(a.size && *a.size==n.size && !a.mode && !a.modified_ns && !a.accessed_ns && !a.birth_ns && !a.flags)return;
         if(a.size){need(!n.directory && !n.symlink,"only regular files support size changes");
             FileContent data(n,view,&changes);if(data.resize(*a.size))touch(n);}
         apply_attributes(n,a);changes[inode_key(id)]=encode(n);
@@ -865,8 +868,8 @@ void Namespace::handle_set_attributes(const std::string& token,const Attributes&
     auto n=linked?inode(view,info.inode):decode_inode(container_.journal_->get(key),info.inode,true);
     need(!n.symlink || !a.size,"invalid symbolic link size change");
     need(!a.size || info.writable,"handle is not writable");
-    if(!a.mode && !a.modified_ns && !a.size && !a.accessed_ns && !a.birth_ns)return;
-    if(a.size && *a.size==n.size && !a.mode && !a.modified_ns && !a.accessed_ns && !a.birth_ns)return;
+    if(!a.mode && !a.modified_ns && !a.size && !a.accessed_ns && !a.birth_ns && !a.flags)return;
+    if(a.size && *a.size==n.size && !a.mode && !a.modified_ns && !a.accessed_ns && !a.birth_ns && !a.flags)return;
     Changes changes;
     auto pre=orphan_prefix(view_,info.inode);auto retained=linked?nullptr:retained_orphan(*container_.journal_,pre);
     if(a.size){FileContent data=retained?FileContent(n,*retained,&changes):linked?FileContent(n,view,&changes):FileContent(n,*container_.journal_,pre,&changes);if(data.resize(*a.size))touch(n);}

@@ -44,7 +44,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `ftruncate`、稀疏文件、`lseek` | setattr size + bounded chunk I/O | 挂载已测零填充、shrink/extend、64 MiB/4 GiB/1 TiB 边界；`SEEK_DATA/SEEK_HOLE` 未验收 |
 | `F_PREALLOCATE`、`posix_fallocate`、hole punch | 可选 Preallocate/SeekRegion 协议 | 未实现相应协议；不能声称空间预留或洞区间查询兼容 |
 | `statfs/statvfs/pathconf` | volumeStatistics、PathConfOperations | 回调/RPC 已测；空间来自宿主卷，不是 forkfs 配额，剩余空间不保证下一次写入成功 |
-| `chflags`、immutable/append-only/hidden 等 | setattr flags + 所有变更点执行约束 | 缺失；flags 更新拒绝，不能仅保存位而不执行约束 |
+| `chflags/fchflags/lchflags`、BSD flags | get/setAttributes → revision inode | 挂载已测 hidden/nodump 的路径/fd/nofollow、硬链接、cp -p、孤儿 fd 和历史隔离；immutable/append-only/nounlink/系统保护标记在修改前拒绝 |
 | `mkfifo/mknod`、Unix socket 路径 | create item types | 缺失；当前只支持 regular/directory/symlink，不适合依赖这些节点的运行目录 |
 | `copyfile/clonefile/fcopyfile/sendfile` | 内核 fallback 或可选复制能力 | 普通 `cp` 部分场景已测；CoW clone、资源 fork 大值、完整 copyfile flags、sendfile 未验收 |
 | `kqueue` vnode 通知、文件监控、FSEvents | 内核事件及卷能力 | 未验收；daemon revision history 不等于应用文件监控事件 |
@@ -144,6 +144,12 @@ APFS 对照成功；这些仍是明确缺口。数量上限现为 128 项，每 
 在发布前拒绝，释放名称/字节预算后可立即重试，不触发存储故障重开。
 见 [数量/预算和 ResourceFork EOF 证据](evidence/2026-11-12-xattr-capacity-resource-fork.json)。
 对照脚本与范围见 [大 xattr 验收](evidence/2026-11-12-large-xattrs.json)。
+
+`hidden`/`nodump` 标记已贯通 daemon、RPC 与 FSKit，flags-only diff 即使时间戳
+相同也能识别变化。非零标记使用 `FFINOD04`，旧版本 daemon 拒绝该记录；
+清除当前 World 的标记不等于清除历史版本。标记不影响数据写入；保护类标记
+继续拒绝，不能把可保存位当作已执行 immutable/append-only 约束。
+见 [BSD 元数据标记验收](evidence/2026-11-12-file-flags.json)。
 
 ## 补全顺序与完成条件
 
