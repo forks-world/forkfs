@@ -101,7 +101,7 @@ try:
     assert getxattr(file,attr)==attr_value and getxattr(file,'com.apple.metadata:_kMDItemUserTags')==tags
     assert attr in listxattr(file) and rpc('fs-xattr-get',namespace+'/file',attr)==attr_value
     rejects(lambda:setxattr(file,attr,b'duplicate',flags=XATTR_CREATE),errno.EEXIST)
-    rejects(lambda:setxattr(file,'user.too-big',bytes(65537)),errno.E2BIG)
+    rejects(lambda:setxattr(file,'user.too-big',bytes(262144)),errno.E2BIG,errno.EFBIG)
     rejects(lambda:setxattr(file,b'bad\xff',b'x'),errno.EINVAL)
     rejects(lambda:getxattr(file,b'bad\xff'),errno.EINVAL)
     setxattr(file,'user.empty',b'');assert getxattr(file,'user.empty')==b'';removexattr(file,'user.empty')

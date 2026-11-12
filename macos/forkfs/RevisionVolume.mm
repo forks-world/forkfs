@@ -3,6 +3,7 @@
 #import <CommonCrypto/CommonDigest.h>
 #include "rpc.h"
 #include "filesystem_limits.h"
+#include <bit>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -145,7 +146,8 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 - (NSInteger)maximumNameLength{return 255;}
 - (BOOL)restrictsOwnershipChanges{return YES;}
 - (BOOL)truncatesLongNames{return NO;}
-- (NSInteger)maximumXattrSize{return 64*1024;}
+// The inclusive native bound is representable in 18 bits.
+- (NSInteger)maximumXattrSizeInBits{return std::bit_width(forkfs::maximum_xattr_bytes);}
 - (uint64_t)maximumFileSize{return forkfs::maximum_file_bytes;}
 #ifdef FSKIT_API_AVAILABILITY_V2_4
 - (FSMountOptions)requestedMountOptions {return _readOnly?FSMountOptionsReadOnly:0;}
@@ -304,7 +306,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
     NSError* e=[self perform:^{[self writable];require(name.string!=nil,EINVAL,"invalid UTF-8 extended attribute name");auto it=[self item:item];auto handle=[self handle:it];
         if(policy==FSSetXattrPolicyDelete){[self call:@[handle?@"fs-hxattr-remove":@"inode-xattr-remove",handle?:it.inode,name.string]];}
         else {
-            require(value!=nil,EINVAL,"missing extended attribute value");require(value.length<=64*1024,E2BIG,"extended attribute exceeds 64 KiB");
+            require(value!=nil,EINVAL,"missing extended attribute value");require(value.length<=forkfs::maximum_xattr_bytes,E2BIG,"extended attribute exceeds 262143 bytes");
             require(policy==FSSetXattrPolicyAlwaysSet || policy==FSSetXattrPolicyMustCreate || policy==FSSetXattrPolicyMustReplace,EINVAL,"invalid extended attribute policy");
             const char* mode=policy==FSSetXattrPolicyMustCreate?"create":policy==FSSetXattrPolicyMustReplace?"replace":"upsert";
             std::vector<std::string> fields{handle?"fs-hxattr-set":"inode-xattr-set",bytes(handle?:it.inode),bytes(name.string),mode,std::string(value.length?static_cast<const char*>(value.bytes):"",value.length),_revision?"--revision":"--world",bytes(_view),"--session",bytes(_session)};

@@ -1,0 +1,163 @@
+{
+  "schema": 1,
+  "date": "2026-11-12",
+  "platform": "macOS-27.2.1-arm64-arm-64bit",
+  "base_commit": "07ca73e0a1d1d534e8660bffe838a69203ef18ff",
+  "source_tree_before_evidence": "6258084707949e24da273ecca744502ad76831d6",
+  "maximum_xattr_bytes": 262143,
+  "validation": {
+    "isolated_release_ctest_passed": 55,
+    "isolated_release_ctest_failed": 0,
+    "system_only_dependencies": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "non_documentation_source_paths_match_isolated_copy": 127,
+    "coverage": "LevelDB and legacy journal path API, max/max+1, failed-write immutability, revisions/forks/diff, LevelDB orphan fd edits, restart/GC, raw inode/handle RPC and FSKit callbacks"
+  },
+  "apfs_reference": {
+    "filesystem": "apfs",
+    "namespace": "/forkfs-xattr-a1mckj7d",
+    "bytes_per_attribute": 262143,
+    "xattr_size_bits": 56,
+    "sha256": "22fc3b1dfd9ba3690ed231d5a30a3adffb16e966164896534017e976868e7902",
+    "copy_preserves_large_user_xattr": true,
+    "resource_fork_copy_probe": {
+      "preserved": true,
+      "returncode": 0,
+      "stderr": ""
+    },
+    "position_read_probe": {
+      "matches": true,
+      "returned_bytes": 17
+    },
+    "open_unlink": true
+  },
+  "native_before": {
+    "old_64k_limit_reproduced": true,
+    "errno": 27,
+    "attempted_bytes": 262144
+  },
+  "native_after": {
+    "filesystem": "forkfs",
+    "namespace": "/forkfs-xattr-cls6zegt",
+    "bytes_per_attribute": 262143,
+    "xattr_size_bits": 18,
+    "sha256": "22fc3b1dfd9ba3690ed231d5a30a3adffb16e966164896534017e976868e7902",
+    "copy_preserves_large_user_xattr": true,
+    "resource_fork_copy_probe": {
+      "preserved": false,
+      "returncode": 1,
+      "stderr": "cp: /private/tmp/xattr-mount.60bszpap/mounted/forkfs-xattr-cls6zegt/file: could not copy extended attributes to /private/tmp/xattr-mount.60bszpap/mounted/forkfs-xattr-cls6zegt/resource-copy: Invalid argument\n"
+    },
+    "oversize_errno": {
+      "user.large": 27,
+      "com.apple.ResourceFork": 27
+    },
+    "revision": "xattr_accept_cls6zegt",
+    "position_read_probe": {
+      "errno": 22
+    },
+    "open_unlink": true,
+    "revision_isolation": true
+  },
+  "native_foundation": {
+    "namespace": "/forkfs-accept-7838clio",
+    "checks": [
+      "binary write/read/fsync reaches daemon content",
+      "native binary/empty xattrs, Finder tags, create policy and size limit",
+      "hardlink identity and symlink traversal",
+      "pathname/fd utime nanoseconds and native creation time reach revision inode",
+      "nofollow metadata, O_SYMLINK fds, cp -Pp binary xattrs and open-unlink/dup identity",
+      "native rename/removal/directory-hardlink errno and failed-operation atomicity",
+      "fsync then revision checkpoint isolates subsequent writes",
+      "xattrs follow hardlink identity, revision isolation and open-unlink handles",
+      "rename/open-unlink/truncate/path reuse preserve file identity",
+      "directory enumeration and dot entries",
+      "atomic-save replacement reaches revision-backed namespace",
+      "UTF-8 names, links, rename, NFC/NFD identity and byte limits",
+      "4 MiB file transfer, 64 MiB sparse growth, truncate zero-fill and chunked open-unlink"
+    ],
+    "timestamp_ns": {
+      "accessed_ns": 1234567890123456790,
+      "modified_ns": 1345678901234567891,
+      "birth_ns": 1123456789000000000
+    },
+    "symlink_attributes": {
+      "mode": 449,
+      "accessed_ns": 111111111111111111,
+      "modified_ns": 222222222222222222,
+      "birth_ns": 100000000000000000,
+      "target_unchanged": true,
+      "dangling_touch_h": true,
+      "dangling_cp_Pp": true,
+      "copied_binary_xattr": true,
+      "fd_open_unlink_dup": true,
+      "data_read_write_errno": "EPERM",
+      "truncate_errno": "EINVAL"
+    },
+    "retained_revision": "mount_accept_b1cb62c22f32",
+    "appledouble_sidecars": 0,
+    "unicode_retained_revision": "unicode_mount_04fcf59b29af",
+    "large_retained_revision": "large_mount_7a7f900ebaaf",
+    "large_namespace": "/forkfs-accept-7838clio/large.bin"
+  },
+  "offline_gc": {
+    "collected_objects": 10263
+  },
+  "storage_check_after_gc": {
+    "service": "forkfsd",
+    "state": "leveldb",
+    "storage_engine": "leveldb",
+    "repository_id": "3ec834b2a6285040dc8a61196dbce41e",
+    "degraded_anchor": false,
+    "mounted": false,
+    "transactions_supported": true,
+    "requires_reopen": false,
+    "last_committed_seq": 730,
+    "checkpoint_seq": 0,
+    "replayed_transactions": 0,
+    "indexed_objects": 654,
+    "object_roots": 744,
+    "compaction_running": false,
+    "compaction_queued": 0,
+    "compaction_active": false,
+    "compaction_completed": 0,
+    "compaction_races": 0,
+    "compaction_failures": 0,
+    "compaction_last_error": "",
+    "metadata_prepare_ns": 0,
+    "storage_metrics": {
+      "transactions": 0,
+      "prepare_ns": 0,
+      "write_ns": 0,
+      "wal_sync_calls": 0,
+      "wal_sync_ns": 0,
+      "other_sync_calls": 2,
+      "other_sync_ns": 11155750,
+      "wal_append_bytes": 0,
+      "wal_append_ns": 0,
+      "wal_flush_ns": 0
+    },
+    "uncommitted_tail": false
+  },
+  "read_only_revision_after_gc": {
+    "read_only_large_xattrs_after_gc": true,
+    "readonly_write_rejected": true,
+    "bytes_per_attribute": 262143
+  },
+  "sha256": {
+    "daemon": "8ddf72467ead5b98fc5533f64f9071177087506c56366a4221ff2e76971e78d9",
+    "installed_signed_extension": "0ea29aefe08d793cd0064189bb98a7ef6be77b3123599e3d6b88c4ed992a1c06",
+    "manual_script": "b3feecfce5c9db304d94ef4490a9b9bae6602cfe05adc52e6ddda6b913f0f630"
+  },
+  "installed_signature_deep_strict_verified": true,
+  "limits": [
+    "Whole-value xattrs are bounded to 262143 bytes within one existing immutable object. No inode/manifest format change. Existing values <=64 KiB need no rewrite; older daemons/frontends reject larger values.",
+    "The tested native macOS 27.2 path rejected exactly 262144 bytes with EFBIG even when the callback allowed it. The shared bound excludes that endpoint. Inode RPC and direct callback oversize rejection is E2BIG.",
+    "ResourceFork whole-value get/set works, but cp -p and position reads return EINVAL on forkfs; APFS completes both. This is not full resource-fork stream/copy compatibility.",
+    "Ordinary large xattrs survive cp -p. The retained copy inode receives its resource fork through a separate whole-value set, not a successful resource-fork copy.",
+    "The 32-attribute count limit remains. No arbitrary-size/chunked xattrs, quotas, named-fork stream or full POSIX/APFS compatibility claim."
+  ]
+}

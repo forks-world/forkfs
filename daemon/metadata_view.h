@@ -22,6 +22,7 @@ public:
     std::vector<std::string> page(const std::string& prefix,const std::string& after,size_t limit) const;
     bool contains(const std::string& key) const;
     Bytes get(const std::string& key) const;
+    uint64_t value_size(const std::string& key) const;
     std::vector<std::string> keys(const std::string& prefix) const;
     Map references() const;
     std::optional<ObjectId> reference(const std::string& key) const {return lookup(key);}

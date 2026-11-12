@@ -168,7 +168,7 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume writeContents:contents toFile:file atOffset:0 replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==4,"binary write failed");
         TestBuffer* buffer=[TestBuffer new];buffer.storage=[NSMutableData dataWithLength:32];
         [volume readFromFile:file offset:0 length:32 intoBuffer:(FSMutableFileDataBuffer*)buffer replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==4 && !memcmp(buffer.storage.bytes,payload,4),"binary read failed");
-        check(volume.maximumXattrSize==65536,"wrong xattr size capability");
+        check(volume.maximumXattrSizeInBits==18,"wrong xattr size capability");
         FSFileName* attrName=[FSFileName nameWithString:@"user.测试📄"];__block NSData* xattrValue=nil;__block NSArray<FSFileName*>* attrNames=nil;
         const char badName[]={char(0xff)};FSFileName* invalidAttr=[FSFileName nameWithBytes:badName length:1];
         [volume getXattrNamed:invalidAttr ofItem:file replyHandler:^(NSData* v,NSError* e){result=e;}];check(result.code==EINVAL,"invalid UTF-8 xattr get must fail safely");
@@ -183,6 +183,12 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume setXattrNamed:attrName toData:nil onItem:file policy:FSSetXattrPolicyDelete replyHandler:^(NSError* e){result=e;}];check(!result,"xattr delete failed");
         [volume setXattrNamed:attrName toData:contents onItem:file policy:FSSetXattrPolicyMustReplace replyHandler:^(NSError* e){result=e;}];check(result.code==ENOATTR,"xattr replace must reject missing name");
         [volume setXattrNamed:attrName toData:contents onItem:file policy:FSSetXattrPolicyAlwaysSet replyHandler:^(NSError* e){result=e;}];check(!result,"xattr upsert failed");
+        NSMutableData* largeAttr=[NSMutableData dataWithLength:262143];memset(largeAttr.mutableBytes,0xa5,largeAttr.length);
+        [volume setXattrNamed:attrName toData:largeAttr onItem:file policy:FSSetXattrPolicyMustReplace replyHandler:^(NSError* e){result=e;}];check(!result,"large xattr set failed");
+        [volume getXattrNamed:attrName ofItem:file replyHandler:^(NSData* v,NSError* e){xattrValue=v;result=e;}];check(!result && [xattrValue isEqualToData:largeAttr],"large xattr read failed");
+        [volume setXattrNamed:attrName toData:[NSMutableData dataWithLength:262144] onItem:file policy:FSSetXattrPolicyMustReplace replyHandler:^(NSError* e){result=e;}];check(result.code==E2BIG,"oversize xattr must fail before mutation");
+        [volume getXattrNamed:attrName ofItem:file replyHandler:^(NSData* v,NSError* e){xattrValue=v;result=e;}];check(!result && [xattrValue isEqualToData:largeAttr],"failed large xattr set changed data");
+        [volume setXattrNamed:attrName toData:contents onItem:file policy:FSSetXattrPolicyMustReplace replyHandler:^(NSError* e){result=e;}];check(!result,"restore small xattr failed");
         [volume setXattrNamed:[FSFileName nameWithString:@"user.root"] toData:contents onItem:root policy:FSSetXattrPolicyAlwaysSet replyHandler:^(NSError* e){result=e;}];check(!result,"inode root xattr set failed");
         [volume getXattrNamed:[FSFileName nameWithString:@"user.root"] ofItem:root replyHandler:^(NSData* v,NSError* e){xattrValue=v;result=e;}];check(!result && [xattrValue isEqualToData:contents],"inode root xattr get failed");
         [volume setXattrNamed:[FSFileName nameWithString:@"user.root"] toData:nil onItem:root policy:FSSetXattrPolicyDelete replyHandler:^(NSError* e){result=e;}];check(!result,"inode root xattr remove failed");

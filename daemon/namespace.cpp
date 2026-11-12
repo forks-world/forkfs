@@ -338,32 +338,39 @@ class Xattrs {
     using Changes=std::map<std::string,std::optional<Bytes>>;
     std::function<bool(const std::string&)> contains_;
     std::function<Bytes(const std::string&)> get_;
+    std::function<uint64_t(const std::string&)> size_;
     std::function<std::vector<std::string>(const std::string&)> keys_;
     std::string prefix_;
     Changes* changes_;
 public:
     Xattrs(const NamespaceView& view,const std::string& id,Changes* changes=nullptr)
-        :contains_([&view](const auto& key){return view.contains(key);}),get_([&view](const auto& key){return view.get(key);}),
+        :contains_([&view](const auto& key){return view.contains(key);}),get_([&view](const auto& key){return view.get(key);}),size_([&view](const auto& key){return view.value_size(key);}),
          keys_([&view](const auto& key){return view.keys(key);}),prefix_(xattr_prefix(id)),changes_(changes) {}
     Xattrs(const Journal& journal,const std::string& orphan,Changes* changes=nullptr)
-        :contains_([&journal](const auto& key){return journal.contains(key);}),get_([&journal](const auto& key){return journal.get(key);}),
+        :contains_([&journal](const auto& key){return journal.contains(key);}),get_([&journal](const auto& key){return journal.get(key);}),size_([&journal](const auto& key){return journal.object_size(journal.root_object(key));}),
          keys_([&journal](const auto& key){return journal.keys(key);}),prefix_(orphan+"xattr/"),changes_(changes) {}
     std::vector<std::string> records() const {return keys_(prefix_);}
     Bytes get(const std::string& name) const {
         valid_xattr_name(name);auto key=prefix_+name;need(contains_(key),"extended attribute not found");auto value=get_(key);
-        need(value.size()<=64*1024,"extended attribute exceeds 64 KiB");return value;
+        need(value.size()<=maximum_xattr_bytes,"extended attribute exceeds 262143 bytes");return value;
     }
     std::vector<std::string> names() const {
-        auto keys=records();need(keys.size()<=32,"extended attribute count limit reached");std::vector<std::string> result;
-        for(const auto& key:keys){auto name=key.substr(prefix_.size());valid_xattr_name(name);result.push_back(name);}return result;
+        auto keys=records();need(keys.size()<=Namespace::maximum_xattr_count,"extended attribute count limit reached");std::vector<std::string> result;
+        uint64_t total=0;
+        for(const auto& key:keys){auto name=key.substr(prefix_.size());valid_xattr_name(name);result.push_back(name);
+            auto length=size_(key);need(length<=Namespace::maximum_xattr_storage_bytes-total,"extended attribute storage limit reached");total+=length;}
+        return result;
     }
     bool edit(const std::string& name,const std::optional<Bytes>& value,Namespace::XattrPolicy policy) {
         valid_xattr_name(name);need(policy==Namespace::XattrPolicy::Upsert || policy==Namespace::XattrPolicy::Create || policy==Namespace::XattrPolicy::Replace,"invalid extended attribute policy");
-        auto key=prefix_+name;bool exists=contains_(key);auto count=records().size();
-        if(value){need(value->size()<=64*1024,"extended attribute exceeds 64 KiB");
+        auto key=prefix_+name;bool exists=contains_(key);auto keys=records();auto count=keys.size();
+        if(value){need(value->size()<=maximum_xattr_bytes,"extended attribute exceeds 262143 bytes");
             need(policy!=Namespace::XattrPolicy::Create || !exists,"extended attribute already exists");
             need(policy!=Namespace::XattrPolicy::Replace || exists,"extended attribute not found");
-            need(exists || count<32,"extended attribute count limit reached");
+            need(exists || count<Namespace::maximum_xattr_count,"extended attribute count limit reached");
+            uint64_t total=value->size();
+            for(const auto& other:keys)if(other!=key){auto length=size_(other);
+                need(length<=Namespace::maximum_xattr_storage_bytes-total,"extended attribute storage limit reached");total+=length;}
         } else need(exists,"extended attribute not found");
         (*changes_)[key]=value;return value.has_value() || count>1;
     }

@@ -191,7 +191,7 @@ names, links, rename, NFC/NFD distinctions and the byte limit; see
 
 Current limits are inherited from the namespace prototype: 1 TiB per regular
 file with 256 KiB per daemon I/O request, UTF-8 names (255 bytes per component, 4096 per path), mode bits through
-0777, native xattrs (64 KiB per value, 32 per inode), no ACLs or uid/gid
+0777, native xattrs (262,143 bytes per value, 128 per inode, 8 MiB total values), no ACLs or uid/gid
 changes, and no special files. Setattr supports mode, size, mtime, atime and birth time atomically;
 unsupported attributes fail before mutation. The owner/group are synthesized
 from the service identity. The mounted root is always exposed as mode 0700, and
@@ -300,7 +300,7 @@ script still validates any AppleDouble headers before excluding sidecars from
 its user-entry comparison. Such files, when present, remain ordinary
 revision-backed entries.
 
-Each value is limited to 64 KiB, including resource-fork values; larger values
+Each value is limited to 262,143 bytes, including resource-fork values; larger values
 fail with E2BIG. Logical xattr names support up to 255 valid UTF-8 bytes without
 normalization, with the namespace's control-character exclusions; macOS can
 apply tighter native name limits. Xattrs do not add ACL or multi-user permission
@@ -399,3 +399,58 @@ repository changes. These checks supplement the kernel's prevalidation.
 
 See [namespace error evidence](evidence/2026-11-10-namespace-posix-errors.json)
 for the APFS comparison, native matrix and direct-RPC regression results.
+
+### Large xattr acceptance
+
+The daemon and FSKit share a 262,143-byte whole-value limit. The frontend declares
+`maximumXattrSizeInBits = 18`, matching native `pathconf(_PC_XATTR_SIZE_BITS)`.
+Native macOS 27.2 testing rejected exactly 262,144 bytes before the callback even
+when the callback allowed it; the common bound therefore excludes that endpoint.
+The callback rejects larger values with E2BIG; the kernel
+may reject them earlier with EFBIG. Failure must preserve the prior value.
+This remains bounded whole-value xattr support, not unlimited named-fork stream
+support. The per-inode limits are 128 attributes and 8 MiB of raw value bytes, including
+system-added attributes.
+
+```sh
+python3 scripts/tests/large_xattr_mount.py /private/tmp --reference-apfs
+python3 scripts/tests/large_xattr_mount.py /path/to/mount \
+  --daemon build/Release/daemon/forkfsd --socket /path/to/runtime/control.sock > /tmp/xattrs.json
+# After unmount, offline GC and mounting the reported revision read-only:
+python3 scripts/tests/large_xattr_mount.py /path/to/mount --verify-report /tmp/xattrs.json
+```
+
+Use a disposable repository. The test retains one revision and checks native
+pathname/fd xattrs, hardlinks, ordinary xattr copy preservation, open-unlink, failed replacement,
+and readback after GC/restart. Position-based resource-fork reads are reported
+separately. On macOS 27.2, ResourceFork `cp -p` and position reads return EINVAL;
+APFS completes both. These paths remain unsupported, despite whole-value support.
+See [large xattr evidence](evidence/2026-11-12-large-xattrs.json).
+
+### Xattr count/byte budget and ResourceFork diagnosis
+
+```sh
+python3 scripts/tests/xattr_capacity_mount.py /path/to/mount \
+  --daemon build/Release/daemon/forkfsd --socket /path/to/runtime/control.sock > /tmp/capacity.json
+# After unmount, offline GC and mounting the reported revision read-only:
+python3 scripts/tests/xattr_capacity_mount.py /path/to/mount --verify-report /tmp/capacity.json
+python3 scripts/tests/resource_fork_probe.py /path/to/mount
+python3 scripts/tests/resource_fork_probe.py /private/tmp --reference-apfs
+```
+
+Capacity acceptance checks 128 total names, exactly 8 MiB of values, ENOSPC
+without mutation, slot/byte reuse, orphan edits, revision isolation and GC/restart.
+The scripts retain a named revision or use only private scratch directories.
+The ResourceFork probe reports path/fd full reads, partial reads, in-range offsets,
+EOF and beyond-EOF reads separately; unsupported results remain failures to qualify.
+
+On the tested mount, a full read succeeds, a short buffer returns ERANGE and
+nonzero positions return EINVAL, including exactly EOF. APFS instead returns the
+requested slice or zero bytes at EOF. The failed `cp -p` can already have copied
+the destination payload before its final EOF probe fails. Apple's
+[copyfile implementation](https://github.com/apple-oss-distributions/copyfile/blob/main/copyfile.c)
+loops resource-fork reads until EOF. Do not treat matching payload bytes as a
+successful copy. Changing `supportsLimitedXAttrs` alone produced identical results;
+that experimental change is not included. Current xattr callbacks carry no offset,
+so this needs further frontend/platform work rather than a daemon range-read stub.
+See [capacity and ResourceFork evidence](evidence/2026-11-12-xattr-capacity-resource-fork.json).
