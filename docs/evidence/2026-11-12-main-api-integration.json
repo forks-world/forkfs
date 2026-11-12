@@ -1,0 +1,155 @@
+{
+  "schema": 1,
+  "date": "2026-11-12",
+  "platform": "macOS-27.2.1-arm64-arm-64bit",
+  "integration": {
+    "base": "556afdc795506e5f666b846e5d98a1e63b9b2d01",
+    "validated_commit": "604652c93b060aa636937b6d68b5bab3fcaa4283",
+    "validated_tree": "b5f4b3328121cf5df73c04a6eadb0bc81f6e1f56",
+    "prior_pr": 100,
+    "prior_merge_commit": "f4bf336f7f7953de6274c3ce2daa278080118771",
+    "prior_merge_target": "feat/chunk-retirement",
+    "prior_merge_tree_identical": true,
+    "main_contains_prior_pr100_commit": false,
+    "includes_pr99_flat_retirement_fix": "d820abe1c6d6bd96183d81d9c5c9b88c8e171e75"
+  },
+  "validation": {
+    "isolated_release_ctest": {
+      "passed": 55,
+      "failed": 0
+    },
+    "isolated_image_cleanup_unit_tests": 16,
+    "system_only_dependencies": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "source_paths_identical_to_validated_copy": 130
+  },
+  "native_allocation": {
+    "namespace": "/forkfs-allocation-u2_yi7i2",
+    "allocation_unit": 512,
+    "logical_size": 1099511627776,
+    "checks": [
+      "1 TiB hole-only file allocates zero data blocks",
+      "zero writes, hardlinks, orphan edits and shrink/extend update allocation",
+      "inline payloads round to 512-byte units"
+    ],
+    "du_kib": 65,
+    "revision": "allocation_accept_u2_yi7i2",
+    "revision_allocated_size": 66048
+  },
+  "native_foundation": {
+    "namespace": "/forkfs-accept-fnq3dbut",
+    "checks": [
+      "binary write/read/fsync reaches daemon content",
+      "native binary/empty xattrs, Finder tags, create policy and size limit",
+      "hardlink identity and symlink traversal",
+      "pathname/fd utime nanoseconds and native creation time reach revision inode",
+      "nofollow metadata, O_SYMLINK fds, cp -Pp binary xattrs and open-unlink/dup identity",
+      "native rename/removal/directory-hardlink errno and failed-operation atomicity",
+      "fsync then revision checkpoint isolates subsequent writes",
+      "xattrs follow hardlink identity, revision isolation and open-unlink handles",
+      "rename/open-unlink/truncate/path reuse preserve file identity",
+      "directory enumeration and dot entries",
+      "atomic-save replacement reaches revision-backed namespace",
+      "UTF-8 names, links, rename, NFC/NFD identity and byte limits",
+      "4 MiB file transfer, 64 MiB sparse growth, truncate zero-fill and chunked open-unlink"
+    ],
+    "timestamp_ns": {
+      "accessed_ns": 1234567890123456790,
+      "modified_ns": 1345678901234567891,
+      "birth_ns": 1123456789000000000
+    },
+    "symlink_attributes": {
+      "mode": 449,
+      "accessed_ns": 111111111111111111,
+      "modified_ns": 222222222222222222,
+      "birth_ns": 100000000000000000,
+      "target_unchanged": true,
+      "dangling_touch_h": true,
+      "dangling_cp_Pp": true,
+      "copied_binary_xattr": true,
+      "fd_open_unlink_dup": true,
+      "data_read_write_errno": "EPERM",
+      "truncate_errno": "EINVAL"
+    },
+    "retained_revision": "mount_accept_b4f1b7b3c566",
+    "appledouble_sidecars": 0,
+    "unicode_retained_revision": "unicode_mount_3426a5cc452b",
+    "large_retained_revision": "large_mount_c68c02e5c096",
+    "large_namespace": "/forkfs-accept-fnq3dbut/large.bin"
+  },
+  "real_owned_apfs_disk_full": {
+    "image_maximum_bytes": 268435456,
+    "rpc_error_code": 29,
+    "filler_bytes": 252182528,
+    "successful_writes_before_failure": 1,
+    "requires_reopen": true,
+    "poisoned_keepalive_code": 6,
+    "poisoned_sync_code": 6,
+    "atomic_recovery": true,
+    "retained_revision_unchanged": true,
+    "write_after_reopen": true,
+    "recovered_sha256": "97e7bb9bc9af1fc06f32d0c0752e941ff4b6c548fdf2d91dc4a873e012f17bd0",
+    "owned_image_detached_and_removed": true
+  },
+  "offline_gc": {
+    "collected_objects": 6436
+  },
+  "repository_check_after_gc": {
+    "service": "forkfsd",
+    "state": "leveldb",
+    "storage_engine": "leveldb",
+    "repository_id": "e220d7652fbd99672797c6cdc42d1e34",
+    "degraded_anchor": false,
+    "mounted": false,
+    "transactions_supported": true,
+    "requires_reopen": false,
+    "last_committed_seq": 533,
+    "checkpoint_seq": 0,
+    "replayed_transactions": 0,
+    "indexed_objects": 551,
+    "object_roots": 606,
+    "compaction_running": false,
+    "compaction_queued": 0,
+    "compaction_active": false,
+    "compaction_completed": 0,
+    "compaction_races": 0,
+    "compaction_failures": 0,
+    "compaction_last_error": "",
+    "metadata_prepare_ns": 0,
+    "storage_metrics": {
+      "transactions": 0,
+      "prepare_ns": 0,
+      "write_ns": 0,
+      "wal_sync_calls": 0,
+      "wal_sync_ns": 0,
+      "other_sync_calls": 2,
+      "other_sync_ns": 11355626,
+      "wal_append_bytes": 0,
+      "wal_append_ns": 0,
+      "wal_flush_ns": 0
+    },
+    "uncommitted_tail": false
+  },
+  "read_only_revision_after_gc": {
+    "revision_size_and_allocation_after_gc": true,
+    "allocated_size": 66048
+  },
+  "module": {
+    "installed_signature_verified": true,
+    "installed_binary_matches_2026_11_11_qualified_binary": true,
+    "frontend_sources_and_shared_headers_unchanged_from_pr100": true
+  },
+  "binary_sha256": {
+    "daemon": "15ddcdb07c83be6b3a65e2b584b109b914b9b6476b7a6b0270aa42e774ddf45d",
+    "installed_signed_extension": "82a7dc5014ccde77dfc8289ad1819490cb19bb13802c43494c72a024470f96a5"
+  },
+  "limits": [
+    "Allocation counts stored data rounded to 512 bytes per position, excluding holes, metadata and WAL; not exclusive physical ownership.",
+    "FFLDB002 is rejected by older daemons. Failed commits require reopen; a failed sync can recover a whole old or new transaction.",
+    "Real ENOSPC acceptance uses production daemon RPC on an owned 256 MiB APFS image; this is not mounted FSKit writeback, quota or hardware power-loss qualification.",
+    "No claim of full POSIX/APFS compatibility; xattrs remain 32 per inode and 64 KiB per value, and permissions remain private single-user."
+  ]
+}
