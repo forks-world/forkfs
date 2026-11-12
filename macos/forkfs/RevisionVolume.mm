@@ -59,6 +59,17 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
     RevisionItem* _root;
     dispatch_source_t _heartbeat;
 }
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 270000
+- (void)seekWithinItem:(FSItem*)item fromOffset:(off_t)offset region:(FSSeekRegion)region context:(FSContext*)context replyHandler:(void(^)(FSSeekRegionResult*,NSError*))reply API_AVAILABLE(macos(27.0)) {
+    __block FSSeekRegionResult* result=nil;NSError* error=[self perform:^{
+        require(offset>=0 && (region==FSSeekRegionData || region==FSSeekRegionHole),EINVAL,"invalid seek region");
+        RevisionItem* it=(RevisionItem*)item;
+        NSDictionary* value=[self json:@[@"inode-seek-region",it.inode,[@(offset) stringValue],region==FSSeekRegionData?@"data":@"hole",[self handle:it]?:@"-"]];
+        result=[[FSSeekRegionResult alloc] initWithReturnedOffset:[value[@"offset"] longLongValue]];
+        require(result!=nil,EIO,"invalid seek region result");
+    }];reply(result,error);
+}
+#endif
 - (std::string)call:(NSArray<NSString*>*)args {
     require(_alive,ESTALE,"mount session is closed");std::vector<std::string> fields;
     for(NSString* arg in args)fields.push_back(bytes(arg));

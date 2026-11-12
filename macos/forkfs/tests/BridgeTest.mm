@@ -176,6 +176,14 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:file replyHandler:^(FSItemAttributes* a,NSError* e){flagAttrs=a;result=e;}];check(!result && flagAttrs.flags==(UF_HIDDEN|UF_NODUMP) && flagAttrs.size==4,"failed flags changed attributes");
         flagRequest=[FSItemSetAttributesRequest new];flagRequest.flags=0;
         [volume setAttributes:flagRequest onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(!result,"clear flags callback failed");
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 270000
+        if(@available(macOS 27.0,*)){
+            __block FSSeekRegionResult* seekResult=nil;
+            [volume seekWithinItem:file fromOffset:0 region:FSSeekRegionData context:nil replyHandler:^(FSSeekRegionResult* r,NSError* e){seekResult=r;result=e;}];check(seekResult && !result,"seek data callback failed");
+            [volume seekWithinItem:file fromOffset:4 region:FSSeekRegionData context:nil replyHandler:^(FSSeekRegionResult* r,NSError* e){result=e;}];check(result.code==ENXIO,"seek EOF must report ENXIO");
+            [volume seekWithinItem:file fromOffset:-1 region:FSSeekRegionHole context:nil replyHandler:^(FSSeekRegionResult* r,NSError* e){result=e;}];check(result.code==EINVAL,"negative seek must fail");
+        }
+#endif
         check(volume.maximumXattrSizeInBits==18,"wrong xattr size capability");
         FSFileName* attrName=[FSFileName nameWithString:@"user.测试📄"];__block NSData* xattrValue=nil;__block NSArray<FSFileName*>* attrNames=nil;
         const char badName[]={char(0xff)};FSFileName* invalidAttr=[FSFileName nameWithBytes:badName length:1];

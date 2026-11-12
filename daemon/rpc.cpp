@@ -149,6 +149,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="fs-xattr-set" || op=="fs-hxattr-set" || op=="inode-xattr-set")count=5;
     if(op=="inode-setattr-flags")count=9;
     if(op=="fs-setflags" || op=="fs-lsetflags" || op=="fs-hsetflags")count=3;
+    if(op=="inode-seek-region")count=5;
+    if(op=="fs-seek-region" || op=="fs-hseek-region")count=4;
     uint32_t creation_mode=0644;
     std::string session_token;bool selected_view=false;
     while(args.size()>=count+2) {
@@ -182,7 +184,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     if(op=="status")return store.status();
     if(op=="storage-profile")return store.storage_profile();
-    static const std::set<std::string> reads{"fs-xattr-get","fs-xattr-list","fs-hxattr-get","fs-hxattr-list","inode-xattr-get","inode-xattr-list","fs-history","fs-diff","fs-cat","fs-read-at","fs-ls","fs-stat","fs-lstat","fs-readlink","fs-check","fs-worlds","fs-revisions","fs-snapshot","fs-fork",
+    static const std::set<std::string> reads{"fs-seek-region","fs-hseek-region","inode-seek-region","fs-xattr-get","fs-xattr-list","fs-hxattr-get","fs-hxattr-list","inode-xattr-get","inode-xattr-list","fs-history","fs-diff","fs-cat","fs-read-at","fs-ls","fs-stat","fs-lstat","fs-readlink","fs-check","fs-worlds","fs-revisions","fs-snapshot","fs-fork",
         "fs-hstat","fs-hread","fs-hread-next","fs-hseek","fs-close","fs-dup","fs-hlock","fs-hrange-lock","fs-dir-open","fs-dir-page","fs-dir-entries","fs-dir-rewind","fs-dir-close"};
     sessions.authorize(session_token,view,revision,!reads.contains(op));
     if(op.starts_with("inode-") && op!="inode-root")sessions.mount_require(session_token,view,revision);
@@ -201,6 +203,15 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
             ",\"uid\":"+std::to_string(geteuid())+",\"gid\":"+std::to_string(getegid())+"}\n";
     }
     if(op.starts_with("inode-xattr-")){args[1]=fs.path_for_inode(args[1]);op="fs-xattr-"+op.substr(12);args[0]=op;}
+    if(op=="inode-seek-region" || op=="fs-seek-region" || op=="fs-hseek-region") {
+        need(args[3]=="data" || args[3]=="hole","invalid seek region");auto offset=number(args[2]);uint64_t result;
+        if(op=="inode-seek-region" && args[4]!="-"){
+            const auto& handle=args[4];need(activity.session->handles.contains(handle),"handle belongs to another session");
+            need(fs.handle_stat(handle).id==args[1],"invalid inode/handle pairing");result=fs.handle_seek_region(handle,offset,args[3]=="data");
+        } else if(op=="fs-hseek-region")result=fs.handle_seek_region(args[1],offset,args[3]=="data");
+        else result=fs.seek_region(op=="inode-seek-region"?fs.path_for_inode(args[1]):args[1],offset,args[3]=="data");
+        return "{\"offset\":"+std::to_string(result)+"}";
+    }
     if(op=="inode-space")return store.space_json();
     if(op=="inode-sync") {
         if(store.requires_reopen())throw RpcError(EIO,"storage requires reopen after write failure");

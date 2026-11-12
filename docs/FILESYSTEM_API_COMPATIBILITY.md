@@ -41,8 +41,8 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `mmap(MAP_SHARED/MAP_PRIVATE)`、`msync`、`munmap` | 内核缓存 + ReadWriteOperations | macOS 27.2 单挂载已测；映射/`pread/pwrite` 一致性、private 隔离、open-unlink、flush 后 revision 隔离 |
 | `fcntl(F_SETLK)`、`flock` | 内核原生 advisory locks；与 RPC 锁分开 | macOS 27.2 跨进程互斥、关闭/退出释放已测；byte-range 不相交范围可同时持有。共享锁/阻塞唤醒/信号打断未验收 |
 | `fsync`、目录同步、`F_FULLFSYNC`、断电恢复 | synchronize → inode-sync + 存储提交 | 基础文件 fsync/提交与 daemon 恢复已测；目录语义、全硬件屏障、断电/内核崩溃没有完整保证 |
-| `ftruncate`、稀疏文件、`lseek` | setattr size + bounded chunk I/O | 挂载已测零填充、shrink/extend、64 MiB/4 GiB/1 TiB 边界；`SEEK_DATA/SEEK_HOLE` 未验收 |
-| `F_PREALLOCATE`、`posix_fallocate`、hole punch | 可选 Preallocate/SeekRegion 协议 | 未实现相应协议；不能声称空间预留或洞区间查询兼容 |
+| `ftruncate`、稀疏文件、`lseek` | setattr size + bounded chunk I/O | 挂载已测零填充、shrink/extend、64 MiB/4 GiB/1 TiB 边界；macOS 27 已挂载验收 `SEEK_DATA/SEEK_HOLE`（64 KiB chunk 粒度）；macOS 26 保留保守 fallback |
+| `F_PREALLOCATE`、`posix_fallocate`、hole punch | 可选 Preallocate/数据变更接口 | 未实现相应协议；不能声称空间预留或洞区间查询兼容 |
 | `statfs/statvfs/pathconf` | volumeStatistics、PathConfOperations | 回调/RPC 已测；空间来自宿主卷，不是 forkfs 配额，剩余空间不保证下一次写入成功 |
 | `chflags/fchflags/lchflags`、BSD flags | get/setAttributes → revision inode | 挂载已测 hidden/nodump 的路径/fd/nofollow、硬链接、cp -p、孤儿 fd 和历史隔离；immutable/append-only/nounlink/系统保护标记在修改前拒绝 |
 | `mkfifo/mknod`、Unix socket 路径 | create item types | 缺失；当前只支持 regular/directory/symlink，不适合依赖这些节点的运行目录 |
@@ -54,7 +54,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 [`RevisionVolume.h`](../macos/forkfs/RevisionVolume.h) 和
 [`RevisionVolume.mm`](../macos/forkfs/RevisionVolume.mm)。已接入 Operations、
 PathConf、OpenClose、ReadWrite、Xattr。macOS 27 Handler 迁移、AccessCheck、
-Preallocate、SeekRegion、DataCache 等独立评估；迁移 API 不自动补齐上表语义。
+Preallocate、DataCache 等独立评估；迁移 API 不自动补齐上表语义。
 
 ## 应用验收：可重复执行
 
@@ -150,6 +150,13 @@ APFS 对照成功；这些仍是明确缺口。数量上限现为 128 项，每 
 清除当前 World 的标记不等于清除历史版本。标记不影响数据写入；保护类标记
 继续拒绝，不能把可保存位当作已执行 immutable/append-only 约束。
 见 [BSD 元数据标记验收](evidence/2026-11-12-file-flags.json)。
+
+macOS 27 的 `SeekRegionHandler` 已接入现有 Operations 前端，原生
+`SEEK_DATA/SEEK_HOLE` 可查询稀疏 chunk 区间，不扫描空洞或读取 payload。
+验收覆盖 1 TiB 稀疏文件、EOF/空文件 ENXIO、dup/open-unlink、路径重用、
+revision 隔离及 GC 后只读重挂载；macOS 26 构建不宣称支持该新协议。
+这是逻辑数据区间查询，不提供物理 extent、预分配或 hole punch。
+见 [稀疏 seek 验收](evidence/2026-11-12-seek-regions.json)。
 
 ## 补全顺序与完成条件
 
