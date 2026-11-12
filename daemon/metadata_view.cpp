@@ -102,6 +102,9 @@ bool NamespaceView::contains(const std::string& key) const {
        (journal_.contains(key) || journal_.contains(history+"allocated/"+key.substr(allocations.size()))))return true;
     return lookup(key).has_value();
 }
+uint64_t NamespaceView::value_size(const std::string& key) const {
+    auto id=lookup(key);need(id.has_value(),"namespace key not found");return journal_.object_size(*id);
+}
 Bytes NamespaceView::get(const std::string& key) const {
     auto id=lookup(key);need(id.has_value(),"namespace key not found");return journal_.get_object(*id);
 }

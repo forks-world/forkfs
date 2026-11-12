@@ -1,0 +1,723 @@
+{
+  "schema": 1,
+  "date": "2026-11-12",
+  "platform": "macOS-27.2.1-arm64-arm-64bit",
+  "parent_head": "9d42f90c881b01d9c2dc147cc87da2d013d95f82",
+  "source_tree_before_evidence": "f719e1d974fa8ff680dc3b09328556704a65b64c",
+  "capacity": {
+    "maximum_names_per_inode": 128,
+    "maximum_logical_value_bytes_per_inode": 8388608,
+    "maximum_bytes_per_value": 262143,
+    "equal_payload_ids_count_per_name": true,
+    "inherited_system_attributes_counted": true,
+    "published_format_change": false
+  },
+  "validation": {
+    "isolated_release_ctest_passed": 55,
+    "isolated_release_ctest_failed": 0,
+    "final_suite_parallelism": 2,
+    "system_only_dependencies": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "non_documentation_paths_match_isolated_copy": 129,
+    "earlier_full_suite": "54 passed; stale-socket cleanup assertion failed once. Isolated lifecycle rerun passed, followed by a complete 55/55 run. No lifecycle source/assertion was changed."
+  },
+  "native_count_before": {
+    "old_32_attribute_limit_reproduced": true
+  },
+  "native_count_and_byte_budget": {
+    "namespace": "/forkfs-xattr-capacity-g941xn_g",
+    "maximum_count": 128,
+    "logical_value_budget_bytes": 8388608,
+    "count_names": [
+      "com.apple.provenance",
+      "user.k0",
+      "user.k1",
+      "user.k10",
+      "user.k100",
+      "user.k101",
+      "user.k102",
+      "user.k103",
+      "user.k104",
+      "user.k105",
+      "user.k106",
+      "user.k107",
+      "user.k108",
+      "user.k109",
+      "user.k11",
+      "user.k110",
+      "user.k111",
+      "user.k112",
+      "user.k113",
+      "user.k114",
+      "user.k115",
+      "user.k116",
+      "user.k117",
+      "user.k118",
+      "user.k119",
+      "user.k12",
+      "user.k120",
+      "user.k121",
+      "user.k122",
+      "user.k123",
+      "user.k124",
+      "user.k125",
+      "user.k126",
+      "user.k13",
+      "user.k14",
+      "user.k15",
+      "user.k16",
+      "user.k17",
+      "user.k18",
+      "user.k19",
+      "user.k2",
+      "user.k20",
+      "user.k21",
+      "user.k22",
+      "user.k23",
+      "user.k24",
+      "user.k25",
+      "user.k26",
+      "user.k27",
+      "user.k28",
+      "user.k29",
+      "user.k3",
+      "user.k30",
+      "user.k31",
+      "user.k32",
+      "user.k33",
+      "user.k34",
+      "user.k35",
+      "user.k36",
+      "user.k37",
+      "user.k38",
+      "user.k39",
+      "user.k4",
+      "user.k40",
+      "user.k41",
+      "user.k42",
+      "user.k43",
+      "user.k44",
+      "user.k45",
+      "user.k46",
+      "user.k47",
+      "user.k48",
+      "user.k49",
+      "user.k5",
+      "user.k50",
+      "user.k51",
+      "user.k52",
+      "user.k53",
+      "user.k54",
+      "user.k55",
+      "user.k56",
+      "user.k57",
+      "user.k58",
+      "user.k59",
+      "user.k6",
+      "user.k60",
+      "user.k61",
+      "user.k62",
+      "user.k63",
+      "user.k64",
+      "user.k65",
+      "user.k66",
+      "user.k67",
+      "user.k68",
+      "user.k69",
+      "user.k7",
+      "user.k70",
+      "user.k71",
+      "user.k72",
+      "user.k73",
+      "user.k74",
+      "user.k75",
+      "user.k76",
+      "user.k77",
+      "user.k78",
+      "user.k79",
+      "user.k8",
+      "user.k80",
+      "user.k81",
+      "user.k82",
+      "user.k83",
+      "user.k84",
+      "user.k85",
+      "user.k86",
+      "user.k87",
+      "user.k88",
+      "user.k89",
+      "user.k9",
+      "user.k90",
+      "user.k91",
+      "user.k92",
+      "user.k93",
+      "user.k94",
+      "user.k95",
+      "user.k96",
+      "user.k97",
+      "user.k98",
+      "user.k99"
+    ],
+    "padding_bytes": 21,
+    "inherited_value_bytes": 11,
+    "revision": "xattr_capacity_g941xn_g",
+    "count_boundary_and_reuse": true,
+    "byte_boundary_and_reuse": true,
+    "orphan_and_revision_isolation": true
+  },
+  "native_foundation": {
+    "namespace": "/forkfs-accept-ui0urjsx",
+    "checks": [
+      "binary write/read/fsync reaches daemon content",
+      "native binary/empty xattrs, Finder tags, create policy and size limit",
+      "hardlink identity and symlink traversal",
+      "pathname/fd utime nanoseconds and native creation time reach revision inode",
+      "nofollow metadata, O_SYMLINK fds, cp -Pp binary xattrs and open-unlink/dup identity",
+      "native rename/removal/directory-hardlink errno and failed-operation atomicity",
+      "fsync then revision checkpoint isolates subsequent writes",
+      "xattrs follow hardlink identity, revision isolation and open-unlink handles",
+      "rename/open-unlink/truncate/path reuse preserve file identity",
+      "directory enumeration and dot entries",
+      "atomic-save replacement reaches revision-backed namespace",
+      "UTF-8 names, links, rename, NFC/NFD identity and byte limits",
+      "4 MiB file transfer, 64 MiB sparse growth, truncate zero-fill and chunked open-unlink"
+    ],
+    "timestamp_ns": {
+      "accessed_ns": 1234567890123456790,
+      "modified_ns": 1345678901234567891,
+      "birth_ns": 1123456789000000000
+    },
+    "symlink_attributes": {
+      "mode": 449,
+      "accessed_ns": 111111111111111111,
+      "modified_ns": 222222222222222222,
+      "birth_ns": 100000000000000000,
+      "target_unchanged": true,
+      "dangling_touch_h": true,
+      "dangling_cp_Pp": true,
+      "copied_binary_xattr": true,
+      "fd_open_unlink_dup": true,
+      "data_read_write_errno": "EPERM",
+      "truncate_errno": "EINVAL"
+    },
+    "retained_revision": "mount_accept_5974d3a58baa",
+    "appledouble_sidecars": 0,
+    "unicode_retained_revision": "unicode_mount_8bbec2cc937e",
+    "large_retained_revision": "large_mount_8fbd68954a54",
+    "large_namespace": "/forkfs-accept-ui0urjsx/large.bin"
+  },
+  "offline_gc": {
+    "collected_objects": 3525
+  },
+  "storage_check": {
+    "service": "forkfsd",
+    "state": "leveldb",
+    "storage_engine": "leveldb",
+    "repository_id": "b7404f129a3af7708ec399d4a7dc075e",
+    "degraded_anchor": false,
+    "mounted": false,
+    "transactions_supported": true,
+    "requires_reopen": false,
+    "last_committed_seq": 284,
+    "checkpoint_seq": 0,
+    "replayed_transactions": 0,
+    "indexed_objects": 352,
+    "object_roots": 370,
+    "compaction_running": false,
+    "compaction_queued": 0,
+    "compaction_active": false,
+    "compaction_completed": 0,
+    "compaction_races": 0,
+    "compaction_failures": 0,
+    "compaction_last_error": "",
+    "metadata_prepare_ns": 0,
+    "storage_metrics": {
+      "transactions": 0,
+      "prepare_ns": 0,
+      "write_ns": 0,
+      "wal_sync_calls": 0,
+      "wal_sync_ns": 0,
+      "other_sync_calls": 2,
+      "other_sync_ns": 12016208,
+      "wal_append_bytes": 0,
+      "wal_append_ns": 0,
+      "wal_flush_ns": 0
+    },
+    "uncommitted_tail": false
+  },
+  "readonly_after_gc": {
+    "revision_count_and_byte_budget_after_gc": true,
+    "readonly_write_rejected": true
+  },
+  "resource_fork": {
+    "before_small": {
+      "filesystem": "forkfs",
+      "bytes": 32768,
+      "cases": [
+        {
+          "target": "path",
+          "position": 0,
+          "capacity": 32768,
+          "returned_bytes": 32768,
+          "matches": true
+        },
+        {
+          "target": "path",
+          "position": 0,
+          "capacity": 17,
+          "errno": 34
+        },
+        {
+          "target": "path",
+          "position": 1,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "path",
+          "position": 32767,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "path",
+          "position": 32768,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "path",
+          "position": 32769,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "fd",
+          "position": 0,
+          "capacity": 32768,
+          "returned_bytes": 32768,
+          "matches": true
+        },
+        {
+          "target": "fd",
+          "position": 0,
+          "capacity": 17,
+          "errno": 34
+        },
+        {
+          "target": "fd",
+          "position": 1,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "fd",
+          "position": 32767,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "fd",
+          "position": 32768,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "fd",
+          "position": 32769,
+          "capacity": 17,
+          "errno": 22
+        }
+      ],
+      "copy": {
+        "returncode": 1,
+        "stderr": "cp: /private/tmp/resource-mount.6idle9ns/mounted/forkfs-resource-probe-eehddnz9/file: could not copy extended attributes to /private/tmp/resource-mount.6idle9ns/mounted/forkfs-resource-probe-eehddnz9/copy: Invalid argument\n",
+        "destination_value_matches": true
+      },
+      "source_unchanged": true
+    },
+    "limited_flag_false": {
+      "filesystem": "forkfs",
+      "bytes": 32768,
+      "cases": [
+        {
+          "target": "path",
+          "position": 0,
+          "capacity": 32768,
+          "returned_bytes": 32768,
+          "matches": true
+        },
+        {
+          "target": "path",
+          "position": 0,
+          "capacity": 17,
+          "errno": 34
+        },
+        {
+          "target": "path",
+          "position": 1,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "path",
+          "position": 32767,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "path",
+          "position": 32768,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "path",
+          "position": 32769,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "fd",
+          "position": 0,
+          "capacity": 32768,
+          "returned_bytes": 32768,
+          "matches": true
+        },
+        {
+          "target": "fd",
+          "position": 0,
+          "capacity": 17,
+          "errno": 34
+        },
+        {
+          "target": "fd",
+          "position": 1,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "fd",
+          "position": 32767,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "fd",
+          "position": 32768,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "fd",
+          "position": 32769,
+          "capacity": 17,
+          "errno": 22
+        }
+      ],
+      "copy": {
+        "returncode": 1,
+        "stderr": "cp: /private/tmp/resource-mount.6idle9ns/mounted/forkfs-resource-probe-85jf_so_/file: could not copy extended attributes to /private/tmp/resource-mount.6idle9ns/mounted/forkfs-resource-probe-85jf_so_/copy: Invalid argument\n",
+        "destination_value_matches": true
+      },
+      "source_unchanged": true
+    },
+    "experimental_flag_tree": "5dbb940c2c9af3638e0b10497643bb54d3e13c86",
+    "flag_experiment_included_in_published_code": false,
+    "final_large": {
+      "filesystem": "forkfs",
+      "bytes": 262143,
+      "cases": [
+        {
+          "target": "path",
+          "position": 0,
+          "capacity": 262143,
+          "returned_bytes": 262143,
+          "matches": true
+        },
+        {
+          "target": "path",
+          "position": 0,
+          "capacity": 17,
+          "errno": 34
+        },
+        {
+          "target": "path",
+          "position": 1,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "path",
+          "position": 262142,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "path",
+          "position": 262143,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "path",
+          "position": 262144,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "fd",
+          "position": 0,
+          "capacity": 262143,
+          "returned_bytes": 262143,
+          "matches": true
+        },
+        {
+          "target": "fd",
+          "position": 0,
+          "capacity": 17,
+          "errno": 34
+        },
+        {
+          "target": "fd",
+          "position": 1,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "fd",
+          "position": 262142,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "fd",
+          "position": 262143,
+          "capacity": 17,
+          "errno": 22
+        },
+        {
+          "target": "fd",
+          "position": 262144,
+          "capacity": 17,
+          "errno": 22
+        }
+      ],
+      "copy": {
+        "returncode": 1,
+        "stderr": "cp: /private/tmp/resource-mount.6idle9ns/mounted/forkfs-resource-probe-zwpaxi2k/file: could not copy extended attributes to /private/tmp/resource-mount.6idle9ns/mounted/forkfs-resource-probe-zwpaxi2k/copy: Invalid argument\n",
+        "destination_value_matches": true
+      },
+      "source_unchanged": true
+    },
+    "apfs_small": {
+      "filesystem": "apfs",
+      "bytes": 32768,
+      "cases": [
+        {
+          "target": "path",
+          "position": 0,
+          "capacity": 32768,
+          "returned_bytes": 32768,
+          "matches": true
+        },
+        {
+          "target": "path",
+          "position": 0,
+          "capacity": 17,
+          "returned_bytes": 17,
+          "matches": true
+        },
+        {
+          "target": "path",
+          "position": 1,
+          "capacity": 17,
+          "returned_bytes": 17,
+          "matches": true
+        },
+        {
+          "target": "path",
+          "position": 32767,
+          "capacity": 17,
+          "returned_bytes": 1,
+          "matches": true
+        },
+        {
+          "target": "path",
+          "position": 32768,
+          "capacity": 17,
+          "returned_bytes": 0,
+          "matches": true
+        },
+        {
+          "target": "path",
+          "position": 32769,
+          "capacity": 17,
+          "returned_bytes": 0,
+          "matches": true
+        },
+        {
+          "target": "fd",
+          "position": 0,
+          "capacity": 32768,
+          "returned_bytes": 32768,
+          "matches": true
+        },
+        {
+          "target": "fd",
+          "position": 0,
+          "capacity": 17,
+          "returned_bytes": 17,
+          "matches": true
+        },
+        {
+          "target": "fd",
+          "position": 1,
+          "capacity": 17,
+          "returned_bytes": 17,
+          "matches": true
+        },
+        {
+          "target": "fd",
+          "position": 32767,
+          "capacity": 17,
+          "returned_bytes": 1,
+          "matches": true
+        },
+        {
+          "target": "fd",
+          "position": 32768,
+          "capacity": 17,
+          "returned_bytes": 0,
+          "matches": true
+        },
+        {
+          "target": "fd",
+          "position": 32769,
+          "capacity": 17,
+          "returned_bytes": 0,
+          "matches": true
+        }
+      ],
+      "copy": {
+        "returncode": 0,
+        "stderr": "",
+        "destination_value_matches": true
+      },
+      "source_unchanged": true
+    },
+    "apfs_large": {
+      "filesystem": "apfs",
+      "bytes": 262143,
+      "cases": [
+        {
+          "target": "path",
+          "position": 0,
+          "capacity": 262143,
+          "returned_bytes": 262143,
+          "matches": true
+        },
+        {
+          "target": "path",
+          "position": 0,
+          "capacity": 17,
+          "returned_bytes": 17,
+          "matches": true
+        },
+        {
+          "target": "path",
+          "position": 1,
+          "capacity": 17,
+          "returned_bytes": 17,
+          "matches": true
+        },
+        {
+          "target": "path",
+          "position": 262142,
+          "capacity": 17,
+          "returned_bytes": 1,
+          "matches": true
+        },
+        {
+          "target": "path",
+          "position": 262143,
+          "capacity": 17,
+          "returned_bytes": 0,
+          "matches": true
+        },
+        {
+          "target": "path",
+          "position": 262144,
+          "capacity": 17,
+          "returned_bytes": 0,
+          "matches": true
+        },
+        {
+          "target": "fd",
+          "position": 0,
+          "capacity": 262143,
+          "returned_bytes": 262143,
+          "matches": true
+        },
+        {
+          "target": "fd",
+          "position": 0,
+          "capacity": 17,
+          "returned_bytes": 17,
+          "matches": true
+        },
+        {
+          "target": "fd",
+          "position": 1,
+          "capacity": 17,
+          "returned_bytes": 17,
+          "matches": true
+        },
+        {
+          "target": "fd",
+          "position": 262142,
+          "capacity": 17,
+          "returned_bytes": 1,
+          "matches": true
+        },
+        {
+          "target": "fd",
+          "position": 262143,
+          "capacity": 17,
+          "returned_bytes": 0,
+          "matches": true
+        },
+        {
+          "target": "fd",
+          "position": 262144,
+          "capacity": 17,
+          "returned_bytes": 0,
+          "matches": true
+        }
+      ],
+      "copy": {
+        "returncode": 0,
+        "stderr": "",
+        "destination_value_matches": true
+      },
+      "source_unchanged": true
+    }
+  },
+  "sha256": {
+    "daemon": "01e05aaf109aae99032f29491c9455a69ca89d2bdb3ea7a924d87296029c69a6",
+    "installed_signed_extension": "e80e7928e71b2602d7b45b369d10d9d529fabf8a403090e54557fdfe02ecf649",
+    "capacity_script": "c13a61fa02e419ac7d2f2586e8e2615eb6edccb8bf1a2962cf27fe8c3f8bef7f",
+    "resource_probe_script": "5da377d9b4065641c494fc576d2cd70d3331b33b44cc07b208d66f49b719ec42"
+  },
+  "installed_signature_deep_strict_verified": true,
+  "limits": [
+    "8 MiB is a per-inode logical value budget, not deduplicated physical usage, reservation or repository quota. Count/byte rejections precede publication; shrinking/removal allows retry without reopening storage.",
+    "Existing <=32-name, <=262143-byte-per-value inodes fit the new budget. Older daemons reject attribute lists/verification above 32 names.",
+    "Indexed object sizes avoid reading payloads for accounting; old unindexed and legacy stores may require payload reads.",
+    "ResourceFork partial/position/EOF reads remain incompatible on the tested FSKit path. Whole reads succeed; cp -p reports EINVAL after destination payload can already match. APFS passes the same range/EOF/copy cases.",
+    "Changing supportsLimitedXAttrs produced no range/copy improvement; the experimental declaration is excluded. Current public xattr callbacks expose no range argument. No full resource-fork stream or full POSIX/APFS compatibility claim."
+  ]
+}

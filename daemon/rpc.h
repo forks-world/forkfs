@@ -31,7 +31,7 @@ inline int rpc_posix_error(std::string_view message) {
     }
     if(message=="extended attribute exceeds 64 KiB" || message=="extended attribute exceeds 262143 bytes")return E2BIG;
     if(message=="extended attribute name exceeds 255 bytes")return ENAMETOOLONG;
-    if(message=="extended attribute count limit reached")return ENOSPC;
+    if(message=="extended attribute count limit reached" || message=="extended attribute storage limit reached")return ENOSPC;
     if(message=="object root not found")return ENOENT;
     if(message=="path exceeds mount protocol limit")return ENAMETOOLONG;
     if(message=="path not found" || message=="source not found")return ENOENT;

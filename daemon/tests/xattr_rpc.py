@@ -59,6 +59,12 @@ for binary in [BIN,LEGACY]:
                 rpc('inode-xattr-set',fid,'n'*256,'upsert',b'',*sel,code=errno.ENAMETOOLONG+1)
                 rpc('inode-xattr-set',fid,b'bad\xff','upsert',b'',*sel,code=errno.EINVAL+1)
                 rpc('fs-xattr-set','/f','foreign','upsert',b'',code=errno.EBUSY+1)
+                names=json.loads(rpc('inode-xattr-list',fid,*sel))['names']
+                for i in range(128-len(names)):
+                    rpc('inode-xattr-set',fid,'count'+str(i),'create',b'',*sel)
+                rpc('inode-xattr-set',fid,'count-overflow','create',b'',*sel,code=errno.ENOSPC+1)
+                assert len(json.loads(rpc('inode-xattr-list',fid,*sel))['names'])==128
+                rpc('inode-xattr-remove',fid,'count0',*sel)
                 handle=json.loads(rpc('inode-open',fid,'r',*sel))['handle'];rpc('inode-remove',rid,'f',fid,'file',*sel)
                 assert rpc('fs-hxattr-get',handle,'binary',*sel)==payload
                 assert rpc('fs-hxattr-get',handle,'big',*sel)==large

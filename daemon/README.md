@@ -108,7 +108,7 @@ Paths address the final inode without following its final symlink. Regular files
 directories and symlinks have independent xattrs; hardlinks share their inode's
 attributes. Names are 1..255 bytes of valid UTF-8, without normalization, excluding
 C0/DEL/C1 controls. A value can be empty or binary, up to 262,143 bytes, and an inode can
-have at most 32 attributes. Native macOS may impose tighter name restrictions.
+have at most 128 attributes. Native macOS may impose tighter name restrictions.
 Set policy is mandatory: `upsert`, `create` (EEXIST if present), or `replace`
 (ENOATTR/ENODATA if absent). Removing a missing name also fails. Invalid input
 and quota failures publish no partial changes.
@@ -133,8 +133,16 @@ The shared daemon/FSKit limit is 262,143 bytes per value, including whole-value
 `com.apple.ResourceFork` operations. Values remain single immutable objects;
 this does not provide arbitrarily large or streamed resource forks. Native
 ResourceFork `cp -p` and position reads still fail with EINVAL on the tested macOS
-27.2 mount; ordinary large xattrs copy successfully. The 32-name
-limit per inode remains. Existing values up to 64 KiB need no rewrite. Older
+27.2 mount; ordinary large xattrs copy successfully. The per-inode limit is 128 names and 8 MiB of raw value bytes. Names include
+system-added attributes such as `com.apple.provenance`. Equal content IDs count
+separately per name. This logical metadata budget bounds updates; it is not an
+exclusive disk-usage bill or reserved host capacity. Both count and byte-budget
+validation failures return ENOSPC without poisoning storage, so freeing a slot
+or reducing a value allows an immediate retry. Length accounting uses immutable
+object-size indexes, with verified payload fallback for old unindexed objects.
+Existing repositories with at most 32 values of at most 262,143 bytes fit the new
+budget. Older daemons reject lists/verification above 32 names; use the updated
+daemon after expanding an inode's attribute set. Existing values up to 64 KiB need no rewrite. Older
 daemons/frontends reject larger values; use the updated pair for repositories
 containing them. No inode/manifest encoding or repository format change is
 introduced by this bound increase. Updates still publish the complete value and

@@ -46,9 +46,35 @@ static void large_values(const std::string& path,bool legacy){
     }
     {Container store(path);Namespace old(store,"large",true);check(old.get_xattr("/alias","com.apple.ResourceFork")==value);old.verify();store.verify();}
 }
+static void attribute_capacity(const std::string& path,bool legacy){
+    if(legacy)Container::create_legacy(path);else Container::create(path);
+    {Container store(path);Namespace fs(store);fs.initialize();fs.write("/count",{});
+        for(size_t i=0;i<Namespace::maximum_xattr_count;++i)fs.set_xattr("/count","a"+std::to_string(i),{});
+        check(fs.list_xattrs("/count").size()==Namespace::maximum_xattr_count);auto stable=store.status();
+        rejects([&]{fs.set_xattr("/count","overflow",{});});check(store.status()==stable);
+        fs.set_xattr("/count","a0",Bytes{1},Namespace::XattrPolicy::Replace);fs.snapshot("count");fs.verify();store.verify();}
+    {Container store(path);Namespace fs(store,"count",true);check(fs.list_xattrs("/count").size()==Namespace::maximum_xattr_count);fs.verify();}
+}
+static void attribute_budget(const std::string& path){
+    Container::create(path);
+    {Container store(path);Namespace fs(store);fs.initialize();fs.write("/budget",{});
+        // Equal immutable payload IDs still consume the per-name logical budget.
+        Bytes large(forkfs::maximum_xattr_bytes,0x5a);
+        for(unsigned i=0;i<32;++i)fs.set_xattr("/budget","large"+std::to_string(i),large);
+        fs.set_xattr("/budget","pad",Bytes(32));fs.snapshot("full");auto stable=store.status();
+        rejects([&]{fs.set_xattr("/budget","extra",Bytes{1});});check(store.status()==stable);
+        auto fd=fs.open("/budget");fs.remove("/budget",false);stable=store.status();
+        rejects([&]{fs.handle_set_xattr(fd,"extra",Bytes{1});});check(store.status()==stable);
+        fs.handle_set_xattr(fd,"pad",Bytes(31));fs.handle_set_xattr(fd,"extra",Bytes{1});
+        check(fs.handle_get_xattr(fd,"extra")==Bytes{1});Namespace old(store,"full",true);
+        check(old.get_xattr("/budget","pad")==Bytes(32));rejects([&]{old.get_xattr("/budget","extra");});
+        fs.verify();old.verify();fs.close(fd);store.collect_garbage();store.verify();}
+    {Container store(path);Namespace old(store,"full",true);check(old.list_xattrs("/budget").size()==33);old.verify();}
+}
 int main(){
     char pattern[]="/tmp/ff-attr-XXXXXX";auto tmp=mkdtemp(pattern);if(!tmp)return 1;auto path=std::string(tmp)+"/db";
     try {
+        attribute_capacity(path+"-count",false);attribute_capacity(path+"-count-legacy",true);attribute_budget(path+"-budget");
         large_values(path+"-large",false);large_values(path+"-legacy",true);
         attribute_identity(path+"-identity");Container::create(path);
         {
@@ -69,12 +95,12 @@ int main(){
             rejects([&]{old.set_xattr("/file","new",{});});rejects([&]{old.remove_xattr("/file","user.test");});
             work.snapshot("changed");auto diff=fs.diff("base","changed");
             check(diff.find("\"xattrs_changed\":true")!=diff.npos && diff.find("\"content_changed\":true")==diff.npos);
-            fs.write("/quota",{});for(unsigned i=0;i<32;++i)fs.set_xattr("/quota","a"+std::to_string(i),Bytes{static_cast<unsigned char>(i)});
+            fs.write("/quota",{});for(unsigned i=0;i<Namespace::maximum_xattr_count;++i)fs.set_xattr("/quota","a"+std::to_string(i),Bytes{static_cast<unsigned char>(i)});
             stable=store.status();rejects([&]{fs.set_xattr("/quota","overflow",{});});rejects([&]{fs.set_xattr("/quota","a0",Bytes(forkfs::maximum_xattr_bytes+1));});
             for(const auto& name:std::vector<std::string>{"",std::string(256,'n'),std::string("bad\0name",8),std::string("\xc0\x80",2)})rejects([&]{fs.set_xattr("/quota",name,{});});
             check(store.status()==stable);fs.set_xattr("/quota","a0",Bytes(forkfs::maximum_xattr_bytes,0xff),Namespace::XattrPolicy::Replace);check(fs.get_xattr("/quota","a0")==Bytes(forkfs::maximum_xattr_bytes,0xff));
-            fs.remove_xattr("/quota","a1");fs.set_xattr("/quota",std::string(255,'n'),{});check(fs.list_xattrs("/quota").size()==32);
-            auto quota=fs.open("/quota",Namespace::Access::Read);fs.remove("/quota",false);check(fs.handle_list_xattrs(quota).size()==32);fs.verify();fs.close(quota);
+            fs.remove_xattr("/quota","a1");fs.set_xattr("/quota",std::string(255,'n'),{});check(fs.list_xattrs("/quota").size()==Namespace::maximum_xattr_count);
+            auto quota=fs.open("/quota",Namespace::Access::Read);fs.remove("/quota",false);check(fs.handle_list_xattrs(quota).size()==Namespace::maximum_xattr_count);fs.verify();fs.close(quota);
             auto handle=fs.open("/file",Namespace::Access::Read);fs.remove("/file",false);fs.remove("/alias",false);
             check(fs.handle_get_xattr(handle,"user.test")==binary);fs.handle_set_xattr(handle,"user.test",Bytes{'O'});fs.handle_remove_xattr(handle,"user.test");
             check(fs.handle_list_xattrs(handle).empty() && !fs.handle_stat(handle).xattrs);fs.handle_set_xattr(handle,"new.orphan",{});

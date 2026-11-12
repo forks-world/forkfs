@@ -37,7 +37,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `link/symlink/readlink`、dangling symlink、`O_SYMLINK` | createLink/createSymbolicLink/readSymbolicLink | 挂载已测；包含链接身份、nofollow 时间/模式、`cp -Pp` 和二进制 xattr |
 | `readdir/getdirentries`、目录游标与属性 | enumerateDirectory → captured cursor | 基础挂载已测、游标 RPC 已测；单目录最多 65,536 项，64 个流，变更中遍历压力未验收 |
 | UTF-8、大小写、NFC/NFD、长名字 | FSFileName → namespace validation | 挂载已测；区分大小写及 NFC/NFD，255 字节/组件、4096 字节/路径；非法 UTF-8/控制符拒绝 |
-| `get/set/list/remove xattr`、fd/nofollow xattr | XattrOperations | 挂载已测；每值 262143 字节、每 inode 32 项；ResourceFork 整值已测，`cp -p`/位置读取仍 EINVAL，不能称完整 fork 兼容 |
+| `get/set/list/remove xattr`、fd/nofollow xattr | XattrOperations | 挂载已测；每值 262143 字节、每 inode 128 项、总值 8 MiB；ResourceFork 整值已测，`cp -p`/位置读取仍 EINVAL，不能称完整 fork 兼容 |
 | `mmap(MAP_SHARED/MAP_PRIVATE)`、`msync`、`munmap` | 内核缓存 + ReadWriteOperations | macOS 27.2 单挂载已测；映射/`pread/pwrite` 一致性、private 隔离、open-unlink、flush 后 revision 隔离 |
 | `fcntl(F_SETLK)`、`flock` | 内核原生 advisory locks；与 RPC 锁分开 | macOS 27.2 跨进程互斥、关闭/退出释放已测；byte-range 不相交范围可同时持有。共享锁/阻塞唤醒/信号打断未验收 |
 | `fsync`、目录同步、`F_FULLFSYNC`、断电恢复 | synchronize → inode-sync + 存储提交 | 基础文件 fsync/提交与 daemon 恢复已测；目录语义、全硬件屏障、断电/内核崩溃没有完整保证 |
@@ -139,7 +139,10 @@ WAL append/sync 的 ENOSPC、EDQUOT、EIO 另有注入测试；没有实现配�
 单值 xattr 上限扩展到 262143 字节（256 KiB 减 1 字节），在现有不可变对象上限内，并与 FSKit 的原生可用边界
 保持一致，旧的 64 KiB 值无需迁移。验收包含普通属性和 ResourceFork 的整值
 读写，以及普通大属性的 `cp -p`。ResourceFork 复制和位置读取实测 EINVAL，
-APFS 对照成功；这些仍是明确缺口。32 项数量上限仍在。
+APFS 对照成功；这些仍是明确缺口。数量上限现为 128 项，每 inode 总值预算 8 MiB，
+包含系统自动添加的属性；相同 payload ID 仍按每个属性名计入。预算 ENOSPC
+在发布前拒绝，释放名称/字节预算后可立即重试，不触发存储故障重开。
+见 [数量/预算和 ResourceFork EOF 证据](evidence/2026-11-12-xattr-capacity-resource-fork.json)。
 对照脚本与范围见 [大 xattr 验收](evidence/2026-11-12-large-xattrs.json)。
 
 ## 补全顺序与完成条件
@@ -153,7 +156,7 @@ APFS 对照成功；这些仍是明确缺口。32 项数量上限仍在。
    差异后分别修复 namespace、RPC 或 FSKit 层。明确 errno、失败不变性、readonly、
    revision/GC 后仍保持语义。rename 扩展需单独评估平台路线或明确兼容范围，
    不能当作普通 daemon 修复任务。
-2. **容量与大文件**：完善空间不足恢复，并解除 32 项 xattr、目录项上限中的应用阻断；
+2. **容量与大文件**：完善空间不足恢复，继续处理 128 项/8 MiB xattr 和目录项上限中的应用阻断；
    扩充更大密集文件的性能/内存资格、旧仓库冷查询性能、边界短写及空间不足故障组合、
    GC/重启和历史隔离验收。预分配必须兑现空间保证，不能只改逻辑长度。
 3. **元数据与安全**：设计持久 uid/gid、特殊模式位、ACL、file flags 的 revision
