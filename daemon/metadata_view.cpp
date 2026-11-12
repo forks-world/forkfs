@@ -27,6 +27,13 @@ void NamespaceView::valid_name(const std::string& name) {
         }),"invalid World/revision name");
 }
 NamespaceView::~NamespaceView()=default;
+uint64_t NamespaceView::allocated_bytes(const std::string& prefix,AllocationCache& cache) const {
+    if(tree_)return tree_->allocated_bytes(prefix,cache);
+    uint64_t result=0;for(const auto& key:keys(prefix)) {
+        auto length=journal_.object_size(*reference(key));auto rounded=((length+511)/512)*512;
+        need(rounded<=UINT64_MAX-result,"allocation size overflow");result+=rounded;
+    }return result;
+}
 NamespaceView::NamespaceView(const Journal& journal,const std::string& name,bool revision,bool validate_root):journal_(journal) {
     valid_name(name);
     legacy_=name=="main" && !revision && !journal.contains(history+"world/main");

@@ -10,6 +10,7 @@
 #include "journal.h"
 
 namespace forkfs {
+class AllocationCache;
 // Exclusive container owner; named-object journal is an experimental transaction profile.
 class Container {
 public:
@@ -20,6 +21,7 @@ public:
     Container(const Container&) = delete;
     Container& operator=(const Container&) = delete;
     std::string status() const;
+    bool requires_reopen() const {std::lock_guard lock(mutex_);return journal_->requires_reopen();}
     std::string space_json() const;
     const std::string& repository_id() const {return id_;}
     std::string storage_profile() const;
@@ -65,5 +67,6 @@ private:
     std::array<unsigned char,4096> anchor_{};
     uint64_t anchor_offset_ = 0;
     std::unique_ptr<Journal> journal_;
+    std::unique_ptr<AllocationCache> allocation_cache_;
 };
 }

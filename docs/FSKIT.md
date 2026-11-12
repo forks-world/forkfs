@@ -229,9 +229,9 @@ python3 scripts/tests/large_file_mount.py /path/to/mount --verify-report /tmp/la
 The script retains a named revision and removes its live scratch directory.
 It checks immediate EFBIG on oversized truncate and O_SYNC/F_NOCACHE writes;
 buffered writes may reach the kernel cache before a writeback error is reported.
-Applications must check write/fsync/close errors. Allocation size is currently
-synthesized from logical size, not accurate per-file physical usage. This is
-not preallocation or quota enforcement. Dense retirement now uses CoW range
+Applications must check write/fsync/close errors. Allocation size now counts
+stored data payloads rounded to 512 bytes per position, excluding holes. It is
+not exclusive physical repository usage, preallocation or quota enforcement. Dense retirement now uses CoW range
 removal and two orphan retention roots, rather than per-chunk root mutations;
 see [daemon limits](../daemon/README.md).
 Large inode records use FFINOD03; old daemons reject them. Full local evidence
@@ -255,6 +255,25 @@ Use a disposable repository: the live scratch directory is removed, but one
 explicitly named revision is retained. The suite reports object-root deltas;
 unsupported/failed operations return nonzero. It does not qualify a full 1 TiB
 dense workload. See [retirement evidence](evidence/2026-11-11-chunk-retirement.json).
+
+Allocation acceptance checks native `st_blocks`, `du`, hardlinks, orphan edits,
+zero writes and shrink/extend, then rechecks the retained sparse revision after
+GC and read-only remount. The disk-full reproducer fills only its own bounded
+256 MiB APFS image, checks ENOSPC and fail-closed keepalive/sync, frees reserve
+space, reopens the daemon and verifies atomic data/revision recovery:
+
+```sh
+python3 scripts/tests/allocation_mount.py /path/to/mount \
+  --daemon build/Release/daemon/forkfsd --socket /path/to/runtime/control.sock > /tmp/allocation.json
+# After unmount, offline GC, and mounting the reported revision read-only:
+python3 scripts/tests/allocation_mount.py /path/to/mount --verify-report /tmp/allocation.json
+python3 scripts/tests/revision_disk_full.py --run --daemon build/Release/daemon/forkfsd
+```
+
+Use disposable repositories. LevelDB `FFLDB002` stores object-length indexes;
+old `FFLDB001` repositories upgrade on their first successful ordinary transaction
+and older daemons then reject them. See [allocation and recovery details](../daemon/README.md#backed-data-allocation-and-storage-errors)
+and [acceptance evidence](evidence/2026-11-11-allocation-enospc.json).
 
 Linux continues to build the daemon without FSKit; enabling the option there is
 an explicit configuration error. CI builds the frontend and runs callback tests
