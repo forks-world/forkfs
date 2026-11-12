@@ -67,6 +67,9 @@ public:
     uint64_t append(const std::string& path,const std::vector<unsigned char>& value);
     void truncate(const std::string& path,uint64_t size);
     std::vector<unsigned char> read(const std::string& path) const;
+    // Query only: kernel/caller owns the file position. Data is conservative at 64 KiB chunk granularity.
+    uint64_t seek_region(const std::string& path,uint64_t offset,bool data) const;
+    uint64_t handle_seek_region(const std::string& handle,uint64_t offset,bool data) const;
     std::vector<unsigned char> read_at(const std::string& path,uint64_t offset,uint64_t count) const;
     std::vector<std::string> list(const std::string& path) const;
     InodeInfo stat(const std::string& path) const;

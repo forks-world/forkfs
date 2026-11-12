@@ -549,6 +549,38 @@ remain readable for small files. Shrinking to at most 64 MiB removes extended
 chunk keys and writes that inode as `FFINOD02` again; retained large revisions
 remain version 3 and still require a compatible daemon.
 
+## Sparse seek queries
+
+RPC provides `fs-seek-region PATH OFFSET data|hole` and session-owned
+`fs-hseek-region HANDLE OFFSET data|hole`, returning `{"offset":N}`.
+The mount uses `inode-seek-region INODE OFFSET data|hole HANDLE_OR_DASH`, with
+inode/handle pairing validation. These queries do not change daemon handle
+positions or inode timestamps. Native `lseek` updates the kernel fd position,
+shared by dup as usual. Both World and read-only revision queries are supported;
+unlinked handles use their retained inode/tree, even after path reuse.
+
+Inline files conservatively report all bytes as data. For chunked files, any
+stored chunk is reported as data for its complete 64 KiB interval (clipped to
+EOF), including zero padding beyond its trimmed payload. Missing chunk keys
+are holes; zero-elided chunks can become holes. Data search starts from the
+metadata key; hole search walks contiguous keys in pages of at most 128, without
+reading payloads or iterating over hole bytes. Historical flat/sorted-run views
+materialize their key list for compatibility and do not have the current CoW
+view's bounded tree traversal.
+
+Offsets at or beyond EOF, including offset zero in an empty file, return ENXIO
+for either query. A data search with no later data also returns ENXIO; a hole
+search with no earlier hole returns EOF. Invalid signed offsets or inode types
+are rejected. This requires no inode/store format change and does not reserve
+space or implement hole punching. Reported data ranges need not match APFS's
+allocation granularity and are not physical device extents.
+
+The FSKit SeekRegion handler is compiled with the macOS 27 SDK and used on
+macOS 27. The macOS 26 build retains its previous conservative kernel fallback;
+its public Operations API has no SeekRegion callback. Deploy the updated daemon
+and module together to use native sparse seeking. Native acceptance and commands
+are documented in [FSKIT.md](../docs/FSKIT.md#sparse-seek-regions).
+
 ## BSD metadata flags
 
 `fs-stat`, `fs-lstat` and handle/inode RPC attributes expose a numeric `flags`

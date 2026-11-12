@@ -57,6 +57,14 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         rpc('fs-close',readonly,*sel)
         rpc('fs-hwrite',handle,'0',b'abc\x00def',*sel)
         assert rpc('fs-hread',handle,'0','99',*sel)==b'abc\x00def'
+        assert obj('inode-seek-region',fid,'2','data',handle,*sel)['offset']==2
+        assert obj('inode-seek-region',fid,'0','hole','-',*sel)['offset']==7
+        rpc('inode-seek-region',fid,'7','data',handle,*sel,error=errno.ENXIO)
+        rpc('inode-seek-region',fid,'0','bad',handle,*sel,error=errno.EINVAL)
+        assert obj('fs-hseek-region',handle,'0','hole',*sel)['offset']==7
+        assert obj('fs-seek-region','/file','0','data',*sel)['offset']==0
+        rpc('inode-seek-region',rid,'0','data',handle,*sel,error=errno.EINVAL)
+        rpc('inode-seek-region',fid,'0','data','foreign',*sel,error=errno.EIO)
         rpc('inode-lookup',rid,'absent',*sel,error=errno.ENOENT)
         rpc('inode-rename',rid,'file',did,'moved',fid,'-',*sel)
         assert obj('inode-stat',fid,*sel)['inode_id']==fid

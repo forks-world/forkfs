@@ -478,3 +478,28 @@ directory/link/hardlink flags, cp preservation, unsupported-mask rejection,
 open-unlink/dup/path reuse and read-only GC/restart readback. It qualifies metadata
 hints, not Finder UI behavior, backup-tool policy or protection enforcement.
 See [flag acceptance evidence](evidence/2026-11-12-file-flags.json).
+
+### Sparse seek regions
+
+When built with SDK 27+, `RevisionVolume` also conforms to
+[`FSVolumeSeekRegionHandler`](https://developer.apple.com/documentation/fskit/fsvolume/seekregionhandler).
+Native `lseek(SEEK_DATA/SEEK_HOLE)` uses `inode-seek-region` with the open inode
+handle when present, retaining open-unlink identity. It does not require a
+migration of the other Operations callbacks; the combination is qualified on
+macOS 27.2.1. SDK 26 builds omit this protocol and retain conservative seeking.
+The updated daemon and module are required together.
+
+```sh
+python3 scripts/tests/seek_regions_mount.py /private/tmp --reference-apfs
+python3 scripts/tests/seek_regions_mount.py /path/to/mount \
+  --daemon build/Release/daemon/forkfsd --socket /path/to/runtime/control.sock > /tmp/seek.json
+# After unmount, offline GC and mounting the reported revision read-only:
+python3 scripts/tests/seek_regions_mount.py /path/to/mount --verify-report /tmp/seek.json
+```
+
+Use a disposable repository. All-hole, empty and 1 TiB sparse files, chunk key
+boundaries, EOF, fd position sharing, orphan writes and revision/GC readback are
+covered. Stored chunks conservatively report data for 64 KiB; inline files
+report all bytes as data. APFS can choose different interval boundaries. This
+adds neither preallocation nor hole punching, and does not describe physical
+storage extents. See [acceptance evidence](evidence/2026-11-12-seek-regions.json).

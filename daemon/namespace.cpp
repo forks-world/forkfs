@@ -269,6 +269,36 @@ public:
         uint64_t result=0;for(const auto& key:keys_(chunks_)){auto length=get(key).size();result+=((length+511)/512)*512;}
         return result;
     }
+    uint64_t seek_region(uint64_t offset,bool data) const {
+        need(!n_.directory && !n_.symlink,"invalid seek region inode type");
+        need(offset<=INT64_MAX,"invalid seek region offset");
+        if(offset>=n_.size)throw std::system_error(ENXIO,std::generic_category(),"no file region at or after offset");
+        if(!n_.chunked)return data?offset:n_.size;
+        auto index=offset/chunk_size;auto key=chunk_key(index);bool present=contains(key);
+        if(present==data)return offset;
+        // Seek over metadata leaves, never over hole bytes or payload objects.
+        auto page=[&](const std::string& after,size_t limit){
+            if(view_)return view_->page(chunks_,after,limit);
+            auto keys=keys_(chunks_);auto begin=std::upper_bound(keys.begin(),keys.end(),after);
+            auto end=begin+std::min<size_t>(limit,keys.end()-begin);return std::vector<std::string>(begin,end);
+        };
+        if(data){auto keys=page(key,1);if(!keys.empty()){
+                uint64_t next;need(parse_chunk_suffix(std::string_view(keys[0]).substr(chunks_.size()),next),"invalid file chunk index");
+                if(next*chunk_size<n_.size)return next*chunk_size;
+            }
+            throw std::system_error(ENXIO,std::generic_category(),"no data region at or after offset");
+        }
+        uint64_t next=index+1;
+        while(next*chunk_size<n_.size){
+            auto keys=page(key,128);if(keys.empty())return next*chunk_size;
+            for(const auto& candidate:keys){uint64_t found;
+                need(parse_chunk_suffix(std::string_view(candidate).substr(chunks_.size()),found),"invalid file chunk index");
+                if(found!=next)return next*chunk_size;
+                ++next;key=candidate;if(next*chunk_size>=n_.size)return n_.size;
+            }
+        }
+        return n_.size;
+    }
     Bytes read(uint64_t offset,uint64_t count) const {
         if(offset>=n_.size || count==0)return {};
         auto length=std::min(count,n_.size-offset);
@@ -788,6 +818,19 @@ Bytes Namespace::read_at(const std::string& path,uint64_t offset,uint64_t count)
     need(offset<=INT64_MAX,"file offset exceeds signed 64-bit range");
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=inode(view,resolve(view,path));
     need(!n.directory,"cannot read a directory");return FileContent(n,view).read(offset,count);
+}
+uint64_t Namespace::seek_region(const std::string& path,uint64_t offset,bool data) const {
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);
+    auto n=inode(view,resolve(view,path));return FileContent(n,view).seek_region(offset,data);
+}
+uint64_t Namespace::handle_seek_region(const std::string& token,uint64_t offset,bool data) const {
+    std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);const auto& j=*container_.journal_;
+    NamespaceView view(j,view_,revision_);
+    if(view.contains(inode_key(info.inode))){auto n=inode(view,info.inode);return FileContent(n,view).seek_region(offset,data);}
+    need(!revision_,"revision inode missing");auto pre=orphan_prefix(view_,info.inode);
+    auto n=decode_inode(j.get(pre+"inode"),info.inode,true);
+    if(auto retained=retained_orphan(j,pre))return FileContent(n,*retained).seek_region(offset,data);
+    return FileContent(n,j,pre).seek_region(offset,data);
 }
 std::vector<std::string> Namespace::list(const std::string& path) const {
     std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);auto id=resolve(j,path);

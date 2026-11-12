@@ -121,7 +121,12 @@ std::vector<std::string> NamespaceView::keys(const std::string& key_prefix) cons
     std::vector<std::string> result;for(const auto& [key,id]:selected)if(id)result.push_back(key);return result;
 }
 std::vector<std::string> NamespaceView::page(const std::string& prefix,const std::string& after,size_t limit) const {
-    need(bool(tree_),"paged directory enumeration requires a CoW tree");return tree_->page(prefix,after,limit);
+    if(tree_)return tree_->page(prefix,after,limit);
+    // Historical flat/sorted-run views have no tree cursor. Keep their read
+    // compatibility; active LevelDB views still use bounded tree traversal.
+    need(limit>=1 && limit<=1025,"invalid metadata page limit");
+    auto all=keys(prefix);auto begin=std::upper_bound(all.begin(),all.end(),after);
+    return {begin,begin+std::min<size_t>(limit,all.end()-begin)};
 }
 NamespaceView::Map NamespaceView::references() const {
     if(tree_)return tree_->entries();
