@@ -200,8 +200,10 @@ rewrite the root metadata of a read-only revision. The frontend is intended for 
 mount point; multi-user permissions and syscall cases beyond the local
 acceptance suite remain unqualified.
 
-Directory enumeration uses captured daemon cursors, retains at most 64 bounded
-streams and rejects directories exceeding 65,536 entries. Old/foreign cookies
+Directory enumeration uses captured daemon cursors and retains at most 64 streams,
+with one page of at most 512 captured entries per stream (plus two dot entries).
+It no longer imposes a 65,536-entry ceiling. Mount-lifetime file ID mappings still
+grow with the number of observed inodes; page bounds are not a total-memory bound. Old/foreign cookies
 fail with ESTALE. FSItem numbers are stable only for the mount lifetime;
 persistent object IDs are not advertised. Inode requests currently traverse the
 revision metadata to locate a linked inode, so large-tree performance is not
@@ -279,6 +281,36 @@ Linux continues to build the daemon without FSKit; enabling the option there is
 an explicit configuration error. CI builds the frontend and runs callback tests
 on macOS 26, alongside the daemon suite on Linux.
 
+
+
+### Large directory streams
+
+Enumeration keeps a captured daemon cursor open and reads pages as the native
+packer accepts entries. Cookies retain their snapshot across page boundaries,
+including attributes of subsequently unlinked entries. Backward cookies rewind
+and replay that same immutable cursor; they do not reopen the live directory.
+At most 64 streams remain; starting another evicts and closes the oldest cursor,
+and its old verifier fails with ESTALE. Session shutdown releases all cursors.
+This uses existing RPCs and does not change storage formats.
+
+```sh
+cmake --build build/Release --target forkfsd_directory_fixture
+# Must be a NEW disposable repository; count is bounded to 100000.
+build/Release/daemon/forkfsd_directory_fixture /private/tmp/owned-dir-test/repo 66000
+# Mount the repository with mount-forkfs.py, then:
+python3 scripts/tests/directory_scale_mount.py /path/to/mount --count 66000
+python3 scripts/tests/directory_scale_mount.py /private/tmp --count 66000 --reference-apfs
+# After unmount + offline GC, remount revision directory_base read-only and repeat.
+```
+
+The fixture retains `directory_base`; it never opens an existing repository.
+It seeds empty-file records in bounded metadata batches for enumeration testing;
+it does not qualify ordinary per-file create throughput.
+The native suite checks complete/unique readdir and scandir results, file types,
+backward telldir/seekdir and sampled metadata beyond the old ceiling. Direct
+callback tests separately cover captured later-page deletion, backward/forward
+cookies, EOF, invalid cookies and cursor eviction. See
+[acceptance evidence](evidence/2026-11-12-directory-streams.json).
 
 ## OS acceptance and remaining qualification
 

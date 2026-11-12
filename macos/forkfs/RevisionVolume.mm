@@ -46,7 +46,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
     NSRecursiveLock* _lock;
     NSMutableDictionary<NSString*,RevisionItem*>* _items;
     NSMutableDictionary<NSString*,NSNumber*>* _numbers;
-    NSMutableDictionary<NSNumber*,NSDictionary*>* _streams;
+    NSMutableDictionary<NSNumber*,NSMutableDictionary*>* _streams;
     uint64_t _nextItem,_nextStream;
     std::string _socket;
     forkfs::LoopbackEndpoint _loopback;
@@ -250,29 +250,50 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
             else{NSMutableDictionary* a=[replaced.attrs mutableCopy];auto links=[a[@"links"] unsignedLongLongValue];a[@"links"]=@(itemType(a)==FSItemTypeDirectory?0:links-1);replaced.attrs=a;}}
     }];reply(e?nil:newName,e);
 }
+- (void)loadDirectoryPage:(NSMutableDictionary*)stream directory:(RevisionItem*)dir {
+    uint64_t start=[stream[@"start"] unsignedLongLongValue]+[stream[@"entries"] count];
+    NSDictionary* page=[self json:@[@"fs-dir-entries",stream[@"cursor"],@"512"]];NSArray* values=page[@"entries"];
+    require([values isKindOfClass:NSArray.class] && values.count<=512 && page[@"eof"]!=nil,EPROTO,"invalid directory page");
+    NSMutableArray* entries=[values mutableCopy];
+    if(start==0 && [stream[@"dots"] boolValue]){
+        [entries insertObject:@{@"dotID":@(dir.parent),@"name":@".."} atIndex:0];
+        [entries insertObject:@{@"dotID":@(dir.number),@"name":@"."} atIndex:0];
+    }
+    require(entries.count>0 || [page[@"eof"] boolValue],EPROTO,"empty nonterminal directory page");
+    stream[@"start"]=@(start);stream[@"entries"]=entries;stream[@"eof"]=page[@"eof"];
+}
 - (void)enumerateDirectory:(FSItem*)directory startingAtCookie:(FSDirectoryCookie)cookie verifier:(FSDirectoryVerifier)verifier providingAttributes:(FSItemGetAttributesRequest*)attributes usingPacker:(FSDirectoryEntryPacker*)packer replyHandler:(void(^)(FSDirectoryVerifier,NSError*))reply {
-    __block FSDirectoryVerifier out=verifier;NSError* e=[self perform:^{auto dir=[self item:directory];NSArray* entries;
+    __block FSDirectoryVerifier out=verifier;NSError* e=[self perform:^{auto dir=[self item:directory];NSMutableDictionary* stream;
         BOOL withDots=attributes==nil && emitsDotEntriesWithoutAttributes();
-        if(cookie==FSDirectoryCookieInitial){require(_streams.count<64,EMFILE,"directory stream limit");
-            NSString* cursor=[self json:@[@"inode-dir-open",dir.inode]][@"cursor"];NSMutableArray* all=[NSMutableArray new];
-            @try {for(;;){NSDictionary* page=[self json:@[@"fs-dir-entries",cursor,@"512"]];NSArray* values=page[@"entries"];
-                require([values isKindOfClass:NSArray.class] && all.count+values.count+(withDots?2:0)<=65536,EOVERFLOW,"directory enumeration limit");[all addObjectsFromArray:values];if([page[@"eof"] boolValue])break;}}
-            @finally{[self json:@[@"fs-dir-close",cursor]];}
-            if(withDots){[all insertObject:@{@"dotID":@(dir.parent),@"name":@".."} atIndex:0];[all insertObject:@{@"dotID":@(dir.number),@"name":@"."} atIndex:0];}
-            out=_nextStream++;_streams[@(out)]=@{@"directory":dir.inode,@"entries":all,@"dots":@(withDots),@"attributes":@(attributes!=nil)};entries=all;
-        } else {NSDictionary* stream=_streams[@(verifier)];require([stream[@"directory"] isEqual:dir.inode],ESTALE,"directory cookie belongs to another inode");
-            require([stream[@"dots"] boolValue]==withDots && [stream[@"attributes"] boolValue]==(attributes!=nil),ESTALE,"directory cookie mode changed");entries=stream[@"entries"];}
-        require(entries!=nil && cookie<=entries.count,ESTALE,"invalid directory cookie");
-        for(NSUInteger index=cookie;index<entries.count;++index){NSDictionary* entry=entries[index];BOOL dot=entry[@"dotID"]!=nil;
+        if(cookie==FSDirectoryCookieInitial){
+            // Retain at most 64 immutable daemon cursors, one page per stream.
+            // Evicted verifiers fail explicitly; they never restart on live data.
+            if(_streams.count>=64){NSNumber* oldest=[[_streams.allKeys sortedArrayUsingSelector:@selector(compare:)] firstObject];
+                [self json:@[@"fs-dir-close",_streams[oldest][@"cursor"]]];[_streams removeObjectForKey:oldest];}
+            NSString* cursor=[self json:@[@"inode-dir-open",dir.inode]][@"cursor"];
+            stream=[@{@"directory":dir.inode,@"cursor":cursor,@"dots":@(withDots),@"attributes":@(attributes!=nil),@"start":@0,@"entries":@[]} mutableCopy];
+            try{[self loadDirectoryPage:stream directory:dir];}catch(...){try{[self json:@[@"fs-dir-close",cursor]];}catch(...){}throw;}
+            out=_nextStream++;_streams[@(out)]=stream;
+        } else {stream=_streams[@(verifier)];require([stream[@"directory"] isEqual:dir.inode],ESTALE,"directory cookie belongs to another inode");
+            require([stream[@"dots"] boolValue]==withDots && [stream[@"attributes"] boolValue]==(attributes!=nil),ESTALE,"directory cookie mode changed");
+            if(cookie<[stream[@"start"] unsignedLongLongValue]){
+                [self json:@[@"fs-dir-rewind",stream[@"cursor"]]];stream[@"start"]=@0;stream[@"entries"]=@[];
+                [self loadDirectoryPage:stream directory:dir];
+            }
+        }
+        uint64_t index=cookie;
+        for(;;){NSArray* entries=stream[@"entries"];uint64_t start=[stream[@"start"] unsignedLongLongValue],end=start+entries.count;
+            require(index>=start,ESTALE,"invalid directory cookie");
+            if(index>=end){if([stream[@"eof"] boolValue]){require(index==end,ESTALE,"invalid directory cookie");break;}
+                [self loadDirectoryPage:stream directory:dir];continue;}
+            NSDictionary* entry=entries[index-start];BOOL dot=entry[@"dotID"]!=nil;
             RevisionItem* it=nil;FSItemType type=FSItemTypeDirectory;FSItemID itemID;
             if(dot)itemID=(FSItemID)[entry[@"dotID"] unsignedLongLongValue];
             else {NSDictionary* snapshot=entry[@"inode"];type=itemType(snapshot);itemID=(FSItemID)[self numberForInode:snapshot[@"inode_id"]];
                 if(attributes){it=[RevisionItem new];it.inode=snapshot[@"inode_id"];it.number=itemID;it.parent=dir.number;it.attrs=snapshot;}}
             if(![packer packEntryWithName:[FSFileName nameWithString:entry[@"name"]] itemType:type itemID:itemID nextCookie:index+1 attributes:(attributes && it)?[self attributes:it]:nil])break;
+            ++index;
         }
-        // Bounded snapshots remain available for resumed cookies. Evict only when
-        // starting a later stream; old cookies then fail explicitly with ESTALE.
-        if(_streams.count>=64){NSNumber* oldest=[[_streams.allKeys sortedArrayUsingSelector:@selector(compare:)] firstObject];if(oldest.unsignedLongLongValue!=out)[_streams removeObjectForKey:oldest];}
     }];reply(out,e);
 }
 - (BOOL)isOpenCloseInhibited{return NO;}
