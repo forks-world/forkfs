@@ -71,6 +71,11 @@ with tempfile.TemporaryDirectory(prefix='ff-io-storage-', dir='/tmp') as tempora
                     rpc('inode-root', *selection)
                     handle = json.loads(rpc('fs-open', '/file', 'rw', *selection))['handle']
                     inode = json.loads(rpc('fs-hstat', handle, *selection))['inode_id']
+                    # Warm verified object/root caches and retained-view reads.
+                    assert rpc('fs-cat', '/file') == old
+                    assert rpc('fs-cat', '/file', '--revision', 'base') == old
+                    assert rpc('fs-hread', handle, 0, len(old), *selection) == old
+                    rpc('fs-cat', '/missing', code=1)  # Logical errors keep the existing generic contract.
                     assert not json.loads(rpc('status'))['requires_reopen']
                     armed.touch()
                     if operation == 'fs-hwrite':
@@ -79,12 +84,30 @@ with tempfile.TemporaryDirectory(prefix='ff-io-storage-', dir='/tmp') as tempora
                     else:
                         rpc(operation, inode, '-', 8192, '-', handle, *selection, code=storage_errno + 1)
                         expected = old + bytes(4096)
-                    assert json.loads(rpc('status'))['requires_reopen']
+                    failed = json.loads(rpc('status'))
+                    assert failed['requires_reopen']
+                    cached = json.loads(rpc('storage-profile'))['storage_metrics']
                     rpc('session-keepalive', session, code=errno.EIO + 1)
                     rpc('inode-sync', *selection, code=errno.EIO + 1)
                     armed.unlink()
-                    response = rpc('fs-hwrite', handle, 0, b'retry', *selection, code=1)
-                    assert b'requires reopen' in response
+                    for request in [
+                        ('fs-hwrite', handle, 0, b'retry', *selection),
+                        ('fs-hwriteback', handle, 0, b'retry', *selection),
+                        ('fs-htruncate', handle, 0, *selection),
+                        ('fs-hread', handle, 0, len(old), *selection),
+                        ('fs-hstat', handle, *selection),
+                        ('fs-cat', '/file'), ('fs-cat', '/file', '--revision', 'base'),
+                        ('fs-stat', '/file'), ('fs-ls', '/'), ('fs-check',),
+                        ('inode-stat', inode, *selection),
+                    ]:
+                        response = rpc(*request, code=errno.EIO + 1)
+                        assert b'requires reopen' in response
+                    after = json.loads(rpc('status'))
+                    for key in ['last_committed_seq', 'indexed_objects', 'object_roots']:
+                        assert after[key] == failed[key], (key, after, failed)
+                    assert after['requires_reopen'] and process.poll() is None
+                    profile = json.loads(rpc('storage-profile'))['storage_metrics']
+                    assert all(profile[key] == cached[key] for key in ['object_cache_hits', 'root_cache_hits'])
                 finally:
                     process.terminate()
                     process.wait(timeout=10)
@@ -104,4 +127,4 @@ with tempfile.TemporaryDirectory(prefix='ff-io-storage-', dir='/tmp') as tempora
                 command('fs-write', db, '/file', data)
                 assert command('fs-cat', db, '/file') == b'recovered'
                 assert not json.loads(command('check', db))['requires_reopen']
-    print('12 WAL append/sync error scenarios preserve errno, reject retries/keepalive, and recover atomic publications')
+    print('12 WAL append/sync scenarios preserve initial errno, return EIO after poison including warm caches, and recover atomic publications')

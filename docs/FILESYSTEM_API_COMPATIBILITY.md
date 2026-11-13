@@ -136,6 +136,18 @@ WAL append/sync 的 ENOSPC、EDQUOT、EIO 另有注入测试；没有实现配�
 完整断电资格。`FFLDB002` 索引升级后旧 daemon 会拒绝打开。
 见 [分配及空间不足证据](evidence/2026-11-11-allocation-enospc.json)。
 
+LevelDB 写失败后的失效检查现抛出明确的 EIO，普通 fs-* 的 handle/路径读取、
+写重试及保留 revision 读取均通过现有 errno+1 wire code 返回，不再混用通用
+错误码 1。首次写失败仍保留 ENOSPC/EDQUOT/EIO；移除故障注入并不修复已打开
+的失效实例，必须停止服务后重开。status/storage-profile 仍可诊断；失效后的
+拒绝不推进提交/对象/根计数，也不命中已预热的对象/根缓存。
+
+12 组 WAL append/sync × ENOSPC/EDQUOT/EIO × 写入/截断故障继续验证完整旧/新
+发布恢复和保留 revision 不变，存储单测另覆盖失效后的校验、压缩和 GC 拒绝。
+这是 daemon/C++ 和 RPC 的错误契约补全；原生前端此前已将同一通用异常映射为
+EIO，因此不提升原生同步故障传播或内核缓存失效的验收等级。见
+[存储失效 EIO 证据](evidence/2026-11-13-poisoned-store-eio.json)。
+
 2026-11-12 对最新 `main` 重新集成了 #100 的分配统计和存储故障处理，保留
 #99 的 flat 布局 open-unlink/rename 替换修复。#100 原先合入已完成主线合并的
 功能分支，因此单看 PR 的 merged 状态不足以证明功能进入主线。本次组合重新
