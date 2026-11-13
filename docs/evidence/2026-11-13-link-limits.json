@@ -141,11 +141,11 @@
     "Native acceptance covers private single-user macOS27.2.1 arm64 and listed operations, including EMLINK state immutability and capacity reuse. No full POSIX/APFS, multi-user or power-loss guarantee."
   ],
   "test_stability_followup": {
-    "tested_tree_before_evidence": "7aa7d8c7bea89b36a3ae966d504500f9e5e37d86",
     "link_limit_test_repetitions": 20,
     "failed": 0,
     "seconds": 8.18,
     "runtime_changes": false,
-    "change": "Assert exact EMLINK and stable committed sequence/object-root/object counts rather than whole status JSON, which contains asynchronous storage timing counters. Directory entries, capacity reuse, net-zero replacement and data/revision checks remain intact."
+    "change": "Assert exact EMLINK and stable committed sequence/object-root/object counts rather than whole status JSON, which contains asynchronous storage timing counters. Directory entries, capacity reuse, net-zero replacement and data/revision checks remain intact.",
+    "link_limit_test_source_sha256": "dfe3dc287f2db91dffa41044a1845d6eceff9040a61e187da67b77a9ad274a5d"
   }
 }
