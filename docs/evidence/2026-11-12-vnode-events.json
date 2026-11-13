@@ -1,0 +1,376 @@
+{
+  "schema": 1,
+  "date": "2026-11-12",
+  "base_commit": "c693901bd0c09bd63aa31a715f72545b25861201",
+  "source_tree_before_evidence": "2e793a8dad5be94fbbfabcba2e027489f3abbb4a",
+  "platform": "macOS-27.2.1-arm64-arm-64bit",
+  "implementation_changes": "None; script and documentation qualify existing kernel vnode events, not revision history or a notification RPC.",
+  "runtime": {
+    "daemon_production_source_paths_match_base": 20,
+    "module_matches_previously_qualified_main_metadata_flags_module": true,
+    "module_source_commit": "660baf4995859034672ee859a92d7dce76b43ef0",
+    "daemon_sha256": "a7a8f96f6800007d26bda0f0664bb2a3ece1a019f78ae3062ca53e5ab5001db3",
+    "installed_signed_extension_sha256": "2744053dec6895b53d067d84602630ef40d08fa8d64f5b4f46a3e6e4d458e612",
+    "installed_signature_deep_strict_verified": true
+  },
+  "apfs_reference": {
+    "schema": 1,
+    "platform": "macOS-27.2.1-arm64-arm-64bit",
+    "filesystem": "apfs",
+    "cases": {
+      "file-events": {
+        "status": "passed",
+        "details": {
+          "cross_process_append": [
+            "WRITE",
+            "EXTEND"
+          ],
+          "overwrite": [
+            "WRITE"
+          ],
+          "chmod": [
+            "ATTRIB"
+          ],
+          "link": [
+            "LINK"
+          ],
+          "unlink_alias": [
+            "LINK",
+            "DELETE"
+          ],
+          "rename": [
+            "RENAME"
+          ],
+          "unlink": [
+            "LINK",
+            "DELETE"
+          ],
+          "orphan_write": [
+            "WRITE",
+            "EXTEND"
+          ],
+          "path_reuse_isolated": true
+        }
+      },
+      "directory-events": {
+        "status": "passed",
+        "details": {
+          "create": [
+            "WRITE"
+          ],
+          "rename": [
+            "WRITE"
+          ],
+          "unlink": [
+            "WRITE"
+          ],
+          "mkdir": [
+            "WRITE",
+            "LINK"
+          ],
+          "rmdir": [
+            "WRITE",
+            "LINK"
+          ]
+        }
+      }
+    },
+    "limits": [
+      "live vnode watches only",
+      "events may coalesce",
+      "no FSEvents, recursive watch, revoke or revision replay qualification"
+    ]
+  },
+  "forkfs_native": {
+    "schema": 1,
+    "platform": "macOS-27.2.1-arm64-arm-64bit",
+    "filesystem": "forkfs",
+    "cases": {
+      "file-events": {
+        "status": "passed",
+        "details": {
+          "cross_process_append": [
+            "WRITE",
+            "EXTEND"
+          ],
+          "overwrite": [
+            "WRITE"
+          ],
+          "chmod": [
+            "ATTRIB"
+          ],
+          "link": [
+            "LINK"
+          ],
+          "unlink_alias": [
+            "LINK",
+            "DELETE"
+          ],
+          "rename": [
+            "RENAME"
+          ],
+          "unlink": [
+            "LINK",
+            "DELETE"
+          ],
+          "orphan_write": [
+            "WRITE",
+            "EXTEND"
+          ],
+          "path_reuse_isolated": true
+        }
+      },
+      "directory-events": {
+        "status": "passed",
+        "details": {
+          "create": [
+            "WRITE"
+          ],
+          "rename": [
+            "WRITE"
+          ],
+          "unlink": [
+            "WRITE"
+          ],
+          "mkdir": [
+            "WRITE",
+            "LINK"
+          ],
+          "rmdir": [
+            "WRITE",
+            "LINK"
+          ]
+        }
+      }
+    },
+    "limits": [
+      "live vnode watches only",
+      "events may coalesce",
+      "no FSEvents, recursive watch, revoke or revision replay qualification"
+    ]
+  },
+  "namespace_check_after_workers": {
+    "service": "forkfsd",
+    "state": "leveldb",
+    "storage_engine": "leveldb",
+    "repository_id": "91762e9c8aac91f0bb6ca8cb8dd4c4b5",
+    "degraded_anchor": false,
+    "mounted": false,
+    "transactions_supported": true,
+    "requires_reopen": false,
+    "last_committed_seq": 161,
+    "checkpoint_seq": 0,
+    "replayed_transactions": 0,
+    "indexed_objects": 2908,
+    "object_roots": 2789,
+    "compaction_running": false,
+    "compaction_queued": 0,
+    "compaction_active": false,
+    "compaction_completed": 0,
+    "compaction_races": 0,
+    "compaction_failures": 0,
+    "compaction_last_error": "",
+    "metadata_prepare_ns": 45049742,
+    "storage_metrics": {
+      "transactions": 160,
+      "prepare_ns": 12586623,
+      "write_ns": 524889002,
+      "wal_sync_calls": 160,
+      "wal_sync_ns": 507042249,
+      "other_sync_calls": 3,
+      "other_sync_ns": 13449041,
+      "wal_append_bytes": 1202260,
+      "wal_append_ns": 141572,
+      "wal_flush_ns": 7558843
+    },
+    "uncommitted_tail": false
+  },
+  "script_sha256": "c19cd53fdebd3574ceea8c5804297ea49d191b2b7d1fdbf30448b0ce9700812a",
+  "limits": [
+    "Native macOS 27.2.1 arm64, private single-user mount, small disposable repository. No macOS 26 native notification qualification.",
+    "Events can coalesce and include extra flags. Tests assert required flag coverage, watched fd identity, metadata/content and original-inode isolation; no event count/order guarantee.",
+    "FSEvents, recursive watching, NOTE_REVOKE/unmount, daemon death, historical replay, power loss and delivery latency under load remain unqualified.",
+    "An exploratory 66000-entry repository attempt exceeded worker deadlines during known metadata scan costs. It was stopped and is not a successful large-repository stress result; successful evidence uses a fresh small repository."
+  ],
+  "revalidation_after_child_environment_fix": {
+    "runtime_base_commit": "6b4be10d5d4cceb90bd7f9c6b0683d6a9e7de340",
+    "module_source_commit": "da278f1b6e502257faf4d9764f0c8638ec8b04cb",
+    "daemon_production_source_paths_match_runtime_base": 20,
+    "daemon_sha256": "acbd23fbf52a0c18be38a58b2b11cbb8a2194a24191d9a6f4a286ad249b06f6a",
+    "installed_signed_extension_sha256": "ed37c1a2a0c2d19ae7eb853a9be3eaf9ca48a0b43b5799d307a927594e640bde",
+    "script_sha256": "2973ba55edd1f061c75f99c0e4960e7c6c3cc6ba0a66239e1ef7d4a0d83d684d",
+    "apfs_reference": {
+      "schema": 1,
+      "platform": "macOS-27.2.1-arm64-arm-64bit",
+      "filesystem": "apfs",
+      "cases": {
+        "file-events": {
+          "status": "passed",
+          "details": {
+            "cross_process_append": [
+              "WRITE",
+              "EXTEND"
+            ],
+            "overwrite": [
+              "WRITE"
+            ],
+            "chmod": [
+              "ATTRIB"
+            ],
+            "link": [
+              "LINK"
+            ],
+            "unlink_alias": [
+              "LINK",
+              "DELETE"
+            ],
+            "rename": [
+              "RENAME"
+            ],
+            "unlink": [
+              "LINK",
+              "DELETE"
+            ],
+            "orphan_write": [
+              "WRITE",
+              "EXTEND"
+            ],
+            "path_reuse_isolated": true
+          }
+        },
+        "directory-events": {
+          "status": "passed",
+          "details": {
+            "create": [
+              "WRITE"
+            ],
+            "rename": [
+              "WRITE"
+            ],
+            "unlink": [
+              "WRITE"
+            ],
+            "mkdir": [
+              "WRITE",
+              "LINK"
+            ],
+            "rmdir": [
+              "WRITE",
+              "LINK"
+            ]
+          }
+        }
+      },
+      "limits": [
+        "live vnode watches only",
+        "events may coalesce",
+        "no FSEvents, recursive watch, revoke or revision replay qualification"
+      ]
+    },
+    "forkfs_native": {
+      "schema": 1,
+      "platform": "macOS-27.2.1-arm64-arm-64bit",
+      "filesystem": "forkfs",
+      "cases": {
+        "file-events": {
+          "status": "passed",
+          "details": {
+            "cross_process_append": [
+              "WRITE",
+              "EXTEND"
+            ],
+            "overwrite": [
+              "WRITE"
+            ],
+            "chmod": [
+              "ATTRIB"
+            ],
+            "link": [
+              "LINK"
+            ],
+            "unlink_alias": [
+              "LINK",
+              "DELETE"
+            ],
+            "rename": [
+              "RENAME"
+            ],
+            "unlink": [
+              "LINK",
+              "DELETE"
+            ],
+            "orphan_write": [
+              "WRITE",
+              "EXTEND"
+            ],
+            "path_reuse_isolated": true
+          }
+        },
+        "directory-events": {
+          "status": "passed",
+          "details": {
+            "create": [
+              "WRITE"
+            ],
+            "rename": [
+              "WRITE"
+            ],
+            "unlink": [
+              "WRITE"
+            ],
+            "mkdir": [
+              "WRITE",
+              "LINK"
+            ],
+            "rmdir": [
+              "WRITE",
+              "LINK"
+            ]
+          }
+        }
+      },
+      "limits": [
+        "live vnode watches only",
+        "events may coalesce",
+        "no FSEvents, recursive watch, revoke or revision replay qualification"
+      ]
+    },
+    "namespace_check_after_workers": {
+      "service": "forkfsd",
+      "state": "leveldb",
+      "storage_engine": "leveldb",
+      "repository_id": "211bdc16fe2a7a8bad317ac38d8a8197",
+      "degraded_anchor": false,
+      "mounted": false,
+      "transactions_supported": true,
+      "requires_reopen": false,
+      "last_committed_seq": 36,
+      "checkpoint_seq": 0,
+      "replayed_transactions": 0,
+      "indexed_objects": 380,
+      "object_roots": 355,
+      "compaction_running": false,
+      "compaction_queued": 0,
+      "compaction_active": false,
+      "compaction_completed": 0,
+      "compaction_races": 0,
+      "compaction_failures": 0,
+      "compaction_last_error": "",
+      "metadata_prepare_ns": 2723042,
+      "storage_metrics": {
+        "transactions": 35,
+        "prepare_ns": 1017457,
+        "write_ns": 131280209,
+        "wal_sync_calls": 35,
+        "wal_sync_ns": 128936788,
+        "other_sync_calls": 3,
+        "other_sync_ns": 16669207,
+        "wal_append_bytes": 130169,
+        "wal_append_ns": 19076,
+        "wal_flush_ns": 1641461
+      },
+      "uncommitted_tail": false
+    },
+    "change": "Child HOME/TMPDIR now use an owned host temporary directory, keeping interpreter/xcrun startup caches off the measured filesystem. Original worker and child deadlines are unchanged. This is a test-isolation fix, not a notification implementation change."
+  }
+}

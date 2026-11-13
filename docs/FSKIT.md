@@ -432,6 +432,35 @@ repository changes. These checks supplement the kernel's prevalidation.
 See [namespace error evidence](evidence/2026-11-10-namespace-posix-errors.json)
 for the APFS comparison, native matrix and direct-RPC regression results.
 
+### Native vnode notifications
+
+The kernel already provides live kqueue `EVFILT_VNODE` notifications for the
+qualified mounted operations; this acceptance adds no notification RPC or
+persistent event log. Revision history does not replay these events. See
+[Apple's kqueue guide](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/FSEvents_ProgGuide/KernelQueues/KernelQueues.html).
+
+```sh
+python3 scripts/tests/vnode_events_mount.py /path/to/private/forkfs/mount
+python3 scripts/tests/vnode_events_mount.py /private/tmp --reference-apfs
+```
+
+The suite creates and removes an owned scratch directory. Each case runs in a
+bounded worker. The append child uses an owned host temporary HOME/TMPDIR so
+interpreter/xcrun startup caches do not add unrelated I/O to the watched mount.
+It tests cross-process append and overwrite (WRITE/EXTEND),
+chmod (ATTRIB), hardlink count changes (LINK), rename (RENAME), unlink (DELETE),
+parent-directory creation/rename/removal, and an unlinked fd whose watch remains
+attached to its original inode after pathname reuse. Assertions allow coalescing
+and extra documented flags; they do not demand event count/order. The watched
+fd remains open for the watch lifetime.
+
+Native macOS 27.2.1 arm64 and APFS reference passed on small disposable
+repositories. FSEvents, recursive watching, NOTE_REVOKE/unmount, daemon-death
+notification and delivery latency under load remain unqualified. An exploratory
+run on the 66,000-entry fixture exceeded worker deadlines amid known metadata
+scan costs; it is not a successful large-repository notification stress result.
+See [vnode notification evidence](evidence/2026-11-12-vnode-events.json).
+
 ### Large xattr acceptance
 
 The daemon and FSKit share a 262,143-byte whole-value limit. The frontend declares

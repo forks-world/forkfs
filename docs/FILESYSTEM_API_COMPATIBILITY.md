@@ -47,7 +47,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `chflags/fchflags/lchflags`、BSD flags | get/setAttributes → revision inode | 挂载已测 hidden/nodump 的路径/fd/nofollow、硬链接、cp -p、孤儿 fd 和历史隔离；immutable/append-only/nounlink/系统保护标记在修改前拒绝 |
 | `mkfifo/mknod`、Unix socket 路径 | create item types | 缺失；当前只支持 regular/directory/symlink，不适合依赖这些节点的运行目录 |
 | `copyfile/clonefile/fcopyfile/sendfile` | 内核 fallback 或可选复制能力 | 普通 `cp` 部分场景已测；CoW clone、资源 fork 大值、完整 copyfile flags、sendfile 未验收 |
-| `kqueue` vnode 通知、文件监控、FSEvents | 内核事件及卷能力 | 未验收；daemon revision history 不等于应用文件监控事件 |
+| `kqueue` vnode 通知、文件监控、FSEvents | 内核 vnode 事件 | macOS 27.2 小仓库已测 WRITE/EXTEND/ATTRIB/LINK/RENAME/DELETE、父目录事件、跨进程写及路径重用隔离；FSEvents、递归监控、revoke 未验收 |
 | 持久 file ID、file handles、卷改名、大小写折叠 | 可选卷能力/身份协议 | persistent IDs 未提供（不宣告）；ID 只在当前 mount 稳定；其余未提供/未验收 |
 
 当前类使用 macOS 26 的 Operations 协议，具体实现见
