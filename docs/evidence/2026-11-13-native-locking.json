@@ -1,0 +1,128 @@
+{
+  "schema": 1,
+  "date": "2026-11-13",
+  "platform": "macOS-27.2.1-arm64-arm-64bit",
+  "base_commit": "4005e3287f09ffcad514923792d543c8007f5a1a",
+  "source_tree_before_evidence": "a81679b878fab341bcada599c9e95b9fbfc6f260",
+  "runtime_implementation_changes": false,
+  "build_validation": {
+    "exact_base_daemon_and_frontend_built_isolated": true,
+    "non_documentation_source_paths_match_isolated_copy": 139,
+    "system_only_dependencies": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "configuration": "Release, Apple Clang, macOS27.2 SDK, WFS_FSKIT=ON; immutable git archive source, no .git/home/credentials/keychain, deny-default execution sandbox with loopback-only test transport."
+  },
+  "apfs_reference": {
+    "schema": 1,
+    "platform": "macOS-27.2.1-arm64-arm-64bit",
+    "filesystem": "apfs",
+    "cases": {
+      "flock": {
+        "status": "passed",
+        "details": {
+          "shared_coexistence_and_exclusive_conflict": true,
+          "blocking_waiter_awakened_by_unlock": true,
+          "last_description_close_releases": true,
+          "file_content_preserved": true
+        }
+      },
+      "lockf": {
+        "status": "passed",
+        "details": {
+          "shared_coexistence_and_exclusive_conflict": true,
+          "blocking_waiter_awakened_by_unlock": true,
+          "any_process_fd_close_releases": true,
+          "F_SETLKW_signal_EINTR_owner_lock_preserved": true,
+          "file_content_preserved": true
+        }
+      }
+    },
+    "limits": [
+      "native kernel locks, not daemon RPC locks",
+      "no fairness/deadlock/OFD-lock or distributed guarantee",
+      "single-user private mount, small files"
+    ]
+  },
+  "forkfs_native": {
+    "schema": 1,
+    "platform": "macOS-27.2.1-arm64-arm-64bit",
+    "filesystem": "forkfs",
+    "cases": {
+      "flock": {
+        "status": "passed",
+        "details": {
+          "shared_coexistence_and_exclusive_conflict": true,
+          "blocking_waiter_awakened_by_unlock": true,
+          "last_description_close_releases": true,
+          "file_content_preserved": true
+        }
+      },
+      "lockf": {
+        "status": "passed",
+        "details": {
+          "shared_coexistence_and_exclusive_conflict": true,
+          "blocking_waiter_awakened_by_unlock": true,
+          "any_process_fd_close_releases": true,
+          "F_SETLKW_signal_EINTR_owner_lock_preserved": true,
+          "file_content_preserved": true
+        }
+      }
+    },
+    "limits": [
+      "native kernel locks, not daemon RPC locks",
+      "no fairness/deadlock/OFD-lock or distributed guarantee",
+      "single-user private mount, small files"
+    ]
+  },
+  "namespace_check_after_cases": {
+    "service": "forkfsd",
+    "state": "leveldb",
+    "storage_engine": "leveldb",
+    "repository_id": "f76c103004212bef92e70d59af603410",
+    "degraded_anchor": false,
+    "mounted": false,
+    "transactions_supported": true,
+    "requires_reopen": false,
+    "last_committed_seq": 15,
+    "checkpoint_seq": 0,
+    "replayed_transactions": 0,
+    "indexed_objects": 151,
+    "object_roots": 144,
+    "compaction_running": false,
+    "compaction_queued": 0,
+    "compaction_active": false,
+    "compaction_completed": 0,
+    "compaction_races": 0,
+    "compaction_failures": 0,
+    "compaction_last_error": "",
+    "metadata_prepare_ns": 974166,
+    "storage_metrics": {
+      "transactions": 14,
+      "prepare_ns": 344043,
+      "write_ns": 57919083,
+      "wal_sync_calls": 14,
+      "wal_sync_ns": 57106249,
+      "other_sync_calls": 3,
+      "other_sync_ns": 15771416,
+      "wal_append_bytes": 50872,
+      "wal_append_ns": 11877,
+      "wal_flush_ns": 623084
+    },
+    "uncommitted_tail": false
+  },
+  "installed_signature_deep_strict_verified": true,
+  "sha256": {
+    "daemon": "bde69811b0c50ca80583fb927075ad6372cf1d65aa4d279d8d9f1bbe2d9475d6",
+    "installed_signed_extension": "25e729843aaa6cb3921ddfb84b36a4f27840159bfe780cc46f59ed2add8f53a2",
+    "manual_script": "667421ac8e297e947cf43d9797da828ad030e61d23b13bf23192b43c81897458"
+  },
+  "limits": [
+    "Only native kernel flock/classic fcntl-lockf semantics on the exact base revision module/daemon. No daemon RPC lock implementation changes or claims.",
+    "Workers use deadlines, explicit readiness/acquisition/release handshakes and a short observation window for blocking. The EINTR case uses one raw Darwin fcntl F_SETLKW call with SA_RESTART disabled, not an automatically restarted Python wrapper.",
+    "Small regular files on private single-user macOS27.2.1 arm64 mounts. No fairness, deadlock detection, OFD locks, distributed locks, arbitrary-load latency, multi-user behavior or power-loss qualification.",
+    "Locks are transient process/kernel state; there is no assertion that they persist through revisions, daemon restart or GC. File bytes remain unchanged by the advisory operations."
+  ]
+}

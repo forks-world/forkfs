@@ -432,6 +432,28 @@ repository changes. These checks supplement the kernel's prevalidation.
 See [namespace error evidence](evidence/2026-11-10-namespace-posix-errors.json)
 for the APFS comparison, native matrix and direct-RPC regression results.
 
+### Shared and blocking native locks
+
+```sh
+python3 scripts/tests/locking_mount.py /path/to/private/forkfs/mount
+python3 scripts/tests/locking_mount.py /private/tmp --reference-apfs
+```
+
+This creates and removes one owned scratch tree. Separate child processes use
+readiness/acquisition/release handshakes and deadlines to verify shared lock
+coexistence, exclusive conflicts, disjoint record ranges, and a blocked waiter
+awakening after unlock. It distinguishes flock's last-open-description-close
+behavior from classic lockf/fcntl's release on any close by the owning process.
+A raw ctypes F_SETLKW call (Darwin ABI, SA_RESTART disabled) verifies SIGUSR1
+interruption with EINTR and that the other process's owner lock remains held.
+Python wrappers may automatically retry EINTR, so they are not used for that
+single interrupted call. Signal handling does not change normal lock behavior.
+
+These are kernel advisory locks on a native FSKit mount, not daemon RPC locks.
+No fairness, deadlock detection, OFD locking, distributed locking, arbitrary load
+or multi-user qualification is claimed. See [acceptance evidence](evidence/2026-11-13-native-locking.json)
+and [Apple's fcntl semantics](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html).
+
 ### Native vnode notifications
 
 The kernel already provides live kqueue `EVFILT_VNODE` notifications for the
