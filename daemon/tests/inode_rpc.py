@@ -130,6 +130,25 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         rpc('fs-hwriteback',appender,'0',b'abc\x00defA',*sel)
         rpc('fs-hwrite',appender,'0',b'X',*sel,error=errno.EPERM)
         assert rpc('fs-hread',appender,'0','99',*sel)==b'abc\x00defA'
+        # CLI request must load binary file contents, never send its filename.
+        writeback_input=root/'writeback-input.bin';writeback_input.write_bytes(b'abc\x00defAB')
+        selected=['--world','main',*sel]
+        cli('request',endpoint,'fs-hwriteback',appender,'0',writeback_input,*selected)
+        assert rpc('fs-hread',appender,'0','99',*sel)==b'abc\x00defAB'
+        empty_input=root/'writeback-empty.bin';empty_input.write_bytes(b'')
+        before_cli=obj('status')['last_committed_seq']
+        cli('request',endpoint,'fs-hwriteback',appender,'9',empty_input,*sel)
+        assert obj('status')['last_committed_seq']==before_cli
+        bad_input=root/'writeback-bad.bin';bad_input.write_bytes(b'Xbc\x00defABC')
+        failed=subprocess.run([BIN,'request',str(endpoint),'fs-hwriteback',appender,'0',str(bad_input),*sel],capture_output=True,timeout=15)
+        assert failed.returncode!=0 and obj('status')['last_committed_seq']==before_cli
+        missing=subprocess.run([BIN,'request',str(endpoint),'fs-hwriteback',appender,'9',str(root/'missing-input'),*sel],capture_output=True,timeout=15)
+        assert missing.returncode!=0 and b'cannot open file input' in missing.stderr and obj('status')['last_committed_seq']==before_cli
+        oversized_input=root/'writeback-oversized.bin';oversized_input.write_bytes(b'X'*(256*1024+1))
+        oversized=subprocess.run([BIN,'request',str(endpoint),'fs-hwriteback',appender,'9',str(oversized_input),*sel],capture_output=True,timeout=15)
+        assert oversized.returncode!=0 and b'oversized file input' in oversized.stderr and obj('status')['last_committed_seq']==before_cli
+        assert rpc('fs-hread',appender,'0','99',*sel)==b'abc\x00defAB'
+
         rpc('fs-close',appender,*sel)
         obj('inode-setattr-flags',fid,'-','-','-','-','-','0',handle,*sel)
         rpc('fs-htruncate',handle,'7',*sel)

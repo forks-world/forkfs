@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "date": "2026-11-13",
+  "platform": "macOS27.2.1 arm64",
+  "base_commit": "41b29f9bfcc839b0d6ed28f3cd5f4cc0958a48ec",
+  "source_tree_before_evidence": "6f6727e98b02a0ec8c626cc03993d1ac589ed62a",
+  "baseline_reproduction": {
+    "runtime_tree": "765fb5f85725dc4be8465724ab5c954dbbe30294",
+    "source_tree_equals_base": true,
+    "result": "Existing CLI sends the input path as fs-hwriteback payload; valid NUL-containing append-only input is rejected with EPERM. The added CLI regression fails on that binary.",
+    "log_sha256": "54c5b991272967ffac0b4601b965228e967dc29b8cbcaf64321e108f894cb9ba"
+  },
+  "validation": {
+    "isolated_release_ctest_passed": 61,
+    "ctest_failed": 0,
+    "ctest_seconds": 107.35,
+    "system_only_dependencies": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "execution": "Release Apple Clang SDK27.2 WFS_FSKIT=ON; disposable archive source without Git metadata, deny-default sandbox excludes home/keychain/publishing paths, loopback-only test transports.",
+    "regression_scope": [
+      "CLI binary file with embedded NUL reaches resident daemon and appends to unchanged prefix",
+      "Combined explicit World and session selectors, and session-only requests",
+      "Empty file produces no publication",
+      "Changed prefix remains rejected without publication",
+      "Missing and over-256-KiB input files fail locally before dispatch, preserving sequence/data",
+      "Existing raw RPC and both FSKit callback transports pass"
+    ]
+  },
+  "native_mount_rerun": false,
+  "native_note": "Only CLI request file-to-payload conversion changes. Wire protocol and frontend callbacks are unchanged; no additional native syscall capability is claimed.",
+  "sha256": {
+    "daemon": "9d69779891b1acf241192f41778c9e45a4f68c32700f2207f5bca5cdb40dd4d6",
+    "regression_source": "5acc51650e420c7d90c5ce6420f7b2a2d37062cef5d561544585f32d9a06ce46",
+    "ctest_log": "34cee1834046cbe42e74120ac0b83eaa3a48b3d6f92534b2702796e1f341c8de"
+  }
+}

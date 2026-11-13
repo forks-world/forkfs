@@ -144,6 +144,7 @@ int main(int argc, char** argv) {
                          "FSKit: inode-root acquires a view lease; see docs/FSKIT.md.\n"
                          "RPC handles: fs-open PATH MODE[,create][,exclusive][,truncate][,append][,nofollow], fs-close HANDLE, fs-hstat HANDLE\n"
                          "fs-hread HANDLE OFFSET COUNT, fs-hwrite HANDLE OFFSET INPUT_FILE\n"
+                         "fs-hwriteback HANDLE OFFSET INPUT_FILE (FSKit cached writeback)\n"
                          "fs-happend HANDLE INPUT_FILE, fs-htruncate HANDLE SIZE\n"
                          "fs-dup HANDLE, fs-hseek HANDLE SIGNED_OFFSET set|cur|end\n"
                          "fs-hread-next HANDLE COUNT, fs-hwrite-next HANDLE INPUT_FILE\n"
@@ -209,8 +210,8 @@ int main(int argc, char** argv) {
         if(command=="request") {
             if(argc<4)throw std::runtime_error("request requires socket and command");
             std::vector<std::string> fields(argv+3,argv+argc);
-            if(fields[0]=="fs-write" || fields[0]=="fs-save" || fields[0]=="fs-write-at" || fields[0]=="fs-append" || fields[0]=="fs-hwrite" || fields[0]=="fs-happend" || fields[0]=="fs-hwrite-next" || fields[0]=="fs-xattr-set" || fields[0]=="fs-hxattr-set" || fields[0]=="inode-xattr-set") {
-                size_t index=(fields[0]=="fs-xattr-set" || fields[0]=="fs-hxattr-set" || fields[0]=="inode-xattr-set")?4:(fields[0]=="fs-write-at" || fields[0]=="fs-hwrite")?3:2;
+            if(fields[0]=="fs-write" || fields[0]=="fs-save" || fields[0]=="fs-write-at" || fields[0]=="fs-append" || fields[0]=="fs-hwrite" || fields[0]=="fs-hwriteback" || fields[0]=="fs-happend" || fields[0]=="fs-hwrite-next" || fields[0]=="fs-xattr-set" || fields[0]=="fs-hxattr-set" || fields[0]=="inode-xattr-set") {
+                size_t index=(fields[0]=="fs-xattr-set" || fields[0]=="fs-hxattr-set" || fields[0]=="inode-xattr-set")?4:(fields[0]=="fs-write-at" || fields[0]=="fs-hwrite" || fields[0]=="fs-hwriteback")?3:2;
                 if(fields.size()!=index+1 && fields.size()!=index+3 && fields.size()!=index+5)throw std::runtime_error("write command requires input file");
                 auto data=load_file(fields[index].c_str());fields[index].assign(data.begin(),data.end());
             }
