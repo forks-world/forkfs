@@ -223,3 +223,11 @@ User immutable (`UF_IMMUTABLE`) 已在 daemon 的路径写入、写打开、元�
 新开写 fd；它不撤销旧 fd/mmap 权限，也不是多用户授权边界。标志本身可由
 私有服务用户清除。旧 daemon 拒绝 FFINOD04 的新增标志位，包括历史版本。
 见 [user immutable 验收](evidence/2026-11-13-user-immutable.json)。
+
+链接容量：daemon 与 FSKit 共用 32,767 上限，新增链接及子目录/跨父目录移动
+增长超限时返回 EMLINK，失败不发布；删除后容量立即复用，替换空目录的净零
+增长在上限仍可完成。原生文件 fixture 包含真实 32,767 个引用，并通过 GC 后
+只读 revision 回读。APFS 对照的 pathconf 同样报 32,767，但实际允许下一个
+链接；forkfs 不宣称相同额外容量。目录边界的快速单测使用合成计数，恢复真实
+计数后做完整校验，不把它当作 32,765 个子目录的性能验收。
+见 [链接容量证据](evidence/2026-11-13-link-limits.json)。

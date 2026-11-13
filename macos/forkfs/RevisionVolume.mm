@@ -153,7 +153,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
     _alive=NO;[_streams removeAllObjects];[_items removeAllObjects];[_lock unlock];
 }
 - (void)dealloc {[self shutdown];if(_scoped)[_runtime stopAccessingSecurityScopedResource];}
-- (NSInteger)maximumLinkCount{return 32767;}
+- (NSInteger)maximumLinkCount{return forkfs::maximum_link_count;}
 - (NSInteger)maximumNameLength{return 255;}
 - (BOOL)restrictsOwnershipChanges{return YES;}
 - (BOOL)truncatesLongNames{return NO;}
