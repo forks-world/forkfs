@@ -1,0 +1,187 @@
+{
+  "schema": 1,
+  "date": "2026-11-13",
+  "base_commit": "3f29e90144ae2340b68f825a8a2a11d72827e308",
+  "source_tree_before_evidence": "25a928e6c78641174e437b5a80ca2eebdfcab1f2",
+  "source_sha256": {
+    "daemon/CMakeLists.txt": "3c4282da7de40fe8ddd48d3c6e82a74003e6b6f5adab56de42cd121bd15ff411",
+    "scripts/tests/sync_mount.py": "3c25964952b31c47952b4471db970cb3f616697807aa6eaea123d48ce0894661"
+  },
+  "platform": "macOS27.2.1 arm64; Apple Clang/SDK27.2; Release WFS_FSKIT=ON",
+  "validation": {
+    "ctest_passed": 65,
+    "ctest_failed": 0,
+    "seconds": 108.1,
+    "system_dependencies": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "log_sha256": "da62872b320e85f9c68c45b8b7cbff197f9dbab0d150f3761f148ebac44d620f",
+    "isolation": "NoGit disposable source; deny-default sandbox excludes home/keychain/credentials/publishing paths; loopback-only services and owned APFS scratch"
+  },
+  "native_frontend": {
+    "reused": true,
+    "source_reference": "bb97da02ec56f4538a6d8b9b4fe0c566c01acd5f",
+    "installed_signed_sha256": "2419b83636a980dd6e6c702033884108554ad61c562e3b6e63e28edf282130d6",
+    "synchronize_callback_matches_current_base": true,
+    "synchronize_source_sha256": "a0668546fb6c794d955fcc4b63cbd973cea92fdfd166eebe8c8c8f73343a2627",
+    "scope": "Reused installed signed append module. Current main frontend adds volume name initialization and rename; relevant sync/I/O callbacks are unchanged. Not complete current-module qualification; no installation/signing performed."
+  },
+  "daemon_sha256": "d4014f1c1af8bab0cb02baaacde724a9e3ab2ba884b9326c1b30a453285c1a20",
+  "apfs_reference": {
+    "platform": "macOS-27.2.1-arm64-arm-64bit",
+    "filesystem": "apfs",
+    "bytes": 1028347,
+    "sha256": "3303fa3e1c0f35e7ad64f03c371cb90693f80c3b5af49fef3066fce14f531271",
+    "limits": [
+      "graceful unmount/restart only; no power-loss or kernel-crash qualification",
+      "barrier syscall acceptance does not prove a hardware media flush",
+      "single private mount; no concurrent atomic-save qualification"
+    ],
+    "namespace": "/forkfs-sync-zc85p1wh",
+    "barrier_probes": {
+      "F_FULLFSYNC": {
+        "accepted": true
+      },
+      "F_BARRIERFSYNC": {
+        "accepted": true
+      }
+    },
+    "file_and_metadata_fsync": true,
+    "directory_fsync_create_link_rename": true,
+    "renamed_directory_fd_fsync": true,
+    "atomic_save_and_replaced_fd_fsync": true
+  },
+  "native": {
+    "platform": "macOS-27.2.1-arm64-arm-64bit",
+    "filesystem": "forkfs",
+    "bytes": 1028347,
+    "sha256": "3303fa3e1c0f35e7ad64f03c371cb90693f80c3b5af49fef3066fce14f531271",
+    "limits": [
+      "graceful unmount/restart only; no power-loss or kernel-crash qualification",
+      "barrier syscall acceptance does not prove a hardware media flush",
+      "single private mount; no concurrent atomic-save qualification"
+    ],
+    "namespace": "/forkfs-sync-g3tb2q4v",
+    "barrier_probes": {
+      "F_FULLFSYNC": {
+        "accepted": true
+      },
+      "F_BARRIERFSYNC": {
+        "accepted": true
+      }
+    },
+    "file_and_metadata_fsync": true,
+    "directory_fsync_create_link_rename": true,
+    "renamed_directory_fd_fsync": true,
+    "atomic_save_and_replaced_fd_fsync": true,
+    "clean_sync_without_publication": true,
+    "revision": "sync_g3tb2q4v",
+    "daemon_live_and_revision_data_verified": true
+  },
+  "new_process_after_services_exit": {
+    "new_process_revision_readback": true,
+    "files": 2,
+    "sha256": "3303fa3e1c0f35e7ad64f03c371cb90693f80c3b5af49fef3066fce14f531271"
+  },
+  "offline_gc": {
+    "collected_objects": 793
+  },
+  "storage_check_after_gc": {
+    "service": "forkfsd",
+    "state": "leveldb",
+    "storage_engine": "leveldb",
+    "repository_id": "bba70cd8349d772b261031b18cc1745d",
+    "degraded_anchor": false,
+    "mounted": false,
+    "transactions_supported": true,
+    "requires_reopen": false,
+    "last_committed_seq": 74,
+    "checkpoint_seq": 0,
+    "replayed_transactions": 0,
+    "indexed_objects": 120,
+    "object_roots": 134,
+    "compaction_running": false,
+    "compaction_queued": 0,
+    "compaction_active": false,
+    "compaction_completed": 0,
+    "compaction_races": 0,
+    "compaction_failures": 0,
+    "compaction_last_error": "",
+    "metadata_prepare_ns": 0,
+    "storage_metrics": {
+      "transactions": 0,
+      "prepare_ns": 0,
+      "write_ns": 0,
+      "wal_sync_calls": 0,
+      "wal_sync_ns": 0,
+      "other_sync_calls": 2,
+      "other_sync_ns": 25449042,
+      "wal_append_bytes": 0,
+      "wal_append_ns": 0,
+      "wal_flush_ns": 0
+    },
+    "uncommitted_tail": false
+  },
+  "revision_namespace_check_after_gc": {
+    "service": "forkfsd",
+    "state": "leveldb",
+    "storage_engine": "leveldb",
+    "repository_id": "bba70cd8349d772b261031b18cc1745d",
+    "degraded_anchor": false,
+    "mounted": false,
+    "transactions_supported": true,
+    "requires_reopen": false,
+    "last_committed_seq": 74,
+    "checkpoint_seq": 0,
+    "replayed_transactions": 0,
+    "indexed_objects": 120,
+    "object_roots": 134,
+    "compaction_running": false,
+    "compaction_queued": 0,
+    "compaction_active": false,
+    "compaction_completed": 0,
+    "compaction_races": 0,
+    "compaction_failures": 0,
+    "compaction_last_error": "",
+    "metadata_prepare_ns": 0,
+    "storage_metrics": {
+      "transactions": 0,
+      "prepare_ns": 0,
+      "write_ns": 0,
+      "wal_sync_calls": 0,
+      "wal_sync_ns": 0,
+      "other_sync_calls": 2,
+      "other_sync_ns": 19976459,
+      "wal_append_bytes": 0,
+      "wal_append_ns": 0,
+      "wal_flush_ns": 0
+    },
+    "uncommitted_tail": false
+  },
+  "readonly_revision_after_gc": {
+    "platform": "macOS-27.2.1-arm64-arm-64bit",
+    "filesystem": "forkfs",
+    "bytes": 1028347,
+    "sha256": "3303fa3e1c0f35e7ad64f03c371cb90693f80c3b5af49fef3066fce14f531271",
+    "limits": [
+      "graceful unmount/restart only; no power-loss or kernel-crash qualification",
+      "barrier syscall acceptance does not prove a hardware media flush",
+      "single private mount; no concurrent atomic-save qualification"
+    ],
+    "readonly_revision_after_gc": true
+  },
+  "durability_boundary": {
+    "inode_sync": "Checks requires_reopen then returns status; mutations already commit synchronously",
+    "pinned_leveldb": "99b3c03b3284f5886f9ef9a4ef703d57373e61be; HAVE_FULLFSYNC=1, macOS SyncFd may fall back to fsync",
+    "per_call_device_barrier_proven": false,
+    "power_loss_or_kernel_crash_tested": false,
+    "sync_error_injection_tested": false
+  },
+  "runtime_changes": false,
+  "cleanup": {
+    "owned_mount_unmounted": true,
+    "owned_services_stopped": true
+  }
+}

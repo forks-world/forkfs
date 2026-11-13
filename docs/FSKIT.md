@@ -719,3 +719,34 @@ the tested child directory/file fd, and is recorded as a capability limitation.
 The public PathConfOperations protocol has no total-path-length property.
 See [evidence](evidence/2026-11-13-volume-capacity.json) and
 [Apple PathConfOperations](https://developer.apple.com/documentation/fskit/fsvolume/pathconfoperations).
+
+### Native sync and atomic-save qualification
+
+```sh
+python3 scripts/tests/sync_mount.py /private/tmp --reference-apfs
+python3 scripts/tests/sync_mount.py /path/to/private/mount \
+  --daemon build/Release/daemon/forkfsd --socket /path/to/runtime/control.sock > /tmp/sync.json
+# Unmount and stop services, run offline GC, then mount the report's revision readonly:
+python3 scripts/tests/sync_mount.py /path/to/private/mount --verify-report /tmp/sync.json
+```
+
+The suite owns one scratch tree and retains one revision; use a disposable
+repository. It tests file data/metadata fsync, directory fsync after child/link
+creation and rename, a renamed directory fd, and temporary-file replacement
+followed by parent sync. A writable fd for the replaced inode can still sync
+without changing its replacement. The 1,028,347-byte payload crosses the RPC
+limit; daemon readback verifies data and metadata before snapshot creation.
+Repeated clean sync must not publish another mutation. Readonly verification
+checks bytes, mode, nanosecond mtime, hardlink identity and the symlink target.
+macOS CTest includes the APFS reference without requiring an installed module.
+
+F_FULLFSYNC and F_BARRIERFSYNC are separate capability observations. Both were
+accepted on the tested APFS and forkfs mounts, but this does not establish a
+per-call device barrier or power-loss guarantee. inode-sync checks storage
+health; mutations already commit synchronously. The pinned LevelDB macOS Env
+tries F_FULLFSYNC and may fall back to ordinary sync. Fault propagation, kernel
+crashes and actual power loss require separate qualification. No runtime,
+wire protocol, storage format or signing change is introduced by this suite.
+Native evidence reused the installed signed module; the relevant callbacks
+match main, but complete current-module qualification is not claimed. See
+[evidence](evidence/2026-11-13-native-sync.json).

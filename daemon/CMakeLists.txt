@@ -363,4 +363,7 @@ if(APPLE)
     add_test(NAME forkfs_volume_capacity_reference COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_SOURCE_DIR}/scripts/tests/volume_capacity_mount.py /private/tmp --reference-apfs)
     set_tests_properties(forkfs_volume_capacity_reference PROPERTIES TIMEOUT 60)
+    add_test(NAME forkfs_sync_reference COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/scripts/tests/sync_mount.py /private/tmp --reference-apfs)
+    set_tests_properties(forkfs_sync_reference PROPERTIES TIMEOUT 90)
 endif()

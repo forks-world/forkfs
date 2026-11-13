@@ -40,7 +40,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `get/set/list/remove xattr`、fd/nofollow xattr | XattrOperations | 挂载已测；每值 262143 字节、每 inode 128 项、总值 8 MiB；ResourceFork 整值已测，`cp -p`/位置读取仍 EINVAL，不能称完整 fork 兼容 |
 | `mmap(MAP_SHARED/MAP_PRIVATE)`、`msync`、`munmap` | 内核缓存 + ReadWriteOperations | macOS 27.2 单挂载已测；映射/`pread/pwrite` 一致性、private 隔离、open-unlink、flush 后 revision 隔离 |
 | `fcntl(F_SETLK)`、`flock` | 内核原生 advisory locks；与 RPC 锁分开 | macOS 27.2 跨进程互斥、关闭/退出释放已测；byte-range 不相交范围可同时持有。新增挂载验收共享锁并存/排他冲突、阻塞唤醒、dup 关闭释放差异和 F_SETLKW 信号 EINTR；公平性/死锁/OFD locks 未验收 |
-| `fsync`、目录同步、`F_FULLFSYNC`、断电恢复 | synchronize → inode-sync + 存储提交 | 基础文件 fsync/提交与 daemon 恢复已测；目录语义、全硬件屏障、断电/内核崩溃没有完整保证 |
+| `fsync`、目录同步、`F_FULLFSYNC`、断电恢复 | synchronize → inode-sync + 存储提交 | 挂载已测文件/元数据和目录 fsync、目录改名后的 fd、原子保存和被替换旧 fd；F_FULLFSYNC/F_BARRIERFSYNC 请求返回成功。全硬件屏障、断电/内核崩溃仍无完整保证 |
 | `ftruncate`、稀疏文件、`lseek` | setattr size + bounded chunk I/O | 挂载已测零填充、shrink/extend、64 MiB/4 GiB/1 TiB 边界；macOS 27 已挂载验收 `SEEK_DATA/SEEK_HOLE`（64 KiB chunk 粒度）；macOS 26 保留保守 fallback |
 | `F_PREALLOCATE`、`posix_fallocate`、hole punch | 可选 Preallocate/数据变更接口 | 未实现相应协议；不能声称空间预留或洞区间查询兼容 |
 | `statfs/statvfs/pathconf` | volumeStatistics、PathConfOperations | 挂载已测容量/单位/标志、路径与 fd 查询、rename/unlink/路径重用和 GC 后只读 revision；子目录/文件 fd 的 `PC_PATH_MAX` 返回 EINVAL，不能宣称完整 pathconf。空间来自宿主卷，不是 forkfs 配额或预留 |
@@ -198,7 +198,7 @@ revision 隔离及 GC 后只读重挂载；macOS 26 构建不宣称支持该新�
 4. **工作负载闭环**：扩大 SQLite WAL 并发和进程故障、Git 大仓库/构建器/编辑器
    atomic-save、copyfile/资源 fork、文件监控。特殊节点和应用运行目录需求独立验证。
 5. **故障与平台资格**：长时间缓存/写回、daemon/bridge/extension 异常、lease 失效
-   后缓存读取边界、重挂载、目录 fsync、硬件 flush、磁盘满与断电恢复；分别记录
+   后缓存读取边界、重挂载、目录 fsync 故障传播、硬件 flush、磁盘满与断电恢复；分别记录
    macOS 26/27，Linux 挂载需要独立前端及完整验收。
 
 达到上述目标意味着约定的 macOS 应用兼容范围通过验收；POSIX 全标准一致性、
@@ -285,3 +285,17 @@ CLI `request ... fs-hwriteback HANDLE OFFSET INPUT_FILE` 已与其他写请求�
 不提交、非法前缀拒绝和缺失/超过 256 KiB 文件在 dispatch 前失败。此修复针对
 CLI 包装层，不改变 wire protocol 或原生 FSKit 能力等级。
 见 [CLI 写回输入验收](evidence/2026-11-13-cli-writeback.json)。
+
+同步验收以 1,028,347 字节二进制内容跨越 256 KiB RPC 边界。文件数据与
+mode/mtime 的 fsync、创建文件/硬链接/符号链接后的目录 fsync、目录改名后
+旧目录 fd 的 fsync、写临时文件后 rename 替换并同步父目录均通过。被替换文件
+的旧 fd 仍可写入/同步，且不影响新文件；干净文件/目录的重复同步不产生提交。
+在创建 snapshot 之前，daemon 已回读确认同步后的内容和元数据。保留的 revision
+还通过服务退出后新进程回读、离线 GC 和只读重挂载的内容/mode/mtime/链接校验。
+
+APFS 与 forkfs 均接受本轮 F_FULLFSYNC 和 F_BARRIERFSYNC 请求，但返回成功
+不能证明每次调用都执行了设备级屏障，亦不能替代断电/内核崩溃测试。当前
+inode-sync 检查存储健康状态，而实际变更由同步提交完成；LevelDB 的 macOS
+Sync 会尝试 full sync，失败可回退普通 sync。因此本轮只提升已列出的调用与
+正常退出/重开的验收等级，不提供新的硬件持久性保证或故障传播资格。见
+[同步与原子保存证据](evidence/2026-11-13-native-sync.json)。
