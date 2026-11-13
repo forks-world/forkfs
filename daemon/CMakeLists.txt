@@ -360,4 +360,7 @@ if(APPLE)
     add_test(NAME forkfs_copy_transfer_reference COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_SOURCE_DIR}/scripts/tests/copy_transfer_mount.py /private/tmp --reference-apfs)
     set_tests_properties(forkfs_copy_transfer_reference PROPERTIES TIMEOUT 120)
+    add_test(NAME forkfs_volume_capacity_reference COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/scripts/tests/volume_capacity_mount.py /private/tmp --reference-apfs)
+    set_tests_properties(forkfs_volume_capacity_reference PROPERTIES TIMEOUT 60)
 endif()
