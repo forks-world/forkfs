@@ -660,3 +660,34 @@ revision isolation and GC/readonly remount. macOS27.2.1 was measured; this does
 not qualify Finder/diskutil workflows or arbitrary concurrent mounts. See
 [evidence](evidence/2026-11-13-volume-name.json) and
 [Apple RenameOperations](https://developer.apple.com/documentation/fskit/fsvolume/renameoperations).
+
+### Native copyfile and sendfile qualification
+
+```sh
+python3 scripts/tests/copy_transfer_mount.py /path/to/private/mount \
+  --daemon build/Release/daemon/forkfsd --socket /path/to/runtime/control.sock
+python3 scripts/tests/copy_transfer_mount.py /private/tmp --reference-apfs
+# After unmount, offline GC and readonly mounting the report's revision:
+python3 scripts/tests/copy_transfer_mount.py /path/to/mount --verify-report REPORT.json
+```
+
+The script owns one unique scratch directory and retains one forkfs revision. CTest
+uses `/private/tmp` so its APFS scratch stays independent of the build filesystem.
+It calls libc copyfile/fcopyfile/sendfile directly. It checks a 502000-byte binary
+payload, copyfile DATA|STAT|XATTR with mode/mtime/hidden/nodump and a 20 KiB binary
+ordinary xattr, fd data copy including unlinked source and destination with
+reused paths, and an EEXIST destination retaining sentinel data and listed
+metadata. EXCL may update ctime on both tested filesystems; full-call atomicity
+is not asserted. Each socket receiver has deadlines and exact byte checks;
+Darwin sendfile short counts are accumulated, including EAGAIN/EINTR. The
+source offset remains unchanged for range, count-zero and beyond-EOF cases.
+
+COPYFILE_CLONE succeeds via ordinary-copy fallback on forkfs and reports
+WAS_CLONED=false; CLONE_FORCE returns ENOTSUP. APFS reports actual clones.
+Neither fallback success nor the sendfile API implies CoW/zero-copy performance.
+ACLs, ResourceFork, recursive copy, sparse allocation, header/trailer sending
+and arbitrary load are outside this qualification. The daemon/frontend runtime
+is unchanged; macOS CTest adds the APFS reference without requiring a mount.
+See [evidence](evidence/2026-11-13-copy-transfer.json),
+[Apple copyfile](https://github.com/apple-oss-distributions/copyfile/blob/main/copyfile.3)
+and [Darwin sendfile](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/sendfile.2.html).
