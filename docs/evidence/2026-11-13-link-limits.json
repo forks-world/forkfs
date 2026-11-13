@@ -139,5 +139,13 @@
     "Native file fixture contains actual32767 references and is verified before snapshot. Fast directory-capacity tests use synthetic counts; no native32765-subdirectory performance or boundary qualification is claimed.",
     "Read paths accept preexisting larger link counts; no format migration or global repair. New links/parent growth are constrained, while removals reduce counts. No new directory entry cap for distinct regular files.",
     "Native acceptance covers private single-user macOS27.2.1 arm64 and listed operations, including EMLINK state immutability and capacity reuse. No full POSIX/APFS, multi-user or power-loss guarantee."
-  ]
+  ],
+  "test_stability_followup": {
+    "tested_tree_before_evidence": "7aa7d8c7bea89b36a3ae966d504500f9e5e37d86",
+    "link_limit_test_repetitions": 20,
+    "failed": 0,
+    "seconds": 8.18,
+    "runtime_changes": false,
+    "change": "Assert exact EMLINK and stable committed sequence/object-root/object counts rather than whole status JSON, which contains asynchronous storage timing counters. Directory entries, capacity reuse, net-zero replacement and data/revision checks remain intact."
+  }
 }

@@ -20,7 +20,19 @@ static void publish(Journal& journal,const forkfs::NamespaceView& view,const std
  batch.push_back({history+"world/main",std::move(plan.manifest)});journal.transact(journal.sequence(),batch);
 }
 static void patch_count(const std::string& path,const std::string& id,uint64_t value){Journal journal(path);forkfs::NamespaceView view(journal,"main");auto key=prefix+"inode/"+id;auto bytes=view.get(key);count(bytes,value);publish(journal,view,{{key,bytes}});}
-template<class F> static void full(Container& store,F fn){auto before=store.status();bool failed=false;try{fn();}catch(const std::system_error& e){failed=e.code().value()==EMLINK;}check(failed && store.status()==before);}
+static std::string logical_state(const std::string& status){
+ std::string result;for(const auto* field:{"last_committed_seq","object_roots","indexed_objects"}){
+  auto key="\""+std::string(field)+"\":";auto begin=status.find(key);check(begin!=status.npos);begin+=key.size();
+  auto end=status.find_first_not_of("0123456789",begin);check(end!=begin);result+=status.substr(begin,end-begin)+"/";
+ }return result;
+}
+template<class F> static void full(Container& store,F fn,int line=__builtin_LINE()){
+ // Background storage metrics can change on reads; compare publication/root
+ // state, not timings or counters unrelated to namespace mutation.
+ auto before=logical_state(store.status());int error=0;try{fn();}catch(const std::system_error& e){error=e.code().value();}
+ if(error!=EMLINK)throw std::runtime_error("expected EMLINK at "+std::to_string(line)+", got "+std::to_string(error));
+ check(logical_state(store.status())==before,line);
+}
 static void fixture(const std::string& path){
  Container::create(path);std::string id,dir;
  {Container store(path);Namespace fs(store);fs.initialize();fs.mkdir("/links");fs.write("/file",{'D'});id=fs.stat("/file").id;dir=fs.stat("/links").id;}
