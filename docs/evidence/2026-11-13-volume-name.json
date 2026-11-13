@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "date": "2026-11-13",
+  "platform": "macOS27.2.1 arm64",
+  "base_commit": "c349752e8c9f44fc01150398f56e8daaa0821fd5",
+  "source_tree_before_evidence": "e083523dbc8deddb69bc3d526c77e511af0e3522",
+  "validation": {
+    "ctest_passed": 61,
+    "ctest_failed": 0,
+    "ctest_seconds": 104.49,
+    "system_only_dependencies": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "source_files_match_disposable_copy": 261,
+    "execution": "Apple Clang SDK27.2 Release WFS_FSKIT=ON; disposable source without Git metadata; deny-default sandbox denies home/keychain/publishing paths; loopback-only test transport. fs-rename allowed only on exact owned reference/native mount roots. Signed module installed separately.",
+    "unit_scope": "LevelDB and legacy flat layouts: default/missing label, UTF-8 and invalid names, 255-byte bound, identity/root-time preservation, no-op sequence stability, label-only/escaped JSON diff, fork and revision isolation, restore safety, reopen and GC. Raw RPC malformed input and both FSKit callback transports included."
+  },
+  "apfs_reference": {
+    "filesystem": "apfs",
+    "initial_name": "ReferenceProbe",
+    "namespace": "/forkfs-volume-name-cfsu0k_m",
+    "empty_name_errno": 22,
+    "retained_name": "Research 卷📦",
+    "open_inode_preserved": true,
+    "native_rename_readback": true,
+    "initial_name_restored": true
+  },
+  "reference_image_created_for_this_test_detached_and_removed": true,
+  "native": {
+    "filesystem": "forkfs",
+    "initial_name": "ForkFS",
+    "namespace": "/forkfs-volume-name-hm6cpdc6",
+    "empty_name_errno": 22,
+    "retained_name": "Research 卷📦",
+    "revision": "volume_name_hm6cpdc6",
+    "revision_isolation": true,
+    "open_inode_preserved": true,
+    "native_rename_readback": true,
+    "initial_name_restored": true
+  },
+  "foundation_groups_passed": 13,
+  "offline_gc": {
+    "collected_objects": 105
+  },
+  "namespace_and_storage_check_after_gc": true,
+  "readonly_revision_after_gc": {
+    "volume_name_after_gc_readonly_remount": "Research 卷📦",
+    "readonly_rename_errno": 30,
+    "data_preserved": true
+  },
+  "previous_reader": {
+    "previous_verifier_rejects_named_revision": true,
+    "error": "orphan namespace records",
+    "sequence_unchanged": true,
+    "cli_revision_name": "Research 卷📦"
+  },
+  "installed_signature_deep_strict_verified": true,
+  "sha256": {
+    "daemon": "54e91eacb8e7f3977fca5b697dc1f859b1fcf5315da80c60e1bad782b4ee5fd8",
+    "installed_signed_extension": "463106a8818c51196d5bc7f6650db7a5939c29414318ecffa81cff2cfe792b5a",
+    "manual_script": "24a4f8e009bbf2bfb03aa2352602f40a6d204395dcd54d603656457734a8b9fe",
+    "ctest_log": "013f8fe0251cb20542bbaf3a147b9995e4f6b7dba5b4438e0b538d01374adf85"
+  },
+  "limits": [
+    "Volume label is optional namespace metadata, separate from root inode flags, World name, repository ID, descriptor/volume identity and mount path. Missing record means ForkFS. Existing inode/tree/revision formats are unchanged.",
+    "Older namespace verifiers reject selected trees containing the added metadata record. Older frontends do not display the persisted name; the new frontend requires the new daemon RPC. No automatic downgrade/migration is claimed.",
+    "Native qualification is private single-user macOS27.2.1 with listed ATTR_VOL_NAME operations; Finder/diskutil integration, arbitrary concurrent mounts, persistent file IDs and power-loss behavior are not qualified.",
+    "APFS reference used a newly created 256 MiB sparse image and verified image/mount ownership. No host or preexisting user volume was renamed."
+  ]
+}

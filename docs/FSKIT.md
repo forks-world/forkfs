@@ -641,3 +641,22 @@ This does not qualify append-only mmap, arbitrary concurrent writers, power loss
 system protection flags or multi-user security. See
 [append evidence](evidence/2026-11-13-append-flags.json) and
 [Apple file flags](https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/FileSystemProgrammingGuide/FileSystemDetails/FileSystemDetails.html).
+
+### Revision-backed volume rename
+
+The macOS 26 RenameOperations protocol now handles native volume-name changes.
+The loaded FSVolume name comes from the selected World/revision; successful
+rename replies and the framework name update only follow the daemon commit.
+An invalid name does not change either value. Readonly/revision mounts return
+EROFS. Naming is independent of inode identity, mount path and the descriptor's
+repository/view identifier. It does not rename the repository or World.
+
+Use matching daemon/module versions: older daemons lack the label RPC, and
+older namespace verifiers reject trees with the optional volume-name metadata
+leaf. Legacy trees without the record retain their default `ForkFS` label.
+The native suite uses an owned forkfs repository and a separate newly created
+APFS reference image; it verifies UTF-8 names, EINVAL, open inode identity,
+revision isolation and GC/readonly remount. macOS27.2.1 was measured; this does
+not qualify Finder/diskutil workflows or arbitrary concurrent mounts. See
+[evidence](evidence/2026-11-13-volume-name.json) and
+[Apple RenameOperations](https://developer.apple.com/documentation/fskit/fsvolume/renameoperations).

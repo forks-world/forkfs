@@ -134,6 +134,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
         auto session=object(forkfs::request_rpc(_socket,{"session-open","60000"},_bridged?&_loopback:nullptr));_session=session[@"session"];
         require([_session isKindOfClass:NSString.class],EPROTO,"invalid session response");_alive=YES;
         NSDictionary* root=[self json:@[@"inode-root"]];require([root[@"repository"] isEqual:config[@"repository"]],ESTALE,"repository identity changed");
+        NSDictionary* label=[self json:@[@"fs-volume-name"]];require([label[@"name"] isKindOfClass:NSString.class],EPROTO,"invalid volume name response");self.name=[FSFileName nameWithString:label[@"name"]];
         _uid=[root[@"uid"] unsignedIntValue];_gid=[root[@"gid"] unsignedIntValue];
         _root=[self remember:root[@"inode"] parent:FSItemIDParentOfRoot];_root.number=FSItemIDRootDirectory;_numbers[_root.inode]=@(FSItemIDRootDirectory);
     }];
@@ -185,6 +186,14 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
     [_lock lock];if([options.taskOptions containsObject:@"ro"] || [options.taskOptions containsObject:@"rdonly"])_readOnly=YES;[_lock unlock];reply(nil);
 }
 - (void)unmountWithReplyHandler:(void(^)(void))reply {[self shutdown];reply();}
+- (BOOL)isVolumeRenameInhibited{return NO;}
+- (void)setVolumeName:(FSFileName*)name replyHandler:(void(^)(FSFileName*,NSError*))reply {
+    __block FSFileName* result=nil;NSError* error=[self perform:^{[self writable];require(name.string!=nil,EINVAL,"invalid UTF-8 volume name");
+        NSDictionary* label=[self json:@[@"fs-set-volume-name",name.string]];
+        require([label[@"name"] isEqual:name.string],EPROTO,"volume rename response mismatch");
+        result=[FSFileName nameWithString:label[@"name"]];self.name=result;
+    }];reply(error?nil:result,error);
+}
 - (void)synchronizeWithFlags:(FSSyncFlags)flags replyHandler:(void(^)(NSError*))reply {reply([self perform:^{[self json:@[@"inode-sync"]];}]);}
 - (void)getAttributes:(FSItemGetAttributesRequest*)desired ofItem:(FSItem*)item replyHandler:(void(^)(FSItemAttributes*,NSError*))reply {
     __block FSItemAttributes* a=nil;NSError* e=[self perform:^{RevisionItem* it=[self item:item];[self refresh:it];a=[self attributes:it];}];reply(a,e);

@@ -46,6 +46,16 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         session=obj('session-open','60000')['session'];sel=['--session',session]
         info=obj('inode-root',*sel);rid=info['inode']['inode_id'];assert info['repository']
         assert obj('inode-space',*sel)['block_size']>0
+        assert obj('fs-volume-name',*sel)['name']=='ForkFS'
+        obj('fs-set-volume-name','RPC卷',*sel)
+        assert obj('fs-volume-name',*sel)['name']=='RPC卷'
+        label_seq=obj('status')['last_committed_seq']
+        for invalid_label in ['', '.', '..', 'a/b', 'a\nb', b'a\x00b', b'\xff']:
+            rpc('fs-set-volume-name',invalid_label,*sel,error=errno.EINVAL)
+        rpc('fs-set-volume-name','x'*256,*sel,error=errno.ENAMETOOLONG)
+        assert obj('status')['last_committed_seq']==label_seq
+        obj('fs-set-volume-name','ForkFS',*sel)
+
         other=obj('session-open','60000')['session']
         rpc('inode-root','--session',other,error=errno.EBUSY)
         rpc('fs-mkdir','/foreign',error=errno.EBUSY)

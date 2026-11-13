@@ -34,7 +34,7 @@ ObjectId revision_manifest(const Journal& j,const std::string& name) {
 namespace {
 using Bytes=std::vector<unsigned char>;
 const std::string prefix("\0forkfs/",8);
-const std::string root_key=prefix+"root";
+const std::string root_key=prefix+"root",volume_name_key=prefix+"volume-name";
 void need(bool ok,const char* message) { if(!ok) throw std::runtime_error(message); }
 uint64_t load(const unsigned char* p,size_t n) {
     uint64_t v=0;for(size_t i=0;i<n;++i)v|=uint64_t(p[i])<<(8*i);return v;
@@ -161,6 +161,15 @@ void valid_namespace_text(const std::string& value) {
         need(scalar>=minimum && scalar<=0x10ffff && !(scalar>=0xd800 && scalar<=0xdfff),"invalid UTF-8 namespace text");
         need(scalar>=0x20 && !(scalar>=0x7f && scalar<=0x9f),"invalid control character in namespace text");
     }
+}
+void valid_volume_name(const std::string& name) {
+    if(name.size()>255)throw std::system_error(ENAMETOOLONG,std::generic_category(),"volume name exceeds 255 bytes");
+    if(name.empty() || name=="." || name==".." || name.find('/')!=name.npos)throw std::system_error(EINVAL,std::generic_category(),"invalid volume name");
+    try{valid_namespace_text(name);}catch(const std::runtime_error& error){throw std::system_error(EINVAL,std::generic_category(),error.what());}
+}
+std::string read_volume_name(const NamespaceView& view) {
+    if(!view.contains(volume_name_key))return "ForkFS";
+    auto bytes=view.get(volume_name_key);std::string name(bytes.begin(),bytes.end());valid_volume_name(name);return name;
 }
 void valid_xattr_name(const std::string& name) {
     need(!name.empty(),"invalid empty extended attribute name");need(name.size()<=255,"extended attribute name exceeds 255 bytes");valid_namespace_text(name);
@@ -624,7 +633,8 @@ std::string Namespace::diff(const std::string& before,const std::string& after,c
         }
     }
     std::string result="{\"before_revision_id\":"+quote(hex_id(journal.root_object(history+"revision/"+before)))+
-        ",\"after_revision_id\":"+quote(hex_id(journal.root_object(history+"revision/"+after)))+",\"changes\":[";
+        ",\"after_revision_id\":"+quote(hex_id(journal.root_object(history+"revision/"+after)))+",\"volume_name_changed\":"+(read_volume_name(left)!=read_volume_name(right)?"true":"false")+
+        ",\"before_volume_name\":"+quote(read_volume_name(left))+",\"after_volume_name\":"+quote(read_volume_name(right))+",\"changes\":[";
     for(size_t i=0;i<changes.size();++i){if(i)result+=',';result+=changes[i];}
     return result+"],\"next_after\":"+quote(eof?"":last)+",\"eof\":"+(eof?"true":"false")+"}\n";
 }
@@ -778,6 +788,15 @@ void Namespace::initialize() {
         auto id=new_id(j);InodeInfo n=created({id,true,0755,2,0,now(),now()});
         changes[root_key]=id_bytes(id);changes[inode_key(id)]=encode(n);changes[allocated_key(id)]=Bytes{};
     });
+}
+std::string Namespace::volume_name() const {
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);root(view);return read_volume_name(view);
+}
+void Namespace::set_volume_name(const std::string& name) {
+    if(revision_)throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");
+    valid_volume_name(name);
+    update([&](const NamespaceView& view,Changes& changes){root(view);if(read_volume_name(view)==name)return;
+        changes[volume_name_key]=name=="ForkFS"?std::optional<Bytes>{}:Bytes(name.begin(),name.end());});
 }
 void Namespace::mkdir(const std::string& path,uint32_t mode) {
     need(mode<=0777,"invalid creation mode");
@@ -1035,6 +1054,7 @@ void Namespace::verify_locked() const {
     if(journal.is_leveldb())(void)j.references(); // Validate the full CoW tree before namespace traversal.
     auto root_id=root(j);need(inode(j,root_id).directory,"root inode is not a directory");std::set<std::string> expected;std::map<std::string,uint64_t> references;
     std::set<std::string> directories;expected.insert(root_key);
+    if(j.contains(volume_name_key)){(void)read_volume_name(j);expected.insert(volume_name_key);}
     std::function<void(const std::string&)> visit=[&](const std::string& id) {
         auto n=inode(j,id);expected.insert(inode_key(id));
         Xattrs attributes(j,id);attributes.verify(n.xattrs);for(const auto& key:attributes.records())expected.insert(key);

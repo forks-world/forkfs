@@ -48,7 +48,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `mkfifo/mknod`、Unix socket 路径 | create item types | 缺失；当前只支持 regular/directory/symlink，不适合依赖这些节点的运行目录 |
 | `copyfile/clonefile/fcopyfile/sendfile` | 内核 fallback 或可选复制能力 | 普通 `cp` 部分场景已测；CoW clone、资源 fork 大值、完整 copyfile flags、sendfile 未验收 |
 | `kqueue` vnode 通知、文件监控、FSEvents | 内核 vnode 事件 | macOS 27.2 小仓库已测 WRITE/EXTEND/ATTRIB/LINK/RENAME/DELETE、父目录事件、跨进程写及路径重用隔离；FSEvents、递归监控、revoke 未验收 |
-| 持久 file ID、file handles、卷改名、大小写折叠 | 可选卷能力/身份协议 | persistent IDs 未提供（不宣告）；ID 只在当前 mount 稳定；其余未提供/未验收 |
+| 持久 file ID、file handles、卷改名、大小写折叠 | 可选卷能力/身份协议 | persistent IDs 未提供（不宣告）；ID 只在当前 mount 稳定；卷名支持 revision 元数据和原生改名，大小写折叠未提供/未验收 |
 
 当前类使用 macOS 26 的 Operations 协议，具体实现见
 [`RevisionVolume.h`](../macos/forkfs/RevisionVolume.h) 和
@@ -239,3 +239,11 @@ FSKit 专用写回先比较已有前缀，只有完全相同的重写和 EOF 后
 避免未满数据页的缓存写回使 fsync 失败。旧 fd 的覆写/截断也受 append 约束，
 区别于 immutable 的已授予数据权限。此功能不是不可撤销日志或多用户授权边界。
 见 [append-only 验收](evidence/2026-11-13-append-flags.json)。
+
+卷名改名通过 FSKit RenameOperations 和 `ATTR_VOL_NAME` 接入，名称是 World
+元数据树中的独立叶子，快照/fork/restore/GC 均保留，不改文件身份、World 名、
+repository ID 或挂载路径。缺失名称记录时仍为 ForkFS；相同名称不产生提交。
+支持 1–255 字节合法 UTF-8，保留大小写/NFC/NFD，不接受空名称、点名称、斜杠
+或控制字符。revision/只读挂载改名返回 EROFS；label-only diff 单独报告卷名变化，
+不伪造文件内容变化。APFS 对照仅操作新建可丢弃镜像。
+见 [卷名验收](evidence/2026-11-13-volume-name.json)。

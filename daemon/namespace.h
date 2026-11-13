@@ -59,6 +59,8 @@ public:
     std::vector<std::string> worlds() const;
     std::vector<std::string> revisions() const;
     void initialize();
+    std::string volume_name() const;
+    void set_volume_name(const std::string& name);
     void compact();
     size_t run_count() const;
     void mkdir(const std::string& path,uint32_t mode=0755);
