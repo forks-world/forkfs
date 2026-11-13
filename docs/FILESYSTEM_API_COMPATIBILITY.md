@@ -43,7 +43,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `fsync`、目录同步、`F_FULLFSYNC`、断电恢复 | synchronize → inode-sync + 存储提交 | 基础文件 fsync/提交与 daemon 恢复已测；目录语义、全硬件屏障、断电/内核崩溃没有完整保证 |
 | `ftruncate`、稀疏文件、`lseek` | setattr size + bounded chunk I/O | 挂载已测零填充、shrink/extend、64 MiB/4 GiB/1 TiB 边界；macOS 27 已挂载验收 `SEEK_DATA/SEEK_HOLE`（64 KiB chunk 粒度）；macOS 26 保留保守 fallback |
 | `F_PREALLOCATE`、`posix_fallocate`、hole punch | 可选 Preallocate/数据变更接口 | 未实现相应协议；不能声称空间预留或洞区间查询兼容 |
-| `statfs/statvfs/pathconf` | volumeStatistics、PathConfOperations | 回调/RPC 已测；空间来自宿主卷，不是 forkfs 配额，剩余空间不保证下一次写入成功 |
+| `statfs/statvfs/pathconf` | volumeStatistics、PathConfOperations | 挂载已测容量/单位/标志、路径与 fd 查询、rename/unlink/路径重用和 GC 后只读 revision；子目录/文件 fd 的 `PC_PATH_MAX` 返回 EINVAL，不能宣称完整 pathconf。空间来自宿主卷，不是 forkfs 配额或预留 |
 | `chflags/fchflags/lchflags`、BSD flags | get/setAttributes → revision inode | 挂载已测 hidden/nodump 的路径/fd/nofollow、硬链接、cp -p、孤儿 fd 和历史隔离；user immutable 及 user append-only 的数据/元数据/目录约束已接入；nounlink/系统保护标记仍拒绝 |
 | `mkfifo/mknod`、Unix socket 路径 | create item types | 缺失；当前只支持 regular/directory/symlink，不适合依赖这些节点的运行目录 |
 | `copyfile/clonefile/fcopyfile/sendfile` | 内核 fallback 或可选复制能力 | 新增原生验收 `copyfile(DATA|STAT|XATTR)`、`fcopyfile(DATA)` 和 sendfile 区间/EOF/unlink fd；clone 请求可回退，强制 clone 返回 ENOTSUP；ResourceFork、ACL、递归/完整 flags 仍未补齐 |
@@ -203,6 +203,21 @@ revision 隔离及 GC 后只读重挂载；macOS 26 构建不宣称支持该新�
 
 达到上述目标意味着约定的 macOS 应用兼容范围通过验收；POSIX 全标准一致性、
 完整 APFS 功能和 Linux 文件系统支持仍是不同目标，需要各自的清单与测试。
+
+容量接口验收直接调用 `statfs/fstatfs/statvfs/fstatvfs/pathconf/fpathconf`，
+核对稳定几何参数、每次返回的计数边界与 fd 卷身份，不要求两次调用之间的空闲
+计数完全相等。只读 revision 仍报告共享宿主空间，由 readonly 标志和 EROFS
+表明不可写；空闲 inode 数不是 forkfs 自身的 inode 配额。`PC_FILESIZEBITS=42`
+是包含 1 TiB 端点所需的有符号位数；实际 1 TiB 稀疏文件可写最后一字节，
+增加一字节的 truncate 返回 EFBIG 且保留内容。`PC_PATH_MAX` 在本次子目录及
+文件 fd 上返回 EINVAL；公开 PathConfOperations 没有路径总长属性，daemon 的
+4096 字节限制不能当作该 syscall 的成功结果。
+
+本轮同时修复超长路径/组件及符号链接目标返回 EINVAL 的问题，现返回
+ENAMETOOLONG，其他非法名称仍为 EINVAL，拒绝操作不产生提交。组件上限按
+UTF-8 字节计：255 字节可用，256 字节拒绝；APFS 本次接受 256 字节的多字节
+名称，不能声称相同 Unicode 名称容量。见
+[容量与名称限制证据](evidence/2026-11-13-volume-capacity.json)。
 
 
 2026-11-12：目录枚举前端改为每个流缓存一页（最多 512 项加 dot 项），

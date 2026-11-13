@@ -1,0 +1,620 @@
+{
+  "schema": 1,
+  "date": "2026-11-13",
+  "base_commit": "0c85c32b741c819e96092d8ef0a1a5b13f98152a",
+  "source_tree_before_evidence": "068ee655d80ad141d3f8596b6e89550f0650a476",
+  "runtime_source_sha256": {
+    "daemon/namespace.cpp": "42ca4831de6eed3e55baed3dcfafd566f5647dbb78854b285b8be94ff35f8d54",
+    "daemon/CMakeLists.txt": "6c2c77d40a85db0aa490d2f79d57d0a0d655dd6f5a30e3a478c1c93112966af3",
+    "daemon/tests/unicode_paths.py": "2d001c489a1fc9673965199f40855d7a2a2a225069fc61e1ff6f51754e90eb32",
+    "scripts/tests/volume_capacity_mount.py": "b5c1452db82f8964dfa8909f2a92e33194b1056d8796efe459aec77e2f37934d"
+  },
+  "platform": "macOS 27.2.1 arm64; Apple Clang/SDK 27.2; Release; WFS_FSKIT=ON",
+  "validation": {
+    "ctest_passed": 64,
+    "ctest_failed": 0,
+    "seconds": 102.38,
+    "system_dependencies": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "log_sha256": "73adcded1670029478f9da2b61298bcfd5c33172f50c097f251d9eba889e200e",
+    "isolation": "NoGit disposable source, deny-default sandbox; no home/keychain/credential/publishing paths; loopback-only services; APFS owned scratch"
+  },
+  "native_frontend": {
+    "reused": true,
+    "source_reference": "bb97da02ec56f4538a6d8b9b4fe0c566c01acd5f",
+    "installed_signed_sha256": "2419b83636a980dd6e6c702033884108554ad61c562e3b6e63e28edf282130d6",
+    "deep_strict_signature_verified": true,
+    "volume_statistics_and_pathconf_selectors_equal_current_base": true,
+    "selector_source_sha256": "148582540aeffcef61c9cb7c4de1ae27c2c71a13ee3cb903fbb50c7c4fba0dc5",
+    "scope": "Previously installed append module reused. Current base adds volume rename, absent from this module. This PR has no frontend changes; no new signing/install. Not qualification of the complete current-base module."
+  },
+  "daemon_sha256": "42517f41a8ff03a63aae8f5f28d8be6a16af61a87a2c3fee29209f0e67a12650",
+  "apfs_reference": {
+    "platform": "macOS-27.2.1-arm64-arm-64bit",
+    "filesystem": "apfs",
+    "queries": {
+      "directory": {
+        "statvfs": {
+          "f_bsize": 1048576,
+          "f_frsize": 4096,
+          "f_blocks": 59840624,
+          "f_bfree": 8040000,
+          "f_bavail": 8040000,
+          "f_files": 324370078,
+          "f_ffree": 321946080,
+          "f_flag": 0,
+          "f_namemax": 255
+        },
+        "statfs": {
+          "bsize": 4096,
+          "iosize": 1048576,
+          "blocks": 59840624,
+          "bfree": 8040000,
+          "bavail": 8040000,
+          "files": 324370078,
+          "ffree": 321946080,
+          "flags": 76583040
+        },
+        "fsid": [
+          16777229,
+          26
+        ],
+        "pathconf": {
+          "PC_NAME_MAX": 255,
+          "PC_LINK_MAX": 32767,
+          "PC_CHOWN_RESTRICTED": 200112,
+          "PC_NO_TRUNC": 200112,
+          "PC_FILESIZEBITS": 56
+        },
+        "path_max_probe": {
+          "value": 1024
+        }
+      },
+      "open": {
+        "statvfs": {
+          "f_bsize": 1048576,
+          "f_frsize": 4096,
+          "f_blocks": 59840624,
+          "f_bfree": 8040000,
+          "f_bavail": 8040000,
+          "f_files": 324370039,
+          "f_ffree": 321946040,
+          "f_flag": 0,
+          "f_namemax": 255
+        },
+        "statfs": {
+          "bsize": 4096,
+          "iosize": 1048576,
+          "blocks": 59840624,
+          "bfree": 8040000,
+          "bavail": 8040000,
+          "files": 324370039,
+          "ffree": 321946040,
+          "flags": 76583040
+        },
+        "fsid": [
+          16777229,
+          26
+        ],
+        "pathconf": {
+          "PC_NAME_MAX": 255,
+          "PC_LINK_MAX": 32767,
+          "PC_CHOWN_RESTRICTED": 200112,
+          "PC_NO_TRUNC": 200112,
+          "PC_FILESIZEBITS": 56
+        },
+        "path_max_probe": {
+          "value": 1024
+        }
+      },
+      "renamed": {
+        "statvfs": {
+          "f_bsize": 1048576,
+          "f_frsize": 4096,
+          "f_blocks": 59840624,
+          "f_bfree": 8040000,
+          "f_bavail": 8040000,
+          "f_files": 324370039,
+          "f_ffree": 321946040,
+          "f_flag": 0,
+          "f_namemax": 255
+        },
+        "statfs": {
+          "bsize": 4096,
+          "iosize": 1048576,
+          "blocks": 59840624,
+          "bfree": 8040000,
+          "bavail": 8040000,
+          "files": 324370039,
+          "ffree": 321946040,
+          "flags": 76583040
+        },
+        "fsid": [
+          16777229,
+          26
+        ],
+        "pathconf": {
+          "PC_NAME_MAX": 255,
+          "PC_LINK_MAX": 32767,
+          "PC_CHOWN_RESTRICTED": 200112,
+          "PC_NO_TRUNC": 200112,
+          "PC_FILESIZEBITS": 56
+        },
+        "path_max_probe": {
+          "value": 1024
+        }
+      },
+      "unlinked": {
+        "statvfs": {
+          "f_bsize": 1048576,
+          "f_frsize": 4096,
+          "f_blocks": 59840624,
+          "f_bfree": 8040000,
+          "f_bavail": 8040000,
+          "f_files": 324370038,
+          "f_ffree": 321946040,
+          "f_flag": 0,
+          "f_namemax": 255
+        },
+        "statfs": {
+          "bsize": 4096,
+          "iosize": 1048576,
+          "blocks": 59840624,
+          "bfree": 8040000,
+          "bavail": 8040000,
+          "files": 324370038,
+          "ffree": 321946040,
+          "flags": 76583040
+        },
+        "fsid": [
+          16777229,
+          26
+        ],
+        "pathconf": {
+          "PC_NAME_MAX": 255,
+          "PC_LINK_MAX": 32767,
+          "PC_CHOWN_RESTRICTED": 200112,
+          "PC_NO_TRUNC": 200112,
+          "PC_FILESIZEBITS": 56
+        },
+        "path_max_probe": {
+          "value": 1024
+        }
+      },
+      "reused": {
+        "statvfs": {
+          "f_bsize": 1048576,
+          "f_frsize": 4096,
+          "f_blocks": 59840624,
+          "f_bfree": 8040000,
+          "f_bavail": 8040000,
+          "f_files": 324369999,
+          "f_ffree": 321946000,
+          "f_flag": 0,
+          "f_namemax": 255
+        },
+        "statfs": {
+          "bsize": 4096,
+          "iosize": 1048576,
+          "blocks": 59840624,
+          "bfree": 8040000,
+          "bavail": 8040000,
+          "files": 324369999,
+          "ffree": 321946000,
+          "flags": 76583040
+        },
+        "fsid": [
+          16777229,
+          26
+        ],
+        "pathconf": {
+          "PC_NAME_MAX": 255,
+          "PC_LINK_MAX": 32767,
+          "PC_CHOWN_RESTRICTED": 200112,
+          "PC_NO_TRUNC": 200112,
+          "PC_FILESIZEBITS": 56
+        },
+        "path_max_probe": {
+          "value": 1024
+        }
+      }
+    },
+    "limits": [
+      "shared host capacity; no quota/reservation",
+      "no exact free-count equality between calls",
+      "no disk-full or hardware durability qualification"
+    ],
+    "namespace": "/forkfs-capacity-l22h540i",
+    "name_limits": {
+      "ascii_255_accepted": true,
+      "ascii_256_errno": 63,
+      "utf8_255_accepted": true,
+      "utf8_256_accepted": true
+    }
+  },
+  "native": {
+    "platform": "macOS-27.2.1-arm64-arm-64bit",
+    "filesystem": "forkfs",
+    "queries": {
+      "directory": {
+        "statvfs": {
+          "f_bsize": 1048576,
+          "f_frsize": 4096,
+          "f_blocks": 59840624,
+          "f_bfree": 8040000,
+          "f_bavail": 8040000,
+          "f_files": 324350388,
+          "f_ffree": 321926360,
+          "f_flag": 2,
+          "f_namemax": 255
+        },
+        "statfs": {
+          "bsize": 4096,
+          "iosize": 1048576,
+          "blocks": 59840624,
+          "bfree": 8040000,
+          "bavail": 8040000,
+          "files": 324350348,
+          "ffree": 321926320,
+          "flags": 270536728
+        },
+        "fsid": [
+          805306432,
+          24
+        ],
+        "pathconf": {
+          "PC_NAME_MAX": 255,
+          "PC_LINK_MAX": 32767,
+          "PC_CHOWN_RESTRICTED": 1,
+          "PC_NO_TRUNC": 1,
+          "PC_FILESIZEBITS": 42
+        },
+        "path_max_probe": {
+          "errno": 22
+        }
+      },
+      "open": {
+        "statvfs": {
+          "f_bsize": 1048576,
+          "f_frsize": 4096,
+          "f_blocks": 59840624,
+          "f_bfree": 8040000,
+          "f_bavail": 8040000,
+          "f_files": 324350067,
+          "f_ffree": 321926040,
+          "f_flag": 2,
+          "f_namemax": 255
+        },
+        "statfs": {
+          "bsize": 4096,
+          "iosize": 1048576,
+          "blocks": 59840624,
+          "bfree": 8040000,
+          "bavail": 8040000,
+          "files": 324350067,
+          "ffree": 321926040,
+          "flags": 270536728
+        },
+        "fsid": [
+          805306432,
+          24
+        ],
+        "pathconf": {
+          "PC_NAME_MAX": 255,
+          "PC_LINK_MAX": 32767,
+          "PC_CHOWN_RESTRICTED": 1,
+          "PC_NO_TRUNC": 1,
+          "PC_FILESIZEBITS": 42
+        },
+        "path_max_probe": {
+          "errno": 22
+        }
+      },
+      "renamed": {
+        "statvfs": {
+          "f_bsize": 1048576,
+          "f_frsize": 4096,
+          "f_blocks": 59840624,
+          "f_bfree": 8040000,
+          "f_bavail": 8040000,
+          "f_files": 324349945,
+          "f_ffree": 321925920,
+          "f_flag": 2,
+          "f_namemax": 255
+        },
+        "statfs": {
+          "bsize": 4096,
+          "iosize": 1048576,
+          "blocks": 59840624,
+          "bfree": 8040000,
+          "bavail": 8040000,
+          "files": 324349588,
+          "ffree": 321925560,
+          "flags": 270536728
+        },
+        "fsid": [
+          805306432,
+          24
+        ],
+        "pathconf": {
+          "PC_NAME_MAX": 255,
+          "PC_LINK_MAX": 32767,
+          "PC_CHOWN_RESTRICTED": 1,
+          "PC_NO_TRUNC": 1,
+          "PC_FILESIZEBITS": 42
+        },
+        "path_max_probe": {
+          "errno": 22
+        }
+      },
+      "unlinked": {
+        "statvfs": {
+          "f_bsize": 1048576,
+          "f_frsize": 4096,
+          "f_blocks": 59840624,
+          "f_bfree": 8040000,
+          "f_bavail": 8040000,
+          "f_files": 324349269,
+          "f_ffree": 321925240,
+          "f_flag": 2,
+          "f_namemax": 255
+        },
+        "statfs": {
+          "bsize": 4096,
+          "iosize": 1048576,
+          "blocks": 59840624,
+          "bfree": 8040000,
+          "bavail": 8040000,
+          "files": 324349269,
+          "ffree": 321925240,
+          "flags": 270536728
+        },
+        "fsid": [
+          805306432,
+          24
+        ],
+        "pathconf": {
+          "PC_NAME_MAX": 255,
+          "PC_LINK_MAX": 32767,
+          "PC_CHOWN_RESTRICTED": 1,
+          "PC_NO_TRUNC": 1,
+          "PC_FILESIZEBITS": 42
+        },
+        "path_max_probe": {
+          "errno": 22
+        }
+      },
+      "reused": {
+        "statvfs": {
+          "f_bsize": 1048576,
+          "f_frsize": 4096,
+          "f_blocks": 59840624,
+          "f_bfree": 8040000,
+          "f_bavail": 8040000,
+          "f_files": 324349744,
+          "f_ffree": 321925720,
+          "f_flag": 2,
+          "f_namemax": 255
+        },
+        "statfs": {
+          "bsize": 4096,
+          "iosize": 1048576,
+          "blocks": 59840624,
+          "bfree": 8040000,
+          "bavail": 8040000,
+          "files": 324349984,
+          "ffree": 321925960,
+          "flags": 270536728
+        },
+        "fsid": [
+          805306432,
+          24
+        ],
+        "pathconf": {
+          "PC_NAME_MAX": 255,
+          "PC_LINK_MAX": 32767,
+          "PC_CHOWN_RESTRICTED": 1,
+          "PC_NO_TRUNC": 1,
+          "PC_FILESIZEBITS": 42
+        },
+        "path_max_probe": {
+          "errno": 22
+        }
+      }
+    },
+    "limits": [
+      "shared host capacity; no quota/reservation",
+      "no exact free-count equality between calls",
+      "no disk-full or hardware durability qualification"
+    ],
+    "namespace": "/forkfs-capacity-hpx8w81h",
+    "name_limits": {
+      "ascii_255_accepted": true,
+      "ascii_256_errno": 63,
+      "utf8_255_accepted": true,
+      "utf8_256_accepted": false
+    },
+    "inclusive_file_limit": {
+      "bytes": 1099511627776,
+      "next_size_errno": 27,
+      "failure_preserves_data": true
+    },
+    "revision": "capacity_hpx8w81h",
+    "revision_data_verified": true
+  },
+  "offline_gc": {
+    "collected_objects": 322
+  },
+  "storage_check_after_gc": {
+    "service": "forkfsd",
+    "state": "leveldb",
+    "storage_engine": "leveldb",
+    "repository_id": "e84f92845e351bfbb1cf3fca43906ad4",
+    "degraded_anchor": false,
+    "mounted": false,
+    "transactions_supported": true,
+    "requires_reopen": false,
+    "last_committed_seq": 95,
+    "checkpoint_seq": 0,
+    "replayed_transactions": 0,
+    "indexed_objects": 116,
+    "object_roots": 140,
+    "compaction_running": false,
+    "compaction_queued": 0,
+    "compaction_active": false,
+    "compaction_completed": 0,
+    "compaction_races": 0,
+    "compaction_failures": 0,
+    "compaction_last_error": "",
+    "metadata_prepare_ns": 0,
+    "storage_metrics": {
+      "transactions": 0,
+      "prepare_ns": 0,
+      "write_ns": 0,
+      "wal_sync_calls": 0,
+      "wal_sync_ns": 0,
+      "other_sync_calls": 2,
+      "other_sync_ns": 22741042,
+      "wal_append_bytes": 0,
+      "wal_append_ns": 0,
+      "wal_flush_ns": 0
+    },
+    "uncommitted_tail": false
+  },
+  "namespace_check_after_gc": {
+    "service": "forkfsd",
+    "state": "leveldb",
+    "storage_engine": "leveldb",
+    "repository_id": "e84f92845e351bfbb1cf3fca43906ad4",
+    "degraded_anchor": false,
+    "mounted": false,
+    "transactions_supported": true,
+    "requires_reopen": false,
+    "last_committed_seq": 95,
+    "checkpoint_seq": 0,
+    "replayed_transactions": 0,
+    "indexed_objects": 116,
+    "object_roots": 140,
+    "compaction_running": false,
+    "compaction_queued": 0,
+    "compaction_active": false,
+    "compaction_completed": 0,
+    "compaction_races": 0,
+    "compaction_failures": 0,
+    "compaction_last_error": "",
+    "metadata_prepare_ns": 0,
+    "storage_metrics": {
+      "transactions": 0,
+      "prepare_ns": 0,
+      "write_ns": 0,
+      "wal_sync_calls": 0,
+      "wal_sync_ns": 0,
+      "other_sync_calls": 2,
+      "other_sync_ns": 22928875,
+      "wal_append_bytes": 0,
+      "wal_append_ns": 0,
+      "wal_flush_ns": 0
+    },
+    "uncommitted_tail": false
+  },
+  "readonly_revision_after_gc": {
+    "platform": "macOS-27.2.1-arm64-arm-64bit",
+    "filesystem": "forkfs",
+    "queries": {
+      "directory": {
+        "statvfs": {
+          "f_bsize": 1048576,
+          "f_frsize": 4096,
+          "f_blocks": 59840624,
+          "f_bfree": 8040000,
+          "f_bavail": 8040000,
+          "f_files": 324054519,
+          "f_ffree": 321630480,
+          "f_flag": 3,
+          "f_namemax": 255
+        },
+        "statfs": {
+          "bsize": 4096,
+          "iosize": 1048576,
+          "blocks": 59840624,
+          "bfree": 8040000,
+          "bavail": 8040000,
+          "files": 324054519,
+          "ffree": 321630480,
+          "flags": 270536729
+        },
+        "fsid": [
+          805306433,
+          24
+        ],
+        "pathconf": {
+          "PC_NAME_MAX": 255,
+          "PC_LINK_MAX": 32767,
+          "PC_CHOWN_RESTRICTED": 1,
+          "PC_NO_TRUNC": 1,
+          "PC_FILESIZEBITS": 42
+        },
+        "path_max_probe": {
+          "errno": 22
+        }
+      },
+      "fd": {
+        "statvfs": {
+          "f_bsize": 1048576,
+          "f_frsize": 4096,
+          "f_blocks": 59840624,
+          "f_bfree": 8040000,
+          "f_bavail": 8040000,
+          "f_files": 324054519,
+          "f_ffree": 321630480,
+          "f_flag": 3,
+          "f_namemax": 255
+        },
+        "statfs": {
+          "bsize": 4096,
+          "iosize": 1048576,
+          "blocks": 59840624,
+          "bfree": 8040000,
+          "bavail": 8040000,
+          "files": 324054519,
+          "ffree": 321630480,
+          "flags": 270536729
+        },
+        "fsid": [
+          805306433,
+          24
+        ],
+        "pathconf": {
+          "PC_NAME_MAX": 255,
+          "PC_LINK_MAX": 32767,
+          "PC_CHOWN_RESTRICTED": 1,
+          "PC_NO_TRUNC": 1,
+          "PC_FILESIZEBITS": 42
+        },
+        "path_max_probe": {
+          "errno": 22
+        }
+      }
+    },
+    "limits": [
+      "shared host capacity; no quota/reservation",
+      "no exact free-count equality between calls",
+      "no disk-full or hardware durability qualification"
+    ],
+    "readonly_after_gc": true
+  },
+  "limits": [
+    "Host-space figures are not forkfs quota/reservation; free counts vary between queries",
+    "PC_PATH_MAX EINVAL on tested child directory and file fd; not complete pathconf compatibility",
+    "APFS accepted tested 256-byte multibyte name; forkfs has 255 UTF-8 byte component limit",
+    "PC_FILESIZEBITS 42 includes sign bit and the exact 1 TiB endpoint; not a 4 TiB write guarantee",
+    "No disk-full, power-loss, multi-user or Linux mount qualification; no frontend bundle replacement"
+  ],
+  "cleanup": {
+    "owned_mount_unmounted": true,
+    "owned_services_stopped": true
+  }
+}

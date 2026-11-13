@@ -691,3 +691,31 @@ is unchanged; macOS CTest adds the APFS reference without requiring a mount.
 See [evidence](evidence/2026-11-13-copy-transfer.json),
 [Apple copyfile](https://github.com/apple-oss-distributions/copyfile/blob/main/copyfile.3)
 and [Darwin sendfile](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/sendfile.2.html).
+
+### Volume capacity and pathname limits
+
+```sh
+python3 scripts/tests/volume_capacity_mount.py /private/tmp --reference-apfs
+python3 scripts/tests/volume_capacity_mount.py /path/to/private/mount \
+  --daemon build/Release/daemon/forkfsd --socket /path/to/runtime/control.sock > /tmp/capacity.json
+# Unmount, stop services, run offline GC, then mount the reported revision readonly:
+python3 scripts/tests/volume_capacity_mount.py /path/to/private/mount --verify-report /tmp/capacity.json
+```
+
+Use a disposable repository: the script retains one revision. Native statfs and
+statvfs queries cover path/fd geometry, flags and count bounds through rename,
+unlink and path reuse. Free counts come from the shared host volume and can
+change between calls; they provide neither a quota nor a reservation. Readonly
+revisions still report that capacity, while exposing readonly flags and EROFS.
+The script checks the actual inclusive 1 TiB limit and failed oversize truncate.
+The signed representation requires PC_FILESIZEBITS=42; it is not a 4 TiB promise.
+
+Overlong namespace components/absolute paths and symlink targets now return
+ENAMETOOLONG through RPC, including FSKit lookup/create requests. Other invalid
+names still return EINVAL. No frontend format or signing update is required for
+this daemon correction. PC_NAME_MAX=255 describes forkfs's UTF-8 byte bound;
+APFS accepts the tested 256-byte multibyte name. PC_PATH_MAX returns EINVAL for
+the tested child directory/file fd, and is recorded as a capability limitation.
+The public PathConfOperations protocol has no total-path-length property.
+See [evidence](evidence/2026-11-13-volume-capacity.json) and
+[Apple PathConfOperations](https://developer.apple.com/documentation/fskit/fsvolume/pathconfoperations).

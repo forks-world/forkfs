@@ -111,11 +111,21 @@ with tempfile.TemporaryDirectory(prefix='ff-unicode-', dir='/tmp') as temporary:
                    ('界'*85+'a').encode(), ('😀'*64).encode()]
         sequence = obj('status')['last_committed_seq']
         for name in invalid:
-            rpc('inode-mkdir', inode, name, str(0o700), *selector, error=errno.EINVAL)
-            rpc('inode-symlink', inode, '拒绝创建', name, *selector, error=errno.EINVAL)
-            rpc('inode-link', file_inode, inode, name, *selector, error=errno.EINVAL)
-            rpc('inode-rename', inode, 'RPC文件📄', inode, name, file_inode, '-', *selector, error=errno.EINVAL)
-        rpc('inode-symlink', inode, '拒绝创建', ('界'*1366).encode(), *selector, error=errno.EINVAL)
+            error = errno.ENAMETOOLONG if len(name)>255 else errno.EINVAL
+            rpc('inode-mkdir', inode, name, str(0o700), *selector, error=error)
+            rpc('inode-symlink', inode, '拒绝创建', name, *selector, error=error)
+            rpc('inode-link', file_inode, inode, name, *selector, error=error)
+            rpc('inode-rename', inode, 'RPC文件📄', inode, name, file_inode, '-', *selector, error=error)
+        for name in ['a'*256, 'é'*128]:
+            rpc('inode-lookup', inode, name, *selector, error=errno.ENAMETOOLONG)
+            rpc('inode-create', inode, name, str(0o600), *selector, error=errno.ENAMETOOLONG)
+            rpc('fs-stat', '/'+name, error=errno.ENAMETOOLONG)
+        # Components individually fit; the full absolute path exceeds 4096.
+        long_path = '/'+'/'.join(['a'*255]*16)+'/x'
+        assert len(long_path.encode()) > 4096
+        rpc('fs-stat', long_path, error=errno.ENAMETOOLONG)
+        rpc('fs-mkdir', long_path, *selector, error=errno.ENAMETOOLONG)
+        rpc('inode-symlink', inode, '拒绝创建', ('界'*1366).encode(), *selector, error=errno.ENAMETOOLONG)
         assert obj('status')['last_committed_seq'] == sequence
         assert obj('inode-lookup', inode, 'RPC文件📄', *selector)['inode_id'] == file_inode
         rpc('fs-check')

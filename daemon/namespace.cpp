@@ -175,14 +175,16 @@ void valid_xattr_name(const std::string& name) {
     need(!name.empty(),"invalid empty extended attribute name");need(name.size()<=255,"extended attribute name exceeds 255 bytes");valid_namespace_text(name);
 }
 std::vector<std::string> components(const std::string& path) {
-    need(!path.empty() && path[0]=='/' && path.size()<=4096,"path must be absolute and at most 4096 bytes");
+    need(!path.empty() && path[0]=='/',"path must be absolute");
+    if(path.size()>4096)throw std::system_error(ENAMETOOLONG,std::generic_category(),"path exceeds 4096 bytes");
     std::vector<std::string> result;
     if(path=="/")return result;
     size_t begin=1;
     while(begin<path.size()) {
         auto end=path.find('/',begin);if(end==std::string::npos)end=path.size();
         auto name=path.substr(begin,end-begin);
-        need(!name.empty() && name!="." && name!=".." && name.size()<=255,"invalid path component");
+        need(!name.empty() && name!="." && name!="..","invalid path component");
+        if(name.size()>255)throw std::system_error(ENAMETOOLONG,std::generic_category(),"path component exceeds 255 bytes");
         valid_namespace_text(name);
         result.push_back(name);begin=end+1;
         need(end==path.size() || begin<path.size(),"trailing slash is unsupported");
@@ -190,12 +192,16 @@ std::vector<std::string> components(const std::string& path) {
     return result;
 }
 std::vector<std::string> target_components(const std::string& target) {
-    need(!target.empty() && target.size()<=4096,"invalid symlink target length");
+    need(!target.empty(),"invalid symlink target length");
+    if(target.size()>4096)throw std::system_error(ENAMETOOLONG,std::generic_category(),"symlink target exceeds 4096 bytes");
     valid_namespace_text(target);
     std::vector<std::string> result;size_t start=0;
     while(start<target.size()) {
         auto end=target.find('/',start);if(end==std::string::npos)end=target.size();auto name=target.substr(start,end-start);
-        if(!name.empty()){need(name.size()<=255,"invalid symlink component");result.push_back(name);}start=end+1;
+        if(!name.empty()){
+            if(name.size()>255)throw std::system_error(ENAMETOOLONG,std::generic_category(),"symlink component exceeds 255 bytes");
+            result.push_back(name);
+        }start=end+1;
     }
     // Preserve a target's trailing slash requirement during traversal.
     if(target.back()=='/' && !result.empty())result.push_back(".");return result;
