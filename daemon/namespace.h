@@ -41,7 +41,9 @@ public:
     DirectoryPage read_directory(DirectoryCursor& cursor,size_t limit,bool attributes=false) const;
     void rewind_directory(DirectoryCursor& cursor) const;
     enum class Access {Read,Write,ReadWrite};
-    struct OpenOptions {bool create=false,exclusive=false,truncate=false;uint32_t mode=0644;bool append=false,nofollow=false,symlink=false;};
+    struct OpenOptions {bool create=false,exclusive=false,truncate=false;uint32_t mode=0644;bool append=false,nofollow=false,symlink=false;
+        // Frontends supply already positioned writes; they must still pass EOF checks.
+        bool positioned_append=false;};
     explicit Namespace(Container& container,std::string view="main",bool revision=false)
         :container_(container),view_(std::move(view)),revision_(revision) {}
     // Stateless page over two immutable revisions with an exclusive path cursor.
@@ -108,6 +110,7 @@ public:
     InodeInfo handle_stat(const std::string& handle) const;
     std::vector<unsigned char> handle_read(const std::string& handle,uint64_t offset,uint64_t count) const;
     void handle_write(const std::string& handle,uint64_t offset,const std::vector<unsigned char>& value);
+    void handle_writeback(const std::string& handle,uint64_t offset,const std::vector<unsigned char>& value);
     uint64_t handle_append(const std::string& handle,const std::vector<unsigned char>& value);
     void handle_truncate(const std::string& handle,uint64_t size);
 private:

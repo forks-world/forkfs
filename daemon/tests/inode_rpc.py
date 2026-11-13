@@ -108,10 +108,25 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         assert obj('status')['last_committed_seq']==immutable_seq
         rpc('fs-hwrite',handle,'0',b'abc\x00def',*sel) # previously admitted writer
         obj('inode-setattr-flags',fid,'-','-','-','-','-','0',handle,*sel)
+        obj('inode-setattr-flags',fid,'-','-','-','-','-','4',handle,*sel)
+        append_seq=obj('status')['last_committed_seq']
+        rpc('inode-open',fid,'rw',*sel,error=errno.EPERM)
+        rpc('fs-hwrite',handle,'0',b'X',*sel,error=errno.EPERM)
+        rpc('fs-htruncate',handle,'0',*sel,error=errno.EPERM)
+        rpc('inode-setattr',fid,str(0o700),'-','-',handle,*sel,error=errno.EPERM)
+        assert obj('status')['last_committed_seq']==append_seq
+        appender=obj('inode-open',fid,'rw,positioned-append',*sel)['handle']
+        rpc('fs-hwriteback',appender,'0',b'Xbc\x00defA',*sel,error=errno.EPERM)
+        rpc('fs-hwriteback',appender,'0',b'abc\x00defA',*sel)
+        rpc('fs-hwrite',appender,'0',b'X',*sel,error=errno.EPERM)
+        assert rpc('fs-hread',appender,'0','99',*sel)==b'abc\x00defA'
+        rpc('fs-close',appender,*sel)
+        obj('inode-setattr-flags',fid,'-','-','-','-','-','0',handle,*sel)
+        rpc('fs-htruncate',handle,'7',*sel)
         st=obj('inode-setattr-flags',fid,'-','-','-','-','-','32769',handle,*sel)
         assert st['flags']==32769
         flag_seq=obj('status')['last_committed_seq']
-        for invalid in ['4','4294967297']:
+        for invalid in ['8','4294967297']:
             rpc('inode-setattr-flags',fid,str(0o777),'0','0','-','-',invalid,handle,*sel,error=errno.ENOTSUP)
         assert obj('status')['last_committed_seq']==flag_seq
         assert obj('fs-hstat',handle,*sel)['flags']==32769

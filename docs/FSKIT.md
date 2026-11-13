@@ -623,3 +623,21 @@ fixture contains actual 32,767 references; native acceptance checks pathconf,
 failure immutability, capacity reuse and GC/readonly revision readback. The
 same APFS probe reports that its next link succeeds despite pathconf=32,767,
 so capacity equality is not claimed. See [evidence](evidence/2026-11-13-link-limits.json).
+
+### User append-only acceptance
+
+UF_APPEND is supported alongside immutable/hidden/nodump. The kernel admits
+O_APPEND opens; the frontend uses positioned RPC writers, preserving callback
+offsets. Its separate writeback RPC verifies existing prefix bytes before
+allowing an append across a partial cached page. The daemon still rejects a
+changed old byte, gaps, size changes and protected namespace/metadata mutations.
+Xattrs remain editable, matching the APFS probe. Ordinary RPC writes are EOF-only.
+
+Install matching new daemon/module versions: the new frontend RPCs are not
+accepted by old daemons. Old daemons also reject retained FFINOD04 append bits.
+The manual suite uses a 332804-byte append, fsync, daemon revision readback,
+directory entry constraints and flag clear, plus GC/readonly revision readback.
+This does not qualify append-only mmap, arbitrary concurrent writers, power loss,
+system protection flags or multi-user security. See
+[append evidence](evidence/2026-11-13-append-flags.json) and
+[Apple file flags](https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/FileSystemProgrammingGuide/FileSystemDetails/FileSystemDetails.html).

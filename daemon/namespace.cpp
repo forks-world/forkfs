@@ -92,6 +92,10 @@ std::unique_ptr<NamespaceView> retained_orphan(const Journal& journal,const std:
 void mutable_inode(const InodeInfo& n) {
     if(n.flags&file_flag_immutable)throw std::system_error(EPERM,std::generic_category(),"inode is user immutable");
 }
+void non_append_inode(const InodeInfo& n) {
+    if(n.flags&file_flag_append)throw std::system_error(EPERM,std::generic_category(),"inode is append only");
+}
+void mutable_metadata(const InodeInfo& n) {mutable_inode(n);non_append_inode(n);}
 Bytes encode(const InodeInfo& n) {
     Bytes b(n.flags?72:64);memcpy(b.data(),n.flags?"FFINOD04":n.size>legacy_file_bytes?"FFINOD03":"FFINOD02",8);store(b.data()+8,n.symlink?3:n.directory?2:n.chunked?4:1,4);
     store(b.data()+12,uint64_t(n.mode)|(n.xattrs?uint64_t(0x80000000U):0),4);store(b.data()+16,n.links,8);store(b.data()+24,n.size,8);
@@ -322,9 +326,19 @@ public:
         }
         return result;
     }
-    bool write(uint64_t offset,const Bytes& value) {
+    bool write(uint64_t offset,const Bytes& value,bool writeback=false) {
         need(value.size()<=Namespace::maximum_io_size,"file I/O exceeds 256 KiB");
         if(value.empty())return false;
+        if((n_.flags&file_flag_append) && offset!=n_.size) {
+            // Cached FSKit writes can include the preexisting partial page.
+            // Verify all overlap before staging anything; never accept a gap
+            // or a changed old byte, including on orphan/retained trees.
+            bool identical=false;
+            if(writeback && offset<n_.size){auto overlap=std::min<uint64_t>(value.size(),n_.size-offset);
+                auto old=read(offset,overlap);identical=std::equal(old.begin(),old.end(),value.begin());}
+            if(!identical)throw std::system_error(EPERM,std::generic_category(),"append-only write must preserve existing data");
+            if(value.size()<=n_.size-offset)return false;
+        }
         need(offset<=Namespace::maximum_file_size && value.size()<=Namespace::maximum_file_size-offset,"file exceeds 1 TiB");
         auto end=offset+value.size();
         if(!n_.chunked && end<=Namespace::maximum_io_size) {
@@ -342,7 +356,7 @@ public:
         n_.size=std::max(n_.size,end);return true;
     }
     bool resize(uint64_t size) {
-        need(size<=Namespace::maximum_file_size,"file exceeds 1 TiB");if(size==n_.size)return false;
+        non_append_inode(n_);need(size<=Namespace::maximum_file_size,"file exceeds 1 TiB");if(size==n_.size)return false;
         if(!n_.chunked && size<=Namespace::maximum_io_size){auto data=get(inline_);need(data.size()==n_.size,"inode size mismatch");data.resize(size,0);(*changes_)[inline_]=std::move(data);}
         else {
             promote();
@@ -783,7 +797,7 @@ void Namespace::write(const std::string& path,const Bytes& value) {
             if(id.empty()){p=std::move(destination);exists=false;id=new_id(j);}
         }
         auto n=exists?inode(j,id):created({id,false,0644,1,0,now(),now()});
-        need(!n.directory && !n.symlink,"cannot write non-regular file");mutable_inode(n);if(n.chunked){for(const auto& key:FileContent(n,j).records())c[key]=std::nullopt;n.chunked=false;}n.size=value.size();touch(n);
+        need(!n.directory && !n.symlink,"cannot write non-regular file");mutable_metadata(n);if(n.chunked){for(const auto& key:FileContent(n,j).records())c[key]=std::nullopt;n.chunked=false;}n.size=value.size();touch(n);
         c[inode_key(id)]=encode(n);c[content_key(id)]=value;
         if(!exists){auto pn=inode(j,p.id);mutable_inode(pn);touch(pn);c[inode_key(p.id)]=encode(pn);c[p.key]=id_bytes(id);c[allocated_key(id)]=Bytes{};}
     });
@@ -793,7 +807,7 @@ void Namespace::replace_file(const std::string& path,const Bytes& value) {
     update([&](const NamespaceView& view,Changes& changes) {
         auto p=parent(view,path);mutable_inode(inode(view,p.id));uint32_t mode=0644;
         if(view.contains(p.key)) {
-            auto old=inode(view,decode_id(view.get(p.key)));mutable_inode(old);need(!old.directory,"cannot replace directory with a file");
+            non_append_inode(inode(view,p.id));auto old=inode(view,decode_id(view.get(p.key)));mutable_metadata(old);need(!old.directory,"cannot replace directory with a file");
             if(!old.symlink)mode=old.mode;
             if(old.links==1)retire(view,changes,old);
             else {--old.links;old.changed_ns=now();changes[inode_key(old.id)]=encode(old);}
@@ -892,6 +906,7 @@ void mutable_attributes(const InodeInfo& n,const Namespace::Attributes& a,bool a
     // Flag-only changes are owner operations. Existing write descriptions retain
     // their data/size rights, matching Darwin; this is not fd permission revocation.
     if(a.mode || a.modified_ns || a.accessed_ns || a.birth_ns || (a.size && !admitted_writer))mutable_inode(n);
+    if(a.mode || a.modified_ns || a.accessed_ns || a.birth_ns || a.size)non_append_inode(n);
 }
 void apply_attributes(InodeInfo& n,const Namespace::Attributes& a) {
     if(a.flags)n.flags=*a.flags;if(a.mode)n.mode=*a.mode;if(a.modified_ns)n.modified_ns=*a.modified_ns;n.changed_ns=now();
@@ -952,7 +967,7 @@ std::string Namespace::readlink(const std::string& path) const {
 }
 void Namespace::link(const std::string& source,const std::string& target) {
     update([&](const NamespaceView& j,Changes& c) {
-        auto id=resolve(j,source,false);auto n=inode(j,id);mutable_inode(n);need(!n.directory,"directory hard links are forbidden");
+        auto id=resolve(j,source,false);auto n=inode(j,id);mutable_metadata(n);need(!n.directory,"directory hard links are forbidden");
         auto p=parent(j,target);mutable_inode(inode(j,p.id));need(!j.contains(p.key),"target already exists");link_capacity(n.links);
         ++n.links;n.changed_ns=now();auto pn=inode(j,p.id);touch(pn);
         c[p.key]=id_bytes(id);c[inode_key(id)]=encode(n);c[inode_key(p.id)]=encode(pn);c[allocated_key(id)]=Bytes{};
@@ -981,7 +996,7 @@ void Namespace::retire(const NamespaceView& j,Changes& c,const InodeInfo& n) {
 }
 void Namespace::remove(const std::string& path,bool directory) {
     update([&](const NamespaceView& j,Changes& c) {
-        auto p=parent(j,path);need(j.contains(p.key),"path not found");auto id=decode_id(j.get(p.key));auto n=inode(j,id),pn=inode(j,p.id);mutable_inode(n);mutable_inode(pn);
+        auto p=parent(j,path);need(j.contains(p.key),"path not found");auto id=decode_id(j.get(p.key));auto n=inode(j,id),pn=inode(j,p.id);mutable_metadata(n);mutable_metadata(pn);
         need(!directory || n.directory,"path is not a directory");
         need(directory || !n.directory,"cannot unlink a directory");
         if(directory){need(j.keys(directory_prefix(id)).empty(),"directory is not empty");--pn.links;}
@@ -995,13 +1010,13 @@ void Namespace::rename(const std::string& source,const std::string& target) {
     update([&](const NamespaceView& j,Changes& c) {
         auto src=parent(j,source);need(j.contains(src.key),"source not found");auto id=decode_id(j.get(src.key));auto n=inode(j,id);
         std::vector<std::string> ancestry;auto dst=parent(j,target,&ancestry);
-        mutable_inode(n);mutable_inode(inode(j,src.id));mutable_inode(inode(j,dst.id));
+        mutable_metadata(n);mutable_metadata(inode(j,src.id));mutable_inode(inode(j,dst.id));
         if(src.key==dst.key)return;
         if(n.directory)need(std::find(ancestry.begin(),ancestry.end(),id)==ancestry.end(),"cannot move directory into itself");
         std::map<std::string,InodeInfo> parents;parents.emplace(src.id,inode(j,src.id));parents.emplace(dst.id,inode(j,dst.id));
         if(j.contains(dst.key)) {
             auto replaced=decode_id(j.get(dst.key));if(replaced==id)return;
-            auto other=inode(j,replaced);mutable_inode(other);need(!other.directory || n.directory,"rename target is a directory");
+            non_append_inode(inode(j,dst.id));auto other=inode(j,replaced);mutable_metadata(other);need(!other.directory || n.directory,"rename target is a directory");
             need(other.directory || !n.directory,"rename target is not a directory");
             if(other.directory){need(j.keys(directory_prefix(replaced)).empty(),"target directory is not empty");--parents.at(dst.id).links;}
             if(other.directory || other.links==1)retire(j,c,other);
@@ -1100,6 +1115,9 @@ std::string Namespace::open(const std::string& path,Access access,const OpenOpti
     } else {id=resolve(view,path,!(options.nofollow || options.symlink));need(!options.nofollow || !inode(view,id).symlink,"final symbolic link is forbidden");}
     if(changes.empty()) {
         auto n=inode(view,id);if(access!=Access::Read || options.truncate || options.append)mutable_inode(n);need(!n.directory,"cannot read a directory");need(!n.symlink || options.symlink,"symbolic link open is forbidden");
+        if(n.flags&file_flag_append){
+            if(options.truncate || (access!=Access::Read && !options.append && !options.positioned_append))non_append_inode(n);
+        }
         if(options.truncate && n.size!=0){FileContent(n,view,&changes).resize(0);touch(n);changes[inode_key(id)]=encode(n);}
     }
     auto token=new_id(view);while(token==id || container_.handles_.contains(token))token=new_id(view);
@@ -1230,6 +1248,10 @@ void Namespace::edit_handle(const std::string& token,const std::function<bool(Fi
 void Namespace::handle_write(const std::string& token,uint64_t offset,const Bytes& value) {
     need(offset<=INT64_MAX,"file offset exceeds signed 64-bit range");
     edit_handle(token,[&](FileContent& data,bool append){return data.write(append?data.size():offset,value);});
+}
+void Namespace::handle_writeback(const std::string& token,uint64_t offset,const Bytes& value) {
+    need(offset<=INT64_MAX,"file offset exceeds signed 64-bit range");
+    edit_handle(token,[&](FileContent& data,bool){return data.write(offset,value,true);});
 }
 uint64_t Namespace::handle_append(const std::string& token,const Bytes& value) {
     uint64_t offset=0;edit_handle(token,[&](FileContent& data,bool){offset=data.size();return data.write(offset,value);});return offset;
