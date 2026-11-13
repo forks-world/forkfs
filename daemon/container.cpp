@@ -153,7 +153,7 @@ void Container::create_legacy(const std::string& path) {
     // that another process might have replaced while initialization was running.
 }
 
-Container::Container(const std::string& path):repository_path_(path),allocation_cache_(std::make_unique<AllocationCache>()) {
+Container::Container(const std::string& path):repository_path_(path),allocation_cache_(std::make_unique<AllocationCache>()),tree_height_cache_(std::make_unique<TreeHeightCache>()) {
     struct stat backing{};
     if(lstat(path.c_str(),&backing)==0 && S_ISDIR(backing.st_mode)) {
         journal_=std::make_unique<Journal>(path);id_=journal_->repository();Namespace::recover_orphans(*this);return;
@@ -321,7 +321,7 @@ size_t Container::collect_garbage() {
     // Remove only unreachable entries; live indices remain usable for dedup.
     std::vector<std::string> obsolete;
     for(const auto& key:registry)if(!live.contains(j.root_object(key)))obsolete.push_back(key);
-    auto removed=j.collect(j.sequence(),live,obsolete);allocation_cache_->prune();j.compact();return removed;
+    auto removed=j.collect(j.sequence(),live,obsolete);allocation_cache_->prune();tree_height_cache_->prune();j.compact();return removed;
 }
 }
 

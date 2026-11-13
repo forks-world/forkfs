@@ -616,6 +616,34 @@ records. Clearing flags in a World does not remove version 4 records retained by
 revisions; use the updated daemon and FSKit module together, and do not downgrade
 while those records remain reachable.
 
+## Metadata height validation reuse
+
+Namespace commits share a repository-owned LRU of immutable tree-node heights
+across fresh editors. A cache hit still checks subtree height against its new
+depth after rotations/merges. Cold or evicted subtrees receive the full check;
+this does not disable the 256-level bound. Keys are content object IDs, never
+paths, inode timestamps or World names. Linked and retained orphan edits use
+this cache. It has a 64 MiB charged LRU budget (with small sharding overhead),
+retains no object roots, is pruned after physical GC, and disappears on reopen.
+Existing allocation and object caches remain separate. This changes no store,
+inode, manifest or RPC format.
+
+```sh
+cmake --build build/Release --target forkfsd_create_probe
+# Creates a NEW disposable repository, runs ordinary Namespace writes, then
+# checks reopen/GC/revision isolation. Timing excludes those verification steps.
+build/Release/daemon/forkfsd_create_probe /private/tmp/owned-create-probe 4000
+```
+
+The opt-in probe bounds count to 100000 and reports creation time and the last
+1000 operations. A single same-machine Release comparison of 4000 empty files
+measured 45.9 s before and 30.1 s after (tail 1000: 15.7 s and 8.1 s). This is a
+Namespace API measurement, not a mounted-create throughput guarantee. A fresh
+editor's deterministic height-cache test goes from 1001 cold misses to 7 warm
+misses on its fixture. Cold first writes still scan uncached subtrees; inode to
+path lookup and other metadata costs remain separate. See
+[validation evidence](../docs/evidence/2026-11-12-metadata-height-cache.json).
+
 ## Directory pages
 
 RPC offers `fs-dir-open PATH`, `fs-dir-page CURSOR LIMIT`, `fs-dir-rewind CURSOR`

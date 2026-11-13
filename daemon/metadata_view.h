@@ -6,6 +6,7 @@ namespace forkfs {
 // or flat roots for the legacy single-file backend.
 class MetadataTree;
 class AllocationCache;
+class TreeHeightCache;
 class NamespaceView {
 public:
     using ObjectId=std::array<unsigned char,32>;
@@ -29,7 +30,7 @@ public:
     uint64_t allocated_bytes(const std::string& prefix,AllocationCache& cache) const;
     bool legacy() const {return legacy_;}
     size_t run_count() const {return tree_?1:runs_.size();}
-    Plan plan(const Changes& changes,bool compact=false,const std::vector<Range>& erased={}) const;
+    Plan plan(const Changes& changes,bool compact=false,const std::vector<Range>& erased={},TreeHeightCache* heights=nullptr) const;
     Frozen freeze() const;
     static Plan compact_frozen(const Frozen& input);
     static void valid_name(const std::string& name);

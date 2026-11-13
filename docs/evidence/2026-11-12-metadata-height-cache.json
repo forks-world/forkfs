@@ -1,0 +1,281 @@
+{
+  "schema": 1,
+  "date": "2026-11-12",
+  "platform": "macOS-27.2.1-arm64-arm-64bit",
+  "base_commit": "6b4be10d5d4cceb90bd7f9c6b0683d6a9e7de340",
+  "source_tree_before_evidence": "997182ffa1398108c94b1d84ec03695d07c9e22a",
+  "validation": {
+    "isolated_release_ctest_passed": 57,
+    "isolated_release_ctest_failed": 0,
+    "ctest_seconds": 84.41,
+    "non_documentation_source_paths_match_isolated_copy": 134,
+    "system_only_dependencies": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "height_cache_test": {
+      "cold_misses": 1001,
+      "fresh_editor_warm_misses": 7,
+      "prune_and_small_budget_eviction_correct": true,
+      "cached_max_depth_insertion_and_rotation_rejected": true
+    },
+    "opt_in_create_probe_built_after_full_suite": true
+  },
+  "same_machine_namespace_api_probe": {
+    "count": 4000,
+    "baseline_production_source_paths_match_base": 20,
+    "probe_source_identical": true,
+    "baseline": {
+      "entries": 4000,
+      "create_seconds": 45.9081,
+      "last_1000_seconds": 15.6734,
+      "reopen_gc_revision_verified": true
+    },
+    "candidate": {
+      "entries": 4000,
+      "create_seconds": 30.0798,
+      "last_1000_seconds": 8.11836,
+      "reopen_gc_revision_verified": true
+    },
+    "creation_ratio_baseline_over_candidate": 1.526,
+    "scope": "One sequential Release pair on fresh owned repositories, ordinary Namespace writes; timings exclude snapshot/reopen/GC verification. Not a mounted-create or universal throughput result."
+  },
+  "native_runtime": {
+    "module_source_commit": "da278f1b6e502257faf4d9764f0c8638ec8b04cb",
+    "module_matches_unchanged_frontend_from_base": true,
+    "installed_signature_deep_strict_verified": true
+  },
+  "native_foundation": {
+    "mountpoint": "/private/tmp/height-mount-_956okii/mounted",
+    "namespace": "/forkfs-accept-4g7713dy",
+    "checks": [
+      "binary write/read/fsync reaches daemon content",
+      "native binary/empty xattrs, Finder tags, create policy and size limit",
+      "hardlink identity and symlink traversal",
+      "pathname/fd utime nanoseconds and native creation time reach revision inode",
+      "nofollow metadata, O_SYMLINK fds, cp -Pp binary xattrs and open-unlink/dup identity",
+      "native rename/removal/directory-hardlink errno and failed-operation atomicity",
+      "fsync then revision checkpoint isolates subsequent writes",
+      "xattrs follow hardlink identity, revision isolation and open-unlink handles",
+      "rename/open-unlink/truncate/path reuse preserve file identity",
+      "directory enumeration and dot entries",
+      "atomic-save replacement reaches revision-backed namespace",
+      "UTF-8 names, links, rename, NFC/NFD identity and byte limits",
+      "4 MiB file transfer, 64 MiB sparse growth, truncate zero-fill and chunked open-unlink"
+    ],
+    "timestamp_ns": {
+      "accessed_ns": 1234567890123456790,
+      "modified_ns": 1345678901234567891,
+      "birth_ns": 1123456789000000000
+    },
+    "symlink_attributes": {
+      "mode": 449,
+      "accessed_ns": 111111111111111111,
+      "modified_ns": 222222222222222222,
+      "birth_ns": 100000000000000000,
+      "target_unchanged": true,
+      "dangling_touch_h": true,
+      "dangling_cp_Pp": true,
+      "copied_binary_xattr": true,
+      "fd_open_unlink_dup": true,
+      "data_read_write_errno": "EPERM",
+      "truncate_errno": "EINVAL"
+    },
+    "retained_revision": "mount_accept_120612a4dff4",
+    "appledouble_sidecars": 0,
+    "unicode_retained_revision": "unicode_mount_d548a9ffd930",
+    "large_retained_revision": "large_mount_bd20d4fe8b1a",
+    "large_namespace": "/forkfs-accept-4g7713dy/large.bin"
+  },
+  "native_application_compatibility": {
+    "schema": 1,
+    "platform": "macOS-27.2.1-arm64-arm-64bit",
+    "filesystem": "forkfs",
+    "python": "3.9.6",
+    "cases": {
+      "mmap": {
+        "status": "passed",
+        "details": {
+          "page_size": 16384,
+          "shared_private_readonly": true,
+          "open_unlink": true
+        }
+      },
+      "lockf": {
+        "status": "passed",
+        "details": {
+          "cross_process_exclusion": true,
+          "close_and_exit_release": true,
+          "scope": "byte ranges (including disjoint ranges)"
+        }
+      },
+      "flock": {
+        "status": "passed",
+        "details": {
+          "cross_process_exclusion": true,
+          "close_and_exit_release": true,
+          "scope": "whole file"
+        }
+      },
+      "sqlite-delete": {
+        "status": "passed",
+        "details": {
+          "journal": "DELETE",
+          "sqlite_version": "3.54.0",
+          "concurrent_reader_writer": true,
+          "abrupt_process_exit_recovery": true
+        }
+      },
+      "sqlite-wal": {
+        "status": "passed",
+        "details": {
+          "journal": "WAL",
+          "sqlite_version": "3.54.0",
+          "concurrent_reader_writer": true,
+          "abrupt_process_exit_recovery": true
+        }
+      },
+      "git": {
+        "status": "passed",
+        "details": {
+          "version": "git version 2.54.0 (Apple Git-157)",
+          "checkout_merge_repack_fsck": true
+        }
+      },
+      "open-flags": {
+        "status": "passed",
+        "details": {
+          "rejected_combinations": 12,
+          "failure_preserves_file": true,
+          "dangling_create": true,
+          "truncate_preserves_inode": true,
+          "darwin_readonly_truncate": true,
+          "umask": "0027 -> 0640"
+        }
+      },
+      "append": {
+        "status": "passed",
+        "details": {
+          "processes": 4,
+          "records_per_process": 4,
+          "record_bytes": 307200,
+          "no_lost_or_interleaved_records": true,
+          "darwin_pwrite_ignores_append": true
+        }
+      },
+      "permissions": {
+        "status": "passed",
+        "details": {
+          "mode_access_checks": true,
+          "directory_search_and_write": true,
+          "open_fd_survives_chmod": true,
+          "denied_mutations_preserve_data": true
+        }
+      },
+      "relative-paths": {
+        "status": "passed",
+        "details": {
+          "openat_statat_linkat_renameat_unlinkat_mkdirat_readlinkat": true,
+          "directory_fd_survives_rename": true
+        }
+      }
+    },
+    "capability_probes": {
+      "rename-extensions": {
+        "status": "measured",
+        "details": {
+          "swap": {
+            "errno": 45,
+            "operation_completed": false,
+            "unsupported": true
+          },
+          "exclusive-existing": {
+            "errno": 17,
+            "operation_completed": false,
+            "unsupported": false
+          },
+          "exclusive-missing": {
+            "errno": 45,
+            "operation_completed": false,
+            "unsupported": true
+          }
+        }
+      }
+    },
+    "limits": [
+      "single mount",
+      "no power-loss or kernel-crash guarantee",
+      "small-file workloads only"
+    ],
+    "forkfs_maximum_file_bytes": 1099511627776,
+    "revision": "api_accept_j660fo4z",
+    "revision_artifact": "/forkfs-api-j660fo4z/mmap/mapped-durable",
+    "mmap_backend_and_revision_isolation": true
+  },
+  "native_sparse_seek_orphan_revision": {
+    "filesystem": "forkfs",
+    "namespace": "/forkfs-seek-l13skma2",
+    "revision": "seek_accept_l13skma2",
+    "revision_isolation": true,
+    "first_data": 196608,
+    "first_hole": 262144,
+    "eof_enxio": true,
+    "one_tib_sparse": true,
+    "orphan_dup_path_reuse": true
+  },
+  "offline_gc": {
+    "collected_objects": 20796
+  },
+  "storage_check_after_gc": {
+    "service": "forkfsd",
+    "state": "leveldb",
+    "storage_engine": "leveldb",
+    "repository_id": "28b74954514bda97ed5cb9c2f32307cf",
+    "degraded_anchor": false,
+    "mounted": false,
+    "transactions_supported": true,
+    "requires_reopen": false,
+    "last_committed_seq": 1106,
+    "checkpoint_seq": 0,
+    "replayed_transactions": 0,
+    "indexed_objects": 1449,
+    "object_roots": 1633,
+    "compaction_running": false,
+    "compaction_queued": 0,
+    "compaction_active": false,
+    "compaction_completed": 0,
+    "compaction_races": 0,
+    "compaction_failures": 0,
+    "compaction_last_error": "",
+    "metadata_prepare_ns": 0,
+    "storage_metrics": {
+      "transactions": 0,
+      "prepare_ns": 0,
+      "write_ns": 0,
+      "wal_sync_calls": 0,
+      "wal_sync_ns": 0,
+      "other_sync_calls": 2,
+      "other_sync_ns": 11941625,
+      "wal_append_bytes": 0,
+      "wal_append_ns": 0,
+      "wal_flush_ns": 0
+    },
+    "uncommitted_tail": false
+  },
+  "readonly_revision_after_gc": {
+    "seek_after_gc_readonly_remount": true
+  },
+  "sha256": {
+    "daemon": "50a046f56cf62ded48802062669a30ffebd4831e1b09d181dac2511a10c8f35f",
+    "create_probe": "19af75cb95303d474ec2ff1de7deaf07ac4ffd937f907e18177bb53824d7025f",
+    "probe_source": "7277aa7e9459246d4b1715298c4c4fadc3f8657b39a3cdac276cb27cc65fafde",
+    "installed_signed_extension": "ed37c1a2a0c2d19ae7eb853a9be3eaf9ca48a0b43b5799d307a927594e640bde"
+  },
+  "limits": [
+    "64 MiB charged LRU height-summary budget per open Container, plus small sharding/allocator overhead and existing separate caches. Entries are immutable content-ID heights, not file paths or timestamps.",
+    "Every reuse checks height against new depth; the 256-level bound remains. Cold/evicted subtrees require a full traversal. Cache is pruned after GC and empty on reopen; it retains no object roots.",
+    "No store, inode, manifest or RPC format changes; legacy backend behavior remains supported. Native checks use private single-user macOS 27.2.1 arm64.",
+    "The 4000-file comparison is a single Namespace API experiment, not 66000-file or native throughput qualification. Inode-to-path scans, other metadata costs, FSEvents, full POSIX/APFS compatibility and power-loss guarantees remain separate."
+  ]
+}

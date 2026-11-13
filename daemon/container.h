@@ -11,6 +11,7 @@
 
 namespace forkfs {
 class AllocationCache;
+class TreeHeightCache;
 // Exclusive container owner; named-object journal is an experimental transaction profile.
 class Container {
 public:
@@ -68,5 +69,6 @@ private:
     uint64_t anchor_offset_ = 0;
     std::unique_ptr<Journal> journal_;
     std::unique_ptr<AllocationCache> allocation_cache_;
+    std::unique_ptr<TreeHeightCache> tree_height_cache_;
 };
 }

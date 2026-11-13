@@ -18,6 +18,22 @@ void AllocationCache::put(const std::array<unsigned char,32>& id,Summary value) 
     owned.release();cache_->Release(handle);
 }
 void AllocationCache::prune(){cache_->Prune();}
+TreeHeightCache::TreeHeightCache(size_t bytes):cache_(leveldb::NewLRUCache(bytes)) {}
+TreeHeightCache::~TreeHeightCache()=default;
+std::optional<unsigned> TreeHeightCache::get(const std::array<unsigned char,32>& id) {
+    auto handle=cache_->Lookup(leveldb::Slice(reinterpret_cast<const char*>(id.data()),id.size()));
+    if(!handle){++misses_;return std::nullopt;}
+    auto height=*static_cast<unsigned*>(cache_->Value(handle));cache_->Release(handle);++hits_;return height;
+}
+void TreeHeightCache::put(const std::array<unsigned char,32>& id,unsigned height) {
+    if(!height || height>256)throw std::runtime_error("invalid metadata height summary");
+    auto owned=std::make_unique<unsigned>(height);
+    auto handle=cache_->Insert(leveldb::Slice(reinterpret_cast<const char*>(id.data()),id.size()),owned.get(),sizeof(unsigned)+32+128,
+        [](const leveldb::Slice&,void* p){delete static_cast<unsigned*>(p);});
+    owned.release();cache_->Release(handle);
+}
+void TreeHeightCache::prune(){cache_->Prune();}
+size_t TreeHeightCache::charge() const {return cache_->TotalCharge();}
 namespace {
 using Id=MetadataTree::Id;
 using Bytes=MetadataTree::Bytes;
@@ -50,14 +66,17 @@ Id MetadataTree::make(const Node& n) {
     memcpy(b.data()+108,n.key.data(),n.key.size());auto id=Journal::object_id(b);
     cache_[id]=n;pending_.emplace(id,std::move(b));return id;
 }
-unsigned MetadataTree::height(Id root,unsigned depth) const {
+unsigned MetadataTree::height(Id root,unsigned depth,TreeHeightCache* shared) const {
     if(root==Id{})return 0;
     need(depth<256,"metadata tree depth limit");
     auto known=heights_.find(root);
     if(known!=heights_.end()){need(known->second<=256-depth,"metadata tree depth limit");return known->second;}
+    if(shared)if(auto cached=shared->get(root)){
+        need(*cached<=256-depth,"metadata tree depth limit");heights_.emplace(root,*cached);return *cached;
+    }
     const auto& n=node(root);
-    auto result=1+std::max(height(n.left,depth+1),height(n.right,depth+1));
-    heights_.emplace(root,result);return result;
+    auto result=1+std::max(height(n.left,depth+1,shared),height(n.right,depth+1,shared));
+    heights_.emplace(root,result);if(shared)shared->put(root,result);return result;
 }
 Id MetadataTree::merge(Id left,Id right) {
     struct Step {Node node;bool replace_right;};
@@ -169,7 +188,7 @@ MetadataTree::Map MetadataTree::entries() const {
     };
     walk(root_,nullptr,nullptr,0);return result;
 }
-MetadataTree::Plan MetadataTree::apply(const Changes& changes,const std::vector<Range>& erased) {
+MetadataTree::Plan MetadataTree::apply(const Changes& changes,const std::vector<Range>& erased,TreeHeightCache* shared) {
     const std::string namespace_root("\0forkfs/root",12);
     // Reject malformed batches before changing the editor, including absent
     // deletes and no-op updates that never reach make().
@@ -184,15 +203,15 @@ MetadataTree::Plan MetadataTree::apply(const Changes& changes,const std::vector<
         need(namespace_root<lower || namespace_root>=upper,"cannot delete namespace root");
     }
     // Validate the complete candidate: rotations can deepen untouched subtrees.
-    // Immutable-node heights are memoized; a cold persisted tree needs one
-    // full walk per editor, while subsequent checks visit only new CoW nodes.
+    // A shared cache reuses immutable heights across editors. Every reuse still
+    // checks the subtree height against its NEW depth after rotations/merges.
     auto candidate=root_;
     for(const auto& [lower,upper]:erased) {
         auto [left,tail]=split(candidate,lower);auto [removed,right]=split(tail,upper);
         (void)removed;candidate=merge(left,right);
     }
     for(const auto& [key,value]:changes)candidate=set(candidate,key,value);
-    if(candidate!=root_)height(candidate);
+    if(candidate!=root_)height(candidate,0,shared);
     Plan result;result.manifest.resize(40);memcpy(result.manifest.data(),"FFTREE01",8);memcpy(result.manifest.data()+8,candidate.data(),32);
     std::set<Id> visited;
     std::function<void(Id)> collect=[&](Id id) {

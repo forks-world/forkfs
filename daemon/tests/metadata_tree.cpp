@@ -52,6 +52,30 @@ std::pair<MetadataTree::Plan,std::string> deep_fixture(const Journal& journal,co
     }
     MetadataTree editor(journal);return {editor.apply(changes),branching?chain[254]:chain.back()};
 }
+void shared_height_cache(Journal& journal,const MetadataTree::Id& value,const MetadataTree::Id& changed) {
+    auto key=[](unsigned i){return std::string("\0forkfs/cache/",14)+std::to_string(i);};
+    MetadataTree::Changes changes{{std::string("\0forkfs/root",12),value}};
+    for(unsigned i=0;i<1000;++i)changes[key(i)]=value;
+    MetadataTree initial(journal);auto plan=initial.apply(changes);publish(journal,"height-initial",plan);
+    TreeHeightCache heights;
+    MetadataTree cold(journal,tree_root(plan));auto first=cold.apply({{key(0),changed}}, {},&heights);
+    auto cold_misses=heights.misses();check(cold_misses>=1000);publish(journal,"height-cold",first);
+    auto misses=heights.misses(),hits=heights.hits();
+    MetadataTree fresh(journal,tree_root(first));auto second=fresh.apply({{key(999),changed}}, {},&heights);
+    auto warm_misses=heights.misses()-misses;
+    check(heights.hits()>hits && warm_misses<128 && warm_misses<cold_misses/4);
+    publish(journal,"height-warm",second);check(MetadataTree(journal,tree_root(second)).lookup(key(999))==changed);
+    check(MetadataTree(journal,tree_root(plan)).lookup(key(0))==value);
+    heights.prune();check(heights.charge()==0);misses=heights.misses();
+    MetadataTree pruned(journal,tree_root(second));auto third=pruned.apply({{key(500),changed}}, {},&heights);
+    check(heights.misses()-misses>=1000);publish(journal,"height-pruned",third);
+    TreeHeightCache tiny(1024);for(unsigned i=0;i<1000;++i){MetadataTree::Bytes bytes(8);memcpy(bytes.data(),&i,sizeof i);tiny.put(Journal::object_id(bytes),1);}
+    // LevelDB shards can retain one just-released entry above each shard budget.
+    check(tiny.charge()<=1024+16*(sizeof(unsigned)+32+128));
+    MetadataTree evicted(journal,tree_root(third));auto fourth=evicted.apply({{key(1),changed}}, {},&tiny);
+    publish(journal,"height-evicted",fourth);check(MetadataTree(journal,tree_root(fourth)).lookup(key(1))==changed);
+    std::cout<<"height cache cold misses="<<cold_misses<<" fresh-editor warm misses="<<warm_misses<<"\n";
+}
 int main() {
     auto pattern=(std::filesystem::temp_directory_path()/"ff-tree-XXXXXX").string();auto directory=mkdtemp(pattern.data());if(!directory)return 1;
     try {
@@ -61,7 +85,7 @@ int main() {
         auto id=Journal::object_id({42}),changed_id=Journal::object_id({43});
         MetadataTree::Map expected,expected_branching;
         {
-            Journal journal(path);journal.put("value",{42});journal.put("changed-value",{43});
+            Journal journal(path);journal.put("value",{42});journal.put("changed-value",{43});shared_height_cache(journal,id,changed_id);
             MetadataTree::Changes changes{{key("root"),id}};expected[key("root")]=id;
             for(int i=0;i<100;++i){changes[key("test/"+std::to_string(i))]=id;expected[key("test/"+std::to_string(i))]=id;}
             MetadataTree initial(journal);auto plan=initial.apply(changes);publish(journal,"snapshot",plan);old_root=tree_root(plan);
@@ -115,8 +139,10 @@ int main() {
             MetadataTree absent_deep(journal,deep_root);
             auto absent_plan=absent_deep.apply({{leaf+"x",std::nullopt}});
             check(absent_plan.objects.empty() && absent_plan.manifest==deep.manifest);
+            TreeHeightCache shared;
+            MetadataTree prime(journal,deep_root);(void)prime.apply({{key("root"),changed_id}}, {},&shared);
             MetadataTree too_deep(journal,deep_root);bool depth_rejected=false;
-            try{too_deep.apply({{leaf+"x",id}});}catch(const std::runtime_error& e){depth_rejected=std::string(e.what())=="metadata tree depth limit";}
+            try{too_deep.apply({{leaf+"x",id}}, {},&shared);}catch(const std::runtime_error& e){depth_rejected=std::string(e.what())=="metadata tree depth limit";}
             check(depth_rejected && too_deep.entries().size()==257);
             // A higher-priority left insertion at depth 254 would demote the
             // existing right leaf to depth 256 without visiting that leaf.
@@ -127,6 +153,9 @@ int main() {
             std::string rotation_key;
             for(unsigned i=0;i<200000;++i){auto k=predecessor+"/rotate-"+std::to_string(i);auto p=priority(k);if(p>priority(parent) && p<priority(predecessor)){rotation_key=k;break;}}
             check(!rotation_key.empty());
+            MetadataTree cached_rotate(journal,deep_root);bool cached_rejected=false;auto previous_hits=shared.hits();
+            try{cached_rotate.apply({{rotation_key,id}}, {},&shared);}catch(const std::runtime_error& e){cached_rejected=std::string(e.what())=="metadata tree depth limit";}
+            check(cached_rejected && shared.hits()>previous_hits && cached_rotate.entries()==deep_entries);
             MetadataTree rotate(journal,deep_root);auto before_rotation=rotate.apply({{key("root"),changed_id}});
             deep_entries[key("root")]=changed_id;
             bool rotation_rejected=false;
