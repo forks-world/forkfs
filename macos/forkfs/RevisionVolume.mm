@@ -299,7 +299,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 - (BOOL)isOpenCloseInhibited{return NO;}
 - (void)openItem:(FSItem*)item withModes:(FSVolumeOpenModes)modes replyHandler:(void(^)(NSError*))reply {
     NSError* e=[self perform:^{auto it=[self item:item];if(itemType(it.attrs)==FSItemTypeDirectory){require(!(modes&FSVolumeOpenModesWrite),EISDIR,"directory is not writable as a file");return;}require(itemType(it.attrs)==FSItemTypeFile || itemType(it.attrs)==FSItemTypeSymlink,ENOTSUP,"unsupported open inode type");
-        if((modes&FSVolumeOpenModesWrite) && !it.writer){[self writable];it.writer=[self json:@[@"inode-open",it.inode,@"rw"]][@"handle"];}
+        if((modes&FSVolumeOpenModesWrite) && !it.writer){[self writable];it.writer=[self json:@[@"inode-open",it.inode,@"rw,positioned-append"]][@"handle"];}
         if((modes&FSVolumeOpenModesRead) && !it.reader && !it.writer)it.reader=[self json:@[@"inode-open",it.inode,@"r"]][@"handle"];
     }];reply(e);
 }
@@ -327,7 +327,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
         // bounded RPCs; ioSize is a preference rather than a request limit.
         require(contents.length==0 || (uint64_t(offset)<=forkfs::maximum_file_bytes && contents.length<=forkfs::maximum_file_bytes-uint64_t(offset)),EFBIG,"file exceeds 1 TiB");
         while(count<contents.length){auto length=MIN(contents.length-count,size_t(256*1024));
-            std::vector<std::string> fields{"fs-hwrite",bytes(it.writer),std::to_string(uint64_t(offset)+count),std::string(static_cast<const char*>(contents.bytes)+count,length),_revision?"--revision":"--world",bytes(_view),"--session",bytes(_session)};
+            std::vector<std::string> fields{"fs-hwriteback",bytes(it.writer),std::to_string(uint64_t(offset)+count),std::string(static_cast<const char*>(contents.bytes)+count,length),_revision?"--revision":"--world",bytes(_view),"--session",bytes(_session)};
             forkfs::request_rpc(_socket,fields,_bridged?&_loopback:nullptr);count+=length;}
     }];reply(count,e);
 }

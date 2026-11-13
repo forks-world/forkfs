@@ -44,7 +44,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `ftruncate`、稀疏文件、`lseek` | setattr size + bounded chunk I/O | 挂载已测零填充、shrink/extend、64 MiB/4 GiB/1 TiB 边界；macOS 27 已挂载验收 `SEEK_DATA/SEEK_HOLE`（64 KiB chunk 粒度）；macOS 26 保留保守 fallback |
 | `F_PREALLOCATE`、`posix_fallocate`、hole punch | 可选 Preallocate/数据变更接口 | 未实现相应协议；不能声称空间预留或洞区间查询兼容 |
 | `statfs/statvfs/pathconf` | volumeStatistics、PathConfOperations | 回调/RPC 已测；空间来自宿主卷，不是 forkfs 配额，剩余空间不保证下一次写入成功 |
-| `chflags/fchflags/lchflags`、BSD flags | get/setAttributes → revision inode | 挂载已测 hidden/nodump 的路径/fd/nofollow、硬链接、cp -p、孤儿 fd 和历史隔离；新增 user immutable 的写打开/元数据/目录变更限制；append-only/nounlink/系统保护标记仍拒绝 |
+| `chflags/fchflags/lchflags`、BSD flags | get/setAttributes → revision inode | 挂载已测 hidden/nodump 的路径/fd/nofollow、硬链接、cp -p、孤儿 fd 和历史隔离；user immutable 及 user append-only 的数据/元数据/目录约束已接入；nounlink/系统保护标记仍拒绝 |
 | `mkfifo/mknod`、Unix socket 路径 | create item types | 缺失；当前只支持 regular/directory/symlink，不适合依赖这些节点的运行目录 |
 | `copyfile/clonefile/fcopyfile/sendfile` | 内核 fallback 或可选复制能力 | 普通 `cp` 部分场景已测；CoW clone、资源 fork 大值、完整 copyfile flags、sendfile 未验收 |
 | `kqueue` vnode 通知、文件监控、FSEvents | 内核 vnode 事件 | macOS 27.2 小仓库已测 WRITE/EXTEND/ATTRIB/LINK/RENAME/DELETE、父目录事件、跨进程写及路径重用隔离；FSEvents、递归监控、revoke 未验收 |
@@ -231,3 +231,11 @@ User immutable (`UF_IMMUTABLE`) 已在 daemon 的路径写入、写打开、元�
 链接；forkfs 不宣称相同额外容量。目录边界的快速单测使用合成计数，恢复真实
 计数后做完整校验，不把它当作 32,765 个子目录的性能验收。
 见 [链接容量证据](evidence/2026-11-13-link-limits.json)。
+
+User append-only (`UF_APPEND`) 允许从 EOF 追加，禁止覆写、空洞写入、截断、
+mode/时间变更及删除/改名/新增硬链接；目录允许新增子项和移动进入，禁止删除、
+替换或移出。xattr 按 APFS 实测保持可修改。普通 RPC 写入严格要求 EOF；
+FSKit 专用写回先比较已有前缀，只有完全相同的重写和 EOF 后追加才可成功，
+避免未满数据页的缓存写回使 fsync 失败。旧 fd 的覆写/截断也受 append 约束，
+区别于 immutable 的已授予数据权限。此功能不是不可撤销日志或多用户授权边界。
+见 [append-only 验收](evidence/2026-11-13-append-flags.json)。

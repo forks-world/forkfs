@@ -1421,3 +1421,40 @@ use generic code 1, and CLI process failure remains nonzero. This refines the
 error contract without a new frame, inode format or permission model. Native
 FSKit already rejects these operation types with the same macOS errors; the
 acceptance script verifies that behavior and repository-state stability.
+
+## User append-only
+
+`UF_APPEND` (4) is persisted in the existing FFINOD04 inode layout. Ordinary
+`write_at`/handle writes require EOF, `append`/append handles choose EOF under
+the repository lock, and whole-file writes and all truncation fail with EPERM.
+This applies to old, duplicated and orphan handles, inline and chunked files.
+Mode/time/xattr semantics differ: mode/times are protected, while xattrs remain
+editable as measured on APFS. Flag-only clear is supported; clearing together
+with protected changes fails atomically. Immutable combined with append still
+blocks append admission.
+
+An append-only directory admits new entries but prevents removal, replacement
+and moving entries out. Existing mutable children retain their own write rights.
+The inode itself cannot be linked, removed, renamed or replaced while append-only.
+System append and other unsupported protection flags remain rejected.
+
+FSKit lacks O_APPEND in its open callback and writes back cached partial pages.
+Its `rw,positioned-append` RPC open admits a positioned writer without relocating
+offsets; `fs-hwriteback` validates **every existing byte** in an overlapping
+request before staging changes, then permits only unchanged overlap and extension
+from EOF. An unchanged retry does not publish. A gap or changed prefix fails
+EPERM before publication. Ordinary `fs-hwrite` remains strictly EOF-only for
+append-only inodes. This is not a new general overwrite permission.
+
+Deploy matching new daemon and module binaries: the frontend uses the new open
+flag and writeback RPC. Older daemons reject the new inode flag bit even when
+only retained revisions contain it. There is no disk-layout migration. Explicit
+administrative restore can switch a World root; owner flag clear remains allowed.
+This is neither a WORM store nor a multi-user authorization boundary.
+
+Native acceptance: `python3 scripts/tests/append_flags_mount.py MOUNT --daemon
+BUILD/daemon/forkfsd --socket RUNTIME/control.sock`. Run the same script with
+`/private/tmp --reference-apfs` for comparison. It retains one revision; after
+unmount, offline GC and readonly mounting that revision, pass `--verify-report
+REPORT.json`. Use an owned disposable repository. See
+[evidence](../docs/evidence/2026-11-13-append-flags.json).

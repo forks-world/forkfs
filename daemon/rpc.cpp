@@ -134,7 +134,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     size_t count=2;
     if(op=="status" || op=="storage-profile" || op=="fs-init" || op=="fs-check" || op=="fs-worlds" || op=="fs-revisions" || op=="fs-compact")count=1;
     if(op=="fs-write" || op=="fs-save" || op=="fs-rename" || op=="fs-link" || op=="fs-fork" || op=="fs-restore" || op=="fs-append" || op=="fs-truncate" || op=="fs-open" || op=="fs-happend" || op=="fs-htruncate" || op=="fs-hread-next" || op=="fs-hwrite-next" || op=="fs-symlink" || op=="fs-chmod" || op=="fs-lchmod" || op=="fs-setmtime" || op=="fs-hchmod" || op=="fs-hsetmtime" || op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-hlock")count=3;
-    if(op=="fs-read-at" || op=="fs-write-at" || op=="fs-hread" || op=="fs-hwrite" || op=="fs-hseek" || op=="fs-hrange-lock")count=4;
+    if(op=="fs-read-at" || op=="fs-write-at" || op=="fs-hread" || op=="fs-hwrite" || op=="fs-hwriteback" || op=="fs-hseek" || op=="fs-hrange-lock")count=4;
     if(op=="fs-history")count=4;
     if(op=="inode-root" || op=="inode-sync" || op=="inode-space")count=1;
     if(op=="inode-stat" || op=="inode-dir-open" || op=="inode-readlink")count=2;
@@ -166,7 +166,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     need(args.size()==count,"invalid RPC command arguments");
     need((op!="fs-diff" && op!="fs-history") || !selected_view,"invalid view selector for revision query");
-    for(size_t i=0;i<args.size();++i)if(!(((op=="fs-xattr-set" || op=="fs-hxattr-set" || op=="inode-xattr-set") && i==4) || ((op=="fs-write" || op=="fs-save" || op=="fs-append" || op=="fs-happend" || op=="fs-hwrite-next") && i==2) || ((op=="fs-write-at" || op=="fs-hwrite") && i==3)))need(args[i].find('\0')==std::string::npos,"NUL in RPC argument");
+    for(size_t i=0;i<args.size();++i)if(!(((op=="fs-xattr-set" || op=="fs-hxattr-set" || op=="inode-xattr-set") && i==4) || ((op=="fs-write" || op=="fs-save" || op=="fs-append" || op=="fs-happend" || op=="fs-hwrite-next") && i==2) || ((op=="fs-write-at" || op=="fs-hwrite" || op=="fs-hwriteback") && i==3)))need(args[i].find('\0')==std::string::npos,"NUL in RPC argument");
     if(op=="session-open") {
         auto lease=number(args[1]);auto token=sessions.create(lease);
         return "{\"session\":\""+token+"\",\"lease_ms\":"+std::to_string(lease)+"}\n";
@@ -297,7 +297,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         while(comma!=std::string::npos) {
             auto start=comma+1;comma=args[2].find(',',start);auto flag=args[2].substr(start,comma==std::string::npos?comma:comma-start);
             need(flags.insert(flag).second,"duplicate open flag");
-            if(flag=="create")options.create=true;
+            if(flag=="positioned-append")options.positioned_append=true;
+            else if(flag=="create")options.create=true;
             else if(flag=="exclusive")options.exclusive=true;
             else if(flag=="truncate")options.truncate=true;
             else if(flag=="append")options.append=true;
@@ -373,6 +374,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="fs-symlink")fs.symlink(args[1],args[2]);
     else if(op=="fs-close"){fs.close(args[1]);activity.session->handles.erase(args[1]);}
     else if(op=="fs-hwrite")fs.handle_write(args[1],number(args[2]),std::vector<unsigned char>(args[3].begin(),args[3].end()));
+    else if(op=="fs-hwriteback")fs.handle_writeback(args[1],number(args[2]),std::vector<unsigned char>(args[3].begin(),args[3].end()));
     else if(op=="fs-htruncate")fs.handle_truncate(args[1],number(args[2]));
     else if(op=="fs-init")fs.initialize();
     else if(op=="fs-write-at")fs.write_at(args[1],number(args[2]),std::vector<unsigned char>(args[3].begin(),args[3].end()));

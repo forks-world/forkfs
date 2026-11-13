@@ -1,0 +1,117 @@
+{
+  "schema": 1,
+  "date": "2026-11-13",
+  "base_commit": "c349752e8c9f44fc01150398f56e8daaa0821fd5",
+  "source_tree_before_evidence": "5d3fde22ae57e31c34ee7ec8e27982a9836b6add",
+  "platform": "macOS27.2.1 arm64",
+  "validation": {
+    "ctest_passed": 61,
+    "ctest_failed": 0,
+    "ctest_seconds": 103.29,
+    "system_only_dependencies": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "source_files_match_disposable_copy": 261,
+    "execution": "Apple Clang SDK27.2 Release WFS_FSKIT=ON; disposable source without Git metadata, deny-default sandbox denies home/keychain/publishing paths, loopback-only test transport. Signed FSKit module installed separately; owned disposable native repository.",
+    "coverage": "LevelDB and legacy flat namespace: strict EOF append, append handle and positioned handle, changed-prefix/gap writeback rejection, identical prefix retries, metadata, xattrs, parent entries, whole-file replacement, mixed flags, duplicated/orphan handles, chunked content, revision isolation and GC. Raw binary inode RPC and both FSKit callback transports included."
+  },
+  "apfs_reference": {
+    "filesystem": "apfs",
+    "namespace": "/forkfs-append-atmkqdt0",
+    "denied": {
+      "new_write_open": 1,
+      "old_pwrite": 1,
+      "old_ftruncate": 1,
+      "truncate_same": 1,
+      "chmod": 1,
+      "utime": 1,
+      "link": 1,
+      "unlink": 1,
+      "rename_source": 1,
+      "rename_over_target": 1,
+      "directory_unlink": 1,
+      "directory_move_out": 1,
+      "directory_replace": 1
+    },
+    "xattr_update_allowed": true,
+    "clear_allows_overwrite": true,
+    "append_bytes": 332804,
+    "sha256": "21bf857064d773fcc120879abfa12563492e2afa8e70d1eccb25273355c32328"
+  },
+  "native": {
+    "filesystem": "forkfs",
+    "namespace": "/forkfs-append-3da0dq_0",
+    "denied": {
+      "new_write_open": 1,
+      "old_pwrite": 1,
+      "old_ftruncate": 1,
+      "truncate_same": 1,
+      "chmod": 1,
+      "utime": 1,
+      "link": 1,
+      "unlink": 1,
+      "rename_source": 1,
+      "rename_over_target": 1,
+      "directory_unlink": 1,
+      "directory_move_out": 1,
+      "directory_replace": 1
+    },
+    "xattr_update_allowed": true,
+    "revision": "append_accept_3da0dq_0",
+    "revision_isolation": true,
+    "clear_allows_overwrite": true,
+    "append_bytes": 332804,
+    "sha256": "21bf857064d773fcc120879abfa12563492e2afa8e70d1eccb25273355c32328"
+  },
+  "foundation_groups_passed": 13,
+  "immutable_regression": {
+    "filesystem": "forkfs",
+    "namespace": "/forkfs-immutable-xbrd6y4h",
+    "denied": {
+      "new_write_open": 1,
+      "chmod": 1,
+      "utime": 1,
+      "link": 1,
+      "unlink": 1,
+      "rename_source": 1,
+      "rename_over_target": 1,
+      "setxattr": 1,
+      "directory_create": 1,
+      "directory_unlink": 1,
+      "directory_rename_out": 1,
+      "directory_rename_in": 1
+    },
+    "revision": "immutable_accept_xbrd6y4h",
+    "revision_isolation": true,
+    "admitted_writer_retains_data_and_size_rights": true,
+    "clear_allows_new_writer": true
+  },
+  "offline_gc": {
+    "collected_objects": 8595
+  },
+  "namespace_and_storage_check_after_gc": true,
+  "readonly_revision_after_gc": {
+    "append_after_gc_readonly_remount": true,
+    "sha256": "21bf857064d773fcc120879abfa12563492e2afa8e70d1eccb25273355c32328"
+  },
+  "previous_reader": {
+    "previous_daemon_rejects_retained_append_flag": true,
+    "error": "unsupported file flags",
+    "sequence_unchanged": true
+  },
+  "installed_signature_deep_strict_verified": true,
+  "sha256": {
+    "daemon": "2fa9783e0b8fd540f6bd2342dd6b10f4879887c6fbe53ab63ce5d5ea58dc3c2b",
+    "installed_signed_extension": "2419b83636a980dd6e6c702033884108554ad61c562e3b6e63e28edf282130d6",
+    "manual_script": "f0225ab640c59f712c688b9b39adeb4763846641399547738ea17ca97cc1a0d0",
+    "ctest_log": "b19e6c8a2fca0a8a0c5f0aa59664108f3e8e5d243b45315c57f676d597001338"
+  },
+  "limits": [
+    "Matching daemon/module binaries required: positioned-append open flag and fs-hwriteback are new RPC surface. Previous daemons reject the added FFINOD04 flag bit, including retained revisions. No on-disk layout change.",
+    "FSKit cached page writeback may include old bytes. Only the separate writeback API accepts identical overlap, checked before staging changes; ordinary handle/path writes remain EOF-only for append-only inodes.",
+    "Xattrs remain editable as measured on APFS. Owner can clear user flags; administrative root restore can select older revisions. No WORM or multi-user authorization guarantee.",
+    "Qualification is the listed private single-user macOS27.2.1 operations. No append-only mmap, arbitrary concurrent append/writeback load, power-loss or system append-flag guarantee."
+  ]
+}

@@ -340,3 +340,10 @@ add_executable(forkfsd_link_limits_test tests/link_limits.cpp
 target_link_libraries(forkfsd_link_limits_test PRIVATE forkfs_metadata)
 add_test(NAME forkfsd_link_limits COMMAND forkfsd_link_limits_test)
 set_tests_properties(forkfsd_link_limits PROPERTIES TIMEOUT 120)
+
+add_executable(forkfsd_append_flags_test tests/append_flags.cpp
+    $<TARGET_OBJECTS:forkfs_common> $<TARGET_OBJECTS:forkfs_container_obj>
+    $<TARGET_OBJECTS:forkfs_compaction_obj>)
+target_link_libraries(forkfsd_append_flags_test PRIVATE forkfs_metadata)
+add_test(NAME forkfsd_append_flags COMMAND forkfsd_append_flags_test)
+set_tests_properties(forkfsd_append_flags PROPERTIES TIMEOUT 120)

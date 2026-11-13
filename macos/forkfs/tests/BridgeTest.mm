@@ -171,7 +171,7 @@ int main(int argc,char** argv){@autoreleasepool {
         FSItemSetAttributesRequest* flagRequest=[FSItemSetAttributesRequest new];flagRequest.flags=UF_HIDDEN|UF_NODUMP;
         __block FSItemAttributes* flagAttrs=nil;
         [volume setAttributes:flagRequest onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){flagAttrs=a;result=e;}];check(!result && flagAttrs.flags==(UF_HIDDEN|UF_NODUMP) && (flagRequest.consumedAttributes&FSItemAttributeFlags),"flag callback failed");
-        FSItemSetAttributesRequest* badFlags=[FSItemSetAttributesRequest new];badFlags.flags=UF_APPEND;badFlags.size=0;
+        FSItemSetAttributesRequest* badFlags=[FSItemSetAttributesRequest new];badFlags.flags=UF_OPAQUE;badFlags.size=0;
         [volume setAttributes:badFlags onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(result.code==ENOTSUP,"protection flags must be rejected");
         [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:file replyHandler:^(FSItemAttributes* a,NSError* e){flagAttrs=a;result=e;}];check(!result && flagAttrs.flags==(UF_HIDDEN|UF_NODUMP) && flagAttrs.size==4,"failed flags changed attributes");
         flagRequest=[FSItemSetAttributesRequest new];flagRequest.flags=0;
@@ -191,6 +191,20 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:file replyHandler:^(FSItemAttributes* a,NSError* e){flagAttrs=a;result=e;}];check(!result && flagAttrs.flags==UF_IMMUTABLE && flagAttrs.size==4,"immutable rejection changed inode");
         flagRequest=[FSItemSetAttributesRequest new];flagRequest.flags=0;
         [volume setAttributes:flagRequest onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(!result,"immutable clear callback failed");
+
+        flagRequest=[FSItemSetAttributesRequest new];flagRequest.flags=UF_APPEND;
+        [volume setAttributes:flagRequest onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(!result,"append flag callback failed");
+        [volume writeContents:[@"XXXX" dataUsingEncoding:NSUTF8StringEncoding] toFile:file atOffset:0 replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(result.code==EPERM && count==0,"append overwrite must fail");
+        [volume writeContents:contents toFile:file atOffset:4 replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==4,"append EOF write failed");
+        FSItemSetAttributesRequest* appendSize=[FSItemSetAttributesRequest new];appendSize.size=0;
+        [volume setAttributes:appendSize onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(result.code==EPERM,"append truncate must fail");
+        [volume closeItem:file keepingModes:0 replyHandler:^(NSError* e){result=e;}];check(!result,"append writer close failed");
+        [volume openItem:file withModes:FSVolumeOpenModesRead|FSVolumeOpenModesWrite replyHandler:^(NSError* e){result=e;}];check(!result,"positioned append writer open failed");
+        [volume writeContents:[@"XXXX" dataUsingEncoding:NSUTF8StringEncoding] toFile:file atOffset:0 replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(result.code==EPERM,"reopened append writer bypassed constraint");
+        flagRequest=[FSItemSetAttributesRequest new];flagRequest.flags=0;
+        [volume setAttributes:flagRequest onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(!result,"append clear failed");
+        appendSize=[FSItemSetAttributesRequest new];appendSize.size=4;
+        [volume setAttributes:appendSize onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(!result,"append cleared truncate failed");
 
         check(volume.maximumLinkCount==32767,"wrong link count capability");
         check(volume.maximumXattrSizeInBits==18,"wrong xattr size capability");
