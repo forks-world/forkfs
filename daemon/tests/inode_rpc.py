@@ -78,6 +78,19 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         old_path_length=2+depth*(1+len(component))
         new_path_length=1+250+depth*(1+len(component))
         assert old_path_length<=4096<new_path_length,(old_path_length,new_path_length)
+        # A long ancestor-symlink alias must not displace a short directory path
+        # used by inode child operations (the appended name would exceed 4096).
+        sub=obj('inode-mkdir',did,'sub',str(0o700),*sel)['inode_id']
+        obj('inode-symlink',deep_parent,'s','/dir',*sel)
+        long_alias='/x/'+'/'.join([component]*depth)+'/s/sub'
+        assert len(long_alias)<=4096<len(long_alias)+1+250
+        assert obj('fs-lstat',long_alias,*sel)['inode_id']==sub
+        child_name='c'*250
+        child_file=obj('inode-create',sub,child_name,str(0o600),*sel)
+        child_id=obj('fs-hstat',child_file['handle'],*sel)['inode_id']
+        rpc('fs-close',child_file['handle'],*sel)
+        assert obj('fs-lstat',long_alias,*sel)['inode_id']==sub
+        assert obj('inode-lookup',sub,child_name,*sel)['inode_id']==child_id
         deep_file=obj('inode-create',deep_parent,'leaf',str(0o600),*sel);deep_id=obj('fs-hstat',deep_file['handle'],*sel)['inode_id']
         rpc('fs-close',deep_file['handle'],*sel)
         obj('inode-link',deep_id,rid,'deep-alias',*sel)

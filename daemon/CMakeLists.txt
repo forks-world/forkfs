@@ -283,6 +283,14 @@ add_test(NAME forkfsd_save COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/save.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
 set_tests_properties(forkfsd_save PROPERTIES TIMEOUT 120)
 
+add_executable(forkfsd_inode_paths_test tests/inode_paths.cpp
+    $<TARGET_OBJECTS:forkfs_common> $<TARGET_OBJECTS:forkfs_container_obj>
+    $<TARGET_OBJECTS:forkfs_compaction_obj>)
+target_include_directories(forkfsd_inode_paths_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(forkfsd_inode_paths_test PRIVATE forkfs_metadata)
+add_test(NAME forkfsd_inode_paths COMMAND forkfsd_inode_paths_test)
+set_tests_properties(forkfsd_inode_paths PROPERTIES TIMEOUT 120)
+
 add_executable(forkfsd_metadata_tree_test tests/metadata_tree.cpp $<TARGET_OBJECTS:forkfs_metadata_tree_obj> $<TARGET_OBJECTS:forkfs_journal_obj> $<TARGET_OBJECTS:forkfs_level_obj>)
 target_include_directories(forkfsd_metadata_tree_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(forkfsd_metadata_tree_test PRIVATE leveldb Threads::Threads)

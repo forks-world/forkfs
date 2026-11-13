@@ -7,6 +7,7 @@
 #include <set>
 #include <thread>
 #include <chrono>
+#include <tuple>
 #include "journal.h"
 
 namespace forkfs {
@@ -67,6 +68,11 @@ private:
     bool degraded_ = false;
     std::array<unsigned char,4096> anchor_{};
     uint64_t anchor_offset_ = 0;
+    // Non-authoritative hints. Namespace resolves every hit in its current view.
+    using InodePathKey=std::tuple<std::string,bool,std::string>;
+    std::map<InodePathKey,std::string> inode_paths_;
+    std::deque<InodePathKey> inode_path_order_;
+    static constexpr size_t maximum_inode_path_hints=4096;
     std::unique_ptr<Journal> journal_;
     std::unique_ptr<AllocationCache> allocation_cache_;
     std::unique_ptr<TreeHeightCache> tree_height_cache_;

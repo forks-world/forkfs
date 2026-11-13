@@ -186,8 +186,10 @@ std::vector<std::string> target_components(const std::string& target) {
 }
 struct Parent {std::string id,name,key;};
 std::string walk(const NamespaceView& journal,const std::vector<std::string>& names,size_t count,
-                 std::vector<std::string>* ancestry=nullptr,bool follow_final=true,Parent* missing=nullptr) {
+                 std::vector<std::string>* ancestry=nullptr,bool follow_final=true,Parent* missing=nullptr,
+                 bool* followed_symlink=nullptr) {
     std::vector<std::string> stack{root(journal)};std::deque<std::string> pending(names.begin(),names.begin()+count);
+    if(followed_symlink)*followed_symlink=false;
     unsigned follows=0;size_t expanded=0;std::string id=stack.back();
     while(!pending.empty()) {
         auto name=pending.front();pending.pop_front();id=stack.back();need(inode(journal,id).directory,"path component is not a directory");
@@ -199,6 +201,7 @@ std::string walk(const NamespaceView& journal,const std::vector<std::string>& na
         }
         auto child=decode_id(journal.get(key));auto n=inode(journal,child);
         if(n.symlink && (follow_final || !pending.empty())) {
+            if(followed_symlink)*followed_symlink=true;
             need(++follows<=40,"too many symbolic links");auto b=journal.get(content_key(child));need(b.size()==n.size,"symlink size mismatch");
             std::string target(b.begin(),b.end());auto parts=target_components(target);expanded+=target.size();need(expanded<=65536,"symlink expansion limit");
             if(target[0]=='/')stack.resize(1);
@@ -212,8 +215,9 @@ Parent parent(const NamespaceView& journal,const std::string& path,std::vector<s
     auto id=walk(journal,names,names.size()-1,ancestry);need(inode(journal,id).directory,"parent is not a directory");
     return {id,names.back(),entry_key(id,names.back())};
 }
-std::string resolve(const NamespaceView& journal,const std::string& path,bool follow=true,Parent* missing=nullptr) {
-    auto names=components(path);return walk(journal,names,names.size(),nullptr,follow,missing);
+std::string resolve(const NamespaceView& journal,const std::string& path,bool follow=true,Parent* missing=nullptr,
+                    bool* followed_symlink=nullptr) {
+    auto names=components(path);return walk(journal,names,names.size(),nullptr,follow,missing,followed_symlink);
 }
 InodeInfo created(InodeInfo n){n.accessed_ns=n.modified_ns;n.birth_ns=n.changed_ns;return n;}
 void touch(InodeInfo& n) {n.modified_ns=n.changed_ns=now();}
@@ -865,7 +869,7 @@ void Namespace::rewind_directory(DirectoryCursor& cursor) const {
     cursor.after_.clear();cursor.done_=cursor.manifest_==ObjectId{};
 }
 InodeInfo Namespace::stat(const std::string& path) const {
-    std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);auto n=inode(j,resolve(j,path));allocation_info(n,j);return n;
+    std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);auto n=inode(j,resolve(j,path));allocation_info(n,j);remember_path(n.id,path);return n;
 }
 void Namespace::allocation_info(InodeInfo& n,const NamespaceView& view) const {
     n.allocated_size=n.directory?0:FileContent(n,view).allocated_bytes(*container_.allocation_cache_);
@@ -920,7 +924,7 @@ void Namespace::handle_set_attributes(const std::string& token,const Attributes&
     apply_attributes(n,a);changes[key]=encode(n);commit_changes(view,changes);
 }
 InodeInfo Namespace::lstat(const std::string& path) const {
-    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=inode(view,resolve(view,path,false));allocation_info(n,view);return n;
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=inode(view,resolve(view,path,false));allocation_info(n,view);remember_path(n.id,path);return n;
 }
 void Namespace::symlink(const std::string& target,const std::string& path) {
     target_components(target);
@@ -1099,7 +1103,7 @@ std::string Namespace::open(const std::string& path,Access access,const OpenOpti
         if(counted){auto count=container_.open_counts_.find({view_,id});if(--count->second==0)container_.open_counts_.erase(count);}
         container_.handles_.erase(token);throw;
     }
-    container_.compaction_cv_.notify_all();return token;
+    remember_path(id,path);container_.compaction_cv_.notify_all();return token;
 }
 
 std::string Namespace::dup(const std::string& token) {
@@ -1241,16 +1245,43 @@ void Namespace::recover_orphans(Container& container) {
 }
 
 namespace forkfs {
+void Namespace::remember_path(const std::string& id,const std::string& path) const noexcept {
+    // Caller holds the repository mutex. An optional hint must never turn an
+    // already committed operation into a failure if allocation is unavailable.
+    try {
+        Container::InodePathKey key{view_,revision_,id};auto& paths=container_.inode_paths_;
+        auto existing=paths.find(key);if(existing!=paths.end()){existing->second=path;return;}
+        auto inserted=paths.emplace(key,path).first;
+        try{container_.inode_path_order_.push_back(std::move(key));}catch(...){paths.erase(inserted);throw;}
+        if(paths.size()>Container::maximum_inode_path_hints){paths.erase(container_.inode_path_order_.front());container_.inode_path_order_.pop_front();}
+    }catch(...){} // Optimization only; resolution remains authoritative.
+}
 std::string Namespace::path_for_inode(const std::string& id) const {
     need(valid_id(id),"invalid inode identity");std::lock_guard lock(container_.mutex_);
     NamespaceView view(*container_.journal_,view_,revision_);auto rid=root(view);
+    auto hint=container_.inode_paths_.find({view_,revision_,id});
+    if(hint!=container_.inode_paths_.end()){
+        try{
+            // Directory RPCs append child names. A symlink alias may be much
+            // longer than the physical path, so use traversal for such hints.
+            bool followed_symlink=false;
+            if(resolve(view,hint->second,false,nullptr,&followed_symlink)==id &&
+               (!inode(view,id).directory || !followed_symlink))return hint->second;
+        }
+        catch(const std::runtime_error& e){auto message=std::string_view(e.what());
+            if(message!="path not found" && message!="path component is not a directory" &&
+               message!="too many symbolic links" && message!="symlink expansion limit")throw;
+        }
+        // Rename, link removal, ancestor symlink retargeting and path reuse can
+        // stale a hint. Fall back without changing the inode identity requested.
+    }
     struct PendingPath {std::string inode,path;bool too_long;};
     // Keep overlong branches in the walk without retaining unbounded path strings.
     std::vector<PendingPath> pending{{rid,"/",false}};std::set<std::string> visited;bool found_too_long=false;
     while(!pending.empty()) {
         auto entry=std::move(pending.back());pending.pop_back();auto& current=entry.inode;
         // A file may have a short hardlink alias elsewhere, so defer the error.
-        if(current==id){if(!entry.too_long)return entry.path;found_too_long=true;}
+        if(current==id){if(!entry.too_long){remember_path(id,entry.path);return entry.path;}found_too_long=true;}
         if(!inode(view,current).directory)continue;
         need(visited.insert(current).second,"invalid directory cycle or hardlink");
         auto pre=directory_prefix(current);

@@ -112,6 +112,7 @@ public:
     void handle_truncate(const std::string& handle,uint64_t size);
 private:
     friend class Container;
+    void remember_path(const std::string& id,const std::string& path) const noexcept;
     void set_path_attributes(const std::string& path,const Attributes& attributes,bool follow_final);
     void require_offline_locked() const;
     static void recover_orphans(Container& container);
