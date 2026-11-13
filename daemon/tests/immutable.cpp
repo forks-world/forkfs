@@ -7,7 +7,17 @@
 using forkfs::Container;using forkfs::Namespace;using Bytes=std::vector<unsigned char>;
 static void check(bool ok,int line=__builtin_LINE()){if(!ok)throw std::runtime_error("immutable check at "+std::to_string(line));}
 static void flags(Namespace& fs,const std::string& path,uint32_t mask){Namespace::Attributes a;a.flags=mask;fs.set_link_attributes(path,a);}
-template<class F> static void denied(Container& store,F fn){auto before=store.status();bool failed=false;try{fn();}catch(const std::system_error& e){failed=e.code().value()==EPERM;}check(failed && store.status()==before);}
+static std::string logical_state(const std::string& status){
+ std::string result;for(const auto* field:{"last_committed_seq","object_roots","indexed_objects"}){
+  auto key="\""+std::string(field)+"\":";auto begin=status.find(key);check(begin!=status.npos);begin+=key.size();
+  auto end=status.find_first_not_of("0123456789",begin);check(end!=begin);result+=status.substr(begin,end-begin)+"/";
+ }return result;
+}
+template<class F> static void denied(Container& store,F fn,int line=__builtin_LINE()){
+ auto before=logical_state(store.status());int error=0;try{fn();}catch(const std::system_error& e){error=e.code().value();}
+ if(error!=EPERM)throw std::runtime_error("expected EPERM at "+std::to_string(line)+", got "+std::to_string(error));
+ check(logical_state(store.status())==before,line);
+}
 int main(){char pattern[]="/tmp/ff-immutable-XXXXXX";auto tmp=mkdtemp(pattern);if(!tmp)return 1;
  try{for(bool legacy:{false,true}){auto path=std::string(tmp)+(legacy?"/legacy":"/db");if(legacy)Container::create_legacy(path);else Container::create(path);
   {Container store(path);Namespace fs(store);fs.initialize();fs.mkdir("/dir");fs.write("/f",{'D'});fs.link("/f","/alias");fs.write("/source",{'S'});fs.symlink("/f","/link");

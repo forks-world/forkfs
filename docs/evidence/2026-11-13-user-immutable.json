@@ -292,5 +292,13 @@
     "New writable opens, pathname writes/truncate, mode/times/xattrs, hardlinks, unlink/rename/replacement and immutable-directory entry mutations are checked before publication. Existing mutable children of an immutable directory remain writable.",
     "Existing 72-byte FFINOD04 format is reused but the new immutable bit is rejected by older daemons. Clearing live flags does not remove reachable historical immutable records; updated daemon/module must be deployed together.",
     "Explicit administrative revision restore switches a World head and is not a POSIX data mutation to a protected inode. Native qualification covers macOS 27.2.1 arm64 private single-user disposable mount and listed operations, not full POSIX/APFS or power-loss guarantees."
-  ]
+  ],
+  "test_stability_followup": {
+    "immutable_test_source_sha256": "0825671065175213c6acea1aeb1c07fc67bb556118d580850f6e4cade87a41c8",
+    "immutable_test_repetitions": 20,
+    "failed": 0,
+    "seconds": 10.21,
+    "runtime_changes": false,
+    "change": "Compare exact EPERM and committed sequence/object-root/object counts, excluding background storage timing metrics from status. Existing file-content, flags, parent, descriptor and revision assertions remain."
+  }
 }
