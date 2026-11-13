@@ -35,7 +35,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `mkdir/rmdir/unlink`、普通 `rename`、原子保存 | create/remove/rename → 原子 namespace 提交 | 挂载已测；失败 errno 与状态不变需按操作继续扩充。直接 RPC 错误码修复另见 PR #95 |
 | `renamex_np/renameatx_np(RENAME_EXCL/RENAME_SWAP)`、交换/排他 rename | FSKit 平台限制 | 原生实测 SWAP、EXCL 到不存在目标均 ENOTSUP；EXCL 目标已存在时内核先返回 EEXIST。旧 Operations 和新 Handler 都不提供 flags 回调，不能只补 daemon 或迁移 Handler 解决 |
 | `link/symlink/readlink`、dangling symlink、`O_SYMLINK` | createLink/createSymbolicLink/readSymbolicLink | 挂载已测；包含链接身份、nofollow 时间/模式、`cp -Pp` 和二进制 xattr |
-| `readdir/getdirentries`、目录游标与属性 | enumerateDirectory → captured cursor | 基础挂载已测、游标 RPC 已测；单目录最多 65,536 项，64 个流，变更中遍历压力未验收 |
+| `readdir/getdirentries`、目录游标与属性 | enumerateDirectory → captured cursor | 挂载已测 66,000 项及 telldir/seekdir；前端按页读取，无旧 65,536 上限；64 个快照流，回调已测跨页删除/回退和淘汰游标 |
 | UTF-8、大小写、NFC/NFD、长名字 | FSFileName → namespace validation | 挂载已测；区分大小写及 NFC/NFD，255 字节/组件、4096 字节/路径；非法 UTF-8/控制符拒绝 |
 | `get/set/list/remove xattr`、fd/nofollow xattr | XattrOperations | 挂载已测；每值 262143 字节、每 inode 128 项、总值 8 MiB；ResourceFork 整值已测，`cp -p`/位置读取仍 EINVAL，不能称完整 fork 兼容 |
 | `mmap(MAP_SHARED/MAP_PRIVATE)`、`msync`、`munmap` | 内核缓存 + ReadWriteOperations | macOS 27.2 单挂载已测；映射/`pread/pwrite` 一致性、private 隔离、open-unlink、flush 后 revision 隔离 |
@@ -183,3 +183,15 @@ revision 隔离及 GC 后只读重挂载；macOS 26 构建不宣称支持该新�
 
 达到上述目标意味着约定的 macOS 应用兼容范围通过验收；POSIX 全标准一致性、
 完整 APFS 功能和 Linux 文件系统支持仍是不同目标，需要各自的清单与测试。
+
+
+2026-11-12：目录枚举前端改为每个流缓存一页（最多 512 项加 dot 项），
+不再一次加载完整目录或在 65,536 项处失败。游标保持原始快照；跨页查询和
+回退不会重新读取 live World。保留最多 64 个流，淘汰时关闭 daemon 游标，
+旧 verifier 返回 ESTALE。挂载生命周期内的 inode→file ID 映射仍随观察到的
+inode 增长，不能把页缓存上限当成整个进程的常数内存保证。
+见 [大目录验收](evidence/2026-11-12-directory-streams.json)。
+
+该验收的 fixture 使用批量元数据准备，不代表逐文件创建性能。普通逐文件
+创建期间已观察到 `MetadataTree::height` 的每编辑器全树检查占主要耗时；
+高度校验复用/创建吞吐将作为独立后续项处理。

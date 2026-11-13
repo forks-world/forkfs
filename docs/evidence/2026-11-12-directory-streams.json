@@ -1,0 +1,112 @@
+{
+  "schema": 1,
+  "date": "2026-11-12",
+  "platform": "macOS 27.2.1 arm64",
+  "base_commit": "c693901bd0c09bd63aa31a715f72545b25861201",
+  "source_tree_before_evidence": "6a3d8c0e27e03846b8c552def8144317563c8ed8",
+  "validation": {
+    "isolated_release_ctest_passed": 56,
+    "isolated_release_ctest_failed": 0,
+    "ctest_seconds": 102.07,
+    "system_only_dependencies": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "non_documentation_source_paths_match_isolated_copy": 133,
+    "direct_callback_coverage": "600 entries, cross-page continuation, backward/forward cookies, later-page unlink with captured attributes, insertion isolation, EOF/invalid cookies, 140 new streams evicting/closing old cursors"
+  },
+  "fixture": {
+    "entries": 66000,
+    "bulk_fixture": true
+  },
+  "apfs_reference": {
+    "filesystem": "apfs",
+    "entries": 66000,
+    "native_readdir_and_scandir": true,
+    "unique_and_complete": true,
+    "backward_telldir_seekdir": true
+  },
+  "native_before": {
+    "prior_overflow_reproduced": true,
+    "errno": 84,
+    "entries_before_failure": 0
+  },
+  "native_after": {
+    "filesystem": "forkfs",
+    "entries": 66000,
+    "native_readdir_and_scandir": true,
+    "unique_and_complete": true,
+    "backward_telldir_seekdir": true
+  },
+  "offline_gc": {
+    "collected_objects": 19325
+  },
+  "storage_check_after_gc": {
+    "service": "forkfsd",
+    "state": "leveldb",
+    "storage_engine": "leveldb",
+    "repository_id": "d9d7ceb2c089a0db101dc339a4626528",
+    "degraded_anchor": false,
+    "mounted": false,
+    "transactions_supported": true,
+    "requires_reopen": false,
+    "last_committed_seq": 287,
+    "checkpoint_seq": 0,
+    "replayed_transactions": 0,
+    "indexed_objects": 330126,
+    "object_roots": 396137,
+    "compaction_running": false,
+    "compaction_queued": 0,
+    "compaction_active": false,
+    "compaction_completed": 0,
+    "compaction_races": 0,
+    "compaction_failures": 0,
+    "compaction_last_error": "",
+    "metadata_prepare_ns": 0,
+    "storage_metrics": {
+      "transactions": 0,
+      "prepare_ns": 0,
+      "write_ns": 0,
+      "wal_sync_calls": 0,
+      "wal_sync_ns": 0,
+      "other_sync_calls": 2,
+      "other_sync_ns": 13064500,
+      "wal_append_bytes": 0,
+      "wal_append_ns": 0,
+      "wal_flush_ns": 0
+    },
+    "uncommitted_tail": false
+  },
+  "readonly_revision_after_gc": {
+    "filesystem": "forkfs",
+    "entries": 66000,
+    "native_readdir_and_scandir": true,
+    "unique_and_complete": true,
+    "backward_telldir_seekdir": true
+  },
+  "readonly_mount_confirmed": true,
+  "installed_signature_deep_strict_verified": true,
+  "sha256": {
+    "daemon": "a7a8f96f6800007d26bda0f0664bb2a3ece1a019f78ae3062ca53e5ab5001db3",
+    "fixture": "7002e9613daf091cd00f6e05049c621d891308f29e38ab276fa18c1e7ea1cb90",
+    "installed_signed_extension": "ef38752454d35fdb33a54d012ea51b47a7d3c65509a56a77ea64bfe96c995cc2",
+    "manual_script": "f6dfe5dbc71ecfd54f757edd8f588499134a9cd45b2b85459b433d8a6d82f2c4"
+  },
+  "limits": [
+    "No new store/inode/RPC format. Stream cursors use existing captured directory RPCs; at most 64 retained streams and 512 captured entries per page, plus dot entries.",
+    "Mount-lifetime inode-to-file-ID mappings still grow with observed inodes; this is a page-buffer bound, not constant total process memory. Backward cookies rewind/replay their original snapshot and can cost a traversal.",
+    "Native acceptance covers 66000 empty files, private single-user macOS 27.2.1 arm64, current and read-only directory_base revision after GC. It does not qualify arbitrary-size directory throughput, multi-user behavior, power loss or full POSIX/APFS compatibility.",
+    "Fixture seeds existing empty-file records in bounded metadata batches; it does not qualify normal per-file create throughput. The initial per-file fixture was interrupted after profiling revealed full-tree MetadataTree::height checks per editor. That performance issue remains a separate follow-up."
+  ],
+  "integration_after_rebase": {
+    "base_commit": "6b4be10d5d4cceb90bd7f9c6b0683d6a9e7de340",
+    "tested_code_commit": "32688973ab156e7f876b5611f82d3c0c2404def3",
+    "ctest_passed": 57,
+    "ctest_failed": 0,
+    "ctest_seconds": 93.82,
+    "source_paths_match_isolated_copy": 135,
+    "system_only_dependencies": true,
+    "notes": "Combination with merged PR104: both sparse seek and paged-directory callback tests pass. Native 66000-entry evidence above remains pinned to the original candidate/runtime hashes."
+  }
+}

@@ -237,6 +237,27 @@ int main(int argc,char** argv){@autoreleasepool {
         unlinkPacker.packedThisCall=0;
         [volume enumerateDirectory:snapshotDirectory startingAtCookie:unlinkCookie verifier:unlinkVerifier providingAttributes:[FSItemGetAttributesRequest new] usingPacker:(FSDirectoryEntryPacker*)unlinkPacker replyHandler:^(FSDirectoryVerifier verifier,NSError* e){unlinkError=e;}];
         check(!unlinkError && unlinkPacker.entries.count==2 && [unlinkPacker.entries[1][@"name"] isEqual:@"z-victim"] && [unlinkPacker.entries[1][@"linkCount"] unsignedLongLongValue]==1,"resumed stream did not retain the captured victim attributes");
+        // Cross RPC pages, rewind an old cookie and retain later-page attributes
+        // after unlink. The live namespace must not be resurrected by enumeration.
+        __block FSItem* paged=nil;__block FSItem* later=nil;
+        [volume createItemNamed:[FSFileName nameWithString:@"paged"] type:FSItemTypeDirectory inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* it,FSFileName* n,NSError* e){paged=it;result=e;}];check(paged && !result,"paged directory creation failed");
+        for(unsigned i=0;i<600;++i){NSString* name=[NSString stringWithFormat:@"n%04u",i];
+            [volume createItemNamed:[FSFileName nameWithString:name] type:FSItemTypeFile inDirectory:paged attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* it,FSFileName* n,NSError* e){if(i==550)later=it;result=e;}];check(!result,"paged entry creation failed");}
+        RecordingPacker* pagedPacker=[RecordingPacker new];pagedPacker.limit=3;__block FSDirectoryVerifier pagedVerifier=FSDirectoryVerifierInitial;
+        void (^enumeratePage)(FSDirectoryCookie)=^(FSDirectoryCookie cookie){pagedPacker.packedThisCall=0;
+            [volume enumerateDirectory:paged startingAtCookie:cookie verifier:pagedVerifier providingAttributes:[FSItemGetAttributesRequest new] usingPacker:(FSDirectoryEntryPacker*)pagedPacker replyHandler:^(FSDirectoryVerifier v,NSError* e){pagedVerifier=v;result=e;}];};
+        enumeratePage(FSDirectoryCookieInitial);check(!result && pagedPacker.entries.count==3,"initial paged enumeration failed");
+        [volume removeItem:later named:[FSFileName nameWithString:@"n0550"] fromDirectory:paged replyHandler:^(NSError* e){result=e;}];check(!result,"later page unlink failed");
+        [volume createItemNamed:[FSFileName nameWithString:@"z-new"] type:FSItemTypeFile inDirectory:paged attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* it,FSFileName* n,NSError* e){result=e;}];check(!result,"concurrent paged insertion failed");
+        pagedPacker.limit=530;enumeratePage(3);check(!result && pagedPacker.entries.count==533 && [pagedPacker.entries.lastObject[@"name"] isEqual:@"n0532"],"cross-page continuation failed");
+        pagedPacker.limit=1;enumeratePage(1);check(!result && [pagedPacker.entries.lastObject[@"name"] isEqual:@"n0001"],"backward directory cookie failed");
+        pagedPacker.limit=20;enumeratePage(548);check(!result && [pagedPacker.entries[pagedPacker.entries.count-18][@"name"] isEqual:@"n0550"] && [pagedPacker.entries[pagedPacker.entries.count-18][@"linkCount"] unsignedLongLongValue]==1,"later page lost captured attributes");
+        auto packed=pagedPacker.entries.count;enumeratePage(600);check(!result && pagedPacker.entries.count==packed,"EOF directory cookie failed");
+        enumeratePage(601);check(result.code==ESTALE,"past-end directory cookie must fail");
+        [volume lookupItemNamed:[FSFileName nameWithString:@"n0550"] inDirectory:paged replyHandler:^(FSItem* it,FSFileName* n,NSError* e){result=e;}];check(result.code==ENOENT,"paged snapshot resurrected removed inode");
+        FSDirectoryVerifier expired=pagedVerifier;
+        pagedPacker.limit=0;for(unsigned i=0;i<140;++i){enumeratePage(FSDirectoryCookieInitial);check(!result,"directory cursor leaked during eviction");}
+        pagedVerifier=expired;enumeratePage(1);check(result.code==ESTALE,"evicted directory verifier must fail");
         __block FSItemAttributes* victimAttrs=nil;
         [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:snapshotVictim replyHandler:^(FSItemAttributes* a,NSError* e){victimAttrs=a;unlinkError=e;}];check(!unlinkError && victimAttrs.linkCount==0,"resumed snapshot resurrected an unlinked inode");
         [volume writeContents:[NSData dataWithBytes:"Z" length:1] toFile:file atOffset:0 replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==1,"orphan write failed");
