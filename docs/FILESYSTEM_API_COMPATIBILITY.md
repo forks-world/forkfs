@@ -39,7 +39,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | UTF-8、大小写、NFC/NFD、长名字 | FSFileName → namespace validation | 挂载已测；区分大小写及 NFC/NFD，255 字节/组件、4096 字节/路径；非法 UTF-8/控制符拒绝 |
 | `get/set/list/remove xattr`、fd/nofollow xattr | XattrOperations | 挂载已测；每值 262143 字节、每 inode 128 项、总值 8 MiB；ResourceFork 整值已测，`cp -p`/位置读取仍 EINVAL，不能称完整 fork 兼容 |
 | `mmap(MAP_SHARED/MAP_PRIVATE)`、`msync`、`munmap` | 内核缓存 + ReadWriteOperations | macOS 27.2 单挂载已测；映射/`pread/pwrite` 一致性、private 隔离、open-unlink、flush 后 revision 隔离 |
-| `fcntl(F_SETLK)`、`flock` | 内核原生 advisory locks；与 RPC 锁分开 | macOS 27.2 跨进程互斥、关闭/退出释放已测；byte-range 不相交范围可同时持有。共享锁/阻塞唤醒/信号打断未验收 |
+| `fcntl(F_SETLK)`、`flock` | 内核原生 advisory locks；与 RPC 锁分开 | macOS 27.2 跨进程互斥、关闭/退出释放已测；byte-range 不相交范围可同时持有。新增挂载验收共享锁并存/排他冲突、阻塞唤醒、dup 关闭释放差异和 F_SETLKW 信号 EINTR；公平性/死锁/OFD locks 未验收 |
 | `fsync`、目录同步、`F_FULLFSYNC`、断电恢复 | synchronize → inode-sync + 存储提交 | 基础文件 fsync/提交与 daemon 恢复已测；目录语义、全硬件屏障、断电/内核崩溃没有完整保证 |
 | `ftruncate`、稀疏文件、`lseek` | setattr size + bounded chunk I/O | 挂载已测零填充、shrink/extend、64 MiB/4 GiB/1 TiB 边界；macOS 27 已挂载验收 `SEEK_DATA/SEEK_HOLE`（64 KiB chunk 粒度）；macOS 26 保留保守 fallback |
 | `F_PREALLOCATE`、`posix_fallocate`、hole punch | 可选 Preallocate/数据变更接口 | 未实现相应协议；不能声称空间预留或洞区间查询兼容 |
@@ -170,6 +170,13 @@ revision 隔离及 GC 后只读重挂载；macOS 26 构建不宣称支持该新�
 4,000 项空文件的单次 Namespace API 对照从 45.9 秒降到 30.1 秒；这不等于
 原生挂载的创建吞吐资格。冷缓存、inode 到路径查找和其他元数据成本仍需
 单独处理。见 [高度缓存验收](evidence/2026-11-12-metadata-height-cache.json)。
+
+原生锁的补充验收直接调用内核 `flock/lockf/fcntl`，与 daemon RPC 锁分开。
+共享锁可并存，排他请求冲突；阻塞等待者在解锁后唤醒。Darwin 的 flock 在最后
+一个共享描述符关闭后释放，经典 fcntl/lockf 则在持锁进程关闭该文件的任一 fd
+后释放。原始 `F_SETLKW` 调用关闭 SA_RESTART 后被 SIGUSR1 打断返回 EINTR，
+不释放另一进程仍持有的锁。用例使用子进程握手和超时，不以单次上锁成功作证。
+见 [共享/阻塞锁证据](evidence/2026-11-13-native-locking.json)。
 
 ## 补全顺序与完成条件
 
