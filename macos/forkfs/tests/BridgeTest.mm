@@ -171,7 +171,7 @@ int main(int argc,char** argv){@autoreleasepool {
         FSItemSetAttributesRequest* flagRequest=[FSItemSetAttributesRequest new];flagRequest.flags=UF_HIDDEN|UF_NODUMP;
         __block FSItemAttributes* flagAttrs=nil;
         [volume setAttributes:flagRequest onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){flagAttrs=a;result=e;}];check(!result && flagAttrs.flags==(UF_HIDDEN|UF_NODUMP) && (flagRequest.consumedAttributes&FSItemAttributeFlags),"flag callback failed");
-        FSItemSetAttributesRequest* badFlags=[FSItemSetAttributesRequest new];badFlags.flags=UF_IMMUTABLE;badFlags.size=0;
+        FSItemSetAttributesRequest* badFlags=[FSItemSetAttributesRequest new];badFlags.flags=UF_APPEND;badFlags.size=0;
         [volume setAttributes:badFlags onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(result.code==ENOTSUP,"protection flags must be rejected");
         [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:file replyHandler:^(FSItemAttributes* a,NSError* e){flagAttrs=a;result=e;}];check(!result && flagAttrs.flags==(UF_HIDDEN|UF_NODUMP) && flagAttrs.size==4,"failed flags changed attributes");
         flagRequest=[FSItemSetAttributesRequest new];flagRequest.flags=0;
@@ -184,6 +184,13 @@ int main(int argc,char** argv){@autoreleasepool {
             [volume seekWithinItem:file fromOffset:-1 region:FSSeekRegionHole context:nil replyHandler:^(FSSeekRegionResult* r,NSError* e){result=e;}];check(result.code==EINVAL,"negative seek must fail");
         }
 #endif
+        flagRequest=[FSItemSetAttributesRequest new];flagRequest.flags=UF_IMMUTABLE;
+        [volume setAttributes:flagRequest onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){flagAttrs=a;result=e;}];check(!result && flagAttrs.flags==UF_IMMUTABLE,"immutable flag callback failed");
+        FSItemSetAttributesRequest* immutableMode=[FSItemSetAttributesRequest new];immutableMode.mode=0700;immutableMode.size=0;
+        [volume setAttributes:immutableMode onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(result.code==EPERM,"immutable mixed setattr must fail atomically");
+        [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:file replyHandler:^(FSItemAttributes* a,NSError* e){flagAttrs=a;result=e;}];check(!result && flagAttrs.flags==UF_IMMUTABLE && flagAttrs.size==4,"immutable rejection changed inode");
+        flagRequest=[FSItemSetAttributesRequest new];flagRequest.flags=0;
+        [volume setAttributes:flagRequest onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(!result,"immutable clear callback failed");
         check(volume.maximumXattrSizeInBits==18,"wrong xattr size capability");
         FSFileName* attrName=[FSFileName nameWithString:@"user.测试📄"];__block NSData* xattrValue=nil;__block NSArray<FSFileName*>* attrNames=nil;
         const char badName[]={char(0xff)};FSFileName* invalidAttr=[FSFileName nameWithBytes:badName length:1];

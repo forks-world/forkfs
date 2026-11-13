@@ -1,0 +1,296 @@
+{
+  "schema": 1,
+  "date": "2026-11-13",
+  "platform": "macOS-27.2.1-arm64-arm-64bit",
+  "base_commit": "4005e3287f09ffcad514923792d543c8007f5a1a",
+  "source_tree_before_evidence": "5dda387a958cbf79e62f72c28eea2026f3265b21",
+  "user_immutable_mask": 2,
+  "validation": {
+    "isolated_release_ctest_passed": 59,
+    "isolated_release_ctest_failed": 0,
+    "ctest_seconds": 107.35,
+    "final_extended_inode_rpc_and_fskit_callback_tests_passed": 3,
+    "final_extended_tests_seconds": 14.29,
+    "non_documentation_source_paths_match_isolated_copy": 140,
+    "system_only_dependencies": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "coverage": "LevelDB/legacy, atomic mixed metadata rejection, path/handle xattrs, write admission, parent mutation, hardlinks, source/target rename and replacement, nofollow symlink, existing writers, orphan fd, revisions/forks, GC/reopen and direct FSKit callbacks"
+  },
+  "apfs_reference": {
+    "filesystem": "apfs",
+    "namespace": "/forkfs-immutable-73t2olsg",
+    "denied": {
+      "new_write_open": 1,
+      "chmod": 1,
+      "utime": 1,
+      "link": 1,
+      "unlink": 1,
+      "rename_source": 1,
+      "rename_over_target": 1,
+      "setxattr": 1,
+      "directory_create": 1,
+      "directory_unlink": 1,
+      "directory_rename_out": 1,
+      "directory_rename_in": 1
+    },
+    "admitted_writer_retains_data_and_size_rights": true,
+    "clear_allows_new_writer": true
+  },
+  "native_before": {
+    "prior_immutable_rejected": true,
+    "errno": 45
+  },
+  "native_after": {
+    "filesystem": "forkfs",
+    "namespace": "/forkfs-immutable-2hngna2e",
+    "denied": {
+      "new_write_open": 1,
+      "chmod": 1,
+      "utime": 1,
+      "link": 1,
+      "unlink": 1,
+      "rename_source": 1,
+      "rename_over_target": 1,
+      "setxattr": 1,
+      "directory_create": 1,
+      "directory_unlink": 1,
+      "directory_rename_out": 1,
+      "directory_rename_in": 1
+    },
+    "revision": "immutable_accept_2hngna2e",
+    "revision_isolation": true,
+    "admitted_writer_retains_data_and_size_rights": true,
+    "clear_allows_new_writer": true
+  },
+  "native_foundation": {
+    "mountpoint": "/private/tmp/immutable-mount-isumngd8/mounted",
+    "namespace": "/forkfs-accept-0e5iwbn_",
+    "checks": [
+      "binary write/read/fsync reaches daemon content",
+      "native binary/empty xattrs, Finder tags, create policy and size limit",
+      "hardlink identity and symlink traversal",
+      "pathname/fd utime nanoseconds and native creation time reach revision inode",
+      "nofollow metadata, O_SYMLINK fds, cp -Pp binary xattrs and open-unlink/dup identity",
+      "native rename/removal/directory-hardlink errno and failed-operation atomicity",
+      "fsync then revision checkpoint isolates subsequent writes",
+      "xattrs follow hardlink identity, revision isolation and open-unlink handles",
+      "rename/open-unlink/truncate/path reuse preserve file identity",
+      "directory enumeration and dot entries",
+      "atomic-save replacement reaches revision-backed namespace",
+      "UTF-8 names, links, rename, NFC/NFD identity and byte limits",
+      "4 MiB file transfer, 64 MiB sparse growth, truncate zero-fill and chunked open-unlink"
+    ],
+    "timestamp_ns": {
+      "accessed_ns": 1234567890123456790,
+      "modified_ns": 1345678901234567891,
+      "birth_ns": 1123456789000000000
+    },
+    "symlink_attributes": {
+      "mode": 449,
+      "accessed_ns": 111111111111111111,
+      "modified_ns": 222222222222222222,
+      "birth_ns": 100000000000000000,
+      "target_unchanged": true,
+      "dangling_touch_h": true,
+      "dangling_cp_Pp": true,
+      "copied_binary_xattr": true,
+      "fd_open_unlink_dup": true,
+      "data_read_write_errno": "EPERM",
+      "truncate_errno": "EINVAL"
+    },
+    "retained_revision": "mount_accept_36bd8082658b",
+    "appledouble_sidecars": 0,
+    "unicode_retained_revision": "unicode_mount_c7b1c827b9f8",
+    "large_retained_revision": "large_mount_e501c33c5cf9",
+    "large_namespace": "/forkfs-accept-0e5iwbn_/large.bin"
+  },
+  "native_application_compatibility": {
+    "schema": 1,
+    "platform": "macOS-27.2.1-arm64-arm-64bit",
+    "filesystem": "forkfs",
+    "python": "3.9.6",
+    "cases": {
+      "mmap": {
+        "status": "passed",
+        "details": {
+          "page_size": 16384,
+          "shared_private_readonly": true,
+          "open_unlink": true
+        }
+      },
+      "lockf": {
+        "status": "passed",
+        "details": {
+          "cross_process_exclusion": true,
+          "close_and_exit_release": true,
+          "scope": "byte ranges (including disjoint ranges)"
+        }
+      },
+      "flock": {
+        "status": "passed",
+        "details": {
+          "cross_process_exclusion": true,
+          "close_and_exit_release": true,
+          "scope": "whole file"
+        }
+      },
+      "sqlite-delete": {
+        "status": "passed",
+        "details": {
+          "journal": "DELETE",
+          "sqlite_version": "3.54.0",
+          "concurrent_reader_writer": true,
+          "abrupt_process_exit_recovery": true
+        }
+      },
+      "sqlite-wal": {
+        "status": "passed",
+        "details": {
+          "journal": "WAL",
+          "sqlite_version": "3.54.0",
+          "concurrent_reader_writer": true,
+          "abrupt_process_exit_recovery": true
+        }
+      },
+      "git": {
+        "status": "passed",
+        "details": {
+          "version": "git version 2.54.0 (Apple Git-157)",
+          "checkout_merge_repack_fsck": true
+        }
+      },
+      "open-flags": {
+        "status": "passed",
+        "details": {
+          "rejected_combinations": 12,
+          "failure_preserves_file": true,
+          "dangling_create": true,
+          "truncate_preserves_inode": true,
+          "darwin_readonly_truncate": true,
+          "umask": "0027 -> 0640"
+        }
+      },
+      "append": {
+        "status": "passed",
+        "details": {
+          "processes": 4,
+          "records_per_process": 4,
+          "record_bytes": 307200,
+          "no_lost_or_interleaved_records": true,
+          "darwin_pwrite_ignores_append": true
+        }
+      },
+      "permissions": {
+        "status": "passed",
+        "details": {
+          "mode_access_checks": true,
+          "directory_search_and_write": true,
+          "open_fd_survives_chmod": true,
+          "denied_mutations_preserve_data": true
+        }
+      },
+      "relative-paths": {
+        "status": "passed",
+        "details": {
+          "openat_statat_linkat_renameat_unlinkat_mkdirat_readlinkat": true,
+          "directory_fd_survives_rename": true
+        }
+      }
+    },
+    "capability_probes": {
+      "rename-extensions": {
+        "status": "measured",
+        "details": {
+          "swap": {
+            "errno": 45,
+            "operation_completed": false,
+            "unsupported": true
+          },
+          "exclusive-existing": {
+            "errno": 17,
+            "operation_completed": false,
+            "unsupported": false
+          },
+          "exclusive-missing": {
+            "errno": 45,
+            "operation_completed": false,
+            "unsupported": true
+          }
+        }
+      }
+    },
+    "limits": [
+      "single mount",
+      "no power-loss or kernel-crash guarantee",
+      "small-file workloads only"
+    ],
+    "forkfs_maximum_file_bytes": 1099511627776,
+    "revision": "api_accept_iiz9spmj",
+    "revision_artifact": "/forkfs-api-iiz9spmj/mmap/mapped-durable",
+    "mmap_backend_and_revision_isolation": true
+  },
+  "offline_gc": {
+    "collected_objects": 22114
+  },
+  "storage_check_after_gc": {
+    "service": "forkfsd",
+    "state": "leveldb",
+    "storage_engine": "leveldb",
+    "repository_id": "7fffe8938d1659c21850843f0f7533d2",
+    "degraded_anchor": false,
+    "mounted": false,
+    "transactions_supported": true,
+    "requires_reopen": false,
+    "last_committed_seq": 1136,
+    "checkpoint_seq": 0,
+    "replayed_transactions": 0,
+    "indexed_objects": 1411,
+    "object_roots": 1600,
+    "compaction_running": false,
+    "compaction_queued": 0,
+    "compaction_active": false,
+    "compaction_completed": 0,
+    "compaction_races": 0,
+    "compaction_failures": 0,
+    "compaction_last_error": "",
+    "metadata_prepare_ns": 0,
+    "storage_metrics": {
+      "transactions": 0,
+      "prepare_ns": 0,
+      "write_ns": 0,
+      "wal_sync_calls": 0,
+      "wal_sync_ns": 0,
+      "other_sync_calls": 2,
+      "other_sync_ns": 11795583,
+      "wal_append_bytes": 0,
+      "wal_append_ns": 0,
+      "wal_flush_ns": 0
+    },
+    "uncommitted_tail": false
+  },
+  "older_daemon_probe": {
+    "old_daemon_rejects_immutable_bit": true,
+    "stderr": "forkfsd: unsupported file flags",
+    "sequence_unchanged": true
+  },
+  "readonly_revision_after_gc": {
+    "immutable_after_gc_readonly_remount": true,
+    "readonly_flag_clear_rejected": true
+  },
+  "installed_signature_deep_strict_verified": true,
+  "sha256": {
+    "daemon": "a34b21ebfb758ee7676d2911ad35f04129e189e7f5cafff3e967bdc5f826e8bc",
+    "installed_signed_extension": "2823df53b848adda0eb26972efcbaf073cb50bac215637d8fcc686df9cc02bd8",
+    "manual_script": "37b27526f95c5fda4b8afaec67801774ace9f411110cfdfc609b8887dd9437c1"
+  },
+  "limits": [
+    "User immutable is not system immutable or a multi-user authorization boundary. The private service owner can clear flags. Other protection bits including append-only remain rejected.",
+    "Matches Darwin retained admission: existing writable fd descriptions and their dups keep data/size rights after the flag is set, including orphan handles. Metadata mutations remain denied. No mmap permission-revocation guarantee.",
+    "New writable opens, pathname writes/truncate, mode/times/xattrs, hardlinks, unlink/rename/replacement and immutable-directory entry mutations are checked before publication. Existing mutable children of an immutable directory remain writable.",
+    "Existing 72-byte FFINOD04 format is reused but the new immutable bit is rejected by older daemons. Clearing live flags does not remove reachable historical immutable records; updated daemon/module must be deployed together.",
+    "Explicit administrative revision restore switches a World head and is not a POSIX data mutation to a protected inode. Native qualification covers macOS 27.2.1 arm64 private single-user disposable mount and listed operations, not full POSIX/APFS or power-loss guarantees."
+  ]
+}

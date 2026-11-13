@@ -29,19 +29,19 @@ int main(){
         for(bool legacy:{false,true}){
             auto path=std::string(tmp)+(legacy?"/legacy":"/db");if(legacy)Container::create_legacy(path);else Container::create(path);
             {Container store(path);Namespace fs(store);fs.initialize();fs.write("/f",Bytes{'D'});fs.link("/f","/alias");fs.mkdir("/dir");fs.symlink("/f","/link");
-                auto before=fs.stat("/f");check(before.flags==0);flags(fs,"/f",forkfs::supported_file_flags);
-                auto n=fs.stat("/alias");check(n.flags==forkfs::supported_file_flags && n.modified_ns==before.modified_ns && fs.read("/f")==Bytes{'D'});
-                flags(fs,"/dir",forkfs::file_flag_hidden);flags(fs,"/link",1,false);check(fs.lstat("/link").flags==1 && fs.stat("/link").flags==forkfs::supported_file_flags);
-                auto stable=store.status();Namespace::Attributes bad;bad.flags=2;bad.size=0;bad.mode=0700;rejects([&]{fs.set_attributes("/f",bad);});check(store.status()==stable && fs.stat("/f").size==1 && fs.stat("/f").mode==before.mode);
-                fs.snapshot("flagged");fs.fork("flagged","work");Namespace old(store,"flagged",true),work(store,"work");flags(work,"/f",0);check(work.stat("/f").flags==0 && old.stat("/f").flags==forkfs::supported_file_flags);
+                auto before=fs.stat("/f");check(before.flags==0);flags(fs,"/f",(forkfs::file_flag_nodump|forkfs::file_flag_hidden));
+                auto n=fs.stat("/alias");check(n.flags==(forkfs::file_flag_nodump|forkfs::file_flag_hidden) && n.modified_ns==before.modified_ns && fs.read("/f")==Bytes{'D'});
+                flags(fs,"/dir",forkfs::file_flag_hidden);flags(fs,"/link",1,false);check(fs.lstat("/link").flags==1 && fs.stat("/link").flags==(forkfs::file_flag_nodump|forkfs::file_flag_hidden));
+                auto stable=store.status();Namespace::Attributes bad;bad.flags=4;bad.size=0;bad.mode=0700;rejects([&]{fs.set_attributes("/f",bad);});check(store.status()==stable && fs.stat("/f").size==1 && fs.stat("/f").mode==before.mode);
+                fs.snapshot("flagged");fs.fork("flagged","work");Namespace old(store,"flagged",true),work(store,"work");flags(work,"/f",0);check(work.stat("/f").flags==0 && old.stat("/f").flags==(forkfs::file_flag_nodump|forkfs::file_flag_hidden));
                 rejects([&]{flags(old,"/f",0);});
                 // Metadata hints do not introduce protection semantics.
-                fs.write_at("/f",0,Bytes{'W'});check(fs.stat("/f").flags==forkfs::supported_file_flags);
+                fs.write_at("/f",0,Bytes{'W'});check(fs.stat("/f").flags==(forkfs::file_flag_nodump|forkfs::file_flag_hidden));
                 if(!legacy){auto fd=fs.open("/f");fs.remove("/f",false);fs.remove("/alias",false);Namespace::Attributes a;a.flags=1;fs.handle_set_attributes(fd,a);
-                    check(fs.handle_stat(fd).flags==1);fs.write("/f",Bytes{'N'});check(fs.stat("/f").flags==0);a.flags=2;stable=store.status();rejects([&]{fs.handle_set_attributes(fd,a);});check(store.status()==stable && fs.handle_stat(fd).flags==1);fs.close(fd);
+                    check(fs.handle_stat(fd).flags==1);fs.write("/f",Bytes{'N'});check(fs.stat("/f").flags==0);a.flags=4;stable=store.status();rejects([&]{fs.handle_set_attributes(fd,a);});check(store.status()==stable && fs.handle_stat(fd).flags==1);fs.close(fd);
                     fs.write("/sparse",{});fs.truncate("/sparse",Namespace::maximum_file_size);flags(fs,"/sparse",forkfs::file_flag_hidden);check(fs.stat("/sparse").size==Namespace::maximum_file_size && fs.stat("/sparse").flags==forkfs::file_flag_hidden);}
                 fs.verify();old.verify();if(!legacy)store.collect_garbage();store.verify();}
-            {Container store(path);Namespace old(store,"flagged",true);check(old.stat("/alias").flags==forkfs::supported_file_flags && old.stat("/dir").flags==forkfs::file_flag_hidden && old.lstat("/link").flags==1);old.verify();store.verify();}
+            {Container store(path);Namespace old(store,"flagged",true);check(old.stat("/alias").flags==(forkfs::file_flag_nodump|forkfs::file_flag_hidden) && old.stat("/dir").flags==forkfs::file_flag_hidden && old.lstat("/link").flags==1);old.verify();store.verify();}
         }
         std::filesystem::remove_all(tmp);std::cout<<"BSD metadata flags, atomic rejection, frozen-clock diff, legacy reads, revisions, orphans, restart and GC passed\n";return 0;
     }catch(const std::exception& e){std::cerr<<e.what()<<'\n';std::filesystem::remove_all(tmp);return 1;}

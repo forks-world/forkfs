@@ -326,3 +326,10 @@ add_executable(forkfsd_create_probe EXCLUDE_FROM_ALL tests/create_probe.cpp
     $<TARGET_OBJECTS:forkfs_common> $<TARGET_OBJECTS:forkfs_container_obj>
     $<TARGET_OBJECTS:forkfs_compaction_obj>)
 target_link_libraries(forkfsd_create_probe PRIVATE forkfs_metadata)
+
+add_executable(forkfsd_immutable_test tests/immutable.cpp
+    $<TARGET_OBJECTS:forkfs_common> $<TARGET_OBJECTS:forkfs_container_obj>
+    $<TARGET_OBJECTS:forkfs_compaction_obj>)
+target_link_libraries(forkfsd_immutable_test PRIVATE forkfs_metadata)
+add_test(NAME forkfsd_immutable COMMAND forkfsd_immutable_test)
+set_tests_properties(forkfsd_immutable PROPERTIES TIMEOUT 120)
