@@ -608,3 +608,18 @@ Use a disposable repository. The script retains an immutable revision and clears
 live scratch flags before cleanup. Existing FFINOD04 layout is reused; older
 binaries reject its new bit, including historical records. Updated daemon/module
 must be deployed together. See [evidence](evidence/2026-11-13-user-immutable.json).
+
+### Link-count capacity
+
+`maximumLinkCount` and daemon link/directory-link capacity now use one shared
+32,767 constant. Raw inode RPC and native link operations report EMLINK at the
+file-link ceiling. Namespace tests also cover parent-directory growth rejection
+and a net-zero replacement of an empty directory at the ceiling. No directory
+entry limit is implied for ordinary distinct files.
+
+Use `forkfsd_link_limits_test --fixture NEW_DISPOSABLE_REPOSITORY` and
+`scripts/tests/link_limits_mount.py` as documented in the daemon README. The
+fixture contains actual 32,767 references; native acceptance checks pathconf,
+failure immutability, capacity reuse and GC/readonly revision readback. The
+same APFS probe reports that its next link succeeds despite pathconf=32,767,
+so capacity equality is not claimed. See [evidence](evidence/2026-11-13-link-limits.json).

@@ -191,6 +191,8 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:file replyHandler:^(FSItemAttributes* a,NSError* e){flagAttrs=a;result=e;}];check(!result && flagAttrs.flags==UF_IMMUTABLE && flagAttrs.size==4,"immutable rejection changed inode");
         flagRequest=[FSItemSetAttributesRequest new];flagRequest.flags=0;
         [volume setAttributes:flagRequest onItem:file replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(!result,"immutable clear callback failed");
+
+        check(volume.maximumLinkCount==32767,"wrong link count capability");
         check(volume.maximumXattrSizeInBits==18,"wrong xattr size capability");
         FSFileName* attrName=[FSFileName nameWithString:@"user.测试📄"];__block NSData* xattrValue=nil;__block NSArray<FSFileName*>* attrNames=nil;
         const char badName[]={char(0xff)};FSFileName* invalidAttr=[FSFileName nameWithBytes:badName length:1];

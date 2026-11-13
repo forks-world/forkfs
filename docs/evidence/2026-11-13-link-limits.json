@@ -1,0 +1,151 @@
+{
+  "schema": 1,
+  "date": "2026-11-13",
+  "platform": "macOS27.2.1 arm64",
+  "base_commit": "4005e3287f09ffcad514923792d543c8007f5a1a",
+  "source_tree_before_evidence": "0a570a10c2c69e61e6222d83f0a079006b6e7cb0",
+  "maximum_link_count": 32767,
+  "validation": {
+    "isolated_release_ctest_passed": 59,
+    "isolated_release_ctest_failed": 0,
+    "ctest_seconds": 115.28,
+    "system_only_dependencies": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "non_documentation_source_paths_match_isolated_copy": 140,
+    "fast_boundary_test_scope": "LevelDB synthetic inode counters exercise file last/overflow/reuse, directory mkdir and cross-parent rename failures, and net-zero empty-directory replacement. Counters are restored to actual references before namespace verify, revision and GC/reopen checks.",
+    "execution": "Release Apple Clang macOS27.2 SDK WFS_FSKIT=ON; readonly archive source without Git metadata, deny-default sandbox, no host home/credential/keychain access, loopback-only test transports."
+  },
+  "actual_reference_fixture": {
+    "links": 32767,
+    "bulk_fixture": true
+  },
+  "apfs_reference": {
+    "filesystem": "apfs",
+    "advertised_link_max": 32767,
+    "links": 32767,
+    "overflow_errno": null,
+    "allows_beyond_advertised": true,
+    "overflow_probe_preserves_state": true,
+    "unlink_reuses_capacity": true,
+    "fixture_restored": true
+  },
+  "native_after": {
+    "filesystem": "forkfs",
+    "advertised_link_max": 32767,
+    "links": 32767,
+    "overflow_errno": 31,
+    "allows_beyond_advertised": false,
+    "overflow_probe_preserves_state": true,
+    "unlink_reuses_capacity": true,
+    "fixture_restored": true
+  },
+  "typed_inode_rpc": {
+    "inode_link_errno": 31,
+    "wire_status": 32,
+    "sequence_unchanged": true
+  },
+  "namespace_check_after_native": {
+    "service": "forkfsd",
+    "state": "leveldb",
+    "storage_engine": "leveldb",
+    "repository_id": "6fa967ae9a65bc5df9275dc1175496ee",
+    "degraded_anchor": false,
+    "mounted": false,
+    "transactions_supported": true,
+    "requires_reopen": false,
+    "last_committed_seq": 140,
+    "checkpoint_seq": 0,
+    "replayed_transactions": 0,
+    "indexed_objects": 34814,
+    "object_roots": 34682,
+    "compaction_running": false,
+    "compaction_queued": 0,
+    "compaction_active": false,
+    "compaction_completed": 0,
+    "compaction_races": 0,
+    "compaction_failures": 0,
+    "compaction_last_error": "",
+    "metadata_prepare_ns": 144449375,
+    "storage_metrics": {
+      "transactions": 8,
+      "prepare_ns": 570458,
+      "write_ns": 53882875,
+      "wal_sync_calls": 8,
+      "wal_sync_ns": 44087665,
+      "other_sync_calls": 12,
+      "other_sync_ns": 142329874,
+      "wal_append_bytes": 78870,
+      "wal_append_ns": 6459,
+      "wal_flush_ns": 9571541
+    },
+    "uncommitted_tail": false
+  },
+  "offline_gc": {
+    "collected_objects": 1975
+  },
+  "storage_check_after_gc": {
+    "service": "forkfsd",
+    "state": "leveldb",
+    "storage_engine": "leveldb",
+    "repository_id": "6fa967ae9a65bc5df9275dc1175496ee",
+    "degraded_anchor": false,
+    "mounted": false,
+    "transactions_supported": true,
+    "requires_reopen": false,
+    "last_committed_seq": 141,
+    "checkpoint_seq": 0,
+    "replayed_transactions": 0,
+    "indexed_objects": 32839,
+    "object_roots": 32843,
+    "compaction_running": false,
+    "compaction_queued": 0,
+    "compaction_active": false,
+    "compaction_completed": 0,
+    "compaction_races": 0,
+    "compaction_failures": 0,
+    "compaction_last_error": "",
+    "metadata_prepare_ns": 0,
+    "storage_metrics": {
+      "transactions": 0,
+      "prepare_ns": 0,
+      "write_ns": 0,
+      "wal_sync_calls": 0,
+      "wal_sync_ns": 0,
+      "other_sync_calls": 2,
+      "other_sync_ns": 12298208,
+      "wal_append_bytes": 0,
+      "wal_append_ns": 0,
+      "wal_flush_ns": 0
+    },
+    "uncommitted_tail": false
+  },
+  "readonly_revision_after_gc": {
+    "readonly_maximum_links_after_gc": 32767,
+    "advertised_link_max": 32767,
+    "identity_and_data_preserved": true
+  },
+  "installed_signature_deep_strict_verified": true,
+  "sha256": {
+    "daemon": "d3c8abf2e7d9614dc1ae8b37daddc3ca577212198bb3802cb28254dee9d6bf72",
+    "fixture_and_boundary_test": "f1439d8f68efa085ac564a24c37fd5096f322542b8d1345727cb5f8ff8a3bf57",
+    "installed_signed_extension": "fd3932f1c94a0870a3d4485382e7bef81509cb0e6682c1f550c18df32132eece",
+    "manual_script": "7e87586d5979fd6ce33b704e47b9a9cd960b8f32aa7919671cebdcf1682c08e1"
+  },
+  "limits": [
+    "Forkfs enforces its advertised 32767 ceiling. The tested APFS pathconf also reports32767 but permits the next hardlink; its extra capacity is a measured difference, not claimed by forkfs.",
+    "Native file fixture contains actual32767 references and is verified before snapshot. Fast directory-capacity tests use synthetic counts; no native32765-subdirectory performance or boundary qualification is claimed.",
+    "Read paths accept preexisting larger link counts; no format migration or global repair. New links/parent growth are constrained, while removals reduce counts. No new directory entry cap for distinct regular files.",
+    "Native acceptance covers private single-user macOS27.2.1 arm64 and listed operations, including EMLINK state immutability and capacity reuse. No full POSIX/APFS, multi-user or power-loss guarantee."
+  ],
+  "test_stability_followup": {
+    "link_limit_test_repetitions": 20,
+    "failed": 0,
+    "seconds": 8.18,
+    "runtime_changes": false,
+    "change": "Assert exact EMLINK and stable committed sequence/object-root/object counts rather than whole status JSON, which contains asynchronous storage timing counters. Directory entries, capacity reuse, net-zero replacement and data/revision checks remain intact.",
+    "link_limit_test_source_sha256": "dfe3dc287f2db91dffa41044a1845d6eceff9040a61e187da67b77a9ad274a5d"
+  }
+}

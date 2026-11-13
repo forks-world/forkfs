@@ -4,6 +4,8 @@
 namespace forkfs {
 // Shared by the namespace and the FSKit RPC frontend. This is a logical size
 // bound, not an allocation reservation or a repository quota.
+// Matches the advertised FSKit pathconf link limit for files and directories.
+inline constexpr uint64_t maximum_link_count=32767;
 inline constexpr uint64_t maximum_file_bytes = uint64_t{1} << 40; // 1 TiB
 inline constexpr uint64_t legacy_file_bytes = uint64_t{64} << 20;
 // The native FSKit path accepts values below 256 KiB. Keep all layers

@@ -702,6 +702,34 @@ retained immutable revisions readable by older versions. Deploy matching new
 daemon/module binaries and keep them while such records are reachable.
 See [native immutable acceptance](../docs/FSKIT.md#user-immutable-acceptance).
 
+## Link-count limits
+
+The namespace and FSKit `maximumLinkCount` share a 32,767 link ceiling.
+`link` rejects an inode already at that count with EMLINK. Creating a directory
+also checks its parent's count (2 plus immediate subdirectories); moving a
+directory to another parent checks the destination after subtracting a replaced
+empty directory. Net-zero replacement at the ceiling succeeds. Failed capacity
+checks publish no namespace/data changes. Removing a link releases capacity.
+Existing larger counters remain readable; this does not rewrite old repositories.
+The limit is separate from the number of distinct files in a directory.
+
+```sh
+# Opt-in full-reference fixture: always creates a NEW disposable repository.
+build/Release/daemon/forkfsd_link_limits_test --fixture /private/tmp/owned-links/repo
+# Mount with mount-forkfs.py, then:
+python3 scripts/tests/link_limits_mount.py /path/to/mount
+# After unmount + GC, mount revision link_limit_base read-only:
+python3 scripts/tests/link_limits_mount.py /path/to/mount --readonly-fixture
+```
+
+The native fixture has 32,767 actual file references and passes namespace
+verification. The fast CTest uses synthetic boundary counters, restores actual
+counts before verification, and covers directory creation/rename atomicity plus
+capacity reuse. The native suite checks pathconf, EMLINK, identity and reuse.
+On the tested APFS reference, pathconf reports 32,767 but the next link succeeds;
+that extra capacity is recorded as a difference, not claimed for forkfs.
+No inode/store/RPC format changes. See [evidence](../docs/evidence/2026-11-13-link-limits.json).
+
 ## Directory pages
 
 RPC offers `fs-dir-open PATH`, `fs-dir-page CURSOR LIMIT`, `fs-dir-rewind CURSOR`

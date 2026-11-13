@@ -224,6 +224,7 @@ std::string resolve(const NamespaceView& journal,const std::string& path,bool fo
 }
 InodeInfo created(InodeInfo n){n.accessed_ns=n.modified_ns;n.birth_ns=n.changed_ns;return n;}
 void touch(InodeInfo& n) {n.modified_ns=n.changed_ns=now();}
+void link_capacity(uint64_t count) {if(count>=maximum_link_count)throw std::system_error(EMLINK,std::generic_category(),"filesystem link count limit reached");}
 }
 // Type 1 remains the original inline regular file. Type 4 stores sparse 64 KiB
 // chunks as ordinary CoW namespace leaves, so revision retention and GC follow
@@ -769,7 +770,7 @@ void Namespace::mkdir(const std::string& path,uint32_t mode) {
     update([&](const NamespaceView& j,Changes& c) {
         auto p=parent(j,path);need(!j.contains(p.key),"path already exists");
         auto id=new_id(j);InodeInfo n=created({id,true,mode,2,0,now(),now()}),pn=inode(j,p.id);mutable_inode(pn);
-        need(pn.links<UINT64_MAX,"directory link count exhausted");++pn.links;touch(pn);
+        link_capacity(pn.links);++pn.links;touch(pn);
         c[p.key]=id_bytes(id);c[inode_key(id)]=encode(n);c[inode_key(p.id)]=encode(pn);c[allocated_key(id)]=Bytes{};
     });
 }
@@ -952,7 +953,7 @@ std::string Namespace::readlink(const std::string& path) const {
 void Namespace::link(const std::string& source,const std::string& target) {
     update([&](const NamespaceView& j,Changes& c) {
         auto id=resolve(j,source,false);auto n=inode(j,id);mutable_inode(n);need(!n.directory,"directory hard links are forbidden");
-        auto p=parent(j,target);mutable_inode(inode(j,p.id));need(!j.contains(p.key),"target already exists");need(n.links<UINT64_MAX,"link count exhausted");
+        auto p=parent(j,target);mutable_inode(inode(j,p.id));need(!j.contains(p.key),"target already exists");link_capacity(n.links);
         ++n.links;n.changed_ns=now();auto pn=inode(j,p.id);touch(pn);
         c[p.key]=id_bytes(id);c[inode_key(id)]=encode(n);c[inode_key(p.id)]=encode(pn);c[allocated_key(id)]=Bytes{};
     });
@@ -1006,7 +1007,7 @@ void Namespace::rename(const std::string& source,const std::string& target) {
             if(other.directory || other.links==1)retire(j,c,other);
             else {--other.links;other.changed_ns=now();c[inode_key(replaced)]=encode(other);}
         }
-        if(n.directory && src.id!=dst.id){--parents.at(src.id).links;need(parents.at(dst.id).links<UINT64_MAX,"directory link count exhausted");++parents.at(dst.id).links;}
+        if(n.directory && src.id!=dst.id){--parents.at(src.id).links;link_capacity(parents.at(dst.id).links);++parents.at(dst.id).links;}
         c[src.key]=std::nullopt;c[dst.key]=id_bytes(id);n.changed_ns=now();c[inode_key(id)]=encode(n);
         for(auto& [parent_id,pn]:parents){touch(pn);c[inode_key(parent_id)]=encode(pn);}
     });
