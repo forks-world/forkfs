@@ -347,3 +347,10 @@ add_executable(forkfsd_append_flags_test tests/append_flags.cpp
 target_link_libraries(forkfsd_append_flags_test PRIVATE forkfs_metadata)
 add_test(NAME forkfsd_append_flags COMMAND forkfsd_append_flags_test)
 set_tests_properties(forkfsd_append_flags PROPERTIES TIMEOUT 120)
+
+add_executable(forkfsd_volume_name_test tests/volume_name.cpp
+    $<TARGET_OBJECTS:forkfs_common> $<TARGET_OBJECTS:forkfs_container_obj>
+    $<TARGET_OBJECTS:forkfs_compaction_obj>)
+target_link_libraries(forkfsd_volume_name_test PRIVATE forkfs_metadata)
+add_test(NAME forkfsd_volume_name COMMAND forkfsd_volume_name_test)
+set_tests_properties(forkfsd_volume_name PROPERTIES TIMEOUT 120)

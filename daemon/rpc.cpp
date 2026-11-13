@@ -132,7 +132,7 @@ struct Activity {
 std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string> args){
     auto op=args[0];std::string view="main";bool revision=false;
     size_t count=2;
-    if(op=="status" || op=="storage-profile" || op=="fs-init" || op=="fs-check" || op=="fs-worlds" || op=="fs-revisions" || op=="fs-compact")count=1;
+    if(op=="status" || op=="storage-profile" || op=="fs-init" || op=="fs-check" || op=="fs-worlds" || op=="fs-revisions" || op=="fs-compact" || op=="fs-volume-name")count=1;
     if(op=="fs-write" || op=="fs-save" || op=="fs-rename" || op=="fs-link" || op=="fs-fork" || op=="fs-restore" || op=="fs-append" || op=="fs-truncate" || op=="fs-open" || op=="fs-happend" || op=="fs-htruncate" || op=="fs-hread-next" || op=="fs-hwrite-next" || op=="fs-symlink" || op=="fs-chmod" || op=="fs-lchmod" || op=="fs-setmtime" || op=="fs-hchmod" || op=="fs-hsetmtime" || op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-hlock")count=3;
     if(op=="fs-read-at" || op=="fs-write-at" || op=="fs-hread" || op=="fs-hwrite" || op=="fs-hwriteback" || op=="fs-hseek" || op=="fs-hrange-lock")count=4;
     if(op=="fs-history")count=4;
@@ -165,6 +165,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         args.resize(args.size()-2);
     }
     need(args.size()==count,"invalid RPC command arguments");
+    if(op=="fs-set-volume-name" && args[1].find('\0')!=args[1].npos)throw RpcError(EINVAL,"NUL in volume name");
     need((op!="fs-diff" && op!="fs-history") || !selected_view,"invalid view selector for revision query");
     for(size_t i=0;i<args.size();++i)if(!(((op=="fs-xattr-set" || op=="fs-hxattr-set" || op=="inode-xattr-set") && i==4) || ((op=="fs-write" || op=="fs-save" || op=="fs-append" || op=="fs-happend" || op=="fs-hwrite-next") && i==2) || ((op=="fs-write-at" || op=="fs-hwrite" || op=="fs-hwriteback") && i==3)))need(args[i].find('\0')==std::string::npos,"NUL in RPC argument");
     if(op=="session-open") {
@@ -184,7 +185,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     if(op=="status")return store.status();
     if(op=="storage-profile")return store.storage_profile();
-    static const std::set<std::string> reads{"fs-seek-region","fs-hseek-region","inode-seek-region","fs-xattr-get","fs-xattr-list","fs-hxattr-get","fs-hxattr-list","inode-xattr-get","inode-xattr-list","fs-history","fs-diff","fs-cat","fs-read-at","fs-ls","fs-stat","fs-lstat","fs-readlink","fs-check","fs-worlds","fs-revisions","fs-snapshot","fs-fork",
+    static const std::set<std::string> reads{"fs-volume-name","fs-seek-region","fs-hseek-region","inode-seek-region","fs-xattr-get","fs-xattr-list","fs-hxattr-get","fs-hxattr-list","inode-xattr-get","inode-xattr-list","fs-history","fs-diff","fs-cat","fs-read-at","fs-ls","fs-stat","fs-lstat","fs-readlink","fs-check","fs-worlds","fs-revisions","fs-snapshot","fs-fork",
         "fs-hstat","fs-hread","fs-hread-next","fs-hseek","fs-close","fs-dup","fs-hlock","fs-hrange-lock","fs-dir-open","fs-dir-page","fs-dir-entries","fs-dir-rewind","fs-dir-close"};
     sessions.authorize(session_token,view,revision,!reads.contains(op));
     if(op.starts_with("inode-") && op!="inode-root")sessions.mount_require(session_token,view,revision);
@@ -212,6 +213,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         else result=fs.seek_region(op=="inode-seek-region"?fs.path_for_inode(args[1]):args[1],offset,args[3]=="data");
         return "{\"offset\":"+std::to_string(result)+"}";
     }
+    if(op=="fs-volume-name")return "{\"name\":"+quoted(fs.volume_name())+"}\n";
+    if(op=="fs-set-volume-name"){fs.set_volume_name(args[1]);return "{\"name\":"+quoted(fs.volume_name())+"}\n";}
     if(op=="inode-space")return store.space_json();
     if(op=="inode-sync") {
         if(store.requires_reopen())throw RpcError(EIO,"storage requires reopen after write failure");

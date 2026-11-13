@@ -1458,3 +1458,37 @@ BUILD/daemon/forkfsd --socket RUNTIME/control.sock`. Run the same script with
 unmount, offline GC and readonly mounting that revision, pass `--verify-report
 REPORT.json`. Use an owned disposable repository. See
 [evidence](../docs/evidence/2026-11-13-append-flags.json).
+
+## Revision-backed volume names
+
+`fs-volume-name CONTAINER [--world WORLD|--revision REVISION]` prints the selected
+volume label. `fs-set-volume-name CONTAINER NAME [--world WORLD]` changes it
+atomically. RPC commands with the same names return `{"name": ...}` and honor
+the existing mounted-World lease. FSKit RenameOperations implements native
+`getattrlist/setattrlist(ATTR_VOL_NAME)` using those RPCs.
+
+Names are 1–255 bytes of valid UTF-8, excluding control characters, slash, `.`
+and `..`; invalid names return EINVAL and oversized names ENAMETOOLONG through
+RPC. No normalization or case folding is applied. Missing metadata means
+`ForkFS`; setting the current name is a no-op, and returning to `ForkFS` removes
+the optional name record. A rename preserves file identities/data, root inode
+times, repository identity, World name, volume identifier and mount path.
+This is volume administration, separate from file/root inode flags.
+
+The optional `volume-name` leaf is part of the immutable namespace metadata
+tree, so snapshot, fork, restore, history retention and GC retain it. The
+`fs-diff` JSON adds `volume_name_changed`, `before_volume_name` and
+`after_volume_name` on every page. Label-only changes leave `changes` empty.
+The existing inode, tree and revision formats are unchanged. Older namespace
+verifiers do not recognize this record and reject named trees; an older
+frontend cannot display persistent names. Deploy the new daemon and frontend
+together, since the frontend loads its name through the new RPC.
+
+Run `python3 scripts/tests/volume_name_mount.py MOUNT --daemon
+BUILD/daemon/forkfsd --socket RUNTIME/control.sock` on a disposable private
+repository. The suite restores the live name and retains a named revision.
+After unmount, GC and readonly mounting that revision, pass `--verify-report
+REPORT.json` to verify its name/data and EROFS rejection. APFS reference mode
+requires `--reference-apfs-image NEW_OWNED_IMAGE` next to its exact mount root
+and verifies the image/mount association with hdiutil. Never use an existing
+user volume as the reference. See [evidence](../docs/evidence/2026-11-13-volume-name.json).

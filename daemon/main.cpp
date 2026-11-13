@@ -154,6 +154,8 @@ int main(int argc, char** argv) {
                          "forkfsd object-get CONTAINER KEY\n"
                          "forkfsd object-batch CONTAINER EXPECTED_SEQUENCE BATCH_FILE\n"
                          "forkfsd fs-init CONTAINER\n"
+                         "forkfsd fs-volume-name CONTAINER [--world WORLD|--revision REVISION]\n"
+                         "forkfsd fs-set-volume-name CONTAINER NAME [--world WORLD]\n"
                          "forkfsd fs-mkdir CONTAINER PATH\n"
                          "forkfsd fs-write CONTAINER PATH INPUT_FILE\n"
                          "forkfsd fs-save CONTAINER PATH INPUT_FILE\n"
@@ -218,7 +220,7 @@ int main(int argc, char** argv) {
         }
         std::string view="main";bool revision_view=false;
         int base_argc=4;
-        if(command=="fs-init" || command=="fs-check" || command=="fs-worlds" || command=="fs-revisions" || command=="fs-compact" || command=="fs-layout")base_argc=3;
+        if(command=="fs-init" || command=="fs-check" || command=="fs-worlds" || command=="fs-revisions" || command=="fs-compact" || command=="fs-layout" || command=="fs-volume-name")base_argc=3;
         if(command=="fs-write" || command=="fs-save" || command=="fs-link" || command=="fs-rename" || command=="fs-fork" || command=="fs-restore" || command=="fs-append" || command=="fs-truncate" || command=="fs-symlink" || command=="fs-lchmod" || command=="fs-chmod" || command=="fs-setmtime")base_argc=5;
         if(command=="fs-setflags" || command=="fs-lsetflags")base_argc=5;
         if(command=="fs-read-at" || command=="fs-write-at")base_argc=6;
@@ -301,6 +303,8 @@ int main(int argc, char** argv) {
             } else if(command=="fs-fork" && argc==5) fs.fork(argv[3],argv[4]);
             else if(command=="fs-worlds" && argc==3) {for(const auto& name:fs.worlds())std::cout<<name<<'\n';return 0;}
             else if(command=="fs-revisions" && argc==3) {for(const auto& name:fs.revisions())std::cout<<name<<'\n';return 0;}
+            else if(command=="fs-volume-name" && argc==3){std::cout<<fs.volume_name()<<'\n';return 0;}
+            else if(command=="fs-set-volume-name" && argc==4)fs.set_volume_name(argv[3]);
             else if(command=="fs-init" && argc==3) fs.initialize();
             else if(command=="fs-check" && argc==3) {container.verify();fs.verify();}
             else if((command=="fs-settimes" || command=="fs-lsettimes") && argc==7) {

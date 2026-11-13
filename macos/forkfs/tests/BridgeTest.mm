@@ -75,6 +75,12 @@ int main(int argc,char** argv){@autoreleasepool {
         if(error)std::cerr<<error.description.UTF8String<<"\n";check(volume!=nil && !error,"volume initialization failed");
         __block FSItem* root=nil;__block NSError* result=nil;
         [volume activateWithOptions:nil replyHandler:^(FSItem* item,NSError* e){root=item;result=e;}];check(root && !result,"activation failed");
+        check([volume.name.string isEqual:@"ForkFS"],"default volume label failed");
+        __block FSFileName* renamed=nil;
+        [volume setVolumeName:[FSFileName nameWithString:@"Bridge 卷📦"] replyHandler:^(FSFileName* name,NSError* e){renamed=name;result=e;}];
+        check(!result && [renamed.string isEqual:@"Bridge 卷📦"] && [volume.name.string isEqual:renamed.string],"volume rename callback failed");
+        [volume setVolumeName:[FSFileName nameWithString:@""] replyHandler:^(FSFileName* name,NSError* e){renamed=name;result=e;}];
+        check(result.code==EINVAL && !renamed && [volume.name.string isEqual:@"Bridge 卷📦"],"invalid rename changed volume name");
         __block FSItemAttributes* rootAttrs=nil;
         [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:root replyHandler:^(FSItemAttributes* a,NSError* e){rootAttrs=a;result=e;}];check(!result && rootAttrs.mode==0700,"mount root must be private");
         FSItemSetAttributesRequest* expose=[FSItemSetAttributesRequest new];expose.mode=0755;
@@ -321,6 +327,8 @@ int main(int argc,char** argv){@autoreleasepool {
         check(write(roFD,roData.bytes,roData.length)==static_cast<ssize_t>(roData.length),"cannot write revision descriptor");close(roFD);
         volume=[[RevisionVolume alloc] initWithRuntimeURL:[NSURL fileURLWithPath:runtime isDirectory:YES] error:&error];check(volume!=nil,"revision volume initialization failed");
         [volume activateWithOptions:nil replyHandler:^(FSItem* it,NSError* e){root=it;result=e;}];check(root && !result,"revision activation failed");
+        check([volume.name.string isEqual:@"ForkFS"],"revision volume name lost isolation");
+        [volume setVolumeName:[FSFileName nameWithString:@"forbidden"] replyHandler:^(FSFileName* name,NSError* e){result=e;}];check(result.code==EROFS,"readonly volume rename must fail");
         [volume createItemNamed:[FSFileName nameWithString:@"forbidden"] type:FSItemTypeFile inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* it,FSFileName* n,NSError* e){result=e;}];check(result.code==EROFS,"revision creation must fail read-only");
         [volume getXattrNamed:[FSFileName nameWithString:@"user.retained"] ofItem:root replyHandler:^(NSData* v,NSError* e){xattrValue=v;result=e;}];check(!result && xattrValue.length==3 && !memcmp(xattrValue.bytes,"R\0X",3),"revision xattr read failed");
         [volume setXattrNamed:attrName toData:contents onItem:root policy:FSSetXattrPolicyAlwaysSet replyHandler:^(NSError* e){result=e;}];check(result.code==EROFS,"revision xattr write must fail read-only");
