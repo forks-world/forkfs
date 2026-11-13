@@ -263,3 +263,10 @@ xattr，以及 `fcopyfile(DATA)` 和源/目标均 unlink 后同名路径重用�
 校验。macOS CTest 自动执行 APFS reference，原生 FSKit 挂载仍单独验收。
 见 [复制与传输验收](evidence/2026-11-13-copy-transfer.json)。不宣称 ACL、
 ResourceFork、递归复制、稀疏分配保留、header/trailer、任意负载或零拷贝性能。
+
+CLI `request ... fs-hwriteback HANDLE OFFSET INPUT_FILE` 已与其他写请求一样
+读取二进制文件内容；此前会把文件名字符串作为 payload，导致合法 append-only
+写回失败，普通可写文件也可能收到文件名文本。回归覆盖含 NUL 的写回、空输入
+不提交、非法前缀拒绝和缺失/超过 256 KiB 文件在 dispatch 前失败。此修复针对
+CLI 包装层，不改变 wire protocol 或原生 FSKit 能力等级。
+见 [CLI 写回输入验收](evidence/2026-11-13-cli-writeback.json)。

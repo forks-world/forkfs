@@ -1492,3 +1492,12 @@ REPORT.json` to verify its name/data and EROFS rejection. APFS reference mode
 requires `--reference-apfs-image NEW_OWNED_IMAGE` next to its exact mount root
 and verifies the image/mount association with hdiutil. Never use an existing
 user volume as the reference. See [evidence](../docs/evidence/2026-11-13-volume-name.json).
+
+The CLI request wrapper also accepts
+`forkfsd request SOCKET fs-hwriteback HANDLE OFFSET INPUT_FILE [--world WORLD]
+--session TOKEN`. Like other data-write requests, it loads the file bytes
+(including NUL) into the RPC payload; the filename is not sent as content.
+An empty input is a no-op. Missing input files fail before RPC dispatch, and
+changed append-only prefixes still fail without a publication. This corrects
+the CLI wrapper only; the writeback wire protocol and frontend semantics are
+unchanged.
