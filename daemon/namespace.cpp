@@ -186,8 +186,10 @@ std::vector<std::string> target_components(const std::string& target) {
 }
 struct Parent {std::string id,name,key;};
 std::string walk(const NamespaceView& journal,const std::vector<std::string>& names,size_t count,
-                 std::vector<std::string>* ancestry=nullptr,bool follow_final=true,Parent* missing=nullptr) {
+                 std::vector<std::string>* ancestry=nullptr,bool follow_final=true,Parent* missing=nullptr,
+                 bool* followed_symlink=nullptr) {
     std::vector<std::string> stack{root(journal)};std::deque<std::string> pending(names.begin(),names.begin()+count);
+    if(followed_symlink)*followed_symlink=false;
     unsigned follows=0;size_t expanded=0;std::string id=stack.back();
     while(!pending.empty()) {
         auto name=pending.front();pending.pop_front();id=stack.back();need(inode(journal,id).directory,"path component is not a directory");
@@ -199,6 +201,7 @@ std::string walk(const NamespaceView& journal,const std::vector<std::string>& na
         }
         auto child=decode_id(journal.get(key));auto n=inode(journal,child);
         if(n.symlink && (follow_final || !pending.empty())) {
+            if(followed_symlink)*followed_symlink=true;
             need(++follows<=40,"too many symbolic links");auto b=journal.get(content_key(child));need(b.size()==n.size,"symlink size mismatch");
             std::string target(b.begin(),b.end());auto parts=target_components(target);expanded+=target.size();need(expanded<=65536,"symlink expansion limit");
             if(target[0]=='/')stack.resize(1);
@@ -212,8 +215,9 @@ Parent parent(const NamespaceView& journal,const std::string& path,std::vector<s
     auto id=walk(journal,names,names.size()-1,ancestry);need(inode(journal,id).directory,"parent is not a directory");
     return {id,names.back(),entry_key(id,names.back())};
 }
-std::string resolve(const NamespaceView& journal,const std::string& path,bool follow=true,Parent* missing=nullptr) {
-    auto names=components(path);return walk(journal,names,names.size(),nullptr,follow,missing);
+std::string resolve(const NamespaceView& journal,const std::string& path,bool follow=true,Parent* missing=nullptr,
+                    bool* followed_symlink=nullptr) {
+    auto names=components(path);return walk(journal,names,names.size(),nullptr,follow,missing,followed_symlink);
 }
 InodeInfo created(InodeInfo n){n.accessed_ns=n.modified_ns;n.birth_ns=n.changed_ns;return n;}
 void touch(InodeInfo& n) {n.modified_ns=n.changed_ns=now();}
@@ -1257,7 +1261,13 @@ std::string Namespace::path_for_inode(const std::string& id) const {
     NamespaceView view(*container_.journal_,view_,revision_);auto rid=root(view);
     auto hint=container_.inode_paths_.find({view_,revision_,id});
     if(hint!=container_.inode_paths_.end()){
-        try{if(resolve(view,hint->second,false)==id)return hint->second;}
+        try{
+            // Directory RPCs append child names. A symlink alias may be much
+            // longer than the physical path, so use traversal for such hints.
+            bool followed_symlink=false;
+            if(resolve(view,hint->second,false,nullptr,&followed_symlink)==id &&
+               (!inode(view,id).directory || !followed_symlink))return hint->second;
+        }
         catch(const std::runtime_error& e){auto message=std::string_view(e.what());
             if(message!="path not found" && message!="path component is not a directory" &&
                message!="too many symbolic links" && message!="symlink expansion limit")throw;

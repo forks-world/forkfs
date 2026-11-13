@@ -170,5 +170,24 @@
     "At most 4096 FIFO hints per Container; pathname bytes retain the existing 4096-byte bound. No object roots or GC pins, no storage/RPC/format changes, and no persistent index or constant-time cold-search guarantee.",
     "The native append harness originally put child HOME/TMPDIR on the mount and exceeded 15 s. The script was corrected to isolate interpreter/xcrun startup caches on the host without raising deadlines. The final large-repository result uses BOTH that harness fix and this daemon; do not attribute the entire pass to inode hints alone.",
     "Native acceptance covers the listed vnode operations amid 66000 preexisting empty files, on private single-user macOS 27.2.1 arm64. This is not universal latency, FSEvents, recursive watch, full POSIX/APFS or power-loss qualification."
-  ]
+  ],
+  "watchdog_integration_2026_11_13": {
+    "base_commit": "891ebad294fe8039bf3358e507219e5f1d568bb2",
+    "tested_tree_before_evidence": "798da24efacaea0047288fc89ad4afa1768a5814",
+    "isolated_release_ctest_passed": 58,
+    "isolated_release_ctest_failed": 0,
+    "ctest_seconds": 107.99,
+    "system_only_dependencies": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "non_documentation_source_paths_match_isolated_copy": 138,
+    "regression": "Directory hint via a 3864-byte ancestor-symlink alias plus a 250-byte child exceeded the 4096-byte path bound despite a short physical path. New inode RPC create and lookup tests reseed that alias before each operation.",
+    "regression_failed_before_fix": true,
+    "fix": "Directory hints traversing any symlink fall back to the physical directory traversal; file hint behavior and path bounds remain unchanged.",
+    "environment": "macOS 27.2 SDK, Apple Clang, Release WFS_FSKIT=ON; disposable git-archive sources without .git, deny-default sandbox, no host home/credentials/keychain access; loopback-only test transport.",
+    "native_evidence_scope": "Earlier native evidence above remains historical and pinned to its original runtime; this entry records new integrated CTest/callback validation, not a new signed native mount.",
+    "daemon_sha256": "bde69811b0c50ca80583fb927075ad6372cf1d65aa4d279d8d9f1bbe2d9475d6"
+  }
 }

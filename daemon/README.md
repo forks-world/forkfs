@@ -331,7 +331,9 @@ Inode RPCs can reuse a recently observed namespace path instead of locating an
 inode by traversing all directory entries. Successful stat/lstat/open and a
 fallback search seed hints. Each use resolves the path in the **current**
 World/revision with no final-symlink following, and compares the requested inode
-ID. A mismatch, vanished path, changed ancestor type or retargeted/cyclic symlink
+ID. Directory hints that traverse ancestor symlinks fall back to the physical
+directory walk, preserving room for child names when an alias is much longer
+than its target. A mismatch, vanished path, changed ancestor type or retargeted/cyclic symlink
 falls back to the existing traversal. Hardlinks may return any valid alias;
 regular-file inode operations cannot accidentally target the final symlink.
 

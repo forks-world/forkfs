@@ -57,7 +57,8 @@ PathConf、OpenClose、ReadWrite、Xattr。macOS 27 Handler 迁移、AccessCheck
 Preallocate、DataCache 等独立评估；迁移 API 不自动补齐上表语义。
 
 inode RPC 的路径查找可复用已观察到的路径提示；每次都在当前 World/revision
-重新解析并核对 inode ID，最终符号链接不跟随。提示失效时仍回退遍历，不以旧
+重新解析并核对 inode ID，最终符号链接不跟随。目录提示若经过祖先符号链接也
+回退真实目录遍历，避免长别名挤占子项路径长度。提示失效时仍回退遍历，不以旧
 路径决定写入目标。缓存全局最多 4,096 项，已测目录改名、硬链接、路径重用、
 祖先符号链接改向/成环、World/revision 隔离和淘汰；不等同于持久 inode 索引
 或任意冷查询的常数复杂度。见 [路径提示验收](evidence/2026-11-12-inode-path-hints.json)。
