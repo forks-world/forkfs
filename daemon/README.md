@@ -615,9 +615,9 @@ are documented in [FSKIT.md](../docs/FSKIT.md#sparse-seek-regions).
 ## BSD metadata flags
 
 `fs-stat`, `fs-lstat` and handle/inode RPC attributes expose a numeric `flags`
-field. Supported masks are `UF_NODUMP` (1), `UF_HIDDEN` (32768), or their
-combination (32769). These are metadata hints for backup/visibility tools;
-they do not restrict file writes. Other flags, including immutable, append-only,
+field. Supported bits are `UF_NODUMP` (1), `UF_IMMUTABLE` (2), and `UF_HIDDEN`
+(32768), including combinations. Hidden/nodump are backup/visibility hints;
+immutable has the enforcement described below. Other flags, including append-only,
 nounlink and system protection bits, fail with ENOTSUP before mutation. The
 native kernel may reject privileged flags earlier with EPERM. This is not full
 BSD flag support or a multi-user authorization model.
@@ -674,6 +674,33 @@ editor's deterministic height-cache test goes from 1001 cold misses to 7 warm
 misses on its fixture. Cold first writes still scan uncached subtrees; inode to
 path lookup and other metadata costs remain separate. See
 [validation evidence](../docs/evidence/2026-11-12-metadata-height-cache.json).
+
+## User immutable flag
+
+`UF_IMMUTABLE` (2) rejects new writable opens, pathname data writes/truncation,
+mode/time/xattr changes, new hardlinks, unlink, source rename and replacement of
+the protected inode with EPERM. Immutable directories reject entry creation,
+removal and rename in either direction, including atomic replacement; existing
+children remain independently writable. Checks precede namespace publication.
+Mixed requests cannot clear the bit and change protected metadata in the same
+request: clear flags first. Flag-only updates remain available to the private
+single-user service owner, including through metadata handles.
+
+Darwin preserves data/size rights granted by a writable open before the flag was
+set. The daemon follows this rule for existing writable descriptions and their
+dups, including retained orphans; metadata changes are still denied. The flag
+does not revoke existing fd/mmap permissions or prevent a service owner from
+clearing it. It is not a privileged system-immutable flag, ACL or multi-user
+security boundary. Unsupported flags (append-only, system bits, etc.) still fail
+before mutation. Explicit offline revision restore changes a World head; this
+administrative operation is not a POSIX write to an immutable inode.
+
+Flags retain revision identity, hardlink sharing and GC retention in the existing
+72-byte FFINOD04 record. There is no format-size change, but older daemons reject
+the newly supported immutable bit. Clearing it in a live World does not make
+retained immutable revisions readable by older versions. Deploy matching new
+daemon/module binaries and keep them while such records are reachable.
+See [native immutable acceptance](../docs/FSKIT.md#user-immutable-acceptance).
 
 ## Directory pages
 

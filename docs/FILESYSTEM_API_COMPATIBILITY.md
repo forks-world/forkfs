@@ -44,7 +44,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `ftruncate`、稀疏文件、`lseek` | setattr size + bounded chunk I/O | 挂载已测零填充、shrink/extend、64 MiB/4 GiB/1 TiB 边界；macOS 27 已挂载验收 `SEEK_DATA/SEEK_HOLE`（64 KiB chunk 粒度）；macOS 26 保留保守 fallback |
 | `F_PREALLOCATE`、`posix_fallocate`、hole punch | 可选 Preallocate/数据变更接口 | 未实现相应协议；不能声称空间预留或洞区间查询兼容 |
 | `statfs/statvfs/pathconf` | volumeStatistics、PathConfOperations | 回调/RPC 已测；空间来自宿主卷，不是 forkfs 配额，剩余空间不保证下一次写入成功 |
-| `chflags/fchflags/lchflags`、BSD flags | get/setAttributes → revision inode | 挂载已测 hidden/nodump 的路径/fd/nofollow、硬链接、cp -p、孤儿 fd 和历史隔离；immutable/append-only/nounlink/系统保护标记在修改前拒绝 |
+| `chflags/fchflags/lchflags`、BSD flags | get/setAttributes → revision inode | 挂载已测 hidden/nodump 的路径/fd/nofollow、硬链接、cp -p、孤儿 fd 和历史隔离；新增 user immutable 的写打开/元数据/目录变更限制；append-only/nounlink/系统保护标记仍拒绝 |
 | `mkfifo/mknod`、Unix socket 路径 | create item types | 缺失；当前只支持 regular/directory/symlink，不适合依赖这些节点的运行目录 |
 | `copyfile/clonefile/fcopyfile/sendfile` | 内核 fallback 或可选复制能力 | 普通 `cp` 部分场景已测；CoW clone、资源 fork 大值、完整 copyfile flags、sendfile 未验收 |
 | `kqueue` vnode 通知、文件监控、FSEvents | 内核 vnode 事件 | macOS 27.2 小仓库已测 WRITE/EXTEND/ATTRIB/LINK/RENAME/DELETE、父目录事件、跨进程写及路径重用隔离；FSEvents、递归监控、revoke 未验收 |
@@ -154,8 +154,8 @@ APFS 对照成功；这些仍是明确缺口。数量上限现为 128 项，每 
 
 `hidden`/`nodump` 标记已贯通 daemon、RPC 与 FSKit，flags-only diff 即使时间戳
 相同也能识别变化。非零标记使用 `FFINOD04`，旧版本 daemon 拒绝该记录；
-清除当前 World 的标记不等于清除历史版本。标记不影响数据写入；保护类标记
-继续拒绝，不能把可保存位当作已执行 immutable/append-only 约束。
+清除当前 World 的标记不等于清除历史版本。hidden/nodump 不影响数据写入；
+后续 user immutable 的范围见下文，append-only 等其他保护类标记仍拒绝。
 见 [BSD 元数据标记验收](evidence/2026-11-12-file-flags.json)。
 
 macOS 27 的 `SeekRegionHandler` 已接入现有 Operations 前端，原生
@@ -208,3 +208,11 @@ inode 增长，不能把页缓存上限当成整个进程的常数内存保证�
 该验收的 fixture 使用批量元数据准备，不代表逐文件创建性能。普通逐文件
 创建期间已观察到 `MetadataTree::height` 的每编辑器全树检查占主要耗时；
 高度校验复用/创建吞吐将作为独立后续项处理。
+
+
+User immutable (`UF_IMMUTABLE`) 已在 daemon 的路径写入、写打开、元数据、
+硬链接及目录变更入口执行 EPERM 限制，并保留在 revision/孤儿 inode 中。
+遵循 Darwin 的已授予权限语义：设置前打开的写 fd 仍可写和截断，设置后不能
+新开写 fd；它不撤销旧 fd/mmap 权限，也不是多用户授权边界。标志本身可由
+私有服务用户清除。旧 daemon 拒绝 FFINOD04 的新增标志位，包括历史版本。
+见 [user immutable 验收](evidence/2026-11-13-user-immutable.json)。

@@ -101,7 +101,7 @@ def main():
         report['path_fd_directory_symlink_hardlink_copy'] = True
         if not args.reference_apfs:
             report['unsupported_errno'] = {}
-            for flags in [2, 4, 0x20000]:
+            for flags in [4, 0x10, 0x20000]:
                 report['unsupported_errno'][str(flags)] = reject(lambda: change(path, flags), errno.ENOTSUP, errno.EPERM)
                 check(os.fstat(fd).st_flags == HIDDEN|NODUMP and path.read_bytes() == b'data', 'unsupported flag changed state')
             revision = 'flags_accept_' + root.name.removeprefix('forkfs-flags-').replace('-', '_')

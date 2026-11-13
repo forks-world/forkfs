@@ -192,7 +192,7 @@ names, links, rename, NFC/NFD distinctions and the byte limit; see
 Current limits are inherited from the namespace prototype: 1 TiB per regular
 file with 256 KiB per daemon I/O request, UTF-8 names (255 bytes per component, 4096 per path), mode bits through
 0777, native xattrs (262,143 bytes per value, 128 per inode, 8 MiB total values), no ACLs or uid/gid
-changes, and no special files. Setattr supports mode, size, mtime, atime, birth time and hidden/nodump flags atomically. Protection flags and other
+changes, and no special files. Setattr supports mode, size, mtime, atime, birth time and hidden/nodump/user-immutable flags atomically. Other unsupported flags and
 unsupported attributes fail before mutation. The owner/group are synthesized
 from the service identity. The mounted root is always exposed as mode 0700, and
 requests to broaden that mode fail before mutation; this mount policy does not
@@ -521,7 +521,7 @@ See [capacity and ResourceFork evidence](evidence/2026-11-12-xattr-capacity-reso
 The frontend reports `FSItemAttributes.flags` and atomically consumes supported
 flags with mode/size/times through `inode-setattr-flags`. Older setattr RPCs
 remain supported; requests without flags keep using the existing times command.
-Supported masks are hidden/nodump only. Kernel-visible rejection is ENOTSUP for
+Supported bits include hidden/nodump and user immutable (see below). Kernel-visible rejection is ENOTSUP for
 unsupported flags, or EPERM when the kernel rejects a privileged mask first.
 Use the matching new daemon/module pair for flag support. `FFINOD04` records
 require the updated daemon, including when only historical roots retain flags.
@@ -564,3 +564,25 @@ covered. Stored chunks conservatively report data for 64 KiB; inline files
 report all bytes as data. APFS can choose different interval boundaries. This
 adds neither preallocation nor hole punching, and does not describe physical
 storage extents. See [acceptance evidence](evidence/2026-11-12-seek-regions.json).
+
+### User immutable acceptance
+
+The module accepts UF_IMMUTABLE and the daemon enforces new write admission,
+metadata mutation and namespace constraints. Existing writable fd data/size
+rights are retained as on Darwin; this does not claim mmap revocation or a
+multi-user security boundary. Immutable directories prevent child entry changes,
+while independently mutable existing children can still be written. Flag-only
+clear is supported; unsupported system/append-only bits remain rejected.
+
+```sh
+python3 scripts/tests/immutable_mount.py /private/tmp --reference-apfs
+python3 scripts/tests/immutable_mount.py /path/to/mount \
+  --daemon build/Release/daemon/forkfsd --socket /path/to/runtime/control.sock > /tmp/immutable.json
+# After unmount, offline GC and readonly mounting the reported revision:
+python3 scripts/tests/immutable_mount.py /path/to/mount --verify-report /tmp/immutable.json
+```
+
+Use a disposable repository. The script retains an immutable revision and clears
+live scratch flags before cleanup. Existing FFINOD04 layout is reused; older
+binaries reject its new bit, including historical records. Updated daemon/module
+must be deployed together. See [evidence](evidence/2026-11-13-user-immutable.json).

@@ -99,10 +99,19 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         assert obj('inode-stat',deep_id,*sel)['inode_id']==deep_id
         assert obj('inode-stat',fid,*sel)['inode_id']==fid
         short_read=obj('inode-open',fid,'r',*sel)['handle'];rpc('fs-close',short_read,*sel)
+        obj('inode-setattr-flags',fid,'-','-','-','-','-','2',handle,*sel)
+        immutable_seq=obj('status')['last_committed_seq']
+        rpc('inode-open',fid,'w',*sel,error=errno.EPERM)
+        rpc('inode-setattr',fid,str(0o700),'-','-',handle,*sel,error=errno.EPERM)
+        rpc('inode-link',fid,rid,'immutable-link',*sel,error=errno.EPERM)
+        rpc('inode-rename',did,'moved',rid,'immutable-moved',fid,'-',*sel,error=errno.EPERM)
+        assert obj('status')['last_committed_seq']==immutable_seq
+        rpc('fs-hwrite',handle,'0',b'abc\x00def',*sel) # previously admitted writer
+        obj('inode-setattr-flags',fid,'-','-','-','-','-','0',handle,*sel)
         st=obj('inode-setattr-flags',fid,'-','-','-','-','-','32769',handle,*sel)
         assert st['flags']==32769
         flag_seq=obj('status')['last_committed_seq']
-        for invalid in ['2','4294967297']:
+        for invalid in ['4','4294967297']:
             rpc('inode-setattr-flags',fid,str(0o777),'0','0','-','-',invalid,handle,*sel,error=errno.ENOTSUP)
         assert obj('status')['last_committed_seq']==flag_seq
         assert obj('fs-hstat',handle,*sel)['flags']==32769
