@@ -26,13 +26,15 @@ static std::string logical_state(const std::string& status){
   auto end=status.find_first_not_of("0123456789",begin);check(end!=begin);result+=status.substr(begin,end-begin)+"/";
  }return result;
 }
-template<class F> static void full(Container& store,F fn,int line=__builtin_LINE()){
+template<class F> static void expect_error(Container& store,int expected,F fn,int line=__builtin_LINE()){
  // Background storage metrics can change on reads; compare publication/root
  // state, not timings or counters unrelated to namespace mutation.
  auto before=logical_state(store.status());int error=0;try{fn();}catch(const std::system_error& e){error=e.code().value();}
- if(error!=EMLINK)throw std::runtime_error("expected EMLINK at "+std::to_string(line)+", got "+std::to_string(error));
+ if(error!=expected)throw std::runtime_error("expected errno "+std::to_string(expected)+" at "+std::to_string(line)+", got "+std::to_string(error));
  check(logical_state(store.status())==before,line);
 }
+template<class F> static void full(Container& store,F fn,int line=__builtin_LINE()){expect_error(store,EMLINK,fn,line);}
+static void flags(Namespace& fs,const std::string& path,uint32_t value){Namespace::Attributes a;a.flags=value;fs.set_link_attributes(path,a);}
 static void fixture(const std::string& path){
  Container::create(path);std::string id,dir;
  {Container store(path);Namespace fs(store);fs.initialize();fs.mkdir("/links");fs.write("/file",{'D'});id=fs.stat("/file").id;dir=fs.stat("/links").id;}
@@ -52,9 +54,13 @@ int main(int argc,char** argv){
   // restored to actual reference counts before full namespace verification.
   patch_count(path,file,forkfs::maximum_link_count-1);patch_count(path,parent,forkfs::maximum_link_count);
   {Container store(path);Namespace fs(store);fs.link("/file","/last");check(fs.stat("/file").links==forkfs::maximum_link_count);
+   flags(fs,"/file",2);expect_error(store,EPERM,[&]{fs.link("/file","/overflow");});flags(fs,"/file",0);
    full(store,[&]{fs.link("/file","/overflow");});check(fs.list("/")==std::vector<std::string>({"alias","file","from","full","last"}));
    fs.remove("/last",false);check(fs.stat("/file").links==forkfs::maximum_link_count-1);fs.link("/file","/reused");
-   full(store,[&]{fs.mkdir("/full/overflow");});full(store,[&]{fs.rename("/from/moving","/full/new");});
+   flags(fs,"/full",2);expect_error(store,EPERM,[&]{fs.mkdir("/full/overflow");});flags(fs,"/full",0);
+   full(store,[&]{fs.mkdir("/full/overflow");});
+   flags(fs,"/full",2);expect_error(store,EPERM,[&]{fs.rename("/from/moving","/full/new");});flags(fs,"/full",0);
+   full(store,[&]{fs.rename("/from/moving","/full/new");});
    check(fs.list("/from")==std::vector<std::string>{"moving"});fs.rename("/from/moving","/full/empty");check(fs.stat("/full").links==forkfs::maximum_link_count);}
   patch_count(path,file,3);patch_count(path,parent,3);
   {Container store(path);Namespace fs(store),old(store,"valid",true);check(old.stat("/file").links==2 && fs.read("/reused")==Bytes{'D'});fs.verify();old.verify();store.collect_garbage();store.verify();}
