@@ -671,7 +671,8 @@ python3 scripts/tests/copy_transfer_mount.py /private/tmp --reference-apfs
 python3 scripts/tests/copy_transfer_mount.py /path/to/mount --verify-report REPORT.json
 ```
 
-The script owns one unique scratch directory and retains one forkfs revision.
+The script owns one unique scratch directory and retains one forkfs revision. CTest
+uses `/private/tmp` so its APFS scratch stays independent of the build filesystem.
 It calls libc copyfile/fcopyfile/sendfile directly. It checks a 502000-byte binary
 payload, copyfile DATA|STAT|XATTR with mode/mtime/hidden/nodump and a 20 KiB binary
 ordinary xattr, fd data copy including unlinked source and destination with
