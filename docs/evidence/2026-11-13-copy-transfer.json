@@ -1,0 +1,125 @@
+{
+  "schema": 1,
+  "date": "2026-11-13",
+  "platform": "macOS27.2.1 arm64",
+  "base_commit": "41b29f9bfcc839b0d6ed28f3cd5f4cc0958a48ec",
+  "base_tree": "765fb5f85725dc4be8465724ab5c954dbbe30294",
+  "source_tree_before_evidence": "9c200718b7670bdf9745feb781e163a94bd3c433",
+  "runtime_unchanged": true,
+  "runtime_build_provenance": {
+    "reused_head": "bb97da02ec56f4538a6d8b9b4fe0c566c01acd5f",
+    "reused_tree_equals_current_base_tree": true,
+    "runtime_source_files_match_prior_isolated_build": 26,
+    "daemon_and_signed_extension_match_prior_evidence_hashes": true,
+    "prior_runtime_evidence": "2026-11-13-append-flags.json",
+    "fresh_full_local_suite_run": false
+  },
+  "validation": {
+    "apfs_registered_ctest_passed": 1,
+    "apfs_registered_ctest_failed": 0,
+    "ctest_seconds": 0.09,
+    "execution": "APFS reference and native scripts in deny-default sandbox; no home/credential/keychain/publishing access; read-only main-equivalent runtime build; loopback-only sockets explicitly bound to 127.0.0.1. Disposable archive source has no Git metadata. Main-equivalent signed module verified separately.",
+    "payload_bytes": 502000,
+    "ordinary_xattr_bytes": 20480,
+    "scope": "libc copyfile DATA|STAT|XATTR, fcopyfile DATA including unlinked source/destination and path reuse, direct Darwin sendfile partial-count accumulation/range/EOF/unchanged source offset, EXCL sentinel preservation, clone state and forced-clone capability."
+  },
+  "apfs_reference": {
+    "filesystem": "apfs",
+    "namespace": "/forkfs-copy-5y8j1353",
+    "bytes": 502000,
+    "sha256": "81a01ef7982bf80f144a590f1871eb2db127ee63d8c1de97edbe51f16e01e611",
+    "exclusive_errno": 17,
+    "exclusive_ctime_changed": true,
+    "clone_requested_copy": {
+      "was_cloned": true,
+      "data_matches": true
+    },
+    "forced_clone": {
+      "supported": true
+    },
+    "sendfile": [
+      {
+        "offset": 17,
+        "requested": 300001,
+        "sent": 300001,
+        "calls": 2
+      },
+      {
+        "offset": 0,
+        "requested": 0,
+        "sent": 502000,
+        "calls": 3
+      },
+      {
+        "offset": 502009,
+        "requested": 0,
+        "sent": 0,
+        "calls": 1
+      }
+    ],
+    "unlinked_fd_copy_and_sendfile": true,
+    "copyfile_data_stat_xattr": true,
+    "fcopyfile_data": true
+  },
+  "native": {
+    "filesystem": "forkfs",
+    "namespace": "/forkfs-copy-ujeb90m5",
+    "bytes": 502000,
+    "sha256": "81a01ef7982bf80f144a590f1871eb2db127ee63d8c1de97edbe51f16e01e611",
+    "exclusive_errno": 17,
+    "exclusive_ctime_changed": true,
+    "clone_requested_copy": {
+      "was_cloned": false,
+      "data_matches": true
+    },
+    "forced_clone": {
+      "supported": false,
+      "errno": 45,
+      "destination_exists_after_failure": false
+    },
+    "sendfile": [
+      {
+        "offset": 17,
+        "requested": 300001,
+        "sent": 300001,
+        "calls": 2
+      },
+      {
+        "offset": 0,
+        "requested": 0,
+        "sent": 502000,
+        "calls": 3
+      },
+      {
+        "offset": 502009,
+        "requested": 0,
+        "sent": 0,
+        "calls": 1
+      }
+    ],
+    "unlinked_fd_copy_and_sendfile": true,
+    "revision": "copy_accept_ujeb90m5",
+    "daemon_revision_data_matches": true,
+    "copyfile_data_stat_xattr": true,
+    "fcopyfile_data": true
+  },
+  "offline_gc": {
+    "collected_objects": 1396
+  },
+  "namespace_and_storage_check_after_gc": true,
+  "readonly_revision_after_gc": {
+    "copies_after_gc_readonly_remount": true,
+    "metadata_and_xattr_preserved": true
+  },
+  "sha256": {
+    "daemon": "2fa9783e0b8fd540f6bd2342dd6b10f4879887c6fbe53ab63ce5d5ea58dc3c2b",
+    "signed_extension": "2419b83636a980dd6e6c702033884108554ad61c562e3b6e63e28edf282130d6",
+    "manual_script": "2fb7f8363e0fff2039556177590b81ecac17a872abc8f8cc9b0b1274fa13da2e"
+  },
+  "limits": [
+    "This change qualifies existing runtime behavior; it does not implement clone support or modify daemon/frontend runtime. No fresh full local CTest run is claimed. The new APFS reference is registered in macOS CTest; native mounting remains a separate acceptance.",
+    "COPYFILE_CLONE falls back to ordinary copy on forkfs with WAS_CLONED=false. CLONE_FORCE returns ENOTSUP; reference APFS actually clones. No forkfs CoW or zero-copy performance claim.",
+    "COPYFILE_EXCL preserved sentinel data, inode identity, mode, mtime and flags, but both filesystems updated ctime on failure. The compound library call is not a single atomic namespace mutation.",
+    "No ACL/ResourceFork/recursive-copy/full-flags, sparse allocation, headers/trailers, arbitrary load or multi-user qualification. Only the listed private single-user Darwin operations were measured."
+  ]
+}

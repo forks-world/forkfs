@@ -46,7 +46,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `statfs/statvfs/pathconf` | volumeStatistics、PathConfOperations | 回调/RPC 已测；空间来自宿主卷，不是 forkfs 配额，剩余空间不保证下一次写入成功 |
 | `chflags/fchflags/lchflags`、BSD flags | get/setAttributes → revision inode | 挂载已测 hidden/nodump 的路径/fd/nofollow、硬链接、cp -p、孤儿 fd 和历史隔离；user immutable 及 user append-only 的数据/元数据/目录约束已接入；nounlink/系统保护标记仍拒绝 |
 | `mkfifo/mknod`、Unix socket 路径 | create item types | 缺失；当前只支持 regular/directory/symlink，不适合依赖这些节点的运行目录 |
-| `copyfile/clonefile/fcopyfile/sendfile` | 内核 fallback 或可选复制能力 | 普通 `cp` 部分场景已测；CoW clone、资源 fork 大值、完整 copyfile flags、sendfile 未验收 |
+| `copyfile/clonefile/fcopyfile/sendfile` | 内核 fallback 或可选复制能力 | 新增原生验收 `copyfile(DATA|STAT|XATTR)`、`fcopyfile(DATA)` 和 sendfile 区间/EOF/unlink fd；clone 请求可回退，强制 clone 返回 ENOTSUP；ResourceFork、ACL、递归/完整 flags 仍未补齐 |
 | `kqueue` vnode 通知、文件监控、FSEvents | 内核 vnode 事件 | macOS 27.2 小仓库已测 WRITE/EXTEND/ATTRIB/LINK/RENAME/DELETE、父目录事件、跨进程写及路径重用隔离；FSEvents、递归监控、revoke 未验收 |
 | 持久 file ID、file handles、卷改名、大小写折叠 | 可选卷能力/身份协议 | persistent IDs 未提供（不宣告）；ID 只在当前 mount 稳定；卷名支持 revision 元数据和原生改名，大小写折叠未提供/未验收 |
 
@@ -247,3 +247,19 @@ repository ID 或挂载路径。缺失名称记录时仍为 ForkFS；相同名�
 或控制字符。revision/只读挂载改名返回 EROFS；label-only diff 单独报告卷名变化，
 不伪造文件内容变化。APFS 对照仅操作新建可丢弃镜像。
 见 [卷名验收](evidence/2026-11-13-volume-name.json)。
+
+原生复制/传输补充验收直接调用 Darwin libc，而不是 Python 文件复制或
+`socket.sendfile` 的回退。502000 字节二进制文件跨 256 KiB RPC 边界，验证
+`copyfile(DATA|STAT|XATTR)` 的数据/mode/mtime/hidden/nodump/20 KiB 普通
+xattr，以及 `fcopyfile(DATA)` 和源/目标均 unlink 后同名路径重用的 fd 身份。
+`sendfile` 通过有期限的 loopback 接收线程检查区间、count=0 到 EOF、超 EOF
+零字节及源 fd 偏移不变，并累计非阻塞短传输/EAGAIN 的实际发送字节。
+
+`COPYFILE_CLONE` 在 forkfs 上成功回退普通复制，state 明确报告未 clone；
+`COPYFILE_CLONE_FORCE` 返回 ENOTSUP。APFS 对照两个分支都实际 clone。
+`COPYFILE_EXCL` 返回 EEXIST 后，目标数据/身份/mode/mtime/flags 保持不变，
+但两种文件系统均观察到 ctime 更新；不能把这个复合库调用当作单次原子提交。
+三份复制文件通过 daemon revision 数据回读和 GC/只读重挂载的元数据/xattr
+校验。macOS CTest 自动执行 APFS reference，原生 FSKit 挂载仍单独验收。
+见 [复制与传输验收](evidence/2026-11-13-copy-transfer.json)。不宣称 ACL、
+ResourceFork、递归复制、稀疏分配保留、header/trailer、任意负载或零拷贝性能。
