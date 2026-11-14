@@ -3,6 +3,7 @@
 #include "metadata_tree.h"
 #include "compaction.h"
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <deque>
@@ -1204,9 +1205,9 @@ uint64_t Namespace::seek(const std::string& token,int64_t offset,Seek origin) {
         base=view.contains(inode_key(info.inode))?inode(view,info.inode).size:
             decode_inode(container_.journal_->get(orphan_prefix(view_,info.inode)+"inode"),info.inode,true).size;
     } else need(origin==Seek::Set,"invalid seek origin");
-    need(base<=INT64_MAX,"file position overflow");uint64_t result;
-    if(offset<0){auto magnitude=uint64_t(-(offset+1))+1;need(magnitude<=base,"negative file position");result=base-magnitude;}
-    else {need(base<=INT64_MAX && uint64_t(offset)<=uint64_t(INT64_MAX)-base,"file position overflow");result=base+uint64_t(offset);}
+    if(base>INT64_MAX)throw std::system_error(EOVERFLOW,std::generic_category(),"file position overflow");uint64_t result;
+    if(offset<0){auto magnitude=uint64_t(-(offset+1))+1;if(magnitude>base)throw std::system_error(EINVAL,std::generic_category(),"negative file position");result=base-magnitude;}
+    else {if(uint64_t(offset)>uint64_t(INT64_MAX)-base)throw std::system_error(EOVERFLOW,std::generic_category(),"file position overflow");result=base+uint64_t(offset);}
     info.cursor->position=result;return result;
 }
 Bytes Namespace::handle_read_next(const std::string& token,uint64_t count) {

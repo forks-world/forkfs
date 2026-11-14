@@ -1,4 +1,5 @@
 """RPC session ownership, heartbeat, quota and lease-driven handle release."""
+import errno
 import json
 from pathlib import Path
 import socket
@@ -22,11 +23,12 @@ with tempfile.TemporaryDirectory(prefix='ff-session-',dir='/tmp') as tmp:
     root=Path(tmp);db=root/'store';endpoint=root/'control.sock'
     p=subprocess.run([BIN,'init',str(db)],capture_output=True,timeout=10);assert p.returncode==0,p.stderr
     proc=subprocess.Popen([BIN,'serve',str(db),'--socket',str(endpoint),'--rpc'],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-    def rpc(*fields,ok=True):
+    def rpc(*fields,ok=True,error=None):
         with socket.socket(socket.AF_UNIX) as s:
             s.settimeout(5);s.connect(str(endpoint));s.sendall(frame(fields))
             h=exact(s,12);assert h[:8]==b'FFRSP001';b=exact(s,struct.unpack('<I',h[8:])[0])
             code=struct.unpack('<I',b[:4])[0];assert (code==0)==ok,(fields[:2],b)
+            if error is not None:assert code==error+1,(fields[:2],code,error)
             return b[4:]
     def session(ms=60000):return json.loads(rpc('session-open',ms))['session']
     def open_file(path,s,*view):return json.loads(rpc('fs-open',path,'rw',*view,'--session',s))['handle']
@@ -117,8 +119,33 @@ with tempfile.TemporaryDirectory(prefix='ff-session-',dir='/tmp') as tmp:
         assert json.loads(rpc('fs-hseek',duplicate,-2,'cur','--session',cursor_session))['offset']==2
         assert rpc('fs-hread-next',h,9,'--session',cursor_session)==b'bc'
         assert json.loads(rpc('fs-hseek',h,-1,'end','--session',cursor_session))['offset']==3
-        rpc('fs-hseek',h,-9,'set','--session',cursor_session,ok=False)
+        before=status()
+        cursor_info=json.loads(rpc('fs-hstat',h,'--session',cursor_session))
+        cursor_content=rpc('fs-hread',h,0,20,'--session',cursor_session)
+        rpc('fs-hseek',h,-1,'set','--session',cursor_session,ok=False,error=errno.EINVAL)
+        assert json.loads(rpc('fs-hseek',duplicate,0,'cur','--session',cursor_session))['offset']==3
+        rpc('fs-hseek',duplicate,-9223372036854775808,'cur','--session',cursor_session,ok=False,error=errno.EINVAL)
+        assert json.loads(rpc('fs-hseek',h,0,'cur','--session',cursor_session))['offset']==3
+        rpc('fs-hseek',h,-9223372036854775808,'end','--session',cursor_session,ok=False,error=errno.EINVAL)
+        assert json.loads(rpc('fs-hseek',duplicate,0,'cur','--session',cursor_session))['offset']==3
+        assert rpc('fs-hread',h,0,20,'--session',cursor_session)==cursor_content
+        cursor_info_after=json.loads(rpc('fs-hstat',h,'--session',cursor_session))
+        assert {k:cursor_info[k] for k in ('inode_id','size','modified_ns','changed_ns')}=={k:cursor_info_after[k] for k in ('inode_id','size','modified_ns','changed_ns')}
+        assert status()['last_committed_seq']==before['last_committed_seq']
+        assert json.loads(rpc('fs-hseek',h,9223372036854775807,'set','--session',cursor_session))['offset']==9223372036854775807
+        before=status()
+        rpc('fs-hseek',duplicate,1,'cur','--session',cursor_session,ok=False,error=errno.EOVERFLOW)
+        assert json.loads(rpc('fs-hseek',h,0,'cur','--session',cursor_session))['offset']==9223372036854775807
+        rpc('fs-hseek',h,9223372036854775807,'end','--session',cursor_session,ok=False,error=errno.EOVERFLOW)
+        assert json.loads(rpc('fs-hseek',duplicate,0,'cur','--session',cursor_session))['offset']==9223372036854775807
+        assert rpc('fs-hread',h,0,20,'--session',cursor_session)==cursor_content
+        cursor_info_after=json.loads(rpc('fs-hstat',h,'--session',cursor_session))
+        assert {k:cursor_info[k] for k in ('inode_id','size','modified_ns','changed_ns')}=={k:cursor_info_after[k] for k in ('inode_id','size','modified_ns','changed_ns')}
+        assert status()['last_committed_seq']==before['last_committed_seq']
+        assert json.loads(rpc('fs-hseek',h,0,'set','--session',cursor_session))['offset']==0
         rpc('fs-hseek',h,'9223372036854775808','set','--session',cursor_session,ok=False)
+        assert json.loads(rpc('fs-hseek',duplicate,0,'cur','--session',cursor_session))['offset']==0
+        assert json.loads(rpc('fs-hseek',h,3,'set','--session',cursor_session))['offset']==3
         other=session();rpc('fs-dup',h,'--session',other,ok=False);rpc('session-close',other)
         rpc('fs-close',h,'--session',cursor_session)
         assert rpc('fs-hread-next',duplicate,1,'--session',cursor_session)==b'c'

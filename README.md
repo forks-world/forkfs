@@ -86,6 +86,12 @@ per value. See [daemon commands, guarantees and limits](daemon/README.md).
 The [filesystem API compatibility matrix](docs/FILESYSTEM_API_COMPATIBILITY.md)
 tracks native syscall/application evidence, remaining gaps, and qualification order.
 
+The C++ namespace seek API and daemon `fs-hseek` RPC report `EINVAL` when a
+requested position is negative and `EOVERFLOW` when it exceeds signed 64-bit
+file positions. Rejected seeks leave the open-description cursor unchanged.
+This covers those two APIs only; native `lseek(2)` behavior is kernel-controlled
+and no new mount capability is claimed. See [seek error compatibility](docs/FILESYSTEM_API_COMPATIBILITY.md#seek-error-codes).
+
 Older architecture and platform guides describe retired or proposed systems;
 they do not enable additional supported runtimes. See
 [revision-only transition](docs/REVISION_ONLY.md) for the replacement policy.
