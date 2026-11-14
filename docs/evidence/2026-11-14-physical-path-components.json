@@ -1,0 +1,80 @@
+{
+  "title": "Physical path components in the daemon namespace",
+  "scope": [
+    "Absolute namespace lookup and mutation paths traverse dot and dot-dot components in physical order; dot-dot clamps at the selected World root",
+    "Repeated interior slashes are accepted, while a trailing slash remains unsupported",
+    "Terminal dot and dot-dot components may be looked up but are rejected for mutation so reserved names cannot become directory entries",
+    "Missing prefixes and dot-dot traversal through a regular file fail; path and component byte limits remain 4096 and 255 bytes",
+    "Directory inode path hints discard noncanonical physical aliases before RPC child paths are constructed",
+    "Namespace verification and revision diff reject corrupt stored entry names including dot, dot-dot, slash-containing, and repeated-slash names"
+  ],
+  "explicit_exclusions": [
+    "This is daemon C++ Namespace and raw-RPC behavior only; it does not claim native filesystem path semantics or a new mount capability",
+    "No lexical normalization across symlinks is claimed; traversal follows the symlink before processing later dot-dot components"
+  ],
+  "baseline": {
+    "base_commit": "4222ac4e9971a6918717ec999cc08421d01f779f",
+    "runtime_source_sha256": "6383f5bb6704acfef5abd82e1301e6b5b347b4e1951a747278aafee58851ff36",
+    "daemon_sha256": "d225263b711431f41c42ae3fdf6d52bad1243e60dc90e559d9d1d6ff159ca09d",
+    "feature_regression_test_snapshot": {
+      "cpp_test_sha256": "4c462d54045f7d8db372eab86f80250ac93b1d5571ab9fa1aa0b6f7cf5e6bea1",
+      "rpc_test_sha256": "7770a28f394d3386fca6d4e8cc811667ec8e691d32214d362522ecacfa00283a",
+      "note": "These feature-regression tests were run against the old runtime. Stored-entry integrity fixtures were added afterward; the final C++ test hash is different. The raw RPC test hash is unchanged."
+    },
+    "cpp_regression": {
+      "exit_code": 1,
+      "log": "/private/tmp/paths-exec-yr9thbri/baseline-cpp.log",
+      "log_sha256": "adc0711155181c8d6da127531da9312bf8e9533738b5a19e0b411894239a0c7b",
+      "observed": "C++ lstat of a physical dot-component alias failed with 'invalid path component'."
+    },
+    "raw_rpc_regression": {
+      "exit_code": 1,
+      "log": "/private/tmp/paths-exec-yr9thbri/baseline-rpc.log",
+      "log_sha256": "f18c53b0a7c6636b578e56b58a060f92cbfbe98f7793e5c101379bb95cf63a55",
+      "observed": "fs-stat on /physical-alias/../file returned wire code 1 and 'invalid path component'."
+    },
+    "control_state": "/private/tmp/paths-control-31kd891k/state.json"
+  },
+  "fixed_validation": {
+    "status": "passed",
+    "validated_base": "4222ac4e9971a6918717ec999cc08421d01f779f",
+    "execution": "Isolated disposable source copy; Release build with FSKit enabled. Executor runtime and five source/test files matched the recorded worktree hashes.",
+    "source_sha256": {
+      "daemon/namespace.cpp": "c274b6eaf1ab65fef1327d41e718989ccf2851c1216f49886376b8d88dd21a75",
+      "daemon/tests/inode_paths.cpp": "2c1cbff16a346687e4b9096fb925d4b492acc814c76eb88b4edc8db252c127e8",
+      "daemon/tests/namespace.py": "d37bdc7ae14f98d40d25630ba6913836e9b4319297e26e81b647e671f88ed6f0",
+      "daemon/tests/rpc.py": "7770a28f394d3386fca6d4e8cc811667ec8e691d32214d362522ecacfa00283a",
+      "daemon/tests/symlinks.py": "3a4fc66998eb248464055ef982d41de748c28ffcd42349022f973654105748a4"
+    },
+    "daemon_sha256": "c14a9c6465ac2ba626d9cd3e9d584c9514eae0aee98219909533a9f443f1c5af",
+    "cpp_binary_sha256": "951b49bda43a87060cae3383172d58867862a59d79c8836986648f83ed171f99",
+    "execution_root": "/private/tmp/paths-exec-yr9thbri",
+    "full_suite": {
+      "command": "ctest --test-dir /private/tmp/paths-exec-yr9thbri/build --output-on-failure --timeout 600 --no-tests=error -j2",
+      "passed": 66,
+      "failed": 0,
+      "seconds": 110.77,
+      "log": "/private/tmp/paths-exec-yr9thbri/validate.log",
+      "log_sha256": "4b52d2ad6d5f6bb5dc1069de4145c1528f1d2ccd81061b99d6b61d337f9d0826"
+    },
+    "targeted_tests": {
+      "forkfsd_inode_paths": "passed; includes exact 4096-byte alias hint, post-GC/reopen dotted reads, and corrupt stored-name rejection in verify and diff for '.', '..', '/a', and 'a//'",
+      "forkfsd_namespace": "passed",
+      "forkfsd_rpc": "passed",
+      "forkfsd_symlinks": "passed"
+    },
+    "dependency_check": {
+      "result": "passed",
+      "system_dependency_counts": {
+        "daemon": 2,
+        "extension": 7,
+        "host": 4
+      }
+    },
+    "control_state": "/private/tmp/paths-control-31kd891k/final-validation.json"
+  },
+  "documentation_sha256": {
+    "daemon/README.md": "468ba0ce2a6bb54132064438cf37097d87bebb37051118c5d194ac1ac7080d4e",
+    "docs/FILESYSTEM_API_COMPATIBILITY.md": "d839a08fe05fb9b7c341ec4cf0e4840ecb583db3988d2c8db1f2e8c008fa6386"
+  }
+}

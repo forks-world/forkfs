@@ -70,8 +70,17 @@ it distinguishes the baseline failures from the completed fixed-build validation
 PathConf、OpenClose、ReadWrite、Xattr。macOS 27 Handler 迁移、AccessCheck、
 Preallocate、DataCache 等独立评估；迁移 API 不自动补齐上表语义。
 
+普通 namespace 路径的 C++/raw-RPC 解析按物理顺序遍历 `.`、`..` 和重复的内部
+`/`，`..` 在 World 根目录钳制；不会跨符号链接做词法折叠。缺失前缀和普通文件
+后的 `..` 仍然失败。原始路径上限仍为 4096 字节（包含点组件及重复分隔符），
+组件上限仍为 255 字节；末尾 `/` 仍不支持。查找可用 `.` 或 `..` 结尾，变更
+操作拒绝这两个末尾组件，避免将保留名称写入目录项。此项记录 daemon namespace
+语义，不代表原生挂载路径能力升级。基线失败和最终回归结果见
+[physical path components evidence](evidence/2026-11-14-physical-path-components.json)。
+
 inode RPC 的路径查找可复用已观察到的路径提示；每次都在当前 World/revision
-重新解析并核对 inode ID，最终符号链接不跟随。目录提示若经过祖先符号链接也
+重新解析并核对 inode ID，最终符号链接不跟随。经过物理非规范点组件或重复分隔符
+的提示会回退遍历，避免长语法别名挤占子项路径长度。目录提示若经过祖先符号链接也
 回退真实目录遍历，避免长别名挤占子项路径长度。提示失效时仍回退遍历，不以旧
 路径决定写入目标。缓存全局最多 4,096 项，已测目录改名、硬链接、路径重用、
 祖先符号链接改向/成环、World/revision 隔离和淘汰；不等同于持久 inode 索引

@@ -27,7 +27,44 @@ with tempfile.TemporaryDirectory(prefix='ffn-',dir='/tmp') as tmp:
     value.write_bytes(b'hello\x00world')
     run('fs-write',image,'/a/file',value)
     fileid=stat(image,'/a/file')['inode_id']
+    # Dots and redundant separators are traversed physically, without lexical
+    # collapse across a symlink, and successful writes use the resolved parent.
+    run('fs-mkdir',image,'/a/sub')
+    run('fs-symlink',image,'/a/sub','/alias')
+    run('fs-symlink',image,'file','/a/final-link')
+    assert stat(image,'/a/./final-link')['inode_id']==fileid
+    assert json.loads(run('fs-lstat',image,'/a/./final-link'))['symlink']
+    run('fs-unlink',image,'/a/final-link')
+    assert stat(image,'/a//./file')['inode_id']==fileid
+    assert stat(image,'/alias/../file')['inode_id']==fileid
+    assert stat(image,'/a/.')['directory'] and stat(image,'/a/..')['inode_id']==rootid
+    assert stat(image,'/../../a/file')['inode_id']==fileid
+    run('fs-write',image,'/a//./file',value)
+    run('fs-mkdir',image,'/a/./dotted')
+    run('fs-mkdir',image,'/a/dotted/../created')
+    assert stat(image,'/a/created')['directory']
+    run('fs-rename',image,'/a/created','/a/dotted/../renamed')
+    assert stat(image,'/a/renamed')['directory']
+    run('fs-rmdir',image,'/a/renamed')
+    run('fs-rmdir',image,'/a/dotted')
+    run('fs-unlink',image,'/alias');run('fs-rmdir',image,'/a/sub')
     assert run('fs-cat',image,'/a/file')==value.read_bytes()
+    # Exact raw path bytes are checked before component processing, including
+    # redundant separators and dot components.
+    run('fs-snapshot',image,'dots-base')
+    exact='/'+'./'*2044+'/a/file'
+    assert len(exact)==4096 and stat(image,exact)['inode_id']==fileid
+    oversized=exact+'/'
+    assert len(oversized)==4097
+    result=subprocess.run([BIN,'fs-stat',str(image),oversized],capture_output=True,timeout=10)
+    assert result.returncode!=0 and b'4096' in result.stderr,(result.returncode,result.stderr)
+    run('fs-cat',image,'/../../a/./file','--revision','dots-base')
+    readonly_seq=json.loads(run('check',image))['last_committed_seq']
+    run('fs-write',image,'/a/../readonly-fail',value,'--revision','dots-base',ok=False)
+    run('fs-mkdir',image,'/a/../readonly-fail-dir','--revision','dots-base',ok=False)
+    assert json.loads(run('check',image))['last_committed_seq']==readonly_seq
+    assert stat(image,'/../../a/./file')['inode_id']==fileid
+    assert json.loads(run('fs-stat',image,'/../../a/./file','--revision','dots-base'))['inode_id']==fileid
     run('fs-link',image,'/a/file','/b/alias')
     assert stat(image,'/b/alias')['inode_id']==fileid
     assert stat(image,'/a/file')['links']==2
@@ -68,9 +105,10 @@ with tempfile.TemporaryDirectory(prefix='ffn-',dir='/tmp') as tmp:
         ('fs-rename','/a/victim','/b/empty'),
         ('fs-link','/b','/a/dirlink'),
         ('fs-rmdir','/a'),('fs-unlink','/b'),('fs-unlink','/'),
-        ('fs-mkdir','/a/../bad'),('fs-mkdir','/a//bad'),
         ('fs-mkdir','/a/trailing/'),('fs-mkdir','/a/\ninvalid'),
+        ('fs-mkdir','/a/../'),('fs-mkdir','/a/.'),('fs-mkdir','/a/..'),
         ('fs-write','/b/empty',str(value)),('fs-mkdir','/missing/child'),
+        ('fs-mkdir','/missing/../child'),('fs-mkdir','/b/moved/../child'),
     ]:
         run(args[0],image,*args[1:],ok=False)
         assert image.read_bytes()==before,args
