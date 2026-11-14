@@ -1,0 +1,78 @@
+{
+  "schema": 1,
+  "date": "2026-11-14",
+  "base_commit": "86d894f53f397919b036057239b26ddba84dcfb6",
+  "source_tree_before_evidence": "e3a876ca0fc0704ce2c30f4911a6e1ff29ace129",
+  "platform": "macOS 27.2.1 arm64; Apple Clang/SDK 27.2; Release FSKit=ON",
+  "source_sha256": {
+    "daemon/rpc.cpp": "62d4019ead5fce3bbdb1abdf02c9445fa8b71f3bf0be839dca3a85f48fadca30",
+    "daemon/tests/session_cleanup_errors.py": "f274ebb8b40e8a621c713ca6b70c8cbdd2495ce3965385d7b07dcf0631353d40",
+    "daemon/CMakeLists.txt": "3e6e3ff174630ba1a29a201b1e86a6254b0fd7983f47a04c76b2eb9749aed182",
+    "daemon/README.md": "cd74f2c76b278f027de2f56c2709d1093ab8dd1f49aaa41d1eb27c90e8623731",
+    "docs/FILESYSTEM_API_COMPATIBILITY.md": "15a260b21d6bd1ad70a09a3df7ada7aaf2a1ca99476402819c781bd6e78957c6"
+  },
+  "baseline_reproduction": {
+    "runtime_file": "base daemon/rpc.cpp",
+    "runtime_source_sha256": "6b9d4a2261cf764c00f67b737e93946c121841acebd66e10114f2cc9addfd2ef",
+    "test_sha256": "f274ebb8b40e8a621c713ca6b70c8cbdd2495ce3965385d7b07dcf0631353d40",
+    "exit_code": 1,
+    "result": "The injected orphan cleanup failure disconnected session-close before the original errno response could be read.",
+    "daemon_sha256": "75f50f505f16196b3249d9b979b9f66158df99809cf72e8a6fcb891cac964eba",
+    "fault_daemon_sha256": "fb4f2b106ccdc6f1c1d51ae562c37a5f579049318c1b3df204b8ebc911098de5",
+    "log_sha256": "4f9ea5301a7cfb3efbaa1979e3ce18a1b36d4efc0bd676fee80e4deadeb47e14"
+  },
+  "validation": {
+    "ctest_passed": 66,
+    "ctest_failed": 0,
+    "seconds": 105.31,
+    "targeted_session_cleanup_seconds": 12.06,
+    "healthy_sessions_seconds": 3.34,
+    "storage_errors_seconds": 4.77,
+    "system_dependencies": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "log_sha256": "3f0a7026e9a5969a980c53de0d38749bc09d0c41e751f4b4f451d9ed079b5d51",
+    "targeted_log_sha256": "a4d8d2d176444a8854ebd5f0edb72248776ebea1f9301941e1227e183c5ef08f",
+    "runtime_source_sha256": {
+      "daemon/rpc.cpp": "62d4019ead5fce3bbdb1abdf02c9445fa8b71f3bf0be839dca3a85f48fadca30",
+      "daemon/CMakeLists.txt": "3e6e3ff174630ba1a29a201b1e86a6254b0fd7983f47a04c76b2eb9749aed182",
+      "daemon/tests/session_cleanup_errors.py": "f274ebb8b40e8a621c713ca6b70c8cbdd2495ce3965385d7b07dcf0631353d40"
+    },
+    "daemon_sha256": "eebcda4235b9063179ded9b2de7590f6156c8f810648efe9833edef14f21e5f8",
+    "fault_daemon_sha256": "7b2afb6248bcb2f74991657de3edb30d83bbdbd3489581bcf633126bf0993f1f",
+    "execution": "macOS 27.2.1 arm64 Apple Clang/SDK 27.2 Release FSKit ON; no-Git read-only source; deny-default sandbox excludes home/keychain/credentials/publishing checkout; loopback-only tests"
+  },
+  "coverage": {
+    "fault_scenarios": 9,
+    "fault_pairs": [
+      ["wal-append", "ENOSPC"],
+      ["wal-sync", "EDQUOT"],
+      ["wal-append", "EIO"]
+    ],
+    "paths_per_fault_pair": [
+      "final close of an unlinked open inode returns the original errno; explicit close reports the error",
+      "poisoned session cleanup on short-lease expiry retains counts and mount fencing",
+      "explicit close after an already-poisoned write returns EIO; SIGTERM with another unexpired linked handle exits cleanly"
+    ],
+    "checks": [
+      "last_committed_seq, indexed_objects, and object_roots unchanged before/after injected failure and across diagnostics",
+      "status and storage-profile remain available after poisoning",
+      "closing/expired session tokens are rejected",
+      "conflicting mutable write and restore retain EBUSY fencing",
+      "bounded shutdown removes its socket and exits zero",
+      "restart preserves retained revision bytes, leaves unlinked path absent, and passes fs-check/check",
+      "existing healthy session suite"
+    ],
+    "recovery_scope": "Whole old or new publication after restart; exact in-memory orphan counters are not required to persist across restart."
+  },
+  "daemon_sha256": "eebcda4235b9063179ded9b2de7590f6156c8f810648efe9833edef14f21e5f8",
+  "native_mount_rerun": false,
+  "limits": [
+    "Daemon RPC session cleanup only; no native mount cleanup or cache invalidation qualification.",
+    "No automatic recovery; poisoned storage still requires stop/reopen and repository checks.",
+    "No physical durability, power-loss, kernel-crash, quota, or signing qualification.",
+    "No wire framing or storage format changes."
+  ]
+}

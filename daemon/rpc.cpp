@@ -97,7 +97,7 @@ public:
     void expire(){
         std::vector<std::string> dead;
         for(const auto& [token,s]:values_)if(s.closing || Clock::now()>=s.deadline)dead.push_back(token);
-        for(const auto& token:dead)close(token);
+        for(const auto& token:dead)cleanup(token);
     }
     void mount_acquire(const std::string& token,const std::string& view,bool revision) {
         auto& selected=acquire(token);
@@ -121,8 +121,16 @@ public:
             throw RpcError(EBUSY,"World restore requires an unmounted filesystem");
     }
     size_t directory_count() const {size_t n=0;for(const auto& [token,s]:values_)n+=s.directories.size();return n;}
-    void shutdown(){while(!values_.empty())close(values_.begin()->first);}
+    void shutdown(){
+        std::vector<std::string> pending;pending.reserve(values_.size());
+        for(const auto& [token,s]:values_)pending.push_back(token);
+        for(const auto& token:pending)cleanup(token);
+    }
 private:
+    void cleanup(const std::string& token){
+        try{close(token);}
+        catch(const std::exception&){if(!store_.requires_reopen())throw;}
+    }
     Container& store_;std::map<std::string,Session> values_;
 };
 struct Activity {
