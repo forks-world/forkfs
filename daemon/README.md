@@ -1102,6 +1102,12 @@ The pinned LevelDB POSIX environment's ENOSPC and EDQUOT I/O statuses propagate
 as the corresponding RPC errno; other storage I/O failures become EIO. A failed
 commit poisons the open store: status reports `requires_reopen: true`, and writes,
 mount keepalive and inode sync fail rather than reporting successful durability.
+For the LevelDB backend, subsequent storage reads and writes return typed EIO
+(RPC result `EIO+1`), including fs-* handle/path and retained-revision reads.
+Previously some fs-* requests returned generic code 1 instead. The first failed
+write still preserves its original ENOSPC, EDQUOT or EIO; later EIO means that
+the open store requires recovery. Verified object/root cache hits cannot bypass
+this health check. Status and storage-profile remain available for diagnosis.
 Freeing host space alone does not repair that process. Unmount/stop the service,
 free space on the backing filesystem, then reopen and check the repository. Do
 not reinitialize or delete its database. A failed sync can still replay a complete
@@ -1109,7 +1115,9 @@ transaction after restart; callers must allow the whole old or new publication,
 not assume that an error proves no write occurred. Retained revisions stay intact.
 
 CTest covers both WAL append and sync failures with ENOSPC, EDQUOT and EIO,
-including handle writes and inode truncation. Native acceptance and the bounded
+including handle writes and inode truncation, typed errors after removing the
+injected fault, warm live/revision caches, and unchanged publication counters
+on rejected retries. Native acceptance and the bounded
 real APFS-image disk-full reproducer are documented in [FSKit](../docs/FSKIT.md).
 These tests do not qualify physical quota enforcement, all short-write paths,
 hardware power loss or full 1 TiB dense workloads.
@@ -1416,8 +1424,9 @@ change inode metadata or modify directory entries. Rename inspects the final
 destination entry without following its symlink: a file may replace a symlink
 to a directory while the referenced directory remains intact.
 
-Inode RPC errors use the existing errno+1 reply code. Ordinary fs-* errors still
-use generic code 1, and CLI process failure remains nonzero. This refines the
+Inode RPC errors use the existing errno+1 reply code. Ordinary fs-* logical errors
+retain generic code 1; typed storage I/O errors also use errno+1. CLI process
+failure remains nonzero. This refines the
 error contract without a new frame, inode format or permission model. Native
 FSKit already rejects these operation types with the same macOS errors; the
 acceptance script verifies that behavior and repository-state stability.

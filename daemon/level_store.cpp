@@ -135,7 +135,9 @@ LevelStore::LevelStore(const std::string& path,bool initialize,size_t object_cac
     need(read("M/roots",value),"missing root count");roots_=number(value);
 }
 LevelStore::~LevelStore()=default;
-void LevelStore::healthy() const {need(!poisoned_,"LevelDB store requires reopen after write failure");}
+void LevelStore::healthy() const {
+    if(poisoned_)throw std::system_error(EIO,std::generic_category(),"LevelDB store requires reopen after write failure");
+}
 bool LevelStore::read(const std::string& key,std::string& value) const {
     healthy();uint64_t epoch=0;
     if(key.starts_with("R/")) {

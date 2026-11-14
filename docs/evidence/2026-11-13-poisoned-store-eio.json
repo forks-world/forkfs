@@ -1,0 +1,97 @@
+{
+  "schema": 1,
+  "date": "2026-11-13",
+  "base_commit": "3f29e90144ae2340b68f825a8a2a11d72827e308",
+  "source_tree_before_evidence": "79a69ab15fe3f0ff932577c1f54e4d70cd7b710b",
+  "platform": "macOS27.2.1 arm64; Apple Clang/SDK27.2; Release WFS_FSKIT=ON",
+  "source_sha256": {
+    "daemon/level_store.cpp": "b517a829273e0fb1437c5c22a386baf04c95a44b90ee2a353337a2552d1541ce",
+    "daemon/tests/object_cache.cpp": "bc4bbbf548520b40fb7c839d8f87eb17276abed781faaaaedcce095763c9f7cf",
+    "daemon/tests/storage_errors.py": "44c38e7df540e2bd96ff795d033f36fd4e533fe9a538680d074861df093c67cf"
+  },
+  "baseline_reproduction": {
+    "runtime_file": "main daemon/level_store.cpp",
+    "runtime_source_sha256": "5d5a3e6f758baa9ed7712b5447ca20b3080daed0a1b5e21edd113ab8628625e7",
+    "test": "new object_cache.cpp poison regression against unchanged main LevelStore",
+    "exit_code": 1,
+    "result": "LevelDB store requires reopen after write failure",
+    "log_sha256": "6fc68cff59ca1717c125d9619a8d72537708e626b4d5d2c1524811a6469bc328"
+  },
+  "validation": {
+    "ctest_passed": 64,
+    "ctest_failed": 0,
+    "seconds": 106.99,
+    "object_cache_test_seconds": 1.54,
+    "storage_error_test_seconds": 4.11,
+    "system_dependencies": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "log_sha256": "628ee575eb9379bdd114d37b0045e581326221ee9594688edc73c97142aef5d4",
+    "isolation": "NoGit disposable source; deny-default sandbox excludes home/keychain/credentials/publishing checkout; loopback-only test transports"
+  },
+  "coverage": {
+    "fault_scenarios": 12,
+    "stages": [
+      "wal-append",
+      "wal-sync"
+    ],
+    "original_errors": [
+      "ENOSPC",
+      "EDQUOT",
+      "EIO"
+    ],
+    "failed_mutations": [
+      "fs-hwrite",
+      "inode-setattr truncate"
+    ],
+    "poisoned_rpc_eio": [
+      "session-keepalive",
+      "inode-sync",
+      "fs-hwrite",
+      "fs-hwriteback",
+      "fs-htruncate",
+      "fs-hread",
+      "fs-hstat",
+      "fs-cat live",
+      "fs-cat retained revision",
+      "fs-stat",
+      "fs-ls",
+      "fs-check",
+      "inode-stat"
+    ],
+    "poisoned_cpp_eio": [
+      "cached contains",
+      "root",
+      "cached object",
+      "object_size",
+      "keys",
+      "verify",
+      "compact",
+      "transact",
+      "collect"
+    ],
+    "unchanged_after_retries": [
+      "last_committed_seq",
+      "indexed_objects",
+      "object_roots",
+      "object_cache_hits",
+      "root_cache_hits"
+    ],
+    "diagnostics_available": [
+      "status",
+      "storage-profile"
+    ],
+    "healthy_logical_error_stays_generic": true,
+    "recovery": "After reopen, complete old/new publication only; WAL-append failure strictly old; retained revision unchanged; checks and new write succeed"
+  },
+  "daemon_sha256": "75f50f505f16196b3249d9b979b9f66158df99809cf72e8a6fcb891cac964eba",
+  "native_mount_rerun": false,
+  "limits": [
+    "Only LevelDB poison exception typing changes; no wire framing or storage format change",
+    "Native frontend already mapped this generic error to EIO; no new native failure-propagation claim",
+    "No kernel-cache invalidation, power-loss, quota or legacy-journal qualification",
+    "Independent of PR117 sync acceptance; no signing or native module installation"
+  ]
+}

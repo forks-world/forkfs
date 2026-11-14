@@ -3,6 +3,7 @@
 #include <atomic>
 #include <filesystem>
 #include <iostream>
+#include <system_error>
 #include <thread>
 #include <unistd.h>
 
@@ -10,6 +11,9 @@ using Bytes=std::vector<unsigned char>;
 void check(bool ok) {if(!ok)throw std::runtime_error("verified object cache check failed");}
 template<class F> void rejects(F f) {
     bool rejected=false;try{f();}catch(const std::runtime_error&){rejected=true;}check(rejected);
+}
+template<class F> void rejects_io(F f) {
+    bool rejected=false;try{f();}catch(const std::system_error& e){check(e.code()==std::errc::io_error);rejected=true;}check(rejected);
 }
 int main() {
     auto pattern=(std::filesystem::temp_directory_path()/"ff-cache-XXXXXX").string();auto directory=mkdtemp(pattern.data());if(!directory)return 1;
@@ -51,7 +55,18 @@ int main() {
             check(store.object(id)==original && store.cache_stats().misses==before+1);
             store.compact();check(store.object(id)==original);
             store.transact(store.sequence(),{{"head",std::nullopt}});check(!store.contains("head"));
-            store.poison();rejects([&]{store.contains("head");});rejects([&]{store.object(id);}); // No cache bypass of poison.
+            auto sequence=store.sequence();auto cached=store.cache_stats();
+            store.poison();
+            rejects_io([&]{store.contains("head");}); // Cached absence cannot bypass poison.
+            rejects_io([&]{store.root("head");});
+            rejects_io([&]{store.object(id);}); // Nor can a verified cached payload.
+            rejects_io([&]{store.object_size(id);});
+            rejects_io([&]{store.keys("");});
+            rejects_io([&]{store.verify();});
+            rejects_io([&]{store.compact();});
+            rejects_io([&]{store.transact(sequence,{{"retry",original}});});
+            rejects_io([&]{store.collect(sequence,{id},{});});
+            check(store.sequence()==sequence && store.cache_stats().hits==cached.hits);
         }
         {
             forkfs::LevelStore store(path,0);check(store.object(id)==original);
