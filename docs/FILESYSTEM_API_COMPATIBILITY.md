@@ -28,7 +28,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `open/read/write/pread/pwrite/close` | OpenCloseOperations、ReadWriteOperations → inode handles | 挂载已测；单文件逻辑上限 1 TiB，RPC 单次最多 256 KiB，回调分块 |
 | `O_CREAT/O_EXCL/O_TRUNC/O_APPEND/O_NOFOLLOW/O_DIRECTORY`、`openat` 系列 | 内核路径解析 + lookup/create/open/setattr | 挂载已测排他/类型/nofollow 拒绝、dangling link 创建、截断身份、umask、并发 append、基本 `*at`；全部组合与极限并发仍未验收 |
 | `dup`、打开后 rename/unlink、同名路径重用 | 内核 fd + daemon orphan roots | 挂载已测；包含普通文件、符号链接元数据 fd 和 mmap |
-| `stat/lstat/fstat`、`chmod/fchmod`、`utime/utimens`、birth time | get/setAttributes | 挂载已测；时间纳秒精度，读取不更新 atime，模式仅 0777 |
+| `stat/lstat/fstat`、`chmod/fchmod`、`utime/utimens`、birth time | get/setAttributes | 挂载已测；时间纳秒精度，读取不更新 atime，模式仅 0777。Directory size rejection (`EISDIR`) is scoped to Namespace path setters and inode RPC after existing validation/protection precedence, including size zero; native FSKit behavior is not established. See [regression evidence](evidence/2026-11-14-directory-size-setattr.json). |
 | `st_blocks`、`du` | allocated_size → allocSize | 挂载已测；空洞为零、数据 payload 每位置向上取整到 512 字节，不是去重后独占仓库空间 |
 | `chown/fchown`、setuid/setgid/sticky、ACL | inode metadata + access checks | 缺失；uid/gid 来自服务用户，拒绝更换属主，无 ACL，不是多用户文件系统 |
 | `access/faccessat`、目录搜索权限、只读 fd 权限 | 内核权限判断；未接 AccessCheckOperations | 挂载已测单用户 mode 000/0400、access、目录搜索/写权限、拒绝 truncate/创建/unlink、chmod 不撤销已开 fd；faccessat/组权限/多用户未验收 |

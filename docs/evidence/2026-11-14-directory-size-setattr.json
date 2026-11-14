@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-14",
+  "title": "Directory size setattr regression",
+  "scope": "C++ Namespace path setters and inode RPC only; no native FSKit compatibility claim",
+  "change": "A present size attribute on a directory is rejected with EISDIR after attribute validation, mutability/protection checks, and the existing symlink-size check, but before no-op shortcuts. Existing validation and protection error precedence is preserved.",
+  "baseline": {
+    "base_commit": "4222ac4e9971a6918717ec999cc08421d01f779f",
+    "runtime_namespace_cpp_sha256": "6383f5bb6704acfef5abd82e1301e6b5b347b4e1951a747278aafee58851ff36",
+    "runtime_daemon_sha256": "d225263b711431f41c42ae3fdf6d52bad1243e60dc90e559d9d1d6ff159ca09d",
+    "test_source_sha256": {
+      "daemon/tests/times.cpp": "de53984e8b524791e65d68379b3922e9f78877fff5c94d7b13de67620374fafa",
+      "daemon/tests/inode_rpc.py": "45a5feae280edc6bb156d3adea1a9d6b4108f03a5a84cc49ca3840cd754539ea"
+    },
+    "cpp_exit_code": 1,
+    "rpc_exit_code": 1,
+    "observed": "Both baseline runs stopped at the size-only zero case: C++ failed its EISDIR assertion, and raw inode-setattr returned wire success with the directory stat. The baseline did not reach the nonzero assertions.",
+    "log_sha256": {
+      "baseline-cpp.log": "e4c3b77d484b8dc0a609e12f3d448fe1a20df2ffb72b980df74610ddaa586fd1",
+      "baseline-rpc.log": "e7e8cf9e9a60164040396dffca4340088f95e7dd64325a811a4d972c495684de"
+    }
+  },
+  "fixed_validation": {
+    "source_sha256": {
+      "daemon/namespace.cpp": "5446430f44e8c2783513f4a02cfd0bc1bd66eb3ec57168c681f6eee957766a9b",
+      "daemon/tests/times.cpp": "de53984e8b524791e65d68379b3922e9f78877fff5c94d7b13de67620374fafa",
+      "daemon/tests/inode_rpc.py": "45a5feae280edc6bb156d3adea1a9d6b4108f03a5a84cc49ca3840cd754539ea"
+    },
+    "daemon_sha256": "5342c9a00373efdafb9b78ce2dec90e83c062906cf036b7250ba3d89c6806ba8",
+    "cpp_test_binary_sha256": "ff79161eae07ceadcf390acf8fe905c4401bf20aeda48c6cf63c824a5cc3dbef",
+    "configuration": "Release build with FSKit enabled",
+    "ctest": {
+      "passed": 66,
+      "failed": 0,
+      "duration_seconds": 108.0,
+      "targeted_tests": [
+        "forkfsd_times_core",
+        "forkfsd_inode_rpc",
+        "forkfsd_attributes",
+        "forkfsd_symlink_attributes",
+        "forkfsd_file_flags"
+      ]
+    },
+    "dependency_check": {
+      "result": "passed",
+      "daemon_libraries": 2,
+      "extension_libraries": 7,
+      "host_libraries": 4
+    },
+    "validation_log_sha256": "3c754435f63b84c6d68aaf3614dab1d3a9680acae3f4e498e08a63d0d1d33191",
+    "covered_cases": [
+      "C++ set_attributes and set_link_attributes: root, child directory, and nested child; size-only zero/nonzero and mixed size/mode/times/flags; exact EISDIR",
+      "C++ failures preserve committed sequence, inode fields, and directory entries",
+      "Directory metadata-only update succeeds; set_attributes follows a symlink to a directory and returns EISDIR for size",
+      "C++ set_link_attributes preserves existing symlink-size rejection behavior",
+      "Regular file truncate to size zero succeeds",
+      "Raw inode-setattr, inode-setattr-times, and inode-setattr-flags: size-only and mixed size/mode/time/flags at zero/nonzero; exact errno+1 EISDIR and unchanged sequence/inode/parent entry",
+      "Directory fixture verification, garbage collection, and reopen verification"
+    ]
+  },
+  "execution_controls": {
+    "source_mode": "read-only source snapshot during execution",
+    "git_access": "validation did not use Git",
+    "environment": "isolated HOME and TMP; loopback-only execution",
+    "artifacts": {
+      "control_state": "/private/tmp/fs123-control-2py2vb4_/state.json",
+      "validation_log": "/private/tmp/fs123-exec-zpq8dk9c/validate.log",
+      "baseline_cpp_log": "/private/tmp/fs123-exec-zpq8dk9c/baseline-cpp.log",
+      "baseline_rpc_log": "/private/tmp/fs123-exec-zpq8dk9c/baseline-rpc.log"
+    }
+  },
+  "limitations": [
+    "The baseline failure was directly observed for size zero; nonzero behavior is covered by the fixed suite but was not independently run against the baseline runtime.",
+    "The results establish the C++ Namespace and inode RPC behavior only. FSKit-enabled build success is not native mount acceptance, and no native FSKit call behavior is claimed.",
+    "Existing attribute validation, read-only, immutable, append-only, and symlink-size error precedence remains in force before the directory EISDIR guard."
+  ]
+}

@@ -60,6 +60,18 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         rpc('inode-root','--session',other,error=errno.EBUSY)
         rpc('fs-mkdir','/foreign',error=errno.EBUSY)
         directory=obj('inode-mkdir',rid,'dir',str(0o700),*sel);did=directory['inode_id'];assert directory['mode']==0o700
+        for opcode,fields in [
+            ('inode-setattr',lambda size,mixed:(str(0o711) if mixed else '-',str(size),'99' if mixed else '-','-')),
+            ('inode-setattr-times',lambda size,mixed:(str(0o711) if mixed else '-',str(size),'99' if mixed else '-', '88' if mixed else '-', '77' if mixed else '-', '-')),
+            ('inode-setattr-flags',lambda size,mixed:(str(0o711) if mixed else '-',str(size),'99' if mixed else '-', '88' if mixed else '-', '77' if mixed else '-', '1' if mixed else '-', '-')),
+        ]:
+            for size in (0,1):
+                for mixed in (False,True):
+                    before=obj('status')['last_committed_seq'];old=obj('inode-stat',did,*sel)
+                    rpc(opcode,did,*fields(size,mixed),*sel,error=errno.EISDIR)
+                    assert obj('status')['last_committed_seq']==before
+                    now=obj('inode-stat',did,*sel);assert now==old,(opcode,size,mixed,old,now)
+                    assert obj('inode-lookup',rid,'dir',*sel)['inode_id']==did
         handle=obj('inode-create',rid,'file',str(0o600),*sel)['handle']
         st=obj('fs-hstat',handle,*sel);fid=st['inode_id'];assert st['mode']==0o600
         readonly=obj('inode-open',fid,'r',*sel)['handle']

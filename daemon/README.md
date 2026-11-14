@@ -561,6 +561,18 @@ a no-op after view/handle validation. Negative timestamps, uid/gid changes,
 ACLs, setuid/sticky bits and multi-user permission
 enforcement remain unsupported.
 
+Directory metadata changes (mode, times and flags) are supported through both
+path setters. After attribute validation and the existing read-only, immutable,
+append-only and symlink-size checks, a present size field on a directory is
+rejected with EISDIR, including size zero and mixed metadata requests; RPC callers
+receive `errno+1` in the reply code. This applies to namespace path setters and
+the inode `setattr`, `setattr-times` and `setattr-flags` operations. Regular-file
+size zero remains a valid truncate; symlink size requests retain their existing
+invalid-size behavior (EINVAL at the inode RPC boundary). Regression results and
+scope are recorded in [directory size setattr evidence](../docs/evidence/2026-11-14-directory-size-setattr.json).
+This describes the C++ Namespace and daemon RPC contract; it does not establish
+how a native FSKit call is handled.
+
 Small unflagged inode records use the 64-byte `FFINOD02` format. Bytes 8..47 retain the
 original type, mode, links, size, mtime and ctime layout; bytes 48..55 and 56..63
 hold little-endian atime and birth time. The daemon still reads 48-byte

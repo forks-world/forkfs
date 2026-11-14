@@ -1,13 +1,17 @@
 #include "namespace.h"
 #include "metadata_view.h"
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <system_error>
 #include <unistd.h>
 using forkfs::Container;using forkfs::Namespace;using Bytes=std::vector<unsigned char>;
 static void check(bool ok,int line=__builtin_LINE()){if(!ok)throw std::runtime_error("timestamp check failed at line "+std::to_string(line));}
 template<class F> static void rejects(F f){bool failed=false;try{f();}catch(const std::exception&){failed=true;}check(failed);}
+template<class F> static void errno_is(F f,int expected){try{f();}catch(const std::system_error& e){check(e.code()==std::error_code(expected,std::generic_category()));return;}check(false);}
+static std::string committed_seq(const Container& store){auto s=store.status();auto p=s.find("\"last_committed_seq\":");check(p!=s.npos);p+=21;auto e=s.find_first_not_of("0123456789",p);return s.substr(p,e-p);}
 // Publish exact inode bytes independently of the namespace encoder. This tests
 // old-format reads and diff's timestamp comparisons with unchanged ctime/mtime.
 static void publish(const std::string& path,bool legacy,bool access_only=false){
@@ -45,6 +49,21 @@ int main(){
         publish(path,false);
         {Container store(path);Namespace fs(store);fs.snapshot("birth");auto diff=fs.diff("atime","birth");check(diff.find("\"metadata_changed\":true")!=diff.npos && diff.find("\"content_changed\":true")==diff.npos);store.collect_garbage();fs.verify();Namespace(store,"old",true).verify();}
         {Container store(path);Namespace fs(store);check(fs.stat("/f").accessed_ns==1 && fs.stat("/f").birth_ns==43);fs.verify();store.verify();}
+        auto dirs_path=std::string(tmp)+"/dirs";Container::create(dirs_path);
+        {Container store(dirs_path);Namespace fs(store);fs.initialize();fs.mkdir("/dir",0700);fs.mkdir("/dir/child",0700);fs.symlink("/dir","/dir-link");
+            for(const auto& target:{std::string("/"),std::string("/dir"),std::string("/dir/child")})for(bool link_api:{false,true})for(uint64_t size:{0,1}){
+                auto old=fs.lstat(target);auto entries=fs.list(target);
+                for(bool mixed:{false,true}){auto before=committed_seq(store);Namespace::Attributes a;a.size=size;if(mixed){a.mode=0711;a.modified_ns=99;a.accessed_ns=88;a.birth_ns=77;a.flags=1;}
+                    errno_is([&]{if(link_api)fs.set_link_attributes(target,a);else fs.set_attributes(target,a);},EISDIR);
+                    check(committed_seq(store)==before);auto now=fs.lstat(target);check(now.id==old.id && now.links==old.links && now.mode==old.mode && now.size==old.size && now.modified_ns==old.modified_ns && now.changed_ns==old.changed_ns && now.accessed_ns==old.accessed_ns && now.birth_ns==old.birth_ns && now.flags==old.flags);check(fs.list(target)==entries);
+                }
+            }
+            Namespace::Attributes a;a.mode=0711;a.modified_ns=99;fs.set_attributes("/dir",a);check(fs.stat("/dir").mode==0711 && fs.stat("/dir").modified_ns==99);
+            a={};a.size=0;errno_is([&]{fs.set_attributes("/dir-link",a);},EISDIR);rejects([&]{fs.set_link_attributes("/dir-link",a);});
+            a={};a.size=0;fs.write("/file",Bytes{'x'});fs.set_attributes("/file",a);check(fs.stat("/file").size==0);
+            fs.verify();store.collect_garbage();fs.verify();store.verify();
+        }
+        {Container store(dirs_path);Namespace fs(store);check(fs.stat("/dir").mode==0711 && fs.stat("/file").size==0);fs.verify();store.verify();}
         std::filesystem::remove_all(tmp);std::cout<<"timestamp v1 migration, v2 persistence, metadata diff, snapshots, handles, restore, noatime reads and GC passed\n";return 0;
     }catch(const std::exception& e){std::cerr<<e.what()<<'\n';std::filesystem::remove_all(tmp);return 1;}
 }

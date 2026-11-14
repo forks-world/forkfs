@@ -950,6 +950,7 @@ void Namespace::set_path_attributes(const std::string& path,const Attributes& a,
     update([&](const NamespaceView& view,Changes& changes) {
         auto id=resolve(view,path,follow_final);auto n=inode(view,id);mutable_attributes(n,a);
         need(!n.symlink || !a.size,"invalid symbolic link size change");
+        if(n.directory && a.size)throw std::system_error(EISDIR,std::generic_category(),"directory size change");
         if(!a.mode && !a.modified_ns && !a.size && !a.accessed_ns && !a.birth_ns && !a.flags)return;
         if(a.size && *a.size==n.size && !a.mode && !a.modified_ns && !a.accessed_ns && !a.birth_ns && !a.flags)return;
         if(a.size){need(!n.directory && !n.symlink,"only regular files support size changes");
