@@ -1,0 +1,92 @@
+{
+  "title": "C++ and RPC file handle seek error behavior",
+  "scope": [
+    "forkfs::Namespace::seek negative computed positions return EINVAL",
+    "forkfs::Namespace::seek positions above INT64_MAX return EOVERFLOW",
+    "daemon raw fs-hseek RPC maps those system errors to the corresponding wire codes",
+    "Rejected seeks preserve the shared open-description cursor, file content, inode metadata, and committed sequence"
+  ],
+  "explicit_exclusions": [
+    "Native lseek(2) behavior is kernel-controlled and is not validated by this record",
+    "No new mount capability is claimed"
+  ],
+  "baseline": {
+    "commit": "86d894f53f397919b036057239b26ddba84dcfb6",
+    "runtime_source_sha256": "42ca4831de6eed3e55baed3dcfafd566f5647dbb78854b285b8be94ff35f8d54",
+    "daemon_sha256": "75f50f505f16196b3249d9b979b9f66158df99809cf72e8a6fcb891cac964eba",
+    "cpp_test_sha256": "f71e19af5b31ffd789161751b767801db355e6ab72b2412c092f1562117b94e7",
+    "rpc_test_sha256": "66892e2b43309119b1eb7265720888e9252d6767751ecdcbe627d633ae8b6f4b",
+    "cpp_regression": {
+      "exit_code": 1,
+      "log": "/private/tmp/seek-exec-zn_eztel/baseline-cpp.log",
+      "log_sha256": "d04a6861acb29cbead57bfbac5641e0af17ce1b568bec22b2152a8e8cbad8e8c",
+      "observed": "The added negative seek assertion received a generic exception ('negative file position') rather than std::system_error."
+    },
+    "raw_rpc_regression": {
+      "exit_code": 1,
+      "log": "/private/tmp/seek-exec-zn_eztel/baseline-rpc.log",
+      "log_sha256": "e632be3b09a8f8ad7e2917bdab7a8279b0922a658d7e630b4c773d7dcf346fa1",
+      "observed": "Negative fs-hseek SET returned generic wire code 1 instead of the EINVAL wire code 23."
+    },
+    "control_state": "/private/tmp/seek-control-mz1v18a4/state.json"
+  },
+  "fixed_validation": {
+    "status": "passed",
+    "validated_base": "86d894f53f397919b036057239b26ddba84dcfb6",
+    "execution": "Disposable no-Git archive; runtime and tests matched the recorded source hashes. macOS 27.2.1 arm64, Apple Clang/SDK 27.2, Release, FSKit enabled; deny-default sandbox excluded home, keychain, credentials, and publishing paths; loopback-only tests.",
+    "source_sha256": {
+      "daemon/namespace.cpp": "6383f5bb6704acfef5abd82e1301e6b5b347b4e1951a747278aafee58851ff36",
+      "daemon/tests/handles.cpp": "f71e19af5b31ffd789161751b767801db355e6ab72b2412c092f1562117b94e7",
+      "daemon/tests/sessions.py": "66892e2b43309119b1eb7265720888e9252d6767751ecdcbe627d633ae8b6f4b"
+    },
+    "daemon_sha256": "9cb0bb4d99d50041f3cff5e147b9af669e229f728b9ca81080d166e305217b48",
+    "build": {
+      "command": "cmake --build /private/tmp/seek-exec-zn_eztel/build --parallel 4",
+      "result": "passed"
+    },
+    "cpp_test": {
+      "ctest_name": "forkfsd_handles",
+      "target": "forkfsd_handles_test",
+      "result": "passed",
+      "seconds": 2.24
+    },
+    "raw_rpc_test": {
+      "ctest_name": "forkfsd_sessions",
+      "result": "passed",
+      "seconds": 3.83
+    },
+    "full_suite": {
+      "command": "ctest --test-dir /private/tmp/seek-exec-zn_eztel/build --output-on-failure --timeout 600 --no-tests=error -j2",
+      "passed": 65,
+      "failed": 0,
+      "seconds": 104.42,
+      "log": "/private/tmp/seek-exec-zn_eztel/validate.log",
+      "log_sha256": "14dfc24e41d76fe0b59be0e39ea17cd84275a9a8b01c54937d5ea68523db241a"
+    },
+    "dependency_check": {
+      "command": "bash /private/tmp/seek-exec-zn_eztel/source/scripts/check-deps.sh /private/tmp/seek-exec-zn_eztel/build",
+      "result": "passed"
+    },
+    "system_dependency_counts": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "full_run_control_state": "/private/tmp/seek-control-mz1v18a4/state.json"
+  },
+  "source_review": {
+    "base": "86d894f53f397919b036057239b26ddba84dcfb6",
+    "scope": "Typed seek-domain errors only; invalid C++ seek enum behavior retained. Raw RPC exercises existing system_error-to-errno mapping. No general RPC mapping or parser changes.",
+    "documentation_sha256": {
+      "README.md": "04568e523c286d5208600b5f10b1467ebcefd011ef4ac1c167305fe3e121493b",
+      "docs/FILESYSTEM_API_COMPATIBILITY.md": "e7ccb437ce50a1746fecf499f7e0793f05d9325176beccdec4f54fe2395c1672"
+    }
+  },
+  "native_apfs_reference": {
+    "artifact": "2026-11-14-seek-apfs-reference.json",
+    "sha256": "18b0250ead7e716ff33a1e6a629d13be91b23b20bea2c6f4150f50e573842ecd",
+    "platform": "macOS-27.2.1-arm64-arm-64bit",
+    "filesystem": "apfs",
+    "role": "independent native syscall context only; not forkfs regression or mount evidence"
+  }
+}

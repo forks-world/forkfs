@@ -1,0 +1,42 @@
+{
+  "platform": "macOS-27.2.1-arm64-arm-64bit",
+  "filesystem": "apfs",
+  "cases": [
+    {
+      "name": "negative-set",
+      "before": 3,
+      "after": 3,
+      "errno": 22
+    },
+    {
+      "name": "exact-max",
+      "before": 3,
+      "after": 9223372036854775807,
+      "result": 9223372036854775807
+    },
+    {
+      "name": "positive-overflow",
+      "before": 9223372036854775807,
+      "after": 9223372036854775807,
+      "errno": 84
+    },
+    {
+      "name": "negative-cur-min",
+      "before": 9223372036854775807,
+      "after": 9223372036854775807,
+      "errno": 22
+    },
+    {
+      "name": "reset",
+      "before": 9223372036854775807,
+      "after": 0,
+      "result": 0
+    },
+    {
+      "name": "negative-min",
+      "before": 0,
+      "after": 0,
+      "errno": 22
+    }
+  ]
+}

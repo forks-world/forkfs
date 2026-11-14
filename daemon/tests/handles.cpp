@@ -1,14 +1,17 @@
 #include "namespace.h"
 #include <atomic>
+#include <cerrno>
 #include <barrier>
 #include <filesystem>
 #include <iostream>
 #include <set>
+#include <system_error>
 #include <thread>
 #include <unistd.h>
 using Bytes=std::vector<unsigned char>;
 void check(bool ok){if(!ok)throw std::runtime_error("file handle check failed");}
 template<class F> void rejects(F f){bool bad=false;try{f();}catch(const std::exception&){bad=true;}check(bad);}
+template<class F> void rejects_errno(F f,int code){try{f();}catch(const std::system_error& e){check(e.code()==std::error_code(code,std::generic_category()));return;}check(false);}
 int main(){
     char pattern[]="/tmp/ff-handles-XXXXXX";auto tmp=mkdtemp(pattern);if(!tmp)return 1;
     auto path=std::string(tmp)+"/store";std::string stale;
@@ -48,6 +51,15 @@ int main(){
             fs.remove("/race",false);writer.join();check(!failed && fs.handle_read(race,0,100)==Bytes(32,42));fs.close(race);
             auto wo=fs.open("/dst",forkfs::Namespace::Access::Write);rejects([&]{fs.handle_read(wo,0,1);});fs.close(wo);
             rejects([&]{fs.open("/");});
+            auto revision_status=store.status();auto revision_info=revision.handle_stat(ro);auto revision_bytes=revision.handle_read(ro,0,UINT64_MAX);
+            rejects_errno([&]{revision.seek(ro,-1,forkfs::Namespace::Seek::Set);},EINVAL);
+            check(revision.seek(ro,0,forkfs::Namespace::Seek::Current)==0);
+            rejects_errno([&]{revision.seek(ro,INT64_MAX,forkfs::Namespace::Seek::End);},EOVERFLOW);
+            check(revision.seek(ro,0,forkfs::Namespace::Seek::Current)==0);
+            auto revision_info_after=revision.handle_stat(ro);
+            check(revision_info.id==revision_info_after.id && revision_info.size==revision_info_after.size &&
+                revision_info.modified_ns==revision_info_after.modified_ns && revision_info.changed_ns==revision_info_after.changed_ns);
+            check(revision.handle_read(ro,0,UINT64_MAX)==revision_bytes && store.status()==revision_status);
             work.close(wh);revision.close(ro);
             // Create/open and truncate pin the selected inode atomically.
             forkfs::Namespace::OpenOptions create{true,false,false,0600},exclusive{true,true,false,0600};
@@ -97,8 +109,9 @@ int main(){
             rejects([&]{fs.handle_write(appenders[0],0,Bytes{1});});rejects([&]{fs.handle_write(appenders[0],UINT64_MAX,{});});
             fs.handle_write(appenders[0],0,{});check(store.status()==stable);
             for(const auto& h:appenders)fs.close(h);fs.remove("/append-test",false);fs.verify();
-            fs.write("/cursor",Bytes{'a','b','c','d'});auto cursor=fs.open("/cursor",forkfs::Namespace::Access::ReadWrite);
-            auto duplicate=fs.dup(cursor),independent=fs.open("/cursor");
+            fs.write("/cursor",Bytes{'a','b','c','d'});fs.link("/cursor","/cursor-alias");auto cursor=fs.open("/cursor",forkfs::Namespace::Access::ReadWrite);
+            fs.rename("/cursor","/cursor-renamed");
+            auto duplicate=fs.dup(cursor),independent=fs.open("/cursor-renamed");
             check(fs.handle_read_next(cursor,1)==Bytes{'a'} && fs.handle_read_next(duplicate,1)==Bytes{'b'});
             check(fs.handle_read_next(independent,1)==Bytes{'a'});
             check(fs.seek(cursor,-1,forkfs::Namespace::Seek::Current)==1);
@@ -106,11 +119,32 @@ int main(){
             fs.handle_write(cursor,0,Bytes{'Y'});check(fs.seek(cursor,0,forkfs::Namespace::Seek::Current)==2);
             check(fs.seek(cursor,-1,forkfs::Namespace::Seek::End)==3);
             check(fs.handle_read_next(duplicate,10)==Bytes{'d'} && fs.handle_read_next(cursor,1).empty());
-            rejects([&]{fs.seek(cursor,INT64_MIN,forkfs::Namespace::Seek::Current);});
+            auto seek_status=store.status();
+            auto seek_inode=fs.handle_stat(cursor);auto seek_bytes=fs.handle_read(cursor,0,UINT64_MAX);
+            auto expect_seek_error=[&](int error,auto action,uint64_t position){rejects_errno(action,error);check(fs.seek(duplicate,0,forkfs::Namespace::Seek::Current)==position);};
+            expect_seek_error(EINVAL,[&]{fs.seek(cursor,-1,forkfs::Namespace::Seek::Set);},4);
+            expect_seek_error(EINVAL,[&]{fs.seek(cursor,INT64_MIN,forkfs::Namespace::Seek::Set);},4);
+            expect_seek_error(EINVAL,[&]{fs.seek(cursor,INT64_MIN,forkfs::Namespace::Seek::Current);},4);
+            expect_seek_error(EINVAL,[&]{fs.seek(cursor,INT64_MIN,forkfs::Namespace::Seek::End);},4);
+            check(fs.seek(independent,0,forkfs::Namespace::Seek::Current)==1);
             check(fs.seek(cursor,INT64_MAX,forkfs::Namespace::Seek::Set)==INT64_MAX);
-            rejects([&]{fs.seek(cursor,1,forkfs::Namespace::Seek::Current);});
+            expect_seek_error(EOVERFLOW,[&]{fs.seek(cursor,1,forkfs::Namespace::Seek::Current);},INT64_MAX);
+            expect_seek_error(EOVERFLOW,[&]{fs.seek(cursor,INT64_MAX,forkfs::Namespace::Seek::End);},INT64_MAX);
+            check(fs.seek(independent,0,forkfs::Namespace::Seek::Current)==1);
             rejects([&]{fs.handle_write_next(cursor,Bytes{1});});check(fs.seek(cursor,0,forkfs::Namespace::Seek::Current)==INT64_MAX);
-            fs.remove("/cursor",false);fs.seek(cursor,0,forkfs::Namespace::Seek::Set);
+            auto seek_inode_after=fs.handle_stat(cursor);
+            check(seek_inode.id==seek_inode_after.id && seek_inode.links==seek_inode_after.links && seek_inode.size==seek_inode_after.size &&
+                seek_inode.mode==seek_inode_after.mode && seek_inode.modified_ns==seek_inode_after.modified_ns && seek_inode.changed_ns==seek_inode_after.changed_ns);
+            check(fs.handle_read(cursor,0,UINT64_MAX)==seek_bytes);
+            check(store.status()==seek_status);
+            fs.remove("/cursor-renamed",false);fs.remove("/cursor-alias",false);fs.seek(cursor,0,forkfs::Namespace::Seek::Set);
+            seek_status=store.status();seek_inode=fs.handle_stat(cursor);seek_bytes=fs.handle_read(cursor,0,UINT64_MAX);
+            expect_seek_error(EINVAL,[&]{fs.seek(cursor,-1,forkfs::Namespace::Seek::Set);},0);
+            expect_seek_error(EOVERFLOW,[&]{fs.seek(cursor,INT64_MAX,forkfs::Namespace::Seek::End);},0);
+            seek_inode_after=fs.handle_stat(cursor);
+            check(seek_inode.links==0 && seek_inode_after.links==0 && seek_inode.size==seek_inode_after.size &&
+                seek_inode.modified_ns==seek_inode_after.modified_ns && seek_inode.changed_ns==seek_inode_after.changed_ns);
+            check(fs.handle_read(cursor,0,UINT64_MAX)==seek_bytes && store.status()==seek_status);
             fs.handle_write_next(cursor,Bytes{'Z'});fs.close(cursor);check(fs.handle_read_next(duplicate,1)==Bytes{'X'});
             fs.close(duplicate);fs.close(independent);
             auto ap=fs.open("/cursor-app",forkfs::Namespace::Access::ReadWrite,{true,false,false,0644,true});

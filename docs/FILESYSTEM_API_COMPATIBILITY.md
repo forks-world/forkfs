@@ -42,6 +42,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `fcntl(F_SETLK)`、`flock` | 内核原生 advisory locks；与 RPC 锁分开 | macOS 27.2 跨进程互斥、关闭/退出释放已测；byte-range 不相交范围可同时持有。新增挂载验收共享锁并存/排他冲突、阻塞唤醒、dup 关闭释放差异和 F_SETLKW 信号 EINTR；公平性/死锁/OFD locks 未验收 |
 | `fsync`、目录同步、`F_FULLFSYNC`、断电恢复 | synchronize → inode-sync + 存储提交 | 挂载已测文件/元数据和目录 fsync、目录改名后的 fd、原子保存和被替换旧 fd；F_FULLFSYNC/F_BARRIERFSYNC 请求返回成功。全硬件屏障、断电/内核崩溃仍无完整保证 |
 | `ftruncate`、稀疏文件、`lseek` | setattr size + bounded chunk I/O | 挂载已测零填充、shrink/extend、64 MiB/4 GiB/1 TiB 边界；macOS 27 已挂载验收 `SEEK_DATA/SEEK_HOLE`（64 KiB chunk 粒度）；macOS 26 保留保守 fallback |
+| C++ `Namespace::seek`、daemon `fs-hseek` | namespace open-description cursor / RPC | 实现约定：负位置为 `EINVAL`，超出 `INT64_MAX` 为 `EOVERFLOW`；失败不移动共享 cursor。修复回归与构建证据见[seek error regression record](evidence/2026-11-14-handle-seek-errors.json)，当前验证状态以记录为准。**此项不验收原生 `lseek(2)` errno 或新增挂载能力。** 独立 APFS syscall 对照见 [seek reference](evidence/2026-11-14-seek-apfs-reference.json) |
 | `F_PREALLOCATE`、`posix_fallocate`、hole punch | 可选 Preallocate/数据变更接口 | 未实现相应协议；不能声称空间预留或洞区间查询兼容 |
 | `statfs/statvfs/pathconf` | volumeStatistics、PathConfOperations | 挂载已测容量/单位/标志、路径与 fd 查询、rename/unlink/路径重用和 GC 后只读 revision；子目录/文件 fd 的 `PC_PATH_MAX` 返回 EINVAL，不能宣称完整 pathconf。空间来自宿主卷，不是 forkfs 配额或预留 |
 | `chflags/fchflags/lchflags`、BSD flags | get/setAttributes → revision inode | 挂载已测 hidden/nodump 的路径/fd/nofollow、硬链接、cp -p、孤儿 fd 和历史隔离；user immutable 及 user append-only 的数据/元数据/目录约束已接入；nounlink/系统保护标记仍拒绝 |
@@ -49,6 +50,20 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `copyfile/clonefile/fcopyfile/sendfile` | 内核 fallback 或可选复制能力 | 新增原生验收 `copyfile(DATA|STAT|XATTR)`、`fcopyfile(DATA)` 和 sendfile 区间/EOF/unlink fd；clone 请求可回退，强制 clone 返回 ENOTSUP；ResourceFork、ACL、递归/完整 flags 仍未补齐 |
 | `kqueue` vnode 通知、文件监控、FSEvents | 内核 vnode 事件 | macOS 27.2 小仓库已测 WRITE/EXTEND/ATTRIB/LINK/RENAME/DELETE、父目录事件、跨进程写及路径重用隔离；FSEvents、递归监控、revoke 未验收 |
 | 持久 file ID、file handles、卷改名、大小写折叠 | 可选卷能力/身份协议 | persistent IDs 未提供（不宣告）；ID 只在当前 mount 稳定；卷名支持 revision 元数据和原生改名，大小写折叠未提供/未验收 |
+
+### Seek error codes
+
+The compatibility claim above is limited to the C++ `Namespace::seek` method and
+the raw daemon `fs-hseek` RPC. A negative computed position produces `EINVAL`;
+a computed position above `INT64_MAX` produces `EOVERFLOW`. Both preserve the
+shared open-description cursor. The APFS reference artifact records a separate
+native `lseek(2)` run on macOS 27.2.1 arm64 with APFS; it is host-kernel context,
+not a forkfs mount result, and does not establish any new mount capability.
+Its `EOVERFLOW` value is the Darwin errno observed in that run.
+The baseline-vs-fixed C++ and raw-RPC regression record is maintained separately
+in [seek error regression evidence](evidence/2026-11-14-handle-seek-errors.json);
+it distinguishes baseline failures from fixed-build results and records fixed
+validation as pending until those runs complete.
 
 当前类使用 macOS 26 的 Operations 协议，具体实现见
 [`RevisionVolume.h`](../macos/forkfs/RevisionVolume.h) 和
