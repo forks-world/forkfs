@@ -73,12 +73,40 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         session=json.loads(cli('session-open','60000'))['session']
         assert json.loads(raw(['status'],fragment=True))['storage_engine']=='leveldb'
         cli('fs-init');cli('fs-mkdir','/src')
+        cli('fs-mkdir','/src/hinted')
         payload=bytes(range(256))*1024;data.write_bytes(payload)
         cli('fs-write','/src/file',data)
         assert raw(['fs-cat','/src/file'])==payload
+        raw(['fs-mkdir','/src/sub']);raw(['fs-symlink','/src/sub','/physical-alias'])
+        assert json.loads(raw(['fs-stat','/physical-alias/../file']))['inode_id']==json.loads(raw(['fs-stat','/src/file']))['inode_id']
+        raw(['fs-mkdir','/src//./created']);assert json.loads(raw(['fs-stat','/src/created']))['directory']
+        raw(['fs-rmdir','/src/created']);raw(['fs-unlink','/physical-alias']);raw(['fs-rmdir','/src/sub'])
+        before_invalid=json.loads(raw(['status']))['last_committed_seq']
+        for invalid in ['/src/.','/src/..','/missing/../child','/src/file/../child','/src/trailing/']:
+            raw(['fs-mkdir',invalid],ok=False)
+        assert json.loads(raw(['status']))['last_committed_seq']==before_invalid
+        # lstat seeds a long syntactic directory hint. inode-create appends a
+        # child that would exceed 4096 bytes if the alias were reused.
+        long_alias='/'+'./'*2041+'src/hinted'
+        assert len(long_alias)==4093
+        hint_session=json.loads(cli('session-open','60000'))['session']
+        raw(['inode-root','--session',hint_session])
+        hinted=json.loads(raw(['fs-lstat',long_alias]))['inode_id']
+        old_session=session;session=hint_session
+        created=json.loads(raw(['inode-create',hinted,'child',str(0o600),'--session',hint_session]))
+        child=json.loads(raw(['fs-hstat',created['handle']]))['inode_id']
+        assert json.loads(raw(['fs-stat','/src/hinted/child']))['inode_id']==child
+        raw(['fs-close',created['handle']])
+        session=old_session
+        cli('session-close',hint_session)
         cli('fs-link','/src/file','/alias')
         assert json.loads(cli('fs-stat','/alias'))['links']==2
         cli('fs-snapshot','base');cli('fs-fork','base','work')
+        assert json.loads(raw(['fs-stat','/src//./file','--revision','base']))['inode_id']==json.loads(raw(['fs-stat','/src/file']))['inode_id']
+        revision_seq=json.loads(raw(['status']))['last_committed_seq']
+        raw(['fs-write','/src/./readonly-fail',b'x','--revision','base'],ok=False)
+        raw(['fs-mkdir','/src/../readonly-fail','--revision','base'],ok=False)
+        assert json.loads(raw(['status']))['last_committed_seq']==revision_seq
         raw(['fs-write','/src/file',b'branch\0bytes','--world','work'])
         assert cli('fs-cat','/src/file','--world','work')==b'branch\0bytes'
         assert cli('fs-cat','/src/file','--revision','base')==payload

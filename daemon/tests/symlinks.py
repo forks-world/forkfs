@@ -73,6 +73,11 @@ with tempfile.TemporaryDirectory(prefix='ff-symlink-',dir='/tmp') as tmp:
         rpc('fs-symlink','/src/file','/rpc-link');assert rpc('fs-readlink','/rpc-link')==b'/src/file'
         assert json.loads(rpc('fs-lstat','/rpc-link'))['symlink']
         session=json.loads(rpc('session-open','60000'))['session']
+        dotted=json.loads(rpc('fs-open','/src/./rpc-dotted-created','rw,create','--session',session))['handle']
+        rpc('fs-close',dotted,'--session',session)
+        rpc('fs-rename','/src/./rpc-dotted-created','/src/./rpc-dotted-renamed')
+        assert json.loads(rpc('fs-stat','/src/rpc-dotted-renamed'))['directory'] is False
+        rpc('fs-unlink','/src/rpc-dotted-renamed')
         handle=json.loads(rpc('fs-open','/rpc-link','rw','--session',session))['handle']
         rpc('fs-unlink','/rpc-link');data.write_bytes(b'via-handle')
         rpc('fs-hwrite',handle,'0',data,'--session',session)
