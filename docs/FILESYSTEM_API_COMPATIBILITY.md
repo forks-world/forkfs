@@ -43,6 +43,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `fsync`、目录同步、`F_FULLFSYNC`、断电恢复 | synchronize → inode-sync + 存储提交 | 挂载已测文件/元数据和目录 fsync、目录改名后的 fd、原子保存和被替换旧 fd；F_FULLFSYNC/F_BARRIERFSYNC 请求返回成功。全硬件屏障、断电/内核崩溃仍无完整保证 |
 | `ftruncate`、稀疏文件、`lseek` | setattr size + bounded chunk I/O | 挂载已测零填充、shrink/extend、64 MiB/4 GiB/1 TiB 边界；macOS 27 已挂载验收 `SEEK_DATA/SEEK_HOLE`（64 KiB chunk 粒度）；macOS 26 保留保守 fallback |
 | C++ `Namespace::seek`、daemon `fs-hseek` | namespace open-description cursor / RPC | 实现约定：负位置为 `EINVAL`，超出 `INT64_MAX` 为 `EOVERFLOW`；失败不移动共享 cursor。修复回归与构建证据见[seek error regression record](evidence/2026-11-14-handle-seek-errors.json)，当前验证状态以记录为准。**此项不验收原生 `lseek(2)` errno 或新增挂载能力。** 独立 APFS syscall 对照见 [seek reference](evidence/2026-11-14-seek-apfs-reference.json) |
+| C++/RPC file-handle bad-handle and access errors | `Namespace` handle operations / session-owned RPC | When handle validation is reached, invalid, closed, or foreign-view handles and handle access-mode refusals report `EBADF`; RPC encodes typed errors as `errno + 1`. Metadata mode/time updates remain allowed through read-only handles. The C++/RPC regression and full build/CTest evidence is in the [handle errno record](evidence/2026-11-14-handle-ebadf.json). This does not establish native FSKit errno behavior or general POSIX permission checks. |
 | `F_PREALLOCATE`、`posix_fallocate`、hole punch | 可选 Preallocate/数据变更接口 | 未实现相应协议；不能声称空间预留或洞区间查询兼容 |
 | `statfs/statvfs/pathconf` | volumeStatistics、PathConfOperations | 挂载已测容量/单位/标志、路径与 fd 查询、rename/unlink/路径重用和 GC 后只读 revision；子目录/文件 fd 的 `PC_PATH_MAX` 返回 EINVAL，不能宣称完整 pathconf。空间来自宿主卷，不是 forkfs 配额或预留 |
 | `chflags/fchflags/lchflags`、BSD flags | get/setAttributes → revision inode | 挂载已测 hidden/nodump 的路径/fd/nofollow、硬链接、cp -p、孤儿 fd 和历史隔离；user immutable 及 user append-only 的数据/元数据/目录约束已接入；nounlink/系统保护标记仍拒绝 |
@@ -63,6 +64,21 @@ Its `EOVERFLOW` value is the Darwin errno observed in that run.
 The baseline-vs-fixed C++ and raw-RPC regression record is maintained separately
 in [seek error regression evidence](evidence/2026-11-14-handle-seek-errors.json);
 it distinguishes the baseline failures from the completed fixed-build validation.
+
+### Handle EBADF behavior
+
+The daemon contract is limited to the C++ `Namespace` API and resident RPC.
+When an operation reaches handle validation, missing, closed, or foreign
+World/revision handles report `EBADF`. Attempts to read through a write-only
+handle, or to write data or change size through a read-only handle, also report
+`EBADF`. Read-only handles may still change owner metadata such as mode and
+times. Failed access checks preserve namespace publication state and the shared
+cursor. RPC handle ownership failures report `EBADF + 1` on the wire,
+including closed and foreign-session tokens, without distinguishing those
+cases. Revision write policy, invalid session errors, and malformed
+payload/offset/session precedence are outside this change. The [regression
+record](evidence/2026-11-14-handle-ebadf.json) contains the baseline differential
+and fixed build/test results; no native FSKit errno behavior is claimed.
 
 当前类使用 macOS 26 的 Operations 协议，具体实现见
 [`RevisionVolume.h`](../macos/forkfs/RevisionVolume.h) 和

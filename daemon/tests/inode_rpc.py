@@ -62,10 +62,41 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         directory=obj('inode-mkdir',rid,'dir',str(0o700),*sel);did=directory['inode_id'];assert directory['mode']==0o700
         handle=obj('inode-create',rid,'file',str(0o600),*sel)['handle']
         st=obj('fs-hstat',handle,*sel);fid=st['inode_id'];assert st['mode']==0o600
-        readonly=obj('inode-open',fid,'r',*sel)['handle']
-        rpc('inode-setattr',fid,'-','1','-',readonly,*sel,error=errno.EBADF)
-        rpc('fs-close',readonly,*sel)
         rpc('fs-hwrite',handle,'0',b'abc\x00def',*sel)
+        readonly=obj('inode-open',fid,'r',*sel)['handle']
+        writeonly=obj('inode-open',fid,'w',*sel)['handle']
+        readonly_dup=obj('fs-dup',readonly,*sel)['handle']
+        rpc('inode-setattr',fid,'-','1','-',readonly,*sel,error=errno.EBADF)
+        assert rpc('fs-hread-next',readonly,'2',*sel)==b'ab'
+        before=obj('fs-hstat',readonly,*sel);seq=obj('status')['last_committed_seq']
+        cursor=obj('fs-hseek',readonly,'0','cur',*sel)['offset']
+        for denied in [('fs-hwrite',readonly,0,b'X'),('fs-hwrite-next',readonly,b'X'),
+                       ('fs-hwriteback',readonly,0,b'X'),
+                       ('fs-happend',readonly,b'X'),('fs-htruncate',readonly,0),
+                       ('inode-setattr',fid,'-','1','-',readonly)]:
+            rpc(*denied,*sel,error=errno.EBADF)
+        rpc('fs-hread',writeonly,'0','1',*sel,error=errno.EBADF)
+        rpc('fs-hread-next',writeonly,'1',*sel,error=errno.EBADF)
+        assert obj('fs-hseek',readonly,'0','cur',*sel)['offset']==cursor
+        assert obj('fs-hlock',readonly,'exclusive',*sel)['granted']
+        assert not obj('fs-hrange-lock',writeonly,'shared','0:1',*sel)['granted']
+        after=obj('fs-hstat',readonly,*sel)
+        assert before==after and obj('status')['last_committed_seq']==seq
+        assert rpc('fs-hread-next',readonly_dup,'1',*sel)==b'c'
+        rpc('fs-hlock',readonly,'unlock',*sel)
+        rpc('inode-setattr',fid,'-','1','-','invalid-token',*sel,error=errno.EBADF)
+        assert rpc('fs-hread',handle,'0','99',*sel)==b'abc\x00def'
+        rpc('fs-hstat',handle,'--session',other,error=errno.EBADF)
+        rpc('fs-hread',handle,'0','1','--revision','base',*sel,error=errno.EBADF)
+        closed_handle=obj('fs-dup',handle,*sel)['handle'];rpc('fs-close',closed_handle,*sel)
+        for token in ('missing-handle',closed_handle):
+            for operation in [('fs-hstat',token),('fs-dup',token),('fs-close',token),
+                              ('fs-hseek',token,'0','cur'),('fs-hlock',token,'shared'),
+                              ('fs-hrange-lock',token,'shared','0:1')]:
+                rpc(*operation,*sel,error=errno.EBADF)
+        rpc('fs-close',readonly,*sel);rpc('fs-hread',readonly,'0','1',*sel,error=errno.EBADF)
+        rpc('fs-close',readonly_dup,*sel)
+        rpc('fs-close',writeonly,*sel)
         assert rpc('fs-hread',handle,'0','99',*sel)==b'abc\x00def'
         assert obj('inode-seek-region',fid,'2','data',handle,*sel)['offset']==2
         assert obj('inode-seek-region',fid,'0','hole','-',*sel)['offset']==7
@@ -74,7 +105,7 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         assert obj('fs-hseek-region',handle,'0','hole',*sel)['offset']==7
         assert obj('fs-seek-region','/file','0','data',*sel)['offset']==0
         rpc('inode-seek-region',rid,'0','data',handle,*sel,error=errno.EINVAL)
-        rpc('inode-seek-region',fid,'0','data','foreign',*sel,error=errno.EIO)
+        rpc('inode-seek-region',fid,'0','data','foreign',*sel,error=errno.EBADF)
         rpc('inode-lookup',rid,'absent',*sel,error=errno.ENOENT)
         rpc('inode-rename',rid,'file',did,'moved',fid,'-',*sel)
         assert obj('inode-stat',fid,*sel)['inode_id']==fid
@@ -167,13 +198,27 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         assert (st['mode'],st['size'],st['modified_ns'])==(0o701,10,0)
         assert rpc('fs-hread',handle,'0','99',*sel)==b'abc\x00def\0\0\0'
         rpc('inode-remove',did,'moved',rid,'file',*sel,error=errno.ESTALE)
+        orphan_read=obj('inode-open',fid,'r',*sel)['handle']
         rpc('inode-remove',did,'moved',fid,'file',*sel)
         rpc('inode-remove',rid,'alias',fid,'file',*sel)
         assert obj('fs-hstat',handle,*sel)['links']==0
         st=obj('inode-setattr-flags',fid,'-','-','-','-','-','1',handle,*sel);assert st['flags']==1
+        orphan_before=obj('fs-hstat',orphan_read,*sel);orphan_seq=obj('status')['last_committed_seq']
+        for denied in [('fs-hwrite',orphan_read,0,b'Q'),('fs-hwriteback',orphan_read,0,b'Q'),
+                       ('fs-happend',orphan_read,b'Q'),('fs-htruncate',orphan_read,0),
+                       ('inode-setattr',fid,'-','1','-',orphan_read)]:
+            rpc(*denied,*sel,error=errno.EBADF)
+        assert obj('fs-hstat',orphan_read,*sel)==orphan_before
+        assert obj('status')['last_committed_seq']==orphan_seq
         rpc('fs-hwrite',handle,'0',b'X',*sel)
         st=obj('inode-setattr',fid,str(0o700),'4','1',handle,*sel);assert st['size']==4
         assert rpc('fs-hread',handle,'0','99',*sel)==b'Xbc\x00'
+        replacement=obj('inode-create',rid,'file',str(0o600),*sel)['handle']
+        replacement_id=obj('fs-hstat',replacement,*sel)['inode_id'];assert replacement_id!=fid
+        assert obj('fs-hstat',orphan_read,*sel)['inode_id']==fid
+        assert rpc('fs-hread',orphan_read,'0','99',*sel)==b'Xbc\x00'
+        rpc('fs-close',replacement,*sel);rpc('inode-remove',rid,'file',replacement_id,'file',*sel)
+        rpc('fs-close',orphan_read,*sel)
         rpc('inode-stat',fid,*sel,error=errno.ESTALE)
         rpc('fs-close',handle,*sel)
         link=obj('inode-symlink',rid,'link','dir',*sel)

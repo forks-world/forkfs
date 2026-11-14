@@ -1,0 +1,90 @@
+{
+  "title": "C++ and RPC file handle EBADF behavior",
+  "scope": [
+    "Namespace missing, closed, and foreign-World/revision handles report generic-category EBADF when handle validation is reached",
+    "Read through write-only handles and data write, writeback, append, truncate, or size setattr through read-only handles report EBADF",
+    "RPC handle ownership failures, including closed and foreign-session tokens, use typed wire code errno + 1",
+    "Failed access checks preserve committed namespace state, inode metadata, file data, and shared cursors; valid duplicate and owning handles remain usable"
+  ],
+  "explicit_exclusions": [
+    "Revision write policy and invalid/expired session errors retain existing behavior",
+    "Malformed payload, offset, and session validation precedence is unchanged",
+    "Read-only handles retain permitted owner metadata operations such as mode and time changes",
+    "Advisory locks remain available through read-only handles",
+    "No native FSKit errno mapping or general POSIX permission behavior is claimed"
+  ],
+  "baseline": {
+    "base": "4222ac4e9971a6918717ec999cc08421d01f779f",
+    "runtime_source_sha256": {
+      "daemon/namespace.cpp": "6383f5bb6704acfef5abd82e1301e6b5b347b4e1951a747278aafee58851ff36",
+      "daemon/rpc.cpp": "62d4019ead5fce3bbdb1abdf02c9445fa8b71f3bf0be839dca3a85f48fadca30"
+    },
+    "daemon_sha256": "d225263b711431f41c42ae3fdf6d52bad1243e60dc90e559d9d1d6ff159ca09d",
+    "regression_source_sha256": {
+      "daemon/tests/handles.cpp": "8f11dd274459f5cb684627c8f22345e35059807e83c410c6725c2441e8296321",
+      "daemon/tests/inode_rpc.py": "d2bf6b259b6c04b436dba20765047fb54a609de20dad5bd6f9444050c3adbabc"
+    },
+    "cpp_regression": {
+      "exit_code": 1,
+      "observed": "A read-only orphan write threw generic runtime_error instead of generic-category EBADF.",
+      "log": "/private/tmp/fs122-exec-l2y8oyz8/baseline-cpp.log",
+      "log_sha256": "dbda13970216e038090f46316c389eddf22eb2b4187e556cb3e8d1db3d902d69"
+    },
+    "raw_rpc_regression": {
+      "exit_code": 1,
+      "observed": "A read-only fs-hwrite returned generic wire code 1 instead of EBADF + 1 (10).",
+      "log": "/private/tmp/fs122-exec-l2y8oyz8/baseline-rpc.log",
+      "log_sha256": "54b3d64edb89588ab9c608c1368acd126f33979b625de4e22380e303024878c9"
+    }
+  },
+  "fixed_validation": {
+    "status": "passed",
+    "source_sha256": {
+      "daemon/namespace.cpp": "693deb27c8bbf5e89b40257040f5235a52f4c5ab816cad1cbc82627073f70e97",
+      "daemon/rpc.cpp": "cc85b04d5a1bb7d207e7952a601a934ea8cd1ca7cb35933974fec1137a465ec5",
+      "daemon/tests/handles.cpp": "8f11dd274459f5cb684627c8f22345e35059807e83c410c6725c2441e8296321",
+      "daemon/tests/inode_rpc.py": "d2bf6b259b6c04b436dba20765047fb54a609de20dad5bd6f9444050c3adbabc",
+      "daemon/tests/symlink_handles.py": "f340893ef66eeef3c8409a843b8f5af4f5ca3b7fc59a60d41114a776aa637755"
+    },
+    "daemon_sha256": "4a746296931533aec61dced85b370b2bc7a2898164840e5ada2eae9649ea77d3",
+    "cpp_test_binary_sha256": "3256950b3de0f4dbaf42924d54cbecb5a7a6ec57214ef2c093b5cd0d41e9246d",
+    "build": {
+      "configuration": "Release, FSKit enabled",
+      "result": "passed",
+      "exit_code": 0
+    },
+    "focused_ctest": {
+      "forkfsd_handles": "passed",
+      "forkfsd_inode_rpc": "passed",
+      "forkfsd_symlink_handles": "passed"
+    },
+    "full_ctest": {
+      "passed": 66,
+      "failed": 0,
+      "seconds": 107.66,
+      "log": "/private/tmp/fs122-exec-l2y8oyz8/validate.log",
+      "log_sha256": "96d5e9d1937433421caa60f18087a910d31b832541d2d72538f137e5655e653d"
+    },
+    "dependency_check": {
+      "result": "passed",
+      "system_dependency_counts": {
+        "daemon": 2,
+        "extension": 7,
+        "host": 4
+      }
+    },
+    "execution_controls": "Disposable isolated executor; no-Git, read-only source snapshot; deny-default execution; isolated HOME/TMP; loopback-only tests. No native install, signing, secrets, push, or PR publication.",
+    "first_fixed_run": {
+      "passed": 65,
+      "failed": 1,
+      "failure": "The pre-existing symlink_handles.py foreign-session assertion expected generic wire code 1; the new EBADF + 1 result was intended. The assertion was corrected and the final full run passed.",
+      "log": "/private/tmp/fs122-exec-l2y8oyz8/first-validate.log",
+      "log_sha256": "6fcfd9fc3c38de29b85503d5d9bc52c8426076b824ed206756046f26908f66a3"
+    },
+    "control_state": "/private/tmp/fs122-control-dhm5ls3e/state.json"
+  },
+  "review_scope": {
+    "validated_base": "4222ac4e9971a6918717ec999cc08421d01f779f",
+    "scope": "Daemon C++ Namespace and raw RPC errno behavior only. Inode/handle identity mismatch semantics, revision write policy, resolver behavior, lock semantics, and native FSKit claims remain unchanged or excluded."
+  }
+}

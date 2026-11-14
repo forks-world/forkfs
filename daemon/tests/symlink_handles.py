@@ -47,7 +47,7 @@ with tempfile.TemporaryDirectory(prefix='ff-linkhandle-',dir='/tmp') as tmp:
         assert obj('fs-lstat','/link')['inode_id']!=lid
         rpc('inode-setattr-times',lid,0o777,attrs['size'],999,999,999,handle,*sel,code=errno.EINVAL+1)
         assert obj('fs-hstat',handle,*sel)['birth_ns']==3
-        other=obj('session-open',60000)['session'];rpc('fs-hstat',handle,'--session',other,code=1);rpc('session-close',other)
+        other=obj('session-open',60000)['session'];rpc('fs-hstat',handle,'--session',other,code=errno.EBADF+1);rpc('session-close',other)
         rpc('fs-close',handle,*sel);assert obj('fs-hstat',dup,*sel)['links']==0;rpc('fs-check');rpc('fs-close',dup,*sel);rpc('fs-check')
         rpc('session-close',session);session=obj('session-open',60000)['session'];sel=('--session',session)
         ro=('--revision','base',*sel);root_id=obj('inode-root',*ro)['inode']['inode_id'];old_id=obj('inode-lookup',root_id,'link',*ro)['inode_id'];old=obj('inode-open',old_id,'r',*ro)['handle']
