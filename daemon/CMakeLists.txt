@@ -270,6 +270,9 @@ set_tests_properties(forkfsd_handles_crash PROPERTIES TIMEOUT 120)
 add_test(NAME forkfsd_sessions COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/sessions.py $<TARGET_FILE:forkfsd>)
 set_tests_properties(forkfsd_sessions PROPERTIES TIMEOUT 120)
+add_test(NAME forkfsd_session_cleanup_errors COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/session_cleanup_errors.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
+set_tests_properties(forkfsd_session_cleanup_errors PROPERTIES TIMEOUT 120)
 add_test(NAME forkfsd_symlinks COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/symlinks.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
 set_tests_properties(forkfsd_symlinks PROPERTIES TIMEOUT 120)

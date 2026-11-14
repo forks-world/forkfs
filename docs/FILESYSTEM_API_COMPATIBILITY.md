@@ -148,6 +148,13 @@ LevelDB 写失败后的失效检查现抛出明确的 EIO，普通 fs-* 的 hand
 EIO，因此不提升原生同步故障传播或内核缓存失效的验收等级。见
 [存储失效 EIO 证据](evidence/2026-11-13-poisoned-store-eio.json)。
 
+失效存储中的 daemon RPC session 清理已限定为：过期清理保留仍打开的 handle、挂载
+所有权、孤儿根及相应计数；不会用清零计数或删除保留根来绕过失败。显式 close
+仍返回清理错误，shutdown 对初始 session 快照只做一轮清理；仅在存储已失效时
+抑制清理异常，健康存储上的意外异常仍传播。这只描述 daemon 清理和挂载写入/恢复
+围栏，不代表原生挂载清理、自动恢复、内核缓存失效、物理持久性或断电资格通过。
+见 [daemon session 清理证据](evidence/2026-11-14-daemon-session-cleanup.json)。
+
 2026-11-12 对最新 `main` 重新集成了 #100 的分配统计和存储故障处理，保留
 #99 的 flat 布局 open-unlink/rename 替换修复。#100 原先合入已完成主线合并的
 功能分支，因此单看 PR 的 merged 状态不足以证明功能进入主线。本次组合重新

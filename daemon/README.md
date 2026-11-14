@@ -750,6 +750,7 @@ after computation may have advanced the cursor; there is no request deduplicatio
 Discard partial results and rewind to enumerate that fixed snapshot again.
 Descriptors are limited to 64 per session and 1024 per service, released on close,
 session expiry or shutdown. They expire on restart and reject other views/sessions.
+Poisoned-store cleanup behavior is described below.
 The initial empty flat namespace is represented as a fixed empty stream.
 
 Name-only pages exclude dot/dot-dot. `fs-dir-entries CURSOR LIMIT` returns
@@ -1113,6 +1114,16 @@ free space on the backing filesystem, then reopen and check the repository. Do
 not reinitialize or delete its database. A failed sync can still replay a complete
 transaction after restart; callers must allow the whole old or new publication,
 not assume that an error proves no write occurred. Retained revisions stay intact.
+
+When session cleanup encounters this poisoned state, expiry leaves the failed
+session closing and retains its still-open handles, mount ownership, orphan roots
+and associated accounting. It does not clear counts or remove retention roots as
+a fallback. Each expiry pass attempts each due session once; shutdown makes one
+pass over its initial session snapshot. Explicit `session-close` still returns
+its cleanup error. Cleanup exceptions are suppressed only after the store is
+poisoned; unexpected cleanup errors on a healthy store still propagate. This
+behavior documents the RPC daemon session path only. It does not provide automatic
+recovery, qualify native mount cleanup, or make a physical durability guarantee.
 
 CTest covers both WAL append and sync failures with ENOSPC, EDQUOT and EIO,
 including handle writes and inode truncation, typed errors after removing the
