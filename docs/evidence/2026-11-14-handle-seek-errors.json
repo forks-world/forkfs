@@ -79,7 +79,7 @@
     "scope": "Typed seek-domain errors only; invalid C++ seek enum behavior retained. Raw RPC exercises existing system_error-to-errno mapping. No general RPC mapping or parser changes.",
     "documentation_sha256": {
       "README.md": "04568e523c286d5208600b5f10b1467ebcefd011ef4ac1c167305fe3e121493b",
-      "docs/FILESYSTEM_API_COMPATIBILITY.md": "e7ccb437ce50a1746fecf499f7e0793f05d9325176beccdec4f54fe2395c1672"
+      "docs/FILESYSTEM_API_COMPATIBILITY.md": "2f272d48ba8927e7470e753be94dfbe0416d69134638b19ddc62816d1cc083ce"
     }
   },
   "native_apfs_reference": {

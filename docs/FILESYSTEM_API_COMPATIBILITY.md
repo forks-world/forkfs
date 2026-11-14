@@ -62,8 +62,7 @@ not a forkfs mount result, and does not establish any new mount capability.
 Its `EOVERFLOW` value is the Darwin errno observed in that run.
 The baseline-vs-fixed C++ and raw-RPC regression record is maintained separately
 in [seek error regression evidence](evidence/2026-11-14-handle-seek-errors.json);
-it distinguishes baseline failures from fixed-build results and records fixed
-validation as pending until those runs complete.
+it distinguishes the baseline failures from the completed fixed-build validation.
 
 当前类使用 macOS 26 的 Operations 协议，具体实现见
 [`RevisionVolume.h`](../macos/forkfs/RevisionVolume.h) 和
