@@ -495,8 +495,11 @@ and cyclic links are representable. Hardlink's source does not follow the final
 symlink. Directory-prefix links are followed in every operation.
 
 Absolute targets begin at the selected World root; relative targets start at the
-link's actual containing directory. Dot/dot-dot in targets use physical traversal,
-clamping at the World root. No host path is opened to resolve a symlink. Traversal
+link's actual containing directory. Dot/dot-dot in targets and ordinary absolute
+namespace paths use physical traversal, clamping at the World root. Repeated
+interior slashes are ignored. Traversal does not lexically collapse components
+across symlinks: for example, `/alias/../file` follows `/alias` first and then
+walks to its physical parent. No host path is opened to resolve a symlink. Traversal
 allows at most 40 followed links and 64 KiB cumulative target expansion. Targets
 are 1..4096 bytes of valid UTF-8, component length at most 255 bytes; repeated slashes
 and dot components are supported inside targets. A target's trailing slash requires
@@ -1016,13 +1019,15 @@ internal prefix `NUL + forkfs/` is reserved against generic PUT/batch mutation.
 
 The prototype supports regular files up to 1 TiB, directories, modes 0644/0755,
 mtime/ctime, and absolute paths with valid UTF-8 components up to 255 bytes
-(path up to 4096 bytes). Names and symlink targets preserve their original UTF-8
-bytes: case and canonically equivalent NFC/NFD spellings remain distinct.
+(raw path up to 4096 bytes, including dots and repeated separators). A trailing
+slash remains unsupported. Lookup may end in `.` or `..`, but mutations reject
+those terminal components so they cannot become directory-entry keys. Names and
+symlink targets preserve their original UTF-8 bytes: case and canonically
+equivalent NFC/NFD spellings remain distinct.
 There is no Unicode normalization or case folding. C0 controls, DEL and C1 controls,
 malformed/truncated UTF-8, overlong encodings, surrogate code points and values
-above U+10FFFF are rejected before publication. Dot components and repeated or
-trailing slashes remain unsupported in ordinary paths; symlink targets retain
-their existing traversal rules. World/revision labels remain restricted to their
+above U+10FFFF are rejected before publication. Missing prefixes and traversal
+through regular files still fail. World/revision labels remain restricted to their
 ASCII identifier grammar. Existing ASCII stores need no conversion; a store with
 UTF-8 names requires a daemon that supports them. These deliberate prototype
 restrictions are not a frozen cross-platform naming policy. Current operations

@@ -163,6 +163,12 @@ void valid_namespace_text(const std::string& value) {
         need(scalar>=0x20 && !(scalar>=0x7f && scalar<=0x9f),"invalid control character in namespace text");
     }
 }
+void valid_stored_entry_name(const std::string& name) {
+    need(!name.empty() && name!="." && name!=".." && name.find('/')==std::string::npos,
+         "invalid directory name");
+    need(name.size()<=255,"invalid directory name");
+    valid_namespace_text(name);
+}
 void valid_volume_name(const std::string& name) {
     if(name.size()>255)throw std::system_error(ENAMETOOLONG,std::generic_category(),"volume name exceeds 255 bytes");
     if(name.empty() || name=="." || name==".." || name.find('/')!=name.npos)throw std::system_error(EINVAL,std::generic_category(),"invalid volume name");
@@ -180,15 +186,20 @@ std::vector<std::string> components(const std::string& path) {
     if(path.size()>4096)throw std::system_error(ENAMETOOLONG,std::generic_category(),"path exceeds 4096 bytes");
     std::vector<std::string> result;
     if(path=="/")return result;
+    // A final slash carries directory semantics that this namespace does not
+    // implement. Interior empty components are harmless separators.
+    need(path.back()!='/',"trailing slash is unsupported");
     size_t begin=1;
     while(begin<path.size()) {
         auto end=path.find('/',begin);if(end==std::string::npos)end=path.size();
         auto name=path.substr(begin,end-begin);
-        need(!name.empty() && name!="." && name!="..","invalid path component");
-        if(name.size()>255)throw std::system_error(ENAMETOOLONG,std::generic_category(),"path component exceeds 255 bytes");
-        valid_namespace_text(name);
-        result.push_back(name);begin=end+1;
-        need(end==path.size() || begin<path.size(),"trailing slash is unsupported");
+        if(!name.empty()) {
+            if(name.size()>255)throw std::system_error(ENAMETOOLONG,std::generic_category(),"path component exceeds 255 bytes");
+            valid_namespace_text(name);
+            result.push_back(name);
+        }
+        if(end==path.size())break;
+        begin=end+1;
     }
     return result;
 }
@@ -235,6 +246,7 @@ std::string walk(const NamespaceView& journal,const std::vector<std::string>& na
 }
 Parent parent(const NamespaceView& journal,const std::string& path,std::vector<std::string>* ancestry=nullptr) {
     auto names=components(path);need(!names.empty(),"cannot modify filesystem root");
+    need(names.back()!="." && names.back()!="..","invalid terminal path component");
     auto id=walk(journal,names,names.size()-1,ancestry);need(inode(journal,id).directory,"parent is not a directory");
     return {id,names.back(),entry_key(id,names.back())};
 }
@@ -631,7 +643,7 @@ std::string Namespace::diff(const std::string& before,const std::string& after,c
                 if(!n || !n->directory)return;
                 need(visited.insert(n->id).second,"directory cycle or hardlink");auto pre=directory_prefix(n->id);
                 for(const auto& key:view.keys(pre)) {
-                    auto name=key.substr(pre.size());auto parsed=components("/"+name);need(parsed.size()==1,"invalid directory name");
+                    auto name=key.substr(pre.size());valid_stored_entry_name(name);
                     auto child_path=path=="/"?path+name:path+"/"+name;need(child_path.size()<=4096,"path exceeds mount protocol limit");
                     auto& pair=pending[child_path];(old?pair.first:pair.second)=decode_id(view.get(key));
                 }
@@ -1072,7 +1084,7 @@ void Namespace::verify_locked() const {
         need(directories.insert(id).second,"directory cycle or hardlink");uint64_t subdirs=0;
         auto pre=directory_prefix(id);
         for(const auto& key:j.keys(pre)) {
-            auto name=key.substr(pre.size());auto parsed=components("/"+name);need(parsed.size()==1,"invalid directory name");
+            auto name=key.substr(pre.size());valid_stored_entry_name(name);
             expected.insert(key);auto child=decode_id(j.get(key));++references[child];
             if(inode(j,child).directory)++subdirs;visit(child);
         }
@@ -1325,7 +1337,13 @@ std::string Namespace::path_for_inode(const std::string& id) const {
             // Directory RPCs append child names. A symlink alias may be much
             // longer than the physical path, so use traversal for such hints.
             bool followed_symlink=false;
-            if(resolve(view,hint->second,false,nullptr,&followed_symlink)==id &&
+            // Inode RPCs append a child name to this path. A physical traversal
+            // alias cannot be safely extended within the raw path byte budget.
+            bool canonical=hint->second.find("//")==std::string::npos &&
+                hint->second.find("/./")==std::string::npos &&
+                hint->second.find("/../")==std::string::npos &&
+                !hint->second.ends_with("/.") && !hint->second.ends_with("/..");
+            if(canonical && resolve(view,hint->second,false,nullptr,&followed_symlink)==id &&
                (!inode(view,id).directory || !followed_symlink))return hint->second;
         }
         catch(const std::runtime_error& e){auto message=std::string_view(e.what());
