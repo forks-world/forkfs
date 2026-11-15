@@ -96,6 +96,7 @@ public:
     void handle_remove_xattr(const std::string& handle,const std::string& name) {edit_xattr(handle,name,std::nullopt,XattrPolicy::Upsert,true);}
 
     void rename(const std::string& source,const std::string& target);
+    void exchange(const std::string& source,const std::string& target);
     void link(const std::string& source,const std::string& target);
     void remove(const std::string& path,bool directory);
     void verify() const;
