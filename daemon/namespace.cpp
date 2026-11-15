@@ -413,6 +413,42 @@ public:
         }
         n_.size=size;return true;
     }
+    bool punch(uint64_t offset,uint64_t length) {
+        non_append_inode(n_);
+        need(offset<=INT64_MAX && length<=INT64_MAX,"invalid hole punch range");
+        if(length==0 || offset>=n_.size)return false;
+        const uint64_t end=offset+std::min<uint64_t>(length,n_.size-offset);
+        if(!n_.chunked) {
+            auto data=get(inline_);need(data.size()==n_.size,"inode size mismatch");
+            std::fill(data.begin()+offset,data.begin()+end,0);(*changes_)[inline_]=std::move(data);return true;
+        }
+        const uint64_t first_full=(offset+chunk_size-1)/chunk_size;
+        const uint64_t end_full=end/chunk_size;
+        if(first_full<end_full) {
+            if(chunks_.starts_with(prefix))changes_->erase_range(chunk_key(first_full),end_full>=maximum_file_bytes/chunk_size?prefix_end(chunks_):chunk_key(end_full));
+            else for(const auto& key:keys_(chunks_)) {
+                uint64_t index;need(parse_chunk_suffix(std::string_view(key).substr(chunks_.size()),index),"invalid file chunk key");
+                if(index>=first_full && index<end_full)(*changes_)[key]=std::nullopt;
+            }
+        }
+        auto punch_edge=[&](uint64_t index,uint64_t begin,uint64_t finish) {
+            if(begin>=finish)return;
+            auto key=chunk_key(index);if(!contains(key))return;
+            auto data=get(key);need(!data.empty() && data.size()<=chunk_size,"invalid file chunk");
+            const auto chunk_begin=index*chunk_size;
+            auto lo=std::max(begin,chunk_begin)-chunk_begin,hi=std::min(finish,chunk_begin+chunk_size)-chunk_begin;
+            if(lo<data.size())std::fill(data.begin()+lo,data.begin()+std::min<uint64_t>(hi,data.size()),0);
+            put_chunk(index,std::move(data));
+        };
+        const auto first_index=offset/chunk_size,last_index=(end-1)/chunk_size;
+        if(first_index==last_index) {
+            if(!(first_index>=first_full && first_index<end_full))punch_edge(first_index,offset,end);
+        } else {
+            if(offset%chunk_size)punch_edge(first_index,offset,std::min<uint64_t>(end,(first_index+1)*chunk_size));
+            if(end%chunk_size)punch_edge(last_index,last_index*chunk_size,end);
+        }
+        return true;
+    }
     std::vector<std::string> records() const {return n_.chunked?keys_(chunks_):std::vector<std::string>{inline_};}
     void verify() const {
         need(n_.size<=Namespace::maximum_file_size,"invalid file size");
@@ -885,6 +921,10 @@ void Namespace::truncate(const std::string& path,uint64_t size) {
     need(size<=maximum_file_size,"file exceeds 1 TiB");
     edit_content(path,[&](FileContent& data){return data.resize(size);});
 }
+void Namespace::punch_hole(const std::string& path,uint64_t offset,uint64_t length) {
+    need(offset<=INT64_MAX && length<=INT64_MAX,"invalid hole punch range");
+    edit_content(path,[&](FileContent& data){return data.punch(offset,length);});
+}
 Bytes Namespace::read_at(const std::string& path,uint64_t offset,uint64_t count) const {
     need(offset<=INT64_MAX,"file offset exceeds signed 64-bit range");
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=inode(view,resolve(view,path));
@@ -1310,6 +1350,10 @@ uint64_t Namespace::handle_append(const std::string& token,const Bytes& value) {
 void Namespace::handle_truncate(const std::string& token,uint64_t size) {
     need(size<=maximum_file_size,"file exceeds 1 TiB");
     edit_handle(token,[&](FileContent& data,bool){return data.resize(size);});
+}
+void Namespace::handle_punch_hole(const std::string& token,uint64_t offset,uint64_t length) {
+    need(offset<=INT64_MAX && length<=INT64_MAX,"invalid hole punch range");
+    edit_handle(token,[&](FileContent& data,bool){return data.punch(offset,length);});
 }
 void Namespace::recover_orphans(Container& container) {
     // Previous-process handles have expired. Release retention roots, not objects.

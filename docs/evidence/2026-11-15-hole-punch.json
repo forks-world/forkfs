@@ -1,0 +1,91 @@
+{
+  "title": "Sparse hole punching through Namespace and daemon APIs",
+  "recorded_date": "2026-11-15",
+  "validated_base": "3ddb0d38eff3daddeed6ddeb9f6f27a6190c658e",
+  "scope": [
+    "Namespace::punch_hole and Namespace::handle_punch_hole, resident fs-punch-hole/fs-hpunch-hole RPC, and offline fs-punch-hole CLI",
+    "Inline range zeroing without promotion; the inline allocated_size remains unchanged",
+    "Chunked partial-edge zeroing and fully covered chunk removal, with a 1 TiB sparse-range regression that does not iterate over hole chunks",
+    "File size and bytes outside the interval remain unchanged; zero-length and offset-at-or-beyond-EOF calls do not publish or update timestamps after normal access and inode append-only checks",
+    "C++ path behavior on both storage backends: symlink following, hard-link identity, snapshots/forks and reopen; modern backend additionally covers GC",
+    "Modern backend handle behavior: duplicate shared cursor, unlink with path reuse, read-only EBADF, inode append-only EPERM, immutable path refusal with admitted writable-handle success, and descriptor O_APPEND not imposing inode append-only policy",
+    "Resident RPC validation: malformed signed-range arguments leave sequence, data, metadata and cursor unchanged; foreign/closed handle ownership returns EBADF+1; another session mount lease returns EBUSY+1",
+    "Offline CLI range operation and repository consistency check"
+  ],
+  "fixed_validation": {
+    "status": "passed",
+    "configuration": "Release WFS_FSKIT=ON",
+    "clean_first": true,
+    "ctest": {
+      "passed": 69,
+      "failed": 0,
+      "seconds": 112.31,
+      "new_targets": [
+        "forkfsd_hole_punch",
+        "forkfsd_hole_punch_rpc"
+      ]
+    },
+    "dependencies": {
+      "result": "passed",
+      "targets": [
+        "daemon",
+        "ForkFSExtension",
+        "ForkFSHost"
+      ],
+      "system_dependency_counts": {
+        "daemon": 2,
+        "extension": 7,
+        "host": 4
+      }
+    },
+    "source_sha256_at_validation": {
+      "daemon/CMakeLists.txt": "e4d7968433524d6c1f40ed1ac83c1649b01f71c07a95c7ad43a81336f1c17fb6",
+      "daemon/namespace.cpp": "979474c3c084bcadd59a6d8e06c8c10f5d8d68a8e4c6ae5d6ba7bdb37d07d4c2",
+      "daemon/namespace.h": "84b827bb69b23763ad10821425fab1c6ff562be72f51839d5e8e2bf0a29edf86",
+      "daemon/rpc.cpp": "0bc587b59379c29dd96fb9f350c2b0d41464ecf57adcedbadd2aa8fd2b20e5bf",
+      "daemon/main.cpp": "98b9311f35b2cc399d208872dcf31a20d1efb5918a98fcb83d1d61a5ad4214d0",
+      "daemon/tests/hole_punch.cpp": "f6ad779ea437e67a1bcd31c6b334a15130068449d3e8444b1fa04b17c7a557b0",
+      "daemon/tests/hole_punch_rpc.py": "ca7c84b57294a9307b6dcc6bc9b962a388c0250573dae6fa541ded085fa1f71f"
+    },
+    "daemon_sha256": "380641c72cfe03a56e3902e8550ad2afd3ad861b21010e9fbb6bfec6a924fa00",
+    "cpp_test_sha256": "0217606b3d25915a93e712c6d398373f62c149d3add4d80fd783e23c0c082249",
+    "validate_log_sha256": "1c9c3d03b1f74b5bb6aa38963c6e4c06129384a26c2942bb3174fbddcd44da0d",
+    "ctest_log_sha256": "3bfd02088860aac1f14eae855ce2ca4406569412b7e4eb042e8ae4bc342283f3",
+    "execution_root": "/private/tmp/fs127-exec-jxhhu_vg"
+  },
+  "baseline_probe": {
+    "status": "passed; unsupported APIs rejected without state change",
+    "base": "3ddb0d38eff3daddeed6ddeb9f6f27a6190c658e",
+    "runtime_source_sha256": {
+      "daemon/namespace.cpp": "51eba35330ad83b9bf3a58b86e4dc1fa99ed8263d6bf1934f46ef42e02c544a0",
+      "daemon/namespace.h": "e989c75a90f70403b9ff972c8dd49ceb41646601d8346e4c9f2b581beaf1a8a3",
+      "daemon/rpc.cpp": "cc85b04d5a1bb7d207e7952a601a934ea8cd1ca7cb35933974fec1137a465ec5",
+      "daemon/main.cpp": "047c6521cdf1f610a878c26f2b9f0560c9afe56f5e08f745687642525404b498"
+    },
+    "daemon_sha256": "81b25098b4e8450b4020ff7a1ac59f99a2e1f7ac98fac16350d318b02fba08b4",
+    "build_exit_code": 0,
+    "preserved_binary": "/private/tmp/fs127-exec-jxhhu_vg/baseline/forkfsd",
+    "harness_sha256": "ca7c84b57294a9307b6dcc6bc9b962a388c0250573dae6fa541ded085fa1f71f",
+    "exit_code": 0,
+    "outcome": {
+      "cursor_preserved": true,
+      "data_preserved": true,
+      "handle_rpc": "rejected",
+      "mode": "expect-unsupported",
+      "offline_cli": "rejected",
+      "path_rpc": "rejected",
+      "sequence_preserved": true,
+      "size_mtime_preserved": true
+    },
+    "log_sha256": "8ab9aee457640bdce5c98716cb788083a4a72f3176e22ed63d3a672f23eafcb5",
+    "log": "/private/tmp/fs127-exec-jxhhu_vg/baseline-probe.log",
+    "qualification": "The new C++ Namespace methods do not exist on the baseline, so no C++ baseline test was attempted. The baseline differential probes RPC path/handle operations and offline CLI only."
+  },
+  "explicit_exclusions": [
+    "No FSKit production callback or native mounted F_PUNCHHOLE syscall behavior is implemented or claimed.",
+    "No Preallocate protocol, F_PREALLOCATE, posix_fallocate, reservation guarantee, or physical extent query is implemented or claimed.",
+    "Inline representation remains allocated after punching; this operation does not promise inline deallocation or allocated_size reduction.",
+    "Raw Journal orphan range-erasure fallback was reviewed statically but was not independently forced by a dedicated test; no distinct test claim is made for it.",
+    "This is C++/daemon RPC/offline CLI validation, not native filesystem compatibility evidence."
+  ]
+}

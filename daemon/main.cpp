@@ -171,6 +171,7 @@ int main(int argc, char** argv) {
                          "forkfsd fs-write-at CONTAINER PATH OFFSET INPUT_FILE\n"
                          "forkfsd fs-append CONTAINER PATH INPUT_FILE\n"
                          "forkfsd fs-truncate CONTAINER PATH SIZE\n"
+                         "forkfsd fs-punch-hole CONTAINER PATH OFFSET LENGTH\n"
                          "forkfsd fs-ls CONTAINER PATH\n"
                          "forkfsd fs-stat CONTAINER PATH\n"
                          "forkfsd fs-lstat CONTAINER PATH\n"
@@ -224,7 +225,7 @@ int main(int argc, char** argv) {
         if(command=="fs-init" || command=="fs-check" || command=="fs-worlds" || command=="fs-revisions" || command=="fs-compact" || command=="fs-layout" || command=="fs-volume-name")base_argc=3;
         if(command=="fs-write" || command=="fs-save" || command=="fs-link" || command=="fs-rename" || command=="fs-fork" || command=="fs-restore" || command=="fs-append" || command=="fs-truncate" || command=="fs-symlink" || command=="fs-lchmod" || command=="fs-chmod" || command=="fs-setmtime")base_argc=5;
         if(command=="fs-setflags" || command=="fs-lsetflags")base_argc=5;
-        if(command=="fs-read-at" || command=="fs-write-at")base_argc=6;
+        if(command=="fs-read-at" || command=="fs-write-at" || command=="fs-punch-hole")base_argc=6;
         if(command=="fs-xattr-get" || command=="fs-xattr-remove")base_argc=5;
         if(command=="fs-xattr-set")base_argc=7;
         if(command=="fs-settimes" || command=="fs-lsettimes")base_argc=7;
@@ -329,6 +330,7 @@ int main(int argc, char** argv) {
             else if(command=="fs-rename" && argc==5) fs.rename(argv[3],argv[4]);
             else if(command=="fs-link" && argc==5) fs.link(argv[3],argv[4]);
             else if(command=="fs-truncate" && argc==5)fs.truncate(argv[3],file_number(argv[4]));
+            else if(command=="fs-punch-hole" && argc==6)fs.punch_hole(argv[3],file_number(argv[4]),file_number(argv[5]));
             else if(command=="fs-write-at" && argc==6)fs.write_at(argv[3],file_number(argv[4]),load_file(argv[5]));
             else if(command=="fs-append" && argc==5) {
                 auto data=load_file(argv[4]);auto offset=fs.append(argv[3],data);

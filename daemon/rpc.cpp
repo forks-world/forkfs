@@ -142,7 +142,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     size_t count=2;
     if(op=="status" || op=="storage-profile" || op=="fs-init" || op=="fs-check" || op=="fs-worlds" || op=="fs-revisions" || op=="fs-compact" || op=="fs-volume-name")count=1;
     if(op=="fs-write" || op=="fs-save" || op=="fs-rename" || op=="fs-link" || op=="fs-fork" || op=="fs-restore" || op=="fs-append" || op=="fs-truncate" || op=="fs-open" || op=="fs-happend" || op=="fs-htruncate" || op=="fs-hread-next" || op=="fs-hwrite-next" || op=="fs-symlink" || op=="fs-chmod" || op=="fs-lchmod" || op=="fs-setmtime" || op=="fs-hchmod" || op=="fs-hsetmtime" || op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-hlock")count=3;
-    if(op=="fs-read-at" || op=="fs-write-at" || op=="fs-hread" || op=="fs-hwrite" || op=="fs-hwriteback" || op=="fs-hseek" || op=="fs-hrange-lock")count=4;
+    if(op=="fs-read-at" || op=="fs-write-at" || op=="fs-hread" || op=="fs-hwrite" || op=="fs-hwriteback" || op=="fs-hseek" || op=="fs-hrange-lock" || op=="fs-punch-hole" || op=="fs-hpunch-hole")count=4;
     if(op=="fs-history")count=4;
     if(op=="inode-root" || op=="inode-sync" || op=="inode-space")count=1;
     if(op=="inode-stat" || op=="inode-dir-open" || op=="inode-readlink")count=2;
@@ -353,6 +353,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         return "{\"written\":"+std::to_string(written)+"}\n";
     }
     if(op=="fs-hread"){auto b=fs.handle_read(args[1],number(args[2]),number(args[3]));return std::string(b.begin(),b.end());}
+    if(op=="fs-punch-hole"){fs.punch_hole(args[1],number(args[2]),number(args[3]));return store.status();}
+    if(op=="fs-hpunch-hole"){fs.handle_punch_hole(args[1],number(args[2]),number(args[3]));return store.status();}
     if(op=="fs-happend") {
         auto offset=fs.handle_append(args[1],std::vector<unsigned char>(args[2].begin(),args[2].end()));
         return "{\"offset\":"+std::to_string(offset)+",\"written\":"+std::to_string(args[2].size())+"}\n";

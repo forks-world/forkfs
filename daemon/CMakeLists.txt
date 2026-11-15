@@ -366,6 +366,16 @@ target_link_libraries(forkfsd_volume_name_test PRIVATE forkfs_metadata)
 add_test(NAME forkfsd_volume_name COMMAND forkfsd_volume_name_test)
 set_tests_properties(forkfsd_volume_name PROPERTIES TIMEOUT 120)
 
+add_executable(forkfsd_hole_punch_test tests/hole_punch.cpp
+    $<TARGET_OBJECTS:forkfs_common> $<TARGET_OBJECTS:forkfs_container_obj>
+    $<TARGET_OBJECTS:forkfs_compaction_obj>)
+target_link_libraries(forkfsd_hole_punch_test PRIVATE forkfs_metadata)
+add_test(NAME forkfsd_hole_punch COMMAND forkfsd_hole_punch_test)
+set_tests_properties(forkfsd_hole_punch PROPERTIES TIMEOUT 120)
+add_test(NAME forkfsd_hole_punch_rpc COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/hole_punch_rpc.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_hole_punch_rpc PROPERTIES TIMEOUT 120)
+
 if(APPLE)
     # Use host APFS scratch independently of the build filesystem; no FSKit mount needed.
     add_test(NAME forkfs_copy_transfer_reference COMMAND ${Python3_EXECUTABLE}
