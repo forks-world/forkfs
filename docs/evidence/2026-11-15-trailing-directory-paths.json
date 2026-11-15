@@ -1,0 +1,78 @@
+{
+  "title": "Trailing slash directory paths in the daemon namespace",
+  "validated_base": "123b69275f2b7dfd6ab429486fd11f4749870cf5",
+  "validated_code_commit": "cc211f73c9af8bbe050ee662d73affc4c8806560",
+  "scope": [
+    "Existing-object resolution accepts a trailing slash and requires the resolved object to be a directory; all-slash paths resolve to the World root",
+    "A final symlink is followed when a trailing slash requires directory traversal, including lstat and link-attribute operations",
+    "File, dangling-link, symlink-to-file, and looping-link paths with a trailing slash are rejected while preserving generic raw-RPC wire error code 1",
+    "Parent-based create, mkdir, remove, rename and link destination paths, O_CREAT paths, and revision diff cursor paths continue to reject trailing slashes",
+    "Raw paths retain the 4096-byte limit and components retain the 255-byte limit; a directory hint ending in slash falls back to its canonical physical path before an inode RPC child is appended",
+    "Regression coverage includes modern and legacy storage, revisions, forks, modern GC and reopen"
+  ],
+  "explicit_exclusions": [
+    "This validates C++ Namespace and raw daemon RPC behavior only; it does not claim native filesystem mount semantics or a new mount capability",
+    "No new typed error or RPC error mapping is claimed; existing generic runtime-error mapping is preserved",
+    "Trailing slashes remain unsupported for parent-path mutation parsing and revision diff cursor parsing"
+  ],
+  "baseline": {
+    "status": "failed as expected on the validated base",
+    "runtime_source_sha256": "673e1c9ca44fa5c7b1d6a0342965ab052ec10ec679330241a85f3345538fa1c3",
+    "daemon_sha256": "c027164cd61ec96ffc1521459c871a46af15d4be2eb7d9bf156a9946ea05be2e",
+    "cpp_binary_sha256": "542f3f313e93d2fb8223488dd791b2ef0c61f01353c71fbb6f68f6bfaecbcef0",
+    "cpp_test_sha256": "2b0d9e831967b04ec97baa7fd59e9198c47fb71e28af01a9eab6f0efdfbf1188",
+    "rpc_test_sha256": "2256ad6454b7cd6d3b7dae4dcfac4d34b1d30ebce81d31433b1507cae4f665be",
+    "cpp_regression": {
+      "exit_code": 1,
+      "log": "/private/tmp/fs125-integrated-exec-n5cy0etm/baseline-cpp.log",
+      "log_sha256": "98e90a165f013929b216243531c280c16ecaf56244d9c1cade684de20b29cda9",
+      "observed": "The all-slash root lookup failed with 'trailing slash is unsupported'."
+    },
+    "raw_rpc_regression": {
+      "exit_code": 1,
+      "log": "/private/tmp/fs125-integrated-exec-n5cy0etm/baseline-rpc.log",
+      "log_sha256": "7519d4af00e1b121fa4a82c89d6545a72cc4cb3b1a0a3ce74d2b251fc234699f",
+      "observed": "fs-stat on /src/ failed with generic wire code 1 and 'trailing slash is unsupported'."
+    }
+  },
+  "fixed_validation": {
+    "status": "passed",
+    "source_sha256": {
+      "daemon/namespace.cpp": "51eba35330ad83b9bf3a58b86e4dc1fa99ed8263d6bf1934f46ef42e02c544a0",
+      "daemon/CMakeLists.txt": "c35ffcabab8cf2e9c728eb881f0f56540f6ca2693003f1d87121a5b5e2b0ce29",
+      "daemon/tests/trailing_paths.cpp": "2b0d9e831967b04ec97baa7fd59e9198c47fb71e28af01a9eab6f0efdfbf1188",
+      "daemon/tests/rpc.py": "2256ad6454b7cd6d3b7dae4dcfac4d34b1d30ebce81d31433b1507cae4f665be"
+    },
+    "daemon_sha256": "81b25098b4e8450b4020ff7a1ac59f99a2e1f7ac98fac16350d318b02fba08b4",
+    "cpp_binary_sha256": "0daf51cf1fd82fc056779370bc2e00e3fbed961c7697f85ad732e588f553de4e",
+    "execution_root": "/private/tmp/fs125-integrated-exec-n5cy0etm",
+    "build_command": "cmake --build build --parallel 4 --clean-first (fresh build directory)",
+    "environment": {
+      "macos": "27.2.1",
+      "arch": "arm64",
+      "sdk": "27.2",
+      "build": "Release WFS_FSKIT=ON, Apple Clang"
+    },
+    "full_suite": {
+      "command": "ctest --test-dir build --output-on-failure --timeout 600 --no-tests=error -j2",
+      "passed": 67,
+      "failed": 0,
+      "seconds": 111.85,
+      "log": "/private/tmp/fs125-integrated-exec-n5cy0etm/validate.log",
+      "log_sha256": "c32b90b2a86fc7f0f475fff17f18450f84bc06995da0b92a2f3b6cd872da7b25"
+    },
+    "targeted_tests": {
+      "forkfsd_rpc": "passed",
+      "forkfsd_trailing_paths": "passed",
+      "forkfsd_inode_paths": "passed"
+    },
+    "dependency_check": {
+      "result": "passed",
+      "system_dependency_counts": {
+        "daemon": 2,
+        "extension": 7,
+        "host": 4
+      }
+    }
+  }
+}

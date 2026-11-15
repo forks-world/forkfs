@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
             raise
         return p
     session=None
-    def raw(fields,ok=True,fragment=False):
+    def raw(fields,ok=True,fragment=False,expected_code=None):
         if fields[0] in ['fs-open','fs-close'] or fields[0].startswith('fs-h'):
             fields=[*fields,'--session',session]
         with socket.socket(socket.AF_UNIX) as s:
@@ -61,6 +61,7 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
             else:s.sendall(b)
             code,value=response(s)
             assert (code==0)==ok,(fields[:2],code,value)
+            if expected_code is not None:assert code==expected_code,(fields[:2],code,value)
             assert s.recv(1)==b''
             return value
     def cli(*args,ok=True):
@@ -74,6 +75,20 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         session=json.loads(cli('session-open','60000'))['session']
         assert json.loads(raw(['status'],fragment=True))['storage_engine']=='leveldb'
         cli('fs-init');cli('fs-mkdir','/src')
+        raw(['fs-write','/rpc-file',b'R'])
+        raw(['fs-symlink','/src','/trail-alias'])
+        raw(['fs-symlink','/missing-trailing-target','/trail-dangling'])
+        raw(['fs-symlink','/trail-loop','/trail-loop'])
+        src_id=json.loads(raw(['fs-stat','/src']))['inode_id']
+        assert json.loads(raw(['fs-stat','/src/']))['inode_id']==src_id
+        assert json.loads(raw(['fs-stat','////']))['inode_id']==json.loads(raw(['fs-stat','/']))['inode_id']
+        assert json.loads(raw(['fs-stat','/trail-alias/']))['inode_id']==src_id
+        assert json.loads(raw(['fs-lstat','/trail-alias/']))['inode_id']==src_id
+        assert raw(['fs-cat','/rpc-file'])==b'R'
+        trailing_seq=json.loads(raw(['status']))['last_committed_seq']
+        for query in ['/rpc-file/','/trail-dangling/','/trail-loop/']:
+            raw(['fs-stat',query],ok=False,expected_code=1)
+        assert json.loads(raw(['status']))['last_committed_seq']==trailing_seq
         cli('fs-mkdir','/src/hinted')
         payload=bytes(range(256))*1024;data.write_bytes(payload)
         cli('fs-write','/src/file',data)
@@ -98,13 +113,21 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         child=json.loads(raw(['fs-hstat',created['handle']]))['inode_id']
         assert json.loads(raw(['fs-stat','/src/hinted/child']))['inode_id']==child
         raw(['fs-close',created['handle']])
+        trailing_hinted=json.loads(raw(['fs-lstat','/src/hinted/']))['inode_id']
+        trailing_created=json.loads(raw(['inode-create',trailing_hinted,'trailing-child',str(0o600),'--session',hint_session]))
+        trailing_child=json.loads(raw(['fs-hstat',trailing_created['handle']]))['inode_id']
+        assert json.loads(raw(['fs-stat','/src/hinted/trailing-child']))['inode_id']==trailing_child
+        raw(['fs-close',trailing_created['handle']])
         session=old_session
         cli('session-close',hint_session)
         cli('fs-link','/src/file','/alias')
         assert json.loads(cli('fs-stat','/alias'))['links']==2
         cli('fs-snapshot','base');cli('fs-fork','base','work')
-        assert json.loads(raw(['fs-stat','/src//./file','--revision','base']))['inode_id']==json.loads(raw(['fs-stat','/src/file']))['inode_id']
         revision_seq=json.loads(raw(['status']))['last_committed_seq']
+        assert json.loads(raw(['fs-stat','/src//./file','--revision','base']))['inode_id']==json.loads(raw(['fs-stat','/src/file']))['inode_id']
+        assert json.loads(raw(['fs-stat','/src/','--revision','base']))['inode_id']==src_id
+        assert json.loads(raw(['fs-lstat','/trail-alias/','--revision','base']))['inode_id']==src_id
+        assert json.loads(raw(['status']))['last_committed_seq']==revision_seq
         raw(['fs-write','/src/./readonly-fail',b'x','--revision','base'],ok=False)
         raw(['fs-mkdir','/src/../readonly-fail','--revision','base'],ok=False)
         assert json.loads(raw(['status']))['last_committed_seq']==revision_seq
