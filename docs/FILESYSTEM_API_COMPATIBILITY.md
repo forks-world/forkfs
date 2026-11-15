@@ -52,6 +52,15 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `kqueue` vnode 通知、文件监控、FSEvents | 内核 vnode 事件 | macOS 27.2 小仓库已测 WRITE/EXTEND/ATTRIB/LINK/RENAME/DELETE、父目录事件、跨进程写及路径重用隔离；FSEvents、递归监控、revoke 未验收 |
 | 持久 file ID、file handles、卷改名、大小写折叠 | 可选卷能力/身份协议 | persistent IDs 未提供（不宣告）；ID 只在当前 mount 稳定；卷名支持 revision 元数据和原生改名，大小写折叠未提供/未验收 |
 
+Namespace object resolution accepts a trailing slash for existing-object queries
+and metadata/content operations. The slash requires the resolved object to be a
+directory, including when the final component is a symlink to a directory;
+`lstat("/link/")` therefore follows that link for directory traversal. A
+trailing slash does not enable create, mkdir, remove, rename, or link destination
+paths. Namespace parent-path parsing and revision diff cursors also continue to
+reject it. See [trailing directory path regression evidence](evidence/2026-11-15-trailing-directory-paths.json).
+Native mount behavior is not established by this Namespace coverage.
+
 ### Seek error codes
 
 The compatibility claim above is limited to the C++ `Namespace::seek` method and
@@ -89,10 +98,14 @@ Preallocate、DataCache 等独立评估；迁移 API 不自动补齐上表语义
 普通 namespace 路径的 C++/raw-RPC 解析按物理顺序遍历 `.`、`..` 和重复的内部
 `/`，`..` 在 World 根目录钳制；不会跨符号链接做词法折叠。缺失前缀和普通文件
 后的 `..` 仍然失败。原始路径上限仍为 4096 字节（包含点组件及重复分隔符），
-组件上限仍为 255 字节；末尾 `/` 仍不支持。查找可用 `.` 或 `..` 结尾，变更
-操作拒绝这两个末尾组件，避免将保留名称写入目录项。此项记录 daemon namespace
-语义，不代表原生挂载路径能力升级。基线失败和最终回归结果见
-[physical path components evidence](evidence/2026-11-14-physical-path-components.json)。
+组件上限仍为 255 字节。现存对象查询及路径元数据/内容操作接受末尾 `/`，并要求
+最终解析对象为目录；末尾符号链接因此按目录路径语义跟随。parent 路径创建、
+mkdir/remove/rename/link 和创建式 open 继续拒绝末尾 `/`，diff 游标路径也不变。
+查找可用 `.` 或 `..` 结尾，变更操作拒绝这两个末尾组件，避免将保留名称写入
+目录项。此项记录 daemon namespace 语义，不代表原生挂载路径能力升级。末尾 `/` 的
+基线失败与当前结果见[专用验收记录](evidence/2026-11-15-trailing-directory-paths.json)。
+`.`、`..` 和重复分隔符的历史验收仍见
+[physical path components evidence](evidence/2026-11-14-physical-path-components.json)；该记录不代表末尾 `/` 的当前行为。
 
 inode RPC 的路径查找可复用已观察到的路径提示；每次都在当前 World/revision
 重新解析并核对 inode ID，最终符号链接不跟随。经过物理非规范点组件或重复分隔符

@@ -517,7 +517,11 @@ walks to its physical parent. No host path is opened to resolve a symlink. Trave
 allows at most 40 followed links and 64 KiB cumulative target expansion. Targets
 are 1..4096 bytes of valid UTF-8, component length at most 255 bytes; repeated slashes
 and dot components are supported inside targets. A target's trailing slash requires
-a directory. Ordinary external paths retain the prototype's strict path rules.
+a directory. Existing-object Namespace paths may end in `/` for queries and
+path metadata/content operations, requiring the final result to be a directory;
+parent-based mutations and creation paths continue to reject it. The focused
+regression is [`forkfsd_trailing_paths_test`](../docs/evidence/2026-11-15-trailing-directory-paths.json);
+this does not establish native mount behavior.
 
 The original inode schema FFINOD01 added type=3 in its 48-byte record; its
 content object contains target bytes and size is target byte length. New lstat/stat
@@ -1045,9 +1049,11 @@ internal prefix `NUL + forkfs/` is reserved against generic PUT/batch mutation.
 
 The prototype supports regular files up to 1 TiB, directories, modes 0644/0755,
 mtime/ctime, and absolute paths with valid UTF-8 components up to 255 bytes
-(raw path up to 4096 bytes, including dots and repeated separators). A trailing
-slash remains unsupported. Lookup may end in `.` or `..`, but mutations reject
-those terminal components so they cannot become directory-entry keys. Names and
+(raw path up to 4096 bytes, including dots and repeated separators). Existing-object
+queries and path metadata/content operations accept a trailing slash and require
+a directory result; parent-based mutations and creation paths continue to reject it.
+Lookup may end in `.` or `..`, but mutations reject those terminal components so
+they cannot become directory-entry keys. Names and
 symlink targets preserve their original UTF-8 bytes: case and canonically
 equivalent NFC/NFD spellings remain distinct.
 There is no Unicode normalization or case folding. C0 controls, DEL and C1 controls,

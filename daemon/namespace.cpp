@@ -190,14 +190,13 @@ std::string read_volume_name(const NamespaceView& view) {
 void valid_xattr_name(const std::string& name) {
     need(!name.empty(),"invalid empty extended attribute name");need(name.size()<=255,"extended attribute name exceeds 255 bytes");valid_namespace_text(name);
 }
-std::vector<std::string> components(const std::string& path) {
+std::vector<std::string> components(const std::string& path,bool allow_trailing=false) {
     need(!path.empty() && path[0]=='/',"path must be absolute");
     if(path.size()>4096)throw std::system_error(ENAMETOOLONG,std::generic_category(),"path exceeds 4096 bytes");
     std::vector<std::string> result;
     if(path=="/")return result;
-    // A final slash carries directory semantics that this namespace does not
-    // implement. Interior empty components are harmless separators.
-    need(path.back()!='/',"trailing slash is unsupported");
+    const bool trailing=path.back()=='/';
+    need(allow_trailing || !trailing,"trailing slash is unsupported");
     size_t begin=1;
     while(begin<path.size()) {
         auto end=path.find('/',begin);if(end==std::string::npos)end=path.size();
@@ -210,6 +209,9 @@ std::vector<std::string> components(const std::string& path) {
         if(end==path.size())break;
         begin=end+1;
     }
+    // Preserve the final slash's requirement that the resolved object be a
+    // directory by forcing physical traversal through a synthetic dot.
+    if(trailing && !result.empty())result.push_back(".");
     return result;
 }
 std::vector<std::string> target_components(const std::string& target) {
@@ -261,7 +263,7 @@ Parent parent(const NamespaceView& journal,const std::string& path,std::vector<s
 }
 std::string resolve(const NamespaceView& journal,const std::string& path,bool follow=true,Parent* missing=nullptr,
                     bool* followed_symlink=nullptr) {
-    auto names=components(path);return walk(journal,names,names.size(),nullptr,follow,missing,followed_symlink);
+    auto names=components(path,true);return walk(journal,names,names.size(),nullptr,follow,missing,followed_symlink);
 }
 InodeInfo created(InodeInfo n){n.accessed_ns=n.modified_ns;n.birth_ns=n.changed_ns;return n;}
 void touch(InodeInfo& n) {n.modified_ns=n.changed_ns=now();}
@@ -1349,7 +1351,7 @@ std::string Namespace::path_for_inode(const std::string& id) const {
             bool followed_symlink=false;
             // Inode RPCs append a child name to this path. A physical traversal
             // alias cannot be safely extended within the raw path byte budget.
-            bool canonical=hint->second.find("//")==std::string::npos &&
+            bool canonical=!hint->second.ends_with('/') && hint->second.find("//")==std::string::npos &&
                 hint->second.find("/./")==std::string::npos &&
                 hint->second.find("/../")==std::string::npos &&
                 !hint->second.ends_with("/.") && !hint->second.ends_with("/..");
