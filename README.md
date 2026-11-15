@@ -85,6 +85,8 @@ checkout integration or replacement for `world exec`. Regular files support up t
 per value. See [daemon commands, guarantees and limits](daemon/README.md).
 The [filesystem API compatibility matrix](docs/FILESYSTEM_API_COMPATIBILITY.md)
 tracks native syscall/application evidence, remaining gaps, and qualification order.
+Xattr existence errno behavior is documented with its focused regression record in
+the [xattr error evidence](docs/evidence/2026-11-15-xattr-existence-errors.json).
 
 The C++ namespace seek API and daemon `fs-hseek` RPC report `EINVAL` when a
 requested position is negative and `EOVERFLOW` when it exceeds signed 64-bit

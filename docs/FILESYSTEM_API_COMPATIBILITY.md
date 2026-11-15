@@ -37,7 +37,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `link/symlink/readlink`、dangling symlink、`O_SYMLINK` | createLink/createSymbolicLink/readSymbolicLink | 挂载已测；包含链接身份、nofollow 时间/模式、`cp -Pp` 和二进制 xattr |
 | `readdir/getdirentries`、目录游标与属性 | enumerateDirectory → captured cursor | 挂载已测 66,000 项及 telldir/seekdir；前端按页读取，无旧 65,536 上限；64 个快照流，回调已测跨页删除/回退和淘汰游标 |
 | UTF-8、大小写、NFC/NFD、长名字 | FSFileName → namespace validation | 挂载已测；区分大小写及 NFC/NFD，255 字节/组件、4096 字节/路径；非法 UTF-8/控制符拒绝 |
-| `get/set/list/remove xattr`、fd/nofollow xattr | XattrOperations | 挂载已测；每值 262143 字节、每 inode 128 项、总值 8 MiB；ResourceFork 整值已测，`cp -p`/位置读取仍 EINVAL，不能称完整 fork 兼容 |
+| `get/set/list/remove xattr`、fd/nofollow xattr | XattrOperations | 挂载已测；每值 262143 字节、每 inode 128 项、总值 8 MiB；Namespace/C++ and raw RPC existence errors are typed (`ENOATTR` on macOS, `ENODATA` elsewhere; `EEXIST` for create-existing); focused CTest/RPC regression evidence [here](evidence/2026-11-15-xattr-existence-errors.json). This does not establish native FSKit errno mapping. ResourceFork whole-value operations are covered, but `cp -p`/position reads still return `EINVAL`, so full fork compatibility is not claimed. |
 | `mmap(MAP_SHARED/MAP_PRIVATE)`、`msync`、`munmap` | 内核缓存 + ReadWriteOperations | macOS 27.2 单挂载已测；映射/`pread/pwrite` 一致性、private 隔离、open-unlink、flush 后 revision 隔离 |
 | `fcntl(F_SETLK)`、`flock` | 内核原生 advisory locks；与 RPC 锁分开 | macOS 27.2 跨进程互斥、关闭/退出释放已测；byte-range 不相交范围可同时持有。新增挂载验收共享锁并存/排他冲突、阻塞唤醒、dup 关闭释放差异和 F_SETLKW 信号 EINTR；公平性/死锁/OFD locks 未验收 |
 | `fsync`、目录同步、`F_FULLFSYNC`、断电恢复 | synchronize → inode-sync + 存储提交 | 挂载已测文件/元数据和目录 fsync、目录改名后的 fd、原子保存和被替换旧 fd；F_FULLFSYNC/F_BARRIERFSYNC 请求返回成功。全硬件屏障、断电/内核崩溃仍无完整保证 |

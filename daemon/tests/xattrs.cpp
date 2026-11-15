@@ -2,10 +2,25 @@
 #include "metadata_view.h"
 #include <filesystem>
 #include <iostream>
+#include <cerrno>
+#include <system_error>
 #include <unistd.h>
 using forkfs::Container;using forkfs::Namespace;using Bytes=std::vector<unsigned char>;
 static void check(bool ok){if(!ok)throw std::runtime_error("xattr check failed");}
 template<class F> static void rejects(F f){bool failed=false;try{f();}catch(const std::exception&){failed=true;}check(failed);}
+static std::string logical_state(const std::string& status){
+    std::string result;for(const auto* field:{"last_committed_seq","object_roots","indexed_objects"}){
+        auto key=std::string("\"")+field+"\":";auto p=status.find(key);check(p!=status.npos);p+=key.size();auto e=status.find_first_of(",}",p);check(e!=status.npos);result.append(status,p,e-p);result.push_back('|');
+    }return result;
+}
+static int missing_error(){
+#ifdef ENOATTR
+    return ENOATTR;
+#else
+    return ENODATA;
+#endif
+}
+template<class F> static void rejects_errno(F f,int expected){int error=0;try{f();}catch(const std::system_error& e){if(e.code().category()==std::generic_category())error=e.code().value();}check(error==expected);}
 // Freeze inode bytes while changing an xattr leaf: diff must use object IDs,
 // including when a clock has not advanced between metadata publications.
 static void attribute_identity(const std::string& path){
@@ -79,15 +94,19 @@ int main(){
         attribute_identity(path+"-identity");Container::create(path);
         {
             Container store(path);Namespace fs(store);fs.initialize();fs.write("/file",Bytes{'D'});fs.link("/file","/alias");fs.mkdir("/dir");fs.symlink("/file","/link");
-            check(fs.list_xattrs("/file").empty());rejects([&]{fs.get_xattr("/file","user.test");});
+            check(fs.list_xattrs("/file").empty());rejects_errno([&]{fs.get_xattr("/file","user.test");},missing_error());
             auto before=fs.stat("/file");Bytes binary{'a',0,0xff};fs.set_xattr("/file","user.test",binary,Namespace::XattrPolicy::Create);
             auto after=fs.stat("/file");check(after.xattrs && after.mode==before.mode && after.size==before.size && after.modified_ns==before.modified_ns);
             check(fs.get_xattr("/alias","user.test")==binary);auto stable=store.status();
-            rejects([&]{fs.set_xattr("/file","user.test",{},Namespace::XattrPolicy::Create);});
-            rejects([&]{fs.set_xattr("/file","user.missing",{},Namespace::XattrPolicy::Replace);});
-            rejects([&]{fs.remove_xattr("/file","user.missing");});check(store.status()==stable);
+            auto before_missing=fs.stat("/file");auto bytes_before=fs.read("/file");auto logical_before=logical_state(store.status());
+            rejects_errno([&]{fs.set_xattr("/file","user.test",{},Namespace::XattrPolicy::Create);},EEXIST);
+            rejects_errno([&]{fs.set_xattr("/file","user.missing",{},Namespace::XattrPolicy::Replace);},missing_error());
+            rejects_errno([&]{fs.remove_xattr("/file","user.missing");},missing_error());
+            auto after_missing=fs.stat("/file");check(logical_state(store.status())==logical_before && fs.read("/file")==bytes_before && fs.get_xattr("/file","user.test")==binary);
+            check(fs.list_xattrs("/file")==std::vector<std::string>{"user.test"} && before_missing.changed_ns==after_missing.changed_ns && before_missing.modified_ns==after_missing.modified_ns && before_missing.accessed_ns==after_missing.accessed_ns && before_missing.birth_ns==after_missing.birth_ns && before_missing.size==after_missing.size);
             fs.set_xattr("/file","empty",{});check(fs.get_xattr("/file","empty").empty());fs.remove_xattr("/alias","empty");
             fs.set_xattr("/dir","目录📄",binary);fs.set_xattr("/link","user.test",Bytes{'L'});fs.set_xattr("/","root.attr",{});
+            rejects_errno([&]{fs.get_xattr("/dir","absent");},missing_error());rejects_errno([&]{fs.get_xattr("/link","absent");},missing_error());
             check(fs.get_xattr("/file","user.test")==binary && fs.get_xattr("/link","user.test")==Bytes{'L'});
             fs.verify();fs.snapshot("base");fs.fork("base","work");Namespace old(store,"base",true),work(store,"work");
             work.set_xattr("/alias","user.test",Bytes{'W'},Namespace::XattrPolicy::Replace);work.remove_xattr("/dir","目录📄");
@@ -101,7 +120,16 @@ int main(){
             check(store.status()==stable);fs.set_xattr("/quota","a0",Bytes(forkfs::maximum_xattr_bytes,0xff),Namespace::XattrPolicy::Replace);check(fs.get_xattr("/quota","a0")==Bytes(forkfs::maximum_xattr_bytes,0xff));
             fs.remove_xattr("/quota","a1");fs.set_xattr("/quota",std::string(255,'n'),{});check(fs.list_xattrs("/quota").size()==Namespace::maximum_xattr_count);
             auto quota=fs.open("/quota",Namespace::Access::Read);fs.remove("/quota",false);check(fs.handle_list_xattrs(quota).size()==Namespace::maximum_xattr_count);fs.verify();fs.close(quota);
+            auto linked_ro=fs.open("/file",Namespace::Access::Read);rejects_errno([&]{fs.handle_get_xattr(linked_ro,"absent");},missing_error());fs.close(linked_ro);
             auto handle=fs.open("/file",Namespace::Access::Read);fs.remove("/file",false);fs.remove("/alias",false);
+            auto orphan_before=fs.handle_stat(handle);auto orphan_state=logical_state(store.status());auto cursor_before=fs.seek(handle,0,Namespace::Seek::Current);
+            rejects_errno([&]{fs.handle_get_xattr(handle,"absent");},missing_error());
+            rejects_errno([&]{fs.handle_remove_xattr(handle,"absent");},missing_error());
+            rejects_errno([&]{fs.handle_set_xattr(handle,"absent",{},Namespace::XattrPolicy::Replace);},missing_error());
+            rejects_errno([&]{fs.handle_set_xattr(handle,"user.test",{},Namespace::XattrPolicy::Create);},EEXIST);
+            auto orphan_after=fs.handle_stat(handle);
+            check(logical_state(store.status())==orphan_state && fs.seek(handle,0,Namespace::Seek::Current)==cursor_before && fs.handle_read(handle,0,UINT64_MAX)==Bytes{'D'});
+            check(orphan_before.changed_ns==orphan_after.changed_ns && orphan_before.modified_ns==orphan_after.modified_ns && orphan_before.accessed_ns==orphan_after.accessed_ns && orphan_before.size==orphan_after.size && fs.handle_get_xattr(handle,"user.test")==binary && fs.handle_list_xattrs(handle)==std::vector<std::string>{"user.test"});
             check(fs.handle_get_xattr(handle,"user.test")==binary);fs.handle_set_xattr(handle,"user.test",Bytes{'O'});fs.handle_remove_xattr(handle,"user.test");
             check(fs.handle_list_xattrs(handle).empty() && !fs.handle_stat(handle).xattrs);fs.handle_set_xattr(handle,"new.orphan",{});
             check(fs.handle_get_xattr(handle,"new.orphan").empty() && fs.handle_stat(handle).xattrs);fs.write("/file",Bytes{'N'});check(fs.list_xattrs("/file").empty());fs.verify();fs.close(handle);
