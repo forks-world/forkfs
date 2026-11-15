@@ -1,5 +1,6 @@
 """Resident namespace protocol, framing limits, isolation and restart."""
 from concurrent.futures import ThreadPoolExecutor
+import errno
 import json
 import os
 from pathlib import Path
@@ -166,7 +167,12 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
                        b'FFRPC001'+struct.pack('<I',4)+struct.pack('<I',17),
                        frame(['fs-mkdir','/partial'])[:-1]]:
             with socket.socket(socket.AF_UNIX) as s:
-                s.settimeout(5);s.connect(str(endpoint));s.sendall(packet);s.shutdown(socket.SHUT_WR)
+                s.settimeout(5);s.connect(str(endpoint));s.sendall(packet)
+                # The daemon may reject and close a malformed frame before
+                # the client half-closes; truncated requests still need EOF.
+                try:s.shutdown(socket.SHUT_WR)
+                except OSError as e:
+                    if e.errno!=errno.ENOTCONN:raise
                 code,_=response(s);assert code!=0
         assert json.loads(cli('status'))['last_committed_seq']==before
         # An idle client cannot hold up other requests.
