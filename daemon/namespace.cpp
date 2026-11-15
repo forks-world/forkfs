@@ -255,8 +255,10 @@ std::string walk(const NamespaceView& journal,const std::vector<std::string>& na
     }
     if(ancestry)*ancestry=stack;return id;
 }
-Parent parent(const NamespaceView& journal,const std::string& path,std::vector<std::string>* ancestry=nullptr) {
-    auto names=components(path);need(!names.empty(),"cannot modify filesystem root");
+Parent parent(const NamespaceView& journal,const std::string& path,std::vector<std::string>* ancestry=nullptr,bool allow_trailing=false) {
+    auto names=components(path,allow_trailing);
+    if(allow_trailing && path.back()=='/' && !names.empty())names.pop_back();
+    need(!names.empty(),"cannot modify filesystem root");
     need(names.back()!="." && names.back()!="..","invalid terminal path component");
     auto id=walk(journal,names,names.size()-1,ancestry);need(inode(journal,id).directory,"parent is not a directory");
     return {id,names.back(),entry_key(id,names.back())};
@@ -831,7 +833,7 @@ void Namespace::set_volume_name(const std::string& name) {
 void Namespace::mkdir(const std::string& path,uint32_t mode) {
     need(mode<=0777,"invalid creation mode");
     update([&](const NamespaceView& j,Changes& c) {
-        auto p=parent(j,path);need(!j.contains(p.key),"path already exists");
+        auto p=parent(j,path,nullptr,true);need(!j.contains(p.key),"path already exists");
         auto id=new_id(j);InodeInfo n=created({id,true,mode,2,0,now(),now()}),pn=inode(j,p.id);mutable_inode(pn);
         link_capacity(pn.links);++pn.links;touch(pn);
         c[p.key]=id_bytes(id);c[inode_key(id)]=encode(n);c[inode_key(p.id)]=encode(pn);c[allocated_key(id)]=Bytes{};

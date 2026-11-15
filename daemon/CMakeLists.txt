@@ -302,6 +302,14 @@ target_link_libraries(forkfsd_trailing_paths_test PRIVATE forkfs_metadata)
 add_test(NAME forkfsd_trailing_paths COMMAND forkfsd_trailing_paths_test)
 set_tests_properties(forkfsd_trailing_paths PROPERTIES TIMEOUT 120)
 
+add_executable(forkfsd_mkdir_trailing_test tests/mkdir_trailing.cpp
+    $<TARGET_OBJECTS:forkfs_common> $<TARGET_OBJECTS:forkfs_container_obj>
+    $<TARGET_OBJECTS:forkfs_compaction_obj>)
+target_include_directories(forkfsd_mkdir_trailing_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(forkfsd_mkdir_trailing_test PRIVATE forkfs_metadata)
+add_test(NAME forkfsd_mkdir_trailing COMMAND forkfsd_mkdir_trailing_test)
+set_tests_properties(forkfsd_mkdir_trailing PROPERTIES TIMEOUT 120)
+
 add_executable(forkfsd_metadata_tree_test tests/metadata_tree.cpp $<TARGET_OBJECTS:forkfs_metadata_tree_obj> $<TARGET_OBJECTS:forkfs_journal_obj> $<TARGET_OBJECTS:forkfs_level_obj>)
 target_include_directories(forkfsd_metadata_tree_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(forkfsd_metadata_tree_test PRIVATE leveldb Threads::Threads)

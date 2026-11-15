@@ -76,6 +76,7 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         assert json.loads(raw(['status'],fragment=True))['storage_engine']=='leveldb'
         cli('fs-init');cli('fs-mkdir','/src')
         raw(['fs-write','/rpc-file',b'R'])
+        raw(['fs-symlink','/rpc-file','/file-link'])
         raw(['fs-symlink','/src','/trail-alias'])
         raw(['fs-symlink','/missing-trailing-target','/trail-dangling'])
         raw(['fs-symlink','/trail-loop','/trail-loop'])
@@ -94,13 +95,24 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         cli('fs-write','/src/file',data)
         assert raw(['fs-cat','/src/file'])==payload
         raw(['fs-mkdir','/src/sub']);raw(['fs-symlink','/src/sub','/physical-alias'])
+        raw(['fs-snapshot','before-trailing-mkdir'])
         assert json.loads(raw(['fs-stat','/physical-alias/../file']))['inode_id']==json.loads(raw(['fs-stat','/src/file']))['inode_id']
         raw(['fs-mkdir','/src//./created']);assert json.loads(raw(['fs-stat','/src/created']))['directory']
+        raw(['fs-mkdir','/src/trailing///']);assert json.loads(raw(['fs-stat','/src/trailing']))['directory']
+        raw(['fs-mkdir','/physical-alias/../trailing-physical///']);assert json.loads(raw(['fs-stat','/src/trailing-physical']))['directory']
+        raw(['fs-rmdir','/src/trailing']);raw(['fs-rmdir','/src/trailing-physical'])
         raw(['fs-rmdir','/src/created']);raw(['fs-unlink','/physical-alias']);raw(['fs-rmdir','/src/sub'])
         before_invalid=json.loads(raw(['status']))['last_committed_seq']
-        for invalid in ['/src/.','/src/..','/missing/../child','/src/file/../child','/src/trailing/']:
-            raw(['fs-mkdir',invalid],ok=False)
+        src_before=json.loads(raw(['fs-stat','/src']));listing_before=raw(['fs-ls','/src'])
+        for invalid in ['/src/.','/src/./','/src/..','/missing/../child','/src/file/../child','/src/','/rpc-file/','/file-link/','/trail-alias/','/trail-dangling/','/missing/child/','/rpc-file/child/']:
+            raw(['fs-mkdir',invalid],ok=False,expected_code=1)
+        raw(['fs-mkdir','/src/'+('/'*4092)],ok=False,expected_code=errno.ENAMETOOLONG+1)
+        raw(['fs-mkdir','/src/'+('x'*256)+'/'],ok=False,expected_code=errno.ENAMETOOLONG+1)
         assert json.loads(raw(['status']))['last_committed_seq']==before_invalid
+        src_after=json.loads(raw(['fs-stat','/src']));assert src_after['links']==src_before['links'] and src_after['modified_ns']==src_before['modified_ns'] and src_after['changed_ns']==src_before['changed_ns']
+        assert raw(['fs-ls','/src'])==listing_before
+        for created in ['/src/trailing','/src/trailing-physical']:
+            raw(['fs-stat',created,'--revision','before-trailing-mkdir'],ok=False,expected_code=1)
         # lstat seeds a long syntactic directory hint. inode-create appends a
         # child that would exceed 4096 bytes if the alias were reused.
         long_alias='/'+'./'*2041+'src/hinted'

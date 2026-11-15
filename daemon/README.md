@@ -518,10 +518,14 @@ allows at most 40 followed links and 64 KiB cumulative target expansion. Targets
 are 1..4096 bytes of valid UTF-8, component length at most 255 bytes; repeated slashes
 and dot components are supported inside targets. A target's trailing slash requires
 a directory. Existing-object Namespace paths may end in `/` for queries and
-path metadata/content operations, requiring the final result to be a directory;
-parent-based mutations and creation paths continue to reject it. The focused
-regression is [`forkfsd_trailing_paths_test`](../docs/evidence/2026-11-15-trailing-directory-paths.json);
-this does not establish native mount behavior.
+path metadata/content operations, requiring the final result to be a directory.
+`mkdir` also accepts one or more trailing slashes after validating the original
+path length and components. Other parent-based mutations and creation paths
+continue to reject trailing slashes. The focused regressions are
+`forkfsd_trailing_paths_test` and `forkfsd_mkdir_trailing_test`; the
+[mkdir trailing slash validation](../docs/evidence/2026-11-15-mkdir-trailing-slashes.json)
+records the exact scope. These Namespace tests do not establish native mount behavior
+or new typed errno mappings.
 
 The original inode schema FFINOD01 added type=3 in its 48-byte record; its
 content object contains target bytes and size is target byte length. New lstat/stat
@@ -1051,7 +1055,8 @@ The prototype supports regular files up to 1 TiB, directories, modes 0644/0755,
 mtime/ctime, and absolute paths with valid UTF-8 components up to 255 bytes
 (raw path up to 4096 bytes, including dots and repeated separators). Existing-object
 queries and path metadata/content operations accept a trailing slash and require
-a directory result; parent-based mutations and creation paths continue to reject it.
+a directory result. `mkdir` accepts trailing slashes after validating the original
+path bytes; other parent-based mutations and creation paths continue to reject them.
 Lookup may end in `.` or `..`, but mutations reject those terminal components so
 they cannot become directory-entry keys. Names and
 symlink targets preserve their original UTF-8 bytes: case and canonically
