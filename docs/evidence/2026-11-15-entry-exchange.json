@@ -1,0 +1,83 @@
+{
+  "title": "Atomic namespace entry exchange through daemon APIs",
+  "recorded_date": "2026-11-15",
+  "validated_base": "9647beabedc2788c4448ad8505061275fb7f0764",
+  "scope": [
+    "Namespace::exchange, resident fs-exchange SOURCE TARGET RPC, and offline fs-exchange CONTAINER SOURCE TARGET",
+    "Atomic swap of two existing final directory entries without following final symlinks; supports files, directories, symlinks, and nonempty directories",
+    "Both directory-cycle directions, same-parent and cross-parent net link accounting, synthetic modern-backend EMLINK boundaries, and failure atomicity",
+    "Immutable/append-only checks on both objects and both parents before same-entry/same-inode no-op handling",
+    "Modern and legacy C++ path tests cover hardlinks, dangling symlinks, mixed types, revision isolation, reopen, and verification; modern tests additionally cover both open files, duplicated handles, nonzero shared cursors, writes through exchanged handles, and GC",
+    "RPC/CLI coverage includes success, missing inputs, malformed RPC arity, and a resident mount lease; baseline probes assert RPC and offline CLI rejection with inode IDs, metadata (full RPC stat; offline stat excluding changed_ns), data, and namespace root state unchanged"
+  ],
+  "fixed_validation": {
+    "status": "passed",
+    "configuration": "Release WFS_FSKIT=ON",
+    "clean_first": true,
+    "ctest": {
+      "passed": 72,
+      "failed": 0,
+      "seconds": 114.1,
+      "new_targets": [
+        "forkfsd_exchange",
+        "forkfsd_exchange_rpc"
+      ]
+    },
+    "dependencies": {
+      "result": "passed",
+      "targets": [
+        "daemon",
+        "ForkFSExtension",
+        "ForkFSHost"
+      ],
+      "system_dependency_counts": {
+        "daemon": 2,
+        "extension": 7,
+        "host": 4
+      }
+    },
+    "source_sha256_at_validation": {
+      "daemon/CMakeLists.txt": "75cb8a813c205db4cb30c23bde03c0547e3f77603f587ede793d8e9635f6f588",
+      "daemon/namespace.cpp": "ba658f282d2990931d908e071bb487016aaf359ab949e20854931f9f28c858d1",
+      "daemon/namespace.h": "4e6f99fc819e7985bce9cb8ce1c9115ae89afd43673d59b2a817891d20b08eed",
+      "daemon/rpc.cpp": "ffa5fc5a69daa450413f3693b463b0e0e7d4ddee4fba6c0148ccb6ed30e328ba",
+      "daemon/main.cpp": "978924436f9024ddb91cc0ea4135bb8961932d59880ba134e441a71702d763cb",
+      "daemon/tests/exchange.cpp": "6c4cbeba585106b8732be32c73aa1b78f926f8676667d100f073cca6bd7744ab",
+      "daemon/tests/exchange_rpc.py": "508c825cf2e6b3d406f0bc4bb6fabcfdefee598f6771eab1b00a1fb2c7667d1f"
+    },
+    "daemon_sha256": "833ffc4a85d6461ebf15da6edb9a3b73135de62171763c532df42377d9d145ae",
+    "cpp_test_sha256": "0a9a9ab55f3f9f91454cbf21ff43ccb0d2cc26c63b295bee66d650315250de01",
+    "validate_log_sha256": "b724c761d2c9abd72e593ace775ab280be5767bde941efd7502e995d90f4502a",
+    "ctest_log_sha256": "24480105ec6670566fafa25937ba2d1aa1028a6ba76c71500614154ef19d3fd7",
+    "execution_root": "/private/tmp/fs128-exec-ex3l5aul"
+  },
+  "baseline_probe": {
+    "status": "passed; unsupported RPC and offline CLI commands rejected without state change",
+    "base": "9647beabedc2788c4448ad8505061275fb7f0764",
+    "runtime_source_sha256": {
+      "daemon/namespace.cpp": "fc4d0c25ea12636916d4df2da5964fb1f6dbf6e65479e6dcc394d3e4dab85342",
+      "daemon/namespace.h": "84b827bb69b23763ad10821425fab1c6ff562be72f51839d5e8e2bf0a29edf86",
+      "daemon/rpc.cpp": "0bc587b59379c29dd96fb9f350c2b0d41464ecf57adcedbadd2aa8fd2b20e5bf",
+      "daemon/main.cpp": "98b9311f35b2cc399d208872dcf31a20d1efb5918a98fcb83d1d61a5ad4214d0"
+    },
+    "daemon_sha256": "615bda542af99725da44a12046cb402c319a82392b5067f46550dedefd719c18",
+    "build_exit_code": 0,
+    "harness_sha256": "508c825cf2e6b3d406f0bc4bb6fabcfdefee598f6771eab1b00a1fb2c7667d1f",
+    "exit_code": 0,
+    "outcome": {
+      "data_unchanged": true,
+      "inode_ids_unchanged": true,
+      "mode": "expect-unsupported",
+      "offline_cli_rejected": true,
+      "root_state_unchanged": true,
+      "rpc_rejected": true
+    },
+    "log_sha256": "b0f46aa347fdd5dfebdea21e072b220838d26d0ce788bc2fe8617310b5d18f22",
+    "qualification": "The new C++ Namespace method did not exist on baseline, so no baseline C++ test was attempted."
+  },
+  "explicit_exclusions": [
+    "No FSKit callback or native mounted RENAME_SWAP/renamex_np implementation is included or claimed.",
+    "No native syscall or macOS APFS exchange compatibility result is claimed.",
+    "The baseline differential covers resident RPC and offline CLI only; the C++ API did not exist on baseline."
+  ]
+}

@@ -1119,6 +1119,32 @@ void Namespace::rename(const std::string& source,const std::string& target) {
         for(auto& [parent_id,pn]:parents){touch(pn);c[inode_key(parent_id)]=encode(pn);}
     });
 }
+void Namespace::exchange(const std::string& source,const std::string& target) {
+    update([&](const NamespaceView& j,Changes& c) {
+        std::vector<std::string> source_ancestry,target_ancestry;
+        auto src=parent(j,source,&source_ancestry);need(j.contains(src.key),"source not found");auto source_id=decode_id(j.get(src.key));auto source_inode=inode(j,source_id);
+        auto dst=parent(j,target,&target_ancestry);need(j.contains(dst.key),"target not found");auto target_id=decode_id(j.get(dst.key));auto target_inode=inode(j,target_id);
+        mutable_metadata(source_inode);mutable_metadata(target_inode);
+        auto source_parent=inode(j,src.id),target_parent=inode(j,dst.id);
+        mutable_metadata(source_parent);mutable_metadata(target_parent);
+        if(src.key==dst.key || source_id==target_id)return;
+        need(!source_inode.directory || std::find(target_ancestry.begin(),target_ancestry.end(),source_id)==target_ancestry.end(),"cannot move directory into itself");
+        need(!target_inode.directory || std::find(source_ancestry.begin(),source_ancestry.end(),target_id)==source_ancestry.end(),"cannot move directory into itself");
+        const int delta_source=int(target_inode.directory)-int(source_inode.directory);
+        const int delta_target=-delta_source;
+        if(src.id!=dst.id) {
+            if(delta_source>0)link_capacity(source_parent.links+delta_source-1);
+            if(delta_target>0)link_capacity(target_parent.links+delta_target-1);
+            source_parent.links=static_cast<uint64_t>(int64_t(source_parent.links)+delta_source);
+            target_parent.links=static_cast<uint64_t>(int64_t(target_parent.links)+delta_target);
+        }
+        c[src.key]=id_bytes(target_id);c[dst.key]=id_bytes(source_id);
+        auto time=now();source_inode.changed_ns=time;target_inode.changed_ns=time;
+        c[inode_key(source_id)]=encode(source_inode);c[inode_key(target_id)]=encode(target_inode);
+        if(src.id==dst.id){touch(source_parent);c[inode_key(src.id)]=encode(source_parent);}
+        else {touch(source_parent);touch(target_parent);c[inode_key(src.id)]=encode(source_parent);c[inode_key(dst.id)]=encode(target_parent);}
+    });
+}
 void Namespace::verify() const {
     std::lock_guard lock(container_.mutex_);verify_locked();
 }

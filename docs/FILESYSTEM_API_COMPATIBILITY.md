@@ -33,6 +33,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `chown/fchown`、setuid/setgid/sticky、ACL | inode metadata + access checks | 缺失；uid/gid 来自服务用户，拒绝更换属主，无 ACL，不是多用户文件系统 |
 | `access/faccessat`、目录搜索权限、只读 fd 权限 | 内核权限判断；未接 AccessCheckOperations | 挂载已测单用户 mode 000/0400、access、目录搜索/写权限、拒绝 truncate/创建/unlink、chmod 不撤销已开 fd；faccessat/组权限/多用户未验收 |
 | `mkdir/rmdir/unlink`、普通 `rename`、原子保存 | create/remove/rename → 原子 namespace 提交 | 挂载已测；失败 errno 与状态不变需按操作继续扩充。直接 RPC 错误码修复另见 PR #95 |
+| daemon `Namespace::exchange`、RPC/离线 CLI `fs-exchange` | 一次 namespace 事务交换两个现存目录项 | daemon API 已测；支持文件、目录、符号链接及非空目录，交换最终符号链接项而不跟随；不提供原生 FSKit 或 `renamex_np(RENAME_SWAP)` 支持，见下方 entry-exchange 记录 |
 | `renamex_np/renameatx_np(RENAME_EXCL/RENAME_SWAP)`、交换/排他 rename | FSKit 平台限制 | 原生实测 SWAP、EXCL 到不存在目标均 ENOTSUP；EXCL 目标已存在时内核先返回 EEXIST。旧 Operations 和新 Handler 都不提供 flags 回调，不能只补 daemon 或迁移 Handler 解决 |
 | `link/symlink/readlink`、dangling symlink、`O_SYMLINK` | createLink/createSymbolicLink/readSymbolicLink | 挂载已测；包含链接身份、nofollow 时间/模式、`cp -Pp` 和二进制 xattr |
 | `readdir/getdirentries`、目录游标与属性 | enumerateDirectory → captured cursor | 挂载已测 66,000 项及 telldir/seekdir；前端按页读取，无旧 65,536 上限；64 个快照流，回调已测跨页删除/回退和淘汰游标 |
@@ -122,6 +123,40 @@ claimed. The raw-Journal orphan range-erasure fallback was source-reviewed but
 not independently forced by a dedicated test. The baseline C++ API did not
 exist, so the baseline probe covers RPC and CLI rejection only. See the
 [hole-punch regression and build record](evidence/2026-11-15-hole-punch.json).
+
+### Entry exchange (daemon APIs only)
+
+`Namespace::exchange(source, target)`, resident RPC `fs-exchange SOURCE TARGET`,
+and offline `fs-exchange CONTAINER SOURCE TARGET` atomically swap two existing
+directory entries in one namespace update. The final entries are exchanged
+without following symlinks; both paths must exist. Files, directories, symlinks,
+and nonempty directories are supported. Exchanging directories checks for cycles
+in both directions. Cross-parent directory swaps adjust each parent's link count
+by the net directory-type change; same-parent swaps and cross-parent directory
+for-directory swaps have zero net change, including at the link limit.
+
+Both entries and both parents pass immutable/append-only metadata checks before
+same-entry or same-inode no-op handling. Successful exchanges preserve inode
+identity, payload, mode, mtime, xattrs and hard-link counts, update exchanged
+inodes' change time, and touch each affected parent once. Existing handles remain
+bound to their inode. Missing paths, malformed/reserved paths, directory cycles,
+and writes through a revision retain existing generic error behavior; capacity,
+immutable/append-only, and mount-lease errors retain their typed errno behavior.
+
+The C++ regression covers modern LevelDB and legacy storage for path exchange,
+hardlinks, dangling symlinks, mixed types, nonempty directories, both cycle
+directions, same-entry/same-inode no-ops, protection checks, revision isolation,
+reopen and verification. The modern backend additionally covers both exchanged open files,
+duplicated handles and nonzero shared cursors, GC, and synthetic link-count
+capacity boundaries. RPC/CLI tests cover success, malformed/missing inputs,
+mount-lease refusal, and baseline rejection with inode IDs, metadata, data, and
+root state unchanged. The API, tests and validation result are recorded in the
+[entry-exchange evidence](evidence/2026-11-15-entry-exchange.json).
+
+This is a daemon namespace capability only. No FSKit callback, native
+`RENAME_SWAP`/`renamex_np` implementation, or mounted exchange behavior is
+implemented or claimed. The baseline C++ Namespace API did not exist; baseline
+differential probes cover RPC and offline CLI only.
 
 当前类使用 macOS 26 的 Operations 协议，具体实现见
 [`RevisionVolume.h`](../macos/forkfs/RevisionVolume.h) 和
