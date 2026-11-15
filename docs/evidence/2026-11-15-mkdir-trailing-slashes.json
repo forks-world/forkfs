@@ -1,0 +1,134 @@
+{
+  "title": "mkdir trailing slash namespace behavior",
+  "validated_base": "3ddb0d38eff3daddeed6ddeb9f6f27a6190c658e",
+  "scope": [
+    "Namespace mkdir accepts one or more trailing slashes after the original raw path and every component have passed existing length and text validation.",
+    "Only the parser-added terminal dot is removed for mkdir; root paths and original terminal dot/dot-dot remain rejected.",
+    "Other parent-based mutations, create-style open, and revision diff cursor paths retain their prior trailing slash rejection behavior.",
+    "No new typed errno mapping or native mount capability is claimed."
+  ],
+  "coverage": {
+    "modern_and_legacy_cpp": true,
+    "modern_gc_and_reopen": true,
+    "mode_parent_links_times_listing_and_snapshot_atomicity": true,
+    "raw_length_4096_accepts_and_4097_rejects_before_separator_collapse": true,
+    "component_length_256_rejected_as_enametoolong": true,
+    "rpc_generic_rejection_wire_code": 1,
+    "rpc_wire_codes": {
+      "generic_rejection": 1,
+      "ENAMETOOLONG": 64
+    },
+    "targeted_test_names": [
+      "forkfsd_namespace",
+      "forkfsd_rpc",
+      "forkfsd_trailing_paths",
+      "forkfsd_mkdir_trailing"
+    ]
+  },
+  "baseline": {
+    "status": "expected failure",
+    "source_sha256": {
+      "daemon/namespace.cpp": "51eba35330ad83b9bf3a58b86e4dc1fa99ed8263d6bf1934f46ef42e02c544a0"
+    },
+    "daemon_sha256": "81b25098b4e8450b4020ff7a1ac59f99a2e1f7ac98fac16350d318b02fba08b4",
+    "cpp_binary_sha256": "b76cdf740b0bd295a46ba3f7059e70704dca4c63328bbff85a31e7835afc6097",
+    "cpp_exit_code": 1,
+    "cpp_log": "/private/tmp/fs126-exec-y82cgkyd/baseline-cpp.log",
+    "cpp_log_sha256": "98e90a165f013929b216243531c280c16ecaf56244d9c1cade684de20b29cda9",
+    "rpc_exit_code": 1,
+    "rpc_log": "/private/tmp/fs126-exec-y82cgkyd/baseline-rpc.log",
+    "rpc_log_sha256": "0de01fb6ce15ca5e7ef3eb28e6e5da33156c67573f2789de1d3d00b33a7fbc95",
+    "observed": "C++ mkdir /parent/new/// and raw fs-mkdir /src/trailing/// reject trailing slash as unsupported; raw wire1.",
+    "limitation": "Each baseline regression stopped at its first unsupported mkdir path; this is not a baseline run of the complete added case matrix."
+  },
+  "validation": {
+    "source_sha256": {
+      "daemon/namespace.cpp": "a5999754fe467ae4a158defa867e24e313b2c8f8f177c573fc4e4b5b9f88c8d9",
+      "daemon/CMakeLists.txt": "bd06a7e7c0eb6bb3872d63bced0399987fc9bec814c51173f7f6395c7d8f92e6",
+      "daemon/tests/mkdir_trailing.cpp": "4b2999f83ef4775cc406d4e38edbbc3a533d83bf0a37468cb32f34427077f24c",
+      "daemon/tests/namespace.py": "80f9cc502265ac93654c50a624e29f742947b5c55dbbc1a8b9ea7882f3f1ba8f",
+      "daemon/tests/rpc.py": "7ed9cce9d737e7d629883b209a8f81b00eb67329a813e218f53b901d86bebbd4",
+      "daemon/tests/trailing_paths.cpp": "fa8ecfc5866c9644523a6491e3b3f293b94052c2cc3736c9922709486513f719"
+    },
+    "daemon_sha256": "1dcdde0b4a508416d50ad5bed707de0705fafde51cf88b69e7d5cef87080f124",
+    "cpp_binary_sha256": "fe776b3b4746e81eb9bdfd82db28774336853a80b39f6efe778d3c43413267a5",
+    "exit_code": 0,
+    "build_command": "cmake --build build --parallel 4 --clean-first",
+    "ctest": {
+      "passed": 68,
+      "failed": 0,
+      "seconds": 113.17
+    },
+    "targeted_ctest_lines": [
+      "18/68 Test #18: forkfsd_namespace ..................   Passed    1.15 sec",
+      "43/68 Test #44: forkfsd_rpc ........................   Passed    1.26 sec",
+      "53/68 Test #54: forkfsd_trailing_paths .............   Passed    1.52 sec",
+      "54/68 Test #55: forkfsd_mkdir_trailing .............   Passed    1.16 sec"
+    ],
+    "validation_log": "/private/tmp/fs126-exec-y82cgkyd/validate.log",
+    "validation_log_sha256": "fe2d6c9e5339bb7b658353091374881c061e106ff6467769111dbbc56fbe265b",
+    "dependency_check": "passed",
+    "dependency_counts": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "environment": {
+      "macos": "27.2.1",
+      "arch": "arm64",
+      "sdk": "27.2",
+      "build": "Release WFS_FSKIT=ON, Apple Clang"
+    }
+  },
+  "independent_host_reference": {
+    "scope": "Independent host mkdir syscall reference, not forkfs mount evidence",
+    "platform": "macOS-27.2.1-arm64-arm-64bit",
+    "sha256": "ccbed40223ff83a69ee9205e332d475497349de22a35c2da95602934580550b6",
+    "cases": [
+      {
+        "path": "new///",
+        "result": "created",
+        "mode": 448,
+        "directory": true
+      },
+      {
+        "path": "new/",
+        "result": "rejected",
+        "errno": 17
+      },
+      {
+        "path": "file/",
+        "result": "rejected",
+        "errno": 20
+      },
+      {
+        "path": "alias/",
+        "result": "rejected",
+        "errno": 17
+      },
+      {
+        "path": "file/child/",
+        "result": "rejected",
+        "errno": 20
+      },
+      {
+        "path": "missing/child/",
+        "result": "rejected",
+        "errno": 2
+      },
+      {
+        "path": "alias/linked///",
+        "result": "created",
+        "mode": 448,
+        "directory": true
+      },
+      {
+        "path": "real/sub/../physical///",
+        "result": "created",
+        "mode": 448,
+        "directory": true
+      }
+    ],
+    "caveat": "Host mkdir syscall outcomes are context only and are not forkfs Namespace, RPC, or mounted filesystem behavior. Host errno values, including ENOTDIR for file paths, are not claimed as forkfs namespace errno mappings."
+  }
+}

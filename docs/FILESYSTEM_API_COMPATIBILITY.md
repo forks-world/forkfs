@@ -56,11 +56,13 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 Namespace object resolution accepts a trailing slash for existing-object queries
 and metadata/content operations. The slash requires the resolved object to be a
 directory, including when the final component is a symlink to a directory;
-`lstat("/link/")` therefore follows that link for directory traversal. A
-trailing slash does not enable create, mkdir, remove, rename, or link destination
-paths. Namespace parent-path parsing and revision diff cursors also continue to
-reject it. See [trailing directory path regression evidence](evidence/2026-11-15-trailing-directory-paths.json).
-Native mount behavior is not established by this Namespace coverage.
+`lstat("/link/")` therefore follows that link for directory traversal. The
+`mkdir` command accepts trailing slashes after raw path and component limits are checked;
+create, remove, rename, link destination paths, and revision diff cursors continue
+to reject them. See [mkdir trailing slash validation](evidence/2026-11-15-mkdir-trailing-slashes.json).
+The earlier [trailing directory path regression](evidence/2026-11-15-trailing-directory-paths.json)
+documents existing-object resolution only, not mkdir support. Namespace behavior
+does not establish native mount semantics or new typed errno mappings.
 
 ### Seek error codes
 
@@ -131,11 +133,11 @@ Preallocate、DataCache 等独立评估；迁移 API 不自动补齐上表语义
 `/`，`..` 在 World 根目录钳制；不会跨符号链接做词法折叠。缺失前缀和普通文件
 后的 `..` 仍然失败。原始路径上限仍为 4096 字节（包含点组件及重复分隔符），
 组件上限仍为 255 字节。现存对象查询及路径元数据/内容操作接受末尾 `/`，并要求
-最终解析对象为目录；末尾符号链接因此按目录路径语义跟随。parent 路径创建、
-mkdir/remove/rename/link 和创建式 open 继续拒绝末尾 `/`，diff 游标路径也不变。
+最终解析对象为目录；末尾符号链接因此按目录路径语义跟随。
 查找可用 `.` 或 `..` 结尾，变更操作拒绝这两个末尾组件，避免将保留名称写入
-目录项。此项记录 daemon namespace 语义，不代表原生挂载路径能力升级。末尾 `/` 的
-基线失败与当前结果见[专用验收记录](evidence/2026-11-15-trailing-directory-paths.json)。
+目录项。只有 `mkdir` 接受末尾 `/`；其他 parent 路径创建、remove/rename/link、
+创建式 open 和 diff 游标路径仍拒绝。此项记录 daemon namespace 语义，不代表原生挂载路径能力升级。
+mkdir 的基线失败与当前结果见[专用验收记录](evidence/2026-11-15-mkdir-trailing-slashes.json)。
 `.`、`..` 和重复分隔符的历史验收仍见
 [physical path components evidence](evidence/2026-11-14-physical-path-components.json)；该记录不代表末尾 `/` 的当前行为。
 
