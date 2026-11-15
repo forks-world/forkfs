@@ -1,0 +1,61 @@
+{
+  "title": "Xattr existence errors",
+  "scope": [
+    "Namespace xattr get and remove of a missing name, and replace of a missing name, report ENOATTR on macOS and ENODATA elsewhere.",
+    "Creating an xattr whose name already exists reports EEXIST.",
+    "C++ Namespace errors use std::system_error with generic_category; raw RPC encodes the errno as errno + 1 for path, handle and inode xattr operations.",
+    "Only the four Xattrs existence checks changed. Name/policy/value validation and quota, protection, revision and handle policy ordering were preserved by source review."
+  ],
+  "explicit_exclusions": [
+    "No blanket translation of generic runtime errors to POSIX errnos.",
+    "No dedicated validation/protection/readonly/precedence probes are claimed; those paths were preserved by source review.",
+    "Cursor preservation was checked at the initial cursor position; no duplicate-handle shared-cursor or nonzero-cursor probe is claimed.",
+    "No native FSKit errno mapping or native mount test is claimed."
+  ],
+  "baseline": {
+    "base": "aeac4ee2793923969e68c4b1bd1b09fd8df7291a",
+    "runtime_source_sha256": {
+      "daemon/namespace.cpp": "60b264a2f827456532841f9f7c05e85cc0af5aae61de9187a63572cc52c4ab93"
+    },
+    "daemon_sha256": "fa4269beaf3a0e9f3081106020b459d2205c99602c571d5e0959e0ec6f6290d0",
+    "cpp_binary_sha256": "84413450c2a5ac4863ca8fb8b8adf6c61906ebb1b805b875e565d6ca427689e5",
+    "observed_cpp": "The final C++ regression binary stopped at missing get: the old implementation threw generic runtime_error rather than a typed xattr errno.",
+    "observed_raw_rpc": "The final raw RPC regression stopped at missing path get: the old server returned wire status 1 rather than ENOATTR + 1 on macOS.",
+    "cpp_log_sha256": "b784117c288da23cb90147e4e0f9eaab29c41ed3e4130d124dbb4a883b396f90",
+    "rpc_log_sha256": "7436de3e0d27fbe4166d3cd514ea08465140b6819207d7c57b65de94237ad4c4",
+    "qualification": "Only these first missing-get failures were independently observed on baseline; other baseline error cases are not claimed."
+  },
+  "fixed_validation": {
+    "source_sha256": {
+      "daemon/namespace.cpp": "673e1c9ca44fa5c7b1d6a0342965ab052ec10ec679330241a85f3345538fa1c3",
+      "daemon/tests/xattrs.cpp": "50f8614da2a54a2e63266006686449a4be63af0a4650588cdb73980f72ba6e3c",
+      "daemon/tests/xattr_rpc.py": "2d6b7b81d6b87e6dbdf3a9e2e4fefee858f57122f25ad7fa69870b6f37323fb1"
+    },
+    "daemon_sha256": "c027164cd61ec96ffc1521459c871a46af15d4be2eb7d9bf156a9946ea05be2e",
+    "cpp_binary_sha256": "54a6bbb8f81e2c06f4360844187b508571ee405e41cccaf9b27332bf87b8175d",
+    "exit_code": 0,
+    "ctest": {
+      "passed": 66,
+      "failed": 0,
+      "seconds": 114.16
+    },
+    "focused_ctest": [
+      " 2/66 Test  #2: forkfsd_symlink_handles ............   Passed    2.58 sec",
+      " 6/66 Test  #7: forkfsd_xattr_rpc ..................   Passed    2.18 sec",
+      "38/66 Test #39: forkfsd_xattrs .....................   Passed    4.41 sec",
+      "56/66 Test #57: forkfsd_inode_rpc ..................   Passed    1.33 sec"
+    ],
+    "dependency_check": "passed",
+    "dependency_counts": {
+      "daemon": 2,
+      "extension": 7,
+      "host": 4
+    },
+    "environment": {
+      "macos": "27.2.1",
+      "arch": "arm64",
+      "build": "Release WFS_FSKIT=ON, Apple Clang/SDK27.2"
+    },
+    "validation_log_sha256": "9b215aec23219aa0f0c791200f41485f47673b8b1ffef5e3d67e2a1656dd5342"
+  }
+}

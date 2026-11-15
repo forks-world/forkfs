@@ -42,6 +42,12 @@ for binary in [BIN,LEGACY]:
                 assert select.select([proc.stdout],[],[],5)[0];assert json.loads(proc.stdout.readline())['state']=='leveldb'
                 session=json.loads(rpc('session-open',60000))['session'];sel=('--session',session)
                 rid=json.loads(rpc('inode-root',*sel))['inode']['inode_id'];fid=json.loads(rpc('inode-lookup',rid,'f',*sel))['inode_id']
+                # The path and handle xattr APIs must preserve the POSIX existence errno.
+                rpc('fs-xattr-get','/f','absent',*sel,code=MISSING+1)
+                rpc('fs-xattr-remove','/f','absent',*sel,code=MISSING+1)
+                rpc('fs-xattr-set','/f','absent','replace',b'',*sel,code=MISSING+1)
+                rpc('fs-xattr-set','/f','user.test','create',b'',*sel,code=errno.EEXIST+1)
+                rpc('fs-xattr-get','/f','absent','--revision','base',code=MISSING+1)
                 rpc('inode-xattr-set',fid,'binary','create',payload,*sel);assert rpc('inode-xattr-get',fid,'binary',*sel)==payload
                 assert json.loads(rpc('inode-xattr-list',fid,*sel))['names']==['binary','user.test']
                 escaped='quote"back\\name'
@@ -65,7 +71,14 @@ for binary in [BIN,LEGACY]:
                 rpc('inode-xattr-set',fid,'count-overflow','create',b'',*sel,code=errno.ENOSPC+1)
                 assert len(json.loads(rpc('inode-xattr-list',fid,*sel))['names'])==128
                 rpc('inode-xattr-remove',fid,'count0',*sel)
+                linked_ro=json.loads(rpc('inode-open',fid,'r',*sel))['handle']
+                rpc('fs-hxattr-get',linked_ro,'absent',*sel,code=MISSING+1)
+                rpc('fs-close',linked_ro,*sel)
                 handle=json.loads(rpc('inode-open',fid,'r',*sel))['handle'];rpc('inode-remove',rid,'f',fid,'file',*sel)
+                rpc('fs-hxattr-get',handle,'absent',*sel,code=MISSING+1)
+                rpc('fs-hxattr-remove',handle,'absent',*sel,code=MISSING+1)
+                rpc('fs-hxattr-set',handle,'absent','replace',b'',*sel,code=MISSING+1)
+                rpc('fs-hxattr-set',handle,'binary','create',b'',*sel,code=errno.EEXIST+1)
                 assert rpc('fs-hxattr-get',handle,'binary',*sel)==payload
                 assert rpc('fs-hxattr-get',handle,'big',*sel)==large
                 rpc('fs-hxattr-set',handle,'big','replace',large[::-1],*sel)

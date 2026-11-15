@@ -38,6 +38,14 @@ const std::string prefix("\0forkfs/",8);
 const std::string root_key=prefix+"root",volume_name_key=prefix+"volume-name";
 void need(bool ok,const char* message) { if(!ok) throw std::runtime_error(message); }
 [[noreturn]] void bad_handle(const char* message) { throw std::system_error(EBADF,std::generic_category(),message); }
+[[noreturn]] void missing_xattr() {
+#ifdef ENOATTR
+    throw std::system_error(ENOATTR,std::generic_category(),"extended attribute not found");
+#else
+    throw std::system_error(ENODATA,std::generic_category(),"extended attribute not found");
+#endif
+}
+[[noreturn]] void existing_xattr() { throw std::system_error(EEXIST,std::generic_category(),"extended attribute already exists"); }
 uint64_t load(const unsigned char* p,size_t n) {
     uint64_t v=0;for(size_t i=0;i<n;++i)v|=uint64_t(p[i])<<(8*i);return v;
 }
@@ -434,7 +442,7 @@ public:
          keys_([&journal](const auto& key){return journal.keys(key);}),prefix_(orphan+"xattr/"),changes_(changes) {}
     std::vector<std::string> records() const {return keys_(prefix_);}
     Bytes get(const std::string& name) const {
-        valid_xattr_name(name);auto key=prefix_+name;need(contains_(key),"extended attribute not found");auto value=get_(key);
+        valid_xattr_name(name);auto key=prefix_+name;if(!contains_(key))missing_xattr();auto value=get_(key);
         need(value.size()<=maximum_xattr_bytes,"extended attribute exceeds 262143 bytes");return value;
     }
     std::vector<std::string> names() const {
@@ -448,13 +456,13 @@ public:
         valid_xattr_name(name);need(policy==Namespace::XattrPolicy::Upsert || policy==Namespace::XattrPolicy::Create || policy==Namespace::XattrPolicy::Replace,"invalid extended attribute policy");
         auto key=prefix_+name;bool exists=contains_(key);auto keys=records();auto count=keys.size();
         if(value){need(value->size()<=maximum_xattr_bytes,"extended attribute exceeds 262143 bytes");
-            need(policy!=Namespace::XattrPolicy::Create || !exists,"extended attribute already exists");
-            need(policy!=Namespace::XattrPolicy::Replace || exists,"extended attribute not found");
+            if(policy==Namespace::XattrPolicy::Create && exists)existing_xattr();
+            if(policy==Namespace::XattrPolicy::Replace && !exists)missing_xattr();
             need(exists || count<Namespace::maximum_xattr_count,"extended attribute count limit reached");
             uint64_t total=value->size();
             for(const auto& other:keys)if(other!=key){auto length=size_(other);
                 need(length<=Namespace::maximum_xattr_storage_bytes-total,"extended attribute storage limit reached");total+=length;}
-        } else need(exists,"extended attribute not found");
+        } else if(!exists)missing_xattr();
         (*changes_)[key]=value;return value.has_value() || count>1;
     }
     void verify(bool flag) const {auto values=names();need(flag==!values.empty(),"invalid extended attribute inode flag");for(const auto& name:values)(void)get(name);}
