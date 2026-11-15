@@ -186,7 +186,10 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     bool dir_op=op.starts_with("fs-dir-");
     need(!(handle_op || dir_op || op.starts_with("inode-")) || !session_token.empty(),"handle operations require --session TOKEN");
     Activity activity{session_token.empty()?nullptr:&sessions.acquire(session_token)};
-    if(handle_op && op!="fs-open")need(activity.session->handles.contains(args[1]),"handle belongs to another session");
+    auto require_owned_handle=[&](const std::string& handle) {
+        if(!activity.session->handles.contains(handle))throw RpcError(EBADF,"handle belongs to another session or is closed");
+    };
+    if(handle_op && op!="fs-open")require_owned_handle(args[1]);
     if(dir_op && op!="fs-dir-open") {
         auto i=activity.session->directories.find(args[1]);need(i!=activity.session->directories.end(),"invalid directory cursor/session");
         need(i->second.view==view && i->second.revision==revision,"directory cursor belongs to another view");
@@ -215,7 +218,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="inode-seek-region" || op=="fs-seek-region" || op=="fs-hseek-region") {
         need(args[3]=="data" || args[3]=="hole","invalid seek region");auto offset=number(args[2]);uint64_t result;
         if(op=="inode-seek-region" && args[4]!="-"){
-            const auto& handle=args[4];need(activity.session->handles.contains(handle),"handle belongs to another session");
+            const auto& handle=args[4];require_owned_handle(handle);
             need(fs.handle_stat(handle).id==args[1],"invalid inode/handle pairing");result=fs.handle_seek_region(handle,offset,args[3]=="data");
         } else if(op=="fs-hseek-region")result=fs.handle_seek_region(args[1],offset,args[3]=="data");
         else result=fs.seek_region(op=="inode-seek-region"?fs.path_for_inode(args[1]):args[1],offset,args[3]=="data");
@@ -261,7 +264,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
             if(args[7]!="-"){auto flags=number(args[7]);need(flags<=UINT32_MAX && !(flags&~uint64_t(supported_file_flags)),"unsupported file flags");a.flags=static_cast<uint32_t>(flags);}handle_index=8;
         }
         if(args[handle_index]!="-") {
-            const auto& handle=args[handle_index];need(activity.session->handles.contains(handle),"handle belongs to another session");
+            const auto& handle=args[handle_index];require_owned_handle(handle);
             need(fs.handle_stat(handle).id==args[1],"invalid inode/handle pairing");fs.handle_set_attributes(handle,a);return inode_json(fs.handle_stat(handle));
         }
         auto path=fs.path_for_inode(args[1]);fs.set_link_attributes(path,a);return inode_json(fs.lstat(path));

@@ -37,6 +37,7 @@ using Bytes=std::vector<unsigned char>;
 const std::string prefix("\0forkfs/",8);
 const std::string root_key=prefix+"root",volume_name_key=prefix+"volume-name";
 void need(bool ok,const char* message) { if(!ok) throw std::runtime_error(message); }
+[[noreturn]] void bad_handle(const char* message) { throw std::system_error(EBADF,std::generic_category(),message); }
 uint64_t load(const unsigned char* p,size_t n) {
     uint64_t v=0;for(size_t i=0;i<n;++i)v|=uint64_t(p[i])<<(8*i);return v;
 }
@@ -972,12 +973,12 @@ void Namespace::set_path_attributes(const std::string& path,const Attributes& a,
 void Namespace::handle_set_attributes(const std::string& token,const Attributes& a) {
     valid_attributes(a);need(!revision_,"revision view is read-only");
     std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);
+    if(a.size && !info.writable)bad_handle("handle is not writable");
     NamespaceView view(*container_.journal_,view_,revision_);bool linked=view.contains(inode_key(info.inode));
     auto key=linked?inode_key(info.inode):orphan_prefix(view_,info.inode)+"inode";
     auto n=linked?inode(view,info.inode):decode_inode(container_.journal_->get(key),info.inode,true);
     mutable_attributes(n,a,info.writable);
     need(!n.symlink || !a.size,"invalid symbolic link size change");
-    need(!a.size || info.writable,"handle is not writable");
     if(!a.mode && !a.modified_ns && !a.size && !a.accessed_ns && !a.birth_ns && !a.flags)return;
     if(a.size && *a.size==n.size && !a.mode && !a.modified_ns && !a.accessed_ns && !a.birth_ns && !a.flags)return;
     Changes changes;
@@ -1121,8 +1122,8 @@ void Namespace::verify_locked() const {
     }
 }
 const Container::OpenHandle& Namespace::find_handle(const std::string& token) const {
-    auto it=container_.handles_.find(token);need(it!=container_.handles_.end(),"invalid or expired file handle");
-    need(it->second.view==view_ && it->second.revision==revision_,"file handle belongs to another view");return it->second;
+    auto it=container_.handles_.find(token);if(it==container_.handles_.end())bad_handle("invalid or expired file handle");
+    if(it->second.view!=view_ || it->second.revision!=revision_)bad_handle("file handle belongs to another view");return it->second;
 }
 std::string Namespace::open(const std::string& path,Access access) {return open(path,access,OpenOptions{});}
 std::string Namespace::open(const std::string& path,Access access,const OpenOptions& options) {
@@ -1223,7 +1224,7 @@ uint64_t Namespace::seek(const std::string& token,int64_t offset,Seek origin) {
     info.cursor->position=result;return result;
 }
 Bytes Namespace::handle_read_next(const std::string& token,uint64_t count) {
-    std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);need(info.readable,"handle is not readable");
+    std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);if(!info.readable)bad_handle("handle is not readable");
     auto data=read_handle_locked(info,info.cursor->position,count);info.cursor->position+=data.size();return data;
 }
 size_t Namespace::handle_write_next(const std::string& token,const Bytes& value) {
@@ -1257,7 +1258,7 @@ InodeInfo Namespace::handle_stat(const std::string& token) const {
 }
 Bytes Namespace::handle_read(const std::string& token,uint64_t offset,uint64_t count) const {
     need(offset<=INT64_MAX,"file offset exceeds signed 64-bit range");
-    std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);need(info.readable,"handle is not readable");
+    std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);if(!info.readable)bad_handle("handle is not readable");
     return read_handle_locked(info,offset,count);
 }
 Bytes Namespace::read_handle_locked(const Container::OpenHandle& info,uint64_t offset,uint64_t count) const {
@@ -1271,7 +1272,7 @@ Bytes Namespace::read_handle_locked(const Container::OpenHandle& info,uint64_t o
 void Namespace::edit_handle(const std::string& token,const std::function<bool(FileContent&,bool)>& edit,const std::function<void()>& committed) {
     need(!revision_,"revision view is read-only");
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);Changes changes;
-    const auto& info=find_handle(token);need(info.writable,"handle is not writable");
+    const auto& info=find_handle(token);if(!info.writable)bad_handle("handle is not writable");
     bool linked=view.contains(inode_key(info.inode));auto pre=orphan_prefix(view_,info.inode);auto& j=*container_.journal_;
     auto n=linked?inode(view,info.inode):decode_inode(j.get(pre+"inode"),info.inode,true);
     need(!n.symlink,"symbolic link handle forbids data I/O");

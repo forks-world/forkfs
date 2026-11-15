@@ -381,6 +381,20 @@ handles to that inode see the same updates. Access mode is enforced per handle;
 revision handles permit reads only. This is not a replacement for Unix permission
 checks, an agent broker or an OS mount adapter.
 
+When an operation reaches handle validation, the Namespace C++ API reports
+`EBADF` in the generic error category for missing, closed, or foreign-view
+handles. Attempts to read through a write-only handle, or to write data, write
+back, append, truncate, or change size through a read-only handle also report
+`EBADF`. A read-only data handle may
+still change owner metadata such as mode and times. These errors do not publish
+namespace changes or advance a shared read cursor. RPC reports these as the
+typed wire code `errno + 1`; a missing, closed, or foreign-session handle is
+reported as `EBADF` without revealing whether another session owns it. Revision
+write policy and malformed request/offset/session precedence are unchanged.
+This is a daemon C++/RPC contract, not a claim about native FSKit errno mapping; see the
+[filesystem API compatibility matrix](../docs/FILESYSTEM_API_COMPATIBILITY.md#handle-ebadf-behavior)
+and [handle errno regression record](../docs/evidence/2026-11-14-handle-ebadf.json).
+
 An unlinked open file retains two durable orphan roots outside the World tree:
 `inode` for its current metadata and `tree` for an immutable CoW retention view.
 Snapshot/fork omit these orphans. Unlink and orphan publication share one

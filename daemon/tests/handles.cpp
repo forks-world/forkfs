@@ -12,6 +12,12 @@ using Bytes=std::vector<unsigned char>;
 void check(bool ok){if(!ok)throw std::runtime_error("file handle check failed");}
 template<class F> void rejects(F f){bool bad=false;try{f();}catch(const std::exception&){bad=true;}check(bad);}
 template<class F> void rejects_errno(F f,int code){try{f();}catch(const std::system_error& e){check(e.code()==std::error_code(code,std::generic_category()));return;}check(false);}
+std::string logical_state(const std::string& status){
+    std::string result;for(const auto* field:{"last_committed_seq","object_roots","indexed_objects"}){
+        auto key="\""+std::string(field)+"\":";auto begin=status.find(key);check(begin!=status.npos);begin+=key.size();
+        auto end=status.find_first_not_of("0123456789",begin);check(end!=begin);result+=status.substr(begin,end-begin)+"/";
+    }return result;
+}
 int main(){
     char pattern[]="/tmp/ff-handles-XXXXXX";auto tmp=mkdtemp(pattern);if(!tmp)return 1;
     auto path=std::string(tmp)+"/store";std::string stale;
@@ -29,12 +35,35 @@ int main(){
             fs.remove("/renamed",false);check(fs.handle_stat(a).links==1);
             fs.remove("/alias",false);check(fs.handle_stat(a).links==0 && fs.list("/").empty());
             fs.handle_write(a,5,Bytes{'!'});check(fs.handle_read(b,0,UINT64_MAX)==Bytes({'o','X','d',0,0,'!'}));
-            rejects([&]{fs.handle_write(b,0,Bytes{1});});rejects([&]{work.handle_read(a,0,5);});
+            auto orphan_ro=fs.dup(b);check(fs.handle_read_next(orphan_ro,1)==Bytes{'o'});
+            auto orphan_info=fs.handle_stat(b);auto orphan_logical=logical_state(store.status());
+            rejects_errno([&]{fs.handle_write(b,0,Bytes{1});},EBADF);
+            rejects_errno([&]{fs.handle_write_next(b,Bytes{1});},EBADF);
+            rejects_errno([&]{fs.handle_writeback(b,0,Bytes{1});},EBADF);
+            rejects_errno([&]{fs.handle_append(b,Bytes{1});},EBADF);
+            rejects_errno([&]{fs.handle_truncate(b,0);},EBADF);
+            rejects_errno([&]{fs.handle_set_attributes(b,{std::nullopt,std::nullopt,1});},EBADF);
+            check(fs.seek(b,0,forkfs::Namespace::Seek::Current)==1 && fs.handle_read_next(b,1)==Bytes{'X'});
+            auto orphan_after=fs.handle_stat(b);check(orphan_info.id==orphan_after.id && orphan_info.size==orphan_after.size &&
+                orphan_info.modified_ns==orphan_after.modified_ns && orphan_info.changed_ns==orphan_after.changed_ns &&
+                orphan_logical==logical_state(store.status()));
+            fs.handle_write(a,1,Bytes{'X'});check(fs.handle_read(b,0,UINT64_MAX)==Bytes({'o','X','d',0,0,'!'}));
+            rejects_errno([&]{work.handle_read(a,0,5);},EBADF);
+            rejects_errno([&]{fs.handle_read(ro,0,5);},EBADF);
             rejects([&]{fs.handle_read(a,UINT64_MAX,5);});rejects([&]{revision.open("/f",forkfs::Namespace::Access::Write);});
             check(fs.handle_append(a,Bytes{'?'})==6);fs.handle_truncate(a,4);
             fs.snapshot("after-unlink");fs.fork("after-unlink","empty");forkfs::Namespace empty(store,"empty"),after(store,"after-unlink",true);
             check(empty.list("/").empty());after.verify();fs.verify();store.verify();
             fs.write("/f",Bytes{'n','e','w'});check(fs.stat("/f").id!=id);
+            auto replaced_logical=logical_state(store.status());
+            rejects_errno([&]{fs.handle_write(b,0,Bytes{'Q'});},EBADF);
+            check(fs.stat("/f").id!=id && fs.handle_stat(orphan_ro).id==id &&
+                fs.handle_read(orphan_ro,0,UINT64_MAX)==Bytes({'o','X','d',0}) &&
+                replaced_logical==logical_state(store.status()));
+            fs.handle_write(a,1,Bytes{'X'});
+            check(fs.stat("/f").id!=id && fs.handle_stat(orphan_ro).id==id &&
+                fs.handle_read(orphan_ro,0,UINT64_MAX)==Bytes({'o','X','d',0}));
+            fs.close(orphan_ro);
             check(fs.handle_read(a,0,20)==Bytes({'o','X','d',0}));check(fs.read("/f")==Bytes({'n','e','w'}));
             check(work.handle_read(wh,0,20)==Bytes({'o','l','d'}));check(revision.handle_read(ro,0,20)==Bytes({'o','l','d'}));
             fs.close(a);check(fs.handle_read(b,0,20)==Bytes({'o','X','d',0}));
@@ -49,7 +78,43 @@ int main(){
             fs.write("/race",{});auto race=fs.open("/race",forkfs::Namespace::Access::ReadWrite);std::atomic<bool> failed=false;
             std::thread writer([&]{try{for(int i=0;i<32;++i)fs.handle_append(race,Bytes{42});}catch(...){failed=true;}});
             fs.remove("/race",false);writer.join();check(!failed && fs.handle_read(race,0,100)==Bytes(32,42));fs.close(race);
-            auto wo=fs.open("/dst",forkfs::Namespace::Access::Write);rejects([&]{fs.handle_read(wo,0,1);});fs.close(wo);
+            auto deny_read=fs.open("/dst",forkfs::Namespace::Access::Read);
+            auto deny_read_dup=fs.dup(deny_read);
+            auto wo=fs.open("/dst",forkfs::Namespace::Access::Write);
+            auto denied_inode=fs.handle_stat(deny_read);auto denied_data=fs.handle_read(deny_read,0,UINT64_MAX);
+            check(fs.handle_read_next(deny_read,1)==Bytes{'n'});
+            auto denied_position=fs.seek(deny_read,0,forkfs::Namespace::Seek::Current);
+            auto denied_inode_after_cursor=fs.handle_stat(deny_read);auto denied_status=logical_state(store.status());
+            check(fs.try_lock(deny_read,forkfs::Namespace::Lock::Exclusive));
+            rejects_errno([&]{fs.handle_write(deny_read,0,Bytes{'x'});},EBADF);
+            rejects_errno([&]{fs.handle_write_next(deny_read,Bytes{'x'});},EBADF);
+            rejects_errno([&]{fs.handle_writeback(deny_read,0,Bytes{'x'});},EBADF);
+            rejects_errno([&]{fs.handle_append(deny_read,Bytes{'x'});},EBADF);
+            rejects_errno([&]{fs.handle_truncate(deny_read,0);},EBADF);
+            rejects_errno([&]{fs.handle_set_attributes(deny_read,{std::nullopt,std::nullopt,1});},EBADF);
+            rejects_errno([&]{fs.handle_read(wo,0,1);},EBADF);
+            rejects_errno([&]{fs.handle_read_next(wo,1);},EBADF);
+            check(fs.seek(wo,0,forkfs::Namespace::Seek::Current)==0);
+            check(fs.seek(deny_read_dup,0,forkfs::Namespace::Seek::Current)==denied_position);
+            auto denied_inode_after=fs.handle_stat(deny_read);auto denied_status_after=logical_state(store.status());
+            auto lock_contender=fs.open("/dst");check(!fs.try_lock(lock_contender,forkfs::Namespace::Lock::Shared));fs.close(lock_contender);
+            check(fs.handle_read(deny_read_dup,0,UINT64_MAX)==denied_data && fs.handle_read_next(deny_read_dup,1)==Bytes{'e'});
+            check(denied_inode.id==denied_inode_after.id && denied_inode.size==denied_inode_after.size &&
+                denied_inode.mode==denied_inode_after.mode && denied_inode.modified_ns==denied_inode_after.modified_ns &&
+                denied_inode.changed_ns==denied_inode_after.changed_ns && denied_inode_after_cursor.id==denied_inode.id &&
+                denied_status==denied_status_after);
+            check(fs.try_lock(deny_read,forkfs::Namespace::Lock::Unlock));
+            fs.close(deny_read_dup);fs.close(deny_read);fs.close(wo);
+            auto closed=fs.open("/dst");fs.close(closed);
+            for(const auto& token:{std::string("invalid-handle"),closed}) {
+                rejects_errno([&]{fs.handle_read(token,0,1);},EBADF);
+                rejects_errno([&]{fs.handle_stat(token);},EBADF);
+                rejects_errno([&]{fs.dup(token);},EBADF);
+                rejects_errno([&]{fs.close(token);},EBADF);
+                rejects_errno([&]{fs.seek(token,0,forkfs::Namespace::Seek::Current);},EBADF);
+                rejects_errno([&]{fs.try_lock(token,forkfs::Namespace::Lock::Shared);},EBADF);
+                rejects_errno([&]{fs.try_lock_range(token,forkfs::Namespace::Lock::Shared,0,1);},EBADF);
+            }
             rejects([&]{fs.open("/");});
             auto revision_status=store.status();auto revision_info=revision.handle_stat(ro);auto revision_bytes=revision.handle_read(ro,0,UINT64_MAX);
             rejects_errno([&]{revision.seek(ro,-1,forkfs::Namespace::Seek::Set);},EINVAL);
