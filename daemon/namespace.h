@@ -70,6 +70,7 @@ public:
     void write_at(const std::string& path,uint64_t offset,const std::vector<unsigned char>& value);
     uint64_t append(const std::string& path,const std::vector<unsigned char>& value);
     void truncate(const std::string& path,uint64_t size);
+    void punch_hole(const std::string& path,uint64_t offset,uint64_t length);
     std::vector<unsigned char> read(const std::string& path) const;
     // Query only: kernel/caller owns the file position. Data is conservative at 64 KiB chunk granularity.
     uint64_t seek_region(const std::string& path,uint64_t offset,bool data) const;
@@ -115,6 +116,7 @@ public:
     void handle_writeback(const std::string& handle,uint64_t offset,const std::vector<unsigned char>& value);
     uint64_t handle_append(const std::string& handle,const std::vector<unsigned char>& value);
     void handle_truncate(const std::string& handle,uint64_t size);
+    void handle_punch_hole(const std::string& handle,uint64_t offset,uint64_t length);
 private:
     friend class Container;
     void remember_path(const std::string& id,const std::string& path) const noexcept;

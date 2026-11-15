@@ -44,7 +44,8 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `ftruncate`、稀疏文件、`lseek` | setattr size + bounded chunk I/O | 挂载已测零填充、shrink/extend、64 MiB/4 GiB/1 TiB 边界；macOS 27 已挂载验收 `SEEK_DATA/SEEK_HOLE`（64 KiB chunk 粒度）；macOS 26 保留保守 fallback |
 | C++ `Namespace::seek`、daemon `fs-hseek` | namespace open-description cursor / RPC | 实现约定：负位置为 `EINVAL`，超出 `INT64_MAX` 为 `EOVERFLOW`；失败不移动共享 cursor。修复回归与构建证据见[seek error regression record](evidence/2026-11-14-handle-seek-errors.json)，当前验证状态以记录为准。**此项不验收原生 `lseek(2)` errno 或新增挂载能力。** 独立 APFS syscall 对照见 [seek reference](evidence/2026-11-14-seek-apfs-reference.json) |
 | C++/RPC file-handle bad-handle and access errors | `Namespace` handle operations / session-owned RPC | When handle validation is reached, invalid, closed, or foreign-view handles and handle access-mode refusals report `EBADF`; RPC encodes typed errors as `errno + 1`. Metadata mode/time updates remain allowed through read-only handles. The C++/RPC regression and full build/CTest evidence is in the [handle errno record](evidence/2026-11-14-handle-ebadf.json). This does not establish native FSKit errno behavior or general POSIX permission checks. |
-| `F_PREALLOCATE`、`posix_fallocate`、hole punch | 可选 Preallocate/数据变更接口 | 未实现相应协议；不能声称空间预留或洞区间查询兼容 |
+| C++ `Namespace::punch_hole`/`handle_punch_hole`、RPC `fs-punch-hole`/`fs-hpunch-hole`、离线 `fs-punch-hole` | daemon content edit | C++/RPC 与离线命令已测；见下方 hole-punch 记录。此项不升级原生挂载兼容状态 |
+| 原生 `F_PUNCHHOLE`、`F_PREALLOCATE`、`posix_fallocate` | 原生 syscall/可选 Preallocate 协议 | 未实现或未验收；不声称原生洞区间修改、物理 extent 查询或空间预留 |
 | `statfs/statvfs/pathconf` | volumeStatistics、PathConfOperations | 挂载已测容量/单位/标志、路径与 fd 查询、rename/unlink/路径重用和 GC 后只读 revision；子目录/文件 fd 的 `PC_PATH_MAX` 返回 EINVAL，不能宣称完整 pathconf。空间来自宿主卷，不是 forkfs 配额或预留 |
 | `chflags/fchflags/lchflags`、BSD flags | get/setAttributes → revision inode | 挂载已测 hidden/nodump 的路径/fd/nofollow、硬链接、cp -p、孤儿 fd 和历史隔离；user immutable 及 user append-only 的数据/元数据/目录约束已接入；nounlink/系统保护标记仍拒绝 |
 | `mkfifo/mknod`、Unix socket 路径 | create item types | 缺失；当前只支持 regular/directory/symlink，不适合依赖这些节点的运行目录 |
@@ -88,6 +89,37 @@ cases. Revision write policy, invalid session errors, and malformed
 payload/offset/session precedence are outside this change. The [regression
 record](evidence/2026-11-14-handle-ebadf.json) contains the baseline differential
 and fixed build/test results; no native FSKit errno behavior is claimed.
+
+### Sparse hole punching (daemon APIs only)
+
+`Namespace::punch_hole(path, offset, length)` and
+`Namespace::handle_punch_hole(handle, offset, length)` zero the intersecting
+bytes of an existing regular file without changing its logical size. Resident
+RPC exposes these as `fs-punch-hole` and `fs-hpunch-hole`; the offline CLI
+supports `fs-punch-hole CONTAINER PATH OFFSET LENGTH`. Path operations follow a
+final symlink. Zero length and offsets at or beyond EOF are no-ops after normal
+path/handle access and inode append-only checks. The range is clipped at EOF,
+and both numeric arguments must fit the signed 64-bit offset space; invalid
+ranges keep the existing generic RPC error code 1.
+
+Inline files are rewritten in place as inline content; punching does not
+promote or deallocate the inline representation, so its `allocated_size` stays
+unchanged. Chunked files zero partial edge chunks and remove fully
+covered chunks, including for a 1 TiB sparse range without iterating over hole
+chunks. File size, bytes outside the requested range, and the handle cursor are
+preserved. C++ path tests cover both storage backends, hard links, symlink
+following, snapshots/forks, reopen and sparse allocation reduction; modern
+backend tests also run GC. Modern backend handle/RPC tests cover shared cursors,
+path reuse after unlink, read-only handles, inode append-only protection,
+immutable-writer admission, foreign/closed handles and the mount lease.
+
+This is a daemon API result only. The macOS FSKit frontend was not changed and
+no mounted `F_PUNCHHOLE` behavior is claimed. No native Preallocate protocol,
+`F_PREALLOCATE`, `posix_fallocate`, physical extent, or reservation guarantee is
+claimed. The raw-Journal orphan range-erasure fallback was source-reviewed but
+not independently forced by a dedicated test. The baseline C++ API did not
+exist, so the baseline probe covers RPC and CLI rejection only. See the
+[hole-punch regression and build record](evidence/2026-11-15-hole-punch.json).
 
 当前类使用 macOS 26 的 Operations 协议，具体实现见
 [`RevisionVolume.h`](../macos/forkfs/RevisionVolume.h) 和
