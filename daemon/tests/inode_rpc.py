@@ -60,6 +60,17 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         rpc('inode-root','--session',other,error=errno.EBUSY)
         rpc('fs-mkdir','/foreign',error=errno.EBUSY)
         directory=obj('inode-mkdir',rid,'dir',str(0o700),*sel);did=directory['inode_id'];assert directory['mode']==0o700
+        sticky_dir=obj('inode-mkdir',rid,'sticky-dir',str(0o1777),*sel);assert sticky_dir['mode']==0o1777
+        sticky_fifo=obj('inode-mkfifo',rid,'sticky-fifo',str(0o1000),*sel);assert sticky_fifo['mode']==0o1000
+        sticky_file=obj('inode-create',rid,'sticky-file',str(0o1000),*sel)['handle']
+        sticky_info=obj('fs-hstat',sticky_file,*sel);sticky_id=sticky_info['inode_id'];assert sticky_info['mode']==0o1000
+        rpc('fs-hchmod',sticky_file,'1777',*sel);assert obj('fs-hstat',sticky_file,*sel)['mode']==0o1777
+        rpc('fs-close',sticky_file,*sel)
+        sticky_seq=obj('status')['last_committed_seq']
+        for invalid in (0o2000,0o4000,0o10000,0x80000000):
+            rpc('inode-setattr',sticky_id,str(invalid),'-','-','-',*sel,error=errno.ENOTSUP)
+            assert obj('status')['last_committed_seq']==sticky_seq
+            assert obj('inode-stat',sticky_id,*sel)['mode']==0o1777
         for opcode,fields in [
             ('inode-setattr',lambda size,mixed:(str(0o711) if mixed else '-',str(size),'99' if mixed else '-','-')),
             ('inode-setattr-times',lambda size,mixed:(str(0o711) if mixed else '-',str(size),'99' if mixed else '-', '88' if mixed else '-', '77' if mixed else '-', '-')),
@@ -223,11 +234,13 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         assert obj('fs-hstat',orphan_read,*sel)==orphan_before
         assert obj('status')['last_committed_seq']==orphan_seq
         rpc('fs-hwrite',handle,'0',b'X',*sel)
+        rpc('fs-hchmod',handle,'1777',*sel)
+        assert obj('fs-hstat',handle,*sel)['mode']==0o1777
         st=obj('inode-setattr',fid,str(0o700),'4','1',handle,*sel);assert st['size']==4
         assert rpc('fs-hread',handle,'0','99',*sel)==b'Xbc\x00'
         replacement=obj('inode-create',rid,'file',str(0o600),*sel)['handle']
-        replacement_id=obj('fs-hstat',replacement,*sel)['inode_id'];assert replacement_id!=fid
-        assert obj('fs-hstat',orphan_read,*sel)['inode_id']==fid
+        replacement_info=obj('fs-hstat',replacement,*sel);replacement_id=replacement_info['inode_id'];assert replacement_id!=fid and replacement_info['mode']==0o600
+        assert obj('fs-hstat',orphan_read,*sel)['inode_id']==fid and obj('fs-hstat',handle,*sel)['mode']==0o700
         assert rpc('fs-hread',orphan_read,'0','99',*sel)==b'Xbc\x00'
         rpc('fs-close',replacement,*sel);rpc('inode-remove',rid,'file',replacement_id,'file',*sel)
         rpc('fs-close',orphan_read,*sel)
@@ -236,7 +249,7 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         link=obj('inode-symlink',rid,'link','dir',*sel)
         assert rpc('inode-readlink',link['inode_id'],*sel)==b'dir'
         cursor=obj('inode-dir-open',rid,*sel)['cursor']
-        page=obj('fs-dir-entries',cursor,'100',*sel);assert page['eof'] and {x['name'] for x in page['entries']}=={'dir','link','deep-alias','z'*250}
+        page=obj('fs-dir-entries',cursor,'100',*sel);assert page['eof'] and {x['name'] for x in page['entries']}=={'dir','link','deep-alias','z'*250,'sticky-dir','sticky-fifo','sticky-file'}
         rpc('fs-dir-close',cursor,*sel)
         ro=obj('session-open','60000')['session'];ro_sel=['--revision','base','--session',ro]
         ro_root=obj('inode-root',*ro_sel)['inode']['inode_id']

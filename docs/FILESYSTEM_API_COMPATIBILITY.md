@@ -28,9 +28,9 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `open/read/write/pread/pwrite/close` | OpenCloseOperations、ReadWriteOperations → inode handles | 挂载已测；单文件逻辑上限 1 TiB，RPC 单次最多 256 KiB，回调分块 |
 | `O_CREAT/O_EXCL/O_TRUNC/O_APPEND/O_NOFOLLOW/O_DIRECTORY`、`openat` 系列 | 内核路径解析 + lookup/create/open/setattr | 挂载已测排他/类型/nofollow 拒绝、dangling link 创建、截断身份、umask、并发 append、基本 `*at`；全部组合与极限并发仍未验收 |
 | `dup`、打开后 rename/unlink、同名路径重用 | 内核 fd + daemon orphan roots | 挂载已测；包含普通文件、符号链接元数据 fd 和 mmap |
-| `stat/lstat/fstat`、`chmod/fchmod`、`utime/utimens`、birth time | get/setAttributes | 挂载已测；时间纳秒精度，读取不更新 atime，模式仅 0777。Directory size rejection (`EISDIR`) is scoped to Namespace path setters and inode RPC after existing validation/protection precedence, including size zero; native FSKit behavior is not established. See [regression evidence](evidence/2026-11-14-directory-size-setattr.json). |
+| `stat/lstat/fstat`、`chmod/fchmod`、`utime/utimens`、birth time | get/setAttributes | 时间纳秒精度，读取不更新 atime；permission plus sticky bits through octal 01777 are covered by passing daemon/Bridge regressions, while native candidate mount qualification remains pending. See [sticky mode evidence](evidence/2026-11-16-sticky-mode.json). Directory size rejection (`EISDIR`) is scoped to Namespace path setters and inode RPC after existing validation/protection precedence, including size zero; native FSKit behavior is not established. See [regression evidence](evidence/2026-11-14-directory-size-setattr.json). |
 | `st_blocks`、`du` | allocated_size → allocSize | 挂载已测；空洞为零、数据 payload 每位置向上取整到 512 字节，不是去重后独占仓库空间 |
-| `chown/fchown`、setuid/setgid/sticky、ACL | inode metadata + access checks | 缺失；uid/gid 来自服务用户，拒绝更换属主，无 ACL，不是多用户文件系统 |
+| `chown/fchown`、setuid/setgid、ACL、sticky-directory access enforcement | inode metadata + access checks | setuid/setgid、ACL 和 daemon 跨用户授权模型缺失；sticky 位作为 inode metadata 支持并持久化，原生内核 sticky-directory 授权行为未验收。uid/gid 来自服务用户并拒绝更换属主；不提供多用户保证 |
 | `access/faccessat`、目录搜索权限、只读 fd 权限 | 内核权限判断；未接 AccessCheckOperations | 挂载已测单用户 mode 000/0400、access、目录搜索/写权限、拒绝 truncate/创建/unlink、chmod 不撤销已开 fd；faccessat/组权限/多用户未验收 |
 | `mkdir/rmdir/unlink`、普通 `rename`、原子保存 | create/remove/rename → 原子 namespace 提交 | 挂载已测；失败 errno 与状态不变需按操作继续扩充。直接 RPC 错误码修复另见 PR #95 |
 | daemon `Namespace::rename_exclusive`、RPC/离线 CLI `fs-rename-excl` | 一次 namespace 事务内的排他目录项移动 | daemon API 已测；目标存在（包括同一路径、同 inode 硬链接和 dangling symlink）返回 `EEXIST`，不替换；只覆盖 daemon API，不表示 FSKit 或原生排他 rename 支持，见下方记录 |
@@ -506,7 +506,7 @@ revision 隔离及 GC 后只读重挂载；macOS 26 构建不宣称支持该新�
 2. **容量与大文件**：完善空间不足恢复，继续处理 128 项/8 MiB xattr 和目录项上限中的应用阻断；
    扩充更大密集文件的性能/内存资格、旧仓库冷查询性能、边界短写及空间不足故障组合、
    GC/重启和历史隔离验收。预分配必须兑现空间保证，不能只改逻辑长度。
-3. **元数据与安全**：设计持久 uid/gid、特殊模式位、ACL、file flags 的 revision
+3. **元数据与安全**：设计持久 uid/gid、setuid/setgid、ACL、file flags 的 revision
    格式与授权模型；所有 write/truncate/link/rename/unlink 路径执行约束。先完成
    私有单用户权限验收，再考虑多用户；不能只增加 AccessCheck selector。
 4. **工作负载闭环**：扩大 SQLite WAL 并发和进程故障、Git 大仓库/构建器/编辑器

@@ -33,6 +33,19 @@ int main(){
         publish(path,true);
         {
             Container store(path);Namespace fs(store);auto n=fs.stat("/f");check(n.accessed_ns==n.modified_ns && n.birth_ns==n.changed_ns);fs.snapshot("old");
+            // Sticky mode is persisted on all inode types, including orphan
+            // handles, while unsupported special and type bits reject atomically.
+            fs.mkdir("/sticky-dir",01777);fs.mkfifo("/sticky-fifo",01000);
+            fs.write("/sticky-file",Bytes{'S'});Namespace::Attributes initial_sticky;initial_sticky.mode=01000;fs.set_attributes("/sticky-file",initial_sticky);
+            fs.link("/sticky-file","/sticky-alias");check(fs.stat("/sticky-alias").mode==01000);
+            fs.snapshot("sticky-base");fs.fork("sticky-base","sticky-work");
+            Namespace::Attributes sticky;sticky.mode=01777;sticky.size=2;sticky.modified_ns=987;fs.set_attributes("/sticky-file",sticky);
+            check(fs.stat("/sticky-alias").mode==01777 && fs.stat("/sticky-file").size==2 && fs.stat("/sticky-file").modified_ns==987);
+            auto sticky_handle=fs.open("/sticky-file");fs.remove("/sticky-file",false);fs.remove("/sticky-alias",false);
+            sticky={};sticky.mode=01000;fs.handle_set_attributes(sticky_handle,sticky);check(fs.handle_stat(sticky_handle).mode==01000 && fs.handle_stat(sticky_handle).links==0);fs.close(sticky_handle);
+            check(Namespace(store,"sticky-base",true).stat("/sticky-file").mode==01000 && Namespace(store,"sticky-work").stat("/sticky-file").mode==01000);
+            fs.restore("sticky-base","sticky-safety");check(fs.stat("/sticky-file").mode==01000);fs.verify();store.collect_garbage();fs.verify();
+            auto stable_mode=committed_seq(store);auto stable_inode=fs.stat("/sticky-file");for(uint32_t bad:{02000u,04000u,010000u,0x80000000u}){Namespace::Attributes invalid;invalid.mode=bad;invalid.size=99;invalid.modified_ns=42;rejects([&]{fs.set_attributes("/sticky-file",invalid);});auto unchanged=fs.stat("/sticky-file");check(committed_seq(store)==stable_mode && unchanged.mode==stable_inode.mode && unchanged.size==stable_inode.size && unchanged.modified_ns==stable_inode.modified_ns && unchanged.changed_ns==stable_inode.changed_ns && unchanged.links==stable_inode.links && fs.read("/sticky-file")==Bytes{'S'});}
             Namespace::Attributes a;a.accessed_ns=0;a.birth_ns=42;a.modified_ns=123;a.mode=0700;a.size=2;fs.set_attributes("/f",a);
             n=fs.stat("/f");check(n.accessed_ns==0 && n.birth_ns==42 && n.modified_ns==123 && n.mode==0700 && n.size==2);
             fs.link("/f","/alias");check(fs.stat("/alias").birth_ns==42);fs.snapshot("base");fs.fork("base","work");

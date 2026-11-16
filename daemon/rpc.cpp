@@ -241,17 +241,17 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         op=op=="inode-stat"?"fs-lstat":op=="inode-dir-open"?"fs-dir-open":op=="inode-readlink"?"fs-readlink":"fs-open";
         args={op,path};if(op=="fs-open") {auto inode=fs.lstat(path);args.push_back(mode+(inode.symlink?",symlink":inode.fifo?",fifo,nofollow":",nofollow"));}
     } else if(op=="inode-create") {
-        auto path=child(args[1],args[2]);auto mode=number(args[3]);need(mode<=0777,"unsupported mode bits");creation_mode=static_cast<uint32_t>(mode);
+        auto path=child(args[1],args[2]);auto mode=number(args[3]);need(mode<=supported_mode_bits,"unsupported mode bits");creation_mode=static_cast<uint32_t>(mode);
         op="fs-open";args={op,path,"rw,create,exclusive,nofollow"};
     } else if(op=="inode-mkdir") {
-        auto path=child(args[1],args[2]);auto mode=number(args[3]);need(mode<=0777,"unsupported mode bits");
+        auto path=child(args[1],args[2]);auto mode=number(args[3]);need(mode<=supported_mode_bits,"unsupported mode bits");
         fs.mkdir(path,static_cast<uint32_t>(mode));return inode_json(fs.lstat(path));
     } else if(op=="inode-mkfifo") {
-        auto path=child(args[1],args[2]);auto mode=number(args[3]);need(mode<=0777,"unsupported mode bits");
+        auto path=child(args[1],args[2]);auto mode=number(args[3]);need(mode<=supported_mode_bits,"unsupported mode bits");
         fs.mkfifo(path,static_cast<uint32_t>(mode));return inode_json(fs.lstat(path));
     } else if(op=="inode-mksocket") {
         auto path=child(args[1],args[2]);
-        auto mode=number(args[3]);need(mode<=0777,"unsupported mode bits");
+        auto mode=number(args[3]);need(mode<=supported_mode_bits,"unsupported mode bits");
         fs.mksocket(path,static_cast<uint32_t>(mode));return inode_json(fs.lstat(path));
     } else if(op=="inode-symlink") {
         auto path=child(args[1],args[2]);fs.symlink(args[3],path);return inode_json(fs.lstat(path));
@@ -267,7 +267,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
             need(missing,"target already exists");}
         fs.rename(source,target);return inode_json(fs.lstat(target));
     } else if(op=="inode-setattr" || op=="inode-setattr-times" || op=="inode-setattr-flags") {
-        Namespace::Attributes a;if(args[2]!="-"){auto mode=number(args[2]);need(mode<=0777,"unsupported mode bits");a.mode=static_cast<uint32_t>(mode);}
+        Namespace::Attributes a;if(args[2]!="-"){auto mode=number(args[2]);need(mode<=supported_mode_bits,"unsupported mode bits");a.mode=static_cast<uint32_t>(mode);}
         if(args[3]!="-")a.size=number(args[3]);if(args[4]!="-")a.modified_ns=number(args[4]);
         size_t handle_index=5;
         if(op=="inode-setattr-times" || op=="inode-setattr-flags"){if(args[5]!="-")a.accessed_ns=number(args[5]);if(args[6]!="-")a.birth_ns=number(args[6]);handle_index=7;}
@@ -415,7 +415,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     if(op=="fs-chmod" || op=="fs-lchmod" || op=="fs-hchmod" || op=="fs-setmtime" || op=="fs-hsetmtime") {
         Namespace::Attributes a;
-        if(op=="fs-chmod" || op=="fs-lchmod" || op=="fs-hchmod"){auto mode=number(args[2],8);need(mode<=0777,"unsupported mode bits");a.mode=static_cast<uint32_t>(mode);}
+        if(op=="fs-chmod" || op=="fs-lchmod" || op=="fs-hchmod"){auto mode=number(args[2],8);need(mode<=supported_mode_bits,"unsupported mode bits");a.mode=static_cast<uint32_t>(mode);}
         else a.modified_ns=number(args[2]);
         if(op=="fs-hchmod" || op=="fs-hsetmtime")fs.handle_set_attributes(args[1],a);else if(op=="fs-lchmod")fs.set_link_attributes(args[1],a);else fs.set_attributes(args[1],a);
         return store.status();
@@ -431,8 +431,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     else if(op=="fs-save")fs.replace_file(args[1],std::vector<unsigned char>(args[2].begin(),args[2].end()));
     else if(op=="fs-write")fs.write(args[1],std::vector<unsigned char>(args[2].begin(),args[2].end()));
     else if(op=="fs-mkdir")fs.mkdir(args[1]);
-    else if(op=="fs-mkfifo"){auto mode=args.size()>2?number(args[2],8):0644;need(mode<=0777,"unsupported mode bits");fs.mkfifo(args[1],static_cast<uint32_t>(mode));}
-    else if(op=="fs-mksocket"){auto mode=args.size()>2?number(args[2],8):0777;need(mode<=0777,"unsupported mode bits");fs.mksocket(args[1],static_cast<uint32_t>(mode));}
+    else if(op=="fs-mkfifo"){auto mode=args.size()>2?number(args[2],8):0644;need(mode<=supported_mode_bits,"unsupported mode bits");fs.mkfifo(args[1],static_cast<uint32_t>(mode));}
+    else if(op=="fs-mksocket"){auto mode=args.size()>2?number(args[2],8):0777;need(mode<=supported_mode_bits,"unsupported mode bits");fs.mksocket(args[1],static_cast<uint32_t>(mode));}
     else if(op=="fs-unlink")fs.remove(args[1],false);
     else if(op=="fs-rmdir")fs.remove(args[1],true);
     else if(op=="fs-rename")fs.rename(args[1],args[2]);

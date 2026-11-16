@@ -2,6 +2,9 @@
 #include <cstdint>
 
 namespace forkfs {
+// Permission and sticky bits are persisted. Setuid, setgid, and higher bits
+// are outside the supported inode mode contract.
+inline constexpr uint32_t supported_mode_bits=01777;
 // Shared by the namespace and the FSKit RPC frontend. This is a logical size
 // bound, not an allocation reservation or a repository quota.
 // Matches the advertised FSKit pathconf link limit for files and directories.

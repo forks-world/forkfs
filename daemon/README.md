@@ -150,8 +150,12 @@ inode atomically, and revisions retain the original object IDs. Attributes do
 not contribute to the file-data `allocated_size` statistic.
 
 Values live at `\0forkfs/xattr/INODE/NAME` as ordinary CoW leaves. The inode's
-encoded mode word reserves bit 31 for attribute presence; the public mode remains
-0000..0777. Older daemons reject that mode marker, and the last removal clears it.
+encoded mode word reserves bit 31 for attribute presence; the public mode supports
+0000..01777, including the sticky bit. Setuid, setgid, and higher mode bits remain
+unsupported. Older daemons reject inode records carrying a sticky bit or the xattr
+marker when decoded; the last xattr removal clears the marker.
+See the [sticky mode validation record](../docs/evidence/2026-11-16-sticky-mode.json)
+for current-base regression results and APFS reference observations.
 Existing stores need no conversion. Orphan attributes use separate retention roots
 until final close/restart, and fs-check verifies their bounds and presence marker.
 Revision diff compares attribute names and object IDs independently of ctime,
@@ -499,7 +503,7 @@ Runtime handle capacity and options are checked before file mutation. The handle
 is reserved before durable publication and rolled back if publication fails.
 Successful mutation replies follow sync commit. A lost reply may still mean the
 file was created/truncated; mutation deduplication is not implemented. C++ creation
-mode defaults to 0644 and can be set to 0000..0777; existing file modes are preserved.
+mode defaults to 0644 and can be set to 0000..01777; existing file modes are preserved.
 RPC uses 0644. Umask/ACL enforcement remains future work. Concurrent exclusive creates produce one winner.
 
 Append-open mode (`w,append` / `rw,append`, optionally with create) requires
@@ -602,7 +606,8 @@ All requested fields are validated before any mutation. The FSKit adapter uses
 fields and an absent handle use `-`. The older `inode-setattr` operation remains
 available for existing clients. Inode RPC calls require a mounted session.
 
-Modes are octal 0000..0777. Times are integer nanoseconds since the Unix epoch in
+Modes are octal 0000..01777, including sticky; setuid, setgid and higher bits are
+rejected. Times are integer nanoseconds since the Unix epoch in
 0..INT64_MAX, including zero. New inodes initialize atime and birth time when
 created. Metadata updates advance ctime; content/size changes advance mtime,
 while atime and birth time remain stable unless explicitly set. Ordinary reads,
@@ -622,8 +627,11 @@ mode or time can change. Directory and
 unlinked regular-file and symlink-metadata handle attributes are supported. Live read-only access
 handles may set owner metadata; revision handles cannot. An all-dash change is
 a no-op after view/handle validation. Negative timestamps, uid/gid changes,
-ACLs, setuid/sticky bits and multi-user permission
-enforcement remain unsupported.
+ACLs, setuid/setgid bits and multi-user permission enforcement remain
+unsupported. Sticky mode is persisted as inode metadata. The daemon has no
+independent cross-user credential or authorization model; native kernel
+sticky-directory deletion/rename authorization is unqualified. The mounted
+root remains private at mode 0700.
 
 Directory metadata changes (mode, times and flags) are supported through both
 path setters. After attribute validation and the existing read-only, immutable,
@@ -1501,7 +1509,9 @@ Commands use inode identities, never host World paths: `inode-lookup PARENT NAME
 `inode-setattr-times INODE MODE SIZE MTIME ATIME BIRTH HANDLE`,
 `inode-setattr-flags INODE MODE SIZE MTIME ATIME BIRTH FLAGS HANDLE`,
 `inode-space`, and `inode-sync`. All require `--session`; the mount must keep the
-same World/revision selector. Modes are decimal 0000..0777. Setattr publishes
+same World/revision selector. Inode RPC modes are decimal 0..1023 (octal
+0000..01777), including sticky; setuid, setgid and higher bits are rejected.
+Setattr publishes
 size/content, mode, metadata flags and mtime/atime/birth time in one synchronous transaction; handle size changes
 require writable access. Subsequent I/O uses the existing session-owned `fs-h*`
 operations, preserving open-unlink behavior. Session loss is terminal for a mount.
