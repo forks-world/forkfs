@@ -1,0 +1,111 @@
+{
+  "date": "2026-11-16",
+  "feature": "POSIX FIFO metadata creation and kernel-managed transient streams",
+  "status": "implementation_and_daemon_callback_validation_passed; native_forkfs_mount_pending",
+  "scope": {
+    "standard_operation": "mkfifo(3)",
+    "inode_type_tag": 5,
+    "record_format": "existing inode record envelope",
+    "persistent_stream_buffer": false,
+    "fifo_metadata_invariants": [
+      "size is zero",
+      "not chunked",
+      "empty inline content marker is present"
+    ],
+    "older_reader_behavior": "Readers that accept inode tags 1 through 4 reject tag 5 during inode decoding; they fail closed instead of interpreting a FIFO as a regular file.",
+    "daemon_guards": {
+      "modern_backend_fifo_open": "ENOTSUP",
+      "legacy_backend_fifo_open": "The generic unsupported-handle error is retained because legacy file handles are unsupported.",
+      "regular_file_byte_io": "ENOTSUP",
+      "seek_region": "ESPIPE",
+      "any_size_setattr_including_zero": "EINVAL after existing validation and protection checks; no namespace publication"
+    },
+    "excluded": [
+      "mknod and device nodes",
+      "Unix socket paths",
+      "general POSIX or APFS compatibility",
+      "multiuser filesystem semantics"
+    ]
+  },
+  "baseline_mounted_forkfs": {
+    "installed_app": "/Users/hurricane/Applications/ForkFS.app",
+    "mounted": true,
+    "mkfifo": "rejected",
+    "errno": 45,
+    "log_sha256": "8e3499ad1acef49d3b53d0c647df608d2e13edac11a6032e97aa7bb2122641fc"
+  },
+  "initial_validation": {
+    "configuration": "Release WFS_FSKIT=ON",
+    "clean_first": true,
+    "ctest_passed": 73,
+    "ctest_failed": 3,
+    "exit_code": 8,
+    "failures": [
+      "FIFO RPC malformed-octal fixture expected typed EINVAL, while the existing parser reports the generic RPC error code.",
+      "Direct and loopback callback directory-enumeration fixtures did not account for the newly created FIFO."
+    ],
+    "log_sha256": "cbe1ba2110f29cb41092ffe9ed9de15604ee8684c92ed78d01b516c5223f1b13"
+  },
+  "final_validation": {
+    "configuration": "Release WFS_FSKIT=ON",
+    "clean_first": true,
+    "ctest_passed": 76,
+    "ctest_failed": 0,
+    "exit_code": 0,
+    "elapsed_seconds": 113.08,
+    "dependency_targets": {
+      "forkfsd": "passed",
+      "ForkFSExtension": "passed",
+      "ForkFSHost": "passed"
+    },
+    "coverage": [
+      "modern and legacy Namespace core behavior",
+      "FIFO RPC and CLI creation/type/regular-I/O guards",
+      "direct and loopback FSKit callback creation/type/size/unlink behavior"
+    ],
+    "daemon_sha256": "b6968b68799d6acea0450e6edbd922d0ab36b79ff3b6bb98458319b8fbb173d2",
+    "cpp_test_sha256": "1fe217e0e965d868cc330d3f2fe11c26de7e5cd687284b93421f9e4291ef0bb6",
+    "extension_sha256": "3604508ca7ec4386c695eba090bfafdc8c57728482bd37cb5f5db71345072bca",
+    "bridge_test_sha256": "494abdf865fa5f4590db7dfccbfe52d0c8ed1d3d8261d23ad9ec60edc0e2b299",
+    "validation_log_sha256": "89f1f0ccde8e81e5aab9a20a8738e26b90b59bcb1d71f51cda188eac222a570a",
+    "ctest_log_sha256": "0846b92b54ecc54b56ff25d1e5f698db1825813ab5eaf68fa0dd54197ee5bc51"
+  },
+  "apfs_reference": {
+    "exit_code": 0,
+    "filesystem": "apfs",
+    "checks": [
+      "mkfifo type/mode/size",
+      "ENXIO without reader",
+      "EOF without writer",
+      "EAGAIN with active writer",
+      "binary pipe data",
+      "EOF after writer close",
+      "ESPIPE",
+      "open descriptor after hardlink/rename/unlink"
+    ],
+    "log_sha256": "fd90fe0a2b3ecd6cf4b9ff36b57a0f89e0c322ec324d3ea55e9ca950ea4ca30a",
+    "limitation": "APFS reference behavior does not establish FIFO stream behavior on a ForkFS mount."
+  },
+  "native_forkfs_candidate": {
+    "status": "blocked_by_keychain_unlock",
+    "signed": false,
+    "installed": false,
+    "mounted": false,
+    "reason": "codesign errSecInternalComponent; security reports User interaction is not allowed",
+    "original_app_untouched": true,
+    "signing_log_sha256": "06b6c4c03427e282863978bb40ffdacb89350068908c35152c23f6e5fad0ad52",
+    "result": "pending; no candidate ForkFS mounted FIFO IPC claim"
+  },
+  "candidate_source_sha256": {
+    "daemon/CMakeLists.txt": "1038a65285fc78c790efdc5b7edeb826fb212e970ae7a9d0fb022e1b87f2ee42",
+    "daemon/namespace.cpp": "a87a699a9d6cc80241fda43991575d8084e01fbf73a14d40310698a457e440e5",
+    "daemon/namespace.h": "848f953b0978ba8cb3715d3aa1cbbe11763ccfc631ce5cea4b1bae2f7d2e691f",
+    "daemon/rpc.cpp": "868ec38311513f3916ede4310bf15c319469b182fe27e7d1a0cb584946d832af",
+    "daemon/main.cpp": "c6b67a277d01e952274931a8b439d9e830c72883599681fa29efcf1f22d7b6fa",
+    "daemon/tests/fifo.cpp": "71a24f34be96848c46701c28f69f31096f42cbc83a417cbcb604a1002f0bf7b1",
+    "daemon/tests/fifo_rpc.py": "4147929fa8d22e04d7b45b1393ef6cc07ab99b8babdb2c34ad3a94c9acd4c069",
+    "macos/forkfs/RevisionVolume.mm": "c209315fd60eeef08e43966fcda0ad51f999d827fd32b13adae5de4e183dcabb",
+    "macos/forkfs/tests/BridgeTest.mm": "f1d657fa02de37097c148e4407535133e31a68dc8442a8ca7392ffdb268aad02",
+    "scripts/tests/fifo_mount.py": "0df04ec5c92efa93c2fef39151af238ae9362b64019aafd0de58aa9901a4c50f"
+  }
+}

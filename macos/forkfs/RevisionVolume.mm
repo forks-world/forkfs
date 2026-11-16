@@ -19,7 +19,7 @@ NSDictionary* object(const std::string& value){
     require([result isKindOfClass:NSDictionary.class],EPROTO,"invalid daemon JSON");return result;
 }
 NSError* posix(int code){return fs_errorForPOSIXError(code);}
-FSItemType itemType(NSDictionary* a){return [a[@"directory"] boolValue]?FSItemTypeDirectory:[a[@"symlink"] boolValue]?FSItemTypeSymlink:FSItemTypeFile;}
+FSItemType itemType(NSDictionary* a){return [a[@"directory"] boolValue]?FSItemTypeDirectory:[a[@"fifo"] boolValue]?FSItemTypeFIFO:[a[@"symlink"] boolValue]?FSItemTypeSymlink:FSItemTypeFile;}
 NSString* timestamp(timespec t) {
     require(t.tv_sec>=0 && t.tv_nsec>=0 && t.tv_nsec<1000000000 &&
         uint64_t(t.tv_sec)<=(uint64_t(INT64_MAX)-uint64_t(t.tv_nsec))/1000000000,EINVAL,"invalid inode time");
@@ -200,6 +200,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 }
 - (void)setAttributes:(FSItemSetAttributesRequest*)request onItem:(FSItem*)item replyHandler:(void(^)(FSItemAttributes*,NSError*))reply {
     __block FSItemAttributes* a=nil;NSError* e=[self perform:^{[self writable];RevisionItem* it=[self item:item];
+        require(itemType(it.attrs)!=FSItemTypeFIFO || ![request isValid:FSItemAttributeSize],EINVAL,"FIFO size is fixed at zero");
         require(it!=_root || ![request isValid:FSItemAttributeMode] || request.mode==0700,EPERM,"mount root must remain private");
         NSString* mode=[request isValid:FSItemAttributeMode]?[@(request.mode) stringValue]:@"-";
         NSString* size=[request isValid:FSItemAttributeSize]?[@(request.size) stringValue]:@"-";
@@ -233,6 +234,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
         auto mode=[request isValid:FSItemAttributeMode]?request.mode:(type==FSItemTypeDirectory?0755:0644);
         require(mode<=0777,ENOTSUP,"unsupported creation mode");NSDictionary* attrs;
         if(type==FSItemTypeDirectory)attrs=[self json:@[@"inode-mkdir",dir.inode,name.string,[@(mode) stringValue]]];
+        else if(type==FSItemTypeFIFO)attrs=[self json:@[@"inode-mkfifo",dir.inode,name.string,[@(mode) stringValue]]];
         else {require(type==FSItemTypeFile,ENOTSUP,"unsupported creation type");
             NSString* handle=[self json:@[@"inode-create",dir.inode,name.string,[@(mode) stringValue]]][@"handle"];
             @try{attrs=[self json:@[@"fs-hstat",handle]];}@finally{[self json:@[@"fs-close",handle]];}}
@@ -307,7 +309,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 }
 - (BOOL)isOpenCloseInhibited{return NO;}
 - (void)openItem:(FSItem*)item withModes:(FSVolumeOpenModes)modes replyHandler:(void(^)(NSError*))reply {
-    NSError* e=[self perform:^{auto it=[self item:item];if(itemType(it.attrs)==FSItemTypeDirectory){require(!(modes&FSVolumeOpenModesWrite),EISDIR,"directory is not writable as a file");return;}require(itemType(it.attrs)==FSItemTypeFile || itemType(it.attrs)==FSItemTypeSymlink,ENOTSUP,"unsupported open inode type");
+    NSError* e=[self perform:^{auto it=[self item:item];if(itemType(it.attrs)==FSItemTypeDirectory){require(!(modes&FSVolumeOpenModesWrite),EISDIR,"directory is not writable as a file");return;}if(itemType(it.attrs)==FSItemTypeFIFO)return;require(itemType(it.attrs)==FSItemTypeFile || itemType(it.attrs)==FSItemTypeSymlink,ENOTSUP,"unsupported open inode type");
         if((modes&FSVolumeOpenModesWrite) && !it.writer){[self writable];it.writer=[self json:@[@"inode-open",it.inode,@"rw,positioned-append"]][@"handle"];}
         if((modes&FSVolumeOpenModesRead) && !it.reader && !it.writer)it.reader=[self json:@[@"inode-open",it.inode,@"r"]][@"handle"];
     }];reply(e);
@@ -323,7 +325,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
     }];reply(e);
 }
 - (void)readFromFile:(FSItem*)item offset:(off_t)offset length:(size_t)length intoBuffer:(FSMutableFileDataBuffer*)buffer replyHandler:(void(^)(size_t,NSError*))reply {
-    __block size_t count=0;NSError* e=[self perform:^{require(offset>=0,EINVAL,"negative read offset");auto it=[self item:item];require(itemType(it.attrs)!=FSItemTypeSymlink,EPERM,"symbolic link handle forbids data I/O");NSString* handle=[self handle:it];require(handle!=nil,EBADF,"file is not open");
+    __block size_t count=0;NSError* e=[self perform:^{require(offset>=0,EINVAL,"negative read offset");auto it=[self item:item];require(itemType(it.attrs)!=FSItemTypeFIFO,ENOTSUP,"FIFO stream is kernel managed");require(itemType(it.attrs)!=FSItemTypeSymlink,EPERM,"symbolic link handle forbids data I/O");NSString* handle=[self handle:it];require(handle!=nil,EBADF,"file is not open");
         const auto wanted=MIN(length,buffer.length);
         while(count<wanted){auto data=[self call:@[@"fs-hread",handle,[@(uint64_t(offset)+count) stringValue],[@(MIN(wanted-count,size_t(256*1024))) stringValue]]];
             require(data.size()<=MIN(wanted-count,size_t(256*1024)),EPROTO,"oversized daemon read");if(data.empty())break;
@@ -331,7 +333,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
     }];reply(count,e);
 }
 - (void)writeContents:(NSData*)contents toFile:(FSItem*)item atOffset:(off_t)offset replyHandler:(void(^)(size_t,NSError*))reply {
-    __block size_t count=0;NSError* e=[self perform:^{[self writable];require(offset>=0,EINVAL,"negative write offset");auto it=[self item:item];require(itemType(it.attrs)!=FSItemTypeSymlink,EPERM,"symbolic link handle forbids data I/O");require(it.writer!=nil,EBADF,"file is not open for writing");
+    __block size_t count=0;NSError* e=[self perform:^{require(offset>=0,EINVAL,"negative write offset");auto it=[self item:item];require(itemType(it.attrs)!=FSItemTypeFIFO,ENOTSUP,"FIFO stream is kernel managed");[self writable];require(itemType(it.attrs)!=FSItemTypeSymlink,EPERM,"symbolic link handle forbids data I/O");require(it.writer!=nil,EBADF,"file is not open for writing");
         // FSKit can exceed ioSize in a single callback. Complete it using
         // bounded RPCs; ioSize is a preference rather than a request limit.
         require(contents.length==0 || (uint64_t(offset)<=forkfs::maximum_file_bytes && contents.length<=forkfs::maximum_file_bytes-uint64_t(offset)),EFBIG,"file exceeds 1 TiB");
