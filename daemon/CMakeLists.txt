@@ -309,6 +309,9 @@ target_include_directories(forkfsd_trailing_paths_test PRIVATE ${CMAKE_CURRENT_S
 target_link_libraries(forkfsd_trailing_paths_test PRIVATE forkfs_metadata)
 add_test(NAME forkfsd_trailing_paths COMMAND forkfsd_trailing_paths_test)
 set_tests_properties(forkfsd_trailing_paths PROPERTIES TIMEOUT 120)
+add_test(NAME forkfsd_trailing_mutations_rpc COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/trailing_mutations_rpc.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_trailing_mutations_rpc PROPERTIES TIMEOUT 120)
 
 add_executable(forkfsd_mkdir_trailing_test tests/mkdir_trailing.cpp
     $<TARGET_OBJECTS:forkfs_common> $<TARGET_OBJECTS:forkfs_container_obj>

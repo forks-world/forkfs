@@ -1,0 +1,606 @@
+{
+  "feature": "APFS-style trailing-slash directory mutations in revision Namespace",
+  "base_sha": "00795b6f6799fd2591f1fa1b71402ba4abbc843e",
+  "tested_candidate_tree": "d22e250f3e753865e1beab4394fcb7105c4671da",
+  "environment": {
+    "os": "ProductName:\t\tmacOS\nProductVersion:\t\t27.2.1\nBuildVersion:\t\t26B131\n",
+    "arch": "arm64",
+    "sdk": "27.2",
+    "compiler": "Apple clang version 21.0.0 (clang-2100.4.1.1)\nTarget: arm64-apple-darwin27.2.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin\n",
+    "cmake": "cmake version 4.4.3\n\nCMake suite maintained and supported by Kitware (kitware.com/cmake).\n",
+    "reference": "owned scratch on APFS; direct Python os.rmdir/os.unlink/os.rename; no mounted forkfs claim"
+  },
+  "validation": {
+    "release_fskit_on_clean_build": "passed",
+    "ctest": {
+      "passed": 82,
+      "failed": 0,
+      "elapsed_seconds": 122.82,
+      "parallelism": 2,
+      "timeout_seconds": 600
+    },
+    "system_dependencies": "passed",
+    "trailing_paths_seconds": 2.57,
+    "trailing_mutations_rpc_seconds": 2.37,
+    "baseline_new_rpc_regression": "fails at fs-rmdir /remove-alias/ with RPC generic status 1: trailing slash is unsupported",
+    "audit_sha256": "400856dbfba2cb8643194c06811d400c031b74ab1a7717e8ac982e13c45a3a81",
+    "logs_sha256": {
+      "validate.log": "789909e9db3f948777b31d4d31f01564f2be763a84e007d1425010281f990fa5",
+      "LastTest.log": "85bb9598dc228d10914bd1dee4ed5c1b7db7beecf258c86fb5e6cd5a5d5951fc",
+      "baseline-new-rpc.log": "162fdf7b2185d9b7f98231f9e51d8cc90749fc31481df6d322d2889fd919d775",
+      "baseline-regression.log": "d983e055c174fd721e1b6820c4c9c5628af0f36136a4d62924ba033c8bea1e42"
+    },
+    "source_files_sha256": {
+      "daemon/CMakeLists.txt": "0cbfa21258e96df513373f9bda316b575e921a03a07b1b22257815fa633a95d2",
+      "daemon/namespace.cpp": "c4cef09f42d57720745a5a983636e7682b762f12893c31d4c96c8e81fd5f4bdf",
+      "daemon/tests/trailing_paths.cpp": "23fb3a576cb5cebb502bee0f0259d59fc0ec8a25c3970b4c2970f1d5f9f75c6e",
+      "daemon/tests/trailing_mutations_rpc.py": "eeadb0a87ff662b89fb9cd382eb614bb5078aaf30a8503b5f3a3fcd7fc0528e6"
+    }
+  },
+  "scope": {
+    "cpp": "modern and legacy Namespace; physical identity, symlink preservation, cross-parent links/data, ancestry cycles, raw byte limits, typed failure atomicity",
+    "rpc_and_offline_cli": "modern backend regression",
+    "rename_exclusive": "same physical slash parser; existing destination EEXIST",
+    "native_fskit_mount": "not tested for this feature; no added callback or mount claim",
+    "persistence": "offline CLI operations reopen storage; C++ suite verifies/reopens storage and existing revision invariants"
+  },
+  "reference": {
+    "filesystem": "APFS; direct host os calls in owned scratch",
+    "cases": [
+      {
+        "dir_exists": false,
+        "errno": 0,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rmdir",
+        "paths": [
+          "dir/"
+        ],
+        "remaining": [
+          "dangling",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": false,
+        "errno": 0,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rmdir",
+        "paths": [
+          "dir///"
+        ],
+        "remaining": [
+          "dangling",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": false,
+        "errno": 0,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rmdir",
+        "paths": [
+          "ldir/"
+        ],
+        "remaining": [
+          "dangling",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": true,
+        "errno": 20,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rmdir",
+        "paths": [
+          "file/"
+        ],
+        "remaining": [
+          "dangling",
+          "dir",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": true,
+        "errno": 2,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rmdir",
+        "paths": [
+          "missing/"
+        ],
+        "remaining": [
+          "dangling",
+          "dir",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": true,
+        "errno": 2,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rmdir",
+        "paths": [
+          "dangling/"
+        ],
+        "remaining": [
+          "dangling",
+          "dir",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": true,
+        "errno": 1,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "unlink",
+        "paths": [
+          "dir/"
+        ],
+        "remaining": [
+          "dangling",
+          "dir",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": true,
+        "errno": 20,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "unlink",
+        "paths": [
+          "file/"
+        ],
+        "remaining": [
+          "dangling",
+          "dir",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": true,
+        "errno": 1,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "unlink",
+        "paths": [
+          "ldir/"
+        ],
+        "remaining": [
+          "dangling",
+          "dir",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": false,
+        "errno": 0,
+        "ldir_is_symlink": true,
+        "moved_is_dir": true,
+        "moved_is_symlink": false,
+        "operation": "rename",
+        "paths": [
+          "dir/",
+          "moved"
+        ],
+        "remaining": [
+          "dangling",
+          "empty",
+          "file",
+          "ldir",
+          "lempty",
+          "moved"
+        ]
+      },
+      {
+        "dir_exists": false,
+        "errno": 0,
+        "ldir_is_symlink": true,
+        "moved_is_dir": true,
+        "moved_is_symlink": false,
+        "operation": "rename",
+        "paths": [
+          "dir",
+          "moved/"
+        ],
+        "remaining": [
+          "dangling",
+          "empty",
+          "file",
+          "ldir",
+          "lempty",
+          "moved"
+        ]
+      },
+      {
+        "dir_exists": false,
+        "errno": 0,
+        "ldir_is_symlink": true,
+        "moved_is_dir": true,
+        "moved_is_symlink": false,
+        "operation": "rename",
+        "paths": [
+          "dir/",
+          "moved/"
+        ],
+        "remaining": [
+          "dangling",
+          "empty",
+          "file",
+          "ldir",
+          "lempty",
+          "moved"
+        ]
+      },
+      {
+        "dir_exists": false,
+        "errno": 0,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rename",
+        "paths": [
+          "dir/",
+          "empty/"
+        ],
+        "remaining": [
+          "dangling",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": false,
+        "errno": 0,
+        "ldir_is_symlink": true,
+        "moved_is_dir": true,
+        "moved_is_symlink": false,
+        "operation": "rename",
+        "paths": [
+          "ldir/",
+          "moved"
+        ],
+        "remaining": [
+          "dangling",
+          "empty",
+          "file",
+          "ldir",
+          "lempty",
+          "moved"
+        ]
+      },
+      {
+        "dir_exists": true,
+        "errno": 2,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rename",
+        "paths": [
+          "ldir",
+          "moved/"
+        ],
+        "remaining": [
+          "dangling",
+          "dir",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": false,
+        "errno": 0,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rename",
+        "paths": [
+          "dir",
+          "lempty/"
+        ],
+        "remaining": [
+          "dangling",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": true,
+        "errno": 20,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rename",
+        "paths": [
+          "file/",
+          "moved"
+        ],
+        "remaining": [
+          "dangling",
+          "dir",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": true,
+        "errno": 2,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rename",
+        "paths": [
+          "file",
+          "moved/"
+        ],
+        "remaining": [
+          "dangling",
+          "dir",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": true,
+        "errno": 20,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rename",
+        "paths": [
+          "dir/",
+          "file/"
+        ],
+        "remaining": [
+          "dangling",
+          "dir",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": true,
+        "errno": 2,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rename",
+        "paths": [
+          "missing",
+          "file/"
+        ],
+        "remaining": [
+          "dangling",
+          "dir",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": true,
+        "errno": 0,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rename",
+        "paths": [
+          "dir/",
+          "dir/"
+        ],
+        "remaining": [
+          "dangling",
+          "dir",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": true,
+        "errno": 0,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rename",
+        "paths": [
+          "ldir/",
+          "ldir/"
+        ],
+        "remaining": [
+          "dangling",
+          "dir",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": false,
+        "errno": 0,
+        "ldir_is_symlink": true,
+        "moved_is_dir": true,
+        "moved_is_symlink": false,
+        "operation": "rename",
+        "paths": [
+          "dir///",
+          "moved///"
+        ],
+        "remaining": [
+          "dangling",
+          "empty",
+          "file",
+          "ldir",
+          "lempty",
+          "moved"
+        ]
+      },
+      {
+        "dir_exists": true,
+        "errno": 2,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rename",
+        "paths": [
+          "dangling/",
+          "moved"
+        ],
+        "remaining": [
+          "dangling",
+          "dir",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": false,
+        "errno": 0,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rename",
+        "paths": [
+          "dir",
+          "dangling/"
+        ],
+        "remaining": [
+          "absent",
+          "dangling",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": true,
+        "errno": 21,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rename",
+        "paths": [
+          "file",
+          "empty/"
+        ],
+        "remaining": [
+          "dangling",
+          "dir",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "dir_exists": true,
+        "errno": 21,
+        "ldir_is_symlink": true,
+        "moved_is_dir": false,
+        "moved_is_symlink": false,
+        "operation": "rename",
+        "paths": [
+          "ldir",
+          "empty/"
+        ],
+        "remaining": [
+          "dangling",
+          "dir",
+          "empty",
+          "file",
+          "ldir",
+          "lempty"
+        ]
+      },
+      {
+        "target": "absent/",
+        "errno": 0,
+        "entries": [
+          "absent",
+          "link"
+        ],
+        "link": "absent/"
+      },
+      {
+        "target": "./absent/",
+        "errno": 0,
+        "entries": [
+          "absent",
+          "link"
+        ],
+        "link": "./absent/"
+      },
+      {
+        "target": "dir/../absent/",
+        "errno": 0,
+        "entries": [
+          "absent",
+          "link"
+        ],
+        "link": "dir/../absent/"
+      }
+    ]
+  },
+  "remote_ci": "not yet run at time of local validation"
+}
