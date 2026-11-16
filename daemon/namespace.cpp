@@ -945,6 +945,7 @@ void Namespace::clone_file(const std::string& source,const std::string& target) 
         auto source_id=resolve(view,source);
         auto original=inode(view,source_id);
         if(original.directory)throw std::system_error(EISDIR,std::generic_category(),"cannot clone a directory");
+        if(original.fifo)throw std::system_error(ENOTSUP,std::generic_category(),"cannot clone a FIFO");
         need(!original.symlink,"cannot clone a non-regular file");
 
         auto destination=parent(view,target);
@@ -1115,11 +1116,12 @@ void Namespace::set_path_attributes(const std::string& path,const Attributes& a,
 void Namespace::handle_set_attributes(const std::string& token,const Attributes& a) {
     valid_attributes(a);need(!revision_,"revision view is read-only");
     std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);
-    if(a.size && !info.writable)bad_handle("handle is not writable");
     NamespaceView view(*container_.journal_,view_,revision_);bool linked=view.contains(inode_key(info.inode));
     auto key=linked?inode_key(info.inode):orphan_prefix(view_,info.inode)+"inode";
     auto n=linked?inode(view,info.inode):decode_inode(container_.journal_->get(key),info.inode,true);
-    if(n.fifo && a.size)throw std::system_error(EINVAL,std::generic_category(),"FIFO size is fixed at zero");mutable_attributes(n,a,info.writable);
+    if(n.fifo && a.size)throw std::system_error(EINVAL,std::generic_category(),"FIFO size is fixed at zero");
+    if(a.size && !info.writable)bad_handle("handle is not writable");
+    mutable_attributes(n,a,info.writable);
     need(!n.symlink || !a.size,"invalid symbolic link size change");
     if(!a.mode && !a.modified_ns && !a.size && !a.accessed_ns && !a.birth_ns && !a.flags)return;
     if(a.size && *a.size==n.size && !a.mode && !a.modified_ns && !a.accessed_ns && !a.birth_ns && !a.flags)return;
@@ -1309,6 +1311,7 @@ std::string Namespace::open(const std::string& path,Access access,const OpenOpti
     need(!options.truncate || access!=Access::Read,"truncate open requires writable access");
     need(!options.append || access!=Access::Read,"append open requires writable access");
     need(!options.symlink || (!options.create && !options.truncate && !options.append && !options.nofollow),"invalid symlink open options");
+    need(!options.fifo || (access==Access::Read && !options.create && !options.exclusive && !options.truncate && !options.append && !options.positioned_append && !options.symlink),"invalid FIFO open options");
     need(options.mode<=0777,"invalid creation mode");
     need(!revision_ || (access==Access::Read && !options.create && !options.truncate),"revision view is read-only");
     std::lock_guard lock(container_.mutex_);auto& j=*container_.journal_;
@@ -1331,7 +1334,11 @@ std::string Namespace::open(const std::string& path,Access access,const OpenOpti
         }
     } else {id=resolve(view,path,!(options.nofollow || options.symlink));need(!options.nofollow || !inode(view,id).symlink,"final symbolic link is forbidden");}
     if(changes.empty()) {
-        auto n=inode(view,id);if(n.fifo)throw std::system_error(ENOTSUP,std::generic_category(),"FIFO opens are kernel managed");if(access!=Access::Read || options.truncate || options.append)mutable_inode(n);need(!n.directory,"cannot read a directory");need(!n.symlink || options.symlink,"symbolic link open is forbidden");
+        auto n=inode(view,id);
+        if(n.fifo && !options.fifo)throw std::system_error(ENOTSUP,std::generic_category(),"FIFO opens are kernel managed");
+        if(options.fifo && !n.fifo)throw std::system_error(EINVAL,std::generic_category(),"FIFO metadata open requires a FIFO");
+        if(!n.fifo && (access!=Access::Read || options.truncate || options.append))mutable_inode(n);
+        need(!n.directory,"cannot read a directory");need(!n.symlink || options.symlink,"symbolic link open is forbidden");
         if(n.flags&file_flag_append){
             if(options.truncate || (access!=Access::Read && !options.append && !options.positioned_append))non_append_inode(n);
         }
@@ -1390,11 +1397,14 @@ bool Namespace::try_lock_range(const std::string& token,Lock mode,uint64_t start
 }
 uint64_t Namespace::seek(const std::string& token,int64_t offset,Seek origin) {
     std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);uint64_t base=0;
+    NamespaceView view(*container_.journal_,view_,revision_);
+    auto id_key=inode_key(info.inode);
+    bool linked=view.contains(id_key);
+    auto opened_inode=linked?inode(view,info.inode):decode_inode(container_.journal_->get(orphan_prefix(view_,info.inode)+"inode"),info.inode,true);
+    if(opened_inode.fifo)throw std::system_error(ESPIPE,std::generic_category(),"FIFO is not seekable");
     if(origin==Seek::Current)base=info.cursor->position;
-    else if(origin==Seek::End){NamespaceView view(*container_.journal_,view_,revision_);
-        base=view.contains(inode_key(info.inode))?inode(view,info.inode).size:
-            decode_inode(container_.journal_->get(orphan_prefix(view_,info.inode)+"inode"),info.inode,true).size;
-    } else need(origin==Seek::Set,"invalid seek origin");
+    else if(origin==Seek::End)base=opened_inode.size;
+    else need(origin==Seek::Set,"invalid seek origin");
     if(base>INT64_MAX)throw std::system_error(EOVERFLOW,std::generic_category(),"file position overflow");uint64_t result;
     if(offset<0){auto magnitude=uint64_t(-(offset+1))+1;if(magnitude>base)throw std::system_error(EINVAL,std::generic_category(),"negative file position");result=base-magnitude;}
     else {if(uint64_t(offset)>uint64_t(INT64_MAX)-base)throw std::system_error(EOVERFLOW,std::generic_category(),"file position overflow");result=base+uint64_t(offset);}

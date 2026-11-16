@@ -309,8 +309,8 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 }
 - (BOOL)isOpenCloseInhibited{return NO;}
 - (void)openItem:(FSItem*)item withModes:(FSVolumeOpenModes)modes replyHandler:(void(^)(NSError*))reply {
-    NSError* e=[self perform:^{auto it=[self item:item];if(itemType(it.attrs)==FSItemTypeDirectory){require(!(modes&FSVolumeOpenModesWrite),EISDIR,"directory is not writable as a file");return;}if(itemType(it.attrs)==FSItemTypeFIFO)return;require(itemType(it.attrs)==FSItemTypeFile || itemType(it.attrs)==FSItemTypeSymlink,ENOTSUP,"unsupported open inode type");
-        if((modes&FSVolumeOpenModesWrite) && !it.writer){[self writable];it.writer=[self json:@[@"inode-open",it.inode,@"rw,positioned-append"]][@"handle"];}
+    NSError* e=[self perform:^{auto it=[self item:item];auto type=itemType(it.attrs);if(type==FSItemTypeDirectory){require(!(modes&FSVolumeOpenModesWrite),EISDIR,"directory is not writable as a file");return;}BOOL fifo=type==FSItemTypeFIFO;require(fifo || type==FSItemTypeFile || type==FSItemTypeSymlink,ENOTSUP,"unsupported open inode type");
+        if((modes&FSVolumeOpenModesWrite) && !it.writer){if(!fifo)[self writable];it.writer=[self json:fifo?@[@"inode-open",it.inode,@"r"]:@[@"inode-open",it.inode,@"rw,positioned-append"]][@"handle"];}
         if((modes&FSVolumeOpenModesRead) && !it.reader && !it.writer)it.reader=[self json:@[@"inode-open",it.inode,@"r"]][@"handle"];
     }];reply(e);
 }

@@ -237,7 +237,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     else if(op=="inode-stat" || op=="inode-dir-open" || op=="inode-readlink" || op=="inode-open") {
         auto path=fs.path_for_inode(args[1]);auto mode=op=="inode-open"?args[2]:"";
         op=op=="inode-stat"?"fs-lstat":op=="inode-dir-open"?"fs-dir-open":op=="inode-readlink"?"fs-readlink":"fs-open";
-        args={op,path};if(op=="fs-open")args.push_back(mode+(fs.lstat(path).symlink?",symlink":",nofollow"));
+        args={op,path};if(op=="fs-open") {auto inode=fs.lstat(path);args.push_back(mode+(inode.symlink?",symlink":inode.fifo?",fifo,nofollow":",nofollow"));}
     } else if(op=="inode-create") {
         auto path=child(args[1],args[2]);auto mode=number(args[3]);need(mode<=0777,"unsupported mode bits");creation_mode=static_cast<uint32_t>(mode);
         op="fs-open";args={op,path,"rw,create,exclusive,nofollow"};
@@ -323,6 +323,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
             else if(flag=="append")options.append=true;
             else if(flag=="nofollow")options.nofollow=true;
             else if(flag=="symlink")options.symlink=true;
+            else if(flag=="fifo")options.fifo=true;
             else throw std::runtime_error("unsupported open flag");
         }
         need(activity.session->handles.size()<256,"session handle limit reached");

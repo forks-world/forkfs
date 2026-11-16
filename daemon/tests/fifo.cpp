@@ -34,6 +34,35 @@ int main(){
                 rejects([&]{fs.seek_region("/pipe",0,true);},ESPIPE);
                 fs.set_xattr("/pipe","user.test",Bytes{'v'});fs.link("/pipe","/alias");
                 check(fs.lstat("/alias").fifo && fs.lstat("/alias").id==pipe.id && fs.lstat("/alias").links==2);
+                if(!legacy){
+                    rejects([&]{fs.clone_file("/pipe","/fifo-copy");},ENOTSUP);
+                    fs.symlink("/pipe","/pipe-link");rejects([&]{fs.clone_file("/pipe-link","/fifo-link-copy");},ENOTSUP);
+                    Namespace::OpenOptions metadata;metadata.fifo=true;metadata.nofollow=true;
+                    fs.mkfifo("/pinned",0600);fs.set_xattr("/pinned","user.test",Bytes{'v'});
+                    auto pinned=fs.lstat("/pinned");auto pin=fs.open("/pinned",Namespace::Access::Read,metadata);auto duplicate=fs.dup(pin);
+                    check(fs.handle_stat(pin).fifo && fs.handle_stat(pin).id==pinned.id);
+                    fs.snapshot("fifo-pin-base");Namespace read_only(store,"fifo-pin-base",true);
+                    auto revision_pin=read_only.open("/pinned",Namespace::Access::Read,metadata);
+                    check(read_only.handle_stat(revision_pin).fifo);
+                    Namespace::Attributes revision_mode;revision_mode.mode=0640;
+                    rejects([&]{read_only.handle_set_attributes(revision_pin,revision_mode);});
+                    read_only.close(revision_pin);
+                    rejects([&]{fs.seek(pin,0,Namespace::Seek::Set);},ESPIPE);
+                    rejects([&]{fs.handle_read(pin,0,1);},ENOTSUP);
+                    rejects([&]{fs.open("/pinned",Namespace::Access::Read);},ENOTSUP);
+                    rejects([&]{fs.open("/pipe",Namespace::Access::ReadWrite,metadata);});
+                    Namespace::Attributes invalid_size;invalid_size.size=0;rejects([&]{fs.handle_set_attributes(pin,invalid_size);},EINVAL);
+                    fs.write("/new",Bytes{'n','e','w'});fs.rename("/new","/pinned");
+                    check(!fs.lstat("/pinned").fifo && fs.lstat("/pinned").id!=pinned.id);
+                    check(fs.handle_stat(pin).fifo && fs.handle_stat(pin).links==0 && fs.handle_stat(pin).size==0);
+                    check(fs.handle_get_xattr(pin,"user.test")==Bytes{'v'});
+                    Namespace::Attributes orphan_mode;orphan_mode.mode=0640;fs.handle_set_attributes(pin,orphan_mode);
+                    check(fs.handle_stat(pin).mode==0640 && fs.lstat("/pinned").mode==0644);
+                    fs.close(pin);check(fs.handle_stat(duplicate).links==0);
+                    fs.close(duplicate);store.collect_garbage();
+                    rejects([&]{fs.handle_stat(duplicate);},EBADF);
+                    fs.remove("/pinned",false);
+                }
                 fs.rename("/alias","/renamed");check(fs.lstat("/renamed").fifo && fs.lstat("/renamed").id==pipe.id);
                 fs.snapshot("fifo-base");Namespace base(store,"fifo-base",true);check(base.lstat("/renamed").fifo);
                 fs.verify();base.verify();store.verify();

@@ -53,8 +53,17 @@ with tempfile.TemporaryDirectory(prefix='ff-fifo-rpc-',dir='/tmp') as tmp:
         rootinfo=obj('inode-root',*sel);rid=rootinfo['inode']['inode_id']
         inodepipe=obj('inode-mkfifo',rid,'inode-pipe',str(0o600),*sel)
         assert inodepipe['fifo'] and inodepipe['mode']==0o600
-        rpc('inode-open',inodepipe['inode_id'],'r',*sel,error=errno.ENOTSUP)
-        rpc('inode-remove',rid,'inode-pipe',inodepipe['inode_id'],'file',*sel)
+        rpc('inode-xattr-set',inodepipe['inode_id'],'user.keep','create',b'v',*sel)
+        pin=obj('inode-open',inodepipe['inode_id'],'r',*sel)['handle'];duplicate=obj('fs-dup',pin,*sel)['handle']
+        rpc('fs-hseek',pin,'0','set',*sel,error=errno.ESPIPE)
+        rpc('fs-hread',pin,'0','0',*sel,error=errno.ENOTSUP)
+        rpc('inode-setattr',inodepipe['inode_id'],'-','0','-',pin,*sel,error=errno.EINVAL)
+        rpc('fs-write','/replacement',b'file',*sel);rpc('fs-rename','/replacement','/inode-pipe',*sel)
+        assert obj('fs-hstat',pin,*sel)['fifo'] and obj('fs-hstat',pin,*sel)['links']==0
+        assert rpc('fs-hxattr-get',pin,'user.keep',*sel)==b'v'
+        rpc('fs-hchmod',pin,'640',*sel);assert obj('fs-hstat',pin,*sel)['mode']==0o640
+        rpc('fs-close',pin,*sel);assert obj('fs-hstat',duplicate,*sel)['links']==0
+        rpc('fs-close',duplicate,*sel);rpc('fs-unlink','/inode-pipe',*sel)
         obj('fs-check');rpc('session-close',session)
         print('FIFO RPC create modes, type publication and typed regular-I/O guards passed')
     finally:

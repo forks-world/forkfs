@@ -44,7 +44,7 @@ public:
     enum class Access {Read,Write,ReadWrite};
     struct OpenOptions {bool create=false,exclusive=false,truncate=false;uint32_t mode=0644;bool append=false,nofollow=false,symlink=false;
         // Frontends supply already positioned writes; they must still pass EOF checks.
-        bool positioned_append=false;};
+        bool positioned_append=false,fifo=false;};
     explicit Namespace(Container& container,std::string view="main",bool revision=false)
         :container_(container),view_(std::move(view)),revision_(revision) {}
     // Stateless page over two immutable revisions with an exclusive path cursor.
