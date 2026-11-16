@@ -442,6 +442,19 @@ restart releases stale handles and orphan roots before serving. GC, World
 restore and retention keep their existing open-handle guards. No persistent
 inode or wire-format version change is needed; handles remain LevelDB-only.
 
+FIFO metadata handles use `OpenOptions::fifo` or `inode-open INODE r`. They are
+read-only metadata pins: regular `fs-open` on a FIFO remains ENOTSUP, while
+`inode-open` resolves the inode without following its final component. Metadata
+handles retain FIFO type, mode, timestamps and xattrs after unlink or rename
+replacement, including across dup and close downgrade. FIFO byte I/O remains
+unavailable: path operations, handle reads, and native callback byte operations
+return ENOTSUP; writes through the read-only metadata handle are denied by its
+access check. Every seek fails with ESPIPE. On a valid mutable view, FIFO size
+updates fail with EINVAL even when the handle is read-only; revision and other
+view/protection checks retain their existing precedence. Native FIFO open
+descriptions retain the metadata pin in the existing reader/writer lifecycle
+slots as needed; the kernel owns stream I/O.
+
 Atomic open options are available through `Namespace::OpenOptions` and RPC:
 
 ```text

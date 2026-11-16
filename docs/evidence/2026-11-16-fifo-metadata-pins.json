@@ -1,0 +1,100 @@
+{
+  "date": "2026-11-16",
+  "feature": "POSIX FIFO metadata pins across unlink and rename replacement",
+  "status": "core_rpc_and_native_callback_validated; native_forkfs_mount_pending",
+  "integrated_source": {
+    "repository": "forks-world/forkfs",
+    "pull_request": 131,
+    "base_branch": "main",
+    "base_sha": "f3f444b5c11bc26348331d84ca0d6582191b82ff",
+    "rebased_head": "62ac2ce2418a5353abc62bd15d02684e9c507811",
+    "rebased_tree": "34fb80151cb268a53a12d532fc3676d9c9f1c85f",
+    "tested_tree": "001cb612d661eb3d7a0b98c6f4de388f294f605c",
+    "previous_base": "c2275ed1682c1cce2f5fa4cfd63a4d989fafc06d",
+    "previous_remote_head": "bb0493924cdfa08aaf4b512e570baed95d547886",
+    "previous_base_validation": "historical_and_invalidated_after_base_advance"
+  },
+  "behavior": {
+    "ordinary_path_open_on_fifo": "ENOTSUP",
+    "inode_open_fifo": "read-only metadata pin; inode-open adds FIFO opt-in and nofollow for exact inode",
+    "metadata_after_unlink_or_rename_replacement": "FIFO identity, type, mode, timestamps and xattrs remain available through open pin",
+    "dup_and_close": "duplicate retains the pin; writer-slot downgrade preserves it as a reader; last close reclaims orphan",
+    "byte_io": "path operations and handle reads report ENOTSUP; writes through read-only metadata handles are denied by the access check; no daemon FIFO stream buffer or byte capability",
+    "seek_and_seek_region": "ESPIPE",
+    "size_setattr": "EINVAL for FIFO, including size zero, after view and inode validation",
+    "fifo_clone_file": "ENOTSUP; regular-file clone tests remain covered by the base suite",
+    "native_stream_io": "kernel-managed route is not validated on a ForkFS mount"
+  },
+  "baseline_regression": {
+    "runtime_head": "62ac2ce2418a5353abc62bd15d02684e9c507811",
+    "base_sha": "f3f444b5c11bc26348331d84ca0d6582191b82ff",
+    "runtime_tree": "34fb80151cb268a53a12d532fc3676d9c9f1c85f",
+    "fresh_native_callback_test": "failed_before_fix_with_open_FIFO_lost_xattrs_after_unlink",
+    "build_exit_code": 0,
+    "test_exit_code": 1,
+    "daemon_sha256": "e032a5087efe92a62d1778706c2b4ca67db8f8f77f244089c4f944e254ece5ac",
+    "test_binary_sha256": "cd5114c19a6eefe9581cbf706efe744621c2712ff07ff799e44f0e2edd08780c",
+    "harness_sha256": "f3ef81bcd477ca21957434a958b37fe1816ec7ac53cc670ca6f61f1bd4b4a8ad",
+    "log_sha256": "d8c266321348650cd03d9a87ba8afcaab8ab98ee73766bc25a80972a4c4b39a0"
+  },
+  "validation": {
+    "configuration": "Release, WFS_FSKIT=ON",
+    "clean_first": true,
+    "ctest_passed": 79,
+    "ctest_failed": 0,
+    "ctest_elapsed_seconds": 121.5,
+    "dependency_checks": {
+      "forkfsd": "passed",
+      "ForkFSExtension": "passed",
+      "ForkFSHost": "passed"
+    },
+    "coverage": [
+      "legacy and modern Namespace FIFO behavior",
+      "FIFO type, mode and xattr pinning, dup, unlink/rename replacement, orphan metadata and last-close cleanup",
+      "FIFO RPC open, seek, size, xattr and mode behavior",
+      "direct and loopback FSKit callback metadata behavior",
+      "native callback writer-to-reader downgrade and final close"
+    ],
+    "daemon_sha256": "bb6545c1a2c75a7aad7f0a6db66dc1250a4f86cd609dc2a7ab4852ee23f1be00",
+    "cpp_test_sha256": "a190dcf6305208e875008e42c7b4c9f70c953ed4fc6f2b2f1baa36a0358216a8",
+    "extension_sha256": "12f0c4d8efb1925ebca73280ed630edcd7ad9f5063418b10198abcbc541cdad8",
+    "bridge_test_sha256": "8b1ba49cf9c8a33835821036c1052f0fae85038967e606b5b6387000f81f2b8d",
+    "validation_log_sha256": "c42e82b2b692f8154b3ab498cc6adad8fb075d44070754f1562fa012dbd819c9",
+    "ctest_log_sha256": "bae8a7cef544906020110a097f445d23d1e3a372ed8ffb5a8eccbc8dd518c347"
+  },
+  "apfs_reference": {
+    "exit_code": 0,
+    "checks": [
+      "mkfifo type/mode/size",
+      "ENXIO without reader",
+      "EOF without writer",
+      "EAGAIN with active writer",
+      "binary pipe stream",
+      "EOF after writer close",
+      "ESPIPE",
+      "open descriptor after hardlink, rename and unlink"
+    ],
+    "log_sha256": "fd90fe0a2b3ecd6cf4b9ff36b57a0f89e0c322ec324d3ea55e9ca950ea4ca30a",
+    "limitation": "APFS reference behavior does not establish FIFO stream behavior on a ForkFS mount."
+  },
+  "native_forkfs_mount": {
+    "status": "pending_keychain_unlock",
+    "candidate_signed": false,
+    "candidate_installed": false,
+    "candidate_mounted": false,
+    "reason": "codesign reported errSecInternalComponent; security reported user interaction is not allowed",
+    "original_installation_untouched": true,
+    "baseline_installed_version_mkfifo_errno": 45,
+    "baseline_log_sha256": "8e3499ad1acef49d3b53d0c647df608d2e13edac11a6032e97aa7bb2122641fc",
+    "claim": "No candidate ForkFS mount FIFO IPC claim is made."
+  },
+  "candidate_source_sha256": {
+    "daemon/namespace.cpp": "8f83fabbcc1200de2b2fd11c0990246ae7e777e491918ffffe599278f5762657",
+    "daemon/namespace.h": "e506fbcd29458ecbf40ffa12560a3628d30b60d691815cb335c0cf77da091b4e",
+    "daemon/rpc.cpp": "c7f6382508d82fd3b7744d23635af30bd3e3e70d62110a98dad8695f2a844419",
+    "daemon/tests/fifo.cpp": "d060f596361ac1c9243ae8feaab95e95c9721e92e39bd93e376b5c9b9114af92",
+    "daemon/tests/fifo_rpc.py": "31adadb5ca876d3a87b7aedbc28dc31a20e4b5c3dabd42140c36e3213a9a8bad",
+    "macos/forkfs/RevisionVolume.mm": "73d470d8fed974c50581cde6ece099052118d4372de7d79eedbe8ef6ff93131a",
+    "macos/forkfs/tests/BridgeTest.mm": "f3ef81bcd477ca21957434a958b37fe1816ec7ac53cc670ca6f61f1bd4b4a8ad"
+  }
+}

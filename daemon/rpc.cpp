@@ -49,7 +49,7 @@ std::string quoted(const std::string& value){
 }
 std::string inode_json(const InodeInfo& n){
     std::ostringstream out;out<<"{\"inode_id\":\""<<n.id<<"\",\"directory\":"<<(n.directory?"true":"false")
-        <<",\"symlink\":"<<(n.symlink?"true":"false")<<",\"mode\":"<<n.mode<<",\"links\":"<<n.links<<",\"size\":"<<n.size
+        <<",\"symlink\":"<<(n.symlink?"true":"false")<<",\"fifo\":"<<(n.fifo?"true":"false")<<",\"mode\":"<<n.mode<<",\"links\":"<<n.links<<",\"size\":"<<n.size
         <<",\"allocated_size\":"<<n.allocated_size<<",\"flags\":"<<n.flags<<",\"modified_ns\":"<<n.modified_ns<<",\"changed_ns\":"<<n.changed_ns
         <<",\"accessed_ns\":"<<n.accessed_ns<<",\"birth_ns\":"<<n.birth_ns<<"}";return out.str();
 }
@@ -140,6 +140,7 @@ struct Activity {
 std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string> args){
     auto op=args[0];std::string view="main";bool revision=false;
     size_t count=2;
+    if(op=="fs-mkfifo")count=args.size()>=3 && args[2]!="--world" && args[2]!="--revision" && args[2]!="--session"?3:2;
     if(op=="status" || op=="storage-profile" || op=="fs-init" || op=="fs-check" || op=="fs-worlds" || op=="fs-revisions" || op=="fs-compact" || op=="fs-volume-name")count=1;
     if(op=="fs-write" || op=="fs-save" || op=="fs-clone-file" || op=="fs-rename" || op=="fs-rename-excl" || op=="fs-exchange" || op=="fs-link" || op=="fs-fork" || op=="fs-restore" || op=="fs-append" || op=="fs-truncate" || op=="fs-open" || op=="fs-happend" || op=="fs-htruncate" || op=="fs-hread-next" || op=="fs-hwrite-next" || op=="fs-symlink" || op=="fs-chmod" || op=="fs-lchmod" || op=="fs-setmtime" || op=="fs-hchmod" || op=="fs-hsetmtime" || op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-hlock")count=3;
     if(op=="fs-read-at" || op=="fs-write-at" || op=="fs-hread" || op=="fs-hwrite" || op=="fs-hwriteback" || op=="fs-hseek" || op=="fs-hrange-lock" || op=="fs-punch-hole" || op=="fs-hpunch-hole")count=4;
@@ -148,6 +149,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="inode-stat" || op=="inode-dir-open" || op=="inode-readlink")count=2;
     if(op=="inode-lookup" || op=="inode-open")count=3;
     if(op=="inode-create" || op=="inode-mkdir" || op=="inode-symlink" || op=="inode-link")count=4;
+    if(op=="inode-mkfifo")count=4;
     if(op=="inode-remove" || op=="fs-diff")count=5;
     if(op=="inode-setattr")count=6;
     if(op=="inode-setattr-times")count=8;
@@ -235,13 +237,16 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     else if(op=="inode-stat" || op=="inode-dir-open" || op=="inode-readlink" || op=="inode-open") {
         auto path=fs.path_for_inode(args[1]);auto mode=op=="inode-open"?args[2]:"";
         op=op=="inode-stat"?"fs-lstat":op=="inode-dir-open"?"fs-dir-open":op=="inode-readlink"?"fs-readlink":"fs-open";
-        args={op,path};if(op=="fs-open")args.push_back(mode+(fs.lstat(path).symlink?",symlink":",nofollow"));
+        args={op,path};if(op=="fs-open") {auto inode=fs.lstat(path);args.push_back(mode+(inode.symlink?",symlink":inode.fifo?",fifo,nofollow":",nofollow"));}
     } else if(op=="inode-create") {
         auto path=child(args[1],args[2]);auto mode=number(args[3]);need(mode<=0777,"unsupported mode bits");creation_mode=static_cast<uint32_t>(mode);
         op="fs-open";args={op,path,"rw,create,exclusive,nofollow"};
     } else if(op=="inode-mkdir") {
         auto path=child(args[1],args[2]);auto mode=number(args[3]);need(mode<=0777,"unsupported mode bits");
         fs.mkdir(path,static_cast<uint32_t>(mode));return inode_json(fs.lstat(path));
+    } else if(op=="inode-mkfifo") {
+        auto path=child(args[1],args[2]);auto mode=number(args[3]);need(mode<=0777,"unsupported mode bits");
+        fs.mkfifo(path,static_cast<uint32_t>(mode));return inode_json(fs.lstat(path));
     } else if(op=="inode-symlink") {
         auto path=child(args[1],args[2]);fs.symlink(args[3],path);return inode_json(fs.lstat(path));
     } else if(op=="inode-link") {
@@ -318,6 +323,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
             else if(flag=="append")options.append=true;
             else if(flag=="nofollow")options.nofollow=true;
             else if(flag=="symlink")options.symlink=true;
+            else if(flag=="fifo")options.fifo=true;
             else throw std::runtime_error("unsupported open flag");
         }
         need(activity.session->handles.size()<256,"session handle limit reached");
@@ -399,6 +405,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     else if(op=="fs-save")fs.replace_file(args[1],std::vector<unsigned char>(args[2].begin(),args[2].end()));
     else if(op=="fs-write")fs.write(args[1],std::vector<unsigned char>(args[2].begin(),args[2].end()));
     else if(op=="fs-mkdir")fs.mkdir(args[1]);
+    else if(op=="fs-mkfifo"){auto mode=args.size()>2?number(args[2],8):0644;need(mode<=0777,"unsupported mode bits");fs.mkfifo(args[1],static_cast<uint32_t>(mode));}
     else if(op=="fs-unlink")fs.remove(args[1],false);
     else if(op=="fs-rmdir")fs.remove(args[1],true);
     else if(op=="fs-rename")fs.rename(args[1],args[2]);

@@ -51,10 +51,46 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | 原生 `F_PUNCHHOLE`、`F_PREALLOCATE`、`posix_fallocate` | 原生 syscall/可选 Preallocate 协议 | 未实现或未验收；不声称原生洞区间修改、物理 extent 查询或空间预留 |
 | `statfs/statvfs/pathconf` | volumeStatistics、PathConfOperations | 挂载已测容量/单位/标志、路径与 fd 查询、rename/unlink/路径重用和 GC 后只读 revision；子目录/文件 fd 的 `PC_PATH_MAX` 返回 EINVAL，不能宣称完整 pathconf。空间来自宿主卷，不是 forkfs 配额或预留 |
 | `chflags/fchflags/lchflags`、BSD flags | get/setAttributes → revision inode | 挂载已测 hidden/nodump 的路径/fd/nofollow、硬链接、cp -p、孤儿 fd 和历史隔离；user immutable 及 user append-only 的数据/元数据/目录约束已接入；nounlink/系统保护标记仍拒绝 |
-| `mkfifo/mknod`、Unix socket 路径 | create item types | 缺失；当前只支持 regular/directory/symlink，不适合依赖这些节点的运行目录 |
+| `mkfifo(3)`、FIFO `stat/open/read/write` | `FSItemTypeFIFO` + inode tag 5; 预期由内核管理stream | FIFO创建、类型/模式/大小、普通文件打开拒绝、metadata-only inode pin、unlink/rename replacement 后的 xattr/属性保留、重复句柄与末次关闭回收已通过 core/RPC/callback 验证。ForkFS真实挂载的 FIFO IPC 仍待签名安装后验收；候选扩展未签名、未安装、未挂载。`mknod` 和 Unix socket 路径仍缺失。见 [FIFO metadata pin evidence](evidence/2026-11-16-fifo-metadata-pins.json) |
 | `copyfile/clonefile/fcopyfile/sendfile` | 内核 fallback 或可选复制能力 | 新增原生验收 `copyfile(DATA|STAT|XATTR)`、`fcopyfile(DATA)` 和 sendfile 区间/EOF/unlink fd；clone 请求可回退，强制 clone 返回 ENOTSUP；ResourceFork、ACL、递归/完整 flags 仍未补齐 |
 | `kqueue` vnode 通知、文件监控、FSEvents | 内核 vnode 事件 | macOS 27.2 小仓库已测 WRITE/EXTEND/ATTRIB/LINK/RENAME/DELETE、父目录事件、跨进程写及路径重用隔离；FSEvents、递归监控、revoke 未验收 |
 | 持久 file ID、file handles、卷改名、大小写折叠 | 可选卷能力/身份协议 | persistent IDs 未提供（不宣告）；ID 只在当前 mount 稳定；卷名支持 revision 元数据和原生改名，大小写折叠未提供/未验收 |
+
+### FIFO support status
+
+`mkfifo(3)` creates a metadata-only FIFO inode using the existing inode record
+envelope and type tag 5. Older readers accepted only tags 1–4 and reject this
+tag during inode decoding, so they fail closed rather than treating a FIFO as a
+regular file. The new reader requires size zero, a nonchunked representation,
+and an empty inline content marker; no pipe buffer is stored in the repository.
+On the modern handle backend, ordinary path-based `fs-open` on a FIFO, path
+byte-I/O operations, and metadata-pin reads reject with `ENOTSUP`. Metadata-pin
+writes are denied by the read-only handle access check (`EBADF`); no FIFO bytes
+are stored or granted through these APIs. Native callbacks also reject daemon
+byte-I/O with `ENOTSUP`. Seek and seek-region operations reject with `ESPIPE`.
+`inode-open INODE r` automatically opens an exact FIFO
+inode as a read-only metadata pin without following the final component. These
+pins retain type, mode, timestamps, and xattrs across unlink or rename
+replacement, dup, writer-slot downgrade, and last-close cleanup. They do not
+grant byte access. `OpenOptions::fifo` is the corresponding explicit C++ option;
+it accepts read-only access and does not modify the inode at open. FIFO size
+setattr, including size zero mixed with another attribute, returns `EINVAL`
+after existing view, inode, and protection checks, without publishing a change.
+Read-only native metadata mutations retain their `EROFS` behavior. `clone_file` rejects
+a FIFO source with `ENOTSUP`; regular-file clone behavior remains covered by the
+base suite. Legacy handles remain unsupported.
+
+The clean-first Release `WFS_FSKIT=ON` run passed 79/79 CTest cases, with the
+daemon, ForkFSExtension, and ForkFSHost dependency checks passing. A regression
+callback linked against the unchanged rebased runtime failed before the fix on
+“open FIFO lost xattrs after unlink”; the fixed callback and core/RPC suites
+pass. The APFS reference test passed standard FIFO stream behavior, including
+`ENXIO`, `EAGAIN`, EOF, `ESPIPE`, and an open descriptor after unlink. The
+pre-change installed ForkFS mount rejected `mkfifo` with `ENOTSUP` (45). The
+candidate extension has not been signed, installed, or mounted because local
+keychain interaction is unavailable. Therefore kernel-managed FIFO IPC on a
+ForkFS mount remains unverified and is not claimed here. See the [FIFO metadata
+pin evidence record](evidence/2026-11-16-fifo-metadata-pins.json).
 
 Namespace object resolution accepts a trailing slash for existing-object queries
 and metadata/content operations. The slash requires the resolved object to be a
