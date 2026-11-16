@@ -126,5 +126,7 @@
     "mounted": false,
     "qualification": "pending"
   },
-  "supersedes": "Validation from base e93c6b4e is historical and is not used as final evidence."
+  "supersedes": "Validation from base e93c6b4e is historical and is not used as final evidence.",
+  "evidence_status": "historical: validated base 00795b6 before PR 133 integration",
+  "superseded_by": "2026-11-16-sticky-mode-watch134.json"
 }

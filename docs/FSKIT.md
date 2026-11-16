@@ -216,7 +216,7 @@ regular files and directories, while a FIFO retained 01777. Subsequent chmod,
 fchmod, lchmod and `cp -p` checks retained sticky metadata. These are observations
 from the selected APFS reference, not a general kernel rule. The forkfs candidate
 was not signed, installed or mounted for this qualification run. See the [sticky
-mode evidence record](evidence/2026-11-16-sticky-mode.json).
+mode evidence record](evidence/2026-11-16-sticky-mode-watch134.json).
 
 Directory enumeration uses captured daemon cursors and retains at most 64 streams,
 with one page of at most 512 captured entries per stream (plus two dot entries).

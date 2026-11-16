@@ -154,7 +154,7 @@ encoded mode word reserves bit 31 for attribute presence; the public mode suppor
 0000..01777, including the sticky bit. Setuid, setgid, and higher mode bits remain
 unsupported. Older daemons reject inode records carrying a sticky bit or the xattr
 marker when decoded; the last xattr removal clears the marker.
-See the [sticky mode validation record](../docs/evidence/2026-11-16-sticky-mode.json)
+See the [sticky mode validation record](../docs/evidence/2026-11-16-sticky-mode-watch134.json)
 for current-base regression results and APFS reference observations.
 Existing stores need no conversion. Orphan attributes use separate retention roots
 until final close/restart, and fs-check verifies their bounds and presence marker.
