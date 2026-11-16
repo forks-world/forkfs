@@ -48,11 +48,15 @@ with tempfile.TemporaryDirectory(prefix='ff-symlink-',dir='/tmp') as tmp:
     assert run('fs-cat',db,'/absolute-alias','--revision','base')==b'original'
     assert run('fs-readlink',db,'/src/relative','--world','work')==b'file'
     run('fs-symlink',db,'/src/file','/readonly','--revision','base',ok=False)
+    control_target='x\n'
+    run('fs-symlink',db,control_target,'/control-target')
+    assert run('fs-readlink',db,'/control-target')==control_target.encode()
+    run('fs-unlink',db,'/control-target')
     run('fs-rename',db,'/src/relative','/src/moved-link')
     assert run('fs-cat',db,'/src/moved-link')==b'original'
     run('fs-unlink',db,'/src/moved-link');assert run('fs-cat',db,'/src/file')==b'original'
     before=json.loads(run('check',db))['last_committed_seq']
-    for target in ['', 'x\n', 'x'*4097, 'a'*256]:run('fs-symlink',db,target,'/bad',ok=False)
+    for target in ['', 'x'*4097, 'a'*256]:run('fs-symlink',db,target,'/bad',ok=False)
     run('fs-readlink',db,'/src/file',ok=False)
     assert json.loads(run('check',db))['last_committed_seq']==before
     run('fs-check',db);run('fs-check',db,'--revision','base');run('fs-check',db,'--world','work')

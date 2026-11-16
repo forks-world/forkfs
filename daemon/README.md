@@ -1076,6 +1076,11 @@ forkfsd fs-unlink project.forkfs /src/alias.cpp
 forkfsd fs-check project.forkfs
 ```
 
+`fs-ls` prints one raw name per line, so a name containing a newline cannot be
+represented unambiguously in that output. For machine-readable listings, use the
+session RPC directory pages (`inode-dir-open` and `fs-dir-entries`); JSON escaping
+preserves control characters when clients decode the returned names.
+
 `fs-init` creates the root directory once. `fs-rmdir` removes empty directories.
 Creation/write updates, hardlinks, rename (including overwrite) and removal use
 one durable multi-key batch. Rename preserves inode identity; hardlinks share
@@ -1097,14 +1102,17 @@ Lookup may end in `.` or `..`, but mutations reject those terminal components so
 they cannot become directory-entry keys. Names and
 symlink targets preserve their original UTF-8 bytes: case and canonically
 equivalent NFC/NFD spellings remain distinct.
-There is no Unicode normalization or case folding. C0 controls, DEL and C1 controls,
-malformed/truncated UTF-8, overlong encodings, surrogate code points and values
-above U+10FFFF are rejected before publication. Missing prefixes and traversal
+There is no Unicode normalization or case folding. Path components and symlink
+targets accept every well-formed UTF-8 scalar except NUL, including C0 controls,
+DEL and C1 controls. Malformed/truncated UTF-8, overlong encodings, surrogate code
+points and values above U+10FFFF are rejected before publication. Missing prefixes and traversal
 through regular files still fail. World/revision labels remain restricted to their
 ASCII identifier grammar. Existing ASCII stores need no conversion; a store with
 UTF-8 names requires a daemon that supports them. These deliberate prototype
 restrictions are not a frozen cross-platform naming policy. Current operations
-wait for local durability.
+wait for local durability. See the
+[control-name qualification record](../docs/evidence/2026-11-16-control-character-names.json)
+for tested boundaries and the native mount limitation.
 
 Regular files retain the original inline inode type (1) until they first grow
 past 256 KiB. They then use inode type 4 and sparse 64 KiB chunks at
@@ -1573,6 +1581,13 @@ RPC. No normalization or case folding is applied. Missing metadata means
 the optional name record. A rename preserves file identities/data, root inode
 times, repository identity, World name, volume identifier and mount path.
 This is volume administration, separate from file/root inode flags.
+
+Extended-attribute names and volume labels keep their existing control-character
+restriction. The directory key grammar and on-disk format are unchanged; a
+repository may contain control names after the first write. Older daemon versions
+can reject those paths and can fail namespace checks or emit invalid JSON while
+enumerating them, so use a matching updated daemon and FSKit frontend for such a
+repository. No downgrade behavior is guaranteed.
 
 The optional `volume-name` leaf is part of the immutable namespace metadata
 tree, so snapshot, fork, restore, history retention and GC retain it. The

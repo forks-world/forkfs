@@ -45,7 +45,8 @@ int64_t signed_number(const std::string& text){
 }
 std::string names(const std::vector<std::string>& values){std::string out;for(const auto& s:values)out+=s+'\n';return out;}
 std::string quoted(const std::string& value){
-    std::string out="\"";for(char c:value){if(c=='\"' || c=='\\')out+='\\';out+=c;}return out+"\"";
+    std::string out="\"";static constexpr char hex[]="0123456789abcdef";
+    for(unsigned char c:value){if(c=='\"' || c=='\\')out+='\\';if(c<0x20){out+="\\u00";out+=hex[c>>4];out+=hex[c&15];}else out+=static_cast<char>(c);}return out+"\"";
 }
 std::string inode_json(const InodeInfo& n){
     std::ostringstream out;out<<"{\"inode_id\":\""<<n.id<<"\",\"directory\":"<<(n.directory?"true":"false")

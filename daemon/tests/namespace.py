@@ -45,6 +45,9 @@ with tempfile.TemporaryDirectory(prefix='ffn-',dir='/tmp') as tmp:
     run('fs-mkdir',image,'/a/trailing///')
     assert stat(image,'/a/trailing')['directory']
     run('fs-rmdir',image,'/a/trailing')
+    run('fs-mkdir',image,'/a/\ninvalid')
+    assert stat(image,'/a/\ninvalid')['directory']
+    run('fs-rmdir',image,'/a/\ninvalid')
     assert stat(image,'/a/created')['directory']
     run('fs-rename',image,'/a/created','/a/dotted/../renamed')
     assert stat(image,'/a/renamed')['directory']
@@ -108,7 +111,6 @@ with tempfile.TemporaryDirectory(prefix='ffn-',dir='/tmp') as tmp:
         ('fs-rename','/a/victim','/b/empty'),
         ('fs-link','/b','/a/dirlink'),
         ('fs-rmdir','/a'),('fs-unlink','/b'),('fs-unlink','/'),
-        ('fs-mkdir','/a/\ninvalid'),
         ('fs-mkdir','/a/../'),('fs-mkdir','/a/.'),('fs-mkdir','/a/..'),
         ('fs-write','/b/empty',str(value)),('fs-mkdir','/missing/child'),
         ('fs-mkdir','/missing/../child'),('fs-mkdir','/b/moved/../child'),

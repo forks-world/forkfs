@@ -39,13 +39,28 @@ with tempfile.TemporaryDirectory(prefix='ff-unicode-', dir='/tmp') as temporary:
 
     # Canonically equivalent spellings are separate byte identities, not aliases.
     spellings = ['é', 'e\u0301', '名字👩\u200d💻', '"反斜线\\📄', '界'*85, '😀'*63+'abc', '\U0010ffff']
+    controls = [chr(value) for value in range(1, 32)] + ['\x7f', '\u0080', '\u009f']
+    spellings += controls + ['diff"\\\n']
+    cli('fs-snapshot', db, 'unicode_before_controls')
     for index, name in enumerate(spellings):
         assert len(name.encode()) <= 255
         data.write_bytes(str(index).encode())
         cli('fs-write', db, '/'+name, data)
+    control_dir = 'dir\n\t'
+    cli('fs-mkdir', db, '/'+control_dir)
+    cli('fs-write', db, '/'+control_dir+'/child\nfile', data)
+    cli('fs-link', db, '/'+controls[2], '/hard\nlink')
+    cli('fs-rename', db, '/hard\nlink', '/renamed\rlink')
+    assert cli('fs-cat', db, '/renamed\rlink') == str(spellings.index(controls[2])).encode()
+    target = 'target\n\t\r\x7f\u0080\u009f'
+    cli('fs-symlink', db, target, '/symbolic\nlink')
+    assert cli('fs-readlink', db, '/symbolic\nlink') == target.encode()
+    assert json.loads(cli('fs-lstat', db, '/symbolic\nlink'))['symlink']
     assert json.loads(cli('fs-stat', db, '/é'))['inode_id'] != json.loads(cli('fs-stat', db, '/e\u0301'))['inode_id']
     names = {line.decode() for line in cli('fs-ls', db, '/').split(b'\n') if line}
-    assert set(spellings) <= names
+    assert set(spellings) - set(controls) - {'diff"\\\n'} <= names
+    # All control spellings must survive an on-disk reopen and a revision view.
+    cli('fs-snapshot', db, 'unicode_current')
     cli('fs-snapshot', db, 'unicode_base')
     cli('fs-fork', db, 'unicode_base', 'unicode_work')
     cli('fs-rename', db, '/目录/文件📄', '/目录/已重命名🚀')
@@ -94,8 +109,28 @@ with tempfile.TemporaryDirectory(prefix='ff-unicode-', dir='/tmp') as temporary:
         inode = obj('inode-root', *selector)['inode']['inode_id']
         assert obj('inode-lookup', inode, 'é', *selector)['inode_id'] != obj('inode-lookup', inode, 'e\u0301', *selector)['inode_id']
         cursor = obj('inode-dir-open', inode, *selector)['cursor']
-        entries = obj('fs-dir-entries', cursor, '100', *selector)['entries']
-        assert set(spellings) <= {entry['name'] for entry in entries}
+        entries = []
+        while True:
+            page = obj('fs-dir-entries', cursor, '3', *selector)
+            entries.extend(entry['name'] for entry in page['entries'])
+            if page['eof']:
+                break
+        assert set(spellings) <= set(entries)
+        cursor_after = ''
+        diff_paths = []
+        seen_cursors = set()
+        while True:
+            assert len(seen_cursors) <= len(spellings) + 2
+            page = obj('fs-diff', 'unicode_before_controls', 'unicode_current', cursor_after, '2')
+            diff_paths.extend(change['path'] for change in page['changes'])
+            if page['eof']:
+                break
+            cursor_after = page['next_after']
+            assert cursor_after
+            assert cursor_after not in seen_cursors
+            seen_cursors.add(cursor_after)
+        assert set('/'+name for name in controls) <= set(diff_paths)
+        assert '/diff"\\\n' in diff_paths
         rpc('fs-dir-close', cursor, *selector)
         handle = obj('inode-create', inode, 'RPC文件📄', str(0o600), *selector)['handle']
         rpc('fs-hwrite', handle, '0', b'\xff\x00binary', *selector)
@@ -103,11 +138,16 @@ with tempfile.TemporaryDirectory(prefix='ff-unicode-', dir='/tmp') as temporary:
         rpc('fs-close', handle, *selector)
         file_inode = obj('inode-lookup', inode, 'RPC文件📄', *selector)['inode_id']
 
-        # All are invalid UTF-8, excluded controls, or overlong byte components.
+        policy_sequence = obj('status')['last_committed_seq']
+        rpc('fs-set-volume-name', 'bad\nlabel', *selector, error=errno.EINVAL)
+        rpc('fs-xattr-set', '/RPC文件📄', 'user.bad\tname', 'upsert', b'value', *selector, error=0)
+        assert obj('status')['last_committed_seq'] == policy_sequence
+
+        # Malformed UTF-8, NUL, and overlong byte components remain invalid.
         invalid = [b'\x80', b'\xbf', b'\xc0\xaf', b'\xc0\xae', b'\xc1\xbf', b'\xe0\x80\xaf',
                    b'\xf0\x80\x80\xaf', b'\xed\xa0\x80', b'\xed\xbf\xbf', b'\xf4\x90\x80\x80',
                    b'\xf5\x80\x80\x80', b'\xff', b'\xc2', b'\xe2\x82', b'\xf0\x9f\x92',
-                   b'\xe2\x28\xa1', b'\x00', b'x\ny', b'x\ty', b'\x7f', b'\xc2\x80', b'\xc2\x9f',
+                   b'\xe2\x28\xa1', b'\x00', b'\x01'*256,
                    ('界'*85+'a').encode(), ('😀'*64).encode()]
         sequence = obj('status')['last_committed_seq']
         for name in invalid:
@@ -142,5 +182,6 @@ with tempfile.TemporaryDirectory(prefix='ff-unicode-', dir='/tmp') as temporary:
     assert cli('fs-cat', db, '/目录/文件📄', '--revision', 'unicode_base') == payload
     for index, name in enumerate(spellings):
         assert cli('fs-cat', db, '/'+name) == str(index).encode()
+        assert cli('fs-cat', db, '/'+name, '--revision', 'unicode_current') == str(index).encode()
     cli('fs-check', db)
 print('UTF-8 byte identity, links, revisions, restart/GC and invalid-input atomicity passed')
