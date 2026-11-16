@@ -1,5 +1,7 @@
 {
   "date": "2026-11-16",
+  "evidence_status": "historical",
+  "superseded_by": "2026-11-16-control-character-names-watch133.json",
   "feature": "POSIX controls in valid UTF-8 path components and symlink targets",
   "status": "daemon_and_callback_validated; native_candidate_control_names_unqualified",
   "source": {

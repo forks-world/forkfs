@@ -24,7 +24,8 @@ with tempfile.TemporaryDirectory(prefix='ff-dir-',dir='/tmp') as tmp:
     def rpc(*args,ok=True):
         with socket.socket(socket.AF_UNIX) as s:
             s.settimeout(10);s.connect(str(endpoint));s.sendall(packet(args));h=exact(s,12);assert h[:8]==b'FFRSP001'
-            b=exact(s,struct.unpack('<I',h[8:])[0]);code=struct.unpack('<I',b[:4])[0]
+            length=struct.unpack('<I',h[8:])[0];assert 4<=length<=1024*1024
+            b=exact(s,length);code=struct.unpack('<I',b[:4])[0]
             assert (code==0)==ok,(args[:2],b);return b[4:]
     def open_dir(path,session,*view):return json.loads(rpc('fs-dir-open',path,*view,'--session',session))['cursor']
     def page(cursor,n,session,*view):return json.loads(rpc('fs-dir-page',cursor,n,*view,'--session',session))
@@ -91,6 +92,31 @@ with tempfile.TemporaryDirectory(prefix='ff-dir-',dir='/tmp') as tmp:
         assert typed_entries['symlink']['symlink'] and typed_entries['symlink']['mode']==0o777
         assert typed_entries['subdir']['directory'] and not typed_entries['subdir']['symlink']
         rpc('fs-dir-close',typed,'--session',session)
+        # Large escaped names force both RPC page formats to retry smaller
+        # reads without advancing the stored cursor past unreturned entries.
+        rpc('fs-mkdir','/bounded')
+        long_names=['\x01'*251+f'{i:04}' for i in range(1030)]
+        for name in long_names:rpc('fs-write','/bounded/'+name,'')
+        bounded=open_dir('/bounded',session)
+        for operation,key in [('fs-dir-page','names'),('fs-dir-entries','entries')]:
+            rpc('fs-dir-rewind',bounded,'--session',session)
+            collected=[]
+            while True:
+                body=rpc(operation,bounded,1024,'--session',session)
+                result=json.loads(body)
+                batch=result[key] if key=='names' else [entry['name'] for entry in result[key]]
+                assert batch
+                collected.extend(batch)
+                assert len(body)+4<=1024*1024
+                for invalid in [0,1025]:rpc(operation,bounded,invalid,'--session',session,ok=False)
+                if result['eof']:break
+            assert collected==sorted(long_names) and len(set(collected))==len(long_names)
+            assert json.loads(rpc(operation,bounded,1024,'--session',session))=={key:[],'eof':True}
+            rpc('fs-dir-rewind',bounded,'--session',session)
+            first=json.loads(rpc(operation,bounded,1024,'--session',session))
+            rpc('fs-dir-rewind',bounded,'--session',session)
+            assert json.loads(rpc(operation,bounded,1024,'--session',session))==first
+        rpc('fs-dir-close',bounded,'--session',session)
         # Quota can be reused after closing streams; session end drops all streams.
         for token in [old,fresh,empty]:rpc('fs-dir-close',token,'--revision','base','--session',session) if token==old else rpc('fs-dir-close',token,'--session',session)
         tokens=[open_dir('/moved',session) for _ in range(64)]

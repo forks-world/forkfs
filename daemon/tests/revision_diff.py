@@ -86,7 +86,7 @@ with tempfile.TemporaryDirectory(prefix='ff-dir-diff-',dir='/tmp') as tmp:
         encoded=[str(x).encode() for x in fields];payload=struct.pack('<I',len(encoded))+b''.join(struct.pack('<I',len(x))+x for x in encoded)
         with socket.socket(socket.AF_UNIX) as s:
             s.settimeout(20);s.connect(str(endpoint));s.sendall(b'FFRPC001'+struct.pack('<I',len(payload))+payload)
-            header=exact(s,12);assert header[:8]==b'FFRSP001';length=struct.unpack('<I',header[8:])[0];assert length<=1024*1024
+            header=exact(s,12);assert header[:8]==b'FFRSP001';length=struct.unpack('<I',header[8:])[0];assert 4<=length<=1024*1024
             body=exact(s,length);code=struct.unpack('<I',body[:4])[0];assert (code==0)==ok,(fields,body)
             return body[4:]
     try:
@@ -105,6 +105,43 @@ with tempfile.TemporaryDirectory(prefix='ff-dir-diff-',dir='/tmp') as tmp:
         rpc('fs-diff','before','after','',64,'--revision','before',ok=False)
         rpc('fs-diff','before','after','',64,'--world','main',ok=False)
         rpc('fs-diff','main','after','',64,ok=False)
+        # C0-heavy maximum-length paths expand substantially in JSON. Diff
+        # retries must return complete smaller pages without skipping paths.
+        control_deep=''
+        for _ in range(15):
+            control_deep+='/'+'\x01'*255
+            rpc('fs-mkdir',control_deep,'--session',session)
+        rpc('fs-snapshot','control-before','--session',session)
+        control_leaves=['\x01'*252+f'{i:03}' for i in range(70)]
+        for name in control_leaves:
+            path=control_deep+'/'+name
+            assert len(path.encode())==4096
+            rpc('fs-write',path,'control','--session',session)
+        rpc('fs-snapshot','control-after','--session',session)
+        control_seq=json.loads(rpc('status','--session',session))['last_committed_seq']
+        expected_control=sorted([control_deep]+[control_deep+'/'+name for name in control_leaves])
+        def rpc_diff_pages(a,b,limit):
+            paths=[];cursor=''
+            while True:
+                body=rpc('fs-diff',a,b,cursor,limit)
+                assert len(body)+4<=1024*1024
+                page=json.loads(body)
+                if page['eof']:
+                    assert page['next_after']==''
+                    assert json.loads(rpc('fs-diff',a,b,cursor,limit))==page
+                    return paths+ [entry['path'] for entry in page['changes']],page
+                assert page['changes'] and page['next_after']==page['changes'][-1]['path'] and page['next_after']>cursor
+                paths.extend(entry['path'] for entry in page['changes'])
+                cursor=page['next_after']
+        first_control=json.loads(rpc('fs-diff','control-before','control-after','',64))
+        assert len(first_control['changes'])<64 and not first_control['eof']
+        assert json.loads(rpc('fs-diff','control-before','control-after','',64))==first_control
+        control_paths,last_control=rpc_diff_pages('control-before','control-after',64)
+        assert control_paths==expected_control and len(set(control_paths))==len(expected_control)
+        assert last_control['eof']
+        assert rpc_diff_pages('control-before','control-after',2)[0]==expected_control
+        rpc('fs-diff','control-before','control-after','',65,ok=False)
+        assert json.loads(rpc('status','--session',session))['last_committed_seq']==control_seq
         rpc('session-close',session)
     finally:
         proc.terminate();proc.wait(timeout=10)
