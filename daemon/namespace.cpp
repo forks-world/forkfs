@@ -1099,10 +1099,17 @@ void Namespace::remove(const std::string& path,bool directory) {
     });
 }
 void Namespace::rename(const std::string& source,const std::string& target) {
+    rename_impl(source,target,false);
+}
+void Namespace::rename_exclusive(const std::string& source,const std::string& target) {
+    rename_impl(source,target,true);
+}
+void Namespace::rename_impl(const std::string& source,const std::string& target,bool exclusive) {
     update([&](const NamespaceView& j,Changes& c) {
         auto src=parent(j,source);need(j.contains(src.key),"source not found");auto id=decode_id(j.get(src.key));auto n=inode(j,id);
         std::vector<std::string> ancestry;auto dst=parent(j,target,&ancestry);
         mutable_metadata(n);mutable_metadata(inode(j,src.id));mutable_inode(inode(j,dst.id));
+        if(exclusive && j.contains(dst.key))throw std::system_error(EEXIST,std::generic_category(),"rename target already exists");
         if(src.key==dst.key)return;
         if(n.directory)need(std::find(ancestry.begin(),ancestry.end(),id)==ancestry.end(),"cannot move directory into itself");
         std::map<std::string,InodeInfo> parents;parents.emplace(src.id,inode(j,src.id));parents.emplace(dst.id,inode(j,dst.id));

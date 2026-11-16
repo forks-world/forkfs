@@ -1,0 +1,76 @@
+{
+  "title": "Exclusive namespace entry rename through daemon APIs",
+  "recorded_date": "2026-11-16",
+  "validated_base": "aecd8ba02a544b78893056867b4466af408fde9e",
+  "scope": [
+    "Namespace::rename_exclusive, resident fs-rename-excl SOURCE TARGET RPC, and offline fs-rename-excl CONTAINER SOURCE TARGET",
+    "Atomic no-replace target check and entry move in one namespace update; existing entries, including same path, same-inode aliases, and dangling symlinks, return EEXIST",
+    "The ordinary rename API retains its replacing behavior; source and parent protection/path validation precede target EEXIST, while target inode flags do not change the refusal",
+    "C++ tests cover modern LevelDB and legacy storage, regular file and directory moves, hardlinks, symlink targets, metadata/xattrs, error atomicity, protections, revision/fork isolation, reopen and verification; modern coverage adds open/duplicated handle cursor continuity and GC",
+    "RPC/CLI tests cover move success, EEXIST, missing inputs, malformed RPC arity, and resident mount lease; baseline tests both occupied and absent destinations and verify namespace state, metadata, and data stay unchanged"
+  ],
+  "fixed_validation": {
+    "status": "passed",
+    "configuration": "Release WFS_FSKIT=ON",
+    "clean_first": true,
+    "ctest": {
+      "passed": 74,
+      "failed": 0,
+      "seconds": 113.68,
+      "new_targets": [
+        "forkfsd_rename_exclusive",
+        "forkfsd_rename_exclusive_rpc"
+      ]
+    },
+    "dependencies": {
+      "result": "passed",
+      "targets": [
+        "daemon",
+        "ForkFSExtension",
+        "ForkFSHost"
+      ]
+    },
+    "source_sha256_at_validation": {
+      "daemon/CMakeLists.txt": "7a39a57aec4797e99740b56ab06ee804c31654e41856e6c7f3bc227ad24f1803",
+      "daemon/namespace.cpp": "bab67006a6225c686e72307c74ed25d48f67b09a8ca3250f4b8af153b0557219",
+      "daemon/namespace.h": "e7ed33deb4b65eda6d970e27eeaafd0e37e4b3793510ff34ed03f95ecc23bc19",
+      "daemon/rpc.cpp": "0dc3d4f93e5ec63b448d074716bf5189bfd0af68f8ccf47bc3b80f12483ccfc0",
+      "daemon/main.cpp": "a3a3897fff0bc5a0b9e3dabfae98b9b9a740760fcf1c4a086134cfb38738a12d",
+      "daemon/tests/rename_exclusive.cpp": "e40495aae7a4e5a256b60beef0e82be690407ab3ac031f9ac99f39919a1420b0",
+      "daemon/tests/rename_exclusive_rpc.py": "62815b874ca9b1bb8c05f7b23fc7b8a6542787f634b26ec17fd7cb135ef6171b"
+    },
+    "daemon_sha256": "712a11bf3ac1c6303d538db03f3b60d7fdda21a027cdcfd3aca872128b1332dd",
+    "cpp_test_sha256": "eb05a66d9b3452f18d4c155813abbb87762f6398e11a515654969940a351f7a3",
+    "validate_log_sha256": "f90e58bd47fa502fd0f8a7d148b025d1720a1ed2e58e40559c43d7eaef048de5",
+    "ctest_log_sha256": "df1a07babbb0a5c7e9369f727e192f230f0afa2f8b4f3bd4767a0cfd32503667",
+    "execution_root": "/private/tmp/fs129-exec-z9cd35xm"
+  },
+  "baseline_probe": {
+    "status": "passed; unsupported RPC and offline CLI requests rejected without namespace state change",
+    "base": "aecd8ba02a544b78893056867b4466af408fde9e",
+    "runtime_source_sha256": {
+      "daemon/namespace.cpp": "ba658f282d2990931d908e071bb487016aaf359ab949e20854931f9f28c858d1",
+      "daemon/namespace.h": "4e6f99fc819e7985bce9cb8ce1c9115ae89afd43673d59b2a817891d20b08eed",
+      "daemon/rpc.cpp": "ffa5fc5a69daa450413f3693b463b0e0e7d4ddee4fba6c0148ccb6ed30e328ba",
+      "daemon/main.cpp": "978924436f9024ddb91cc0ea4135bb8961932d59880ba134e441a71702d763cb"
+    },
+    "daemon_sha256": "833ffc4a85d6461ebf15da6edb9a3b73135de62171763c532df42377d9d145ae",
+    "build_exit_code": 0,
+    "build_log_sha256": "5619eb8d8c5813f855a613282e5724d521d7934700ca3b1e8b36fc497f541da2",
+    "harness_sha256": "62815b874ca9b1bb8c05f7b23fc7b8a6542787f634b26ec17fd7cb135ef6171b",
+    "exit_code": 0,
+    "outcome": {
+      "mode": "expect-unsupported",
+      "namespace_unchanged": true,
+      "offline_cli_rejected": true,
+      "rpc_rejected": true
+    },
+    "log_sha256": "eb917e337bb0e0bf09c94d76df06b12e6895b32706184514bbd6bbd1932a8f99",
+    "qualification": "The baseline C++ Namespace API did not include rename_exclusive, so no baseline C++ test was attempted."
+  },
+  "explicit_exclusions": [
+    "No FSKit callback, native RENAME_EXCL/renamex_np implementation, or mounted exclusive-rename behavior is included or claimed.",
+    "Synthetic link-capacity boundaries, source-parent append-only refusal, successful movement of a dangling symlink source, and the new RPC world selector are not covered by these focused tests.",
+    "The baseline differential covers resident RPC and offline CLI only because the baseline C++ API did not exist."
+  ]
+}
