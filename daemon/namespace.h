@@ -66,6 +66,7 @@ public:
     void mkdir(const std::string& path,uint32_t mode=0755);
     std::string path_for_inode(const std::string& id) const;
     void write(const std::string& path,const std::vector<unsigned char>& value);
+    void clone_file(const std::string& source,const std::string& target);
     void replace_file(const std::string& path,const std::vector<unsigned char>& value);
     void write_at(const std::string& path,uint64_t offset,const std::vector<unsigned char>& value);
     uint64_t append(const std::string& path,const std::vector<unsigned char>& value);
@@ -134,9 +135,12 @@ private:
     friend class FileContent;
     struct Changes:std::map<std::string,std::optional<std::vector<unsigned char>>> {
         std::vector<std::pair<std::string,std::string>> erased;
-        bool empty() const {return std::map<std::string,std::optional<std::vector<unsigned char>>>::empty() && erased.empty();}
+        std::map<std::string,std::array<unsigned char,32>> references;
+        bool empty() const {return std::map<std::string,std::optional<std::vector<unsigned char>>>::empty() && references.empty() && erased.empty();}
         void erase_range(const std::string& lower,const std::string& upper) {
-            erase(lower_bound(lower),lower_bound(upper));erased.emplace_back(lower,upper);
+            erase(lower_bound(lower),lower_bound(upper));
+            for(auto it=references.lower_bound(lower);it!=references.end() && it->first<upper;)it=references.erase(it);
+            erased.emplace_back(lower,upper);
         }
     };
     std::pair<InodeInfo,bool> xattr_inode(const NamespaceView& view,const std::string& target,bool handle) const;

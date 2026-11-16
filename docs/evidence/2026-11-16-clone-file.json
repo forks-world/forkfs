@@ -1,0 +1,90 @@
+{
+  "title": "Daemon copy-on-write file clone",
+  "recorded_date": "2026-11-16",
+  "validated_base": "c2275ed1682c1cce2f5fa4cfd63a4d989fafc06d",
+  "intended_publication_branch": "feat/cow-file-clone",
+  "scope": [
+    "Namespace::clone_file, resident fs-clone-file SOURCE TARGET RPC, and offline fs-clone-file CONTAINER SOURCE TARGET CLI",
+    "The source final symlink is followed; regular files are cloned, directories return EISDIR, and occupied destinations return EEXIST without publishing namespace changes",
+    "A clone has a distinct inode and one link; source mode, supported flags, atime/mtime/birth time, size, representation, sparse content, and xattrs are retained while source metadata remains unchanged",
+    "Content and xattr object references are reused without reading payload bytes or iterating logical holes; subsequent file, xattr, and flag edits are inode-independent",
+    "C++ modern LevelDB and legacy tests cover empty, inline, chunked and 1 TiB sparse files, symlink/hardlink source resolution, destination and parent errors, source protection, snapshots/forks, reopen, and mutation independence",
+    "Modern-only object-ID assertions cover inline and empty content, chunk payloads, and xattrs. Modern handle retention and GC tests close all handles before GC",
+    "RPC/offline CLI tests cover clone success, target conflicts, malformed RPC arity, resident mount lease refusal, World selection, and baseline unsupported-command rejection with unchanged namespace state"
+  ],
+  "baseline_probe": {
+    "status": "passed; unsupported RPC and offline CLI commands rejected without namespace state change",
+    "base": "c2275ed1682c1cce2f5fa4cfd63a4d989fafc06d",
+    "runtime_source_sha256": {
+      "daemon/namespace.cpp": "bab67006a6225c686e72307c74ed25d48f67b09a8ca3250f4b8af153b0557219",
+      "daemon/namespace.h": "e7ed33deb4b65eda6d970e27eeaafd0e37e4b3793510ff34ed03f95ecc23bc19",
+      "daemon/rpc.cpp": "0dc3d4f93e5ec63b448d074716bf5189bfd0af68f8ccf47bc3b80f12483ccfc0",
+      "daemon/main.cpp": "a3a3897fff0bc5a0b9e3dabfae98b9b9a740760fcf1c4a086134cfb38738a12d"
+    },
+    "daemon_sha256": "712a11bf3ac1c6303d538db03f3b60d7fdda21a027cdcfd3aca872128b1332dd",
+    "build_exit_code": 0,
+    "build_log_sha256": "b3be4392b2b4a6c92a8a477293701596dabdec7bb2d3716e5769eda314af62bb",
+    "harness_sha256": "8f0cf2feb6904cb50bf95e0707343270635723edd7cff5b7980cbd34a252a403",
+    "exit_code": 0,
+    "outcome": {
+      "mode": "expect-unsupported",
+      "offline_cli_rejected": true,
+      "rpc_rejected": true,
+      "state_unchanged": true
+    },
+    "log_sha256": "ebdffd8b70dbd28eb73781fc12b4b0debe777f00bc81c13b6019f6206353d3b7",
+    "qualification": "The baseline C++ Namespace API did not include clone_file, so baseline differential coverage is limited to RPC and offline CLI."
+  },
+  "initial_fixture_attempt": {
+    "status": "failed and corrected before final validation",
+    "ctest_passed": 75,
+    "ctest_failed": 1,
+    "cause": "The new C++ fixture requested GC while handles were open; the existing GC policy requires an idle offline repository.",
+    "correction": "The fixture now reads and closes all handles before requesting GC. Runtime code and GC policy were not changed.",
+    "log_sha256": "cc18b0e6f323643146232f6ad22d280014ab3978b9066ef1ada8715cdfd4d37a"
+  },
+  "fixed_validation": {
+    "status": "passed",
+    "configuration": "Release WFS_FSKIT=ON",
+    "clean_first": true,
+    "ctest": {
+      "passed": 76,
+      "failed": 0,
+      "seconds": 116.36,
+      "new_targets": [
+        "forkfsd_clone_file",
+        "forkfsd_clone_file_rpc"
+      ]
+    },
+    "dependencies": {
+      "result": "passed",
+      "targets": [
+        "daemon",
+        "ForkFSExtension",
+        "ForkFSHost"
+      ]
+    },
+    "source_sha256_at_validation": {
+      "daemon/CMakeLists.txt": "aaebabe06597e214517b5185d126d475c677f22386b794cfb5af786cd41ad869",
+      "daemon/namespace.cpp": "17c447f057860977f4f1d020c9c250a1e2646d7e51986be5ea9d4cb273ac5062",
+      "daemon/namespace.h": "1bc834b5937094407308eeb407f9c8ebfb7eb9353b10575d6adad9136376814e",
+      "daemon/rpc.cpp": "584599ada733a72eaec6843aad126140195e5e58ee39f32562b8a91cfa4b853f",
+      "daemon/main.cpp": "7c68e2102be9d9634f7e0fbd397d21a20604863c3da8c325f4fc6fbac3efbdee",
+      "daemon/tests/clone_file.cpp": "8fbf397a2d5fbb8caf31f3c502d24a728df8d5fbb66bc13f1e2d843e1f6c2aba",
+      "daemon/tests/clone_file_rpc.py": "8f0cf2feb6904cb50bf95e0707343270635723edd7cff5b7980cbd34a252a403"
+    },
+    "daemon_sha256": "c61bf4ed0d98f022d72d1de1c6aa0e4648d4121140160b1d91555090cb10eced",
+    "cpp_test_sha256": "c05e4a1e47dc1ea309bdfe2ec124bc615651ae7481c6993e8088be200d8cfa22",
+    "validate_log_sha256": "3b3258dcfde75e081cacb292737deef4b7cfdb796332a67f9386c3f1f1f05802",
+    "ctest_log_sha256": "3c3f21516a73708d4204a45a57fa4e8fea31563a80271b7276a52ffe351c88bc",
+    "execution_root": "/private/tmp/fs130-exec-m4c0mulz"
+  },
+  "explicit_exclusions": [
+    "No FSKit callback, native clonefile(2)/copyfile(3) clone capability, or mounted clone behavior is implemented or claimed.",
+    "No physical disk deduplication/space guarantee or performance benchmark is established; the 1 TiB sparse case is a bounded regression, not a benchmark.",
+    "Reference-ID equality is asserted on the modern backend only; legacy tests validate clone behavior but do not assert object-ID equality.",
+    "Modern handle-retention and GC coverage is modern-only, and GC is requested only after all handles are closed.",
+    "The focused tests do not assert the newly created inode change-time value or explicitly test a destination that is a hardlink to the source.",
+    "Baseline differential coverage is resident RPC and offline CLI only because the baseline C++ Namespace API did not include clone_file."
+  ]
+}

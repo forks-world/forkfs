@@ -159,6 +159,7 @@ int main(int argc, char** argv) {
                          "forkfsd fs-set-volume-name CONTAINER NAME [--world WORLD]\n"
                          "forkfsd fs-mkdir CONTAINER PATH\n"
                          "forkfsd fs-write CONTAINER PATH INPUT_FILE\n"
+                         "forkfsd fs-clone-file CONTAINER SOURCE TARGET\n"
                          "forkfsd fs-save CONTAINER PATH INPUT_FILE\n"
                          "forkfsd fs-cat CONTAINER PATH\n"
                          "forkfsd fs-xattr-list CONTAINER PATH\n"
@@ -225,7 +226,7 @@ int main(int argc, char** argv) {
         std::string view="main";bool revision_view=false;
         int base_argc=4;
         if(command=="fs-init" || command=="fs-check" || command=="fs-worlds" || command=="fs-revisions" || command=="fs-compact" || command=="fs-layout" || command=="fs-volume-name")base_argc=3;
-        if(command=="fs-write" || command=="fs-save" || command=="fs-link" || command=="fs-rename" || command=="fs-rename-excl" || command=="fs-exchange" || command=="fs-fork" || command=="fs-restore" || command=="fs-append" || command=="fs-truncate" || command=="fs-symlink" || command=="fs-lchmod" || command=="fs-chmod" || command=="fs-setmtime")base_argc=5;
+        if(command=="fs-write" || command=="fs-save" || command=="fs-clone-file" || command=="fs-link" || command=="fs-rename" || command=="fs-rename-excl" || command=="fs-exchange" || command=="fs-fork" || command=="fs-restore" || command=="fs-append" || command=="fs-truncate" || command=="fs-symlink" || command=="fs-lchmod" || command=="fs-chmod" || command=="fs-setmtime")base_argc=5;
         if(command=="fs-setflags" || command=="fs-lsetflags")base_argc=5;
         if(command=="fs-read-at" || command=="fs-write-at" || command=="fs-punch-hole")base_argc=6;
         if(command=="fs-xattr-get" || command=="fs-xattr-remove")base_argc=5;
@@ -346,6 +347,8 @@ int main(int argc, char** argv) {
             } else if(command=="fs-save" && argc==5) {fs.replace_file(argv[3],load_file(argv[4]));
             } else if(command=="fs-write" && argc==5) {
                 fs.write(argv[3],load_file(argv[4]));
+            } else if(command=="fs-clone-file" && argc==5) {
+                fs.clone_file(argv[3],argv[4]);
             } else if(command=="fs-cat" && argc==4) {
                 for(uint64_t offset=0;;) {
                     auto value=fs.read_at(argv[3],offset,forkfs::Namespace::maximum_io_size);

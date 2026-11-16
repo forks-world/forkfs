@@ -582,9 +582,12 @@ void Namespace::commit_changes(const NamespaceView& view,Changes& changes) {
     std::vector<Mutation> batch;
     // Initialization alone retains compatibility with the original flat format.
     if(view.legacy() && !view.contains(root_key)) {
+        need(changes.references.empty(),"cannot publish object references during filesystem initialization");
         for(auto& [key,value]:changes)batch.push_back({key,std::move(value)});
     } else {
         NamespaceView::Changes delta;std::map<std::string,Bytes> new_objects;
+        // Apply references first; explicit byte mutations and deletions override them.
+        for(const auto& [key,id]:changes.references)delta[key]=id;
         const auto allocated=prefix+"allocated/";
         for(const auto& [key,value]:changes) {
             if(key.starts_with(history+"orphan/")){
@@ -887,6 +890,44 @@ void Namespace::write(const std::string& path,const Bytes& value) {
         need(!n.directory && !n.symlink,"cannot write non-regular file");mutable_metadata(n);if(n.chunked){for(const auto& key:FileContent(n,j).records())c[key]=std::nullopt;n.chunked=false;}n.size=value.size();touch(n);
         c[inode_key(id)]=encode(n);c[content_key(id)]=value;
         if(!exists){auto pn=inode(j,p.id);mutable_inode(pn);touch(pn);c[inode_key(p.id)]=encode(pn);c[p.key]=id_bytes(id);c[allocated_key(id)]=Bytes{};}
+    });
+}
+void Namespace::clone_file(const std::string& source,const std::string& target) {
+    update([&](const NamespaceView& view,Changes& changes) {
+        auto source_id=resolve(view,source);
+        auto original=inode(view,source_id);
+        if(original.directory)throw std::system_error(EISDIR,std::generic_category(),"cannot clone a directory");
+        need(!original.symlink,"cannot clone a non-regular file");
+
+        auto destination=parent(view,target);
+        mutable_inode(inode(view,destination.id));
+        if(view.contains(destination.key))throw std::system_error(EEXIST,std::generic_category(),"clone target already exists");
+
+        auto id=new_id(view);
+        InodeInfo copy=original;
+        copy.id=id;copy.links=1;copy.changed_ns=now();copy.allocated_size=0;
+        changes[inode_key(id)]=encode(copy);
+        changes[allocated_key(id)]=Bytes{};
+        changes[destination.key]=id_bytes(id);
+
+        auto reference=[&](const std::string& from,const std::string& to) {
+            auto object=view.reference(from);
+            need(object.has_value(),"clone source object disappeared");
+            changes.references[to]=*object;
+        };
+        if(original.chunked) {
+            const auto from=prefix+"chunk/"+source_id+"/";
+            const auto to=prefix+"chunk/"+id+"/";
+            for(const auto& key:view.keys(from))reference(key,to+key.substr(from.size()));
+        } else {
+            const auto from=content_key(source_id);
+            reference(from,content_key(id));
+        }
+        const auto from_xattrs=xattr_prefix(source_id),to_xattrs=xattr_prefix(id);
+        for(const auto& key:view.keys(from_xattrs))reference(key,to_xattrs+key.substr(from_xattrs.size()));
+
+        auto parent_inode=inode(view,destination.id);touch(parent_inode);
+        changes[inode_key(destination.id)]=encode(parent_inode);
     });
 }
 void Namespace::replace_file(const std::string& path,const Bytes& value) {
