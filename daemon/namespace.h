@@ -96,6 +96,7 @@ public:
     void handle_remove_xattr(const std::string& handle,const std::string& name) {edit_xattr(handle,name,std::nullopt,XattrPolicy::Upsert,true);}
 
     void rename(const std::string& source,const std::string& target);
+    void rename_exclusive(const std::string& source,const std::string& target);
     void exchange(const std::string& source,const std::string& target);
     void link(const std::string& source,const std::string& target);
     void remove(const std::string& path,bool directory);
@@ -149,6 +150,7 @@ private:
     std::string view_;
     bool revision_;
     void update(const std::function<void(const NamespaceView&,Changes&)>& operation);
+    void rename_impl(const std::string& source,const std::string& target,bool exclusive);
     void edit_content(const std::string& path,const std::function<bool(FileContent&)>& edit);
 };
 }

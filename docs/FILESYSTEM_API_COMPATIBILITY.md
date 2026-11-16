@@ -33,6 +33,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `chown/fchown`、setuid/setgid/sticky、ACL | inode metadata + access checks | 缺失；uid/gid 来自服务用户，拒绝更换属主，无 ACL，不是多用户文件系统 |
 | `access/faccessat`、目录搜索权限、只读 fd 权限 | 内核权限判断；未接 AccessCheckOperations | 挂载已测单用户 mode 000/0400、access、目录搜索/写权限、拒绝 truncate/创建/unlink、chmod 不撤销已开 fd；faccessat/组权限/多用户未验收 |
 | `mkdir/rmdir/unlink`、普通 `rename`、原子保存 | create/remove/rename → 原子 namespace 提交 | 挂载已测；失败 errno 与状态不变需按操作继续扩充。直接 RPC 错误码修复另见 PR #95 |
+| daemon `Namespace::rename_exclusive`、RPC/离线 CLI `fs-rename-excl` | 一次 namespace 事务内的排他目录项移动 | daemon API 已测；目标存在（包括同一路径、同 inode 硬链接和 dangling symlink）返回 `EEXIST`，不替换；只覆盖 daemon API，不表示 FSKit 或原生排他 rename 支持，见下方记录 |
 | daemon `Namespace::exchange`、RPC/离线 CLI `fs-exchange` | 一次 namespace 事务交换两个现存目录项 | daemon API 已测；支持文件、目录、符号链接及非空目录，交换最终符号链接项而不跟随；不提供原生 FSKit 或 `renamex_np(RENAME_SWAP)` 支持，见下方 entry-exchange 记录 |
 | `renamex_np/renameatx_np(RENAME_EXCL/RENAME_SWAP)`、交换/排他 rename | FSKit 平台限制 | 原生实测 SWAP、EXCL 到不存在目标均 ENOTSUP；EXCL 目标已存在时内核先返回 EEXIST。旧 Operations 和新 Handler 都不提供 flags 回调，不能只补 daemon 或迁移 Handler 解决 |
 | `link/symlink/readlink`、dangling symlink、`O_SYMLINK` | createLink/createSymbolicLink/readSymbolicLink | 挂载已测；包含链接身份、nofollow 时间/模式、`cp -Pp` 和二进制 xattr |
@@ -157,6 +158,46 @@ This is a daemon namespace capability only. No FSKit callback, native
 `RENAME_SWAP`/`renamex_np` implementation, or mounted exchange behavior is
 implemented or claimed. The baseline C++ Namespace API did not exist; baseline
 differential probes cover RPC and offline CLI only.
+
+### Exclusive entry rename (daemon APIs only)
+
+`Namespace::rename_exclusive(source, target)`, resident RPC
+`fs-rename-excl SOURCE TARGET`, and offline CLI
+`fs-rename-excl CONTAINER SOURCE TARGET` move a final directory entry only
+when the target name is absent. The target check and namespace move share one
+update, so an existing target is never replaced. An existing entry returns
+`EEXIST`, including when source and target are the same path, when both names
+refer to the same inode, or when the target is a dangling symlink. Files,
+directories (including nonempty directories), and symlink entries can move;
+the final symlink is moved without following it. Successful moves preserve
+inode identity, data, xattrs, and hard-link counts while updating inode and
+parent metadata through the existing rename path. There is no successful
+same-entry or same-inode no-op.
+
+The existing source and parent admission checks run before the atomic target
+existence check. Thus source or parent protections and path validation retain
+their existing error precedence, while a present target produces `EEXIST`
+before target inode checks or replacement/type checks. Missing paths, malformed
+or reserved paths, directory cycles, and revision writes retain existing
+generic error behavior. Target inode flags do not prevent an `EEXIST` refusal.
+
+Focused C++ coverage runs against modern LevelDB and legacy storage for regular
+files, directories, hardlinks, symlinks, metadata/xattrs, existing-target and
+invalid-path failures, protection checks, revision/fork isolation, reopen and
+verification. The modern backend also covers open/duplicated handle identity,
+cursor continuity, and GC. RPC and offline CLI coverage checks successful
+moves, `EEXIST`, missing/arity errors, and resident mount-lease refusal. The
+baseline RPC and CLI probes reject both occupied-target and absent-target
+requests and verify paths, metadata, data, and root state remain unchanged.
+The tests do not cover synthetic link-capacity boundaries, source-parent
+append-only refusal, successful movement of a dangling symlink source, or a
+world selector on the new RPC. Full execution details and source hashes are in
+the [exclusive rename evidence](evidence/2026-11-16-exclusive-rename.json).
+
+This is a daemon namespace feature only. No FSKit callback, native
+`RENAME_EXCL`/`renamex_np` implementation, or mounted exclusive-rename behavior
+is implemented or claimed. Baseline differential validation covers resident
+RPC and offline CLI only because the baseline C++ Namespace API did not exist.
 
 当前类使用 macOS 26 的 Operations 协议，具体实现见
 [`RevisionVolume.h`](../macos/forkfs/RevisionVolume.h) 和

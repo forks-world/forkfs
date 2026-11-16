@@ -394,6 +394,16 @@ add_test(NAME forkfsd_exchange_rpc COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/exchange_rpc.py $<TARGET_FILE:forkfsd>)
 set_tests_properties(forkfsd_exchange_rpc PROPERTIES TIMEOUT 120)
 
+add_executable(forkfsd_rename_exclusive_test tests/rename_exclusive.cpp
+    $<TARGET_OBJECTS:forkfs_common> $<TARGET_OBJECTS:forkfs_container_obj>
+    $<TARGET_OBJECTS:forkfs_compaction_obj>)
+target_link_libraries(forkfsd_rename_exclusive_test PRIVATE forkfs_metadata)
+add_test(NAME forkfsd_rename_exclusive COMMAND forkfsd_rename_exclusive_test)
+set_tests_properties(forkfsd_rename_exclusive PROPERTIES TIMEOUT 120)
+add_test(NAME forkfsd_rename_exclusive_rpc COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/rename_exclusive_rpc.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_rename_exclusive_rpc PROPERTIES TIMEOUT 120)
+
 if(APPLE)
     # Use host APFS scratch independently of the build filesystem; no FSKit mount needed.
     add_test(NAME forkfs_copy_transfer_reference COMMAND ${Python3_EXECUTABLE}
