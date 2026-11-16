@@ -188,12 +188,30 @@ NamespaceView::Plan NamespaceView::plan(const Changes& changes,bool compact,cons
         }
         flush();
     } else if(!changes.empty()) {
-        auto b=encode_run(changes);auto id=Journal::object_id(b);
-        // Identical delta is already represented at the front; avoid duplicates.
-        if(runs.empty() || runs.front()!=id) {
-            runs.erase(std::remove(runs.begin(),runs.end(),id),runs.end());
-            runs.insert(runs.begin(),id);result.objects.push_back(std::move(b));
+        // Keep each immutable delta below the legacy backend's 256 KiB
+        // per-object ceiling. Large namespace edits (notably file clones)
+        // become several newest-first runs.
+        std::vector<Id> deltas;Changes part;size_t bytes=12;
+        auto flush=[&] {
+            if(part.empty())return;
+            auto payload=encode_run(part);deltas.push_back(Journal::object_id(payload));
+            result.objects.push_back(std::move(payload));part.clear();bytes=12;
+        };
+        for(const auto& [key,id]:changes) {
+            const size_t entry=40+key.size();
+            need(12+entry<=256*1024,"metadata entry exceeds sorted-run limit");
+            if(bytes+entry>256*1024)flush();
+            part.emplace(key,id);bytes+=entry;
         }
+        flush();
+        // Newer partitions precede older ones. Remove repeated object IDs
+        // from both the deltas and existing runs without changing precedence.
+        std::set<Id> seen;
+        std::vector<Id> merged;
+        for(const auto& id:deltas)if(seen.insert(id).second)merged.push_back(id);
+        for(const auto& id:runs)if(seen.insert(id).second)merged.push_back(id);
+        if(merged.size()>hard_run_limit)return plan(changes,true);
+        runs=std::move(merged);
     }
     result.manifest=encode_manifest(runs);result.run_count=runs.size();return result;
 }

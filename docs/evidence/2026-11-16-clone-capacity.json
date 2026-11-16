@@ -1,0 +1,83 @@
+{
+  "title": "Copy-on-write clone metadata capacity regression",
+  "recorded_date": "2026-11-16",
+  "validated_base": "c2275ed1682c1cce2f5fa4cfd63a4d989fafc06d",
+  "original_head": "a63af225e86453217a0fdf2d1b1bcc9417dd57ae",
+  "tested_tree": "dc1dc06cc903fb9ed602ecaa149e2003a61ded63",
+  "review_finding": {
+    "thread": "PRRT_kwDOUf7jGc63z1wd",
+    "severity": "P2",
+    "summary": "Large clone reference maps exceeded the LevelDB 4,096-mutation transaction limit and legacy 256 KiB sorted-run limit."
+  },
+  "old_runtime_reproduction": {
+    "status": "both backend regressions reproduced independently",
+    "runtime_head": "a63af225e86453217a0fdf2d1b1bcc9417dd57ae",
+    "base": "c2275ed1682c1cce2f5fa4cfd63a4d989fafc06d",
+    "runtime_source_sha256": {
+      "daemon/namespace.cpp": "17c447f057860977f4f1d020c9c250a1e2646d7e51986be5ea9d4cb273ac5062",
+      "daemon/namespace.h": "1bc834b5937094407308eeb407f9c8ebfb7eb9353b10575d6adad9136376814e",
+      "daemon/metadata_view.cpp": "a62b209899a71b2d563b1706a616447945b541943e0af42d16e11c6e05d797d5",
+      "daemon/metadata_view.h": "ba006e172cb50cbf18a165f34b0c73acbc82603f3fb333843f3963c4318656af"
+    },
+    "build_exit_code": 0,
+    "test_binary_sha256": "0a4e5be8f10b8fa4fb45792368d62203f9dc7e9cf249fea0744f0d61722d0357",
+    "harness_sha256": "58cbbc2402d56a863b607d88057efd0da904669d4f8dcc770966c502940e4d7b",
+    "modern": {
+      "exit_code": 1,
+      "error": "LevelDB batch requires 1..4096 mutations",
+      "log_sha256": "16257e3420730faf895571389b7a41adb7584346b19e45a5a46faf672be5e553"
+    },
+    "legacy": {
+      "exit_code": 1,
+      "error": "sorted run exceeds 256 KiB",
+      "log_sha256": "09a383c26c12d9efb6bba1a04318413b5740f2f495f17e7f87580935c6d85c6f"
+    },
+    "qualification": "The same new regression test was linked separately against the unchanged old runtime for each backend."
+  },
+  "implementation": {
+    "small_batch": "A complete batch within backend limits is still committed in one transaction.",
+    "oversized_batch": "The full plan and final publication batch are constructed and validated before any staging write. Only immutable content-addressed object roots are staged in bounded transactions. Allocation roots, mutable namespace roots, and the World head publish together in one final transaction.",
+    "legacy_metadata": "Large deltas are split into sorted runs of at most 256 KiB. If the resulting manifest would exceed the existing hard limit of 32 runs, planning falls back to full compaction before writes; the capacity limit is not raised.",
+    "crash_recovery": "A process crash after a durable modern staging transaction can advance the physical sequence and object-root count while leaving the destination and World head unpublished. Reopen, GC, and retry recover successfully."
+  },
+  "regression_fixture": {
+    "chunks": 4097,
+    "bytes_per_chunk_reference": 1,
+    "logical_file_size_bytes": 268435457,
+    "qualification": "The fixture models a sparse 256 MiB + 1 byte logical file using 4,097 one-byte references to shared payload data; it is not a dense-payload throughput benchmark.",
+    "assertions": [
+      "Modern and legacy clone succeeds and preserves the logical size and allocated size.",
+      "Chunk object IDs match across source and clone in the snapshot on both backends.",
+      "Boundary reads, an independent clone edit, snapshot reads, reopen, and verify succeed.",
+      "Modern GC after closing handles preserves retained snapshot data.",
+      "Modern fault injection after the first durable staging transaction leaves the clone destination absent; reopen, GC, and retry succeed."
+    ],
+    "crash_backend_qualification": "The injected staged crash is modern LevelDB only; no legacy crash injection is claimed."
+  },
+  "validation": {
+    "status": "passed",
+    "configuration": "Release WFS_FSKIT=ON",
+    "clean_first": true,
+    "ctest": {
+      "passed": 77,
+      "failed": 0,
+      "seconds": 117.1,
+      "new_target": "forkfsd_clone_file_scale"
+    },
+    "dependencies": {
+      "result": "passed",
+      "targets": ["daemon", "ForkFSExtension", "ForkFSHost"]
+    },
+    "source_sha256_at_validation": {
+      "daemon/CMakeLists.txt": "82f421f4e4afd2f826bfc03a7942adf2210fdfcbe960d2e1c5ee17ee2ea967a8",
+      "daemon/namespace.cpp": "0abaf31d1441added36ff55d64d9a70c99724f4c1101611710c70562e73d796d",
+      "daemon/metadata_view.cpp": "17f813155c26c02b44e0c0f0703dce0d53ea13c01a7cfc8bc14c36b58ffa9bac",
+      "daemon/tests/clone_file_scale.cpp": "58cbbc2402d56a863b607d88057efd0da904669d4f8dcc770966c502940e4d7b"
+    },
+    "daemon_sha256": "bc157fb3a3e14e54f089b0699a1e3648aef50d4bae029c57f22c376190aa52d7",
+    "test_binary_sha256": "db812b53830dd72857a412be0dea0b84e43bd6b83ad620b3e66c61c551d42f2f",
+    "validate_log_sha256": "a6918264da95cd72c24f46392f88d0bc20a4df761f7f6cfb5268562daa183a06",
+    "ctest_log_sha256": "a7f39c178bde368c5ddd122c0bc7a3dbcbc61fecb1eadeeb72e3f679bef9818c"
+  },
+  "scope_qualification": "This resolves clone metadata transaction capacity. It does not claim native FSKit clone support, physical storage deduplication, dense payload throughput, or legacy staged-crash coverage."
+}

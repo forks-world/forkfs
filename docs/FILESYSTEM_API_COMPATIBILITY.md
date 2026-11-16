@@ -35,6 +35,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `mkdir/rmdir/unlink`、普通 `rename`、原子保存 | create/remove/rename → 原子 namespace 提交 | 挂载已测；失败 errno 与状态不变需按操作继续扩充。直接 RPC 错误码修复另见 PR #95 |
 | daemon `Namespace::rename_exclusive`、RPC/离线 CLI `fs-rename-excl` | 一次 namespace 事务内的排他目录项移动 | daemon API 已测；目标存在（包括同一路径、同 inode 硬链接和 dangling symlink）返回 `EEXIST`，不替换；只覆盖 daemon API，不表示 FSKit 或原生排他 rename 支持，见下方记录 |
 | daemon `Namespace::exchange`、RPC/离线 CLI `fs-exchange` | 一次 namespace 事务交换两个现存目录项 | daemon API 已测；支持文件、目录、符号链接及非空目录，交换最终符号链接项而不跟随；不提供原生 FSKit 或 `renamex_np(RENAME_SWAP)` 支持，见下方 entry-exchange 记录 |
+| daemon `Namespace::clone_file`、RPC/离线 CLI `fs-clone-file` | 新 inode 引用既有不可变 payload 对象 | daemon API 已测；创建独立 inode 并共享内容/xattr 对象引用；不表示原生 `clonefile(2)`、FSKit clone 回调或物理空间节省保证，见下方记录 |
 | `renamex_np/renameatx_np(RENAME_EXCL/RENAME_SWAP)`、交换/排他 rename | FSKit 平台限制 | 原生实测 SWAP、EXCL 到不存在目标均 ENOTSUP；EXCL 目标已存在时内核先返回 EEXIST。旧 Operations 和新 Handler 都不提供 flags 回调，不能只补 daemon 或迁移 Handler 解决 |
 | `link/symlink/readlink`、dangling symlink、`O_SYMLINK` | createLink/createSymbolicLink/readSymbolicLink | 挂载已测；包含链接身份、nofollow 时间/模式、`cp -Pp` 和二进制 xattr |
 | `readdir/getdirentries`、目录游标与属性 | enumerateDirectory → captured cursor | 挂载已测 66,000 项及 telldir/seekdir；前端按页读取，无旧 65,536 上限；64 个快照流，回调已测跨页删除/回退和淘汰游标 |
@@ -158,6 +159,69 @@ This is a daemon namespace capability only. No FSKit callback, native
 `RENAME_SWAP`/`renamex_np` implementation, or mounted exchange behavior is
 implemented or claimed. The baseline C++ Namespace API did not exist; baseline
 differential probes cover RPC and offline CLI only.
+
+### File clone (daemon API only)
+
+`Namespace::clone_file(source, target)`, resident RPC
+`fs-clone-file SOURCE TARGET`, and offline CLI
+`fs-clone-file CONTAINER SOURCE TARGET` create a new file inode in the selected
+World. The final source symlink is followed and the resolved source must be a
+regular file; a directory returns `EISDIR`. The target parent is resolved and
+checked for immutable protection before the exclusive destination check. Any
+occupied target, including a symlink, the same path, or another hardlink to the
+source, returns `EEXIST` without publishing changes. The new inode has a new ID,
+one link, and a new change time; mode, supported flags, atime, mtime, birth time,
+logical size, representation, sparse extents, and xattrs are copied. The source
+inode and metadata are unchanged. Immutable and append-only source flags are
+allowed and copied; the cloned flags must be cleared before content or metadata
+that those flags protect can be changed. Append-only destination directories
+allow entry insertion; immutable destination directories reject it.
+
+The daemon stores file content and xattrs as immutable objects. Clone metadata
+references the existing inline-content, chunk, and xattr object IDs instead of
+reading and copying payload bytes. It enumerates stored chunks only, so the
+1 TiB sparse-file regression uses only a few stored chunks rather than walking
+logical holes. Later writes, truncation, hole punching, xattr edits, and flag
+changes operate on the new inode independently. The tests assert object-ID equality for
+inline/empty content, chunk payloads, and xattrs on the modern backend. This is
+metadata-level sharing evidence, not a guarantee about physical storage
+deduplication, disk usage, or operation speed.
+
+Focused C++ tests cover modern LevelDB and legacy storage for empty, inline,
+chunked, and 1 TiB sparse files; source symlink and hardlink resolution;
+metadata/xattrs/flags; destination conflicts and parent protection; independent
+mutation; snapshots, forks, and reopen. Modern-only checks cover source-handle
+path reuse, compare shared object IDs, and exercise GC after all open handles
+are closed. RPC/offline CLI tests cover success, target conflicts, malformed RPC
+arity, mounted-world lease refusal, and a World selector. The baseline probe
+confirms the new RPC and CLI commands are rejected without changing namespace
+state. The initial C++ fixture attempted GC with open handles and failed the
+existing idle-repository requirement; the test was corrected to close handles
+before GC, without changing runtime policy. The final clean-first run passed
+76/76 CTest cases. Source hashes, build/test hashes, and probe results are in
+the [file-clone evidence](evidence/2026-11-16-clone-file.json).
+
+A follow-up capacity regression also confirms a 4,097-chunk clone succeeds on
+both storage backends. The fixture represents a 256 MiB + 1 byte sparse file
+with 4,097 one-byte references to shared payload data; it checks shared chunk
+IDs, reads, independent edits, snapshots, reopen, and GC. When a clone exceeds
+one transaction, the daemon stages only immutable object roots in bounded
+transactions, then publishes allocation roots, mutable namespace entries, and
+the World head together in one final transaction. Clones whose complete batch
+fits keep the single-transaction path. Legacy metadata deltas are partitioned
+into sorted runs no larger than 256 KiB; compaction remains subject to its
+existing hard 32-run limit. A modern-backend crash after a durable staging
+transaction leaves the destination unpublished; reopen, GC, and retry pass.
+The test does not inject a legacy-backend crash or benchmark dense payload
+throughput. On the unchanged old runtime, the same focused regression fails
+independently with the 4,096-mutation limit on LevelDB and the 256 KiB sorted
+run limit on legacy storage. See the [clone capacity evidence](evidence/2026-11-16-clone-capacity.json).
+
+This is a daemon namespace feature only. The FSKit frontend was not changed; no
+native `clonefile(2)` or `copyfile(3)` clone capability, mounted clone behavior,
+physical space guarantee, or performance benchmark is claimed. Baseline
+differential evidence covers RPC and offline CLI because the baseline C++
+`Namespace` API did not include `clone_file`.
 
 ### Exclusive entry rename (daemon APIs only)
 
