@@ -410,6 +410,18 @@ add_executable(forkfsd_clone_file_test tests/clone_file.cpp
 target_link_libraries(forkfsd_clone_file_test PRIVATE forkfs_metadata)
 add_test(NAME forkfsd_clone_file COMMAND forkfsd_clone_file_test)
 set_tests_properties(forkfsd_clone_file PROPERTIES TIMEOUT 120)
+add_executable(forkfsd_clone_file_scale_test tests/clone_file_scale.cpp
+    $<TARGET_OBJECTS:forkfs_common> $<TARGET_OBJECTS:forkfs_container_fault_obj>
+    $<TARGET_OBJECTS:forkfs_journal_fault_obj> $<TARGET_OBJECTS:forkfs_level_fault_obj>
+    $<TARGET_OBJECTS:forkfs_compaction_fault_obj> $<TARGET_OBJECTS:forkfs_metadata_tree_obj>)
+target_include_directories(forkfsd_clone_file_scale_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(forkfsd_clone_file_scale_test PRIVATE FORKFS_TEST_FAULTS=1)
+target_link_libraries(forkfsd_clone_file_scale_test PRIVATE leveldb Threads::Threads)
+if(NOT APPLE)
+    target_link_libraries(forkfsd_clone_file_scale_test PRIVATE OpenSSL::Crypto)
+endif()
+add_test(NAME forkfsd_clone_file_scale COMMAND forkfsd_clone_file_scale_test)
+set_tests_properties(forkfsd_clone_file_scale PROPERTIES TIMEOUT 600)
 add_test(NAME forkfsd_clone_file_rpc COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/clone_file_rpc.py $<TARGET_FILE:forkfsd>)
 set_tests_properties(forkfsd_clone_file_rpc PROPERTIES TIMEOUT 120)

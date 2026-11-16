@@ -201,6 +201,22 @@ before GC, without changing runtime policy. The final clean-first run passed
 76/76 CTest cases. Source hashes, build/test hashes, and probe results are in
 the [file-clone evidence](evidence/2026-11-16-clone-file.json).
 
+A follow-up capacity regression also confirms a 4,097-chunk clone succeeds on
+both storage backends. The fixture represents a 256 MiB + 1 byte sparse file
+with 4,097 one-byte references to shared payload data; it checks shared chunk
+IDs, reads, independent edits, snapshots, reopen, and GC. When a clone exceeds
+one transaction, the daemon stages only immutable object roots in bounded
+transactions, then publishes allocation roots, mutable namespace entries, and
+the World head together in one final transaction. Clones whose complete batch
+fits keep the single-transaction path. Legacy metadata deltas are partitioned
+into sorted runs no larger than 256 KiB; compaction remains subject to its
+existing hard 32-run limit. A modern-backend crash after a durable staging
+transaction leaves the destination unpublished; reopen, GC, and retry pass.
+The test does not inject a legacy-backend crash or benchmark dense payload
+throughput. On the unchanged old runtime, the same focused regression fails
+independently with the 4,096-mutation limit on LevelDB and the 256 KiB sorted
+run limit on legacy storage. See the [clone capacity evidence](evidence/2026-11-16-clone-capacity.json).
+
 This is a daemon namespace feature only. The FSKit frontend was not changed; no
 native `clonefile(2)` or `copyfile(3)` clone capability, mounted clone behavior,
 physical space guarantee, or performance benchmark is claimed. Baseline

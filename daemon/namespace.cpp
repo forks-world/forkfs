@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstring>
 #include <deque>
+#include <iterator>
 #include <set>
 #include <stdexcept>
 #include <system_error>
@@ -580,6 +581,7 @@ void Namespace::commit_changes(const NamespaceView& view,Changes& changes) {
     if(changes.empty())return;auto prepare_start=std::chrono::steady_clock::now();
     auto& journal=*container_.journal_;
     std::vector<Mutation> batch;
+    std::vector<Mutation> staged_objects;
     // Initialization alone retains compatibility with the original flat format.
     if(view.legacy() && !view.contains(root_key)) {
         need(changes.references.empty(),"cannot publish object references during filesystem initialization");
@@ -607,11 +609,46 @@ void Namespace::commit_changes(const NamespaceView& view,Changes& changes) {
                 auto id=Journal::object_id(payload);auto key=history+"object/"+hex_id(id);
                 if(!journal.contains(key))new_objects.emplace(key,std::move(payload));
             }
-            for(auto& [key,value]:new_objects)batch.push_back({key,std::move(value)});
+            for(auto& [key,value]:new_objects) {
+                if(key.starts_with(history+"object/"))staged_objects.push_back({key,std::move(value)});
+                else batch.push_back({key,std::move(value)});
+            }
             batch.push_back({history+"world/"+view_,std::move(plan.manifest)});
         }
     }
     container_.metadata_prepare_ns_+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-prepare_start).count();
+    const size_t max_mutations=journal.is_leveldb()?4096:64;
+    const size_t max_value_bytes=journal.is_leveldb()?16*1024*1024:1024*1024;
+    auto value_bytes=[](const std::vector<Mutation>& mutations) {
+        size_t total=0;
+        for(const auto& mutation:mutations)if(mutation.value) {
+            need(mutation.value->size()<=SIZE_MAX-total,"transaction value size overflow");
+            total+=mutation.value->size();
+        }
+        return total;
+    };
+    // Validate the eventual publication batch before writing any staged
+    // immutable objects. It contains every mutable root and the new world head.
+    need(!batch.empty() && batch.size()<=max_mutations,"namespace publication exceeds transaction mutation limit");
+    need(value_bytes(batch)<=max_value_bytes,"namespace publication exceeds transaction value limit");
+    bool oversized=batch.size()+staged_objects.size()>max_mutations ||
+        value_bytes(batch)+value_bytes(staged_objects)>max_value_bytes;
+    if(!oversized) {
+        batch.insert(batch.end(),std::make_move_iterator(staged_objects.begin()),std::make_move_iterator(staged_objects.end()));
+        journal.transact(journal.sequence(),batch);return;
+    }
+    // Only content-addressed immutable objects may be committed early. Their
+    // roots are not reachable from a world until the final atomic publication.
+    for(size_t at=0;at<staged_objects.size();) {
+        std::vector<Mutation> stage;size_t bytes=0;
+        while(at<staged_objects.size() && stage.size()<max_mutations) {
+            const auto size=staged_objects[at].value?staged_objects[at].value->size():0;
+            if(!stage.empty() && size>max_value_bytes-bytes)break;
+            need(size<=max_value_bytes,"immutable object exceeds staging transaction limit");
+            bytes+=size;stage.push_back(std::move(staged_objects[at++]));
+        }
+        journal.transact(journal.sequence(),stage);
+    }
     journal.transact(journal.sequence(),batch);
 }
 
