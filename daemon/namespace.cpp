@@ -157,9 +157,9 @@ std::string new_id(const NamespaceView& journal) {
     }
     throw std::runtime_error("inode identity collision");
 }
-void valid_namespace_text(const std::string& value) {
-    // Keep the original bytes as identity. Decode only to reject malformed
-    // UTF-8 and the C0/DEL/C1 controls excluded by the naming policy.
+void valid_utf8_text(const std::string& value, bool reject_controls) {
+    // Keep original bytes as identity. Decode to reject malformed UTF-8; the
+    // strict metadata policy additionally excludes C0/DEL/C1 controls.
     for(size_t at=0;at<value.size();) {
         const auto lead=static_cast<unsigned char>(value[at++]);
         uint32_t scalar=lead,minimum=0;size_t remaining=0;
@@ -175,14 +175,17 @@ void valid_namespace_text(const std::string& value) {
             scalar=(scalar<<6)|(next&0x3f);
         }
         need(scalar>=minimum && scalar<=0x10ffff && !(scalar>=0xd800 && scalar<=0xdfff),"invalid UTF-8 namespace text");
-        need(scalar>=0x20 && !(scalar>=0x7f && scalar<=0x9f),"invalid control character in namespace text");
+        need(scalar!=0,"NUL is not valid namespace text");
+        if(reject_controls)need(scalar>=0x20 && !(scalar>=0x7f && scalar<=0x9f),"invalid control character in namespace text");
     }
 }
+void valid_namespace_text(const std::string& value) { valid_utf8_text(value,true); }
+void valid_path_text(const std::string& value) { valid_utf8_text(value,false); }
 void valid_stored_entry_name(const std::string& name) {
     need(!name.empty() && name!="." && name!=".." && name.find('/')==std::string::npos,
          "invalid directory name");
     need(name.size()<=255,"invalid directory name");
-    valid_namespace_text(name);
+    valid_path_text(name);
 }
 void valid_volume_name(const std::string& name) {
     if(name.size()>255)throw std::system_error(ENAMETOOLONG,std::generic_category(),"volume name exceeds 255 bytes");
@@ -209,7 +212,7 @@ std::vector<std::string> components(const std::string& path,bool allow_trailing=
         auto name=path.substr(begin,end-begin);
         if(!name.empty()) {
             if(name.size()>255)throw std::system_error(ENAMETOOLONG,std::generic_category(),"path component exceeds 255 bytes");
-            valid_namespace_text(name);
+            valid_path_text(name);
             result.push_back(name);
         }
         if(end==path.size())break;
@@ -223,7 +226,7 @@ std::vector<std::string> components(const std::string& path,bool allow_trailing=
 std::vector<std::string> target_components(const std::string& target) {
     need(!target.empty(),"invalid symlink target length");
     if(target.size()>4096)throw std::system_error(ENAMETOOLONG,std::generic_category(),"symlink target exceeds 4096 bytes");
-    valid_namespace_text(target);
+    valid_path_text(target);
     std::vector<std::string> result;size_t start=0;
     while(start<target.size()) {
         auto end=target.find('/',start);if(end==std::string::npos)end=target.size();auto name=target.substr(start,end-start);
@@ -681,7 +684,7 @@ std::string Namespace::diff(const std::string& before,const std::string& after,c
     std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;
     auto before_manifest=revision_manifest(journal,before),after_manifest=revision_manifest(journal,after);
     NamespaceView left(journal,before_manifest),right(journal,after_manifest);
-    auto quote=[](const std::string& value){std::string result="\"";for(char c:value){if(c=='"' || c=='\\')result+='\\';result+=c;}return result+'"';};
+    auto quote=[](const std::string& value){std::string result="\"";static constexpr char hex[]="0123456789abcdef";for(unsigned char c:value){if(c=='"' || c=='\\')result+='\\';if(c<0x20){result+="\\u00";result+=hex[c>>4];result+=hex[c&15];}else result+=static_cast<char>(c);}return result+'"';};
     auto type=[&](const std::optional<InodeInfo>& n){return n?quote(n->directory?"directory":n->fifo?"fifo":n->socket?"socket":n->symlink?"symlink":"file"):std::string("null");};
     auto identity=[&](const std::optional<InodeInfo>& n){return n?quote(n->id):std::string("null");};
     auto same_metadata=[](const InodeInfo& a,const InodeInfo& b){return a.id==b.id && a.directory==b.directory && a.symlink==b.symlink && a.fifo==b.fifo && a.socket==b.socket &&

@@ -183,11 +183,15 @@ claim that a live mount survives service restart.
 
 Names and symlink targets preserve their UTF-8 bytes without normalization or
 case folding. Chinese, emoji and combining sequences are supported; NFC and NFD
-spellings are distinct names. Malformed UTF-8 and C0/DEL/C1 controls are rejected.
-World and revision labels continue to use the separate ASCII identifier grammar.
-Actual macOS 27.2 World and read-only revision mounts verified Chinese/emoji
-names, links, rename, NFC/NFD distinctions and the byte limit; see
-[UTF-8 acceptance evidence](evidence/2026-11-09-fskit-utf8.json).
+spellings are distinct names. Path components and symlink targets accept every
+well-formed UTF-8 scalar except NUL, including C0, DEL and C1 controls; malformed
+UTF-8 remains invalid. World and revision labels continue to use the separate
+ASCII identifier grammar. Actual macOS 27.2 World and read-only revision mounts
+verified Chinese/emoji names, links, rename, NFC/NFD distinctions and the byte
+limit; that historical qualification did not cover control names. The current
+candidate control-name mount probe has not been run. See
+[the historical UTF-8 acceptance evidence](evidence/2026-11-09-fskit-utf8.json) and
+[control-name qualification record](evidence/2026-11-16-control-character-names.json).
 
 Current limits are inherited from the namespace prototype: 1 TiB per regular
 file with 256 KiB per daemon I/O request, UTF-8 names (255 bytes per component, 4096 per path), mode bits through
@@ -334,8 +338,8 @@ revision-backed entries.
 
 Each value is limited to 262,143 bytes, including resource-fork values; larger values
 fail with E2BIG. Logical xattr names support up to 255 valid UTF-8 bytes without
-normalization, with the namespace's control-character exclusions; macOS can
-apply tighter native name limits. Xattrs do not add ACL or multi-user permission
+normalization and continue to exclude C0, DEL and C1 controls; macOS can apply
+tighter native name limits. Xattrs do not add ACL or multi-user permission
 enforcement. Final symlinks refer to their own attributes. The daemon marks
 inodes that have xattrs so older readers reject them; after the last attribute
 is removed, that marker clears. Attributes are retained by immutable revisions,

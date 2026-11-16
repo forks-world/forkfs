@@ -276,8 +276,11 @@ LIMIT entries (default and maximum 64, minimum 1), ordered by original UTF-8 pat
 bytes, including `/` when root metadata changes. Pass `next_after` as the exclusive
 AFTER_PATH for the next page while `eof` is false. The final page has an empty
 `next_after`. Cursors are path positions within the chosen revision pair; retain
-that pair while paging. Responses fit the existing 1 MiB RPC frame even at the
-4096-byte path limit. Paths exceeding that supported limit fail explicitly.
+that pair while paging. RPC responses fit the existing 1 MiB frame, including
+at the 4096-byte path limit; the RPC may return fewer than LIMIT entries when
+JSON escaping requires it. Offline `fs-diff` retains its entry-count limit and
+is not subject to an RPC frame bound. Paths exceeding the supported 4096-byte
+limit fail explicitly.
 
 Entries report `path`, `change` (`added`, `removed`, `modified`), before/after inode
 IDs and types (null on the absent side), `metadata_changed` and `content_changed`.
@@ -807,8 +810,11 @@ No inode/store/RPC format changes. See [evidence](../docs/evidence/2026-11-13-li
 
 RPC offers `fs-dir-open PATH`, `fs-dir-page CURSOR LIMIT`, `fs-dir-rewind CURSOR`
 and `fs-dir-close CURSOR`, all with the owning `--session` and view selector.
-Open returns cursor JSON; page returns names/eof JSON with 1..1024 names requested.
-C++ uses open_directory/read_directory/rewind_directory and an opaque cursor value.
+Open returns cursor JSON; page requests 1..1024 names and returns names/eof JSON.
+The RPC response is bounded by the 1 MiB frame limit, so a page may contain fewer
+names than requested when escaped JSON would exceed that limit. C++ callers of
+open_directory/read_directory/rewind_directory use an opaque cursor and are not
+subject to the RPC serialization bound.
 
 Open pins the current immutable namespace manifest and directory identity.
 Lexically ordered pages use exclusive last-key continuation through the CoW tree,
@@ -820,7 +826,10 @@ from symlinks are enumerated as entries, without following each child.
 
 Rewind returns to the beginning of the same pinned snapshot. An RPC reply lost
 after computation may have advanced the cursor; there is no request deduplication.
-Discard partial results and rewind to enumerate that fixed snapshot again.
+For an oversized serialized page, the RPC retries smaller reads from a copied
+cursor and commits the cursor only after the complete response fits the frame.
+An individually oversized entry fails without advancing the cursor. Discard
+partial results and rewind to enumerate that fixed snapshot again.
 Descriptors are limited to 64 per session and 1024 per service, released on close,
 session expiry or shutdown. They expire on restart and reject other views/sessions.
 Poisoned-store cleanup behavior is described below.
@@ -1076,6 +1085,11 @@ forkfsd fs-unlink project.forkfs /src/alias.cpp
 forkfsd fs-check project.forkfs
 ```
 
+`fs-ls` prints one raw name per line, so a name containing a newline cannot be
+represented unambiguously in that output. For machine-readable listings, use the
+session RPC directory pages (`inode-dir-open` and `fs-dir-entries`); JSON escaping
+preserves control characters when clients decode the returned names.
+
 `fs-init` creates the root directory once. `fs-rmdir` removes empty directories.
 Creation/write updates, hardlinks, rename (including overwrite) and removal use
 one durable multi-key batch. Rename preserves inode identity; hardlinks share
@@ -1097,14 +1111,20 @@ Lookup may end in `.` or `..`, but mutations reject those terminal components so
 they cannot become directory-entry keys. Names and
 symlink targets preserve their original UTF-8 bytes: case and canonically
 equivalent NFC/NFD spellings remain distinct.
-There is no Unicode normalization or case folding. C0 controls, DEL and C1 controls,
-malformed/truncated UTF-8, overlong encodings, surrogate code points and values
-above U+10FFFF are rejected before publication. Missing prefixes and traversal
+There is no Unicode normalization or case folding. Path components and symlink
+targets accept every well-formed UTF-8 scalar except NUL, including C0 controls,
+DEL and C1 controls. Malformed/truncated UTF-8, overlong encodings, surrogate code
+points and values above U+10FFFF are rejected before publication. Missing prefixes and traversal
 through regular files still fail. World/revision labels remain restricted to their
 ASCII identifier grammar. Existing ASCII stores need no conversion; a store with
 UTF-8 names requires a daemon that supports them. These deliberate prototype
 restrictions are not a frozen cross-platform naming policy. Current operations
-wait for local durability.
+wait for local durability. See the
+[historical control-name qualification record](../docs/evidence/2026-11-16-control-character-names.json)
+for tested boundaries and the native mount limitation. Its 79-test run used
+base e93c6b4 and predates PR 133 integration on base 00795b6; current integrated
+validation is recorded separately in
+[the PR 133 control-name evidence](../docs/evidence/2026-11-16-control-character-names-watch133.json).
 
 Regular files retain the original inline inode type (1) until they first grow
 past 256 KiB. They then use inode type 4 and sparse 64 KiB chunks at
@@ -1573,6 +1593,13 @@ RPC. No normalization or case folding is applied. Missing metadata means
 the optional name record. A rename preserves file identities/data, root inode
 times, repository identity, World name, volume identifier and mount path.
 This is volume administration, separate from file/root inode flags.
+
+Extended-attribute names and volume labels keep their existing control-character
+restriction. The directory key grammar and on-disk format are unchanged; a
+repository may contain control names after the first write. Older daemon versions
+can reject those paths and can fail namespace checks or emit invalid JSON while
+enumerating them, so use a matching updated daemon and FSKit frontend for such a
+repository. No downgrade behavior is guaranteed.
 
 The optional `volume-name` leaf is part of the immutable namespace metadata
 tree, so snapshot, fork, restore, history retention and GC retain it. The

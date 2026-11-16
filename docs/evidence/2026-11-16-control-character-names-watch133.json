@@ -1,0 +1,101 @@
+{
+  "date": "2026-11-16",
+  "feature": "PR 133 POSIX controls in UTF-8 paths with payload-bounded RPC pages",
+  "status": "integrated_tree_locally_validated; remote_ci_and_review_pending",
+  "pull_request": {
+    "repository": "forks-world/forkfs",
+    "number": 133,
+    "base_sha": "00795b6f6799fd2591f1fa1b71402ba4abbc843e",
+    "original_head_sha": "5e4ead844c3a4b116aef16e90c838eed992ae369",
+    "rebased_unfixed_head_sha": "79694c65eccede7b4cf792a1081dc34a2885b880",
+    "rebased_unfixed_tree": "7ec80f2205508c1660873efd7d35c55b39ec1d7e",
+    "tested_tree": "53e1bd74492d9615f656bcc1e0848a8f342f9f21"
+  },
+  "source_files_sha256": {
+    "daemon/namespace.cpp": "fcbbf923ecfbeea54400bfc884f682f528b2c73df9282db62d650ce7981486d6",
+    "daemon/rpc.cpp": "c261b2397b02565beb1b65c8993a5c5e4f30aed6b627b2f6e26414d440311a6d",
+    "daemon/tests/directories.py": "90c80b1a3bba05f032ab744da39b0947adfe04f7b64e4aa30ec17a221f88f01f",
+    "daemon/tests/inode_paths.cpp": "85f6e2ce6cf856291c787559dac1f551a9e28db27d6d469048c440bfc2eee33f",
+    "daemon/tests/namespace.py": "597580b982057d00708d6757730d77cbc1074d843deef55fad4e55af55d07ac5",
+    "daemon/tests/revision_diff.py": "973d3f882a3db8e042f4e470d09ae7559a5ea71033abda808317f877ce8a83bc",
+    "daemon/tests/symlinks.py": "1b8e36831741440ff13f5464423a38f14d43740bef35a4b6c3bf719214d1ac0d",
+    "daemon/tests/unicode_paths.py": "ff49dc06315ea93d710371c1e26d9c854a1cdee28a7fbf3f44e216421ade3634",
+    "macos/forkfs/tests/BridgeTest.mm": "c4e7bd8ad84c33c26f76317d912002ae29809a3f8e7ab020ccf8a6a193b9a57b",
+    "scripts/tests/control_names_mount.py": "769abe9c64ea9350807f3d4272be8f62a9d1d1e1fb50b4bf75280cadc7f4837f"
+  },
+  "behavior": {
+    "path_components_and_symlink_targets": "accept well-formed UTF-8 scalars except U+0000, preserving original bytes without normalization",
+    "unchanged_limits": "255 bytes per component and 4096 bytes per path or symlink target",
+    "strict_metadata_names": "volume labels and extended-attribute names continue to reject C0, DEL, and C1 controls",
+    "directory_rpc_pages": "validate requested count 1..1024; serialize complete JSON pages and retry from a copied cursor with halved counts until the response plus 4-byte status fits the 1 MiB RPC frame; commit cursor only on success",
+    "diff_rpc_pages": "validate requested count 1..64; retry the same stateless revision/path query with halved counts until the response plus 4-byte status fits the 1 MiB RPC frame",
+    "offline_and_namespace_limits": "Namespace directory/diff APIs and offline fs-diff retain their entry-count limits; no protocol or storage format change",
+    "oversized_single_entry": "fails without advancing a directory cursor; diff reports an error if a one-entry result cannot fit",
+    "json": "C0 bytes in paths/names are escaped in JSON and decode to the original bytes"
+  },
+  "validation": {
+    "configuration": "Release, WFS_FSKIT=ON, clean-first",
+    "environment": {
+      "system": "macOS 27.2.1",
+      "build": "26B131",
+      "architecture": "arm64",
+      "sdk": "27.2",
+      "external_network": "denied",
+      "credential_home_git_keychain_access": "denied",
+      "source_read_only": true,
+      "TMPDIR_trailing_slash": true
+    },
+    "ctest": {
+      "passed": 81,
+      "failed": 0,
+      "seconds": 124.27,
+      "directory_rpc_regression_seconds": 26.57,
+      "revision_diff_regression_seconds": 15.53
+    },
+    "dependency_checks": {
+      "forkfsd_libraries": 2,
+      "ForkFSExtension_libraries": 7,
+      "ForkFSHost_libraries": 4,
+      "result": "passed"
+    },
+    "focused_regressions": [
+      "Directory fs-dir-page and fs-dir-entries pages with 1030 unique 255-byte C0-heavy names: every response fits the frame, all names appear exactly once in sorted order, normal 1024-entry pages remain unchanged, invalid limits do not advance, and EOF/rewind behavior is stable.",
+      "RPC fs-diff with 70 unique 4096-byte C0-heavy paths: an overflowing request for 64 returns a smaller complete page, pages match a limit-2 oracle without loss or duplication, cursors advance strictly, repeated requests are stable, EOF repeats, invalid limit 65 fails, and store sequence is unchanged."
+    ],
+    "binary_sha256": {
+      "daemon/forkfsd": "ed7cdd48ea8a216ba632ceb68402164ad1e3634ad599b256fe1b5b52bfd849f2",
+      "macos/forkfs/ForkFSExtension": "ef27008c91483411e9b27311695e4e913d08be0eaec22d096aec6b5f88097a43",
+      "macos/forkfs/ForkFSHost": "a03e1d094807f63fd7b1a2ea437fb140c0a5490ad1be500ff67058b106c0ebfc",
+      "macos/forkfs/forkfs_bridge_test": "ce5ada009e9f3ba2f144657c67d95137d148e47a3b8cbac94b2c1246fe7e340b"
+    },
+    "logs": {
+      "validation_audit": "/private/tmp/watch133-control-ep83k11g/validation-audit-complete.json",
+      "validation_audit_sha256": "f23eca6a54d625304ef79ac96e68199c053fc40112b05f8a3f87ed8e6501241e",
+      "validate_complete": "/private/tmp/watch133-control-ep83k11g/logs/validate-complete.log",
+      "validate_complete_sha256": "22d0c04e7339ea4e23b16837bd5684f87ee0ebf4e5a156abd9e6e60038b3862f",
+      "last_test_complete": "/private/tmp/watch133-control-ep83k11g/logs/LastTest-complete.log",
+      "last_test_complete_sha256": "c2599847ccd9b0e2bba43d10941aafadb7c6837b92bb70b602e1fd0c08beb06e"
+    }
+  },
+  "baseline_regressions": {
+    "tested_tree": "7ec80f2205508c1660873efd7d35c55b39ec1d7e",
+    "daemon_sha256": "9c243f37e5d447e7a01394f2d2a739ec04262de7a862fbaf088f21698528e0cc",
+    "directory_rpc": "failed as expected: RPC payload exceeds 1 MiB",
+    "revision_diff_rpc": "failed as expected: RPC payload exceeds 1 MiB",
+    "directory_log_sha256": "194f7d3f1c32a705a452ba3b8a29d31f31cb87ca7b33d033aa71c3244ab47289",
+    "diff_log_sha256": "785c6edfad8d3df5e552e1d07a7a19533c0c09931193090f92ace1c2d262e5ea"
+  },
+  "historical_validation": {
+    "previous_evidence": "2026-11-16-control-character-names.json",
+    "previous_base": "e93c6b4e37d73c5b0b98d4615a121609983adbee",
+    "previous_ctest_passed": 79,
+    "directory_only_stage_tree": "80af1deeb28f4204d946a45593480c98245ff505",
+    "directory_only_stage_ctest_passed": 81,
+    "note": "Prior runs are retained as historical evidence; the 79-test run predates PR 133 integration with PR 132. The 81-test directory-only stage preceded the final diff regression and is not current validation."
+  },
+  "not_claimed": [
+    "Fresh remote CI or a completed Codex review for the eventual pushed head.",
+    "Native ForkFS candidate signing, installation, or mount validation.",
+    "Power-loss, kernel-crash, or hardware-media-flush qualification."
+  ]
+}

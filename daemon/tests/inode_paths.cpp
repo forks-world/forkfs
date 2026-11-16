@@ -1,5 +1,6 @@
 #include "namespace.h"
 #include "metadata_view.h"
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -30,8 +31,25 @@ int main(int argc,char** argv){
  if(argc!=1)return 2;char pattern[]="/tmp/ff-path-hints-XXXXXX";auto tmp=mkdtemp(pattern);if(!tmp)return 1;
  try{for(bool legacy:{false,true}){
   auto path=std::string(tmp)+(legacy?"/legacy":"/db");if(legacy)Container::create_legacy(path);else Container::create(path);
-  std::string id;
+  std::string id;std::vector<std::string> control_names;for(unsigned char c=1;c<32;++c)control_names.emplace_back(1,static_cast<char>(c));
+  control_names.emplace_back(1,static_cast<char>(0x7f));control_names.emplace_back("\xc2\x80");control_names.emplace_back("\xc2\x9f");
   {Container store(path);Namespace fs(store);fs.initialize();fs.mkdir("/dir");fs.write("/dir/a",Bytes{'A'});id=fs.stat("/dir/a").id;
+   // Directory names and symlink targets accept all non-NUL UTF-8 scalars.
+   for(size_t i=0;i<control_names.size();++i){auto name=control_names[i];fs.write("/"+name,Bytes{static_cast<unsigned char>(i)});check(fs.read("/"+name)==Bytes{static_cast<unsigned char>(i)});}
+   auto listed=fs.list("/");for(const auto& name:control_names)check(std::find(listed.begin(),listed.end(),name)!=listed.end());
+   fs.link("/"+control_names[1],"/hard\nlink");fs.rename("/hard\nlink","/renamed\rlink");
+   check(fs.read("/renamed\rlink")==Bytes{1});
+   fs.mkdir("/directory\n\t");fs.write("/directory\n\t/child\rfile",Bytes{'D'});check(fs.read("/directory\n\t/child\rfile")==Bytes{'D'});
+   fs.symlink(control_names[8],"/follow\tlink");check(fs.read("/follow\tlink")==Bytes{8});
+   std::string target="target\n\t\r";target.push_back(static_cast<char>(0x7f));target+="\xc2\x80\xc2\x9f";
+   fs.symlink(target,"/symbolic\nlink");check(fs.readlink("/symbolic\nlink")==target);check(fs.lstat("/symbolic\nlink").symlink);
+   fs.snapshot("controls");
+   auto unchanged=sequence(store.status());auto rejects=[&](const std::string& value){bool failed=false;try{fs.write(value,Bytes{'X'});}catch(const std::exception&){failed=true;}check(failed && sequence(store.status())==unchanged);};
+   rejects(std::string("/bad\0name",9));rejects("/"+std::string(256,'x'));
+   std::string long_path="/";for(unsigned i=0;i<16;++i){if(i)long_path+='/';long_path+=std::string(255,'p');}long_path+="/x";rejects(long_path);
+   bool strict=false;try{fs.set_volume_name("bad\nlabel");}catch(const std::exception&){strict=true;}check(strict && sequence(store.status())==unchanged);
+   strict=false;try{fs.set_xattr("/dir/a","user.bad\tname",Bytes{'x'},Namespace::XattrPolicy::Upsert);}catch(const std::exception&){strict=true;}check(strict && sequence(store.status())==unchanged);
+   Namespace controls_view(store,"controls",true);for(size_t i=0;i<control_names.size();++i)check(controls_view.read("/"+control_names[i])==Bytes{static_cast<unsigned char>(i)});controls_view.verify();
    // A long syntactic alias must not become an inode hint used as the base
    // for RPC child paths: path_for_inode should return the compact physical path.
    std::string dotted="/";for(unsigned i=0;i<2046;++i)dotted+="./";dotted+="dir";check(dotted.size()==4096);
@@ -58,7 +76,9 @@ int main(int argc,char** argv){
     check(fs.path_for_inode(current_id)=="/moved/a" && fs.read("/moved/./a")==Bytes{'R'});
     check(old.path_for_inode(id)=="/dir/a" && old.read("/dir/../dir/./a")==Bytes{'A'});}
    fs.verify();old.verify();store.verify();}
-  {Container store(path);Namespace fs(store),old(store,"before",true);missing([&]{fs.path_for_inode(id);});check(old.path_for_inode(id)=="/dir/a");
+  {Container store(path);Namespace fs(store),old(store,"before",true),controls(store,"controls",true);missing([&]{fs.path_for_inode(id);});check(old.path_for_inode(id)=="/dir/a");
+   for(size_t i=0;i<control_names.size();++i)check(controls.read("/"+control_names[i])==Bytes{static_cast<unsigned char>(i)});
+   check(controls.read("/directory\n\t/child\rfile")==Bytes{'D'} && controls.read("/follow\tlink")==Bytes{8});
    if(!legacy){check(fs.read("/moved/./a")==Bytes{'R'} && fs.stat("/moved/a").id!=id);
     check(old.path_for_inode(id)=="/dir/a" && old.read("/dir/../dir/./a")==Bytes{'A'});}
    fs.verify();old.verify();store.verify();}

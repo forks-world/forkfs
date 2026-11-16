@@ -1,0 +1,112 @@
+{
+  "date": "2026-11-16",
+  "evidence_status": "historical",
+  "superseded_by": "2026-11-16-control-character-names-watch133.json",
+  "feature": "POSIX controls in valid UTF-8 path components and symlink targets",
+  "status": "daemon_and_callback_validated; native_candidate_control_names_unqualified",
+  "source": {
+    "base_sha": "e93c6b4e37d73c5b0b98d4615a121609983adbee",
+    "branch": "feat/fs-api-next-133",
+    "format_change": false,
+    "source_hashes_match_frozen_archive": true,
+    "validation_audit_sha256": "ed601568a580ed3f4d24b86088b48316d05d4a77b03f68d09eb8b328ce63db69",
+    "source_sha256": {
+      "daemon/namespace.cpp": "e5931248b187e1ce24847b62f78a5303810b6aeb6ba0dea4623605488c5371cf",
+      "daemon/rpc.cpp": "e7a181611ecd217134abc21d7e8e9571f25b676e89d50a6c1f603ae1d07ec3c5",
+      "daemon/tests/inode_paths.cpp": "85f6e2ce6cf856291c787559dac1f551a9e28db27d6d469048c440bfc2eee33f",
+      "daemon/tests/namespace.py": "597580b982057d00708d6757730d77cbc1074d843deef55fad4e55af55d07ac5",
+      "daemon/tests/symlinks.py": "1b8e36831741440ff13f5464423a38f14d43740bef35a4b6c3bf719214d1ac0d",
+      "daemon/tests/unicode_paths.py": "ff49dc06315ea93d710371c1e26d9c854a1cdee28a7fbf3f44e216421ade3634",
+      "macos/forkfs/tests/BridgeTest.mm": "22a10fa442ffa616a9e21ad7a041bfead11f97ecda29b6425bb3edcbcd789498",
+      "scripts/tests/control_names_mount.py": "769abe9c64ea9350807f3d4272be8f62a9d1d1e1fb50b4bf75280cadc7f4837f"
+    }
+  },
+  "behavior": {
+    "path_components_and_symlink_targets": "accept all well-formed UTF-8 scalars except U+0000, without normalization",
+    "unchanged_limits": "255 bytes per component and 4096 bytes per path or symlink target",
+    "unchanged_rejections": "malformed UTF-8, NUL, slash/dot/dotdot component rules, and paths, targets or components exceeding their byte limits",
+    "strict_metadata_names": "volume labels and extended-attribute names still reject C0, DEL, and C1 controls",
+    "json": "directory listing and diff JSON escape every C0 byte; decoded strings preserve the original UTF-8 bytes",
+    "fs_ls": "raw line-delimited output remains ambiguous for names containing newline; use JSON session directory pages",
+    "repository_format": "unchanged raw byte keys; no version bump or record ambiguity"
+  },
+  "validation": {
+    "configuration": "Release, WFS_FSKIT=ON, clean-first",
+    "ctest": {
+      "passed": 79,
+      "failed": 0,
+      "seconds": 120.75,
+      "scope_note": "79 tests on base e93c6b4e; this base does not include the independent open PR #132 socket tests"
+    },
+    "dependency_checks": {
+      "forkfsd_libraries": 2,
+      "ForkFSExtension_libraries": 7,
+      "ForkFSHost_libraries": 4,
+      "result": "passed"
+    },
+    "focused_coverage": [
+      "modern LevelDB and legacy Namespace paths: all 31 C0 non-NUL scalars plus DEL and representative C1 values, list/read/write, mkdir, hardlink/rename, symlink follow/readlink, snapshot, reopen and verification",
+      "negative NUL, malformed UTF-8, 256-byte components, paths and symlink targets exceeding 4096 bytes, strict volume/xattr policy and atomicity",
+      "RPC JSON directory pages and diff cursors round-trip control, quote, backslash and newline names",
+      "direct and loopback FSKit callbacks create/lookup/readdir/readlink control-name coverage",
+      "new native candidate qualifier executed against an APFS reference only"
+    ],
+    "test_binary_sha256": {
+      "daemon/forkfsd": "1e08a112861dea9dcc2d50195b9486db6000194e56bf739087a160b1b4c879d2",
+      "macos/forkfs/ForkFSExtension": "12f0c4d8efb1925ebca73280ed630edcd7ad9f5063418b10198abcbc541cdad8",
+      "macos/forkfs/ForkFSHost": "a03e1d094807f63fd7b1a2ea437fb140c0a5490ad1be500ff67058b106c0ebfc",
+      "macos/forkfs/forkfs_bridge_test": "ceaa856e4b11c80c67bac4769d2e1aeb78c0a8db5385984310b09f61221bea3a"
+    },
+    "logs": {
+      "full_validation_sha256": "7868224555178c1bf0ea0fcc4f84fcc3cc255a74459a45a89a64ed43874c95a6",
+      "ctest_sha256": "8a4ff58414a303bfff532e0814caa32aab6bdf8646a279301b48de26408fa424"
+    }
+  },
+  "corrected_preliminary_runs": {
+    "stale_test_expectations": 3,
+    "correction": "Updated tests for newly valid control paths/targets and the generic fs-xattr-set RPC error shape; no runtime change was made for these failures.",
+    "expectation_failure_log_sha256": "374945ca51dd07bd7daa6f91aa0f18d8139d7a66a2707d6ae4a908c16755a7e5",
+    "baseline_bridge_compile_issue": "Initial new BridgeTest compile exposed four NSData byte pointer casts and a directory packer cast; corrected before the final validation.",
+    "compile_failure_log_sha256": "6501589d68e643015b6b025e9721b8ac83e17003c8bbc50c5cfc6b14871f0070"
+  },
+  "native_reference": {
+    "apfs_probe": {
+      "non_nul_controls": 64,
+      "checks": [
+        "exact byte names from listdir",
+        "read and write",
+        "hardlink and rename identity",
+        "symlink target byte roundtrip and follow"
+      ],
+      "result": "passed",
+      "report_sha256": "48a53bb986fd54c81214623bb2940e0f5aa6557bbad4b43e45b2c3dcd6068f1f"
+    },
+    "bounded_mount_qualifier": {
+      "filesystem": "APFS reference",
+      "control_scalars": 34,
+      "checks": ["filename byte read/write/listdir", "dangling symlink target readlink byte roundtrip"],
+      "result": "passed",
+      "report_sha256": "7ec3487db1569169ab03f4b759484441b63bbd5773abc08bee485ddde70fd61b"
+    },
+    "limitation": "APFS reference results do not establish behavior on a mounted ForkFS candidate."
+  },
+  "compatibility_probe": {
+    "new_reader_fs_check": "passed",
+    "old_e93_reader_fs_check": "rejected control-name namespace with invalid-control error",
+    "namespace_sequence_unchanged": true,
+    "limitation": "This single check does not establish general fail-closed or downgrade behavior.",
+    "report_sha256": "ec30a300f3b2b7136130596b15fa21352a9076f035ed5212dfbfab1959f3f4f2"
+  },
+  "baseline_regression": {
+    "old_daemon_with_new_bridge_test": "compiled after test argument casts were fixed, then failed at control filename creation as expected",
+    "daemon_sha256": "bb6545c1a2c75a7aad7f0a6db66dc1250a4f86cd609dc2a7ab4852ee23f1be00",
+    "log_sha256": "8cc5fd4fdebc843f1d9be27f7696abd824d0be2871ac2b46486ade4c6dfa9300"
+  },
+  "native_forkfs_candidate": {
+    "status": "not_run",
+    "signed": false,
+    "installed": false,
+    "mounted": false,
+    "claim": "No native ForkFS mount control-name compatibility is claimed."
+  }
+}

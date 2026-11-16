@@ -380,6 +380,30 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:danglingLink replyHandler:^(FSItemAttributes* a,NSError* e){attrs=a;result=e;}];check(!result && attrs.linkCount==0 && attrs.type==FSItemTypeSymlink,"symlink reader must retain orphan after downgrade");
         [volume closeItem:danglingLink keepingModes:0 replyHandler:^(NSError* e){result=e;}];check(!result,"symlink metadata close failed");
         [volume reclaimItem:danglingLink replyHandler:^(NSError* e){result=e;}];check(!result,"symlink metadata reclaim failed");
+        // Control scalars remain valid UTF-8 names and symlink target bytes.
+        // Remove these fixtures before the later revision and root checks.
+        NSString* controlName=@"control\n\t\r\x7f\u0080\u009f";
+        NSData* controlNameBytes=[controlName dataUsingEncoding:NSUTF8StringEncoding];
+        __block FSItem* controlFile=nil;
+        [volume createItemNamed:[FSFileName nameWithBytes:static_cast<const char*>(controlNameBytes.bytes) length:controlNameBytes.length] type:FSItemTypeFile inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* it,FSFileName* n,NSError* e){controlFile=it;result=e;}];
+        check(controlFile && !result,"control filename create callback failed");
+        __block FSItem* controlLookup=nil;
+        [volume lookupItemNamed:[FSFileName nameWithBytes:static_cast<const char*>(controlNameBytes.bytes) length:controlNameBytes.length] inDirectory:root replyHandler:^(FSItem* it,FSFileName* n,NSError* e){controlLookup=it;result=e;}];
+        check(controlLookup==controlFile && !result,"control filename lookup callback failed");
+        NSString* controlTarget=@"target\n\t\r\x7f\u0080\u009f";
+        NSData* controlTargetBytes=[controlTarget dataUsingEncoding:NSUTF8StringEncoding];
+        __block FSItem* controlLink=nil;
+        [volume createSymbolicLinkNamed:[FSFileName nameWithString:@"control-link"] inDirectory:root attributes:[FSItemSetAttributesRequest new] linkContents:[FSFileName nameWithBytes:static_cast<const char*>(controlTargetBytes.bytes) length:controlTargetBytes.length] replyHandler:^(FSItem* it,FSFileName* n,NSError* e){controlLink=it;result=e;}];
+        check(controlLink && !result,"control symlink target create callback failed");
+        __block FSFileName* readControlTarget=nil;
+        [volume readSymbolicLink:controlLink replyHandler:^(FSFileName* value,NSError* e){readControlTarget=value;result=e;}];
+        check(!result && [readControlTarget.string isEqual:controlTarget],"control symlink target round trip failed");
+        RecordingPacker* controlPacker=[RecordingPacker new];controlPacker.limit=512;
+        [volume enumerateDirectory:root startingAtCookie:FSDirectoryCookieInitial verifier:0 providingAttributes:nil usingPacker:(FSDirectoryEntryPacker*)controlPacker replyHandler:^(FSDirectoryVerifier verifier,NSError* e){result=e;}];
+        BOOL foundControl=NO;for(NSDictionary* entry in controlPacker.entries)if([entry[@"name"] isEqual:controlName])foundControl=YES;
+        check(!result && foundControl,"control filename missing from readdir callback");
+        [volume removeItem:controlLink named:[FSFileName nameWithString:@"control-link"] fromDirectory:root replyHandler:^(NSError* e){result=e;}];check(!result,"control symlink cleanup failed");
+        [volume removeItem:controlFile named:[FSFileName nameWithBytes:static_cast<const char*>(controlNameBytes.bytes) length:controlNameBytes.length] fromDirectory:root replyHandler:^(NSError* e){result=e;}];check(!result,"control filename cleanup failed");
         [volume deactivateWithOptions:0 replyHandler:^(NSError* e){result=e;}];check(!result,"deactivation failed");volume=nil;
         NSMutableDictionary* roConfig=[@{@"schema_version":@1,@"revision":@"base",@"repository":status[@"repository_id"]} mutableCopy];
         if(config[@"rpc"])roConfig[@"rpc"]=config[@"rpc"];

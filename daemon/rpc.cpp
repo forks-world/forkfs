@@ -45,7 +45,8 @@ int64_t signed_number(const std::string& text){
 }
 std::string names(const std::vector<std::string>& values){std::string out;for(const auto& s:values)out+=s+'\n';return out;}
 std::string quoted(const std::string& value){
-    std::string out="\"";for(char c:value){if(c=='\"' || c=='\\')out+='\\';out+=c;}return out+"\"";
+    std::string out="\"";static constexpr char hex[]="0123456789abcdef";
+    for(unsigned char c:value){if(c=='\"' || c=='\\')out+='\\';if(c<0x20){out+="\\u00";out+=hex[c>>4];out+=hex[c&15];}else out+=static_cast<char>(c);}return out+"\"";
 }
 std::string inode_json(const InodeInfo& n){
     std::ostringstream out;out<<"{\"inode_id\":\""<<n.id<<"\",\"directory\":"<<(n.directory?"true":"false")
@@ -289,12 +290,22 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="fs-dir-rewind"){fs.rewind_directory(activity.session->directories.at(args[1]).cursor);return store.status();}
     if(op=="fs-dir-close"){activity.session->directories.erase(args[1]);return store.status();}
     if(op=="fs-dir-page" || op=="fs-dir-entries") {
-        auto limit=number(args[2]);need(limit>=1 && limit<=1024,"directory page limit must be 1..1024");
-        bool attrs=op=="fs-dir-entries";auto page=fs.read_directory(activity.session->directories.at(args[1]).cursor,limit,attrs);
-        std::string result=attrs?"{\"entries\":[":"{\"names\":[";bool first=true;
-        if(attrs)for(const auto& entry:page.entries){if(!first)result+=',';first=false;result+="{\"name\":"+quoted(entry.name)+",\"inode\":"+inode_json(entry.inode)+"}";}
-        else for(const auto& name:page.names){if(!first)result+=',';first=false;result+=quoted(name);}
-        return result+"],\"eof\":"+(page.eof?"true":"false")+"}\n";
+        const auto requested=number(args[2]);need(requested>=1 && requested<=1024,"directory page limit must be 1..1024");
+        const bool attrs=op=="fs-dir-entries";auto& stored=activity.session->directories.at(args[1]).cursor;
+        size_t attempt_count=static_cast<size_t>(requested);
+        for(unsigned attempt=0;attempt<11;++attempt) {
+            auto candidate=stored;auto page=fs.read_directory(candidate,attempt_count,attrs);
+            std::string result=attrs?"{\"entries\":[":"{\"names\":[";bool first=true;
+            if(attrs)for(const auto& entry:page.entries){if(!first)result+=',';first=false;result+="{\"name\":"+quoted(entry.name)+",\"inode\":"+inode_json(entry.inode)+"}";}
+            else for(const auto& name:page.names){if(!first)result+=',';first=false;result+=quoted(name);}
+            result+= "],\"eof\":";
+            result+=(page.eof?"true":"false");
+            result+="}\n";
+            if(result.size()<=limit-4){stored=std::move(candidate);return result;}
+            if(attempt_count==1)throw std::runtime_error("directory entry exceeds RPC payload limit");
+            attempt_count=std::max<size_t>(1,attempt_count/2);
+        }
+        throw std::runtime_error("directory page exceeds RPC payload limit");
     }
     if(op=="fs-xattr-get" || op=="fs-hxattr-get"){auto value=op=="fs-xattr-get"?fs.get_xattr(args[1],args[2]):fs.handle_get_xattr(args[1],args[2]);return std::string(value.begin(),value.end());}
     if(op=="fs-xattr-list" || op=="fs-hxattr-list"){
@@ -310,7 +321,17 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     if(op=="fs-restore"){sessions.require_unmounted(view);return fs.restore(args[1],args[2]);}
     if(op=="fs-history"){auto limit=number(args[3]);need(limit>=1 && limit<=64,"invalid history page limit; expected 1..64");return fs.revision_history(args[1],args[2],static_cast<size_t>(limit));}
-    if(op=="fs-diff"){auto limit=number(args[4]);need(limit>=1 && limit<=64,"invalid diff page limit; expected 1..64");return fs.diff(args[1],args[2],args[3],static_cast<size_t>(limit));}
+    if(op=="fs-diff"){
+        const auto requested=number(args[4]);need(requested>=1 && requested<=64,"invalid diff page limit; expected 1..64");
+        size_t attempt_limit=static_cast<size_t>(requested);
+        for(unsigned attempt=0;attempt<7;++attempt) {
+            auto result=fs.diff(args[1],args[2],args[3],attempt_limit);
+            if(result.size()<=limit-4)return result;
+            if(attempt_limit==1)throw std::runtime_error("diff entry exceeds RPC payload limit");
+            attempt_limit=std::max<size_t>(1,attempt_limit/2);
+        }
+        throw std::runtime_error("diff page exceeds RPC payload limit");
+    }
     if(op=="fs-cat"){auto b=fs.read(args[1]);return std::string(b.begin(),b.end());}
     if(op=="fs-read-at"){auto b=fs.read_at(args[1],number(args[2]),number(args[3]));return std::string(b.begin(),b.end());}
     if(op=="fs-open") {
