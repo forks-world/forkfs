@@ -32,7 +32,7 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | `st_blocks`、`du` | allocated_size → allocSize | 挂载已测；空洞为零、数据 payload 每位置向上取整到 512 字节，不是去重后独占仓库空间 |
 | `chown/fchown`、setuid/setgid/sticky、ACL | inode metadata + access checks | 缺失；uid/gid 来自服务用户，拒绝更换属主，无 ACL，不是多用户文件系统 |
 | `access/faccessat`、目录搜索权限、只读 fd 权限 | 内核权限判断；未接 AccessCheckOperations | 挂载已测单用户 mode 000/0400、access、目录搜索/写权限、拒绝 truncate/创建/unlink、chmod 不撤销已开 fd；faccessat/组权限/多用户未验收 |
-| `mkdir/rmdir/unlink`、普通 `rename`、原子保存 | create/remove/rename → 原子 namespace 提交 | 挂载已测；失败 errno 与状态不变需按操作继续扩充。直接 RPC 错误码修复另见 PR #95 |
+| `mkdir/rmdir/unlink`、普通 `rename`、原子保存 | create/remove/rename → 原子 namespace 提交 | 挂载已测；末尾斜杠的 APFS/Darwin observed 语义另有 Namespace、RPC 与离线 CLI 回归：`rmdir(alias/)` 和 `rename(alias/, ...)` 修改物理目标并保留 alias；`rename(dir, alias/)` 跟随目标，含 dangling link 的缺失目录目标。也覆盖 `rename_exclusive` 共用解析器。此项不增加原生挂载兼容声明。失败 errno 与状态不变仍需按操作继续扩充。直接 RPC 错误码修复另见 PR #95 |
 | daemon `Namespace::rename_exclusive`、RPC/离线 CLI `fs-rename-excl` | 一次 namespace 事务内的排他目录项移动 | daemon API 已测；目标存在（包括同一路径、同 inode 硬链接和 dangling symlink）返回 `EEXIST`，不替换；只覆盖 daemon API，不表示 FSKit 或原生排他 rename 支持，见下方记录 |
 | daemon `Namespace::exchange`、RPC/离线 CLI `fs-exchange` | 一次 namespace 事务交换两个现存目录项 | daemon API 已测；支持文件、目录、符号链接及非空目录，交换最终符号链接项而不跟随；不提供原生 FSKit 或 `renamex_np(RENAME_SWAP)` 支持，见下方 entry-exchange 记录 |
 | daemon `Namespace::clone_file`、RPC/离线 CLI `fs-clone-file` | 新 inode 引用既有不可变 payload 对象 | daemon API 已测；创建独立 inode 并共享内容/xattr 对象引用；不表示原生 `clonefile(2)`、FSKit clone 回调或物理空间节省保证，见下方记录 |
@@ -130,11 +130,16 @@ and metadata/content operations. The slash requires the resolved object to be a
 directory, including when the final component is a symlink to a directory;
 `lstat("/link/")` therefore follows that link for directory traversal. The
 `mkdir` command accepts trailing slashes after raw path and component limits are checked;
-create, remove, rename, link destination paths, and revision diff cursors continue
-to reject them. See [mkdir trailing slash validation](evidence/2026-11-15-mkdir-trailing-slashes.json).
+create and link destination paths plus revision diff cursors continue to reject
+them. `rmdir`, `rename`, and `rename_exclusive` now use the physically resolved
+directory entry for slash operands, including through a dangling destination
+symlink when a directory source is moved. See the daemon README regression scope.
+See [mkdir trailing slash validation](evidence/2026-11-15-mkdir-trailing-slashes.json)
+for the earlier mkdir-only evidence.
 The earlier [trailing directory path regression](evidence/2026-11-15-trailing-directory-paths.json)
-documents existing-object resolution only, not mkdir support. Namespace behavior
-does not establish native mount semantics or new typed errno mappings.
+documents existing-object resolution only, not mutation behavior. Namespace behavior
+does not establish native mount semantics; error conventions are specific to the
+APFS/Darwin observed contract and host-compiled daemon behavior.
 
 ### Seek error codes
 

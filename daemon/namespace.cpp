@@ -238,40 +238,75 @@ std::vector<std::string> target_components(const std::string& target) {
 struct Parent {std::string id,name,key;};
 std::string walk(const NamespaceView& journal,const std::vector<std::string>& names,size_t count,
                  std::vector<std::string>* ancestry=nullptr,bool follow_final=true,Parent* missing=nullptr,
-                 bool* followed_symlink=nullptr) {
-    std::vector<std::string> stack{root(journal)};std::deque<std::string> pending(names.begin(),names.begin()+count);
+                 bool* followed_symlink=nullptr,Parent* physical_parent=nullptr,bool posix_errors=false,
+                 bool allow_missing_target_slash=false) {
+    const bool track_physical=physical_parent!=nullptr;
+    std::vector<std::string> stack{root(journal)};std::vector<Parent> incoming;if(track_physical)incoming.emplace_back();
+    std::deque<std::string> pending(names.begin(),names.begin()+count);
     if(followed_symlink)*followed_symlink=false;
     unsigned follows=0;size_t expanded=0;std::string id=stack.back();
     while(!pending.empty()) {
-        auto name=pending.front();pending.pop_front();id=stack.back();need(inode(journal,id).directory,"path component is not a directory");
+        auto name=pending.front();pending.pop_front();id=stack.back();
+        if(!inode(journal,id).directory) {
+            if(posix_errors)throw std::system_error(ENOTDIR,std::generic_category(),"path component is not a directory");
+            need(false,"path component is not a directory");
+        }
         if(name==".")continue;
-        if(name==".."){if(stack.size()>1)stack.pop_back();id=stack.back();continue;}
+        if(name==".."){if(stack.size()>1){stack.pop_back();if(track_physical)incoming.pop_back();}id=stack.back();continue;}
         auto key=entry_key(id,name);
         if(!journal.contains(key)) {
-            need(missing && pending.empty(),"path not found");*missing={id,name,key};return {};
+            if(missing && pending.empty()) {
+                *missing={id,name,key};if(physical_parent)*physical_parent=*missing;if(ancestry)*ancestry=stack;return {};
+            }
+            if(posix_errors)throw std::system_error(ENOENT,std::generic_category(),"path not found");
+            need(false,"path not found");
         }
         auto child=decode_id(journal.get(key));auto n=inode(journal,child);
         if(n.symlink && (follow_final || !pending.empty())) {
             if(followed_symlink)*followed_symlink=true;
             need(++follows<=40,"too many symbolic links");auto b=journal.get(content_key(child));need(b.size()==n.size,"symlink size mismatch");
             std::string target(b.begin(),b.end());auto parts=target_components(target);expanded+=target.size();need(expanded<=65536,"symlink expansion limit");
-            if(target[0]=='/')stack.resize(1);
+            if(allow_missing_target_slash && pending.empty() && target.back()=='/' && !parts.empty() && parts.back()==".")parts.pop_back();
+            if(target[0]=='/'){stack.resize(1);if(track_physical)incoming.resize(1);}
             for(auto i=parts.rbegin();i!=parts.rend();++i)pending.push_front(*i);id=stack.back();
-        } else {id=child;stack.push_back(child);}
+        } else {if(track_physical)incoming.push_back({id,name,key});id=child;stack.push_back(child);}
     }
-    if(ancestry)*ancestry=stack;return id;
+    if(ancestry)*ancestry=stack;
+    if(track_physical && incoming.size()>1)*physical_parent=incoming.back();
+    return id;
 }
-Parent parent(const NamespaceView& journal,const std::string& path,std::vector<std::string>* ancestry=nullptr,bool allow_trailing=false) {
+Parent parent(const NamespaceView& journal,const std::string& path,std::vector<std::string>* ancestry=nullptr,bool allow_trailing=false,bool posix_errors=false) {
     auto names=components(path,allow_trailing);
     if(allow_trailing && path.back()=='/' && !names.empty())names.pop_back();
     need(!names.empty(),"cannot modify filesystem root");
     need(names.back()!="." && names.back()!="..","invalid terminal path component");
-    auto id=walk(journal,names,names.size()-1,ancestry);need(inode(journal,id).directory,"parent is not a directory");
+    auto id=walk(journal,names,names.size()-1,ancestry,true,nullptr,nullptr,nullptr,posix_errors);
+    if(!inode(journal,id).directory) {
+        if(posix_errors)throw std::system_error(ENOTDIR,std::generic_category(),"parent is not a directory");
+        need(false,"parent is not a directory");
+    }
     return {id,names.back(),entry_key(id,names.back())};
 }
 std::string resolve(const NamespaceView& journal,const std::string& path,bool follow=true,Parent* missing=nullptr,
                     bool* followed_symlink=nullptr) {
     auto names=components(path,true);return walk(journal,names,names.size(),nullptr,follow,missing,followed_symlink);
+}
+struct PhysicalPath { Parent parent;std::string id;std::vector<std::string> ancestry;bool exists=true; };
+PhysicalPath physical_path(const NamespaceView& journal,const std::string& path,bool allow_missing=false) {
+    auto names=components(path,true);
+    if(path.back()=='/' && !names.empty())names.pop_back(); // discard only components()' synthetic dot
+    need(!names.empty() && names.back()!="." && names.back()!="..","cannot modify filesystem root or dot entries");
+    PhysicalPath result;
+    Parent missing;
+    auto id=walk(journal,names,names.size(),&result.ancestry,true,allow_missing?&missing:nullptr,
+                 nullptr,&result.parent,true,allow_missing);
+    if(id.empty()) {result.exists=false;result.parent=std::move(missing);return result;}
+    result.id=std::move(id);
+    if(result.ancestry.size()>1)result.ancestry.pop_back();
+    else result.parent={};
+    need(!result.parent.id.empty(),"cannot modify filesystem root");
+    if(!inode(journal,result.id).directory)throw std::system_error(ENOTDIR,std::generic_category(),"trailing slash requires a directory");
+    return result;
 }
 InodeInfo created(InodeInfo n){n.accessed_ns=n.modified_ns;n.birth_ns=n.changed_ns;return n;}
 void touch(InodeInfo& n) {n.modified_ns=n.changed_ns=now();}
@@ -1192,8 +1227,17 @@ void Namespace::retire(const NamespaceView& j,Changes& c,const InodeInfo& n) {
 }
 void Namespace::remove(const std::string& path,bool directory) {
     update([&](const NamespaceView& j,Changes& c) {
-        auto p=parent(j,path);need(j.contains(p.key),"path not found");auto id=decode_id(j.get(p.key));auto n=inode(j,id),pn=inode(j,p.id);mutable_metadata(n);mutable_metadata(pn);
+        const bool trailing=!path.empty() && path.back()=='/';
+        Parent p;std::string id;
+        if(trailing) {auto resolved=physical_path(j,path);p=std::move(resolved.parent);id=std::move(resolved.id);}
+        else {p=parent(j,path);need(j.contains(p.key),"path not found");id=decode_id(j.get(p.key));}
+        auto n=inode(j,id),pn=inode(j,p.id);mutable_metadata(n);mutable_metadata(pn);
         need(!directory || n.directory,"path is not a directory");
+#ifdef __APPLE__
+        if(trailing && !directory && n.directory)throw std::system_error(EPERM,std::generic_category(),"cannot unlink a directory");
+#else
+        if(trailing && !directory && n.directory)throw std::system_error(EISDIR,std::generic_category(),"cannot unlink a directory");
+#endif
         need(directory || !n.directory,"cannot unlink a directory");
         if(directory){need(j.keys(directory_prefix(id)).empty(),"directory is not empty");--pn.links;}
         c[p.key]=std::nullopt;
@@ -1210,16 +1254,31 @@ void Namespace::rename_exclusive(const std::string& source,const std::string& ta
 }
 void Namespace::rename_impl(const std::string& source,const std::string& target,bool exclusive) {
     update([&](const NamespaceView& j,Changes& c) {
-        auto src=parent(j,source);need(j.contains(src.key),"source not found");auto id=decode_id(j.get(src.key));auto n=inode(j,id);
-        std::vector<std::string> ancestry;auto dst=parent(j,target,&ancestry);
+        const bool source_trailing=!source.empty() && source.back()=='/';
+        const bool target_trailing=!target.empty() && target.back()=='/';
+        Parent src;std::string id;
+        if(source_trailing) {auto resolved=physical_path(j,source);src=std::move(resolved.parent);id=std::move(resolved.id);}
+        else {src=parent(j,source,nullptr,false,source_trailing||target_trailing);if(!j.contains(src.key)) {
+                if(source_trailing||target_trailing)throw std::system_error(ENOENT,std::generic_category(),"source not found");
+                need(false,"source not found");
+            }id=decode_id(j.get(src.key));}
+        auto n=inode(j,id);
+        Parent dst;std::vector<std::string> ancestry;std::string target_id;bool target_exists;
+        if(target_trailing) {
+            auto resolved=physical_path(j,target,true);dst=std::move(resolved.parent);ancestry=std::move(resolved.ancestry);
+            target_exists=resolved.exists;target_id=std::move(resolved.id);
+        } else {dst=parent(j,target,&ancestry,false,source_trailing||target_trailing);target_exists=j.contains(dst.key);if(target_exists)target_id=decode_id(j.get(dst.key));}
         mutable_metadata(n);mutable_metadata(inode(j,src.id));mutable_inode(inode(j,dst.id));
-        if(exclusive && j.contains(dst.key))throw std::system_error(EEXIST,std::generic_category(),"rename target already exists");
+        if(exclusive && target_exists)throw std::system_error(EEXIST,std::generic_category(),"rename target already exists");
+        if(target_trailing && !target_exists && !n.directory)throw std::system_error(ENOENT,std::generic_category(),"directory target does not exist");
         if(src.key==dst.key)return;
         if(n.directory)need(std::find(ancestry.begin(),ancestry.end(),id)==ancestry.end(),"cannot move directory into itself");
         std::map<std::string,InodeInfo> parents;parents.emplace(src.id,inode(j,src.id));parents.emplace(dst.id,inode(j,dst.id));
-        if(j.contains(dst.key)) {
-            auto replaced=decode_id(j.get(dst.key));if(replaced==id)return;
-            non_append_inode(inode(j,dst.id));auto other=inode(j,replaced);mutable_metadata(other);need(!other.directory || n.directory,"rename target is a directory");
+        if(target_exists) {
+            auto replaced=target_id;if(replaced==id)return;
+            non_append_inode(inode(j,dst.id));auto other=inode(j,replaced);mutable_metadata(other);
+            if(target_trailing && other.directory && !n.directory)throw std::system_error(EISDIR,std::generic_category(),"rename target is a directory");
+            need(!other.directory || n.directory,"rename target is a directory");
             need(other.directory || !n.directory,"rename target is not a directory");
             if(other.directory){need(j.keys(directory_prefix(replaced)).empty(),"target directory is not empty");--parents.at(dst.id).links;}
             if(other.directory || other.links==1)retire(j,c,other);

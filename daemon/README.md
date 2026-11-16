@@ -556,12 +556,24 @@ and dot components are supported inside targets. A target's trailing slash requi
 a directory. Existing-object Namespace paths may end in `/` for queries and
 path metadata/content operations, requiring the final result to be a directory.
 `mkdir` also accepts one or more trailing slashes after validating the original
-path length and components. Other parent-based mutations and creation paths
+path length and components. Namespace `rmdir`, `rename`, and shared-parser
+`rename_exclusive` resolve trailing-slash operands through their physical directory target. A final
+symlink remains in place when its target directory is removed or moved, and a
+destination slash may create a missing target through a dangling symlink when
+the source is a directory. `unlink` with a slash follows the target and returns
+the observed Darwin `EPERM` directory-unlink error (Linux uses `EISDIR`). Raw path and component
+limits are checked before traversal. These semantics are covered at the
+Namespace, RPC, and offline CLI layers only; they do not establish native
+FSKit/mount behavior or general POSIX compatibility. `link` and creation paths
 continue to reject trailing slashes. The focused regressions are
-`forkfsd_trailing_paths_test` and `forkfsd_mkdir_trailing_test`; the
+`forkfsd_trailing_paths_test`, `forkfsd_trailing_mutations_rpc` and
+`forkfsd_mkdir_trailing_test`; the
 [mkdir trailing slash validation](../docs/evidence/2026-11-15-mkdir-trailing-slashes.json)
-records the exact scope. These Namespace tests do not establish native mount behavior
-or new typed errno mappings.
+records the earlier mkdir-only scope. Mutation errno cases follow APFS/Darwin
+observations for this change; they do not promise identical host syscall results
+or establish native mount error mapping. See the
+[trailing mutation validation](../docs/evidence/2026-11-16-trailing-mutations.json)
+for the tested tree, APFS observations, and coverage boundaries.
 
 The original inode schema FFINOD01 added type=3 in its 48-byte record; its
 content object contains target bytes and size is target byte length. New lstat/stat
@@ -1092,7 +1104,9 @@ mtime/ctime, and absolute paths with valid UTF-8 components up to 255 bytes
 (raw path up to 4096 bytes, including dots and repeated separators). Existing-object
 queries and path metadata/content operations accept a trailing slash and require
 a directory result. `mkdir` accepts trailing slashes after validating the original
-path bytes; other parent-based mutations and creation paths continue to reject them.
+path bytes. `rmdir`, `rename`, and `rename_exclusive` also accept trailing slash
+operands and act on the resolved physical directory entry; `link` and creation
+paths continue to reject them.
 Lookup may end in `.` or `..`, but mutations reject those terminal components so
 they cannot become directory-entry keys. Names and
 symlink targets preserve their original UTF-8 bytes: case and canonically
