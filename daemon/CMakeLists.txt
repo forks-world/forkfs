@@ -227,9 +227,13 @@ target_include_directories(forkfsd_symlink_handles_test PRIVATE ${CMAKE_CURRENT_
 add_test(NAME forkfsd_symlink_handles_core COMMAND forkfsd_symlink_handles_test)
 set_tests_properties(forkfsd_symlink_handles_core PROPERTIES TIMEOUT 120)
 add_executable(forkfsd_fifo_test tests/fifo.cpp $<TARGET_OBJECTS:forkfs_common> $<TARGET_OBJECTS:forkfs_container_obj> $<TARGET_OBJECTS:forkfs_journal_obj> $<TARGET_OBJECTS:forkfs_level_obj> $<TARGET_OBJECTS:forkfs_compaction_obj> $<TARGET_OBJECTS:forkfs_metadata_tree_obj>)
+add_executable(forkfsd_socket_test tests/socket.cpp $<TARGET_OBJECTS:forkfs_common> $<TARGET_OBJECTS:forkfs_container_obj> $<TARGET_OBJECTS:forkfs_journal_obj> $<TARGET_OBJECTS:forkfs_level_obj> $<TARGET_OBJECTS:forkfs_compaction_obj> $<TARGET_OBJECTS:forkfs_metadata_tree_obj>)
 target_include_directories(forkfsd_fifo_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(forkfsd_socket_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME forkfsd_fifo_core COMMAND forkfsd_fifo_test)
 set_tests_properties(forkfsd_fifo_core PROPERTIES TIMEOUT 120)
+add_test(NAME forkfsd_socket_core COMMAND forkfsd_socket_test)
+set_tests_properties(forkfsd_socket_core PROPERTIES TIMEOUT 120)
 add_executable(forkfsd_times_test tests/times.cpp $<TARGET_OBJECTS:forkfs_common> $<TARGET_OBJECTS:forkfs_container_obj> $<TARGET_OBJECTS:forkfs_journal_obj> $<TARGET_OBJECTS:forkfs_level_obj> $<TARGET_OBJECTS:forkfs_compaction_obj> $<TARGET_OBJECTS:forkfs_metadata_tree_obj>)
 target_include_directories(forkfsd_times_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME forkfsd_times_core COMMAND forkfsd_times_test)
@@ -253,7 +257,7 @@ target_compile_definitions(forkfsd_leveldb_fault_test PRIVATE FORKFS_TEST_FAULTS
 add_test(NAME forkfsd_leveldb COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/leveldb.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
 set_tests_properties(forkfsd_leveldb PROPERTIES TIMEOUT 180)
-foreach(target forkfsd_directory_fixture forkfsd_seek_regions_test forkfsd forkfsd_legacy_test forkfsd_fault_test forkfsd_transaction_test forkfsd_lsm_test forkfsd_maintenance_test forkfsd_staged_compaction_test forkfsd_leveldb_fault_test forkfsd_leveldb_transaction_test forkfsd_object_cache_test forkfsd_file_io_test forkfsd_chunked_test forkfsd_large_files_test forkfsd_allocation_test forkfsd_file_flags_test forkfsd_chunk_retirement_test forkfsd_chunk_retirement_fault_test forkfsd_symlink_handles_test forkfsd_fifo_test forkfsd_times_test forkfsd_xattrs_test forkfsd_restore_test forkfsd_retention_test forkfsd_handles_test)
+foreach(target forkfsd_directory_fixture forkfsd_seek_regions_test forkfsd forkfsd_legacy_test forkfsd_fault_test forkfsd_transaction_test forkfsd_lsm_test forkfsd_maintenance_test forkfsd_staged_compaction_test forkfsd_leveldb_fault_test forkfsd_leveldb_transaction_test forkfsd_object_cache_test forkfsd_file_io_test forkfsd_chunked_test forkfsd_large_files_test forkfsd_allocation_test forkfsd_file_flags_test forkfsd_chunk_retirement_test forkfsd_chunk_retirement_fault_test forkfsd_symlink_handles_test forkfsd_fifo_test forkfsd_socket_test forkfsd_times_test forkfsd_xattrs_test forkfsd_restore_test forkfsd_retention_test forkfsd_handles_test)
     target_link_libraries(${target} PRIVATE leveldb Threads::Threads)
     if(NOT APPLE)
         target_link_libraries(${target} PRIVATE OpenSSL::Crypto)
@@ -346,6 +350,9 @@ set_tests_properties(forkfsd_inode_rpc PROPERTIES TIMEOUT 120)
 add_test(NAME forkfsd_fifo_rpc COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/fifo_rpc.py $<TARGET_FILE:forkfsd>)
 set_tests_properties(forkfsd_fifo_rpc PROPERTIES TIMEOUT 60)
+add_test(NAME forkfsd_socket_rpc COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/socket_rpc.py $<TARGET_FILE:forkfsd>)
+set_tests_properties(forkfsd_socket_rpc PROPERTIES TIMEOUT 60)
 
 # Opt-in manual Namespace API creation probe; not part of default builds/CTest.
 add_executable(forkfsd_create_probe EXCLUDE_FROM_ALL tests/create_probe.cpp

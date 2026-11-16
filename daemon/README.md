@@ -87,7 +87,7 @@ magic `FFRSP001` are followed by payload length u32 LE. Request payload is field
 count u32 LE (1..16), then length u32 LE + bytes for each field. First field is the
 command; write payload is binary. Reply payload starts with result code u32 LE
 (0 success, 1 generic error, or POSIX errno + 1 for typed errors) followed by raw result/error bytes. The format is experimental.
-Supported commands are `status`, `fs-init`, `fs-mkdir`, `fs-write`, `fs-cat`,
+Supported commands are `status`, `fs-init`, `fs-mkdir`, `fs-mksocket`, `fs-write`, `fs-cat`,
 `fs-xattr-list`, `fs-xattr-get`, `fs-xattr-set`, `fs-xattr-remove`,
 `fs-settimes`, `fs-lsettimes`, `fs-lchmod`, `fs-history`, `fs-diff`, `fs-ls`, `fs-stat`, `fs-read-at`, `fs-write-at`, `fs-append`, `fs-truncate`, `fs-link`, `fs-rename`, `fs-unlink`, `fs-rmdir`, `fs-check`,
 `fs-compact`, `fs-snapshot`, `fs-fork`, `fs-restore`, `fs-worlds` and `fs-revisions`, with the
@@ -454,6 +454,29 @@ updates fail with EINVAL even when the handle is read-only; revision and other
 view/protection checks retain their existing precedence. Native FIFO open
 descriptions retain the metadata pin in the existing reader/writer lifecycle
 slots as needed; the kernel owns stream I/O.
+
+Unix-domain socket pathname nodes use `fs-mksocket PATH [OCTAL_MODE]` or the
+session-scoped `inode-mksocket PARENT NAME DECIMAL_MODE` operation. The default
+mode is `0777`. They have inode type tag 6 and are serialized with the
+`FFINOD05` envelope, so older readers fail closed. Socket nodes have size zero,
+zero allocated data, and an empty inline content marker. Metadata operations,
+xattrs, links, rename, snapshots, verification, and garbage collection treat
+them as ordinary namespace inodes of a distinct type. Snapshots/reopen preserve
+pathname metadata only; no live endpoint, listener, or stream is persisted or
+restored.
+
+Normal daemon opens reject socket pathnames with `ENOTSUP`. Read/write/clone
+operations reject with `ENOTSUP`, size setattr including zero rejects with
+`EINVAL`, and seek-region rejects with `ESPIPE`. The FSKit open callback returns
+Darwin's APFS-observed `EOPNOTSUPP` for pathname opens. Socket nodes acquire no
+daemon handle or metadata pin; the kernel owns descriptors and connection
+streams. Core, RPC, and direct/loopback callback validation passed. APFS
+reference bind/listen/connect/accept behavior passed, but mounted ForkFS
+pathname behavior remains unverified. No signing, installation, or candidate
+mount was attempted in this task; a prior signing attempt failed with
+`errSecInternalComponent` while keychain interaction was unavailable. The
+FSKit SDK's create-item contract also does not prove that kernel `bind` reaches
+the socket create callback. See [socket validation evidence](../docs/evidence/2026-11-16-unix-socket.json).
 
 Atomic open options are available through `Namespace::OpenOptions` and RPC:
 
@@ -1450,6 +1473,7 @@ the daemon's committed root, not unsent kernel writeback.
 Commands use inode identities, never host World paths: `inode-lookup PARENT NAME`,
 `inode-stat INODE`, `inode-dir-open INODE`, `inode-open INODE r|w|rw`,
 `inode-create PARENT NAME MODE`, `inode-mkdir PARENT NAME MODE`,
+`inode-mksocket PARENT NAME MODE`,
 `inode-symlink PARENT NAME TARGET`, `inode-readlink INODE`,
 `inode-link INODE PARENT NAME`, `inode-remove PARENT NAME EXPECTED_INODE file|directory`,
 `inode-rename SOURCE_PARENT SOURCE_NAME DEST_PARENT DEST_NAME EXPECTED_INODE EXPECTED_DEST_OR_DASH`,

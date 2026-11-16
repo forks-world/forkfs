@@ -159,6 +159,7 @@ int main(int argc, char** argv) {
                          "forkfsd fs-set-volume-name CONTAINER NAME [--world WORLD]\n"
                          "forkfsd fs-mkdir CONTAINER PATH\n"
                          "forkfsd fs-mkfifo CONTAINER PATH [MODE]\n"
+                         "forkfsd fs-mksocket CONTAINER PATH [MODE]\n"
                          "forkfsd fs-write CONTAINER PATH INPUT_FILE\n"
                          "forkfsd fs-clone-file CONTAINER SOURCE TARGET\n"
                          "forkfsd fs-save CONTAINER PATH INPUT_FILE\n"
@@ -226,7 +227,7 @@ int main(int argc, char** argv) {
         }
         std::string view="main";bool revision_view=false;
         int base_argc=4;
-        if(command=="fs-mkfifo" && argc>=5 && std::string(argv[4])!="--world" && std::string(argv[4])!="--revision")base_argc=5;
+        if((command=="fs-mkfifo" || command=="fs-mksocket") && argc>=5 && std::string(argv[4])!="--world" && std::string(argv[4])!="--revision")base_argc=5;
         if(command=="fs-init" || command=="fs-check" || command=="fs-worlds" || command=="fs-revisions" || command=="fs-compact" || command=="fs-layout" || command=="fs-volume-name")base_argc=3;
         if(command=="fs-write" || command=="fs-save" || command=="fs-clone-file" || command=="fs-link" || command=="fs-rename" || command=="fs-rename-excl" || command=="fs-exchange" || command=="fs-fork" || command=="fs-restore" || command=="fs-append" || command=="fs-truncate" || command=="fs-symlink" || command=="fs-lchmod" || command=="fs-chmod" || command=="fs-setmtime")base_argc=5;
         if(command=="fs-setflags" || command=="fs-lsetflags")base_argc=5;
@@ -331,6 +332,7 @@ int main(int argc, char** argv) {
             else if(command=="fs-readlink" && argc==4){std::cout<<fs.readlink(argv[3]);return 0;}
             else if(command=="fs-mkdir" && argc==4) fs.mkdir(argv[3]);
             else if(command=="fs-mkfifo" && (argc==4 || argc==5)) {auto mode=argc==5?file_number(argv[4],8):0644; if(mode>0777)throw std::runtime_error("unsupported mode bits");fs.mkfifo(argv[3],static_cast<uint32_t>(mode));}
+            else if(command=="fs-mksocket" && (argc==4 || argc==5)) {auto mode=argc==5?file_number(argv[4],8):0777; if(mode>0777)throw std::runtime_error("unsupported mode bits");fs.mksocket(argv[3],static_cast<uint32_t>(mode));}
             else if(command=="fs-unlink" && argc==4) fs.remove(argv[3],false);
             else if(command=="fs-rmdir" && argc==4) fs.remove(argv[3],true);
             else if(command=="fs-rename" && argc==5) fs.rename(argv[3],argv[4]);
@@ -365,7 +367,7 @@ int main(int argc, char** argv) {
             } else if((command=="fs-stat" || command=="fs-lstat") && argc==4) {
                 auto n=command=="fs-lstat"?fs.lstat(argv[3]):fs.stat(argv[3]);
                 std::cout<<"{\"inode_id\":\""<<n.id<<"\",\"directory\":"<<(n.directory?"true":"false")
-                         <<",\"symlink\":"<<(n.symlink?"true":"false")<<",\"fifo\":"<<(n.fifo?"true":"false")<<",\"mode\":"<<n.mode<<",\"links\":"<<n.links<<",\"size\":"<<n.size
+                         <<",\"symlink\":"<<(n.symlink?"true":"false")<<",\"fifo\":"<<(n.fifo?"true":"false")<<",\"socket\":"<<(n.socket?"true":"false")<<",\"mode\":"<<n.mode<<",\"links\":"<<n.links<<",\"size\":"<<n.size
                          <<",\"allocated_size\":"<<n.allocated_size<<",\"flags\":"<<n.flags<<",\"modified_ns\":"<<n.modified_ns<<",\"changed_ns\":"<<n.changed_ns
                          <<",\"accessed_ns\":"<<n.accessed_ns<<",\"birth_ns\":"<<n.birth_ns<<"}\n";
                 return 0;
