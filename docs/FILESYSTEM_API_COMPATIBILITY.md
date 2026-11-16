@@ -51,7 +51,8 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 | 原生 `F_PUNCHHOLE`、`F_PREALLOCATE`、`posix_fallocate` | 原生 syscall/可选 Preallocate 协议 | 未实现或未验收；不声称原生洞区间修改、物理 extent 查询或空间预留 |
 | `statfs/statvfs/pathconf` | volumeStatistics、PathConfOperations | 挂载已测容量/单位/标志、路径与 fd 查询、rename/unlink/路径重用和 GC 后只读 revision；子目录/文件 fd 的 `PC_PATH_MAX` 返回 EINVAL，不能宣称完整 pathconf。空间来自宿主卷，不是 forkfs 配额或预留 |
 | `chflags/fchflags/lchflags`、BSD flags | get/setAttributes → revision inode | 挂载已测 hidden/nodump 的路径/fd/nofollow、硬链接、cp -p、孤儿 fd 和历史隔离；user immutable 及 user append-only 的数据/元数据/目录约束已接入；nounlink/系统保护标记仍拒绝 |
-| `mkfifo(3)`、FIFO `stat/open/read/write` | `FSItemTypeFIFO` + inode tag 5; 预期由内核管理stream | FIFO创建、类型/模式/大小、普通文件打开拒绝、metadata-only inode pin、unlink/rename replacement 后的 xattr/属性保留、重复句柄与末次关闭回收已通过 core/RPC/callback 验证。ForkFS真实挂载的 FIFO IPC 仍待签名安装后验收；候选扩展未签名、未安装、未挂载。`mknod` 和 Unix socket 路径仍缺失。见 [FIFO metadata pin evidence](evidence/2026-11-16-fifo-metadata-pins.json) |
+| `mkfifo(3)`、FIFO `stat/open/read/write` | `FSItemTypeFIFO` + inode tag 5; 预期由内核管理stream | FIFO创建、类型/模式/大小、普通文件打开拒绝、metadata-only inode pin、unlink/rename replacement 后的 xattr/属性保留、重复句柄与末次关闭回收已通过 core/RPC/callback 验证。ForkFS真实挂载的 FIFO IPC 仍待签名安装后验收；候选扩展未签名、未安装、未挂载。`mknod` 和设备节点仍未提供。见 [FIFO metadata pin evidence](evidence/2026-11-16-fifo-metadata-pins.json) |
+| Unix-domain socket pathname `stat/open/bind/listen/connect/accept` | daemon inode tag 6 + `FSItemTypeSocket`; endpoint/I/O由内核管理 | Durable socket pathname metadata create/stat/readdir, zero-size/allocation invariants, links/rename/xattrs/snapshots, byte-operation rejection, and direct/loopback FSKit callback behavior pass core/RPC/BridgeTest. APFS reference bind/listen/connect/accept, collision, unlink-connected-transfer/rebind, and `open` errno pass. **ForkFS mounted pathname creation/bind routing is unverified**: FSKit SDK documents create-item for file/directory. No signing/install/mount was attempted in this task; a prior signing attempt failed with `errSecInternalComponent` while keychain interaction was unavailable. Snapshots/reopen preserve pathname metadata only; no live endpoint, listener, or stream is persisted or restored. See [Unix socket evidence](evidence/2026-11-16-unix-socket.json) |
 | `copyfile/clonefile/fcopyfile/sendfile` | 内核 fallback 或可选复制能力 | 新增原生验收 `copyfile(DATA|STAT|XATTR)`、`fcopyfile(DATA)` 和 sendfile 区间/EOF/unlink fd；clone 请求可回退，强制 clone 返回 ENOTSUP；ResourceFork、ACL、递归/完整 flags 仍未补齐 |
 | `kqueue` vnode 通知、文件监控、FSEvents | 内核 vnode 事件 | macOS 27.2 小仓库已测 WRITE/EXTEND/ATTRIB/LINK/RENAME/DELETE、父目录事件、跨进程写及路径重用隔离；FSEvents、递归监控、revoke 未验收 |
 | 持久 file ID、file handles、卷改名、大小写折叠 | 可选卷能力/身份协议 | persistent IDs 未提供（不宣告）；ID 只在当前 mount 稳定；卷名支持 revision 元数据和原生改名，大小写折叠未提供/未验收 |
@@ -91,6 +92,38 @@ candidate extension has not been signed, installed, or mounted because local
 keychain interaction is unavailable. Therefore kernel-managed FIFO IPC on a
 ForkFS mount remains unverified and is not claimed here. See the [FIFO metadata
 pin evidence record](evidence/2026-11-16-fifo-metadata-pins.json).
+
+### Unix-domain socket pathname metadata
+
+The daemon stores socket pathnames as inode type tag 6 in the `FFINOD05`
+record envelope. Readers that do not recognize that envelope fail closed with
+an invalid-inode-record error rather than reading the node as a regular file.
+Socket nodes require an empty, nonchunked content marker, size zero, and zero
+allocated data. They retain ordinary inode metadata such as mode, xattrs,
+hardlinks, rename identity, snapshots, and verification state. Snapshots/reopen
+preserve pathname metadata only; no live endpoint, listener, or stream is
+persisted or restored.
+
+Normal daemon path opens reject socket pathnames with `ENOTSUP`. The FSKit open
+callback reports Darwin's observed APFS errno `EOPNOTSUPP` (102). Byte I/O and
+clone reject with `ENOTSUP`, size setattr including zero rejects with `EINVAL`,
+and seek-region rejects with `ESPIPE`. Socket pathnames do not create daemon
+handles or metadata pins. The kernel owns socket descriptors and any live
+connection; there is no daemon stream buffer or socket IPC implementation.
+
+The Release `WFS_FSKIT=ON` clean-first validation passed 81/81 CTest cases,
+including modern and legacy core tests, RPC, and direct plus loopback bridge
+callbacks. The old runtime failed the fresh socket-create bridge probe; the
+new runtime passed. APFS reference checks passed with bind collision
+`EADDRINUSE` (48), distinct inode after unlink/rebind, connected transfer after
+unlink, and `EOPNOTSUPP` (102) for both nonblocking read-only and write-only
+pathname opens. These are reference and direct-callback results only. The
+no signing, installation, or candidate mount was attempted in this task. A
+prior signing attempt failed with `errSecInternalComponent` while keychain
+interaction was unavailable. The SDK create-item contract also does not
+establish that kernel `bind` routes through this callback. Native mounted
+socket pathname behavior remains unverified; no such claim is made. See the
+[socket evidence record](evidence/2026-11-16-unix-socket.json).
 
 Namespace object resolution accepts a trailing slash for existing-object queries
 and metadata/content operations. The slash requires the resolved object to be a

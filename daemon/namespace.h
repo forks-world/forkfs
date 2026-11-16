@@ -19,6 +19,7 @@ struct InodeInfo {
     uint64_t allocated_size=0;
     uint32_t flags=0;
     bool fifo=false;
+    bool socket=false;
 };
 class NamespaceView;
 class FileContent;
@@ -66,6 +67,7 @@ public:
     size_t run_count() const;
     void mkdir(const std::string& path,uint32_t mode=0755);
     void mkfifo(const std::string& path,uint32_t mode=0644);
+    void mksocket(const std::string& path,uint32_t mode=0777);
     std::string path_for_inode(const std::string& id) const;
     void write(const std::string& path,const std::vector<unsigned char>& value);
     void clone_file(const std::string& source,const std::string& target);

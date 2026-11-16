@@ -89,6 +89,41 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume createItemNamed:[FSFileName nameWithString:@"文件📄"] type:FSItemTypeFile inDirectory:root attributes:create replyHandler:^(FSItem* item,FSFileName* n,NSError* e){file=item;result=e;}];check(file && !result,"create callback failed");
         __block FSItem* fifo=nil;
         [volume createItemNamed:[FSFileName nameWithString:@"pipe"] type:FSItemTypeFIFO inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){fifo=item;result=e;}];check(fifo && !result,"FIFO create callback failed");
+        __block FSItem* socketDirectory=nil;
+        [volume createItemNamed:[FSFileName nameWithString:@"socket-test-dir"] type:FSItemTypeDirectory inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){socketDirectory=item;result=e;}];check(socketDirectory && !result,"socket test directory create failed");
+        __block FSItem* socketItem=nil;
+        [volume createItemNamed:[FSFileName nameWithString:@"sock"] type:FSItemTypeSocket inDirectory:socketDirectory attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){socketItem=item;result=e;}];check(socketItem && !result,"socket metadata create callback failed");
+        __block FSItem* socket0600=nil;FSItemSetAttributesRequest* socketCreateMode=[FSItemSetAttributesRequest new];socketCreateMode.mode=0600;
+        [volume createItemNamed:[FSFileName nameWithString:@"sock0600"] type:FSItemTypeSocket inDirectory:socketDirectory attributes:socketCreateMode replyHandler:^(FSItem* item,FSFileName* n,NSError* e){socket0600=item;result=e;}];check(socket0600 && !result,"socket explicit-mode create callback failed");
+        __block FSItemAttributes* socket0600Attrs=nil;
+        [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:socket0600 replyHandler:^(FSItemAttributes* a,NSError* e){socket0600Attrs=a;result=e;}];check(!result && socket0600Attrs.type==FSItemTypeSocket && socket0600Attrs.mode==0600,"socket create mode was not preserved");
+        FSFileName* socketXattr=[FSFileName nameWithString:@"user.socket"];NSData* socketXattrValue=[NSData dataWithBytes:"s" length:1];__block NSData* socketXattrRead=nil;
+        [volume setXattrNamed:socketXattr toData:socketXattrValue onItem:socket0600 policy:FSSetXattrPolicyMustCreate replyHandler:^(NSError* e){result=e;}];check(!result,"socket xattr set failed");
+        [volume getXattrNamed:socketXattr ofItem:socket0600 replyHandler:^(NSData* value,NSError* e){socketXattrRead=value;result=e;}];check(!result && [socketXattrRead isEqualToData:socketXattrValue],"socket xattr roundtrip failed");
+        [volume createItemNamed:[FSFileName nameWithString:@"device"] type:FSItemTypeCharDevice inDirectory:socketDirectory attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){result=e;}];check(result.code==ENOTSUP,"unsupported device create type was accepted");
+        __block FSItemAttributes* socketAttrs=nil;
+        [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:socketItem replyHandler:^(FSItemAttributes* a,NSError* e){socketAttrs=a;result=e;}];check(!result && socketAttrs.type==FSItemTypeSocket && socketAttrs.size==0 && socketAttrs.allocSize==0 && socketAttrs.mode==0777,"socket attributes did not preserve socket type and zero allocation");
+        [volume openItem:socketItem withModes:FSVolumeOpenModesRead replyHandler:^(NSError* e){result=e;}];check(result.code==EOPNOTSUPP,"socket pathname open did not return the APFS errno");
+        TestBuffer* socketBuffer=[TestBuffer new];socketBuffer.storage=[NSMutableData dataWithLength:8];
+        result=nil;[volume readFromFile:socketItem offset:0 length:8 intoBuffer:(FSMutableFileDataBuffer*)socketBuffer replyHandler:^(size_t n,NSError* e){result=e;}];check(result.code==ENOTSUP,"socket byte read was not rejected");
+        result=nil;[volume writeContents:[NSData dataWithBytes:"x" length:1] toFile:socketItem atOffset:0 replyHandler:^(size_t n,NSError* e){result=e;}];check(result.code==ENOTSUP,"socket byte write was not rejected");
+        FSItemSetAttributesRequest* socketSize=[FSItemSetAttributesRequest new];socketSize.size=0;socketSize.mode=0600;
+        [volume setAttributes:socketSize onItem:socketItem replyHandler:^(FSItemAttributes* a,NSError* e){result=e;}];check(result.code==EINVAL,"socket size mutation did not fail");
+        [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:socketItem replyHandler:^(FSItemAttributes* a,NSError* e){socketAttrs=a;result=e;}];check(!result && socketAttrs.mode==0777 && socketAttrs.type==FSItemTypeSocket,"failed socket size mutation changed attributes");
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 270000
+        if(@available(macOS 27.0,*)){
+            [volume seekWithinItem:socketItem fromOffset:0 region:FSSeekRegionData context:nil replyHandler:^(FSSeekRegionResult* r,NSError* e){result=e;}];check(result.code==ESPIPE,"socket seek-region did not reject the pathname");
+        }
+#endif
+        RecordingPacker* socketPacker=[RecordingPacker new];socketPacker.limit=4;
+        [volume enumerateDirectory:socketDirectory startingAtCookie:FSDirectoryCookieInitial verifier:FSDirectoryVerifierInitial providingAttributes:[FSItemGetAttributesRequest new] usingPacker:(FSDirectoryEntryPacker*)socketPacker replyHandler:^(FSDirectoryVerifier v,NSError* e){result=e;}];
+        check(!result && socketPacker.entries.count==2 && [socketPacker.entries[0][@"type"] integerValue]==FSItemTypeSocket && [socketPacker.entries[1][@"type"] integerValue]==FSItemTypeSocket && [socketPacker.entries[0][@"hasAttributes"] boolValue],"readdir did not publish the socket item type");
+        [volume removeItem:socketItem named:[FSFileName nameWithString:@"sock"] fromDirectory:socketDirectory replyHandler:^(NSError* e){result=e;}];check(!result,"socket metadata unlink failed");
+        [volume reclaimItem:socketItem replyHandler:^(NSError* e){result=e;}];check(!result,"socket item reclaim failed");
+        [volume removeItem:socket0600 named:[FSFileName nameWithString:@"sock0600"] fromDirectory:socketDirectory replyHandler:^(NSError* e){result=e;}];check(!result,"explicit-mode socket unlink failed");
+        [volume reclaimItem:socket0600 replyHandler:^(NSError* e){result=e;}];check(!result,"explicit-mode socket reclaim failed");
+        [volume removeItem:socketDirectory named:[FSFileName nameWithString:@"socket-test-dir"] fromDirectory:root replyHandler:^(NSError* e){result=e;}];check(!result,"socket test directory unlink failed");
+        [volume reclaimItem:socketDirectory replyHandler:^(NSError* e){result=e;}];check(!result,"socket directory reclaim failed");
         __block FSItemAttributes* fifoAttrs=nil;
         [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:fifo replyHandler:^(FSItemAttributes* a,NSError* e){fifoAttrs=a;result=e;}];check(!result && fifoAttrs.type==FSItemTypeFIFO && fifoAttrs.size==0 && fifoAttrs.mode==0644,"FIFO attributes did not retain the native FIFO type");
         [volume openItem:fifo withModes:(FSVolumeOpenModesRead|FSVolumeOpenModesWrite) replyHandler:^(NSError* e){result=e;}];check(!result,"FIFO open incorrectly required a daemon byte-stream handle");

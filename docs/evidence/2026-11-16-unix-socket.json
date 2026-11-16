@@ -1,0 +1,116 @@
+{
+  "date": "2026-11-16",
+  "feature": "durable Unix-domain socket pathname metadata",
+  "status": "core_rpc_and_direct_loopback_bridge_validated; apfs_reference_passed; native_forkfs_mount_unverified",
+  "scope": {
+    "pathname_metadata": true,
+    "inode_type_tag": 6,
+    "record_envelope": "FFINOD05",
+    "older_reader_behavior": "A reader that does not recognize FFINOD05 fails closed with invalid inode record; the e93c6b4e37d73c5b0b98d4615a121609983adbee reader rejected the new socket record.",
+    "invariants": [
+      "socket is mutually exclusive with directory, symlink, FIFO and regular-file types",
+      "size is zero",
+      "content is nonchunked with an empty inline marker",
+      "allocated data size is zero"
+    ],
+    "metadata_operations": [
+      "stat/lstat and readdir publish the socket type",
+      "mode, xattrs, hardlinks, rename, snapshots and verification preserve socket metadata",
+      "snapshot and reopen preserve pathname metadata only; no bound endpoint or listener is recovered"
+    ],
+    "daemon_guards": {
+      "ordinary_path_open": "ENOTSUP",
+      "byte_io_and_clone": "ENOTSUP",
+      "size_setattr_including_zero": "EINVAL, with no namespace publication",
+      "seek_region": "ESPIPE",
+      "socket_handle_or_metadata_pin": false,
+      "daemon_socket_stream_or_ipc": false
+    },
+    "fskit_callback": {
+      "item_type": "FSItemTypeSocket",
+      "create_stat_readdir": "direct and loopback bridge callbacks passed",
+      "pathname_open_errno": "EOPNOTSUPP (102), matching APFS reference",
+      "kernel_bind_createitem_routing": "unverified; SDK create-item contract lists files and directories but does not establish bind routing"
+    }
+  },
+  "validation": {
+    "configuration": "Release, WFS_FSKIT=ON",
+    "clean_first": true,
+    "ctest_passed": 81,
+    "ctest_total": 81,
+    "ctest_elapsed_seconds": 121.36,
+    "dependency_checks": {
+      "forkfsd": {"result": "passed", "system_library_count": 2},
+      "ForkFSExtension": {"result": "passed", "system_library_count": 7},
+      "ForkFSHost": {"result": "passed", "system_library_count": 4}
+    },
+    "coverage": [
+      "modern and legacy Namespace socket metadata and type guards",
+      "CLI/RPC creation modes, namespace adapter, read-only revisions, and typed errors",
+      "direct and loopback FSKit create/stat/readdir/open/size/byte-operation callbacks",
+      "socket metadata, xattrs, links, rename, snapshots, verification, reopen and GC"
+    ],
+    "binary_sha256": {
+      "daemon/forkfsd": "eec99218368551f703891b9f4faadd75ad990fb8ded083292fef24911176aef9",
+      "macos/forkfs/ForkFSExtension": "ef27008c91483411e9b27311695e4e913d08be0eaec22d096aec6b5f88097a43",
+      "macos/forkfs/ForkFSHost": "a03e1d094807f63fd7b1a2ea437fb140c0a5490ad1be500ff67058b106c0ebfc",
+      "macos/forkfs/forkfs_bridge_test": "bf1f083b53971599b83e8ad8a6b7e8f679d92057faaa446e4308738356bad1e1"
+    },
+    "validation_audit": "/private/tmp/fs132-control-mi09coh9/validation-audit.json",
+    "validation_log_sha256": "5bab1c89d704c035c7473c3535cf065c5370f0425ce283db460b88a893a370b0",
+    "ctest_log_sha256": "75cbf65164c2a878917a484d297ed40e74e1b7d4a865176e3f1cf66535d3210e",
+    "source_hashes_match_frozen_manifest": true,
+    "frozen_source_sha256": {
+      "daemon/CMakeLists.txt": "88a26119dbe92e3ad4c1fe39448c74544714c742035445ee21e930d6831c1ca5",
+      "daemon/main.cpp": "3723ed0f2bbdc086bf6e8e69221020c320a4c707c583222f5959c71dbf1636b9",
+      "daemon/namespace.cpp": "a2d08d419837d867d9197a5636ead5f54d11a6e41617ed8cfd92c88213aa0cb8",
+      "daemon/namespace.h": "64bbb118baaad34b711aa2415811c3e51f15d03e39d40c93ba85cb43afab4656",
+      "daemon/rpc.cpp": "08916befbb6ec98b1faf49f4e56c416f2d33429fcf92a19c297547546effceb2",
+      "daemon/tests/socket.cpp": "3e3b06f74a1950bf97925454922a75e6b37ad4d11aa5a62e8535d95a064739c0",
+      "daemon/tests/socket_rpc.py": "bccbb331a75aa522840965a4b6ff582e81872efa91dc0a9e9626848152c56909",
+      "macos/forkfs/RevisionVolume.mm": "36d380ecb20e3fd4fdecbdf324675e3a8e58eb2a4bde5515c9b1eaf8c4d01254",
+      "macos/forkfs/tests/BridgeTest.mm": "a96901648b97707ad71ff58fb7d9efddaeec98686719d228e8c015e147d682f1",
+      "scripts/tests/socket_mount.py": "72ca0b14a456f581bddd5b1257aa894b152fe6c09ad68f423ee93ecf2d9c9e73"
+    }
+  },
+  "baseline_regressions": {
+    "pre_feature_runtime_bridge_test": {
+      "result": "failed as expected",
+      "failure": "socket metadata create callback failed",
+      "exit_code": 1,
+      "log_sha256": "d3c3f9a86d3920a0bd9e3c8d82698949466845eca4194a1bc2e10abb697b391d"
+    },
+    "old_reader": {
+      "base_sha": "e93c6b4e37d73c5b0b98d4615a121609983adbee",
+      "result": "rejected socket record during fs-lstat",
+      "error": "invalid inode record",
+      "exit_code": 1,
+      "log_sha256": "649831d2f300cdfa75438a5de1e1eb5e7ea83cfec15f9e47c70ebaba79ed6899"
+    }
+  },
+  "apfs_reference": {
+    "result": "passed",
+    "filesystem": "apfs",
+    "checks": [
+      "bind publishes a socket pathname",
+      "second bind of occupied pathname returns EADDRINUSE (48)",
+      "connect/accept stream transfer",
+      "unlink preserves an established connection's transfer",
+      "rebind succeeds and creates a distinct pathname inode",
+      "nonblocking os.open with O_RDONLY returns EOPNOTSUPP (102)",
+      "nonblocking os.open with O_WRONLY returns EOPNOTSUPP (102)"
+    ],
+    "candidate_tested": false,
+    "bind_routing_into_fskit_createitem_callback_verified": false,
+    "reference_result_sha256": "1c97ab79ac9d024b168a294ecd02ace0ffc7f38cb61f77a5e0c8f593e465b2cf"
+  },
+  "native_forkfs_candidate": {
+    "status": "pending signing and mounted qualification",
+    "signed": false,
+    "installed": false,
+    "mounted": false,
+    "signing_attempted_in_this_task": false,
+    "known_blocker": "Earlier signing reported errSecInternalComponent because keychain user interaction was unavailable.",
+    "claim": "No mounted ForkFS pathname bind/listen/IPC behavior is claimed."
+  }
+}
