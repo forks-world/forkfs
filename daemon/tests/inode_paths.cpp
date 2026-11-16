@@ -50,6 +50,10 @@ int main(int argc,char** argv){
    bool strict=false;try{fs.set_volume_name("bad\nlabel");}catch(const std::exception&){strict=true;}check(strict && sequence(store.status())==unchanged);
    strict=false;try{fs.set_xattr("/dir/a","user.bad\tname",Bytes{'x'},Namespace::XattrPolicy::Upsert);}catch(const std::exception&){strict=true;}check(strict && sequence(store.status())==unchanged);
    Namespace controls_view(store,"controls",true);for(size_t i=0;i<control_names.size();++i)check(controls_view.read("/"+control_names[i])==Bytes{static_cast<unsigned char>(i)});controls_view.verify();
+   fs.mkdir("/sticky-dir",01777);fs.mkfifo("/sticky-fifo",01000);fs.write("/sticky-file",Bytes{'S'});
+   Namespace::Attributes sticky;sticky.mode=01777;fs.set_attributes("/sticky-file",sticky);fs.link("/sticky-file","/sticky-alias");
+   check(fs.stat("/sticky-dir").mode==01777 && fs.stat("/sticky-fifo").mode==01000 && fs.stat("/sticky-alias").mode==01777);
+   auto sticky_seq=sequence(store.status());for(uint32_t bad:{02000u,04000u,010000u,0x80000000u}){Namespace::Attributes invalid;invalid.mode=bad;invalid.size=9;bool rejected=false;try{fs.set_attributes("/sticky-file",invalid);}catch(const std::exception&){rejected=true;}check(rejected && sequence(store.status())==sticky_seq && fs.stat("/sticky-file").mode==01777 && fs.read("/sticky-file")==Bytes{'S'});}
    // A long syntactic alias must not become an inode hint used as the base
    // for RPC child paths: path_for_inode should return the compact physical path.
    std::string dotted="/";for(unsigned i=0;i<2046;++i)dotted+="./";dotted+="dir";check(dotted.size()==4096);
@@ -79,6 +83,7 @@ int main(int argc,char** argv){
   {Container store(path);Namespace fs(store),old(store,"before",true),controls(store,"controls",true);missing([&]{fs.path_for_inode(id);});check(old.path_for_inode(id)=="/dir/a");
    for(size_t i=0;i<control_names.size();++i)check(controls.read("/"+control_names[i])==Bytes{static_cast<unsigned char>(i)});
    check(controls.read("/directory\n\t/child\rfile")==Bytes{'D'} && controls.read("/follow\tlink")==Bytes{8});
+   check(fs.stat("/sticky-dir").mode==01777 && fs.stat("/sticky-fifo").mode==01000 && fs.stat("/sticky-alias").mode==01777);
    if(!legacy){check(fs.read("/moved/./a")==Bytes{'R'} && fs.stat("/moved/a").id!=id);
     check(old.path_for_inode(id)=="/dir/a" && old.read("/dir/../dir/./a")==Bytes{'A'});}
    fs.verify();old.verify();store.verify();}

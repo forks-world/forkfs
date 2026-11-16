@@ -42,9 +42,12 @@ for binary in [BIN,LEGACY]:
         assert times('/link','--world','work')!=[111,222,333]
         run('fs-lsettimes',db,'/link',0,0,0,'--world','work');assert times('/link','--world','work')==[0,0,0]
         assert times('/file','--world','work')==[1,2,3]
-        before=sequence();run('fs-lsettimes',db,'/cycle','-','-','-')
-        for command,args in [('fs-lchmod',('/link','1000')),('fs-lsettimes',('/link',1,2,9223372036854775808)),('fs-lsettimes',('/missing',1,2,3))]:
+        run('fs-lsettimes',db,'/cycle','-','-','-')
+        run('fs-lchmod',db,'/link','1000');assert attrs('/link')['mode']==0o1000 and run('fs-readlink',db,'/link')==b'/file'
+        before=sequence()
+        for command,args in [('fs-lchmod',('/link','2000')),('fs-lchmod',('/link','4000')),('fs-lsettimes',('/link',1,2,9223372036854775808)),('fs-lsettimes',('/missing',1,2,3))]:
             run(command,db,*args,ok=False)
+        assert sequence()==before and attrs('/link')['mode']==0o1000 and run('fs-readlink',db,'/link')==b'/file'
         run('fs-lchmod',db,'/link','700','--revision','base',ok=False)
         run('fs-lsettimes',db,'/link',1,2,3,'--revision','base',ok=False);assert sequence()==before
         run('fs-restore',db,'base','safety');assert attrs('/link')['mode']==0o777 and attrs('/file')==target

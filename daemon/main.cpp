@@ -325,14 +325,14 @@ int main(int argc, char** argv) {
             }
             else if((command=="fs-chmod" || command=="fs-lchmod" || command=="fs-setmtime") && argc==5) {
                 forkfs::Namespace::Attributes a;
-                if(command=="fs-chmod" || command=="fs-lchmod"){auto mode=file_number(argv[4],8);if(mode>0777)throw std::runtime_error("unsupported mode bits");a.mode=static_cast<uint32_t>(mode);}
+                if(command=="fs-chmod" || command=="fs-lchmod"){auto mode=file_number(argv[4],8);if(mode>forkfs::supported_mode_bits)throw std::runtime_error("unsupported mode bits");a.mode=static_cast<uint32_t>(mode);}
                 else a.modified_ns=file_number(argv[4]);if(command=="fs-lchmod")fs.set_link_attributes(argv[3],a);else fs.set_attributes(argv[3],a);
             }
             else if(command=="fs-symlink" && argc==5)fs.symlink(argv[3],argv[4]);
             else if(command=="fs-readlink" && argc==4){std::cout<<fs.readlink(argv[3]);return 0;}
             else if(command=="fs-mkdir" && argc==4) fs.mkdir(argv[3]);
-            else if(command=="fs-mkfifo" && (argc==4 || argc==5)) {auto mode=argc==5?file_number(argv[4],8):0644; if(mode>0777)throw std::runtime_error("unsupported mode bits");fs.mkfifo(argv[3],static_cast<uint32_t>(mode));}
-            else if(command=="fs-mksocket" && (argc==4 || argc==5)) {auto mode=argc==5?file_number(argv[4],8):0777; if(mode>0777)throw std::runtime_error("unsupported mode bits");fs.mksocket(argv[3],static_cast<uint32_t>(mode));}
+            else if(command=="fs-mkfifo" && (argc==4 || argc==5)) {auto mode=argc==5?file_number(argv[4],8):0644; if(mode>forkfs::supported_mode_bits)throw std::runtime_error("unsupported mode bits");fs.mkfifo(argv[3],static_cast<uint32_t>(mode));}
+            else if(command=="fs-mksocket" && (argc==4 || argc==5)) {auto mode=argc==5?file_number(argv[4],8):0777; if(mode>forkfs::supported_mode_bits)throw std::runtime_error("unsupported mode bits");fs.mksocket(argv[3],static_cast<uint32_t>(mode));}
             else if(command=="fs-unlink" && argc==4) fs.remove(argv[3],false);
             else if(command=="fs-rmdir" && argc==4) fs.remove(argv[3],true);
             else if(command=="fs-rename" && argc==5) fs.rename(argv[3],argv[4]);

@@ -16,6 +16,8 @@ int main(){
     try{for(bool legacy:{false,true}){auto path=std::string(tmp)+(legacy?"/legacy":"/modern");if(legacy)Container::create_legacy(path);else Container::create(path);
         {Container store(path);Namespace fs(store);fs.initialize();fs.mksocket("/sock",0600);auto n=fs.lstat("/sock");
             check(n.socket&&!n.fifo&&!n.symlink&&!n.directory&&!n.chunked&&n.size==0&&n.allocated_size==0&&n.mode==0600&&n.links==1);
+            fs.mksocket("/sticky-socket",01777);check(fs.lstat("/sticky-socket").socket&&fs.lstat("/sticky-socket").mode==01777);
+            Namespace::Attributes sticky;sticky.mode=01000;fs.set_attributes("/sticky-socket",sticky);check(fs.lstat("/sticky-socket").mode==01000);fs.remove("/sticky-socket",false);
             auto stable=logical_state(store.status());rejects([&]{fs.mksocket("/sock",0777);});rejects([&]{fs.mksocket("/bad/",0777);});check(fs.lstat("/sock").id==n.id);
             rejects([&]{fs.write("/sock",Bytes{'x'});},ENOTSUP);rejects([&]{fs.replace_file("/sock",Bytes{'x'});},ENOTSUP);
             rejects([&]{fs.append("/sock",Bytes{'x'});},ENOTSUP);rejects([&]{fs.truncate("/sock",0);},ENOTSUP);

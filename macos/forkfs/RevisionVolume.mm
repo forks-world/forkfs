@@ -232,7 +232,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 - (void)createItemNamed:(FSFileName*)name type:(FSItemType)type inDirectory:(FSItem*)directory attributes:(FSItemSetAttributesRequest*)request replyHandler:(void(^)(FSItem*,FSFileName*,NSError*))reply {
     __block RevisionItem* result=nil;NSError* e=[self perform:^{[self writable];auto dir=[self item:directory];
         auto mode=[request isValid:FSItemAttributeMode]?request.mode:(type==FSItemTypeDirectory?0755:type==FSItemTypeSocket?0777:0644);
-        require(mode<=0777,ENOTSUP,"unsupported creation mode");NSDictionary* attrs;
+        require(mode<=forkfs::supported_mode_bits,ENOTSUP,"unsupported creation mode");NSDictionary* attrs;
         if(type==FSItemTypeDirectory)attrs=[self json:@[@"inode-mkdir",dir.inode,name.string,[@(mode) stringValue]]];
         else if(type==FSItemTypeFIFO)attrs=[self json:@[@"inode-mkfifo",dir.inode,name.string,[@(mode) stringValue]]];
         else if(type==FSItemTypeSocket)attrs=[self json:@[@"inode-mksocket",dir.inode,name.string,[@(mode) stringValue]]];

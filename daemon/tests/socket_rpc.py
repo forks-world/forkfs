@@ -7,6 +7,7 @@ with tempfile.TemporaryDirectory(prefix='ff-socket-rpc-',dir='/tmp') as tmp:
         p=subprocess.run([BIN,*map(str,args)],capture_output=True,timeout=15);assert p.returncode==0,(args,p.stderr);return p.stdout
     cli('init',db);cli('fs-init',db)
     cli('fs-mksocket',db,'/cli','600');assert json.loads(cli('fs-stat',db,'/cli'))['socket']
+    cli('fs-mksocket',db,'/cli-sticky','1777');assert json.loads(cli('fs-stat',db,'/cli-sticky'))['mode']==0o1777
     cli('fs-mksocket',db,'/default');assert json.loads(cli('fs-stat',db,'/default'))['mode']==0o777
     proc=subprocess.Popen([BIN,'serve',db,'--socket',endpoint,'--rpc'],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     def raw(fields):
@@ -37,6 +38,8 @@ with tempfile.TemporaryDirectory(prefix='ff-socket-rpc-',dir='/tmp') as tmp:
         session=obj('session-open','60000')['session'];sel=['--session',session]
         root=obj('inode-root',*sel);rootid=root['inode']['inode_id']
         created=obj('inode-mksocket',rootid,'rpc-socket',str(0o600),*sel);assert created['socket'] and created['mode']==0o600
+        sticky_created=obj('inode-mksocket',rootid,'sticky-socket',str(0o1777),*sel);assert sticky_created['socket'] and sticky_created['mode']==0o1777
+        rpc('fs-mksocket','/rpc-sticky','1777',*sel);assert obj('fs-lstat','/rpc-sticky',*sel)['mode']==0o1777
         rpc('inode-mksocket',rootid,'decimal-mode',str(0o777),*sel);assert obj('fs-lstat','/decimal-mode',*sel)['mode']==0o777
         for command in [('fs-write','/cli',b'x'),('fs-save','/cli',b'x'),('fs-read-at','/cli','0','1'),('fs-truncate','/cli','0'),('fs-punch-hole','/cli','0','1'),('fs-clone-file','/cli','/copy')]:rpc(*command,*sel,error=errno.ENOTSUP)
         rpc('fs-seek-region','/cli','0','data',*sel,error=errno.ESPIPE)

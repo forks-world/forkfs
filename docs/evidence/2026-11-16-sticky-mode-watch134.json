@@ -1,0 +1,79 @@
+{
+  "feature": "Sticky mode metadata after PR 133 integration",
+  "base_sha": "61552dc9778b230c9175ca0c1affa84233083dcb",
+  "tested_commit": "4a7b9bec594b9f4d3d6311d63feeaea4ac72cc5c",
+  "tested_tree": "8abce9b8f90511b0cc80605d13b281f2788a7891",
+  "configuration": "Release WFS_FSKIT=ON clean-first AppleClang SDK toolchain",
+  "environment": {
+    "os": "ProductName:\t\tmacOS\nProductVersion:\t\t27.2.1\nBuildVersion:\t\t26B131",
+    "arch": "arm64",
+    "sdk": "27.2",
+    "compiler": "Apple clang version 21.0.0 (clang-2100.4.1.1)\nTarget: arm64-apple-darwin27.2.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin"
+  },
+  "isolation": "no Git, credentials, home or keychain access; no external network; readonly archived source; separate build/home/tmp and APFS scratch",
+  "ctest": {
+    "passed": 81,
+    "failed": 0,
+    "duration_seconds": 131.35
+  },
+  "system_dependencies": {
+    "forkfsd": 2,
+    "ForkFSExtension": 7,
+    "ForkFSHost": 4
+  },
+  "apfs_reference": {
+    "checks": {
+      "directory_chmod": true,
+      "fifo_chmod": true,
+      "regular_chmod_fchmod_and_write": true,
+      "symlink_lchmod": true,
+      "unlinked_handle_path_reuse": true
+    },
+    "filesystem": "apfs",
+    "scratch": "forkfs-sticky-floqcdni"
+  },
+  "archives": [
+    {
+      "revision": "4a7b9bec594b9f4d3d6311d63feeaea4ac72cc5c",
+      "archive_sha256": "28f327450b461fff4e4d284a3a9570965932b462e8df7b167ed5bafa0433b610",
+      "verified_files": 313
+    },
+    {
+      "revision": "99b3c03b3284f5886f9ef9a4ef703d57373e61be",
+      "archive_sha256": "1ab29b567293da2be4c24f09e9fc7028af48e854fce70b90bcb9768f3fb67fa9",
+      "verified_files": 152
+    }
+  ],
+  "source_files_sha256": {
+    "daemon/filesystem_limits.h": "e93f57fdf2c2b2eb408c1ecca920593d4b2585a1a357054c52bac6c9b3a10cbe",
+    "daemon/main.cpp": "02627b545854f2a3a943dbda2c1d92b1871f46cd2d5d08051523b0cf7e832f4f",
+    "daemon/namespace.cpp": "95f5c3d0801e12b616fab1f86f6994024bea91d2fbd086666a18620fc34c8d5e",
+    "daemon/rpc.cpp": "0d705ac02c571ca135fa3f5dfff2914c6db0855b3d2819a49f2c49df333c83cc",
+    "daemon/tests/attributes.py": "4b8d1f3e84c1e8b608b284eccb8c0ff4ab7f19a90f6a810398507549c9be5ad8",
+    "daemon/tests/inode_paths.cpp": "7ed08977c1333fde12d7eeb1ab62b6c90b0cc52c7475a5711d0a62a8eca433d4",
+    "daemon/tests/inode_rpc.py": "5ffa8538bdfd91523afcc532051fc26cf4c933f6d518d0e0a3190b144ef81cf1",
+    "daemon/tests/socket.cpp": "9a4f527668749573ae4a151ef9f4f907f2b9fc2744e76f2737607c3ab8e7ed65",
+    "daemon/tests/socket_rpc.py": "a426dac9c62d295e6b08b79e6cbb9b44ca2a459870e62e01feb30d6c5613958f",
+    "daemon/tests/symlink_attributes.py": "b752c8a1738406b39be4dd0e9f81a1b91212e6202e477397b84a08e8b015233e",
+    "daemon/tests/times.cpp": "64f518e1aa207a01472f20df2857d8173587e88f5db26b3aac2e60a10163fb29",
+    "macos/forkfs/RevisionVolume.mm": "8edd11569a6d411eed26a58c963d6f614f4a550ede8af642691855b887f676e7",
+    "macos/forkfs/tests/BridgeTest.mm": "777c08401d732cadde28d5430adfd235eeb7fe0139836da34aeea9faaef0eba4",
+    "scripts/tests/sticky_mode_mount.py": "9f1d97a4648a023f206210f6c31e3dd67ee32f44144bb2e6199f50b385c5ed90"
+  },
+  "audit_sha256": "5e6dd55e2744e2fd8a6112384be6d1a5663494ed6140ed7c3f541f7a98e660e7",
+  "log_sha256": {
+    "validate.log": "da79cacf5783df26f7f738ea25dfb31d165e4c06843ce727d64721402cbb973f",
+    "LastTest.log": "6da7c5816ad467ae0bb40c0828ce22203996ffc831850aa54146734378d7a8ca",
+    "apfs-probe.json": "9c4cdb2ae951a62077c826177b5847a9c379c1039297987b9f7a2cea2c6ba02e"
+  },
+  "scope": {
+    "supported_mode_bits": "01777; permission and sticky metadata bits",
+    "rejected_mode_bits": "02000 setgid, 04000 setuid, and higher bits",
+    "coverage": "both Namespace metadata backends, RPC/offline CLI, direct and loopback FSKit bridges; combined with main 133 control-name and bounded RPC page regressions",
+    "native_candidate_signed_installed_or_mounted": false,
+    "native_sticky_directory_authorization": "unqualified; daemon retains single-user model",
+    "root_mode": "0700 unchanged"
+  },
+  "prior_evidence": "2026-11-16-sticky-mode.json records historical base 00795b6 validation; not reused as current validation",
+  "remote_ci": "pending new-head checks after publication"
+}

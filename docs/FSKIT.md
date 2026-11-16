@@ -194,15 +194,29 @@ candidate control-name mount probe has not been run. See
 [control-name qualification record](evidence/2026-11-16-control-character-names.json).
 
 Current limits are inherited from the namespace prototype: 1 TiB per regular
-file with 256 KiB per daemon I/O request, UTF-8 names (255 bytes per component, 4096 per path), mode bits through
-0777, native xattrs (262,143 bytes per value, 128 per inode, 8 MiB total values), no ACLs or uid/gid
-changes, and no special files. Setattr supports mode, size, mtime, atime, birth time and hidden/nodump/user-immutable flags atomically. Other unsupported flags and
+file with 256 KiB per daemon I/O request, UTF-8 names (255 bytes per component, 4096 per path), permission and sticky mode bits through
+octal 01777, native xattrs (262,143 bytes per value, 128 per inode, 8 MiB total values), no setuid/setgid bits, ACLs or uid/gid
+changes. FIFO and Unix socket pathname metadata are supported; device nodes are
+not. Native bind/listen/connect routing and socket IPC remain unqualified.
+Setattr supports mode, size, mtime, atime, birth time and hidden/nodump/user-immutable flags atomically. Other unsupported flags and
 unsupported attributes fail before mutation. The owner/group are synthesized
 from the service identity. The mounted root is always exposed as mode 0700, and
 requests to broaden that mode fail before mutation; this mount policy does not
 rewrite the root metadata of a read-only revision. The frontend is intended for a single-user, private
-mount point; multi-user permissions and syscall cases beyond the local
-acceptance suite remain unqualified.
+mount point; sticky mode is stored as inode metadata. The daemon has no
+independent cross-user credential or authorization model, and native kernel
+sticky-directory deletion/rename authorization is unqualified. Multi-user
+permissions and syscall cases beyond the local acceptance suite remain
+unqualified. The older
+inode decoder rejected records with sticky set when decoding; this support does
+not change the inode format, so an older daemon can fail to decode such an inode.
+
+The APFS reference probe observed mode 01777 creation requests becoming 0777 for
+regular files and directories, while a FIFO retained 01777. Subsequent chmod,
+fchmod, lchmod and `cp -p` checks retained sticky metadata. These are observations
+from the selected APFS reference, not a general kernel rule. The forkfs candidate
+was not signed, installed or mounted for this qualification run. See the [sticky
+mode evidence record](evidence/2026-11-16-sticky-mode-watch134.json).
 
 Directory enumeration uses captured daemon cursors and retains at most 64 streams,
 with one page of at most 512 captured entries per stream (plus two dot entries).

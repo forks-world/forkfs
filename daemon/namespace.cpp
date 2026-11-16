@@ -85,7 +85,7 @@ InodeInfo decode_inode(const Bytes& b,const std::string& id,bool orphan=false) {
     auto type=load(b.data()+8,4),encoded_mode=load(b.data()+12,4);
     // Older readers reject this mode bit instead of silently losing xattrs.
     bool xattrs=(encoded_mode&0x80000000U)!=0;auto mode=encoded_mode&~uint64_t(0x80000000U);
-    need((type==1||type==2||type==3||type==4||type==5||(socket_format&&type==6)) && mode<=0777,"unsupported inode attributes");
+    need((type==1||type==2||type==3||type==4||type==5||(socket_format&&type==6)) && mode<=supported_mode_bits,"unsupported inode attributes");
     InodeInfo n{id,type==2,static_cast<uint32_t>(mode),load(b.data()+16,8),load(b.data()+24,8),
                 load(b.data()+32,8),load(b.data()+40,8),type==3,type==4,xattrs};
     need(n.size<=maximum_file_bytes && (flagged?(n.size<=legacy_file_bytes || n.chunked):large?(n.chunked && n.size>legacy_file_bytes):n.size<=legacy_file_bytes),"invalid inode size/version");
@@ -915,7 +915,7 @@ void Namespace::set_volume_name(const std::string& name) {
         changes[volume_name_key]=name=="ForkFS"?std::optional<Bytes>{}:Bytes(name.begin(),name.end());});
 }
 void Namespace::mkdir(const std::string& path,uint32_t mode) {
-    need(mode<=0777,"invalid creation mode");
+    need(mode<=supported_mode_bits,"invalid creation mode");
     update([&](const NamespaceView& j,Changes& c) {
         auto p=parent(j,path,nullptr,true);need(!j.contains(p.key),"path already exists");
         auto id=new_id(j);InodeInfo n=created({id,true,mode,2,0,now(),now()}),pn=inode(j,p.id);mutable_inode(pn);
@@ -924,7 +924,7 @@ void Namespace::mkdir(const std::string& path,uint32_t mode) {
     });
 }
 void Namespace::mkfifo(const std::string& path,uint32_t mode) {
-    need(mode<=0777,"invalid creation mode");
+    need(mode<=supported_mode_bits,"invalid creation mode");
     update([&](const NamespaceView& j,Changes& c) {
         auto p=parent(j,path);need(!j.contains(p.key),"path already exists");
         auto id=new_id(j);InodeInfo n=created({id,false,mode,1,0,now(),now()});n.fifo=true;
@@ -933,7 +933,7 @@ void Namespace::mkfifo(const std::string& path,uint32_t mode) {
     });
 }
 void Namespace::mksocket(const std::string& path,uint32_t mode) {
-    need(mode<=0777,"invalid creation mode");
+    need(mode<=supported_mode_bits,"invalid creation mode");
     update([&](const NamespaceView& j,Changes& c) {
         auto p=parent(j,path);need(!j.contains(p.key),"path already exists");
         auto id=new_id(j);InodeInfo n=created({id,false,mode,1,0,now(),now()});n.socket=true;
@@ -1091,7 +1091,7 @@ void Namespace::allocation_info(InodeInfo& n,const NamespaceView& view) const {
 }
 namespace {
 void valid_attributes(const Namespace::Attributes& a) {
-    need(!a.mode || *a.mode<=0777,"unsupported mode bits");
+    need(!a.mode || *a.mode<=supported_mode_bits,"unsupported mode bits");
     need(!a.flags || !(*a.flags&~supported_file_flags),"unsupported file flags");
     need(!a.size || *a.size<=Namespace::maximum_file_size,"file exceeds 1 TiB");
     need(!a.modified_ns || *a.modified_ns<=INT64_MAX,"mtime exceeds supported nanosecond range");
@@ -1328,7 +1328,7 @@ std::string Namespace::open(const std::string& path,Access access,const OpenOpti
     need(!options.append || access!=Access::Read,"append open requires writable access");
     need(!options.symlink || (!options.create && !options.truncate && !options.append && !options.nofollow),"invalid symlink open options");
     need(!options.fifo || (access==Access::Read && !options.create && !options.exclusive && !options.truncate && !options.append && !options.positioned_append && !options.symlink),"invalid FIFO open options");
-    need(options.mode<=0777,"invalid creation mode");
+    need(options.mode<=supported_mode_bits,"invalid creation mode");
     need(!revision_ || (access==Access::Read && !options.create && !options.truncate),"revision view is read-only");
     std::lock_guard lock(container_.mutex_);auto& j=*container_.journal_;
     need(j.is_leveldb(),"file handles require the LevelDB backend");

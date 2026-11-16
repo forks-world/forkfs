@@ -25,6 +25,9 @@ with tempfile.TemporaryDirectory(prefix='ff-attr-',dir='/tmp') as tmp:
     run('fs-setmtime',db,'/alias','123456789');assert stat('/file')['modified_ns']==123456789
     assert stat('/file')['size']==len(payload) and run('fs-cat',db,'/file')==payload
     run('fs-chmod',db,'/file','0000');assert stat('/file')['mode']==0
+    run('fs-chmod',db,'/file','1777');assert stat('/file')['mode']==0o1777
+    run('fs-lchmod',db,'/link','1777');assert json.loads(run('fs-lstat',db,'/link'))['mode']==0o1777
+    run('fs-chmod',db,'/file','0000');assert stat('/file')['mode']==0
     run('fs-setmtime',db,'/file','0');assert stat('/file')['modified_ns']==0
     run('fs-chmod',db,'/dir','0700');run('fs-setmtime',db,'/dir','42');assert stat('/dir')['mode']==0o700
     assert stat('/file','--revision','base')['mode']==original['mode']
@@ -35,7 +38,7 @@ with tempfile.TemporaryDirectory(prefix='ff-attr-',dir='/tmp') as tmp:
     assert stat('/link')['flags']==32769
     run('fs-setflags',db,'/file','0');run('fs-lsetflags',db,'/link','0')
     before=json.loads(run('check',db))['last_committed_seq']
-    for mode in ['888','1000','-1','0x755','777777777777777777777777']:
+    for mode in ['888','2000','4000','-1','0x755','777777777777777777777777']:
         run('fs-chmod',db,'/file',mode,ok=False)
     for stamp in ['-1','9223372036854775808','1x']:run('fs-setmtime',db,'/file',stamp,ok=False)
     run('fs-chmod',db,'/missing','755',ok=False)

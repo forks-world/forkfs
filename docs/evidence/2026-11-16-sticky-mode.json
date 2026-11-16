@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-16",
+  "feature": "sticky mode inode metadata",
+  "base_commit": "00795b6f6799fd2591f1fa1b71402ba4abbc843e",
+  "base_description": "origin/main with PR 132 socket pathname metadata merged; PR 133 control names not included",
+  "tested_commit": "117413312f23b1dc7357f781a3b5d7e603e545ed",
+  "configuration": "Release, WFS_FSKIT=ON, clean-first",
+  "supported_mode_bits_octal": "01777",
+  "mode_policy": {
+    "accepts": "permission bits and sticky bit, modes 0000..01777",
+    "rejects": "setuid, setgid and higher bits",
+    "inode_format_changed": false,
+    "older_reader": "The previous reader rejects a sticky-bearing inode during decode with unsupported inode attributes; the validation observed no committed-sequence change.",
+    "private_root": "Root remains mode 0700.",
+    "authorization": "No daemon-side cross-user credentials or authorization model is claimed. Native kernel sticky-directory authorization was not qualified."
+  },
+  "validation": {
+    "source_hashes_match_audit": true,
+    "source_file_sha256": {
+      "daemon/filesystem_limits.h": "e93f57fdf2c2b2eb408c1ecca920593d4b2585a1a357054c52bac6c9b3a10cbe",
+      "daemon/main.cpp": "02627b545854f2a3a943dbda2c1d92b1871f46cd2d5d08051523b0cf7e832f4f",
+      "daemon/namespace.cpp": "094c424ac4b234e84b038127187663b31966f7fe63a18fb7e1530ba73b9682f9",
+      "daemon/rpc.cpp": "510f5cfd8cb8297bfc55fb380caf2421dbb5da4a51be22caf83c1ca14bc98839",
+      "daemon/tests/attributes.py": "4b8d1f3e84c1e8b608b284eccb8c0ff4ab7f19a90f6a810398507549c9be5ad8",
+      "daemon/tests/inode_paths.cpp": "d3b5f56eb4e954d46e179173ef7052d8ca97f88c62625ce781e71a037ae31bf0",
+      "daemon/tests/inode_rpc.py": "5ffa8538bdfd91523afcc532051fc26cf4c933f6d518d0e0a3190b144ef81cf1",
+      "daemon/tests/socket.cpp": "9a4f527668749573ae4a151ef9f4f907f2b9fc2744e76f2737607c3ab8e7ed65",
+      "daemon/tests/socket_rpc.py": "a426dac9c62d295e6b08b79e6cbb9b44ca2a459870e62e01feb30d6c5613958f",
+      "daemon/tests/symlink_attributes.py": "b752c8a1738406b39be4dd0e9f81a1b91212e6202e477397b84a08e8b015233e",
+      "daemon/tests/times.cpp": "64f518e1aa207a01472f20df2857d8173587e88f5db26b3aac2e60a10163fb29",
+      "macos/forkfs/RevisionVolume.mm": "8edd11569a6d411eed26a58c963d6f614f4a550ede8af642691855b887f676e7",
+      "macos/forkfs/tests/BridgeTest.mm": "5297682ec515744e23bb3edea1e38ece0cfa8ca5608ce21cbdc6d3b0a935b0c3",
+      "scripts/tests/sticky_mode_mount.py": "9f1d97a4648a023f206210f6c31e3dd67ee32f44144bb2e6199f50b385c5ed90"
+    },
+    "ctest": {
+      "passed": 81,
+      "total": 81,
+      "duration_seconds": 120.3
+    },
+    "dependency_libraries": {
+      "forkfsd": 2,
+      "ForkFSExtension": 7,
+      "ForkFSHost": 4
+    },
+    "binary_sha256": {
+      "daemon/forkfsd": "a04acf20c6f1ee2866c7653ef128f597bff7d77448159842c33ad168969a12be",
+      "macos/forkfs/ForkFSExtension": "79367c82459eed4e43945ca3af4ce453b335d8c95bf74a8f5ebb4e7cdb3a9610",
+      "macos/forkfs/ForkFSHost": "a03e1d094807f63fd7b1a2ea437fb140c0a5490ad1be500ff67058b106c0ebfc",
+      "macos/forkfs/forkfs_bridge_test": "9e65da238753c515fef1357fa5bd72a96f619cab597ef51bc842d53196c5bedd"
+    },
+    "baseline_daemon_sha256": "eec99218368551f703891b9f4faadd75ad990fb8ded083292fef24911176aef9",
+    "audit_sha256": "9762c7b243b9effe87f1ef26f05ad424aec58d36ecd818c90b7c290663730cec",
+    "log_sha256": {
+      "baseline-bridge.log": "870f462a281afe07b9b7f3daeedd3c5cf8932b42916ed86c0345729f09fa799e",
+      "baseline-probe.json": "cae1bf295f433105bc89cd06292b4bb052fad007a75bf4bd189ea1f02fa24cb9",
+      "apfs-reference.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "compatibility.json": "9837ef0a862f18850a62ece769bd76a5746902a64431b6e475b286423d10f90f",
+      "validate.log": "ea6885f38cd4f1dd1c6bf0c5b88a237d32872589f492212f40f2fba23b451d67",
+      "baseline.log": "38c67227e369bfa69f3238e50fc82137060c98795b3fb2ddd2a95c8aa43b6edc",
+      "apfs-reference-first-assumption.stderr": "7c41b2cf52214370c7f61caefed8c66519fd30248c0a683f36a31ff761affd5e",
+      "apfs-reference.json": "990486b9c40bc1faffd70f59d832dafff08628b793aa4f4e780c5a4811f52746",
+      "apfs-probe.json": "0871907d39590733ecd1746c8e8cde342c9a0ec7e8d044eccdcfa353b77f9eb6",
+      "apfs-reference-summary.json": "31ed080c54993eaf25e0b06d2efbe26a19136f43194e4aee6be54aeae4546734",
+      "LastTest.log": "ff455b2cf54c6660a21c9c97a56072244f7bea023a362dde5bcd4d18bdfc7d2f"
+    },
+    "passing_tests": [
+      "forkfsd_times_core",
+      "forkfsd_inode_paths",
+      "forkfsd_attributes",
+      "forkfsd_inode_rpc",
+      "forkfsd_socket_core",
+      "forkfsd_socket_rpc",
+      "forkfs_bridge",
+      "forkfs_loopback_bridge"
+    ],
+    "sticky_mode_mount_script": {
+      "filesystem": "APFS",
+      "result": "passed",
+      "checks": [
+        "regular chmod/fchmod and write persistence",
+        "directory chmod",
+        "FIFO chmod",
+        "symlink lchmod",
+        "unlinked-handle mode isolation after pathname reuse"
+      ]
+    }
+  },
+  "apfs_reference_observations": {
+    "summary": {
+      "copy_p_mode": 1023,
+      "create": {
+        "dir": 511,
+        "fifo": 1023,
+        "file": 511
+      },
+      "fchmod_1000": 512,
+      "fchmod_preserves_inode": true,
+      "file_write_preserves_sticky": true,
+      "lchmod_symlink_mode": 1023
+    },
+    "summary_mode_numbers_are_decimal": true,
+    "octal_interpretation": {
+      "01777 regular creation": "0777",
+      "01777 directory creation": "0777",
+      "01777 FIFO creation": "01777",
+      "fchmod 01000": "01000",
+      "lchmod symlink 01777": "01777",
+      "cp -p sticky file": "01777"
+    },
+    "scope": "Observations from this APFS reference only; no general kernel rule is inferred."
+  },
+  "baseline_comparison": {
+    "base_commit": "00795b6f6799fd2591f1fa1b71402ba4abbc843e",
+    "bridge_binary_compilation": "passed",
+    "sticky_01777_regular_create_callback": "failed with exact message: create callback failed",
+    "CLI_fs_chmod_mode_01777": "The baseline probe invoked fs-chmod on /file with octal mode 1777; it was rejected as unsupported mode bits."
+  },
+  "socket_scope": {
+    "pathname_metadata": "Socket metadata create/stat, RPC and Bridge regression cases passed.",
+    "native_bind_listen_connect_or_socket_ipc": "unqualified; no native IPC claim is made."
+  },
+  "candidate_mount": {
+    "signed": false,
+    "installed": false,
+    "mounted": false,
+    "qualification": "pending"
+  },
+  "supersedes": "Validation from base e93c6b4e is historical and is not used as final evidence.",
+  "evidence_status": "historical: validated base 00795b6 before PR 133 integration",
+  "superseded_by": "2026-11-16-sticky-mode-watch134.json"
+}
