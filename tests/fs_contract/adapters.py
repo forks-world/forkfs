@@ -487,9 +487,7 @@ class RpcAdapter:
         if op == "xattr_get": return {"value_hex": self.rpc("fs-xattr-get", path("path"), a["name"], *sel()).hex()}
         if op == "xattr_remove": self.rpc("fs-xattr-remove", path("path"), a["name"], *sel()); return {}
         if op == "mkdir_at":
-            self._json("inode-root", *sel())
-            parent_id = self._json("fs-hstat", a["handle"], *sel())["inode_id"]
-            result = self._json("inode-mkdir", parent_id, a["name"], a.get("mode", 0o777), *sel())
+            result = self._json("fs-hmkdir", a["handle"], a["name"], a.get("mode", 0o777), *sel())
             return {"inode": result.get("inode_id")}
         if op == "snapshot":
             result = self._json("fs-snapshot", a["name"], *sel())

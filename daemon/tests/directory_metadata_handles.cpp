@@ -51,7 +51,24 @@ static void rename_replace(const std::string& path){
     check(fs.handle_get_xattr(h,"user.old")==Bytes{'T'});fs.handle_set_xattr(h,"user.old",Bytes{'X'});check(fs.list_xattrs("/target").empty());
     fs.verify();fs.close(h);fs.verify();
 }
+static void mkdir_by_handle(const std::string& path){
+    Container::create(path);Container store(path);Namespace fs(store);fs.initialize();fs.mkdir("/parent",0750);
+    Namespace::OpenOptions pin;pin.directory=true;auto handle=fs.open("/parent",Namespace::Access::Read,pin),duplicate=fs.dup(handle);
+    auto linked_state=store.status();rejects([&]{fs.handle_mkdir(handle,"overflow",uint64_t(1)<<32);});check(store.status()==linked_state);
+    auto original=fs.handle_stat(handle).id;fs.rename("/parent","/moved");fs.mkdir("/parent",0700);
+    auto created=fs.handle_mkdir(handle,"child",0711);check(fs.lstat("/moved/child").id==created.id && fs.lstat("/parent").id!=original);
+    fs.remove("/moved/child",true);fs.remove("/moved",true);fs.mkdir("/moved",0700);auto replacement=fs.lstat("/moved").id;
+    auto before=store.status();rejects([&]{fs.handle_mkdir(handle,"orphan",0755);},ENOENT);
+    check(store.status()==before && fs.lstat("/moved").id==replacement && fs.list("/moved").empty());
+    rejects([&]{fs.handle_mkdir(duplicate,"orphan",0755);},ENOENT);check(store.status()==before);
+    fs.close(handle);rejects([&]{fs.handle_mkdir(handle,"closed",0755);},EBADF);
+    rejects([&]{fs.handle_mkdir(duplicate,"still-open",0701);},ENOENT);fs.close(duplicate);
+    fs.write("/file",Bytes{'x'});auto file=fs.open("/file",Namespace::Access::Read);rejects([&]{fs.handle_mkdir(file,"child",0755);},ENOTDIR);fs.close(file);
+    Namespace old(store,"mkdir-base",true);fs.snapshot("mkdir-base");auto revision_handle=old.open("/moved",Namespace::Access::Read,pin);
+    rejects([&]{old.handle_mkdir(revision_handle,"child",0755);},EROFS);old.close(revision_handle);fs.verify();
+}
 int main(){char pattern[]="/tmp/ff-dirhandle-XXXXXX";auto tmp=mkdtemp(pattern);if(!tmp)return 1;try{
     exercise(std::string(tmp)+"/modern",false);exercise(std::string(tmp)+"/flat",true);rename_replace(std::string(tmp)+"/rename");
+    mkdir_by_handle(std::string(tmp)+"/mkdir");
     std::filesystem::remove_all(tmp);std::cout<<"directory metadata pins, rmdir, flat retirement, rename replacement, identity reuse, xattrs and final close passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';std::filesystem::remove_all(tmp);return 1;}}

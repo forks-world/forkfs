@@ -1579,6 +1579,25 @@ InodeInfo Namespace::handle_stat(const std::string& token) const {
     else n.allocated_size=FileContent(n,j,pre).allocated_bytes(*container_.allocation_cache_);
     return n;
 }
+InodeInfo Namespace::handle_mkdir(const std::string& token,const std::string& name,uint64_t mode) {
+    std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);
+    if(revision_)throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");
+    auto& journal=*container_.journal_;NamespaceView view(journal,view_,revision_);
+    auto key=inode_key(info.inode);bool linked=view.contains(key);InodeInfo parent_inode;
+    if(linked)parent_inode=inode(view,info.inode);
+    else parent_inode=decode_inode(journal.get(orphan_prefix(view_,info.inode)+"inode"),info.inode,true);
+    if(!parent_inode.directory)throw std::system_error(ENOTDIR,std::generic_category(),"parent is not a directory");
+    if(!linked)throw std::system_error(ENOENT,std::generic_category(),"directory is no longer linked");
+    if(name.size()>255)throw std::system_error(ENAMETOOLONG,std::generic_category(),"directory name exceeds 255 bytes");
+    valid_stored_entry_name(name);need(mode<=supported_mode_bits,"invalid creation mode");
+    auto child_key=entry_key(info.inode,name);
+    if(view.contains(child_key))throw std::system_error(EEXIST,std::generic_category(),"path already exists");
+    mutable_inode(parent_inode);link_capacity(parent_inode.links);++parent_inode.links;touch(parent_inode);
+    auto id=new_id(view);InodeInfo child=created({id,true,static_cast<uint32_t>(mode),2,0,now(),now()});Changes changes;
+    changes[child_key]=id_bytes(id);changes[inode_key(id)]=encode(child);
+    changes[key]=encode(parent_inode);changes[allocated_key(id)]=Bytes{};
+    commit_changes(view,changes);return child;
+}
 Bytes Namespace::handle_read(const std::string& token,uint64_t offset,uint64_t count) const {
     need(offset<=INT64_MAX,"file offset exceeds signed 64-bit range");
     std::lock_guard lock(container_.mutex_);const auto& info=find_handle(token);if(!info.readable)bad_handle("handle is not readable");

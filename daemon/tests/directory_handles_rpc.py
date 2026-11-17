@@ -35,7 +35,31 @@ with tempfile.TemporaryDirectory(prefix='ff-dirhandle-rpc-',dir='/tmp') as tmp:
         rpc('fs-open','/pinned','r',*sel,error=errno.EISDIR)
         h=obj('inode-open',did,'r',*sel)['handle'];dup=obj('fs-dup',h,*sel)['handle'];other=obj('session-open','60000')['session']
         rpc('fs-hstat',h,'--session',other,error=errno.EBADF)
+        rpc('fs-hmkdir',h,'foreign',str(0o755),'--session',other,error=errno.EBADF)
+        rpc('fs-hmkdir',h,'wrong-view',str(0o755),'--revision','base',*sel,error=errno.EBADF)
         rpc('fs-hread',h,'0','0',*sel,error=errno.EISDIR)
+        # Handle-aware mkdir follows the open directory across rename, even when
+        # its former pathname is reused by a different directory.
+        obj('fs-mkdir','/mkdir-parent',*sel);parent_id=obj('inode-lookup',rid,'mkdir-parent',*sel)['inode_id']
+        mkdir_handle=obj('inode-open',parent_id,'r',*sel)['handle'];mkdir_dup=obj('fs-dup',mkdir_handle,*sel)['handle']
+        rpc('fs-rename','/mkdir-parent','/mkdir-moved',*sel);obj('fs-mkdir','/mkdir-parent',*sel)
+        child=obj('fs-hmkdir',mkdir_handle,'child',str(0o711),*sel)['inode_id']
+        assert obj('inode-lookup',parent_id,'child',*sel)['inode_id']==child
+        assert rpc('fs-ls','/mkdir-parent',*sel).splitlines()==[]
+        rpc('fs-rmdir','/mkdir-moved/child',*sel);rpc('fs-rmdir','/mkdir-moved',*sel);obj('fs-mkdir','/mkdir-moved',*sel)
+        reused=obj('fs-lstat','/mkdir-moved',*sel)['inode_id'];before_deleted=obj('status')
+        rpc('fs-hmkdir',mkdir_handle,'orphan',str(0o755),*sel,error=errno.ENOENT)
+        rpc('fs-hmkdir',mkdir_dup,'orphan',str(0o755),*sel,error=errno.ENOENT)
+        rpc('inode-mkdir',parent_id,'orphan',str(0o755),*sel,error=errno.ESTALE)
+        rpc('inode-mkdir','f'*32,'unknown',str(0o755),*sel,error=errno.ESTALE)
+        after_deleted=obj('status')
+        assert after_deleted['last_committed_seq']==before_deleted['last_committed_seq']
+        assert after_deleted['object_roots']==before_deleted['object_roots']
+        assert obj('fs-lstat','/mkdir-moved',*sel)['inode_id']==reused and rpc('fs-ls','/mkdir-moved',*sel).splitlines()==[]
+        rpc('fs-close',mkdir_handle,*sel);rpc('fs-hmkdir',mkdir_handle,'closed',str(0o755),*sel,error=errno.EBADF)
+        rpc('fs-hmkdir',mkdir_dup,'still-open',str(0o701),*sel,error=errno.ENOENT);rpc('fs-close',mkdir_dup,*sel)
+        file_handle=obj('fs-open','/not-directory','rw,create',*sel)['handle']
+        rpc('fs-hmkdir',file_handle,'child',str(0o755),*sel,error=errno.ENOTDIR);rpc('fs-close',file_handle,*sel)
         before=obj('status')['last_committed_seq'];rpc('inode-remove',rid,'pinned',did,'directory',*sel)
         obj('inode-mkdir',rid,'pinned',str(0o755),*sel);new_id=obj('inode-lookup',rid,'pinned',*sel)['inode_id'];assert new_id!=did
         assert obj('fs-hstat',h,*sel)['inode_id']==did and obj('fs-hstat',h,*sel)['links']==2
@@ -49,9 +73,12 @@ with tempfile.TemporaryDirectory(prefix='ff-dirhandle-rpc-',dir='/tmp') as tmp:
         assert obj('fs-hstat',replace_pin,*sel)['inode_id']==old_replace and obj('fs-hstat',replace_pin,*sel)['links']==2
         assert rpc('fs-hxattr-get',replace_pin,'user.replace',*sel)==b'retained';rpc('fs-close',replace_pin,*sel)
         base=obj('session-open','60000')['session'];base_sel=('--revision','base','--session',base);base_root=obj('inode-root',*base_sel)['inode']['inode_id'];base_dir=obj('inode-lookup',base_root,'pinned',*base_sel)['inode_id'];ro=obj('inode-open',base_dir,'r',*base_sel)['handle']
+        rpc('fs-hmkdir',ro,'child',str(0o755),*base_sel,error=errno.EROFS)
         rpc('inode-xattr-set',base_dir,'user.old','replace',b'x',*base_sel,error=errno.EROFS);assert rpc('fs-hxattr-get',ro,'user.old',*base_sel)==b'old'
         rpc('fs-close',ro,*base_sel);rpc('session-close',base)
         rpc('fs-close',h,*sel);rpc('fs-hstat',h,*sel,error=errno.EBADF);assert obj('fs-hstat',dup,*sel)['inode_id']==did;rpc('fs-close',dup,*sel);rpc('fs-check');rpc('session-close',other);rpc('session-close',session)
+        expired_before=obj('status');expired_code,expired_reply=raw(['fs-hmkdir',h,'expired-session',str(0o755),'--session',session]);expired_after=obj('status')
+        assert expired_code==1 and expired_after['last_committed_seq']==expired_before['last_committed_seq'] and expired_after['object_roots']==expired_before['object_roots']
     finally:
         proc.terminate();proc.wait(timeout=10)
     cli('fs-check',db);cli('gc',db);cli('fs-check',db)
