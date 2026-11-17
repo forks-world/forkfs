@@ -51,6 +51,9 @@ target_compile_definitions(forkfsd_legacy_test PRIVATE FORKFS_LEGACY_DEFAULT=1)
 add_executable(forkfsd ${FORKFS_NORMAL_OBJECTS})
 target_compile_options(forkfsd PRIVATE -Wall -Wextra -Wpedantic)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME fs_contract_harness_selftest COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/scripts/tests/fs_contract.py --selftest)
+set_tests_properties(fs_contract_harness_selftest PROPERTIES TIMEOUT 30)
 add_test(NAME forkfsd_namespace_errors COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/namespace_errors.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_legacy_test>)
 set_tests_properties(forkfsd_namespace_errors PROPERTIES TIMEOUT 120)
