@@ -74,7 +74,19 @@ class HarnessModelTests(unittest.TestCase):
             root = Path(tmp)
             (root / "d").mkdir()
             (root / "d" / "f").write_bytes(b"x")
-            self.assertEqual(safe_path(root, "d/../d/f"), os.fsencode(str(root) + "/d/../d/f"))
+            self.assertEqual(safe_path(root, "d/../d/f"),
+                             os.fsencode(str(root.resolve(strict=True)) + "/d/../d/f"))
+
+    def test_safe_path_canonicalizes_owned_root_symlink_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "owned"
+            (root / "d").mkdir(parents=True)
+            (root / "d" / "f").write_bytes(b"x")
+            alias = base / "owned-alias"
+            os.symlink(root, alias, target_is_directory=True)
+            self.assertEqual(safe_path(alias, "d/../d/f"),
+                             os.fsencode(str(root.resolve(strict=True)) + "/d/../d/f"))
 
     def test_darwin_fingerprint_encodes_path_arguments_for_ctypes(self):
         with tempfile.TemporaryDirectory() as tmp:
