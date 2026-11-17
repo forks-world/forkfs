@@ -263,7 +263,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     } else if(op=="inode-rename") {
         auto source=child(args[1],args[2]),target=child(args[3],args[4]);need(fs.lstat(source).id==args[5],"invalid stale source entry");
         if(args[6]!="-")need(fs.lstat(target).id==args[6],"invalid stale target entry");
-        else {bool missing=false;try{(void)fs.lstat(target);}catch(const std::runtime_error& e){if(std::string_view(e.what())=="path not found")missing=true;else throw;}
+        else {bool missing=false;try{(void)fs.lstat(target);}catch(const std::system_error& e){if(e.code()==std::error_code(ENOENT,std::generic_category()))missing=true;else throw;}
+            catch(const std::runtime_error& e){if(std::string_view(e.what())=="path not found")missing=true;else throw;}
             need(missing,"target already exists");}
         fs.rename(source,target);return inode_json(fs.lstat(target));
     } else if(op=="inode-setattr" || op=="inode-setattr-times" || op=="inode-setattr-flags") {

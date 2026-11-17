@@ -81,7 +81,7 @@ with tempfile.TemporaryDirectory(prefix='ff-posix-errors-',dir='/tmp') as tmp:
         assert obj('fs-stat','/missing-target')['directory']
         assert obj('fs-lstat','/dangling')['inode_id']==dangling_id
         assert rpc('fs-readlink','/dangling',*sel)==b'/missing-target'
-        historical_missing=rpc('fs-stat','/missing-target','--revision','base',code=1)
+        historical_missing=rpc('fs-stat','/missing-target','--revision','base',code=errno.ENOENT+1)
         assert b'path not found' in historical_missing
         before_collision=stable_state()
         rpc('inode-mkdir',rid,'missing-target',str(0o755),*sel,code=errno.EEXIST+1)

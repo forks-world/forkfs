@@ -43,7 +43,7 @@ with tempfile.TemporaryDirectory(prefix='ff-clone-file-',dir='/tmp') as td:
             raw(['fs-clone-file','/link','/rpc-copy'],expect=1)
             raw(['fs-clone-file','/source'],expect=1)
             assert state()==before and json.loads(raw(['fs-lstat','/source']))==src
-            raw(['fs-stat','/rpc-copy'],expect=1)
+            raw(['fs-stat','/rpc-copy'],expect=errno.ENOENT+1)
             assert raw(['fs-read-at','/source','0','70000'])==payload.read_bytes()
             report={'mode':'expect-unsupported','rpc_rejected':True,'state_unchanged':True}
         else:
@@ -69,7 +69,7 @@ with tempfile.TemporaryDirectory(prefix='ff-clone-file-',dir='/tmp') as td:
             assert state()==before;raw(['session-close',lease])
             raw(['fs-snapshot','base']);raw(['fs-fork','base','work'])
             raw(['fs-clone-file','/source','/world-copy','--world','work'])
-            raw(['fs-stat','/world-copy'],expect=1)
+            raw(['fs-stat','/world-copy'],expect=errno.ENOENT+1)
             assert raw(['fs-read-at','/world-copy','0','70000','--world','work'])==payload.read_bytes()
             report={'mode':'fixed','rpc_clone':'passed','exclusive_errors':'atomic','world_selector':'passed'}
     finally:

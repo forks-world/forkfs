@@ -291,8 +291,8 @@ Parent parent(const NamespaceView& journal,const std::string& path,std::vector<s
     return {id,names.back(),entry_key(id,names.back())};
 }
 std::string resolve(const NamespaceView& journal,const std::string& path,bool follow=true,Parent* missing=nullptr,
-                    bool* followed_symlink=nullptr) {
-    auto names=components(path,true);return walk(journal,names,names.size(),nullptr,follow,missing,followed_symlink);
+                    bool* followed_symlink=nullptr,bool posix_errors=false) {
+    auto names=components(path,true);return walk(journal,names,names.size(),nullptr,follow,missing,followed_symlink,nullptr,posix_errors);
 }
 struct PhysicalPath { Parent parent;std::string id;std::vector<std::string> ancestry;bool exists=true; };
 PhysicalPath physical_path(const NamespaceView& journal,const std::string& path,bool allow_missing=false) {
@@ -1101,7 +1101,7 @@ void Namespace::punch_hole(const std::string& path,uint64_t offset,uint64_t leng
 }
 Bytes Namespace::read_at(const std::string& path,uint64_t offset,uint64_t count) const {
     need(offset<=INT64_MAX,"file offset exceeds signed 64-bit range");
-    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=inode(view,resolve(view,path));
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=inode(view,resolve(view,path,true,nullptr,nullptr,true));
     if(n.fifo||n.socket)throw std::system_error(ENOTSUP,std::generic_category(),"special inode has no byte stream");need(!n.directory,"cannot read a directory");return FileContent(n,view).read(offset,count);
 }
 uint64_t Namespace::seek_region(const std::string& path,uint64_t offset,bool data) const {
@@ -1150,7 +1150,7 @@ void Namespace::rewind_directory(DirectoryCursor& cursor) const {
     cursor.after_.clear();cursor.done_=cursor.manifest_==ObjectId{};
 }
 InodeInfo Namespace::stat(const std::string& path) const {
-    std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);auto n=inode(j,resolve(j,path));allocation_info(n,j);remember_path(n.id,path);return n;
+    std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);auto n=inode(j,resolve(j,path,true,nullptr,nullptr,true));allocation_info(n,j);remember_path(n.id,path);return n;
 }
 void Namespace::allocation_info(InodeInfo& n,const NamespaceView& view) const {
     n.allocated_size=(n.directory||n.fifo||n.socket)?0:FileContent(n,view).allocated_bytes(*container_.allocation_cache_);
@@ -1216,7 +1216,7 @@ void Namespace::handle_set_attributes(const std::string& token,const Attributes&
     apply_attributes(n,a);changes[key]=encode(n);commit_changes(view,changes);
 }
 InodeInfo Namespace::lstat(const std::string& path) const {
-    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=inode(view,resolve(view,path,false));allocation_info(n,view);remember_path(n.id,path);return n;
+    std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=inode(view,resolve(view,path,false,nullptr,nullptr,true));allocation_info(n,view);remember_path(n.id,path);return n;
 }
 void Namespace::symlink(const std::string& target,const std::string& path) {
     target_components(target);
@@ -1280,16 +1280,22 @@ void Namespace::remove(const std::string& path,bool directory) {
         const bool trailing=!path.empty() && path.back()=='/';
         Parent p;std::string id;
         if(trailing) {auto resolved=physical_path(j,path);p=std::move(resolved.parent);id=std::move(resolved.id);}
-        else {p=parent(j,path);need(j.contains(p.key),"path not found");id=decode_id(j.get(p.key));}
+        else {p=parent(j,path,nullptr,false,true);if(!j.contains(p.key))throw std::system_error(ENOENT,std::generic_category(),"path not found");id=decode_id(j.get(p.key));}
         auto n=inode(j,id),pn=inode(j,p.id);mutable_metadata(n);mutable_metadata(pn);
-        need(!directory || n.directory,"path is not a directory");
+        if(directory && !n.directory)throw std::system_error(ENOTDIR,std::generic_category(),"path is not a directory");
 #ifdef __APPLE__
         if(trailing && !directory && n.directory)throw std::system_error(EPERM,std::generic_category(),"cannot unlink a directory");
 #else
         if(trailing && !directory && n.directory)throw std::system_error(EISDIR,std::generic_category(),"cannot unlink a directory");
 #endif
-        need(directory || !n.directory,"cannot unlink a directory");
-        if(directory){need(j.keys(directory_prefix(id)).empty(),"directory is not empty");--pn.links;}
+        if(!directory && n.directory) {
+#ifdef __APPLE__
+            throw std::system_error(EPERM,std::generic_category(),"cannot unlink a directory");
+#else
+            throw std::system_error(EISDIR,std::generic_category(),"cannot unlink a directory");
+#endif
+        }
+        if(directory){if(!j.keys(directory_prefix(id)).empty())throw std::system_error(ENOTEMPTY,std::generic_category(),"directory is not empty");--pn.links;}
         c[p.key]=std::nullopt;
         if(directory || n.links==1)retire(j,c,n);
         else {--n.links;n.changed_ns=now();c[inode_key(id)]=encode(n);}
@@ -1328,9 +1334,9 @@ void Namespace::rename_impl(const std::string& source,const std::string& target,
             auto replaced=target_id;if(replaced==id)return;
             non_append_inode(inode(j,dst.id));auto other=inode(j,replaced);mutable_metadata(other);
             if(target_trailing && other.directory && !n.directory)throw std::system_error(EISDIR,std::generic_category(),"rename target is a directory");
-            need(!other.directory || n.directory,"rename target is a directory");
-            need(other.directory || !n.directory,"rename target is not a directory");
-            if(other.directory){need(j.keys(directory_prefix(replaced)).empty(),"target directory is not empty");--parents.at(dst.id).links;}
+            if(other.directory && !n.directory)throw std::system_error(EISDIR,std::generic_category(),"rename target is a directory");
+            if(!other.directory && n.directory)throw std::system_error(ENOTDIR,std::generic_category(),"rename target is not a directory");
+            if(other.directory){if(!j.keys(directory_prefix(replaced)).empty())throw std::system_error(ENOTEMPTY,std::generic_category(),"target directory is not empty");--parents.at(dst.id).links;}
             if(other.directory || other.links==1)retire(j,c,other);
             else {--other.links;other.changed_ns=now();c[inode_key(replaced)]=encode(other);}
         }
@@ -1439,14 +1445,14 @@ std::string Namespace::open(const std::string& path,Access access,const OpenOpti
     need(!options.fifo || (access==Access::Read && !options.create && !options.exclusive && !options.truncate && !options.append && !options.positioned_append && !options.symlink),"invalid FIFO open options");
     need(!options.directory || (access==Access::Read && !options.create && !options.exclusive && !options.truncate && !options.append && !options.positioned_append && !options.fifo && !options.symlink),"invalid directory metadata open options");
     need(options.mode<=supported_mode_bits,"invalid creation mode");
-    need(!revision_ || (access==Access::Read && !options.create && !options.truncate),"revision view is read-only");
+    if(revision_ && (access!=Access::Read || options.create || options.truncate))throw std::system_error(EROFS,std::generic_category(),"revision view is read-only");
     std::lock_guard lock(container_.mutex_);auto& j=*container_.journal_;
     need(j.is_leveldb(),"file handles require the LevelDB backend");
     need(container_.handles_.size()<4096,"file handle limit reached");NamespaceView view(j,view_,revision_);
     Changes changes;std::string id;
     if(options.create) {
-        auto p=parent(view,path);bool exists=view.contains(p.key);
-        need(!exists || !options.exclusive,"path already exists");
+        auto p=parent(view,path,nullptr,false,true);bool exists=view.contains(p.key);
+        if(exists && options.exclusive)throw std::system_error(EEXIST,std::generic_category(),"path already exists");
         if(exists) {
             auto raw=inode(view,decode_id(view.get(p.key)));
             need(!options.nofollow || !raw.symlink,"final symbolic link is forbidden");
@@ -1458,7 +1464,7 @@ std::string Namespace::open(const std::string& path,Access access,const OpenOpti
             changes[inode_key(id)]=encode(n);changes[content_key(id)]=Bytes{};changes[allocated_key(id)]=Bytes{};
             changes[p.key]=id_bytes(id);changes[inode_key(p.id)]=encode(pn);
         }
-    } else {id=resolve(view,path,!(options.nofollow || options.symlink));need(!options.nofollow || !inode(view,id).symlink,"final symbolic link is forbidden");}
+    } else {id=resolve(view,path,!(options.nofollow || options.symlink),nullptr,nullptr,true);need(!options.nofollow || !inode(view,id).symlink,"final symbolic link is forbidden");}
     if(changes.empty()) {
         auto n=inode(view,id);
         if(n.socket)throw std::system_error(ENOTSUP,std::generic_category(),"socket descriptors are kernel managed");

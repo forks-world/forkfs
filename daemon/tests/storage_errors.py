@@ -75,7 +75,7 @@ with tempfile.TemporaryDirectory(prefix='ff-io-storage-', dir='/tmp') as tempora
                     assert rpc('fs-cat', '/file') == old
                     assert rpc('fs-cat', '/file', '--revision', 'base') == old
                     assert rpc('fs-hread', handle, 0, len(old), *selection) == old
-                    rpc('fs-cat', '/missing', code=1)  # Logical errors keep the existing generic contract.
+                    rpc('fs-cat', '/missing', code=errno.ENOENT + 1)
                     assert not json.loads(rpc('status'))['requires_reopen']
                     armed.touch()
                     if operation == 'fs-hwrite':
