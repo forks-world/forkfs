@@ -102,10 +102,23 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         raw(['fs-mkdir','/physical-alias/../trailing-physical///']);assert json.loads(raw(['fs-stat','/src/trailing-physical']))['directory']
         raw(['fs-rmdir','/src/trailing']);raw(['fs-rmdir','/src/trailing-physical'])
         raw(['fs-rmdir','/src/created']);raw(['fs-unlink','/physical-alias']);raw(['fs-rmdir','/src/sub'])
+        dangling_id=json.loads(raw(['fs-lstat','/trail-dangling']))['inode_id']
+        raw(['fs-mkdir','/trail-dangling/'])
+        assert json.loads(raw(['fs-stat','/missing-trailing-target']))['directory']
+        assert json.loads(raw(['fs-lstat','/trail-dangling']))['inode_id']==dangling_id
+        assert raw(['fs-readlink','/trail-dangling'])==b'/missing-trailing-target'
+        raw(['fs-stat','/missing-trailing-target','--revision','before-trailing-mkdir'],ok=False,expected_code=1)
         before_invalid=json.loads(raw(['status']))['last_committed_seq']
         src_before=json.loads(raw(['fs-stat','/src']));listing_before=raw(['fs-ls','/src'])
-        for invalid in ['/src/.','/src/./','/src/..','/missing/../child','/src/file/../child','/src/','/rpc-file/','/file-link/','/trail-alias/','/trail-dangling/','/missing/child/','/rpc-file/child/']:
-            raw(['fs-mkdir',invalid],ok=False,expected_code=1)
+        mkdir_errors={
+            '/src/.':errno.EEXIST+1,'/src/./':errno.EEXIST+1,'/src/..':errno.EEXIST+1,
+            '/src/':errno.EEXIST+1,'/trail-alias/':errno.EEXIST+1,
+            '/missing/../child':errno.ENOENT+1,'/missing/child/':errno.ENOENT+1,
+            '/src/file/../child':errno.ENOTDIR+1,'/rpc-file/':errno.ENOTDIR+1,
+            '/file-link/':errno.ENOTDIR+1,'/rpc-file/child/':errno.ENOTDIR+1,
+        }
+        for invalid,expected in mkdir_errors.items():
+            raw(['fs-mkdir',invalid],ok=False,expected_code=expected)
         raw(['fs-mkdir','/src/'+('/'*4092)],ok=False,expected_code=errno.ENAMETOOLONG+1)
         raw(['fs-mkdir','/src/'+('x'*256)+'/'],ok=False,expected_code=errno.ENAMETOOLONG+1)
         assert json.loads(raw(['status']))['last_committed_seq']==before_invalid

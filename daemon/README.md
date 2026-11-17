@@ -585,8 +585,15 @@ are 1..4096 bytes of valid UTF-8, component length at most 255 bytes; repeated s
 and dot components are supported inside targets. A target's trailing slash requires
 a directory. Existing-object Namespace paths may end in `/` for queries and
 path metadata/content operations, requiring the final result to be a directory.
-`mkdir` also accepts one or more trailing slashes after validating the original
-path length and components. Namespace `rmdir`, `rename`, and shared-parser
+`mkdir` accepts one or more trailing slashes after validating the original
+path length and components. Without a slash it checks the final directory entry
+without following a final symlink and reports `EEXIST` when occupied. With a
+slash it follows the final symlink, reports `EEXIST` for an existing directory
+and `ENOTDIR` for a non-directory; a dangling final symlink can create its
+missing physical target while preserving the link. Missing parents report
+`ENOENT`, and terminal `.`/`..` components are physically traversed rather than
+created as names. These typed results cover Namespace and raw RPC behavior;
+they do not claim a new native FSKit/mount behavior. Namespace `rmdir`, `rename`, and shared-parser
 `rename_exclusive` resolve trailing-slash operands through their physical directory target. A final
 symlink remains in place when its target directory is removed or moved, and a
 destination slash may create a missing target through a dangling symlink when
@@ -594,12 +601,14 @@ the source is a directory. `unlink` with a slash follows the target and returns
 the observed Darwin `EPERM` directory-unlink error (Linux uses `EISDIR`). Raw path and component
 limits are checked before traversal. These semantics are covered at the
 Namespace, RPC, and offline CLI layers only; they do not establish native
-FSKit/mount behavior or general POSIX compatibility. `link` and creation paths
-continue to reject trailing slashes. The focused regressions are
+FSKit/mount behavior or general POSIX compatibility. `link` and other creation
+paths continue to reject trailing slashes. The focused regressions are
 `forkfsd_trailing_paths_test`, `forkfsd_trailing_mutations_rpc` and
 `forkfsd_mkdir_trailing_test`; the
 [mkdir trailing slash validation](../docs/evidence/2026-11-15-mkdir-trailing-slashes.json)
-records the earlier mkdir-only scope. Mutation errno cases follow APFS/Darwin
+records the earlier mkdir-only scope. Current mkdir trailing-link behavior and
+typed `EEXIST`/`ENOENT`/`ENOTDIR` results are recorded in
+[mkdir path validation](../docs/evidence/2026-11-17-mkdir-path-semantics.json). Mutation errno cases follow APFS/Darwin
 observations for this change; they do not promise identical host syscall results
 or establish native mount error mapping. See the
 [trailing mutation validation](../docs/evidence/2026-11-16-trailing-mutations.json)

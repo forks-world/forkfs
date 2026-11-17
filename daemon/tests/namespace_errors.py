@@ -21,7 +21,8 @@ with tempfile.TemporaryDirectory(prefix='ff-posix-errors-',dir='/tmp') as tmp:
         for name in ['file-src','file-dst']:command(binary,'fs-write',db,'/'+name,data)
         for name in ['dir-src','dir-src/child','dir-dst','nonempty']:command(binary,'fs-mkdir',db,'/'+name)
         command(binary,'fs-write',db,'/nonempty/file',data)
-        command(binary,'fs-symlink',db,'/dir-dst','/dir-link');command(binary,'fs-snapshot',db,'base')
+        command(binary,'fs-symlink',db,'/dir-dst','/dir-link');command(binary,'fs-symlink',db,'/file-src','/file-link')
+        command(binary,'fs-symlink',db,'/missing-target','/dangling');command(binary,'fs-snapshot',db,'base')
     db=root/'rpc';prepare(BIN,db);endpoint=root/'control.sock'
     proc=subprocess.Popen([BIN,'serve',str(db),'--socket',str(endpoint),'--rpc'],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     def exact(s,n):
@@ -36,7 +37,7 @@ with tempfile.TemporaryDirectory(prefix='ff-posix-errors-',dir='/tmp') as tmp:
     def obj(*args):return json.loads(rpc(*args))
     def stable_state():
         status=obj('status');result={k:status[k] for k in ['last_committed_seq','indexed_objects','object_roots']}
-        result['entries']=rpc('fs-ls','/');result['attrs']={p:obj('fs-lstat',p) for p in ['/','/file-src','/file-dst','/dir-src','/dir-src/child','/dir-dst','/nonempty','/nonempty/file','/dir-link']}
+        result['entries']=rpc('fs-ls','/');result['attrs']={p:obj('fs-lstat',p) for p in ['/','/file-src','/file-dst','/dir-src','/dir-src/child','/dir-dst','/nonempty','/nonempty/file','/dir-link','/file-link','/dangling']}
         result['contents']=[rpc('fs-cat',p) for p in ['/file-src','/file-dst','/nonempty/file']]
         result['revisions']=rpc('fs-revisions');return result
     try:
@@ -57,12 +58,34 @@ with tempfile.TemporaryDirectory(prefix='ff-posix-errors-',dir='/tmp') as tmp:
                (('inode-link',rid,rid,'forbidden-root-link'),errno.EPERM),
                (('inode-link',ids['file-src'],rid,'file-dst'),errno.EEXIST),
                (('inode-rename',rid,'absent',rid,'new',ids['file-src'],'-'),errno.ENOENT),
+               (('fs-mkdir','/'),errno.EEXIST),
+               (('fs-mkdir','/file-src'),errno.EEXIST),
+               (('fs-mkdir','/dir-src'),errno.EEXIST),
+               (('fs-mkdir','/dangling'),errno.EEXIST),
+               (('fs-mkdir','/file-src/'),errno.ENOTDIR),
+               (('fs-mkdir','/file-link/'),errno.ENOTDIR),
+               (('fs-mkdir','/dir-src/.'),errno.EEXIST),
+               (('fs-mkdir','/absent/child/'),errno.ENOENT),
+               (('fs-mkdir','/absent/.'),errno.ENOENT),
+               (('fs-mkdir','/file-src/child/'),errno.ENOTDIR),
+               (('fs-mkdir','/file-src/..'),errno.ENOTDIR),
+               (('inode-mkdir',rid,'file-src',str(0o755)),errno.EEXIST),
                (('inode-rename',rid,'file-src',rid,'dir-dst',ids['file-dst'],ids['dir-dst']),errno.ESTALE),
                (('inode-rename',rid,'file-src',ids['file-dst'],'child',ids['file-src'],'-'),errno.ENOTDIR),
                (('inode-rename',rid,'dir-src',ids['dir-src'],'inside',ids['dir-src'],'-'),errno.EINVAL)]
         before=stable_state()
         for args,error in cases:
             rpc(*args,*sel,code=error+1);assert stable_state()==before,(args,error)
+        dangling_id=obj('fs-lstat','/dangling')['inode_id']
+        rpc('fs-mkdir','/dangling/',*sel)
+        assert obj('fs-stat','/missing-target')['directory']
+        assert obj('fs-lstat','/dangling')['inode_id']==dangling_id
+        assert rpc('fs-readlink','/dangling',*sel)==b'/missing-target'
+        historical_missing=rpc('fs-stat','/missing-target','--revision','base',code=1)
+        assert b'path not found' in historical_missing
+        before_collision=stable_state()
+        rpc('inode-mkdir',rid,'missing-target',str(0o755),*sel,code=errno.EEXIST+1)
+        assert stable_state()==before_collision
         rpc('fs-check');rpc('fs-check','--revision','base')
         # A destination symlink pointing to a directory is still replaceable by
         # a non-directory; checking its target type would reject this valid case.

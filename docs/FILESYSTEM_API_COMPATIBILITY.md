@@ -130,9 +130,17 @@ Namespace object resolution accepts a trailing slash for existing-object queries
 and metadata/content operations. The slash requires the resolved object to be a
 directory, including when the final component is a symlink to a directory;
 `lstat("/link/")` therefore follows that link for directory traversal. The
-`mkdir` command accepts trailing slashes after raw path and component limits are checked;
-create and link destination paths plus revision diff cursors continue to reject
-them. `rmdir`, `rename`, and `rename_exclusive` now use the physically resolved
+`mkdir` command accepts trailing slashes after raw path and component limits are checked.
+Without a slash its final entry is not followed and an occupied name reports
+`EEXIST`; with a slash it follows the final link, returning `EEXIST` for an
+existing directory and `ENOTDIR` for a non-directory. A dangling final link may
+create its missing physical target while preserving the link. Missing parents
+report `ENOENT`; terminal `.` and `..` are fully traversed and never treated as
+creation names. These typed errors apply to Namespace and raw RPC behavior and
+do not claim new native FSKit/mount behavior. See
+[mkdir path validation](evidence/2026-11-17-mkdir-path-semantics.json). Other create and link destination
+paths plus revision diff cursors continue to reject trailing slashes.
+`rmdir`, `rename`, and `rename_exclusive` now use the physically resolved
 directory entry for slash operands, including through a dangling destination
 symlink when a directory source is moved. See the daemon README regression scope.
 See [mkdir trailing slash validation](evidence/2026-11-15-mkdir-trailing-slashes.json)
@@ -349,10 +357,13 @@ Preallocate、DataCache 等独立评估；迁移 API 不自动补齐上表语义
 后的 `..` 仍然失败。原始路径上限仍为 4096 字节（包含点组件及重复分隔符），
 组件上限仍为 255 字节。现存对象查询及路径元数据/内容操作接受末尾 `/`，并要求
 最终解析对象为目录；末尾符号链接因此按目录路径语义跟随。
-查找可用 `.` 或 `..` 结尾，变更操作拒绝这两个末尾组件，避免将保留名称写入
-目录项。只有 `mkdir` 接受末尾 `/`；其他 parent 路径创建、remove/rename/link、
-创建式 open 和 diff 游标路径仍拒绝。此项记录 daemon namespace 语义，不代表原生挂载路径能力升级。
-mkdir 的基线失败与当前结果见[专用验收记录](evidence/2026-11-15-mkdir-trailing-slashes.json)。
+查找可用 `.` 或 `..` 结尾，变更操作拒绝将它们作为目录项名称。`mkdir` 接受末尾 `/`：
+无斜线时不跟随最终链接且占用项返回 `EEXIST`；有斜线时跟随最终链接，现存目录返回
+`EEXIST`、非目录返回 `ENOTDIR`，dangling 最终链接可创建缺失的物理目标并保留链接。
+缺失父目录返回 `ENOENT`；末尾 `.`、`..` 会完整物理遍历，不会被当作创建名称。
+这些错误码适用于 Namespace 与 raw RPC，不声明原生 FSKit/挂载行为升级。其他创建与链接
+路径及 diff 游标仍拒绝末尾 `/`。此项 daemon namespace 行为的原始证据见
+[mkdir trailing slash validation](evidence/2026-11-15-mkdir-trailing-slashes.json)。
 `.`、`..` 和重复分隔符的历史验收仍见
 [physical path components evidence](evidence/2026-11-14-physical-path-components.json)；该记录不代表末尾 `/` 的当前行为。
 
