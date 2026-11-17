@@ -211,7 +211,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
         require((![request isValid:FSItemAttributeUID] || request.uid==_uid) && (![request isValid:FSItemAttributeGID] || request.gid==_gid),EPERM,"ownership changes are unsupported");
         require(![request isValid:FSItemAttributeType] && ![request isValid:FSItemAttributeLinkCount] && ![request isValid:FSItemAttributeAllocSize] && ![request isValid:FSItemAttributeFileID] && ![request isValid:FSItemAttributeParentID] && ![request isValid:FSItemAttributeChangeTime] && ![request isValid:FSItemAttributeBackupTime] && ![request isValid:FSItemAttributeAddedTime],ENOTSUP,"unsupported inode attributes");
         require(![request isValid:FSItemAttributeFlags] || !(request.flags&~forkfs::supported_file_flags),ENOTSUP,"unsupported file flags");
-        NSString* handle=[request isValid:FSItemAttributeSize]?(it.writer?:@"-"):([self handle:it]?:@"-");
+        NSString* handle=[request isValid:FSItemAttributeSize]?(it.writer?:((itemType(it.attrs)==FSItemTypeDirectory)?([self handle:it]?:@"-"):@"-")):([self handle:it]?:@"-");
         if([request isValid:FSItemAttributeFlags])it.attrs=[self json:@[@"inode-setattr-flags",it.inode,mode,size,mtime,atime,birth,[@(request.flags) stringValue],handle]];
         else it.attrs=[self json:@[@"inode-setattr-times",it.inode,mode,size,mtime,atime,birth,handle]];
         request.consumedAttributes=([request isValid:FSItemAttributeFlags]?FSItemAttributeFlags:0)|([request isValid:FSItemAttributeUID]?FSItemAttributeUID:0)|([request isValid:FSItemAttributeGID]?FSItemAttributeGID:0)|([request isValid:FSItemAttributeMode]?FSItemAttributeMode:0)|([request isValid:FSItemAttributeSize]?FSItemAttributeSize:0)|([request isValid:FSItemAttributeModifyTime]?FSItemAttributeModifyTime:0)|([request isValid:FSItemAttributeAccessTime]?FSItemAttributeAccessTime:0)|([request isValid:FSItemAttributeBirthTime]?FSItemAttributeBirthTime:0);
@@ -310,7 +310,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 }
 - (BOOL)isOpenCloseInhibited{return NO;}
 - (void)openItem:(FSItem*)item withModes:(FSVolumeOpenModes)modes replyHandler:(void(^)(NSError*))reply {
-    NSError* e=[self perform:^{auto it=[self item:item];auto type=itemType(it.attrs);if(type==FSItemTypeSocket)require(false,EOPNOTSUPP,"socket pathname opens are kernel managed");if(type==FSItemTypeDirectory){require(!(modes&FSVolumeOpenModesWrite),EISDIR,"directory is not writable as a file");return;}BOOL fifo=type==FSItemTypeFIFO;require(fifo || type==FSItemTypeFile || type==FSItemTypeSymlink,ENOTSUP,"unsupported open inode type");
+    NSError* e=[self perform:^{auto it=[self item:item];auto type=itemType(it.attrs);if(type==FSItemTypeSocket)require(false,EOPNOTSUPP,"socket pathname opens are kernel managed");if(type==FSItemTypeDirectory){require(!(modes&FSVolumeOpenModesWrite),EISDIR,"directory is not writable as a file");if((modes&FSVolumeOpenModesRead) && !it.reader && !it.writer)it.reader=[self json:@[@"inode-open",it.inode,@"r"]][@"handle"];return;}BOOL fifo=type==FSItemTypeFIFO;require(fifo || type==FSItemTypeFile || type==FSItemTypeSymlink,ENOTSUP,"unsupported open inode type");
         if((modes&FSVolumeOpenModesWrite) && !it.writer){if(!fifo)[self writable];it.writer=[self json:fifo?@[@"inode-open",it.inode,@"r"]:@[@"inode-open",it.inode,@"rw,positioned-append"]][@"handle"];}
         if((modes&FSVolumeOpenModesRead) && !it.reader && !it.writer)it.reader=[self json:@[@"inode-open",it.inode,@"r"]][@"handle"];
     }];reply(e);

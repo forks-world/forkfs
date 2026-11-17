@@ -462,6 +462,29 @@ view/protection checks retain their existing precedence. Native FIFO open
 descriptions retain the metadata pin in the existing reader/writer lifecycle
 slots as needed; the kernel owns stream I/O.
 
+Directory metadata pins use `OpenOptions::directory` or
+`fs-open PATH r,directory`; this explicit option accepts only read access and
+cannot be combined with create, exclusive, truncate, append, positioned append,
+FIFO, or symlink options. `nofollow` is allowed. Ordinary file opens continue to
+reject directories with `EISDIR`. `inode-open INODE r` detects a directory and
+creates the same metadata pin automatically; the FSKit `RevisionVolume` reader
+slot uses it when a directory is opened for read, while write opens return
+`EISDIR` and a zero-mode open creates no pin.
+
+The pin exposes live directory attributes and xattrs without a directory byte
+stream. After `rmdir` or rename replacement, an open pin keeps the old inode's
+metadata and xattrs separate from a new entry at the same path. Its reported
+link count remains 2, matching the APFS reference probe; last close releases the
+orphan metadata. Directory reads and size setattrs return `EISDIR`; writes
+through a read-only pin return `EBADF`. Daemon handle seek and seek-region
+return `ENOTSUP` by this metadata-pin API contract; this does not claim native
+APFS operations return the same errors. Revision pins remain read-only. These
+results cover Namespace, RPC, and direct or loopback FSKit callback tests only.
+The candidate extension has not been signed, installed, or mounted; no native
+`openat`, `readdir`, or `fchdir` behavior for removed directories is promised. See the
+[directory metadata pin validation](../docs/evidence/2026-11-17-directory-metadata-pins.json)
+for the exact tested tree, baseline callback regression and APFS reference.
+
 Unix-domain socket pathname nodes use `fs-mksocket PATH [OCTAL_MODE]` or the
 session-scoped `inode-mksocket PARENT NAME DECIMAL_MODE` operation. The default
 mode is `0777`. They have inode type tag 6 and are serialized with the

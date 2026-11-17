@@ -1,0 +1,109 @@
+{
+  "feature": "Directory metadata pins across rmdir and rename replacement",
+  "base_sha": "64d5bbd1981d041209850a41bbd85d7dae3ca065",
+  "tested_candidate_tree": "073542fba7c93e09a9956c37efdf47c360a563cd",
+  "environment": {
+    "os": "ProductName:\t\tmacOS\nProductVersion:\t\t27.2.1\nBuildVersion:\t\t26B131",
+    "arch": "arm64",
+    "sdk": "27.2",
+    "compiler": "Apple clang version 21.0.0 (clang-2100.4.1.1)\nTarget: arm64-apple-darwin27.2.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin"
+  },
+  "host_filesystem": {
+    "FilesystemType": "apfs",
+    "FilesystemName": "APFS",
+    "MountPoint": "/System/Volumes/Data"
+  },
+  "configuration": "Release WFS_FSKIT=ON clean-first; Apple Clang SDK toolchain",
+  "isolation": "No Git, host home, credentials, keychains or external network; readonly archived source; separate writable build/home/tmp",
+  "validation": {
+    "ctest": {
+      "passed": 84,
+      "failed": 0,
+      "duration_seconds": 131.25
+    },
+    "system_dependencies": {
+      "forkfsd": 2,
+      "ForkFSExtension": 7,
+      "ForkFSHost": 4
+    },
+    "audit_sha256": "9fedbe71e4b6ba50f005547bd798f3040cf3c772c1794beeccee7a98460985c1",
+    "log_sha256": {
+      "validate.log": "2a80cf4e0cfae41698345731d45292e92e905053e22e97131b1dc9e740db3f61",
+      "LastTest.log": "2845a63516fcd66e55fa2934ab1891865c8b9a41bed0c7f169f961ce6ed1be74",
+      "baseline-bridge-final.log": "7f0fc4b1bee7747e7765f8280851b6451a49761561649f55f81fe5277a3a12cc",
+      "apfs-reference.json": "7e1634aec65e52e5ab200079f18f9de248e5053b08eb0b3f3f2b5d21b6dc163e"
+    },
+    "source_files_sha256": {
+      "daemon/CMakeLists.txt": "2f5f36a8d67e25bafc4672f8fce550003255f875965f5f63cf3bdd51cb603e58",
+      "daemon/namespace.cpp": "a3728f6848be2e5a8e0e15e20023b76aba367949ac456d2c68cd0299ade315a1",
+      "daemon/namespace.h": "6a4a24b0d2f474e7d75d8f13ab5dae8f2cf7032fd02706633dd35c6e13e2e716",
+      "daemon/rpc.cpp": "165d13692a2fd92d830e90bc1a8eb2130f536be477ec20e5aaff6a7d06981b16",
+      "daemon/tests/symlink_handles.py": "154ab809b21948bde30a7bdbb73b12f6334a2b7ce31547933fe7b56f744a8fc7",
+      "macos/forkfs/RevisionVolume.mm": "cb86561288f9e6e442b9d73c70567b830175bad49916fc61efefbd243c5927ac",
+      "macos/forkfs/tests/BridgeTest.mm": "ac7bce532a729fc1495888e12ea98677d54e63f748d185d2513f27613910e834",
+      "daemon/tests/directory_handles_rpc.py": "b64a87bff9b43d38b5416d7d9f13f7078a337c61026b64dc899a8cbd58f1e5be",
+      "daemon/tests/directory_metadata_handles.cpp": "d78ececc89ca2a53d11984d50c2599296297281ee8f552bfc1cdd70b9eb2e168"
+    },
+    "source_verification": [
+      {
+        "revision": "073542fba7c93e09a9956c37efdf47c360a563cd",
+        "verified_files": 318,
+        "content_manifest_sha256": "bb3939e5a9e516576681b84988343fd10ab0b7def8061ace26b08d5c4a82100f"
+      },
+      {
+        "revision": "99b3c03b3284f5886f9ef9a4ef703d57373e61be",
+        "verified_files": 152,
+        "content_manifest_sha256": "7f813af409a3323c0e1f1f3881737c739a59e52114f57640da1ab5b608966d4a"
+      }
+    ]
+  },
+  "baseline_callback": {
+    "base": "64d5bbd1981d041209850a41bbd85d7dae3ca065",
+    "only_source_override": "macos/forkfs/tests/BridgeTest.mm",
+    "test_sha256": "ac7bce532a729fc1495888e12ea98677d54e63f748d185d2513f27613910e834",
+    "old_adapter_and_rpc_source_verified_against_base": true,
+    "expected_exit": 1,
+    "failure": "open directory lost xattrs after rmdir",
+    "baseline_daemon_sha256": "e5f311fa9a701d2b1bfea6fc8bbf518ca6e7a3ef9d8fb5569e324f2532b73252"
+  },
+  "apfs_reference": {
+    "filesystem": "APFS",
+    "cases": [
+      {
+        "operation": "rmdir",
+        "before_links": 2,
+        "removed_links": 2,
+        "same_inode_after_dup": true,
+        "replacement_distinct_inode": true,
+        "fchmod_errno": 0,
+        "fd_mode": 449,
+        "xattr_get_errno": 0,
+        "xattr_before_edit": "old",
+        "xattr_set_errno": 0,
+        "old_fd_xattr_after_path_reuse": "after"
+      },
+      {
+        "operation": "rename-replacement",
+        "before_links": 2,
+        "removed_links": 2,
+        "same_inode_after_dup": true,
+        "replacement_distinct_inode": true,
+        "fchmod_errno": 0,
+        "fd_mode": 449,
+        "xattr_get_errno": 0,
+        "xattr_before_edit": "old",
+        "xattr_set_errno": 0,
+        "old_fd_xattr_after_path_reuse": "after"
+      }
+    ]
+  },
+  "scope": {
+    "namespace": "Modern LevelDB handles, including retained-tree and original flat-key directory orphan layouts. Legacy single-file handles remain unsupported.",
+    "cpp_and_rpc": "rmdir and rename replacement retain old directory inode/mode/xattrs with link count 2; pathname reuse and readonly revisions remain isolated; dup/final-close cleanup and byte-I/O/attribute guards covered.",
+    "direct_and_loopback_fskit_callbacks": "Directory read open, rmdir, xattr reads/updates, mode and size guards, pathname reuse, close and reclaim. Rename replacement is covered in C++/RPC, not a new native callback acceptance claim.",
+    "metadata_pin_seek": "ENOTSUP is a daemon metadata-handle contract; no APFS/native directory seek errno claim.",
+    "candidate_signed_installed_or_mounted": false,
+    "removed_directory_openat_readdir_fchdir": "not qualified by this change"
+  },
+  "remote_ci": "not yet run at time of local validation"
+}

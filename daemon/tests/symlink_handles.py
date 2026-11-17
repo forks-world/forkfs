@@ -34,7 +34,9 @@ with tempfile.TemporaryDirectory(prefix='ff-linkhandle-',dir='/tmp') as tmp:
     proc=start()
     try:
         session=obj('session-open',60000)['session'];sel=('--session',session);rid=obj('inode-root',*sel)['inode']['inode_id'];lid=obj('inode-lookup',rid,'link',*sel)['inode_id']
-        rpc('inode-open',rid,'r',*sel,code=errno.EISDIR+1)
+        directory_pin=obj('inode-open',rid,'r',*sel)['handle'];directory_attrs=obj('fs-hstat',directory_pin,*sel)
+        assert directory_attrs['inode_id']==rid and directory_attrs['directory'] and directory_attrs['links']==2
+        rpc('fs-hread',directory_pin,'0','0',*sel,code=errno.EISDIR+1);rpc('fs-close',directory_pin,*sel)
         handle=obj('inode-open',lid,'rw',*sel)['handle'];assert obj('fs-hstat',handle,*sel)['symlink']
         for fields in [('fs-hread',handle,0,1),('fs-hread-next',handle,0),('fs-hwrite',handle,0,b'x'),('fs-hwrite-next',handle,b''),('fs-htruncate',handle,0)]:rpc(*fields,*sel,code=1)
         assert rpc('fs-cat','/file')==b'target'
