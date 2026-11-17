@@ -1557,6 +1557,11 @@ Commands use inode identities, never host World paths: `inode-lookup PARENT NAME
 `inode-space`, and `inode-sync`. All require `--session`; the mount must keep the
 same World/revision selector. Inode RPC modes are decimal 0..1023 (octal
 0000..01777), including sticky; setuid, setgid and higher bits are rejected.
+`fs-hmkdir HANDLE NAME MODE` is the directory-handle variant for POSIX
+`mkdirat`: it creates under the inode owned by the open directory handle, even
+after rename; an unlinked directory handle returns `ENOENT`. `inode-mkdir`
+continues to resolve its parent by inode identity and reports an unlinked inode
+as `ESTALE`.
 Setattr publishes
 size/content, mode, metadata flags and mtime/atime/birth time in one synchronous transaction; handle size changes
 require writable access. Subsequent I/O uses the existing session-owned `fs-h*`

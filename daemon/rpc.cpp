@@ -145,6 +145,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="status" || op=="storage-profile" || op=="fs-init" || op=="fs-check" || op=="fs-worlds" || op=="fs-revisions" || op=="fs-compact" || op=="fs-volume-name")count=1;
     if(op=="fs-write" || op=="fs-save" || op=="fs-clone-file" || op=="fs-rename" || op=="fs-rename-excl" || op=="fs-exchange" || op=="fs-link" || op=="fs-fork" || op=="fs-restore" || op=="fs-append" || op=="fs-truncate" || op=="fs-open" || op=="fs-happend" || op=="fs-htruncate" || op=="fs-hread-next" || op=="fs-hwrite-next" || op=="fs-symlink" || op=="fs-chmod" || op=="fs-lchmod" || op=="fs-setmtime" || op=="fs-hchmod" || op=="fs-hsetmtime" || op=="fs-dir-page" || op=="fs-dir-entries" || op=="fs-hlock")count=3;
     if(op=="fs-read-at" || op=="fs-write-at" || op=="fs-hread" || op=="fs-hwrite" || op=="fs-hwriteback" || op=="fs-hseek" || op=="fs-hrange-lock" || op=="fs-punch-hole" || op=="fs-hpunch-hole")count=4;
+    if(op=="fs-hmkdir")count=4;
     if(op=="fs-history")count=4;
     if(op=="inode-root" || op=="inode-sync" || op=="inode-space")count=1;
     if(op=="inode-stat" || op=="inode-dir-open" || op=="inode-readlink")count=2;
@@ -205,6 +206,9 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     sessions.authorize(session_token,view,revision,!reads.contains(op));
     if(op.starts_with("inode-") && op!="inode-root")sessions.mount_require(session_token,view,revision);
     Namespace fs(store,view,revision);
+    if(op=="fs-hmkdir") {
+        return inode_json(fs.handle_mkdir(args[1],args[2],number(args[3])))+"\n";
+    }
     // RPC dispatch is serial. Resolve inode identities and mutate under the same
     // dispatch turn; another RPC cannot retarget the path between these steps.
     auto child=[&](const std::string& parent,const std::string& name) {
