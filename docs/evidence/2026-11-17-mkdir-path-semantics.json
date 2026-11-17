@@ -1,0 +1,301 @@
+{
+  "feature": "APFS-style mkdir physical trailing-link resolution and typed failures",
+  "base_sha": "64d5bbd1981d041209850a41bbd85d7dae3ca065",
+  "tested_candidate_tree": "5faaec56dff132774646d4dd1249cb34d7ba976d",
+  "environment": {
+    "os": "ProductName:\t\tmacOS\nProductVersion:\t\t27.2.1\nBuildVersion:\t\t26B131",
+    "arch": "arm64",
+    "sdk": "27.2",
+    "compiler": "Apple clang version 21.0.0 (clang-2100.4.1.1)\nTarget: arm64-apple-darwin27.2.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin"
+  },
+  "filesystem": "apfs",
+  "configuration": "Release WFS_FSKIT=ON clean-first; Apple Clang SDK toolchain",
+  "isolation": "No Git, host home, credentials, keychains or external network; readonly archived source; separate writable build/home/tmp",
+  "ctest": {
+    "passed": 82,
+    "failed": 0,
+    "duration_seconds": 129.99
+  },
+  "system_dependencies": {
+    "forkfsd": 2,
+    "ForkFSExtension": 7,
+    "ForkFSHost": 4
+  },
+  "audit_sha256": "02b467072e8ac219a29c13f4b86117c6d1f3ff3c7928a125ad3607fc49533f2d",
+  "source_files_sha256": {
+    "daemon/namespace.cpp": "f897c09a0a229361e1fd04939f0e9a8904fe11321e407b24ffeced924f29c9f8",
+    "daemon/tests/mkdir_trailing.cpp": "a3342bb8882298b87d4b4e2cd0633262edcb33ce845768306a80df4b9b56f42d",
+    "daemon/tests/namespace_errors.py": "6dee3c53c30797e5a2fe52b30814ac0aef3a5c6ee2b2cf437b404e2e2b5deed4",
+    "daemon/tests/rpc.py": "06efd9a6cb289741af02245af172b5b017262719ffbcc4bc8816c7b4546fccd9"
+  },
+  "source_verification": [
+    {
+      "revision": "5faaec56dff132774646d4dd1249cb34d7ba976d",
+      "verified_files": 316,
+      "content_manifest_sha256": "f1a269249c9f54e27b8e8e731dea1264b654e8b61a47f59d701eb40439e39b93"
+    },
+    {
+      "revision": "99b3c03b3284f5886f9ef9a4ef703d57373e61be",
+      "verified_files": 152,
+      "content_manifest_sha256": "7f813af409a3323c0e1f1f3881737c739a59e52114f57640da1ab5b608966d4a"
+    }
+  ],
+  "log_sha256": {
+    "validate.log": "a56564651f449874134e91d3681c581e14c30ba2c0b2365f0482f6f0278e2489",
+    "LastTest.log": "0e0b067b89d31584af51fbcbabb463c422ad7db894a8335022d14e1c34803be0",
+    "baseline-regression.log": "736687dcd905a343a1f404f683dc84f22603f8e8db168c27193ed04b6d137f20",
+    "baseline-new-rpc.log": "24003d3039761dc28c860e51ea2b9dfe0aaf777a3bd5c84df5beee6f673c3c89",
+    "apfs-reference.json": "729c9450ac1b8e48650f5d02d18fac2e458721acc46104ada5a3c367ba287a57",
+    "fixed-cli.json": "0ae1e34c2fcd87ced309efd7f53a96966cf03670fc84051b30b4f90d979442fe",
+    "focused.log": "eaf7272c0b0aba0c185df3478b0bbfdc41d389672b506067d48343bc692aadb8"
+  },
+  "baseline": {
+    "commit": "64d5bbd1981d041209850a41bbd85d7dae3ca065",
+    "daemon_sha256": "e5f311fa9a701d2b1bfea6fc8bbf518ca6e7a3ef9d8fb5569e324f2532b73252",
+    "dangling_link_slash": "mkdir /alias/ where alias -> /created-target returns exit1/path already exists; target stays absent and link/sequence unchanged",
+    "raw_rpc_root": "identical final namespace_errors.py expects EEXIST+1 for fs-mkdir /; unchanged baseline returns generic status1/cannot modify filesystem root"
+  },
+  "fixed_cli": [
+    {
+      "binary": "forkfsd",
+      "mkdir_alias_slash": "created physical target",
+      "mode": 493,
+      "symlink_identity_and_target_preserved": true,
+      "prior_revision_target_absent": true,
+      "namespace_check": "passed",
+      "physical_gc": "passed"
+    },
+    {
+      "binary": "forkfsd_legacy_test",
+      "mkdir_alias_slash": "created physical target",
+      "mode": 493,
+      "symlink_identity_and_target_preserved": true,
+      "prior_revision_target_absent": true,
+      "namespace_check": "passed",
+      "physical_gc": "not exercised for legacy backend"
+    }
+  ],
+  "apfs_reference": {
+    "filesystem": "APFS",
+    "fixture": "independent owned directory per case",
+    "cases": [
+      {
+        "path": "/",
+        "errno": 17,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "///",
+        "errno": 17,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "<scratch>",
+        "errno": 17,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "<scratch>///",
+        "errno": 17,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "dir",
+        "errno": 17,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "dir/",
+        "errno": 17,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "file",
+        "errno": 17,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "file/",
+        "errno": 20,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "ldir",
+        "errno": 17,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "ldir/",
+        "errno": 17,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "lfile",
+        "errno": 17,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "lfile/",
+        "errno": 20,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "dangling",
+        "errno": 17,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "dangling/",
+        "errno": 0,
+        "created_target_directories": [
+          "absent"
+        ],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "dangling/.",
+        "errno": 2,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "dangling/..",
+        "errno": 2,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "danglingslash/",
+        "errno": 0,
+        "created_target_directories": [
+          "absent-tail"
+        ],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "chain/",
+        "errno": 0,
+        "created_target_directories": [
+          "absent-tail"
+        ],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "relative/",
+        "errno": 0,
+        "created_target_directories": [
+          "relative-target"
+        ],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "dir/.",
+        "errno": 17,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "dir/..",
+        "errno": 17,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "dir/./",
+        "errno": 17,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "missing/.",
+        "errno": 2,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "missing/..",
+        "errno": 2,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "file/.",
+        "errno": 20,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "file/..",
+        "errno": 20,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "ldir/.",
+        "errno": 17,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "lfile/.",
+        "errno": 20,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "dir/../dir",
+        "errno": 17,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "missing/../new",
+        "errno": 2,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "file/../new",
+        "errno": 20,
+        "created_target_directories": [],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "new/",
+        "errno": 0,
+        "created_target_directories": [
+          "new"
+        ],
+        "symlinks_preserved": true
+      },
+      {
+        "path": "new///",
+        "errno": 0,
+        "created_target_directories": [
+          "new"
+        ],
+        "symlinks_preserved": true
+      }
+    ]
+  },
+  "scope": {
+    "namespace": "Modern and legacy backends; raw limits, physical terminal dot traversal, absolute/relative link chains, link identity, parent metadata/link counts and revision isolation",
+    "rpc": "Raw fs-mkdir now emits errno+1 for EEXIST, ENOENT and ENOTDIR when reached; other operation errors retain their existing contracts",
+    "native_fskit": "Existing inode-mkdir already used a string-to-errno mapper for common failures; this change does not qualify new native behavior",
+    "candidate_signed_installed_or_mounted": false
+  },
+  "remote_ci": "not yet run at time of local validation"
+}

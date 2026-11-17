@@ -952,10 +952,42 @@ void Namespace::set_volume_name(const std::string& name) {
 void Namespace::mkdir(const std::string& path,uint32_t mode) {
     need(mode<=supported_mode_bits,"invalid creation mode");
     update([&](const NamespaceView& j,Changes& c) {
-        auto p=parent(j,path,nullptr,true);need(!j.contains(p.key),"path already exists");
-        auto id=new_id(j);InodeInfo n=created({id,true,mode,2,0,now(),now()}),pn=inode(j,p.id);mutable_inode(pn);
-        link_capacity(pn.links);++pn.links;touch(pn);
-        c[p.key]=id_bytes(id);c[inode_key(id)]=encode(n);c[inode_key(p.id)]=encode(pn);c[allocated_key(id)]=Bytes{};
+        auto names=components(path,true);
+        const bool trailing=path.back()=='/';
+        if(trailing && !names.empty())names.pop_back(); // remove only components()' synthetic dot
+
+        auto existing_error=[] {throw std::system_error(EEXIST,std::generic_category(),"path already exists");};
+        auto make_directory=[&](const Parent& p) {
+            auto id=new_id(j);InodeInfo n=created({id,true,mode,2,0,now(),now()}),pn=inode(j,p.id);mutable_inode(pn);
+            link_capacity(pn.links);++pn.links;touch(pn);
+            c[p.key]=id_bytes(id);c[inode_key(id)]=encode(n);c[inode_key(p.id)]=encode(pn);c[allocated_key(id)]=Bytes{};
+        };
+
+        // Root and explicit terminal dot components name existing objects; they
+        // cannot be treated as a missing leaf even when an earlier component is absent.
+        if(names.empty() || names.back()=="." || names.back()=="..") {
+            (void)walk(j,names,names.size(),nullptr,true,nullptr,nullptr,nullptr,true);
+            existing_error();
+        }
+
+        if(trailing) {
+            // A slash follows the final link and requires its physical target to
+            // be a directory. Keeping the full walk local to mkdir lets a
+            // dangling final link create its missing target without changing
+            // shared mutation rules for root and dot entries.
+            Parent missing;
+            auto id=walk(j,names,names.size(),nullptr,true,&missing,nullptr,nullptr,true,true);
+            if(id.empty()) {
+                make_directory(missing);
+                return;
+            }
+            if(!inode(j,id).directory)throw std::system_error(ENOTDIR,std::generic_category(),"trailing slash requires a directory");
+            existing_error();
+        }
+
+        auto p=parent(j,path,nullptr,false,true);
+        if(j.contains(p.key))existing_error();
+        make_directory(p);
     });
 }
 void Namespace::mkfifo(const std::string& path,uint32_t mode) {
