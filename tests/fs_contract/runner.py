@@ -428,6 +428,11 @@ def run_contract(case_file: Path, coverage_file: Path, profile: str, report_path
     if profile not in {"reference", "daemon", "mounted"}:
         raise SchemaError(f"unknown profile {profile}")
     if profile == "daemon" and daemon is None: raise SchemaError("daemon profile requires --daemon")
+    # Workers run from the repository root. Keep paths anchored to the caller
+    # without resolving symlinks before the native mount checks.
+    daemon = Path(daemon).absolute() if daemon is not None else None
+    reference_root = Path(reference_root).absolute() if reference_root is not None else None
+    mountpoint = Path(mountpoint).absolute() if mountpoint is not None else None
     native_error = None
     try:
         native_info = _native_preflight(profile, reference_root, mountpoint, timeout) if profile != "daemon" else {}
