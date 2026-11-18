@@ -118,6 +118,7 @@ public:
     size_t handle_write_next(const std::string& handle,const std::vector<unsigned char>& value);
     void close(const std::string& handle);
     InodeInfo handle_stat(const std::string& handle) const;
+    InodeInfo handle_mkdir(const std::string& handle,const std::string& name,uint64_t mode=0777);
     std::vector<unsigned char> handle_read(const std::string& handle,uint64_t offset,uint64_t count) const;
     void handle_write(const std::string& handle,uint64_t offset,const std::vector<unsigned char>& value);
     void handle_writeback(const std::string& handle,uint64_t offset,const std::vector<unsigned char>& value);

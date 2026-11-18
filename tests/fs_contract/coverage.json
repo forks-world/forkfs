@@ -1,0 +1,1740 @@
+{
+  "schema_version": 1,
+  "families": {
+    "names": {
+      "case_ids": [
+        "component_name_byte_limit_255_and_256",
+        "directory_entry_names_preserve_quote_newline_and_unicode",
+        "path_dot_dot_physical_resolution"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_unicode_paths",
+          "layer": "rpc",
+          "script": "daemon/tests/unicode_paths.py",
+          "status": "not_run",
+          "scenarios": [
+            "Unicode path components and normalization-sensitive names"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "apfs_casefold_nfc_name_equivalence",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "The shared name cases check exact quote, newline, emoji and byte-length handling; they do not compare APFS case folding or NFC/NFD equivalence."
+        }
+      ]
+    },
+    "name_length": {
+      "case_ids": [
+        "component_name_byte_limit_255_and_256"
+      ],
+      "existing_external": [],
+      "missing_contracts": []
+    },
+    "type_errors": {
+      "case_ids": [
+        "file_directory_mismatch_and_trailing_slash",
+        "rename_directory_type_mismatch_is_atomic",
+        "terminal_dot_path_type_errors"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_namespace_errors",
+          "layer": "rpc",
+          "script": "daemon/tests/namespace_errors.py",
+          "status": "not_run",
+          "scenarios": [
+            "file and directory operation type mismatch errors"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "data": {
+      "case_ids": [
+        "append_adds_bytes_at_end",
+        "rename_preserves_inode_and_payload"
+      ],
+      "existing_external": [],
+      "missing_contracts": []
+    },
+    "metadata": {
+      "case_ids": [
+        "binary_xattr_create_replace_remove",
+        "chmod_and_utime_metadata_roundtrip",
+        "rename_preserves_inode_and_payload"
+      ],
+      "existing_external": [],
+      "missing_contracts": []
+    },
+    "path_resolution": {
+      "case_ids": [
+        "directory_entry_names_preserve_quote_newline_and_unicode",
+        "file_directory_mismatch_and_trailing_slash",
+        "mkdir_through_dangling_symlink_trailing_slash",
+        "mkdir_trailing_slash_succeeds",
+        "path_dot_dot_physical_resolution",
+        "terminal_dot_path_type_errors"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_trailing_paths_cpp",
+          "layer": "daemon_core",
+          "script": "daemon/tests/trailing_paths.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "physical component traversal through dot and dot-dot",
+            "symlink path resolution with trailing slash"
+          ]
+        },
+        {
+          "id": "daemon_trailing_paths_rpc",
+          "layer": "rpc",
+          "script": "daemon/tests/trailing_mutations_rpc.py",
+          "status": "not_run",
+          "scenarios": [
+            "RPC mutations with trailing slash and symlink aliases"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "mkdir": {
+      "case_ids": [
+        "mkdir_and_exclusive_create_conflicts",
+        "mkdir_through_dangling_symlink_trailing_slash",
+        "mkdir_trailing_slash_succeeds"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_mkdir_trailing",
+          "layer": "daemon_core",
+          "script": "daemon/tests/mkdir_trailing.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "mkdir trailing slash against existing entries and symlinks"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "create": {
+      "case_ids": [
+        "component_name_byte_limit_255_and_256",
+        "mkdir_and_exclusive_create_conflicts"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_create_probe",
+          "layer": "daemon_core",
+          "script": "daemon/tests/create_probe.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "batch create, reopen and snapshot benchmark; not an errno conformance probe"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "errno": {
+      "case_ids": [
+        "component_name_byte_limit_255_and_256",
+        "dangling_symlink_lstat_readlink_and_follow",
+        "mkdir_and_exclusive_create_conflicts",
+        "terminal_dot_path_type_errors"
+      ],
+      "existing_external": [],
+      "missing_contracts": []
+    },
+    "failure_atomicity": {
+      "case_ids": [
+        "binary_xattr_create_replace_remove",
+        "file_directory_mismatch_and_trailing_slash",
+        "mkdir_and_exclusive_create_conflicts",
+        "rename_directory_type_mismatch_is_atomic",
+        "rmdir_nonempty_rejected_without_changes",
+        "terminal_dot_path_type_errors"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_namespace_errors",
+          "layer": "rpc",
+          "script": "daemon/tests/namespace_errors.py",
+          "status": "not_run",
+          "scenarios": [
+            "typed namespace errors and no-publication-on-failure assertions"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "create_exclusive": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "daemon_file_flags",
+          "layer": "daemon_core",
+          "script": "daemon/tests/file_flags.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "O_CREAT and O_EXCL combinations and existing targets"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "trailing_slash": {
+      "case_ids": [
+        "file_directory_mismatch_and_trailing_slash",
+        "mkdir_through_dangling_symlink_trailing_slash",
+        "mkdir_trailing_slash_succeeds"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_trailing_mutations",
+          "layer": "rpc",
+          "script": "daemon/tests/trailing_mutations_rpc.py",
+          "status": "not_run",
+          "scenarios": [
+            "RPC rmdir and rename trailing-slash behavior, including aliases"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "symlink": {
+      "case_ids": [
+        "dangling_symlink_lstat_readlink_and_follow",
+        "mkdir_through_dangling_symlink_trailing_slash"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_symlinks_rpc",
+          "layer": "daemon_cli",
+          "script": "daemon/tests/symlinks.py",
+          "status": "not_run",
+          "scenarios": [
+            "symlink creation, lookup, dangling targets and link traversal"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "lstat": {
+      "case_ids": [
+        "dangling_symlink_lstat_readlink_and_follow"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_symlink_attributes",
+          "layer": "rpc",
+          "script": "daemon/tests/symlink_attributes.py",
+          "status": "not_run",
+          "scenarios": [
+            "lstat and no-follow symlink metadata"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "readlink": {
+      "case_ids": [
+        "dangling_symlink_lstat_readlink_and_follow"
+      ],
+      "existing_external": [],
+      "missing_contracts": []
+    },
+    "dangling": {
+      "case_ids": [
+        "dangling_symlink_lstat_readlink_and_follow"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_symlinks",
+          "layer": "daemon_cli",
+          "script": "daemon/tests/symlinks.py",
+          "status": "not_run",
+          "scenarios": [
+            "dangling symlink create, lstat, readlink and failed follow"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "rename": {
+      "case_ids": [
+        "rename_directory_type_mismatch_is_atomic",
+        "rename_preserves_inode_and_payload"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_namespace_rename",
+          "layer": "daemon_cli",
+          "script": "daemon/tests/namespace.py",
+          "status": "not_run",
+          "scenarios": [
+            "ordinary file and directory rename behavior"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "rename_exchange",
+          "layer": "rpc",
+          "profiles": [
+            "daemon"
+          ],
+          "mandatory": false,
+          "reason": "RENAME_SWAP is a daemon extension and has no shared native syscall mapping in this contract."
+        },
+        {
+          "id": "rename_overwrite_identity",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "Initial shared cases cover simple rename and type mismatch, not replacement of an existing file or nonempty directory."
+        },
+        {
+          "id": "rename_overwrite_identity_rpc",
+          "layer": "rpc",
+          "profiles": [
+            "daemon"
+          ],
+          "mandatory": false,
+          "reason": "The first RPC contract cases do not cover ordinary rename replacement of an existing file or nonempty directory."
+        }
+      ]
+    },
+    "identity": {
+      "case_ids": [
+        "hardlink_unlink_link_count",
+        "open_directory_rmdir_retains_identity",
+        "open_unlink_path_reuse_keeps_old_inode",
+        "path_dot_dot_physical_resolution",
+        "rename_preserves_inode_and_payload"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_inode_rpc",
+          "layer": "rpc",
+          "script": "daemon/tests/inode_rpc.py",
+          "status": "not_run",
+          "scenarios": [
+            "inode identity and namespace mutation across inode RPC handles"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "hardlink": {
+      "case_ids": [
+        "hardlink_unlink_link_count"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_hardlink_namespace",
+          "layer": "daemon_cli",
+          "script": "daemon/tests/namespace.py",
+          "status": "not_run",
+          "scenarios": [
+            "hard-link namespace creation and removal"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "unlink": {
+      "case_ids": [
+        "hardlink_unlink_link_count",
+        "open_unlink_path_reuse_keeps_old_inode"
+      ],
+      "existing_external": [],
+      "missing_contracts": []
+    },
+    "nlink": {
+      "case_ids": [
+        "hardlink_unlink_link_count"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_hardlink_limits",
+          "layer": "daemon_core",
+          "script": "daemon/tests/link_limits.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "hard-link count limits and link metadata"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "rmdir": {
+      "case_ids": [
+        "open_directory_rmdir_retains_identity",
+        "rmdir_nonempty_rejected_without_changes"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_directories",
+          "layer": "rpc",
+          "script": "daemon/tests/directories.py",
+          "status": "not_run",
+          "scenarios": [
+            "directory creation, removal, and nonempty-directory rejection"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "nonempty_directory": {
+      "case_ids": [
+        "rmdir_nonempty_rejected_without_changes"
+      ],
+      "existing_external": [],
+      "missing_contracts": []
+    },
+    "binary_io": {
+      "case_ids": [
+        "append_adds_bytes_at_end",
+        "binary_pread_pwrite_and_sparse_hole",
+        "truncate_shrink_grow_zero_fills"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_file_io",
+          "layer": "daemon_core",
+          "script": "daemon/tests/file_io.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "offset reads and writes, sparse zero fill, truncation and append"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "pread_pwrite": {
+      "case_ids": [
+        "binary_pread_pwrite_and_sparse_hole"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_rpc_file_io",
+          "layer": "rpc",
+          "script": "daemon/tests/rpc.py",
+          "status": "not_run",
+          "scenarios": [
+            "RPC offset writes and reads, including zero-filled gaps"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "sparse_file": {
+      "case_ids": [
+        "binary_pread_pwrite_and_sparse_hole"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_large_files",
+          "layer": "daemon_core",
+          "script": "daemon/tests/large_files.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "large sparse logical files and bounded offset IO"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "holes": {
+      "case_ids": [
+        "binary_pread_pwrite_and_sparse_hole"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_hole_punch",
+          "layer": "daemon_core",
+          "script": "daemon/tests/hole_punch.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "hole punching and sparse allocation behavior"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "truncate": {
+      "case_ids": [
+        "truncate_shrink_grow_zero_fills"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_file_io",
+          "layer": "daemon_core",
+          "script": "daemon/tests/file_io.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "truncate shrinking, growth, and extension zero fill"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "size": {
+      "case_ids": [
+        "truncate_shrink_grow_zero_fills"
+      ],
+      "existing_external": [],
+      "missing_contracts": []
+    },
+    "zero_fill": {
+      "case_ids": [
+        "truncate_shrink_grow_zero_fills"
+      ],
+      "existing_external": [],
+      "missing_contracts": []
+    },
+    "append": {
+      "case_ids": [
+        "append_adds_bytes_at_end"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_append_flags",
+          "layer": "daemon_core",
+          "script": "daemon/tests/append_flags.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "append semantics and interaction with descriptor offsets"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "concurrent_append_atomicity",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "This first deterministic DSL has no concurrency scheduling operation; concurrent multi-process append records remain outside its contract."
+        }
+      ]
+    },
+    "fd_lifetime": {
+      "case_ids": [
+        "directory_handle_relative_create_survives_rename_and_path_reuse",
+        "dup_shares_open_description_offset",
+        "open_directory_rmdir_retains_identity",
+        "open_unlink_path_reuse_keeps_old_inode"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_handles",
+          "layer": "daemon_core",
+          "script": "daemon/tests/handles.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "open handle lifecycle and orphaned inode operations"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "dup": {
+      "case_ids": [
+        "dup_shares_open_description_offset"
+      ],
+      "existing_external": [],
+      "missing_contracts": []
+    },
+    "shared_offset": {
+      "case_ids": [
+        "dup_shares_open_description_offset"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_handle_offsets",
+          "layer": "daemon_core",
+          "script": "daemon/tests/handles.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "duplicated handle cursor sharing and close behavior"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "close": {
+      "case_ids": [
+        "dup_shares_open_description_offset"
+      ],
+      "existing_external": [],
+      "missing_contracts": []
+    },
+    "path_reuse": {
+      "case_ids": [
+        "directory_handle_relative_create_survives_rename_and_path_reuse",
+        "open_unlink_path_reuse_keeps_old_inode"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_open_unlink_crash",
+          "layer": "daemon_cli",
+          "script": "daemon/tests/handles_crash.py",
+          "status": "not_run",
+          "scenarios": [
+            "open-unlink and replacement survival across daemon restart"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "directory_metadata_fd": {
+      "case_ids": [
+        "open_directory_rmdir_retains_identity"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_directory_metadata_handles",
+          "layer": "daemon_core",
+          "script": "daemon/tests/directory_metadata_handles.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "open directory metadata pin, rmdir, retained identity and final close"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "native_directory_fd_removed_openat",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "The shared case only checks fstat identity after rmdir; openat and readdir through a removed directory descriptor are not included."
+        }
+      ]
+    },
+    "directory_fd_identity": {
+      "case_ids": [
+        "directory_handle_relative_create_survives_rename_and_path_reuse"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_directory_handles_rpc",
+          "layer": "rpc",
+          "script": "daemon/tests/directory_handles_rpc.py",
+          "status": "not_run",
+          "scenarios": [
+            "directory metadata handle retained through rmdir and path reuse, including attributes and xattrs"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "native_removed_directory_openat",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "The shared case checks mkdirat through a renamed directory descriptor and ENOENT after removal; it does not exercise every openat/fstatat/linkat/unlinkat variant."
+        }
+      ]
+    },
+    "mkdir_at": {
+      "case_ids": [
+        "directory_handle_relative_create_survives_rename_and_path_reuse"
+      ],
+      "existing_external": [],
+      "missing_contracts": []
+    },
+    "modes_times": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "daemon_attributes",
+          "layer": "daemon_cli",
+          "script": "daemon/tests/attributes.py",
+          "status": "not_run",
+          "scenarios": [
+            "chmod and set/get inode attributes"
+          ]
+        },
+        {
+          "id": "daemon_times",
+          "layer": "daemon_cli",
+          "script": "daemon/tests/times.py",
+          "status": "not_run",
+          "scenarios": [
+            "nanosecond atime and mtime updates"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "chmod": {
+      "case_ids": [
+        "chmod_and_utime_metadata_roundtrip"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_attributes_chmod",
+          "layer": "daemon_cli",
+          "script": "daemon/tests/attributes.py",
+          "status": "not_run",
+          "scenarios": [
+            "chmod mode update and observed inode attributes"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "times": {
+      "case_ids": [
+        "chmod_and_utime_metadata_roundtrip"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_times",
+          "layer": "daemon_cli",
+          "script": "daemon/tests/times.py",
+          "status": "not_run",
+          "scenarios": [
+            "nanosecond atime and mtime updates"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "stat": {
+      "case_ids": [
+        "chmod_and_utime_metadata_roundtrip"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_attributes_stat",
+          "layer": "daemon_cli",
+          "script": "daemon/tests/attributes.py",
+          "status": "not_run",
+          "scenarios": [
+            "path stat attribute results"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "xattr": {
+      "case_ids": [
+        "binary_xattr_create_replace_remove"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_xattr_rpc",
+          "layer": "rpc",
+          "script": "daemon/tests/xattr_rpc.py",
+          "status": "not_run",
+          "scenarios": [
+            "binary xattr set, get, replace and remove through RPC"
+          ]
+        },
+        {
+          "id": "daemon_xattrs_cpp",
+          "layer": "daemon_core",
+          "script": "daemon/tests/xattrs.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "xattr value lifecycle and inode metadata"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "nofollow_xattr",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "The initial common xattr operation targets a regular file; symlink no-follow xattr behavior is not represented."
+        }
+      ]
+    },
+    "binary_xattr": {
+      "case_ids": [
+        "binary_xattr_create_replace_remove"
+      ],
+      "existing_external": [],
+      "missing_contracts": []
+    },
+    "snapshot": {
+      "case_ids": [
+        "rpc_snapshot_read_only_isolation"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_revision_only",
+          "layer": "daemon_cli",
+          "script": "daemon/tests/revision_only.py",
+          "status": "not_run",
+          "scenarios": [
+            "read-only revision selection and rejected writes"
+          ]
+        },
+        {
+          "id": "daemon_rpc_revisions",
+          "layer": "rpc",
+          "script": "daemon/tests/rpc.py",
+          "status": "not_run",
+          "scenarios": [
+            "snapshot creation and current versus historical revision reads"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "native_snapshot",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "Snapshots and revision selectors are daemon-specific and are intentionally not mapped to native POSIX behavior."
+        }
+      ]
+    },
+    "revision_isolation": {
+      "case_ids": [
+        "rpc_snapshot_read_only_isolation"
+      ],
+      "existing_external": [],
+      "missing_contracts": []
+    },
+    "rpc_extension": {
+      "case_ids": [
+        "rpc_snapshot_read_only_isolation",
+        "sync_restart_persistence"
+      ],
+      "existing_external": [],
+      "missing_contracts": []
+    },
+    "sync": {
+      "case_ids": [
+        "sync_restart_persistence"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_sync_crash",
+          "layer": "daemon_cli",
+          "script": "daemon/tests/file_io_crash.py",
+          "status": "not_run",
+          "scenarios": [
+            "sync and committed state observation across process failure"
+          ]
+        },
+        {
+          "id": "native_fsync_contract",
+          "layer": "posix",
+          "script": "scripts/tests/sync_mount.py",
+          "status": "not_run",
+          "scenarios": [
+            "file/metadata fsync, directory create/link/rename fsync, renamed-directory fd, atomic save, replaced fd, and clean-sync publication"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "native_sync_durability",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "The first contract does not define a power-loss model or crash point for fsync/fdatasync durability."
+        }
+      ]
+    },
+    "restart": {
+      "case_ids": [
+        "sync_restart_persistence"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_staged_crash",
+          "layer": "daemon_cli",
+          "script": "daemon/tests/staged_crash.py",
+          "status": "not_run",
+          "scenarios": [
+            "daemon restart and persistence after staged transaction termination"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "persistence": {
+      "case_ids": [
+        "sync_restart_persistence"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_journal",
+          "layer": "daemon_cli",
+          "script": "daemon/tests/journal.py",
+          "status": "not_run",
+          "scenarios": [
+            "journal reopen and persistence checks"
+          ]
+        }
+      ],
+      "missing_contracts": []
+    },
+    "mmap": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "native_mmap_qualification",
+          "layer": "posix",
+          "script": "scripts/tests/filesystem_compat.py",
+          "status": "not_run",
+          "scenarios": [
+            "mapped_io: MAP_SHARED/MAP_PRIVATE and readonly mappings, pread/pwrite coherence, msync and unlink mappings"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "mmap_contract",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "There is no mmap, msync, munmap, or mapping protection operation in the first closed DSL."
+        }
+      ]
+    },
+    "locking": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "native_advisory_lock_qualification",
+          "layer": "posix",
+          "script": "scripts/tests/locking_mount.py",
+          "status": "not_run",
+          "scenarios": [
+            "flock and lockf child-process conflict, release, blocking and interruption cases"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "advisory_locks",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "The DSL has no flock or fcntl lock operations; RPC locks would not establish native advisory lock semantics."
+        }
+      ]
+    },
+    "readdir": {
+      "case_ids": [
+        "directory_entry_names_preserve_quote_newline_and_unicode"
+      ],
+      "existing_external": [
+        {
+          "id": "native_directory_streams",
+          "layer": "posix",
+          "script": "scripts/tests/directory_scale_mount.py",
+          "status": "not_run",
+          "scenarios": [
+            "opendir/readdir full set and telldir/seekdir backwards resume"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "directory_stream_contract",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "listdir checks names only; it does not exercise directory streams, cookies, ordering guarantees, or descriptor-relative stream behavior."
+        }
+      ]
+    },
+    "statfs": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "native_statfs_qualification",
+          "layer": "posix",
+          "script": "scripts/tests/volume_capacity_mount.py",
+          "status": "not_run",
+          "scenarios": [
+            "fd/path statfs64, statvfs and pathconf volume geometry agreement"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "volume_statistics",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "No statfs/statvfs/pathconf operation or fixed capacity contract is in this harness version."
+        }
+      ]
+    },
+    "flags": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "daemon_rpc_open_flags",
+          "layer": "rpc",
+          "script": "daemon/tests/rpc.py",
+          "status": "not_run",
+          "scenarios": [
+            "resident RPC fs-open handle/flag cases; exact command arguments are in the rpc.py scenario"
+          ]
+        },
+        {
+          "id": "native_append_flag_interactions",
+          "layer": "posix",
+          "script": "scripts/tests/filesystem_compat.py",
+          "status": "not_run",
+          "scenarios": [
+            "append worker: lseek and O_APPEND interaction, concurrent append records, and Darwin pwrite behavior"
+          ]
+        },
+        {
+          "id": "native_open_flag_matrix",
+          "layer": "posix",
+          "script": "scripts/tests/filesystem_compat.py",
+          "status": "not_run",
+          "scenarios": [
+            "open-flags worker: O_CREAT/O_EXCL/O_TRUNC/O_NOFOLLOW/O_DIRECTORY failures, dangling-link create, truncate identity, and umask"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "full_open_flag_matrix",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "Initial cases exercise read/write/directory flags and create exclusive as relevant; O_NOFOLLOW, O_TRUNC, O_APPEND descriptor semantics, and the complete invalid flag matrix remain uncovered."
+        },
+        {
+          "id": "full_open_flag_matrix_rpc",
+          "layer": "rpc",
+          "profiles": [
+            "daemon"
+          ],
+          "mandatory": false,
+          "reason": "The initial RPC open cases do not cover O_NOFOLLOW, O_TRUNC, O_APPEND descriptor interactions, or the complete invalid flag matrix."
+        }
+      ]
+    },
+    "permissions": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "native_permission_checks",
+          "layer": "posix",
+          "script": "scripts/tests/filesystem_compat.py",
+          "status": "not_run",
+          "scenarios": [
+            "permissions worker: current-user open/access mode checks, directory search/write denials, and already-open fd after chmod"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "permission_enforcement",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "The DSL does not control uid/gid credentials or assert access denial based on permission bits; chmod metadata roundtrip alone is not permission enforcement."
+        }
+      ]
+    },
+    "concurrency": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "daemon_concurrent_append",
+          "layer": "daemon_core",
+          "script": "daemon/tests/file_io.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "multi-thread concurrent append records remain atomic"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "concurrent_namespace_and_io",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "The sequential case runner has no concurrent actors or synchronization primitives."
+        },
+        {
+          "id": "concurrent_namespace_and_io_rpc",
+          "layer": "rpc",
+          "profiles": [
+            "daemon"
+          ],
+          "mandatory": false,
+          "reason": "The sequential case runner has no concurrent actors or synchronization primitives for RPC operations."
+        }
+      ]
+    },
+    "crash_durability": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "daemon_crash_recovery",
+          "layer": "daemon_cli",
+          "script": "daemon/tests/file_io_crash.py",
+          "status": "not_run",
+          "scenarios": [
+            "daemon termination at staged file IO and reopen state checks"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "power_loss_durability_model",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "Process restart does not simulate device power loss or specify durable ordering for directory entries and file contents."
+        }
+      ]
+    },
+    "fifo_socket": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "daemon_fifo",
+          "layer": "rpc",
+          "script": "daemon/tests/fifo_rpc.py",
+          "status": "not_run",
+          "scenarios": [
+            "FIFO RPC type metadata and unsupported open behavior"
+          ]
+        },
+        {
+          "id": "daemon_socket",
+          "layer": "rpc",
+          "script": "daemon/tests/socket_rpc.py",
+          "status": "not_run",
+          "scenarios": [
+            "socket node metadata and namespace operations"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "fifo_and_socket_nodes",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "Fixtures and operations cover regular files, directories and symlinks only; FIFO and socket creation/open behavior is not in the DSL."
+        }
+      ]
+    },
+    "flags_metadata": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "daemon_append_flags",
+          "layer": "daemon_core",
+          "script": "daemon/tests/append_flags.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "append-only inode flag and append mutation behavior"
+          ]
+        },
+        {
+          "id": "daemon_immutable_flags",
+          "layer": "daemon_core",
+          "script": "daemon/tests/immutable.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "immutable inode flag blocks protected namespace and content mutations"
+          ]
+        },
+        {
+          "id": "native_append_flags",
+          "layer": "posix",
+          "script": "scripts/tests/append_flags_mount.py",
+          "status": "not_run",
+          "scenarios": [
+            "mounted append-only inode flag and write behavior"
+          ]
+        },
+        {
+          "id": "native_append_only_flags",
+          "layer": "posix",
+          "script": "scripts/tests/append_flags_mount.py",
+          "status": "not_run",
+          "scenarios": [
+            "append-only file and directory mutation restrictions"
+          ]
+        },
+        {
+          "id": "native_file_flags",
+          "layer": "posix",
+          "script": "scripts/tests/file_flags_mount.py",
+          "status": "not_run",
+          "scenarios": [
+            "hidden/nodump path/fd/nofollow and metadata flag behavior"
+          ]
+        },
+        {
+          "id": "native_immutable_flags",
+          "layer": "posix",
+          "script": "scripts/tests/immutable_mount.py",
+          "status": "not_run",
+          "scenarios": [
+            "mounted immutable inode flag and protected mutation behavior"
+          ]
+        },
+        {
+          "id": "native_immutable_flags",
+          "layer": "posix",
+          "script": "scripts/tests/immutable_mount.py",
+          "status": "not_run",
+          "scenarios": [
+            "immutable flag protected namespace/content mutation behavior"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "inode_flags",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "Immutable and append-only file flags are outside the initial chmod/time metadata operations."
+        },
+        {
+          "id": "inode_flags_rpc",
+          "layer": "rpc",
+          "profiles": [
+            "daemon"
+          ],
+          "mandatory": false,
+          "reason": "Immutable and append-only file flags are outside the initial RPC chmod/time operations."
+        }
+      ]
+    },
+    "rename_exclusive_exchange": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "daemon_exchange",
+          "layer": "rpc",
+          "script": "daemon/tests/exchange_rpc.py",
+          "status": "not_run",
+          "scenarios": [
+            "daemon atomic directory-entry exchange"
+          ]
+        },
+        {
+          "id": "daemon_rename_exclusive",
+          "layer": "rpc",
+          "script": "daemon/tests/rename_exclusive_rpc.py",
+          "status": "not_run",
+          "scenarios": [
+            "daemon exclusive rename target conflict and success"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "native_rename_flags",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "Exclusive and exchange rename are daemon extensions and are not represented as portable POSIX rename operations."
+        }
+      ]
+    },
+    "allocation_blocks": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "native_allocation_mount",
+          "layer": "posix",
+          "script": "scripts/tests/allocation_mount.py",
+          "status": "not_run",
+          "scenarios": [
+            "forkfs mount st_blocks/allocated_size agreement for sparse writes, hardlinks, orphan edits, truncation, GC and retained revisions; candidate mount only"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "st_blocks_contract",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "The DSL has no stat.st_blocks or allocated_size assertion. Logical zero-fill tests do not prove physical allocation accounting or APFS reference behavior."
+        }
+      ]
+    },
+    "seek": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "native_lseek_openflags",
+          "layer": "posix",
+          "script": "scripts/tests/filesystem_compat.py",
+          "status": "not_run",
+          "scenarios": [
+            "open-flags/append workers: lseek cursor positioning, O_APPEND cursor behavior, and Darwin pwrite interaction"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "lseek_cursor_errno_contract",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "The DSL has no lseek operation, so cursor positioning errors, SEEK_SET/CUR/END, and failure cursor invariance are not checked."
+        }
+      ]
+    },
+    "seek_regions": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "daemon_seek_regions",
+          "layer": "daemon_core",
+          "script": "daemon/tests/seek_regions.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "Namespace sparse seek-region queries and extent boundary behavior"
+          ]
+        },
+        {
+          "id": "native_seek_regions",
+          "layer": "posix",
+          "script": "scripts/tests/seek_regions_mount.py",
+          "status": "not_run",
+          "scenarios": [
+            "SEEK_DATA/SEEK_HOLE across all-hole, written, chunk-boundary, EOF, duplicate-descriptor, orphan, and retained-revision cases"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "seek_region_contract",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "The DSL does not expose SEEK_DATA/SEEK_HOLE or RPC fs-seek-region; pwrite gaps only assert logical zero bytes."
+        }
+      ]
+    },
+    "pathconf": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "native_pathconf",
+          "layer": "posix",
+          "script": "scripts/tests/volume_capacity_mount.py",
+          "status": "not_run",
+          "scenarios": [
+            "PC_NAME_MAX and path/fd volume geometry; PC_PATH_MAX behavior for directory and file descriptors"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "complete_pathconf_contract",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "The suite records PC_PATH_MAX EINVAL for subdirectory/file descriptors; this harness has no pathconf operation and does not define complete pathconf semantics."
+        }
+      ]
+    },
+    "ownership_acl": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "native_mode_permissions",
+          "layer": "posix",
+          "script": "scripts/tests/filesystem_compat.py",
+          "status": "not_run",
+          "scenarios": [
+            "permissions worker: current-user mode 000/0400 access denials, directory search/write, and existing-fd behavior; not chown or ACL"
+          ]
+        },
+        {
+          "id": "native_sticky_mode",
+          "layer": "posix",
+          "script": "scripts/tests/sticky_mode_mount.py",
+          "status": "not_run",
+          "scenarios": [
+            "sticky mode metadata and directory mutation behavior on an owned forkfs mount or APFS reference"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "owner_and_acl_contract",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "The API matrix states chown/fchown, setuid/setgid and ACL enforcement are missing or limited. The DSL cannot set uid/gid or ACLs, and no multi-user authorization contract is claimed."
+        },
+        {
+          "id": "sticky_authorization_contract",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "Sticky-bit metadata support does not establish native sticky-directory authorization behavior; no shared credentials/ownership operation exists in the DSL."
+        }
+      ]
+    },
+    "resource_fork": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "native_large_resource_fork",
+          "layer": "posix",
+          "script": "scripts/tests/large_xattr_mount.py",
+          "status": "not_run",
+          "scenarios": [
+            "whole-value ResourceFork xattr persistence, size bounds, fd access, and retained-revision checks"
+          ]
+        },
+        {
+          "id": "native_resource_fork_position_probe",
+          "layer": "posix",
+          "script": "scripts/tests/resource_fork_probe.py",
+          "status": "not_run",
+          "scenarios": [
+            "ResourceFork range/EOF syscall comparison on a private forkfs mount or APFS reference"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "resource_fork_full_compatibility",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "No ResourceFork-specific range or stream operation exists in this DSL. The compatibility matrix records cp -p and position reads as EINVAL, so whole-value xattr coverage cannot imply full fork compatibility."
+        }
+      ]
+    },
+    "copy_transfer": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "native_copy_transfer",
+          "layer": "posix",
+          "script": "scripts/tests/copy_transfer_mount.py",
+          "status": "not_run",
+          "scenarios": [
+            "copyfile DATA/STAT/XATTR, fcopyfile DATA, sendfile ranges/EOF/unlinked descriptors, clone fallback and forced-clone capability observations"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "copy_transfer_contract",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "The DSL has no copyfile, fcopyfile, sendfile, clonefile, or forced-clone operation. The external mounted suite is only indexed as not_run; recursive copy, ResourceFork, ACL, complete flags, sparse allocation, and zero-copy performance remain unclaimed."
+        }
+      ]
+    },
+    "clone_copy": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "daemon_clone_core",
+          "layer": "daemon_core",
+          "script": "daemon/tests/clone_file.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "Namespace clone_file identity, independent edits, xattrs, sparse content, revisions, and reopen behavior"
+          ]
+        },
+        {
+          "id": "daemon_clone_rpc",
+          "layer": "rpc",
+          "script": "daemon/tests/clone_file_rpc.py",
+          "status": "not_run",
+          "scenarios": [
+            "RPC clone-file command success/error and namespace behavior"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "native_clone_contract",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "Daemon clone_file tests are not native clonefile coverage. Native clone requests may fall back and forced clone is reported ENOTSUP; neither behavior is in shared cases."
+        }
+      ]
+    },
+    "vnode_events": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "native_vnode_notifications",
+          "layer": "posix",
+          "script": "scripts/tests/vnode_events_mount.py",
+          "status": "not_run",
+          "scenarios": [
+            "kqueue vnode WRITE/EXTEND/ATTRIB/LINK/RENAME/DELETE notifications for files/directories, cross-process append, orphan identity and path reuse"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "vnode_event_contract",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "The DSL has no kqueue/vnode event subscription or event-flag assertion."
+        }
+      ]
+    },
+    "fsevents": {
+      "case_ids": [],
+      "existing_external": [],
+      "missing_contracts": [
+        {
+          "id": "fsevents_contract",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "FSEvents is explicitly outside the current native event suite; recursive monitoring and revoke behavior are not qualified."
+        }
+      ]
+    },
+    "persistent_ids": {
+      "case_ids": [],
+      "existing_external": [],
+      "missing_contracts": [
+        {
+          "id": "persistent_file_id_contract",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "Persistent file IDs and file-handle APIs are not provided; inode IDs are scoped to the current mount and are not a persistent-ID guarantee."
+        }
+      ]
+    },
+    "volume_name": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "daemon_volume_name",
+          "layer": "daemon_core",
+          "script": "daemon/tests/volume_name.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "Namespace volume-name metadata and persistence behavior"
+          ]
+        },
+        {
+          "id": "native_volume_name",
+          "layer": "posix",
+          "script": "scripts/tests/volume_name_mount.py",
+          "status": "not_run",
+          "scenarios": [
+            "native volume-name get/set/readback, open-inode identity, live versus snapshot label isolation, and readonly-remount retention"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "volume_name_contract",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "Volume-name mutation and persistence are outside this DSL; the external native suite is indexed as not_run."
+        }
+      ]
+    },
+    "mount_lifecycle": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "launcher_mount_lifecycle",
+          "layer": "daemon_cli",
+          "script": "scripts/tests/mount_lifecycle.py",
+          "status": "not_run",
+          "scenarios": [
+            "MountSession start/stop order, startup cleanup, busy unmount retry, dead-backend detach, stale-socket and mountpoint safety with mocked OS mount operations"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "native_mount_lifecycle",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "The indexed lifecycle suite mocks OS mount operations. Real mount/unmount, readonly remount and backend-loss teardown are not exercised by shared cases; transparent reconnect after service loss is not supported."
+        }
+      ]
+    },
+    "directory_link_counts": {
+      "case_ids": [],
+      "existing_external": [
+        {
+          "id": "daemon_directory_pins",
+          "layer": "daemon_core",
+          "script": "daemon/tests/directory_metadata_handles.cpp",
+          "status": "not_run",
+          "scenarios": [
+            "metadata pin retains removed directory identity/attributes and reports the daemon removed-directory link count"
+          ]
+        }
+      ],
+      "missing_contracts": [
+        {
+          "id": "parent_directory_link_count",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "No shared case asserts parent directory link-count growth/decrease as child directories are created and removed."
+        },
+        {
+          "id": "removed_directory_link_count_cross_fs",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "Removed-directory nlink differs across filesystems and is intentionally not normalized or asserted by shared cases."
+        }
+      ]
+    },
+    "preallocation": {
+      "case_ids": [],
+      "existing_external": [],
+      "missing_contracts": [
+        {
+          "id": "native_preallocation_contract",
+          "layer": "posix",
+          "profiles": [
+            "reference",
+            "mounted"
+          ],
+          "mandatory": false,
+          "reason": "F_PREALLOCATE and posix_fallocate are not implemented or qualified; the DSL has no allocation reservation operation."
+        }
+      ]
+    }
+  }
+}

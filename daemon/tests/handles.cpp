@@ -145,7 +145,8 @@ int main(){
             std::atomic<int> wins=0,conflicts=0;std::vector<std::thread> creators;
             for(int i=0;i<8;++i)creators.emplace_back([&]{try{
                 auto h=fs.open("/create-race",forkfs::Namespace::Access::ReadWrite,exclusive);++wins;fs.close(h);
-            }catch(const std::exception& e){if(std::string(e.what())=="path already exists")++conflicts;else failed=true;}});
+            }catch(const std::system_error& e){if(e.code()==std::error_code(EEXIST,std::generic_category()))++conflicts;else failed=true;}
+             catch(...){failed=true;}});
             for(auto& t:creators)t.join();check(!failed && wins==1 && conflicts==7);
             fs.remove("/create-race",false);fs.verify();
             // Append-open selects EOF for every write, including after unlink.

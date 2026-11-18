@@ -13,6 +13,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  fs-contract-daemon:
+    name: Filesystem contract (FFRPC daemon)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Initialize storage dependency
+        run: git submodule update --init third_party/leveldb
+      - name: Install Linux dependencies
+        run: sudo apt-get update && sudo apt-get install -y g++-14 libssl-dev
+      - name: Configure Release
+        run: cmake -S . -B build/contract -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14
+      - name: Build daemon
+        run: cmake --build build/contract --target forkfsd --parallel 4
+      - name: Strict daemon contract
+        run: python3 scripts/tests/fs_contract.py --profile daemon --daemon build/contract/daemon/forkfsd --report build/contract/fs-contract-daemon.json
+      - name: Upload daemon contract report
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: fs-contract-daemon-report
+          if-no-files-found: warn
+          path: build/contract/fs-contract-daemon.json
+
   revision-runtime:
     name: Revision runtime (${{ matrix.os }})
     strategy:
@@ -47,6 +73,16 @@ jobs:
         run: cmake --build build/ci --parallel 4
       - name: Test revision runtime
         run: ctest --test-dir build/ci --output-on-failure --no-tests=error
+      - name: APFS reference contract
+        if: runner.os == 'macOS'
+        run: python3 scripts/tests/fs_contract.py --profile reference --reference-root "$RUNNER_TEMP" --report build/ci/fs-contract-reference.json
+      - name: Upload APFS reference report
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: fs-contract-apfs-reference
+          if-no-files-found: warn
+          path: build/ci/fs-contract-reference.json
       - name: Check linked dependencies
         run: scripts/check-deps.sh build/ci
       - name: Upload failure logs

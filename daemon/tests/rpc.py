@@ -88,7 +88,8 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         assert raw(['fs-cat','/rpc-file'])==b'R'
         trailing_seq=json.loads(raw(['status']))['last_committed_seq']
         for query in ['/rpc-file/','/trail-dangling/','/trail-loop/']:
-            raw(['fs-stat',query],ok=False,expected_code=1)
+            expected=errno.ENOTDIR+1 if query=='/rpc-file/' else errno.ENOENT+1 if query=='/trail-dangling/' else 1
+            raw(['fs-stat',query],ok=False,expected_code=expected)
         assert json.loads(raw(['status']))['last_committed_seq']==trailing_seq
         cli('fs-mkdir','/src/hinted')
         payload=bytes(range(256))*1024;data.write_bytes(payload)
@@ -107,7 +108,7 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         assert json.loads(raw(['fs-stat','/missing-trailing-target']))['directory']
         assert json.loads(raw(['fs-lstat','/trail-dangling']))['inode_id']==dangling_id
         assert raw(['fs-readlink','/trail-dangling'])==b'/missing-trailing-target'
-        raw(['fs-stat','/missing-trailing-target','--revision','before-trailing-mkdir'],ok=False,expected_code=1)
+        raw(['fs-stat','/missing-trailing-target','--revision','before-trailing-mkdir'],ok=False,expected_code=errno.ENOENT+1)
         before_invalid=json.loads(raw(['status']))['last_committed_seq']
         src_before=json.loads(raw(['fs-stat','/src']));listing_before=raw(['fs-ls','/src'])
         mkdir_errors={
@@ -125,7 +126,7 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         src_after=json.loads(raw(['fs-stat','/src']));assert src_after['links']==src_before['links'] and src_after['modified_ns']==src_before['modified_ns'] and src_after['changed_ns']==src_before['changed_ns']
         assert raw(['fs-ls','/src'])==listing_before
         for created in ['/src/trailing','/src/trailing-physical']:
-            raw(['fs-stat',created,'--revision','before-trailing-mkdir'],ok=False,expected_code=1)
+            raw(['fs-stat',created,'--revision','before-trailing-mkdir'],ok=False,expected_code=errno.ENOENT+1)
         # lstat seeds a long syntactic directory hint. inode-create appends a
         # child that would exceed 4096 bytes if the alias were reused.
         long_alias='/'+'./'*2041+'src/hinted'

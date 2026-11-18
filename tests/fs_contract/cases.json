@@ -1,0 +1,2369 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "path_dot_dot_physical_resolution",
+      "families": [
+        "path_resolution",
+        "identity",
+        "names"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "directory",
+          "path": "d"
+        },
+        {
+          "type": "directory",
+          "path": "d/sub"
+        },
+        {
+          "type": "file",
+          "path": "d/f",
+          "data_hex": "706879736963616c"
+        },
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "6c65786963616c"
+        },
+        {
+          "type": "symlink",
+          "path": "alias",
+          "target": "d/sub"
+        }
+      ],
+      "steps": [
+        {
+          "op": "stat",
+          "args": {
+            "path": "d/f"
+          },
+          "save": "physical",
+          "expect": {
+            "errno": 0,
+            "type": "file",
+            "links": 1,
+            "size": 8
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "alias/../f"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "file",
+            "inode": {
+              "ref": "physical",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "alias/../f"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "706879736963616c"
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "6c65786963616c"
+          }
+        }
+      ]
+    },
+    {
+      "id": "terminal_dot_path_type_errors",
+      "families": [
+        "path_resolution",
+        "errno",
+        "failure_atomicity",
+        "type_errors"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "78"
+        },
+        {
+          "type": "directory",
+          "path": "d"
+        }
+      ],
+      "steps": [
+        {
+          "op": "mkdir",
+          "args": {
+            "path": "."
+          },
+          "expect": {
+            "errno": "EEXIST",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "f/."
+          },
+          "expect": {
+            "errno": "ENOTDIR",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "d"
+          },
+          "save": "directory",
+          "expect": {
+            "errno": 0,
+            "type": "directory"
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "d/."
+          },
+          "expect": {
+            "errno": 0,
+            "type": "directory",
+            "inode": {
+              "ref": "directory",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "78"
+          }
+        }
+      ]
+    },
+    {
+      "id": "directory_entry_names_preserve_quote_newline_and_unicode",
+      "families": [
+        "names",
+        "readdir",
+        "path_resolution"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "directory",
+          "path": "entries"
+        },
+        {
+          "type": "file",
+          "path": "entries/quoted\"name",
+          "data_hex": ""
+        },
+        {
+          "type": "file",
+          "path": "entries/line\nbreak",
+          "data_hex": ""
+        },
+        {
+          "type": "file",
+          "path": "entries/emoji-🙂",
+          "data_hex": ""
+        }
+      ],
+      "steps": [
+        {
+          "op": "listdir",
+          "args": {
+            "path": "entries"
+          },
+          "expect": {
+            "errno": 0,
+            "names": [
+              "line\nbreak",
+              "quoted\"name",
+              "emoji-🙂"
+            ]
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "entries/line\nbreak"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "file",
+            "size": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "entries/quoted\"name"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "file",
+            "size": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "entries/emoji-🙂"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "file",
+            "size": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "component_name_byte_limit_255_and_256",
+      "families": [
+        "names",
+        "name_length",
+        "create",
+        "errno"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [],
+      "steps": [
+        {
+          "op": "create",
+          "args": {
+            "path": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "data_hex": ""
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "file",
+            "size": 0
+          }
+        },
+        {
+          "op": "create",
+          "args": {
+            "path": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "data_hex": ""
+          },
+          "expect": {
+            "errno": "ENAMETOOLONG",
+            "unchanged": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "mkdir_and_exclusive_create_conflicts",
+      "families": [
+        "mkdir",
+        "create",
+        "errno",
+        "failure_atomicity"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "directory",
+          "path": "d"
+        },
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "6f6c64"
+        }
+      ],
+      "steps": [
+        {
+          "op": "mkdir",
+          "args": {
+            "path": "d"
+          },
+          "expect": {
+            "errno": "EEXIST",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "create",
+          "args": {
+            "path": "f",
+            "data_hex": "6e6577",
+            "exclusive": true
+          },
+          "expect": {
+            "errno": "EEXIST",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "file",
+            "size": 3
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "6f6c64"
+          }
+        }
+      ]
+    },
+    {
+      "id": "mkdir_trailing_slash_succeeds",
+      "families": [
+        "mkdir",
+        "trailing_slash",
+        "path_resolution"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [],
+      "steps": [
+        {
+          "op": "mkdir",
+          "args": {
+            "path": "newdir/",
+            "mode": 493
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "newdir"
+          },
+          "save": "newdir",
+          "expect": {
+            "errno": 0,
+            "type": "directory",
+            "mode": 493,
+            "links": 2
+          }
+        },
+        {
+          "op": "listdir",
+          "args": {
+            "path": "newdir"
+          },
+          "expect": {
+            "errno": 0,
+            "names": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "mkdir_through_dangling_symlink_trailing_slash",
+      "families": [
+        "mkdir",
+        "trailing_slash",
+        "symlink",
+        "path_resolution"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "symlink",
+          "path": "alias",
+          "target": "missing///"
+        },
+        {
+          "type": "symlink",
+          "path": "bad",
+          "target": "absent/."
+        },
+        {
+          "type": "symlink",
+          "path": "a",
+          "target": "b/"
+        },
+        {
+          "type": "symlink",
+          "path": "b",
+          "target": "chain-target/"
+        }
+      ],
+      "steps": [
+        {
+          "op": "lstat",
+          "args": {
+            "path": "alias"
+          },
+          "save": "alias",
+          "expect": {
+            "errno": 0,
+            "type": "symlink"
+          }
+        },
+        {
+          "op": "lstat",
+          "args": {
+            "path": "a"
+          },
+          "save": "a_link",
+          "expect": {
+            "errno": 0,
+            "type": "symlink"
+          }
+        },
+        {
+          "op": "lstat",
+          "args": {
+            "path": "b"
+          },
+          "save": "b_link",
+          "expect": {
+            "errno": 0,
+            "type": "symlink"
+          }
+        },
+        {
+          "op": "mkdir",
+          "args": {
+            "path": "alias///",
+            "mode": 493
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "missing"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "directory",
+            "mode": 493,
+            "links": 2
+          }
+        },
+        {
+          "op": "lstat",
+          "args": {
+            "path": "alias"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "symlink",
+            "inode": {
+              "ref": "alias",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "readlink",
+          "args": {
+            "path": "alias"
+          },
+          "expect": {
+            "errno": 0,
+            "target": "missing///"
+          }
+        },
+        {
+          "op": "mkdir",
+          "args": {
+            "path": "a/",
+            "mode": 493
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "chain-target"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "directory",
+            "mode": 493,
+            "links": 2
+          }
+        },
+        {
+          "op": "lstat",
+          "args": {
+            "path": "a"
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "a_link",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "lstat",
+          "args": {
+            "path": "b"
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "b_link",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "readlink",
+          "args": {
+            "path": "a"
+          },
+          "expect": {
+            "errno": 0,
+            "target": "b/"
+          }
+        },
+        {
+          "op": "readlink",
+          "args": {
+            "path": "b"
+          },
+          "expect": {
+            "errno": 0,
+            "target": "chain-target/"
+          }
+        },
+        {
+          "op": "mkdir",
+          "args": {
+            "path": "bad/",
+            "mode": 493
+          },
+          "expect": {
+            "errno": "ENOENT",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "readlink",
+          "args": {
+            "path": "bad"
+          },
+          "expect": {
+            "errno": 0,
+            "target": "absent/."
+          }
+        }
+      ]
+    },
+    {
+      "id": "file_directory_mismatch_and_trailing_slash",
+      "families": [
+        "path_resolution",
+        "type_errors",
+        "trailing_slash",
+        "failure_atomicity"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "64617461"
+        },
+        {
+          "type": "directory",
+          "path": "d"
+        },
+        {
+          "type": "symlink",
+          "path": "file-link",
+          "target": "f"
+        }
+      ],
+      "steps": [
+        {
+          "op": "rmdir",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": "ENOTDIR",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "unlink",
+          "args": {
+            "path": "d"
+          },
+          "expect": {
+            "errno": {
+              "darwin": "EPERM",
+              "linux": "EISDIR"
+            },
+            "unchanged": true
+          }
+        },
+        {
+          "op": "unlink",
+          "args": {
+            "path": "f/"
+          },
+          "expect": {
+            "errno": "ENOTDIR",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "mkdir",
+          "args": {
+            "path": "f/"
+          },
+          "expect": {
+            "errno": "ENOTDIR",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "mkdir",
+          "args": {
+            "path": "file-link/"
+          },
+          "expect": {
+            "errno": "ENOTDIR",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "64617461"
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "d"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "directory"
+          }
+        }
+      ]
+    },
+    {
+      "id": "dangling_symlink_lstat_readlink_and_follow",
+      "families": [
+        "symlink",
+        "lstat",
+        "readlink",
+        "dangling",
+        "errno"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "symlink",
+          "path": "dangling",
+          "target": "missing/target"
+        }
+      ],
+      "steps": [
+        {
+          "op": "lstat",
+          "args": {
+            "path": "dangling"
+          },
+          "save": "link",
+          "expect": {
+            "errno": 0,
+            "type": "symlink",
+            "links": 1,
+            "size": 14
+          }
+        },
+        {
+          "op": "readlink",
+          "args": {
+            "path": "dangling"
+          },
+          "expect": {
+            "errno": 0,
+            "target": "missing/target"
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "dangling"
+          },
+          "expect": {
+            "errno": "ENOENT",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "dangling"
+          },
+          "expect": {
+            "errno": "ENOENT",
+            "unchanged": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "rename_preserves_inode_and_payload",
+      "families": [
+        "rename",
+        "identity",
+        "data",
+        "metadata"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "from",
+          "data_hex": "0041ff42",
+          "mode": 384
+        }
+      ],
+      "steps": [
+        {
+          "op": "stat",
+          "args": {
+            "path": "from"
+          },
+          "save": "before",
+          "expect": {
+            "errno": 0,
+            "type": "file",
+            "links": 1,
+            "size": 4,
+            "mode": 384
+          }
+        },
+        {
+          "op": "rename",
+          "args": {
+            "source": "from",
+            "target": "to"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "to"
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "before",
+              "field": "inode"
+            },
+            "links": 1,
+            "mode": 384,
+            "size": 4
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "to"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "0041ff42"
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "from"
+          },
+          "expect": {
+            "errno": "ENOENT",
+            "unchanged": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "rename_directory_type_mismatch_is_atomic",
+      "families": [
+        "rename",
+        "type_errors",
+        "failure_atomicity"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "directory",
+          "path": "dir"
+        },
+        {
+          "type": "file",
+          "path": "file",
+          "data_hex": "6b656570"
+        }
+      ],
+      "steps": [
+        {
+          "op": "rename",
+          "args": {
+            "source": "dir",
+            "target": "file"
+          },
+          "expect": {
+            "errno": "ENOTDIR",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "dir"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "directory"
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "file"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "6b656570"
+          }
+        }
+      ]
+    },
+    {
+      "id": "hardlink_unlink_link_count",
+      "families": [
+        "hardlink",
+        "unlink",
+        "nlink",
+        "identity"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "a",
+          "data_hex": "68617264"
+        }
+      ],
+      "steps": [
+        {
+          "op": "stat",
+          "args": {
+            "path": "a"
+          },
+          "save": "original",
+          "expect": {
+            "errno": 0,
+            "links": 1
+          }
+        },
+        {
+          "op": "link",
+          "args": {
+            "source": "a",
+            "target": "b"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "b"
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "original",
+              "field": "inode"
+            },
+            "links": 2
+          }
+        },
+        {
+          "op": "unlink",
+          "args": {
+            "path": "a"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "b"
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "original",
+              "field": "inode"
+            },
+            "links": 1
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "b"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "68617264"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rmdir_nonempty_rejected_without_changes",
+      "families": [
+        "rmdir",
+        "nonempty_directory",
+        "failure_atomicity"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "directory",
+          "path": "d"
+        },
+        {
+          "type": "file",
+          "path": "d/child",
+          "data_hex": "78"
+        }
+      ],
+      "steps": [
+        {
+          "op": "rmdir",
+          "args": {
+            "path": "d"
+          },
+          "expect": {
+            "errno": "ENOTEMPTY",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "listdir",
+          "args": {
+            "path": "d"
+          },
+          "expect": {
+            "errno": 0,
+            "names": [
+              "child"
+            ]
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "d/child"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "78"
+          }
+        }
+      ]
+    },
+    {
+      "id": "binary_pread_pwrite_and_sparse_hole",
+      "families": [
+        "binary_io",
+        "pread_pwrite",
+        "sparse_file",
+        "holes"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "00ff"
+        }
+      ],
+      "steps": [
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "save": "fd",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "pwrite",
+          "args": {
+            "handle": {
+              "ref": "fd",
+              "field": "handle"
+            },
+            "offset": 4,
+            "data_hex": "418000"
+          },
+          "expect": {
+            "errno": 0,
+            "written": 3
+          }
+        },
+        {
+          "op": "pread",
+          "args": {
+            "handle": {
+              "ref": "fd",
+              "field": "handle"
+            },
+            "offset": 0,
+            "count": 7
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "00ff0000418000"
+          }
+        },
+        {
+          "op": "fstat",
+          "args": {
+            "handle": {
+              "ref": "fd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0,
+            "size": 7,
+            "type": "file"
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "fd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "truncate_shrink_grow_zero_fills",
+      "families": [
+        "truncate",
+        "size",
+        "zero_fill",
+        "binary_io"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "4142434445"
+        }
+      ],
+      "steps": [
+        {
+          "op": "truncate",
+          "args": {
+            "path": "f",
+            "size": 3
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "414243"
+          }
+        },
+        {
+          "op": "truncate",
+          "args": {
+            "path": "f",
+            "size": 6
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "size": 6,
+            "type": "file"
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "414243000000"
+          }
+        }
+      ]
+    },
+    {
+      "id": "append_adds_bytes_at_end",
+      "families": [
+        "append",
+        "binary_io",
+        "data"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "4100"
+        }
+      ],
+      "steps": [
+        {
+          "op": "append",
+          "args": {
+            "path": "f",
+            "data_hex": "ff42"
+          },
+          "expect": {
+            "errno": 0,
+            "written": 2
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "size": 4,
+            "type": "file"
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "4100ff42"
+          }
+        }
+      ]
+    },
+    {
+      "id": "dup_shares_open_description_offset",
+      "families": [
+        "fd_lifetime",
+        "dup",
+        "shared_offset",
+        "close"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "303132333435"
+        }
+      ],
+      "steps": [
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read"
+            ]
+          },
+          "save": "fd1",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "dup",
+          "args": {
+            "handle": {
+              "ref": "fd1",
+              "field": "handle"
+            }
+          },
+          "save": "fd2",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "read_next",
+          "args": {
+            "handle": {
+              "ref": "fd1",
+              "field": "handle"
+            },
+            "count": 2
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "3031",
+            "offset": 2
+          }
+        },
+        {
+          "op": "read_next",
+          "args": {
+            "handle": {
+              "ref": "fd2",
+              "field": "handle"
+            },
+            "count": 2
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "3233",
+            "offset": 4
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "fd1",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "read_next",
+          "args": {
+            "handle": {
+              "ref": "fd2",
+              "field": "handle"
+            },
+            "count": 2
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "3435",
+            "offset": 6
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "fd2",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "open_unlink_path_reuse_keeps_old_inode",
+      "families": [
+        "fd_lifetime",
+        "path_reuse",
+        "identity",
+        "unlink"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "file",
+          "data_hex": "4f4c44",
+          "mode": 384
+        }
+      ],
+      "steps": [
+        {
+          "op": "stat",
+          "args": {
+            "path": "file"
+          },
+          "save": "old",
+          "expect": {
+            "errno": 0,
+            "type": "file",
+            "links": 1
+          }
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "file",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "save": "fd",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "unlink",
+          "args": {
+            "path": "file"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "create",
+          "args": {
+            "path": "file",
+            "data_hex": "4e4557",
+            "exclusive": true
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "file"
+          },
+          "expect": {
+            "errno": 0,
+            "inode_not": {
+              "ref": "old",
+              "field": "inode"
+            },
+            "links": 1
+          }
+        },
+        {
+          "op": "fstat",
+          "args": {
+            "handle": {
+              "ref": "fd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "old",
+              "field": "inode"
+            },
+            "links": 0
+          }
+        },
+        {
+          "op": "pread",
+          "args": {
+            "handle": {
+              "ref": "fd",
+              "field": "handle"
+            },
+            "offset": 0,
+            "count": 8
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "4f4c44"
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "file"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "4e4557"
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "fd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "open_directory_rmdir_retains_identity",
+      "families": [
+        "directory_metadata_fd",
+        "rmdir",
+        "identity",
+        "fd_lifetime"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "directory",
+          "path": "dir"
+        }
+      ],
+      "steps": [
+        {
+          "op": "stat",
+          "args": {
+            "path": "dir"
+          },
+          "save": "dir_before",
+          "expect": {
+            "errno": 0,
+            "type": "directory",
+            "links": 2
+          }
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "dir",
+            "flags": [
+              "read",
+              "directory"
+            ]
+          },
+          "save": "dirfd",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "rmdir",
+          "args": {
+            "path": "dir"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "fstat",
+          "args": {
+            "handle": {
+              "ref": "dirfd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0,
+            "type": "directory",
+            "inode": {
+              "ref": "dir_before",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "dir"
+          },
+          "expect": {
+            "errno": "ENOENT",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "dirfd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "directory_handle_relative_create_survives_rename_and_path_reuse",
+      "families": [
+        "directory_fd_identity",
+        "path_reuse",
+        "mkdir_at",
+        "fd_lifetime"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "directory",
+          "path": "parent"
+        }
+      ],
+      "steps": [
+        {
+          "op": "stat",
+          "args": {
+            "path": "parent"
+          },
+          "save": "parent_before",
+          "expect": {
+            "errno": 0,
+            "type": "directory"
+          }
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "parent",
+            "flags": [
+              "read",
+              "directory"
+            ]
+          },
+          "save": "parent_fd",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "rename",
+          "args": {
+            "source": "parent",
+            "target": "moved"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "mkdir",
+          "args": {
+            "path": "parent"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "mkdir_at",
+          "args": {
+            "handle": {
+              "ref": "parent_fd",
+              "field": "handle"
+            },
+            "name": "fromfd",
+            "mode": 448
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "moved"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "directory",
+            "inode": {
+              "ref": "parent_before",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "moved/fromfd"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "directory",
+            "mode": 448
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "parent/fromfd"
+          },
+          "expect": {
+            "errno": "ENOENT",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "rmdir",
+          "args": {
+            "path": "moved/fromfd"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "rmdir",
+          "args": {
+            "path": "moved"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "mkdir_at",
+          "args": {
+            "handle": {
+              "ref": "parent_fd",
+              "field": "handle"
+            },
+            "name": "orphan",
+            "mode": 448
+          },
+          "expect": {
+            "errno": "ENOENT",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "fstat",
+          "args": {
+            "handle": {
+              "ref": "parent_fd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0,
+            "type": "directory",
+            "inode": {
+              "ref": "parent_before",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "parent_fd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "chmod_and_utime_metadata_roundtrip",
+      "families": [
+        "chmod",
+        "times",
+        "metadata",
+        "stat"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "6d657461",
+          "mode": 420
+        }
+      ],
+      "steps": [
+        {
+          "op": "chmod",
+          "args": {
+            "path": "f",
+            "mode": 384
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "utime",
+          "args": {
+            "path": "f",
+            "atime_ns": 1234567890,
+            "mtime_ns": 2345678901
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "file",
+            "mode": 384,
+            "size": 4,
+            "atime_ns": 1234567890,
+            "mtime_ns": 2345678901
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "6d657461"
+          }
+        }
+      ]
+    },
+    {
+      "id": "binary_xattr_create_replace_remove",
+      "families": [
+        "xattr",
+        "binary_xattr",
+        "metadata",
+        "failure_atomicity"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "78"
+        }
+      ],
+      "steps": [
+        {
+          "op": "xattr_set",
+          "args": {
+            "path": "f",
+            "name": "user.contract",
+            "value_hex": "00ff4100",
+            "policy": "create"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "xattr_get",
+          "args": {
+            "path": "f",
+            "name": "user.contract"
+          },
+          "expect": {
+            "errno": 0,
+            "value_hex": "00ff4100"
+          }
+        },
+        {
+          "op": "xattr_set",
+          "args": {
+            "path": "f",
+            "name": "user.contract",
+            "value_hex": "424300",
+            "policy": "replace"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "xattr_get",
+          "args": {
+            "path": "f",
+            "name": "user.contract"
+          },
+          "expect": {
+            "errno": 0,
+            "value_hex": "424300"
+          }
+        },
+        {
+          "op": "xattr_remove",
+          "args": {
+            "path": "f",
+            "name": "user.contract"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "xattr_get",
+          "args": {
+            "path": "f",
+            "name": "user.contract"
+          },
+          "expect": {
+            "errno": {
+              "darwin": "ENOATTR",
+              "linux": "ENODATA"
+            },
+            "unchanged": true
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "78"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rpc_snapshot_read_only_isolation",
+      "families": [
+        "snapshot",
+        "revision_isolation",
+        "rpc_extension"
+      ],
+      "profiles": [
+        "daemon"
+      ],
+      "layers": [
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "6265666f7265"
+        }
+      ],
+      "steps": [
+        {
+          "op": "snapshot",
+          "args": {
+            "name": "before"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "save": "live_fd",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "write_next",
+          "args": {
+            "handle": {
+              "ref": "live_fd",
+              "field": "handle"
+            },
+            "data_hex": "6368616e6765"
+          },
+          "expect": {
+            "errno": 0,
+            "written": 6
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "live_fd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f",
+            "revision": "before"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "6265666f7265"
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "6368616e6765"
+          }
+        },
+        {
+          "op": "create",
+          "args": {
+            "path": "frozen",
+            "data_hex": "78",
+            "revision": "before"
+          },
+          "expect": {
+            "errno": "EROFS",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f",
+            "revision": "before"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "6265666f7265"
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "6368616e6765"
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "frozen",
+            "revision": "before"
+          },
+          "expect": {
+            "errno": "ENOENT",
+            "unchanged": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "sync_restart_persistence",
+      "families": [
+        "sync",
+        "restart",
+        "persistence",
+        "rpc_extension"
+      ],
+      "profiles": [
+        "daemon"
+      ],
+      "layers": [
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "70657273697374"
+        }
+      ],
+      "steps": [
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "save": "fd",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "write_next",
+          "args": {
+            "handle": {
+              "ref": "fd",
+              "field": "handle"
+            },
+            "data_hex": "5041594c4f4144"
+          },
+          "expect": {
+            "errno": 0,
+            "written": 7,
+            "offset": 7
+          }
+        },
+        {
+          "op": "sync",
+          "args": {
+            "handle": {
+              "ref": "fd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "fd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "restart",
+          "args": {},
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "5041594c4f4144"
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "file",
+            "size": 7
+          }
+        }
+      ]
+    }
+  ]
+}
