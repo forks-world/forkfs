@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,7 @@ import subprocess
 import sys
 import time
 
-from .model import SchemaError, safe_path
+from .model import FILE_SIZE_LIMIT, SchemaError, safe_path
 
 RPC_ENTRY_LIMIT = 4096
 FINGERPRINT_BYTE_LIMIT = 64 * 1024 * 1024
@@ -22,6 +23,11 @@ FINGERPRINT_BYTE_LIMIT = 64 * 1024 * 1024
 
 class Unsupported(RuntimeError):
     pass
+
+
+def _check_write_extent(position, size):
+    if position + size > FILE_SIZE_LIMIT:
+        raise Unsupported(f"sequential write extent exceeds {FILE_SIZE_LIMIT} byte bound")
 
 
 class UntypedRpcFailure(RuntimeError):
@@ -120,11 +126,22 @@ class PosixAdapter:
         if op == "pwrite":
             data = bytes.fromhex(a["data_hex"]); n = os.pwrite(self._fd(a["handle"]), data, a["offset"])
             return {"written": n}
+        if op == "seek":
+            whence = {"set": os.SEEK_SET, "cur": os.SEEK_CUR, "end": os.SEEK_END}[a["whence"]]
+            return {"offset": os.lseek(self._fd(a["handle"]), a["displacement"], whence)}
         if op == "read_next":
             fd = self._fd(a["handle"]); data = os.read(fd, a["count"])
             return {"data_hex": data.hex(), "offset": os.lseek(fd, 0, os.SEEK_CUR)}
         if op == "write_next":
-            fd = self._fd(a["handle"]); data = bytes.fromhex(a["data_hex"]); n = os.write(fd, data)
+            fd = self._fd(a["handle"])
+            data = bytes.fromhex(a["data_hex"])
+            if data:
+                flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                info = os.fstat(fd)
+                if (flags & os.O_ACCMODE) != os.O_RDONLY and stat.S_ISREG(info.st_mode):
+                    position = info.st_size if flags & os.O_APPEND else os.lseek(fd, 0, os.SEEK_CUR)
+                    _check_write_extent(position, len(data))
+            n = os.write(fd, data)
             return {"written": n, "offset": os.lseek(fd, 0, os.SEEK_CUR)}
         if op == "truncate": os.truncate(self._path(a["path"]), a["size"]); return {}
         if op == "ftruncate": os.ftruncate(self._fd(a["handle"]), a["size"]); return {}
@@ -334,6 +351,7 @@ class RpcAdapter:
         if len(os.fsencode(self.socket_path)) >= 100: raise Unsupported("Unix socket path too long")
         self.timeout = timeout; self.process = None; self.session = None; self.handles = set()
         self.handle_revisions = {}; self.revisions = set()
+        self.handle_write_modes = {}
         try:
             self._command("init", self.db)
             self._command("fs-init", self.db)
@@ -434,7 +452,10 @@ class RpcAdapter:
             result = self._json("fs-open", path("path"), mode, *sel())
             handle = result["handle"]; self.handles.add(handle)
             self.handle_revisions[handle] = a.get("revision")
-            if op == "open": return {"handle": handle}
+            if op == "open":
+                if "write" in flags:
+                    self.handle_write_modes[handle] = "append" if "append" in flags else "positioned"
+                return {"handle": handle}
             try:
                 data = bytes.fromhex(a["data_hex"])
                 if data: self.rpc("fs-hwrite", handle, "0", data, *sel())
@@ -442,18 +463,33 @@ class RpcAdapter:
             finally:
                 self.rpc("fs-close", handle, *sel()); self.handles.discard(handle); self.handle_revisions.pop(handle, None)
         if op == "close":
-            self.rpc("fs-close", a["handle"], *sel()); self.handles.discard(a["handle"]); self.handle_revisions.pop(a["handle"], None); return {}
+            self.rpc("fs-close", a["handle"], *sel()); self.handles.discard(a["handle"]); self.handle_revisions.pop(a["handle"], None)
+            self.handle_write_modes.pop(a["handle"], None); return {}
         if op == "dup":
             result = self._json("fs-dup", a["handle"], *sel()); self.handles.add(result["handle"])
-            self.handle_revisions[result["handle"]] = self.handle_revisions.get(a["handle"], a.get("revision")); return result
+            self.handle_revisions[result["handle"]] = self.handle_revisions.get(a["handle"], a.get("revision"))
+            if a["handle"] in self.handle_write_modes:
+                self.handle_write_modes[result["handle"]] = self.handle_write_modes[a["handle"]]
+            return result
         if op == "fstat": return self._normal_stat(self._json("fs-hstat", a["handle"], *sel()))
         if op == "read": return {"data_hex": self.rpc("fs-cat", path("path"), *sel()).hex()}
         if op == "pread": return {"data_hex": self.rpc("fs-hread", a["handle"], a["offset"], a["count"], *sel()).hex()}
         if op == "pwrite":
             data = bytes.fromhex(a["data_hex"]); self.rpc("fs-hwrite", a["handle"], a["offset"], data, *sel()); return {"written": len(data)}
+        if op == "seek":
+            result = self._json("fs-hseek", a["handle"], a["displacement"], a["whence"], *sel())
+            return {"offset": result["offset"]}
         if op == "read_next": return {"data_hex": self.rpc("fs-hread-next", a["handle"], a["count"], *sel()).hex(), "offset": self._json("fs-hseek", a["handle"], 0, "cur", *sel())["offset"]}
         if op == "write_next":
-            data = bytes.fromhex(a["data_hex"]); result = self._json("fs-hwrite-next", a["handle"], data, *sel())
+            data = bytes.fromhex(a["data_hex"])
+            mode = self.handle_write_modes.get(a["handle"])
+            if data and mode is not None:
+                if mode == "append":
+                    position = self._json("fs-hstat", a["handle"], *sel())["size"]
+                else:
+                    position = self._json("fs-hseek", a["handle"], 0, "cur", *sel())["offset"]
+                _check_write_extent(position, len(data))
+            result = self._json("fs-hwrite-next", a["handle"], data, *sel())
             result["offset"] = self._json("fs-hseek", a["handle"], 0, "cur", *sel())["offset"]; return result
         if op == "truncate": self.rpc("fs-truncate", path("path"), a["size"], *sel()); return {}
         if op == "ftruncate": self.rpc("fs-htruncate", a["handle"], a["size"], *sel()); return {}
@@ -591,7 +627,7 @@ class RpcAdapter:
                 break
             except (OSError, ConnectionError): time.sleep(0.02)
         else: raise TimeoutError("forkfsd RPC socket unavailable after restart")
-        self.handles.clear(); self.handle_revisions.clear()
+        self.handles.clear(); self.handle_revisions.clear(); self.handle_write_modes.clear()
         self.session = self._json("session-open", "60000")["session"]
 
     def _stop(self):
@@ -610,4 +646,4 @@ class RpcAdapter:
         if self.process is not None and self.session:
             try: self.rpc("session-close", self.session)
             except Exception: pass
-        self.handles.clear(); self.handle_revisions.clear(); self._stop()
+        self.handles.clear(); self.handle_revisions.clear(); self.handle_write_modes.clear(); self._stop()

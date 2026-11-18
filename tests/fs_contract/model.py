@@ -12,13 +12,16 @@ class SchemaError(ValueError):
     pass
 
 
+FILE_SIZE_LIMIT = 64 * 1024 * 1024
+
 PROFILES = {"reference", "daemon", "mounted"}
 LAYERS = {"posix", "rpc"}
 OPS = {
     "mkdir": {"path", "mode"}, "create": {"path", "data_hex", "mode", "exclusive"},
     "open": {"path", "flags", "mode"}, "close": {"handle"}, "dup": {"handle"},
     "fstat": {"handle"}, "read": {"path"}, "pread": {"handle", "offset", "count"},
-    "pwrite": {"handle", "offset", "data_hex"}, "read_next": {"handle", "count"},
+    "pwrite": {"handle", "offset", "data_hex"}, "seek": {"handle", "displacement", "whence"},
+    "read_next": {"handle", "count"},
     "write_next": {"handle", "data_hex"}, "truncate": {"path", "size"},
     "ftruncate": {"handle", "size"}, "append": {"path", "data_hex"},
     "stat": {"path"}, "lstat": {"path"}, "listdir": {"path"},
@@ -40,7 +43,7 @@ ERRNOS = {
     "E2BIG", "EACCES", "EBADF", "EBUSY", "EEXIST", "EFAULT", "EFBIG", "EINTR",
     "EINVAL", "EIO", "EISDIR", "ELOOP", "EMFILE", "ENAMETOOLONG", "ENFILE",
     "ENODATA", "ENOATTR", "ENOENT", "ENOSPC", "ENOTDIR", "ENOTEMPTY", "ENOTSUP",
-    "EOPNOTSUPP", "EPERM", "ERANGE", "EROFS", "ESPIPE", "ESTALE", "ETIMEDOUT", "EXDEV",
+    "EOPNOTSUPP", "EOVERFLOW", "EPERM", "ERANGE", "EROFS", "ESPIPE", "ESTALE", "ETIMEDOUT", "EXDEV",
 }
 SYMBOL = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
@@ -145,6 +148,7 @@ REQUIRED_ARGS = {
     "mkdir": {"path"}, "create": {"path", "data_hex"}, "open": {"path", "flags"},
     "close": {"handle"}, "dup": {"handle"}, "fstat": {"handle"}, "read": {"path"},
     "pread": {"handle", "offset", "count"}, "pwrite": {"handle", "offset", "data_hex"},
+    "seek": {"handle", "displacement", "whence"},
     "read_next": {"handle", "count"}, "write_next": {"handle", "data_hex"},
     "truncate": {"path", "size"}, "ftruncate": {"handle", "size"}, "append": {"path", "data_hex"},
     "stat": {"path"}, "lstat": {"path"}, "listdir": {"path"},
@@ -163,7 +167,7 @@ EXPECT_FOR_OP = {
     "mkdir": set(), "create": {"written"}, "open": {"handle"}, "close": set(),
     "dup": {"handle"}, "fstat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns"},
     "read": {"data_hex"}, "pread": {"data_hex"}, "pwrite": {"written"},
-    "read_next": {"data_hex", "offset"}, "write_next": {"written", "offset"},
+    "seek": {"offset"}, "read_next": {"data_hex", "offset"}, "write_next": {"written", "offset"},
     "truncate": set(), "ftruncate": set(), "append": {"written"},
     "stat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns"},
     "lstat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns", "target"},
@@ -285,6 +289,12 @@ def validate_case_file(doc):
                         if not isinstance(value, list) or any(not isinstance(flag, str) for flag in value):
                             raise SchemaError(f"{sw}.args.flags must be a string array")
                     elif not isinstance(value, str): raise SchemaError(f"{sw}.args.{key} must be a string")
+            if op == "seek":
+                displacement = step["args"]["displacement"]
+                if type(displacement) is not int or not -(1 << 63) <= displacement < (1 << 63):
+                    raise SchemaError(f"{sw}.args.displacement must be a signed 64-bit integer")
+                if step["args"]["whence"] not in ("set", "cur", "end"):
+                    raise SchemaError(f"{sw}.args.whence must be set, cur, or end")
             if op == "open":
                 flags = step["args"]["flags"]
                 if not isinstance(flags, list) or not flags or any(not isinstance(x, str) for x in flags) or len(flags) != len(set(flags)) or not set(flags) <= {"read", "write", "create", "exclusive", "truncate", "append", "directory", "nofollow"}:

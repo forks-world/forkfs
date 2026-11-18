@@ -17,11 +17,10 @@ import sys
 import uuid
 
 from .adapters import PosixAdapter, RpcAdapter, Unsupported, UntypedRpcFailure
-from .model import SchemaError, load_json, resolve_refs, validate_case_file, validate_coverage
+from .model import FILE_SIZE_LIMIT, SchemaError, load_json, resolve_refs, validate_case_file, validate_coverage
 
 
 BYTE_LIMIT = 64 * 1024 * 1024
-FILE_SIZE_LIMIT = 64 * 1024 * 1024
 ENTRY_LIMIT = 4096
 STEP_LIMIT = 256
 

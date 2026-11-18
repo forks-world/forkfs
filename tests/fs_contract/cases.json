@@ -2364,6 +2364,299 @@
           }
         }
       ]
+    },
+    {
+      "id": "seek_preserves_shared_cursor_on_failure",
+      "families": [
+        "seek",
+        "shared_offset",
+        "errno",
+        "failure_atomicity"
+      ],
+      "profiles": [
+        "reference",
+        "daemon",
+        "mounted"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "000102030405"
+        }
+      ],
+      "steps": [
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "original"
+        },
+        {
+          "op": "dup",
+          "args": {
+            "handle": {
+              "ref": "original",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "duplicate"
+        },
+        {
+          "op": "seek",
+          "args": {
+            "handle": {
+              "ref": "original",
+              "field": "handle"
+            },
+            "displacement": 2,
+            "whence": "set"
+          },
+          "expect": {
+            "errno": 0,
+            "offset": 2
+          }
+        },
+        {
+          "op": "seek",
+          "args": {
+            "handle": {
+              "ref": "duplicate",
+              "field": "handle"
+            },
+            "displacement": 1,
+            "whence": "cur"
+          },
+          "expect": {
+            "errno": 0,
+            "offset": 3
+          }
+        },
+        {
+          "op": "read_next",
+          "args": {
+            "handle": {
+              "ref": "original",
+              "field": "handle"
+            },
+            "count": 1
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "03",
+            "offset": 4
+          }
+        },
+        {
+          "op": "seek",
+          "args": {
+            "handle": {
+              "ref": "duplicate",
+              "field": "handle"
+            },
+            "displacement": -1,
+            "whence": "end"
+          },
+          "expect": {
+            "errno": 0,
+            "offset": 5
+          }
+        },
+        {
+          "op": "seek",
+          "args": {
+            "handle": {
+              "ref": "original",
+              "field": "handle"
+            },
+            "displacement": -1,
+            "whence": "set"
+          },
+          "expect": {
+            "errno": "EINVAL",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "seek",
+          "args": {
+            "handle": {
+              "ref": "duplicate",
+              "field": "handle"
+            },
+            "displacement": -6,
+            "whence": "cur"
+          },
+          "expect": {
+            "errno": "EINVAL",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "seek",
+          "args": {
+            "handle": {
+              "ref": "original",
+              "field": "handle"
+            },
+            "displacement": -7,
+            "whence": "end"
+          },
+          "expect": {
+            "errno": "EINVAL",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "read_next",
+          "args": {
+            "handle": {
+              "ref": "original",
+              "field": "handle"
+            },
+            "count": 1
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "05",
+            "offset": 6
+          }
+        },
+        {
+          "op": "seek",
+          "args": {
+            "handle": {
+              "ref": "original",
+              "field": "handle"
+            },
+            "displacement": 9223372036854775807,
+            "whence": "set"
+          },
+          "expect": {
+            "errno": 0,
+            "offset": 9223372036854775807
+          }
+        },
+        {
+          "op": "seek",
+          "args": {
+            "handle": {
+              "ref": "duplicate",
+              "field": "handle"
+            },
+            "displacement": 1,
+            "whence": "cur"
+          },
+          "expect": {
+            "errno": "EOVERFLOW",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "seek",
+          "args": {
+            "handle": {
+              "ref": "original",
+              "field": "handle"
+            },
+            "displacement": -9223372036854775808,
+            "whence": "cur"
+          },
+          "expect": {
+            "errno": "EINVAL",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "seek",
+          "args": {
+            "handle": {
+              "ref": "duplicate",
+              "field": "handle"
+            },
+            "displacement": 0,
+            "whence": "cur"
+          },
+          "expect": {
+            "errno": 0,
+            "offset": 9223372036854775807
+          }
+        },
+        {
+          "op": "seek",
+          "args": {
+            "handle": {
+              "ref": "original",
+              "field": "handle"
+            },
+            "displacement": 0,
+            "whence": "set"
+          },
+          "expect": {
+            "errno": 0,
+            "offset": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "size": 6
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "000102030405"
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "duplicate",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "original",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        }
+      ]
     }
   ]
 }
