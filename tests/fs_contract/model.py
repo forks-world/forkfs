@@ -26,6 +26,7 @@ OPS = {
     "ftruncate": {"handle", "size"}, "append": {"path", "data_hex"},
     "stat": {"path"}, "lstat": {"path"}, "listdir": {"path"},
     "link": {"source", "target"}, "rename": {"source", "target"},
+    "rename_exclusive": {"source", "target"}, "rename_exchange": {"source", "target"},
     "symlink": {"target", "path"}, "readlink": {"path"}, "unlink": {"path"},
     "rmdir": {"path"}, "chmod": {"path", "mode"},
     "utime": {"path", "atime_ns", "mtime_ns"},
@@ -153,6 +154,7 @@ REQUIRED_ARGS = {
     "truncate": {"path", "size"}, "ftruncate": {"handle", "size"}, "append": {"path", "data_hex"},
     "stat": {"path"}, "lstat": {"path"}, "listdir": {"path"},
     "link": {"source", "target"}, "rename": {"source", "target"}, "symlink": {"target", "path"},
+    "rename_exclusive": {"source", "target"}, "rename_exchange": {"source", "target"},
     "readlink": {"path"}, "unlink": {"path"}, "rmdir": {"path"}, "chmod": {"path", "mode"},
     "utime": {"path", "atime_ns", "mtime_ns"}, "xattr_set": {"path", "name", "value_hex", "policy"},
     "xattr_get": {"path", "name"}, "xattr_remove": {"path", "name"},
@@ -172,6 +174,7 @@ EXPECT_FOR_OP = {
     "stat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns"},
     "lstat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns", "target"},
     "listdir": {"names"}, "link": set(), "rename": set(), "symlink": set(),
+    "rename_exclusive": set(), "rename_exchange": set(),
     "readlink": {"target"}, "unlink": set(), "rmdir": set(), "chmod": set(), "utime": set(),
     "xattr_set": set(), "xattr_get": {"value_hex"}, "xattr_remove": set(),
     "mkdir_at": {"inode"}, "snapshot": set(), "restart": set(), "sync": set(),
@@ -265,7 +268,7 @@ def validate_case_file(doc):
                 if key in {"path", "source"} and isinstance(value, str):
                     allow_dot = key == "path" and value == "." and op in {"mkdir", "stat", "lstat", "listdir"}
                     _safe_relpath(value, sw + ".args." + key, allow_dot)
-                if key == "target" and op in {"link", "rename"} and isinstance(value, str):
+                if key == "target" and op in {"link", "rename", "rename_exclusive", "rename_exchange"} and isinstance(value, str):
                     _safe_relpath(value, sw + ".args.target")
                 if key == "target" and isinstance(value, str) and op == "symlink":
                     if not value or value.startswith("/") or "\x00" in value:

@@ -160,6 +160,19 @@ class PosixAdapter:
         if op == "listdir": return {"names": sorted(os.fsdecode(x) for x in os.listdir(self._path(a["path"])))}
         if op == "link": os.link(self._path(a["source"]), self._path(a["target"])); return {}
         if op == "rename": os.rename(self._path(a["source"]), self._path(a["target"])); return {}
+        if op in {"rename_exclusive", "rename_exchange"}:
+            if sys.platform != "darwin":
+                raise Unsupported("rename flags require Darwin renamex_np")
+            libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+            rename = libc.renamex_np
+            rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+            rename.restype = ctypes.c_int
+            # RENAME_EXCL and RENAME_SWAP from Darwin's <sys/stdio.h>.
+            flag = {"rename_exclusive": 0x4, "rename_exchange": 0x2}[op]
+            if rename(self._path(a["source"]), self._path(a["target"]), flag) != 0:
+                code = ctypes.get_errno()
+                raise OSError(code, os.strerror(code))
+            return {}
         if op == "symlink": os.symlink(a["target"], self._path(a["path"])); return {}
         if op == "readlink": return {"target": os.fsdecode(os.readlink(self._path(a["path"])))}
         if op == "unlink": os.unlink(self._path(a["path"])); return {}
@@ -511,7 +524,14 @@ class RpcAdapter:
                 return {"names": sorted(names)}
             finally: self.rpc("fs-dir-close", cursor, *sel())
         if op == "link": self.rpc("fs-link", path("source"), path("target"), *sel()); return {}
-        if op == "rename": self.rpc("fs-rename", path("source"), path("target"), *sel()); return {}
+        if op in {"rename", "rename_exclusive", "rename_exchange"}:
+            command = {
+                "rename": "fs-rename",
+                "rename_exclusive": "fs-rename-excl",
+                "rename_exchange": "fs-exchange",
+            }[op]
+            self.rpc(command, path("source"), path("target"), *sel())
+            return {}
         if op == "symlink": self.rpc("fs-symlink", a["target"], path("path"), *sel()); return {}
         if op == "readlink": return {"target": self.rpc("fs-readlink", path("path"), *sel()).decode()}
         if op == "unlink": self.rpc("fs-unlink", path("path"), *sel()); return {}

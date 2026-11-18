@@ -36,6 +36,17 @@ class HarnessModelTests(unittest.TestCase):
         doc["cases"][0]["steps"][0]["op"] = "eval"
         with self.assertRaises(SchemaError): validate_case_file(doc)
 
+    def test_rename_extensions_reject_paths_outside_owned_root(self):
+        for op in ("rename_exclusive", "rename_exchange"):
+            for field in ("source", "target"):
+                with self.subTest(op=op, field=field):
+                    doc = _valid_case()
+                    args = {"source": "from", "target": "to"}
+                    args[field] = "../outside"
+                    doc["cases"][0]["steps"] = [{"op": op, "args": args, "expect": {"errno": 0}}]
+                    with self.assertRaisesRegex(SchemaError, "escapes the owned root"):
+                        validate_case_file(doc)
+
     def test_forward_reference_is_rejected(self):
         doc = _valid_case()
         doc["cases"][0]["steps"].insert(0, {"op": "fstat", "args": {"handle": {"ref": "later", "field": "handle"}},
