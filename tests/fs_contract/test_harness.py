@@ -88,6 +88,21 @@ class HarnessModelTests(unittest.TestCase):
             self.assertEqual(safe_path(alias, "d/../d/f"),
                              os.fsencode(str(root.resolve(strict=True)) + "/d/../d/f"))
 
+    def test_sequential_write_beyond_extent_bound_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = PosixAdapter(Path(tmp), "test")
+            try:
+                handle = adapter.execute("open", {"path": "f", "flags": ["write", "create"]})["handle"]
+                self.assertEqual(
+                    adapter.execute("seek", {"handle": handle, "displacement": runner.FILE_SIZE_LIMIT, "whence": "set"}),
+                    {"offset": runner.FILE_SIZE_LIMIT},
+                )
+                with self.assertRaises(Unsupported):
+                    adapter.execute("write_next", {"handle": handle, "data_hex": "ff"})
+                self.assertEqual((Path(tmp) / "f").stat().st_size, 0)
+            finally:
+                adapter.close_all()
+
     def test_darwin_fingerprint_encodes_path_arguments_for_ctypes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

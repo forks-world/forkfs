@@ -148,7 +148,8 @@
         "component_name_byte_limit_255_and_256",
         "dangling_symlink_lstat_readlink_and_follow",
         "mkdir_and_exclusive_create_conflicts",
-        "terminal_dot_path_type_errors"
+        "terminal_dot_path_type_errors",
+        "seek_preserves_shared_cursor_on_failure"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -160,7 +161,8 @@
         "mkdir_and_exclusive_create_conflicts",
         "rename_directory_type_mismatch_is_atomic",
         "rmdir_nonempty_rejected_without_changes",
-        "terminal_dot_path_type_errors"
+        "terminal_dot_path_type_errors",
+        "seek_preserves_shared_cursor_on_failure"
       ],
       "existing_external": [
         {
@@ -561,7 +563,8 @@
     },
     "shared_offset": {
       "case_ids": [
-        "dup_shares_open_description_offset"
+        "dup_shares_open_description_offset",
+        "seek_preserves_shared_cursor_on_failure"
       ],
       "existing_external": [
         {
@@ -1338,7 +1341,9 @@
       ]
     },
     "seek": {
-      "case_ids": [],
+      "case_ids": [
+        "seek_preserves_shared_cursor_on_failure"
+      ],
       "existing_external": [
         {
           "id": "native_lseek_openflags",
@@ -1350,18 +1355,7 @@
           ]
         }
       ],
-      "missing_contracts": [
-        {
-          "id": "lseek_cursor_errno_contract",
-          "layer": "posix",
-          "profiles": [
-            "reference",
-            "mounted"
-          ],
-          "mandatory": false,
-          "reason": "The DSL has no lseek operation, so cursor positioning errors, SEEK_SET/CUR/END, and failure cursor invariance are not checked."
-        }
-      ]
+      "missing_contracts": []
     },
     "seek_regions": {
       "case_ids": [],
