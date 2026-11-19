@@ -37,6 +37,8 @@ The APFS reference and daemon profiles cover exclusive rename and rename exchang
 
 The shared cases also cover ordinary rename replacement, exclusive creation through aliases, and cursor behavior across independent and duplicated handles. The daemon profile checks that a read-only revision rejects writable opens and directory-relative creation with `EROFS`. It also verifies that snapshots retain their hardlink topology after live path reuse and preserve file contents, modes, and xattrs across a daemon restart.
 
+The data-integrity cases check append after a seek, cursor preservation across `ftruncate`, truncating opens, and writes through unlinked handles after path reuse. The metadata cases check xattr failure atomicity, metadata shared by hardlinks, and xattrs attached directly to symlinks. Directory-relative creation checks cover both an invalid parent type and an occupied name. The daemon profile also compares two immutable snapshot generations with the live file after restart.
+
 ## Fixed expectations and DSL
 
 `cases.json` uses `schema_version: 1` and a closed operation vocabulary in `model.py`. Each case has an ID, family inventory, applicable profiles/layers, setup fixture, ordered steps, literal expected results, and optional known-gap annotation. `coverage.json` binds every case ID to each family it claims. Unknown fields, operations, duplicate IDs or keys, dangling coverage IDs, invalid references, empty case sets, and unsupported expectation forms fail closed.
