@@ -2657,6 +2657,348 @@
           }
         }
       ]
+    },
+    {
+      "id": "rename_exclusive_preserves_occupied_targets",
+      "families": [
+        "rename",
+        "rename_exclusive_exchange",
+        "identity",
+        "failure_atomicity"
+      ],
+      "profiles": [
+        "reference",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "source",
+          "data_hex": "00736f75726365ff"
+        },
+        {
+          "type": "file",
+          "path": "occupied",
+          "data_hex": "006b656570ff"
+        },
+        {
+          "type": "symlink",
+          "path": "dangling",
+          "target": "absent"
+        }
+      ],
+      "steps": [
+        {
+          "op": "stat",
+          "args": {
+            "path": "source"
+          },
+          "save": "source",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "rename_exclusive",
+          "args": {
+            "source": "source",
+            "target": "occupied"
+          },
+          "expect": {
+            "errno": "EEXIST",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "rename_exclusive",
+          "args": {
+            "source": "source",
+            "target": "dangling"
+          },
+          "expect": {
+            "errno": "EEXIST",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "rename_exclusive",
+          "args": {
+            "source": "source",
+            "target": "moved"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "source"
+          },
+          "expect": {
+            "errno": "ENOENT",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "moved"
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "source",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "moved"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "00736f75726365ff"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rename_exchange_preserves_open_file_identity",
+      "families": [
+        "rename",
+        "rename_exclusive_exchange",
+        "identity",
+        "fd_lifetime"
+      ],
+      "profiles": [
+        "reference",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "left",
+          "data_hex": "006c656674"
+        },
+        {
+          "type": "file",
+          "path": "right",
+          "data_hex": "ff7269676874"
+        }
+      ],
+      "steps": [
+        {
+          "op": "open",
+          "args": {
+            "path": "left",
+            "flags": [
+              "read"
+            ]
+          },
+          "save": "left_fd",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "right",
+            "flags": [
+              "read"
+            ]
+          },
+          "save": "right_fd",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "fstat",
+          "args": {
+            "handle": {
+              "ref": "left_fd",
+              "field": "handle"
+            }
+          },
+          "save": "left_inode",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "fstat",
+          "args": {
+            "handle": {
+              "ref": "right_fd",
+              "field": "handle"
+            }
+          },
+          "save": "right_inode",
+          "expect": {
+            "errno": 0,
+            "inode_not": {
+              "ref": "left_inode",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "rename_exchange",
+          "args": {
+            "source": "left",
+            "target": "right"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "left"
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "right_inode",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "right"
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "left_inode",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "left"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "ff7269676874"
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "right"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "006c656674"
+          }
+        },
+        {
+          "op": "fstat",
+          "args": {
+            "handle": {
+              "ref": "left_fd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "left_inode",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "fstat",
+          "args": {
+            "handle": {
+              "ref": "right_fd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "right_inode",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "pread",
+          "args": {
+            "handle": {
+              "ref": "left_fd",
+              "field": "handle"
+            },
+            "offset": 0,
+            "count": 5
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "006c656674"
+          }
+        },
+        {
+          "op": "pread",
+          "args": {
+            "handle": {
+              "ref": "right_fd",
+              "field": "handle"
+            },
+            "offset": 0,
+            "count": 6
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "ff7269676874"
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "left_fd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "right_fd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        }
+      ]
     }
   ]
 }

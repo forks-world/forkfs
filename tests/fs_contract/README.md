@@ -33,6 +33,8 @@ python3 scripts/tests/fs_contract.py \
 
 The mountpoint must be the exact mount root. The harness does not use a plain directory as a mounted candidate. If native preflight cannot verify APFS and forkfs, the report records blocked executions and exits nonzero.
 
+The APFS reference and daemon profiles cover exclusive rename and rename exchange. The exclusive case checks that an existing file or dangling symlink causes `EEXIST` with identical before and after fingerprints. The exchange case checks that pathnames swap inode identities and contents while open handles retain their original inodes and bytes. Native forkfs mount coverage for these rename flags remains a gap in `coverage.json`.
+
 ## Fixed expectations and DSL
 
 `cases.json` uses `schema_version: 1` and a closed operation vocabulary in `model.py`. Each case has an ID, family inventory, applicable profiles/layers, setup fixture, ordered steps, literal expected results, and optional known-gap annotation. `coverage.json` binds every case ID to each family it claims. Unknown fields, operations, duplicate IDs or keys, dangling coverage IDs, invalid references, empty case sets, and unsupported expectation forms fail closed.

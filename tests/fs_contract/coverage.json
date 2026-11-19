@@ -162,7 +162,8 @@
         "rename_directory_type_mismatch_is_atomic",
         "rmdir_nonempty_rejected_without_changes",
         "terminal_dot_path_type_errors",
-        "seek_preserves_shared_cursor_on_failure"
+        "seek_preserves_shared_cursor_on_failure",
+        "rename_exclusive_preserves_occupied_targets"
       ],
       "existing_external": [
         {
@@ -273,7 +274,9 @@
     "rename": {
       "case_ids": [
         "rename_directory_type_mismatch_is_atomic",
-        "rename_preserves_inode_and_payload"
+        "rename_preserves_inode_and_payload",
+        "rename_exclusive_preserves_occupied_targets",
+        "rename_exchange_preserves_open_file_identity"
       ],
       "existing_external": [
         {
@@ -287,15 +290,6 @@
         }
       ],
       "missing_contracts": [
-        {
-          "id": "rename_exchange",
-          "layer": "rpc",
-          "profiles": [
-            "daemon"
-          ],
-          "mandatory": false,
-          "reason": "RENAME_SWAP is a daemon extension and has no shared native syscall mapping in this contract."
-        },
         {
           "id": "rename_overwrite_identity",
           "layer": "posix",
@@ -323,7 +317,9 @@
         "open_directory_rmdir_retains_identity",
         "open_unlink_path_reuse_keeps_old_inode",
         "path_dot_dot_physical_resolution",
-        "rename_preserves_inode_and_payload"
+        "rename_preserves_inode_and_payload",
+        "rename_exclusive_preserves_occupied_targets",
+        "rename_exchange_preserves_open_file_identity"
       ],
       "existing_external": [
         {
@@ -539,7 +535,8 @@
         "directory_handle_relative_create_survives_rename_and_path_reuse",
         "dup_shares_open_description_offset",
         "open_directory_rmdir_retains_identity",
-        "open_unlink_path_reuse_keeps_old_inode"
+        "open_unlink_path_reuse_keeps_old_inode",
+        "rename_exchange_preserves_open_file_identity"
       ],
       "existing_external": [
         {
@@ -1280,7 +1277,10 @@
       ]
     },
     "rename_exclusive_exchange": {
-      "case_ids": [],
+      "case_ids": [
+        "rename_exclusive_preserves_occupied_targets",
+        "rename_exchange_preserves_open_file_identity"
+      ],
       "existing_external": [
         {
           "id": "daemon_exchange",
@@ -1306,11 +1306,10 @@
           "id": "native_rename_flags",
           "layer": "posix",
           "profiles": [
-            "reference",
             "mounted"
           ],
           "mandatory": false,
-          "reason": "Exclusive and exchange rename are daemon extensions and are not represented as portable POSIX rename operations."
+          "reason": "The mounted forkfs frontend has no verified successful RENAME_EXCL or RENAME_SWAP contract."
         }
       ]
     },
