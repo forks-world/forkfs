@@ -60,7 +60,8 @@
     "data": {
       "case_ids": [
         "append_adds_bytes_at_end",
-        "rename_preserves_inode_and_payload"
+        "rename_preserves_inode_and_payload",
+        "rename_overwrite_retains_open_destination_identity"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -149,7 +150,9 @@
         "dangling_symlink_lstat_readlink_and_follow",
         "mkdir_and_exclusive_create_conflicts",
         "terminal_dot_path_type_errors",
-        "seek_preserves_shared_cursor_on_failure"
+        "seek_preserves_shared_cursor_on_failure",
+        "exclusive_create_dangling_symlink_no_clobber",
+        "exclusive_create_hardlink_alias_no_clobber"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -163,7 +166,12 @@
         "rmdir_nonempty_rejected_without_changes",
         "terminal_dot_path_type_errors",
         "seek_preserves_shared_cursor_on_failure",
-        "rename_exclusive_preserves_occupied_targets"
+        "rename_exclusive_preserves_occupied_targets",
+        "rename_nonempty_directory_replacement_is_atomic",
+        "exclusive_create_dangling_symlink_no_clobber",
+        "exclusive_create_hardlink_alias_no_clobber",
+        "rpc_revision_writable_open_read_only",
+        "rpc_revision_mkdir_at_read_only"
       ],
       "existing_external": [
         {
@@ -179,7 +187,10 @@
       "missing_contracts": []
     },
     "create_exclusive": {
-      "case_ids": [],
+      "case_ids": [
+        "exclusive_create_dangling_symlink_no_clobber",
+        "exclusive_create_hardlink_alias_no_clobber"
+      ],
       "existing_external": [
         {
           "id": "daemon_file_flags",
@@ -215,7 +226,8 @@
     "symlink": {
       "case_ids": [
         "dangling_symlink_lstat_readlink_and_follow",
-        "mkdir_through_dangling_symlink_trailing_slash"
+        "mkdir_through_dangling_symlink_trailing_slash",
+        "exclusive_create_dangling_symlink_no_clobber"
       ],
       "existing_external": [
         {
@@ -256,7 +268,8 @@
     },
     "dangling": {
       "case_ids": [
-        "dangling_symlink_lstat_readlink_and_follow"
+        "dangling_symlink_lstat_readlink_and_follow",
+        "exclusive_create_dangling_symlink_no_clobber"
       ],
       "existing_external": [
         {
@@ -276,7 +289,11 @@
         "rename_directory_type_mismatch_is_atomic",
         "rename_preserves_inode_and_payload",
         "rename_exclusive_preserves_occupied_targets",
-        "rename_exchange_preserves_open_file_identity"
+        "rename_exchange_preserves_open_file_identity",
+        "rename_overwrite_retains_open_destination_identity",
+        "rename_nonempty_directory_replacement_is_atomic",
+        "rename_hardlink_alias_is_noop",
+        "rename_cross_parent_replaces_empty_directory"
       ],
       "existing_external": [
         {
@@ -289,27 +306,7 @@
           ]
         }
       ],
-      "missing_contracts": [
-        {
-          "id": "rename_overwrite_identity",
-          "layer": "posix",
-          "profiles": [
-            "reference",
-            "mounted"
-          ],
-          "mandatory": false,
-          "reason": "Initial shared cases cover simple rename and type mismatch, not replacement of an existing file or nonempty directory."
-        },
-        {
-          "id": "rename_overwrite_identity_rpc",
-          "layer": "rpc",
-          "profiles": [
-            "daemon"
-          ],
-          "mandatory": false,
-          "reason": "The first RPC contract cases do not cover ordinary rename replacement of an existing file or nonempty directory."
-        }
-      ]
+      "missing_contracts": []
     },
     "identity": {
       "case_ids": [
@@ -319,7 +316,11 @@
         "path_dot_dot_physical_resolution",
         "rename_preserves_inode_and_payload",
         "rename_exclusive_preserves_occupied_targets",
-        "rename_exchange_preserves_open_file_identity"
+        "rename_exchange_preserves_open_file_identity",
+        "rename_overwrite_retains_open_destination_identity",
+        "rename_hardlink_alias_is_noop",
+        "rename_cross_parent_replaces_empty_directory",
+        "exclusive_create_hardlink_alias_no_clobber"
       ],
       "existing_external": [
         {
@@ -336,7 +337,10 @@
     },
     "hardlink": {
       "case_ids": [
-        "hardlink_unlink_link_count"
+        "hardlink_unlink_link_count",
+        "rename_hardlink_alias_is_noop",
+        "exclusive_create_hardlink_alias_no_clobber",
+        "rpc_revision_hardlink_recreate"
       ],
       "existing_external": [
         {
@@ -422,7 +426,8 @@
     },
     "pread_pwrite": {
       "case_ids": [
-        "binary_pread_pwrite_and_sparse_hole"
+        "binary_pread_pwrite_and_sparse_hole",
+        "positioned_write_preserves_shared_cursor"
       ],
       "existing_external": [
         {
@@ -536,7 +541,10 @@
         "dup_shares_open_description_offset",
         "open_directory_rmdir_retains_identity",
         "open_unlink_path_reuse_keeps_old_inode",
-        "rename_exchange_preserves_open_file_identity"
+        "rename_exchange_preserves_open_file_identity",
+        "rename_overwrite_retains_open_destination_identity",
+        "rename_cross_parent_replaces_empty_directory",
+        "independent_open_and_dup_cursor_isolation"
       ],
       "existing_external": [
         {
@@ -553,7 +561,9 @@
     },
     "dup": {
       "case_ids": [
-        "dup_shares_open_description_offset"
+        "dup_shares_open_description_offset",
+        "independent_open_and_dup_cursor_isolation",
+        "positioned_write_preserves_shared_cursor"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -561,7 +571,9 @@
     "shared_offset": {
       "case_ids": [
         "dup_shares_open_description_offset",
-        "seek_preserves_shared_cursor_on_failure"
+        "seek_preserves_shared_cursor_on_failure",
+        "independent_open_and_dup_cursor_isolation",
+        "positioned_write_preserves_shared_cursor"
       ],
       "existing_external": [
         {
@@ -586,7 +598,8 @@
     "path_reuse": {
       "case_ids": [
         "directory_handle_relative_create_survives_rename_and_path_reuse",
-        "open_unlink_path_reuse_keeps_old_inode"
+        "open_unlink_path_reuse_keeps_old_inode",
+        "rpc_revision_hardlink_recreate"
       ],
       "existing_external": [
         {
@@ -631,7 +644,8 @@
     },
     "directory_fd_identity": {
       "case_ids": [
-        "directory_handle_relative_create_survives_rename_and_path_reuse"
+        "directory_handle_relative_create_survives_rename_and_path_reuse",
+        "rename_cross_parent_replaces_empty_directory"
       ],
       "existing_external": [
         {
@@ -659,7 +673,8 @@
     },
     "mkdir_at": {
       "case_ids": [
-        "directory_handle_relative_create_survives_rename_and_path_reuse"
+        "directory_handle_relative_create_survives_rename_and_path_reuse",
+        "rpc_revision_mkdir_at_read_only"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -741,7 +756,8 @@
     },
     "xattr": {
       "case_ids": [
-        "binary_xattr_create_replace_remove"
+        "binary_xattr_create_replace_remove",
+        "rpc_revision_metadata_restart"
       ],
       "existing_external": [
         {
@@ -785,7 +801,11 @@
     },
     "snapshot": {
       "case_ids": [
-        "rpc_snapshot_read_only_isolation"
+        "rpc_snapshot_read_only_isolation",
+        "rpc_revision_writable_open_read_only",
+        "rpc_revision_mkdir_at_read_only",
+        "rpc_revision_hardlink_recreate",
+        "rpc_revision_metadata_restart"
       ],
       "existing_external": [
         {
@@ -822,7 +842,11 @@
     },
     "revision_isolation": {
       "case_ids": [
-        "rpc_snapshot_read_only_isolation"
+        "rpc_snapshot_read_only_isolation",
+        "rpc_revision_writable_open_read_only",
+        "rpc_revision_mkdir_at_read_only",
+        "rpc_revision_hardlink_recreate",
+        "rpc_revision_metadata_restart"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -830,7 +854,11 @@
     "rpc_extension": {
       "case_ids": [
         "rpc_snapshot_read_only_isolation",
-        "sync_restart_persistence"
+        "sync_restart_persistence",
+        "rpc_revision_writable_open_read_only",
+        "rpc_revision_mkdir_at_read_only",
+        "rpc_revision_hardlink_recreate",
+        "rpc_revision_metadata_restart"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -874,7 +902,8 @@
     },
     "restart": {
       "case_ids": [
-        "sync_restart_persistence"
+        "sync_restart_persistence",
+        "rpc_revision_metadata_restart"
       ],
       "existing_external": [
         {
@@ -891,7 +920,8 @@
     },
     "persistence": {
       "case_ids": [
-        "sync_restart_persistence"
+        "sync_restart_persistence",
+        "rpc_revision_metadata_restart"
       ],
       "existing_external": [
         {

@@ -2999,6 +2999,1433 @@
           }
         }
       ]
+    },
+    {
+      "id": "rename_overwrite_retains_open_destination_identity",
+      "families": [
+        "rename",
+        "identity",
+        "fd_lifetime",
+        "data"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "src",
+          "data_hex": "736f75726365"
+        },
+        {
+          "type": "file",
+          "path": "dst",
+          "data_hex": "6f6c64"
+        }
+      ],
+      "steps": [
+        {
+          "op": "stat",
+          "args": {
+            "path": "src"
+          },
+          "save": "src_stat",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "dst",
+            "flags": [
+              "read"
+            ]
+          },
+          "save": "dst_fd",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "fstat",
+          "args": {
+            "handle": {
+              "ref": "dst_fd",
+              "field": "handle"
+            }
+          },
+          "save": "dst_stat",
+          "expect": {
+            "errno": 0,
+            "inode_not": {
+              "ref": "src_stat",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "rename",
+          "args": {
+            "source": "src",
+            "target": "dst"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "src"
+          },
+          "expect": {
+            "errno": "ENOENT",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "dst"
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "src_stat",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "dst"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "736f75726365"
+          }
+        },
+        {
+          "op": "fstat",
+          "args": {
+            "handle": {
+              "ref": "dst_fd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "dst_stat",
+              "field": "inode"
+            },
+            "links": 0
+          }
+        },
+        {
+          "op": "pread",
+          "args": {
+            "handle": {
+              "ref": "dst_fd",
+              "field": "handle"
+            },
+            "offset": 0,
+            "count": 3
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "6f6c64"
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "dst_fd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "rename_nonempty_directory_replacement_is_atomic",
+      "families": [
+        "rename",
+        "failure_atomicity"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "directory",
+          "path": "src"
+        },
+        {
+          "type": "file",
+          "path": "src/source",
+          "data_hex": "73"
+        },
+        {
+          "type": "directory",
+          "path": "dst"
+        },
+        {
+          "type": "file",
+          "path": "dst/child",
+          "data_hex": "64"
+        }
+      ],
+      "steps": [
+        {
+          "op": "rename",
+          "args": {
+            "source": "src",
+            "target": "dst"
+          },
+          "expect": {
+            "errno": "ENOTEMPTY",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "src/source"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "73"
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "dst/child"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "64"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rename_hardlink_alias_is_noop",
+      "families": [
+        "rename",
+        "hardlink",
+        "identity"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "src",
+          "data_hex": "68617264"
+        }
+      ],
+      "steps": [
+        {
+          "op": "link",
+          "args": {
+            "source": "src",
+            "target": "dst"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "src"
+          },
+          "save": "original",
+          "expect": {
+            "errno": 0,
+            "links": 2
+          }
+        },
+        {
+          "op": "rename",
+          "args": {
+            "source": "src",
+            "target": "dst"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "src"
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "original",
+              "field": "inode"
+            },
+            "links": 2
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "dst"
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "original",
+              "field": "inode"
+            },
+            "links": 2
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "dst"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "68617264"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rename_cross_parent_replaces_empty_directory",
+      "families": [
+        "rename",
+        "identity",
+        "directory_fd_identity",
+        "fd_lifetime"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "directory",
+          "path": "left"
+        },
+        {
+          "type": "directory",
+          "path": "right"
+        },
+        {
+          "type": "directory",
+          "path": "left/src"
+        },
+        {
+          "type": "directory",
+          "path": "left/src/sub"
+        },
+        {
+          "type": "file",
+          "path": "left/src/sub/data",
+          "data_hex": "78"
+        },
+        {
+          "type": "directory",
+          "path": "right/dst"
+        }
+      ],
+      "steps": [
+        {
+          "op": "stat",
+          "args": {
+            "path": "left/src"
+          },
+          "save": "src_stat",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "right/dst",
+            "flags": [
+              "read",
+              "directory"
+            ]
+          },
+          "save": "dst_fd",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "fstat",
+          "args": {
+            "handle": {
+              "ref": "dst_fd",
+              "field": "handle"
+            }
+          },
+          "save": "dst_stat",
+          "expect": {
+            "errno": 0,
+            "inode_not": {
+              "ref": "src_stat",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "rename",
+          "args": {
+            "source": "left/src",
+            "target": "right/dst"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "left/src"
+          },
+          "expect": {
+            "errno": "ENOENT",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "right/dst"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "directory",
+            "inode": {
+              "ref": "src_stat",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "right/dst/sub/data"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "78"
+          }
+        },
+        {
+          "op": "fstat",
+          "args": {
+            "handle": {
+              "ref": "dst_fd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0,
+            "type": "directory",
+            "inode": {
+              "ref": "dst_stat",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "dst_fd",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "exclusive_create_dangling_symlink_no_clobber",
+      "families": [
+        "create_exclusive",
+        "symlink",
+        "dangling",
+        "errno",
+        "failure_atomicity"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "symlink",
+          "path": "link",
+          "target": "missing"
+        }
+      ],
+      "steps": [
+        {
+          "op": "lstat",
+          "args": {
+            "path": "link"
+          },
+          "save": "link_inode",
+          "expect": {
+            "errno": 0,
+            "type": "symlink",
+            "target": "missing"
+          }
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "link",
+            "flags": [
+              "write",
+              "create",
+              "exclusive"
+            ]
+          },
+          "expect": {
+            "errno": "EEXIST",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "lstat",
+          "args": {
+            "path": "link"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "symlink",
+            "target": "missing",
+            "inode": {
+              "ref": "link_inode",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "missing"
+          },
+          "expect": {
+            "errno": "ENOENT",
+            "unchanged": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "exclusive_create_hardlink_alias_no_clobber",
+      "families": [
+        "create_exclusive",
+        "hardlink",
+        "identity",
+        "failure_atomicity",
+        "errno"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "target",
+          "data_hex": "616263646566"
+        }
+      ],
+      "steps": [
+        {
+          "op": "link",
+          "args": {
+            "source": "target",
+            "target": "alias"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "target"
+          },
+          "save": "inode",
+          "expect": {
+            "errno": 0,
+            "links": 2,
+            "size": 6
+          }
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "alias",
+            "flags": [
+              "write",
+              "create",
+              "exclusive"
+            ]
+          },
+          "expect": {
+            "errno": "EEXIST",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "alias"
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "inode",
+              "field": "inode"
+            },
+            "links": 2,
+            "size": 6
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "target"
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "inode",
+              "field": "inode"
+            },
+            "links": 2,
+            "size": 6
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "alias"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "616263646566"
+          }
+        }
+      ]
+    },
+    {
+      "id": "independent_open_and_dup_cursor_isolation",
+      "families": [
+        "fd_lifetime",
+        "dup",
+        "shared_offset"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "target",
+          "data_hex": "616263646566"
+        }
+      ],
+      "steps": [
+        {
+          "op": "open",
+          "args": {
+            "path": "target",
+            "flags": [
+              "read"
+            ]
+          },
+          "save": "h",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "dup",
+          "args": {
+            "handle": {
+              "ref": "h",
+              "field": "handle"
+            }
+          },
+          "save": "d",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "target",
+            "flags": [
+              "read"
+            ]
+          },
+          "save": "other",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "read_next",
+          "args": {
+            "handle": {
+              "ref": "h",
+              "field": "handle"
+            },
+            "count": 2
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "6162",
+            "offset": 2
+          }
+        },
+        {
+          "op": "read_next",
+          "args": {
+            "handle": {
+              "ref": "other",
+              "field": "handle"
+            },
+            "count": 1
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "61",
+            "offset": 1
+          }
+        },
+        {
+          "op": "read_next",
+          "args": {
+            "handle": {
+              "ref": "d",
+              "field": "handle"
+            },
+            "count": 2
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "6364",
+            "offset": 4
+          }
+        },
+        {
+          "op": "read_next",
+          "args": {
+            "handle": {
+              "ref": "other",
+              "field": "handle"
+            },
+            "count": 2
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "6263",
+            "offset": 3
+          }
+        }
+      ]
+    },
+    {
+      "id": "positioned_write_preserves_shared_cursor",
+      "families": [
+        "pread_pwrite",
+        "dup",
+        "shared_offset"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "target",
+          "data_hex": "616263646566"
+        }
+      ],
+      "steps": [
+        {
+          "op": "open",
+          "args": {
+            "path": "target",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "save": "h",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "dup",
+          "args": {
+            "handle": {
+              "ref": "h",
+              "field": "handle"
+            }
+          },
+          "save": "d",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "seek",
+          "args": {
+            "handle": {
+              "ref": "h",
+              "field": "handle"
+            },
+            "displacement": 2,
+            "whence": "set"
+          },
+          "expect": {
+            "errno": 0,
+            "offset": 2
+          }
+        },
+        {
+          "op": "pwrite",
+          "args": {
+            "handle": {
+              "ref": "d",
+              "field": "handle"
+            },
+            "offset": 4,
+            "data_hex": "5859"
+          },
+          "expect": {
+            "errno": 0,
+            "written": 2
+          }
+        },
+        {
+          "op": "seek",
+          "args": {
+            "handle": {
+              "ref": "h",
+              "field": "handle"
+            },
+            "displacement": 0,
+            "whence": "cur"
+          },
+          "expect": {
+            "errno": 0,
+            "offset": 2
+          }
+        },
+        {
+          "op": "pread",
+          "args": {
+            "handle": {
+              "ref": "h",
+              "field": "handle"
+            },
+            "offset": 0,
+            "count": 1
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "61"
+          }
+        },
+        {
+          "op": "seek",
+          "args": {
+            "handle": {
+              "ref": "h",
+              "field": "handle"
+            },
+            "displacement": 0,
+            "whence": "cur"
+          },
+          "expect": {
+            "errno": 0,
+            "offset": 2
+          }
+        },
+        {
+          "op": "read_next",
+          "args": {
+            "handle": {
+              "ref": "d",
+              "field": "handle"
+            },
+            "count": 4
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "63645859",
+            "offset": 6
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "target"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "616263645859"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rpc_revision_writable_open_read_only",
+      "families": [
+        "snapshot",
+        "revision_isolation",
+        "rpc_extension",
+        "failure_atomicity"
+      ],
+      "profiles": [
+        "daemon"
+      ],
+      "layers": [
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "00ff416200"
+        }
+      ],
+      "steps": [
+        {
+          "op": "snapshot",
+          "args": {
+            "name": "before"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "write"
+            ],
+            "revision": "before"
+          },
+          "expect": {
+            "errno": "EROFS",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f",
+            "revision": "before"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "00ff416200"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rpc_revision_mkdir_at_read_only",
+      "families": [
+        "snapshot",
+        "revision_isolation",
+        "rpc_extension",
+        "failure_atomicity",
+        "mkdir_at"
+      ],
+      "profiles": [
+        "daemon"
+      ],
+      "layers": [
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "directory",
+          "path": "d"
+        }
+      ],
+      "steps": [
+        {
+          "op": "snapshot",
+          "args": {
+            "name": "before"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "d",
+            "flags": [
+              "read",
+              "directory"
+            ],
+            "revision": "before"
+          },
+          "save": "dirfd",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "mkdir_at",
+          "args": {
+            "handle": {
+              "ref": "dirfd",
+              "field": "handle"
+            },
+            "name": "child",
+            "revision": "before"
+          },
+          "expect": {
+            "errno": "EROFS",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "listdir",
+          "args": {
+            "path": "d",
+            "revision": "before"
+          },
+          "expect": {
+            "errno": 0,
+            "names": []
+          }
+        }
+      ]
+    },
+    {
+      "id": "rpc_revision_hardlink_recreate",
+      "families": [
+        "snapshot",
+        "revision_isolation",
+        "rpc_extension",
+        "hardlink",
+        "path_reuse"
+      ],
+      "profiles": [
+        "daemon"
+      ],
+      "layers": [
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "00ff416200"
+        }
+      ],
+      "steps": [
+        {
+          "op": "link",
+          "args": {
+            "source": "f",
+            "target": "alias"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "f"
+          },
+          "save": "original",
+          "expect": {
+            "errno": 0,
+            "links": 2
+          }
+        },
+        {
+          "op": "snapshot",
+          "args": {
+            "name": "before"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "unlink",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "create",
+          "args": {
+            "path": "f",
+            "data_hex": "deadbeef"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "f",
+            "revision": "before"
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "original",
+              "field": "inode"
+            },
+            "links": 2
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "alias",
+            "revision": "before"
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "original",
+              "field": "inode"
+            },
+            "links": 2
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f",
+            "revision": "before"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "00ff416200"
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "alias",
+            "revision": "before"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "00ff416200"
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "inode_not": {
+              "ref": "original",
+              "field": "inode"
+            },
+            "links": 1
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "alias"
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "original",
+              "field": "inode"
+            },
+            "links": 1
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "deadbeef"
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "alias"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "00ff416200"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rpc_revision_metadata_restart",
+      "families": [
+        "snapshot",
+        "revision_isolation",
+        "rpc_extension",
+        "persistence",
+        "restart",
+        "xattr"
+      ],
+      "profiles": [
+        "daemon"
+      ],
+      "layers": [
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "00ff416200"
+        }
+      ],
+      "steps": [
+        {
+          "op": "chmod",
+          "args": {
+            "path": "f",
+            "mode": 416
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "xattr_set",
+          "args": {
+            "path": "f",
+            "name": "user.contract",
+            "value_hex": "00ff",
+            "policy": "upsert"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "snapshot",
+          "args": {
+            "name": "before"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "chmod",
+          "args": {
+            "path": "f",
+            "mode": 384
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "xattr_set",
+          "args": {
+            "path": "f",
+            "name": "user.contract",
+            "value_hex": "abcd",
+            "policy": "upsert"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "create",
+          "args": {
+            "path": "f",
+            "data_hex": "112233",
+            "exclusive": false
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "restart",
+          "args": {},
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "f",
+            "revision": "before"
+          },
+          "expect": {
+            "errno": 0,
+            "mode": 416
+          }
+        },
+        {
+          "op": "xattr_get",
+          "args": {
+            "path": "f",
+            "name": "user.contract",
+            "revision": "before"
+          },
+          "expect": {
+            "errno": 0,
+            "value_hex": "00ff"
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f",
+            "revision": "before"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "00ff416200"
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "mode": 384
+          }
+        },
+        {
+          "op": "xattr_get",
+          "args": {
+            "path": "f",
+            "name": "user.contract"
+          },
+          "expect": {
+            "errno": 0,
+            "value_hex": "abcd"
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "112233"
+          }
+        }
+      ]
     }
   ]
 }
