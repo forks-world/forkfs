@@ -60,7 +60,8 @@
     "data": {
       "case_ids": [
         "append_adds_bytes_at_end",
-        "rename_preserves_inode_and_payload"
+        "rename_preserves_inode_and_payload",
+        "rename_overwrite_retains_open_destination_identity"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -69,7 +70,12 @@
       "case_ids": [
         "binary_xattr_create_replace_remove",
         "chmod_and_utime_metadata_roundtrip",
-        "rename_preserves_inode_and_payload"
+        "rename_preserves_inode_and_payload",
+        "xattr_policy_failures_preserve_binary_state",
+        "hardlink_xattr_shared_after_unlink",
+        "relative_symlink_chmod_utime_follow_referent",
+        "truncate_hardlink_preserves_inode_metadata",
+        "symlink_xattr_nofollow_independent_from_referent"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -81,7 +87,8 @@
         "mkdir_through_dangling_symlink_trailing_slash",
         "mkdir_trailing_slash_succeeds",
         "path_dot_dot_physical_resolution",
-        "terminal_dot_path_type_errors"
+        "terminal_dot_path_type_errors",
+        "relative_symlink_chmod_utime_follow_referent"
       ],
       "existing_external": [
         {
@@ -149,7 +156,13 @@
         "dangling_symlink_lstat_readlink_and_follow",
         "mkdir_and_exclusive_create_conflicts",
         "terminal_dot_path_type_errors",
-        "seek_preserves_shared_cursor_on_failure"
+        "seek_preserves_shared_cursor_on_failure",
+        "exclusive_create_dangling_symlink_no_clobber",
+        "exclusive_create_hardlink_alias_no_clobber",
+        "readonly_handle_writes_rejected_unchanged",
+        "xattr_policy_failures_preserve_binary_state",
+        "mkdir_at_regular_handle_enotdir_preserves_cursor",
+        "mkdir_at_existing_file_atomic_then_reuse_handle"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -163,7 +176,17 @@
         "rmdir_nonempty_rejected_without_changes",
         "terminal_dot_path_type_errors",
         "seek_preserves_shared_cursor_on_failure",
-        "rename_exclusive_preserves_occupied_targets"
+        "rename_exclusive_preserves_occupied_targets",
+        "rename_nonempty_directory_replacement_is_atomic",
+        "exclusive_create_dangling_symlink_no_clobber",
+        "exclusive_create_hardlink_alias_no_clobber",
+        "rpc_revision_writable_open_read_only",
+        "rpc_revision_mkdir_at_read_only",
+        "readonly_handle_writes_rejected_unchanged",
+        "xattr_policy_failures_preserve_binary_state",
+        "symlink_xattr_nofollow_independent_from_referent",
+        "mkdir_at_regular_handle_enotdir_preserves_cursor",
+        "mkdir_at_existing_file_atomic_then_reuse_handle"
       ],
       "existing_external": [
         {
@@ -179,7 +202,10 @@
       "missing_contracts": []
     },
     "create_exclusive": {
-      "case_ids": [],
+      "case_ids": [
+        "exclusive_create_dangling_symlink_no_clobber",
+        "exclusive_create_hardlink_alias_no_clobber"
+      ],
       "existing_external": [
         {
           "id": "daemon_file_flags",
@@ -215,7 +241,10 @@
     "symlink": {
       "case_ids": [
         "dangling_symlink_lstat_readlink_and_follow",
-        "mkdir_through_dangling_symlink_trailing_slash"
+        "mkdir_through_dangling_symlink_trailing_slash",
+        "exclusive_create_dangling_symlink_no_clobber",
+        "relative_symlink_chmod_utime_follow_referent",
+        "symlink_xattr_nofollow_independent_from_referent"
       ],
       "existing_external": [
         {
@@ -256,7 +285,8 @@
     },
     "dangling": {
       "case_ids": [
-        "dangling_symlink_lstat_readlink_and_follow"
+        "dangling_symlink_lstat_readlink_and_follow",
+        "exclusive_create_dangling_symlink_no_clobber"
       ],
       "existing_external": [
         {
@@ -276,7 +306,11 @@
         "rename_directory_type_mismatch_is_atomic",
         "rename_preserves_inode_and_payload",
         "rename_exclusive_preserves_occupied_targets",
-        "rename_exchange_preserves_open_file_identity"
+        "rename_exchange_preserves_open_file_identity",
+        "rename_overwrite_retains_open_destination_identity",
+        "rename_nonempty_directory_replacement_is_atomic",
+        "rename_hardlink_alias_is_noop",
+        "rename_cross_parent_replaces_empty_directory"
       ],
       "existing_external": [
         {
@@ -289,27 +323,7 @@
           ]
         }
       ],
-      "missing_contracts": [
-        {
-          "id": "rename_overwrite_identity",
-          "layer": "posix",
-          "profiles": [
-            "reference",
-            "mounted"
-          ],
-          "mandatory": false,
-          "reason": "Initial shared cases cover simple rename and type mismatch, not replacement of an existing file or nonempty directory."
-        },
-        {
-          "id": "rename_overwrite_identity_rpc",
-          "layer": "rpc",
-          "profiles": [
-            "daemon"
-          ],
-          "mandatory": false,
-          "reason": "The first RPC contract cases do not cover ordinary rename replacement of an existing file or nonempty directory."
-        }
-      ]
+      "missing_contracts": []
     },
     "identity": {
       "case_ids": [
@@ -319,7 +333,16 @@
         "path_dot_dot_physical_resolution",
         "rename_preserves_inode_and_payload",
         "rename_exclusive_preserves_occupied_targets",
-        "rename_exchange_preserves_open_file_identity"
+        "rename_exchange_preserves_open_file_identity",
+        "rename_overwrite_retains_open_destination_identity",
+        "rename_hardlink_alias_is_noop",
+        "rename_cross_parent_replaces_empty_directory",
+        "exclusive_create_hardlink_alias_no_clobber",
+        "open_truncate_preserves_old_handle_inode",
+        "hardlink_xattr_shared_after_unlink",
+        "relative_symlink_chmod_utime_follow_referent",
+        "truncate_hardlink_preserves_inode_metadata",
+        "unlinked_handle_mutations_leave_replacement_intact"
       ],
       "existing_external": [
         {
@@ -336,7 +359,12 @@
     },
     "hardlink": {
       "case_ids": [
-        "hardlink_unlink_link_count"
+        "hardlink_unlink_link_count",
+        "rename_hardlink_alias_is_noop",
+        "exclusive_create_hardlink_alias_no_clobber",
+        "rpc_revision_hardlink_recreate",
+        "hardlink_xattr_shared_after_unlink",
+        "truncate_hardlink_preserves_inode_metadata"
       ],
       "existing_external": [
         {
@@ -354,14 +382,18 @@
     "unlink": {
       "case_ids": [
         "hardlink_unlink_link_count",
-        "open_unlink_path_reuse_keeps_old_inode"
+        "open_unlink_path_reuse_keeps_old_inode",
+        "hardlink_xattr_shared_after_unlink",
+        "unlinked_handle_mutations_leave_replacement_intact"
       ],
       "existing_external": [],
       "missing_contracts": []
     },
     "nlink": {
       "case_ids": [
-        "hardlink_unlink_link_count"
+        "hardlink_unlink_link_count",
+        "hardlink_xattr_shared_after_unlink",
+        "truncate_hardlink_preserves_inode_metadata"
       ],
       "existing_external": [
         {
@@ -405,7 +437,9 @@
       "case_ids": [
         "append_adds_bytes_at_end",
         "binary_pread_pwrite_and_sparse_hole",
-        "truncate_shrink_grow_zero_fills"
+        "truncate_shrink_grow_zero_fills",
+        "truncate_hardlink_preserves_inode_metadata",
+        "unlinked_handle_mutations_leave_replacement_intact"
       ],
       "existing_external": [
         {
@@ -422,7 +456,10 @@
     },
     "pread_pwrite": {
       "case_ids": [
-        "binary_pread_pwrite_and_sparse_hole"
+        "binary_pread_pwrite_and_sparse_hole",
+        "positioned_write_preserves_shared_cursor",
+        "readonly_handle_writes_rejected_unchanged",
+        "unlinked_handle_mutations_leave_replacement_intact"
       ],
       "existing_external": [
         {
@@ -473,7 +510,11 @@
     },
     "truncate": {
       "case_ids": [
-        "truncate_shrink_grow_zero_fills"
+        "truncate_shrink_grow_zero_fills",
+        "ftruncate_dup_preserves_cursor_and_zero_fills",
+        "open_truncate_preserves_old_handle_inode",
+        "truncate_hardlink_preserves_inode_metadata",
+        "unlinked_handle_mutations_leave_replacement_intact"
       ],
       "existing_external": [
         {
@@ -490,21 +531,26 @@
     },
     "size": {
       "case_ids": [
-        "truncate_shrink_grow_zero_fills"
+        "truncate_shrink_grow_zero_fills",
+        "ftruncate_dup_preserves_cursor_and_zero_fills",
+        "open_truncate_preserves_old_handle_inode",
+        "truncate_hardlink_preserves_inode_metadata"
       ],
       "existing_external": [],
       "missing_contracts": []
     },
     "zero_fill": {
       "case_ids": [
-        "truncate_shrink_grow_zero_fills"
+        "truncate_shrink_grow_zero_fills",
+        "ftruncate_dup_preserves_cursor_and_zero_fills"
       ],
       "existing_external": [],
       "missing_contracts": []
     },
     "append": {
       "case_ids": [
-        "append_adds_bytes_at_end"
+        "append_adds_bytes_at_end",
+        "append_dup_seek_writes_at_eof"
       ],
       "existing_external": [
         {
@@ -536,7 +582,12 @@
         "dup_shares_open_description_offset",
         "open_directory_rmdir_retains_identity",
         "open_unlink_path_reuse_keeps_old_inode",
-        "rename_exchange_preserves_open_file_identity"
+        "rename_exchange_preserves_open_file_identity",
+        "rename_overwrite_retains_open_destination_identity",
+        "rename_cross_parent_replaces_empty_directory",
+        "independent_open_and_dup_cursor_isolation",
+        "open_truncate_preserves_old_handle_inode",
+        "unlinked_handle_mutations_leave_replacement_intact"
       ],
       "existing_external": [
         {
@@ -553,7 +604,11 @@
     },
     "dup": {
       "case_ids": [
-        "dup_shares_open_description_offset"
+        "dup_shares_open_description_offset",
+        "independent_open_and_dup_cursor_isolation",
+        "positioned_write_preserves_shared_cursor",
+        "append_dup_seek_writes_at_eof",
+        "ftruncate_dup_preserves_cursor_and_zero_fills"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -561,7 +616,11 @@
     "shared_offset": {
       "case_ids": [
         "dup_shares_open_description_offset",
-        "seek_preserves_shared_cursor_on_failure"
+        "seek_preserves_shared_cursor_on_failure",
+        "independent_open_and_dup_cursor_isolation",
+        "positioned_write_preserves_shared_cursor",
+        "append_dup_seek_writes_at_eof",
+        "ftruncate_dup_preserves_cursor_and_zero_fills"
       ],
       "existing_external": [
         {
@@ -586,7 +645,9 @@
     "path_reuse": {
       "case_ids": [
         "directory_handle_relative_create_survives_rename_and_path_reuse",
-        "open_unlink_path_reuse_keeps_old_inode"
+        "open_unlink_path_reuse_keeps_old_inode",
+        "rpc_revision_hardlink_recreate",
+        "unlinked_handle_mutations_leave_replacement_intact"
       ],
       "existing_external": [
         {
@@ -631,7 +692,9 @@
     },
     "directory_fd_identity": {
       "case_ids": [
-        "directory_handle_relative_create_survives_rename_and_path_reuse"
+        "directory_handle_relative_create_survives_rename_and_path_reuse",
+        "rename_cross_parent_replaces_empty_directory",
+        "mkdir_at_existing_file_atomic_then_reuse_handle"
       ],
       "existing_external": [
         {
@@ -659,7 +722,10 @@
     },
     "mkdir_at": {
       "case_ids": [
-        "directory_handle_relative_create_survives_rename_and_path_reuse"
+        "directory_handle_relative_create_survives_rename_and_path_reuse",
+        "rpc_revision_mkdir_at_read_only",
+        "mkdir_at_regular_handle_enotdir_preserves_cursor",
+        "mkdir_at_existing_file_atomic_then_reuse_handle"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -690,7 +756,8 @@
     },
     "chmod": {
       "case_ids": [
-        "chmod_and_utime_metadata_roundtrip"
+        "chmod_and_utime_metadata_roundtrip",
+        "relative_symlink_chmod_utime_follow_referent"
       ],
       "existing_external": [
         {
@@ -707,7 +774,8 @@
     },
     "times": {
       "case_ids": [
-        "chmod_and_utime_metadata_roundtrip"
+        "chmod_and_utime_metadata_roundtrip",
+        "relative_symlink_chmod_utime_follow_referent"
       ],
       "existing_external": [
         {
@@ -724,7 +792,8 @@
     },
     "stat": {
       "case_ids": [
-        "chmod_and_utime_metadata_roundtrip"
+        "chmod_and_utime_metadata_roundtrip",
+        "relative_symlink_chmod_utime_follow_referent"
       ],
       "existing_external": [
         {
@@ -741,7 +810,12 @@
     },
     "xattr": {
       "case_ids": [
-        "binary_xattr_create_replace_remove"
+        "binary_xattr_create_replace_remove",
+        "rpc_revision_metadata_restart",
+        "xattr_policy_failures_preserve_binary_state",
+        "hardlink_xattr_shared_after_unlink",
+        "truncate_hardlink_preserves_inode_metadata",
+        "symlink_xattr_nofollow_independent_from_referent"
       ],
       "existing_external": [
         {
@@ -763,29 +837,26 @@
           ]
         }
       ],
-      "missing_contracts": [
-        {
-          "id": "nofollow_xattr",
-          "layer": "posix",
-          "profiles": [
-            "reference",
-            "mounted"
-          ],
-          "mandatory": false,
-          "reason": "The initial common xattr operation targets a regular file; symlink no-follow xattr behavior is not represented."
-        }
-      ]
+      "missing_contracts": []
     },
     "binary_xattr": {
       "case_ids": [
-        "binary_xattr_create_replace_remove"
+        "binary_xattr_create_replace_remove",
+        "xattr_policy_failures_preserve_binary_state",
+        "hardlink_xattr_shared_after_unlink",
+        "symlink_xattr_nofollow_independent_from_referent"
       ],
       "existing_external": [],
       "missing_contracts": []
     },
     "snapshot": {
       "case_ids": [
-        "rpc_snapshot_read_only_isolation"
+        "rpc_snapshot_read_only_isolation",
+        "rpc_revision_writable_open_read_only",
+        "rpc_revision_mkdir_at_read_only",
+        "rpc_revision_hardlink_recreate",
+        "rpc_revision_metadata_restart",
+        "rpc_two_snapshots_live_binary_restart"
       ],
       "existing_external": [
         {
@@ -822,7 +893,12 @@
     },
     "revision_isolation": {
       "case_ids": [
-        "rpc_snapshot_read_only_isolation"
+        "rpc_snapshot_read_only_isolation",
+        "rpc_revision_writable_open_read_only",
+        "rpc_revision_mkdir_at_read_only",
+        "rpc_revision_hardlink_recreate",
+        "rpc_revision_metadata_restart",
+        "rpc_two_snapshots_live_binary_restart"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -830,7 +906,12 @@
     "rpc_extension": {
       "case_ids": [
         "rpc_snapshot_read_only_isolation",
-        "sync_restart_persistence"
+        "sync_restart_persistence",
+        "rpc_revision_writable_open_read_only",
+        "rpc_revision_mkdir_at_read_only",
+        "rpc_revision_hardlink_recreate",
+        "rpc_revision_metadata_restart",
+        "rpc_two_snapshots_live_binary_restart"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -874,7 +955,9 @@
     },
     "restart": {
       "case_ids": [
-        "sync_restart_persistence"
+        "sync_restart_persistence",
+        "rpc_revision_metadata_restart",
+        "rpc_two_snapshots_live_binary_restart"
       ],
       "existing_external": [
         {
@@ -891,7 +974,9 @@
     },
     "persistence": {
       "case_ids": [
-        "sync_restart_persistence"
+        "sync_restart_persistence",
+        "rpc_revision_metadata_restart",
+        "rpc_two_snapshots_live_binary_restart"
       ],
       "existing_external": [
         {
@@ -1013,7 +1098,10 @@
       ]
     },
     "flags": {
-      "case_ids": [],
+      "case_ids": [
+        "append_dup_seek_writes_at_eof",
+        "open_truncate_preserves_old_handle_inode"
+      ],
       "existing_external": [
         {
           "id": "daemon_rpc_open_flags",
@@ -1052,7 +1140,7 @@
             "mounted"
           ],
           "mandatory": false,
-          "reason": "Initial cases exercise read/write/directory flags and create exclusive as relevant; O_NOFOLLOW, O_TRUNC, O_APPEND descriptor semantics, and the complete invalid flag matrix remain uncovered."
+          "reason": "O_NOFOLLOW and the full invalid flag matrix remain outside the shared cases."
         },
         {
           "id": "full_open_flag_matrix_rpc",
@@ -1061,7 +1149,7 @@
             "daemon"
           ],
           "mandatory": false,
-          "reason": "The initial RPC open cases do not cover O_NOFOLLOW, O_TRUNC, O_APPEND descriptor interactions, or the complete invalid flag matrix."
+          "reason": "O_NOFOLLOW and the full invalid flag matrix remain outside the shared cases."
         }
       ]
     },
