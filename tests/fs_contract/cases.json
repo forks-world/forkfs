@@ -8961,6 +8961,32 @@
           }
         }
       ]
+    },
+    {
+      "id": "rpc_volume_name_revision_isolation_and_persistence",
+      "families": ["volume_name", "revision_isolation", "failure_atomicity", "restart"],
+      "profiles": ["daemon"],
+      "layers": ["rpc"],
+      "mandatory": true,
+      "fixture": [{"type":"file","path":"identity-file","data_hex":"7061796c6f6164"}],
+      "steps": [
+        {"op":"volume_name","args":{},"expect":{"errno":0,"name":"ForkFS"}},
+        {"op":"lstat","args":{"path":"."},"save":"root_before","expect":{"errno":0,"type":"directory"}},
+        {"op":"lstat","args":{"path":"identity-file"},"save":"file_before","expect":{"errno":0,"type":"file"}},
+        {"op":"set_volume_name","args":{"name":"RPC卷"},"expect":{"errno":0,"name":"RPC卷"}},
+        {"op":"lstat","args":{"path":"."},"expect":{"errno":0,"inode":{"ref":"root_before","field":"inode"}}},
+        {"op":"lstat","args":{"path":"identity-file"},"expect":{"errno":0,"inode":{"ref":"file_before","field":"inode"}}},
+        {"op":"read","args":{"path":"identity-file"},"expect":{"errno":0,"data_hex":"7061796c6f6164"}},
+        {"op":"snapshot","args":{"name":"unicode_label"},"expect":{"errno":0}},
+        {"op":"set_volume_name","args":{"name":"Live 東京"},"expect":{"errno":0,"name":"Live 東京"}},
+        {"op":"volume_name","args":{"revision":"unicode_label"},"expect":{"errno":0,"name":"RPC卷"}},
+        {"op":"set_volume_name","args":{"name":"readonly","revision":"unicode_label"},"expect":{"errno":"EROFS","unchanged":true}},
+        {"op":"set_volume_name","args":{"name":"bad/name"},"expect":{"errno":"EINVAL","unchanged":true}},
+        {"op":"set_volume_name","args":{"name":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"},"expect":{"errno":"ENAMETOOLONG","unchanged":true}},
+        {"op":"restart","args":{},"expect":{"errno":0}},
+        {"op":"volume_name","args":{},"expect":{"errno":0,"name":"Live 東京"}},
+        {"op":"volume_name","args":{"revision":"unicode_label"},"expect":{"errno":0,"name":"RPC卷"}}
+      ]
     }
   ]
 }
