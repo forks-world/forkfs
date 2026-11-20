@@ -1444,9 +1444,8 @@ void Namespace::exchange(const std::string& source,const std::string& target) {
 void Namespace::verify() const {
     std::lock_guard lock(container_.mutex_);verify_locked();
 }
-void Namespace::verify_locked() const {
-    const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);
-    if(journal.is_leveldb())(void)j.references(); // Validate the full CoW tree before namespace traversal.
+namespace {
+void verify_namespace(const NamespaceView& j) {
     auto root_id=root(j);need(inode(j,root_id).directory,"root inode is not a directory");std::set<std::string> expected;std::map<std::string,uint64_t> references;
     std::set<std::string> directories;expected.insert(root_key);
     if(j.contains(volume_name_key)){(void)read_volume_name(j);expected.insert(volume_name_key);}
@@ -1474,6 +1473,13 @@ void Namespace::verify_locked() const {
     }
     auto actual=j.keys(prefix);need(actual.size()==expected.size(),"orphan namespace records");
     for(const auto& key:actual)need(expected.contains(key),"unexpected namespace record");
+}
+}
+
+void Namespace::verify_locked() const {
+    const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);
+    if(journal.is_leveldb())(void)j.references(); // Validate the full CoW tree before namespace traversal.
+    verify_namespace(j);
     if(!revision_) {
         auto pre=history+"orphan/"+view_+"/";auto orphan_keys=journal.keys(pre);std::set<std::string> checked;
         for(const auto& key:orphan_keys) {
@@ -1501,6 +1507,265 @@ void Namespace::verify_locked() const {
         }
     }
 }
+namespace {
+std::string merge_json_string(const std::string& value) {
+    constexpr char hex[] = "0123456789abcdef";
+    std::string result = "\"";
+    for (unsigned char byte : value) {
+        if (byte == '"' || byte == '\\') result += '\\';
+        if (byte < 0x20) {
+            result += "\\u00";
+            result += hex[byte >> 4];
+            result += hex[byte & 15];
+        } else result += static_cast<char>(byte);
+    }
+    return result + '"';
+}
+
+bool revision_ancestor(const Journal& journal, const ObjectId& base, ObjectId revision) {
+    std::optional<uint64_t> previous;
+    while (revision != ObjectId{}) {
+        if (revision == base) return true;
+        auto record = journal.get_object(revision);
+        need(record.size() == 80 && !memcmp(record.data(), "FFREV001", 8), "invalid merge revision");
+        auto sequence = load(record.data() + 72, 8);
+        need(!previous || sequence < *previous, "invalid merge ancestry sequence");
+        previous = sequence;
+        std::copy_n(record.data() + 40, revision.size(), revision.begin());
+    }
+    return false;
+}
+
+// Treat an inode and its file content, chunks, and xattrs as one merge unit.
+std::string merge_group(const std::string& key) {
+    need(key.starts_with(prefix), "invalid merge namespace key");
+    auto relative = std::string_view(key).substr(prefix.size());
+    for (auto kind : {"content/", "chunk/", "xattr/"}) {
+        if (relative.starts_with(kind)) {
+            auto id = relative.substr(std::strlen(kind), 32);
+            if (valid_id(std::string(id))) return inode_key(std::string(id));
+        }
+    }
+    return key;
+}
+
+using MergeInputs = std::array<NamespaceView::Map, 3>;
+enum MergeSide { Base, Source, Target };
+
+std::optional<InodeInfo> merge_directory(const Journal& journal, const std::string& key,
+                                         const MergeInputs& inputs) {
+    if (!key.starts_with(prefix + "inode/")) return std::nullopt;
+    auto read = [&](const NamespaceView::Map& records) -> std::optional<InodeInfo> {
+        auto it = records.find(key);
+        if (it == records.end()) return std::nullopt;
+        auto node = decode_inode(journal.get_object(it->second), key.substr((prefix + "inode/").size()));
+        if (!node.directory) return std::nullopt;
+        return node;
+    };
+    auto base = read(inputs[Base]), source = read(inputs[Source]), target = read(inputs[Target]);
+    if (!base || !source || !target) return std::nullopt;
+    auto stable = [](InodeInfo node) {
+        node.links = 2;
+        node.modified_ns = node.changed_ns = 0;
+        return encode(node);
+    };
+    if (stable(*base) != stable(*source) || stable(*base) != stable(*target)) return std::nullopt;
+    auto other = [&](MergeSide side) {
+        auto records = inputs[side];
+        records.erase(key);
+        return records;
+    };
+    if (other(Base) != other(Source) || other(Base) != other(Target)) return std::nullopt;
+    target->modified_ns = std::max(target->modified_ns, source->modified_ns);
+    target->changed_ns = std::max(target->changed_ns, source->changed_ns);
+    return target;
+}
+
+std::string merge_conflict(const std::string& key) {
+    auto relative = key.substr(prefix.size());
+    if (relative.starts_with("inode/")) {
+        return "{\"kind\":\"inode\",\"inode_id\":" + merge_json_string(relative.substr(6)) + "}";
+    }
+    if (relative.starts_with("entry/") && relative.size() > 39) {
+        return "{\"kind\":\"entry\",\"parent_inode_id\":" + merge_json_string(relative.substr(6, 32))
+            + ",\"name\":" + merge_json_string(relative.substr(39)) + "}";
+    }
+    return "{\"kind\":\"metadata\",\"record\":" + merge_json_string(relative) + "}";
+}
+}
+
+std::string Namespace::merge(const std::string& base, const std::string& source,
+                             const std::optional<std::string>& expected_token) {
+    valid_view_name(view_);
+    valid_view_name(base);
+    valid_view_name(source);
+    need(!revision_, "merge target must be a mutable World");
+    std::lock_guard lock(container_.mutex_);
+    auto& journal = *container_.journal_;
+    need(journal.is_leveldb(), "merge requires a LevelDB repository");
+    // Leave time in the host's three-second RPC window to commit and reply.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    auto check_budget = [&] {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::system_error(ETIMEDOUT, std::generic_category(), "merge preparation timed out");
+        }
+    };
+
+    const auto head_key = history + "world/" + view_;
+    const auto target_manifest = journal.contains(head_key)?hex_id(journal.root_object(head_key)):"flat";
+    const auto base_id = journal.root_object(history + "revision/" + base);
+    const auto source_id = journal.root_object(history + "revision/" + source);
+    const auto fields = "FFMERGE01/" + container_.repository_id() + "/" + view_ + "/"
+        + std::to_string(journal.sequence()) + "/" + target_manifest + "/" + hex_id(base_id) + "/" + hex_id(source_id);
+    const auto token = hex_id(Journal::object_id(Bytes(fields.begin(), fields.end())));
+    if (expected_token && *expected_token != token) {
+        throw std::system_error(ESTALE, std::generic_category(), "merge plan is stale");
+    }
+    if (expected_token) {
+        for (const auto& [owner, count] : container_.open_counts_) {
+            if (owner.first == view_ && count != 0) {
+                throw std::system_error(EBUSY, std::generic_category(), "World has open file handles");
+            }
+        }
+    }
+    const auto target_base = journal.get(history + "base/" + view_);
+    ObjectId target_base_id{};
+    need(target_base.size() == target_base_id.size(), "invalid target merge base");
+    std::copy(target_base.begin(), target_base.end(), target_base_id.begin());
+    need(revision_ancestor(journal, base_id, source_id) && revision_ancestor(journal, base_id, target_base_id),
+         "base checkpoint must be an ancestor of source checkpoint and target history");
+
+    const auto base_manifest = revision_manifest(journal, base);
+    const auto source_manifest = revision_manifest(journal, source);
+    const auto response = "{\"world\":" + merge_json_string(view_) + ",\"base_revision_id\":\"" + hex_id(base_id)
+        + "\",\"source_revision_id\":\"" + hex_id(source_id) + "\",\"target_manifest_id\":"
+        + (target_manifest == "flat"?"null":"\"" + target_manifest + "\"");
+    auto finish = [&](const std::string& state, const std::string& manifest = {}) {
+        return response + ",\"state\":\"" + state + "\",\"token\":\"" + token + "\""
+            + (manifest.empty()?"":",\"manifest_id\":\"" + manifest + "\"") + "}\n";
+    };
+    if (base_manifest == source_manifest || target_manifest == hex_id(source_manifest)) {
+        return finish("unchanged", target_manifest == "flat"?"":target_manifest);
+    }
+
+    NamespaceView base_view(journal, base_manifest), source_view(journal, source_manifest), target_view(journal, view_);
+    verify_namespace(source_view);
+    check_budget();
+    if (target_manifest == hex_id(base_manifest)) {
+        auto result = finish(expected_token?"merged":"ready", hex_id(source_manifest));
+        if (expected_token) journal.transact(journal.sequence(), {{head_key, std::nullopt, source_manifest}});
+        return result;
+    }
+
+    verify_namespace(base_view);
+    check_budget();
+    verify_namespace(target_view);
+    check_budget();
+    std::map<std::string, MergeInputs> groups;
+    auto group = [&](const NamespaceView::Map& refs, MergeSide side) {
+        for (const auto& [key, id] : refs) groups[merge_group(key)][side].emplace(key, id);
+    };
+    const auto target = target_view.references();
+    group(base_view.references(), Base);
+    group(source_view.references(), Source);
+    group(target, Target);
+    auto candidate = target;
+    std::set<std::string> source_directory_edits, target_directory_edits;
+    const auto entries = prefix + "entry/";
+    for (const auto& [key, inputs] : groups) {
+        if (key.starts_with(entries)) {
+            auto directory = inode_key(key.substr(entries.size(), 32));
+            if (inputs[Source] != inputs[Base]) source_directory_edits.insert(directory);
+            if (inputs[Target] != inputs[Base]) target_directory_edits.insert(directory);
+        }
+    }
+    std::map<std::string, InodeInfo> directories;
+    std::vector<std::string> conflicts;
+    for (const auto& [key, inputs] : groups) {
+        check_budget();
+        if (inputs[Source] == inputs[Base] || inputs[Source] == inputs[Target]) continue;
+        if (inputs[Target] == inputs[Base]) {
+            for (const auto& [record, id] : inputs[Target]) candidate.erase(record);
+            candidate.insert(inputs[Source].begin(), inputs[Source].end());
+        } else if (auto directory = source_directory_edits.contains(key) && target_directory_edits.contains(key)
+                        ?merge_directory(journal, key, inputs):std::nullopt) {
+            directories.emplace(key, *directory);
+        } else {
+            conflicts.push_back(merge_conflict(key));
+            if (conflicts.size() == 32) break;
+        }
+    }
+    auto conflict_result = [&] {
+        auto result = response + ",\"state\":\"conflict\",\"conflicts\":[";
+        for (size_t i = 0; i < conflicts.size(); ++i) {
+            if (i) result += ',';
+            result += conflicts[i];
+        }
+        if (conflicts.size() == 32) return result + "],\"conflicts_limited\":true}\n";
+        return result + "]}\n";
+    };
+    if (!conflicts.empty()) return conflict_result();
+
+    NamespaceView::Objects pending;
+    try {
+        NamespaceView proposed(journal, candidate, pending);
+        for (auto& [key, directory] : directories) {
+            directory.links = 2;
+            for (const auto& entry : proposed.keys(directory_prefix(directory.id))) {
+                auto child = decode_id(proposed.get(entry));
+                if (inode(proposed, child).directory) {
+                    link_capacity(directory.links);
+                    ++directory.links;
+                }
+            }
+            auto data = encode(directory);
+            auto id = Journal::object_id(data);
+            candidate[key] = id;
+            pending.emplace(id, std::move(data));
+        }
+        verify_namespace(proposed);
+    } catch (const std::system_error& error) {
+        if (error.code() != std::error_code(EMLINK, std::generic_category())) throw;
+        conflicts.push_back("{\"kind\":\"namespace\",\"detail\":" + merge_json_string(error.what()) + "}");
+    } catch (const std::runtime_error& error) {
+        conflicts.push_back("{\"kind\":\"namespace\",\"detail\":" + merge_json_string(error.what()) + "}");
+    }
+    check_budget();
+    if (!conflicts.empty()) return conflict_result();
+
+    NamespaceView::Changes changes;
+    for (const auto& [key, id] : candidate) {
+        auto previous = target.find(key);
+        if (previous == target.end() || previous->second != id) changes.emplace(key, id);
+    }
+    for (const auto& [key, id] : target) if (!candidate.contains(key)) changes.emplace(key, std::nullopt);
+    if (changes.empty()) return finish("unchanged", target_manifest == "flat"?"":target_manifest);
+
+    auto plan = target_view.plan(changes, false, {}, container_.tree_height_cache_.get());
+    const auto manifest_id = hex_id(Journal::object_id(plan.manifest));
+    for (auto& data : plan.objects) {
+        auto id = Journal::object_id(data);
+        pending.try_emplace(id, std::move(data));
+    }
+    std::vector<Mutation> batch;
+    size_t bytes = plan.manifest.size();
+    for (auto& [id, data] : pending) {
+        auto key = history + "object/" + hex_id(id);
+        if (!journal.contains(key)) {
+            bytes += data.size();
+            batch.push_back({std::move(key), std::move(data)});
+        }
+    }
+    need(batch.size() < 4096 && bytes <= 16 * 1024 * 1024, "merge exceeds atomic publication batch limit");
+    check_budget();
+    auto result = finish(expected_token?"merged":"ready", manifest_id);
+    if (expected_token) {
+        batch.push_back({head_key, std::move(plan.manifest)});
+        journal.transact(journal.sequence(), batch);
+    }
+    return result;
+}
+
 const Container::OpenHandle& Namespace::find_handle(const std::string& token) const {
     auto it=container_.handles_.find(token);if(it==container_.handles_.end())bad_handle("invalid or expired file handle");
     if(it->second.view!=view_ || it->second.revision!=revision_)bad_handle("file handle belongs to another view");return it->second;
