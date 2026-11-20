@@ -36,11 +36,13 @@ OPS = {
     "restart": set(), "sync": {"handle"},
     "flock": {"handle", "lock_mode"}, "rpc_lock": {"handle", "lock_mode"},
     "rpc_range_lock": {"handle", "lock_mode", "start", "length"},
+    "rpc_dir_open": {"path"}, "rpc_dir_page": {"cursor", "limit"},
+    "rpc_dir_rewind": {"cursor"}, "rpc_dir_close": {"cursor"},
 }
 EXPECT_KEYS = {"errno", "unchanged", "data_hex", "type", "inode", "inode_not", "links",
                "size", "mode", "mtime_ns", "atime_ns", "target", "names", "offset",
-               "written", "value_hex", "granted"}
-RESULT_FIELDS = EXPECT_KEYS - {"errno", "unchanged", "inode_not"} | {"handle"}
+               "ordered_names", "eof", "written", "value_hex", "granted"}
+RESULT_FIELDS = EXPECT_KEYS - {"errno", "unchanged", "inode_not", "ordered_names"} | {"handle", "cursor"}
 REF_FIELD = {"ref", "field"}
 ERRNOS = {
     "E2BIG", "EACCES", "EBADF", "EBUSY", "EEXIST", "EFAULT", "EFBIG", "EINTR",
@@ -163,6 +165,8 @@ REQUIRED_ARGS = {
     "mkdir_at": {"handle", "name"}, "snapshot": {"name"}, "restart": set(), "sync": {"handle"},
     "flock": {"handle", "lock_mode"}, "rpc_lock": {"handle", "lock_mode"},
     "rpc_range_lock": {"handle", "lock_mode", "start", "length"},
+    "rpc_dir_open": {"path"}, "rpc_dir_page": {"cursor", "limit"},
+    "rpc_dir_rewind": {"cursor"}, "rpc_dir_close": {"cursor"},
 }
 OPTIONAL_ARGS = {op: OPS[op] - REQUIRED_ARGS[op] for op in OPS}
 REVISION_OPS = {"mkdir", "create", "open", "read", "pread", "pwrite", "read_next", "write_next",
@@ -183,6 +187,8 @@ EXPECT_FOR_OP = {
     "xattr_set": set(), "xattr_get": {"value_hex"}, "xattr_remove": set(),
     "mkdir_at": {"inode"}, "snapshot": set(), "restart": set(), "sync": set(),
     "flock": set(), "rpc_lock": {"granted"}, "rpc_range_lock": {"granted"},
+    "rpc_dir_open": {"cursor"}, "rpc_dir_page": {"ordered_names", "eof"},
+    "rpc_dir_rewind": set(), "rpc_dir_close": set(),
 }
 
 
@@ -250,7 +256,7 @@ def validate_case_file(doc):
                             raise SchemaError(f"{fw}: symlink target escapes owned root")
                     elif part not in ("", "."):
                         depth += 1
-        symbols = set()
+        symbols = {}
         for si, step in enumerate(case["steps"]):
             sw = f"{where}.steps[{si}]"
             _keys(step, {"op", "args", "expect"}, {"save"}, sw)
@@ -261,6 +267,8 @@ def validate_case_file(doc):
                 raise SchemaError(f"{sw}: flock is POSIX-only")
             if op in {"rpc_lock", "rpc_range_lock"} and set(case["layers"]) != {"rpc"}:
                 raise SchemaError(f"{sw}: {op} is RPC-only")
+            if op.startswith("rpc_dir_") and (set(case["profiles"]) != {"daemon"} or set(case["layers"]) != {"rpc"}):
+                raise SchemaError(f"{sw}: directory cursor operations are daemon/RPC-only")
             if not isinstance(step["args"], dict):
                 raise SchemaError(f"{sw}.args must be an object")
             required = REQUIRED_ARGS[op]
@@ -268,10 +276,12 @@ def validate_case_file(doc):
             _keys(step["args"], required, optional, sw + ".args")
             for key, value in step["args"].items():
                 _ref_or(value, sw + ".args." + key)
-                if isinstance(value, dict) and key != "handle":
-                    raise SchemaError(f"{sw}.args.{key}: references are allowed only for owned handles")
+                if isinstance(value, dict) and key not in {"handle", "cursor"}:
+                    raise SchemaError(f"{sw}.args.{key}: references are allowed only for owned handles or cursors")
                 if isinstance(value, dict) and value["ref"] not in symbols:
                     raise SchemaError(f"{sw}: forward or unknown ref {value['ref']!r}")
+                if isinstance(value, dict) and key in {"handle", "cursor"} and symbols[value["ref"]] != key:
+                    raise SchemaError(f"{sw}: {key} ref must come from a successful owned {key} result")
                 if key == "revision" and (set(case["profiles"]) != {"daemon"} or set(case["layers"]) != {"rpc"} or not isinstance(value, str) or not value):
                     raise SchemaError(f"{sw}: revision selector is daemon/RPC-only")
                 if key in {"path", "source"} and isinstance(value, str):
@@ -284,11 +294,11 @@ def validate_case_file(doc):
                         raise SchemaError(f"{sw}: symlink target must be relative and safe")
                 if key in {"path", "source", "target", "name", "policy", "revision"} and not isinstance(value, str):
                     raise SchemaError(f"{sw}.args.{key} must be a string")
-                if key == "handle" and (not isinstance(value, dict) or value.get("field") != "handle"):
-                    raise SchemaError(f"{sw}.args.handle must reference an owned handle")
+                if key in {"handle", "cursor"} and (not isinstance(value, dict) or value.get("field") != key):
+                    raise SchemaError(f"{sw}.args.{key} must reference an owned {key}")
                 if key in {"data_hex", "value_hex"}:
                     _hex(value, sw + ".args." + key)
-                if key in {"mode", "size", "offset", "count", "atime_ns", "mtime_ns"} and not isinstance(value, dict) and type(value) is not int:
+                if key in {"mode", "size", "offset", "count", "limit", "atime_ns", "mtime_ns"} and not isinstance(value, dict) and type(value) is not int:
                     raise SchemaError(f"{sw}.args.{key} must be an integer")
                 if key in {"mode", "size", "count", "atime_ns", "mtime_ns"} and type(value) is int and value < 0:
                     raise SchemaError(f"{sw}.args.{key} must be nonnegative")
@@ -307,6 +317,10 @@ def validate_case_file(doc):
                 start, length = step["args"]["start"], step["args"]["length"]
                 if type(start) is not int or type(length) is not int or not 0 <= start <= (1 << 63) - 1 or not 0 <= length <= (1 << 63) - start:
                     raise SchemaError(f"{sw}: invalid signed offset lock range")
+            if op == "rpc_dir_page":
+                limit = step["args"]["limit"]
+                if type(limit) is not int or not 1 <= limit <= 1024:
+                    raise SchemaError(f"{sw}.args.limit must be an integer from 1 through 1024")
             if op == "seek":
                 displacement = step["args"]["displacement"]
                 if type(displacement) is not int or not -(1 << 63) <= displacement < (1 << 63):
@@ -338,6 +352,8 @@ def validate_case_file(doc):
                 if any(not isinstance(x, str) or x not in ERRNOS for x in ev.values()):
                     raise SchemaError(f"{sw}: invalid platform errno map")
             success = type(ev) is int and ev == 0
+            if success and op == "rpc_dir_page" and not {"ordered_names", "eof"} <= set(exp):
+                raise SchemaError(f"{sw}: successful directory page must assert names and eof")
             if success and op in {"rpc_lock", "rpc_range_lock"} and "granted" not in exp:
                 raise SchemaError(f"{sw}: successful RPC lock must assert granted")
             if not success and exp.get("unchanged") is not True:
@@ -349,14 +365,16 @@ def validate_case_file(doc):
                         raise SchemaError(f"{sw}: {key} is not a result field for {op}")
                     if key == "granted" and type(value) is not bool:
                         raise SchemaError(f"{sw}.expect.granted must be a literal boolean")
+                    if key == "eof" and type(value) is not bool:
+                        raise SchemaError(f"{sw}.expect.eof must be a literal boolean")
                     if key == "unchanged" and value is not True:
                         raise SchemaError(f"{sw}: unchanged must be true")
                     if isinstance(value, dict) and value["ref"] not in symbols:
                         raise SchemaError(f"{sw}: forward or unknown assertion ref {value['ref']!r}")
                     if key in {"data_hex", "value_hex"} and isinstance(value, str):
                         _hex(value, sw + ".expect." + key)
-                    if key == "names" and (not isinstance(value, list) or any(not isinstance(x, str) for x in value)):
-                        raise SchemaError(f"{sw}.expect.names must be string array")
+                    if key in {"names", "ordered_names"} and (not isinstance(value, list) or any(not isinstance(x, str) for x in value)):
+                        raise SchemaError(f"{sw}.expect.{key} must be string array")
                     if key == "type" and value not in {"file", "directory", "symlink"}:
                         raise SchemaError(f"{sw}.expect.type is invalid")
                     if key in {"inode", "inode_not", "links", "size", "mode", "mtime_ns", "atime_ns", "offset", "written"} and type(value) is int and value < 0:
@@ -375,7 +393,10 @@ def validate_case_file(doc):
                 sym = step["save"]
                 if not isinstance(sym, str) or not SYMBOL.fullmatch(sym) or sym in symbols:
                     raise SchemaError(f"{sw}: invalid or duplicate save symbol")
-                symbols.add(sym)
+                produces = op == "rpc_dir_open" or op in {"open", "dup"}
+                if produces and not success:
+                    raise SchemaError(f"{sw}: owned resource save requires successful operation")
+                symbols[sym] = "cursor" if op == "rpc_dir_open" and success else "handle" if op in {"open", "dup"} and success else ""
     return {case["id"]: case for case in doc["cases"]}
 
 

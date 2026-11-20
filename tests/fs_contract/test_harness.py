@@ -78,6 +78,32 @@ class HarnessModelTests(unittest.TestCase):
         doc["cases"][0]["steps"][0]["op"] = "eval"
         with self.assertRaises(SchemaError): validate_case_file(doc)
 
+    def test_rpc_directory_pages_reject_reversed_order(self):
+        observed = {"names": ["b", "a"], "eof": False}
+        self.assertTrue(runner._compare(observed, {"ordered_names": ["a", "b"], "eof": False}, {}))
+        self.assertFalse(runner._compare(observed, {"names": ["a", "b"]}, {}))
+
+    def test_rpc_directory_cursor_schema_is_owned_and_bounded(self):
+        def doc(limit=2, cursor_ref="opened"):
+            case = _valid_case()["cases"][0]
+            case["profiles"], case["layers"] = ["daemon"], ["rpc"]
+            case["steps"] = [
+                {"op": "rpc_dir_open", "args": {"path": "d"}, "save": "opened", "expect": {"errno": 0}},
+                {"op": "rpc_dir_page", "args": {"cursor": {"ref": cursor_ref, "field": "cursor"}, "limit": limit},
+                 "expect": {"errno": 0, "ordered_names": ["a"], "eof": False}},
+            ]
+            return {"schema_version": 1, "cases": [case]}
+        validate_case_file(doc())
+        for limit in (0, 1025, True):
+            with self.subTest(limit=limit), self.assertRaises(SchemaError): validate_case_file(doc(limit))
+        with self.assertRaises(SchemaError): validate_case_file(doc(cursor_ref="missing"))
+        bad = doc()
+        bad["cases"][0]["steps"][1]["expect"]["eof"] = 1
+        with self.assertRaises(SchemaError): validate_case_file(bad)
+        bad = doc()
+        bad["cases"][0]["steps"][1]["expect"].pop("eof")
+        with self.assertRaises(SchemaError): validate_case_file(bad)
+
     def test_rename_extensions_reject_paths_outside_owned_root(self):
         for op in ("rename_exclusive", "rename_exchange"):
             for field in ("source", "target"):

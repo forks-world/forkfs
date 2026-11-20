@@ -8615,6 +8615,352 @@
           }
         }
       ]
+    },
+    {
+      "id": "rpc_directory_cursor_snapshot_paging",
+      "families": [
+        "readdir",
+        "rpc_directory_cursor"
+      ],
+      "profiles": [
+        "daemon"
+      ],
+      "layers": [
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "directory",
+          "path": "d"
+        },
+        {
+          "type": "file",
+          "path": "d/a",
+          "data_hex": ""
+        },
+        {
+          "type": "file",
+          "path": "d/b",
+          "data_hex": ""
+        },
+        {
+          "type": "file",
+          "path": "d/c",
+          "data_hex": ""
+        },
+        {
+          "type": "file",
+          "path": "d/d",
+          "data_hex": ""
+        }
+      ],
+      "steps": [
+        {
+          "op": "rpc_dir_open",
+          "args": {
+            "path": "d"
+          },
+          "save": "old",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "rpc_dir_page",
+          "args": {
+            "cursor": {
+              "ref": "old",
+              "field": "cursor"
+            },
+            "limit": 2
+          },
+          "expect": {
+            "errno": 0,
+            "eof": false,
+            "ordered_names": [
+              "a",
+              "b"
+            ]
+          }
+        },
+        {
+          "op": "unlink",
+          "args": {
+            "path": "d/d"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "rename",
+          "args": {
+            "source": "d/c",
+            "target": "d/cc"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "create",
+          "args": {
+            "path": "d/e",
+            "data_hex": ""
+          },
+          "expect": {
+            "errno": 0,
+            "written": 0
+          }
+        },
+        {
+          "op": "rpc_dir_open",
+          "args": {
+            "path": "d"
+          },
+          "save": "fresh",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "rpc_dir_page",
+          "args": {
+            "cursor": {
+              "ref": "fresh",
+              "field": "cursor"
+            },
+            "limit": 2
+          },
+          "expect": {
+            "errno": 0,
+            "eof": false,
+            "ordered_names": [
+              "a",
+              "b"
+            ]
+          }
+        },
+        {
+          "op": "rpc_dir_page",
+          "args": {
+            "cursor": {
+              "ref": "old",
+              "field": "cursor"
+            },
+            "limit": 2
+          },
+          "expect": {
+            "errno": 0,
+            "eof": true,
+            "ordered_names": [
+              "c",
+              "d"
+            ]
+          }
+        },
+        {
+          "op": "rpc_dir_page",
+          "args": {
+            "cursor": {
+              "ref": "fresh",
+              "field": "cursor"
+            },
+            "limit": 2
+          },
+          "expect": {
+            "errno": 0,
+            "eof": true,
+            "ordered_names": [
+              "cc",
+              "e"
+            ]
+          }
+        },
+        {
+          "op": "rpc_dir_page",
+          "args": {
+            "cursor": {
+              "ref": "fresh",
+              "field": "cursor"
+            },
+            "limit": 2
+          },
+          "expect": {
+            "errno": 0,
+            "eof": true,
+            "ordered_names": []
+          }
+        },
+        {
+          "op": "rpc_dir_page",
+          "args": {
+            "cursor": {
+              "ref": "old",
+              "field": "cursor"
+            },
+            "limit": 2
+          },
+          "expect": {
+            "errno": 0,
+            "eof": true,
+            "ordered_names": []
+          }
+        },
+        {
+          "op": "rpc_dir_rewind",
+          "args": {
+            "cursor": {
+              "ref": "old",
+              "field": "cursor"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "rpc_dir_page",
+          "args": {
+            "cursor": {
+              "ref": "old",
+              "field": "cursor"
+            },
+            "limit": 2
+          },
+          "expect": {
+            "errno": 0,
+            "eof": false,
+            "ordered_names": [
+              "a",
+              "b"
+            ]
+          }
+        },
+        {
+          "op": "rpc_dir_page",
+          "args": {
+            "cursor": {
+              "ref": "old",
+              "field": "cursor"
+            },
+            "limit": 2
+          },
+          "expect": {
+            "errno": 0,
+            "eof": true,
+            "ordered_names": [
+              "c",
+              "d"
+            ]
+          }
+        },
+        {
+          "op": "rpc_dir_rewind",
+          "args": {
+            "cursor": {
+              "ref": "fresh",
+              "field": "cursor"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "rpc_dir_page",
+          "args": {
+            "cursor": {
+              "ref": "fresh",
+              "field": "cursor"
+            },
+            "limit": 1
+          },
+          "expect": {
+            "errno": 0,
+            "eof": false,
+            "ordered_names": [
+              "a"
+            ]
+          }
+        },
+        {
+          "op": "rpc_dir_page",
+          "args": {
+            "cursor": {
+              "ref": "fresh",
+              "field": "cursor"
+            },
+            "limit": 1
+          },
+          "expect": {
+            "errno": 0,
+            "eof": false,
+            "ordered_names": [
+              "b"
+            ]
+          }
+        },
+        {
+          "op": "rpc_dir_page",
+          "args": {
+            "cursor": {
+              "ref": "fresh",
+              "field": "cursor"
+            },
+            "limit": 1
+          },
+          "expect": {
+            "errno": 0,
+            "eof": false,
+            "ordered_names": [
+              "cc"
+            ]
+          }
+        },
+        {
+          "op": "rpc_dir_page",
+          "args": {
+            "cursor": {
+              "ref": "fresh",
+              "field": "cursor"
+            },
+            "limit": 1
+          },
+          "expect": {
+            "errno": 0,
+            "eof": true,
+            "ordered_names": [
+              "e"
+            ]
+          }
+        },
+        {
+          "op": "rpc_dir_close",
+          "args": {
+            "cursor": {
+              "ref": "old",
+              "field": "cursor"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "rpc_dir_close",
+          "args": {
+            "cursor": {
+              "ref": "fresh",
+              "field": "cursor"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        }
+      ]
     }
   ]
 }

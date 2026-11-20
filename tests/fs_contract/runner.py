@@ -53,7 +53,7 @@ def _compare(result, expected, saved):
         if key in ("errno", "unchanged"):
             continue
         wanted = resolve_refs(value, saved)
-        actual_key = "inode" if key == "inode_not" else key
+        actual_key = "inode" if key == "inode_not" else "names" if key == "ordered_names" else key
         if actual_key not in result:
             failures.append(f"result omitted required field {actual_key}")
             continue
@@ -64,6 +64,8 @@ def _compare(result, expected, saved):
             if actual.lower() != wanted.lower(): failures.append(f"{key} differs")
         elif key == "names":
             if not isinstance(actual, list) or Counter(actual) != Counter(wanted): failures.append("directory names differ")
+        elif key == "ordered_names":
+            if actual != wanted: failures.append(f"ordered directory names: expected {wanted!r}, got {actual!r}")
         elif actual != wanted:
             failures.append(f"{key}: expected {wanted!r}, got {actual!r}")
     return failures
