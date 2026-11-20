@@ -882,16 +882,86 @@ void Namespace::require_offline_locked() const {
     need(container_.handles_.empty() && !container_.compaction_running_,"retention requires an idle offline repository");
     for(const auto& pin:container_.directory_pins_)need(pin.expired(),"retention requires closed directory cursors");
 }
-std::string Namespace::drop_world(const std::string& name) {
-    valid_view_name(name);need(name!="main","cannot drop main World");
-    std::lock_guard lock(container_.mutex_);require_offline_locked();auto& j=*container_.journal_;
-    auto head=history+"world/"+name,base=history+"base/"+name;
-    need(j.contains(head) && j.contains(base),"World does not exist or has incomplete roots");
-    auto manifest=j.root_object(head);auto parent=j.get(base);need(parent.size()==32,"invalid World base");
-    ObjectId parent_id{};std::copy(parent.begin(),parent.end(),parent_id.begin());
-    j.transact(j.sequence(),{{head,std::nullopt},{base,std::nullopt}});
-    return "{\"world\":\""+name+"\",\"manifest_id\":\""+hex_id(manifest)+"\",\"base_revision_id\":\""+hex_id(parent_id)+"\",\"collected_objects\":0}\n";
+namespace {
+struct WorldRoots {
+    std::string head_key;
+    std::string base_key;
+    ObjectId manifest;
+    ObjectId base;
+
+    std::string describe(const std::string& name) const {
+        return "{\"world\":\"" + name + "\",\"manifest_id\":\"" + hex_id(manifest)
+            + "\",\"base_revision_id\":\"" + hex_id(base) + "\"";
+    }
+
+    std::string token(const Journal& journal, const std::string& repository,
+                      const std::string& name) const {
+        // The sequence distinguishes a recreated name even with identical roots.
+        const auto fields = "FFDISCARD01/" + repository + "/" + name + "/"
+            + std::to_string(journal.sequence()) + "/" + hex_id(manifest) + "/" + hex_id(base);
+        return hex_id(Journal::object_id(Bytes(fields.begin(), fields.end())));
+    }
+};
+
+WorldRoots world_roots(const Journal& journal, const std::string& name) {
+    WorldRoots roots{history + "world/" + name, history + "base/" + name, {}, {}};
+    const bool has_head = journal.contains(roots.head_key);
+    const bool has_base = journal.contains(roots.base_key);
+    if (!has_head && !has_base) {
+        throw std::system_error(ENOENT, std::generic_category(), "World does not exist");
+    }
+    need(has_head && has_base, "World has incomplete roots");
+    roots.manifest = journal.root_object(roots.head_key);
+    const auto base = journal.get(roots.base_key);
+    need(base.size() == roots.base.size(), "invalid World base");
+    std::copy(base.begin(), base.end(), roots.base.begin());
+    return roots;
 }
+
+void validate_discard_name(const std::string& name) {
+    valid_view_name(name);
+    if (name == "main") {
+        throw std::system_error(EPERM, std::generic_category(), "cannot drop main World");
+    }
+}
+}
+
+std::string Namespace::discard_plan(const std::string& name) const {
+    validate_discard_name(name);
+    std::lock_guard lock(container_.mutex_);
+    const auto& journal = *container_.journal_;
+    need(view_ == "main" && !revision_ && journal.is_leveldb(),
+         "online discard requires a LevelDB repository and explicit World name");
+    const auto roots = world_roots(journal, name);
+    return roots.describe(name) + ",\"token\":\""
+        + roots.token(journal, container_.id_, name) + "\"}\n";
+}
+
+std::string Namespace::drop_world(const std::string& name,
+                                  const std::optional<std::string>& expected_token) {
+    validate_discard_name(name);
+    std::lock_guard lock(container_.mutex_);
+    auto& journal = *container_.journal_;
+    if (expected_token) {
+        need(view_ == "main" && !revision_ && journal.is_leveldb(),
+             "online discard requires a LevelDB repository and explicit World name");
+        for (const auto& [owner, count] : container_.open_counts_) {
+            if (owner.first == name && count != 0) {
+                throw std::system_error(EBUSY, std::generic_category(), "World has open file handles");
+            }
+        }
+    } else {
+        require_offline_locked();
+    }
+    const auto roots = world_roots(journal, name);
+    if (expected_token && *expected_token != roots.token(journal, container_.id_, name)) {
+        throw std::system_error(ESTALE, std::generic_category(), "discard plan is stale");
+    }
+    auto result = roots.describe(name) + ",\"collected_objects\":0}\n";
+    journal.transact(journal.sequence(), {{roots.head_key, std::nullopt}, {roots.base_key, std::nullopt}});
+    return result;
+}
+
 std::string Namespace::forget_revision(const std::string& name) {
     valid_view_name(name);
     std::lock_guard lock(container_.mutex_);require_offline_locked();auto& j=*container_.journal_;
