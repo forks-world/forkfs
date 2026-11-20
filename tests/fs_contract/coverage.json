@@ -188,7 +188,8 @@
         "mkdir_at_regular_handle_enotdir_preserves_cursor",
         "mkdir_at_existing_file_atomic_then_reuse_handle",
         "rpc_volume_name_revision_isolation_and_persistence",
-        "rpc_sparse_seek_region_chunk_eof_cursor_and_orphan"
+        "rpc_sparse_seek_region_chunk_eof_cursor_and_orphan",
+        "rpc_allocation_accounting"
       ],
       "existing_external": [
         {
@@ -368,7 +369,8 @@
         "rpc_revision_hardlink_recreate",
         "hardlink_xattr_shared_after_unlink",
         "truncate_hardlink_preserves_inode_metadata",
-        "flock_hardlink_rename_same_inode"
+        "flock_hardlink_rename_same_inode",
+        "rpc_allocation_accounting"
       ],
       "existing_external": [
         {
@@ -481,7 +483,8 @@
     },
     "sparse_file": {
       "case_ids": [
-        "binary_pread_pwrite_and_sparse_hole"
+        "binary_pread_pwrite_and_sparse_hole",
+        "rpc_allocation_accounting"
       ],
       "existing_external": [
         {
@@ -912,7 +915,8 @@
         "rpc_revision_metadata_restart",
         "rpc_two_snapshots_live_binary_restart",
         "rpc_lock_revision_selector_isolation",
-        "rpc_volume_name_revision_isolation_and_persistence"
+        "rpc_volume_name_revision_isolation_and_persistence",
+        "rpc_allocation_accounting"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -1452,7 +1456,9 @@
       ]
     },
     "allocation_blocks": {
-      "case_ids": [],
+      "case_ids": [
+        "rpc_allocation_accounting"
+      ],
       "existing_external": [
         {
           "id": "native_allocation_mount",
@@ -1473,7 +1479,7 @@
             "mounted"
           ],
           "mandatory": false,
-          "reason": "The DSL has no stat.st_blocks or allocated_size assertion. Logical zero-fill tests do not prove physical allocation accounting or APFS reference behavior."
+          "reason": "The daemon profile checks RPC allocated_size. Native stat.st_blocks and APFS allocation behavior remain outside the DSL."
         }
       ]
     },

@@ -43,7 +43,7 @@ OPS = {
 }
 EXPECT_KEYS = {"errno", "unchanged", "data_hex", "type", "inode", "inode_not", "links", "name",
                "size", "mode", "mtime_ns", "atime_ns", "target", "names", "offset",
-               "ordered_names", "eof", "written", "value_hex", "granted"}
+               "ordered_names", "eof", "written", "value_hex", "granted", "allocated_size"}
 RESULT_FIELDS = EXPECT_KEYS - {"errno", "unchanged", "inode_not", "ordered_names"} | {"handle", "cursor"}
 REF_FIELD = {"ref", "field"}
 ERRNOS = {
@@ -180,12 +180,12 @@ REVISION_OPS = {"mkdir", "create", "open", "read", "pread", "pwrite", "read_next
                 "volume_name", "set_volume_name"}
 EXPECT_FOR_OP = {
     "mkdir": set(), "create": {"written"}, "open": {"handle"}, "close": set(),
-    "dup": {"handle"}, "fstat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns"},
+    "dup": {"handle"}, "fstat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns", "allocated_size"},
     "read": {"data_hex"}, "pread": {"data_hex"}, "pwrite": {"written"},
     "seek": {"offset"}, "read_next": {"data_hex", "offset"}, "write_next": {"written", "offset"},
     "truncate": set(), "ftruncate": set(), "append": {"written"},
-    "stat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns"},
-    "lstat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns", "target"},
+    "stat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns", "allocated_size"},
+    "lstat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns", "allocated_size", "target"},
     "listdir": {"names"}, "link": set(), "rename": set(), "symlink": set(),
     "rename_exclusive": set(), "rename_exchange": set(),
     "readlink": {"target"}, "unlink": set(), "rmdir": set(), "chmod": set(), "utime": set(),
@@ -368,6 +368,8 @@ def validate_case_file(doc):
                 if any(not isinstance(x, str) or x not in ERRNOS for x in ev.values()):
                     raise SchemaError(f"{sw}: invalid platform errno map")
             success = type(ev) is int and ev == 0
+            if "allocated_size" in exp and (set(case["layers"]) != {"rpc"} or set(case["profiles"]) != {"daemon"}):
+                raise SchemaError(f"{sw}: allocated_size is only available from daemon RPC")
             if success and op == "rpc_dir_page" and not {"ordered_names", "eof"} <= set(exp):
                 raise SchemaError(f"{sw}: successful directory page must assert names and eof")
             if success and op in {"rpc_lock", "rpc_range_lock"} and "granted" not in exp:
@@ -397,9 +399,9 @@ def validate_case_file(doc):
                         raise SchemaError(f"{sw}.expect.{key} must be string array")
                     if key == "type" and value not in {"file", "directory", "symlink"}:
                         raise SchemaError(f"{sw}.expect.type is invalid")
-                    if key in {"inode", "inode_not", "links", "size", "mode", "mtime_ns", "atime_ns", "offset", "written"} and type(value) is int and value < 0:
+                    if key in {"inode", "inode_not", "links", "size", "mode", "mtime_ns", "atime_ns", "offset", "written", "allocated_size"} and type(value) is int and value < 0:
                         raise SchemaError(f"{sw}.expect.{key} must be nonnegative")
-                    if key in {"links", "size", "mode", "mtime_ns", "atime_ns", "offset", "written"} and not isinstance(value, dict) and type(value) is not int:
+                    if key in {"links", "size", "mode", "mtime_ns", "atime_ns", "offset", "written", "allocated_size"} and not isinstance(value, dict) and type(value) is not int:
                         raise SchemaError(f"{sw}.expect.{key} must be an integer or result ref")
                     if key in {"inode", "inode_not"} and not isinstance(value, dict) and type(value) not in (int, str):
                         raise SchemaError(f"{sw}.expect.{key} must be an integer, opaque ID, or result ref")
