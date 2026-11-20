@@ -34,15 +34,17 @@ OPS = {
     "xattr_get": {"path", "name"}, "xattr_remove": {"path", "name"},
     "mkdir_at": {"handle", "name", "mode"}, "snapshot": {"name"},
     "restart": set(), "sync": {"handle"},
+    "flock": {"handle", "lock_mode"}, "rpc_lock": {"handle", "lock_mode"},
+    "rpc_range_lock": {"handle", "lock_mode", "start", "length"},
 }
 EXPECT_KEYS = {"errno", "unchanged", "data_hex", "type", "inode", "inode_not", "links",
                "size", "mode", "mtime_ns", "atime_ns", "target", "names", "offset",
-               "written", "value_hex"}
+               "written", "value_hex", "granted"}
 RESULT_FIELDS = EXPECT_KEYS - {"errno", "unchanged", "inode_not"} | {"handle"}
 REF_FIELD = {"ref", "field"}
 ERRNOS = {
     "E2BIG", "EACCES", "EBADF", "EBUSY", "EEXIST", "EFAULT", "EFBIG", "EINTR",
-    "EINVAL", "EIO", "EISDIR", "ELOOP", "EMFILE", "ENAMETOOLONG", "ENFILE",
+    "EINVAL", "EWOULDBLOCK", "EIO", "EISDIR", "ELOOP", "EMFILE", "ENAMETOOLONG", "ENFILE",
     "ENODATA", "ENOATTR", "ENOENT", "ENOSPC", "ENOTDIR", "ENOTEMPTY", "ENOTSUP",
     "EOPNOTSUPP", "EOVERFLOW", "EPERM", "ERANGE", "EROFS", "ESPIPE", "ESTALE", "ETIMEDOUT", "EXDEV",
 }
@@ -159,12 +161,14 @@ REQUIRED_ARGS = {
     "utime": {"path", "atime_ns", "mtime_ns"}, "xattr_set": {"path", "name", "value_hex", "policy"},
     "xattr_get": {"path", "name"}, "xattr_remove": {"path", "name"},
     "mkdir_at": {"handle", "name"}, "snapshot": {"name"}, "restart": set(), "sync": {"handle"},
+    "flock": {"handle", "lock_mode"}, "rpc_lock": {"handle", "lock_mode"},
+    "rpc_range_lock": {"handle", "lock_mode", "start", "length"},
 }
 OPTIONAL_ARGS = {op: OPS[op] - REQUIRED_ARGS[op] for op in OPS}
 REVISION_OPS = {"mkdir", "create", "open", "read", "pread", "pwrite", "read_next", "write_next",
                 "truncate", "ftruncate", "append", "stat", "lstat", "listdir", "link", "rename",
                 "symlink", "readlink", "unlink", "rmdir", "chmod", "utime", "xattr_set", "xattr_get",
-                "xattr_remove", "mkdir_at"}
+                "xattr_remove", "mkdir_at", "rpc_lock", "rpc_range_lock"}
 EXPECT_FOR_OP = {
     "mkdir": set(), "create": {"written"}, "open": {"handle"}, "close": set(),
     "dup": {"handle"}, "fstat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns"},
@@ -178,6 +182,7 @@ EXPECT_FOR_OP = {
     "readlink": {"target"}, "unlink": set(), "rmdir": set(), "chmod": set(), "utime": set(),
     "xattr_set": set(), "xattr_get": {"value_hex"}, "xattr_remove": set(),
     "mkdir_at": {"inode"}, "snapshot": set(), "restart": set(), "sync": set(),
+    "flock": set(), "rpc_lock": {"granted"}, "rpc_range_lock": {"granted"},
 }
 
 
@@ -252,6 +257,10 @@ def validate_case_file(doc):
             op = step["op"]
             if not isinstance(op, str) or op not in OPS:
                 raise SchemaError(f"{sw}: unknown operation {op!r}")
+            if op == "flock" and set(case["layers"]) != {"posix"}:
+                raise SchemaError(f"{sw}: flock is POSIX-only")
+            if op in {"rpc_lock", "rpc_range_lock"} and set(case["layers"]) != {"rpc"}:
+                raise SchemaError(f"{sw}: {op} is RPC-only")
             if not isinstance(step["args"], dict):
                 raise SchemaError(f"{sw}.args must be an object")
             required = REQUIRED_ARGS[op]
@@ -292,6 +301,12 @@ def validate_case_file(doc):
                         if not isinstance(value, list) or any(not isinstance(flag, str) for flag in value):
                             raise SchemaError(f"{sw}.args.flags must be a string array")
                     elif not isinstance(value, str): raise SchemaError(f"{sw}.args.{key} must be a string")
+            if op in {"flock", "rpc_lock", "rpc_range_lock"} and step["args"]["lock_mode"] not in ("shared", "exclusive", "unlock"):
+                raise SchemaError(f"{sw}.args.lock_mode is invalid")
+            if op == "rpc_range_lock":
+                start, length = step["args"]["start"], step["args"]["length"]
+                if type(start) is not int or type(length) is not int or not 0 <= start <= (1 << 63) - 1 or not 0 <= length <= (1 << 63) - start:
+                    raise SchemaError(f"{sw}: invalid signed offset lock range")
             if op == "seek":
                 displacement = step["args"]["displacement"]
                 if type(displacement) is not int or not -(1 << 63) <= displacement < (1 << 63):
@@ -323,6 +338,8 @@ def validate_case_file(doc):
                 if any(not isinstance(x, str) or x not in ERRNOS for x in ev.values()):
                     raise SchemaError(f"{sw}: invalid platform errno map")
             success = type(ev) is int and ev == 0
+            if success and op in {"rpc_lock", "rpc_range_lock"} and "granted" not in exp:
+                raise SchemaError(f"{sw}: successful RPC lock must assert granted")
             if not success and exp.get("unchanged") is not True:
                 raise SchemaError(f"{sw}: expected failures must require unchanged=true")
             for key, value in exp.items():
@@ -330,6 +347,8 @@ def validate_case_file(doc):
                     _ref_or(value, sw + ".expect." + key)
                     if key not in {"unchanged", "inode_not"} and key not in EXPECT_FOR_OP[op]:
                         raise SchemaError(f"{sw}: {key} is not a result field for {op}")
+                    if key == "granted" and type(value) is not bool:
+                        raise SchemaError(f"{sw}.expect.granted must be a literal boolean")
                     if key == "unchanged" and value is not True:
                         raise SchemaError(f"{sw}: unchanged must be true")
                     if isinstance(value, dict) and value["ref"] not in symbols:

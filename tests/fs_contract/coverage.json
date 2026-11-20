@@ -310,7 +310,8 @@
         "rename_overwrite_retains_open_destination_identity",
         "rename_nonempty_directory_replacement_is_atomic",
         "rename_hardlink_alias_is_noop",
-        "rename_cross_parent_replaces_empty_directory"
+        "rename_cross_parent_replaces_empty_directory",
+        "flock_hardlink_rename_same_inode"
       ],
       "existing_external": [
         {
@@ -364,7 +365,8 @@
         "exclusive_create_hardlink_alias_no_clobber",
         "rpc_revision_hardlink_recreate",
         "hardlink_xattr_shared_after_unlink",
-        "truncate_hardlink_preserves_inode_metadata"
+        "truncate_hardlink_preserves_inode_metadata",
+        "flock_hardlink_rename_same_inode"
       ],
       "existing_external": [
         {
@@ -384,7 +386,8 @@
         "hardlink_unlink_link_count",
         "open_unlink_path_reuse_keeps_old_inode",
         "hardlink_xattr_shared_after_unlink",
-        "unlinked_handle_mutations_leave_replacement_intact"
+        "unlinked_handle_mutations_leave_replacement_intact",
+        "flock_unlink_recreate_independent_inode"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -587,7 +590,9 @@
         "rename_cross_parent_replaces_empty_directory",
         "independent_open_and_dup_cursor_isolation",
         "open_truncate_preserves_old_handle_inode",
-        "unlinked_handle_mutations_leave_replacement_intact"
+        "unlinked_handle_mutations_leave_replacement_intact",
+        "flock_dup_last_close_releases",
+        "rpc_whole_range_lock_interoperability"
       ],
       "existing_external": [
         {
@@ -608,7 +613,10 @@
         "independent_open_and_dup_cursor_isolation",
         "positioned_write_preserves_shared_cursor",
         "append_dup_seek_writes_at_eof",
-        "ftruncate_dup_preserves_cursor_and_zero_fills"
+        "ftruncate_dup_preserves_cursor_and_zero_fills",
+        "flock_dup_last_close_releases",
+        "flock_unlock_through_duplicate",
+        "rpc_whole_range_lock_interoperability"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -637,7 +645,8 @@
     },
     "close": {
       "case_ids": [
-        "dup_shares_open_description_offset"
+        "dup_shares_open_description_offset",
+        "flock_dup_last_close_releases"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -647,7 +656,8 @@
         "directory_handle_relative_create_survives_rename_and_path_reuse",
         "open_unlink_path_reuse_keeps_old_inode",
         "rpc_revision_hardlink_recreate",
-        "unlinked_handle_mutations_leave_replacement_intact"
+        "unlinked_handle_mutations_leave_replacement_intact",
+        "flock_unlink_recreate_independent_inode"
       ],
       "existing_external": [
         {
@@ -898,7 +908,8 @@
         "rpc_revision_mkdir_at_read_only",
         "rpc_revision_hardlink_recreate",
         "rpc_revision_metadata_restart",
-        "rpc_two_snapshots_live_binary_restart"
+        "rpc_two_snapshots_live_binary_restart",
+        "rpc_lock_revision_selector_isolation"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -911,7 +922,15 @@
         "rpc_revision_mkdir_at_read_only",
         "rpc_revision_hardlink_recreate",
         "rpc_revision_metadata_restart",
-        "rpc_two_snapshots_live_binary_restart"
+        "rpc_two_snapshots_live_binary_restart",
+        "rpc_lock_shared_failed_upgrade_retains_owner",
+        "rpc_range_lock_boundaries",
+        "rpc_range_lock_partial_unlock_split",
+        "rpc_range_lock_zero_length_future_eof",
+        "rpc_whole_range_lock_interoperability",
+        "rpc_lock_advisory_io",
+        "rpc_lock_restart_drops_locks",
+        "rpc_lock_revision_selector_isolation"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -957,7 +976,8 @@
       "case_ids": [
         "sync_restart_persistence",
         "rpc_revision_metadata_restart",
-        "rpc_two_snapshots_live_binary_restart"
+        "rpc_two_snapshots_live_binary_restart",
+        "rpc_lock_restart_drops_locks"
       ],
       "existing_external": [
         {
@@ -1018,7 +1038,21 @@
       ]
     },
     "locking": {
-      "case_ids": [],
+      "case_ids": [
+        "flock_shared_coexist_exclusive_contender",
+        "flock_dup_last_close_releases",
+        "flock_unlock_through_duplicate",
+        "flock_hardlink_rename_same_inode",
+        "flock_unlink_recreate_independent_inode",
+        "rpc_lock_shared_failed_upgrade_retains_owner",
+        "rpc_range_lock_boundaries",
+        "rpc_range_lock_partial_unlock_split",
+        "rpc_range_lock_zero_length_future_eof",
+        "rpc_whole_range_lock_interoperability",
+        "rpc_lock_advisory_io",
+        "rpc_lock_restart_drops_locks",
+        "rpc_lock_revision_selector_isolation"
+      ],
       "existing_external": [
         {
           "id": "native_advisory_lock_qualification",
@@ -1027,6 +1061,17 @@
           "status": "not_run",
           "scenarios": [
             "flock and lockf child-process conflict, release, blocking and interruption cases"
+          ]
+        },
+        {
+          "id": "daemon_rpc_lock_sessions",
+          "layer": "rpc",
+          "script": "daemon/tests/sessions.py",
+          "status": "not_run",
+          "scenarios": [
+            "session close and expiry release locks",
+            "world and revision lock isolation",
+            "RPC lock argument validation"
           ]
         }
       ],
@@ -1039,7 +1084,7 @@
             "mounted"
           ],
           "mandatory": false,
-          "reason": "The DSL has no flock or fcntl lock operations; RPC locks would not establish native advisory lock semantics."
+          "reason": "Blocking and cross-process wakeup, classic fcntl record locks, and signal interruption are covered by the separate native qualification script."
         }
       ]
     },

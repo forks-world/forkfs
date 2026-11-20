@@ -115,6 +115,10 @@ class PosixAdapter:
             return {"handle": self._remember(fd)}
         if op == "close": os.close(self._fd(a["handle"])); self.handles.pop(a["handle"]); return {}
         if op == "dup": return {"handle": self._remember(os.dup(self._fd(a["handle"]))) }
+        if op == "flock":
+            mode = {"shared": fcntl.LOCK_SH, "exclusive": fcntl.LOCK_EX, "unlock": fcntl.LOCK_UN}[a["lock_mode"]]
+            fcntl.flock(self._fd(a["handle"]), mode if mode == fcntl.LOCK_UN else mode | fcntl.LOCK_NB)
+            return {}
         if op == "fstat": return _norm_stat(os.fstat(self._fd(a["handle"])))
         if op == "read":
             with open(self._path(a["path"]), "rb") as stream: data = stream.read(64 * 1024 * 1024 + 1)
@@ -484,6 +488,13 @@ class RpcAdapter:
             if a["handle"] in self.handle_write_modes:
                 self.handle_write_modes[result["handle"]] = self.handle_write_modes[a["handle"]]
             return result
+        if op in {"rpc_lock", "rpc_range_lock"}:
+            fields = ["fs-hlock" if op == "rpc_lock" else "fs-hrange-lock", a["handle"], a["lock_mode"]]
+            if op == "rpc_range_lock": fields.append(f'{a["start"]}:{a["length"]}')
+            result = self._json(*fields, *sel())
+            if not isinstance(result, dict) or type(result.get("granted")) is not bool:
+                raise RuntimeError("RPC lock response must contain boolean granted")
+            return {"granted": result["granted"]}
         if op == "fstat": return self._normal_stat(self._json("fs-hstat", a["handle"], *sel()))
         if op == "read": return {"data_hex": self.rpc("fs-cat", path("path"), *sel()).hex()}
         if op == "pread": return {"data_hex": self.rpc("fs-hread", a["handle"], a["offset"], a["count"], *sel()).hex()}

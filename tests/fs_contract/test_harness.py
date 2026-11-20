@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from . import runner
-from .adapters import PosixAdapter, Unsupported, UntypedRpcFailure, _DarwinXattr
+from .adapters import PosixAdapter, RpcAdapter, Unsupported, UntypedRpcFailure, _DarwinXattr
 from .model import SchemaError, resolve_refs, safe_path, validate_case_file, validate_coverage
 
 
@@ -30,6 +30,48 @@ class HarnessModelTests(unittest.TestCase):
         cases = validate_case_file(_valid_case())
         coverage = {"schema_version": 1, "families": {"paths": {"case_ids": ["one"]}}}
         validate_coverage(coverage, cases)
+
+    def test_lock_schema_bounds_and_qualification(self):
+        def case(op, args, expect, rpc=True):
+            doc = _valid_case()
+            item = doc["cases"][0]
+            if rpc:
+                item["profiles"], item["layers"] = ["daemon"], ["rpc"]
+            item["steps"] = [
+                {"op": "open", "args": {"path": "f", "flags": ["read"]}, "save": "h", "expect": {"errno": 0}},
+                {"op": op, "args": {"handle": {"ref": "h", "field": "handle"}, **args}, "expect": expect},
+            ]
+            return doc
+        good = case("rpc_range_lock", {"lock_mode": "shared", "start": (1 << 63) - 1, "length": 1}, {"errno": 0, "granted": False})
+        validate_case_file(good)
+        for start, length in [(True, 1), (-1, 1), (1 << 63, 0), (1, 1 << 63), (0, True)]:
+            with self.subTest(start=start, length=length), self.assertRaises(SchemaError):
+                validate_case_file(case("rpc_range_lock", {"lock_mode": "shared", "start": start, "length": length}, {"errno": 0, "granted": True}))
+        for expect in ({"errno": 0}, {"errno": 0, "granted": 1}, {"errno": 0, "granted": {"ref": "h", "field": "handle"}}):
+            with self.assertRaises(SchemaError): validate_case_file(case("rpc_lock", {"lock_mode": "shared"}, expect))
+        with self.assertRaises(SchemaError): validate_case_file(case("flock", {"lock_mode": "shared"}, {"errno": 0}))
+        with self.assertRaises(SchemaError): validate_case_file(case("rpc_lock", {"lock_mode": "shared"}, {"errno": 0, "granted": True}, False))
+        validate_case_file(case("flock", {"lock_mode": "exclusive"}, {"errno": "EWOULDBLOCK", "unchanged": True}, False))
+
+    def test_lock_adapter_wire_and_response(self):
+        adapter = RpcAdapter.__new__(RpcAdapter)
+        adapter.revisions = set()
+        adapter.session = "session"
+        adapter._json = mock.Mock(return_value={"granted": False})
+        self.assertEqual(adapter.execute("rpc_range_lock", {"handle": "h", "lock_mode": "exclusive", "start": 3, "length": 5}), {"granted": False})
+        adapter._json.assert_called_once_with("fs-hrange-lock", "h", "exclusive", "3:5", "--session", "session")
+        adapter._json.return_value = {"granted": 1}
+        with self.assertRaises(RuntimeError): adapter.execute("rpc_lock", {"handle": "h", "lock_mode": "shared"})
+        with tempfile.TemporaryDirectory() as tmp:
+            posix = PosixAdapter(Path(tmp), "reference")
+            fd = os.open(Path(tmp) / "f", os.O_CREAT | os.O_RDWR, 0o600)
+            handle = posix._remember(fd)
+            try:
+                with mock.patch("fcntl.flock") as flock:
+                    posix.execute("flock", {"handle": handle, "lock_mode": "exclusive"})
+                    import fcntl
+                    flock.assert_called_once_with(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally: posix.close_all()
 
     def test_unknown_operation_is_rejected(self):
         doc = _valid_case()
