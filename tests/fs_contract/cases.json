@@ -6370,6 +6370,2251 @@
           }
         }
       ]
+    },
+    {
+      "id": "flock_shared_coexist_exclusive_contender",
+      "families": [
+        "locking"
+      ],
+      "profiles": [
+        "reference",
+        "mounted"
+      ],
+      "layers": [
+        "posix"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "61"
+        }
+      ],
+      "steps": [
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "a"
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "b"
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "c"
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "shared"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "shared"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "c",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": "EWOULDBLOCK",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "unlock"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "c",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": "EWOULDBLOCK",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "unlock"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "c",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "shared"
+          },
+          "expect": {
+            "errno": "EWOULDBLOCK",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "c",
+              "field": "handle"
+            },
+            "lock_mode": "unlock"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "shared"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "c",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "flock_dup_last_close_releases",
+      "families": [
+        "locking",
+        "dup",
+        "close",
+        "fd_lifetime"
+      ],
+      "profiles": [
+        "reference",
+        "mounted"
+      ],
+      "layers": [
+        "posix"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "61"
+        }
+      ],
+      "steps": [
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "a"
+        },
+        {
+          "op": "dup",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "dup"
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "b"
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": "EWOULDBLOCK",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "dup",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "flock_unlock_through_duplicate",
+      "families": [
+        "locking",
+        "dup"
+      ],
+      "profiles": [
+        "reference",
+        "mounted"
+      ],
+      "layers": [
+        "posix"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "61"
+        }
+      ],
+      "steps": [
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "a"
+        },
+        {
+          "op": "dup",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "dup"
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "b"
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": "EWOULDBLOCK",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "dup",
+              "field": "handle"
+            },
+            "lock_mode": "unlock"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": "EWOULDBLOCK",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "unlock"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "dup",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "flock_hardlink_rename_same_inode",
+      "families": [
+        "locking",
+        "hardlink",
+        "rename"
+      ],
+      "profiles": [
+        "reference",
+        "mounted"
+      ],
+      "layers": [
+        "posix"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "61"
+        }
+      ],
+      "steps": [
+        {
+          "op": "link",
+          "args": {
+            "source": "f",
+            "target": "alias"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "a"
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "rename",
+          "args": {
+            "source": "alias",
+            "target": "renamed"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "renamed",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "b"
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": "EWOULDBLOCK",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "unlock"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": "EWOULDBLOCK",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "flock_unlink_recreate_independent_inode",
+      "families": [
+        "locking",
+        "unlink",
+        "path_reuse"
+      ],
+      "profiles": [
+        "reference",
+        "mounted"
+      ],
+      "layers": [
+        "posix"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "61"
+        }
+      ],
+      "steps": [
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "old"
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "old_contender"
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "old",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "unlink",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "create",
+          "args": {
+            "path": "f",
+            "data_hex": "62",
+            "exclusive": true
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "new"
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "new",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "old_contender",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": "EWOULDBLOCK",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "old",
+              "field": "handle"
+            },
+            "lock_mode": "unlock"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "old_contender",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "flock",
+          "args": {
+            "handle": {
+              "ref": "old",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": "EWOULDBLOCK",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "old",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "old_contender",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "new",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "rpc_lock_shared_failed_upgrade_retains_owner",
+      "families": [
+        "rpc_extension",
+        "locking"
+      ],
+      "profiles": [
+        "daemon"
+      ],
+      "layers": [
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "616263646566"
+        }
+      ],
+      "steps": [
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "a"
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "b"
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "c"
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "shared"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "shared"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": false
+          }
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "unlock"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "c",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": false
+          }
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "unlock"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "c",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "rpc_range_lock_boundaries",
+      "families": [
+        "rpc_extension",
+        "locking"
+      ],
+      "profiles": [
+        "daemon"
+      ],
+      "layers": [
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "616263646566"
+        }
+      ],
+      "steps": [
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "a"
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "b"
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 10,
+            "length": 10
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 0,
+            "length": 10
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 20,
+            "length": 5
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 9,
+            "length": 2
+          },
+          "expect": {
+            "errno": 0,
+            "granted": false
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 19,
+            "length": 2
+          },
+          "expect": {
+            "errno": 0,
+            "granted": false
+          }
+        }
+      ]
+    },
+    {
+      "id": "rpc_range_lock_partial_unlock_split",
+      "families": [
+        "rpc_extension",
+        "locking"
+      ],
+      "profiles": [
+        "daemon"
+      ],
+      "layers": [
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "616263646566"
+        }
+      ],
+      "steps": [
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "a"
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "b"
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 10,
+            "length": 30
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "unlock",
+            "start": 20,
+            "length": 10
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 20,
+            "length": 10
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 19,
+            "length": 1
+          },
+          "expect": {
+            "errno": 0,
+            "granted": false
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 30,
+            "length": 1
+          },
+          "expect": {
+            "errno": 0,
+            "granted": false
+          }
+        }
+      ]
+    },
+    {
+      "id": "rpc_range_lock_zero_length_future_eof",
+      "families": [
+        "rpc_extension",
+        "locking"
+      ],
+      "profiles": [
+        "daemon"
+      ],
+      "layers": [
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "616263646566"
+        }
+      ],
+      "steps": [
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "a"
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "b"
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 4,
+            "length": 0
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 3,
+            "length": 1
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "unlock",
+            "start": 3,
+            "length": 1
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 4,
+            "length": 1
+          },
+          "expect": {
+            "errno": 0,
+            "granted": false
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 1000000,
+            "length": 1
+          },
+          "expect": {
+            "errno": 0,
+            "granted": false
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 9223372036854775807,
+            "length": 1
+          },
+          "expect": {
+            "errno": 0,
+            "granted": false
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "unlock",
+            "start": 4,
+            "length": 0
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 1000000,
+            "length": 1
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 9223372036854775807,
+            "length": 1
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "rpc_whole_range_lock_interoperability",
+      "families": [
+        "rpc_extension",
+        "locking",
+        "dup",
+        "fd_lifetime"
+      ],
+      "profiles": [
+        "daemon"
+      ],
+      "layers": [
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "616263646566"
+        }
+      ],
+      "steps": [
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "a"
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "b"
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "shared",
+            "start": 5,
+            "length": 1
+          },
+          "expect": {
+            "errno": 0,
+            "granted": false
+          }
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "unlock"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 10,
+            "length": 30
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "unlock",
+            "start": 20,
+            "length": 10
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": false
+          }
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "unlock"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "dup",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            }
+          },
+          "save": "duplicate",
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 20,
+            "length": 1
+          },
+          "expect": {
+            "errno": 0,
+            "granted": false
+          }
+        },
+        {
+          "op": "close",
+          "args": {
+            "handle": {
+              "ref": "duplicate",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "start": 20,
+            "length": 1
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "rpc_lock_advisory_io",
+      "families": [
+        "rpc_extension",
+        "locking"
+      ],
+      "profiles": [
+        "daemon"
+      ],
+      "layers": [
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "616263646566"
+        }
+      ],
+      "steps": [
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "a"
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "b"
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": false
+          }
+        },
+        {
+          "op": "write_next",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "data_hex": "5859"
+          },
+          "expect": {
+            "errno": 0,
+            "written": 2
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "585963646566"
+          }
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": false
+          }
+        }
+      ]
+    },
+    {
+      "id": "rpc_lock_restart_drops_locks",
+      "families": [
+        "rpc_extension",
+        "locking",
+        "restart"
+      ],
+      "profiles": [
+        "daemon"
+      ],
+      "layers": [
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "616263646566"
+        }
+      ],
+      "steps": [
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "a"
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "b"
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "b",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": false
+          }
+        },
+        {
+          "op": "sync",
+          "args": {
+            "handle": {
+              "ref": "a",
+              "field": "handle"
+            }
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "restart",
+          "args": {},
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read",
+              "write"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "c"
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "c",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "f"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "616263646566"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rpc_lock_revision_selector_isolation",
+      "families": [
+        "rpc_extension",
+        "locking",
+        "revision_isolation"
+      ],
+      "profiles": [
+        "daemon"
+      ],
+      "layers": [
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "f",
+          "data_hex": "616263646566"
+        }
+      ],
+      "steps": [
+        {
+          "op": "snapshot",
+          "args": {
+            "name": "before"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "live"
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read"
+            ]
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "live_other"
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read"
+            ],
+            "revision": "before"
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "rev"
+        },
+        {
+          "op": "open",
+          "args": {
+            "path": "f",
+            "flags": [
+              "read"
+            ],
+            "revision": "before"
+          },
+          "expect": {
+            "errno": 0
+          },
+          "save": "rev_other"
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "live",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "rev",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "revision": "before",
+            "start": 0,
+            "length": 10
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "live_other",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": false
+          }
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "rev_other",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "revision": "before"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": false
+          }
+        },
+        {
+          "op": "rpc_range_lock",
+          "args": {
+            "handle": {
+              "ref": "rev",
+              "field": "handle"
+            },
+            "lock_mode": "unlock",
+            "revision": "before",
+            "start": 0,
+            "length": 10
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "rev_other",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive",
+            "revision": "before"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": true
+          }
+        },
+        {
+          "op": "rpc_lock",
+          "args": {
+            "handle": {
+              "ref": "live_other",
+              "field": "handle"
+            },
+            "lock_mode": "exclusive"
+          },
+          "expect": {
+            "errno": 0,
+            "granted": false
+          }
+        }
+      ]
     }
   ]
 }

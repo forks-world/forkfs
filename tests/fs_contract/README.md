@@ -2,7 +2,7 @@
 
 This directory holds a fixed, reviewable black-box contract for common filesystem behavior. It supplements the existing daemon and mounted-filesystem suites. The cases cover path resolution and creation, rename/link/unlink, binary and positioned I/O, sparse extension, descriptor identity and offsets, metadata and xattrs, and the daemon's snapshot/restart extensions.
 
-The suite is a bounded acceptance inventory. Passing it does not prove all POSIX behavior. In particular, mmap coherence, advisory locks, statfs details, descriptor flags, FIFOs, sockets, and broader crash/power-loss behavior remain outside this contract. The trailing-slash `mkdir` cases were added to expose and guard the regression fixed by PR #137; their normative expectations remain mandatory after that fix. `coverage.json` records implemented cases, existing suites that are inventoried but not run by this harness, and missing contracts. An `existing_external` entry always has `status: not_run` and never counts as a pass. `conformance_complete` therefore remains false while any frontier remains.
+The suite is a bounded acceptance inventory. Passing it does not prove all POSIX behavior. In particular, mmap coherence, blocking and classic `fcntl` locks, statfs details, descriptor flags, FIFOs, sockets, and broader crash/power-loss behavior remain outside this contract. The trailing-slash `mkdir` cases were added to expose and guard the regression fixed by PR #137; their normative expectations remain mandatory after that fix. `coverage.json` records implemented cases, existing suites that are inventoried but not run by this harness, and missing contracts. An `existing_external` entry always has `status: not_run` and never counts as a pass. `conformance_complete` therefore remains false while any frontier remains.
 
 ## Profiles
 
@@ -38,6 +38,8 @@ The APFS reference and daemon profiles cover exclusive rename and rename exchang
 The shared cases also cover ordinary rename replacement, exclusive creation through aliases, and cursor behavior across independent and duplicated handles. The daemon profile checks that a read-only revision rejects writable opens and directory-relative creation with `EROFS`. It also verifies that snapshots retain their hardlink topology after live path reuse and preserve file contents, modes, and xattrs across a daemon restart.
 
 The data-integrity cases check append after a seek, cursor preservation across `ftruncate`, truncating opens, and writes through unlinked handles after path reuse. The metadata cases check xattr failure atomicity, metadata shared by hardlinks, and xattrs attached directly to symlinks. Directory-relative creation checks cover both an invalid parent type and an occupied name. The daemon profile also compares two immutable snapshot generations with the live file after restart.
+
+The native profiles exercise nonblocking `flock` on independently opened descriptors and their duplicates. A conflict returns `EWOULDBLOCK`. The daemon profile exercises `fs-hlock` and `fs-hrange-lock` and requires an explicit boolean `granted` result for each successful RPC, including `false` on a conflict. Cases probe ownership with subsequent lock attempts because filesystem fingerprints cannot observe held locks. The separate [locking qualification script](../../scripts/tests/locking_mount.py) covers cross-process blocking and classic `fcntl` behavior.
 
 ## Fixed expectations and DSL
 
