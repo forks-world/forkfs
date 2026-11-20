@@ -1090,7 +1090,8 @@
     },
     "readdir": {
       "case_ids": [
-        "directory_entry_names_preserve_quote_newline_and_unicode"
+        "directory_entry_names_preserve_quote_newline_and_unicode",
+        "rpc_directory_cursor_snapshot_paging"
       ],
       "existing_external": [
         {
@@ -1861,6 +1862,23 @@
           "reason": "F_PREALLOCATE and posix_fallocate are not implemented or qualified; the DSL has no allocation reservation operation."
         }
       ]
+    },
+    "rpc_directory_cursor": {
+      "case_ids": [
+        "rpc_directory_cursor_snapshot_paging"
+      ],
+      "existing_external": [
+        {
+          "id": "daemon_directory_cursor_rpc",
+          "layer": "rpc",
+          "script": "daemon/tests/directories.py",
+          "status": "not_run",
+          "scenarios": [
+            "directory cursor paging, captured view, rewind and close semantics"
+          ]
+        }
+      ],
+      "missing_contracts": []
     }
   }
 }

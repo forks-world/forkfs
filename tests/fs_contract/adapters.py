@@ -534,6 +534,23 @@ class RpcAdapter:
                     if page["eof"]: break
                 return {"names": sorted(names)}
             finally: self.rpc("fs-dir-close", cursor, *sel())
+        if op == "rpc_dir_open":
+            result = self._json("fs-dir-open", path("path"), *sel())
+            cursor = result.get("cursor") if isinstance(result, dict) else None
+            if not isinstance(cursor, str) or not cursor:
+                raise RuntimeError("RPC directory open response must contain a nonempty cursor")
+            return {"cursor": cursor}
+        if op == "rpc_dir_page":
+            result = self._json("fs-dir-page", a["cursor"], str(a["limit"]), *sel())
+            if (not isinstance(result, dict) or set(result) != {"names", "eof"} or
+                    not isinstance(result["names"], list) or any(not isinstance(n, str) for n in result["names"]) or
+                    type(result["eof"]) is not bool or len(result["names"]) > a["limit"]):
+                raise RuntimeError("RPC directory page must contain bounded names and boolean eof")
+            return result
+        if op == "rpc_dir_rewind":
+            self.rpc("fs-dir-rewind", a["cursor"], *sel()); return {}
+        if op == "rpc_dir_close":
+            self.rpc("fs-dir-close", a["cursor"], *sel()); return {}
         if op == "link": self.rpc("fs-link", path("source"), path("target"), *sel()); return {}
         if op in {"rename", "rename_exclusive", "rename_exchange"}:
             command = {
