@@ -40,11 +40,11 @@ OPS = {
     "rpc_seek_region": {"path", "offset", "region"}, "rpc_hseek_region": {"handle", "offset", "region"},
     "rpc_dir_open": {"path"}, "rpc_dir_page": {"cursor", "limit"},
     "rpc_dir_rewind": {"cursor"}, "rpc_dir_close": {"cursor"},
-    "volume_name": set(), "set_volume_name": {"name"},
+    "volume_name": set(), "set_volume_name": {"name"}, "rpc_setflags": {"path", "mask"},
 }
 EXPECT_KEYS = {"errno", "unchanged", "data_hex", "type", "inode", "inode_not", "links", "name",
                "size", "mode", "mtime_ns", "atime_ns", "target", "names", "offset",
-               "ordered_names", "eof", "written", "value_hex", "granted", "allocated_size"}
+               "ordered_names", "eof", "written", "value_hex", "granted", "allocated_size", "flags"}
 RESULT_FIELDS = EXPECT_KEYS - {"errno", "unchanged", "inode_not", "ordered_names"} | {"handle", "cursor"}
 REF_FIELD = {"ref", "field"}
 ERRNOS = {
@@ -171,7 +171,7 @@ REQUIRED_ARGS = {
     "rpc_seek_region": {"path", "offset", "region"}, "rpc_hseek_region": {"handle", "offset", "region"},
     "rpc_dir_open": {"path"}, "rpc_dir_page": {"cursor", "limit"},
     "rpc_dir_rewind": {"cursor"}, "rpc_dir_close": {"cursor"},
-    "volume_name": set(), "set_volume_name": {"name"},
+    "volume_name": set(), "set_volume_name": {"name"}, "rpc_setflags": {"path", "mask"},
 }
 OPTIONAL_ARGS = {op: OPS[op] - REQUIRED_ARGS[op] for op in OPS}
 REVISION_OPS = {"mkdir", "create", "open", "read", "pread", "pwrite", "read_next", "write_next",
@@ -181,12 +181,12 @@ REVISION_OPS = {"mkdir", "create", "open", "read", "pread", "pwrite", "read_next
                 "volume_name", "set_volume_name"}
 EXPECT_FOR_OP = {
     "mkdir": set(), "create": {"written"}, "open": {"handle"}, "close": set(),
-    "dup": {"handle"}, "fstat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns", "allocated_size"},
+    "dup": {"handle"}, "fstat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns", "allocated_size", "flags"},
     "read": {"data_hex"}, "pread": {"data_hex"}, "pwrite": {"written"},
     "seek": {"offset"}, "read_next": {"data_hex", "offset"}, "write_next": {"written", "offset"},
     "truncate": set(), "ftruncate": set(), "append": {"written"},
-    "stat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns", "allocated_size"},
-    "lstat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns", "allocated_size", "target"},
+    "stat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns", "allocated_size", "flags"},
+    "lstat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns", "allocated_size", "flags", "target"},
     "listdir": {"names"}, "link": set(), "rename": set(), "symlink": set(),
     "rename_exclusive": set(), "rename_exchange": set(), "clone_file": set(),
     "readlink": {"target"}, "unlink": set(), "rmdir": set(), "chmod": set(), "utime": set(),
@@ -195,7 +195,7 @@ EXPECT_FOR_OP = {
     "flock": set(), "rpc_lock": {"granted"}, "rpc_range_lock": {"granted"},
     "rpc_seek_region": {"offset"}, "rpc_hseek_region": {"offset"},
     "rpc_dir_open": {"cursor"}, "rpc_dir_page": {"ordered_names", "eof"},
-    "rpc_dir_rewind": set(), "rpc_dir_close": set(), "volume_name": {"name"}, "set_volume_name": {"name"},
+    "rpc_dir_rewind": set(), "rpc_dir_close": set(), "volume_name": {"name"}, "set_volume_name": {"name"}, "rpc_setflags": set(),
 }
 
 
@@ -280,6 +280,8 @@ def validate_case_file(doc):
                 raise SchemaError(f"{sw}: clone_file is daemon/RPC-only")
             if op in {"volume_name", "set_volume_name"} and (set(case["profiles"]) != {"daemon"} or set(case["layers"]) != {"rpc"}):
                 raise SchemaError(f"{sw}: volume-name operations are daemon/RPC-only")
+            if op == "rpc_setflags" and (set(case["profiles"]) != {"daemon"} or set(case["layers"]) != {"rpc"}):
+                raise SchemaError(f"{sw}: rpc_setflags is daemon/RPC-only")
             if op.startswith("rpc_dir_") and (set(case["profiles"]) != {"daemon"} or set(case["layers"]) != {"rpc"}):
                 raise SchemaError(f"{sw}: directory cursor operations are daemon/RPC-only")
             if not isinstance(step["args"], dict):
@@ -311,10 +313,12 @@ def validate_case_file(doc):
                     raise SchemaError(f"{sw}.args.{key} must reference an owned {key}")
                 if key in {"data_hex", "value_hex"}:
                     _hex(value, sw + ".args." + key)
-                if key in {"mode", "size", "offset", "count", "limit", "atime_ns", "mtime_ns"} and not isinstance(value, dict) and type(value) is not int:
+                if key in {"mode", "size", "offset", "count", "limit", "atime_ns", "mtime_ns", "mask"} and not isinstance(value, dict) and type(value) is not int:
                     raise SchemaError(f"{sw}.args.{key} must be an integer")
                 if key in {"mode", "size", "count", "atime_ns", "mtime_ns"} and type(value) is int and value < 0:
                     raise SchemaError(f"{sw}.args.{key} must be nonnegative")
+                if key == "mask" and type(value) is int and not 0 <= value <= 0xffffffff:
+                    raise SchemaError(f"{sw}.args.mask must be a uint32")
                 if key == "mode" and type(value) is int and value > 0o7777:
                     raise SchemaError(f"{sw}.args.mode exceeds POSIX mode bits")
                 if key == "exclusive" and type(value) is not bool:
@@ -373,6 +377,10 @@ def validate_case_file(doc):
             success = type(ev) is int and ev == 0
             if "allocated_size" in exp and (set(case["layers"]) != {"rpc"} or set(case["profiles"]) != {"daemon"}):
                 raise SchemaError(f"{sw}: allocated_size is only available from daemon RPC")
+            if "flags" in exp and (set(case["layers"]) != {"rpc"} or set(case["profiles"]) != {"daemon"}):
+                raise SchemaError(f"{sw}: flags assertion is only available from daemon RPC")
+            if "flags" in exp and (type(exp["flags"]) is not int or not 0 <= exp["flags"] <= 0xffffffff):
+                raise SchemaError(f"{sw}.expect.flags must be a uint32 integer")
             if success and op == "rpc_dir_page" and not {"ordered_names", "eof"} <= set(exp):
                 raise SchemaError(f"{sw}: successful directory page must assert names and eof")
             if success and op in {"rpc_lock", "rpc_range_lock"} and "granted" not in exp:

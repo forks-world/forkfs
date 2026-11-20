@@ -463,6 +463,9 @@ class RpcAdapter:
         if a.get("revision") is not None: self.revisions.add(a["revision"])
         if op == "volume_name": return self._volume_name("fs-volume-name", *sel())
         if op == "set_volume_name": return self._volume_name("fs-set-volume-name", a["name"], *sel())
+        if op == "rpc_setflags":
+            self.rpc("fs-setflags", path("path"), a["mask"], *sel())
+            return {}
         if op == "mkdir":
             if a.get("mode", 0o755) != 0o755: raise Unsupported("RPC fs-mkdir has no creation-mode argument")
             self.rpc("fs-mkdir", path("path"), *sel()); return {}
@@ -604,10 +607,13 @@ class RpcAdapter:
         allocated_size = value.get("allocated_size")
         if type(allocated_size) is not int or allocated_size < 0:
             raise RuntimeError("RPC stat allocated_size must be a nonnegative integer")
+        flags = value.get("flags")
+        if type(flags) is not int or not 0 <= flags <= 0xffffffff:
+            raise RuntimeError("RPC stat flags must be a uint32 integer")
         return {"inode": value["inode_id"], "type": "directory" if value["directory"] else "symlink" if value["symlink"] else "file",
                 "links": value["links"], "size": value["size"], "mode": value["mode"],
                 "mtime_ns": value["modified_ns"], "atime_ns": value["accessed_ns"],
-                "allocated_size": allocated_size}
+                "allocated_size": allocated_size, "flags": flags}
 
     def fingerprint(self, revision=None):
         status = self._json("status")

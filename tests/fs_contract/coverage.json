@@ -169,6 +169,7 @@
     },
     "failure_atomicity": {
       "case_ids": [
+        "rpc_immutable_flags_hardlink_revision",
         "binary_xattr_create_replace_remove",
         "file_directory_mismatch_and_trailing_slash",
         "mkdir_and_exclusive_create_conflicts",
@@ -909,6 +910,7 @@
     },
     "revision_isolation": {
       "case_ids": [
+        "rpc_immutable_flags_hardlink_revision",
         "rpc_snapshot_read_only_isolation",
         "rpc_revision_writable_open_read_only",
         "rpc_revision_mkdir_at_read_only",
@@ -924,6 +926,7 @@
     },
     "rpc_extension": {
       "case_ids": [
+        "rpc_immutable_flags_hardlink_revision",
         "rpc_snapshot_read_only_isolation",
         "sync_restart_persistence",
         "rpc_revision_writable_open_read_only",
@@ -1331,7 +1334,9 @@
       ]
     },
     "flags_metadata": {
-      "case_ids": [],
+      "case_ids": [
+        "rpc_immutable_flags_hardlink_revision"
+      ],
       "existing_external": [
         {
           "id": "daemon_append_flags",
@@ -1415,7 +1420,7 @@
             "daemon"
           ],
           "mandatory": false,
-          "reason": "Immutable and append-only file flags are outside the initial RPC chmod/time operations."
+          "reason": "RPC coverage qualifies UF_IMMUTABLE on regular-file hardlinks, denied append/unlink/xattr removal/new writable open, and saved-revision isolation. Append-only and other flag combinations remain outside this contract."
         }
       ]
     },
