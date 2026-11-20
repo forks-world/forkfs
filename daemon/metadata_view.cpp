@@ -47,6 +47,8 @@ NamespaceView::NamespaceView(const Journal& journal,const std::string& name,bool
     load(manifest,validate_root);
 }
 NamespaceView::NamespaceView(const Journal& journal,const ObjectId& manifest):journal_(journal) {load(manifest,true);}
+NamespaceView::NamespaceView(const Journal& journal,const Map& records,const Objects& objects)
+    :journal_(journal),candidate_(&records),pending_(&objects) {}
 void NamespaceView::load(const ObjectId& manifest,bool validate_root) {
     const auto& journal=journal_;
     auto b=journal.get_object(manifest);
@@ -91,6 +93,10 @@ NamespaceView::Changes NamespaceView::decode_run(const Bytes& b) {
     return result;
 }
 std::optional<Id> NamespaceView::lookup(const std::string& key) const {
+    if(candidate_){
+        auto it=candidate_->find(key);
+        return it==candidate_->end()?std::nullopt:std::optional<Id>(it->second);
+    }
     if(tree_)return tree_->lookup(key);
     if(legacy_)return journal_.contains(key)?std::optional<Id>(journal_.root_object(key)):std::nullopt;
     for(const auto& id:runs_) {const auto& entries=run(id);auto it=entries.find(key);if(it!=entries.end())return it->second;}
@@ -103,12 +109,22 @@ bool NamespaceView::contains(const std::string& key) const {
     return lookup(key).has_value();
 }
 uint64_t NamespaceView::value_size(const std::string& key) const {
-    auto id=lookup(key);need(id.has_value(),"namespace key not found");return journal_.object_size(*id);
+    auto id=lookup(key);need(id.has_value(),"namespace key not found");
+    if(pending_)if(auto it=pending_->find(*id);it!=pending_->end())return it->second.size();
+    return journal_.object_size(*id);
 }
 Bytes NamespaceView::get(const std::string& key) const {
-    auto id=lookup(key);need(id.has_value(),"namespace key not found");return journal_.get_object(*id);
+    auto id=lookup(key);need(id.has_value(),"namespace key not found");
+    if(pending_)if(auto it=pending_->find(*id);it!=pending_->end())return it->second;
+    return journal_.get_object(*id);
 }
 std::vector<std::string> NamespaceView::keys(const std::string& key_prefix) const {
+    if(candidate_){
+        std::vector<std::string> result;
+        for(auto it=candidate_->lower_bound(key_prefix);it!=candidate_->end() && it->first.starts_with(key_prefix);++it)
+            result.push_back(it->first);
+        return result;
+    }
     if(tree_)return tree_->keys(key_prefix);
     if(legacy_)return journal_.keys(key_prefix);
     Changes selected;
@@ -129,6 +145,7 @@ std::vector<std::string> NamespaceView::page(const std::string& prefix,const std
     return {begin,begin+std::min<size_t>(limit,all.end()-begin)};
 }
 NamespaceView::Map NamespaceView::references() const {
+    if(candidate_)return *candidate_;
     if(tree_)return tree_->entries();
     Map result;
     if(legacy_){for(const auto& key:journal_.keys(prefix))result[key]=journal_.root_object(key);return result;}
@@ -154,6 +171,7 @@ Bytes NamespaceView::encode_manifest(const std::vector<Id>& runs) {
     for(size_t i=0;i<runs.size();++i)memcpy(b.data()+12+i*32,runs[i].data(),32);return b;
 }
 NamespaceView::Plan NamespaceView::plan(const Changes& changes,bool compact,const std::vector<Range>& erased,TreeHeightCache* heights) const {
+    need(!candidate_, "candidate namespace is read-only");
     if(journal_.is_leveldb()) {
         Changes all=changes;
         if(!tree_) {for(const auto& [key,value]:references()) {

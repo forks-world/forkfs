@@ -12,6 +12,7 @@ public:
     using ObjectId=std::array<unsigned char,32>;
     using Bytes=std::vector<unsigned char>;
     using Map=std::map<std::string,ObjectId>;
+    using Objects=std::map<ObjectId,Bytes>;
     using Changes=std::map<std::string,std::optional<ObjectId>>;
     using Range=std::pair<std::string,std::string>;
     struct Frozen {Map flat;std::vector<Bytes> runs;};
@@ -19,6 +20,8 @@ public:
     struct Plan {std::vector<Bytes> objects;Bytes manifest;size_t run_count;};
     NamespaceView(const Journal& journal,const std::string& name,bool revision=false,bool validate_root=true);
     NamespaceView(const Journal& journal,const ObjectId& manifest);
+    // Read-only view over a candidate namespace and its uncommitted payloads.
+    NamespaceView(const Journal& journal,const Map& records,const Objects& objects);
     ~NamespaceView();
     std::vector<std::string> page(const std::string& prefix,const std::string& after,size_t limit) const;
     bool contains(const std::string& key) const;
@@ -36,6 +39,8 @@ public:
     static void valid_name(const std::string& name);
 private:
     const Journal& journal_;
+    const Map* candidate_=nullptr;
+    const Objects* pending_=nullptr;
     mutable std::unique_ptr<MetadataTree> tree_;
     bool legacy_=false;
     std::vector<ObjectId> runs_;

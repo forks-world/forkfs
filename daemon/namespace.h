@@ -54,6 +54,8 @@ public:
     std::string revision_history(const std::string& tip,const std::string& after_id="",size_t limit=64) const;
     std::string snapshot(const std::string& name);
     std::string restore(const std::string& revision,const std::string& safety_revision);
+    std::string merge(const std::string& base,const std::string& source,
+                      const std::optional<std::string>& expected_token=std::nullopt);
     std::string discard_plan(const std::string& name) const;
     // The RPC dispatcher excludes mounts and directory cursors before online removal.
     std::string drop_world(const std::string& name,

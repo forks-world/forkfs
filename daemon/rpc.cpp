@@ -121,7 +121,7 @@ public:
         for(const auto& [token,s]:values_)if(s.mount && !s.mount->revision && s.mount->view==view)
             throw RpcError(EBUSY,"World restore requires an unmounted filesystem");
     }
-    void require_discard_idle(const std::string& view) const {
+    void require_idle_world(const std::string& view) const {
         for (const auto& [token, session] : values_) {
             if (session.mount && !session.mount->revision && session.mount->view == view) {
                 throw RpcError(EBUSY, "World has an active mount");
@@ -160,6 +160,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     if(op=="fs-hmkdir")count=4;
     if(op=="fs-history")count=4;
     if(op=="fs-discard")count=3;
+    if(op=="fs-merge-plan")count=4;
+    if(op=="fs-merge")count=5;
     if(op=="inode-root" || op=="inode-sync" || op=="inode-space")count=1;
     if(op=="inode-stat" || op=="inode-dir-open" || op=="inode-readlink")count=2;
     if(op=="inode-lookup" || op=="inode-open")count=3;
@@ -200,6 +202,15 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     }
     if(op=="session-keepalive"){sessions.acquire(args[1]);if(store.requires_reopen())throw RpcError(EIO,"storage requires reopen after write failure");return store.status();}
     if(op=="session-close"){sessions.acquire(args[1]);sessions.close(args[1]);return store.status();}
+    if (op == "fs-merge-plan" || op == "fs-merge") {
+        need(!selected_view && session_token.empty(), "merge takes explicit World and checkpoint names");
+        if (op == "fs-merge-plan") return Namespace(store, args[1]).merge(args[2], args[3]);
+        need(args[4].size() == 64 && std::all_of(args[4].begin(), args[4].end(), [](char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        }), "invalid merge token");
+        sessions.require_idle_world(args[1]);
+        return Namespace(store, args[1]).merge(args[2], args[3], args[4]);
+    }
     if (op == "fs-discard-plan" || op == "fs-discard") {
         need(!selected_view && session_token.empty(), "discard takes explicit World names without selectors");
         Namespace fs(store);
@@ -208,7 +219,7 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
             return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
         }), "invalid discard token");
         // The dispatcher is serial, so no RPC can open the view before the commit.
-        sessions.require_discard_idle(args[1]);
+        sessions.require_idle_world(args[1]);
         return fs.drop_world(args[1], args[2]);
     }
     bool handle_op=op=="fs-open" || op=="fs-close" || op=="fs-dup" || (op.starts_with("fs-h") && op!="fs-history");

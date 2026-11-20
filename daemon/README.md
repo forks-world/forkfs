@@ -1474,6 +1474,34 @@ root keys and 32-byte values are admitted. Poisoned stores reject reads before
 cache lookup. This does not replace immutable-object hash/collision checks or
 change synchronous commit. Full verify continues to scan the database itself.
 
+## Online three-way merge
+
+`fs-merge-plan WORLD BASE SOURCE` previews a merge into a LevelDB World.
+`BASE` and `SOURCE` are named checkpoints. The base must be an ancestor of
+both the source and the target World's checkpoint history. The target input
+is its current committed namespace, including edits after its last checkpoint.
+
+A clean preview returns `ready` and a confirmation token. `fs-merge WORLD BASE
+SOURCE TOKEN` accepts that token and publishes the candidate target in a single
+synchronous batch. The command rejects active target mounts, file handles and
+directory cursors. The token includes the repository sequence and target head,
+so any intervening repository commit makes the plan stale. A fresh preview
+after an applied change can report `unchanged`. The source checkpoint and the
+target's checkpoint ancestry remain available. Create a target checkpoint to
+name the merged result.
+
+Merge compares entries and whole inode bundles, including content, metadata and
+xattrs. Divergent changes to a bundle or a directory entry produce a read-only
+`conflict` result. The result identifies the inode or directory entry. Independent
+directory entry edits can combine their derived link counts and modification times.
+A directory metadata edit on one side without an entry change still participates
+in conflict detection.
+Before publication the daemon validates the complete resulting namespace and
+returns a conflict if the combination yields invalid topology. File contents
+are selected as complete versions. Merge preparation has a two-second budget,
+and the candidate must fit one LevelDB batch. Read-only revisions and other
+Worlds retain their own roots.
+
 ## Online branch discard
 
 LevelDB RPC clients can use `fs-discard-plan WORLD` to read a non-main World's
