@@ -1474,6 +1474,24 @@ root keys and 32-byte values are admitted. Poisoned stores reject reads before
 cache lookup. This does not replace immutable-object hash/collision checks or
 change synchronous commit. Full verify continues to scan the database itself.
 
+## Online branch discard
+
+LevelDB RPC clients can use `fs-discard-plan WORLD` to read a non-main World's
+manifest ID, base revision ID, and a confirmation token. `fs-discard WORLD TOKEN`
+compares the token to the current state and removes the matching World head and
+base in one synchronous transaction. Both commands take an explicit World name.
+
+The token covers the repository, World name, both roots, and the committed
+repository sequence. A commit anywhere in the repository invalidates the plan.
+This also fences reusing a name for a World forked from the same revision.
+Create a fresh plan after reviewing the current state when a token is stale.
+
+Discard returns `EBUSY` for an active mutable mount, open file handle or open
+directory cursor on the selected World. A stale token returns `ESTALE`. An
+absent World returns `ENOENT`. The daemon permits access to other Worlds and
+read-only revisions during this operation. The response identifies both removed
+roots. Named revisions remain available and `collected_objects` is zero.
+
 ## Offline retention
 
 Stop the daemon and unmount FSKit before these commands. They require exclusive

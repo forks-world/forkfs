@@ -72,6 +72,10 @@ set_tests_properties(forkfsd_restore PROPERTIES TIMEOUT 120)
 add_test(NAME forkfsd_retention COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/retention.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_legacy_test> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
 set_tests_properties(forkfsd_retention PROPERTIES TIMEOUT 120)
+
+add_test(NAME forkfsd_discard_rpc COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/discard_rpc.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_leveldb_fault_test>)
+set_tests_properties(forkfsd_discard_rpc PROPERTIES TIMEOUT 60)
 add_test(NAME forkfsd_xattr_rpc COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/xattr_rpc.py $<TARGET_FILE:forkfsd> $<TARGET_FILE:forkfsd_legacy_test>)
 set_tests_properties(forkfsd_xattr_rpc PROPERTIES TIMEOUT 120)

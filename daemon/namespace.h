@@ -54,8 +54,11 @@ public:
     std::string revision_history(const std::string& tip,const std::string& after_id="",size_t limit=64) const;
     std::string snapshot(const std::string& name);
     std::string restore(const std::string& revision,const std::string& safety_revision);
-    // Offline retention operations; descendants and other roots keep their data.
-    std::string drop_world(const std::string& name);
+    std::string discard_plan(const std::string& name) const;
+    // The RPC dispatcher excludes mounts and directory cursors before online removal.
+    std::string drop_world(const std::string& name,
+                           const std::optional<std::string>& expected_token = std::nullopt);
+    // Offline retention; descendants and other roots keep their data.
     std::string forget_revision(const std::string& name);
     void fork(const std::string& revision,const std::string& world);
     std::vector<std::string> worlds() const;
