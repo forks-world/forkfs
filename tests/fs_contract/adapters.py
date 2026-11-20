@@ -600,9 +600,13 @@ class RpcAdapter:
 
     @staticmethod
     def _normal_stat(value):
+        allocated_size = value.get("allocated_size")
+        if type(allocated_size) is not int or allocated_size < 0:
+            raise RuntimeError("RPC stat allocated_size must be a nonnegative integer")
         return {"inode": value["inode_id"], "type": "directory" if value["directory"] else "symlink" if value["symlink"] else "file",
                 "links": value["links"], "size": value["size"], "mode": value["mode"],
-                "mtime_ns": value["modified_ns"], "atime_ns": value["accessed_ns"]}
+                "mtime_ns": value["modified_ns"], "atime_ns": value["accessed_ns"],
+                "allocated_size": allocated_size}
 
     def fingerprint(self, revision=None):
         status = self._json("status")

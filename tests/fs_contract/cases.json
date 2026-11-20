@@ -9018,6 +9018,50 @@
         {"op":"rpc_seek_region","args":{"path":"sparse","offset":65536,"region":"data"},"expect":{"errno":"ENXIO","unchanged":true}},
         {"op":"rpc_hseek_region","args":{"handle":{"ref":"h","field":"handle"},"offset":0,"region":"data"},"expect":{"errno":0,"offset":65536}}
       ]
+    },
+    {
+      "id": "rpc_allocation_accounting",
+      "profiles": [
+        "daemon"
+      ],
+      "layers": [
+        "rpc"
+      ],
+      "mandatory": true,
+      "families": [
+        "allocation_blocks",
+        "sparse_file",
+        "hardlink",
+        "revision_isolation",
+        "failure_atomicity"
+      ],
+      "fixture": [{"type": "file", "path": "f", "data_hex": "41"}],
+      "steps": [
+        {"op": "stat", "args": {"path": "f"}, "expect": {"errno": 0, "size": 1, "allocated_size": 512}, "save": "initial"},
+        {"op": "open", "args": {"path": "f", "flags": ["read", "write"]}, "expect": {"errno": 0}, "save": "file"},
+        {"op": "ftruncate", "args": {"handle": {"ref": "file", "field": "handle"}, "size": 262145}, "expect": {"errno": 0}},
+        {"op": "fstat", "args": {"handle": {"ref": "file", "field": "handle"}}, "expect": {"errno": 0, "size": 262145, "allocated_size": 512}},
+        {"op": "pwrite", "args": {"handle": {"ref": "file", "field": "handle"}, "offset": 66048, "data_hex": "42"}, "expect": {"errno": 0, "written": 1}},
+        {"op": "ftruncate", "args": {"handle": {"ref": "file", "field": "handle"}, "size": 66049}, "expect": {"errno": 0}},
+        {"op": "fstat", "args": {"handle": {"ref": "file", "field": "handle"}}, "expect": {"errno": 0, "inode": {"ref": "initial", "field": "inode"}, "size": 66049, "allocated_size": 1536}},
+        {"op": "link", "args": {"source": "f", "target": "alias"}, "expect": {"errno": 0}},
+        {"op": "lstat", "args": {"path": "alias"}, "expect": {"errno": 0, "inode": {"ref": "initial", "field": "inode"}, "links": 2, "allocated_size": 1536}},
+        {"op": "snapshot", "args": {"name": "backed"}, "expect": {"errno": 0}},
+        {"op": "pwrite", "args": {"handle": {"ref": "file", "field": "handle"}, "offset": 0, "data_hex": "00"}, "expect": {"errno": 0, "written": 1}},
+        {"op": "stat", "args": {"path": "alias"}, "expect": {"errno": 0, "inode": {"ref": "initial", "field": "inode"}, "links": 2, "size": 66049, "allocated_size": 1024}},
+        {"op": "stat", "args": {"path": "f", "revision": "backed"}, "expect": {"errno": 0, "inode": {"ref": "initial", "field": "inode"}, "size": 66049, "allocated_size": 1536}},
+        {"op": "unlink", "args": {"path": "f"}, "expect": {"errno": 0}},
+        {"op": "unlink", "args": {"path": "alias"}, "expect": {"errno": 0}},
+        {"op": "stat", "args": {"path": "f"}, "expect": {"errno": "ENOENT", "unchanged": true}},
+        {"op": "create", "args": {"path": "f", "data_hex": "4e"}, "expect": {"errno": 0, "written": 1}},
+        {"op": "stat", "args": {"path": "f"}, "expect": {"errno": 0, "inode_not": {"ref": "initial", "field": "inode"}, "size": 1, "allocated_size": 512}},
+        {"op": "fstat", "args": {"handle": {"ref": "file", "field": "handle"}}, "expect": {"errno": 0, "inode": {"ref": "initial", "field": "inode"}, "links": 0, "size": 66049, "allocated_size": 1024}},
+        {"op": "pwrite", "args": {"handle": {"ref": "file", "field": "handle"}, "offset": 66048, "data_hex": "00"}, "expect": {"errno": 0, "written": 1}},
+        {"op": "fstat", "args": {"handle": {"ref": "file", "field": "handle"}}, "expect": {"errno": 0, "inode": {"ref": "initial", "field": "inode"}, "links": 0, "size": 66049, "allocated_size": 0}},
+        {"op": "stat", "args": {"path": "f", "revision": "backed"}, "expect": {"errno": 0, "inode": {"ref": "initial", "field": "inode"}, "size": 66049, "allocated_size": 1536}},
+        {"op": "read", "args": {"path": "f"}, "expect": {"errno": 0, "data_hex": "4e"}},
+        {"op": "close", "args": {"handle": {"ref": "file", "field": "handle"}}, "expect": {"errno": 0}}
+      ]
     }
   ]
 }
