@@ -9062,6 +9062,314 @@
         {"op": "read", "args": {"path": "f"}, "expect": {"errno": 0, "data_hex": "4e"}},
         {"op": "close", "args": {"handle": {"ref": "file", "field": "handle"}}, "expect": {"errno": 0}}
       ]
+    },
+    {
+      "id": "rpc_clone_file_symlink_copy_independence",
+      "families": [
+        "clone_copy",
+        "failure_atomicity"
+      ],
+      "profiles": [
+        "daemon"
+      ],
+      "layers": [
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "source",
+          "data_hex": "636c6f6e652d736f75726365"
+        },
+        {
+          "type": "symlink",
+          "path": "source-link",
+          "target": "source"
+        },
+        {
+          "type": "file",
+          "path": "occupied",
+          "data_hex": "6f63637570696564"
+        },
+        {
+          "type": "symlink",
+          "path": "dangling-destination",
+          "target": "missing"
+        }
+      ],
+      "steps": [
+        {
+          "op": "xattr_set",
+          "args": {
+            "path": "source",
+            "name": "user.clone",
+            "policy": "upsert",
+            "value_hex": "736f757263652d61747472"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "lstat",
+          "args": {
+            "path": "source-link"
+          },
+          "save": "source_link",
+          "expect": {
+            "errno": 0,
+            "type": "symlink",
+            "target": "source"
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "source"
+          },
+          "save": "source",
+          "expect": {
+            "errno": 0,
+            "type": "file",
+            "links": 1
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "source"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "636c6f6e652d736f75726365"
+          }
+        },
+        {
+          "op": "xattr_get",
+          "args": {
+            "path": "source",
+            "name": "user.clone"
+          },
+          "expect": {
+            "errno": 0,
+            "value_hex": "736f757263652d61747472"
+          }
+        },
+        {
+          "op": "clone_file",
+          "args": {
+            "source": "source-link",
+            "target": "copy"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "lstat",
+          "args": {
+            "path": "source-link"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "symlink",
+            "target": "source",
+            "inode": {
+              "ref": "source_link",
+              "field": "inode"
+            }
+          }
+        },
+        {
+          "op": "lstat",
+          "args": {
+            "path": "copy"
+          },
+          "expect": {
+            "errno": 0,
+            "type": "file",
+            "inode_not": {
+              "ref": "source",
+              "field": "inode"
+            },
+            "links": 1
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "copy"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "636c6f6e652d736f75726365"
+          }
+        },
+        {
+          "op": "xattr_get",
+          "args": {
+            "path": "copy",
+            "name": "user.clone"
+          },
+          "expect": {
+            "errno": 0,
+            "value_hex": "736f757263652d61747472"
+          }
+        },
+        {
+          "op": "append",
+          "args": {
+            "path": "copy",
+            "data_hex": "2d636f7079"
+          },
+          "expect": {
+            "errno": 0,
+            "written": 5
+          }
+        },
+        {
+          "op": "xattr_set",
+          "args": {
+            "path": "copy",
+            "name": "user.clone",
+            "policy": "replace",
+            "value_hex": "636f70792d61747472"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "copy"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "636c6f6e652d736f757263652d636f7079"
+          }
+        },
+        {
+          "op": "xattr_get",
+          "args": {
+            "path": "copy",
+            "name": "user.clone"
+          },
+          "expect": {
+            "errno": 0,
+            "value_hex": "636f70792d61747472"
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "source"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "636c6f6e652d736f75726365"
+          }
+        },
+        {
+          "op": "xattr_get",
+          "args": {
+            "path": "source",
+            "name": "user.clone"
+          },
+          "expect": {
+            "errno": 0,
+            "value_hex": "736f757263652d61747472"
+          }
+        },
+        {
+          "op": "append",
+          "args": {
+            "path": "source",
+            "data_hex": "2d736f75726365"
+          },
+          "expect": {
+            "errno": 0,
+            "written": 7
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "source"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "636c6f6e652d736f757263652d736f75726365"
+          }
+        },
+        {
+          "op": "xattr_set",
+          "args": {
+            "path": "source",
+            "name": "user.clone",
+            "policy": "replace",
+            "value_hex": "736f757263652d65646974"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "xattr_get",
+          "args": {
+            "path": "source",
+            "name": "user.clone"
+          },
+          "expect": {
+            "errno": 0,
+            "value_hex": "736f757263652d65646974"
+          }
+        },
+        {
+          "op": "xattr_get",
+          "args": {
+            "path": "copy",
+            "name": "user.clone"
+          },
+          "expect": {
+            "errno": 0,
+            "value_hex": "636f70792d61747472"
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "copy"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "636c6f6e652d736f757263652d636f7079"
+          }
+        },
+        {
+          "op": "clone_file",
+          "args": {
+            "source": "source",
+            "target": "occupied"
+          },
+          "expect": {
+            "errno": "EEXIST",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "clone_file",
+          "args": {
+            "source": "source",
+            "target": "dangling-destination"
+          },
+          "expect": {
+            "errno": "EEXIST",
+            "unchanged": true
+          }
+        }
+      ]
     }
   ]
 }

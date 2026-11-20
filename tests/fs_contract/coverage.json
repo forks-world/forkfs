@@ -189,7 +189,8 @@
         "mkdir_at_existing_file_atomic_then_reuse_handle",
         "rpc_volume_name_revision_isolation_and_persistence",
         "rpc_sparse_seek_region_chunk_eof_cursor_and_orphan",
-        "rpc_allocation_accounting"
+        "rpc_allocation_accounting",
+        "rpc_clone_file_symlink_copy_independence"
       ],
       "existing_external": [
         {
@@ -1670,7 +1671,9 @@
       ]
     },
     "clone_copy": {
-      "case_ids": [],
+      "case_ids": [
+        "rpc_clone_file_symlink_copy_independence"
+      ],
       "existing_external": [
         {
           "id": "daemon_clone_core",

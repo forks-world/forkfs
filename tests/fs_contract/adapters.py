@@ -567,6 +567,7 @@ class RpcAdapter:
         if op == "rpc_dir_close":
             self.rpc("fs-dir-close", a["cursor"], *sel()); return {}
         if op == "link": self.rpc("fs-link", path("source"), path("target"), *sel()); return {}
+        if op == "clone_file": self.rpc("fs-clone-file", path("source"), path("target"), *sel()); return {}
         if op in {"rename", "rename_exclusive", "rename_exchange"}:
             command = {
                 "rename": "fs-rename",
