@@ -503,6 +503,13 @@ class RpcAdapter:
             if not isinstance(result, dict) or type(result.get("granted")) is not bool:
                 raise RuntimeError("RPC lock response must contain boolean granted")
             return {"granted": result["granted"]}
+        if op in {"rpc_seek_region", "rpc_hseek_region"}:
+            command = "fs-seek-region" if op == "rpc_seek_region" else "fs-hseek-region"
+            target = path("path") if op == "rpc_seek_region" else a["handle"]
+            result = self._json(command, target, a["offset"], a["region"], *sel())
+            if not isinstance(result, dict) or type(result.get("offset")) is not int:
+                raise RuntimeError("seek-region RPC response must contain an integer offset")
+            return {"offset": result["offset"]}
         if op == "fstat": return self._normal_stat(self._json("fs-hstat", a["handle"], *sel()))
         if op == "read": return {"data_hex": self.rpc("fs-cat", path("path"), *sel()).hex()}
         if op == "pread": return {"data_hex": self.rpc("fs-hread", a["handle"], a["offset"], a["count"], *sel()).hex()}

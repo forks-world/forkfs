@@ -8987,6 +8987,37 @@
         {"op":"volume_name","args":{},"expect":{"errno":0,"name":"Live 東京"}},
         {"op":"volume_name","args":{"revision":"unicode_label"},"expect":{"errno":0,"name":"RPC卷"}}
       ]
+    },
+    {
+      "id":"rpc_sparse_seek_region_chunk_eof_cursor_and_orphan",
+      "families":["seek_regions","failure_atomicity"],
+      "profiles":["daemon"],
+      "layers":["rpc"],
+      "mandatory":true,
+      "fixture":[{"type":"file","path":"sparse","data_hex":""}],
+      "steps":[
+        {"op":"open","args":{"path":"sparse","flags":["read","write"]},"save":"h","expect":{"errno":0}},
+        {"op":"ftruncate","args":{"handle":{"ref":"h","field":"handle"},"size":262145},"expect":{"errno":0}},
+        {"op":"pwrite","args":{"handle":{"ref":"h","field":"handle"},"offset":65543,"data_hex":"41"},"expect":{"errno":0,"written":1}},
+        {"op":"pwrite","args":{"handle":{"ref":"h","field":"handle"},"offset":196618,"data_hex":"5a"},"expect":{"errno":0,"written":1}},
+        {"op":"ftruncate","args":{"handle":{"ref":"h","field":"handle"},"size":196619},"expect":{"errno":0}},
+        {"op":"rpc_seek_region","args":{"path":"sparse","offset":0,"region":"data"},"expect":{"errno":0,"offset":65536}},
+        {"op":"rpc_seek_region","args":{"path":"sparse","offset":65556,"region":"hole"},"expect":{"errno":0,"offset":131072}},
+        {"op":"rpc_seek_region","args":{"path":"sparse","offset":196618,"region":"hole"},"expect":{"errno":0,"offset":196619}},
+        {"op":"rpc_seek_region","args":{"path":"sparse","offset":196619,"region":"data"},"expect":{"errno":"ENXIO","unchanged":true}},
+        {"op":"rpc_seek_region","args":{"path":"sparse","offset":196619,"region":"hole"},"expect":{"errno":"ENXIO","unchanged":true}},
+        {"op":"seek","args":{"handle":{"ref":"h","field":"handle"},"displacement":37,"whence":"set"},"expect":{"errno":0,"offset":37}},
+        {"op":"dup","args":{"handle":{"ref":"h","field":"handle"}},"save":"hdup","expect":{"errno":0}},
+        {"op":"rpc_hseek_region","args":{"handle":{"ref":"hdup","field":"handle"},"offset":0,"region":"data"},"expect":{"errno":0,"offset":65536}},
+        {"op":"rpc_hseek_region","args":{"handle":{"ref":"hdup","field":"handle"},"offset":65556,"region":"hole"},"expect":{"errno":0,"offset":131072}},
+        {"op":"rpc_hseek_region","args":{"handle":{"ref":"hdup","field":"handle"},"offset":196619,"region":"data"},"expect":{"errno":"ENXIO","unchanged":true}},
+        {"op":"rpc_hseek_region","args":{"handle":{"ref":"hdup","field":"handle"},"offset":196619,"region":"hole"},"expect":{"errno":"ENXIO","unchanged":true}},
+        {"op":"seek","args":{"handle":{"ref":"h","field":"handle"},"displacement":0,"whence":"cur"},"expect":{"errno":0,"offset":37}},
+        {"op":"unlink","args":{"path":"sparse"},"expect":{"errno":0}},
+        {"op":"create","args":{"path":"sparse","data_hex":"6e6577"},"expect":{"errno":0,"written":3}},
+        {"op":"rpc_seek_region","args":{"path":"sparse","offset":65536,"region":"data"},"expect":{"errno":"ENXIO","unchanged":true}},
+        {"op":"rpc_hseek_region","args":{"handle":{"ref":"h","field":"handle"},"offset":0,"region":"data"},"expect":{"errno":0,"offset":65536}}
+      ]
     }
   ]
 }
