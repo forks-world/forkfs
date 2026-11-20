@@ -187,7 +187,8 @@
         "symlink_xattr_nofollow_independent_from_referent",
         "mkdir_at_regular_handle_enotdir_preserves_cursor",
         "mkdir_at_existing_file_atomic_then_reuse_handle",
-        "rpc_volume_name_revision_isolation_and_persistence"
+        "rpc_volume_name_revision_isolation_and_persistence",
+        "rpc_sparse_seek_region_chunk_eof_cursor_and_orphan"
       ],
       "existing_external": [
         {
@@ -1494,7 +1495,9 @@
       "missing_contracts": []
     },
     "seek_regions": {
-      "case_ids": [],
+      "case_ids": [
+        "rpc_sparse_seek_region_chunk_eof_cursor_and_orphan"
+      ],
       "existing_external": [
         {
           "id": "daemon_seek_regions",
@@ -1524,7 +1527,7 @@
             "mounted"
           ],
           "mandatory": false,
-          "reason": "The DSL does not expose SEEK_DATA/SEEK_HOLE or RPC fs-seek-region; pwrite gaps only assert logical zero bytes."
+          "reason": "RPC contract asserts fixed forkfs 64 KiB sparse chunk granularity and query-only cursor behavior; native SEEK_DATA/SEEK_HOLE uses host filesystem granularity and changes the descriptor cursor, so its cross-platform contract remains separate."
         }
       ]
     },

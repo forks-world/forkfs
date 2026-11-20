@@ -36,6 +36,7 @@ OPS = {
     "restart": set(), "sync": {"handle"},
     "flock": {"handle", "lock_mode"}, "rpc_lock": {"handle", "lock_mode"},
     "rpc_range_lock": {"handle", "lock_mode", "start", "length"},
+    "rpc_seek_region": {"path", "offset", "region"}, "rpc_hseek_region": {"handle", "offset", "region"},
     "rpc_dir_open": {"path"}, "rpc_dir_page": {"cursor", "limit"},
     "rpc_dir_rewind": {"cursor"}, "rpc_dir_close": {"cursor"},
     "volume_name": set(), "set_volume_name": {"name"},
@@ -48,7 +49,7 @@ REF_FIELD = {"ref", "field"}
 ERRNOS = {
     "E2BIG", "EACCES", "EBADF", "EBUSY", "EEXIST", "EFAULT", "EFBIG", "EINTR",
     "EINVAL", "EWOULDBLOCK", "EIO", "EISDIR", "ELOOP", "EMFILE", "ENAMETOOLONG", "ENFILE",
-    "ENODATA", "ENOATTR", "ENOENT", "ENOSPC", "ENOTDIR", "ENOTEMPTY", "ENOTSUP",
+    "ENODATA", "ENOATTR", "ENOENT", "ENOSPC", "ENOTDIR", "ENOTEMPTY", "ENOTSUP", "ENXIO",
     "EOPNOTSUPP", "EOVERFLOW", "EPERM", "ERANGE", "EROFS", "ESPIPE", "ESTALE", "ETIMEDOUT", "EXDEV",
 }
 SYMBOL = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
@@ -166,6 +167,7 @@ REQUIRED_ARGS = {
     "mkdir_at": {"handle", "name"}, "snapshot": {"name"}, "restart": set(), "sync": {"handle"},
     "flock": {"handle", "lock_mode"}, "rpc_lock": {"handle", "lock_mode"},
     "rpc_range_lock": {"handle", "lock_mode", "start", "length"},
+    "rpc_seek_region": {"path", "offset", "region"}, "rpc_hseek_region": {"handle", "offset", "region"},
     "rpc_dir_open": {"path"}, "rpc_dir_page": {"cursor", "limit"},
     "rpc_dir_rewind": {"cursor"}, "rpc_dir_close": {"cursor"},
     "volume_name": set(), "set_volume_name": {"name"},
@@ -174,7 +176,8 @@ OPTIONAL_ARGS = {op: OPS[op] - REQUIRED_ARGS[op] for op in OPS}
 REVISION_OPS = {"mkdir", "create", "open", "read", "pread", "pwrite", "read_next", "write_next",
                 "truncate", "ftruncate", "append", "stat", "lstat", "listdir", "link", "rename",
                 "symlink", "readlink", "unlink", "rmdir", "chmod", "utime", "xattr_set", "xattr_get",
-                "xattr_remove", "mkdir_at", "rpc_lock", "rpc_range_lock", "volume_name", "set_volume_name"}
+                "xattr_remove", "mkdir_at", "rpc_lock", "rpc_range_lock", "rpc_seek_region", "rpc_hseek_region",
+                "volume_name", "set_volume_name"}
 EXPECT_FOR_OP = {
     "mkdir": set(), "create": {"written"}, "open": {"handle"}, "close": set(),
     "dup": {"handle"}, "fstat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns"},
@@ -189,6 +192,7 @@ EXPECT_FOR_OP = {
     "xattr_set": set(), "xattr_get": {"value_hex"}, "xattr_remove": set(),
     "mkdir_at": {"inode"}, "snapshot": set(), "restart": set(), "sync": set(),
     "flock": set(), "rpc_lock": {"granted"}, "rpc_range_lock": {"granted"},
+    "rpc_seek_region": {"offset"}, "rpc_hseek_region": {"offset"},
     "rpc_dir_open": {"cursor"}, "rpc_dir_page": {"ordered_names", "eof"},
     "rpc_dir_rewind": set(), "rpc_dir_close": set(), "volume_name": {"name"}, "set_volume_name": {"name"},
 }
@@ -269,6 +273,8 @@ def validate_case_file(doc):
                 raise SchemaError(f"{sw}: flock is POSIX-only")
             if op in {"rpc_lock", "rpc_range_lock"} and set(case["layers"]) != {"rpc"}:
                 raise SchemaError(f"{sw}: {op} is RPC-only")
+            if op in {"rpc_seek_region", "rpc_hseek_region"} and (set(case["profiles"]) != {"daemon"} or set(case["layers"]) != {"rpc"}):
+                raise SchemaError(f"{sw}: {op} is daemon/RPC-only")
             if op in {"volume_name", "set_volume_name"} and (set(case["profiles"]) != {"daemon"} or set(case["layers"]) != {"rpc"}):
                 raise SchemaError(f"{sw}: volume-name operations are daemon/RPC-only")
             if op.startswith("rpc_dir_") and (set(case["profiles"]) != {"daemon"} or set(case["layers"]) != {"rpc"}):
@@ -321,6 +327,12 @@ def validate_case_file(doc):
                 start, length = step["args"]["start"], step["args"]["length"]
                 if type(start) is not int or type(length) is not int or not 0 <= start <= (1 << 63) - 1 or not 0 <= length <= (1 << 63) - start:
                     raise SchemaError(f"{sw}: invalid signed offset lock range")
+            if op in {"rpc_seek_region", "rpc_hseek_region"}:
+                offset, region = step["args"]["offset"], step["args"]["region"]
+                if type(offset) is not int or not 0 <= offset <= FILE_SIZE_LIMIT:
+                    raise SchemaError(f"{sw}.args.offset must be a nonnegative bounded literal offset")
+                if not isinstance(region, str) or region not in ("data", "hole"):
+                    raise SchemaError(f"{sw}.args.region must be data or hole")
             if op == "rpc_dir_page":
                 limit = step["args"]["limit"]
                 if type(limit) is not int or not 1 <= limit <= 1024:
@@ -360,6 +372,8 @@ def validate_case_file(doc):
                 raise SchemaError(f"{sw}: successful directory page must assert names and eof")
             if success and op in {"rpc_lock", "rpc_range_lock"} and "granted" not in exp:
                 raise SchemaError(f"{sw}: successful RPC lock must assert granted")
+            if success and op in {"rpc_seek_region", "rpc_hseek_region"} and "offset" not in exp:
+                raise SchemaError(f"{sw}: successful seek-region query must assert offset")
             if success and op in {"volume_name", "set_volume_name"} and "name" not in exp:
                 raise SchemaError(f"{sw}: successful volume-name operation must assert name")
             if not success and exp.get("unchanged") is not True:
