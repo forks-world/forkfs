@@ -427,6 +427,12 @@ class RpcAdapter:
 
     def _json(self, *fields): return json.loads(self.rpc(*fields).decode())
 
+    def _volume_name(self, *fields):
+        result = self._json(*fields)
+        if not isinstance(result, dict) or not isinstance(result.get("name"), str):
+            raise RuntimeError("volume-name RPC response must contain a string name")
+        return {"name": result["name"]}
+
     def _selectors(self, revision=None):
         result = ["--session", self.session]
         if revision is not None: result += ["--revision", revision]
@@ -455,6 +461,8 @@ class RpcAdapter:
         path = lambda name: "/" + a[name]
         sel = lambda: self._selectors(a.get("revision"))
         if a.get("revision") is not None: self.revisions.add(a["revision"])
+        if op == "volume_name": return self._volume_name("fs-volume-name", *sel())
+        if op == "set_volume_name": return self._volume_name("fs-set-volume-name", a["name"], *sel())
         if op == "mkdir":
             if a.get("mode", 0o755) != 0o755: raise Unsupported("RPC fs-mkdir has no creation-mode argument")
             self.rpc("fs-mkdir", path("path"), *sel()); return {}
@@ -596,12 +604,15 @@ class RpcAdapter:
             raise RuntimeError("RPC status omitted publication fingerprint fields")
         result = {"seq": status.get("last_committed_seq"), "indexed_objects": status.get("indexed_objects"),
                   "object_roots": status.get("object_roots"), "revisions": self.rpc("fs-revisions").decode().splitlines(),
-                  "view_trees": {}}
+                  "view_trees": {}, "volume_names": {"live": None, "revisions": {}}}
         views = [None, *sorted(self.revisions | ({revision} if revision else set()))]
         logical_bytes = 0
         total_entries = 0
         for view in views:
             selectors = self._selectors(view)
+            volume_name = self._volume_name("fs-volume-name", *selectors)["name"]
+            if view is None: result["volume_names"]["live"] = volume_name
+            else: result["volume_names"]["revisions"][view] = volume_name
             entries = []
             def walk(path):
                 nonlocal logical_bytes, total_entries

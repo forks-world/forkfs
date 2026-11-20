@@ -38,8 +38,9 @@ OPS = {
     "rpc_range_lock": {"handle", "lock_mode", "start", "length"},
     "rpc_dir_open": {"path"}, "rpc_dir_page": {"cursor", "limit"},
     "rpc_dir_rewind": {"cursor"}, "rpc_dir_close": {"cursor"},
+    "volume_name": set(), "set_volume_name": {"name"},
 }
-EXPECT_KEYS = {"errno", "unchanged", "data_hex", "type", "inode", "inode_not", "links",
+EXPECT_KEYS = {"errno", "unchanged", "data_hex", "type", "inode", "inode_not", "links", "name",
                "size", "mode", "mtime_ns", "atime_ns", "target", "names", "offset",
                "ordered_names", "eof", "written", "value_hex", "granted"}
 RESULT_FIELDS = EXPECT_KEYS - {"errno", "unchanged", "inode_not", "ordered_names"} | {"handle", "cursor"}
@@ -167,12 +168,13 @@ REQUIRED_ARGS = {
     "rpc_range_lock": {"handle", "lock_mode", "start", "length"},
     "rpc_dir_open": {"path"}, "rpc_dir_page": {"cursor", "limit"},
     "rpc_dir_rewind": {"cursor"}, "rpc_dir_close": {"cursor"},
+    "volume_name": set(), "set_volume_name": {"name"},
 }
 OPTIONAL_ARGS = {op: OPS[op] - REQUIRED_ARGS[op] for op in OPS}
 REVISION_OPS = {"mkdir", "create", "open", "read", "pread", "pwrite", "read_next", "write_next",
                 "truncate", "ftruncate", "append", "stat", "lstat", "listdir", "link", "rename",
                 "symlink", "readlink", "unlink", "rmdir", "chmod", "utime", "xattr_set", "xattr_get",
-                "xattr_remove", "mkdir_at", "rpc_lock", "rpc_range_lock"}
+                "xattr_remove", "mkdir_at", "rpc_lock", "rpc_range_lock", "volume_name", "set_volume_name"}
 EXPECT_FOR_OP = {
     "mkdir": set(), "create": {"written"}, "open": {"handle"}, "close": set(),
     "dup": {"handle"}, "fstat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns"},
@@ -188,7 +190,7 @@ EXPECT_FOR_OP = {
     "mkdir_at": {"inode"}, "snapshot": set(), "restart": set(), "sync": set(),
     "flock": set(), "rpc_lock": {"granted"}, "rpc_range_lock": {"granted"},
     "rpc_dir_open": {"cursor"}, "rpc_dir_page": {"ordered_names", "eof"},
-    "rpc_dir_rewind": set(), "rpc_dir_close": set(),
+    "rpc_dir_rewind": set(), "rpc_dir_close": set(), "volume_name": {"name"}, "set_volume_name": {"name"},
 }
 
 
@@ -267,6 +269,8 @@ def validate_case_file(doc):
                 raise SchemaError(f"{sw}: flock is POSIX-only")
             if op in {"rpc_lock", "rpc_range_lock"} and set(case["layers"]) != {"rpc"}:
                 raise SchemaError(f"{sw}: {op} is RPC-only")
+            if op in {"volume_name", "set_volume_name"} and (set(case["profiles"]) != {"daemon"} or set(case["layers"]) != {"rpc"}):
+                raise SchemaError(f"{sw}: volume-name operations are daemon/RPC-only")
             if op.startswith("rpc_dir_") and (set(case["profiles"]) != {"daemon"} or set(case["layers"]) != {"rpc"}):
                 raise SchemaError(f"{sw}: directory cursor operations are daemon/RPC-only")
             if not isinstance(step["args"], dict):
@@ -356,6 +360,8 @@ def validate_case_file(doc):
                 raise SchemaError(f"{sw}: successful directory page must assert names and eof")
             if success and op in {"rpc_lock", "rpc_range_lock"} and "granted" not in exp:
                 raise SchemaError(f"{sw}: successful RPC lock must assert granted")
+            if success and op in {"volume_name", "set_volume_name"} and "name" not in exp:
+                raise SchemaError(f"{sw}: successful volume-name operation must assert name")
             if not success and exp.get("unchanged") is not True:
                 raise SchemaError(f"{sw}: expected failures must require unchanged=true")
             for key, value in exp.items():
@@ -385,7 +391,7 @@ def validate_case_file(doc):
                         raise SchemaError(f"{sw}.expect.{key} must be an integer, opaque ID, or result ref")
                     if key in {"data_hex", "value_hex"} and not isinstance(value, (str, dict)):
                         raise SchemaError(f"{sw}.expect.{key} must be hex or result ref")
-                    if key in {"target", "type"} and not isinstance(value, str):
+                    if key in {"target", "type", "name"} and not isinstance(value, str):
                         raise SchemaError(f"{sw}.expect.{key} must be a string")
             if "inode" in exp and "inode_not" in exp:
                 raise SchemaError(f"{sw}: inode and inode_not are mutually exclusive")

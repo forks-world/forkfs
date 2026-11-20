@@ -186,7 +186,8 @@
         "xattr_policy_failures_preserve_binary_state",
         "symlink_xattr_nofollow_independent_from_referent",
         "mkdir_at_regular_handle_enotdir_preserves_cursor",
-        "mkdir_at_existing_file_atomic_then_reuse_handle"
+        "mkdir_at_existing_file_atomic_then_reuse_handle",
+        "rpc_volume_name_revision_isolation_and_persistence"
       ],
       "existing_external": [
         {
@@ -909,7 +910,8 @@
         "rpc_revision_hardlink_recreate",
         "rpc_revision_metadata_restart",
         "rpc_two_snapshots_live_binary_restart",
-        "rpc_lock_revision_selector_isolation"
+        "rpc_lock_revision_selector_isolation",
+        "rpc_volume_name_revision_isolation_and_persistence"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -977,7 +979,8 @@
         "sync_restart_persistence",
         "rpc_revision_metadata_restart",
         "rpc_two_snapshots_live_binary_restart",
-        "rpc_lock_restart_drops_locks"
+        "rpc_lock_restart_drops_locks",
+        "rpc_volume_name_revision_isolation_and_persistence"
       ],
       "existing_external": [
         {
@@ -1751,7 +1754,9 @@
       ]
     },
     "volume_name": {
-      "case_ids": [],
+      "case_ids": [
+        "rpc_volume_name_revision_isolation_and_persistence"
+      ],
       "existing_external": [
         {
           "id": "daemon_volume_name",
@@ -1781,7 +1786,7 @@
             "mounted"
           ],
           "mandatory": false,
-          "reason": "Volume-name mutation and persistence are outside this DSL; the external native suite is indexed as not_run."
+          "reason": "The contract covers RPC volume-name metadata, revision isolation, and restart persistence. Native POSIX volume get/set remains outside this RPC-only DSL; the external native suite is indexed as not_run."
         }
       ]
     },
