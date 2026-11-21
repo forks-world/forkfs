@@ -88,7 +88,8 @@
         "mkdir_trailing_slash_succeeds",
         "path_dot_dot_physical_resolution",
         "terminal_dot_path_type_errors",
-        "relative_symlink_chmod_utime_follow_referent"
+        "relative_symlink_chmod_utime_follow_referent",
+        "open_nofollow_rejects_final_symlinks"
       ],
       "existing_external": [
         {
@@ -162,7 +163,8 @@
         "readonly_handle_writes_rejected_unchanged",
         "xattr_policy_failures_preserve_binary_state",
         "mkdir_at_regular_handle_enotdir_preserves_cursor",
-        "mkdir_at_existing_file_atomic_then_reuse_handle"
+        "mkdir_at_existing_file_atomic_then_reuse_handle",
+        "open_nofollow_rejects_final_symlinks"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -191,7 +193,8 @@
         "rpc_volume_name_revision_isolation_and_persistence",
         "rpc_sparse_seek_region_chunk_eof_cursor_and_orphan",
         "rpc_allocation_accounting",
-        "rpc_clone_file_symlink_copy_independence"
+        "rpc_clone_file_symlink_copy_independence",
+        "open_nofollow_rejects_final_symlinks"
       ],
       "existing_external": [
         {
@@ -249,7 +252,8 @@
         "mkdir_through_dangling_symlink_trailing_slash",
         "exclusive_create_dangling_symlink_no_clobber",
         "relative_symlink_chmod_utime_follow_referent",
-        "symlink_xattr_nofollow_independent_from_referent"
+        "symlink_xattr_nofollow_independent_from_referent",
+        "open_nofollow_rejects_final_symlinks"
       ],
       "existing_external": [
         {
@@ -1158,7 +1162,8 @@
     "flags": {
       "case_ids": [
         "append_dup_seek_writes_at_eof",
-        "open_truncate_preserves_old_handle_inode"
+        "open_truncate_preserves_old_handle_inode",
+        "open_nofollow_rejects_final_symlinks"
       ],
       "existing_external": [
         {
@@ -1198,7 +1203,7 @@
             "mounted"
           ],
           "mandatory": false,
-          "reason": "O_NOFOLLOW and the full invalid flag matrix remain outside the shared cases."
+          "reason": "The full invalid open flag matrix remains outside the shared cases."
         },
         {
           "id": "full_open_flag_matrix_rpc",
@@ -1207,7 +1212,7 @@
             "daemon"
           ],
           "mandatory": false,
-          "reason": "O_NOFOLLOW and the full invalid flag matrix remain outside the shared cases."
+          "reason": "The full invalid open flag matrix remains outside the shared cases."
         }
       ]
     },
