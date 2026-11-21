@@ -26,6 +26,7 @@ OPS = {
     "ftruncate": {"handle", "size"}, "append": {"path", "data_hex"},
     "stat": {"path"}, "lstat": {"path"}, "listdir": {"path"},
     "link": {"source", "target"}, "rename": {"source", "target"},
+    "clone_file": {"source", "target"},
     "rename_exclusive": {"source", "target"}, "rename_exchange": {"source", "target"},
     "symlink": {"target", "path"}, "readlink": {"path"}, "unlink": {"path"},
     "rmdir": {"path"}, "chmod": {"path", "mode"},
@@ -159,7 +160,7 @@ REQUIRED_ARGS = {
     "read_next": {"handle", "count"}, "write_next": {"handle", "data_hex"},
     "truncate": {"path", "size"}, "ftruncate": {"handle", "size"}, "append": {"path", "data_hex"},
     "stat": {"path"}, "lstat": {"path"}, "listdir": {"path"},
-    "link": {"source", "target"}, "rename": {"source", "target"}, "symlink": {"target", "path"},
+    "link": {"source", "target"}, "clone_file": {"source", "target"}, "rename": {"source", "target"}, "symlink": {"target", "path"},
     "rename_exclusive": {"source", "target"}, "rename_exchange": {"source", "target"},
     "readlink": {"path"}, "unlink": {"path"}, "rmdir": {"path"}, "chmod": {"path", "mode"},
     "utime": {"path", "atime_ns", "mtime_ns"}, "xattr_set": {"path", "name", "value_hex", "policy"},
@@ -187,7 +188,7 @@ EXPECT_FOR_OP = {
     "stat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns", "allocated_size"},
     "lstat": {"inode", "type", "links", "size", "mode", "mtime_ns", "atime_ns", "allocated_size", "target"},
     "listdir": {"names"}, "link": set(), "rename": set(), "symlink": set(),
-    "rename_exclusive": set(), "rename_exchange": set(),
+    "rename_exclusive": set(), "rename_exchange": set(), "clone_file": set(),
     "readlink": {"target"}, "unlink": set(), "rmdir": set(), "chmod": set(), "utime": set(),
     "xattr_set": set(), "xattr_get": {"value_hex"}, "xattr_remove": set(),
     "mkdir_at": {"inode"}, "snapshot": set(), "restart": set(), "sync": set(),
@@ -275,6 +276,8 @@ def validate_case_file(doc):
                 raise SchemaError(f"{sw}: {op} is RPC-only")
             if op in {"rpc_seek_region", "rpc_hseek_region"} and (set(case["profiles"]) != {"daemon"} or set(case["layers"]) != {"rpc"}):
                 raise SchemaError(f"{sw}: {op} is daemon/RPC-only")
+            if op == "clone_file" and (set(case["profiles"]) != {"daemon"} or set(case["layers"]) != {"rpc"}):
+                raise SchemaError(f"{sw}: clone_file is daemon/RPC-only")
             if op in {"volume_name", "set_volume_name"} and (set(case["profiles"]) != {"daemon"} or set(case["layers"]) != {"rpc"}):
                 raise SchemaError(f"{sw}: volume-name operations are daemon/RPC-only")
             if op.startswith("rpc_dir_") and (set(case["profiles"]) != {"daemon"} or set(case["layers"]) != {"rpc"}):
@@ -297,7 +300,7 @@ def validate_case_file(doc):
                 if key in {"path", "source"} and isinstance(value, str):
                     allow_dot = key == "path" and value == "." and op in {"mkdir", "stat", "lstat", "listdir"}
                     _safe_relpath(value, sw + ".args." + key, allow_dot)
-                if key == "target" and op in {"link", "rename", "rename_exclusive", "rename_exchange"} and isinstance(value, str):
+                if key == "target" and op in {"link", "clone_file", "rename", "rename_exclusive", "rename_exchange"} and isinstance(value, str):
                     _safe_relpath(value, sw + ".args.target")
                 if key == "target" and isinstance(value, str) and op == "symlink":
                     if not value or value.startswith("/") or "\x00" in value:
