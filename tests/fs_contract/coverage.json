@@ -60,6 +60,7 @@
     "data": {
       "case_ids": [
         "append_adds_bytes_at_end",
+        "rpc_append_only_handle_and_live_clear",
         "rename_preserves_inode_and_payload",
         "rename_overwrite_retains_open_destination_identity"
       ],
@@ -169,6 +170,7 @@
     },
     "failure_atomicity": {
       "case_ids": [
+        "rpc_append_only_handle_and_live_clear",
         "rpc_immutable_flags_hardlink_revision",
         "binary_xattr_create_replace_remove",
         "file_directory_mismatch_and_trailing_slash",
@@ -560,7 +562,8 @@
     "append": {
       "case_ids": [
         "append_adds_bytes_at_end",
-        "append_dup_seek_writes_at_eof"
+        "append_dup_seek_writes_at_eof",
+        "rpc_append_only_handle_and_live_clear"
       ],
       "existing_external": [
         {
@@ -910,6 +913,7 @@
     },
     "revision_isolation": {
       "case_ids": [
+        "rpc_append_only_handle_and_live_clear",
         "rpc_immutable_flags_hardlink_revision",
         "rpc_snapshot_read_only_isolation",
         "rpc_revision_writable_open_read_only",
@@ -926,6 +930,7 @@
     },
     "rpc_extension": {
       "case_ids": [
+        "rpc_append_only_handle_and_live_clear",
         "rpc_immutable_flags_hardlink_revision",
         "rpc_snapshot_read_only_isolation",
         "sync_restart_persistence",
@@ -1335,6 +1340,7 @@
     },
     "flags_metadata": {
       "case_ids": [
+        "rpc_append_only_handle_and_live_clear",
         "rpc_immutable_flags_hardlink_revision"
       ],
       "existing_external": [
@@ -1420,7 +1426,7 @@
             "daemon"
           ],
           "mandatory": false,
-          "reason": "RPC coverage qualifies UF_IMMUTABLE on regular-file hardlinks, denied append/unlink/xattr removal/new writable open, and saved-revision isolation. Append-only and other flag combinations remain outside this contract."
+          "reason": "RPC cases qualify UF_IMMUTABLE on hardlinks and append-only handle, append, truncate, unlink, clear, and saved-revision behavior. Other inode flag bits and mixed flag combinations remain outside this contract."
         }
       ]
     },
