@@ -4792,6 +4792,34 @@
       ]
     },
     {
+      "id": "open_nofollow_rejects_final_symlinks",
+      "families": ["flags", "symlink", "path_resolution", "errno", "failure_atomicity"],
+      "profiles": ["reference", "mounted", "daemon"],
+      "layers": ["posix", "rpc"],
+      "mandatory": true,
+      "fixture": [
+        {"type": "file", "path": "f", "data_hex": "6b656570"},
+        {"type": "directory", "path": "dir"},
+        {"type": "file", "path": "dir/f", "data_hex": "646972"},
+        {"type": "symlink", "path": "alias", "target": "f"},
+        {"type": "symlink", "path": "dangling", "target": "missing"},
+        {"type": "symlink", "path": "dir-link", "target": "dir"}
+      ],
+      "steps": [
+        {"op": "open", "args": {"path": "alias", "flags": ["read", "nofollow"]}, "expect": {"errno": "ELOOP", "unchanged": true}},
+        {"op": "open", "args": {"path": "dangling", "flags": ["read", "nofollow"]}, "expect": {"errno": "ELOOP", "unchanged": true}},
+        {"op": "open", "args": {"path": "alias", "flags": ["write", "create", "truncate", "nofollow"]}, "expect": {"errno": "ELOOP", "unchanged": true}},
+        {"op": "open", "args": {"path": "dangling", "flags": ["read", "create", "nofollow"]}, "expect": {"errno": "ELOOP", "unchanged": true}},
+        {"op": "open", "args": {"path": "alias", "flags": ["read", "write", "create", "exclusive", "nofollow"]}, "expect": {"errno": "EEXIST", "unchanged": true}},
+        {"op": "read", "args": {"path": "f"}, "expect": {"errno": 0, "data_hex": "6b656570"}},
+        {"op": "open", "args": {"path": "f", "flags": ["read", "nofollow"]}, "save": "regular", "expect": {"errno": 0}},
+        {"op": "close", "args": {"handle": {"ref": "regular", "field": "handle"}}, "expect": {"errno": 0}},
+        {"op": "open", "args": {"path": "dir-link/f", "flags": ["read", "nofollow"]}, "save": "intermediate", "expect": {"errno": 0}},
+        {"op": "close", "args": {"handle": {"ref": "intermediate", "field": "handle"}}, "expect": {"errno": 0}},
+        {"op": "lstat", "args": {"path": "dangling"}, "expect": {"errno": 0, "type": "symlink"}}
+      ]
+    },
+    {
       "id": "open_truncate_preserves_old_handle_inode",
       "families": [
         "truncate",

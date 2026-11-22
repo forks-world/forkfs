@@ -1790,7 +1790,7 @@ std::string Namespace::open(const std::string& path,Access access,const OpenOpti
         if(exists && options.exclusive)throw std::system_error(EEXIST,std::generic_category(),"path already exists");
         if(exists) {
             auto raw=inode(view,decode_id(view.get(p.key)));
-            need(!options.nofollow || !raw.symlink,"final symbolic link is forbidden");
+            if(options.nofollow && raw.symlink)throw std::system_error(ELOOP,std::generic_category(),"final symbolic link is forbidden");
             Parent destination;id=resolve(view,path,true,&destination);
             if(id.empty()){p=std::move(destination);exists=false;}
         }
@@ -1799,7 +1799,10 @@ std::string Namespace::open(const std::string& path,Access access,const OpenOpti
             changes[inode_key(id)]=encode(n);changes[content_key(id)]=Bytes{};changes[allocated_key(id)]=Bytes{};
             changes[p.key]=id_bytes(id);changes[inode_key(p.id)]=encode(pn);
         }
-    } else {id=resolve(view,path,!(options.nofollow || options.symlink),nullptr,nullptr,true);need(!options.nofollow || !inode(view,id).symlink,"final symbolic link is forbidden");}
+    } else {
+        id=resolve(view,path,!(options.nofollow || options.symlink),nullptr,nullptr,true);
+        if(options.nofollow && inode(view,id).symlink)throw std::system_error(ELOOP,std::generic_category(),"final symbolic link is forbidden");
+    }
     if(changes.empty()) {
         auto n=inode(view,id);
         if(n.socket)throw std::system_error(ENOTSUP,std::generic_category(),"socket descriptors are kernel managed");
