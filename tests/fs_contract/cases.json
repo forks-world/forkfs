@@ -9399,6 +9399,36 @@
         {"op": "stat", "args": {"path": "f", "revision": "immutable_saved"}, "expect": {"errno": 0, "flags": 2, "links": 2, "size": 8}},
         {"op": "read", "args": {"path": "f", "revision": "immutable_saved"}, "expect": {"errno": 0, "data_hex": "6f726967696e616c"}}
       ]
+    },
+    {
+      "id": "rpc_append_only_handle_and_live_clear",
+      "families": ["rpc_extension", "flags_metadata", "append", "data", "failure_atomicity", "revision_isolation"],
+      "profiles": ["daemon"],
+      "layers": ["rpc"],
+      "mandatory": true,
+      "fixture": [{"type": "file", "path": "f", "data_hex": "44"}, {"type": "file", "path": "g", "data_hex": "47"}],
+      "steps": [
+        {"op": "open", "args": {"path": "f", "flags": ["read", "write"]}, "save": "old", "expect": {"errno": 0}},
+        {"op": "rpc_setflags", "args": {"path": "f", "mask": 4}, "expect": {"errno": 0}},
+        {"op": "pwrite", "args": {"handle": {"ref": "old", "field": "handle"}, "offset": 0, "data_hex": "58"}, "expect": {"errno": "EPERM", "unchanged": true}},
+        {"op": "pwrite", "args": {"handle": {"ref": "old", "field": "handle"}, "offset": 1, "data_hex": "41"}, "expect": {"errno": 0, "written": 1}},
+        {"op": "open", "args": {"path": "f", "flags": ["write"]}, "expect": {"errno": "EPERM", "unchanged": true}},
+        {"op": "open", "args": {"path": "f", "flags": ["read", "write", "append"]}, "save": "app", "expect": {"errno": 0}},
+        {"op": "pwrite", "args": {"handle": {"ref": "app", "field": "handle"}, "offset": 0, "data_hex": "42"}, "expect": {"errno": 0, "written": 1}},
+        {"op": "dup", "args": {"handle": {"ref": "app", "field": "handle"}}, "save": "app_dup", "expect": {"errno": 0}},
+        {"op": "write_next", "args": {"handle": {"ref": "app_dup", "field": "handle"}, "data_hex": "43"}, "expect": {"errno": 0, "written": 1, "offset": 4}},
+        {"op": "read", "args": {"path": "f"}, "expect": {"errno": 0, "data_hex": "44414243"}},
+        {"op": "truncate", "args": {"path": "f", "size": 0}, "expect": {"errno": "EPERM", "unchanged": true}},
+        {"op": "rpc_setflags", "args": {"path": "g", "mask": 4}, "expect": {"errno": 0}},
+        {"op": "unlink", "args": {"path": "g"}, "expect": {"errno": "EPERM", "unchanged": true}},
+        {"op": "snapshot", "args": {"name": "append_saved"}, "expect": {"errno": 0}},
+        {"op": "rpc_setflags", "args": {"path": "f", "mask": 0}, "expect": {"errno": 0}},
+        {"op": "pwrite", "args": {"handle": {"ref": "old", "field": "handle"}, "offset": 0, "data_hex": "58"}, "expect": {"errno": 0, "written": 1}},
+        {"op": "stat", "args": {"path": "f"}, "expect": {"errno": 0, "flags": 0, "size": 4}},
+        {"op": "read", "args": {"path": "f"}, "expect": {"errno": 0, "data_hex": "58414243"}},
+        {"op": "stat", "args": {"path": "f", "revision": "append_saved"}, "expect": {"errno": 0, "flags": 4, "size": 4}},
+        {"op": "read", "args": {"path": "f", "revision": "append_saved"}, "expect": {"errno": 0, "data_hex": "44414243"}}
+      ]
     }
   ]
 }
