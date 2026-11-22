@@ -9457,6 +9457,30 @@
         {"op": "stat", "args": {"path": "f", "revision": "append_saved"}, "expect": {"errno": 0, "flags": 4, "size": 4}},
         {"op": "read", "args": {"path": "f", "revision": "append_saved"}, "expect": {"errno": 0, "data_hex": "44414243"}}
       ]
+    },
+    {
+      "id": "rpc_symlink_traversal_cycles_are_eloop",
+      "families": ["symlink", "path_resolution", "errno", "flags", "failure_atomicity"],
+      "profiles": ["daemon"],
+      "layers": ["rpc"],
+      "mandatory": true,
+      "fixture": [
+        {"type": "file", "path": "f", "data_hex": "636f6e74726f6c"},
+        {"type": "symlink", "path": "self", "target": "self"},
+        {"type": "symlink", "path": "a", "target": "b"},
+        {"type": "symlink", "path": "b", "target": "a"},
+        {"type": "symlink", "path": "finite-a", "target": "finite-b"},
+        {"type": "symlink", "path": "finite-b", "target": "f"}
+      ],
+      "steps": [
+        {"op": "read", "args": {"path": "self"}, "expect": {"errno": "ELOOP", "unchanged": true}},
+        {"op": "open", "args": {"path": "self", "flags": ["read"]}, "expect": {"errno": "ELOOP", "unchanged": true}},
+        {"op": "open", "args": {"path": "a", "flags": ["write", "create", "truncate"]}, "expect": {"errno": "ELOOP", "unchanged": true}},
+        {"op": "open", "args": {"path": "self/f", "flags": ["read", "nofollow"]}, "expect": {"errno": "ELOOP", "unchanged": true}},
+        {"op": "stat", "args": {"path": "self"}, "expect": {"errno": "ELOOP", "unchanged": true}},
+        {"op": "lstat", "args": {"path": "self"}, "expect": {"errno": 0, "type": "symlink"}},
+        {"op": "read", "args": {"path": "finite-a"}, "expect": {"errno": 0, "data_hex": "636f6e74726f6c"}}
+      ]
     }
   ]
 }
