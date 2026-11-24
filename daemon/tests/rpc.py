@@ -93,6 +93,16 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
             expected=expected_error+1
             raw(['fs-stat',query],ok=False,expected_code=expected)
         assert json.loads(raw(['status']))['last_committed_seq']==trailing_seq
+        raw(['fs-symlink','/rpc-file','/rpc-file-link'])
+        ls_seq=json.loads(raw(['status']))['last_committed_seq']
+        for query, expected_error in [('/missing',errno.ENOENT),
+                                      ('/trail-dangling',errno.ENOENT),
+                                      ('/rpc-file',errno.ENOTDIR),
+                                      ('/rpc-file-link',errno.ENOTDIR),
+                                      ('/rpc-file/child',errno.ENOTDIR)]:
+            raw(['fs-ls',query],ok=False,expected_code=expected_error+1)
+        assert raw(['fs-ls','/trail-alias'])==b''
+        assert json.loads(raw(['status']))['last_committed_seq']==ls_seq
         cli('fs-mkdir','/src/hinted')
         payload=bytes(range(256))*1024;data.write_bytes(payload)
         cli('fs-write','/src/file',data)
