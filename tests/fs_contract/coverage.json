@@ -90,7 +90,8 @@
         "path_dot_dot_physical_resolution",
         "terminal_dot_path_type_errors",
         "relative_symlink_chmod_utime_follow_referent",
-        "open_nofollow_rejects_final_symlinks"
+        "open_nofollow_rejects_final_symlinks",
+        "rpc_symlink_traversal_cycles_are_eloop"
       ],
       "existing_external": [
         {
@@ -165,7 +166,8 @@
         "xattr_policy_failures_preserve_binary_state",
         "mkdir_at_regular_handle_enotdir_preserves_cursor",
         "mkdir_at_existing_file_atomic_then_reuse_handle",
-        "open_nofollow_rejects_final_symlinks"
+        "open_nofollow_rejects_final_symlinks",
+        "rpc_symlink_traversal_cycles_are_eloop"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -196,7 +198,8 @@
         "rpc_sparse_seek_region_chunk_eof_cursor_and_orphan",
         "rpc_allocation_accounting",
         "rpc_clone_file_symlink_copy_independence",
-        "open_nofollow_rejects_final_symlinks"
+        "open_nofollow_rejects_final_symlinks",
+        "rpc_symlink_traversal_cycles_are_eloop"
       ],
       "existing_external": [
         {
@@ -255,7 +258,8 @@
         "exclusive_create_dangling_symlink_no_clobber",
         "relative_symlink_chmod_utime_follow_referent",
         "symlink_xattr_nofollow_independent_from_referent",
-        "open_nofollow_rejects_final_symlinks"
+        "open_nofollow_rejects_final_symlinks",
+        "rpc_symlink_traversal_cycles_are_eloop"
       ],
       "existing_external": [
         {
@@ -268,7 +272,15 @@
           ]
         }
       ],
-      "missing_contracts": []
+      "missing_contracts": [
+        {
+          "id": "native_symlink_traversal_loops",
+          "layer": "posix",
+          "profiles": ["reference", "mounted"],
+          "mandatory": false,
+          "reason": "The native safe_path containment guard rejects cyclic symlink traversal before the filesystem syscall, so POSIX ELOOP behavior is outside the reference and mounted profiles."
+        }
+      ]
     },
     "lstat": {
       "case_ids": [
@@ -1168,7 +1180,8 @@
       "case_ids": [
         "append_dup_seek_writes_at_eof",
         "open_truncate_preserves_old_handle_inode",
-        "open_nofollow_rejects_final_symlinks"
+        "open_nofollow_rejects_final_symlinks",
+        "rpc_symlink_traversal_cycles_are_eloop"
       ],
       "existing_external": [
         {

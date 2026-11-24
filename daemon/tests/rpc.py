@@ -87,8 +87,10 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         assert json.loads(raw(['fs-lstat','/trail-alias/']))['inode_id']==src_id
         assert raw(['fs-cat','/rpc-file'])==b'R'
         trailing_seq=json.loads(raw(['status']))['last_committed_seq']
-        for query in ['/rpc-file/','/trail-dangling/','/trail-loop/']:
-            expected=errno.ENOTDIR+1 if query=='/rpc-file/' else errno.ENOENT+1 if query=='/trail-dangling/' else 1
+        for query, expected_error in [('/rpc-file/', errno.ENOTDIR),
+                                      ('/trail-dangling/', errno.ENOENT),
+                                      ('/trail-loop/', errno.ELOOP)]:
+            expected=expected_error+1
             raw(['fs-stat',query],ok=False,expected_code=expected)
         assert json.loads(raw(['status']))['last_committed_seq']==trailing_seq
         cli('fs-mkdir','/src/hinted')

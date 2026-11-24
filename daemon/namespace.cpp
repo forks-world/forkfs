@@ -267,7 +267,8 @@ std::string walk(const NamespaceView& journal,const std::vector<std::string>& na
         auto child=decode_id(journal.get(key));auto n=inode(journal,child);
         if(n.symlink && (follow_final || !pending.empty())) {
             if(followed_symlink)*followed_symlink=true;
-            need(++follows<=40,"too many symbolic links");auto b=journal.get(content_key(child));need(b.size()==n.size,"symlink size mismatch");
+            if(++follows>40)throw std::system_error(ELOOP,std::generic_category(),"too many symbolic links");
+            auto b=journal.get(content_key(child));need(b.size()==n.size,"symlink size mismatch");
             std::string target(b.begin(),b.end());auto parts=target_components(target);expanded+=target.size();need(expanded<=65536,"symlink expansion limit");
             if(allow_missing_target_slash && pending.empty() && target.back()=='/' && !parts.empty() && parts.back()==".")parts.pop_back();
             if(target[0]=='/'){stack.resize(1);if(track_physical)incoming.resize(1);}
@@ -2031,9 +2032,10 @@ std::string Namespace::path_for_inode(const std::string& id) const {
             if(canonical && resolve(view,hint->second,false,nullptr,&followed_symlink)==id &&
                (!inode(view,id).directory || !followed_symlink))return hint->second;
         }
+        catch(const std::system_error& e){if(e.code()!=std::error_code(ELOOP,std::generic_category()))throw;}
         catch(const std::runtime_error& e){auto message=std::string_view(e.what());
             if(message!="path not found" && message!="path component is not a directory" &&
-               message!="too many symbolic links" && message!="symlink expansion limit")throw;
+               message!="symlink expansion limit")throw;
         }
         // Rename, link removal, ancestor symlink retargeting and path reuse can
         // stale a hint. Fall back without changing the inode identity requested.
