@@ -248,6 +248,7 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         rpc('fs-close',handle,*sel)
         link=obj('inode-symlink',rid,'link','dir',*sel)
         assert rpc('inode-readlink',link['inode_id'],*sel)==b'dir'
+        rpc('inode-readlink',sticky_id,*sel,error=errno.EINVAL)
         cursor=obj('inode-dir-open',rid,*sel)['cursor']
         page=obj('fs-dir-entries',cursor,'100',*sel);assert page['eof'] and {x['name'] for x in page['entries']}=={'dir','link','deep-alias','z'*250,'sticky-dir','sticky-fifo','sticky-file'}
         rpc('fs-dir-close',cursor,*sel)

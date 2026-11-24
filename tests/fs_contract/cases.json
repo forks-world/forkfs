@@ -845,6 +845,154 @@
       ]
     },
     {
+      "id": "readlink_errno_and_traversal",
+      "families": [
+        "readlink",
+        "symlink",
+        "errno",
+        "path_resolution",
+        "failure_atomicity"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "file",
+          "data_hex": "64617461"
+        },
+        {
+          "type": "directory",
+          "path": "dir"
+        },
+        {
+          "type": "symlink",
+          "path": "dir-alias",
+          "target": "dir"
+        },
+        {
+          "type": "symlink",
+          "path": "dir/inner-link",
+          "target": "inner-target"
+        },
+        {
+          "type": "symlink",
+          "path": "link-file",
+          "target": "file"
+        },
+        {
+          "type": "symlink",
+          "path": "link-dir",
+          "target": "dir"
+        },
+        {
+          "type": "symlink",
+          "path": "dangling",
+          "target": "missing/target"
+        }
+      ],
+      "steps": [
+        {
+          "op": "readlink",
+          "args": {
+            "path": "file"
+          },
+          "expect": {
+            "errno": "EINVAL",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "readlink",
+          "args": {
+            "path": "dir"
+          },
+          "expect": {
+            "errno": "EINVAL",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "readlink",
+          "args": {
+            "path": "missing"
+          },
+          "expect": {
+            "errno": "ENOENT",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "readlink",
+          "args": {
+            "path": "file/child"
+          },
+          "expect": {
+            "errno": "ENOTDIR",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "readlink",
+          "args": {
+            "path": "link-dir/"
+          },
+          "expect": {
+            "errno": "EINVAL",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "readlink",
+          "args": {
+            "path": "link-file/"
+          },
+          "expect": {
+            "errno": "ENOTDIR",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "readlink",
+          "args": {
+            "path": "dangling/"
+          },
+          "expect": {
+            "errno": "ENOENT",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "readlink",
+          "args": {
+            "path": "dangling"
+          },
+          "expect": {
+            "errno": 0,
+            "target": "missing/target"
+          }
+        },
+        {
+          "op": "readlink",
+          "args": {
+            "path": "dir-alias/inner-link"
+          },
+          "expect": {
+            "errno": 0,
+            "target": "inner-target"
+          }
+        }
+      ]
+    },
+    {
       "id": "rename_preserves_inode_and_payload",
       "families": [
         "rename",

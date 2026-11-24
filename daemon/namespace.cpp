@@ -1300,7 +1300,9 @@ void Namespace::symlink(const std::string& target,const std::string& path) {
 }
 std::string Namespace::readlink(const std::string& path) const {
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);
-    auto id=resolve(view,path,false);auto n=inode(view,id);need(n.symlink,"path is not a symbolic link");auto b=view.get(content_key(id));
+    auto id=resolve(view,path,false,nullptr,nullptr,true);auto n=inode(view,id);
+    if(!n.symlink)throw std::system_error(EINVAL,std::generic_category(),"path is not a symbolic link");
+    auto b=view.get(content_key(id));
     need(b.size()==n.size,"symlink size mismatch");std::string result(b.begin(),b.end());target_components(result);return result;
 }
 void Namespace::link(const std::string& source,const std::string& target) {
