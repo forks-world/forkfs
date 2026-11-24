@@ -91,7 +91,8 @@
         "terminal_dot_path_type_errors",
         "relative_symlink_chmod_utime_follow_referent",
         "open_nofollow_rejects_final_symlinks",
-        "rpc_symlink_traversal_cycles_are_eloop"
+        "rpc_symlink_traversal_cycles_are_eloop",
+        "listdir_errno_and_symlink_resolution"
       ],
       "existing_external": [
         {
@@ -167,7 +168,8 @@
         "mkdir_at_regular_handle_enotdir_preserves_cursor",
         "mkdir_at_existing_file_atomic_then_reuse_handle",
         "open_nofollow_rejects_final_symlinks",
-        "rpc_symlink_traversal_cycles_are_eloop"
+        "rpc_symlink_traversal_cycles_are_eloop",
+        "listdir_errno_and_symlink_resolution"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -199,7 +201,8 @@
         "rpc_allocation_accounting",
         "rpc_clone_file_symlink_copy_independence",
         "open_nofollow_rejects_final_symlinks",
-        "rpc_symlink_traversal_cycles_are_eloop"
+        "rpc_symlink_traversal_cycles_are_eloop",
+        "listdir_errno_and_symlink_resolution"
       ],
       "existing_external": [
         {
@@ -1124,7 +1127,8 @@
     "readdir": {
       "case_ids": [
         "directory_entry_names_preserve_quote_newline_and_unicode",
-        "rpc_directory_cursor_snapshot_paging"
+        "rpc_directory_cursor_snapshot_paging",
+        "listdir_errno_and_symlink_resolution"
       ],
       "existing_external": [
         {

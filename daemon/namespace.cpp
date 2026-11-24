@@ -1189,13 +1189,17 @@ uint64_t Namespace::handle_seek_region(const std::string& token,uint64_t offset,
     return FileContent(n,j,pre).seek_region(offset,data);
 }
 std::vector<std::string> Namespace::list(const std::string& path) const {
-    std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);auto id=resolve(j,path);
-    need(inode(j,id).directory,"path is not a directory");auto pre=directory_prefix(id);std::vector<std::string> result;
+    std::lock_guard lock(container_.mutex_);const auto& journal=*container_.journal_;NamespaceView j(journal,view_,revision_);
+    auto id=resolve(j,path,true,nullptr,nullptr,true);
+    if(!inode(j,id).directory)throw std::system_error(ENOTDIR,std::generic_category(),"path is not a directory");
+    auto pre=directory_prefix(id);std::vector<std::string> result;
     for(const auto& key:j.keys(pre))result.push_back(key.substr(pre.size()));return result;
 }
 Namespace::DirectoryCursor Namespace::open_directory(const std::string& path) const {
     std::lock_guard lock(container_.mutex_);const auto& j=*container_.journal_;need(j.is_leveldb(),"directory cursors require LevelDB");
-    NamespaceView view(j,view_,revision_);auto id=resolve(view,path);need(inode(view,id).directory,"path is not a directory");
+    NamespaceView view(j,view_,revision_);
+    auto id=resolve(view,path,true,nullptr,nullptr,true);
+    if(!inode(view,id).directory)throw std::system_error(ENOTDIR,std::generic_category(),"path is not a directory");
     DirectoryCursor cursor;cursor.lifetime_=container_.lifetime_;cursor.view_=view_;cursor.revision_=revision_;cursor.prefix_=directory_prefix(id);
     if(view.legacy()){need(view.keys(cursor.prefix_).empty(),"flat namespace directory is not empty");cursor.done_=true;}
     else cursor.manifest_=revision_?revision_manifest(j,view_):j.root_object(history+"world/"+view_);
