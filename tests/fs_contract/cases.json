@@ -1240,6 +1240,179 @@
       ]
     },
     {
+      "id": "hardlink_create_typed_path_errors_and_alias_parent",
+      "families": [
+        "hardlink",
+        "path_resolution",
+        "errno",
+        "failure_atomicity"
+      ],
+      "profiles": [
+        "reference",
+        "mounted",
+        "daemon"
+      ],
+      "layers": [
+        "posix",
+        "rpc"
+      ],
+      "mandatory": true,
+      "fixture": [
+        {
+          "type": "file",
+          "path": "file",
+          "data_hex": "686172646c696e6b"
+        },
+        {
+          "type": "file",
+          "path": "occupied",
+          "data_hex": "6f63637570696564"
+        },
+        {
+          "type": "directory",
+          "path": "dir"
+        },
+        {
+          "type": "symlink",
+          "path": "dangling",
+          "target": "missing-target"
+        },
+        {
+          "type": "directory",
+          "path": "real-dir"
+        },
+        {
+          "type": "symlink",
+          "path": "dir-alias",
+          "target": "real-dir"
+        }
+      ],
+      "steps": [
+        {
+          "op": "link",
+          "args": {
+            "source": "missing-source",
+            "target": "new-link"
+          },
+          "expect": {
+            "errno": "ENOENT",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "link",
+          "args": {
+            "source": "file/child",
+            "target": "new-link"
+          },
+          "expect": {
+            "errno": "ENOTDIR",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "link",
+          "args": {
+            "source": "file",
+            "target": "absent/new-link"
+          },
+          "expect": {
+            "errno": "ENOENT",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "link",
+          "args": {
+            "source": "file",
+            "target": "file/child"
+          },
+          "expect": {
+            "errno": "ENOTDIR",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "link",
+          "args": {
+            "source": "file",
+            "target": "occupied"
+          },
+          "expect": {
+            "errno": "EEXIST",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "link",
+          "args": {
+            "source": "file",
+            "target": "dangling"
+          },
+          "expect": {
+            "errno": "EEXIST",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "link",
+          "args": {
+            "source": "dir",
+            "target": "new-link"
+          },
+          "expect": {
+            "errno": "EPERM",
+            "unchanged": true
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "file"
+          },
+          "save": "original",
+          "expect": {
+            "errno": 0,
+            "links": 1
+          }
+        },
+        {
+          "op": "link",
+          "args": {
+            "source": "file",
+            "target": "dir-alias/linked"
+          },
+          "expect": {
+            "errno": 0
+          }
+        },
+        {
+          "op": "stat",
+          "args": {
+            "path": "real-dir/linked"
+          },
+          "expect": {
+            "errno": 0,
+            "inode": {
+              "ref": "original",
+              "field": "inode"
+            },
+            "links": 2
+          }
+        },
+        {
+          "op": "read",
+          "args": {
+            "path": "real-dir/linked"
+          },
+          "expect": {
+            "errno": 0,
+            "data_hex": "686172646c696e6b"
+          }
+        }
+      ]
+    },
+    {
       "id": "rmdir_nonempty_rejected_without_changes",
       "families": [
         "rmdir",

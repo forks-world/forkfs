@@ -1311,8 +1311,11 @@ std::string Namespace::readlink(const std::string& path) const {
 }
 void Namespace::link(const std::string& source,const std::string& target) {
     update([&](const NamespaceView& j,Changes& c) {
-        auto id=resolve(j,source,false);auto n=inode(j,id);mutable_metadata(n);need(!n.directory,"directory hard links are forbidden");
-        auto p=parent(j,target);mutable_inode(inode(j,p.id));need(!j.contains(p.key),"target already exists");link_capacity(n.links);
+        auto id=resolve(j,source,false,nullptr,nullptr,true);auto n=inode(j,id);mutable_metadata(n);
+        if(n.directory)throw std::system_error(EPERM,std::generic_category(),"directory hard links are forbidden");
+        auto p=parent(j,target,nullptr,false,true);mutable_inode(inode(j,p.id));
+        if(j.contains(p.key))throw std::system_error(EEXIST,std::generic_category(),"target already exists");
+        link_capacity(n.links);
         ++n.links;n.changed_ns=now();auto pn=inode(j,p.id);touch(pn);
         c[p.key]=id_bytes(id);c[inode_key(id)]=encode(n);c[inode_key(p.id)]=encode(pn);c[allocated_key(id)]=Bytes{};
     });

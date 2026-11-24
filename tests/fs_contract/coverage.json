@@ -93,7 +93,8 @@
         "relative_symlink_chmod_utime_follow_referent",
         "open_nofollow_rejects_final_symlinks",
         "rpc_symlink_traversal_cycles_are_eloop",
-        "listdir_errno_and_symlink_resolution"
+        "listdir_errno_and_symlink_resolution",
+        "hardlink_create_typed_path_errors_and_alias_parent"
       ],
       "existing_external": [
         {
@@ -171,7 +172,8 @@
         "mkdir_at_existing_file_atomic_then_reuse_handle",
         "open_nofollow_rejects_final_symlinks",
         "rpc_symlink_traversal_cycles_are_eloop",
-        "listdir_errno_and_symlink_resolution"
+        "listdir_errno_and_symlink_resolution",
+        "hardlink_create_typed_path_errors_and_alias_parent"
       ],
       "existing_external": [],
       "missing_contracts": []
@@ -205,7 +207,8 @@
         "rpc_clone_file_symlink_copy_independence",
         "open_nofollow_rejects_final_symlinks",
         "rpc_symlink_traversal_cycles_are_eloop",
-        "listdir_errno_and_symlink_resolution"
+        "listdir_errno_and_symlink_resolution",
+        "hardlink_create_typed_path_errors_and_alias_parent"
       ],
       "existing_external": [
         {
@@ -392,6 +395,7 @@
     "hardlink": {
       "case_ids": [
         "hardlink_unlink_link_count",
+        "hardlink_create_typed_path_errors_and_alias_parent",
         "rename_hardlink_alias_is_noop",
         "exclusive_create_hardlink_alias_no_clobber",
         "rpc_revision_hardlink_recreate",
