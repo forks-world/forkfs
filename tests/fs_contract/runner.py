@@ -30,6 +30,16 @@ def _json_hash(value):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _fingerprint_oserror(exc, phase):
+    detail = {"phase": phase, "errno": exc.errno,
+              "errno_name": errno.errorcode.get(exc.errno), "message": str(exc)}
+    if hasattr(exc, "fingerprint_probe"):
+        detail["probe"] = exc.fingerprint_probe
+    if hasattr(exc, "fingerprint_handle"):
+        detail["handle"] = exc.fingerprint_handle
+    return detail
+
+
 def _errno_value(expected):
     if type(expected) is int:
         return expected
@@ -216,6 +226,9 @@ def _execute_case_inner(case, role, scratch_root, daemon, timeout):
                     record["fingerprint_before_sha256"] = _json_hash(before)
                 except Unsupported as exc:
                     record.update(status="unsupported", detail=str(exc)); bad = True; continue
+                except OSError as exc:
+                    record["fingerprint_error"] = _fingerprint_oserror(exc, "before")
+                    bad = True; break
             try:
                 observed = adapter.execute(step["op"], args)
                 actual_errno = 0
@@ -266,6 +279,11 @@ def _execute_case_inner(case, role, scratch_root, daemon, timeout):
                     if record["status"] != "fail":
                         record["status"] = "unsupported"
                     bad = True
+                except OSError as exc:
+                    record["fingerprint_error"] = _fingerprint_oserror(exc, "after")
+                    if record["status"] != "fail":
+                        record["status"] = "blocked"
+                    bad = True; break
         statuses = [step["status"] for step in result["steps"]]
         # Preserve observed contract violations even if a later dependent step
         # cannot run or the fingerprint becomes unavailable.

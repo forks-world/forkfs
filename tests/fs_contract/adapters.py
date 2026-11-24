@@ -228,7 +228,12 @@ class PosixAdapter:
             st = os.fstat(fd); item = {"symbol": symbol, **_norm_stat(st)}
             item.pop("atime_ns", None)
             item["ctime_ns"] = getattr(st, "st_ctime_ns", int(st.st_ctime * 1e9))
-            item["xattrs"] = self._fd_xattrs(fd)
+            try:
+                item["xattrs"] = self._fd_xattrs(fd)
+            except OSError as exc:
+                exc.fingerprint_probe = "fd_xattrs"
+                exc.fingerprint_handle = symbol
+                raise
             if stat.S_ISREG(st.st_mode): item["offset"] = os.lseek(fd, 0, os.SEEK_CUR)
             if stat.S_ISREG(st.st_mode):
                 logical_bytes += st.st_size
