@@ -254,6 +254,60 @@ class HarnessModelTests(unittest.TestCase):
         self.assertEqual(result["status"], "fail")
         self.assertTrue(result["steps"][0].get("atomicity_diff"))
 
+    def test_fingerprint_oserror_reports_phase_and_preserves_contract_failure(self):
+        case = self._simple_case({"errno": "EEXIST", "unchanged": True})
+        case["steps"].append({"op": "stat", "args": {"path": "later"}, "expect": {"errno": 0}})
+        class ErrorAdapter:
+            fail_on = 1
+            operation_errno = errno.EEXIST
+            executions = 0
+            def __init__(self, *args, **kwargs): self.fingerprints = 0
+            def fixture(self, item): pass
+            def execute(self, op, args):
+                type(self).executions += 1
+                raise OSError(self.operation_errno, "operation error")
+            def fingerprint(self, revision=None):
+                self.fingerprints += 1
+                if self.fingerprints == self.fail_on:
+                    exc = OSError(errno.ESTALE, "stale descriptor")
+                    exc.fingerprint_probe = "fd_xattrs"; exc.fingerprint_handle = "fd0"
+                    raise exc
+                return {"entries": [], "handles": []}
+            def close_all(self): pass
+        for fail_on, op_errno, status, phase, executions in (
+                (1, errno.EEXIST, "blocked", "before", 0),
+                (2, errno.EEXIST, "blocked", "after", 1),
+                (2, errno.EPERM, "fail", "after", 1)):
+            with self.subTest(phase=phase, op_errno=op_errno):
+                ErrorAdapter.fail_on = fail_on; ErrorAdapter.operation_errno = op_errno; ErrorAdapter.executions = 0
+                with tempfile.TemporaryDirectory() as tmp, mock.patch.object(runner, "PosixAdapter", ErrorAdapter):
+                    result = runner._execute_case_inner(case, "reference", Path(tmp) / "owned", None, 1)
+                step = result["steps"][0]
+                self.assertEqual(result["status"], status)
+                self.assertEqual(step["status"], status)
+                self.assertEqual(ErrorAdapter.executions, executions)
+                self.assertEqual(len(result["steps"]), 1)
+                self.assertEqual(step["fingerprint_error"]["phase"], phase)
+                self.assertEqual(step["fingerprint_error"]["errno"], errno.ESTALE)
+                self.assertEqual(step["fingerprint_error"]["errno_name"], "ESTALE")
+                self.assertEqual(step["fingerprint_error"]["probe"], "fd_xattrs")
+                self.assertEqual(step["fingerprint_error"]["handle"], "fd0")
+                if status == "fail": self.assertEqual(step["errno_actual"], errno.EPERM)
+
+    def test_fd_xattr_fingerprint_error_identifies_owned_handle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = PosixAdapter(Path(tmp), "apfs")
+            adapter.handles["fd0"] = os.open(tmp, os.O_RDONLY)
+            try:
+                with mock.patch.object(adapter, "_listxattrs", return_value={}), \
+                     mock.patch.object(adapter, "_fd_xattrs", side_effect=OSError(errno.ESTALE, "stale")):
+                    with self.assertRaises(OSError) as caught: adapter.fingerprint()
+                self.assertEqual(caught.exception.errno, errno.ESTALE)
+                self.assertEqual(caught.exception.fingerprint_probe, "fd_xattrs")
+                self.assertEqual(caught.exception.fingerprint_handle, "fd0")
+            finally:
+                adapter.close_all()
+
     def test_contract_failure_survives_later_unsupported_fingerprint(self):
         case = self._simple_case({"errno": "EEXIST", "unchanged": True})
         class FailingAdapter:
