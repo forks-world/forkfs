@@ -4940,6 +4940,32 @@
       ]
     },
     {
+      "id": "open_create_through_symlink_parent_errors",
+      "families": ["create", "flags", "path_resolution", "errno", "failure_atomicity", "symlink"],
+      "profiles": ["reference", "mounted", "daemon"],
+      "layers": ["posix", "rpc"],
+      "mandatory": true,
+      "fixture": [
+        {"type": "directory", "path": "dir"},
+        {"type": "file", "path": "regular", "data_hex": "6b656570"},
+        {"type": "symlink", "path": "missing-parent", "target": "missing/child"},
+        {"type": "symlink", "path": "file-parent", "target": "regular/child"},
+        {"type": "symlink", "path": "valid-parent", "target": "dir/child"}
+      ],
+      "steps": [
+        {"op": "open", "args": {"path": "missing-parent", "flags": ["write", "create"]}, "expect": {"errno": "ENOENT", "unchanged": true}},
+        {"op": "open", "args": {"path": "file-parent", "flags": ["write", "create"]}, "expect": {"errno": "ENOTDIR", "unchanged": true}},
+        {"op": "open", "args": {"path": "missing-parent", "flags": ["write", "create", "exclusive"]}, "expect": {"errno": "EEXIST", "unchanged": true}},
+        {"op": "open", "args": {"path": "file-parent", "flags": ["write", "create", "nofollow"]}, "expect": {"errno": "ELOOP", "unchanged": true}},
+        {"op": "open", "args": {"path": "valid-parent", "flags": ["write", "create"]}, "save": "created", "expect": {"errno": 0}},
+        {"op": "pwrite", "args": {"handle": {"ref": "created", "field": "handle"}, "offset": 0, "data_hex": "6869"}, "expect": {"errno": 0, "written": 2}},
+        {"op": "close", "args": {"handle": {"ref": "created", "field": "handle"}}, "expect": {"errno": 0}},
+        {"op": "read", "args": {"path": "dir/child"}, "expect": {"errno": 0, "data_hex": "6869"}},
+        {"op": "readlink", "args": {"path": "valid-parent"}, "expect": {"errno": 0, "target": "dir/child"}},
+        {"op": "lstat", "args": {"path": "valid-parent"}, "expect": {"errno": 0, "type": "symlink"}}
+      ]
+    },
+    {
       "id": "open_nofollow_rejects_final_symlinks",
       "families": ["flags", "symlink", "path_resolution", "errno", "failure_atomicity"],
       "profiles": ["reference", "mounted", "daemon"],

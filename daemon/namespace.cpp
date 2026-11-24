@@ -1798,7 +1798,7 @@ std::string Namespace::open(const std::string& path,Access access,const OpenOpti
         if(exists) {
             auto raw=inode(view,decode_id(view.get(p.key)));
             if(options.nofollow && raw.symlink)throw std::system_error(ELOOP,std::generic_category(),"final symbolic link is forbidden");
-            Parent destination;id=resolve(view,path,true,&destination);
+            Parent destination;id=resolve(view,path,true,&destination,nullptr,true);
             if(id.empty()){p=std::move(destination);exists=false;}
         }
         if(!exists) {
