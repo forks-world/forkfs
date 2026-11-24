@@ -20,6 +20,8 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 - **未验收**：尚无足够证据；不等同于已证实失败。
 - **缺失/受限**：明确的实现缺口或产品限制。
 
+后续工作和验收顺序见[兼容性路线图](FILESYSTEM_COMPATIBILITY_ROADMAP.md)。
+
 ## API 清单
 
 | 应用接口/行为 | FSKit 或内核路径 | 当前状态与验收边界 |
