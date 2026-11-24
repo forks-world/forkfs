@@ -89,6 +89,7 @@
         "mkdir_trailing_slash_succeeds",
         "path_dot_dot_physical_resolution",
         "terminal_dot_path_type_errors",
+        "readlink_errno_and_traversal",
         "relative_symlink_chmod_utime_follow_referent",
         "open_nofollow_rejects_final_symlinks",
         "rpc_symlink_traversal_cycles_are_eloop",
@@ -158,6 +159,7 @@
       "case_ids": [
         "component_name_byte_limit_255_and_256",
         "dangling_symlink_lstat_readlink_and_follow",
+        "readlink_errno_and_traversal",
         "mkdir_and_exclusive_create_conflicts",
         "terminal_dot_path_type_errors",
         "seek_preserves_shared_cursor_on_failure",
@@ -180,6 +182,7 @@
         "rpc_immutable_flags_hardlink_revision",
         "binary_xattr_create_replace_remove",
         "file_directory_mismatch_and_trailing_slash",
+        "readlink_errno_and_traversal",
         "mkdir_and_exclusive_create_conflicts",
         "rename_directory_type_mismatch_is_atomic",
         "rmdir_nonempty_rejected_without_changes",
@@ -257,6 +260,7 @@
     "symlink": {
       "case_ids": [
         "dangling_symlink_lstat_readlink_and_follow",
+        "readlink_errno_and_traversal",
         "mkdir_through_dangling_symlink_trailing_slash",
         "exclusive_create_dangling_symlink_no_clobber",
         "relative_symlink_chmod_utime_follow_referent",
@@ -304,7 +308,8 @@
     },
     "readlink": {
       "case_ids": [
-        "dangling_symlink_lstat_readlink_and_follow"
+        "dangling_symlink_lstat_readlink_and_follow",
+        "readlink_errno_and_traversal"
       ],
       "existing_external": [],
       "missing_contracts": []
