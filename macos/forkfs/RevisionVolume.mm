@@ -12,6 +12,7 @@
 
 namespace {
 void require(bool ok,int code,const char* message){if(!ok)throw forkfs::RpcError(code,message);}
+NSString* requiredFilename(FSFileName* name){NSString* value=name.string;require(value!=nil,EINVAL,"invalid UTF-8 name");return value;}
 std::string bytes(NSString* value){NSData* data=[value dataUsingEncoding:NSUTF8StringEncoding];require(data!=nil,EINVAL,"invalid UTF-8 argument");return std::string(data.length?static_cast<const char*>(data.bytes):"",data.length);}
 NSDictionary* object(const std::string& value){
     NSData* data=[NSData dataWithBytes:value.data() length:value.size()];
@@ -218,7 +219,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
         a=[self attributes:it];}];reply(a,e);
 }
 - (void)lookupItemNamed:(FSFileName*)name inDirectory:(FSItem*)directory replyHandler:(void(^)(FSItem*,FSFileName*,NSError*))reply {
-    __block RevisionItem* it=nil;NSError* e=[self perform:^{auto dir=[self item:directory];it=[self remember:[self json:@[@"inode-lookup",dir.inode,name.string]] parent:dir.number];}];reply(it,e?nil:name,e);
+    __block RevisionItem* it=nil;NSError* e=[self perform:^{auto dir=[self item:directory];NSString* filename=requiredFilename(name);it=[self remember:[self json:@[@"inode-lookup",dir.inode,filename]] parent:dir.number];}];reply(it,e?nil:name,e);
 }
 - (void)reclaimItem:(FSItem*)item replyHandler:(void(^)(NSError*))reply {
     NSError* e=[self perform:^{auto it=[self item:item];require(!it.reader && !it.writer,EBUSY,"reclaim of open inode");
@@ -232,32 +233,35 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 - (void)createItemNamed:(FSFileName*)name type:(FSItemType)type inDirectory:(FSItem*)directory attributes:(FSItemSetAttributesRequest*)request replyHandler:(void(^)(FSItem*,FSFileName*,NSError*))reply {
     __block RevisionItem* result=nil;NSError* e=[self perform:^{[self writable];auto dir=[self item:directory];
         auto mode=[request isValid:FSItemAttributeMode]?request.mode:(type==FSItemTypeDirectory?0755:type==FSItemTypeSocket?0777:0644);
-        require(mode<=forkfs::supported_mode_bits,ENOTSUP,"unsupported creation mode");NSDictionary* attrs;
-        if(type==FSItemTypeDirectory)attrs=[self json:@[@"inode-mkdir",dir.inode,name.string,[@(mode) stringValue]]];
-        else if(type==FSItemTypeFIFO)attrs=[self json:@[@"inode-mkfifo",dir.inode,name.string,[@(mode) stringValue]]];
-        else if(type==FSItemTypeSocket)attrs=[self json:@[@"inode-mksocket",dir.inode,name.string,[@(mode) stringValue]]];
-        else {require(type==FSItemTypeFile,ENOTSUP,"unsupported creation type");
-            NSString* handle=[self json:@[@"inode-create",dir.inode,name.string,[@(mode) stringValue]]][@"handle"];
+        require(mode<=forkfs::supported_mode_bits,ENOTSUP,"unsupported creation mode");
+        require(type==FSItemTypeDirectory || type==FSItemTypeFIFO || type==FSItemTypeSocket || type==FSItemTypeFile,ENOTSUP,"unsupported creation type");
+        NSString* filename=requiredFilename(name);NSDictionary* attrs;
+        if(type==FSItemTypeDirectory)attrs=[self json:@[@"inode-mkdir",dir.inode,filename,[@(mode) stringValue]]];
+        else if(type==FSItemTypeFIFO)attrs=[self json:@[@"inode-mkfifo",dir.inode,filename,[@(mode) stringValue]]];
+        else if(type==FSItemTypeSocket)attrs=[self json:@[@"inode-mksocket",dir.inode,filename,[@(mode) stringValue]]];
+        else {NSString* handle=[self json:@[@"inode-create",dir.inode,filename,[@(mode) stringValue]]][@"handle"];
             @try{attrs=[self json:@[@"fs-hstat",handle]];}@finally{[self json:@[@"fs-close",handle]];}}
         result=[self remember:attrs parent:dir.number];request.consumedAttributes=[request isValid:FSItemAttributeMode]?FSItemAttributeMode:0;
     }];reply(result,e?nil:name,e);
 }
 - (void)createSymbolicLinkNamed:(FSFileName*)name inDirectory:(FSItem*)directory attributes:(FSItemSetAttributesRequest*)request linkContents:(FSFileName*)contents replyHandler:(void(^)(FSItem*,FSFileName*,NSError*))reply {
     __block RevisionItem* result=nil;NSError* e=[self perform:^{[self writable];auto dir=[self item:directory];
-        result=[self remember:[self json:@[@"inode-symlink",dir.inode,name.string,contents.string]] parent:dir.number];request.consumedAttributes=0;}];reply(result,e?nil:name,e);
+        NSString* filename=requiredFilename(name);NSString* target=requiredFilename(contents);
+        result=[self remember:[self json:@[@"inode-symlink",dir.inode,filename,target]] parent:dir.number];request.consumedAttributes=0;}];reply(result,e?nil:name,e);
 }
 - (void)createLinkToItem:(FSItem*)item named:(FSFileName*)name inDirectory:(FSItem*)directory replyHandler:(void(^)(FSFileName*,NSError*))reply {
-    NSError* e=[self perform:^{[self writable];auto it=[self item:item],dir=[self item:directory];it.attrs=[self json:@[@"inode-link",it.inode,dir.inode,name.string]];}];reply(e?nil:name,e);
+    NSError* e=[self perform:^{[self writable];auto it=[self item:item],dir=[self item:directory];NSString* filename=requiredFilename(name);it.attrs=[self json:@[@"inode-link",it.inode,dir.inode,filename]];}];reply(e?nil:name,e);
 }
 - (void)removeItem:(FSItem*)item named:(FSFileName*)name fromDirectory:(FSItem*)directory replyHandler:(void(^)(NSError*))reply {
     NSError* e=[self perform:^{[self writable];auto it=[self item:item],dir=[self item:directory];
-        auto type=itemType(it.attrs);[self json:@[@"inode-remove",dir.inode,name.string,it.inode,type==FSItemTypeDirectory?@"directory":@"file"]];
+        auto type=itemType(it.attrs);NSString* filename=requiredFilename(name);[self json:@[@"inode-remove",dir.inode,filename,it.inode,type==FSItemTypeDirectory?@"directory":@"file"]];
         if([self handle:it])[self refresh:it];else {NSMutableDictionary* a=[it.attrs mutableCopy];auto links=[a[@"links"] unsignedLongLongValue];a[@"links"]=@(itemType(a)==FSItemTypeDirectory?0:links-1);it.attrs=a;}
     }];reply(e);
 }
 - (void)renameItem:(FSItem*)item inDirectory:(FSItem*)source named:(FSFileName*)name toNewName:(FSFileName*)newName inDirectory:(FSItem*)destination overItem:(FSItem*)over replyHandler:(void(^)(FSFileName*,NSError*))reply {
     NSError* e=[self perform:^{[self writable];auto it=[self item:item],src=[self item:source],dst=[self item:destination];
-        it.attrs=[self json:@[@"inode-rename",src.inode,name.string,dst.inode,newName.string,it.inode,over?[self item:over].inode:@"-"]];it.parent=dst.number;
+        NSString* overInode=over?[self item:over].inode:@"-";NSString* filename=requiredFilename(name);NSString* destinationName=requiredFilename(newName);
+        it.attrs=[self json:@[@"inode-rename",src.inode,filename,dst.inode,destinationName,it.inode,overInode]];it.parent=dst.number;
         if(over && over!=item){auto replaced=[self item:over];if([self handle:replaced])[self refresh:replaced];
             else{NSMutableDictionary* a=[replaced.attrs mutableCopy];auto links=[a[@"links"] unsignedLongLongValue];a[@"links"]=@(itemType(a)==FSItemTypeDirectory?0:links-1);replaced.attrs=a;}}
     }];reply(e?nil:newName,e);
