@@ -1296,7 +1296,9 @@ InodeInfo Namespace::lstat(const std::string& path) const {
 void Namespace::symlink(const std::string& target,const std::string& path) {
     target_components(target);
     update([&](const NamespaceView& view,Changes& c) {
-        auto p=parent(view,path);mutable_inode(inode(view,p.id));need(!view.contains(p.key),"path already exists");auto id=new_id(view);
+        auto p=parent(view,path,nullptr,false,true);mutable_inode(inode(view,p.id));
+        if(view.contains(p.key))throw std::system_error(EEXIST,std::generic_category(),"path already exists");
+        auto id=new_id(view);
         InodeInfo n=created({id,false,0777,1,target.size(),now(),now(),true});auto pn=inode(view,p.id);touch(pn);
         c[inode_key(id)]=encode(n);c[content_key(id)]=Bytes(target.begin(),target.end());c[allocated_key(id)]=Bytes{};
         c[p.key]=id_bytes(id);c[inode_key(p.id)]=encode(pn);
